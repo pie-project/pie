@@ -45,34 +45,82 @@ pub struct ProgramFires {
 }
 
 impl ProgramFires {
-    /// The terms of the pairs that can be in a fire now, each capped at
-    /// its live instances: a fire carries no more lanes of a pair than it
-    /// has instances bound (or binding), and an engine lays a flight for
-    /// the power of two over its members, so `l = min(pow2(min(r,
-    /// FireLimits::max_lanes, its live instances)), the pair's max_lanes)`.
+    /// The terms of the pairs that can be in a fire now, each with its
+    /// live instances: a fire carries no more members of a pair than it
+    /// has instances bound (or binding), and the engine lays them as its
+    /// facts state, so `l = min(laid.of(min(r, FireLimits::max_lanes, its
+    /// live instances)), the pair's max_lanes)`.
     fn open_terms(&self) -> Vec<FireTerm> {
         self.open
             .iter()
             .filter_map(|(key, &live)| {
                 let term = *self.terms.get(key)?;
-                let live = crate::store::slots::flight_lanes(live);
-                let max_lanes = match term.max_lanes {
-                    0 => live,
-                    own => own.min(live),
-                };
-                Some(FireTerm { max_lanes, ..term })
+                Some(FireTerm { live, ..term })
             })
             .collect()
     }
 }
 
-/// A program's fire term from its facts.
+impl std::fmt::Display for ProgramFires {
+    /// Every open pair with the term it counts, pair after pair in the
+    /// keys' order: what a refused submission is read against
+    /// ([`impossible_submission`]).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut open: Vec<_> = self.open.iter().collect();
+        open.sort_unstable_by_key(|(key, _)| (key.program.0, format!("{:?}", key.extents)));
+        for (at, (key, live)) in open.into_iter().enumerate() {
+            if at > 0 {
+                f.write_str("; ")?;
+            }
+            match self.terms.get(key) {
+                Some(term) => write!(
+                    f,
+                    "{key}: live {live}, a_lane {}, fixed {}, max_lanes {}, laid {:?}",
+                    term.a_lane, term.fixed, term.max_lanes, term.laid
+                )?,
+                None => write!(f, "{key}: live {live}, facts not learned")?,
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The engine called a submission impossible
+/// ([`::engine::Error::Impossible`]): a fire asked more of the span than
+/// the engine backs, which the rung arithmetic is there to rule out. One
+/// line with what that arithmetic held when it came back: the pool's rung,
+/// the cap fires are cut to, the activation reserved, the rung's own with
+/// the terms, and every open pair's term.
+pub fn impossible_submission(engine: usize, error: &::engine::Error) {
+    let Some(shared) = crate::store::registry::try_get(0, engine).and_then(|stores| stores.shared)
+    else {
+        return;
+    };
+    let pool = shared.lock().unwrap();
+    let rung = pool.pool().rung();
+    tracing::error!(
+        engine,
+        %error,
+        rung,
+        cap = super::fire_cap(engine),
+        act_reserved = pool.pool().act_reserved(),
+        act_chunks = pool.pool().act_chunks(rung),
+        max_lanes = pool.pool().max_lanes(),
+        terms = %pool.programs,
+        "the engine called a submission impossible"
+    );
+}
+
+/// A program's fire term from its facts, its live instances not counted
+/// yet.
 #[must_use]
 pub fn term_of(facts: &FireFacts) -> FireTerm {
     FireTerm {
         fixed: facts.fixed,
         a_lane: facts.a_lane,
         max_lanes: facts.max_lanes,
+        live: 0,
+        laid: facts.laid,
     }
 }
 

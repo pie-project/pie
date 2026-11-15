@@ -106,15 +106,44 @@ pub struct ProgramFacts {
     pub adapter: Footprint,
 }
 
+/// The lanes an engine lays a guest program's flight of `members` lanes
+/// for, stated in [`FireFacts::laid`]: what a fire of `members` takes of
+/// the span is the bytes of the lanes laid, not of the members in it, so
+/// the term a rung backs counts these lanes.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+pub enum LaidLanes {
+    /// The members themselves: each takes its own lane's bytes.
+    #[default]
+    Exact,
+    /// The power of two over the members: the engine keeps one layout of a
+    /// flight's lane tables (or one executable) for every count in a power
+    /// of two, so 170 members are laid as 256.
+    PowerOfTwo,
+}
+
+impl LaidLanes {
+    /// The lanes laid for a flight of `members`.
+    #[must_use]
+    pub fn of(self, members: u64) -> u64 {
+        match self {
+            LaidLanes::Exact => members,
+            LaidLanes::PowerOfTwo => members.checked_next_power_of_two().unwrap_or(u64::MAX),
+        }
+    }
+}
+
 /// What a fire holding lanes of a program bound at given extents needs
 /// beside the model's own activation (REDESIGN 2.4, §6): the per-batch
 /// tables and value scratch of the program's stage, sized by the binding's
 /// [`BindExtents`] (the same program at 256 and 4096 rows differs 16x). A
-/// fire of a rung of `r` tokens carries `l = min(r, FireLimits::max_lanes,
-/// max_lanes)` lanes of it and needs `fixed + l × a_lane` bytes for each
-/// (program, extents) bound that can be in it; the runtime folds the sum
-/// into the rung's activation ([`crate::Engine::fire_facts`]). A program
-/// registers after load, so `ChunkFacts` cannot state it.
+/// fire of a rung of `r` tokens carries `m = min(r, FireLimits::max_lanes,
+/// the pair's bound instances)` members of it, laid as `l =
+/// min(laid.of(m), max_lanes)` lanes, and needs `fixed + l × a_lane` bytes
+/// for each (program, extents) bound that can be in it; the runtime folds
+/// the sum into the rung's activation ([`crate::Engine::fire_facts`]). A
+/// program registers after load, so `ChunkFacts` cannot state it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FireFacts {
     #[serde(default)]
@@ -126,25 +155,32 @@ pub struct FireFacts {
     /// `FireLimits::max_lanes` only.
     #[serde(default)]
     pub max_lanes: u32,
+    /// The lanes the engine lays for a flight's members. The engine states
+    /// it and lays by it; the runtime sizes the term by it and has no rule
+    /// of its own.
+    #[serde(default)]
+    pub laid: LaidLanes,
 }
 
 impl FireFacts {
-    /// The lanes of the program a fire carrying `lanes` lanes flies:
-    /// capped by [`Self::max_lanes`] where it states one.
+    /// The lanes a fire carrying `members` instances of the program lays:
+    /// [`Self::laid`] over them, capped by [`Self::max_lanes`] where it
+    /// states one.
     #[must_use]
-    pub fn lanes(&self, lanes: u64) -> u64 {
+    pub fn lanes(&self, members: u64) -> u64 {
+        let laid = self.laid.of(members);
         if self.max_lanes == 0 {
-            lanes
+            laid
         } else {
-            lanes.min(u64::from(self.max_lanes))
+            laid.min(u64::from(self.max_lanes))
         }
     }
 
-    /// The bytes a fire of `lanes` lanes needs for the program.
+    /// The bytes a fire of `members` instances needs for the program.
     #[must_use]
-    pub fn bytes(&self, lanes: u64) -> u64 {
+    pub fn bytes(&self, members: u64) -> u64 {
         self.fixed
-            .saturating_add(self.lanes(lanes).saturating_mul(self.a_lane))
+            .saturating_add(self.lanes(members).saturating_mul(self.a_lane))
     }
 }
 

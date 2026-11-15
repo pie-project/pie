@@ -7,7 +7,7 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use ::engine::{FireFacts, InstanceId, ProgramId};
+use ::engine::{FireFacts, InstanceId, LaidLanes, ProgramId};
 use tokio::sync::Notify;
 
 use super::*;
@@ -205,25 +205,57 @@ fn the_fire_term_takes_its_chunks_at_every_rung_s_lanes() {
 }
 
 /// The term a rung backs for `n` live instances is what a fire of `n` lays,
-/// for every `n` up to the fire's lanes: the engine lays a guest flight for
-/// the power of two over its members, so 33 live take 64 lanes' bytes.
+/// for every `n` up to the fire's lanes and for each form an engine states
+/// ([`LaidLanes`]): an engine laying the members themselves takes `n`
+/// lanes' bytes, one laying the power of two over them takes 64 for 33
+/// live. The lanes are the engine's own statement, read back here as the
+/// engine lays them (`FireFacts::bytes`).
 #[test]
 fn the_term_a_rung_backs_for_n_live_is_what_a_fire_of_n_lays() {
+    for laid in [LaidLanes::Exact, LaidLanes::PowerOfTwo] {
+        let (mut pool, _) = pool_at_256();
+        let facts = FireFacts {
+            a_lane: MIB,
+            laid,
+            ..FireFacts::default()
+        };
+        pool.fire_facts_learned(key(PROGRAM), &facts);
+        for n in 1..=u64::from(LANES) {
+            pool.instance_bound(InstanceId(n), key(PROGRAM));
+            let lays = facts.bytes(n);
+            assert_eq!(
+                u64::from(pool.pool().act_chunks(2048)),
+                12 + lays.div_ceil(CHUNK),
+                "{n} live, laid {laid:?}"
+            );
+        }
+        let lanes = match laid {
+            LaidLanes::Exact => 33,
+            LaidLanes::PowerOfTwo => 64,
+        };
+        assert_eq!(facts.bytes(33), lanes * MIB, "33 members, laid {laid:?}");
+    }
+}
+
+/// A pair's own cap holds over the lanes laid: 5 live of an engine laying
+/// powers of two with flights of 4 take 4 lanes' bytes, not 8.
+#[test]
+fn a_pairs_own_cap_holds_over_the_lanes_laid() {
     let (mut pool, _) = pool_at_256();
     let facts = FireFacts {
         a_lane: MIB,
+        max_lanes: 4,
+        laid: LaidLanes::PowerOfTwo,
         ..FireFacts::default()
     };
     pool.fire_facts_learned(key(PROGRAM), &facts);
-    for n in 1..=u64::from(LANES) {
+    for n in 1..=5 {
         pool.instance_bound(InstanceId(n), key(PROGRAM));
-        let laid = u64::from(crate::store::slots::flight_lanes(n as u32)) * MIB;
-        assert_eq!(
-            u64::from(pool.pool().act_chunks(2048)),
-            12 + laid.div_ceil(CHUNK),
-            "{n} live"
-        );
     }
+    assert_eq!(
+        u64::from(pool.pool().act_chunks(2048)),
+        12 + (4 * MIB).div_ceil(CHUNK)
+    );
 }
 
 /// A term that leaves the smallest rung no room on the device refuses the
@@ -726,6 +758,7 @@ fn the_fire_chunks_never_fall_as_the_rung_rises() {
                 fixed: 3 * MIB,
                 a_lane: 384 << 10,
                 max_lanes: 0,
+                ..FireFacts::default()
             },
         ),
         (
@@ -734,6 +767,7 @@ fn the_fire_chunks_never_fall_as_the_rung_rises() {
                 fixed: 20 * MIB,
                 a_lane: 1 << 20,
                 max_lanes: 8,
+                ..FireFacts::default()
             },
         ),
         (
@@ -742,6 +776,7 @@ fn the_fire_chunks_never_fall_as_the_rung_rises() {
                 fixed: 0,
                 a_lane: 100 << 10,
                 max_lanes: 32,
+                ..FireFacts::default()
             },
         ),
     ];

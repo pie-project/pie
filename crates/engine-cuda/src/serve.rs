@@ -862,6 +862,8 @@ impl Shell {
             a_lane: bytes.a_lane,
             fixed: bytes.fixed,
             max_lanes: bytes.max_lanes,
+            // What `Plane::fly` lays a flight's members for.
+            laid: crate::program::LAID,
         })
     }
 

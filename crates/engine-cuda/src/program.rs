@@ -197,16 +197,21 @@ pub struct FireBytes {
 }
 
 /// The lanes a flight of `members` instances is laid for: the power of two
-/// over them. The lanes laid key what a stage keeps between fires: its lane
-/// table and descriptor rows are built again, and its tables staged again,
-/// whenever the lanes differ from the last lay (`launch::Prepared::lay`,
-/// and `Plane::fly`'s `laid`). A wave whose members come and go fire by fire
-/// stays in one layout at a power of two, where the exact count would build
-/// and stage the tables every fire. A pair's fire term counts the same
-/// lanes, so a fire never lays more than the term its rung backs.
+/// over them, stated to the runtime in `engine::FireFacts::laid`
+/// (`Session::fire_facts`). The lanes laid key what a stage keeps between
+/// fires: its lane table and descriptor rows are built again, and its
+/// tables staged again, whenever the lanes differ from the last lay
+/// (`launch::Prepared::lay`, and `Plane::fly`'s `laid`). A wave whose
+/// members come and go fire by fire stays in one layout at a power of two,
+/// where the exact count would build and stage the tables every fire. A
+/// pair's fire term counts the same lanes, here and in the runtime, so a
+/// fire never lays more than the term its rung backs.
+pub const LAID: engine::LaidLanes = engine::LaidLanes::PowerOfTwo;
+
+/// [`LAID`] over a flight's `members`.
 #[must_use]
 pub fn flight_lanes(members: u32) -> u32 {
-    members.checked_next_power_of_two().unwrap_or(u32::MAX)
+    u32::try_from(LAID.of(u64::from(members))).unwrap_or(u32::MAX)
 }
 
 impl FireBytes {
@@ -1228,6 +1233,19 @@ mod term_tests {
                     plane.fire_term(256),
                     lays,
                     "{n} bound, flights of {max_lanes}"
+                );
+                // And what the runtime counts from the facts stated to it
+                // (`Session::fire_facts`) for `n` members.
+                let stated = engine::FireFacts {
+                    a_lane: bytes.a_lane,
+                    fixed: bytes.fixed,
+                    max_lanes: bytes.max_lanes,
+                    laid: LAID,
+                };
+                assert_eq!(
+                    stated.bytes(u64::from(n)),
+                    lays,
+                    "{n} members as stated, flights of {max_lanes}"
                 );
                 // A narrower rung's fire carries no more lanes than it holds.
                 let narrow = flight_lanes(n.min(64)).min(bytes.max_lanes);

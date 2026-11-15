@@ -113,25 +113,23 @@ pub struct SlotPoolFacts {
 }
 
 /// What one registered program's fires add to every rung's activation
-/// (REDESIGN §6, [`::engine::ProgramFacts::fire_bytes`]): a fire of a rung
-/// of `r` tokens carries `min(r, FireLimits::max_lanes, max_lanes)` lanes
-/// of it and needs `fixed + lanes × a_lane` bytes beside the model's own
-/// activation.
+/// (REDESIGN §6, [`::engine::FireFacts`]): a fire of a rung of `r` tokens
+/// carries `m = min(r, FireLimits::max_lanes, live)` members of it, which
+/// the engine lays as `l = min(laid.of(m), max_lanes)` lanes, and needs
+/// `fixed + l × a_lane` bytes beside the model's own activation. The lanes
+/// laid for the members are the engine's statement
+/// ([`::engine::LaidLanes`]); nothing here has a rule of its own.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FireTerm {
     pub fixed: u64,
     pub a_lane: u64,
     /// The most lanes one fire of the program flies; 0: no cap of its own.
     pub max_lanes: u32,
-}
-
-/// The lanes an engine lays a guest program's flight of `members` lanes
-/// for: the power of two over them, so that a wave whose members come and
-/// go keeps one layout of its lane tables fire to fire. A fire term counts
-/// those lanes, never fewer: the room a rung backs is what a fire lays.
-#[must_use]
-pub fn flight_lanes(members: u32) -> u32 {
-    members.checked_next_power_of_two().unwrap_or(u32::MAX)
+    /// The pair's instances bound or binding: a fire carries no more
+    /// members of it; 0: not counted.
+    pub live: u32,
+    /// The lanes the engine lays for a flight's members.
+    pub laid: ::engine::LaidLanes,
 }
 
 impl FireTerm {
@@ -140,17 +138,22 @@ impl FireTerm {
         self.fixed == 0 && self.a_lane == 0
     }
 
-    /// Bytes a fire carrying `lanes` lanes needs for the program: its own
-    /// lane cap taken.
+    /// Bytes a fire carrying `lanes` lanes needs for the program: the
+    /// lanes the engine lays for the members in it, its own lane cap taken.
     #[must_use]
     pub fn bytes(&self, lanes: u32) -> u64 {
-        let lanes = if self.max_lanes == 0 {
+        let members = if self.live == 0 {
             lanes
         } else {
-            lanes.min(self.max_lanes)
+            lanes.min(self.live)
         };
-        self.fixed
-            .saturating_add(u64::from(lanes).saturating_mul(self.a_lane))
+        let laid = self.laid.of(u64::from(members));
+        let laid = if self.max_lanes == 0 {
+            laid
+        } else {
+            laid.min(u64::from(self.max_lanes))
+        };
+        self.fixed.saturating_add(laid.saturating_mul(self.a_lane))
     }
 }
 
@@ -694,11 +697,11 @@ impl SlotPool {
             })
     }
 
-    /// The chunks the fire terms take at a rung of `tokens`: a flight of
-    /// `min(tokens, max_lanes)` lanes, laid for the power of two over them
-    /// ([`flight_lanes`]), each program's own cap taken.
+    /// The chunks the fire terms take at a rung of `tokens`: a fire of
+    /// `min(tokens, max_lanes)` lanes, each term counting the lanes its
+    /// engine lays for the members it has in it ([`FireTerm::bytes`]).
     fn fire_chunks(&self, tokens: u32) -> u32 {
-        let lanes = flight_lanes(tokens.min(self.max_lanes));
+        let lanes = tokens.min(self.max_lanes);
         let bytes = self
             .fire
             .iter()
@@ -724,6 +727,12 @@ impl SlotPool {
     /// The most lanes a fire carries: the engine's `FireLimits::max_lanes`.
     pub fn set_max_lanes(&mut self, lanes: u32) {
         self.max_lanes = lanes.max(1);
+    }
+
+    /// See [`Self::set_max_lanes`].
+    #[must_use]
+    pub fn max_lanes(&self) -> u32 {
+        self.max_lanes
     }
 
     /// The activation chunks set aside now.
