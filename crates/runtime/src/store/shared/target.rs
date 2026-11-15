@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use tokio::sync::Notify;
 
-use super::{RungStep, RungWalk, SegmentMove, Shared};
+use super::{GrowFor, RungStep, RungWalk, SegmentMove, Shared, SharedPool};
 use crate::governor::{Demand, Growth, PATIENCE, PoolTarget, Retarget};
 use crate::scheduler::worker::PoolOp;
 use crate::store::registry;
@@ -38,6 +38,14 @@ pub struct SharedGrow {
     /// The last raise found no room: none is tried again until room is
     /// freed ([`Self::room_freed`]), the one event that can change that.
     raise_blocked: Arc<AtomicBool>,
+    /// The planner waits on a grow this walk was told to make
+    /// ([`Self::promise_grow`]): a walk that ends with the promise standing
+    /// tells it no grow is coming ([`Self::no_grow`]).
+    grow_waiter: Arc<AtomicBool>,
+    /// What the walk tells when a promised grow does not come: the
+    /// planner's `no_grow`, whose plan then goes on to demote, sweep and
+    /// evict.
+    no_grow: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl SharedGrow {
@@ -69,7 +77,21 @@ impl SharedGrow {
                 u32::try_from(live).unwrap_or(u32::MAX)
             }),
             raise_blocked: Arc::new(AtomicBool::new(false)),
+            grow_waiter: Arc::new(AtomicBool::new(false)),
+            no_grow: Arc::new(move || {
+                if let Some(planner) = crate::planner::planner_for(model, engine) {
+                    planner.no_grow();
+                }
+            }),
         }
+    }
+
+    /// What the walk tells when a promised grow does not come; for a test.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_no_grow(mut self, no_grow: impl Fn() + Send + Sync + 'static) -> Self {
+        self.no_grow = Arc::new(no_grow);
+        self
     }
 
     /// A governor tick; for a test.
@@ -315,18 +337,43 @@ impl SharedGrow {
         self.wake.notify_one();
     }
 
-    /// Whether a segment below the top span is still uncommitted, under the
-    /// governor's target.
+    /// Whether the walk's next step for a live waiter maps a segment: the
+    /// same step the walk takes ([`SharedPool::grow_step`] toward
+    /// [`Self::goal`]), so a waiter told the pool grows never waits on a
+    /// grow the walk does not make. A span the lowered rung lends is no
+    /// such step (live state never opens in the top rung's span), nor a
+    /// segment the engine holds back, nor one past the goal.
     #[must_use]
     pub fn can_grow(&self) -> bool {
         let pool = self.shared.lock().unwrap();
-        let top = pool.pool().top_segment();
-        let next = pool.pool().prefix_segments();
-        // The next segment must be one the engine binds: one at or past
-        // what it holds back never commits, and a waiter told the pool
-        // grows would wait on it for good.
-        (next < top && pool.pool().backs(next) || pool.pool().span_to_commit().is_some())
-            && pool.mapped_segments() < self.target.load(Ordering::Acquire)
+        pool.grow_step(self.goal_in(&pool), GrowFor::Live).is_some()
+    }
+
+    /// The walk's next grow step for a live waiter; for a test.
+    #[cfg(test)]
+    pub(crate) fn live_step_for_test(&self) -> Option<super::GrowStep> {
+        let pool = self.shared.lock().unwrap();
+        pool.grow_step(self.goal_in(&pool), GrowFor::Live)
+    }
+
+    /// Promises a waiter a grow where [`Self::can_grow`]: the walk is woken
+    /// to make it, and a walk that ends without mapping a segment since
+    /// tells the planner no grow is coming. False, promising nothing,
+    /// where the next step maps nothing.
+    #[must_use]
+    pub fn promise_grow(&self) -> bool {
+        if !self.can_grow() {
+            return false;
+        }
+        self.grow_waiter.store(true, Ordering::Release);
+        self.wake();
+        true
+    }
+
+    /// Whether a promised grow stands; for a test.
+    #[cfg(test)]
+    pub(crate) fn grow_promised(&self) -> bool {
+        self.grow_waiter.load(Ordering::Acquire)
     }
 
     /// Starts moving; the scheduler that takes the moves is up.
@@ -355,31 +402,14 @@ impl SharedGrow {
     }
 
     fn goal(&self) -> u32 {
-        let pinned = pinned_segments();
-        let target = pinned.unwrap_or_else(|| self.target.load(Ordering::Acquire));
         let pool = self.shared.lock().unwrap();
-        let mapped = pool.mapped_segments();
-        if pinned.is_some() {
-            return target;
-        }
-        if target <= mapped {
-            return target;
-        }
-        let short = pool
-            .pool()
-            .demand()
-            .wanted
-            .saturating_sub(pool.pool().demand().live);
-        let ahead = pool.ahead_target(short);
-        tracing::trace!(
-            target,
-            mapped,
-            short,
-            ahead,
-            headroom = pool.pool().headroom(),
-            "segment goal"
-        );
-        target.min(ahead)
+        self.goal_in(&pool)
+    }
+
+    /// [`Self::goal`] of `pool`, held: the test pin as it stands, else the
+    /// governor's target as [`SharedPool::walk_goal`] meets it.
+    fn goal_in(&self, pool: &SharedPool) -> u32 {
+        pinned_segments().unwrap_or_else(|| pool.walk_goal(self.target.load(Ordering::Acquire)))
     }
 
     /// Walks each time something it waits on happens: a retarget or a
@@ -398,8 +428,20 @@ impl SharedGrow {
     }
 
     /// Steps toward the goal until there, or until a move has to wait.
-    async fn walk(&self) {
+    /// A grow promised a waiter and not made by the walk's end (its next
+    /// step maps nothing, or the engine refused it) is told to the planner
+    /// as no grow: its plan goes on to demote, sweep and evict on that
+    /// event, never on a clock.
+    pub(crate) async fn walk(&self) {
         self.walk_rung().await;
+        self.walk_segments().await;
+        if self.grow_waiter.swap(false, Ordering::AcqRel) {
+            tracing::debug!(engine = self.engine, "a promised grow maps nothing");
+            (self.no_grow)();
+        }
+    }
+
+    async fn walk_segments(&self) {
         loop {
             let goal = self.goal();
             let (current, retired) = self.epochs();
@@ -434,6 +476,11 @@ impl SharedGrow {
             let evacuating = matches!(op, PoolOp::Evacuate(_));
             match crate::scheduler::pool(self.engine, op).await {
                 Ok(()) => {
+                    // A segment mapped: what was promised a waiter is
+                    // kept, and `pages_freed` wakes the planner.
+                    if commit.is_some() || span.is_some() {
+                        self.grow_waiter.store(false, Ordering::Release);
+                    }
                     if let Some(n) = span {
                         self.shared.lock().unwrap().span_committed(n);
                         if let Some(planner) = crate::planner::planner_for(self.model, self.engine)
@@ -551,6 +598,8 @@ mod tests {
         // The ceiling one chunk short of the next segment's end.
         let held = top - (next_end - 1);
         pool.hold_back(u64::from(held) * pool.pool().chunk_bytes());
+        // A waiter short of room, as `can_grow` is asked by one.
+        pool.pool_mut().wait(1, 0, 1024);
         let shared: Shared = Arc::new(std::sync::Mutex::new(pool));
         let mut grow = SharedGrow::new(0, 58, shared.clone());
         let _ = grow.retarget(u64::from(u32::MAX));

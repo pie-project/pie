@@ -642,6 +642,53 @@ mod programs;
 mod span;
 mod tiers;
 
+/// What a grow waiter is short of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Short {
+    /// Kv pages: the list shape's slots.
+    Kv,
+    /// State: a record's pieces.
+    State,
+}
+
+/// For the walk's and the planner's tests: an on-demand pool at the largest
+/// rung, the engine told, its prefix committed whole (`prefix_whole`) or as
+/// loaded, every record held. With `lent`, the 256 rung lends span no
+/// segment backs; without, what the rung lends is backed already.
+pub(crate) fn grow_pool(prefix_whole: bool, lent: bool) -> SharedPool {
+    let (mut pool, mut engine) = span::on_demand_pool();
+    if prefix_whole {
+        assert_eq!(
+            walk_segments(&mut pool, 6, 0, &mut engine),
+            Retarget::Reached
+        );
+        assert_eq!(pool.pool().prefix_segments(), 6, "the prefix whole");
+    }
+    if lent {
+        pool.lower_rung(256).unwrap();
+    } else {
+        while let Some(n) = pool.pool().span_to_commit() {
+            pool.span_committed(n);
+        }
+    }
+    let records = pool.records_available() as usize;
+    pool.take_records(records).unwrap();
+    pool
+}
+
+/// Registers a waiter on `pool` short of `short`, well past what commits
+/// ahead.
+pub(crate) fn wait_short(pool: &mut SharedPool, short: Short) {
+    match short {
+        Short::Kv => pool.pool_mut().wait(1, 0, 1024),
+        Short::State => {
+            let shape = pool.fixed()[0];
+            pool.pool_mut()
+                .wait(1, shape.pool, 64 * u64::from(shape.pieces));
+        }
+    }
+}
+
 /// SPEC decision 6, the governor's rung shrink: under critical pressure the
 /// walk caps fires to the smaller rung first, lowers the pool's rung only
 /// once the scheduler has no wider step in flight and every fire handed out

@@ -24,6 +24,14 @@ pub struct PlannerStats {
     pub salvages: AtomicU64,
     pub e6_relaxations: AtomicU64,
     pub restore_absorb_short: AtomicU64,
+    /// Plans that ended waiting on a grow the segment walk was promised.
+    pub grow_waits: AtomicU64,
+    /// The unmet waiters behind the last plan's wait on a grow; 0 where it
+    /// did not end on one.
+    pub grow_parked: AtomicU64,
+    /// Walks that ended without the grow they promised
+    /// ([`super::ResidencyPlanner::no_grow`]).
+    pub no_grows: AtomicU64,
     pub host_swap_exhaustions: AtomicU64,
     pub host_swap_unblocks: AtomicU64,
     pub d2h_pages: AtomicU64,

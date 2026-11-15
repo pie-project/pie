@@ -384,6 +384,24 @@ fn pressure_round(
     (Vec::new(), discarded)
 }
 
+/// Per tier, the episode in which the default responder finds nothing left
+/// to discard: said once as it starts and once as it ends.
+static NOTHING_LEFT: std::sync::Mutex<[process::WaitEpisode; 2]> =
+    std::sync::Mutex::new([process::WaitEpisode::new(), process::WaitEpisode::new()]);
+
+/// Ends `tier`'s nothing-left episode, if one is under way, saying how long
+/// it ran and why it ended.
+fn nothing_left_ends(tier: Tier, why: &'static str) {
+    if let Some(lasted) = NOTHING_LEFT.lock().unwrap()[tier.index()].end() {
+        tracing::info!(
+            tier = tier.name(),
+            lasted_ms = lasted.as_millis() as u64,
+            why,
+            "tier pressure: the waiters no longer wait on the governor alone"
+        );
+    }
+}
+
 /// The default tier-pressure responder (see [`pressure::choose`]): for each
 /// pressed tier, discards working sets lowest retention key first until what
 /// they free covers the shortfall. Policy-layer code with the policy's own
@@ -393,6 +411,7 @@ fn respond(registry: &Registry, pressed: &[Tier], keys: &dyn retention::Keys) ->
     for &tier in pressed {
         let short = registry.pressure[tier.index()].short;
         if short == 0 {
+            nothing_left_ends(tier, "the tier is short no more");
             continue;
         }
         let candidates = registry
@@ -403,12 +422,23 @@ fn respond(registry: &Registry, pressed: &[Tier], keys: &dyn retention::Keys) ->
             .collect();
         let chosen = pressure::choose(candidates, short);
         if chosen.is_empty() {
-            tracing::warn!(
-                tier = tier.name(),
-                short,
-                "tier pressure: nothing is left to discard; the waiters wait on the governor"
-            );
+            // Said once an episode, as it starts; its repeats at DEBUG.
+            if NOTHING_LEFT.lock().unwrap()[tier.index()].seen() {
+                tracing::info!(
+                    tier = tier.name(),
+                    short,
+                    "tier pressure: nothing is left to discard; the waiters wait on the governor"
+                );
+            } else {
+                tracing::debug!(
+                    tier = tier.name(),
+                    short,
+                    "tier pressure: still nothing left to discard"
+                );
+            }
             pressure::answered_nothing(tier);
+        } else {
+            nothing_left_ends(tier, "a working set is discarded");
         }
         for id in chosen {
             let Ok(owner) = ProcessId::from_str(&id) else {

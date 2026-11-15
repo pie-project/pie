@@ -180,9 +180,40 @@ pub(crate) fn execution_slot_capacity() -> Option<usize> {
 /// so, and again after each such span.
 const STEP_SAYS_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Awaits `step`, saying every [`STEP_SAYS_AFTER`] that process `pid` still
-/// waits at `stage`: what a stall on the way from a process to the lane is
-/// read from (seats, bind, plan, enqueue). Outside a runtime it only awaits.
+/// A wait said once an episode: at INFO when it is first known, at DEBUG
+/// while it repeats, and at INFO again as it ends, with how long it ran.
+#[derive(Debug, Default)]
+pub(crate) struct WaitEpisode {
+    since: Option<Instant>,
+}
+
+impl WaitEpisode {
+    pub(crate) const fn new() -> Self {
+        Self { since: None }
+    }
+
+    /// The wait is seen now: true the first time in its episode, the one
+    /// said at INFO.
+    pub(crate) fn seen(&mut self) -> bool {
+        if self.since.is_some() {
+            return false;
+        }
+        self.since = Some(Instant::now());
+        true
+    }
+
+    /// The wait is over: how long since its episode was first seen, `None`
+    /// where none was under way (nothing to say).
+    pub(crate) fn end(&mut self) -> Option<std::time::Duration> {
+        self.since.take().map(|since| since.elapsed())
+    }
+}
+
+/// Awaits `step`, saying once [`STEP_SAYS_AFTER`] has passed that process
+/// `pid` waits at `stage` (each span after that at DEBUG), and once more as
+/// the wait ends, with its duration: what a stall on the way from a process
+/// to the lane is read from (seats, bind, plan, enqueue). Outside a runtime
+/// it only awaits.
 pub(crate) async fn said<F: std::future::Future>(
     stage: &'static str,
     pid: ProcessId,
@@ -193,14 +224,31 @@ pub(crate) async fn said<F: std::future::Future>(
     }
     tokio::pin!(step);
     let started = Instant::now();
+    let mut episode = WaitEpisode::default();
     loop {
         match crate::rt::time::timeout(STEP_SAYS_AFTER, &mut step).await {
-            Ok(output) => return output,
-            Err(_) => tracing::warn!(
+            Ok(output) => {
+                if episode.end().is_some() {
+                    tracing::info!(
+                        stage,
+                        %pid,
+                        waited_ms = started.elapsed().as_millis() as u64,
+                        "a process waited on its way to a fire"
+                    );
+                }
+                return output;
+            }
+            Err(_) if episode.seen() => tracing::info!(
                 stage,
                 %pid,
                 waited_s = started.elapsed().as_secs(),
                 "a process waits on its way to a fire"
+            ),
+            Err(_) => tracing::debug!(
+                stage,
+                %pid,
+                waited_s = started.elapsed().as_secs(),
+                "a process still waits on its way to a fire"
             ),
         }
     }
@@ -1147,6 +1195,22 @@ pub(crate) mod probe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A wait is said at INFO once as its episode starts, not on repeats,
+    /// and once as it ends; the next wait is a new episode.
+    #[test]
+    fn a_wait_is_said_once_as_it_starts_and_once_as_it_ends() {
+        let mut episode = WaitEpisode::new();
+        assert!(episode.end().is_none(), "no episode: nothing to end");
+        assert!(episode.seen(), "the first sight is said");
+        assert!(!episode.seen(), "a repeat is not");
+        assert!(
+            episode.end().is_some(),
+            "the end is said, with its duration"
+        );
+        assert!(episode.end().is_none(), "once");
+        assert!(episode.seen(), "a new episode is said again");
+    }
 
     fn idle(process_id: ProcessId, client_pid: ProcessId, result_tx: SharedResultTx) -> Process {
         Process {

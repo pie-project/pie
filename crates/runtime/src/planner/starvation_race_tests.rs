@@ -36,6 +36,10 @@ struct RacePool {
     host_total: u32,
     // A registered model whose RS store backs the slot calls.
     rs_model: Option<usize>,
+    /// A shared pool's segment walk the planner's grow asks, as
+    /// `RegistryPool`'s does: the waiter registered short, then promised a
+    /// grow only where the walk's next step maps a segment.
+    grow: Option<crate::store::shared::SharedGrow>,
 }
 
 impl RacePool {
@@ -48,6 +52,7 @@ impl RacePool {
             pulls: parking_lot::Mutex::new(Vec::new()),
             host_total: 0,
             rs_model: None,
+            grow: None,
         }
     }
 
@@ -75,6 +80,18 @@ impl RacePool {
 }
 
 impl PoolPort for RacePool {
+    fn grow(&self, need: Demand) -> bool {
+        let Some(grow) = &self.grow else {
+            return false;
+        };
+        let short = if need.kv_pages > 0 {
+            crate::store::shared::tests::Short::Kv
+        } else {
+            crate::store::shared::tests::Short::State
+        };
+        crate::store::shared::tests::wait_short(&mut grow.shared().lock().unwrap(), short);
+        grow.promise_grow()
+    }
     fn chunk_stats(&self) -> ChunkStats {
         ChunkStats {
             pages: (self.free.lock().len() as u32, self.total),
@@ -2201,4 +2218,132 @@ async fn a_bind_by_a_suspended_process_waits_for_its_restore() {
         .expect("the decode bind lands once it is restored");
     assert_eq!(attempts.get(), 2, "bound again once, after the restore");
     assert_eq!(engine.borrow().bindings.len(), 2);
+}
+
+/// A pool whose segment walk is `grow` over `pool`, the planner's grow
+/// asking it; the device dry, a host to evict to, and a head short one page
+/// with younger residents behind it. The head's entry key.
+fn short_of_a_grow(
+    pool: crate::store::shared::SharedPool,
+    target: u32,
+) -> (
+    Arc<ResidencyPlanner>,
+    crate::store::shared::SharedGrow,
+    EntryKey,
+) {
+    use crate::governor::PoolTarget;
+    let shared: crate::store::shared::Shared = Arc::new(std::sync::Mutex::new(pool));
+    let planner_cell: Arc<std::sync::OnceLock<std::sync::Weak<ResidencyPlanner>>> = Arc::default();
+    let told = planner_cell.clone();
+    let mut grow = crate::store::shared::SharedGrow::new(0, 44, shared).with_no_grow(move || {
+        if let Some(planner) = told.get().and_then(std::sync::Weak::upgrade) {
+            planner.no_grow();
+        }
+    });
+    let _ = grow.retarget(u64::from(target));
+    let port = RacePool {
+        grow: Some(grow.clone()),
+        ..RacePool::with_swap(4, 64)
+    };
+    let planner = Arc::new(ResidencyPlanner::new(Arc::new(port)));
+    planner_cell.set(Arc::downgrade(&planner)).unwrap();
+    let key = planner.with_inner(|inner| {
+        let mut keys = Vec::new();
+        for _ in 0..3 {
+            let pid = ProcessId::new_v4();
+            let seq = inner.next_seq;
+            inner.next_seq += 1;
+            let mut proc = Proc::new(seq);
+            proc.admitted = true;
+            inner.procs.insert(pid, proc);
+            keys.push(pid);
+        }
+        inner.enqueue(
+            keys[0],
+            allocation(Demand {
+                kv_pages: 1,
+                rs: RsUnits::default(),
+            }),
+        )
+    });
+    (planner, grow, key)
+}
+
+/// Whether the plan went on to `plan_eviction` for the head `key`: the
+/// eviction rung deferred, a move started, or the head noted short for the
+/// policy (nothing the planner may move covers it).
+fn reached_eviction(planner: &ResidencyPlanner, key: EntryKey) -> bool {
+    planner.stats.eviction_deferrals.load(Ordering::Relaxed) > 0
+        || planner.stats.evictions_started.load(Ordering::Relaxed) > 0
+        || planner.short.lock().worst(key.1).is_some()
+}
+
+/// Mac's over-demand stall reworked (Metal, M1, Qwen3-0.6B, 64 single-lane
+/// requests, 0 of 539 pages free, 0 evictions for good): the prefix whole
+/// and a lowered rung lending span no segment backs, a head short of room
+/// gets an eviction plan, and nothing waits on a span commit. Before, the
+/// planner was told the pool grows (the lent span) while the walk's goal
+/// stopped at the prefix, so the plan returned on the grow and never
+/// reached `plan_eviction`.
+#[tokio::test(flavor = "current_thread")]
+async fn a_head_short_beside_an_unbacked_lent_span_gets_an_eviction_plan() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = crate::store::shared::tests::grow_pool(true, true);
+    assert_eq!(
+        pool.pool().span_to_commit(),
+        Some(1),
+        "a span lent, unbacked"
+    );
+    let (planner, grow, key) = short_of_a_grow(pool, u32::MAX);
+    planner.plan();
+    assert_eq!(
+        planner.stats.grow_waits.load(Ordering::Relaxed),
+        0,
+        "no plan waits on a grow"
+    );
+    assert!(!grow.grow_promised(), "nothing promised");
+    assert!(
+        reached_eviction(&planner, key),
+        "the head is funded by eviction"
+    );
+    let shared = grow.shared().clone();
+    let goal = grow.goal_for_test();
+    assert!(
+        !matches!(
+            shared.lock().unwrap().next_move(goal, 1),
+            Some(crate::store::shared::SegmentMove::CommitSpan { .. })
+        ),
+        "and the walk backs no span"
+    );
+}
+
+/// A grow the plan waits on that the walk does not make (the governor
+/// lowered its target since the promise) wakes the planner with no grow,
+/// and that plan goes on past the grow to eviction, on the event alone.
+#[tokio::test(flavor = "current_thread")]
+async fn a_grow_the_walk_does_not_make_wakes_the_plan_into_eviction() {
+    use crate::governor::PoolTarget;
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = crate::store::shared::tests::grow_pool(false, false);
+    let mapped = pool.mapped_segments();
+    let (planner, mut grow, key) = short_of_a_grow(pool, u32::MAX);
+    planner.plan();
+    assert_eq!(planner.stats.grow_waits.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        planner.diagnostics().grow_parked,
+        1,
+        "the head parks behind the grow"
+    );
+    assert!(grow.grow_promised());
+    assert!(!reached_eviction(&planner, key), "waiting on the grow");
+    let _ = grow.retarget(u64::from(mapped));
+    grow.walk().await;
+    let d = planner.diagnostics();
+    assert_eq!(d.no_grows_total, 1, "the walk told no grow");
+    assert_eq!(
+        d.grow_waits_total, 1,
+        "and the plan it woke did not wait again"
+    );
+    assert_eq!(d.grow_parked, 0);
+    assert!(reached_eviction(&planner, key), "it went on to eviction");
 }

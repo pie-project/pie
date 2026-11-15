@@ -9,7 +9,7 @@
 //! activation 52..64.
 
 use super::*;
-use crate::governor::PATIENCE;
+use crate::governor::{PATIENCE, PoolTarget};
 use crate::store::shared::programs::{Mover, take_raise};
 
 /// The engine's lane as a raise meets it: the fake engine, shared.
@@ -53,7 +53,7 @@ fn loaded_on_demand() -> (SharedPool, FakeEngine) {
 
 /// An on-demand pool raised to the largest rung, as a first wide pass
 /// takes it (the engine told), nothing held yet.
-fn on_demand_pool() -> (SharedPool, FakeEngine) {
+pub(super) fn on_demand_pool() -> (SharedPool, FakeEngine) {
     let (mut pool, engine) = loaded_on_demand();
     let evacuation = pool.plan_raise(2048).unwrap();
     assert_eq!(
@@ -612,4 +612,129 @@ fn a_refused_commit_span_is_asked_again_only_once_room_is_freed() {
         pool.next_move(7, 3),
         Some(SegmentMove::CommitSpan { n: 1 })
     ));
+}
+
+/// `can_grow` is whether the walk's next step maps a segment, by the one
+/// function both take ([`SharedPool::grow_step`]), over every pool state
+/// the stall could stand in: the prefix whole or not, a span lent or not,
+/// a span commit refused or not, the target above what is mapped or at it,
+/// and a waiter short of kv, of state, or none. Spelled out apart from the
+/// code: a live waiter grows only into the prefix, under a target above it,
+/// and the lent span is never its step.
+#[test]
+fn can_grow_is_whether_the_walk_s_next_step_maps_a_segment() {
+    const ENGINE: usize = 46;
+    let waiters = [None, Some(Short::Kv), Some(Short::State)];
+    let mut cases = 0;
+    for prefix_whole in [false, true] {
+        for lent in [false, true] {
+            for blocked in [false, true] {
+                for below in [false, true] {
+                    for waiter in waiters {
+                        let case = format!(
+                            "prefix_whole={prefix_whole} lent={lent} blocked={blocked} \
+                             below={below} waiter={waiter:?}"
+                        );
+                        let mut pool = grow_pool(prefix_whole, lent);
+                        assert_eq!(pool.pool().span_to_commit().is_some(), lent, "{case}");
+                        pool.block_span_commit(blocked);
+                        if let Some(short) = waiter {
+                            wait_short(&mut pool, short);
+                        }
+                        let mapped = pool.mapped_segments();
+                        let shared: Shared = Arc::new(Mutex::new(pool));
+                        let mut grow = SharedGrow::new(0, ENGINE, shared.clone());
+                        let target = if below { u32::MAX } else { mapped };
+                        let _ = grow.retarget(u64::from(target));
+                        let can = grow.can_grow();
+                        let goal = grow.goal_for_test();
+                        let step = shared.lock().unwrap().next_move(goal, 1);
+                        let maps = matches!(
+                            step,
+                            Some(SegmentMove::Commit { .. } | SegmentMove::CommitSpan { .. })
+                        );
+                        assert_eq!(can, grow.live_step_for_test().is_some(), "{case}");
+                        if waiter.is_some() {
+                            assert_eq!(can, maps, "{case}: can_grow is the walk's own step");
+                            assert_eq!(can, below && !prefix_whole, "{case}");
+                        } else {
+                            let pool = shared.lock().unwrap();
+                            assert_eq!(
+                                maps,
+                                pool.grow_step(goal, GrowFor::Target).is_some(),
+                                "{case}: the walk takes the step for no waiter"
+                            );
+                        }
+                        assert!(
+                            !matches!(step, Some(SegmentMove::CommitSpan { .. })),
+                            "{case}: nothing the walk goes toward backs the lent span"
+                        );
+                        cases += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(cases, 48);
+}
+
+/// Mac's over-demand stall (Metal, the span backed on demand): the prefix
+/// whole and a lowered rung lending span no segment backs, a live waiter
+/// short of room is told the pool does not grow, and the walk backs no span
+/// for it, so the planner goes on to demote, sweep and evict. Before,
+/// `can_grow` said yes for the lent span while the walk's goal stopped at
+/// the prefix: the planner waited on a grow that never came, and nothing
+/// was ever evicted.
+#[test]
+fn a_live_waiter_beside_an_unbacked_lent_span_is_told_the_pool_does_not_grow() {
+    const ENGINE: usize = 48;
+    for short in [Short::Kv, Short::State] {
+        let mut pool = grow_pool(true, true);
+        assert_eq!(pool.pool().span_to_commit(), Some(1));
+        wait_short(&mut pool, short);
+        let mapped = pool.mapped_segments();
+        let shared: Shared = Arc::new(Mutex::new(pool));
+        let mut grow = SharedGrow::new(0, ENGINE, shared.clone());
+        let _ = grow.retarget(u64::from(u32::MAX));
+        assert!(!grow.can_grow(), "{short:?}: no step maps a segment");
+        assert!(!grow.promise_grow(), "{short:?}: so nothing is promised");
+        assert_eq!(grow.goal_for_test(), mapped, "{short:?}: the prefix");
+        assert_eq!(
+            shared.lock().unwrap().next_move(mapped, 1),
+            None,
+            "{short:?}: and the walk backs no span"
+        );
+    }
+}
+
+/// A grow promised a waiter that the walk does not make (here the governor
+/// lowered its target since) is told as no grow when the walk ends, once;
+/// a walk with nothing promised tells nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn a_promised_grow_the_walk_does_not_make_is_told_as_no_grow() {
+    const ENGINE: usize = 45;
+    let mut pool = grow_pool(false, false);
+    wait_short(&mut pool, Short::Kv);
+    let mapped = pool.mapped_segments();
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    let told = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let counted = told.clone();
+    let mut grow = SharedGrow::new(0, ENGINE, shared.clone()).with_no_grow(move || {
+        counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    });
+    let _ = grow.retarget(u64::from(u32::MAX));
+    assert!(grow.promise_grow(), "the prefix grows");
+    assert!(grow.grow_promised());
+    let _ = grow.retarget(u64::from(mapped));
+    assert!(!grow.can_grow(), "the target stands at what is mapped");
+    grow.walk().await;
+    assert_eq!(told.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert!(!grow.grow_promised(), "told once");
+    assert_eq!(shared.lock().unwrap().mapped_segments(), mapped);
+    grow.walk().await;
+    assert_eq!(
+        told.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "nothing promised: nothing told"
+    );
 }
