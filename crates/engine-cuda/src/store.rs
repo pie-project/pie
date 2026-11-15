@@ -753,7 +753,7 @@ impl Pools {
     #[allow(clippy::too_many_arguments)]
     pub fn reserve(
         device: i32,
-        allowance: engine::Allowance,
+        ceiling: u64,
         trace: &Trace,
         paging: Paging,
         budget: Option<u64>,
@@ -765,7 +765,7 @@ impl Pools {
         rows: bool,
         one_window: bool,
     ) -> Result<Pools> {
-        let pool = PhysicalPool::open(device, allowance)?;
+        let pool = PhysicalPool::open(device, ceiling)?;
         let layout = lay(
             trace,
             &paging,

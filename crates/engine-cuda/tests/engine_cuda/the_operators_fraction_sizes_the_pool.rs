@@ -1,6 +1,6 @@
 use engine::Allowance;
 use engine_cuda::device::elastic::map_unit_for;
-use engine_cuda::device::elastic::{budget_bytes, safety_floor_bytes};
+use engine_cuda::device::elastic::{budget_bytes, ceiling_of, room_under, safety_floor_bytes};
 use engine_cuda::store::kv::Paging;
 use engine_cuda::store::{
     Accounting, BODIES_FLOOR_BYTES, bodies_allowance, decoded_weight_reserve, holds_within,
@@ -15,6 +15,7 @@ const WEIGHTS: u64 = 13_761_281_792;
 fn the_operators_fraction_sizes_the_pool_every_case() {
     the_share_is_of_the_card_and_charges_what_is_already_on_it();
     a_stated_budget_caps_what_the_load_takes();
+    a_stated_budget_counts_the_weights_the_load_took();
     the_card_does_not_hold_a_deployment_whose_weights_leave_no_context();
     the_reservations_scale_to_a_twenty_four_gigabyte_card();
     the_decoded_weight_tiles_are_held_out_of_the_pool();
@@ -371,6 +372,65 @@ fn a_stated_budget_caps_what_the_load_takes() {
         budget_bytes(free, CARD, Allowance::WHOLE),
         "past it, the share stands"
     );
+}
+
+fn a_stated_budget_counts_the_weights_the_load_took() {
+    const BEFORE: u64 = 3 << 30;
+    const BUDGET: u64 = 20 << 30;
+    let floor = safety_floor_bytes(CARD);
+    let share = (CARD as f64 * engine::load::DEVICE_SHARE) as u64;
+    let stated = Allowance {
+        budget: Some(BUDGET),
+    };
+    // The ceiling is resolved once, on the card as the load found it.
+    let ceiling = ceiling_of(CARD, BEFORE, stated);
+    assert_eq!(ceiling, BEFORE + BUDGET);
+    assert_eq!(
+        room_under(ceiling, CARD - BEFORE, CARD),
+        budget_bytes(CARD - BEFORE, CARD, stated),
+        "before the load takes anything, the room is the budget's"
+    );
+    // The pool opens with the weights resident: they are inside the budget.
+    let free = CARD - BEFORE - WEIGHTS;
+    assert_eq!(
+        room_under(ceiling, free, CARD),
+        BUDGET - WEIGHTS - floor,
+        "the pool has what the budget leaves past the weights"
+    );
+    assert_eq!(
+        budget_bytes(free, CARD, stated),
+        BUDGET - floor,
+        "resolved with the weights resident, the budget would be counted past them"
+    );
+    assert_eq!(
+        room_under(ceiling, CARD - BEFORE - BUDGET, CARD),
+        0,
+        "a load holding its budget has no room"
+    );
+    assert_eq!(
+        ceiling_of(
+            CARD,
+            BEFORE,
+            Allowance {
+                budget: Some(u64::MAX)
+            }
+        ),
+        share,
+        "a budget past the share leaves the share"
+    );
+
+    // With no budget the ceiling is the share whenever it is resolved, and
+    // every reading under it is the room the allowance states then.
+    for held in [0, BEFORE, BEFORE + WEIGHTS, CARD] {
+        assert_eq!(ceiling_of(CARD, held, Allowance::WHOLE), share);
+    }
+    let whole = ceiling_of(CARD, BEFORE, Allowance::WHOLE);
+    for free in [CARD, CARD - BEFORE, free, 1 << 30, 0] {
+        assert_eq!(
+            room_under(whole, free, CARD),
+            budget_bytes(free, CARD, Allowance::WHOLE)
+        );
+    }
 }
 
 fn the_card_does_not_hold_a_deployment_whose_weights_leave_no_context() {

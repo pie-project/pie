@@ -43,19 +43,24 @@ pub fn budget_bytes(free: u64, total: u64, allowance: engine::Allowance) -> u64 
         .saturating_sub(safety_floor_bytes(total))
 }
 
-/// What may be held on a card of `total` bytes in all, once `allowance` is
-/// resolved against the `held` bytes it had when the pool opened: a later
-/// reading's room is this less what the card then holds, so a stated budget
-/// counts what the load has taken since.
-#[cfg_attr(not(feature = "device"), allow(dead_code))]
-fn ceiling_of(total: u64, held: u64, allowance: engine::Allowance) -> u64 {
-    held.saturating_add(allowance.room(total, held))
+/// What a card of `total` bytes may hold in all while a load under
+/// `allowance` runs, resolved once against the `held` bytes it had when the
+/// load began: the device's share, and no more than a stated budget past
+/// what was held then. A later reading's room is this less what the card
+/// then holds ([`room_under`]), so a stated budget counts everything the
+/// load has taken since, its weights among it.
+#[must_use]
+pub fn ceiling_of(total: u64, held: u64, allowance: engine::Allowance) -> u64 {
+    let share = engine::Allowance::WHOLE.ceiling(total);
+    allowance
+        .budget
+        .map_or(share, |budget| share.min(held.saturating_add(budget)))
 }
 
 /// What may still be taken under `ceiling` of a card with `free` of
 /// `total` bytes free, past the driver's safety floor.
-#[cfg_attr(not(feature = "device"), allow(dead_code))]
-fn room_under(ceiling: u64, free: u64, total: u64) -> u64 {
+#[must_use]
+pub fn room_under(ceiling: u64, free: u64, total: u64) -> u64 {
     ceiling
         .min(total)
         .saturating_sub(total.saturating_sub(free))
@@ -86,13 +91,14 @@ pub struct PhysicalPool {
     held_pages: u64,
     committed_pages: u64,
     /// What the card may hold in all under the load's allowance, resolved
-    /// when the pool opened ([`ceiling_of`]).
+    /// when the load began ([`ceiling_of`]).
     #[cfg_attr(not(feature = "device"), allow(dead_code))]
     ceiling: u64,
 }
 
 impl PhysicalPool {
-    pub fn open(device: i32, allowance: engine::Allowance) -> Result<PhysicalPool> {
+    /// A pool of what `ceiling` ([`ceiling_of`]) leaves of the card now.
+    pub fn open(device: i32, ceiling: u64) -> Result<PhysicalPool> {
         #[cfg(feature = "device")]
         {
             use crate::device::rt;
@@ -102,7 +108,6 @@ impl PhysicalPool {
             // SAFETY: two live locals; the call only writes them.
             let asked = unsafe { rt::cudaMemGetInfo(&raw mut free, &raw mut total) };
             crate::device::ctx::check("cudaMemGetInfo", asked)?;
-            let ceiling = ceiling_of(total as u64, (total - free) as u64, allowance);
             let budget = room_under(ceiling, free as u64, total as u64);
             let handle_bytes = align_up(MAP_UNIT_BYTES.max(granularity), granularity);
             let pages = budget / LOGICAL_PAGE_BYTES;
@@ -120,7 +125,7 @@ impl PhysicalPool {
         }
         #[cfg(not(feature = "device"))]
         {
-            let _ = (device, allowance);
+            let _ = (device, ceiling);
             Err(Fault::Runtimeless)
         }
     }

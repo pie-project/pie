@@ -42,6 +42,10 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // SAFETY: the boot's communicator is held by the engine for the life of
     // the shell it loads.
     let mut device = Context::bind(boot.ordinal, unsafe { boot.comm.as_ref() })?;
+    // What the card may hold while this load runs, resolved here before the
+    // load takes anything: every later reading of its room is under it.
+    let (free, total) = crate::store::device_memory()?;
+    let ceiling = crate::device::elastic::ceiling_of(total, total - free, boot.allowance);
     let chip = match boot.knobs.chip.clone() {
         Some(chip) => chip,
         None => {
@@ -229,10 +233,9 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // bodies and the guests' programs have the other half; the token budget
     // halves toward its floor until they do, and the lattice follows.
     let (free, total) = crate::store::device_memory()?;
-    let after_weights =
-        crate::device::elastic::budget_bytes(free, total, boot.allowance).saturating_sub(
-            crate::store::weight_tier_bytes(&boot.trace, boot.residency.device_demand(), 0)?,
-        );
+    let after_weights = crate::device::elastic::room_under(ceiling, free, total).saturating_sub(
+        crate::store::weight_tier_bytes(&boot.trace, boot.residency.device_demand(), 0)?,
+    );
     let after_weights = held_beside(boot, after_weights)?;
     let facts = kv::probe(&boot.trace)?;
     let derive_voxels = boot
@@ -452,6 +455,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         anchored,
         asked,
         stated_buckets: !stated_buckets.is_empty(),
+        ceiling,
     })
 }
 
@@ -584,9 +588,10 @@ fn refit(
     table: &crate::run::WeightTable,
     engine: crate::chip::Engine,
     asked: &Budget,
+    ceiling: u64,
 ) -> Result<(CompiledModel, Budgets, Vec<u64>)> {
     let (free, total) = crate::store::device_memory()?;
-    let live = crate::device::elastic::budget_bytes(free, total, boot.allowance);
+    let live = crate::device::elastic::room_under(ceiling, free, total);
     let live = held_beside(boot, live)?;
     let facts = kv::probe(&boot.trace)?;
     let window = crate::store::window_of(&boot.trace)?;
@@ -767,6 +772,7 @@ impl Shell {
             anchored,
             asked,
             stated_buckets,
+            ceiling,
         } = bake(&mut boot)?;
         // What shapes this deployment's bodies, beside the engine build
         // the record's key carries ([`super::measured`]).
@@ -793,7 +799,7 @@ impl Shell {
         // could hold, the stated budget or the share of the card before the
         // weights land; `Pools::fit_the_card` sizes it within that.
         let pool_bytes = boot.kv_budget.unwrap_or_else(|| {
-            crate::device::elastic::budget_bytes(free_before, device_total, boot.allowance)
+            crate::device::elastic::room_under(ceiling, free_before, device_total)
         });
         let paging = Paging::of(
             boot.page_size,
@@ -914,6 +920,7 @@ impl Shell {
             weights.table(),
             engine,
             &asked,
+            ceiling,
         )?;
         let paging = paging
             .windowed(
@@ -1025,7 +1032,7 @@ impl Shell {
         let arena_bytes = compiled.arena.bytes.max(forked_bytes);
         let pools = Pools::reserve(
             device.ordinal(),
-            boot.allowance,
+            ceiling,
             &boot.trace,
             paging,
             boot.kv_budget,
@@ -2242,6 +2249,9 @@ pub(super) struct Baked {
     pub(super) asked: Budget,
     /// Whether the load stated its buckets (no default lattice to coarsen).
     pub(super) stated_buckets: bool,
+    /// What the card may hold in all under the load's allowance, resolved
+    /// before the load took anything (`elastic::ceiling_of`).
+    pub(super) ceiling: u64,
 }
 
 /// The widest fire whose lanes of `rows` prompt rows put no more (lane,
