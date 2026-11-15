@@ -1139,6 +1139,52 @@ fn a_segment_straddling_the_ceiling_is_never_mapped() {
     );
 }
 
+/// The room the planner counts is what can be backed: while the engine holds
+/// part of the range back, the list's slots are the chunks under the
+/// ceiling in segments the pool may map, as `bound_bytes` bounds them,
+/// plus what the smallest rung leaves of the span; a segment straddling the
+/// ceiling counts for nothing. Held on a segment boundary, exactly the held
+/// chunks go; held none, the room is the range's, as before.
+#[test]
+fn the_room_counts_only_what_can_be_backed_under_what_the_engine_holds() {
+    let mut pool = pool();
+    let act_start = TOTAL - pool.pool().act_max();
+    let top_start = pool.pool().top_segment() * SEGMENT;
+    let whole = pool.room();
+    let spc = pool.list().expect("a kv list").slots_per_chunk;
+    assert_eq!(whole.list_slots, whole.state_chunks * spc);
+
+    // Held: 19 chunks under the activation, the ceiling inside a segment.
+    let held: u32 = 19;
+    pool.hold_back(u64::from(held) * CHUNK);
+    let ceiling = pool.pool().ceiling();
+    assert_ne!(ceiling % SEGMENT, 0, "the ceiling straddles a segment");
+    assert!(ceiling < top_start);
+    let backable = ceiling / SEGMENT * SEGMENT;
+    // The same chunks the pool may map below the span.
+    let bound = pool.bound_bytes(u64::from(held) * CHUNK) / CHUNK;
+    assert_eq!(u64::from(backable), bound - u64::from(TOTAL - top_start));
+    let room = pool.room();
+    assert_eq!(
+        room.state_chunks,
+        whole.state_chunks - (act_start - backable),
+        "the held chunks and the straddled segment are no room"
+    );
+    assert_eq!(room.list_slots, room.state_chunks * spc);
+    assert!(room.list_slots < whole.list_slots);
+
+    // Negative control: held on a segment boundary, only the held chunks go.
+    pool.hold_back(u64::from(act_start - 2 * SEGMENT) * CHUNK);
+    assert_eq!(pool.pool().ceiling(), 2 * SEGMENT);
+    assert_eq!(
+        pool.room().state_chunks,
+        whole.state_chunks - (act_start - 2 * SEGMENT)
+    );
+    // Held none: the range's room, as before.
+    pool.hold_back(0);
+    assert_eq!(pool.room(), whole);
+}
+
 /// An engine's rung gate is its own whatever its id: the 65th engine a
 /// process registers is cut, granted and woken by its own gate, never by
 /// another engine's and never left uncapped.

@@ -1089,7 +1089,11 @@ impl SharedPool {
     /// How the device's chunks divide: what the reserved chunks, the
     /// activation and the weights' pinned slots (held, every atom;
     /// streaming, the staging floor) hold for good, and what is left
-    /// for kv and state. No eviction reaches below that.
+    /// for kv and state. No eviction reaches below that. What is left is
+    /// what can be backed, not the range: while the engine holds part of
+    /// the range back, the chunks it binds none of and the segments that
+    /// cannot be mapped whole are no room, so the planner's page total, its
+    /// past-the-pool refusal and its seating count only what can be backed.
     #[must_use]
     pub fn room(&self) -> PoolRoom {
         let pool = &self.pool;
@@ -1107,8 +1111,20 @@ impl SharedPool {
             })
             .sum();
         let act_chunks = pool.act_chunks(0);
-        let state_chunks = pool
-            .total_chunks()
+        // What state can ever be backed in, not the range: below the span,
+        // the chunks under what the engine binds that lie in segments the
+        // pool may map ([`Self::backable_below_span`]); in the span, what
+        // the smallest rung leaves, where it is backed while the engine
+        // holds anything back.
+        let span_backable = !pool.span_on_demand() || pool.ceiling() >= pool.total_chunks();
+        let lent = if span_backable {
+            pool.act_max()
+        } else {
+            act_chunks
+        };
+        let state_chunks = self
+            .backable_below_span()
+            .saturating_add(lent)
             .saturating_sub(pool.reserved_chunks())
             .saturating_sub(act_chunks)
             .saturating_sub(weight_chunks);
@@ -1124,6 +1140,26 @@ impl SharedPool {
                     .unwrap_or(u32::MAX)
             }),
             list_tokens: self.list.map_or(0, |list| list.tokens),
+        }
+    }
+
+    /// The chunks below the activation's span state can ever be backed in:
+    /// under the ceiling the engine binds below while it holds part of the
+    /// range back ([`Self::hold_back`]), and of those only the ones in
+    /// segments the pool may map, as [`Self::bound_bytes`] bounds them: a
+    /// segment under the top span that straddles the ceiling is never
+    /// committed, so its chunks under the ceiling count for nothing. The
+    /// whole of it up to the span where the engine holds none.
+    fn backable_below_span(&self) -> u32 {
+        let pool = &self.pool;
+        let act_start = pool.total_chunks().saturating_sub(pool.act_max());
+        let ceiling = pool.ceiling().min(act_start);
+        let seg = pool.segments().segment_chunks().max(1);
+        let top_start = pool.top_segment() * seg;
+        if ceiling >= top_start {
+            ceiling
+        } else {
+            ceiling / seg * seg
         }
     }
 
