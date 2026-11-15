@@ -138,7 +138,10 @@ pub trait Engine: Send {
 
     /// What a fire holding lanes of `program` bound at `extents` needs
     /// beside the model's activation, asked before the first bind of those
-    /// extents is sent. The default states none.
+    /// extents is sent. The facts are the pair's; what a rung backs is a
+    /// fire's ([`crate::GuestTerm`]): the worst fire of the rung's lanes
+    /// over the pairs bound, each paying for the members the fire gives it
+    /// and nothing where it gives none. The default states none.
     fn fire_facts(&self, program: ProgramId, extents: &BindExtents) -> Result<FireFacts> {
         let _ = (program, extents);
         Ok(FireFacts::default())

@@ -180,6 +180,10 @@ pub struct Plane {
     /// The (program, extents) pairs bound now, what a fire of each takes
     /// and the instances bound at it.
     pairs: Vec<(ProgramId, Extents, FireBytes, u32)>,
+    /// What a fire takes of its span for the pairs bound now, at every
+    /// count of lanes ([`Plane::fire_term`]): built when an instance is
+    /// bound or closed ([`Plane::fit_term`]), never in a fire.
+    term: engine::GuestTerm,
     /// How the last fire laid that span: each group's program, extents and
     /// lanes, in order. A fire that lays it the same finds its bind-time
     /// tables where it staged them.
@@ -203,9 +207,10 @@ pub struct FireBytes {
 /// tables staged again, whenever the lanes differ from the last lay
 /// (`launch::Prepared::lay`, and `Plane::fly`'s `laid`). A wave whose
 /// members come and go fire by fire stays in one layout at a power of two,
-/// where the exact count would build and stage the tables every fire. A
-/// pair's fire term counts the same lanes, here and in the runtime, so a
-/// fire never lays more than the term its rung backs.
+/// where the exact count would build and stage the tables every fire. The
+/// guest term counts the same lanes, here and in the runtime
+/// (`engine::GuestTerm`), so a fire never lays more than the term its rung
+/// backs.
 pub const LAID: engine::LaidLanes = engine::LaidLanes::PowerOfTwo;
 
 /// [`LAID`] over a flight's `members`.
@@ -219,6 +224,20 @@ impl FireBytes {
     #[must_use]
     pub fn at(&self, lanes: u32) -> u64 {
         self.fixed + u64::from(lanes.min(self.max_lanes)) * self.a_lane
+    }
+
+    /// The same as the engine states it to the runtime
+    /// (`engine::Engine::fire_facts`), laid as [`Plane::fly`] lays a
+    /// flight's members ([`LAID`]): what the guest term is counted from on
+    /// both sides.
+    #[must_use]
+    pub fn facts(&self) -> engine::FireFacts {
+        engine::FireFacts {
+            a_lane: self.a_lane,
+            fixed: self.fixed,
+            max_lanes: self.max_lanes,
+            laid: LAID,
+        }
     }
 }
 
@@ -248,6 +267,7 @@ impl Plane {
             span: (0, 0),
             fire_lanes: 0,
             pairs: Vec::new(),
+            term: engine::GuestTerm::default(),
             laid: Vec::new(),
         }
     }
@@ -267,6 +287,7 @@ impl Plane {
     /// The most lanes one fire carries.
     pub fn set_fire_lanes(&mut self, lanes: u32) {
         self.fire_lanes = lanes;
+        self.fit_term();
     }
 
     /// The fire in hand lays its programs in `span`: its end and the bytes
@@ -280,31 +301,61 @@ impl Plane {
 
     /// What a fire of `program_id` bound at `extents` takes of the fire's
     /// span: every stage's tables and scratch, a lane and fixed.
+    ///
+    /// The wave's own tables ride the same span and are stated in the
+    /// pair's `fixed`, whole: a row for every lane of the fire whatever
+    /// the flights it flies in (`Wave::lane_bytes`: 72 bytes a channel the
+    /// program names and 136 more, a member), and 320 bytes a fire for the
+    /// room they are aligned in. A fire lays that table once, whatever the
+    /// pairs in it, where the term counts it for every pair the fire
+    /// carries: an upper bound, over what the fire lays by `(pairs
+    /// carried − 1) ×` the table (14 pairs of 4 channels in a fire of 256
+    /// lanes: 13 × 108 864 bytes, 1.4 MB).
     pub fn fire_bytes(&self, program_id: ProgramId, extents: Extents) -> Result<FireBytes> {
         let program = self
             .programs
             .get(&program_id)
             .ok_or_else(|| Fault::program("program::plane", format!("no program {program_id}")))?;
         let mut bytes = fire_bytes(&program.stages(extents)?, self.flight);
-        // The wave's own tables ride the same span, a row for every lane of
-        // the fire whatever the flights it flies in: stated whole.
         let (lane, fixed) = Wave::lane_bytes(program.plan.package.channels.len());
         bytes.fixed += lane * u64::from(self.fire_lanes) + fixed + 256;
         Ok(bytes)
     }
 
-    /// What the fires of every pair bound now take of a fire's span, at
-    /// `lanes` lanes: the sum the runtime keeps free at a rung
-    /// (`engine::Engine::fire_facts`).
+    /// What a fire of up to `lanes` lanes takes of its span for the pairs
+    /// bound now, whichever of them its members are of: what the runtime
+    /// keeps free at a rung (`engine::Engine::fire_facts`,
+    /// `engine::GuestTerm`). A fire lays, for each pair it carries, a
+    /// flight as wide as the power of two over the pair's members in it
+    /// (`Plane::fly`), and nothing for a pair it carries none of; the term
+    /// is the worst such fire.
     #[must_use]
     pub fn fire_term(&self, lanes: u32) -> u64 {
-        // A pair flies no more lanes than it has instances bound, in
-        // flights as wide as the power of two over its members
-        // (`Plane::fly`): what it lays.
-        self.pairs
+        self.term.bytes(lanes)
+    }
+
+    /// Builds the term of the pairs bound now, for fires of up to the
+    /// fire's lanes (every lane count where none is set). It runs on the
+    /// engine's thread inside the bind or close that changed a pair's
+    /// count, and builds the table only where the change shows in it: a
+    /// pair's flights grow at 1, 2 and one past each power of two, so a
+    /// wave of binds builds it a few times a pair. What a build costs is
+    /// measured in `engine::GuestTerm` (30 pairs of 256 lanes: 39 - 53 us).
+    fn fit_term(&mut self) {
+        let pairs: Vec<engine::FirePair> = self
+            .pairs
             .iter()
-            .map(|(_, _, bytes, bound)| bytes.at(flight_lanes(lanes.min(*bound))))
-            .sum()
+            .map(|(_, _, bytes, bound)| engine::FirePair {
+                facts: bytes.facts(),
+                live: *bound,
+            })
+            .collect();
+        let most = if self.fire_lanes == 0 {
+            u32::MAX
+        } else {
+            self.fire_lanes
+        };
+        self.term.fit(&pairs, most);
     }
 
     /// An instance of `program_id` is bound at `extents`.
@@ -320,6 +371,7 @@ impl Plane {
                 self.pairs.push((program_id, extents, bytes, 1));
             }
         }
+        self.fit_term();
         Ok(())
     }
 
@@ -334,6 +386,7 @@ impl Plane {
             if self.pairs[at].3 == 0 {
                 self.pairs.remove(at);
             }
+            self.fit_term();
         }
     }
 
@@ -1227,6 +1280,7 @@ mod term_tests {
             for n in 1..=256 {
                 let mut plane = Plane::default();
                 plane.pairs.push((ProgramId(1), Extents::default(), bytes, n));
+                plane.fit_term();
                 // What `Plane::fly` lays for a group of `n` members.
                 let lays = bytes.at(flight_lanes(n).min(bytes.max_lanes).max(1));
                 assert_eq!(
@@ -1236,12 +1290,7 @@ mod term_tests {
                 );
                 // And what the runtime counts from the facts stated to it
                 // (`Session::fire_facts`) for `n` members.
-                let stated = engine::FireFacts {
-                    a_lane: bytes.a_lane,
-                    fixed: bytes.fixed,
-                    max_lanes: bytes.max_lanes,
-                    laid: LAID,
-                };
+                let stated = bytes.facts();
                 assert_eq!(
                     stated.bytes(u64::from(n)),
                     lays,
@@ -1256,5 +1305,62 @@ mod term_tests {
                 );
             }
         }
+    }
+
+    /// The term is a fire's, not a pair's. Fourteen pairs with 256 bound
+    /// each, in fires of 256 lanes: a fire lays a flight for each pair it
+    /// carries, as wide as the power of two over the pair's members in it
+    /// (`Plane::fly`), so no fire lays more than the worst split of its
+    /// 256 members does, and none lays fourteen fires' worth, which the
+    /// sum over pairs set aside.
+    #[test]
+    fn many_pairs_take_what_the_worst_fire_of_them_lays() {
+        let bytes = FireBytes {
+            a_lane: 455_990,
+            fixed: 1 << 20,
+            max_lanes: 256,
+        };
+        let mut plane = Plane::default();
+        plane.set_fire_lanes(256);
+        for pair in 1..=14 {
+            plane
+                .pairs
+                .push((ProgramId(pair), Extents::default(), bytes, 256));
+        }
+        plane.fit_term();
+        // What `Plane::fly` lays for groups of these members.
+        let lays = |groups: &[u32]| -> u64 {
+            groups
+                .iter()
+                .map(|&members| bytes.at(flight_lanes(members).min(bytes.max_lanes).max(1)))
+                .sum()
+        };
+        let term = plane.fire_term(256);
+        // The worst fire: every pair carried, and the members past one
+        // each (242) given so that the flights round up the most: 129, 65,
+        // 33, 17 and 3 members lay 256, 128, 64, 32 and 4 lanes, nine
+        // pairs of one member 9: 493 lanes for 256 members.
+        let worst = [129, 65, 33, 17, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1];
+        assert_eq!(worst.iter().sum::<u32>(), 256);
+        assert_eq!(lays(&worst), 14 * (1 << 20) + 493 * 455_990);
+        assert_eq!(term, lays(&worst));
+        for split in [
+            &[256][..],
+            &[129, 127],
+            &[65, 65, 65, 61],
+            &[33, 33, 33, 33, 33, 33, 33, 25],
+            &[19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 9],
+        ] {
+            assert!(split.iter().sum::<u32>() <= 256);
+            assert!(lays(split) <= term, "{split:?}");
+        }
+        // Pair by pair it was fourteen flights of 256: 1.65 GB for the
+        // 239 MB the worst fire lays.
+        assert_eq!(14 * bytes.at(256), 1_648_948_224);
+        assert_eq!(term, 239_483_134);
+        // A narrower rung's fire: 64 members, every pair carried.
+        let narrow = [33, 17, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1];
+        assert_eq!(narrow.iter().sum::<u32>(), 64);
+        assert_eq!(plane.fire_term(64), lays(&narrow));
     }
 }

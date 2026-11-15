@@ -7,6 +7,10 @@ use eta_ir::registry::GeometryClass;
 
 use crate::channel::ChannelSeed;
 
+mod term;
+
+pub use term::{FirePair, GuestTerm};
+
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
 )]
@@ -129,6 +133,8 @@ impl LaidLanes {
     pub fn of(self, members: u64) -> u64 {
         match self {
             LaidLanes::Exact => members,
+            // No member lays no lane (the power of two over 0 is 1).
+            LaidLanes::PowerOfTwo if members == 0 => 0,
             LaidLanes::PowerOfTwo => members.checked_next_power_of_two().unwrap_or(u64::MAX),
         }
     }
@@ -137,13 +143,24 @@ impl LaidLanes {
 /// What a fire holding lanes of a program bound at given extents needs
 /// beside the model's own activation (REDESIGN 2.4, §6): the per-batch
 /// tables and value scratch of the program's stage, sized by the binding's
-/// [`BindExtents`] (the same program at 256 and 4096 rows differs 16x). A
-/// fire of a rung of `r` tokens carries `m = min(r, FireLimits::max_lanes,
-/// the pair's bound instances)` members of it, laid as `l =
-/// min(laid.of(m), max_lanes)` lanes, and needs `fixed + l × a_lane` bytes
-/// for each (program, extents) bound that can be in it; the runtime folds
-/// the sum into the rung's activation ([`crate::Engine::fire_facts`]). A
-/// program registers after load, so `ChunkFacts` cannot state it.
+/// [`BindExtents`] (the same program at 256 and 4096 rows differs 16x).
+///
+/// The facts are a pair's, a (program, extents) bound; the term is a
+/// fire's. A fire of a rung of `r` tokens carries `min(r,
+/// FireLimits::max_lanes)` members in all, split among the pairs open. A
+/// pair given `m ≥ 1` of them (no more than its bound instances) is laid
+/// as `l = min(laid.of(m), max_lanes)` lanes and needs `fixed + l ×
+/// a_lane` bytes; a pair given none needs nothing, its `fixed` neither.
+/// The runtime sets aside, at every rung, what the worst such fire takes
+/// ([`GuestTerm`], [`crate::Engine::fire_facts`]), and an engine that
+/// backs its own carve counts the same, from the same function. A program
+/// registers after load, so `ChunkFacts` cannot state it.
+///
+/// `fixed` is charged to each pair a fire carries. An engine may charge to
+/// it a table it lays once a fire whatever the pairs in it (CUDA: its
+/// wave's rows): the term then counts that table once for every pair
+/// carried where the fire lays it once, an upper bound over what the fire
+/// lays by `(pairs carried − 1) ×` that table.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FireFacts {
     #[serde(default)]
@@ -176,9 +193,13 @@ impl FireFacts {
         }
     }
 
-    /// The bytes a fire of `members` instances needs for the program.
+    /// The bytes a fire of `members` instances needs for the program; a
+    /// fire that carries none of it needs none, its `fixed` neither.
     #[must_use]
     pub fn bytes(&self, members: u64) -> u64 {
+        if members == 0 {
+            return 0;
+        }
         self.fixed
             .saturating_add(self.lanes(members).saturating_mul(self.a_lane))
     }

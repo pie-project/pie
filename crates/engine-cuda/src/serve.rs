@@ -857,14 +857,7 @@ impl Shell {
         program: engine::ProgramId,
         extents: eta_exec::Extents,
     ) -> Result<engine::program::FireFacts> {
-        let bytes = self.programs.fire_bytes(program, extents)?;
-        Ok(engine::program::FireFacts {
-            a_lane: bytes.a_lane,
-            fixed: bytes.fixed,
-            max_lanes: bytes.max_lanes,
-            // What `Plane::fly` lays a flight's members for.
-            laid: crate::program::LAID,
-        })
+        Ok(self.programs.fire_bytes(program, extents)?.facts())
     }
 
     /// What an instance of `program` keeps in the pool's `Instance` and

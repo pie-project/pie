@@ -1,9 +1,11 @@
-//! REDESIGN §6: a registered program's fire term in the rung arithmetic.
+//! REDESIGN §6: the registered programs' guest term in the rung arithmetic.
 //! A rung of `r` tokens carries `min(r, max_lanes)` lanes; its activation
-//! is the model's chunks plus the chunks `fixed + lanes × a_lane` bytes of
-//! every program that can be in a fire take. A bind of a program whose term
-//! raises the span waits until the raise is funded and taken; the last
-//! instance's close drops the term, and the next lower gives the room back.
+//! is the model's chunks plus the chunks the worst fire of those lanes
+//! takes for the pairs open, each pair paying `fixed + lanes × a_lane` for
+//! the members the fire gives it and nothing where it gives none
+//! ([`::engine::GuestTerm`]). A bind of a program whose term raises the
+//! span waits until the raise is funded and taken; the last instance's
+//! close drops the pair, and the next lower gives the room back.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -11,7 +13,7 @@ use ::engine::{FireFacts, InstanceId, LaidLanes, ProgramId};
 use tokio::sync::Notify;
 
 use super::*;
-use crate::store::shared::programs::{FireKey, Funder, Mover, ProgramOpen, fund_span};
+use crate::store::shared::programs::{FireKey, Funder, Mover, ProgramOpen, fit_fire, fund_span};
 
 const PROGRAM: ProgramId = ProgramId(7);
 const LANES: u32 = 64;
@@ -51,6 +53,13 @@ fn lane_facts() -> FireFacts {
         a_lane: 256 << 10,
         ..FireFacts::default()
     }
+}
+
+/// The engine closed instance `id` and the close committed: the lane drops
+/// the count, the scheduler builds the term.
+fn closed(pool: &mut SharedPool, id: u64) {
+    pool.instance_closed(InstanceId(id));
+    pool.refit();
 }
 
 /// Binds `n` instances of `key`, ids from `from`.
@@ -198,7 +207,7 @@ fn the_fire_term_takes_its_chunks_at_every_rung_s_lanes() {
     assert_eq!(pool.rung(), 16, "4 chunks hold the 16 rung with its term");
     // Closes shrink it, a live instance a lane, to nothing with the last.
     for id in 1..=74 {
-        pool.instance_closed(InstanceId(id));
+        closed(&mut pool, id);
     }
     assert_eq!(pool.pool().act_chunks(256), 4, "the last closed: gone");
     assert_eq!(pool.rung(), 256);
@@ -368,6 +377,7 @@ async fn a_program_s_fire_term_widens_the_span_before_its_bind_and_its_close_giv
     // Its close drops the term; the walk lowers to give the room back once
     // the fires handed out by then retire.
     shared.lock().unwrap().instance_closed(InstanceId(1));
+    fit_fire(&shared);
     let mut walk = RungWalk::default();
     let pool = shared.lock().unwrap();
     assert_eq!(pool.pool().act_chunks(256), 4);
@@ -404,12 +414,15 @@ fn a_program_s_own_lane_cap_bounds_its_term() {
     assert_eq!(pool.pool().act_chunks(16), 1 + 2);
     assert_eq!(pool.pool().act_chunks(256), 4 + 2);
     assert_eq!(pool.pool().act_chunks(2048), 12 + 2);
-    // Beside an uncapped program with 64 live: each takes its own lanes.
+    // Beside an uncapped program with 64 live: the two share one fire's 64
+    // lanes, both `fixed` paid. The capped one lays no more than 16, so
+    // the worst fire is 20 + 20 MiB and 64 lanes' 16 MiB whichever way
+    // they fall: 56 MiB, 4 chunks (pair by pair it was 24 + 36 MiB).
     const OTHER: ProgramId = ProgramId(8);
     pool.fire_facts_learned(key(OTHER), &lane_facts());
     bind_live(&mut pool, key(OTHER), 100, 64);
-    // 24 + 36 MiB = 60 MiB, 4 chunks.
     assert_eq!(pool.pool().act_chunks(256), 4 + 4);
+    assert_eq!(pool.pool().fire().bytes(LANES), 56 * MIB);
 }
 
 /// 55 chunks a fire: the 2048 rung (12 + 55) no longer fits the 63 chunks
@@ -647,8 +660,8 @@ fn a_zero_term_never_refuses_a_bind_on_a_pool_with_rungs() {
     assert!(ProgramOpen::new(&shared, key(PROGRAM)).is_ok());
 }
 
-/// One program at two extents is two terms, summed: 256 rows take 8 MiB
-/// fixed, 4096 rows 16x that.
+/// One program at two extents is two pairs, and a fire that carries both
+/// pays both `fixed`: 256 rows take 8 MiB fixed, 4096 rows 16x that.
 fn rows_facts(rows: u32) -> FireFacts {
     FireFacts {
         fixed: u64::from(rows) * (32 << 10),
@@ -668,19 +681,19 @@ fn two_extents_of_one_program_sum_and_each_closes_with_its_last_bind() {
     pool.instance_bound(InstanceId(3), at(PROGRAM, 256));
     // 8 + 128 MiB: 9 chunks.
     assert_eq!(pool.pool().act_chunks(256), 4 + 9, "the two pairs sum");
-    pool.instance_closed(InstanceId(2));
+    closed(&mut pool, 2);
     assert_eq!(
         pool.pool().act_chunks(256),
         4 + 1,
         "4096 rows: its last bind closed"
     );
-    pool.instance_closed(InstanceId(1));
+    closed(&mut pool, 1);
     assert_eq!(
         pool.pool().act_chunks(256),
         4 + 1,
         "256 rows: one bind left"
     );
-    pool.instance_closed(InstanceId(3));
+    closed(&mut pool, 3);
     assert_eq!(pool.pool().act_chunks(256), 4, "every pair closed");
 }
 
@@ -807,7 +820,7 @@ fn a_lower_lends_only_after_every_fire_cut_to_the_old_rung_has_retired() {
     let evacuation = pool.plan_raise(256).unwrap();
     pool.apply_rung(&evacuation, 0).unwrap();
     assert_eq!(pool.pool().act_reserved(), 7);
-    pool.instance_closed(InstanceId(1));
+    closed(&mut pool, 1);
     assert_eq!(pool.pool().act_chunks(256), 4);
     let mut walk = RungWalk::default();
     // A step wider than the cap is still in flight: wait for the grant.
@@ -872,7 +885,7 @@ async fn a_bind_the_engine_refuses_closes_its_term_as_if_it_never_happened() {
     {
         let pool = shared.lock().unwrap();
         assert_eq!(pool.pool().act_chunks(256), 4, "the term closed");
-        assert!(pool.pool().fire().is_empty(), "no term left counted");
+        assert!(pool.pool().fire().is_zero(), "no term left counted");
         assert!(pool.knows_fire(&at(PROGRAM, 4096)), "its facts are kept");
         pool.pool().check();
     }
@@ -886,7 +899,8 @@ async fn a_bind_the_engine_refuses_closes_its_term_as_if_it_never_happened() {
     drop(open);
     assert_eq!(shared.lock().unwrap().pool().act_chunks(256), 4 + 8);
     shared.lock().unwrap().instance_closed(InstanceId(7));
-    assert!(shared.lock().unwrap().pool().fire().is_empty());
+    fit_fire(&shared);
+    assert!(shared.lock().unwrap().pool().fire().is_zero());
 }
 
 /// Each bind of a pair grows its term by a live instance, and widens the
@@ -939,6 +953,7 @@ async fn each_bind_grows_the_term_and_each_close_shrinks_it() {
     // A close shrinks it; the walk lowers once fires cut to the old span
     // have retired.
     shared.lock().unwrap().instance_closed(InstanceId(3));
+    fit_fire(&shared);
     let pool = shared.lock().unwrap();
     assert_eq!(pool.pool().act_chunks(256), 4 + 1, "two live again");
     let mut walk = RungWalk::default();
@@ -957,4 +972,154 @@ async fn each_bind_grows_the_term_and_each_close_shrinks_it() {
         4 + 1,
         "the room is back"
     );
+}
+
+/// The term is a fire's, not a pair's: fourteen pairs of one sampler (one
+/// program at fourteen extents), 64 instances bound of each, take what one
+/// fire's 64 lanes take however they fall among the pairs, and each pair's
+/// `fixed` once where the fire carries it. Pair by pair it was fourteen
+/// times a fire's lanes.
+#[test]
+fn fourteen_pairs_of_one_sampler_count_as_one_fire_s_lanes() {
+    for laid in [LaidLanes::Exact, LaidLanes::PowerOfTwo] {
+        let (mut pool, _) = pool_at_256();
+        let facts = FireFacts {
+            fixed: 2 * MIB,
+            a_lane: MIB,
+            laid,
+            ..FireFacts::default()
+        };
+        for pair in 0..14u32 {
+            let key = at(PROGRAM, 256 + pair);
+            pool.fire_facts_learned(key, &facts);
+            bind_live(&mut pool, key, u64::from(pair) * 100, 64);
+        }
+        let by_pair = 14 * facts.bytes(64);
+        assert_eq!(by_pair, 14 * 66 * MIB, "what the sum over pairs set aside");
+        let (at_16, at_64) = match laid {
+            // Every pair carried, the fire's lanes among them: 14 x 2 MiB
+            // and 16 lanes, 14 x 2 MiB and 64.
+            LaidLanes::Exact => (44 * MIB, 92 * MIB),
+            // Laid by powers of two a split lays more than the fire's
+            // lanes, under twice them: every pair carried, 16 members as
+            // one pair's 3 and thirteen of one lay 17 lanes, 64 as 33, 17,
+            // 3 and eleven of one lay 111.
+            LaidLanes::PowerOfTwo => ((28 + 17) * MIB, (28 + 111) * MIB),
+        };
+        let term = pool.pool().fire();
+        assert_eq!(term.bytes(16), at_16, "laid {laid:?}");
+        assert_eq!(term.bytes(LANES), at_64, "laid {laid:?}");
+        assert_eq!(
+            u64::from(pool.pool().act_chunks(2048)),
+            12 + at_64.div_ceil(CHUNK),
+            "laid {laid:?}"
+        );
+        assert_eq!(
+            u64::from(pool.pool().act_chunks(16)),
+            1 + at_16.div_ceil(CHUNK),
+            "laid {laid:?}"
+        );
+    }
+}
+
+/// Who builds the table, and when. A bind builds the one it would leave on
+/// its own task and counts with it. The lane's bind takes over the count
+/// the bind's guard held, so nothing changes there and nothing is built on
+/// the lane; the guard then gives nothing back. A close drops the count on
+/// the lane and leaves the term as it was, the instance still counted,
+/// until the close's commit builds it.
+#[test]
+fn the_lane_s_bind_takes_over_the_guard_s_count_and_a_close_is_built_at_its_commit() {
+    let (mut pool, _) = pool_at_256();
+    // A chunk a live instance.
+    pool.fire_facts_learned(
+        key(PROGRAM),
+        &FireFacts {
+            a_lane: CHUNK,
+            ..FireFacts::default()
+        },
+    );
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    let act = || shared.lock().unwrap().pool().act_chunks(256);
+
+    let open = ProgramOpen::new(&shared, key(PROGRAM)).unwrap();
+    assert_eq!(act(), 4 + 1, "one binding");
+    shared
+        .lock()
+        .unwrap()
+        .instance_bound(InstanceId(1), key(PROGRAM));
+    assert_eq!(act(), 4 + 1, "the instance took the guard's count");
+    drop(open);
+    assert_eq!(act(), 4 + 1, "the guard gives nothing back");
+
+    // Two binds under way, one bound, the other refused by the engine:
+    // its guard's count goes, the bound one's stays.
+    let (first, second) = (
+        ProgramOpen::new(&shared, key(PROGRAM)).unwrap(),
+        ProgramOpen::new(&shared, key(PROGRAM)).unwrap(),
+    );
+    assert_eq!(act(), 4 + 3);
+    shared
+        .lock()
+        .unwrap()
+        .instance_bound(InstanceId(2), key(PROGRAM));
+    drop(first);
+    drop(second);
+    assert_eq!(act(), 4 + 2, "two bound, none binding");
+
+    // A bind whose task was dropped before the lane reached it: no guard
+    // is left, and the lane counts the instance itself.
+    drop(ProgramOpen::new(&shared, key(PROGRAM)).unwrap());
+    assert_eq!(act(), 4 + 2);
+    shared
+        .lock()
+        .unwrap()
+        .instance_bound(InstanceId(3), key(PROGRAM));
+    assert_eq!(act(), 4 + 3);
+
+    // A close: counted until its commit builds the term.
+    shared.lock().unwrap().instance_closed(InstanceId(3));
+    assert_eq!(act(), 4 + 3, "the lane builds nothing");
+    fit_fire(&shared);
+    assert_eq!(act(), 4 + 2, "built at the commit");
+    // A bind that follows a close not yet committed builds from what is
+    // open: the closed instance is gone from its table.
+    shared.lock().unwrap().instance_closed(InstanceId(2));
+    let open = ProgramOpen::new(&shared, key(PROGRAM)).unwrap();
+    assert_eq!(act(), 4 + 2, "one bound, one binding");
+    drop(open);
+    shared.lock().unwrap().instance_closed(InstanceId(1));
+    fit_fire(&shared);
+    assert!(shared.lock().unwrap().pool().fire().is_zero());
+}
+
+/// A bind refused for the term it would leave leaves the pool as it found
+/// it: the pair is not counted, the term of the pairs open stands, and the
+/// cap fires may take never saw the refused one.
+#[test]
+fn a_refused_bind_leaves_the_term_of_the_pairs_open() {
+    const HUGE: ProgramId = ProgramId(9);
+    let (mut pool, _) = pool_at_256();
+    pool.fire_facts_learned(key(PROGRAM), &fire_facts());
+    pool.fire_facts_learned(
+        key(HUGE),
+        &FireFacts {
+            fixed: u64::from(TOTAL) * CHUNK,
+            ..FireFacts::default()
+        },
+    );
+    pool.instance_bound(InstanceId(1), key(PROGRAM));
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    let before = shared.lock().unwrap().pool().fire().clone();
+    let refused = ProgramOpen::new(&shared, key(HUGE))
+        .err()
+        .expect("past the device");
+    assert!(
+        refused.contains("the smallest rung would then take"),
+        "{refused}"
+    );
+    let pool = shared.lock().unwrap();
+    assert_eq!(pool.pool().fire(), &before);
+    assert_eq!(pool.pool().act_chunks(256), 4 + 3);
+    assert_eq!(pool.fit_cap(), u32::MAX);
 }
