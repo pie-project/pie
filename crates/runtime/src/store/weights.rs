@@ -680,7 +680,7 @@ impl WeightCache {
             })
             .filter(|&(_, read)| read < last)
             .collect();
-        idle.sort_unstable_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)));
+        idle.sort_unstable_by_key(|a| (a.1, a.0));
         let room = if refill {
             usize::try_from(pool.available(kept.pool)).unwrap_or(usize::MAX)
         } else {

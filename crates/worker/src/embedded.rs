@@ -143,15 +143,12 @@ impl Settings {
         let mut set = |key: &str, value: toml::Value| {
             options.insert(key.into(), value);
         };
-        match kind {
-            EngineKind::Vulkan => {
-                let cache = home.join("vulkan-pipelines.bin");
-                set(
-                    "pipeline_cache",
-                    cache.to_string_lossy().into_owned().into(),
-                );
-            }
-            _ => {}
+        if kind == EngineKind::Vulkan {
+            let cache = home.join("vulkan-pipelines.bin");
+            set(
+                "pipeline_cache",
+                cache.to_string_lossy().into_owned().into(),
+            );
         }
         options
     }
