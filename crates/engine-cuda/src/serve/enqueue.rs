@@ -802,15 +802,10 @@ impl FireCtx<'_> {
         if let Some(body) = self.device.conditional_ctx() {
             run = run.conditional(body, &stream);
         }
-        let rs_scratch = (p.rs.rows_ext > 0)
-            .then(|| {
-                self.rs_scratch
-                    .zip(self.buffers)
-                    .map(|((ptr, bytes), buffers)| {
-                        crate::run::RsScratch::new(ptr, bytes, buffers.ext_row_bytes())
-                    })
-            })
-            .flatten();
+        let rs_scratch = self
+            .rs_scratch
+            .filter(|_| p.rs.rows_ext > 0)
+            .map(|(ptr, bytes)| crate::run::RsScratch::new(ptr, bytes, p.rs.rows_ext));
         if p.rs.body.buffers()
             && let Some(buffers) = self.buffers
         {
@@ -828,7 +823,6 @@ impl FireCtx<'_> {
                     page_tokens: buffers.page_tokens(),
                 },
                 extended: p.rs.body == record::RsBody::Replays,
-                replays: &p.rs.replays,
                 scratch: rs_scratch.as_ref(),
             });
         }

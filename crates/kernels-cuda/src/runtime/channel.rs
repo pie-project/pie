@@ -392,9 +392,12 @@ pub struct RsLane {
     pub replay_off: u32,
     /// Where its pages' slot addresses start in the page table.
     pub page_off: u32,
+    /// Where its extended rows start in the fire's extended run: past
+    /// every earlier lane's replayed and own rows.
+    pub ext: u32,
 }
 
-const _: () = assert!(size_of::<RsLane>() == 16);
+const _: () = assert!(size_of::<RsLane>() == 20);
 
 impl RsLane {
     pub const NONE: u32 = u32::MAX;
@@ -405,6 +408,7 @@ impl RsLane {
         replay: 0,
         replay_off: 0,
         page_off: 0,
+        ext: 0,
     };
 }
 
@@ -465,7 +469,9 @@ pub fn rs_scatter(
 }
 
 /// The window's extended layout into `csr` (`lanes_cap + 1` words) and the
-/// live words the recurrent kernels read the extended rows by (`ext_win`).
+/// live words the recurrent kernels read the extended rows by (`ext_win`):
+/// from the window's place in the fire's extended run, its first lane's
+/// [`RsLane::ext`].
 pub fn rs_ext_csr(
     ctx: &Ctx,
     qo_indptr: DevicePtr,

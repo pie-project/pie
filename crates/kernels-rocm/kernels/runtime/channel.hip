@@ -382,9 +382,12 @@ struct RsLane {
     u32 replay_off;
     // Where its pages' slot addresses start in the page table.
     u32 page_off;
+    // Where its extended rows start in the fire's extended run: past every
+    // earlier lane's replayed and own rows.
+    u32 ext;
 };
 
-static_assert(sizeof(RsLane) == 16, "RsLane: the Rust `channel::RsLane` mirrors this layout");
+static_assert(sizeof(RsLane) == 20, "RsLane: the Rust `channel::RsLane` mirrors this layout");
 
 constexpr u32 RS_NONE = 0xffffffffu;
 
@@ -445,8 +448,8 @@ __global__ void rs_scatter(
 
 // The window's extended layout: lane r's replayed rows then its own from
 // `csr[r]`, padded lanes (to `lanes_cap`) empty; `ext_win` the live words
-// the recurrent kernels read the extended rows by (no row offset: the
-// extended rows are the window's own).
+// the recurrent kernels read the extended rows by, from the window's place
+// in the fire's extended run (its first lane's `ext`).
 __global__ void rs_ext_csr(
     const u32* __restrict__ qo_indptr,
     const u32* __restrict__ win,
@@ -466,7 +469,7 @@ __global__ void rs_ext_csr(
     }
     for (u32 r = lanes; r <= lanes_cap; ++r) csr[r] = acc;
     ext_win[0] = acc;
-    ext_win[1] = 0u;
+    ext_win[1] = lanes != 0u ? lanes_tab[lane0].ext : 0u;
     ext_win[2] = lanes;
     ext_win[3] = lane0;
 }
@@ -494,12 +497,14 @@ __global__ void rs_ext_gather(
     const u32 lane0 = win != nullptr ? win[3] : 0u;
     const u32 r = blockIdx.x;
     // Lane r's extended rows start past every earlier lane's replayed and
-    // own rows; the first gather of an op (`ext_win` non-null) lays the
-    // window's layout from block 0, padded lanes empty.
+    // own rows, from the window's place in the fire's extended run; the
+    // first gather of an op (`ext_win` non-null) lays the window's layout
+    // from block 0, padded lanes empty.
     __shared__ u32 begin;
     if (threadIdx.x == 0) {
         const u32 upto = r < lanes ? r : lanes;
-        u32 acc = 0;
+        const u32 base = lanes != 0u ? lanes_tab[lane0].ext : 0u;
+        u32 acc = base;
         for (u32 i = 0; i < upto; ++i) {
             acc += lanes_tab[lane0 + i].replay + (qo_indptr[i + 1] - qo_indptr[i]);
         }
@@ -512,7 +517,7 @@ __global__ void rs_ext_gather(
             }
             for (u32 i = lanes; i <= lanes_stated; ++i) csr[i] = total;
             ext_win[0] = total;
-            ext_win[1] = 0u;
+            ext_win[1] = base;
             ext_win[2] = lanes;
             ext_win[3] = lane0;
         }
@@ -543,7 +548,8 @@ __global__ void rs_ext_gather(
 }
 
 // Lane r's own rows of the extended `ext` back onto `target` (a block a
-// lane), past the rows it replayed.
+// lane), past the rows it replayed, from the window's place in the fire's
+// extended run.
 __global__ void rs_ext_land(
     const u8* __restrict__ ext,
     u8* __restrict__ target,
@@ -558,8 +564,8 @@ __global__ void rs_ext_land(
     const u32 r = blockIdx.x;
     if (r >= lanes) return;
     const u32 row0 = win != nullptr ? win[1] : 0u;
-    const u32 rl = win != nullptr ? r + win[3] : r;
-    const u32 skip = csr[r] + lanes_tab[rl].replay;
+    const u32 lane0 = win != nullptr ? win[3] : 0u;
+    const u32 skip = lanes_tab[lane0].ext + csr[r] + lanes_tab[lane0 + r].replay;
     const u32 t0 = qo_indptr[r];
     const u32 n = qo_indptr[r + 1] - t0;
     for (u32 e = 0; e < n; ++e) {

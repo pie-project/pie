@@ -1300,6 +1300,22 @@ impl FrameShell for Shell {
                     .collect()
             })
             .collect();
+        // A fire's extended run holds the widest bucket's tokens of
+        // replayed rows (`store::rs::Buffers::rows_ext`), the most the
+        // runtime lets one carry (`engine::fire::rung_rows`): one that
+        // replays more is refused here, before a page is committed or a
+        // row written.
+        let replayed: u32 = rs_reads
+            .iter()
+            .map(|reads| crate::run::replayed(reads))
+            .sum();
+        if replayed > self.budget.max_tokens {
+            return Err(Fault::Ceiling {
+                what: "buffered recurrent rows a fire replays ahead of its own",
+                need: u64::from(replayed),
+                have: u64::from(self.budget.max_tokens),
+            });
+        }
         self.pools.commit_frame(demand, &kv_ranges, &window_pages)?;
         // The rs buffer pages the lanes name, seated before a row lands.
         self.pools.seat_rs(&rs_pages)?;
@@ -1328,9 +1344,17 @@ impl FrameShell for Shell {
                        plan that declares no chunked recurrence to buffer"
                     .to_string(),
             })?;
-            for (fire_lane, verb) in rs_moves.iter().enumerate() {
+            // Each lane's extended rows, its replayed then its own, lie past
+            // every earlier lane's in the fire's extended run.
+            let mut ext = 0u32;
+            for (fire_lane, (verb, row)) in rs_moves.iter().zip(composition.lanes()).enumerate() {
+                let begin = ext;
+                ext += rs_replays[fire_lane] + row.rows;
                 let RsMove::Scatter { pages, at, .. } = verb else {
-                    rs_lanes.push(kernels_cuda::runtime::channel::RsLane::INERT);
+                    rs_lanes.push(kernels_cuda::runtime::channel::RsLane {
+                        ext: begin,
+                        ..kernels_cuda::runtime::channel::RsLane::INERT
+                    });
                     continue;
                 };
                 let replay_off = rs_tokens.len() as u32;
@@ -1342,6 +1366,7 @@ impl FrameShell for Shell {
                     replay: rs_replays[fire_lane],
                     replay_off,
                     page_off: rs_slots.len() as u32,
+                    ext: begin,
                 });
                 for &page in pages.iter() {
                     rs_slots.push(buffers.slot(&self.pools, page)?);
@@ -1561,21 +1586,9 @@ impl FrameShell for Shell {
         super::btrace::mark("segmentation");
         // A tapped fire is walked, so the walk can mark where each layer
         // ends on the stream.
-        // A body's window holds its own rows twice and at least `REPLAYED`
-        // replayed (`Run::rs_layout`): a fire whose lanes replay more in a
-        // window than its rows or `REPLAYED` walks.
-        let replays_fit = windows.spans().all(|span| {
-            rs_replays
-                .iter()
-                .skip(span.lane_offset as usize)
-                .take(span.lanes as usize)
-                .sum::<u32>()
-                <= span.rows.max(crate::store::rs::REPLAYED)
-        });
         let snapshots_fit = snapshots.rows.len() <= crate::store::rs::SNAPSHOTS as usize;
         let bodied = records_bodies
             && !tapped
-            && replays_fit
             && snapshots_fit
             && Self::keyable_units(&self.compiled)
             && world
@@ -1621,8 +1634,6 @@ impl FrameShell for Shell {
             (records_bodies && !arming && !(bodied && readouts_fit && lanes_fit)).then(|| {
                 let why = if tapped {
                     "it is tapped"
-                } else if !replays_fit {
-                    "a window's lanes replay more rows than a body's window holds"
                 } else if !snapshots_fit {
                     "it takes more snapshots than a body holds"
                 } else if !Self::keyable_units(&self.compiled) {
@@ -1741,22 +1752,10 @@ impl FrameShell for Shell {
 
         // A buffering fire's recurrences take its commit lengths and its
         // fold predicate whatever its lanes fold, so one body serves every
-        // fold; its extended rows reach a body's ceiling (`Run::rs_layout`).
+        // fold; its extended run is the widest bucket's, whatever its rows
+        // and whatever its lanes replay.
         let rs_rows_ext = if rs_body == record::RsBody::Replays {
-            // Each window's region holds its own rows twice and at least
-            // `REPLAYED` more.
-            let own = launched.max(rows);
-            let regions = u32::try_from(windows.len()).unwrap_or(u32::MAX).max(1);
-            // A body's windows are laid at those ceilings whatever its
-            // lanes replay; a walked fire's hold what they replay beside.
-            let replayed = if bodied {
-                0
-            } else {
-                rs_replays.iter().sum::<u32>()
-            };
-            own.saturating_mul(2)
-                .saturating_add(regions.saturating_mul(crate::store::rs::REPLAYED))
-                .saturating_add(replayed)
+            crate::store::rs::Buffers::rows_ext(self.budget.max_tokens)
         } else {
             0
         };
@@ -1859,7 +1858,6 @@ impl FrameShell for Shell {
                 moves: rs_moves,
                 lens: rs_lens,
                 order: rs_order,
-                replays: rs_replays,
                 rows_ext: rs_rows_ext,
                 snapshots,
             },
