@@ -571,6 +571,11 @@ pub(super) async fn save(held: &Held, tenant: &str, name: &str) -> Result<Value,
             }
             None => None,
         };
+        // What is kept states the cursor's frozen length too, and a load
+        // takes it as exact: a bound is not kept.
+        cursor
+            .at_rest()
+            .map_err(|why| failed("reading the frozen length", why))?;
         let state = match &rs_set {
             Some((rs, set)) => Some(read_state(kv.engine, rs, set).await?),
             None => None,
@@ -1180,6 +1185,28 @@ mod tests {
         assert!(
             refused.message.contains("reading recurrent state")
                 && refused.message.contains(DEVICE_LOST),
+            "{}",
+            refused.message
+        );
+    }
+
+    /// What a save keeps states the cursor's frozen length, and a load
+    /// takes it as exact: a set whose length a fold left unknown is refused
+    /// by name, before any byte of it is read.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_save_of_a_set_whose_frozen_length_is_not_known_is_refused_by_name() {
+        use crate::handle::held::tests::{parked, unplaced};
+        use crate::inferlet::host::working_set::Cursor;
+        configure(
+            std::env::temp_dir().join(format!("pie-snapshots-{}", Uuid::new_v4())),
+            u64::MAX,
+        );
+        let held = parked(unplaced());
+        let refused = save(&held, "tenant", "bound").await;
+        let refused = refused.expect_err("a bound is not kept");
+        assert!(
+            refused.message.contains("reading the frozen length")
+                && refused.message.contains(Cursor::UNPLACED),
             "{}",
             refused.message
         );

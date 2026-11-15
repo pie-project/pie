@@ -64,6 +64,23 @@ impl StagedRows {
 }
 
 impl Cursor {
+    /// What a set whose frozen length is not known is refused with.
+    pub const UNPLACED: &str = "its frozen length is not known: a fire that was to place \
+                                its fold when it settled never did (dropped before it \
+                                settled, or run with no count reported)";
+
+    /// Whether the frozen length is known. It is not while a fire that
+    /// places its fold when it settles is on its way, and it stays unknown
+    /// where no fire is left to place one: `folded` is then a bound, which
+    /// what copies or keeps the set must not state as its length.
+    pub fn at_rest(&self) -> Result<(), &'static str> {
+        if self.folded_exact {
+            Ok(())
+        } else {
+            Err(Self::UNPLACED)
+        }
+    }
+
     /// `fire` is staged on the set, its rows to land where the device says.
     pub fn stage(&mut self, fire: Arc<StagedRows>) {
         let (written, _) = self.standing();
@@ -299,28 +316,18 @@ impl pie::inferlet::working_set::HostWorkingSet for ProcessCtx {
             }
             Err(failed) => return Ok(Err(format!("working set {failed}"))),
         }
-        // A fire on its way that folds the recurrent state by a count the
-        // device computes leaves the frozen length behind the record until
-        // it settles, and a child takes both. Those fires are this
-        // pipeline's, and only this task settles them: the fork runs them
-        // to their end first, woken as each completes. One that fails ends
-        // the wait as the pipeline's failure. A fold still unsettled then
-        // is none this task can settle (a fire the planner is finalizing,
-        // or one dropped that the engine still holds): its end wakes the
-        // fork.
+        // The child starts from the frozen length the fires on their way
+        // leave, or the fork is refused: never from a bound.
         let stores = store_registry::get(kv.model, kv.engine);
-        let unsettled = |rs: &RsWorkingSet| {
-            stores.rs.lock().unwrap().device_fold_gate(rs.id)
-                == Err(crate::store::rs::RsError::DeviceFoldUnsettled)
+        let at_rest = {
+            let cell = self.ctx().table.get(&this)?.cursor.clone();
+            let rs = rs.as_ref().map(|rs| rs.id);
+            crate::pipeline::fire::cursor_at_rest(self, &fires, &failure, &kv, rs, &cell).await?
         };
-        if let Some(rs) = rs.as_ref().filter(|rs| unsettled(rs)) {
-            crate::pipeline::fire::drain_pipeline_fires(self, &fires).await?;
-            crate::store::rs::device_folds_settled(&stores.rs, &[rs.id]).await;
-        }
-        if let Some(reason) = failure.lock().unwrap().clone() {
-            return Ok(Err(format!("pipeline failed: {reason}")));
-        }
-        let cursor = self.ctx().table.get(&this)?.cursor();
+        let cursor = match at_rest {
+            Ok(cursor) => cursor,
+            Err(why) => return Ok(Err(why)),
+        };
         let kv_child =
             match store_registry::with_kv_lock(&stores.kv, "host-working-set", |s| s.fork(kv.id)) {
                 Ok(id) => kv.forked(id),

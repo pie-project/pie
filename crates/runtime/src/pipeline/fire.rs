@@ -2341,6 +2341,59 @@ pub(crate) async fn drain_pipeline_fires<C: FireContext>(
     }
 }
 
+/// The cursor a copy of `kv`'s set starts from: read once every fire on its
+/// way has placed its fold. Until then the frozen length the cursor states
+/// is a bound, and a child that took it would state it for good: no fire
+/// settles a copy.
+///
+/// The cursor is the mark, on every set; the recurrent store's is only on a
+/// set that keeps recurrent state. The fires are `fires`', the pipeline the
+/// set is scoped to, and only this task settles them: they run to their end
+/// first, woken as each completes. One dropped unsettled lifts the
+/// recurrent store's mark when the engine is done with it, which wakes the
+/// wait. One another finalizer took off the queue is under the finalizer
+/// gate until its fold is placed and its failure latched: the cursor and
+/// the failure are read with the gate in hand.
+///
+/// A fire that failed refuses the copy as the pipeline's failure. A fold no
+/// fire is left to place leaves the length unknown for good, and the copy
+/// is refused by that name ([`Cursor::UNPLACED`]) rather than left waiting.
+///
+/// [`Cursor::UNPLACED`]: crate::inferlet::host::working_set::Cursor::UNPLACED
+pub(crate) async fn cursor_at_rest<C: FireContext>(
+    ctx: &mut C,
+    fires: &PendingFires,
+    failure: &PipelineFailure,
+    kv: &crate::store::kv::working_set::KvWorkingSet,
+    rs: Option<crate::store::rs::RsWorkingSetId>,
+    cursor: &CursorCell,
+) -> Anyhow<Result<crate::inferlet::host::working_set::Cursor, String>> {
+    let stores = crate::store::registry::get(kv.model, kv.engine);
+    let marked = rs.is_some_and(|rs| {
+        stores.rs.lock().unwrap().device_fold_gate(rs)
+            == Err(crate::store::rs::RsError::DeviceFoldUnsettled)
+    });
+    let at_rest = cursor.lock().unwrap().at_rest().is_ok();
+    if !at_rest || marked {
+        drain_pipeline_fires(ctx, fires).await?;
+        if let Some(rs) = rs {
+            crate::store::rs::device_folds_settled(&stores.rs, &[rs]).await;
+        }
+    }
+    let _gate = fires.finalize_guard().await;
+    if let Some(reason) = failure.lock().unwrap().clone() {
+        return Ok(Err(format!("pipeline failed: {reason}")));
+    }
+    let cursor = cursor.lock().unwrap().clone();
+    Ok(match cursor.at_rest() {
+        Ok(()) => Ok(cursor),
+        // The recurrent store says how the fire ended, where it keeps one.
+        Err(why) => Err(rs
+            .and_then(|rs| stores.rs.lock().unwrap().device_fold_gate(rs).err())
+            .map_or_else(|| format!("working set: {why}"), |named| named.to_string())),
+    })
+}
+
 /// Each lane's guest switches, and what the outputs the program reads ask of
 /// it: the runtime switches their writers run under, and the last rows they
 /// are computed over.
@@ -6345,7 +6398,7 @@ mod fold_tests {
         fn next(&self, fold: &geometry::Fold) -> (crate::engine::WorkItemCompletion, u64) {
             submit(
                 &self.kv,
-                self.rs,
+                Some(self.rs),
                 &self.cursor,
                 &self.fires,
                 &self.failure,
@@ -6384,6 +6437,17 @@ mod fold_tests {
     /// `exact` is whether the host knew the frozen length when it planned
     /// the fold; `reach` where the fire's own rows end, where it knew.
     fn in_flight(fold: &geometry::Fold, exact: bool, reach: Option<u64>) -> Flight {
+        in_flight_on(fold, exact, reach, true)
+    }
+
+    /// `recurrent` is whether the pass keeps recurrent state: a pass that
+    /// keeps none folds its set with the recurrent store left out.
+    fn in_flight_on(
+        fold: &geometry::Fold,
+        exact: bool,
+        reach: Option<u64>,
+        recurrent: bool,
+    ) -> Flight {
         let model = crate::store::registry::register_model(4, &[8], &[1]);
         let stores = crate::store::registry::get(model, 0);
         let id = {
@@ -6406,7 +6470,8 @@ mod fold_tests {
         let kv = KvWorkingSet::new(model, 0, id, 8);
         let failure: PipelineFailure = Arc::new(Mutex::new(None));
         let fires = Arc::new(PendingFireQueue::new());
-        let (completion, tag) = submit(&kv, rs, &cell, &fires, &failure, fold, reach);
+        let part = recurrent.then_some(rs);
+        let (completion, tag) = submit(&kv, part, &cell, &fires, &failure, fold, reach);
         Flight {
             stores,
             fires,
@@ -6425,7 +6490,7 @@ mod fold_tests {
     /// what its first lane reports under, where the device counts.
     fn submit(
         kv: &KvWorkingSet,
-        rs: RsWorkingSetId,
+        rs: Option<RsWorkingSetId>,
         cursor: &CursorCell,
         fires: &PendingFires,
         failure: &PipelineFailure,
@@ -6443,7 +6508,7 @@ mod fold_tests {
             fold,
             u64::MAX,
             true,
-            Some(rs),
+            rs,
             &mut req,
             &mut tags,
         )
@@ -6515,6 +6580,180 @@ mod fold_tests {
         assert_eq!(flight.fork(), Ok(7), "the child takes what the fold left");
         assert_eq!(flight.exported(), Ok(7));
         assert!(flight.failure.lock().unwrap().is_none());
+        Ok(())
+    }
+
+    /// A set that keeps no recurrent state is folded by the device's count
+    /// too, and nothing in the recurrent store marks it: its cursor does.
+    /// The fork reads the cursor only at rest ([`cursor_at_rest`]): it goes
+    /// no further than the fire in flight, nor than one another finalizer
+    /// holds off the queue, and the child then starts from the frozen
+    /// length the count left, the one its pages are frozen to.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_set_with_no_recurrent_state_forks_at_the_length_its_fold_leaves() -> Anyhow<()> {
+        // Who settles the fire: the fork's own drain, or another finalizer
+        // that took it off the queue under the gate before the fork began.
+        for other_finalizer in [false, true] {
+            let flight = in_flight_on(&geometry::Fold::Device, true, None, false);
+            let (mut ctx, mut other) = (Flight::context(), Flight::context());
+            assert_eq!(
+                flight.stores.rs.lock().unwrap().device_fold_gate(flight.rs),
+                Ok(()),
+                "the recurrent store has nothing of this pass to mark"
+            );
+            let staged = flight.cursor.lock().unwrap().clone();
+            assert!(
+                staged.at_rest().is_err() && staged.unsettled == 1 && staged.folded == 4,
+                "what a child made now would state for good: {staged:?}"
+            );
+            let window = if other_finalizer {
+                record_kv_writes(vec![report(flight.tag, 3)]);
+                resolve_test_completion(&flight.completion, false);
+                let gate = flight.fires.finalize_guard().await;
+                let op = pop_settled(Some(&flight.fires)).expect("the fire settled");
+                let finalized = finalize_op_await(op).await;
+                assert!(flight.fires.lock().unwrap().is_empty());
+                Some((gate, finalized))
+            } else {
+                None
+            };
+            let child = {
+                let mut fork = Box::pin(cursor_at_rest(
+                    &mut ctx,
+                    &flight.fires,
+                    &flight.failure,
+                    &flight.kv,
+                    None,
+                    &flight.cursor,
+                ));
+                assert!(
+                    fork.as_mut().now_or_never().is_none(),
+                    "the fork goes no further than the fire: {other_finalizer}"
+                );
+                match window {
+                    Some((gate, finalized)) => {
+                        complete_finalize(&mut other, finalized);
+                        drop(gate);
+                    }
+                    None => {
+                        record_kv_writes(vec![report(flight.tag, 3)]);
+                        resolve_test_completion(&flight.completion, false);
+                    }
+                }
+                fork.await?.expect("the fold was placed")
+            };
+            assert!(
+                child.at_rest().is_ok() && child.unsettled == 0 && child.folded == 7,
+                "{child:?}"
+            );
+            let pages = {
+                let mut kv = flight.stores.kv.lock();
+                let forked = kv.fork(flight.kv.id).unwrap();
+                kv.folded(forked).unwrap()
+            };
+            assert_eq!(
+                u64::from(child.folded),
+                pages,
+                "the child states the length its pages are frozen to"
+            );
+            // At rest there is nothing to wait for.
+            let again = cursor_at_rest(
+                &mut ctx,
+                &flight.fires,
+                &flight.failure,
+                &flight.kv,
+                None,
+                &flight.cursor,
+            );
+            let again = again.now_or_never().expect("no fire is on its way")?;
+            assert_eq!(again.map(|cursor| cursor.folded), Ok(7));
+        }
+        Ok(())
+    }
+
+    /// A fold no fire is left to place never lets the cursor come to rest:
+    /// the fork does not hang on it, and does not hand out the bound. It is
+    /// refused by name where the fire was dropped unsettled or ran and
+    /// brought no count (the recurrent store's name for it, where the set
+    /// keeps recurrent state), and by the pipeline's failure where the fire
+    /// failed: also one another finalizer holds off the queue, its failure
+    /// not latched yet.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_fold_that_is_never_placed_refuses_the_fork_by_name() -> Anyhow<()> {
+        use crate::inferlet::host::working_set::Cursor;
+        for ended in ["dropped", "no count", "failed", "failed, off the queue"] {
+            let flight = in_flight_on(&geometry::Fold::Device, true, None, false);
+            let (mut ctx, mut other) = (Flight::context(), Flight::context());
+            let mut window = None;
+            match ended {
+                "dropped" => flight.fires.lock().unwrap().clear(),
+                "no count" => resolve_test_completion(&flight.completion, false),
+                "failed" => resolve_test_completion(&flight.completion, true),
+                _ => {
+                    resolve_test_completion(&flight.completion, true);
+                    let gate = flight.fires.finalize_guard().await;
+                    let op = pop_settled(Some(&flight.fires)).expect("the fire settled");
+                    let finalized = finalize_op_await(op).await;
+                    assert_eq!(flight.failure.lock().unwrap().as_ref(), None);
+                    window = Some((gate, finalized));
+                }
+            }
+            let mut fork = Box::pin(cursor_at_rest(
+                &mut ctx,
+                &flight.fires,
+                &flight.failure,
+                &flight.kv,
+                None,
+                &flight.cursor,
+            ));
+            if let Some((gate, finalized)) = window {
+                assert!(
+                    fork.as_mut().now_or_never().is_none(),
+                    "its failure is not written yet"
+                );
+                complete_finalize(&mut other, finalized);
+                drop(gate);
+            }
+            let refused = fork
+                .as_mut()
+                .now_or_never()
+                .unwrap_or_else(|| panic!("{ended}: it never hangs"))?
+                .expect_err("the frozen length is not known");
+            let staged = flight.cursor.lock().unwrap().clone();
+            assert!(
+                staged.at_rest().is_err() && staged.unsettled == 1 && staged.folded == 4,
+                "{ended}: {staged:?}"
+            );
+            match ended {
+                "dropped" | "no count" => {
+                    assert_eq!(refused, format!("working set: {}", Cursor::UNPLACED));
+                    assert!(flight.failure.lock().unwrap().is_none(), "{ended}");
+                }
+                _ => assert!(
+                    refused.starts_with("pipeline failed: pipeline: forward failed"),
+                    "{ended}: {refused}"
+                ),
+            }
+        }
+        // A set that keeps recurrent state is refused as its store names
+        // how the fire ended.
+        let flight = in_flight(&geometry::Fold::Device, true, None);
+        let mut ctx = Flight::context();
+        resolve_test_completion(&flight.completion, false);
+        let fork = cursor_at_rest(
+            &mut ctx,
+            &flight.fires,
+            &flight.failure,
+            &flight.kv,
+            Some(flight.rs),
+            &flight.cursor,
+        );
+        let refused = fork.now_or_never().expect("it never hangs")?;
+        let unreported = RsError::DeviceFoldFailed(RsDeviceFold::UNREPORTED.to_string());
+        assert_eq!(
+            refused.map(|cursor| cursor.folded),
+            Err(unreported.to_string())
+        );
         Ok(())
     }
 

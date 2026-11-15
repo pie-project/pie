@@ -124,6 +124,14 @@ impl Held {
             }
             None => None,
         };
+        // Parked, the set has no fire on its way: a frozen length a fold
+        // left unknown stays so, and the child would state the bound.
+        if let Err(why) = cursor.at_rest() {
+            if let Some(rs) = rs_child {
+                rs.release();
+            }
+            return Err(why.to_string());
+        }
         let child = settled(kv, "handle-fork", |store| store.fork(kv.id)).await;
         match child {
             Ok(child) => Ok(Held::park(
@@ -328,6 +336,46 @@ pub(super) mod tests {
             Cursor::default(),
         );
         (held, stores, rs)
+    }
+
+    /// A parked set that keeps no recurrent state, its cursor as `cursor`.
+    pub(in crate::handle) fn parked(cursor: Cursor) -> Held {
+        let model = store_registry::register_model(4, &[8], &[2]);
+        let stores = store_registry::get(model, 0);
+        let kv = stores.kv.lock().create_working_set();
+        Held::park(
+            ProcessId::new_v4(),
+            KvWorkingSet::new(model, 0, kv, 4),
+            None,
+            cursor,
+        )
+    }
+
+    /// A cursor whose frozen length a fold left unknown: the fire that was
+    /// to place it never did.
+    pub(in crate::handle) fn unplaced() -> Cursor {
+        Cursor {
+            folded_exact: false,
+            unsettled: 1,
+            ..Cursor::default()
+        }
+    }
+
+    /// A parked set has no fire on its way, so a frozen length a fold left
+    /// unknown stays unknown: its fork is refused by name, never handed the
+    /// bound. One at rest forks.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_fork_of_a_set_whose_frozen_length_is_not_known_is_refused_by_name() {
+        let bound = parked(unplaced());
+        let refused = bound
+            .fork(ProcessId::new_v4())
+            .now_or_never()
+            .expect("there is nothing to wait for")
+            .expect_err("the child would state a bound");
+        assert_eq!(refused, Cursor::UNPLACED);
+        let child = parked(Cursor::default()).fork(ProcessId::new_v4()).await;
+        let child = child.expect("its frozen length is known");
+        assert!(child.parts().cursor.at_rest().is_ok());
     }
 
     #[tokio::test(flavor = "current_thread")]
