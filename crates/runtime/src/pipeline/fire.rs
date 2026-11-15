@@ -1974,11 +1974,7 @@ struct StagedFire {
 impl StagedFire {
     /// The end its lanes reported, the furthest of them; none unless each
     /// reported one.
-    fn settle(
-        &self,
-        reported: &std::collections::HashMap<u64, ::engine::KvWrites>,
-        success: bool,
-    ) {
+    fn settle(&self, reported: &std::collections::HashMap<u64, ::engine::KvWrites>, success: bool) {
         let end = self
             .tags
             .iter()
@@ -2011,8 +2007,90 @@ enum FoldBy {
         tags: Vec<u64>,
         reach: u64,
         cursor: std::sync::Arc<std::sync::Mutex<crate::inferlet::host::working_set::Cursor>>,
-        rs: Option<crate::store::rs::RsWorkingSetId>,
+        rs: Option<RsDeviceFold>,
     },
+}
+
+/// The recurrent state a fold the device counts freezes with the KV, by the
+/// same count, when the fire settles. From the fire's submit until then its
+/// working set is marked in the store
+/// ([`crate::store::rs::RsStore::begin_device_fold`]): the engine's record
+/// stands ahead of the frozen length the runtime states, so the set is not
+/// forked, checkpointed, exported or moved. Every way the fire ends lifts
+/// the mark: its fold settling, counted or not ([`Self::settle`]), and,
+/// dropped before that, the engine being done with it.
+struct RsDeviceFold {
+    ws: crate::store::rs::RsWorkingSetId,
+    submitted: Option<(
+        std::sync::Arc<std::sync::Mutex<crate::store::rs::RsStore>>,
+        crate::engine::WorkItemCompletion,
+    )>,
+}
+
+impl RsDeviceFold {
+    /// What a fire dropped before it settled leaves its set refused with:
+    /// it may have folded, and nothing read by how much.
+    const DROPPED: &str = "pipeline: the fire was dropped before it settled";
+
+    fn planned(ws: crate::store::rs::RsWorkingSetId) -> Self {
+        Self {
+            ws,
+            submitted: None,
+        }
+    }
+
+    fn submitted(
+        &mut self,
+        stores: &crate::store::registry::Stores,
+        completion: &crate::engine::WorkItemCompletion,
+    ) {
+        stores.rs.lock().unwrap().begin_device_fold(self.ws);
+        self.submitted = Some((stores.rs.clone(), completion.clone()));
+    }
+
+    /// `slots` the fold froze, where the fire ran and reported them;
+    /// `failure` why it did not run.
+    fn settle(mut self, slots: Option<u32>, failure: Option<&str>) {
+        if let Some((store, _)) = self.submitted.take() {
+            store
+                .lock()
+                .unwrap()
+                .end_device_fold(self.ws, slots, failure);
+        }
+    }
+}
+
+impl Drop for RsDeviceFold {
+    fn drop(&mut self) {
+        let Some((store, completion)) = self.submitted.take() else {
+            return;
+        };
+        let ws = self.ws;
+        completion.on_settled(move || {
+            store
+                .lock()
+                .unwrap()
+                .end_device_fold(ws, None, Some(Self::DROPPED));
+        });
+    }
+}
+
+/// The fire is submitted: each working set whose recurrent state it folds
+/// by a count the device computes is marked until that fold settles.
+fn mark_device_folds(
+    stores: &crate::store::registry::Stores,
+    completion: &crate::engine::WorkItemCompletion,
+    parts: &mut [FireWs],
+) {
+    for part in parts {
+        if let Some(FoldAt {
+            by: FoldBy::Settled { rs: Some(rs), .. },
+            ..
+        }) = &mut part.fold
+        {
+            rs.submitted(stores, completion);
+        }
+    }
 }
 
 fn plain_decode(req: &crate::engine::FireRequest, adapted: bool, fire_wide_mask: bool) -> bool {
@@ -2813,7 +2891,10 @@ fn fold_at(
         .min(end);
     let (tags, rs) = match count {
         Some(_) => (Vec::new(), None),
-        None => (vec![report_on(req, first, tags)], rs),
+        None => (
+            vec![report_on(req, first, tags)],
+            rs.map(RsDeviceFold::planned),
+        ),
     };
     Some(FoldBy::Settled {
         count,
@@ -3795,6 +3876,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             for part in &mut parts {
                 part.kvtxn.retire_on(&completion);
             }
+            mark_device_folds(&stores, &completion, &mut parts);
             submitted.push(completion.clone());
             if let Some(reservation) = ticket_reservation {
                 reservation.commit();
@@ -4248,14 +4330,24 @@ pub(crate) async fn finalize_op_detached(op: PendingOp) -> Anyhow<()> {
 }
 
 /// The last fold of the working set to settle makes its cursor exact.
+/// `failure` is why the fire did not run to its end, when it did not: what
+/// it was to freeze stays unfrozen, and a recurrent state it folded by a
+/// count the device computes is left refused by that name.
 fn settle_fold(
     stores: &crate::store::registry::Stores,
     ws: crate::store::kv::page_table::WorkingSetId,
     fold: FoldAt,
     reported: &std::collections::HashMap<u64, ::engine::KvWrites>,
-    success: bool,
+    failure: Option<&str>,
 ) {
-    let FoldAt { by, decoded } = fold;
+    let success = failure.is_none();
+    let FoldAt { mut by, decoded } = fold;
+    // Taken before the kv lock: ending it takes the rs store's.
+    let device_fold = match &mut by {
+        FoldBy::Settled { rs, .. } => rs.take(),
+        FoldBy::To(_) => None,
+    };
+    let mut device_slots = None;
     let folded = crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
         let frozen = kv.folded(ws)?;
         let (to, cursor) = match by {
@@ -4265,7 +4357,7 @@ fn settle_fold(
                 tags,
                 reach,
                 cursor,
-                rs,
+                rs: _,
             } => {
                 let count = count.or_else(|| {
                     tags.iter()
@@ -4275,8 +4367,10 @@ fn settle_fold(
                 });
                 let to = count.map(|count| frozen.saturating_add(u64::from(count)).min(reach));
                 // The recurrent state froze the same slots on the device.
-                let rs = rs.zip(to).map(|(rs, to)| (rs, to.saturating_sub(frozen)));
-                (to, Some((cursor, to.is_some(), rs)))
+                device_slots = to
+                    .filter(|_| success)
+                    .map(|to| u32::try_from(to.saturating_sub(frozen)).unwrap_or(u32::MAX));
+                (to, Some((cursor, to.is_some())))
             }
         };
         let pages = match to.filter(|_| success) {
@@ -4288,13 +4382,6 @@ fn settle_fold(
     match folded {
         Ok((pages, frozen, cursor)) => {
             SEALED_PAGES.fetch_add(pages, std::sync::atomic::Ordering::Relaxed);
-            if let Some((_, _, Some((rs, slots)))) = &cursor
-                && success
-            {
-                let slots = u32::try_from(*slots).unwrap_or(u32::MAX);
-                stores.rs.lock().unwrap().fold(*rs, slots);
-            }
-            let cursor = cursor.map(|(cursor, placed, _)| (cursor, placed));
             if let Some((cursor, placed)) = cursor
                 && placed
             {
@@ -4306,7 +4393,15 @@ fn settle_fold(
                 }
             }
         }
-        Err(error) => tracing::debug!(%error, "pipeline: sealing what a fire froze"),
+        Err(error) => {
+            tracing::debug!(%error, "pipeline: sealing what a fire froze");
+            device_slots = None;
+        }
+    }
+    // The count lands and the mark lifts together, whichever way the fire
+    // ended: what waited on the set reads the frozen length this leaves.
+    if let Some(device_fold) = device_fold {
+        device_fold.settle(device_slots, failure);
     }
 }
 
@@ -4326,7 +4421,12 @@ async fn finalize_fire_await(fire: PendingFire) -> Anyhow<FinalizeOutcome> {
     } = fire;
     let prior_failure = failure.lock().unwrap().clone();
     let result = completion.await;
-    let success = result.is_ok() && prior_failure.is_none();
+    let failure_reason = prior_failure.or_else(|| {
+        result
+            .err()
+            .map(|error| format!("pipeline: forward failed: {error:#}"))
+    });
+    let success = failure_reason.is_none();
     let mut leases = Vec::with_capacity(kv.len());
 
     {
@@ -4393,7 +4493,7 @@ async fn finalize_fire_await(fire: PendingFire) -> Anyhow<FinalizeOutcome> {
         }
         // What the fire froze seals now that its rows are logged.
         for (ws, fold) in folds {
-            settle_fold(&stores, ws, fold, &reported, success);
+            settle_fold(&stores, ws, fold, &reported, failure_reason.as_deref());
         }
         for checkpoint in &checkpoints {
             take_checkpoint(&stores, checkpoint, success);
@@ -4408,11 +4508,6 @@ async fn finalize_fire_await(fire: PendingFire) -> Anyhow<FinalizeOutcome> {
         pass.close_native();
     }
 
-    let failure_reason = prior_failure.or_else(|| {
-        result
-            .err()
-            .map(|error| format!("pipeline: forward failed: {error:#}"))
-    });
     let action = if let Some(reason) = failure_reason {
         FinalizeAction::Fail {
             fwd_rep,
@@ -4918,6 +5013,7 @@ async fn fire_device_geometry<C: FireContext>(
     for part in &mut parts {
         part.kvtxn.retire_on(&completion);
     }
+    mark_device_folds(&stores, &completion, &mut parts);
     if let Some(ask) = rung_ask {
         ask.until_settled(&completion);
     }
@@ -4988,10 +5084,10 @@ pub(crate) mod lifecycle_tests {
     use super::*;
     use wasmtime::component::ResourceTable;
 
-    struct TestContext {
-        id: uuid::Uuid,
-        resources: ResourceTable,
-        tails: Vec<PendingFires>,
+    pub(super) struct TestContext {
+        pub(super) id: uuid::Uuid,
+        pub(super) resources: ResourceTable,
+        pub(super) tails: Vec<PendingFires>,
     }
 
     impl FireContext for TestContext {
@@ -6121,7 +6217,7 @@ mod fold_tests {
             cursor: cell.clone(),
             rs: None,
         };
-        settle_fold(&stores, ws, FoldAt { by, decoded: true }, &reported, true);
+        settle_fold(&stores, ws, FoldAt { by, decoded: true }, &reported, None);
         assert_eq!(stores.kv.lock().folded(ws).unwrap(), 7);
         let now = cell.lock().unwrap().clone();
         assert!(now.folded_exact && now.unsettled == 0 && now.folded == 7);
@@ -6146,10 +6242,10 @@ mod fold_tests {
             decoded: false,
         };
         let none = std::collections::HashMap::new();
-        settle_fold(&stores, ws, settled(2, 20), &none, true);
+        settle_fold(&stores, ws, settled(2, 20), &none, None);
         assert!(!cell.lock().unwrap().folded_exact, "another is on its way");
         // Counted from where the first left it, short of what the fire wrote.
-        settle_fold(&stores, ws, settled(9, 10), &none, true);
+        settle_fold(&stores, ws, settled(9, 10), &none, None);
         assert_eq!(stores.kv.lock().folded(ws).unwrap(), 10);
         let now = cell.lock().unwrap().clone();
         assert!(now.folded_exact && now.folded == 10);
@@ -6175,11 +6271,286 @@ mod fold_tests {
             ws,
             FoldAt { by, decoded: false },
             &std::collections::HashMap::new(),
-            true,
+            None,
         );
         assert_eq!(stores.kv.lock().folded(ws).unwrap(), 4);
         let now = cell.lock().unwrap().clone();
         assert!(!now.folded_exact && now.unsettled == 1);
+    }
+
+    // A fold the device counts, between its fire's submit and its settle:
+    // the set's recurrent state is not forked, kept or moved, and what
+    // waits for it is woken by the fire's end, however it ends.
+
+    use super::lifecycle_tests::{TestContext, resolve_test_completion};
+    use crate::store::rs::{RsError, RsWorkingSetId, device_folds_settled};
+    use futures::FutureExt;
+
+    /// One fire in flight on a pipeline, on a working set frozen at 4 in
+    /// both stores with 12 slots reserved.
+    struct Flight {
+        stores: crate::store::registry::Stores,
+        fires: PendingFires,
+        completion: crate::engine::WorkItemCompletion,
+        failure: PipelineFailure,
+        kv: KvWorkingSet,
+        rs: RsWorkingSetId,
+        /// What its first lane reports under, where the device counts.
+        tag: u64,
+    }
+
+    impl Flight {
+        fn fork(&self) -> Result<u32, RsError> {
+            let mut rs = self.stores.rs.lock().unwrap();
+            let child = rs.fork(self.rs)?;
+            rs.frozen(child)
+        }
+
+        fn exported(&self) -> Result<u32, RsError> {
+            let rs = self.stores.rs.lock().unwrap();
+            rs.export(self.rs).map(|_| rs.frozen(self.rs).unwrap())
+        }
+
+        fn frozen(&self) -> (u64, u32) {
+            (
+                self.stores.kv.lock().folded(self.kv.id).unwrap(),
+                self.stores.rs.lock().unwrap().frozen(self.rs).unwrap(),
+            )
+        }
+
+        fn context() -> TestContext {
+            TestContext {
+                id: uuid::Uuid::new_v4(),
+                resources: wasmtime::component::ResourceTable::new(),
+                tails: Vec::new(),
+            }
+        }
+    }
+
+    /// `exact` is whether the host knew the frozen length when it planned
+    /// the fold; `reach` where the fire's own rows end, where it knew.
+    fn in_flight(fold: &geometry::Fold, exact: bool, reach: Option<u64>) -> Flight {
+        let model = crate::store::registry::register_model(4, &[8], &[1]);
+        let stores = crate::store::registry::get(model, 0);
+        let id = {
+            let mut kv = stores.kv.lock();
+            let id = kv.create_working_set();
+            kv.fold(id, 4, false).unwrap();
+            id
+        };
+        let rs = {
+            let mut rs = stores.rs.lock().unwrap();
+            let ws = rs.create_working_set(crate::store::rs::RsGeometry {
+                state_size: 8,
+                buffer_page_tokens: 4,
+            });
+            rs.fold(ws, 4);
+            ws
+        };
+        let cell = cursor(4, 12);
+        cell.lock().unwrap().folded_exact = exact;
+        let pass = lanes(&[&cell]);
+        let mut req = request(1);
+        let mut tags = Vec::new();
+        let by = fold_at(
+            &pass,
+            &[0],
+            reach,
+            fold,
+            u64::MAX,
+            true,
+            Some(rs),
+            &mut req,
+            &mut tags,
+        )
+        .expect("the fire folds");
+        let kv = KvWorkingSet::new(model, 0, id, 8);
+        let completion = crate::engine::WorkItemCompletion::deferred_with_guard(None);
+        let mut parts = vec![FireWs {
+            ws: id,
+            kvtxn: KvTxnGuard::new(model, 0, None),
+            log: None,
+            lease: kv.fire_lease().expect("lease the submitted working set"),
+            fold: Some(FoldAt { by, decoded: false }),
+            reports: tags,
+            staged: None,
+        }];
+        // The submit.
+        mark_device_folds(&stores, &completion, &mut parts);
+        let failure: PipelineFailure = Arc::new(Mutex::new(None));
+        let fires = Arc::new(PendingFireQueue::new());
+        fires
+            .lock()
+            .unwrap()
+            .push_back(PendingOp::Fire(PendingFire {
+                completion: completion.clone(),
+                checkpoints: Vec::new(),
+                kv: parts,
+                device_geometry: true,
+                rstxn: RsTxnsGuard::new(model, 0, None),
+                model,
+                engine: 0,
+                fwd_rep: u32::MAX,
+                cells: Vec::new(),
+                failure: failure.clone(),
+                retired: None,
+            }));
+        Flight {
+            stores,
+            fires,
+            completion,
+            failure,
+            kv,
+            rs,
+            tag: req.lanes[0].reports,
+        }
+    }
+
+    /// The in-pass fork: the guest forks a set between its own pipelined
+    /// fires. The host fork runs the pipeline's fires to their end
+    /// ([`drain_pipeline_fires`], which only its own task can); a handle's
+    /// fork, a save and the planner's suspend wait on the store and on the
+    /// fire's lease. None ends before the fire settles, and each then reads
+    /// the frozen length the device's count left.
+    #[tokio::test(flavor = "current_thread")]
+    async fn what_copies_or_moves_a_set_waits_for_the_fold_the_device_counts() -> Anyhow<()> {
+        let flight = in_flight(&geometry::Fold::Device, true, None);
+        let mut ctx = Flight::context();
+        assert_eq!(flight.fork(), Err(RsError::DeviceFoldUnsettled));
+        assert_eq!(flight.exported(), Err(RsError::DeviceFoldUnsettled));
+        let sets = [flight.rs];
+        let mut waiting = Box::pin(device_folds_settled(&flight.stores.rs, &sets));
+        assert!(waiting.as_mut().now_or_never().is_none());
+        let suspend = flight.kv.suspend_handle();
+        let mut quiesce = Box::pin(suspend.quiesce());
+        assert!(quiesce.as_mut().now_or_never().is_none());
+        {
+            let mut drain = Box::pin(drain_pipeline_fires(&mut ctx, &flight.fires));
+            assert!(
+                drain.as_mut().now_or_never().is_none(),
+                "the fork goes no further than the fire in flight"
+            );
+            assert_eq!(flight.frozen(), (4, 4), "what a copy made now would state");
+            record_kv_writes(vec![report(flight.tag, 3)]);
+            resolve_test_completion(&flight.completion, false);
+            drain.await?;
+        }
+        assert!(waiting.as_mut().now_or_never().is_some());
+        assert!(quiesce.as_mut().now_or_never().is_some());
+        assert_eq!(flight.frozen(), (7, 7));
+        assert_eq!(flight.fork(), Ok(7), "the child takes what the fold left");
+        assert_eq!(flight.exported(), Ok(7));
+        assert!(flight.failure.lock().unwrap().is_none());
+        Ok(())
+    }
+
+    /// A pass that fails releases whoever waited, and what they asked for
+    /// is refused by the pass's own failure: the engine's, or that of the
+    /// pipeline's earlier fire.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_pass_ends_the_wait_with_its_failure() -> Anyhow<()> {
+        for earlier in [None, Some("pipeline: an earlier fire failed")] {
+            let flight = in_flight(&geometry::Fold::Device, true, None);
+            let mut ctx = Flight::context();
+            let sets = [flight.rs];
+            let mut waiting = Box::pin(device_folds_settled(&flight.stores.rs, &sets));
+            assert!(waiting.as_mut().now_or_never().is_none());
+            *flight.failure.lock().unwrap() = earlier.map(str::to_string);
+            record_kv_writes(vec![report(flight.tag, 3)]);
+            resolve_test_completion(&flight.completion, earlier.is_none());
+            drain_pipeline_fires(&mut ctx, &flight.fires).await?;
+            assert!(waiting.as_mut().now_or_never().is_some(), "it never hangs");
+            let reason = flight
+                .failure
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("the pipeline failed: the host fork refuses by this");
+            match earlier {
+                Some(earlier) => assert_eq!(reason, earlier),
+                None => assert!(
+                    reason.starts_with("pipeline: forward failed") && reason.contains("test"),
+                    "{reason}"
+                ),
+            }
+            assert_eq!(
+                flight.fork(),
+                Err(RsError::DeviceFoldFailed(reason.clone()))
+            );
+            assert_eq!(flight.exported(), Err(RsError::DeviceFoldFailed(reason)));
+            assert_eq!(
+                flight.frozen(),
+                (4, 4),
+                "a count from a failed pass is not taken"
+            );
+        }
+        Ok(())
+    }
+
+    /// A fold the host counts states the frozen length at submit: nothing
+    /// waits on its fire.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_fold_the_host_counts_delays_nothing() -> Anyhow<()> {
+        let host = geometry::Fold::Host(vec![2]);
+        for (exact, reach) in [(true, Some(10)), (false, None)] {
+            let flight = in_flight(&host, exact, reach);
+            let mut ctx = Flight::context();
+            let sets = [flight.rs];
+            assert_eq!(flight.tag, 0, "the host needs no report");
+            assert!(
+                device_folds_settled(&flight.stores.rs, &sets)
+                    .now_or_never()
+                    .is_some()
+            );
+            assert_eq!(flight.fork(), Ok(4));
+            assert_eq!(flight.exported(), Ok(4));
+            let mut drain = Box::pin(drain_pipeline_fires(&mut ctx, &flight.fires));
+            assert!(
+                drain.as_mut().now_or_never().is_none(),
+                "while its fire is still in flight"
+            );
+            resolve_test_completion(&flight.completion, false);
+            drain.await?;
+            assert_eq!(flight.frozen().0, 6);
+        }
+        Ok(())
+    }
+
+    /// A fire dropped before anything settled it (its process torn down)
+    /// still lifts the mark: when the engine is done with it, or when the
+    /// engine itself is gone and its completion with it. What it folded is
+    /// then not known, and the set says so.
+    #[test]
+    fn a_fire_dropped_unsettled_lifts_the_mark_when_the_engine_is_done_with_it() {
+        let dropped = || RsError::DeviceFoldFailed(RsDeviceFold::DROPPED.to_string());
+        for lost in [false, true] {
+            let Flight {
+                stores,
+                fires,
+                completion,
+                rs,
+                ..
+            } = in_flight(&geometry::Fold::Device, true, None);
+            let sets = [rs];
+            let mut waiting = Box::pin(device_folds_settled(&stores.rs, &sets));
+            drop(fires);
+            assert_eq!(
+                stores.rs.lock().unwrap().device_fold_gate(rs),
+                Err(RsError::DeviceFoldUnsettled),
+                "the engine may still run it"
+            );
+            assert!(waiting.as_mut().now_or_never().is_none());
+            if lost {
+                drop(completion);
+            } else {
+                resolve_test_completion(&completion, false);
+            }
+            assert!(waiting.as_mut().now_or_never().is_some());
+            assert_eq!(
+                stores.rs.lock().unwrap().device_fold_gate(rs),
+                Err(dropped())
+            );
+        }
     }
 }
 

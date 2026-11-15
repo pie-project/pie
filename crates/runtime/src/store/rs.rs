@@ -102,6 +102,16 @@ pub enum RsError {
     },
     #[error("rs grant mismatch: required {required}, granted {granted}")]
     GrantMismatch { required: RsUnits, granted: RsUnits },
+    #[error(
+        "a fire on its way folds this working set's recurrent state by a count the device \
+         computes; it is not forked, checkpointed, exported or moved until that fire settles"
+    )]
+    DeviceFoldUnsettled,
+    #[error(
+        "a fire that folded this working set's recurrent state by a count the device computes \
+         did not settle ({0}): how far its record is folded is not known"
+    )]
+    DeviceFoldFailed(String),
 }
 
 pub const RS_TRANSLATION_UNMAPPED: u32 = u32::MAX;
@@ -256,6 +266,17 @@ struct RsEntry {
     frozen: u32,
     windows: Vec<Vec<Option<RsSlotId>>>,
     window: Option<WindowState>,
+    /// Fires on their way that fold the state by a count the device
+    /// computes ([`RsStore::begin_device_fold`]). Until the last settles the
+    /// engine's record stands ahead of `frozen` by slots only the engine
+    /// counts, and only where the record stands now: the set is not forked,
+    /// checkpointed, exported or moved.
+    device_folds: u32,
+    /// Why such a fire did not settle its fold: `frozen` no longer says
+    /// where the record stands, until the state is forgotten. The set is
+    /// refused a fork, a checkpoint and an export by it, and its record
+    /// stays where the engine holds it.
+    device_fold_failed: Option<String>,
 }
 
 #[derive(Debug)]
@@ -310,6 +331,10 @@ pub struct RsStore {
     /// Told whenever a move lets slots go: what waits for a set to stop
     /// moving waits on it.
     moved: std::sync::Arc<tokio::sync::Notify>,
+    /// Told whenever a fold the device counted settles, however its fire
+    /// ended: what waits for a set's frozen length to be the record's waits
+    /// on it.
+    device_folded: std::sync::Arc<tokio::sync::Notify>,
     /// The tokens an rs list slot holds, where the buffer pages are a
     /// shared pool's rs list (CONTRACT-BC 18): a page holds that many rows,
     /// whatever a set's geometry says, and the buffer starts at a multiple
@@ -484,6 +509,7 @@ impl RsStore {
             checkpoints: HashMap::new(),
             moving: HashSet::new(),
             moved: std::sync::Arc::new(tokio::sync::Notify::new()),
+            device_folded: std::sync::Arc::new(tokio::sync::Notify::new()),
             rs_tokens: None,
         }
     }
@@ -733,11 +759,16 @@ impl RsStore {
             frozen: 0,
             windows: vec![Vec::new(); self.window.len()],
             window: windowed.then(WindowState::default),
+            device_folds: 0,
+            device_fold_failed: None,
         })
     }
 
-    /// What a snapshot keeps of `ws`, on the rows it stands on now.
+    /// What a snapshot keeps of `ws`, on the rows it stands on now: not
+    /// while its frozen length is behind its record
+    /// ([`Self::device_fold_gate`]), which an export leaves the engine with.
     pub fn export(&self, ws: RsWorkingSetId) -> Result<RsExport, RsError> {
+        self.device_fold_gate(ws)?;
         let entry = self.entry(ws)?;
         Ok(RsExport {
             folded: entry.folded,
@@ -844,15 +875,92 @@ impl RsStore {
             frozen: set.frozen,
             windows: set.windows,
             window: set.window,
+            device_folds: 0,
+            device_fold_failed: None,
         })
     }
 
+    /// Not while a fire on its way folds `ws` by a count the device
+    /// computes, nor once such a fire failed ([`Self::device_fold_gate`]):
+    /// the child would state a frozen length behind its copy of the record.
     pub fn fork(&mut self, ws: RsWorkingSetId) -> Result<RsWorkingSetId, RsError> {
+        self.device_fold_gate(ws)?;
         let entry = self.entry(ws)?.clone();
         for id in Self::slots(&entry) {
             *self.refs.entry(id).or_insert(1) += 1;
         }
         Ok(self.working_sets.insert(entry))
+    }
+
+    /// A fire that folds `ws` by a count the device computes was submitted:
+    /// from here until [`Self::end_device_fold`] its record is ahead of its
+    /// frozen length by slots the runtime cannot count.
+    pub fn begin_device_fold(&mut self, ws: RsWorkingSetId) {
+        if let Ok(entry) = self.entry_mut(ws) {
+            entry.device_folds += 1;
+        }
+    }
+
+    /// The fire [`Self::begin_device_fold`] counted is done, however it
+    /// ended: `slots` it froze, where it ran and reported them, and
+    /// `failure` why it did not run to its end. The count lands and the
+    /// mark lifts under one lock, so whoever waited sees the frozen length
+    /// the fold left.
+    pub fn end_device_fold(
+        &mut self,
+        ws: RsWorkingSetId,
+        slots: Option<u32>,
+        failure: Option<&str>,
+    ) {
+        if let Some(slots) = slots {
+            self.fold(ws, slots);
+        }
+        if let Ok(entry) = self.entry_mut(ws) {
+            entry.device_folds = entry.device_folds.saturating_sub(1);
+            if let Some(failure) = failure {
+                entry
+                    .device_fold_failed
+                    .get_or_insert_with(|| failure.to_string());
+            }
+        }
+        self.device_folded.notify_waiters();
+    }
+
+    /// Whether `ws`'s frozen length is where its record stands: what a copy
+    /// of the record, or the record somewhere the engine does not follow it
+    /// (another tier, an export), is told to replay from.
+    pub fn device_fold_gate(&self, ws: RsWorkingSetId) -> Result<(), RsError> {
+        let entry = self.entry(ws)?;
+        if entry.device_folds > 0 {
+            return Err(RsError::DeviceFoldUnsettled);
+        }
+        match &entry.device_fold_failed {
+            Some(failure) => Err(RsError::DeviceFoldFailed(failure.clone())),
+            None => Ok(()),
+        }
+    }
+
+    /// Told whenever a fold the device counted settles
+    /// ([`Self::device_fold_gate`] may have turned): arm it before looking.
+    pub fn device_folds_ended(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        std::sync::Arc::clone(&self.device_folded)
+    }
+
+    /// The slots of `working_sets` a suspend leaves on the device: those a
+    /// fire on its way writes, and every slot of a set a fire on its way
+    /// folds by a count the device computes, or one that failed did, whose
+    /// record the engine alone knows the length of, and only where it
+    /// stands.
+    fn unsettled_slots(&self, working_sets: &HashSet<RsWorkingSetId>) -> HashSet<RsSlotId> {
+        let mut slots = self.busy_slots();
+        slots.extend(
+            working_sets
+                .iter()
+                .filter_map(|&ws| self.working_sets.get(ws))
+                .filter(|entry| entry.device_folds > 0 || entry.device_fold_failed.is_some())
+                .flat_map(Self::slots),
+        );
+        slots
     }
 
     /// Told whenever a move lets slots go ([`Self::in_move`] may have
@@ -872,6 +980,10 @@ impl RsStore {
         let Some(entry) = self.working_sets.remove(ws) else {
             return 0;
         };
+        if entry.device_folds > 0 {
+            // Nothing is left to wait for.
+            self.device_folded.notify_waiters();
+        }
         let ids: Vec<RsSlotId> = Self::slots(&entry).collect();
         self.decref_all(&ids)
     }
@@ -1024,7 +1136,8 @@ impl RsStore {
     /// Not when a fire on its way still writes it, or a suspend took it to the
     /// host. A window's checkpoint is its pages within the window, shared by
     /// refcount like the kv list's (CONTRACT-BC 19); another state's, its
-    /// folded state.
+    /// folded state. Refused by name while the frozen length is behind the
+    /// record ([`Self::device_fold_gate`]): a checkpoint is a fork.
     pub fn checkpoint(
         &mut self,
         ws: RsWorkingSetId,
@@ -1070,6 +1183,7 @@ impl RsStore {
         if at == 0 || at > window.committed || self.holds_host(entry) || self.unsettled(ws) {
             return Ok(false);
         }
+        self.device_fold_gate(ws)?;
         let mut snapshot = entry.clone();
         let mut state = WindowState {
             committed: at,
@@ -1245,6 +1359,8 @@ impl RsStore {
             let entry = self.entry_mut(ws)?;
             entry.base = 0;
             entry.frozen = 0;
+            // No record is left for a frozen length to be behind.
+            entry.device_fold_failed = None;
             entry.window = entry.window.map(|_| WindowState::default());
             let lists = entry.windows.len();
             (
@@ -1796,6 +1912,8 @@ impl RsStore {
                 frozen: frozen + row,
                 windows: Vec::new(),
                 window: None,
+                device_folds: 0,
+                device_fold_failed: None,
             });
             snapshots.push(RsSnapshot {
                 ws,
@@ -2089,12 +2207,16 @@ impl RsStore {
     /// Parks the sets' private, settled slots in host rows, when rows for
     /// all of them are free, and the checkpoints sharing them with them;
     /// otherwise they stay on the device, nothing is dropped, and `None`
-    /// says so ([`Self::suspend_short`] tells what the host lacks).
+    /// says so ([`Self::suspend_short`] tells what the host lacks). A set a
+    /// fire on its way folds by a count the device computes is not settled:
+    /// its slots stay where the engine holds the record
+    /// ([`device_folds_settled`] waits for it), as do those of a set such a
+    /// fire failed on, whose frozen length the record may stand past.
     pub fn prepare_suspend(
         &mut self,
         working_sets: &HashSet<RsWorkingSetId>,
     ) -> Option<RsResidencyTxn> {
-        let busy = self.busy_slots();
+        let busy = self.unsettled_slots(working_sets);
         let slots: Vec<RsSlotId> = self
             .private(working_sets)
             .into_iter()
@@ -2112,7 +2234,7 @@ impl RsStore {
     /// The host rows a suspend of `working_sets` would take beyond those
     /// free: what keeps its state on the device. Zero when it fits.
     pub fn suspend_short(&self, working_sets: &HashSet<RsWorkingSetId>) -> RsUnits {
-        let busy = self.busy_slots();
+        let busy = self.unsettled_slots(working_sets);
         let need = self.units(
             self.private(working_sets)
                 .into_iter()
@@ -2451,5 +2573,32 @@ impl RsStore {
         });
         self.recycle(vec![id], epoch);
         true
+    }
+}
+
+/// Returns once no fire on its way folds any of `sets` by a count the
+/// device computes: woken by each such fold settling
+/// ([`RsStore::end_device_fold`]), which every way a fire ends reaches, and
+/// by a set's release. Whether a fold failed is the caller's to read next
+/// ([`RsStore::device_fold_gate`]).
+pub async fn device_folds_settled(store: &std::sync::Mutex<RsStore>, sets: &[RsWorkingSetId]) {
+    let ended = store.lock().unwrap().device_folds_ended();
+    loop {
+        let notified = ended.notified();
+        let mut notified = std::pin::pin!(notified);
+        notified.as_mut().enable();
+        let unsettled = {
+            let store = store.lock().unwrap();
+            sets.iter().any(|&ws| {
+                store
+                    .working_sets
+                    .get(ws)
+                    .is_some_and(|entry| entry.device_folds > 0)
+            })
+        };
+        if !unsettled {
+            return;
+        }
+        notified.await;
     }
 }
