@@ -3,13 +3,13 @@ use eta_compiler::codegen::launch::{LaunchRegion, LaunchStagePlan};
 use eta_compiler::plan::{LibraryOp, RegionKind};
 use eta_exec::{
     Extents, LANE_HEADER_BYTES, LANE_RECORD_BYTES, LaneChannelSlot, LaneHeader, LaneRecord,
-    LaneShape, Layout, Lifetime, NO_TICKET, OpParams, SCRATCH_ALIGN, ValueDesc, describe, layout,
-    layout_reusing,
+    LaneShape, Launch, Launches, Layout, NO_TICKET, OpParams, SCRATCH_ALIGN, ValueDesc,
+    describe_launched, region_rows,
 };
 use eta_ir::Dtype;
 use eta_ir::container::HostRole;
 use eta_ir::op::tags;
-use eta_ir::types::{MAX_RANK, name_or_unknown};
+use eta_ir::types::name_or_unknown;
 
 use std::sync::Arc;
 
@@ -636,281 +636,26 @@ pub(crate) fn shell_launches(region: &LaunchRegion) -> bool {
     region.kind != RegionKind::Library(LibraryOp::SecondParty)
 }
 
-#[must_use]
-fn read_only_by_skipped_regions(plan: &LaunchStagePlan) -> Vec<bool> {
-    let values = plan.value_types.len();
-
-    let mut producer = vec![usize::MAX; values];
-    let mut result_base = 0u32;
-    for (node, op) in plan.ops.iter().enumerate() {
-        for result in 0..u32::from(op.result_count) {
-            if let Some(slot) = producer.get_mut((result_base + result) as usize) {
-                *slot = node;
-            }
-        }
-        result_base += u32::from(op.result_count);
-    }
-
-    let mut skipped = vec![false; plan.ops.len()];
-    let mut unread = vec![false; values];
-    for region in plan.fused.iter().filter(|region| !shell_launches(region)) {
-        for &node in &region.nodes {
-            if let Some(node) = skipped.get_mut(node as usize) {
-                *node = true;
-            }
-        }
-        for value in region.inputs.iter().copied().chain(
-            region
-                .nodes
-                .iter()
-                .filter_map(|&node| plan.ops.get(node as usize))
-                .flat_map(|op| op.reads()),
-        ) {
-            if let Some(value) = unread.get_mut(value as usize) {
-                *value = true;
-            }
-        }
-    }
-
-    for (node, op) in plan.ops.iter().enumerate() {
-        if skipped.get(node).copied().unwrap_or(false) {
-            continue;
-        }
-        for value in op.reads() {
-            if let Some(value) = unread.get_mut(value as usize) {
-                *value = false;
-            }
-        }
-    }
-    for region in plan.fused.iter().filter(|region| shell_launches(region)) {
-        for sink in &region.sinks {
-            if let Some(value) = unread.get_mut(sink.value as usize) {
-                *value = false;
-            }
-        }
-    }
-
-    for (value, drop) in unread.iter_mut().enumerate() {
-        let tag = producer
-            .get(value)
-            .and_then(|&node| plan.ops.get(node))
-            .map(|op| op.tag);
-        if !matches!(tag, Some(tags::CHAN_READ | tags::CHAN_TAKE)) {
-            *drop = false;
-        }
-    }
-    unread
-}
-
 pub fn describe_values(plan: &LaunchStagePlan, extents: Extents) -> Result<Vec<ValueDesc>> {
-    let empty = read_only_by_skipped_regions(plan);
-    plan.value_types
-        .iter()
-        .enumerate()
-        .map(|(value, declared)| {
-            let described = describe(declared, &extents).map_err(|why| {
-                Fault::program(
-                    "program::launch",
-                    format!("a value's shape does not resolve against this fire: {why:?}"),
-                )
-            })?;
-            Ok(if empty.get(value).copied().unwrap_or(false) {
-                ValueDesc {
-                    len: 0,
-                    rows: 0,
-                    last: 0,
-                    dims: [0; MAX_RANK],
-                    ..described
-                }
-            } else {
-                described
-            })
-        })
-        .collect()
+    describe_launched(plan, &extents, shell_launches).map_err(|why| {
+        Fault::program(
+            "program::launch",
+            format!("a value's shape does not resolve against this fire: {why:?}"),
+        )
+    })
 }
 
-fn value_lifetimes(plan: &LaunchStagePlan, rows: &[u32]) -> Option<Vec<Lifetime>> {
-    let mut step_of = vec![u32::MAX; plan.ops.len()];
-    let mut region_of = vec![u32::MAX; plan.ops.len()];
-    let mut region_first = Vec::with_capacity(plan.fused.len());
-    let mut region_last = Vec::with_capacity(plan.fused.len());
-    let mut step = 0u32;
-    for (index, region) in plan.fused.iter().enumerate() {
-        let per_node = region.kind == RegionKind::Generated;
-        region_first.push(step);
-        let run = if region.order.is_empty() {
-            &region.nodes
-        } else {
-            &region.order
-        };
-        for &node in run {
-            *step_of.get_mut(node as usize)? = step;
-            *region_of.get_mut(node as usize)? = u32::try_from(index).ok()?;
-            if per_node {
-                step = step.checked_add(1)?;
-            }
-        }
-        if !per_node {
-            step = step.checked_add(1)?;
-        }
-        region_last.push(step.saturating_sub(1));
-    }
-    if step_of.contains(&u32::MAX) {
-        return None;
-    }
-    let region_of_step = |step: u32| -> u32 {
-        region_first
-            .partition_point(|&first| first <= step)
-            .saturating_sub(1) as u32
-    };
-    let class_of = |region: u32, value: u32| -> u64 {
-        let Some(fused) = plan.fused.get(region as usize) else {
-            return Lifetime::SEQUENTIAL;
-        };
-        if rows.get(region as usize).copied().unwrap_or(1) <= 1 {
-            return Lifetime::SEQUENTIAL;
-        }
-        let geometry = fused
-            .row_value
-            .and_then(|witness| plan.value_types.get(witness as usize))
-            .and_then(|ty| eta_compiler::plan::value_rows(&ty.axes));
-        let Some(geometry) = geometry else {
-            return 0;
-        };
-        let Some(ty) = plan.value_types.get(value as usize) else {
-            return 0;
-        };
-        let elem: u64 = if ty.dtype == Dtype::Bool { 1 } else { 4 };
-        let alias = fused.row_alias;
-        if ty.axes.len() >= 2
-            && eta_compiler::plan::value_rows(&ty.axes)
-                .is_some_and(|shape| eta_compiler::plan::same_rows(shape, geometry, alias))
-        {
-            let width = match ty.axes.last() {
-                Some(eta_compiler::plan::Dimension::Static(width)) => u64::from(*width),
-                _ => return 0,
-            };
-            (1u64 << 40) | (width * elem)
-        } else if eta_compiler::plan::is_row_vector(&ty.axes, geometry.0, geometry.1, alias) {
-            (2u64 << 40) | elem
-        } else {
-            0
-        }
-    };
-    let values = plan.value_types.len();
-    let mut lifetimes = vec![
-        Lifetime {
-            dead: false,
-            def: 0,
-            last: 0,
-            reusable: false,
-            launch_def: 0,
-            launch_last: 0,
-            class_def: Lifetime::SEQUENTIAL,
-            class_last: Lifetime::SEQUENTIAL,
-        };
-        values
-    ];
-    let mut alias_of = vec![u32::MAX; values];
-    let bump = |lifetimes: &mut Vec<Lifetime>, alias_of: &[u32], mut value: u32, step: u32| {
-        for _ in 0..=alias_of.len() {
-            let Some(life) = lifetimes.get_mut(value as usize) else {
-                return;
-            };
-            life.last = life.last.max(step);
-            match alias_of.get(value as usize).copied() {
-                Some(source) if source != u32::MAX => value = source,
-                _ => return,
-            }
-        }
-    };
-    let mut result_base = 0u32;
-    for (node, op) in plan.ops.iter().enumerate() {
-        let step = step_of[node];
-        let written_in_full = !matches!(
-            op.tag,
-            tags::PIVOT_THRESHOLD | tags::CHAN_READ | tags::CHAN_TAKE
-        );
-        for result in 0..u32::from(op.result_count) {
-            if let Some(life) = lifetimes.get_mut((result_base + result) as usize) {
-                life.def = step;
-                life.last = life.last.max(step);
-                life.reusable = written_in_full;
-                life.launch_def = region_of[node];
-            }
-        }
-        if op.tag == tags::RESHAPE
-            && let Some(&source) = op.args.first()
-            && let Some(slot) = alias_of.get_mut(result_base as usize)
-        {
-            *slot = source;
-        }
-        result_base += u32::from(op.result_count);
-        let region = region_of[node];
-        let generated = plan
-            .fused
-            .get(region as usize)
-            .is_some_and(|fused| fused.kind == RegionKind::Generated);
-        for value in op.reads() {
-            bump(&mut lifetimes, &alias_of, value, step);
-            if generated
-                && lifetimes
-                    .get(value as usize)
-                    .is_some_and(|life| life.launch_def == region && life.last >= life.def)
-                && let Some(&last) = region_last.get(region as usize)
-            {
-                bump(&mut lifetimes, &alias_of, value, last);
-            }
-        }
-    }
-    for (region, fused) in plan.fused.iter().enumerate() {
-        let step = region_last[region];
-        let named = fused
-            .inputs
-            .iter()
-            .chain(fused.outputs.iter())
-            .copied()
-            .chain(fused.sinks.iter().map(|sink| sink.value));
-        for value in named {
-            bump(&mut lifetimes, &alias_of, value, step);
-        }
-    }
-    for (value, life) in lifetimes.iter_mut().enumerate() {
-        let value = value as u32;
-        life.launch_last = region_of_step(life.last);
-        life.class_def = class_of(life.launch_def, value);
-        life.class_last = class_of(life.launch_last, value);
-        if life.class_last == 0 {
-            life.last = life.last.max(region_last[life.launch_last as usize]);
-        }
-    }
-    for fused in &plan.fused {
-        for &value in &fused.spent {
-            if let Some(life) = lifetimes.get_mut(value as usize) {
-                life.dead = true;
-            }
-        }
-    }
-    Some(lifetimes)
-}
-
-fn region_rows(plan: &LaunchStagePlan, descriptors: &[ValueDesc]) -> Vec<u32> {
+/// The blocks each region runs across.
+fn region_blocks(plan: &LaunchStagePlan, descriptors: &[ValueDesc]) -> Vec<u32> {
     plan.fused
         .iter()
-        .map(|region| {
-            let rows = region
-                .row_value
-                .and_then(|value| descriptors.get(value as usize))
-                .map_or(1, |descriptor| descriptor.rows.max(1));
-            match region.kind {
-                RegionKind::Generated => rows,
-                kind if lane_sampler(kind) => LANE_SAMPLER_BLOCKS,
-                RegionKind::Library(LibraryOp::TopK) if selects(plan, region) => rows,
-                RegionKind::Library(LibraryOp::TopK | LibraryOp::Sort) => {
-                    rows.min(ORDER_ROW_BLOCKS)
-                }
-                RegionKind::Library(_) => 1,
-            }
+        .zip(region_rows(plan, descriptors))
+        .map(|(region, rows)| match region.kind {
+            RegionKind::Generated => rows,
+            kind if lane_sampler(kind) => LANE_SAMPLER_BLOCKS,
+            RegionKind::Library(LibraryOp::TopK) if selects(plan, region) => rows,
+            RegionKind::Library(LibraryOp::TopK | LibraryOp::Sort) => rows.min(ORDER_ROW_BLOCKS),
+            RegionKind::Library(_) => 1,
         })
         .collect()
 }
@@ -956,15 +701,30 @@ fn temporary_floor(plan: &LaunchStagePlan, descriptors: &[ValueDesc], rows: &[u3
         .unwrap_or(0)
 }
 
-fn lay_out(plan: &LaunchStagePlan, descriptors: &[ValueDesc]) -> Result<Layout> {
-    let rows = region_rows(plan, descriptors);
-    let lifetimes = value_lifetimes(plan, &rows);
-    let floor = temporary_floor(plan, descriptors, &rows);
-    match lifetimes {
-        Some(lifetimes) => layout_reusing(descriptors, &lifetimes, floor),
-        None => layout(descriptors),
+/// The stage as this engine runs it: a launch a region across its blocks,
+/// a value a generated region streams taking no bytes.
+fn launches<'a>(plan: &'a LaunchStagePlan, blocks: &[u32], temporary_floor: u64) -> Launches<'a> {
+    Launches {
+        each: plan
+            .fused
+            .iter()
+            .zip(blocks)
+            .map(|(region, &blocks)| Launch::of_region(region, blocks))
+            .collect(),
+        hollow: plan
+            .fused
+            .iter()
+            .flat_map(|region| region.spent.iter().copied())
+            .collect(),
+        temporary_floor,
+        ..Launches::default()
     }
-    .map_err(|why| {
+}
+
+fn lay_out(plan: &LaunchStagePlan, descriptors: &[ValueDesc]) -> Result<Layout> {
+    let blocks = region_blocks(plan, descriptors);
+    let floor = temporary_floor(plan, descriptors, &blocks);
+    eta_exec::lay_out(plan, descriptors, &launches(plan, &blocks, floor)).map_err(|why| {
         Fault::program(
             "program::launch",
             format!("this fire's scratch does not fit: {why:?}"),
@@ -1001,7 +761,7 @@ impl Prepared {
             .map_err(|_| Fault::program("program::launch", "a temporary offset past a u32"))?;
         let temporary_bytes = u32::try_from(scratch_layout.temporary_bytes)
             .map_err(|_| Fault::program("program::launch", "a temporary arena past a u32"))?;
-        let region_rows = region_rows(plan, &descriptors);
+        let region_rows = region_blocks(plan, &descriptors);
         let samplers = plan
             .fused
             .iter()
@@ -1675,9 +1435,314 @@ pub fn launch(
     }
 }
 
+/// The layout as this engine derived it before `eta_exec::lay_out`: what
+/// the shared one is held to, byte for byte.
+#[cfg(test)]
+mod former {
+    use super::*;
+    use eta_exec::{Lifetime, describe};
+    use eta_ir::types::MAX_RANK;
+
+    #[must_use]
+    fn read_only_by_skipped_regions(plan: &LaunchStagePlan) -> Vec<bool> {
+        let values = plan.value_types.len();
+
+        let mut producer = vec![usize::MAX; values];
+        let mut result_base = 0u32;
+        for (node, op) in plan.ops.iter().enumerate() {
+            for result in 0..u32::from(op.result_count) {
+                if let Some(slot) = producer.get_mut((result_base + result) as usize) {
+                    *slot = node;
+                }
+            }
+            result_base += u32::from(op.result_count);
+        }
+
+        let mut skipped = vec![false; plan.ops.len()];
+        let mut unread = vec![false; values];
+        for region in plan.fused.iter().filter(|region| !shell_launches(region)) {
+            for &node in &region.nodes {
+                if let Some(node) = skipped.get_mut(node as usize) {
+                    *node = true;
+                }
+            }
+            for value in region.inputs.iter().copied().chain(
+                region
+                    .nodes
+                    .iter()
+                    .filter_map(|&node| plan.ops.get(node as usize))
+                    .flat_map(|op| op.reads()),
+            ) {
+                if let Some(value) = unread.get_mut(value as usize) {
+                    *value = true;
+                }
+            }
+        }
+
+        for (node, op) in plan.ops.iter().enumerate() {
+            if skipped.get(node).copied().unwrap_or(false) {
+                continue;
+            }
+            for value in op.reads() {
+                if let Some(value) = unread.get_mut(value as usize) {
+                    *value = false;
+                }
+            }
+        }
+        for region in plan.fused.iter().filter(|region| shell_launches(region)) {
+            for sink in &region.sinks {
+                if let Some(value) = unread.get_mut(sink.value as usize) {
+                    *value = false;
+                }
+            }
+        }
+
+        for (value, drop) in unread.iter_mut().enumerate() {
+            let tag = producer
+                .get(value)
+                .and_then(|&node| plan.ops.get(node))
+                .map(|op| op.tag);
+            if !matches!(tag, Some(tags::CHAN_READ | tags::CHAN_TAKE)) {
+                *drop = false;
+            }
+        }
+        unread
+    }
+
+    pub fn describe_values(plan: &LaunchStagePlan, extents: Extents) -> Result<Vec<ValueDesc>> {
+        let empty = read_only_by_skipped_regions(plan);
+        plan.value_types
+            .iter()
+            .enumerate()
+            .map(|(value, declared)| {
+                let described = describe(declared, &extents).map_err(|why| {
+                    Fault::program(
+                        "program::launch",
+                        format!("a value's shape does not resolve against this fire: {why:?}"),
+                    )
+                })?;
+                Ok(if empty.get(value).copied().unwrap_or(false) {
+                    ValueDesc {
+                        len: 0,
+                        rows: 0,
+                        last: 0,
+                        dims: [0; MAX_RANK],
+                        ..described
+                    }
+                } else {
+                    described
+                })
+            })
+            .collect()
+    }
+
+    pub fn value_lifetimes(plan: &LaunchStagePlan, rows: &[u32]) -> Option<Vec<Lifetime>> {
+        let mut step_of = vec![u32::MAX; plan.ops.len()];
+        let mut region_of = vec![u32::MAX; plan.ops.len()];
+        let mut region_first = Vec::with_capacity(plan.fused.len());
+        let mut region_last = Vec::with_capacity(plan.fused.len());
+        let mut step = 0u32;
+        for (index, region) in plan.fused.iter().enumerate() {
+            let per_node = region.kind == RegionKind::Generated;
+            region_first.push(step);
+            let run = if region.order.is_empty() {
+                &region.nodes
+            } else {
+                &region.order
+            };
+            for &node in run {
+                *step_of.get_mut(node as usize)? = step;
+                *region_of.get_mut(node as usize)? = u32::try_from(index).ok()?;
+                if per_node {
+                    step = step.checked_add(1)?;
+                }
+            }
+            if !per_node {
+                step = step.checked_add(1)?;
+            }
+            region_last.push(step.saturating_sub(1));
+        }
+        if step_of.contains(&u32::MAX) {
+            return None;
+        }
+        let region_of_step = |step: u32| -> u32 {
+            region_first
+                .partition_point(|&first| first <= step)
+                .saturating_sub(1) as u32
+        };
+        let class_of = |region: u32, value: u32| -> u64 {
+            let Some(fused) = plan.fused.get(region as usize) else {
+                return Lifetime::SEQUENTIAL;
+            };
+            if rows.get(region as usize).copied().unwrap_or(1) <= 1 {
+                return Lifetime::SEQUENTIAL;
+            }
+            let geometry = fused
+                .row_value
+                .and_then(|witness| plan.value_types.get(witness as usize))
+                .and_then(|ty| eta_compiler::plan::value_rows(&ty.axes));
+            let Some(geometry) = geometry else {
+                return 0;
+            };
+            let Some(ty) = plan.value_types.get(value as usize) else {
+                return 0;
+            };
+            let elem: u64 = if ty.dtype == Dtype::Bool { 1 } else { 4 };
+            let alias = fused.row_alias;
+            if ty.axes.len() >= 2
+                && eta_compiler::plan::value_rows(&ty.axes)
+                    .is_some_and(|shape| eta_compiler::plan::same_rows(shape, geometry, alias))
+            {
+                let width = match ty.axes.last() {
+                    Some(eta_compiler::plan::Dimension::Static(width)) => u64::from(*width),
+                    _ => return 0,
+                };
+                (1u64 << 40) | (width * elem)
+            } else if eta_compiler::plan::is_row_vector(&ty.axes, geometry.0, geometry.1, alias) {
+                (2u64 << 40) | elem
+            } else {
+                0
+            }
+        };
+        let values = plan.value_types.len();
+        let mut lifetimes = vec![
+            Lifetime {
+                dead: false,
+                def: 0,
+                last: 0,
+                reusable: false,
+                launch_def: 0,
+                launch_last: 0,
+                class_def: Lifetime::SEQUENTIAL,
+                class_last: Lifetime::SEQUENTIAL,
+            };
+            values
+        ];
+        let mut alias_of = vec![u32::MAX; values];
+        let bump = |lifetimes: &mut Vec<Lifetime>, alias_of: &[u32], mut value: u32, step: u32| {
+            for _ in 0..=alias_of.len() {
+                let Some(life) = lifetimes.get_mut(value as usize) else {
+                    return;
+                };
+                life.last = life.last.max(step);
+                match alias_of.get(value as usize).copied() {
+                    Some(source) if source != u32::MAX => value = source,
+                    _ => return,
+                }
+            }
+        };
+        let mut result_base = 0u32;
+        for (node, op) in plan.ops.iter().enumerate() {
+            let step = step_of[node];
+            let written_in_full = !matches!(
+                op.tag,
+                tags::PIVOT_THRESHOLD | tags::CHAN_READ | tags::CHAN_TAKE
+            );
+            for result in 0..u32::from(op.result_count) {
+                if let Some(life) = lifetimes.get_mut((result_base + result) as usize) {
+                    life.def = step;
+                    life.last = life.last.max(step);
+                    life.reusable = written_in_full;
+                    life.launch_def = region_of[node];
+                }
+            }
+            if op.tag == tags::RESHAPE
+                && let Some(&source) = op.args.first()
+                && let Some(slot) = alias_of.get_mut(result_base as usize)
+            {
+                *slot = source;
+            }
+            result_base += u32::from(op.result_count);
+            let region = region_of[node];
+            let generated = plan
+                .fused
+                .get(region as usize)
+                .is_some_and(|fused| fused.kind == RegionKind::Generated);
+            for value in op.reads() {
+                bump(&mut lifetimes, &alias_of, value, step);
+                if generated
+                    && lifetimes
+                        .get(value as usize)
+                        .is_some_and(|life| life.launch_def == region && life.last >= life.def)
+                    && let Some(&last) = region_last.get(region as usize)
+                {
+                    bump(&mut lifetimes, &alias_of, value, last);
+                }
+            }
+        }
+        for (region, fused) in plan.fused.iter().enumerate() {
+            let step = region_last[region];
+            let named = fused
+                .inputs
+                .iter()
+                .chain(fused.outputs.iter())
+                .copied()
+                .chain(fused.sinks.iter().map(|sink| sink.value));
+            for value in named {
+                bump(&mut lifetimes, &alias_of, value, step);
+            }
+        }
+        for (value, life) in lifetimes.iter_mut().enumerate() {
+            let value = value as u32;
+            life.launch_last = region_of_step(life.last);
+            life.class_def = class_of(life.launch_def, value);
+            life.class_last = class_of(life.launch_last, value);
+            if life.class_last == 0 {
+                life.last = life.last.max(region_last[life.launch_last as usize]);
+            }
+        }
+        for fused in &plan.fused {
+            for &value in &fused.spent {
+                if let Some(life) = lifetimes.get_mut(value as usize) {
+                    life.dead = true;
+                }
+            }
+        }
+        Some(lifetimes)
+    }
+
+    pub fn region_rows(plan: &LaunchStagePlan, descriptors: &[ValueDesc]) -> Vec<u32> {
+        plan.fused
+            .iter()
+            .map(|region| {
+                let rows = region
+                    .row_value
+                    .and_then(|value| descriptors.get(value as usize))
+                    .map_or(1, |descriptor| descriptor.rows.max(1));
+                match region.kind {
+                    RegionKind::Generated => rows,
+                    kind if lane_sampler(kind) => LANE_SAMPLER_BLOCKS,
+                    RegionKind::Library(LibraryOp::TopK) if selects(plan, region) => rows,
+                    RegionKind::Library(LibraryOp::TopK | LibraryOp::Sort) => {
+                        rows.min(ORDER_ROW_BLOCKS)
+                    }
+                    RegionKind::Library(_) => 1,
+                }
+            })
+            .collect()
+    }
+
+    pub fn lay_out(plan: &LaunchStagePlan, descriptors: &[ValueDesc]) -> Result<Layout> {
+        let rows = region_rows(plan, descriptors);
+        let lifetimes = value_lifetimes(plan, &rows);
+        let floor = temporary_floor(plan, descriptors, &rows);
+        match lifetimes {
+            Some(lifetimes) => eta_exec::layout_reusing(descriptors, &lifetimes, 0, floor),
+            None => eta_exec::layout(descriptors),
+        }
+        .map_err(|why| {
+            Fault::program(
+                "program::launch",
+                format!("this fire's scratch does not fit: {why:?}"),
+            )
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eta_ir::types::MAX_RANK;
 
     /// A take its region runs after a constant cannot hand the constant its
     /// slot: the scratch is laid out in the order the emitter runs the ops,
@@ -1722,8 +1787,7 @@ mod tests {
             dims: [0; MAX_RANK],
         };
         let offsets = |plan: &LaunchStagePlan| {
-            let lifetimes = value_lifetimes(plan, &[1]).expect("every node is in a region");
-            layout_reusing(&[one, one], &lifetimes, 0)
+            eta_exec::lay_out(plan, &[one, one], &launches(plan, &[1], 0))
                 .expect("fits")
                 .values
         };
@@ -1738,6 +1802,297 @@ mod tests {
             stated[0], stated[1],
             "in the stated order the constant may reuse the dead take's slot"
         );
+    }
+
+    /// Guest programs as inferlets ship them, traced here: the scratch
+    /// they are laid is read off these.
+    mod shipped {
+        use eta_compiler::codegen::launch::LaunchPackage;
+        use eta_compiler::plan::compile_bound;
+        use eta_dsl::Traced;
+        use eta_dsl::prelude::*;
+        use eta_ir::registry::{Axis, EngineCaps, OutputDecl, Port};
+
+        pub const QWEN_VOCAB: u32 = 151_936;
+
+        fn leak(channel: Channel) -> &'static Channel {
+            Box::leak(Box::new(channel))
+        }
+
+        fn logits(vocab: u32) -> Vec<Vec<OutputDecl>> {
+            vec![vec![OutputDecl {
+                name: "logits".into(),
+                axis: Axis::Row,
+                width: vocab,
+                dtype: eta_ir::Dtype::F32,
+                layers: 0,
+                readout: true,
+            }]]
+        }
+
+        fn builder(vocab: u32) -> (Builder<'static>, &'static Channel) {
+            let tok_in = leak(Channel::from([42i32]));
+            let mut b = Builder::new(vocab, 16);
+            b.outputs(logits(vocab));
+            b.bind_port(Port::EmbedTokens, tok_in);
+            b.bind_port(Port::EmbedIndptr, leak(Channel::from([0u32, 1])));
+            b.bind_port(Port::Fold, leak(Channel::from([u32::MAX])));
+            (b, tok_in)
+        }
+
+        /// `text-completion-bench`'s decode epilogue: a temperature-scaled
+        /// top-p Gumbel-max draw.
+        pub fn top_p(vocab: u32) -> Traced {
+            let (temperature, top_p) = (0.6f32, 0.95f32);
+            let rng = leak(Channel::from([0x7ce1u32, 0]));
+            let out = leak(Channel::new([1], dtype::i32).capacity(8));
+            let (mut b, tok_in) = builder(vocab);
+            b.stage(Stage::Epilogue, move || {
+                let logits = intrinsics::output(0, "logits");
+                let scaled = logits / temperature;
+                let probs = softmax(&scaled);
+                let keep = pivot_threshold(probs, cummass_le(top_p));
+                let neg_inf = broadcast(f32::NEG_INFINITY, [vocab]);
+                let masked = select(&keep, &scaled, &neg_inf);
+                let r = rng.take();
+                let g = gumbel(&r, [vocab]);
+                let r_next = &r + iota(2);
+                rng.put(&r_next);
+                let t = reshape(reduce_argmax(masked + g), [1]);
+                tok_in.put(&t);
+                out.put(&t);
+            });
+            out.note_host_take();
+            b.build().expect("the top-p epilogue traces")
+        }
+
+        /// The `compat` generate step's sampler with a top-k and a top-p
+        /// cut: both pivots, their `and`, the mask and a Gumbel-max draw.
+        pub fn top_k_top_p(vocab: u32) -> Traced {
+            let temperature = 0.8f32;
+            let rng = leak(Channel::from([0x7ce1u32, 0]));
+            let out = leak(Channel::new([1], dtype::i32).capacity(8));
+            let (mut b, tok_in) = builder(vocab);
+            b.stage(Stage::Epilogue, move || {
+                let r = rng.take();
+                let logits = reshape(intrinsics::output(0, "logits"), [vocab]);
+                let scaled = &logits / temperature;
+                let probs = softmax(&scaled);
+                let ranked = pivot_threshold(&probs, rank_le(40u32));
+                let nucleus = pivot_threshold(&probs, cummass_le(0.9f32));
+                let keep = and(&ranked, &nucleus);
+                let token = reshape(gumbel_max(mask_apply(&scaled, keep), &r), [1]);
+                rng.put(&r + iota(2));
+                tok_in.put(&token);
+                out.put(&token);
+            });
+            out.note_host_take();
+            b.build().expect("the top-k top-p epilogue traces")
+        }
+
+        /// A temperature Gumbel-max draw with no cut.
+        pub fn gumbel_max_only(vocab: u32) -> Traced {
+            let rng = leak(Channel::from([0x7ce1u32, 0]));
+            let out = leak(Channel::new([1], dtype::i32).capacity(8));
+            let (mut b, tok_in) = builder(vocab);
+            b.stage(Stage::Epilogue, move || {
+                let r = rng.take();
+                let scaled = intrinsics::output(0, "logits") / 0.7f32;
+                let token = reshape(gumbel_max(scaled, &r), [1]);
+                rng.put(&r + iota(2));
+                tok_in.put(&token);
+                out.put(&token);
+            });
+            out.note_host_take();
+            b.build().expect("the gumbel-max epilogue traces")
+        }
+
+        /// The greedy decode epilogue.
+        pub fn greedy(vocab: u32) -> Traced {
+            let out = leak(Channel::new([1], dtype::i32).capacity(8));
+            let (mut b, tok_in) = builder(vocab);
+            b.stage(Stage::Epilogue, move || {
+                let t = reshape(reduce_argmax(intrinsics::output(0, "logits")), [1]);
+                tok_in.put(&t);
+                out.put(&t);
+            });
+            out.note_host_take();
+            b.build().expect("the greedy epilogue traces")
+        }
+
+        /// A greedy step that lands its top logprobs: a top-k region.
+        pub fn top_logprobs(vocab: u32) -> Traced {
+            let out = leak(Channel::new([1], dtype::i32).capacity(8));
+            let values_out = leak(Channel::new([5], dtype::f32).capacity(8));
+            let ids_out = leak(Channel::new([5], dtype::i32).capacity(8));
+            let (mut b, tok_in) = builder(vocab);
+            b.stage(Stage::Epilogue, move || {
+                let logits = reshape(intrinsics::output(0, "logits"), [vocab]);
+                let t = reshape(reduce_argmax(&logits), [1]);
+                let (values, ids) = top_k(log_softmax(&logits), 5);
+                values_out.put(&values);
+                ids_out.put(cast(&ids, dtype::i32));
+                tok_in.put(&t);
+                out.put(&t);
+            });
+            values_out.note_host_take();
+            ids_out.note_host_take();
+            out.note_host_take();
+            b.build().expect("the top-logprobs epilogue traces")
+        }
+
+        /// A greedy step that lands the whole row in order: a sort region.
+        pub fn sorted(vocab: u32) -> Traced {
+            let out = leak(Channel::new([1], dtype::i32).capacity(8));
+            let ids_out = leak(Channel::new([vocab], dtype::i32).capacity(2));
+            let (mut b, tok_in) = builder(vocab);
+            b.stage(Stage::Epilogue, move || {
+                let logits = reshape(intrinsics::output(0, "logits"), [vocab]);
+                let t = reshape(reduce_argmax(&logits), [1]);
+                let (_, ids) = sort_desc(softmax(&logits));
+                ids_out.put(cast(&ids, dtype::i32));
+                tok_in.put(&t);
+                out.put(&t);
+            });
+            ids_out.note_host_take();
+            out.note_host_take();
+            b.build().expect("the sorted epilogue traces")
+        }
+
+        /// Every program here, by name.
+        pub fn all(vocab: u32) -> Vec<(&'static str, Traced)> {
+            vec![
+                ("top-p", top_p(vocab)),
+                ("top-k + top-p", top_k_top_p(vocab)),
+                ("gumbel-max", gumbel_max_only(vocab)),
+                ("greedy", greedy(vocab)),
+                ("top logprobs", top_logprobs(vocab)),
+                ("sorted", sorted(vocab)),
+            ]
+        }
+
+        pub fn package(traced: &Traced, vocab: u32) -> LaunchPackage {
+            let caps = EngineCaps {
+                lora: true,
+                attn_page_mask: true,
+            };
+            let bound = eta_ir::validate::bind(traced.container().clone(), logits(vocab), caps)
+                .expect("the program binds");
+            let stages = compile_bound(&bound);
+            eta_compiler::codegen::launch::build(&bound, &stages)
+        }
+    }
+
+    /// The shared layout lays every stage as this engine's own did: the
+    /// same descriptors, blocks, lifetimes, offsets, temporary area and
+    /// total.
+    #[test]
+    fn the_shared_layout_is_this_engines_former_one_byte_for_byte() {
+        let same = |name: &str, plan: &LaunchStagePlan| {
+            let extents = Extents::default();
+            let descriptors = describe_values(plan, extents).expect("static shapes");
+            assert_eq!(
+                descriptors,
+                former::describe_values(plan, extents).expect("static shapes"),
+                "{name}: descriptors"
+            );
+            let blocks = region_blocks(plan, &descriptors);
+            assert_eq!(
+                blocks,
+                former::region_rows(plan, &descriptors),
+                "{name}: blocks"
+            );
+            let floor = temporary_floor(plan, &descriptors, &blocks);
+            assert_eq!(
+                eta_exec::value_lifetimes(plan, &launches(plan, &blocks, floor)),
+                former::value_lifetimes(plan, &blocks),
+                "{name}: lifetimes"
+            );
+            assert_eq!(
+                lay_out(plan, &descriptors).expect("fits"),
+                former::lay_out(plan, &descriptors).expect("fits"),
+                "{name}: layout"
+            );
+        };
+        let mut stages = 0;
+        let mut many_blocks = 0;
+        for vocab in [shipped::QWEN_VOCAB, 32_000, 257] {
+            for (name, traced) in shipped::all(vocab) {
+                let package = shipped::package(&traced, vocab);
+                for plan in &package.plans {
+                    same(name, plan);
+                    stages += 1;
+                    let descriptors =
+                        describe_values(plan, Extents::default()).expect("static shapes");
+                    many_blocks += region_blocks(plan, &descriptors)
+                        .iter()
+                        .filter(|&&blocks| blocks > 1)
+                        .count();
+                }
+            }
+        }
+        assert!(stages >= 18, "every program laid a stage: {stages}");
+        assert!(many_blocks > 0, "a region across several blocks was laid");
+
+        // A region that runs its nodes out of their stated order, and a
+        // node no region holds (each value its own bytes, either way).
+        let op =
+            |tag, result_count, args: Vec<u32>, channel| eta_compiler::codegen::launch::LaunchOp {
+                tag,
+                result_count,
+                args,
+                channel,
+                ..Default::default()
+            };
+        let mut plan = LaunchStagePlan {
+            ops: vec![
+                op(tags::CHAN_TAKE, 1, vec![], Some(1)),
+                op(tags::CONST, 1, vec![], None),
+                op(tags::CHAN_PUT, 0, vec![1], Some(0)),
+            ],
+            value_types: vec![
+                eta_compiler::codegen::launch::LaunchPlanValue {
+                    dtype: Dtype::U32,
+                    axes: vec![eta_compiler::plan::Dimension::Static(1)],
+                };
+                2
+            ],
+            fused: vec![LaunchRegion {
+                kind: RegionKind::Generated,
+                nodes: vec![0, 1, 2],
+                order: vec![1, 0, 2],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        same("ordered", &plan);
+        plan.fused[0].order.clear();
+        same("stated", &plan);
+        plan.fused[0].nodes.pop();
+        same("a node in no region", &plan);
+    }
+
+    /// What a lane's scratch is for the samplers inferlets ship, at a
+    /// vocabulary of 151,936.
+    #[test]
+    fn a_shipped_samplers_scratch_a_lane() {
+        let vocab = shipped::QWEN_VOCAB;
+        let total = |traced: &eta_dsl::Traced| {
+            let package = shipped::package(traced, vocab);
+            let [plan] = &package.plans[..] else {
+                panic!("one stage");
+            };
+            let descriptors = describe_values(plan, Extents::default()).expect("static shapes");
+            let own = eta_exec::layout(&descriptors).expect("fits").total;
+            (own, lay_out(plan, &descriptors).expect("fits").total)
+        };
+        assert_eq!(total(&shipped::top_p(vocab)), (9_312_512, 9_268_992));
+        assert_eq!(total(&shipped::top_k_top_p(vocab)), (9_616_896, 5_775_360));
+        assert_eq!(
+            total(&shipped::gumbel_max_only(vocab)),
+            (5_512_960, 5_471_488)
+        );
+        assert_eq!(total(&shipped::greedy(vocab)), (3_688_704, 3_647_232));
     }
 
     #[test]
