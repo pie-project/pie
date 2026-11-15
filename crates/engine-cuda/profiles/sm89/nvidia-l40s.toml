@@ -50,6 +50,12 @@ prefill_lattice_steps = 8
 dag_streams = true
 dag_streams_until = 256
 
+[rates]
+# 362.05 TFLOPS dense bf16 (NVIDIA L40S datasheet; 733 with sparsity).
+bf16_flops_per_ns = 362050.0
+# 864 GB/s of GDDR6 (L40S datasheet).
+bytes_per_ns = 864.0
+
 [provenance]
 measured = [
   "kernel.gemm.fp8_shadow",

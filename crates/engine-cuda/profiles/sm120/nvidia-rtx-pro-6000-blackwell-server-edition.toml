@@ -86,6 +86,15 @@ seat_to_end = true
 # gemma-4-31b c128 961 -> 1,075 (vLLM 1,068), gemma-4-26b-a4b c1024 6,262 -> 6,805 tok/s (vLLM 6,741)
 seat_spread = true
 
+[rates]
+# Dense bf16, derived: 4 PFLOPS of FP4 with sparsity (NVIDIA RTX PRO 6000
+# Blackwell Server Edition datasheet) is 2000 dense, and bf16 runs at a
+# quarter of FP4's rate: 500 TFLOPS. Replace with a direct vendor dense bf16
+# figure when one is published.
+bf16_flops_per_ns = 500000.0
+# 1597 GB/s of GDDR7 (RTX PRO 6000 Blackwell Server Edition datasheet).
+bytes_per_ns = 1597.0
+
 [provenance]
 source = "pie tune (quick, gptoss-20b) on RunPod; 512-token prompt 20.5 -> 20.5 ms, 1-lane step 2.99 -> 2.93 ms, 4-lane step 4.11 -> 4.06 ms, 8-lane step 6.36 -> 5.33 ms, readout cosine 1.0000"
 measured = [
