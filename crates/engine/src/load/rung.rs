@@ -284,6 +284,49 @@ mod tests {
     }
 
     #[test]
+    fn a_small_live_capacity_picks_a_narrow_top_rung() {
+        // Qwen3-8B on an MI300X: 16.4 GB of bf16 weights read a fire at
+        // about 5.3 TB/s (3.1 ms), 16 GFLOP a token at about 1.3 PFLOP/s
+        // (12 µs); the activation span grows toward 7.3 GiB at 8192.
+        const GIB: f64 = (1u64 << 30) as f64;
+        let span = |gib: f64| (gib * GIB) as u64;
+        let rungs: Vec<RungFacts> = [
+            (256, 0.23),
+            (512, 0.46),
+            (1024, 0.91),
+            (2048, 1.83),
+            (4096, 3.65),
+            (8192, 7.3),
+        ]
+        .iter()
+        .map(|&(tokens, gib)| RungFacts {
+            span_bytes: span(gib),
+            ..rung(tokens, 0)
+        })
+        .collect();
+        let times = FireTimes {
+            measured: &[],
+            estimate: estimate(3_100_000, 12_000.0),
+        };
+        // A live range far past the span: the throughput decides, and the
+        // widest rung is the most efficient.
+        let wide = top_rung(&rungs, 1 << 40, &times).unwrap();
+        assert_eq!((wide.tokens, wide.times), (8192, TimesUsed::Estimate));
+        // A 26 GiB budget: about 3 GiB of kv beside the 7.3 GiB span.
+        let live = span(3.0 + 7.3);
+        let narrow = top_rung(&rungs, live, &times).unwrap();
+        assert!(narrow.tokens < 8192, "{narrow:?}");
+        let score = |rung: &TopRung| match rung.why {
+            TopWhy::Argmax { eff, live_share } => eff * (1.0 - live_share),
+            TopWhy::OnlyFeasible => panic!("{rung:?}"),
+        };
+        // The wide top's score at this live range: eff 1, its share 7.3 / 10.3.
+        let at_wide = 1.0 - 7.3 / 10.3;
+        assert!(score(&narrow) > at_wide, "{narrow:?} against {at_wide}");
+        assert_eq!(narrow.tokens, 2048);
+    }
+
+    #[test]
     fn a_cliff_in_the_measured_table_moves_the_pick() {
         let rungs = [rung(1024, 16), rung(2048, 32), rung(4096, 64)];
         // Throughput doubling with each width: the widest wins.
