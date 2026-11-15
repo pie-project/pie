@@ -8,7 +8,10 @@ the simulator, driven through the engine by a guest, its static arrays from a ch
 M1h (flux2-mini's text encoder on the simulator through the engine, compiled on load; `pie run
 text-to-media` making an image on the host fabric, §4.1), M1i (the VAE decode on the simulator
 by the grid regime; the readings co-resident; `pie run text-to-media` fully on the simulator,
-48.3 dB from diffusers, §4.1) and M3 (the decode
+48.3 dB from diffusers, §4.1), M2c (klein's text reading at 512 tokens links: grouped-query
+attention and three taps on the row stream, a GQA miniature on the simulator; grid programs
+priced, the VAE's passes in weight groups; klein end to end 51.8 s predicted, the VAE decode
+its bottleneck, §4.1) and M3 (the decode
 layouts as points of the Floorplan, §2.5). ARCHITECTURE.md is what runs for decode.
 
 **Goal.** A `.poem` model the compiler has not seen runs on the wafer with no hand code. The
@@ -1231,6 +1234,140 @@ milestone's tail.
     - The encoder's compile-on-load clip (the clip whose output is the denoiser's latent).
     - Co-residence on the simulator costs every reading the whole program's tiles: a load
       simulated end to end runs its readings apart (`stream_processes`).
+
+- **M2c** (klein-4B's text reading at real size; grouped-query attention and several taps on the
+  row stream; grid programs priced; the VAE's passes in weight groups; klein's end to end priced).
+  - **Grouped-query attention in the stream attention** (klein's Qwen3-4B: 32 q heads over 8 kv
+    heads of 128). A head root holds its kv head's q heads (`Qh = q / kv`), k and v; P7's PEs
+    and root (`satt.csl`, `cy_satt.csl`) were already written over `Qh` q heads a kv head.
+    What was missing, each generic:
+    - **q and k turned together at different widths** (`rope(q, k)`, q 4,096 wide, k 1,024) is
+      no region of one width: poem-compiler's `fuse::chain::lower_run_parts` cuts the run into a
+      region a side (q's norm and rotation, k's), each the node's rotation of that side alone at
+      the same positions, each a **head region** (a head's ops: its row a head) where every op
+      is a head's. `lower_with` now refuses a q / k pair of unequal widths (it had silently read
+      k at q's width). MHA runs (the miniature's, flux's) keep their one region.
+    - **Head regions a head at a time** (`RegionAt::reps`): a region narrower than the values it
+      reads runs over each of a head root's heads in turn (its heads' rows in, `row()`, each
+      head's results into the root's buffer of them), its tables one head's.
+    - **One module for q's and k's**: the two head regions are the same region (an RMS norm by
+      a gain, a rotation at the row's position), so a root imports it once and each side copies
+      its own gain in before its heads (`alike` in `emit::stream`); the rotation's P5 tables
+      (12 KB at 512 rows) are held once, and a row's position scalar once (two regions that read
+      the same scalar share its slot).
+    - **K / V PEs' budget** (`build::kv_entries`): satt's per-query buffers grow with `Qh`
+      (8 KB at 4 q heads, not 2.8): an attention PE keeps 19 entries, not 23 (at 23 cslc ran
+      out of PE memory).
+  - **Several taps** (klein projects layers 9, 18 and 27 into the context and sums them). The
+    projection of an early tap is made at its layer's unit and read 9 and 18 units later:
+    - **The row stream carries several values** (`build::carried`, `unit::lower_through`): a
+      unit takes in, holds over its barrier and sends on a value a later unit of its classes
+      reads, read or not; several values on the stream go in at a row's start and out at its
+      end in one order (by value), a unit with a barrier sending after it. A row-stream input a
+      buffer a value (`pin<v>`).
+    - **Column values onto the rows**: a projection lands on the column roots; one leaving on the
+      row stream, or a root region over values of both sides (the tap sum `part + total`), moves
+      it across with an identity matvec (`unit::move_across`; its tile the constant one on the
+      diagonal, `host::UNIT`, as the VAE's skips), the region then running on the rows.
+      poem-compiler's stream lowering takes such an op on the rows (`spatial::layer`).
+    - Every row-side value must cut evenly over the row roots (`build`: a `py` that does not is
+      refused, so the search skips it). This found a latent bug: klein's 64-row denoise program
+      took `py = 192`, under which the lane prologue's 256-wide timestep sinusoid cut to 1 column
+      a root (256 / 192); the search now takes `py = 256` there. The 1024² program
+      (`py = 256`) is byte-identical to 678668e24's.
+    - A unit's host output rows count against its root's held-row budget (`place`): klein's
+      last text unit holds its 512 rows of the context out and two values over the barrier, so
+      its held rows go to the row store.
+  - **The miniature** (`models/flux_2.poem`: `flux2-mini-gqa`, the miniature's DiT and VAE with a
+    Qwen3 text encoder of hidden 256, 4 q heads over 2 kv heads, three layers, every layer
+    tapped and projected by its column block of the context embedder as klein's are; flux2-mini
+    and klein unchanged). Its goldens: `mk_tiny_flux2_pipe.py --gqa --text` (transformers'
+    `Qwen3ForCausalLM`, hidden_states[1..3] through the context embedder); engine-cerebras
+    `a_gqa_text_reading_taps_three_layers` (engine-cpu against transformers; `--ignored`: a
+    fabric run's capture, program and rows). The program: 3 units, 6 K / V columns, 15 x 76 PEs
+    at 16 rows; the row stream carries two values between its units (the residual and the
+    taps' sum so far), each unit moving its tap's projection onto the rows (an identity matvec
+    a unit).
+
+    | text rows, "a red fox sleeping" (16 tokens) | vs engine-cpu | vs transformers |
+    |---|---|---|
+    | engine-cpu (`Forward::stream`, bf16 trunk) | | 8.85e-3 / 0.9999609 |
+    | **simulator** (`stream/run.py`, capture-fed) | 8.66e-3 / 0.9999625 | **8.73e-3 / 0.9999620** |
+
+    3.89M cycles of stamps (the first launch, start-up included), 38 min of simulator.
+  - **klein's text reading at real size** (512 rows, the poem's `TE_MAX_TOKENS`): 27 units,
+    216 K / V columns (8 a layer, 19 entries a PE, 27 PEs a column), 723 x 549 PEs (397k), `py`
+    512; the largest root 33 KB (a head root: its kv head's 4 q heads and k through one head
+    region, its P5 tables), a K / V PE 38 KB. **It links for the system fabric**
+    (`cslc --fabric-dims=762,1172`): 8.3 min, about 22 GB of memory, 375 MB of ELFs, rc 0.
+    240.9M cycles predicted (275 ms at 875 MHz); a layer's row is about 16.9k cycles before the
+    barrier (the head roots' q and k norms and rotations, 4 + 1 heads at 3.3k) and 16.7k after
+    (a query over 512 rows at 19 entries a PE and 4 q heads, 12.6k).
+  - **Grid programs priced** (`cost::grid`; `wafer-compile stream --reading vae.decode --clip ..
+    --price [--parts]`): a pass's rows at their slowest PE's work (the weight PEs' tile elements
+    at P1's 0.55, the roots' regions by `RegionFeatures`, a gather's taps copied, a fetched or
+    kept chunk, P7's store and query), plus a row's fixed cost (`ROW` = 1,150 cycles, fitted:
+    the fetch's round trip up a chain, the gather's index math), for tail and head rows, and the
+    norms' finals. flux2-mini's decode: 4.51M (2 x 2 latent; simulator 4.72M) and 75.2M (8 x 8;
+    simulator 73.5M).
+  - **klein's VAE decode at 1024²** (latent 128 x 128): 36 passes over 16 x 16 roots,
+    **39.8G cycles, 45.5 s** priced (unplaced: its tiles do not fit). By resolution: 128² 2.1G,
+    256² 3.8G, 512² 8.9G, **1024² 24.9G** (eight 1M-row passes at about 3k cycles a row: the
+    row's fixed cost and its head row, not the matvecs).
+  - **The VAE's passes in weight groups** (`grid::weight_groups`). Where a unit's weight PEs
+    cannot hold every pass's tiles, the passes are cut into runs whose tiles fit beside the
+    store (an attention's queries with its stores), each run's tiles from its first word; a step
+    is a launch a run: the host writes the run's tiles (`w`, `group` in `host.json`) and its pass
+    range (`grp`), the kernels sweep those passes alone (the K / V column runs in its run's
+    launch), the stores stay in the weight PEs across launches, the rows are read back after the
+    last (engine-cerebras `Reading::launch_with`; `Fabric::launch`, a launch reading no rows
+    back, `wafer-fabric`'s `launch`). `wafer-compile stream --weight-words N` and the VAE fabric
+    test's `READING_WEIGHT_WORDS` put a reading that fits in groups all the same. One group:
+    every program as before (flux2-mini's three readings byte-identical).
+    - **Simulator** (`flux_2_minis_vae_on_the_fabric`, the 2 x 2 drawn latent, `READING_WEIGHT_
+      WORDS=2000`: groups [0, 9), [9, 19), [19, 28), three launches): 1.415e-2 / 0.99990192, PSNR 48.2 dB
+      against engine-cpu, as the one-launch run (M1i), 4.72M cycles over the three launches, 9.2
+      min.
+    - **klein** does not build in groups yet: its mid-block attention's q, k and v are whole at
+      CY root 0, so their three 512 x 512 matvecs' tiles sit in weight column 0 alone (49k
+      words a PE at `P = 16`, 24.6k at 32): one pass over a PE's memory. And at `P = 16` one
+      4,608 x 512 convolution's tile (9,216 words) does not fit beside the 8 x 8 latent's store.
+  - **klein end to end at 1024²** (priced; one CS-3, readings in turn):
+
+    | reading | footprint | predicted |
+    |---|---|---|
+    | text (512 tokens) | 723 x 549 PEs, links | 0.28 s |
+    | denoise, 4 steps | 741 x 1143 PEs, links (M2b) | 4 x 1.52 = 6.06 s |
+    | VAE decode | 16 x 16 roots, does not fit (above) | 45.5 s |
+    | **total** | | **51.8 s** |
+
+    **The bottleneck is the VAE decode** (88%), and in it the 1024² passes' rows: a single
+    unit sweeps 1M rows a pass at about 3k cycles a row, overhead-bound. Text and denoise do not
+    fit the fabric together (397k + 847k PEs of 883k), so a request also switches programs
+    (their weights rewritten from the host: not priced; the host's bandwidth is unmeasured).
+  - Decode is unchanged: plan + build `diff -r` identical against 678668e24's wafer-compile for
+    qwen35-d0.8b, qwen35-d9b, llama31-8b, gptoss-20b, gemma4-e2b and tiny t08. flux2-mini's text,
+    denoise (16 and 64 rows) and VAE decode programs byte-identical; klein's denoise at 1024²
+    byte-identical.
+  - Left:
+    - **The VAE at 1024²** builds and links nowhere yet. Each a blocker: the tiles (weight groups
+      over a larger `P`, or a unit a group of passes side by side with the held values handed
+      between units); the attention's q / k / v whole at one root (cut them evenly and gather
+      them to the K / V root, or a K / V column fed from every root); the store (a 1024² value of
+      128 channels is 256 MB: a held value as a tape of PEs beside the unit, or streamed through
+      the host during a pass); the line buffer (2 x 1,024 + 3 rows of a root's chunk, 128 KB at
+      `P = 16`: `P = 32` and an exact ring, or column strips); the 16k-row attention's K / V
+      column (1,509 PEs, past the fabric's height: folded over columns); a pass's 1M rows past
+      the programs' 16-bit words.
+    - **VAE speed**: the passes are row-overhead-bound. Rows batched into each op's vectors (a
+      chunk times B rows: the fixed cost a row / B; the cost model with `ROW / B`: klein's 1024²
+      decode 45.5 s -> 25.0 s at B = 4, 21.6 s at 8, the head rows' ops and the matvecs left),
+      more roots (`P = 32`: the matvecs' tiles a quarter, the chunks half), the fetch issued a
+      row ahead, and row replicas of the unit over strips of the image are the levers; none is
+      built (item 4 of M2c, the miniature's batching, was not reached).
+    - The text reading at real size on the simulator (only the miniature's ran); the head
+      roots' rotation tables a row at every head root (the same angles for its 5 heads; 3.3k
+      cycles a head) are the text's cost.
 
 ## 5. Risks
 
