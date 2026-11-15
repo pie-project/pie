@@ -836,14 +836,7 @@ pub fn eval_op(op: &LaunchOp, package: &LaunchPackage, vals: &mut [Value]) -> Re
                     0 => {
                         let kv = vals[payload].lanes_i64();
                         let kk = kv[pick(kv.len(), r)].clamp(0, len as i64);
-                        for i in 0..len {
-                            if row[i].is_nan() {
-                                continue;
-                            }
-                            let greater =
-                                row.iter().filter(|&&y| !y.is_nan() && y > row[i]).count() as i64;
-                            k[i] = u8::from(greater < kk);
-                        }
+                        eta_ir::rank::rank_cut(row, kk as usize, |i| k[i] = 1);
                     }
 
                     1 => {

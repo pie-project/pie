@@ -7,6 +7,7 @@ pub mod container;
 pub mod expand;
 pub mod infer;
 pub mod op;
+pub mod rank;
 pub mod read;
 pub mod registry;
 pub mod rng;
