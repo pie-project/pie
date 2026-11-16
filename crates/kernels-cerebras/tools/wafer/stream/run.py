@@ -21,11 +21,12 @@ W, H = host["w"], host["h"]
 kw = dict(streaming=False, order=MemcpyOrder.ROW_MAJOR, nonblock=False)
 F32, U16 = MemcpyDataType.MEMCPY_32BIT, MemcpyDataType.MEMCPY_16BIT
 t0 = time.time()
-r = SdkRuntime(out_dir)
+# SIMTH: the simulator's threads (the SDK's default else)
+r = SdkRuntime(out_dir, **({"simfab_numthreads": int(os.environ["SIMTH"])} if os.environ.get("SIMTH") else {}))
 r.load()
 r.run()
 took = 0
-for a in host["h2d"]:
+for i, a in enumerate(host["h2d"]):
     f = f"{prog}/{a['file']}"
     if entries and "entry" in a:
         f = f"{entries}/{os.path.basename(a['file'])}"
@@ -34,6 +35,12 @@ for a in host["h2d"]:
     data = d.reshape(-1).astype(np.uint32) if a["u16"] else d.reshape(-1).astype(np.float32)
     r.memcpy_h2d(r.get_id(a["sym"]), data, a["x"], a["y"], a["w"], a["h"], a["len"],
                  data_type=U16 if a["u16"] else F32, **kw)
+    # every write landed (a word read back from its first PE) before the next: the simulator's
+    # memcpy halo takes commands before the fabric has taken the ones before, and halts (an hcf
+    # in its command fan) when they queue past its depth (GENERIC.md G1.6)
+    r.memcpy_d2h(np.zeros(3, np.uint32), r.get_id("tsc"), a["x"], a["y"], 1, 1, 3, data_type=F32, **kw)
+    if os.environ.get("VERBOSE"):
+        print(f"  {i} {a['sym']} landed at {time.time() - t0:.0f} s", flush=True)
 t1 = time.time()
 print(f"loaded {len(host['h2d'])} arrays ({took} the engine's entries) in {t1 - t0:.0f} s", flush=True)
 r.launch("run", nonblock=False)

@@ -498,6 +498,12 @@ impl Runtime {
         })
     }
 
+    /// Whether it runs on the fabric simulator.
+    #[must_use]
+    pub fn simulated(&self) -> bool {
+        matches!(self._platform, PlatformMem::Simulator(_))
+    }
+
     pub fn rpc(&self) -> &Rpc {
         &self.rpc
     }

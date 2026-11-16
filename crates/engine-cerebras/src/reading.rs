@@ -1071,6 +1071,16 @@ impl Fabric for Runtime {
             })?;
             self.memcpy_h2d(&a.sym, part, rect, a.len, Order::RowMajor, dt)
                 .map_err(|x| x.to_string())?;
+            // the simulator's memcpy halo takes a write's command before the fabric has taken
+            // the one before; commands queued that way past its depth halt it (an `hcf` in the
+            // command fan, GENERIC.md G1.6): each write landed (a word read back from its first
+            // PE) before the next
+            if self.simulated() && self.rpc().symbols().contains_key("tsc") {
+                let one = Rect { w: 1, h: 1, ..rect };
+                let mut ts = [0u32; 3];
+                self.memcpy_d2h("tsc", &mut ts, one, 3, Order::RowMajor, DataType::Bits32)
+                    .map_err(|x| x.to_string())?;
+            }
             y += n;
         }
         Ok(())
