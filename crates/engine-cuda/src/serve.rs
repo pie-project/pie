@@ -832,16 +832,13 @@ impl Shell {
     /// is backed for them. The runtime cuts a guest fire to the widest
     /// such rung and refuses a bind that fits at none.
     fn fit_programs(&self) -> Result<()> {
-        let scored = self.programs.scores_bound();
-        let rungs = self.arena.every_rung(
-            self.compiled.arena_forked.as_ref(),
-            self.budget.max_tokens,
-            scored,
-        );
+        let rungs = self
+            .arena
+            .every_rung(self.compiled.arena_forked.as_ref(), self.budget.max_tokens);
         let mut refused = None;
         for (rung, under) in rungs {
             let term = self.programs.fire_term(self.program_lanes(rung));
-            match self.pools.program_span(under, term, scored) {
+            match self.pools.program_span(under, term, 0) {
                 Ok(_) => return Ok(()),
                 Err(fault) => refused = Some(fault),
             }
@@ -1342,7 +1339,13 @@ pub(crate) fn program_span(
     tokens: u64,
     lanes: u64,
 ) -> Result<(u64, u64)> {
-    let scored = programs.scores_bound();
-    let (rung, under) = arena.rung_of(forked, tokens, lanes, limits.0, scored);
-    pools.program_span(under, programs.fire_term(rung.min(limits.1)), scored)
+    let (rung, under) = arena.rung_of(forked, tokens, lanes, limits.0);
+    // With a reader bound, the fire's planes lie right under its carve and
+    // its programs under them, all of it in the term.
+    let planes = if programs.scores_bound() {
+        arena.planes_at(forked, tokens, lanes)
+    } else {
+        0
+    };
+    pools.program_span(under, programs.fire_term(rung.min(limits.1)), planes)
 }

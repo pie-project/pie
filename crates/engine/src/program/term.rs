@@ -292,7 +292,6 @@ mod tests {
                 fixed,
                 max_lanes,
                 laid,
-                a_row: 0,
             },
             live,
         }

@@ -1418,9 +1418,11 @@ impl Shell {
         shell.programs.set_flight(flight);
         shell.programs.set_fire_lanes(shell.fire_lanes());
         // A program reading `attn.scores` states the planes it switches on
-        // as its term (`engine::FireFacts::a_row`): no load backs them.
-        let (a_row, slack) = crate::arena::score_term(&shell.trace);
-        shell.programs.set_scores(a_row, slack);
+        // in its term (`engine::FireFacts::fixed`): no load backs them.
+        let widest = shell.arena.widest_planes(
+            std::iter::once(&shell.compiled.arena).chain(shell.compiled.arena_forked.as_ref()),
+        );
+        shell.programs.set_scores(widest);
         // A fire that replays a recorded body carves for the body's lane
         // capacity, not its own lanes: the rungs stated to the runtime
         // follow that carve, so state is never lent under a carve a fire
