@@ -21,7 +21,7 @@
 
 use kernels_metal::linear::gemm;
 use kernels_metal::tensor::{RaggedTensor, RecurrentPool};
-use engine::rates::{ATTN_SHAPE, GEMM_COLUMNS, GEMM_DEPTH, LATTICE_ROWS, SCAN_SHAPE};
+use engine::rates::{ATTN_KEYS, ATTN_SHAPE, AttnShape, DEPTHS, LATTICE_ROWS, SCAN_SHAPE};
 use kernels_metal::{KvPool, PrefillPlan, StateMap, Tensor, Tuning, attn, ssm};
 use poem_ir::Dtype;
 use profile::fire::Rates;
@@ -38,10 +38,11 @@ const FRAME_SECONDS: f64 = 0.020;
 /// The most of one measurement a timed frame repeats.
 const MAX_REPEATS: u32 = 512;
 
-/// The distinct bf16 weights (32 MiB each at 4096 × 4096) the matmul
-/// curve rotates over: 256 MiB, well past any Apple GPU's system-level
-/// cache.
-const WEIGHTS: u64 = 8;
+/// The bytes the distinct weights a matmul's repeats rotate over add up to
+/// at least: well past any Apple GPU's system-level cache, so each repeat
+/// streams its weight as a fire's matmul does (8 of 32 MiB at depth 4096,
+/// 2 of 128 MiB at 8192).
+const ROTATED_BYTES: u64 = 256 << 20;
 
 fn median(mut times: Vec<f64>) -> f64 {
     times.sort_by(f64::total_cmp);
@@ -125,16 +126,16 @@ impl Bench<'_> {
         Ok(median(times))
     }
 
-    /// `weights` the [`WEIGHTS`] distinct weight buffers a matmul ladder
-    /// rotates over.
-    fn matmul_flops(&self, m: u32, weights: &[Tensor]) -> Result<f64, String> {
+    /// An `m × k × k` matmul's rate, each repeat over the next of `weights`
+    /// (`k × k` each).
+    fn matmul_flops(&self, m: u32, k: u32, weights: &[Tensor]) -> Result<f64, String> {
         let (a, y) = (
-            self.zeroed(u64::from(m) * u64::from(GEMM_DEPTH) * 2)?,
-            self.zeroed(u64::from(m) * u64::from(GEMM_COLUMNS) * 2)?,
+            self.zeroed(u64::from(m) * u64::from(k) * 2)?,
+            self.zeroed(u64::from(m) * u64::from(k) * 2)?,
         );
         let (at, yt) = (
-            self.tensor(&a, m, GEMM_DEPTH, Dtype::Bf16)?,
-            self.tensor(&y, m, GEMM_COLUMNS, Dtype::Bf16)?,
+            self.tensor(&a, m, k, Dtype::Bf16)?,
+            self.tensor(&y, m, k, Dtype::Bf16)?,
         );
         // Each repeat reads the next weight: serving streams a layer's from
         // memory, and one weight repeated would sit in the system cache,
@@ -142,63 +143,60 @@ impl Bench<'_> {
         let seconds = self.timed(&|sink, at_k| {
             gemm::matmul(sink, self.tuning, at, weights[at_k as usize % weights.len()], yt)
         })?;
-        Ok(engine::rates::gemm_flops(m) / (seconds * 1e9))
+        Ok(engine::rates::gemm_flops(m, k) / (seconds * 1e9))
     }
 
-    fn attention_flops(&self) -> Result<f64, String> {
-        const ROWS: u32 = ATTN_SHAPE.rows;
-        const KEYS: u32 = ATTN_SHAPE.keys;
-        const Q_HEADS: u32 = ATTN_SHAPE.q_heads;
-        const KV_HEADS: u32 = ATTN_SHAPE.kv_heads;
-        const D: u32 = ATTN_SHAPE.head_dim;
+    fn attention_flops(&self, shape: AttnShape) -> Result<f64, String> {
+        let (rows, keys, q_heads, kv_heads, d) =
+            (shape.rows, shape.keys, shape.q_heads, shape.kv_heads, shape.head_dim);
         const PAGE: u32 = 16;
-        let pages = KEYS.div_ceil(PAGE);
+        let pages = keys.div_ceil(PAGE);
         let slots = pages * PAGE;
-        let kv = (slots * KV_HEADS * D) as usize;
+        let kv = (slots * kv_heads * d) as usize;
         let keys = self.buffer(&bf16_noise(kv, 11, 1.0))?;
         let values = self.buffer(&bf16_noise(kv, 13, 1.0))?;
-        let q = self.buffer(&bf16_noise((ROWS * Q_HEADS * D) as usize, 17, 1.0))?;
-        let out = self.zeroed(u64::from(ROWS * Q_HEADS * D) * 2)?;
-        let positions: Vec<u32> = (0..ROWS).collect();
+        let q = self.buffer(&bf16_noise((rows * q_heads * d) as usize, 17, 1.0))?;
+        let out = self.zeroed(u64::from(rows * q_heads * d) * 2)?;
+        let positions: Vec<u32> = (0..rows).collect();
         let page_ids: Vec<u32> = (0..pages).collect();
         let le = u32::to_le_bytes;
         let page_indices = self.buffer(&words(&page_ids, le))?;
         let page_indptr = self.buffer(&words(&[0, pages], le))?;
         let positions = self.buffer(&words(&positions, le))?;
-        let owner = self.buffer(&words(&vec![0u32; ROWS as usize], le))?;
-        let q_indptr = self.buffer(&words(&[0, ROWS], le))?;
+        let owner = self.buffer(&words(&vec![0u32; rows as usize], le))?;
+        let q_indptr = self.buffer(&words(&[0, rows], le))?;
         let mask = self.buffer(&[1u8])?;
-        let masked = self.buffer(&vec![0u8; ROWS as usize])?;
+        let masked = self.buffer(&vec![0u8; rows as usize])?;
         let pool = KvPool {
-            keys: self.tensor(&keys, slots, KV_HEADS * D, Dtype::Bf16)?,
-            values: self.tensor(&values, slots, KV_HEADS * D, Dtype::Bf16)?,
+            keys: self.tensor(&keys, slots, kv_heads * d, Dtype::Bf16)?,
+            values: self.tensor(&values, slots, kv_heads * d, Dtype::Bf16)?,
             page_indices: self.tensor(&page_indices, pages, 1, Dtype::U32)?,
             page_indptr: self.tensor(&page_indptr, 2, 1, Dtype::U32)?,
             page_size: PAGE as i32,
-            seq_stride: u64::from(KV_HEADS * D),
-            head_stride: u64::from(D),
+            seq_stride: u64::from(kv_heads * d),
+            head_stride: u64::from(d),
             q8: false,
             page_stride: [0; 2],
         }
         .paged_densely();
         let plan = PrefillPlan {
-            positions: self.tensor(&positions, ROWS, 1, Dtype::I32)?,
-            last_page_len: self.tensor(&positions, ROWS, 1, Dtype::I32)?,
-            request_of_token: self.tensor(&owner, ROWS, 1, Dtype::I32)?,
+            positions: self.tensor(&positions, rows, 1, Dtype::I32)?,
+            last_page_len: self.tensor(&positions, rows, 1, Dtype::I32)?,
+            request_of_token: self.tensor(&owner, rows, 1, Dtype::I32)?,
             mask: self.tensor(&mask, 1, 1, Dtype::U8)?,
-            mask_enabled: self.tensor(&masked, ROWS, 1, Dtype::U8)?,
+            mask_enabled: self.tensor(&masked, rows, 1, Dtype::U8)?,
             mask_stride: 0,
         };
         let q = RaggedTensor {
-            data: self.tensor(&q, ROWS, Q_HEADS * D, Dtype::Bf16)?,
+            data: self.tensor(&q, rows, q_heads * d, Dtype::Bf16)?,
             indptr: self.tensor(&q_indptr, 2, 1, Dtype::I32)?,
         };
-        let o = self.tensor(&out, ROWS, Q_HEADS * D, Dtype::Bf16)?;
-        let scale = 1.0 / (D as f32).sqrt();
+        let o = self.tensor(&out, rows, q_heads * d, Dtype::Bf16)?;
+        let scale = 1.0 / (d as f32).sqrt();
         let seconds = self.timed(&|sink, _| {
-            attn::arbiter::prefill(sink, q, &plan, &pool, None, D, KV_HEADS, scale, o, 1, self.tuning)
+            attn::arbiter::prefill(sink, q, &plan, &pool, None, d, kv_heads, scale, o, 1, self.tuning)
         })?;
-        Ok(engine::rates::attn_flops(ATTN_SHAPE) / (seconds * 1e9))
+        Ok(engine::rates::attn_flops(shape) / (seconds * 1e9))
     }
 
     fn scan_elements(&self) -> Result<f64, String> {
@@ -312,24 +310,29 @@ pub fn measure(
         pipelines: Pipelines::new(),
         tuning: &tuning,
     };
-    let weights = (0..WEIGHTS)
-        .map(|seed| {
-            let w = bench.buffer(&bf16_noise((GEMM_COLUMNS * GEMM_DEPTH) as usize, 7 + seed, 0.05))?;
-            Ok((bench.tensor(&w, GEMM_COLUMNS, GEMM_DEPTH, Dtype::Bf16)?, w))
-        })
-        .collect::<Result<Vec<(Tensor, Buffer)>, String>>()?;
-    let weight_tensors: Vec<Tensor> = weights.iter().map(|(t, _)| *t).collect();
-    let mut curve = Vec::with_capacity(LATTICE_ROWS.len());
-    for m in LATTICE_ROWS {
-        let rate = bench.matmul_flops(m, &weight_tensors)?;
-        say(&format!(
-            "  bf16 matmul {m} x {GEMM_COLUMNS} x {GEMM_DEPTH}: {:.2} TFLOP/s",
-            rate / 1e3
-        ));
-        curve.push((m, rate));
+    let mut grid = Vec::with_capacity(LATTICE_ROWS.len() * DEPTHS.len());
+    for k in DEPTHS {
+        let weight_bytes = u64::from(k) * u64::from(k) * 2;
+        let count = ROTATED_BYTES.div_ceil(weight_bytes).max(2);
+        let weights = (0..count)
+            .map(|seed| {
+                let w = bench.buffer(&bf16_noise((k * k) as usize, 7 + seed, 0.05))?;
+                Ok((bench.tensor(&w, k, k, Dtype::Bf16)?, w))
+            })
+            .collect::<Result<Vec<(Tensor, Buffer)>, String>>()?;
+        let tensors: Vec<Tensor> = weights.iter().map(|(t, _)| *t).collect();
+        for m in LATTICE_ROWS {
+            let rate = bench.matmul_flops(m, k, &tensors)?;
+            say(&format!("  bf16 matmul {m} x {k} x {k}: {:.2} TFLOP/s", rate / 1e3));
+            grid.push((m, k, rate));
+        }
     }
-    let attn = bench.attention_flops()?;
-    say(&format!("  prefill attention: {:.2} TFLOP/s", attn / 1e3));
+    let mut keys_curve = Vec::with_capacity(ATTN_KEYS.len());
+    for keys in ATTN_KEYS {
+        let rate = bench.attention_flops(ATTN_SHAPE.at(keys))?;
+        say(&format!("  prefill attention, {keys} rows over {keys} keys: {:.2} TFLOP/s", rate / 1e3));
+        keys_curve.push((keys, rate));
+    }
     let scan = bench.scan_elements()?;
     say(&format!("  gated-delta scan and its conv: {scan:.1} state elements a ns"));
     let bytes = bench.bytes_per_ns()?;
@@ -337,8 +340,8 @@ pub fn measure(
     let launch = bench.launch_ns()?;
     say(&format!("  launch: {launch} ns a dispatch"));
     Ok(Rates {
-        bf16_flops_per_ns_by_rows: Some(curve),
-        attn_flops_per_ns: Some(attn),
+        bf16_flops_per_ns_by_rows_and_depth: Some(grid),
+        attn_flops_per_ns_by_keys: Some(keys_curve),
         scan_elements_per_ns: Some(scan),
         bytes_per_ns: Some(bytes),
         launch_ns: Some(launch),
