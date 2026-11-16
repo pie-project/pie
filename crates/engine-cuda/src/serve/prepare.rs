@@ -1756,8 +1756,15 @@ impl Shell {
         // A tapped fire is walked, so the walk can mark where each layer
         // ends on the stream.
         let snapshots_fit = snapshots.rows.len() <= crate::store::rs::SNAPSHOTS as usize;
+        // A capturing fire's rows lie at the top of its programs' span, as
+        // many as its capturing lanes: it is walked, and counted.
+        let captures = composition
+            .lanes()
+            .iter()
+            .any(|row| self.exports.captures.classes.contains(row.class as usize));
         let bodied = records_bodies
             && !tapped
+            && !captures
             && snapshots_fit
             && Self::keyable_units(&self.compiled)
             && world
@@ -1803,6 +1810,8 @@ impl Shell {
             (records_bodies && !arming && !(bodied && readouts_fit && lanes_fit)).then(|| {
                 let why = if tapped {
                     "it is tapped"
+                } else if captures {
+                    "it captures attention scores"
                 } else if !snapshots_fit {
                     "it takes more snapshots than a body holds"
                 } else if !Self::keyable_units(&self.compiled) {

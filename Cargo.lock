@@ -1782,6 +1782,7 @@ dependencies = [
  "checkpoint",
  "cudarc",
  "engine",
+ "engine-cpu",
  "eta-compiler",
  "eta-exec",
  "inferlet",

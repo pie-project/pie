@@ -19,9 +19,9 @@ pub struct Arena {
     /// Each lies at the reservation's end, so a rung's fires touch only the
     /// top of the span and state may take what lies under it.
     rungs: Vec<(u32, ArenaMap)>,
-    /// For every carve laid at the reservation's end, its bytes and the
-    /// bytes before its `attn.scores` planes ([`Arena::ensure_rungs`]).
-    prefixes: Vec<(u64, u64)>,
+    /// The bytes of every carve laid at the reservation's end
+    /// ([`Arena::ensure_rungs`]).
+    carves: Vec<u64>,
     /// The lanes every fire carves for, whatever its own: a fire that
     /// replays a recorded body lays its lane tables at the body's capacity
     /// (`window::lane_capacity`), so its carve is the smallest rung's that
@@ -38,7 +38,7 @@ impl Arena {
             committed: 0,
             reserved: bytes,
             rungs: Vec::new(),
-            prefixes: Vec::new(),
+            carves: Vec::new(),
             lane_reach: 0,
         }
     }
@@ -53,18 +53,13 @@ impl Arena {
     /// first: a fire carves the smallest that holds it, at the
     /// reservation's end ([`Arena::fire_slots`]).
     ///
-    /// `prefixes`: each carve that may be laid at the end, its bytes and
-    /// the bytes before its `attn.scores` planes.
+    /// `carves`: the bytes of each carve that may be laid at the end.
     #[must_use]
-    pub fn with_rungs(
-        mut self,
-        mut rungs: Vec<(u32, ArenaMap)>,
-        prefixes: Vec<(u64, u64)>,
-    ) -> Arena {
+    pub fn with_rungs(mut self, mut rungs: Vec<(u32, ArenaMap)>, carves: Vec<u64>) -> Arena {
         rungs.retain(|(_, map)| map.bytes <= self.reserved);
         rungs.sort_by_key(|&(tokens, _)| tokens);
         self.rungs = rungs;
-        self.prefixes = prefixes;
+        self.carves = carves;
         self
     }
 
@@ -128,18 +123,17 @@ impl Arena {
         rungs
     }
 
-    /// Backs, for every carve laid at the reservation's end, the part a
-    /// fire reads before its scores. Nothing where no rung is stated: every
-    /// carve then lies at the span's start, under [`Arena::ensure`]'s
-    /// prefix. After the fit: a range reserved anew backs again only the
-    /// prefix from the span's start.
+    /// Backs every carve laid at the reservation's end. Nothing where no
+    /// rung is stated: every carve then lies at the span's start, under
+    /// [`Arena::ensure`]'s prefix. After the fit: a range reserved anew
+    /// backs again only the prefix from the span's start.
     pub fn ensure_rungs(&self, pools: &mut Pools) -> Result<()> {
         if self.rungs.is_empty() {
             return Ok(());
         }
-        for &(bytes, unscored) in &self.prefixes {
+        for &bytes in &self.carves {
             let at = self.reserved.saturating_sub(bytes);
-            pools.hold_activation_at(at, unscored.min(bytes), false)?;
+            pools.hold_activation_at(at, bytes, false)?;
         }
         Ok(())
     }
@@ -153,17 +147,6 @@ impl Arena {
     #[must_use]
     pub fn reserved(&self) -> u64 {
         self.reserved
-    }
-
-    /// Backs the whole reservation: the `attn.scores` planes over the prefix
-    /// a load commits, once a program reads them.
-    pub fn ensure_whole(&mut self, pools: &mut Pools) -> Result<()> {
-        if self.committed >= self.reserved {
-            return Ok(());
-        }
-        pools.hold_activation(self.reserved, true)?;
-        self.committed = self.reserved;
-        Ok(())
     }
 
     pub fn ensure(&mut self, pools: &mut Pools, bytes: u64) -> Result<()> {

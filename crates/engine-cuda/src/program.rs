@@ -188,7 +188,28 @@ pub struct Plane {
     /// lanes, in order. A fire that lays it the same finds its bind-time
     /// tables where it staged them.
     laid: Vec<(ProgramId, Extents, u32)>,
+    /// The bytes at the top of the span the fire in hand's capturing lanes
+    /// hold ([`Plane::hold_captures`]): its programs lay under them.
+    captured: u64,
+    /// The capturing lanes those bytes are the rows of.
+    captured_rows: u32,
+    /// What a capturing lane's rows take ([`Plane::set_capture_rows`]).
+    capture_rows: CaptureRows,
 }
+
+/// What one capturing lane's score rows take, in bytes: the key row its
+/// captures add into (with its entry of the fire's capturing table), and
+/// the page row summed from it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CaptureRows {
+    pub keys: u64,
+    pub pages: u64,
+}
+
+/// The outputs a capturing lane's rows are read out through: its key row
+/// and its page row.
+pub const SCORES: &str = "attn.scores";
+pub const SCORE_PAGES: &str = "attn.scores.pages";
 
 /// What a fire of one program at one bind's extents takes of the fire's
 /// span (`engine::Engine::fire_facts`).
@@ -269,6 +290,9 @@ impl Plane {
             pairs: Vec::new(),
             term: engine::GuestTerm::default(),
             laid: Vec::new(),
+            captured: 0,
+            captured_rows: 0,
+            capture_rows: CaptureRows::default(),
         }
     }
 
@@ -297,6 +321,45 @@ impl Plane {
             self.laid.clear();
         }
         self.span = span;
+        self.hold_at_top(0, 0);
+    }
+
+    /// What a capturing lane's score rows take, as the load lays them: a
+    /// program reading them states them a member ([`Plane::fire_bytes`]).
+    pub fn set_capture_rows(&mut self, rows: CaptureRows) {
+        self.capture_rows = rows;
+    }
+
+    /// The fire in hand's `rows` capturing lanes hold `bytes` at the top of
+    /// its span: where they start. Its programs lay under them, in the room
+    /// their terms state the rows a member in.
+    pub fn hold_captures(&mut self, rows: u32, bytes: u64) -> Result<u64> {
+        let (end, room) = self.span;
+        let held = bytes.next_multiple_of(256);
+        if held > room {
+            return Err(Fault::Ceiling {
+                what: "bytes of the fire's span its capturing lanes' score rows take",
+                need: held,
+                have: room,
+            });
+        }
+        self.hold_at_top(held, rows);
+        Ok(end - held)
+    }
+
+    /// The rows the last fire's capturing lanes held at its span's top, and
+    /// their bytes.
+    #[must_use]
+    pub fn captured(&self) -> (u32, u64) {
+        (self.captured_rows, self.captured)
+    }
+
+    fn hold_at_top(&mut self, held: u64, rows: u32) {
+        if self.captured != held {
+            self.laid.clear();
+        }
+        self.captured = held;
+        self.captured_rows = rows;
     }
 
     /// What a fire of `program_id` bound at `extents` takes of the fire's
@@ -319,6 +382,27 @@ impl Plane {
         let mut bytes = fire_bytes(&program.stages(extents)?, self.flight);
         let (lane, fixed) = Wave::lane_bytes(program.plan.package.channels.len());
         bytes.fixed += lane * u64::from(self.fire_lanes) + fixed + 256;
+        // A member reading its lanes' scores holds a row for each lane it
+        // reads them at, at the span's top (`Plane::hold_captures`): the key
+        // row whichever it reads, and the page row where it reads that.
+        let reads = program.plan.outputs();
+        let lanes_reading = |names: &[&str]| -> u64 {
+            let mut lanes: Vec<u32> = reads
+                .iter()
+                .filter(|(name, _)| names.contains(name))
+                .map(|&(_, lane)| lane)
+                .collect();
+            lanes.sort_unstable();
+            lanes.dedup();
+            lanes.len() as u64
+        };
+        let capturing = lanes_reading(&[SCORES, SCORE_PAGES]);
+        if capturing > 0 {
+            bytes.a_lane += capturing * self.capture_rows.keys
+                + lanes_reading(&[SCORE_PAGES]) * self.capture_rows.pages;
+            // The rows are held whole, rounded up to an aligned block.
+            bytes.fixed += 256;
+        }
         Ok(bytes)
     }
 
@@ -748,9 +832,10 @@ impl Plane {
         // The wave's own tables lie first in the fire's span, its groups'
         // under them.
         let (end, room) = self.span;
-        // What the fire lays, down from the span's end: the bind that
-        // opened each pair backed it, so a fire past it counted wrong.
-        let mut under = end;
+        // What the fire lays, down from under its capturing lanes' rows at
+        // the span's end: the bind that opened each pair backed it, so a
+        // fire past it counted wrong.
+        let mut under = end - self.captured;
         let mut lay = |bytes: u64| -> Result<u64> {
             under = under.saturating_sub(bytes.next_multiple_of(256));
             if end - under > room {

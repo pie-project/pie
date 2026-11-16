@@ -796,16 +796,6 @@ impl Shell {
         ids: &[engine::ChannelId],
         slots: crate::program::Slots,
     ) -> Result<engine::InstanceId> {
-        let reads_scores = self.programs.program(program_id).is_some_and(|program| {
-            program
-                .plan
-                .outputs()
-                .iter()
-                .any(|(name, _)| *name == "attn.scores")
-        });
-        if reads_scores {
-            self.arena.ensure_whole(&mut self.pools)?;
-        }
         let stream = self.device.stream();
         let buffers_rs = self.buffers.is_some();
         let pools = &self.pools;
@@ -1039,6 +1029,13 @@ impl Shell {
         (self.held.len() as u32)
             .min(self.fire_lanes())
             .min(self.budget.max_tokens)
+    }
+
+    /// The capturing lanes the last fire laid a score row for, and the bytes
+    /// their rows held at the top of its programs' span.
+    #[must_use]
+    pub fn captured(&self) -> (u32, u64) {
+        self.programs.captured()
     }
 
     /// The most lanes one fire carries: the load's lanes, or fewer where

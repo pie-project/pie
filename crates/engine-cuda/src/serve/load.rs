@@ -461,8 +461,8 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
 /// The token and lane budgets fitted to what the card has with the weights
 /// resident. What a fire's working set takes at those budgets (the
 /// activation arena, the attention workspaces, the decoded-weight tiles, the
-/// guests' programs, the capturing lanes' score planes and the readout
-/// indices) is held to half of the card past the weights, the half `bake`
+/// guests' programs, with their capturing lanes' score rows, and the
+/// readout indices) is held to half of the card past the weights, the half `bake`
 /// sizes the token budget against before the weights are down, and to what
 /// leaves one sequence and the bodies' floor beside it. The tile yields
 /// first, held to the widest plane fired at token rows (a plane past it is
@@ -997,7 +997,10 @@ impl Shell {
         facts.mark_rows_a_lane(&read_only_by_decoders(&boot.trace, &compiled, &decoding));
         let feeds = Feeds::of(&boot.trace, &compiled);
         let tiers = crate::record::Tiers {
-            plain: plain_of(&landing, &Exports::of(&boot.trace, &compiled, boot.context, boot.page_size)?.outputs),
+            plain: plain_of(
+                &landing,
+                &Exports::of(&boot.trace, &compiled, boot.context, boot.page_size)?.outputs,
+            ),
         };
         let drafting_words: std::collections::HashSet<u64> = compiled
             .classes
@@ -1132,8 +1135,11 @@ impl Shell {
         );
         // Committed whole: a fire reading out past one row a lane (a verify
         // reads every row) would otherwise grow it outside the fit.
-        let unscored = compiled.arena.bytes.max(
-            compiled.arena_forked.as_ref().map_or(0, |forked| forked.bytes),
+        let whole = compiled.arena.bytes.max(
+            compiled
+                .arena_forked
+                .as_ref()
+                .map_or(0, |forked| forked.bytes),
         );
         // The activation rungs a pool may drop to (SPEC decision 6), each a
         // bucket's carve laid at the reservation's end.
@@ -1145,14 +1151,14 @@ impl Shell {
                 .map(|(tokens, map)| (*tokens, map.bytes))
                 .collect::<Vec<_>>(),
         );
-        // What each carve laid at the end reads before its scores.
-        let prefixes: Vec<(u64, u64)> = std::iter::once(&compiled.arena)
+        // Each carve that may be laid at the end, backed there.
+        let carves: Vec<u64> = std::iter::once(&compiled.arena)
             .chain(compiled.arena_forked.as_ref())
             .chain(rungs.iter().map(|(_, map)| map))
-            .map(|map| (map.bytes, map.bytes))
+            .map(|map| map.bytes)
             .collect();
-        let mut arena = Arena::reserve(arena_bytes).with_rungs(rungs, prefixes);
-        arena.ensure(&mut pools, unscored)?;
+        let mut arena = Arena::reserve(arena_bytes).with_rungs(rungs, carves);
+        arena.ensure(&mut pools, whole)?;
         if arena.has_rungs() {
             pools.fit_range_whole();
         }
@@ -1414,6 +1420,9 @@ impl Shell {
         // several, and its scratch is held at this width, not at the lanes.
         let flight = 1 << shell.device.device().num_sm.max(1).ilog2();
         shell.programs.set_flight(flight);
+        shell
+            .programs
+            .set_capture_rows(shell.exports.captures.rows());
         shell.programs.set_fire_lanes(shell.fire_lanes());
         // A fire that replays a recorded body carves for the body's lane
         // capacity, not its own lanes: the rungs stated to the runtime
