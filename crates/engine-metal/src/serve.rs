@@ -4104,13 +4104,20 @@ impl Shell {
                     ..engine::KvWrites::default()
                 });
             }
-            if let (engine::fire::RsVerb::Buffer { folded, fold, .. }, Some(key)) = (&rs, held_key) {
-                let n = match fold {
-                    engine::fire::FoldLen::Host(n) => Some(*n),
-                    engine::fire::FoldLen::Device => {
-                        ports.as_ref().and_then(engine::ports::LanePorts::fold)
-                    }
-                };
+            // Only a device-counted fold leaves the record ahead of what the
+            // runtime states next: a count the host states is the runtime's
+            // own, which a keep may renumber down after the fire (the rows it
+            // dropped), and an entry then would stand past the record.
+            if let (
+                engine::fire::RsVerb::Buffer {
+                    folded,
+                    fold: engine::fire::FoldLen::Device,
+                    ..
+                },
+                Some(key),
+            ) = (&rs, held_key)
+            {
+                let n = ports.as_ref().and_then(engine::ports::LanePorts::fold);
                 let to = n.map_or(*folded, |n| {
                     folded.saturating_add(n).min(first.saturating_add(row.rows))
                 });
