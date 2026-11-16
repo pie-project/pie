@@ -282,12 +282,21 @@ fn check_estimate(
             let mut out = format!(
                 "dissected ({form}{}): a fire of {width} tokens of {model}: {wall:.2} ms wall, \
                  {:.2} ms in {} kernels' dispatches on the device (frame span {:.2} ms; {} \
-                 dispatches encoded)\n",
+                 dispatches encoded); on the host: submit {:.2} ms, fence wait {:.2} ms, \
+                 encode {:.2} ms, the rest of the fire {:.2} ms\n",
                 if replayed { ", replayed" } else { "" },
                 device as f64 / 1e6,
                 rows.len(),
                 crate::encode::frame_span_ns() as f64 / 1e6,
                 shapes.len(),
+                crate::encode::submit_ns() as f64 / 1e6,
+                crate::encode::fence_ns() as f64 / 1e6,
+                crate::encode::host_encode_ns() as f64 / 1e6,
+                (wall * 1e6
+                    - (crate::encode::submit_ns()
+                        + crate::encode::fence_ns()
+                        + crate::encode::host_encode_ns()) as f64)
+                    / 1e6,
             );
             for (name, ns, fires) in rows.iter().take(14) {
                 let groups: Vec<String> = shapes
