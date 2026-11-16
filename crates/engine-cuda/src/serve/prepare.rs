@@ -1796,7 +1796,10 @@ impl Shell {
                 });
         let readout_ceiling = (last_rows.min(max_lanes) + every_row).min(composition.bucket());
         let readouts_fit = readout_rows.len() <= readout_ceiling as usize;
-        let lanes_fit = composition.lane_count() <= crate::window::lane_capacity(max_lanes);
+        // A body lays its window tables for its bucket's lanes, at most the
+        // load's capacity: a fire of the bucket holds no more.
+        let body_lanes = crate::window::body_lanes(max_lanes, composition.bucket());
+        let lanes_fit = composition.lane_count() <= body_lanes;
         // A body carves for its window table's lanes, which may be a wider
         // rung than the fire's own. A fire capturing scores lays its rung's
         // planes, which the runtime sets aside for the rung it cut the fire
@@ -1806,12 +1809,12 @@ impl Shell {
             .iter()
             .any(|row| self.arena.captures(row.class as usize));
         let scores_fit = !scored
-            || self.arena.carve_rung(
-                u64::from(launched),
-                u64::from(crate::window::lane_capacity(max_lanes)),
-            ) == self
+            || self
                 .arena
-                .carve_rung(u64::from(launched), u64::from(composition.lane_count()));
+                .carve_rung(u64::from(launched), u64::from(body_lanes))
+                == self
+                    .arena
+                    .carve_rung(u64::from(launched), u64::from(composition.lane_count()));
         // Why a fire of a load that records bodies walks its plan, for the
         // warning it raises (`Bodies::eager_unbodied`).
         let fits = readouts_fit && lanes_fit && scores_fit;
@@ -1887,7 +1890,7 @@ impl Shell {
         let mut qo_absolute: Vec<i32> = Vec::new();
         let mut lane_carve = composition.lane_count();
         if bodied {
-            let capacity = crate::window::lane_capacity(max_lanes);
+            let capacity = body_lanes;
             lane_carve = lane_carve.max(capacity);
             for geometry in geometries.iter_mut().chain(&mut device_geometries) {
                 geometry.pad_to(capacity as usize);
