@@ -174,9 +174,21 @@ struct Bound {
     word: u64,
     planes: BTreeMap<String, (Vec<u64>, Vec<f32>)>,
     dir: std::path::PathBuf,
+    /// The buffers the device had created when the load was ready.
+    ready: u64,
 }
 
 const T: f32 = 0.375;
+
+/// The buffers `engine`'s device has created.
+fn creations(engine: &mut backend::Engine) -> u64 {
+    engine
+        .shell_mut()
+        .expect("loaded")
+        .device()
+        .books()
+        .creations()
+}
 
 /// The tokens of a pass.
 const ROWS: u32 = 3;
@@ -254,6 +266,7 @@ fn bound(tag: &str) -> Option<Bound> {
         planes,
         dir,
     } = loaded(tag, &Outputs)?;
+    let ready = creations(&mut engine);
     let facts = trace.facts.clone();
     let t_input = trace
         .inputs
@@ -362,6 +375,7 @@ fn bound(tag: &str) -> Option<Bound> {
         word: facts.word(&Request::new(rows, false)),
         planes,
         dir,
+        ready,
     })
 }
 
@@ -375,6 +389,7 @@ fn a_guest_reads_lane_layer_and_id_outputs_by_name() {
         word,
         planes,
         dir,
+        ..
     }) = bound("outputs")
     else {
         return;
@@ -447,6 +462,84 @@ fn a_guest_reads_lane_layer_and_id_outputs_by_name() {
         0,
         "a fire a guest reads built a pipeline the load did not"
     );
+    drop(engine);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Nothing is allocated after the load is ready (ruling (v)): a bind lays
+/// the instance's tables and scratch in pool slots the runtime took, and
+/// its passes stage and land through the ring the load laid; three fires
+/// create no buffer. The negative control: one buffer made by hand counts.
+#[test]
+fn a_bind_and_its_fires_create_no_buffer() {
+    let Some(Bound {
+        mut engine,
+        instance,
+        channels,
+        t_input,
+        word,
+        dir,
+        ready,
+        ..
+    }) = bound("creations")
+    else {
+        return;
+    };
+    for (round, token) in [3u32, 11, 7].into_iter().enumerate() {
+        let lane = Lane {
+            slot: 0,
+            word,
+            tokens: vec![token, token, token],
+            readout: Readout::Last,
+            kv_less: true,
+            inputs: vec![InputFeed {
+                id: t_input,
+                channel: channels[2],
+            }],
+            ..Lane::default()
+        };
+        if round > 0 {
+            assert!(
+                engine
+                    .publish_channel(instance, 2, &T.to_le_bytes())
+                    .expect("the timestep publishes"),
+                "the ring had room"
+            );
+        }
+        let mut ticket = engine
+            .submit(&FrameSubmission::of(Step {
+                lanes: vec![lane],
+                attachments: vec![Attachment {
+                    lane: 0,
+                    lanes: 1,
+                    instance,
+                    adapter_only: false,
+                }],
+                media: Vec::new(),
+                voxels: Vec::new(),
+            }))
+            .expect("the frame fires");
+        engine.settle_frame(&mut ticket).expect("the frame settles");
+        for dense in [0, 1] {
+            engine
+                .take_channel(instance, dense)
+                .expect("the channel reads")
+                .expect("the channel holds a cell");
+        }
+    }
+    assert_eq!(
+        creations(&mut engine),
+        ready,
+        "a bind and three fires created buffers after the load was ready"
+    );
+    let made = <backend::Buffer as engine_gpu::Buffer<backend::Api>>::zeroed(
+        engine.shell_mut().expect("loaded").device(),
+        256,
+        engine_gpu::books::owners::TEST,
+    )
+    .expect("a buffer by hand");
+    assert_eq!(creations(&mut engine), ready + 1, "the books see a creation");
+    drop(made);
     drop(engine);
     let _ = std::fs::remove_dir_all(&dir);
 }

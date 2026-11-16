@@ -84,6 +84,7 @@ impl Raw {
         // create info for a nonzero size.
         let buffer =
             unsafe { d.create_buffer(&info, None) }.map_err(|e| core.fault("vkCreateBuffer", e))?;
+        core.books.created();
         // SAFETY: `buffer` was just created on `d`.
         let need = unsafe { d.get_buffer_memory_requirements(buffer) };
         let Some(index) = Self::memory_type(core, &need, kind) else {

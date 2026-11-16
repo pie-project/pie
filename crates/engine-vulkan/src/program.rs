@@ -144,6 +144,10 @@ pub struct Plane {
     #[cfg(feature = "vulkan")]
     kept: crate::guest::session::Kept,
 
+    /// The host staging ring every pass stages through, laid at load.
+    #[cfg(feature = "vulkan")]
+    ring: Option<Arc<crate::guest::session::Ring>>,
+
     /// Passes run on the device.
     tally: u64,
 }
@@ -169,6 +173,18 @@ impl Plane {
             why = self.forms.refusal(id).map(ToString::to_string),
             "guest program registered"
         );
+        if let Some(
+            why @ (engine_gpu::guest::Refused::Chunk { .. }
+            | engine_gpu::guest::Refused::LaneIo { .. }),
+        ) = self.forms.refusal(id)
+        {
+            let why = why.to_string();
+            self.forms.forget(id);
+            return Err(Refusal::Program(format!(
+                "program 0x{:016x} is past this load's bounds: {why}",
+                registration.program_hash
+            )));
+        }
         self.programs.insert(id, Arc::new(plan));
         Ok(id)
     }
@@ -484,13 +500,16 @@ impl Plane {
                     id,
                     instance,
                     rings,
+                    scratch,
                     ..
                 } => {
                     let seat = self.instances.get_mut(id).ok_or(Refusal::Closed {
                         what: "instance",
                         id: id.0,
                     })?;
-                    seat.session.retarget(pools, instance).map_err(program)?;
+                    seat.session
+                        .retarget(pools, instance, scratch)
+                        .map_err(program)?;
                     let mut kept = self.kept.lock().expect("kept cells lock poisoned");
                     for ring in rings {
                         let channel = seat.ids.get(ring.channel as usize).ok_or_else(|| {
@@ -938,7 +957,7 @@ impl Plane {
 
         let crate::guest::run::Deferral {
             frame,
-            landing,
+            region,
             landings,
         } = deferral;
         let Some(frame) = frame else {
@@ -968,45 +987,41 @@ impl Plane {
             Arc::clone(&seat.faulted),
             owed.clone(),
         );
-        let status = seat.session.status_cell();
-        let spare = seat.session.landings();
-        let landing = Mutex::new(landing);
+        let landing = Mutex::new(region);
         let owing = Arc::clone(&seat.landing);
         let faulted = Arc::clone(&seat.faulted);
         let on_done = move |refused: Option<String>| {
             let mut fault = refused;
-            if fault.is_none() {
-                let mut word = [0u8; 4];
-                fault = match status.read(0, &mut word) {
-                    Ok(()) if word == [0; 4] => None,
-                    Ok(()) => Some(format!(
-                        "instance {instance} (program {program}) faulted on the device with                          code {}",
-                        u32::from_le_bytes(word)
+            // The pass's ring rooms go back once its cells are read.
+            let region = landing.lock().expect("landing lock poisoned").take();
+            if fault.is_none()
+                && let Some(region) = region.as_ref()
+            {
+                fault = match region.fault() {
+                    Ok(None) => None,
+                    Ok(Some(code)) => Some(format!(
+                        "instance {instance} (program {program}) faulted on the device with \
+                         code {code}"
                     )),
                     Err(why) => Some(why.to_string()),
                 };
-            }
-            let lent = landing.lock().expect("landing lock poisoned").take();
-            if fault.is_none()
-                && let Some(lent) = lent.as_ref()
-            {
-                for (ring, sequence, landing) in &fixups {
-                    match crate::guest::run::landed_value(lent, landing) {
-                        Ok(value) => ring.encode_sequence(*sequence, &value),
-                        Err(why) => {
-                            fault = Some(why.to_string());
-                            break;
+                if fault.is_none() {
+                    for (ring, sequence, landing) in &fixups {
+                        match crate::guest::run::landed_value(region, landing) {
+                            Ok(value) => ring.encode_sequence(*sequence, &value),
+                            Err(why) => {
+                                fault = Some(why.to_string());
+                                break;
+                            }
                         }
                     }
                 }
             }
+            drop(region);
             if fault.is_some() {
                 faulted.store(true, Ordering::Release);
             }
             owing.land(&owed);
-            if let Some(lent) = lent {
-                spare.lock().expect("spare lock poisoned").push(lent);
-            }
             if let Some(done) = done.as_ref() {
                 let outcome = match fault {
                     None => done.settled(),
@@ -1056,6 +1071,10 @@ impl Plane {
         if self.widen.is_none() {
             return Err("the plane built no readout widen at the load".to_owned());
         }
+        let ring = self
+            .ring
+            .as_ref()
+            .ok_or_else(|| "the plane laid no guest staging ring at the load".to_owned())?;
         let extents = eta_exec::Extents {
             row_count: binding.extents.row_count,
             token_count: binding.extents.token_count,
@@ -1075,6 +1094,10 @@ impl Plane {
                 pools: place.pools,
                 slots: &binding.instance_slots,
                 align: place.align,
+                scratch: &binding.scratch,
+                chunk: place.pools.chunk_bytes(),
+                ring,
+                lanes: engine_gpu::guest::pass_lanes(&plan.package),
             },
         )
         .map_err(|why| format!("its device half did not build: {why}"))
@@ -1106,6 +1129,15 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
             Refusal::Program(format!("the readout widen did not build: {why}"))
         })?;
         self.widen = Some(widen);
+        self.ring = Some(
+            crate::guest::session::Ring::lay(place.device, place.io).map_err(|why| {
+                Refusal::Program(format!("the guest staging ring was not laid: {why}"))
+            })?,
+        );
+        self.forms.load(engine_gpu::guest::Bounds {
+            chunk: place.pools.chunk_bytes(),
+            io: place.io,
+        });
         Ok(())
     }
 

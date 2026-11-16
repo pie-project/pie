@@ -237,6 +237,7 @@ fn place<B: Host>(shell: &Shell<B>) -> Place<'_, B> {
         device: shell.device(),
         pools: shell.pools(),
         align: B::table_align(shell.device()),
+        io: shell.guest_io(),
     }
 }
 
@@ -579,6 +580,7 @@ where
                 prefill_rows: 0,
                 prefill_lanes: 0,
                 max_readouts,
+                guest_lane_bytes: shell.guest_io().lane_bytes,
             },
             has_lora: true,
             has_attn_page_mask: false,
@@ -651,21 +653,35 @@ where
     /// A program reading captured attention scores holds the capture
     /// planes' rows for its lanes as its instances' state
     /// ([`Shell::capture_state`]).
+    ///
+    /// Each instance's scratch lies in pool chunks as well
+    /// ([`crate::guest::session::instance_scratch`]): one run where its
+    /// stages lay it in one piece, else a whole chunk a piece.
     fn guest_state(
         &self,
         program: ProgramId,
-        _extents: &engine::BindExtents,
+        extents: &engine::BindExtents,
     ) -> EngineResult<engine::GuestState> {
         let (Some(shell), Some(package)) = (self.shell.as_ref(), self.programs.package(program))
         else {
             return Ok(engine::GuestState::default());
         };
-        Ok(shell.capture_state(
+        let capture = shell.capture_state(
             package
                 .values
                 .iter()
                 .filter_map(|value| Some((value.output.as_deref()?, value.lane))),
-        ))
+        );
+        let scratch = crate::guest::session::instance_scratch(
+            &package.plans,
+            &crate::guest::session::extents_of(extents),
+            shell.pools().chunk_bytes(),
+        )
+        .map_err(|why| Error::Program(format!("program {program}'s scratch: {why}")))?;
+        Ok(engine::GuestState {
+            per_instance: scratch + capture.per_instance,
+            per_pair: capture.per_pair,
+        })
     }
 
     fn ring_facts(

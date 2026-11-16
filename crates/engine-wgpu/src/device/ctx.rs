@@ -223,6 +223,7 @@ impl Core {
     /// A buffer outside any slab, entered in the books under `owner` while
     /// it stands.
     pub(crate) fn held(&self, descriptor: &wgpu::BufferDescriptor<'_>, owner: Owner) -> Held {
+        self.books.created();
         let buffer = self.device.create_buffer(descriptor);
         self.books.take(owner, buffer.size());
         Held {

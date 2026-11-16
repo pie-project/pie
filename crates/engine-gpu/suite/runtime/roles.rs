@@ -343,6 +343,14 @@ fn an_instance_in_pool_slots_fires_through_moves() {
         &registered,
     );
     assert!(!binding.instance_slots.is_empty(), "the tables take slots");
+    // The scratch an unpark lands in: a fresh place, its bytes dead
+    // between fires.
+    let state = engine
+        .guest_state(program, &binding.extents)
+        .expect("the program's guest state");
+    assert!(state.per_instance > 0, "the instance holds its scratch");
+    let unparked_scratch = slots.scratch(state.per_instance);
+    assert_ne!(unparked_scratch, binding.scratch, "a new place");
     assert_eq!(
         !binding.ring_slots.is_empty(),
         channel_shape.is_some(),
@@ -459,7 +467,7 @@ fn an_instance_in_pool_slots_fires_through_moves() {
             instance: binding.instance_slots.clone(),
             rings: binding.ring_slots.clone(),
             adapter: Vec::new(),
-            scratch: ScratchPlace::None,
+            scratch: binding.scratch.clone(),
             pair: ScratchPlace::None,
         })
         .expect("the slots rebind");
@@ -545,7 +553,7 @@ fn an_instance_in_pool_slots_fires_through_moves() {
                 })
                 .collect(),
             adapter: Vec::new(),
-            scratch: ScratchPlace::None,
+            scratch: unparked_scratch.clone(),
             pair: ScratchPlace::None,
         })
         .expect("the unparked slots rebind");

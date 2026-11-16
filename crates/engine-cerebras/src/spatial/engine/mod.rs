@@ -236,6 +236,7 @@ impl Engine for Spatial {
                 prefill_rows: 0,
                 prefill_lanes: 0,
                 max_readouts: budgets.max_tokens,
+                guest_lane_bytes: 0,
             },
             has_lora: false,
             has_attn_page_mask: false,

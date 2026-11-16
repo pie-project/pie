@@ -3,17 +3,25 @@ use std::sync::Arc;
 
 use ash::vk;
 use eta_compiler::codegen::launch::LaunchStagePlan;
-use eta_exec::{Extents, ValueDesc};
+use eta_exec::{Extents, Placed, ValueDesc};
 
 use crate::device::Context;
-use crate::device::alloc::{Buffer, Memory};
+use crate::device::alloc::Buffer;
 use crate::device::ctx::{Core, Frame, Pending};
 use engine_gpu::error::{Fault, Result};
 use engine_gpu::store::Pools;
 use engine_gpu::store::layout::{CHANNEL, INSTANCE};
 
 use engine_gpu::guest::held::{self, consecutive};
-use engine_gpu::guest::session::{BINDINGS, StageTables, groups_for, stage_tables};
+use engine_gpu::guest::session::{
+    BINDINGS, PiecePlace, RING_ALIGN, SEGMENT_BINDINGS, StageTables, bases_at, groups_for,
+    piece_places, stage_tables,
+};
+
+/// The host staging ring the plane laid at load.
+pub type Ring = engine_gpu::guest::ring::Ring<crate::device::Api>;
+/// A pass's rooms in it.
+pub type Region = engine_gpu::guest::ring::Region<crate::device::Api>;
 
 /// A span of a pool slot (or run) a guest holds.
 pub type Held = held::Held<crate::device::Api>;
@@ -61,20 +69,20 @@ struct Stage {
     groups: u32,
     set: vk::DescriptorSet,
 
-    offsets: Vec<u64>,
+    /// Each value's piece and offset there.
+    places: Vec<Placed>,
 
     descriptors: Vec<ValueDesc>,
     /// The stage's bind-time tables in the instance's `Instance` slots,
     /// in `TABLE_BINDINGS` order.
     tables: [Held; 4],
 
-    heap: Buffer,
-
-    staging: Buffer,
-
-    landing: Buffer,
-
-    dirty: Vec<(u64, u64)>,
+    /// The roots staged in the pass's ring region: (ring byte, value).
+    staged: Vec<(u64, u32)>,
+    /// The constants filled on the device: (value, word).
+    filled: Vec<(u32, u32)>,
+    /// The values landed in the pass's ring region: (value, ring byte).
+    landed: Vec<(u32, u64)>,
 }
 
 /// The cells of channels the device keeps between fires, by channel: one
@@ -186,24 +194,51 @@ impl Cell {
     }
 }
 
-/// Where an instance's tables go: the `Instance` slots the runtime took
-/// for them, and a table's alignment there.
+/// Where an instance's state goes: the `Instance` slots the runtime took
+/// for its tables, a table's alignment there, where its scratch lies, the
+/// pool's chunk, and the ring its passes stage through.
 pub struct Tables<'a> {
     pub pools: &'a Pools<crate::device::Api>,
     pub slots: &'a [u32],
     pub align: u64,
+    pub scratch: &'a engine::ScratchPlace,
+    pub chunk: u64,
+    pub ring: &'a Arc<Ring>,
+    /// The lanes one pass runs: its ring rooms.
+    pub lanes: u32,
+}
+
+/// A piece of the instance's scratch: where it lies, and its segment's
+/// buffer.
+#[derive(Clone)]
+struct Piece {
+    place: PiecePlace,
+    buffer: Buffer,
 }
 
 pub struct Session {
     core: Arc<Core>,
 
-    status: Buffer,
     stages: Vec<Stage>,
     pool: vk::DescriptorPool,
     /// The `Instance` slots the stages' tables lie in, in binding order,
     /// and whether they are one run.
     slots: Vec<u32>,
     run: bool,
+    /// The instance's fault word, after its stages' tables.
+    status: Held,
+
+    /// Where the scratch lies, its pieces there, the most pieces and bytes
+    /// any stage lays in them.
+    scratch: engine::ScratchPlace,
+    pieces: Vec<Piece>,
+    piece_count: u32,
+    held: u64,
+
+    ring: Arc<Ring>,
+    lanes: u32,
+    /// The rooms of the pass being recorded.
+    pass: Option<Region>,
 
     kept: Kept,
     /// The engine's channel behind each of the program's.
@@ -211,20 +246,22 @@ pub struct Session {
 
     /// Passes submitted and not yet waited on, oldest first.
     airborne: std::collections::VecDeque<Pending>,
-    /// Read-back buffers a landed pass has handed back, one stage's landing
-    /// wide each.
-    landings: Arc<std::sync::Mutex<Vec<Buffer>>>,
 }
 
 impl std::fmt::Debug for Session {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Session")
             .field("stages", &self.stages.len())
-            .field(
-                "heap",
-                &self.stages.iter().map(|s| s.heap.bytes()).sum::<u64>(),
-            )
+            .field("scratch", &self.scratch)
+            .field("held", &self.held)
             .finish()
+    }
+}
+
+fn program(why: String) -> Fault {
+    Fault::Program {
+        at: "guest::session",
+        why,
     }
 }
 
@@ -241,44 +278,44 @@ impl Session {
         tables: &Tables<'_>,
     ) -> Result<Session> {
         if code.len() != plans.len() {
-            return Err(Fault::Program {
-                at: "guest::session",
-                why: format!(
-                    "{} stage plans but {} compiled forms; a session runs every stage or none",
-                    plans.len(),
-                    code.len()
-                ),
-            });
+            return Err(program(format!(
+                "{} stage plans but {} compiled forms; a session runs every stage or none",
+                plans.len(),
+                code.len()
+            )));
         }
-
-        let mut status = Buffer::with(
-            device,
-            eta_exec::STATUS_BYTES as u64,
-            Memory::Host,
-            engine_gpu::books::owners::GUEST,
-        )?;
-        status.write(0, &[0u8; eta_exec::STATUS_BYTES])?;
 
         let core = device.core().clone();
         let resolved = plans
             .iter()
-            .map(|plan| {
-                stage_tables(plan, extents).map_err(|why| Fault::Program {
-                    at: "guest::session",
-                    why,
-                })
-            })
+            .map(|plan| stage_tables(plan, extents, tables.chunk).map_err(program))
             .collect::<Result<Vec<StageTables>>>()?;
-        // Every stage's tables, in the instance's slots, written at once.
-        let bytes: Vec<Vec<u8>> = resolved
+        let piece_count = resolved
             .iter()
-            .flat_map(|stage| stage.tables.iter().cloned())
-            .collect();
+            .map(|stage| stage.scratch.pieces())
+            .max()
+            .unwrap_or(0);
+        let held = resolved
+            .iter()
+            .map(|stage| stage.scratch.held_bytes(tables.chunk))
+            .max()
+            .unwrap_or(0);
+        let pieces = pieces_of(tables.pools, tables.scratch, piece_count, held)?;
+        // Every stage's tables, then the fault word, in the instance's
+        // slots, written at once; each stage's place table names its pieces'
+        // bases.
+        let mut bytes: Vec<Vec<u8>> = Vec::with_capacity(4 * resolved.len() + 1);
+        for (plan, stage) in plans.iter().zip(&resolved) {
+            let mut stage_bytes = stage.tables.clone();
+            write_bases(&mut stage_bytes[2], plan.value_types.len(), &pieces);
+            bytes.extend(stage_bytes);
+        }
+        bytes.push(vec![0u8; eta_exec::STATUS_BYTES]);
         let (placed, run) =
             held::place_tables(tables.pools, INSTANCE, tables.slots, &bytes, tables.align)?;
         let mut placed = placed.into_iter();
         let mut stages = Vec::with_capacity(plans.len());
-        for ((plan, lowered), resolved) in plans.iter().zip(code).zip(resolved) {
+        for (lowered, resolved) in code.iter().zip(resolved) {
             let pipelines = match built.get(&stage_key(lowered)) {
                 Some(pipelines) => Arc::clone(pipelines),
                 None => {
@@ -287,11 +324,29 @@ impl Session {
                     pipelines
                 }
             };
-            let tables = [(); 4].map(|()| placed.next().expect("four tables a stage"));
-            stages.push(build_stage(
-                device, plan, lowered, resolved, tables, pipelines,
-            )?);
+            let stage_tables = [(); 4].map(|()| placed.next().expect("four tables a stage"));
+            let StageTables {
+                descriptors,
+                places,
+                ..
+            } = resolved;
+            stages.push(Stage {
+                built: pipelines,
+                groups: if lowered.strides_the_grid {
+                    groups_for(&descriptors, device.cores())
+                } else {
+                    1
+                },
+                set: vk::DescriptorSet::null(),
+                places,
+                descriptors,
+                tables: stage_tables,
+                staged: Vec::new(),
+                filled: Vec::new(),
+                landed: Vec::new(),
+            });
         }
+        let status = placed.next().expect("the fault word after the tables");
 
         let sizes = [
             vk::DescriptorPoolSize::default()
@@ -321,15 +376,21 @@ impl Session {
 
         let mut session = Session {
             core,
-            status,
             stages,
             pool,
             slots: tables.slots.to_vec(),
             run,
+            status,
+            scratch: tables.scratch.clone(),
+            pieces,
+            piece_count,
+            held,
+            ring: Arc::clone(tables.ring),
+            lanes: tables.lanes,
+            pass: None,
             kept,
             channels,
             airborne: std::collections::VecDeque::new(),
-            landings: Arc::default(),
         };
         session.bind_sets()?;
         Ok(session)
@@ -355,26 +416,55 @@ impl Session {
         self.write_sets()
     }
 
-    /// Points each stage's set at its buffers: the status word, its tables
-    /// where their slots lie now, and its heap. Nothing on the queue uses
-    /// the sets: at construction none has run, and a rebind settles first.
+    /// The buffer each segment binding takes: the segment where a piece
+    /// lies in it, else the first piece's (never read), else the fault
+    /// word's slot (a scratch of no pieces reads no segment).
+    fn segment_buffers(&self) -> [(vk::Buffer, u64); 4] {
+        let fallback = self.pieces.first().map_or_else(
+            || {
+                (
+                    self.status.buffer().slab().buffer,
+                    self.status.buffer().bytes(),
+                )
+            },
+            |piece| (piece.buffer.slab().buffer, piece.buffer.bytes()),
+        );
+        let mut out = [fallback; 4];
+        for piece in &self.pieces {
+            if let Some(slot) = out.get_mut(piece.place.segment as usize) {
+                *slot = (piece.buffer.slab().buffer, piece.buffer.bytes());
+            }
+        }
+        out
+    }
+
+    /// Points each stage's set at its buffers: the fault word, its tables
+    /// where their slots lie now, and the segments its pieces lie in.
+    /// Nothing on the queue uses the sets: at construction none has run,
+    /// and a rebind settles first.
     fn write_sets(&self) -> Result<()> {
         let d = &self.core.device;
+        let segments = self.segment_buffers();
         for stage in &self.stages {
             let [descs, params, offs, cfg] = &stage.tables;
-            let whole = |buffer: &Buffer| (buffer.slab().buffer, 0, buffer.bytes());
             let held = |held: &Held| (held.buffer().slab().buffer, held.offset(), held.bytes());
-            let buffers = [
-                (whole(&self.status), vk::DescriptorType::STORAGE_BUFFER),
-                (held(descs), vk::DescriptorType::STORAGE_BUFFER),
-                (held(params), vk::DescriptorType::STORAGE_BUFFER),
-                (held(offs), vk::DescriptorType::STORAGE_BUFFER),
-                (whole(&stage.heap), vk::DescriptorType::STORAGE_BUFFER),
-                (held(cfg), vk::DescriptorType::UNIFORM_BUFFER),
+            let mut buffers = vec![
+                (0, held(&self.status), vk::DescriptorType::STORAGE_BUFFER),
+                (1, held(descs), vk::DescriptorType::STORAGE_BUFFER),
+                (2, held(params), vk::DescriptorType::STORAGE_BUFFER),
+                (3, held(offs), vk::DescriptorType::STORAGE_BUFFER),
+                (5, held(cfg), vk::DescriptorType::UNIFORM_BUFFER),
             ];
+            for (&binding, &(buffer, range)) in SEGMENT_BINDINGS.iter().zip(&segments) {
+                buffers.push((
+                    binding,
+                    (buffer, 0, range),
+                    vk::DescriptorType::STORAGE_BUFFER,
+                ));
+            }
             let infos: Vec<[vk::DescriptorBufferInfo; 1]> = buffers
                 .iter()
-                .map(|&((buffer, offset, range), _)| {
+                .map(|&(_, (buffer, offset, range), _)| {
                     [vk::DescriptorBufferInfo::default()
                         .buffer(buffer)
                         .offset(offset)
@@ -384,28 +474,41 @@ impl Session {
             let writes: Vec<vk::WriteDescriptorSet> = buffers
                 .iter()
                 .zip(&infos)
-                .enumerate()
-                .map(|(binding, ((_, kind), info))| {
+                .map(|(&(binding, _, kind), info)| {
                     vk::WriteDescriptorSet::default()
                         .dst_set(stage.set)
-                        .dst_binding(binding as u32)
-                        .descriptor_type(*kind)
+                        .dst_binding(binding)
+                        .descriptor_type(kind)
                         .buffer_info(info)
                 })
                 .collect();
             // SAFETY: no command on the queue uses `stage.set` (see above);
-            // each write names a live buffer (a pool segment at a table's
-            // offset, aligned to the device's descriptor offset alignment by
-            // the table layout, or this session's own) with the descriptor
-            // type its layout binding declares, and the `infos` it points
-            // into outlive the call.
+            // each write names a live buffer (a pool segment, whole or at a
+            // table's offset, aligned to the device's descriptor offset
+            // alignment by the table layout) with the descriptor type its
+            // layout binding declares, and the `infos` it points into
+            // outlive the call.
             unsafe { d.update_descriptor_sets(&writes, &[]) };
         }
         Ok(())
     }
 
-    /// Points the stages' sets at the chunks their tables' slots sit in
-    /// now, after an evacuation; the passes on the queue land first.
+    /// Writes each stage's piece bases into its place table, where the
+    /// pieces lie now.
+    fn write_bases(&self) -> Result<()> {
+        for stage in &self.stages {
+            let values = stage.descriptors.len();
+            let mut words = Vec::new();
+            write_bases(&mut words, values, &self.pieces);
+            let at = bases_at(values);
+            stage.tables[2].write(at, &words[usize::try_from(at).unwrap_or(0)..])?;
+        }
+        Ok(())
+    }
+
+    /// Points the stages at the chunks their tables' slots and scratch
+    /// pieces sit in now, after an evacuation; the passes on the queue land
+    /// first.
     pub fn rebind(&mut self, pools: &Pools<crate::device::Api>) -> Result<()> {
         self.settle()?;
         for stage in &mut self.stages {
@@ -413,39 +516,50 @@ impl Session {
                 table.rebind(pools)?;
             }
         }
+        self.status.rebind(pools)?;
+        self.pieces = pieces_of(pools, &self.scratch, self.piece_count, self.held)?;
+        self.write_bases()?;
         self.write_sets()
     }
 
     /// Moves the tables to `slots` (`Instance` slot refs, as many as they
-    /// lie in, in order), whose bytes the runtime copied there.
-    pub fn retarget(&mut self, pools: &Pools<crate::device::Api>, slots: &[u32]) -> Result<()> {
+    /// lie in, in order), whose bytes the runtime copied there, and the
+    /// scratch to `scratch`, whose bytes are dead between fires.
+    pub fn retarget(
+        &mut self,
+        pools: &Pools<crate::device::Api>,
+        slots: &[u32],
+        scratch: &engine::ScratchPlace,
+    ) -> Result<()> {
         if slots.len() != self.slots.len() {
-            return Err(Fault::Program {
-                at: "guest::session",
-                why: format!(
-                    "tables in {} instance slot(s) rebound to {slots:?}",
-                    self.slots.len()
-                ),
-            });
+            return Err(program(format!(
+                "tables in {} instance slot(s) rebound to {slots:?}",
+                self.slots.len()
+            )));
         }
         if self.run && !consecutive(slots) {
-            return Err(Fault::Program {
-                at: "guest::session",
-                why: format!("tables in one run rebound to {slots:?}, not a run"),
-            });
+            return Err(program(format!(
+                "tables in one run rebound to {slots:?}, not a run"
+            )));
         }
         self.settle()?;
+        let at_of = |old: &[u32], held: &Held| {
+            old.iter()
+                .position(|&slot| slot == held.slot())
+                .expect("a table lies in one of the session's slots")
+        };
         for stage in &mut self.stages {
             for table in &mut stage.tables {
-                let at = self
-                    .slots
-                    .iter()
-                    .position(|&slot| slot == table.slot())
-                    .expect("a table lies in one of the session's slots");
+                let at = at_of(&self.slots, table);
                 table.retarget(pools, slots[at])?;
             }
         }
+        let at = at_of(&self.slots, &self.status);
+        self.status.retarget(pools, slots[at])?;
         self.slots = slots.to_vec();
+        self.scratch = scratch.clone();
+        self.pieces = pieces_of(pools, &self.scratch, self.piece_count, self.held)?;
+        self.write_bases()?;
         self.write_sets()
     }
 
@@ -454,142 +568,223 @@ impl Session {
         self.stages.len()
     }
 
+    /// Where `value` of `stage` lies: its segment's buffer, its byte there,
+    /// and its bytes.
     #[must_use]
-    pub fn span(&self, stage: usize, value: u32) -> Option<(u64, u64)> {
+    pub fn place(&self, stage: usize, value: u32) -> Option<(&Buffer, u64, u64)> {
         let stage = self.stages.get(stage)?;
-        let at = value as usize;
+        let placed = stage.places.get(value as usize)?;
+        let piece = self.pieces.get(placed.piece as usize)?;
         Some((
-            *stage.offsets.get(at)?,
-            stage.descriptors.get(at)?.device_bytes(),
+            &piece.buffer,
+            piece.place.at + placed.offset,
+            stage.descriptors.get(value as usize)?.device_bytes(),
         ))
     }
 
+    /// `value`'s bytes.
     #[must_use]
-    pub fn heap(&self, stage: usize) -> Option<&Buffer> {
-        self.stages.get(stage).map(|stage| &stage.heap)
+    pub fn bytes(&self, stage: usize, value: u32) -> Option<u64> {
+        Some(
+            self.stages
+                .get(stage)?
+                .descriptors
+                .get(value as usize)?
+                .device_bytes(),
+        )
     }
 
+    fn placed(&self, stage: usize, value: u32) -> Result<(Buffer, u64, u64)> {
+        self.place(stage, value)
+            .map(|(buffer, at, len)| (buffer.clone(), at, len))
+            .ok_or_else(|| program(format!("value {value} is not stage {stage}'s")))
+    }
+
+    /// Takes ring rooms for the pass about to be recorded, waiting for one
+    /// in flight to land where the ring has none free.
+    pub fn open(&mut self, stage: usize) -> Result<()> {
+        let stage = self
+            .stages
+            .get_mut(stage)
+            .ok_or_else(|| program(format!("stage {stage} is past this package's")))?;
+        stage.staged.clear();
+        stage.filled.clear();
+        stage.landed.clear();
+        if self.pass.is_none() {
+            self.pass = Some(self.ring.take(self.lanes)?);
+        }
+        Ok(())
+    }
+
+    fn region(&self) -> Result<&Region> {
+        self.pass
+            .as_ref()
+            .ok_or_else(|| program("a pass staged nothing before it took ring rooms".into()))
+    }
+
+    /// Gives the pass's ring rooms up to the caller: a deferred pass holds
+    /// them until it lands.
+    pub fn close(&mut self) -> Option<Region> {
+        self.pass.take()
+    }
+
+    /// Stages `bytes` as `value`'s, through the pass's ring rooms.
     pub fn stage_in(&mut self, stage: usize, value: u32, bytes: &[u8]) -> Result<()> {
-        let (at, len) = self.span(stage, value).ok_or_else(|| Fault::Program {
-            at: "guest::session",
-            why: format!("value {value} is not stage {stage}'s"),
-        })?;
+        let (_, _, len) = self.placed(stage, value)?;
         if bytes.len() as u64 != len {
-            return Err(Fault::Program {
-                at: "guest::session",
-                why: format!(
-                    "value {value} of stage {stage} holds {len} bytes, and a root of \
-                     {} was offered; a short root leaves the last fire's tail under it",
-                    bytes.len()
-                ),
-            });
+            return Err(program(format!(
+                "value {value} of stage {stage} holds {len} bytes, and a root of {} was \
+                 offered; a short root leaves the last fire's tail under it",
+                bytes.len()
+            )));
         }
-        // A pass still on the queue may not have copied its own roots out.
-        self.settle()?;
-        let stage = &mut self.stages[stage];
-        stage.staging.write(at, bytes)?;
-        stage.dirty.push((at, len));
+        let region = self.region()?;
+        let used: u64 = self.stages[stage]
+            .staged
+            .iter()
+            .map(|&(_, staged)| {
+                self.bytes(stage, staged)
+                    .unwrap_or(0)
+                    .next_multiple_of(RING_ALIGN)
+            })
+            .sum();
+        if used + len > region.bound() {
+            return Err(program(format!(
+                "stage {stage} stages {} bytes, past the {} its lanes' ring rooms hold",
+                used + len,
+                region.bound()
+            )));
+        }
+        let at = region.staged() + used;
+        region.buffer().write_shared(at, bytes)?;
+        self.stages[stage].staged.push((at, value));
         Ok(())
     }
 
+    /// Fills `value` with `word` on the device: a constant, one word over
+    /// its every lane.
+    pub fn fill(&mut self, stage: usize, value: u32, word: u32) -> Result<()> {
+        self.placed(stage, value)?;
+        self.stages[stage].filled.push((value, word));
+        Ok(())
+    }
+
+    /// Records the stage's staged roots and filled constants into place,
+    /// and clears the fault word.
     pub fn flush(&mut self, frame: &mut Frame, stage: usize) -> Result<()> {
-        let Some(stage) = self.stages.get_mut(stage) else {
+        if stage >= self.stages.len() {
             return Ok(());
-        };
-        for (at, len) in stage.dirty.drain(..) {
-            frame.copy(&stage.staging, at, &stage.heap, at, len)?;
+        }
+        frame.fill_zero(
+            self.status.buffer(),
+            self.status.offset(),
+            eta_exec::STATUS_BYTES as u64,
+        )?;
+        let staged = std::mem::take(&mut self.stages[stage].staged);
+        let filled = std::mem::take(&mut self.stages[stage].filled);
+        for &(from, value) in &staged {
+            let (into, at, len) = self.placed(stage, value)?;
+            let ring = self.region()?.buffer().clone();
+            frame.copy(&ring, from, &into, at, len)?;
+        }
+        for &(value, word) in &filled {
+            let (into, at, len) = self.placed(stage, value)?;
+            frame.fill_word(&into, at, len, word)?;
         }
         Ok(())
     }
 
-    pub fn read_back(&mut self, frame: &mut Frame, stage: usize, value: u32) -> Result<()> {
-        let (at, len) = self.span(stage, value).ok_or_else(|| Fault::Program {
-            at: "guest::session",
-            why: format!("value {value} is not stage {stage}'s"),
-        })?;
-        let stage = &self.stages[stage];
-        frame.copy(&stage.heap, at, &stage.landing, at, len)
+    /// Records `value`'s copy into the pass's ring rooms; the ring byte it
+    /// lands at.
+    pub fn read_back(&mut self, frame: &mut Frame, stage: usize, value: u32) -> Result<u64> {
+        if let Some(&(_, at)) = self.stages[stage]
+            .landed
+            .iter()
+            .find(|&&(landed, _)| landed == value)
+        {
+            return Ok(at);
+        }
+        let (from, from_at, len) = self.placed(stage, value)?;
+        let region = self.region()?;
+        let used: u64 = self.stages[stage]
+            .landed
+            .iter()
+            .map(|&(landed, _)| {
+                self.bytes(stage, landed)
+                    .unwrap_or(0)
+                    .next_multiple_of(RING_ALIGN)
+            })
+            .sum();
+        if used + len > region.bound() {
+            return Err(program(format!(
+                "stage {stage} lands {} bytes, past the {} its lanes' ring rooms hold",
+                used + len,
+                region.bound()
+            )));
+        }
+        let at = region.landed() + used;
+        let ring = region.buffer().clone();
+        frame.copy(&from, from_at, &ring, at, len)?;
+        self.stages[stage].landed.push((value, at));
+        Ok(at)
+    }
+
+    /// Records the pass's fault word into its ring rooms, behind its
+    /// dispatches.
+    pub fn land_status(&mut self, frame: &mut Frame) -> Result<()> {
+        let region = self.region()?;
+        let (ring, at) = (region.buffer().clone(), region.status());
+        frame.copy(
+            self.status.buffer(),
+            self.status.offset(),
+            &ring,
+            at,
+            eta_exec::STATUS_BYTES as u64,
+        )
     }
 
     /// Copies `value` into the device's cell for `channel`, in place of a
     /// read back: the next fire's take of the channel restores it.
-    pub fn keep(
-        &mut self,
-        device: &Context,
-        frame: &mut Frame,
-        stage: usize,
-        value: u32,
-        channel: u32,
-    ) -> Result<()> {
-        let (at, len) = self.span(stage, value).ok_or_else(|| Fault::Program {
-            at: "guest::session",
-            why: format!("value {value} is not stage {stage}'s"),
-        })?;
-        let _ = device;
+    pub fn keep(&mut self, frame: &mut Frame, stage: usize, value: u32, channel: u32) -> Result<()> {
+        let (from, at, len) = self.placed(stage, value)?;
         let id = self.channel(channel)?;
         let mut kept = self.kept.lock().expect("kept cells lock poisoned");
-        let cell = kept.get_mut(&id).ok_or_else(|| Fault::Program {
-            at: "guest::session",
-            why: format!(
+        let cell = kept.get_mut(&id).ok_or_else(|| {
+            program(format!(
                 "channel {id} keeps a cell on the device and holds no place for one: its \
                  registration took no Channel slots"
-            ),
+            ))
         })?;
         if cell.bytes < len {
-            return Err(Fault::Program {
-                at: "guest::session",
-                why: format!(
-                    "channel {id} keeps a {len}-byte value in a {}-byte cell",
-                    cell.bytes
-                ),
-            });
+            return Err(program(format!(
+                "channel {id} keeps a {len}-byte value in a {}-byte cell",
+                cell.bytes
+            )));
         }
         let (into, into_at) = cell.span();
-        frame.copy(&self.stages[stage].heap, at, into, into_at, len)?;
+        frame.copy(&from, at, into, into_at, len)?;
         cell.live = true;
         Ok(())
     }
 
-    /// A read-back buffer of its own for a pass that lands after the next
-    /// one is recorded.
-    pub fn lend_landing(&mut self, device: &Context, stage: usize) -> Result<Buffer> {
-        let bytes = self.stages[stage].landing.bytes();
-        let spare = self.landings.lock().expect("landings lock poisoned").pop();
-        match spare {
-            Some(buffer) if buffer.bytes() >= bytes => Ok(buffer),
-            _ => Buffer::with(
-                device,
-                bytes,
-                Memory::Host,
-                engine_gpu::books::owners::GUEST,
-            ),
-        }
+    /// The fault word the open pass landed.
+    pub fn status(&self) -> Result<Option<u32>> {
+        self.region()?.fault()
     }
 
-    /// Where a landed pass hands its read-back buffer back.
-    #[must_use]
-    pub fn landings(&self) -> Arc<std::sync::Mutex<Vec<Buffer>>> {
-        Arc::clone(&self.landings)
-    }
-
-    pub fn read_back_into(
-        &self,
-        frame: &mut Frame,
-        stage: usize,
-        value: u32,
-        into: &Buffer,
-    ) -> Result<()> {
-        let (at, len) = self.span(stage, value).ok_or_else(|| Fault::Program {
-            at: "guest::session",
-            why: format!("value {value} is not stage {stage}'s"),
-        })?;
-        frame.copy(&self.stages[stage].heap, at, into, at, len)
-    }
-
-    /// The device's fault word, for a pass that lands on another thread.
-    #[must_use]
-    pub fn status_cell(&self) -> Buffer {
-        self.status.clone()
+    /// What `value` landed in the open pass's ring rooms.
+    pub fn taken(&self, stage: usize, value: u32) -> Result<Vec<u8>> {
+        let len = self
+            .bytes(stage, value)
+            .ok_or_else(|| program(format!("value {value} is not stage {stage}'s")))?;
+        let &(_, at) = self.stages[stage]
+            .landed
+            .iter()
+            .find(|&&(landed, _)| landed == value)
+            .ok_or_else(|| program(format!("value {value} of stage {stage} was not landed")))?;
+        let mut out = vec![0u8; usize::try_from(len).unwrap_or(0)];
+        self.region()?.read(at, &mut out)?;
+        Ok(out)
     }
 
     /// The engine's id of the program's `channel`.
@@ -597,12 +792,11 @@ impl Session {
         self.channels
             .get(channel as usize)
             .copied()
-            .ok_or_else(|| Fault::Program {
-                at: "guest::session",
-                why: format!(
+            .ok_or_else(|| {
+                program(format!(
                     "channel {channel} is past the {} this instance binds",
                     self.channels.len()
-                ),
+                ))
             })
     }
 
@@ -667,34 +861,17 @@ impl Session {
         let Some(cell) = self.kept_cell(channel) else {
             return Ok(false);
         };
-        let (at, len) = self.span(stage, value).ok_or_else(|| Fault::Program {
-            at: "guest::session",
-            why: format!("value {value} is not stage {stage}'s"),
-        })?;
-        frame.copy(
-            &cell.buffer,
-            cell.at,
-            &self.stages[stage].heap,
-            at,
-            len.min(cell.bytes),
-        )?;
+        let (into, at, len) = self.placed(stage, value)?;
+        frame.copy(&cell.buffer, cell.at, &into, at, len.min(cell.bytes))?;
         Ok(true)
     }
 
-    pub fn taken(&self, stage: usize, value: u32) -> Result<Vec<u8>> {
-        let (at, len) = self.span(stage, value).ok_or_else(|| Fault::Program {
-            at: "guest::session",
-            why: format!("value {value} is not stage {stage}'s"),
-        })?;
-        let mut out = vec![0u8; len as usize];
-        self.stages[stage].landing.read(at, &mut out)?;
-        Ok(out)
-    }
-
     pub fn dispatch(&self, frame: &Frame, at: usize) -> Result<()> {
-        let stage = self.stages.get(at).ok_or_else(|| Fault::Program {
-            at: "guest::session",
-            why: format!("stage {at} is past this package's {}", self.stages.len()),
+        let stage = self.stages.get(at).ok_or_else(|| {
+            program(format!(
+                "stage {at} is past this package's {}",
+                self.stages.len()
+            ))
         })?;
         let [groups, ..] = engine_gpu::workgroups(
             "guest",
@@ -705,7 +882,8 @@ impl Session {
         // SAFETY: `cmd` is the open frame's buffer, recorded only on this
         // thread (`Frame` is not `Sync`). The set, layout and pipelines are
         // this session's own and stay alive until it settles the frame; the
-        // set was written once at construction and matches the layout.
+        // set was written at construction (or at a rebind, which settles
+        // first) and matches the layout.
         unsafe {
             let cmd = frame.cmd();
 
@@ -770,17 +948,6 @@ impl Session {
         }
         Ok(())
     }
-
-    pub fn status(&self) -> Result<Option<u32>> {
-        let mut raw = [0u8; eta_exec::STATUS_BYTES];
-        self.status.read(0, &mut raw)?;
-        let code = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
-        Ok((code != 0).then_some(code))
-    }
-
-    pub fn clear_status(&mut self) -> Result<()> {
-        self.status.write(0, &[0u8; eta_exec::STATUS_BYTES])
-    }
 }
 
 impl Drop for Session {
@@ -796,51 +963,35 @@ impl Drop for Session {
     }
 }
 
-fn build_stage(
-    device: &Context,
-    plan: &LaunchStagePlan,
-    lowered: &engine_gpu::guest::Lowered<Vec<u32>>,
-    resolved: StageTables,
-    tables: [Held; 4],
-    built: Arc<Built>,
-) -> Result<Stage> {
-    let _ = plan;
-    let StageTables {
-        descriptors,
-        offsets,
-        scratch,
-        ..
-    } = resolved;
-    let heap = Buffer::zeroed(device, scratch, engine_gpu::books::owners::GUEST_STATE)?;
-    let staging = Buffer::with(
-        device,
-        scratch,
-        Memory::Host,
-        engine_gpu::books::owners::GUEST,
-    )?;
-    let landing = Buffer::with(
-        device,
-        scratch,
-        Memory::Host,
-        engine_gpu::books::owners::GUEST,
-    )?;
+/// Where `count` pieces of `held` bytes lie at `scratch`, each with its
+/// segment's buffer.
+fn pieces_of(
+    pools: &Pools<crate::device::Api>,
+    scratch: &engine::ScratchPlace,
+    count: u32,
+    held: u64,
+) -> Result<Vec<Piece>> {
+    piece_places(pools, scratch, count, held)?
+        .into_iter()
+        .map(|place| {
+            let buffer = pools.segment_buffer(place.segment)?.clone();
+            Ok(Piece { place, buffer })
+        })
+        .collect()
+}
 
-    Ok(Stage {
-        built,
-        groups: if lowered.strides_the_grid {
-            groups_for(&descriptors, device.cores())
-        } else {
-            1
-        },
-        set: vk::DescriptorSet::null(),
-        offsets,
-        descriptors,
-        tables,
-        heap,
-        staging,
-        landing,
-        dirty: Vec::new(),
-    })
+/// Writes `pieces`' bases into a place table of `values` values (its bytes
+/// grown to hold them where shorter).
+fn write_bases(table: &mut Vec<u8>, values: usize, pieces: &[Piece]) {
+    let at = usize::try_from(bases_at(values)).unwrap_or(usize::MAX);
+    let end = at + 4 * pieces.len();
+    if table.len() < end {
+        table.resize(end, 0);
+    }
+    for (index, piece) in pieces.iter().enumerate() {
+        table[at + 4 * index..at + 4 * index + 4]
+            .copy_from_slice(&piece.place.address().to_le_bytes());
+    }
 }
 
 fn build_pipelines(

@@ -1602,6 +1602,12 @@ impl Frame {
     }
 
     pub fn fill_zero(&mut self, into: &Buffer, at: u64, len: u64) -> Result<()> {
+        self.fill_word(into, at, len, 0)
+    }
+
+    /// Fills `len` bytes of `into` from `at` with `word` repeated, rounded
+    /// up to a whole word.
+    pub fn fill_word(&mut self, into: &Buffer, at: u64, len: u64, word: u32) -> Result<()> {
         if len == 0 {
             return Ok(());
         }
@@ -1627,7 +1633,7 @@ impl Frame {
                 &[],
                 &[],
             );
-            d.cmd_fill_buffer(cmd, into.buffer, at, len.next_multiple_of(4), 0);
+            d.cmd_fill_buffer(cmd, into.buffer, at, len.next_multiple_of(4), word);
             let after = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                 .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);

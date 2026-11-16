@@ -63,6 +63,7 @@ impl<'a> OnDevice<'a> {
         let plan = &package.plans[at];
         let mut frame = self.device.frame()?;
 
+        self.session.open(at)?;
         for &global in roots {
             let Some(local) = local_of(package, at, global)? else {
                 continue;
@@ -76,10 +77,14 @@ impl<'a> OnDevice<'a> {
                         root.output, root.lane
                     ),
                 })?;
-                let (_, held) = self.session.span(at, local).ok_or_else(|| Fault::Program {
-                    at: "guest::run",
-                    why: format!("the output root {local} is not stage {at}'s"),
-                })?;
+                let (into, into_at, held) = self
+                    .session
+                    .place(at, local)
+                    .map(|(buffer, into_at, held)| (buffer.clone(), into_at, held))
+                    .ok_or_else(|| Fault::Program {
+                        at: "guest::run",
+                        why: format!("the output root {local} is not stage {at}'s"),
+                    })?;
                 let values = u32::try_from(held / 4).unwrap_or(0);
                 if values > seat.width {
                     return Err(Fault::Program {
@@ -91,27 +96,18 @@ impl<'a> OnDevice<'a> {
                         ),
                     });
                 }
-                let heap = self.session.heap(at).ok_or_else(|| Fault::Program {
-                    at: "guest::run",
-                    why: format!("stage {at} has no heap"),
-                })?;
-                let (into, _) = self
-                    .session
-                    .span(at, local)
-                    .expect("the span was just read");
                 if seat.dtype != Dtype::Bf16 {
-                    let heap = heap.clone();
-                    frame.copy(seat.seat, seat.at, &heap, into, u64::from(values) * 4)?;
+                    frame.copy(seat.seat, seat.at, &into, into_at, u64::from(values) * 4)?;
                 } else {
                     self.widen
-                        .encode(&frame, seat.seat, seat.at, heap, into, values)?;
+                        .encode(&frame, seat.seat, seat.at, &into, into_at, values)?;
                 }
                 continue;
             }
             let bytes = root_bytes(
                 root,
                 &vals[global as usize],
-                self.session.span(at, local).map_or(0, |(_, l)| l),
+                self.session.bytes(at, local).unwrap_or(0),
             );
             self.session.stage_in(at, local, &bytes)?;
         }
@@ -124,14 +120,12 @@ impl<'a> OnDevice<'a> {
                 locals.push(local);
             }
         }
-        self.session
-            .read_back(self.device, &mut frame, at, &locals)?;
+        self.session.read_back(&mut frame, at, &locals)?;
         let pending = frame.commit_async(None)?;
-        self.session.collect(at)?;
         pending.wait()?;
 
-        if let Some(code) = self.session.status(at)? {
-            self.session.clear_status()?;
+        if let Some(code) = self.session.status()? {
+            self.session.close();
             return Err(Fault::Program {
                 at: "guest::run",
                 why: {
@@ -161,10 +155,7 @@ impl<'a> OnDevice<'a> {
                 continue;
             };
             let dtype = plan.value_types[local as usize].dtype;
-            let (_, held) = self
-                .session
-                .span(at, local)
-                .expect("a wanted value has a span");
+            let held = self.session.bytes(at, local).unwrap_or(0);
             let raw = self.session.taken(at, local)?;
             tracing::trace!(
                 stage = at,
@@ -176,6 +167,7 @@ impl<'a> OnDevice<'a> {
             );
             vals[global as usize] = from_heap(&raw, dtype, held);
         }
+        self.session.close();
         self.ran.push(at);
         Ok(())
     }

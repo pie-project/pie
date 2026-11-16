@@ -102,6 +102,10 @@ pub struct Books {
     /// Whether these bytes are the process's: a device's are, and a naming
     /// load's ([`Books::apart`]) reserve nothing.
     process: bool,
+    /// The buffers the backend has created on the device, device or host
+    /// memory alike ([`Books::created`]): a served engine creates none after
+    /// it is ready.
+    creations: AtomicU64,
 }
 
 impl Default for Books {
@@ -118,6 +122,7 @@ impl Books {
             ledger: Mutex::new(Ledger::new(1, u64::MAX)),
             device: AtomicU64::new(0),
             process: true,
+            creations: AtomicU64::new(0),
         }
     }
 
@@ -145,6 +150,17 @@ impl Books {
             let held = ledger.of(owner.class, owner.name);
             ledger.enter(owner.class, owner.name, held.saturating_add(bytes));
         });
+    }
+
+    /// The backend created a buffer on the device.
+    pub fn created(&self) {
+        self.creations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The buffers the backend has created since these books opened.
+    #[must_use]
+    pub fn creations(&self) -> u64 {
+        self.creations.load(Ordering::Relaxed)
     }
 
     /// `owner` gave `bytes` back to the device.

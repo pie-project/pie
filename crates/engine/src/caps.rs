@@ -37,6 +37,18 @@ pub struct FireLimits {
     /// 0: as many as `max_tokens`.
     #[serde(default)]
     pub max_readouts: u32,
+    /// The bytes one lane's guest pass moves between the host and the
+    /// device each way in a fire: the roots the host writes before it, and
+    /// the puts it reads back after. A load fact derived from the model's
+    /// declared outputs, like the vocabulary they carry: the sum over every
+    /// per-lane output the model declares (the logits row, a sampled token,
+    /// any other) of its width (a row a layer of a stacked one) times the
+    /// bytes of the element a guest reads. The engine lays its host staging
+    /// at load for `max_lanes` lanes of each fire in flight, and refuses a
+    /// program whose lanes would move more, by name, at registration. 0:
+    /// the engine states none.
+    #[serde(default)]
+    pub guest_lane_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

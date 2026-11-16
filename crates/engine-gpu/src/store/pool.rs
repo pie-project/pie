@@ -313,6 +313,26 @@ impl<B: Backend> Pool<B> {
         Ok((buffer, at % span))
     }
 
+    /// Segment `segment`'s buffer; refuses an uncommitted one.
+    pub fn segment(&self, segment: u32) -> Result<&B::Buffer> {
+        self.segments
+            .get(segment as usize)
+            .and_then(Option::as_ref)
+            .ok_or(Fault::Ceiling {
+                what: "committed segments of the state pool",
+                need: u64::from(segment) + 1,
+                have: u64::from(self.committed_segments()),
+            })
+    }
+
+    /// The segment virtual byte `at` lies in, its buffer, and the byte in
+    /// it; refuses an uncommitted one.
+    pub fn segment_of(&self, at: u64) -> Result<(u32, &B::Buffer, u64)> {
+        let span = u64::from(self.segment_chunks) * self.chunk_bytes;
+        let (buffer, offset) = self.locate(at)?;
+        Ok((u32::try_from(at / span).unwrap_or(u32::MAX), buffer, offset))
+    }
+
     /// The pool as kernels bind it: every committed segment, the rest
     /// absent.
     pub fn bind(&self, handles: &Handles<B>) -> Result<Segments> {

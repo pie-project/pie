@@ -57,6 +57,7 @@ impl Raw {
         if owner == engine_gpu::books::owners::POOL && kind == Memory::Device {
             usage |= wgpu::BufferUsages::UNIFORM;
         }
+        core.books.created();
         let buffer = core.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size,
@@ -186,6 +187,7 @@ impl Raw {
             return;
         }
         core.destroy_spent();
+        core.books.created();
         let staging = core.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("pie read"),
             size: span,

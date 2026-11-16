@@ -537,6 +537,7 @@ impl Engine for Xla {
                     &budgets,
                 )))
                 .unwrap_or(u32::MAX),
+                guest_lane_bytes: 0,
             },
             has_lora: true,
             has_attn_page_mask: false,

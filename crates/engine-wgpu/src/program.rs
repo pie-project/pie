@@ -304,6 +304,10 @@ pub struct Plane {
     #[cfg(feature = "wgpu")]
     codes: BTreeMap<ProgramId, Arc<crate::guest::session::Code>>,
 
+    /// The host ring every pass lands through, laid at load.
+    #[cfg(feature = "wgpu")]
+    ring: Option<Arc<crate::guest::session::Ring>>,
+
     tally: Arc<Tally>,
 }
 
@@ -328,6 +332,18 @@ impl Plane {
             why = self.forms.refusal(id).map(ToString::to_string),
             "guest program registered"
         );
+        if let Some(
+            why @ (engine_gpu::guest::Refused::Chunk { .. }
+            | engine_gpu::guest::Refused::LaneIo { .. }),
+        ) = self.forms.refusal(id)
+        {
+            let why = why.to_string();
+            self.forms.forget(id);
+            return Err(Refusal::Program(format!(
+                "program 0x{:016x} is past this load's bounds: {why}",
+                registration.program_hash
+            )));
+        }
         self.programs.insert(id, Arc::new(plan));
         Ok(id)
     }
@@ -962,6 +978,11 @@ impl Plane {
         if self.widen.is_none() {
             return Err("the plane built no readout widen at the load".to_owned());
         }
+        let ring = Arc::clone(
+            self.ring
+                .as_ref()
+                .ok_or_else(|| "the plane laid no guest ring at the load".to_owned())?,
+        );
         let extents = eta_exec::Extents {
             row_count: binding.extents.row_count,
             token_count: binding.extents.token_count,
@@ -989,6 +1010,10 @@ impl Plane {
                 pools: place.pools,
                 slots: &binding.instance_slots,
                 align: place.align,
+                scratch: &binding.scratch,
+                chunk: place.pools.chunk_bytes(),
+                ring: &ring,
+                lanes: engine_gpu::guest::pass_lanes(&plan.package),
             },
         )
         .map_err(|why| format!("its device half did not build: {why}"))
@@ -1064,6 +1089,7 @@ impl Plane {
                 id,
                 instance,
                 rings,
+                scratch,
                 ..
             } => {
                 if !rings.is_empty() {
@@ -1083,11 +1109,11 @@ impl Plane {
                         .lock()
                         .expect("half lock poisoned")
                         .session
-                        .retarget(pools, instance)
+                        .retarget(pools, instance, scratch)
                         .map_err(|fault| Refusal::Program(fault.to_string()))?;
                 }
                 #[cfg(not(feature = "wgpu"))]
-                let _ = (seat, pools, instance);
+                let _ = (seat, pools, instance, scratch);
                 Ok(())
             }
             Rebind::Channel { id, .. } => Err(Refusal::Program(format!(
@@ -1142,6 +1168,15 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
             Refusal::Program(format!("the readout widen did not build: {why}"))
         })?;
         self.widen = Some(Arc::new(widen));
+        self.ring = Some(
+            crate::guest::session::Ring::lay(place.device, place.io).map_err(|why| {
+                Refusal::Program(format!("the guest staging ring was not laid: {why}"))
+            })?,
+        );
+        self.forms.load(engine_gpu::guest::Bounds {
+            chunk: place.pools.chunk_bytes(),
+            io: place.io,
+        });
         Ok(())
     }
 

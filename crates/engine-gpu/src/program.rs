@@ -15,11 +15,41 @@ use crate::store::Pools;
 
 /// Where a plane places what an instance or channel holds on the device:
 /// the device, the state pool whose `Instance` and `Channel` slots the
-/// runtime took for it, and the alignment of a table in its slot.
+/// runtime took for it, the alignment of a table in its slot, and the
+/// bound a guest pass's host traffic is laid by.
 pub struct Place<'a, B: Serve> {
     pub device: &'a B::Context,
     pub pools: &'a Pools<B>,
     pub align: u64,
+    pub io: GuestIo,
+}
+
+/// What a load lays a plane's host staging by (`FireLimits::guest_lane_bytes`):
+/// the bytes one lane's pass moves each way, the lanes of a fire, and the
+/// fires in flight.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GuestIo {
+    pub lane_bytes: u64,
+    pub lanes: u32,
+    pub depth: u32,
+}
+
+impl GuestIo {
+    /// A lane's room in the ring: what it stages, what it lands, and its
+    /// fault word, each from an aligned byte.
+    #[must_use]
+    pub fn lane_room(&self) -> u64 {
+        let align = crate::guest::session::RING_ALIGN;
+        2 * self.lane_bytes.next_multiple_of(align)
+            + (eta_exec::STATUS_BYTES as u64).next_multiple_of(align)
+    }
+
+    /// The ring's bytes: a lane's room for every lane of every fire in
+    /// flight.
+    #[must_use]
+    pub fn ring_bytes(&self) -> u64 {
+        self.lane_room() * u64::from(self.lanes.max(1)) * u64::from(self.depth.max(1))
+    }
 }
 
 #[derive(Debug)]

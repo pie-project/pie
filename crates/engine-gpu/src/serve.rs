@@ -2207,6 +2207,37 @@ impl<B: Serve> Shell<B> {
         Ok(u64::from(self.out_width))
     }
 
+    /// What a guest pass's host traffic is bounded by
+    /// (`FireLimits::guest_lane_bytes`), derived from the load's own facts:
+    /// a lane moves at most what the model declares it reads out, each way.
+    /// That is the sum over the model's declared outputs (its readout
+    /// planes: the logits row, a sampled token, every other per-lane
+    /// output, a stacked one a row a layer) of width x the element a guest
+    /// reads (4 bytes: an f32, an i32, or a bf16 widened), for every lane
+    /// of every fire in flight.
+    #[must_use]
+    pub fn guest_io(&self) -> crate::program::GuestIo {
+        let mut seen: Vec<&str> = Vec::new();
+        let mut lane_bytes = 0u64;
+        for plane in &self.readouts {
+            if seen.contains(&plane.output.as_str()) {
+                continue;
+            }
+            seen.push(&plane.output);
+            let layers = u64::try_from(plane.values.len().max(1)).unwrap_or(u64::MAX);
+            lane_bytes = lane_bytes.saturating_add(
+                u64::from(plane.width)
+                    .saturating_mul(layers)
+                    .saturating_mul(GUEST_ELEMENT_BYTES),
+            );
+        }
+        crate::program::GuestIo {
+            lane_bytes,
+            lanes: self.budget().max_lanes,
+            depth: u32::try_from(self.arms.depth()).unwrap_or(u32::MAX),
+        }
+    }
+
     #[must_use]
     pub fn frames_in_flight(&self) -> usize {
         self.arms.depth()
@@ -4202,6 +4233,10 @@ pub struct Landed {
 }
 
 pub const READOUT_ROWS_PER_LANE: u32 = 8;
+
+/// The bytes of an output element as a guest reads it: an f32 or an i32,
+/// a bf16 widened to f32.
+pub const GUEST_ELEMENT_BYTES: u64 = 4;
 
 type ReadoutTable = (Vec<i32>, Vec<ReadSpan>);
 

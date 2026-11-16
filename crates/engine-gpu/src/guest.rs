@@ -11,6 +11,7 @@ use eta_compiler::codegen::launch::{LaunchPackage, LaunchStagePlan, ValueOrigin}
 use eta_compiler::codegen::wgsl;
 
 pub mod held;
+pub mod ring;
 pub mod run;
 pub mod session;
 pub mod widen;
@@ -44,6 +45,19 @@ pub enum Refused {
 
         why: &'static str,
     },
+
+    /// The stage's scratch does not lie in the load's chunks: a value, or
+    /// the temporary area, is larger than a chunk.
+    Chunk { stage: usize, why: String },
+
+    /// A pass of the stage moves more between the host and the device than
+    /// the load's staging holds for its lanes (`FireLimits::guest_lane_bytes`).
+    LaneIo {
+        stage: usize,
+        way: &'static str,
+        bytes: u64,
+        bound: u64,
+    },
 }
 
 impl std::fmt::Display for Refused {
@@ -73,6 +87,17 @@ impl std::fmt::Display for Refused {
                     "stage {stage}'s scratch does not hold value {value} for the host: {why}"
                 )
             }
+            Self::Chunk { stage, why } => write!(f, "stage {stage}'s scratch: {why}"),
+            Self::LaneIo {
+                stage,
+                way,
+                bytes,
+                bound,
+            } => write!(
+                f,
+                "a pass of stage {stage} {way} {bytes} bytes, past the {bound} this load's \
+                 guest staging holds for its lanes"
+            ),
         }
     }
 }
@@ -184,9 +209,99 @@ impl<L: Lower> std::fmt::Debug for Compiled<L> {
     }
 }
 
+/// What a load lays a program's device half by: the pool's chunk, which
+/// no value of its scratch may pass, and its host staging's bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bounds {
+    pub chunk: u64,
+    pub io: crate::program::GuestIo,
+}
+
+/// The lanes a pass of `package` runs: one for each lane its output roots
+/// read, at least one.
+#[must_use]
+pub fn pass_lanes(package: &LaunchPackage) -> u32 {
+    package
+        .values
+        .iter()
+        .filter(|value| value.source == ValueOrigin::Output)
+        .map(|value| value.lane + 1)
+        .max()
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// What a pass of `package`'s stage `at` moves between the host and the
+/// device, as `tables` lay it: the channel cells the host stages in (a
+/// constant is filled on the device, an output copied there), and the puts
+/// it reads back.
+#[must_use]
+pub fn pass_io(package: &LaunchPackage, at: usize, tables: &session::StageTables) -> (u64, u64) {
+    let bytes = |local: u32| {
+        tables
+            .descriptors
+            .get(local as usize)
+            .map_or(0, eta_exec::ValueDesc::device_bytes)
+    };
+    let staged = package
+        .values
+        .iter()
+        .enumerate()
+        .filter(|(_, value)| {
+            matches!(
+                value.source,
+                ValueOrigin::ChannelTake | ValueOrigin::ChannelRead
+            )
+        })
+        .filter_map(|(global, _)| match package.plan_local(global as u32) {
+            Some((stage, Some(local))) if stage == at => Some(bytes(local)),
+            _ => None,
+        })
+        .sum();
+    let mut read: Vec<u32> = Vec::new();
+    for put in package.stages.get(at).map_or(&[][..], |stage| &stage.puts[..]) {
+        if let Some((stage, Some(local))) = package.plan_local(put.value)
+            && stage == at
+            && !read.contains(&local)
+        {
+            read.push(local);
+        }
+    }
+    (staged, read.into_iter().map(bytes).sum())
+}
+
+/// Refuses, by name, a program whose stage `at` lays no scratch in the
+/// load's chunks or moves more than its staging holds, at `extents`.
+pub fn within(
+    package: &LaunchPackage,
+    at: usize,
+    extents: &eta_exec::Extents,
+    bounds: Bounds,
+) -> Result<session::StageTables, Refused> {
+    let plan = &package.plans[at];
+    let tables = session::stage_tables(plan, extents, bounds.chunk)
+        .map_err(|why| Refused::Chunk { stage: at, why })?;
+    let bound = u64::from(pass_lanes(package)) * bounds.io.lane_bytes;
+    let (staged, landed) = pass_io(package, at, &tables);
+    for (way, bytes) in [("stages", staged), ("lands", landed)] {
+        if bytes > bound {
+            return Err(Refused::LaneIo {
+                stage: at,
+                way,
+                bytes,
+                bound,
+            });
+        }
+    }
+    Ok(tables)
+}
+
 impl<L: Lower> Compiled<L> {
-    pub fn of(package: &LaunchPackage) -> Result<Compiled<L>, Refused> {
+    pub fn of(package: &LaunchPackage, bounds: Bounds) -> Result<Compiled<L>, Refused> {
         scratch_holds_the_hosts_values(package)?;
+        for at in 0..package.plans.len() {
+            within(package, at, &eta_exec::Extents::default(), bounds)?;
+        }
         let mut stages = Vec::with_capacity(package.plans.len());
         for (at, plan) in package.plans.iter().enumerate() {
             let stepwise = step_source(at, plan)?;
@@ -224,6 +339,9 @@ pub struct Forms<L: Lower> {
     compiled: HashMap<ProgramId, Arc<Compiled<L>>>,
 
     refused: HashMap<ProgramId, Refused>,
+
+    /// The load's bounds, from its load on.
+    bounds: Option<Bounds>,
 }
 
 impl<L: Lower> Default for Forms<L> {
@@ -231,13 +349,36 @@ impl<L: Lower> Default for Forms<L> {
         Forms {
             compiled: HashMap::new(),
             refused: HashMap::new(),
+            bounds: None,
         }
     }
 }
 
 impl<L: Lower> Forms<L> {
+    /// The load's bounds every program after it is admitted by.
+    pub fn load(&mut self, bounds: Bounds) {
+        self.bounds = Some(bounds);
+    }
+
+    #[must_use]
+    pub fn bounds(&self) -> Option<Bounds> {
+        self.bounds
+    }
+
+    /// Admits `package`'s device half: refused (and recorded) where it
+    /// does not lower, or no load bounds it yet.
     pub fn admit(&mut self, program: ProgramId, package: &LaunchPackage) -> bool {
-        match Compiled::of(package) {
+        let Some(bounds) = self.bounds else {
+            self.refused.insert(
+                program,
+                Refused::Emitting {
+                    stage: 0,
+                    why: "no model is loaded, so no pool lays its scratch".into(),
+                },
+            );
+            return false;
+        };
+        match Compiled::of(package, bounds) {
             Ok(compiled) => {
                 self.compiled.insert(program, Arc::new(compiled));
                 true
@@ -283,6 +424,22 @@ mod tests {
         use eta_ir::registry::{Axis, EngineCaps, OutputDecl, Port};
 
         pub const QWEN_VOCAB: u32 = 151_936;
+
+        /// Qwen3-0.6B's pool chunk on the GPU (its chunk recipe's).
+        pub const QWEN_CHUNK: u64 = 4 << 20;
+
+        /// [`super::a_shipped_programs_stage_scratch`]'s rows.
+        /// Each: the program, its scratch each value its own bytes, the
+        /// pieces it lies in at [`QWEN_CHUNK`], the bytes an instance holds
+        /// for it, and what a lane's pass (stages in, lands).
+        pub const EXPECTED: [(&str, u64, u32, u64, (u64, u64)); 6] = [
+            ("top-p", 9_312_512, 2, 8_388_608, (8, 12)),
+            ("top-k + top-p", 9_616_896, 2, 8_388_608, (8, 12)),
+            ("gumbel-max", 5_512_960, 2, 8_388_608, (8, 12)),
+            ("greedy", 3_688_704, 1, 3_688_448, (0, 4)),
+            ("top logprobs", 6_728_960, 2, 8_388_608, (0, 44)),
+            ("sorted", 8_551_168, 2, 8_388_608, (0, 607_748)),
+        ];
 
         fn leak(channel: Channel) -> &'static Channel {
             Box::leak(Box::new(channel))
@@ -453,11 +610,24 @@ mod tests {
     }
 
     /// What a stage's scratch is for the programs inferlets ship, at a
-    /// vocabulary of 151,936: each value its own bytes, and as laid here.
+    /// vocabulary of 151,936 and Qwen3-0.6B's chunk on the GPU
+    /// ([`shipped::QWEN_CHUNK`]): each value its own bytes; as laid in
+    /// pieces of a chunk, the pieces and the bytes an instance holds; and
+    /// what a lane's pass stages in and lands.
     #[test]
     fn a_shipped_programs_stage_scratch() {
         let vocab = shipped::QWEN_VOCAB;
-        let totals: Vec<(&str, u64, u64)> = shipped::all(vocab)
+        let chunk = shipped::QWEN_CHUNK;
+        // Every lane bound passed: the rows state what each moves.
+        let bounds = Bounds {
+            chunk,
+            io: crate::program::GuestIo {
+                lane_bytes: u64::MAX >> 8,
+                lanes: 1,
+                depth: 1,
+            },
+        };
+        let totals: Vec<(&str, u64, u32, u64, (u64, u64))> = shipped::all(vocab)
             .iter()
             .map(|(name, traced)| {
                 let package = shipped::package(traced, vocab);
@@ -467,23 +637,79 @@ mod tests {
                 step_source(0, plan).unwrap_or_else(|why| panic!("{name}: {why}"));
                 scratch_holds_the_hosts_values(&package)
                     .unwrap_or_else(|why| panic!("{name}: {why}"));
-                let tables =
-                    session::stage_tables(plan, &Extents::default()).expect("static shapes");
+                let tables = within(&package, 0, &Extents::default(), bounds)
+                    .unwrap_or_else(|why| panic!("{name}: {why}"));
                 let own = eta_exec::layout(&tables.descriptors).expect("fits").total;
-                (*name, own, tables.scratch)
+                for (value, placed) in tables.places.iter().enumerate() {
+                    let end = placed.offset + tables.descriptors[value].device_bytes();
+                    assert!(end <= chunk, "{name}: value {value} crosses its piece");
+                }
+                (
+                    *name,
+                    own,
+                    tables.scratch.pieces(),
+                    tables.scratch.held_bytes(chunk),
+                    pass_io(&package, 0, &tables),
+                )
             })
             .collect();
-        assert_eq!(
-            totals,
-            [
-                ("top-p", 9_312_512, 5_056_768),
-                ("top-k + top-p", 9_616_896, 5_209_088),
-                ("gumbel-max", 5_512_960, 4_296_448),
-                ("greedy", 3_688_704, 3_688_448),
-                ("top logprobs", 6_728_960, 4_904_448),
-                ("sorted", 8_551_168, 4_904_192),
-            ]
+        eprintln!("{totals:#?}");
+        assert_eq!(totals, shipped::EXPECTED);
+    }
+
+    /// A program whose value is past a chunk, or whose lane moves more than
+    /// a lane's staging holds, is refused at registration by name.
+    #[test]
+    fn a_program_past_the_loads_bounds_is_refused_by_name() {
+        let vocab = shipped::QWEN_VOCAB;
+        let package = shipped::package(&shipped::sorted(vocab), vocab);
+        let io = crate::program::GuestIo {
+            lane_bytes: u64::from(vocab) * 4,
+            lanes: 1,
+            depth: 1,
+        };
+        let small = Bounds {
+            chunk: 1 << 20,
+            io,
+        };
+        let refused = within(&package, 0, &Extents::default(), small).err();
+        assert!(
+            matches!(&refused, Some(Refused::Chunk { stage: 0, why }) if why.contains("past a 1048576-byte chunk")),
+            "{refused:?}"
         );
+        // A model declaring the logits row alone bounds a lane at that row
+        // (`Shell::guest_io`): the whole row's ids and the token beside
+        // them are four bytes past it, refused by name.
+        let bounds = Bounds {
+            chunk: shipped::QWEN_CHUNK,
+            io,
+        };
+        let refused = within(&package, 0, &Extents::default(), bounds).err();
+        assert!(
+            matches!(
+                refused,
+                Some(Refused::LaneIo { stage: 0, way: "lands", bytes, bound })
+                    if bytes == bound + 4
+            ),
+            "{refused:?}"
+        );
+        assert!(
+            refused
+                .expect("refused")
+                .to_string()
+                .contains("lands 607748 bytes, past the 607744"),
+        );
+        // One that declares a sampled token beside it holds them.
+        let with_token = Bounds {
+            io: crate::program::GuestIo {
+                lane_bytes: (u64::from(vocab) + 1) * 4,
+                ..io
+            },
+            ..bounds
+        };
+        assert!(within(&package, 0, &Extents::default(), with_token).is_ok());
+        let top_p = shipped::package(&shipped::top_p(vocab), vocab);
+        assert!(within(&top_p, 0, &Extents::default(), bounds).is_ok());
     }
 
     /// A value the host stages or reads back that the stage's plan does not

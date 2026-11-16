@@ -5,13 +5,14 @@
 use engine::Engine;
 use engine::channel::{ChannelId, ChannelRegistration};
 use engine::chunk::{ChunkFacts, ShapeId, SlotRole};
-use engine::program::{Footprint, InstanceBinding, RingSlots};
+use engine::program::{Footprint, InstanceBinding, RingSlots, ScratchPlace};
 
 /// Slots of one role's shape, handed out from one chunk upward.
 #[derive(Debug, Clone, Copy)]
 pub struct Shape {
     pub id: ShapeId,
     pub per_chunk: u32,
+    pub slot_bytes: u64,
     next: u32,
 }
 
@@ -21,6 +22,7 @@ impl Shape {
         Some(Shape {
             id: shape.id,
             per_chunk: shape.slots_per_chunk,
+            slot_bytes: shape.slot_bytes,
             next: chunk * shape.slots_per_chunk,
         })
     }
@@ -38,11 +40,15 @@ impl Shape {
     }
 }
 
-/// The two guest shapes the engine states, each in a chunk of its own.
-#[derive(Debug, Clone, Copy)]
+/// The two guest shapes the engine states, each in a chunk of its own, and
+/// whole chunks a scratch past a chunk's `Instance` slots takes, handed out
+/// from the last down.
+#[derive(Debug, Clone)]
 pub struct Slots {
     pub instance: Option<Shape>,
     pub channel: Option<Shape>,
+    pub chunks: Vec<u32>,
+    pub chunk_bytes: u64,
 }
 
 impl Slots {
@@ -51,7 +57,39 @@ impl Slots {
         Slots {
             instance: Shape::of(facts, SlotRole::Instance, instance),
             channel: Shape::of(facts, SlotRole::Channel, channel),
+            chunks: Vec::new(),
+            chunk_bytes: facts.chunk_bytes,
         }
+    }
+
+    /// Where `bytes` of guest scratch lie, as the runtime's role store lays
+    /// them: one run of `Instance` slots where they fit a chunk's, else
+    /// whole chunks of [`Slots::chunks`].
+    pub fn scratch(&mut self, bytes: u64) -> ScratchPlace {
+        let chunk_bytes = self.chunk_bytes;
+        if bytes == 0 {
+            return ScratchPlace::None;
+        }
+        let shape = self.instance.as_mut().expect("scratch takes the Instance shape");
+        if bytes <= u64::from(shape.per_chunk) * shape.slot_bytes {
+            let footprint = Footprint {
+                bytes,
+                slots: u32::try_from(bytes.div_ceil(shape.slot_bytes)).expect("a chunk's slots"),
+                contiguous: true,
+            };
+            let refs = shape.take(&footprint);
+            return ScratchPlace::Run {
+                first: refs[0],
+                slots: footprint.slots,
+            };
+        }
+        let need = usize::try_from(bytes.div_ceil(chunk_bytes)).expect("chunks");
+        assert!(
+            self.chunks.len() >= need,
+            "a test's scratch of {bytes} bytes takes {need} chunks, and {} are handed",
+            self.chunks.len()
+        );
+        ScratchPlace::Chunks(self.chunks.split_off(self.chunks.len() - need))
     }
 
     /// Registers `registration` over the channel slots its ring facts state.
@@ -103,9 +141,14 @@ impl Slots {
                     .take(&ring.footprint),
             })
             .collect();
+        let state = engine
+            .guest_state(binding.program, &binding.extents)
+            .expect("the program's guest state");
+        let scratch = self.scratch(state.per_instance);
         InstanceBinding {
             instance_slots,
             ring_slots,
+            scratch,
             ..binding
         }
     }

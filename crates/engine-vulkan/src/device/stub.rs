@@ -191,6 +191,10 @@ impl Frame {
         match self.never {}
     }
 
+    pub fn fill_word(&mut self, _into: &Buffer, _at: u64, _len: u64, _word: u32) -> Result<()> {
+        match self.never {}
+    }
+
     pub fn into_kept(self) -> Result<Kept> {
         match self.never {}
     }

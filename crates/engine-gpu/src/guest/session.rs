@@ -4,16 +4,28 @@
 use eta_compiler::codegen::launch::LaunchStagePlan;
 use eta_compiler::codegen::{wgsl, wgsl_analysis};
 use eta_exec::{
-    Extents, Launch, Launches, OpParams, SELECT_RESERVE, ValueDesc, describe, lay_out,
-    whole_value_temporaries,
+    ChunkLayout, Extents, Launch, Launches, OpParams, Placed, SELECT_RESERVE, ValueDesc,
+    describe, lay_out_chunked, whole_value_temporaries,
 };
 use eta_ir::op::tags;
 
 pub const DESC_WORDS: usize = 9;
 
-pub const BINDINGS: u32 = 6;
+pub const BINDINGS: u32 = 9;
 
 pub const CFG_BINDING: u32 = 5;
+
+/// Where the pool's segments bind, one each: the instance's scratch lies in
+/// pool chunks, and a chunk in one segment.
+pub const SEGMENT_BINDINGS: [u32; kernels_slang::SEGMENTS] = [4, 6, 7, 8];
+
+/// The top bits of a guest address name its segment
+/// (`ptir_runtime.wgsl`'s `SEG_SHIFT`): a segment's words are fewer.
+pub const SEGMENT_SHIFT: u32 = 30;
+
+/// Where a pass's spans start in the host staging ring: the scratch's own
+/// alignment, which a copy's offsets meet on every API.
+pub const RING_ALIGN: u64 = eta_exec::SCRATCH_ALIGN;
 
 pub const WORKGROUP: u32 = eta_compiler::codegen::wgsl::WORKGROUP;
 
@@ -23,9 +35,9 @@ pub const GROUPS_PER_CORE: u32 = 4;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Cfg {
     pub value_count: u32,
-    pub temporary: u32,
     pub op_count: u32,
     pub lane: u32,
+    pub pad: u32,
 }
 
 const _: () = assert!(size_of::<Cfg>() == 16);
@@ -50,7 +62,7 @@ pub fn words_le(words: &[u32]) -> Vec<u8> {
 impl Cfg {
     #[must_use]
     pub fn to_le_bytes(self) -> Vec<u8> {
-        words_le(&[self.value_count, self.temporary, self.op_count, self.lane])
+        words_le(&[self.value_count, self.op_count, self.lane, self.pad])
     }
 }
 
@@ -124,7 +136,7 @@ impl Stepping {
     }
 }
 
-pub fn alias_reshapes(plan: &LaunchStagePlan, values: &mut [u64]) {
+pub fn alias_reshapes(plan: &LaunchStagePlan, values: &mut [Placed]) {
     for (result, source) in wgsl_analysis::analyze_stage(plan).aliases {
         let Some(&at) = values.get(source as usize) else {
             continue;
@@ -143,9 +155,25 @@ pub fn groups_for(descriptors: &[ValueDesc], cores: u32) -> u32 {
 }
 
 /// A stage's bind-time launch tables, in the order they lie in the
-/// instance's `Instance` slots: descriptors, op params, value offsets and
+/// instance's `Instance` slots: descriptors, op params, value places and
 /// the config, bound at these bindings.
 pub const TABLE_BINDINGS: [u32; 4] = [1, 2, 3, CFG_BINDING];
+
+/// The words of a stage's place table (binding 3) for `values` values:
+/// each value's word in its piece, each value's piece, the temporary
+/// area's piece and word, then the base of each piece, at most one a value
+/// and one for the temporary area ([`bases_at`]).
+#[must_use]
+pub fn place_words(values: usize) -> usize {
+    3 * values + 3
+}
+
+/// The byte of a stage's place table its piece bases start at: what a bind
+/// and a rebind write.
+#[must_use]
+pub fn bases_at(values: usize) -> u64 {
+    (2 * values as u64 + 2) * 4
+}
 
 /// The bytes of a stage's tables ([`TABLE_BINDINGS`] order): what its
 /// value and op counts fix, whatever the extents a bind resolves.
@@ -154,30 +182,40 @@ pub fn table_sizes(plan: &LaunchStagePlan) -> [u64; 4] {
     [
         (plan.value_types.len() * DESC_WORDS * 4).max(DESC_WORDS * 4) as u64,
         (plan.ops.len().max(1) * size_of::<OpParams>()) as u64,
-        (plan.value_types.len().max(1) * 4) as u64,
+        (place_words(plan.value_types.len()) * 4) as u64,
         size_of::<Cfg>() as u64,
     ]
 }
 
-/// Every stage's tables, stage by stage, as an instance of `plans` lays
-/// them in its slots.
+/// Every stage's tables, stage by stage, then the instance's fault word,
+/// as an instance of `plans` lays them in its slots.
 #[must_use]
 pub fn program_table_sizes(plans: &[LaunchStagePlan]) -> Vec<u64> {
-    plans.iter().flat_map(table_sizes).collect()
+    plans
+        .iter()
+        .flat_map(table_sizes)
+        .chain([eta_exec::STATUS_BYTES as u64])
+        .collect()
 }
 
-/// What a stage resolves at a bind: its values' descriptors and scratch
-/// offsets, the scratch's bytes, and its tables' bytes ([`table_sizes`]
-/// each, [`TABLE_BINDINGS`] order).
+/// What a stage resolves at a bind: its values' descriptors and places,
+/// its scratch in pieces of a chunk, and its tables' bytes ([`table_sizes`]
+/// each, [`TABLE_BINDINGS`] order; the place table's bases left for the
+/// bind to write, [`bases_at`]).
 pub struct StageTables {
     pub descriptors: Vec<ValueDesc>,
-    pub offsets: Vec<u64>,
-    pub scratch: u64,
+    pub places: Vec<Placed>,
+    pub scratch: ChunkLayout,
     pub tables: [Vec<u8>; 4],
 }
 
-/// Resolves `plan` against `extents`.
-pub fn stage_tables(plan: &LaunchStagePlan, extents: &Extents) -> Result<StageTables, String> {
+/// Resolves `plan` against `extents`, its scratch in chunks of `chunk`
+/// bytes: refused by name where a value is past a chunk.
+pub fn stage_tables(
+    plan: &LaunchStagePlan,
+    extents: &Extents,
+    chunk: u64,
+) -> Result<StageTables, String> {
     let descriptors = plan
         .value_types
         .iter()
@@ -187,13 +225,15 @@ pub fn stage_tables(plan: &LaunchStagePlan, extents: &Extents) -> Result<StageTa
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut scratch = lay_out(
+    let scratch = lay_out_chunked(
         plan,
         &descriptors,
         &Stepping::of(plan).launches(&descriptors),
+        chunk,
     )
-    .map_err(|why| format!("a guest pass's scratch does not fit: {why:?}"))?;
-    alias_reshapes(plan, &mut scratch.values);
+    .map_err(|why| format!("a guest pass's scratch does not lie in chunks: {why}"))?;
+    let mut places = scratch.values.clone();
+    alias_reshapes(plan, &mut places);
 
     let sizes = table_sizes(plan);
     let sized = |mut bytes: Vec<u8>, at: usize| {
@@ -210,26 +250,134 @@ pub fn stage_tables(plan: &LaunchStagePlan, extents: &Extents) -> Result<StageTa
         params.extend_from_slice(&OpParams::of(op, result_base, plan.output_slots).to_le_bytes());
         result_base += u32::from(op.result_count);
     }
-    let offsets: Vec<u32> = scratch
-        .values
+    let word = |at: u64| u32::try_from(at / 4).unwrap_or(u32::MAX);
+    let place_table: Vec<u32> = places
         .iter()
-        .map(|&at| u32::try_from(at).unwrap_or(u32::MAX))
+        .map(|placed| word(placed.offset))
+        .chain(places.iter().map(|placed| placed.piece))
+        .chain([scratch.temporary.piece, word(scratch.temporary.offset)])
         .collect();
     let config = Cfg {
         value_count: u32::try_from(plan.value_types.len()).unwrap_or(u32::MAX),
-        temporary: u32::try_from(scratch.temporary / 4).unwrap_or(u32::MAX),
         op_count: u32::try_from(plan.ops.len()).unwrap_or(u32::MAX),
         lane: 0,
+        pad: 0,
     };
     Ok(StageTables {
         descriptors,
         tables: [
             sized(descs, 0),
             sized(params, 1),
-            sized(words_le(&offsets), 2),
+            sized(words_le(&place_table), 2),
             sized(config.to_le_bytes(), 3),
         ],
-        offsets: scratch.values,
-        scratch: scratch.total.max(256),
+        places,
+        scratch,
     })
+}
+
+/// A binding's extents as a stage's shapes resolve against them.
+#[must_use]
+pub fn extents_of(extents: &engine::BindExtents) -> Extents {
+    Extents {
+        row_count: extents.row_count,
+        token_count: extents.token_count,
+        sampled_rows: extents.sampled_rows,
+        query_len: extents.query_len,
+        key_len: extents.key_len,
+    }
+}
+
+/// What an instance of `plans` holds for its scratch in chunks of `chunk`
+/// bytes (`engine::GuestState::per_instance`): its stages run one after
+/// another, each over the same pieces, so the most any stage holds
+/// ([`ChunkLayout::held_bytes`]).
+pub fn instance_scratch(
+    plans: &[LaunchStagePlan],
+    extents: &Extents,
+    chunk: u64,
+) -> Result<u64, String> {
+    plans.iter().try_fold(0u64, |most, plan| {
+        Ok(most.max(stage_tables(plan, extents, chunk)?.scratch.held_bytes(chunk)))
+    })
+}
+
+/// A piece of an instance's scratch as the guest runtime addresses it: its
+/// segment and its first word there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PiecePlace {
+    pub segment: u32,
+    /// Its first byte in the segment.
+    pub at: u64,
+}
+
+impl PiecePlace {
+    /// The guest address of its first word: the segment in the top bits.
+    #[must_use]
+    pub fn address(self) -> u32 {
+        (self.segment << SEGMENT_SHIFT) | u32::try_from(self.at / 4).unwrap_or(u32::MAX)
+    }
+}
+
+/// Where the `pieces` pieces of an instance's scratch lie in the pool, laid
+/// at `place` ([`engine::ScratchPlace`]): a run's one piece from its first
+/// slot, else each whole chunk's first byte, piece by piece. Refused by
+/// name where the place holds fewer pieces than the scratch takes, or a
+/// segment's words reach past the address bits.
+pub fn piece_places<B: crate::backend::Backend>(
+    pools: &crate::store::Pools<B>,
+    place: &engine::ScratchPlace,
+    pieces: u32,
+    held: u64,
+) -> crate::error::Result<Vec<PiecePlace>> {
+    use crate::store::layout::INSTANCE;
+    let refused = |why: String| crate::error::Fault::Program {
+        at: "guest::session",
+        why,
+    };
+    let firsts: Vec<u32> = match place {
+        engine::ScratchPlace::None if pieces == 0 => Vec::new(),
+        engine::ScratchPlace::None => {
+            return Err(refused(format!(
+                "a guest's scratch takes {pieces} piece(s) and its binding holds none"
+            )));
+        }
+        engine::ScratchPlace::Run { first, slots } => {
+            let room = u64::from(*slots) * pools.slot_bytes(INSTANCE)?;
+            if pieces != 1 || room < held {
+                return Err(refused(format!(
+                    "a guest's scratch of {pieces} piece(s), {held} bytes, given a run of                      {slots} instance slot(s), {room} bytes"
+                )));
+            }
+            vec![*first]
+        }
+        engine::ScratchPlace::Chunks(chunks) => {
+            if (chunks.len() as u64) < u64::from(pieces) {
+                return Err(refused(format!(
+                    "a guest's scratch of {pieces} piece(s) given {} chunk(s)",
+                    chunks.len()
+                )));
+            }
+            let per_chunk = pools.slots_per_chunk(INSTANCE)?;
+            chunks[..pieces as usize]
+                .iter()
+                .map(|&chunk| chunk.checked_mul(per_chunk).ok_or_else(|| refused(format!(
+                    "chunk {chunk} names no instance slot"
+                ))))
+                .collect::<crate::error::Result<_>>()?
+        }
+    };
+    firsts
+        .into_iter()
+        .map(|slot| {
+            let (segment, _, at) = pools.slot_segment(INSTANCE, slot)?;
+            if at % 4 != 0 || (at + pools.chunk_bytes()) / 4 > 1 << SEGMENT_SHIFT {
+                return Err(refused(format!(
+                    "a guest piece at byte {at} of segment {segment}, which a guest address \
+                     of {SEGMENT_SHIFT} word bits does not reach"
+                )));
+            }
+            Ok(PiecePlace { segment, at })
+        })
+        .collect()
 }
