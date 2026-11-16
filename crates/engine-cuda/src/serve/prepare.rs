@@ -1797,41 +1797,58 @@ impl Shell {
         let readout_ceiling = (last_rows.min(max_lanes) + every_row).min(composition.bucket());
         let readouts_fit = readout_rows.len() <= readout_ceiling as usize;
         let lanes_fit = composition.lane_count() <= crate::window::lane_capacity(max_lanes);
+        // A body carves for its window table's lanes, which may be a wider
+        // rung than the fire's own. A fire capturing scores lays its rung's
+        // planes, which the runtime sets aside for the rung it cut the fire
+        // to and no wider: it runs at its own rung's carve, walked.
+        let scored = composition
+            .lanes()
+            .iter()
+            .any(|row| self.arena.captures(row.class as usize));
+        let scores_fit = !scored
+            || self.arena.carve_rung(
+                u64::from(launched),
+                u64::from(crate::window::lane_capacity(max_lanes)),
+            ) == self
+                .arena
+                .carve_rung(u64::from(launched), u64::from(composition.lane_count()));
         // Why a fire of a load that records bodies walks its plan, for the
         // warning it raises (`Bodies::eager_unbodied`).
-        let unbodied =
-            (records_bodies && !arming && !(bodied && readouts_fit && lanes_fit)).then(|| {
-                let why = if tapped {
-                    "it is tapped"
-                } else if !snapshots_fit {
-                    "it takes more snapshots than a body holds"
-                } else if !Self::keyable_units(&self.compiled) {
-                    "the plan's units key no body"
-                } else if !world {
-                    "its expert group is not whole"
-                } else if self.cache.body_refused(&key) {
-                    "its body was refused when it was captured"
-                } else if !bodied {
-                    "its admitted set cannot be cut to a body"
-                } else if !readouts_fit {
-                    "it reads out more rows than its bucket's body carries"
-                } else {
-                    "it has more lanes than a body's window table holds"
-                };
-                if bodied && !readouts_fit {
-                    format!(
-                        "{key}: {why} ({} rows read out over {} lanes; the body carries {}: \
+        let fits = readouts_fit && lanes_fit && scores_fit;
+        let unbodied = (records_bodies && !arming && !(bodied && fits)).then(|| {
+            let why = if tapped {
+                "it is tapped"
+            } else if !scores_fit {
+                "it captures scores and its body carves a rung wider than its own"
+            } else if !snapshots_fit {
+                "it takes more snapshots than a body holds"
+            } else if !Self::keyable_units(&self.compiled) {
+                "the plan's units key no body"
+            } else if !world {
+                "its expert group is not whole"
+            } else if self.cache.body_refused(&key) {
+                "its body was refused when it was captured"
+            } else if !bodied {
+                "its admitted set cannot be cut to a body"
+            } else if !readouts_fit {
+                "it reads out more rows than its bucket's body carries"
+            } else {
+                "it has more lanes than a body's window table holds"
+            };
+            if bodied && !readouts_fit {
+                format!(
+                    "{key}: {why} ({} rows read out over {} lanes; the body carries {}: \
                          {last_rows} last rows under {max_lanes} lanes, {every_row} every row, \
                          lane ceiling {lane_ceiling})",
-                        readout_rows.len(),
-                        composition.lane_count(),
-                        readout_ceiling,
-                    )
-                } else {
-                    format!("{key}: {why}")
-                }
-            });
-        let bodied = bodied && readouts_fit && lanes_fit;
+                    readout_rows.len(),
+                    composition.lane_count(),
+                    readout_ceiling,
+                )
+            } else {
+                format!("{key}: {why}")
+            }
+        });
+        let bodied = bodied && fits;
         let readout_live = readout_rows.len() as u32;
         if bodied {
             readout_rows.resize(readout_ceiling as usize, 0);

@@ -126,6 +126,16 @@ impl Arena {
         self
     }
 
+    /// The rung whose carve a fire of `tokens` tokens carving for `lanes`
+    /// lanes lays ([`Arena::fire_slots`]); `None`: the whole arena's.
+    #[must_use]
+    pub fn carve_rung(&self, tokens: u64, lanes: u64) -> Option<u32> {
+        self.rungs
+            .iter()
+            .map(|&(rung, _)| rung)
+            .find(|&rung| u64::from(rung) >= tokens && u64::from(rung) >= lanes)
+    }
+
     /// Whether a lane of `class` captures scores.
     #[must_use]
     pub fn captures(&self, class: usize) -> bool {
@@ -283,9 +293,13 @@ impl Arena {
     /// this load states rungs, the smallest rung's carve that holds `rows`
     /// (a fire that forks keeps its own) at the reservation's end. The
     /// carve's score planes lie under the rest of it, inside the span where
-    /// it has room for them; else they get no slot, and a `scored` fire is
-    /// refused. The place each carve takes is fixed, so a body recorded at
-    /// any rung stays good at every rung its fire fits.
+    /// it has room for them; else they get no slot. A `scored` fire runs
+    /// at its own rung's carve (`Shell::prepare` walks one whose body
+    /// carves wider), so its planes are no more than the term the runtime
+    /// set aside at the rung it cut the fire to; one past the span is a
+    /// wrong count, refused by name, never backed. The place each carve
+    /// takes is fixed, so a body recorded at any rung stays good at every
+    /// rung its fire fits.
     pub fn fire_slots_at(
         &self,
         base: u64,

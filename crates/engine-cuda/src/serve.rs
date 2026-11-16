@@ -812,9 +812,9 @@ impl Shell {
             &|role, refs, bytes| pools.guest_span(role, refs, bytes),
             stream,
         )?;
-        // What its fires lay under the state's end is backed before any
-        // flies: a bind the card has no room for is refused here.
-        if let Err(refused) = self.back_programs() {
+        // Its fires lay their programs in the span, backed at load: a bind
+        // whose term no rung's room under its carve holds is refused here.
+        if let Err(refused) = self.fit_programs() {
             self.programs.close_instance(id)?;
             return Err(refused);
         }
@@ -827,26 +827,26 @@ impl Shell {
         rung.min(self.fire_lanes())
     }
 
-    /// Backs, for every rung, what the programs bound now lay under the
-    /// state's end at it: what the activation's span has no room for under
-    /// that rung's carve.
-    fn back_programs(&mut self) -> Result<()> {
+    /// Whether some rung's room under its carve, in the span, holds what
+    /// the programs bound now lay at it (`Pools::program_span`); nothing
+    /// is backed for them. The runtime cuts a guest fire to the widest
+    /// such rung and refuses a bind that fits at none.
+    fn fit_programs(&self) -> Result<()> {
         let scored = self.programs.scores_bound();
-        let under_state = self
-            .arena
-            .every_rung(
-                self.compiled.arena_forked.as_ref(),
-                self.budget.max_tokens,
-                scored,
-            )
-            .into_iter()
-            .map(|(rung, under)| {
-                let term = self.programs.fire_term(self.program_lanes(rung));
-                self.pools.program_bytes_under_state(under, term, scored)
-            })
-            .max()
-            .unwrap_or(0);
-        self.pools.hold_under_state(under_state)
+        let rungs = self.arena.every_rung(
+            self.compiled.arena_forked.as_ref(),
+            self.budget.max_tokens,
+            scored,
+        );
+        let mut refused = None;
+        for (rung, under) in rungs {
+            let term = self.programs.fire_term(self.program_lanes(rung));
+            match self.pools.program_span(under, term, scored) {
+                Ok(_) => return Ok(()),
+                Err(fault) => refused = Some(fault),
+            }
+        }
+        refused.map_or(Ok(()), Err)
     }
 
     /// Points the guests' programs at where a fire of `tokens` tokens and
