@@ -3209,6 +3209,36 @@ fn restate_boundary(lane: &mut ::engine::Lane, folded: u64) {
     lane.kv.folded = lane.kv.folded.max(folded);
 }
 
+/// An engine that reads a lane's mask from slot 0, not from its set's
+/// committed boundary ([`::engine::Capabilities::buffer_masks`]), is handed
+/// the mask over the whole context: the committed slots admitted, then the
+/// guest's columns. The same bits: the committed part is always read. Goes
+/// with the last such engine.
+fn masks_for_engine(req: &mut crate::engine::FireRequest) {
+    if crate::model::model().eta_caps().buffer_masks {
+        return;
+    }
+    whole_context_masks(req);
+}
+
+fn whole_context_masks(req: &mut crate::engine::FireRequest) {
+    for lane in req.lanes.iter_mut().filter(|lane| !lane.kv_less) {
+        let committed = u64::from(lane.kv.folded);
+        if committed == 0 {
+            continue;
+        }
+        match &mut lane.mask {
+            Some(::engine::Masking::Extent(mask)) => *mask = mask.behind(committed),
+            Some(::engine::Masking::Rows(masks)) => {
+                for mask in masks.iter_mut() {
+                    *mask = mask.behind(committed);
+                }
+            }
+            None => {}
+        }
+    }
+}
+
 /// The last step of a piece's prepare on a working set it writes from
 /// `start`: its log begins there, and what it folds by a count the host
 /// knows is frozen through `freeze`. A piece that starts inside what the
@@ -4273,6 +4303,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 None,
                 "a lane whose fold the device counts asks for its report"
             );
+            masks_for_engine(&mut req);
             rs::apply_shared(&mut req, stores.shared.as_ref(), Some(&rs_prepared));
             checkpoints_here.extend(
                 rs_prepared
@@ -5572,6 +5603,7 @@ async fn fire_device_geometry<C: FireContext>(
         None,
         "a lane whose fold the device counts asks for its report"
     );
+    masks_for_engine(&mut req);
     rs::apply_shared(&mut req, stores.shared.as_ref(), Some(&rs_prepared));
     let submit_error = crate::scheduler::submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
         &scheduler,
@@ -9525,6 +9557,30 @@ mod unfolded_tests {
 #[cfg(test)]
 mod mask_cut_tests {
     use super::*;
+
+    /// An engine that reads masks from slot 0 is handed the same bits over
+    /// the whole context: the committed slots admitted, then the guest's.
+    #[test]
+    fn a_mask_for_an_engine_reading_from_slot_0_admits_the_committed_slots() {
+        let mask = ::engine::Mask::new(vec![1, 2], 3);
+        let mut req = crate::engine::FireRequest::one(::engine::Lane {
+            tokens: vec![0],
+            kv: ::engine::KvDelta {
+                held: 6,
+                folded: 4,
+                ..Default::default()
+            },
+            mask: Some(::engine::Masking::Extent(mask.clone())),
+            ..::engine::Lane::default()
+        });
+        whole_context_masks(&mut req);
+        let Some(::engine::Masking::Extent(whole)) = &req.lanes[0].mask else {
+            panic!("the lane keeps its mask");
+        };
+        assert_eq!(whole.total, 7);
+        assert_eq!(whole.admitted(0..7).collect::<Vec<_>>(), vec![0..4, 5..7]);
+        assert_eq!(whole.after(4), mask);
+    }
 
     /// A mask plane fits the room of the rung its piece runs at, `max(t *
     /// t, max_context)` bits, by cutting rows and never by refusing: a

@@ -653,6 +653,7 @@ impl Engine for Metal {
             },
             has_lora: true,
             has_attn_page_mask: false,
+            buffer_masks: true,
             draft_block: shell.trace().drafter.map_or(0, |d| d.rows),
             draft_mask_token: shell.trace().drafter.map_or(0, |d| d.mask_token),
             draft_proposals_from: shell.trace().drafter.map_or(1, |d| d.proposals_from),
