@@ -58,10 +58,6 @@ pub struct DeviceBoot {
     /// Trace and compile the first fire shapes at load (`serve/warm.rs`).
     pub prewarm: bool,
 
-    /// Windowed kv rows live in their own pool; `false` keeps them in full
-    /// pages, for a test that compares the two.
-    pub window_pool: bool,
-
     /// Device bytes the load leaves past its weights and pool for XLA's
     /// scratch; `None` takes the chip's (`chip::Tpu::headroom`).
     pub headroom: Option<u64>,
@@ -92,7 +88,6 @@ impl Default for DeviceBoot {
             ordinal: 0,
             profiles: None,
             prewarm: false,
-            window_pool: true,
             headroom: None,
             seat_tokens: None,
             stream_weights: false,
