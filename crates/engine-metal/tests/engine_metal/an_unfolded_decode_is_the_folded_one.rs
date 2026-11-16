@@ -35,7 +35,7 @@ fn an_unfolded_decode_is_the_folded_one() {
     let per_page = shell.pool_layout().rs_tokens.max(1);
     eprintln!("buffer page: {per_page} rows");
     let fold = RsVerb::Fold;
-    let mut fire = |shell: &mut engine_metal::Shell, slot: u32, held: u32, toks: &[u32], rs: &RsVerb, reset: RsReset| {
+    let fire = |shell: &mut engine_metal::Shell, slot: u32, held: u32, toks: &[u32], rs: &RsVerb, reset: RsReset| {
         shell
             .fire_seated(&[Seated {
                 held: Some(held),
@@ -65,6 +65,8 @@ fn an_unfolded_decode_is_the_folded_one() {
             base: PROMPT,
             folded: PROMPT,
             fold: FoldLen::Host(0),
+            // Alone on its set: every buffered slot.
+            lineage: engine::fire::Lineage::Set,
         };
         let replayed = fire(&mut shell, 1, held, &[token], &unfolded, RsReset::Held);
         let d = spread(&folded, &replayed);
