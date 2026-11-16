@@ -575,6 +575,9 @@ fn spawn_inner(
     executors: Vec<String>,
     watch_departure: bool,
 ) -> Result<(ProcessId, Option<crate::planner::DepartureWatch>)> {
+    // Admitted: a device asleep wakes while the request is tokenized and
+    // its program launched, not under its first fire.
+    crate::scheduler::expect_work();
     let id = Uuid::new_v4();
     // Before anything is held under the id, so no departure is missed.
     let watch = watch_departure.then(|| crate::planner::DepartureWatch::new(id));

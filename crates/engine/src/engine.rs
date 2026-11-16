@@ -288,6 +288,12 @@ pub trait Engine: Send {
         Ok(())
     }
 
+    /// Work is coming: the runtime admitted a request, ahead of its
+    /// tokenization and its program's launch. An engine whose device sleeps
+    /// when idle wakes it here, so the wake overlaps that host work instead
+    /// of the request's first fire. A notice: nothing waits on it.
+    fn expect_work(&mut self) {}
+
     /// Copies each moved chunk's bytes onto its new physical chunk and
     /// updates the engine's [`crate::chunk::ChunkTable`], stream-ordered
     /// before the next fire; the slot refs the runtime holds stand.
