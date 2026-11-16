@@ -1025,6 +1025,14 @@ impl GuestCarve {
         }
     }
 
+    /// Tests: the region's bytes as they stand.
+    #[cfg(test)]
+    pub fn bytes(&self) -> Vec<u8> {
+        let mut out = vec![0u8; self.buffer.bytes() as usize];
+        self.buffer.read(0, &mut out).expect("the guest region reads back");
+        out
+    }
+
     /// Tests: the same region, `gap` bytes left between takes, so no two
     /// members' scratch lie a stride apart.
     #[cfg(test)]
@@ -1498,7 +1506,7 @@ mod tests {
     #[test]
     fn every_form_answers_through_an_unfilled_scratch() {
         let context = Context::bind().expect("a Metal 4 device");
-        let wrong = alone_and_together(&context, 0);
+        let (wrong, _) = alone_and_together(&context, 0);
         assert!(
             wrong.is_empty(),
             "a lane answered another index than its peak (poisoned scratch: {}): {wrong:#?}",
@@ -1518,16 +1526,24 @@ mod tests {
         let context = Context::bind().expect("a Metal 4 device");
         // Past any stride, and not a multiple of one.
         const GAP: u64 = (3 << 20) + 4096;
-        let wrong = alone_and_together(&context, GAP);
+        let (wrong, apart) = alone_and_together(&context, GAP);
         assert!(wrong.is_empty(), "lanes laid apart: {wrong:#?}");
+        // Each lane wrote its own scratch, apart from the others'.
+        for &(form, islands) in &apart {
+            assert_eq!(islands, LANES as usize, "{form:?}: lanes wrote {islands} places, not one each");
+        }
         launch::ALIAS_LANE_SCRATCH.with(|alias| alias.set(true));
-        let aliased = alone_and_together(&context, GAP);
+        let (aliased, onto) = alone_and_together(&context, GAP);
         launch::ALIAS_LANE_SCRATCH.with(|alias| alias.set(false));
-        for form in ["Streamed", "Grouped"] {
-            assert!(
-                aliased.iter().any(|line| line.starts_with(form) && line.contains("together")),
-                "the control (every lane on member 0's scratch) answered right in {form}: \
-                 the test does not see where a lane's scratch lies: {aliased:#?}"
+        // The control: the bases name member 0's scratch for every lane, and
+        // the forms that read them wrote there alone (the fused form seats
+        // each member's scratch itself and is unchanged).
+        for &(form, islands) in &onto {
+            let want = if form == compile::Form::Fused { LANES as usize } else { 1 };
+            assert_eq!(
+                islands, want,
+                "the control: {form:?}'s lanes wrote {islands} places, not {want}: the kernel \
+                 does not take a lane's scratch from its bases"
             );
         }
         assert!(
@@ -1539,13 +1555,14 @@ mod tests {
     /// Each form's lanes fired alone, then together, from a guest region
     /// laid `gap` bytes between takes: every lane whose answer is not its
     /// own peak, by form and how it fired.
-    fn alone_and_together(context: &Context, gap: u64) -> Vec<String> {
+    fn alone_and_together(context: &Context, gap: u64) -> (Vec<String>, Vec<(compile::Form, usize)>) {
         use crate::store::Pools;
         use eta_compiler::codegen::program::KernelKind;
         let context = context;
         let guests = |context: &Context| guests(context).spaced(gap);
         let (registration, count, seeds, token) = registration_of(true);
         let mut wrong = Vec::new();
+        let mut islands = Vec::new();
         for (form, dropped) in [
             (compile::Form::Streamed, &[][..]),
             (compile::Form::Grouped, &[KernelKind::Streamed][..]),
@@ -1637,14 +1654,16 @@ mod tests {
             };
             plane.lay_batches(&tables, area, &host).expect("the batches lay");
             let mut frame = context.frame().expect("a frame");
+            let carve = guests(&context);
             let launched = plane
-                .stage_batched(&mut frame, &lanes, &guests(&context), 0)
+                .stage_batched(&mut frame, &lanes, &carve, 0)
                 .expect("the lanes stage");
             assert!(
                 launched.iter().all(|(_, launched)| matches!(launched, Launched::Airborne)),
                 "{form:?}: every lane launches: {launched:?}"
             );
             frame.commit().expect("the frame lands");
+            islands.push((form, written_islands(&carve.bytes(), gap.max(1) / 2)));
             for (&id, &peak) in lanes.iter().zip(&peaks) {
                 plane.settle_launched(id).expect("the lane settles");
                 let got = take(&mut plane, id);
@@ -1653,7 +1672,20 @@ mod tests {
                 }
             }
         }
-        wrong
+        (wrong, islands)
+    }
+
+    /// The runs of written (non-zero) bytes in `bytes`, runs closer than
+    /// `apart` zero bytes counted as one: where a fire's lanes wrote.
+    fn written_islands(bytes: &[u8], apart: u64) -> usize {
+        let (mut islands, mut last) = (0usize, None::<usize>);
+        for (at, _) in bytes.iter().enumerate().filter(|(_, b)| **b != 0) {
+            if last.is_none_or(|end| (at - end) as u64 > apart) {
+                islands += 1;
+            }
+            last = Some(at);
+        }
+        islands
     }
 
     /// A program that launched its lanes together leaves no batch behind

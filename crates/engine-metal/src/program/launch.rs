@@ -1971,8 +1971,6 @@ fn scratch_bases_bytes(lanes: u32) -> u64 {
     u64::from(lanes) * u64::from(eta_compiler::codegen::metal::M3_SCRATCH_PIECES) * 8
 }
 
-/// `scratch` as the grouped kernels read a lane's bases: piece 0 at its
-/// GPU address (one piece until eta_exec's chunk-aware layout).
 #[cfg(test)]
 thread_local! {
     /// Tests' negative control: every lane of a batch handed member 0's
@@ -1982,6 +1980,8 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
+/// `scratch` as the grouped kernels read a lane's bases: piece 0 at its
+/// GPU address (one piece until eta_exec's chunk-aware layout).
 fn scratch_bases_of(scratch: &ScratchAt) -> Result<Vec<u8>> {
     Ok(address_of(&scratch.buffer, scratch.offset)?.to_le_bytes().to_vec())
 }
@@ -2233,7 +2233,6 @@ impl Batch {
         if count == 0 {
             return Ok(());
         }
-        let stride = u64::from(self.key.scratch_stride);
         self.pending_flags.zero_span(
             0,
             u64::from(count) * u64::from(self.shape.channel_slots_per_lane),
@@ -2248,7 +2247,12 @@ impl Batch {
             };
             let scratch = self.scratch(member)?.clone();
             #[cfg(target_vendor = "apple")]
-            poison_scratch(frame, scratch.buffer.slab(), scratch.offset, stride)?;
+            poison_scratch(
+                frame,
+                scratch.buffer.slab(),
+                scratch.offset,
+                u64::from(self.key.scratch_stride),
+            )?;
             bases.extend(scratch_bases_of(&scratch)?);
         }
         self.scratch_bases.write(0, &bases)?;
@@ -2864,7 +2868,7 @@ mod tests {
             "all_descriptors",
             "params",
             "offsets",
-            "all_scratch",
+            "scratch_bases",
             "layout",
             "channel_bindings",
             "pending_flags",
