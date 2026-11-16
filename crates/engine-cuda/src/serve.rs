@@ -796,16 +796,6 @@ impl Shell {
         ids: &[engine::ChannelId],
         slots: crate::program::Slots,
     ) -> Result<engine::InstanceId> {
-        let reads_scores = self.programs.program(program_id).is_some_and(|program| {
-            program
-                .plan
-                .outputs()
-                .iter()
-                .any(|(name, _)| *name == "attn.scores")
-        });
-        if reads_scores {
-            self.arena.ensure_whole(&mut self.pools)?;
-        }
         let stream = self.device.stream();
         let buffers_rs = self.buffers.is_some();
         let pools = &self.pools;
@@ -841,13 +831,18 @@ impl Shell {
     /// state's end at it: what the activation's span has no room for under
     /// that rung's carve.
     fn back_programs(&mut self) -> Result<()> {
+        let scored = self.programs.scores_bound();
         let under_state = self
             .arena
-            .every_rung(self.compiled.arena_forked.as_ref(), self.budget.max_tokens)
+            .every_rung(
+                self.compiled.arena_forked.as_ref(),
+                self.budget.max_tokens,
+                scored,
+            )
             .into_iter()
             .map(|(rung, under)| {
                 let term = self.programs.fire_term(self.program_lanes(rung));
-                self.pools.program_bytes_under_state(under, term)
+                self.pools.program_bytes_under_state(under, term, scored)
             })
             .max()
             .unwrap_or(0);
@@ -1347,6 +1342,7 @@ pub(crate) fn program_span(
     tokens: u64,
     lanes: u64,
 ) -> Result<(u64, u64)> {
-    let (rung, under) = arena.rung_of(forked, tokens, lanes, limits.0);
-    pools.program_span(under, programs.fire_term(rung.min(limits.1)))
+    let scored = programs.scores_bound();
+    let (rung, under) = arena.rung_of(forked, tokens, lanes, limits.0, scored);
+    pools.program_span(under, programs.fire_term(rung.min(limits.1)), scored)
 }

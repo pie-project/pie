@@ -299,6 +299,7 @@ impl Stages {
             fixed: one.saturating_sub(a_lane),
             max_lanes: by_lanes.keys().copied().max().unwrap_or(0),
             laid: engine::program::LaidLanes::PowerOfTwo,
+            a_row: 0,
         }
     }
 

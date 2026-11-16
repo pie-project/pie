@@ -40,13 +40,14 @@ pub fn eta_decl(decl: &poem_ir::OutputDecl) -> OutputDecl {
 /// Every output the loaded classes write, as one lane reads them.
 #[allow(dead_code)]
 pub fn loaded_decls(loaded: &engine::Capabilities) -> Vec<OutputDecl> {
+    loaded_decls_of(&loaded.classes)
+}
+
+/// Every output `classes` write, as one lane reads them.
+#[allow(dead_code)]
+pub fn loaded_decls_of(classes: &poem_ir::LaneClasses) -> Vec<OutputDecl> {
     let mut decls: Vec<OutputDecl> = Vec::new();
-    for decl in loaded
-        .classes
-        .classes
-        .iter()
-        .flat_map(|class| &class.outputs)
-    {
+    for decl in classes.classes.iter().flat_map(|class| &class.outputs) {
         if !decls.iter().any(|seen| seen.name == decl.name) {
             decls.push(eta_decl(decl));
         }
@@ -79,7 +80,7 @@ pub fn loaded(
     bind(container, vec![decls; lanes as usize], caps())
 }
 
-fn caps() -> EngineCaps {
+pub fn caps() -> EngineCaps {
     EngineCaps {
         lora: true,
         attn_page_mask: true,

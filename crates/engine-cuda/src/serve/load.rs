@@ -1022,13 +1022,16 @@ impl Shell {
             );
         }
         // The fires that run the side streams carve their own arena
-        // (`CompiledModel::arena_forked`): the larger of the two is what the
-        // pool keeps under its end for a fire's activation.
-        let forked_bytes = compiled
-            .arena_forked
-            .as_ref()
-            .map_or(0, |forked| forked.bytes);
-        let arena_bytes = compiled.arena.bytes.max(forked_bytes);
+        // (`CompiledModel::arena_forked`): the larger of the two, without
+        // its `attn.scores` planes, is what the pool keeps under its end for
+        // a fire's activation. No load reserves score planes: a fire that
+        // captures them lays them in its programs' term (`Arena`).
+        let arena_bytes = compiled.arena.scores_from(&boot.trace).max(
+            compiled
+                .arena_forked
+                .as_ref()
+                .map_or(0, |forked| forked.scores_from(&boot.trace)),
+        );
         // What allocates on the device beside the pools allocates before
         // they read the card: the guests' fan streams, and on ROCm what the
         // runtime and its libraries take at their first use. A flat range
@@ -1130,14 +1133,6 @@ impl Shell {
                 })
                 .collect(),
         );
-        // Committed whole: a fire reading out past one row a lane (a verify
-        // reads every row) would otherwise grow it outside the fit.
-        let unscored = compiled.arena.scores_from(&boot.trace).max(
-            compiled
-                .arena_forked
-                .as_ref()
-                .map_or(0, |forked| forked.scores_from(&boot.trace)),
-        );
         // The activation rungs a pool may drop to (SPEC decision 6), each a
         // bucket's carve laid at the reservation's end.
         let rungs = activation_rungs(&boot.trace, &budgets, &compiled)?;
@@ -1148,14 +1143,18 @@ impl Shell {
                 .map(|(tokens, map)| (*tokens, map.bytes))
                 .collect::<Vec<_>>(),
         );
-        // What each carve laid at the end reads before its scores.
-        let prefixes: Vec<(u64, u64)> = std::iter::once(&compiled.arena)
-            .chain(compiled.arena_forked.as_ref())
-            .chain(rungs.iter().map(|(_, map)| map))
-            .map(|map| (map.bytes, map.scores_from(&boot.trace)))
-            .collect();
-        let mut arena = Arena::reserve(arena_bytes).with_rungs(rungs, prefixes);
-        arena.ensure(&mut pools, unscored)?;
+        // Backed whole, before ready: every chunk the runtime may open state
+        // in under a rung's carve, and a fire reading out past one row a
+        // lane (a verify reads every row), lie in it.
+        let mut arena = Arena::reserve(arena_bytes, crate::arena::score_values(&boot.trace))
+            .with_rungs(rungs)
+            .with_scoring(crate::arena::scoring_classes(&boot.trace, &compiled));
+        arena.back(&mut pools)?;
+        eprintln!(
+            "engine-cuda: activation span of {} bytes backed whole at load ({} held)",
+            arena.reserved(),
+            pools.activation_held_bytes(),
+        );
         if arena.has_rungs() {
             pools.fit_range_whole();
         }
@@ -1418,6 +1417,10 @@ impl Shell {
         let flight = 1 << shell.device.device().num_sm.max(1).ilog2();
         shell.programs.set_flight(flight);
         shell.programs.set_fire_lanes(shell.fire_lanes());
+        // A program reading `attn.scores` states the planes it switches on
+        // as its term (`engine::FireFacts::a_row`): no load backs them.
+        let (a_row, slack) = crate::arena::score_term(&shell.trace);
+        shell.programs.set_scores(a_row, slack);
         // A fire that replays a recorded body carves for the body's lane
         // capacity, not its own lanes: the rungs stated to the runtime
         // follow that carve, so state is never lent under a carve a fire
@@ -1569,9 +1572,6 @@ impl Shell {
                 shell.pools.fresh()
             );
         }
-        // The carves laid at the activation's end, backed where the range
-        // now lies (the fit may have reserved it anew).
-        shell.arena.ensure_rungs(&mut shell.pools)?;
         shell.lay_workspace()?;
         let afforded = fitted.bodies;
         if shell.measuring {
@@ -1759,9 +1759,6 @@ impl Staged {
                 false,
                 &resident,
             )?;
-            // The fit may have reserved the range anew: the carves laid at
-            // the activation's end are backed where it now lies.
-            shell.arena.ensure_rungs(&mut shell.pools)?;
             shell.pools.state_whole();
             fitted
         } else {
@@ -1894,7 +1891,6 @@ impl Shell {
         let fitted = self
             .pools
             .fit_the_card(hold, self.held_for_fires, false, &resident)?;
-        self.arena.ensure_rungs(&mut self.pools)?;
         self.lay_workspace()?;
         self.bodies_mem = usize::try_from(hold).unwrap_or(usize::MAX);
         self.rearming = true;

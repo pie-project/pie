@@ -670,6 +670,7 @@ impl Plane {
             fixed: 0,
             max_lanes: 0,
             laid: engine::LaidLanes::Exact,
+            a_row: 0,
         })
     }
 

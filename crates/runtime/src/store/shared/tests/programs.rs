@@ -1501,6 +1501,7 @@ async fn a_wave_past_the_span_the_engine_states_is_cut_to_the_widest_rung_it_cov
         fixed: 4_718_592,
         max_lanes: 0,
         laid: LaidLanes::Exact,
+        a_row: 0,
     };
     for at_pair in 0..PAIRS {
         let key = at(PROGRAM, 256 + at_pair);
