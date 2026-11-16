@@ -68,6 +68,14 @@
 //! approximate one. One bounded deviation: the per-token score is floored at
 //! `1e-7`, biasing the null mean low by that amount, because without it a
 //! strongly favoured token yields `+∞` and destroys the statistic.
+//!
+//! The run checks itself (`verdict`): the keyed z-score over the distinct
+//! contexts must reach 4 over at least 100 of them. A shorter text, or a
+//! peaked model that keeps repeating its contexts, is reported as too few
+//! contexts to judge, neither a pass nor a failure. The default length
+//! (256 tokens) leaves enough contexts on the shipped models.
+
+mod verdict;
 
 use inferlet::eta::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -121,6 +129,9 @@ struct Output {
     /// evidence and are dropped — the same de-duplication every published
     /// detector performs.
     unique_contexts: usize,
+    /// The self-check's decision (`verdict`): registered, missing, too few
+    /// contexts to judge, or not watermarked.
+    verdict: String,
 }
 
 fn default_prompt() -> String {
@@ -143,8 +154,10 @@ fn default_temperature() -> f32 {
     1.0
 }
 
+/// Enough for a peaked model's text to leave `verdict::MIN_CONTEXTS`
+/// distinct contexts.
 fn default_max_tokens() -> usize {
-    32
+    256
 }
 
 fn default_seed() -> u32 {
@@ -279,6 +292,7 @@ async fn main(input: Input) -> Result<Output> {
             mean_null_score: 0.0,
             z_score: 0.0,
             unique_contexts: 0,
+            verdict: verdict::Verdict::of(input.watermark, 0, 0.0).describe(0, 0.0),
         });
     }
 
@@ -438,9 +452,11 @@ async fn main(input: Input) -> Result<Output> {
     // `1 / sqrt(n)` and this is already a z-score.
     let z_score = (mean_score - 1.0) * denom.sqrt();
 
-    if cfg.watermark && kept >= 16 && mean_score <= mean_null {
+    let verdict = verdict::Verdict::of(cfg.watermark, kept, z_score);
+    if verdict == verdict::Verdict::Missing {
         return Err(format!(
-            "watermark did not register: keyed score {mean_score} did not beat the decoy {mean_null} over {kept} distinct contexts — the context hash is not reaching the sampler"
+            "watermark did not register: {}; keyed mean {mean_score}, decoy {mean_null} — the context hash is not reaching the sampler",
+            verdict.describe(kept, z_score)
         ));
     }
 
@@ -455,5 +471,6 @@ async fn main(input: Input) -> Result<Output> {
         mean_null_score: mean_null,
         z_score,
         unique_contexts: kept,
+        verdict: verdict.describe(kept, z_score),
     })
 }
