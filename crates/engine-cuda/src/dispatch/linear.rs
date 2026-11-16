@@ -3005,6 +3005,15 @@ impl Run<'_> {
                     .to_string(),
             ));
         };
+        // A select on a side stream may overlap one on another: each stream
+        // stages into its own lane.
+        let Some(lane) = staged.lane(self.stream_index()) else {
+            return Err(refused(format!(
+                "a select of a host-resident bank runs on stream {}, which the load laid no \
+                 staging lane for",
+                self.stream_index()
+            )));
+        };
         let stream = self.ctx().stream();
         if crate::device::alloc::is_capturing(stream) {
             return Err(refused(
@@ -3053,10 +3062,10 @@ impl Run<'_> {
                 plane.dtype,
             ))
         };
-        let staged_codes = stage(codes, staged.runs[0])?;
-        let staged_scales = stage(scales, staged.runs[1])?;
+        let staged_codes = stage(codes, lane[0])?;
+        let staged_scales = stage(scales, lane[1])?;
         let staged_biases = match biases {
-            Some(biases) => Some(stage(biases, staged.runs[2])?),
+            Some(biases) => Some(stage(biases, lane[2])?),
             None => None,
         };
         let slot_of = |expert: i32| unique.binary_search(&expert).map_or(-1, |at| at as i32);
@@ -3064,7 +3073,7 @@ impl Run<'_> {
             .iter()
             .map(|e| if *e < 0 { -1 } else { slot_of(*e) })
             .collect();
-        let (routes_at, routes_run) = staged.runs[3];
+        let (routes_at, routes_run) = lane[3];
         if (count * 4) as u64 > routes_run {
             return Err(over("routes", (count * 4) as u64, routes_run));
         }

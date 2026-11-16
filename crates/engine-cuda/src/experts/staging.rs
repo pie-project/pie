@@ -8,6 +8,11 @@
 //! once in the activation's span beside the staged inputs, and entered in
 //! the load's ledger: a fire allocates nothing and reads no expert across
 //! the bus.
+//!
+//! A join's branches may run on side streams at once (`poem_compiler::
+//! branch::split`, a region's `stream`), so two staged selects of one fire
+//! can overlap: each stream whose regions run one stages into a lane of
+//! its own.
 
 use poem_ir::{Def, Linear, Operation, Trace};
 
@@ -15,6 +20,9 @@ use crate::error::{Fault, Result};
 
 /// What a run of the staging is aligned to.
 const ALIGN: u64 = 256;
+
+/// The most streams a load stages on.
+const LANES: usize = 8;
 
 /// One select of a host-resident bank, as its staging is sized.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,17 +36,21 @@ pub struct Select {
     /// The bytes an expert takes of each of its planes: codes, scales and
     /// the third (zeros, an NVFP4 bank's tensor scales), 0 where it has none.
     pub planes: [u64; 3],
+    /// The stream its region runs on (0 the fire's main stream).
+    pub stream: u32,
 }
 
 /// The staging a load lays for its host-resident banks: each plane's run
 /// holds the most experts one fire's select can touch, `min(experts, rows
 /// × top_k)` of its widest bank, and the routes' run one fire's renumbered
-/// routes. The selects run one after another on the fire's stream, so one
-/// run of each serves every layer.
+/// routes. The selects of one stream run one after another, so a lane of
+/// these runs serves every layer on it; a lane a stream that runs one.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Staging {
-    /// The bytes of each run: codes, scales, third, routes.
+    /// The bytes of each run of a lane: codes, scales, third, routes.
     runs: [u64; 4],
+    /// The streams that run a staged select, a lane each.
+    streams: Vec<u32>,
     /// The rows a fire stages for at most.
     rows: u32,
     /// The banks it stages, by name.
@@ -48,10 +60,31 @@ pub struct Staging {
 /// The staging as a fire reads it: where each run lies and what it holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Staged {
-    /// Each run's address and bytes: codes, scales, third, routes.
-    pub runs: [(u64, u64); 4],
+    /// The first lane's runs, address and bytes: codes, scales, third,
+    /// routes.
+    runs: [(u64, u64); 4],
+    /// From one lane to the next.
+    stride: u64,
+    /// Each lane's stream; the first `lanes` hold one.
+    streams: [u32; LANES],
+    lanes: usize,
     /// The rows a fire stages for at most.
     pub rows: u32,
+}
+
+impl Staged {
+    /// The runs of `stream`'s lane; `None` for a stream the load laid none
+    /// for.
+    #[must_use]
+    pub fn lane(&self, stream: u32) -> Option<[(u64, u64); 4]> {
+        let lane = self.streams[..self.lanes]
+            .iter()
+            .position(|&at| at == stream)? as u64;
+        Some(
+            self.runs
+                .map(|(at, bytes)| (at + lane * self.stride, bytes)),
+        )
+    }
 }
 
 impl Staging {
@@ -60,7 +93,11 @@ impl Staging {
     pub fn bound(selects: &[Select], rows: u32) -> Staging {
         let mut runs = [0u64; 4];
         let mut banks: Vec<String> = Vec::new();
+        let mut streams: Vec<u32> = Vec::new();
         for select in selects {
+            if !streams.contains(&select.stream) {
+                streams.push(select.stream);
+            }
             let routes = u64::from(rows) * u64::from(select.top_k);
             let slots = u64::from(select.experts).min(routes);
             for (run, bytes) in runs.iter_mut().zip(select.planes) {
@@ -74,20 +111,28 @@ impl Staging {
         if banks.is_empty() {
             return Staging::default();
         }
-        Staging { runs, rows, banks }
+        streams.sort_unstable();
+        Staging {
+            runs,
+            streams,
+            rows,
+            banks,
+        }
     }
 
     /// The selects of `trace` whose bank lies on the host (`host` of its
     /// codes' address) and is not one the weight cache tables (`tabled`,
-    /// by param), each as `table` binds it.
+    /// by param), each as `table` binds it and on the stream `stream_of`
+    /// gives its node.
     pub fn selects(
         trace: &Trace,
         table: &crate::run::WeightTable,
         tabled: &[u32],
         host: impl Fn(u64) -> bool,
+        stream_of: impl Fn(usize) -> u32,
     ) -> Result<Vec<Select>> {
         let mut out = Vec::new();
-        for node in &trace.nodes {
+        for (at, node) in trace.nodes.iter().enumerate() {
             let Operation::Linear(Linear::MoeSelect { bank, routes, .. }) = &node.op else {
                 continue;
             };
@@ -131,6 +176,7 @@ impl Staging {
                     u64::from(scales.width),
                     biases.map_or(0, |third| u64::from(third.width)),
                 ],
+                stream: stream_of(at),
             });
         }
         Ok(out)
@@ -139,6 +185,10 @@ impl Staging {
     /// The bytes the staging takes of the activation's span.
     #[must_use]
     pub fn bytes(&self) -> u64 {
+        self.lane_bytes() * self.streams.len() as u64
+    }
+
+    fn lane_bytes(&self) -> u64 {
         self.runs
             .iter()
             .map(|run| run.next_multiple_of(ALIGN))
@@ -152,18 +202,28 @@ impl Staging {
 
     /// Refuses a staging `room` bytes do not hold, by its banks' names.
     pub fn fits(&self, room: u64) -> Result<()> {
+        if self.streams.len() > LANES {
+            return Err(Fault::Residency(format!(
+                "the routed bank(s) {} lie on the host and their selects run on {} streams; a \
+                 load stages experts on at most {LANES}",
+                self.names(),
+                self.streams.len(),
+            )));
+        }
         let need = self.bytes();
         if need <= room {
             return Ok(());
         }
         Err(Fault::Residency(format!(
             "the routed bank(s) {} lie on the host with no table of the weight cache to read \
-             them through, and a fire of {} rows stages the experts it routes to on the device: \
-             {need} bytes laid at load, and the card has {room} bytes free for it. Serve fewer \
+             them through, and a fire of {} rows stages the experts it routes to on the device, \
+             a lane for each of {} stream(s): {need} bytes laid at load, and the card has {room} \
+             bytes free for it. Serve fewer \
              `max_forward_tokens`, let the weight cache take the bank(s), or free what else \
              holds the device.",
             self.names(),
             self.rows,
+            self.streams.len(),
         )))
     }
 
@@ -179,8 +239,14 @@ impl Staging {
             at += bytes.next_multiple_of(ALIGN);
             run
         });
+        let mut streams = [0u32; LANES];
+        let lanes = self.streams.len().min(LANES);
+        streams[..lanes].copy_from_slice(&self.streams[..lanes]);
         Some(Staged {
             runs,
+            stride: self.lane_bytes(),
+            streams,
+            lanes,
             rows: self.rows,
         })
     }
@@ -192,11 +258,13 @@ impl Staging {
             format!(
                 "engine-cuda: the routed bank(s) {} lie on the host with no table of the \
                  weight cache: a fire reads its routes back and stages the experts they name \
-                 into {} MiB laid at load (each plane the most experts {} rows route to), so \
-                 its fires walk eagerly, unrecorded",
+                 into {} MiB laid at load (each plane the most experts {} rows route to, a \
+                 lane for each of {} stream(s) that runs a select), so its fires walk \
+                 eagerly, unrecorded",
                 self.names(),
                 self.bytes() >> 20,
                 self.rows,
+                self.streams.len(),
             )
         })
     }
@@ -220,6 +288,7 @@ mod tests {
             experts,
             top_k,
             planes,
+            stream: 0,
         }
     }
 
@@ -228,6 +297,31 @@ mod tests {
         a_staging_holds_the_experts_one_fire_can_touch();
         a_staging_the_card_cannot_hold_is_refused_by_name();
         a_load_with_no_host_bank_stages_nothing();
+        each_stream_that_runs_a_select_stages_in_a_lane_of_its_own();
+    }
+
+    fn each_stream_that_runs_a_select_stages_in_a_lane_of_its_own() {
+        let up = select("blk.0.up", 128, 8, [4096, 256, 0]);
+        let gate = Select {
+            stream: 2,
+            ..select("blk.0.gate", 128, 8, [4096, 256, 0])
+        };
+        let one = Staging::bound(std::slice::from_ref(&up), 4);
+        let two = Staging::bound(&[up, gate], 4);
+        assert_eq!(two.bytes(), 2 * one.bytes(), "a lane a stream");
+        let staged = two.at(1 << 20).expect("stages");
+        let main = staged.lane(0).expect("the main stream's lane");
+        let side = staged.lane(2).expect("the side stream's lane");
+        assert_eq!(main[0].0, 1 << 20);
+        assert_eq!(
+            side[0].0,
+            (1 << 20) + one.bytes(),
+            "the lanes do not overlap"
+        );
+        assert!(
+            staged.lane(1).is_none(),
+            "no lane for a stream that runs none"
+        );
     }
 
     fn a_staging_holds_the_experts_one_fire_can_touch() {

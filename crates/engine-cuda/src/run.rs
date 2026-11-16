@@ -1354,14 +1354,21 @@ impl<'c> Run<'c> {
     /// conditional body runs in the main stream's order and decodes into its
     /// tile; a load that warmed no tiles decodes as it did.
     pub(crate) fn decoded_tile_holds(&self, n: u32, k: u32) -> bool {
-        let at = match self.stream.get() {
-            _ if self.side.is_empty() => 0,
-            crate::window::BODY => 0,
-            n => n as usize,
-        };
+        let at = self.stream_index() as usize;
         self.decoded
             .get(at)
             .is_none_or(|tile| u64::from(n).saturating_mul(u64::from(k)).saturating_mul(2) <= *tile)
+    }
+
+    /// The stream this region launches on, as its region states it: 0 the
+    /// fire's main stream (a fire walked on no side stream, or a
+    /// conditional body, which runs in the main stream's order).
+    pub(crate) fn stream_index(&self) -> u32 {
+        match self.stream.get() {
+            _ if self.side.is_empty() => 0,
+            crate::window::BODY => 0,
+            n => n,
+        }
     }
 
     pub(crate) fn ctx(&self) -> &'c Ctx {

@@ -1285,16 +1285,28 @@ impl Shell {
         // A routed bank on the host that no table of the weight cache reads
         // is staged by its fire: the most experts one fire routes to, laid
         // here with the staged inputs. ROCm stages its own (`dispatch::hip`).
+        // A lane of it for each stream whose regions run such a select.
         #[cfg(not(feature = "rocm"))]
-        let expert_staging = crate::experts::staging::Staging::bound(
-            &crate::experts::staging::Staging::selects(
-                &boot.trace,
-                weights.table(),
-                &pools.expert_params(),
-                crate::device::alloc::is_host_pointer,
-            )?,
-            budgets.tokens.max_tokens,
-        );
+        let expert_staging = {
+            let mut streams = vec![0u32; boot.trace.nodes.len()];
+            for region in compiled.template() {
+                for node in region.nodes.clone() {
+                    if let Some(stream) = streams.get_mut(node as usize) {
+                        *stream = region.stream;
+                    }
+                }
+            }
+            crate::experts::staging::Staging::bound(
+                &crate::experts::staging::Staging::selects(
+                    &boot.trace,
+                    weights.table(),
+                    &pools.expert_params(),
+                    crate::device::alloc::is_host_pointer,
+                    |node| streams[node],
+                )?,
+                budgets.tokens.max_tokens,
+            )
+        };
         #[cfg(feature = "rocm")]
         let expert_staging = crate::experts::staging::Staging::default();
         if expert_staging.bytes() > 0 {
