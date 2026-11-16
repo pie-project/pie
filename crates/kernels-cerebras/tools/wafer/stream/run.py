@@ -32,7 +32,11 @@ for i, a in enumerate(host["h2d"]):
         f = f"{entries}/{os.path.basename(a['file'])}"
         took += 1
     d = np.load(f)
-    data = d.reshape(-1).astype(np.uint32) if a["u16"] else d.reshape(-1).astype(np.float32)
+    # (a 16-bit array's words: integers, or their bits in an f32 file as the grid regimes write)
+    if a["u16"]:
+        data = (d.view(np.uint32) if d.dtype == np.float32 else d.astype(np.uint32)).reshape(-1)
+    else:
+        data = d.reshape(-1).astype(np.float32)
     r.memcpy_h2d(r.get_id(a["sym"]), data, a["x"], a["y"], a["w"], a["h"], a["len"],
                  data_type=U16 if a["u16"] else F32, **kw)
     # every write landed (a word read back from its first PE) before the next: the simulator's
@@ -48,10 +52,15 @@ t2 = time.time()
 print(f"step ran in {t2 - t1:.0f} s", flush=True)
 got = {}
 # the host rows out, a column of roots one memcpy
-cols = {}
+cols, bufs = {}, {}
 for o in host["d2h"]:
+    if o.get("h", 1) > 1:
+        # (a rectangle a read: the GEMM regime's column of a value's rows, a PE's rows in turn)
+        b = np.zeros(o["w"] * o["h"] * o["len"], np.float32)
+        r.memcpy_d2h(b, r.get_id(o["sym"]), o["x"], o["y"], o["w"], o["h"], o["len"], data_type=F32, **kw)
+        bufs[(o["x"], o["y"])] = b
+        continue
     cols.setdefault((o["sym"], o["x"], o["len"]), []).append(o)
-bufs = {}
 for (sym, x, n), os_ in cols.items():
     os_.sort(key=lambda o: o["y"])
     runs = [[os_[0]]]
