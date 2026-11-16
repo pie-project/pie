@@ -372,6 +372,18 @@ impl Instance {
         })
     }
 
+    /// The cell at channel `chan`'s front, whatever its host role: what an
+    /// engine's descriptor port reads of it (the guest-program contract's
+    /// view of a loop-carried geometry channel).
+    #[must_use]
+    pub fn peek(&self, chan: u32) -> Option<Value> {
+        if (chan as usize) < self.channels.len() {
+            self.with_chan(chan as usize, |st| st.queue.front().cloned())
+        } else {
+            None
+        }
+    }
+
     pub fn host_read(&mut self, bound: &BoundTrace, chan: u32) -> Result<Value, HostError> {
         if self.poisoned {
             return Err(HostError::Poisoned);

@@ -1568,6 +1568,27 @@ mod tests {
                     .step(&case.bound, &inputs, &mut NoKernels)
                     .expect("the interpreter steps");
                 assert!(stepped.committed, "{} step {step}: {:?}", case.name, stepped.missed);
+                // Every channel the stage carries on the device (its mask,
+                // slots, positions, fill), as an engine's port reads it.
+                for channel in 0..case.bound.container.channels.len() as u32 {
+                    if case.readers.contains(&channel) {
+                        continue;
+                    }
+                    let Some(want) = reference.peek(channel) else {
+                        continue;
+                    };
+                    let want = wire(&want);
+                    let got = plane.instance(id).expect("bound").head_cell(channel).expect("reads");
+                    if got != want {
+                        wrong.push(format!(
+                            "{} step {step}: carried channel {channel}: {:02x?} != {:02x?}",
+                            case.name,
+                            &got[..got.len().min(16)],
+                            &want[..want.len().min(16)]
+                        ));
+                        break 'steps;
+                    }
+                }
                 for &channel in &case.readers {
                     let want = wire(&reference.host_take(&case.bound, channel).expect("a cell"));
                     let got = plane
@@ -1645,8 +1666,8 @@ mod tests {
                         query_len: case.rows,
                         ..Extents::default()
                     },
-                    GeometryClass::Host,
-                    PortMask::NONE,
+                    GeometryClass::DecodeEnvelope,
+                    PortMask::of(&[eta_ir::registry::Port::EmbedTokens, eta_ir::registry::Port::AttnMask]),
                     &ids,
                     session::Pooled {
                         pools: &pools,
@@ -1675,6 +1696,13 @@ mod tests {
                     let _ = plane.instance_mut(id).expect("bound").take(reader);
                 }
                 let now = plane.instance(id).expect("bound").head_cell(mask as u32).expect("reads");
+                let envelope = plane.envelope(id).expect("an envelope").expect("decode-envelope bound");
+                let resolved = envelope.mask.clone().unwrap_or_default();
+                let packed: Vec<u8> = resolved
+                    .chunks(8)
+                    .map(|bits| bits.iter().enumerate().fold(0u8, |byte, (at, &on)| byte | (u8::from(on) << at)))
+                    .collect();
+                eprintln!("{} step {step}: head changed {} resolved==head {} resolved==seed {} resolved len {}", case.name, now != seed, packed == now, packed == seed, resolved.len());
                 if now == seed {
                     wrong.push(format!("{} step {step}: the mask's head cell is still the seed", case.name));
                 }
