@@ -501,17 +501,44 @@ pub fn spans(p: &Program, a: &HostArray) -> R<Option<Vec<Span>>> {
         // constant one the unit's)
         let flags = FLAT | cast;
         let mut s: Vec<Span> = vec![[NONE, 0, 0, 1, 0, 0, 1, 0]];
+        // a tile row's cells as runs: a weight's elements at one stride, zeros, ones
         for &xr in &rows {
+            let mut run: Option<Span> = None;
             for &oc in &cols {
-                s.push(if cells.one(xr, oc) {
-                    [UNIT, 0, 0, 1, 0, flags, 1, 0]
-                } else {
-                    match cells.at(xr, oc) {
-                        Some(e) => [weight.0, 0, e as u32, 1, kk as u32, flags, 1, 0],
-                        None => [NONE, 0, 0, 1, 0, 0, 1, 0],
+                let cell = match (cells.one(xr, oc), cells.at(xr, oc)) {
+                    (true, _) => [UNIT, 0, 0, 1, 0, flags, 1, 0],
+                    (false, Some(e)) => [weight.0, 0, e as u32, 1, kk as u32, flags, 1, 0],
+                    (false, None) => [NONE, 0, 0, 1, 0, 0, 1, 0],
+                };
+                match run.as_mut() {
+                    // a zero after zeros
+                    Some(r) if r[0] == NONE && cell[0] == NONE => r[3] += 1,
+                    // a weight's element one stride on from the run's last
+                    Some(r)
+                        if r[0] == weight.0
+                            && cell[0] == weight.0
+                            && r[0] != UNIT
+                            && (r[3] == 1 || cell[2] == r[2] + r[3] * r[4])
+                            && cell[2] > r[2] =>
+                    {
+                        if r[3] == 1 {
+                            r[4] = cell[2] - r[2];
+                        }
+                        if cell[2] == r[2] + r[3] * r[4] {
+                            r[3] += 1;
+                        } else {
+                            s.push(*r);
+                            *r = cell;
+                        }
                     }
-                });
+                    Some(r) => {
+                        s.push(*r);
+                        *r = cell;
+                    }
+                    None => run = Some(cell),
+                }
             }
+            s.extend(run);
         }
         let used = 1 + rows.len() * cols.len();
         if used < a.len as usize {
