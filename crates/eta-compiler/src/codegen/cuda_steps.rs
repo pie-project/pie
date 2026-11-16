@@ -25,6 +25,15 @@ pub const BLOCK: u32 = 256;
 /// The arguments the stage kernel takes (`PS_STAGE_ARGS`).
 pub const ARITY: usize = 22;
 
+/// The blocks of a lane the one-row select splits a row over (the
+/// runtime's `SEL_GROUPS`): as many as a lane runs on.
+pub const SELECT_GROUPS: u32 = 64;
+
+/// The words the one-row select keeps just below a node's temporary area
+/// (the runtime's `SEL_WORDS`): its state, each group's histogram and
+/// counts, and the candidates.
+pub const SELECT_WORDS: u32 = 16 + SELECT_GROUPS * 258 + 2 * 1024;
+
 /// The stage kernel's entry point.
 pub const ENTRY: &str = "ptir_stage";
 
@@ -519,6 +528,13 @@ pub fn record(step: &Step, set: &[Kernel]) -> Option<[u32; 4]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_runtime_and_the_layout_agree_on_the_selects_state() {
+        let groups = alloc::format!("#define SEL_GROUPS {SELECT_GROUPS}u");
+        let words = alloc::format!("#define SEL_WORDS {SELECT_WORDS}u");
+        assert!(RUNTIME.contains(&groups) && RUNTIME.contains(&words));
+    }
 
     #[test]
     fn the_stage_kernel_spells_every_kernel_at_its_index() {

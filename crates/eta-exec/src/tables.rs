@@ -429,7 +429,11 @@ pub fn stepped_tables(
             .and_then(|&arg| descriptors.get(arg as usize))
             .zip(temporary)
             .map_or(0, |(d, kept)| kept.bytes(d));
-        let reserve = if select { SELECT_RESERVE } else { 0 };
+        let reserve = if select {
+            u64::from(eta_compiler::codegen::cuda_steps::SELECT_WORDS) * 4
+        } else {
+            0
+        };
         // A ladder's buffers are the fire's arena's; a lane keeps only the
         // select's state.
         arena = arena.max(bytes);

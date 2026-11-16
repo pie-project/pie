@@ -30,8 +30,11 @@ typedef unsigned long long ps_u64;
 #define PIVOT_UNROLL 32u
 
 #define SEL_CAP 1024u
-#define SEL_GROUPS 32u
-#define SEL_WORDS 10320u
+// A lane's blocks a one-row select splits the row over, and the state it
+// keeps below the temporary area (`cuda_steps::SELECT_WORDS`):
+// 16 + SEL_GROUPS * 258 + 2 * SEL_CAP.
+#define SEL_GROUPS 64u
+#define SEL_WORDS 18576u
 #define SEL_MODE 0u
 #define SEL_ACTIVE 1u
 #define SEL_WANT 2u
@@ -1678,7 +1681,11 @@ struct Ps {
     // Ties past the cap landed in no particular order, so the walk trusts
     // only the keys below the cut then.
     const ps_u32 held = below + ties <= SEL_CAP ? below + ties : below;
-    for (ps_u32 i = sel_lt; i < SEL_CAP; i += PTIR_WG) {
+    // The candidates and the pads up to the power of two over them: the
+    // sort orders those, the pads last, as it would the whole cap.
+    ps_u32 width = 2u;
+    while (width < held) width = width * 2u;
+    for (ps_u32 i = sel_lt; i < width; i += PTIR_WG) {
       if (i < held) {
         sel_wg_key[i] = heap[sel_cand_key(i)];
         sel_wg_idx[i] = heap[sel_cand_idx(i)];
@@ -1688,9 +1695,9 @@ struct Ps {
       }
     }
     __syncthreads();
-    for (ps_u32 size = 2u; size <= SEL_CAP; size = size * 2u) {
+    for (ps_u32 size = 2u; size <= width; size = size * 2u) {
       for (ps_u32 stride = size / 2u; stride > 0u; stride = stride / 2u) {
-        for (ps_u32 t = sel_lt; t < SEL_CAP / 2u; t += PTIR_WG) {
+        for (ps_u32 t = sel_lt; t < width / 2u; t += PTIR_WG) {
           const ps_u32 lo = 2u * stride * (t / stride) + (t % stride);
           const ps_u32 hi = lo + stride;
           const bool ascending = (lo & size) == 0u;

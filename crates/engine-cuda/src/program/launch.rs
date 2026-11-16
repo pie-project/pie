@@ -570,10 +570,6 @@ const SPANS: u64 = 5;
 /// The most blocks a lane's stage runs on.
 const MAX_GROUPS: u32 = 64;
 
-/// The most lane slots a stage that sorts runs at once, each with its
-/// share of the fire's arena: its fire's other lanes take a slot after.
-const ARENA_SLOTS: u32 = 16;
-
 /// The blocks a step of a stage runs a lane on: enough for its widest
 /// value a thread an element, at most four a multiprocessor.
 fn groups_for(descriptors: &[ValueDesc]) -> u32 {
@@ -715,8 +711,7 @@ impl Prepared {
             + words * (size_of::<u64>() + 4 * size_of::<u32>()) as u64
             + u64::from(self.channel_count).max(1)
             + 2 * size_of::<u32>() as u64
-            // A lane slot's share of the arena: a fire lays one a lane, up to
-            // `ARENA_SLOTS`.
+            // A lane's share of the arena: a fire lays one a lane.
             + u64::from(self.arena_bytes)
     }
 
@@ -814,9 +809,8 @@ impl Prepared {
         }
         self.cells = take(cell_at);
         self.barriers = take(2 * size_of::<u32>() * lanes as usize);
-        // After the scratch, so a lane finds its slot's share words past it.
-        let (_, slots) = self.shape_for(lanes);
-        self.arena = take(self.arena_bytes as usize * slots as usize);
+        // After the scratch, so a lane finds its share words past it.
+        self.arena = take(self.arena_bytes as usize * lanes as usize);
         self.lanes = lanes;
         Ok(next)
     }
@@ -1020,23 +1014,18 @@ impl Prepared {
         )
     }
 
-    /// The blocks a lane runs on and the lane slots one launch holds: as
-    /// wide as the stage's widest value asks, at most [`MAX_GROUPS`], every
-    /// block of the launch resident at once (one a multiprocessor), its
-    /// lanes looped over the slots where the fire carries more.
+    /// The blocks a lane runs on and the lane slots one launch holds: every
+    /// lane a slot of its own, so no fire loops its lanes; a lane's blocks
+    /// as many as the device holds at once with the fire's lanes (they meet
+    /// between steps, so they must be resident together), from one (which
+    /// meets no other, past the units) to [`MAX_GROUPS`], and no more than
+    /// the stage's widest value asks.
     fn shape(&self) -> (u32, u32) {
-        self.shape_for(self.filled)
-    }
-
-    fn shape_for(&self, lanes: u32) -> (u32, u32) {
-        let units = device_units().max(1);
-        let mut lanes = lanes.max(1);
-        if self.arena_bytes != 0 {
-            lanes = lanes.min(ARENA_SLOTS);
-        }
-        let groups = (units / lanes).clamp(1, MAX_GROUPS).min(self.groups.max(1));
-        let slots = lanes.min((units / groups).max(1));
-        (groups, slots)
+        let lanes = self.filled.max(1);
+        let groups = (device_units().max(1) / lanes)
+            .clamp(1, MAX_GROUPS)
+            .min(self.groups.max(1));
+        (groups, lanes)
     }
 
     #[must_use]
