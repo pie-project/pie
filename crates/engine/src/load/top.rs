@@ -39,6 +39,9 @@ pub struct Counts {
     /// The kv bytes a key read takes, summed over the kv rows attentions
     /// read: every plane of the row at its element's size.
     pub kv_bytes_per_key: u64,
+    /// The widest head the trace's attentions read (0 with none): the width
+    /// the attention rate is read at.
+    pub attn_head_dim: u32,
     /// The recurrent state elements a row steps, summed over the layers: a
     /// scan's state row (a gated delta's `v_heads · k_dim · v_dim`), once a
     /// state the scans read however many forms of the scan the trace holds.
@@ -133,6 +136,7 @@ impl Counts {
             readout_depth: to(readout_depth),
             attn_flops_per_row_key,
             kv_bytes_per_key,
+            attn_head_dim: attn_head_dim(trace),
             state_elements_per_row: state_elements(trace),
             elementwise_bytes_per_row: elementwise_bytes(trace),
             width: u32::try_from(width).unwrap_or(u32::MAX),
@@ -174,6 +178,25 @@ fn heads(trace: &Trace) -> Vec<usize> {
     out.sort_unstable();
     out.dedup();
     out
+}
+
+/// The widest head of `trace`'s attentions: their prefill, decode, dense
+/// and ragged forms' stated head width.
+fn attn_head_dim(trace: &Trace) -> u32 {
+    trace
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.op {
+            Operation::Attn(
+                poem_ir::Attn::Prefill { head_dim, .. }
+                | poem_ir::Attn::Decode { head_dim, .. }
+                | poem_ir::Attn::Dense { head_dim, .. }
+                | poem_ir::Attn::Ragged { head_dim, .. },
+            ) => Some(*head_dim),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// The state elements a row steps, over every recurrent scan of `trace`:
@@ -347,11 +370,12 @@ pub fn estimate(
             .filter(|grid| !grid.is_empty())
             .ok_or("bf16_flops_per_ns_by_rows_and_depth")?,
         bytes_per_ns: rates.bytes_per_ns.ok_or("bytes_per_ns")?,
-        attn_by_keys: match &rates.attn_flops_per_ns_by_keys {
-            Some(curve) if !curve.is_empty() => curve.clone(),
+        attn_grid: match &rates.attn_flops_per_ns_by_keys_and_dim {
+            Some(grid) if !grid.is_empty() => grid.clone(),
             _ if counts.attn_flops_per_row_key == 0 => Vec::new(),
-            _ => return Err("attn_flops_per_ns_by_keys"),
+            _ => return Err("attn_flops_per_ns_by_keys_and_dim"),
         },
+        attn_head_dim: counts.attn_head_dim,
         scan_elements_per_ns: needed(
             rates.scan_elements_per_ns,
             counts.state_elements_per_row > 0,
@@ -482,6 +506,7 @@ mod tests {
             gemm_shapes: vec![(4096, 4096, 1 << 30)],
             attn_flops_per_row_key: 1 << 10,
             kv_bytes_per_key: 1 << 10,
+            attn_head_dim: 128,
             readout_flops: 0,
             readout_depth: 4096,
             state_elements_per_row: 0,
@@ -509,7 +534,7 @@ mod tests {
         let none = [rung(1024, 300 * MIB, Some("past one binding"))];
         let rated = profile::fire::Rates {
             bf16_flops_per_ns_by_rows_and_depth: Some(vec![(4096, 4096, 1.0)]),
-            attn_flops_per_ns_by_keys: Some(vec![(2048, 1.0)]),
+            attn_flops_per_ns_by_keys_and_dim: Some(vec![(2048, 128, 1.0)]),
             bytes_per_ns: Some(1.0),
             ..profile::fire::Rates::default()
         };
@@ -526,7 +551,7 @@ mod tests {
     fn the_estimate_reads_the_rates_and_the_counts() {
         let rates = profile::fire::Rates {
             bf16_flops_per_ns_by_rows_and_depth: Some(vec![(16, 4096, 1.0), (4096, 4096, 10.0)]),
-            attn_flops_per_ns_by_keys: Some(vec![(2048, 7.0)]),
+            attn_flops_per_ns_by_keys_and_dim: Some(vec![(2048, 128, 7.0)]),
             bytes_per_ns: Some(100.0),
             launch_ns: Some(5),
             ..profile::fire::Rates::default()
@@ -535,8 +560,8 @@ mod tests {
         assert_eq!(e.flops_grid, vec![(16, 4096, 1.0), (4096, 4096, 10.0)]);
         assert_eq!(e.gemm_shapes, vec![(4096, 4096, (1u64 << 30) as f64)]);
         assert_eq!(
-            (e.attn_by_keys.clone(), e.bytes_per_ns, e.launch_ns),
-            (vec![(2048, 7.0)], 100.0, 5.0)
+            (e.attn_grid.clone(), e.bytes_per_ns, e.launch_ns),
+            (vec![(2048, 128, 7.0)], 100.0, 5.0)
         );
         // No recurrent state: no scan rate read.
         assert_eq!(e.scan_elements_per_ns, 0.0);
@@ -558,9 +583,9 @@ mod tests {
                 },
             ),
             (
-                "attn_flops_per_ns_by_keys",
+                "attn_flops_per_ns_by_keys_and_dim",
                 profile::fire::Rates {
-                    attn_flops_per_ns_by_keys: None,
+                    attn_flops_per_ns_by_keys_and_dim: None,
                     ..rates.clone()
                 },
             ),
@@ -586,7 +611,7 @@ mod tests {
             ..counts()
         };
         let no_attn = profile::fire::Rates {
-            attn_flops_per_ns_by_keys: None,
+            attn_flops_per_ns_by_keys_and_dim: None,
             ..rates
         };
         assert!(estimate(&attending_nothing, &no_attn).is_ok());
@@ -604,7 +629,7 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "device Card X has no rates in its profile for this model: `[rates] \
-             attn_flops_per_ns_by_keys` is unstated, so nothing weighs its top rung; `pie tune <backend> \
+             attn_flops_per_ns_by_keys_and_dim` is unstated, so nothing weighs its top rung; `pie tune <backend> \
              --rates` measures it"
         );
     }

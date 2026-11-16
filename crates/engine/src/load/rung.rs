@@ -64,7 +64,7 @@ impl RungFacts {
 /// `work(r) = max(weights(r) / bytes_per_ns,
 ///             Σ_(n, k) padded_rows(r) · flops_per_row(n, k) / flops(padded_rows(r), k))
 ///       + sampled(r) · readout_flops / flops(sampled(r), hidden)
-///       + tokens(r) · keys(r) · attn_flops_per_row_key / attn(keys(r))
+///       + tokens(r) · keys(r) · attn_flops_per_row_key / attn(keys(r), d)
 ///       + keys(r) · kv_bytes_per_key / bytes_per_ns
 ///       + tokens(r) · state_elements_per_row / scan_elements_per_ns
 ///       + tokens(r) · elementwise_bytes_per_row / bytes_per_ns`
@@ -81,9 +81,10 @@ impl RungFacts {
 /// ([`profile::fire::flops_at`]), and each of the model's dense shapes
 /// (`n` columns at depth `k`, [`super::Counts::gemm_shapes`]) is read at its
 /// own depth: a narrow model's matmuls run below a wide one's at the same
-/// rows. `attn(keys)` is the device's attention rate at a row's keys, its
-/// measured curve interpolated in `log keys` and clamped (a paged prefill
-/// streams long keys faster a flop than short). The output head
+/// rows. `attn(keys, d)` is the device's attention rate at a row's keys and
+/// the model's head width `d`, its measured grid interpolated in `log keys`
+/// and `log d` and clamped (a paged prefill streams long keys faster a flop
+/// than short, and a wide head's tiles run at their own rate). The output head
 /// runs once a lane (the readout), not once a row, so its flops are their
 /// own term, over the rows the rung samples ([`RungFacts::sampled`]): a
 /// rung no wider than its lanes is weighed decode-shaped (a lane a token,
@@ -107,9 +108,12 @@ pub struct FireEstimate {
     /// Dense bf16 matmul flops a nanosecond by rows and depth: `(m, k,
     /// rate)`, a full grid ([`profile::fire::grid`]).
     pub flops_grid: Vec<(u32, u32, f64)>,
-    /// Attention flops a nanosecond by the keys a row attends: `(keys,
-    /// rate)`, ascending; read only where the model attends.
-    pub attn_by_keys: Vec<(u32, f64)>,
+    /// Attention flops a nanosecond by the keys a row attends and the head
+    /// width: `(keys, d, rate)`, a full grid; read only where the model
+    /// attends.
+    pub attn_grid: Vec<(u32, u32, f64)>,
+    /// The model's head width, the attention grid's `d` it is read at.
+    pub attn_head_dim: u32,
     /// Recurrent state elements a nanosecond; read only where the model
     /// carries recurrent state.
     pub scan_elements_per_ns: f64,
@@ -205,7 +209,7 @@ impl FireEstimate {
                 tokens * keys * self.attn_flops_per_row_key,
                 // The rate at the keys a row attends: one at a decode lane,
                 // the curve's narrowest point.
-                profile::fire::interpolate(&self.attn_by_keys, keys as u32)
+                profile::fire::flops_at(&self.attn_grid, keys as u32, self.attn_head_dim)
                     .unwrap_or(f64::INFINITY),
             ),
             kv: over(keys_read * self.kv_bytes_per_key, self.bytes_per_ns),
@@ -501,7 +505,8 @@ mod tests {
     fn estimate(fixed_ns: u64, per_token_ns: f64) -> FireEstimate {
         FireEstimate {
             flops_grid: vec![(1, 1, 1.0)],
-            attn_by_keys: Vec::new(),
+            attn_grid: Vec::new(),
+            attn_head_dim: 0,
             scan_elements_per_ns: 0.0,
             bytes_per_ns: 1.0,
             launch_ns: 0.0,
@@ -679,8 +684,10 @@ mod tests {
             // At depth 64: 1 a ns at 4 rows, 5 at 64: 3 at 16, 4 at 32 (log
             // rows). At depth 256: twice that.
             flops_grid: vec![(4, 64, 1.0), (64, 64, 5.0), (4, 256, 2.0), (64, 256, 10.0)],
-            // 0.25 a ns at one key, 1 at 16 and past.
-            attn_by_keys: vec![(1, 0.25), (16, 1.0)],
+            // At width 8: 0.25 a ns at one key, 1 at 16 and past; at width
+            // 32 twice that.
+            attn_grid: vec![(1, 8, 0.25), (16, 8, 1.0), (1, 32, 0.5), (16, 32, 2.0)],
+            attn_head_dim: 8,
             scan_elements_per_ns: 2.0,
             bytes_per_ns: 4.0,
             launch_ns: 3.0,
@@ -790,6 +797,18 @@ mod tests {
         // 4 keys, halfway from 1 to 16 in log keys: 0.625 a ns.
         let short = RungFacts { keys: 4, ..prompt };
         assert!((e.terms(&short).attention - 8.0 * 4.0 * 0.5 / 0.625).abs() < 1e-9);
+        // A model of 32-wide heads reads the grid at its width: 2 a ns at 16
+        // keys, half the time; one of 16, halfway in log width, 1.5.
+        let wide = FireEstimate {
+            attn_head_dim: 32,
+            ..e.clone()
+        };
+        assert_eq!(wide.terms(&prompt).attention, 32.0);
+        let mid = FireEstimate {
+            attn_head_dim: 16,
+            ..e
+        };
+        assert!((mid.terms(&prompt).attention - 64.0 / 1.5).abs() < 1e-9);
         assert_eq!(t.kv, 32.0);
     }
 

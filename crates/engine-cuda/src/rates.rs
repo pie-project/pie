@@ -34,7 +34,9 @@
 //! Index and page tables, gates, outputs and workspace stay as laid.
 
 #[cfg_attr(not(feature = "device"), allow(unused_imports))]
-use engine::rates::{ATTN_KEYS, ATTN_SHAPE, DEPTHS, LATTICE_ROWS, SCAN_SHAPE, weights_at};
+use engine::rates::{
+    ATTN_DIMS, ATTN_KEYS, ATTN_SHAPE, DEPTHS, LATTICE_ROWS, SCAN_SHAPE, weights_at,
+};
 use profile::fire::Rates;
 
 /// The kv cache's page, as a served load pages it.
@@ -256,9 +258,15 @@ mod on_device {
         let mut held = Vec::new();
         let random = Random::new(stream)?;
         let grid = gemm(device.ctx(), &clock, &random, &mut held)?;
-        let mut attn = Vec::with_capacity(ATTN_KEYS.len());
-        for keys in ATTN_KEYS {
-            attn.push((keys, attention(&device, &clock, &random, &mut held, keys)?));
+        let mut attn = Vec::with_capacity(ATTN_KEYS.len() * ATTN_DIMS.len());
+        for d in ATTN_DIMS {
+            for keys in ATTN_KEYS {
+                attn.push((
+                    keys,
+                    d,
+                    attention(&device, &clock, &random, &mut held, keys, d)?,
+                ));
+            }
         }
         let scan = scan(device.ctx(), &clock, &random, &mut held)?;
         let bytes = copy(stream, &clock)?;
@@ -266,7 +274,7 @@ mod on_device {
         device.synchronize().map_err(say("the device"))?;
         Ok(Rates {
             bf16_flops_per_ns_by_rows_and_depth: Some(grid),
-            attn_flops_per_ns_by_keys: Some(attn),
+            attn_flops_per_ns_by_keys_and_dim: Some(attn),
             scan_elements_per_ns: Some(scan),
             bytes_per_ns: Some(bytes),
             launch_ns: Some(launch),
@@ -326,9 +334,10 @@ mod on_device {
         random: &Random,
         held: &mut Vec<Buffer>,
         keys_n: u32,
+        head_dim: u32,
     ) -> Result<f64, String> {
         let ctx = device.ctx();
-        let at = ATTN_SHAPE.at(keys_n);
+        let at = ATTN_SHAPE.at(keys_n).with_dim(head_dim);
         // One sequence attending its own keys, written before the attention.
         let (rows, d) = (at.rows, at.head_dim);
         let (q_heads, kv_heads) = (at.q_heads, at.kv_heads);

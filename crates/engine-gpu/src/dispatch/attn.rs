@@ -98,7 +98,7 @@ impl<B: Backend> Run<'_, B> {
             names.join();
             return Ok(());
         }
-        if q.rows / self.requests().max(1) >= self.tuning().sdpa_tile_rows_per_request() {
+        if self.tuning().sdpa_tiles(q.rows / self.requests().max(1)) {
             tiled()
         } else {
             walked()

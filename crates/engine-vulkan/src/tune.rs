@@ -350,6 +350,66 @@ fn check_estimate(
                 share(&["sdpa", "attn_"]) / 1e6,
                 estimated / 1e6
             ));
+            // The rates' attention micro-fire at this fire's shape (its rows
+            // attending themselves at the model's head width), dissected the
+            // same way, so a kernel the two do not share shows.
+            if form == "replayed" && weighed.estimate.attn_head_dim > 0 {
+                let served: Vec<String> = rows
+                    .iter()
+                    .filter(|(name, ..)| name.contains("sdpa"))
+                    .map(|(name, ns, fires)| {
+                        let groups: Vec<String> = shapes
+                            .iter()
+                            .filter(|s| s.entrypoint == name.as_str())
+                            .map(|s| format!("{:?}", s.groups))
+                            .take(1)
+                            .collect();
+                        format!(
+                            "{name} groups {} {:.3} ms a dispatch",
+                            groups.join(" "),
+                            *ns as f64 / 1e6 / (*fires).max(1) as f64
+                        )
+                    })
+                    .collect();
+                let shape = engine::rates::ATTN_SHAPE
+                    .at(width)
+                    .with_dim(weighed.estimate.attn_head_dim);
+                crate::encode::capture_shapes(true);
+                crate::encode::reset_kernel_profile();
+                let rate = crate::rates::attention_rate(&shell.device, &shell.tuning, shape);
+                crate::encode::capture_shapes(false);
+                let micro_shapes = crate::encode::take_shapes();
+                let micro: Vec<String> = crate::encode::kernel_profile()
+                    .iter()
+                    .filter(|(name, ..)| name.contains("sdpa"))
+                    .map(|(name, ns, fires)| {
+                        let groups: Vec<String> = micro_shapes
+                            .iter()
+                            .filter(|s| s.entrypoint == name.as_str())
+                            .map(|s| format!("{:?}", s.groups))
+                            .take(1)
+                            .collect();
+                        format!(
+                            "{name} groups {} {:.3} ms a dispatch",
+                            groups.join(" "),
+                            *ns as f64 / 1e6 / (*fires).max(1) as f64
+                        )
+                    })
+                    .collect();
+                out.push_str(&format!(
+                    "  sdpa, served: {}\n  sdpa, the rates' micro-fire at {} rows x {} keys, d \
+                     {} ({}): {}\n",
+                    served.join("; "),
+                    shape.rows,
+                    shape.keys,
+                    shape.head_dim,
+                    match rate {
+                        Ok(r) => format!("{:.1} TFLOP/s", r / 1e3),
+                        Err(e) => format!("refused: {e}"),
+                    },
+                    micro.join("; ")
+                ));
+            }
             out.push_str(&format!(
                 "  fused matmul dispatches (swiglu, glu, a matmul with its epilogue): {:.3} ms\n",
                 share(&["swiglu", "matmul_glu", "fused"]) / 1e6
@@ -713,7 +773,7 @@ fn rates(base: &Profile, say: &mut dyn FnMut(&str)) -> Result<profile::fire::Rat
     say(&format!(
         "[rates]: attention {:.1} TFLOP/s, scan {:.2} G state elements/s, {:.0} GB/s, launch \
          {:.2} us",
-        rates.attn_at(16384).unwrap_or(0.0) / 1e3,
+        rates.attn_at(16384, 128).unwrap_or(0.0) / 1e3,
         rates.scan_elements_per_ns.unwrap_or(0.0),
         rates.bytes_per_ns.unwrap_or(0.0),
         rates.launch_ns.unwrap_or(0) as f64 / 1e3

@@ -916,7 +916,7 @@ api = 1
 device = "Apple M9"
 [rates]
 bf16_flops_per_ns_by_rows_and_depth = [[16, 4096, 5000.0], [4096, 4096, 50000]]  # 50 TFLOP/s wide
-attn_flops_per_ns_by_keys = [[2048, 20000.0]]
+attn_flops_per_ns_by_keys_and_dim = [[2048, 128, 20000.0]]
 scan_elements_per_ns = 3000.0
 bytes_per_ns = 400           # 400 GB/s
 "#;
@@ -949,7 +949,7 @@ fn a_device_file_states_its_rates_and_a_layer_above_replaces_them() {
                 (16, 4096, 5000.0),
                 (4096, 4096, 50000.0)
             ]),
-            attn_flops_per_ns_by_keys: Some(vec![(2048, 20000.0)]),
+            attn_flops_per_ns_by_keys_and_dim: Some(vec![(2048, 128, 20000.0)]),
             scan_elements_per_ns: Some(3000.0),
             bytes_per_ns: Some(400.0),
             launch_ns: None,
@@ -1031,13 +1031,19 @@ fn rates_are_refused_where_they_do_not_read_and_fire_times_are_no_profiles() {
             "`launch_ns`, not `attn_flops_per_ns`",
         ),
         (
-            "[rates]\nattn_flops_per_ns_by_keys = [[2048, 2.0], [512, 1.0]]\n",
-            "`rates.attn_flops_per_ns_by_keys` is a non-empty list of [keys, flops a ns] pairs, \
-             ascending in keys, not",
+            "[rates]\nattn_flops_per_ns_by_keys = [[2048, 2.0]]\n",
+            "`launch_ns`, not `attn_flops_per_ns_by_keys`",
         ),
         (
-            "[rates]\nattn_flops_per_ns_by_keys = []\n",
-            "ascending in keys, not an empty list",
+            "[rates]\nattn_flops_per_ns_by_keys_and_dim = [[512, 128, 1.0], [2048, 128, \
+             2.0], [512, 256, 3.0]]\n",
+            "`rates.attn_flops_per_ns_by_keys_and_dim` is a full grid of [keys, head width, \
+             flops a ns], every head width at every key count, each rate positive, not 3 points \
+             that leave a hole or state a point twice",
+        ),
+        (
+            "[rates]\nattn_flops_per_ns_by_keys_and_dim = []\n",
+            "each rate positive, not an empty list",
         ),
         (
             "[rates]\nscan_elements_per_ns = 0\n",

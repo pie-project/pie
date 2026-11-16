@@ -20,9 +20,11 @@
 //! state the device idled into, not the kernel. The counts that turn the
 //! times into rates are [`engine::rates`]'.
 
+use engine::rates::{
+    ATTN_DIMS, ATTN_KEYS, ATTN_SHAPE, AttnShape, DEPTHS, LATTICE_ROWS, SCAN_SHAPE,
+};
 use kernels_metal::linear::gemm;
 use kernels_metal::tensor::{RaggedTensor, RecurrentPool};
-use engine::rates::{ATTN_KEYS, ATTN_SHAPE, AttnShape, DEPTHS, LATTICE_ROWS, SCAN_SHAPE};
 use kernels_metal::{KvPool, PrefillPlan, StateMap, Tensor, Tuning, attn, ssm};
 use poem_ir::Dtype;
 use profile::fire::Rates;
@@ -38,7 +40,6 @@ const FRAME_SECONDS: f64 = 0.020;
 
 /// The most of one measurement a timed frame repeats.
 const MAX_REPEATS: u32 = 512;
-
 
 fn median(mut times: Vec<f64>) -> f64 {
     times.sort_by(f64::total_cmp);
@@ -71,7 +72,8 @@ struct Bench<'a> {
 
 impl Bench<'_> {
     fn buffer(&self, bytes: &[u8]) -> Result<Buffer, String> {
-        let mut b = Buffer::zeroed(self.device, bytes.len().max(4) as u64).map_err(|e| e.to_string())?;
+        let mut b =
+            Buffer::zeroed(self.device, bytes.len().max(4) as u64).map_err(|e| e.to_string())?;
         b.write(0, bytes).map_err(|e| e.to_string())?;
         Ok(b)
     }
@@ -137,14 +139,25 @@ impl Bench<'_> {
         // memory, and one weight repeated would sit in the system cache,
         // by a share that changes run to run (2x at m = 16 on an M5 Pro).
         let seconds = self.timed(&|sink, at_k| {
-            gemm::matmul(sink, self.tuning, at, weights[at_k as usize % weights.len()], yt)
+            gemm::matmul(
+                sink,
+                self.tuning,
+                at,
+                weights[at_k as usize % weights.len()],
+                yt,
+            )
         })?;
         Ok(engine::rates::gemm_flops(m, k) / (seconds * 1e9))
     }
 
     fn attention_flops(&self, shape: AttnShape) -> Result<f64, String> {
-        let (rows, keys, q_heads, kv_heads, d) =
-            (shape.rows, shape.keys, shape.q_heads, shape.kv_heads, shape.head_dim);
+        let (rows, keys, q_heads, kv_heads, d) = (
+            shape.rows,
+            shape.keys,
+            shape.q_heads,
+            shape.kv_heads,
+            shape.head_dim,
+        );
         const PAGE: u32 = 16;
         let pages = keys.div_ceil(PAGE);
         let slots = pages * PAGE;
@@ -192,7 +205,19 @@ impl Bench<'_> {
         let o = self.tensor(&out, rows, q_heads * d, Dtype::Bf16)?;
         let scale = 1.0 / (d as f32).sqrt();
         let seconds = self.timed(&|sink, _| {
-            attn::arbiter::prefill(sink, q, &plan, &pool, None, d, kv_heads, scale, o, 1, self.tuning)
+            attn::arbiter::prefill(
+                sink,
+                q,
+                &plan,
+                &pool,
+                None,
+                d,
+                kv_heads,
+                scale,
+                o,
+                1,
+                self.tuning,
+            )
         })?;
         Ok(engine::rates::attn_flops(shape) / (seconds * 1e9))
     }
@@ -323,25 +348,36 @@ pub fn measure(
         let tensors: Vec<Tensor> = weights.iter().map(|(t, _)| *t).collect();
         for m in LATTICE_ROWS {
             let rate = bench.matmul_flops(m, k, &tensors)?;
-            say(&format!("  bf16 matmul {m} x {k} x {k}: {:.2} TFLOP/s", rate / 1e3));
+            say(&format!(
+                "  bf16 matmul {m} x {k} x {k}: {:.2} TFLOP/s",
+                rate / 1e3
+            ));
             grid.push((m, k, rate));
         }
     }
-    let mut keys_curve = Vec::with_capacity(ATTN_KEYS.len());
-    for keys in ATTN_KEYS {
-        let rate = bench.attention_flops(ATTN_SHAPE.at(keys))?;
-        say(&format!("  prefill attention, {keys} rows over {keys} keys: {:.2} TFLOP/s", rate / 1e3));
-        keys_curve.push((keys, rate));
+    let mut keys_curve = Vec::with_capacity(ATTN_KEYS.len() * ATTN_DIMS.len());
+    for (d, keys) in ATTN_DIMS
+        .iter()
+        .flat_map(|&d| ATTN_KEYS.iter().map(move |&keys| (d, keys)))
+    {
+        let rate = bench.attention_flops(ATTN_SHAPE.at(keys).with_dim(d))?;
+        say(&format!(
+            "  prefill attention, {keys} rows over {keys} keys, d {d}: {:.2} TFLOP/s",
+            rate / 1e3
+        ));
+        keys_curve.push((keys, d, rate));
     }
     let scan = bench.scan_elements()?;
-    say(&format!("  gated-delta scan and its conv: {scan:.1} state elements a ns"));
+    say(&format!(
+        "  gated-delta scan and its conv: {scan:.1} state elements a ns"
+    ));
     let bytes = bench.bytes_per_ns()?;
     say(&format!("  256 MiB blit: {bytes:.1} GB/s read and write"));
     let launch = bench.launch_ns()?;
     say(&format!("  launch: {launch} ns a dispatch"));
     Ok(Rates {
         bf16_flops_per_ns_by_rows_and_depth: Some(grid),
-        attn_flops_per_ns_by_keys: Some(keys_curve),
+        attn_flops_per_ns_by_keys_and_dim: Some(keys_curve),
         scan_elements_per_ns: Some(scan),
         bytes_per_ns: Some(bytes),
         launch_ns: Some(launch),

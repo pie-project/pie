@@ -26,3 +26,15 @@ pub fn gemm_rate(
     let timer = |frame: Frame| Ok((None, (frame.commit_timed()? * 1e9) as u64));
     engine_gpu::rates::gemm_rate::<Api>(device, tuning.gemm(tier), &timer, mnk)
 }
+
+/// The attention rate of `device` at `shape`, through the kernel a served
+/// fire takes there ([`engine_gpu::rates::attention_rate`]).
+pub fn attention_rate(
+    device: &Context,
+    tuning: &crate::tuning::Tuning,
+    shape: engine::rates::AttnShape,
+) -> Result<f64> {
+    let tier = <Api as engine_gpu::serve::Serve>::tier(device);
+    let timer = |frame: Frame| Ok((None, (frame.commit_timed()? * 1e9) as u64));
+    engine_gpu::rates::attention_rate::<Api, _>(device, tuning, tier, &timer, shape)
+}

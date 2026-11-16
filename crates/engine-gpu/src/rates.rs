@@ -13,7 +13,9 @@
 //!   `m x k x k`, each fire reading the next of `engine::rates::weights_at(k)`
 //!   weight planes (past the last-level cache), for the matmul grid;
 //! - its prefill attention at `engine::rates::ATTN_SHAPE`'s heads over each
-//!   `engine::rates::ATTN_KEYS`, for the attention curve;
+//!   `engine::rates::ATTN_KEYS` and head width of `engine::rates::ATTN_DIMS`,
+//!   through the kernel a served fire selects at that shape, for the
+//!   attention grid;
 //! - its chunked gated-delta scan, the causal conv before it, at
 //!   `engine::rates::SCAN_SHAPE`, for the scan rate;
 //! - a buffer copy of [`COPY_BYTES`], for bytes a nanosecond;
@@ -28,8 +30,8 @@
 //! biases it.
 
 use engine::rates::{
-    ATTN_KEYS, ATTN_SHAPE, DEPTHS, LATTICE_ROWS, SCAN_SHAPE, attn_flops, gemm_flops, scan_elements,
-    weights_at,
+    ATTN_DIMS, ATTN_KEYS, ATTN_SHAPE, DEPTHS, LATTICE_ROWS, SCAN_SHAPE, attn_flops, gemm_flops,
+    scan_elements, weights_at,
 };
 use kernels_slang::{KvPool, RaggedTensor, Tensor};
 use poem_ir::Dtype;
@@ -177,17 +179,19 @@ pub fn measure<B: Serve, T: Tactics + ?Sized>(
 ) -> Result<Rates> {
     let mut rig = Rig::<B>::new(device);
     let grid = grid(&mut rig, tactics.gemm(tier), timer)?;
-    let sdpa = tactics.sdpa(tier, ATTN_SHAPE.head_dim);
-    let mut attn = Vec::with_capacity(ATTN_KEYS.len());
-    for keys in ATTN_KEYS {
-        attn.push((keys, attention(&mut rig, sdpa, timer, keys)?));
-        rig.release();
+    let mut attn = Vec::with_capacity(ATTN_KEYS.len() * ATTN_DIMS.len());
+    for d in ATTN_DIMS {
+        for keys in ATTN_KEYS {
+            let shape = ATTN_SHAPE.at(keys).with_dim(d);
+            attn.push((keys, d, attention(&mut rig, tactics, tier, timer, shape)?));
+            rig.release();
+        }
     }
     let scan = scan(&mut rig, tactics.recurrent(), timer)?;
     let (bytes_per_ns, launch_ns) = copy_and_launch(&mut rig, tactics.gemm(tier), timer)?;
     Ok(Rates {
         bf16_flops_per_ns_by_rows_and_depth: Some(grid),
-        attn_flops_per_ns_by_keys: Some(attn),
+        attn_flops_per_ns_by_keys_and_dim: Some(attn),
         scan_elements_per_ns: Some(scan),
         bytes_per_ns: Some(bytes_per_ns),
         launch_ns: Some(launch_ns),
@@ -232,16 +236,19 @@ fn grid<B: Serve>(
     Ok(out)
 }
 
-/// The prefill attention's rate at [`ATTN_SHAPE`]'s heads over `keys`: one
-/// sequence of `keys` rows attending itself, causal, its kv laid in pages of
-/// [`PAGE`].
-fn attention<B: Serve>(
+/// The prefill attention's rate at `s`: one sequence of `s.rows` rows
+/// attending itself, causal, its kv laid in pages of [`PAGE`], through the
+/// kernel a served fire takes at that shape (the tactic at its head width,
+/// tiled or walked by [`Tactics::sdpa_tiles`]).
+fn attention<B: Serve, T: Tactics + ?Sized>(
     rig: &mut Rig<'_, B>,
-    tactic: kernels_slang::attn::sdpa::Tactic,
+    tactics: &T,
+    tier: kernels_slang::Tier,
     timer: Timer<'_, B>,
-    keys: u32,
+    s: engine::rates::AttnShape,
 ) -> Result<f64> {
-    let s = ATTN_SHAPE.at(keys);
+    let tactic = tactics.sdpa(tier, s.head_dim);
+    let tiled = tactics.sdpa_tiles(s.rows);
     let kv_width = s.kv_heads * s.head_dim;
     let q = rig.zeros(s.rows, s.q_heads * s.head_dim, Dtype::Bf16)?;
     let o = rig.zeros(s.rows, s.q_heads * s.head_dim, Dtype::Bf16)?;
@@ -273,9 +280,15 @@ fn attention<B: Serve>(
     };
     let scale = 1.0 / (s.head_dim as f32).sqrt();
     let ns = rig.each(timer, &|sink| {
-        kernels_slang::attn::sdpa::prefill(
-            sink, tactic, q, &tables, &pool, None, s.head_dim, scale, o, None,
-        )
+        if tiled {
+            kernels_slang::attn::sdpa::prefill(
+                sink, tactic, q, &tables, &pool, None, s.head_dim, scale, o, None,
+            )
+        } else {
+            kernels_slang::attn::sdpa::decode(
+                sink, tactic, q, &tables, &pool, None, s.head_dim, scale, o, None, None,
+            )
+        }
         .map_err(fault("rates: attention"))
     })?;
     Ok(attn_flops(s) / ns as f64)
@@ -384,6 +397,20 @@ fn copy_and_launch<B: Serve>(
     let copy_ns = with_copy.saturating_sub(alone).max(1);
     // Every byte copied is read and written.
     Ok((2.0 * copy as f64 / copy_ns as f64, launch))
+}
+
+/// The attention rate of `device` at `shape` through the kernel a served
+/// fire takes there ([`attention`]'s one micro-fire): a check of the
+/// estimate times it beside a served fire's attention at the same shape.
+pub fn attention_rate<B: Serve, T: Tactics + ?Sized>(
+    device: &B::Context,
+    tactics: &T,
+    tier: kernels_slang::Tier,
+    timer: Timer<'_, B>,
+    shape: engine::rates::AttnShape,
+) -> Result<f64> {
+    let mut rig = Rig::<B>::new(device);
+    attention(&mut rig, tactics, tier, timer, shape)
 }
 
 /// The bf16 matmul rate of `device` at `(m, n, k)` under `tactic`: a check

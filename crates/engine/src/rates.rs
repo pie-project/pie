@@ -9,10 +9,12 @@
 //! - `bf16_flops_per_ns_by_rows_and_depth`: a bf16 matmul `m x k x k` (`m`
 //!   rows, `k` columns, depth `k`) at each `m` of [`LATTICE_ROWS`] and each
 //!   `k` of [`DEPTHS`], [`gemm_flops`] a matmul over its time.
-//! - `attn_flops_per_ns_by_keys`: the backend's prefill attention at
-//!   [`ATTN_SHAPE`]'s heads, one sequence of `keys` rows attending itself at
-//!   each `keys` of [`ATTN_KEYS`] ([`AttnShape::at`]), its pages laid in the
-//!   pool in [`attn_page_order`], [`attn_flops`] over its time.
+//! - `attn_flops_per_ns_by_keys_and_dim`: the backend's prefill attention
+//!   at [`ATTN_SHAPE`]'s heads, one sequence of `keys` rows attending itself
+//!   at each `keys` of [`ATTN_KEYS`] and head width `d` of [`ATTN_DIMS`]
+//!   ([`AttnShape::at`], [`AttnShape::with_dim`]), its pages laid in the pool
+//!   in [`attn_page_order`], through the attention kernel serving selects at
+//!   that shape, [`attn_flops`] over its time.
 //! - `scan_elements_per_ns`: the backend's prefill gated-delta scan and the
 //!   causal conv before it at [`SCAN_SHAPE`], [`scan_elements`] over the two
 //!   together's time.
@@ -153,7 +155,19 @@ pub fn attn_page_order(pages: u32) -> Vec<u32> {
         .collect()
 }
 
+/// The head widths the attention grid is measured at: the widths of the
+/// models served (64 for the small and older ones, 128 for most, 256 for
+/// Qwen3.5's and Gemma's global layers), since a kernel's rate a flop moves
+/// with the width its tiles hold.
+pub const ATTN_DIMS: [u32; 3] = [64, 128, 256];
+
 impl AttnShape {
+    /// This shape's heads, each `head_dim` wide.
+    #[must_use]
+    pub fn with_dim(self, head_dim: u32) -> AttnShape {
+        AttnShape { head_dim, ..self }
+    }
+
     /// This shape's heads over one sequence of `keys` rows attending itself.
     #[must_use]
     pub fn at(self, keys: u32) -> AttnShape {
@@ -241,12 +255,11 @@ pub fn provenance(backend: &str, how: &str) -> (&'static str, String) {
     let text = format!(
         "pie tune {backend} --rates on {} (pie {}): {how}; at engine::rates' lattice (matmul \
          m x k x k, m 16..8192, k 1024..16384; attention keys x keys, keys 512..16384, {}/{} \
-         heads of {}; scan {} tokens, {}/{} heads of {}x{}, conv {})",
+         heads of 64..256; scan {} tokens, {}/{} heads of {}x{}, conv {})",
         today(),
         env!("CARGO_PKG_VERSION"),
         ATTN_SHAPE.q_heads,
         ATTN_SHAPE.kv_heads,
-        ATTN_SHAPE.head_dim,
         SCAN_SHAPE.tokens,
         SCAN_SHAPE.k_heads,
         SCAN_SHAPE.v_heads,
@@ -313,6 +326,12 @@ mod tests {
         }
         assert_eq!(&attn_page_order(32)[..4], &[0, 15, 30, 13]);
         assert_eq!(ATTN_SHAPE.at(512).rows, 512);
+        assert!(ATTN_DIMS.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(ATTN_SHAPE.at(512).with_dim(256).head_dim, 256);
+        assert_eq!(
+            attn_flops(ATTN_SHAPE.at(512).with_dim(256)),
+            2.0 * attn_flops(ATTN_SHAPE.at(512).with_dim(128))
+        );
         assert_eq!(attn_flops(ATTN_SHAPE.at(512)), 4.0 * 512.0 * 512.0 * 2048.0);
     }
 
@@ -342,7 +361,7 @@ mod tests {
     fn the_writer_writes_what_the_profile_reads() {
         let rates = profile::fire::Rates {
             bf16_flops_per_ns_by_rows_and_depth: Some(vec![(16, 1024, 100.0), (8192, 1024, 900.5)]),
-            attn_flops_per_ns_by_keys: Some(vec![(512, 40.0), (16384, 50.0)]),
+            attn_flops_per_ns_by_keys_and_dim: Some(vec![(512, 128, 40.0), (16384, 128, 50.0)]),
             scan_elements_per_ns: Some(7.0),
             bytes_per_ns: Some(800.0),
             launch_ns: Some(3500),
@@ -351,7 +370,7 @@ mod tests {
             tuned(&rates),
             "[rates]\nbf16_flops_per_ns_by_rows_and_depth = [\n  [16, 1024, 100.0],\n  [8192, 1024, \
              900.5],\n]\n\
-             attn_flops_per_ns_by_keys = [[512, 40.0], [16384, 50.0]]\nscan_elements_per_ns = 7.0\nbytes_per_ns = 800.0\n\
+             attn_flops_per_ns_by_keys_and_dim = [\n  [512, 128, 40.0],\n  [16384, 128, 50.0],\n]\nscan_elements_per_ns = 7.0\nbytes_per_ns = 800.0\n\
              launch_ns = 3500\n"
         );
         let (key, text) = provenance("vulkan", "the matmul through Coopmat");

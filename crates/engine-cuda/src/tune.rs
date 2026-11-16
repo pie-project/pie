@@ -48,7 +48,10 @@ pub fn rates(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Rated
         .bf16_flops_per_ns_by_rows_and_depth
         .clone()
         .unwrap_or_default();
-    let attn = r.attn_flops_per_ns_by_keys.clone().unwrap_or_default();
+    let attn = r
+        .attn_flops_per_ns_by_keys_and_dim
+        .clone()
+        .unwrap_or_default();
     for &k in &engine::rates::DEPTHS {
         let at = |rows: u32| {
             grid.iter()
@@ -64,8 +67,8 @@ pub fn rates(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Rated
     say(&format!(
         "[rates]: attention {:.1} TFLOP/s at 512 keys to {:.1} at 16384, scan {:.0} G \
          elements/s, {:.0} GB/s, launch {} ns",
-        r.attn_at(512).unwrap_or(0.0) / 1e3,
-        r.attn_at(16384).unwrap_or(0.0) / 1e3,
+        r.attn_at(512, 128).unwrap_or(0.0) / 1e3,
+        r.attn_at(16384, 128).unwrap_or(0.0) / 1e3,
         r.scan_elements_per_ns.unwrap_or(0.0),
         r.bytes_per_ns.unwrap_or(0.0),
         r.launch_ns.unwrap_or(0),
@@ -75,7 +78,9 @@ pub fn rates(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Rated
         bf16_flops_per_ns_by_rows_and_depth: Some(
             grid.iter().map(|&(m, k, v)| (m, k, tenth(v))).collect(),
         ),
-        attn_flops_per_ns_by_keys: Some(attn.iter().map(|&(k, v)| (k, tenth(v))).collect()),
+        attn_flops_per_ns_by_keys_and_dim: Some(
+            attn.iter().map(|&(k, d, v)| (k, d, tenth(v))).collect(),
+        ),
         scan_elements_per_ns: r.scan_elements_per_ns.map(tenth),
         bytes_per_ns: r.bytes_per_ns.map(tenth),
         ..r

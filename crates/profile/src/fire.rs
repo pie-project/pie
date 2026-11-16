@@ -13,7 +13,8 @@
 //!   [16, 1024, 600.0], [8192, 1024, 15000.0],
 //!   [16, 4096, 1900.0], [8192, 4096, 26000.0],
 //! ]
-//! attn_flops_per_ns_by_keys = [[512, 6000.0], [16384, 11000.0]]  # prefill attention by keys
+//! # prefill attention flops a ns by keys and head width: a full grid
+//! attn_flops_per_ns_by_keys_and_dim = [[512, 128, 6000.0], [16384, 128, 11000.0]]
 //! scan_elements_per_ns = 1500.0    # recurrent state elements a ns (scan + conv)
 //! bytes_per_ns = 726.0             # device memory bytes a ns (GB/s)
 //! launch_ns = 3500                 # a dispatch's cost beside its work
@@ -28,10 +29,11 @@ pub struct Rates {
     /// `(m, k, rate)` over a full grid of rows by depths, ordered by depth
     /// then rows ([`Rates::flops_at`]).
     pub bf16_flops_per_ns_by_rows_and_depth: Option<Vec<(u32, u32, f64)>>,
-    /// Attention flops a nanosecond by the keys a row attends: `(keys,
-    /// rate)`, non-empty and strictly ascending in keys (the count the
-    /// estimate's attention term takes, over a prefill's rows and keys).
-    pub attn_flops_per_ns_by_keys: Option<Vec<(u32, f64)>>,
+    /// Attention flops a nanosecond by the keys a row attends and the head
+    /// width: `(keys, d, rate)` over a full grid of keys by widths, ordered
+    /// by width then keys ([`grid`]; the count the estimate's attention
+    /// term takes, over a prefill's rows and keys).
+    pub attn_flops_per_ns_by_keys_and_dim: Option<Vec<(u32, u32, f64)>>,
     /// Recurrent state elements a nanosecond: the scan's state elements a
     /// token, the conv beside it folded in.
     pub scan_elements_per_ns: Option<f64>,
@@ -49,9 +51,9 @@ impl Rates {
             bf16_flops_per_ns_by_rows_and_depth: self
                 .bf16_flops_per_ns_by_rows_and_depth
                 .or(below.bf16_flops_per_ns_by_rows_and_depth),
-            attn_flops_per_ns_by_keys: self
-                .attn_flops_per_ns_by_keys
-                .or(below.attn_flops_per_ns_by_keys),
+            attn_flops_per_ns_by_keys_and_dim: self
+                .attn_flops_per_ns_by_keys_and_dim
+                .or(below.attn_flops_per_ns_by_keys_and_dim),
             scan_elements_per_ns: self.scan_elements_per_ns.or(below.scan_elements_per_ns),
             bytes_per_ns: self.bytes_per_ns.or(below.bytes_per_ns),
             launch_ns: self.launch_ns.or(below.launch_ns),
@@ -73,11 +75,11 @@ impl Rates {
         )
     }
 
-    /// The attention rate at `keys` ([`interpolate`]). `None` where no
-    /// curve is stated.
+    /// The attention rate at `keys` and head width `d` ([`flops_at`]: in
+    /// `log keys` and `log d`, clamped). `None` where no grid is stated.
     #[must_use]
-    pub fn attn_at(&self, keys: u32) -> Option<f64> {
-        interpolate(self.attn_flops_per_ns_by_keys.as_deref()?, keys)
+    pub fn attn_at(&self, keys: u32, d: u32) -> Option<f64> {
+        flops_at(self.attn_flops_per_ns_by_keys_and_dim.as_deref()?, keys, d)
     }
 
     /// The grid's fastest point: the rate a compute-bound matmul reaches.
@@ -101,9 +103,12 @@ impl Rates {
             }
             let _ = writeln!(out, "]");
         }
-        if let Some(curve) = &self.attn_flops_per_ns_by_keys {
-            let points: Vec<String> = curve.iter().map(|(k, r)| format!("[{k}, {r:?}]")).collect();
-            let _ = writeln!(out, "attn_flops_per_ns_by_keys = [{}]", points.join(", "));
+        if let Some(grid) = &self.attn_flops_per_ns_by_keys_and_dim {
+            let _ = writeln!(out, "attn_flops_per_ns_by_keys_and_dim = [");
+            for (keys, d, r) in grid {
+                let _ = writeln!(out, "  [{keys}, {d}, {r:?}],");
+            }
+            let _ = writeln!(out, "]");
         }
         if let Some(v) = self.scan_elements_per_ns {
             let _ = writeln!(out, "scan_elements_per_ns = {v:?}");
@@ -286,16 +291,29 @@ mod tests {
     }
 
     #[test]
-    fn the_attention_curve_interpolates_in_log_keys_and_clamps() {
+    fn the_attention_grid_interpolates_in_log_keys_and_log_width_and_clamps() {
         let rates = Rates {
-            attn_flops_per_ns_by_keys: Some(vec![(512, 100.0), (2048, 300.0), (8192, 400.0)]),
+            attn_flops_per_ns_by_keys_and_dim: grid(vec![
+                (512, 128, 100.0),
+                (2048, 128, 300.0),
+                (512, 256, 200.0),
+                (2048, 256, 600.0),
+            ]),
             ..Rates::default()
         };
-        assert_eq!(rates.attn_at(1), Some(100.0), "a decode lane's one key");
-        assert!((rates.attn_at(1024).unwrap() - 200.0).abs() < 1e-9);
-        assert_eq!(rates.attn_at(2048), Some(300.0));
-        assert_eq!(rates.attn_at(1 << 20), Some(400.0));
-        assert_eq!(Rates::default().attn_at(2048), None);
+        assert_eq!(
+            rates.attn_at(1, 128),
+            Some(100.0),
+            "a decode lane's one key"
+        );
+        assert!((rates.attn_at(1024, 128).unwrap() - 200.0).abs() < 1e-9);
+        assert_eq!(rates.attn_at(2048, 256), Some(600.0));
+        // 181 is about halfway from 128 to 256 in log width; a 64-wide
+        // head clamps to the narrowest stated.
+        assert_eq!(rates.attn_at(512, 64), Some(100.0));
+        assert!((rates.attn_at(1024, 256).unwrap() - 400.0).abs() < 1e-9);
+        assert_eq!(rates.attn_at(1 << 20, 1 << 20), Some(600.0));
+        assert_eq!(Rates::default().attn_at(2048, 128), None);
     }
 
     #[test]

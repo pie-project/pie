@@ -37,7 +37,7 @@ pub fn rates(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Outco
     say(&format!(
         "[rates]: attention {:.1} TFLOP/s, scan {:.2} G state elements/s, {:.0} GB/s, launch \
          {:.2} us",
-        r.attn_at(16384).unwrap_or(0.0) / 1e3,
+        r.attn_at(16384, 128).unwrap_or(0.0) / 1e3,
         r.scan_elements_per_ns.unwrap_or(0.0),
         r.bytes_per_ns.unwrap_or(0.0),
         r.launch_ns.unwrap_or(0) as f64 / 1e3

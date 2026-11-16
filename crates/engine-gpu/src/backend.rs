@@ -284,6 +284,13 @@ pub trait Tactics: std::fmt::Debug {
             .0
     }
 
+    /// Whether a prefill attention of `rows_per_request` query rows a
+    /// request runs the tiled kernel (else each row walks as a decode row):
+    /// the one choice a served fire and the rates' micro-fire both make.
+    fn sdpa_tiles(&self, rows_per_request: u32) -> bool {
+        rows_per_request >= self.sdpa_tile_rows_per_request()
+    }
+
     fn sdpa_split_groups(&self) -> u32;
 
     fn sdpa_split_min_keys(&self) -> u32 {

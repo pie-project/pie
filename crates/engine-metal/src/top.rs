@@ -128,6 +128,7 @@ mod tests {
             gemm_shapes: vec![(4096, 4096, 1 << 30)],
             attn_flops_per_row_key: 1 << 10,
             kv_bytes_per_key: 1 << 14,
+            attn_head_dim: 128,
             readout_flops: 0,
             readout_depth: 4096,
             state_elements_per_row: 0,
@@ -172,7 +173,7 @@ mod tests {
         );
         let rated = profile::fire::Rates {
             bf16_flops_per_ns_by_rows_and_depth: Some(vec![(4096, 4096, 5000.0)]),
-            attn_flops_per_ns_by_keys: Some(vec![(2048, 2000.0)]),
+            attn_flops_per_ns_by_keys_and_dim: Some(vec![(2048, 128, 2000.0)]),
             bytes_per_ns: Some(400.0),
             launch_ns: Some(5000),
             ..profile::fire::Rates::default()
