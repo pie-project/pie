@@ -77,7 +77,10 @@ struct TableAt {
 #[derive(Debug, Clone)]
 pub struct Handles {
     pub tokens: Tensor,
+    /// Each row's cache row: what its attention is bounded by.
     pub positions: Tensor,
+    /// Each row's stated position: what rotates it.
+    pub rotations: Tensor,
     pub windows: u32,
     pub page_tables: Vec<TableHandles>,
     pub slot_ids: Tensor,
@@ -150,6 +153,7 @@ pub struct TableHandles {
 pub struct Fire<'a> {
     pub tokens: &'a [i32],
     pub positions: &'a [i32],
+    pub rotations: &'a [i32],
     pub windows: &'a [i32],
     pub slot_ids: &'a [i32],
     pub slot_of_row: &'a [i32],
@@ -357,6 +361,7 @@ pub struct Inputs {
     store: Region,
     tokens: u64,
     positions: u64,
+    rotations: u64,
     windows: u64,
     window_ints: u64,
     row_valid: u64,
@@ -412,7 +417,7 @@ pub fn window_ints(
     let lanes = u64::from(budget.max_lanes);
     let pages = u64::from(budget.max_lanes) * u64::from(paging.pages_per_slot);
     let intervals = (classes * (classes + 1) / 2) as u64;
-    let per_gathered = 3 * rows + page_tables as u64 * (2 * lanes + (lanes + 1) + pages);
+    let per_gathered = 4 * rows + page_tables as u64 * (2 * lanes + (lanes + 1) + pages);
     (intervals + 1 + gathered as u64) * (lanes + 1) + gathered as u64 * per_gathered
 }
 
@@ -455,6 +460,7 @@ impl Inputs {
         };
         let tokens = take(rows * 4);
         let positions = take(rows * 4);
+        let rotations = take(rows * 4);
         let windows = take(window_ints * 4);
         let row_valid = take(rows);
         let slot_ids = take(lanes * width * 4);
@@ -542,6 +548,7 @@ impl Inputs {
             store: Region::unplaced(total, Buffer::zeroed(device, 0)?),
             tokens,
             positions,
+            rotations,
             windows,
             window_ints,
             row_valid,
@@ -673,6 +680,7 @@ impl Inputs {
 
         self.store.write(self.tokens, bytes_of(fire.tokens))?;
         self.store.write(self.positions, bytes_of(fire.positions))?;
+        self.store.write(self.rotations, bytes_of(fire.rotations))?;
         if fire.windows.len() as u64 > self.window_ints {
             return Err(Fault::Ceiling {
                 what: "packed window boundaries",
@@ -1152,6 +1160,12 @@ impl Inputs {
                 handles,
                 self.store.view(),
                 self.store.at(self.positions),
+                rows,
+            )?,
+            rotations: i32s(
+                handles,
+                self.store.view(),
+                self.store.at(self.rotations),
                 rows,
             )?,
             windows: handles.bind(
