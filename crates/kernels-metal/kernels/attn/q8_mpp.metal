@@ -17,7 +17,7 @@ q8_mpp(const device bfloat *q [[buffer(0)]], const device KV *keys [[buffer(1)]]
        const device uint *ptr [[buffer(8)]], constant int &page_size [[buffer(9)]],
        constant int &kv_heads [[buffer(10)]], constant float &scale [[buffer(11)]],
        const device uchar *mask [[buffer(12)]], constant uint &mask_stride [[buffer(13)]],
-       const device uchar *enabled [[buffer(14)]], constant int &window [[buffer(15)]],
+       const device uint *enabled [[buffer(14)]], constant int &window [[buffer(15)]],
        const device bfloat *sinks [[buffer(16)]], constant int &rows [[buffer(17)]],
        device float *lse [[buffer(18)]], const constant ulong &k_page_stride [[buffer(19)]],
        const constant ulong &v_page_stride [[buffer(20)]],
@@ -88,7 +88,7 @@ q8_mpp(const device bfloat *q [[buffer(0)]], const device KV *keys [[buffer(1)]]
     int last = 0, first = 0x7fffffff;
     for (int r = sub; r < end; ++r) {
       const int pos = positions[row0 + r];
-      last = max(last, enabled[row0 + r] == 2 ? int(ptr[req + 1] - ptr[req]) * P - 1 : pos);
+      last = max(last, (enabled[row0 + r] & 3u) == 2 ? int(ptr[req + 1] - ptr[req]) * P - 1 : pos);
       first = min(first, window > 0 ? max(0, pos - window + 1) : 0);
     }
     for (int base = (first / N) * N; base <= last; base += N) {
@@ -125,9 +125,9 @@ q8_mpp(const device bfloat *q [[buffer(0)]], const device KV *keys [[buffer(1)]]
       for (uint r = sg; r < M; r += SG) {
         const int row = row0 + r, pos = row < rows ? positions[row] : 0, kpos = base + lane;
         bool keep = int(r) >= sub && int(r) < end && row < rows && owners[row] == req &&
-                    (enabled[row] == 2 || kpos <= pos) && (window <= 0 || kpos >= pos - window + 1);
-        if (keep && enabled[row])
-          keep = uint(kpos) < mask_stride && mask[ulong(row) * mask_stride + kpos] != 0;
+                    ((enabled[row] & 3u) == 2 || kpos <= pos) && (window <= 0 || kpos >= pos - window + 1);
+        if (keep && (enabled[row] & 3u))
+          keep = pie_mask_admits(mask, mask_stride, enabled[row] >> 2, uint(row), uint(kpos));
         const ulong cell = ulong(lane % P) * kv_heads * W;
         float ks = 1, vs = 1;
         if constexpr (Q8) {
@@ -190,7 +190,7 @@ q8_mpp(const device bfloat *q [[buffer(0)]], const device KV *keys [[buffer(1)]]
       const device bfloat *, const device KV *, const device KV *, device bfloat *,                \
       constant int &, const device int *, const device int *, const device uint *,                 \
       const device uint *, constant int &, constant int &, constant float &, const device uchar *, \
-      constant uint &, const device uchar *, constant int &, const device bfloat *,                \
+      constant uint &, const device uint *, constant int &, const device bfloat *,                 \
       constant int &, device float *, PIE_KV_LAYOUT_TYPES uint2, uint2, uint, uint, uint);
 #define Q8_MPP_LSE(DIM, DIRECT, KV, LSE, NAME) Q8_MPP_PAGE(DIM, DIRECT, KV, LSE, 32, NAME)
 #define Q8_MPP(DIM, DIRECT, KV, NAME) Q8_MPP_LSE(DIM, DIRECT, KV, false, NAME)

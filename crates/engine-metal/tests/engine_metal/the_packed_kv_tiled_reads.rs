@@ -27,6 +27,11 @@ use kernels_metal::attn::{self, PrefillPlan};
 use kernels_metal::{KvPool, RaggedTensor, Tensor};
 use poem_ir::Dtype;
 
+/// A row's mask words, one u32 a row (its enable flag, its boundary 0).
+fn mask_words(v: &[u32]) -> Vec<u8> {
+    v.iter().flat_map(|w| w.to_le_bytes()).collect()
+}
+
 const KV_HEADS: usize = 2;
 const Q_HEADS: usize = 4; // gqa = 2
 const N_KV: usize = 20; // cached key/value tokens (positions 0..N_KV)
@@ -336,14 +341,14 @@ fn build_fires(rig: &mut Rig, head_dim: usize) -> Fires {
     let hreq = rig.i32s(&[0i32; 4]);
     let hindptr = rig.u32s(&[0u32, rows as u32]); // one request owning all rows
 
-    let open_mask = rig.u8s(&[0u8; 4]); // never read while disabled
-    let open_enabled = rig.u8s(&[0u8; 4]); // 0 → full causal, mask off
+    let open_mask = rig.u8s(&mask_words(&[0u32; 4])); // never read while disabled
+    let open_enabled = rig.u8s(&mask_words(&[0u32; 4])); // 0 → full causal, mask off
 
     // A dense all-keep mask, stride N_KV: causal is still enforced by the kernel
     // (kp > q_pos is rejected independently), so an all-ones mask exercises the
     // masked kernel's mask-read path while leaving the attended set = causal.
     let keep_mask = rig.u8s(&[1u8; N_KV * 4]);
-    let keep_enabled = rig.u8s(&[1u8; 4]); // 1 → apply the mask
+    let keep_enabled = rig.u8s(&mask_words(&[1u32; 4])); // 1 → apply the mask
 
     // seeded queries, bf16-rounded
     let q_src: Vec<f32> = (0..(rows * Q_HEADS * head_dim) as u64)
@@ -357,9 +362,9 @@ fn build_fires(rig: &mut Rig, head_dim: usize) -> Fires {
         positions: Tensor::new(hpos, rows as u32, 1, Dtype::I32),
         request_of_token: Tensor::new(hreq, rows as u32, 1, Dtype::I32),
         open_mask: Tensor::new(open_mask, rows as u32, 1, Dtype::U8),
-        open_enabled: Tensor::new(open_enabled, rows as u32, 1, Dtype::U8),
+        open_enabled: Tensor::new(open_enabled, rows as u32, 1, Dtype::U32),
         keep_mask: Tensor::new(keep_mask, rows as u32, N_KV as u32, Dtype::U8),
-        keep_enabled: Tensor::new(keep_enabled, rows as u32, 1, Dtype::U8),
+        keep_enabled: Tensor::new(keep_enabled, rows as u32, 1, Dtype::U32),
         sm_scale: (head_dim as f32).sqrt().recip(),
         rows,
         head_dim,

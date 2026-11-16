@@ -156,6 +156,9 @@ pub struct Seated<'a> {
     pub inputs: &'a [engine::fire::InputFeed],
     pub pages: &'a [u32],
     pub held: Option<u32>,
+    /// The set's committed boundary (`KvDelta::folded`): the lane's mask
+    /// speaks of the keys from it on.
+    pub folded: u32,
     pub mask: Option<&'a Masking>,
     /// A lane with no KV of its own: its mask is over its attention group.
     pub kv_less: bool,
@@ -200,6 +203,7 @@ impl<'a> Seated<'a> {
             inputs: &[],
             pages: &[],
             held: None,
+            folded: 0,
             mask: None,
             kv_less: false,
             adapter: None,
@@ -3893,6 +3897,7 @@ impl Shell {
             masks.push(crate::mask::LaneMask {
                 mask: masking,
                 have,
+                folded: seated.folded.min(have),
                 rows: row.rows,
                 wide: self.wide.contains(row.class as usize),
             });
