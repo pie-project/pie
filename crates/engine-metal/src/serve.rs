@@ -2887,6 +2887,13 @@ impl Shell {
     }
 
     /// Seat `slot`'s state rows, one after another.
+    /// The planes [`Shell::state_bytes`] lays end to end: each state row's
+    /// trace cache index, bytes and dtype.
+    #[must_use]
+    pub fn state_planes(&self) -> Vec<(u32, u64, Dtype)> {
+        self.pools.state_planes()
+    }
+
     pub fn state_bytes(&mut self, slot: u32) -> Result<Vec<u8>> {
         self.drain()?;
         let record = self.pools.record(None, slot)?;

@@ -272,8 +272,96 @@ fn same_state(a: &[u8], b: &[u8]) -> Result<(), String> {
     }
 }
 
-fn assert_same_state(got: &[u8], want: &[u8], what: &str) {
+/// Each state plane `(name, bytes, dtype)` the record lays end to end.
+type Planes = Vec<(String, u64, poem_ir::Dtype)>;
+
+fn planes_of(shell: &Shell) -> Planes {
+    shell
+        .state_planes()
+        .into_iter()
+        .map(|(cache, bytes, dtype)| {
+            let name = match shell.trace().caches.get(cache as usize) {
+                Some(poem_ir::CacheRow::State { name, .. } | poem_ir::CacheRow::Kv { name, .. }) => {
+                    name.clone()
+                }
+                None => format!("cache {cache}"),
+            };
+            (name, bytes, dtype)
+        })
+        .collect()
+}
+
+/// Where `got` and `want` differ, plane by plane: each element read in its
+/// plane's own dtype, how many differ, the largest difference, the plane's
+/// largest value, and the worst difference in ulps of the element's own
+/// value (an element's ulp is the gap to the next float above its
+/// magnitude). Printed only when the states differ past the check.
+fn tell_planes(got: &[u8], want: &[u8], planes: &Planes) {
+    let mut at = 0usize;
+    for (name, bytes, dtype) in planes {
+        let len = *bytes as usize;
+        let (g, w) = (&got[at..at + len], &want[at..at + len]);
+        let read = |b: &[u8]| -> Vec<f32> {
+            match dtype {
+                poem_ir::Dtype::F32 => b
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect(),
+                poem_ir::Dtype::Bf16 => b
+                    .chunks_exact(2)
+                    .map(|c| f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16))
+                    .collect(),
+                _ => Vec::new(),
+            }
+        };
+        let ulp = |v: f32| -> f32 {
+            let m = v.abs().max(f32::MIN_POSITIVE);
+            match dtype {
+                poem_ir::Dtype::Bf16 => {
+                    f32::from_bits(((m.to_bits() >> 16) + 1) << 16) - f32::from_bits((m.to_bits() >> 16) << 16)
+                }
+                _ => f32::from_bits(m.to_bits() + 1) - m,
+            }
+        };
+        let (gv, wv) = (read(g), read(w));
+        let largest = wv.iter().fold(0f32, |a, v| a.max(v.abs()));
+        let (mut apart, mut worst, mut worst_ulps, mut first) = (0usize, 0f32, 0f32, None);
+        let mut worst_at = (0usize, 0f32, 0f32);
+        for (k, (&x, &y)) in gv.iter().zip(&wv).enumerate() {
+            if x.to_bits() == y.to_bits() {
+                continue;
+            }
+            apart += 1;
+            first.get_or_insert(k);
+            let gap = (x - y).abs();
+            if gap > worst {
+                worst_at = (k, x, y);
+            }
+            worst = worst.max(gap);
+            worst_ulps = worst_ulps.max(gap / ulp(y));
+        }
+        if apart > 0 || gv.is_empty() {
+            eprintln!(
+                "plane {name} ({dtype:?}, {len} bytes at byte {at}): {apart} of {} apart, \
+                 max |diff| {worst:e}, max |value| {largest:e}, worst {worst_ulps:.1} ulps of its \
+                 own value, first at element {first:?}; the largest at element {} is {:e} \
+                 against {:e}",
+                gv.len(),
+                worst_at.0,
+                worst_at.1,
+                worst_at.2
+            );
+        }
+        at += len;
+    }
+    if at != got.len() {
+        eprintln!("the planes cover {at} of {} bytes", got.len());
+    }
+}
+
+fn assert_same_state(got: &[u8], want: &[u8], what: &str, planes: &Planes) {
     if let Err(why) = same_state(got, want) {
+        tell_planes(got, want, planes);
         panic!("{what}: {why}");
     }
 }
@@ -299,6 +387,7 @@ fn a_gdn_buffered_fold_is_the_fold_it_replaces() {
 /// answers as alone; and rounds of a two-row window with a rejected row
 /// leave the banks a plain fold of the survivors leaves.
 fn holds_the_contract(mut shell: Shell) {
+    let planes = planes_of(&shell);
     let fold = RsVerb::Fold;
     let tokens = window(11);
     let k = WINDOW as u32;
@@ -356,6 +445,7 @@ fn holds_the_contract(mut shell: Shell) {
         &shell.state_bytes(3).expect("slot 3"),
         &folded_j,
         &format!("a replay truncated at {j} did not leave the banks a fold of {j} leaves"),
+        &planes,
     );
 
     shell.open(4).expect("slot 4 opens");
@@ -366,6 +456,7 @@ fn holds_the_contract(mut shell: Shell) {
         &shell.state_bytes(4).expect("slot 4"),
         &folded_j,
         &format!("the mixed row did not land the fold at row {j}"),
+        &planes,
     );
     let d = spread(&reference[0], &mixed[0]);
     eprintln!("claim 4: mixed row vs folding window, last-row logit spread {d:.4}");
@@ -385,6 +476,7 @@ fn holds_the_contract(mut shell: Shell) {
         &shell.state_bytes(5).expect("slot 5"),
         &folded,
         "replaying A ahead of B did not leave the banks Fold(A) leaves",
+        &planes,
     );
     shell.open(6).expect("slot 6 opens");
     shell
@@ -422,6 +514,7 @@ fn holds_the_contract(mut shell: Shell) {
         &shell.state_bytes(7).expect("slot 7"),
         &alone_state,
         "a folding lane's banks changed for having a buffering peer",
+        &planes,
     );
     assert_eq!(
         shell.state_bytes(1).expect("slot 1"),
