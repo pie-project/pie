@@ -155,14 +155,12 @@ pub struct FireBindings {
     pub capture: Option<CaptureSeat>,
 }
 
-/// A fire's capturing lanes' rows, as its score kernels read them: the
-/// span's buffer they lie in (bound from its start, f32), and each fire
-/// lane's key row and page row start in it (u64 elements; `u64::MAX` for a
-/// lane that captures nothing). A row is `keys` keys, or `pages` pages of
-/// `page_size`.
+/// A fire's capturing lanes' rows, as its score kernels read them: each
+/// fire lane's key row and page row, f32 at its GPU address (its reader
+/// instance's rows, wherever they lie this fire; 0 for a lane that captures
+/// nothing). A row is `keys` keys, or `pages` pages of `page_size`.
 #[derive(Clone, Copy, Debug)]
 pub struct CaptureSeat {
-    pub store: Tensor,
     pub keys_at: Tensor,
     pub pages_at: Tensor,
     pub keys: u32,

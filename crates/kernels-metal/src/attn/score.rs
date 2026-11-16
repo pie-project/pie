@@ -26,13 +26,11 @@ fn stamp_for(head_dim: u32) -> Option<usize> {
 
 const PAGES: &str = "attn_score_pages";
 
-/// Where a fire's capturing lanes lay their score rows: `store`, the
-/// buffer the rows lie in (bound from its start), and `rows`, each fire
-/// lane's row's first element in it (a u64; `u64::MAX` for a lane that
-/// captures nothing). This window's first lane is `first`.
+/// Where a fire's capturing lanes lay their score rows: `rows`, each fire
+/// lane's row's GPU address (a u64, f32 rows; 0 for a lane that captures
+/// nothing). This window's first lane is `first`.
 #[derive(Clone, Copy, Debug)]
 pub struct CaptureRows {
-    pub store: Tensor,
     pub rows: Tensor,
     pub first: u32,
 }
@@ -77,21 +75,12 @@ pub fn capture(
             ),
         ));
     }
-    if rows.store.dtype != Dtype::F32 {
-        return Err(refuse(
-            OP,
-            format!(
-                "the score rows are {:?}, and a per-key mass is an f32 rectangle",
-                rows.store.dtype
-            ),
-        ));
-    }
     if rows.rows.dtype != Dtype::U64 {
         return Err(refuse(
             OP,
             format!(
-                "the capturing lanes' row table is {:?}, and each start is a u64 element \
-                 offset",
+                "the capturing lanes' row table is {:?}, and each start is a u64 GPU \
+                 address",
                 rows.rows.dtype
             ),
         ));
@@ -187,7 +176,6 @@ pub fn capture(
             pool.page_indices.arg(),
             pool.page_indptr.arg(),
             plan.last_page_len.arg(),
-            rows.store.arg_mut(),
             stated(OP, page_size)?.arg(),
             stated(OP, num_q_heads)?.arg(),
             stated(OP, kv_heads)?.arg(),
@@ -214,7 +202,6 @@ pub fn capture(
 #[allow(clippy::too_many_arguments)]
 pub fn pages(
     ctx: &Ctx<'_>,
-    store: Tensor,
     keys: Tensor,
     pages: Tensor,
     first: u32,
@@ -223,11 +210,8 @@ pub fn pages(
     requests: u32,
 ) -> Result<(), Error> {
     const OP: &str = "attn.score_pages";
-    if store.dtype != Dtype::F32 || keys.dtype != Dtype::U64 || pages.dtype != Dtype::U64 {
-        return Err(refuse(
-            OP,
-            "the rows are f32 and each row's start a u64 element offset",
-        ));
+    if keys.dtype != Dtype::U64 || pages.dtype != Dtype::U64 {
+        return Err(refuse(OP, "each row's start is a u64 GPU address"));
     }
     nonzero(OP, "the keys a row holds", keys_len)?;
     nonzero(OP, "the keys a page holds", page_size)?;
@@ -246,7 +230,6 @@ pub fn pages(
     ctx.fire(
         Fire::at(FILE, PAGES).apply(Grid::of([page_count, requests, 1], [64.min(page_count), 1, 1])),
         &[
-            store.arg_mut(),
             keys.arg(),
             pages.arg(),
             first.arg(),
@@ -280,7 +263,6 @@ mod tests {
     /// The rows of `lanes` capturing lanes, from the window's first.
     fn rows(lanes: u32) -> CaptureRows {
         CaptureRows {
-            store: Tensor::new(4, 1, 1, Dtype::F32),
             rows: Tensor::new(10, lanes, 1, Dtype::U64),
             first: 0,
         }
@@ -379,13 +361,13 @@ mod tests {
             .expect_err("each of the window's two capturing lanes has its row's start");
         assert!(format!("{why}").contains("the row table holds 1"), "{why}");
 
-        let bf16_rows = CaptureRows {
-            store: Tensor::new(4, 1, 1, Dtype::Bf16),
+        let f32_rows = CaptureRows {
+            rows: Tensor::new(10, 2, 1, Dtype::F32),
             ..rows(2)
         };
-        let dtype = fire(&probe, bf16(40, 16 * 64), 8, 64, Dtype::Bf16, 32, bf16_rows)
-            .expect_err("a per-key mass is an f32 rectangle");
-        assert!(format!("{dtype}").contains("f32 rectangle"), "{dtype}");
+        let dtype = fire(&probe, bf16(40, 16 * 64), 8, 64, Dtype::Bf16, 32, f32_rows)
+            .expect_err("each row's start is a u64 GPU address");
+        assert!(format!("{dtype}").contains("u64 GPU"), "{dtype}");
     }
 
     fn an_observation_window_of_zero_rows_is_refused_by_name() {

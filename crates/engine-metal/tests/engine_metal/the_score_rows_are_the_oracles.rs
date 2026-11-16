@@ -13,6 +13,7 @@ use poem::Request;
 use poem_compiler::Budget;
 
 use super::a_scattered_pool_serves_the_same_logits::{fixture_of, seeded_bf16, word};
+use super::a_score_reader_holds_its_rows_through_a_park::{at_lane, bind_reader, reader};
 
 const MODEL: &str = "qwen3-micro-text";
 const LANES: u32 = 256;
@@ -93,7 +94,14 @@ fn the_score_rows_are_the_oracles() {
             }
         })
         .collect();
-    shell.fire_seated(&mixed).expect("the mixed fire lands");
+    // Its rows are its reader's: a reader bound at the capturing lane.
+    let program = shell
+        .register_program(&reader(CONTEXT))
+        .expect("the reader registers");
+    let (id, ..) = bind_reader(&mut shell, program, prompt.len() as u32, 1);
+    shell
+        .fire_attached(&mixed, &[at_lane(0, id)])
+        .expect("the mixed fire lands");
     let rows = shell.score_rows().expect("the rows read back");
     assert_eq!(rows.len(), 1, "one capturing lane of {LANES} laid {} rows", rows.len());
     let (source, keys, pages) = &rows[0];
