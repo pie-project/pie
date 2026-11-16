@@ -863,7 +863,6 @@ pub(super) fn kernel_head(
          dispatch_lane * layout->reserved2;\n",
     );
     source.push_str(super::M3_LANE_SCRATCH);
-    source.push_str("  device uchar* temporary = scratch + layout->temporary_offset;\n");
     source.push_str(
         "  const device bfloat* logits = \
          reinterpret_cast<const device bfloat*>(lane.logits_base);\n",
@@ -987,7 +986,7 @@ pub fn emit_streamed_region(
             elided_gather.insert(producer);
         }
     }
-    let value_ptr = |value: u32| format!("scratch + offsets[{value}]");
+    let value_ptr = |value: u32| format!("PTIR_AT({value})");
     let argmax_over_f32 = |op: &OpView| -> bool {
         op.args
             .first()
@@ -1188,7 +1187,7 @@ pub fn emit_streamed_region(
     if split_count > 0 {
         let _ = writeln!(
             source,
-            "  device uchar* m4_planes = temporary + {select_bytes}u;\n  const uint m4_plane_bytes = ((layout->scratch_stride - layout->temporary_offset - {select_bytes}u) / {split_count}u) & ~15u;"
+            "  device uchar* m4_planes = temporary + {select_bytes}u;\n  const uint m4_plane_bytes = ((layout->temporary_bytes - {select_bytes}u) / {split_count}u) & ~15u;"
         );
     }
 
