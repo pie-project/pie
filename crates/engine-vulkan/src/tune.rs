@@ -311,14 +311,63 @@ fn check_estimate(
                     groups.join(" ")
                 ));
             }
-            say(&out);
+            // The recurrent scan and the conv of a hybrid, whatever their
+            // place in the list.
+            let recurrent: f64 = rows
+                .iter()
+                .filter(|(name, ..)| {
+                    ["gdn", "ssm", "scan", "conv", "recurrent"]
+                        .iter()
+                        .any(|w| name.contains(w))
+                })
+                .map(|row| row.1 as f64)
+                .sum();
+            out.push_str(&format!(
+                "  recurrent scan and conv dispatches: {:.3} ms\n",
+                recurrent / 1e6
+            ));
+            if form == "replayed" || width <= 16 {
+                say(&out);
+            }
         }
         crate::encode::profile_kernels(false);
         Ok(())
     };
-    for width in widths.iter().copied().filter(|&w| w <= 16) {
+    for width in widths.iter().copied() {
         dissect(width, say)?;
     }
+    // The matmul rate the device reaches at a few row counts on the
+    // model's own dense shapes (its distinct planes, `columns x depth`).
+    let mut shapes: Vec<(u32, u32)> = Vec::new();
+    for param in &trace.params {
+        if param.shape.len() == 2 {
+            let (n, k) = (param.shape[0], param.shape[1]);
+            if let (Ok(n), Ok(k)) = (u32::try_from(n), u32::try_from(k))
+                && n >= 256
+                && k >= 256
+                && n <= 32_768
+                && !shapes.contains(&(n, k))
+            {
+                shapes.push((n, k));
+            }
+        }
+    }
+    let mut rates_out = format!("matmul rate of {model}'s planes (TFLOP/s) at m =");
+    const ROWS: [u32; 5] = [16, 64, 256, 1024, 4096];
+    for m in ROWS {
+        rates_out.push_str(&format!(" {m:>7}"));
+    }
+    rates_out.push('\n');
+    for &(n, k) in shapes.iter().take(8) {
+        rates_out.push_str(&format!("  {n:>6} x {k:<6}             "));
+        for m in ROWS {
+            let r = crate::rates::gemm_rate(&shell.device, &shell.tuning, (m, n, k))
+                .map_err(|e| e.to_string())?;
+            rates_out.push_str(&format!(" {:>7.2}", r / 1e3));
+        }
+        rates_out.push('\n');
+    }
+    say(&rates_out);
     let measured = search::time_fires(
         &widths,
         |width, timed| {
@@ -379,13 +428,26 @@ fn check_estimate(
             .map_or(0.0, |&(_, s)| s)
     };
     let (at_est, best) = (score(by_est.tokens), score(by_meas.tokens));
-    let mut out = format!("{model} on {device}: rung, measured ms, estimated ms\n");
+    let mut out = format!(
+        "{model} on {device}: rung, measured ms, estimated ms = launch + max(weights, flops) + \
+         readout + attention + kv + recurrent + elementwise\n"
+    );
     for (k, r) in rungs.iter().enumerate() {
+        let t = weighed.estimate.terms(r);
         out.push_str(&format!(
-            "  {:>6} {:>10.2} {:>10.2}\n",
+            "  {:>6} {:>9.2} {:>9.2} = {:>7.2} + max({:>7.2}, {:>7.2}) + {:>7.2} + {:>7.2} + \
+             {:>7.2} + {:>7.2} + {:>7.2}\n",
             r.tokens,
             meas[k] / 1e6,
-            est[k] / 1e6
+            est[k] / 1e6,
+            t.launch / 1e6,
+            t.weights / 1e6,
+            t.flops / 1e6,
+            t.readout / 1e6,
+            t.attention / 1e6,
+            t.kv / 1e6,
+            t.recurrent / 1e6,
+            t.elementwise / 1e6
         ));
     }
     let short = if best > 0.0 { 1.0 - at_est / best } else { 0.0 };
