@@ -7,11 +7,12 @@
 //! allocation to the card's free bytes holds them back by name.
 //!
 //! The area a queue takes is read from KFD's topology for the device. The
-//! queues are KFD's own list for this process where that list is ours to
-//! read (the host's PID namespace); in a container's PID namespace it is
-//! not, and the count is HIP's rule instead: one utility queue, a hardware
-//! queue for each stream up to HIP's limit, and a copy queue for each stream
-//! a load made one on ([`warm_copies`]).
+//! queues are counted by HIP's rule, in every PID namespace alike: one
+//! utility queue, a hardware queue for each stream up to HIP's limit, and a
+//! copy queue for each stream a load made one on ([`warm_copies`]). KFD's
+//! own list of the process's queues ([`listed_queues`], readable from the
+//! host's PID namespace only) agrees with it at every count the tests hold
+//! it to.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -23,22 +24,12 @@ const PROCESSES: &str = "/sys/class/kfd/kfd/proc";
 /// not state one (CLR's default).
 const HIP_HW_QUEUES: u32 = 4;
 
-/// Where the queue count came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Counted {
-    /// KFD's list of this process's queues.
-    Driver,
-    /// HIP's rule, KFD's list being another PID namespace's.
-    HipRule,
-}
 
 /// The device memory the driver holds for this process's queues.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SaveAreas {
+    /// The queues, by HIP's rule.
     pub queues: u32,
-    pub counted: Counted,
-    /// What HIP's rule counts, beside KFD's list where both are read.
-    pub rule: u32,
     pub xcc: u32,
     /// Bytes a queue's wave save area takes on one XCC, its control stack
     /// within it (topology's `cwsr_size`).
@@ -66,19 +57,13 @@ impl core::fmt::Display for SaveAreas {
         write!(
             f,
             "{} MiB for {} queues' wave save areas ({} XCC x ({} save + {} debugger) bytes a \
-             queue; queues {})",
+             queue; queues by HIP's rule: a utility queue, a hardware queue a stream up to \
+             GPU_MAX_HW_QUEUES, a copy queue a copying stream)",
             self.bytes() >> 20,
             self.queues,
             self.xcc,
             self.cwsr,
             self.debug,
-            match self.counted {
-                Counted::Driver => "from KFD's list for this process",
-                Counted::HipRule => {
-                    "by HIP's rule: one utility queue and a hardware queue a stream up to \
-                     GPU_MAX_HW_QUEUES, KFD's list being another PID namespace's"
-                }
-            },
         )
     }
 }
@@ -109,23 +94,15 @@ pub fn save_areas(streams: u32) -> Result<SaveAreas, String> {
             node.display()
         )
     })?;
-    let gpu = fs::read_to_string(node.join("gpu_id"))
-        .map_err(|why| format!("{}: {why}", node.join("gpu_id").display()))?;
     let limit = std::env::var("GPU_MAX_HW_QUEUES")
         .ok()
         .and_then(|v| v.trim().parse::<u32>().ok())
         .unwrap_or(HIP_HW_QUEUES);
     // Compute queues by HIP's rule, and a copy queue for each stream
     // `warm_copies` made one on.
-    let rule = 1 + streams.min(limit) + warmed();
-    let (queues, counted) = match own_queues(gpu.trim()) {
-        Some(queues) => (queues, Counted::Driver),
-        None => (rule, Counted::HipRule),
-    };
+    let queues = 1 + streams.min(limit) + warmed();
     Ok(SaveAreas {
         queues,
-        counted,
-        rule,
         xcc,
         cwsr,
         debug,
@@ -216,10 +193,13 @@ pub fn process_vram() -> Option<u64> {
     fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
-/// This process's queues on the GPU KFD names `gpu`, compute and copy
-/// alike (each holds a save area), where KFD's list under this PID is this
-/// process's: it holds a queue on that GPU.
-fn own_queues(gpu: &str) -> Option<u32> {
+/// KFD's list of this process's queues on the current device, compute and
+/// copy alike, where that list is this process's to read (the host's PID
+/// namespace): what the tests hold HIP's rule ([`save_areas`]) to.
+pub fn listed_queues() -> Option<u32> {
+    let node = node_of_current_device().ok()?;
+    let gpu = fs::read_to_string(node.join("gpu_id")).ok()?;
+    let gpu = gpu.trim();
     let dir = Path::new(PROCESSES)
         .join(std::process::id().to_string())
         .join("queues");
@@ -307,8 +287,6 @@ mod tests {
         assert_eq!(debug, 48_640);
         let areas = SaveAreas {
             queues: 1,
-            counted: Counted::Driver,
-            rule: 1,
             xcc: 8,
             cwsr: 23_203_840,
             debug,
