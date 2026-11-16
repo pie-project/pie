@@ -141,7 +141,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     let mut profile = DeviceProfile::of(&chip, device.device().num_sm, &crate::EXCLUSIVE, grouped);
     let mut kernels = poem_compiler::fuse::flags::on(&chip, &crate::FUSIONS);
     if !boot.knobs.diagnostics.fuse_chains {
-        kernels.retain(|rule| crate::UNCHAINED.contains(&rule.kernel()));
+        kernels.clear();
     }
     #[cfg(feature = "rocm")]
     {
