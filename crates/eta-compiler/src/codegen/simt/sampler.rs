@@ -199,6 +199,7 @@ pub fn emit_sampler_region(
   g.slice = lane_row;
   g.slices = lane_blocks;
   g.arena = lane_arenas + (m1_u64)dispatch_lane * lane_blocks * M1_LANE_ARENA_STRIDE;
+  g.words = reinterpret_cast<m1_u32*>(lane_line);
   g.stride = M1_LANE_ARENA_STRIDE;
   g.parity = 0u;
   g.arrivals = 0u;
@@ -211,11 +212,11 @@ pub fn emit_sampler_region(
             source,
             "  ptir_lane_cut<{rank}>(
       g,
-      scratch + offsets[{probs}],
+      ptir_at({probs}),
       descriptors[{probs}u],
-      scratch + offsets[{threshold}],
+      ptir_at({threshold}),
       descriptors[{threshold}u],
-      scratch + offsets[{keep}]);
+      ptir_at({keep}));
 }}
 "
         );
@@ -227,14 +228,14 @@ pub fn emit_sampler_region(
   const M1ValueDesc logits_desc = descriptors[{logits}u];
   ptir_lane_sample<{rank}>(
       g,
-      scratch + offsets[{logits}],
-      scratch + offsets[{threshold}],
+      ptir_at({logits}),
+      ptir_at({threshold}),
       descriptors[{threshold}u],
-      scratch + offsets[{state}],
+      ptir_at({state}),
       descriptors[{state}u],
-      scratch + offsets[{probs}],
-      scratch + offsets[{keep}],
-      scratch + offsets[{token}],
+      ptir_at({probs}),
+      ptir_at({keep}),
+      ptir_at({token}),
       logits_desc.rows,
       logits_desc.last);
 }}

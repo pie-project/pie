@@ -85,19 +85,14 @@ async fn main(input: Input) -> Result<Output> {
         .find(|output| output.name == "attn.scores")
         .ok_or("this model reads out no attention scores")?;
     let layers = scores.layers.max(1);
-    // The output states how each layer's row factors: a run of `score_kv`
-    // keys per query head. Folding over a head count of the guest's own
-    // misreads a model with another one.
-    let [heads, score_kv] = scores.planes[..] else {
+    // One row a capturing lane, a key of the load's context each: the mass
+    // summed over the layers and averaged over the query heads.
+    let [1, score_kv] = scores.planes[..] else {
         return Err(format!(
-            "attn.scores states its row as planes {:?}, not [query heads, keys]",
+            "attn.scores states its row as planes {:?}, not [1, keys]",
             scores.planes
         ));
     };
-    let Some(planes) = layers.checked_mul(heads) else {
-        return Err("layers * heads overflows the plane count".into());
-    };
-    let heads_f = heads as f32;
     let max_tokens = input.max_tokens;
     let temperature = input.temperature;
     let ws = WorkingSet::new();
@@ -178,9 +173,8 @@ async fn main(input: Input) -> Result<Output> {
             tok_out.put(&token);
             rng.put(&(&r + iota(2)));
 
-            // `[planes, kv]` layer-major; dividing by `heads` averages heads and sums layers.
-            let rect = reshape(intrinsics::output(0, "attn.scores"), [planes, score_kv]);
-            let folded = &reduce_sum(transpose(&rect)) / heads_f;
+            // Summed over the layers and averaged over the heads already.
+            let folded = reshape(intrinsics::output(0, "attn.scores"), [score_kv]);
             scores_out.put(gather(&folded, iota(kv_max)));
         });
 

@@ -333,3 +333,151 @@ fn a_guest_slot_parks_on_the_host_and_comes_back() {
         );
     }
 }
+
+/// A score reader's pair holds the fire's score planes, and a park gives
+/// them back: unparked to fresh room elsewhere, the reader's scored decode
+/// captures where the planes lie now (its captures read where through the
+/// fire's staged word) and sums the same scores.
+#[test]
+fn a_parked_score_reader_sums_its_scores_where_its_planes_moved() {
+    use crate::a_score_reader_states_its_planes_and_nothing_backs_them as scored;
+    use engine::fire::Readout;
+    use engine_cuda::serve::Attached;
+    use engine_cuda::{Lane, Seated};
+    use eta_compiler::codegen::program::{Backend, emit_program};
+    use poem::Request;
+
+    if !engine_cuda::device::present() {
+        eprintln!("no CUDA device: skipping");
+        return;
+    }
+    let trace = poem::trace_hybrid("scored-micro", &scored::Scored, Platform::Cuda);
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let path = Weights::random(&trace, 4409).write(dir.path());
+    let mut shell = scored::shell(trace.clone(), &path, Graphs::On);
+    let pages: Vec<u32> = (0..64 / scored::PAGE).collect();
+    let prompt: Vec<u32> = (0..scored::PROMPT)
+        .map(|t| (t * 7 + 11) % scored::VOCAB)
+        .collect();
+    shell
+        .fire_rows(
+            &[Seated {
+                pages: &pages,
+                held: Some(0),
+                ..Seated::of(Lane {
+                    slot: 0,
+                    word: trace.facts.word(&Request::new(scored::PROMPT, false)),
+                    tokens: &prompt,
+                })
+            }],
+            &[Readout::Last],
+        )
+        .expect("the prompt prefills");
+
+    let facts = shell.chunk_facts().expect("the chunk facts");
+    let segments = facts.segments.committed.max(1);
+    shell
+        .commit_segments(segments)
+        .expect("the first segment commits");
+    let decls = crate::bound::loaded_decls_of(&shell.classes());
+    let bound = eta_ir::validate::bind(scored::reader(), vec![decls], crate::bound::caps())
+        .expect("the reader binds");
+    let stages = eta_compiler::plan::compile_bound(&bound);
+    let backend = Backend::parse(engine_cuda::api::CODEGEN).expect("the engine's codegen backend");
+    let program = shell
+        .register_program(&engine::ProgramRegistration {
+            program_hash: 0x5c0f,
+            emitted_kernels: emit_program(backend, &stages, &bound),
+            emitter_version: backend.emitter_version(),
+            region_analysis: eta_compiler::codegen::cuda::region_analysis::analyze_program(&stages),
+            launch: eta_compiler::codegen::launch::build(&bound, &stages),
+            ..Default::default()
+        })
+        .expect("the reader registers");
+    let extents = eta_exec::Extents {
+        row_count: 1,
+        token_count: 1,
+        sampled_rows: 1,
+        query_len: 1,
+        ..eta_exec::Extents::default()
+    };
+    let state = shell
+        .guest_state(program, extents)
+        .expect("the reader's guest state");
+    let mut guest = crate::guest::Guest::of(&facts, segments * facts.segment_chunks);
+    let program_facts = shell.program_facts(program).expect("the program's facts");
+    let slots = guest.shell_slots(program, &program_facts, extents, state);
+    let instance = shell
+        .bind_program(
+            program,
+            &[],
+            extents,
+            eta_ir::registry::GeometryClass::Host,
+            eta_ir::registry::PortMask::NONE,
+            &[None],
+            &[engine::ChannelId(1)],
+            slots.clone(),
+        )
+        .expect("the reader binds");
+
+    // One scored decode, always at the same depth: the same scores each
+    // time, summed into the reader's channel.
+    let token = [prompt[0]];
+    let depth = [scored::PROMPT];
+    let decode = |shell: &mut Shell| -> f32 {
+        shell
+            .fire_media(
+                &[Seated {
+                    pages: &pages,
+                    held: Some(scored::PROMPT),
+                    positions: &depth,
+                    ..Seated::of(Lane {
+                        slot: 0,
+                        word: trace
+                            .facts
+                            .word(&Request::new(1, true).capturing_scores(true)),
+                        tokens: &token,
+                    })
+                }],
+                &[Attached {
+                    lane: 0,
+                    lanes: 1,
+                    instance,
+                    adapter_only: false,
+                }],
+                &[],
+            )
+            .expect("the scored decode fires");
+        shell.drain().expect("the decode lands");
+        let cell = shell
+            .program_instance(instance)
+            .expect("the reader's instance")
+            .expect("bound")
+            .take(0)
+            .expect("the sum reads")
+            .expect("a sum");
+        f32::from_le_bytes(cell[..4].try_into().expect("an f32"))
+    };
+    let first = decode(&mut shell);
+    assert!(first != 0.0, "the reader summed no scores");
+
+    // Parked and unparked: its scratch and its pair's state, the planes'
+    // room, taken afresh elsewhere; nothing copied.
+    let (scratch, pair) = guest.moved(program, extents, state);
+    assert_ne!(pair, slots.pair, "the pair's state moved");
+    shell
+        .rebind_program(
+            instance,
+            engine_cuda::program::Slots {
+                scratch,
+                pair,
+                ..slots
+            },
+        )
+        .expect("the reader rebinds");
+    assert_eq!(
+        decode(&mut shell),
+        first,
+        "the capture writes the planes where they lie now"
+    );
+}

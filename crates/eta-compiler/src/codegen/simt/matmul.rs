@@ -28,9 +28,9 @@ const BODY: &str = r#"
 
   const M1ValueDesc left_desc = descriptors[kLeft];
   const M1ValueDesc right_desc = descriptors[kRight];
-  const m1_u8* left = scratch + offsets[kLeft];
-  const m1_u8* right = scratch + offsets[kRight];
-  m1_u8* product = scratch + offsets[kOutput];
+  const m1_u8* left = ptir_at(kLeft);
+  const m1_u8* right = ptir_at(kRight);
+  m1_u8* product = ptir_at(kOutput);
   if (left_desc.rank != 2u || right_desc.rank != 2u ||
       left_desc.dims[1] != right_desc.dims[0]) {
     if (threadIdx.x == 0u) {

@@ -89,7 +89,6 @@ pub(super) struct Arming {
     belted: bool,
     starved: Option<u64>,
     peer_stopped: bool,
-    unit_margin: u64,
     /// The bodies' allowance is a record's measurement
     /// ([`super::measured`]): the lattice arms as recorded, unpriced, and
     /// no headroom estimate stops it.
@@ -1028,16 +1027,10 @@ impl Shell {
                 .sum::<usize>()
                 + kept * average
         };
-        // What the allowance has left, or the card where it has less: the
-        // ceiling's spare stops arming as the allowance does.
-        let allowance = self.bodies_mem.saturating_sub(spent.bytes);
-        let spare = self
-            .pools
-            .spare_bytes_for_bodies(allowance as u64)
-            .map_or(allowance, |spare| {
-                usize::try_from(spare).unwrap_or(usize::MAX)
-            });
-        let room = allowance.min(spare);
+        // What the bodies may still take (`Shell::bodies_room`), priced at
+        // what the armed ones took as they were instantiated: the bytes
+        // `arm_target` stops on.
+        let room = usize::try_from(self.bodies_room()).unwrap_or(usize::MAX);
         while need(&buckets) > room {
             if fine <= steps.max(1) {
                 eprintln!(
@@ -1077,8 +1070,25 @@ impl Shell {
             .filter(|b| !buckets.contains(b))
             .copied()
             .collect();
+        // The fires compose at the buckets left (`Shell::budgets`), as the
+        // lattice arms them: a bucket dropped here is one no fire pads to.
+        self.budgets.tokens.buckets.clone_from(&buckets);
         self.budget.buckets = buckets;
         dropped
+    }
+
+    /// What the bodies may still take: the allowance past the bytes the
+    /// armed ones took of the device as each was instantiated and uploaded
+    /// (`record::Body::bytes`, measured), or the card's spare past the cache
+    /// rows' reserve where it has less. Arming stops when it is spent
+    /// (`arm_target`), and the lattice's fit prices the bodies still to arm
+    /// in it (`fit_lattice`).
+    fn bodies_room(&self) -> u64 {
+        let allowance =
+            (self.bodies_mem as u64).saturating_sub(self.cache.body_stats().census.bytes as u64);
+        self.pools
+            .spare_bytes_for_bodies(allowance)
+            .map_or(allowance, |spare| allowance.min(spare))
     }
 
     /// Forgets the recorded bodies and arms the lattice again within the
@@ -1461,7 +1471,6 @@ impl Shell {
             belted: false,
             starved: None,
             peer_stopped: false,
-            unit_margin: self.pools.arming_margin_bytes(),
             from_record: self.bodies_from_record || self.rearming,
             capped: !(self.bodies_from_record && self.arming_at_load),
             took: Some(0),
@@ -1514,20 +1523,15 @@ impl Shell {
         // bucket's fires made what its warm fire would.
         self.arm_cold = st.narrower(bucket, &target) && !st.verify;
         let spent = self.cache.body_stats();
-        let room = (self.bodies_mem as u64).saturating_sub(spent.census.bytes as u64);
-        let spare = self.pools.spare_bytes_for_bodies(room).unwrap_or(u64::MAX);
-        let price = (2 * spent.census.bytes / spent.census.bodies.max(1)) as u64;
-        // A map unit's margin never past a quarter of the allowance: an
-        // allowance the fit held under the margin would otherwise stop
-        // arming before its first body.
-        let margin = price.max(st.unit_margin.min(self.bodies_mem as u64 / 4));
-        // Estimated where nothing is known; a record's allowance is a
-        // measurement, and the headroom estimate is not consulted.
-        let headroom = !st.from_record && spare < margin;
+        // Stopped on the count: the bytes the armed bodies took, measured as
+        // each was made, against the allowance and the card's spare. A
+        // record's allowance is a measurement and the card is not consulted.
+        let room = self.bodies_room();
+        let spent_out = room == 0 && (spent.census.bytes as u64) < self.bodies_mem as u64;
         let mine = !st.verify
             && (spent.census.bodies >= record::MAX_BODIES
                 || (st.capped && spent.census.bytes >= self.bodies_mem)
-                || headroom);
+                || (!st.from_record && spent_out));
         let stop = match self.ep.as_ref() {
             // The group's ranks fire one sequence of steps: the allowance
             // one rank runs out of stops every rank's captures.
@@ -1538,8 +1542,8 @@ impl Shell {
             if st.never == 0 {
                 st.never_from = bucket;
                 st.belted = spent.census.bodies >= record::MAX_BODIES;
-                if headroom && !st.belted && spent.census.bytes < self.bodies_mem {
-                    st.starved = Some(spare);
+                if !st.from_record && spent_out && !st.belted {
+                    st.starved = Some(spent.census.bytes as u64);
                 }
                 st.peer_stopped = !mine;
             }
@@ -1844,17 +1848,18 @@ impl Shell {
             }
         }
         // A load that records bodies serves every composition it fires from
-        // one: one that armed none, or stopped arming for want of room, would
-        // serve eagerly, which is never what a deployment asked for. A load
-        // that stages host-resident experts reads each fire's routes back,
-        // so it records none by design (`Run::capturable`; stated at load).
+        // one: one that armed none, or stopped arming with compositions left,
+        // would serve eagerly, which is never what a deployment asked for. A
+        // load that stages host-resident experts reads each fire's routes
+        // back, so it records none by design (`Run::capturable`; stated at
+        // load).
         let attempted = st.wanted + st.never;
         if st.records
             && self.expert_staged.is_none()
             && !st.verify
             && !st.group
             && attempted > 0
-            && (st.armed == 0 || st.starved.is_some())
+            && (st.armed == 0 || st.never > 0)
         {
             return Err(Fault::Residency(format!(
                 "the card does not hold this deployment's graph bodies: {} of {attempted} \
@@ -1866,9 +1871,22 @@ impl Shell {
                  ({report})",
                 st.armed,
                 match st.starved {
-                    Some(spare) => format!(
-                        ", arming stopped with {} MiB spare under the ceiling",
-                        spare >> 20
+                    Some(took) => format!(
+                        ", arming stopped when the {} armed bodies had taken {} MiB and the card's \
+                         spare under the ceiling, past the cache rows' reserve, was spent",
+                        st.armed,
+                        took >> 20
+                    ),
+                    None if st.belted => {
+                        format!(
+                            ", arming stopped at {} bodies (record::MAX_BODIES)",
+                            record::MAX_BODIES
+                        )
+                    }
+                    None if st.never > 0 => format!(
+                        ", arming stopped when the bodies had taken their allowance, \
+                         `[engine] bodies_mem` {} MiB",
+                        self.bodies_mem >> 20
                     ),
                     None => String::new(),
                 },
@@ -2099,9 +2117,9 @@ impl core::fmt::Display for Armed {
                 match self.starved {
                     _ if self.peer_stopped =>
                         "a peer rank's bound (the stop is agreed across the group)".to_string(),
-                    Some(spare) => format!(
-                        "the ceiling's spare ran out ({} MiB left beyond the elastic pool's growth)",
-                        spare >> 20
+                    Some(took) => format!(
+                        "the ceiling's spare ran out (the bodies had taken {} MiB)",
+                        took >> 20
                     ),
                     None if self.belted => "record::MAX_BODIES".to_string(),
                     None => "[engine] bodies_mem".to_string(),

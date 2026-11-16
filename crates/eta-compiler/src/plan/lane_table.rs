@@ -1,4 +1,4 @@
-pub const LANE_TABLE_ABI_VERSION: u32 = 5;
+pub const LANE_TABLE_ABI_VERSION: u32 = 6;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
@@ -34,6 +34,9 @@ pub struct LaneRecord {
     pub mtp_drafts_base: u64,
     pub mtp_drafts_depth: u32,
     pub reserved2: u32,
+    /// Where the lane's instance's scratch base table lies: one device
+    /// address a piece of its scratch, the piece's chunk where it lies now.
+    pub scratch_table: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

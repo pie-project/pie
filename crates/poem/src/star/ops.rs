@@ -1011,32 +1011,6 @@ pub(crate) static OPS: &[Op] = &[
     },
     Op {
         module: "attn",
-        name: "score_capture",
-        params: &[
-            "q", "inputs", "kv", "q_heads", "kv_heads", "head_dim", "sm_scale", "observe", "kv_max",
-        ],
-        call: |a, heap| {
-            let q: Value = a.next()?;
-            let inputs: Input = a.next()?;
-            let kv: StateName = a.next()?;
-            let q_heads: u32 = a.next()?;
-            let kv_heads: u32 = a.next()?;
-            let head_dim: u32 = a.next()?;
-            let sm_scale: f32 = a.next()?;
-            let observe: u32 = a.next()?;
-            let kv_max: u32 = a.next()?;
-            result(
-                heap,
-                dsl("attn.score_capture", || {
-                    ops::attn::score_capture(
-                        &q, &inputs, &kv.0, q_heads, kv_heads, head_dim, sm_scale, observe, kv_max,
-                    )
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
         name: "attend_mla",
         params: &[
             "q",

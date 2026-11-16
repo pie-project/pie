@@ -23,6 +23,18 @@ pub enum Dim {
     VoxelsScaled(u32, u32),
     Clips,
     ClipsPlus(u32),
+    /// The lanes of a fire whose requests capture attention scores, in lane
+    /// order and nothing between them. A value of this many rows is no
+    /// arena value: each capturing lane's row lies in its reading program's
+    /// own guest region, a term of that program's members.
+    Capturing,
+    /// `n` runs of the load's kv context, one a query head: the keys a lane
+    /// may attend, as the load states its context (no constant in the
+    /// trace).
+    ContextTimes(u32),
+    /// The pages of the load's kv context: its context over its page size,
+    /// both the load's.
+    ContextPages,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -100,10 +112,16 @@ impl Dim {
     #[must_use]
     pub fn axis(self) -> Option<RowAxis> {
         match self {
-            Dim::Const(_) => None,
-            Dim::Tokens | Dim::TokensTimes(_) | Dim::Lanes | Dim::LanesPlus(_) | Dim::Readouts => {
-                Some(RowAxis::Tokens)
-            }
+            // A width, not a row axis: the load states it.
+            Dim::Const(_) | Dim::ContextTimes(_) | Dim::ContextPages => None,
+            // The capturing lanes are some of the fire's lanes, on its
+            // token axis.
+            Dim::Tokens
+            | Dim::TokensTimes(_)
+            | Dim::Lanes
+            | Dim::LanesPlus(_)
+            | Dim::Readouts
+            | Dim::Capturing => Some(RowAxis::Tokens),
             Dim::Patches | Dim::Images | Dim::ImagesPlus(_) => Some(RowAxis::Patches),
             Dim::Voxels | Dim::VoxelsScaled(..) | Dim::Clips | Dim::ClipsPlus(_) => {
                 Some(RowAxis::Voxels)

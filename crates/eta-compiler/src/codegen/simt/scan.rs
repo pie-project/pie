@@ -26,8 +26,8 @@ const BODY: &str = r#"
   (void)temporary;
 
   const M1ValueDesc scan_desc = descriptors[kInput];
-  const m1_u8* scan_input = scratch + offsets[kInput];
-  m1_u8* scan_output = scratch + offsets[kOutput];
+  const m1_u8* scan_input = ptir_at(kInput);
+  m1_u8* scan_output = ptir_at(kOutput);
   const m1_u32 scan_len = scan_desc.last;
   const m1_u32 scan_rows = scan_desc.rows;
 

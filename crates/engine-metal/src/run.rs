@@ -1427,6 +1427,8 @@ impl<'c> Run<'c> {
                 readout_span(&self.fire.readout_indptr, window.lane_offset, window.lanes)
             }
             Some(Dim::Const(_)) | None => return handle,
+            // A capturing lane's row lies in its program's guest region, never cut here.
+            Some(Dim::Capturing | Dim::ContextTimes(_) | Dim::ContextPages) => return handle,
             Some(Dim::Patches) => (patch.row_offset, patch.rows),
             Some(Dim::Images) => (patch.lane_offset, patch.lanes),
             Some(Dim::ImagesPlus(k)) => (patch.lane_offset, patch.lanes + k),

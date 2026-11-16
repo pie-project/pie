@@ -34,13 +34,19 @@ impl Run<'_> {
                 cache,
                 head_dim,
                 kv_heads,
+                q_heads,
                 sm_scale,
                 observe,
-                kv_max,
-                scores,
+                into,
+                ..
             } => {
                 let mut q_rows = self.ragged(*q);
                 q_rows.data = self.windowed(q_rows.data);
+                // Each capturing lane's row where the fire's table says: a
+                // recorded capture replays wherever the reader's instance
+                // holds it then. A layer's row is the one before's, added
+                // into.
+                let rows = self.bindings().score_rows;
                 kernels_cuda::attn::score::capture(
                     self.ctx(),
                     q_rows,
@@ -48,11 +54,29 @@ impl Run<'_> {
                     &self.pool(*cache),
                     *head_dim,
                     *kv_heads,
+                    *q_heads,
                     *sm_scale,
                     *observe,
                     self.window().span().lane_offset,
-                    *kv_max,
-                    &mut self.tensor(*scores),
+                    kernels_cuda::attn::score::Rows {
+                        table: rows.table,
+                        context: rows.context,
+                    },
+                    into.is_some(),
+                )
+            }
+            Attn::ScorePages { .. } => {
+                let rows = self.bindings().score_rows;
+                let span = self.window().span();
+                kernels_cuda::attn::score::pages(
+                    self.ctx(),
+                    kernels_cuda::attn::score::Rows {
+                        table: rows.table,
+                        context: rows.context,
+                    },
+                    span.lanes,
+                    span.lane_offset,
+                    rows.page_size,
                 )
             }
             Attn::Voxel {

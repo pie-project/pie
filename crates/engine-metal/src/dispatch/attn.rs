@@ -17,29 +17,15 @@ impl Run<'_> {
 
     fn attention(&mut self, op: &Attn) -> Result<(), kernels_metal::Error> {
         match op {
-            Attn::ScoreCapture {
-                q,
-                plan,
-                cache,
-                head_dim,
-                kv_heads,
-                sm_scale,
-                observe,
-                kv_max,
-                scores,
-            } => attn::score::capture(
-                self.ctx(),
-                self.ragged(*q),
-                &self.prefill_plan_over(*plan, *cache),
-                self.pool(*cache),
-                *head_dim,
-                *kv_heads,
-                *sm_scale,
-                *observe,
-                *kv_max,
-                self.requests(),
-                self.tensor(*scores),
-            ),
+            // WIP: Metal's capture into a capturing lane's guest-region row
+            // lands next on this branch; until then a capturing fire is
+            // refused by name.
+            Attn::ScoreCapture { .. } | Attn::ScorePages { .. } => Err(kernels_metal::Error::Backend {
+                op: "attn.score_capture",
+                detail: "Metal does not yet lay a capturing lane's score row in its reading \
+                         program's guest region"
+                    .to_string(),
+            }),
             Attn::Voxel {
                 q,
                 k,

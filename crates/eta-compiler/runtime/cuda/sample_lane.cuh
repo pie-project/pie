@@ -15,9 +15,9 @@
 //
 // The arena, per block (`M1_LANE_ARENA_STRIDE` apart, a lane's blocks' together
 // in the engine's lane arenas, laid once at load: a fire's lanes meet there
-// one launch after another): a 64-byte line (block 0's
-// holds the lane's barrier words, one a block; zeroed before the launch),
-// two exchange buffers, used by alternate merges (a block is at most one
+// one launch after another): a 64-byte line (unused: the lane's barrier
+// words, one a block, are its line of the fire's tables, zeroed before the
+// launch), two exchange buffers, used by alternate merges (a block is at most one
 // merge ahead of the slowest), and two buffers of gathered elements.
 
 #define M1_LANE_HALF 24576u
@@ -539,6 +539,8 @@ struct M1Lane {
   m1_u32 slice;
   m1_u32 slices;
   m1_u8* arena;
+  // The lane's barrier words, one a block.
+  m1_u32* words;
   m1_u32 stride;
   m1_u32 parity;
   m1_u32 arrivals;
@@ -585,7 +587,6 @@ struct M1Lane {
     __syncthreads();
     arrivals += 1u;
     if (threadIdx.x < 32u) {
-      m1_u32* words = reinterpret_cast<m1_u32*>(arena);
       if (threadIdx.x == 0u) M1_LANE_PUT32(words + slice, arrivals);
       bool ready = threadIdx.x >= slices;
       for (;;) {

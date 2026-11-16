@@ -153,7 +153,8 @@ fn copyable(trace: &Trace, region: &Region) -> bool {
                     Some(Dim::Tokens) => matches!(dtype, Dtype::Bf16 | Dtype::F32),
                     Some(Dim::TokensTimes(_)) => false,
                     Some(Dim::Const(_)) | None => true,
-                    Some(Dim::Lanes | Dim::LanesPlus(_)) => false,
+                    Some(Dim::Lanes | Dim::LanesPlus(_) | Dim::Capturing) => false,
+                    Some(Dim::ContextTimes(_) | Dim::ContextPages) => false,
                     Some(Dim::Readouts) => false,
                     Some(Dim::Patches | Dim::Images | Dim::ImagesPlus(_)) => false,
                     Some(Dim::Voxels | Dim::VoxelsScaled(..) | Dim::Clips | Dim::ClipsPlus(_)) => {

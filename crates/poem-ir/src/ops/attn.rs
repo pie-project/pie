@@ -146,8 +146,12 @@ pub enum Attn {
         #[output]
         o: ValueId,
     },
-    /// Each lane's attention mass over its first `kv_max` keys, averaged
-    /// over its last `observe` query rows: a `kv_max` run per query head.
+    /// Each capturing lane's attention mass a key of the load's context
+    /// ([`crate::Dim::ContextTimes`]`(1)`), averaged over its last `observe`
+    /// query rows and over every query head, added to `into` (an earlier
+    /// layer's, the same row) or, with none, to a zeroed row: one row a
+    /// capturing lane ([`crate::Dim::Capturing`]). The last layer's is the
+    /// mass summed over the layers, a key.
     ScoreCapture {
         #[input]
         q: ValueId,
@@ -157,11 +161,23 @@ pub enum Attn {
         cache: ValueId,
         head_dim: u32,
         kv_heads: u32,
+        /// The model's query heads, every rank's: what the mass a key is
+        /// averaged over, where a rank attends only its share of them.
+        q_heads: u32,
         sm_scale: f32,
         observe: u32,
-        kv_max: u32,
+        #[input(F32)]
+        into: Option<ValueId>,
         #[output(F32)]
         scores: ValueId,
+    },
+    /// Each capturing lane's key row `keys` summed a kv page of the load's:
+    /// one row a capturing lane, a mass a page ([`crate::Dim::ContextPages`]).
+    ScorePages {
+        #[input(F32)]
+        keys: ValueId,
+        #[output(F32)]
+        pages: ValueId,
     },
     Sink {
         #[input]

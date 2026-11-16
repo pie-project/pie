@@ -23,7 +23,6 @@ pub mod exports;
 pub mod group;
 #[cfg(not(feature = "rocm"))]
 pub mod grouped_decode;
-pub mod guest_term;
 pub mod inputs;
 pub mod lockstep;
 pub mod mask;

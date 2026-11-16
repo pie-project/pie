@@ -820,54 +820,7 @@ impl Shell {
             &|role, refs, bytes| pools.guest_span(role, refs, bytes),
             stream,
         )?;
-        // Its fires lay their programs in the span, backed at load: a bind
-        // whose term no rung's room under its carve holds is refused here.
-        if let Err(refused) = self.fit_programs() {
-            self.programs.close_instance(id)?;
-            return Err(refused);
-        }
         Ok(id)
-    }
-
-    /// The lanes a fire of `rung` tokens carries of a guest program, as the
-    /// engine lays them ([`crate::program::Plane::fire_term`]).
-    fn program_lanes(&self, rung: u32) -> u32 {
-        rung.min(self.fire_lanes())
-    }
-
-    /// Whether some rung's room under its carve, in the span, holds what
-    /// the programs bound now lay at it (`Pools::program_span`); nothing
-    /// is backed for them. The runtime cuts a guest fire to the widest
-    /// such rung and refuses a bind that fits at none.
-    fn fit_programs(&self) -> Result<()> {
-        let rungs = self
-            .arena
-            .every_rung(self.compiled.arena_forked.as_ref(), self.budget.max_tokens);
-        let mut refused = None;
-        for (rung, under) in rungs {
-            let term = self.programs.fire_term(self.program_lanes(rung));
-            match self.pools.program_span(under, term, 0) {
-                Ok(_) => return Ok(()),
-                Err(fault) => refused = Some(fault),
-            }
-        }
-        refused.map_or(Ok(()), Err)
-    }
-
-    /// Points the guests' programs at where a fire of `tokens` tokens and
-    /// `lanes` lanes lays them: under its own carve.
-    pub(crate) fn point_programs(&mut self, tokens: u64, lanes: u64) -> Result<()> {
-        let span = program_span(
-            &self.arena,
-            &self.pools,
-            &self.programs,
-            self.compiled.arena_forked.as_ref(),
-            (self.budget.max_tokens, self.fire_lanes()),
-            tokens,
-            lanes,
-        )?;
-        self.programs.set_span(span);
-        Ok(())
     }
 
     /// What `program` bound at `extents` holds as state
@@ -877,7 +830,7 @@ impl Shell {
         program: engine::ProgramId,
         extents: eta_exec::Extents,
     ) -> Result<engine::GuestState> {
-        Ok(self.programs.fire_bytes(program, extents)?.state())
+        self.programs.guest_state(program, extents)
     }
 
     /// What an instance of `program` keeps in the pool's `Instance` and
@@ -1360,28 +1313,4 @@ impl EnqueuedPhase for Enqueued<'_> {
     fn launches(&self) -> u32 {
         self.launches
     }
-}
-
-/// Where a fire of `tokens` tokens and `lanes` lanes lays its guests'
-/// programs: under its own carve, in what the runtime keeps free of state
-/// at the fire's rung (`store::Pools::program_span`). `limits`: the load's
-/// most tokens and the most lanes a fire carries.
-pub(crate) fn program_span(
-    arena: &crate::arena::Arena,
-    pools: &crate::store::Pools,
-    programs: &ProgramPlane,
-    forked: Option<&poem_compiler::ArenaMap>,
-    limits: (u32, u32),
-    tokens: u64,
-    lanes: u64,
-) -> Result<(u64, u64)> {
-    let (rung, under) = arena.rung_of(forked, tokens, lanes, limits.0);
-    // With a reader bound, the fire's planes lie right under its carve and
-    // its programs under them, all of it in the term.
-    let planes = if programs.scores_bound() {
-        arena.planes_at(forked, tokens, lanes)
-    } else {
-        0
-    };
-    pools.program_span(under, programs.fire_term(rung.min(limits.1)), planes)
 }

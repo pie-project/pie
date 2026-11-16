@@ -42,7 +42,7 @@ impl Facts {
         }
         let compiled = compile_axes(&trace, &Budgets::of(budget), &DeviceProfile::default())
             .map_err(|e| e.to_string())?;
-        let exports = poem_exec::feeds::class_outputs(&trace, &compiled)?;
+        let exports = poem_exec::feeds::class_outputs(&trace, &compiled, budgets.max_context, budgets.page_size)?;
         if exports.is_empty() {
             return Err("the trace has no output, so a fire would compute nothing".into());
         }

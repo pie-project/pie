@@ -24,6 +24,12 @@ template <typename T, int HEAD_DIM_MAX, int SIMDS>
     const constant ulong& v_page_stride [[buffer(15)]],
     const constant ulong& k_offset [[buffer(16)]],
     const constant ulong& v_offset [[buffer(17)]],
+    // Where each capturing lane's rows start in `scores`, in elements, by
+    // its place among the fire's capturing lanes; this window's first lane
+    // is `row_first`, and this layer's row lies `layer_at` past each start.
+    const device ulong* row_at          [[buffer(18)]],
+    const constant uint& row_first      [[buffer(19)]],
+    const constant ulong& layer_at      [[buffer(20)]],
     uint3 tgid     [[threadgroup_position_in_grid]],
     uint  simd_gid [[simdgroup_index_in_threadgroup]],
     uint  simd_lid [[thread_index_in_simdgroup]]) {
@@ -44,9 +50,8 @@ template <typename T, int HEAD_DIM_MAX, int SIMDS>
   threadgroup float wm[SIMDS];
   threadgroup float wl[SIMDS];
 
-  device float* out =
-      scores + (size_t(request) * size_t(num_q_heads) + size_t(head)) *
-                   size_t(kv_max);
+  device float* out = scores + row_at[row_first + uint(request)] + layer_at +
+                      size_t(head) * size_t(kv_max);
   for (int i = tid; i < kv_max; i += THREADS) {
     out[i] = 0.0f;
   }
@@ -158,7 +163,8 @@ template <typename T, int HEAD_DIM_MAX, int SIMDS>
       const device uint*, const device uint*, const device int*,              \
       device float*, const constant int&, const constant int&,                \
       const constant int&, const constant int&, const constant float&,        \
-      const constant int&, const constant int&, PIE_KV_LAYOUT_TYPES uint3, uint, uint);
+      const constant int&, const constant int&, PIE_KV_LAYOUT_TYPES           \
+      const device ulong*, const constant uint&, const constant ulong&, uint3, uint, uint);
 
 instantiate_attn_score_capture(bfloat16, bfloat, 64)
 instantiate_attn_score_capture(bfloat16, bfloat, 128)

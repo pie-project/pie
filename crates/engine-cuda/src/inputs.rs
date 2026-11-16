@@ -180,6 +180,9 @@ pub struct Handles {
     pub readout_rows: Tensor,
     /// How many of `readout_rows` are live (the rest pad a body's ceiling).
     pub readout_live: u64,
+    /// A table of a device address a lane: where each of the fire's lanes
+    /// has its score rows ([`Fire::score_rows`]).
+    pub score_rows: u64,
     pub mask: Option<Tensor>,
     pub mask_indptr: Option<Tensor>,
     /// Per lane its mask word: its committed boundary and its wide bit
@@ -309,6 +312,11 @@ pub struct Fire<'a> {
     pub adapter_routes: Option<&'a [i32]>,
     pub readout_rows: &'a [i32],
     pub readout_live: u32,
+    /// Where each of the fire's lanes has its score rows (0: it captures
+    /// none): in its reading program's instance, which moves when the
+    /// instance is parked. A recorded capture reads them through this
+    /// table, never at a place of its own.
+    pub score_rows: &'a [u64],
     pub page_tables: &'a [Geometry],
     pub mask: Option<&'a crate::mask::Staged>,
     pub live_rows: u32,
@@ -562,6 +570,7 @@ pub struct Inputs {
     adapter_routes: u64,
     readout_rows: u64,
     readout_live: u64,
+    score_rows: u64,
     mask_bits: u64,
     mask_bytes: u64,
     mask_indptr: u64,
@@ -651,6 +660,7 @@ impl Inputs {
         let adapter_routes = take(rows * 4);
         let readout_rows = take(rows * 4);
         let readout_live = take(4);
+        let score_rows = take(lanes * 8);
         let context = u64::from(paging.pages_per_slot) * u64::from(paging.page_size);
         let mask_bytes = if masked {
             (rows * context).div_ceil(8) + lanes
@@ -778,6 +788,7 @@ impl Inputs {
             adapter_routes,
             readout_rows,
             readout_live,
+            score_rows,
             mask_bits,
             mask_bytes,
             mask_indptr,
@@ -1048,6 +1059,25 @@ impl Inputs {
             self.readout_live,
             &fire.readout_live.to_le_bytes(),
             "staged live readouts",
+        )?;
+        // Every lane's entry, the ones past the fire's zero: a body's padded
+        // lanes read theirs too.
+        if fire.score_rows.len() > self.max_lanes as usize {
+            return Err(crate::error::Fault::Ceiling {
+                what: "lanes of a fire's score row table",
+                need: fire.score_rows.len() as u64,
+                have: u64::from(self.max_lanes),
+            });
+        }
+        let mut score_rows = vec![0u64; self.max_lanes as usize];
+        score_rows[..fire.score_rows.len()].copy_from_slice(fire.score_rows);
+        put(
+            self.score_rows,
+            &score_rows
+                .iter()
+                .flat_map(|at| at.to_le_bytes())
+                .collect::<Vec<u8>>(),
+            "staged score rows",
         )?;
 
         let mask_bytes = match fire.mask {
@@ -1375,6 +1405,8 @@ impl Inputs {
         );
         let at_readouts = self.readout_rows;
         let at_readout_live = self.readout_live;
+        let at_score_rows = self.score_rows;
+        let score_lanes = self.max_lanes as usize;
         let places: Vec<TableAt> = self.page_tables.clone();
         let at_lane_of_row = self.lane_of_row;
         let at_group_of_lane = self.group_of_lane;
@@ -1429,6 +1461,7 @@ impl Inputs {
         copy(at_lane_of_row, rows as usize * 4)?;
         copy(at_readouts, readouts as usize * 4)?;
         copy(at_readout_live, 4)?;
+        copy(at_score_rows, score_lanes * 8)?;
         copy(at_slot_ids, *state_ids as usize * 4)?;
         if let Some(routes) = adapter_rows {
             copy(at_routes, *routes as usize * 4)?;
@@ -1519,6 +1552,7 @@ impl Inputs {
             adapter_routes: adapter_rows.map(|rows| i32s(base + at_routes, rows)),
             readout_rows: i32s(base + at_readouts, readouts),
             readout_live: base + at_readout_live,
+            score_rows: base + at_score_rows,
             row_valid: Tensor::new(base + at_row_valid, rows, 1, Dtype::U8),
             mask: mask_bytes.map(|bytes| Tensor::new(base + at_mask, bytes, 1, Dtype::U8)),
             mask_indptr: mask_bytes.map(|_| i64s(base + at_mask_indptr, lanes + 1)),

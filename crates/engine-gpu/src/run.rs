@@ -535,6 +535,8 @@ impl<'c, B: Backend> Run<'c, B> {
             Some(Dim::Lanes) => (self.arena.lane_row(id, window.lane_offset), window.lanes),
             Some(Dim::LanesPlus(k)) => (window.lane_offset, window.lanes + k),
             Some(Dim::Readouts) => return handle,
+            // A capturing fire is refused before a value of either is cut.
+            Some(Dim::Capturing | Dim::ContextTimes(_) | Dim::ContextPages) => return handle,
             Some(Dim::Const(_)) | None => return handle,
             Some(Dim::Patches) => (patch.row_offset, patch.rows),
             Some(Dim::Images) => (patch.lane_offset, patch.lanes),
