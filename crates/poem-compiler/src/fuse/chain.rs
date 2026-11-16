@@ -696,8 +696,7 @@ fn lowers_explicitly(op: &Operation) -> bool {
             form: RopeForm::Interleaved,
             ..
         }) | Operation::Elemwise(Elemwise::Rope {
-            freqs: None,
-            turn: Turn::Full { .. } | Turn::Partial { .. } | Turn::Last { .. },
+            turn: Turn::Full { .. } | Turn::Partial { .. } | Turn::Last { .. } | Turn::Yarn { .. },
             ..
         }) | Operation::Linear(Linear::Glu {
             packed: Some(_),
@@ -707,7 +706,7 @@ fn lowers_explicitly(op: &Operation) -> bool {
             limit: None,
             act: GluAct::Swiglu | GluAct::GegluTanh,
             ..
-        }) | Operation::Elemwise(Elemwise::Standardize { .. })
+        }) | Operation::Elemwise(Elemwise::Standardize { .. } | Elemwise::RmsnormGated { .. })
     )
 }
 
@@ -1162,7 +1161,8 @@ fn part(trace: &Trace, run: &[u32], width: u32) -> Option<u32> {
                 axis: NormAxis::Head(head),
                 ..
             })
-            | Operation::Elemwise(Elemwise::Rope { head_dim: head, .. }) => Some(*head),
+            | Operation::Elemwise(Elemwise::Rope { head_dim: head, .. })
+            | Operation::Elemwise(Elemwise::RmsnormGated { head_dim: head, .. }) => Some(*head),
             Operation::Elemwise(
                 Elemwise::ResidualAdd { gate: None, .. }
                 | Elemwise::Binary { .. }
@@ -1454,6 +1454,40 @@ impl Builder {
                 };
                 self.set(*y, out);
             }
+            // A gated norm (a run named outright: no chain forms over it): each head normed,
+            // times its weight where given, times the gate's activation.
+            Elemwise::RmsnormGated {
+                x,
+                gate,
+                weight,
+                head_dim,
+                eps,
+                act,
+                y,
+            } => {
+                let (width, head) = (self.width, *head_dim);
+                if head == 0 || width % head != 0 {
+                    return None;
+                }
+                let x = self.get(*x)?;
+                let mut n = if head == width {
+                    self.rms_normed(x, *eps)
+                } else {
+                    self.b.rms_normed_heads(x, head, *eps)
+                };
+                if let Some(w) = weight {
+                    let w = self.get(*w)?;
+                    n = self.push(Op::Binary(Binary::Mul, n, w));
+                }
+                let g = self.get(*gate)?;
+                let s = self.sigmoid(g);
+                let a = match act {
+                    poem_ir::GateActivation::Sigmoid => s,
+                    poem_ir::GateActivation::Silu => self.push(Op::Binary(Binary::Mul, g, s)),
+                };
+                let out = self.push(Op::Binary(Binary::Mul, n, a));
+                self.set(*y, out);
+            }
             // A head as wide as the row is the row's norm.
             Elemwise::Rmsnorm {
                 x,
@@ -1514,6 +1548,28 @@ impl Builder {
                 let turn = rotation(self.width, *head_dim, *theta, turn)?;
                 let out = self.b.rotate(self.get(*q)?, self.get(*positions)?, &turn);
                 self.set(*q_out, out);
+            }
+            // a rotation at frequencies stated outright (a checkpoint's rope scaling: a run
+            // named outright, no chain forms over it), q alone or q and k at the same positions
+            Elemwise::Rope {
+                q,
+                k,
+                positions,
+                head_dim,
+                theta,
+                turn,
+                freqs: Some(f),
+                q_out,
+                k_out,
+            } if f.mscale == 1.0 => {
+                let turn = rotation(self.width, *head_dim, *theta, turn)?;
+                let pos = self.get(*positions)?;
+                let qo = self.b.rotate_with(self.get(*q)?, pos, &turn, Some(&f.inv_freq));
+                self.set(*q_out, qo);
+                if let (Some(k), Some(k_out)) = (k, k_out) {
+                    let ko = self.b.rotate_with(self.get(*k)?, pos, &turn, Some(&f.inv_freq));
+                    self.set(*k_out, ko);
+                }
             }
             // q and k turned together (a run named outright: no chain forms over it), each
             // its own rotation at the same positions
