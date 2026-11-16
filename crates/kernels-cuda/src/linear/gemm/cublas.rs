@@ -2564,6 +2564,12 @@ pub fn time_tactics(on: bool) {
     TIMING.store(on, std::sync::atomic::Ordering::Release);
 }
 
+/// Whether tactics are being timed now (`pie tune`).
+#[must_use]
+pub fn timing() -> bool {
+    TIMING.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// The shapes met with no tactic in the tables since the last call, by
 /// name (`MxNxK`): a load names them once, after arming.
 #[must_use]

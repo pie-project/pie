@@ -1511,8 +1511,9 @@ impl Shell {
         }
         self.arm_rs = rs;
         // Past its kind's widest bucket a target captures cold: the top
-        // bucket's fires made what its warm fire would.
-        self.arm_cold = st.narrower(bucket, &target) && !st.verify;
+        // bucket's fires made what its warm fire would. Under `pie tune`
+        // each warms first, so its products meet the tuner uncaptured.
+        self.arm_cold = st.narrower(bucket, &target) && !st.verify && !tuning_tactics();
         let spent = self.cache.body_stats();
         let room = (self.bodies_mem as u64).saturating_sub(spent.census.bytes as u64);
         let spare = self.pools.spare_bytes_for_bodies(room).unwrap_or(u64::MAX);
@@ -1916,6 +1917,14 @@ impl Shell {
         let over = rows % lanes;
         Some((0..lanes).map(|at| base + u32::from(at < over)).collect())
     }
+}
+
+/// Whether `pie tune` is timing dense GEMM tactics in this process.
+fn tuning_tactics() -> bool {
+    #[cfg(feature = "cuda")]
+    return kernels_cuda::linear::gemm::timing();
+    #[cfg(not(feature = "cuda"))]
+    false
 }
 
 fn evidence(walked: &[Vec<f32>], replayed: &[Vec<f32>]) -> Option<String> {
