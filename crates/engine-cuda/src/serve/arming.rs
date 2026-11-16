@@ -1798,17 +1798,21 @@ impl Shell {
             self.budget.buckets.len(),
             st.profiled
         );
+        let took = stats.census.bytes as u64;
+        let captured = st.took.unwrap_or(took);
+        // What this arming took, the allowance a re-arm within the same
+        // load starts from ([`Shell::rearm_bodies`]) and a measuring load's
+        // second fit holds ([`Shell::measured_refit`]), with or without a
+        // record to keep it in.
+        if !st.verify {
+            self.bodies_took = captured.max(took);
+        }
         // The record: written where every rung armed, at what the bodies
         // took and what their captures took; dropped, and said, where a record's
         // allowance armed short of whole.
         if let Some(record) = self.bodies_record.as_deref()
             && !st.verify
         {
-            let took = stats.census.bytes as u64;
-            let captured = st.took.unwrap_or(took);
-            // What this arming took, the allowance a re-arm within the same
-            // load starts from ([`Shell::rearm_bodies`]).
-            self.bodies_took = captured.max(took);
             let measured = super::measured::Measured {
                 bytes: took,
                 bodies: stats.census.bodies as u64,
