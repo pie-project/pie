@@ -548,63 +548,103 @@ async fn a_guest_term_is_cut_to_the_top_rung_s_span_and_one_past_every_rung_is_r
     drop(open);
 }
 
-/// A pool that states no rungs (Vulkan, wgpu, XLA, Metal before its span):
-/// its activation is no part of it.
-fn rungless_pool() -> (SharedPool, FakeEngine) {
+/// A pool that states no rungs (a load whose activation lies outside the
+/// pool): one rung of fires of any tokens whose carve takes no chunk, its
+/// span the room the load backs, `room` chunks (`act_span_chunks`).
+fn rungless_pool(room: Option<u32>) -> (SharedPool, FakeEngine) {
     let mut facts = facts();
     facts.act_chunks = Vec::new();
+    facts.act_span_chunks = room;
     let mut pool = SharedPool::new(&facts, 256).unwrap();
     pool.set_max_lanes(LANES);
-    assert!(pool.rungs().is_empty());
+    assert_eq!(pool.rungs(), [u32::MAX], "one rung");
+    assert_eq!(pool.pool().act_max(), room.unwrap_or(0));
     (pool, FakeEngine::new())
 }
 
 /// The regression: on a pool without rungs every bind was refused, a zero
 /// term included ("fires need 0 bytes ... 0 chunks of the 15173"). A zero
-/// term never refuses, and the bind waits on nothing.
+/// term never refuses, and the bind waits on nothing, with or without room.
 #[tokio::test(flavor = "current_thread")]
 async fn a_zero_term_never_refuses_a_bind_on_a_pool_without_rungs() {
-    let (mut pool, engine) = rungless_pool();
-    pool.fire_facts_learned(key(PROGRAM), &FireFacts::default());
-    let shared: Shared = Arc::new(Mutex::new(pool));
-    let open = ProgramOpen::new(&shared, key(PROGRAM), 0).expect("a zero term never refuses");
-    fund_span(&shared, || u32::MAX, &Lane(Arc::new(Mutex::new(engine))))
-        .await
-        .unwrap();
-    drop(open);
+    for room in [None, Some(4)] {
+        let (mut pool, engine) = rungless_pool(room);
+        pool.fire_facts_learned(key(PROGRAM), &FireFacts::default());
+        let shared: Shared = Arc::new(Mutex::new(pool));
+        let open = ProgramOpen::new(&shared, key(PROGRAM), 0).expect("a zero term never refuses");
+        fund_span(&shared, || u32::MAX, &Lane(Arc::new(Mutex::new(engine))))
+            .await
+            .unwrap();
+        drop(open);
+    }
 }
 
-/// On a pool without rungs a term, however large, is ignored: no bind is
-/// refused for it and none waits on it.
+/// A pool without rungs is the one-rung case of the same cut: its guest
+/// term (here 36 MiB a fire, 3 chunks) is set aside in the room its load
+/// backs (4 chunks at the pool's end, below which live state lies), the
+/// bind funded there and its fires uncut; a term past that room is
+/// refused at its first bind, by name, the pool as it was. A load that
+/// backs no room refuses any term.
 #[tokio::test(flavor = "current_thread")]
-async fn a_pool_without_rungs_skips_the_term_check() {
-    let (mut pool, engine) = rungless_pool();
+async fn a_pool_without_rungs_cuts_and_refuses_its_term_against_the_room_its_load_backs() {
+    const PAST: ProgramId = ProgramId(9);
+    let (mut pool, engine) = rungless_pool(Some(4));
+    let records = pool
+        .take_records(pool.records_available() as usize)
+        .unwrap();
     pool.fire_facts_learned(key(PROGRAM), &fire_facts());
     pool.fire_facts_learned(
-        key(ProgramId(9)),
+        key(PAST),
         &FireFacts {
-            fixed: u64::from(TOTAL) * CHUNK,
+            fixed: 5 * CHUNK,
             ..FireFacts::default()
         },
     );
     let shared: Shared = Arc::new(Mutex::new(pool));
-    let open = ProgramOpen::new(&shared, key(PROGRAM), 0).expect("the term is ignored");
-    let huge =
-        ProgramOpen::new(&shared, key(ProgramId(9)), 0).expect("past the device, still ignored");
+
+    let refused = ProgramOpen::new(&shared, key(PAST), 0)
+        .map(|_| ())
+        .unwrap_err();
+    assert!(refused.contains(&key(PAST).to_string()), "{refused}");
+    assert!(
+        refused.contains("4 chunks the engine's activation span covers"),
+        "{refused}"
+    );
+    assert!(shared.lock().unwrap().pool().fire().is_zero());
+
+    let open = ProgramOpen::new(&shared, key(PROGRAM), 0).expect("3 chunks fit the room of 4");
     {
         let pool = shared.lock().unwrap();
-        assert_eq!(
-            pool.pool().act_chunks(16),
-            0,
-            "no activation to fold it into"
-        );
-        assert_eq!(pool.span_short(u32::MAX), 0);
+        assert_eq!(pool.pool().act_chunks(16), 3, "the term, no carve");
+        assert_eq!(pool.widest_fit(), Some(u32::MAX));
         assert_eq!(pool.fit_cap(), u32::MAX, "fires uncut");
     }
     fund_span(&shared, || u32::MAX, &Lane(Arc::new(Mutex::new(engine))))
         .await
         .unwrap();
-    drop((open, huge));
+    {
+        let pool = shared.lock().unwrap();
+        assert_eq!(pool.pool().act_reserved(), 3, "set aside for its fires");
+        assert_eq!(pool.pool().live_limit(), TOTAL - 4);
+        assert!(
+            records
+                .iter()
+                .flat_map(|&record| pool.record_slots(record))
+                .all(|slot| pool.pool().physical(slot.chunk).unwrap() < TOTAL - 4),
+            "live state below the room"
+        );
+        pool.pool().check();
+    }
+    drop(open);
+
+    let (mut bare, _) = rungless_pool(None);
+    bare.fire_facts_learned(key(PROGRAM), &fire_facts());
+    let bare: Shared = Arc::new(Mutex::new(bare));
+    let refused = ProgramOpen::new(&bare, key(PROGRAM), 0)
+        .map(|_| ())
+        .unwrap_err();
+    assert!(refused.contains(&key(PROGRAM).to_string()), "{refused}");
+    assert!(refused.contains("of the top rung's span"), "{refused}");
 }
 
 /// On a pool with rungs a zero term never refuses either.

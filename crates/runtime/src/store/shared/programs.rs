@@ -342,12 +342,12 @@ impl SharedPool {
             .max()
     }
 
-    /// Whether the guest term leaves no rung room in the top rung's span: never
-    /// where no pair takes anything (a zero term is no term), and never on
-    /// a pool that states no rungs, whose activation is no part of it, so
-    /// the term is ignored there.
+    /// Whether the guest term leaves no rung room in the top rung's span:
+    /// never where no pair takes anything (a zero term is no term). A pool
+    /// stating no rungs is one rung, its span the room its load backs
+    /// ([`SlotPool::new`]), and is refused the same way.
     fn term_refused(&self) -> bool {
-        !self.pool.guests_zero() && !self.pool.rungs().is_empty() && self.widest_fit().is_none()
+        !self.pool.guests_zero() && self.widest_fit().is_none()
     }
 
     /// The widest rung fires may take: [`Self::widest_fit`], the smallest

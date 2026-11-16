@@ -889,7 +889,9 @@ impl SharedPool {
                 growth: SegmentGrowth::Fixed,
             },
             reserved: Vec::new(),
+            // No activation, and no span of the device's.
             act_chunks: Vec::new(),
+            act_span_chunks: None,
             eager_rungs: Vec::new(),
             held_bytes: 0,
             outside_bytes: 0,

@@ -1747,7 +1747,11 @@ async fn sixty_four_windowed_prompts_grow_a_pool_that_starts_at_one_segment() {
     let stores = crate::store::registry::get(model, 0);
     let shared = stores.shared.clone().expect("a shared pool");
     assert_eq!(shared.lock().unwrap().mapped_segments(), 1);
-    assert!(shared.lock().unwrap().rungs().is_empty());
+    assert_eq!(
+        shared.lock().unwrap().rungs(),
+        [u32::MAX],
+        "no rung stated: one of no carve"
+    );
     let mut grow = crate::store::shared::SharedGrow::new(model, 0, shared.clone());
     let planner = Arc::new(ResidencyPlanner::new(Arc::new(
         RegistryPool::new(model, 0, false).with_shared_grow(grow.clone()),
