@@ -97,6 +97,7 @@ fn trunk_and_decoder() -> Trace {
         value: y,
         layer: None,
         grid: None,
+        planes: Vec::new(),
     });
     let h = b.op(latent, voxel(Dim::Voxels), Guard::Fact(0));
     let pixels = b.op(h, voxel(Dim::VoxelsScaled(4, 1)), Guard::Fact(0));
@@ -105,6 +106,7 @@ fn trunk_and_decoder() -> Trace {
         value: pixels,
         layer: None,
         grid: None,
+        planes: Vec::new(),
     });
     b.trace
 }

@@ -28,6 +28,7 @@ fn output_decl(
         layers: output.layers,
         max_rows: u32::try_from(output_rows(output, limits)).unwrap_or(u32::MAX),
         readout: output.readout,
+        planes: output.planes.clone(),
     }
 }
 
