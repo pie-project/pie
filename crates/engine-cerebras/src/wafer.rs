@@ -10,6 +10,7 @@ use std::time::Instant;
 
 use crate::artifact::{self, ArtifactModel};
 use crate::sdk::{Platform, Runtime, Sdk};
+use crate::units::UnitModel;
 
 type R<T> = std::result::Result<T, String>;
 
@@ -59,7 +60,49 @@ enum Job {
 /// The argmax after each row, and the logits rows asked for.
 type Answer = R<(Vec<u32>, Vec<Vec<f32>>)>;
 
-/// An [`ArtifactModel`] on its own thread.
+/// The model a wafer program serves: the decode template's, or a program of stream units.
+enum Model {
+    Artifact(Box<ArtifactModel>),
+    Units(Box<UnitModel>),
+}
+
+impl Model {
+    /// (passes a launch, positions, vocab, hidden)
+    fn sizes(&self) -> (usize, usize, usize, usize) {
+        match self {
+            Model::Artifact(m) => (m.cap, m.positions, m.vocab, m.hidden),
+            Model::Units(m) => (1, m.positions, m.vocab, 0),
+        }
+    }
+
+    fn counts(&self) -> (u64, u64) {
+        match self {
+            Model::Artifact(m) => (m.launches, m.steps),
+            Model::Units(m) => (m.launches, m.steps),
+        }
+    }
+
+    fn greedy(&mut self, tokens: &[u32], start: usize, extra: usize) -> R<Vec<u32>> {
+        match self {
+            Model::Artifact(m) => m.greedy(tokens, start, extra),
+            Model::Units(m) => m.greedy(tokens, start, extra),
+        }
+    }
+
+    fn forward(
+        &mut self,
+        tokens: &[u32],
+        start: usize,
+        logits: bool,
+    ) -> R<(Vec<u32>, Option<Vec<f32>>)> {
+        match self {
+            Model::Artifact(m) => m.forward(tokens, start, logits),
+            Model::Units(m) => m.forward(tokens, start, logits),
+        }
+    }
+}
+
+/// A [`Model`] on its own thread.
 pub struct Wafer {
     jobs: Option<mpsc::Sender<Job>>,
     answers: mpsc::Receiver<Answer>,
@@ -90,6 +133,52 @@ impl Wafer {
     ) -> R<Wafer> {
         let art = artifact::read(&program)?;
         let posted_loop = art.host.loop_len as usize;
+        Wafer::spawn(posted_loop, move || {
+            let sdk = Sdk::open_at(&sdk_lib).map_err(|e| e.to_string())?;
+            let mut rt =
+                Runtime::new(sdk, &program, platform, "WARNING").map_err(|e| e.to_string())?;
+            let t0 = Instant::now();
+            rt.load();
+            rt.run();
+            tracing::info!(s = t0.elapsed().as_secs_f64(), "artifact: program loaded");
+            let mut m = ArtifactModel::open(Box::new(rt), &weights, &art, vocab)?;
+            m.force = force_prompt;
+            Ok(Model::Artifact(Box::new(m)))
+        })
+    }
+
+    /// A decode program of stream units ([`UnitModel`]): `program` its `wafer-compile stream`
+    /// files (host.json), `link` its link, its statics made from `checkpoint` as `contract`
+    /// lands it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_units(
+        program: PathBuf,
+        link: PathBuf,
+        platform: Platform,
+        sdk_lib: PathBuf,
+        trace: poem_ir::Trace,
+        contract: checkpoint::contract::ModelContract,
+        checkpoint: PathBuf,
+        positions: usize,
+    ) -> R<Wafer> {
+        Wafer::spawn(0, move || {
+            let reading = crate::reading::Reading::open(&program)?;
+            let landed = crate::prepare::land(&trace, &contract, &checkpoint)?;
+            let sdk = Sdk::open_at(&sdk_lib).map_err(|e| e.to_string())?;
+            let mut rt =
+                Runtime::new(sdk, &link, platform, "WARNING").map_err(|e| e.to_string())?;
+            let t0 = Instant::now();
+            rt.load();
+            rt.run();
+            tracing::info!(s = t0.elapsed().as_secs_f64(), "units: program loaded");
+            let of = |name: &str, count: usize| crate::prepare::plane(&landed, name, count);
+            let m = UnitModel::open(Box::new(rt), reading, trace, &of, positions)?;
+            Ok(Model::Units(Box::new(m)))
+        })
+    }
+
+    /// The model `open` makes, on a thread of its own taking jobs.
+    fn spawn(posted_loop: usize, open: impl FnOnce() -> R<Model> + Send + 'static) -> R<Wafer> {
         let (job_tx, job_rx) = mpsc::channel::<Job>();
         let (ans_tx, ans_rx) = mpsc::channel::<Answer>();
         let (post_tx, post_rx) = mpsc::channel::<Answer>();
@@ -97,21 +186,9 @@ impl Wafer {
         let thread = std::thread::Builder::new()
             .name("spatial-wafer".into())
             .spawn(move || {
-                let open = || -> R<ArtifactModel> {
-                    let sdk = Sdk::open_at(&sdk_lib).map_err(|e| e.to_string())?;
-                    let mut rt = Runtime::new(sdk, &program, platform, "WARNING")
-                        .map_err(|e| e.to_string())?;
-                    let t0 = Instant::now();
-                    rt.load();
-                    rt.run();
-                    tracing::info!(s = t0.elapsed().as_secs_f64(), "artifact: program loaded");
-                    let mut m = ArtifactModel::open(Box::new(rt), &weights, &art, vocab)?;
-                    m.force = force_prompt;
-                    Ok(m)
-                };
                 let mut m = match open() {
                     Ok(m) => {
-                        let _ = ready_tx.send(Ok((m.cap, m.positions, m.vocab, m.hidden)));
+                        let _ = ready_tx.send(Ok(m.sizes()));
                         m
                     }
                     Err(e) => {
@@ -162,11 +239,8 @@ impl Wafer {
                         } => (forward(&mut m, &tokens, start, which), &ans_tx),
                     };
                     idle_from = Instant::now();
-                    tracing::info!(
-                        launches = m.launches,
-                        steps = m.steps,
-                        "spatial wafer: totals"
-                    );
+                    let (launches, steps) = m.counts();
+                    tracing::info!(launches, steps, "spatial wafer: totals");
                     if to.send(answer).is_err() {
                         break;
                     }
@@ -258,7 +332,7 @@ impl Wafer {
 }
 
 /// A forward on the wafer's thread: every row's logits a row at a time.
-fn forward(m: &mut ArtifactModel, tokens: &[u32], start: usize, which: Logits) -> Answer {
+fn forward(m: &mut Model, tokens: &[u32], start: usize, which: Logits) -> Answer {
     match which {
         Logits::None => m
             .forward(tokens, start, false)

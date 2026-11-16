@@ -59,7 +59,9 @@ const USAGE: &str = "usage: wafer-bench --program <dir> --weights <dir>[:<prefix
                      <golden.json> [--steps N] [--tokens N] [--cmaddr <addr>] [--logits <out.json>] \
                      [--times <out.json>] [--forced N]\n       wafer-bench --reading <dir> --program <dir> \
                      --inputs <dir> [--grid T,H,W] [--steps N] [--golden <dir>] [--save <dir>] [--reload 1] [--cmaddr <addr>] [--statics <dir>] [--stamps <dir>] \
-                     [--rows 1 [--save-rows <dir>]]";
+                     [--rows 1 [--save-rows <dir>]]\n       wafer-bench --decode <golden.json> --checkpoint <dir> \
+                     (--reading <dir> --program <dir> | --model <deployment> --cache <dir> [--positions N]) \
+                     [--steps N] [--cmaddr <addr>] [--export <dir>] [--dry 1]";
 
 fn main() {
     match run() {
@@ -280,7 +282,30 @@ fn stamped(
 fn decode(get: &HashMap<String, String>) -> Result<bool, String> {
     use engine_cerebras::reading::Reading;
     let need = |k: &str| get.get(k).cloned().ok_or_else(|| USAGE.to_string());
-    let reading = Reading::open(Path::new(&need("reading")?))?;
+    // the program given, or (`--cache`) the one the engine compiles on load for the model
+    let (dir, program) = match get.get("cache") {
+        None => (need("reading")?, need("program")?),
+        Some(cache) => {
+            let model = need("model")?;
+            let trace = poem_compiler::catalog::repository()
+                .parse(&model)
+                .ok_or_else(|| format!("{model}: no such deployment"))?
+                .trace(poem_ir::Platform::Cerebras);
+            let cfg = engine_cerebras::config::Config {
+                cache_dir: Some(cache.into()),
+                cmaddr: get.get("cmaddr").cloned(),
+                ..Default::default()
+            };
+            let positions = get
+                .get("positions")
+                .map(|p| p.parse::<u32>().map_err(|e| format!("--positions: {e}")))
+                .transpose()?;
+            let (d, l, at) = engine_cerebras::prepare::unit_program(&cfg, &trace, positions)?;
+            println!("DECODE_PROGRAM {} at {at} positions", d.display());
+            (d.display().to_string(), l.display().to_string())
+        }
+    };
+    let reading = Reading::open(Path::new(&dir))?;
     let trace = reading.trace()?;
     let golden: Value = serde_json::from_str(
         &std::fs::read_to_string(need("decode")?).map_err(|e| format!("--decode: {e}"))?,
@@ -379,8 +404,8 @@ fn decode(get: &HashMap<String, String>) -> Result<bool, String> {
         }),
     };
     let sdk = Sdk::open().map_err(|e| e.to_string())?;
-    let mut rt = Runtime::new(sdk, Path::new(&need("program")?), platform, "WARNING")
-        .map_err(|e| e.to_string())?;
+    let mut rt =
+        Runtime::new(sdk, Path::new(&program), platform, "WARNING").map_err(|e| e.to_string())?;
     rt.load();
     rt.run();
     reading.write_statics(&mut rt, &statics)?;
@@ -759,7 +784,7 @@ fn run() -> Result<bool, String> {
             _ => return Err(USAGE.into()),
         }
     }
-    if get.contains_key("reading") && get.contains_key("decode") {
+    if get.contains_key("decode") && (get.contains_key("reading") || get.contains_key("cache")) {
         return decode(&get);
     }
     if get.contains_key("reading") {

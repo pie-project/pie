@@ -490,30 +490,8 @@ pub fn stream_programs(
         if let Some(cslc) = &cslc {
             for dir in &progs {
                 let reading = dir.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
-                let fab = std::fs::read_to_string(dir.join("fabric.txt")).map_err(io(dir))?;
-                let f: Vec<u32> = fab.split_whitespace().filter_map(|x| x.parse().ok()).collect();
-                let (w, h, bf16) = match f[..] {
-                    [w, h, b] => (w, h, b == 1),
-                    _ => return Err(format!("{}: fabric.txt is not `w h bf16`", dir.display())),
-                };
-                let (mut fabric_dims, fabric_offsets) = kernels_cerebras::toolchain::memcpy_fabric(w, h);
-                if cfg.cmaddr.is_some() {
-                    fabric_dims = arch(cfg.target).system_fabric();
-                }
                 let t0 = std::time::Instant::now();
-                cslc.compile(&kernels_cerebras::toolchain::Compile {
-                    arch: arch(cfg.target),
-                    layout: dir.join("layout.csl"),
-                    fabric_dims,
-                    fabric_offsets,
-                    params: Vec::new(),
-                    memcpy: true,
-                    channels: 1,
-                    import_paths: Vec::new(),
-                    out: dir.join("out"),
-                    bf16,
-                })
-                .map_err(|e| format!("{reading}: {e}"))?;
+                link_stream(cfg, cslc, dir).map_err(|e| format!("{reading}: {e}"))?;
                 tracing::info!(reading = %reading, s = t0.elapsed().as_secs_f64(), "cerebras: a stream program linked");
             }
         }
@@ -533,6 +511,141 @@ pub fn stream_programs(
             })
             .collect(),
     ))
+}
+
+/// A stream program's link (`wafer-compile stream`'s files in `dir`, linked into `dir/out`) for
+/// the fabric the engine runs on.
+fn link_stream(cfg: &Config, cslc: &Cslc, dir: &Path) -> R<()> {
+    let fab = std::fs::read_to_string(dir.join("fabric.txt")).map_err(io(dir))?;
+    let f: Vec<u32> = fab
+        .split_whitespace()
+        .filter_map(|x| x.parse().ok())
+        .collect();
+    let (w, h, bf16) = match f[..] {
+        [w, h, b] => (w, h, b == 1),
+        _ => return Err(format!("{}: fabric.txt is not `w h bf16`", dir.display())),
+    };
+    let (mut fabric_dims, fabric_offsets) = kernels_cerebras::toolchain::memcpy_fabric(w, h);
+    if cfg.cmaddr.is_some() {
+        fabric_dims = arch(cfg.target).system_fabric();
+    }
+    cslc.compile(&kernels_cerebras::toolchain::Compile {
+        arch: arch(cfg.target),
+        layout: dir.join("layout.csl"),
+        fabric_dims,
+        fabric_offsets,
+        params: Vec::new(),
+        memcpy: true,
+        channels: 1,
+        import_paths: Vec::new(),
+        out: dir.join("out"),
+        bf16,
+    })
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+/// The positions a decode program of stream units is first tried at when the config states none,
+/// and the fewest it is searched down to.
+const UNIT_POSITIONS: (u32, u32) = (8192, 64);
+
+/// A decode program of stream units (GENERIC.md G1), compiled on load into the cache unless it
+/// holds it: the model's decode step lowered to units (`stream::compile_decode`) at `positions`
+/// (the config's context), else at the most positions in `UNIT_POSITIONS` its K / V columns
+/// hold (a refusal at the fewest is the model's). Returns its files' directory, its link and
+/// its positions.
+pub fn unit_program(
+    cfg: &Config,
+    trace: &Trace,
+    positions: Option<u32>,
+) -> R<(PathBuf, PathBuf, u32)> {
+    use kernels_cerebras::stream;
+    let cache = Cache::open(cfg)?;
+    let cslc = Cslc::find(&cfg.toolchain).map_err(|e| e.to_string())?;
+    let fabric = if cfg.cmaddr.is_some() {
+        "system"
+    } else {
+        "simulator"
+    };
+    let stage = tempfile::Builder::new()
+        .prefix(".units-")
+        .tempdir_in(&cache.root)
+        .map_err(io(&cache.root))?;
+    let dir = stage.path().join("decode");
+    let compile = |at: u32| {
+        let _ = std::fs::remove_dir_all(&dir);
+        stream::compile_decode(trace, at, true, &dir).map(|_| ())
+    };
+    // the most positions that fit: the most a compile takes, by bisection (or the stated ones)
+    let (mut hi, mut lo) = match positions {
+        Some(p) => (p, p),
+        None => UNIT_POSITIONS,
+    };
+    let mut at = hi;
+    if let Err(e) = compile(hi) {
+        if lo == hi {
+            return Err(e);
+        }
+        compile(lo)?;
+        while hi > lo + lo.max(16) / 8 {
+            let mid = lo + (hi - lo) / 2;
+            match compile(mid) {
+                Ok(()) => lo = mid,
+                Err(_) => hi = mid,
+            }
+        }
+        // multiples of 16 positions
+        lo -= lo % 16;
+        compile(lo)?;
+        at = lo;
+    }
+    let mut hasher = blake3::Hasher::new();
+    let mut files = walk(&dir)?;
+    files.sort();
+    for f in files {
+        hasher.update(
+            f.strip_prefix(&dir)
+                .unwrap_or(&f)
+                .to_string_lossy()
+                .as_bytes(),
+        );
+        hasher.update(&std::fs::read(&f).map_err(io(&f))?);
+    }
+    for (n, src) in kernels_cerebras::sources::OPS
+        .iter()
+        .chain(kernels_cerebras::sources::STREAM_OPS)
+    {
+        hasher.update(n.as_bytes());
+        hasher.update(src.as_bytes());
+    }
+    hasher.update(fabric.as_bytes());
+    hasher.update(cslc.frontend().to_string_lossy().as_bytes());
+    let key = hasher.finalize().to_hex()[..16].to_string();
+    let parts = serde_json::json!({ "decode": "units", "positions": at, "fabric": fabric });
+    let made = cache.entry("u", &trace.name, &key, &parts, |tmp| {
+        if cfg.wafer.build == Build::Never {
+            return Err(format!(
+                "no compiled unit program {key} in the cache and [engine.wafer] build = \
+                 \"never\": compile it first (wafer-compile stream --reading decode + cslc)"
+            ));
+        }
+        for e in std::fs::read_dir(&dir).map_err(io(&dir))?.flatten() {
+            let to = tmp.join(e.file_name());
+            std::fs::rename(e.path(), &to).map_err(io(&to))?;
+        }
+        kernels_cerebras::stream::coresident::ops(tmp, &[])?;
+        let t0 = std::time::Instant::now();
+        link_stream(cfg, &cslc, tmp)?;
+        tracing::info!(
+            positions = at,
+            s = t0.elapsed().as_secs_f64(),
+            "cerebras: the unit decode program linked"
+        );
+        Ok(())
+    });
+    let (root, made) = made?;
+    tracing::info!(program = %root.display(), positions = at, compiled = made, "cerebras: the unit decode program");
+    Ok((root.clone(), root.join("out"), at))
 }
 
 /// Every file under `dir`.

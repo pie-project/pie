@@ -157,49 +157,82 @@ impl Engine for CerebrasEngine {
         }
         // the program serves the context the config states (else as many positions as it holds)
         let positions = budgets.context_declared.then_some(budgets.max_context);
-        let prepared = match prepare::prepare(&self.cfg, &trace, &contract, &path, positions) {
-            Ok(p) => p,
+        let slots = poem_compiler::state_slots(budgets.slots, &trace, DEFAULT_STATE_SLOTS);
+        let platform = self.platform();
+        let w = match prepare::prepare(&self.cfg, &trace, &contract, &path, positions) {
+            Ok(prepared) => {
+                let facts = Facts::of(trace.clone(), &budgets, slots).map_err(Error::Load)?;
+                let vocab = facts
+                    .readout()
+                    .as_ref()
+                    .map_or(usize::MAX, |(_, w)| *w as usize);
+                let w = wafer::Wafer::open(
+                    prepared.program.clone(),
+                    platform,
+                    vocab,
+                    prepared.weights.clone(),
+                    self.cfg.toolchain.sdk_lib(),
+                    self.debug.force_prompt,
+                )
+                .map_err(|e| Error::Load(format!("the wafer model: {e}")))?;
+                tracing::info!(
+                    program = %prepared.program.display(),
+                    vocab = w.vocab,
+                    hidden = w.hidden,
+                    "spatial wafer model loaded"
+                );
+                w
+            }
             Err(e) => {
-                // a model the decode program does not run: its stream readings, compiled here
                 let host = self.debug.stream_fabric.as_deref() == Some("host");
-                let streamed = if self.debug.program.is_none() {
-                    prepare::stream_programs(&self.cfg, &trace, host).map_err(Error::Load)?
-                } else {
+                let declared = trace.facts.declared("reading").is_some();
+                // a model the decode templates do not run: its decode step as stream units
+                let units = if declared || self.debug.program.is_some() || host {
                     None
+                } else {
+                    match prepare::unit_program(&self.cfg, &trace, positions) {
+                        Ok(p) => Some(p),
+                        Err(u) => {
+                            tracing::warn!(templates = %e, units = %u, "cerebras: no decode program");
+                            None
+                        }
+                    }
                 };
-                if let Some(programs) = streamed {
-                    tracing::info!(
-                        decode = %e,
-                        "cerebras: no decode program; the model's stream readings are served"
-                    );
-                    return self.load_stream(trace, &path, &contract, &budgets, &programs);
+                if let Some((program, link, held)) = units {
+                    tracing::info!(decode = %e, "cerebras: the decode templates refuse; the decode step runs as stream units");
+                    let w = wafer::Wafer::open_units(
+                        program.clone(),
+                        link,
+                        platform,
+                        self.cfg.toolchain.sdk_lib(),
+                        trace.clone(),
+                        contract.clone(),
+                        path.clone(),
+                        held as usize,
+                    )
+                    .map_err(|e| Error::Load(format!("the unit decode program: {e}")))?;
+                    tracing::info!(program = %program.display(), vocab = w.vocab, positions = w.positions, "spatial unit decode model loaded");
+                    w
+                } else {
+                    // a model the decode program does not run: its stream readings, compiled here
+                    let streamed = if self.debug.program.is_none() {
+                        prepare::stream_programs(&self.cfg, &trace, host).map_err(Error::Load)?
+                    } else {
+                        None
+                    };
+                    if let Some(programs) = streamed {
+                        tracing::info!(
+                            decode = %e,
+                            "cerebras: no decode program; the model's stream readings are served"
+                        );
+                        return self.load_stream(trace, &path, &contract, &budgets, &programs);
+                    }
+                    return Err(Error::Load(format!("the wafer program: {e}")));
                 }
-                return Err(Error::Load(format!("the wafer program: {e}")));
             }
         };
-        let slots = poem_compiler::state_slots(budgets.slots, &trace, DEFAULT_STATE_SLOTS);
         let facts = Facts::of(trace, &budgets, slots).map_err(Error::Load)?;
         self.readout = facts.readout();
-        let platform = self.platform();
-        let vocab = self
-            .readout
-            .as_ref()
-            .map_or(usize::MAX, |(_, w)| *w as usize);
-        let w = wafer::Wafer::open(
-            prepared.program.clone(),
-            platform,
-            vocab,
-            prepared.weights.clone(),
-            self.cfg.toolchain.sdk_lib(),
-            self.debug.force_prompt,
-        )
-        .map_err(|e| Error::Load(format!("the wafer model: {e}")))?;
-        tracing::info!(
-            program = %prepared.program.display(),
-            vocab = w.vocab,
-            hidden = w.hidden,
-            "spatial wafer model loaded"
-        );
         // The context the model holds: the wafer program's positions.
         let model_context = u32::try_from(w.positions).unwrap_or(u32::MAX);
         self.model = Some(w);

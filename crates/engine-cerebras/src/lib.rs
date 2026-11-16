@@ -37,6 +37,7 @@ pub mod guest;
 pub mod prepare;
 pub mod reading;
 pub mod sdk;
+pub mod units;
 pub mod wafer;
 
 use std::path::Path;
