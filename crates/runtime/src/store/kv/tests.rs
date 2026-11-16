@@ -80,6 +80,7 @@ fn tests_every_case() {
     a_pass_maps_in_more_after_what_it_mapped_in();
     a_page_no_one_else_reads_is_written_in_place();
     a_lookup_takes_the_copy_on_the_device();
+    a_lookup_follows_one_copy_to_its_children();
     what_a_decode_folds_seals();
     a_fire_that_never_settled_leaves_the_log_cut();
     a_hit_refreshes_only_the_entries_it_used_whole();
@@ -1014,6 +1015,30 @@ fn a_lookup_takes_the_copy_on_the_device() {
     let other = store.cached_run(&keys);
     assert_eq!(other.len(), 3, "the other copy, whole");
     assert_ne!(other[0].node, run[0].node);
+}
+
+fn a_lookup_follows_one_copy_to_its_children() {
+    let mut store = KvStore::new(32, h(77));
+    store.set_keeps(true);
+    let opening = prompt(77, 2);
+    let mut history = opening.clone();
+    history.extend(prompt(78, 2));
+    let first = store.create_working_set();
+    sealed(&mut store, first, &opening);
+    let agent = reader(&mut store, &opening, 2);
+    commit_opaque(&mut store, agent, 2);
+    seal(&mut store, agent, 32, &history[32..]);
+    let second = store.create_working_set();
+    sealed(&mut store, second, &opening);
+    for ws in [first, agent, second] {
+        store.release_working_set(ws, store.current_epoch());
+    }
+    store.retire_idle();
+    let next = store.create_working_set();
+    let keys = keys_ahead(&store, next, 0, &history);
+    let run = store.cached_run(&keys);
+    assert_eq!(run.len(), 4);
+    assert_eq!(store.attach_run(next, &run, 4, 16).unwrap(), 4);
 }
 
 fn decoded(store: &mut KvStore, tokens: &[u32], prefilled: usize, logged: usize) -> WorkingSetId {
