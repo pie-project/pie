@@ -1,7 +1,7 @@
 //! What a guest session shares across APIs: a stage's descriptor words and
 //! config, and how wide it dispatches.
 
-use eta_compiler::codegen::launch::LaunchStagePlan;
+use eta_compiler::codegen::launch::{LaunchPackage, LaunchStagePlan};
 use eta_compiler::codegen::{wgsl, wgsl_analysis};
 use eta_exec::{
     ChunkLayout, Extents, Launch, Launches, OpParams, Placed, SELECT_RESERVE, ValueDesc,
@@ -288,22 +288,160 @@ pub fn extents_of(extents: &engine::BindExtents) -> Extents {
     }
 }
 
-/// What an instance of `plans` holds for its scratch in chunks of `chunk`
-/// bytes (`engine::GuestState::per_instance`): its stages run one after
-/// another, each over the same pieces, so the most any stage holds
-/// ([`ChunkLayout::held_bytes`]).
-pub fn instance_scratch(
-    plans: &[LaunchStagePlan],
-    extents: &Extents,
-    chunk: u64,
-) -> Result<u64, String> {
-    plans.iter().try_fold(0u64, |most, plan| {
-        Ok(most.max(stage_tables(plan, extents, chunk)?.scratch.held_bytes(chunk)))
-    })
+/// The score rows an instance of a program holds for its capturing lanes
+/// (`Shell::score_spec`): each lane a read of which switches capture on, and
+/// whether it reads pages too; a key row's bytes and a page row's.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScoreSpec {
+    pub lanes: Vec<(u32, bool)>,
+    pub key_bytes: u64,
+    pub page_bytes: u64,
 }
 
-/// A piece of an instance's scratch as the guest runtime addresses it: its
-/// segment and its first word there.
+/// Every output `package` reads, by name, and the lane it reads it for.
+pub fn reads_of(package: &LaunchPackage) -> impl Iterator<Item = (&str, u32)> {
+    package
+        .values
+        .iter()
+        .filter_map(|value| Some((value.output.as_deref()?, value.lane)))
+}
+
+/// What an instance holds at its place: its stages' scratch (each stage over
+/// the same pieces, so each piece as full as the fullest stage leaves it),
+/// then its capturing lanes' score rows, each whole in a piece: a free tail
+/// of the first piece with room, else a new piece.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InstanceLay {
+    /// Each piece's bytes in use.
+    pub ends: Vec<u64>,
+    /// Each capturing lane's key row and, where it reads pages, page row.
+    pub rows: Vec<(u32, Placed, Option<Placed>)>,
+}
+
+impl InstanceLay {
+    #[must_use]
+    pub fn pieces(&self) -> u32 {
+        u32::try_from(self.ends.len()).unwrap_or(u32::MAX)
+    }
+
+    /// The bytes an instance holds in chunks of `chunk` bytes: the one
+    /// piece's where it takes one (a run inside a chunk), else whole
+    /// chunks, one a piece.
+    #[must_use]
+    pub fn held_bytes(&self, chunk: u64) -> u64 {
+        match self.ends[..] {
+            [] => 0,
+            [only] => only,
+            _ => u64::from(self.pieces()).saturating_mul(chunk),
+        }
+    }
+}
+
+/// `stages` laid together with `scores`' rows in chunks of `chunk` bytes
+/// ([`InstanceLay`]); a row larger than a chunk is refused by name.
+pub fn lay_instance(
+    stages: &[&ChunkLayout],
+    scores: &ScoreSpec,
+    chunk: u64,
+) -> Result<InstanceLay, String> {
+    let mut ends: Vec<u64> = Vec::new();
+    for stage in stages {
+        for (piece, &end) in stage.ends.iter().enumerate() {
+            match ends.get_mut(piece) {
+                Some(have) => *have = (*have).max(end),
+                None => ends.push(end),
+            }
+        }
+    }
+    let align = eta_exec::SCRATCH_ALIGN;
+    let mut place = |bytes: u64, what: &str| -> Result<Placed, String> {
+        let span = bytes.next_multiple_of(align);
+        if span > chunk {
+            return Err(format!(
+                "{what} takes {bytes} bytes, past a {chunk}-byte chunk, and a score row lies \
+                 whole in one"
+            ));
+        }
+        for (piece, end) in ends.iter_mut().enumerate() {
+            let at = end.next_multiple_of(align);
+            if at + span <= chunk {
+                *end = at + span;
+                return Ok(Placed {
+                    piece: u32::try_from(piece).unwrap_or(u32::MAX),
+                    offset: at,
+                });
+            }
+        }
+        ends.push(span);
+        Ok(Placed {
+            piece: u32::try_from(ends.len() - 1).unwrap_or(u32::MAX),
+            offset: 0,
+        })
+    };
+    let mut rows = Vec::with_capacity(scores.lanes.len());
+    for &(lane, pages) in &scores.lanes {
+        let key = place(scores.key_bytes, "a key row")?;
+        let page = if pages {
+            Some(place(scores.page_bytes, "a page row")?)
+        } else {
+            None
+        };
+        rows.push((lane, key, page));
+    }
+    Ok(InstanceLay { ends, rows })
+}
+
+/// What an instance of `plans` holds at `extents` with `scores`' rows, in
+/// chunks of `chunk` bytes ([`lay_instance`]).
+pub fn instance_lay(
+    plans: &[LaunchStagePlan],
+    extents: &Extents,
+    scores: &ScoreSpec,
+    chunk: u64,
+) -> Result<InstanceLay, String> {
+    let stages = plans
+        .iter()
+        .map(|plan| stage_tables(plan, extents, chunk).map(|tables| tables.scratch))
+        .collect::<Result<Vec<_>, _>>()?;
+    lay_instance(&stages.iter().collect::<Vec<_>>(), scores, chunk)
+}
+
+/// A capturing lane's score rows at its instance's place: its key row, and
+/// its page row where it reads pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScoreRows {
+    pub keys: PiecePlace,
+    pub pages: Option<PiecePlace>,
+}
+
+/// `lay`'s rows where its pieces lie (`pieces`, [`piece_places`]), by the
+/// program lane each is for.
+#[must_use]
+pub fn score_rows(lay: &InstanceLay, pieces: &[PiecePlace]) -> Vec<(u32, ScoreRows)> {
+    let at = |placed: Placed| {
+        pieces
+            .get(placed.piece as usize)
+            .map(|piece| piece.past(placed.offset))
+    };
+    lay.rows
+        .iter()
+        .filter_map(|&(lane, keys, pages)| {
+            Some((
+                lane,
+                ScoreRows {
+                    keys: at(keys)?,
+                    pages: match pages {
+                        Some(pages) => Some(at(pages)?),
+                        None => None,
+                    },
+                },
+            ))
+        })
+        .collect()
+}
+
+/// A piece of an instance's state as the guest runtime and the kernels
+/// address it (or a place inside one): its segment and its byte there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PiecePlace {
     pub segment: u32,
@@ -312,6 +450,15 @@ pub struct PiecePlace {
 }
 
 impl PiecePlace {
+    /// Byte `offset` of the piece.
+    #[must_use]
+    pub fn past(self, offset: u64) -> PiecePlace {
+        PiecePlace {
+            at: self.at + offset,
+            ..self
+        }
+    }
+
     /// The guest address of its first word: the segment in the top bits.
     #[must_use]
     pub fn address(self) -> u32 {

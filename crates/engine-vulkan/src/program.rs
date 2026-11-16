@@ -1075,6 +1075,9 @@ impl Plane {
             .ring
             .as_ref()
             .ok_or_else(|| "the plane laid no guest staging ring at the load".to_owned())?;
+        let scores = place
+            .shell
+            .score_spec(engine_gpu::guest::session::reads_of(&plan.package));
         let extents = eta_exec::Extents {
             row_count: binding.extents.row_count,
             token_count: binding.extents.token_count,
@@ -1098,6 +1101,7 @@ impl Plane {
                 chunk: place.pools.chunk_bytes(),
                 ring,
                 lanes: engine_gpu::guest::pass_lanes(&plan.package),
+                scores: &scores,
             },
         )
         .map_err(|why| format!("its device half did not build: {why}"))
@@ -1229,6 +1233,23 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
 
     fn take(&mut self, instance: InstanceId, channel: u32) -> Result<Option<Vec<u8>>, Refusal> {
         Plane::take(self, instance, channel)
+    }
+
+    fn score_rows(
+        &self,
+        instance: InstanceId,
+    ) -> Vec<(u32, engine_gpu::guest::session::ScoreRows)> {
+        #[cfg(feature = "vulkan")]
+        {
+            self.instances
+                .get(&instance)
+                .map_or_else(Vec::new, |seat| seat.session.score_rows().to_vec())
+        }
+        #[cfg(not(feature = "vulkan"))]
+        {
+            let _ = instance;
+            Vec::new()
+        }
     }
 
     fn reads(&self, instance: InstanceId) -> Vec<(String, u32)> {

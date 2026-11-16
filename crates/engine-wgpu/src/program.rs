@@ -33,6 +33,11 @@ struct Instance {
 
     #[cfg(feature = "wgpu")]
     gate: Arc<Gate>,
+
+    /// Where its capturing lanes' score rows lie, as its session last
+    /// placed them (read at every fire, without the half's lock).
+    #[cfg(feature = "wgpu")]
+    rows: Vec<(u32, engine_gpu::guest::session::ScoreRows)>,
 }
 
 impl Instance {
@@ -479,6 +484,8 @@ impl Plane {
         self.instances.insert(
             id,
             Instance {
+                #[cfg(feature = "wgpu")]
+                rows: session.score_rows().to_vec(),
                 #[cfg(feature = "wgpu")]
                 half: Arc::new(std::sync::Mutex::new(Half {
                     id,
@@ -983,6 +990,9 @@ impl Plane {
                 .as_ref()
                 .ok_or_else(|| "the plane laid no guest ring at the load".to_owned())?,
         );
+        let scores = place
+            .shell
+            .score_spec(engine_gpu::guest::session::reads_of(&plan.package));
         let extents = eta_exec::Extents {
             row_count: binding.extents.row_count,
             token_count: binding.extents.token_count,
@@ -1014,6 +1024,7 @@ impl Plane {
                 chunk: place.pools.chunk_bytes(),
                 ring: &ring,
                 lanes: engine_gpu::guest::pass_lanes(&plan.package),
+                scores: &scores,
             },
         )
         .map_err(|why| format!("its device half did not build: {why}"))
@@ -1065,13 +1076,12 @@ impl Plane {
     /// Points every instance's tables at the chunks their slots sit in now.
     pub fn rebind(&mut self, pools: &Pools<crate::device::Api>) -> Result<(), Refusal> {
         #[cfg(feature = "wgpu")]
-        for seat in self.instances.values() {
-            seat.half
-                .lock()
-                .expect("half lock poisoned")
-                .session
+        for seat in self.instances.values_mut() {
+            let mut half = seat.half.lock().expect("half lock poisoned");
+            half.session
                 .rebind(pools)
                 .map_err(|fault| Refusal::Program(fault.to_string()))?;
+            seat.rows = half.session.score_rows().to_vec();
         }
         #[cfg(not(feature = "wgpu"))]
         let _ = pools;
@@ -1098,19 +1108,18 @@ impl Plane {
                          of a ring on the host"
                     )));
                 }
-                let seat = self.instances.get(id).ok_or(Refusal::Closed {
+                let seat = self.instances.get_mut(id).ok_or(Refusal::Closed {
                     what: "instance",
                     id: id.0,
                 })?;
                 #[cfg(feature = "wgpu")]
                 {
                     seat.gate.settle(*id)?;
-                    seat.half
-                        .lock()
-                        .expect("half lock poisoned")
-                        .session
+                    let mut half = seat.half.lock().expect("half lock poisoned");
+                    half.session
                         .retarget(pools, instance, scratch)
                         .map_err(|fault| Refusal::Program(fault.to_string()))?;
+                    seat.rows = half.session.score_rows().to_vec();
                 }
                 #[cfg(not(feature = "wgpu"))]
                 let _ = (seat, pools, instance, scratch);
@@ -1273,6 +1282,23 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
 
     fn take(&mut self, instance: InstanceId, channel: u32) -> Result<Option<Vec<u8>>, Refusal> {
         Plane::take(self, instance, channel)
+    }
+
+    fn score_rows(
+        &self,
+        instance: InstanceId,
+    ) -> Vec<(u32, engine_gpu::guest::session::ScoreRows)> {
+        #[cfg(feature = "wgpu")]
+        {
+            self.instances
+                .get(&instance)
+                .map_or_else(Vec::new, |seat| seat.rows.clone())
+        }
+        #[cfg(not(feature = "wgpu"))]
+        {
+            let _ = instance;
+            Vec::new()
+        }
     }
 
     fn reads(&self, instance: InstanceId) -> Vec<(String, u32)> {

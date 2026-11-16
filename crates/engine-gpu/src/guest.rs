@@ -712,6 +712,51 @@ mod tests {
         assert!(within(&top_p, 0, &Extents::default(), bounds).is_ok());
     }
 
+    /// An instance's score rows lie whole in pieces beside its scratch: in
+    /// its pieces' free tails first, else in pieces of their own; held as a
+    /// run where all of it fits one piece, else whole chunks; a row past a
+    /// chunk is refused by name.
+    #[test]
+    fn score_rows_lie_whole_beside_the_scratch() {
+        use session::{ScoreSpec, lay_instance};
+        let vocab = shipped::QWEN_VOCAB;
+        let chunk = shipped::QWEN_CHUNK;
+        let greedy = shipped::package(&shipped::greedy(vocab), vocab);
+        let stage = session::stage_tables(&greedy.plans[0], &Extents::default(), chunk)
+            .expect("greedy lays out");
+        let spec = |lanes: Vec<(u32, bool)>| ScoreSpec {
+            lanes,
+            key_bytes: 40_960 * 4,
+            page_bytes: 2_560 * 4,
+        };
+        let none = lay_instance(&[&stage.scratch], &spec(Vec::new()), chunk).expect("fits");
+        assert_eq!(none.ends, stage.scratch.ends, "no row, the scratch alone");
+        let one = lay_instance(&[&stage.scratch], &spec(vec![(0, true)]), chunk).expect("fits");
+        assert_eq!(one.pieces(), 1, "a key and a page row fit the scratch's piece");
+        let (lane, keys, pages) = one.rows[0];
+        assert_eq!(lane, 0);
+        assert!(keys.offset >= stage.scratch.ends[0], "past the scratch");
+        assert_eq!(pages.expect("a page row").offset, keys.offset + 40_960 * 4);
+        assert_eq!(one.held_bytes(chunk), one.ends[0], "one run");
+        let many: Vec<(u32, bool)> = (0..8).map(|lane| (lane, lane % 2 == 0)).collect();
+        let lay = lay_instance(&[&stage.scratch], &spec(many), chunk).expect("fits");
+        assert!(lay.pieces() > 1);
+        assert_eq!(lay.held_bytes(chunk), u64::from(lay.pieces()) * chunk);
+        for &(_, keys, pages) in &lay.rows {
+            for (row, bytes) in [(Some(keys), 40_960 * 4), (pages, 2_560 * 4)] {
+                if let Some(row) = row {
+                    assert!(row.offset + bytes <= chunk, "a row lies whole in its piece");
+                }
+            }
+        }
+        let wide = ScoreSpec {
+            key_bytes: chunk + 4,
+            ..spec(vec![(0, false)])
+        };
+        let refused = lay_instance(&[&stage.scratch], &wide, chunk).unwrap_err();
+        assert!(refused.contains("a key row takes"), "{refused}");
+    }
+
     /// A value the host stages or reads back that the stage's plan does not
     /// hold for it is refused by name, never laid over.
     #[test]

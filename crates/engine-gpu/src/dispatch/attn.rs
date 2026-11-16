@@ -171,21 +171,85 @@ impl<B: Backend> Run<'_, B> {
         )
     }
 
+    /// The fire's capture table and the normalisers' room.
+    fn capture_seats(
+        &self,
+        op: &'static str,
+    ) -> Result<(kernels_slang::Tensor, kernels_slang::Tensor), kernels_slang::Error> {
+        let missing = |what: &str| kernels_slang::Error::Backend {
+            op,
+            detail: format!("a capturing fire with no {what}, which the load lays where its trace captures"),
+        };
+        let table = self.bindings().capture.ok_or_else(|| missing("capture table"))?;
+        let stats = self.score_stats().ok_or_else(|| missing("normalisers' room"))?;
+        Ok((table, stats))
+    }
+
     fn requests(&self) -> u32 {
         u32::try_from(self.qo_indptr_host().len().saturating_sub(1)).unwrap_or(u32::MAX)
     }
 
     fn attention(&mut self, op: &Attn) -> Result<(), kernels_slang::Error> {
         match op {
-            // A capturing lane's rows lie in its reading program's guest
-            // region (`poem_ir::Dim::Capturing`); this backend lays none
-            // yet, so a capturing fire is refused by name.
-            Attn::ScoreCapture { .. } | Attn::ScorePages { .. } => Err(kernels_slang::Error::Backend {
-                op: "attn.score_capture",
-                detail: "this backend does not yet lay a capturing lane's score rows in its \
-                         reading program's guest region"
-                    .to_string(),
-            }),
+            // A fire's capturing lanes, compacted through its capture table:
+            // each one's rows lie at its reading instance's place in the
+            // pool whatever the window, so a capture fires once a fire, in
+            // its region's first launch. Every layer adds into the one key
+            // row the lane holds.
+            Attn::ScoreCapture {
+                q,
+                cache,
+                head_dim,
+                kv_heads,
+                q_heads,
+                sm_scale,
+                observe,
+                into,
+                ..
+            } => {
+                if self.run_index() != 0 {
+                    return Ok(());
+                }
+                let capturing = self.scored().rows();
+                if capturing == 0 {
+                    return Ok(());
+                }
+                let (table, stats) = self.capture_seats("attn.score_capture")?;
+                kernels_slang::attn::score::capture(
+                    self.ctx,
+                    &kernels_slang::attn::score::Capture {
+                        q: self.uncut(*q),
+                        positions: self.bindings().positions,
+                        table,
+                        capturing,
+                        stats,
+                        context: self.scored().widths().0,
+                    },
+                    self.pool(*cache),
+                    *head_dim,
+                    *kv_heads,
+                    *q_heads,
+                    *sm_scale,
+                    *observe,
+                    into.is_some(),
+                )
+            }
+            Attn::ScorePages { .. } => {
+                if self.run_index() != 0 || self.scored().page_rows() == 0 {
+                    return Ok(());
+                }
+                let (table, _) = self.capture_seats("attn.score_pages")?;
+                let (context, pages, page_size) = self.scored().widths();
+                kernels_slang::attn::score::pages(
+                    self.ctx,
+                    table,
+                    self.scored().rows(),
+                    context,
+                    pages,
+                    page_size,
+                    self.pool_segments(),
+                )
+            }
             Attn::Voxel {
                 q,
                 k,

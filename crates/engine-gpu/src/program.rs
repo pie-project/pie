@@ -18,6 +18,9 @@ use crate::store::Pools;
 /// runtime took for it, the alignment of a table in its slot, and the
 /// bound a guest pass's host traffic is laid by.
 pub struct Place<'a, B: Serve> {
+    /// The loaded shell: what a program's score rows are
+    /// (`Shell::score_spec`).
+    pub shell: &'a crate::serve::Shell<B>,
     pub device: &'a B::Context,
     pub pools: &'a Pools<B>,
     pub align: u64,
@@ -163,6 +166,10 @@ pub trait Programs<B: Serve>: Default {
 
     /// The outputs `instance` reads, each with the lane of its attachment.
     fn reads(&self, instance: InstanceId) -> Vec<(String, u32)>;
+
+    /// Where `instance`'s capturing lanes' score rows lie at its place, by
+    /// the program lane each is for; none where it captures nothing.
+    fn score_rows(&self, instance: InstanceId) -> Vec<(u32, crate::guest::session::ScoreRows)>;
 }
 
 /// The elements a cell of `shape` holds (a scalar holds one).

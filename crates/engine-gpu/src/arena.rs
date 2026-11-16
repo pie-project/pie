@@ -10,17 +10,18 @@
 //! the same bytes whatever the pool's rung is, and the span under the
 //! current rung's carve is state's to take.
 //!
-//! The planes the compiler lifts over every other slot (`attn.scores`, a
-//! layer each: `ArenaMap::scores_from`) are no part of a rung's carve. The
-//! span is laid for fires that capture nothing; a fire some of whose lanes
-//! capture is seated the planes' rows for those lanes, one a lane, right
-//! under its rung's carve, inside the span (`Engine::guest_state` states
-//! them to the runtime as the capturing instance's state).
+//! A capturing lane's score rows (`poem_ir::Dim::Capturing`,
+//! `Placement::Capture`) are no arena value and no part of a rung's carve:
+//! they are the reading instance's state, laid at its place in the pool
+//! beside its scratch (`guest::session::instance_lay`, `Engine::guest_state`),
+//! a key row for each of its capturing lanes and a page row for each of
+//! those whose program reads pages ([`CaptureRows`]). A fire's capture table
+//! names each row's pool segment and word.
 
 use kernels_slang::Tensor;
-use poem_compiler::{ArenaMap, Budgets, CompiledModel, FireRows, Placement, RowExpr};
+use poem_compiler::{ArenaMap, Budgets, CompiledModel, FireRows, Placement};
 use poem_exec::store::arena::rect;
-use poem_ir::{Dtype, Trace, ValueId};
+use poem_ir::{Dim, Dtype, Trace, Ty, ValueId};
 
 use crate::backend::{Backend, Tactics};
 use crate::error::{Fault, Result};
@@ -46,137 +47,87 @@ pub struct Rung {
     rooms_at: u64,
     /// The carve and the rooms.
     bytes: u64,
-    /// The capture planes, which the carve leaves out.
-    lifted: Lifted,
 }
 
-/// A capture plane of one carve: its slot, and a row of it.
+/// The score rows of a load whose trace captures (`Dim::Capturing`): a
+/// capturing lane's key row is a mass a key of the load's context, and its
+/// page row a mass a kv page of it. No arena slot holds either: they are the
+/// reading instance's state, at its place in the pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Plane {
-    /// The placement that holds it.
-    root: u32,
-    /// The bytes of one row: one capturing lane's.
-    row: u64,
-    width: u32,
-    dtype: Dtype,
+pub struct CaptureRows {
+    /// The keys of the load's context: a key row's f32s.
+    pub keys: u32,
+    /// The kv pages of that context: a page row's f32s.
+    pub pages: u32,
+    /// The keys a kv page holds: what a page row sums.
+    pub page_size: u32,
 }
 
-/// The planes the compiler lifted over every other slot of a carve, bottom
-/// up. A fire with `rows` capturing lanes takes [`Lifted::bytes`] for them,
-/// each plane `rows` rows, aligned, one after another.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct Lifted {
-    planes: Vec<Plane>,
+/// Which row of a capturing lane a value is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Grain {
+    Keys,
+    Pages,
 }
 
-impl Lifted {
-    /// The planes of `map`, every slot from byte `from` on
-    /// (`ArenaMap::scores_from`). The carve under `from` must hold every
-    /// other slot whole, and a plane a row a lane: the lift is the
-    /// compiler's, and a fire's seat for its capturing lanes rests on it.
-    fn of(map: &ArenaMap, from: u64) -> Result<Lifted> {
-        let mut planes: Vec<(u64, Plane)> = Vec::new();
-        for (root, slot) in map.placements.iter().enumerate() {
-            let Placement::Arena {
-                offset,
-                bytes,
-                rows,
-                width,
-                dtype,
-            } = slot
-            else {
+impl CaptureRows {
+    /// The rows of `trace`'s captures at a load of `context` keys a lane in
+    /// pages of `page_size`; `None` where it captures nothing. A capture
+    /// wider than one run of the context is refused by name.
+    pub fn of(trace: &Trace, context: u32, page_size: u32) -> Result<Option<CaptureRows>> {
+        let mut any = false;
+        for (at, decl) in trace.values.iter().enumerate() {
+            let Ty::Tensor { shape, dtype } = &decl.ty else {
                 continue;
             };
-            if *bytes == 0 {
+            if shape.first() != Some(&Dim::Capturing) {
                 continue;
             }
-            if *offset < from {
-                if offset + bytes > from {
+            match (&shape[1..], dtype) {
+                ([Dim::ContextTimes(1) | Dim::ContextPages], Dtype::F32) => any = true,
+                _ => {
                     return Err(Fault::Program {
-                        at: "arena::Lifted::of",
+                        at: "arena::CaptureRows::of",
                         why: format!(
-                            "value {root}'s slot at byte {offset} for {bytes} lies across byte \
-                             {from}, where the capture planes start"
+                            "value {at} is a capturing lane's row of {shape:?} {dtype:?}; this \
+                             engine lays an f32 row of one run of the load's context, or of \
+                             its pages"
                         ),
                     });
                 }
-                continue;
             }
-            let row = poem_compiler::arena::elem_bytes(*dtype)
-                .map_or(0, |element| width.saturating_mul(element));
-            if *rows != RowExpr::Lanes || row == 0 {
-                return Err(Fault::Program {
-                    at: "arena::Lifted::of",
-                    why: format!(
-                        "value {root}'s capture plane holds {rows:?} rows of {width} {dtype:?}, \
-                         not a row a lane"
-                    ),
-                });
-            }
-            planes.push((
-                *offset,
-                Plane {
-                    root: u32::try_from(root).unwrap_or(u32::MAX),
-                    row,
-                    width: u32::try_from(*width).unwrap_or(u32::MAX),
-                    dtype: *dtype,
-                },
-            ));
         }
-        planes.sort_by_key(|&(offset, _)| offset);
-        Ok(Lifted {
-            planes: planes.into_iter().map(|(_, plane)| plane).collect(),
-        })
+        Ok(any.then(|| CaptureRows {
+            keys: context,
+            pages: context.div_ceil(page_size.max(1)),
+            page_size: page_size.max(1),
+        }))
     }
 
-    /// Which plane backs `value`, if one does.
-    fn plane_of(&self, map: &ArenaMap, value: ValueId) -> Option<usize> {
-        if self.planes.is_empty() {
-            return None;
-        }
-        let root = map.root(value).0;
-        self.planes.iter().position(|plane| plane.root == root)
+    /// The bytes of one key row.
+    #[must_use]
+    pub fn key_bytes(&self) -> u64 {
+        u64::from(self.keys) * 4
     }
 
-    /// Where plane `plane` starts among `rows` rows of each.
-    fn seat(&self, plane: usize, rows: u32) -> u64 {
-        self.planes[..plane]
-            .iter()
-            .map(|plane| (u64::from(rows) * plane.row).next_multiple_of(ALIGN))
-            .sum()
-    }
-
-    /// The bytes `rows` rows of every plane take.
-    fn bytes(&self, rows: u32) -> u64 {
-        self.seat(self.planes.len(), rows)
-    }
-
-    /// One row of every plane: what one capturing lane adds.
-    fn a_lane(&self) -> u64 {
-        self.planes.iter().map(|plane| plane.row).sum()
-    }
-
-    /// The most the planes' alignment adds to a fire's rows of them.
-    fn slack(&self) -> u64 {
-        self.planes.len() as u64 * (ALIGN - 1)
+    /// The bytes of one page row.
+    #[must_use]
+    pub fn page_bytes(&self) -> u64 {
+        u64::from(self.pages) * 4
     }
 }
 
-/// The bytes from the span's end down to the planes of a fire: its rung's
-/// `carve` and, right under it, `planes` bytes of them, within the `room`
-/// bytes a fire's activation may take. A fire they do not fit beside was
-/// cut no narrower than its rung, which the runtime's fit does for every
-/// fire of a program whose term it was told.
-fn planes_under(carve: u64, planes: u64, room: u64) -> Result<u64> {
-    let need = carve.saturating_add(planes);
-    if need > room {
-        return Err(Fault::Ceiling {
-            what: "bytes of the activation span for a fire's carve and its capture planes",
-            need,
-            have: room,
-        });
+/// Which capturing row `value` is, where `map` places it as one.
+#[must_use]
+pub fn grain(map: &ArenaMap, value: ValueId) -> Option<Grain> {
+    match map.placements.get(map.root(value).0 as usize)? {
+        Placement::Capture {
+            width: Dim::ContextPages,
+            ..
+        } => Some(Grain::Pages),
+        Placement::Capture { .. } => Some(Grain::Keys),
+        _ => None,
     }
-    Ok(need)
 }
 
 impl Rung {
@@ -202,17 +153,7 @@ impl Rung {
         let rooms = Rooms::lay(
             trace, compiled, &map, budgets, tokens, paging, tuning, routers,
         );
-        // The carve ends where the capture planes start: a fire is seated
-        // those by its capturing lanes, under the carve.
-        let unscored = map.bytes;
-        let lifted = Lifted::of(&map, unscored).map_err(|fault| match fault {
-            Fault::Program { at, why } => Fault::Program {
-                at,
-                why: format!("the carve for fires of {tokens} tokens: {why}"),
-            },
-            other => other,
-        })?;
-        let rooms_at = unscored.next_multiple_of(ALIGN);
+        let rooms_at = map.bytes.next_multiple_of(ALIGN);
         let bytes = (rooms_at + rooms.bytes()).next_multiple_of(ALIGN);
         Ok(Rung {
             tokens,
@@ -221,7 +162,6 @@ impl Rung {
             rooms,
             rooms_at,
             bytes,
-            lifted,
         })
     }
 
@@ -247,9 +187,12 @@ pub struct Span<B: Backend> {
     /// For each rung, the carve its fires take ([`Span::widen`]).
     widest: Vec<usize>,
     routers: Vec<u32>,
+    /// The score rows a capturing lane's reader holds at its place, where
+    /// the trace captures.
+    capture: Option<CaptureRows>,
     /// The pool's last segment and the byte in it the span ends at: the
-    /// segment is the span a fire's carve and its capture planes may take
-    /// together, and the pool states it so (`ChunkFacts::act_span_chunks`).
+    /// segment is the span a fire's carve may take, and the pool states it
+    /// so (`ChunkFacts::act_span_chunks`).
     place: Option<(B::Buffer, u64)>,
 }
 
@@ -266,6 +209,7 @@ impl<B: Backend> Span<B> {
         tuning: &B::Tuning,
     ) -> Result<Span<B>> {
         let routers = crate::scratch::routers(trace);
+        let capture = CaptureRows::of(trace, paging.context(), paging.page_size)?;
         let rungs = tokens
             .iter()
             .map(|&tokens| Rung::lay(trace, compiled, budgets, tokens, paging, tuning, &routers))
@@ -274,6 +218,7 @@ impl<B: Backend> Span<B> {
             widest: (0..rungs.len()).collect(),
             rungs,
             routers,
+            capture,
             place: None,
         })
     }
@@ -289,29 +234,11 @@ impl<B: Backend> Span<B> {
         self.rungs.iter().map(Rung::bytes).max().unwrap_or(0)
     }
 
-    /// What a fire takes beside its rung's carve for its capturing lanes,
-    /// as `(bytes a lane, bytes a fire)`: a row of every capture plane a
-    /// lane, and the most the planes' alignment adds. Zero where the model
-    /// captures nothing.
+    /// The score rows a capturing lane's reader holds at its place; `None`
+    /// where the trace captures nothing.
     #[must_use]
-    pub fn capture_term(&self) -> (u64, u64) {
-        let most = |of: fn(&Lifted) -> u64| {
-            self.rungs
-                .iter()
-                .map(|rung| of(&rung.lifted))
-                .max()
-                .unwrap_or(0)
-        };
-        (most(Lifted::a_lane), most(Lifted::slack))
-    }
-
-    /// Whether a capture plane backs `value`: its rows are then a fire's
-    /// capturing lanes ([`Scored`]), not its lanes.
-    #[must_use]
-    pub fn captured(&self, value: ValueId) -> bool {
-        self.rungs
-            .last()
-            .is_some_and(|top| top.lifted.plane_of(&top.map, value).is_some())
+    pub fn capture(&self) -> Option<CaptureRows> {
+        self.capture
     }
 
     /// `(rung tokens, chunks)` of every rung, chunks of `chunk_bytes`,
@@ -402,9 +329,9 @@ impl<B: Backend> Span<B> {
         Ok(end - self.rungs[rung].bytes)
     }
 
-    /// A fire's slots at rung `rung`: its carve at its place and, right
-    /// under it, the capture planes' rows for the fire's capturing lanes
-    /// (`scored`); a fire none of whose lanes captures binds no plane.
+    /// A fire's slots at rung `rung`: its carve at its place. A capturing
+    /// lane's score rows are no slot: they lie at the reading instance's
+    /// place, which the fire's capture table names (`scored`).
     pub fn slots(
         &self,
         handles: &Handles<B>,
@@ -415,18 +342,12 @@ impl<B: Backend> Span<B> {
         let (buffer, end) = self.placed()?;
         let at = &self.rungs[rung];
         let base = end - at.bytes;
-        let captured = scored.rows();
-        let planes_at = if captured == 0 {
-            base
-        } else {
-            end - planes_under(at.bytes, at.lifted.bytes(captured), end)?
-        };
         let mut slots: Vec<Option<Tensor>> = Vec::with_capacity(at.map.placements.len());
-        let mut backed: Vec<u32> = Vec::new();
         for value in 0..at.map.placements.len() {
             let value = ValueId(value as u32);
-            let Some(plane) = at.lifted.plane_of(&at.map, value) else {
-                slots.push(match rect(&at.map, value, rows) {
+            slots.push(match grain(&at.map, value) {
+                Some(_) => None,
+                None => match rect(&at.map, value, rows) {
                     Some(rect) => Some(Tensor::new(
                         handles.bind(buffer, base + rect.offset, rect.bytes)?,
                         rect.rows,
@@ -434,29 +355,10 @@ impl<B: Backend> Span<B> {
                         rect.dtype,
                     )),
                     None => None,
-                });
-                continue;
-            };
-            backed.push(value.0);
-            if captured == 0 {
-                slots.push(None);
-                continue;
-            }
-            let Plane {
-                row, width, dtype, ..
-            } = at.lifted.planes[plane];
-            slots.push(Some(Tensor::new(
-                handles.bind(
-                    buffer,
-                    planes_at + at.lifted.seat(plane, captured),
-                    u64::from(captured) * row,
-                )?,
-                captured,
-                width,
-                dtype,
-            )));
+                },
+            });
         }
-        Ok(SlotTable(slots, scored.backing(backed)))
+        Ok(SlotTable(slots, scored))
     }
 
     /// A fire's rooms at rung `rung`.
@@ -532,123 +434,35 @@ pub fn capacities(map: &ArenaMap) -> Vec<u32> {
 
 #[cfg(test)]
 mod tests {
-    use poem_compiler::{ArenaMap, Placement, RowExpr};
-    use poem_ir::{Dtype, ValueId};
+    use poem_compiler::{ArenaMap, Placement};
+    use poem_ir::{Dim, Dtype, ValueId};
 
-    use super::{ALIGN, Lifted, planes_under};
-    use crate::error::Fault;
+    use super::{Grain, grain};
 
-    /// One row of a fixture plane: 32 f32.
-    const ROW: u64 = 128;
-    const LANES: u64 = 512;
-
-    fn plane(offset: u64) -> Placement {
-        Placement::Arena {
-            offset,
-            bytes: LANES * ROW,
-            rows: RowExpr::Lanes,
-            width: 32,
-            dtype: Dtype::F32,
-        }
-    }
-
-    /// A carve of 1024 bytes of rows, then two capture planes (the second
-    /// placed first in value order) and an alias of one.
-    fn map() -> ArenaMap {
-        ArenaMap {
+    /// A capture's value is the key row or the page row by its width, and
+    /// an arena value neither.
+    #[test]
+    fn a_capture_is_a_key_or_a_page_row_by_its_width() {
+        let map = ArenaMap {
             placements: vec![
-                Placement::Arena {
-                    offset: 0,
-                    bytes: 1024,
-                    rows: RowExpr::Tokens,
-                    width: 64,
+                Placement::Capture {
+                    width: Dim::ContextTimes(1),
                     dtype: Dtype::F32,
                 },
-                plane(1024 + LANES * ROW),
-                Placement::Alias(ValueId(1)),
-                plane(1024),
+                Placement::Alias(ValueId(0)),
+                Placement::Capture {
+                    width: Dim::ContextPages,
+                    dtype: Dtype::F32,
+                },
                 Placement::Param(0),
             ],
             spans: Vec::new(),
             live_in: Vec::new(),
-            bytes: 1024 + 2 * LANES * ROW,
-        }
-    }
-
-    /// The capture planes are the slots from where the lift starts, bottom
-    /// up; a fire takes a row of each a capturing lane, each plane aligned,
-    /// and none where no lane captures.
-    #[test]
-    fn a_fire_takes_a_row_of_every_capture_plane_a_capturing_lane() {
-        let map = map();
-        let lifted = Lifted::of(&map, 1024).expect("the fixture's lift");
-        assert_eq!(
-            lifted
-                .planes
-                .iter()
-                .map(|plane| plane.root)
-                .collect::<Vec<_>>(),
-            [3, 1],
-            "bottom up"
-        );
-        assert_eq!(lifted.a_lane(), 2 * ROW);
-        assert_eq!(lifted.slack(), 2 * (ALIGN - 1));
-        assert_eq!(lifted.plane_of(&map, ValueId(3)), Some(0));
-        assert_eq!(lifted.plane_of(&map, ValueId(2)), Some(1), "an alias");
-        assert_eq!(lifted.plane_of(&map, ValueId(0)), None);
-        assert_eq!(lifted.plane_of(&map, ValueId(4)), None);
-        assert_eq!(lifted.bytes(0), 0);
-        // Three capturing lanes: 384 bytes a plane, each on its own
-        // alignment.
-        assert_eq!(lifted.seat(1, 3), 512);
-        assert_eq!(lifted.bytes(3), 1024);
-        // Every lane capturing takes what the compiler's lift did.
-        assert_eq!(lifted.bytes(LANES as u32), 2 * LANES * ROW);
-        // What the term states covers the planes at every count.
-        for lanes in [1, 2, 3, 7, 64, 511, 512] {
-            assert!(lifted.bytes(lanes) <= u64::from(lanes) * lifted.a_lane() + lifted.slack());
-        }
-        // A model that captures nothing lifts none.
-        let none = Lifted::of(&map, map.bytes).expect("no lift");
-        assert_eq!(none, Lifted::default());
-        assert_eq!(none.plane_of(&map, ValueId(3)), None);
-        assert_eq!((none.a_lane(), none.slack(), none.bytes(512)), (0, 0, 0));
-    }
-
-    /// A slot lying across the byte the lift starts at, or a lifted slot
-    /// that is not a row a lane, is refused by name: the seat of a fire's
-    /// capturing lanes rests on both.
-    #[test]
-    fn a_lift_that_is_not_whole_planes_of_a_row_a_lane_is_refused() {
-        let map = map();
-        let Err(Fault::Program { why, .. }) = Lifted::of(&map, 512) else {
-            panic!("a carve slot across the lift is refused");
+            bytes: 0,
         };
-        assert!(why.contains("lies across byte 512"), "{why}");
-        let mut rows = map.clone();
-        rows.placements[3] = Placement::Arena {
-            offset: 1024,
-            bytes: LANES * ROW,
-            rows: RowExpr::Tokens,
-            width: 32,
-            dtype: Dtype::F32,
-        };
-        let Err(Fault::Program { why, .. }) = Lifted::of(&rows, 1024) else {
-            panic!("a plane a row a token is refused");
-        };
-        assert!(why.contains("not a row a lane"), "{why}");
-    }
-
-    /// A fire's planes lie right under its rung's carve, within what a
-    /// fire's activation may take; past it the fire is refused with the
-    /// bytes it wants and the bytes laid.
-    #[test]
-    fn a_fires_planes_lie_under_its_carve_within_the_span() {
-        assert_eq!(planes_under(4096, 1024, 8192).expect("fits"), 5120);
-        assert_eq!(planes_under(4096, 4096, 8192).expect("fits whole"), 8192);
-        let Err(Fault::Ceiling { need, have, .. }) = planes_under(4096, 4097, 8192) else {
-            panic!("planes past the span are refused");
-        };
-        assert_eq!((need, have), (8193, 8192));
+        assert_eq!(grain(&map, ValueId(0)), Some(Grain::Keys));
+        assert_eq!(grain(&map, ValueId(1)), Some(Grain::Keys), "an alias");
+        assert_eq!(grain(&map, ValueId(2)), Some(Grain::Pages));
+        assert_eq!(grain(&map, ValueId(3)), None);
     }
 }

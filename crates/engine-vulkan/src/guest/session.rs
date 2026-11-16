@@ -14,8 +14,8 @@ use engine_gpu::store::layout::{CHANNEL, INSTANCE};
 
 use engine_gpu::guest::held::{self, consecutive};
 use engine_gpu::guest::session::{
-    BINDINGS, PiecePlace, RING_ALIGN, SEGMENT_BINDINGS, StageTables, bases_at, groups_for,
-    piece_places, stage_tables,
+    BINDINGS, InstanceLay, PiecePlace, RING_ALIGN, ScoreRows, ScoreSpec, SEGMENT_BINDINGS, StageTables, bases_at, groups_for,
+    lay_instance, piece_places, score_rows, stage_tables,
 };
 
 /// The host staging ring the plane laid at load.
@@ -206,6 +206,8 @@ pub struct Tables<'a> {
     pub ring: &'a Arc<Ring>,
     /// The lanes one pass runs: its ring rooms.
     pub lanes: u32,
+    /// The score rows its capturing lanes hold beside its scratch.
+    pub scores: &'a ScoreSpec,
 }
 
 /// A piece of the instance's scratch: where it lies, and its segment's
@@ -234,6 +236,9 @@ pub struct Session {
     pieces: Vec<Piece>,
     piece_count: u32,
     held: u64,
+    /// Its scratch and score rows in pieces, and the rows where they lie.
+    lay: InstanceLay,
+    rows: Vec<(u32, ScoreRows)>,
 
     ring: Arc<Ring>,
     lanes: u32,
@@ -290,16 +295,14 @@ impl Session {
             .iter()
             .map(|plan| stage_tables(plan, extents, tables.chunk).map_err(program))
             .collect::<Result<Vec<StageTables>>>()?;
-        let piece_count = resolved
-            .iter()
-            .map(|stage| stage.scratch.pieces())
-            .max()
-            .unwrap_or(0);
-        let held = resolved
-            .iter()
-            .map(|stage| stage.scratch.held_bytes(tables.chunk))
-            .max()
-            .unwrap_or(0);
+        let lay = lay_instance(
+            &resolved.iter().map(|stage| &stage.scratch).collect::<Vec<_>>(),
+            tables.scores,
+            tables.chunk,
+        )
+        .map_err(program)?;
+        let piece_count = lay.pieces();
+        let held = lay.held_bytes(tables.chunk);
         let pieces = pieces_of(tables.pools, tables.scratch, piece_count, held)?;
         // Every stage's tables, then the fault word, in the instance's
         // slots, written at once; each stage's place table names its pieces'
@@ -374,6 +377,7 @@ impl Session {
             }
         };
 
+        let rows = score_rows(&lay, &pieces.iter().map(|piece| piece.place).collect::<Vec<_>>());
         let mut session = Session {
             core,
             stages,
@@ -385,6 +389,8 @@ impl Session {
             pieces,
             piece_count,
             held,
+            rows,
+            lay,
             ring: Arc::clone(tables.ring),
             lanes: tables.lanes,
             pass: None,
@@ -518,6 +524,10 @@ impl Session {
         }
         self.status.rebind(pools)?;
         self.pieces = pieces_of(pools, &self.scratch, self.piece_count, self.held)?;
+        self.rows = score_rows(
+            &self.lay,
+            &self.pieces.iter().map(|piece| piece.place).collect::<Vec<_>>(),
+        );
         self.write_bases()?;
         self.write_sets()
     }
@@ -559,8 +569,18 @@ impl Session {
         self.slots = slots.to_vec();
         self.scratch = scratch.clone();
         self.pieces = pieces_of(pools, &self.scratch, self.piece_count, self.held)?;
+        self.rows = score_rows(
+            &self.lay,
+            &self.pieces.iter().map(|piece| piece.place).collect::<Vec<_>>(),
+        );
         self.write_bases()?;
         self.write_sets()
+    }
+
+    /// Where its capturing lanes' score rows lie, by program lane.
+    #[must_use]
+    pub fn score_rows(&self) -> &[(u32, ScoreRows)] {
+        &self.rows
     }
 
     #[must_use]

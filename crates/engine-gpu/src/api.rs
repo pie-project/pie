@@ -234,6 +234,7 @@ impl<B: Host> Gpu<B> {
 /// Where `shell`'s guests place their tables and cells.
 fn place<B: Host>(shell: &Shell<B>) -> Place<'_, B> {
     Place {
+        shell,
         device: shell.device(),
         pools: shell.pools(),
         align: B::table_align(shell.device()),
@@ -650,13 +651,11 @@ where
         self.programs.facts(program, &place(shell)).map_err(refusal)
     }
 
-    /// A program reading captured attention scores holds the capture
-    /// planes' rows for its lanes as its instances' state
-    /// ([`Shell::capture_state`]).
-    ///
-    /// Each instance's scratch lies in pool chunks as well
-    /// ([`crate::guest::session::instance_scratch`]): one run where its
-    /// stages lay it in one piece, else a whole chunk a piece.
+    /// What an instance of `program` holds at its place in the pool
+    /// ([`crate::guest::session::instance_lay`]): its stages' scratch, in
+    /// pieces of a chunk, and the score rows its capturing lanes read
+    /// ([`Shell::score_spec`]): one run where all of it lies in one piece,
+    /// else a whole chunk a piece.
     fn guest_state(
         &self,
         program: ProgramId,
@@ -666,21 +665,18 @@ where
         else {
             return Ok(engine::GuestState::default());
         };
-        let capture = shell.capture_state(
-            package
-                .values
-                .iter()
-                .filter_map(|value| Some((value.output.as_deref()?, value.lane))),
-        );
-        let scratch = crate::guest::session::instance_scratch(
+        let scores = shell.score_spec(crate::guest::session::reads_of(package));
+        let chunk = shell.pools().chunk_bytes();
+        let lay = crate::guest::session::instance_lay(
             &package.plans,
             &crate::guest::session::extents_of(extents),
-            shell.pools().chunk_bytes(),
+            &scores,
+            chunk,
         )
-        .map_err(|why| Error::Program(format!("program {program}'s scratch: {why}")))?;
+        .map_err(|why| Error::Program(format!("program {program}'s state: {why}")))?;
         Ok(engine::GuestState {
-            per_instance: scratch + capture.per_instance,
-            per_pair: capture.per_pair,
+            per_instance: lay.held_bytes(chunk),
+            per_pair: 0,
         })
     }
 
@@ -1163,10 +1159,17 @@ impl<B: Host> Gpu<B> {
         let guests = B::guests(self, submission)?;
 
         let mut reads: Vec<Vec<String>> = vec![Vec::new(); submission.lanes.len()];
+        let mut scores: Vec<Option<crate::guest::session::ScoreRows>> =
+            vec![None; submission.lanes.len()];
         for attachment in program_attachments(submission) {
             for (name, k) in self.programs.reads(attachment.instance) {
                 if let Some(lane) = reads.get_mut((attachment.lane + k) as usize) {
                     lane.push(name);
+                }
+            }
+            for (k, rows) in self.programs.score_rows(attachment.instance) {
+                if let Some(lane) = scores.get_mut((attachment.lane + k) as usize) {
+                    *lane = Some(rows);
                 }
             }
         }
@@ -1291,6 +1294,7 @@ impl<B: Host> Gpu<B> {
                 feed: feeds[at].as_ref(),
                 group: lane.group,
                 inputs: &input_cells[at],
+                scores: scores[at],
             })
             .collect();
 
