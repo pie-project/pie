@@ -108,6 +108,11 @@ pub enum RsError {
     )]
     DeviceFoldUnsettled,
     #[error(
+        "a keep moves the rows it left buffered into {pages} fresh rs buffer page(s), and the \
+         pool has no room for them"
+    )]
+    KeepNoRoom { pages: u32 },
+    #[error(
         "a fire that folded this working set's recurrent state by a count the device computes \
          did not settle ({0}): how far its record is folded is not known"
     )]
@@ -115,6 +120,17 @@ pub enum RsError {
 }
 
 pub const RS_TRANSLATION_UNMAPPED: u32 = u32::MAX;
+
+/// The token runs a keep left on the rs list, and the pages they read,
+/// which go once the runs land ([`RsStore::keep_buffer`]).
+#[derive(Debug)]
+pub struct RsKeepLanding {
+    /// The engine's shape of the rs list; `None` outside a shared pool,
+    /// where no keep copies.
+    pub shape: Option<::engine::chunk::ShapeId>,
+    pub runs: Vec<::engine::chunk::SlotRun>,
+    old: Vec<RsSlotId>,
+}
 
 /// A count in each recurrent pool: state slots and buffer pages, or, of a
 /// windowed store, its window lists' slots: `pages` their sum and
@@ -341,6 +357,8 @@ pub struct RsStore {
     /// whatever a set's geometry says, and the buffer starts at a multiple
     /// of it.
     rs_tokens: Option<u32>,
+    /// The engine's shape of the rs list, where a shared pool has one.
+    rs_shape: Option<::engine::chunk::ShapeId>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -475,6 +493,7 @@ impl RsStore {
             Vec::new(),
         );
         store.rs_tokens = rs_list.map(|list| list.tokens.max(1));
+        store.rs_shape = rs_list.map(|list| list.id);
         store
     }
 
@@ -512,6 +531,7 @@ impl RsStore {
             moved: std::sync::Arc::new(tokio::sync::Notify::new()),
             device_folded: std::sync::Arc::new(tokio::sync::Notify::new()),
             rs_tokens: None,
+            rs_shape: None,
         }
     }
 
@@ -2000,6 +2020,106 @@ impl RsStore {
             };
         }
         for id in dropped {
+            self.decref(id);
+        }
+    }
+
+    /// A keep that dropped `dropped` rows below the `suffix` rows it left
+    /// buffered. The record already holds every row through the suffix's
+    /// start (a fold of the commit and drop columns, [`Self::fold`]); the
+    /// suffix renumbers down by `dropped`, as the kv rows it shadows did,
+    /// so `frozen` is the set's one committed length again.
+    ///
+    /// Where the buffer's start can move down by `dropped` and stay on an
+    /// rs list slot (CONTRACT-BC 18: always, outside a shared pool), the
+    /// suffix keeps its pages and nothing is copied. Otherwise the suffix
+    /// lands in fresh pages from the aligned start, and the returned token
+    /// runs fill them: the caller issues them on the engine's stream before
+    /// the set's next fire and hands the landing back
+    /// ([`Self::keep_landed`]) once they land, which lets the old pages go.
+    pub fn keep_buffer(
+        &mut self,
+        ws: RsWorkingSetId,
+        dropped: u32,
+        suffix: u32,
+    ) -> Result<Option<RsKeepLanding>, RsError> {
+        if dropped == 0 {
+            return Ok(None);
+        }
+        let entry = self.entry(ws)?;
+        let page = self.page_tokens(entry);
+        let base = self.buffer_base(entry);
+        let frozen = entry.frozen;
+        let after = frozen.saturating_sub(dropped);
+        if suffix == 0 {
+            let entry = self.entry_mut(ws)?;
+            let old: Vec<RsSlotId> = entry.buffer.drain(..).flatten().collect();
+            entry.frozen = after;
+            let base = self.empty_base(after);
+            self.entry_mut(ws)?.base = base;
+            for id in old {
+                self.decref(id);
+            }
+            return Ok(None);
+        }
+        let in_place = base >= dropped
+            && self
+                .rs_tokens
+                .is_none_or(|tokens| (base - dropped) % tokens == 0);
+        if in_place {
+            let entry = self.entry_mut(ws)?;
+            entry.frozen = after;
+            entry.base = base - dropped;
+            return Ok(None);
+        }
+        let start = self.empty_base(after);
+        let count = (after + suffix - start).div_ceil(page);
+        let fresh = self
+            .pages
+            .try_alloc_n(count as usize)
+            .ok_or(RsError::KeepNoRoom { pages: count })?;
+        let entry = self.entry(ws)?;
+        let mut runs: Vec<::engine::chunk::SlotRun> = Vec::new();
+        for at in 0..suffix {
+            let (from, to) = (frozen + at - base, after + at - start);
+            let Some(Some(src)) = entry.buffer.get((from / page) as usize).copied() else {
+                continue;
+            };
+            let (src, dst) = (self.engine_id(src), self.engine_id(fresh[(to / page) as usize]));
+            let (src_token, dst_token) = (from % page, to % page);
+            match runs.last_mut() {
+                Some(run)
+                    if run.src == src
+                        && run.dst == dst
+                        && run.src_token + run.tokens == src_token
+                        && run.dst_token + run.tokens == dst_token =>
+                {
+                    run.tokens += 1;
+                }
+                _ => runs.push(::engine::chunk::SlotRun {
+                    src,
+                    src_token,
+                    dst,
+                    dst_token,
+                    tokens: 1,
+                }),
+            }
+        }
+        let entry = self.entry_mut(ws)?;
+        let old: Vec<RsSlotId> = entry.buffer.drain(..).flatten().collect();
+        entry.buffer = fresh.into_iter().map(Some).collect();
+        entry.base = start;
+        entry.frozen = after;
+        Ok(Some(RsKeepLanding {
+            shape: self.rs_shape,
+            runs,
+            old,
+        }))
+    }
+
+    /// The runs of a keep landed: the pages the buffered rows left go.
+    pub fn keep_landed(&mut self, landing: RsKeepLanding) {
+        for id in landing.old {
             self.decref(id);
         }
     }

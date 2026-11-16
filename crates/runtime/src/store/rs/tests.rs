@@ -485,3 +485,58 @@ fn a_wait_on_a_device_counted_fold_ends_when_it_settles_however_it_ended() {
         }
     }
 }
+
+/// A set whose buffer holds slots 0..10 in pages of 4, its rs list slots of
+/// 4 tokens as in a shared pool.
+fn buffered_to_ten() -> (RsStore, RsWorkingSetId) {
+    let mut s = store();
+    s.rs_tokens = Some(4);
+    s.rs_shape = Some(::engine::chunk::ShapeId(3));
+    let ws = store_with_state(&mut s);
+    let prepared = s
+        .prepare_group(ws, false, false, None, Some(0..10), None)
+        .unwrap();
+    settled(&mut s, prepared);
+    (s, ws)
+}
+
+#[test]
+fn a_keep_that_drops_off_a_slot_copies_the_buffered_rows_to_an_aligned_start() {
+    // Commit 2, drop 5, buffer 7..10: the record folds 7, the three
+    // buffered rows land at 2..5, from the slot-aligned start 0.
+    let (mut s, ws) = buffered_to_ten();
+    s.fold(ws, 7);
+    assert_eq!((s.frozen(ws), s.base(ws)), (Ok(7), Ok(4)));
+    let landing = s.keep_buffer(ws, 5, 3).unwrap().expect("rows move");
+    assert_eq!((s.frozen(ws), s.base(ws), s.buffer_size(ws)), (Ok(2), Ok(0), Ok(2)));
+    let at = |run: &::engine::chunk::SlotRun| (run.src_token, run.dst_token, run.tokens);
+    // Rows 7, 8, 9 sat at offsets 3 (page 0) and 0, 1 (page 1) from base 4;
+    // they land at offsets 2, 3 (page 0) and 0 (page 1) from base 0.
+    assert_eq!(
+        landing.runs.iter().map(at).collect::<Vec<_>>(),
+        vec![(3, 2, 1), (0, 3, 1), (1, 0, 1)]
+    );
+    assert_eq!(landing.shape, Some(::engine::chunk::ShapeId(3)));
+    s.keep_landed(landing);
+}
+
+#[test]
+fn a_keep_that_drops_whole_slots_renumbers_and_copies_nothing() {
+    // Commit 2, drop 4, buffer 6..10: the start moves from 4 to 0, still on
+    // a slot, and every buffered row keeps its page and offset.
+    let (mut s, ws) = buffered_to_ten();
+    s.fold(ws, 6);
+    let pages = s.buffer_translation(ws).unwrap();
+    assert!(s.keep_buffer(ws, 4, 4).unwrap().is_none());
+    assert_eq!((s.frozen(ws), s.base(ws)), (Ok(2), Ok(0)));
+    assert_eq!(s.buffer_translation(ws).unwrap(), pages);
+}
+
+#[test]
+fn a_keep_that_buffers_nothing_empties_the_buffer() {
+    let (mut s, ws) = buffered_to_ten();
+    s.fold(ws, 10);
+    assert!(s.keep_buffer(ws, 3, 0).unwrap().is_none());
+    assert_eq!((s.frozen(ws), s.buffer_size(ws)), (Ok(7), Ok(0)));
+    assert_eq!(s.base(ws), Ok(4), "an empty buffer starts on the slot below `frozen`");
+}

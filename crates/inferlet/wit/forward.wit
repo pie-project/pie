@@ -35,11 +35,22 @@ interface forward {
     /// - `fold`: per lane, how many more slots freeze after this fire;
     ///   `u32::MAX` folds everything. Default: none. May be computed on the
     ///   device; lanes sharing a working set fold by the first one's count.
+    /// - `keep`: `[lanes, n]` u32, the fold that sorts a lane's buffer: per
+    ///   column `c` (slot `folded + c`, the buffer and then the lane's rows),
+    ///   0 commits it, 1 leaves it buffered, 2 drops it. After the fire the
+    ///   committed columns, in order, are frozen at `folded ..`, the buffered
+    ///   ones follow them, the dropped ones are gone; slots below `folded`
+    ///   never change, and a row with no stated position keeps the position
+    ///   it had. `n` covers the lane's extent; columns past it are not read.
+    ///   On a model with recurrent state the buffered columns are a suffix.
+    ///   A lane alone on its working set; not with `fold` (a fold of `n` is
+    ///   the keep that commits the first `n` columns).
     record state-geometry {
         positions: option<borrow<channel>>,
         slots:     option<borrow<channel>>,
         kv-len:    option<borrow<channel>>,
         fold:      option<borrow<channel>>,
+        keep:      option<borrow<channel>>,
     }
 
     /// A forward-pass builder. Construction is empty; descriptor resources are

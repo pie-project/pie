@@ -1759,9 +1759,14 @@ impl Pools {
             return Ok(());
         };
         let page = self.paging.page_size;
+        within_slot(moves, page)?;
+        let moves: Vec<&KvRun> = moves.iter().filter(|m| m.tokens > 0).collect();
         let mut whole: Vec<(ShapeId, u32, u32)> = Vec::new();
         let mut cells: Vec<(u32, u32, u32, u32, u32)> = Vec::new();
         for m in moves {
+            if m.src_page == m.dst_page && m.src_token == m.dst_token {
+                continue;
+            }
             if m.tokens == page && m.src_token == 0 && m.dst_token == 0 {
                 whole.push((id, m.src_page, m.dst_page));
             } else {
@@ -1774,7 +1779,136 @@ impl Pools {
                 ));
             }
         }
-        self.copy(device, handles, &whole)?;
+        self.copy_kv_cells(device, handles, id, &whole, &cells)
+    }
+
+    /// Applies token runs of the rs list (slot refs of its shape): each rs
+    /// plane lays a slot's rows as a kv page lays its keys and values
+    /// (`(q · stride + offset) · page + token` of its view), so a run copies
+    /// row for row, one program for every plane. A run stays in its slots,
+    /// and one reading the rows it writes is refused: every destination of
+    /// a keep's runs is a fresh slot.
+    pub fn copy_rs_runs(
+        &mut self,
+        device: &Device,
+        handles: &Handles,
+        runs: &[KvRun],
+    ) -> Result<()> {
+        let Some(id) = self.rs_shape() else {
+            return Err(Fault::Unbound {
+                what: "token runs of the rs list in a load that lays none".into(),
+            });
+        };
+        if let Some(run) = runs.iter().find(|run| {
+            run.src_page == run.dst_page
+                && run.src_token != run.dst_token
+                && run.src_token < run.dst_token + run.tokens
+                && run.dst_token < run.src_token + run.tokens
+        }) {
+            return Err(Fault::Unbound {
+                what: format!(
+                    "a token run of the rs list that reads the rows it writes: tokens {}..{} \
+                     onto {}..{} of slot {}",
+                    run.src_token,
+                    run.src_token + run.tokens,
+                    run.dst_token,
+                    run.dst_token + run.tokens,
+                    run.src_page
+                ),
+            });
+        }
+        within_slot(runs, self.paging.page_size)?;
+        let runs: Vec<&KvRun> = (runs.iter())
+            .filter(|m| m.tokens > 0 && (m.src_page != m.dst_page || m.src_token != m.dst_token))
+            .collect();
+        if runs.is_empty() {
+            return Ok(());
+        }
+        // The pool's own u32 words, `w` a row: every rs plane's token row is
+        // a whole number of them. A plane's view is written through a Mosaic
+        // scatter in place, which the TPU compiler refuses beside a gather of
+        // the same pool in one program; the root's rows are plain.
+        let shape = self.shape(id)?.clone();
+        let mut w: u64 = ROW_BYTES / 4;
+        for plane in &shape.planes {
+            let row = plane.row_bytes();
+            if row == 0 || !row.is_multiple_of(4) {
+                return Err(Fault::Unbound {
+                    what: format!(
+                        "rs plane {:?}: {row}-byte rows, which no whole u32 word lays",
+                        plane.what
+                    ),
+                });
+            }
+            w = gcd(w, row / 4);
+        }
+        let words = self.bytes / 4;
+        if words / w > i32::MAX as u64 {
+            return Err(Fault::Ceiling {
+                what: "rows of the pool a run of the rs list addresses",
+                need: words / w,
+                have: i32::MAX as u64,
+            });
+        }
+        let mut src: Vec<i64> = Vec::new();
+        let mut dst: Vec<i64> = Vec::new();
+        for plane in &shape.planes {
+            let (stride, offset) = self.layout.map(&shape, plane);
+            let per = (plane.row_bytes() / 4 / w) as i64;
+            let first = |slot: u32, token: u32| -> Result<i64> {
+                let block = i64::from(self.grain(id, slot)?) * stride + offset;
+                Ok((block * i64::from(plane.per) + i64::from(token)) * per)
+            };
+            for m in &runs {
+                let (s, d) = (
+                    first(m.src_page, m.src_token)?,
+                    first(m.dst_page, m.dst_token)?,
+                );
+                let n = i64::from(m.tokens) * per;
+                src.extend(s..s + n);
+                dst.extend(d..d + n);
+            }
+        }
+        let n = src.len().next_power_of_two();
+        for list in [&mut src, &mut dst] {
+            let last = list[list.len() - 1];
+            list.resize(n, last);
+        }
+        let mut flat = src;
+        flat.extend_from_slice(&dst);
+        let (inputs, at) = indices(handles, &flat);
+        let tracer = Tracer::new(handles).with_stage(self.stage_at(inputs.rows()));
+        let root = self.root;
+        let (n, len) = (n as i64, flat.len() as i64);
+        let (rows, w) = ((words / w) as i64, w as i64);
+        let pool = ((self.bytes / ROW_BYTES) as i64, (ROW_BYTES / 4) as i64);
+        tracer.emit(&mut |cx| {
+            let whole = cx.read(root)?;
+            let whole = cx.reshape(whole, &[rows, w])?;
+            let all = cx.read(at)?;
+            let all = cx.reshape(all, &[len])?;
+            let s = cx.slice_axis(all, 0, 0, n)?;
+            let d = cx.slice_axis(all, 0, n, 2 * n)?;
+            let moved = cx.take_rows(whole, s)?;
+            let next = cx.put_rows(whole, d, moved, kernels_xla::hlo::Combine::Set)?;
+            let next = cx.reshape(next, &[pool.0, pool.1])?;
+            cx.write(root, next)
+        })?;
+        crate::exec::maintain(device, tracer, self, &inputs)
+    }
+
+    /// Lands whole kv slots and kv cells (grain, token, grain, token,
+    /// tokens) plane by plane, cell by cell.
+    fn copy_kv_cells(
+        &mut self,
+        device: &Device,
+        handles: &Handles,
+        id: ShapeId,
+        whole: &[(ShapeId, u32, u32)],
+        cells: &[(u32, u32, u32, u32, u32)],
+    ) -> Result<()> {
+        let page = self.paging.page_size;
+        self.copy(device, handles, whole)?;
         if cells.is_empty() {
             return Ok(());
         }
@@ -1789,7 +1923,7 @@ impl Pools {
                 })?;
             let mut src: Vec<i64> = Vec::new();
             let mut dst: Vec<i64> = Vec::new();
-            for &(sq, st, dq, dt, n) in &cells {
+            for &(sq, st, dq, dt, n) in cells {
                 for t in 0..n {
                     src.push(
                         (i64::from(sq) * map.stride + map.offset) * i64::from(page)
@@ -2208,4 +2342,25 @@ fn state_block(slab: &[u64]) -> (u64, u64) {
 
 fn narrow(n: u64) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+/// Refuses a run that reaches past a list slot of `page` rows.
+fn within_slot(runs: &[KvRun], page: u32) -> Result<()> {
+    for m in runs {
+        for token in [m.src_token, m.dst_token] {
+            let end = u64::from(token) + u64::from(m.tokens);
+            if end > u64::from(page) {
+                return Err(Fault::Ceiling {
+                    what: "rows of one list slot a token run reaches",
+                    need: end,
+                    have: u64::from(page),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn gcd(a: u64, b: u64) -> u64 {
+    if b == 0 { a } else { gcd(b, a % b) }
 }

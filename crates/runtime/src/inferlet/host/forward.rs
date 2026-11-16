@@ -111,6 +111,9 @@ fn state_rebind_diff(existing: &StateBinding, next: &StateBinding) -> Option<&'s
     if existing.fold != next.fold {
         return Some("fold");
     }
+    if existing.keep != next.keep {
+        return Some("keep");
+    }
     None
 }
 
@@ -507,6 +510,7 @@ impl ProcessCtx {
             slots,
             kv_len,
             fold,
+            keep,
         } = geom;
         if lanes.is_empty() {
             return Ok(Err(
@@ -516,7 +520,7 @@ impl ProcessCtx {
         for lane in &lanes {
             let _ = self.ctx().table.get(lane)?;
         }
-        for channel in [&positions, &slots, &kv_len, &fold].into_iter().flatten() {
+        for channel in [&positions, &slots, &kv_len, &fold, &keep].into_iter().flatten() {
             let _ = self.ctx().table.get(channel)?;
         }
         let reps: Vec<u32> = lanes.iter().map(Resource::rep).collect();
@@ -534,6 +538,7 @@ impl ProcessCtx {
             slots: slots.map(|resource| resource.rep()),
             kv_len: kv_len.map(|resource| resource.rep()),
             fold: fold.map(|resource| resource.rep()),
+            keep: keep.map(|resource| resource.rep()),
         };
         let pass = self.ctx().table.get(&this)?;
         if pass.is_bound() {
@@ -1099,6 +1104,7 @@ impl ProcessCtx {
                 (Port::KvLen, geometry(|state| state.kv_len)),
                 (Port::AttnMask, mask),
                 (Port::Fold, geometry(|state| state.fold)),
+                (Port::Keep, geometry(|state| state.keep)),
                 (Port::Readout, readout),
             ];
             if let Err(error) =
@@ -1837,6 +1843,7 @@ mod tests {
             slots: None,
             kv_len: Some(4),
             fold: Some(6),
+            keep: None,
         };
         let forks = StateBinding {
             lanes: vec![7, 8],

@@ -292,6 +292,14 @@ pub(crate) fn symbolic_port_type(port: Port, value_type: ValueType) -> SymbolicT
             }
         }
         Port::EmbedIndptr => set_first_symbolic(&mut ty, SymbolicExtent::RowCount),
+        // A lane's outcome for each column of its set's buffer extent.
+        Port::Keep => {
+            set_first_symbolic(&mut ty, SymbolicExtent::RowCount);
+            if ty.dims.len() > 1 {
+                let last = ty.dims.len() - 1;
+                ty.dims[last] = Dimension::Symbolic(SymbolicExtent::KeyLen);
+            }
+        }
     }
     ty
 }

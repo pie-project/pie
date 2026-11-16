@@ -143,6 +143,7 @@ class Port(IntEnum):
     ATTN_MASK = 9
     SLOTS = 16
     FOLD = 17
+    KEEP = 18
 
     @property
     def consumes(self) -> bool:

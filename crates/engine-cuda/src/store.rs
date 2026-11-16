@@ -2353,20 +2353,12 @@ impl Pools {
         if moves.is_empty() && windowed.is_empty() {
             return Ok(());
         }
-        let page_size = u64::from(self.paging.page_size);
         let mut highest = 0u64;
-        for span in moves.iter().chain(windowed) {
-            for token in [span.src_token, span.dst_token] {
-                let end = u64::from(token) + u64::from(span.tokens);
-                if end > page_size {
-                    return Err(Fault::Ceiling {
-                        what: "token slots in one kv page",
-                        need: end,
-                        have: page_size,
-                    });
-                }
-            }
-        }
+        within_slots(
+            moves.iter().chain(windowed),
+            self.paging.page_size,
+            "token slots in one kv page",
+        )?;
         for span in moves {
             highest = highest.max(u64::from(span.src_page.max(span.dst_page)) + 1);
         }
@@ -2398,28 +2390,86 @@ impl Pools {
             };
             let element = u64::from(elem_size(dtype));
             let moves = if in_window { windowed } else { moves };
-            for (at, &offset) in offsets.iter().enumerate().take(values_plane + 1) {
-                let width = if at == 0 { keys_width } else { values_width };
-                let cell = width * element;
-                for span in moves {
-                    if span.tokens == 0 {
-                        continue;
-                    }
-                    let bytes = u64::from(span.tokens) * cell;
-                    let src = offset + u64::from(span.src_token) * cell;
-                    let dst = offset + u64::from(span.dst_token) * cell;
-                    if span.src_page == span.dst_page && src == dst {
-                        continue;
-                    }
-                    crate::device::copy_d2d(
-                        stream,
-                        self.chunks
-                            .span(Kind::paged(list), span.dst_page, dst, bytes)?,
-                        self.chunks
-                            .span(Kind::paged(list), span.src_page, src, bytes)?,
-                        usize::try_from(bytes).unwrap_or(0),
-                    )?;
+            let planes = offsets
+                .iter()
+                .enumerate()
+                .take(values_plane + 1)
+                .map(|(at, &offset)| {
+                    let width = if at == 0 { keys_width } else { values_width };
+                    (offset, width * element)
+                });
+            self.copy_rows(stream, Kind::paged(list), planes, moves)?;
+        }
+        Ok(())
+    }
+
+    /// Copies token runs of the rs list on `stream`, device to device: a
+    /// run's rows of every rs row the list lays (each `(offset, bytes a
+    /// token)` into a slot), as a kv run's are of its planes. A run stays
+    /// in its slots, and one reading the rows it writes is refused: every
+    /// destination of a keep's runs is a fresh slot.
+    pub fn copy_rs_runs(&mut self, stream: *mut core::ffi::c_void, runs: &[KvRun]) -> Result<()> {
+        let Some((tokens, layers)) = self.rs_layout() else {
+            return Err(Fault::program(
+                "store::chunks",
+                "token runs of the rs list in a load that lays none",
+            ));
+        };
+        within_slots(runs, tokens, "token slots in one rs list slot")?;
+        if let Some(run) = runs.iter().find(|run| {
+            run.src_page == run.dst_page
+                && run.src_token != run.dst_token
+                && run.src_token < run.dst_token + run.tokens
+                && run.dst_token < run.src_token + run.tokens
+        }) {
+            return Err(Fault::program(
+                "store::chunks",
+                format!(
+                    "a token run of the rs list reads the rows it writes: tokens {}..{} onto \
+                     {}..{} of slot {}",
+                    run.src_token,
+                    run.src_token + run.tokens,
+                    run.dst_token,
+                    run.dst_token + run.tokens,
+                    run.src_page
+                ),
+            ));
+        }
+        self.seat_pages(
+            Kind::Rs,
+            runs.iter()
+                .flat_map(|run| [u64::from(run.src_page), u64::from(run.dst_page)]),
+        )?;
+        self.fence_all_swaps(stream)?;
+        self.copy_rows(stream, Kind::Rs, layers.into_iter(), runs)
+    }
+
+    /// Copies `runs` of slots of `kind` in each plane `(offset, bytes a
+    /// token)` a slot lays; the slots are seated and in range.
+    fn copy_rows(
+        &self,
+        stream: *mut core::ffi::c_void,
+        kind: Kind,
+        planes: impl Iterator<Item = (u64, u64)>,
+        runs: &[KvRun],
+    ) -> Result<()> {
+        for (offset, cell) in planes {
+            for run in runs {
+                if run.tokens == 0 {
+                    continue;
                 }
+                let bytes = u64::from(run.tokens) * cell;
+                let src = offset + u64::from(run.src_token) * cell;
+                let dst = offset + u64::from(run.dst_token) * cell;
+                if run.src_page == run.dst_page && src == dst {
+                    continue;
+                }
+                crate::device::copy_d2d(
+                    stream,
+                    self.chunks.span(kind, run.dst_page, dst, bytes)?,
+                    self.chunks.span(kind, run.src_page, src, bytes)?,
+                    usize::try_from(bytes).unwrap_or(0),
+                )?;
             }
         }
         Ok(())
@@ -4953,6 +5003,27 @@ pub fn window_of(trace: &Trace) -> Result<Option<u32>> {
 
 fn narrow(n: u64) -> i32 {
     i32::try_from(n).unwrap_or(i32::MAX)
+}
+
+/// Refuses a run that reaches past a slot of `tokens` rows (`what`).
+fn within_slots<'a>(
+    runs: impl IntoIterator<Item = &'a KvRun>,
+    tokens: u32,
+    what: &'static str,
+) -> Result<()> {
+    for run in runs {
+        for token in [run.src_token, run.dst_token] {
+            let end = u64::from(token) + u64::from(run.tokens);
+            if end > u64::from(tokens) {
+                return Err(Fault::Ceiling {
+                    what,
+                    need: end,
+                    have: u64::from(tokens),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn wide(n: u64) -> i64 {

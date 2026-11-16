@@ -947,7 +947,7 @@ impl Engine for Cuda {
 
     fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
         use crate::store::Tier;
-        use crate::store::layout::{FIXED, LIST, WINDOW};
+        use crate::store::layout::{FIXED, LIST, RS, WINDOW};
         let tier = |domain| match domain {
             MemoryDomain::CudaDevice(_) => Some(Tier::Device),
             MemoryDomain::HostPinned => Some(Tier::Host),
@@ -985,38 +985,30 @@ impl Engine for Cuda {
             }
             return Ok(());
         }
-        if copy.shape != LIST && copy.shape != WINDOW {
-            // Any other shape this load states (the rs list): whole slots.
+        let pairs: Vec<[u32; 2]> = copy.slots.iter().map(|&(src, dst)| [src, dst]).collect();
+        if copy.shape != LIST && copy.shape != WINDOW && copy.shape != RS {
+            // Any other shape this load states: whole slots.
             if !copy.runs.is_empty() {
                 return Err(Error::Invalid(format!(
                     "copy_slots names token runs of shape {}, whose slots are copied whole",
                     copy.shape
                 )));
             }
-            let pairs: Vec<[u32; 2]> = copy.slots.iter().map(|&(src, dst)| [src, dst]).collect();
             return shell.copy_whole_slots(copy.shape, &pairs).map_err(fault);
         }
-        let page = shell.paging().page_size;
         let runs: Vec<engine::transfer::KvRun> = copy
-            .slots
+            .runs
             .iter()
-            .map(|&(src, dst)| engine::transfer::KvRun {
-                src_page: src,
-                src_token: 0,
-                dst_page: dst,
-                dst_token: 0,
-                tokens: page,
-            })
-            .chain(copy.runs.iter().map(|run| engine::transfer::KvRun {
+            .map(|run| engine::transfer::KvRun {
                 src_page: run.src,
                 src_token: run.src_token,
                 dst_page: run.dst,
                 dst_token: run.dst_token,
                 tokens: run.tokens,
-            }))
+            })
             .collect();
         shell
-            .copy_token_slots(copy.shape == WINDOW, &runs)
+            .copy_token_slots(copy.shape, &pairs, &runs)
             .map_err(fault)
     }
 

@@ -19,6 +19,8 @@ members = [
     "naive-baseline",
     "working-set-handles",
     "naive-masked",
+    "keep-check",
+    "keep-bench",
     "prefix-tree-kv-cache",
     "repetition-penalty",
     "dry-repetition-penalty",

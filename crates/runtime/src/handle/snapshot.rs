@@ -105,6 +105,10 @@ struct Manifest {
     folded: u64,
     prompt_pages: u64,
     logged: Vec<u32>,
+    /// The first page no fold seals, where a keep dropped rows; a manifest
+    /// from before keeps states none.
+    #[serde(default)]
+    keyless_from: Option<u64>,
     /// Each page's key, where sealed.
     pages: Vec<Option<String>>,
     /// Each page's file under `pages/`, which holds what `kv/` links.
@@ -130,6 +134,10 @@ struct SavedCursor {
     #[serde(default)]
     written: Option<u32>,
     spans: Vec<(u32, u32, u32)>,
+    /// The rows keeps dropped ([`Cursor::ahead`]); none in a manifest from
+    /// before keeps.
+    #[serde(default)]
+    ahead: u32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -814,11 +822,13 @@ async fn finish(
             reserved: cursor.reserved,
             written: Some(cursor.written_end()),
             spans: cursor.spans.clone(),
+            ahead: cursor.ahead,
         },
         page_len: set.page_len,
         folded: set.folded,
         prompt_pages: set.prompt_pages,
         logged: set.logged.clone(),
+        keyless_from: set.keyless_from,
         pages: set
             .pages
             .iter()
@@ -941,6 +951,7 @@ pub(super) async fn load(holder: ProcessId, tenant: &str, name: &str) -> Result<
         folded,
         prompt_pages,
         logged,
+        keyless_from,
         ..
     } = manifest;
     let exported = ExportedSet {
@@ -957,6 +968,7 @@ pub(super) async fn load(holder: ProcessId, tenant: &str, name: &str) -> Result<
         folded,
         prompt_pages,
         logged,
+        keyless_from,
     };
     let host_slots = slots.into_iter().map(HostKvSlotId).collect();
     let id = store_registry::with_kv_lock(&stores.kv, "snapshot-load", |kv| {
@@ -970,6 +982,7 @@ pub(super) async fn load(holder: ProcessId, tenant: &str, name: &str) -> Result<
         written: cursor.written.unwrap_or(cursor.reserved),
         staged: Vec::new(),
         spans: cursor.spans,
+        ahead: cursor.ahead,
     };
     Ok(Held::park(holder, kv, rs, cursor))
 }

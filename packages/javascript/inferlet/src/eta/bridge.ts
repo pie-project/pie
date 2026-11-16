@@ -409,6 +409,39 @@ export interface StateGeometry {
   /** Per lane, how many slots the lane reads. */
   kvLen?: Channel;
   fold?: Fold;
+  /**
+   * `[lanes, n]` u32, the fold that sorts a lane's buffer: per column (slot `folded() + c`), 0 commits
+   * it, 1 leaves it buffered, 2 drops it. Committed columns freeze at `folded()` in order, buffered ones
+   * follow, dropped ones go. On a model with recurrent state the buffered columns are a suffix. A lane
+   * alone on its working set; not with `fold` (a fold of `n` commits the first `n` columns).
+   *
+   * A keep is stated from the host: one the device computes is taken to the host (`takeHost`) and
+   * bound as a host channel; keep every few hundred steps and hide evicted rows with the mask between.
+   * Per-slot state the guest holds follows the keep with `compact`.
+   */
+  keep?: Channel;
+}
+
+/** What a keep does with a column: committed, left buffered, dropped. */
+export const KEEP_COMMIT = 0;
+export const KEEP_BUFFER = 1;
+export const KEEP_DROP = 2;
+
+/** Where each slot from `folded` on comes from after `keep`: the committed columns' slots, then the buffered ones'. */
+export function keepOrder(folded: number, keep: ArrayLike<number>): number[] {
+  const slots = (outcome: number) =>
+    Array.from(keep, (at, column) => [at, folded + column] as const)
+      .filter(([at]) => at === outcome)
+      .map(([, slot]) => slot);
+  return [...slots(KEEP_COMMIT), ...slots(KEEP_BUFFER)];
+}
+
+/** `values`, one a slot, as the slots stand after `keep`: those below `folded`, the kept ones in order, `fill` after. */
+export function compact<T>(values: ArrayLike<T>, folded: number, keep: ArrayLike<number>, fill: T): T[] {
+  const out = Array.from(values).slice(0, Math.min(folded, values.length));
+  for (const slot of keepOrder(folded, keep)) if (slot < values.length) out.push(values[slot]);
+  while (out.length < values.length) out.push(fill);
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -551,6 +584,7 @@ export class ForwardPass {
       [Port.SLOTS, geom.slots],
       [Port.KV_LEN, geom.kvLen],
       [Port.FOLD, fold],
+      [Port.KEEP, geom.keep],
     ];
     if (!rebind) this.ensurePortsAvailable(stated.filter(([, ch]) => ch !== undefined).map(([port]) => port));
     const g: witForward.StateGeometry = {};
@@ -558,6 +592,7 @@ export class ForwardPass {
     if (geom.slots) g.slots = geom.slots.wit();
     if (geom.kvLen) g.kvLen = geom.kvLen.wit();
     if (fold) g.fold = fold.wit();
+    if (geom.keep) g.keep = geom.keep.wit();
     wit('state', () => this.wit.state(lanes.map((l) => l.ws), g));
     this.lanes = [...lanes];
     if (!rebind) for (const [port, ch] of stated) if (ch !== undefined) this.ports.push([port, ch]);

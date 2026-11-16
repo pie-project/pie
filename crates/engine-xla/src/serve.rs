@@ -1227,6 +1227,11 @@ impl Shell {
         self.pools.copy_kv(&self.device, &self.handles, moves)
     }
 
+    /// Copies token runs between slot refs of the rs list.
+    pub fn copy_rs_runs(&mut self, moves: &[engine::transfer::KvRun]) -> Result<()> {
+        self.pools.copy_rs_runs(&self.device, &self.handles, moves)
+    }
+
     /// Copies whole slots `(shape, src ref, dst ref)`, in order.
     pub fn copy_slots(&mut self, copies: &[(engine::chunk::ShapeId, u32, u32)]) -> Result<()> {
         self.pools.copy(&self.device, &self.handles, copies)
