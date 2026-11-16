@@ -39,6 +39,12 @@ pub struct TuneArgs {
     /// Fit the measurements the last run kept, without measuring again.
     #[arg(long)]
     pub refit: bool,
+
+    /// Time only the dense GEMM tactics each checked model's served load
+    /// arms (CUDA), into the user's table beside their profile, with no
+    /// profile search; the profile is not written.
+    #[arg(long)]
+    pub gemm_only: bool,
 }
 
 pub fn run(args: TuneArgs) -> Result<Answer> {
@@ -84,6 +90,7 @@ pub fn run(args: TuneArgs) -> Result<Answer> {
         no_check: args.no_check,
         cache: &cache,
         refit: args.refit,
+        gemm_only: args.gemm_only,
     };
     let tuned = tune(&req, &mut say).map_err(|e| anyhow!(e))?;
 
@@ -116,6 +123,10 @@ pub fn run(args: TuneArgs) -> Result<Answer> {
                 "  <- slower or different"
             }
         ));
+    }
+    if args.gemm_only {
+        out.push_str("--gemm-only: the dense GEMM tactics were timed into the user's table; the profile is not written\n");
+        return Ok(text(out));
     }
     if args.dry_run {
         out.push_str("\n--dry-run: nothing written. The profile:\n\n");

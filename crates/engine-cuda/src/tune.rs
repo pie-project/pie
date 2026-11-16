@@ -300,6 +300,56 @@ impl Bench for Cuda<'_> {
 
 /// Run the tune on GPU 0: search, check, and assemble the file. `say` hears
 /// progress.
+/// `pie tune cuda --gemm-only`: under today's profile, each model's served
+/// load arms its lattice with timing on, adding what the tactic tables lack
+/// to the user's table; no profile search, and the profile is not changed.
+pub fn gemm_only(
+    profiles: Option<&Path>,
+    models: &[(PathBuf, String)],
+    say: &mut dyn FnMut(&str),
+) -> Result<Outcome, String> {
+    let began = Instant::now();
+    let (name, facts) = crate::chip::probe(0).ok_or("no CUDA device answers")?;
+    let (base, report) = crate::chip::resolve(&name, &facts, profiles);
+    say(&format!(
+        "{name}: timing dense GEMM tactics under {}",
+        report.used
+    ));
+    if models.is_empty() {
+        return Err("--gemm-only needs a model to load (import one, or pass --check)".to_string());
+    }
+    #[cfg(feature = "cuda")]
+    {
+        kernels_cuda::linear::gemm::time_tactics(true);
+        let _untime = Untime;
+        let before = kernels_cuda::linear::gemm::timed();
+        for (artifact, deployment) in models {
+            say(&format!(
+                "timing the dense GEMM tactics {deployment}'s served lattice arms"
+            ));
+            arm_served(artifact, deployment, &base, profiles)?;
+        }
+        say(&format!(
+            "{} product(s) timed",
+            kernels_cuda::linear::gemm::timed() - before
+        ));
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (base, name, began);
+        Err("--gemm-only times cuBLAS tactics, and this build has no CUDA runtime".to_string())
+    }
+    #[cfg(feature = "cuda")]
+    Ok(Outcome {
+        device: name,
+        file: String::new(),
+        lines: Vec::new(),
+        checks: Vec::new(),
+        changed: false,
+        seconds: began.elapsed().as_secs_f64(),
+    })
+}
+
 pub fn run(
     profiles: Option<&Path>,
     models: &[(PathBuf, String)],
