@@ -111,7 +111,8 @@ pub const COPY_DISPATCHES: u32 = 1;
 /// The tolerance two runs of a rates step agree within, and a check's
 /// estimate within the measured best: what [`rate_from`] allows a burst to
 /// fall below its launches before it calls the two a measurement fault.
-pub const AGREEMENT: f64 = 0.05;
+/// Defined once, in the profile crate, whose search breaks ties by it.
+pub use profile::AGREEMENT;
 
 /// The rate a timed fire comes to once its dispatches' launches are off:
 /// `work / (burst_ns − dispatches · launch_ns)`, `burst_ns` one fire's time
