@@ -144,6 +144,10 @@ pub struct FireTables {
 
     /// The expert table of each bank streamed by its experts, by its param.
     pub expert_tables: Vec<(u32, ExpertTable)>,
+
+    /// Where a select stages a host-resident bank's experts, laid at load
+    /// (`experts::staging`); `None` where the load stages none.
+    pub expert_staging: Option<crate::experts::staging::Staged>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2240,6 +2244,12 @@ impl<'c> Run<'c> {
             .map_or(ExpertTable::RESIDENT, |(_, table)| *table)
     }
 
+    /// Where a select stages a host-resident bank's experts, if the load
+    /// laid a staging for them.
+    pub(crate) fn expert_staging(&self) -> Option<crate::experts::staging::Staged> {
+        self.fire.tables.expert_staging
+    }
+
     pub(crate) fn expert_bank(&self, id: ValueId) -> (Tensor, ExpertTable) {
         let at = id.0 as usize;
         let Def::Weight(w) = &self.values[at].def else {
@@ -2695,21 +2705,37 @@ impl<'c> Run<'c> {
         sink.0.finish()
     }
 
+    /// Whether the fire can be recorded: not where a select stages a
+    /// host-resident bank's experts, which reads the fire's routes back to
+    /// the host (`experts::staging`), nor where a prefill plan refused its
+    /// graph form.
     pub(crate) fn capturable(&self) -> bool {
-        self.structs.iter().flatten().all(|(_, slot)| match slot {
-            StructSlot::Prefill(plan) => plan.graph_capturable,
-            _ => true,
-        })
+        self.fire.tables.expert_staging.is_none()
+            && self.structs.iter().flatten().all(|(_, slot)| match slot {
+                StructSlot::Prefill(plan) => plan.graph_capturable,
+                _ => true,
+            })
     }
 
     pub(crate) fn uncapturable_why(&self) -> Vec<String> {
-        self.structs
-            .iter()
-            .flatten()
-            .filter_map(|(_, slot)| match slot {
-                StructSlot::Prefill(plan) => plan.graph_refusal.clone(),
-                _ => None,
+        self.fire
+            .tables
+            .expert_staging
+            .map(|_| {
+                "a select stages a host-resident bank's experts by its routes, read back as \
+                 the fire walks"
+                    .to_string()
             })
+            .into_iter()
+            .chain(
+                self.structs
+                    .iter()
+                    .flatten()
+                    .filter_map(|(_, slot)| match slot {
+                        StructSlot::Prefill(plan) => plan.graph_refusal.clone(),
+                        _ => None,
+                    }),
+            )
             .collect()
     }
 

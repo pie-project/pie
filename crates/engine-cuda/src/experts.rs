@@ -6,6 +6,8 @@ use poem_ir::{Def, Linear, Operation, ParamSource, Trace, ValueId};
 use crate::device::Pinned;
 use crate::error::{Fault, Result};
 
+pub mod staging;
+
 pub type Attachments = BTreeMap<usize, Vec<usize>>;
 
 #[derive(Debug)]

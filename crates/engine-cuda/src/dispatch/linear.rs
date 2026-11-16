@@ -2081,7 +2081,7 @@ impl Run<'_> {
         if codes.dtype == Dtype::Nvfp4 {
             let tensor_scales = tensor_scales("linear.moe_select", biases)?;
             let (codes, scales, tensor_scales, routes) =
-                match self.staged_experts(codes, scales, Some(tensor_scales), routes) {
+                match self.staged_experts(codes, scales, Some(tensor_scales), routes)? {
                     Some((codes, scales, Some(tensor_scales), routes)) => {
                         (codes, scales, tensor_scales, routes)
                     }
@@ -2100,7 +2100,7 @@ impl Run<'_> {
             );
         }
         let (codes, scales, biases, routes) = self
-            .staged_experts(codes, scales, biases, routes)
+            .staged_experts(codes, scales, biases, routes)?
             .unwrap_or((codes, scales, biases, routes));
         linear::moe::matmul_select_quant(
             self.ctx(),
@@ -2980,113 +2980,102 @@ const EXPERT_ALPHA: &str = "linear.act_quant.expert_alpha";
 #[cfg(feature = "cuda")]
 const READ_BACK: &str = "linear.act_quant.read_back";
 
-const STAGED_EXPERT_BYTES: u64 = 1536 * 1024 * 1024;
-
 impl Run<'_> {
+    /// A host-resident bank's experts this fire routes to, copied into the
+    /// staging the load laid for them (`experts::staging`), and the routes
+    /// renumbered to their places there; `None` for a bank on the device,
+    /// or routes that name no expert. The routes are read back to the host,
+    /// so a load that stages records no body (`Run::capturable`).
     fn staged_experts(
         &self,
         codes: Tensor,
         scales: Tensor,
         biases: Option<Tensor>,
         routes: Tensor,
-    ) -> Option<(Tensor, Tensor, Option<Tensor>, Tensor)> {
+    ) -> Result<Option<(Tensor, Tensor, Option<Tensor>, Tensor)>, kernels_cuda::Error> {
+        const OP: &str = "linear.moe_select";
         if routes.rows == 0 || !crate::device::alloc::is_host_pointer(codes.ptr) {
-            return None;
+            return Ok(None);
         }
+        let refused = |detail: String| kernels_cuda::Error::Backend { op: OP, detail };
+        let Some(staged) = self.expert_staging() else {
+            return Err(refused(
+                "a select reads a routed bank on the host that no table of the weight cache \
+                 reads, and the load laid no staging for its experts"
+                    .to_string(),
+            ));
+        };
         let stream = self.ctx().stream();
         if crate::device::alloc::is_capturing(stream) {
-            return None;
+            return Err(refused(
+                "a host-resident bank's experts are staged by the fire's routes, read back to \
+                 the host, which no capture records"
+                    .to_string(),
+            ));
         }
+        let copy = |dst: u64, src: u64, bytes: usize| {
+            crate::device::copy_any(stream, dst, src, bytes)
+                .map_err(|fault| refused(fault.to_string()))
+        };
         let count = routes.rows as usize * routes.width as usize;
         let mut picked = vec![0i32; count];
-        if crate::device::copy_any(stream, picked.as_mut_ptr() as u64, routes.ptr, count * 4)
-            .is_err()
-        {
-            return None;
-        }
+        copy(picked.as_mut_ptr() as u64, routes.ptr, count * 4)?;
         let mut unique: Vec<i32> = picked.iter().copied().filter(|e| *e >= 0).collect();
         unique.sort_unstable();
         unique.dedup();
         if unique.is_empty() {
-            return None;
+            return Ok(None);
         }
-        let per_expert = |plane: Tensor| u64::from(plane.width);
-        let bytes_each = per_expert(codes) + per_expert(scales) + biases.map_or(0, per_expert);
-        if unique.len() as u64 * bytes_each > STAGED_EXPERT_BYTES {
-            return None;
-        }
-        let slot_of = |expert: i32| unique.binary_search(&expert).map_or(-1, |at| at as i32);
-        let remapped: Vec<i32> = picked
-            .iter()
-            .map(|e| if *e < 0 { -1 } else { slot_of(*e) })
-            .collect();
-        let stage = |name: &'static str, plane: Tensor| -> Option<Tensor> {
-            let width = plane.width as usize;
-            let ptr = staging(name, unique.len() * width)?;
-            for (slot, expert) in unique.iter().enumerate() {
-                crate::device::copy_any(
-                    stream,
-                    ptr + (slot * width) as u64,
-                    plane.ptr + u64::from(*expert as u32) * width as u64,
-                    width,
-                )
-                .ok()?;
+        let over = |what: &str, need: u64, run: u64| {
+            refused(format!(
+                "a fire of {} rows stages {need} bytes of {what}, past the {run} the load \
+                 laid for fires of up to {} rows",
+                routes.rows, staged.rows,
+            ))
+        };
+        let stage = |plane: Tensor, (at, run): (u64, u64)| -> Result<Tensor, kernels_cuda::Error> {
+            let width = u64::from(plane.width);
+            let need = unique.len() as u64 * width;
+            if need > run {
+                return Err(over("an expert plane", need, run));
             }
-            Some(Tensor::new(
-                ptr,
+            for (slot, expert) in unique.iter().enumerate() {
+                copy(
+                    at + slot as u64 * width,
+                    plane.ptr + u64::from(*expert as u32) * width,
+                    plane.width as usize,
+                )?;
+            }
+            Ok(Tensor::new(
+                at,
                 unique.len() as u32,
                 plane.width,
                 plane.dtype,
             ))
         };
-        let staged_codes = stage("moe.staged.codes", codes)?;
-        let staged_scales = stage("moe.staged.scales", scales)?;
+        let staged_codes = stage(codes, staged.runs[0])?;
+        let staged_scales = stage(scales, staged.runs[1])?;
         let staged_biases = match biases {
-            Some(biases) => Some(stage("moe.staged.biases", biases)?),
+            Some(biases) => Some(stage(biases, staged.runs[2])?),
             None => None,
         };
-        let routes_ptr = staging("moe.staged.routes", count * 4)?;
-        crate::device::copy_any(stream, routes_ptr, remapped.as_ptr() as u64, count * 4).ok()?;
-        Some((
+        let slot_of = |expert: i32| unique.binary_search(&expert).map_or(-1, |at| at as i32);
+        let remapped: Vec<i32> = picked
+            .iter()
+            .map(|e| if *e < 0 { -1 } else { slot_of(*e) })
+            .collect();
+        let (routes_at, routes_run) = staged.runs[3];
+        if (count * 4) as u64 > routes_run {
+            return Err(over("routes", (count * 4) as u64, routes_run));
+        }
+        copy(routes_at, remapped.as_ptr() as u64, count * 4)?;
+        Ok(Some((
             staged_codes,
             staged_scales,
             staged_biases,
-            Tensor::new(routes_ptr, routes.rows, routes.width, routes.dtype),
-        ))
+            Tensor::new(routes_at, routes.rows, routes.width, routes.dtype),
+        )))
     }
-}
-
-/// A staging buffer per `name`, grown by doubling. A buffer it outgrows is
-/// kept, never freed: copies queued on it may still be in flight, and a
-/// free here would either race them or synchronise the device (illegal
-/// mid-capture). Doubling keeps what is retired under the live buffer's
-/// size.
-fn staging(name: &'static str, bytes: usize) -> Option<u64> {
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-    struct Held {
-        live: HashMap<&'static str, (u64, usize)>,
-        retired: Vec<u64>,
-    }
-    static HELD: Mutex<Option<Held>> = Mutex::new(None);
-    if bytes == 0 {
-        return None;
-    }
-    let mut held = HELD.lock().expect("held lock poisoned");
-    let held = held.get_or_insert_with(|| Held {
-        live: HashMap::new(),
-        retired: Vec::new(),
-    });
-    let cap = held.live.get(name).map_or(0, |(_, cap)| *cap);
-    if let Some((ptr, _)) = held.live.get(name).filter(|_| cap >= bytes) {
-        return Some(*ptr);
-    }
-    let size = bytes.max(cap * 2);
-    let fresh = crate::device::alloc::raw_alloc(size)?;
-    if let Some((old, _)) = held.live.insert(name, (fresh, size)) {
-        held.retired.push(old);
-    }
-    Some(fresh)
 }
 
 /// The routes a routed select reads.
