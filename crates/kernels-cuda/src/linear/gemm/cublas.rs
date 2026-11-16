@@ -226,8 +226,11 @@ pub(crate) fn act_x_wt(
             tuning.gemm_skinny_rows,
         );
         let plan = device.plan_for(call);
+        // A shape the tables lack runs cuBLASLt's first heuristic for it:
+        // its ranking, the same each boot, where a timing is not.
         let tactic = capturing
-            .and_then(|status| device.tactic_for(handle, stream, plan.as_deref(), call, status));
+            .and_then(|status| device.tactic_for(handle, stream, plan.as_deref(), call, status))
+            .or_else(|| plan.as_ref().map(|_| Tactic::Lt(0)));
         (plan, tactic, device.lt.handle, device.lt.workspace_bytes)
     });
     let (ws, ws_bytes) = match ctx.scratch_stream(op, LT_WORKSPACE, want) {
@@ -406,8 +409,11 @@ pub(crate) fn anchored(
         let Some(status) = capturing else {
             return (None, planned(device), lt);
         };
-        if status != cudaStreamCaptureStatus::cudaStreamCaptureStatusNone
-            || device.chosen.len() >= 1024
+        let captured = status != cudaStreamCaptureStatus::cudaStreamCaptureStatusNone;
+        if device.chosen.len() >= 1024
+            || !may_time(key, captured, || {
+                format!("{m}x{}x{k} (epilogue {:016x})", n * parts, epi.hash())
+            })
             || (m as usize) * (n as usize) * 2 * (parts as usize + outs.len()) > 256 << 20
         {
             return (None, planned(device), lt);
@@ -428,8 +434,7 @@ pub(crate) fn anchored(
         if let (Some(_), Some(plan)) = (epi.lt(), plan.as_deref()) {
             candidates.extend((0..plan.heuristics.len()).map(Tactic::LtEpilogue));
         }
-        // A size-only walk (`crate::sizing`) times nothing and keeps no pick.
-        if candidates.is_empty() || crate::sizing::active() || !may_time(key) {
+        if candidates.is_empty() {
             return (None, plan, lt);
         }
         let charge = device.charge(m);
@@ -1731,14 +1736,11 @@ impl Device {
             self.chosen.insert(key, tactic);
             return Some(tactic);
         }
-        // A capture times nothing, nor does a size-only walk (`crate::sizing`),
-        // which keeps no pick it did not time either.
-        if capturing != cudaStreamCaptureStatus::cudaStreamCaptureStatusNone
-            || crate::sizing::active()
+        let capturing = capturing != cudaStreamCaptureStatus::cudaStreamCaptureStatusNone;
+        if !may_time(key, capturing, || {
+            format!("{}x{}x{}", call.m, call.n, call.k)
+        }) || (call.m as usize) * (call.n as usize) * 2 > 256 * 1024 * 1024
         {
-            return None;
-        }
-        if (call.m as usize) * (call.n as usize) * 2 > 256 * 1024 * 1024 || !may_time(key) {
             return None;
         }
         let tactic = tune(
@@ -2513,8 +2515,9 @@ fn flush_bytes() -> usize {
 /// Each table opens with the signature of the cuBLAS and device it was timed
 /// on; one under another signature is not read. Tactics are timed only by
 /// `pie tune` ([`time_tactics`]), which writes the user's table; a load or a
-/// serving times nothing, and a product the tables lack runs cuBLAS's own
-/// pick, counted once a shape ([`untuned`]).
+/// serving times nothing, and a product the tables lack runs cuBLASLt's
+/// first heuristic for its shape (a ranking, not a timing), named once
+/// ([`untold`]).
 struct DiskCache {
     signature: String,
     path: Option<PathBuf>,
@@ -2525,7 +2528,9 @@ struct DiskCache {
 /// The tables [`install_tactics`] named, read by each device's cache.
 static TABLES: Mutex<(Option<&'static str>, Option<PathBuf>)> = Mutex::new((None, None));
 static TIMING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static UNTUNED: Mutex<Option<std::collections::HashSet<u64>>> = Mutex::new(None);
+/// The products met that no table had a tactic for, each key with its
+/// shape's name, and how many of them [`untold`] has named.
+static UNTUNED: Mutex<(Vec<(u64, String)>, usize)> = Mutex::new((Vec::new(), 0));
 /// Products timed since the process began: only `pie tune` times any.
 static TIMED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -2559,14 +2564,15 @@ pub fn time_tactics(on: bool) {
     TIMING.store(on, std::sync::atomic::Ordering::Release);
 }
 
-/// The products met that no table had a tactic for.
+/// The shapes met with no tactic in the tables since the last call, by
+/// name (`MxNxK`): a load names them once, after arming.
 #[must_use]
-pub fn untuned() -> usize {
-    UNTUNED
-        .lock()
-        .expect("untuned lock")
-        .as_ref()
-        .map_or(0, |set| set.len())
+pub fn untold() -> Vec<String> {
+    let mut untuned = UNTUNED.lock().expect("untuned lock");
+    let (met, told) = &mut *untuned;
+    let fresh = met[*told..].iter().map(|(_, name)| name.clone()).collect();
+    *told = met.len();
+    fresh
 }
 
 /// The products timed since the process began: 0 unless `pie tune` ran
@@ -2576,24 +2582,23 @@ pub fn timed() -> usize {
     TIMED.load(std::sync::atomic::Ordering::Acquire)
 }
 
-/// Whether a missing tactic may be timed now (`pie tune`); otherwise it is
-/// counted.
-fn may_time(key: u64) -> bool {
+/// Whether a product the tables lack is timed now: only under `pie tune`,
+/// outside a capture and a size-only walk (`crate::sizing`). A serving's
+/// is noted by its shape's name instead.
+fn may_time(key: u64, capturing: bool, name: impl FnOnce() -> String) -> bool {
+    if crate::sizing::active() {
+        return false;
+    }
     if TIMING.load(std::sync::atomic::Ordering::Acquire) {
+        if capturing {
+            return false;
+        }
         TIMED.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         return true;
     }
-    let new = UNTUNED
-        .lock()
-        .expect("untuned lock")
-        .get_or_insert_with(Default::default)
-        .insert(key);
-    if new {
-        tracing::warn!(
-            key = format!("{key:016x}"),
-            "a dense product has no tactic in the profile's tables; it runs cuBLAS's own pick \
-             (`pie tune` times it)"
-        );
+    let mut untuned = UNTUNED.lock().expect("untuned lock");
+    if !untuned.0.iter().any(|&(met, _)| met == key) {
+        untuned.0.push((key, name()));
     }
     false
 }

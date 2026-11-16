@@ -1792,6 +1792,20 @@ impl Shell {
             seal,
         };
         eprintln!("engine-cuda: {report}");
+        #[cfg(feature = "cuda")]
+        {
+            let untuned = kernels_cuda::linear::gemm::untold();
+            if !untuned.is_empty() {
+                eprintln!(
+                    "engine-cuda: WARNING: {}'s profile has no dense GEMM tactic for {} shape(s) \
+                     this load arms: {}. They run cuBLASLt's first heuristic, untimed; \
+                     `pie tune cuda` times them into the profile.",
+                    self.device.name(),
+                    untuned.len(),
+                    untuned.join(", "),
+                );
+            }
+        }
         // The lattice the bodies armed over against the profile's: fewer
         // buckets is the allowance binding, each fire padded further.
         eprintln!(

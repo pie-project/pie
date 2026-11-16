@@ -80,7 +80,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         }
         eprintln!(
             "engine-cuda: dense GEMM tactics from the profile's tables: {} checked in, {} the \
-             user's; a product they lack runs cuBLAS's own pick, and nothing is timed",
+             user's; a product they lack runs cuBLASLt's first heuristic, and nothing is timed",
             tactics.from_profile, tactics.from_user,
         );
     }
