@@ -1156,6 +1156,7 @@ mod tests {
                     pools: &pools,
                     instance: &instance,
                     rings: &rings,
+                    scratch: &scratch_of(&plane, program, &one_row(), &pools, 0, 0),
                 },
             )
             .expect("the instance binds");
@@ -1166,18 +1167,13 @@ mod tests {
         plane
             .bind_output(id, "logits", 0, &logits, 0, eta_ir::Dtype::Bf16, vocab, vocab)
             .expect("the logits bind");
-        let carve = GuestCarve::new(
-            crate::device::Buffer::zeroed(&context, 256 << 20).expect("a guest region"),
-            256 << 20,
-            0,
-        );
         // One fire to build the pipelines, one timed.
-        let _ = plane.fire(&context, id, Attach::Epilogue, &carve).expect("the stage fires");
+        let _ = plane.fire(&context, id, Attach::Epilogue, &pools).expect("the stage fires");
         let _ = plane.instance_mut(id).expect("bound").take(mask).expect("the take");
         let (channel, seed) = &seeds[0];
         plane.instance_mut(id).expect("bound").publish(*channel, seed).expect("the reseed");
         let began = std::time::Instant::now();
-        let fired = plane.fire(&context, id, Attach::Epilogue, &carve).expect("the stage fires");
+        let fired = plane.fire(&context, id, Attach::Epilogue, &pools).expect("the stage fires");
         let took = began.elapsed();
         assert!(matches!(fired, Fired::Committed), "the cut fires: {fired:?}");
         let cell = plane
@@ -1283,19 +1279,81 @@ mod tests {
     const LANES: u32 = 2;
     const CHUNK: u64 = 16 << 20;
 
-    /// The slots instance `nth` of `facts` takes: its tables from logical
-    /// chunk 1, its rings from chunk 2, each instance's apart.
-    /// A guest region of its own for fires with no model carve above
-    /// them: a buffer, laid from its top.
-    fn guests(context: &Context) -> GuestCarve {
-        const BYTES: u64 = 64 << 20;
-        GuestCarve::new(
-            crate::device::Buffer::zeroed(context, BYTES).expect("a guest region"),
-            BYTES,
-            0,
-        )
+    /// The extents every test here binds at: one row, one sampled.
+    fn one_row() -> Extents {
+        Extents {
+            row_count: 1,
+            sampled_rows: 1,
+            query_len: 1,
+            ..Extents::default()
+        }
     }
 
+    /// The logical chunk the instances' scratch lies in: no table, ring or
+    /// evacuation here takes it.
+    const SCRATCH_CHUNK: u32 = 0;
+
+    /// Instance `nth`'s scratch as the runtime holds it for `program` bound
+    /// at `extents` (`Plane::lane_scratch`, one run of `Instance` slots):
+    /// in [`SCRATCH_CHUNK`], `gap` bytes left after each instance's, so no
+    /// two lie a stride apart.
+    fn scratch_of(
+        plane: &Plane,
+        program: ProgramId,
+        extents: &Extents,
+        pools: &crate::store::Pools,
+        nth: u32,
+        gap: u64,
+    ) -> engine::ScratchPlace {
+        use crate::store::layout::INSTANCE;
+        let bytes = plane
+            .lane_scratch(program, extents, pools)
+            .expect("the scratch lays in pieces");
+        let per_chunk = pools.slots_per_chunk(INSTANCE).expect("an instance shape");
+        let slot = pools.slot_bytes(INSTANCE).expect("an instance slot");
+        assert!(
+            bytes <= u64::from(per_chunk) * slot,
+            "{bytes} bytes of scratch: a test instance's lies in one run"
+        );
+        let slots = u32::try_from(bytes.max(1).div_ceil(slot)).expect("slots");
+        let step = slots + u32::try_from(gap.div_ceil(slot)).expect("slots");
+        assert!(
+            nth * step + slots <= per_chunk,
+            "instance {nth}'s scratch lies inside its chunk"
+        );
+        engine::ScratchPlace::Run {
+            first: SCRATCH_CHUNK * per_chunk + nth * step,
+            slots,
+        }
+    }
+
+    /// The scratch chunk's bytes as they stand: every instance's scratch.
+    fn scratch_bytes(pools: &crate::store::Pools) -> Vec<u8> {
+        use crate::store::layout::INSTANCE;
+        let per_chunk = pools.slots_per_chunk(INSTANCE).expect("an instance shape");
+        (SCRATCH_CHUNK * per_chunk..(SCRATCH_CHUNK + 1) * per_chunk)
+            .flat_map(|slot| pools.read_slot_bytes(INSTANCE, slot).expect("the slot reads"))
+            .collect()
+    }
+
+    /// Zeroes the scratch chunk, so what a fire writes there stands alone.
+    fn zero_scratch(pools: &crate::store::Pools) {
+        use crate::store::layout::INSTANCE;
+        let per_chunk = pools.slots_per_chunk(INSTANCE).expect("an instance shape");
+        let slot = pools.slot_bytes(INSTANCE).expect("an instance slot");
+        held::Held::in_run(
+            pools,
+            INSTANCE,
+            SCRATCH_CHUNK * per_chunk,
+            per_chunk,
+            0,
+            u64::from(per_chunk) * slot,
+        )
+        .expect("the scratch chunk zeroes");
+    }
+
+    /// The slots instance `nth` of `facts` takes: its tables from logical
+    /// chunk 1, its rings from chunk 2, each instance's apart.
     fn slots_for(
         pools: &crate::store::Pools,
         facts: &engine::ProgramFacts,
@@ -1451,14 +1509,14 @@ mod tests {
         );
     }
 
-    /// Each form's lanes fired alone, then together, from a guest region
-    /// laid `gap` bytes between takes: every lane whose answer is not its
-    /// own peak, by form and how it fired.
+    /// Each form's lanes fired alone, then together, each instance's
+    /// scratch its own run `gap` bytes past the last's: every lane whose
+    /// answer is not its own peak, by form and how it fired, and the places
+    /// the fire together wrote.
     fn alone_and_together(context: &Context, gap: u64) -> (Vec<String>, Vec<(compile::Form, usize)>) {
         use crate::store::Pools;
         use eta_compiler::codegen::program::KernelKind;
         let context = context;
-        let guests = |context: &Context| guests(context).spaced(gap);
         let (registration, count, seeds, token) = registration_of(true);
         let mut wrong = Vec::new();
         let mut islands = Vec::new();
@@ -1503,6 +1561,7 @@ mod tests {
                                 pools: &pools,
                                 instance: &instance,
                                 rings: &rings,
+                                scratch: &scratch_of(&plane, program, &one_row(), &pools, nth, gap),
                             },
                         )
                         .expect("the lane binds");
@@ -1537,7 +1596,7 @@ mod tests {
             // Alone: each lane's stage in a frame of its own.
             for (&id, &peak) in lanes.iter().zip(&peaks) {
                 let fired = plane
-                    .fire(&context, id, Attach::Epilogue, &guests(&context))
+                    .fire(&context, id, Attach::Epilogue, &pools)
                     .expect("the stage fires");
                 assert!(matches!(fired, Fired::Committed), "{form:?} {id} fires: {fired:?}");
                 let got = take(&mut plane, id);
@@ -1552,17 +1611,19 @@ mod tests {
                 Ok(vec![(0, bytes, tables.host_span(at, bytes)?)])
             };
             plane.lay_batches(&tables, area, &host).expect("the batches lay");
+            // What the lone fires wrote cleared, so the islands are what
+            // the fire together wrote.
+            zero_scratch(&pools);
             let mut frame = context.frame().expect("a frame");
-            let carve = guests(&context);
             let launched = plane
-                .stage_batched(&mut frame, &lanes, &carve, 0)
+                .stage_batched(&mut frame, &lanes, &pools, 0)
                 .expect("the lanes stage");
             assert!(
                 launched.iter().all(|(_, launched)| matches!(launched, Launched::Airborne)),
                 "{form:?}: every lane launches: {launched:?}"
             );
             frame.commit().expect("the frame lands");
-            islands.push((form, written_islands(&carve.bytes(), gap.max(1) / 2)));
+            islands.push((form, written_islands(&scratch_bytes(&pools), gap.max(1) / 2)));
             for (&id, &peak) in lanes.iter().zip(&peaks) {
                 plane.settle_launched(id).expect("the lane settles");
                 let got = take(&mut plane, id);
@@ -1625,6 +1686,7 @@ mod tests {
                             pools: &pools,
                             instance: &instance,
                             rings: &rings,
+                            scratch: &scratch_of(&plane, program, &one_row(), &pools, lane, 0),
                         },
                     )
                     .expect("the lane binds");
@@ -1656,7 +1718,7 @@ mod tests {
             .expect("the batches lay");
         let mut frame = context.frame().expect("a frame");
         let launched = plane
-            .stage_batched(&mut frame, &lanes, &guests(&context), 0)
+            .stage_batched(&mut frame, &lanes, &pools, 0)
             .expect("the lanes stage");
         assert!(
             launched
@@ -1762,6 +1824,7 @@ mod tests {
                             pools: &pools,
                             instance,
                             rings,
+                            scratch: &scratch_of(&plane, program, &one_row(), &pools, nth, 0),
                         },
                     )
                     .expect("the lane binds");
@@ -1796,7 +1859,7 @@ mod tests {
             .expect("the batches lay");
         let members: Vec<InstanceId> = lanes.iter().map(|(id, _)| *id).collect();
         let mut frame = context.frame().expect("a frame");
-        let _ = plane.stage_batched(&mut frame, &members, &guests(&context), 0);
+        let _ = plane.stage_batched(&mut frame, &members, &pools, 0);
     }
 
     /// An instance's tables and rings in pool slots fire as another's in
@@ -1879,12 +1942,15 @@ mod tests {
             id
         };
         // Two instances in slots of their own: the second is moved below.
+        let other_scratch = scratch_of(&plane, program, &extents, &pools, 1, 0);
+        let scratch = scratch_of(&plane, program, &extents, &pools, 0, 0);
         let own = bind(
             &mut plane,
             session::Pooled {
                 pools: &pools,
                 instance: &other_instance,
                 rings: &other_rings,
+                scratch: &other_scratch,
             },
         );
         let pooled = bind(
@@ -1893,6 +1959,7 @@ mod tests {
                 pools: &pools,
                 instance: &instance,
                 rings: &rings,
+                scratch: &scratch,
             },
         );
 
@@ -1904,7 +1971,7 @@ mod tests {
             let mut tokens = Vec::new();
             for id in [own, pooled] {
                 let fired = plane
-                    .fire(&context, id, Attach::Epilogue, &guests(&context))
+                    .fire(&context, id, Attach::Epilogue, &pools)
                     .expect("the stage fires");
                 assert!(matches!(fired, Fired::Committed), "{id} fires: {fired:?}");
                 let cell = plane
@@ -2008,7 +2075,10 @@ mod tests {
                     instance: fresh_instance.clone(),
                     rings: fresh_rings.clone(),
                     adapter: Vec::new(),
-                    scratch: engine::ScratchPlace::None,
+                    // An unpark takes fresh room for the scratch and
+                    // copies nothing (its contents are dead between
+                    // fires): the next fire seats there.
+                    scratch: scratch_of(&plane, program, &extents, &pools, 2, 0),
                     pair: engine::ScratchPlace::None,
                 },
             )
@@ -2087,7 +2157,7 @@ mod tests {
                     instance,
                     rings,
                     adapter: Vec::new(),
-                    scratch: engine::ScratchPlace::None,
+                    scratch,
                     pair: engine::ScratchPlace::None,
                 },
             )
@@ -2137,6 +2207,7 @@ mod tests {
                     pools: &pools,
                     instance: &instance,
                     rings: &rings,
+                    scratch: &scratch_of(&plane, program, &one_row(), &pools, 0, 0),
                 },
             )
             .expect("the instance binds");
@@ -2148,7 +2219,7 @@ mod tests {
             bf16[at as usize * 2..at as usize * 2 + 2].copy_from_slice(&0x3f80u16.to_le_bytes());
             logits.write(0, &bf16).expect("the logits write");
             let fired = plane
-                .fire(&context, id, Attach::Epilogue, &guests(&context))
+                .fire(&context, id, Attach::Epilogue, &pools)
                 .expect("the stage fires");
             assert!(matches!(fired, Fired::Committed), "the instance fires: {fired:?}");
             let cell = plane
