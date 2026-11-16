@@ -393,6 +393,20 @@ pub struct FireBindings {
     pub toggles: Toggles,
 
     pub capture: bool,
+
+    /// The fire's capturing lanes, where some lane of it captures its
+    /// attention scores ([`Captures`]).
+    pub captures: Option<Captures>,
+}
+
+/// Where a fire's capturing lanes lay their score rows: `lanes` (i32, a
+/// capturing row each, in lane order) names the fire lane each row is; the
+/// rows themselves are the capture values' slots, in the reading programs'
+/// span. `page_size` is the kv page a page's score sums.
+#[derive(Clone, Copy, Debug)]
+pub struct Captures {
+    pub lanes: Tensor,
+    pub page_size: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1462,6 +1476,38 @@ impl<'c> Run<'c> {
         &self.fire
     }
 
+    /// The fire's capturing rows as this window reads them, and the kv page
+    /// a page's score sums.
+    pub(crate) fn capture_rows(
+        &self,
+        op: &'static str,
+    ) -> Result<(kernels_cuda::attn::score::CaptureRows, u32), kernels_cuda::Error> {
+        let refuse = |detail: &str| kernels_cuda::Error::Backend {
+            op,
+            detail: detail.to_string(),
+        };
+        let captures = self
+            .fire
+            .captures
+            .ok_or_else(|| refuse("a capture on a fire whose lanes capture nothing"))?;
+        let window = self.window();
+        if window.gathered.is_some() {
+            return Err(refuse(
+                "a capture over a gathered window, whose requests are not the fire's lanes \
+                 from one",
+            ));
+        }
+        let span = window.span();
+        Ok((
+            kernels_cuda::attn::score::CaptureRows {
+                lanes: captures.lanes,
+                lane_offset: span.lane_offset,
+                requests: span.lanes,
+            },
+            captures.page_size,
+        ))
+    }
+
     pub(crate) fn window(&self) -> &'c Window {
         self.windows
             .at(self.place.region.get(), self.place.run.get())
@@ -1603,7 +1649,8 @@ impl<'c> Run<'c> {
             Dim::Patches => row(1),
             Dim::Readouts => return handle,
             Dim::Lanes => return handle,
-            // A capturing fire is refused before a value of either is cut.
+            // A row a capturing lane of the fire, whatever the window: a
+            // capture reads its window's off the fire's capturing lanes.
             Dim::Capturing | Dim::ContextTimes(_) | Dim::ContextPages => return handle,
             Dim::LanesPlus(k) => lane(k),
             Dim::Images => lane(0),

@@ -235,6 +235,15 @@ struct Staged {
     slots: SlotTable,
     caches: CacheTable,
     paging: Paging,
+    captures: FireCaptures,
+}
+
+/// The rows a fire's capturing lanes hold ([`FireCtx::lay_captures`]).
+struct FireCaptures {
+    /// Each lane's row, by its place in the fire's composition; none where
+    /// it does not capture.
+    row_of: Vec<Option<u32>>,
+    binding: Option<crate::run::Captures>,
 }
 
 impl Shell {
@@ -550,6 +559,7 @@ impl FireCtx<'_> {
             carve_lanes,
         )?;
         self.programs.set_span(span);
+        let captures = self.lay_captures(p, &mut slots)?;
         if let Some(ep) = self.ep {
             ep.seats(forked)
                 .seat(ep.wire(), p.composition.bucket(), &mut slots);
@@ -622,6 +632,75 @@ impl FireCtx<'_> {
             slots,
             caches,
             paging,
+            captures,
+        })
+    }
+
+    /// Lays a row for each of the fire's capturing lanes (those of a class
+    /// running a score capture), in lane order, at the top of its programs'
+    /// span: the key rows, then the page rows where a program the fire
+    /// carries reads them, then the capturing table (each row's lane).
+    /// Each capture value's slot is its rows; the programs lay under them,
+    /// in what each reading program's term states a member.
+    fn lay_captures(&mut self, p: &Prepared<'_>, slots: &mut SlotTable) -> Result<FireCaptures> {
+        let captures = &self.exports.captures;
+        let mut row_of = vec![None; p.composition.lanes().len()];
+        let mut lanes: Vec<i32> = Vec::new();
+        for (at, row) in p.composition.lanes().iter().enumerate() {
+            if captures.classes.contains(row.class as usize) {
+                row_of[at] = Some(u32::try_from(lanes.len()).unwrap_or(u32::MAX));
+                lanes.push(i32::try_from(at).unwrap_or(i32::MAX));
+            }
+        }
+        if lanes.is_empty() {
+            return Ok(FireCaptures {
+                row_of,
+                binding: None,
+            });
+        }
+        let mut pages_read = false;
+        for attached in p.attachments.iter().filter(|a| !a.adapter_only) {
+            pages_read |= self
+                .programs
+                .reads(attached.instance)?
+                .iter()
+                .any(|(name, _)| name == crate::program::SCORE_PAGES);
+        }
+        let n = lanes.len() as u64;
+        let keys = n * u64::from(captures.context) * 4;
+        let pages = if pages_read {
+            n * u64::from(captures.pages) * 4
+        } else {
+            0
+        };
+        let rows = u32::try_from(n).unwrap_or(u32::MAX);
+        let base = self.programs.hold_captures(rows, keys + pages + n * 4)?;
+        for &(value, page_row) in &captures.values {
+            slots.0[value.0 as usize] = match (page_row, pages_read) {
+                (false, _) => Some(kernels_cuda::Tensor::new(
+                    base,
+                    rows,
+                    captures.context,
+                    Dtype::F32,
+                )),
+                (true, true) => Some(kernels_cuda::Tensor::new(
+                    base + keys,
+                    rows,
+                    captures.pages,
+                    Dtype::F32,
+                )),
+                (true, false) => None,
+            };
+        }
+        let table = base + keys + pages;
+        let bytes: Vec<u8> = lanes.iter().flat_map(|lane| lane.to_le_bytes()).collect();
+        crate::device::stage_raw(self.device.stream(), table, &bytes)?;
+        Ok(FireCaptures {
+            row_of,
+            binding: Some(crate::run::Captures {
+                lanes: kernels_cuda::Tensor::new(table, rows, 1, Dtype::I32),
+                page_size: captures.page_size,
+            }),
         })
     }
 
@@ -721,6 +800,7 @@ impl FireCtx<'_> {
             device: self.device.device(),
             toggles: self.device.toggles(),
             capture: self.graphs.shaped(),
+            captures: staged.captures.binding,
         };
         let place = At::new();
         let stream = Cell::new(0u32);
@@ -1086,6 +1166,8 @@ impl FireCtx<'_> {
             Reap::Landed,
         )?;
         super::btrace::mark("epi_reap");
+        // A lane's row among the fire's capturing lanes, where it captures.
+        let captured = |row: u32| staged.captures.row_of.get(row as usize).copied().flatten();
         let mut epilogues = AirborneFires::default();
         for attached in p.attachments.iter().filter(|a| !a.adapter_only) {
             let reads = self.programs.reads(attached.instance)?;
@@ -1108,7 +1190,7 @@ impl FireCtx<'_> {
                         &plane_of,
                         &storage_of,
                         (first_row[at], last_row[at], lane_rows[at]),
-                        lane_row[at],
+                        (lane_row[at], captured(lane_row[at])),
                         first_voxel(index, at),
                     )?;
                 }
@@ -1172,7 +1254,9 @@ impl FireCtx<'_> {
     /// Points instance `instance`'s reads of `out` for its lane `k` (the
     /// fire's lane `at`) at where the fire wrote it: a readout output at the
     /// rows the lane reads out, a lane output at the lane's row (a layer
-    /// after another), a row or voxel output from the lane's first.
+    /// after another; a capturing lane's score rows at its row among the
+    /// capturing lanes, `lane_row.1`), a row or voxel output from the
+    /// lane's first.
     #[allow(clippy::too_many_arguments)]
     fn bind_output(
         &mut self,
@@ -1184,7 +1268,7 @@ impl FireCtx<'_> {
         plane_of: &dyn Fn(poem_ir::ValueId, &str) -> Result<kernels_cuda::Tensor>,
         storage_of: &dyn Fn(Dtype) -> Result<u32>,
         (first_row, last_row, owned): (u32, u32, u32),
-        lane_row: u32,
+        (lane_row, captured): (u32, Option<u32>),
         first_voxel: u32,
     ) -> Result<()> {
         let name = &out.decl.name;
@@ -1193,6 +1277,21 @@ impl FireCtx<'_> {
         let width = plane.width;
         match out.decl.axis {
             poem_ir::InputAxis::Lane => {
+                let lane_row = if self
+                    .exports
+                    .captures
+                    .values
+                    .iter()
+                    .any(|&(value, _)| value == out.values[0])
+                {
+                    captured.ok_or_else(|| Fault::Unbound {
+                        what: format!(
+                            "output `{name}` of lane {at}, which captures no scores this fire"
+                        ),
+                    })?
+                } else {
+                    lane_row
+                };
                 let elem = poem_compiler::arena::elem_bytes(plane.dtype).unwrap_or(0);
                 let stride = match out.values.get(1) {
                     Some(&next) => {
