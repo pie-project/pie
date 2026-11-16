@@ -36,6 +36,7 @@ mod mpp_attention_over_a_bf16_pool_matches_fp64;
 mod the_block_dyn_conv_matches_its_reference;
 mod the_conditioning_ops_answer_their_host_reference;
 mod the_dense_mpp_matches_the_simdgroup_gemm;
+mod the_device_rates;
 mod the_folded_qmv_answers_the_reference;
 mod the_gated_delta_scans_agree;
 mod the_hadamard_transform_agrees;
