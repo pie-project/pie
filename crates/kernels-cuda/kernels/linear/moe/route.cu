@@ -989,12 +989,6 @@ __global__ void moe_align_decode(
         }
         if (threadIdx.x == 0) {
             offsets[num_experts] = *block_base;
-#if defined(PIE_MOE_ALIGN_REPORT)
-
-            printf("[moe-align] used=%d max=%d routes=%d experts=%d\n",
-                   *block_base / block_size, max_blocks, num_routes,
-                   num_experts);
-#endif
         }
     }
     __syncthreads();

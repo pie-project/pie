@@ -250,8 +250,6 @@ pub struct Toggles {
 
     pub window_split: bool,
 
-    pub chunk_floor_128: bool,
-
     pub prefill_ctas_per_sm: u32,
 
     pub static_max_requests: u32,
@@ -265,7 +263,6 @@ impl Toggles {
         Self {
             force_split_small: tuning.decode_split_small,
             window_split: tuning.decode_split_window,
-            chunk_floor_128: tuning.decode_chunk_floor_128,
             prefill_ctas_per_sm: tuning.prefill_ctas_per_sm,
             static_max_requests: tuning.decode_static_max_requests,
             decode_gqa: crate::attn::decode_gqa::Gate::of(tuning),
@@ -384,7 +381,6 @@ pub fn plan_decode(
             page_size: shape.page_size,
             head_dim: shape.head_dim,
             enable_cuda_graph,
-            chunk_floor_128: toggles.chunk_floor_128,
             window_left: u32::try_from(window_left).ok(),
             whole: ranks > 0
                 || toggles

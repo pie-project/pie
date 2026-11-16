@@ -1348,7 +1348,8 @@ impl Pools {
         self.chunks
             .clear_past_parting(&mut self.pool, self.contiguous)?;
         let fitted = self.fit(bodies, programs, settled, true, resident)?;
-        self.chunks.state_fitted(self.fitted_chunks(), self.contiguous)?;
+        self.chunks
+            .state_fitted(self.fitted_chunks(), self.contiguous)?;
         Ok(fitted)
     }
 
@@ -2033,11 +2034,6 @@ impl Pools {
             .fixed
             .as_ref()
             .map_or(1, |fixed| fixed.ids_a_lane().max(1))
-    }
-
-    /// Lets go of the name [`Pools::name_record`] gave `key`.
-    pub fn forget_record(&mut self, key: u32) {
-        self.records.remove(&key);
     }
 
     /// Where a fire whose carve leaves `under` bytes of the span below it

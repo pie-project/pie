@@ -1,4 +1,4 @@
-// `cuda_fp8.h` for NVRTC, which ships no device headers (see README.md).
+// `cuda_fp8.h` for NVRTC, which ships no device headers.
 // e4m3/e5m2 storage and conversions: the sm_89 cvt instructions, integer
 // arithmetic below (sm_80).
 

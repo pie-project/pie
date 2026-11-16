@@ -458,19 +458,6 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     })
 }
 
-/// The token and lane budgets fitted to what the card has with the weights
-/// resident. What a fire's working set takes at those budgets (the
-/// activation arena, the attention workspaces, the decoded-weight tiles, the
-/// guests' programs, the capturing lanes' score planes and the readout
-/// indices) is held to half of the card past the weights, the half `bake`
-/// sizes the token budget against before the weights are down, and to what
-/// leaves one sequence and the bodies' floor beside it. The tile yields
-/// first, held to the widest plane fired at token rows (a plane past it is
-/// served by the fused-dequant arm), then the token budget halves toward its
-/// floor, then the lanes halve toward one, and what their cut frees grows the
-/// token budget back toward `asked`'s, the budget before `bake` cut it at the
-/// asked lanes; `Pools::fit_the_card` still refuses past that.
-#[allow(clippy::too_many_arguments)]
 /// Where the weight cache's copy of a streamable weight lies off the device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HostCopy {
@@ -577,6 +564,19 @@ fn held_beside(boot: &Boot<'_>, room: u64) -> Result<u64> {
     Ok(if cached < room { room - cached } else { room })
 }
 
+/// The token and lane budgets fitted to what the card has with the weights
+/// resident. What a fire's working set takes at those budgets (the
+/// activation arena, the attention workspaces, the decoded-weight tiles, the
+/// guests' programs, the capturing lanes' score planes and the readout
+/// indices) is held to half of the card past the weights, the half `bake`
+/// sizes the token budget against before the weights are down, and to what
+/// leaves one sequence and the bodies' floor beside it. The tile yields
+/// first, held to the widest plane fired at token rows (a plane past it is
+/// served by the fused-dequant arm), then the token budget halves toward its
+/// floor, then the lanes halve toward one, and what their cut frees grows the
+/// token budget back toward `asked`'s, the budget before `bake` cut it at the
+/// asked lanes; `Pools::fit_the_card` still refuses past that.
+#[allow(clippy::too_many_arguments)]
 fn refit(
     boot: &mut Boot<'_>,
     device: &Context,
@@ -1466,10 +1466,8 @@ impl Shell {
             let copies = format!("|{:?}", kernels_cuda::hip::sys::copy_queues());
             #[cfg(not(feature = "rocm"))]
             let copies = String::new();
-            let record = super::measured::path(
-                dir,
-                &format!("{bodies_shape}|{:?}{copies}", shell.budget),
-            );
+            let record =
+                super::measured::path(dir, &format!("{bodies_shape}|{:?}{copies}", shell.budget));
             if let Some(measured) = super::measured::read(&record) {
                 recorded = true;
                 let held = usize::try_from(measured.hold()).unwrap_or(usize::MAX);
@@ -1492,9 +1490,8 @@ impl Shell {
         // A flat range cannot grow after its bodies name it, so a load that
         // has no record of what they take measures it: no estimate stands
         // in for the figure.
-        shell.measuring = shell.records_bodies()
-            && !crate::device::elastic::mapped_on_demand()
-            && !recorded;
+        shell.measuring =
+            shell.records_bodies() && !crate::device::elastic::mapped_on_demand() && !recorded;
         let bodies = if shell.measuring {
             crate::store::MEASURING
         } else if shell.records_bodies() {

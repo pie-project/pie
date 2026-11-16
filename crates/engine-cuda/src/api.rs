@@ -192,7 +192,6 @@ impl Cuda {
         &self,
         trace: &Trace,
         path: &Path,
-        residency: &engine::Residency,
     ) -> EngineResult<(ModelContract, crate::experts::Plan)> {
         let contract = (self.contract_for)(trace, path).map_err(Error::Load)?;
         let prospect =
@@ -207,7 +206,6 @@ impl Cuda {
             crate::store::layout::streamed_experts(trace)
         };
         let ranking = prospect.ranking.clone().caching(&cached);
-        let _ = residency;
         Ok((contract, crate::experts::Plan::cut(&ranking)))
     }
 
@@ -604,7 +602,7 @@ impl Engine for Cuda {
             trace.platform.backend(),
             width_free(&trace.name),
         )?;
-        let (contract, plan) = self.settle(&trace, &path, &residency)?;
+        let (contract, plan) = self.settle(&trace, &path)?;
         let mut budgets = budgets;
         if budgets.context_declared && residency.device_kv_budget.is_none() {
             let fits = crate::store::declared_context_that_fits(
