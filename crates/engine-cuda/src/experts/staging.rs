@@ -219,23 +219,30 @@ impl Staging {
         self.rows
     }
 
-    /// Refuses a staging `room` bytes do not hold, by its banks' names.
-    pub fn fits(&self, room: u64) -> Result<()> {
-        let need = self.bytes();
-        if need <= room {
-            return Ok(());
+    /// The fit's refusal of a load that lays this staging, its banks named:
+    /// the staging is a run of the activation's span, a term of the fit as
+    /// the workspaces are, so a card the fit cannot seat it on refuses the
+    /// load there.
+    #[must_use]
+    pub fn short(&self, why: Fault) -> Fault {
+        if self.banks.is_empty() {
+            return why;
         }
-        Err(Fault::Residency(format!(
-            "the routed bank(s) {} lie on the host with no table of the weight cache to read \
-             them through, and a fire of {} rows stages the experts it routes to on the device, \
-             a lane for each of {} stream(s): {need} bytes laid at load, and the card has {room} \
-             bytes free for it. Serve fewer \
-             `max_forward_tokens`, let the weight cache take the bank(s), or free what else \
-             holds the device.",
+        let why = match why {
+            Fault::Residency(said) => said,
+            other => other.to_string(),
+        };
+        Fault::Residency(format!(
+            "{why}. Of what this load lays, the routed bank(s) {} lie on the host with no \
+             table of the weight cache to read them through, and a fire of {} rows stages the \
+             experts it routes to on the device, a lane for each of {} stream(s): {} bytes of \
+             staged experts. Serve fewer `max_forward_tokens`, or let the weight cache take \
+             the bank(s).",
             self.names(),
             self.rows,
             self.streams.len(),
-        )))
+            self.bytes(),
+        ))
     }
 
     /// The staging laid from `base`; `None` where it stages nothing.
@@ -354,19 +361,19 @@ mod tests {
     fn a_staging_the_card_cannot_hold_is_refused_by_name() {
         let staging = Staging::bound(&[select("blk.3.gate_up", 64, 4, [1 << 20, 0, 0])], 1024);
         let need = staging.bytes();
-        staging.fits(need).expect("the room it needs holds it");
         let said = staging
-            .fits(need - 1)
-            .expect_err("a byte short refuses the load")
+            .short(Fault::Residency(
+                "the card does not hold this deployment".to_string(),
+            ))
             .to_string();
+        assert!(
+            said.contains("the card does not hold"),
+            "keeps the fit's: {said}"
+        );
         assert!(said.contains("`blk.3.gate_up`"), "names the bank: {said}");
         assert!(
-            said.contains(&format!("{need} bytes")),
+            said.contains(&format!("{need} bytes of staged experts")),
             "and the bytes: {said}"
-        );
-        assert!(
-            said.contains(&format!("{} bytes free", need - 1)),
-            "and the room: {said}"
         );
     }
 
@@ -375,6 +382,7 @@ mod tests {
         assert_eq!(staging.bytes(), 0);
         assert!(staging.at(1 << 20).is_none());
         assert!(staging.fact().is_none());
-        staging.fits(0).expect("nothing to hold");
+        let why = Fault::Residency("short".to_string());
+        assert_eq!(staging.short(why).to_string(), "weight residency: short");
     }
 }

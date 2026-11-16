@@ -407,7 +407,26 @@ fn load(fixture: &Fixture, cache: &Path) -> Shell {
 static SMALL_POOL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn load_with(fixture: &Fixture, cache: &Path, knobs: engine_cuda::Knobs) -> Shell {
-    let shell = Shell::load(Boot {
+    let shell = load_under(fixture, cache, knobs, engine::Allowance::WHOLE)
+        .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
+    let (_, outside) = shell.held_and_outside();
+    assert_eq!(
+        outside,
+        shell.ledger().bytes(engine::memory::Class::Outside),
+        "{}: the load states outside its span what its ledger enters there",
+        fixture.model
+    );
+    shell
+}
+
+/// [`load_with`] under `allowance`, its refusal returned.
+fn load_under(
+    fixture: &Fixture,
+    cache: &Path,
+    knobs: engine_cuda::Knobs,
+    allowance: engine::Allowance,
+) -> Result<Shell, String> {
+    Shell::load(Boot {
         trace: fixture.trace.clone(),
         contract: &fixture.contract,
         checkpoint: &fixture.container,
@@ -432,7 +451,7 @@ fn load_with(fixture: &Fixture, cache: &Path, knobs: engine_cuda::Knobs) -> Shel
                 .map(|mib| mib << 20),
             mib => Some(mib << 20),
         },
-        allowance: engine::Allowance::WHOLE,
+        allowance,
         context_declared: false,
         ordinal: 0,
         knobs,
@@ -443,15 +462,7 @@ fn load_with(fixture: &Fixture, cache: &Path, knobs: engine_cuda::Knobs) -> Shel
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
     })
-    .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
-    let (_, outside) = shell.held_and_outside();
-    assert_eq!(
-        outside,
-        shell.ledger().bytes(engine::memory::Class::Outside),
-        "{}: the load states outside its span what its ledger enters there",
-        fixture.model
-    );
-    shell
+    .map_err(|why| why.to_string())
 }
 
 /// The load's knobs: `PIE_GOLDEN_CHUNK` (bytes) sets the chunk size the
@@ -2619,8 +2630,8 @@ fn staged_steps(shell: &mut Shell, trace: &Trace) -> Vec<Vec<f32>> {
 /// (`untabled-experts`), so each fire stages the experts it routes to into
 /// the run the load laid. The staging is the bound times its streams, the
 /// steps serve the device-resident banks' logits, a fire past the first
-/// round takes no device memory, and the staging refuses a room a byte
-/// short of it by its banks' names.
+/// round takes no device memory, the ledger enters it, and the fit's
+/// refusal names it.
 #[test]
 #[ignore = "a probe run by hand: see the module's doc"]
 fn golden_staged_experts() {
@@ -2646,11 +2657,21 @@ fn golden_staged_experts() {
         let want = staged_steps(&mut resident, trace);
         drop(resident);
 
-        let mut knobs = knobs();
-        knobs.diagnostics.dense_weights = false;
-        knobs.diagnostics.untabled_experts = true;
-        let mut shell = load_with(&fixture, &cache, knobs);
+        let staged = || {
+            let mut knobs = knobs();
+            knobs.diagnostics.dense_weights = false;
+            knobs.diagnostics.untabled_experts = true;
+            knobs
+        };
+        let mut shell = load_with(&fixture, &cache, staged());
         let staging = shell.expert_staging().clone();
+        assert_eq!(
+            shell
+                .ledger()
+                .of(engine::memory::Class::Fire, "staged experts"),
+            staging.bytes(),
+            "{model}: the ledger enters the staging as a fire's"
+        );
         let fact = staging
             .fact()
             .unwrap_or_else(|| panic!("{model}: no bank is staged"));
@@ -2728,10 +2749,12 @@ fn golden_staged_experts() {
             assert!(most < 0.25, "{model} step {at}: |diff| {most:e}");
         }
 
-        // A room a byte short of the staging refuses it, by name.
+        // The staging is a term of the fit: its refusal names the banks
+        // and the staging's bytes.
         let said = staging
-            .fits(staging.bytes() - 1)
-            .expect_err("a byte short refuses the load")
+            .short(engine_cuda::Fault::Residency(
+                "the card does not hold this deployment".to_string(),
+            ))
             .to_string();
         assert!(
             staging
@@ -2741,7 +2764,7 @@ fn golden_staged_experts() {
             "{model}: the refusal names the banks: {said}"
         );
         assert!(
-            said.contains(&format!("{} bytes laid at load", staging.bytes())),
+            said.contains(&format!("{} bytes of staged experts", staging.bytes())),
             "{model}: and the bytes: {said}"
         );
     }

@@ -1315,9 +1315,8 @@ impl Shell {
         };
         #[cfg(feature = "rocm")]
         let expert_staging = crate::experts::staging::Staging::default();
-        if expert_staging.bytes() > 0 {
-            expert_staging.fits(pools.free_room()?)?;
-        }
+        // It is a staged run of the activation's span: the fit seats it or
+        // refuses the load, naming it (`Staging::short`).
         if let Some(fact) = expert_staging.fact() {
             eprintln!("{fact}");
         }
@@ -1602,7 +1601,8 @@ impl Shell {
         }
         let fitted = shell
             .pools
-            .fit_the_card(bodies, shell.held_for_fires, false, &resident)?;
+            .fit_the_card(bodies, shell.held_for_fires, false, &resident)
+            .map_err(|why| shell.expert_staging.short(why))?;
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
                 "[arm-trace] claim before arming: {} pages, {} chunks, room {} MiB (fresh {})",

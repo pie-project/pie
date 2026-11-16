@@ -1129,13 +1129,6 @@ impl Pools {
             .saturating_sub(self.committed_bytes())
     }
 
-    /// What the device has free under the load's ceiling now, the cache
-    /// rows' declared reserve not taken from it: before the fit, what a
-    /// buffer laid at load may take (the fit then sizes the rows past it).
-    pub fn free_room(&self) -> Result<u64> {
-        self.pool.spare_bytes(0)
-    }
-
     pub fn spare_bytes(&self) -> Result<u64> {
         self.pool.spare_bytes(self.segment_reserve())
     }
