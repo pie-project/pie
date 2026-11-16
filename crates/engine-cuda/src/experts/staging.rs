@@ -233,11 +233,12 @@ impl Staging {
             other => other.to_string(),
         };
         Fault::Residency(format!(
-            "{why}. Of what this load lays, the routed bank(s) {} lie on the host with no \
+            "{}. Of what this load lays, the routed bank(s) {} lie on the host with no \
              table of the weight cache to read them through, and a fire of {} rows stages the \
              experts it routes to on the device, a lane for each of {} stream(s): {} bytes of \
              staged experts. Serve fewer `max_forward_tokens`, or let the weight cache take \
              the bank(s).",
+            why.trim_end_matches('.'),
             self.names(),
             self.rows,
             self.streams.len(),

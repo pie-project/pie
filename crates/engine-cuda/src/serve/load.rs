@@ -233,7 +233,11 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // halves toward its floor until they do, and the lattice follows.
     let (free, total) = crate::store::device_memory()?;
     let after_weights = crate::device::elastic::room_under(ceiling, free, total).saturating_sub(
-        crate::store::weight_tier_bytes(&boot.trace, boot.residency.device_demand(), 0)?,
+        crate::store::weight_tier_bytes(
+            &boot.trace,
+            boot.residency.resident_bytes(&boot.trace)?,
+            0,
+        )?,
     );
     let after_weights = held_beside(boot, after_weights)?;
     let facts = kv::probe(&boot.trace)?;
@@ -827,7 +831,7 @@ impl Shell {
         };
         let accounting = crate::store::admit_the_card(
             boot.allowance,
-            boot.residency.device_demand(),
+            boot.residency.resident_bytes(&boot.trace)?,
             decoded_dense,
             &boot.trace,
             paging,
@@ -1161,7 +1165,23 @@ impl Shell {
             .map(|map| (map.bytes, map.scores_from(&boot.trace)))
             .collect();
         let mut arena = Arena::reserve(arena_bytes).with_rungs(rungs, prefixes);
-        arena.ensure(&mut pools, unscored)?;
+        // The arena is backed here, at load, out of the elastic pool the
+        // allowance leaves past the weights: one it does not hold refuses
+        // the load by name.
+        arena
+            .ensure(&mut pools, unscored)
+            .map_err(|why| match why {
+                Fault::Ceiling { need, have, .. } | Fault::OutOfMemory { need, have } => {
+                    Fault::Residency(format!(
+                        "the card does not hold this deployment's activation arena: it backs \
+                         {need} bytes at load, and under the load's allowance (`[engine.memory] \
+                         budget_device`, or the whole card) the elastic pool past the weights \
+                         holds {have}. Raise `[engine.memory] budget_device`, or serve fewer \
+                         `max_forward_tokens`."
+                    ))
+                }
+                other => other,
+            })?;
         if arena.has_rungs() {
             pools.fit_range_whole();
         }

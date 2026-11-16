@@ -2605,6 +2605,102 @@ const STAGED_SCRIPT: &[Step] = &[
     Step::Decode,
 ];
 
+/// The budget probe: `PIE_GOLDEN_MODELS` loaded under each of
+/// `PIE_GOLDEN_BUDGETS` (bytes, comma-separated), its banks staged where
+/// `PIE_GOLDEN_UNTABLED` is set, and fired over [`STAGED_SCRIPT`]: each
+/// budget's load refused, or served.
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn golden_budget_probe() {
+    let cache = cache_dir();
+    let budgets: Vec<u64> = std::env::var("PIE_GOLDEN_BUDGETS")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|b| b.trim().parse().ok())
+        .collect();
+    for model in models() {
+        let fixture = fixture(&model, &cache);
+        // `PIE_GOLDEN_SEARCH`: the least budget a load serves every fire
+        // under, between the two stated, and the refusal a byte under it.
+        if std::env::var_os("PIE_GOLDEN_SEARCH").is_some() {
+            let untabled = std::env::var_os("PIE_GOLDEN_UNTABLED").is_some();
+            let (least, said) = least_budget(&fixture, &cache, untabled, budgets[0], budgets[1]);
+            println!("budget {model}: the least budget served is {least}");
+            println!("budget {model}: a byte under it: {said}");
+            continue;
+        }
+        for &budget in &budgets {
+            let mut knobs = knobs();
+            if std::env::var_os("PIE_GOLDEN_UNTABLED").is_some() {
+                knobs.diagnostics.dense_weights = false;
+                knobs.diagnostics.untabled_experts = true;
+            }
+            let allowance = engine::Allowance {
+                budget: Some(budget),
+            };
+            match load_under(&fixture, &cache, knobs, allowance) {
+                Err(why) => println!("budget {model} {budget}: refused at load: {why}"),
+                Ok(mut shell) => {
+                    for (class, owner, bytes) in shell.ledger().entries() {
+                        println!("budget {model} {budget}: ledger {class:?} {owner} {bytes}");
+                    }
+                    let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        staged_steps(&mut shell, &fixture.trace).len()
+                    }));
+                    println!("budget {model} {budget}: loaded; fires: {served:?}");
+                }
+            }
+        }
+    }
+}
+
+/// The least budget (bytes, in `lo..=hi`, `lo` refused and `hi` served)
+/// under which `fixture` loads and serves every fire of [`STAGED_SCRIPT`],
+/// its banks staged where `untabled`, and the load's refusal a byte under
+/// it. No budget between loads and then fails a fire: a load is refused,
+/// or serves.
+fn least_budget(
+    fixture: &Fixture,
+    cache: &Path,
+    untabled: bool,
+    mut lo: u64,
+    mut hi: u64,
+) -> (u64, String) {
+    let knobs = || {
+        let mut knobs = knobs();
+        if untabled {
+            knobs.diagnostics.dense_weights = false;
+            knobs.diagnostics.untabled_experts = true;
+        }
+        knobs
+    };
+    let serves = |budget: u64| -> Result<(), String> {
+        let allowance = engine::Allowance {
+            budget: Some(budget),
+        };
+        let mut shell = load_under(fixture, cache, knobs(), allowance)?;
+        let fired = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            staged_steps(&mut shell, &fixture.trace).len()
+        }));
+        assert!(
+            fired.is_ok(),
+            "{} under {budget} bytes: a fire failed after the load was ready",
+            fixture.model
+        );
+        Ok(())
+    };
+    assert!(serves(hi).is_ok(), "{}: serves under {hi}", fixture.model);
+    assert!(serves(lo).is_err(), "{}: refused under {lo}", fixture.model);
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        match serves(mid) {
+            Ok(()) => hi = mid,
+            Err(_) => lo = mid,
+        }
+    }
+    (hi, serves(hi - 1).expect_err("a byte under it refuses"))
+}
+
 /// `shell` fired over [`STAGED_SCRIPT`] from a fresh slot: each step's logits.
 fn staged_steps(shell: &mut Shell, trace: &Trace) -> Vec<Vec<f32>> {
     shell.open(0).expect("slot 0 opens");
@@ -2630,8 +2726,9 @@ fn staged_steps(shell: &mut Shell, trace: &Trace) -> Vec<Vec<f32>> {
 /// (`untabled-experts`), so each fire stages the experts it routes to into
 /// the run the load laid. The staging is the bound times its streams, the
 /// steps serve the device-resident banks' logits, a fire past the first
-/// round takes no device memory, the ledger enters it, and the fit's
-/// refusal names it.
+/// round takes no device memory, the ledger enters it, no budget loads it
+/// and then fails a fire, and a budget a byte short of the least it serves
+/// at is refused by the fit, by the staging's name.
 #[test]
 #[ignore = "a probe run by hand: see the module's doc"]
 fn golden_staged_experts() {
@@ -2749,13 +2846,12 @@ fn golden_staged_experts() {
             assert!(most < 0.25, "{model} step {at}: |diff| {most:e}");
         }
 
-        // The staging is a term of the fit: its refusal names the banks
+        drop(shell);
+        // The staging is a term of the fit: under the least budget the
+        // load serves at, less a byte, the fit refuses it, naming the banks
         // and the staging's bytes.
-        let said = staging
-            .short(engine_cuda::Fault::Residency(
-                "the card does not hold this deployment".to_string(),
-            ))
-            .to_string();
+        let (least, said) = least_budget(&fixture, &cache, true, 1 << 30, 16 << 30);
+        println!("staged {model}: least budget {least}; a byte under it: {said}");
         assert!(
             staging
                 .banks()
