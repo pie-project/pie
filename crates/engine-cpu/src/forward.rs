@@ -292,7 +292,22 @@ impl Forward {
     /// the trace's arms chosen by `word`. Returns every output the word's
     /// arms write, in the order the trace first names them.
     pub fn step(&mut self, tokens: &[u32], start: u32, word: u64) -> Result<Vec<Output>, String> {
+        self.step_piece(tokens, start, word, Piece::WHOLE)
+    }
+
+    /// One piece of a lane's pass, as the runtime cuts a long prompt: its
+    /// rows, the token past its last row the runtime holds (the next
+    /// piece's first), and whether it reads its last row out (only the
+    /// pass's last piece does).
+    pub fn step_piece(
+        &mut self,
+        tokens: &[u32],
+        start: u32,
+        word: u64,
+        piece: Piece,
+    ) -> Result<Vec<Output>, String> {
         let n = tokens.len();
+        let reads = n > 0 && piece.reads_out;
         let positions: Vec<i32> = (0..n).map(|t| (start as usize + t) as i32).collect();
         let mut vals: Vec<Option<Held>> = self.weights.clone();
         for (id, decl) in self.trace.values.iter().enumerate() {
@@ -305,7 +320,7 @@ impl Forward {
                 Def::Input(RuntimeInput::NextTokens) => Held::Ints {
                     rows: n,
                     width: 1,
-                    v: next_tokens(tokens),
+                    v: next_tokens(tokens, piece.lookahead),
                 },
                 Def::Input(RuntimeInput::Positions) => Held::Ints {
                     rows: n,
@@ -318,13 +333,9 @@ impl Forward {
                     v: vec![-1; n],
                 },
                 Def::Input(RuntimeInput::ReadoutRows) => Held::Ints {
-                    rows: usize::from(n > 0),
+                    rows: usize::from(reads),
                     width: 1,
-                    v: if n > 0 {
-                        vec![n as i32 - 1]
-                    } else {
-                        Vec::new()
-                    },
+                    v: if reads { vec![n as i32 - 1] } else { Vec::new() },
                 },
                 Def::Input(RuntimeInput::Mask | RuntimeInput::Geometry { .. })
                 | Def::Cache(_) => Held::Opaque,
@@ -1439,14 +1450,34 @@ impl Run<'_> {
     }
 }
 
-/// The step's lane's next token at each row: row i + 1's, and the last
-/// row its own (the token the step samples goes there in the forward).
+/// A piece of a lane's pass ([`Forward::step_piece`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Piece {
+    /// The token past the piece's last row, when the runtime holds it.
+    pub lookahead: Option<u32>,
+    /// Whether the piece reads its last row out.
+    pub reads_out: bool,
+}
+
+impl Piece {
+    /// A whole pass: nothing past it, its last row read out.
+    pub const WHOLE: Piece = Piece {
+        lookahead: None,
+        reads_out: true,
+    };
+}
+
+/// The step's lane's next token at each row: row i + 1's, the last row's
+/// the token past it (`lookahead`), else its own (the token the step
+/// samples goes there in the forward).
 #[must_use]
-pub fn next_tokens(tokens: &[u32]) -> Vec<i32> {
+pub fn next_tokens(tokens: &[u32], lookahead: Option<u32>) -> Vec<i32> {
+    let last = tokens.last().map(|&own| lookahead.unwrap_or(own));
     tokens
         .iter()
         .skip(1)
-        .chain(tokens.last())
-        .map(|&t| t as i32)
+        .copied()
+        .chain(last)
+        .map(|t| t as i32)
         .collect()
 }

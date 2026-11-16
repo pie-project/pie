@@ -135,15 +135,24 @@ pub(crate) fn corrected_classes(trace: &Trace, compiled: &CompiledModel) -> poem
     })
 }
 
+/// The classes whose lanes carry media: those scattering a tower's rows
+/// into their embedding by the fire's patch routes. A class scattering rows
+/// of its own by another route (a draft head's sampled rows over its next
+/// tokens, at its readout rows) carries none, and arms as text.
 #[must_use]
 pub(crate) fn media_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir::ClassSet {
-    classes_running(trace, compiled, |op| {
+    let patch_routed = |routes: &ValueId| {
         matches!(
-            op,
-            poem_ir::Operation::Gather(
-                poem_ir::Gather::ScatterRows { .. } | poem_ir::Gather::ScatterLiveRows { .. }
-            )
+            trace.values.get(routes.0 as usize).map(|decl| &decl.def),
+            Some(poem_ir::Def::Input(poem_ir::RuntimeInput::PatchRoutes))
         )
+    };
+    classes_running(trace, compiled, |op| match op {
+        poem_ir::Operation::Gather(
+            poem_ir::Gather::ScatterRows { routes, .. }
+            | poem_ir::Gather::ScatterLiveRows { routes, .. },
+        ) => patch_routed(routes),
+        _ => false,
     })
 }
 
@@ -508,5 +517,95 @@ mod tests {
                 "no request lands in class {class}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A load's lattice keys a text prefill for every plain class that is no
+    /// media one and no decoding one (`serve::arming`'s `prefilling`): the
+    /// classes the size-only walk and the arming fire at every bucket.
+    fn text_prefilling(trace: &Trace, compiled: &CompiledModel) -> (Vec<usize>, Vec<usize>) {
+        let landing = landing_requests(&trace.facts, &compiled.classes);
+        let decoding = decoding_of(&landing);
+        let exports = Exports::of(trace, compiled).expect("the classes' outputs");
+        let plain = plain_of(&landing, &exports.outputs);
+        let media = media_classes(trace, compiled);
+        let multi_row_plain: Vec<usize> = (0..landing.len())
+            .filter(|&class| {
+                landing[class]
+                    .iter()
+                    .any(|request| request.plain() && request.query_len() > 1)
+            })
+            .collect();
+        let keyed = multi_row_plain
+            .iter()
+            .copied()
+            .filter(|&class| !decoding.contains(class) && !media.contains(class))
+            .filter(|&class| plain.contains(class))
+            .collect();
+        (multi_row_plain, keyed)
+    }
+
+    fn compiled(row: &poem_compiler::catalog::Deployment) -> (Trace, CompiledModel) {
+        let trace = row.trace(poem_ir::Platform::Cuda);
+        let load = engine::load::Budgets {
+            max_lanes: 4,
+            max_tokens: 2048,
+            ..engine::load::Budgets::default()
+        };
+        let mut budgets = poem_compiler::Budgets::of(poem_compiler::Budget::new(4, 2048));
+        if let Some(ladder) = crate::api::patch_ladder(&trace, &load) {
+            budgets = budgets.with_patches(ladder);
+        }
+        let compiled = poem_compiler::compile_axes(
+            &trace,
+            &budgets,
+            &poem_compiler::DeviceProfile::default(),
+        )
+        .unwrap_or_else(|why| panic!("{} compiles: {why}", row.name));
+        (trace, compiled)
+    }
+
+    /// Qwen3.5's MTP head scatters its sampled rows over its next tokens on
+    /// every prefill: that makes none of its classes a media one, so every
+    /// prefill class of an MTP deployment is keyed, walked and armed as text.
+    /// A tower's scatter by the patch routes still makes its class media.
+    #[test]
+    fn every_prefill_class_of_an_mtp_deployment_is_walked() {
+        let rows: Vec<_> = poem_compiler::catalog::deployments()
+            .filter(|row| row.model.id == "qwen35-d0.8b")
+            .collect();
+        let mtp: Vec<_> = rows
+            .iter()
+            .filter(|row| row.deploy.drafter.as_deref() == Some("mtp"))
+            .collect();
+        assert!(!mtp.is_empty());
+        for row in mtp {
+            let (trace, compiled) = compiled(row);
+            assert!(trace.reads_next_tokens(), "{}", row.name);
+            let (prefills, keyed) = text_prefilling(&trace, &compiled);
+            assert!(!prefills.is_empty(), "{} lands no prefill", row.name);
+            assert_eq!(
+                keyed, prefills,
+                "{}: every prefill class is keyed as text, so the walk sizes its fires",
+                row.name
+            );
+        }
+        let towered = rows
+            .iter()
+            .find(|row| {
+                row.deploy.drafter.is_none()
+                    && row.deploy.parts.iter().any(|part| part == "vision")
+            })
+            .expect("a Qwen3.5 0.8B row with its tower");
+        let (trace, compiled) = compiled(towered);
+        assert!(
+            !media_classes(&trace, &compiled).is_empty(),
+            "{}: a tower's patch-routed scatter still marks its classes media",
+            towered.name
+        );
     }
 }

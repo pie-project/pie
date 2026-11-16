@@ -1498,6 +1498,7 @@ impl Cuda {
                         word: words[at],
                         tokens: &lane.tokens,
                     },
+                    lookahead: lane.lookahead,
                     positions: &lane.positions,
                     pages: match table(lane, LIST) {
                         Some(refs) if by_refs && lane.kv.translation.is_empty() => refs,

@@ -1654,16 +1654,26 @@ fn u32_bytes_of(values: &[u32]) -> &[u8] {
 }
 
 /// Each staged row's lane's next token: row i's is row i + 1's token when
-/// that row is live and the same lane's; a lane's last row and a pad row
-/// hold their own.
+/// that row is live and the same lane's; a lane's last row holds the token
+/// past it its fire lane states (`lookahead`, by `lane_of_row`), else its
+/// own; a pad row its own.
 #[must_use]
-pub fn next_tokens(tokens: &[i32], lane_of_row: &[i32], live: u32) -> Vec<i32> {
-    let live = live as usize;
+pub fn next_tokens(
+    tokens: &[i32],
+    lane_of_row: &[i32],
+    live: u32,
+    lookahead: &[Option<i32>],
+) -> Vec<i32> {
+    let live = (live as usize).min(tokens.len());
     (0..tokens.len())
         .map(|row| {
             let next = row + 1;
-            if next < live.min(tokens.len()) && lane_of_row.get(next) == lane_of_row.get(row) {
+            let lane = lane_of_row.get(row);
+            if next < live && lane_of_row.get(next) == lane {
                 tokens[next]
+            } else if row < live {
+                lane.and_then(|&lane| lookahead.get(lane as usize).copied().flatten())
+                    .unwrap_or(tokens[row])
             } else {
                 tokens[row]
             }

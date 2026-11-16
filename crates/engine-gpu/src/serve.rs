@@ -392,6 +392,10 @@ pub struct Lane<'a> {
 pub struct Seated<'a, B: Serve> {
     pub lane: Lane<'a>,
 
+    /// The lane's token after its last row, when the runtime holds it
+    /// (`engine::fire::Lane::lookahead`): that row's next token.
+    pub lookahead: Option<u32>,
+
     pub pages: &'a [u32],
 
     pub held: Option<u32>,
@@ -453,6 +457,7 @@ impl<'a, B: Serve> Seated<'a, B> {
         const FOLD: engine::fire::RsVerb = engine::fire::RsVerb::Fold;
         Seated {
             lane,
+            lookahead: None,
             pages: &[],
             held: None,
             kv_less: false,
@@ -2929,6 +2934,8 @@ impl<B: Serve> Shell<B> {
         let mut slot_ids: Vec<i32> = Vec::with_capacity(lanes.len());
 
         let mut request_of_token: Vec<i32> = Vec::with_capacity(rows as usize);
+        // Each fire lane's token past its last row, when the runtime holds it.
+        let mut lookahead: Vec<Option<i32>> = Vec::with_capacity(lanes.len());
 
         let mut rs_plans: Vec<engine::rs::LanePlan> = Vec::with_capacity(lanes.len());
         let mut rs_active = false;
@@ -3229,6 +3236,10 @@ impl<B: Serve> Shell<B> {
                 snap_entries.push(entry);
             }
             let at_lane = (slot_ids.len() / state.len().max(1)) as i32 - 1;
+            if let Ok(at) = usize::try_from(at_lane) {
+                lookahead.resize(lookahead.len().max(at + 1), None);
+                lookahead[at] = seated.lookahead.map(|t| t as i32);
+            }
 
             if !matches!(seated.rs, engine::fire::RsVerb::Fold) {
                 if self.rs_layout.is_none() {
@@ -3632,6 +3643,7 @@ impl<B: Serve> Shell<B> {
                 rs_replay: rs_active.then_some(rs_replay.as_slice()),
                 rs_commit: rs_active.then_some(rs_commit.as_slice()),
                 request_of_token: &request_of_token,
+                lookahead: &lookahead,
                 adapter_routes: any_adapter.then_some(adapter_routes.as_slice()),
                 page_tables: &geometries,
                 mask: staged.as_ref(),

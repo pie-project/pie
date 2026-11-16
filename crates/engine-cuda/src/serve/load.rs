@@ -1876,6 +1876,14 @@ fn footprint(shell: &Shell, device_total: u64, free_before: u64) -> Footprint {
 }
 
 impl Shell {
+    /// How this load's fires have been served so far: bodies replayed,
+    /// captured, and fires walked eagerly (`eager_unbodied`), which a
+    /// serving fire never is.
+    #[must_use]
+    pub fn body_tally(&self) -> crate::record::BodyTally {
+        self.cache.tally()
+    }
+
     /// The device's memory as this load holds it now ([`ledger`]).
     #[must_use]
     pub fn ledger(&self) -> engine::memory::Ledger {

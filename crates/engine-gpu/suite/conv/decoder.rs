@@ -439,6 +439,7 @@ fn a_conv_decoder_fires_over_a_voxel_input() {
         .collect();
     let tokens = [0u32];
     let lanes = [0u32, 1].map(|slot| Seated {
+        lookahead: None,
         kv_less: true,
         ..Seated::of(Lane {
             slot,

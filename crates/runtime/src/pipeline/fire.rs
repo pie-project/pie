@@ -1221,6 +1221,8 @@ fn rows_of_lanes(
             let (from, to) = rows?;
             let mut lane = lane.clone();
             let (a, b) = (from as usize, to as usize);
+            // The next piece's first token is this piece's last row's next.
+            lane.lookahead = lane.tokens.get(b).copied().or(lane.lookahead);
             lane.tokens = lane.tokens[a..b].to_vec();
             if !lane.positions.is_empty() {
                 lane.positions = lane.positions[a..b].to_vec();
@@ -6491,6 +6493,11 @@ mod cut_tests {
             (5, 27, 2)
         );
         assert_eq!(lane.tokens[0], 100);
+        assert_eq!(
+            lane.lookahead,
+            Some(127),
+            "a cut's last row's next token is the next piece's first"
+        );
         assert!(matches!(lane.readout, ::engine::Readout::None));
         assert!(
             !first.boundary_program,
@@ -6503,6 +6510,7 @@ mod cut_tests {
             (96, 9, 7)
         );
         assert_eq!(lane.tokens[0], 191);
+        assert_eq!(lane.lookahead, None, "the last piece's next is the sample");
         assert!(matches!(lane.readout, ::engine::Readout::Last));
         assert!(tail.boundary_program);
     }

@@ -167,14 +167,13 @@ async fn main(input: Input) -> Result<Output> {
         .context("reserve the decode's slots")?;
     let pipe = Pipeline::new();
 
-    // The drafting pass is the last prompt token alone: a draft head attends
-    // as its readout rows, so every row of a drafting fire is read out.
+    // The whole prompt in one forward, its last row read out: the trunk's
+    // sample there and, drafting, the head's first chain from the same fire.
+    // The runtime cuts a long prompt into pieces, each fed past its last row
+    // the next piece's first token, so the head's KV is written at every
+    // prompt position with its true next token (vLLM's shape).
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-    let spans = if k > 0 && n > 1 {
-        vec![(0, n - 1), (n - 1, n)]
-    } else {
-        vec![(0, n)]
-    };
+    let spans = [(0, n)];
     let last_span = spans.len() - 1;
     let mut seed: Vec<i32> = Vec::new();
     for (at, &(base, end)) in spans.iter().enumerate() {

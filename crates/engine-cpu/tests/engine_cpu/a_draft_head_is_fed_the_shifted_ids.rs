@@ -7,7 +7,7 @@
 //! row alone is read out, and its rows are held to the reference.
 
 use engine_cpu::Forward;
-use engine_cpu::forward::{Output, Values};
+use engine_cpu::forward::{Output, Piece, Values};
 use poem::{Dtype, ForwardHybrid, Input, Platform, Request, StateRows, Weight, ops};
 
 const VOCAB: u32 = 32;
@@ -91,5 +91,39 @@ fn a_draft_head_is_fed_the_shifted_ids() {
             &table[id * w..][..w],
             "row {row}: the head is fed token {id}, as vLLM's shifted ids feed it"
         );
+    }
+}
+
+/// A prompt the runtime cuts into pieces at the rung feeds the head what
+/// one whole-prompt fire feeds it: each piece's last row takes the next
+/// piece's first token (the runtime's lookahead, `Lane::lookahead`), and only
+/// the last piece, which reads its row out, takes the sample there.
+#[test]
+fn a_prompt_cut_into_pieces_feeds_the_head_what_one_fire_does() {
+    let trace = poem::trace_hybrid("head-feed", &HeadFeed, Platform::Cuda);
+    let prompt: [u32; 11] = [5, 17, 2, 30, 9, 9, 21, 4, 13, 1, 28];
+    let word = |rows: usize| trace.facts.word(&Request::new(rows as u32, false));
+    let mut whole = Forward::new(trace.clone(), None, &plane).expect("the miniature loads");
+    let want = f32s(
+        &whole.step(&prompt, 0, word(prompt.len())).expect("the whole prompt runs"),
+        "fed",
+    );
+    for cuts in [vec![4, 11], vec![1, 6, 11], vec![3, 7, 10, 11]] {
+        let mut cut = Forward::new(trace.clone(), None, &plane).expect("the miniature loads");
+        let mut fed = Vec::new();
+        let mut from = 0;
+        for &to in &cuts {
+            let last = to == prompt.len();
+            let piece = Piece {
+                lookahead: prompt.get(to).copied(),
+                reads_out: last,
+            };
+            let outs = cut
+                .step_piece(&prompt[from..to], from as u32, word(to - from), piece)
+                .expect("the piece runs");
+            fed.extend(f32s(&outs, "fed"));
+            from = to;
+        }
+        assert_eq!(fed, want, "pieces {cuts:?} feed the head the whole prompt's rows");
     }
 }

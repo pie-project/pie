@@ -1238,6 +1238,7 @@ impl<B: Host> Gpu<B> {
             .iter()
             .enumerate()
             .map(|(at, lane)| Seated {
+                lookahead: lane.lookahead,
                 lane: Lane {
                     slot: lane.slot,
 

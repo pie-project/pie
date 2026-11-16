@@ -1868,8 +1868,14 @@ impl Shell {
         }
 
         // Each row's lane's next token: the row after it in the same lane,
-        // a lane's last row (and a pad) its own.
-        let next_tokens = crate::inputs::next_tokens(&tokens, &lane_of_row, rows);
+        // a lane's last row the token past it the runtime holds (its next
+        // piece's first), else (and a pad) its own.
+        let lookahead: Vec<Option<i32>> = composition
+            .lanes()
+            .iter()
+            .map(|row| lanes[row.source as usize].lookahead.map(|t| t as i32))
+            .collect();
+        let next_tokens = crate::inputs::next_tokens(&tokens, &lane_of_row, rows, &lookahead);
 
         let mut qo_absolute: Vec<i32> = Vec::new();
         let mut lane_carve = composition.lane_count();

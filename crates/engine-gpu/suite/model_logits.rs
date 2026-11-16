@@ -397,6 +397,7 @@ pub fn serve_seats(shell: &mut Shell, trace: &Trace, steps: usize) -> Vec<Vec<f3
     let mut rows = Vec::new();
     for lane in 0..2usize {
         let seated = Seated {
+            lookahead: None,
             held: Some(held[lane]),
             ..Seated::of(Lane {
                 slot: lane as u32,
@@ -412,6 +413,7 @@ pub fn serve_seats(shell: &mut Shell, trace: &Trace, steps: usize) -> Vec<Vec<f3
     for _ in 0..steps {
         let seated: Vec<Seated<'_>> = (0..2usize)
             .map(|lane| Seated {
+                lookahead: None,
                 held: Some(held[lane]),
                 ..Seated::of(Lane {
                     slot: lane as u32,
@@ -506,6 +508,7 @@ fn every_rung_fires_what_the_load_built(model: &str) {
                 }
                 let seated: Vec<Seated<'_>> = (0..lanes)
                     .map(|lane| Seated {
+                        lookahead: None,
                         held: Some(held),
                         ..Seated::of(Lane {
                             slot: lane,
@@ -654,6 +657,7 @@ fn a_mixed_fire_that_cuts_a_region_fires_from_what_the_load_built() {
     // Three plain prompts seat their rows: no region is cut.
     let seated: Vec<Seated<'_>> = (0..3)
         .map(|lane| Seated {
+            lookahead: None,
             held: Some(0),
             ..Seated::of(Lane {
                 slot: lane,
@@ -671,6 +675,7 @@ fn a_mixed_fire_that_cuts_a_region_fires_from_what_the_load_built() {
     // A new plain prompt, a decode of the second seat, and a new prompt
     // under an adapter.
     let lane = |slot: u32, held: u32, word: u64, rows: usize| Seated {
+        lookahead: None,
         held: Some(held),
         ..Seated::of(Lane {
             slot,
@@ -682,6 +687,7 @@ fn a_mixed_fire_that_cuts_a_region_fires_from_what_the_load_built() {
         lane(0, 0, plain(ROWS), ROWS),
         lane(1, ROWS as u32, plain(1), 1),
         Seated {
+            lookahead: None,
             adapter: Some(0),
             ..lane(2, 0, adapted, ROWS)
         },
@@ -805,6 +811,7 @@ fn state_lent_in_the_span_outlives_a_narrow_rungs_fires() {
     let mut held = [0u32; 2];
     for lane in 0..2usize {
         let seated = Seated {
+            lookahead: None,
             held: Some(held[lane]),
             ..Seated::of(Lane {
                 slot: lane as u32,
@@ -865,6 +872,7 @@ fn state_lent_in_the_span_outlives_a_narrow_rungs_fires() {
     for _ in 0..6 {
         let seated: Vec<Seated<'_>> = (0..2usize)
             .map(|lane| Seated {
+                lookahead: None,
                 held: Some(held[lane]),
                 ..Seated::of(Lane {
                     slot: lane as u32,
@@ -1002,6 +1010,7 @@ fn serve_refs(
             .iter()
             .zip(&tables)
             .map(|(&(lane, tokens, have), pages)| Seated {
+                lookahead: None,
                 pages,
                 held: Some(have),
                 refs: true,
@@ -1305,6 +1314,7 @@ fn trimmed_window_of(fixture: &Fixture, model: &str, page: u32, context: u32, pr
                     .find(|(id, _)| *id == LIST)
                     .map_or(&[], |(_, refs)| refs.as_slice());
                 let seated = Seated {
+                    lookahead: None,
                     held: Some(have),
                     refs: trimmed,
                     pages: if trimmed { pages } else { &[] },

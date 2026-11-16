@@ -2584,3 +2584,64 @@ fn golden_eager_resume() {
         small_pool_arms(&fixture, &cache);
     }
 }
+
+/// An MTP deployment's every armed composition is sized and fired at load
+/// (the size-only walk lays each slab a composition asks; arming then fires
+/// each, so a slab no walk sized refuses the load by name), and every class
+/// a serving fire lands in is one the load armed: a plain prefill, a
+/// drafting prompt and a drafting window, each of a class whose lowering
+/// carries the draft head, fire from bodies, none walked eagerly.
+#[test]
+fn every_armed_composition_of_an_mtp_deployment_is_sized() {
+    if !engine_cuda::device::present() {
+        eprintln!("no CUDA device: skipping");
+        return;
+    }
+    let row = poem_compiler::catalog::deployments()
+        .find(|row| {
+            row.model.id == "qwen35-d0.8b"
+                && row.deploy.drafter.as_deref() == Some("mtp")
+                && row.deploy.parts.is_empty()
+        })
+        .expect("the catalog ships Qwen3.5 0.8B with its MTP head");
+    let cache = cache_dir();
+    let fixture = fixture(&row.name, &cache);
+    assert!(fixture.trace.reads_next_tokens());
+    let mut shell = load(&fixture, &cache);
+    shell.open(0).expect("slot 0 opens");
+    let served = shell.body_tally();
+    let mut fire = |shell: &mut Shell, tokens: &[u32], drafts: bool| {
+        let rows = u32::try_from(tokens.len()).expect("a count");
+        let word = fixture
+            .trace
+            .facts
+            .word(&Request::new(rows, false).drafting(drafts));
+        let seated = Seated::of(Lane {
+            slot: 0,
+            word,
+            tokens,
+        });
+        shell
+            .fire_rows(&[seated], &[engine::fire::Readout::Last])
+            .unwrap_or_else(|why| panic!("{rows} rows, drafts {drafts}: {why}"));
+    };
+    let prompt: Vec<u32> = (0..120u32).map(|t| (t * 7 + 11) % 1000).collect();
+    // A plain prefill of a class the head runs on, a drafting prompt, and a
+    // drafting window after it.
+    fire(&mut shell, &prompt, false);
+    fire(&mut shell, &prompt, true);
+    fire(&mut shell, &[5, 6], true);
+    let after = shell.body_tally();
+    assert_eq!(
+        after.eager_unbodied - served.eager_unbodied,
+        0,
+        "{}: a serving fire walked with no body ({after:?})",
+        row.name
+    );
+    assert_eq!(
+        after.sealed_declines - served.sealed_declines,
+        0,
+        "{}: a serving fire's composition was never armed ({after:?})",
+        row.name
+    );
+}

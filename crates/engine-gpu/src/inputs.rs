@@ -197,6 +197,10 @@ pub struct Fire<'a> {
 
     pub request_of_token: &'a [i32],
 
+    /// Each lane's token past its last row, by its `request_of_token`
+    /// index, when the runtime holds it.
+    pub lookahead: &'a [Option<i32>],
+
     pub page_tables: &'a [Geometry],
 
     pub mask: Option<&'a crate::mask::Staged>,
@@ -560,7 +564,11 @@ impl<B: Backend> Inputs<B> {
             .write(self.request_of_token, bytes_of(fire.request_of_token))?;
         self.store.write(
             self.next_tokens,
-            bytes_of(&next_tokens(fire.tokens, fire.request_of_token)),
+            bytes_of(&next_tokens(
+                fire.tokens,
+                fire.request_of_token,
+                fire.lookahead,
+            )),
         )?;
         self.store
             .write(self.slot_of_row, bytes_of(fire.slot_of_row))?;
@@ -1053,13 +1061,18 @@ fn rows_table(into: &mut Vec<i32>, staged: &[i32], rows: u32) {
 
 /// Each row's lane's next token, staged from the lane of each row: row i's
 /// is row i + 1's token when that row is the same lane's; a lane's last row
-/// holds its own (its next is the one the fire samples, which the forward
-/// puts there).
+/// holds the token past it the runtime holds (`lookahead`, by lane), else
+/// its own (its next is the one the fire samples, which the forward puts
+/// there).
 #[must_use]
-pub fn next_tokens(tokens: &[i32], lane_of_row: &[i32]) -> Vec<i32> {
+pub fn next_tokens(tokens: &[i32], lane_of_row: &[i32], lookahead: &[Option<i32>]) -> Vec<i32> {
     (0..tokens.len())
         .map(|row| match (lane_of_row.get(row), lane_of_row.get(row + 1)) {
             (Some(here), Some(next)) if here == next && row + 1 < tokens.len() => tokens[row + 1],
+            (Some(&here), _) => usize::try_from(here)
+                .ok()
+                .and_then(|lane| lookahead.get(lane).copied().flatten())
+                .unwrap_or(tokens[row]),
             _ => tokens[row],
         })
         .collect()

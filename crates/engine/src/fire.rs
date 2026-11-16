@@ -192,6 +192,12 @@ pub struct Lane {
     pub slot: u32,
     pub word: u64,
     pub tokens: Vec<u32>,
+    /// The lane's token after its last row, when the runtime holds it: the
+    /// first token of the lane's next piece of a prompt cut into pieces. It
+    /// is the last row's entry of `inputs.next_tokens()`; without it that
+    /// row's is the token the fire samples there.
+    #[serde(default)]
+    pub lookahead: Option<u32>,
     pub positions: Vec<u32>,
     pub kv: KvDelta,
     pub mask: Option<Masking>,

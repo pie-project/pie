@@ -12,6 +12,9 @@ pub type Clips<'a> = crate::voxels::Clips<'a>;
 #[derive(Debug, Clone)]
 pub struct Seated<'a> {
     pub lane: Lane<'a>,
+    /// The lane's token after its last row, when the runtime holds it
+    /// (`engine::fire::Lane::lookahead`): that row's next token.
+    pub lookahead: Option<u32>,
     pub positions: &'a [u32],
     pub pages: &'a [u32],
     pub held: Option<u32>,
@@ -44,6 +47,7 @@ impl<'a> Seated<'a> {
     pub fn of(lane: Lane<'a>) -> Seated<'a> {
         Seated {
             lane,
+            lookahead: None,
             positions: &[],
             pages: &[],
             held: None,

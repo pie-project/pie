@@ -646,6 +646,7 @@ impl Shell {
                     word: lane.word,
                     tokens: &lane.tokens,
                 },
+                lookahead: None,
                 positions: &[],
                 pages: &lane.pages,
                 held: lane.held,
@@ -1296,6 +1297,9 @@ impl Shell {
         let targets = self
             .lattice_targets()
             .map_or_else(Vec::new, |lattice| lattice.targets);
+        if self.records_bodies() {
+            self.every_plain_class_keyed(&targets)?;
+        }
         if targets.is_empty() && self.voxels.is_none() {
             return Ok(None);
         }
@@ -1343,6 +1347,37 @@ impl Shell {
         let footprint = crate::sizing::end();
         self.arm_rs = record::RsBody::Folds;
         walked.map(|()| Some(footprint))
+    }
+
+    /// A plain class a request lands in serves from bodies alone: one no
+    /// composition of the lattice fires is never walked, sized or armed, so
+    /// its fires would walk eagerly or be refused a slab. The load refuses
+    /// it by name instead.
+    fn every_plain_class_keyed(&self, targets: &[(u32, BodySynth, record::RsBody)]) -> Result<()> {
+        let mut keyed = poem_ir::ClassSet::default();
+        for (_, target, _) in targets {
+            for (class, _) in target.lanes().0 {
+                keyed.insert(class);
+            }
+        }
+        let unkeyed: Vec<String> = (0..self.landing.len())
+            .filter(|&class| {
+                self.tiers.plain.contains(class)
+                    && !self.landing[class].is_empty()
+                    && !keyed.contains(class)
+            })
+            .map(|class| format!("c{class}"))
+            .collect();
+        if unkeyed.is_empty() {
+            return Ok(());
+        }
+        Err(Fault::Unbound {
+            what: format!(
+                "plain class(es) {} that requests land in, which no composition of the \
+                 lattice fires: the load would walk, size and arm none of their fires",
+                unkeyed.join(", ")
+            ),
+        })
     }
 
     /// The size-only walk of a voxel fire at the ladder's top: the lattice
