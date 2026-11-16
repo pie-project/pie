@@ -15,6 +15,7 @@ pub mod pack;
 mod pq;
 pub mod prefetch;
 mod region;
+pub mod rs;
 pub mod shard;
 pub mod spatial;
 pub mod stream;
