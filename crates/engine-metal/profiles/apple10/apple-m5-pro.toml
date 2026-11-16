@@ -17,3 +17,6 @@ bytes_per_ns = 275.1
 # A dispatch's launch, back to back in one serial pass (512 of the smallest
 # GEMM in one frame).
 launch_ns = 1856
+
+[provenance]
+rates = "the_device_rates test on a 20-core M5 Pro on 2026-11-15, through the dense kernel serving dispatches"

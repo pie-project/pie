@@ -138,6 +138,10 @@ pub struct Report {
     pub rejected: Vec<(Source, String)>,
     /// The decisions whose value a layer measured on this device.
     pub measured: Vec<&'static str>,
+    /// How the rates the profile runs were measured on this device, as the
+    /// layer stating them says (`[provenance] rates`); `None` where no layer
+    /// states rates measured on it.
+    pub rates_measured: Option<String>,
 }
 
 impl Report {
@@ -146,6 +150,21 @@ impl Report {
     #[must_use]
     pub fn untuned(&self) -> bool {
         self.measured.is_empty() || !self.rejected.is_empty()
+    }
+
+    /// What was measured on the device, in words: its rates, its decisions,
+    /// each or neither.
+    #[must_use]
+    pub fn what_was_measured(&self) -> String {
+        let decisions = if self.measured.is_empty() {
+            "its kernel decisions untuned".to_string()
+        } else {
+            format!("{} decisions measured on it", self.measured.len())
+        };
+        match &self.rates_measured {
+            Some(how) => format!("rates measured on it ({how}); {decisions}"),
+            None => format!("no rates measured on it; {decisions}"),
+        }
     }
 
     /// The layers applied, topmost first.
@@ -630,6 +649,7 @@ impl Registry {
     fn resolve_with(&self, layers: &[Candidate], facts: Option<&Facts>) -> (Profile, Report) {
         let mut entries: BTreeMap<&'static str, Vec<Rung>> = BTreeMap::new();
         let mut tuned = crate::fire::Tuned::default();
+        let mut rates_measured: Option<String> = None;
         let mut measured: BTreeMap<&'static str, bool> = BTreeMap::new();
         let mut target = crate::registry::Target::default();
         // What the checked-in layers below assume, which a checked-in
@@ -684,6 +704,15 @@ impl Registry {
                 target.name_contains = file.target.name_contains;
             }
             tuned.lay(&file.tuned);
+            // A layer stating rates says how they were measured, or leaves
+            // the ones below standing as they were.
+            if file.tuned.rates != crate::fire::Rates::default() {
+                rates_measured = file
+                    .provenance
+                    .iter()
+                    .find(|(k, _)| k == "rates")
+                    .map(|(_, v)| v.trim_matches('"').to_string());
+            }
             used.push(layer.source.clone());
         }
         let top = used.last().cloned().unwrap_or(Source::Defaults);
@@ -696,6 +725,7 @@ impl Registry {
                 .filter(|(_, m)| *m)
                 .map(|(id, _)| id)
                 .collect(),
+            rates_measured,
         };
         (
             self.assemble(&entries, target, top).with_tuned(tuned),
