@@ -7,10 +7,11 @@ using namespace metal;
 // One threadgroup a request (a lane of the fire's window): a capturing
 // lane's attention mass a key, over its last `observe` query rows and over
 // the query heads this launch attends (`num_q_heads` of the model's
-// `total_heads`, each a 1 / (rows x total_heads) share), added to its row in
-// `scores`, the `kv_max` (the load's context) floats from
-// `row_at[row_first + request]`; a lane that captures nothing has no row
-// (`~0`) and returns. With `zero`, the row is cleared first: the first
+// `total_heads`, each a 1 / (rows x total_heads) share), added to its row,
+// the `kv_max` (the load's context) floats at the GPU address
+// `row_at[row_first + request]` (its reader instance's, wherever its slots
+// lie this fire); a lane that captures nothing has no row (`0`) and
+// returns. With `zero`, the row is cleared first: the first
 // layer's capture. The heads run one after another, so each key's sum is
 // the heads' in order: no atomics.
 template <typename T, int HEAD_DIM_MAX, int SIMDS>
@@ -21,22 +22,21 @@ template <typename T, int HEAD_DIM_MAX, int SIMDS>
     const device uint* kv_page_indices  [[buffer(3)]],
     const device uint* kv_page_indptr   [[buffer(4)]],
     const device int* kv_last_page_lens [[buffer(5)]],
-    device float* scores                [[buffer(6)]],
-    const constant int& page_size       [[buffer(7)]],
-    const constant int& num_q_heads     [[buffer(8)]],
-    const constant int& num_kv_heads    [[buffer(9)]],
-    const constant int& head_dim        [[buffer(10)]],
-    const constant float& sm_scale      [[buffer(11)]],
-    const constant int& observe         [[buffer(12)]],
-    const constant int& kv_max          [[buffer(13)]],
-    const constant ulong& k_page_stride [[buffer(14)]],
-    const constant ulong& v_page_stride [[buffer(15)]],
-    const constant ulong& k_offset [[buffer(16)]],
-    const constant ulong& v_offset [[buffer(17)]],
-    const device ulong* row_at          [[buffer(18)]],
-    const constant uint& row_first      [[buffer(19)]],
-    const constant int& total_heads     [[buffer(20)]],
-    const constant uint& zero           [[buffer(21)]],
+    const constant int& page_size       [[buffer(6)]],
+    const constant int& num_q_heads     [[buffer(7)]],
+    const constant int& num_kv_heads    [[buffer(8)]],
+    const constant int& head_dim        [[buffer(9)]],
+    const constant float& sm_scale      [[buffer(10)]],
+    const constant int& observe         [[buffer(11)]],
+    const constant int& kv_max          [[buffer(12)]],
+    const constant ulong& k_page_stride [[buffer(13)]],
+    const constant ulong& v_page_stride [[buffer(14)]],
+    const constant ulong& k_offset [[buffer(15)]],
+    const constant ulong& v_offset [[buffer(16)]],
+    const device ulong* row_at          [[buffer(17)]],
+    const constant uint& row_first      [[buffer(18)]],
+    const constant int& total_heads     [[buffer(19)]],
+    const constant uint& zero           [[buffer(20)]],
     uint3 tgid     [[threadgroup_position_in_grid]],
     uint  simd_gid [[simdgroup_index_in_threadgroup]],
     uint  simd_lid [[thread_index_in_simdgroup]]) {
@@ -56,10 +56,10 @@ template <typename T, int HEAD_DIM_MAX, int SIMDS>
   threadgroup float wl[SIMDS];
 
   const ulong at = row_at[row_first + uint(request)];
-  if (at == ~0ul) {
+  if (at == 0ul) {
     return;
   }
-  device float* out = scores + at;
+  device float* out = reinterpret_cast<device float*>(at);
   if (zero != 0u) {
     for (int i = tid; i < kv_max; i += THREADS) {
       out[i] = 0.0f;
@@ -163,7 +163,7 @@ template <typename T, int HEAD_DIM_MAX, int SIMDS>
   [[kernel]] void attn_score_capture<itype, d, 8>(                            \
       const device itype*, const device int*, const device itype*,            \
       const device uint*, const device uint*, const device int*,              \
-      device float*, const constant int&, const constant int&,                \
+      const constant int&, const constant int&,                               \
       const constant int&, const constant int&, const constant float&,        \
       const constant int&, const constant int&, PIE_KV_LAYOUT_TYPES           \
       const device ulong*, const constant uint&, const constant int&,         \
@@ -176,25 +176,24 @@ instantiate_attn_score_capture(bfloat16, bfloat, 256)
 instantiate_attn_score_capture(bfloat16, bfloat, 512)
 
 // Each capturing request's key row summed a page of `page_size` keys into
-// its page row: request `gid.y`'s page `gid.x`, one thread a page; a lane
-// that captures nothing (`~0`) has neither row.
+// its page row (each at its GPU address): request `gid.y`'s page `gid.x`,
+// one thread a page; a lane that captures nothing (`0`) has neither row.
 [[kernel]] void attn_score_pages(
-    device float* store                 [[buffer(0)]],
-    const device ulong* keys_at         [[buffer(1)]],
-    const device ulong* pages_at        [[buffer(2)]],
-    const constant uint& row_first      [[buffer(3)]],
-    const constant uint& keys           [[buffer(4)]],
-    const constant uint& page_size      [[buffer(5)]],
-    const constant uint& pages          [[buffer(6)]],
+    const device ulong* keys_at         [[buffer(0)]],
+    const device ulong* pages_at        [[buffer(1)]],
+    const constant uint& row_first      [[buffer(2)]],
+    const constant uint& keys           [[buffer(3)]],
+    const constant uint& page_size      [[buffer(4)]],
+    const constant uint& pages          [[buffer(5)]],
     uint2 gid [[thread_position_in_grid]]) {
   const uint page = gid.x;
   const uint request = gid.y;
   const ulong key_at = keys_at[row_first + request];
-  if (page >= pages || key_at == ~0ul) {
+  if (page >= pages || key_at == 0ul) {
     return;
   }
-  const device float* key_row = store + key_at;
-  device float* page_row = store + pages_at[row_first + request];
+  const device float* key_row = reinterpret_cast<const device float*>(key_at);
+  device float* page_row = reinterpret_cast<device float*>(pages_at[row_first + request]);
   const uint from = page * page_size;
   const uint to = min(from + page_size, keys);
   float sum = 0.0f;
