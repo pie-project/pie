@@ -1009,13 +1009,13 @@ pub fn emit_streamed_region(
         let node_u32 = u32::try_from(node)
             .map_err(|_| EmitError::RegionNodeOutOfRange(RegionForm::GroupedFused))?;
         if let Some(&producer) = fused_argmax.get(&node) {
-            let slots = Slots::of(op, base, |value| value_ptr(alias.resolve(value)));
+            let slots = Slots::of(op, base, "temporary", |value| value_ptr(alias.resolve(value)));
             let mut body = String::new();
             emit_logits_argmax(&mut body, bases[producer], &slots.o0);
             planned.push((node_u32, Plan::Single(body)));
             continue;
         }
-        let mut slots = Slots::of(op, base, |value| value_ptr(alias.resolve(value)));
+        let mut slots = Slots::of(op, base, "temporary", |value| value_ptr(alias.resolve(value)));
         let reads: Vec<u32> = op.reads().map(|a| alias.resolve(a)).collect();
         if op.tag == tags::OUTPUT {
             let single_row = key_of(base).len() <= 1;

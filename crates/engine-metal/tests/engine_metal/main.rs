@@ -78,3 +78,29 @@ fn full_pool(trace: &poem_ir::Trace, page_size: u32, context: u32, slots: u32) -
     let _ = (trace, page_size, context, slots);
     None
 }
+
+/// The instance's and the pair's guest state (`Shell::guest_state`) as runs
+/// of `Instance` slots from `first`, the scratch first and the pair's tables
+/// after it, both short of the chunk `first` lies in.
+fn guest_places(
+    shell: &engine_metal::Shell,
+    program: engine::ProgramId,
+    extents: &eta_exec::Extents,
+    first: u32,
+) -> (engine::ScratchPlace, engine::ScratchPlace) {
+    let instance = shell.pool_layout().instance.expect("an instance shape");
+    let state = shell.guest_state(program, extents).expect("the guest state");
+    let slots = |bytes: u64| u32::try_from(bytes.div_ceil(instance.slot_bytes)).expect("a slot count");
+    let run = |first: u32, slots: u32| match slots {
+        0 => engine::ScratchPlace::None,
+        _ => engine::ScratchPlace::Run { first, slots },
+    };
+    let scratch = slots(state.per_instance);
+    let pair = slots(state.per_pair);
+    let end = (first / instance.per_chunk + 1) * instance.per_chunk;
+    assert!(
+        first + scratch + pair < end,
+        "the guest state ({scratch} + {pair} slots from {first}) fits its chunk"
+    );
+    (run(first, scratch), run(first + scratch, pair))
+}

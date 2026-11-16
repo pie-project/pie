@@ -23,7 +23,7 @@ fn names(case: &str, value: u32) -> bool {
 /// Whether a case's text reaches value `value`'s bytes: its slot or its
 /// register (a descriptor names its shape, not its bytes).
 fn reaches(case: &str, value: u32) -> bool {
-    [format!("offsets[{value}]"), format!("r_{value} ")]
+    [format!("PTIR_AT({value})"), format!("r_{value} ")]
         .iter()
         .any(|needle| case.contains(needle.as_str()))
 }

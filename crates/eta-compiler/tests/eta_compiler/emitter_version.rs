@@ -7,7 +7,7 @@ use eta_compiler::codegen::program::{Backend, emit_program};
 const PINNED: &[(&str, u16, u64)] = &[
     ("cuda", 69, 0xe21d_1247_8c8d_1f13),
     ("hip", 29, 0xf0cd_10bc_43b5_0e32),
-    ("metal", 63, 0xcb47_10e2_4efc_3762),
+    ("metal", 65, 0x9096_5e53_2e37_1ccb),
 ];
 
 fn fingerprint(backend: Backend) -> u64 {

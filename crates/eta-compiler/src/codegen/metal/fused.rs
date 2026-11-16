@@ -146,7 +146,7 @@ pub fn emit_fused_region(
         let Some(op) = ops.get(node) else {
             return Err(EmitError::RegionNodeOutOfRange(RegionForm::Fused));
         };
-        let mut slots = Slots::of(op, bases[node], value_ptr);
+        let mut slots = Slots::of(op, bases[node], "temporary", value_ptr);
         if op.tag == tags::CHAN_TAKE || op.tag == tags::CHAN_READ {
             if op.chan < 0 || op.chan as usize >= channel_bindings.len() {
                 return Err(EmitError::ChannelRootBindingOutOfRange);
@@ -355,7 +355,7 @@ pub fn emit_grouped_fused_region(
             continue;
         }
         if let Some(&producer) = fused_argmax.get(&node) {
-            let slots = Slots::of(op, base, |value| value_ptr(alias.resolve(value)));
+            let slots = Slots::of(op, base, "temporary", |value| value_ptr(alias.resolve(value)));
             emit_logits_argmax(&mut source, bases[producer], &slots.o0);
             source.push_str(BARRIER);
             source.push_str("  if (status->state != 1) return;\n");
@@ -364,7 +364,7 @@ pub fn emit_grouped_fused_region(
         if is_view_reshape(node) {
             continue;
         }
-        let mut slots = Slots::of(op, base, |value| value_ptr(alias.resolve(value)));
+        let mut slots = Slots::of(op, base, "temporary", |value| value_ptr(alias.resolve(value)));
         if op.tag == tags::OUTPUT
             && let Some(slot) = addressed_slot(stage, op, base)
         {
