@@ -344,7 +344,16 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
                 beside: sequence.saturating_add(crate::store::BODIES_FLOOR_BYTES),
             });
         }
-        let rungs = crate::top::rung_facts(&candidates, boot.budget.max_lanes, after_weights);
+        // The rows the dense product computes at each width: its tile's.
+        #[cfg(not(feature = "rocm"))]
+        let computed = {
+            let tuning = kernels_cuda::tuning::Tuning::of(&chip);
+            move |rows| kernels_cuda::linear::gemm::rows_computed(&tuning, rows)
+        };
+        #[cfg(feature = "rocm")]
+        let computed = |rows| rows;
+        let rungs =
+            crate::top::rung_facts(&candidates, boot.budget.max_lanes, after_weights, computed);
         let counts = crate::top::counts(&boot.trace)?;
         let top = crate::top::choose(&rungs, after_weights, &chip.rates(), device.name(), &counts)?;
         eprintln!(

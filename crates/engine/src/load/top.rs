@@ -212,10 +212,10 @@ pub fn line_of(
 ) -> String {
     let r = &tuned.rates;
     let rates = format!(
-        "{:.1} TFLOP/s bf16, {:.0} GB/s, launch {} us",
+        "{:.1} TFLOP/s bf16, {:.0} GB/s, launch {} ns",
         r.peak_flops().unwrap_or(0.0) / 1e3,
         r.bytes_per_ns.unwrap_or(0.0),
-        r.launch_ns.unwrap_or(0) / 1000
+        r.launch_ns.unwrap_or(0)
     );
     let by = match rung.why {
         TopWhy::Argmax { eff, live_share } => {
@@ -346,7 +346,7 @@ mod tests {
         assert_eq!(
             line_of(&top, 2048, 512 * MIB, 2 << 30, &tuned),
             "top rung 2048 by the estimate: eff 0.900 at a live share of 0.250; span 512 MiB \
-             of 2.0 GiB live; the profile's rates: 249.0 TFLOP/s bf16, 654 GB/s, launch 1 us"
+             of 2.0 GiB live; the profile's rates: 249.0 TFLOP/s bf16, 654 GB/s, launch 1620 ns"
         );
     }
 }
