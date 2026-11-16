@@ -1177,9 +1177,17 @@ impl<B: Host> Gpu<B> {
 
         let mut reads: Vec<Vec<String>> = vec![Vec::new(); submission.lanes.len()];
         for attachment in program_attachments(submission) {
+            // A root read at lane `k` may span rows: row `r` is lane
+            // `k + r`'s readout, so every lane of the attachment from `k`
+            // on reads the output out.
+            let end = attachment.lane + attachment.lanes.max(1);
             for (name, k) in self.programs.reads(attachment.instance) {
-                if let Some(lane) = reads.get_mut((attachment.lane + k) as usize) {
-                    lane.push(name);
+                for at in attachment.lane + k..end {
+                    if let Some(lane) = reads.get_mut(at as usize)
+                        && !lane.contains(&name)
+                    {
+                        lane.push(name.clone());
+                    }
                 }
             }
         }

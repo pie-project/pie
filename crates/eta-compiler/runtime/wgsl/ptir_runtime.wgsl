@@ -691,6 +691,20 @@ fn op_transpose(p : u32) {
   let n2 = d_dim(a, 1u);
   let n = m * n2;
   let odt = d_dtype(o);
+  if (odt == DT_BOOL) {
+    let words = (n + 3u) / 4u;
+    for (var w : u32 = tid; w < words; w = w + lanes) {
+      var b : array<bool, 4>;
+      for (var k : u32 = 0u; k < 4u; k = k + 1u) {
+        let at = w * 4u + k;
+        var v = false;
+        if (at < n) { v = ld_b(a, (at % m) * n2 + at / m); }
+        b[k] = v;
+      }
+      st_b_word(o, w, n, b[0], b[1], b[2], b[3]);
+    }
+    return;
+  }
   for (var at : u32 = tid; at < n; at = at + lanes) {
     let src = (at % m) * n2 + at / m;
     if (odt == DT_F32) { st_f(o, at, ld_f(a, src)); }
@@ -708,6 +722,23 @@ fn op_gather(p : u32) {
   let rest = gather_rest(a);
   let n0 = gather_first(a);
   let odt = d_dtype(o);
+  if (odt == DT_BOOL) {
+    let words = (n + 3u) / 4u;
+    for (var w : u32 = tid; w < words; w = w + lanes) {
+      var b : array<bool, 4>;
+      for (var k : u32 = 0u; k < 4u; k = k + 1u) {
+        let at = w * 4u + k;
+        var v = false;
+        if (at < n) {
+          let want = ld_i(ix, pick(d_len(ix), at / rest));
+          if (want >= 0 && u32(want) < n0) { v = ld_b(a, u32(want) * rest + at % rest); }
+        }
+        b[k] = v;
+      }
+      st_b_word(o, w, n, b[0], b[1], b[2], b[3]);
+    }
+    return;
+  }
   for (var at : u32 = tid; at < n; at = at + lanes) {
     let slot = at / rest;
     let within = at % rest;
@@ -740,6 +771,23 @@ fn op_gather_row(p : u32) {
   let m = d_dim(a, 0u);
   let n2 = d_dim(a, 1u);
   let odt = d_dtype(o);
+  if (odt == DT_BOOL) {
+    let words = (m + 3u) / 4u;
+    for (var w : u32 = tid; w < words; w = w + lanes) {
+      var b : array<bool, 4>;
+      for (var k : u32 = 0u; k < 4u; k = k + 1u) {
+        let i = w * 4u + k;
+        var v = false;
+        if (i < m) {
+          let c = ld_i(ix, pick(d_len(ix), i));
+          if (c >= 0 && u32(c) < n2) { v = ld_b(a, i * n2 + u32(c)); }
+        }
+        b[k] = v;
+      }
+      st_b_word(o, w, m, b[0], b[1], b[2], b[3]);
+    }
+    return;
+  }
   for (var i : u32 = tid; i < m; i = i + lanes) {
     let c = ld_i(ix, pick(d_len(ix), i));
     let ok = c >= 0 && u32(c) < n2;
@@ -761,6 +809,33 @@ fn op_scatter(p : u32, is_add : bool) {
   let slots = d_len(ix);
   let scalar = d_len(src) == 1u && slots * rest != 1u;
   let odt = d_dtype(o);
+  if (odt == DT_BOOL) {
+    // Four cells a word: a thread owns the word it writes. An add is an or.
+    let words = (n + 3u) / 4u;
+    for (var w : u32 = tid; w < words; w = w + lanes) {
+      var b : array<bool, 4>;
+      for (var q : u32 = 0u; q < 4u; q = q + 1u) {
+        let at = w * 4u + q;
+        var v = false;
+        if (at < n) {
+          v = ld_b(a, at);
+          let dest = at / rest;
+          let within = at % rest;
+          for (var k : u32 = 0u; k < slots; k = k + 1u) {
+            let want = ld_i(ix, k);
+            if (want < 0 || u32(want) >= n0 || u32(want) != dest) { continue; }
+            var lane = k * rest + within;
+            if (scalar) { lane = 0u; }
+            let x = ld_b(src, lane);
+            if (is_add) { v = v || x; } else { v = x; }
+          }
+        }
+        b[q] = v;
+      }
+      st_b_word(o, w, n, b[0], b[1], b[2], b[3]);
+    }
+    return;
+  }
   for (var at : u32 = tid; at < n; at = at + lanes) {
     var acc_f = ld_f(a, at);
     var acc_i = ld_i(a, at);

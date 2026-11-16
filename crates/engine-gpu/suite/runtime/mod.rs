@@ -1,3 +1,6 @@
+mod beam_stage;
+mod bool_gather;
+mod bool_moves;
 mod fold;
 mod outputs;
 mod port;
