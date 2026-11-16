@@ -51,17 +51,22 @@ dag_streams = true
 dag_streams_until = 256
 
 [rates]
-# Measured on an L40S through pie's own path, median of 5 after a warm one:
-# a 4096^3 bf16 cuBLAS GEMM accumulating in FP32 (0.552 ms). The vendor's
-# 362.05 TFLOPS dense (L40S datasheet) is the upper bound; cuBLAS reaches 69%.
-bf16_flops_per_ns = 249000.0
-# A 256 MiB device-to-device copy counted read plus write (0.821 ms); the
-# vendor's 864 GB/s of GDDR6 is the upper bound (76%).
-bytes_per_ns = 654.0
-# A kernel's launch inside a captured graph, as serving replays its bodies:
-# 1000 empty kernels in one graph, the graph's time / 1000 (574 ns). Launched
-# one by one on a stream each costs 1620 ns, which no served fire pays.
-launch_ns = 574
+# `pie tune cuda --rates` on an L40S: each a ~20 ms burst of its kernel back
+# to back, the median of 5 bursts after a warm one. An m x 4096 x 4096 bf16
+# matmul through cuBLAS(Lt) under this file's tactics, rotating 12 weights so
+# each reads device memory; the vendor's 362 TFLOPS dense bf16 is the bound
+# (cuBLAS reaches ~75% from 512 rows).
+bf16_flops_per_ns_by_rows = [[16, 10831.8], [32, 21712.0], [64, 43022.4], [128, 72711.6], [256, 161176.8], [512, 264019.1], [1024, 271849.4], [2048, 272109.4], [4096, 274751.4], [8192, 270225.3]]
+# The FA2 paged causal prefill, 2048 rows over 2048 keys, 16/8 heads of 128.
+attn_flops_per_ns = 140270.6
+# The chunked conv (width 4) and gated delta scan, 2048 tokens x 16 heads x 128^2.
+scan_elements_per_ns = 2688.1
+# A 256 MiB device-to-device copy counted read plus write; the vendor's
+# 864 GB/s of GDDR6 is the upper bound (75%).
+bytes_per_ns = 647.2
+# A dispatch inside a captured graph, as serving replays its bodies: 1000
+# near-empty residual adds in one graph, the graph's time / 1000.
+launch_ns = 907
 
 [provenance]
 measured = [
@@ -120,4 +125,4 @@ measured = [
   "compiler.launch_us",
   "compiler.side_streams",
 ]
-rates = "measured on an L40S on 2026-11-15/16: the GEMM through cuBLAS, the copy device to device, the launch inside a captured graph (in-graph); median of 5 after a warm one"
+rates = "pie tune cuda --rates, 2026-11-16, NVIDIA L40S, fe773679"

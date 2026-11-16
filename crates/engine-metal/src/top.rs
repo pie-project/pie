@@ -148,6 +148,7 @@ mod tests {
             bf16_flops_per_ns: Some(5000.0),
             bytes_per_ns: Some(400.0),
             launch_ns: Some(5000),
+            ..profile::fire::Rates::default()
         };
         let top = choose(&rungs, 1 << 33, &rated, "Apple X", &counts()).unwrap();
         assert!(matches!(top.tokens, 1024 | 2048));

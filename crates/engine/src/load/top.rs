@@ -141,7 +141,7 @@ fn routing(trace: &Trace) -> Option<(u32, u32)> {
 #[must_use]
 pub fn estimate(counts: &Counts, rates: &profile::fire::Rates) -> Option<FireEstimate> {
     Some(FireEstimate {
-        flops_per_ns: rates.bf16_flops_per_ns?,
+        flops_per_ns: rates.bf16_flops_per_ns()?,
         bytes_per_ns: rates.bytes_per_ns?,
         launch_ns: rates.launch_ns.unwrap_or(0) as f64,
         dense_bytes: counts.weight_bytes,
@@ -211,7 +211,7 @@ pub fn line_of(
     let r = tuned.rates;
     let rates = format!(
         "{:.1} TFLOP/s bf16, {:.0} GB/s, launch {} us",
-        r.bf16_flops_per_ns.unwrap_or(0.0) / 1e3,
+        r.bf16_flops_per_ns().unwrap_or(0.0) / 1e3,
         r.bytes_per_ns.unwrap_or(0.0),
         r.launch_ns.unwrap_or(0) / 1000
     );
@@ -283,6 +283,7 @@ mod tests {
             bf16_flops_per_ns: Some(1.0),
             bytes_per_ns: Some(1.0),
             launch_ns: None,
+            ..profile::fire::Rates::default()
         };
         let err = choose(&none, 1 << 33, &rated, "Card X", &counts()).unwrap_err();
         assert!(matches!(err, Refused::NoRung(_)), "{err}");
@@ -299,6 +300,7 @@ mod tests {
             bf16_flops_per_ns: Some(10.0),
             bytes_per_ns: Some(100.0),
             launch_ns: Some(5),
+            ..profile::fire::Rates::default()
         };
         let e = estimate(&counts(), &rates).unwrap();
         assert_eq!(
@@ -336,6 +338,7 @@ mod tests {
                 bf16_flops_per_ns: Some(249_000.0),
                 bytes_per_ns: Some(654.0),
                 launch_ns: Some(1620),
+                ..profile::fire::Rates::default()
             },
             measured_this_load: false,
         };

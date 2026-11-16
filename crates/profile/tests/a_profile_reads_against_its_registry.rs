@@ -946,6 +946,7 @@ fn a_device_file_states_its_rates_and_a_layer_above_replaces_them() {
             bf16_flops_per_ns: Some(50000.0),
             bytes_per_ns: Some(400.0),
             launch_ns: None,
+            ..profile::fire::Rates::default()
         }
     );
 

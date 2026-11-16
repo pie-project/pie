@@ -136,6 +136,13 @@ pub fn run(args: TuneArgs) -> Result<Answer> {
         ));
     }
     // A check of the estimate is a test: it writes nothing of its own.
+    if args.dry_run
+        && let Some(rates) = &tuned.rates
+    {
+        out.push_str("\n--dry-run: nothing written. The rates:\n\n");
+        out.push_str(rates);
+        return Ok(text(out));
+    }
     if args.dry_run || (args.check_estimate.is_some() && !args.rates) {
         out.push_str("\n--dry-run: nothing written. The profile:\n\n");
         out.push_str(&tuned.file);

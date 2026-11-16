@@ -155,5 +155,6 @@ pub fn measure<B: Serve>(
         // Every byte copied is read and written.
         bytes_per_ns: Some(2.0 * copy as f64 / copy_ns as f64),
         launch_ns: Some(launch),
+        ..Rates::default()
     })
 }

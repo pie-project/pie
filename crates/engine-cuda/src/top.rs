@@ -134,6 +134,7 @@ mod tests {
             bf16_flops_per_ns: Some(249_000.0),
             bytes_per_ns: Some(654.0),
             launch_ns: Some(1620),
+            ..profile::fire::Rates::default()
         }
     }
 

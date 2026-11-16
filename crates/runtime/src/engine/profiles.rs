@@ -62,6 +62,9 @@ pub struct Tuned {
     /// Whether the tuned file differs from today's at all.
     pub changed: bool,
     pub seconds: f64,
+    /// The `[rates]` step's block and its provenance line, where it ran:
+    /// what `--rates --dry-run` prints.
+    pub rates: Option<String>,
 }
 
 /// The check models among the artifacts stamped for `backend`: those
@@ -157,6 +160,7 @@ macro_rules! tuned {
                 .collect(),
             changed: $out.changed,
             seconds: $out.seconds,
+            rates: None,
         }
     };
 }
@@ -217,14 +221,23 @@ fn tune_wgpu(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, 
         checks: Vec::new(),
         changed: true,
         seconds: out.seconds,
+        rates: None,
     })
 }
 
 #[cfg(feature = "engine-cuda")]
 fn tune_cuda(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String> {
     let models = pick_models("cuda", req)?;
-    let out = engine_cuda::tune::run(Some(req.profiles), &models, req.check_estimate, say)?;
-    Ok(tuned!(out, wrong: Vec::new()))
+    let steps = engine_cuda::tune::Steps {
+        rates: req.rates,
+        check_estimate: req.check_estimate,
+    };
+    let out = engine_cuda::tune::run(Some(req.profiles), &models, steps, say)?;
+    let rates = out.rates.clone();
+    Ok(Tuned {
+        rates,
+        ..tuned!(out, wrong: Vec::new())
+    })
 }
 
 /// Every backend this build hosts.

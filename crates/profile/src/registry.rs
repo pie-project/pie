@@ -985,9 +985,45 @@ impl<'a> Walk<'a> {
         };
         for (k, v) in t.iter() {
             match k.get_ref().as_ref() {
-                key @ ("bf16_flops_per_ns" | "bytes_per_ns") => match positive(v.get_ref()) {
-                    Some(f) if key == "bytes_per_ns" => rates.bytes_per_ns = Some(f),
-                    Some(f) => rates.bf16_flops_per_ns = Some(f),
+                "bf16_flops_per_ns_by_rows" => {
+                    // `[[rows, rate], …]` at every row count of `BY_ROWS`, in order.
+                    let curve = match v.get_ref() {
+                        DeValue::Array(items) if items.len() == crate::fire::BY_ROWS.len() => items
+                            .iter()
+                            .zip(crate::fire::BY_ROWS)
+                            .map(|(item, rows)| match item.get_ref() {
+                                DeValue::Array(pair) if pair.len() == 2 => {
+                                    let stated = int(pair[0].get_ref())
+                                        .is_some_and(|r| r == i64::from(rows));
+                                    positive(pair[1].get_ref()).filter(|_| stated)
+                                }
+                                _ => None,
+                            })
+                            .collect::<Option<Vec<f64>>>(),
+                        _ => None,
+                    };
+                    match curve.and_then(|c| <[f64; 10]>::try_from(c).ok()) {
+                        Some(curve) => rates.bf16_flops_per_ns_by_rows = Some(curve),
+                        None => self.err(
+                            v.span().start,
+                            format!(
+                                "`rates.bf16_flops_per_ns_by_rows` is `[[rows, rate], …]` at rows \
+                                 {:?} in that order, each rate a positive number",
+                                crate::fire::BY_ROWS
+                            ),
+                        ),
+                    }
+                }
+                key @ ("bf16_flops_per_ns"
+                | "bytes_per_ns"
+                | "attn_flops_per_ns"
+                | "scan_elements_per_ns") => match positive(v.get_ref()) {
+                    Some(f) => match key {
+                        "bytes_per_ns" => rates.bytes_per_ns = Some(f),
+                        "attn_flops_per_ns" => rates.attn_flops_per_ns = Some(f),
+                        "scan_elements_per_ns" => rates.scan_elements_per_ns = Some(f),
+                        _ => rates.bf16_flops_per_ns = Some(f),
+                    },
                     None => self.err(
                         v.span().start,
                         format!(
@@ -1009,8 +1045,9 @@ impl<'a> Walk<'a> {
                 other => self.err(
                     k.span().start,
                     format!(
-                        "`rates` holds `bf16_flops_per_ns`, `bytes_per_ns` and `launch_ns`, \
-                         not `{other}`"
+                        "`rates` holds `bf16_flops_per_ns`, `bf16_flops_per_ns_by_rows`, \
+                         `attn_flops_per_ns`, `scan_elements_per_ns`, `bytes_per_ns` and \
+                         `launch_ns`, not `{other}`"
                     ),
                 ),
             }

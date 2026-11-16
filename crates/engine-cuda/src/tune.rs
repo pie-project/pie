@@ -19,6 +19,77 @@ pub struct Outcome {
     pub checks: Vec<Check>,
     pub changed: bool,
     pub seconds: f64,
+    /// The `[rates]` step's block and its provenance line, where it ran.
+    pub rates: Option<String>,
+}
+
+/// The steps a `pie tune cuda` run takes: every decision's search by
+/// default; the `[rates]` step, the check of the estimate, or both, else.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Steps {
+    /// The `[rates]` step ([`crate::rates::measure`]).
+    pub rates: bool,
+    /// The check of the estimate (`--check-estimate`).
+    pub check_estimate: bool,
+}
+
+/// The `[rates]` step on GPU 0 under `base`: the block it states and its
+/// provenance value (`pie tune cuda --rates, <date>, <device>, <sitting>`,
+/// the sitting the hash of what it measured).
+fn rates_step(
+    device: &str,
+    base: &Profile,
+    say: &mut dyn FnMut(&str),
+) -> Result<(String, String), String> {
+    use std::hash::{Hash, Hasher};
+    say(&format!("[rates]: measuring {device}"));
+    let r = crate::rates::measure(0, base)?;
+    let curve = r.bf16_flops_per_ns_by_rows.unwrap_or_default();
+    say(&format!(
+        "[rates]: bf16 {:.1} TFLOP/s at 16 rows to {:.1} at 8192, attention {:.1} TFLOP/s, \
+         scan {:.0} G elements/s, {:.0} GB/s, launch {} ns",
+        curve[0] / 1e3,
+        curve[9] / 1e3,
+        r.attn_flops_per_ns.unwrap_or(0.0) / 1e3,
+        r.scan_elements_per_ns.unwrap_or(0.0),
+        r.bytes_per_ns.unwrap_or(0.0),
+        r.launch_ns.unwrap_or(0),
+    ));
+    let rounded = |v: Option<f64>| v.map(|v| (v * 10.0).round() / 10.0);
+    let r = profile::fire::Rates {
+        bf16_flops_per_ns_by_rows: Some(curve.map(|v| (v * 10.0).round() / 10.0)),
+        attn_flops_per_ns: rounded(r.attn_flops_per_ns),
+        scan_elements_per_ns: rounded(r.scan_elements_per_ns),
+        bytes_per_ns: rounded(r.bytes_per_ns),
+        ..r
+    };
+    let block = r.toml();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (device, &block).hash(&mut h);
+    let provenance = format!(
+        "pie tune cuda --rates, {}, {device}, {:08x}",
+        today(),
+        h.finish() as u32
+    );
+    Ok((block, provenance))
+}
+
+/// Today's date, UTC, as `YYYY-MM-DD`.
+fn today() -> String {
+    let days = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() / 86_400) as i64;
+    // Howard Hinnant's civil-from-days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
 }
 
 /// Serve `artifact` under `chip`: a prompt, then steps at each lane count.
@@ -550,7 +621,7 @@ impl Bench for Cuda<'_> {
 pub fn run(
     profiles: Option<&Path>,
     models: &[(PathBuf, String)],
-    check_estimate: bool,
+    steps: Steps,
     say: &mut dyn FnMut(&str),
 ) -> Result<Outcome, String> {
     let began = Instant::now();
@@ -569,15 +640,51 @@ pub fn run(
         facts: &facts,
         sms,
     };
-    // The check of the estimate alone: under today's profile, every model
+    // The `[rates]` step, the check of the estimate, or both: the check
+    // under today's profile with the rates this run measured, every model
     // checked before the run fails on any.
-    if check_estimate {
-        let today = bench.file(&[])?;
+    if steps.rates || steps.check_estimate {
+        let measured = if steps.rates {
+            Some(rates_step(&name, &base, say)?)
+        } else {
+            None
+        };
+        let block = measured.as_ref().map_or("", |(block, _)| block.as_str());
+        let provenance: Vec<(&str, String)> = measured
+            .iter()
+            .map(|(_, line)| ("rates", format!("\"{line}\"")))
+            .collect();
+        let file_of = |overrides: &[(String, String)], provenance: &[(&str, String)]| {
+            search::assemble(
+                crate::chip::registry(),
+                &base,
+                &name,
+                &facts,
+                &format!("{}\n{block}", search::render_overrides(overrides)),
+                provenance,
+                &[crate::chip::ARCH],
+            )
+        };
+        let today = file_of(&[], &provenance)?;
+        let rates = measured
+            .as_ref()
+            .map(|(block, line)| format!("{block}\n[provenance]\nrates = \"{line}\"\n"));
+        if !steps.check_estimate {
+            return Ok(Outcome {
+                device: name,
+                file: today,
+                lines: Vec::new(),
+                checks: Vec::new(),
+                changed: true,
+                seconds: began.elapsed().as_secs_f64(),
+                rates,
+            });
+        }
         let eager = [
             ("engine.graphs".to_string(), "\"off\"".to_string()),
             ("engine.recording".to_string(), "\"off\"".to_string()),
         ];
-        let walked = bench.file(&eager)?;
+        let walked = file_of(&eager, &[])?;
         let mut failed = Vec::new();
         for (artifact, deployment) in models {
             say(&format!("check of the estimate: {deployment}"));
@@ -599,8 +706,9 @@ pub fn run(
             file: today,
             lines: Vec::new(),
             checks: Vec::new(),
-            changed: false,
+            changed: rates.is_some(),
             seconds: began.elapsed().as_secs_f64(),
+            rates,
         });
     }
     let mut lines = Vec::new();
@@ -691,6 +799,7 @@ pub fn run(
         checks,
         changed: !unchanged,
         seconds,
+        rates: None,
     })
 }
 
