@@ -525,11 +525,17 @@ impl Body<'_, '_> {
             }
             axis = Some(a);
         }
-        if tiles {
-            if !matches!(self.phases.last(), Some(Phase::Mixer { .. })) {
+        // (a stream unit's mixer lands its output at its column roots: an op reading it after
+        // other phases runs there)
+        let after_mixer = !matches!(self.phases.last(), Some(Phase::Mixer { .. }));
+        if tiles && !(after_mixer && self.r.stream) {
+            if after_mixer {
                 return Err(format!("{} reads the tiles after their mixer", op.op));
             }
             return self.mixer(op, None, acts, outs);
+        }
+        if tiles {
+            axis = Some(Axis::Col);
         }
         let Some(axis) = axis else {
             match self.phases.last_mut() {
