@@ -31,7 +31,7 @@ impl UnitModel {
     /// landed checkpoint's) and written.
     pub fn open(
         mut rt: Box<dyn Fabric>,
-        reading: Reading,
+        mut reading: Reading,
         trace: Trace,
         plane: &dyn Fn(&str, usize) -> Vec<f32>,
         positions: usize,
@@ -42,6 +42,8 @@ impl UnitModel {
         let host = Forward::host_for(trace.clone(), plane, &reading.entry_values())?;
         reading.write_statics(rt.as_mut(), &statics)?;
         let vocab = reading.outs.iter().map(|o| o.2).max().unwrap_or(0);
+        // a served step reads no stamps (the per-PE cycles: 3 words a PE)
+        reading.stamped = false;
         Ok(UnitModel {
             rt,
             reading,

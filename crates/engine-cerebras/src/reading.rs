@@ -325,6 +325,8 @@ pub struct Reading {
     pub causal: bool,
     /// No program runs it: the host's forward makes its outputs whole ([`Reading::host_only`]).
     pub host_only: bool,
+    /// Whether a launch reads its PEs' stamps back (its cycles): a served decode step reads none.
+    pub stamped: bool,
     /// Its PEs' first column and row in a program of co-resident readings (`stream::coresident`).
     pub origin: (i32, i32),
     /// The id its launch takes in a program of co-resident readings (`None`: a program its own).
@@ -486,6 +488,7 @@ impl Reading {
             h: num(&host, "h")? as u32,
             causal: host["causal"].as_bool().unwrap_or(false),
             host_only: false,
+            stamped: true,
             origin: (
                 host["origin"][0].as_i64().unwrap_or(0) as i32,
                 host["origin"][1].as_i64().unwrap_or(0) as i32,
@@ -543,6 +546,7 @@ impl Reading {
             h: 0,
             causal: false,
             host_only: true,
+            stamped: true,
             origin: (0, 0),
             rd: None,
             clip: None,
@@ -1005,6 +1009,9 @@ impl Runtime {
     }
 
     fn stamps(&mut self, reading: &Reading) -> R<Option<u64>> {
+        if !reading.stamped {
+            return Ok(None);
+        }
         let Some(ts) = self.tsc(reading)? else {
             return Ok(None);
         };
