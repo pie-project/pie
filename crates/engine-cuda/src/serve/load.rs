@@ -1168,20 +1168,18 @@ impl Shell {
         );
         // The activation rungs a pool may drop to (SPEC decision 6), each a
         // bucket's carve laid at the reservation's end.
-        let rungs = activation_rungs(&boot.trace, &budgets, &compiled)?;
-        eprintln!(
-            "engine-cuda: activation rungs {:?} under an arena of {arena_bytes} bytes",
-            rungs
-                .iter()
-                .map(|(tokens, map)| (*tokens, map.bytes))
-                .collect::<Vec<_>>(),
-        );
+        let rungs = activation_rungs(&boot.trace, &budgets, &compiled, arena_bytes)?;
         // Backed whole, before ready: every chunk the runtime may open state
         // in under a rung's carve, and a fire reading out past one row a
         // lane (a verify reads every row), lie in it.
         let mut arena = Arena::reserve(arena_bytes, crate::arena::score_values(&boot.trace))
             .with_rungs(rungs)
             .with_scoring(crate::arena::scoring_classes(&boot.trace, &compiled));
+        // Each rung's carve as the span weighs it: without its score planes.
+        eprintln!(
+            "engine-cuda: activation rungs {:?} under an arena of {arena_bytes} bytes",
+            arena.carves(),
+        );
         arena.back(&mut pools)?;
         eprintln!(
             "engine-cuda: activation span of {} bytes backed whole at load ({} held)",
@@ -1596,6 +1594,21 @@ impl Shell {
             );
         }
         shell.lay_workspace()?;
+        let ledger = shell.pools.activation_ledger();
+        eprintln!(
+            "engine-cuda: activation span of {} chunks of {} bytes: {} asked (the arena's {}, \
+             then the rs scratch, the workspaces' {} and the staged inputs' {}), {} held",
+            ledger.chunks,
+            ledger.chunk_bytes,
+            ledger.asked,
+            shell.arena.reserved(),
+            shell
+                .workspace
+                .as_ref()
+                .map_or(0, |workspace| workspace.bytes),
+            shell.staged_runs().iter().sum::<u64>(),
+            ledger.held,
+        );
         let afforded = fitted.bodies;
         if shell.measuring {
             // Arming is allowed all the card has past the least range.
@@ -2402,6 +2415,7 @@ fn activation_rungs(
     trace: &poem_ir::Trace,
     budgets: &Budgets,
     compiled: &CompiledModel,
+    span: u64,
 ) -> Result<Vec<(u32, poem_compiler::ArenaMap)>> {
     let max = budgets.tokens.max_tokens;
     let mut tokens: Vec<u32> = engine::memory::rungs(1, max)
@@ -2420,7 +2434,9 @@ fn activation_rungs(
     let mut rungs = Vec::new();
     for rung in tokens {
         let map = poem_compiler::arena_rung(trace, budgets, compiled, rung)?;
-        if map.bytes < compiled.arena.bytes {
+        // A rung narrower than the span, both weighed without their score
+        // planes: a fire's planes lie in its reader's term, under the carve.
+        if map.scores_from(trace) < span {
             rungs.push((rung, map));
         }
     }

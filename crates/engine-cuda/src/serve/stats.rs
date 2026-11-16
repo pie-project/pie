@@ -135,6 +135,13 @@ impl Shell {
         )
     }
 
+    /// The activation's whole span, its arena and the runs past it, as the
+    /// pool states and backs it ([`crate::store::Pools::activation_ledger`]).
+    #[must_use]
+    pub fn activation_ledger(&self) -> crate::store::ActivationLedger {
+        self.pools.activation_ledger()
+    }
+
     #[must_use]
     pub fn accounting(&self) -> crate::store::Accounting {
         self.accounting
@@ -167,6 +174,20 @@ impl Shell {
         let max_tokens = self.budget().max_tokens;
         let rungs = self.arena.rungs(self.compiled.arena_forked.as_ref());
         let mut facts = self.pools.chunk_facts(max_tokens, &rungs)?;
+        // The top rung's chunks are the activation's span: what its runs
+        // were asked, rounded to a chunk, every run of it backed.
+        let ledger = self.pools.activation_ledger();
+        if !ledger.agrees() {
+            return Err(crate::error::Fault::program(
+                "serve::chunk_facts",
+                format!(
+                    "the activation's span states {} chunks of {} bytes for runs asked to {} \
+                     bytes, the last held ending at {}: the chunks stated, the runs asked and \
+                     the runs backed must agree",
+                    ledger.chunks, ledger.chunk_bytes, ledger.asked, ledger.held_end
+                ),
+            ));
+        }
         (facts.held_bytes, facts.outside_bytes) = self.held_and_outside();
         Ok(facts)
     }

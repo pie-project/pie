@@ -541,6 +541,31 @@ impl Seats {
     }
 }
 
+/// The activation's span: the chunks the pool keeps under its end for it
+/// (the top rung's, as stated to the runtime), the bytes its runs were
+/// asked (the arena, the rs scratch, the kernels' workspaces and the staged
+/// inputs, each aligned past the last), where the last run held backed
+/// ends, and the bytes held. A load states no chunk its runs do not reach
+/// and backs every run it asked: `chunks` is `asked` rounded up to a chunk,
+/// and `held_end` is `asked`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActivationLedger {
+    pub chunk_bytes: u64,
+    pub chunks: u32,
+    pub asked: u64,
+    pub held_end: u64,
+    pub held: u64,
+}
+
+impl ActivationLedger {
+    /// Whether the chunks stated, the runs asked and the runs backed agree.
+    #[must_use]
+    pub fn agrees(&self) -> bool {
+        u64::from(self.chunks) == self.asked.div_ceil(self.chunk_bytes.max(1))
+            && self.held_end == self.asked
+    }
+}
+
 #[derive(Debug)]
 pub struct Pools {
     pool: PhysicalPool,
@@ -1352,7 +1377,8 @@ impl Pools {
         self.chunks
             .clear_past_parting(&mut self.pool, self.contiguous)?;
         let fitted = self.fit(bodies, programs, settled, true, resident)?;
-        self.chunks.state_fitted(self.fitted_chunks(), self.contiguous)?;
+        self.chunks
+            .state_fitted(self.fitted_chunks(), self.contiguous)?;
         Ok(fitted)
     }
 
@@ -1642,6 +1668,19 @@ impl Pools {
     /// stated to no runtime ([`chunks::Chunks::skip_past`]).
     pub fn fit_range_whole(&mut self) {
         self.whole_fit = true;
+    }
+
+    /// The activation's span as the pool lays it and backs it
+    /// ([`ActivationLedger`]).
+    #[must_use]
+    pub fn activation_ledger(&self) -> ActivationLedger {
+        ActivationLedger {
+            chunk_bytes: self.chunks.layout().chunk_bytes,
+            chunks: self.chunks.act_chunks(),
+            asked: self.chunks.activation_asked(),
+            held_end: self.chunks.activation_held_end(),
+            held: self.chunks.activation_held_bytes(),
+        }
     }
 
     /// The bytes of the activation's span held backed, wherever in it.

@@ -168,6 +168,22 @@ impl Chunks {
         (u64::from(self.act) * chunk).saturating_sub(self.range.held(u64::from(self.total) * chunk))
     }
 
+    /// The bytes of the activation's span its runs were asked
+    /// ([`Chunks::reserve`], [`Chunks::widen_activation`]): its chunks are
+    /// these, rounded up to a chunk.
+    #[must_use]
+    pub fn activation_asked(&self) -> u64 {
+        self.act_asked
+    }
+
+    /// Where the last run held backed in the activation's span ends, from
+    /// the span's start.
+    #[must_use]
+    pub fn activation_held_end(&self) -> u64 {
+        self.range
+            .held_end_past(u64::from(self.total) * self.layout.chunk_bytes)
+    }
+
     /// The bytes of the activation's span held backed, wherever in it: the
     /// arena's prefix, the carves laid at its end, the workspaces and the
     /// staged runs.
@@ -451,12 +467,15 @@ impl Chunks {
         let held = self
             .range
             .held(u64::from(self.total) * self.layout.chunk_bytes);
-        let act_bytes = u64::from(self.act) * self.layout.chunk_bytes;
+        // The span's runs as asked, not its chunks' bytes: the chunks are
+        // these rounded up, and a widening later lays its run past them.
+        let act_bytes = self.act_asked;
         // A flat range is allocated once, here at the fit, and laid out
         // anew inside that allocation by every fit after that fits in it;
         // only a fit that needs more (a measuring load's, past the least
         // range it armed over) allocates it again.
-        if self.range.flat_allocated() && u64::from(total) + u64::from(self.act) <= self.room_chunks()
+        if self.range.flat_allocated()
+            && u64::from(total) + u64::from(self.act) <= self.room_chunks()
         {
             return self.relay(pool, total, self.act, self.act_asked, held);
         }
