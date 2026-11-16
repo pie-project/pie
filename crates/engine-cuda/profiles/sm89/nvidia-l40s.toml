@@ -118,3 +118,4 @@ measured = [
   "compiler.launch_us",
   "compiler.side_streams",
 ]
+rates = "measured on an L40S through cuBLAS on 2026-11-15, median of 5 after a warm one"

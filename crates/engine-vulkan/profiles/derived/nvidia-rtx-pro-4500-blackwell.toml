@@ -19,3 +19,6 @@ launch_ns = 34000
 # Blackwell's fifth generation tensor cores run bf16 at a quarter of FP4's
 # rate), and 896 GB/s of GDDR7 (nvidia.com, RTX PRO 4500 Blackwell
 # specifications).
+
+[provenance]
+rates = "pie tune vulkan --rates at 78e16ecf7 on 2026-11-15, the matmul through Coopmat"

@@ -997,3 +997,49 @@ fn rates_are_refused_where_they_do_not_read_and_fire_times_are_no_profiles() {
         assert!(e.contains(says), "{body}: {e}");
     }
 }
+
+#[test]
+fn the_notice_names_rates_measured_on_the_device_and_what_is_untuned() {
+    let r = registry();
+    let rated = |provenance: &str| {
+        format!(
+            "api = 1\n[target]\ndevice = \"Apple M9\"\n[rates]\nbf16_flops_per_ns = 5000.0\n\
+             bytes_per_ns = 300.0\n{provenance}"
+        )
+    };
+    // Rates a layer says it measured: the notice says so, and that the
+    // decisions are untuned.
+    let measured = rated("[provenance]\nrates = \"pie tune metal --rates on 2026-11-15\"\n");
+    let (_, report) = r.resolve(
+        &[layer(
+            Source::Seeded("derived/apple-m9.toml".into()),
+            &measured,
+        )],
+        &facts(11, true),
+    );
+    assert_eq!(
+        report.rates_measured.as_deref(),
+        Some("pie tune metal --rates on 2026-11-15")
+    );
+    assert_eq!(
+        report.what_was_measured(),
+        "rates measured on it (pie tune metal --rates on 2026-11-15); its kernel decisions untuned"
+    );
+    // Rates no layer says were measured (a vendor's figure): none measured.
+    let stated = rated("");
+    let (_, report) = r.resolve(
+        &[layer(
+            Source::Seeded("derived/apple-m9.toml".into()),
+            &stated,
+        )],
+        &facts(11, true),
+    );
+    assert_eq!(report.rates_measured, None);
+    assert!(
+        report
+            .what_was_measured()
+            .starts_with("no rates measured on it"),
+        "{}",
+        report.what_was_measured()
+    );
+}

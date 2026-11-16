@@ -559,7 +559,7 @@ fn check_profiles() -> Checks {
         ));
         checks.push((
             "profile".to_string(),
-            report.describe(),
+            format!("{}: {}", report.describe(), report.what_was_measured()),
             if report.untuned() {
                 Status::Warn
             } else {
