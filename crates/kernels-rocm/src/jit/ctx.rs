@@ -564,7 +564,7 @@ impl Ctx {
     ) -> Result<(), Error> {
         let resolved = match kernel.resolve() {
             Ok(resolved) => resolved,
-            Err(why) => unfireable(op, kernel, &why),
+            Err(why) => return Err(unfireable(op, kernel, &why)),
         };
 
         let mut bound = crate::jit::abi::Bound::new(args);
@@ -579,7 +579,7 @@ impl Ctx {
         };
         match fired {
             Ok(()) => Ok(()),
-            Err(why) => unfireable(op, kernel, &why),
+            Err(why) => Err(unfireable(op, kernel, &why)),
         }
     }
 
@@ -597,14 +597,14 @@ impl Ctx {
 }
 
 /// A device instantiation that will not fire (it does not compile, its
-/// module does not load, or its launch is refused): a fault, never a
-/// fallback that serves in its place.
+/// module does not load, or its launch is refused): a fault naming the op,
+/// the unit and the instantiation, never a fallback that serves in its place.
 #[cfg(feature = "rocm")]
-fn unfireable(op: &str, kernel: &Kernel, why: &crate::jit::Fault) -> ! {
-    panic!(
-        "{op}: `{}` {} will not fire: {why}",
-        kernel.file, kernel.name
-    )
+fn unfireable(op: &'static str, kernel: &Kernel, why: &crate::jit::Fault) -> Error {
+    Error::Backend {
+        op,
+        detail: format!("`{}` {} will not fire: {why}", kernel.file, kernel.name),
+    }
 }
 
 #[cfg(test)]
