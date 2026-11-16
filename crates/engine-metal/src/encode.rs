@@ -54,9 +54,19 @@ impl<'a> Sink<'a> {
 static KERNEL_PROFILE: std::sync::Mutex<std::collections::BTreeMap<String, (u64, u64)>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// The kernel profile switched on by `pie tune --check-estimate` for the
+/// fires it dissects, beside the boot's `kernel-profile` diagnostic.
+static PROFILE_FORCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Time each dispatch on the device (its own committed command buffer)
+/// while `on`, whatever the diagnostics say.
+pub fn profile_kernels(on: bool) {
+    PROFILE_FORCED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[cfg(target_vendor = "apple")]
 fn profiling() -> bool {
-    crate::diag::on().kernel_profile.on()
+    crate::diag::on().kernel_profile.on() || PROFILE_FORCED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[must_use]

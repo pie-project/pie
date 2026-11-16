@@ -161,20 +161,6 @@ macro_rules! tuned {
     };
 }
 
-/// `pie tune` on a backend that measures a kernel grid at a depth.
-#[cfg(all(feature = "metal", target_vendor = "apple"))]
-macro_rules! tune_grid {
-    ($name:ident, $engine:ident, $backend:literal) => {
-        fn $name(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String> {
-            use $engine::tune::{Depth, run};
-            let depth = if req.full { Depth::Full } else { Depth::Quick };
-            let models = pick_models($backend, req)?;
-            let out = run(depth, Some(req.profiles), req.cache, req.refit, &models, say)?;
-            Ok(tuned!(out, wrong: out.wrong))
-        }
-    };
-}
-
 /// `pie tune` on Vulkan: the kernel grid and the search, then the
 /// `[fire_ns]` step (or that step alone).
 #[cfg(feature = "vulkan")]
@@ -197,8 +183,20 @@ fn tune_vulkan(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned
     Ok(tuned!(out, wrong: out.wrong))
 }
 
+/// `pie tune metal`: the kernel grid and the search, or `--check-estimate`
+/// alone: every rung's fire timed against the estimate, and dissected.
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
-tune_grid!(tune_metal, engine_metal, "metal");
+fn tune_metal(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String> {
+    use engine_metal::tune::{Depth, check_estimate, run};
+    let models = pick_models("metal", req)?;
+    if req.check_estimate {
+        let out = check_estimate(Some(req.profiles), &models, say)?;
+        return Ok(tuned!(out, wrong: out.wrong));
+    }
+    let depth = if req.full { Depth::Full } else { Depth::Quick };
+    let out = run(depth, Some(req.profiles), req.cache, req.refit, &models, say)?;
+    Ok(tuned!(out, wrong: out.wrong))
+}
 
 /// `pie tune wgpu`: the `[rates]` step alone.
 #[cfg(feature = "wgpu")]
