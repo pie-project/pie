@@ -1860,6 +1860,20 @@ impl Kept {
         if let Some(at) = at {
             crate::encode::credit_submit(at.elapsed().as_nanos() as u64);
         }
+        // A frame recorded while profiling carries its timestamp queries
+        // (the pool's reset and a write around each dispatch): each replay
+        // writes them again, so each replay's wait reads them again while
+        // profiling.
+        if crate::encode::profiling()
+            && let Some(timing) = self
+                .inner
+                .timing
+                .lock()
+                .expect("timing lock poisoned")
+                .as_mut()
+        {
+            timing.harvested = false;
+        }
         let pending = Pending {
             inner: Arc::clone(&self.inner),
         };
