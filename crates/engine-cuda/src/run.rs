@@ -560,13 +560,18 @@ impl Standing {
         (rows >= span.rows).then_some(rows)
     }
 
+    /// The lanes a captured window launches over: its carve's lane ceiling
+    /// within the staged boundary words, whether its rows are a plane's or
+    /// the whole bucket's. A whole window launched over its fire's live
+    /// lanes would hold a body only for fires of that many lanes, while
+    /// every fire of its key replays it.
     pub(crate) fn lanes(&self, windows: &Windows, span: MaskSpan) -> Option<u32> {
-        let Held::Captured {
-            plane: true, lanes, ..
-        } = self.held
-        else {
+        let Held::Captured { plane, lanes, .. } = self.held else {
             return None;
         };
+        if !(plane || self.whole) {
+            return None;
+        }
         let (before, own) = lanes?;
         let staged = windows
             .qo_absolute()
