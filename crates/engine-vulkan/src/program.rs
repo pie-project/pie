@@ -632,6 +632,7 @@ impl Plane {
         &self,
         instance: InstanceId,
         rows: usize,
+        lane_at: usize,
     ) -> Result<Option<Vec<u32>>, Refusal> {
         let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
             what: "instance",
@@ -668,13 +669,71 @@ impl Plane {
                 )));
             }
         };
-        if ids.len() != rows {
+        let indptr = engine_gpu::program::embed_indptr(&seat.plan, &seat.inst);
+        let span = engine_gpu::program::lane_span(
+            &indptr,
+            instance,
+            "embed_tokens",
+            ids.len(),
+            rows,
+            lane_at,
+        )?;
+        Ok(Some(ids[span].to_vec()))
+    }
+
+    pub fn lane_count(&self, instance: InstanceId) -> Result<usize, Refusal> {
+        let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
+            what: "instance",
+            id: instance.0,
+        })?;
+        Ok(engine_gpu::program::lane_count(&seat.plan, &seat.inst))
+    }
+
+    /// Lane `lane_at`'s attention mask from the `attn_mask` cell the
+    /// instance's last pass put, once that pass has landed it.
+    pub fn envelope_mask(
+        &self,
+        instance: InstanceId,
+        rows: usize,
+        lane_at: usize,
+    ) -> Result<Option<engine::fire::Masking>, Refusal> {
+        let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
+            what: "instance",
+            id: instance.0,
+        })?;
+        if !seat.geometry.ports().contains(Port::EmbedTokens) {
+            return Ok(None);
+        }
+        let Some(binding) = seat
+            .plan
+            .package
+            .ports
+            .iter()
+            .find(|binding| binding.port == Port::AttnMask && !binding.is_const)
+        else {
+            return Ok(None);
+        };
+        let ring = &seat.inst.channels[binding.channel as usize];
+        seat.landing
+            .wait((binding.channel, ring.head()), &seat.faulted);
+        if seat.faulted.load(Ordering::Acquire) {
+            return Err(Refusal::Program(format!("instance {instance} is poisoned")));
+        }
+        if ring.is_empty() {
             return Err(Refusal::Program(format!(
-                "instance {instance}: `embed_tokens` carries {} id(s) for a lane of {rows} row(s)",
-                ids.len()
+                "instance {instance}: the `attn_mask` ring is empty at the fire"
             )));
         }
-        Ok(Some(ids))
+        let keys = seat
+            .plan
+            .package
+            .channels
+            .get(binding.channel as usize)
+            .and_then(|decl| decl.shape.last().copied())
+            .map_or(0, |keys| keys as usize);
+        let indptr = engine_gpu::program::embed_indptr(&seat.plan, &seat.inst);
+        engine_gpu::program::lane_mask(&ring.front(), keys, &indptr, instance, rows, lane_at)
+            .map(Some)
     }
 
     pub fn publish(
@@ -851,9 +910,12 @@ impl Plane {
     /// queue wrote it there rather than to the ring.
     #[cfg(feature = "vulkan")]
     #[must_use]
+    /// The device cell holding lane `lane_at`'s one token, where the
+    /// device keeps the instance's `embed_tokens` cell.
     pub fn token_feed(
         &self,
         instance: InstanceId,
+        lane_at: usize,
     ) -> Option<engine_gpu::serve::DeviceCell<crate::device::Api>> {
         let seat = self.instances.get(&instance)?;
         if !seat.geometry.ports().contains(Port::EmbedTokens) {
@@ -865,7 +927,18 @@ impl Plane {
             .ports
             .iter()
             .find(|binding| binding.port == Port::EmbedTokens && !binding.is_const)?;
-        seat.session.kept_cell(binding.channel)
+        let mut cell = seat.session.kept_cell(binding.channel)?;
+        if lane_at > 0 {
+            let indptr = engine_gpu::program::embed_indptr(&seat.plan, &seat.inst);
+            let start = u64::from(*indptr.get(lane_at)?);
+            let end = u64::from(*indptr.get(lane_at + 1)?);
+            if end != start + 1 || end * 4 > cell.bytes {
+                return None;
+            }
+            cell.at += start * 4;
+            cell.bytes = 4;
+        }
+        Some(cell)
     }
 
     /// Whether `instance`'s pass can be recorded to land later: one stage,
@@ -1206,6 +1279,44 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
 
     fn reads(&self, instance: InstanceId) -> Vec<(String, u32)> {
         Plane::reads(self, instance)
+    }
+
+    fn fire_seated(
+        &mut self,
+        device: &crate::device::Context,
+        instance: InstanceId,
+        seats: Vec<Vec<engine_gpu::guest::run::Readout<'_, crate::device::Api>>>,
+    ) -> Result<(), Refusal> {
+        let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
+            what: "instance",
+            id: instance.0,
+        })?;
+        #[cfg(feature = "vulkan")]
+        {
+            let session = &seat.session;
+            let unread = engine_gpu::guest::run::unread_seat(
+                &seat.plan.package,
+                |at, local| session.span(at, local).map(|(_, held)| held),
+                &seats,
+            )
+            .map_err(|fault| Refusal::Program(fault.to_string()))?;
+            if let Some((output, lane)) = unread {
+                return Err(engine_gpu::program::unread(instance, &output, lane));
+            }
+            self.fire(instance, Stage::Epilogue, Some(device), seats)?;
+            self.instances.get_mut(&instance).map_or(Ok(()), |seat| {
+                seat.session
+                    .settle()
+                    .map_err(|f| Refusal::Program(f.to_string()))
+            })
+        }
+        #[cfg(not(feature = "vulkan"))]
+        {
+            let _ = (seat, device, seats);
+            Err(Refusal::Program(format!(
+                "instance {instance}: this build carries no Vulkan device, so a guest pass has nowhere to run"
+            )))
+        }
     }
 }
 

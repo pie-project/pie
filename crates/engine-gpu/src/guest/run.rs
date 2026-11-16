@@ -30,6 +30,127 @@ impl<B: Backend> Clone for Readout<'_, B> {
 
 impl<B: Backend> Copy for Readout<'_, B> {}
 
+/// The seats a pass reads output root `root` from, `values` values of it,
+/// in the order its rows lie: row `r` of an output the pass reads at lane
+/// `root.lane` is the readout row of the instance's lane `root.lane + r`,
+/// each through that lane's own seat (`seats[k]` is what the fire read out
+/// for the pass's lane `k`). A root a lane's seat holds whole reads that
+/// seat alone. Each entry is a seat and the values read from it, rows whose
+/// seats lie end to end one entry.
+pub fn row_seats<'a, B: Backend>(
+    seats: &[Vec<Readout<'a, B>>],
+    root: &LaunchValue,
+    values: u32,
+) -> Result<Vec<(Readout<'a, B>, u32)>> {
+    let name = root.output.as_deref().unwrap_or("");
+    let seat_of = |lane: usize| {
+        seats
+            .get(lane)
+            .and_then(|offered| offered.iter().find(|seat| seat.output == name))
+            .cloned()
+    };
+    let first = root.lane as usize;
+    let Some(seat) = seat_of(first) else {
+        return Err(Fault::Program {
+            at: "guest::run",
+            why: format!(
+                "this pass reads output {name:?} of lane {first}, which the fire read out none of"
+            ),
+        });
+    };
+    if values <= seat.width {
+        return Ok(vec![(seat, values)]);
+    }
+    let row = seat.width.max(1);
+    if values % row != 0 {
+        return Err(Fault::Program {
+            at: "guest::run",
+            why: format!(
+                "this pass reads {values} values of output {name:?} from lane {first}, whose \
+                 readout holds {row}: not whole rows of it"
+            ),
+        });
+    }
+    (0..(values / row) as usize)
+        .map(|r| {
+            let lane = first + r;
+            let seat = seat_of(lane).ok_or_else(|| Fault::Program {
+                at: "guest::run",
+                why: format!(
+                    "this pass reads row {r} of output {name:?} at lane {first}, which is lane \
+                     {lane}'s readout row, and the fire read out none for that lane"
+                ),
+            })?;
+            if seat.width != row {
+                return Err(Fault::Program {
+                    at: "guest::run",
+                    why: format!(
+                        "row {r} of output {name:?} is lane {lane}'s readout of {} values, and \
+                         its row 0 holds {row}",
+                        seat.width
+                    ),
+                });
+            }
+            Ok((seat, row))
+        })
+        .try_fold(Vec::new(), |mut runs: Vec<(Readout<'a, B>, u32)>, next| {
+            // Rows whose seats lie end to end in one buffer read as one run.
+            let (seat, values) = next?;
+            let elem = if seat.dtype == Dtype::Bf16 { 2 } else { 4 };
+            match runs.last_mut() {
+                Some((run, held))
+                    if std::ptr::eq(run.seat, seat.seat)
+                        && run.dtype == seat.dtype
+                        && run.at + u64::from(*held) * elem == seat.at =>
+                {
+                    *held += values;
+                    run.width = *held;
+                }
+                _ => runs.push((seat, values)),
+            }
+            Ok(runs)
+        })
+}
+
+/// The first seat of `seats` (`seats[k]` lane `k`'s) no output root of
+/// `package` reads a row of, as its output and lane: a root of `held` bytes
+/// read at lane `k` reads rows `k..k + rows`, a seat's width a row.
+/// `held(stage, local)` is a stage's value's bytes.
+pub fn unread_seat<B: Backend>(
+    package: &LaunchPackage,
+    held: impl Fn(usize, u32) -> Option<u64>,
+    seats: &[Vec<Readout<'_, B>>],
+) -> Result<Option<(String, usize)>> {
+    let mut read: Vec<(usize, &str)> = Vec::new();
+    for (global, root) in package.values.iter().enumerate() {
+        if root.source != ValueOrigin::Output {
+            continue;
+        }
+        let Some(name) = root.output.as_deref() else {
+            continue;
+        };
+        for at in 0..package.plans.len() {
+            let Some(local) = local_of(package, at, global as u32)? else {
+                continue;
+            };
+            let values = held(at, local).unwrap_or(0) / 4;
+            let first = root.lane as usize;
+            let row = seats
+                .get(first)
+                .and_then(|offered| offered.iter().find(|seat| seat.output == name))
+                .map_or(values, |seat| u64::from(seat.width.max(1)));
+            let rows = values.div_ceil(row.max(1)).max(1) as usize;
+            read.extend((first..first + rows).map(|lane| (lane, name)));
+        }
+    }
+    Ok(seats.iter().enumerate().find_map(|(lane, offered)| {
+        offered
+            .iter()
+            .find(|seat| !read.contains(&(lane, seat.output)))
+            .map(|seat| (seat.output.to_string(), lane))
+    }))
+}
+
 pub fn local_of(package: &LaunchPackage, at: usize, global: u32) -> Result<Option<u32>> {
     match package.plan_local(global) {
         Some((stage, local)) if stage == at => Ok(local),

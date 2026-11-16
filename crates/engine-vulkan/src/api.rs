@@ -52,7 +52,9 @@ impl Host for Api {
     }
 
     fn ports() -> PortMask {
-        PortMask::DECODE_ENVELOPE.with(eta_ir::registry::Port::Fold)
+        PortMask::DECODE_ENVELOPE
+            .with(eta_ir::registry::Port::Fold)
+            .with(eta_ir::registry::Port::AttnMask)
     }
 
     fn settles_asynchronously(gpu: &Vulkan) -> bool {
@@ -144,25 +146,39 @@ impl Host for Api {
 
     fn envelope(gpu: &mut Vulkan, step: &Step, envelope: &mut Envelope<Api>) -> EngineResult<()> {
         for attachment in &step.attachments {
-            let Some(lane) = step.lanes.get(attachment.lane as usize) else {
-                return Err(Error::Invalid(format!(
-                    "attachment names lane {} of a {}-lane step",
-                    attachment.lane,
-                    step.lanes.len()
-                )));
-            };
-            #[cfg(feature = "vulkan")]
-            if let Some(cell) = gpu.programs.token_feed(attachment.instance) {
-                // A pass still on the queue wrote this lane's token; the
-                // forward copies it in behind that pass.
-                envelope.tokens[attachment.lane as usize] = Some(vec![0; lane.tokens.len()]);
-                envelope.feeds[attachment.lane as usize] = Some(cell);
-                continue;
-            }
-            envelope.tokens[attachment.lane as usize] = gpu
+            let lane_count = gpu
                 .programs
-                .envelope_tokens(attachment.instance, lane.tokens.len())
+                .lane_count(attachment.instance)
                 .map_err(refusal)?;
+            for lane_at in 0..lane_count {
+                let lane_index = attachment.lane as usize + lane_at;
+                let Some(lane) = step.lanes.get(lane_index) else {
+                    return Err(Error::Invalid(format!(
+                        "attachment names lane {lane_index} of a {}-lane step",
+                        step.lanes.len()
+                    )));
+                };
+                if lane.mask.is_none() {
+                    envelope.masks[lane_index] = gpu
+                        .programs
+                        .envelope_mask(attachment.instance, lane.tokens.len(), lane_at)
+                        .map_err(refusal)?;
+                }
+                #[cfg(feature = "vulkan")]
+                if lane.tokens.len() == 1
+                    && let Some(cell) = gpu.programs.token_feed(attachment.instance, lane_at)
+                {
+                    // A pass still on the queue wrote this lane's token; the
+                    // forward copies it in behind that pass.
+                    envelope.tokens[lane_index] = Some(vec![0; lane.tokens.len()]);
+                    envelope.feeds[lane_index] = Some(cell);
+                    continue;
+                }
+                envelope.tokens[lane_index] = gpu
+                    .programs
+                    .envelope_tokens(attachment.instance, lane.tokens.len(), lane_at)
+                    .map_err(refusal)?;
+            }
         }
         Ok(())
     }

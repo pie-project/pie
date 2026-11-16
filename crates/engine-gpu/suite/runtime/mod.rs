@@ -1,3 +1,4 @@
+mod beam_stage;
 mod bool_gather;
 mod bool_moves;
 mod fold;
