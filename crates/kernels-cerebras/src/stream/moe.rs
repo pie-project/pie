@@ -413,3 +413,163 @@ pub fn activation(g: &Group, narrow: Dtype) -> R<Chain> {
         region,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kernels_ir::interp::{Arg, eval};
+
+    fn group(score: RouteScore, bias: bool, scale: bool) -> Group {
+        Group {
+            route: 7,
+            nodes: vec![7],
+            logits: ValueId(0),
+            bias: bias.then_some(ValueId(1)),
+            scale: scale.then_some(ValueId(2)),
+            experts: 8,
+            top_k: 3,
+            score,
+            x: ValueId(0),
+            hidden: 16,
+            gate: (ValueId(3), 8, 0),
+            up: (ValueId(3), 8, 4),
+            down: ValueId(4),
+            inter: 4,
+            silu: true,
+            y: ValueId(5),
+            dtype: Dtype::Bf16,
+        }
+    }
+
+    /// The route the reference takes: the top k (the lower expert first on a tie) of the keys,
+    /// their weights as the score states them, a gate an expert.
+    fn reference(
+        l: &[f32],
+        bias: Option<&[f32]>,
+        gain: Option<&[f32]>,
+        score: RouteScore,
+        k: usize,
+    ) -> Vec<f32> {
+        let s: Vec<f32> = match score {
+            RouteScore::Sigmoid { .. } => l.iter().map(|x| 1.0 / (1.0 + (-x).exp())).collect(),
+            _ => l.to_vec(),
+        };
+        let mut key: Vec<f32> = (0..l.len())
+            .map(|i| s[i] + bias.map_or(0.0, |b| b[i]))
+            .collect();
+        let mut picks = Vec::new();
+        for _ in 0..k {
+            let (at, _) = key
+                .iter()
+                .enumerate()
+                .fold((0, f32::MIN), |b, (i, &v)| if v > b.1 { (i, v) } else { b });
+            picks.push(at);
+            key[at] = f32::MIN;
+        }
+        let mut g = vec![0.0f32; l.len()];
+        match score {
+            RouteScore::Sigmoid {
+                renormalize,
+                scaling,
+            } => {
+                let sum: f32 = picks.iter().map(|&p| s[p]).sum();
+                for &p in &picks {
+                    g[p] = if renormalize { s[p] / sum } else { s[p] } * scaling;
+                }
+            }
+            _ => {
+                let m = picks.iter().map(|&p| l[p]).fold(f32::MIN, f32::max);
+                let sum: f32 = picks.iter().map(|&p| (l[p] - m).exp()).sum();
+                for &p in &picks {
+                    g[p] = (l[p] - m).exp() / sum;
+                }
+            }
+        }
+        if let Some(w) = gain {
+            for (x, w) in g.iter_mut().zip(w) {
+                *x *= w;
+            }
+        }
+        g
+    }
+
+    fn close(a: &[f32], b: &[f32]) -> bool {
+        a.iter()
+            .zip(b)
+            .all(|(x, y)| (x - y).abs() <= 1e-5 * (1.0 + y.abs()))
+    }
+
+    /// The router's region picks and weighs as the route does: a softmax over the picked logits
+    /// (with a per-expert gain), a biased sigmoid renormalized and scaled; a tie at the cut
+    /// picks the lower expert alone.
+    #[test]
+    fn the_routers_region_picks_and_weighs_as_the_route() {
+        // (the trace states the values' dtypes alone: any trace's)
+        let trace = poem_compiler::catalog::repository()
+            .parse("qwen3-0.6b-bf16-kv-bf16-l1")
+            .expect("a catalog model")
+            .trace(poem_ir::Platform::Cerebras);
+        let l = vec![0.3, -1.2, 2.5, 0.3, 1.1, 0.3, -0.4, 0.9];
+        let bias = vec![0.0, 0.5, -0.2, 0.0, 0.1, 0.0, 0.3, -0.1];
+        let gain = vec![1.5, 0.5, 2.0, 1.0, 0.25, 1.0, 3.0, 1.0];
+        let cases = [
+            (RouteScore::Softmax, false, false),
+            (RouteScore::Softmax, false, true),
+            (
+                RouteScore::Sigmoid {
+                    renormalize: true,
+                    scaling: 2.5,
+                },
+                true,
+                false,
+            ),
+            (
+                RouteScore::Sigmoid {
+                    renormalize: false,
+                    scaling: 1.0,
+                },
+                false,
+                false,
+            ),
+        ];
+        for (score, b, s) in cases {
+            let g = group(score, b, s);
+            let c = router(&trace, &g).unwrap_or_else(|e| panic!("{e}"));
+            let mut args = vec![Arg::Row(l.clone())];
+            if b {
+                args.push(Arg::Row(bias.clone()));
+            }
+            if s {
+                args.push(Arg::Row(gain.clone()));
+            }
+            let got = eval(&c.region, &args).unwrap_or_else(|e| panic!("{e}"));
+            let want = reference(&l, b.then_some(&bias[..]), s.then_some(&gain[..]), score, 3);
+            assert!(close(&got[0], &want), "{score:?}: {:?} vs {want:?}", got[0]);
+        }
+        // three logits tied at 0.3 past the top two: the lowest of them (expert 0) alone
+        let g = group(RouteScore::Softmax, false, false);
+        let c = router(&trace, &g).unwrap();
+        let tied = vec![0.3, -1.2, 2.5, 0.3, 1.1, 0.3, -0.4, 0.3];
+        let got = eval(&c.region, &[Arg::Row(tied)]).unwrap();
+        let picked: Vec<usize> = (0..8).filter(|&i| got[0][i] != 0.0).collect();
+        assert_eq!(picked, [0, 2, 4]);
+    }
+
+    /// A bank's views: an expert's gate or up rows a block, its down columns a block.
+    #[test]
+    fn a_banks_views_lay_its_experts() {
+        use crate::stream::unit::View;
+        // gate | up bank [E 2, 2I 4, H 3]: up row o of expert 1 is the bank's row 1·4 + 2 + o % 2
+        let up = View::Rows {
+            block: 2,
+            stride: 4,
+            off: 2,
+        };
+        assert_eq!(up.at(3, 1, 3, 4), Some((4 + 2 + 1) * 3 + 1));
+        // down bank [E 2, H 3, I 2]: input i = e·I + j reads expert e's [H, I] at (o, j)
+        let down = View::Blocks { block: 2 };
+        assert_eq!(down.at(1, 3, 4, 3), Some(3 * 2 + 2 + 1));
+        assert_eq!(View::Plain.at(2, 1, 5, 3), Some(11));
+        assert_eq!(View::Spread { rep: 4 }.at(0, 0, 1, 4), None);
+    }
+}
