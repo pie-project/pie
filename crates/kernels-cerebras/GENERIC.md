@@ -2244,8 +2244,35 @@ milestone's tail.
       first, outlasts the simulator's half hour.) The compile-on-load program for `B` 1
       changes only its PE's request (`pcfg` a word longer, the line's bounds `R0`, `RQ`): the
       klein program staged for the chip is 902e22887's.
-      Next: the engine's side (a step's entries from `B` requests' host values, the
-      scheduler handing a launch its requests) and compile on load's `B`.
+    - **Batches through Pie.** Nothing in the runtime changes: a pass's lanes already carry a
+      group (`ForwardPass::group`: a guidance pass's two groups, cond and uncond), and the
+      scheduler already puts several passes' lanes in one fire, their groups renumbered apart.
+      - **Compile on load** takes the GEMM regime's `B` by price (`gemm::batched`, up to
+        `stream::BATCH_MOST` = 4: a request's share of its step, the fewer on a tie; the regimes
+        compared by a request's share), with no pin; where no `B` above 1 fits it keeps the
+        `B` 1 program (klein at 1024², unchanged). flux2-mini at 16 rows: text 16 x 67 and
+        denoise 32 x 139 PEs, `B` 4. `host.json` states `batch`.
+      - **A fire's requests** (`backend::stream::fire_stream`): its lanes' runs of one group, each
+        the reading's classes, a request each (lanes of no group: one). A launch takes the
+        program's `B` of them in turn (the last padded with its last request, those rows
+        dropped): each request's inputs off its lanes' channels as before, the entries the
+        host forward's of each request's step with every value's rows the requests' in turn
+        (`Reading::entries_batch`), the rows back cut a request each (`Reading::request_of`),
+        each request's outputs its own host ops' (`finish_values`), the lanes' outputs the
+        requests' in turn. A `B` 1 program runs a fire of more groups a launch a group: a
+        guidance pass's cond and uncond now run too. The host fabric runs each request's
+        forward and lays its rows out as the batch's (`Fabric::run_batch`).
+      - **`pie run text-to-media` on the host fabric**, 2 prompts in one run (`--prompts "a red
+        fox sleeping|a red cat sleeping" --seed 7`: one denoise pass of two groups, image `i`
+        seeded `seed + i`): `out_0.png` and `out_1.png` are **byte for byte** the single runs'
+        (`--prompt "a red fox sleeping" --seed 7`, `--prompt "a red cat sleeping" --seed 8`);
+        the two images' denoise steps ran as 2 fires (6 stream steps against a single run's 4:
+        a text pass and a decode each).
+      - The engine's entries of the two-request batch (`wafer-bench --reading --inputs a,b
+        --entries`) are the compile's from the batched capture word for word
+        (`a_batch_of_twos_entries_are_its_requests_in_turn`), and on the simulator with them
+        (the 32 x 8 cut through double block 0's attention, `run.py --entries`, 7.6 min): the
+        same 5.196e-3 / 0.9999865 over both requests' 64 rows, the capture's entries' digits.
 
 ## G1: the poem survey
 
