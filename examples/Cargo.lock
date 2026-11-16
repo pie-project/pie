@@ -386,6 +386,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "keep-bench"
+version = "0.1.0"
+dependencies = [
+ "inferlet",
+ "serde",
+]
+
+[[package]]
 name = "keep-check"
 version = "0.1.0"
 dependencies = [
