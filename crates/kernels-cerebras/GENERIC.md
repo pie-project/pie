@@ -2121,7 +2121,7 @@ program of `KernelSet` x `Shape` (ARCHITECTURE.md).
 | llama_3 | llama31-8b | decode | template PASS | template PASS; **units PASS** (738 x 1072, 0.43M cycles priced) |
 | llama_3 | llama33-70b-mini-l4 | decode | EMIT: a head turn off a column source | **template PASS** (search keeps PEs' words that build) |
 | gemma_4 | e2b; e4b-mini-l1 | decode | template PASS | template PASS; units: shared KV (e2b), `gather.embed` per layer (PLE) |
-| gemma_4 | 26b-a4b-mini-e64 | decode | router form refused | units: one attention shape a reading (global vs sliding head dims) |
+| gemma_4 | 26b-a4b-mini-e64 | decode | router form refused | units: the experts' dense matvec over 512 rest roots (expert-sparse placement) |
 | gemma_4 | 31b -l2 | decode | no partition | units: an emitter column gap |
 | gpt_oss | 20b | decode | template PASS | template PASS; units: `attn.sink` |
 | glm_4 | glm45-air-mini, glm47-mini | decode | router form refused | units: an emitter column gap (shared expert); heads straddling chunks |
@@ -2138,7 +2138,7 @@ program of `KernelSet` x `Shape` (ARCHITECTURE.md).
 | flux_2 | mini; klein-4b | text, denoise, vae.decode | PASS | PASS (sha-identical programs) |
 | flux_2 | mini; klein | vae.encode | mini PASS at a 256-row clip (16 rows make a 1 x 1 grid its downsamplings do not map); klein: a weight PE over its words | the same |
 | z_image | mini | denoise | `elemwise.clamp` | an emitter gap in the lanes (a moved part) |
-| ltx_2 | mini | denoise | `elemwise.clamp` | one attention shape a reading (audio 64, video 128) |
+| ltx_2 | mini | denoise | `elemwise.clamp` | `rope_axes` in the split-ladder form (no region) |
 | minimax_h3 | mini | denoise | `gather.concat_cols` | a lane column on no bus word |
 | wan_2 | mini-nano, mini-d128 | denoise | cross-attention | cross-attention |
 | hunyuan_image_3 | mini | decode / text / denoise | `rope_axes`; `gather.rows` | an emitter column gap (after MoE and the split rotation) |
@@ -2184,7 +2184,9 @@ klein's text, denoise and VAE programs are sha-identical across every commit.
   as a weight view lays it; the gated activation is a region. Exact (an unpicked expert adds
   zeros) and per-PE bound as a dense layer of the experts' width.
 - **Placement.** The decode search keeps a partition only where every PE's words build (rcfg),
-  so a searched plan cannot fail at the emitter (llama33-70b-mini-l4).
+  so a searched plan cannot fail at the emitter (llama33-70b-mini-l4). Each stream block's K / V
+  columns are its own attention's (its first unit's heads, head width and scale), so a reading's
+  attentions may differ (ltx's audio and video, gemma's sliding and global).
 
 ### G1.3 Special cases a general mechanism would remove
 
@@ -2197,8 +2199,6 @@ klein's text, denoise and VAE programs are sha-identical across every commit.
 - `spatial::layer::stream::classes`: the stream values `context` / `latents` by name (flux's
   `reference` and ltx's audio streams are not classes).
 - `PERMUTES` (a list of names for the host's permutations).
-- `stream::shape`'s one attention shape a reading (`JointSpec`): the K / V columns share one
-  shape; per-block shapes would take gemma's and ltx's mixed heads.
 - The stream floorplan's one-unit-a-layer bands: a layer too wide for 512 rest roots is refused
   (a 30B layer); the template's K layers a unit is the missing axis.
 
