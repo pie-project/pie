@@ -126,7 +126,7 @@ async fn main(input: Input) -> Result<String> {
     let prefill = ForwardPass::new();
     prefill.embed(&prefill_prompt, &prefill_embed_indptr)?;
     prefill.mask(&prefill_mask)?;
-    prefill.state(&streams, StateGeometry::folding())?;
+    prefill.state(&streams, StateGeometry::default())?;
     prefill.epilogue(move || {
         let logits = reshape(intrinsics::output(0, "logits"), [2, vocab]);
         let amateur = reshape(gather(&logits, iota(1)), [vocab]);
@@ -158,7 +158,7 @@ async fn main(input: Input) -> Result<String> {
     let decode = ForwardPass::new();
     decode.embed(&toks, &embed_indptr)?;
     decode.mask(&mask)?;
-    decode.state(&streams, StateGeometry::folding())?;
+    decode.state(&streams, StateGeometry::default())?;
     decode.epilogue(move || {
         let logits = reshape(intrinsics::output(0, "logits"), [2, vocab]);
         let amateur = reshape(gather(&logits, iota(1)), [vocab]);

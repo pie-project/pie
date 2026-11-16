@@ -717,6 +717,7 @@ impl FireCtx<'_> {
             plan_values: facts.plans.len(),
             tables: FireTables {
                 mask_indptr: handles.mask_indptr,
+                mask_origin: handles.mask_origin,
                 pool_state: self.pools.pool_slabs(),
                 row_tables: self.pools.row_tables(),
                 expert_tables: self.pools.expert_tables(),

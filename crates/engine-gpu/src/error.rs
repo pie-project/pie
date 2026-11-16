@@ -340,8 +340,9 @@ impl fmt::Display for Fault {
                 extent,
             } => write!(
                 f,
-                "lane {lane} states a mask over {stated} keys and will read {extent}; a \
-                 mask must REACH the extent (a longer one is fine and is clipped)"
+                "lane {lane} states a mask over {stated} columns and will read {extent} (its \
+                 buffer from its committed boundary, then its rows); a mask must REACH the \
+                 extent (a longer one is fine and is clipped)"
             ),
             Self::Maskless { lane } => write!(
                 f,

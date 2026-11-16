@@ -505,6 +505,9 @@ impl ReqGeometry {
                 positions,
                 kv: ::engine::KvDelta {
                     held: start,
+                    // Where the set's commit stands as the pass is staged;
+                    // a piece of a cut pass restates it as it is prepared.
+                    folded: place.folded.min(start),
                     pages: (0..kv_len.div_ceil(page)).collect(),
                     ..Default::default()
                 },

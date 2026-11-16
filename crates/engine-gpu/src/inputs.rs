@@ -111,7 +111,13 @@ struct TableAt {
 pub struct Handles {
     pub tokens: Tensor,
 
+    /// Each row's cache row: attention's causal bound (and its window's).
     pub positions: Tensor,
+
+    /// Each row's stated position, what `RuntimeInput::Positions` reads:
+    /// the rotation. With mrope the rotation rides its own table and this
+    /// holds the cache row.
+    pub rotations: Tensor,
 
     pub readout_rows: Tensor,
 
@@ -131,6 +137,8 @@ pub struct Handles {
 
     pub mask: Tensor,
 
+    /// One u32 a row: its enable flag (bits 0-1) and its lane's committed
+    /// boundary (bits 2-31), the key the row's plane column 0 is.
     pub mask_enabled: Tensor,
 
     pub mask_stride: u32,
@@ -182,6 +190,8 @@ pub struct Fire<'a> {
 
     pub positions: &'a [i32],
 
+    pub rotations: &'a [i32],
+
     pub readout_rows: &'a [i32],
 
     pub windows: &'a [i32],
@@ -228,6 +238,7 @@ pub struct Inputs<B: Backend> {
     store: B::Buffer,
     tokens: u64,
     positions: u64,
+    rotations: u64,
     readout_rows: u64,
     windows: u64,
     window_ints: u64,
@@ -293,7 +304,7 @@ impl<B: Backend> Inputs<B> {
         // A lane's table holds as many pages as its narrowest list takes.
         let pages = u64::from(budget.max_lanes) * u64::from(paging.pages_per_slot.max(table_pages));
 
-        let per_gathered = 3 * rows + page_tables as u64 * (2 * lanes + (lanes + 1) + pages);
+        let per_gathered = 4 * rows + page_tables as u64 * (2 * lanes + (lanes + 1) + pages);
         let window_ints =
             (classes * (classes + 1) / 2 + 1) as u64 * (lanes + 1) + gathered as u64 * per_gathered;
 
@@ -305,6 +316,7 @@ impl<B: Backend> Inputs<B> {
         };
         let tokens = take(rows * 4);
         let positions = take(rows * 4);
+        let rotations = take(rows * 4);
         let readout_rows = take(rows * 4);
         let windows = take(window_ints * 4);
         let row_valid = take(rows);
@@ -320,7 +332,7 @@ impl<B: Backend> Inputs<B> {
         let mask_plane_bytes = rows * context;
         let mask_planes = take(mask_plane_bytes);
 
-        let mask_enabled = take(rows);
+        let mask_enabled = take(rows * 4);
         let page_tables: Vec<TableAt> = (0..page_tables)
             .map(|_| TableAt {
                 indptr: take((lanes + 1) * 4),
@@ -383,6 +395,7 @@ impl<B: Backend> Inputs<B> {
             store,
             tokens,
             positions,
+            rotations,
             readout_rows,
             windows,
             window_ints,
@@ -531,6 +544,7 @@ impl<B: Backend> Inputs<B> {
 
         self.store.write(self.tokens, bytes_of(fire.tokens))?;
         self.store.write(self.positions, bytes_of(fire.positions))?;
+        self.store.write(self.rotations, bytes_of(fire.rotations))?;
         if fire.readout_rows.len() > rows as usize {
             return Err(Fault::Ceiling {
                 what: "readout rows in one fire",
@@ -581,14 +595,15 @@ impl<B: Backend> Inputs<B> {
         let stride = fire.mask.map_or(0, |staged| staged.stride);
         if u64::from(stride) > u64::from(self.mask_stride) {
             return Err(Fault::Ceiling {
-                what: "key positions in one mask row",
+                what: "columns in one mask row",
                 need: u64::from(stride),
                 have: u64::from(self.mask_stride),
             });
         }
         match fire.mask {
             None => {
-                self.store.zero_span(self.mask_enabled, u64::from(rows))?;
+                self.store
+                    .zero_span(self.mask_enabled, u64::from(rows) * 4)?;
             }
             Some(staged) => {
                 if staged.bytes.len() as u64 > self.mask_plane_bytes {
@@ -599,7 +614,8 @@ impl<B: Backend> Inputs<B> {
                     });
                 }
                 self.store.write(self.mask_planes, &staged.bytes)?;
-                self.store.write(self.mask_enabled, &staged.enabled)?;
+                let words: Vec<u8> = staged.words.iter().flat_map(|w| w.to_le_bytes()).collect();
+                self.store.write(self.mask_enabled, &words)?;
             }
         }
 
@@ -899,6 +915,7 @@ impl<B: Backend> Inputs<B> {
         Ok(Handles {
             tokens: i32s(handles, &self.store, self.tokens, rows)?,
             positions: i32s(handles, &self.store, self.positions, rows)?,
+            rotations: i32s(handles, &self.store, self.rotations, rows)?,
             readout_rows: i32s(
                 handles,
                 &self.store,
@@ -933,10 +950,10 @@ impl<B: Backend> Inputs<B> {
                 Dtype::U8,
             ),
             mask_enabled: Tensor::new(
-                handles.bind(&self.store, self.mask_enabled, u64::from(rows))?,
+                handles.bind(&self.store, self.mask_enabled, u64::from(rows) * 4)?,
                 rows,
                 1,
-                Dtype::U8,
+                Dtype::U32,
             ),
             mask_stride: stride,
             patches,

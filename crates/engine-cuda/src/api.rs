@@ -1504,6 +1504,7 @@ impl Cuda {
                         _ => &lane.kv.pages,
                     },
                     held: (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
+                    folded: lane.kv.folded,
                     kv_less: lane.kv_less,
                     translation: match table(lane, LIST) {
                         Some(refs) if by_refs && !lane.kv.translation.is_empty() => refs,

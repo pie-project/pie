@@ -106,6 +106,7 @@ fn windows(trace: &Trace, compiled: &CompiledModel, enabled: bool) -> Windows {
             enabled,
             page_tables: &page_tables,
             positions: &positions,
+            rotations: &positions,
             request_of_token: &request_of_token,
         },
     )
@@ -499,6 +500,7 @@ fn the_packed_blob_and_the_bind_walk_it_in_one_order() {
             };
             want += gathered.rows_host.len()
                 + gathered.positions_host.len()
+                + gathered.rotations_host.len()
                 + gathered.request_of_token_host.len();
             for table in &gathered.page_tables {
                 want += table.page_indptr_host.len()
