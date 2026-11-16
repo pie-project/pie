@@ -1058,16 +1058,11 @@ impl Shell {
                 &Exports::of(&boot.trace, &compiled, boot.context, boot.page_size)?.outputs,
             ),
         };
-        let drafting_words: std::collections::HashSet<u64> = compiled
-            .classes
-            .classes
-            .iter()
-            .enumerate()
-            .filter(|(class, _)| {
-                tiers.plain.contains(*class) && !landing[*class].iter().any(poem_ir::Request::plain)
-            })
-            .flat_map(|(_, class)| class.words.iter().copied())
-            .collect();
+        let drafting_words: std::collections::HashSet<u64> =
+            crate::exports::drafting_of(&landing, &tiers.plain)
+                .into_iter()
+                .flat_map(|class| compiled.classes.classes[class].words.iter().copied())
+                .collect();
         let media = media_classes(&boot.trace, &compiled);
         let shifted = regions_shifting(&boot.trace, &compiled);
         let lane_shifted = regions_lane_shifting(&boot.trace, &compiled);
@@ -1416,6 +1411,8 @@ impl Shell {
             inputs_at: 0,
             decoded_tiles: Vec::new(),
             arming: false,
+            arming_rows: Vec::new(),
+            arming_capture: (0, 0),
             armed_body: None,
             arm_cold: false,
             arm_rs: crate::record::RsBody::Folds,
@@ -1477,6 +1474,18 @@ impl Shell {
         // A capturing lane's score rows are its reader's state, a row of
         // the load's context a grain (`engine::GuestState::per_instance`).
         shell.programs.set_capture(boot.context, boot.page_size);
+        // Arming a scored class lends its fires' capture rows from a run
+        // the load holds beside its staged inputs, the widest fire's lanes'
+        // rows, counted before ready.
+        let scored = engine::load::armed::scored_classes(&shell.landing)
+            .iter()
+            .any(|class| shell.tiers.plain.contains(class));
+        shell.arming_capture.0 = engine::load::armed::arming_capture_room(
+            scored,
+            shell.fire_lanes(),
+            boot.context,
+            boot.page_size,
+        );
         // A program's tables and scratch are its instances' state
         // (`Shell::guest_state`): nothing is held for them here.
         let programs = 0u64;
@@ -1680,12 +1689,13 @@ impl Shell {
     /// the readout rows' table, the voxel store and the rs fold predicates,
     /// each to
     /// [`INPUTS_ALIGN`].
-    fn staged_runs(&self) -> [u64; 4] {
+    fn staged_runs(&self) -> [u64; 5] {
         [
             self.inputs.bytes(),
             self.readout_rows.bytes() as u64,
             self.voxels.as_ref().map_or(0, crate::voxels::Store::bytes),
             self.predicate.bytes(),
+            self.arming_capture.0,
         ]
         .map(|bytes| bytes.next_multiple_of(INPUTS_ALIGN))
     }
@@ -1696,8 +1706,8 @@ impl Shell {
         if let Some(buffers) = &self.buffers {
             buffers.lay_scratch(&mut self.pools)?;
         }
-        let [inputs, readouts, voxels, predicates] = self.staged_runs();
-        let staged = inputs + readouts + voxels + predicates;
+        let [inputs, readouts, voxels, predicates, capture] = self.staged_runs();
+        let staged = inputs + readouts + voxels + predicates + capture;
         self.pools
             .hold_activation_at(self.inputs_at, staged, false)?;
         let base = self.pools.activation_base() + self.inputs_at;
@@ -1708,6 +1718,7 @@ impl Shell {
             store.lay(base + inputs + readouts);
         }
         self.predicate.lay(base + inputs + readouts + voxels)?;
+        self.arming_capture.1 = base + inputs + readouts + voxels + predicates;
         let Some(workspace) = &self.workspace else {
             return Ok(());
         };

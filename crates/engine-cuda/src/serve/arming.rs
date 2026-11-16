@@ -1212,9 +1212,7 @@ impl Shell {
                         && self.tiers.plain.contains(*class)
                 })
                 .collect(),
-            drafting: (0..classes)
-                .filter(|class| !self.landing[*class].iter().any(poem_ir::Request::plain))
-                .collect(),
+            drafting: crate::exports::drafting_of(&self.landing, &self.tiers.plain),
             rs_rungs: self.rs_rungs(),
             decoding: self.decoding.clone(),
             seats,
@@ -1470,6 +1468,21 @@ impl Shell {
     }
 
     fn arm_lattice_fenced(&mut self, verify: bool) -> Result<()> {
+        // A scored class's fires capture into rows no reader holds yet:
+        // each lane's lent from the run the load holds for them.
+        let (room, at) = self.arming_capture;
+        let row = self.programs.capture().bytes();
+        self.arming_rows = if room == 0 {
+            Vec::new()
+        } else {
+            (0..room / row).map(|lane| at + lane * row).collect()
+        };
+        let armed = self.arm_lattice_rows(verify);
+        self.arming_rows = Vec::new();
+        armed
+    }
+
+    fn arm_lattice_rows(&mut self, verify: bool) -> Result<()> {
         let Some(mut st) = self.arm_begin(verify) else {
             return Ok(());
         };

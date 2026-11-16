@@ -334,12 +334,20 @@ fn a_guest_slot_parks_on_the_host_and_comes_back() {
     }
 }
 
-/// A score reader's pair holds the fire's score planes, and a park gives
-/// them back: unparked to fresh room elsewhere, the reader's scored decode
-/// captures where the planes lie now (its captures read where through the
-/// fire's staged word) and sums the same scores.
-#[test]
-fn a_parked_score_reader_sums_its_scores_where_its_planes_moved() {
+/// What a scored session gave: each decode's summed scores and logits, and
+/// the bodies' tally after the load armed and after the session.
+struct Scored {
+    decodes: Vec<(f32, Vec<f32>)>,
+    armed: engine_cuda::record::BodyTally,
+    after: engine_cuda::record::BodyTally,
+}
+
+/// An eviction guest's session on a shell recording bodies as `graphs`
+/// says: a score reader registered and bound after the load (after ready),
+/// two scored decodes, a park and an unpark of its rows to fresh room
+/// elsewhere, two more. Every decode at the same depth: the same scores
+/// and logits each time.
+fn scored_session(graphs: Graphs) -> Scored {
     use crate::a_score_reader_states_its_planes_and_nothing_backs_them as scored;
     use engine::fire::Readout;
     use engine_cuda::serve::Attached;
@@ -347,14 +355,11 @@ fn a_parked_score_reader_sums_its_scores_where_its_planes_moved() {
     use eta_compiler::codegen::program::{Backend, emit_program};
     use poem::Request;
 
-    if !engine_cuda::device::present() {
-        eprintln!("no CUDA device: skipping");
-        return;
-    }
     let trace = poem::trace_hybrid("scored-micro", &scored::Scored, Platform::Cuda);
     let dir = tempfile::tempdir().expect("a scratch directory");
     let path = Weights::random(&trace, 4409).write(dir.path());
-    let mut shell = scored::shell(trace.clone(), &path, Graphs::On);
+    let mut shell = scored::shell(trace.clone(), &path, graphs);
+    let armed = shell.body_stats().tally;
     let pages: Vec<u32> = (0..64 / scored::PAGE).collect();
     let prompt: Vec<u32> = (0..scored::PROMPT)
         .map(|t| (t * 7 + 11) % scored::VOCAB)
@@ -420,12 +425,10 @@ fn a_parked_score_reader_sums_its_scores_where_its_planes_moved() {
         )
         .expect("the reader binds");
 
-    // One scored decode, always at the same depth: the same scores each
-    // time, summed into the reader's channel.
     let token = [prompt[0]];
     let depth = [scored::PROMPT];
-    let decode = |shell: &mut Shell| -> f32 {
-        shell
+    let decode = |shell: &mut Shell| -> (f32, Vec<f32>) {
+        let logits = shell
             .fire_media(
                 &[Seated {
                     pages: &pages,
@@ -435,7 +438,7 @@ fn a_parked_score_reader_sums_its_scores_where_its_planes_moved() {
                         slot: 0,
                         word: trace
                             .facts
-                            .word(&Request::new(1, true).capturing_scores(true)),
+                            .word(&scored::decoding(&trace).capturing_scores(true)),
                         tokens: &token,
                     })
                 }],
@@ -456,15 +459,17 @@ fn a_parked_score_reader_sums_its_scores_where_its_planes_moved() {
             .take(0)
             .expect("the sum reads")
             .expect("a sum");
-        f32::from_le_bytes(cell[..4].try_into().expect("an f32"))
+        (
+            f32::from_le_bytes(cell[..4].try_into().expect("an f32")),
+            logits.into_iter().flatten().collect(),
+        )
     };
-    let first = decode(&mut shell);
-    assert!(first != 0.0, "the reader summed no scores");
+    let mut decodes = vec![decode(&mut shell), decode(&mut shell)];
 
-    // Parked and unparked: its scratch and its pair's state, the planes'
-    // room, taken afresh elsewhere; nothing copied.
+    // Parked and unparked: its scratch and its pair's state, the score
+    // rows among them, taken afresh elsewhere; nothing copied.
     let (scratch, pair) = guest.moved(program, extents, state);
-    assert_ne!(pair, slots.pair, "the pair's state moved");
+    assert_ne!(scratch, slots.scratch, "the instance's scratch moved");
     shell
         .rebind_program(
             instance,
@@ -475,9 +480,74 @@ fn a_parked_score_reader_sums_its_scores_where_its_planes_moved() {
             },
         )
         .expect("the reader rebinds");
+    decodes.push(decode(&mut shell));
+    decodes.push(decode(&mut shell));
+    Scored {
+        decodes,
+        armed,
+        after: shell.body_stats().tally,
+    }
+}
+
+/// A score reader's rows are its instance's state, and a park gives them
+/// back: unparked to fresh room elsewhere, the reader's scored decode
+/// captures where its rows lie now (through the fire's staged table) and
+/// sums the same scores.
+#[test]
+fn a_parked_score_reader_sums_its_scores_where_its_planes_moved() {
+    if !engine_cuda::device::present() {
+        eprintln!("no CUDA device: skipping");
+        return;
+    }
+    let walked = scored_session(Graphs::Off);
+    let (first, _) = &walked.decodes[0];
+    assert!(*first != 0.0, "the reader summed no scores");
+    for (sum, _) in &walked.decodes {
+        assert_eq!(sum, first, "the capture writes the rows where they lie now");
+    }
+}
+
+/// A scored fire is armed like any other (every body is captured before
+/// ready): a score reader bound after ready replays its decode's body,
+/// parked and unparked too, and nothing is captured or walked after ready.
+/// Its scores and its tokens are the walked session's.
+#[test]
+fn a_scored_fire_after_ready_replays_its_armed_body() {
+    if !engine_cuda::device::present() {
+        eprintln!("no CUDA device: skipping");
+        return;
+    }
+    let walked = scored_session(Graphs::Off);
+    let replayed = scored_session(Graphs::On);
+    eprintln!("armed {:?}\nafter {:?}", replayed.armed, replayed.after);
+    assert!(replayed.armed.armed_at_load > 0, "the load armed bodies");
     assert_eq!(
-        decode(&mut shell),
-        first,
-        "the capture writes the planes where they lie now"
+        replayed.after.captures, replayed.armed.captures,
+        "no body is captured after ready"
     );
+    assert_eq!(
+        replayed.after.eager_unbodied, replayed.armed.eager_unbodied,
+        "no fire walks unbodied after ready"
+    );
+    assert!(
+        replayed.after.hits >= replayed.armed.hits + replayed.decodes.len() as u64,
+        "every scored decode replays a body"
+    );
+    // The token a decode draws greedily: a body's kernels may round its
+    // logits other than the walk's, never past the top token.
+    let token = |logits: &[f32]| {
+        logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(at, _)| at)
+    };
+    for ((sum, logits), (want_sum, want_logits)) in replayed.decodes.iter().zip(&walked.decodes) {
+        assert_eq!(sum, want_sum, "a replay sums the walked scores");
+        assert_eq!(
+            token(logits),
+            token(want_logits),
+            "a replay draws the walked token"
+        );
+    }
 }

@@ -159,6 +159,13 @@ pub struct Shell {
     inputs_at: u64,
     decoded_tiles: Vec<u64>,
     arming: bool,
+    /// Each lane's score rows while the lattice arms a scored class, since
+    /// no reader is bound: lent from the run the load holds for them in the
+    /// activation's span ([`Shell::arming_capture`]).
+    arming_rows: Vec<u64>,
+    /// The bytes of that run (`engine::load::armed::arming_capture_room`),
+    /// and where it lies once laid.
+    arming_capture: (u64, u64),
     golden_arm: Golden,
     armed_body: Option<record::BodyKey>,
     /// The target arming fires is past its kind's widest bucket

@@ -137,10 +137,11 @@ impl Capture {
         self.context.div_ceil(self.page_size.max(1))
     }
 
-    /// The bytes of a lane's rows, both grains.
+    /// The bytes of a lane's rows, both grains
+    /// ([`engine::load::armed::capture_row_bytes`]).
     #[must_use]
     pub fn bytes(self) -> u64 {
-        u64::from(self.context + self.pages()) * size_of::<f32>() as u64
+        engine::load::armed::capture_row_bytes(self.context, self.page_size)
     }
 }
 

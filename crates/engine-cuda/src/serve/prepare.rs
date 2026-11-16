@@ -231,6 +231,11 @@ impl Shell {
                         ),
                     });
                 }
+                // A size-only walk launches nothing: no row is written.
+                None if crate::sizing::active() => Some(0),
+                // Arming: no reader is bound, and the lane captures into
+                // rows lent for it.
+                None if self.arming => self.arming_rows.get(at).copied(),
                 None => None,
             };
             rows[at] = row.ok_or_else(|| Fault::Unbound {
