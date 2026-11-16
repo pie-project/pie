@@ -9,10 +9,9 @@
 //! The area a queue takes is read from KFD's topology for the device. The
 //! queues are KFD's own list for this process where that list is ours to
 //! read (the host's PID namespace); in a container's PID namespace it is
-//! not, and the count is HIP's rule instead: one utility queue, and a
-//! hardware queue for each stream up to HIP's limit. The rule counts no
-//! copy queue, so it holds only while the copy queues are off
-//! ([`super::sys::copy_queues`]).
+//! not, and the count is HIP's rule instead: one utility queue, a hardware
+//! queue for each stream up to HIP's limit, and a copy queue for each stream
+//! a load made one on ([`warm_copies`]).
 
 use std::fs;
 use std::path::{Path, PathBuf};

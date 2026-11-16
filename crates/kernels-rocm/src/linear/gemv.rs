@@ -66,19 +66,6 @@ pub(crate) fn gemv_bf16(
     )
 }
 
-/// The current device's compute units, asked once per process (every device
-/// a process drives is the same part).
-pub(crate) fn compute_units() -> u32 {
-    static CUS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *CUS.get_or_init(|| {
-        let mut device = 0i32;
-        // SAFETY: writes one int.
-        unsafe { crate::hip::rt::hipGetDevice(&raw mut device) };
-        crate::hip::multiprocessors(device.unsigned_abs())
-            .unwrap_or(304)
-            .max(1)
-    })
-}
 
 /// The skinny kernel's wavefronts a block.
 const SKINNY_WAVES: u32 = 16;
@@ -185,8 +172,14 @@ const QUAD_SPLIT_K: u32 = 12288;
 /// `quad_from` rows. The summation order depends only on `m`, `rows`, `k`
 /// and `quad_from` (never on `n` or the epilogue), so a fused GLU lands the
 /// bits its bank's plain projection would.
-pub(crate) fn skinny_plan(m: u32, rows: u32, k: u32, swiglu: bool, quad_from: u32) -> SkinnyPlan {
-    let cus = compute_units();
+pub(crate) fn skinny_plan(
+    m: u32,
+    rows: u32,
+    k: u32,
+    swiglu: bool,
+    quad_from: u32,
+    cus: u32,
+) -> SkinnyPlan {
     let n = if swiglu { rows / 2 } else { rows };
     let act_global = m * k * 2 > SKINNY_LDS;
     if m >= quad_from && rows >= QUAD_MIN_ROWS {
@@ -300,6 +293,7 @@ pub(crate) fn skinny(
         k.unsigned_abs(),
         swiglu,
         ctx.tuning().gemm_skinny_quad_from,
+        ctx.multiprocessors("linear.skinny")?,
     );
     skinny_planned(ctx, weight, act, out, m, n, k, epilogue, plan)
 }
@@ -405,16 +399,22 @@ const TURN_WAVE_LDS: u32 = 8 << 10;
 /// `[gate | up]` one) over K `k`: wavefronts a block (`ks`, a 256-element
 /// slice of K each, up to four), slices a wavefront (`r`, up to two) and
 /// blocks (as many as the LDS keeps resident, at most a 16-row tile each).
-/// `None` past K 2048.
-pub(crate) fn turn_plan(m: u32, rows: u32, k: u32) -> Option<(u32, u32, u32)> {
-    if !(1..=32).contains(&m) || k == 0 || !k.is_multiple_of(256) || k > 2048 || rows == 0 {
+/// `None` past K 2048 ([`turn_fits`]).
+pub(crate) fn turn_plan(m: u32, rows: u32, k: u32, cus: u32) -> Option<(u32, u32, u32)> {
+    if !turn_fits(m, rows, k) {
         return None;
     }
     let slices = k / 256;
     let ks = slices.min(if m > 16 { 8 } else { 4 });
     let r = slices.div_ceil(ks);
-    let resident = compute_units() * ((64 << 10) / (ks * TURN_WAVE_LDS));
+    let resident = cus * ((64 << 10) / (ks * TURN_WAVE_LDS));
     Some((ks, r, rows.div_ceil(16).min(resident)))
+}
+
+/// Whether the turned kernel covers `m` rows over `rows` weight rows of K
+/// `k`: 1 to 32 rows, K in whole 256s up to 2048.
+pub(crate) fn turn_fits(m: u32, rows: u32, k: u32) -> bool {
+    (1..=32).contains(&m) && k != 0 && k.is_multiple_of(256) && k <= 2048 && rows != 0
 }
 
 /// `y[m, n] = act[m, k] · w[n, k]ᵀ` for 1 ≤ m ≤ 32 on the turned kernel
@@ -437,6 +437,7 @@ pub(crate) fn skinnyt(
         m.unsigned_abs(),
         n.unsigned_abs() * if glu { 2 } else { 1 },
         k.unsigned_abs(),
+        ctx.multiprocessors(OP)?,
     );
     let (Some((ks, r, grid)), true) = (plan, n > 0 && k > 0) else {
         return Err(refuse(

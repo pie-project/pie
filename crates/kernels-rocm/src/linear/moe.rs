@@ -679,7 +679,7 @@ fn grouped_lt(
 }
 
 /// `groups` strided bf16 matmuls in one hipBLASLt launch; `Ok(false)` where
-/// hipBLASLt is absent or offers no algorithm.
+/// hipBLASLt offers no algorithm for the shape.
 #[cfg(feature = "rocm")]
 #[allow(clippy::too_many_arguments)]
 fn grouped_lt(

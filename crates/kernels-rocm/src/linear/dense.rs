@@ -3,8 +3,8 @@
 
 //! `y = act · wᵀ` for a bf16 projection: the skinny kernel for a decode's
 //! few rows (the gemv where it refuses), hipBLASLt's heuristic pick above
-//! them (what torch and vLLM run on ROCm), and rocBLAS where hipBLASLt is
-//! absent or offers nothing.
+//! them (what torch and vLLM run on ROCm), and rocBLAS for a shape hipBLASLt
+//! offers no algorithm for.
 
 use crate::error::Error;
 use crate::hip::blas::{self, Operand};
@@ -13,7 +13,7 @@ use crate::jit::{Ctx, kernel, refuse};
 
 use super::dense_batch::dense_batch_bf16;
 use super::gemv::{
-    SkinnyEpilogue, gemv_bf16, skinny_bf16, skinny_f32, skinny_swiglu_bf16, skinnyt, turn_plan,
+    SkinnyEpilogue, gemv_bf16, skinny_bf16, skinny_f32, skinny_swiglu_bf16, skinnyt, turn_fits,
 };
 
 /// Up to eight rows the skinny kernels always take a small weight.
@@ -50,7 +50,7 @@ fn route(ctx: &Ctx, m: i32, rows: i32, k: i32) -> Route {
     if t.gemm_turn_from > 0
         && (t.gemm_turn_from as i32..=until as i32).contains(&m)
         && rows.unsigned_abs() >= t.gemm_turn_min_n
-        && turn_plan(m.unsigned_abs(), rows.unsigned_abs(), k.unsigned_abs()).is_some()
+        && turn_fits(m.unsigned_abs(), rows.unsigned_abs(), k.unsigned_abs())
     {
         return Route::Turn;
     }
