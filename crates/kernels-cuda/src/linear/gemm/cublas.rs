@@ -2526,6 +2526,8 @@ struct DiskCache {
 static TABLES: Mutex<(Option<&'static str>, Option<PathBuf>)> = Mutex::new((None, None));
 static TIMING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static UNTUNED: Mutex<Option<std::collections::HashSet<u64>>> = Mutex::new(None);
+/// Products timed since the process began: only `pie tune` times any.
+static TIMED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// What [`install_tactics`] found for this device.
 #[derive(Clone, Debug, Default)]
@@ -2567,10 +2569,18 @@ pub fn untuned() -> usize {
         .map_or(0, |set| set.len())
 }
 
+/// The products timed since the process began: 0 unless `pie tune` ran
+/// ([`time_tactics`]), since a load or a serving times none.
+#[must_use]
+pub fn timed() -> usize {
+    TIMED.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Whether a missing tactic may be timed now (`pie tune`); otherwise it is
 /// counted.
 fn may_time(key: u64) -> bool {
     if TIMING.load(std::sync::atomic::Ordering::Acquire) {
+        TIMED.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         return true;
     }
     let new = UNTUNED

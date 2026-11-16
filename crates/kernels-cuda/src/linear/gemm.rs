@@ -14,7 +14,7 @@ use dtype::Dtype;
 #[cfg(feature = "cuda")]
 pub(crate) mod cublas;
 #[cfg(feature = "cuda")]
-pub use cublas::{Tactics, install_tactics, time_tactics, untuned};
+pub use cublas::{Tactics, install_tactics, time_tactics, timed, untuned};
 #[cfg(feature = "cuda")]
 pub mod cublas_lt_fp8;
 

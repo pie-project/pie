@@ -2579,3 +2579,69 @@ fn golden_eager_resume() {
         small_pool_arms(&fixture, &cache);
     }
 }
+
+/// A load and its serving time no dense GEMM tactic: two loads of one model
+/// with fresh, empty user tables pick the same tactics (the checked-in
+/// table's, or cuBLAS's own) and serve bit-identical logits, and the
+/// process timed nothing. Under `time_tactics` (as `pie tune` runs) the same
+/// load times what the tables lack, which is the control: a model the
+/// checked-in table does not cover, so there is something to time.
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn golden_two_fresh_loads_time_nothing() {
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    let cache = cache_dir();
+    // A model whose products the checked-in table does not hold, so the
+    // control has something to time: `PIE_GOLDEN_FRESH`.
+    let model =
+        std::env::var("PIE_GOLDEN_FRESH").unwrap_or_else(|_| "qwen38-flash-next-mini".to_string());
+    let fixture = fixture(&model, &cache);
+    let fresh = |n: u32| {
+        let dir =
+            std::env::temp_dir().join(format!("pie-fresh-tactics-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut knobs = knobs();
+        knobs.profiles = Some(dir);
+        knobs
+    };
+    let serve = |knobs: engine_cuda::Knobs| {
+        let mut shell = load_with(&fixture, &cache, knobs);
+        shell.open(0).expect("slot 0 opens");
+        let prompt: Vec<u32> = (0..64u32).map(|t| (t * 7 + 11) % 1000).collect();
+        let word = fixture.trace.facts.word(&Request::new(64, false));
+        let mut rows = shell
+            .fire_media(
+                &[Seated::of(Lane {
+                    slot: 0,
+                    word,
+                    tokens: &prompt,
+                })],
+                &[],
+                &[],
+            )
+            .expect("the prompt fires");
+        rows.swap_remove(0)
+    };
+    let before = kernels_cuda::linear::gemm::timed();
+    let first = serve(fresh(0));
+    let second = serve(fresh(1));
+    let timed = kernels_cuda::linear::gemm::timed() - before;
+    println!(
+        "golden {model}-fresh-loads: timed {timed} product(s); logits equal: {}",
+        first == second
+    );
+    assert_eq!(timed, 0, "a load timed {timed} dense GEMM product(s)");
+    assert!(first == second, "two fresh loads served different logits");
+    kernels_cuda::linear::gemm::time_tactics(true);
+    let _ = serve(fresh(2));
+    kernels_cuda::linear::gemm::time_tactics(false);
+    let control = kernels_cuda::linear::gemm::timed() - before;
+    println!("golden {model}-fresh-loads: under time_tactics a load timed {control}");
+    assert!(
+        control > 0,
+        "a load under time_tactics timed nothing, so this probe's model shows nothing"
+    );
+}
