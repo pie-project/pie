@@ -237,7 +237,9 @@ pub fn residual_rmsnorm(
         && y.width > 256
         && y.width.is_multiple_of(8)
         && runs <= 4
-        && [x.ptr, y.ptr, weight.ptr, out.ptr].iter().all(|&at| aligned16(at));
+        && [x.ptr, y.ptr, weight.ptr, out.ptr]
+            .iter()
+            .all(|&at| aligned16(at));
     if !takes {
         return Ok(false);
     }
