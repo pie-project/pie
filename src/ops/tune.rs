@@ -82,6 +82,12 @@ pub fn run(args: TuneArgs) -> Result<Answer> {
     let mut say = |line: &str| eprintln!("{}", palette.dim(line));
     let artifacts = crate::paths::pie_home().join("artifacts");
     let cache = crate::paths::pie_home().join("tune");
+    #[cfg(feature = "engine-cuda")]
+    let home = crate::paths::pie_home();
+    #[cfg(feature = "engine-cuda")]
+    let served_cuda = |artifact: &std::path::Path| {
+        worker::backend::served_cuda(artifact, &home).map_err(|e| format!("{e:#}"))
+    };
     let req = runtime::engine::profiles::TuneRequest {
         full: args.full,
         profiles: &dir,
@@ -91,6 +97,8 @@ pub fn run(args: TuneArgs) -> Result<Answer> {
         cache: &cache,
         refit: args.refit,
         gemm_only: args.gemm_only,
+        #[cfg(feature = "engine-cuda")]
+        served_cuda: &served_cuda,
     };
     let tuned = tune(&req, &mut say).map_err(|e| anyhow!(e))?;
 

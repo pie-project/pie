@@ -92,30 +92,28 @@ fn load(
     Ok((shell, trace))
 }
 
-/// Load `artifact` as `pie serve` does with no budget stated: the default
-/// lanes, and the forward tokens the engine picks. Its arming walks every
-/// composition of the lattice a served load records, so the products it
-/// times are the ones serving runs, rung by rung; the tune's own servings
-/// ([`serve`]) cover only their prompt and lane counts.
+/// The engine boot and load request `pie serve` makes for an artifact when
+/// its config states nothing past the model (the worker builds both).
+pub type Served<'a> =
+    &'a dyn Fn(&Path) -> Result<(crate::DeviceBoot, engine::load::LoadRequest), String>;
+
+/// Load `artifact` under `chip` as `pie serve` does, through the engine's
+/// own load: its arming walks every composition of the lattice a served
+/// load records, so the products it times are the ones serving runs, rung
+/// by rung; the tune's own servings ([`serve`]) cover only their prompt and
+/// lane counts.
 #[cfg(feature = "cuda")]
 fn arm_served(
     artifact: &Path,
-    deployment: &str,
     chip: &Profile,
-    profiles: Option<&Path>,
+    served: Served<'_>,
+    contract_for: crate::ContractFor,
 ) -> Result<(), String> {
-    // The budgets `pie serve` loads with when none is stated, baked as its
-    // load bakes them (`api::bake_budgets`, `api::patch_ladder`), so the
-    // lattice armed is the one serving arms, wide compositions included.
-    let budgets = engine::load::Budgets::default();
-    let (shell, _) = load(artifact, deployment, chip, profiles, |trace| Shape {
-        slots: budgets.slots,
-        budget: crate::api::bake_budgets(&budgets, trace),
-        patches: crate::api::patch_ladder(trace, &budgets),
-        page_size: budgets.page_size,
-        context: budgets.max_context,
-    })?;
-    drop(shell);
+    use engine::Engine;
+    let (mut boot, request) = served(artifact)?;
+    boot.knobs.chip = Some(chip.clone());
+    let mut cuda = crate::open(boot, contract_for)?;
+    cuda.load(request).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -323,6 +321,8 @@ impl Bench for Cuda<'_> {
 pub fn gemm_only(
     profiles: Option<&Path>,
     models: &[(PathBuf, String)],
+    served: Served<'_>,
+    contract_for: crate::ContractFor,
     say: &mut dyn FnMut(&str),
 ) -> Result<Outcome, String> {
     let began = Instant::now();
@@ -344,7 +344,7 @@ pub fn gemm_only(
             say(&format!(
                 "timing the dense GEMM tactics {deployment}'s served lattice arms"
             ));
-            arm_served(artifact, deployment, &base, profiles)?;
+            arm_served(artifact, &base, served, contract_for)?;
         }
         say(&format!(
             "{} product(s) timed",
@@ -353,7 +353,7 @@ pub fn gemm_only(
     }
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (base, name, began);
+        let _ = (base, name, began, served, contract_for);
         Err("--gemm-only times cuBLAS tactics, and this build has no CUDA runtime".to_string())
     }
     #[cfg(feature = "cuda")]
@@ -370,6 +370,8 @@ pub fn gemm_only(
 pub fn run(
     profiles: Option<&Path>,
     models: &[(PathBuf, String)],
+    served: Served<'_>,
+    contract_for: crate::ContractFor,
     say: &mut dyn FnMut(&str),
 ) -> Result<Outcome, String> {
     let began = Instant::now();
@@ -425,8 +427,10 @@ pub fn run(
         say(&format!(
             "timing the dense GEMM tactics {deployment}'s served lattice arms"
         ));
-        arm_served(artifact, deployment, &Cuda::profile_of(&draft)?, profiles)?;
+        arm_served(artifact, &Cuda::profile_of(&draft)?, served, contract_for)?;
     }
+    #[cfg(not(feature = "cuda"))]
+    let _ = (served, contract_for);
     let mut checks = Vec::new();
     // A file that changes nothing serves as today's does.
     let unchanged = draft == today;

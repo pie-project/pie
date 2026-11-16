@@ -44,6 +44,10 @@ pub struct TuneRequest<'a> {
     /// Time only the dense GEMM tactics the checked models' served loads
     /// arm, with no profile search (CUDA).
     pub gemm_only: bool,
+    /// The engine boot and load request `pie serve` makes for an artifact,
+    /// which the tune loads to time the GEMM products serving runs.
+    #[cfg(feature = "engine-cuda")]
+    pub served_cuda: engine_cuda::tune::Served<'a>,
 }
 
 /// What a tune produced.
@@ -189,9 +193,21 @@ tune_grid!(tune_metal, engine_metal, "metal");
 fn tune_cuda(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String> {
     let models = pick_models("cuda", req)?;
     let out = if req.gemm_only {
-        engine_cuda::tune::gemm_only(Some(req.profiles), &models, say)?
+        engine_cuda::tune::gemm_only(
+            Some(req.profiles),
+            &models,
+            req.served_cuda,
+            crate::engine::load::contract_for,
+            say,
+        )?
     } else {
-        engine_cuda::tune::run(Some(req.profiles), &models, say)?
+        engine_cuda::tune::run(
+            Some(req.profiles),
+            &models,
+            req.served_cuda,
+            crate::engine::load::contract_for,
+            say,
+        )?
     };
     Ok(tuned!(out, wrong: Vec::new()))
 }
