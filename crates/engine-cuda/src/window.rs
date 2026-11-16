@@ -131,6 +131,17 @@ pub const fn lane_capacity(max_lanes: u32) -> u32 {
     max_lanes.saturating_mul(2)
 }
 
+/// The lanes a body recorded at `bucket` lays its window tables for: the
+/// load's [`lane_capacity`], no more than the bucket's rows, since every
+/// lane of a fire holds a row of it. A body's carve is then its own rung's,
+/// not the top's, and a narrower rung leaves the span under its carve free.
+#[must_use]
+pub const fn body_lanes(max_lanes: u32, bucket: u32) -> u32 {
+    let capacity = lane_capacity(max_lanes);
+    let bucket = if bucket == 0 { 1 } else { bucket };
+    if capacity < bucket { capacity } else { bucket }
+}
+
 impl Slots {
     #[must_use]
     pub fn new(
