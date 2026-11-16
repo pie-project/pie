@@ -403,3 +403,135 @@ fn a_park_gives_the_scratch_back_whole_and_an_unpark_takes_fresh_chunks() {
     }
     assert!(roles.lock().unwrap().stale(holder(1)).is_empty());
 }
+
+/// The `Instance` slot refs `place` covers.
+fn refs_of(place: &ScratchPlace) -> Vec<u32> {
+    match place {
+        ScratchPlace::None => Vec::new(),
+        ScratchPlace::Run { first, slots } => (*first..first + slots).collect(),
+        ScratchPlace::Chunks(chunks) => chunks
+            .iter()
+            .flat_map(|&chunk| chunk * SPC..(chunk + 1) * SPC)
+            .collect(),
+    }
+}
+
+/// Whether no slot lies in two of `places`: the first one that does,
+/// named.
+fn disjoint(places: &[&ScratchPlace]) -> Result<(), String> {
+    let mut seen = std::collections::HashMap::new();
+    for (at, place) in places.iter().enumerate() {
+        for slot in refs_of(place) {
+            if let Some(was) = seen.insert(slot, at) {
+                return Err(format!("slot {slot} lies in places {was} and {at}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Two programs at their own pairs, three instances each, all of them in
+/// one fire: a beam stage and a sampler. Every instance's scratch and each
+/// pair's lie in places of their own, no slot in two of them, all below the
+/// top rung's span (where a fire's readout and capture rows lie, beside its
+/// carve); so too after one instance parks and unparks. What a fire lays
+/// for one program never lies where another's lies, whatever the facts.
+#[test]
+fn two_programs_scratch_and_pairs_lie_apart_and_stay_apart_after_a_park() {
+    let Pools { device, roles } = pools(64);
+    // The sampler: a run an instance, chunks for its pair.
+    let mut sampler = GuestEngine::new(TOP_P, 2 * CHUNK);
+    // The beam: chunks an instance, a run for its pair.
+    let mut beam = GuestEngine::new(2 * CHUNK, PAIR);
+    beam.next = 100;
+    for by in 1..=3 {
+        bind(&roles, &mut sampler, by).unwrap();
+        learn_program(&roles, &mut beam, ProgramId(8)).unwrap();
+        bind_instance(
+            Some(&roles),
+            &mut beam,
+            &InstanceBinding {
+                program: ProgramId(8),
+                ..InstanceBinding::default()
+            },
+            Some(holder(10 + by)),
+            |_| false,
+        )
+        .unwrap();
+    }
+    let mut scratch: Vec<ScratchPlace> = sampler
+        .bindings
+        .iter()
+        .chain(&beam.bindings)
+        .map(|binding| binding.scratch.clone())
+        .collect();
+    let pairs = [
+        sampler.bindings[0].pair.clone(),
+        beam.bindings[0].pair.clone(),
+    ];
+    assert!(sampler.bindings.iter().all(|binding| binding.pair == pairs[0]));
+    assert!(beam.bindings.iter().all(|binding| binding.pair == pairs[1]));
+    assert!(matches!(scratch[0], ScratchPlace::Run { .. }));
+    assert!(matches!(scratch[3], ScratchPlace::Chunks(_)));
+    assert!(matches!(pairs[0], ScratchPlace::Chunks(_)));
+    assert!(matches!(pairs[1], ScratchPlace::Run { .. }));
+    let limit = device.lock().unwrap().pool().live_limit();
+    let check = |scratch: &[ScratchPlace]| {
+        let places: Vec<&ScratchPlace> = scratch.iter().chain(&pairs).collect();
+        disjoint(&places).unwrap();
+        for place in places {
+            assert!(
+                chunks(place).iter().all(|&chunk| chunk < limit),
+                "{place:?} lies below the span's {limit}"
+            );
+        }
+    };
+    check(&scratch);
+
+    // The sampler's first instance parks alone (its pair stays with the
+    // other two) and unparks into fresh room.
+    let park = roles.lock().unwrap().prepare_park(holder(1)).unwrap();
+    roles.lock().unwrap().commit(park);
+    let unpark = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(1))
+        .unwrap()
+        .unwrap();
+    roles.lock().unwrap().commit(unpark);
+    let stale = roles.lock().unwrap().stale(holder(1));
+    let [
+        Rebind::Instance {
+            scratch: fresh,
+            pair,
+            ..
+        },
+    ] = stale.as_slice()
+    else {
+        panic!("one rebind: {stale:?}");
+    };
+    assert_eq!(*pair, pairs[0], "the pair did not move");
+    scratch[0] = fresh.clone();
+    check(&scratch);
+}
+
+/// The control: two instances told one run, or runs that overlap, are
+/// caught; adjacent runs are not.
+#[test]
+fn two_instances_told_one_run_are_caught() {
+    let run = ScratchPlace::Run {
+        first: SPC,
+        slots: 709,
+    };
+    let overlapping = ScratchPlace::Run {
+        first: SPC + 708,
+        slots: 2,
+    };
+    let adjacent = ScratchPlace::Run {
+        first: SPC + 709,
+        slots: 1,
+    };
+    assert!(disjoint(&[&run, &run]).is_err());
+    assert!(disjoint(&[&run, &overlapping]).is_err());
+    assert!(disjoint(&[&run, &adjacent]).is_ok());
+}
