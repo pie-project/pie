@@ -47,6 +47,12 @@ struct Input {
     ckpt_sync: bool,
     #[serde(default)]
     rollback_mode: Option<String>,
+    /// Rescore each final hypothesis as a lone sequence, one token a fire on
+    /// a working set of its own, and require its summed log-probability to
+    /// equal its beam's score: each beam read its own ancestry and nothing of
+    /// its siblings'.
+    #[serde(default)]
+    verify: bool,
 }
 
 fn default_prompt() -> String {
@@ -337,8 +343,64 @@ async fn main(input: Input) -> Result<String> {
         ));
     }
     let text = model::decode(&hypotheses[best_lane])?;
+    let verified = if input.verify {
+        let mut worst = 0f32;
+        for (lane, hypothesis) in hypotheses.iter().enumerate() {
+            let alone = rescore(&prompt, hypothesis).await?;
+            let apart = (alone - final_scores[lane]).abs();
+            // bf16 logits: a step's log-probability rounds to about 1e-2.
+            let room = 0.02 * hypothesis.len() as f32 + 0.05;
+            if apart > room {
+                return Err(format!(
+                    "beam {lane} scored {:.4}, and its hypothesis alone scores {alone:.4}: \
+                     {apart:.4} apart, past {room:.3}; its recurrence or attention read \
+                     another beam's cells",
+                    final_scores[lane]
+                ));
+            }
+            worst = worst.max(apart);
+        }
+        format!(" verified={} worst_apart={worst:.4}", hypotheses.len())
+    } else {
+        String::new()
+    };
     Ok(format!(
-        "{text}\n[beam] width={b} steps={max_steps} best_score={:.4} greedy_mismatches={greedy_mismatches}",
+        "{text}\n[beam] width={b} steps={max_steps} best_score={:.4} greedy_mismatches={greedy_mismatches}{verified}",
         final_scores[best_lane]
     ))
+}
+
+/// The summed log-probability of `hypothesis` after `prompt`, teacher-forced
+/// one token a fire on a working set of its own: what a beam that read only
+/// its own ancestry scores.
+async fn rescore(prompt: &[u32], hypothesis: &[u32]) -> Result<f32> {
+    let v = model::output_vocab_size();
+    let ws = WorkingSet::new();
+    let pipeline = Pipeline::new();
+    let mut total = 0f32;
+    for (at, &target) in hypothesis.iter().enumerate() {
+        let fed: Vec<i32> = if at == 0 {
+            prompt.iter().map(|&t| t as i32).collect()
+        } else {
+            vec![hypothesis[at - 1] as i32]
+        };
+        let rows = u32::try_from(fed.len()).map_err(|_| "a prompt past u32 rows")?;
+        let toks = Channel::from(&fed[..]);
+        let indptr = Channel::from([0u32, rows]);
+        let wanted = Channel::from([target]);
+        let out = Channel::new([1], dtype::f32);
+        let fwd = ForwardPass::new();
+        fwd.embed(&toks, &indptr)?;
+        fwd.state(&[&ws], StateGeometry::folding())
+            .context("bind the rescoring set")?;
+        fwd.epilogue(move || {
+            let logits = reshape(intrinsics::output(0, "logits"), [v]);
+            out.put(gather(log_softmax(&logits), wanted.take()));
+        });
+        fwd.submit(&pipeline).context("rescore submit")?;
+        let got = out.take_host::<Vec<f32>>().await.context("rescore drain")?;
+        total += got.first().copied().ok_or("the rescoring fire returned nothing")?;
+    }
+    pipeline.close();
+    Ok(total)
 }
