@@ -1834,6 +1834,7 @@ dependencies = [
  "block2",
  "checkpoint",
  "engine",
+ "engine-cpu",
  "eta-compiler",
  "eta-exec",
  "kernels-metal",
