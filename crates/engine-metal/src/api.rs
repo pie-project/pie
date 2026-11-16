@@ -543,6 +543,7 @@ impl Engine for Metal {
                     runahead: engine::runahead::Runahead::of(frames_in_flight),
                     residency: experts::Plan::default(),
                     profiles: self.boot.profiles.clone(),
+                    top: crate::Top::Ruled,
                 })
                 .map_err(fault)?;
                 let narrower = (budgets.max_tokens / 2).max(MIN_FITTED_FORWARD_TOKENS);
@@ -581,6 +582,14 @@ impl Engine for Metal {
                 Err(other) => return Err(fault(other)),
             }
         };
+        // The fires the load is laid for: the ruled top (`crate::top`) where
+        // it picked narrower than asked, and what every limit below states.
+        {
+            let laid = shell.budget();
+            budgets.max_tokens = laid.max_tokens;
+            budgets.max_lanes = laid.max_lanes;
+            budgets.buckets.clone_from(&laid.buckets);
+        }
         if let Some(short) = cut {
             eprintln!(
                 "the widest fire narrowed from {asked} to {} forward tokens at load: at the \

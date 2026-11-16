@@ -520,6 +520,8 @@ fn serve(artifact: &Path, deployment: &str, device: &str, file: &str) -> Result<
         runahead: engine::runahead::Runahead::F1,
         profiles: Some(dir.clone()),
         residency: crate::ResidencyPlan::default(),
+        // A candidate is timed at the fire size it names.
+        top: crate::Top::EveryRung,
     })
     .map_err(|e| e.to_string())?;
     // No runtime raises the rung here: the widest carve is backed.
