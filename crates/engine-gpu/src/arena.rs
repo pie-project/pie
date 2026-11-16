@@ -179,17 +179,6 @@ fn planes_under(carve: u64, planes: u64, room: u64) -> Result<u64> {
     Ok(need)
 }
 
-/// The bytes from the span's end a fire's carve and its capture planes may
-/// take: the top rung's of the rungs the pool states, `(tokens, chunks)` of
-/// `chunk_bytes`, ascending. The runtime holds every rung's chunks and its
-/// guest term to the same chunks (`ChunkFacts::act_span_chunks`).
-#[must_use]
-pub fn span_room(stated: &[(u32, u32)], chunk_bytes: u64) -> u64 {
-    stated
-        .last()
-        .map_or(0, |&(_, chunks)| u64::from(chunks) * chunk_bytes)
-}
-
 impl Rung {
     fn lay<T: Tactics + ?Sized>(
         trace: &Trace,
@@ -258,12 +247,9 @@ pub struct Span<B: Backend> {
     /// For each rung, the carve its fires take ([`Span::widen`]).
     widest: Vec<usize>,
     routers: Vec<u32>,
-    /// The bytes from the span's end a fire's carve and its capture planes
-    /// may take together: the top rung's span in whole chunks, as the pool
-    /// states it (`ChunkFacts::act_span_chunks`, [`Span::widen`]). What of
-    /// the last segment lies under it is state's.
-    room: u64,
-    /// The pool's last segment and the byte in it the span ends at.
+    /// The pool's last segment and the byte in it the span ends at: the
+    /// segment is the span a fire's carve and its capture planes may take
+    /// together, and the pool states it so (`ChunkFacts::act_span_chunks`).
     place: Option<(B::Buffer, u64)>,
 }
 
@@ -288,7 +274,6 @@ impl<B: Backend> Span<B> {
             widest: (0..rungs.len()).collect(),
             rungs,
             routers,
-            room: 0,
             place: None,
         })
     }
@@ -391,11 +376,7 @@ impl<B: Backend> Span<B> {
     /// its rung's stated chunks, so where rungs share their chunks (all of
     /// them, where the span lies past the kernels' state index) it lays
     /// out as at the top fire and lends nothing it would not.
-    ///
-    /// The top rung's stated chunks are the room a fire's carve and its
-    /// capture planes take together ([`span_room`]).
     pub fn widen(&mut self, stated: &[(u32, u32)], chunk_bytes: u64) {
-        self.room = span_room(stated, chunk_bytes);
         let room = |tokens: u32| {
             stated
                 .iter()
@@ -438,7 +419,7 @@ impl<B: Backend> Span<B> {
         let planes_at = if captured == 0 {
             base
         } else {
-            end - planes_under(at.bytes, at.lifted.bytes(captured), self.room.min(end))?
+            end - planes_under(at.bytes, at.lifted.bytes(captured), end)?
         };
         let mut slots: Vec<Option<Tensor>> = Vec::with_capacity(at.map.placements.len());
         let mut backed: Vec<u32> = Vec::new();
@@ -554,7 +535,7 @@ mod tests {
     use poem_compiler::{ArenaMap, Placement, RowExpr};
     use poem_ir::{Dtype, ValueId};
 
-    use super::{ALIGN, Lifted, planes_under, span_room};
+    use super::{ALIGN, Lifted, planes_under};
     use crate::error::Fault;
 
     /// One row of a fixture plane: 32 f32.
@@ -669,36 +650,5 @@ mod tests {
             panic!("planes past the span are refused");
         };
         assert_eq!((need, have), (8193, 8192));
-    }
-
-    /// The room a fire's carve and its capture planes take is the top
-    /// rung's stated chunks, not the last segment they lie at the end of:
-    /// planes past the top rung's span are refused though the segment's
-    /// old room (its end) would have held them.
-    #[test]
-    fn the_capture_room_is_the_top_rungs_span_not_its_segment() {
-        const CHUNK: u64 = 4096;
-        // Rungs of 1 and 2 chunks, the top's carve 6000 bytes of its 2; the
-        // segment the span lies at the end of is 8 chunks.
-        let stated = [(16u32, 1u32), (256, 2)];
-        let room = span_room(&stated, CHUNK);
-        let end = 8 * CHUNK;
-        assert_eq!(room, 2 * CHUNK, "the top rung's chunks");
-        let carve = 6000;
-        assert_eq!(
-            planes_under(carve, room - carve, room).expect("planes within the span"),
-            room
-        );
-        let Err(Fault::Ceiling { need, have, .. }) = planes_under(carve, room - carve + 1, room)
-        else {
-            panic!("planes past the top rung's span are refused");
-        };
-        assert_eq!((need, have), (room + 1, room));
-        // The negative control: the segment's end admits the same planes.
-        assert_eq!(
-            planes_under(carve, room - carve + 1, end).expect("the segment holds them"),
-            room + 1
-        );
-        assert_eq!(span_room(&[], CHUNK), 0, "no rung, no room");
     }
 }
