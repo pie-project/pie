@@ -128,7 +128,7 @@ fn fold_count(
 pub struct Plane {
     programs: BTreeMap<ProgramId, Arc<ExecPlan>>,
 
-    forms: engine_gpu::guest::Forms<crate::device::Api>,
+    forms: engine_gpu::guest::Forms,
 
     channels: BTreeMap<ChannelId, Arc<ChannelState>>,
     instances: BTreeMap<InstanceId, Instance>,
@@ -138,8 +138,9 @@ pub struct Plane {
     #[cfg(feature = "vulkan")]
     widen: Option<crate::guest::widen::Widen>,
 
+    /// Every guest pipeline, built at the load (`Programs::load`).
     #[cfg(feature = "vulkan")]
-    built: crate::guest::session::BuiltStages,
+    library: Option<Arc<crate::guest::session::Library>>,
 
     #[cfg(feature = "vulkan")]
     kept: crate::guest::session::Kept,
@@ -1056,6 +1057,10 @@ impl Plane {
         if self.widen.is_none() {
             return Err("the plane built no readout widen at the load".to_owned());
         }
+        let library = self
+            .library
+            .clone()
+            .ok_or_else(|| "the plane built no guest pipelines at the load".to_owned())?;
         let extents = eta_exec::Extents {
             row_count: binding.extents.row_count,
             token_count: binding.extents.token_count,
@@ -1068,7 +1073,7 @@ impl Plane {
             &plan.package.plans,
             compiled.all(),
             &extents,
-            &mut self.built,
+            &library,
             Arc::clone(&self.kept),
             binding.channels.clone(),
             &crate::guest::session::Tables {
@@ -1102,15 +1107,46 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
         &mut self,
         place: &engine_gpu::program::Place<'_, crate::device::Api>,
     ) -> Result<(), Refusal> {
-        let widen = crate::guest::widen::Widen::new(place.device).map_err(|why| {
-            Refusal::Program(format!("the readout widen did not build: {why}"))
-        })?;
-        self.widen = Some(widen);
+        #[cfg(feature = "vulkan")]
+        {
+            let started = std::time::Instant::now();
+            let library = crate::guest::session::Library::build(place.device).map_err(|why| {
+                Refusal::Program(format!("the guest pipelines did not build: {why}"))
+            })?;
+            tracing::info!(
+                calls = engine_gpu::guest::step_calls(),
+                built = library.built(),
+                ms = started.elapsed().as_millis() as u64,
+                "every guest step's pipeline is built"
+            );
+            self.library = Some(Arc::new(library));
+            let widen = crate::guest::widen::Widen::new(place.device).map_err(|why| {
+                Refusal::Program(format!("the readout widen did not build: {why}"))
+            })?;
+            self.widen = Some(widen);
+        }
+        // A build with no device builds nothing, and binds no instance.
+        #[cfg(not(feature = "vulkan"))]
+        let _ = place;
         Ok(())
     }
 
     fn package(&self, program: ProgramId) -> Option<&eta_compiler::codegen::launch::LaunchPackage> {
         Plane::package(self, program)
+    }
+
+    #[cfg(feature = "vulkan")]
+    fn built_serving(&self) -> u64 {
+        self.library
+            .as_ref()
+            .map_or(0, |library| library.built_serving())
+    }
+
+    #[cfg(feature = "vulkan")]
+    fn forget_step(&mut self, call: u32) {
+        if let Some(library) = &self.library {
+            library.forget(call);
+        }
     }
 
     fn facts(

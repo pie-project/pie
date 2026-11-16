@@ -407,6 +407,11 @@ impl Pipelines {
         self.compiles.get()
     }
 
+    #[must_use]
+    pub fn built_since(&self, _from: u64) -> Vec<&'static str> {
+        Vec::new()
+    }
+
     pub fn get(
         &self,
         _device: &Context,

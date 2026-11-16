@@ -119,6 +119,10 @@ pub struct Gpu<B: Host> {
 
     /// What the engine counts while it serves.
     live: engine::live::Live,
+
+    /// The guest pipelines built after the load as of the last count
+    /// (`Programs::built_serving`).
+    guest_built: u64,
 }
 
 impl<B: Host> Gpu<B> {
@@ -137,14 +141,21 @@ impl<B: Host> Gpu<B> {
             adapters: BTreeMap::new(),
             handed: None,
             live: engine::live::Live::armed(),
+            guest_built: 0,
         }
     }
 
-    /// Counts the pipelines the frame's fires built: the load built every
-    /// pipeline its walks named, so one built while serving is a fire that
-    /// ran what the load did not prepare ([`engine::live::Tally::Unrecorded`]).
+    /// Counts the pipelines built after ready, by a frame's fires or a bind:
+    /// the load built every kernel pipeline its walks named and every guest
+    /// step's, so each one built since is one it did not prepare
+    /// ([`engine::live::Tally::BuiltAfterReady`]).
     /// And the steps a backend that keeps recordings walked to keep: a shape
     /// recorded at its first serving fire ([`engine::live::Tally::Compiled`]).
+    /// And the steps walked and kept by no recording: each ran eagerly. On a
+    /// backend that keeps recordings that is a fire it should have replayed
+    /// (a split step, bindings a recording cannot hold:
+    /// [`engine::live::Tally::Unrecorded`]); on one that keeps none it is
+    /// every fire, as the backend states ([`engine::live::Tally::Eager`]).
     fn count_built(&mut self) {
         let built = self
             .shell
@@ -152,7 +163,7 @@ impl<B: Host> Gpu<B> {
             .map_or_else(Vec::new, Shell::built_serving);
         // A kernel is built once, so each is named once.
         for kernel in built {
-            self.live.tally(engine::live::Tally::Unrecorded, 1);
+            self.live.tally(engine::live::Tally::BuiltAfterReady, 1);
             tracing::error!(
                 engine = B::KIND,
                 kernel,
@@ -162,6 +173,25 @@ impl<B: Host> Gpu<B> {
         let recorded = self.shell.as_mut().map_or(0, Shell::recorded_serving);
         if recorded > 0 {
             self.live.tally(engine::live::Tally::Compiled, recorded);
+        }
+        // A guest pipeline a bind built after the load, which built every
+        // one a stage can dispatch.
+        let guest = self.programs.built_serving();
+        if guest > self.guest_built {
+            self.live.tally(
+                engine::live::Tally::BuiltAfterReady,
+                guest - self.guest_built,
+            );
+            self.guest_built = guest;
+        }
+        let unkept = self.shell.as_mut().map_or(0, Shell::unkept_serving);
+        if unkept > 0 {
+            let tally = if B::RECORDS {
+                engine::live::Tally::Unrecorded
+            } else {
+                engine::live::Tally::Eager
+            };
+            self.live.tally(tally, unkept);
         }
     }
 
@@ -528,6 +558,8 @@ where
         })
         .map_err(fault)?;
         self.programs.load(&place(&shell)).map_err(refusal)?;
+        // What the load itself walked is the load's: serving counts from here.
+        shell.unkept_serving();
         // The fire the shell took, which a binding may have bounded below
         // the one asked.
         let (max_lanes, max_tokens) = (shell.budget().max_lanes, shell.budget().max_tokens);
@@ -805,10 +837,10 @@ where
         }
 
         let place = self.shell.as_ref().map(place);
-        let bound = self
-            .programs
-            .bind(binding, place.as_ref())
-            .map_err(refusal)?;
+        let bound = self.programs.bind(binding, place.as_ref()).map_err(refusal);
+        // What the bind built, counted where it lands, before its first fire.
+        self.count_built();
+        let bound = bound?;
 
         // A lane that only classes the kernels refuse serve is refused
         // here, where its first fire would be.

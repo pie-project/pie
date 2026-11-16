@@ -629,6 +629,9 @@ pub struct Shell<B: Serve> {
     /// The steps walked to be kept since the last count
     /// ([`Shell::recorded_serving`]).
     recorded: u64,
+    /// The steps walked and not kept since the last count: each ran its
+    /// regions eagerly, with no recording to replay.
+    unkept: u64,
 
     /// The most dispatches a walked fire's frame encoded, and the most
     /// launches a walked fire made of its regions, since the last count
@@ -1475,6 +1478,7 @@ impl<B: Serve> Shell<B> {
             tier,
             built: B::compiled(&pipelines),
             recorded: 0,
+            unkept: 0,
             walked: (0, 0),
             pipelines,
             asks,
@@ -1999,6 +2003,12 @@ impl<B: Serve> Shell<B> {
     /// fire waited on, recorded at its first fire and replayed after.
     pub fn recorded_serving(&mut self) -> u64 {
         std::mem::take(&mut self.recorded)
+    }
+
+    /// The steps walked and not kept since the last count: each a fire
+    /// served with no recording, which no later fire replays either.
+    pub fn unkept_serving(&mut self) -> u64 {
+        std::mem::take(&mut self.unkept)
     }
 
     /// The most dispatches one walked fire's frame encoded, and the most
@@ -2695,6 +2705,11 @@ impl<B: Serve> Shell<B> {
     }
 
     #[must_use]
+    /// The pipelines built so far, the load's and any built since.
+    pub fn pipelines(&self) -> &B::Pipelines {
+        &self.pipelines
+    }
+
     pub fn device(&self) -> &B::Context {
         &self.device
     }
@@ -4308,6 +4323,7 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
             Plan::Walk { keep, split } => (keep, split),
         };
         self.recorded += u64::from(keep.is_some());
+        self.unkept += u64::from(keep.is_none());
         let walked = self.walk_once(&prepared, keep.is_some(), split)?;
         let mut frame = walked.frame.expect("the walk opened a frame");
 

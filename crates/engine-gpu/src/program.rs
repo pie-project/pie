@@ -62,10 +62,25 @@ pub trait Programs<B: Serve>: Default {
 
     fn package(&self, program: ProgramId) -> Option<&LaunchPackage>;
 
-    /// Builds what every instance's device half shares (the readout
-    /// widen's pipeline and its config), at the load: binding an instance
-    /// then builds its own stages and nothing else.
+    /// Builds what every instance's device half shares, at the load: the
+    /// pipeline of every call a guest stage can dispatch
+    /// ([`crate::guest::step_calls`]), and the readout widen's pipeline and
+    /// its config. Binding an instance, or registering a program, while
+    /// serving then builds no pipeline.
     fn load(&mut self, place: &Place<'_, B>) -> Result<(), Refusal>;
+
+    /// The pipelines built after the load, at a bind: none, where
+    /// [`Programs::load`] built every one a guest stage can dispatch.
+    fn built_serving(&self) -> u64 {
+        0
+    }
+
+    /// Takes guest step call `call`'s pipeline out, so the next bind that
+    /// dispatches it builds it while serving: the control of
+    /// [`Programs::built_serving`].
+    fn forget_step(&mut self, call: u32) {
+        let _ = call;
+    }
 
     /// What an instance of `program` holds in the pool's `Instance` and
     /// `Channel` slots (`Engine::program_facts`).

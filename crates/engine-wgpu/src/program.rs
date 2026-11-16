@@ -291,7 +291,7 @@ impl Guests {
 pub struct Plane {
     programs: BTreeMap<ProgramId, Arc<ExecPlan>>,
 
-    forms: engine_gpu::guest::Forms<crate::device::Api>,
+    forms: engine_gpu::guest::Forms,
 
     channels: BTreeMap<ChannelId, Arc<ChannelState>>,
     instances: BTreeMap<InstanceId, Instance>,
@@ -301,8 +301,9 @@ pub struct Plane {
     #[cfg(feature = "wgpu")]
     widen: Option<Arc<crate::guest::widen::Widen>>,
 
+    /// Every guest pipeline, built at the load (`Programs::load`).
     #[cfg(feature = "wgpu")]
-    codes: BTreeMap<ProgramId, Arc<crate::guest::session::Code>>,
+    library: Option<Arc<crate::guest::session::Library>>,
 
     tally: Arc<Tally>,
 }
@@ -962,6 +963,10 @@ impl Plane {
         if self.widen.is_none() {
             return Err("the plane built no readout widen at the load".to_owned());
         }
+        let library = self
+            .library
+            .clone()
+            .ok_or_else(|| "the plane built no guest pipelines at the load".to_owned())?;
         let extents = eta_exec::Extents {
             row_count: binding.extents.row_count,
             token_count: binding.extents.token_count,
@@ -969,21 +974,11 @@ impl Plane {
             query_len: binding.extents.query_len,
             key_len: binding.extents.key_len,
         };
-        let code = match self.codes.get(&binding.program) {
-            Some(code) => Arc::clone(code),
-            None => {
-                let code = Arc::new(
-                    crate::guest::session::Code::new(device, compiled.all())
-                        .map_err(|why| format!("its device code did not build: {why}"))?,
-                );
-                self.codes.insert(binding.program, Arc::clone(&code));
-                code
-            }
-        };
         crate::guest::session::Session::new(
             device,
             &plan.package.plans,
-            code,
+            compiled.all(),
+            library,
             &extents,
             &crate::guest::session::Tables {
                 pools: place.pools,
@@ -1138,15 +1133,39 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
         &mut self,
         place: &engine_gpu::program::Place<'_, crate::device::Api>,
     ) -> Result<(), Refusal> {
-        let widen = crate::guest::widen::Widen::new(place.device).map_err(|why| {
-            Refusal::Program(format!("the readout widen did not build: {why}"))
-        })?;
-        self.widen = Some(Arc::new(widen));
+        #[cfg(feature = "wgpu")]
+        {
+            let library = crate::guest::session::Library::build(place.device).map_err(|why| {
+                Refusal::Program(format!("the guest pipelines did not build: {why}"))
+            })?;
+            self.library = Some(Arc::new(library));
+            let widen = crate::guest::widen::Widen::new(place.device).map_err(|why| {
+                Refusal::Program(format!("the readout widen did not build: {why}"))
+            })?;
+            self.widen = Some(Arc::new(widen));
+        }
+        // A build with no device builds nothing, and binds no instance.
+        #[cfg(not(feature = "wgpu"))]
+        let _ = place;
         Ok(())
     }
 
     fn package(&self, program: ProgramId) -> Option<&eta_compiler::codegen::launch::LaunchPackage> {
         Plane::package(self, program)
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn built_serving(&self) -> u64 {
+        self.library
+            .as_ref()
+            .map_or(0, |library| library.built_serving())
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn forget_step(&mut self, call: u32) {
+        if let Some(library) = &self.library {
+            library.forget(call);
+        }
     }
 
     fn facts(

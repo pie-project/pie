@@ -3,12 +3,27 @@ use eta_compiler::codegen::cuda::CUDA_GENERATED_EMITTER_VERSION;
 use eta_compiler::codegen::hip::HIP_GENERATED_EMITTER_VERSION;
 use eta_compiler::codegen::metal::METAL_M1_EMITTER_VERSION;
 use eta_compiler::codegen::program::{Backend, emit_program};
+use eta_compiler::codegen::wgsl::{WGSL_STEP_EMITTER_VERSION, step_calls, step_module};
 
 const PINNED: &[(&str, u16, u64)] = &[
     ("cuda", 68, 0xe715_b81b_7428_72ff),
     ("hip", 28, 0xb012_bb79_5744_660f),
     ("metal", 63, 0xcb47_10e2_4efc_3762),
 ];
+
+/// The stepwise WGSL emitter's version and the fingerprint of what it
+/// writes: every call's module, in the order a stage's steps index them.
+const WGSL_PINNED: (u16, u64) = (1, 0xdb61_72d4_3fe0_3d69);
+
+fn wgsl_fingerprint() -> u64 {
+    let mut bytes = Vec::new();
+    for call in step_calls() {
+        let module = step_module("main", &call);
+        bytes.extend_from_slice(&(module.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(module.as_bytes());
+    }
+    eta_ir::fnv1a64(&bytes)
+}
 
 fn fingerprint(backend: Backend) -> u64 {
     let stages: Vec<_> = corpus_stages()
@@ -42,6 +57,23 @@ fn backend_of(name: &str) -> Backend {
 fn emitter_version_every_case() {
     the_pinned_versions_are_the_compiled_ones();
     each_emitter_version_still_describes_its_output();
+    the_stepwise_wgsl_version_still_describes_its_output();
+}
+
+fn the_stepwise_wgsl_version_still_describes_its_output() {
+    let (version, pinned) = WGSL_PINNED;
+    assert_eq!(
+        version, WGSL_STEP_EMITTER_VERSION,
+        "the stepwise WGSL emitter version constant is {WGSL_STEP_EMITTER_VERSION}, but \
+         WGSL_PINNED still says {version}"
+    );
+    let actual = wgsl_fingerprint();
+    assert_eq!(
+        actual, pinned,
+        "stepwise WGSL emitter version {version} was pinned to {pinned:#018x} but now emits \
+         {actual:#018x}: bump WGSL_STEP_EMITTER_VERSION and put the new fingerprint in \
+         WGSL_PINNED, in the same commit"
+    );
 }
 
 fn the_pinned_versions_are_the_compiled_ones() {
