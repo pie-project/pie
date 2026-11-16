@@ -2,6 +2,12 @@
 //! programs and channels, binding instances, moving cells, and what a fire
 //! reads of an instance. Each backend's plane runs its device halves its own
 //! way.
+//!
+//! engine-gpu beam steps serialise (host-resolved geometry): the planes
+//! advertise the decode envelope's ports (tokens, attention mask, fold) and
+//! no device geometry, so a beam program's slots, positions and kv lengths
+//! are the runtime's, resolved on the host from its shadow of the epilogue,
+//! and each step reads its tokens and mask back before the next is staged.
 
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
 use engine::program::{
