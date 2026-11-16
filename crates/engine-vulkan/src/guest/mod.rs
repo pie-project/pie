@@ -18,13 +18,16 @@ impl engine_gpu::guest::Lower for crate::device::Api {
 pub enum Slot {
     Storage,
     Uniform,
+    /// A uniform bound at a dynamic offset a dispatch: a step's node, rung
+    /// and selector.
+    Stepped,
 }
 
-/// The layout every guest stage's pipelines bind (group 0): storage
-/// buffers, the config a uniform.
+/// The layout every guest pipeline binds (group 0): storage buffers, the
+/// config a uniform, and the step's node, rung and selector a uniform at its offset.
 #[must_use]
 pub fn stage_layout() -> Vec<(u32, Slot)> {
-    use engine_gpu::guest::session::{BINDINGS, CFG_BINDING};
+    use engine_gpu::guest::session::{BINDINGS, CFG_BINDING, STEP_BINDING};
     (0..BINDINGS)
         .map(|at| {
             let slot = if at == CFG_BINDING {
@@ -34,6 +37,7 @@ pub fn stage_layout() -> Vec<(u32, Slot)> {
             };
             (at, slot)
         })
+        .chain([(STEP_BINDING, Slot::Stepped)])
         .collect()
 }
 
@@ -44,6 +48,7 @@ pub fn descriptor_type(slot: Slot) -> ash::vk::DescriptorType {
     match slot {
         Slot::Storage => ash::vk::DescriptorType::STORAGE_BUFFER,
         Slot::Uniform => ash::vk::DescriptorType::UNIFORM_BUFFER,
+        Slot::Stepped => ash::vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
     }
 }
 
@@ -67,7 +72,10 @@ pub fn lower(stage: usize, source: &str, layout: &[(u32, Slot)]) -> Result<Vec<u
         let bound = (binding.group == 0)
             .then(|| layout.iter().find(|(at, _)| *at == binding.binding))
             .flatten()
-            .map(|&(_, slot)| slot);
+            .map(|&(_, slot)| match slot {
+                Slot::Stepped => Slot::Uniform,
+                other => other,
+            });
         if bound != Some(declared) {
             return Err(refuse(format!(
                 "binding {}.{} is declared {declared:?} and the pipeline layout binds {bound:?}",

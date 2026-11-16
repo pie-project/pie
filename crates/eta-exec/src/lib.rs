@@ -24,6 +24,7 @@ mod scratch;
 mod stage_cache;
 mod status;
 mod step;
+pub mod tables;
 mod value;
 
 pub use error::{Error, Result};

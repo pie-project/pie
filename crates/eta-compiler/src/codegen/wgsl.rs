@@ -5,15 +5,14 @@ use core::fmt::Write as _;
 use eta_ir::op::tags;
 
 use crate::codegen::op_view::{OpView, result_bases};
+use crate::codegen::steps::{self, Call, Finish, Reduce, StepUniform};
+pub use crate::codegen::steps::{REDUCE_LEVELS, SORT_ROUNDS, STEP_BYTES};
+use crate::codegen::steps::{is_reduce, is_sort, reduce_levels, sort_rounds};
 use crate::plan::{CompiledStage, Region};
 
 pub const RUNTIME: &str = include_str!("../../runtime/wgsl/ptir_runtime.wgsl");
 
 pub const WORKGROUP: u32 = 256;
-
-const REDUCE_LEVELS: u32 = 7;
-
-const SORT_ROUNDS: u32 = 28;
 
 /// Words the runtime's one-row select keeps just below the temporary area
 /// (`SEL_WORDS` in the runtime), which a scratch layout must leave free.
@@ -111,17 +110,6 @@ pub fn emits(tag: u8) -> bool {
     )
 }
 
-const fn is_reduce(tag: u8) -> bool {
-    matches!(
-        tag,
-        tags::REDUCE_SUM | tags::REDUCE_MAX | tags::REDUCE_MIN | tags::REDUCE_ARGMAX
-    )
-}
-
-const fn is_sort(tag: u8) -> bool {
-    matches!(tag, tags::SORT_DESC | tags::TOP_K | tags::PIVOT_THRESHOLD)
-}
-
 #[must_use]
 pub fn is_boundary(tag: u8) -> bool {
     if tag == tags::OUTPUT {
@@ -142,77 +130,6 @@ pub fn launched_nodes(plan: &crate::codegen::launch::LaunchStagePlan) -> Vec<u32
         .filter(|&(at, op)| !is_boundary(op.tag) && fusion.emits_node(at))
         .map(|(at, _)| at as u32)
         .collect()
-}
-
-fn sort_rounds(plan: &crate::codegen::launch::LaunchStagePlan, at: usize) -> u32 {
-    let Some(op) = plan.ops.get(at) else {
-        return SORT_ROUNDS;
-    };
-    let Some(&arg) = op.args.first() else {
-        return SORT_ROUNDS;
-    };
-    let Some(value) = plan.value_types.get(arg as usize) else {
-        return SORT_ROUNDS;
-    };
-    let mut total: u64 = 1;
-    for axis in &value.axes {
-        let crate::plan::Dimension::Static(extent) = axis else {
-            return SORT_ROUNDS;
-        };
-        total *= u64::from(*extent);
-    }
-    let mut need = 0u32;
-    while (1u64 << need) < total {
-        need += 1;
-        if need >= SORT_ROUNDS {
-            return SORT_ROUNDS;
-        }
-    }
-    let rounds = need + (need & 1);
-    rounds.min(SORT_ROUNDS)
-}
-
-/// The fold levels a reduce over `at`'s argument needs: one per 32-fold
-/// until a row is one cell. A row of unknown length gets the full ladder.
-fn reduce_levels(plan: &crate::codegen::launch::LaunchStagePlan, at: usize) -> u32 {
-    let Some(mut len) = last_extent(plan, at) else {
-        return REDUCE_LEVELS;
-    };
-    let mut levels = 0;
-    while len > 1 && levels < REDUCE_LEVELS {
-        len = len.div_ceil(32);
-        levels += 1;
-    }
-    levels
-}
-
-fn arg_axes(
-    plan: &crate::codegen::launch::LaunchStagePlan,
-    at: usize,
-) -> Option<&[crate::plan::Dimension]> {
-    let arg = *plan.ops.get(at)?.args.first()?;
-    Some(&plan.value_types.get(arg as usize)?.axes)
-}
-
-fn last_extent(plan: &crate::codegen::launch::LaunchStagePlan, at: usize) -> Option<u64> {
-    match arg_axes(plan, at)?.last() {
-        Some(crate::plan::Dimension::Static(extent)) => Some(u64::from(*extent)),
-        None => Some(1),
-        _ => None,
-    }
-}
-
-/// Whether `at`'s argument is one row, which the runtime's select handles.
-fn one_row(plan: &crate::codegen::launch::LaunchStagePlan, at: usize) -> bool {
-    let Some(axes) = arg_axes(plan, at) else {
-        return false;
-    };
-    let Some((_, leading)) = axes.split_last() else {
-        return true;
-    };
-    leading
-        .iter()
-        .all(|axis| matches!(axis, crate::plan::Dimension::Static(1)))
 }
 
 // Native drivers recompile everything an entry point reaches per pipeline, so
@@ -400,16 +317,184 @@ pub fn emit_launch_stage(
     Ok(wrap(entry_name, &body))
 }
 
+/// One dispatch of a stepwise stage: call `call` of [`step_calls`] (the
+/// closed set, [`steps`]) on node `node` at `rung`, with `selector`. The
+/// call reads all three from the step's uniform ([`STEP_BINDING`]), so its
+/// pipeline names no program: every pipeline a stage can dispatch is one of
+/// [`step_calls`], and a backend builds them all before it serves.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Step {
+    /// What the step is, for a reader: the prefix, the node and the rung.
     pub entry: String,
     pub node: u32,
+    /// Its call's index in [`step_calls`].
+    pub call: u32,
+    pub rung: u32,
+    pub selector: u32,
+}
+
+impl Step {
+    /// What the step's uniform holds.
+    #[must_use]
+    pub fn uniform(&self) -> StepUniform {
+        StepUniform {
+            node: self.node,
+            rung: self.rung,
+            selector: self.selector,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Stepwise {
-    pub source: String,
     pub steps: Vec<Step>,
+}
+
+/// The version of what the stepwise emitter writes ([`step_calls`],
+/// [`step_module`], [`emit_launch_steps`]): it moves with the emitted bytes,
+/// pinned beside the other emitters' in `tests/eta_compiler/emitter_version.rs`.
+/// 1: every step a call of the closed set, reading its node, rung and
+/// selector from a uniform; before, each stage one module with its nodes
+/// spelled in.
+pub const WGSL_STEP_EMITTER_VERSION: u16 = 1;
+
+/// The binding of the uniform a step module reads its node, rung and
+/// selector from ([`StepUniform`]), beside the runtime's (0 to 5): a
+/// backend binds each step's at its own dynamic offset.
+pub const STEP_BINDING: u32 = 6;
+
+const NODE: &str = "pie_step.node";
+const RUNG: &str = "pie_step.rung";
+const SELECTOR: &str = "pie_step.selector";
+
+/// The ops this backend steps: every one it emits but a boundary op.
+fn stepped(tag: u8) -> bool {
+    emits(tag) && !is_boundary(tag)
+}
+
+/// The closed set's calls, in [`step_calls`]' order.
+fn calls() -> Vec<Call> {
+    steps::calls_of(stepped)
+}
+
+fn reduce_name(reduce: Reduce) -> &'static str {
+    match reduce {
+        Reduce::Sum => "RED_SUM",
+        Reduce::Max => "RED_MAX",
+        Reduce::Min => "RED_MIN",
+        Reduce::Argmax => "RED_ARGMAX",
+    }
+}
+
+/// `call` in WGSL: the runtime function it runs, on the uniform's node,
+/// rung and selector. Where the ops are not named (Dawn, which reuses the
+/// compile of the runtime's switch), a call that runs one op's step runs
+/// the switch instead.
+fn call_text(call: Call) -> String {
+    let (p, k, j) = (NODE, RUNG, SELECTOR);
+    let flag = |name: &str| alloc::format!("{name}({p}, {j} != 0u)");
+    let named = specialize();
+    let body = match call {
+        Call::ReduceLevel(reduce) if named => {
+            alloc::format!("op_reduce_level({p}, {}, {k})", reduce_name(reduce))
+        }
+        Call::ReduceLevel(_) => alloc::format!("ptir_reduce_level({p}, {k})"),
+        Call::ReduceFinish(reduce) if named => {
+            alloc::format!("op_reduce_finish({p}, {})", reduce_name(reduce))
+        }
+        Call::ReduceFinish(_) => alloc::format!("ptir_reduce_finish({p})"),
+        Call::SortSeed { .. } => alloc::format!("ptir_sort_seed({p})"),
+        Call::SortRound { .. } => alloc::format!("ptir_sort_round({p}, {k})"),
+        Call::SortPre { .. } => alloc::format!("ptir_sort_pre({p})"),
+        Call::PivotPack { .. } => alloc::format!("ptir_pivot_pack({p})"),
+        Call::SelInit => alloc::format!("sel_init({p})"),
+        Call::SelHist => alloc::format!("sel_hist({p}, {k})"),
+        Call::SelPick => alloc::format!("sel_pick({p}, {k})"),
+        Call::SelRankMask => alloc::format!("sel_rank_mask({p})"),
+        Call::SelTally => alloc::format!("sel_tally({p})"),
+        Call::SelPlace => alloc::format!("sel_place({p})"),
+        Call::SelWalk => alloc::format!("sel_walk({p})"),
+        _ if !named => alloc::format!("ptir_step({p})"),
+        Call::Unary => alloc::format!("map_unary({p}, {j})"),
+        Call::Arith => alloc::format!("bin_arith({p}, {j})"),
+        Call::Compare => alloc::format!("cmp_op({p}, {j})"),
+        Call::Logic => alloc::format!("logic_op({p}, {j})"),
+        Call::Select => alloc::format!("op_select({p})"),
+        Call::Cumulative => flag("op_cumulative"),
+        Call::Broadcast => alloc::format!("op_broadcast({p})"),
+        Call::Copy => alloc::format!("op_copy({p})"),
+        Call::Transpose => alloc::format!("op_transpose({p})"),
+        Call::Gather => alloc::format!("op_gather({p})"),
+        Call::GatherRow => alloc::format!("op_gather_row({p})"),
+        Call::Scatter => flag("op_scatter"),
+        Call::Iota => alloc::format!("op_iota({p})"),
+        Call::MaskApply => alloc::format!("op_mask_apply({p})"),
+        Call::StructMask => alloc::format!("op_struct_mask({p}, {j})"),
+        Call::Rng => flag("op_rng"),
+        Call::Matmul => alloc::format!("op_matmul({p})"),
+        Call::Const => alloc::format!("op_const({p})"),
+        Call::Finish { finish, .. } => match finish {
+            Finish::SortDesc => alloc::format!("op_sort_desc_finish({p})"),
+            Finish::TopK => alloc::format!("op_top_k_finish({p})"),
+            Finish::Pivot => alloc::format!("op_pivot_finish({p})"),
+        },
+    };
+    let guarded = matches!(
+        call,
+        Call::SortSeed { guarded: true }
+            | Call::SortRound { guarded: true }
+            | Call::SortPre { guarded: true }
+            | Call::Finish { guarded: true, .. }
+            | Call::PivotPack { guarded: true }
+    );
+    if guarded {
+        // The ladder runs only for a row the select handed over.
+        alloc::format!("  if (sel_ladder_idle()) {{ return; }}\n  {body};\n")
+    } else {
+        alloc::format!("  {body};\n")
+    }
+}
+
+/// Every call a stepwise stage can dispatch, each once, in WGSL: the steps
+/// of every ladder of every op this backend emits ([`steps::calls_of`]). A
+/// stage's steps index it, so the pipelines a shell builds from it are
+/// every one a guest program can run.
+#[must_use]
+pub fn step_calls() -> Vec<String> {
+    calls().into_iter().map(call_text).collect()
+}
+
+/// The module of call `call` of [`step_calls`]: the runtime, the step's
+/// uniform, and one entry point, `entry`, that runs the call across the
+/// whole grid.
+#[must_use]
+pub fn step_module(entry: &str, call: &str) -> String {
+    let mut source = String::with_capacity(RUNTIME.len() + 1024);
+    source.push_str(RUNTIME);
+    source.push('\n');
+    // The words at `steps::NODE_AT`, `RUNG_AT` and `SELECTOR_AT`.
+    source.push_str(
+        "struct PieStep {\n  node : u32,\n  rung : u32,\n  selector : u32,\n  pad : u32,\n}\n",
+    );
+    let _ = writeln!(
+        source,
+        "@group(0) @binding({STEP_BINDING}) var<uniform> pie_step : PieStep;"
+    );
+    source.push_str(ENTRY_MARKER);
+    source.push('\n');
+    wrap_step(&mut source, entry, call);
+    source
+}
+
+/// `call` as one step's own text: what it runs, spelled with its node,
+/// rung and selector in place of the uniform's reads.
+#[must_use]
+pub fn spelled(call: &str, step: &Step) -> String {
+    let flag = if step.selector != 0 { "true" } else { "false" };
+    call.replace(NODE, &alloc::format!("{}u", step.node))
+        .replace(&alloc::format!("{SELECTOR} != 0u"), flag)
+        .replace(SELECTOR, &alloc::format!("{}u", step.selector))
+        .replace(RUNG, &alloc::format!("{}u", step.rung))
 }
 
 fn wrap_step(source: &mut String, entry_name: &str, call: &str) {
@@ -429,84 +514,8 @@ fn wrap_step(source: &mut String, entry_name: &str, call: &str) {
     source.push_str("}\n");
 }
 
-fn step_op(
-    source: &mut String,
-    steps: &mut Vec<Step>,
-    prefix: &str,
-    plan: &crate::codegen::launch::LaunchStagePlan,
-    at: usize,
-    tag: u8,
-) {
-    let mut push = |call: String, suffix: &str| {
-        let entry = alloc::format!("{prefix}_{at}_{suffix}");
-        wrap_step(source, &entry, &call);
-        steps.push(Step {
-            entry,
-            node: at as u32,
-        });
-    };
-    let pivot = (tag == tags::PIVOT_THRESHOLD).then(|| plan.ops[at].pred_tag);
-    if pivot.is_some_and(|pred| pred > 1) {
-        // ProbGe compares each lane with the threshold; nothing to order.
-        push(alloc::format!("  {};\n", step_call(at, tag)), "step");
-    } else if pivot.is_some() && one_row(plan, at) {
-        let rank = pivot == Some(0);
-        push(alloc::format!("  sel_init({at}u);\n"), "sel");
-        for pass in 0..4 {
-            push(
-                alloc::format!("  sel_hist({at}u, {pass}u);\n"),
-                &alloc::format!("h{pass}"),
-            );
-            push(
-                alloc::format!("  sel_pick({at}u, {pass}u);\n"),
-                &alloc::format!("p{pass}"),
-            );
-        }
-        if rank {
-            push(alloc::format!("  sel_rank_mask({at}u);\n"), "mask");
-        } else {
-            push(alloc::format!("  sel_tally({at}u);\n"), "tally");
-            push(alloc::format!("  sel_place({at}u);\n"), "place");
-            push(alloc::format!("  sel_walk({at}u);\n"), "walk");
-            let guard = "  if (sel_ladder_idle()) { return; }\n";
-            push(alloc::format!("{guard}  ptir_sort_seed({at}u);\n"), "seed");
-            for round in 0..sort_rounds(plan, at) {
-                push(
-                    alloc::format!("{guard}  ptir_sort_round({at}u, {round}u);\n"),
-                    &alloc::format!("r{round}"),
-                );
-            }
-            push(alloc::format!("{guard}  ptir_sort_pre({at}u);\n"), "pre");
-            push(alloc::format!("{guard}  {};\n", step_call(at, tag)), "step");
-            push(alloc::format!("{guard}  ptir_pivot_pack({at}u);\n"), "pack");
-        }
-    } else if is_sort(tag) {
-        push(alloc::format!("  ptir_sort_seed({at}u);\n"), "seed");
-        for round in 0..sort_rounds(plan, at) {
-            push(
-                alloc::format!("  ptir_sort_round({at}u, {round}u);\n"),
-                &alloc::format!("r{round}"),
-            );
-        }
-        push(alloc::format!("  ptir_sort_pre({at}u);\n"), "pre");
-        push(alloc::format!("  {};\n", step_call(at, tag)), "step");
-        push(alloc::format!("  ptir_pivot_pack({at}u);\n"), "pack");
-    } else if is_reduce(tag) {
-        for level in 0..reduce_levels(plan, at) {
-            push(
-                alloc::format!("  {};\n", reduce_level_call(at, tag, level)),
-                &alloc::format!("l{level}"),
-            );
-        }
-        push(
-            alloc::format!("  {};\n", reduce_finish_call(at, tag)),
-            "fin",
-        );
-    } else {
-        push(alloc::format!("  {};\n", step_call(at, tag)), "step");
-    }
-}
-
+/// `plan`'s launches as steps of the closed set; a node no call serves is
+/// refused by its op's name.
 pub fn emit_launch_steps(
     prefix: &str,
     plan: &crate::codegen::launch::LaunchStagePlan,
@@ -514,23 +523,34 @@ pub fn emit_launch_steps(
     if !valid_identifier(prefix) {
         return Err(Refused::EntryName(prefix.to_string()));
     }
-    let mut source = String::from(RUNTIME);
-    source.push('\n');
-    source.push_str(ENTRY_MARKER);
-    source.push('\n');
-    let mut steps = Vec::new();
+    let calls = calls();
+    let mut out = Vec::new();
     for at in launched_nodes(plan) {
         let at = at as usize;
         let op = &plan.ops[at];
+        let refused = || Refused::Op {
+            tag: op.tag,
+            name: eta_ir::op::spec(op.tag).map_or("?", |row| row.name),
+        };
         if !emits(op.tag) {
-            return Err(Refused::Op {
-                tag: op.tag,
-                name: eta_ir::op::spec(op.tag).map_or("?", |row| row.name),
+            return Err(refused());
+        }
+        let ladder = steps::ladder_of(plan, at, op.tag);
+        for step in steps::steps_of(op.tag, ladder).ok_or_else(refused)? {
+            let index = calls
+                .iter()
+                .position(|listed| *listed == step.call)
+                .ok_or_else(refused)?;
+            out.push(Step {
+                entry: alloc::format!("{prefix}_{at}_{}", step.suffix),
+                node: at as u32,
+                call: index as u32,
+                rung: step.rung,
+                selector: step.selector,
             });
         }
-        step_op(&mut source, &mut steps, prefix, plan, at, op.tag);
     }
-    Ok(Stepwise { source, steps })
+    Ok(Stepwise { steps: out })
 }
 
 #[cfg(test)]
@@ -774,7 +794,10 @@ mod tests {
 
 #[cfg(test)]
 mod stepwise_tests {
-    use super::{ENTRY_MARKER, RUNTIME, Refused, WORKGROUP, emit_launch_stage, emit_launch_steps};
+    use super::{
+        ENTRY_MARKER, RUNTIME, Refused, Stepwise, WORKGROUP, emit_launch_stage, emit_launch_steps,
+        spelled, step_calls, step_module,
+    };
     use crate::codegen::launch::{LaunchOp, LaunchPlanValue, LaunchStagePlan};
     use crate::plan::Dimension;
     use alloc::format;
@@ -831,6 +854,68 @@ mod stepwise_tests {
             .collect()
     }
 
+    /// What `many`'s steps run, each with its node and rung spelled in.
+    fn run(many: &Stepwise) -> String {
+        let calls = step_calls();
+        many.steps
+            .iter()
+            .map(|step| spelled(&calls[step.call as usize], step))
+            .collect()
+    }
+
+    /// Every op the guest IR carries is refused at admission (this backend
+    /// emits no WGSL for it), a boundary the host serves, or has a call of
+    /// the closed set for every step of every ladder it can take; where the
+    /// ops are named, none of those calls is the runtime's whole switch, a
+    /// driver's seconds for every op at once. The negative control: a set
+    /// short of any one call fails.
+    #[test]
+    fn the_closed_set_holds_every_step_of_every_op() {
+        use eta_ir::op::OP_TABLE;
+        let calls = super::calls();
+        assert_eq!(super::steps::unlisted(&calls, super::stepped), None);
+        let stepped = OP_TABLE
+            .iter()
+            .filter(|row| super::stepped(row.tag))
+            .count();
+        assert!(stepped > 40, "{stepped} ops take steps");
+        if super::specialize() {
+            for call in step_calls() {
+                assert!(
+                    !call.contains("ptir_step("),
+                    "`{}` is the whole switch",
+                    call.trim()
+                );
+            }
+        }
+        for gone in 0..calls.len() {
+            let mut short = calls.clone();
+            let call = short.remove(gone);
+            assert!(
+                super::steps::unlisted(&short, super::stepped).is_some(),
+                "the set without {call:?} still passes"
+            );
+        }
+    }
+
+    /// A sink call is the engine's: its node takes no dispatch.
+    #[test]
+    fn a_sink_call_takes_no_step() {
+        let stage = plan(
+            vec![op(tags::IOTA, 0, &[]), op(tags::SINK_CALL, 1, &[0])],
+            vec![
+                value(&[Dimension::Static(64)]),
+                value(&[Dimension::Static(64)]),
+            ],
+        );
+        let many = emit_launch_steps("s", &stage).expect("emits");
+        assert!(
+            many.steps.iter().all(|step| step.node != 1),
+            "{:?}",
+            many.steps
+        );
+    }
+
     #[test]
     fn wgsl_1_every_case() {
         the_two_shapes_sequence_the_same_calls();
@@ -860,12 +945,12 @@ mod stepwise_tests {
 
         assert_eq!(
             calls(&one),
-            calls(&many.source),
+            calls(&run(&many)),
             "the two shapes ask the runtime for different work"
         );
         assert_eq!(
             many.steps.len(),
-            calls(&many.source).len(),
+            calls(&run(&many)).len(),
             "every step is one dispatch of one call"
         );
     }
@@ -900,11 +985,14 @@ mod stepwise_tests {
             ],
         );
         let many = emit_launch_steps("s", &stage).expect("emits");
-        let emitted = &many.source[RUNTIME.len()..];
-        assert!(
-            !emitted.contains("Barrier("),
-            "a stepwise entry point must not pretend a barrier orders the grid"
-        );
+        let calls = step_calls();
+        for step in &many.steps {
+            let module = step_module("s", &calls[step.call as usize]);
+            assert!(
+                !module[RUNTIME.len()..].contains("Barrier("),
+                "a stepwise entry point must not pretend a barrier orders the grid"
+            );
+        }
         assert!(
             emit_launch_stage("whole", &stage)
                 .expect("emits")
@@ -919,7 +1007,8 @@ mod stepwise_tests {
             vec![value(&[Dimension::Static(64)])],
         );
         let many = emit_launch_steps("s", &stage).expect("emits");
-        let emitted = &many.source[RUNTIME.len()..];
+        let module = step_module("s", &step_calls()[many.steps[0].call as usize]);
+        let emitted = &module[RUNTIME.len()..];
         assert!(emitted.contains("global_invocation_id"));
         assert!(emitted.contains("num_workgroups"));
         assert!(emitted.contains("tid = gid.x;"));
@@ -948,7 +1037,7 @@ mod stepwise_tests {
         let one = emit_launch_stage("whole", &stage).expect("emits");
         let many = emit_launch_steps("s", &stage).expect("emits");
         let one_body = one.split(ENTRY_MARKER).nth(1).unwrap();
-        let many_body = many.source.split(ENTRY_MARKER).nth(1).unwrap();
+        let many_body = run(&many);
         assert!(
             !one_body.contains("(1u)") && !one_body.contains("(1u,"),
             "the reshape reads no bytes"
@@ -958,7 +1047,7 @@ mod stepwise_tests {
             many.steps.iter().all(|step| step.node != 1),
             "an elided node gets no dispatch of its own"
         );
-        assert_eq!(calls(&one), calls(&many.source));
+        assert_eq!(calls(&one), calls(&run(&many)));
     }
 
     fn a_stepwise_prefix_must_be_an_identifier() {
@@ -1063,7 +1152,7 @@ mod sort_bound_tests {
 
 #[cfg(test)]
 mod select_tests {
-    use super::{RUNTIME, SELECT_WORDS, emit_launch_steps};
+    use super::{RUNTIME, SELECT_WORDS, emit_launch_steps, spelled, step_calls};
     use crate::codegen::launch::{LaunchOp, LaunchPlanValue, LaunchStagePlan};
     use crate::plan::Dimension;
     use alloc::string::String;
@@ -1123,7 +1212,13 @@ mod select_tests {
         );
         assert_eq!(steps[12], "seed");
         assert_eq!(steps.last().map(String::as_str), Some("pack"));
-        let source = emit_launch_steps("main", &pivot(1, &ROW)).unwrap().source;
+        let calls = step_calls();
+        let source: String = emit_launch_steps("main", &pivot(1, &ROW))
+            .unwrap()
+            .steps
+            .iter()
+            .map(|step| spelled(&calls[step.call as usize], step))
+            .collect();
         assert!(
             source.contains("if (sel_ladder_idle()) { return; }\n  ptir_sort_seed(0u);"),
             "the ladder runs only for a row the select handed over"

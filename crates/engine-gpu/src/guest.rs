@@ -65,7 +65,7 @@ impl std::fmt::Display for Refused {
                 write!(f, "stage {stage} has no emitted WGSL: {why}")
             }
             Self::Lowering { stage, why } => {
-                write!(f, "stage {stage}'s emitted WGSL did not lower: {why}")
+                write!(f, "step call {stage}'s WGSL did not lower: {why}")
             }
             Self::Scratch { stage, value, why } => {
                 write!(
@@ -160,39 +160,30 @@ pub fn step_source(stage: usize, plan: &LaunchStagePlan) -> Result<wgsl::Stepwis
     })
 }
 
-pub struct Compiled<L: Lower> {
-    stages: Vec<Lowered<L::Code>>,
-}
-
-pub struct Lowered<C> {
-    pub code: C,
-
-    pub entries: Vec<String>,
+/// A stage's dispatches, in order: each a call of the closed set
+/// ([`wgsl::step_calls`]) at its node, rung and selector.
+#[derive(Clone, Debug)]
+pub struct Lowered {
+    pub steps: Vec<wgsl::Step>,
 
     pub strides_the_grid: bool,
 }
 
-impl<L: Lower> std::fmt::Debug for Compiled<L> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Compiled")
-            .field("stages", &self.stages.len())
-            .field(
-                "dispatches",
-                &self.stages.iter().map(|s| s.entries.len()).sum::<usize>(),
-            )
-            .finish()
-    }
+/// What a program's stages dispatch. No stage holds code of its own: every
+/// call runs on one of the pipelines a backend built at load
+/// ([`step_calls`]).
+#[derive(Debug)]
+pub struct Compiled {
+    stages: Vec<Lowered>,
 }
 
-impl<L: Lower> Compiled<L> {
-    pub fn of(package: &LaunchPackage) -> Result<Compiled<L>, Refused> {
+impl Compiled {
+    pub fn of(package: &LaunchPackage) -> Result<Compiled, Refused> {
         scratch_holds_the_hosts_values(package)?;
         let mut stages = Vec::with_capacity(package.plans.len());
         for (at, plan) in package.plans.iter().enumerate() {
-            let stepwise = step_source(at, plan)?;
             stages.push(Lowered {
-                code: L::lower(at, stepwise.source)?,
-                entries: stepwise.steps.into_iter().map(|step| step.entry).collect(),
+                steps: step_source(at, plan)?.steps,
                 strides_the_grid: true,
             });
         }
@@ -200,12 +191,12 @@ impl<L: Lower> Compiled<L> {
     }
 
     #[must_use]
-    pub fn stage(&self, at: usize) -> Option<&Lowered<L::Code>> {
+    pub fn stage(&self, at: usize) -> Option<&Lowered> {
         self.stages.get(at)
     }
 
     #[must_use]
-    pub fn all(&self) -> &[Lowered<L::Code>] {
+    pub fn all(&self) -> &[Lowered] {
         &self.stages
     }
 
@@ -220,14 +211,30 @@ impl<L: Lower> Compiled<L> {
     }
 }
 
-pub struct Forms<L: Lower> {
-    compiled: HashMap<ProgramId, Arc<Compiled<L>>>,
+/// How many calls a guest stage can dispatch ([`wgsl::step_calls`]): the
+/// pipelines a backend builds before it serves, so a program registered
+/// while serving builds none.
+#[must_use]
+pub fn step_calls() -> usize {
+    wgsl::step_calls().len()
+}
+
+/// Call `call`'s module, with its one entry point [`ENTRY`].
+#[must_use]
+pub fn step_module(call: usize) -> Option<String> {
+    wgsl::step_calls()
+        .get(call)
+        .map(|text| wgsl::step_module(ENTRY, text))
+}
+
+pub struct Forms {
+    compiled: HashMap<ProgramId, Arc<Compiled>>,
 
     refused: HashMap<ProgramId, Refused>,
 }
 
-impl<L: Lower> Default for Forms<L> {
-    fn default() -> Forms<L> {
+impl Default for Forms {
+    fn default() -> Forms {
         Forms {
             compiled: HashMap::new(),
             refused: HashMap::new(),
@@ -235,7 +242,7 @@ impl<L: Lower> Default for Forms<L> {
     }
 }
 
-impl<L: Lower> Forms<L> {
+impl Forms {
     pub fn admit(&mut self, program: ProgramId, package: &LaunchPackage) -> bool {
         match Compiled::of(package) {
             Ok(compiled) => {
@@ -250,7 +257,7 @@ impl<L: Lower> Forms<L> {
     }
 
     #[must_use]
-    pub fn get(&self, program: ProgramId) -> Option<&Arc<Compiled<L>>> {
+    pub fn get(&self, program: ProgramId) -> Option<&Arc<Compiled>> {
         self.compiled.get(&program)
     }
 

@@ -549,7 +549,7 @@ fn an_instance_in_pool_slots_fires_through_moves() {
         bound
             .engine
             .live()
-            .tallied(engine::live::Tally::Unrecorded),
+            .tallied(engine::live::Tally::BuiltAfterReady),
         0,
         "a fire through pool slots and their moves built a pipeline the load did not"
     );
