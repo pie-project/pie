@@ -15,6 +15,7 @@ pub mod chip;
 pub mod comm;
 pub mod device;
 mod dispatch;
+pub mod dissect;
 pub mod ep;
 mod error;
 pub mod experts;

@@ -223,7 +223,7 @@ fn tune_wgpu(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, 
 #[cfg(feature = "engine-cuda")]
 fn tune_cuda(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String> {
     let models = pick_models("cuda", req)?;
-    let out = engine_cuda::tune::run(Some(req.profiles), &models, say)?;
+    let out = engine_cuda::tune::run(Some(req.profiles), &models, req.check_estimate, say)?;
     Ok(tuned!(out, wrong: Vec::new()))
 }
 
