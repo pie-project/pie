@@ -489,6 +489,7 @@ impl Shell {
             crate::chip::resolve(device.kind(), boot.device.profiles.as_deref());
         if !device.kind().is_empty() {
             crate::chip::SHELF.tell_untuned(device.kind(), &chip_report);
+            crate::chip::tell_unmeasured(device.kind(), &chip, &chip_report);
         }
         let tpu = crate::chip::Tpu::of(device.kind());
         let headroom = boot.device.headroom.unwrap_or_else(|| tpu.headroom());
