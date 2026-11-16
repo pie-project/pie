@@ -136,6 +136,8 @@ pub struct PoolSlabs {
 #[derive(Clone, Debug)]
 pub struct FireTables {
     pub mask_indptr: Option<Tensor>,
+    /// Per lane its mask word: its committed boundary and its wide bit.
+    pub mask_origin: Option<Tensor>,
 
     pub pool_state: Vec<(u32, PoolSlabs)>,
 
@@ -1536,6 +1538,18 @@ impl<'c> Run<'c> {
             })
     }
 
+    /// Each lane's mask word, cut to the window's lanes as `mask_indptr` is.
+    pub(crate) fn mask_origin(&self) -> Option<Tensor> {
+        if self.plane_base() {
+            return self.fire.tables.mask_origin;
+        }
+        let span = self.window().span();
+        self.fire
+            .tables
+            .mask_origin
+            .map(|table| skip(table, span.lane_offset, span.lanes))
+    }
+
     pub(crate) fn mask_indptr(&self) -> Option<Tensor> {
         if self.plane_base() {
             return self.fire.tables.mask_indptr;
@@ -2683,7 +2697,7 @@ impl<'c> Run<'c> {
                     p.total_tokens,
                     p.causal,
                     p.graph_capturable,
-                    p.mask_indptr
+                    (p.mask_indptr, p.mask_origin)
                 ),
                 StructSlot::Mla(p) => write!(
                     sink,
