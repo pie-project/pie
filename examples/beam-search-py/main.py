@@ -4,7 +4,8 @@
 The chat-templated prompt (or `prompt_tokens`) is prefilled once; that fire
 picks the first `beams` tokens, and the beams then share one working set,
 each reading the pool up to its own slot under a mask that admits its own
-ancestry.
+ancestry. The prompt is folded, so it is committed and no mask speaks of it:
+a mask's column `c` is pool slot `n + c`.
 """
 
 from inferlet import chat, model
@@ -129,8 +130,9 @@ async def main(input: dict) -> str:
         pool = [ws] * B
 
         # The first decode writes beam i's token at slot n + i; it sees the prompt and its own cell.
-        init_mask = [p < n or p == n + lane for lane in range(B) for p in range(pool_len)]
-        mask = Channel.from_shaped([B, pool_len], init_mask)
+        cells = pool_len - n
+        init_mask = [c == lane for lane in range(B) for c in range(cells)]
+        mask = Channel.from_shaped([B, cells], init_mask)
         slots = Channel.from_(range(n, n + B), dtype.u32)
         # A beam's RoPE position is its depth in the sequence, not its pool slot.
         pos = Channel.from_([n] * B, dtype.u32)
@@ -148,8 +150,9 @@ async def main(input: dict) -> str:
             wpos = base_b + iota(B)
 
             inherited = gather(mask.take(), parent)
-            col = broadcast(reshape(iota(pool_len), [1, pool_len]), [B, pool_len])
-            wpos_b = broadcast(reshape(wpos, [B, 1]), [B, pool_len])
+            # Column `c` is slot `n + c`.
+            col = broadcast(reshape(iota(cells) + n, [1, cells]), [B, cells])
+            wpos_b = broadcast(reshape(wpos, [B, 1]), [B, cells])
             newpos = eq(col, wpos_b)
             mask.put(or_(inherited, newpos))
 
