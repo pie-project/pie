@@ -16,8 +16,11 @@ the simulator in 0.9M cycles, 81x fewer, 50.1 dB from diffusers; klein's 1024² 
 0.13 s priced; klein end to end 6.5 s, §4.1), M1j (flux2-mini on the CS-3: the denoise loop
 at 1.34M cycles a step, the simulator's numerics; `pie run text-to-media` on the system, 48.4 dB
 from diffusers, §4.1), M1k (the PE clock is 750 MHz; a step's wall split; a reading's first
-launch no longer waits on its static arrays, §4.1) and M3 (the decode
-layouts as points of the Floorplan, §2.5). ARCHITECTURE.md is what runs for decode.
+launch no longer waits on its static arrays, §4.1), M2e (the rotation tables a level at a time,
+the K / V columns folded over two columns a head, the cost model held to the simulator unit by
+unit: a row's round trip through a unit; klein's step 1,326M -> 1,081M cycles, 1.77 s -> 1.44 s,
+end to end 7.54 s -> 6.21 s at 750 MHz; the roofline 10.9M cycles a step, §4.1) and M3 (the
+decode layouts as points of the Floorplan, §2.5). ARCHITECTURE.md is what runs for decode.
 
 **Goal.** A `.poem` model the compiler has not seen runs on the wafer with no hand code. The
 primary acceptance target is `models/flux_2.poem`: a text encoder, a DiT denoiser run over whole
@@ -1660,6 +1663,177 @@ milestone's tail.
   - Left: the text step's 58-110 ms past its 0.77 ms on the wafer (the host side of a reading's
     first fire); the stamps read back every step (0.2 ms, 8% of the 16-row step) only where the
     cycles are wanted; the rows' copies (0.38 ms for 2k words).
+
+- **M2e** (klein's denoise step: the rotation tables a level at a time, the K / V columns folded,
+  the cost model held to the simulator unit by unit; 1,326M -> 1,081M cycles a step priced, 1.77 s
+  -> 1.44 s at the PE's 750 MHz (M1k), end to end 7.54 s -> 6.21 s; what the stream regime's
+  floor is and what reaches the roofline). Seconds here are at 750 MHz.
+  - **The roofline.** A klein step at 1024² (4,608 rows: 512 text, 4,096 image) is 17.4T MACs
+    (34.8 TFLOP): the blocks' matmuls 14.1T (a double block's side runs its own weights over its
+    own rows: 122.7M weights x 4,608 rows a block, 2.83T over the five; the 20 single blocks
+    11.3T), the joint attention 3.26T (25 blocks x 24 heads x 4,608² x 256). The wafer's 883k
+    PEs at P1's measured 0.55 cycles a MAC (16-bit operands, f32 accumulation: the DSD's write
+    port) do 1.6M MACs a cycle: **10.9M cycles, 14.5 ms a step**. The weights (3.7B, 7.4 GB, 17%
+    of the SRAM) are resident, so no memory bandwidth enters, and a row's 3,072 values and a
+    column's partial sums a row are far under a link's wavelet a cycle.
+  - **Where the time goes.** The barrier serialises the blocks: a step is about 25 blocks x
+    4,608 rows x one unit's pace a row, and a unit holds a 30th of the weight PEs, so about two
+    units (34k weight PEs) and a block's K / V PEs work at a time. M2b's 1,326M cycles were
+    priced as each unit's busiest PE (its column roots' steps summed); the simulator (below) shows
+    what a unit's pace is: **a row's round trip**. A unit's weight PEs and roots finish a row
+    before they take the next (their chains synchronous, `ops/schain.csl`), so a row costs its
+    path through the unit's steps, CX region, matvec, column region, matvec back, until what
+    returns to its row roots, or one PE's own work a row where that is longer.
+
+    | a row of (klein, 1024²) | M2b | M2e |
+    |---|---|---|
+    | a head root's q / k norms and four-axis rotation (24 roots, chunk 128) | 8,793 | 5,216 |
+    | a query (P7, 47 -> 24 entries a PE) | 8,197 | 4,573 |
+    | the SwiGLU on the rest roots | 1,940 (15 helpers; the double blocks' text side 10,921, none) | 1,714 (23 helpers, every unit) |
+    | a single block before / after the barrier | 11,240 / 8,197 (M2b's price) | 8,164 / 5,484 |
+    | a double block's image side before / after | 9,301 / 10,137 | 5,724 / 13,664 |
+    | **the step** (each program priced by M2e's model) | **1,325.9M, 1.77 s** | **1,081.4M, 1.44 s** |
+
+    A single block's row before the barrier is now its round trip (the CX roots' layernorm and
+    modulation 748, the in_proj's busiest column 3,802, the SwiGLU 1,714, the MLP's out matvec
+    1,901); a double block's after it, two (the query, out_proj, the gated residual, layernorm
+    and modulation at the CX roots, the MLP in, the SwiGLU, the MLP out).
+  - **The rotation tables a level at a time** (`ops/srope.csl`, stream only; decode's `rope.csl`
+    unchanged). P5's cos / sin of a position are the product of LV levels of its digits' table
+    rotations, recomputed whole every row. srope now keeps each level's product and each call's
+    last position: a row recomputes only the levels from the highest digit that changed, from
+    the kept product above it, by the same products in the same order, so the cos / sin are bit
+    for bit the whole computation's; a position that holds costs one compare. Rows whose
+    positions advance by one a row (a raster of cells, a token index) recompute about one level
+    of one axis a row; flux's image rows hold their t and l axes, its text rows all but l.
+    `prims/reg` (the mini's per-head RMS norm and four-axis rotation, nodes 69, 70: 2 roots x
+    128, LV 4, BITS 3, 64 rows, on the simulator):
+
+    | srope | positions | cycles a row of `row()` | vs interp |
+    |---|---|---|---|
+    | M2a's (every level every row) | the step's | 7,011 | 9.27e-7 |
+    | a level at a time | the step's (one axis advancing) | **3,435** | 9.27e-7 (the same words) |
+    | a level at a time | every position held | 2,821 | |
+    | a level at a time | shuffled (every level of every axis a row) | 7,663 | |
+
+    The cost model: a call `ROT_CALL` = 170, a row whose position moved `ROT_CHANGE` = 429 and
+    `ROT_LEVEL` = 152 a level, `2^B / (2^B - 1)` levels a row at `B` bits a digit (one axis
+    advancing a step a row), once a row however many heads a root's region runs over; fitted to
+    the three rows above. (The mini's own tables are two levels deep, so its step gains little:
+    below.)
+  - **K / V columns over several columns a head** (`floorplan::stream`, `build::KV_SPLITS`).
+    A K / V column was one PE wide (99 PEs a head at klein's 4,608 rows, 47 entries each);
+    M2b's fold over two columns was refused, a head root's link to a column two wide crossing the
+    other heads' columns (a 48-class clique, past the palette's 21 colours). Now at `sub > 1`:
+    - a block's first unit lays its head columns `sub` apart (`StreamUnit::col`: head `h` at
+      `h sub`, the rest roots in the columns between and after; its row chains run west to
+      east, and its weight PEs' row-chain roles, a column-side matvec's leaf and the row store's,
+      read that order: `emit::stream`), so each head's K / V column is a `sub`-wide snake
+      straight below its head root;
+    - every K / V root sits on one row below the later units' turns and the helpers
+      (`Stream::turns`, `KvColumn::root`): the first unit's links go straight down, a later
+      unit's turn west on its head's row and down the head root's column (`KvColumn::link`); no
+      link passes a K / V column, and the links meet as before (a later unit's turn crosses the
+      first unit's later heads' links: a bipartite graph);
+    - a block's first unit takes helpers too (the later units' turns pass over them, not over
+      K / V columns).
+
+    The search tries `sub` 2 and 3 at `1 / sub` of the entries a PE (the band's rows as before,
+    `sub` times the PEs), with 0 to 23 helpers: klein takes `sub = 2` (198 PEs a head, 24
+    entries each: a query 4,573 cycles), 23 helpers, 741 x 1152 PEs.
+  - **The cost model, held to the simulator** (`cost::stream::time_at`). A phase's pace is the
+    longest of: a row's path through its steps (each value's time in the row, a step starting
+    when what it reads has landed, a matvec its busiest column's tile; a row waits on what comes
+    back to its row roots, not on a dead end such as a store), each column root's own steps a
+    row (the head roots' and the rest roots' apart), the row roots' regions, the busiest weight
+    column; an f32 input's matvec (`X32`) two passes. The simulator's stamps (each root kernel
+    stamping the end of each schedule segment, a local instrumentation, not committed) on
+    flux2-mini's re-launched step (16 + 16 rows, K / V over 2 columns, no helpers), a row:
+
+    | unit | measured | priced |
+    |---|---|---|
+    | double blocks after the barrier, image side | 11.6k | 11,957 |
+    | double blocks after the barrier, text side | 12.5k - 13.1k | 11,957 |
+    | single blocks before the barrier | about 10.3k | 10,143 |
+    | single blocks after the barrier | 2.05k - 2.3k | 2,919 |
+    | the entries (their f32 host rows) | 5.3k - 8.2k | 1,126 - 1,690 |
+
+    The entries are short (their fill, 0.1-0.15M cycles of the mini's step, is not priced);
+    every unit after them within 5-10%. M2b's sum and M2e's first price (each unit at its
+    busiest root, 0.73M for the mini) both miss the round trip: M2b's matched the mini only
+    because its head roots' sum stood in for it.
+  - **On the simulator** (flux2-mini, 16 + 16 rows, the 2-step loop from the engine's inputs,
+    `wafer-bench --reading --steps 2`; rel L2 / cosine against engine-cpu):
+
+    | program | step 0 velocity | step 1 velocity | latent after 2 | step 1 cycles | priced |
+    |---|---|---|---|---|---|
+    | M1g's (bcad836bb, py 16, 7 helpers) | 4.853e-3 / 0.9999882 | 6.358e-3 / 0.9999798 | 3.861e-3 / 0.9999925 | 1,265,798 | 1.21M (M2b) |
+    | the same pins, srope a level at a time | the same digits | the same digits | the same digits | **1,226,968** | 1.079M |
+    | K / V over 2 columns (no helpers: before `turns`) | the same digits | the same digits | the same digits | 1,426,064 | 1.319M |
+    | K / V over 2 columns, 7 helpers (M2e's) | the same digits | the same digits | the same digits | **1,126,817** | 0.961M |
+
+    The velocities and latents agree with M1g's to every printed digit: the tables are bit for
+    bit, and the fold moves PEs, not arithmetic. The mini's tables are two levels deep and its
+    head roots off its round trip, so the tables alone gain 3%; at 16 + 16 rows its K / V PEs hold
+    4 entries, so the fold's own gain there is the helpers it lets the first units take (the text
+    side's SwiGLU after the barrier): 1.27M -> 1.13M cycles a step, 11%. Without the corridor
+    below the helpers (`turns`) a fold of the mini's 2 heads left no room for them (1.43M). Each
+    run is the priced step plus the entries' unpriced fill (0.12-0.17M).
+  - **klein-4B at 1024²** (the search's choice: `py 256`, tile 12,288, K / V over 2 columns a
+    head, 23 helpers): **1,081.4M cycles, 1.442 s a step** (M2b's program under the same model
+    1,325.9M, 1.768 s). By lever: the tables a level at a time 1,325.9M -> 1,292.5M; the K / V
+    fold, with helpers under the first units, -> 1,106.4M; 23 helpers -> 1,081.4M. **It links
+    for the system fabric** (`cslc --fabric-dims=762,1172`): 1,264 ELFs, 965 s, 36 GB at its
+    peak, 821 MB, rc 0.
+  - **Text** (klein's text reading at 512 tokens, the same srope and fold): 239.4M -> 218.0M
+    cycles, 0.319 -> 0.291 s (723 x 559 PEs; M2c's program priced by M2e's model 239.4M, by its
+    own 240.9M). It links for the system fabric: 387 ELFs, 603 s, 16 GB, 382 MB, rc 0.
+  - **klein end to end at 1024²** (priced; one CS-3, readings in turn):
+
+    | reading | footprint | M2d (repriced at 750 MHz) | M2e |
+    |---|---|---|---|
+    | text (512 tokens) | 723 x 559 PEs | 239.4M, 0.32 s | 218.0M, 0.29 s |
+    | denoise, 4 steps | 741 x 1152 PEs | 4 x 1,325.9M, 7.07 s | 4 x 1,081.4M, 5.77 s |
+    | VAE decode | 514 x 1029 PEs (unchanged) | 113.2M, 0.15 s | 0.15 s |
+    | **total** | | **7.54 s** | **6.21 s** |
+
+  - **What is left, in order of what it buys** (klein, a step):
+    - **Rows in flight in a unit** (1.44 s -> about 0.91 s, the step with every unit at its
+      busiest PE, M2e's first price: 680M). A unit's PEs take row `t + 1` before row `t`'s round
+      trip returns: a software pipeline of each phase at its round trips (a weight PE's matvecs
+      of row `t` and the second half of row `t - 1`'s; a column root receiving row `t`, casting
+      row `t - 1`'s result, then running row `t`'s region; the CX roots a region ahead), every PE
+      in one order of its chains' messages so the synchronous sends still meet. An emitter
+      change (each kernel's `early` / `late` cut into stages) and a deadlock question for the
+      simulator; not started.
+    - **The stream regime's floor**: with rows in flight, every unit's pace is its weight PEs'
+      (a rest column's 10,368 elements at 0.55: 5.7k) or its head roots' (5.7k): 25 x 4,608 x
+      5.7k = 657M, 0.88 s, 60x the roofline. One unit (a 30th of the weight PEs) works a row at
+      a time, and the fabric is full (741 x 1152 of 755 x 1170): no row replicas, no wider units.
+    - **A tiled regime for the DiT** (the roofline's way): every PE on the current layer, the
+      step's rows and channels both cut over the fabric (a SUMMA-style GEMM: PE `(r, c)` holds
+      `Y[T / R rows, N / C cols]`, the activations' panels multicast along PE rows, the weights
+      stationary a column of PEs and multicast down it), norms as row all-reduces, the attention
+      two such GEMMs a head with an online softmax. At `R x C` = 768 x 1,150 a single block's
+      in_proj is 6 rows x 24 columns x 3,072 MACs a PE, 243k cycles, its inputs (92k values a
+      PE) at a wavelet a cycle under that; a PE's share of a step is 19.7M MACs, 10.8M cycles,
+      about 15 ms with the norms and exchanges on top. M2d's tiled regime is its VAE form (a
+      pixel's channels whole at a PE, the weights from a tape); the DiT needs the channel split
+      M2d left open.
+    - The entries' fill priced (their f32 host rows on the simulator: 5-8k cycles a row); the
+      head roots' rotation by a signed sine (three DSD ops of a head's seven) once the round trip
+      is gone; the 64-row and klein programs on the simulator (only 16 + 16 ran); klein on a
+      system.
+  - Decode is unchanged: plan + build `diff -r` identical against d79d38e33's wafer-compile for
+    qwen35-d0.8b, qwen35-d9b, llama31-8b, gptoss-20b, gemma4-e2b and tiny t08. flux2-mini's and
+    klein's VAE programs (rows and tiled) byte-identical; flux2-mini's denoise at M1g's pins the
+    same files bar their price (`stream.json`). The programs the search picks for flux2-mini's
+    text, denoise and the GQA miniature's text move under the new prices (folds, `py 32`).
+    flux2-mini's text reading as compile on load now builds it (10 x 62 PEs), on the simulator
+    through the engine (`flux_2_minis_text_on_the_fabric`, co-resident with the denoise and VAE
+    programs, linked on load): 7.860e-3 / 0.99996911 against engine-cpu, 8.735e-3 / 0.99996185
+    against transformers' `Qwen3ForCausalLM`, M1h's digits; 1.43M cycles (the first launch),
+    70 min of simulator.
 
 ## 5. Risks
 
