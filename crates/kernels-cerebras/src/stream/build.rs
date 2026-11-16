@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use poem_compiler::spatial::layer::stream::Stage;
+use poem_compiler::spatial::layer::stream::{Stage, StreamProgram};
 use poem_ir::{Def, Linear, Operands, Operation, Trace, ValueId};
 
 use super::StreamShape;
@@ -457,29 +457,27 @@ pub fn program_py(
     })
 }
 
-/// [`program_upto`] at `py` row roots a unit and weight tiles of at most `tile` words, within
-/// `bounds` (`spill`: every unit's rows held over the barrier in its row store).
-#[allow(clippy::too_many_arguments)]
-pub fn program_at(
+/// What a stream reading lowers to before any placement: the host's nodes, each class's rows
+/// and first row in the step, and the units (the lane prologue, then each stage's sides) with
+/// the class word each is read for, and the attending units of each block. Every regime that
+/// runs a stream program reads it (the row stream's units, [`program_at`]; the GEMM regime's
+/// whole-fabric ops, `stream::gemm`).
+pub struct Lowered {
+    pub host: BTreeSet<u32>,
+    pub class_rows: Vec<(u32, u32)>,
+    pub units: Vec<(Unit, u64)>,
+    pub blocks: Vec<Vec<usize>>,
+}
+
+/// [`Lowered`] of `prog` (`trace`'s stream program), its first `upto` stages (the last's units
+/// leaving their rows to the host), `taps` also read out.
+pub fn lower_units(
     trace: &Trace,
-    shape: StreamShape,
-    round16: bool,
+    prog: &StreamProgram,
     upto: Option<usize>,
     taps: &[u32],
-    py: u32,
-    tile: u32,
-    split: KvSplit,
-    spill: bool,
-    bounds: Bounds,
-) -> R<Program> {
-    let prog = &shape.program;
+) -> R<Lowered> {
     let name = &trace.name;
-    if py == 0 || !prog.hidden.is_multiple_of(py) {
-        return Err(format!(
-            "{name}: a hidden width of {} cuts over no {py} rows",
-            prog.hidden
-        ));
-    }
     // the host's nodes: the stream program's (its permutations and tables), and the lane ops it
     // computes from its own inputs, the checkpoint's constants and its other lane ops alone (a
     // sinusoid of the timestep, the timestep's affine map before it), a matvec aside
@@ -601,6 +599,44 @@ pub fn program_at(
         }
     }
 
+    Ok(Lowered {
+        host,
+        class_rows,
+        units,
+        blocks,
+    })
+}
+
+/// [`program_upto`] at `py` row roots a unit and weight tiles of at most `tile` words, within
+/// `bounds` (`spill`: every unit's rows held over the barrier in its row store).
+#[allow(clippy::too_many_arguments)]
+pub fn program_at(
+    trace: &Trace,
+    shape: StreamShape,
+    round16: bool,
+    upto: Option<usize>,
+    taps: &[u32],
+    py: u32,
+    tile: u32,
+    split: KvSplit,
+    spill: bool,
+    bounds: Bounds,
+) -> R<Program> {
+    let prog = &shape.program;
+    let name = &trace.name;
+    if py == 0 || !prog.hidden.is_multiple_of(py) {
+        return Err(format!(
+            "{name}: a hidden width of {} cuts over no {py} rows",
+            prog.hidden
+        ));
+    }
+    let Lowered {
+        class_rows,
+        units,
+        blocks,
+        ..
+    } = lower_units(trace, prog, upto, taps)?;
+
     // layouts and regions
     let mut built: Vec<Built> = Vec::new();
     for (u, word) in units {
@@ -662,6 +698,7 @@ pub fn program_at(
                     round16,
                     rope_lv: lv.max(1),
                     rope_bits: 3,
+                    straddle: false,
                 },
             )
             .map_err(|e| format!("{}: step {i}: {e}", u.name))?;
@@ -717,6 +754,7 @@ pub fn program_at(
                             round16,
                             rope_lv: lv.max(1),
                             rope_bits: 3,
+                            straddle: false,
                         },
                     )
                     .map_err(|e| format!("{}: step {i} (helpers): {e}", u.name))?;

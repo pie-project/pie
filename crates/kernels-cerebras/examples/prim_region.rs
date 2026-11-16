@@ -173,6 +173,7 @@ fn main() {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(4),
             rope_bits: 3,
+            straddle: false,
         },
     )
     .unwrap_or_else(|e| panic!("{e}"));

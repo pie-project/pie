@@ -55,6 +55,9 @@ pub struct Place {
     /// The rotation tables' digits: positions below `2^(lv bits)`.
     pub rope_lv: u32,
     pub rope_bits: u32,
+    /// A head may be wider than the chunk (cut over whole chunks of consecutive roots): its sums
+    /// all-reduced over those roots (`seg.head_reduce`). Otherwise such a head is refused.
+    pub straddle: bool,
 }
 
 /// A static table the host writes into each root: `of_chunk[r]` root `r`'s words.
@@ -76,6 +79,9 @@ pub struct Printed {
     pub tables: Vec<Table>,
     /// Segment all-reduces a row.
     pub all_reduces: u32,
+    /// All-reduces a row of a head's sums over the roots its head straddles (`seg.head_reduce`:
+    /// a head wider than the chunk, cut over consecutive roots).
+    pub head_reduces: u32,
 }
 
 /// Why a region does not print.
@@ -123,6 +129,7 @@ struct Printer<'a> {
     decls: String,
     body: String,
     all_reduces: u32,
+    head_reduces: u32,
     /// Cos / sin rows already made from an angle: angle -> (cos buf, sin buf).
     trig: BTreeMap<ValueId, (usize, usize)>,
     rope: Option<RopeUse>,
@@ -192,6 +199,7 @@ pub fn print(region: &Region, place: &Place) -> R<Printed> {
         decls: String::new(),
         body: String::new(),
         all_reduces: 0,
+        head_reduces: 0,
         trig: BTreeMap::new(),
         rope: None,
         angles: None,
@@ -250,13 +258,14 @@ pub fn print(region: &Region, place: &Place) -> R<Printed> {
         let _ = writeln!(p.body, "  @fmovs(OUT{k}, {src});");
         results.push(name);
     }
-    let (tables, all_reduces) = (p.tables.clone(), p.all_reduces);
+    let (tables, all_reduces, head_reduces) = (p.tables.clone(), p.all_reduces, p.head_reduces);
     Ok(Printed {
         csl: p.finish(),
         params,
         results,
         tables,
         all_reduces,
+        head_reduces,
     })
 }
 
@@ -518,10 +527,13 @@ impl Printer<'_> {
 
     fn head(&mut self, v: ValueId, op: &Op, k: usize, size: u32) -> R<()> {
         let c = self.c();
-        if !c.is_multiple_of(size) {
+        // a head wider than the chunk, cut over whole chunks: one head value a root, its sums
+        // all-reduced over the roots the head straddles
+        let straddle = self.place.straddle && size > c && size.is_multiple_of(c);
+        if !c.is_multiple_of(size) && !straddle {
             return refuse(format!("op {k}: heads of {size} straddle chunks of {c}"));
         }
-        let nh = c / size;
+        let (nh, size) = if straddle { (1, c) } else { (c / size, size) };
         // (`hd`: `h16` is the 16-bit scratch row)
         let name = format!("hd{v}");
         let _ = writeln!(self.decls, "var {name} = @zeros([{nh}]f32);");
@@ -533,6 +545,16 @@ impl Printer<'_> {
             }
         };
         let expr = match *op {
+            Op::ReduceHeads(Reduce::Sum, a, s) if straddle && s > size => {
+                let src = self.ptr_of(a)?;
+                self.sums = true;
+                self.head_reduces += 1;
+                let _ = writeln!(
+                    self.body,
+                    "  sred[0] = vsum({src}, 0, C);\n  seg.head_reduce(SRED, 1);"
+                );
+                "sred[0]".to_string()
+            }
             Op::ReduceHeads(Reduce::Sum, a, s) if s == size => {
                 let src = self.ptr_of(a)?;
                 self.sums = true;
@@ -1151,7 +1173,7 @@ impl Printer<'_> {
                 "var h16 = @zeros([C]@fp16());\nconst H16 = @get_dsd(mem1d_dsd, .{{ .tensor_access = |i|{{C}} -> h16[i] }});"
             );
         }
-        if self.place.roots > 1 && self.all_reduces > 0 {
+        if self.place.roots > 1 && self.all_reduces + self.head_reduces > 0 {
             let _ = writeln!(
                 s,
                 "var sred = @zeros([1]f32);\nconst SRED = @get_dsd(mem1d_dsd, .{{ .tensor_access = |i|{{1}} -> sred[i] }});"
@@ -1364,6 +1386,7 @@ mod tests {
                 round16: true,
                 rope_lv: 4,
                 rope_bits: 3,
+                straddle: false,
             };
             let p = print(reg, &place).unwrap_or_else(|e| panic!("node {at} ({name}): {e}"));
             if name == "elemwise.layernorm" {
@@ -1401,6 +1424,7 @@ mod tests {
             round16: false,
             rope_lv: 4,
             rope_bits: 3,
+            straddle: false,
         };
         let p = print(&region, &place).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(p.csl.matches("while (i < C)").count(), 2, "{}", p.csl);

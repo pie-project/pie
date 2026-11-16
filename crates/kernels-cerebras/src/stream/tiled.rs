@@ -708,10 +708,11 @@ fn print_regions(p: &mut TileProgram) -> R<()> {
                 round16: p.round16,
                 rope_lv: 1,
                 rope_bits: 3,
+                straddle: false,
             },
         )
         .map_err(|e| format!("{}: region {ri}: {e}", p.trace.name))?;
-        if !printed.tables.is_empty() || printed.all_reduces > 0 {
+        if !printed.tables.is_empty() || printed.all_reduces + printed.head_reduces > 0 {
             return Err(format!(
                 "{}: region {ri}: a region with tables or a row's reduction on a grid row",
                 p.trace.name
