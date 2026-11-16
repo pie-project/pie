@@ -2356,6 +2356,26 @@ are B rows, one a lane, each with its own position, pages and state.
 
 The sim checks run B = 4 with different prompts and positions a lane once B = 1 holds.
 
+**Built** (linked, not yet run on a fabric; the CS-3 request runs B = 1 and B = 4):
+- `compile_decode(trace, positions, lanes, ..)`: B rows a step. Each attention column's slots in
+  pages of `size` (a multiple of every column's rows, at least 64), one page more as the scratch an
+  idle row stores into; `ptab` (B x pages) and `rowp` (three words a row: lane slot, state slot,
+  position) on every decode PE. satt's PAGED mode stores a row at its lane's page and offset,
+  holds its q a row (not an entry each), and unmasks its lane's pages up to its position (and
+  from its window's first). host.json states the paging.
+- A recurrence's column holds a state a lane slot (sst / cy_sst SLOTS; its PEs as many again as
+  lanes), each row stepping its lane's slot, cleared at the row's position 0 (qwen35-d0.8b -l1 at
+  2 lanes links, 422 x 162).
+- The engine: a unit program over pages reports its columns' pages and page size as Pie's; a
+  fire's lanes run as rows B a launch (`UnitModel::rows`), each over its lane's page ids and state
+  slot, the lane slots' tables written when they change; greedy readers take the wafer's argmax.
+  The load compiles the lanes a launch by price (the cheapest a token of 1, 2, 4 .. up to the
+  budget's lanes). One sequence is lane slot 0.
+- Priced (0.6B -l2, 512 positions): B = 1 0.023M cycles a step, B = 4 0.081M (0.020M a token):
+  the slice's three units pipeline little.
+- Not yet: rows of a prefill piece mixed with decode rows are built (a lane's rows in order) but
+  untested; a program over a recurrence alone (no pages) serves Pie's lanes a sequence at a time.
+
 ## 5. Risks
 
 - **Numerics: f16.** The decode kernels hold IEEE f16 tiles and f16 activations, with f16
