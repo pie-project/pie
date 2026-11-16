@@ -2418,7 +2418,8 @@ fn kv_root_file(p: &Program, k: usize, ks: &place::KvSched) -> R<(String, String
 
 /// A decode program's paging (GENERIC.md G1.8): its K / V columns' slots in pages of `size`
 /// positions (a multiple of every column's rows, at least [`PAGE_MIN`]), `pages` of them a
-/// column (the cache's positions), `lanes` lane slots (a step's rows) each of at most `pages`.
+/// column (the cache's positions, and a scratch page last: an idle row's), `lanes` lane slots (a
+/// step's rows) each of at most `pages`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Paging {
     pub size: u32,
@@ -2451,7 +2452,8 @@ pub fn paging(p: &Program) -> Option<Paging> {
     let lanes = p.class_rows.iter().map(|c| c.0).sum::<u32>().max(1);
     Some(Paging {
         size,
-        pages: cache.div_ceil(size),
+        // (and the scratch an idle row stores into)
+        pages: cache.div_ceil(size) + 1,
         lanes,
     })
 }

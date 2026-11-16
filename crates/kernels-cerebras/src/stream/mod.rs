@@ -420,6 +420,17 @@ pub fn compile_decode(
         false,
         crate::floorplan::stream::Bounds::system(),
     )?;
+    // (a state column holds one lane's state yet)
+    if lanes > 1
+        && p.units
+            .iter()
+            .any(|b| b.unit.joint.is_some_and(|j| j.state.is_some()))
+    {
+        return Err(format!(
+            "{}: a recurrence's state column holds one lane's state, not {lanes}",
+            trace.name
+        ));
+    }
     let e = crate::emit::stream::emit(&p)?;
     std::fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
     for (name, text) in &e.files {
