@@ -954,22 +954,27 @@ __global__ __launch_bounds__(BV) void ssm_gdn_scan(
             sk[i] = kt[i];
         }
         __syncthreads();
+        // Every loop over the state runs all BK entries, those past K_d
+        // predicated off: a loop that breaks at K_d does not unroll, and the
+        // state it indexes is then kept in scratch.
         float kv = 0.f;
 #pragma unroll
         for (int i = 0; i < BK; ++i) {
-            if (i >= K_d) break;
-            const float decayed = to_f32(s[i]) * g;
-            if (!fused_decay) s[i] = from_f32<bf16>(decayed);
-            kv += decayed * sk[i];
+            if (i < K_d) {
+                const float decayed = to_f32(s[i]) * g;
+                if (!fused_decay) s[i] = from_f32<bf16>(decayed);
+                kv += decayed * sk[i];
+            }
         }
         const float delta = col ? (v[at * V_h * V_d + static_cast<long long>(h) * V_d + j] - kv) * b : 0.f;
         float o = 0.f;
 #pragma unroll
         for (int i = 0; i < BK; ++i) {
-            if (i >= K_d) break;
-            const float next = (fused_decay ? to_f32(s[i]) * g : to_f32(s[i])) + sk[i] * delta;
-            s[i] = from_f32<bf16>(next);
-            o += next * sq[i];
+            if (i < K_d) {
+                const float next = (fused_decay ? to_f32(s[i]) * g : to_f32(s[i])) + sk[i] * delta;
+                s[i] = from_f32<bf16>(next);
+                o += next * sq[i];
+            }
         }
         if (col) out[((sp.t0 + t + row0) * V_h + h) * V_d + j] = o;
         if (sn.e0 < sn.e1 && snap_rows[sn.e0] == t + 1) {
@@ -978,8 +983,7 @@ __global__ __launch_bounds__(BV) void ssm_gdn_scan(
             if (col && folds(write_state, mask, rl)) {
 #pragma unroll
                 for (int i = 0; i < BK; ++i) {
-                    if (i >= K_d) break;
-                    at[static_cast<long long>(i) * V_d + j] = s[i];
+                    if (i < K_d) at[static_cast<long long>(i) * V_d + j] = s[i];
                 }
             }
             ++sn.e0;
@@ -990,8 +994,7 @@ __global__ __launch_bounds__(BV) void ssm_gdn_scan(
     if (!col || !folds(write_state, mask, rl)) return;
 #pragma unroll
     for (int i = 0; i < BK; ++i) {
-        if (i >= K_d) break;
-        state[static_cast<long long>(i) * V_d + j] = s[i];
+        if (i < K_d) state[static_cast<long long>(i) * V_d + j] = s[i];
     }
 }
 
