@@ -571,8 +571,25 @@ fn qwen38_flash_next_mini_buffers_its_ngram_ids_as_an_rs_row_beside_the_others()
         assert_eq!(rs.planes.len(), 1);
         assert_eq!(rs.per_token(), 4);
         let runs = rs_runs(&recipe);
-        assert_eq!(runs.len(), 4, "{preset}: three delta layers and the ids");
+        assert_eq!(
+            runs.len(),
+            5,
+            "{preset}: three delta layers, the PLE conv and the ids"
+        );
         assert_eq!(recipe.rs.run(*id).unwrap().per_token, 4);
+        // The PLE conv commits only as a fold does: its input is an rs row of
+        // its own (`poem_compiler::rs::buffered_convs`, `Feeds::Alone`).
+        let conv: Vec<_> = recipe
+            .rs
+            .rows
+            .iter()
+            .filter(|(_, rs)| {
+                rs.state
+                    .is_some_and(|s| name_of(&trace, RowId::Cache(s)) == "ple.conv_state")
+            })
+            .collect();
+        assert_eq!(conv.len(), 1, "{preset}: the PLE conv's rs row");
+        assert_eq!(conv[0].1.planes.len(), 1, "{preset}: its input alone");
         println!("{preset}: rs list {}", recipe.shapes());
     }
 }

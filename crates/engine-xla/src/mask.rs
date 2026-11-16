@@ -8,6 +8,11 @@ pub struct LaneMask<'a> {
 
     pub have: u32,
 
+    /// The lane's set's committed boundary (`KvDelta::folded`, at most
+    /// `have`): mask column `c` is key `folded + c`; keys below it are read
+    /// under the causal bound and no mask bit.
+    pub folded: u32,
+
     pub rows: u32,
 
     /// The class attends both ways: a stated mask's rows are unclipped and
@@ -26,6 +31,11 @@ pub struct Staged {
     pub stride: u32,
 }
 
+/// The fire's byte plane: a row a lane row, a byte a key position (`stride`
+/// a power of two of 256 and more, past every lane's `have + rows`). A lane's
+/// mask speaks of its keys from `folded` on: its committed keys (`0..folded`)
+/// are admitted under the causal bound, and mask column `c` lands at key
+/// `folded + c`. Among the lane's own rows the bound is the row order.
 pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
     if lanes.iter().all(|lane| lane.mask.is_none()) {
         return Ok(None);
@@ -37,13 +47,14 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
         let Some(masking) = lane.mask else {
             continue;
         };
-
+        // The mask's extent: the buffer past the boundary, then the rows.
+        let extent = kv - u64::from(lane.folded.min(lane.have));
         for mask in masking.masks() {
-            if mask.total < kv {
+            if mask.total < extent {
                 return Err(Fault::Mask {
                     lane: at as u32,
                     stated: mask.total,
-                    extent: kv,
+                    extent,
                 });
             }
         }
@@ -81,7 +92,10 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
 
     let mut row = 0usize;
     for lane in lanes {
+        let folded = u64::from(lane.folded.min(lane.have));
         let kv = u64::from(lane.have) + u64::from(lane.rows);
+        // The mask's columns: `0..extent`, column `c` key `folded + c`.
+        let extent = kv - folded;
         let flag = if lane.wide { 2 } else { 1 };
         let Some(masking) = lane.mask else {
             row += lane.rows as usize;
@@ -91,13 +105,20 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
             out.enabled[row + q] = flag;
         }
         let base = row as u64;
+        // Every row reads the committed keys under the causal bound alone.
+        for q in 0..u64::from(lane.rows) {
+            let at = ((base + q) * u64::from(stride)) as usize;
+            if let Some(cells) = out.bytes.get_mut(at..at + folded as usize) {
+                cells.fill(1);
+            }
+        }
         match masking {
             Masking::Extent(mask) => {
                 let mut at_position = 0u64;
                 for (index, &run) in mask.runs.iter().enumerate() {
-                    let end = at_position.saturating_add(u64::from(run)).min(kv);
+                    let end = at_position.saturating_add(u64::from(run)).min(extent);
                     if index % 2 == 1 {
-                        for key in at_position..end {
+                        for key in (folded + at_position)..(folded + end) {
                             let first = if lane.wide {
                                 0
                             } else {
@@ -108,7 +129,7 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
                             }
                         }
                     }
-                    if end == kv {
+                    if end == extent {
                         break;
                     }
                     at_position = end;
@@ -125,13 +146,13 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
                     };
                     let mut at_position = 0u64;
                     for (index, &run) in mask.runs.iter().enumerate() {
-                        let end = at_position.saturating_add(u64::from(run)).min(kv);
+                        let end = at_position.saturating_add(u64::from(run)).min(extent);
                         if index % 2 == 1 {
-                            for key in at_position..end.min(bound + 1) {
+                            for key in (folded + at_position)..(folded + end).min(bound + 1) {
                                 keep(&mut out.bytes, stride, base + q, key);
                             }
                         }
-                        if end == kv {
+                        if end == extent {
                             break;
                         }
                         at_position = end;
@@ -162,9 +183,41 @@ mod tests {
         let lane = |wide| LaneMask {
             mask: None,
             have: 40,
+            folded: 0,
             rows: 600,
             wide,
         };
         assert_eq!(stage(&[lane(true), lane(false), lane(true)]).unwrap(), None);
+    }
+
+    /// A lane's mask speaks of its keys from its set's committed boundary
+    /// on: with 4 keys held, 2 committed, and 2 rows, its 4 columns are keys
+    /// 2..6 (the buffer 2, 3, then its rows 4, 5). The committed keys are read
+    /// under the causal bound, no bit; column 0 hidden hides key 2; the own
+    /// rows are bound by row order. A mask short of the 4 columns is refused
+    /// with that extent.
+    #[test]
+    fn a_mask_reads_its_columns_from_the_committed_boundary() {
+        use engine::fire::{Mask, Masking};
+        let hide_first = Masking::Extent(Mask { runs: vec![1, 3], total: 4 });
+        let lane = LaneMask {
+            mask: Some(&hide_first),
+            have: 4,
+            folded: 2,
+            rows: 2,
+            wide: false,
+        };
+        let staged = stage(&[lane]).unwrap().expect("a plane");
+        let stride = staged.stride as usize;
+        let row = |q: usize| &staged.bytes[q * stride..q * stride + 6];
+        assert_eq!(row(0), &[1, 1, 0, 1, 1, 0], "row 0: committed, buffer, itself");
+        assert_eq!(row(1), &[1, 1, 0, 1, 1, 1], "row 1: and row 0, itself");
+        assert_eq!(staged.enabled, vec![1, 1]);
+        let short = Masking::Extent(Mask { runs: vec![0, 3], total: 3 });
+        let refused = stage(&[LaneMask { mask: Some(&short), ..lane }]).unwrap_err();
+        assert!(
+            matches!(refused, crate::error::Fault::Mask { extent: 4, .. }),
+            "refused with the buffer's extent: {refused:?}"
+        );
     }
 }

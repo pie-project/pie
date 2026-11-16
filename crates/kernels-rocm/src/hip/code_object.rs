@@ -57,10 +57,11 @@ impl std::fmt::Display for Ask {
 
 /// Refuses `image` where one of its kernels asks the runtime for memory it
 /// allocates late (a buffer at first launch, or scratch), naming the kernel
-/// and what it asks. An image that is not an ELF code object, or carries no
-/// metadata, asks nothing.
+/// and what it asks. An image this cannot read (not an ELF code object, or
+/// one that carries no kernel metadata) is refused too: what it asks is not
+/// known. An offload bundle is unbundled first ([`unbundle`]).
 pub fn refuse_late_buffers(image: &[u8]) -> Result<(), String> {
-    refuse(&asked(image))
+    refuse(&asked(image)?)
 }
 
 fn refuse(asked: &[(String, Ask)]) -> Result<(), String> {
@@ -75,12 +76,17 @@ fn refuse(asked: &[(String, Ask)]) -> Result<(), String> {
 }
 
 /// Each kernel of `image` and the late memory it asks for.
-fn asked(image: &[u8]) -> Vec<(String, Ask)> {
+fn asked(image: &[u8]) -> Result<Vec<(String, Ask)>, String> {
+    if !elf64(image) {
+        return Err("the image is not an ELF code object, so what its kernels ask is not known".into());
+    }
     let mut asked = Vec::new();
+    let mut described = false;
     for meta in notes(image).filter_map(msgpack::read) {
         let Some(Mp::Arr(kernels)) = meta.get("amdhsa.kernels") else {
             continue;
         };
+        described = true;
         for kernel in kernels {
             let name = kernel.get(".name").and_then(Mp::text).unwrap_or("?");
             let args = match kernel.get(".args") {
@@ -106,7 +112,84 @@ fn asked(image: &[u8]) -> Vec<(String, Ask)> {
             }
         }
     }
-    asked
+    if !described {
+        return Err("the code object carries no AMDGPU kernel metadata, so what its kernels ask is not known".into());
+    }
+    Ok(asked)
+}
+
+/// Whether `image` is an ELF64 little-endian image, as an AMDGPU code
+/// object is.
+fn elf64(image: &[u8]) -> bool {
+    image.starts_with(b"\x7fELF") && image.get(4) == Some(&2) && image.get(5) == Some(&1)
+}
+
+/// The code object for `arch` (`gfx942`) out of a clang offload bundle,
+/// compressed (`CCOB`, zlib or zstd) or not; an ELF image is its own code
+/// object. A bundle with no entry for `arch` is refused by name.
+#[cfg(feature = "rocm")]
+pub fn unbundle(image: &[u8], arch: &str) -> Result<Vec<u8>, String> {
+    if elf64(image) {
+        return Ok(image.to_vec());
+    }
+    let le = |bytes: &[u8], at: usize, n: usize| -> Option<u64> {
+        let slice = bytes.get(at..at.checked_add(n)?)?;
+        Some(slice.iter().rev().fold(0, |acc, &b| acc << 8 | u64::from(b)))
+    };
+    let bundle = if image.starts_with(b"CCOB") {
+        // The compressed bundle's header: version, method, then (from
+        // version 3) 64-bit total and uncompressed sizes, and a hash.
+        let version = le(image, 4, 2).ok_or("a CCOB header cut short")?;
+        let method = le(image, 6, 2).ok_or("a CCOB header cut short")?;
+        let (header, size) = match version {
+            2 => (24, le(image, 12, 4)),
+            3 => (32, le(image, 16, 8)),
+            other => return Err(format!("a CCOB bundle of version {other}, which this reads not")),
+        };
+        let size = usize::try_from(size.ok_or("a CCOB header cut short")?)
+            .map_err(|_| "a CCOB bundle past the address space")?;
+        let packed = image.get(header..).ok_or("a CCOB bundle with no payload")?;
+        let unpacked = match method {
+            0 => miniz_oxide::inflate::decompress_to_vec_zlib(packed)
+                .map_err(|why| format!("a zlib CCOB bundle does not inflate: {why:?}"))?,
+            1 => zstd::bulk::decompress(packed, size)
+                .map_err(|why| format!("a zstd CCOB bundle does not inflate: {why}"))?,
+            other => return Err(format!("a CCOB bundle compressed by method {other}, which this reads not")),
+        };
+        if unpacked.len() != size {
+            return Err(format!("a CCOB bundle inflated to {} bytes, not the {size} it states", unpacked.len()));
+        }
+        unpacked
+    } else {
+        image.to_vec()
+    };
+    const MAGIC: &[u8] = b"__CLANG_OFFLOAD_BUNDLE__";
+    if !bundle.starts_with(MAGIC) {
+        return Err("the image is neither an ELF code object nor an offload bundle".into());
+    }
+    let cut = || "an offload bundle's entry table cut short".to_string();
+    let entries = le(&bundle, MAGIC.len(), 8).ok_or_else(cut)?;
+    let mut at = MAGIC.len() + 8;
+    for _ in 0..entries {
+        let offset = le(&bundle, at, 8).ok_or_else(cut)?;
+        let size = le(&bundle, at + 8, 8).ok_or_else(cut)?;
+        let id_len = usize::try_from(le(&bundle, at + 16, 8).ok_or_else(cut)?).map_err(|_| cut())?;
+        let id = bundle.get(at + 24..at + 24 + id_len).ok_or_else(cut)?;
+        at += 24 + id_len;
+        // `hipv4-amdgcn-amd-amdhsa--gfx942[:features]`
+        let target = std::str::from_utf8(id)
+            .ok()
+            .and_then(|id| id.rsplit_once("--"))
+            .map(|(_, target)| target.split(':').next().unwrap_or_default());
+        if target == Some(arch) {
+            let (offset, size) = (usize::try_from(offset).map_err(|_| cut())?, usize::try_from(size).map_err(|_| cut())?);
+            return bundle
+                .get(offset..offset.checked_add(size).ok_or_else(cut)?)
+                .map(<[u8]>::to_vec)
+                .ok_or_else(cut);
+        }
+    }
+    Err(format!("the offload bundle holds no code object for {arch}"))
 }
 
 /// The descriptors of `image`'s AMDGPU metadata notes: an ELF64
@@ -121,9 +204,7 @@ fn notes(image: &[u8]) -> impl Iterator<Item = &[u8]> {
                 .fold(0, |acc, &b| acc << 8 | u64::from(b)),
         )
     };
-    let elf64 =
-        image.starts_with(b"\x7fELF") && image.get(4) == Some(&2) && image.get(5) == Some(&1);
-    let sections = elf64
+    let sections = elf64(image)
         .then(|| {
             let table = usize::try_from(le(0x28, 8)?).ok()?;
             let entry = usize::try_from(le(0x3a, 2)?).ok()?;
@@ -189,6 +270,8 @@ fn note_descs(section: &[u8]) -> Vec<&[u8]> {
 #[cfg(test)]
 mod tests {
     use super::{NT_AMDGPU_METADATA, SHT_NOTE, refuse_late_buffers};
+    #[cfg(feature = "rocm")]
+    use super::unbundle;
 
     /// MessagePack for a string.
     fn s(out: &mut Vec<u8>, text: &str) {
@@ -304,7 +387,45 @@ mod tests {
             refuse_late_buffers(&image(&metadata("add", "hidden_block_count_x"))),
             Ok(())
         );
-        assert_eq!(refuse_late_buffers(b"not an elf"), Ok(()));
-        assert_eq!(refuse_late_buffers(&[]), Ok(()));
+    }
+
+    #[test]
+    fn an_image_that_says_nothing_is_refused() {
+        assert!(refuse_late_buffers(b"not an elf").is_err_and(|why| why.contains("not an ELF")));
+        assert!(refuse_late_buffers(&[]).is_err());
+        // An ELF whose notes carry no kernel metadata.
+        assert!(image(&[]).len() > 0);
+        assert!(refuse_late_buffers(&image(&[0xc0])).is_err_and(|why| why.contains("no AMDGPU")));
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn a_bundle_yields_its_arch_code_object() {
+        let code = image(&metadata("add", "global_buffer"));
+        let mut bundle = b"__CLANG_OFFLOAD_BUNDLE__".to_vec();
+        let ids: [&[u8]; 2] = [b"host-x86_64-unknown-linux-gnu--", b"hipv4-amdgcn-amd-amdhsa--gfx942:xnack-"];
+        bundle.extend_from_slice(&2u64.to_le_bytes());
+        let table = bundle.len() + ids.iter().map(|id| 24 + id.len()).sum::<usize>();
+        for (n, id) in ids.iter().enumerate() {
+            let (offset, size) = if n == 0 { (table, 0) } else { (table, code.len()) };
+            bundle.extend_from_slice(&(offset as u64).to_le_bytes());
+            bundle.extend_from_slice(&(size as u64).to_le_bytes());
+            bundle.extend_from_slice(&(id.len() as u64).to_le_bytes());
+            bundle.extend_from_slice(id);
+        }
+        bundle.extend_from_slice(&code);
+        assert_eq!(unbundle(&bundle, "gfx942"), Ok(code.clone()));
+        assert!(unbundle(&bundle, "gfx950").is_err_and(|why| why.contains("gfx950")));
+        // Compressed (CCOB version 3, zstd).
+        let packed = zstd::bulk::compress(&bundle, 3).unwrap();
+        let mut ccob = b"CCOB".to_vec();
+        ccob.extend_from_slice(&3u16.to_le_bytes());
+        ccob.extend_from_slice(&1u16.to_le_bytes());
+        ccob.extend_from_slice(&((32 + packed.len()) as u64).to_le_bytes());
+        ccob.extend_from_slice(&(bundle.len() as u64).to_le_bytes());
+        ccob.extend_from_slice(&0u64.to_le_bytes());
+        ccob.extend_from_slice(&packed);
+        assert_eq!(unbundle(&ccob, "gfx942"), Ok(code.clone()));
+        assert_eq!(unbundle(&code, "gfx942"), Ok(code));
     }
 }

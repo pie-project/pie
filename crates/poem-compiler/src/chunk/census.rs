@@ -433,10 +433,13 @@ fn atom(slab: &[u64], bytes: u64, read: &Read, shard: &Shard) -> Atom {
 /// The rs buffer: a per-token row of `width` a chunked recurrence whose
 /// commit is deferred, `width` the planes it replays (as the engines'
 /// `store::rs::read` lay them): the conv's input, then the gate prep's
-/// `[b | a]` (gated delta) or the forget and beta projections (KDA); then a
-/// row an n-gram id window, its unfolded token ids (as Metal's rs layout
-/// buffers them, in their own dtype). `RowId::Rs(n)`: the recurrences in
-/// node order, then the windows in the order their first reader stands.
+/// `[b | a]` (gated delta) or the forget and beta projections (KDA); a
+/// buffered conv no recurrence reads (`rs::Feeds::Alone`, Qwen4's PLE
+/// conv), its input alone; then a row an n-gram id window, its unfolded
+/// token ids (as Metal's rs layout buffers them, in their own dtype).
+/// `RowId::Rs(n)`: the recurrences and lone convs in node order, then the
+/// windows in the order their first reader stands. Which convs are buffered
+/// is [`crate::rs::buffered_convs`], the rule every backend reads.
 fn rs_rows(
     trace: &Trace,
     readers: &[Read],
@@ -452,17 +455,30 @@ fn rs_rows(
         }
     }
     let op_of = |id: ValueId| defined.get(&id.0).map(|n| &trace.nodes[*n].op);
-    let conv_x = |id| match op_of(id) {
-        Some(Operation::Ssm(Ssm::CausalConv1dChunked { x, .. })) => Some(*x),
-        _ => None,
-    };
+    // The prompt convs the rs buffer covers (`crate::rs::buffered_convs`,
+    // the rule every backend's rs layout reads), by their output: a
+    // recurrence's planes start with its conv's input, and a conv no
+    // recurrence reads is a row of its own.
+    let buffered: Vec<crate::rs::BufferedConv> = crate::rs::buffered_convs(trace, rs_mamba2)
+        .filter(|conv| conv.chunked)
+        .collect();
+    let by_y: HashMap<u32, crate::rs::BufferedConv> =
+        buffered.iter().map(|conv| (conv.y.0, *conv)).collect();
+    let conv_x = |id: ValueId| by_y.get(&id.0).map(|conv| conv.x);
     let cache = |id: ValueId| match trace.values.get(id.0 as usize).map(|d| &d.def) {
         Some(Def::Cache(row)) => Some(*row),
         _ => None,
     };
     let mut recurrences = Vec::new();
     let mut windows: Vec<(u32, ValueId, Option<u32>)> = Vec::new();
-    for node in &trace.nodes {
+    for (at, node) in trace.nodes.iter().enumerate() {
+        if let Some(conv) = buffered
+            .iter()
+            .find(|conv| conv.node == at && conv.feeds == crate::rs::Feeds::Alone)
+        {
+            recurrences.push((vec![conv.x], conv.state, node.layer));
+            continue;
+        }
         match &node.op {
             Operation::Ssm(Ssm::GatedDeltaChunked {
                 qkv, gates, state, ..
@@ -484,7 +500,7 @@ fn rs_rows(
             }
             // A Mamba-2 layer replays its conv's input and its step sizes;
             // its gate `z` reads only the rows a fire lands.
-            Operation::Ssm(Ssm::Mamba2Chunked { xbc, dt, state, .. }) if rs_mamba2 => {
+            Operation::Ssm(Ssm::Mamba2Chunked { xbc, dt, state, .. }) => {
                 if let Some(x) = conv_x(*xbc) {
                     recurrences.push((vec![x, *dt], *state, node.layer));
                 }

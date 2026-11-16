@@ -136,8 +136,13 @@ impl Run<'_> {
             let Some(plan) = seat.lanes.get(lane0 as usize + r) else {
                 continue;
             };
-            if let Some(run) = &plan.gather {
-                self.rs_move(op, &mut copies, seat, plane, run, ext, begin, false)?;
+            // Every run the lane replays, one after another: a lane sharing
+            // its set replays the slots its mask admits (its ancestry), which
+            // its siblings' slots interleave, so not one run from its first.
+            let mut at = begin;
+            for run in &plan.gathers {
+                self.rs_move(op, &mut copies, seat, plane, run, ext, at, false)?;
+                at += run.count;
             }
             let own_at = u64::from(indptr[r].max(0) as u32) * row_bytes;
             self.rs_copy(

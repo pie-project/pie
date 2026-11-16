@@ -1131,7 +1131,12 @@ impl Shell {
                         ),
                     ));
                 }
-                pending_mask_injects.push((masks.len(), src, have.saturating_add(row.rows)));
+                // The guest's cell holds the lane's buffer, then its row:
+                // columns from its committed boundary on.
+                let extent = have
+                    .saturating_sub(seated.folded.min(have))
+                    .saturating_add(row.rows);
+                pending_mask_injects.push((masks.len(), src, extent));
             }
             let runs_masked_arm = self.masked.contains(row.class as usize);
             let reads_group_mask = self.group_masked.contains(row.class as usize);
@@ -1153,6 +1158,7 @@ impl Shell {
                 // masks (`group_masks`), not over the lane's keys.
                 mask: masking.filter(|_| runs_masked_arm),
                 have,
+                folded: seated.folded.min(have),
                 rows: row.rows,
                 wide: self.wide.contains(row.class as usize),
             });
@@ -1190,6 +1196,7 @@ impl Shell {
                     base,
                     folded,
                     fold,
+                    lineage,
                 } => {
                     rs_pages.extend_from_slice(pages);
                     // A device-counted fold not yet settled left the state
@@ -1219,7 +1226,7 @@ impl Shell {
                             ),
                         ));
                     }
-                    let reads = engine::fire::buffered_reads(masking, *folded, first, row.rows)
+                    let reads = engine::fire::buffered_reads(masking, *folded, first, *lineage)
                         .map_err(|error| {
                             Fault::program("serve::rs", format!("lane {}: {error}", row.source))
                         })?;

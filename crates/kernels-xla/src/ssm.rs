@@ -38,11 +38,11 @@ use crate::tensor::{Landing, Operand, RaggedTensor, Stored};
 const GDN_EPS: f64 = 1e-6;
 
 /// Whether a ragged GDN fire's chunks run as the fused Mosaic kernel
-/// (`chunk`): 2 leaves it to `PIE_GDN_CHUNK_KERNEL` (on unless `0`).
+/// (`chunk`): on, unless a test turns it off (`fused_chunks`).
 static FUSED_CHUNKS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
 
-/// Turns the fused chunk kernel on or off for this process (`None`: as the
-/// environment says), for tests that run both forms.
+/// Turns the fused chunk kernel on or off for this process (`None`: on),
+/// for tests that run both forms.
 pub fn fused_chunks(on: Option<bool>) {
     let v = on.map_or(2, u8::from);
     FUSED_CHUNKS.store(v, std::sync::atomic::Ordering::Relaxed);
@@ -50,32 +50,25 @@ pub fn fused_chunks(on: Option<bool>) {
 
 fn fused_chunks_on() -> bool {
     match FUSED_CHUNKS.load(std::sync::atomic::Ordering::Relaxed) {
-        2 => !std::env::var("PIE_GDN_CHUNK_KERNEL").is_ok_and(|v| v == "0"),
+        2 => true,
         v => v == 1,
     }
 }
 
 /// Whether a GDN decode fire steps its lanes as the Mosaic kernel (`step`):
-/// 2 leaves it to `PIE_GDN_STEP_KERNEL` (on unless `0`).
+/// on, unless a test turns it off (`step_kernel`).
 static STEP_KERNEL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
 
-/// Turns the decode step kernel on or off for this process (`None`: as the
-/// environment says), for tests that run both forms.
+/// Turns the decode step kernel on or off for this process (`None`: on),
+/// for tests that run both forms.
 pub fn step_kernel(on: Option<bool>) {
     let v = on.map_or(2, u8::from);
     STEP_KERNEL.store(v, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// The pool conv step kernel. `PIE_XLA_CONV_KERNEL=0` turns it off: a
-/// diagnostic switch only, for the hybrid gates' parity with the base build
-/// (its output differs at the ulp), never a configuration knob.
-fn conv_step_on() -> bool {
-    !std::env::var("PIE_XLA_CONV_KERNEL").is_ok_and(|v| v == "0")
-}
-
 fn step_kernel_on() -> bool {
     match STEP_KERNEL.load(std::sync::atomic::Ordering::Relaxed) {
-        2 => !std::env::var("PIE_GDN_STEP_KERNEL").is_ok_and(|v| v == "0"),
+        2 => true,
         v => v == 1,
     }
 }
@@ -466,7 +459,6 @@ fn conv(
     // A decode over the chunk pool: one Mosaic kernel takes each lane's
     // window out of the pool, weighs it and lands it rolled.
     if is_decode
-        && conv_step_on()
         && let Some((acc, slab)) = conv_step::conv_step(
             f,
             x.val,

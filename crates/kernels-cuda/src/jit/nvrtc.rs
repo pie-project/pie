@@ -557,7 +557,9 @@ mod tests {
     /// the generic units, sm_80 (the oldest a unit is compiled for) and
     /// sm_100 (the B200's plain target, past whose `__CUDA_ARCH__` gates).
     fn tiers(file: &str) -> &'static [&'static str] {
-        if file.contains("_sm100") {
+        if file.contains("_sm120") {
+            &["sm_120"]
+        } else if file.contains("_sm100") {
             &["sm_100"]
         } else if file.contains("_sm90") {
             &["sm_90"]

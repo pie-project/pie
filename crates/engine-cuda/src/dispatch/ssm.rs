@@ -474,6 +474,11 @@ impl Run<'_> {
     ) -> Result<(), kernels_cuda::Error> {
         let bias = bias.map(|b| self.tensor(b));
         self.rs_begin();
+        // A conv no recurrence reads is a layer of its own.
+        let lone = self.rs_lone(x);
+        if lone {
+            self.rs_begin_lone();
+        }
         let x_ext = self.rs_extend(op, x, true)?;
         let csr = self.rs_ext_csr(op)?;
         let mut y_ext = self.rs_out(op, y)?;
@@ -506,7 +511,11 @@ impl Run<'_> {
                 &mut y_ext,
             )?;
         }
-        self.rs_land(op, y_ext, y)
+        self.rs_land(op, y_ext, y)?;
+        if lone {
+            self.rs_layer_done();
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]

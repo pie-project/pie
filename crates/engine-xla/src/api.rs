@@ -58,10 +58,6 @@ pub struct DeviceBoot {
     /// Trace and compile the first fire shapes at load (`serve/warm.rs`).
     pub prewarm: bool,
 
-    /// Windowed kv rows live in their own pool; `false` keeps them in full
-    /// pages, for a test that compares the two.
-    pub window_pool: bool,
-
     /// Device bytes the load leaves past its weights and pool for XLA's
     /// scratch; `None` takes the chip's (`chip::Tpu::headroom`).
     pub headroom: Option<u64>,
@@ -92,7 +88,6 @@ impl Default for DeviceBoot {
             ordinal: 0,
             profiles: None,
             prewarm: false,
-            window_pool: true,
             headroom: None,
             seat_tokens: None,
             stream_weights: false,
@@ -637,6 +632,19 @@ impl Engine for Xla {
             .register(registration, device)
             .map_err(refusal);
         self.refused(registered)
+    }
+
+    /// XLA's readouts ([`engine::Engine::readout_facts`]): every output
+    /// lands in a ring laid at load (`Pools::lay_readouts`), inside the
+    /// bytes the load reserved, so no term beside the rungs; a sequence
+    /// readout's ring holds the lane rung's rows a fire, the store the
+    /// runtime cuts a fire's sequence lanes to. Float lanes' rows land in a
+    /// ring of the top row rung's rows and are not bounded here.
+    fn readout_facts(&self) -> EngineResult<engine::ReadoutFacts> {
+        Ok(engine::ReadoutFacts {
+            landing: engine::ReadoutLanding::InSpan,
+            store_rows: self.shell.as_ref().and_then(Shell::readout_store_rows),
+        })
     }
 
     /// The rings an instance keeps in the pool's `Channel` slots: its
@@ -1661,6 +1669,7 @@ impl Xla {
                     }) => Some(*have),
                     _ => (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
                 },
+                folded: lane.kv.folded,
                 mask: device[at]
                     .as_ref()
                     .and_then(|resolved| resolved.mask.as_ref())

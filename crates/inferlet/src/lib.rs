@@ -54,6 +54,7 @@ pub mod model {
     pub use crate::pie::inferlet::model::{
         BlockDrafter, InputAxis, InputDecl, LaneDecl, LatentSpace, OutputDecl, RowCount,
         ScheduleFact, ScheduleKind, SwitchDecl, architecture, channel_capacity, draft_block,
+        draft_depth,
         frame_size, kv_page_size, lane, latent, max_pass_rows, name, output_vocab_size,
         rs_state_size, run_ahead_window, schedule, submit_deadline_us, switches,
     };

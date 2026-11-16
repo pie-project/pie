@@ -307,7 +307,7 @@ mod tests {
             last_page_len: i32s(2),
             request_of_token: i32s(rows),
             mask: Tensor::new(7, rows, 1, Dtype::U8),
-            mask_enabled: Tensor::new(9, rows, 1, Dtype::U8),
+            mask_enabled: Tensor::new(9, rows, 1, Dtype::U32),
             mask_stride: 1,
         }
     }

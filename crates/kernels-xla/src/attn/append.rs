@@ -44,10 +44,9 @@ fn vmem(n: i64, w: i64, m: i64) -> i64 {
 }
 
 /// Whether the kernel takes a fire of `n` rows into `[slots, w]` planes of
-/// `ps`-row pages with `m` runs (`PIE_XLA_KV_KERNEL=0` turns it off).
+/// `ps`-row pages with `m` runs.
 pub(crate) fn fits(n: i64, w: i64, slots: i64, ps: i64, m: i64, vmem_cap: i64) -> bool {
-    !std::env::var("PIE_XLA_KV_KERNEL").is_ok_and(|v| v == "0")
-        && ps == PS
+    ps == PS
         && n >= 2 * PS
         && n % PS == 0
         && w % 128 == 0

@@ -12,7 +12,6 @@ pub mod lane_gemm;
 #[cfg(feature = "rocm")]
 mod gemv;
 #[cfg(feature = "rocm")]
-pub(crate) use gemv::compute_units;
 #[cfg(feature = "rocm")]
 #[cfg(feature = "rocm")]
 pub mod skinny;

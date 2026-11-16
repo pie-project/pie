@@ -117,10 +117,11 @@ Notes on the table:
 
 ```toml
 [engine]
-kind = "cerebras"
+type = "cerebras"
+device = ["cerebras:0"]
 target = "wse3"
 cmaddr = "10.x.y.z:9000"   # omit for the fabric simulator
-max_model_len = 4096       # the positions the program is built for; omit for as many as the preset holds
+max_context = 4096         # the positions the program is built for; omit for as many as the preset holds
 lookahead = 254
 async = true
 # posted_loop = 32         # default: the plan's LOOP

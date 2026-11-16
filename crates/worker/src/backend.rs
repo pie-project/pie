@@ -226,9 +226,8 @@ fn dump_device_boot(home: &Path, boot: &DeviceBoot, group_id: usize, rank: Optio
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn land(
-    backend: &mut runtime::engine::EngineBox,
+/// The request a boot loads the model at `snapshot_dir` with.
+fn load_request(
     snapshot_dir: &Path,
     cache_dir: &Path,
     budgets: engine::Budgets,
@@ -236,7 +235,7 @@ fn land(
     platform: poem_ir::Platform,
     frames_in_flight: u8,
     overrides: &runtime::engine::load::Overrides,
-) -> Result<(engine::Loaded, String, Option<PathBuf>)> {
+) -> Result<engine::LoadRequest> {
     let mut request = runtime::engine::load::request(
         overrides,
         snapshot_dir,
@@ -254,6 +253,55 @@ fn land(
             None => dir,
         });
     }
+    Ok(request)
+}
+
+/// The engine boot and load request `pie serve` makes for the model at
+/// `snapshot_dir` on one CUDA device under `home` when its config states
+/// nothing past the model: what `pie tune` loads to time the dense GEMM
+/// products serving runs.
+#[cfg(feature = "engine-cuda")]
+pub fn served_cuda(snapshot_dir: &Path, home: &Path) -> Result<(DeviceBoot, engine::LoadRequest)> {
+    validate_snapshot_dir(snapshot_dir)?;
+    let cache_dir = &crate::disk::engine_cache_dir(home);
+    let boot = device_boot(&CudaEngineOptions::default(), home, cache_dir, None)?;
+    let overrides = runtime::engine::load::Overrides::default();
+    let request = load_request(
+        snapshot_dir,
+        cache_dir,
+        cuda_budgets(
+            config::AdapterConfig::default().seats(),
+            None,
+            declared_context(snapshot_dir, &overrides),
+        ),
+        config::MemoryConfig::default().residency(),
+        poem_ir::Platform::Cuda,
+        u8::try_from(config::RuntimeConfig::default().frame_dispatch_depth).unwrap_or(u8::MAX),
+        &overrides,
+    )?;
+    Ok((boot, request))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn land(
+    backend: &mut runtime::engine::EngineBox,
+    snapshot_dir: &Path,
+    cache_dir: &Path,
+    budgets: engine::Budgets,
+    residency: engine::Residency,
+    platform: poem_ir::Platform,
+    frames_in_flight: u8,
+    overrides: &runtime::engine::load::Overrides,
+) -> Result<(engine::Loaded, String, Option<PathBuf>)> {
+    let request = load_request(
+        snapshot_dir,
+        cache_dir,
+        budgets,
+        residency,
+        platform,
+        frames_in_flight,
+        overrides,
+    )?;
     let deployment = request.trace.name.clone();
     let disk_kv_dir = request.residency.disk_kv_dir.clone();
     let wide = request.trace.nodes.iter().any(|node| {
@@ -995,11 +1043,7 @@ pub(crate) fn build_options(e: &config::EngineConfig, flavor: Flavor) -> Result<
     match flavor {
         #[cfg(feature = "engine-cuda")]
         Flavor::Cuda => {
-            let mut c: CudaEngineOptions = e
-                .options
-                .clone()
-                .try_into()
-                .map_err(|why| anyhow!("[engine] options: {why}"))?;
+            let mut c: CudaEngineOptions = e.options_as()?;
             let device = e
                 .device
                 .first()
@@ -1009,50 +1053,30 @@ pub(crate) fn build_options(e: &config::EngineConfig, flavor: Flavor) -> Result<
         }
         #[cfg(all(feature = "metal", target_vendor = "apple"))]
         Flavor::Metal => {
-            let p: MetalEngineOptions = e
-                .options
-                .clone()
-                .try_into()
-                .map_err(|why| anyhow!("[engine] options: {why}"))?;
+            let p: MetalEngineOptions = e.options_as()?;
             Ok(EngineOptions::Metal(p))
         }
         #[cfg(feature = "vulkan")]
         Flavor::Vulkan => {
-            let mut v: VulkanEngineOptions = e
-                .options
-                .clone()
-                .try_into()
-                .map_err(|why| anyhow!("[engine] options: {why}"))?;
+            let mut v: VulkanEngineOptions = e.options_as()?;
             v.device_index = device_index(&e.device, &["vulkan"])?;
             Ok(EngineOptions::Vulkan(v))
         }
         #[cfg(feature = "wgpu")]
         Flavor::Wgpu => {
-            let mut w: WgpuEngineOptions = e
-                .options
-                .clone()
-                .try_into()
-                .map_err(|why| anyhow!("[engine] options: {why}"))?;
+            let mut w: WgpuEngineOptions = e.options_as()?;
             w.adapter_index = device_index(&e.device, &["wgpu"])?;
             Ok(EngineOptions::Wgpu(w))
         }
         #[cfg(feature = "xla")]
         Flavor::Xla => {
-            let mut x: XlaEngineOptions = e
-                .options
-                .clone()
-                .try_into()
-                .map_err(|why| anyhow!("[engine] options: {why}"))?;
+            let mut x: XlaEngineOptions = e.options_as()?;
             x.device_index = device_index(&e.device, &["tpu", "xla"])?;
             Ok(EngineOptions::Xla(x))
         }
         #[cfg(feature = "cerebras")]
         Flavor::Cerebras => {
-            let c: CerebrasEngineOptions = e
-                .options
-                .clone()
-                .try_into()
-                .map_err(|why| anyhow!("[engine] options: {why}"))?;
+            let c: CerebrasEngineOptions = e.options_as()?;
             Ok(EngineOptions::Cerebras(c))
         }
     }

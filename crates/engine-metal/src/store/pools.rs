@@ -1349,6 +1349,23 @@ impl Pools {
 
     /// The state rows of the record whose physical pieces are `record`,
     /// one after another, each row's pieces in order.
+    /// The planes [`Pools::read_record`] lays end to end: each state row's
+    /// trace cache index, bytes and dtype, in that order.
+    #[must_use]
+    pub fn state_planes(&self) -> Vec<(u32, u64, Dtype)> {
+        self.rows
+            .iter()
+            .filter_map(|row| match *row {
+                Row::State { stride, dtype, .. } => {
+                    Some((stride * u64::from(elem_size(dtype)), dtype))
+                }
+                _ => None,
+            })
+            .zip(&self.shape_rows[1])
+            .map(|((bytes, dtype), &cache)| (cache, bytes, dtype))
+            .collect()
+    }
+
     pub fn read_record(&self, record: &[u32]) -> Result<Vec<u8>> {
         let fixed = *self.shape(FIXED)?;
         let mut out = Vec::new();
