@@ -721,8 +721,6 @@ pub struct Shell<B: Serve> {
 
     rs_buffers: Option<crate::rs::Buffers>,
 
-    rs_scratch: Option<B::Buffer>,
-
     out: Option<ValueId>,
     readouts: Vec<ReadoutPlane>,
     feeds: poem_exec::feeds::Feeds,
@@ -1349,31 +1347,6 @@ impl<B: Serve> Shell<B> {
         // the weights and the working set leave of the share, in whole
         // chunks; the kernels bind it in at most four segments, none past
         // the device's binding limit.
-        // The scratch of a fire's extended recurrent rows, laid at the
-        // widest rung's (`rs::Seat::widest_rows`) for its most lanes: no
-        // fire grows it, and one that would need more is refused.
-        let rs_scratch = rs_layout
-            .as_deref()
-            .map(|layout| {
-                B::Buffer::zeroed(
-                    &device,
-                    crate::rs::Seat::scratch_bytes(
-                        layout,
-                        crate::rs::Seat::widest_rows(budgets.tokens.max_tokens),
-                        budgets.tokens.max_lanes,
-                    ),
-                    crate::books::owners::RS_SCRATCH,
-                )
-            })
-            .transpose()?;
-        if let Some(scratch) = &rs_scratch {
-            tracing::info!(
-                bytes = scratch.bytes(),
-                rows = crate::rs::Seat::widest_rows(budgets.tokens.max_tokens),
-                lanes = budgets.tokens.max_lanes,
-                "the recurrent scratch is laid at the widest rung's extended rows"
-            );
-        }
         // The snapshot table, where a record holds state: a lane's entry
         // for every lane a fire carries at most (`snapshot_table_bytes`).
         let snaps = (rows.fixed_bytes > 0)
@@ -1565,7 +1538,6 @@ impl<B: Serve> Shell<B> {
             rs_layout,
             snaps,
             rs_buffers,
-            rs_scratch,
             out,
             readouts,
             feeds,
@@ -3559,16 +3531,14 @@ impl<B: Serve> Shell<B> {
         let rs_replay: Vec<i32> = rs_plans.iter().map(|plan| plan.replay as i32).collect();
         let rs_commit: Vec<i32> = rs_plans.iter().map(|plan| plan.commit as i32).collect();
         let rows_ext = rows.saturating_add(rs_plans.iter().map(|plan| plan.replay).sum::<u32>());
-        if rs_active {
-            let layout = self
-                .rs_layout
-                .as_ref()
-                .expect("rs_active implies a layout, checked at the lane");
-            crate::rs::Seat::fits(
-                crate::rs::Seat::scratch_bytes(layout, rows_ext, lane_count),
-                self.rs_scratch.as_ref().map_or(0, B::Buffer::bytes),
-            )?;
-        }
+        // The rows the fire carries at its rung: each lane's own or the
+        // buffered rows it replays, the more of them (`engine::fire::rung_rows`).
+        let carried: u32 = composition
+            .lanes()
+            .iter()
+            .zip(&rs_plans)
+            .map(|(row, plan)| engine::fire::rung_rows(row.rows, plan.replay))
+            .sum();
 
         let (group_of_lane, packings) = if self.feeds.selections.is_empty() {
             (Vec::new(), Vec::new())
@@ -3739,9 +3709,22 @@ impl<B: Serve> Shell<B> {
             clips: u64::from(composition.clips()),
             readouts,
         };
-        // The narrowest rung that holds the fire: its carve at its fixed
-        // place under the span's end.
-        let rung = self.span.rung_of(fire_rows);
+        // The narrowest rung that holds the fire and the rows its lanes
+        // replay: its carve at its fixed place under the span's end.
+        let rung = self.span.rung_of(FireRows {
+            tokens: fire_rows.tokens.max(u64::from(carried)),
+            ..fire_rows
+        });
+        if rs_active {
+            let layout = self
+                .rs_layout
+                .as_ref()
+                .expect("rs_active implies a layout, checked at the lane");
+            crate::rs::Seat::fits(
+                crate::rs::Seat::scratch_bytes(layout, rows_ext, lane_count),
+                self.span.rs_scratch(rung)?.2,
+            )?;
+        }
         let slots = self.span.slots(&self.handles, rung, fire_rows, scored)?;
         let caches = self.pools.table(
             &self.handles,
@@ -3852,9 +3835,8 @@ impl<B: Serve> Shell<B> {
             inputs: bound.inputs,
             voxels: bound.voxels,
             rs: if rs_active {
-                let (Some(layout), Some(buffers), Some(scratch)) =
-                    (&self.rs_layout, &self.rs_buffers, &self.rs_scratch)
-                else {
+                let scratch = self.span.rs_scratch(rung)?;
+                let (Some(layout), Some(buffers)) = (&self.rs_layout, &self.rs_buffers) else {
                     return Err(Fault::Unbound {
                         what: "the recurrent seat of a fire whose plan buffers nothing".to_string(),
                     });
