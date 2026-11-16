@@ -1065,7 +1065,13 @@ impl Shell {
             &budgets,
             arena_bytes,
             boot.knobs.diagnostics.chunk_bytes,
-            boot.residency.cached_experts(),
+            // `untabled-experts`: the banks stay on the host tier with no
+            // shape, so no table reads them.
+            if boot.knobs.diagnostics.untabled_experts {
+                &[]
+            } else {
+                boot.residency.cached_experts()
+            },
             !boot.knobs.diagnostics.dense_weights,
             boot.knobs.diagnostics.one_window,
         )?;
@@ -1310,7 +1316,7 @@ impl Shell {
         #[cfg(feature = "rocm")]
         let expert_staging = crate::experts::staging::Staging::default();
         if expert_staging.bytes() > 0 {
-            expert_staging.fits(pools.spare_bytes()?)?;
+            expert_staging.fits(pools.free_room()?)?;
         }
         if let Some(fact) = expert_staging.fact() {
             eprintln!("{fact}");
@@ -1367,8 +1373,10 @@ impl Shell {
             adapters: crate::blob::Adapters::new(adapter_seats),
             held: vec![0; boot.slots as usize],
             readout_rows,
+            // Lent at the stand-in span until laid, as the readout rows
+            // are: the size-only walk stages into it and copies nothing.
+            expert_staged: expert_staging.at(crate::sizing::STAND_IN),
             expert_staging,
-            expert_staged: None,
             exports,
             graphs: engine.graphs,
             copies: engine.copies,
@@ -1915,6 +1923,13 @@ fn footprint(shell: &Shell, device_total: u64, free_before: u64) -> Footprint {
 }
 
 impl Shell {
+    /// The staging a fire lays a host-resident bank's experts in, as the
+    /// load bounded it (`experts::staging`).
+    #[must_use]
+    pub fn expert_staging(&self) -> &crate::experts::staging::Staging {
+        &self.expert_staging
+    }
+
     /// The device's memory as this load holds it now ([`ledger`]).
     #[must_use]
     pub fn ledger(&self) -> engine::memory::Ledger {

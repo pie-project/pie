@@ -2584,3 +2584,165 @@ fn golden_eager_resume() {
         small_pool_arms(&fixture, &cache);
     }
 }
+
+/// The steps [`golden_staged_experts`] fires: a prefill, then decodes.
+const STAGED_SCRIPT: &[Step] = &[
+    Step::Prefill(37),
+    Step::Decode,
+    Step::Decode,
+    Step::Prefill(90),
+    Step::Decode,
+];
+
+/// `shell` fired over [`STAGED_SCRIPT`] from a fresh slot: each step's logits.
+fn staged_steps(shell: &mut Shell, trace: &Trace) -> Vec<Vec<f32>> {
+    shell.open(0).expect("slot 0 opens");
+    let mut fed = 0u32;
+    let mut last = None;
+    let mut steps = Vec::with_capacity(STAGED_SCRIPT.len());
+    for step in STAGED_SCRIPT {
+        let tokens: Vec<u32> = match *step {
+            Step::Prefill(rows) => (fed..fed + rows).map(|t| (t * 7 + 11) % 1000).collect(),
+            Step::Decode => vec![last.expect("a decode follows a step")],
+        };
+        fed += u32::try_from(tokens.len()).expect("a count");
+        let logits = fire(shell, trace, &tokens);
+        last = Some(argmax(&logits));
+        steps.push(logits);
+    }
+    steps
+}
+
+/// The staged-experts probe: `PIE_GOLDEN_MODELS` (quantized MoE miniatures;
+/// DeepSeek-V4-Flash's u4g64 one by default) loaded with its routed banks on
+/// the host tier and no table of the weight cache reading them
+/// (`untabled-experts`), so each fire stages the experts it routes to into
+/// the run the load laid. The staging is the bound times its streams, the
+/// steps serve the device-resident banks' logits, a fire past the first
+/// round takes no device memory, and the staging refuses a room a byte
+/// short of it by its banks' names.
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn golden_staged_experts() {
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    let cache = cache_dir();
+    let models = std::env::var("PIE_GOLDEN_MODELS").map_or_else(
+        |_| vec!["dsv4-flash-mini-u4g64-u2g64-kv-bf16".to_string()],
+        |_| models(),
+    );
+    for model in models {
+        let fixture = fixture(&model, &cache);
+        let trace = &fixture.trace;
+        // The banks on the device, as the base engine seats them.
+        let mut resident = load(&fixture, &cache);
+        assert_eq!(
+            resident.expert_staging().bytes(),
+            0,
+            "{model}: a load with its banks on the device stages nothing"
+        );
+        let want = staged_steps(&mut resident, trace);
+        drop(resident);
+
+        let mut knobs = knobs();
+        knobs.diagnostics.dense_weights = false;
+        knobs.diagnostics.untabled_experts = true;
+        let mut shell = load_with(&fixture, &cache, knobs);
+        let staging = shell.expert_staging().clone();
+        let fact = staging
+            .fact()
+            .unwrap_or_else(|| panic!("{model}: no bank is staged"));
+        println!("staged {model}: {fact}");
+        // The bound, from the trace: each staged bank's codes hold the most
+        // experts one fire routes to, the routes one fire's.
+        let classes = poem_ir::residency::residency(trace);
+        let bytes = engine_cuda::weights::plane_bytes(trace).expect("sized");
+        let rows = u64::from(staging.rows());
+        let (mut codes, mut routes) = (0u64, 0u64);
+        for bank in staging.banks() {
+            let at = trace
+                .params
+                .iter()
+                .position(|param| &param.name == bank)
+                .unwrap_or_else(|| panic!("the trace declares `{bank}`"));
+            let poem_ir::residency::Residency::Expert(atom) = classes[at] else {
+                panic!("`{bank}` is staged and routes no expert");
+            };
+            let experts = u64::from(atom.experts);
+            let slots = experts.min(rows * u64::from(atom.top_k));
+            codes = codes.max(slots * (bytes[at] / experts));
+            routes = routes.max(rows * u64::from(atom.top_k) * 4);
+        }
+        let runs = staging.runs();
+        assert_eq!(runs[0], codes, "{model}: the codes' run is the bound");
+        assert_eq!(runs[3], routes, "{model}: the routes' run is one fire's");
+        let lane: u64 = runs.iter().map(|run| run.next_multiple_of(256)).sum();
+        assert!(!staging.streams().is_empty());
+        assert_eq!(
+            staging.bytes(),
+            lane * staging.streams().len() as u64,
+            "{model}: a lane a stream"
+        );
+        println!(
+            "staged {model}: {} bank(s), runs {runs:?}, {} stream(s), {} bytes for {rows} rows",
+            staging.banks().len(),
+            staging.streams().len(),
+            staging.bytes(),
+        );
+
+        // The first round builds what a fire builds; the second takes
+        // nothing more of the device.
+        let first = staged_steps(&mut shell, trace);
+        let free = engine_cuda::device::free_bytes();
+        let heaps = engine_cuda::device::held::heap_bytes();
+        let second = staged_steps(&mut shell, trace);
+        assert_eq!(
+            engine_cuda::device::free_bytes(),
+            free,
+            "{model}: a staged fire took device memory"
+        );
+        assert_eq!(
+            engine_cuda::device::held::heap_bytes(),
+            heaps,
+            "{model}: a staged fire grew a heap"
+        );
+        assert_eq!(second, first, "{model}: the second round is the first's");
+        for (at, (got, want)) in first.iter().zip(&want).enumerate() {
+            let most = got
+                .iter()
+                .zip(want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            println!(
+                "staged {model} {at}: most |diff| {most:e} from resident, tops {} {}",
+                argmax(got),
+                argmax(want)
+            );
+            assert_eq!(
+                argmax(got),
+                argmax(want),
+                "{model} step {at}: the staged top token"
+            );
+            assert!(most < 0.25, "{model} step {at}: |diff| {most:e}");
+        }
+
+        // A room a byte short of the staging refuses it, by name.
+        let said = staging
+            .fits(staging.bytes() - 1)
+            .expect_err("a byte short refuses the load")
+            .to_string();
+        assert!(
+            staging
+                .banks()
+                .iter()
+                .all(|bank| said.contains(&format!("`{bank}`"))),
+            "{model}: the refusal names the banks: {said}"
+        );
+        assert!(
+            said.contains(&format!("{} bytes laid at load", staging.bytes())),
+            "{model}: and the bytes: {said}"
+        );
+    }
+}
