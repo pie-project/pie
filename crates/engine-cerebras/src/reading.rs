@@ -79,6 +79,10 @@ impl Array {
 }
 
 /// Where a step's arrays are written and run: the SDK runtime, or [`HostFabric`].
+/// The most words one host-to-device memcpy call carries ([`Fabric::write`] on the SDK
+/// runtime cuts a larger array into bands of its rows).
+pub const MEMCPY_WORDS: usize = 1 << 24;
+
 pub trait Fabric {
     /// Writes array `a`'s words (each an f32's bits, or a 16-bit word).
     fn write(&mut self, a: &Array, words: &[u32]) -> R<()>;
@@ -987,8 +991,31 @@ impl Fabric for Runtime {
         } else {
             DataType::Bits32
         };
-        self.memcpy_h2d(&a.sym, words, a.rect, a.len, Order::RowMajor, dt)
-            .map_err(|x| x.to_string())
+        // a band of the rectangle's rows a call, each at most MEMCPY_WORDS (one call of an
+        // array a decode program's head holds, 155M words, the simulator's memcpy halts on)
+        let row = (a.rect.w.max(1) as usize) * a.len.max(1);
+        let band = (MEMCPY_WORDS / row).max(1);
+        let mut y = 0;
+        while y < a.rect.h as usize {
+            let n = band.min(a.rect.h as usize - y);
+            let rect = Rect {
+                y: a.rect.y + y as i32,
+                h: n as i32,
+                ..a.rect
+            };
+            let part = words.get(y * row..(y + n) * row).ok_or_else(|| {
+                format!(
+                    "`{}`: {} words for {} rows of {row}",
+                    a.sym,
+                    words.len(),
+                    a.rect.h
+                )
+            })?;
+            self.memcpy_h2d(&a.sym, part, rect, a.len, Order::RowMajor, dt)
+                .map_err(|x| x.to_string())?;
+            y += n;
+        }
+        Ok(())
     }
 
     fn run(
