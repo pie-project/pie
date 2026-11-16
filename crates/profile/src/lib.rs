@@ -3,6 +3,7 @@
 //! file, the user's file) against a [`Registry`], each layer checked against
 //! the probed facts and applied whole or not at all.
 
+pub mod fire;
 pub mod ladder;
 pub mod profile;
 pub mod region;
@@ -29,14 +30,13 @@ const TUNABLE: &[&str] = &["metal", "cuda", "vulkan"];
 
 /// What `pie` prints when a device runs without a profile measured on it.
 fn untuned_hint(device: &str, backend: &str, id: &str, report: &Report) -> String {
-    let mut out = if !report.measured.is_empty() {
-        format!("{device}: running {}.", report.describe())
-    } else if report.layers.is_empty() {
+    let mut out = if report.layers.is_empty() {
         format!("{device}: no profile for it, running the registry defaults.")
     } else {
         format!(
-            "{device}: running {}, none of whose numbers were measured on it.",
-            report.describe()
+            "{device}: running {}: {}.",
+            report.describe(),
+            report.what_was_measured()
         )
     };
     for (source, why) in &report.rejected {

@@ -160,6 +160,12 @@ pub trait Serve: Backend {
     /// What a kept step binds moved: the segments, or a layer's stage.
     fn forget(shelf: &mut Self::Shelf);
 
+    /// The steps replayed and recorded so far, where the backend records:
+    /// what `pie tune` reads to time only fires that replay, as served.
+    fn recordings(_shelf: &Self::Shelf) -> Option<(u64, u64)> {
+        None
+    }
+
     /// Arm `arm`'s readout seat grew to `bytes`.
     fn grown(shell: &mut Shell<Self>, arm: usize, bytes: u64) -> Result<()>;
 
@@ -279,6 +285,30 @@ pub struct Boot<'a, B: Serve> {
     pub residency: engine::load::Residency,
 
     pub handed: Option<B::Handed>,
+
+    /// How the top rung is chosen.
+    pub top: Top,
+}
+
+/// The rungs a load weighed its top by, and the estimate it weighed them
+/// with, over its live range: what a check of the estimate reads.
+#[derive(Debug, Clone)]
+pub struct Weighed {
+    pub rungs: Vec<engine::load::RungFacts>,
+    pub estimate: engine::load::FireEstimate,
+    pub live: u64,
+}
+
+/// How a load chooses the top rung of its fires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Top {
+    /// The ruling (`engine::load::top_rung`) over the profile's measured
+    /// fire times or its rates: every served load.
+    #[default]
+    Ruled,
+    /// Every rung one binding holds, up to the requested fire size: what
+    /// `pie tune` lays to time each rung.
+    EveryRung,
 }
 
 /// A load fitted to its device: the device, its tuning and tier, and the
@@ -643,6 +673,9 @@ pub struct Shell<B: Serve> {
     pub weights: Weights<B>,
     /// A fire's arena and kernel scratch, at the top of the pool.
     span: Span<B>,
+    /// The rungs the load weighed its top by, and the estimate, where the
+    /// profile states rates.
+    weighed: Option<Weighed>,
     pools: Pools<B>,
     /// The weight cache's row tables (PLE), streamed through pool slots.
     pub row_caches: crate::store::rows::RowCaches<B>,
@@ -846,6 +879,7 @@ impl<B: Serve> Shell<B> {
                 device: boot.device,
                 residency: boot.residency.clone(),
                 handed: None,
+                top: boot.top,
             },
             Fitted {
                 device: crate::named::Facts::of::<B>(device),
@@ -967,13 +1001,33 @@ impl<B: Serve> Shell<B> {
         //
         // A rung whose span cannot lie in one binding is no rung of this
         // device: the span lies in the pool's last segment, and no segment
-        // is past a binding. The top is the widest rung that can; a fire
-        // wider than it has no carve, so the load's fires are cut to it and
-        // the model compiled again at it (its own carve is laid again, as
-        // it may differ from the rung's laid under the wider top).
+        // is past a binding. Of the rungs the requested fire size offers,
+        // the top is the one the ruling picks (`crate::top`), over the live
+        // range kv and activation share at load: what the device leaves the
+        // weights it keeps, within the largest pool the kernels address (at
+        // most `kernels_slang::SEGMENTS` segments, none past one binding:
+        // `store::pool::sized`). A fire wider than it has no carve, so the
+        // load's fires are cut to it and the model compiled again at it (its
+        // own carve is laid again, as it may differ from the rung's laid
+        // under the wider top); past the pick, only one binding bounds the
+        // top again. `Top::EveryRung` (`pie tune`, timing each rung) keeps
+        // every rung one binding holds instead.
         let binding = device.max_buffer();
-        // The top asked and its rungs' `(tokens, span bytes)`, once bounded.
-        let mut unbounded: Option<(u32, Vec<(u32, u64)>)> = None;
+        let counts = crate::top::Counts::of(&boot.trace)?;
+        let live = {
+            let room = device.left().saturating_sub(counts.weight_bytes);
+            kv_budget
+                .map_or(room, |budget| budget.min(room))
+                .min(binding.saturating_mul(kernels_slang::SEGMENTS as u64))
+        };
+        let device_profile = tuning.profile().clone();
+        let device_name = device.name().to_owned();
+        let gemm = tuning.gemm(B::tier(&device));
+        let padded = |rows: u32| {
+            kernels_slang::linear::gemm::padded_rows(B::TARGET, gemm, rows, counts.width)
+        };
+        let mut chosen: Option<Option<engine::load::TopRung>> = None;
+        let mut weighed: Option<Weighed> = None;
         let (compiled, mut span) = loop {
             let compiled = compile_axes(&boot.trace, &budgets, &profile)?;
             let top = budgets.tokens.max_tokens;
@@ -994,25 +1048,69 @@ impl<B: Serve> Shell<B> {
                 .iter()
                 .map(|rung| (rung.tokens, rung.bytes()))
                 .collect();
-            match crate::arena::bound_top(&spans, binding) {
-                Some(widest) if widest < top => {
-                    unbounded.get_or_insert((top, spans));
-                    budgets.tokens = crate::arena::bounded_budget(&budgets.tokens, widest);
-                    boot.budget = budgets.tokens.clone();
+            // The kernels a fire issues: the compiled plan's launches.
+            let launches = u32::try_from(compiled.template().len()).unwrap_or(u32::MAX);
+            let rungs = crate::top::rung_facts(
+                &spans,
+                budgets.tokens.max_lanes,
+                binding,
+                launches,
+                &padded,
+            );
+            if weighed.is_none() {
+                weighed = crate::top::estimate(&counts, &device_profile.rates()).map(|estimate| {
+                    Weighed {
+                        rungs: rungs.clone(),
+                        estimate,
+                        live,
+                    }
+                });
+            }
+            let pick = match (&chosen, boot.top) {
+                (None, Top::Ruled) => {
+                    let (pick, _) = crate::top::choose(
+                        &rungs,
+                        live,
+                        &device_profile,
+                        &device_name,
+                        &counts,
+                        binding,
+                    )?;
+                    tracing::debug!(spans = ?spans, ?pick, live, "the rungs the top is chosen of");
+                    chosen = Some(Some(pick));
+                    Some(pick.tokens)
                 }
                 // None: not even the least rung lies in one binding, and
                 // the pool refuses the load below.
+                _ => {
+                    chosen.get_or_insert(None);
+                    crate::arena::bound_top(&spans, binding)
+                }
+            };
+            match pick {
+                Some(widest) if widest < top => {
+                    budgets.tokens = crate::arena::bounded_budget(&budgets.tokens, widest);
+                    boot.budget = budgets.tokens.clone();
+                }
                 _ => break (compiled, span),
             }
         };
-        if let Some((asked, spans)) = unbounded {
-            tracing::info!(
-                asked,
-                top = budgets.tokens.max_tokens,
-                spans = ?spans,
-                "the top rung is bounded by this device's largest binding: {} MiB",
-                binding >> 20
-            );
+        match chosen.flatten() {
+            Some(rung) => tracing::info!(
+                "{}",
+                crate::top::line_of(
+                    &rung,
+                    budgets.tokens.max_tokens,
+                    span.bytes(),
+                    live,
+                    device_profile.tuned(),
+                )
+            ),
+            None => tracing::info!(
+                "top rung {}: every rung one binding holds, to time each; span {} MiB",
+                budgets.tokens.max_tokens,
+                span.bytes() >> 20
+            ),
         }
 
         crate::window::no_schedule_straddles_its_readers(&boot.trace, &compiled)?;
@@ -1484,6 +1582,7 @@ impl<B: Serve> Shell<B> {
             budgets,
             weights,
             span,
+            weighed,
             pools,
             row_caches,
             expert_caches,
@@ -1948,6 +2047,26 @@ impl<B: Serve> Shell<B> {
     #[must_use]
     pub fn tuning(&self) -> &B::Tuning {
         &self.tuning
+    }
+
+    /// The steps replayed and recorded so far, where the backend records.
+    #[must_use]
+    pub fn recordings(&self) -> Option<(u64, u64)> {
+        B::recordings(&self.shelf)
+    }
+
+    /// The rungs the load weighed its top by and the estimate it weighed
+    /// them with, where its profile states rates.
+    #[must_use]
+    pub fn weighed(&self) -> Option<&Weighed> {
+        self.weighed.as_ref()
+    }
+
+    /// The widths, in tokens, of the rungs the load laid, narrowest first:
+    /// what `pie tune` times a fire at.
+    #[must_use]
+    pub fn rung_tokens(&self) -> Vec<u32> {
+        self.span.rungs().iter().map(|rung| rung.tokens).collect()
     }
 
     #[must_use]

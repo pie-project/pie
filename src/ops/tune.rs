@@ -39,6 +39,20 @@ pub struct TuneArgs {
     /// Fit the measurements the last run kept, without measuring again.
     #[arg(long)]
     pub refit: bool,
+
+    /// Check the estimate the load weighs its top rung by: time a fire at
+    /// each rung width of these models (by name or substring; the smallest
+    /// imported artifact without one) through the serving path, print the
+    /// measured and estimated times a rung and both picks, and fail where
+    /// the estimate's pick falls more than the stated bound short of the
+    /// measured best. Writes nothing.
+    #[arg(long, num_args = 0..)]
+    pub check_estimate: Option<Vec<String>>,
+
+    /// Run the `[rates]` step alone: measure the device's bf16 matmul rate,
+    /// its memory bandwidth and a fire's launch cost on it.
+    #[arg(long)]
+    pub rates: bool,
 }
 
 pub fn run(args: TuneArgs) -> Result<Answer> {
@@ -76,14 +90,18 @@ pub fn run(args: TuneArgs) -> Result<Answer> {
     let mut say = |line: &str| eprintln!("{}", palette.dim(line));
     let artifacts = crate::paths::pie_home().join("artifacts");
     let cache = crate::paths::pie_home().join("tune");
+    let mut check = args.check.clone();
+    check.extend(args.check_estimate.iter().flatten().cloned());
     let req = runtime::engine::profiles::TuneRequest {
         full: args.full,
         profiles: &dir,
         artifacts: &artifacts,
-        check: &args.check,
+        check: &check,
         no_check: args.no_check,
         cache: &cache,
         refit: args.refit,
+        check_estimate: args.check_estimate.is_some(),
+        rates: args.rates,
     };
     let tuned = tune(&req, &mut say).map_err(|e| anyhow!(e))?;
 
@@ -117,7 +135,8 @@ pub fn run(args: TuneArgs) -> Result<Answer> {
             }
         ));
     }
-    if args.dry_run {
+    // A check of the estimate is a test: it writes nothing of its own.
+    if args.dry_run || (args.check_estimate.is_some() && !args.rates) {
         out.push_str("\n--dry-run: nothing written. The profile:\n\n");
         out.push_str(&tuned.file);
         return Ok(text(out));

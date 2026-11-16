@@ -909,3 +909,137 @@ fn the_shelf_check_keeps_one_family_and_one_device_file_per_device() {
         "{e}"
     );
 }
+
+const M9_DERIVED: &str = r#"
+api = 1
+[target]
+device = "Apple M9"
+[rates]
+bf16_flops_per_ns = 50000.0  # 50 TFLOP/s
+bytes_per_ns = 400           # 400 GB/s
+"#;
+
+#[test]
+fn a_device_file_states_its_rates_and_a_layer_above_replaces_them() {
+    let r = registry();
+    let shelf = profile::Shelf {
+        backend: "toy",
+        seeded: &[
+            ("apple10.toml", APPLE10),
+            ("derived/apple-m9.toml", M9_DERIVED),
+        ],
+        derived: SHELF.derived,
+    };
+    let (p, report) = shelf.resolve(&r, "Apple M9", &facts(11, true), None);
+    assert_eq!(
+        report.layers,
+        [
+            Source::Derived,
+            Source::Seeded("derived/apple-m9.toml".into())
+        ],
+        "the derived device's own file over the derived profile"
+    );
+    assert_eq!(p.get::<PrefillChunk>().0, 128, "the derived profile's");
+    assert_eq!(
+        p.rates(),
+        profile::fire::Rates {
+            bf16_flops_per_ns: Some(50000.0),
+            bytes_per_ns: Some(400.0),
+            launch_ns: None,
+        }
+    );
+
+    let dir = std::env::temp_dir().join(format!("pie-shelf-rates-{}", std::process::id()));
+    let path = shelf.user_path(&dir, "Apple M9");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "api = 1\n[rates]\nlaunch_ns = 9000\n").unwrap();
+    let (p, _) = shelf.resolve(&r, "Apple M9", &facts(11, true), Some(&dir));
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(p.rates().bytes_per_ns, Some(400.0), "kept key by key");
+    assert_eq!(p.rates().launch_ns, Some(9000));
+
+    // A dump carries them, and reads back.
+    let text = profile::render::dump(&p);
+    let file = r.parse(&text, "dump.toml", Strict::User).unwrap();
+    assert_eq!(&file.tuned, p.tuned(), "{text}");
+
+    // The shelf check admits a derived device file filed under its id.
+    let check_dir = std::env::temp_dir().join(format!("pie-shelf-rc-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&check_dir);
+    for (path, text) in shelf.seeded {
+        let at = check_dir.join(path);
+        std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+        std::fs::write(at, text).unwrap();
+    }
+    let checked = shelf.check(&r, &check_dir);
+    std::fs::remove_dir_all(&check_dir).unwrap();
+    checked.unwrap();
+}
+
+#[test]
+fn rates_are_refused_where_they_do_not_read_and_fire_times_are_no_profiles() {
+    for (body, says) in [
+        (
+            "[rates]\nbytes_per_ns = -1\n",
+            "`rates.bytes_per_ns` is a positive number",
+        ),
+        (
+            "[rates]\nflops = 1.0\n",
+            "`rates` holds `bf16_flops_per_ns`",
+        ),
+        (
+            "[rates]\nlaunch_ns = 1.5\n",
+            "`rates.launch_ns` is a whole number",
+        ),
+        ("[fire_ns]\n\"m\" = [[1, 10]]\n", "fire_ns"),
+    ] {
+        let e = refusal(&format!("api = 1\n{body}"));
+        assert!(e.contains(says), "{body}: {e}");
+    }
+}
+
+#[test]
+fn the_notice_names_rates_measured_on_the_device_and_what_is_untuned() {
+    let r = registry();
+    let rated = |provenance: &str| {
+        format!(
+            "api = 1\n[target]\ndevice = \"Apple M9\"\n[rates]\nbf16_flops_per_ns = 5000.0\n\
+             bytes_per_ns = 300.0\n{provenance}"
+        )
+    };
+    // Rates a layer says it measured: the notice says so, and that the
+    // decisions are untuned.
+    let measured = rated("[provenance]\nrates = \"pie tune metal --rates on 2026-11-15\"\n");
+    let (_, report) = r.resolve(
+        &[layer(
+            Source::Seeded("derived/apple-m9.toml".into()),
+            &measured,
+        )],
+        &facts(11, true),
+    );
+    assert_eq!(
+        report.rates_measured.as_deref(),
+        Some("pie tune metal --rates on 2026-11-15")
+    );
+    assert_eq!(
+        report.what_was_measured(),
+        "rates measured on it (pie tune metal --rates on 2026-11-15); its kernel decisions untuned"
+    );
+    // Rates no layer says were measured (a vendor's figure): none measured.
+    let stated = rated("");
+    let (_, report) = r.resolve(
+        &[layer(
+            Source::Seeded("derived/apple-m9.toml".into()),
+            &stated,
+        )],
+        &facts(11, true),
+    );
+    assert_eq!(report.rates_measured, None);
+    assert!(
+        report
+            .what_was_measured()
+            .starts_with("no rates measured on it"),
+        "{}",
+        report.what_was_measured()
+    );
+}

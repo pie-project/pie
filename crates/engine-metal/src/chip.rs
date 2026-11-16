@@ -137,10 +137,12 @@ macro_rules! seeded {
 
 seeded!(
     "apple7.toml",
+    "apple7/apple-m1-max.toml",
     "apple8.toml",
     "apple9.toml",
     "apple9/apple-m4-pro.toml",
     "apple10.toml",
+    "apple10/apple-m5-pro.toml",
 );
 
 pub static SHELF: Shelf = Shelf {

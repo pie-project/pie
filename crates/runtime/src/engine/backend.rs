@@ -109,6 +109,10 @@ pub mod open {
             .map_err(::anyhow::Error::msg)
     }
 
+    /// The fire a served Vulkan load is asked ([`engine_vulkan::FIRE`]).
+    #[cfg(feature = "vulkan")]
+    pub const VULKAN_FIRE: (u32, u32) = engine_vulkan::FIRE;
+
     #[cfg(feature = "vulkan")]
     pub fn vulkan(config_bytes: &[u8]) -> Result<EngineBox> {
         engine_vulkan::open(config_bytes, crate::engine::load::contract_for)

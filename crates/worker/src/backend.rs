@@ -86,8 +86,8 @@ const METAL_FIRE: Fire = Fire {
 const METAL_PAGE_SIZE: u32 = 32;
 #[cfg(feature = "vulkan")]
 const VULKAN_FIRE: Fire = Fire {
-    lanes: 512,
-    tokens: 10240,
+    lanes: runtime::engine::backend::open::VULKAN_FIRE.0,
+    tokens: runtime::engine::backend::open::VULKAN_FIRE.1,
 };
 #[cfg(feature = "wgpu")]
 const WGPU_FIRE: Fire = Fire {

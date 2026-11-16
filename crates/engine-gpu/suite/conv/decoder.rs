@@ -421,6 +421,7 @@ fn a_conv_decoder_fires_over_a_voxel_input() {
             ..engine::load::Residency::default()
         },
         handed: None,
+        top: engine_gpu::serve::Top::EveryRung,
     })
     .expect("the decoder loads");
     let built = shell.compiled();

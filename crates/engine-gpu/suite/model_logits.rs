@@ -332,6 +332,7 @@ fn boot<'a>(
         device,
         residency,
         handed: None,
+        top: engine_gpu::serve::Top::EveryRung,
     }
 }
 

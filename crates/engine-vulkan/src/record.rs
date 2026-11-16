@@ -126,6 +126,11 @@ impl Recorder {
         next
     }
 
+    /// The steps replayed and recorded so far.
+    pub(crate) fn counts(&self) -> (u64, u64) {
+        (self.replayed.get(), self.recorded.get())
+    }
+
     pub(crate) fn records(&self) -> bool {
         self.refused.is_none()
     }

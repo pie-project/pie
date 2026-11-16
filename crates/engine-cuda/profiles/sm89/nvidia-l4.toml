@@ -48,6 +48,12 @@ recording = { use = "bodies", mem_mb = 1024 }
 forward_tokens = 2304
 prefill_lattice_steps = 8
 
+[rates]
+# 121 TFLOPS dense bf16 (NVIDIA L4 datasheet; 242 with sparsity).
+bf16_flops_per_ns = 121000.0
+# 300 GB/s of GDDR6 (L4 datasheet).
+bytes_per_ns = 300.0
+
 [provenance]
 measured = [
   "kernel.gemm.fp8_shadow",

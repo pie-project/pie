@@ -525,6 +525,7 @@ where
             residency,
             device: &self.boot,
             handed: self.handed.take(),
+            top: crate::serve::Top::Ruled,
         })
         .map_err(fault)?;
         self.programs.load(&place(&shell)).map_err(refusal)?;

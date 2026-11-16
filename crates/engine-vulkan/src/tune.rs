@@ -100,6 +100,8 @@ fn serve(artifact: &Path, deployment: &str, device: &str, file: &str) -> Result<
         device: &boot,
         residency: engine::load::Residency::default(),
         handed: None,
+        // A device untuned has no rates to rule its top by; every rung is laid.
+        top: engine_gpu::serve::Top::EveryRung,
     })
     .map_err(|e| e.to_string())?;
     let token = |i: u32| 100 + (i * 7919) % 5000;
@@ -167,6 +169,246 @@ fn serve(artifact: &Path, deployment: &str, device: &str, file: &str) -> Result<
         read,
         refused: None,
     })
+}
+
+/// How far the estimate's pick may fall short of the measured-best rung:
+/// its score, under the measured times, within this share of the best's.
+pub const CHECK_BOUND: f64 = 0.05;
+
+/// `--check-estimate`: `artifact` loaded under `file` as a served load is
+/// asked ([`crate::FIRE`]), every rung one binding holds laid; a fire of
+/// each rung's width timed through the serving path (one lane on a fresh
+/// slot, replayed as served fires are), against the estimate the load
+/// weighs its top by. Prints both a rung and the two picks; refuses where
+/// the estimate's pick scores, under the measured times, more than
+/// [`CHECK_BOUND`] below the measured best.
+fn check_estimate(
+    artifact: &Path,
+    deployment: &str,
+    device: &str,
+    file: &str,
+    say: &mut dyn FnMut(&str),
+) -> Result<String, String> {
+    use poem::{Platform, Request};
+    let (lanes, tokens) = crate::FIRE;
+    let dir = std::env::temp_dir().join(format!("pie-tune-vulkan-check-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = crate::chip::SHELF.user_path(&dir, device);
+    std::fs::create_dir_all(path.parent().expect("a parent")).map_err(|e| e.to_string())?;
+    std::fs::write(&path, file).map_err(|e| e.to_string())?;
+    let row = poem_compiler::catalog::deployment(deployment)
+        .ok_or_else(|| format!("no catalog row `{deployment}`"))?;
+    let trace = row.trace(Platform::Vulkan);
+    let model = engine::load::model_class(&trace).to_owned();
+    let source = ztensor_compat::index(artifact).map_err(|e| e.to_string())?;
+    let contract =
+        poem::import::own_contract(&source, &trace.params, row.deploy.tp, Platform::Vulkan)
+            .map_err(|e| e.to_string())?;
+    drop(source);
+    let boot = crate::api::DeviceBoot {
+        profiles: Some(dir.clone()),
+        ..crate::api::DeviceBoot::default()
+    };
+    // One slot holds the widest fire's tokens: its rows are all a fire
+    // reads beside the weights.
+    let mut shell = engine_gpu::serve::Shell::<crate::device::Api>::load(engine_gpu::serve::Boot {
+        trace: trace.clone(),
+        contract: &contract,
+        checkpoint: artifact,
+        budget: poem_compiler::Budget::new(lanes, tokens),
+        patches: patches(&trace, 1),
+        voxels: None,
+        profile: None,
+        page_size: 16,
+        context: tokens,
+        slots: 1,
+        runahead: engine::runahead::Runahead::F1,
+        device: &boot,
+        residency: engine::load::Residency::default(),
+        handed: None,
+        top: engine_gpu::serve::Top::EveryRung,
+    })
+    .map_err(|e| e.to_string())?;
+    let weighed = shell.weighed().cloned().ok_or_else(|| {
+        format!(
+            "{device} has no rates in its profile to estimate by: run `pie tune vulkan --rates`"
+        )
+    })?;
+    let widths: Vec<u32> = weighed
+        .rungs
+        .iter()
+        .filter(|r| r.infeasible.is_none())
+        .map(|r| r.tokens)
+        .collect();
+    say(&format!(
+        "timing a fire at each of {} rung widths of {model}",
+        widths.len()
+    ));
+    let token = |i: u32| 100 + (i * 7919) % 5000;
+    // The narrowest widths' fires dissected, before any is recorded: the
+    // first walked and recorded with a timestamp around each dispatch, the
+    // second replaying that recording (the form a served fire takes), its
+    // timestamps written again and read back. Each dispatch's kernel and
+    // groups, and each kernel's device time, of both.
+    let mut dissect = |width: u32, say: &mut dyn FnMut(&str)| -> Result<(), String> {
+        let prompt: Vec<u32> = (0..width).map(token).collect();
+        let lane = engine_gpu::serve::Lane {
+            slot: 0,
+            word: trace.facts.word(&Request::new(width, false)),
+            tokens: &prompt,
+        };
+        crate::encode::profile_kernels(true);
+        let mut shapes = Vec::new();
+        for form in ["walked", "replayed"] {
+            shell.open(0).map_err(|e| e.to_string())?;
+            crate::encode::capture_shapes(form == "walked");
+            crate::encode::reset_kernel_profile();
+            let before = shell.recordings();
+            let began = Instant::now();
+            let fired = shell.fire(std::slice::from_ref(&lane));
+            let wall = began.elapsed().as_secs_f64() * 1e3;
+            crate::encode::capture_shapes(false);
+            if let Err(e) = fired {
+                crate::encode::profile_kernels(false);
+                return Err(e.to_string());
+            }
+            if form == "walked" {
+                shapes = crate::encode::take_shapes();
+            }
+            let replayed = shell.recordings().map_or(0, |c| c.0) > before.map_or(0, |c| c.0);
+            let mut rows = crate::encode::kernel_profile();
+            rows.sort_by_key(|row| std::cmp::Reverse(row.1));
+            let device: u64 = rows.iter().map(|row| row.1).sum();
+            let mut out = format!(
+                "dissected ({form}{}): a fire of {width} tokens of {model}: {wall:.2} ms wall, \
+                 {:.2} ms in {} kernels' dispatches on the device (frame span {:.2} ms; {} \
+                 dispatches encoded); on the host: submit {:.2} ms, fence wait {:.2} ms, \
+                 encode {:.2} ms, the rest of the fire {:.2} ms\n",
+                if replayed { ", replayed" } else { "" },
+                device as f64 / 1e6,
+                rows.len(),
+                crate::encode::frame_span_ns() as f64 / 1e6,
+                shapes.len(),
+                crate::encode::submit_ns() as f64 / 1e6,
+                crate::encode::fence_ns() as f64 / 1e6,
+                crate::encode::host_encode_ns() as f64 / 1e6,
+                (wall * 1e6
+                    - (crate::encode::submit_ns()
+                        + crate::encode::fence_ns()
+                        + crate::encode::host_encode_ns()) as f64)
+                    / 1e6,
+            );
+            for (name, ns, fires) in rows.iter().take(14) {
+                let groups: Vec<String> = shapes
+                    .iter()
+                    .filter(|s| s.entrypoint == name.as_str())
+                    .map(|s| format!("{:?}", s.groups))
+                    .take(3)
+                    .collect();
+                out.push_str(&format!(
+                    "  {:>9.3} ms  x{fires:<4} {name}  groups {}\n",
+                    *ns as f64 / 1e6,
+                    groups.join(" ")
+                ));
+            }
+            say(&out);
+        }
+        crate::encode::profile_kernels(false);
+        Ok(())
+    };
+    for width in widths.iter().copied().filter(|&w| w <= 16) {
+        dissect(width, say)?;
+    }
+    let measured = search::time_fires(
+        &widths,
+        |width, timed| {
+            let prompt: Vec<u32> = (0..width).map(token).collect();
+            shell.open(0).map_err(|e| e.to_string())?;
+            let lane = engine_gpu::serve::Lane {
+                slot: 0,
+                word: trace.facts.word(&Request::new(width, false)),
+                tokens: &prompt,
+            };
+            let before = shell.recordings();
+            let began = Instant::now();
+            shell
+                .fire(std::slice::from_ref(&lane))
+                .map_err(|e| e.to_string())?;
+            let ns = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            // Served fires replay what they recorded: a fire walked here
+            // times the host's encoding beside the device's work, and is no
+            // fire time of this model.
+            let replayed = |c: Option<(u64, u64)>| c.map_or(0, |(replayed, _)| replayed);
+            if timed && replayed(shell.recordings()) <= replayed(before) {
+                return Err(format!(
+                    "a fire of {width} tokens of {model} was walked, not replayed (recordings \
+                     {:?}): its time is not what serving runs, so it is no measurement",
+                    shell.recordings()
+                ));
+            }
+            Ok(ns)
+        },
+        say,
+    )?;
+    drop(shell);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let rungs: Vec<engine::load::RungFacts> = weighed
+        .rungs
+        .iter()
+        .filter(|r| r.infeasible.is_none())
+        .copied()
+        .collect();
+    let est: Vec<f64> = rungs.iter().map(|r| weighed.estimate.ns(r)).collect();
+    let meas: Vec<f64> = rungs
+        .iter()
+        .map(|r| {
+            measured
+                .iter()
+                .find(|&&(t, _)| t == r.tokens)
+                .map_or(f64::NAN, |&(_, ns)| ns as f64)
+        })
+        .collect();
+    let by_est = engine::load::pick(&rungs, &est, weighed.live).map_err(|e| e.to_string())?;
+    let by_meas = engine::load::pick(&rungs, &meas, weighed.live).map_err(|e| e.to_string())?;
+    let scores = engine::load::scored(&rungs, &meas, weighed.live);
+    let score = |tokens: u32| {
+        scores
+            .iter()
+            .find(|&&(t, _)| t == tokens)
+            .map_or(0.0, |&(_, s)| s)
+    };
+    let (at_est, best) = (score(by_est.tokens), score(by_meas.tokens));
+    let mut out = format!("{model} on {device}: rung, measured ms, estimated ms\n");
+    for (k, r) in rungs.iter().enumerate() {
+        out.push_str(&format!(
+            "  {:>6} {:>10.2} {:>10.2}\n",
+            r.tokens,
+            meas[k] / 1e6,
+            est[k] / 1e6
+        ));
+    }
+    let short = if best > 0.0 { 1.0 - at_est / best } else { 0.0 };
+    out.push_str(&format!(
+        "  pick by the estimate {}, by the measured times {}; the estimate's scores {:.1}% below \
+         the best (bound {:.0}%)\n",
+        by_est.tokens,
+        by_meas.tokens,
+        100.0 * short,
+        100.0 * CHECK_BOUND
+    ));
+    say(&out);
+    if short > CHECK_BOUND {
+        return Err(format!(
+            "the estimate picks rung {} for {model}, {:.1}% below the measured best {}: past \
+             the {:.0}% bound\n{out}",
+            by_est.tokens,
+            100.0 * short,
+            by_meas.tokens,
+            100.0 * CHECK_BOUND
+        ));
+    }
+    Ok(out)
 }
 
 /// A fingerprint of the fused trace and plan a load under `text` runs, as
@@ -291,15 +533,66 @@ fn measure(_: &Profile, _: &qmm::Grid, _: &mut dyn FnMut(&str)) -> Result<qmm::M
     Err("this build carries no Vulkan device code".to_string())
 }
 
+/// The steps a `pie tune` run takes: every decision's search by default;
+/// the `[rates]` step, the check of the estimate, or both, else.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Steps {
+    /// The `[rates]` step alone ([`crate::rates::measure`]).
+    pub rates: bool,
+    /// The check of the estimate alone (`--check-estimate`).
+    pub check_estimate: bool,
+}
+
+impl Steps {
+    fn search(self) -> bool {
+        !self.rates && !self.check_estimate
+    }
+
+    fn checks(self) -> bool {
+        self.check_estimate
+    }
+}
+
+/// The `[rates]` step: the device's rates measured on it under `base`.
+fn rates(base: &Profile, say: &mut dyn FnMut(&str)) -> Result<profile::fire::Rates, String> {
+    let device =
+        crate::device::Context::bind(&crate::api::DeviceBoot::default(), engine::Allowance::WHOLE)
+            .map_err(|e| e.to_string())?;
+    let tuning = crate::tuning::Tuning::new(base.clone(), device.limits());
+    let rates = crate::rates::measure(&device, &tuning).map_err(|e| e.to_string())?;
+    // The matmul path the profile selects on this card, which the rates
+    // step measures through.
+    let tier = <crate::device::Api as engine_gpu::serve::Serve>::tier(&device);
+    let path = kernels_slang::linear::gemm::tile_for(
+        kernels_slang::Target::Spirv,
+        engine_gpu::backend::Tactics::gemm(&tuning, tier),
+        engine_gpu::rates::GEMM,
+        engine_gpu::rates::GEMM,
+        engine_gpu::rates::GEMM,
+    );
+    say(&format!(
+        "[rates]: the matmul runs {path:?} (tier {tier:?})"
+    ));
+    say(&format!(
+        "[rates]: {:.1} TFLOP/s bf16, {:.0} GB/s, launch {} us",
+        rates.bf16_flops_per_ns.unwrap_or(0.0) / 1e3,
+        rates.bytes_per_ns.unwrap_or(0.0),
+        rates.launch_ns.unwrap_or(0) / 1000
+    ));
+    Ok(rates)
+}
+
 /// Tune the device a load opens. `say` hears progress.
 pub fn run(
     depth: Depth,
     profiles: Option<&Path>,
     cache: &Path,
     refit: bool,
+    steps: Steps,
     models: &[(PathBuf, String)],
     say: &mut dyn FnMut(&str),
 ) -> Result<Outcome, String> {
+    let fire_only = !steps.search();
     let began = Instant::now();
     let (name, facts) = crate::chip::probe().ok_or("no Vulkan device answers")?;
     let cores = facts
@@ -312,7 +605,11 @@ pub fn run(
         facts.describe().join(", "),
         report.used
     ));
-    let (fitted, mut lines, wrong) = bench_qmm(depth, &name, &base, cores, cache, refit, say)?;
+    let (fitted, mut lines, wrong) = if fire_only {
+        (Vec::new(), Vec::new(), Vec::new())
+    } else {
+        bench_qmm(depth, &name, &base, cores, cache, refit, say)?
+    };
     // The fitted ladder must also win end to end to be kept.
     let mut knobs: Vec<search::Knob> = Vec::new();
     for (id, value) in &fitted {
@@ -331,7 +628,9 @@ pub fn run(
             });
         }
     }
-    knobs.extend(search::knobs(&base, SEARCH_SKIPS, ""));
+    if !fire_only {
+        knobs.extend(search::knobs(&base, SEARCH_SKIPS, ""));
+    }
     let mut bench = Vulkan {
         models,
         device: &name,
@@ -348,7 +647,7 @@ pub fn run(
                 text: "not searched: no model to serve (import one, or pass --check)".to_string(),
             });
         }
-    } else {
+    } else if !fire_only {
         let names: Vec<&str> = models.iter().map(|(_, d)| d.as_str()).collect();
         say(&format!(
             "searching {} decisions end to end on {}",
@@ -359,9 +658,41 @@ pub fn run(
         chosen = found;
         lines.extend(searched);
     }
-    let tuned = search::render_overrides(&chosen);
+    let mut tuned = search::render_overrides(&chosen);
+    if steps.rates {
+        let r = rates(&base, say)?;
+        tuned.push_str(&format!(
+            "[rates]\nbf16_flops_per_ns = {:?}\nbytes_per_ns = {:?}\nlaunch_ns = {}\n",
+            r.bf16_flops_per_ns.unwrap_or(1.0),
+            r.bytes_per_ns.unwrap_or(1.0),
+            r.launch_ns.unwrap_or(0)
+        ));
+    }
     let today = bench.file(&[])?;
     let draft = bench.file(&chosen)?;
+    // The estimate each model's load weighs its top by, against its fires
+    // measured, under the file this writes: its decisions and the rates this
+    // run measured.
+    let checked_under = search::assemble(
+        crate::chip::registry(),
+        &base,
+        &name,
+        &facts,
+        &tuned,
+        &[],
+        ASSUME,
+    )?;
+    // Every model is checked before the run fails on any.
+    let mut failed = Vec::new();
+    for (artifact, deployment) in models.iter().filter(|_| steps.checks()) {
+        say(&format!("check of the estimate: {deployment}"));
+        if let Err(why) = check_estimate(artifact, deployment, &name, &checked_under, say) {
+            failed.push(why);
+        }
+    }
+    if !failed.is_empty() {
+        return Err(failed.join("\n"));
+    }
     let mut checks = Vec::new();
     let unchanged = draft == today;
     if unchanged && !models.is_empty() {

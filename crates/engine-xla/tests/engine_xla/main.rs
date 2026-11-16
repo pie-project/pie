@@ -15,6 +15,7 @@ mod a_dry_load_traces_the_real_load_programs;
 mod a_maintenance_write_is_timed;
 mod a_fire_the_load_did_not_prepare_is_counted;
 mod a_pool_answers_what_the_base_build_answered;
+mod a_device_states_its_rates;
 mod a_pool_view_reads_the_packed_rows_order;
 mod a_readout_lands_in_one_plane_shape;
 mod a_registered_channel_carries_one_cell_across_its_instances;
