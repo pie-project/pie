@@ -193,7 +193,8 @@ pub trait Tactics: std::fmt::Debug {
 
     fn kquant(&self) -> kernels_slang::linear::kquant::Tactic;
 
-    fn gemm(&self, tier: kernels_slang::Tier) -> kernels_slang::linear::gemm::Tactic;
+    /// The dense matmul tactic for a fire of `rows` activation rows.
+    fn gemm(&self, tier: kernels_slang::Tier, rows: u32) -> kernels_slang::linear::gemm::Tactic;
 
     /// The tiles and sort a batched route of `pairs` over `experts` runs at.
     fn batch(&self, pairs: u32, experts: u32) -> kernels_slang::linear::moe::select::Batch;

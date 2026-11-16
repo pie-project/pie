@@ -1,0 +1,25 @@
+api = 1
+
+[target]
+assumes = { vendor = "nvidia" }
+
+# What the derived profile states, so a device file below can measure past
+# it: a discrete GPU has no submit watchdog a step outlasts.
+[engine]
+submit.split_rows = [
+  { when = "discrete or vendor in (nvidia, amd, intel)", value = 0 },
+  { value = 32 },
+]
+
+[kernel]
+gemm.path = [{ when = "coopmat", use = "coopmat" }, { use = "tiled" }]
+moe.path = [{ when = "coopmat", use = "coopmat" }, { use = "tiled" }]
+qmm = [
+  { when = "coopmat and rows >= 12", use = "coopmat" },
+  { when = "rows >= 12", use = "tiled", crossover_tg = 160 },
+  { use = "qmv", vecs = 4 },
+]
+sdpa.decode.split = [
+  { when = "cores > 0", use = "per_core", per = 1 },
+  { use = "fixed", groups = 16 },
+]

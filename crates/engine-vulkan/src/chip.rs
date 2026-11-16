@@ -38,7 +38,12 @@ macro_rules! seeded {
     };
 }
 
-seeded!("qualcomm.toml", "imagination.toml");
+seeded!(
+    "qualcomm.toml",
+    "imagination.toml",
+    "nvidia.toml",
+    "nvidia/nvidia-rtx-pro-4500-blackwell.toml",
+);
 
 /// What a device no family file applies to runs.
 pub const DERIVED: &str = include_str!("derived.toml");
@@ -156,8 +161,9 @@ mod tests {
     fn a_device_runs_its_vendors_files_or_what_its_facts_derive() {
         let qualcomm = "qualcomm.toml";
         let imagination = "imagination.toml";
+        let nvidia = "nvidia.toml";
         for (d, files) in [
-            (device("nvidia", 32, Some(142), true), &[][..]),
+            (device("nvidia", 32, Some(142), true), &[nvidia][..]),
             (device("amd", 64, Some(60), false), &[]),
             (device("intel", 16, None, false), &[]),
             (device("qualcomm", 32, None, true), &[]),
@@ -257,7 +263,7 @@ mod tests {
                 "{d:?}"
             );
             assert_eq!(t.sdpa_split_min_keys(), if qualcomm { 128 } else { 256 });
-            assert_eq!(t.gemm_coopmat() && t.moe_coopmat(), d.coopmat, "{d:?}");
+            assert_eq!(t.gemm_coopmat(2048) && t.moe_coopmat(), d.coopmat, "{d:?}");
             assert_eq!(t.sdpa_tile_rows_per_request(), 32);
             for (pairs, experts, tile) in [
                 (0, 8, 1),
@@ -274,6 +280,40 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The RTX PRO 4500's file takes the tiled matmul below its measured
+    /// 96-row crossover and cooperative matrices from it; another NVIDIA
+    /// GPU with cooperative matrices, unmeasured, takes them at every row
+    /// count, so the crossover is the device file's.
+    #[test]
+    fn a_measured_device_crosses_to_cooperative_matrices_at_its_rows() {
+        let pro = Device {
+            name: "NVIDIA RTX PRO 4500 Blackwell".to_string(),
+            ..device("nvidia", 32, Some(82), true)
+        };
+        let (_, report) = resolve(&pro, None);
+        assert_eq!(
+            report.layers,
+            [
+                Source::Seeded("nvidia.toml".to_string()),
+                Source::Seeded("nvidia/nvidia-rtx-pro-4500-blackwell.toml".to_string()),
+            ]
+        );
+        let t = tuning(&pro);
+        for rows in [4, 16, 64, 95] {
+            assert!(!t.gemm_coopmat(rows), "{rows} rows");
+        }
+        for rows in [96, 128, 512, 2048] {
+            assert!(t.gemm_coopmat(rows), "{rows} rows");
+        }
+        let other = tuning(&device("nvidia", 32, Some(82), true));
+        assert!(other.gemm_coopmat(4) && other.gemm_coopmat(95));
+        let without = tuning(&Device {
+            coopmat: false,
+            ..pro
+        });
+        assert!(!without.gemm_coopmat(2048));
     }
 
     #[test]
