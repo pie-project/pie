@@ -204,6 +204,10 @@ impl Engine for Spatial {
             // recurrent state replays from tokens: no buffered verbs
             ..DegeneratePools::default()
         });
+        self.kv.ref_from = chunks
+            .shape(engine::chunk::DEGENERATE_KV)
+            .and_then(|shape| Some((shape.pinned?, shape.slots_per_chunk)))
+            .map_or(0, |(pinned, per)| pinned.device.first * per - pinned.ids_from);
         let pools = PoolFacts::default();
         let caps = Capabilities {
             device: DeviceFacts {

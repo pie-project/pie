@@ -333,6 +333,33 @@ pub fn apply_shared(
     }
 }
 
+/// Names each lane's kv pages by the slot refs of `pinned`, the kv run an
+/// engine that pins its pools states (the degenerate mode): its list table
+/// ([`::engine::chunk::DEGENERATE_KV`]). Nothing where `pinned` is `None`.
+pub fn apply_pinned(
+    req: &mut crate::engine::FireRequest,
+    pinned: Option<&crate::store::chunks::ShapeRun>,
+) {
+    let Some(run) = pinned else {
+        return;
+    };
+    for lane in &mut req.lanes {
+        let list = if lane.kv.translation.is_empty() {
+            &lane.kv.pages
+        } else {
+            &lane.kv.translation
+        };
+        if list.is_empty() {
+            continue;
+        }
+        let refs = list
+            .iter()
+            .map(|&id| id - run.ids_from + run.ref_from)
+            .collect();
+        lane.tables = vec![(::engine::chunk::DEGENERATE_KV, refs)];
+    }
+}
+
 /// Records every slot the batch hands the engine as read by it, so a
 /// slot one of its fires reads outlives that fire however it is dropped.
 fn note_reads(store: &mut RsStore, published: &RsPublished, out: &PreparedRs) {

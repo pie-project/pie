@@ -344,6 +344,7 @@ impl Spatial {
             }
         }
         let lanes = &step.lanes;
+        let pages: Vec<Vec<u32>> = lanes.iter().map(|lane| self.kv.lane_pages(lane)).collect();
         if tracing::enabled!(target: "spatial_trace", tracing::Level::DEBUG) {
             for lane in lanes {
                 tracing::debug!(target: "spatial_trace",
@@ -399,7 +400,7 @@ impl Spatial {
                             .map_err(port_error)?
                             .map(|after| after.saturating_sub(rows as u32))
                     } else {
-                        (!lane.kv.pages.is_empty()).then_some(lane.kv.held)
+                        (!pages[source].is_empty()).then_some(lane.kv.held)
                     };
                     tokens[source] = ports.tokens_for(rows).map_err(port_error)?.to_vec();
                     if let Some((cells, stride)) = ports.mask(rows).map_err(port_error)? {
@@ -459,7 +460,7 @@ impl Spatial {
                 // the lane holds.
                 let start = match positions[at].first() {
                     Some(&p) => p,
-                    None if !lane.kv.pages.is_empty() => lane.kv.held,
+                    None if !pages[at].is_empty() => lane.kv.held,
                     None => self.kv.slots.get(&lane.slot).map_or(0, |h| h.len() as u32),
                 };
                 if positions[at]
@@ -483,7 +484,7 @@ impl Spatial {
                     && one_reader(step, at);
                 self.forward(
                     lane.slot,
-                    &lane.kv.pages,
+                    &pages[at],
                     &tokens[at],
                     start,
                     &rows,
