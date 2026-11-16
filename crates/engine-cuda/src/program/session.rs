@@ -93,6 +93,7 @@ impl Session {
         extents: Extents,
         endpoints: Vec<Option<Arc<Endpoint>>>,
         place: &super::launch::Place,
+        stages: &[Option<Prepared>],
         shadow: bool,
         stream: *mut core::ffi::c_void,
     ) -> Result<Session> {
@@ -110,10 +111,20 @@ impl Session {
         let rings = Rings::allocate(
             &shapes,
             endpoints,
-            super::launch::Held::of(&plan.package.channels),
+            super::launch::Held::of(&plan.package.channels, &plan.package.plans),
             place,
             stream,
         )?;
+        // Each stage's tables, at this bind's extents, into the instance's
+        // own item: a fire reads them where they lie and writes none.
+        for (index, prepared) in stages.iter().enumerate() {
+            let (Some(prepared), Some(at)) = (prepared, rings.tables(index)) else {
+                continue;
+            };
+            for (bytes, &address) in prepared.tables().iter().zip(&at) {
+                crate::device::stage_raw(stream, address, bytes)?;
+            }
+        }
         let cursors = vec![Cursor { head: 0, tail: 0 }; shapes.len()];
 
         let commit_key = crate::device::held::pool::commit_key(2 * size_of::<u32>());
@@ -172,6 +183,12 @@ impl Session {
         let seeded = session.cursors_now();
         session.rings.seed_registry(&seeded, stream)?;
         Ok(session)
+    }
+
+    /// Where stage `stage`'s tables lie on the device now.
+    #[must_use]
+    pub fn tables(&self, stage: usize) -> Option<[u64; 4]> {
+        self.rings.tables(stage)
     }
 
     /// Points the rings at `place`, where their pool slots lie now.
@@ -943,7 +960,7 @@ fn stages_and_plans_agree(compiled: &Compiled) -> Result<()> {
         &compiled
             .stages
             .iter()
-            .map(|stage| (stage.signature_hash, !stage.regions.is_empty()))
+            .map(|stage| (stage.signature_hash, !stage.steps.is_empty()))
             .collect::<Vec<_>>(),
         &compiled
             .plans
@@ -971,8 +988,8 @@ fn stage_plans_are_parallel(stages: &[(u64, bool)], plans: &[u64]) -> Result<()>
             return Err(Fault::program(
                 "program::session",
                 format!(
-                    "stage {index} has regions to launch and the plan at that index \
-                     describes a different stage: its regions would index scratch, \
+                    "stage {index} has steps to launch and the plan at that index \
+                     describes a different stage: its steps would index scratch, \
                      descriptors and a channel table sized for someone else"
                 ),
             ));

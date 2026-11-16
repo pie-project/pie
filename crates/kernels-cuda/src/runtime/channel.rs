@@ -198,6 +198,28 @@ const _: () = assert!(size_of::<WordRun>() == 16);
 
 const GATHER_BLOCK: u32 = 32;
 
+/// The kernels a guest fire runs around its stages: the pull, bump,
+/// publish and settle of its tickets, and the gathers a decode envelope's
+/// mask takes.
+const FIRE_KERNELS: [&str; 8] = [
+    "::pie::runtime::channel::gather_words",
+    "::pie::runtime::channel::pull_validate",
+    "::pie::runtime::channel::commit_bump",
+    "::pie::runtime::channel::scatter_publish",
+    "::pie::runtime::channel::settle",
+    "::pie::runtime::channel::mask_from_commit",
+    "::pie::runtime::channel::gather_bits",
+    "::pie::runtime::channel::gather_bit_runs",
+];
+
+/// Loads every kernel a guest fire runs ([`FIRE_KERNELS`]) on the current
+/// device, so that no fire builds one.
+pub fn load() -> Result<(), Error> {
+    FIRE_KERNELS
+        .iter()
+        .try_for_each(|name| kernel(FILE, name).load())
+}
+
 /// Copies each of `run_count` runs at `runs` into `dst`, a block a run: one
 /// launch where a copy a run would be a driver call and a copy node apiece.
 pub fn gather_words(

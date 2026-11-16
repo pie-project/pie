@@ -289,9 +289,9 @@ pub fn with_host_codegen<'a>(
     };
     let registered = lookup(plan.program_hash);
 
-    let emitted = plan
-        .emitted_kernels
-        .is_empty()
+    // A CUDA or HIP engine runs a stage as steps of the closed set it built
+    // at load, and reads no emitted region.
+    let emitted = (plan.emitted_kernels.is_empty() && !matches!(backend, "cuda" | "hip"))
         .then(|| registered.as_ref()?.emitted(backend))
         .flatten();
 

@@ -1,10 +1,11 @@
 #![allow(unsafe_code)]
-use eta_compiler::codegen::launch::{LaunchRegion, LaunchStagePlan};
+use eta_compiler::codegen::cuda_steps;
+use eta_compiler::codegen::launch::LaunchStagePlan;
 use eta_compiler::plan::{LibraryOp, RegionKind};
+use eta_exec::tables::StageTables;
 use eta_exec::{
     Extents, LANE_HEADER_BYTES, LANE_RECORD_BYTES, LaneChannelSlot, LaneHeader, LaneRecord,
-    LaneShape, Launch, Launches, Layout, NO_TICKET, OpParams, SCRATCH_ALIGN, SCRATCH_DUMMY_BYTES,
-    SCRATCH_POISON, ValueDesc, describe_launched, region_rows,
+    LaneShape, NO_TICKET, OpParams, SCRATCH_ALIGN, SCRATCH_DUMMY_BYTES, SCRATCH_POISON, ValueDesc,
 };
 use eta_ir::Dtype;
 use eta_ir::container::HostRole;
@@ -17,28 +18,8 @@ use kernels_cuda::runtime::channel::MAX_RING;
 
 use crate::error::{Fault, Result};
 
-use super::compile::{Module, Region};
+use super::compile::{Module, Stage};
 use super::endpoint::Endpoint;
-
-const FUSED_ARITY: usize = 18;
-
-pub const ORDER_ROW_BLOCKS: u32 = 32;
-/// The most blocks a lane's sampler region runs on (`sample_lane.cuh`); a
-/// fire runs as many as the device holds at once with its lanes, from one.
-pub const LANE_SAMPLER_BLOCKS: u32 = 16;
-/// A sampler block's arena: a barrier word's line, two exchange buffers and
-/// two buffers of 512 gathered elements (`M1_FAST_GATHER`).
-const LANE_SAMPLER_ARENA: u64 = 64 + 2 * 24_576 + 2 * 512 * 8;
-
-/// Whether `kind` is a lane sampler region: its lane's blocks split each row
-/// and meet at a barrier (`LANE_SAMPLER_BLOCKS`).
-#[must_use]
-pub fn lane_sampler(kind: RegionKind) -> bool {
-    matches!(
-        kind,
-        RegionKind::Library(LibraryOp::NucleusSample | LibraryOp::RankSample | LibraryOp::LaneCut)
-    )
-}
 
 pub const INTRINSIC_STORAGE_F32: u32 = 0;
 
@@ -49,88 +30,6 @@ pub const INTRINSIC_STORAGE_ROW_POINTERS: u32 = 2;
 pub const INTRINSIC_STORAGE_RAW_I32: u32 = 3;
 
 pub const BOOL_STORAGE_NATIVE_BYTES: u32 = 0;
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(C)]
-pub struct CudaOpParams {
-    pub tag: u32,
-    pub a0: u32,
-    pub a1: u32,
-    pub a2: u32,
-    pub o0: u32,
-    pub o1: u32,
-    pub imm: u32,
-    pub imm2: u32,
-    pub imm3: u32,
-    pub kind: u32,
-    pub pred_tag: u32,
-    pub lit_dtype: u32,
-    pub lit_bits: u32,
-    pub channel_slot: u32,
-    pub intr: u32,
-    pub sink_bytes: u32,
-
-    pub intrinsic_dtype: u32,
-    pub bool_storage: u32,
-    pub intrinsic_row_stride: u32,
-    pub intrinsic_row_offset: u32,
-    pub rng_seed: u64,
-}
-
-const _: () = assert!(size_of::<CudaOpParams>() == 88);
-
-const _: () = {
-    assert!(std::mem::offset_of!(CudaOpParams, tag) == 0);
-    assert!(std::mem::offset_of!(CudaOpParams, a0) == 4);
-    assert!(std::mem::offset_of!(CudaOpParams, a1) == 8);
-    assert!(std::mem::offset_of!(CudaOpParams, a2) == 12);
-    assert!(std::mem::offset_of!(CudaOpParams, o0) == 16);
-    assert!(std::mem::offset_of!(CudaOpParams, o1) == 20);
-    assert!(std::mem::offset_of!(CudaOpParams, imm) == 24);
-    assert!(std::mem::offset_of!(CudaOpParams, imm2) == 28);
-    assert!(std::mem::offset_of!(CudaOpParams, imm3) == 32);
-    assert!(std::mem::offset_of!(CudaOpParams, kind) == 36);
-    assert!(std::mem::offset_of!(CudaOpParams, pred_tag) == 40);
-    assert!(std::mem::offset_of!(CudaOpParams, lit_dtype) == 44);
-    assert!(std::mem::offset_of!(CudaOpParams, lit_bits) == 48);
-    assert!(std::mem::offset_of!(CudaOpParams, channel_slot) == 52);
-    assert!(std::mem::offset_of!(CudaOpParams, intr) == 56);
-    assert!(std::mem::offset_of!(CudaOpParams, sink_bytes) == 60);
-    assert!(std::mem::offset_of!(CudaOpParams, intrinsic_dtype) == 64);
-    assert!(std::mem::offset_of!(CudaOpParams, bool_storage) == 68);
-    assert!(std::mem::offset_of!(CudaOpParams, intrinsic_row_stride) == 72);
-    assert!(std::mem::offset_of!(CudaOpParams, intrinsic_row_offset) == 76);
-    assert!(std::mem::offset_of!(CudaOpParams, rng_seed) == 80);
-};
-
-impl CudaOpParams {
-    #[must_use]
-    pub const fn widen(shared: OpParams) -> CudaOpParams {
-        CudaOpParams {
-            tag: shared.tag,
-            a0: shared.a0,
-            a1: shared.a1,
-            a2: shared.a2,
-            o0: shared.o0,
-            o1: shared.o1,
-            imm: shared.imm,
-            imm2: shared.imm2,
-            imm3: shared.imm3,
-            kind: shared.kind,
-            pred_tag: shared.pred_tag,
-            lit_dtype: shared.lit_dtype,
-            lit_bits: shared.lit_bits,
-            channel_slot: shared.channel_slot,
-            intr: shared.intr,
-            sink_bytes: shared.sink_bytes,
-            intrinsic_dtype: INTRINSIC_STORAGE_F32,
-            bool_storage: BOOL_STORAGE_NATIVE_BYTES,
-            intrinsic_row_stride: 0,
-            intrinsic_row_offset: 0,
-            rng_seed: 0,
-        }
-    }
-}
 
 #[must_use]
 pub fn native_cell_bytes(dtype: Dtype, numel: usize) -> usize {
@@ -222,8 +121,9 @@ impl ChannelShape {
 
 /// What an instance of a program keeps in the pool
 /// (`new-memory/STATE-ROLES.md`): its own item, the rings' registry and
-/// then the native cells of each ring the host reads or writes, and the
-/// rings only the device touches, an item each.
+/// then the native cells of each ring the host reads or writes, then each
+/// stage's bind-time tables (`eta_exec::tables`); and the rings only the
+/// device touches, an item each.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Held {
     /// The instance's item, whole.
@@ -234,14 +134,23 @@ pub struct Held {
     /// The bytes of each ring that is an item of its own; `None` for the
     /// channels above.
     pub ring_bytes: Vec<Option<u64>>,
+    /// Where each stage's tables lie in the instance's item: its
+    /// descriptors, op params, value offsets and config.
+    pub tables: Vec<[u64; 4]>,
 }
 
 /// What every cell span in an item starts a whole number of.
 const CELL_ALIGN: u64 = 64;
 
+/// What every table in an item starts a whole number of.
+const TABLE_ALIGN: u64 = 256;
+
 impl Held {
     #[must_use]
-    pub fn of(channels: &[eta_compiler::codegen::launch::LaunchChannel]) -> Held {
+    pub fn of(
+        channels: &[eta_compiler::codegen::launch::LaunchChannel],
+        plans: &[LaunchStagePlan],
+    ) -> Held {
         let mut at = registry_bytes(channels.len()).next_multiple_of(CELL_ALIGN);
         let mut native_at = Vec::with_capacity(channels.len());
         let mut ring_bytes = Vec::with_capacity(channels.len());
@@ -257,10 +166,21 @@ impl Held {
                 at = (at + bytes).next_multiple_of(CELL_ALIGN);
             }
         }
+        let mut tables = Vec::with_capacity(plans.len());
+        for plan in plans {
+            let mut stage = [0u64; 4];
+            for (slot, bytes) in stage.iter_mut().zip(eta_exec::tables::table_sizes(plan)) {
+                at = at.next_multiple_of(TABLE_ALIGN);
+                *slot = at;
+                at += bytes;
+            }
+            tables.push(stage);
+        }
         Held {
             instance_bytes: at,
             native_at,
             ring_bytes,
+            tables,
         }
     }
 }
@@ -395,6 +315,14 @@ impl Rings {
             u32::try_from(slots).unwrap_or(u32::MAX),
         );
         Ok(())
+    }
+
+    /// Where stage `stage`'s tables lie on the device now: its
+    /// descriptors, op params, value offsets and config.
+    #[must_use]
+    pub fn tables(&self, stage: usize) -> Option<[u64; 4]> {
+        let offsets = self.held.tables.get(stage)?;
+        Some(offsets.map(|at| self.registry + at))
     }
 
     #[must_use]
@@ -583,17 +511,17 @@ pub struct Cursor {
 }
 #[derive(Debug)]
 pub struct Prepared {
-    /// Where this stage's tables and scratch lie in the fire's span, laid
-    /// by [`Prepared::lay`]: each an address in it.
+    /// The stage's bind-time tables (descriptors, op params, value offsets,
+    /// config; `eta_exec::tables::stage_tables` at the bind's extents), as
+    /// a bind writes them into each instance's `Instance` slots
+    /// (`Held::tables`).
+    tables: [Vec<u8>; 4],
+    /// The blocks a step runs a lane on.
+    groups: u32,
+    /// Where the fire's lane table, scratch and cells lie in its span,
+    /// laid by [`Prepared::lay`]: each an address in it.
     table: u64,
     table_host: Vec<u8>,
-    descriptors: u64,
-    descriptor_row: Vec<u8>,
-    descriptors_host: Vec<u8>,
-    params: u64,
-    params_host: Vec<u8>,
-    offsets: u64,
-    offsets_host: Vec<u8>,
     scratch: u64,
     /// The lanes' intrinsic tables (bases, modes, widths, strides,
     /// offsets) and pending flags, one span staged in one copy a commit
@@ -613,12 +541,7 @@ pub struct Prepared {
     names: Vec<String>,
     output_slots: u32,
     channel_count: u32,
-    value_count: u32,
     scratch_stride: u32,
-    temporary_offset: u32,
-    temporary_bytes: u32,
-    region_rows: Vec<u32>,
-    samplers: Vec<bool>,
     lanes: u32,
     filled: u32,
     bindings: Vec<u32>,
@@ -627,153 +550,42 @@ pub struct Prepared {
 /// What every span of a stage starts a whole number of in the fire's span.
 const SPAN_ALIGN: u64 = 256;
 
-/// The spans a stage lays: its params, offsets, table, descriptors, scratch
-/// and cells.
-const SPANS: u64 = 6;
+/// The spans a stage lays in a fire's span: its lane table, scratch and
+/// cells.
+const SPANS: u64 = 3;
 
-#[must_use]
-pub(crate) fn shell_launches(region: &LaunchRegion) -> bool {
-    region.kind != RegionKind::Library(LibraryOp::SecondParty)
+/// The blocks a step of a stage runs a lane on: enough for its widest
+/// value a thread an element, at most four a multiprocessor.
+fn groups_for(descriptors: &[ValueDesc]) -> u32 {
+    let widest = descriptors.iter().map(|d| d.len).max().unwrap_or(1).max(1);
+    widest
+        .div_ceil(cuda_steps::BLOCK)
+        .clamp(1, device_units().saturating_mul(4).max(1))
 }
 
+/// `plan`'s tables and a lane's scratch at `extents`. A sink's operands (an
+/// adapter's planes, landed at bind) are the engine's, and take no bytes of
+/// a lane.
+fn staged(plan: &LaunchStagePlan, extents: Extents) -> Result<StageTables> {
+    eta_exec::tables::stage_tables_launched(plan, &extents, |region| {
+        region.kind != RegionKind::Library(LibraryOp::SecondParty)
+    })
+    .map_err(|why| Fault::program("program::launch", why))
+}
+
+/// Each of `plan`'s values as a bind at `extents` describes it.
 pub fn describe_values(plan: &LaunchStagePlan, extents: Extents) -> Result<Vec<ValueDesc>> {
-    describe_launched(plan, &extents, shell_launches).map_err(|why| {
-        Fault::program(
-            "program::launch",
-            format!("a value's shape does not resolve against this fire: {why:?}"),
-        )
-    })
+    staged(plan, extents).map(|staged| staged.descriptors)
 }
 
-/// The blocks each region runs across.
-fn region_blocks(plan: &LaunchStagePlan, descriptors: &[ValueDesc]) -> Vec<u32> {
-    plan.fused
-        .iter()
-        .zip(region_rows(plan, descriptors))
-        .map(|(region, rows)| match region.kind {
-            RegionKind::Generated => rows,
-            kind if lane_sampler(kind) => LANE_SAMPLER_BLOCKS,
-            RegionKind::Library(LibraryOp::TopK) if selects(plan, region) => rows,
-            RegionKind::Library(LibraryOp::TopK | LibraryOp::Sort) => rows.min(ORDER_ROW_BLOCKS),
-            RegionKind::Library(_) => 1,
-        })
-        .collect()
-}
-
-fn selects(plan: &LaunchStagePlan, region: &LaunchRegion) -> bool {
-    region
-        .nodes
-        .first()
-        .and_then(|&node| plan.ops.get(node as usize))
-        .is_some_and(|op| {
-            op.tag == tags::TOP_K
-                && (1..=eta_compiler::codegen::cuda::order::TOP_K_SELECT_MAX).contains(&op.imm)
-        })
-}
-
-/// The bytes a lane's temporary area holds: the most a region's blocks keep
-/// there between them (a launch hands each block its share,
-/// `launch_region`).
-fn temporary_bytes(plan: &LaunchStagePlan, descriptors: &[ValueDesc], blocks: &[u32]) -> u64 {
-    plan.fused
-        .iter()
-        .zip(blocks)
-        .map(|(region, &blocks)| {
-            block_temporary(plan, descriptors, region)
-                .checked_next_multiple_of(SCRATCH_ALIGN)
-                .unwrap_or(u64::MAX)
-                .saturating_mul(u64::from(blocks.max(1)))
-        })
-        .max()
-        .unwrap_or(0)
-}
-
-/// The bytes a block of `region` keeps in the temporary area: what its
-/// kernel does, by the emitter that writes it.
-fn block_temporary(
-    plan: &LaunchStagePlan,
-    descriptors: &[ValueDesc],
-    region: &LaunchRegion,
-) -> u64 {
-    let widest = descriptors
-        .iter()
-        .map(|d| u64::from(d.last))
-        .max()
-        .unwrap_or(1)
-        .max(1);
-    match region.kind {
-        // A generated region's block keeps its reductions' levels here and
-        // nothing else.
-        RegionKind::Generated => {
-            eta_compiler::codegen::launch::generated_temporary_bytes(plan, region, widest)
-        }
-        // A sampler block's arena (`sample_lane.cuh`).
-        kind if lane_sampler(kind) => LANE_SAMPLER_ARENA,
-        // A select keeps its candidates in the block's shared memory.
-        RegionKind::Library(LibraryOp::TopK) if selects(plan, region) => 0,
-        // An order block sorts through two rows of indices (`order_a`,
-        // `order_b`).
-        RegionKind::Library(LibraryOp::TopK | LibraryOp::Sort) => {
-            8 * order_width(plan, descriptors, region).unwrap_or(widest)
-        }
-        // A scan and a matmul keep nothing here.
-        RegionKind::Library(_) => 0,
-    }
-}
-
-/// The width of the rows an order region sorts: its one node's input's.
-fn order_width(
-    plan: &LaunchStagePlan,
-    descriptors: &[ValueDesc],
-    region: &LaunchRegion,
-) -> Option<u64> {
-    let op = plan.ops.get(*region.nodes.first()? as usize)?;
-    let input = descriptors.get(*op.args.first()? as usize)?;
-    Some(u64::from(input.last))
-}
-
-/// The stage as this engine runs it: a launch a region across its blocks,
-/// a value a region's kernel never touches (what it streams through
-/// registers, what a scan of the model's row leaves unwritten, a reshape
-/// read as its source, a sampler's interior) taking no bytes, the temporary
-/// area what its kernels keep there.
-fn launches<'a>(plan: &'a LaunchStagePlan, blocks: &[u32], temporary: u64) -> Launches<'a> {
-    Launches {
-        each: plan
-            .fused
-            .iter()
-            .zip(blocks)
-            .map(|(region, &blocks)| Launch::of_region(region, blocks))
-            .collect(),
-        hollow: plan
-            .fused
-            .iter()
-            .flat_map(|region| region.spent.iter().copied())
-            .collect(),
-        temporary,
-        ..Launches::default()
-    }
-}
-
-fn lay_out(plan: &LaunchStagePlan, descriptors: &[ValueDesc]) -> Result<Layout> {
-    let blocks = region_blocks(plan, descriptors);
-    let temporary = temporary_bytes(plan, descriptors, &blocks);
-    eta_exec::lay_out(plan, descriptors, &launches(plan, &blocks, temporary)).map_err(|why| {
-        Fault::program(
-            "program::launch",
-            format!("this fire's scratch does not fit: {why:?}"),
-        )
-    })
-}
-
+/// The bytes a lane of `plan` at `extents` takes of a fire's scratch.
 pub fn scratch_bytes(plan: &LaunchStagePlan, extents: Extents) -> Result<u64> {
-    let descriptors = describe_values(plan, extents)?;
-    lay_out(plan, &descriptors).map(|layout| layout.total)
+    staged(plan, extents).map(|staged| staged.scratch)
 }
 
+/// Where each of `plan`'s values lies in a lane's scratch at `extents`.
 pub fn scratch_offsets(plan: &LaunchStagePlan, extents: Extents) -> Result<Vec<u64>> {
-    let descriptors = describe_values(plan, extents)?;
-    lay_out(plan, &descriptors).map(|layout| layout.values)
+    staged(plan, extents).map(|staged| staged.offsets)
 }
 
 impl Prepared {
@@ -784,75 +596,46 @@ impl Prepared {
     ) -> Result<Prepared> {
         let channel_count = u32::try_from(plan.channel_bindings.len())
             .map_err(|_| Fault::program("program::launch", "more channels than a u32 can count"))?;
-        let value_count = u32::try_from(plan.value_types.len())
-            .map_err(|_| Fault::program("program::launch", "more values than a u32 can count"))?;
-
-        let descriptors = describe_values(plan, extents)?;
-        let scratch_layout = lay_out(plan, &descriptors)?;
-        let scratch_stride = u32::try_from(scratch_layout.total)
-            .map_err(|_| Fault::program("program::launch", "a scratch stride past a u32"))?;
-        let temporary_offset = u32::try_from(scratch_layout.temporary)
-            .map_err(|_| Fault::program("program::launch", "a temporary offset past a u32"))?;
-        let temporary_bytes = u32::try_from(scratch_layout.temporary_bytes)
-            .map_err(|_| Fault::program("program::launch", "a temporary arena past a u32"))?;
-        let region_rows = region_blocks(plan, &descriptors);
-        let samplers = plan
-            .fused
-            .iter()
-            .map(|region| lane_sampler(region.kind))
-            .collect();
-
-        let mut records = Vec::with_capacity(plan.ops.len());
-        let mut result_base = 0u32;
-        for op in &plan.ops {
-            let mut record = CudaOpParams::widen(OpParams::of(op, result_base, plan.output_slots));
-            if let (true, Some(channel)) = (op.tag == tags::CHAN_PUT, op.channel) {
-                let dense = plan
-                    .channel_bindings
-                    .get(channel as usize)
-                    .copied()
-                    .ok_or_else(|| {
-                        Fault::program(
-                            "program::launch",
-                            format!(
-                                "a put names stage-local channel {channel}, which the plan \
-                                 does not bind"
-                            ),
-                        )
-                    })?;
-                let shape = shapes.get(dense as usize).copied().ok_or_else(|| {
+        let staged = staged(plan, extents)?;
+        let mut tables = staged.tables;
+        // A put's cell bytes, which the shared params leave to the engine.
+        let record = size_of::<OpParams>();
+        for (at, op) in plan.ops.iter().enumerate() {
+            let (true, Some(channel)) = (op.tag == tags::CHAN_PUT, op.channel) else {
+                continue;
+            };
+            let dense = plan
+                .channel_bindings
+                .get(channel as usize)
+                .copied()
+                .ok_or_else(|| {
                     Fault::program(
                         "program::launch",
                         format!(
-                            "a put targets channel {dense}, which this instance does not carry"
+                            "a put names stage-local channel {channel}, which the plan does \
+                             not bind"
                         ),
                     )
                 })?;
-                record.sink_bytes = u32::try_from(shape.cell_bytes()).map_err(|_| {
-                    Fault::program("program::launch", "a channel cell past what a u32 counts")
-                })?;
-            }
-            records.push(record);
-            result_base += u32::from(op.result_count);
+            let shape = shapes.get(dense as usize).copied().ok_or_else(|| {
+                Fault::program(
+                    "program::launch",
+                    format!("a put targets channel {dense}, which this instance does not carry"),
+                )
+            })?;
+            let bytes = u32::try_from(shape.cell_bytes()).map_err(|_| {
+                Fault::program("program::launch", "a channel cell past what a u32 counts")
+            })?;
+            let word = at * record + 15 * size_of::<u32>();
+            tables[1][word..word + 4].copy_from_slice(&bytes.to_le_bytes());
         }
-
-        let offsets_host: Vec<u8> = scratch_layout
-            .values
-            .iter()
-            .map(|&at| u32::try_from(at).unwrap_or(u32::MAX))
-            .flat_map(u32::to_le_bytes)
-            .collect();
-
+        let scratch_stride = u32::try_from(staged.scratch)
+            .map_err(|_| Fault::program("program::launch", "a scratch stride past a u32"))?;
         Ok(Prepared {
+            tables,
+            groups: groups_for(&staged.descriptors),
             table: 0,
             table_host: Vec::new(),
-            descriptors: 0,
-            descriptor_row: descriptors.iter().flat_map(record_bytes).collect(),
-            descriptors_host: Vec::new(),
-            params: 0,
-            params_host: records_bytes(&records),
-            offsets: 0,
-            offsets_host,
             scratch: 0,
             cells: 0,
             cell_at: [0; 6],
@@ -866,62 +649,48 @@ impl Prepared {
             names: plan.names.clone(),
             output_slots: plan.output_slots,
             channel_count,
-            value_count,
             scratch_stride,
-            temporary_offset,
-            temporary_bytes,
-            region_rows,
-            samplers,
             lanes: 0,
             filled: 0,
             bindings: plan.channel_bindings.clone(),
         })
     }
 
-    /// The bytes of the spans whose size no lane count changes: the params
-    /// and offsets, the table's header, and the room every span's
-    /// alignment may take.
+    /// The stage's tables, in [`Held::tables`] order, as a bind writes them.
     #[must_use]
-    pub fn fixed_bytes(&self) -> u64 {
-        (self.params_host.len().max(size_of::<CudaOpParams>())
-            + self.offsets_host.len().max(size_of::<u32>())) as u64
-            + LANE_HEADER_BYTES
-            + SPANS * SPAN_ALIGN
-            + 6 * 16
+    pub const fn tables(&self) -> &[Vec<u8>; 4] {
+        &self.tables
     }
 
-    /// The bytes each lane adds: its record and channel slots, its
-    /// descriptor row, its scratch and its intrinsic and pending cells.
+    /// The bytes of the spans whose size no lane count changes: the lane
+    /// table's header, and the room every span's alignment may take.
+    #[must_use]
+    pub fn fixed_bytes(&self) -> u64 {
+        LANE_HEADER_BYTES + SPANS * SPAN_ALIGN + 6 * 16
+    }
+
+    /// The bytes each lane adds: its record and channel slots, its scratch
+    /// and its intrinsic and pending cells.
     #[must_use]
     pub fn lane_bytes(&self) -> u64 {
         let words = self.pitch as u64;
         LANE_RECORD_BYTES
             + u64::from(self.channel_count) * size_of::<LaneChannelSlot>() as u64
-            + self.descriptor_row.len().max(1) as u64
             + u64::from(self.scratch_stride)
             + words * (size_of::<u64>() + 4 * size_of::<u32>()) as u64
             + u64::from(self.channel_count).max(1)
     }
 
     /// Lays this stage for `lanes` lanes in the fire's span from `at` up,
-    /// and returns where its bytes end. `fresh`: the span was laid
-    /// otherwise since this stage last lay here, so the tables no lane
-    /// changes are staged again. Nothing is kept there between fires: a
-    /// span is the fire's.
-    pub fn lay(
-        &mut self,
-        extents: Extents,
-        lanes: u32,
-        at: u64,
-        fresh: bool,
-        stream: *mut core::ffi::c_void,
-    ) -> Result<u64> {
+    /// and returns where its bytes end. Nothing is kept there between
+    /// fires: a span is the fire's.
+    pub fn lay(&mut self, extents: Extents, lanes: u32, at: u64) -> Result<u64> {
         self.filled = 0;
         let lanes = lanes.max(1);
         let total = u64::from(self.scratch_stride) * u64::from(lanes);
         if total > eta_exec::SCRATCH_MAX_BYTES {
             return Err(Fault::Ceiling {
-                what: "a wave's fused-region scratch",
+                what: "a wave's guest scratch",
                 need: total,
                 have: eta_exec::SCRATCH_MAX_BYTES,
             });
@@ -932,11 +701,6 @@ impl Prepared {
             next = (here + bytes as u64).next_multiple_of(SPAN_ALIGN);
             here
         };
-        let params = take(self.params_host.len().max(size_of::<CudaOpParams>()));
-        let offsets = take(self.offsets_host.len().max(size_of::<u32>()));
-        let moved = fresh || params != self.params || lanes != self.lanes;
-        self.params = params;
-        self.offsets = offsets;
         let shape = LaneShape::of(lanes, self.channel_count);
         let table_bytes = shape
             .bytes()
@@ -980,19 +744,6 @@ impl Prepared {
             self.table_host = table_host;
         }
         self.table = take(table_bytes);
-
-        let row = self.descriptor_row.len().max(1);
-        self.descriptors = take(row * lanes as usize);
-        if lanes != self.lanes {
-            self.descriptors_host = self
-                .descriptor_row
-                .iter()
-                .copied()
-                .cycle()
-                .take(self.descriptor_row.len() * lanes as usize)
-                .collect();
-        }
-
         self.scratch = take(
             (self.scratch_stride as usize * lanes as usize)
                 .max(usize::try_from(SCRATCH_ALIGN).unwrap_or(256)),
@@ -1024,11 +775,6 @@ impl Prepared {
         }
         self.cells = take(cell_at);
         self.lanes = lanes;
-        if moved {
-            crate::device::stage_raw(stream, self.params, &self.params_host)?;
-            crate::device::stage_raw(stream, self.offsets, &self.offsets_host)?;
-            crate::device::stage_raw(stream, self.descriptors, &self.descriptors_host)?;
-        }
         Ok(next)
     }
 
@@ -1172,49 +918,20 @@ impl Prepared {
         self.cells + self.cell_at[cell] as u64
     }
 
-    pub fn launch_region(&self, region: &Region, stream: *mut core::ffi::c_void) -> Result<()> {
-        if self.filled == 0 {
+    /// Launches `stage`'s steps for the lanes staged, in order, each a
+    /// kernel of the closed set over every lane at once: the stage's
+    /// tables at `tables` (where a bind laid them, in an instance of the
+    /// flight; every instance of it lays the same bytes), each lane over
+    /// its own scratch.
+    pub fn launch_steps(
+        &self,
+        stage: &Stage,
+        tables: [u64; 4],
+        stream: *mut core::ffi::c_void,
+    ) -> Result<()> {
+        if self.filled == 0 || stage.steps.is_empty() {
             return Ok(());
         }
-        let mut args = Args::new();
-        args.ptr(self.table)
-            .ptr(self.lane_records_ptr())
-            .ptr(self.channel_slots_ptr())
-            .ptr(self.descriptors)
-            .ptr(self.params)
-            .ptr(self.offsets)
-            .ptr(self.scratch)
-            .u32(self.value_count)
-            .u32(self.scratch_stride)
-            .u32(self.temporary_offset)
-            .ptr(self.cell(5))
-            .ptr(self.cell(0))
-            .ptr(self.cell(1))
-            .ptr(self.cell(2))
-            .ptr(self.cell(3))
-            .ptr(self.cell(4));
-        let rows = self
-            .region_rows
-            .get(region.region_index as usize)
-            .copied()
-            .unwrap_or(1)
-            .max(1);
-        let stride = (self.temporary_bytes / rows) & !(SCRATCH_ALIGN as u32 - 1);
-        let sampler = self
-            .samplers
-            .get(region.region_index as usize)
-            .copied()
-            .unwrap_or(false);
-        // A sampler lane runs on as many blocks as the device holds at once
-        // with the fire's lanes (its blocks wait on one another), each over
-        // its own arena; the lanes' barrier words start at zero.
-        let rows = if sampler {
-            self.zero_barriers(stream)?;
-            (device_units() / self.filled.max(1)).clamp(1, LANE_SAMPLER_BLOCKS.min(rows))
-        } else {
-            rows
-        };
-        args.u32(rows).u32(stride);
         // A value stated to take no bytes lies on the lane's dummy bytes: a
         // build with `test-slot-fill` poisons them before every launch, so a
         // kernel that reads one answers wrongly where a golden sees it.
@@ -1222,21 +939,39 @@ impl Prepared {
         if cfg!(feature = "test-slot-fill") {
             self.poison_dummy(stream)?;
         }
-        launch(
-            &region.module,
-            self.filled.saturating_mul(rows),
-            region.module.block_threads(),
-            &mut args,
-            FUSED_ARITY,
-            stream,
-        )
-    }
-
-    /// Whether a region of this stage is a lane sampler, whose blocks wait
-    /// for one another and so need their grid resident at once.
-    #[must_use]
-    pub fn meets_across_blocks(&self) -> bool {
-        self.samplers.iter().any(|&sampler| sampler)
+        let pitch = u32::try_from(self.pitch).unwrap_or(u32::MAX);
+        for step in stage.steps.iter() {
+            let mut args = Args::new();
+            args.ptr(self.table)
+                .ptr(self.lane_records_ptr())
+                .ptr(self.channel_slots_ptr())
+                .ptr(tables[0])
+                .ptr(tables[1])
+                .ptr(tables[2])
+                .ptr(tables[3])
+                .ptr(self.scratch)
+                .u32(self.scratch_stride)
+                .ptr(self.cell(5))
+                .ptr(self.cell(0))
+                .ptr(self.cell(1))
+                .ptr(self.cell(2))
+                .ptr(self.cell(3))
+                .ptr(self.cell(4))
+                .u32(pitch)
+                .u32(self.groups)
+                .u32(step.uniform.node)
+                .u32(step.uniform.rung)
+                .u32(step.uniform.selector);
+            launch(
+                &step.module,
+                self.filled.saturating_mul(self.groups),
+                cuda_steps::BLOCK,
+                &mut args,
+                cuda_steps::ARITY,
+                stream,
+            )?;
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -1283,15 +1018,9 @@ fn write_record<T: Copy>(into: &mut [u8], at: usize, record: &T) {
     into[at..at + bytes.len()].copy_from_slice(bytes);
 }
 
-pub(super) fn record_bytes<T: Copy>(record: &T) -> Vec<u8> {
-    // SAFETY: as `write_record` — a fully-initialised `#[repr(C)]` mirror.
-    unsafe {
-        std::slice::from_raw_parts(std::ptr::from_ref(record).cast::<u8>(), size_of::<T>()).to_vec()
-    }
-}
-
 pub(super) fn slice_bytes<T: Copy>(records: &[T]) -> Vec<u8> {
-    // SAFETY: as `record_bytes`, over a contiguous run of them.
+    // SAFETY: as `write_record`, over a contiguous run of fully-initialised
+    // `#[repr(C)]` mirrors.
     unsafe {
         std::slice::from_raw_parts(
             records.as_ptr().cast::<u8>(),
@@ -1299,14 +1028,6 @@ pub(super) fn slice_bytes<T: Copy>(records: &[T]) -> Vec<u8> {
         )
         .to_vec()
     }
-}
-
-fn records_bytes(params: &[CudaOpParams]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(size_of_val(params));
-    for record in params {
-        bytes.extend_from_slice(&record_bytes(record));
-    }
-    bytes
 }
 
 #[derive(Default)]
@@ -1350,36 +1071,6 @@ impl Args {
 }
 
 impl Prepared {
-    /// The fire's lanes' sampler barrier words (the first 64 bytes of each
-    /// lane's temporary arena: a word a block) back to zero.
-    fn zero_barriers(&self, stream: *mut core::ffi::c_void) -> Result<()> {
-        #[cfg(feature = "device")]
-        {
-            use crate::device::dr;
-            // SAFETY: the scratch holds `filled` lanes `scratch_stride` apart,
-            // each with its temporary arena at `temporary_offset`.
-            let code = unsafe {
-                dr::cuMemsetD2D32Async(
-                    self.scratch + u64::from(self.temporary_offset),
-                    self.scratch_stride as usize,
-                    0,
-                    16,
-                    self.filled as usize,
-                    stream.cast(),
-                )
-            };
-            if code != dr::CUresult::CUDA_SUCCESS {
-                return Err(Fault::Device {
-                    call: "cuMemsetD2D32Async",
-                    code: code as i32,
-                });
-            }
-        }
-        #[cfg(not(feature = "device"))]
-        let _ = stream;
-        Ok(())
-    }
-
     /// The fire's lanes' dummy bytes (the first [`SCRATCH_DUMMY_BYTES`] of
     /// each lane's scratch, where every value that takes no bytes lies)
     /// filled with [`SCRATCH_POISON`].
@@ -1510,70 +1201,7 @@ pub fn launch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eta_ir::types::MAX_RANK;
 
-    /// A take its region runs after a constant cannot hand the constant its
-    /// slot: the scratch is laid out in the order the emitter runs the ops,
-    /// not the order the stage states them.
-    #[test]
-    fn a_region_lays_its_scratch_out_in_the_order_it_runs() {
-        let op =
-            |tag, result_count, args: Vec<u32>, channel| eta_compiler::codegen::launch::LaunchOp {
-                tag,
-                result_count,
-                args,
-                channel,
-                ..Default::default()
-            };
-        let mut plan = LaunchStagePlan {
-            ops: vec![
-                op(tags::CHAN_TAKE, 1, vec![], Some(1)),
-                op(tags::CONST, 1, vec![], None),
-                op(tags::CHAN_PUT, 0, vec![1], Some(0)),
-            ],
-            value_types: vec![
-                eta_compiler::codegen::launch::LaunchPlanValue {
-                    dtype: Dtype::U32,
-                    axes: vec![eta_compiler::plan::Dimension::Static(1)],
-                };
-                2
-            ],
-            fused: vec![LaunchRegion {
-                kind: RegionKind::Generated,
-                nodes: vec![0, 1, 2],
-                order: vec![1, 0, 2],
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let one = ValueDesc {
-            len: 1,
-            rows: 1,
-            last: 1,
-            rank: 1,
-            dtype: 0,
-            dims: [0; MAX_RANK],
-        };
-        let offsets = |plan: &LaunchStagePlan| {
-            eta_exec::lay_out(plan, &[one, one], &launches(plan, &[1], 0))
-                .expect("fits")
-                .values
-        };
-        let laid = offsets(&plan);
-        assert_ne!(
-            laid[0], laid[1],
-            "the take lands over the constant the put reads after it"
-        );
-        plan.fused[0].order.clear();
-        let stated = offsets(&plan);
-        assert_eq!(
-            stated[0], stated[1],
-            "in the stated order the constant may reuse the dead take's slot"
-        );
-    }
-
-    /// Guest programs as inferlets ship them, traced here: the scratch
-    /// they are laid is read off these.
     mod shipped {
         use eta_compiler::codegen::launch::LaunchPackage;
         use eta_compiler::plan::{CompiledStage, compile_bound};
@@ -1762,246 +1390,28 @@ mod tests {
     /// the temporary area's share of it; and what it was while the rows a
     /// scan of the model's row leaves unwritten, and the reshapes read as
     /// their sources, held bytes.
+    /// Every program inferlets ship runs as steps of the closed set, its
+    /// tables and a lane's scratch resolved at a bind's extents, the scratch
+    /// what a lane of a fire takes.
     #[test]
-    fn a_shipped_programs_scratch_a_lane() {
-        const WAS: [u64; 6] = [
-            3_505_408, 4_265_984, 3_040_512, 1_216_256, 2_508_544, 3_647_744,
-        ];
+    fn a_shipped_program_runs_as_steps_of_the_set() {
         let vocab = shipped::QWEN_VOCAB;
-        let totals: Vec<(&str, u64, u64, u64)> = shipped::all(vocab)
-            .iter()
-            .map(|(name, traced)| {
-                let package = shipped::package(traced, vocab);
-                let [plan] = &package.plans[..] else {
-                    panic!("{name}: one stage");
-                };
-                let descriptors = describe_values(plan, Extents::default()).expect("static shapes");
-                let own = eta_exec::layout(&descriptors).expect("fits").total;
-                let laid = lay_out(plan, &descriptors).expect("fits");
-                (*name, own, laid.total, laid.temporary_bytes)
-            })
-            .collect();
-        assert_eq!(
-            totals,
-            [
-                ("top-p", 9_312_512, 2_898_432, 921_600),
-                ("top-k + top-p", 9_616_896, 3_658_240, 921_600),
-                ("gumbel-max", 5_512_960, 1_792, 0),
-                ("greedy", 3_688_704, 768, 0),
-                ("top logprobs", 6_728_960, 1_900_800, 76_032),
-                ("sorted", 8_551_168, 3_040_000, 1_215_488),
-            ]
-        );
-        for ((name, _, now, _), was) in totals.iter().zip(WAS) {
-            assert!(*now < was, "{name}: {now} bytes a lane, {was} before");
-        }
-    }
-
-    /// No generated kernel of the programs inferlets ship names the bytes
-    /// of a value its stage states to take none (a generated kernel
-    /// addresses a value as `offsets[<its id>]` and no other way), and no
-    /// such value is one a region is handed, hands on or puts. A greedy or
-    /// a Gumbel-max lane, whose one argmax scans the model's row, holds no
-    /// row of the vocabulary at all.
-    #[test]
-    fn no_kernel_names_a_value_that_takes_no_bytes() {
-        let vocab = shipped::QWEN_VOCAB;
-        let mut unwritten_rows = Vec::new();
         for (name, traced) in shipped::all(vocab) {
-            let (stages, package) = shipped::compiled(&traced, vocab);
-            let ([stage], [plan]) = (&stages[..], &package.plans[..]) else {
+            let package = shipped::package(&traced, vocab);
+            let [plan] = &package.plans[..] else {
                 panic!("{name}: one stage");
             };
-            let descriptors = describe_values(plan, Extents::default()).expect("static shapes");
-            let laid = lay_out(plan, &descriptors).expect("fits");
-            let hollow: Vec<u32> = plan
-                .fused
-                .iter()
-                .flat_map(|region| region.spent.iter().copied())
-                .collect();
-            for &value in &hollow {
-                assert_eq!(laid.values[value as usize], 0, "{name}: value {value}");
-                for region in &plan.fused {
-                    assert!(
-                        !region.inputs.contains(&value)
-                            && !region.outputs.contains(&value)
-                            && region.sinks.iter().all(|sink| sink.value != value),
-                        "{name}: value {value} takes no bytes and a region holds it"
-                    );
-                }
-            }
-            for (index, (region, lowered)) in
-                stage.fused.regions.iter().zip(&plan.fused).enumerate()
-            {
-                if lowered.kind != RegionKind::Generated {
-                    continue;
-                }
-                let source = eta_compiler::codegen::cuda::emit_region("kernel", stage, region)
-                    .unwrap_or_else(|why| panic!("{name}: region {index}: {why:?}"))
-                    .replace("intrinsic_offsets[", "");
-                for &value in &hollow {
-                    assert!(
-                        !source.contains(&format!("offsets[{value}]")),
-                        "{name}: region {index} names value {value}, which takes no bytes"
-                    );
-                }
-            }
-            let rows = descriptors
-                .iter()
-                .zip(&laid.values)
-                .filter(|(descriptor, at)| descriptor.last == vocab && **at != 0)
-                .count();
-            if rows == 0 {
-                unwritten_rows.push(name);
-            }
-        }
-        assert_eq!(unwritten_rows, ["gumbel-max", "greedy"]);
-    }
-
-    /// The kernel of a region this engine states no temporary bytes for
-    /// names no temporary area, and one it states bytes for does: the
-    /// statement follows the emitters over the programs inferlets ship.
-    /// (An op the interpreter runs is handed the area whatever it is; the
-    /// interpreter goes to it for a reduction alone,
-    /// `ptir_m1_runtime_body.cuh`.)
-    #[test]
-    fn a_kernel_names_the_temporary_area_only_where_bytes_are_stated() {
-        // What every kernel's preamble says of the area, and a stream's
-        // pointer to it, which only its reductions go through.
-        const UNUSED: [&str; 3] = [
-            "m1_u8* temporary = scratch + temporary_offset + (m1_u64)lane_row * temporary_stride;",
-            "(void)temporary;",
-            "float* stream_work = reinterpret_cast<float*>(temporary);",
-        ];
-        // The tag of the op a line hands the interpreter, if it does.
-        let interpreted = |line: &str| -> Option<u8> {
-            let (_, call) = line.split_once("ptir_m1_execute(")?;
-            call.split_once('u')?.0.parse().ok()
-        };
-        let reduces =
-            |tag: u8| matches!(tag, tags::REDUCE_SUM | tags::REDUCE_MAX | tags::REDUCE_MIN);
-        let vocab = shipped::QWEN_VOCAB;
-        let mut stated_some = 0;
-        let mut stated_none = 0;
-        for (name, traced) in shipped::all(vocab) {
-            let (stages, package) = shipped::compiled(&traced, vocab);
-            let ([stage], [plan]) = (&stages[..], &package.plans[..]) else {
-                panic!("{name}: one stage");
-            };
-            let descriptors = describe_values(plan, Extents::default()).expect("static shapes");
-            assert_eq!(stage.fused.regions.len(), plan.fused.len());
-            for (index, (region, lowered)) in
-                stage.fused.regions.iter().zip(&plan.fused).enumerate()
-            {
-                let source = eta_compiler::codegen::cuda::emit_region("kernel", stage, region)
-                    .unwrap_or_else(|why| panic!("{name}: region {index}: {why:?}"));
-                let entry = source
-                    .rfind("extern \"C\" __global__ void ")
-                    .expect("a kernel has its entry");
-                let (_, block) = source[entry..]
-                    .split_once(") {")
-                    .expect("its parameters end where its block opens");
-                let mut body: String = block
-                    .lines()
-                    .filter(|line| interpreted(line).is_none_or(reduces))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                for unused in UNUSED {
-                    body = body.replace(unused, "");
-                }
-                let names: Vec<&str> = body
-                    .lines()
-                    .filter(|line| line.contains("temporary") || line.contains("stream_work"))
-                    .collect();
-                let stated = block_temporary(plan, &descriptors, lowered);
-                assert_eq!(
-                    !names.is_empty(),
-                    stated != 0,
-                    "{name}: region {index} ({:?}): {stated} bytes a block stated, named by {names:#?}",
-                    lowered.kind
-                );
-                if stated == 0 {
-                    stated_none += 1;
-                } else {
-                    stated_some += 1;
-                }
-            }
-        }
-        assert!(stated_some != 0 && stated_none != 0, "both kinds were seen");
-    }
-
-    /// A sampler region's kernel reads its logits, threshold and state and
-    /// writes its probabilities, kept flags and token: what its nodes
-    /// compute between those takes no bytes, what it touches keeps its own.
-    #[test]
-    fn a_samplers_untouched_values_take_no_bytes() {
-        let vocab = shipped::QWEN_VOCAB;
-        let package = shipped::package(&shipped::top_p(vocab), vocab);
-        let [plan] = &package.plans[..] else {
-            panic!("one stage");
-        };
-        let descriptors = describe_values(plan, Extents::default()).expect("static shapes");
-        let laid = lay_out(plan, &descriptors).expect("fits");
-        let bases: Vec<u32> = plan
-            .ops
-            .iter()
-            .scan(0u32, |next, op| {
-                let base = *next;
-                *next += u32::from(op.result_count);
-                Some(base)
-            })
-            .collect();
-        let sampler = plan
-            .fused
-            .iter()
-            .find(|region| lane_sampler(region.kind))
-            .expect("top-p's cut and draw are a sampler region");
-
-        let rows = sampler
-            .spent
-            .iter()
-            .filter(|&&value| descriptors[value as usize].last == vocab)
-            .count();
-        assert_eq!(rows, 7, "rows of the vocabulary the kernel never touches");
-        for &value in &sampler.spent {
-            assert_eq!(
-                laid.values[value as usize], 0,
-                "value {value} takes no bytes"
+            let steps = eta_compiler::codegen::cuda_steps::stage_steps(plan)
+                .unwrap_or_else(|tag| panic!("{name}: no kernel serves tag {tag:#x}"));
+            assert!(!steps.is_empty(), "{name}: a stage of no steps");
+            let staged = eta_exec::tables::stage_tables(plan, &Extents::default())
+                .unwrap_or_else(|why| panic!("{name}: {why}"));
+            assert!(
+                staged.scratch < 16 << 20,
+                "{name}: {} bytes of scratch a lane",
+                staged.scratch
             );
-            assert!(!sampler.inputs.contains(&value));
-            assert!(!sampler.outputs.contains(&value));
-            assert!(sampler.sinks.iter().all(|sink| sink.value != value));
         }
-
-        let node = |tag: u8| {
-            sampler
-                .nodes
-                .iter()
-                .copied()
-                .find(|&node| plan.ops[node as usize].tag == tag)
-                .expect("a sampler region holds its cut and its draw") as usize
-        };
-        let cut = node(tags::PIVOT_THRESHOLD);
-        let touched = [
-            plan.ops[node(tags::REDUCE_MAX)].args[0],
-            plan.ops[cut].args[0],
-            bases[cut],
-            plan.ops[node(tags::RNG_KEYED)].args[0],
-            bases[node(tags::REDUCE_ARGMAX)],
-        ];
-        let mut at: Vec<u64> = touched
-            .iter()
-            .map(|&value| laid.values[value as usize])
-            .collect();
-        assert!(at.iter().all(|&offset| offset != 0));
-        at.sort_unstable();
-        at.dedup();
-        assert_eq!(at.len(), touched.len(), "each its own bytes");
-        assert_eq!(
-            laid.temporary_bytes,
-            u64::from(LANE_SAMPLER_BLOCKS) * LANE_SAMPLER_ARENA.next_multiple_of(SCRATCH_ALIGN),
-            "the sampler's blocks' arenas and nothing else"
-        );
     }
 
     #[test]
