@@ -59,7 +59,15 @@ impl RungFacts {
 /// What a fire costs, as work over the device's rates (the one shared
 /// formula every engine weighs its top rung by):
 ///
-/// `t(r) = max(launches(r) · launch_ns, work(r))`,
+/// `t(r) = Σ_dispatches max(launch_ns, work_d(r))`: each of the fire's
+/// dispatches takes its own work or a launch, whichever is longer, and a
+/// dispatch of the compiled plan the model's counts name no work for takes
+/// a launch. A dispatch's work is its op's term over the dispatches the op
+/// takes (a matmul plane's read or compute, whichever is longer; an
+/// attention layer's flops and kv read; a scan layer's state steps; an
+/// elementwise op's bytes), so a fire of many short kernels pays a launch
+/// for each of them, and one whose kernels are long pays only their work.
+/// The terms, summed over the fire (the work, unfloored):
 ///
 /// `work(r) = max(weights(r) / bytes_per_ns,
 ///             Σ_(n, k) padded_rows(r) · flops_per_row(n, k) / flops(padded_rows(r), k))
@@ -70,10 +78,10 @@ impl RungFacts {
 ///       + tokens(r) · elementwise_bytes_per_row / bytes_per_ns`
 ///
 /// The rates are timed as back-to-back dispatches in a frame, so each
-/// already holds its dispatches' launches wherever they serialize: the
-/// launches decide a fire's time only when it is too small for its work to
-/// hide its dispatches. Where `weights(r) = dense_bytes + expert_bytes · (1
-/// − (1 − k/E)^tokens)`:
+/// already holds its dispatch's launch wherever they serialize: a launch
+/// decides a dispatch's time only when the dispatch is too short for its
+/// work to hide it. Where `weights(r) = dense_bytes + expert_bytes · (1 −
+/// (1 − k/E)^tokens)`:
 /// a fire reads every dense weight once (the output head's among them), and
 /// of a routed bank the experts its rows touch (each row picks `k` of `E`).
 /// `flops(m, k)` is the device's matmul rate at `m` rows and depth `k`, its
@@ -128,8 +136,10 @@ pub struct FireEstimate {
     /// `(k, E)`: the experts a row picks, of how many; `None` without a
     /// routed bank.
     pub experts: Option<(u32, u32)>,
-    /// The matmuls a row takes, by shape: `(n, k, flops a row)`.
-    pub gemm_shapes: Vec<(u32, u32, f64)>,
+    /// The matmuls a row takes, by shape.
+    pub gemm_shapes: Vec<GemmShape>,
+    /// The output head's bytes, read every fire.
+    pub head_bytes: u64,
     /// The output head's flops a lane: two a head element.
     pub readout_flops: f64,
     /// The output head's depth (the model's hidden width).
@@ -140,9 +150,13 @@ pub struct FireEstimate {
     pub kv_bytes_per_key: f64,
     /// The recurrent state elements a row steps, all layers together.
     pub state_elements_per_row: f64,
-    /// The activation bytes a row's norms and elementwise ops read and
-    /// write, all layers together.
-    pub elementwise_bytes_per_row: f64,
+    /// The dispatches the attention takes (one a layer) and the scan (its
+    /// conv and its scan a layer).
+    pub attn_dispatches: u32,
+    pub scan_dispatches: u32,
+    /// The activation bytes a row's per-row ops read and write, one an op
+    /// (each a dispatch).
+    pub elementwise_ops: Vec<u64>,
 }
 
 impl FireEstimate {
@@ -172,14 +186,14 @@ impl FireEstimate {
         let rows = rung.padded_rows;
         self.gemm_shapes
             .iter()
-            .map(|&(n, k, per_row)| {
-                let work = f64::from(rows) * per_row;
+            .map(|s| {
+                let work = f64::from(rows) * s.flops_per_row as f64;
                 let ns = if work > 0.0 {
-                    work / self.flops_per_ns(rows, k)
+                    work / self.flops_per_ns(rows, s.k)
                 } else {
                     0.0
                 };
-                (n, k, ns)
+                (s.n, s.k, ns)
             })
             .collect()
     }
@@ -197,27 +211,83 @@ impl FireEstimate {
         };
         // Work over a rate, nothing where there is no work.
         let over = |work: f64, rate: f64| if work > 0.0 { work / rate } else { 0.0 };
+        // `count` dispatches sharing `work`, each its share or a launch.
+        let floored = |work: f64, count: u32| {
+            let count = f64::from(count.max(1));
+            count * (work / count).max(self.launch_ns)
+        };
+        let (mut dispatched, mut dispatches) = (0.0, 0u64);
+        // The matmuls: each plane a dispatch, its read or its compute.
+        let touched = self.touched(rung.tokens);
+        let (mut weights, mut flops) = (0.0, 0.0);
+        for (s, &(_, _, mm)) in self.gemm_shapes.iter().zip(&self.matmuls(rung)) {
+            let bytes = s.bytes as f64 * if s.routed { touched } else { 1.0 };
+            let read = over(bytes, self.bytes_per_ns);
+            weights += read;
+            flops += mm;
+            dispatched += floored(read.max(mm), s.planes);
+            dispatches += u64::from(s.planes.max(1));
+        }
+        // The readout: one dispatch, the head's read or its compute.
+        let head_read = over(self.head_bytes as f64, self.bytes_per_ns);
+        weights += head_read;
+        let readout = over(
+            f64::from(rung.sampled()) * self.readout_flops,
+            self.flops_per_ns(rung.sampled(), self.readout_depth),
+        );
+        if self.readout_flops > 0.0 {
+            dispatched += floored(readout.max(head_read), 1);
+            dispatches += 1;
+        }
+        let attention = over(
+            tokens * keys * self.attn_flops_per_row_key,
+            // The rate at the keys a row attends: one at a decode lane, the
+            // grid's narrowest point.
+            profile::fire::flops_at(&self.attn_grid, keys as u32, self.attn_head_dim)
+                .unwrap_or(f64::INFINITY),
+        );
+        let kv = over(keys_read * self.kv_bytes_per_key, self.bytes_per_ns);
+        if self.attn_flops_per_row_key > 0.0 {
+            dispatched += floored(attention + kv, self.attn_dispatches);
+            dispatches += u64::from(self.attn_dispatches.max(1));
+        }
+        let recurrent = over(
+            tokens * self.state_elements_per_row,
+            self.scan_elements_per_ns,
+        );
+        if self.state_elements_per_row > 0.0 {
+            dispatched += floored(recurrent, self.scan_dispatches);
+            dispatches += u64::from(self.scan_dispatches.max(1));
+        }
+        let mut elementwise = 0.0;
+        for &bytes in &self.elementwise_ops {
+            let work = over(tokens * bytes as f64, self.bytes_per_ns);
+            elementwise += work;
+            dispatched += floored(work, 1);
+            dispatches += 1;
+        }
+        // The plan's other dispatches: a launch each.
+        dispatched += u64::from(rung.launches).saturating_sub(dispatches) as f64 * self.launch_ns;
         Terms {
             launch: f64::from(rung.launches) * self.launch_ns,
-            weights: over(self.weight_bytes(rung.tokens), self.bytes_per_ns),
-            flops: self.matmuls(rung).iter().map(|&(_, _, ns)| ns).sum(),
-            readout: over(
-                f64::from(rung.sampled()) * self.readout_flops,
-                self.flops_per_ns(rung.sampled(), self.readout_depth),
-            ),
-            attention: over(
-                tokens * keys * self.attn_flops_per_row_key,
-                // The rate at the keys a row attends: one at a decode lane,
-                // the curve's narrowest point.
-                profile::fire::flops_at(&self.attn_grid, keys as u32, self.attn_head_dim)
-                    .unwrap_or(f64::INFINITY),
-            ),
-            kv: over(keys_read * self.kv_bytes_per_key, self.bytes_per_ns),
-            recurrent: over(
-                tokens * self.state_elements_per_row,
-                self.scan_elements_per_ns,
-            ),
-            elementwise: over(tokens * self.elementwise_bytes_per_row, self.bytes_per_ns),
+            weights,
+            flops,
+            readout,
+            attention,
+            kv,
+            recurrent,
+            elementwise,
+            dispatched,
+        }
+    }
+
+    /// The share of the experts a fire of `tokens` touches.
+    fn touched(&self, tokens: u32) -> f64 {
+        match self.experts {
+            Some((k, e)) if e > 0 => {
+                1.0 - (1.0 - f64::from(k.min(e)) / f64::from(e)).powf(f64::from(tokens))
+            }
+            _ => 0.0,
         }
     }
 
@@ -240,17 +310,18 @@ pub fn shape_table(estimate: &FireEstimate, rungs: &[RungFacts], measured: &[f64
         "  per (n x k) shape: matmul ms at the rung's padded rows / its read ms; then the sums, \
          read + matmul against max(read, matmul) and the measured fire\n",
     );
-    let total: f64 = estimate.gemm_shapes.iter().map(|&(_, _, f)| f).sum();
+    let touched = estimate.touched(0);
     for (r, &meas) in rungs.iter().zip(measured) {
         let t = estimate.terms(r);
+        let touched = if estimate.experts.is_some() {
+            estimate.touched(r.tokens)
+        } else {
+            touched
+        };
         let mut line = format!("  {:>6}", r.tokens);
-        for (&(n, k, ns), &(_, _, per_row)) in estimate.matmuls(r).iter().zip(&estimate.gemm_shapes)
-        {
-            let read = if total > 0.0 {
-                t.weights * per_row / total
-            } else {
-                0.0
-            };
+        for (&(n, k, ns), s) in estimate.matmuls(r).iter().zip(&estimate.gemm_shapes) {
+            let bytes = s.bytes as f64 * if s.routed { touched } else { 1.0 };
+            let read = bytes / estimate.bytes_per_ns;
             line.push_str(&format!(" | {n}x{k} {:.2}/{:.2}", ns / 1e6, read / 1e6));
         }
         line.push_str(&format!(
@@ -264,6 +335,36 @@ pub fn shape_table(estimate: &FireEstimate, rungs: &[RungFacts], measured: &[f64
         out.push_str(&line);
     }
     out
+}
+
+/// One matmul shape of a model: `planes` planes (a dispatch each) of `n`
+/// columns at depth `k`, `flops_per_row` a row all together (two a weight
+/// element; for a routed bank, two a routed element of the `k` of `E`
+/// experts a row picks), and `bytes` on the device (a routed bank's read as
+/// far as a fire's rows touch it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GemmShape {
+    pub n: u32,
+    pub k: u32,
+    pub flops_per_row: u64,
+    pub planes: u32,
+    pub bytes: u64,
+    pub routed: bool,
+}
+
+impl GemmShape {
+    /// One dense plane of `n x k`, `bytes` on the device.
+    #[must_use]
+    pub fn dense(n: u32, k: u32, flops_per_row: u64, bytes: u64) -> GemmShape {
+        GemmShape {
+            n,
+            k,
+            flops_per_row,
+            planes: 1,
+            bytes,
+            routed: false,
+        }
+    }
 }
 
 /// The estimate's terms of one fire, in ns ([`FireEstimate::terms`]).
@@ -286,6 +387,8 @@ pub struct Terms {
     pub recurrent: f64,
     /// The norms' and elementwise ops' activation bytes, over the bandwidth.
     pub elementwise: f64,
+    /// The fire's time: each dispatch its work or a launch, summed.
+    pub dispatched: f64,
 }
 
 impl Terms {
@@ -301,11 +404,17 @@ impl Terms {
             + self.elementwise
     }
 
-    /// The fire's time: its work, or its launches where they take longer
-    /// (a fire too small for its work to hide its dispatches).
+    /// The fire's time: each dispatch its work or a launch, summed.
     #[must_use]
     pub fn total(&self) -> f64 {
-        self.work().max(self.launch)
+        self.dispatched
+    }
+
+    /// What the launch floors add to the fire's work: its dispatches too
+    /// short to hide their launches.
+    #[must_use]
+    pub fn floor(&self) -> f64 {
+        (self.dispatched - self.work()).max(0.0)
     }
 }
 
@@ -513,13 +622,16 @@ mod tests {
             dense_bytes: fixed_ns,
             expert_bytes: 0,
             experts: None,
-            gemm_shapes: vec![(1, 1, per_token_ns)],
+            gemm_shapes: vec![GemmShape::dense(1, 1, per_token_ns as u64, fixed_ns)],
+            head_bytes: 0,
             readout_flops: 0.0,
             readout_depth: 1,
             attn_flops_per_row_key: 0.0,
             kv_bytes_per_key: 0.0,
             state_elements_per_row: 0.0,
-            elementwise_bytes_per_row: 0.0,
+            elementwise_ops: Vec::new(),
+            attn_dispatches: 1,
+            scan_dispatches: 1,
         }
     }
 
@@ -694,13 +806,16 @@ mod tests {
             dense_bytes: 200,
             expert_bytes: 0,
             experts: None,
-            gemm_shapes: vec![(64, 64, 10.0)],
+            gemm_shapes: vec![GemmShape::dense(64, 64, 10, 200)],
+            head_bytes: 0,
             readout_flops: 6.0,
             readout_depth: 64,
             attn_flops_per_row_key: 0.5,
             kv_bytes_per_key: 8.0,
             state_elements_per_row: 3.0,
-            elementwise_bytes_per_row: 2.0,
+            elementwise_ops: vec![2],
+            attn_dispatches: 1,
+            scan_dispatches: 1,
         };
         let r = RungFacts {
             tokens: 4,
@@ -733,7 +848,10 @@ mod tests {
     fn a_model_of_two_depths_reads_each_shape_at_its_own_depth() {
         let (e, r) = documented();
         let two = FireEstimate {
-            gemm_shapes: vec![(64, 64, 10.0), (256, 256, 10.0)],
+            gemm_shapes: vec![
+                GemmShape::dense(64, 64, 10, 0),
+                GemmShape::dense(256, 256, 10, 0),
+            ],
             ..e
         };
         // 32 · 10 at 4 a ns (depth 64), and 32 · 10 at 8 a ns (depth 256).
@@ -834,38 +952,83 @@ mod tests {
     }
 
     #[test]
-    fn the_launches_decide_only_a_fire_too_small_to_hide_them() {
+    fn each_dispatch_takes_its_work_or_a_launch() {
         let (e, r) = documented();
-        // The documented fire's 128 ns of work hide its 5 · 3 ns launches.
+        // The documented fire's five dispatches: the matmul's 80 (its read
+        // 50), the readout's 24, the attention's 8 + 8, the scan's 6, and
+        // the one elementwise op's 2, floored at a 3 ns launch.
         let t = e.terms(&r);
-        assert_eq!(t.launch, 15.0);
         assert!((t.work() - 128.0).abs() < 1e-9);
-        assert_eq!(t.total(), t.work());
-        // A thousand dispatches over the same work: they take the fire.
-        let tiny = RungFacts {
+        assert!((t.total() - 129.0).abs() < 1e-9);
+        assert!((t.floor() - 1.0).abs() < 1e-9);
+        // The plan's dispatches the counts name no work for: a launch each.
+        let more = RungFacts {
             launches: 1000,
             ..r
         };
-        assert_eq!(e.terms(&tiny).total(), 3000.0);
-        // A wide fire's work buries them again.
+        assert!((e.terms(&more).total() - (129.0 + 995.0 * 3.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_model_of_many_tiny_ops_pays_a_launch_for_each() {
+        let (e, r) = documented();
+        // A hundred per-row ops of one byte a row: 1 ns of work each at 4
+        // tokens, 3 ns of launch each.
+        let tiny = FireEstimate {
+            elementwise_ops: vec![1; 100],
+            ..e
+        };
+        let wide = RungFacts { launches: 104, ..r };
+        let t = tiny.terms(&wide);
+        assert!((t.elementwise - 100.0).abs() < 1e-9);
+        assert!((t.total() - (80.0 + 24.0 + 16.0 + 6.0 + 300.0)).abs() < 1e-9);
+        assert!((t.floor() - 200.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_long_matmul_buries_its_launch() {
+        let (e, r) = documented();
+        // A wide fire: the one matmul plane's compute far past a launch,
+        // its time the work's, unchanged by the floor.
         let wide = RungFacts {
-            launches: 1000,
             tokens: 4096,
             lanes: 4096,
             padded_rows: 4096,
             ..r
         };
         let t = e.terms(&wide);
-        assert!(t.work() > t.launch, "{t:?}");
-        assert_eq!(t.total(), t.work());
+        assert!(t.flops > 100.0 * e.launch_ns);
+        let matmul = t.flops.max(t.weights);
+        let floored = matmul + t.readout + (t.attention + t.kv) + t.recurrent + t.elementwise;
+        assert!((t.total() - floored).abs() < 1e-9, "{t:?}");
+    }
+
+    #[test]
+    fn a_one_token_fire_is_its_launches() {
+        // The M5's rung 1: one row, every dispatch shorter than a launch.
+        let (e, r) = documented();
+        let quick = FireEstimate {
+            launch_ns: 1000.0,
+            ..e
+        };
+        let one = RungFacts {
+            tokens: 1,
+            lanes: 1,
+            padded_rows: 1,
+            launches: 40,
+            ..r
+        };
+        let t = quick.terms(&one);
+        assert!(t.work() < 1000.0, "{t:?}");
+        assert_eq!(t.total(), 40.0 * 1000.0);
     }
 
     #[test]
     fn the_estimate_is_its_documented_form() {
         let (e, r) = documented();
-        // max(5·3, max(200/4, 32·10/4) + 4·6/1 + 4·1·0.5/0.25 + 4·8/4
-        //     + 4·3/2 + 4·2/4)
-        let want = 80.0 + 24.0 + 8.0 + 8.0 + 6.0 + 2.0;
+        // Each of its five dispatches its work or a 3 ns launch: max(200/4,
+        // 32·10/4), 4·6/1, 4·1·0.5/0.25 + 4·8/4, 4·3/2, and 4·2/4 floored.
+        let want = 80.0 + 24.0 + (8.0 + 8.0) + 6.0 + 3.0;
         assert!((e.ns(&r) - want).abs() < 1e-9, "{}", e.ns(&r));
         assert_eq!(e.ns(&r), e.terms(&r).total());
     }

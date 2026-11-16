@@ -558,19 +558,21 @@ fn check_estimate(
     };
     let (at_est, best) = (score(by_est.tokens), score(by_meas.tokens));
     let mut out = format!(
-        "{model} on {device}: rung, measured ms, estimated ms = max(launch, work); work = \
-         max(weights, flops) + readout + attention + kv + recurrent + elementwise\n"
+        "{model} on {device}: rung, measured ms, estimated ms = work + the launch floors' \
+         share (each dispatch its work or a launch); work = max(weights, flops) + readout + \
+         attention + kv + recurrent + elementwise\n"
     );
     for (k, r) in rungs.iter().enumerate() {
         let t = weighed.estimate.terms(r);
         out.push_str(&format!(
-            "  {:>6} {:>9.2} {:>9.2} = max({:>7.2}, {:>7.2}); {:>7.2} = max({:>7.2}, {:>7.2}) + \
-             {:>7.2} + {:>7.2} + {:>7.2} + {:>7.2} + {:>7.2}\n",
+            "  {:>6} {:>9.2} {:>9.2} = {:>7.2} + floor {:>7.2} ({:>4.1}%); {:>7.2} = max({:>7.2}, \
+             {:>7.2}) + {:>7.2} + {:>7.2} + {:>7.2} + {:>7.2} + {:>7.2}\n",
             r.tokens,
             meas[k] / 1e6,
             est[k] / 1e6,
-            t.launch / 1e6,
             t.work() / 1e6,
+            t.floor() / 1e6,
+            100.0 * t.floor() / t.total().max(1.0),
             t.work() / 1e6,
             t.weights / 1e6,
             t.flops / 1e6,

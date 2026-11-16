@@ -9,7 +9,7 @@ use std::fmt;
 
 use poem_ir::{Def, Dim, Operation, Trace, Ty};
 
-use super::rung::{FireEstimate, NoRung, RungFacts, TopRung, TopWhy};
+use super::rung::{FireEstimate, GemmShape, NoRung, RungFacts, TopRung, TopWhy};
 
 /// What a fire of the model reads and computes: the estimate's counts.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,11 +22,12 @@ pub struct Counts {
     pub expert_bytes: u64,
     /// `(k, E)` of the routed banks: the experts a row picks, of how many.
     pub experts: Option<(u32, u32)>,
-    /// The matmuls a row takes, by shape: `(n, k, flops a row)`, the planes
-    /// of `n` columns at depth `k` merged, two flops a dense weight element
-    /// (the output head's aside) and two a routed element of the `k` of `E`
-    /// experts a row picks. Ordered by `(n, k)`.
-    pub gemm_shapes: Vec<(u32, u32, u64)>,
+    /// The matmuls a row takes, by shape: the planes of `n` columns at depth
+    /// `k` merged (their count, flops and bytes), dense and routed apart, the
+    /// output head's aside. Ordered by `(n, k)`.
+    pub gemm_shapes: Vec<GemmShape>,
+    /// The output head's bytes on the device, read every fire.
+    pub head_bytes: u64,
     /// The output head's flops a sampled row: two a head element. A fire
     /// reads out once a sampled row, not once a row; the head's bytes are
     /// in `weight_bytes`.
@@ -46,10 +47,14 @@ pub struct Counts {
     /// scan's state row (a gated delta's `v_heads · k_dim · v_dim`), once a
     /// state the scans read however many forms of the scan the trace holds.
     pub state_elements_per_row: u64,
-    /// The activation bytes a row's norms and elementwise ops read and
-    /// write, summed over the trace's elementwise nodes: every operand a row
-    /// of the fire's tokens wide, at its element's size.
-    pub elementwise_bytes_per_row: u64,
+    /// The dispatches the attentions take: one a layer that attends.
+    pub attn_dispatches: u32,
+    /// The dispatches the scans take: a conv and a scan a recurrent layer.
+    pub scan_dispatches: u32,
+    /// The activation bytes a row's per-row ops read and write, one an op
+    /// (each its own dispatch): every operand a row of the fire's tokens
+    /// wide, at its element's size.
+    pub elementwise_ops: Vec<u64>,
     /// The contraction of the largest dense plane: the width its matmul
     /// kernel is picked at, which a fire's rows pad to the tile of.
     pub width: u32,
@@ -76,17 +81,19 @@ impl Counts {
         let heads = heads(trace);
         let (mut readout, mut readout_depth) = (0u64, 0u64);
         let experts = routing(trace);
-        // `(n, k)` to the elements a row multiplies at that shape.
-        let mut shapes: std::collections::BTreeMap<(u32, u32), u64> =
+        // `(n, k, routed)` to the shape's planes, elements a row and bytes.
+        let mut shapes: std::collections::BTreeMap<(u32, u32, bool), (u32, u64, u64)> =
             std::collections::BTreeMap::new();
+        let mut head_bytes = 0u64;
         let to = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
         for (at, param) in trace.params.iter().enumerate() {
             if heads.contains(&at) {
                 // The output head: read whole every fire (a tied table as
                 // much as its own plane), multiplied once a lane.
                 let (rows, cols) = rectangle(&param.shape);
-                weight_bytes =
-                    weight_bytes.saturating_add(kept.plane_bytes.get(at).copied().unwrap_or(0));
+                let bytes = kept.plane_bytes.get(at).copied().unwrap_or(0);
+                weight_bytes = weight_bytes.saturating_add(bytes);
+                head_bytes = head_bytes.saturating_add(bytes);
                 readout = readout.saturating_add(rows.saturating_mul(cols));
                 readout_depth = readout_depth.max(cols);
                 continue;
@@ -108,14 +115,16 @@ impl Counts {
                         // every row.
                         None => e.saturating_mul(*n).saturating_mul(k),
                     };
-                    *shapes.entry((to(*n), to(k))).or_default() += per_row;
+                    let seat = shapes.entry((to(*n), to(k), true)).or_default();
+                    *seat = (seat.0 + 1, seat.1 + per_row, seat.2 + bytes);
                 }
             } else {
                 weight_bytes = weight_bytes.saturating_add(bytes);
                 if param.shape.len() >= 2 {
                     let (n, k) = rectangle(&param.shape);
                     let elements = n.saturating_mul(k);
-                    *shapes.entry((to(n), to(k))).or_default() += elements;
+                    let seat = shapes.entry((to(n), to(k), false)).or_default();
+                    *seat = (seat.0 + 1, seat.1 + elements, seat.2 + bytes);
                     if elements > largest {
                         largest = elements;
                         width = k;
@@ -130,15 +139,25 @@ impl Counts {
             experts,
             gemm_shapes: shapes
                 .into_iter()
-                .map(|((n, k), elements)| (n, k, elements.saturating_mul(2)))
+                .map(|((n, k, routed), (planes, elements, bytes))| GemmShape {
+                    n,
+                    k,
+                    flops_per_row: elements.saturating_mul(2),
+                    planes,
+                    bytes,
+                    routed,
+                })
                 .collect(),
+            head_bytes,
             readout_flops: readout.saturating_mul(2),
             readout_depth: to(readout_depth),
             attn_flops_per_row_key,
             kv_bytes_per_key,
             attn_head_dim: attn_head_dim(trace),
-            state_elements_per_row: state_elements(trace),
-            elementwise_bytes_per_row: elementwise_bytes(trace),
+            state_elements_per_row: state_elements(trace).0,
+            attn_dispatches: attn_dispatches(trace),
+            scan_dispatches: state_elements(trace).1.saturating_mul(2),
+            elementwise_ops: elementwise_bytes(trace),
             width: u32::try_from(width).unwrap_or(u32::MAX),
         }
     }
@@ -202,7 +221,7 @@ fn attn_head_dim(trace: &Trace) -> u32 {
 /// The state elements a row steps, over every recurrent scan of `trace`:
 /// each distinct state row its gated-delta, KDA and Mamba-2 scans read,
 /// at its slab's elements (one slot's).
-fn state_elements(trace: &Trace) -> u64 {
+fn state_elements(trace: &Trace) -> (u64, u32) {
     use poem_ir::Operands as _;
     let mut states: Vec<usize> = Vec::new();
     let mut inputs = Vec::new();
@@ -236,13 +255,41 @@ fn state_elements(trace: &Trace) -> u64 {
             }
         }
     }
-    states
+    let elements = states
         .iter()
         .filter_map(|&row| match trace.caches.get(row) {
             Some(poem_ir::CacheRow::State { slab, .. }) => Some(slab.iter().product::<u64>()),
             _ => None,
         })
-        .sum()
+        .sum();
+    (elements, u32::try_from(states.len()).unwrap_or(u32::MAX))
+}
+
+/// The dispatches `trace`'s attentions take: one a layer that attends (its
+/// prefill and decode forms one dispatch, whichever a fire takes), one a
+/// node where no layer is stated.
+fn attn_dispatches(trace: &Trace) -> u32 {
+    let mut layers: Vec<u32> = Vec::new();
+    let mut unlayered = 0u32;
+    for node in &trace.nodes {
+        if !matches!(
+            node.op,
+            Operation::Attn(
+                poem_ir::Attn::Prefill { .. }
+                    | poem_ir::Attn::Decode { .. }
+                    | poem_ir::Attn::Dense { .. }
+                    | poem_ir::Attn::Ragged { .. }
+            )
+        ) {
+            continue;
+        }
+        match node.layer {
+            Some(layer) if !layers.contains(&layer) => layers.push(layer),
+            Some(_) => {}
+            None => unlayered += 1,
+        }
+    }
+    u32::try_from(layers.len()).unwrap_or(u32::MAX) + unlayered
 }
 
 /// The activation bytes a row's per-row ops read and write: each operand
@@ -252,7 +299,7 @@ fn state_elements(trace: &Trace) -> u64 {
 /// RoPE, activations, residual adds), the q / k / v splits, the fused
 /// norm and RoPE forms, and the kv append (its k and v rows read and
 /// written to the pool).
-fn elementwise_bytes(trace: &Trace) -> u64 {
+fn elementwise_bytes(trace: &Trace) -> Vec<u64> {
     use poem_ir::Operands as _;
     let row_bytes = |value: &poem_ir::ValueId| -> u64 {
         let Some(decl) = trace.values.get(value.0 as usize) else {
@@ -276,7 +323,7 @@ fn elementwise_bytes(trace: &Trace) -> u64 {
         elements.saturating_mul(dtype.bits()) / 8
     };
     let mut operands = Vec::new();
-    let mut total = 0u64;
+    let mut ops = Vec::new();
     for node in &trace.nodes {
         // Each counted node's operands, and how many times its rows move:
         // once each, or twice for an append (read, then written to the
@@ -316,9 +363,9 @@ fn elementwise_bytes(trace: &Trace) -> u64 {
         node.op.inputs(&mut operands);
         node.op.outputs(&mut operands);
         let bytes: u64 = operands.iter().map(row_bytes).sum();
-        total = total.saturating_add(bytes.saturating_mul(times));
+        ops.push(bytes.saturating_mul(times));
     }
-    total
+    ops
 }
 
 /// `(k, E)` of the trace's routed selects: the routes a row carries (the
@@ -385,17 +432,16 @@ pub fn estimate(
         dense_bytes: counts.weight_bytes,
         expert_bytes: counts.expert_bytes,
         experts: counts.experts,
-        gemm_shapes: counts
-            .gemm_shapes
-            .iter()
-            .map(|&(n, k, flops)| (n, k, flops as f64))
-            .collect(),
+        gemm_shapes: counts.gemm_shapes.clone(),
+        head_bytes: counts.head_bytes,
         readout_flops: counts.readout_flops as f64,
         readout_depth: counts.readout_depth,
         attn_flops_per_row_key: counts.attn_flops_per_row_key as f64,
         kv_bytes_per_key: counts.kv_bytes_per_key as f64,
         state_elements_per_row: counts.state_elements_per_row as f64,
-        elementwise_bytes_per_row: counts.elementwise_bytes_per_row as f64,
+        elementwise_ops: counts.elementwise_ops.clone(),
+        attn_dispatches: counts.attn_dispatches,
+        scan_dispatches: counts.scan_dispatches,
     })
 }
 
@@ -503,14 +549,17 @@ mod tests {
             weight_bytes: 1 << 30,
             expert_bytes: 0,
             experts: None,
-            gemm_shapes: vec![(4096, 4096, 1 << 30)],
+            gemm_shapes: vec![GemmShape::dense(4096, 4096, 1 << 30, 1 << 30)],
+            head_bytes: 0,
             attn_flops_per_row_key: 1 << 10,
             kv_bytes_per_key: 1 << 10,
             attn_head_dim: 128,
             readout_flops: 0,
             readout_depth: 4096,
             state_elements_per_row: 0,
-            elementwise_bytes_per_row: 0,
+            elementwise_ops: vec![0],
+            attn_dispatches: 28,
+            scan_dispatches: 0,
             width: 4096,
         }
     }
@@ -558,7 +607,7 @@ mod tests {
         };
         let e = estimate(&counts(), &rates).unwrap();
         assert_eq!(e.flops_grid, vec![(16, 4096, 1.0), (4096, 4096, 10.0)]);
-        assert_eq!(e.gemm_shapes, vec![(4096, 4096, (1u64 << 30) as f64)]);
+        assert_eq!(e.gemm_shapes, counts().gemm_shapes);
         assert_eq!(
             (e.attn_grid.clone(), e.bytes_per_ns, e.launch_ns),
             (vec![(2048, 128, 7.0)], 100.0, 5.0)
@@ -697,7 +746,10 @@ mod tests {
                 rms(2, 3, poem_ir::NormAxis::Head(128)),
             ],
         );
-        assert_eq!(elementwise_bytes(&trace), 2 * 2048 + 2 * 4096);
+        assert_eq!(
+            elementwise_bytes(&trace).iter().sum::<u64>(),
+            2 * 2048 + 2 * 4096
+        );
     }
 
     #[test]
@@ -714,7 +766,10 @@ mod tests {
                 v: v(3),
             })],
         );
-        assert_eq!(elementwise_bytes(&trace), 6144 + 4096 + 1024 + 1024);
+        assert_eq!(
+            elementwise_bytes(&trace).iter().sum::<u64>(),
+            6144 + 4096 + 1024 + 1024
+        );
     }
 
     #[test]
@@ -735,7 +790,10 @@ mod tests {
                 k_out: Some(v(1)),
             })],
         );
-        assert_eq!(elementwise_bytes(&trace), 2 * (4096 + 1024));
+        assert_eq!(
+            elementwise_bytes(&trace).iter().sum::<u64>(),
+            2 * (4096 + 1024)
+        );
     }
 
     #[test]
@@ -752,7 +810,10 @@ mod tests {
                 write_offset: v(2),
             })],
         );
-        assert_eq!(elementwise_bytes(&trace), 2 * (1024 + 1024));
+        assert_eq!(
+            elementwise_bytes(&trace).iter().sum::<u64>(),
+            2 * (1024 + 1024)
+        );
     }
 
     #[test]
