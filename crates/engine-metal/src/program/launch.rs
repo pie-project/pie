@@ -3,7 +3,7 @@ use std::mem::size_of;
 use std::sync::Arc;
 
 use eta_compiler::codegen::launch::{LaunchChannel, LaunchStagePlan};
-use eta_exec::{Launch, Launches, Layout, TooLarge};
+use eta_exec::{ChunkLayout, Launch, Launches, TooLarge};
 use eta_exec::{
     Extents, LANE_ABI_VERSION, LaneChannelSlot, LaneHeader, LaneRecord, LaneShape, NO_TICKET,
     OpParams, SCRATCH_ALIGN, Status, ValueDesc, describe,
@@ -57,15 +57,51 @@ fn launches<'a>(
     }
 }
 
-/// A stage's scratch as Metal lays it ([`launches`]): what the kernels'
-/// offsets, `Plane::lane_scratch` and the stride all read, the same at
-/// every call.
+/// A stage's scratch as Metal lays it ([`launches`]) in pieces of at most
+/// `chunk` bytes ([`eta_exec::lay_out_chunked`]): what the kernels'
+/// offsets and pieces, the instance's scratch (`engine::GuestState`) and
+/// the lane's piece bases all read, the same at every call. A value past
+/// a piece is refused by name ([`TooLarge::PastChunk`]).
 fn layout_of(
     plan: &LaunchStagePlan,
     regions: &[Region],
     descriptors: &[ValueDesc],
-) -> std::result::Result<Layout, TooLarge> {
-    eta_exec::lay_out(plan, descriptors, &launches(plan, regions, descriptors))
+    chunk: u64,
+) -> Result<ChunkLayout> {
+    eta_exec::lay_out_chunked(plan, descriptors, &launches(plan, regions, descriptors), chunk)
+        .map_err(|why: TooLarge| {
+            Fault::program(
+                "program::launch",
+                format!("a lane's scratch does not lie in pieces of {chunk} bytes: {why}"),
+            )
+        })
+}
+
+/// The bytes a piece of a guest's scratch holds at most: a chunk's
+/// `Instance` slots, one run of them (`engine::ScratchPlace::Run`) or the
+/// room of a whole chunk (`Chunks`).
+pub fn scratch_unit(pools: &Pools) -> Result<u64> {
+    Ok(u64::from(pools.slots_per_chunk(INSTANCE)?) * pools.slot_bytes(INSTANCE)?)
+}
+
+/// The bytes an instance holds for a stage laid as `ends` says
+/// ([`ChunkLayout::ends`]): its one piece's where it takes one (a run in a
+/// chunk), else a whole chunk of `chunk_bytes` a piece, so the runtime
+/// takes one chunk for each.
+#[must_use]
+pub fn scratch_held(ends: &[u64], chunk_bytes: u64) -> u64 {
+    match ends {
+        [] => 0,
+        [only] => (*only).max(SCRATCH_ALIGN).next_multiple_of(SCRATCH_ALIGN),
+        _ => u64::try_from(ends.len()).unwrap_or(u64::MAX).saturating_mul(chunk_bytes),
+    }
+}
+
+/// The most pieces a stage's scratch lies in: each value in one, and the
+/// temporary area in one. What sizes a lane's piece bases from counts
+/// alone.
+fn pieces_bound(plan: &LaunchStagePlan) -> u32 {
+    u32::try_from(plan.value_types.len() + 1).unwrap_or(u32::MAX)
 }
 use eta_ir::Dtype;
 use eta_ir::op::tags;
@@ -78,7 +114,7 @@ use super::compile::{Form, Region, StreamedStep};
 use super::held::{self, Cells, Held, Tables};
 use super::shared::SharedRing;
 use crate::store::Pools;
-use crate::store::layout::CHANNEL;
+use crate::store::layout::{CHANNEL, INSTANCE};
 use eta_compiler::codegen::metal::{StepKind, reduce_dispatch_levels};
 
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
@@ -405,12 +441,14 @@ struct Bound {
 struct GroupLayout {
     lane_count: u32,
     value_count: u32,
-    scratch_stride: u32,
+    temporary_bytes: u32,
     temporary_offset: u32,
     vocab: u32,
     reserved0: u32,
     reserved1: u32,
     reserved2: u32,
+    scratch_pieces: u32,
+    temporary_piece: u32,
 }
 
 #[repr(C)]
@@ -476,7 +514,7 @@ impl Grouped {
     #[allow(clippy::too_many_arguments)]
     fn build(
         plan: &LaunchStagePlan,
-        regions: &[Region],
+        scratch_layout: &ChunkLayout,
         descriptors: &[ValueDesc],
         shape: LaneShape,
         status: &Held,
@@ -555,21 +593,17 @@ impl Grouped {
         let row_meta = tables.take((GROUPED_LANES as u64) * size_of::<RowMeta>() as u64)?;
         let row_indices = tables.take(u64::from(rows_bound.max(1)) * size_of::<u32>() as u64)?;
 
-        let scratch_layout = layout_of(plan, regions, descriptors).map_err(|why| {
-            Fault::program(
-                "program::launch",
-                format!("this fire's scratch does not fit: {why:?}"),
-            )
-        })?;
         let base = GroupLayout {
             lane_count: GROUPED_LANES,
             value_count: u32::try_from(plan.value_types.len()).unwrap_or(u32::MAX),
-            scratch_stride: lane_word(LANE_SCRATCH, scratch_layout.total)?,
-            temporary_offset: lane_word(LANE_TEMPORARY, scratch_layout.temporary)?,
+            temporary_bytes: lane_word(LANE_TEMPORARY_BYTES, scratch_layout.temporary_bytes)?,
+            temporary_offset: lane_word(LANE_TEMPORARY, scratch_layout.temporary.offset)?,
             vocab: 0,
             reserved0: stride,
             reserved1: 1,
             reserved2: u32::try_from(plan.ops.len()).unwrap_or(u32::MAX),
+            scratch_pieces: scratch_layout.pieces(),
+            temporary_piece: scratch_layout.temporary.piece,
         };
         let mut layout_words = Vec::with_capacity(plan.fused.len());
         let mut layouts = Vec::with_capacity(plan.fused.len());
@@ -667,14 +701,15 @@ impl Grouped {
     }
 }
 
-const LANE_SCRATCH: &str = "bytes of one lane's value scratch (the kernels' `uint scratch_stride`)";
+const LANE_TEMPORARY_BYTES: &str =
+    "bytes of one lane's temporary area (the kernels' `uint temporary_bytes`)";
 const LANE_TEMPORARY: &str =
-    "bytes before one lane's temporaries (the kernels' `uint temporary_offset`)";
+    "bytes before one lane's temporaries in their piece (the kernels' `uint temporary_offset`)";
 
 /// A lane's scratch extent as the generated kernels' layout word holds it:
-/// a `uint`, refused past one. A lane's base is `ulong(lane) * ulong(stride)`
-/// in every generated kernel, so a batch of lanes addresses as far as the
-/// region its scratch is taken from (`GuestCarve::take` refuses past that).
+/// a `uint`, refused past one. A value's place is its piece's base (a
+/// 64-bit address) plus its offset there, so no product of lanes and bytes
+/// is taken in a `uint`.
 fn lane_word(what: &'static str, bytes: u64) -> Result<u32> {
     u32::try_from(bytes).map_err(|_| Fault::Ceiling {
         what,
@@ -683,9 +718,9 @@ fn lane_word(what: &'static str, bytes: u64) -> Result<u32> {
     })
 }
 
-/// Where a fire's value scratch lies: the activation span's guest region,
-/// laid per fire under the model's carve (REDESIGN 3, guest programs), or
-/// nowhere before a fire seats it.
+/// Where a piece of a lane's value scratch lies: the first byte of a run of
+/// its instance's `Instance` slots, or of one of its whole chunks
+/// (`engine::ScratchPlace`), where the pool's view holds it now.
 #[derive(Debug, Clone)]
 pub struct ScratchAt {
     pub buffer: Buffer,
@@ -703,12 +738,13 @@ pub struct Prepared {
     descriptors: Held,
     params: Held,
     offsets: Held,
-    /// The value scratch this fire seated ([`Prepared::seat_scratch`]),
-    /// `scratch_bytes` of it.
-    scratch: Option<ScratchAt>,
-    scratch_bytes: u64,
-    /// The lane's scratch bases (`scratch_bases_bytes(1)`), written at each
-    /// seat: the grouped kernels' buffer 4.
+    /// Where each piece of the lane's scratch lies, as its fire seated it
+    /// ([`Prepared::seat_scratch`]): empty before one does.
+    scratch: Vec<ScratchAt>,
+    /// Each piece's bytes in use ([`ChunkLayout::ends`]).
+    ends: Vec<u64>,
+    /// The lane's piece bases (`scratch_bases_bytes(1, pieces_bound)`),
+    /// written at each seat: every kernel's buffer 4.
     scratch_bases: Held,
     /// By output slot ([`eta_ir::op::output_slot`]): how the stage reads it,
     /// what is bound there and its table entry.
@@ -723,8 +759,10 @@ pub struct Prepared {
     output_slots: u32,
     channel_count: u32,
     value_count: u32,
-    scratch_stride: u32,
+    /// The temporary area: its piece, its first byte there, its bytes.
+    temporary_piece: u32,
     temporary_offset: u32,
+    temporary_bytes: u32,
     bindings: Vec<u32>,
     bound: Vec<Bound>,
     grouped: Option<Grouped>,
@@ -944,8 +982,10 @@ pub struct BatchKey {
     content: u64,
     channel_count: u32,
     channel_slots_per_lane: u32,
-    scratch_stride: u32,
+    scratch_pieces: u32,
+    temporary_piece: u32,
     temporary_offset: u32,
+    temporary_bytes: u32,
     readout_rows: u32,
     regions: usize,
 }
@@ -1021,9 +1061,15 @@ impl Prepared {
         }
     }
 
-    /// The value scratch one lane of a stage of `plan` takes in a fire at
-    /// `extents`: its stride, aligned, as [`Prepared::build`] lays it.
-    pub fn scratch_for(plan: &LaunchStagePlan, regions: &[Region], extents: &Extents) -> Result<u64> {
+    /// The pieces one lane of a stage of `plan` takes at `extents`, each
+    /// piece's bytes in use, laid in pieces of at most `chunk` bytes as
+    /// [`Prepared::build`] lays them.
+    pub fn scratch_ends(
+        plan: &LaunchStagePlan,
+        regions: &[Region],
+        extents: &Extents,
+        chunk: u64,
+    ) -> Result<Vec<u64>> {
         let descriptors: Vec<ValueDesc> = plan
             .value_types
             .iter()
@@ -1036,23 +1082,13 @@ impl Prepared {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let total = layout_of(plan, regions, &descriptors)
-            .map_err(|why| {
-                Fault::program(
-                    "program::launch",
-                    format!("a stage's scratch does not fit: {why:?}"),
-                )
-            })?
-            .total;
-        Ok(u64::try_from(total)
-            .unwrap_or(u64::MAX)
-            .max(SCRATCH_ALIGN)
-            .next_multiple_of(SCRATCH_ALIGN))
+        Ok(layout_of(plan, regions, &descriptors, chunk)?.ends)
     }
 
     /// The bind-time tables a stage of `plan` takes, in the order `build`
-    /// takes them from its [`Tables`]: params, descriptors, offsets, the
-    /// status word, the output addresses and the lane's scratch bases and,
+    /// takes them from its [`Tables`]: params, descriptors, offsets (each
+    /// value's offset, then its piece), the status word, the output
+    /// addresses and the lane's piece bases and,
     /// for a grouped stage, the
     /// channel bindings, the lane table (`channels` slots a lane), its
     /// flags, indices, row meta, `rows` readout rows and each fused
@@ -1063,10 +1099,10 @@ impl Prepared {
         let mut sizes = vec![
             (plan.ops.len() * size_of::<OpParams>()).max(size_of::<OpParams>()) as u64,
             (plan.value_types.len() * size_of::<ValueDesc>()).max(1) as u64,
-            (plan.value_types.len() * size_of::<u32>()).max(size_of::<u32>()) as u64,
+            offsets_bytes(plan),
             eta_exec::STATUS_BYTES as u64,
             ((plan.output_pitch as usize).max(1) * size_of::<OutputSeat>()) as u64,
-            scratch_bases_bytes(1),
+            scratch_bases_bytes(1, pieces_bound(plan)),
         ];
         if plan.needs.grouped_valid {
             let shape = LaneShape::of(GROUPED_LANES, channels);
@@ -1084,12 +1120,16 @@ impl Prepared {
         sizes
     }
 
+    /// The stage at `extents`, its scratch laid in pieces of at most
+    /// `chunk` bytes ([`scratch_unit`]).
+    #[allow(clippy::too_many_arguments)]
     pub fn build(
         plan: &LaunchStagePlan,
         regions: &[Region],
         shapes: &[ChannelShape],
         extents: Extents,
         rows: u32,
+        chunk: u64,
         tables: &mut Tables<'_>,
     ) -> Result<Prepared> {
         let channel_count = u32::try_from(plan.channel_bindings.len())
@@ -1109,14 +1149,9 @@ impl Prepared {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let scratch_layout = layout_of(plan, regions, &descriptors).map_err(|why| {
-            Fault::program(
-                "program::launch",
-                format!("this fire's scratch does not fit: {why:?}"),
-            )
-        })?;
-        let scratch_stride = lane_word(LANE_SCRATCH, scratch_layout.total)?;
-        let temporary_offset = lane_word(LANE_TEMPORARY, scratch_layout.temporary)?;
+        let scratch_layout = layout_of(plan, regions, &descriptors, chunk)?;
+        let temporary_offset = lane_word(LANE_TEMPORARY, scratch_layout.temporary.offset)?;
+        let temporary_bytes = lane_word(LANE_TEMPORARY_BYTES, scratch_layout.temporary_bytes)?;
 
         let mut records = Vec::with_capacity(plan.ops.len());
         let pitch = plan.output_pitch as usize;
@@ -1198,21 +1233,23 @@ impl Prepared {
         let mut descriptor_buffer = tables.take(descriptor_bytes.len().max(1) as u64)?;
         descriptor_buffer.write(0, &descriptor_bytes)?;
 
+        // Each value's offset in its piece, then each value's piece: one
+        // table, the pieces `value_count` words past (`PTIR_AT`).
         let offset_bytes: Vec<u8> = scratch_layout
             .values
             .iter()
-            .map(|&at| u32::try_from(at).unwrap_or(u32::MAX))
+            .map(|placed| lane_word(LANE_OFFSET, placed.offset))
+            .chain(scratch_layout.values.iter().map(|placed| Ok(placed.piece)))
+            .collect::<Result<Vec<u32>>>()?
+            .into_iter()
             .flat_map(u32::to_le_bytes)
             .collect();
-        let mut offsets = tables.take(offset_bytes.len().max(size_of::<u32>()) as u64)?;
+        let mut offsets = tables.take(offsets_bytes(plan))?;
         offsets.write(0, &offset_bytes)?;
 
-        let scratch_bytes = u64::from(scratch_stride)
-            .max(SCRATCH_ALIGN)
-            .next_multiple_of(SCRATCH_ALIGN);
         let status = tables.take(eta_exec::STATUS_BYTES as u64)?;
         let addresses = tables.take((pitch.max(1) * size_of::<OutputSeat>()) as u64)?;
-        let scratch_bases = tables.take(scratch_bases_bytes(1))?;
+        let scratch_bases = tables.take(scratch_bases_bytes(1, pieces_bound(plan)))?;
 
         let lanes = LaneShape::of(
             GROUPED_LANES,
@@ -1222,7 +1259,7 @@ impl Prepared {
         );
         let grouped = Grouped::build(
             plan,
-            regions,
+            &scratch_layout,
             &descriptors,
             lanes,
             &status,
@@ -1236,8 +1273,8 @@ impl Prepared {
             descriptors: descriptor_buffer,
             params,
             offsets,
-            scratch: None,
-            scratch_bytes,
+            scratch: Vec::new(),
+            ends: scratch_layout.ends,
             scratch_bases,
             reads,
             outputs: vec![None; pitch],
@@ -1248,8 +1285,9 @@ impl Prepared {
             output_slots: plan.output_slots,
             channel_count,
             value_count,
-            scratch_stride,
+            temporary_piece: scratch_layout.temporary.piece,
             temporary_offset,
+            temporary_bytes,
             bindings: plan.channel_bindings.clone(),
             bound: Vec::new(),
             grouped,
@@ -1273,8 +1311,10 @@ impl Prepared {
             content: hasher.finish(),
             channel_count: self.channel_count,
             channel_slots_per_lane: grouped.shape.channel_slots_per_lane,
-            scratch_stride: self.scratch_stride,
+            scratch_pieces: self.scratch_pieces(),
+            temporary_piece: self.temporary_piece,
             temporary_offset: self.temporary_offset,
+            temporary_bytes: self.temporary_bytes,
             readout_rows: grouped.readout_rows,
             regions: grouped.layouts.len(),
         })
@@ -1284,35 +1324,69 @@ impl Prepared {
         self.refresh_cells(rings, cursors)
     }
 
-    /// The value scratch one fire of this stage takes: its stride, aligned.
+    /// The pieces this stage's scratch lies in.
     #[must_use]
-    pub fn scratch_bytes(&self) -> u64 {
-        self.scratch_bytes
+    pub fn scratch_pieces(&self) -> u32 {
+        u32::try_from(self.ends.len()).unwrap_or(u32::MAX)
     }
 
-    /// Seats this fire's value scratch at `at`, its bases written where the
-    /// grouped kernels read them; a later fire seats its own.
-    pub fn seat_scratch(&mut self, at: ScratchAt) -> Result<()> {
-        self.scratch_bases.write(0, &scratch_bases_of(&at)?)?;
-        self.scratch = Some(at);
+    /// Seats this fire's value scratch: `pieces`, where its instance's
+    /// scratch lies now, piece by piece (`engine::ScratchPlace`), this
+    /// stage's pieces the first of them. Its bases are written where the
+    /// kernels read them; a later fire seats again.
+    pub fn seat_scratch(&mut self, pieces: &[ScratchAt]) -> Result<()> {
+        let Some(pieces) = pieces.get(..self.ends.len()) else {
+            return Err(Fault::program(
+                "program::launch",
+                format!(
+                    "a stage whose scratch lies in {} piece(s) seated in an instance's                      scratch of {}",
+                    self.ends.len(),
+                    pieces.len()
+                ),
+            ));
+        };
+        self.scratch_bases.write(0, &scratch_bases_of(pieces)?)?;
+        self.scratch = pieces.to_vec();
         Ok(())
     }
 
-    fn scratch(&self) -> Result<&ScratchAt> {
-        self.scratch.as_ref().ok_or_else(|| {
-            Fault::program(
+    fn scratch(&self) -> Result<&[ScratchAt]> {
+        if self.scratch.len() < self.ends.len() {
+            return Err(Fault::program(
                 "program::launch",
-                "a stage fired before its fire seated its value scratch in the span",
-            )
-        })
+                "a stage fired before its fire seated its value scratch in its instance's",
+            ));
+        }
+        Ok(&self.scratch)
     }
 
-    /// Test builds: poisons the seated scratch ([`poison_scratch`]) ahead
-    /// of the stage's passes.
+    /// The temporary area's first byte, where the seated scratch lies.
+    fn temporary_at(&self) -> Result<(&Buffer, u64)> {
+        let piece = self
+            .scratch()?
+            .get(self.temporary_piece as usize)
+            .ok_or_else(|| {
+                Fault::program(
+                    "program::launch",
+                    format!(
+                        "the temporary area lies in piece {}, past the {} seated",
+                        self.temporary_piece,
+                        self.scratch.len()
+                    ),
+                )
+            })?;
+        Ok((&piece.buffer, piece.offset + u64::from(self.temporary_offset)))
+    }
+
+    /// Test builds: poisons the seated scratch ([`poison_scratch`]), every
+    /// piece's bytes in use, ahead of the stage's passes.
     #[cfg(target_vendor = "apple")]
     pub fn poison_scratch_on(&mut self, frame: &mut Frame) -> Result<()> {
-        let scratch = self.scratch()?.clone();
-        poison_scratch(frame, scratch.buffer.slab(), scratch.offset, self.scratch_bytes)
+        let pieces = self.scratch()?.to_vec();
+        for (piece, &end) in pieces.iter().zip(&self.ends) {
+            poison_scratch(frame, piece.buffer.slab(), piece.offset, end)?;
+        }
+        Ok(())
     }
 
     pub fn refresh_cells(&mut self, rings: &Rings, cursors: &[Cursor]) -> Result<()> {
@@ -1430,10 +1504,7 @@ impl Prepared {
 
     pub fn encode_into(&self, frame: &Frame, region: &Region) -> Result<()> {
         match region.form {
-            Form::Fused => {
-                let scratch = self.scratch()?;
-                self.encode_fused(frame, region, &scratch.buffer, scratch.offset)
-            }
+            Form::Fused => self.encode_fused(frame, region),
             Form::Streamed => self.encode_streamed(frame, region),
             Form::Grouped | Form::GroupedLibrary => self.encode_grouped(frame, region),
         }
@@ -1510,20 +1581,21 @@ impl Prepared {
                     3,
                 );
                 {
-                    // The lane's scratch bases (buffer 4): addresses, so
-                    // the scratch's buffer is made resident by name.
-                    let scratch = self.scratch()?;
+                    // The lane's piece bases (buffer 4): addresses, so
+                    // each piece's buffer is made resident by name.
                     encoder.setBuffer_offset_atIndex(
                         Some(self.scratch_bases.raw()),
                         self.scratch_bases.offset() as usize,
                         4,
                     );
-                    let resource: &ProtocolObject<dyn MTLResource> =
-                        ProtocolObject::from_ref(&**scratch.buffer.slab());
-                    encoder.useResource_usage(
-                        resource,
-                        MTLResourceUsage::Read | MTLResourceUsage::Write,
-                    );
+                    for piece in self.scratch()? {
+                        let resource: &ProtocolObject<dyn MTLResource> =
+                            ProtocolObject::from_ref(&**piece.buffer.slab());
+                        encoder.useResource_usage(
+                            resource,
+                            MTLResourceUsage::Read | MTLResourceUsage::Write,
+                        );
+                    }
                 }
                 encoder.setBuffer_offset_atIndex(Some(layout.raw()), layout.offset() as usize, 5);
                 encoder.setBuffer_offset_atIndex(
@@ -1573,8 +1645,7 @@ impl Prepared {
                 resident(&held.base, MTLResourceUsage::Read);
             }
             let threads = streamed_threads(region.pipeline().maxTotalThreadsPerThreadgroup());
-            let temporary_bytes =
-                u64::from(self.scratch_stride.saturating_sub(self.temporary_offset));
+            let temporary_bytes = u64::from(self.temporary_bytes);
             Ok((
                 streamed_dispatches(
                     &region.steps,
@@ -1588,13 +1659,7 @@ impl Prepared {
     }
 
     #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
-    fn encode_fused(
-        &self,
-        frame: &Frame,
-        region: &Region,
-        scratch: &Buffer,
-        scratch_at: u64,
-    ) -> Result<()> {
+    fn encode_fused(&self, frame: &Frame, region: &Region) -> Result<()> {
         #[cfg(target_vendor = "apple")]
         {
             use objc2::runtime::ProtocolObject;
@@ -1607,7 +1672,13 @@ impl Prepared {
                     ProtocolObject::from_ref(&**held.base.slab());
                 encoder.useResource_usage(resource, MTLResourceUsage::Read);
             }
-            let scratch_at = usize::try_from(scratch_at).unwrap_or(usize::MAX);
+            for piece in self.scratch()? {
+                let resource: &ProtocolObject<dyn MTLResource> =
+                    ProtocolObject::from_ref(&**piece.buffer.slab());
+                encoder.useResource_usage(resource, MTLResourceUsage::Read | MTLResourceUsage::Write);
+            }
+            let (temporary, temporary_at) = self.temporary_at()?;
+            let temporary_at = usize::try_from(temporary_at).unwrap_or(usize::MAX);
             // SAFETY: every buffer is retained by `self`/`region`/the batch; every offset was bounds-checked.
             unsafe {
                 encoder.setBuffer_offset_atIndex(
@@ -1630,12 +1701,14 @@ impl Prepared {
                     self.offsets.offset() as usize,
                     3,
                 );
-                encoder.setBuffer_offset_atIndex(Some(scratch.raw()), scratch_at, 4);
+                // The lane's piece bases; each value at its piece's base
+                // plus its offset (`PTIR_AT`).
                 encoder.setBuffer_offset_atIndex(
-                    Some(scratch.raw()),
-                    scratch_at + self.temporary_offset as usize,
-                    5,
+                    Some(self.scratch_bases.raw()),
+                    self.scratch_bases.offset() as usize,
+                    4,
                 );
+                encoder.setBuffer_offset_atIndex(Some(temporary.raw()), temporary_at, 5);
                 match self.readout.and_then(|slot| self.outputs[slot].as_ref()) {
                     Some(bound) => encoder.setBuffer_offset_atIndex(
                         Some(bound.base.raw()),
@@ -1737,20 +1810,21 @@ impl Prepared {
                     3,
                 );
                 {
-                    // The lane's scratch bases (buffer 4): addresses, so
-                    // the scratch's buffer is made resident by name.
-                    let scratch = self.scratch()?;
+                    // The lane's piece bases (buffer 4): addresses, so
+                    // each piece's buffer is made resident by name.
                     encoder.setBuffer_offset_atIndex(
                         Some(self.scratch_bases.raw()),
                         self.scratch_bases.offset() as usize,
                         4,
                     );
-                    let resource: &ProtocolObject<dyn MTLResource> =
-                        ProtocolObject::from_ref(&**scratch.buffer.slab());
-                    encoder.useResource_usage(
-                        resource,
-                        MTLResourceUsage::Read | MTLResourceUsage::Write,
-                    );
+                    for piece in self.scratch()? {
+                        let resource: &ProtocolObject<dyn MTLResource> =
+                            ProtocolObject::from_ref(&**piece.buffer.slab());
+                        encoder.useResource_usage(
+                            resource,
+                            MTLResourceUsage::Read | MTLResourceUsage::Write,
+                        );
+                    }
                 }
                 encoder.setBuffer_offset_atIndex(Some(layout.raw()), layout.offset() as usize, 5);
                 encoder.setBuffer_offset_atIndex(
@@ -1885,11 +1959,6 @@ impl Prepared {
     pub const fn value_count(&self) -> u32 {
         self.value_count
     }
-
-    #[must_use]
-    pub const fn scratch_stride(&self) -> u32 {
-        self.scratch_stride
-    }
 }
 
 #[derive(Debug)]
@@ -1910,12 +1979,10 @@ pub struct Batch {
     lane_indices: SpanRegion,
     row_meta: SpanRegion,
     row_indices: SpanRegion,
-    /// This fire's value scratch, seated per fire ([`Batch::seat_scratch`]):
-    /// each member's own, wherever it lies.
-    scratch: Vec<ScratchAt>,
     addresses: SpanRegion,
-    /// Each lane's scratch bases ([`scratch_bases_bytes`]), written each
-    /// fire from its member's seat: the grouped kernels' buffer 4.
+    /// Each lane's piece bases ([`scratch_bases_bytes`]), written each
+    /// fire from its member's seat (its instance's scratch): the kernels'
+    /// buffer 4.
     scratch_bases: SpanRegion,
     table_bytes: u64,
     layouts: Vec<SpanRegion>,
@@ -1942,7 +2009,7 @@ fn batch_pieces(
     channel_slots: u32,
     (descriptor, param, offset, binding): (u64, u64, u64, u64),
     rows: u32,
-    table_bytes: u64,
+    (table_bytes, pieces): (u64, u32),
     fused: usize,
 ) -> Vec<u64> {
     let lanes64 = u64::from(lanes);
@@ -1959,17 +2026,25 @@ fn batch_pieces(
         lanes64 * size_of::<RowMeta>() as u64,
         (lanes64 * u64::from(rows) * size_of::<u32>() as u64).max(4),
         lanes64 * table_bytes,
-        scratch_bases_bytes(lanes),
+        scratch_bases_bytes(lanes, pieces),
     ];
     pieces.extend((0..fused).map(|_| size_of::<GroupLayout>() as u64));
     pieces
 }
 
-/// The bytes of a table of `lanes` lanes' scratch bases: a GPU address a
-/// piece (`M3_SCRATCH_PIECES`), the grouped kernels' buffer 4.
-fn scratch_bases_bytes(lanes: u32) -> u64 {
-    u64::from(lanes) * u64::from(eta_compiler::codegen::metal::M3_SCRATCH_PIECES) * 8
+/// The bytes of a table of `lanes` lanes' piece bases, `pieces` a lane: a
+/// GPU address a piece, the kernels' buffer 4.
+fn scratch_bases_bytes(lanes: u32, pieces: u32) -> u64 {
+    (u64::from(lanes) * u64::from(pieces.max(1)) * size_of::<u64>() as u64).max(8)
 }
+
+/// The bytes of a stage's offsets table: each value's offset in its piece,
+/// then each value's piece.
+fn offsets_bytes(plan: &LaunchStagePlan) -> u64 {
+    (2 * plan.value_types.len() * size_of::<u32>()).max(size_of::<u32>()) as u64
+}
+
+const LANE_OFFSET: &str = "bytes before a value in its piece (the kernels' `offsets` words)";
 
 #[cfg(test)]
 thread_local! {
@@ -1980,10 +2055,14 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
-/// `scratch` as the grouped kernels read a lane's bases: piece 0 at its
-/// GPU address (one piece until eta_exec's chunk-aware layout).
-fn scratch_bases_of(scratch: &ScratchAt) -> Result<Vec<u8>> {
-    Ok(address_of(&scratch.buffer, scratch.offset)?.to_le_bytes().to_vec())
+/// `pieces` as the kernels read a lane's bases: each piece's first byte at
+/// its GPU address, in piece order.
+fn scratch_bases_of(pieces: &[ScratchAt]) -> Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(pieces.len() * size_of::<u64>());
+    for piece in pieces {
+        bytes.extend(address_of(&piece.buffer, piece.offset)?.to_le_bytes());
+    }
+    Ok(bytes)
 }
 
 /// The span bytes `pieces` take, each on the arena's boundary.
@@ -2016,11 +2095,14 @@ impl Batch {
             (
                 values * size_of::<ValueDesc>() as u64,
                 (plan.ops.len() * size_of::<OpParams>()) as u64,
-                values * size_of::<u32>() as u64,
+                offsets_bytes(plan),
                 (plan.channel_bindings.len() * size_of::<u32>()) as u64,
             ),
             rows.max(1),
-            ((plan.output_pitch as usize).max(1) * size_of::<OutputSeat>()) as u64,
+            (
+                ((plan.output_pitch as usize).max(1) * size_of::<OutputSeat>()) as u64,
+                pieces_bound(plan),
+            ),
             plan.fused.len(),
         ))
     }
@@ -2101,7 +2183,7 @@ impl Batch {
                 binding_bytes.len() as u64,
             ),
             rows_per_lane,
-            table_bytes,
+            (table_bytes, template.scratch_pieces()),
             grouped.layout_words.len(),
         );
         let mut regions = pieces
@@ -2121,7 +2203,6 @@ impl Batch {
             lane_indices: next(),
             row_meta: next(),
             row_indices: next(),
-            scratch: Vec::new(),
             addresses: next(),
             scratch_bases: next(),
             table_bytes,
@@ -2183,29 +2264,6 @@ impl Batch {
         Ok(next)
     }
 
-    /// The value scratch each member of a fire takes: its stride, aligned.
-    #[must_use]
-    pub fn member_scratch_bytes(&self) -> u64 {
-        u64::from(self.key.scratch_stride)
-            .max(SCRATCH_ALIGN)
-            .next_multiple_of(SCRATCH_ALIGN)
-    }
-
-    /// Seats this fire's value scratch: `at[i]` member i's, wherever each
-    /// lies.
-    pub fn seat_scratch(&mut self, at: Vec<ScratchAt>) {
-        self.scratch = at;
-    }
-
-    fn scratch(&self, member: usize) -> Result<&ScratchAt> {
-        self.scratch.get(member).ok_or_else(|| {
-            Fault::program(
-                "program::launch",
-                "a batch fired before its fire seated its value scratch in the span",
-            )
-        })
-    }
-
     #[must_use]
     pub fn key(&self) -> BatchKey {
         self.key
@@ -2237,23 +2295,35 @@ impl Batch {
             0,
             u64::from(count) * u64::from(self.shape.channel_slots_per_lane),
         )?;
-        let mut bases = Vec::with_capacity(scratch_bases_bytes(count) as usize);
-        for member in 0..members.len() {
+        // Each lane's piece bases, from where its member's instance holds
+        // its scratch now (seated at the member's fire).
+        let pieces = self.key.scratch_pieces;
+        let mut bases =
+            Vec::with_capacity(scratch_bases_bytes(count, pieces) as usize);
+        for index in 0..members.len() {
             #[cfg(test)]
-            let member = if ALIAS_LANE_SCRATCH.with(std::cell::Cell::get) {
+            let index = if ALIAS_LANE_SCRATCH.with(std::cell::Cell::get) {
                 0
             } else {
-                member
+                index
             };
-            let scratch = self.scratch(member)?.clone();
+            let member: &Prepared = &*members[index];
+            let seated = member.scratch()?;
+            if seated.len() != pieces as usize {
+                return Err(Fault::program(
+                    "program::launch",
+                    format!(
+                        "member {index} of a batch seated {} scratch piece(s), and the batch \
+                         lays {pieces} a lane",
+                        seated.len()
+                    ),
+                ));
+            }
             #[cfg(target_vendor = "apple")]
-            poison_scratch(
-                frame,
-                scratch.buffer.slab(),
-                scratch.offset,
-                u64::from(self.key.scratch_stride),
-            )?;
-            bases.extend(scratch_bases_of(&scratch)?);
+            for (piece, &end) in seated.iter().zip(&member.ends) {
+                poison_scratch(frame, piece.buffer.slab(), piece.offset, end)?;
+            }
+            bases.extend(scratch_bases_of(seated)?);
         }
         self.scratch_bases.write(0, &bases)?;
         let frame: &Frame = frame;
@@ -2340,9 +2410,8 @@ impl Batch {
         for region in regions {
             match region.form {
                 Form::Fused => {
-                    for (index, member) in members.iter().enumerate() {
-                        let scratch = self.scratch(index)?;
-                        member.encode_fused(frame, region, &scratch.buffer, scratch.offset)?;
+                    for member in members.iter() {
+                        member.encode_fused(frame, region)?;
                     }
                 }
                 Form::Grouped | Form::GroupedLibrary => {
@@ -2414,9 +2483,9 @@ impl Batch {
                         self.scratch_bases.at(0) as usize,
                         4,
                     );
-                    for scratch in &self.scratch {
+                    for piece in members.iter().flat_map(|member| member.scratch.iter()) {
                         let resource: &ProtocolObject<dyn MTLResource> =
-                            ProtocolObject::from_ref(&**scratch.buffer.slab());
+                            ProtocolObject::from_ref(&**piece.buffer.slab());
                         encoder.useResource_usage(
                             resource,
                             MTLResourceUsage::Read | MTLResourceUsage::Write,
@@ -2480,11 +2549,7 @@ impl Batch {
                 .first()
                 .ok_or_else(|| Fault::program("program::launch", "a batch with no members"))?;
             let threads = streamed_threads(region.pipeline().maxTotalThreadsPerThreadgroup());
-            let temporary_bytes = u64::from(
-                self.key
-                    .scratch_stride
-                    .saturating_sub(self.key.temporary_offset),
-            );
+            let temporary_bytes = u64::from(self.key.temporary_bytes);
             self.dump_streamed_tables(region, template)?;
             dispatch_streamed(
                 &encoder,
@@ -2523,13 +2588,13 @@ impl Batch {
         self.descriptors.read(0, &mut descriptors)?;
         let mut params = vec![0u8; params_per_lane * size_of::<OpParams>()];
         self.params.read(0, &mut params)?;
-        let mut offsets = vec![0u8; value_count * 4];
+        let mut offsets = vec![0u8; value_count * 8];
         self.offsets.read(0, &mut offsets)?;
         let mut bytes = Vec::new();
         for word in [
             value_count as u32,
             params_per_lane as u32,
-            self.key.scratch_stride,
+            self.key.temporary_bytes,
             self.key.temporary_offset,
         ] {
             bytes.extend_from_slice(&word.to_le_bytes());
@@ -2604,9 +2669,9 @@ impl Batch {
                         self.scratch_bases.at(0) as usize,
                         4,
                     );
-                    for scratch in &self.scratch {
+                    for piece in members.iter().flat_map(|member| member.scratch.iter()) {
                         let resource: &ProtocolObject<dyn MTLResource> =
-                            ProtocolObject::from_ref(&**scratch.buffer.slab());
+                            ProtocolObject::from_ref(&**piece.buffer.slab());
                         encoder.useResource_usage(
                             resource,
                             MTLResourceUsage::Read | MTLResourceUsage::Write,
@@ -2766,13 +2831,13 @@ mod tests {
     #[test]
     fn a_lane_scratch_past_a_uint_is_refused_by_name() {
         assert_eq!(
-            lane_word(LANE_SCRATCH, u64::from(u32::MAX)).ok(),
+            lane_word(LANE_TEMPORARY_BYTES, u64::from(u32::MAX)).ok(),
             Some(u32::MAX)
         );
-        let refused = lane_word(LANE_SCRATCH, 1 << 32).expect_err("past a uint");
+        let refused = lane_word(LANE_TEMPORARY_BYTES, 1 << 32).expect_err("past a uint");
         assert!(
             matches!(refused, Fault::Ceiling { what, need, .. }
-                if what == LANE_SCRATCH && need == 1 << 32),
+                if what == LANE_TEMPORARY_BYTES && need == 1 << 32),
             "{refused}"
         );
     }
@@ -2829,17 +2894,19 @@ mod tests {
             [
                 "uint lane_count",
                 "uint value_count",
-                "uint scratch_stride",
+                "uint temporary_bytes",
                 "uint temporary_offset",
                 "uint vocab",
                 "uint reserved0",
                 "uint reserved1",
                 "uint reserved2",
+                "uint scratch_pieces",
+                "uint temporary_piece",
             ],
             "`GroupLayout` in this file is the host half of the emitted \
              `M3GroupLayout`, and the two have parted"
         );
-        assert_eq!(size_of::<GroupLayout>(), (u32::BITS as usize));
+        assert_eq!(size_of::<GroupLayout>(), 10 * size_of::<u32>());
         assert_eq!(
             fields("M3RowMeta"),
             [
