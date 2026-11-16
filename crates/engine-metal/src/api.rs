@@ -1034,6 +1034,7 @@ impl Engine for Metal {
                 &binding.channels,
                 &binding.instance_slots,
                 &binding.ring_slots,
+                &binding.scratch,
             )
             .map_err(fault)?;
         let standing_guest_bytes = shell.standing_guest_bytes();

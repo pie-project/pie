@@ -725,6 +725,8 @@ fn lane_word(what: &'static str, bytes: u64) -> Result<u32> {
 pub struct ScratchAt {
     pub buffer: Buffer,
     pub offset: u64,
+    /// The bytes the piece holds from `offset`.
+    pub bytes: u64,
 }
 
 #[derive(Debug)]
@@ -1345,6 +1347,18 @@ impl Prepared {
                 ),
             ));
         };
+        for (index, (piece, &end)) in pieces.iter().zip(&self.ends).enumerate() {
+            if end > piece.bytes {
+                return Err(Fault::program(
+                    "program::launch",
+                    format!(
+                        "piece {index} of a stage's scratch takes {end} bytes, and its \
+                         instance holds {} there",
+                        piece.bytes
+                    ),
+                ));
+            }
+        }
         self.scratch_bases.write(0, &scratch_bases_of(pieces)?)?;
         self.scratch = pieces.to_vec();
         Ok(())

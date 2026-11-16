@@ -12,7 +12,7 @@ use crate::store::layout::INSTANCE;
 
 use super::compile::Compiled;
 use super::held::{self, TableLayout, Tables};
-use super::launch::{ChannelShape, Cursor, Prepared, Rings};
+use super::launch::{ChannelShape, Cursor, Prepared, Rings, ScratchAt};
 use super::ports;
 use super::shared::SharedRing;
 
@@ -79,6 +79,8 @@ pub struct Pooled<'a> {
     pub instance: &'a [u32],
     /// `Channel` slot refs for the rings it holds itself.
     pub rings: &'a [engine::program::RingSlots],
+    /// Where its lanes' scratch lies (`engine::InstanceBinding::scratch`).
+    pub scratch: &'a engine::ScratchPlace,
 }
 
 #[derive(Debug)]
@@ -88,6 +90,10 @@ pub struct Session {
     /// Whether they are one run (a table larger than a slot).
     tables_run: bool,
     rings: Rings,
+    /// Where the lanes' scratch lies in the instance's `Instance` room
+    /// (`engine::GuestState::per_instance`): every stage's pieces from its
+    /// first, seated at each fire where the pool holds them then.
+    scratch: engine::ScratchPlace,
     shapes: Vec<ChannelShape>,
     cursors: Vec<Cursor>,
     prepared: Vec<Option<Prepared>>,
@@ -101,20 +107,63 @@ pub struct Session {
 impl Session {
     /// The bind-time tables an instance of `compiled` takes, every
     /// launching stage's in order.
-    #[must_use]
-    /// The value scratch one lane of the program takes in a fire at
-    /// `extents`: the widest launching stage's. Stages fire one after
-    /// another in one serial pass order and none reads another's scratch
-    /// (values cross stages through channels), so one stage's room serves
-    /// every stage of the fire.
-    pub fn scratch_for(compiled: &Compiled, extents: &Extents) -> Result<u64> {
+    /// The scratch an instance of `compiled` bound at `extents` holds for
+    /// its lanes (`engine::GuestState::per_instance`): the widest launching
+    /// stage's, each laid in pieces of at most `unit` bytes
+    /// ([`super::launch::scratch_unit`]) and held as one run where it takes
+    /// one piece, else a whole chunk of `chunk_bytes` a piece
+    /// ([`super::launch::scratch_held`]). Stages fire one after another in
+    /// one serial pass order and none reads another's scratch (values cross
+    /// stages through channels), so every stage's pieces lie from the
+    /// instance's first. A value past a piece is refused by name.
+    pub fn scratch_for(
+        compiled: &Compiled,
+        extents: &Extents,
+        unit: u64,
+        chunk_bytes: u64,
+    ) -> Result<u64> {
         let mut widest = 0;
         for (index, plan) in compiled.plans.iter().enumerate() {
             if launches(compiled, index) {
-                widest = widest.max(Prepared::scratch_for(plan, &compiled.stages[index].regions, extents)?);
+                let ends =
+                    Prepared::scratch_ends(plan, &compiled.stages[index].regions, extents, unit)?;
+                widest = widest.max(super::launch::scratch_held(&ends, chunk_bytes));
             }
         }
         Ok(widest)
+    }
+
+    /// Where each piece of this instance's scratch lies now: its run's
+    /// first slot, or each of its whole chunks' first, through the pool's
+    /// view, each with the bytes it holds. The pool may have moved them
+    /// since the last fire (an evacuation, an unpark), so a fire asks anew.
+    pub fn scratch_at(&self, pools: &Pools) -> Result<Vec<ScratchAt>> {
+        let slot_bytes = pools.slot_bytes(INSTANCE)?;
+        let per_chunk = pools.slots_per_chunk(INSTANCE)?;
+        let at = |slot: u32, slots: u32| -> Result<ScratchAt> {
+            let (buffer, offset, _, _) = pools.slot_place(INSTANCE, slot)?;
+            Ok(ScratchAt {
+                buffer,
+                offset,
+                bytes: u64::from(slots) * slot_bytes,
+            })
+        };
+        match &self.scratch {
+            engine::ScratchPlace::None => Ok(Vec::new()),
+            engine::ScratchPlace::Run { first, slots } => Ok(vec![at(*first, *slots)?]),
+            engine::ScratchPlace::Chunks(chunks) => chunks
+                .iter()
+                .map(|&chunk| {
+                    let first = chunk.checked_mul(per_chunk).ok_or_else(|| {
+                        Fault::program(
+                            "program::session",
+                            format!("scratch chunk {chunk} lies past a u32 slot ref"),
+                        )
+                    })?;
+                    at(first, per_chunk)
+                })
+                .collect(),
+        }
     }
 
     /// The span bytes the batch tables of `lanes` lanes take for every
@@ -174,6 +223,7 @@ impl Session {
         let tables_run = TableLayout::of(&sizes, pooled.pools.slot_bytes(INSTANCE)?).run;
         let mut tables = Tables::pooled(pooled.pools, INSTANCE, pooled.instance, &sizes)?;
         let cursors = vec![Cursor { head: 0, tail: 0 }; shapes.len()];
+        let unit = super::launch::scratch_unit(pooled.pools)?;
 
         let mut prepared = Vec::with_capacity(compiled.plans.len());
         for (index, stage_plan) in compiled.plans.iter().enumerate() {
@@ -184,6 +234,7 @@ impl Session {
                     &shapes,
                     extents,
                     rows,
+                    unit,
                     &mut tables,
                 )?)
             } else {
@@ -196,6 +247,7 @@ impl Session {
             instance_slots: pooled.instance.to_vec(),
             tables_run,
             rings,
+            scratch: pooled.scratch.clone(),
             shapes,
             cursors,
             prepared,
@@ -235,12 +287,15 @@ impl Session {
 
     /// Moves the pooled tables to `instance` (the refs, in order, that
     /// replace this instance's) and its own rings to `rings`; the runtime
-    /// already copied their bytes there.
+    /// already copied their bytes there. Its scratch lies at `scratch` from
+    /// now: dead between fires, nothing of it is copied, and the next fire
+    /// seats its stages there.
     pub fn retarget(
         &mut self,
         pools: &Pools,
         instance: &[u32],
         rings: &[engine::program::RingSlots],
+        scratch: &engine::ScratchPlace,
     ) -> Result<()> {
         if instance.len() != self.instance_slots.len()
             || (self.tables_run && !held::consecutive(instance))
@@ -271,6 +326,7 @@ impl Session {
         }
         self.rings.retarget(pools, rings)?;
         self.instance_slots = instance.to_vec();
+        self.scratch = scratch.clone();
         Ok(())
     }
 
@@ -426,7 +482,7 @@ impl Session {
         compiled: &Compiled,
         plan: &ExecPlan,
         at: Stage,
-        carve: &super::GuestCarve,
+        pools: &Pools,
     ) -> Result<Fired> {
         if self.airborne.is_some() {
             return Err(Fault::program(
@@ -441,6 +497,7 @@ impl Session {
         }
 
         let cursors = self.cursors_now();
+        let pieces = self.scratch_at(pools)?;
         let mut launched = Vec::with_capacity(compiled.stages.len());
         for (index, stage) in compiled.stages.iter().enumerate() {
             if !plan.runs_at(index, at) {
@@ -450,11 +507,10 @@ impl Session {
                 continue;
             };
             prepared.refresh(&self.rings, &cursors)?;
-            // Its scratch from the guest region's top, zeroed on the GPU in
-            // the frame of the stage's first region: the one queue orders it
-            // after whatever frame still reads the span, with no submission
-            // or wait of its own.
-            prepared.seat_scratch(carve.clone().take(prepared.scratch_bytes())?)?;
+            // Its scratch where the instance holds it now: the one queue
+            // orders this fire after whatever frame still reads it (one
+            // fire of an instance in flight at a time).
+            prepared.seat_scratch(&pieces)?;
             for (at, region) in stage.regions.iter().enumerate() {
                 prepared.launch_region(device, pipelines, &self.rings, region, at == 0)?;
             }
@@ -468,6 +524,7 @@ impl Session {
         &mut self,
         compiled: &Compiled,
         plan: &ExecPlan,
+        pools: &Pools,
     ) -> Result<Option<Fired>> {
         if self.airborne.is_some() {
             return Err(Fault::program(
@@ -482,6 +539,7 @@ impl Session {
             return Ok(Some(refused));
         }
         let cursors = self.cursors_now();
+        let pieces = self.scratch_at(pools)?;
         let mut launched = Vec::with_capacity(compiled.stages.len());
         for (index, stage) in compiled.stages.iter().enumerate() {
             if !plan.runs_at(index, Stage::Epilogue) {
@@ -494,6 +552,7 @@ impl Session {
                 continue;
             }
             prepared.refresh_cells(&self.rings, &cursors)?;
+            prepared.seat_scratch(&pieces)?;
             launched.push(index);
         }
         self.airborne = Some(launched);
