@@ -149,8 +149,9 @@ impl<B: Host> Gpu<B> {
     /// the load built every kernel pipeline its walks named and every guest
     /// step's, so each one built since is one it did not prepare
     /// ([`engine::live::Tally::BuiltAfterReady`]).
-    /// And the steps a backend that keeps recordings walked to keep: a shape
-    /// recorded at its first serving fire ([`engine::live::Tally::Compiled`]).
+    /// And the steps a backend that keeps recordings walked to keep: a body
+    /// recorded at a serving fire, which the load should have recorded
+    /// ([`engine::live::Tally::RecordedAfterReady`]).
     /// And the steps walked and kept by no recording: each ran eagerly. On a
     /// backend that keeps recordings that is a fire it should have replayed
     /// (a split step, bindings a recording cannot hold:
@@ -172,7 +173,8 @@ impl<B: Host> Gpu<B> {
         }
         let recorded = self.shell.as_mut().map_or(0, Shell::recorded_serving);
         if recorded > 0 {
-            self.live.tally(engine::live::Tally::Compiled, recorded);
+            self.live
+                .tally(engine::live::Tally::RecordedAfterReady, recorded);
         }
         // A guest pipeline a bind built after the load, which built every
         // one a stage can dispatch.

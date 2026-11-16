@@ -73,8 +73,19 @@ impl KeyBuilder {
 
 const SHAPES_KEPT: usize = 64;
 
+/// The arms a composition was kept at, as of which forget.
+struct KeptAt {
+    arms: Vec<usize>,
+    forgets: u64,
+}
+
 pub(crate) struct Recorder {
     by_key: HashMap<Key, Recording>,
+
+    /// What each composition (the key less its arm and its tables) was kept
+    /// at, and since which forget: why a fire keeps a recording.
+    kept: HashMap<Key, KeptAt>,
+    forgets: u64,
 
     replayed: std::cell::Cell<u64>,
     recorded: std::cell::Cell<u64>,
@@ -89,6 +100,8 @@ impl Recorder {
     pub(crate) fn new() -> Recorder {
         Recorder {
             by_key: HashMap::new(),
+            kept: HashMap::new(),
+            forgets: 0,
             replayed: std::cell::Cell::new(0),
             recorded: std::cell::Cell::new(0),
             evicted: std::cell::Cell::new(0),
@@ -100,6 +113,8 @@ impl Recorder {
     pub(crate) fn refusing(why: &'static str) -> Recorder {
         Recorder {
             by_key: HashMap::new(),
+            kept: HashMap::new(),
+            forgets: 0,
             replayed: std::cell::Cell::new(0),
             recorded: std::cell::Cell::new(0),
             evicted: std::cell::Cell::new(0),
@@ -138,6 +153,33 @@ impl Recorder {
     /// a replay after those slabs change would land in the old ones.
     pub(crate) fn forget(&mut self) {
         self.by_key.clear();
+        self.forgets += 1;
+    }
+
+    /// Why a fire of `composition` at `arm` keeps a recording, and notes it
+    /// kept one: no recording of its composition before; one only at
+    /// another arm; one at this arm over other tables (kv pages, a mask's
+    /// width, a gathered window); or one a forget since dropped.
+    pub(crate) fn why_kept(&mut self, composition: Key, arm: usize) -> &'static str {
+        let forgets = self.forgets;
+        let seen = self.kept.entry(composition).or_insert_with(|| KeptAt {
+            arms: Vec::new(),
+            forgets,
+        });
+        let why = if seen.arms.is_empty() {
+            "a composition no recording held"
+        } else if seen.forgets != forgets {
+            "a composition whose recordings a commit, release or residency forgot"
+        } else if !seen.arms.contains(&arm) {
+            "a composition recorded at another arm"
+        } else {
+            "a composition recorded at this arm over other tables (kv pages, a mask, a window)"
+        };
+        if !seen.arms.contains(&arm) {
+            seen.arms.push(arm);
+        }
+        seen.forgets = forgets;
+        why
     }
 
     pub(crate) fn insert(&mut self, key: Key, recording: Recording) {
@@ -155,5 +197,39 @@ impl Recorder {
             self.evicted.set(self.evicted.get() + 1);
         }
         self.by_key.insert(key, recording);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{KeyBuilder, Recorder};
+
+    fn key(n: u32) -> super::Key {
+        let mut key = KeyBuilder::new();
+        key.hashed(&n);
+        key.finish()
+    }
+
+    /// Why a fire keeps a recording: a composition no recording held, then
+    /// the same at another arm, then at an arm it was kept at (its tables
+    /// changed), then after a forget.
+    #[test]
+    fn a_kept_recording_says_why() {
+        let mut recorder = Recorder::new();
+        assert_eq!(
+            recorder.why_kept(key(1), 0),
+            "a composition no recording held"
+        );
+        assert_eq!(
+            recorder.why_kept(key(1), 1),
+            "a composition recorded at another arm"
+        );
+        assert!(recorder.why_kept(key(1), 0).contains("over other tables"));
+        recorder.forget();
+        assert!(recorder.why_kept(key(1), 0).contains("forgot"));
+        assert_eq!(
+            recorder.why_kept(key(2), 0),
+            "a composition no recording held"
+        );
     }
 }

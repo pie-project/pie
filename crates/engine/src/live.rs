@@ -59,16 +59,21 @@ pub enum Tally {
     /// guest region's module). The rule is that every one serving can
     /// reach is built before ready, so this reads 0.
     BuiltAfterReady,
+    /// A body recorded after ready: a serving fire whose frame no recording
+    /// the load made replays, so it walked and kept one. The rule is that
+    /// every body serving fires is recorded before ready, so this reads 0.
+    RecordedAfterReady,
 }
 
 impl Tally {
-    pub const ALL: [Tally; 6] = [
+    pub const ALL: [Tally; 7] = [
         Tally::Compiled,
         Tally::Fallback,
         Tally::Unrecorded,
         Tally::Refused,
         Tally::Eager,
         Tally::BuiltAfterReady,
+        Tally::RecordedAfterReady,
     ];
 
     /// Its name in the model status.
@@ -81,6 +86,7 @@ impl Tally {
             Tally::Refused => "refused",
             Tally::Eager => "eager",
             Tally::BuiltAfterReady => "built_after_ready",
+            Tally::RecordedAfterReady => "recorded_after_ready",
         }
     }
 }

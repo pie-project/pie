@@ -252,6 +252,17 @@ impl Serve for Api {
             && prepared.seats.iter().map(|seat| seat.rows).sum::<u32>() >= split_rows)
             || prepared.bindings.voxels.is_some();
         let keep = key.filter(|_| !split && shell.shelf.recorder.has_room());
+        if keep.is_some() {
+            let composition = composition_key(prepared);
+            let why = shell.shelf.recorder.why_kept(composition, prepared.arm);
+            tracing::info!(
+                arm = prepared.arm,
+                rung = ?prepared.rung,
+                lanes = prepared.lanes.len(),
+                why,
+                "a fire keeps a recording"
+            );
+        }
         Ok(Plan::Walk { keep, split })
     }
 
@@ -388,6 +399,20 @@ fn record_key(shell: &Shell<Api>, p: &Prepared<'_, Api>) -> crate::record::Key {
         key.shown(&lane.reads);
     }
 
+    key.finish()
+}
+
+/// A fire's composition: its key less its arm and the tables a fire
+/// states afresh (the kv pages, the bindings and windows over them).
+fn composition_key(p: &Prepared<'_, Api>) -> crate::record::Key {
+    let mut key = crate::record::KeyBuilder::new();
+    key.bytes(&p.descriptor.pack());
+    key.hashed(&p.slots);
+    key.shown(&p.rung);
+    for lane in p.lanes {
+        key.shown(&lane.readout);
+        key.shown(&lane.reads);
+    }
     key.finish()
 }
 
