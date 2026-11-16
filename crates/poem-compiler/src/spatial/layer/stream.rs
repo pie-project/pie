@@ -196,6 +196,8 @@ impl Body<'_, '_> {
         outs: &[poem_ir::ValueId],
     ) -> R<()> {
         match node {
+            // a shared expert's gated add: a root op as an elementwise one is
+            Operation::Linear(Linear::MoeSigmoidGateAdd { .. }) => self.elementwise(op, acts, outs),
             // every elementwise op is a root op (or the lanes' / the host's): whether its region
             // prints is the unit's lowering's question (`fuse::chain::lower_run`, `emit::region`),
             // not a list of names here

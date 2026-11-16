@@ -707,6 +707,7 @@ fn lowers_explicitly(op: &Operation) -> bool {
             act: GluAct::Swiglu | GluAct::GegluTanh,
             ..
         }) | Operation::Elemwise(Elemwise::Standardize { .. } | Elemwise::RmsnormGated { .. })
+            | Operation::Linear(Linear::MoeSigmoidGateAdd { .. })
     )
 }
 
@@ -1298,6 +1299,20 @@ impl Builder {
     pub(super) fn node(&mut self, trace: &Trace, op: &Operation) -> Option<()> {
         match op {
             Operation::Elemwise(e) => self.elemwise(trace, e),
+            // a shared expert gated in: `routed + sigmoid(gate) shared`, the gate a row's one
+            Operation::Linear(Linear::MoeSigmoidGateAdd {
+                routed,
+                shared,
+                gate,
+                y,
+            }) => {
+                let g = self.get(*gate)?;
+                let s = self.sigmoid(g);
+                let gs = self.push(Op::Binary(Binary::Mul, s, self.get(*shared)?));
+                let out = self.push(Op::Binary(Binary::Add, self.get(*routed)?, gs));
+                self.set(*y, out);
+                Some(())
+            }
             // the row an id picks of the table, a parameter read so
             Operation::Gather(Gather::Embed { table, y, .. }) => {
                 let row = self.part(*table, 0)?;

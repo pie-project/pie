@@ -340,7 +340,8 @@ impl Reader<'_> {
 fn rooted(op: &Operation) -> bool {
     matches!(
         op,
-        Operation::Elemwise(_) | Operation::Linear(Linear::Glu { .. })
+        Operation::Elemwise(_)
+            | Operation::Linear(Linear::Glu { .. } | Linear::MoeSigmoidGateAdd { .. })
     )
 }
 
