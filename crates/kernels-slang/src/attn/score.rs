@@ -32,11 +32,57 @@ const NORM: [&str; 3] = [
     "attn_score_norm_bf16_d_256",
 ];
 
-const MASS: [&str; 3] = [
-    "attn_score_mass_bf16_d_64",
-    "attn_score_mass_bf16_d_128",
-    "attn_score_mass_bf16_d_256",
+fn stamp_for(head_dim: u32) -> Option<usize> {
+    STAMPS.iter().position(|stamp| head_dim <= *stamp)
+}
+
+/// The mass kernel's forms by the workgroup memory they take, each its
+/// tile's key rows' and query rows' words (`PIE_MASS_ROWS`, `PIE_MASS_Q`):
+/// a device states which it runs ([`mass_form`]).
+const MASS: [MassForm; 2] = [
+    MassForm {
+        entry: "attn_score_mass_s32",
+        rows: 5120,
+        q: 2112,
+        bytes: 32 << 10,
+    },
+    MassForm {
+        entry: "attn_score_mass_s16",
+        rows: 2080,
+        q: 1088,
+        bytes: 16 << 10,
+    },
 ];
+
+/// The query heads the mass kernel stages a normaliser of (`PIE_MASS_HEADS`).
+const MASS_HEADS: u32 = 64;
+
+/// The workgroups a capturing lane's mass runs over (`PIE_MASS_GRID`): the
+/// tiles past them are walked by the same.
+const MASS_GRID: u32 = 1024;
+
+#[derive(Clone, Copy, Debug)]
+struct MassForm {
+    entry: &'static str,
+    rows: u32,
+    q: u32,
+    bytes: u32,
+}
+
+/// The mass kernel's form on a device of `workgroup_bytes` of workgroup
+/// memory, and its keys a tile: the widest that fits the device and
+/// `heads` query heads over `kv_heads` of `head_dim`, every kv head's row of
+/// a tile's keys and every query head's row staged at once.
+fn mass_form(workgroup_bytes: u32, heads: u32, kv_heads: u32, head_dim: u32) -> Option<(MassForm, u32)> {
+    let run = head_dim / 2 + 1;
+    MASS.into_iter().find_map(|form| {
+        let fits = workgroup_bytes >= form.bytes
+            && heads <= MASS_HEADS
+            && heads.saturating_mul(run) <= form.q;
+        let tile = (form.rows / kv_heads.saturating_mul(run).max(1)).min(THREADS / heads.max(1));
+        (fits && tile > 0).then_some((form, tile))
+    })
+}
 
 const PAGES: &str = "attn_score_pages";
 
@@ -72,10 +118,6 @@ pub struct Capture {
     /// The keys of the load's context: a key row's f32s, which the pool
     /// holds at each lane's place (added into, or written).
     pub context: u32,
-}
-
-fn stamp_for(head_dim: u32) -> Option<usize> {
-    STAMPS.iter().position(|stamp| head_dim <= *stamp)
 }
 
 /// The kv heads the pool row's strides spell, which must be the stated ones.
@@ -126,6 +168,7 @@ pub fn capture(
     sm_scale: f32,
     observe: u32,
     into: bool,
+    workgroup_bytes: u32,
 ) -> Result<(), Error> {
     const OP: &str = "attn.score_capture";
     let q = at.q;
@@ -162,7 +205,7 @@ pub fn capture(
         return Err(refuse(
             OP,
             format!(
-                "the {head_dim}-wide head is wider than the {}-wide dot this kernel is \
+                "the {head_dim}-wide head is wider than the {}-wide dot the normaliser is \
                  stamped for",
                 STAMPS[STAMPS.len() - 1]
             ),
@@ -171,7 +214,9 @@ pub fn capture(
     if !head_dim.is_multiple_of(16) {
         return Err(refuse(
             OP,
-            format!("the {head_dim}-wide head is read eight bf16 pairs at a time, and is no multiple of 16"),
+            format!(
+                "the {head_dim}-wide head is read eight bf16 pairs at a time, and is no multiple of 16"
+            ),
         ));
     }
     let heads = super::row_heads(OP, q.width, head_dim)?;
@@ -181,6 +226,16 @@ pub fn capture(
             format!("{heads} query heads do not group over {kv_heads} kv heads"),
         ));
     }
+    let Some((mass, tile)) = mass_form(workgroup_bytes, heads, kv_heads, head_dim) else {
+        return Err(refuse(
+            OP,
+            format!(
+                "{heads} query heads over {kv_heads} kv heads of {head_dim}: no form of the mass \
+                 kernel stages a key's rows and the heads' query rows in the {workgroup_bytes} \
+                 bytes of workgroup memory this device states"
+            ),
+        ));
+    };
     if q_heads < heads {
         return Err(refuse(
             OP,
@@ -214,16 +269,16 @@ pub fn capture(
             ),
         ));
     }
-    let tiles = context.div_ceil(THREADS);
+    let tiles = context.div_ceil(tile);
     let launches = |what: &str, groups: u64| {
         u32::try_from(groups).map_err(|_| {
             refuse(OP, format!("the {what} grid will not launch: {groups} workgroups"))
         })
     };
     let norm_x = launches("normaliser", u64::from(at.capturing) * u64::from(THREADS))?;
-    let mass_x = launches("mass", u64::from(tiles) * u64::from(THREADS))?;
+    let mass_x = launches("mass", u64::from(tiles.min(MASS_GRID)) * u64::from(THREADS))?;
 
-    let scalars = |into: bool| -> Result<Vec<ArgValue>, Error> {
+    let scalars = |into: bool, tile: u32| -> Result<Vec<ArgValue>, Error> {
         Ok(vec![
             pool.pool.words.arg(),
             pool.origin[0].arg(),
@@ -237,6 +292,7 @@ pub fn capture(
             stated(OP, context)?.arg(),
             i32::from(into).arg(),
             stated(OP, q_heads)?.arg(),
+            stated(OP, tile)?.arg(),
         ])
     };
     let reads = [
@@ -254,34 +310,23 @@ pub fn capture(
             format!("the normalisers take {need} f32, and the scratch holds {have}"),
         ));
     }
-    wide_capture(ctx, at, pool, stamp, heads, norm_x, mass_x, &reads, &scalars(into)?)
-}
-
-/// The two dispatches of a layer's capture.
-#[allow(clippy::too_many_arguments)]
-fn wide_capture(
-    ctx: &Ctx<'_>,
-    at: &Capture,
-    pool: &KvPool,
-    stamp: usize,
-    heads: u32,
-    norm_x: u32,
-    mass_x: u32,
-    reads: &[ArgValue],
-    scalars: &[ArgValue],
-) -> Result<(), Error> {
     ctx.fire(
         Fire::at(SCORE, NORM[stamp]).apply(Grid::of([norm_x, heads, 1], [THREADS, 1, 1])),
-        &[reads, &[at.stats.arg_mut()], &pool.pool.args(false), scalars].concat(),
+        &[
+            &reads[..],
+            &[at.stats.arg_mut()],
+            &pool.pool.args(false),
+            &scalars(into, tile)?,
+        ]
+        .concat(),
     )?;
     ctx.fire(
-        Fire::at(SCORE, MASS[stamp])
-            .apply(Grid::of([mass_x, at.capturing, 1], [THREADS, 1, 1])),
+        Fire::at(SCORE, mass.entry).apply(Grid::of([mass_x, at.capturing, 1], [THREADS, 1, 1])),
         &[
-            reads,
+            &reads[..],
             &[at.stats.arg()],
             &pool.pool.args(true),
-            scalars,
+            &scalars(into, tile)?,
         ]
         .concat(),
     )

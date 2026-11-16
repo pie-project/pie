@@ -578,6 +578,12 @@ impl Context {
         crate::chip::UNREPORTED_CORES
     }
 
+    /// The workgroup memory the adapter states a kernel may take.
+    #[must_use]
+    pub fn workgroup_bytes(&self) -> u32 {
+        self.core.limits.max_compute_workgroup_storage_size
+    }
+
     /// The alignment a guest table takes in its pool slot: 16 at least, and
     /// what a storage or uniform binding's offset asks.
     #[must_use]

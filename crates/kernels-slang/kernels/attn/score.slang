@@ -20,10 +20,11 @@
 // order a key, so a run reproduces):
 //   - `PIE_NORM`, a workgroup a (capturing lane, query head): each observed
 //     row's softmax maximum and inverse sum, into `stats`;
-//   - the mass kernel, a workgroup a (256 keys, capturing lane), a thread a
-//     key: every head's and observed row's mass summed in the thread (no
-//     per-head row is ever laid), added into the lane's key row or into
-//     zero.
+//   - the mass kernel, a workgroup a tile of keys of a capturing lane: the
+//     tile's keys' rows, every kv head's, read coalesced into workgroup
+//     memory with the row's query heads, a thread a (key, head) dot, and a
+//     key's heads summed in head order (no per-head row is ever laid), added
+//     into the lane's key row or into zero.
 // `PIE_PAGES` sums the final key row a page, a thread a page.
 
 #define PIE_THREADS 256
@@ -111,11 +112,15 @@ struct Params {
     int into;
     // The model's query heads, every rank's: what the mass is averaged over.
     int q_heads_total;
+    // The mass kernel's keys a tile, as the host sized it to its rows.
+    int tile;
 };
 PIE_PARAMS(PIE_PARAMS_AT, Params, params);
 PIE_POOL_READ(uint, params.seg_words)
 
+#if defined(PIE_NORM)
 groupshared float score_q[PIE_HEAD_DIM_MAX];
+#endif
 groupshared int score_first;
 groupshared int score_cap;
 groupshared int score_qohi;
@@ -141,6 +146,8 @@ void stage_lane(uint c, uint tid) {
     }
     GroupMemoryBarrierWithGroupSync();
 }
+
+#if defined(PIE_NORM)
 
 // Query row `qi`'s head `head`, staged as f32.
 void stage_q(int qi, int head, uint tid) {
@@ -178,6 +185,8 @@ float key_dot(int j, uint kv_head, int page_first) {
     PIE_POOL_BRANCH(seg, SCORE_KEY_WORDS)
     return dot;
 }
+
+#endif
 
 #if defined(PIE_NORM)
 
@@ -248,12 +257,24 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 
 #else
 
+// A tile of keys' rows, every kv head's, and the row's query heads, as
+// words of two bf16, in workgroup memory: each read from device memory a
+// workgroup makes is coalesced (consecutive threads, consecutive words of
+// one key's row), never a row a thread. Each kv head's run of a key, and
+// each query head's row, is one word longer than its words, so the heads a
+// warp reads at once lie in different banks.
+groupshared uint mass_rows[PIE_MASS_ROWS];
+groupshared uint mass_q[PIE_MASS_Q];
+groupshared float mass_top[PIE_MASS_HEADS];
+groupshared float mass_inv[PIE_MASS_HEADS];
+groupshared float mass_term[PIE_THREADS];
+groupshared int mass_limit;
+
 [shader("compute")]
 [numthreads(PIE_THREADS, 1, 1)]
 void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     uint c = group.y;
     uint tid = local.x;
-    int j = int(group.x) * PIE_THREADS + int(tid);
     stage_lane(c, tid);
     int page_first = workgroupUniformLoad(score_first);
     int capacity = workgroupUniformLoad(score_cap);
@@ -261,42 +282,97 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     int rows = workgroupUniformLoad(score_rows);
     uint keys_seg = workgroupUniformLoad(score_keys_seg);
     uint keys_at = workgroupUniformLoad(score_keys_at);
-    int groups = params.q_heads / params.kv_heads;
-
-    float acc = 0.0;
-    // A tile past the lane's keys holds no mass: its row is zeroed or kept.
-    if (int(group.x) * PIE_THREADS < capacity) {
-        for (int head = 0; head < params.q_heads; head++) {
-            uint kv_head = uint(head / groups);
-            uint at = (c * uint(params.q_heads) + uint(head)) * uint(params.observe);
+    uint head_dim = uint(params.head_dim);
+    uint pairs = head_dim >> 1;
+    uint heads = uint(params.q_heads);
+    uint kv_heads = uint(params.kv_heads);
+    uint groups = heads / kv_heads;
+    uint run = pairs + 1u;
+    uint key_words = kv_heads * run;
+    uint tile = uint(params.tile);
+    float share = rows > 0 ? 1.0 / (float(rows) * float(params.q_heads_total)) : 0.0;
+    uint tiles = (uint(params.context) + tile - 1u) / tile;
+    // Thread `k < tile` owns key `first + k` of the tile it walks; thread
+    // `k * heads + h` dots head `h` against it.
+    uint my_key = tid / heads;
+    uint my_head = tid % heads;
+    // The grid walks the tiles, its workgroups `PIE_MASS_GRID` tiles apart.
+    for (uint t = group.x; t < tiles; t += uint(PIE_MASS_GRID)) {
+        int first = int(t * tile);
+        float acc = 0.0;
+        if (first < capacity) {
+            int live = min(int(tile), capacity - first);
+            // Every kv head's row of the tile's keys, each key's rows one
+            // contiguous run of the page.
+            for (uint i = tid; i < uint(live) * kv_heads * pairs; i += uint(PIE_THREADS)) {
+                uint k = i / (kv_heads * pairs);
+                uint within = i % (kv_heads * pairs);
+                int j = first + int(k);
+                uint page = kv_page_indices[uint(page_first + j / params.page_size)];
+                uint half_at = page * (2u * params.page_stride)
+                    + uint(j % params.page_size) * kv_heads * head_dim;
+                mass_rows[k * key_words + (within / pairs) * run + within % pairs] =
+                    pie_pool_get(params.k_origin + (half_at >> 1) + within);
+            }
             for (int w = 0; w < rows; w++) {
                 int qi = qo_hi - rows + w;
-                stage_q(qi, head, tid);
-                int limit = min(position_ids[uint(qi)] + 1, capacity);
-                if (j < limit) {
-                    float m = stats[(at + uint(w)) * 2u];
-                    float inv = stats[(at + uint(w)) * 2u + 1u];
-                    acc += exp(key_dot(j, kv_head, page_first) * params.sm_scale - m) * inv;
+                uint q_at = uint(qi) * heads * pairs;
+                for (uint i = tid; i < heads * pairs; i += uint(PIE_THREADS)) {
+                    mass_q[(i / pairs) * run + i % pairs] = q[q_at + i];
+                }
+                for (uint h = tid; h < heads; h += uint(PIE_THREADS)) {
+                    uint at = ((c * heads + h) * uint(params.observe) + uint(w)) * 2u;
+                    mass_top[h] = stats[at];
+                    mass_inv[h] = stats[at + 1u];
+                }
+                if (tid == 0u) {
+                    mass_limit = min(position_ids[uint(qi)] + 1, capacity);
+                }
+                GroupMemoryBarrierWithGroupSync();
+                int limit = workgroupUniformLoad(mass_limit);
+                if (my_key < tile) {
+                    int j = first + int(my_key);
+                    float term = 0.0;
+                    if (int(my_key) < live && j < limit) {
+                        uint row_at = my_key * key_words + (my_head / groups) * run;
+                        uint q_row = my_head * run;
+                        float dot = 0.0;
+                        for (uint p = 0u; p < pairs; p++) {
+                            uint kw = mass_rows[row_at + p];
+                            uint qw = mass_q[q_row + p];
+                            dot = fma(bf16_to_f32(qw & 0xffffu), bf16_to_f32(kw & 0xffffu), dot);
+                            dot = fma(bf16_to_f32(qw >> 16), bf16_to_f32(kw >> 16), dot);
+                        }
+                        term = exp(dot * params.sm_scale - mass_top[my_head]) * mass_inv[my_head];
+                    }
+                    mass_term[tid] = term;
+                }
+                GroupMemoryBarrierWithGroupSync();
+                // A key's heads summed in head order.
+                if (tid < tile) {
+                    for (uint h = 0u; h < heads; h++) {
+                        acc += mass_term[tid * heads + h];
+                    }
                 }
                 GroupMemoryBarrierWithGroupSync();
             }
         }
-    }
-    if (j < params.context) {
-        float share = rows > 0 ? 1.0 / (float(rows) * float(params.q_heads_total)) : 0.0;
-        uint dst = keys_at + uint(j);
+        int j = first + int(tid);
+        if (tid < tile && j < params.context) {
+            uint dst = keys_at + uint(j);
 #define SCORE_ROW_ADD(buf_) \
-        { \
-            float prior = params.into != 0 ? asfloat(buf_[dst]) : 0.0; \
-            buf_[dst] = asuint(prior + acc * share); \
+            { \
+                float prior = params.into != 0 ? asfloat(buf_[dst]) : 0.0; \
+                buf_[dst] = asuint(prior + acc * share); \
+            }
+            PIE_POOL_BRANCH(keys_seg, SCORE_ROW_ADD)
         }
-        PIE_POOL_BRANCH(keys_seg, SCORE_ROW_ADD)
     }
 }
 
-// pie:instantiate attn_score_mass_bf16_d_64 PIE_HEAD_DIM_MAX=64
-// pie:instantiate attn_score_mass_bf16_d_128 PIE_HEAD_DIM_MAX=128
-// pie:instantiate attn_score_mass_bf16_d_256 PIE_HEAD_DIM_MAX=256
+// The grid's workgroups a capturing lane: the tiles past them are walked.
+// pie:instantiate attn_score_mass_s16 PIE_HEAD_DIM_MAX=64 PIE_MASS_ROWS=2080 PIE_MASS_Q=1088 PIE_MASS_HEADS=64 PIE_MASS_GRID=1024
+// pie:instantiate attn_score_mass_s32 PIE_HEAD_DIM_MAX=64 PIE_MASS_ROWS=5120 PIE_MASS_Q=2112 PIE_MASS_HEADS=64 PIE_MASS_GRID=1024
 
 #endif
 #endif
