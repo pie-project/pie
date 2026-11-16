@@ -41,6 +41,8 @@ impl UnitModel {
         drop(weights);
         let host = Forward::host_for(trace.clone(), plane, &reading.entry_values())?;
         reading.write_statics(rt.as_mut(), &statics)?;
+        // one sequence: lane slot 0's pages in order
+        reading.write_pages(rt.as_mut(), &reading.one_sequence())?;
         let vocab = reading.outs.iter().map(|o| o.2).max().unwrap_or(0);
         // a served step reads no stamps (the per-PE cycles: 3 words a PE)
         reading.stamped = false;
@@ -69,8 +71,9 @@ impl UnitModel {
         let at = u32::try_from(at).map_err(|e| e.to_string())?;
         let (step, entries) =
             self.reading
-                .decode_step(&mut self.host, &self.trace, &[token], at)?;
+                .decode_step(&mut self.host, &self.trace, &[token], &[at])?;
         self.reading.write_pos(self.rt.as_mut(), at)?;
+        self.reading.write_rows(self.rt.as_mut(), &[(0, at)])?;
         self.launches += 1;
         self.steps += 1;
         if !logits && !self.reading.argmax.is_empty() {

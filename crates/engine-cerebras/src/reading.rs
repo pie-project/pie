@@ -340,6 +340,36 @@ pub struct Reading {
     /// A decode program's K / V PEs (GENERIC.md G1): each told a step's first position (`pos`),
     /// their caches kept across steps.
     pub pos: Vec<Rect>,
+    /// A decode program's paging (GENERIC.md G1.8): its attention columns' pages, `size`
+    /// positions each, `pages` a column, `lanes` lane slots (a step's rows); `rowp` its PEs told a
+    /// step's rows' (lane slot, position), `ptab` each lane slot's pages.
+    pub paging: Option<Paging>,
+    pub rowp: Vec<Rect>,
+    pub ptab: Vec<Rect>,
+}
+
+/// A decode program's paging ([`Reading::paging`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Paging {
+    pub size: u32,
+    pub pages: u32,
+    pub lanes: u32,
+}
+
+/// `host.json`'s PEs under `key` (`{x, y}` each), a column's consecutive PEs one rectangle.
+fn pes(host: &Value, key: &str) -> Vec<Rect> {
+    let mut cs: Vec<(i32, i32)> = (host[key].as_array().into_iter().flatten())
+        .filter_map(|c| Some((c["x"].as_i64()? as i32, c["y"].as_i64()? as i32)))
+        .collect();
+    cs.sort_unstable();
+    let mut out: Vec<Rect> = Vec::new();
+    for (x, y) in cs {
+        match out.last_mut() {
+            Some(r) if r.x == x && r.y + r.h == y => r.h += 1,
+            _ => out.push(Rect { x, y, w: 1, h: 1 }),
+        }
+    }
+    out
 }
 
 fn num(v: &Value, k: &str) -> R<u64> {
@@ -503,16 +533,14 @@ impl Reading {
                 <[u32; 3]>::try_from(v).ok()
             }),
             groups: host["groups"].as_u64().unwrap_or(0) as usize,
-            pos: (host["pos"].as_array().into_iter().flatten())
-                .filter_map(|c| {
-                    Some(Rect {
-                        x: c["x"].as_i64()? as i32,
-                        y: c["y"].as_i64()? as i32,
-                        w: 1,
-                        h: 1,
-                    })
-                })
-                .collect(),
+            pos: pes(&host, "pos"),
+            paging: host["paging"].as_object().map(|g| Paging {
+                size: g.get("size").and_then(Value::as_u64).unwrap_or(0) as u32,
+                pages: g.get("pages").and_then(Value::as_u64).unwrap_or(0) as u32,
+                lanes: g.get("lanes").and_then(Value::as_u64).unwrap_or(1) as u32,
+            }),
+            rowp: pes(&host, "rowp"),
+            ptab: pes(&host, "ptab"),
         })
     }
 
@@ -552,6 +580,9 @@ impl Reading {
             clip: None,
             groups: 0,
             pos: Vec::new(),
+            paging: None,
+            rowp: Vec::new(),
+            ptab: Vec::new(),
         }
     }
 
@@ -841,14 +872,14 @@ impl Reading {
 
     /// One step on a loaded program: every array written (an entry's words from `entries`, the
     /// rest from its file), then [`Reading::launch`].
-    /// A decode program's step (GENERIC.md G1): `tokens` (a lane's one each) at positions
-    /// from `at`, the trace's positions given as theirs; the step and its entries.
+    /// A decode program's step (GENERIC.md G1): `tokens` (a row each) at `positions` (a row
+    /// each), the trace's positions given as theirs; the step and its entries.
     pub fn decode_step(
         &self,
         host: &mut Forward,
         trace: &Trace,
         tokens: &[u32],
-        at: u32,
+        positions: &[u32],
     ) -> R<(StreamStep<'static>, Vec<Option<Vec<f32>>>)> {
         let step = StreamStep {
             lanes: self
@@ -871,11 +902,7 @@ impl Reading {
                 value: ValueId(v as u32),
                 rows: tokens.len(),
                 width: 1,
-                values: Values::I32(
-                    (0..tokens.len())
-                        .map(|i| (at as usize + i) as i32)
-                        .collect(),
-                ),
+                values: Values::I32(positions.iter().map(|&p| p as i32).collect()),
             })
             .collect();
         let entries = self.entries_given(host, &step, &given)?;
@@ -884,20 +911,40 @@ impl Reading {
 
     /// The K / V PEs told a decode step's first position ([`Reading::pos`]).
     pub fn write_pos(&self, rt: &mut dyn Fabric, at: u32) -> R<()> {
-        for r in &self.pos {
-            let a = Array {
-                sym: "pos".into(),
-                rect: *r,
-                len: 1,
-                u16: false,
-                file: None,
-                entry: None,
-                statics: None,
-                group: None,
-            };
-            rt.write(&a, &[at])?;
+        write_all(rt, &self.pos, "pos", &[at])
+    }
+
+    /// The attention PEs told a step's rows' (lane slot, position) ([`Reading::rowp`]; rows
+    /// past `rows` lane slot 0 at position 0).
+    pub fn write_rows(&self, rt: &mut dyn Fabric, rows: &[(u32, u32)]) -> R<()> {
+        let Some(g) = self.paging else {
+            return Ok(());
+        };
+        let mut words = vec![0u32; 2 * g.lanes as usize];
+        for (t, &(lane, at)) in rows.iter().enumerate().take(g.lanes as usize) {
+            words[2 * t] = lane;
+            words[2 * t + 1] = at;
         }
-        Ok(())
+        write_all(rt, &self.rowp, "rowp", &words)
+    }
+
+    /// One sequence's page table: lane slot 0's pages in order (the rest none).
+    #[must_use]
+    pub fn one_sequence(&self) -> Vec<u32> {
+        let Some(g) = self.paging else {
+            return Vec::new();
+        };
+        let mut table = vec![0u32; (g.lanes * g.pages) as usize];
+        for (j, w) in table.iter_mut().take(g.pages as usize).enumerate() {
+            *w = j as u32;
+        }
+        table
+    }
+
+    /// The attention PEs told each lane slot's pages (`table`: lane slot by lane slot, `pages` a
+    /// slot; [`Reading::ptab`]).
+    pub fn write_pages(&self, rt: &mut dyn Fabric, table: &[u32]) -> R<()> {
+        write_all(rt, &self.ptab, "ptab", table)
     }
 
     pub fn fire(
@@ -1165,6 +1212,26 @@ impl Fabric for Runtime {
         }
         Ok(Some(best.into_iter().map(|(_, k)| k).collect()))
     }
+}
+
+/// `words` written to every PE of each of `rects` (array `sym`, the same words a PE).
+fn write_all(rt: &mut dyn Fabric, rects: &[Rect], sym: &str, words: &[u32]) -> R<()> {
+    for r in rects {
+        let a = Array {
+            sym: sym.into(),
+            rect: *r,
+            len: words.len(),
+            u16: false,
+            file: None,
+            entry: None,
+            statics: None,
+            group: None,
+        };
+        let n = (r.w * r.h) as usize;
+        let all: Vec<u32> = (0..n).flat_map(|_| words.iter().copied()).collect();
+        rt.write(&a, &all)?;
+    }
+    Ok(())
 }
 
 /// `d2h` in runs read by one memcpy each: consecutive one-PE reads of one symbol and length, at

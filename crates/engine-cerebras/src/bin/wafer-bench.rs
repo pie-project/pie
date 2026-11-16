@@ -347,7 +347,7 @@ fn decode(get: &HashMap<String, String>) -> Result<bool, String> {
         // every array's words for step 0 (the statics and the first step's entries) as the
         // h2d files a capture-fed program's are, its host.json naming them: what
         // tools/wafer/stream/run.py loads
-        let (_, entries) = reading.decode_step(&mut host, &trace, &seq[0..=0], 0)?;
+        let (_, entries) = reading.decode_step(&mut host, &trace, &seq[0..=0], &[0])?;
         let dir = Path::new(dir);
         std::fs::create_dir_all(dir.join("h2d")).map_err(|e| e.to_string())?;
         let path = reading.dir.join("host.json");
@@ -386,7 +386,7 @@ fn decode(get: &HashMap<String, String>) -> Result<bool, String> {
         // the host's side alone: the statics made, each step's entries
         let words: usize = statics.iter().flatten().map(Vec::len).sum();
         for s in 0..seq.len().saturating_sub(1).min(3) {
-            let (_, e) = reading.decode_step(&mut host, &trace, &seq[s..=s], s as u32)?;
+            let (_, e) = reading.decode_step(&mut host, &trace, &seq[s..=s], &[s as u32])?;
             let n: usize = e.iter().flatten().map(Vec::len).sum();
             println!("DECODE_DRY step {s}: {n} entry words");
         }
@@ -409,6 +409,8 @@ fn decode(get: &HashMap<String, String>) -> Result<bool, String> {
     rt.load();
     rt.run();
     reading.write_statics(&mut rt, &statics)?;
+    // one sequence: lane slot 0's pages in order
+    reading.write_pages(&mut rt, &reading.one_sequence())?;
     let steps = get
         .get("steps")
         .map_or(Ok(seq.len().saturating_sub(1)), |v| v.parse::<usize>())
@@ -417,8 +419,9 @@ fn decode(get: &HashMap<String, String>) -> Result<bool, String> {
     let (mut held, mut checked) = (0, 0);
     for s in 0..steps {
         let at = u32::try_from(s).map_err(|e| e.to_string())?;
-        let (_, entries) = reading.decode_step(&mut host, &trace, &seq[s..=s], at)?;
+        let (_, entries) = reading.decode_step(&mut host, &trace, &seq[s..=s], &[at])?;
         reading.write_pos(&mut rt, at)?;
+        reading.write_rows(&mut rt, &[(0, at)])?;
         let t1 = std::time::Instant::now();
         let (got, cycles) = reading.launch(&mut rt, &entries)?;
         let wall_ms = t1.elapsed().as_secs_f64() * 1e3;
