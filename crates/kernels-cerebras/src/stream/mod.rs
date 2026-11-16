@@ -228,7 +228,8 @@ pub fn shape(trace: &Trace, reading: &str, classes: &[RowClass]) -> R<StreamShap
     }
     let mut attn = attn.ok_or_else(|| format!("{name}: the stream step attends nothing"))?;
     attn.qk_norm = qk_norm;
-    let (intermediate, act) = glu.ok_or_else(|| format!("{name}: the stream step has no MLP"))?;
+    // (no gated MLP: the shape states none)
+    let (intermediate, act) = glu.unwrap_or((0, Act::Silu));
     Ok(StreamShape {
         reading: reading.to_string(),
         hidden: prog.hidden,
@@ -261,17 +262,13 @@ fn width_of(trace: &Trace, v: poem_ir::ValueId) -> u32 {
     }
 }
 
-/// `spec`, the reading's one attention shape.
+/// `spec`, the reading's first attention shape (each block's K / V columns its own block's:
+/// the shape states the first, for the reading's description and its defaults).
 fn one_attention(attn: &mut Option<JointSpec>, spec: JointSpec) -> R<()> {
-    match attn {
-        Some(a) if *a != spec => Err(format!(
-            "an attention of {spec:?} beside {a:?}: one attention shape a reading"
-        )),
-        _ => {
-            *attn = Some(spec);
-            Ok(())
-        }
+    if attn.is_none() {
+        *attn = Some(spec);
     }
+    Ok(())
 }
 
 /// What [`compile`] builds: a reading at `rows` rows a class, its roundings the build's 16-bit

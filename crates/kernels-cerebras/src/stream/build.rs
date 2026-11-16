@@ -859,24 +859,41 @@ pub fn program_at(
         }
     }
 
-    // the floorplan
-    let heads = shape.attn.kv_heads;
+    // the floorplan: each block's K / V columns its own attention's (its first unit's), the
+    // band as tall as the tallest
+    let joint_of = |k: &KvSched| {
+        k.units
+            .first()
+            .and_then(|&u| built.get(u))
+            .and_then(|b| b.unit.joint)
+    };
+    let heads = kv
+        .iter()
+        .filter_map(|k| joint_of(k).map(|j| j.kv_heads))
+        .max()
+        .unwrap_or(shape.attn.kv_heads);
     let requests = Requests {
         stream: true,
         joint: !blocks.is_empty(),
         lanes: lane_unit,
         ..Requests::default()
     };
-    let qh = shape.attn.q_heads / shape.attn.kv_heads.max(1);
     let pya = kv
         .iter()
         .map(|k| {
+            let (qh, hd) = joint_of(k).map_or(
+                (
+                    shape.attn.q_heads / shape.attn.kv_heads.max(1),
+                    shape.attn.head_dim,
+                ),
+                |j| (j.q_heads / j.kv_heads.max(1), j.head_dim),
+            );
             kv_pya_split(
                 shape
                     .cache
                     .unwrap_or_else(|| k.stores.iter().map(|s| s.1).sum()),
                 qh,
-                shape.attn.head_dim,
+                hd,
                 split,
             )
         })

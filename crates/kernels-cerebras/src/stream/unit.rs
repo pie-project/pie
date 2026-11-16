@@ -466,6 +466,8 @@ pub fn lower_through(
     let mut i = 0;
     // the nodes a routed layer's lowering stands for, past its route
     let mut skip: BTreeSet<u32> = BTreeSet::new();
+    // a routed layer's group, by its first select
+    let mut routed: BTreeMap<u32, super::moe::Group> = BTreeMap::new();
     while i <= nodes.len() {
         let next = nodes.get(i).copied();
         if next.is_some_and(|n| skip.contains(&n)) {
@@ -658,10 +660,16 @@ pub fn lower_through(
                 });
             }
             // routed experts: their gated sum over every expert ([`super::moe`])
+            // (lowered where its first select comes: its input made by then)
             Operation::Linear(Linear::MoeRoute { .. }) => {
-                use super::moe::{self, Kind, synth};
-                let g = moe::group(trace, at, nodes).map_err(|e| refuse(at, e))?;
-                skip.extend(g.nodes[1..].iter().copied());
+                let g = super::moe::group(trace, at, nodes).map_err(|e| refuse(at, e))?;
+                skip.extend(g.nodes[2..].iter().copied());
+                routed.insert(g.nodes[1], g);
+            }
+            Operation::Linear(Linear::MoeSelect { .. }) if routed.contains_key(&at) => {
+                use super::moe::{Kind, synth};
+                let g = routed.remove(&at).unwrap_or_else(|| unreachable!());
+                let at = g.route;
                 let l = r.cols(g.logits);
                 let gs = side_of(&sides, l).ok_or_else(|| {
                     refuse(at, "linear.moe_route reads logits no root has".into())
@@ -670,7 +678,7 @@ pub fn lower_through(
                 let gate = synth(at, Kind::Gate);
                 steps.push(Step::Region {
                     side: gs,
-                    chain: moe::router(trace, &g).map_err(|e| refuse(at, e))?,
+                    chain: super::moe::router(trace, &g).map_err(|e| refuse(at, e))?,
                 });
                 sides.insert(gate, gs);
                 let o = gs.flip();
@@ -721,15 +729,15 @@ pub fn lower_through(
                     }
                 };
                 let narrow = r.dtype(synth(at, Kind::Gates)).unwrap_or(Dtype::Bf16);
-                for (kind, off) in [(Kind::Gates, 0), (Kind::Ups, g.inter)] {
+                for (kind, (bank, stride, off)) in [(Kind::Gates, g.gate), (Kind::Ups, g.up)] {
                     steps.push(Step::Matvec {
                         node: at,
                         from: gs,
                         input: xin,
-                        weight: g.gate_up,
+                        weight: bank,
                         view: View::Rows {
                             block: g.inter,
-                            stride: 2 * g.inter,
+                            stride,
                             off,
                         },
                         output: synth(at, kind),
@@ -742,7 +750,7 @@ pub fn lower_through(
                 }
                 steps.push(Step::Region {
                     side: o,
-                    chain: moe::activation(&g, narrow).map_err(|e| refuse(at, e))?,
+                    chain: super::moe::activation(&g, narrow).map_err(|e| refuse(at, e))?,
                 });
                 let acts = synth(at, Kind::Acts);
                 sides.insert(acts, o);

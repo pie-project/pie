@@ -388,6 +388,8 @@ impl Stream {
         let mut kv = Vec::new();
         if requests.joint {
             for (b, blk) in blocks.iter().enumerate() {
+                // (a block's heads its first unit's: blocks of other attentions apart)
+                let heads = blk.first().map_or(heads, |&u| units[u].heads().min(heads));
                 for h in 0..heads {
                     if blk.iter().any(|&u| units[u].heads() <= h) {
                         return Err(format!(

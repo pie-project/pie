@@ -62,14 +62,18 @@ pub struct Group {
     pub nodes: Vec<u32>,
     pub logits: ValueId,
     pub bias: Option<ValueId>,
+    /// A per-expert gain on the picked weights.
+    pub scale: Option<ValueId>,
     pub experts: u32,
     pub top_k: u32,
     pub score: RouteScore,
     /// The layer's input (the selects' first `x`) and its width.
     pub x: ValueId,
     pub hidden: u32,
-    /// The gate | up bank `[E, 2 I, H]`, the down bank `[E, H, I]`.
-    pub gate_up: ValueId,
+    /// The gate's and the up's bank, each expert's rows `stride` apart from `off` (a gate | up
+    /// bank's halves: stride `2 I`), and the down bank `[E, H, I]`.
+    pub gate: (ValueId, u32, u32),
+    pub up: (ValueId, u32, u32),
     pub down: ValueId,
     pub inter: u32,
     pub silu: bool,
@@ -115,8 +119,8 @@ pub fn group(trace: &Trace, node: u32, nodes: &[u32]) -> R<Group> {
     else {
         return Err(refuse("is no route"));
     };
-    if ids.is_some() || table.is_some() || scale.is_some() || hint.is_some() {
-        return Err(refuse("by ids, a table, a gain or a hint"));
+    if ids.is_some() || table.is_some() || hint.is_some() {
+        return Err(refuse("by ids, a table or a hint"));
     }
     match score {
         RouteScore::Softmax if bias.is_none() => {}
@@ -135,21 +139,22 @@ pub fn group(trace: &Trace, node: u32, nodes: &[u32]) -> R<Group> {
         }) if *routes == r)
     };
     let s1 = after(&|op| plain(op, *routes)).ok_or_else(|| refuse("selects no plain bank"))?;
-    let Operation::Linear(Linear::MoeSelect {
-        x,
-        bank: gate_up,
-        y: gu,
-        ..
-    }) = &trace.nodes[s1 as usize].op
-    else {
-        unreachable!()
+    let select = |n: u32| match &trace.nodes[n as usize].op {
+        Operation::Linear(Linear::MoeSelect { x, bank, y, .. }) => (*x, *bank, *y),
+        _ => unreachable!(),
     };
+    let (x, b1, y1) = select(s1);
+    // the experts' activation over their gate | up rows (one bank, its halves), or over a gate
+    // and an up selected apart (a bank each)
     let glu = after(&|op| {
-        matches!(op, Operation::Linear(Linear::Glu { packed: Some(p), gate: None, up: None,
-            weights: None, limit: None, .. }) if p == gu)
+        matches!(op, Operation::Linear(Linear::Glu { packed, gate, up, weights: None,
+            limit: None, .. })
+            if *packed == Some(y1) || (*gate == Some(y1) && up.is_some()))
     })
-    .ok_or_else(|| refuse("activates its gate | up by no plain gated unit"))?;
+    .ok_or_else(|| refuse("activates its experts by no plain gated unit"))?;
     let Operation::Linear(Linear::Glu {
+        packed,
+        up,
         intermediate,
         act,
         y: a,
@@ -157,6 +162,20 @@ pub fn group(trace: &Trace, node: u32, nodes: &[u32]) -> R<Group> {
     }) = &trace.nodes[glu as usize].op
     else {
         unreachable!()
+    };
+    let i = *intermediate;
+    let (gate_half, up_half, s_up) = if packed.is_some() {
+        ((b1, 2 * i, 0), (b1, 2 * i, i), None)
+    } else {
+        let u = up.ok_or_else(|| refuse("activates no up"))?;
+        let su = after(&|op| {
+            plain(op, *routes)
+                && matches!(op, Operation::Linear(Linear::MoeSelect { x: sx, y, .. })
+                    if *y == u && *sx == x)
+        })
+        .ok_or_else(|| refuse("selects its up apart from its input"))?;
+        let (_, b2, _) = select(su);
+        ((b1, i, 0), (b2, i, 0), Some(su))
     };
     let silu = match act {
         poem_ir::GluAct::Swiglu => true,
@@ -181,19 +200,24 @@ pub fn group(trace: &Trace, node: u32, nodes: &[u32]) -> R<Group> {
     let Operation::Linear(Linear::MoeCombine { y, .. }) = &trace.nodes[comb as usize].op else {
         unreachable!()
     };
+    let mut nodes = vec![node, s1];
+    nodes.extend(s_up);
+    nodes.extend([glu, s2, comb]);
     Ok(Group {
         route: node,
-        nodes: vec![node, s1, glu, s2, comb],
+        nodes,
         logits: *logits,
         bias: *bias,
+        scale: *scale,
         experts: *experts,
         top_k: *top_k,
         score: *score,
-        x: *x,
-        hidden: width(trace, *x),
-        gate_up: *gate_up,
+        x,
+        hidden: width(trace, x),
+        gate: gate_half,
+        up: up_half,
         down: *down,
-        inter: *intermediate,
+        inter: i,
         silu,
         y: *y,
         dtype: dtype(trace, *y),
@@ -211,7 +235,7 @@ pub fn ty(trace: &Trace, v: ValueId) -> Option<(u32, Dtype)> {
     let nodes: Vec<u32> = (0..trace.nodes.len() as u32).collect();
     let g = group(trace, node, &nodes).ok()?;
     let ei = g.experts * g.inter;
-    let narrow = dtype(trace, g.gate_up);
+    let narrow = dtype(trace, g.gate.0);
     Some(match kind {
         0 => (g.experts, Dtype::F32),
         1 => (ei, Dtype::F32),
@@ -241,7 +265,8 @@ fn input(value: ValueId, dtype: Dtype, shared: bool) -> In {
 
 /// The router's region: the logits (and the pick bias) in, the gate out.
 pub fn router(trace: &Trace, g: &Group) -> R<Chain> {
-    let mut b = Ops::new(1 + u32::from(g.bias.is_some()));
+    let mut b = Ops::new(1 + u32::from(g.bias.is_some()) + u32::from(g.scale.is_some()));
+    let gain = 1 + u32::from(g.bias.is_some());
     let logits = 0;
     let sigmoid = |b: &mut Ops, t: u32| {
         let one = b.f32(1.0);
@@ -303,10 +328,15 @@ pub fn router(trace: &Trace, g: &Group) -> R<Chain> {
             b.push(Op::Binary(Binary::Div, w, sum))
         }
     };
+    // the per-expert gain on the picked weights
+    let gate = match g.scale {
+        Some(_) => b.push(Op::Binary(Binary::Mul, gate, gain)),
+        None => gate,
+    };
     let mut ins = vec![input(g.logits, dtype(trace, g.logits), false)];
     let mut params = vec![Shape::Row];
-    if let Some(bias) = g.bias {
-        ins.push(input(bias, dtype(trace, bias), true));
+    for w in [g.bias, g.scale].into_iter().flatten() {
+        ins.push(input(w, dtype(trace, w), true));
         params.push(Shape::Row);
     }
     let region = Region {
@@ -370,7 +400,7 @@ pub fn activation(g: &Group, narrow: Dtype) -> R<Chain> {
         .types()
         .map_err(|e| format!("node {}: the experts' activation: {e:?}", g.route))?;
     Ok(Chain {
-        nodes: g.nodes[2..3].to_vec(),
+        nodes: vec![g.route],
         ins: vec![
             input(synth(g.route, Kind::Gates), narrow, false),
             input(synth(g.route, Kind::Ups), narrow, false),

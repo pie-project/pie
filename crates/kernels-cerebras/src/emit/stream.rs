@@ -2172,16 +2172,33 @@ fn kv_pe_params(p: &Program, c: Coord) -> (Vec<(String, u32)>, u32) {
     )
 }
 
-fn kv_consts(p: &Program) -> (u32, u32, u32, f32) {
+/// A K / V column's attention: its block's first unit's (the reading's first where none).
+fn kv_joint(p: &Program, ks: &place::KvSched) -> crate::stream::unit::Joint {
     let a = &p.shape.attn;
+    ks.units
+        .first()
+        .and_then(|&u| p.units.get(u))
+        .and_then(|b| b.unit.joint)
+        .unwrap_or(crate::stream::unit::Joint {
+            q_heads: a.q_heads,
+            kv_heads: a.kv_heads,
+            head_dim: a.head_dim,
+            scale: a.sm_scale,
+            causal: a.causal,
+            window: None,
+        })
+}
+
+fn kv_consts(p: &Program, ks: &place::KvSched) -> (u32, u32, u32, f32) {
+    let a = kv_joint(p, ks);
     let qh = a.q_heads / a.kv_heads;
-    (qh, a.head_dim, qh * a.head_dim, a.sm_scale)
+    (qh, a.head_dim, qh * a.head_dim, a.scale)
 }
 
 /// A K / V column's root: each unit's rows' [q | k | v] down the column in the store order,
 /// then each query's output back to the unit that asked it.
 fn kv_root_file(p: &Program, k: usize, ks: &place::KvSched) -> R<(String, String)> {
-    let (qh, dc, qd, _) = kv_consts(p);
+    let (qh, dc, qd, _) = kv_consts(p, ks);
     let (lo, hi) = if p.round16 {
         ("1.0e-30", "1.0e30")
     } else {
@@ -2248,13 +2265,14 @@ fn kv_root_file(p: &Program, k: usize, ks: &place::KvSched) -> R<(String, String
 
 /// A K / V column's attention PE: the rows it keeps (q too), then every query.
 fn kv_pe_file(p: &Program, k: usize, ks: &place::KvSched) -> R<(String, String)> {
-    let (qh, dc, _, sc) = kv_consts(p);
+    let (qh, dc, _, sc) = kv_consts(p, ks);
     let total: u32 = ks.stores.iter().map(|s| s.1).sum();
     let pya = p.stream.kv[k].pya;
     // a decode step's cache keeps its positions across steps; a stream step's rows its own
     let ne = p.shape.cache.unwrap_or(total).div_ceil(pya);
     let pmax = if p.round16 { "1.0e30" } else { "65504.0" };
-    if p.shape.attn.causal && (ks.stores.len() != 1 || ks.stores[0].2 != 0) {
+    let causal = kv_joint(p, ks).causal;
+    if causal && (ks.stores.len() != 1 || ks.stores[0].2 != 0) {
         return Err(format!(
             "K / V column {k}: a causal attention over {} stores: its rows' order is one unit's",
             ks.stores.len()
@@ -2276,13 +2294,8 @@ fn kv_pe_file(p: &Program, k: usize, ks: &place::KvSched) -> R<(String, String)>
         t,
         "const att = @import_module(\"ops/satt.csl\", .{{ .fab = fab, .math = math, .red = red, .YM = q_am, .Qh = {qh}, .Dc = {dc}, .NE = {ne}, .PYA = {}, .SC = {sc:?}, .PMAX = {pmax}, .QH = true{} }});",
         pya,
-        if p.shape.attn.causal {
-            match ks
-                .units
-                .first()
-                .and_then(|&u| p.units[u].unit.joint)
-                .and_then(|j| j.window)
-            {
+        if causal {
+            match kv_joint(p, ks).window {
                 // a sliding window's: of the rows stored before a query, its last alone
                 Some(w) => format!(", .CAUSAL = true, .WIN = {w}"),
                 None => ", .CAUSAL = true".to_string(),
