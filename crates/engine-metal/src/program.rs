@@ -1474,6 +1474,121 @@ mod tests {
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
+/// [`a_beam_step_answers_what_the_interpreter_answers`] over many steps:
+    /// the stage's own state carried across fires on the device (its scores,
+    /// tokens, the parents' mask rows, slots, positions), each step's logits
+    /// new, every reader each step what the interpreter, stepped alongside,
+    /// puts there.
+    #[test]
+    fn beam_steps_answer_what_the_interpreter_answers() {
+        use eta_compiler::codegen::program::{Backend, emit_program};
+        use eta_compiler::contract::{beam_stage, wire};
+        use eta_compiler::eval::interp::{Instance, NoKernels, PassInputs, Value};
+        use eta_compiler::plan::compile_bound;
+        const STEPS: u32 = 16;
+        let Ok(context) = Context::bind() else {
+            eprintln!("no device: skipping");
+            return;
+        };
+        let bf16 = |x: f32| {
+            let b = x.to_bits();
+            f32::from_bits((b + 0x7fff + ((b >> 16) & 1)) & 0xffff_0000)
+        };
+        let step_logits = |len: usize, step: u32| -> Vec<f32> {
+            let mut state = 0x9e37_79b9_7f4a_7c15u64 ^ (u64::from(step) * 0x2545_f491_4f6c_dd1d);
+            (0..len)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    bf16(((state >> 11) as f64 / (1u64 << 53) as f64) as f32 * 16.0 - 8.0)
+                })
+                .collect()
+        };
+        let mut wrong = Vec::new();
+        for case in beam_stage() {
+            let stages = compile_bound(&case.bound);
+            let backend = Backend::parse("metal").expect("the metal codegen");
+            let registration = ProgramRegistration {
+                program_hash: 0xbea1_0000 ^ u64::from(case.rows),
+                emitted_kernels: emit_program(backend, &stages, &case.bound),
+                emitter_version: backend.emitter_version(),
+                launch: eta_compiler::codegen::launch::build(&case.bound, &stages),
+                ..Default::default()
+            };
+            let pools = crate::store::Pools::guests_only(&context, CHUNK, 4).expect("a pool");
+            let mut plane = Plane::new();
+            plane.set_flight(1, 1, case.rows);
+            let program = plane.register(&context, &registration).expect("registers");
+            let facts = plane.facts(program, &pools).expect("facts");
+            let count = case.bound.container.channels.len();
+            let ids: Vec<ChannelId> = (1..=count as u64).map(ChannelId).collect();
+            let (instance, rings) = slots_for(&pools, &facts, 0);
+            let id = plane
+                .bind(
+                    &context,
+                    program,
+                    &case.wire_seeds(),
+                    Extents {
+                        row_count: case.rows,
+                        sampled_rows: case.rows,
+                        query_len: case.rows,
+                        ..Extents::default()
+                    },
+                    GeometryClass::Host,
+                    PortMask::NONE,
+                    &ids,
+                    session::Pooled {
+                        pools: &pools,
+                        instance: &instance,
+                        rings: &rings,
+                    },
+                )
+                .expect("binds");
+            let mut reference = Instance::new(&case.bound, &case.seeds).expect("instantiates");
+            let mut logits = crate::device::Buffer::zeroed(&context, case.logits.len() as u64 * 2)
+                .expect("a logits plane");
+            let carve = guests(&context);
+            'steps: for step in 0..STEPS {
+                let values = step_logits(case.logits.len(), step);
+                let bytes: Vec<u8> = values
+                    .iter()
+                    .flat_map(|x| ((x.to_bits() >> 16) as u16).to_le_bytes())
+                    .collect();
+                logits.write(0, &bytes).expect("the logits upload");
+                plane
+                    .bind_output(id, "logits", 0, &logits, 0, eta_ir::Dtype::Bf16, case.vocab, case.vocab)
+                    .expect("the logits bind");
+                let fired = plane.fire(&context, id, Attach::Epilogue, &carve).expect("fires");
+                assert!(matches!(fired, Fired::Committed), "{} step {step}: {fired:?}", case.name);
+                let inputs = PassInputs {
+                    outputs: vec![("logits".to_string(), 0, Value::F32(values))],
+                };
+                let stepped = reference
+                    .step(&case.bound, &inputs, &mut NoKernels)
+                    .expect("the interpreter steps");
+                assert!(stepped.committed, "{} step {step}: {:?}", case.name, stepped.missed);
+                for &channel in &case.readers {
+                    let want = wire(&reference.host_take(&case.bound, channel).expect("a cell"));
+                    let got = plane
+                        .instance_mut(id)
+                        .expect("bound")
+                        .take(channel)
+                        .expect("reads")
+                        .expect("a cell");
+                    if got != want {
+                        wrong.push(format!(
+                            "{} step {step}: channel {channel}: {got:02x?} != {want:02x?}",
+                            case.name
+                        ));
+                        break 'steps;
+                    }
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
     fn slots_for(
         pools: &crate::store::Pools,
         facts: &engine::ProgramFacts,
