@@ -51,7 +51,7 @@ fn the_span_is_backed_at_load() {
     let device = shell.audit().device;
     eprintln!("ready: {made} span heaps, {} MiB on the device", device >> 20);
     let tokens: Vec<u32> = (0..9u32).map(|at| (7 + at * 37) % 256).collect();
-    let mut fire = |shell: &mut engine_metal::Shell, slot: u32, rows: &[u32], held: u32| {
+    let fire = |shell: &mut engine_metal::Shell, slot: u32, rows: &[u32], held: u32| {
         shell
             .fire_seated(&[Seated {
                 held: Some(held),
