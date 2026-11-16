@@ -4,8 +4,8 @@
 //! memory, so a routing kernel writes them and a graph can hold the launch.
 //!
 //! The logic file (zlib-compressed msgpack) names the grouped solutions and
-//! their tiles; the code object (a compressed offload bundle) loads through
-//! `hipModuleLoadData`. The arguments are built as hipBLASLt 1.4
+//! their tiles; the code object, unbundled from its compressed offload
+//! bundle, loads through `hipModuleLoadData`. The arguments are built as hipBLASLt 1.4
 //! (rocm-libraries 39d8d603) builds them for `run(deviceUserArgs)`:
 //!
 //! - kernarg, 144 bytes, of which the kernel reads 40 in its user-argument
@@ -217,8 +217,12 @@ impl Library {
         if solutions.is_empty() {
             return Err(format!("{stem} offers no solution of the known contract"));
         }
-        let code =
+        let bundled =
             std::fs::read(dir.join(format!("{stem}.co"))).map_err(|e| format!("{stem}.co: {e}"))?;
+        // The code object out of its (compressed) offload bundle, so what its
+        // kernels ask is read before it loads, and the module loads from it.
+        let code = super::code_object::unbundle(&bundled, arch)
+            .map_err(|why| format!("{stem}.co: {why}"))?;
         super::code_object::refuse_late_buffers(&code)
             .map_err(|why| format!("{stem}.co: {why}"))?;
         let api = sys::api()?;
