@@ -10,10 +10,9 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use ::engine::{FireFacts, InstanceId, LaidLanes, ProgramId};
-use tokio::sync::Notify;
 
 use super::*;
-use crate::store::shared::programs::{FireKey, Funder, Mover, ProgramOpen, fit_fire, fund_span};
+use crate::store::shared::programs::{FireKey, Mover, ProgramOpen, fit_fire, fund_span};
 
 const PROGRAM: ProgramId = ProgramId(7);
 const LANES: u32 = 64;
@@ -83,31 +82,6 @@ fn pool_at_256() -> (SharedPool, FakeEngine) {
     (pool, engine)
 }
 
-/// The planner as a raise's funding meets it: an ask parks until the test
-/// has freed the room, then is granted.
-#[derive(Default)]
-struct Planner {
-    asked: AtomicU32,
-    granted: Notify,
-}
-
-impl Funder for Arc<Planner> {
-    async fn fund(&self, pages: u32) -> Result<bool, String> {
-        self.asked.store(pages, Ordering::Release);
-        self.granted.notified().await;
-        Ok(true)
-    }
-}
-
-/// A planner nothing should ask.
-struct NoPlanner;
-
-impl Funder for NoPlanner {
-    async fn fund(&self, pages: u32) -> Result<bool, String> {
-        panic!("asked for {pages} pages with nothing short");
-    }
-}
-
 /// The engine's side of a raise, on the fake engine.
 struct Lane(Arc<Mutex<FakeEngine>>);
 
@@ -155,17 +129,12 @@ async fn a_zero_fire_term_leaves_the_rung_arithmetic_unchanged() {
         RungStep::Wait,
         "at its rung: nothing moves"
     );
-    // A bind waits on nothing, and asks no planner.
+    // A bind waits on nothing.
     let shared: Shared = Arc::new(Mutex::new(pool));
     let open = ProgramOpen::new(&shared, key(PROGRAM), 0).unwrap();
-    fund_span(
-        &shared,
-        || 256,
-        &NoPlanner,
-        &Lane(Arc::new(Mutex::new(engine))),
-    )
-    .await
-    .unwrap();
+    fund_span(&shared, || 256, &Lane(Arc::new(Mutex::new(engine))))
+        .await
+        .unwrap();
     drop(open);
     assert_eq!(shared.lock().unwrap().pool().act_reserved(), 4);
 }
@@ -297,24 +266,17 @@ async fn a_program_s_fire_term_widens_the_span_before_its_bind_and_its_close_giv
     let cached = span_cache(&mut pool, 16);
     let shared: Shared = Arc::new(Mutex::new(pool));
     let engine = Arc::new(Mutex::new(engine));
-    let planner = Arc::new(Planner::default());
 
     let open = ProgramOpen::new(&shared, key(PROGRAM), 0).unwrap();
     assert_eq!(shared.lock().unwrap().span_short(256), 3);
     let wait = tokio::spawn({
-        let (shared, planner, engine) = (shared.clone(), planner.clone(), engine.clone());
-        async move { fund_span(&shared, || 256, &planner, &Lane(engine)).await }
+        let (shared, engine) = (shared.clone(), engine.clone());
+        async move { fund_span(&shared, || 256, &Lane(engine)).await }
     });
     for _ in 0..10 {
         tokio::task::yield_now().await;
     }
     assert!(!wait.is_finished(), "the bind waits on the cache's clear");
-    assert_eq!(
-        planner.asked.load(Ordering::Acquire),
-        0,
-        "nothing asked of the planner"
-    );
-    assert_eq!(shared.lock().unwrap().raise_short(256), (0, 0));
     assert_eq!(
         shared.lock().unwrap().pool().act_reserved(),
         4,
@@ -460,7 +422,6 @@ async fn a_term_past_the_largest_rung_funds_the_widest_that_fits_and_cuts_fires_
             fund_span(
                 &shared,
                 move || cap.load(Ordering::Acquire),
-                &NoPlanner,
                 &Lane(Arc::new(Mutex::new(engine))),
             )
             .await
@@ -607,14 +568,9 @@ async fn a_zero_term_never_refuses_a_bind_on_a_pool_without_rungs() {
     pool.fire_facts_learned(key(PROGRAM), &FireFacts::default());
     let shared: Shared = Arc::new(Mutex::new(pool));
     let open = ProgramOpen::new(&shared, key(PROGRAM), 0).expect("a zero term never refuses");
-    fund_span(
-        &shared,
-        || u32::MAX,
-        &NoPlanner,
-        &Lane(Arc::new(Mutex::new(engine))),
-    )
-    .await
-    .unwrap();
+    fund_span(&shared, || u32::MAX, &Lane(Arc::new(Mutex::new(engine))))
+        .await
+        .unwrap();
     drop(open);
 }
 
@@ -645,14 +601,9 @@ async fn a_pool_without_rungs_skips_the_term_check() {
         assert_eq!(pool.span_short(u32::MAX), 0);
         assert_eq!(pool.fit_cap(), u32::MAX, "fires uncut");
     }
-    fund_span(
-        &shared,
-        || u32::MAX,
-        &NoPlanner,
-        &Lane(Arc::new(Mutex::new(engine))),
-    )
-    .await
-    .unwrap();
+    fund_span(&shared, || u32::MAX, &Lane(Arc::new(Mutex::new(engine))))
+        .await
+        .unwrap();
     drop((open, huge));
 }
 
@@ -707,12 +658,6 @@ fn two_extents_of_one_program_sum_and_each_closes_with_its_last_bind() {
 /// moved down by the engine's copy, while the smaller pair's stays.
 #[tokio::test(flavor = "current_thread")]
 async fn a_larger_extent_bind_widens_the_span_before_it_is_sent() {
-    struct Granting;
-    impl Funder for Granting {
-        async fn fund(&self, _pages: u32) -> Result<bool, String> {
-            Ok(true)
-        }
-    }
     let (mut pool, engine) = pool_at_256();
     pool.fire_facts_learned(at(PROGRAM, 256), &rows_facts(256));
     pool.fire_facts_learned(at(PROGRAM, 2048), &rows_facts(2048));
@@ -733,7 +678,7 @@ async fn a_larger_extent_bind_widens_the_span_before_it_is_sent() {
 
     let open = ProgramOpen::new(&shared, at(PROGRAM, 2048), 0).unwrap();
     assert_eq!(shared.lock().unwrap().span_short(256), 4);
-    fund_span(&shared, || 256, &Granting, &Lane(engine.clone()))
+    fund_span(&shared, || 256, &Lane(engine.clone()))
         .await
         .unwrap();
     // What the bind is sent after.
@@ -861,12 +806,6 @@ fn a_lower_lends_only_after_every_fire_cut_to_the_old_rung_has_retired() {
 /// reaches the engine is `a_larger_extent_bind_widens_the_span_before_it_is_sent`.
 #[tokio::test(flavor = "current_thread")]
 async fn a_bind_the_engine_refuses_closes_its_term_as_if_it_never_happened() {
-    struct Granting;
-    impl Funder for Granting {
-        async fn fund(&self, _pages: u32) -> Result<bool, String> {
-            Ok(true)
-        }
-    }
     let (mut pool, engine) = pool_at_256();
     pool.fire_facts_learned(at(PROGRAM, 4096), &rows_facts(4096));
     let shared: Shared = Arc::new(Mutex::new(pool));
@@ -874,7 +813,7 @@ async fn a_bind_the_engine_refuses_closes_its_term_as_if_it_never_happened() {
 
     // The bind: its pair opened and funded, then the engine refuses it.
     let open = ProgramOpen::new(&shared, at(PROGRAM, 4096), 0).unwrap();
-    fund_span(&shared, || 256, &Granting, &Lane(engine.clone()))
+    fund_span(&shared, || 256, &Lane(engine.clone()))
         .await
         .unwrap();
     assert_eq!(shared.lock().unwrap().pool().act_chunks(256), 4 + 8);
@@ -935,14 +874,9 @@ async fn each_bind_grows_the_term_and_each_close_shrinks_it() {
         1,
         "three live: one chunk more"
     );
-    fund_span(
-        &shared,
-        || 256,
-        &NoPlanner,
-        &Lane(Arc::new(Mutex::new(engine))),
-    )
-    .await
-    .unwrap();
+    fund_span(&shared, || 256, &Lane(Arc::new(Mutex::new(engine))))
+        .await
+        .unwrap();
     assert_eq!(
         shared.lock().unwrap().pool().act_reserved(),
         4 + 2,
@@ -1135,19 +1069,19 @@ fn a_refused_bind_leaves_the_term_of_the_pairs_open() {
 
 // ---- ruling 2: the rung the engine holds, and the span it states ----
 
-/// The fixture's pool with its span backed on demand, stating as Metal
-/// does that its activation span covers the segments from the one the
-/// largest rung's carve starts in (6 and 7: 16 chunks); as it loads, the
-/// prefix through segment 5 committed. The engine holds the smallest rung.
-fn on_demand_loaded() -> (SharedPool, FakeEngine) {
+/// The fixture's pool with its engine told rungs, stating as Metal does
+/// that its activation span covers the segments from the one the largest
+/// rung's carve starts in (6 and 7: 16 chunks); every segment committed.
+/// The engine holds the smallest rung.
+fn told_loaded() -> (SharedPool, FakeEngine) {
     let mut facts = facts();
-    facts.span_backed_on_demand = true;
+    facts.tells_rungs = true;
     facts.act_span_chunks = Some(2 * SEGMENT);
     let mut pool = SharedPool::new(&facts, 256).unwrap();
     pool.set_max_lanes(LANES);
-    let mut engine = FakeEngine::on_demand();
+    let mut engine = FakeEngine::new();
     assert_eq!(
-        walk_segments(&mut pool, 6, 0, &mut engine),
+        walk_segments(&mut pool, 8, 0, &mut engine),
         Retarget::Reached
     );
     assert_eq!(pool.told(), 16, "the load's rung");
@@ -1156,9 +1090,9 @@ fn on_demand_loaded() -> (SharedPool, FakeEngine) {
     (pool, engine)
 }
 
-/// [`on_demand_loaded`], the engine told `rung` by a raise from the load's.
-fn on_demand_at(rung: u32) -> (SharedPool, FakeEngine) {
-    let (mut pool, engine) = on_demand_loaded();
+/// [`told_loaded`], the engine told `rung` by a raise from the load's.
+fn told_at(rung: u32) -> (SharedPool, FakeEngine) {
+    let (mut pool, engine) = told_loaded();
     let raise = pool.plan_raise(rung).unwrap();
     assert_eq!(pool.raise_applied(&raise).unwrap(), Some((16, rung)));
     pool.rung_told();
@@ -1186,7 +1120,7 @@ fn notices(engine: &FakeEngine) -> Vec<(u32, u32)> {
 /// wait on the engine, nor on one another.
 #[tokio::test(flavor = "current_thread")]
 async fn binds_at_a_standing_rung_send_the_engine_no_notice() {
-    let (mut pool, engine) = on_demand_at(256);
+    let (mut pool, engine) = told_at(256);
     pool.fire_facts_learned(key(PROGRAM), &lane_facts());
     let shared: Shared = Arc::new(Mutex::new(pool));
     let engine = Arc::new(Mutex::new(engine));
@@ -1200,7 +1134,7 @@ async fn binds_at_a_standing_rung_send_the_engine_no_notice() {
             let planned = pool.plan_raise(256).unwrap();
             assert!(!pool.raise_waits(&planned), "bind {id}");
         }
-        fund_span(&shared, || 256, &NoPlanner, &Lane(engine.clone()))
+        fund_span(&shared, || 256, &Lane(engine.clone()))
             .await
             .unwrap();
         let mut pool = shared.lock().unwrap();
@@ -1231,19 +1165,14 @@ async fn binds_at_a_standing_rung_send_the_engine_no_notice() {
 /// nothing, before the bind.
 #[tokio::test(flavor = "current_thread")]
 async fn a_growth_at_a_standing_rung_over_the_span_s_cache_sends_nothing_once_it_is_cleared() {
-    let (mut pool, mut engine) = on_demand_at(256);
+    let (mut pool, engine) = told_at(256);
     let below = pool
         .take_records(pool.records_available() as usize)
         .unwrap();
-    // The 256 rung leaves 52..60 to cache; span segment 7 backed, the
-    // weight cache takes 56..60.
-    assert_eq!(
-        walk_segments(&mut pool, 7, 0, &mut engine),
-        Retarget::Reached
-    );
-    assert_eq!(engine.calls.last(), Some(&Call::CommitSpan(1)));
+    // The 256 rung leaves 52..60 to cache, backed from the load; the
+    // weight cache takes it.
     assert_eq!(pool.records_available(), 0, "live state takes none of it");
-    let cached = span_cache(&mut pool, 8);
+    let cached = span_cache(&mut pool, 16);
     pool.fire_facts_learned(key(PROGRAM), &fire_facts());
     let sent = engine.calls.len();
     let shared: Shared = Arc::new(Mutex::new(pool));
@@ -1256,12 +1185,12 @@ async fn a_growth_at_a_standing_rung_over_the_span_s_cache_sends_nothing_once_it
             pool.plan_raise(256).is_err_and(|error| error.span_cached()),
             "57..60 holds cache"
         );
-        assert_eq!(pool.raise_short(256), (0, 0), "nothing to fund");
+
         clear_span_cache(&mut pool, &cached, 1);
         let planned = pool.plan_raise(256).unwrap();
         assert!(!pool.raise_waits(&planned), "no trip through the lane");
     }
-    fund_span(&shared, || 256, &NoPlanner, &Lane(engine.clone()))
+    fund_span(&shared, || 256, &Lane(engine.clone()))
         .await
         .unwrap();
     {
@@ -1295,14 +1224,14 @@ async fn a_growth_at_a_standing_rung_over_the_span_s_cache_sends_nothing_once_it
 /// fence, and the engine is sent no notice either way: its rung stood.
 #[tokio::test(flavor = "current_thread")]
 async fn a_bind_the_engine_cannot_cover_at_a_standing_rung_gives_its_room_back_unnoticed() {
-    let (mut pool, engine) = on_demand_at(256);
+    let (mut pool, engine) = told_at(256);
     pool.fire_facts_learned(key(PROGRAM), &fire_facts());
     let shared: Shared = Arc::new(Mutex::new(pool));
     let engine = Arc::new(Mutex::new(engine));
     let before = engine.lock().unwrap().calls.clone();
 
     let open = ProgramOpen::new(&shared, key(PROGRAM), 0).unwrap();
-    fund_span(&shared, || 256, &NoPlanner, &Lane(engine.clone()))
+    fund_span(&shared, || 256, &Lane(engine.clone()))
         .await
         .unwrap();
     assert_eq!(shared.lock().unwrap().pool().act_reserved(), 4 + 3);
@@ -1351,7 +1280,7 @@ async fn a_bind_the_engine_cannot_cover_at_a_standing_rung_gives_its_room_back_u
 /// engine is sent nothing.
 #[tokio::test(flavor = "current_thread")]
 async fn a_bind_under_a_wider_rung_the_engine_holds_is_funded_at_that_rung() {
-    let (mut pool, engine) = on_demand_at(256);
+    let (mut pool, engine) = told_at(256);
     pool.fire_facts_learned(key(PROGRAM), &fire_facts());
     let shared: Shared = Arc::new(Mutex::new(pool));
     let engine = Arc::new(Mutex::new(engine));
@@ -1367,7 +1296,7 @@ async fn a_bind_under_a_wider_rung_the_engine_holds_is_funded_at_that_rung() {
         assert!(!pool.told_unfit());
         assert_eq!(pool.raise_at(16), Some(256), "no narrower than it holds");
     }
-    fund_span(&shared, || 16, &NoPlanner, &Lane(engine.clone()))
+    fund_span(&shared, || 16, &Lane(engine.clone()))
         .await
         .unwrap();
     let pool = shared.lock().unwrap();
@@ -1387,7 +1316,7 @@ async fn a_bind_under_a_wider_rung_the_engine_holds_is_funded_at_that_rung() {
 /// against its span first.
 #[tokio::test(flavor = "current_thread")]
 async fn a_term_past_the_rung_the_engine_holds_brings_it_down_before_the_bind() {
-    let (mut pool, engine) = on_demand_at(2048);
+    let (mut pool, engine) = told_at(2048);
     assert_eq!(pool.pool().act_reserved(), 12);
     // 7 chunks a fire: 12 + 7 is past the top rung's 12, 4 + 7 is not.
     pool.fire_facts_learned(
@@ -1410,15 +1339,7 @@ async fn a_term_past_the_rung_the_engine_holds_brings_it_down_before_the_bind() 
     let cap = Arc::new(AtomicU32::new(u32::MAX));
     let wait = tokio::spawn({
         let (shared, cap, engine) = (shared.clone(), cap.clone(), engine.clone());
-        async move {
-            fund_span(
-                &shared,
-                move || cap.load(Ordering::Acquire),
-                &NoPlanner,
-                &Lane(engine),
-            )
-            .await
-        }
+        async move { fund_span(&shared, move || cap.load(Ordering::Acquire), &Lane(engine)).await }
     });
     for _ in 0..10 {
         tokio::task::yield_now().await;
@@ -1487,7 +1408,7 @@ async fn a_term_past_the_rung_the_engine_holds_brings_it_down_before_the_bind() 
 /// every later step of the walk waits. No rung, no cap, no notice.
 #[test]
 fn a_steady_one_row_decode_moves_no_rung_and_no_cap() {
-    let (mut pool, engine) = on_demand_loaded();
+    let (mut pool, engine) = told_loaded();
     let cap = pool.start_cap();
     assert_eq!(cap, 16, "fires start cut to the load's rung");
     pool.fire_facts_learned(key(PROGRAM), &lane_facts());
@@ -1567,7 +1488,7 @@ async fn a_wave_past_the_span_the_engine_states_is_cut_to_the_widest_rung_it_cov
             ..shape(LIST, kind, CHUNK_BYTES / 8)
         }],
         act_chunks: vec![(16, 60), (128, 320), (256, 622), (2048, 1740)],
-        span_backed_on_demand: true,
+        tells_rungs: true,
         act_span_chunks: Some(span),
         ..ChunkFacts::default()
     };
@@ -1621,7 +1542,7 @@ async fn a_wave_past_the_span_the_engine_states_is_cut_to_the_widest_rung_it_cov
     let notice = pool.raise_applied(&raise).unwrap();
     assert_eq!(notice, Some((16, 128)));
     let shared: Shared = Arc::new(Mutex::new(pool));
-    let engine = Arc::new(Mutex::new(FakeEngine::on_demand()));
+    let engine = Arc::new(Mutex::new(FakeEngine::new()));
     crate::store::shared::programs::carry_raise(&shared, notice, &Lane(engine.clone()))
         .await
         .unwrap();
@@ -1642,7 +1563,7 @@ async fn a_wave_past_the_span_the_engine_states_is_cut_to_the_widest_rung_it_cov
     }
     // One more bind of a pair open is funded at 128 and waits on nothing.
     let open = ProgramOpen::new(&shared, at(PROGRAM, 256), 0).unwrap();
-    fund_span(&shared, || 128, &NoPlanner, &Lane(engine.clone()))
+    fund_span(&shared, || 128, &Lane(engine.clone()))
         .await
         .unwrap();
     drop(open);
@@ -1913,14 +1834,9 @@ async fn a_bind_s_standing_bytes_are_backed_before_its_bind_and_a_total_past_the
     let added = shared.lock().unwrap().standing_added(total);
     assert_eq!(added, SET);
     let open = ProgramOpen::new(&shared, key(PROGRAM), added).unwrap();
-    fund_span(
-        &shared,
-        || 256,
-        &NoPlanner,
-        &Lane(Arc::new(Mutex::new(fake))),
-    )
-    .await
-    .unwrap();
+    fund_span(&shared, || 256, &Lane(Arc::new(Mutex::new(fake))))
+        .await
+        .unwrap();
     assert_eq!(shared.lock().unwrap().pool().act_reserved(), 4 + 2);
     assert_eq!(engine.binds, 0, "backed before the engine binds");
     let bound = engine.bind_instance(&binding(PROGRAM)).unwrap();

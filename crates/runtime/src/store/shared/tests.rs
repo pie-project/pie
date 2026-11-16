@@ -127,16 +127,9 @@ impl FakeEngine {
         }
     }
 
-    /// An engine whose span is backed on demand: none of it from the load.
-    fn on_demand() -> Self {
-        Self {
-            top: TOTAL / SEGMENT,
-            ..Self::new()
-        }
-    }
-
-    /// Backs the top `n` span segments: monotone, from the top. Refused
-    /// as a placement heap the device has no room for is.
+    /// Backs the top `n` span segments again (the governor's grow):
+    /// monotone, from the top. Refused as a heap the device has no room
+    /// for is.
     fn commit_span(&mut self, n: u32) -> ::engine::Result<()> {
         if self.refuse {
             return Err(::engine::Error::Exhausted {
@@ -151,8 +144,8 @@ impl FakeEngine {
         Ok(())
     }
 
-    /// The rung moves (`Engine::set_rung`): a raise backs the carve, and is
-    /// refused as a placement heap the device has no room for is.
+    /// The rung moves (`Engine::set_rung`): refused where `refuse` is set,
+    /// as an engine that cannot take the notice is.
     fn set_rung(&mut self, from: u32, to: u32) -> ::engine::Result<()> {
         if self.refuse && to > from {
             return Err(::engine::Error::Exhausted {
@@ -683,25 +676,26 @@ pub(crate) fn clear_span_cache(pool: &mut SharedPool, cached: &[Slot], epoch: u6
     pool.pool_mut().retire_through(epoch);
 }
 
-/// For the walk's and the planner's tests: an on-demand pool at the largest
-/// rung, the engine told, its prefix committed whole (`prefix_whole`) or as
-/// loaded, every record held. With `lent`, the 256 rung lends span no
-/// segment backs; without, what the rung lends is backed already.
-pub(crate) fn grow_pool(prefix_whole: bool, lent: bool) -> SharedPool {
-    let (mut pool, mut engine) = span::on_demand_pool();
+/// For the walk's and the planner's tests: a pool whose engine is told
+/// rungs, at the largest rung, its prefix committed whole (`prefix_whole`)
+/// or as loaded, every record held. With `shed`, lowered to the 256 rung
+/// and yield's last shed taken: the span below the activation given back.
+pub(crate) fn grow_pool(prefix_whole: bool, shed: bool) -> SharedPool {
+    let (mut pool, mut engine) = span::told_pool();
     if prefix_whole {
         assert_eq!(
-            walk_segments(&mut pool, 6, 0, &mut engine),
+            walk_segments(&mut pool, 8, 0, &mut engine),
             Retarget::Reached
         );
         assert_eq!(pool.pool().prefix_segments(), 6, "the prefix whole");
     }
-    if lent {
+    if shed {
         pool.lower_rung(256).unwrap();
-    } else {
-        while let Some(n) = pool.pool().span_to_commit() {
-            pool.span_committed(n);
-        }
+        let n = pool
+            .pool()
+            .span_to_shed()
+            .expect("the span below the activation");
+        pool.pool_mut().release_span(n);
     }
     let records = pool.records_available() as usize;
     pool.take_records(records).unwrap();
@@ -881,22 +875,19 @@ fn a_raise_by_demand_lacks_nothing_live_state_fills_and_clears_the_span_s_cache(
     assert_eq!(pool.rung_for(17), 256);
     assert_eq!(pool.rung_for(5000), 2048, "past every rung: the largest");
     pool.lower_rung(16).unwrap();
-    assert_eq!(
-        pool.raise_short(2048),
-        (0, 0),
+    assert!(
+        pool.plan_raise(2048).is_ok(),
         "an empty pool raises at once"
     );
     let all = pool
         .take_records(pool.records_available() as usize)
         .unwrap();
     assert!(!all.is_empty());
-    assert_eq!(
-        pool.raise_short(2048),
-        (0, 0),
+    assert!(
+        pool.plan_raise(2048).is_ok(),
         "live state never fills the span: the raise lacks nothing"
     );
     let cached = span_cache(&mut pool, 6);
-    assert_eq!(pool.raise_short(2048), (0, 0), "cache is no room to fund");
     assert!(
         pool.plan_raise(2048)
             .is_err_and(|error| error.span_cached()),

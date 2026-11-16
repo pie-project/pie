@@ -40,7 +40,6 @@ fn pool(chunks: u32, weights: &WeightShape) -> SlotPool {
         reserved_chunks: 1,
         shapes,
         act_chunks: Vec::new(),
-        span_on_demand: false,
         act_span: None,
     })
 }
@@ -169,7 +168,6 @@ fn lowered_pool(weights: &WeightShape) -> SlotPool {
         reserved_chunks: 1,
         shapes,
         act_chunks: vec![(16, 1), (256, 4)],
-        span_on_demand: false,
         act_span: None,
     });
     pool.set_rung(16).unwrap();
@@ -208,7 +206,6 @@ fn a_raise_drops_the_weight_cache_in_its_span_and_moves_nothing() {
             chunks: 3
         }
     );
-    assert_eq!(slots.rung_short(256), 0);
     slots.clear_span(12);
     assert_eq!(cache.clear_span(&mut slots, 12, 7), 3);
     assert_eq!(resident(&cache, 16), Vec::<u32>::new(), "they stream again");

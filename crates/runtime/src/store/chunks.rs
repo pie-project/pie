@@ -86,7 +86,6 @@ impl<I: PoolId> ShapePool<I> {
                 slots_per_chunk: 1,
             }],
             act_chunks: Vec::new(),
-            span_on_demand: false,
             act_span: None,
         });
         Self {
@@ -579,7 +578,6 @@ impl Seats {
                     slots_per_chunk: 1,
                 }],
                 act_chunks: Vec::new(),
-                span_on_demand: false,
                 act_span: None,
             }),
             capacity,

@@ -2279,20 +2279,20 @@ fn reached_eviction(planner: &ResidencyPlanner, key: EntryKey) -> bool {
 }
 
 /// Mac's over-demand stall reworked (Metal, M1, Qwen3-0.6B, 64 single-lane
-/// requests, 0 of 539 pages free, 0 evictions for good): the prefix whole
-/// and a lowered rung lending span no segment backs, a head short of room
-/// gets an eviction plan, and nothing waits on a span commit. Before, the
-/// planner was told the pool grows (the lent span) while the walk's goal
-/// stopped at the prefix, so the plan returned on the grow and never
+/// requests, 0 of 539 pages free, 0 evictions for good), on the span yield
+/// gave back: the prefix whole, a head short of room gets an eviction
+/// plan, and nothing waits on a span commit (live state never opens in
+/// the span). Before, the planner was told the pool grows while the walk's
+/// goal stopped at the prefix, so the plan returned on the grow and never
 /// reached `plan_eviction`.
 #[tokio::test(flavor = "current_thread")]
-async fn a_head_short_beside_an_unbacked_lent_span_gets_an_eviction_plan() {
+async fn a_head_short_beside_the_span_yield_gave_back_gets_an_eviction_plan() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
     let pool = crate::store::shared::tests::grow_pool(true, true);
     assert_eq!(
-        pool.pool().span_to_commit(),
-        Some(1),
-        "a span lent, unbacked"
+        pool.pool().span_to_regrow(),
+        Some(2),
+        "the span yield gave back"
     );
     let (planner, grow, key) = short_of_a_grow(pool, u32::MAX);
     planner.plan();

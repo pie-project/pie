@@ -660,13 +660,6 @@ impl Drop for ProgramOpen {
     }
 }
 
-/// How a span short of room has it freed: a planner waiter's ask of `pages`
-/// kv pages, granted (`Ok(true)`), to be asked again (`Ok(false)`), or
-/// refused.
-pub trait Funder {
-    fn fund(&self, pages: u32) -> impl std::future::Future<Output = Result<bool, String>> + Send;
-}
-
 /// The engine's side of a raise: the notice of a rung it does not hold
 /// (`Engine::set_rung` through the engine's lane), where it backs its carve
 /// for the wider rung. Nothing moves in a raise.
@@ -720,9 +713,10 @@ pub async fn take_raise(
                         .ok()
                         .map(|notice| (raise, notice, stood)),
                     Err(error) => {
-                        // Idle cache lies in the span: the walk has its
-                        // owner clear it, and raises then.
-                        if error.span_cached() {
+                        // Idle cache lies in the span, or the span is
+                        // yield's to grow back: the walk has it cleared or
+                        // waits on the grow, and raises then.
+                        if error.span_cached() || error.span_shed() {
                             super::ask_walk(mover.engine());
                         }
                         None
@@ -762,11 +756,9 @@ pub async fn carry_raise(
         return Ok(());
     };
     if let Err(error) = mover.set_rung(from, to).await {
-        tracing::warn!(%error, from, to, "a raise's carve was refused; fires stay at the rung in hand");
+        tracing::warn!(%error, from, to, "a raise's notice was refused; fires stay at the rung in hand");
         shared.lock().unwrap().raise_refused();
-        return Err(format!(
-            "the engine refused the carve for rung {to}: {error}"
-        ));
+        return Err(format!("the engine refused rung {to}'s notice: {error}"));
     }
     shared.lock().unwrap().rung_told();
     Ok(())
@@ -775,10 +767,12 @@ pub async fn carry_raise(
 /// Waits until `shared`'s activation holds what fires may take now, the
 /// fire terms of the programs that can be in a fire included: fires cut to
 /// `cap()` rows, and no wider than the widest rung that fits with the terms
-/// ([`SharedPool::widest_fit`]). Where the span falls short, the room is
-/// asked of `funder` as a rung raise's is, then the raise taken (nothing
-/// moves: idle cache in the widened span is cleared first, and live state
-/// never lies there) and the engine's notice taken before this returns. Where fires are cut wider than the widest
+/// ([`SharedPool::widest_fit`]). Where the span falls short the raise is
+/// taken: nothing moves and no room is asked of anyone (idle cache in the
+/// widened span is cleared first, live state never lies there, and the
+/// span is reserved at load: given back only by yield, which the
+/// governor's grow backs again), and the engine's notice is taken before
+/// this returns. Where fires are cut wider than the widest
 /// rung that fits, or the engine holds a wider rung than that
 /// ([`SharedPool::told_unfit`]), it waits on the walk to cut them and
 /// bring the engine down ([`super::SharedGrow`], asked to look at once:
@@ -793,7 +787,6 @@ pub async fn carry_raise(
 pub async fn fund_span(
     shared: &Shared,
     cap: impl Fn() -> u32,
-    funder: &impl Funder,
     mover: &impl Mover,
 ) -> Result<(), String> {
     let engine = mover.engine();
@@ -821,13 +814,13 @@ pub async fn fund_span(
                 rows <= pool.lifted(fires),
             )
         };
-        let Some(goal) = goal else {
+        if goal.is_none() {
             // The engine holds a rung the terms no longer fit: the walk
             // brings it down, and tells the rung.
             super::ask_walk(engine);
             watch.await;
             continue;
-        };
+        }
         if short == 0 && !awaiting && cut {
             return Ok(());
         }
@@ -840,53 +833,13 @@ pub async fn fund_span(
             watch.await;
             continue;
         }
-        let pages = shared.lock().unwrap().raise_short(goal).1;
-        if pages > 0 {
-            tracing::debug!(
-                pages,
-                goal,
-                "a program's fire term asks the planner for room"
-            );
-            if !funder.fund(pages).await? {
-                // Quoted again: the planner's answer is the event.
-                continue;
-            }
-        }
         if take_raise(shared, |pool| pool.rung_for(cap()), mover)
             .await?
             .is_none()
         {
-            // The walk is raising it, or the room went to another since:
-            // either moves the rung or frees room.
+            // The walk is raising it (idle cache in the span cleared first,
+            // or the span yield gave back backed again): it tells the rung.
             watch.await;
-        }
-    }
-}
-
-/// The runtime's [`Funder`]: process `pid`'s planner, as a waiter of
-/// `quorum`.
-pub struct Planner {
-    pub pid: uuid::Uuid,
-    pub quorum: uuid::Uuid,
-}
-
-impl Funder for Planner {
-    async fn fund(&self, pages: u32) -> Result<bool, String> {
-        let Some(planner) = crate::planner::planner_of(self.pid) else {
-            return Err(format!("process {} has no planner to fund it", self.pid));
-        };
-        let demand = crate::planner::Demand {
-            kv_pages: pages,
-            rs: crate::store::rs::RsUnits::default(),
-        };
-        match planner.acquire(self.pid, self.quorum, demand).await {
-            Ok(crate::planner::Acquired::Granted(grant)) => {
-                // Given back at once: the raise takes the room it freed.
-                drop(grant);
-                Ok(true)
-            }
-            Ok(crate::planner::Acquired::Requote | crate::planner::Acquired::Yield) => Ok(false),
-            Err(error) => Err(error.to_string()),
         }
     }
 }
