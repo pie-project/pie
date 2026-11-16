@@ -9,9 +9,10 @@
 use crate::error::Error;
 use crate::hip::blas::{self, Operand};
 use crate::hip::{lt, sys};
-use crate::jit::{Ctx, kernel, refuse};
+use crate::jit::{Ctx, aligned16, kernel, refuse};
 
 use super::dense_batch::dense_batch_bf16;
+use super::skinny;
 use super::gemv::{
     SkinnyEpilogue, gemv_bf16, skinny_bf16, skinny_f32, skinny_swiglu_bf16, skinnyt, turn_fits,
 };
@@ -40,7 +41,17 @@ enum Route {
     Other,
 }
 
-fn route(ctx: &Ctx, m: i32, rows: i32, k: i32) -> Route {
+/// Whether the diagonal kernels' vector reads take these planes: each one
+/// there, and the weight and the activation 16-byte aligned.
+fn vector_operands(w: u64, act: u64, y: u64) -> bool {
+    w != 0 && act != 0 && y != 0 && aligned16(w) && aligned16(act)
+}
+
+/// The route for `m` rows over a bank of `rows` weight rows of K `k`: a
+/// kernel is named only where it serves the product, its shape and its
+/// planes (`vectors`, [`vector_operands`]), so a route named is a route
+/// that runs, and one that refuses is a fault.
+fn route(ctx: &Ctx, m: i32, rows: i32, k: i32, vectors: bool) -> Route {
     let t = ctx.tuning();
     let until = if rows.unsigned_abs() >= t.gemm_skinny_batch_min_n {
         t.gemm_turn_wide_until
@@ -50,18 +61,20 @@ fn route(ctx: &Ctx, m: i32, rows: i32, k: i32) -> Route {
     if t.gemm_turn_from > 0
         && (t.gemm_turn_from as i32..=until as i32).contains(&m)
         && rows.unsigned_abs() >= t.gemm_turn_min_n
+        && vectors
         && turn_fits(m.unsigned_abs(), rows.unsigned_abs(), k.unsigned_abs())
     {
         return Route::Turn;
     }
-    if m <= SKINNY_SMALL && i64::from(rows) * i64::from(k) <= SKINNY_SMALL_WEIGHT {
+    let skinny = vectors && skinny::fits(m, rows, k);
+    if skinny && m <= SKINNY_SMALL && i64::from(rows) * i64::from(k) <= SKINNY_SMALL_WEIGHT {
         return Route::Skinny;
     }
     // Past two rows an activation beyond LDS (a long K) costs the diagonal
     // kernel its L2 rereads, where hipBLASLt still tiles a short bank faster;
     // a bank of the whole-product kernel's width keeps it.
     let reread = m > 2 && 2 * i64::from(m) * i64::from(k) > SKINNY_LDS && rows < SKINNY_QUAD_ROWS;
-    if m <= t.gemm_skinny_dense_rows as i32 && !reread {
+    if skinny && m <= t.gemm_skinny_dense_rows as i32 && !reread {
         return Route::Skinny;
     }
     // Past the skinny rows an lm_head-wide bank streams best on the batch
@@ -92,23 +105,19 @@ pub(crate) fn act_x_wt(
     if m <= 0 || n <= 0 || k <= 0 {
         return Ok(false);
     }
-    let way = route(ctx, m, n, k);
-    if bias == 0
-        && way == Route::Turn
-        && took(
-            "skinnyt",
-            skinnyt(ctx, w, act, y, m, n, k, SkinnyEpilogue::Store),
-        )
-    {
+    let vectors = vector_operands(w, act, y);
+    let way = route(ctx, m, n, k, vectors);
+    if bias == 0 && way == Route::Turn {
+        skinnyt(ctx, w, act, y, m, n, k, SkinnyEpilogue::Store)?;
         return Ok(false);
     }
-    if bias == 0
-        && way == Route::Skinny
-        && took("skinny_bf16", skinny_bf16(ctx, w, act, y, m, n, k))
-    {
+    if bias == 0 && way == Route::Skinny {
+        skinny_bf16(ctx, w, act, y, m, n, k)?;
         return Ok(false);
     }
-    if m == 1 && took("gemv_bf16", gemv_bf16(ctx, w, act, bias, y, n, k)) {
+    // The gemv: one row, K in whole eights, over vector-read planes.
+    if m == 1 && vectors && k % 8 == 0 {
+        gemv_bf16(ctx, w, act, bias, y, n, k)?;
         return Ok(bias != 0);
     }
     if bias == 0 && way == Route::Batch && dense_batch_bf16(ctx, w, act, y, m, n, k, false)? {
@@ -168,17 +177,12 @@ pub(crate) fn act_x_wt_f32(
     n: i32,
     k: i32,
 ) -> Result<(), Error> {
-    let way = route(ctx, m, n, k);
-    if way == Route::Turn
-        && took(
-            "skinnyt",
-            skinnyt(ctx, w, act, y, m, n, k, SkinnyEpilogue::F32),
-        )
-    {
-        return Ok(());
+    let way = route(ctx, m, n, k, vector_operands(w, act, y));
+    if way == Route::Turn {
+        return skinnyt(ctx, w, act, y, m, n, k, SkinnyEpilogue::F32);
     }
-    if way == Route::Skinny && took("skinny_f32", skinny_f32(ctx, w, act, y, m, n, k)) {
-        return Ok(());
+    if way == Route::Skinny {
+        return skinny_f32(ctx, w, act, y, m, n, k);
     }
     let shape = lt::Shape {
         m: m.unsigned_abs(),
@@ -231,30 +235,22 @@ pub(crate) fn act_x_wt_swiglu(
     if m <= 0 || intermediate <= 0 || k <= 0 {
         return Ok(false);
     }
-    let way = route(ctx, m, 2 * intermediate, k);
-    if way == Route::Turn
-        && took(
-            "skinnyt",
-            skinnyt(
-                ctx,
-                gate_up,
-                act,
-                h,
-                m,
-                intermediate,
-                k,
-                SkinnyEpilogue::Swiglu,
-            ),
-        )
-    {
+    let way = route(ctx, m, 2 * intermediate, k, vector_operands(gate_up, act, h));
+    if way == Route::Turn {
+        skinnyt(
+            ctx,
+            gate_up,
+            act,
+            h,
+            m,
+            intermediate,
+            k,
+            SkinnyEpilogue::Swiglu,
+        )?;
         return Ok(true);
     }
-    if way == Route::Skinny
-        && took(
-            "skinny_swiglu_bf16",
-            skinny_swiglu_bf16(ctx, gate_up, act, h, m, intermediate, k),
-        )
-    {
+    if way == Route::Skinny {
+        skinny_swiglu_bf16(ctx, gate_up, act, h, m, intermediate, k)?;
         return Ok(true);
     }
     if way == Route::Batch && dense_batch_bf16(ctx, gate_up, act, h, m, intermediate, k, true)? {
@@ -342,29 +338,3 @@ pub(crate) fn act_x_wt_live(
     Ok(true)
 }
 
-/// Whether a faster route took a product: a route that declines (a shape it
-/// does not serve, a slab no walk laid, a launch it could not make) hands
-/// it to the next, slower one, which is counted and said, route by route,
-/// at the first and at every doubling, with why.
-fn took(route: &'static str, fired: Result<(), Error>) -> bool {
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-    let Err(why) = fired else {
-        return true;
-    };
-    crate::tally::declined();
-    static DECLINED: Mutex<Option<HashMap<&'static str, u64>>> = Mutex::new(None);
-    let mut declined = DECLINED.lock().expect("declined lock poisoned");
-    let count = declined
-        .get_or_insert_with(HashMap::new)
-        .entry(route)
-        .or_insert(0);
-    *count += 1;
-    if count.is_power_of_two() {
-        eprintln!(
-            "kernels-rocm: the `{route}` route declined a product, which a slower route took: \
-             {why}; {count} such product(s) so far"
-        );
-    }
-    false
-}
