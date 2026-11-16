@@ -409,6 +409,13 @@ export interface StateGeometry {
   /** Per lane, how many slots the lane reads. */
   kvLen?: Channel;
   fold?: Fold;
+  /**
+   * `[lanes, n]` u32, the fold that sorts a lane's buffer: per column (slot `folded() + c`), 0 commits
+   * it, 1 leaves it buffered, 2 drops it. Committed columns freeze at `folded()` in order, buffered ones
+   * follow, dropped ones go. On a model with recurrent state the buffered columns are a suffix. A lane
+   * alone on its working set; not with `fold` (a fold of `n` commits the first `n` columns).
+   */
+  keep?: Channel;
 }
 
 // ---------------------------------------------------------------------------
@@ -551,6 +558,7 @@ export class ForwardPass {
       [Port.SLOTS, geom.slots],
       [Port.KV_LEN, geom.kvLen],
       [Port.FOLD, fold],
+      [Port.KEEP, geom.keep],
     ];
     if (!rebind) this.ensurePortsAvailable(stated.filter(([, ch]) => ch !== undefined).map(([port]) => port));
     const g: witForward.StateGeometry = {};
@@ -558,6 +566,7 @@ export class ForwardPass {
     if (geom.slots) g.slots = geom.slots.wit();
     if (geom.kvLen) g.kvLen = geom.kvLen.wit();
     if (fold) g.fold = fold.wit();
+    if (geom.keep) g.keep = geom.keep.wit();
     wit('state', () => this.wit.state(lanes.map((l) => l.ws), g));
     this.lanes = [...lanes];
     if (!rebind) for (const [port, ch] of stated) if (ch !== undefined) this.ports.push([port, ch]);

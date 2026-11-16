@@ -335,6 +335,10 @@ pub enum Fold {
     None,
     Host(Vec<u32>),
     Device,
+    /// A keep a lane (`crate::store::kv::keep`): each lane's outcome for
+    /// each column of its set's buffer extent, 0 commit, 1 buffer, 2 drop;
+    /// columns past the extent are not read.
+    Keep(Vec<Vec<u32>>),
 }
 
 impl Fold {
@@ -351,6 +355,21 @@ impl Fold {
                 counts => counts.get(lane).copied(),
             },
             Fold::Device => None,
+            // What the recurrence folds: every column before the first one
+            // left buffered (the suffix rule holds it to the rest).
+            Fold::Keep(rows) => rows.get(lane).map(|row| {
+                row.iter()
+                    .position(|&outcome| outcome == 1)
+                    .map_or(u32::MAX, |at| at as u32)
+            }),
+        }
+    }
+
+    /// Lane `lane`'s keep, where the pass states one.
+    pub fn keep(&self, lane: usize) -> Option<&[u32]> {
+        match self {
+            Fold::Keep(rows) => rows.get(lane).map(Vec::as_slice),
+            _ => None,
         }
     }
 
@@ -371,6 +390,10 @@ impl Fold {
                     ),
                 })
             }
+            Fold::Keep(rows) if rows.len() != lanes => Err(EvaluatedGeometryError::BadValue {
+                port: Port::Keep,
+                reason: format!("it states {} keep row(s) for {lanes} lanes; a keep is a row a lane", rows.len()),
+            }),
             _ => Ok(()),
         }
     }
@@ -383,6 +406,8 @@ pub struct Place {
     pub tail: Option<u32>,
     pub shared: bool,
     pub spans: Vec<(u32, u32, u32)>,
+    /// The rows keeps dropped from the set ([`crate::inferlet::host::working_set::Cursor::ahead`]).
+    pub ahead: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -485,10 +510,13 @@ impl ReqGeometry {
             };
             // Unstated, a row rotates the working set's lag behind its slot.
             let lag = crate::inferlet::host::working_set::lag(&place.spans, start);
+            // A keep that dropped rows leaves later rows below their positions.
+            let ahead = place.ahead;
             let positions = match &self.positions {
                 Some(positions) => cut(positions, lane),
-                None if lag == 0 => Vec::new(),
-                None => (start - lag..end - lag).collect(),
+                None if lag == 0 && ahead == 0 => Vec::new(),
+                None => ((start + ahead).saturating_sub(lag)..(end + ahead).saturating_sub(lag))
+                    .collect(),
             };
             let positions = if positions
                 .iter()
@@ -747,6 +775,43 @@ pub fn map_geometry_evaluated_with(
         }
         Err(error) => return Err(error),
     };
+    let device_keep = || EvaluatedGeometryError::BadValue {
+        port: Port::Keep,
+        reason: "a keep the device computes is read back when its fire settles, which this \
+                 runtime does not do yet; state the keep from the host"
+            .to_string(),
+    };
+    let fold = match optional_u32(Port::Keep) {
+        Ok(None) => fold,
+        Ok(Some(_)) if device_resolved.contains(Port::Keep) => return Err(device_keep()),
+        Ok(Some(values)) => {
+            if !matches!(fold, Fold::None) {
+                return Err(EvaluatedGeometryError::BadValue {
+                    port: Port::Keep,
+                    reason: "the pass states a fold count and a keep; a keep is the fold, \
+                             and a count is the keep that commits a prefix"
+                        .to_string(),
+                });
+            }
+            if lanes == 0 || values.len() % lanes != 0 {
+                return Err(EvaluatedGeometryError::BadValue {
+                    port: Port::Keep,
+                    reason: format!(
+                        "{} keep value(s) for {lanes} lane(s): a keep is [lanes, columns]",
+                        values.len()
+                    ),
+                });
+            }
+            let width = values.len() / lanes;
+            Fold::Keep(values.chunks(width.max(1)).map(<[u32]>::to_vec).collect())
+        }
+        Err(EvaluatedGeometryError::NotDerivable { .. })
+            if device_resolved.contains(Port::Keep) =>
+        {
+            return Err(device_keep());
+        }
+        Err(error) => return Err(error),
+    };
     let mut g = ReqGeometry {
         token_ids,
         qo_indptr,
@@ -891,6 +956,7 @@ mod tests {
             tail: Some(tail),
             shared: false,
             spans: Vec::new(),
+            ahead: 0,
         }
     }
 

@@ -2140,6 +2140,17 @@ enum FoldBy {
         /// Held from the fire's submit ([`unsettle`]).
         unplaced: Option<Unplaced>,
     },
+    /// A keep (`crate::store::kv::keep`): settled with the fire, its rows
+    /// moved by a copy the settle issues, and the set's next fire staged
+    /// only once that copy lands, from the mark it holds from submit.
+    Keep {
+        outcomes: Vec<crate::store::kv::keep::Outcome>,
+        /// One past the lane's last row: the keep's extent ends here.
+        end: u64,
+        rs: Option<crate::store::rs::RsWorkingSetId>,
+        cursor: Arc<Mutex<crate::inferlet::host::working_set::Cursor>>,
+        unplaced: Option<Unplaced>,
+    },
 }
 
 /// A working set's folded length is a lower bound while a fire on its way
@@ -3035,6 +3046,7 @@ fn pass_lanes<C: FireContext>(ctx: &mut C, fwd: &Resource<ForwardPass>) -> Anyho
             tail: now.tail,
             shared: lanes.iter().filter(|&&other| other == rep).count() > 1,
             spans: now.spans,
+            ahead: now.ahead,
         });
         cursors.push(cursor);
     }
@@ -3101,7 +3113,7 @@ fn unsettle(
         .iter_mut()
         .filter_map(|part| match &mut part.fold {
             Some(FoldAt {
-                by: FoldBy::Settled { unplaced, .. },
+                by: FoldBy::Settled { unplaced, .. } | FoldBy::Keep { unplaced, .. },
                 ..
             }) => Some((part.ws, unplaced)),
             _ => None,
@@ -3137,6 +3149,75 @@ fn unsettle(
     clippy::too_many_arguments,
     reason = "the fold, where it ends, and the request whose lanes report it"
 )]
+/// The keep a pass states, refused by name before anything is reserved or
+/// written: on a model with window lists (they retire by committed count),
+/// on a working set more than one lane of the fire rides, on a set whose
+/// folded length is a bound, past an M-RoPE span not yet folded, short of a
+/// lane's extent, or not a keep (an outcome past 2; on a recurrent model a
+/// buffered column before a committed or dropped one).
+fn keep_refusal(
+    fold: &geometry::Fold,
+    groups: &[(crate::store::kv::page_table::WorkingSetId, Vec<usize>)],
+    places: &[geometry::Place],
+    landings: &[geometry::Landing],
+    rs: &[crate::store::rs::RsWorkingSetId],
+    windowed: bool,
+) -> Result<(), String> {
+    let geometry::Fold::Keep(_) = fold else {
+        return Ok(());
+    };
+    if windowed {
+        return Err("pipeline: a keep on a model with window lists, whose windows retire by \
+                    the committed count: refused until a keep moves window rows"
+            .to_string());
+    }
+    for (_, lanes) in groups {
+        let Some(&first) = lanes.first() else {
+            continue;
+        };
+        if lanes.len() > 1 {
+            return Err(format!(
+                "pipeline: lanes {lanes:?} keep one working set; a keep sorts one lane's buffer, \
+                 and lanes sharing a set read one"
+            ));
+        }
+        let place = &places[first];
+        if !place.folded_exact {
+            return Err(format!(
+                "pipeline: lane {first} keeps a working set whose folded length is a bound \
+                 ({})",
+                crate::store::kv::page_table::UNPLACED
+            ));
+        }
+        if place.spans.iter().any(|&(_, end, _)| end > place.folded) {
+            return Err(format!(
+                "pipeline: lane {first} keeps past an M-RoPE span its set has not folded"
+            ));
+        }
+        let Some(row) = fold.keep(first) else {
+            continue;
+        };
+        let (folded, end) = (u64::from(place.folded), u64::from(landings[first].end()));
+        let extent = usize::try_from(end.saturating_sub(folded)).unwrap_or(usize::MAX);
+        let Some(columns) = row.get(..extent) else {
+            return Err(format!(
+                "pipeline: lane {first}'s keep states {} column(s) for an extent of {extent}",
+                row.len()
+            ));
+        };
+        let outcomes = columns
+            .iter()
+            .map(|&outcome| {
+                crate::store::kv::keep::Outcome::of(u8::try_from(outcome).unwrap_or(u8::MAX))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("pipeline: lane {first}: {error}"))?;
+        crate::store::kv::keep::plan(folded, end, &outcomes, rs.get(first).is_some())
+            .map_err(|error| format!("pipeline: lane {first}: {error}"))?;
+    }
+    Ok(())
+}
+
 fn fold_at(
     lanes: &PassLanes,
     group: &[usize],
@@ -3154,6 +3235,30 @@ fn fold_at(
     let first = *group.first()?;
     let place = &lanes.places[first];
     let reach = u64::from(landings[first].end());
+    if let Some(row) = fold.keep(first) {
+        // A cut pass keeps once, with its last piece: an earlier piece's
+        // fold would move the columns the keep names.
+        if !last {
+            return None;
+        }
+        let end = reach.min(end);
+        let extent = usize::try_from(end.saturating_sub(u64::from(place.folded))).ok()?;
+        let outcomes = row
+            .get(..extent)?
+            .iter()
+            .map(|&outcome| {
+                crate::store::kv::keep::Outcome::of(u8::try_from(outcome).unwrap_or(u8::MAX))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+        return Some(FoldBy::Keep {
+            outcomes,
+            end,
+            rs,
+            cursor: lanes.cursors[first].clone(),
+            unplaced: None,
+        });
+    }
     let count = fold.of(first);
     if count == Some(0) {
         return None;
@@ -3641,6 +3746,11 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 Err(error) => return Ok(Err(error)),
             };
         let windowed = crate::model::model().rs_caps().window_tokens > 0;
+        if let Err(refusal) =
+            keep_refusal(&geometry.fold, &groups, &pass_lanes.places, &landings, &rs_ws_ids, windowed)
+        {
+            return Ok(Err(refusal));
+        }
         // A long host pass runs as several fires; all but the last run the
         // model's forward alone. A recurrent state folding all its rows, or
         // none, folds each fire's rows in turn.
@@ -4831,6 +4941,140 @@ pub(crate) async fn finalize_op_detached(op: PendingOp) -> Anyhow<()> {
 /// ([`RsDeviceFold::UNREPORTED`]): the engine's record went on by a count
 /// the frozen length never takes, and what copies or moves the set would
 /// state a length behind it.
+/// A keep that moved rows, settled on the host and not yet landed on the
+/// device: the copies its settle leaves ([`land_keep`]), and the mark that
+/// holds the set's next fire until they land.
+struct KeepPending {
+    landing: crate::store::kv::KeepLanding,
+    rs: Option<crate::store::rs::RsKeepLanding>,
+    cursor: Arc<Mutex<crate::inferlet::host::working_set::Cursor>>,
+    unplaced: Option<Unplaced>,
+}
+
+/// Settles a keep with its fire: the kv rows sorted ([`KvStore::fold_keep`],
+/// a plain fold where nothing moves), and, on a recurrent model, the
+/// buffered suffix renumbered after the record folded through its start
+/// ([`RsStore::keep_buffer`]). A failed fire keeps nothing. What moves is
+/// left to [`land_keep`].
+///
+/// [`KvStore::fold_keep`]: crate::store::kv::KvStore::fold_keep
+/// [`RsStore::keep_buffer`]: crate::store::rs::RsStore::keep_buffer
+#[allow(clippy::too_many_arguments)]
+fn settle_keep(
+    stores: &crate::store::registry::Stores,
+    ws: crate::store::kv::page_table::WorkingSetId,
+    outcomes: &[crate::store::kv::keep::Outcome],
+    end: u64,
+    rs: Option<crate::store::rs::RsWorkingSetId>,
+    cursor: Arc<Mutex<crate::inferlet::host::working_set::Cursor>>,
+    mut unplaced: Option<Unplaced>,
+    decoded: bool,
+    failure: Option<&str>,
+) -> Option<KeepPending> {
+    let kept = crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
+        let kept = match failure {
+            Some(_) => Ok(None),
+            None => kv.fold_keep(ws, end, outcomes, rs.is_some(), decoded),
+        };
+        if !matches!(kept, Ok(Some(_)))
+            && let Some(unplaced) = &mut unplaced
+        {
+            unplaced.settle(kv, failure.is_none() && kept.is_ok());
+        }
+        kept
+    });
+    let landing = match kept {
+        Ok(Some(landing)) => landing,
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::warn!(%error, "pipeline: a keep the fire settled");
+            return None;
+        }
+    };
+    let rs = rs.and_then(|rs| {
+        let dropped = u32::try_from(landing.plan.dropped).unwrap_or(u32::MAX);
+        let buffered = u32::try_from(landing.plan.buffered).unwrap_or(u32::MAX);
+        stores
+            .rs
+            .lock()
+            .unwrap()
+            .keep_buffer(rs, dropped, buffered)
+            .inspect_err(|error| tracing::warn!(%error, "pipeline: a keep's recurrent buffer"))
+            .ok()
+            .flatten()
+    });
+    Some(KeepPending {
+        landing,
+        rs,
+        cursor,
+        unplaced,
+    })
+}
+
+/// Lands a keep's copies on the device, in order on the engine's stream and
+/// before the set's next fire: its kv rows, then its buffered recurrent
+/// rows. Then the set's rows end where the keep left them (the cursor), the
+/// pages and slots they left go, and the mark lifts, so the next fire stages
+/// on the moved rows. A copy that failed leaves the folded length a bound.
+async fn land_keep(engine: usize, stores: &crate::store::registry::Stores, pending: KeepPending) {
+    use crate::scheduler::worker::PreLaunchCopy;
+    let KeepPending {
+        landing,
+        rs,
+        cursor,
+        mut unplaced,
+    } = pending;
+    let device = crate::scheduler::device_domain(engine);
+    let copy = |plan: PreLaunchCopy| async move {
+        crate::scheduler::scheduler_handle(engine)?
+            .copy_tracked(plan)?
+            .wait()
+            .await
+    };
+    let mut landed = copy(PreLaunchCopy::Kv(::engine::KvCopy {
+        src: device,
+        dst: device,
+        src_page_ids: Vec::new(),
+        dst_page_ids: Vec::new(),
+        moves: landing.moves.clone(),
+        windowed: Vec::new(),
+    }))
+    .await;
+    if let (Ok(()), Some(rs)) = (&landed, &rs)
+        && let Some(shape) = rs.shape
+        && !rs.runs.is_empty()
+    {
+        landed = copy(PreLaunchCopy::Slots(::engine::chunk::SlotCopy {
+            shape,
+            src: device,
+            dst: device,
+            slots: Vec::new(),
+            runs: rs.runs.clone(),
+        }))
+        .await;
+    }
+    if let Err(error) = &landed {
+        tracing::warn!(%error, "pipeline: a keep's rows did not land");
+    }
+    {
+        let dropped = u32::try_from(landing.plan.dropped).unwrap_or(u32::MAX);
+        let mut cursor = cursor.lock().unwrap();
+        cursor.reserved = cursor.reserved.saturating_sub(dropped);
+        cursor.written = cursor.written.saturating_sub(dropped);
+        cursor.tail = cursor.tail.map(|tail| tail.saturating_sub(dropped));
+        cursor.ahead = cursor.ahead.saturating_add(dropped);
+    }
+    if let Some(rs) = rs {
+        stores.rs.lock().unwrap().keep_landed(rs);
+    }
+    crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
+        kv.settle(landing.epoch);
+        if let Some(unplaced) = &mut unplaced {
+            unplaced.settle(kv, landed.is_ok());
+        }
+    });
+}
+
 fn settle_fold(
     stores: &crate::store::registry::Stores,
     ws: crate::store::kv::page_table::WorkingSetId,
@@ -4838,9 +5082,19 @@ fn settle_fold(
     reported: &std::collections::HashMap<u64, ::engine::KvWrites>,
     written_end: Option<u64>,
     failure: Option<&str>,
-) {
+) -> Option<KeepPending> {
     let success = failure.is_none();
     let FoldAt { mut by, decoded } = fold;
+    if let FoldBy::Keep {
+        outcomes,
+        end,
+        rs,
+        cursor,
+        unplaced,
+    } = by
+    {
+        return settle_keep(stores, ws, &outcomes, end, rs, cursor, unplaced, decoded, failure);
+    }
     // Taken before the kv lock: ending the one takes the rs store's, and
     // the other, dropped unsettled, the kv store's. The count is the
     // host's, or what the engine reported under the lanes' tags; a fire
@@ -4861,13 +5115,14 @@ fn settle_fold(
             });
             (rs.take(), success && count.is_none(), unplaced.take())
         }
-        FoldBy::To(_) => (None, false, None),
+        FoldBy::To(_) | FoldBy::Keep { .. } => (None, false, None),
     };
     let mut device_slots = None;
     let folded = crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
         let frozen = kv.folded(ws)?;
         let to = match by {
             FoldBy::To(to) => Some(to),
+            FoldBy::Keep { .. } => None,
             FoldBy::Settled {
                 count,
                 tags: _,
@@ -4919,6 +5174,7 @@ fn settle_fold(
         let failure = failure.or(unreported.then_some(RsDeviceFold::UNREPORTED));
         device_fold.settle(device_slots, failure);
     }
+    None
 }
 
 async fn finalize_fire_await(fire: PendingFire) -> FinalizeOutcome {
@@ -4944,6 +5200,7 @@ async fn finalize_fire_await(fire: PendingFire) -> FinalizeOutcome {
     });
     let success = failure_reason.is_none();
     let mut leases = Vec::with_capacity(kv.len());
+    let mut keeps: Vec<KeepPending> = Vec::new();
 
     {
         let stores = crate::store::registry::get(model, engine);
@@ -5015,17 +5272,25 @@ async fn finalize_fire_await(fire: PendingFire) -> FinalizeOutcome {
         // What the fire froze seals now that its rows are logged.
         for (ws, fold) in folds {
             let written_end = written_ends.get(&ws).copied();
-            settle_fold(
+            keeps.extend(settle_fold(
                 &stores,
                 ws,
                 fold,
                 &reported,
                 written_end,
                 failure_reason.as_deref(),
-            );
+            ));
         }
         for checkpoint in &checkpoints {
             take_checkpoint(&stores, checkpoint, success);
+        }
+    }
+
+    // A keep's rows move before its set's next fire, which its mark holds.
+    if !keeps.is_empty() {
+        let stores = crate::store::registry::get(model, engine);
+        for pending in keeps {
+            land_keep(engine, &stores, pending).await;
         }
     }
 
@@ -5130,10 +5395,25 @@ async fn fire_device_geometry<C: FireContext>(
             Err(error) => return Ok(Err(error)),
         };
 
-    let (rs_reps, fold) = {
+    let (rs_reps, fold, keeps) = {
         let pass = ctx.resources().get(&fwd)?;
-        (pass.rs_ws.clone(), fold_of_pass(pass))
+        let keeps = pass
+            .instance
+            .program
+            .bound
+            .container
+            .ports
+            .iter()
+            .any(|binding| binding.port == Port::Keep);
+        (pass.rs_ws.clone(), fold_of_pass(pass), keeps)
     };
+    // Rows the device places land where the host learns only at settle; a
+    // keep sorts rows the host places.
+    if keeps {
+        return Ok(Err("pipeline: a keep on a pass whose rows the device places; a keep \
+                       sorts the buffer of a lane the host places"
+            .to_string()));
+    }
     // A recurrent state a device-counted fold left unsettled is read where
     // the engine left it: the fire goes ahead of the settle.
     let pass_lanes = pass_lanes(ctx, &fwd)?;
@@ -6767,6 +7047,7 @@ pub(crate) mod fold_tests {
                         tail: now.tail,
                         shared: false,
                         spans: now.spans,
+                        ahead: now.ahead,
                     }
                 })
                 .collect(),
@@ -9349,6 +9630,7 @@ mod unfolded_tests {
                     tail: None,
                     shared: false,
                     spans: Vec::new(),
+                    ahead: 0,
                 }],
                 cursors: vec![Arc::new(Mutex::new(Cursor {
                     reserved: 14,
@@ -9500,6 +9782,7 @@ mod unfolded_tests {
                     tail: None,
                     shared: false,
                     spans: Vec::new(),
+                    ahead: 0,
                 }],
                 cursors: vec![cell],
                 kv: Vec::new(),

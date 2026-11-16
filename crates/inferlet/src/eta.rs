@@ -449,6 +449,13 @@ pub enum Fold<'a> {
     /// Per lane (or one for all), possibly computed on the device; lanes
     /// sharing a working set fold by the first one's.
     Count(&'a Channel),
+    /// `[lanes, n]` u32: per column of the lane's buffer (slot `folded + c`),
+    /// 0 commits it, 1 leaves it buffered, 2 drops it. The committed columns
+    /// are frozen at `folded ..` in order, the buffered ones follow, the
+    /// dropped ones go; nothing below `folded` changes. On a model with
+    /// recurrent state the buffered columns are a suffix. A lane alone on
+    /// its working set. `Count(n)` is the keep that commits the first `n`.
+    Keep(&'a Channel),
 }
 
 /// Where a pass's rows land and what they read. Left out, rows append, are
@@ -695,8 +702,12 @@ impl ForwardPass {
     /// bind other working sets (a beam's forks).
     pub fn state(&self, lanes: &[&WorkingSet], geom: StateGeometry<'_>) -> Result<(), String> {
         let rebind = self.inner.borrow().program_attached;
+        let keep = match geom.fold {
+            Fold::Keep(channel) => Some(*channel),
+            _ => None,
+        };
         let fold = match geom.fold {
-            Fold::None => None,
+            Fold::None | Fold::Keep(_) => None,
             Fold::Count(channel) => Some(*channel),
             Fold::All => Some(
                 *self
@@ -711,6 +722,7 @@ impl ForwardPass {
             (Port::Slots, geom.slots.copied()),
             (Port::KvLen, geom.kv_len.copied()),
             (Port::Fold, fold),
+            (Port::Keep, keep),
         ];
         if !rebind {
             let ports: Vec<Port> = stated
@@ -733,6 +745,7 @@ impl ForwardPass {
                 slots: wits[1].as_deref(),
                 kv_len: wits[2].as_deref(),
                 fold: wits[3].as_deref(),
+                keep: wits[4].as_deref(),
             },
         )?;
         let mut inner = self.inner.borrow_mut();

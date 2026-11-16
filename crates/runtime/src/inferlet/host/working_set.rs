@@ -32,6 +32,10 @@ pub struct Cursor {
     pub staged: Vec<Arc<StagedRows>>,
     /// M-RoPE spans `(start_slot, end_slot, lag)`, `lag = token_count - position_span`.
     pub spans: Vec<(u32, u32, u32)>,
+    /// The rows keeps dropped from the set's buffer: a row past them stands
+    /// that many slots below its position, which a row with no stated
+    /// position rotates at.
+    pub ahead: u32,
 }
 
 /// The rows of one fire on a working set that land where the device says,
@@ -125,6 +129,7 @@ impl Default for Cursor {
             written: 0,
             staged: Vec::new(),
             spans: Vec::new(),
+            ahead: 0,
         }
     }
 }

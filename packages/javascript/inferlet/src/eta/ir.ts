@@ -99,6 +99,7 @@ export enum Port {
   ATTN_MASK = 9,
   SLOTS = 16,
   FOLD = 17,
+  KEEP = 18,
 }
 
 /** True iff a channel bound to this port is consumed (take) by the pass. */

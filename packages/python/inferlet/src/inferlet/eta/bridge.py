@@ -439,6 +439,11 @@ class StateGeometry:
     kv_len: Channel | None = None
     """Per lane, how many slots the lane reads."""
     fold: Fold = None
+    keep: Channel | None = None
+    """`[lanes, n]` u32, the fold that sorts a lane's buffer: per column (slot `folded() + c`), 0
+    commits it, 1 leaves it buffered, 2 drops it. Committed columns freeze at `folded()` in order,
+    buffered ones follow, dropped ones go. On a model with recurrent state the buffered columns are a
+    suffix. A lane alone on its working set; not with `fold` (a fold of `n` commits the first `n`)."""
 
     @staticmethod
     def folding(**fields) -> "StateGeometry":
@@ -599,6 +604,7 @@ class ForwardPass:
             (Port.SLOTS, geom.slots),
             (Port.KV_LEN, geom.kv_len),
             (Port.FOLD, fold),
+            (Port.KEEP, geom.keep),
         ]
         if not rebind:
             self._ensure_ports_available([port for port, ch in stated if ch is not None])
@@ -607,7 +613,7 @@ class ForwardPass:
             self.wit.state,
             [lane.ws for lane in lanes],
             _wit_forward.StateGeometry(
-                positions=wits[0], slots=wits[1], kv_len=wits[2], fold=wits[3]
+                positions=wits[0], slots=wits[1], kv_len=wits[2], fold=wits[3], keep=wits[4]
             ),
             what="state",
         )

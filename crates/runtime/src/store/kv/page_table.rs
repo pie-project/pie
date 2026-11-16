@@ -98,6 +98,8 @@ pub struct ExportedSet {
     pub folded: u64,
     pub prompt_pages: u64,
     pub logged: Vec<u32>,
+    /// The first page no fold seals ([`WorkingSetEntry::keyless_from`]).
+    pub keyless_from: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -1982,6 +1984,7 @@ impl KvPageTable {
             folded: entry.folded,
             prompt_pages: entry.prompt_pages,
             logged: entry.logged.clone(),
+            keyless_from: entry.keyless_from,
         })
     }
 
@@ -2018,6 +2021,7 @@ impl KvPageTable {
         entry.folded = set.folded;
         entry.prompt_pages = set.prompt_pages;
         entry.logged = set.logged;
+        entry.keyless_from = set.keyless_from;
         Ok(ws)
     }
 

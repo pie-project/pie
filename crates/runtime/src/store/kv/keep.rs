@@ -198,6 +198,7 @@ pub fn plan(
 
 /// The keep a fold of `count` slots is: the first `count` columns
 /// committed, the rest buffered.
+#[cfg(test)]
 #[must_use]
 pub fn fold_of(count: u64, extent: u64) -> Vec<Outcome> {
     (0..extent)
