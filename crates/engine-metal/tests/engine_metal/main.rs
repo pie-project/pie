@@ -75,3 +75,4 @@ fn full_pool(trace: &poem_ir::Trace, page_size: u32, context: u32, slots: u32) -
     let _ = (trace, page_size, context, slots);
     None
 }
+mod an_unfolded_decode_is_the_folded_one;
