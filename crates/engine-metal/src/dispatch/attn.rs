@@ -15,17 +15,63 @@ impl Run<'_> {
         u32::try_from(self.qo_indptr_host().len().saturating_sub(1)).unwrap_or(u32::MAX)
     }
 
+    /// The fire's capturing lanes' rows: a score op runs only in a fire one
+    /// of whose lanes captures.
+    fn capture_seat(&self) -> Result<crate::run::CaptureSeat, kernels_metal::Error> {
+        self.bindings().capture.ok_or_else(|| kernels_metal::Error::Backend {
+            op: "attn.score_capture",
+            detail: "this fire runs a score capture and none of its lanes captures".to_string(),
+        })
+    }
+
     fn attention(&mut self, op: &Attn) -> Result<(), kernels_metal::Error> {
         match op {
-            // WIP: Metal's capture into a capturing lane's guest-region row
-            // lands next on this branch; until then a capturing fire is
-            // refused by name.
-            Attn::ScoreCapture { .. } | Attn::ScorePages { .. } => Err(kernels_metal::Error::Backend {
-                op: "attn.score_capture",
-                detail: "Metal does not yet lay a capturing lane's score row in its reading \
-                         program's guest region"
-                    .to_string(),
-            }),
+            Attn::ScoreCapture {
+                q,
+                plan,
+                cache,
+                head_dim,
+                kv_heads,
+                q_heads,
+                sm_scale,
+                observe,
+                into,
+                ..
+            } => {
+                let seat = self.capture_seat()?;
+                attn::score::capture(
+                    self.ctx(),
+                    self.ragged(*q),
+                    &self.prefill_plan_over(*plan, *cache),
+                    self.pool(*cache),
+                    *head_dim,
+                    *kv_heads,
+                    *sm_scale,
+                    *observe,
+                    seat.keys,
+                    *q_heads,
+                    into.is_none(),
+                    self.requests(),
+                    attn::score::CaptureRows {
+                        store: seat.store,
+                        rows: seat.keys_at,
+                        first: self.window().span.lane_offset,
+                    },
+                )
+            }
+            Attn::ScorePages { .. } => {
+                let seat = self.capture_seat()?;
+                attn::score::pages(
+                    self.ctx(),
+                    seat.store,
+                    seat.keys_at,
+                    seat.pages_at,
+                    self.window().span.lane_offset,
+                    seat.keys,
+                    seat.page_size,
+                    self.requests(),
+                )
+            }
             Attn::Voxel {
                 q,
                 k,
