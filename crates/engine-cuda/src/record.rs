@@ -1051,10 +1051,7 @@ impl Bodies {
                 eprintln!(
                     "engine-cuda: body {key} declines to capture ({}), so this \
                      composition walks eagerly for good, each serving fire counted \
-                     unrecorded. A prefill schedule that refused its graph form: \
-                     the prefill float grant is sized at the lattice's top rung in \
-                     `inputs::reserve` (`prefill_float_bytes`); a bucket that \
-                     outgrows it is this line.",
+                     unrecorded.",
                     run.uncapturable_why().join("; ")
                 );
             }

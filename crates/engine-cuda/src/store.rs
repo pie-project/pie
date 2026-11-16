@@ -429,7 +429,7 @@ pub fn weight_tier_bytes(trace: &Trace, stated: u64, extra_resident: u64) -> Res
 /// ceiling, not a reading ahead of it.
 pub fn load_ceiling(allowance: engine::Allowance, latch: bool) -> Result<u64> {
     let (free, total) = device_memory()?;
-    let held = (total - free).saturating_sub(crate::device::own::before_loads(latch));
+    let held = (total - free).saturating_sub(crate::device::own::before_loads(latch)?);
     Ok(elastic::ceiling_of(total, held, allowance))
 }
 
