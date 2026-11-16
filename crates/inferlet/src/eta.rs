@@ -57,6 +57,18 @@ fn set_declared_capacity(gid: u64, capacity: u32) {
     });
 }
 
+/// Forgets channel `gid` here and in the trace's registry: its WIT resource
+/// drops, and the host frees its ring once no bound pass reads it.
+fn forget_channel(gid: u64) {
+    let wit = WIT_CHANNELS
+        .try_with(|m| m.try_borrow_mut().ok()?.remove(&gid))
+        .ok()
+        .flatten();
+    drop(wit);
+    let _ = DECLARED.try_with(|m| m.try_borrow_mut().map(|mut m| m.remove(&gid)));
+    DslChannel::release(gid);
+}
+
 fn lookup_channel(gid: u64) -> Option<Rc<wit_channel::Channel>> {
     if let Some(wit) = WIT_CHANNELS.with(|m| m.borrow().get(&gid).cloned()) {
         return Some(wit);
@@ -121,6 +133,13 @@ impl Channel {
 
     fn wit(&self) -> Rc<wit_channel::Channel> {
         lookup_channel(self.gid).expect("channel token resolves in the WIT registry")
+    }
+
+    /// Lets go of the channel: a process keeps every channel it makes until
+    /// it ends, so one that loops makes this call for those it is done with.
+    /// The token names nothing after; releasing it again does nothing.
+    pub fn release(self) {
+        forget_channel(self.gid);
     }
 
     pub fn capacity(self, n: u32) -> Channel {
@@ -563,6 +582,8 @@ struct ForwardInner {
     adapter_scale_sites: u32,
     inputs: Vec<(u32, String, DslChannel)>,
     switches: Vec<(u32, String, String)>,
+    bound: Vec<u64>,
+    releases: bool,
 }
 
 impl ForwardPass {
@@ -598,8 +619,16 @@ impl ForwardPass {
                 adapter_scale_sites: 0,
                 inputs: Vec::new(),
                 switches: Vec::new(),
+                bound: Vec::new(),
+                releases: false,
             }),
         }
+    }
+
+    /// Releases every channel the pass binds when it drops ([`Channel::release`]),
+    /// for a pass whose channels end with it.
+    pub fn release_on_drop(&self) {
+        self.inner.borrow_mut().releases = true;
     }
 
     /// Sets lane `lane`'s model switch `name` (`model::switches()`) to `value`.
@@ -902,6 +931,7 @@ impl ForwardPass {
         }
         let traced = builder.build().map_err(|error| error.to_string())?;
         drop(builder);
+        let bound = traced.channel_order().to_vec();
         let handles: Vec<Rc<wit_channel::Channel>> = traced
             .channel_order()
             .iter()
@@ -911,8 +941,25 @@ impl ForwardPass {
         let bytes = traced.encode();
         self.wit.program(&bytes, &borrows)?;
         drop(inner);
-        self.inner.borrow_mut().program_attached = true;
+        let mut inner = self.inner.borrow_mut();
+        inner.program_attached = true;
+        inner.bound = bound;
         Ok(())
+    }
+}
+
+impl Drop for ForwardPass {
+    fn drop(&mut self) {
+        let inner = self.inner.get_mut();
+        let mut gids: Vec<u64> = inner.fold_all.iter().map(|channel| channel.gid).collect();
+        if inner.releases {
+            gids.extend(inner.ports.iter().map(|(_, channel)| channel.gid()));
+            gids.extend(inner.inputs.iter().map(|(_, _, channel)| channel.gid()));
+            gids.extend(inner.bound.iter().copied());
+        }
+        gids.sort_unstable();
+        gids.dedup();
+        gids.into_iter().for_each(forget_channel);
     }
 }
 
