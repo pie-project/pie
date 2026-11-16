@@ -998,9 +998,10 @@ impl Engine for Xla {
         if copy.runs.is_empty() {
             return Ok(());
         }
-        if shell.pools().kv_shape() != Some(copy.shape) {
+        let rs = shell.pools().rs_shape() == Some(copy.shape);
+        if !rs && shell.pools().kv_shape() != Some(copy.shape) {
             return Err(Error::Unsupported {
-                verb: "`copy_slots` token runs outside the kv list",
+                verb: "`copy_slots` token runs outside the kv list and the rs list",
                 engine: "xla",
             });
         }
@@ -1015,7 +1016,11 @@ impl Engine for Xla {
                 tokens: r.tokens,
             })
             .collect();
-        shell.copy_kv(&runs).map_err(fault)
+        if rs {
+            shell.copy_rs_runs(&runs).map_err(fault)
+        } else {
+            shell.copy_kv(&runs).map_err(fault)
+        }
     }
 }
 

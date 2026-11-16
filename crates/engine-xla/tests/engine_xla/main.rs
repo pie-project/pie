@@ -23,6 +23,7 @@ mod a_tier_read_lands_every_slot_whole;
 mod a_prompt_length_reuses_its_programs;
 mod an_adapter_lies_in_its_slots;
 mod an_epilogue_agrees_with_the_host_interpreter;
+mod an_rs_token_run_lands_row_for_row;
 mod host_bank;
 mod kernels_act;
 mod kernels_attn;
