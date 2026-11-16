@@ -39,6 +39,7 @@ param SC: f32;
 param PMAX: f32 = 65504.0;
 param QH: bool = false;
 param CAUSAL: bool = false;
+param WIN: u16 = 0;
 
 const matvec = @import_module("ops/mv.csl");
 
@@ -131,12 +132,24 @@ fn query_q(p: u16) void {
 }
 
 // The causal mask: of the entries kept here (rows e * PYA + myrow), those after row qpos score
-// no probability.
+// no probability (WIN > 0: nor those WIN or more rows before it, a sliding window's).
 fn mask() void {
   var n: u16 = 0;
   if (qpos >= myrow) { n = (qpos - myrow) / PYA + 1; }
-  if (n >= NE) { return; }
   var h: u16 = 0;
+  if (WIN > 0 and qpos + 1 > WIN) {
+    // the first row kept, qpos + 1 - WIN: entries below it out
+    const lo = qpos + 1 - WIN;
+    var m: u16 = 0;
+    if (lo > myrow) { m = (lo - myrow + PYA - 1) / PYA; }
+    if (m > NE) { m = NE; }
+    while (h < Qh) : (h += 1) {
+      var e: u16 = 0;
+      while (e < m) : (e += 1) { y[h * NE + e] = 0.0; }
+    }
+    h = 0;
+  }
+  if (n >= NE) { return; }
   while (h < Qh) : (h += 1) {
     var e: u16 = n;
     while (e < NE) : (e += 1) { y[h * NE + e] = 0.0; }

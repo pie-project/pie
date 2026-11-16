@@ -251,6 +251,40 @@ impl Body<'_, '_> {
                     outs,
                 )
             }
+            // a decode step's attention over its own layer's cache: the step's row stored at its
+            // position (the append before it), then attending every row stored at or before it,
+            // as a causal prefill's one row does; the cache persists across steps
+            Operation::Attn(Attn::Decode {
+                q,
+                plan,
+                cache,
+                selection: None,
+                bias: None,
+                head_dim,
+                selected: None,
+                ..
+            }) => {
+                if self.r.owner.get(cache).is_some_and(|&l| l != self.layer) {
+                    return Err(format!(
+                        "{} reads a cache another layer appends: no shared cache yet",
+                        op.op
+                    ));
+                }
+                let kv_heads = match self.r.maker(*plan) {
+                    Some(Operation::Attn(Attn::PlanDecode { kv_heads, .. })) => *kv_heads,
+                    _ => return Err(format!("{}: its plan is no decode plan", op.op)),
+                };
+                self.joint(
+                    op,
+                    Mixer::Joint {
+                        q_heads: self.r.width(*q) / (*head_dim).max(1),
+                        kv_heads,
+                        head_dim: *head_dim,
+                        causal: true,
+                    },
+                    outs,
+                )
+            }
             _ => Err(format!("{} has no spatial lowering", op.op)),
         }
     }
@@ -554,6 +588,17 @@ pub fn lower(
         bodies,
         stages,
     })
+}
+
+/// A decode step's one row class: the single-token request's word (the trace's decode arm), its
+/// `rows` rows a request's one token each.
+#[must_use]
+pub fn decode_classes(trace: &Trace, rows: u32) -> Vec<RowClass> {
+    vec![RowClass {
+        name: "decode".to_string(),
+        word: trace.facts.word(&poem_ir::Request::new(1, false)),
+        rows,
+    }]
 }
 
 /// The conventional row classes of a diffusion poem's `reading` = `reading` step: one a value

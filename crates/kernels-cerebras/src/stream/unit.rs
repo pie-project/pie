@@ -99,6 +99,9 @@ pub struct Joint {
     pub scale: f32,
     /// A row attends the rows stored before it alone (a prefill's mask).
     pub causal: bool,
+    /// And of them, the last `window` alone (a sliding window's), where one is stated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window: Option<u32>,
 }
 
 use serde::Serialize;
@@ -544,6 +547,7 @@ pub fn lower_through(
                     head_dim: *head_dim,
                     scale: *sm_scale,
                     causal: false,
+                    window: None,
                 });
                 steps.push(Step::Store { q, k, v });
                 sides.insert(*o, Side::Col);
@@ -593,6 +597,56 @@ pub fn lower_through(
                     head_dim: *head_dim,
                     scale: *sm_scale,
                     causal: *causal,
+                    window: None,
+                });
+                steps.push(Step::Store { q, k, v });
+                sides.insert(*o, Side::Col);
+                steps.push(Step::Attend {
+                    out: *o,
+                    round: r.round(*o),
+                });
+            }
+            // a decode step's attention over its layer's cache: the row stored with its query
+            // (at its position), then attending every row stored at or before it
+            Operation::Attn(Attn::Decode {
+                q,
+                plan,
+                cache,
+                head_dim,
+                sm_scale,
+                window,
+                o,
+                ..
+            }) => {
+                let Some(&(_, k, v)) = appended.iter().find(|(c, _, _)| c == cache) else {
+                    return Err(refuse(
+                        at,
+                        "attn.decode reads pages no step of its unit appends".into(),
+                    ));
+                };
+                let kv_heads = match r.def(*plan) {
+                    Some(Def::Op(n)) => match &trace.nodes[*n as usize].op {
+                        Operation::Attn(Attn::PlanDecode { kv_heads, .. }) => *kv_heads,
+                        _ => return Err(refuse(at, "attn.decode's plan is no decode plan".into())),
+                    },
+                    _ => return Err(refuse(at, "attn.decode's plan is no decode plan".into())),
+                };
+                let q = r.cols(*q);
+                for c in [q, k, v] {
+                    if side_of(&sides, c) != Some(Side::Col) {
+                        return Err(refuse(
+                            at,
+                            "attn.decode reads a q / k / v not at the column roots".into(),
+                        ));
+                    }
+                }
+                joint = Some(Joint {
+                    q_heads: q.width / head_dim,
+                    kv_heads,
+                    head_dim: *head_dim,
+                    scale: *sm_scale,
+                    causal: true,
+                    window: *window,
                 });
                 steps.push(Step::Store { q, k, v });
                 sides.insert(*o, Side::Col);

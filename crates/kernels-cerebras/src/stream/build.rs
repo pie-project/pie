@@ -840,7 +840,9 @@ pub fn program_at(
         .iter()
         .map(|k| {
             kv_pya_split(
-                k.stores.iter().map(|s| s.1).sum(),
+                shape
+                    .cache
+                    .unwrap_or_else(|| k.stores.iter().map(|s| s.1).sum()),
                 qh,
                 shape.attn.head_dim,
                 split,

@@ -580,3 +580,27 @@ fn checkpoint_stamp(checkpoint: &Path) -> R<String> {
     files.sort();
     Ok(format!("{}:{files:?}", checkpoint.display()))
 }
+
+/// A checkpoint plane's values as f32 (`landed` holds it bf16 or f32 as the contract lands it).
+pub fn plane(landed: &Landed, name: &str, count: usize) -> Vec<f32> {
+    use kernels_cerebras::tiles::Params;
+    let Some(p) = landed.get(name) else {
+        return Vec::new();
+    };
+    let b = p.bytes;
+    if b.len() == 2 * count {
+        b.as_chunks::<2>()
+            .0
+            .iter()
+            .map(|h| f32::from_bits(u32::from(u16::from_le_bytes(*h)) << 16))
+            .collect()
+    } else if b.len() == 4 * count {
+        b.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|w| f32::from_le_bytes(*w))
+            .collect()
+    } else {
+        Vec::new()
+    }
+}

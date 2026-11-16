@@ -618,30 +618,6 @@ fn output_shape(trace: &Trace, v: poem_ir::ValueId) -> (InputAxis, usize) {
     }
 }
 
-/// A checkpoint plane's values as f32 (`landed` holds it bf16 or f32 as the contract lands it).
-pub(crate) fn plane(landed: &crate::prepare::Landed, name: &str, count: usize) -> Vec<f32> {
-    use kernels_cerebras::tiles::Params;
-    let Some(p) = landed.get(name) else {
-        return Vec::new();
-    };
-    let b = p.bytes;
-    if b.len() == 2 * count {
-        b.as_chunks::<2>()
-            .0
-            .iter()
-            .map(|h| f32::from_bits(u32::from(u16::from_le_bytes(*h)) << 16))
-            .collect()
-    } else if b.len() == 4 * count {
-        b.as_chunks::<4>()
-            .0
-            .iter()
-            .map(|w| f32::from_le_bytes(*w))
-            .collect()
-    } else {
-        Vec::new()
-    }
-}
-
 impl CerebrasEngine {
     /// Loads a model's stream readings (`programs`: each `wafer-compile stream`'s output and
     /// its link): each reading's host side, the checkpoint landed for their static arrays, the
@@ -661,7 +637,7 @@ impl CerebrasEngine {
         let load = |e: String| Error::Load(e);
         let t0 = std::time::Instant::now();
         let landed = crate::prepare::land(&trace, contract, checkpoint).map_err(load)?;
-        let of = |name: &str, count: usize| plane(&landed, name, count);
+        let of = |name: &str, count: usize| crate::prepare::plane(&landed, name, count);
         let mut weights = Forward::new(trace.clone(), None, &of).map_err(load)?;
         tracing::info!(
             s = t0.elapsed().as_secs_f64(),

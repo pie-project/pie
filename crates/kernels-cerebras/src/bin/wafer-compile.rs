@@ -246,6 +246,32 @@ fn stream(args: &[String]) -> Result<(), String> {
         .parse(&model)
         .ok_or_else(|| format!("no catalog model {model}"))?
         .trace(poem_ir::Platform::Cerebras);
+    let declared = trace
+        .facts
+        .declared("reading")
+        .is_some_and(|d| d.values.contains(&reading));
+    if reading == "decode" && !declared {
+        // the decode step through the units, its caches `--positions` long (GENERIC.md G1)
+        let positions: u32 = get("--positions")
+            .map_or(Ok(4096), |r| r.parse())
+            .map_err(|e| format!("--positions: {e}"))?;
+        let p = kernels_cerebras::stream::compile_decode(
+            &trace,
+            positions,
+            !ieee,
+            std::path::Path::new(&out),
+        )?;
+        println!(
+            "{model} decode: {} units, {} K / V columns of {positions} positions, {} x {} PEs, py {}, {:.3}M cycles a token priced",
+            p.units.len(),
+            p.stream.kv.len(),
+            p.stream.w,
+            p.stream.h,
+            p.stream.py,
+            kernels_cerebras::cost::stream::time(&p).cycles / 1e6
+        );
+        return Ok(());
+    }
     if kernels_cerebras::stream::grid::is_grid(&trace, &reading) {
         // a grid reading (a VAE's): its passes over one unit, on the clip `--clip t,h,w` (else
         // the one `--rows` token rows make)

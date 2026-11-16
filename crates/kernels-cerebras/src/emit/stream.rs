@@ -476,6 +476,16 @@ pub fn emit(p: &Program) -> R<Emitted> {
             let (params, role) = kv_pe_params(p, c);
             tiles.insert(c, (pname.clone(), params));
             arrays.extend(cfg_array(c, &[i, role]));
+            if p.shape.cache.is_some() {
+                // a decode step's first position, the host's a step (0 at the load)
+                arrays.push(HostArray {
+                    at: c,
+                    sym: "pos".into(),
+                    u16: false,
+                    len: 1,
+                    fill: Fill::Words(vec![0]),
+                });
+            }
         }
     }
     // the lane root
@@ -2245,7 +2255,8 @@ fn kv_pe_file(p: &Program, k: usize, ks: &place::KvSched) -> R<(String, String)>
     let (qh, dc, _, sc) = kv_consts(p);
     let total: u32 = ks.stores.iter().map(|s| s.1).sum();
     let pya = p.stream.kv[k].pya;
-    let ne = total.div_ceil(pya);
+    // a decode step's cache keeps its positions across steps; a stream step's rows its own
+    let ne = p.shape.cache.unwrap_or(total).div_ceil(pya);
     let pmax = if p.round16 { "1.0e30" } else { "65504.0" };
     if p.shape.attn.causal && (ks.stores.len() != 1 || ks.stores[0].2 != 0) {
         return Err(format!(
@@ -2270,27 +2281,49 @@ fn kv_pe_file(p: &Program, k: usize, ks: &place::KvSched) -> R<(String, String)>
         "const att = @import_module(\"ops/satt.csl\", .{{ .fab = fab, .math = math, .red = red, .YM = q_am, .Qh = {qh}, .Dc = {dc}, .NE = {ne}, .PYA = {}, .SC = {sc:?}, .PMAX = {pmax}, .QH = true{} }});",
         pya,
         if p.shape.attn.causal {
-            ", .CAUSAL = true"
+            match ks
+                .units
+                .first()
+                .and_then(|&u| p.units[u].unit.joint)
+                .and_then(|j| j.window)
+            {
+                // a sliding window's: of the rows stored before a query, its last alone
+                Some(w) => format!(", .CAUSAL = true, .WIN = {w}"),
+                None => ", .CAUSAL = true".to_string(),
+            }
         } else {
-            ""
+            String::new()
         }
     );
-    let mut body = String::from(
-        "  stamp(0);\n  att.init(@as(u16, pcfg[0]));\n  red.role = @as(u16, pcfg[1]);\n",
-    );
+    // a cache's step stores and queries from its first position (`pos`, the host's a step; a
+    // sequence's first step clears it)
+    let (init, at) = if p.shape.cache.is_some() {
+        t.push_str("var pos = @zeros([1]u32);\nvar pos_p: [*]u32 = &pos;\n");
+        (
+            "  if (pos[0] == 0) { att.init(@as(u16, pcfg[0])); } else { att.myrow = @as(u16, pcfg[0]); }\n",
+            "@as(u16, pos[0]) + ",
+        )
+    } else {
+        ("  att.init(@as(u16, pcfg[0]));\n", "")
+    };
+    let mut body = format!("  stamp(0);\n{init}  red.role = @as(u16, pcfg[1]);\n");
     for &(_, rows, p0) in &ks.stores {
         let _ = writeln!(
             body,
-            "  {{ var t: u16 = 0; while (t < {rows}) : (t += 1) {{ att.store_q({p0} + t); }} }}"
+            "  {{ var t: u16 = 0; while (t < {rows}) : (t += 1) {{ att.store_q({at}{p0} + t); }} }}"
         );
     }
     let _ = writeln!(
         body,
-        "  {{ var t: u16 = 0; while (t < {total}) : (t += 1) {{ att.query_q(t); }} }}"
+        "  {{ var t: u16 = 0; while (t < {total}) : (t += 1) {{ att.query_q({at}t); }} }}"
     );
     body.push_str("  stamp(1);\n  sys_mod.unblock_cmd_stream();\n");
     let _ = write!(t, "task go() void {{\n{body}}}\n");
-    t.push_str("comptime {\n  @bind_local_task(go, T_GO);\n  @export_symbol(run);\n  @export_symbol(tsc_p, \"tsc\");\n  @export_symbol(pcfg_p, \"pcfg\");\n  @initialize_queue(q_am, .{ .color = @get_color(C_AM) });\n  @initialize_queue(q_r, .{ .color = @get_color(C_R) });\n  @initialize_queue(q_s, .{ .color = @get_color(C_S) });\n}\n");
+    t.push_str("comptime {\n  @bind_local_task(go, T_GO);\n  @export_symbol(run);\n  @export_symbol(tsc_p, \"tsc\");\n  @export_symbol(pcfg_p, \"pcfg\");\n  @initialize_queue(q_am, .{ .color = @get_color(C_AM) });\n  @initialize_queue(q_r, .{ .color = @get_color(C_R) });\n  @initialize_queue(q_s, .{ .color = @get_color(C_S) });\n");
+    if p.shape.cache.is_some() {
+        t.push_str("  @export_symbol(pos_p, \"pos\");\n");
+    }
+    t.push_str("}\n");
     Ok((name, t))
 }
 
@@ -2354,7 +2387,7 @@ fn layout_file(p: &Program, tiles: &Tiles, arrays: &[HostArray]) -> String {
         names.insert(a.sym.clone(), a.u16);
     }
     for (n, u16) in &names {
-        let ty = if n == "tsc" || n == "pcfg" {
+        let ty = if n == "tsc" || n == "pcfg" || n == "pos" {
             "u32"
         } else if *u16 {
             "u16"

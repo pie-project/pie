@@ -67,6 +67,9 @@ pub struct StreamShape {
     pub units: usize,
     pub layer_bodies: usize,
     pub program: StreamProgram,
+    /// A decode step's cache: the positions each K / V column keeps across steps (its rows
+    /// stored at the step's position, `pos` at its PEs); `None`, a stream step's own rows alone.
+    pub cache: Option<u32>,
 }
 
 /// The shape of `trace`'s `reading` over a step of `classes`' rows: its stream program, and the
@@ -134,6 +137,38 @@ pub fn shape(trace: &Trace, reading: &str, classes: &[RowClass]) -> R<StreamShap
                 };
                 one_attention(&mut attn, spec).map_err(refuse)?;
             }
+            // a decode step's attention over its cache: one row a step, causal over the rows
+            // stored before it
+            Operation::Attn(Attn::Decode {
+                q,
+                plan,
+                head_dim,
+                sm_scale,
+                ..
+            }) => {
+                let kv_heads = match trace
+                    .values
+                    .get(plan.0 as usize)
+                    .map(|d| &d.def)
+                    .and_then(|d| match d {
+                        poem_ir::Def::Op(n) => trace.nodes.get(*n as usize).map(|n| &n.op),
+                        _ => None,
+                    }) {
+                    Some(Operation::Attn(Attn::PlanDecode { kv_heads, .. })) => *kv_heads,
+                    _ => return Err(refuse("attn.decode: its plan is no decode plan".into())),
+                };
+                let spec = JointSpec {
+                    q_heads: width_of(trace, *q) / (*head_dim).max(1),
+                    kv_heads,
+                    head_dim: *head_dim,
+                    sm_scale: *sm_scale,
+                    qk_norm: false,
+                    causal: true,
+                };
+                one_attention(&mut attn, spec).map_err(refuse)?;
+            }
+            // (the rotations print as their regions do, `fuse::chain::lower_run`: the shape
+            // states the first, a form the tables turn, for the reading's description alone)
             Operation::Elemwise(Elemwise::RopeAxes {
                 dims,
                 thetas,
@@ -141,32 +176,13 @@ pub fn shape(trace: &Trace, reading: &str, classes: &[RowClass]) -> R<StreamShap
                 rotary_dim,
                 head_dim,
                 ..
-            }) => {
-                let interleaved = match form {
-                    RopeForm::Interleaved => true,
-                    RopeForm::Neox => false,
-                    other => {
-                        return Err(refuse(format!(
-                            "elemwise.rope_axes in the {other:?} form: the rotation tables turn \
-                             interleaved or NeoX pairs"
-                        )));
-                    }
-                };
-                if rotary_dim != head_dim {
-                    return Err(refuse(format!(
-                        "elemwise.rope_axes over {rotary_dim} of a head's {head_dim} dims"
-                    )));
-                }
-                let spec = AxesRope {
-                    dims: *dims,
-                    thetas: *thetas,
-                    interleaved,
-                };
-                match &rope {
-                    Some(r) if *r != spec => {
-                        return Err(refuse("elemwise.rope_axes of two rotations".into()));
-                    }
-                    _ => rope = Some(spec),
+            }) if rope.is_none() && rotary_dim == head_dim => {
+                if let RopeForm::Interleaved | RopeForm::Neox = form {
+                    rope = Some(AxesRope {
+                        dims: *dims,
+                        thetas: *thetas,
+                        interleaved: matches!(form, RopeForm::Interleaved),
+                    });
                 }
             }
             Operation::Elemwise(Elemwise::Rmsnorm { axis, eps: e, .. }) => {
@@ -186,18 +202,12 @@ pub fn shape(trace: &Trace, reading: &str, classes: &[RowClass]) -> R<StreamShap
                     modulations.push(f.to_string());
                 }
             }
+            // (each MLP prints as its region does: the shape states the first, for the
+            // reading's description alone)
             Operation::Linear(Linear::Glu {
                 intermediate, act, ..
-            }) => {
-                let a = crate::target::act(act).map_err(refuse)?;
-                match &glu {
-                    Some((i, g)) if (*i, *g) != (*intermediate, a) => {
-                        return Err(refuse(format!(
-                            "linear.glu of {intermediate} wide beside {i}: one MLP a reading"
-                        )));
-                    }
-                    _ => glu = Some((*intermediate, a)),
-                }
+            }) if glu.is_none() => {
+                glu = Some((*intermediate, crate::target::act(act).map_err(refuse)?));
             }
             Operation::Linear(Linear::Matmul {
                 input_scales,
@@ -233,6 +243,7 @@ pub fn shape(trace: &Trace, reading: &str, classes: &[RowClass]) -> R<StreamShap
         units: prog.units(),
         layer_bodies: prog.layer_bodies().len(),
         program: prog,
+        cache: None,
     })
 }
 
@@ -348,6 +359,52 @@ pub fn compile_pinned(
     )
     .map_err(|e| e.to_string())?;
     host::write(&p, &e.arrays, gold, out)?;
+    Ok(p)
+}
+
+/// Compiles `trace`'s decode step as a unit program (GENERIC.md G1: decode through the stream
+/// regime's units, one row a step, each attention layer's K / V column its cache of `positions`
+/// across steps) into `out`. Returns the program.
+pub fn compile_decode(
+    trace: &Trace,
+    positions: u32,
+    round16: bool,
+    out: &std::path::Path,
+) -> R<build::Program> {
+    let classes = program::decode_classes(trace, 1);
+    let mut s = shape(trace, "decode", &classes)?;
+    s.cache = Some(positions);
+    let p = build::program_py(trace, s, round16, None, &[], None, None, None, false)?;
+    let e = crate::emit::stream::emit(&p)?;
+    std::fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
+    for (name, text) in &e.files {
+        std::fs::write(out.join(name), text).map_err(|e| format!("{name}: {e}"))?;
+    }
+    std::fs::write(
+        out.join("fabric.txt"),
+        format!("{} {} {}\n", e.w, e.h, u8::from(round16)),
+    )
+    .map_err(|e| e.to_string())?;
+    host::write(&p, &e.arrays, None, out)?;
+    // the K / V PEs the host tells a step's first position (`pos`, a word each)
+    let at = out.join("host.json");
+    let mut h: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&at).map_err(|e| format!("{}: {e}", at.display()))?,
+    )
+    .map_err(|e| e.to_string())?;
+    let pos: Vec<serde_json::Value> = p
+        .stream
+        .kv
+        .iter()
+        .flat_map(|kc| (0..kc.pya).map(|i| kc.pe(&p.stream, i)))
+        .map(|c| serde_json::json!({"x": c.x, "y": c.y}))
+        .collect();
+    h["pos"] = serde_json::json!(pos);
+    std::fs::write(
+        &at,
+        serde_json::to_string_pretty(&h).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
     Ok(p)
 }
 

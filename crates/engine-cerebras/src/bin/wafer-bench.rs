@@ -271,6 +271,106 @@ fn stamped(
     }))
 }
 
+/// `--reading <decode program> --program <out> --checkpoint <dir> --decode <golden.json>`: a
+/// decode step through the units (GENERIC.md G1) token by token: each step its token's entries
+/// (the host's ops: the embedding, the positions), its K / V PEs told its position, a launch,
+/// the logits back and their argmax; the golden's tokens fed (teacher-forced), each step past the
+/// prompt held to the golden's next token. `--steps N`: the first N steps alone.
+fn decode(get: &HashMap<String, String>) -> Result<bool, String> {
+    use engine_cerebras::reading::Reading;
+    let need = |k: &str| get.get(k).cloned().ok_or_else(|| USAGE.to_string());
+    let reading = Reading::open(Path::new(&need("reading")?))?;
+    let trace = reading.trace()?;
+    let golden: Value = serde_json::from_str(
+        &std::fs::read_to_string(need("decode")?).map_err(|e| format!("--decode: {e}"))?,
+    )
+    .map_err(|e| format!("--decode: {e}"))?;
+    let ids = |k: &str| -> Vec<u32> {
+        golden[k]
+            .as_array()
+            .map(|a| a.iter().filter_map(|t| t.as_u64()).map(|t| t as u32).collect())
+            .unwrap_or_default()
+    };
+    let (prompt, seq) = (ids("prompt"), ids("tokens"));
+    let ckpt = std::path::PathBuf::from(need("checkpoint")?);
+    let t0 = std::time::Instant::now();
+    let d = poem_compiler::catalog::repository()
+        .parse(&reading.model)
+        .ok_or_else(|| format!("{}: no such deployment", reading.model))?;
+    let source = checkpoint::file::snapshot::open(&ckpt)
+        .map_err(|e| format!("{}: {e}", ckpt.display()))?;
+    let contract = d
+        .contract(&source, poem_ir::Platform::Cerebras)
+        .map_err(|e| format!("the import contract of {}: {e}", reading.model))?;
+    let landed = engine_cerebras::prepare::land(&trace, &contract, &ckpt)?;
+    let of = |name: &str, count: usize| engine_cerebras::prepare::plane(&landed, name, count);
+    let mut weights = engine_cpu::Forward::new(trace.clone(), None, &of)?;
+    let statics = reading.statics(&mut weights, &reading.step(&trace, None, &[]))?;
+    let mut host = engine_cpu::Forward::host_for(trace.clone(), &of, &reading.entry_values())?;
+    println!(
+        "DECODE {} landed and its statics made in {:.0} s",
+        reading.model,
+        t0.elapsed().as_secs_f64()
+    );
+    let platform = match get.get("cmaddr") {
+        Some(c) => Platform::System { cmaddr: c.clone() },
+        None => Platform::Simulator(Simulator {
+            num_threads: 8,
+            ..Simulator::new(Target::Wse3)
+        }),
+    };
+    let sdk = Sdk::open().map_err(|e| e.to_string())?;
+    let mut rt = Runtime::new(sdk, Path::new(&need("program")?), platform, "WARNING")
+        .map_err(|e| e.to_string())?;
+    rt.load();
+    rt.run();
+    reading.write_statics(&mut rt, &statics)?;
+    let steps = get
+        .get("steps")
+        .map_or(Ok(seq.len().saturating_sub(1)), |v| v.parse::<usize>())
+        .map_err(|e| format!("--steps: {e}"))?
+        .min(seq.len().saturating_sub(1));
+    let (mut held, mut checked) = (0, 0);
+    for s in 0..steps {
+        let at = u32::try_from(s).map_err(|e| e.to_string())?;
+        let (_, entries) = reading.decode_step(&mut host, &trace, &seq[s..=s], at)?;
+        reading.write_pos(&mut rt, at)?;
+        let t1 = std::time::Instant::now();
+        let (got, cycles) = reading.launch(&mut rt, &entries)?;
+        let wall_ms = t1.elapsed().as_secs_f64() * 1e3;
+        let back = reading.rows_back(&got)?;
+        let logits = back
+            .iter()
+            .max_by_key(|c| c.width)
+            .ok_or("no logits read back")?;
+        let engine_cpu::forward::Values::F32(v) = &logits.values else {
+            return Err("logits not f32".into());
+        };
+        let (best, top) = v
+            .iter()
+            .enumerate()
+            .fold((0usize, f32::MIN), |b, (i, &x)| if x > b.1 { (i, x) } else { b });
+        let want = seq[s + 1];
+        let past = s + 1 >= prompt.len();
+        if past {
+            checked += 1;
+            held += usize::from(best as u32 == want);
+        }
+        // the golden's top-5 at this step (HF's own logits), for the margin a miss had
+        let gtop = &golden["top5"][s + 1 - prompt.len().min(s + 1)];
+        println!(
+            "DECODE_STEP {}",
+            json!({"step": s, "token": seq[s], "argmax": best, "logit": top, "want": want,
+                "checked": past, "ok": best as u32 == want, "cycles": cycles, "wall_ms": wall_ms,
+                "finite": v.iter().all(|x| x.is_finite()),
+                "golden_top": if past { gtop.clone() } else { Value::Null }})
+        );
+    }
+    rt.stop();
+    println!("DECODE_RESULT {}", json!({"held": held, "checked": checked}));
+    Ok(held == checked)
+}
+
 /// `--reading`: a stream reading's steps on the program, the host's ops the engine's.
 fn reading(get: &HashMap<String, String>) -> Result<bool, String> {
     use engine_cerebras::reading::{Denoise, Reading};
@@ -543,6 +643,9 @@ fn run() -> Result<bool, String> {
             }
             _ => return Err(USAGE.into()),
         }
+    }
+    if get.contains_key("reading") && get.contains_key("decode") {
+        return decode(&get);
     }
     if get.contains_key("reading") {
         return reading(&get);

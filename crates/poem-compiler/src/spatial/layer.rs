@@ -601,7 +601,7 @@ impl Body<'_, '_> {
                 cache,
                 window,
                 ..
-            }) => {
+            }) if !self.r.stream => {
                 let Some(Operation::Attn(Attn::PlanDecode {
                     q_heads,
                     kv_heads,

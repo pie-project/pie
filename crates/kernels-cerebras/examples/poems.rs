@@ -117,7 +117,11 @@ fn main() {
             name,
             "-",
             "TRACE",
-            &format!("nodes={} layers={layers}", trace.nodes.len()),
+            &format!(
+                "nodes={} layers={layers} params={}",
+                trace.nodes.len(),
+                trace.params.len()
+            ),
             t0,
         );
         let decodes =
@@ -128,6 +132,34 @@ fn main() {
             match decode(&trace, &out) {
                 Ok(what) => line(name, "decode", "PASS", &what, t1),
                 Err((stage, e)) => line(name, "decode", &stage, &e, t1),
+            }
+            let _ = std::fs::remove_dir_all(&out);
+        }
+        if std::env::var("UNITS").is_ok() {
+            // the decode step through the units (GENERIC.md G1)
+            let t1 = Instant::now();
+            let out = dir.join("decode_units");
+            let positions = std::env::var("POSITIONS")
+                .ok()
+                .and_then(|r| r.parse().ok())
+                .unwrap_or(4096);
+            match kernels_cerebras::stream::compile_decode(&trace, positions, true, &out) {
+                Ok(p) => line(
+                    name,
+                    "decode.units",
+                    "PASS",
+                    &format!(
+                        "units={} fabric={}x{} py={} kv-columns={} cycles~{:.2}M",
+                        p.units.len(),
+                        p.stream.w,
+                        p.stream.h,
+                        p.stream.py,
+                        p.stream.kv.len(),
+                        kernels_cerebras::cost::stream::time(&p).cycles / 1e6
+                    ),
+                    t1,
+                ),
+                Err(e) => line(name, "decode.units", "UNITS", &e, t1),
             }
             let _ = std::fs::remove_dir_all(&out);
         }

@@ -318,6 +318,9 @@ pub struct Reading {
     /// A grid program's weight groups: a step is a launch a group, each group's arrays written
     /// before it (the stores kept between); 0: one launch.
     pub groups: usize,
+    /// A decode program's K / V PEs (GENERIC.md G1): each told a step's first position (`pos`),
+    /// their caches kept across steps.
+    pub pos: Vec<Rect>,
 }
 
 fn num(v: &Value, k: &str) -> R<u64> {
@@ -471,6 +474,16 @@ impl Reading {
                 <[u32; 3]>::try_from(v).ok()
             }),
             groups: host["groups"].as_u64().unwrap_or(0) as usize,
+            pos: (host["pos"].as_array().into_iter().flatten())
+                .filter_map(|c| {
+                    Some(Rect {
+                        x: c["x"].as_i64()? as i32,
+                        y: c["y"].as_i64()? as i32,
+                        w: 1,
+                        h: 1,
+                    })
+                })
+                .collect(),
         })
     }
 
@@ -507,6 +520,7 @@ impl Reading {
             rd: None,
             clip: None,
             groups: 0,
+            pos: Vec::new(),
         }
     }
 
@@ -582,9 +596,19 @@ impl Reading {
     /// but those the host's own ops read, [`Forward::host_for`]): an entry's from the step's
     /// values, `None` for an array whose words are the file's.
     pub fn entries(&self, host: &mut Forward, step: &StreamStep<'_>) -> R<Vec<Option<Vec<f32>>>> {
+        self.entries_given(host, step, &[])
+    }
+
+    /// [`Reading::entries`] with `given` held (a decode step's positions: its tokens' own).
+    pub fn entries_given(
+        &self,
+        host: &mut Forward,
+        step: &StreamStep<'_>,
+        given: &[Captured],
+    ) -> R<Vec<Option<Vec<f32>>>> {
         let wanted = self.entry_values();
         let held: BTreeMap<u32, (usize, usize, Rc<Vec<f32>>)> = host
-            .stream_values(step, &[], &wanted)?
+            .stream_values(step, given, &wanted)?
             .into_iter()
             .map(|c| {
                 let v = match c.values {
@@ -785,6 +809,61 @@ impl Reading {
 
     /// One step on a loaded program: every array written (an entry's words from `entries`, the
     /// rest from its file), then [`Reading::launch`].
+    /// A decode program's step (GENERIC.md G1): `tokens` (a lane's one each) at positions
+    /// from `at`, the trace's positions given as theirs; the step and its entries.
+    pub fn decode_step(
+        &self,
+        host: &mut Forward,
+        trace: &Trace,
+        tokens: &[u32],
+        at: u32,
+    ) -> R<(StreamStep<'static>, Vec<Option<Vec<f32>>>)> {
+        let step = StreamStep {
+            lanes: self
+                .classes
+                .iter()
+                .map(|c| StreamLane {
+                    word: c.word,
+                    rows: c.rows as usize,
+                    clip: None,
+                })
+                .collect(),
+            inputs: Vec::new(),
+            tokens: tokens.to_vec(),
+        };
+        let given: Vec<Captured> = (trace.values.iter().enumerate())
+            .filter(|(_, d)| matches!(d.def, Def::Input(RuntimeInput::Positions)))
+            .map(|(v, _)| Captured {
+                node: usize::MAX,
+                input: false,
+                value: ValueId(v as u32),
+                rows: tokens.len(),
+                width: 1,
+                values: Values::I32((0..tokens.len()).map(|i| (at as usize + i) as i32).collect()),
+            })
+            .collect();
+        let entries = self.entries_given(host, &step, &given)?;
+        Ok((step, entries))
+    }
+
+    /// The K / V PEs told a decode step's first position ([`Reading::pos`]).
+    pub fn write_pos(&self, rt: &mut dyn Fabric, at: u32) -> R<()> {
+        for r in &self.pos {
+            let a = Array {
+                sym: "pos".into(),
+                rect: *r,
+                len: 1,
+                u16: false,
+                file: None,
+                entry: None,
+                statics: None,
+                group: None,
+            };
+            rt.write(&a, &[at])?;
+        }
+        Ok(())
+    }
+
     pub fn fire(
         &self,
         rt: &mut Runtime,
