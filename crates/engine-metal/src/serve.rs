@@ -1523,7 +1523,7 @@ impl PreparedLoad<'_> {
             false => None,
         };
         let weighed = weighed.and_then(|(counts, rungs, live)| {
-            engine::load::estimate(&counts, &chip.tuned().rates).map(|estimate| {
+            engine::load::estimate(&counts, &chip.tuned().rates).ok().map(|estimate| {
                 crate::top::Weighed {
                     rungs,
                     estimate,

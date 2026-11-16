@@ -5,18 +5,24 @@ api = 1
 device = "Apple M5 Pro"
 assumes = { cores = 20 }
 
-# What pie's Metal kernels reach here (M5 Pro, 20-core GPU, macOS 27; median
-# of 5 timed by the GPU after a warm run, `the_device_rates`; the middle of
-# three runs, which agreed within 0.5%).
+# What pie's Metal kernels reach here (M5 Pro, 20-core GPU, macOS 27), as
+# `pie tune metal --rates` measured them at engine::rates' lattice; two runs
+# agreed within 1.8% (the launch within 0.2% once the process was warm).
 [rates]
-# A 4096^3 bf16 GEMM through the dense kernel serving dispatches (Apple10's
-# tensor-op (mpp) form): 28.57 TFLOPS.
-bf16_flops_per_ns_by_rows = [[4096, 28570.0]]
+# A bf16 matmul m x 4096 x 4096 through the dense kernel serving dispatches
+# (Apple10's tensor-op (mpp) form at 8 rows and up), at m = 16..8192: 3.01
+# TFLOPS at 16, 19.27 at 128, 28.88 at 512, 30.11 at 2048.
+bf16_flops_per_ns_by_rows = [[16, 3007.8333626734216], [32, 6019.4997400129905], [64, 10020.528407523383], [128, 19265.412647035384], [256, 24509.601719205577], [512, 28879.499458721733], [1024, 29818.672108414266], [2048, 30105.64367156648], [4096, 28487.893819210316], [8192, 28395.82610304688]]
+# A causal prefill, 2048 rows over 2048 keys, 16 query and 8 kv heads of
+# 128, counted over the full rectangle: 18.48 TFLOPS.
+attn_flops_per_ns = 18484.53420727922
+# A gated-delta chunked scan and its width-4 conv, 2048 tokens, 16 heads of
+# 128 x 128: 302.7 state elements a ns.
+scan_elements_per_ns = 302.73608492993526
 # A 256 MiB blit between two buffers, read and write counted: 275 GB/s.
-bytes_per_ns = 275.1
-# A dispatch's launch, back to back in one serial pass (512 of the smallest
-# GEMM in one frame).
-launch_ns = 1856
+bytes_per_ns = 274.8251401153083
+# A dispatch's launch, the smallest matmul back to back in one frame.
+launch_ns = 1821
 
 [provenance]
-rates = "the_device_rates test on a 20-core M5 Pro on 2026-11-15, through the dense kernel serving dispatches"
+rates = "pie tune metal --rates on 2026-11-16 (pie 0.6.0): each kernel through the dispatch serving runs, back to back in 20 ms frames timed by the GPU, the matmul over 8 distinct weights; at engine::rates' lattice (matmul m x 4096 x 4096, m 16..8192; attention 2048x2048 keys, 16/8 heads of 128; scan 2048 tokens, 16/16 heads of 128x128, conv 4)"
