@@ -1284,8 +1284,7 @@ impl Shell {
         );
         // A routed bank on the host that no table of the weight cache reads
         // is staged by its fire: the most experts one fire routes to, laid
-        // here with the staged inputs. ROCm stages its own (`dispatch::hip`).
-        #[cfg(not(feature = "rocm"))]
+        // here with the staged inputs.
         let expert_staging = crate::experts::staging::Staging::bound(
             &crate::experts::staging::Staging::selects(
                 &boot.trace,
@@ -1295,8 +1294,6 @@ impl Shell {
             )?,
             budgets.tokens.max_tokens,
         );
-        #[cfg(feature = "rocm")]
-        let expert_staging = crate::experts::staging::Staging::default();
         if expert_staging.bytes() > 0 {
             expert_staging.fits(pools.spare_bytes()?)?;
         }
