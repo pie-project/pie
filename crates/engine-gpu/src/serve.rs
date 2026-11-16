@@ -70,9 +70,6 @@ pub trait Serve: Backend {
     /// The fusions the backend implements.
     const FUSIONS: &'static [poem_compiler::fuse::Rule];
 
-    /// What the backend's kernels compile to.
-    const TARGET: kernels_slang::Target;
-
     /// Whether a step's frames are recorded to replay: a recorded fire binds
     /// buffers that stand across fires, so the rows a gather of its token ids
     /// reads are prestaged in the arm's ring rather than handed from the host.

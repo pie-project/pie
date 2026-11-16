@@ -60,8 +60,6 @@ impl Serve for Api {
 
     const RECORDS: bool = true;
 
-    const TARGET: kernels_slang::Target = kernels_slang::Target::Spirv;
-
     /// A pass keeps the cells only the device reads in `Channel` slots
     /// (`guest::session::Kept`).
     const CHANNEL_CELLS: bool = true;

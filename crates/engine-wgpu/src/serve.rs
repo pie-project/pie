@@ -38,8 +38,6 @@ impl Serve for Api {
 
     const RECORDS: bool = false;
 
-    const TARGET: kernels_slang::Target = kernels_slang::Target::Wgsl;
-
     /// Every cell of a guest's rings lies on the host: a pass reads its
     /// takes from there and lands its puts there.
     const CHANNEL_CELLS: bool = false;
