@@ -280,8 +280,8 @@ impl Plane {
     }
 
     /// The most lanes one fire flies, the frames in flight and the
-    /// readout rows a lane may take in one fire: what the tables a binding
-    /// opens are laid for.
+    /// readout rows one fire may take (any one lane may take them all):
+    /// what the tables a binding opens are laid for.
     pub fn set_flight(&mut self, lanes: u32, arms: usize, rows: u32) {
         self.lanes = lanes.max(1);
         self.arms = arms.max(1);
