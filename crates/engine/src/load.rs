@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::caps::Capabilities;
 
+pub mod armed;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Budgets {
     pub max_lanes: u32,
