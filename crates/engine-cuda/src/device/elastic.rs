@@ -90,6 +90,17 @@ fn align_up(value: u64, alignment: u64) -> u64 {
     value.div_ceil(alignment) * alignment
 }
 
+/// Every map of physical memory into a range this process has made
+/// ([`maps`]).
+static MAPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many times this process has mapped physical memory into a range:
+/// a pool's segments, its held spans, a flat range's one allocation.
+#[must_use]
+pub fn maps() -> u64 {
+    MAPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[derive(Debug)]
 pub struct PhysicalPool {
     #[cfg_attr(not(feature = "device"), allow(dead_code))]
@@ -660,6 +671,7 @@ impl Arena {
         Ok(())
     }
     fn map(&self, pool: &PhysicalPool, at: u64, handle: u64) -> Result<()> {
+        MAPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         #[cfg(feature = "device")]
         {
             use crate::device::dr;
@@ -1288,6 +1300,7 @@ pub fn shared(device: i32, readers: &[i32], bytes: u64) -> Result<u64> {
             "cuMemAddressReserve",
             dr::cuMemAddressReserve(&raw mut base, bytes, granularity as usize, 0, 0),
         )?;
+        MAPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         said("cuMemMap", dr::cuMemMap(base, bytes, 0, handle, 0))?;
         said(
             "cuMemSetAccess",

@@ -133,8 +133,9 @@ fn reader() -> TraceContainer {
 /// No load backs a score plane, and nothing backs the span after the load:
 /// the span the arena states is what it backed, a program reading
 /// `attn.scores` states its planes a row of the fire (`FireFacts::a_row`,
-/// `HEADS × KV_MAX` f32 a layer), and neither its bind nor a fire that
-/// captures the scores it reads asks the span backed again.
+/// `HEADS × KV_MAX` f32 a layer), and neither its register, its bind nor a
+/// fire that captures the scores it reads maps anything: its programs and
+/// its planes lie in the span.
 #[test]
 fn a_score_reader_states_its_planes_and_nothing_backs_them() {
     if !engine_cuda::device::present() {
@@ -175,6 +176,14 @@ fn a_score_reader_states_its_planes_and_nothing_backs_them() {
         )
         .expect("the prompt prefills");
 
+    // What the runtime would have committed before a bind: the first
+    // segment. From here on nothing maps: not the register, the bind, nor
+    // the scored fire.
+    let segments = facts.segments.committed.max(1);
+    shell
+        .commit_segments(segments)
+        .expect("the first segment commits");
+    let maps = engine_cuda::device::elastic::maps();
     let decls = crate::bound::loaded_decls_of(&shell.classes());
     let bound = eta_ir::validate::bind(reader(), vec![decls], crate::bound::caps())
         .expect("the reader binds");
@@ -207,10 +216,6 @@ fn a_score_reader_states_its_planes_and_nothing_backs_them() {
         "its planes a row of the fire: one layer's, f32"
     );
 
-    let segments = facts.segments.committed.max(1);
-    shell
-        .commit_segments(segments)
-        .expect("the first segment commits");
     let slots = crate::guest::Guest::of(&facts, segments * facts.segment_chunks).slots(
         &shell.program_facts(program).expect("the program's facts"),
         |_| false,
@@ -235,6 +240,11 @@ fn a_score_reader_states_its_planes_and_nothing_backs_them() {
         shell.activation_span().2,
         holds,
         "a reader's bind backs nothing of the span"
+    );
+    assert_eq!(
+        engine_cuda::device::elastic::maps(),
+        maps,
+        "a reader's register and bind map nothing"
     );
 
     let token = [prompt[0]];
@@ -272,6 +282,11 @@ fn a_score_reader_states_its_planes_and_nothing_backs_them() {
         shell.activation_span().2,
         holds,
         "a scored fire backs nothing of the span"
+    );
+    assert_eq!(
+        engine_cuda::device::elastic::maps(),
+        maps,
+        "a scored fire maps nothing"
     );
     fired.expect("a one-token fire's planes fit under its carve");
 }

@@ -196,25 +196,6 @@ impl Chunks {
         self.range.base() + u64::from(self.under_state().0) * self.layout.chunk_bytes
     }
 
-    /// Backs the last `bytes` under the state's end, and keeps them
-    /// backed: where a fire lays its guests' programs once the activation's
-    /// own span has no room under its carve. No further down than the
-    /// state's last chunks lie in one run ([`Chunks::state_fitted`]).
-    pub fn hold_under_state(&mut self, pool: &mut PhysicalPool, bytes: u64) -> Result<Commit> {
-        let (end, run) = self.under_state();
-        let end = u64::from(end) * self.layout.chunk_bytes;
-        let run = u64::from(run) * self.layout.chunk_bytes;
-        if self.skip.0 < self.stated() && bytes > run {
-            return Err(Fault::Ceiling {
-                what: "bytes of the state pool in one run under the activation's span",
-                need: bytes,
-                have: run,
-            });
-        }
-        let bytes = bytes.min(run);
-        self.range.hold(pool, end - bytes, bytes, false)
-    }
-
     /// Where a fire's activation starts: the range's end less its chunks.
     #[must_use]
     pub fn activation_base(&self) -> u64 {
