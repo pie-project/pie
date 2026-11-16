@@ -111,7 +111,13 @@ struct TableAt {
 pub struct Handles {
     pub tokens: Tensor,
 
+    /// Each row's cache row: attention's causal bound (and its window's).
     pub positions: Tensor,
+
+    /// Each row's stated position, what `RuntimeInput::Positions` reads:
+    /// the rotation. With mrope the rotation rides its own table and this
+    /// holds the cache row.
+    pub rotations: Tensor,
 
     pub readout_rows: Tensor,
 
@@ -184,6 +190,8 @@ pub struct Fire<'a> {
 
     pub positions: &'a [i32],
 
+    pub rotations: &'a [i32],
+
     pub readout_rows: &'a [i32],
 
     pub windows: &'a [i32],
@@ -230,6 +238,7 @@ pub struct Inputs<B: Backend> {
     store: B::Buffer,
     tokens: u64,
     positions: u64,
+    rotations: u64,
     readout_rows: u64,
     windows: u64,
     window_ints: u64,
@@ -295,7 +304,7 @@ impl<B: Backend> Inputs<B> {
         // A lane's table holds as many pages as its narrowest list takes.
         let pages = u64::from(budget.max_lanes) * u64::from(paging.pages_per_slot.max(table_pages));
 
-        let per_gathered = 3 * rows + page_tables as u64 * (2 * lanes + (lanes + 1) + pages);
+        let per_gathered = 4 * rows + page_tables as u64 * (2 * lanes + (lanes + 1) + pages);
         let window_ints =
             (classes * (classes + 1) / 2 + 1) as u64 * (lanes + 1) + gathered as u64 * per_gathered;
 
@@ -307,6 +316,7 @@ impl<B: Backend> Inputs<B> {
         };
         let tokens = take(rows * 4);
         let positions = take(rows * 4);
+        let rotations = take(rows * 4);
         let readout_rows = take(rows * 4);
         let windows = take(window_ints * 4);
         let row_valid = take(rows);
@@ -385,6 +395,7 @@ impl<B: Backend> Inputs<B> {
             store,
             tokens,
             positions,
+            rotations,
             readout_rows,
             windows,
             window_ints,
@@ -533,6 +544,7 @@ impl<B: Backend> Inputs<B> {
 
         self.store.write(self.tokens, bytes_of(fire.tokens))?;
         self.store.write(self.positions, bytes_of(fire.positions))?;
+        self.store.write(self.rotations, bytes_of(fire.rotations))?;
         if fire.readout_rows.len() > rows as usize {
             return Err(Fault::Ceiling {
                 what: "readout rows in one fire",
@@ -903,6 +915,7 @@ impl<B: Backend> Inputs<B> {
         Ok(Handles {
             tokens: i32s(handles, &self.store, self.tokens, rows)?,
             positions: i32s(handles, &self.store, self.positions, rows)?,
+            rotations: i32s(handles, &self.store, self.rotations, rows)?,
             readout_rows: i32s(
                 handles,
                 &self.store,

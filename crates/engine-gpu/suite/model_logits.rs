@@ -985,6 +985,62 @@ fn a_masked_fire_after_a_partial_fold_admits_the_committed_keys() {
     );
 }
 
+/// A row's causal bound is its row order, the cache row; a stated position
+/// rotates the row and bounds nothing. A lane's four rows land at slots
+/// 0..4 and all state position 0: the last row still reads the three before
+/// it, so two lanes whose middle tokens differ answer differently (bounded
+/// by the stated position, the last row read slot 0 alone and the two
+/// answered the same). The rotation follows the stated position: stating
+/// 0 everywhere answers otherwise than stating nothing, and stating the
+/// slots answers the same, bit for bit.
+#[test]
+fn a_stated_position_rotates_and_bounds_no_key() {
+    let fixture = fixture("qwen3-micro-text", None);
+    let Some(mut shell) = load(&fixture, CONTEXT) else {
+        return;
+    };
+    let mut last = |slot: u32, tokens: &[u32], positions: &[u32]| {
+        let seated = Seated {
+            held: Some(0),
+            positions,
+            ..Seated::of(Lane {
+                slot,
+                word: word(&fixture.trace, tokens.len() as u32),
+                tokens,
+            })
+        };
+        shell
+            .fire_seated(&[seated])
+            .expect("the fire lands")
+            .remove(0)
+    };
+    let zeros = [0u32; 4];
+    let one = last(0, &[11, 48, 85, 122], &zeros);
+    let two = last(1, &[11, 200, 7, 122], &zeros);
+    let apart = |a: &[f32], b: &[f32]| {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max)
+    };
+    assert!(
+        apart(&one, &two) > 1e-3,
+        "the last row's logits are the same whatever the rows before it say: its \
+         attention was bounded by its stated position, not its cache row"
+    );
+    let unstated = last(0, &[11, 48, 85, 122], &[]);
+    let slots = last(0, &[11, 48, 85, 122], &[0, 1, 2, 3]);
+    same(
+        "positions stated as the slots",
+        &[slots],
+        &[unstated.clone()],
+    );
+    assert!(
+        apart(&one, &unstated) > 1e-3,
+        "stating position 0 everywhere rotated the rows as their slots"
+    );
+}
+
 /// Panics at the first row whose logits differ in a bit.
 pub fn same(what: &str, got: &[Vec<f32>], want: &[Vec<f32>]) {
     assert_eq!(got.len(), want.len(), "{what}: rows");
