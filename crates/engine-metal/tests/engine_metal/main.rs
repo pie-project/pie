@@ -61,6 +61,7 @@ mod the_register_routed_mlp_answers_the_per_route_path;
 mod the_register_rows_match_affine_dots;
 mod the_rotated_packed_kv_serves;
 mod the_rs_scratch_is_the_widest_layers;
+mod the_score_rows_are_the_oracles;
 mod the_selector_reads_out_the_reference_walk;
 mod the_staged_rows_match_affine_dots;
 mod the_tower_reads_pixels_as_the_host_cut_them;

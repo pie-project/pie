@@ -311,6 +311,8 @@ pub struct Shell {
     /// Where a capturing lane's score rows lie ([`CaptureLayout`]), when the
     /// trace reads scores out.
     capture: Option<CaptureLayout>,
+    /// The last staged fire's capturing lanes' rows ([`Shell::score_rows`]).
+    last_capture: CaptureRows,
     arms: Arms,
     airborne: Airborne,
     inflight: VecDeque<Flight>,
@@ -1010,7 +1012,7 @@ impl PreparedLoad<'_> {
         };
 
         let outputs =
-            poem_exec::feeds::class_outputs(&boot.trace, &compiled, boot.context, boot.page_size).map_err(Fault::Recipe)?;
+            poem_exec::feeds::class_outputs(&boot.trace, &compiled, boot.context, page_size).map_err(Fault::Recipe)?;
         let grid_chains = outputs
             .iter()
             .map(|out| out.grid.and_then(&grid_chain))
@@ -1403,6 +1405,7 @@ impl PreparedLoad<'_> {
             readout,
             readout_row_bytes,
             capture,
+            last_capture: CaptureRows::default(),
             outputs,
             grid_chains,
             arms: Arms::of(arms),
@@ -4821,6 +4824,7 @@ impl Shell {
         // any program stage takes its scratch there.
         let mut guest = self.guest_carve();
         let (capture_seat, capture_rows) = self.lay_capture(&composition, &mut guest, arm)?;
+        self.last_capture = capture_rows.clone();
         let bindings = FireBindings {
             tokens: bound.tokens,
             positions: bound.positions,
@@ -4999,6 +5003,43 @@ impl Shell {
             page_size: layout.page_size,
         };
         Ok((Some(seat), CaptureRows(rows)))
+    }
+
+    /// The last fire's capturing lanes' rows, read back where it laid them:
+    /// each one's source lane, key row and page row (none where no lane of
+    /// it captured). A later fire may lay its own over them.
+    pub fn score_rows(&mut self) -> Result<Vec<(u32, Vec<f32>, Vec<f32>)>> {
+        self.drain()?;
+        let Some(layout) = self.capture.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let read = |at: u64, floats: u32| -> Result<Vec<f32>> {
+            let bytes = u64::from(floats) * 4;
+            let mut out = vec![0u8; bytes as usize];
+            for (into, len, ptr) in span_host(&self.pools, at, bytes)? {
+                // SAFETY: the span is mapped under the run `span_host`
+                // names, and no frame writes it: every frame drained above.
+                #[allow(unsafe_code)]
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        ptr.as_ptr(),
+                        out.as_mut_ptr().add(into as usize),
+                        len as usize,
+                    );
+                }
+            }
+            Ok(out
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect())
+        };
+        self.last_capture
+            .0
+            .iter()
+            .map(|&(source, keys_at, pages_at)| {
+                Ok((source, read(keys_at, layout.keys)?, read(pages_at, layout.pages)?))
+            })
+            .collect()
     }
 
     fn feed_inputs(&self, frame: &mut Frame, p: &Prepared<'_>) -> Result<()> {
