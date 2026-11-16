@@ -1,11 +1,13 @@
 // wafer/ops/sst.csl: P8 (GENERIC.md §3.1, G1), a state PE's side of a gated linear recurrence a
-// head (the root's side: ops/cy_sst.csl), one step a row. A column of these PEs holds a head's
+// head (a root's side: ops/cy_sst.csl), one step a row. A column of these PEs holds a head's
 // state S (DK x DV, f32): row r of the column keeps state rows i = r (mod PYA) as rows i / PYA.
 //
-// step(): the root's multicast [k | q] (2 DK f32); the PE's partial [Sᵀk | Sᵀq] of its rows (the
-// state before the step) up the column chain; then the root's multicast [delta | decay]
-// (DV + 1): each row it keeps S_i = decay S_i + k_i delta (the delta rule's rank-one update; a
-// recurrence with no delta rule sends delta its own increment).
+// step(): the root's multicast [k~ | q~ | k] (3 DK f32: the key and the query each times its
+// row's decay, and the key); the PE's partials [Σ k~_i S_i | Σ q~_i S_i] of its rows (the state
+// before the step) up the column chain; then the root's multicast [delta | decay] (DV + DK):
+// each row it keeps S_i = decay_i S_i + k_i delta. One form for every recurrence of this shape:
+// a decay a head (Gated DeltaNet's, Mamba-2's: the vector constant) or one a key (KDA's), a delta
+// rule's delta or a plain increment (Mamba-2's dt x).
 //
 // Params: fab (ops/fabric.csl), red (the column chain: ops/schain.csl), YM (the root's multicast
 // input queue), DK / DV (the head's key / value dims), PYA (the column's PEs).
@@ -18,13 +20,13 @@ param PYA: u16;
 
 const NR: u16 = (DK + PYA - 1) / PYA;
 var st = @zeros([NR * DV]f32);
-var kq = @zeros([2 * DK]f32);
-var dd: [DV + 1]f32 align(16) = @zeros([DV + 1]f32);
+var kq = @zeros([3 * DK]f32);
+var dd: [DV + DK]f32 align(16) = @zeros([DV + DK]f32);
 var acc: [2 * DV]f32 align(16) = @zeros([2 * DV]f32);
 var myrow: u16 = 0;
 const st_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DV} -> st[i] });
-const kq_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2 * DK} -> kq[i] });
-const dd_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DV + 1} -> dd[i] });
+const kq_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{3 * DK} -> kq[i] });
+const dd_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DV + DK} -> dd[i] });
 const acc_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2 * DV} -> acc[i] });
 
 // A sequence's first step: the state cleared, the PE's row in the column.
@@ -35,7 +37,7 @@ fn init(row: u16) void {
 }
 
 fn step() void {
-  @fmovs(kq_d, fab.fin(YM, 2 * DK));
+  @fmovs(kq_d, fab.fin(YM, 3 * DK));
   @fmovs(acc_d, @as(f32, 0.0));
   const sk = @set_dsd_length(acc_d, DV);
   const sq = @increment_dsd_offset(sk, @as(i16, DV), f32);
@@ -49,16 +51,15 @@ fn step() void {
     }
   }
   red.send(acc_d, 2 * DV);
-  @fmovs(dd_d, fab.fin(YM, DV + 1));
-  const decay = dd[DV];
+  @fmovs(dd_d, fab.fin(YM, DV + DK));
   const delta = @set_dsd_length(dd_d, DV);
   r = 0;
   while (r < NR) : (r += 1) {
     const i = r * PYA + myrow;
     if (i < DK) {
       const row = @increment_dsd_offset(st_d, @as(i16, r * DV), f32);
-      @fmuls(row, row, decay);
-      @fmacs(row, row, delta, kq[i]);
+      @fmuls(row, row, dd[DV + i]);
+      @fmacs(row, row, delta, kq[2 * DK + i]);
     }
   }
 }
