@@ -142,6 +142,7 @@ seeded!(
     "apple9.toml",
     "apple9/apple-m4-pro.toml",
     "apple10.toml",
+    "apple10/apple-m5-pro.toml",
 );
 
 pub static SHELF: Shelf = Shelf {

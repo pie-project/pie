@@ -1,0 +1,19 @@
+api = 1
+
+# The 20-core M5 Pro.
+[target]
+device = "Apple M5 Pro"
+assumes = { cores = 20 }
+
+# What pie's Metal kernels reach here (M5 Pro, 20-core GPU, macOS 27; median
+# of 5 timed by the GPU after a warm run, `the_device_rates`; the middle of
+# three runs, which agreed within 0.5%).
+[rates]
+# A 4096^3 bf16 GEMM through the dense kernel serving dispatches (Apple10's
+# tensor-op (mpp) form): 28.57 TFLOPS.
+bf16_flops_per_ns = 28570.0
+# A 256 MiB blit between two buffers, read and write counted: 275 GB/s.
+bytes_per_ns = 275.1
+# A dispatch's launch, back to back in one serial pass (512 of the smallest
+# GEMM in one frame).
+launch_ns = 1856
