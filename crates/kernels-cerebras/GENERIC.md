@@ -11,7 +11,9 @@ by the grid regime; the readings co-resident; `pie run text-to-media` fully on t
 48.3 dB from diffusers, §4.1), M2c (klein's text reading at 512 tokens links: grouped-query
 attention and three taps on the row stream, a GQA miniature on the simulator; grid programs
 priced, the VAE's passes in weight groups; klein end to end 51.8 s predicted, the VAE decode
-its bottleneck, §4.1) and M3 (the decode
+its bottleneck, §4.1), M2d (the tiled regime: a VAE's image over the fabric; flux2-mini's decode on
+the simulator in 0.9M cycles, 81x fewer, 50.1 dB from diffusers; klein's 1024² decode links,
+0.13 s priced; klein end to end 6.5 s, §4.1) and M3 (the decode
 layouts as points of the Floorplan, §2.5). ARCHITECTURE.md is what runs for decode.
 
 **Goal.** A `.poem` model the compiler has not seen runs on the wafer with no hand code. The
@@ -1368,6 +1370,176 @@ milestone's tail.
     - The text reading at real size on the simulator (only the miniature's ran); the head
       roots' rotation tables a row at every head root (the same angles for its 5 heads; 3.3k
       cycles a head) are the text's cost.
+
+- **M2d** (the tiled regime: a grid reading's image spread over the fabric; klein's VAE decode at
+  1024² builds and links, priced at 0.13 s).
+  - **Why.** The rows regime (M1i) sweeps a clip's rows through one unit, a row at a time, so
+    a pass costs its rows times a row's fixed cost (~3k cycles): klein's 1024² decode is 1M-row
+    passes, 45.5 s. A convolution is a GEMM of pixels x (9 · c_in) x c_out: what the wafer wants
+    is the pixels over its PEs, each multiplying its own pixels by weights that pass by.
+  - **The regime** (kernels-cerebras `stream::tiled`, `emit::tiled`, `cost::tiled`; `wafer-compile
+    stream --reading vae.decode --regime tiled [--tile h,w] [--price --parts]`). The reading is
+    lowered off its trace (the rows regime's prelude: its class, the host's nodes, the grids) into
+    **ops over the whole image**, bulk-synchronous (an op finishes everywhere before the next reads
+    its output): a convolution (3 x 3 or 1 x 1 "same" at stride 1; a `linear.matmul` the same op
+    with one tap; its bias its own), a group norm, a printed region (every other elementwise run,
+    `fuse::chain::lower_run`, printed by `emit::region` at a chunk of 8 columns of a pixel), an
+    upsampling and a pixel shuffle (an axis at a time: a move, the shuffle's half each child's
+    every other channel), the attention. No op is named: each lowers by its family; what has no
+    lowering (a stride-2 convolution, an unshuffle on the wafer) is refused by name. Values live
+    where they are made, f32 (rounded to 16 bits where the trace types them so), each a slot of
+    a PE's arena shared by lifetime (first fit over the ops' intervals).
+  - **Data layout per resolution.** One **image array** of `gx x gy` PEs (powers of two). At an
+    `h x w` resolution each axis on its own: `h >= gy` gives each PE a tile of `th = h / gy`
+    rows; `h < gy` a **stride** `sy = gy / h` (the PEs of rows `0, sy, 2sy, ..` hold a pixel row
+    each; the rest pass halos and moves through). Strides nest, so an upsampling by two is local
+    (a tile doubles) or a move of `sy / 2` PEs, and a 3 x 3 halo is the next busy PE's border,
+    `sy` PEs off. Every PE holds all its pixels' channels (no channel split: below). The search
+    (`tiled::program`) prices every power-of-two top tile whose array, memory and fabric fit
+    (`Bounds::system()`: 755 x 1170) and keeps the cheapest. klein at 1024² (latent 128²): the
+    top tile 1 x 2, **gx x gy = 512 x 1024** (the fabric is taller than wide):
+
+    | resolution | channels | th x tw | stride (sy, sx) | busy PEs | a PE's pixels |
+    |---|---|---|---|---|---|
+    | 64² (the latent's standardisation, the host's unshuffle) | 128 | 1 x 1 | 16, 8 | 4k | 1 |
+    | 128² (conv_in, mid block, up 0) | 512 | 1 x 1 | 8, 4 | 16k | 1 |
+    | 256² (up 1) | 512 | 1 x 1 | 4, 2 | 65k | 1 |
+    | 512² (up 2) | 512 -> 256 | 1 x 1 | 2, 1 | 262k | 1 |
+    | 1024² (up 3, conv_out) | 256 -> 128 -> 3 | 1 x 2 | 1, 1 | 524k | 2 |
+
+  - **The weights pass by.** The VAE is small (klein's decoder: 49.5M weights, 99 MB), so they
+    are not resident where they are used: they stream once a launch from a **tape** (PEs below
+    the array, each holding 10,000 words of the reading's records in op order: `statics` spans
+    over the checkpoint, two 16-bit weights a word, the new span flag `PACK`; klein 2,483 PEs,
+    the mini 12), up a **spine** column and east along every row (a multicast tree: every PE sees
+    every word, in lockstep with the slowest). A tape PE sends its words, then forwards those of
+    the PEs past it. A convolution stages its input 16-bit a chunk of up to 128 channels at a
+    time (with its halo), then receives each tap's weights a block of `kb` input rows x `c_out`
+    (512 words) and runs `ops/mv.csl`'s `mac32` per pixel (the block the tile, the pixel's `kb`
+    staged inputs its x), f32 accumulation in the output's slot; a bias, a norm's gamma and beta,
+    a region's resident are f32 records on the same tape.
+  - **Halos.** E / W first along busy rows, then N / S whole halo rows (the corners ride along),
+    two 16-bit values a wavelet. An exchange is paired by parity (blocks of parity 0 send while
+    those of parity 1 receive, then the reverse), so every send is synchronous and no PE waits
+    on one that waits on it; a PE between two busy ones forwards (`mov32` fabric to fabric).
+    Zeros past the image's edge (the padding).
+  - **Group norm**: two **all-reduces** of `G` sums (the means, then the centred squares), each
+    along every row east (`fadds` from the fabric into the fabric), down the last column, from
+    the corner to a **hub** PE east of it, which sends it back over a broadcast tree (west along
+    the rows from the last column). Then the gammas and betas off the tape, a channel's scale and
+    shift, the apply (and SiLU) a printed region.
+  - **Attention** (`attn.voxel` at the lowest resolution): every key's [k | v] (16-bit, packed)
+    goes east along its row, down the last column to the hub and back over the broadcast tree, in
+    one order every PE follows (a PE forwards the blocks passing through it, then takes the
+    block off the broadcast: no PE waits on a block another holds back); each PE runs its
+    queries over every key as it passes (an online softmax, f32: a running max and sum a query).
+  - **Routing / colours** (12 of 21; a pattern of the array laid by comptime loops in
+    `layout.csl`, not Floorplan links):
+
+    | class | colours | routes |
+    |---|---|---|
+    | shifts E / W / S / N | 2 each (8) | a PE sends on its parity's (`x`, `y` for S / N), receives its neighbour's on the other |
+    | weight tree | 1 | tape 0 → the spine (column 0, north) → every row east, to every PE's ramp |
+    | broadcast | 1 | the hub → the corner → up the last column → west along every row |
+    | tape | 2 | tape PE `k` sends on `parity(k)` to `k - 1` |
+
+    An image PE's code depends on its parities alone (4 images); its place is two config words.
+    klein: 212 ELFs.
+  - **Memory a PE at klein 1024²** (the linked ELF): code 20.1 KB, the program's tables 3.6 KB
+    (100 ops; a layout an index into a table of 9), data 19.6 KB: the arena 3,200 f32 words
+    (12.8 KB; its peak at the 128² resnets' norms: three 512-wide values and the norm's scratch,
+    and at the mid block's attention: the residual, q, k, v, o and a key's buffer), the staging
+    buffer 1,536 16-bit words (3 x 3 x 128 channels + halo, 3 KB), the weight block 512 words
+    (2 KB), the printed regions' chunk buffers (6 modules), the host's latent; with the task table
+    **44.2 KB of the 48**.
+  - **Cycles from first principles** (the per-op roofline; `cost::tiled`). Every PE in lockstep
+    with the tape, an op costs its busiest PE's work plus what passes every PE. A convolution:
+    its blocks' words received (two weights a wavelet) then multiplied (0.55 an element, `P`
+    pixels a PE), not overlapped (a synchronous receive): `≈ W · (0.5 + 0.55 P)` cycles for `W`
+    weights, plus its staging and halos. klein: 128² 24.7M weights at `P = 1`, 256² 16.5M, 512²
+    6.6M, 1024² 1.65M at `P = 2`. The attention: 16k keys past every PE, each about 3.3k cycles
+    (forwarded, received, widened; a query's product, halving sum and exponents).
+
+    | klein 1024² (priced) | cycles |
+    |---|---|
+    | convolutions (40: the 3 x 3 ones, the shortcuts, the attention's four projections) | 57.2M |
+    | attention (128², 16k keys of 512) | 54.4M |
+    | group norms (30), regions, moves | 1.1M |
+    | **the decode** | **112.7M, 0.129 s** (rows regime: 45.5 s, unplaced) |
+
+    By resolution: 128² 82.9M (the mid block's attention and the 512-channel resnets), 256²
+    19.0M, 512² 7.7M, 1024² 3.1M.
+  - **On the simulator** (engine-cerebras `flux_2_minis_vae_on_the_fabric` with
+    `READING_REGIME=tiled READING_TILE=2,2`: the pipeline's 8 x 8 latent, 64 x 64 pixels, a
+    32 x 32 array (the 8² stage at a stride of 4, 64² two by two a PE), 34 x 33 PEs, 12 tape
+    PEs; the static arrays from the checkpoint, the entries from the engine, as M1i):
+
+    | flux2-mini's decode | vs engine-cpu (rel L2 / cosine, PSNR) | vs diffusers | cycles | simulator |
+    |---|---|---|---|---|
+    | rows regime (M1i) | 1.03e-2 / 0.99994750, 51.0 dB | 1.16e-2, 49.8 dB | 73.5M | 2.4 h |
+    | **tiled** | **9.99e-3 / 0.99995013, 51.2 dB** | **1.13e-2 / 0.99993657, 50.1 dB** | **0.905M** | 12.9 min |
+
+    - Every prefix (`READING_PASSES=N`: the first N ops, the last one's value read out) against
+      the program on the host (`tiled::emulate`): bit for bit to 7 ops (the latent in, its
+      standardisation, the shuffle's two moves, a 1 x 1 and a strided 3 x 3 convolution, a norm
+      through the hub); after the attention (19 ops) 3.7e-4 (its f32 softmax against the
+      emulator's f64), 2.5e-3 at 27, 3.8e-3 at 36 (the norms after it amplifying it, as in M1i).
+    - On the host (`flux_2_minis_tiled_vae_program_is_the_reference`): the program vs engine-cpu
+      6.5e-4, 75.3 dB; vs diffusers 50.4 dB (engine-cpu's own: 50.4).
+      `flux_2_minis_tiled_vae_reading_serves_on_the_host_fabric`: its host side (the latent on
+      its layout's busy rows, the pixels read back a rectangle at a time) bit for bit.
+    - Two simulator lessons: a `mov32` forward of `mov16` sends hangs the PE (halos and keys go
+      two 16-bit values a wavelet since); a fabric DSD of 32,768 wavelets stalls (the tape and
+      the hub forward 16,384 at a time).
+  - **The cost model against the simulator.** The mini's prefixes (2, 4, 7, 19, 27, 36, 78 ops:
+    31k to 905k cycles) fit the priced terms plus a fixed 5.1k cycles an op (`cost::tiled::OP`:
+    the array's lockstep between ops; conv 5.1k, norm 5.1k, region 6.0k, move 4.3k fitted apart)
+    and a launch's 17k, within 3% at 19 ops and more. The mini's ops are small (32 channels), so
+    the fit checks the fixed terms; klein's are its words and MACs (0.55 an element and a wavelet a
+    cycle, the stream regime's measured rates), the tree's and the tape's throughput at klein's
+    size not measured.
+  - **klein-4B's VAE decode at 1024²** (latent 128², the search's array 512 x 1024): compiles in
+    2 s (89 MB: `layout.csl` 0.97 MB of loops, the tape's spans), **links for the system fabric**
+    (`cslc --fabric-dims=762,1172`): 514 x 1029 PEs, 212 ELFs, 226 s, 9 GB of memory at its peak,
+    500 MB of ELFs, rc 0 (the rows regime's did not place). **113.2M cycles, 0.129 s** priced.
+  - **klein end to end at 1024²** (priced; one CS-3, readings in turn):
+
+    | reading | footprint | predicted |
+    |---|---|---|
+    | text (512 tokens) | 723 x 549 PEs, links (M2c) | 0.28 s |
+    | denoise, 4 steps | 741 x 1143 PEs, links (M2b) | 4 x 1.52 = 6.06 s |
+    | VAE decode | 514 x 1029 PEs, links | **0.13 s** (was 45.5 s) |
+    | **total** | | **6.47 s** (was 51.8 s) |
+
+    The denoise is 94% of it now.
+  - **The regime by price** (`stream::compile_grid`, what compile on load calls): the tiled
+    program (its top tile searched) and the rows one, the cheaper of those that place within a
+    system: flux2-mini's decode the tiled (0.9M against 74.9M cycles), klein's the tiled (the
+    rows does not place). The rows regime stays (`grid::compile`, `wafer-compile stream
+    --reading vae.decode` without `--regime`, its programs byte-identical) and is still chosen
+    where it is cheaper or the tiled refuses (`vae.encode`'s stride-2 convolutions). Co-resident
+    readings (`stream::coresident::combine`) move a tiled program's loops by its origin.
+  - **The engine** (engine-cerebras `Reading`): a `d2h` item may name a rectangle of PEs read
+    back alike (`w`, `h`: one memcpy, its rows in the rectangle's order). kernels-cerebras
+    `stream::host`: the span flag `PACK` (two 16-bit elements a word, pairing across an array's
+    spans), `span_words`; the rows regime's host side (`grid::host_arrays`) shared.
+  - Decode is unchanged: plan + build `diff -r` identical against e8d0c8935's wafer-compile for
+    qwen35-d0.8b, qwen35-d9b, llama31-8b, gptoss-20b, gemma4-e2b and tiny t08. flux2-mini's text
+    (16 rows), denoise (16 and 64 rows) and rows-regime VAE decode programs and klein's 1024²
+    denoise byte-identical.
+  - Left:
+    - **Speed**, in order: the weight receive double-buffered (the convolutions' 57M -> about
+      30M: a block's receive overlapping the last one's MACs); the attention (54M: 16k keys past
+      every PE while 16k of 524k hold a query: the keys split over a query's idle neighbours, each
+      a slice merged by its running max and sum, or the scores a 16-bit tile matvec over blocks
+      of keys); at the low resolutions a channel split (a pixel's output channels over `S`
+      PEs, `S` trees and tapes: the weight stream's floor, `W / 2` words, divided by `S`).
+    - A reading switch rewrites the tape's 25M words (the host's bandwidth unmeasured), as the
+      text and denoise programs' weights are.
+    - `vae.encode` in the tiled regime (stride-2 convolutions with back padding, the latent's
+      unshuffle on the wafer); a clip other than a square of powers of two.
+    - `pie run text-to-media` on the simulator with the tiled decode (compile on load now
+      picks it; M1i's run used the rows regime); klein's VAE on a system.
 
 ## 5. Risks
 
