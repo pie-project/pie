@@ -6,7 +6,8 @@
 //!   [`engine::rates::LATTICE_ROWS`], each repeat over the next of
 //!   engine::rates::weights_at's distinct weights so every one streams from memory, as a fire's do;
 //! * attention: `attn::arbiter::prefill` at [`engine::rates::ATTN_SHAPE`],
-//!   causal, over a bf16 pool of the 16-token pages serving builds;
+//!   causal, over a bf16 pool of the 16-token pages serving builds, laid
+//!   in engine::rates::attn_page_order's scattered order;
 //! * the scan: `ssm::causal_conv1d_chunked` then `ssm::gated_delta_chunked`
 //!   at [`engine::rates::SCAN_SHAPE`];
 //! * a 256 MiB blit between two buffers (read and write counted), and a
@@ -153,7 +154,9 @@ impl Bench<'_> {
         let q = self.buffer(&bf16_noise((rows * q_heads * d) as usize, 17, 1.0))?;
         let out = self.zeroed(u64::from(rows * q_heads * d) * 2)?;
         let positions: Vec<u32> = (0..rows).collect();
-        let page_ids: Vec<u32> = (0..pages).collect();
+        // The pool pages scattered as a served pool lays a sequence's, the
+        // same order every backend times (engine::rates::attn_page_order).
+        let page_ids: Vec<u32> = engine::rates::attn_page_order(pages);
         let le = u32::to_le_bytes;
         let page_indices = self.buffer(&words(&page_ids, le))?;
         let page_indptr = self.buffer(&words(&[0, pages], le))?;
