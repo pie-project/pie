@@ -286,6 +286,11 @@ pub trait Tactics: std::fmt::Debug {
 
     fn sdpa_split_groups(&self) -> u32;
 
+    /// The workgroup memory a kernel may take, as the device states it
+    /// (`maxComputeSharedMemorySize`, `maxComputeWorkgroupStorageSize`):
+    /// what a kernel staged in it sizes its form by.
+    fn workgroup_bytes(&self) -> u32;
+
     fn sdpa_split_min_keys(&self) -> u32 {
         self.profile().get::<crate::tuning::DecodeSplitMinKeys>().0
     }
