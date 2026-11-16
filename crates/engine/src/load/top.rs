@@ -22,15 +22,27 @@ pub struct Counts {
     pub expert_bytes: u64,
     /// `(k, E)` of the routed banks: the experts a row picks, of how many.
     pub experts: Option<(u32, u32)>,
-    /// The matmul flops a row takes: two a dense weight element, and two a
-    /// routed element of the `k` of `E` experts a row picks.
+    /// The matmul flops a row takes: two a dense weight element (the output
+    /// head's aside), and two a routed element of the `k` of `E` experts a
+    /// row picks.
     pub flops_per_row: u64,
+    /// The output head's flops a lane: two a head element. A fire reads out
+    /// once a lane, not once a row; the head's bytes are in `weight_bytes`.
+    pub readout_flops: u64,
     /// The flops a row takes a key it attends, summed over the layers: four
     /// a query element (the scores' product and the values').
     pub attn_flops_per_row_key: u64,
     /// The kv bytes a key read takes, summed over the kv rows attentions
     /// read: every plane of the row at its element's size.
     pub kv_bytes_per_key: u64,
+    /// The recurrent state elements a row steps, summed over the layers: a
+    /// scan's state row (a gated delta's `v_heads · k_dim · v_dim`), once a
+    /// state the scans read however many forms of the scan the trace holds.
+    pub state_elements_per_row: u64,
+    /// The activation bytes a row's norms and elementwise ops read and
+    /// write, summed over the trace's elementwise nodes: every operand a row
+    /// of the fire's tokens wide, at its element's size.
+    pub elementwise_bytes_per_row: u64,
     /// The contraction of the largest dense plane: the width its matmul
     /// kernel is picked at, which a fire's rows pad to the tile of.
     pub width: u32,
@@ -55,7 +67,18 @@ impl Counts {
         let (mut weight_bytes, mut expert_bytes) = (0u64, 0u64);
         let (mut dense, mut routed) = (0u64, 0u64);
         let (mut largest, mut width) = (0u64, 0u64);
+        let heads = heads(trace);
+        let mut readout = 0u64;
         for (at, param) in trace.params.iter().enumerate() {
+            if heads.contains(&at) {
+                // The output head: read whole every fire (a tied table as
+                // much as its own plane), multiplied once a lane.
+                let (rows, cols) = rectangle(&param.shape);
+                weight_bytes =
+                    weight_bytes.saturating_add(kept.plane_bytes.get(at).copied().unwrap_or(0));
+                readout = readout.saturating_add(rows.saturating_mul(cols));
+                continue;
+            }
             if kept.tables.contains(&at) {
                 continue;
             }
@@ -90,8 +113,11 @@ impl Counts {
             expert_bytes,
             experts,
             flops_per_row: dense.saturating_add(routed_per_row).saturating_mul(2),
+            readout_flops: readout.saturating_mul(2),
             attn_flops_per_row_key,
             kv_bytes_per_key,
+            state_elements_per_row: state_elements(trace),
+            elementwise_bytes_per_row: elementwise_bytes(trace),
             width: u32::try_from(width).unwrap_or(u32::MAX),
         }
     }
@@ -105,6 +131,118 @@ pub fn rectangle(shape: &[u64]) -> (u64, u64) {
         Some((rows, rest)) => (*rows, rest.iter().product()),
         None => (1, 1),
     }
+}
+
+/// The params the trace's output head multiplies by (a `Matmul` marked
+/// `logits`, or its softcapped fusion).
+fn heads(trace: &Trace) -> Vec<usize> {
+    let param = |value: poem_ir::ValueId| match trace.values.get(value.0 as usize) {
+        Some(decl) => match decl.def {
+            Def::Weight(w) => Some(w as usize),
+            _ => None,
+        },
+        None => None,
+    };
+    let mut out: Vec<usize> = trace
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.op {
+            Operation::Linear(poem_ir::Linear::Matmul {
+                w, logits: true, ..
+            })
+            | Operation::Fused(poem_ir::Fused::MatmulSoftcap { w, .. }) => param(*w),
+            _ => None,
+        })
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// The state elements a row steps, over every recurrent scan of `trace`:
+/// each distinct state row its gated-delta, KDA and Mamba-2 scans read,
+/// at its slab's elements (one slot's).
+fn state_elements(trace: &Trace) -> u64 {
+    use poem_ir::Operands as _;
+    let mut states: Vec<usize> = Vec::new();
+    let mut inputs = Vec::new();
+    for node in &trace.nodes {
+        let Operation::Ssm(scan) = &node.op else {
+            continue;
+        };
+        if !matches!(
+            scan,
+            poem_ir::Ssm::GatedDelta { .. }
+                | poem_ir::Ssm::GatedDeltaChunked { .. }
+                | poem_ir::Ssm::Kda { .. }
+                | poem_ir::Ssm::KdaChunked { .. }
+                | poem_ir::Ssm::Mamba2 { .. }
+                | poem_ir::Ssm::Mamba2Chunked { .. }
+        ) {
+            continue;
+        }
+        inputs.clear();
+        node.op.inputs(&mut inputs);
+        for value in &inputs {
+            if let Some(decl) = trace.values.get(value.0 as usize)
+                && let Def::Cache(row) = decl.def
+                && matches!(
+                    trace.caches.get(row as usize),
+                    Some(poem_ir::CacheRow::State { .. })
+                )
+                && !states.contains(&(row as usize))
+            {
+                states.push(row as usize);
+            }
+        }
+    }
+    states
+        .iter()
+        .filter_map(|&row| match trace.caches.get(row) {
+            Some(poem_ir::CacheRow::State { slab, .. }) => Some(slab.iter().product::<u64>()),
+            _ => None,
+        })
+        .sum()
+}
+
+/// The activation bytes a row's elementwise nodes read and write: each
+/// operand whose rows are the fire's tokens, its row at its element's
+/// size (an op in place reads its row and writes it back, both counted).
+fn elementwise_bytes(trace: &Trace) -> u64 {
+    use poem_ir::Operands as _;
+    let row_bytes = |value: &poem_ir::ValueId| -> u64 {
+        let Some(decl) = trace.values.get(value.0 as usize) else {
+            return 0;
+        };
+        let Ty::Tensor { shape, dtype } = &decl.ty else {
+            return 0;
+        };
+        let rows = match shape.first() {
+            Some(Dim::Tokens) => 1,
+            Some(Dim::TokensTimes(n)) => u64::from(*n),
+            _ => return 0,
+        };
+        let mut elements = rows;
+        for d in &shape[1..] {
+            match d {
+                Dim::Const(n) => elements = elements.saturating_mul(*n),
+                _ => return 0,
+            }
+        }
+        elements.saturating_mul(dtype.bits()) / 8
+    };
+    let mut operands = Vec::new();
+    let mut total = 0u64;
+    for node in &trace.nodes {
+        if !matches!(node.op, Operation::Elemwise(_)) {
+            continue;
+        }
+        operands.clear();
+        node.op.inputs(&mut operands);
+        node.op.outputs(&mut operands);
+        total = total.saturating_add(operands.iter().map(row_bytes).sum::<u64>());
+    }
+    total
 }
 
 /// `(k, E)` of the trace's routed selects: the routes a row carries (the
@@ -136,29 +274,55 @@ fn routing(trace: &Trace) -> Option<(u32, u32)> {
     })
 }
 
-/// The estimate of a fire's time on a device of `rates`. `None` where the
-/// device states no compute rate or no bandwidth.
-#[must_use]
-pub fn estimate(counts: &Counts, rates: &profile::fire::Rates) -> Option<FireEstimate> {
-    Some(FireEstimate {
-        // The curve's widest point until the estimate reads it by rows.
-        flops_per_ns: rates.flops_at(u32::MAX)?,
-        bytes_per_ns: rates.bytes_per_ns?,
+/// The estimate of a fire's time on a device of `rates`, or the first rate
+/// the model's work needs that the device's profile leaves unstated: the
+/// matmul curve and the bandwidth always, the attention rate where the
+/// model attends, the scan rate where it carries recurrent state.
+pub fn estimate(
+    counts: &Counts,
+    rates: &profile::fire::Rates,
+) -> Result<FireEstimate, &'static str> {
+    let needed = |rate: Option<f64>, needed: bool, key: &'static str| match rate {
+        Some(rate) => Ok(rate),
+        None if !needed => Ok(0.0),
+        None => Err(key),
+    };
+    Ok(FireEstimate {
+        flops_by_rows: rates
+            .bf16_flops_per_ns_by_rows
+            .clone()
+            .filter(|curve| !curve.is_empty())
+            .ok_or("bf16_flops_per_ns_by_rows")?,
+        bytes_per_ns: rates.bytes_per_ns.ok_or("bytes_per_ns")?,
+        attn_flops_per_ns: needed(
+            rates.attn_flops_per_ns,
+            counts.attn_flops_per_row_key > 0,
+            "attn_flops_per_ns",
+        )?,
+        scan_elements_per_ns: needed(
+            rates.scan_elements_per_ns,
+            counts.state_elements_per_row > 0,
+            "scan_elements_per_ns",
+        )?,
         launch_ns: rates.launch_ns.unwrap_or(0) as f64,
         dense_bytes: counts.weight_bytes,
         expert_bytes: counts.expert_bytes,
         experts: counts.experts,
         flops_per_row: counts.flops_per_row as f64,
+        readout_flops: counts.readout_flops as f64,
         attn_flops_per_row_key: counts.attn_flops_per_row_key as f64,
         kv_bytes_per_key: counts.kv_bytes_per_key as f64,
+        state_elements_per_row: counts.state_elements_per_row as f64,
+        elementwise_bytes_per_row: counts.elementwise_bytes_per_row as f64,
     })
 }
 
 /// Why no top rung was chosen.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Refused {
-    /// The device's profile states no rates: nothing weighs its rungs.
-    NoRates { device: String },
+    /// The device's profile leaves `key` of `[rates]` unstated, which the
+    /// model's work is weighed by: nothing weighs its rungs.
+    NoRates { device: String, key: &'static str },
     /// No rung offered is feasible.
     NoRung(NoRung),
 }
@@ -166,11 +330,11 @@ pub enum Refused {
 impl fmt::Display for Refused {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Refused::NoRates { device } => write!(
+            Refused::NoRates { device, key } => write!(
                 f,
-                "device {device} has no rates in its profile (`[rates] bf16_flops_per_ns_by_rows` \
-                 and `bytes_per_ns`), so nothing weighs its top rung; `pie tune --rates` measures \
-                 them"
+                "device {device} has no rates in its profile for this model: `[rates] {key}` is \
+                 unstated, so nothing weighs its top rung; `pie tune <backend> --rates` measures \
+                 it"
             ),
             Refused::NoRung(no) => no.fmt(f),
         }
@@ -190,11 +354,10 @@ pub fn choose(
     device: &str,
     counts: &Counts,
 ) -> Result<(TopRung, FireEstimate), Refused> {
-    let Some(estimate) = estimate(counts, rates) else {
-        return Err(Refused::NoRates {
-            device: device.to_owned(),
-        });
-    };
+    let estimate = estimate(counts, rates).map_err(|key| Refused::NoRates {
+        device: device.to_owned(),
+        key,
+    })?;
     let top = super::rung::top_rung(rungs, live, &estimate).map_err(Refused::NoRung)?;
     Ok((top, estimate))
 }
@@ -261,6 +424,9 @@ mod tests {
             flops_per_row: 1 << 30,
             attn_flops_per_row_key: 1 << 10,
             kv_bytes_per_key: 1 << 10,
+            readout_flops: 0,
+            state_elements_per_row: 0,
+            elementwise_bytes_per_row: 0,
             width: 4096,
         }
     }
@@ -276,13 +442,15 @@ mod tests {
             "{err}"
         );
         assert!(
-            err.to_string().contains("`pie tune --rates` measures them"),
+            err.to_string()
+                .contains("`pie tune <backend> --rates` measures it"),
             "{err}"
         );
         // No feasible rung at all: the ruling's refusal.
         let none = [rung(1024, 300 * MIB, Some("past one binding"))];
         let rated = profile::fire::Rates {
             bf16_flops_per_ns_by_rows: Some(vec![(4096, 1.0)]),
+            attn_flops_per_ns: Some(1.0),
             bytes_per_ns: Some(1.0),
             ..profile::fire::Rates::default()
         };
@@ -299,21 +467,86 @@ mod tests {
     fn the_estimate_reads_the_rates_and_the_counts() {
         let rates = profile::fire::Rates {
             bf16_flops_per_ns_by_rows: Some(vec![(16, 1.0), (4096, 10.0)]),
+            attn_flops_per_ns: Some(7.0),
             bytes_per_ns: Some(100.0),
             launch_ns: Some(5),
             ..profile::fire::Rates::default()
         };
         let e = estimate(&counts(), &rates).unwrap();
+        assert_eq!(e.flops_by_rows, vec![(16, 1.0), (4096, 10.0)]);
         assert_eq!(
-            (e.flops_per_ns, e.bytes_per_ns, e.launch_ns),
-            (10.0, 100.0, 5.0)
+            (e.attn_flops_per_ns, e.bytes_per_ns, e.launch_ns),
+            (7.0, 100.0, 5.0)
         );
+        // No recurrent state: no scan rate read.
+        assert_eq!(e.scan_elements_per_ns, 0.0);
         assert_eq!(e.dense_bytes, 1 << 30);
-        let unstated = profile::fire::Rates {
-            bytes_per_ns: None,
+        // Each rate the model's work needs, unstated, is named.
+        for (key, unstated) in [
+            (
+                "bytes_per_ns",
+                profile::fire::Rates {
+                    bytes_per_ns: None,
+                    ..rates.clone()
+                },
+            ),
+            (
+                "bf16_flops_per_ns_by_rows",
+                profile::fire::Rates {
+                    bf16_flops_per_ns_by_rows: None,
+                    ..rates.clone()
+                },
+            ),
+            (
+                "attn_flops_per_ns",
+                profile::fire::Rates {
+                    attn_flops_per_ns: None,
+                    ..rates.clone()
+                },
+            ),
+        ] {
+            assert_eq!(estimate(&counts(), &unstated), Err(key));
+        }
+        let recurrent = Counts {
+            state_elements_per_row: 1 << 20,
+            ..counts()
+        };
+        assert_eq!(estimate(&recurrent, &rates), Err("scan_elements_per_ns"));
+        let scanned = profile::fire::Rates {
+            scan_elements_per_ns: Some(3.0),
             ..rates.clone()
         };
-        assert_eq!(estimate(&counts(), &unstated), None);
+        assert_eq!(
+            estimate(&recurrent, &scanned).unwrap().scan_elements_per_ns,
+            3.0
+        );
+        // A model attending nothing reads no attention rate.
+        let attending_nothing = Counts {
+            attn_flops_per_row_key: 0,
+            ..counts()
+        };
+        let no_attn = profile::fire::Rates {
+            attn_flops_per_ns: None,
+            ..rates
+        };
+        assert!(estimate(&attending_nothing, &no_attn).is_ok());
+    }
+
+    #[test]
+    fn the_refusal_names_the_key_unstated() {
+        let rungs = [rung(1024, 100 * MIB, None)];
+        let rates = profile::fire::Rates {
+            bf16_flops_per_ns_by_rows: Some(vec![(4096, 1.0)]),
+            bytes_per_ns: Some(1.0),
+            ..profile::fire::Rates::default()
+        };
+        let err = choose(&rungs, 1 << 33, &rates, "Card X", &counts()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "device Card X has no rates in its profile for this model: `[rates] \
+             attn_flops_per_ns` is unstated, so nothing weighs its top rung; `pie tune <backend> \
+             --rates` measures it"
+        );
     }
 
     #[test]

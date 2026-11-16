@@ -105,6 +105,9 @@ mod tests {
             flops_per_row: 1 << 30,
             attn_flops_per_row_key: 1 << 10,
             kv_bytes_per_key: 1 << 10,
+            readout_flops: 0,
+            state_elements_per_row: 0,
+            elementwise_bytes_per_row: 0,
             width: 4096,
         }
     }
@@ -126,7 +129,9 @@ mod tests {
         );
         // No feasible rung at all: the ruling's refusal, with the binding.
         let none = facts(&[(1024, 300 * MIB)], 200 * MIB);
-        let rated = profile("api = 1\n[rates]\nbf16_flops_per_ns_by_rows = [[4096, 1.0]]\nbytes_per_ns = 1.0\n");
+        let rated = profile(
+            "api = 1\n[rates]\nbf16_flops_per_ns_by_rows = [[4096, 1.0]]\nattn_flops_per_ns = 1.0\nbytes_per_ns = 1.0\n",
+        );
         let err = choose(&none, 1 << 33, &rated, "Card X", &counts(), 200 * MIB).unwrap_err();
         assert!(
             err.to_string().contains(

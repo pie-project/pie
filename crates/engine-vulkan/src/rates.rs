@@ -8,9 +8,21 @@ use profile::fire::Rates;
 
 use crate::device::{Api, Context, Frame};
 
-/// The rates of `device`, under the matmul tactic `tuning` picks.
+/// The rates of `device`, under the tactics `tuning` picks.
 pub fn measure(device: &Context, tuning: &crate::tuning::Tuning) -> Result<Rates> {
     let tier = <Api as engine_gpu::serve::Serve>::tier(device);
     let timer = |frame: Frame| Ok((None, (frame.commit_timed()? * 1e9) as u64));
-    engine_gpu::rates::measure::<Api>(device, tuning.gemm(tier), &timer)
+    engine_gpu::rates::measure::<Api, _>(device, tuning, tier, &timer)
+}
+
+/// The bf16 matmul rate of `device` at `(m, n, k)`, under the tactic
+/// `tuning` picks ([`engine_gpu::rates::gemm_rate`]).
+pub fn gemm_rate(
+    device: &Context,
+    tuning: &crate::tuning::Tuning,
+    mnk: (u32, u32, u32),
+) -> Result<f64> {
+    let tier = <Api as engine_gpu::serve::Serve>::tier(device);
+    let timer = |frame: Frame| Ok((None, (frame.commit_timed()? * 1e9) as u64));
+    engine_gpu::rates::gemm_rate::<Api>(device, tuning.gemm(tier), &timer, mnk)
 }

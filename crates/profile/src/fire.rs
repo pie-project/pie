@@ -60,19 +60,7 @@ impl Rates {
     /// rate past either end. `None` where no curve is stated.
     #[must_use]
     pub fn flops_at(&self, rows: u32) -> Option<f64> {
-        let curve = self.bf16_flops_per_ns_by_rows.as_deref()?;
-        let (&(m0, r0), &(m1, r1)) = (curve.first()?, curve.last()?);
-        if rows <= m0 {
-            return Some(r0);
-        }
-        if rows >= m1 {
-            return Some(r1);
-        }
-        let at = curve.partition_point(|&(m, _)| m <= rows);
-        let ((lo, a), (hi, b)) = (curve[at - 1], curve[at]);
-        let ln = |m: u32| f64::from(m.max(1)).ln();
-        let t = (ln(rows) - ln(lo)) / (ln(hi) - ln(lo));
-        Some(a + (b - a) * t)
+        flops_at(self.bf16_flops_per_ns_by_rows.as_deref()?, rows)
     }
 
     /// The curve's fastest point: the rate a compute-bound matmul reaches.
@@ -107,6 +95,26 @@ impl Rates {
         }
         out
     }
+}
+
+/// The rate of `curve` (`(m, rate)`, ascending in `m`) at `rows`:
+/// interpolated linearly in `log(rows)` between its two neighbouring
+/// points, and its end point's rate past either end. `None` for an empty
+/// curve.
+#[must_use]
+pub fn flops_at(curve: &[(u32, f64)], rows: u32) -> Option<f64> {
+    let (&(m0, r0), &(m1, r1)) = (curve.first()?, curve.last()?);
+    if rows <= m0 {
+        return Some(r0);
+    }
+    if rows >= m1 {
+        return Some(r1);
+    }
+    let at = curve.partition_point(|&(m, _)| m <= rows);
+    let ((lo, a), (hi, b)) = (curve[at - 1], curve[at]);
+    let ln = |m: u32| f64::from(m.max(1)).ln();
+    let t = (ln(rows) - ln(lo)) / (ln(hi) - ln(lo));
+    Some(a + (b - a) * t)
 }
 
 /// `(tokens, ns)` of a fire at each rung width, ascending in tokens: what a

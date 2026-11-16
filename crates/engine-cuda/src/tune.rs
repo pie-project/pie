@@ -382,23 +382,29 @@ fn check_estimate_of(
     let (at_est, best) = (score(by_est.tokens), score(by_meas.tokens));
     let mut out = format!(
         "{model}: rung, measured ms, estimated ms, measured/estimated, measured tok/s, estimated \
-         tok/s; the estimate's terms (ms): launches, weight read, matmul, attention, kv\n"
+         tok/s; the estimate's terms (ms): launches, weight read, matmul, readout, attention, kv, \
+         recurrent, elementwise\n"
     );
     for (k, r) in rungs.iter().enumerate() {
         let tokens = f64::from(r.tokens);
+        let t = e.terms(r);
         out.push_str(&format!(
-            "  {:>6} {:>9.2} {:>9.2} {:>6.2}x {:>9.0} {:>9.0}   {:.2} {:.2} {:.2} {:.2} {:.2}\n",
+            "  {:>6} {:>9.2} {:>9.2} {:>6.2}x {:>9.0} {:>9.0}   {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} \
+             {:.2} {:.2}\n",
             r.tokens,
             meas[k] / 1e6,
             est[k] / 1e6,
             meas[k] / est[k],
             tokens / meas[k] * 1e9,
             tokens / est[k] * 1e9,
-            f64::from(r.launches) * e.launch_ns / 1e6,
-            e.weight_bytes(r.tokens) / e.bytes_per_ns / 1e6,
-            f64::from(r.padded_rows) * e.flops_per_row / e.flops_per_ns / 1e6,
-            tokens * f64::from(r.keys) * e.attn_flops_per_row_key / e.flops_per_ns / 1e6,
-            f64::from(r.keys) * e.kv_bytes_per_key / e.bytes_per_ns / 1e6,
+            t.launch / 1e6,
+            t.weights / 1e6,
+            t.flops / 1e6,
+            t.readout / 1e6,
+            t.attention / 1e6,
+            t.kv / 1e6,
+            t.recurrent / 1e6,
+            t.elementwise / 1e6,
         ));
     }
     let short = if best > 0.0 { 1.0 - at_est / best } else { 0.0 };

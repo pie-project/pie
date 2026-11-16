@@ -118,6 +118,9 @@ mod tests {
             flops_per_row: 1 << 30,
             attn_flops_per_row_key: 1 << 10,
             kv_bytes_per_key: 1 << 14,
+            readout_flops: 0,
+            state_elements_per_row: 0,
+            elementwise_bytes_per_row: 0,
             width: 1024,
         }
     }
@@ -158,6 +161,7 @@ mod tests {
         );
         let rated = profile::fire::Rates {
             bf16_flops_per_ns_by_rows: Some(vec![(4096, 5000.0)]),
+            attn_flops_per_ns: Some(2000.0),
             bytes_per_ns: Some(400.0),
             launch_ns: Some(5000),
             ..profile::fire::Rates::default()
