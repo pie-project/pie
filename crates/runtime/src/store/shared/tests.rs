@@ -402,6 +402,10 @@ fn beam_lanes_leave_their_rows_unfolded_in_rs_list_slots() {
     for lane in &lanes {
         assert_eq!(buffer_of(lane).0, pages, "every lane reads one buffer");
         assert!(lane.slot_copies.is_empty(), "fresh slots copy nothing");
+        assert!(
+            !lane.fixed.is_empty() && lane.fixed.iter().all(|(_, pieces)| !pieces.is_empty()),
+            "a lane bound to a record names it in its fixed table"
+        );
         lane.validate_chunks(&facts).unwrap();
     }
     assert!(out.state_copy().is_none());

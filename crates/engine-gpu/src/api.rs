@@ -1263,7 +1263,6 @@ impl<B: Host> Gpu<B> {
 
                 rs: &lane.rs,
                 rs_reset: lane.rs_reset,
-                rs_slot: lane.rs_slot,
                 rs_snapshots: &lane.rs_snapshots,
                 refs: true,
                 windows: &lane.tables,

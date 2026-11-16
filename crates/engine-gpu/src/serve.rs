@@ -412,8 +412,6 @@ pub struct Seated<'a, B: Serve> {
 
     pub rs_reset: engine::fire::RsReset,
 
-    pub rs_slot: Option<u32>,
-
     /// Rows inside the lane whose state the fire lands in records of their
     /// own (CONTRACT-BC 16; `Lane::rs_snapshots`).
     pub rs_snapshots: &'a [engine::fire::RsSnapshot],
@@ -464,7 +462,6 @@ impl<'a, B: Serve> Seated<'a, B> {
             translation: &[],
             rs: &FOLD,
             rs_reset: engine::fire::RsReset::Inferred,
-            rs_slot: None,
             rs_snapshots: &[],
             refs: false,
             windows: &[],
@@ -2989,27 +2986,16 @@ impl<B: Serve> Shell<B> {
 
             // The lane's slots as kernels address them: slot refs the
             // runtime names, or a seat's runs for a direct fire.
-            let seat_slot = seated.rs_slot.unwrap_or(lane.slot);
-            let record = if seated.refs {
-                match (seated.record, seated.rs_slot) {
-                    (Some(record), _) => self.pools.record(Some(record), seat_slot)?,
-                    (None, Some(slot)) => self.pools.record(Some(&[slot]), seat_slot)?,
-                    (None, None) => self.pools.record(None, seat_slot)?,
-                }
-            } else {
-                self.pools.record(None, seat_slot)?
-            };
+            // A lane by refs names its record in its fixed table; one that
+            // names none carries no state, and reads and writes the null
+            // record (ref 0, the null chunk).
+            let seat_slot = lane.slot;
+            let null = vec![0; self.pools.pieces() as usize];
+            let record_ref = seated.refs.then(|| seated.record.unwrap_or(&null));
+            let record = self.pools.record(record_ref, seat_slot)?;
             // The slots the record stands in: where its own frozen position
             // is kept.
-            let record_refs = match (seated.record, seated.rs_slot) {
-                (Some(record), _) if seated.refs => {
-                    self.pools.record_refs(Some(record), seat_slot)?
-                }
-                (None, Some(slot)) if seated.refs => {
-                    self.pools.record_refs(Some(&[slot]), seat_slot)?
-                }
-                _ => self.pools.record_refs(None, seat_slot)?,
-            };
+            let record_refs = self.pools.record_refs(record_ref, seat_slot)?;
             let fresh = match seated.rs_reset {
                 engine::fire::RsReset::Inferred => have == 0,
                 engine::fire::RsReset::Fresh => true,
@@ -3574,7 +3560,7 @@ impl<B: Serve> Shell<B> {
                         narrow(u64::from(offset)),
                     ]);
                     let seated = &lanes[row.source as usize];
-                    voxel_slots.push(seated.rs_slot.unwrap_or(seated.lane.slot) as i32);
+                    voxel_slots.push(seated.lane.slot as i32);
                     offset = offset
                         .saturating_add(boxed[0].saturating_mul(boxed[1]).saturating_mul(boxed[2]));
                     if let Some(p) = patch {
