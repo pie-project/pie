@@ -219,6 +219,44 @@ impl FireEstimate {
     }
 }
 
+/// The per-shape table a check of the estimate prints: at each of `rungs`
+/// (measured at `measured` ns, one a rung), each dense shape's matmul ms at
+/// the rung's padded rows and its share of the weight read (its flops'
+/// share of the dense ones), then the sums, read + matmul and max(read,
+/// matmul) beside the measured fire: whether a fire runs the read and the
+/// compute one after the other or together.
+#[must_use]
+pub fn shape_table(estimate: &FireEstimate, rungs: &[RungFacts], measured: &[f64]) -> String {
+    let mut out = String::from(
+        "  per (n x k) shape: matmul ms at the rung's padded rows / its read ms; then the sums, \
+         read + matmul against max(read, matmul) and the measured fire\n",
+    );
+    let total: f64 = estimate.gemm_shapes.iter().map(|&(_, _, f)| f).sum();
+    for (r, &meas) in rungs.iter().zip(measured) {
+        let t = estimate.terms(r);
+        let mut line = format!("  {:>6}", r.tokens);
+        for (&(n, k, ns), &(_, _, per_row)) in estimate.matmuls(r).iter().zip(&estimate.gemm_shapes)
+        {
+            let read = if total > 0.0 {
+                t.weights * per_row / total
+            } else {
+                0.0
+            };
+            line.push_str(&format!(" | {n}x{k} {:.2}/{:.2}", ns / 1e6, read / 1e6));
+        }
+        line.push_str(&format!(
+            " | sum {:.2}/{:.2}: read + matmul {:.2}, max {:.2}, measured {:.2}\n",
+            t.flops / 1e6,
+            t.weights / 1e6,
+            (t.flops + t.weights) / 1e6,
+            t.flops.max(t.weights) / 1e6,
+            meas / 1e6
+        ));
+        out.push_str(&line);
+    }
+    out
+}
+
 /// The estimate's terms of one fire, in ns ([`FireEstimate::terms`]).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Terms {
@@ -686,6 +724,16 @@ mod tests {
         assert!(
             (two.terms(&r).flops - 120.0).abs() < 1e-9,
             "the shapes' sum"
+        );
+        // The check's table: each shape's matmul and its half of the 200 / 4
+        // read, then read + matmul and max beside the measured.
+        let table = shape_table(&two, &[r], &[200e6]);
+        assert!(
+            table.ends_with(
+                "       4 | 64x64 0.00/0.00 | 256x256 0.00/0.00 | sum 0.00/0.00: read + matmul \
+                 0.00, max 0.00, measured 200.00\n"
+            ),
+            "{table}"
         );
     }
 

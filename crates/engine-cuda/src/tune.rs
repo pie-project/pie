@@ -522,6 +522,7 @@ fn check_estimate_of(
             t.elementwise / 1e6,
         ));
     }
+    out.push_str(&engine::load::shape_table(e, &rungs, &meas));
     let short = if best > 0.0 { 1.0 - at_est / best } else { 0.0 };
     out.push_str(&format!(
         "  pick by the estimate {}, by the measured times {}; the estimate's scores {:.1}% below \

@@ -10,7 +10,8 @@
 //! left is the work's own time beside a dispatch's:
 //! - the backend's own bf16 matmul at each row count of
 //!   `engine::rates::LATTICE_ROWS` and each depth of `engine::rates::DEPTHS`,
-//!   `m x k x k`, for the matmul grid;
+//!   `m x k x k`, each fire reading the next of `engine::rates::weights_at(k)`
+//!   weight planes (past the last-level cache), for the matmul grid;
 //! - its prefill attention at `engine::rates::ATTN_SHAPE`'s heads over each
 //!   `engine::rates::ATTN_KEYS`, for the attention curve;
 //! - its chunked gated-delta scan, the causal conv before it, at
@@ -28,6 +29,7 @@
 
 use engine::rates::{
     ATTN_KEYS, ATTN_SHAPE, DEPTHS, LATTICE_ROWS, SCAN_SHAPE, attn_flops, gemm_flops, scan_elements,
+    weights_at,
 };
 use kernels_slang::{KvPool, RaggedTensor, Tensor};
 use poem_ir::Dtype;
@@ -203,10 +205,16 @@ fn grid<B: Serve>(
     let mut out = Vec::with_capacity(LATTICE_ROWS.len() * DEPTHS.len());
     for k in DEPTHS {
         let act = rig.zeros(widest, k, Dtype::Bf16)?;
-        let w = rig.zeros(k, k, Dtype::Bf16)?;
+        // Each fire reads the next of these, past the last-level cache.
+        let weights = (0..weights_at(k))
+            .map(|_| rig.zeros(k, k, Dtype::Bf16))
+            .collect::<Result<Vec<Tensor>>>()?;
         let y = rig.zeros(widest, k, Dtype::Bf16)?;
+        let next = std::cell::Cell::new(0usize);
         for m in LATTICE_ROWS {
             let ns = rig.each(timer, &|sink| {
+                let w = weights[next.get() % weights.len()];
+                next.set(next.get() + 1);
                 kernels_slang::linear::gemm::matmul(
                     sink,
                     tactic,

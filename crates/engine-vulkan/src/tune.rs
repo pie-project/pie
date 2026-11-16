@@ -519,46 +519,7 @@ fn check_estimate(
             t.elementwise / 1e6
         ));
     }
-    // Each dense shape's matmul at each rung, and its share of the weight
-    // read (its flops' share of the dense ones): whether a narrow rung's
-    // fire runs the read and the compute one after the other or together.
-    out.push_str(
-        "  per (n x k) shape: matmul ms at the rung's padded rows / its read ms; then the \
-         sums, read + matmul against max(read, matmul) and the measured fire\n",
-    );
-    let total: f64 = weighed
-        .estimate
-        .gemm_shapes
-        .iter()
-        .map(|&(_, _, f)| f)
-        .sum();
-    for (k, r) in rungs.iter().enumerate() {
-        let t = weighed.estimate.terms(r);
-        let mut line = format!("  {:>6}", r.tokens);
-        for &(n, depth, ns) in &weighed.estimate.matmuls(r) {
-            let per_row = weighed
-                .estimate
-                .gemm_shapes
-                .iter()
-                .find(|&&(nn, kk, _)| nn == n && kk == depth)
-                .map_or(0.0, |&(_, _, f)| f);
-            let read = if total > 0.0 {
-                t.weights * per_row / total
-            } else {
-                0.0
-            };
-            line.push_str(&format!(" | {n}x{depth} {:.2}/{:.2}", ns / 1e6, read / 1e6));
-        }
-        line.push_str(&format!(
-            " | sum {:.2}/{:.2}: read + matmul {:.2}, max {:.2}, measured {:.2}\n",
-            t.flops / 1e6,
-            t.weights / 1e6,
-            (t.flops + t.weights) / 1e6,
-            t.flops.max(t.weights) / 1e6,
-            meas[k] / 1e6
-        ));
-        out.push_str(&line);
-    }
+    out.push_str(&engine::load::shape_table(&weighed.estimate, &rungs, &meas));
     let short = if best > 0.0 { 1.0 - at_est / best } else { 0.0 };
     out.push_str(&format!(
         "  pick by the estimate {}, by the measured times {}; the estimate's scores {:.1}% below \

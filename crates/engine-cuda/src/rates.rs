@@ -14,7 +14,7 @@
 //! - `bf16_flops_per_ns_by_rows_and_depth`: the matmul `m x k x k` at each
 //!   row count of [`LATTICE_ROWS`] and depth of [`DEPTHS`] through `linear::gemm` (cuBLAS(Lt) on CUDA,
 //!   hipBLASLt/rocBLAS on ROCm) under the GEMM tactics serving runs; its
-//!   launches rotate through [`weights_at`] weight planes, [`WEIGHT_BYTES`]
+//!   launches rotate through `engine::rates::weights_at` weight planes, `engine::rates::WEIGHT_BYTES`
 //!   of them, several times what any last-level cache holds, so each reads
 //!   its weight from device memory as a layer's does.
 //! - `attn_flops_per_ns_by_keys`: the paged prefill attention at
@@ -28,23 +28,8 @@
 //!   body, as serving replays them.
 
 #[cfg_attr(not(feature = "device"), allow(unused_imports))]
-use engine::rates::{ATTN_KEYS, ATTN_SHAPE, DEPTHS, LATTICE_ROWS, SCAN_SHAPE};
+use engine::rates::{ATTN_KEYS, ATTN_SHAPE, DEPTHS, LATTICE_ROWS, SCAN_SHAPE, weights_at};
 use profile::fire::Rates;
-
-/// The bytes of weight planes a matmul burst rotates through at least: three
-/// times the largest last-level cache of a card this engine serves (an
-/// MI300X's 256 MiB Infinity Cache; an L40S holds 96 MiB). Twelve 2 MiB
-/// planes of depth 1024 sit in an L40S's L2 whole, and its rates there moved
-/// 4% run to run.
-pub const WEIGHT_BYTES: usize = 768 << 20;
-
-/// The weight planes a burst at depth `k` rotates through: [`WEIGHT_BYTES`]
-/// of `k x k` bf16 planes, and never fewer than 12.
-#[must_use]
-pub fn weights_at(k: u32) -> usize {
-    let plane = k as usize * k as usize * 2;
-    WEIGHT_BYTES.div_ceil(plane.max(1)).max(12)
-}
 
 /// The kv cache's page, as a served load pages it.
 pub const PAGE: u32 = 16;

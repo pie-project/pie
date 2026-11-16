@@ -40,6 +40,22 @@ pub fn gemm_flops(rows: u32, depth: u32) -> f64 {
     2.0 * f64::from(rows) * f64::from(depth) * f64::from(depth)
 }
 
+/// The bytes of weight planes a matmul's timed fires rotate through at
+/// least: three times the largest last-level cache of a device served (an
+/// MI300X's 256 MiB Infinity Cache; an L40S holds 96 MiB, an RTX PRO 4500
+/// 64 MiB). Twelve 2 MiB planes of depth 1024 sit in an L40S's L2 whole, and
+/// its rates there moved 4% run to run.
+pub const WEIGHT_BYTES: usize = 768 << 20;
+
+/// The weight planes the timed matmuls at depth `k` rotate through:
+/// [`WEIGHT_BYTES`] of `k x k` bf16 planes, and never fewer than 12, so each
+/// reads its weight from device memory as a layer's does.
+#[must_use]
+pub fn weights_at(k: u32) -> usize {
+    let plane = k as usize * k as usize * 2;
+    WEIGHT_BYTES.div_ceil(plane.max(1)).max(12)
+}
+
 /// A prefill attention the attention rate is timed at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AttnShape {
@@ -207,6 +223,8 @@ mod tests {
     fn the_lattice_ascends_and_the_counts_are_the_estimates() {
         assert!(LATTICE_ROWS.windows(2).all(|w| w[0] < w[1]));
         assert!(DEPTHS.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(weights_at(1024), 384);
+        assert_eq!(weights_at(8192), 12);
         assert_eq!(gemm_flops(16, 1024), 2.0 * 16.0 * 1024.0 * 1024.0);
         // 4 · 2048 · 2048 · 16 · 128.
         assert_eq!(attn_flops(ATTN_SHAPE), 4.0 * 2048.0 * 2048.0 * 2048.0);
