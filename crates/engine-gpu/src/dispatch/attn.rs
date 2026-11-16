@@ -171,37 +171,101 @@ impl<B: Backend> Run<'_, B> {
         )
     }
 
+    /// The fire's capture table and the normalisers' room.
+    fn capture_seats(
+        &self,
+        op: &'static str,
+    ) -> Result<(kernels_slang::Tensor, kernels_slang::Tensor), kernels_slang::Error> {
+        let missing = |what: &str| kernels_slang::Error::Backend {
+            op,
+            detail: format!("a capturing fire with no {what}, which the load lays where its trace captures"),
+        };
+        let table = self.bindings().capture.ok_or_else(|| missing("capture table"))?;
+        let stats = self.score_stats().ok_or_else(|| missing("normalisers' room"))?;
+        Ok((table, stats))
+    }
+
     fn requests(&self) -> u32 {
         u32::try_from(self.qo_indptr_host().len().saturating_sub(1)).unwrap_or(u32::MAX)
     }
 
     fn attention(&mut self, op: &Attn) -> Result<(), kernels_slang::Error> {
         match op {
+            // A fire's capturing lanes, compacted through its capture table:
+            // their rows lie in the fire's guest region whatever the
+            // window, so a capture fires once a fire, in its region's first
+            // launch.
             Attn::ScoreCapture {
                 q,
-                plan,
                 cache,
                 head_dim,
                 kv_heads,
+                q_heads,
                 sm_scale,
                 observe,
-                kv_max,
+                into,
                 scores,
-            } => kernels_slang::attn::score::capture(
-                self.ctx,
-                self.ragged(*q),
-                self.prefill_plan(*plan).positions,
-                self.pool(*cache),
-                *head_dim,
-                *kv_heads,
-                *sm_scale,
-                *observe,
-                // The rows are the window's lanes already.
-                0,
-                *kv_max,
-                self.requests(),
-                self.tensor(*scores),
-            ),
+                ..
+            } => {
+                if self.run_index() != 0 {
+                    return Ok(());
+                }
+                let capturing = self.scored().rows();
+                if capturing == 0 {
+                    return Ok(());
+                }
+                let (table, stats) = self.capture_seats("attn.score_capture")?;
+                let scores = self.tensor(*scores);
+                if let Some(into) = into {
+                    let held = self.tensor(*into);
+                    if held.buf != scores.buf {
+                        return Err(kernels_slang::Error::Backend {
+                            op: "attn.score_capture",
+                            detail: format!(
+                                "the row it adds into (value {}) is not the one it writes: a \
+                                 capturing lane holds one key row",
+                                into.0
+                            ),
+                        });
+                    }
+                }
+                kernels_slang::attn::score::capture(
+                    self.ctx,
+                    &kernels_slang::attn::score::Capture {
+                        q: self.uncut(*q),
+                        positions: self.bindings().positions,
+                        table,
+                        capturing,
+                        stats,
+                        scores,
+                    },
+                    self.pool(*cache),
+                    *head_dim,
+                    *kv_heads,
+                    *q_heads,
+                    *sm_scale,
+                    *observe,
+                    into.is_some(),
+                    self.tuning().workgroup_bytes(),
+                )
+            }
+            Attn::ScorePages { keys, pages } => {
+                if self.run_index() != 0 || self.scored().page_rows() == 0 {
+                    return Ok(());
+                }
+                let (table, _) = self.capture_seats("attn.score_pages")?;
+                let (keys, pages) = (self.tensor(*keys), self.tensor(*pages));
+                // The span lays the rows at a context of whole pages.
+                let page_size = keys.width / pages.width.max(1);
+                kernels_slang::attn::score::pages(
+                    self.ctx,
+                    table,
+                    self.scored().rows(),
+                    keys,
+                    pages,
+                    page_size,
+                )
+            }
             Attn::Voxel {
                 q,
                 k,

@@ -413,6 +413,7 @@ fn writes_cache(op: &Operation) -> bool {
             | Attn::Ragged { .. }
             | Attn::Voxel { .. }
             | Attn::ScoreCapture { .. }
+            | Attn::ScorePages { .. }
             | Attn::Sink { .. }
             | Attn::MergeLse { .. }
             | Attn::MlaPlan { .. }

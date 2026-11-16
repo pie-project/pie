@@ -694,7 +694,7 @@ impl Shell {
         // the top row rung's rows. Nothing is laid per fire.
         let readout_cap =
             poem_exec::fire::rung_of(&budgets.tokens.buckets, budgets.tokens.max_lanes);
-        let readout_exports = poem_exec::feeds::class_outputs(&boot.trace, &compiled)
+        let readout_exports = poem_exec::feeds::class_outputs(&boot.trace, &compiled, boot.context, boot.page_size)
             .map_err(|why| Fault::Unbound { what: why })?;
         let top_tokens = budgets.tokens.buckets.last().copied().unwrap_or(0);
         let readout_specs =
@@ -940,7 +940,7 @@ impl Shell {
             );
         }
 
-        let exports = poem_exec::feeds::class_outputs(&boot.trace, &compiled)
+        let exports = poem_exec::feeds::class_outputs(&boot.trace, &compiled, boot.context, boot.page_size)
             .map_err(|why| Fault::Unbound { what: why })?;
         if exports.is_empty() {
             return Err(Fault::Unbound {

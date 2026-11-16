@@ -45,7 +45,6 @@ struct Output {
     /// Live KV positions at the last observed step.
     kv_len: u32,
     cache_size: u32,
-    layers_observed: u32,
     /// Slots inside the live prefix that carry a finite, non-negative score.
     live_scored: usize,
     /// Slots past the live prefix. Every one of them must be exactly zero.
@@ -84,20 +83,10 @@ async fn main(input: Input) -> Result<Output> {
         .into_iter()
         .find(|output| output.name == "attn.scores")
         .ok_or("this model reads out no attention scores")?;
-    let layers = scores.layers.max(1);
-    // The output states how each layer's row factors: a run of `score_kv`
-    // keys per query head. Folding over a head count of the guest's own
-    // misreads a model with another one.
-    let [heads, score_kv] = scores.planes[..] else {
-        return Err(format!(
-            "attn.scores states its row as planes {:?}, not [query heads, keys]",
-            scores.planes
-        ));
-    };
-    let Some(planes) = layers.checked_mul(heads) else {
-        return Err("layers * heads overflows the plane count".into());
-    };
-    let heads_f = heads as f32;
+    // One row a lane: the attention mass a key of the load's context,
+    // summed over the layers and averaged over the query heads; the guest
+    // folds nothing.
+    let score_kv = scores.width;
     let max_tokens = input.max_tokens;
     let temperature = input.temperature;
     let ws = WorkingSet::new();
@@ -178,9 +167,7 @@ async fn main(input: Input) -> Result<Output> {
             tok_out.put(&token);
             rng.put(&(&r + iota(2)));
 
-            // `[planes, kv]` layer-major; dividing by `heads` averages heads and sums layers.
-            let rect = reshape(intrinsics::output(0, "attn.scores"), [planes, score_kv]);
-            let folded = &reduce_sum(transpose(&rect)) / heads_f;
+            let folded = reshape(intrinsics::output(0, "attn.scores"), [score_kv]);
             scores_out.put(gather(&folded, iota(kv_max)));
         });
 
@@ -230,7 +217,6 @@ async fn main(input: Input) -> Result<Output> {
         kv_max,
         kv_len: last_kv_len,
         cache_size,
-        layers_observed: layers,
         live_scored: last_scores[..live]
             .iter()
             .filter(|s| s.is_finite() && **s >= 0.0)
