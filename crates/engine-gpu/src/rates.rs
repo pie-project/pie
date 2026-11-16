@@ -9,8 +9,8 @@
 //! its pipelines), so the frame's one submit and wait cancel and what is
 //! left is the work's own time beside a dispatch's:
 //! - the backend's own bf16 matmul at each row count of
-//!   the rung lattice (`engine::rates::row_lattice` up to the backend's
-//!   `Serve::ROWS_TOP`) and each column count and depth of
+//!   the backend's rung lattice (`Serve::rung_lattice`, the rows its loads
+//!   lay fires at) and each column count and depth of
 //!   `engine::rates::DEPTHS`, `m x n x k`, each fire reading the next of
 //!   `engine::rates::weights_at(n, k)`
 //!   weight planes (past the last-level cache), for the matmul grid;
@@ -226,7 +226,7 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         engine::rates::WARM_SHAPE.0,
         warmed.rate / 1e3
     ));
-    let rows = engine::rates::row_lattice(B::ROWS_TOP);
+    let rows = B::rung_lattice();
     let grid = grid(&mut rig, tactics.gemm(tier), timer, launch, &rows)?;
     let mut attn = Vec::with_capacity(ATTN_KEYS.len() * ATTN_DIMS.len());
     for d in ATTN_DIMS {

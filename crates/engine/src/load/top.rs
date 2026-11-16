@@ -592,12 +592,39 @@ mod tests {
         }
     }
 
-    /// A grid at every row of the rung lattice, at 4096 x 4096.
+    /// A grid at every power of two of rows to 16384, at 4096 x 4096.
     fn lattice(rate: f64) -> Vec<(u32, u32, u32, f64)> {
-        crate::rates::row_lattice(16384)
-            .into_iter()
-            .map(|m| (m, 4096, 4096, rate))
-            .collect()
+        (0..=14).map(|i| (1u32 << i, 4096, 4096, rate)).collect()
+    }
+
+    #[test]
+    fn a_lattice_off_the_powers_of_two_is_read_where_its_engine_timed_it() {
+        // An engine whose candidates are its own buckets (2234, 2436), its
+        // grid timed at exactly those rows and at a readout's one: every
+        // rung reads its own rows, and nothing is off the grid.
+        let rows = [1, 2234, 2436];
+        let rates = profile::fire::Rates {
+            bf16_flops_per_ns_by_rows_n_k: Some(
+                rows.iter().map(|&m| (m, 4096, 4096, 1.0)).collect(),
+            ),
+            attn_flops_per_ns_by_keys_and_dim: Some(vec![(2048, 128, 1.0)]),
+            bytes_per_ns: Some(1.0),
+            ..profile::fire::Rates::default()
+        };
+        let rungs = [rung(2234, 100 * MIB, None), rung(2436, 110 * MIB, None)];
+        let (top, estimate) = choose(&rungs, 1 << 33, &rates, "Card X", &counts()).unwrap();
+        assert!(rungs.iter().any(|r| r.tokens == top.tokens));
+        assert_eq!(profile::fire::gemm_rows(&estimate.flops_grid), rows);
+        // The same rungs against a powers-of-two grid: refused by name.
+        let pow2 = profile::fire::Rates {
+            bf16_flops_per_ns_by_rows_n_k: Some(lattice(1.0)),
+            ..rates
+        };
+        let err = choose(&rungs, 1 << 33, &pow2, "Card X", &counts()).unwrap_err();
+        assert!(
+            matches!(err, Refused::OffGrid { ref rows, .. } if rows == &vec![2234, 2436]),
+            "{err}"
+        );
     }
 
     #[test]

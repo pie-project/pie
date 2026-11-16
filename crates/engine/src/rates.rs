@@ -7,8 +7,9 @@
 //! [`provenance`] write them.
 //!
 //! - `bf16_flops_per_ns_by_rows_n_k`: a bf16 matmul of `m` rows, `n`
-//!   columns and depth `k` at each `m` of the rung lattice ([`row_lattice`]
-//!   up to the backend's widest fire) and each `n` and
+//!   columns and depth `k` at each `m` of the engine's own rung lattice
+//!   (the rows its loads lay fires at, which its rates step times exactly;
+//!   no lattice is engine::rates') and each `n` and
 //!   each `k` of [`DEPTHS`] (a serving projection is seldom square: a gate
 //!   and up leg runs wide and shallow, a down leg narrow and deep),
 //!   [`gemm_flops`] a matmul over its time.
@@ -32,23 +33,8 @@
 //!   overlaps its launches the gap comes out small; where it serializes
 //!   them, it is what each adds.
 
-/// The rows the matmul grid is timed at, and the rungs a load lays its
-/// fires at: the one rung lattice, every power of two of tokens from 1 to
-/// `top` and `top` itself ([`crate::memory::rungs`]), `top` the backend's
-/// widest fire. Each point is timed through the kernel serving runs at
-/// that many rows (its own padding and tile in the rate), the estimate
-/// reads a rung's tokens exactly there, and a load lays no rung off it.
-#[must_use]
-pub fn row_lattice(top: u32) -> Vec<u32> {
-    let mut rows = crate::memory::rungs(1, top.max(1));
-    if rows.last() != Some(&top.max(1)) {
-        rows.push(top.max(1));
-    }
-    rows
-}
-
 /// The bytes the rates step lays on the device at once, at most, for a
-/// lattice up to `top` rows: the largest of the warm-up's planes and
+/// largest fire of `top` rows: the largest of the warm-up's planes and
 /// operands, one grid shape's rotation and operands, one attention point's
 /// cold sets, one scan point's cold sets, and the copy's two buffers. What
 /// the step's device binds, so it needs no load budget.
@@ -510,9 +496,6 @@ mod tests {
 
     #[test]
     fn the_lattice_ascends_and_the_counts_are_the_estimates() {
-        assert_eq!(row_lattice(10240)[..3], [1, 2, 4]);
-        assert_eq!(row_lattice(10240).last(), Some(&10240));
-        assert_eq!(row_lattice(8192).len(), 14);
         assert!(step_bytes(10240) >= 6 << 30, "a 16384^2 rotation");
         assert!(DEPTHS.windows(2).all(|w| w[0] < w[1]));
         assert_eq!(weights_at(1024, 1024), 384);

@@ -65,9 +65,21 @@ pub trait Serve: Backend {
     type Flight;
 
     /// The widest fire this backend lays: the tokens its served loads are
-    /// asked, the top of its rung lattice (`engine::rates::row_lattice`) and
-    /// of the rows its rates grid is timed at.
+    /// asked, the top of its rung lattice ([`Serve::rung_lattice`]).
     const ROWS_TOP: u32;
+
+    /// The rows this backend lays fires at, its one rung lattice: every
+    /// power of two of tokens from 1 to [`Serve::ROWS_TOP`], and that top.
+    /// A load offers no other rung, and the rates step times exactly these.
+    #[must_use]
+    fn rung_lattice() -> Vec<u32> {
+        let top = Self::ROWS_TOP.max(1);
+        let mut rows = engine::memory::rungs(1, top);
+        if rows.last() != Some(&top) {
+            rows.push(top);
+        }
+        rows
+    }
 
     /// The key a walked step is kept under to replay.
     type Keep;
@@ -1047,7 +1059,7 @@ impl<B: Serve> Shell<B> {
             // rows the rates grid was timed at, so the estimate never weighs
             // a rung it did not measure.
             let top = budgets.tokens.max_tokens;
-            let mut rung_tokens: Vec<u32> = engine::rates::row_lattice(B::ROWS_TOP)
+            let mut rung_tokens: Vec<u32> = B::rung_lattice()
                 .into_iter()
                 .filter(|&t| t <= top)
                 .collect();
