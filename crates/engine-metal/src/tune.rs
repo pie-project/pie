@@ -906,7 +906,8 @@ fn check_one(
     let e = &weighed.estimate;
     let mut out = format!(
         "{model} on {device}: {:.0} flop/ns at 8192 x 4096, {:.0} B/ns, launch {:.0} ns; dense \
-         {:.2} GB\n  rung  measured  estimated | est (ms): launch work weights flops \
+         {:.2} GB; estimated = work + the launch floors' share (each dispatch its work or a \
+         launch)\n  rung  measured  estimated | est (ms): work floor (share) weights flops \
          readout attn kv recur elem | device by kind (ms, dispatches timed alone): {}  dispatches  sum  \
          wall-sum\n",
         e.flops_per_ns(8192, 4096),
@@ -924,12 +925,13 @@ fn check_one(
         let sum: u64 = by_kind.iter().sum();
         let ms = |ns: f64| format!("{:>6.2}", ns / 1e6);
         out.push_str(&format!(
-            "  {:>5} {:>8.2} {:>9.2} | {} {} {} {} {} {} {} {} {} | {} {:>5} {:>7.2} {:>7.2}\n",
+            "  {:>5} {:>8.2} {:>9.2} | {} {} ({:>4.1}%) {} {} {} {} {} {} {} | {} {:>5} {:>7.2} {:>7.2}\n",
             r.tokens,
             meas[k] / 1e6,
             est[k] / 1e6,
-            ms(t.launch),
             ms(t.work()),
+            ms(t.floor()),
+            100.0 * t.floor() / t.total().max(1.0),
             ms(t.weights),
             ms(t.flops),
             ms(t.readout),
