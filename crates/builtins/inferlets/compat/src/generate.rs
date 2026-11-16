@@ -474,6 +474,7 @@ async fn score_prompt(
         });
 
         let fwd = ForwardPass::new();
+        fwd.release_on_drop();
         fwd.embed(&toks, &embed_indptr)?;
         fwd.state(&[ws], StateGeometry::folding())?;
         fwd.readout(&readout)?;
@@ -659,6 +660,7 @@ pub async fn generate(
     let knobs = KnobChannels::new(&sampling);
 
     let fwd = ForwardPass::new();
+    fwd.release_on_drop();
     fwd.embed(&toks, &embed_indptr)?;
     if !images.is_empty() {
         let spans: Vec<media::Span> = images.iter().map(media::Span::Image).collect();
@@ -746,6 +748,7 @@ pub async fn generate(
     let mask = guide.is_some().then(|| Channel::new([vocab], dtype::bool));
 
     let fwd = ForwardPass::new();
+    fwd.release_on_drop();
     fwd.embed(&tok_in, &lane1)?;
     fwd.state(&[&ws], StateGeometry::folding())?;
     fwd.epilogue(move || {
