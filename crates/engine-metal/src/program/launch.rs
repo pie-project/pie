@@ -1052,7 +1052,8 @@ impl Prepared {
 
     /// The bind-time tables a stage of `plan` takes, in the order `build`
     /// takes them from its [`Tables`]: params, descriptors, offsets, the
-    /// status word and the output addresses and, for a grouped stage, the
+    /// status word, the output addresses and the lane's scratch bases and,
+    /// for a grouped stage, the
     /// channel bindings, the lane table (`channels` slots a lane), its
     /// flags, indices, row meta, `rows` readout rows and each fused
     /// region's layout. Counts alone size them, so a program states them
@@ -1065,6 +1066,7 @@ impl Prepared {
             (plan.value_types.len() * size_of::<u32>()).max(size_of::<u32>()) as u64,
             eta_exec::STATUS_BYTES as u64,
             ((plan.output_pitch as usize).max(1) * size_of::<OutputSeat>()) as u64,
+            scratch_bases_bytes(1),
         ];
         if plan.needs.grouped_valid {
             let shape = LaneShape::of(GROUPED_LANES, channels);
@@ -1971,11 +1973,11 @@ fn scratch_bases_bytes(lanes: u32) -> u64 {
 
 /// `scratch` as the grouped kernels read a lane's bases: piece 0 at its
 /// GPU address (one piece until eta_exec's chunk-aware layout).
-/// Tests' negative control: every lane of a batch handed member 0's
-/// scratch, as a kernel that ignored the bases table would address it.
-/// Per thread, so no other test's batch sees it.
 #[cfg(test)]
 thread_local! {
+    /// Tests' negative control: every lane of a batch handed member 0's
+    /// scratch, as a kernel that ignored the bases table would address it.
+    /// Per thread, so no other test's batch sees it.
     pub(crate) static ALIAS_LANE_SCRATCH: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 }
