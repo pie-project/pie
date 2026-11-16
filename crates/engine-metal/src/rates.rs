@@ -348,7 +348,7 @@ pub fn measure(
     say: &mut dyn FnMut(&str),
 ) -> Result<Rates, String> {
     let tuning = Tuning::new(profile, false, device.cores()).with_family(device.family());
-    let bench = Bench {
+    let mut bench = Bench {
         device,
         handles: Handles::new(),
         pipelines: Pipelines::new(),
@@ -360,6 +360,9 @@ pub fn measure(
         .iter()
         .flat_map(|&k| DEPTHS.iter().map(move |&n| (k, n)))
     {
+        // Each pair's tensors are its own: the handles let the last pair's
+        // planes go (a grid of every (n, k) holds no more than one pair's).
+        bench.handles = Handles::new();
         // The planes every backend rotates through (engine::rates::weights_at:
         // 768 MiB, at least 12), each its own memory so each repeat streams
         // its weight as a layer's matmul does; one plane of the operand
@@ -386,6 +389,7 @@ pub fn measure(
         .iter()
         .flat_map(|&d| ATTN_KEYS.iter().map(move |&keys| (d, keys)))
     {
+        bench.handles = Handles::new();
         let rate = bench.attention_flops(ATTN_SHAPE.at(keys).with_dim(d))?;
         say(&format!(
             "  prefill attention, {keys} rows over {keys} keys, d {d}: {:.2} TFLOP/s",
@@ -393,6 +397,7 @@ pub fn measure(
         ));
         keys_curve.push((keys, d, rate));
     }
+    bench.handles = Handles::new();
     let scan = bench.scan_elements()?;
     say(&format!(
         "  gated-delta scan and its conv: {scan:.1} state elements a ns"
