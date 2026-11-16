@@ -1334,10 +1334,14 @@ pub fn attend(
         Value::merge(arms)
     };
     if scores {
+        const OBSERVE: u32 = 32;
+        const KV_MAX: u32 = 2048;
         let captured = score_capture(
-            q, inputs, kv, q_heads, kv_heads, head_dim, sm_scale, 32, 2048,
+            q, inputs, kv, q_heads, kv_heads, head_dim, sm_scale, OBSERVE, KV_MAX,
         );
-        crate::output("attn.scores", &captured, None);
+        // A `KV_MAX` run per query head: the guest folds over the heads the
+        // output states, never a count of its own.
+        crate::output_in_planes("attn.scores", &captured, None, &[q_heads, KV_MAX]);
     }
     o
 }

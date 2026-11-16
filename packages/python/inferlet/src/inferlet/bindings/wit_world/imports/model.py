@@ -82,7 +82,10 @@ class OutputDecl:
     `width` values of `dtype` per `axis` entry, stacked `layers` deep when
     the model writes it per layer (0 when it does not); at most `max-rows`
     rows a pass. `readout`: its rows are the lane's readout rows, which
-    `forward-pass.readout` chooses.
+    `forward-pass.readout` chooses. `planes`: how one entry's `width`
+    values factor, outermost first, each run contiguous: `[q-heads,
+    keys]` for `attn.scores`, so a guest folds over the heads the model
+    states. Empty when the entry is one flat run.
     """
     name: str
     axis: InputAxis
@@ -91,6 +94,7 @@ class OutputDecl:
     layers: int
     max_rows: int
     readout: bool
+    planes: List[int]
 
 @dataclass
 class LaneDecl:

@@ -639,6 +639,19 @@ impl Engine for Xla {
         self.refused(registered)
     }
 
+    /// XLA's readouts ([`engine::Engine::readout_facts`]): every output
+    /// lands in a ring laid at load (`Pools::lay_readouts`), inside the
+    /// bytes the load reserved, so no term beside the rungs; a sequence
+    /// readout's ring holds the lane rung's rows a fire, the store the
+    /// runtime cuts a fire's sequence lanes to. Float lanes' rows land in a
+    /// ring of the top row rung's rows and are not bounded here.
+    fn readout_facts(&self) -> EngineResult<engine::ReadoutFacts> {
+        Ok(engine::ReadoutFacts {
+            landing: engine::ReadoutLanding::InSpan,
+            store_rows: self.shell.as_ref().and_then(Shell::readout_store_rows),
+        })
+    }
+
     /// The rings an instance keeps in the pool's `Channel` slots: its
     /// program's carried channels on the device; every other ring lives on
     /// the host. No `Instance` slots: the bind-time tables stay host-side.

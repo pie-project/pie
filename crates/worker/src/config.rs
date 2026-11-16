@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 
 /// Backend-specific option structs (typed views over `EngineConfig::options`).
 pub mod backend;
-/// Keys that are gone: each refuses a file that still states it, saying why.
-pub mod removed;
+/// Keys that are retired: each refuses a file that still states it, saying
+/// what became of it.
+pub mod retired;
 /// The dotted-path schema `pie config set`/`get` walk.
 pub mod schema;
 
@@ -16,7 +17,6 @@ pub use backend::{
     CerebrasEngineOptions, CudaEngineOptions, MetalEngineOptions, VulkanEngineOptions,
     WgpuEngineOptions, XlaEngineOptions,
 };
-pub use removed::{Gone, Removed};
 pub use units::{ByteSize, Duration};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -55,7 +55,15 @@ impl Config {
     /// Pure: no file IO, no env, no clap.
     pub fn parse(s: &str) -> Result<Self> {
         let cfg: Config = toml::from_str(s).map_err(|e| {
-            if s.contains("[[model]]") {
+            if let Some(refusal) = retired::explain(e.message(), None) {
+                let line = e
+                    .span()
+                    .map(|span| s[..span.start].matches('\n').count() + 1);
+                match line {
+                    Some(line) => anyhow::anyhow!("parse config: line {line}: {refusal}"),
+                    None => anyhow::anyhow!("parse config: {refusal}"),
+                }
+            } else if s.contains("[[model]]") {
                 anyhow::anyhow!(
                     "parse config: {e}\n\
                      hint: pie serves exactly one model — use a single `[model]` table, \
@@ -506,51 +514,6 @@ pub struct ModelConfig {
     /// wider compute is a normal combination.
     #[serde(default = "default_weight_dtype")]
     pub weight_dtype: String,
-    /// Removed: dense weights always live on the device.
-    #[serde(default, skip_serializing)]
-    pub device_weight_budget: Removed<removed::DeviceWeightBudget>,
-    /// Removed: dense weights always live on the device.
-    #[serde(default, skip_serializing)]
-    pub host_weight_budget: Removed<removed::HostWeightBudget>,
-    /// Removed: `[engine.memory] governor_backoff` / `governor_release_idle`.
-    #[serde(default, skip_serializing)]
-    pub memory_tolerance: Removed<removed::MemoryTolerance>,
-    /// Removed: the weight cache has no mode.
-    #[serde(default, skip_serializing)]
-    pub weight_streaming: Removed<removed::WeightStreaming>,
-    /// Removed: the kv pool takes what the device has.
-    #[serde(default, skip_serializing)]
-    pub device_kv_budget: Removed<removed::DeviceKvBudget>,
-    /// Removed: the load measures the device.
-    #[serde(default, skip_serializing)]
-    pub device_memory_share: Removed<removed::DeviceMemoryShare>,
-    /// Removed: `[engine.memory] budget_host`.
-    #[serde(default, skip_serializing)]
-    pub host_kv_budget: Removed<removed::HostKvBudget>,
-    /// Removed: `[engine.memory] budget_disk`.
-    #[serde(default, skip_serializing)]
-    pub disk_kv_budget: Removed<removed::DiskKvBudget>,
-    /// Removed: `[engine.memory] disk_path`.
-    #[serde(default, skip_serializing)]
-    pub disk_kv_dir: Removed<removed::DiskKvDir>,
-    /// Removed: `[engine.memory] disk_persistent`.
-    #[serde(default, skip_serializing)]
-    pub disk_kv_persistent: Removed<removed::DiskKvPersistent>,
-    /// Removed: the engine tier it deferred is gone.
-    #[serde(default, skip_serializing)]
-    pub host_weight_deferred: Removed<removed::HostWeightDeferred>,
-    /// Removed: the patch ladder is derived.
-    #[serde(default, skip_serializing)]
-    pub max_patches: Removed<removed::MaxPatches>,
-    /// Removed: the patch ladder is derived.
-    #[serde(default, skip_serializing)]
-    pub max_images: Removed<removed::MaxImages>,
-    /// Removed: the voxel ladder is derived.
-    #[serde(default, skip_serializing)]
-    pub max_voxels: Removed<removed::MaxVoxels>,
-    /// Removed: the voxel ladder is derived.
-    #[serde(default, skip_serializing)]
-    pub max_clips: Removed<removed::MaxClips>,
     /// How many adapter seats this deployment intends to use, and which
     /// adapters to write into them at boot. Absent means zero seats.
     #[serde(default)]
@@ -764,7 +727,7 @@ pub struct RuntimeConfig {
     #[serde(default = "default_frame_dispatch_depth")]
     pub frame_dispatch_depth: u32,
     /// Hard cap on inferlets admitted at once. Omit to derive it from the
-    /// engine's `max_forward_requests`, which is what fills a batch.
+    /// engine's fire lanes, which is what fills a batch.
     #[serde(default)]
     pub max_concurrent_processes: Option<usize>,
     /// The worker-plane PLEX policy: a built-in policy's name (`noop`,
@@ -1010,6 +973,25 @@ impl MemoryConfig {
 }
 
 impl EngineConfig {
+    /// The named engine's own keys as its options struct. A retired key is
+    /// refused with what became of it.
+    ///
+    /// # Errors
+    ///
+    /// A key the engine does not declare, or a value of the wrong type.
+    pub fn options_as<T: serde::de::DeserializeOwned>(&self) -> Result<T> {
+        toml::Value::Table(self.options.clone())
+            .try_into()
+            .map_err(|e: toml::de::Error| {
+                let why = retired::explain(e.message(), Some(self.kind))
+                    .unwrap_or_else(|| e.to_string());
+                anyhow::anyhow!(
+                    "invalid [engine] options for engine type {:?}: {why}",
+                    self.kind,
+                )
+            })
+    }
+
     fn validate(&self) -> Result<()> {
         ensure!(!self.device.is_empty(), "engine.device must be non-empty");
         ensure!(
@@ -1019,67 +1001,19 @@ impl EngineConfig {
         self.memory.validate()?;
         match self.kind {
             EngineKind::Cuda => {
-                let _: CudaEngineOptions = toml::Value::Table(self.options.clone())
-                    .try_into()
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "invalid [engine] options for engine type {:?}: {e}",
-                            self.kind,
-                        )
-                    })?;
+                self.options_as::<CudaEngineOptions>()?;
             }
             EngineKind::Metal => {
-                let _: MetalEngineOptions = toml::Value::Table(self.options.clone())
-                    .try_into()
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "invalid [engine] options for engine type {:?}: {e}",
-                            self.kind,
-                        )
-                    })?;
+                self.options_as::<MetalEngineOptions>()?;
             }
             EngineKind::Vulkan => {
-                let _: VulkanEngineOptions = toml::Value::Table(self.options.clone())
-                    .try_into()
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "invalid [engine] options for engine type {:?}: {e}",
-                            self.kind,
-                        )
-                    })?;
+                self.options_as::<VulkanEngineOptions>()?;
             }
-            EngineKind::Wgpu => {
-                let opts: WgpuEngineOptions = toml::Value::Table(self.options.clone())
-                    .try_into()
-                    .map_err(|e| {
-                    anyhow::anyhow!(
-                        "invalid [engine] options for engine type {:?}: {e}",
-                        self.kind,
-                    )
-                })?;
-                opts.validate()?;
-            }
+            EngineKind::Wgpu => self.options_as::<WgpuEngineOptions>()?.validate()?,
             EngineKind::Xla => {
-                let _: XlaEngineOptions = toml::Value::Table(self.options.clone())
-                    .try_into()
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "invalid [engine] options for engine type {:?}: {e}",
-                            self.kind,
-                        )
-                    })?;
+                self.options_as::<XlaEngineOptions>()?;
             }
-            EngineKind::Cerebras => {
-                let opts: CerebrasEngineOptions = toml::Value::Table(self.options.clone())
-                    .try_into()
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "invalid [engine] options for engine type {:?}: {e}",
-                            self.kind,
-                        )
-                    })?;
-                opts.validate()?;
-            }
+            EngineKind::Cerebras => self.options_as::<CerebrasEngineOptions>()?.validate()?,
         }
         Ok(())
     }
@@ -1204,39 +1138,93 @@ device = ["metal:0"]
         an_adapter_past_its_seats_or_on_a_relative_path_is_refused_by_name();
         an_empty_memory_table_is_the_dedicated_machine();
         the_memory_keys_are_seven_and_prefixed();
-        a_removed_key_is_refused_with_why();
-        a_removed_memory_key_names_its_replacement();
+        a_retired_key_is_refused_with_its_fate();
         the_dispatch_depth_is_bounded_by_the_engine_kind();
     }
 
-    fn a_removed_key_is_refused_with_why() {
+    /// Every retired key, stated where main read it, is refused with what
+    /// became of it, on the line that states it; a typo is still only
+    /// unknown, and the keys that replaced them load.
+    fn a_retired_key_is_refused_with_its_fate() {
+        const ENGINE_KEYS: &[&str] = &[
+            "max_model_len",
+            "max_forward_tokens",
+            "max_forward_requests",
+            "max_state_slots",
+            "kv_page_size",
+            "device_memory",
+            "pipeline_cache",
+        ];
+        for r in retired::RETIRED {
+            let kind = r.engine.unwrap_or(EngineKind::Metal).as_str();
+            let line = format!("{} = 1", r.key);
+            let (model, engine) = if ENGINE_KEYS.contains(&r.key) {
+                ("", line.as_str())
+            } else {
+                (line.as_str(), "")
+            };
+            let toml = format!(
+                "[model]\nname = \"default\"\nsource = \"Qwen/Qwen3-0.6B\"\n{model}\n\
+                 [engine]\ntype = \"{kind}\"\ndevice = [\"{kind}:0\"]\n{engine}\n"
+            );
+            let err = Config::parse(&toml).unwrap_err().to_string();
+            let refusal = retired::refusal_for(r.key, r.engine).unwrap();
+            assert!(err.contains(&refusal), "{}: {err}", r.key);
+            assert!(!err.contains("unknown field"), "{}: {err}", r.key);
+            if !model.is_empty() {
+                assert!(err.contains("line 4: "), "{}: {err}", r.key);
+            }
+        }
         let err = Config::parse(&MINIMAL_METAL.replace(
-            "source = \"Qwen/Qwen3-0.6B\"",
-            "source = \"Qwen/Qwen3-0.6B\"\nhost_weight_deferred = false",
+            "device = [\"metal:0\"]",
+            "device = [\"metal:0\"]\nmax_model_len = 8192",
         ))
         .unwrap_err()
         .to_string();
-        assert!(err.contains("`host_weight_deferred` was removed"), "{err}");
-        for key in ["device_weight_budget", "host_weight_budget"] {
-            let toml = MINIMAL_METAL.replace(
-                "source = \"Qwen/Qwen3-0.6B\"",
-                &format!("source = \"Qwen/Qwen3-0.6B\"\n{key} = \"4GiB\""),
-            );
-            let err = Config::parse(&toml).unwrap_err().to_string();
+        assert!(
+            err.contains("`max_model_len` was renamed to `max_context` in `[engine]`"),
+            "{err}"
+        );
+        let err = Config::parse(&MINIMAL_METAL.replace(
+            "device = [\"metal:0\"]",
+            "device = [\"metal:0\"]\nmax_forward_requests = 64",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("`max_forward_requests` is no longer a setting: "),
+            "{err}"
+        );
+
+        // The negative control: a key that was never a setting is only
+        // unknown, and names no fate.
+        for (at, typo) in [
+            ("source = \"Qwen/Qwen3-0.6B\"", "max_contxt = 8192"),
+            ("device = [\"metal:0\"]", "max_contxt = 8192"),
+        ] {
+            let err = Config::parse(&MINIMAL_METAL.replace(at, &format!("{at}\n{typo}")))
+                .unwrap_err()
+                .to_string();
             assert!(
-                err.contains(&format!("`{key}` was removed"))
-                    && err.contains("dense weights always live in device memory"),
-                "{key}: {err}"
+                err.contains("unknown field `max_contxt`") && !err.contains("renamed"),
+                "{err}"
             );
         }
-        let err = toml::from_str::<backend::CudaEngineOptions>("max_state_slots = 16\n")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("`max_state_slots` was removed"), "{err}");
-        let err = toml::from_str::<backend::VulkanEngineOptions>("max_state_slots = 16\n")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("`max_state_slots` was removed"), "{err}");
+
+        // What replaced them loads, and the vulkan engine keeps the
+        // `pipeline_cache` the wgpu engine retired.
+        let current = MINIMAL_METAL.replace(
+            "device = [\"metal:0\"]",
+            "device = [\"metal:0\"]\nmax_context = 8192",
+        ) + "\n[engine.memory]\nbudget_host = \"8GiB\"\nbudget_disk = \"20GiB\"\n\
+              disk_path = \"/nvme\"\ndisk_persistent = false\n";
+        let cfg = Config::parse(&current).expect("the current keys load");
+        assert_eq!(cfg.engine.max_context, Some(8192));
+        assert_eq!(cfg.engine.memory.budget_host, Some(ByteSize::from_mib(8 * 1024)));
+        let vulkan = "[model]\nname = \"default\"\nsource = \"Qwen/Qwen3-0.6B\"\n\
+                      [engine]\ntype = \"vulkan\"\ndevice = [\"vulkan:0\"]\n\
+                      pipeline_cache = \"/tmp/p.bin\"\n";
+        Config::parse(vulkan).expect("vulkan reads pipeline_cache");
     }
 
     fn an_empty_memory_table_is_the_dedicated_machine() {
@@ -1292,51 +1280,6 @@ device = ["metal:0"]
                 "engine.memory.governor_release_idle",
             ]
         );
-    }
-
-    fn a_removed_memory_key_names_its_replacement() {
-        for (key, value, names) in [
-            ("device_memory_share", "0.9", "budget_device"),
-            ("device_kv_budget", "\"20GiB\"", "budget_device"),
-            ("host_kv_budget", "\"20GiB\"", "budget_host"),
-            ("disk_kv_budget", "\"20GiB\"", "budget_disk"),
-            ("disk_kv_dir", "\"/nvme\"", "disk_path"),
-            ("disk_kv_persistent", "true", "disk_persistent"),
-            ("memory_tolerance", "\"polite\"", "governor_backoff"),
-            ("weight_streaming", "\"on\"", "no mode"),
-            ("max_patches", "4096", "refused"),
-            ("max_voxels", "4096", "refused"),
-        ] {
-            let toml = MINIMAL_METAL.replace(
-                "source = \"Qwen/Qwen3-0.6B\"",
-                &format!("source = \"Qwen/Qwen3-0.6B\"\n{key} = {value}"),
-            );
-            let err = Config::parse(&toml).unwrap_err().to_string();
-            assert!(
-                err.contains(&format!("`{key}` was removed")) && err.contains(names),
-                "{key}: {err}"
-            );
-        }
-        for (key, names) in [
-            ("max_forward_tokens = 2048", "largest rung"),
-            ("max_forward_requests = 64", "largest rung"),
-            ("max_model_len = 8192", "max_context"),
-            ("kv_page_size = 16", "chunk plan"),
-        ] {
-            let toml = MINIMAL_METAL.replace(
-                "device = [\"metal:0\"]",
-                &format!("device = [\"metal:0\"]\n{key}"),
-            );
-            let err = Config::parse(&toml).unwrap_err().to_string();
-            assert!(
-                err.contains("was removed") && err.contains(names),
-                "{key}: {err}"
-            );
-        }
-        let err = toml::from_str::<backend::WgpuEngineOptions>("device_memory = \"8GiB\"\n")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("budget_device"), "{err}");
     }
 
     /// A staged engine keeps the 64-bit ring's 15 frames; only the cerebras

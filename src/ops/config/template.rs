@@ -244,30 +244,31 @@ mod tests {
         the_cerebras_block_states_only_keys_the_engine_declares();
         a_binary_with_an_engine_writes_a_config_that_parses();
         it_names_the_engine_this_binary_actually_has();
-        no_block_names_a_removed_key();
+        no_block_names_a_retired_key();
     }
 
     /// Not even commented out: an operator who uncomments a line the
     /// template offers gets a file that parses.
-    fn no_block_names_a_removed_key() {
+    fn no_block_names_a_retired_key() {
+        use worker::config::EngineKind;
         #[allow(unused_mut)]
         let mut blocks = vec![
-            HEADER,
-            DEFAULT_MODEL_BLOCK,
-            CUDA_ENGINE_BLOCK,
-            VULKAN_ENGINE_BLOCK,
-            WGPU_ENGINE_BLOCK,
-            XLA_ENGINE_BLOCK,
-            CEREBRAS_ENGINE_BLOCK,
-            MEMORY,
-            RUNTIME,
-            DEFAULT_FRAMES,
-            CEREBRAS_FRAMES,
-            TAIL,
+            (HEADER, None),
+            (DEFAULT_MODEL_BLOCK, None),
+            (CUDA_ENGINE_BLOCK, Some(EngineKind::Cuda)),
+            (VULKAN_ENGINE_BLOCK, Some(EngineKind::Vulkan)),
+            (WGPU_ENGINE_BLOCK, Some(EngineKind::Wgpu)),
+            (XLA_ENGINE_BLOCK, Some(EngineKind::Xla)),
+            (CEREBRAS_ENGINE_BLOCK, Some(EngineKind::Cerebras)),
+            (MEMORY, None),
+            (RUNTIME, None),
+            (DEFAULT_FRAMES, None),
+            (CEREBRAS_FRAMES, None),
+            (TAIL, None),
         ];
         #[cfg(all(feature = "metal", target_vendor = "apple"))]
-        blocks.push(METAL_ENGINE_BLOCK);
-        for block in blocks {
+        blocks.push((METAL_ENGINE_BLOCK, Some(EngineKind::Metal)));
+        for (block, engine) in blocks {
             for line in block.lines() {
                 let stated = line.trim_start_matches(['#', ' ']);
                 let Some((key, _)) = stated.split_once('=') else {
@@ -275,8 +276,8 @@ mod tests {
                 };
                 let key = key.trim();
                 assert!(
-                    worker::config::removed::refusal_for(key).is_none(),
-                    "the template offers the removed key {key}: {line}"
+                    worker::config::retired::refusal_for(key, engine).is_none(),
+                    "the template offers the retired key {key}: {line}"
                 );
             }
         }

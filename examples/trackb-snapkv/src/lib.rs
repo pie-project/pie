@@ -21,8 +21,6 @@ struct Input {
     /// page, which is where the decode writes.
     #[serde(default = "default_page_budget")]
     page_budget: u32,
-    #[serde(default = "default_heads")]
-    heads: u32,
     #[serde(default)]
     prompt_tokens: Option<Vec<u32>>,
     #[serde(default)]
@@ -43,10 +41,6 @@ fn default_seed() -> u32 {
 }
 fn default_page_budget() -> u32 {
     4
-}
-/// Qwen3.5-0.8B: 8 query heads.
-fn default_heads() -> u32 {
-    8
 }
 
 /// Tie-break ramp: equal-mass pages go to the earlier one, the StreamingLLM prior.
@@ -102,23 +96,21 @@ async fn main(input: Input) -> Result<Output> {
     if input.page_budget == 0 {
         return Err("page_budget must be at least 1".into());
     }
-    if input.heads == 0 {
-        return Err("heads must be at least 1".into());
-    }
     let scores = model::lane_of(&[])?
         .outputs
         .into_iter()
         .find(|output| output.name == "attn.scores")
         .ok_or("this model reads out no attention scores")?;
     let layers = scores.layers.max(1);
-    let heads = input.heads;
-    let score_kv = scores.width / heads;
-    if score_kv * heads != scores.width {
+    // The output states how each layer's row factors: a run of `score_kv`
+    // keys per query head. Folding over a head count of the guest's own
+    // misreads a model with another one.
+    let [heads, score_kv] = scores.planes[..] else {
         return Err(format!(
-            "the {}-wide score row does not split into {heads} heads",
-            scores.width
+            "attn.scores states its row as planes {:?}, not [query heads, keys]",
+            scores.planes
         ));
-    }
+    };
     let Some(planes) = layers.checked_mul(heads) else {
         return Err("layers * heads overflows the plane count".into());
     };

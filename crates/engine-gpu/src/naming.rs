@@ -355,6 +355,7 @@ mod tests {
                     layers: 1,
                     readout: false,
                     tail: 0,
+                    planes: Vec::new(),
                 })
                 .collect(),
             patch: None,
