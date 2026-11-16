@@ -3,8 +3,6 @@ use std::sync::OnceLock;
 
 pub const CUBINS: &str = "cubins";
 
-pub const GEMM_ALGOS: &str = "gemm-algos";
-
 static ROOT: OnceLock<Option<PathBuf>> = OnceLock::new();
 
 pub fn install(root: Option<&Path>) {

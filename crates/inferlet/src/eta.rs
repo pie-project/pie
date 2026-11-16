@@ -647,7 +647,10 @@ impl ForwardPass {
         self.wit.group(lane, id)
     }
 
-    /// Per row, the rows it attends: kv slots if the lanes read kv, else its group's rows.
+    /// Per row, what it attends past the frozen part: column `c` is slot
+    /// `folded() + c` of its lane's working set, the buffer and then the
+    /// pass's rows. Frozen slots are always read. Kv-less lanes: its group's
+    /// rows.
     pub fn mask(&self, rows: &Channel) -> Result<(), String> {
         self.ensure_ports_available(&[Port::AttnMask])?;
         let wit = rows.wit();

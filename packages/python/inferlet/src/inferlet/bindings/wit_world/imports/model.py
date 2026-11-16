@@ -82,7 +82,10 @@ class OutputDecl:
     `width` values of `dtype` per `axis` entry, stacked `layers` deep when
     the model writes it per layer (0 when it does not); at most `max-rows`
     rows a pass. `readout`: its rows are the lane's readout rows, which
-    `forward-pass.readout` chooses.
+    `forward-pass.readout` chooses. `planes`: how one entry's `width`
+    values factor, outermost first, each run contiguous: `[q-heads,
+    keys]` for `attn.scores`, so a guest folds over the heads the model
+    states. Empty when the entry is one flat run.
     """
     name: str
     axis: InputAxis
@@ -91,6 +94,7 @@ class OutputDecl:
     layers: int
     max_rows: int
     readout: bool
+    planes: List[int]
 
 @dataclass
 class LaneDecl:
@@ -166,6 +170,15 @@ def architecture() -> str:
     """
     raise NotImplementedError
 def draft_block() -> Optional[BlockDrafter]:
+    raise NotImplementedError
+def draft_depth() -> int:
+    """
+    How many tokens the model's own draft head proposes in one pass, each
+    fed the one before it: the leading entries of the `mtp.drafts` output
+    that are a chain, whatever width that output has. A guest drafting from
+    the head drafts at most this many a round. 0 for a model whose text
+    states no draft head. Static.
+    """
     raise NotImplementedError
 def switches() -> List[SwitchDecl]:
     """

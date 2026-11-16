@@ -20,6 +20,7 @@ export const modelStub = {
   submitDeadlineUs: () => 50_000n,
   runAheadWindow: () => 4,
   draftBlock: () => undefined,
+  draftDepth: () => 0,
   switches: () => [{ name: 'mode', values: ['encode', 'denoise'] }],
   lane: (switches: Array<[string, string]>) => ({
     inputs: switches.some(([k, v]) => k === 'mode' && v === 'denoise')
@@ -27,7 +28,7 @@ export const modelStub = {
       : [],
     state: true,
     embeds: true,
-    outputs: [{ name: 'logits', axis: 'row', width: 151936, dtype: 'f32', layers: 0, maxRows: 256, readout: true }],
+    outputs: [{ name: 'logits', axis: 'row', width: 151936, dtype: 'f32', layers: 0, maxRows: 256, readout: true, planes: new Uint32Array() }],
   }),
 };
 

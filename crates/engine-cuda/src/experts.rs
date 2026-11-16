@@ -6,6 +6,8 @@ use poem_ir::{Def, Linear, Operation, ParamSource, Trace, ValueId};
 use crate::device::Pinned;
 use crate::error::{Fault, Result};
 
+pub mod staging;
+
 pub type Attachments = BTreeMap<usize, Vec<usize>>;
 
 #[derive(Debug)]
@@ -424,6 +426,20 @@ impl Plan {
     #[must_use]
     pub fn device_demand(&self) -> u64 {
         self.device_bytes
+    }
+
+    /// The bytes of `trace`'s planes this plan leaves on the device's
+    /// weight tier: every plane but those it moves to the host or the
+    /// serving file and the routed banks the weight cache's pool takes.
+    /// Read from the planes, so a plan built up from the default one
+    /// counts what it moved as a cut plan does.
+    pub fn resident_bytes(&self, trace: &Trace) -> Result<u64> {
+        Ok(crate::weights::plane_bytes(trace)?
+            .iter()
+            .enumerate()
+            .filter(|(at, _)| !self.streamed_whole(*at) && !self.pooled.contains(at))
+            .map(|(_, bytes)| bytes.next_multiple_of(crate::weights::ALIGN))
+            .sum())
     }
 
     #[must_use]

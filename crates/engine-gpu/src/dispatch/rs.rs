@@ -117,8 +117,13 @@ impl<B: Backend> Run<'_, B> {
             let Some(plan) = seat.lanes.get(lane0 as usize + r) else {
                 continue;
             };
-            if let Some(run) = &plan.gather {
-                self.rs_move(op, seat, plane, run, ext, begin, false)?;
+            // The buffered slots the lane's lineage replays, run after run
+            // in slot order: every one of its set's (`Lineage::Set`), or the
+            // ones its mask admits (`Lineage::Admitted`).
+            let mut at = begin;
+            for run in &plan.gathers {
+                self.rs_move(op, seat, plane, run, ext, at, false)?;
+                at += run.count;
             }
             let own_at = u64::from(indptr[r].max(0) as u32) * row_bytes;
             self.rs_copy(

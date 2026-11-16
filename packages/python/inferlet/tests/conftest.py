@@ -71,6 +71,7 @@ def _make_model() -> types.ModuleType:
     m.run_ahead_window = lambda: 4
     m.BlockDrafter = BlockDrafterStub
     m.draft_block = lambda: None
+    m.draft_depth = lambda: 0
     m.switches = lambda: [SwitchDeclStub("mode", ["encode", "denoise"])]
     m.lane = _lane
     return m
@@ -117,6 +118,7 @@ class OutputDeclStub:
     layers: int
     max_rows: int
     readout: bool
+    planes: list[int]
 
 
 @dataclass
@@ -130,7 +132,7 @@ class LaneDeclStub:
 def _lane(switches) -> LaneDeclStub:
     denoise = ("mode", "denoise") in switches
     inputs = [InputDeclStub("self_cond_ids", InputAxis.ROW, 4, "i32", None)] if denoise else []
-    logits = OutputDeclStub("logits", InputAxis.ROW, 151936, Dtype.F32, 0, 256, True)
+    logits = OutputDeclStub("logits", InputAxis.ROW, 151936, Dtype.F32, 0, 256, True, [])
     return LaneDeclStub(inputs, True, True, [logits])
 
 

@@ -13,6 +13,14 @@ export function name(): string;
 export function architecture(): string;
 export function draftBlock(): BlockDrafter | undefined;
 /**
+ * How many tokens the model's own draft head proposes in one pass, each
+ * fed the one before it: the leading entries of the `mtp.drafts` output
+ * that are a chain, whatever width that output has. A guest drafting from
+ * the head drafts at most this many a round. 0 for a model whose text
+ * states no draft head. Static.
+ */
+export function draftDepth(): number;
+/**
  * Every switch the bound model declares; empty for a one-path model.
  */
 export function switches(): Array<SwitchDecl>;
@@ -194,7 +202,10 @@ export interface InputDecl {
  * `width` values of `dtype` per `axis` entry, stacked `layers` deep when
  * the model writes it per layer (0 when it does not); at most `max-rows`
  * rows a pass. `readout`: its rows are the lane's readout rows, which
- * `forward-pass.readout` chooses.
+ * `forward-pass.readout` chooses. `planes`: how one entry's `width`
+ * values factor, outermost first, each run contiguous: `[q-heads,
+ * keys]` for `attn.scores`, so a guest folds over the heads the model
+ * states. Empty when the entry is one flat run.
  */
 export interface OutputDecl {
   name: string,
@@ -204,6 +215,7 @@ export interface OutputDecl {
   layers: number,
   maxRows: number,
   readout: boolean,
+  planes: Uint32Array,
 }
 /**
  * A lane of given switches: the inputs it binds (exactly these), whether

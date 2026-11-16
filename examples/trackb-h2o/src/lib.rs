@@ -21,8 +21,6 @@ struct Input {
     page_budget: u32,
     #[serde(default)]
     enforce_tokens: Option<usize>,
-    #[serde(default = "default_heads")]
-    heads: u32,
 }
 
 fn default_prompt() -> String {
@@ -39,10 +37,6 @@ fn default_seed() -> u32 {
 }
 fn default_page_budget() -> u32 {
     4
-}
-/// Qwen3.5-0.8B: 8 query heads.
-fn default_heads() -> u32 {
-    8
 }
 
 /// Four orders of magnitude below one layer-fire's 1.0, so one observation dominates the ramp.
@@ -106,23 +100,21 @@ async fn main(input: Input) -> Result<Output> {
     if input.page_budget == 0 {
         return Err("page_budget must be at least 1".into());
     }
-    if input.heads == 0 {
-        return Err("heads must be at least 1".into());
-    }
     let scores = model::lane_of(&[])?
         .outputs
         .into_iter()
         .find(|output| output.name == "attn.scores")
         .ok_or("this model reads out no attention scores")?;
     let layers = scores.layers.max(1);
-    let heads = input.heads;
-    let score_kv = scores.width / heads;
-    if score_kv * heads != scores.width {
+    // The output states how each layer's row factors: a run of `score_kv`
+    // keys per query head. Folding over a head count of the guest's own
+    // misreads a model with another one.
+    let [heads, score_kv] = scores.planes[..] else {
         return Err(format!(
-            "the {}-wide score row does not split into {heads} heads",
-            scores.width
+            "attn.scores states its row as planes {:?}, not [query heads, keys]",
+            scores.planes
         ));
-    }
+    };
     let Some(planes) = layers.checked_mul(heads) else {
         return Err("layers * heads overflows the plane count".into());
     };
@@ -166,7 +158,7 @@ async fn main(input: Input) -> Result<Output> {
 
     let fwd_p = ForwardPass::new();
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
-    fwd_p.state(&[&ws], StateGeometry::folding())?;
+    fwd_p.state(&[&ws], StateGeometry::default())?;
     fwd_p.epilogue(move || {
         let r = rng_p.take();
         let logits = intrinsics::output(0, "logits");
@@ -217,7 +209,7 @@ async fn main(input: Input) -> Result<Output> {
 
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &lane1)?;
-        fwd.state(&[&ws], StateGeometry::folding())?;
+        fwd.state(&[&ws], StateGeometry::default())?;
 
         fwd.epilogue(move || {
             let r = rng.take();
@@ -321,7 +313,7 @@ async fn main(input: Input) -> Result<Output> {
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &lane1)?;
         fwd.mask(&mask)?;
-        fwd.state(&[&ws], StateGeometry::folding())?;
+        fwd.state(&[&ws], StateGeometry::default())?;
         fwd.epilogue(move || {
             let length = fill.take();
             let r = rng.take();

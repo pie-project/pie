@@ -170,6 +170,7 @@ impl Build {
             value: v,
             layer: None,
             grid: None,
+            planes: Vec::new(),
         });
         self
     }

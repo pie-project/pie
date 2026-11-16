@@ -429,7 +429,7 @@ pub(crate) fn anchored(
             candidates.extend((0..plan.heuristics.len()).map(Tactic::LtEpilogue));
         }
         // A size-only walk (`crate::sizing`) times nothing and keeps no pick.
-        if candidates.is_empty() || crate::sizing::active() {
+        if candidates.is_empty() || crate::sizing::active() || !may_time(key) {
             return (None, plan, lt);
         }
         let charge = device.charge(m);
@@ -1738,7 +1738,7 @@ impl Device {
         {
             return None;
         }
-        if (call.m as usize) * (call.n as usize) * 2 > 256 * 1024 * 1024 {
+        if (call.m as usize) * (call.n as usize) * 2 > 256 * 1024 * 1024 || !may_time(key) {
             return None;
         }
         let tactic = tune(
@@ -2507,21 +2507,118 @@ fn flush_bytes() -> usize {
         .map_or(FALLBACK, |l2| (3 * l2).max(FALLBACK))
 }
 
+/// The dense GEMM tactics a load runs, from its profile's layers: the
+/// device's checked-in table (`profiles/<family>/<device>.gemm`), then the
+/// user's beside their profile (`$PIE_HOME/profiles/cuda/user/<device>.gemm`).
+/// Each table opens with the signature of the cuBLAS and device it was timed
+/// on; one under another signature is not read. Tactics are timed only by
+/// `pie tune` ([`time_tactics`]), which writes the user's table; a load or a
+/// serving times nothing, and a product the tables lack runs cuBLAS's own
+/// pick, counted once a shape ([`untuned`]).
 struct DiskCache {
     signature: String,
     path: Option<PathBuf>,
     entries: HashMap<u64, (i32, i32)>,
+    found: Tactics,
+}
+
+/// The tables [`install_tactics`] named, read by each device's cache.
+static TABLES: Mutex<(Option<&'static str>, Option<PathBuf>)> = Mutex::new((None, None));
+static TIMING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static UNTUNED: Mutex<Option<std::collections::HashSet<u64>>> = Mutex::new(None);
+/// Products timed since the process began: only `pie tune` times any.
+static TIMED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// What [`install_tactics`] found for this device.
+#[derive(Clone, Debug, Default)]
+pub struct Tactics {
+    /// Entries read from the device profile's table.
+    pub from_profile: usize,
+    /// Entries read from the user's table.
+    pub from_user: usize,
+    /// A table timed under another signature, which was not read: its
+    /// header, and the one this device has.
+    pub stale: Option<(String, String)>,
+}
+
+/// Name the tactic tables a load runs: `seeded` the device profile's
+/// checked-in text, `user` the user's file. Called once a load, before its
+/// first product.
+pub fn install_tactics(seeded: Option<&'static str>, user: Option<PathBuf>) -> Tactics {
+    *TABLES.lock().expect("tactic tables lock") = (seeded, user);
+    with_device(|device| {
+        device.chosen.clear();
+        device.disk = DiskCache::new();
+        device.disk.found.clone()
+    })
+}
+
+/// `pie tune` only: time the products the tables lack, and add each pick to
+/// the user's table.
+pub fn time_tactics(on: bool) {
+    TIMING.store(on, std::sync::atomic::Ordering::Release);
+}
+
+/// The products met that no table had a tactic for.
+#[must_use]
+pub fn untuned() -> usize {
+    UNTUNED
+        .lock()
+        .expect("untuned lock")
+        .as_ref()
+        .map_or(0, |set| set.len())
+}
+
+/// The products timed since the process began: 0 unless `pie tune` ran
+/// ([`time_tactics`]), since a load or a serving times none.
+#[must_use]
+pub fn timed() -> usize {
+    TIMED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Whether a missing tactic may be timed now (`pie tune`); otherwise it is
+/// counted.
+fn may_time(key: u64) -> bool {
+    if TIMING.load(std::sync::atomic::Ordering::Acquire) {
+        TIMED.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        return true;
+    }
+    let new = UNTUNED
+        .lock()
+        .expect("untuned lock")
+        .get_or_insert_with(Default::default)
+        .insert(key);
+    if new {
+        tracing::warn!(
+            key = format!("{key:016x}"),
+            "a dense product has no tactic in the profile's tables; it runs cuBLAS's own pick \
+             (`pie tune` times it)"
+        );
+    }
+    false
 }
 
 impl DiskCache {
     fn new() -> Self {
+        let (seeded, user) = TABLES.lock().expect("tactic tables lock").clone();
         let mut cache = Self {
             signature: signature(),
-            path: cache_path(),
+            path: user,
             entries: HashMap::new(),
+            found: Tactics::default(),
         };
-        if !cache.signature.is_empty() && cache.path.is_some() {
-            cache.load();
+        if cache.signature.is_empty() {
+            return cache;
+        }
+        if let Some(text) = seeded {
+            cache.found.from_profile = cache.read(text);
+        }
+        if let Some(text) = cache
+            .path
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+        {
+            cache.found.from_user = cache.read(&text);
         }
         cache
     }
@@ -2553,40 +2650,32 @@ impl DiskCache {
         let _ = writeln!(file, "{key:016x} {kind} {algo}");
     }
 
-    fn load(&mut self) {
-        let Some(path) = self.path.clone() else {
-            return;
-        };
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            return;
-        };
+    /// Lay one table's entries over those read before it; the count read,
+    /// or 0 for a table under another signature (named in `found.stale`).
+    fn read(&mut self, text: &str) -> usize {
         let mut lines = text.lines();
-        let matches = lines
-            .next()
-            .is_some_and(|first| first.trim_end_matches(['\n', '\r']) == self.signature);
-        if matches {
-            let mut fields = lines.flat_map(str::split_whitespace);
-            while let (Some(key), Some(kind), Some(algo)) =
-                (fields.next(), fields.next(), fields.next())
-            {
-                let (Ok(key), Ok(kind), Ok(algo)) = (
-                    u64::from_str_radix(key, 16),
-                    kind.parse::<i32>(),
-                    algo.parse::<i32>(),
-                ) else {
-                    break;
-                };
-                self.entries.insert(key, (kind, algo));
-            }
-        } else {
-            self.entries.clear();
-            let _ = std::fs::remove_file(&path);
+        let head = lines.next().unwrap_or("").trim_end_matches(['\n', '\r']);
+        if head != self.signature {
+            self.found.stale = Some((head.to_string(), self.signature.clone()));
+            return 0;
         }
+        let mut read = 0;
+        let mut fields = lines.flat_map(str::split_whitespace);
+        while let (Some(key), Some(kind), Some(algo)) =
+            (fields.next(), fields.next(), fields.next())
+        {
+            let (Ok(key), Ok(kind), Ok(algo)) = (
+                u64::from_str_radix(key, 16),
+                kind.parse::<i32>(),
+                algo.parse::<i32>(),
+            ) else {
+                break;
+            };
+            self.entries.insert(key, (kind, algo));
+            read += 1;
+        }
+        read
     }
-}
-
-fn cache_path() -> Option<PathBuf> {
-    Some(crate::disk::dir(crate::disk::GEMM_ALGOS)?.join("dense.txt"))
 }
 
 fn signature() -> String {
@@ -2616,4 +2705,65 @@ fn signature() -> String {
         "# pie-dense-gemm v11 sm{}{} cublas={version} dev={name}",
         prop.major, prop.minor
     )
+}
+
+#[cfg(test)]
+mod tactic_tables {
+    use super::{DiskCache, Tactics};
+    use std::collections::HashMap;
+
+    fn cache() -> DiskCache {
+        DiskCache {
+            signature: "# pie-dense-gemm v11 sm89 cublas=130000 dev=NVIDIA L40S".to_string(),
+            path: None,
+            entries: HashMap::new(),
+            found: Tactics::default(),
+        }
+    }
+
+    #[test]
+    fn the_users_table_lays_over_the_profiles() {
+        let mut c = cache();
+        let head = c.signature.clone();
+        assert_eq!(
+            c.read(&format!(
+                "{head}\n00000000000000aa 1 3\n00000000000000bb 1 4\n"
+            )),
+            2
+        );
+        assert_eq!(c.read(&format!("{head}\n00000000000000bb 2 7\n")), 1);
+        assert_eq!(c.lookup(0xaa), Some((1, 3)));
+        assert_eq!(c.lookup(0xbb), Some((2, 7)));
+        assert!(c.found.stale.is_none());
+    }
+
+    #[test]
+    fn a_table_timed_under_another_signature_is_not_read() {
+        let mut c = cache();
+        let other = "# pie-dense-gemm v11 sm89 cublas=120800 dev=NVIDIA L40S";
+        assert_eq!(c.read(&format!("{other}\n00000000000000aa 1 3\n")), 0);
+        assert_eq!(c.lookup(0xaa), None);
+        assert_eq!(c.found.stale.as_ref().map(|(t, _)| t.as_str()), Some(other));
+    }
+
+    #[test]
+    fn the_checked_in_l40s_table_reads_whole() {
+        let text = include_str!("../../../../engine-cuda/profiles/sm89/nvidia-l40s.gemm");
+        let mut c = cache();
+        assert_eq!(c.read(text), text.lines().count() - 1);
+    }
+
+    #[test]
+    fn the_checked_in_rtx_pro_4500_table_reads_whole() {
+        let text = include_str!(
+            "../../../../engine-cuda/profiles/sm120/nvidia-rtx-pro-4500-blackwell.gemm"
+        );
+        let mut c = DiskCache {
+            signature: "# pie-dense-gemm v11 sm120 cublas=130000 dev=NVIDIA RTX PRO 4500 Blackwell"
+                .to_string(),
+            ..cache()
+        };
+        assert_eq!(c.read(text), text.lines().count() - 1);
+        assert!(c.found.stale.is_none());
+    }
 }

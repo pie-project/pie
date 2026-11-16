@@ -550,6 +550,14 @@ pub fn prepare_many(
                 return Err(error.to_string());
             }
         };
+        // A lane alone on its set replays every buffered slot of it; lanes
+        // sharing a set replay the slots their masks admit, the ancestry
+        // they state.
+        let lineage = if group.lanes.len() > 1 {
+            engine::fire::Lineage::Admitted
+        } else {
+            engine::fire::Lineage::Set
+        };
         for (at, &lane) in group.lanes.iter().enumerate() {
             let fold = match (at, group.fold) {
                 (0, GroupFold::Host(count)) => engine::fire::FoldLen::Host(count),
@@ -561,6 +569,7 @@ pub fn prepare_many(
                 base,
                 folded,
                 fold,
+                lineage,
             };
         }
     }
@@ -688,6 +697,7 @@ mod tests {
             base,
             folded,
             fold,
+            ..
         } = &lowered(&out, 1)[0].0
         else {
             panic!("a buffering lane");

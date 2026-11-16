@@ -1,5 +1,6 @@
 //! poem-compiler's integration tests, one binary: each module was a test file.
 
+mod a_score_output_states_its_heads_and_keys;
 mod common;
 mod flux_2_dims;
 mod hunyuan_image_3_dims;
@@ -40,6 +41,7 @@ mod every_row_is_a_deployment_its_model_checks;
 mod legs_join_into_what_a_package_once_packed;
 mod an_mtp_head_reads_the_next_tokens;
 mod the_block_drafters_state_their_facts;
+mod a_draft_head_states_its_chain;
 mod the_bonsai_forward_wires_the_hadamard_rotation;
 mod the_bonsai_rht_signs_ingest_is_value_exact;
 mod the_dsv41_plan_is_the_published_one;

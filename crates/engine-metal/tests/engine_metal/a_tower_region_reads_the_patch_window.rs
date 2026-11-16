@@ -99,6 +99,7 @@ fn tower_and_trunk() -> Trace {
         value: y,
         layer: None,
         grid: None,
+        planes: Vec::new(),
     });
     b.trace
 }

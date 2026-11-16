@@ -25,8 +25,6 @@ struct Input {
     /// whole prompt served. The gate compares the two.
     #[serde(default = "default_evict")]
     evict: bool,
-    #[serde(default = "default_heads")]
-    heads: u32,
 }
 
 fn default_needle() -> String {
@@ -46,10 +44,6 @@ fn default_page_budget() -> u32 {
 }
 fn default_evict() -> bool {
     true
-}
-/// Qwen3.5-0.8B: 8 query heads.
-fn default_heads() -> u32 {
-    8
 }
 
 #[derive(Serialize)]
@@ -83,9 +77,6 @@ struct Output {
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    if input.heads == 0 {
-        return Err("heads must be at least 1".into());
-    }
     let scores = model::lane_of(&[])?
         .outputs
         .into_iter()
@@ -95,14 +86,15 @@ async fn main(input: Input) -> Result<Output> {
         return Err("depth must be between 0.0 and 1.0".into());
     }
     let layers = scores.layers.max(1);
-    let heads = input.heads;
-    let score_kv = scores.width / heads;
-    if score_kv * heads != scores.width {
+    // The output states how each layer's row factors: a run of `score_kv`
+    // keys per query head. Folding over a head count of the guest's own
+    // misreads a model with another one.
+    let [heads, score_kv] = scores.planes[..] else {
         return Err(format!(
-            "the {}-wide score row does not split into {heads} heads",
-            scores.width
+            "attn.scores states its row as planes {:?}, not [query heads, keys]",
+            scores.planes
         ));
-    }
+    };
     let Some(planes) = layers.checked_mul(heads) else {
         return Err("layers * heads overflows the plane count".into());
     };
@@ -169,20 +161,17 @@ async fn main(input: Input) -> Result<Output> {
     // Freezes the haystack but buffers the question's rows: the answer below writes them again.
     let toks_p = Channel::from(&prompt_i32[..]);
     let embed_indptr_p = Channel::from([0u32, n]);
-    let fold_p = Channel::from([ask_at]);
     let tok_out_p = Channel::new([1], dtype::i32);
     let page_mass_out = Channel::new([p_max], dtype::f32);
     let total_out = Channel::new([1], dtype::f32);
 
     let fwd_p = ForwardPass::new();
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
-    fwd_p.state(
-        &[&ws],
-        StateGeometry {
-            fold: Fold::Count(&fold_p),
-            ..StateGeometry::default()
-        },
-    )?;
+    // The haystack stays unfolded: the question's mask hides the rows it does
+    // not keep, and a mask speaks only of the rows past the set's committed
+    // boundary (column `c` is slot `folded + c`). Unfolded, the boundary
+    // stays 0 and the columns are slots.
+    fwd_p.state(&[&ws], StateGeometry::default())?;
     fwd_p.epilogue(move || {
         let logits = intrinsics::output(0, "logits");
         tok_out_p.put(reduce_argmax(logits));

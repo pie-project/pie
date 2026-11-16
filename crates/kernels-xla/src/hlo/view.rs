@@ -711,7 +711,7 @@ impl Func {
             && g % len == 0
             && self.blocked(rows_total, nr)
             && batch * nr * LANES * 4 <= SMALL_BY_XLA;
-        if aligned && g % len == 0 && k > 1 && crate::blocks::on() && !self.xla_reads && !small {
+        if aligned && g % len == 0 && k > 1 && !self.xla_reads && !small {
             // Whole blocks by DMA, any number of rows: no element
             // reinterpreted (`crate::blocks`).
             let at = self.block_of(row, nr)?;
@@ -1105,7 +1105,7 @@ impl Func {
         rows_total: i64,
         unique: bool,
     ) -> Built<Option<Val>> {
-        if g % len == 0 && k > 1 && crate::blocks::on() {
+        if g % len == 0 && k > 1 {
             // whole blocks by DMA (`crate::blocks`), any number of rows:
             // a row scatter pays for every pool row it is handed
             let at = self.block_of(row, nr)?;

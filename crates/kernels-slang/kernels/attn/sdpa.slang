@@ -5,13 +5,14 @@
 #include "prim/pool.slang"
 
 // Paged attention over a KV cache, bf16 two a word, causal (an optional
-// sliding window, an optional per-row byte mask). Decode reads one query row
-// a workgroup (per head): the workgroup's subgroups (the subgroup tier,
-// SPIR-V only) or 32-lane strips (the baseline, reduced through workgroup
-// memory) each walk a share of the keys with an online softmax and fold at
-// the end. The subgroup tier reads a bf16 value a lane and the mask a byte
-// at a time as 16- and 8-bit storage (the same bytes as the packed words),
-// one load a dim: engine-vulkan's decode, kept as it was measured.
+// sliding window, an optional per-row byte mask from its lane's committed
+// boundary on). Decode reads one query row a workgroup (per head): the
+// workgroup's subgroups (the subgroup tier, SPIR-V only) or 32-lane strips
+// (the baseline, reduced through workgroup memory) each walk a share of the
+// keys with an online softmax and fold at the end. The subgroup tier reads a
+// bf16 value a lane and the mask a byte at a time as 16- and 8-bit storage
+// (the same bytes as the packed words), one load a dim: engine-vulkan's
+// decode, kept as it was measured.
 // Variants: the row's base-2 LSE (`PIE_LSE`); the keys a block selection
 // names (`PIE_SELECTED`); one of `splits` key ranges a workgroup, landing f32
 // partials and their LSE for the fold (`PIE_SPLIT`, `PIE_SPLIT_LSE`).
@@ -144,27 +145,21 @@ void main(uint3 gid : SV_DispatchThreadID) {
 [[vk::binding(3)]] StructuredBuffer<int> req_of_token;
 [[vk::binding(4)]] StructuredBuffer<uint> kv_page_indices;
 [[vk::binding(5)]] StructuredBuffer<uint> kv_page_indptr;
+// A row's mask word: its enable flag in bits 0-1 (nonzero: the row reads
+// its mask) and its lane's committed boundary in bits 2-31, the key its
+// plane's column 0 is.
+[[vk::binding(7)]] StructuredBuffer<uint> attention_mask_words;
 #if defined(SDPA_NARROW_STORAGE)
 [[vk::binding(6)]] StructuredBuffer<uint8_t> attention_mask;
-[[vk::binding(7)]] StructuredBuffer<uint8_t> attention_mask_enabled;
 
 uint mask_byte(uint i) {
     return uint(attention_mask[i]);
 }
-
-uint mask_enabled_byte(uint row) {
-    return uint(attention_mask_enabled[row]);
-}
 #else
 [[vk::binding(6)]] StructuredBuffer<uint> attention_mask;
-[[vk::binding(7)]] StructuredBuffer<uint> attention_mask_enabled;
 
 uint mask_byte(uint i) {
     return byte_at(attention_mask, i);
-}
-
-uint mask_enabled_byte(uint row) {
-    return byte_at(attention_mask_enabled, row);
 }
 #endif
 #if defined(PIE_SPLIT)
@@ -226,19 +221,29 @@ uint page_row(int req, int kp) {
         + uint(kp % params.page_size) * uint(params.n_kv_heads) * uint(PIE_HEAD_DIM);
 }
 
+// Whether row `row`'s mask admits key `kp`. A row's mask speaks of the keys
+// from its lane's committed boundary on: every key below it is committed and
+// read under the model's own bounds alone, and the plane's column `c` is key
+// `origin + c`. An unmasked row admits every key.
+bool mask_admits(uint row, uint kp) {
+    uint word = attention_mask_words[row];
+    if ((word & 3u) == 0u) {
+        return true;
+    }
+    uint origin = word >> 2;
+    if (kp < origin) {
+        return true;
+    }
+    uint column = kp - origin;
+    return column < params.attention_mask_stride
+        && mask_byte(row * params.attention_mask_stride + column) != 0u;
+}
+
 bool keeps(uint row, int kp, int q_pos, int start) {
     if (kp > q_pos || kp < start) {
         return false;
     }
-    if (mask_enabled_byte(row) != 0u) {
-        if (uint(kp) >= params.attention_mask_stride) {
-            return false;
-        }
-        if (mask_byte(row * params.attention_mask_stride + uint(kp)) == 0u) {
-            return false;
-        }
-    }
-    return true;
+    return mask_admits(row, uint(kp));
 }
 
 int window_start(int q_pos) {

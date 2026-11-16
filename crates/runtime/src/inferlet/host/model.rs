@@ -28,6 +28,7 @@ fn output_decl(
         layers: output.layers,
         max_rows: u32::try_from(output_rows(output, limits)).unwrap_or(u32::MAX),
         readout: output.readout,
+        planes: output.planes.clone(),
     }
 }
 
@@ -67,6 +68,10 @@ impl pie::inferlet::model::Host for ProcessCtx {
                 proposals_from: caps.draft_proposals_from,
             }),
         )
+    }
+
+    async fn draft_depth(&mut self) -> Result<u32> {
+        Ok(model::model().facts().draft_depth.unwrap_or(0))
     }
 
     async fn switches(&mut self) -> Result<Vec<pie::inferlet::model::SwitchDecl>> {

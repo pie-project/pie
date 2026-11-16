@@ -328,12 +328,30 @@ impl Recorder {
     }
 
     pub fn output(&self, name: &str, value: &Value, grid: Option<&Value>) {
+        self.output_in_planes(name, value, grid, &[]);
+    }
+
+    /// [`Recorder::output`], with how one entry's width factors
+    /// ([`poem_ir::Output::planes`]).
+    pub fn output_in_planes(&self, name: &str, value: &Value, grid: Option<&Value>, planes: &[u32]) {
         self.inner.borrow_mut().outputs.push(Output {
             name: name.to_string(),
             value: value.id,
             layer: self.at.get(),
             grid: grid.map(|grid| grid.id),
+            planes: planes.to_vec(),
         });
+    }
+
+    /// States the draft head's chain depth; a text states it once.
+    pub fn draft_depth(&self, depth: u32) {
+        let mut inner = self.inner.borrow_mut();
+        match inner.facts.draft_depth {
+            Some(prior) if prior != depth => {
+                panic!("the text states two draft depths: {prior} and then {depth}")
+            }
+            _ => inner.facts.draft_depth = Some(depth),
+        }
     }
 
     pub fn declare_switch(&self, name: &str, values: &[&str]) {

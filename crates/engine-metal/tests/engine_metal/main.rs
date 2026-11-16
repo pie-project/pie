@@ -20,6 +20,7 @@ mod a_parked_lane_serves_the_never_parked_logits;
 mod a_prompt_scan_lands_its_snapshots;
 mod a_scattered_pool_serves_the_same_logits;
 mod a_settled_fires_fold_is_told_before_it_returns;
+mod a_stated_position_bounds_no_key;
 mod a_stale_frozen_length_replays_from_where_the_record_stands;
 mod a_ternary_decode_in_dot_answers_the_host_decoder;
 mod a_tower_region_reads_the_patch_window;

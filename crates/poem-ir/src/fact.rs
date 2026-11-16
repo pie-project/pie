@@ -73,6 +73,12 @@ pub struct Facts {
     pub table: Vec<Fact>,
     #[serde(default)]
     pub switches: Vec<SwitchDecl>,
+    /// The tokens the model's own draft head proposes in one pass, each fed
+    /// the one before it: the leading entries of `mtp.drafts` that are a
+    /// chain, however many copies the output carries. `None` when the text
+    /// states no head.
+    #[serde(default)]
+    pub draft_depth: Option<u32>,
 }
 
 impl Facts {

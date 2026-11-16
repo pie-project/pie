@@ -5,7 +5,7 @@
 // (`PivotThreshold(CummassLe)`) or top-k (`RankLe`) cut of it, the cut logits
 // masked, Gumbel noise added, an argmax — on several blocks a lane instead of
 // one. Each block walks its stretch of the row; the reductions and every pass
-// of the cut meet through the lane's temporary arena, the blocks waiting for
+// of the cut meet through the lane's arena, the blocks waiting for
 // one another at a barrier (a lane's blocks are launched together, a grid the
 // device holds at once). Every merge runs in block order and every decision
 // after it is a function of the merged results alone, so the blocks decide
@@ -13,7 +13,9 @@
 // width-32 tree (`canonical_reduce`), and the cut is `m1_cut_row` /
 // `m1_rank_row` over the group's hooks.
 //
-// The arena, per block (`temporary_stride` apart): a 64-byte line (block 0's
+// The arena, per block (`M1_LANE_ARENA_STRIDE` apart, a lane's blocks' together
+// in the engine's lane arenas, laid once at load: a fire's lanes meet there
+// one launch after another): a 64-byte line (block 0's
 // holds the lane's barrier words, one a block; zeroed before the launch),
 // two exchange buffers, used by alternate merges (a block is at most one
 // merge ahead of the slowest), and two buffers of gathered elements.
@@ -25,6 +27,11 @@
 // the gathered elements each holds (two buffers of them, after the halves).
 #define M1_LANE_ARENAS 16u
 #define M1_FAST_GATHER 512u
+// A block's arena, from one to the next in the lane arenas: its line, its
+// halves and its gather buffers, to 256 bytes (the launcher's
+// `lane_arena_stride`).
+#define M1_LANE_ARENA_STRIDE                                                          \
+  ((M1_LANE_HEAD + 2u * M1_LANE_HALF + 2u * M1_FAST_GATHER * 8u + 255u) & ~255u)
 
 // ---------------------------------------------------------- the fast cut --
 //

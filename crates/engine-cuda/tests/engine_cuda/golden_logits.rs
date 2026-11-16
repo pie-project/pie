@@ -8,14 +8,13 @@
 //! that must not move a logit (a memory layout, an address) is proven by
 //! the same hashes before and after it.
 //!
-//! cuBLAS picks a dense product's algorithm by timing it once a process, so
-//! two processes may sum a product in two orders. The probe pins those picks
-//! in a GEMM algorithm cache shared across runs (`PIE_GOLDEN_CACHE`, by
-//! default `pie-golden-cache` under the system's temp dir): the first run
-//! times and records each pick, every later one reads it back. Each model is
-//! served twice in its process, the first serving only warming the picks,
-//! so a product first met inside a graph capture (left untimed there) has
-//! been timed before the hashed serving, in every run and every order.
+//! A dense product's cuBLAS algorithm is the one the profile's tactic tables
+//! name, or cuBLAS's own pick where they name none; nothing is timed at load,
+//! so every run sums each product in the same order. The probe reads the
+//! user's table under the cache shared across runs (`PIE_GOLDEN_CACHE/profiles`,
+//! the cache by default `pie-golden-cache` under the system's temp dir) over
+//! the device profile's checked-in one. Each model is served twice in its
+//! process, and the second serving is the one hashed.
 //!
 //! Run by hand (both are ignored in the suite): first `golden_fixtures`,
 //! which seeds each model's checkpoint into the cache's `fixtures` without a
@@ -407,7 +406,26 @@ fn load(fixture: &Fixture, cache: &Path) -> Shell {
 static SMALL_POOL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn load_with(fixture: &Fixture, cache: &Path, knobs: engine_cuda::Knobs) -> Shell {
-    let shell = Shell::load(Boot {
+    let shell = load_under(fixture, cache, knobs, engine::Allowance::WHOLE)
+        .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
+    let (_, outside) = shell.held_and_outside();
+    assert_eq!(
+        outside,
+        shell.ledger().bytes(engine::memory::Class::Outside),
+        "{}: the load states outside its span what its ledger enters there",
+        fixture.model
+    );
+    shell
+}
+
+/// [`load_with`] under `allowance`, its refusal returned.
+fn load_under(
+    fixture: &Fixture,
+    cache: &Path,
+    knobs: engine_cuda::Knobs,
+    allowance: engine::Allowance,
+) -> Result<Shell, String> {
+    Shell::load(Boot {
         trace: fixture.trace.clone(),
         contract: &fixture.contract,
         checkpoint: &fixture.container,
@@ -432,7 +450,7 @@ fn load_with(fixture: &Fixture, cache: &Path, knobs: engine_cuda::Knobs) -> Shel
                 .map(|mib| mib << 20),
             mib => Some(mib << 20),
         },
-        allowance: engine::Allowance::WHOLE,
+        allowance,
         context_declared: false,
         ordinal: 0,
         knobs,
@@ -443,15 +461,7 @@ fn load_with(fixture: &Fixture, cache: &Path, knobs: engine_cuda::Knobs) -> Shel
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
     })
-    .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
-    let (_, outside) = shell.held_and_outside();
-    assert_eq!(
-        outside,
-        shell.ledger().bytes(engine::memory::Class::Outside),
-        "{}: the load states outside its span what its ledger enters there",
-        fixture.model
-    );
-    shell
+    .map_err(|why| why.to_string())
 }
 
 /// The load's knobs: `PIE_GOLDEN_CHUNK` (bytes) sets the chunk size the
@@ -459,6 +469,7 @@ fn load_with(fixture: &Fixture, cache: &Path, knobs: engine_cuda::Knobs) -> Shel
 /// full model's are. The logits are the same either way.
 fn knobs() -> engine_cuda::Knobs {
     let mut knobs = engine_cuda::Knobs::default();
+    knobs.profiles = Some(cache_dir().join("profiles"));
     if let Ok(bytes) = std::env::var("PIE_GOLDEN_CHUNK") {
         knobs.diagnostics.chunk_bytes = Some(bytes.parse().expect("PIE_GOLDEN_CHUNK is bytes"));
     }
@@ -1276,6 +1287,7 @@ fn served_buffered(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
                 base,
                 folded,
                 fold: FoldLen::Host(fold),
+                lineage: engine::fire::Lineage::Set,
             },
         );
         fed = end;
@@ -1406,6 +1418,7 @@ fn served_carrying(fixture: &Fixture, cache: &Path, buffer: bool) -> (Vec<Vec<f3
                 base,
                 folded,
                 fold: FoldLen::Host(if at == CARRIED { CARRIED + 1 } else { 0 }),
+                lineage: engine::fire::Lineage::Set,
             }
         } else {
             RsVerb::Fold
@@ -1530,6 +1543,7 @@ fn served_pair_buffered(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
                         base,
                         folded: folded[lane],
                         fold: FoldLen::Host(fold),
+                        lineage: engine::fire::Lineage::Set,
                     },
                     fold,
                 )
@@ -1762,6 +1776,7 @@ fn submitted_buffered(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
                 base,
                 folded,
                 fold: FoldLen::Host(fold),
+                lineage: engine::fire::Lineage::Set,
             },
             copies,
         );
@@ -2644,4 +2659,491 @@ fn every_armed_composition_of_an_mtp_deployment_is_sized() {
         "{}: a serving fire's composition was never armed ({after:?})",
         row.name
     );
+}
+
+/// A load and its serving time no dense GEMM tactic: two loads of one model
+/// with fresh, empty user tables pick the same tactics (the checked-in
+/// table's, or cuBLAS's own) and serve bit-identical logits, and the
+/// process timed nothing. Under `time_tactics` (as `pie tune` runs) the same
+/// load times what the tables lack, which is the control: a model the
+/// checked-in table does not cover, so there is something to time.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn golden_two_fresh_loads_time_nothing() {
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    let cache = cache_dir();
+    // A model whose products the checked-in table does not hold, so the
+    // control has something to time: `PIE_GOLDEN_FRESH`.
+    let model =
+        std::env::var("PIE_GOLDEN_FRESH").unwrap_or_else(|_| "qwen38-flash-next-mini".to_string());
+    let fixture = fixture(&model, &cache);
+    let dir_of =
+        |n: u32| std::env::temp_dir().join(format!("pie-fresh-tactics-{}-{n}", std::process::id()));
+    // The probe's homes go when it ends, passing or not.
+    struct Homes<F: Fn(u32) -> std::path::PathBuf>(F);
+    impl<F: Fn(u32) -> std::path::PathBuf> Drop for Homes<F> {
+        fn drop(&mut self) {
+            for n in 0..3 {
+                let _ = std::fs::remove_dir_all((self.0)(n));
+            }
+        }
+    }
+    let _homes = Homes(dir_of);
+    let fresh = |n: u32| {
+        let dir = dir_of(n);
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut knobs = knobs();
+        knobs.profiles = Some(dir);
+        knobs
+    };
+    let serve = |knobs: engine_cuda::Knobs| {
+        let mut shell = load_with(&fixture, &cache, knobs);
+        shell.open(0).expect("slot 0 opens");
+        let prompt: Vec<u32> = (0..64u32).map(|t| (t * 7 + 11) % 1000).collect();
+        let word = fixture.trace.facts.word(&Request::new(64, false));
+        let mut rows = shell
+            .fire_media(
+                &[Seated::of(Lane {
+                    slot: 0,
+                    word,
+                    tokens: &prompt,
+                })],
+                &[],
+                &[],
+            )
+            .expect("the prompt fires");
+        rows.swap_remove(0)
+    };
+    let before = kernels_cuda::linear::gemm::timed();
+    let first = serve(fresh(0));
+    let second = serve(fresh(1));
+    let timed = kernels_cuda::linear::gemm::timed() - before;
+    println!(
+        "golden {model}-fresh-loads: timed {timed} product(s); logits equal: {}",
+        first == second
+    );
+    assert_eq!(timed, 0, "a load timed {timed} dense GEMM product(s)");
+    assert!(first == second, "two fresh loads served different logits");
+    kernels_cuda::linear::gemm::time_tactics(true);
+    let _ = serve(fresh(2));
+    kernels_cuda::linear::gemm::time_tactics(false);
+    let control = kernels_cuda::linear::gemm::timed() - before;
+    println!("golden {model}-fresh-loads: under time_tactics a load timed {control}");
+    assert!(
+        control > 0,
+        "a load under time_tactics timed nothing, so this probe's model shows nothing"
+    );
+}
+
+/// One lane's state after a fire of `tokens` that buffers them all past a
+/// fresh state, then a fire of `next` that replays the first `keep` of them
+/// and folds those (`RsVerb::Buffer` with `fold`), against slots that fold
+/// `tokens` whole and its first `keep` alone. Returns the three states.
+fn served_partial_fold(
+    fixture: &Fixture,
+    cache: &Path,
+    tokens: &[u32],
+    next: &[u32],
+    keep: u32,
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    use engine::fire::{FoldLen, RsVerb};
+    let mut shell = Shell::load(Boot {
+        trace: fixture.trace.clone(),
+        contract: &fixture.contract,
+        checkpoint: &fixture.container,
+        budget: Budget::new(1, TOKENS),
+        patches: None,
+        voxels: None,
+        page_size: PAGE,
+        context: CONTEXT,
+        slots: 4,
+        kv_budget: None,
+        allowance: engine::Allowance::WHOLE,
+        context_declared: false,
+        ordinal: 0,
+        knobs: buffering(knobs()),
+        cache_dir: Some(cache),
+        runahead: engine::runahead::Runahead::F1,
+        residency: engine_cuda::experts::Plan::default(),
+        world: engine_cuda::World::default(),
+        expert: engine_cuda::World::default(),
+        comm: core::ptr::null_mut(),
+    })
+    .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
+    shell.back_whole().expect("the fitted pool is backed whole");
+    let page = rs_page(&mut shell);
+    let fire = |shell: &mut Shell, slot: u32, tokens: &[u32], rs: RsVerb| {
+        let word = fixture.trace.facts.word(&Request::new(
+            u32::try_from(tokens.len()).expect("a count"),
+            false,
+        ));
+        shell
+            .fire_media(
+                &[Seated {
+                    rs,
+                    ..Seated::of(Lane { slot, word, tokens })
+                }],
+                &[],
+                &[],
+            )
+            .expect("the fire runs");
+    };
+    let held = u32::try_from(tokens.len()).expect("a count");
+    let end = held + u32::try_from(next.len()).expect("a count");
+    let pages: Vec<u32> = (0..end.div_ceil(page)).collect();
+    for slot in 0..3 {
+        shell.open(slot).expect("the slot opens");
+    }
+    fire(&mut shell, 0, tokens, RsVerb::Fold);
+    let whole = shell.state_bytes(0).expect("slot 0 reads back");
+    fire(&mut shell, 1, &tokens[..keep as usize], RsVerb::Fold);
+    let kept = shell.state_bytes(1).expect("slot 1 reads back");
+    let buffer = |fold: u32| RsVerb::Buffer {
+        pages: pages.clone(),
+        base: 0,
+        folded: 0,
+        fold: FoldLen::Host(fold),
+        lineage: engine::fire::Lineage::Set,
+    };
+    fire(&mut shell, 2, tokens, buffer(0));
+    fire(&mut shell, 2, next, buffer(keep));
+    let partial = shell.state_bytes(2).expect("slot 2 reads back");
+    (whole, kept, partial)
+}
+
+/// How far apart `a` and `b` lie, read as bf16 words (the state pool's
+/// element): the root of the summed squared differences of the finite ones.
+fn bf16_apart(a: &[u8], b: &[u8]) -> f64 {
+    assert_eq!(a.len(), b.len(), "two slots of one pool");
+    let value = |w: &[u8]| {
+        f64::from(f32::from_bits(
+            u32::from(u16::from_le_bytes([w[0], w[1]])) << 16,
+        ))
+    };
+    a.chunks_exact(2)
+        .zip(b.chunks_exact(2))
+        .map(|(x, y)| (value(x), value(y)))
+        .filter(|(x, y)| x.is_finite() && y.is_finite())
+        .map(|(x, y)| (x - y) * (x - y))
+        .sum::<f64>()
+        .sqrt()
+}
+
+/// A fire that buffers a window's rows and a later fire that folds only the
+/// first `keep` of them (a speculative verify keeping fewer than its drafts)
+/// leave the state a fold of those `keep` rows leaves, to rounding — not one
+/// that also took the rows it did not keep. On a model whose PLE conv
+/// (Qwen4, Qwen3.8-Flash-Next) commits as it runs, the partial state holds
+/// that conv's row as the whole window left it, and so stands nearer the
+/// whole fold than the kept one. `PIE_GOLDEN_PARTIAL` names the model
+/// (`qwen38-flash-next-micro` by default; `qwen35-tiny` for GDN alone).
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn golden_partial_fold_keeps_its_rows() {
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    let cache = cache_dir();
+    let model = std::env::var("PIE_GOLDEN_PARTIAL")
+        .unwrap_or_else(|_| "qwen38-flash-next-micro".to_string());
+    let fixture = fixture(&model, &cache);
+    let tokens: Vec<u32> = (0..6).map(|t| (t * 7 + 11) % 1000).collect();
+    let next: Vec<u32> = (6..9).map(|t| (t * 7 + 11) % 1000).collect();
+    let keep = 3;
+    let (whole, kept, partial) = served_partial_fold(&fixture, &cache, &tokens, &next, keep);
+    let to_kept = bf16_apart(&partial, &kept);
+    let to_whole = bf16_apart(&partial, &whole);
+    let kept_whole = bf16_apart(&kept, &whole);
+    println!(
+        "golden {model}-partial-fold: the partial state lies {to_kept:.4} from the kept fold and \
+         {to_whole:.4} from the whole one (the two folds {kept_whole:.4} apart)"
+    );
+    assert!(
+        kept_whole > 0.0,
+        "folding {keep} rows and folding 6 leave one state"
+    );
+    // Rounding moves the state a little (the chunked and the step scans sum
+    // in other orders); a row the fold did not keep moves it by about the
+    // distance between the two folds.
+    assert!(
+        to_kept < 0.1 * kept_whole,
+        "a partial fold of {keep} rows left a state {to_kept:.4} from a fold of {keep}, against \
+         {kept_whole:.4} between the two folds — the rows it did not keep moved it ({to_whole:.4} \
+         from the whole fold)"
+    );
+}
+
+/// The steps [`golden_staged_experts`] fires: a prefill, then decodes.
+const STAGED_SCRIPT: &[Step] = &[
+    Step::Prefill(37),
+    Step::Decode,
+    Step::Decode,
+    Step::Prefill(90),
+    Step::Decode,
+];
+
+/// The budget probe: `PIE_GOLDEN_MODELS` loaded under each of
+/// `PIE_GOLDEN_BUDGETS` (bytes, comma-separated), its banks staged where
+/// `PIE_GOLDEN_UNTABLED` is set, and fired over [`STAGED_SCRIPT`]: each
+/// budget's load refused, or served.
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn golden_budget_probe() {
+    let cache = cache_dir();
+    let budgets: Vec<u64> = std::env::var("PIE_GOLDEN_BUDGETS")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|b| b.trim().parse().ok())
+        .collect();
+    for model in models() {
+        let fixture = fixture(&model, &cache);
+        // `PIE_GOLDEN_SEARCH`: the least budget a load serves every fire
+        // under, between the two stated, and the refusal a byte under it.
+        if std::env::var_os("PIE_GOLDEN_SEARCH").is_some() {
+            let untabled = std::env::var_os("PIE_GOLDEN_UNTABLED").is_some();
+            let (least, said) = least_budget(&fixture, &cache, untabled, budgets[0], budgets[1]);
+            println!("budget {model}: the least budget served is {least}");
+            println!("budget {model}: a byte under it: {said}");
+            continue;
+        }
+        for &budget in &budgets {
+            let mut knobs = knobs();
+            if std::env::var_os("PIE_GOLDEN_UNTABLED").is_some() {
+                knobs.diagnostics.dense_weights = false;
+                knobs.diagnostics.untabled_experts = true;
+            }
+            let allowance = engine::Allowance {
+                budget: Some(budget),
+            };
+            match load_under(&fixture, &cache, knobs, allowance) {
+                Err(why) => println!("budget {model} {budget}: refused at load: {why}"),
+                Ok(mut shell) => {
+                    for (class, owner, bytes) in shell.ledger().entries() {
+                        println!("budget {model} {budget}: ledger {class:?} {owner} {bytes}");
+                    }
+                    let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        staged_steps(&mut shell, &fixture.trace).len()
+                    }));
+                    println!("budget {model} {budget}: loaded; fires: {served:?}");
+                }
+            }
+        }
+    }
+}
+
+/// The least budget (bytes, in `lo..=hi`, `lo` refused and `hi` served)
+/// under which `fixture` loads and serves every fire of [`STAGED_SCRIPT`],
+/// its banks staged where `untabled`, and the load's refusal a byte under
+/// it. No budget between loads and then fails a fire: a load is refused,
+/// or serves.
+fn least_budget(
+    fixture: &Fixture,
+    cache: &Path,
+    untabled: bool,
+    mut lo: u64,
+    mut hi: u64,
+) -> (u64, String) {
+    let knobs = || {
+        let mut knobs = knobs();
+        if untabled {
+            knobs.diagnostics.dense_weights = false;
+            knobs.diagnostics.untabled_experts = true;
+        }
+        knobs
+    };
+    let serves = |budget: u64| -> Result<(), String> {
+        let allowance = engine::Allowance {
+            budget: Some(budget),
+        };
+        let mut shell = load_under(fixture, cache, knobs(), allowance)?;
+        let fired = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            staged_steps(&mut shell, &fixture.trace).len()
+        }));
+        assert!(
+            fired.is_ok(),
+            "{} under {budget} bytes: a fire failed after the load was ready",
+            fixture.model
+        );
+        Ok(())
+    };
+    assert!(serves(hi).is_ok(), "{}: serves under {hi}", fixture.model);
+    assert!(serves(lo).is_err(), "{}: refused under {lo}", fixture.model);
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        match serves(mid) {
+            Ok(()) => hi = mid,
+            Err(_) => lo = mid,
+        }
+    }
+    (hi, serves(hi - 1).expect_err("a byte under it refuses"))
+}
+
+/// `shell` fired over [`STAGED_SCRIPT`] from a fresh slot: each step's logits.
+fn staged_steps(shell: &mut Shell, trace: &Trace) -> Vec<Vec<f32>> {
+    shell.open(0).expect("slot 0 opens");
+    let mut fed = 0u32;
+    let mut last = None;
+    let mut steps = Vec::with_capacity(STAGED_SCRIPT.len());
+    for step in STAGED_SCRIPT {
+        let tokens: Vec<u32> = match *step {
+            Step::Prefill(rows) => (fed..fed + rows).map(|t| (t * 7 + 11) % 1000).collect(),
+            Step::Decode => vec![last.expect("a decode follows a step")],
+        };
+        fed += u32::try_from(tokens.len()).expect("a count");
+        let logits = fire(shell, trace, &tokens);
+        last = Some(argmax(&logits));
+        steps.push(logits);
+    }
+    steps
+}
+
+/// The staged-experts probe: `PIE_GOLDEN_MODELS` (quantized MoE miniatures;
+/// DeepSeek-V4-Flash's u4g64 one by default) loaded with its routed banks on
+/// the host tier and no table of the weight cache reading them
+/// (`untabled-experts`), so each fire stages the experts it routes to into
+/// the run the load laid. The staging is the bound times its streams, the
+/// steps serve the device-resident banks' logits, a fire past the first
+/// round takes no device memory, the ledger enters it, no budget loads it
+/// and then fails a fire, and a budget a byte short of the least it serves
+/// at is refused by the fit, by the staging's name.
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn golden_staged_experts() {
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    let cache = cache_dir();
+    let models = std::env::var("PIE_GOLDEN_MODELS").map_or_else(
+        |_| vec!["dsv4-flash-mini-u4g64-u2g64-kv-bf16".to_string()],
+        |_| models(),
+    );
+    for model in models {
+        let fixture = fixture(&model, &cache);
+        let trace = &fixture.trace;
+        // The banks on the device, as the base engine seats them.
+        let mut resident = load(&fixture, &cache);
+        assert_eq!(
+            resident.expert_staging().bytes(),
+            0,
+            "{model}: a load with its banks on the device stages nothing"
+        );
+        let want = staged_steps(&mut resident, trace);
+        drop(resident);
+
+        let staged = || {
+            let mut knobs = knobs();
+            knobs.diagnostics.dense_weights = false;
+            knobs.diagnostics.untabled_experts = true;
+            knobs
+        };
+        let mut shell = load_with(&fixture, &cache, staged());
+        let staging = shell.expert_staging().clone();
+        assert_eq!(
+            shell
+                .ledger()
+                .of(engine::memory::Class::Fire, "staged experts"),
+            staging.bytes(),
+            "{model}: the ledger enters the staging as a fire's"
+        );
+        let fact = staging
+            .fact()
+            .unwrap_or_else(|| panic!("{model}: no bank is staged"));
+        println!("staged {model}: {fact}");
+        // The bound, from the trace: each staged bank's codes hold the most
+        // experts one fire routes to, the routes one fire's.
+        let classes = poem_ir::residency::residency(trace);
+        let bytes = engine_cuda::weights::plane_bytes(trace).expect("sized");
+        let rows = u64::from(staging.rows());
+        let (mut codes, mut routes) = (0u64, 0u64);
+        for bank in staging.banks() {
+            let at = trace
+                .params
+                .iter()
+                .position(|param| &param.name == bank)
+                .unwrap_or_else(|| panic!("the trace declares `{bank}`"));
+            let poem_ir::residency::Residency::Expert(atom) = classes[at] else {
+                panic!("`{bank}` is staged and routes no expert");
+            };
+            let experts = u64::from(atom.experts);
+            let slots = experts.min(rows * u64::from(atom.top_k));
+            codes = codes.max(slots * (bytes[at] / experts));
+            routes = routes.max(rows * u64::from(atom.top_k) * 4);
+        }
+        let runs = staging.runs();
+        assert_eq!(runs[0], codes, "{model}: the codes' run is the bound");
+        assert_eq!(runs[3], routes, "{model}: the routes' run is one fire's");
+        let lane: u64 = runs.iter().map(|run| run.next_multiple_of(256)).sum();
+        assert!(!staging.streams().is_empty());
+        assert_eq!(
+            staging.bytes(),
+            lane * staging.streams().len() as u64,
+            "{model}: a lane a stream"
+        );
+        println!(
+            "staged {model}: {} bank(s), runs {runs:?}, {} stream(s), {} bytes for {rows} rows",
+            staging.banks().len(),
+            staging.streams().len(),
+            staging.bytes(),
+        );
+
+        // The first round builds what a fire builds; the second takes
+        // nothing more of the device.
+        let first = staged_steps(&mut shell, trace);
+        let free = engine_cuda::device::free_bytes();
+        let heaps = engine_cuda::device::held::heap_bytes();
+        let second = staged_steps(&mut shell, trace);
+        assert_eq!(
+            engine_cuda::device::free_bytes(),
+            free,
+            "{model}: a staged fire took device memory"
+        );
+        assert_eq!(
+            engine_cuda::device::held::heap_bytes(),
+            heaps,
+            "{model}: a staged fire grew a heap"
+        );
+        assert_eq!(second, first, "{model}: the second round is the first's");
+        for (at, (got, want)) in first.iter().zip(&want).enumerate() {
+            let most = got
+                .iter()
+                .zip(want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            println!(
+                "staged {model} {at}: most |diff| {most:e} from resident, tops {} {}",
+                argmax(got),
+                argmax(want)
+            );
+            assert_eq!(
+                argmax(got),
+                argmax(want),
+                "{model} step {at}: the staged top token"
+            );
+            assert!(most < 0.25, "{model} step {at}: |diff| {most:e}");
+        }
+
+        drop(shell);
+        // The staging is a term of the fit: under the least budget the
+        // load serves at, less a byte, the fit refuses it, naming the banks
+        // and the staging's bytes.
+        let (least, said) = least_budget(&fixture, &cache, true, 1 << 30, 16 << 30);
+        println!("staged {model}: least budget {least}; a byte under it: {said}");
+        assert!(
+            staging
+                .banks()
+                .iter()
+                .all(|bank| said.contains(&format!("`{bank}`"))),
+            "{model}: the refusal names the banks: {said}"
+        );
+        assert!(
+            said.contains(&format!("{} bytes of staged experts", staging.bytes())),
+            "{model}: and the bytes: {said}"
+        );
+    }
 }
