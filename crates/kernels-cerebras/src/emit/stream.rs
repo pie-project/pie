@@ -372,7 +372,7 @@ pub fn emit(p: &Program) -> R<Emitted> {
                 let c = su.w(col, row);
                 // (no row index: a column's PEs differ only in their chains' colours and their
                 // config words, so they share a few images)
-                tiles.insert(c, (name.clone(), weight_params(p, c)));
+                tiles.insert(c, (name.clone(), weight_params(p, ui, c)));
                 let mut words = cfg.clone();
                 words[0] = weight_role(p, c);
                 if !wsc.is_empty() {
@@ -656,13 +656,9 @@ fn parked(p: &Program, c: Coord, mut v: Vec<(String, u32)>) -> Vec<(String, u32)
     v
 }
 
-fn weight_params(p: &Program, c: Coord) -> Vec<(String, u32)> {
-    let u = p
-        .stream
-        .units
-        .iter()
-        .position(|u| c.x > u.x && c.x <= u.x + u.cols())
-        .unwrap_or(0);
+/// Weight PE `c` of unit `u`: its chains' colours and its unit's casts (the unit by index, not
+/// by `c`'s column: a later band's units share their columns with the first band's).
+fn weight_params(p: &Program, u: usize, c: Coord) -> Vec<(String, u32)> {
     let (cs, cr, _) = chain_cols(p, c, COL_CHAIN);
     let (rs, rr, _) = chain_cols(p, c, ROW_CHAIN);
     let xr = colour_of(p, &format!("XR{u}")).map_or(0xff, u32::from);

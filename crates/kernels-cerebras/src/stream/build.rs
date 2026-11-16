@@ -327,7 +327,18 @@ pub fn program_upto(
     upto: Option<usize>,
     taps: &[u32],
 ) -> R<Program> {
-    program_py(trace, shape, round16, upto, taps, None, None, None, false)
+    program_py(
+        trace,
+        shape,
+        round16,
+        upto,
+        taps,
+        None,
+        None,
+        None,
+        false,
+        Bounds::system(),
+    )
 }
 
 /// The row roots a unit may take: the divisors of the hidden width that leave a CX root at
@@ -350,8 +361,8 @@ pub const TILE_FRACTIONS: [(u32, u32); 3] = [(1, 1), (3, 4), (1, 2)];
 /// [`program_upto`] at `py` row roots a unit and `tile` words a weight PE (`spill`: rows held over
 /// the barrier in the row store always), or (`None`) at the
 /// (row roots, tile budget) the
-/// cost model prices lowest of those that build within the system fabric ([`py_candidates`],
-/// [`TILE_FRACTIONS`]).
+/// cost model prices lowest of those that build within `bounds` ([`py_candidates`],
+/// [`TILE_FRACTIONS`]; [`Bounds::system`] but in tests of a narrower fabric).
 #[allow(clippy::too_many_arguments)]
 pub fn program_py(
     trace: &Trace,
@@ -363,8 +374,8 @@ pub fn program_py(
     tile: Option<u32>,
     kv: Option<KvSplit>,
     spill: bool,
+    bounds: Bounds,
 ) -> R<Program> {
-    let bounds = Bounds::system();
     // (row roots and tiles both pinned: the program as pinned, its cut the plain one unless
     // pinned too; flux2-mini's `--py 16 --tile 12288` is M1d's full step)
     let kvs: Vec<KvSplit> = match kv {
@@ -951,6 +962,99 @@ mod tests {
         assert_eq!(p.lane_words, 1536 + 1536 + 768 + 512);
     }
 
+    /// flux2-mini within a fabric 38 PEs wide (as `wafer-compile stream --fabric-width 38`):
+    /// three bands, a later band's first unit under the lane unit, and the lane bus reaching
+    /// every root that reads a lane vector in each of them.
+    #[test]
+    fn flux_2_mini_over_three_bands_reaches_every_lane_root() {
+        let t = trace();
+        let s = super::super::shape_of(&t, "denoise", 16).unwrap_or_else(|e| panic!("{e}"));
+        let p = program_py(
+            &t,
+            s,
+            true,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            false,
+            Bounds::system().narrowed(Some(38)),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let st = &p.stream;
+        let bands: std::collections::BTreeSet<u32> = st.units.iter().map(|u| u.y).collect();
+        assert_eq!(bands.len(), 3, "{} x {}", st.w, st.h);
+        assert!(st.w <= 38);
+        assert!(st.units.iter().any(|u| u.x == 0 && u.y > 0 && u.on_path));
+        let lb = st.lanes.as_ref().expect("a lane bus");
+        let w = st.wiring();
+        let bus = w
+            .links
+            .iter()
+            .find_map(|l| match l {
+                crate::wiring::Link::Broadcast(b) => Some(b),
+                _ => None,
+            })
+            .expect("the lane bus");
+        for c in &lb.to {
+            assert!(
+                bus.pts
+                    .iter()
+                    .position(|q| q == c)
+                    .is_some_and(|i| bus.recv[i]),
+                "no lane bus at {c:?}"
+            );
+        }
+        // every weight PE's casts in (its unit's row and column casts) bound to a colour routed
+        // to its ramp there: a later band's weight PEs share their columns with the first band's
+        let e = crate::emit::stream::emit(&p).unwrap_or_else(|e| panic!("{e}"));
+        let layout = &e
+            .files
+            .iter()
+            .find(|(n, _)| n == "layout.csl")
+            .expect("layout.csl")
+            .1;
+        let at = |l: &str, k: &str| -> Option<u32> {
+            let i = l.find(k)? + k.len();
+            l[i..]
+                .split(|c: char| !c.is_ascii_digit())
+                .next()?
+                .parse()
+                .ok()
+        };
+        let xy = |l: &str| -> Option<(u32, u32)> {
+            let a = l.split_once('(')?.1;
+            let mut it = a.split(',');
+            Some((
+                it.next()?.trim().parse().ok()?,
+                it.next()?.trim().parse().ok()?,
+            ))
+        };
+        let to_ramp: std::collections::BTreeSet<(u32, u32, u32)> = layout
+            .lines()
+            .filter(|l| l.contains("@set_color_config(") && l.contains("RAMP } }"))
+            .filter_map(|l| Some((xy(l)?, at(l, "@get_color(")?)))
+            .map(|((x, y), c)| (x, y, c))
+            .collect();
+        let mut n = 0;
+        for l in layout
+            .lines()
+            .filter(|l| l.contains("@set_tile_code(") && l.contains("\"w_"))
+        {
+            let (x, y) = xy(l).expect("a PE");
+            for k in [".C_XR = ", ".C_XC = "] {
+                let c = at(l, k).expect("a cast colour");
+                assert!(
+                    to_ramp.contains(&(x, y, c)),
+                    "({x}, {y}){k}{c}: not to its ramp"
+                );
+            }
+            n += 1;
+        }
+        assert!(n > 0);
+    }
+
     /// The row store: flux2-mini's attending units with their held rows in their weight PEs
     /// (each row root's chunk cast to its row, summed back up the row chain after the barrier)
     /// build and print: the CX roots hold one row of each, the weight PEs their share.
@@ -968,6 +1072,7 @@ mod tests {
             Some(place::TILE_BUDGET),
             None,
             true,
+            Bounds::system(),
         )
         .unwrap_or_else(|e| panic!("{e}"));
         let spilled: Vec<&str> = p

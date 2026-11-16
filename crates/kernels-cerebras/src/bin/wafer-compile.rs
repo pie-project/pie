@@ -45,7 +45,7 @@ const USAGE: &str = "usage: wafer-compile plan (--model <deployment> | --shape <
      wafer-compile search --model <deployment> [--positions N] [--set K=V,...] [--keep N]\n       \
      wafer-compile stream --model <deployment> [--reading R] [--rows N] [--ieee] --out <dir> \
      [--values <dir>] [--stages N] [--tap v,..] [--py N] [--tile W] [--spill] \
-     [--cut THIN,SUB,WIDEN,HELP] [--class-rows context=512,latents=4096] \
+     [--cut THIN,SUB,WIDEN,HELP] [--fabric-width W] [--class-rows context=512,latents=4096] \
      [--price context=512,latents=4096 [--parts]] [--clip t,h,w]";
 
 fn main() {
@@ -224,8 +224,8 @@ fn search(args: &[String]) -> Result<(), String> {
 }
 
 /// `stream --model <name> [--reading denoise] [--rows 64] [--class-rows name=N,..] [--ieee]
-/// [--py N] [--tile W] --out <dir> [--values <dir>]` (`--py 16 --tile 12288`: flux2-mini as M1d
-/// built it):
+/// [--py N] [--tile W] [--fabric-width W] --out <dir> [--values <dir>]` (`--py 16 --tile 12288`:
+/// flux2-mini as M1d built it; `--fabric-width 38`: flux2-mini over three bands):
 /// a stream reading's wafer program (kernels-cerebras `stream::compile`); with a step's captured
 /// values, the host's files for a run of it (`tools/wafer/stream/run.py`).
 fn stream(args: &[String]) -> Result<(), String> {
@@ -444,6 +444,10 @@ fn stream(args: &[String]) -> Result<(), String> {
         kv,
         spill: args.iter().any(|a| a == "--spill"),
         class_rows: kernels_cerebras::stream::parse_rows(&get("--class-rows").unwrap_or_default())?,
+        width: get("--fabric-width")
+            .map(|s| s.parse::<u32>())
+            .transpose()
+            .map_err(|e| format!("--fabric-width: {e}"))?,
     };
     let p = kernels_cerebras::stream::compile_pinned(
         &trace,

@@ -145,7 +145,8 @@ pub struct KvColumn {
 }
 
 /// The lane bus: from the lane root (the lane unit's corner) up its CX column, along row 0, and
-/// down each column to its last root that holds a lane vector.
+/// down each column to its last root that holds a lane vector (in the lane root's own column,
+/// down from the lane root: a later band's first units' CX roots).
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct LaneBus {
     pub unit: usize,
@@ -168,6 +169,15 @@ impl Bounds {
         Bounds {
             w: w - hw,
             h: h - hh,
+        }
+    }
+
+    /// These bounds at most `w` wide (`None`: as they are).
+    #[must_use]
+    pub fn narrowed(self, w: Option<u32>) -> Bounds {
+        Bounds {
+            w: w.map_or(self.w, |w| w.min(self.w)),
+            h: self.h,
         }
     }
 }
@@ -594,7 +604,7 @@ impl Stream {
 }
 
 /// The lane bus as a tree: from `root` north to row 0, east along it, down each column to its
-/// deepest receiver.
+/// deepest receiver; in `root`'s own column, south from `root` to the receivers below it.
 fn lane_tree(root: Coord, to: &[Coord]) -> Broadcast {
     let mut pts: Vec<Coord> = Vec::new();
     let mut parent: Vec<Option<usize>> = Vec::new();
@@ -626,11 +636,14 @@ fn lane_tree(root: Coord, to: &[Coord]) -> Broadcast {
             .map(|c| c.y)
             .max()
             .unwrap_or(0);
-        let mut p = row0[(x - root.x) as usize];
-        if x == root.x {
-            continue;
-        }
-        for y in 1..=deepest {
+        // the root's own column: its receivers above it are on the trunk north, those below
+        // (a later band's units under the lane unit) on a branch south from the root
+        let (mut p, from) = if x == root.x {
+            (0, root.y + 1)
+        } else {
+            (row0[(x - root.x) as usize], 1)
+        };
+        for y in from..=deepest {
             p = at(&mut pts, &mut parent, Coord::new(x, y), Some(p));
         }
     }
@@ -702,6 +715,59 @@ mod tests {
             lanes: (false, false),
             helpers: 0,
         }
+    }
+
+    /// The lane bus reaches every root that reads a lane vector, in every band: the first unit
+    /// of a later band sits in the lane root's column, below it (flux2-mini over three bands,
+    /// klein's band 2 hung at their first launch waiting on lane vectors the bus never sent).
+    #[test]
+    fn the_lane_bus_reaches_every_band() {
+        let mut asks: Vec<UnitAsk> = (0..7).map(|u| ask(&format!("u{u}"), 9, 2)).collect();
+        asks[0].heads = 0;
+        asks[0].on_path = false;
+        for a in &mut asks[1..] {
+            a.lanes = (true, true);
+        }
+        let blocks = vec![vec![1, 2], vec![3, 4], vec![5, 6]];
+        let requests = Requests {
+            stream: true,
+            joint: true,
+            lanes: true,
+            ..Requests::default()
+        };
+        let s = Stream::of(
+            &requests,
+            4,
+            &asks,
+            &blocks,
+            2,
+            3,
+            1,
+            Bounds { w: 32, h: 60 },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert!(s.units.iter().filter(|u| u.x == 0).count() >= 3);
+        let lb = s.lanes.as_ref().expect("a lane bus");
+        let wiring = s.wiring();
+        let bus = wiring
+            .links
+            .iter()
+            .find_map(|l| match l {
+                crate::wiring::Link::Broadcast(b) => Some(b),
+                _ => None,
+            })
+            .expect("the lane bus");
+        for c in &lb.to {
+            let i = bus.pts.iter().position(|p| p == c);
+            assert!(i.is_some_and(|i| bus.recv[i]), "the lane bus misses {c:?}");
+        }
+        for (i, p) in bus.parent.iter().enumerate() {
+            if let Some(q) = *p {
+                let (a, b) = (bus.pts[i], bus.pts[q]);
+                assert_eq!(a.x.abs_diff(b.x) + a.y.abs_diff(b.y), 1);
+            }
+        }
+        assert_eq!(bus.recv.iter().filter(|&&r| r).count(), lb.to.len());
     }
 
     /// Units too wide for one row of the fabric fill bands, a block never split over two; the

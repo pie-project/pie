@@ -298,6 +298,11 @@ pub struct Pins {
     /// Rows of the classes named here in place of `rows` (flux at 1024²: context 512, latents
     /// 4096).
     pub class_rows: Vec<(String, u32)>,
+    /// The fabric's width for the program (`None`: the system's, [`Bounds::system`]; narrower
+    /// fills more bands: a test of the row stream's turn into a band on a small model).
+    ///
+    /// [`Bounds::system`]: crate::floorplan::stream::Bounds::system
+    pub width: Option<u32>,
 }
 
 /// Compiles `trace`'s stream reading (`o`) into `out`: the program's CSL (`layout.csl`, the
@@ -330,7 +335,16 @@ pub fn compile_pinned(
         ),
     )?;
     let p = build::program_py(
-        trace, s, o.round16, o.upto, &o.taps, pins.py, pins.tile, pins.kv, pins.spill,
+        trace,
+        s,
+        o.round16,
+        o.upto,
+        &o.taps,
+        pins.py,
+        pins.tile,
+        pins.kv,
+        pins.spill,
+        crate::floorplan::stream::Bounds::system().narrowed(pins.width),
     )?;
     let e = crate::emit::stream::emit(&p)?;
     std::fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
@@ -375,7 +389,18 @@ pub fn compile_decode(
     let classes = program::decode_classes(trace, 1);
     let mut s = shape(trace, "decode", &classes)?;
     s.cache = Some(positions);
-    let p = build::program_py(trace, s, round16, None, &[], None, None, None, false)?;
+    let p = build::program_py(
+        trace,
+        s,
+        round16,
+        None,
+        &[],
+        None,
+        None,
+        None,
+        false,
+        crate::floorplan::stream::Bounds::system(),
+    )?;
     let e = crate::emit::stream::emit(&p)?;
     std::fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
     for (name, text) in &e.files {
