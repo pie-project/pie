@@ -1347,6 +1347,167 @@ fn golden_buffered() {
     }
 }
 
+/// Each rs row of rs list slot `slot`, as its bytes.
+fn rs_rows(shell: &mut Shell, slot: u32, tokens: u32, layers: &[(u64, u64)]) -> Vec<Vec<u8>> {
+    layers
+        .iter()
+        .map(|&(offset, per_token)| {
+            let bytes = u64::from(tokens) * per_token;
+            let at = shell
+                .rs_span(slot, offset, bytes)
+                .expect("an rs row of the slot");
+            let mut held = vec![0u8; usize::try_from(bytes).expect("a host size")];
+            engine_cuda::device::alloc::copy_d2h_on(shell.stream(), at, &mut held)
+                .expect("the rs row reads");
+            held
+        })
+        .collect()
+}
+
+/// A keep's token runs on the rs list (CONTRACT-BC 18 left the buffer's
+/// start off a slot): rows of an rs list slot written with known bytes move
+/// at an offset into another slot, row for row across every rs row; the rows
+/// no run names keep what they held. A run that reads the rows it writes, or
+/// reaches past its slot, is refused by name; whole slots still copy whole.
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn golden_rs_token_runs() {
+    use engine::transfer::KvRun;
+    use engine_cuda::store::layout::RS;
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    let cache = cache_dir();
+    let fixture = fixture(&buffered_model(), &cache);
+    let mut shell = load_with(&fixture, &cache, buffering(knobs()));
+    shell.back_whole().expect("the fitted pool is backed whole");
+    let (tokens, layers) = shell.rs_layout().expect("a hybrid model lays an rs list");
+    assert!(tokens >= 4, "an rs list slot of {tokens} tokens");
+    assert!(!layers.is_empty(), "the rs list lays its rows");
+    let (src, dst, whole) = (1u32, 2u32, 3u32);
+    let fill = |shell: &mut Shell, slot: u32, byte: &dyn Fn(usize, u64) -> u8| {
+        for (k, &(offset, per_token)) in layers.iter().enumerate() {
+            let bytes = u64::from(tokens) * per_token;
+            let seed: Vec<u8> = (0..bytes).map(|at| byte(k, at)).collect();
+            let at = shell
+                .rs_span(slot, offset, bytes)
+                .expect("an rs row of the slot");
+            engine_cuda::device::alloc::stage_raw(shell.stream(), at, &seed)
+                .expect("the rs row writes");
+            let mut held = vec![0u8; seed.len()];
+            engine_cuda::device::alloc::copy_d2h_on(shell.stream(), at, &mut held)
+                .expect("the rs row reads");
+            assert_eq!(
+                held, seed,
+                "rs row {k} of slot {slot} holds what was written"
+            );
+        }
+    };
+    fill(&mut shell, src, &|k, at| {
+        u8::try_from((k as u64 * 131 + at * 7 + 1) % 251).expect("a byte")
+    });
+    fill(&mut shell, dst, &|_, _| 0xEE);
+    let source = rs_rows(&mut shell, src, tokens, &layers);
+
+    // Two runs, neither on a slot boundary nor a slot long: src's tokens
+    // 2.. onto dst's 1.., then src's first two after them.
+    let long = tokens - 3;
+    let runs = [
+        KvRun {
+            src_page: src,
+            src_token: 2,
+            dst_page: dst,
+            dst_token: 1,
+            tokens: long,
+        },
+        KvRun {
+            src_page: src,
+            src_token: 0,
+            dst_page: dst,
+            dst_token: 1 + long,
+            tokens: 2,
+        },
+    ];
+    shell
+        .copy_token_slots(RS, &[], &runs)
+        .expect("the rs list's token runs copy");
+    let landed = rs_rows(&mut shell, dst, tokens, &layers);
+    for (k, (&(_, per_token), (got, from))) in
+        layers.iter().zip(landed.iter().zip(&source)).enumerate()
+    {
+        let row = usize::try_from(per_token).expect("a host size");
+        for t in 0..tokens {
+            let want: Vec<u8> = match t {
+                t if (1..1 + long).contains(&t) => {
+                    let s = (t - 1 + 2) as usize;
+                    from[s * row..(s + 1) * row].to_vec()
+                }
+                t if (1 + long..3 + long).contains(&t) => {
+                    let s = (t - 1 - long) as usize;
+                    from[s * row..(s + 1) * row].to_vec()
+                }
+                _ => vec![0xEE; row],
+            };
+            let t = t as usize;
+            assert_eq!(
+                got[t * row..(t + 1) * row],
+                want[..],
+                "rs row {k}, token {t} of the destination slot"
+            );
+        }
+    }
+
+    // Refused by name, nothing copied: a run reading the rows it writes,
+    // and one past its slot.
+    let overlapping = KvRun {
+        src_page: src,
+        src_token: 0,
+        dst_page: src,
+        dst_token: 1,
+        tokens: 2,
+    };
+    let refused = shell
+        .copy_token_slots(RS, &[], &[overlapping])
+        .expect_err("an overlapping run is refused")
+        .to_string();
+    assert!(
+        refused.contains("reads the rows it writes"),
+        "refused as: {refused}"
+    );
+    let past = KvRun {
+        src_page: src,
+        src_token: 0,
+        dst_page: dst,
+        dst_token: tokens - 1,
+        tokens: 2,
+    };
+    let refused = shell
+        .copy_token_slots(RS, &[], &[past])
+        .expect_err("a run past its slot is refused")
+        .to_string();
+    assert!(
+        refused.contains("token slots in one rs list slot"),
+        "refused as: {refused}"
+    );
+    assert_eq!(
+        rs_rows(&mut shell, src, tokens, &layers),
+        source,
+        "a refused run copies nothing"
+    );
+    assert_eq!(
+        rs_rows(&mut shell, dst, tokens, &layers),
+        landed,
+        "a refused run copies nothing"
+    );
+
+    // Whole slots still copy whole.
+    shell
+        .copy_token_slots(RS, &[[src, whole]], &[])
+        .expect("a whole rs list slot copies");
+    assert_eq!(rs_rows(&mut shell, whole, tokens, &layers), source);
+}
+
 /// The rows the carrying probe's lane leaves unfolded before one decode
 /// replays them all: more than a page of the rs buffer, and than the
 /// decode's own bucket.
