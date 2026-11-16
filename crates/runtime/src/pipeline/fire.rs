@@ -573,12 +573,15 @@ fn host_rs_plan(
 }
 
 /// Each working set buffers every slot from where its state ends up to what it
-/// reserved.
+/// reserved, and folds what [`device_fold`] says of its first lane's rows,
+/// `split` apart: a recurrent state's rows are never reported, so a fold the
+/// engine alone could place is refused.
 fn device_rs_plan(
     stores: &crate::store::registry::Stores,
     ids: &[crate::store::rs::RsWorkingSetId],
     groups: &LaneGroups,
     lanes: &PassLanes,
+    split: &[u32],
     fold: &geometry::Fold,
 ) -> Result<rs::RsPlan, String> {
     if ids.is_empty() {
@@ -592,7 +595,18 @@ fn device_rs_plan(
             .frozen(ids[first])
             .map_err(|error| error.to_string())?;
         let reserved = lanes.cursors[first].lock().unwrap().reserved;
-        let fold = group_fold(fold, first, frozen, reserved);
+        let rows = split[first + 1] - split[first];
+        let fold = match device_fold(
+            fold.of(first),
+            rows,
+            reserved.saturating_sub(frozen),
+            appends_folded(lanes, group),
+        ) {
+            DeviceFold::None => rs::GroupFold::None,
+            DeviceFold::Device => rs::GroupFold::Device,
+            DeviceFold::Count(count) => rs::GroupFold::Host(count),
+            DeviceFold::PastRows(_) => return Err(past_rows_refusal(first, rows)),
+        };
         // The device picks where a lane's rows start: what it carries in is
         // bounded by what stands unfolded in its set ([`device_lane_rows`]).
         plans.push(rs::GroupPlan {
@@ -1381,6 +1395,7 @@ static SUPPLIED: SupplyCounts = SupplyCounts {
     mapped: std::sync::atomic::AtomicU64::new(0),
 };
 
+#[derive(Clone, Copy)]
 enum Attach {
     No,
     Kv,
@@ -1395,13 +1410,17 @@ struct Supplied {
 }
 
 /// Maps in the sealed pages holding a keyed pass's first rows, short of its
-/// last row's page, which is read out so always computed.
+/// last row's page, which is read out so always computed. Mapping freezes
+/// nothing: what the set has folded is what its passes state. A recurrent
+/// state is folded through the checkpoint it resumes from, so it resumes no
+/// further than the `folds` rows the pass folds.
 fn supply(
     stores: &crate::store::registry::Stores,
     ws: crate::store::kv::page_table::WorkingSetId,
     full: &crate::engine::FireRequest,
     slots: &[crate::store::kv::hash::Hash256],
     attach: Attach,
+    folds: u64,
     page_size: u32,
 ) -> Supplied {
     use std::sync::atomic::Ordering::Relaxed;
@@ -1425,7 +1444,7 @@ fn supply(
         let clean = held.is_multiple_of(page) && kv.mapped_len(ws)? == held / page;
         let mapped = match attach {
             Attach::Kv if clean && kv.keeps() => {
-                let mapped = kv.attach_run(ws, &run, limit, page_size)?;
+                let mapped = kv.attach_run(ws, &run, limit)?;
                 kv.log_rows(ws, held, tokens_of(held / page + mapped))?;
                 mapped
             }
@@ -1450,7 +1469,7 @@ fn supply(
             ws,
             rs,
             &keys,
-            run.len().min(limit as usize),
+            run.len().min((limit.min(folds / page)) as usize),
             page_size,
         );
         if mapped > 0 {
@@ -1630,8 +1649,9 @@ impl Drop for Promoted {
     }
 }
 
-/// Resumes a hybrid pass from its furthest checkpoint; none when either half is
-/// gone by then, and `rs` holds no state again.
+/// Resumes a hybrid pass from its furthest checkpoint within `reach` pages,
+/// which both halves are then folded through; none when either half is gone
+/// by then, and `rs` holds no state again, the set having folded nothing.
 pub(crate) fn resume(
     stores: &crate::store::registry::Stores,
     ws: crate::store::kv::page_table::WorkingSetId,
@@ -1656,7 +1676,11 @@ pub(crate) fn resume(
         if run.len() as u64 != pages {
             return Ok(0);
         }
-        kv.attach_run(ws, &run, pages, page_size)
+        let mapped = kv.attach_run(ws, &run, pages)?;
+        if mapped == pages {
+            kv.freeze(ws, pages * u64::from(page_size.max(1)))?;
+        }
+        Ok::<_, crate::store::kv::KvStoreError>(mapped)
     });
     match mapped {
         Ok(mapped) if mapped == pages => pages,
@@ -1750,16 +1774,108 @@ struct Reserved {
     kvtxns: Vec<KvTxnGuard>,
     rs: rs::PreparedRs,
     epoch: FireEpoch,
+    unfired: Unfired,
+}
+
+/// What a pipeline says of a fire prepared that did not follow, where no
+/// refusal said more.
+const UNFIRED: &str = "pipeline: a fire was prepared and never submitted";
+
+/// A fire prepared and still to be submitted. [`reserve`] ended by
+/// committing what it folds into its recurrent states, and each piece's
+/// prepare freezes what it folds by a count the host knows
+/// ([`begin_piece`]); neither is taken back. So a fire that does not follow
+/// fails its pipeline, and its sets with it, however the call that prepared
+/// it ends: by a refusal, by a trap, or dropped where it waits. Held from
+/// [`reserve`] to the submit, this leaves the failure when it is dropped
+/// unless the fire was submitted ([`Unfired::submitted`]); a refusal that
+/// left its own reason first keeps it.
+struct Unfired {
+    failure: Option<PipelineFailure>,
+}
+
+impl Unfired {
+    fn new(failure: &PipelineFailure) -> Self {
+        Self {
+            failure: Some(failure.clone()),
+        }
+    }
+
+    /// The engine took the fire: its pipeline is still to queue it.
+    fn submitted(mut self) -> Unqueued {
+        Unqueued {
+            failure: self.failure.take(),
+        }
+    }
+}
+
+impl Drop for Unfired {
+    fn drop(&mut self) {
+        if let Some(failure) = self.failure.take() {
+            fail_unless_failed(&failure, UNFIRED);
+        }
+    }
+}
+
+/// What a pipeline says of a fire the engine took that it never queued to
+/// settle.
+const UNQUEUED: &str = "pipeline: a fire was submitted and never queued to settle";
+
+/// A fire the engine took, still to be queued on its pipeline. A call that
+/// ends before it queues the fire (by a trap: nothing between the submit
+/// and the queueing waits) leaves a fire nothing finalizes: the fold it
+/// places as it settles is never placed, and its sets' cursors stand short
+/// of what the engine writes. So it fails its pipeline, and its sets with
+/// it. Held from the submit ([`Unfired::submitted`]) to the queueing
+/// ([`Unqueued::queue`]), this leaves the failure when it is dropped.
+///
+/// The marks the submit left on the fire's sets wait on no pipeline. The
+/// fire's parts go with the call, and each mark dropped unsettled hangs on
+/// the fire's completion ([`Unplaced`], [`RsDeviceFold`]): it lifts where
+/// the engine resolves that, or lets its last handle go, as it does for a
+/// fire dropped off its pipeline's queue.
+#[must_use]
+struct Unqueued {
+    failure: Option<PipelineFailure>,
+}
+
+impl Unqueued {
+    /// `fire` is its pipeline's to finalize from here.
+    fn queue(mut self, fires: &PendingFireQueue, fire: PendingFire) {
+        fires.lock().unwrap().push_back(PendingOp::Fire(fire));
+        self.failure = None;
+    }
+}
+
+impl Drop for Unqueued {
+    fn drop(&mut self) {
+        if let Some(failure) = self.failure.take() {
+            fail_unless_failed(&failure, UNQUEUED);
+        }
+    }
+}
+
+/// `reason` fails the pipeline unless something said why first.
+fn fail_unless_failed(failure: &PipelineFailure, reason: &str) {
+    let mut pipeline = failure
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if pipeline.is_none() {
+        *pipeline = Some(reason.to_string());
+    }
 }
 
 /// A demand that drifted from its grant is quoted again. What it binds
-/// opens the fire's epoch on engine `engine` of model `model`.
+/// opens the fire's epoch on engine `engine` of model `model`. What it
+/// returns holds the pipeline's `failure` to the fire's submit
+/// ([`Unfired`]); a reserve refused committed nothing, and leaves none.
 #[allow(clippy::too_many_arguments)]
 async fn reserve<C: FireContext>(
     ctx: &mut C,
     (model, engine): (usize, usize),
     stores: &crate::store::registry::Stores,
     pipeline_id: uuid::Uuid,
+    failure: &PipelineFailure,
     sets: &[(&KvWorkingSet, Written)],
     rs_ids: &[crate::store::rs::RsWorkingSetId],
     rs_plan: impl Fn() -> Result<rs::RsPlan, String>,
@@ -1801,6 +1917,7 @@ async fn reserve<C: FireContext>(
                     kvtxns,
                     rs,
                     epoch: FireEpoch::begin(model, engine, stores, ctx.process_id()),
+                    unfired: Unfired::new(failure),
                 });
             }
             Err(ReservedError::Stale) if requote_on_drift(&mut stale_at, demand) => {}
@@ -1961,16 +2078,60 @@ struct FoldAt {
 }
 
 enum FoldBy {
+    /// Frozen as the fire was prepared; its pages seal when it settles.
     To(u64),
-    /// The cursor is exact again once the last fire of its working set placed
-    /// this way settles.
+    /// Frozen when the fire settles: the folded length is exact again once
+    /// the last fire of its working set placed this way settles. `written`
+    /// when it reaches no further than where the engine reports the fire's
+    /// rows ended, and is not placed without that report.
     Settled {
         count: Option<u32>,
         tags: Vec<u64>,
         reach: u64,
-        cursor: std::sync::Arc<std::sync::Mutex<crate::inferlet::host::working_set::Cursor>>,
+        written: bool,
         rs: Option<RsDeviceFold>,
+        /// Held from the fire's submit ([`unsettle`]).
+        unplaced: Option<Unplaced>,
     },
+}
+
+/// A working set's folded length is a lower bound while a fire on its way
+/// folds it by a count placed when the fire settles
+/// ([`crate::store::kv::KvStore::unsettle`]): the set is not forked or
+/// exported until then. Every way the fire ends lifts it: its fold
+/// settling, placed or not ([`Self::settle`]), and, dropped before that,
+/// the engine being done with it, the fold then never placed.
+struct Unplaced {
+    ws: crate::store::kv::page_table::WorkingSetId,
+    submitted: Option<(
+        Arc<parking_lot::Mutex<crate::store::kv::KvStore>>,
+        crate::engine::WorkItemCompletion,
+    )>,
+}
+
+impl Unplaced {
+    /// The fold settled, `placed` when its count was.
+    fn settle(&mut self, kv: &mut crate::store::kv::KvStore, placed: bool) {
+        if self.submitted.take().is_some()
+            && let Err(error) = kv.fold_settled(self.ws, placed)
+        {
+            tracing::debug!(%error, "pipeline: a fold settled on a set gone");
+        }
+    }
+}
+
+impl Drop for Unplaced {
+    fn drop(&mut self) {
+        let Some((store, completion)) = self.submitted.take() else {
+            return;
+        };
+        let ws = self.ws;
+        completion.on_settled(move || {
+            crate::store::registry::with_kv_lock(&store, "host-other", |kv| {
+                let _ = kv.fold_settled(ws, false);
+            });
+        });
+    }
 }
 
 /// The recurrent state a fold the device counts freezes with the KV, by the
@@ -2323,24 +2484,25 @@ pub(crate) async fn drain_pipeline_fires<C: FireContext>(
 }
 
 /// The cursor a copy of `kv`'s set starts from: read once every fire on its
-/// way has placed its fold. Until then the frozen length the cursor states
-/// is a bound, and a child that took it would state it for good: no fire
-/// settles a copy.
+/// way has placed its fold. Until then the frozen length the KV working set
+/// states is a bound, and a child that took it would state it for good: no
+/// fire settles a copy.
 ///
-/// The cursor is the mark, on every set; the recurrent store's is only on a
+/// The KV working set is the mark, on every set (its fires on their way that
+/// fold by a count placed when they settle); the recurrent store's is only on a
 /// set that keeps recurrent state. The fires are `fires`', the pipeline the
 /// set is scoped to, and only this task settles them: they run to their end
 /// first, woken as each completes. One dropped unsettled lifts the
 /// recurrent store's mark when the engine is done with it, which wakes the
 /// wait. One another finalizer took off the queue is under the finalizer
-/// gate until its fold is placed and its failure latched: the cursor and
-/// the failure are read with the gate in hand.
+/// gate until its fold is placed and its failure latched: the frozen
+/// length and the failure are read with the gate in hand.
 ///
 /// A fire that failed refuses the copy as the pipeline's failure. A fold no
 /// fire is left to place leaves the length unknown for good, and the copy
-/// is refused by that name ([`Cursor::UNPLACED`]) rather than left waiting.
+/// is refused by that name ([`UNPLACED`]) rather than left waiting.
 ///
-/// [`Cursor::UNPLACED`]: crate::inferlet::host::working_set::Cursor::UNPLACED
+/// [`UNPLACED`]: crate::store::kv::page_table::UNPLACED
 pub(crate) async fn cursor_at_rest<C: FireContext>(
     ctx: &mut C,
     fires: &PendingFires,
@@ -2354,8 +2516,11 @@ pub(crate) async fn cursor_at_rest<C: FireContext>(
         stores.rs.lock().unwrap().device_fold_gate(rs)
             == Err(crate::store::rs::RsError::DeviceFoldUnsettled)
     });
-    let at_rest = cursor.lock().unwrap().at_rest().is_ok();
-    if !at_rest || marked {
+    let unsettled =
+        crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |store| {
+            store.unsettled(kv.id)
+        })?;
+    if unsettled > 0 || marked {
         drain_pipeline_fires(ctx, fires).await?;
         if let Some(rs) = rs {
             crate::store::rs::device_folds_settled(&stores.rs, &[rs]).await;
@@ -2365,13 +2530,20 @@ pub(crate) async fn cursor_at_rest<C: FireContext>(
     if let Some(reason) = failure.lock().unwrap().clone() {
         return Ok(Err(format!("pipeline failed: {reason}")));
     }
+    let exact = crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |store| {
+        store.folded_exact(kv.id)
+    })?;
     let cursor = cursor.lock().unwrap().clone();
-    Ok(match cursor.at_rest() {
-        Ok(()) => Ok(cursor),
+    Ok(if exact {
+        Ok(cursor)
+    } else {
         // The recurrent store says how the fire ended, where it keeps one.
-        Err(why) => Err(rs
+        Err(rs
             .and_then(|rs| stores.rs.lock().unwrap().device_fold_gate(rs).err())
-            .map_or_else(|| format!("working set: {why}"), |named| named.to_string())),
+            .map_or_else(
+                || format!("working set: {}", crate::store::kv::page_table::UNPLACED),
+                |named| named.to_string(),
+            ))
     })
 }
 
@@ -2782,25 +2954,42 @@ fn pass_lanes<C: FireContext>(ctx: &mut C, fwd: &Resource<ForwardPass>) -> Anyho
         let pass = ctx.resources().get(fwd)?;
         (pass.lanes.clone(), pass.kv_lanes.clone())
     };
+    let mut kv = Vec::with_capacity(kv_lanes.len());
+    for &rep in &kv_lanes {
+        let res: Resource<KvWorkingSet> = Resource::new_borrow(rep);
+        kv.push(ctx.resources().get(&res)?.clone());
+    }
+    // What each lane's working set has folded, and whether that is all of
+    // it, are its KV working set's.
+    let folded: Vec<(u32, bool)> = match kv.first() {
+        Some(ws) => {
+            let stores = crate::store::registry::get(ws.model, ws.engine);
+            crate::store::registry::with_kv_lock(&stores.kv, "host-other", |store| {
+                kv.iter()
+                    .map(|ws| {
+                        let folded = u32::try_from(store.folded(ws.id)?).unwrap_or(u32::MAX);
+                        Ok((folded, store.folded_exact(ws.id)?))
+                    })
+                    .collect::<Result<_, crate::store::kv::KvStoreError>>()
+            })?
+        }
+        None => Vec::new(),
+    };
     let mut places = Vec::with_capacity(lanes.len());
     let mut cursors = Vec::with_capacity(lanes.len());
-    for &rep in &lanes {
+    for (lane, &rep) in lanes.iter().enumerate() {
         let res: Resource<WorkingSet> = Resource::new_borrow(rep);
         let cursor = ctx.resources().get(&res)?.cursor.clone();
         let now = cursor.lock().unwrap().clone();
+        let (folded, folded_exact) = folded.get(lane).copied().unwrap_or((0, true));
         places.push(geometry::Place {
-            folded: now.folded,
-            folded_exact: now.folded_exact,
+            folded,
+            folded_exact,
             tail: now.tail,
             shared: lanes.iter().filter(|&&other| other == rep).count() > 1,
             spans: now.spans,
         });
         cursors.push(cursor);
-    }
-    let mut kv = Vec::with_capacity(kv_lanes.len());
-    for &rep in &kv_lanes {
-        let res: Resource<KvWorkingSet> = Resource::new_borrow(rep);
-        kv.push(ctx.resources().get(&res)?.clone());
     }
     Ok(PassLanes {
         places,
@@ -2811,68 +3000,92 @@ fn pass_lanes<C: FireContext>(ctx: &mut C, fwd: &Resource<ForwardPass>) -> Anyho
 
 type CursorCell = std::sync::Arc<std::sync::Mutex<crate::inferlet::host::working_set::Cursor>>;
 
-/// Working sets in `settles` freeze where the fire settles.
-fn advance_cursors(
-    lanes: &PassLanes,
-    landings: Option<&[geometry::Landing]>,
-    matched: &[crate::pipeline::media::MatchedRun],
-    fold: &geometry::Fold,
-    settles: &[CursorCell],
+/// A fire on its way moves its working set's cursor, as soon as it is
+/// submitted: a pass that stops short leaves the cursor at the fires that
+/// went. `tail` is where its rows end, `None` where the device places them
+/// past rows the host cannot place; `spans` the first slot it writes and
+/// the lags of the media runs it carries. What it folds is not the
+/// cursor's: that is its KV working set's.
+fn advance_cursor(
+    cell: &CursorCell,
+    tail: Option<u32>,
+    spans: Option<(u32, Vec<(u32, u32, u32)>)>,
 ) {
-    let mut done: Vec<&CursorCell> = Vec::new();
-    for (lane, cell) in lanes.cursors.iter().enumerate() {
-        if done.iter().any(|seen| std::sync::Arc::ptr_eq(seen, cell)) {
-            continue;
-        }
-        done.push(cell);
-        let mine: Vec<usize> = (lane..lanes.cursors.len())
-            .filter(|&other| std::sync::Arc::ptr_eq(&lanes.cursors[other], cell))
-            .collect();
-        let mut cursor = cell.lock().unwrap();
-        if settles
-            .iter()
-            .any(|later| std::sync::Arc::ptr_eq(later, cell))
-        {
-            cursor.unsettled += 1;
-            cursor.folded_exact = false;
-        }
-        let Some(landings) = landings else {
-            cursor.tail = None;
-            continue;
-        };
-        let end = mine
-            .iter()
-            .filter_map(|&lane| landings.get(lane))
-            .map(|landing| landing.end())
-            .max()
-            .unwrap_or(0);
-        cursor.tail = Some(end);
+    let mut cursor = cell.lock().unwrap();
+    cursor.tail = tail;
+    if let Some(end) = tail {
         cursor.reserved = cursor.reserved.max(end);
         cursor.written = cursor.written.max(end);
-        let start = mine
-            .iter()
-            .filter_map(|&lane| landings.get(lane))
-            .map(|landing| landing.start)
-            .min()
-            .unwrap_or(end);
-        let spans = matched
-            .iter()
-            .filter(|run| mine.contains(&(run.lane as usize)))
-            .map(|run| {
-                let at = landings[run.lane as usize].start + run.anchor;
-                let lag = run.span.token_count.saturating_sub(run.span.position_span);
-                (at, at + run.rows, lag)
-            })
-            .filter(|&(_, _, lag)| lag > 0);
+    }
+    if let Some((start, spans)) = spans {
         cursor.rewrite(start, spans);
-        // Exact, or a bound below the fold still to be placed.
-        if let Some(count) = fold.of(mine[0]) {
-            let folded = cursor.folded.saturating_add(count).min(end);
-            cursor.folded = cursor.folded.max(folded);
-        }
     }
 }
 
+/// The lags of the media runs `lanes` carry that start in `slots`.
+fn lagging_spans(
+    landings: &[geometry::Landing],
+    matched: &[crate::pipeline::media::MatchedRun],
+    lanes: &[usize],
+    slots: &std::ops::Range<u64>,
+) -> Vec<(u32, u32, u32)> {
+    matched
+        .iter()
+        .filter(|run| lanes.contains(&(run.lane as usize)))
+        .map(|run| {
+            let at = landings[run.lane as usize].start + run.anchor;
+            let lag = run.span.token_count.saturating_sub(run.span.position_span);
+            (at, at + run.rows, lag)
+        })
+        .filter(|&(at, _, lag)| lag > 0 && slots.contains(&u64::from(at)))
+        .collect()
+}
+
+/// The fire is submitted: each working set it folds by a count placed when
+/// it settles says so, its folded length a lower bound until the fire
+/// settles ([`settle_fold`]) or, dropped, the engine is done with it. It is
+/// not forked or exported until then.
+fn unsettle(
+    stores: &crate::store::registry::Stores,
+    completion: &crate::engine::WorkItemCompletion,
+    parts: &mut [FireWs],
+) {
+    let mut settling = parts
+        .iter_mut()
+        .filter_map(|part| match &mut part.fold {
+            Some(FoldAt {
+                by: FoldBy::Settled { unplaced, .. },
+                ..
+            }) => Some((part.ws, unplaced)),
+            _ => None,
+        })
+        .peekable();
+    if settling.peek().is_none() {
+        return;
+    }
+    crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
+        for (ws, unplaced) in settling {
+            match kv.unsettle(ws) {
+                Ok(()) => {
+                    *unplaced = Some(Unplaced {
+                        ws,
+                        submitted: Some((stores.kv.clone(), completion.clone())),
+                    });
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "pipeline: a fold placed at settle on a set gone");
+                }
+            }
+        }
+    });
+}
+
+/// What a fire whose rows the host places folds on `group`'s working set.
+/// A count the host knows over a folded length it knows is a slot, frozen
+/// as the fire is prepared; anything else is placed when the pass's last
+/// fire settles. A fold reaches no further than where the group's first
+/// lane lands its rows (`landings`), as its recurrent state's does
+/// ([`host_rs_plan`]), nor than `end`, where this fire's rows end.
 #[allow(
     clippy::too_many_arguments,
     reason = "the fold, where it ends, and the request whose lanes report it"
@@ -2880,7 +3093,7 @@ fn advance_cursors(
 fn fold_at(
     lanes: &PassLanes,
     group: &[usize],
-    reach: Option<u64>,
+    landings: &[geometry::Landing],
     fold: &geometry::Fold,
     end: u64,
     last: bool,
@@ -2893,12 +3106,13 @@ fn fold_at(
     }
     let first = *group.first()?;
     let place = &lanes.places[first];
+    let reach = u64::from(landings[first].end());
     let count = fold.of(first);
     if count == Some(0) {
         return None;
     }
     if place.folded_exact
-        && let (Some(count), Some(reach)) = (count, reach)
+        && let Some(count) = count
     {
         return Some(FoldBy::To(
             u64::from(place.folded)
@@ -2910,10 +3124,6 @@ fn fold_at(
     if !last {
         return None;
     }
-    let cursor = lanes.cursors[first].clone();
-    let reach = reach
-        .unwrap_or_else(|| u64::from(cursor.lock().unwrap().reserved))
-        .min(end);
     let (tags, rs) = match count {
         Some(_) => (Vec::new(), None),
         None => (
@@ -2924,23 +3134,131 @@ fn fold_at(
     Some(FoldBy::Settled {
         count,
         tags,
-        reach,
-        cursor,
+        reach: reach.min(end),
+        written: false,
         rs,
+        unplaced: None,
     })
 }
 
-fn settling(parts: &[FireWs]) -> Vec<CursorCell> {
-    parts
-        .iter()
-        .filter_map(|part| match &part.fold {
-            Some(FoldAt {
-                by: FoldBy::Settled { cursor, .. },
-                ..
-            }) => Some(cursor.clone()),
-            _ => None,
-        })
-        .collect()
+/// The last step of a piece's prepare on a working set it writes from
+/// `start`: its log begins there, and what it folds by a count the host
+/// knows is frozen through `freeze`. A piece that starts inside what the
+/// set has frozen begins no log, and freezes nothing.
+fn begin_piece(
+    kv: &mut crate::store::kv::KvStore,
+    ws: crate::store::kv::page_table::WorkingSetId,
+    start: u64,
+    freeze: Option<u64>,
+) -> Result<Option<u64>, crate::store::kv::KvStoreError> {
+    if start < kv.folded(ws)? {
+        return Ok(None);
+    }
+    let seq = kv.log_begin(ws, start)?;
+    if let Some(to) = freeze {
+        kv.freeze(ws, to)?;
+    }
+    Ok(Some(seq))
+}
+
+/// What a pass whose rows the device places folds on a working set, as far
+/// as the host can say before the fire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeviceFold {
+    None,
+    /// By a count the device computes.
+    Device,
+    /// This many slots past the folded length.
+    Count(u32),
+    /// By a count that runs past the lane's rows, from rows the host cannot
+    /// place: how far it reaches is where the engine says the rows ended.
+    PastRows(u32),
+}
+
+/// Whether the rows the device places on a working set start at its folded
+/// length: one lane writes it, it holds no unfolded row, and the host knows
+/// it.
+fn appends_folded(lanes: &PassLanes, group: &[usize]) -> bool {
+    match group {
+        [lane] => {
+            let place = &lanes.places[*lane];
+            place.folded_exact && place.tail == Some(place.folded)
+        }
+        _ => false,
+    }
+}
+
+/// The engine folds through `min(folded + count, first + rows)`, `first`
+/// being where the device lands the lane's `rows` rows, at or past the
+/// folded length. A count within the rows stops short of them wherever
+/// they land; one past them stops at their end, which the host knows only
+/// when they start at the folded length. `room` is what the set reserved
+/// past it.
+fn device_fold(count: Option<u32>, rows: u32, room: u32, appends: bool) -> DeviceFold {
+    match count {
+        None => DeviceFold::Device,
+        Some(0) => DeviceFold::None,
+        Some(count) if count <= rows || appends => match count.min(rows).min(room) {
+            0 => DeviceFold::None,
+            count => DeviceFold::Count(count),
+        },
+        Some(count) => DeviceFold::PastRows(count),
+    }
+}
+
+/// The refusal of [`DeviceFold::PastRows`] where nothing tells the host
+/// where the rows ended: a fire that reports no rows, or a recurrent state,
+/// whose fold the host states is final as stated.
+fn past_rows_refusal(lane: usize, rows: u32) -> String {
+    format!(
+        "pipeline: lane {lane} folds past the {rows} row(s) it writes, which land where the \
+         device says on a working set that may hold unfolded rows before them; that fold \
+         ends where the rows do, which the device alone knows here. Fold no more than the \
+         lane writes, or fold what the set holds before this pass"
+    )
+}
+
+/// [`fold_at`] for rows the device places: `stated` is [`device_fold`] for
+/// the working set's first lane, `reported` whether the fire reports the
+/// rows it wrote.
+fn device_fold_at(
+    lanes: &PassLanes,
+    first: usize,
+    stated: DeviceFold,
+    reported: bool,
+    rs: Option<crate::store::rs::RsWorkingSetId>,
+    req: &mut crate::engine::FireRequest,
+    tags: &mut Vec<ReportTag>,
+) -> Option<FoldBy> {
+    let place = &lanes.places[first];
+    let reach = u64::from(lanes.cursors[first].lock().unwrap().reserved);
+    let settled = |count, tags, written, rs| FoldBy::Settled {
+        count,
+        tags,
+        reach,
+        written,
+        rs,
+        unplaced: None,
+    };
+    match stated {
+        DeviceFold::None => None,
+        DeviceFold::Device => {
+            let tag = report_on(req, first, tags);
+            Some(settled(
+                None,
+                vec![tag],
+                false,
+                rs.map(RsDeviceFold::planned),
+            ))
+        }
+        DeviceFold::Count(count) if place.folded_exact => Some(FoldBy::To(
+            u64::from(place.folded).saturating_add(u64::from(count)),
+        )),
+        DeviceFold::Count(count) => Some(settled(Some(count), Vec::new(), false, None)),
+        DeviceFold::PastRows(count) => {
+            reported.then(|| settled(Some(count), Vec::new(), true, None))
+        }
+    }
 }
 
 /// The working sets a piece writes: those with a lane that has rows in it. A set whose lanes
@@ -3372,9 +3690,22 @@ pub async fn submit_pass_stamped<C: FireContext>(
             rows: supplied,
             keys,
         } = match &pass_slots {
-            Some(slots) => supply(&stores, ws.id, &full, slots, attach, page_size),
+            Some(slots) => {
+                let folds = fold.of(0).map_or(0, |count| {
+                    u64::from(count).min(full.lanes[0].tokens.len() as u64)
+                });
+                supply(&stores, ws.id, &full, slots, attach, folds, page_size)
+            }
             None => Supplied::default(),
         };
+        // A state resumed is folded through what was mapped in, rows the
+        // set holds from here on whatever becomes of the rest of the pass.
+        if supplied > 0 && matches!(attach, Attach::Checkpoint(_)) {
+            let mut cursor = pass_lanes.cursors[0].lock().unwrap();
+            let end = full.lanes[0].kv.held.saturating_add(supplied);
+            cursor.tail = Some(end);
+            cursor.reserved = cursor.reserved.max(end);
+        }
         drop(promoted);
         if pass_slots.is_some() {
             // It looked, so what it found is measured, nothing included.
@@ -3567,7 +3898,8 @@ pub async fn submit_pass_stamped<C: FireContext>(
         };
         let framed = matches!(frame, Some(stamp) if stamp.fires == 1);
         let mut submitted: Vec<crate::engine::completion::WorkItemCompletion> = Vec::new();
-        let mut settles = Vec::new();
+        // The working sets a piece of this pass has moved the cursor of.
+        let mut advanced = vec![false; groups.len()];
         let mut at = 0;
         while at < cuts.len() {
             if recuttable && at > 0 && at + 1 < cuts.len() {
@@ -3743,6 +4075,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 (model, engine),
                 &stores,
                 quorum_pipeline_id,
+                &pipeline_failure,
                 &sets,
                 &rs_ws_ids,
                 rs_plan,
@@ -3755,6 +4088,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 kvtxns,
                 rs: rs_prepared,
                 epoch,
+                unfired,
             } = match reserved {
                 Ok(reserved) => reserved,
                 Err(error) => return Ok(Err(error)),
@@ -3770,6 +4104,29 @@ pub async fn submit_pass_stamped<C: FireContext>(
             let mut parts = Vec::with_capacity(group_sets.len());
             for (&group, (lease, kvtxn)) in present.iter().zip(leases.into_iter().zip(kvtxns)) {
                 let (set, (slots, written)) = (&group_sets[group], &spans[group]);
+                let lanes = &groups[group].1;
+                let mut tags = Vec::new();
+                let rs = rs_ws_ids.get(lanes[0]).copied().filter(|_| !windowed);
+                let by = fold_at(
+                    &pass_lanes,
+                    lanes,
+                    &landings,
+                    &fold,
+                    slots.end,
+                    last,
+                    rs,
+                    &mut req,
+                    &mut tags,
+                );
+                // What the piece folds is frozen with its log begun, in the
+                // step `reserve` ended by committing the recurrent state's
+                // fold: nothing is awaited between them. A fire that does
+                // not follow fails the pipeline, and its sets with it,
+                // however this call ends (`unfired`).
+                let freeze = match &by {
+                    Some(FoldBy::To(to)) => Some(*to),
+                    _ => None,
+                };
                 let logged = crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
                     let folded = kv.folded(set.id)?;
                     let pages = if reports && kv.keeps() {
@@ -3785,23 +4142,26 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     } else {
                         None
                     };
-                    let seq = (slots.start >= folded)
-                        .then(|| kv.log_begin(set.id, slots.start))
-                        .transpose()?;
+                    let seq = begin_piece(kv, set.id, slots.start, freeze)?;
                     Ok::<_, crate::store::kv::KvStoreError>((folded, seq, pages))
                 });
                 let (folded, seq, pages) = match logged {
                     Ok(logged) => logged,
-                    Err(error) => return Ok(Err(format!("pipeline: KV rows: {error}"))),
+                    Err(error) => {
+                        let reason = format!("pipeline: KV rows: {error}");
+                        record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
+                        return Ok(Err(reason));
+                    }
                 };
                 let Some(seq) = seq else {
-                    return Ok(Err(format!(
+                    let reason = format!(
                         "pipeline: a fire writes slot {}, inside its working set's frozen \
                          prefix (0..{folded})",
                         slots.start
-                    )));
+                    );
+                    record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
+                    return Ok(Err(reason));
                 };
-                let mut tags = Vec::new();
                 // A piece carrying media is not its tokens' alone.
                 let rows = match (&pass_slots, pages) {
                     (Some(_), _) if !req.media.is_empty() => LogRows::Unknown,
@@ -3816,20 +4176,6 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     },
                     (None, None) => LogRows::Unknown,
                 };
-                let lanes = &groups[group].1;
-                let reach = Some(u64::from(landings[lanes[0]].end()));
-                let rs = rs_ws_ids.get(lanes[0]).copied().filter(|_| !windowed);
-                let by = fold_at(
-                    &pass_lanes,
-                    lanes,
-                    reach,
-                    &fold,
-                    slots.end,
-                    last,
-                    rs,
-                    &mut req,
-                    &mut tags,
-                );
                 parts.push(FireWs {
                     ws: set.id,
                     kvtxn,
@@ -3843,8 +4189,8 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     staged: None,
                 });
             }
-            settles.extend(settling(&parts));
             if let Err(refusal) = map_lane_pages(&mut req, &stores, &piece_groups) {
+                record_submit_failure(ctx, &fwd, &pipeline_failure, &refusal);
                 return Ok(Err(refusal));
             }
             crate::offload::stream::tap(pid, &stores, &mut req);
@@ -3900,11 +4246,13 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
                 return Ok(Err(reason));
             }
+            let unqueued = unfired.submitted();
             epoch.retire_on(&completion);
             for part in &mut parts {
                 part.kvtxn.retire_on(&completion);
             }
             mark_device_folds(&stores, &completion, &mut parts);
+            unsettle(&stores, &completion, &mut parts);
             submitted.push(completion.clone());
             if let Some(reservation) = ticket_reservation {
                 reservation.commit();
@@ -3916,10 +4264,34 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 crate::probe_fire_record!(submit_probe.shadow_advance_us, began.elapsed());
             }
 
-            pipe_fires
-                .lock()
-                .unwrap()
-                .push_back(PendingOp::Fire(PendingFire {
+            // Each set the piece writes ends where the piece does: a pass
+            // that stops short of its last piece leaves the cursors at the
+            // pieces that went.
+            for &group in &present {
+                let (lanes, slots) = (&groups[group].1, &spans[group].0);
+                let cell = &pass_lanes.cursors[lanes[0]];
+                let start = if advanced[group] {
+                    slots.start
+                } else {
+                    lanes
+                        .iter()
+                        .map(|&lane| u64::from(landings[lane].start))
+                        .min()
+                        .unwrap_or(slots.start)
+                };
+                advanced[group] = true;
+                advance_cursor(
+                    cell,
+                    Some(slots.end as u32),
+                    Some((
+                        start as u32,
+                        lagging_spans(&landings, &matched, lanes, &(start..slots.end)),
+                    )),
+                );
+            }
+            unqueued.queue(
+                &pipe_fires,
+                PendingFire {
                     completion,
                     checkpoints: checkpoints_here,
                     kv: parts,
@@ -3931,7 +4303,8 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     cells: cells.clone(),
                     failure: pipeline_failure.clone(),
                     retired: None,
-                }));
+                },
+            );
             // The next piece reads the KV this one writes: they run in
             // order on the device, so it is submitted now, as a decode's
             // next pass is, rather than once this one retires.
@@ -3945,7 +4318,18 @@ pub async fn submit_pass_stamped<C: FireContext>(
         if let (Some(guard), Some(last)) = (coalesced.take(), submitted.last()) {
             last.on_settled(move || drop(guard));
         }
-        advance_cursors(&pass_lanes, Some(&landings), &matched, &fold, &settles);
+        // A set no piece wrote (its lanes carry no rows) ends where they land.
+        for (group, (_, lanes)) in groups.iter().enumerate() {
+            if advanced[group] {
+                continue;
+            }
+            let end = lanes.iter().map(|&lane| landings[lane].end()).max();
+            let start = lanes.iter().map(|&lane| landings[lane].start).min();
+            if let (Some(end), Some(start)) = (end, start) {
+                let cell = &pass_lanes.cursors[lanes[0]];
+                advance_cursor(cell, Some(end), Some((start, Vec::new())));
+            }
+        }
         crate::probe_fire_record!(submit_probe.total_us, submit_clock.elapsed());
         crate::probe_fire_count!(submit_probe.submits);
         Ok(Ok(()))
@@ -4362,11 +4746,15 @@ pub(crate) async fn finalize_op_detached(op: PendingOp) -> Anyhow<()> {
     Ok(())
 }
 
-/// The last fold of the working set to settle makes its cursor exact.
+/// What the fire froze seals; a fold placed only now is frozen first, the
+/// working set's one folded length moving by the count the engine reports
+/// or the host stated, and its recurrent state's by the same count. The
+/// last such fold of the set to settle makes that length exact again.
+/// `written_end` is where the fire's rows ended, where they are known.
 /// `failure` is why the fire did not run to its end, when it did not: what
-/// it was to freeze stays unfrozen, and a recurrent state it folded by a
-/// count the device computes is left refused by that name. One whose fire
-/// ran to its end and brought no count is left refused too
+/// it was to freeze only now stays unfrozen, and a recurrent state it
+/// folded by a count the device computes is left refused by that name. One
+/// whose fire ran to its end and brought no count is left refused too
 /// ([`RsDeviceFold::UNREPORTED`]): the engine's record went on by a count
 /// the frozen length never takes, and what copies or moves the set would
 /// state a length behind it.
@@ -4375,16 +4763,22 @@ fn settle_fold(
     ws: crate::store::kv::page_table::WorkingSetId,
     fold: FoldAt,
     reported: &std::collections::HashMap<u64, ::engine::KvWrites>,
+    written_end: Option<u64>,
     failure: Option<&str>,
 ) {
     let success = failure.is_none();
     let FoldAt { mut by, decoded } = fold;
-    // Taken before the kv lock: ending it takes the rs store's. The count
-    // is the host's, or what the engine reported under the lanes' tags; a
-    // fire that ran and brought neither went unreported.
-    let (device_fold, unreported) = match &mut by {
+    // Taken before the kv lock: ending the one takes the rs store's, and
+    // the other, dropped unsettled, the kv store's. The count is the
+    // host's, or what the engine reported under the lanes' tags; a fire
+    // that ran and brought neither went unreported.
+    let (device_fold, unreported, mut unplaced) = match &mut by {
         FoldBy::Settled {
-            count, tags, rs, ..
+            count,
+            tags,
+            rs,
+            unplaced,
+            ..
         } => {
             *count = count.or_else(|| {
                 tags.iter()
@@ -4392,49 +4786,54 @@ fn settle_fold(
                     .collect::<Option<Vec<u32>>>()
                     .and_then(|counts| counts.into_iter().max())
             });
-            (rs.take(), success && count.is_none())
+            (rs.take(), success && count.is_none(), unplaced.take())
         }
-        FoldBy::To(_) => (None, false),
+        FoldBy::To(_) => (None, false, None),
     };
     let mut device_slots = None;
     let folded = crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
         let frozen = kv.folded(ws)?;
-        let (to, cursor) = match by {
-            FoldBy::To(to) => (Some(to), None),
+        let to = match by {
+            FoldBy::To(to) => Some(to),
             FoldBy::Settled {
                 count,
                 tags: _,
                 reach,
-                cursor,
+                written,
                 rs: _,
+                unplaced: _,
             } => {
-                let to = count.map(|count| frozen.saturating_add(u64::from(count)).min(reach));
+                let reach = match (written, written_end) {
+                    (false, _) => Some(reach),
+                    (true, end) => end.map(|end| end.min(reach)),
+                };
+                let to = count
+                    .zip(reach)
+                    .map(|(count, reach)| frozen.saturating_add(u64::from(count)).min(reach));
                 // The recurrent state froze the same slots on the device.
                 device_slots = to
                     .filter(|_| success)
                     .map(|to| u32::try_from(to.saturating_sub(frozen)).unwrap_or(u32::MAX));
-                (to, Some((cursor, to.is_some())))
+                to
             }
         };
-        let pages = match to.filter(|_| success) {
-            Some(to) => kv.fold(ws, to, decoded)?,
-            None => 0,
+        let placed = to.filter(|_| success);
+        let pages = match placed {
+            Some(to) => kv.fold(ws, to, decoded),
+            None => Ok(0),
         };
-        Ok::<_, crate::store::kv::KvStoreError>((pages, kv.folded(ws)?, cursor))
+        // The fold is settled whether or not it was placed: one never
+        // placed leaves the folded length a lower bound.
+        if let Some(unplaced) = &mut unplaced {
+            unplaced.settle(kv, placed.is_some() && pages.is_ok());
+        }
+        pages
     });
+    // One whose set was gone lifts nothing, outside the store's lock.
+    drop(unplaced);
     match folded {
-        Ok((pages, frozen, cursor)) => {
+        Ok(pages) => {
             SEALED_PAGES.fetch_add(pages, std::sync::atomic::Ordering::Relaxed);
-            if let Some((cursor, placed)) = cursor
-                && placed
-            {
-                let mut cursor = cursor.lock().unwrap();
-                cursor.unsettled = cursor.unsettled.saturating_sub(1);
-                if cursor.unsettled == 0 {
-                    cursor.folded = u32::try_from(frozen).unwrap_or(u32::MAX);
-                    cursor.folded_exact = true;
-                }
-            }
         }
         Err(error) => {
             tracing::debug!(%error, "pipeline: sealing what a fire froze");
@@ -4509,6 +4908,8 @@ async fn finalize_fire_await(fire: PendingFire) -> FinalizeOutcome {
         for fire in &staged {
             fire.settle(&reported, success);
         }
+        // Where each working set's rows ended, where the fire's rows are known.
+        let mut written_ends = std::collections::HashMap::new();
         for (ws, LogFire { seq, rows }) in logs {
             let known = match rows {
                 _ if !success => None,
@@ -4534,10 +4935,21 @@ async fn finalize_fire_await(fire: PendingFire) -> FinalizeOutcome {
             if let Err(error) = logged {
                 tracing::debug!(%error, "pipeline: logging what a fire wrote");
             }
+            if let Some((start, tokens)) = &known {
+                written_ends.insert(ws, start + tokens.len() as u64);
+            }
         }
         // What the fire froze seals now that its rows are logged.
         for (ws, fold) in folds {
-            settle_fold(&stores, ws, fold, &reported, failure_reason.as_deref());
+            let written_end = written_ends.get(&ws).copied();
+            settle_fold(
+                &stores,
+                ws,
+                fold,
+                &reported,
+                written_end,
+                failure_reason.as_deref(),
+            );
         }
         for checkpoint in &checkpoints {
             take_checkpoint(&stores, checkpoint, success);
@@ -4733,6 +5145,21 @@ async fn fire_device_geometry<C: FireContext>(
         Ok(ids) => ids,
         Err(error) => return Ok(Err(error)),
     };
+    // What each working set folds, as far as the host can say before the fire.
+    let stated: Vec<DeviceFold> = groups
+        .iter()
+        .map(|(_, lanes)| {
+            let first = lanes[0];
+            let place = &pass_lanes.places[first];
+            let reserved = pass_lanes.cursors[first].lock().unwrap().reserved;
+            device_fold(
+                fold.of(first),
+                split[first + 1] - split[first],
+                reserved.saturating_sub(place.folded),
+                appends_folded(&pass_lanes, lanes),
+            )
+        })
+        .collect();
     let windowed = crate::model::model().rs_caps().window_tokens > 0;
     // The fire stages its rows whole (the device places them, so it is never
     // cut): it asks the activation rung for them as every pass does
@@ -4793,7 +5220,7 @@ async fn fire_device_geometry<C: FireContext>(
         if windowed {
             device_window_plan(&stores, ws.id, &write_indexes[0], &rs_ws_ids)
         } else {
-            device_rs_plan(&stores, &rs_ws_ids, &groups, &pass_lanes, &fold)
+            device_rs_plan(&stores, &rs_ws_ids, &groups, &pass_lanes, &split, &fold)
         }
     };
     let reserved = reserve(
@@ -4801,6 +5228,7 @@ async fn fire_device_geometry<C: FireContext>(
         (ws.model, ws.engine),
         &stores,
         quorum_pipeline_id,
+        &pipeline_failure,
         &sets,
         &rs_ws_ids,
         rs_plan,
@@ -4813,6 +5241,7 @@ async fn fire_device_geometry<C: FireContext>(
         kvtxns,
         rs: mut rs_prepared,
         epoch,
+        unfired,
     } = match reserved {
         Ok(reserved) => reserved,
         Err(error) => return Ok(Err(error)),
@@ -4821,13 +5250,30 @@ async fn fire_device_geometry<C: FireContext>(
     let rstxns = RsTxnsGuard::new(ws.model, ws.engine, rs_prepared.txn.take());
     // The device picks the slots a decode writes: each working set's log is
     // cut where it may start writing, its frozen length, unless the engine
-    // reports what it wrote.
+    // reports what it wrote. A fold the host can place is frozen with it, in
+    // the step `reserve` ended by committing the recurrent state's fold; a
+    // fire that does not follow fails the pipeline, and its sets with it,
+    // however this call ends (`unfired`).
     let mut logged = Vec::with_capacity(group_sets.len());
-    for ((set, indexes), (_, lanes)) in group_sets.iter().zip(&write_indexes).zip(&groups) {
-        let known = u64::from(pass_lanes.places[lanes[0]].folded);
+    for (((set, indexes), (_, lanes)), stated) in group_sets
+        .iter()
+        .zip(&write_indexes)
+        .zip(&groups)
+        .zip(&stated)
+    {
+        let place = &pass_lanes.places[lanes[0]];
+        let known = u64::from(place.folded);
+        let freeze = match stated {
+            DeviceFold::Count(count) if place.folded_exact => Some(known + u64::from(*count)),
+            _ => None,
+        };
         let entry = crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
             let cut = kv.folded(set.id)?.max(known);
-            let seq = kv.log_begin(set.id, cut)?;
+            let seq = begin_piece(kv, set.id, cut, freeze)?.ok_or(
+                crate::store::kv::KvStoreError::BadWriteSet {
+                    reason: "a fire writes inside its working set's frozen prefix",
+                },
+            )?;
             let pages = if kv.keeps() && rs_ws_ids.is_empty() && group_sets.len() == 1 {
                 let flat = kv.flat_table(set.id)?;
                 Some(
@@ -4843,7 +5289,11 @@ async fn fire_device_geometry<C: FireContext>(
         });
         match entry {
             Ok(entry) => logged.push(entry),
-            Err(error) => return Ok(Err(format!("pipeline: KV rows: {error}"))),
+            Err(error) => {
+                let reason = format!("pipeline: KV rows: {error}");
+                record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
+                return Ok(Err(reason));
+            }
         }
     }
 
@@ -4974,12 +5424,13 @@ async fn fire_device_geometry<C: FireContext>(
     let plain_decode =
         !reads_each_other && switched.plain() && plain_decode(&req, lora_program, fire_wide_mask);
     let mut parts = Vec::with_capacity(group_sets.len());
-    for ((((set, (log_seq, log_pages)), lease), kvtxn), (_, lanes)) in group_sets
+    for (((((set, (log_seq, log_pages)), lease), kvtxn), (_, lanes)), &stated) in group_sets
         .iter()
         .zip(logged)
         .zip(leases)
         .zip(kvtxns)
         .zip(&groups)
+        .zip(&stated)
     {
         let mut tags = Vec::new();
         let rows = match log_pages.filter(|_| plain_decode) {
@@ -4990,16 +5441,21 @@ async fn fire_device_geometry<C: FireContext>(
             },
             None => LogRows::Unknown,
         };
-        // Where the rows land is the device's: the fold is placed when the
-        // fire settles.
+        let reported = matches!(rows, LogRows::Reported { .. });
+        if let (DeviceFold::PastRows(_), false) = (stated, reported) {
+            let first = lanes[0];
+            let reason = past_rows_refusal(first, split[first + 1] - split[first]);
+            record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
+            return Ok(Err(reason));
+        }
+        // What the host could place was frozen as the fire was prepared; the
+        // rest is placed when the fire settles.
         let rs = rs_ws_ids.get(lanes[0]).copied().filter(|_| !windowed);
-        let by = fold_at(
+        let by = device_fold_at(
             &pass_lanes,
-            lanes,
-            None,
-            &fold,
-            u64::MAX,
-            true,
+            lanes[0],
+            stated,
+            reported,
             rs,
             &mut req,
             &mut tags,
@@ -5032,7 +5488,6 @@ async fn fire_device_geometry<C: FireContext>(
             staged,
         });
     }
-    let settles = settling(&parts);
     debug_assert_eq!(
         untagged_device_fold(&req),
         None,
@@ -5060,30 +5515,39 @@ async fn fire_device_geometry<C: FireContext>(
         record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
         return Ok(Err(reason));
     }
+    let unqueued = unfired.submitted();
     epoch.retire_on(&completion);
     for part in &mut parts {
         part.kvtxn.retire_on(&completion);
     }
     mark_device_folds(&stores, &completion, &mut parts);
+    unsettle(&stores, &completion, &mut parts);
     if let Some(ask) = rung_ask {
         ask.until_settled(&completion);
     }
     ticket_reservation.commit();
     advance_shadow(ctx, &fwd)?;
-    advance_cursors(&pass_lanes, None, &[], &fold, &settles);
+    // Rows that start at the folded length and are folded whole end there;
+    // any others end where the device put them.
     for (part, (_, lanes)) in parts.iter().zip(&groups) {
+        let first = lanes[0];
+        let (place, cell) = (&pass_lanes.places[first], &pass_lanes.cursors[first]);
+        let rows = split[first + 1] - split[first];
+        let end = place.folded.saturating_add(rows);
+        let folded_whole = appends_folded(&pass_lanes, lanes)
+            && matches!(
+                &part.fold,
+                Some(FoldAt { by: FoldBy::To(to), .. }) if *to == u64::from(end)
+            );
+        advance_cursor(cell, folded_whole.then_some(end), None);
         if let Some(staged) = &part.staged {
-            pass_lanes.cursors[lanes[0]]
-                .lock()
-                .unwrap()
-                .stage(staged.rows.clone());
+            cell.lock().unwrap().stage(staged.rows.clone());
         }
     }
 
-    pipe_fires
-        .lock()
-        .unwrap()
-        .push_back(PendingOp::Fire(PendingFire {
+    unqueued.queue(
+        &pipe_fires,
+        PendingFire {
             completion,
             checkpoints: Vec::new(),
             kv: parts,
@@ -5095,7 +5559,8 @@ async fn fire_device_geometry<C: FireContext>(
             cells,
             failure: pipeline_failure,
             retired: None,
-        }));
+        },
+    );
     Ok(Ok(()))
 }
 
@@ -6198,24 +6663,28 @@ mod cut_tests {
 pub(crate) mod fold_tests {
     use super::*;
     use crate::inferlet::host::working_set::Cursor;
+    use crate::store::kv::KvStoreError;
+    use crate::store::kv::page_table::{KvTableError, WorkingSetId};
+    use crate::store::registry::Stores;
 
-    fn cursor(folded: u32, reserved: u32) -> CursorCell {
+    fn cursor(reserved: u32) -> CursorCell {
         Arc::new(Mutex::new(Cursor {
-            folded,
             reserved,
             ..Cursor::default()
         }))
     }
 
-    fn lanes(cursors: &[&CursorCell]) -> PassLanes {
+    /// The lanes of a pass, each on a working set folded through `folded`,
+    /// `exact` when no fold on its way or untold may have moved it further.
+    fn lanes(folded: u32, exact: bool, cursors: &[&CursorCell]) -> PassLanes {
         PassLanes {
             places: cursors
                 .iter()
                 .map(|cell| {
                     let now = cell.lock().unwrap().clone();
                     geometry::Place {
-                        folded: now.folded,
-                        folded_exact: now.folded_exact,
+                        folded,
+                        folded_exact: exact,
                         tail: now.tail,
                         shared: false,
                         spans: now.spans,
@@ -6227,6 +6696,27 @@ pub(crate) mod fold_tests {
         }
     }
 
+    /// Those lanes as a pass reads them when it starts ([`pass_lanes`]):
+    /// what their set has folded is its KV working set's.
+    fn lanes_on(stores: &Stores, ws: WorkingSetId, cursors: &[&CursorCell]) -> PassLanes {
+        let (folded, exact) = folded(stores, ws);
+        lanes(folded as u32, exact, cursors)
+    }
+
+    /// The set's folded length, and whether that is all it has folded.
+    fn folded(stores: &Stores, ws: WorkingSetId) -> (u64, bool) {
+        let kv = stores.kv.lock();
+        (kv.folded(ws).unwrap(), kv.folded_exact(ws).unwrap())
+    }
+
+    fn landing(start: u32, rows: u32) -> geometry::Landing {
+        geometry::Landing { start, rows }
+    }
+
+    fn all() -> geometry::Fold {
+        geometry::Fold::Host(vec![u32::MAX])
+    }
+
     fn request(lanes: usize) -> crate::engine::FireRequest {
         crate::engine::FireRequest {
             lanes: (0..lanes).map(|_| ::engine::Lane::default()).collect(),
@@ -6234,12 +6724,23 @@ pub(crate) mod fold_tests {
         }
     }
 
-    fn frozen_at(
-        folded: u64,
-    ) -> (
-        crate::store::registry::Stores,
-        crate::store::kv::page_table::WorkingSetId,
-    ) {
+    fn rows(held: u32, tokens: &[u32]) -> crate::engine::FireRequest {
+        crate::engine::FireRequest {
+            lanes: vec![::engine::Lane {
+                tokens: tokens.to_vec(),
+                kv: ::engine::KvDelta {
+                    held,
+                    ..Default::default()
+                },
+                ..::engine::Lane::default()
+            }],
+            ..crate::engine::FireRequest::default()
+        }
+    }
+
+    /// A model of 4-row pages, and a working set of it folded through
+    /// `folded`.
+    fn frozen_at(folded: u64) -> (usize, Stores, WorkingSetId) {
         let model = crate::store::registry::register_model(4, &[8], &[1]);
         let stores = crate::store::registry::get(model, 0);
         let ws = {
@@ -6248,7 +6749,72 @@ pub(crate) mod fold_tests {
             kv.fold(ws, folded, false).unwrap();
             ws
         };
-        (stores, ws)
+        (model, stores, ws)
+    }
+
+    fn state_at(stores: &Stores, frozen: u32) -> crate::store::rs::RsWorkingSetId {
+        let mut rs = stores.rs.lock().unwrap();
+        let ws = rs.create_working_set(crate::store::rs::RsGeometry {
+            state_size: 8,
+            buffer_page_tokens: 4,
+        });
+        rs.fold(ws, frozen);
+        ws
+    }
+
+    /// The fire's part on one working set, folding it by `by`.
+    fn part(
+        model: usize,
+        id: WorkingSetId,
+        by: FoldBy,
+        tags: Vec<ReportTag>,
+    ) -> (KvWorkingSet, FireWs) {
+        let kv = KvWorkingSet::new(model, 0, id, 8);
+        let part = FireWs {
+            ws: id,
+            kvtxn: KvTxnGuard::new(model, 0, None),
+            log: None,
+            lease: kv.fire_lease().expect("lease the submitted working set"),
+            fold: Some(FoldAt { by, decoded: false }),
+            reports: tags,
+            staged: None,
+        };
+        (kv, part)
+    }
+
+    /// What a fold placed as its fire is prepared freezes.
+    fn frozen_as_prepared(by: Option<&FoldBy>) -> Option<u64> {
+        match by {
+            Some(FoldBy::To(to)) => Some(*to),
+            _ => None,
+        }
+    }
+
+    /// A fold placed when its fire settles, the fire submitted on `ws`.
+    fn settled(
+        stores: &Stores,
+        ws: WorkingSetId,
+        count: Option<u32>,
+        tags: Vec<u64>,
+        reach: u64,
+        written: bool,
+    ) -> FoldAt {
+        stores.kv.lock().unsettle(ws).unwrap();
+        let completion = crate::engine::WorkItemCompletion::deferred_with_guard(None);
+        FoldAt {
+            by: FoldBy::Settled {
+                count,
+                tags,
+                reach,
+                written,
+                rs: None,
+                unplaced: Some(Unplaced {
+                    ws,
+                    submitted: Some((stores.kv.clone(), completion)),
+                }),
+            },
+            decoded: false,
+        }
     }
 
     fn taken(tags: &[ReportTag]) -> std::collections::HashMap<u64, ::engine::KvWrites> {
@@ -6265,19 +6831,33 @@ pub(crate) mod fold_tests {
         }
     }
 
+    fn none() -> std::collections::HashMap<u64, ::engine::KvWrites> {
+        std::collections::HashMap::new()
+    }
+
+    const UNSETTLED: KvStoreError = KvStoreError::Table(KvTableError::FoldUnsettled);
+    const UNPLACED: KvStoreError = KvStoreError::Table(KvTableError::FoldUnplaced);
+
     #[test]
     fn fold_every_case() {
-        a_fold_the_host_knows_is_placed_at_submit();
-        a_device_fold_is_reported_and_placed_when_it_settles();
-        the_last_fold_to_settle_makes_the_cursor_exact();
-        a_fold_never_reported_leaves_the_cursor_a_bound();
+        a_fold_the_host_knows_is_frozen_as_its_fire_is_prepared();
+        a_fold_the_device_counts_leaves_the_folded_length_until_it_settles();
+        the_last_fold_to_settle_makes_the_folded_length_exact();
+        a_fold_never_reported_leaves_the_folded_length_a_bound();
         a_fire_carrying_a_span_leaves_its_lag();
+        lanes_of_one_set_fold_to_where_the_first_ends();
+        a_count_on_rows_the_device_places_is_frozen_as_the_fire_is_prepared();
+        a_count_past_rows_the_device_places_is_placed_where_they_ended();
+        a_cut_pass_folds_from_where_each_piece_finds_it();
+        a_cut_pass_that_stops_short_leaves_what_its_pieces_folded();
+        a_piece_inside_the_frozen_prefix_begins_nothing();
+        a_pass_supplied_from_the_cache_folds_what_it_states();
+        a_state_resumes_no_further_than_its_pass_folds();
     }
 
     fn a_fire_carrying_a_span_leaves_its_lag() {
-        let cell = cursor(0, 0);
+        let cell = cursor(0);
         cell.lock().unwrap().spans = vec![(10, 14, 2), (50, 60, 4)];
-        let pass = lanes(&[&cell]);
         let span = Arc::new(media::front::EncodedSpan {
             token_count: 20,
             position_span: 5,
@@ -6297,13 +6877,11 @@ pub(crate) mod fold_tests {
             rows: 20,
             span,
         };
-        let landings = [geometry::Landing {
-            start: 40,
-            rows: 30,
-        }];
-        advance_cursors(&pass, Some(&landings), &[run], &geometry::Fold::None, &[]);
+        let landings = [landing(40, 30)];
+        let spans = lagging_spans(&landings, &[run], &[0], &(40..70));
+        advance_cursor(&cell, Some(70), Some((40, spans)));
         let now = cell.lock().unwrap().clone();
-        assert_eq!(now.tail, Some(70));
+        assert_eq!((now.tail, now.reserved, now.written), (Some(70), 70, 70));
         assert_eq!(
             now.spans,
             [(10, 14, 2), (43, 63, 15)],
@@ -6312,16 +6890,21 @@ pub(crate) mod fold_tests {
         assert_eq!(crate::inferlet::host::working_set::lag(&now.spans, 70), 17);
     }
 
-    fn a_fold_the_host_knows_is_placed_at_submit() {
-        let cell = cursor(4, 0);
-        let pass = lanes(&[&cell]);
+    /// A count the host knows, over a folded length it knows, is a slot:
+    /// frozen in the step that begins the fire's log, read by whatever is
+    /// staged next, and only sealed when the fire settles.
+    fn a_fold_the_host_knows_is_frozen_as_its_fire_is_prepared() {
+        let (_, stores, ws) = frozen_at(4);
+        let cell = cursor(0);
+        let pass = lanes_on(&stores, ws, &[&cell]);
         let mut req = request(1);
         let mut tags = Vec::new();
+        let landings = [landing(4, 6)];
         let mut at = |fold: &geometry::Fold, end: u64, last: bool| {
             fold_at(
                 &pass,
                 &[0],
-                Some(10),
+                &landings,
                 fold,
                 end,
                 last,
@@ -6336,20 +6919,49 @@ pub(crate) mod fold_tests {
             matches!(at(&three, 6, true), Some(FoldBy::To(6))),
             "short of what this fire writes"
         );
+        assert!(
+            matches!(at(&all(), 20, true), Some(FoldBy::To(10))),
+            "no further than its rows land"
+        );
         assert!(at(&geometry::Fold::Host(vec![0]), 10, true).is_none());
         assert!(tags.is_empty() && req.lanes[0].reports == 0);
+
+        let seq = begin_piece(&mut stores.kv.lock(), ws, 4, Some(7)).unwrap();
+        assert!(seq.is_some());
+        assert_eq!(folded(&stores, ws), (7, true));
+        assert_eq!(stores.kv.lock().unsettled(ws).unwrap(), 0);
+        let next = lanes_on(&stores, ws, &[&cell]);
+        assert!(next.places[0].folded == 7 && next.places[0].folded_exact);
+        // Nothing waits on the fire: a fork takes the length it froze.
+        let child = stores.kv.lock().fork(ws).unwrap();
+        assert_eq!(folded(&stores, child), (7, true));
+        let to = |to| FoldAt {
+            by: FoldBy::To(to),
+            decoded: false,
+        };
+        settle_fold(&stores, ws, to(7), &none(), None, None);
+        assert_eq!(folded(&stores, ws), (7, true));
+        // A fire that failed leaves what it froze frozen: its pipeline
+        // failed with it, and its sets fire no more.
+        begin_piece(&mut stores.kv.lock(), ws, 7, Some(9)).unwrap();
+        settle_fold(&stores, ws, to(9), &none(), None, Some("the fire failed"));
+        assert_eq!(folded(&stores, ws), (9, true));
     }
 
-    fn a_device_fold_is_reported_and_placed_when_it_settles() {
-        let (stores, ws) = frozen_at(4);
-        let cell = cursor(4, 12);
-        let pass = lanes(&[&cell, &cell]);
+    /// A fold the device counts is not known when its fire is prepared:
+    /// the folded length stays where it was, marked a lower bound from the
+    /// fire's submit, and moves by the reported count when the fire
+    /// settles.
+    fn a_fold_the_device_counts_leaves_the_folded_length_until_it_settles() {
+        let (model, stores, ws) = frozen_at(4);
+        let cell = cursor(12);
+        let pass = lanes_on(&stores, ws, &[&cell, &cell]);
         let mut req = request(2);
         let mut tags = Vec::new();
         let by = fold_at(
             &pass,
             &[0, 1],
-            None,
+            &[landing(4, 8), landing(4, 8)],
             &geometry::Fold::Device,
             u64::MAX,
             true,
@@ -6367,92 +6979,706 @@ pub(crate) mod fold_tests {
             FoldBy::Settled {
                 count: None,
                 reach: 12,
+                written: false,
                 ..
             }
         ));
-        advance_cursors(
-            &pass,
-            None,
-            &[],
-            &geometry::Fold::Device,
-            std::slice::from_ref(&cell),
-        );
-        let now = cell.lock().unwrap().clone();
-        assert!(!now.folded_exact && now.unsettled == 1 && now.tail.is_none());
+        // Its prepare freezes nothing.
+        let freeze = frozen_as_prepared(Some(&by));
+        assert_eq!(freeze, None);
+        begin_piece(&mut stores.kv.lock(), ws, 4, freeze)
+            .unwrap()
+            .expect("it writes past what is frozen");
+        assert_eq!(folded(&stores, ws), (4, true));
+        // Its submit.
+        let (_set, mut fire) = part(model, ws, by, tags);
+        let completion = crate::engine::WorkItemCompletion::deferred_with_guard(None);
+        unsettle(&stores, &completion, std::slice::from_mut(&mut fire));
+        assert_eq!(folded(&stores, ws), (4, false));
+        assert_eq!(stores.kv.lock().unsettled(ws).unwrap(), 1);
+        assert_eq!(stores.kv.lock().fork(ws), Err(UNSETTLED));
+        // A pass staged meanwhile reads a lower bound, and says so.
+        let next = lanes_on(&stores, ws, &[&cell]);
+        assert!(next.places[0].folded == 4 && !next.places[0].folded_exact);
+        assert!(!appends_folded(&next, &[0]));
 
         record_kv_writes(vec![report(req.lanes[0].reports, 3)]);
-        let reported = taken(&tags);
-        let by = FoldBy::Settled {
-            count: None,
-            tags: tags.iter().map(|tag| tag.0).collect(),
-            reach: 12,
-            cursor: cell.clone(),
-            rs: None,
-        };
-        settle_fold(&stores, ws, FoldAt { by, decoded: true }, &reported, None);
-        assert_eq!(stores.kv.lock().folded(ws).unwrap(), 7);
-        let now = cell.lock().unwrap().clone();
-        assert!(now.folded_exact && now.unsettled == 0 && now.folded == 7);
+        let reported = taken(&fire.reports);
+        let fold = fire.fold.take().unwrap();
+        settle_fold(&stores, ws, fold, &reported, None, None);
+        assert_eq!(folded(&stores, ws), (7, true));
+        assert_eq!(stores.kv.lock().unsettled(ws).unwrap(), 0);
+        let child = stores.kv.lock().fork(ws).unwrap();
+        assert_eq!(folded(&stores, child), (7, true));
     }
 
-    fn the_last_fold_to_settle_makes_the_cursor_exact() {
-        let (stores, ws) = frozen_at(4);
-        let cell = cursor(4, 0);
-        {
-            let mut now = cell.lock().unwrap();
-            now.unsettled = 2;
-            now.folded_exact = false;
-        }
-        let settled = |count: u32, reach: u64| FoldAt {
+    fn the_last_fold_to_settle_makes_the_folded_length_exact() {
+        let (_, stores, ws) = frozen_at(4);
+        let counted =
+            |count: u32, reach: u64| settled(&stores, ws, Some(count), Vec::new(), reach, false);
+        let (first, second) = (counted(2, 20), counted(9, 10));
+        assert_eq!(stores.kv.lock().unsettled(ws).unwrap(), 2);
+        settle_fold(&stores, ws, first, &none(), None, None);
+        assert_eq!(folded(&stores, ws), (6, false), "another is on its way");
+        // Counted from where the first left it, short of what the fire wrote.
+        settle_fold(&stores, ws, second, &none(), None, None);
+        assert_eq!(folded(&stores, ws), (10, true));
+        // One never submitted lifts nothing of another's.
+        let other = counted(1, 20);
+        let unsubmitted = FoldAt {
             by: FoldBy::Settled {
-                count: Some(count),
+                count: Some(1),
                 tags: Vec::new(),
-                reach,
-                cursor: cell.clone(),
+                reach: 20,
+                written: false,
                 rs: None,
+                unplaced: None,
             },
             decoded: false,
-        };
-        let none = std::collections::HashMap::new();
-        settle_fold(&stores, ws, settled(2, 20), &none, None);
-        assert!(!cell.lock().unwrap().folded_exact, "another is on its way");
-        // Counted from where the first left it, short of what the fire wrote.
-        settle_fold(&stores, ws, settled(9, 10), &none, None);
-        assert_eq!(stores.kv.lock().folded(ws).unwrap(), 10);
-        let now = cell.lock().unwrap().clone();
-        assert!(now.folded_exact && now.folded == 10);
-    }
-
-    fn a_fold_never_reported_leaves_the_cursor_a_bound() {
-        let (stores, ws) = frozen_at(4);
-        let cell = cursor(4, 0);
-        {
-            let mut now = cell.lock().unwrap();
-            now.unsettled = 1;
-            now.folded_exact = false;
-        }
-        let by = FoldBy::Settled {
-            count: None,
-            tags: vec![u64::MAX],
-            reach: 20,
-            cursor: cell.clone(),
-            rs: None,
         };
         settle_fold(
             &stores,
             ws,
-            FoldAt { by, decoded: false },
-            &std::collections::HashMap::new(),
+            unsubmitted,
+            &none(),
             None,
+            Some("never submitted"),
         );
-        assert_eq!(stores.kv.lock().folded(ws).unwrap(), 4);
-        let now = cell.lock().unwrap().clone();
-        assert!(!now.folded_exact && now.unsettled == 1);
+        assert_eq!(folded(&stores, ws), (10, false));
+        assert_eq!(stores.kv.lock().unsettled(ws).unwrap(), 1);
+        settle_fold(&stores, ws, other, &none(), None, None);
+        assert_eq!(folded(&stores, ws), (11, true));
+    }
+
+    /// A fold whose count never came (the engine reported none, or the
+    /// pass failed) settles unplaced: the folded length is a lower bound
+    /// from then on, in the set, so the set is forked no more, and nothing
+    /// waits for a settle that has happened.
+    fn a_fold_never_reported_leaves_the_folded_length_a_bound() {
+        for failure in [None, Some("the fire failed")] {
+            let (_, stores, ws) = frozen_at(4);
+            let (count, tags) = match failure {
+                None => (None, vec![u64::MAX]),
+                Some(_) => (Some(3), Vec::new()),
+            };
+            let fold = settled(&stores, ws, count, tags, 20, false);
+            assert_eq!(stores.kv.lock().fork(ws), Err(UNSETTLED));
+            settle_fold(&stores, ws, fold, &none(), None, failure);
+            assert_eq!(folded(&stores, ws), (4, false));
+            assert_eq!(stores.kv.lock().unsettled(ws).unwrap(), 0);
+            // No fire is left to place it: a copy would state the bound
+            // as its length, and is refused by that name.
+            assert_eq!(stores.kv.lock().fork(ws), Err(UNPLACED));
+        }
+    }
+
+    /// Several lanes on one set ending at different slots: the set folds
+    /// through where its first lane ends, in the KV and in its recurrent
+    /// state alike.
+    fn lanes_of_one_set_fold_to_where_the_first_ends() {
+        let (_, stores, ws) = frozen_at(4);
+        let rs = state_at(&stores, 4);
+        let cell = cursor(0);
+        let pass = lanes_on(&stores, ws, &[&cell, &cell]);
+        // Three rows and four, from slot 4.
+        let mut req = crate::engine::FireRequest {
+            lanes: [3, 4].into_iter().map(|rows| rows_of(4, rows)).collect(),
+            ..crate::engine::FireRequest::default()
+        };
+        let landings = [landing(4, 3), landing(4, 4)];
+        let ids = [rs, rs];
+        let groups = lane_groups(&[ws, ws]);
+        assert_eq!(groups.len(), 1);
+        let plan = host_rs_plan(&stores, &ids, &groups, &req, &all(), &[]).unwrap();
+        let rs::RsPlan::Groups(plan) = plan else {
+            panic!("a plain recurrent model plans groups");
+        };
+        assert_eq!(plan[0].fold, rs::GroupFold::Host(3));
+        let mut tags = Vec::new();
+        let by = fold_at(
+            &pass,
+            &[0, 1],
+            &landings,
+            &all(),
+            8,
+            true,
+            Some(rs),
+            &mut req,
+            &mut tags,
+        );
+        assert!(
+            matches!(by, Some(FoldBy::To(7))),
+            "4 + 3, not the 8 written"
+        );
+    }
+
+    fn rows_of(held: u32, rows: usize) -> ::engine::Lane {
+        ::engine::Lane {
+            tokens: vec![0; rows],
+            kv: ::engine::KvDelta {
+                held,
+                ..Default::default()
+            },
+            ..::engine::Lane::default()
+        }
+    }
+
+    /// Rows the device places, folded by a count the host knows. The
+    /// engine folds through `min(folded + count, first + rows)`: a count
+    /// within the lane's rows is exact wherever they land, and one past
+    /// them is exact when they start at the folded length. Either is
+    /// frozen as the fire is prepared, never past the rows: a set that
+    /// reserved seventeen slots and fires one row folding all it holds
+    /// folds one.
+    fn a_count_on_rows_the_device_places_is_frozen_as_the_fire_is_prepared() {
+        use DeviceFold::{Count, Device, None as Nothing, PastRows};
+        assert_eq!(device_fold(None, 2, 8, false), Device);
+        assert_eq!(device_fold(Some(0), 2, 8, true), Nothing);
+        assert_eq!(device_fold(Some(1), 2, 8, false), Count(1));
+        assert_eq!(device_fold(Some(2), 2, 8, false), Count(2));
+        assert_eq!(device_fold(Some(5), 2, 8, false), PastRows(5));
+        assert_eq!(device_fold(Some(5), 2, 8, true), Count(2));
+        assert_eq!(device_fold(Some(u32::MAX), 1, 17, true), Count(1));
+        assert_eq!(device_fold(Some(u32::MAX), 2, 1, true), Count(1));
+        assert_eq!(device_fold(Some(2), 2, 0, true), Nothing);
+
+        let (_, stores, ws) = frozen_at(4);
+        let rs = state_at(&stores, 4);
+        let groups = lane_groups(&[ws]);
+        let cell = cursor(21);
+        cell.lock().unwrap().tail = Some(4);
+        // Two fires of one row, the second staged before the first settles.
+        for at in [4u64, 5] {
+            let pass = lanes_on(&stores, ws, &[&cell]);
+            assert!(appends_folded(&pass, &[0]));
+            let stated = device_fold(all().of(0), 1, 21 - at as u32, true);
+            assert_eq!(stated, Count(1));
+            // Its recurrent state folds the same count, as the plan is
+            // reserved.
+            let plan = device_rs_plan(&stores, &[rs], &groups, &pass, &[0, 1], &all()).unwrap();
+            let rs::RsPlan::Groups(plan) = plan else {
+                panic!("a plain recurrent model plans groups");
+            };
+            assert_eq!(plan[0].fold, rs::GroupFold::Host(1));
+            stores.rs.lock().unwrap().fold(rs, 1);
+            let mut req = request(1);
+            let mut tags = Vec::new();
+            let by = device_fold_at(&pass, 0, stated, false, Some(rs), &mut req, &mut tags);
+            assert!(matches!(by, Some(FoldBy::To(to)) if to == at + 1));
+            assert!(tags.is_empty(), "no report is asked for");
+            begin_piece(
+                &mut stores.kv.lock(),
+                ws,
+                at,
+                frozen_as_prepared(by.as_ref()),
+            )
+            .unwrap()
+            .expect("it writes past what is frozen");
+            advance_cursor(&cell, Some(at as u32 + 1), None);
+            assert_eq!(folded(&stores, ws), (at + 1, true));
+            assert_eq!(stores.rs.lock().unwrap().frozen(rs).unwrap(), at as u32 + 1);
+        }
+        // They settle: the pages seal, the length stays.
+        for to in [5, 6] {
+            let fold = FoldAt {
+                by: FoldBy::To(to),
+                decoded: false,
+            };
+            settle_fold(&stores, ws, fold, &none(), None, None);
+            assert_eq!(folded(&stores, ws), (6, true));
+        }
+
+        // A lane that carries unfolded rows in: a count within its rows is
+        // still a slot.
+        cell.lock().unwrap().tail = None;
+        let pass = lanes_on(&stores, ws, &[&cell]);
+        assert!(!appends_folded(&pass, &[0]));
+        let stated = device_fold(Some(2), 3, 21 - 6, false);
+        let mut req = request(1);
+        let mut tags = Vec::new();
+        let by = device_fold_at(&pass, 0, stated, false, None, &mut req, &mut tags);
+        assert!(matches!(by, Some(FoldBy::To(8))));
+        // Behind a fold on its way unplaced, the same count is placed at
+        // settle: the length it counts from is not known yet.
+        let behind = lanes(6, false, &[&cell]);
+        let by = device_fold_at(&behind, 0, stated, false, None, &mut req, &mut tags);
+        assert!(matches!(
+            by,
+            Some(FoldBy::Settled {
+                count: Some(2),
+                written: false,
+                ..
+            })
+        ));
+        assert!(tags.is_empty());
+    }
+
+    /// A lane that carries unfolded rows in and folds past its own rows
+    /// folds through where those rows end, which the engine alone knows:
+    /// the fold is placed when the fire settles, from the end it reports,
+    /// and left unplaced without one. A fire that reports no rows is
+    /// refused it by name, as is a recurrent state.
+    fn a_count_past_rows_the_device_places_is_placed_where_they_ended() {
+        let (_, stores, ws) = frozen_at(4);
+        let cell = cursor(40);
+        cell.lock().unwrap().tail = None;
+        let pass = lanes_on(&stores, ws, &[&cell]);
+        let stated = device_fold(Some(9), 2, 36, appends_folded(&pass, &[0]));
+        assert_eq!(stated, DeviceFold::PastRows(9));
+        let mut req = request(1);
+        let mut tags = Vec::new();
+        assert!(device_fold_at(&pass, 0, stated, false, None, &mut req, &mut tags).is_none());
+        let refusal = past_rows_refusal(0, 2);
+        assert!(
+            refusal.contains("lane 0 folds past the 2 row(s) it writes")
+                && refusal.contains("Fold no more than the lane writes"),
+            "{refusal}"
+        );
+        let by = device_fold_at(&pass, 0, stated, true, None, &mut req, &mut tags);
+        assert!(matches!(
+            by,
+            Some(FoldBy::Settled {
+                count: Some(9),
+                reach: 40,
+                written: true,
+                ..
+            })
+        ));
+        // The rows landed at 8 and 9, behind four carried in: the engine
+        // folded through min(4 + 9, 10).
+        let fold = settled(&stores, ws, Some(9), Vec::new(), 40, true);
+        settle_fold(&stores, ws, fold, &none(), Some(10), None);
+        assert_eq!(folded(&stores, ws), (10, true));
+        // The rows landed further on and the count ran out first.
+        let fold = settled(&stores, ws, Some(9), Vec::new(), 40, true);
+        settle_fold(&stores, ws, fold, &none(), Some(30), None);
+        assert_eq!(folded(&stores, ws), (19, true));
+        // No end reported: not placed, and the length is a bound.
+        let fold = settled(&stores, ws, Some(9), Vec::new(), 40, true);
+        settle_fold(&stores, ws, fold, &none(), None, None);
+        assert_eq!(folded(&stores, ws), (19, false));
+
+        let rs = state_at(&stores, 19);
+        let groups = lane_groups(&[ws]);
+        let pass = lanes(19, true, &[&cell]);
+        let over = geometry::Fold::Host(vec![9]);
+        let refused = device_rs_plan(&stores, &[rs], &groups, &pass, &[0, 2], &over)
+            .err()
+            .expect("a recurrent state's fold is final as stated");
+        assert_eq!(refused, past_rows_refusal(0, 2));
+    }
+
+    /// One piece of a cut pass on a set, prepared and fired as the host
+    /// loop does: its recurrent state's fold committed as the piece is
+    /// reserved, the KV's frozen with the piece's log begun, the cursor
+    /// moved once the piece is on its way. Returns the folded length the
+    /// piece found, in the KV and in the recurrent state.
+    fn fire_piece(
+        stores: &Stores,
+        ws: WorkingSetId,
+        rs: Option<crate::store::rs::RsWorkingSetId>,
+        pass: &PassLanes,
+        landings: &[geometry::Landing],
+        fold: &geometry::Fold,
+        slots: std::ops::Range<u64>,
+        last: bool,
+    ) -> (u64, Option<u32>) {
+        let found = stores.kv.lock().folded(ws).unwrap();
+        let state = rs.map(|rs| stores.rs.lock().unwrap().frozen(rs).unwrap());
+        let mut req = crate::engine::FireRequest {
+            lanes: vec![rows_of(
+                slots.start as u32,
+                (slots.end - slots.start) as usize,
+            )],
+            ..crate::engine::FireRequest::default()
+        };
+        if let Some(rs) = rs {
+            let groups = lane_groups(&[ws]);
+            let plan = host_rs_plan(stores, &[rs], &groups, &req, fold, &[]).unwrap();
+            let rs::RsPlan::Groups(plan) = plan else {
+                panic!("a plain recurrent model plans groups");
+            };
+            if let rs::GroupFold::Host(count) = plan[0].fold {
+                stores.rs.lock().unwrap().fold(rs, count);
+            }
+        }
+        let mut tags = Vec::new();
+        let by = fold_at(
+            pass,
+            &[0],
+            landings,
+            fold,
+            slots.end,
+            last,
+            rs,
+            &mut req,
+            &mut tags,
+        );
+        begin_piece(
+            &mut stores.kv.lock(),
+            ws,
+            slots.start,
+            frozen_as_prepared(by.as_ref()),
+        )
+        .unwrap()
+        .expect("it writes past what is frozen");
+        advance_cursor(
+            &pass.cursors[0],
+            Some(slots.end as u32),
+            Some((slots.start as u32, Vec::new())),
+        );
+        (found, state)
+    }
+
+    /// A pass of 128 rows from slot 10 in two pieces. Each piece folds
+    /// from the folded length its prepare finds, to the same absolute slot
+    /// the whole pass states: folding all, the second piece starts where
+    /// the first froze; folding twenty, both end at 30; folding nothing,
+    /// neither moves it. A recurrent state, cut only when it folds all or
+    /// nothing, stands at the same length before every piece.
+    fn a_cut_pass_folds_from_where_each_piece_finds_it() {
+        let pieces = [(10..74, false), (74..138, true)];
+        let cases = [
+            (all(), [10, 74], 138, true),
+            (geometry::Fold::Host(vec![20]), [10, 30], 30, false),
+            (geometry::Fold::Host(vec![0]), [10, 10], 10, true),
+        ];
+        for (fold, found, after, with_state) in cases {
+            for state in [false, true] {
+                if state && !with_state {
+                    continue;
+                }
+                let (_, stores, ws) = frozen_at(10);
+                let rs = state.then(|| state_at(&stores, 10));
+                let cell = cursor(0);
+                cell.lock().unwrap().tail = Some(10);
+                // Read once, as the pass starts.
+                let pass = lanes_on(&stores, ws, &[&cell]);
+                let landings = [landing(10, 128)];
+                for ((slots, last), found) in pieces.clone().into_iter().zip(found) {
+                    let at = fire_piece(&stores, ws, rs, &pass, &landings, &fold, slots, last);
+                    assert_eq!(at, (found, rs.map(|_| found as u32)));
+                }
+                assert_eq!(folded(&stores, ws), (after, true));
+                if let Some(rs) = rs {
+                    assert_eq!(stores.rs.lock().unwrap().frozen(rs).unwrap(), after as u32);
+                }
+                assert_eq!(cell.lock().unwrap().tail, Some(138));
+            }
+        }
+    }
+
+    /// A cut pass whose later piece never fires (its reserve is refused)
+    /// leaves the folded length and the cursor at the pieces that went.
+    fn a_cut_pass_that_stops_short_leaves_what_its_pieces_folded() {
+        let (_, stores, ws) = frozen_at(10);
+        let rs = state_at(&stores, 10);
+        let cell = cursor(0);
+        cell.lock().unwrap().tail = Some(10);
+        let pass = lanes_on(&stores, ws, &[&cell]);
+        let landings = [landing(10, 192)];
+        for (slots, went) in [(10..74, 74), (74..138, 138)] {
+            fire_piece(
+                &stores,
+                ws,
+                Some(rs),
+                &pass,
+                &landings,
+                &all(),
+                slots,
+                false,
+            );
+            assert_eq!(folded(&stores, ws), (went, true));
+            assert_eq!(stores.rs.lock().unwrap().frozen(rs).unwrap(), went as u32);
+            let now = cell.lock().unwrap().clone();
+            assert_eq!(
+                (now.tail, now.reserved, now.written),
+                (Some(went as u32), went as u32, went as u32)
+            );
+        }
+    }
+
+    /// A piece that would write inside what its set froze begins no log
+    /// and freezes nothing; it and any other piece prepared and not fired
+    /// fail the pipeline, and a set of a failed pipeline, or a fork of
+    /// one, joins no other.
+    fn a_piece_inside_the_frozen_prefix_begins_nothing() {
+        use crate::store::{PipelineScope, ScopeRefusal};
+        let (model, stores, ws) = frozen_at(4);
+        let began = begin_piece(&mut stores.kv.lock(), ws, 3, Some(9)).unwrap();
+        assert_eq!(began, None);
+        assert_eq!(folded(&stores, ws), (4, true));
+        let child = stores.kv.lock().fork(ws).unwrap();
+
+        let failure = PipelineFailure::default();
+        let scope = PipelineScope::failing_as(failure.clone(), || true);
+        let set = KvWorkingSet::new(model, 0, ws, 4);
+        set.claim_pipeline_scope(&scope).unwrap();
+        let forked = set.forked(child);
+        let mut ctx = Flight::context();
+        let reason = "pipeline: a fire writes slot 3, inside its working set's frozen prefix";
+        let gone: Resource<ForwardPass> = Resource::new_borrow(u32::MAX);
+        record_submit_failure(&mut ctx, &gone, &failure, reason);
+        record_submit_failure(&mut ctx, &gone, &failure, "a later one");
+        assert_eq!(set.pipeline_failure().as_deref(), Some(reason));
+        scope.close();
+        let next = PipelineScope::failing_as(Default::default(), || true);
+        let refused = Err(ScopeRefusal::Failed {
+            owner: scope.id(),
+            reason: reason.to_string(),
+        });
+        assert_eq!(set.claim_pipeline_scope(&next), refused);
+        assert_eq!(forked.claim_pipeline_scope(&next), refused);
+        assert_eq!(set.forked(child).claim_pipeline_scope(&next), refused);
+    }
+
+    /// What a fire froze as it was prepared stands when the fire does not
+    /// follow, so the pipeline fails however the call that prepared it
+    /// ends: here by a trap between the freeze and the submit, on a pass
+    /// gone, and dropped where it waits. What [`reserve`] returns says so
+    /// until the engine takes the fire.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_fire_prepared_and_never_submitted_fails_its_pipeline() {
+        use crate::store::{PipelineScope, ScopeRefusal};
+
+        async fn prepared(
+            ctx: &mut TestContext,
+            model: usize,
+            stores: &Stores,
+            failure: &PipelineFailure,
+        ) -> Unfired {
+            let none = || Ok(rs::RsPlan::Groups(Vec::new()));
+            let id = uuid::Uuid::new_v4();
+            let reserved = reserve(ctx, (model, 0), stores, id, failure, &[], &[], none, false);
+            reserved.await.unwrap().unfired
+        }
+        /// A piece prepared as a pass prepares one, whose call then asks
+        /// for a pass gone, as each path does before its submit.
+        async fn trapped(
+            ctx: &mut TestContext,
+            model: usize,
+            stores: &Stores,
+            ws: WorkingSetId,
+            failure: &PipelineFailure,
+        ) -> Anyhow<()> {
+            let unfired = prepared(ctx, model, stores, failure).await;
+            begin_piece(&mut stores.kv.lock(), ws, 4, Some(7))?;
+            let gone: Resource<ForwardPass> = Resource::new_borrow(u32::MAX);
+            ctx.resources().get_mut(&gone)?;
+            drop(unfired.submitted());
+            Ok(())
+        }
+
+        let (model, stores, ws) = frozen_at(4);
+        let mut ctx = Flight::context();
+        let failure = PipelineFailure::default();
+        let scope = PipelineScope::failing_as(failure.clone(), || true);
+        let set = KvWorkingSet::new(model, 0, ws, 4);
+        set.claim_pipeline_scope(&scope).unwrap();
+        assert!(
+            trapped(&mut ctx, model, &stores, ws, &failure)
+                .await
+                .is_err()
+        );
+        assert_eq!(folded(&stores, ws), (7, true), "the freeze stands");
+        assert_eq!(set.pipeline_failure().as_deref(), Some(UNFIRED));
+        let child = stores.kv.lock().fork(ws).unwrap();
+        scope.close();
+        let next = PipelineScope::failing_as(Default::default(), || true);
+        let refused = Err(ScopeRefusal::Failed {
+            owner: scope.id(),
+            reason: UNFIRED.to_string(),
+        });
+        assert_eq!(set.claim_pipeline_scope(&next), refused);
+        assert_eq!(set.forked(child).claim_pipeline_scope(&next), refused);
+
+        // A refusal that said why keeps its reason.
+        let failure = PipelineFailure::default();
+        let unfired = prepared(&mut ctx, model, &stores, &failure).await;
+        let gone: Resource<ForwardPass> = Resource::new_borrow(u32::MAX);
+        record_submit_failure(&mut ctx, &gone, &failure, "pipeline: submit failed");
+        drop(unfired);
+        assert_eq!(
+            failure.lock().unwrap().as_deref(),
+            Some("pipeline: submit failed")
+        );
+
+        // A call dropped where it waits, its fire prepared.
+        let failure = PipelineFailure::default();
+        let unfired = prepared(&mut ctx, model, &stores, &failure).await;
+        let mut waiting = Box::pin(async move {
+            let _unfired = unfired;
+            std::future::pending::<()>().await;
+        });
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(waiting.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(*failure.lock().unwrap(), None);
+        drop(waiting);
+        assert_eq!(failure.lock().unwrap().as_deref(), Some(UNFIRED));
+
+        // A fire the engine took leaves this one no more (what it leaves
+        // until it is queued is its own), and a reserve refused leaves none.
+        let failure = PipelineFailure::default();
+        let unqueued = prepared(&mut ctx, model, &stores, &failure)
+            .await
+            .submitted();
+        assert_eq!(*failure.lock().unwrap(), None);
+        drop(unqueued);
+        assert_eq!(failure.lock().unwrap().as_deref(), Some(UNQUEUED));
+        let failure = PipelineFailure::default();
+        let refused = || Err("no mode".to_string());
+        let id = uuid::Uuid::new_v4();
+        let reserved = reserve(
+            &mut ctx,
+            (model, 0),
+            &stores,
+            id,
+            &failure,
+            &[],
+            &[],
+            refused,
+            false,
+        );
+        assert!(reserved.await.is_err());
+        assert_eq!(*failure.lock().unwrap(), None);
+    }
+
+    /// A prompt of `tokens` sealed in the cache of `stores` by a set since
+    /// gone, 16 rows a page; its rows' hashes, and its pages' keys.
+    fn sealed_prompt(
+        stores: &Stores,
+        tokens: &[u32],
+    ) -> (
+        Vec<crate::store::kv::hash::Hash256>,
+        Vec<crate::store::kv::hash::Hash256>,
+    ) {
+        let mut kv = stores.kv.lock();
+        kv.set_keeps(true);
+        let ws = kv.create_working_set();
+        let pages = (tokens.len() as u64).div_ceil(16);
+        kv.reserve(ws, pages).unwrap();
+        let indexes: Vec<u64> = (0..pages).collect();
+        let need = kv.write_demand(ws, &indexes).unwrap();
+        let mut granted = kv.reserve_device_pages(need).unwrap();
+        let prepared = kv
+            .prepare_write_reserved(ws, &indexes, &mut granted)
+            .unwrap();
+        let commits: Vec<_> = (0..pages)
+            .map(|_| crate::store::kv::write::PageCommit {
+                token_hashes: Vec::new(),
+                page_hash: None,
+            })
+            .collect();
+        let seq = kv.publish_prepared(prepared, &commits).unwrap();
+        kv.settle(seq);
+        let slots = kv.slot_hashes(ws, 0, tokens, 16).unwrap().unwrap();
+        let keys = kv.page_keys(ws, 0, &slots, 16).unwrap().unwrap();
+        kv.seal_rows(ws, 0, &slots, 16).unwrap();
+        let epoch = kv.current_epoch();
+        kv.release_working_set(ws, epoch);
+        kv.retire_idle();
+        (slots, keys)
+    }
+
+    /// A keyed pass of 64 rows whose first 48 the cache holds maps them in
+    /// and freezes nothing: the set has folded what its passes state,
+    /// whatever the cache held. A later row written into a mapped page
+    /// copies it and every mapped page after it.
+    fn a_pass_supplied_from_the_cache_folds_what_it_states() {
+        let model = crate::store::registry::register_model(16, &[16], &[4]);
+        let stores = crate::store::registry::get(model, 0);
+        let tokens: Vec<u32> = (0..64).map(|t| 400 + t).collect();
+        let (slots, _) = sealed_prompt(&stores, &tokens);
+        let full = rows(0, &tokens);
+        for (fold, states) in [
+            (geometry::Fold::Host(vec![0]), 0),
+            (geometry::Fold::Host(vec![20]), 20),
+            (all(), 64),
+        ] {
+            let ws = stores.kv.lock().create_working_set();
+            let folds = u64::from(fold.of(0).unwrap()).min(64);
+            let supplied = supply(&stores, ws, &full, &slots, Attach::Kv, folds, 16);
+            assert_eq!(supplied.rows, 48, "short of its last row's page");
+            assert_eq!(stores.kv.lock().mapped_len(ws).unwrap(), 3);
+            assert_eq!(folded(&stores, ws), (0, true), "mapping freezes nothing");
+            // The pass runs from row 48, and folds what it states.
+            let cell = cursor(0);
+            let pass = lanes_on(&stores, ws, &[&cell]);
+            let landings = [landing(0, 64)];
+            fire_piece(&stores, ws, None, &pass, &landings, &fold, 48..64, true);
+            assert_eq!(folded(&stores, ws), (states, true));
+            if states < 48 {
+                let mut kv = stores.kv.lock();
+                kv.reserve(ws, 4).unwrap();
+                assert_eq!(kv.write_demand(ws, &[2]).unwrap(), 1);
+                assert_eq!(kv.write_demand(ws, &[1]).unwrap(), 2);
+            }
+        }
+    }
+
+    /// A recurrent state resumes from a checkpoint, which both halves are
+    /// then folded through: no further than the rows its pass folds. A
+    /// checkpoint whose pages the cache no longer holds resumes nothing,
+    /// and neither half is left folded.
+    fn a_state_resumes_no_further_than_its_pass_folds() {
+        let model = crate::store::registry::register_model(16, &[16], &[4]);
+        let stores = crate::store::registry::get(model, 0);
+        let geometry = crate::store::rs::RsGeometry {
+            state_size: 8,
+            buffer_page_tokens: 4,
+        };
+        let tokens: Vec<u32> = (0..64).map(|t| 800 + t).collect();
+        let (slots, keys) = sealed_prompt(&stores, &tokens);
+        let checkpoint = |key, frozen: u32| {
+            let mut rs = stores.rs.lock().unwrap();
+            let ws = rs.create_working_set(geometry);
+            let prepared = rs.prepare_group(ws, true, false, None, None, None).unwrap();
+            let published = rs.publish_prepared(prepared).unwrap();
+            rs.settle(published);
+            rs.fold(ws, frozen);
+            assert!(rs.checkpoint(ws, key, None).unwrap());
+            rs.release_working_set(ws);
+        };
+        checkpoint(keys[1], 32);
+        checkpoint(keys[2], 48);
+        let fresh = || {
+            (
+                stores.kv.lock().create_working_set(),
+                stores.rs.lock().unwrap().create_working_set(geometry),
+            )
+        };
+        let both = |ws, rs| {
+            (
+                stores.kv.lock().folded(ws).unwrap(),
+                stores.rs.lock().unwrap().frozen(rs).unwrap(),
+            )
+        };
+        let full = rows(0, &tokens);
+        for (folds, resumed) in [(64, 48), (40, 32), (20, 0), (0, 0)] {
+            let (ws, rs) = fresh();
+            let supplied = supply(
+                &stores,
+                ws,
+                &full,
+                &slots,
+                Attach::Checkpoint(rs),
+                folds,
+                16,
+            );
+            assert_eq!(supplied.rows, resumed, "a pass folding {folds} rows");
+            assert_eq!(both(ws, rs), (u64::from(resumed), resumed));
+        }
+        // The state is kept under a key whose pages are gone.
+        checkpoint([9; 32], 32);
+        let (ws, rs) = fresh();
+        assert_eq!(resume(&stores, ws, rs, &[[8; 32], [9; 32]], 2, 16), 0);
+        assert_eq!(both(ws, rs), (0, 0));
+        assert_eq!(stores.kv.lock().mapped_len(ws).unwrap(), 0);
     }
 
     // A fold the device counts, between its fire's submit and its settle:
-    // the set's recurrent state is not forked, kept or moved, and what
-    // waits for it is woken by the fire's end, however it ends.
+    // the set is not forked, kept or moved, and what waits for it is woken
+    // by the fire's end, however it ends.
 
     use super::lifecycle_tests::{TestContext, resolve_test_completion};
     use crate::store::rs::{RsError, RsWorkingSetId, device_folds_settled};
@@ -6461,7 +7687,7 @@ pub(crate) mod fold_tests {
     /// One fire in flight on a pipeline, on a working set frozen at 4 in
     /// both stores with 12 slots reserved.
     struct Flight {
-        stores: crate::store::registry::Stores,
+        stores: Stores,
         fires: PendingFires,
         completion: crate::engine::WorkItemCompletion,
         failure: PipelineFailure,
@@ -6484,7 +7710,6 @@ pub(crate) mod fold_tests {
                 &self.fires,
                 &self.failure,
                 fold,
-                None,
             )
         }
 
@@ -6494,9 +7719,29 @@ pub(crate) mod fold_tests {
             rs.frozen(child)
         }
 
+        /// The folded length a KV fork made now takes, and whether it is
+        /// all the child has folded.
+        fn kv_fork(&self) -> Result<(u64, bool), KvStoreError> {
+            let mut kv = self.stores.kv.lock();
+            let child = kv.fork(self.kv.id)?;
+            Ok((kv.folded(child)?, kv.folded_exact(child)?))
+        }
+
         fn exported(&self) -> Result<u32, RsError> {
             let rs = self.stores.rs.lock().unwrap();
             rs.export(self.rs).map(|_| rs.frozen(self.rs).unwrap())
+        }
+
+        /// The set's one folded length, whether it is all the set has
+        /// folded, and the fires on their way that fold it by a count
+        /// placed when they settle.
+        fn length(&self) -> (u64, bool, u32) {
+            let kv = self.stores.kv.lock();
+            (
+                kv.folded(self.kv.id).unwrap(),
+                kv.folded_exact(self.kv.id).unwrap(),
+                kv.unsettled(self.kv.id).unwrap(),
+            )
         }
 
         fn frozen(&self) -> (u64, u32) {
@@ -6515,44 +7760,52 @@ pub(crate) mod fold_tests {
         }
     }
 
-    /// `exact` is whether the host knew the frozen length when it planned
-    /// the fold; `reach` where the fire's own rows end, where it knew.
-    fn in_flight(fold: &geometry::Fold, exact: bool, reach: Option<u64>) -> Flight {
-        in_flight_on(fold, exact, reach, true)
+    /// `exact` is whether the host knew the folded length when it planned
+    /// the fold: not while an earlier fire's fold is on its way unplaced.
+    /// The fire's eight rows land at slot 4.
+    fn in_flight(fold: &geometry::Fold, exact: bool) -> Flight {
+        in_flight_on(fold, exact, true)
+    }
+
+    /// [`in_flight`]'s fire as the engine took it, its pipeline still to
+    /// queue it.
+    fn submitted(fold: &geometry::Fold, exact: bool) -> (Flight, PendingFire, Unqueued) {
+        let (model, stores, id) = frozen_at(4);
+        let rs = state_at(&stores, 4);
+        if !exact {
+            stores.kv.lock().unsettle(id).unwrap();
+        }
+        let cell = cursor(12);
+        let kv = KvWorkingSet::new(model, 0, id, 8);
+        let failure: PipelineFailure = Arc::new(Mutex::new(None));
+        let (completion, tag, fire, unqueued) = stage(&kv, Some(rs), &cell, &failure, fold);
+        let flight = Flight {
+            stores,
+            fires: Arc::new(PendingFireQueue::new()),
+            completion,
+            failure,
+            kv,
+            rs,
+            cursor: cell,
+            tag,
+        };
+        (flight, fire, unqueued)
     }
 
     /// `recurrent` is whether the pass keeps recurrent state: a pass that
     /// keeps none folds its set with the recurrent store left out.
-    fn in_flight_on(
-        fold: &geometry::Fold,
-        exact: bool,
-        reach: Option<u64>,
-        recurrent: bool,
-    ) -> Flight {
-        let model = crate::store::registry::register_model(4, &[8], &[1]);
-        let stores = crate::store::registry::get(model, 0);
-        let id = {
-            let mut kv = stores.kv.lock();
-            let id = kv.create_working_set();
-            kv.fold(id, 4, false).unwrap();
-            id
-        };
-        let rs = {
-            let mut rs = stores.rs.lock().unwrap();
-            let ws = rs.create_working_set(crate::store::rs::RsGeometry {
-                state_size: 8,
-                buffer_page_tokens: 4,
-            });
-            rs.fold(ws, 4);
-            ws
-        };
-        let cell = cursor(4, 12);
-        cell.lock().unwrap().folded_exact = exact;
+    fn in_flight_on(fold: &geometry::Fold, exact: bool, recurrent: bool) -> Flight {
+        let (model, stores, id) = frozen_at(4);
+        let rs = state_at(&stores, 4);
+        if !exact {
+            stores.kv.lock().unsettle(id).unwrap();
+        }
+        let cell = cursor(12);
         let kv = KvWorkingSet::new(model, 0, id, 8);
         let failure: PipelineFailure = Arc::new(Mutex::new(None));
         let fires = Arc::new(PendingFireQueue::new());
         let part = recurrent.then_some(rs);
-        let (completion, tag) = submit(&kv, part, &cell, &fires, &failure, fold, reach);
+        let (completion, tag) = submit(&kv, part, &cell, &fires, &failure, fold);
         Flight {
             stores,
             fires,
@@ -6565,10 +7818,12 @@ pub(crate) mod fold_tests {
         }
     }
 
-    /// A fire of a pass on `kv` and `rs`, submitted: staged on what
-    /// `cursor` states now, its set marked, queued on `fires` behind the
-    /// pass's fires in flight, the cursor moved on. Its completion, and
-    /// what its first lane reports under, where the device counts.
+    /// A fire of a pass on `kv` and `rs`, submitted: its fold placed on the
+    /// folded length the set states now (frozen as it is prepared, where
+    /// the host knows the count), its set marked, queued on `fires` behind
+    /// the pass's fires in flight. Its eight rows land at slot 4. Its
+    /// completion, and what its first lane reports under, where the device
+    /// counts.
     fn submit(
         kv: &KvWorkingSet,
         rs: Option<RsWorkingSetId>,
@@ -6576,16 +7831,29 @@ pub(crate) mod fold_tests {
         fires: &PendingFires,
         failure: &PipelineFailure,
         fold: &geometry::Fold,
-        reach: Option<u64>,
     ) -> (crate::engine::WorkItemCompletion, u64) {
+        let (completion, tag, fire, unqueued) = stage(kv, rs, cursor, failure, fold);
+        unqueued.queue(fires, fire);
+        (completion, tag)
+    }
+
+    /// [`submit`] up to the queue: the fire as the engine took it, its
+    /// pipeline still to queue it.
+    fn stage(
+        kv: &KvWorkingSet,
+        rs: Option<RsWorkingSetId>,
+        cursor: &CursorCell,
+        failure: &PipelineFailure,
+        fold: &geometry::Fold,
+    ) -> (crate::engine::WorkItemCompletion, u64, PendingFire, Unqueued) {
         let stores = crate::store::registry::get(kv.model, kv.engine);
-        let pass = lanes(&[cursor]);
+        let pass = lanes_on(&stores, kv.id, &[cursor]);
         let mut req = request(1);
         let mut tags = Vec::new();
         let by = fold_at(
             &pass,
             &[0],
-            reach,
+            &[landing(4, 8)],
             fold,
             u64::MAX,
             true,
@@ -6594,6 +7862,19 @@ pub(crate) mod fold_tests {
             &mut tags,
         )
         .expect("the fire folds");
+        // Its prepare: a count the host knows is frozen now, in the
+        // recurrent state as the fire is reserved and in the KV with its
+        // log begun.
+        let freeze = frozen_as_prepared(Some(&by));
+        if let (Some(to), Some(rs)) = (freeze, rs) {
+            let mut store = stores.rs.lock().unwrap();
+            let frozen = u64::from(store.frozen(rs).unwrap());
+            store.fold(rs, to.saturating_sub(frozen) as u32);
+        }
+        let start = stores.kv.lock().folded(kv.id).unwrap();
+        begin_piece(&mut stores.kv.lock(), kv.id, start, freeze)
+            .unwrap()
+            .expect("it writes past what is frozen");
         let completion = crate::engine::WorkItemCompletion::deferred_with_guard(None);
         let mut parts = vec![FireWs {
             ws: kv.id,
@@ -6604,26 +7885,27 @@ pub(crate) mod fold_tests {
             reports: tags,
             staged: None,
         }];
+        // The submit.
         mark_device_folds(&stores, &completion, &mut parts);
-        let settles = settling(&parts);
-        fires
-            .lock()
-            .unwrap()
-            .push_back(PendingOp::Fire(PendingFire {
-                completion: completion.clone(),
-                checkpoints: Vec::new(),
-                kv: parts,
-                device_geometry: true,
-                rstxn: RsTxnsGuard::new(kv.model, kv.engine, None),
-                model: kv.model,
-                engine: kv.engine,
-                fwd_rep: u32::MAX,
-                cells: Vec::new(),
-                failure: failure.clone(),
-                retired: None,
-            }));
-        advance_cursors(&pass, None, &[], fold, &settles);
-        (completion, req.lanes[0].reports)
+        unsettle(&stores, &completion, &mut parts);
+        let unqueued = Unfired::new(failure).submitted();
+        let fire = PendingFire {
+            completion: completion.clone(),
+            checkpoints: Vec::new(),
+            kv: parts,
+            device_geometry: true,
+            rstxn: RsTxnsGuard::new(kv.model, kv.engine, None),
+            model: kv.model,
+            engine: kv.engine,
+            fwd_rep: u32::MAX,
+            cells: Vec::new(),
+            failure: failure.clone(),
+            retired: None,
+        };
+        // Its rows land where the device says: the cursor no longer knows
+        // where they end.
+        advance_cursor(cursor, None, None);
+        (completion, req.lanes[0].reports, fire, unqueued)
     }
 
     /// A process at its end, as the SDK's `run_ahead` leaves it: its
@@ -6635,7 +7917,8 @@ pub(crate) mod fold_tests {
         pub(crate) residency: Arc<Mutex<crate::inferlet::process::ProcessResidency>>,
         /// The set's rep in the table.
         pub(crate) ws: u32,
-        pub(crate) cursor: CursorCell,
+        /// Its KV working set, whose folded length is the set's.
+        kv_id: WorkingSetId,
         pub(crate) stores: crate::store::registry::Stores,
         completion: crate::engine::WorkItemCompletion,
         tag: u64,
@@ -6647,6 +7930,11 @@ pub(crate) mod fold_tests {
     }
 
     impl Ending {
+        /// Its KV working set.
+        pub(crate) fn kv_id(&self) -> WorkingSetId {
+            self.kv_id
+        }
+
         /// The process's table, as its end hands it to the teardown.
         pub(crate) fn table(&mut self) -> wasmtime::component::ResourceTable {
             std::mem::replace(
@@ -6676,7 +7964,7 @@ pub(crate) mod fold_tests {
             id
         };
         let kv = KvWorkingSet::new(model, 0, id, 8);
-        let cell = cursor(4, 12);
+        let cell = cursor(12);
         let mut ctx = Flight::context();
         let pipeline = ctx.resources.push(Pipeline::new())?;
         let rep = pipeline.rep();
@@ -6698,13 +7986,13 @@ pub(crate) mod fold_tests {
         });
         assert_eq!(kv.claim_pipeline_scope(&scope), Ok(()));
         let fold = geometry::Fold::Device;
-        let (completion, tag) = submit(&kv, None, &cell, &fires, &failure, &fold, None);
+        let (completion, tag) = submit(&kv, None, &cell, &fires, &failure, &fold);
         pipeline_close(&mut ctx, Resource::new_borrow(rep)).await?;
         if dropped {
             pipeline_drop(&mut ctx, pipeline).await?;
         }
         assert!(
-            !fires.lock().unwrap().is_empty() && cell.lock().unwrap().at_rest().is_err(),
+            !fires.lock().unwrap().is_empty() && stores.kv.lock().unsettled(id).unwrap() == 1,
             "a close does not wait for a fire in flight"
         );
         let kv = ctx.resources.push(kv)?.rep();
@@ -6718,7 +8006,7 @@ pub(crate) mod fold_tests {
             resources: ctx.resources,
             residency,
             ws,
-            cursor: cell,
+            kv_id: id,
             stores,
             completion,
             tag,
@@ -6731,12 +8019,14 @@ pub(crate) mod fold_tests {
     /// ([`drain_pipeline_fires`], which only its own task can); a handle's
     /// fork, a save and the planner's suspend wait on the store and on the
     /// fire's lease. None ends before the fire settles, and each then reads
-    /// the frozen length the device's count left.
+    /// the folded length the device's count left, one length in both
+    /// stores.
     #[tokio::test(flavor = "current_thread")]
     async fn what_copies_or_moves_a_set_waits_for_the_fold_the_device_counts() -> Anyhow<()> {
-        let flight = in_flight(&geometry::Fold::Device, true, None);
+        let flight = in_flight(&geometry::Fold::Device, true);
         let mut ctx = Flight::context();
         assert_eq!(flight.fork(), Err(RsError::DeviceFoldUnsettled));
+        assert_eq!(flight.kv_fork(), Err(UNSETTLED));
         assert_eq!(flight.exported(), Err(RsError::DeviceFoldUnsettled));
         let sets = [flight.rs];
         let mut waiting = Box::pin(device_folds_settled(&flight.stores.rs, &sets));
@@ -6759,6 +8049,7 @@ pub(crate) mod fold_tests {
         assert!(quiesce.as_mut().now_or_never().is_some());
         assert_eq!(flight.frozen(), (7, 7));
         assert_eq!(flight.fork(), Ok(7), "the child takes what the fold left");
+        assert_eq!(flight.kv_fork(), Ok((7, true)));
         assert_eq!(flight.exported(), Ok(7));
         assert!(flight.failure.lock().unwrap().is_none());
         Ok(())
@@ -6775,7 +8066,7 @@ pub(crate) mod fold_tests {
         // Who settles the fire: the fork's own drain, or another finalizer
         // that took it off the queue under the gate before the fork began.
         for other_finalizer in [false, true] {
-            let flight = in_flight_on(&geometry::Fold::Device, true, None, false);
+            let flight = in_flight_on(&geometry::Fold::Device, true, false);
             let (mut ctx, mut other) = (Flight::context(), Flight::context());
             assert_eq!(
                 flight.stores.rs.lock().unwrap().device_fold_gate(flight.rs),
@@ -6784,7 +8075,7 @@ pub(crate) mod fold_tests {
             );
             let staged = flight.cursor.lock().unwrap().clone();
             assert!(
-                staged.at_rest().is_err() && staged.unsettled == 1 && staged.folded == 4,
+                flight.length() == (4, false, 1),
                 "what a child made now would state for good: {staged:?}"
             );
             let window = if other_finalizer {
@@ -6824,7 +8115,7 @@ pub(crate) mod fold_tests {
                 fork.await?.expect("the fold was placed")
             };
             assert!(
-                child.at_rest().is_ok() && child.unsettled == 0 && child.folded == 7,
+                flight.length() == (7, true, 0),
                 "{child:?}"
             );
             let pages = {
@@ -6833,7 +8124,7 @@ pub(crate) mod fold_tests {
                 kv.folded(forked).unwrap()
             };
             assert_eq!(
-                u64::from(child.folded),
+                flight.length().0,
                 pages,
                 "the child states the length its pages are frozen to"
             );
@@ -6847,7 +8138,7 @@ pub(crate) mod fold_tests {
                 &flight.cursor,
             );
             let again = again.now_or_never().expect("no fire is on its way")?;
-            assert_eq!(again.map(|cursor| cursor.folded), Ok(7));
+            assert_eq!(again.map(|_| flight.length().0), Ok(7));
         }
         Ok(())
     }
@@ -6861,9 +8152,8 @@ pub(crate) mod fold_tests {
     /// not latched yet.
     #[tokio::test(flavor = "current_thread")]
     async fn a_fold_that_is_never_placed_refuses_the_fork_by_name() -> Anyhow<()> {
-        use crate::inferlet::host::working_set::Cursor;
         for ended in ["dropped", "no count", "failed", "failed, off the queue"] {
-            let flight = in_flight_on(&geometry::Fold::Device, true, None, false);
+            let flight = in_flight_on(&geometry::Fold::Device, true, false);
             let (mut ctx, mut other) = (Flight::context(), Flight::context());
             let mut window = None;
             match ended {
@@ -6902,12 +8192,12 @@ pub(crate) mod fold_tests {
                 .expect_err("the frozen length is not known");
             let staged = flight.cursor.lock().unwrap().clone();
             assert!(
-                staged.at_rest().is_err() && staged.unsettled == 1 && staged.folded == 4,
+                flight.length().0 == 4 && !flight.length().1,
                 "{ended}: {staged:?}"
             );
             match ended {
                 "dropped" | "no count" => {
-                    assert_eq!(refused, format!("working set: {}", Cursor::UNPLACED));
+                    assert_eq!(refused, format!("working set: {}", crate::store::kv::page_table::UNPLACED));
                     assert!(flight.failure.lock().unwrap().is_none(), "{ended}");
                 }
                 _ => assert!(
@@ -6918,7 +8208,7 @@ pub(crate) mod fold_tests {
         }
         // A set that keeps recurrent state is refused as its store names
         // how the fire ended.
-        let flight = in_flight(&geometry::Fold::Device, true, None);
+        let flight = in_flight(&geometry::Fold::Device, true);
         let mut ctx = Flight::context();
         resolve_test_completion(&flight.completion, false);
         let fork = cursor_at_rest(
@@ -6932,7 +8222,7 @@ pub(crate) mod fold_tests {
         let refused = fork.now_or_never().expect("it never hangs")?;
         let unreported = RsError::DeviceFoldFailed(RsDeviceFold::UNREPORTED.to_string());
         assert_eq!(
-            refused.map(|cursor| cursor.folded),
+            refused.map(|_| ()),
             Err(unreported.to_string())
         );
         Ok(())
@@ -6944,7 +8234,7 @@ pub(crate) mod fold_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_failed_pass_ends_the_wait_with_its_failure() -> Anyhow<()> {
         for earlier in [None, Some("pipeline: an earlier fire failed")] {
-            let flight = in_flight(&geometry::Fold::Device, true, None);
+            let flight = in_flight(&geometry::Fold::Device, true);
             let mut ctx = Flight::context();
             let sets = [flight.rs];
             let mut waiting = Box::pin(device_folds_settled(&flight.stores.rs, &sets));
@@ -6977,6 +8267,11 @@ pub(crate) mod fold_tests {
                 (4, 4),
                 "a count from a failed pass is not taken"
             );
+            assert_eq!(
+                flight.kv_fork(),
+                Err(KvStoreError::Table(KvTableError::FoldUnplaced)),
+                "and the length is a bound, which no copy states"
+            );
         }
         Ok(())
     }
@@ -6993,7 +8288,7 @@ pub(crate) mod fold_tests {
     async fn a_set_of_a_failed_pipeline_fires_on_no_other() -> Anyhow<()> {
         use crate::store::{PipelineScope, ScopeRefusal};
         for failed in [true, false] {
-            let flight = in_flight(&geometry::Fold::Device, true, None);
+            let flight = in_flight(&geometry::Fold::Device, true);
             let mut ctx = Flight::context();
             let fires = Arc::downgrade(&flight.fires);
             let own = PipelineScope::failing_as(flight.failure.clone(), move || {
@@ -7037,14 +8332,15 @@ pub(crate) mod fold_tests {
 
             let staged = flight.cursor.lock().unwrap().clone();
             if !failed {
-                assert!(staged.folded_exact && staged.unsettled == 0 && staged.folded == 7);
+                assert_eq!(flight.length(), (7, true, 0));
                 assert_eq!(flight.kv.claim_pipeline_scope(&next), Ok(()));
                 assert_eq!(rs.claim_pipeline_scope(&next), Ok(()));
                 continue;
             }
             assert!(
-                !staged.folded_exact && staged.unsettled == 1 && staged.tail.is_none(),
-                "the cursor stands as the failed fire staged it: {staged:?}"
+                !flight.length().1 && staged.tail.is_none(),
+                "the set stands as the failed fire staged it: {staged:?}, {:?}",
+                flight.length()
             );
             let reason = flight.failure.lock().unwrap().clone().expect("it failed");
             let refused = ScopeRefusal::Failed {
@@ -7097,7 +8393,7 @@ pub(crate) mod fold_tests {
             ("no report from a fire that failed", |_| None, false, None),
         ];
         for (what, brought, ran, left) in cases {
-            let flight = in_flight(&geometry::Fold::Device, true, None);
+            let flight = in_flight(&geometry::Fold::Device, true);
             let mut ctx = Flight::context();
             let sets = [flight.rs];
             let mut waiting = Box::pin(device_folds_settled(&flight.stores.rs, &sets));
@@ -7122,17 +8418,13 @@ pub(crate) mod fold_tests {
                     assert_eq!(flight.frozen(), (u64::from(left), left), "{what}");
                     assert_eq!(flight.fork(), Ok(left), "{what}");
                     assert_eq!(flight.exported(), Ok(left), "{what}");
-                    assert!(flight.cursor.lock().unwrap().folded_exact, "{what}");
+                    assert!(flight.length().1, "{what}");
                 }
                 (None, None) => {
                     assert_eq!(flight.frozen(), (4, 4), "{what}: nothing is frozen");
                     assert_eq!(flight.fork(), Err(unreported()), "{what}");
                     assert_eq!(flight.exported(), Err(unreported()), "{what}");
-                    let now = flight.cursor.lock().unwrap().clone();
-                    assert!(
-                        !now.folded_exact && now.unsettled == 1,
-                        "{what}: its fires go on from the bound"
-                    );
+                    assert!(!flight.length().1, "{what}: its fires go on from the bound");
                 }
                 (None, Some(reason)) => {
                     assert_ne!(reason, RsDeviceFold::UNREPORTED, "{what}");
@@ -7147,13 +8439,16 @@ pub(crate) mod fold_tests {
         Ok(())
     }
 
-    /// A fold the host counts states the frozen length at submit: nothing
-    /// waits on its fire.
+    /// A fold the host counts over a folded length it knows is frozen as
+    /// its fire is prepared, in both stores: nothing waits on the fire,
+    /// and a copy made while it is in flight takes the length it froze.
+    /// Behind a fold on its way unplaced it is placed when its own fire
+    /// settles.
     #[tokio::test(flavor = "current_thread")]
     async fn a_fold_the_host_counts_delays_nothing() -> Anyhow<()> {
         let host = geometry::Fold::Host(vec![2]);
-        for (exact, reach) in [(true, Some(10)), (false, None)] {
-            let flight = in_flight(&host, exact, reach);
+        for exact in [true, false] {
+            let flight = in_flight(&host, exact);
             let mut ctx = Flight::context();
             let sets = [flight.rs];
             assert_eq!(flight.tag, 0, "the host needs no report");
@@ -7162,8 +8457,15 @@ pub(crate) mod fold_tests {
                     .now_or_never()
                     .is_some()
             );
-            assert_eq!(flight.fork(), Ok(4));
-            assert_eq!(flight.exported(), Ok(4));
+            if exact {
+                assert_eq!(flight.frozen(), (6, 6));
+                assert_eq!(flight.fork(), Ok(6));
+                assert_eq!(flight.kv_fork(), Ok((6, true)));
+                assert_eq!(flight.exported(), Ok(6));
+            } else {
+                assert_eq!(flight.frozen().0, 4);
+                assert_eq!(flight.kv_fork(), Err(UNSETTLED));
+            }
             let mut drain = Box::pin(drain_pipeline_fires(&mut ctx, &flight.fires));
             assert!(
                 drain.as_mut().now_or_never().is_none(),
@@ -7188,9 +8490,10 @@ pub(crate) mod fold_tests {
                 stores,
                 fires,
                 completion,
+                kv,
                 rs,
                 ..
-            } = in_flight(&geometry::Fold::Device, true, None);
+            } = in_flight(&geometry::Fold::Device, true);
             let sets = [rs];
             let mut waiting = Box::pin(device_folds_settled(&stores.rs, &sets));
             drop(fires);
@@ -7199,6 +8502,7 @@ pub(crate) mod fold_tests {
                 Err(RsError::DeviceFoldUnsettled),
                 "the engine may still run it"
             );
+            assert_eq!(stores.kv.lock().fork(kv.id), Err(UNSETTLED));
             assert!(waiting.as_mut().now_or_never().is_none());
             if lost {
                 drop(completion);
@@ -7210,6 +8514,11 @@ pub(crate) mod fold_tests {
                 stores.rs.lock().unwrap().device_fold_gate(rs),
                 Err(dropped())
             );
+            // The KV's folded length is a bound from then on, and waits
+            // on nothing: a copy is refused by that name.
+            assert_eq!(folded(&stores, kv.id), (4, false));
+            assert_eq!(stores.kv.lock().unsettled(kv.id).unwrap(), 0);
+            assert_eq!(stores.kv.lock().fork(kv.id), Err(UNPLACED));
         }
     }
 
@@ -7275,14 +8584,13 @@ pub(crate) mod fold_tests {
     fn first_of_a_frame() -> (Flight, Frames, TestContext) {
         let ctx = Flight::context();
         let mut frames = Frames::of_two(ctx.id);
-        let flight = in_flight(&geometry::Fold::Device, true, None);
+        let flight = in_flight(&geometry::Fold::Device, true);
         frames.arrive(0);
         assert!(
             frames.dispatched().is_empty(),
             "a frame is dispatched whole"
         );
-        let cursor = flight.cursor.lock().unwrap().clone();
-        assert!(!cursor.folded_exact && cursor.unsettled == 1 && cursor.folded == 4);
+        assert_eq!(flight.length(), (4, false, 1));
         (flight, frames, ctx)
     }
 
@@ -7296,8 +8604,7 @@ pub(crate) mod fold_tests {
         let (flight, mut frames, mut ctx) = first_of_a_frame();
         let (second, tag) = flight.next(&device);
         assert!(tag != 0 && tag != flight.tag, "each fire reports its own");
-        let cursor = flight.cursor.lock().unwrap().clone();
-        assert!(!cursor.folded_exact && cursor.unsettled == 2 && cursor.folded == 4);
+        assert_eq!(flight.length(), (4, false, 2));
         frames.arrive(1);
         assert_eq!(
             frames.dispatched(),
@@ -7316,8 +8623,7 @@ pub(crate) mod fold_tests {
         .await
         .expect("both fires settle")?;
         assert_eq!(flight.frozen(), (10, 10), "the first fold, then the second");
-        let cursor = flight.cursor.lock().unwrap().clone();
-        assert!(cursor.folded_exact && cursor.unsettled == 0 && cursor.folded == 10);
+        assert_eq!(flight.length(), (10, true, 0));
         assert_eq!(flight.fork(), Ok(10));
         assert!(flight.failure.lock().unwrap().is_none());
         Ok(())
@@ -7342,6 +8648,106 @@ pub(crate) mod fold_tests {
             "the fire it waits for is held for the fire that waits"
         );
         assert_eq!(flight.frozen(), (4, 4));
+    }
+
+    /// A fire the engine took whose call then traps, here on a pass gone
+    /// where each path advances its shadow, is never queued: nothing
+    /// finalizes it. Its pipeline fails by that name, and its sets with it.
+    /// The marks its submit left stand while the engine may still run it
+    /// and lift when the engine is done with it, the pipeline and its queue
+    /// long gone, or when the engine itself is gone: nothing waits on them
+    /// for good. Its folded length is a bound from then on, which no fork
+    /// takes; no other pipeline takes the set, and its recurrent state
+    /// stays refused, since what the fire folded was never read.
+    #[test]
+    fn a_fire_submitted_and_never_queued_fails_its_pipeline_and_its_settle_lifts_the_marks() {
+        use crate::store::{PipelineScope, ScopeRefusal};
+
+        /// What each path does between its submit and its queueing, on a
+        /// pass since gone.
+        fn trapped(
+            ctx: &mut TestContext,
+            fires: &PendingFires,
+            fire: PendingFire,
+            unqueued: Unqueued,
+        ) -> Anyhow<()> {
+            let gone: Resource<ForwardPass> = Resource::new_borrow(u32::MAX);
+            advance_shadow(ctx, &gone)?;
+            unqueued.queue(fires, fire);
+            Ok(())
+        }
+
+        let dropped = || RsError::DeviceFoldFailed(RsDeviceFold::DROPPED.to_string());
+        let unqueued = |owner| {
+            Err(ScopeRefusal::Failed {
+                owner,
+                reason: UNQUEUED.to_string(),
+            })
+        };
+        for lost in [false, true] {
+            let (flight, fire, guard) = submitted(&geometry::Fold::Device, true);
+            let Flight {
+                stores,
+                fires,
+                completion,
+                failure,
+                kv,
+                rs,
+                ..
+            } = flight;
+            let scope = PipelineScope::failing_as(failure.clone(), || true);
+            kv.claim_pipeline_scope(&scope).unwrap();
+            let mut ctx = Flight::context();
+            assert!(trapped(&mut ctx, &fires, fire, guard).is_err());
+            assert!(fires.lock().unwrap().is_empty(), "nothing finalizes it");
+            assert_eq!(failure.lock().unwrap().as_deref(), Some(UNQUEUED));
+            assert_eq!(kv.pipeline_failure().as_deref(), Some(UNQUEUED));
+
+            // The engine may still run it: the marks stand.
+            let sets = [rs];
+            let mut waiting = Box::pin(device_folds_settled(&stores.rs, &sets));
+            assert_eq!(
+                stores.rs.lock().unwrap().device_fold_gate(rs),
+                Err(RsError::DeviceFoldUnsettled)
+            );
+            assert_eq!(stores.kv.lock().fork(kv.id), Err(UNSETTLED));
+            assert!(waiting.as_mut().now_or_never().is_none());
+
+            // The pipeline goes, and the engine settles the fire after it.
+            scope.close();
+            drop((fires, failure, ctx));
+            if lost {
+                drop(completion);
+            } else {
+                resolve_test_completion(&completion, false);
+            }
+            assert!(waiting.as_mut().now_or_never().is_some());
+            assert_eq!(stores.kv.lock().unsettled(kv.id).unwrap(), 0);
+            assert_eq!(folded(&stores, kv.id), (4, false));
+            assert_eq!(stores.kv.lock().fork(kv.id), Err(UNPLACED));
+            assert_eq!(
+                stores.rs.lock().unwrap().device_fold_gate(rs),
+                Err(dropped())
+            );
+            let next = PipelineScope::failing_as(Default::default(), || true);
+            assert_eq!(kv.claim_pipeline_scope(&next), unqueued(scope.id()));
+        }
+
+        // A failure that said why first keeps its reason.
+        let (flight, fire, guard) = submitted(&geometry::Fold::Device, true);
+        *flight.failure.lock().unwrap() = Some("pipeline: submit failed".to_string());
+        drop((guard, fire));
+        assert_eq!(
+            flight.failure.lock().unwrap().as_deref(),
+            Some("pipeline: submit failed")
+        );
+        resolve_test_completion(&flight.completion, false);
+
+        // A fire queued leaves none: its pipeline finalizes it.
+        let flight = in_flight(&geometry::Fold::Device, true);
+        assert_eq!(flight.fires.lock().unwrap().len(), 1);
+        assert_eq!(*flight.failure.lock().unwrap(), None);
+        resolve_test_completion(&flight.completion, false);
     }
 }
 
@@ -7373,7 +8779,6 @@ mod unfolded_tests {
     /// folded through 100, with `reserved` slots granted.
     fn decoding(reserved: u32) -> Cursor {
         Cursor {
-            folded: 100,
             tail: Some(105),
             reserved,
             written: 105,
@@ -7866,7 +9271,6 @@ mod unfolded_tests {
                     spans: Vec::new(),
                 }],
                 cursors: vec![Arc::new(Mutex::new(Cursor {
-                    folded: 10,
                     reserved: 14,
                     tail: None,
                     ..Cursor::default()
@@ -7875,7 +9279,7 @@ mod unfolded_tests {
             };
             let mut req = lane(10, 4);
             let plan = if device_places {
-                device_rs_plan(&stores, &ids, &groups_of, &pass, fold)
+                device_rs_plan(&stores, &ids, &groups_of, &pass, &[0, 4], fold)
             } else {
                 host_rs_plan(&stores, &ids, &groups_of, &req, fold, &[])
             }
@@ -7901,18 +9305,29 @@ mod unfolded_tests {
                 "{what}: the verb alone asks for nothing"
             );
             let mut tags = Vec::new();
-            let by = fold_at(
-                &pass,
-                &groups_of[0].1,
-                None,
-                fold,
-                u64::MAX,
-                true,
-                Some(ws),
-                &mut req,
-                &mut tags,
+            let by = if device_places {
+                let stated = device_fold(fold.of(0), 4, 4, false);
+                device_fold_at(&pass, 0, stated, false, Some(ws), &mut req, &mut tags)
+            } else {
+                fold_at(
+                    &pass,
+                    &groups_of[0].1,
+                    &[geometry::Landing { start: 10, rows: 4 }],
+                    fold,
+                    u64::MAX,
+                    true,
+                    Some(ws),
+                    &mut req,
+                    &mut tags,
+                )
+            };
+            // A count the host knows over a folded length it knows is a
+            // slot; the device's count is placed when the fire settles.
+            assert_eq!(
+                matches!(by, Some(FoldBy::Settled { .. })),
+                counts,
+                "{what}"
             );
-            assert!(matches!(by, Some(FoldBy::Settled { .. })), "{what}");
             assert_eq!(req.lanes[0].reports != 0, counts, "{what}");
             assert_eq!(untagged_device_fold(&req), None, "{what}");
         }
@@ -7994,7 +9409,6 @@ mod unfolded_tests {
         // what the lane reserved.
         let device = |reserved: u32| {
             let cell = Arc::new(Mutex::new(Cursor {
-                folded: 13,
                 reserved,
                 tail: None,
                 ..Cursor::default()
@@ -8010,7 +9424,14 @@ mod unfolded_tests {
                 cursors: vec![cell],
                 kv: Vec::new(),
             };
-            device_rs_plan(&stores, &ids, &groups_of, &lanes, &geometry::Fold::Device)
+            device_rs_plan(
+                &stores,
+                &ids,
+                &groups_of,
+                &lanes,
+                &[0, 5],
+                &geometry::Fold::Device,
+            )
         };
         let planned = groups(device(13 + 5 + 5).unwrap());
         assert_eq!(planned[0].writes, Some(13..23));

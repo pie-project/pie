@@ -2,7 +2,7 @@ use wasmtime::component::Resource;
 
 use super::context::FireContext;
 use super::{
-    FireWs, PendingFire, PendingOp, Reserved, Switched, TicketReservation, advance_shadow,
+    FireWs, PendingFire, Reserved, Switched, TicketReservation, advance_shadow,
     bound_rs_working_sets, every_lane, lora_program_of, open_pipeline, record_submit_failure,
     reserve, rs, settle_and_wait_resident, stamp_lane_facts, stamp_lane_words,
 };
@@ -263,11 +263,12 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         None => Vec::new(),
     };
     let plan = fold_one_plan(&rs_ids);
-    let (rs_prepared, epoch) = match reserve(
+    let (rs_prepared, epoch, unfired) = match reserve(
         ctx,
         (model, engine),
         &stores,
         quorum_pipeline_id,
+        &pipeline_failure,
         &[],
         &rs_ids,
         || Ok(plan.clone()),
@@ -275,8 +276,26 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
     )
     .await
     {
-        Ok(Reserved { rs, epoch, .. }) => (rs, epoch),
+        Ok(Reserved {
+            rs, epoch, unfired, ..
+        }) => (rs, epoch, unfired),
         Err(error) => return Ok(Err(error)),
+    };
+    // `reserve` ended by committing the fold of one slot into each recurrent
+    // state: the folded length that state follows moves in the same step,
+    // nothing awaited between. A fire that does not follow fails the
+    // pipeline, and its sets with it, however this call ends (`unfired`).
+    let ids: Vec<_> = kvs.iter().map(|ws| ws.id).collect();
+    let folded = match (!rs_ids.is_empty())
+        .then(|| fold_one(&stores, &ids))
+        .transpose()
+    {
+        Ok(folded) => folded.unwrap_or_default(),
+        Err(error) => {
+            let reason = format!("pipeline: float lane's folded length: {error}");
+            record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
+            return Ok(Err(reason));
+        }
     };
     for lane in &mut req.lanes {
         lane.rs_reset = ::engine::RsReset::Held;
@@ -317,27 +336,33 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
         return Ok(Err(reason));
     }
+    let unqueued = unfired.submitted();
     epoch.retire_on(&completion);
     ticket_reservation.commit();
     advance_shadow(ctx, &fwd)?;
+    // Each working set ends at the slot it folded.
     let mut advanced: Vec<u32> = Vec::new();
-    for &rep in lanes.iter().filter(|_| !rs_ids.is_empty()) {
+    for (&rep, &kv_rep) in lanes.iter().zip(&kv_reps).filter(|_| !rs_ids.is_empty()) {
         if advanced.contains(&rep) {
             continue;
         }
         advanced.push(rep);
+        let kv: Resource<KvWorkingSet> = Resource::new_borrow(kv_rep);
+        let id = ctx.resources().get(&kv)?.id;
+        let Some(folded) = ids.iter().position(|&set| set == id).map(|at| folded[at]) else {
+            continue;
+        };
+        let folded = u32::try_from(folded).unwrap_or(u32::MAX);
         let res: Resource<WorkingSet> = Resource::new_borrow(rep);
         let cursor = ctx.resources().get(&res)?.cursor.clone();
         let mut cursor = cursor.lock().unwrap();
-        cursor.folded += 1;
-        cursor.tail = Some(cursor.folded);
-        cursor.reserved = cursor.reserved.max(cursor.folded);
-        cursor.written = cursor.written.max(cursor.folded);
+        cursor.tail = Some(folded);
+        cursor.reserved = cursor.reserved.max(folded);
+        cursor.written = cursor.written.max(folded);
     }
-    pipe_fires
-        .lock()
-        .unwrap()
-        .push_back(PendingOp::Fire(PendingFire {
+    unqueued.queue(
+        &pipe_fires,
+        PendingFire {
             completion,
             checkpoints: Vec::new(),
             kv: kvs
@@ -361,13 +386,30 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
             cells,
             failure: pipeline_failure,
             retired: None,
-        }));
+        },
+    );
     Ok(Ok(()))
+}
+
+/// One slot more is folded on each of `sets`: what a float fire folds into
+/// their recurrent states. Their folded lengths after it.
+fn fold_one(
+    stores: &crate::store::registry::Stores,
+    sets: &[crate::store::kv::page_table::WorkingSetId],
+) -> Result<Vec<u64>, crate::store::kv::KvStoreError> {
+    crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
+        sets.iter()
+            .map(|&set| {
+                let to = kv.folded(set)?.saturating_add(1);
+                kv.freeze(set, to)
+            })
+            .collect()
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{fold_one_plan, rs};
+    use super::{fold_one, fold_one_plan, rs};
     use crate::store::rs::{RsGeometry, RsStore};
 
     fn geom() -> RsGeometry {
@@ -386,6 +428,7 @@ mod tests {
     #[test]
     fn float_every_case() {
         a_frame_folds_one_slot_fresh_then_held();
+        a_frame_moves_the_folded_length_with_its_state();
         a_fork_decodes_on_from_a_copy_of_its_parents_state();
     }
 
@@ -409,6 +452,29 @@ mod tests {
         let lanes = fire(&mut store, &[ws, other]);
         assert_eq!(lanes.slot_flags, vec![0, crate::engine::RS_FLAG_RESET]);
         assert_ne!(lanes.slot_ids[0], lanes.slot_ids[1], "a state a lane");
+    }
+
+    /// The one folded length a working set has is its KV working set's: a
+    /// float fire, which writes no KV, moves it by the slot it folds into
+    /// the recurrent state, so the two never part.
+    fn a_frame_moves_the_folded_length_with_its_state() {
+        let model = crate::store::registry::register_model(4, &[8], &[1]);
+        let stores = crate::store::registry::get(model, 0);
+        let kv = stores.kv.lock().create_working_set();
+        let ws = stores.rs.lock().unwrap().create_working_set(geom());
+        for frame in 1..=3u64 {
+            fire(&mut stores.rs.lock().unwrap(), &[ws]);
+            assert_eq!(fold_one(&stores, &[kv]).unwrap(), [frame]);
+            assert_eq!(
+                (
+                    stores.kv.lock().folded(kv).unwrap(),
+                    stores.rs.lock().unwrap().frozen(ws)
+                ),
+                (frame, Ok(frame as u32)),
+                "frame {frame}"
+            );
+        }
+        assert!(stores.kv.lock().folded_exact(kv).unwrap());
     }
 
     fn a_fork_decodes_on_from_a_copy_of_its_parents_state() {

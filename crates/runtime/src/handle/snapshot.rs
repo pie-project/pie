@@ -118,9 +118,11 @@ struct Spent {
     bytes: u64,
 }
 
+/// Where the rows end. What is folded is the manifest's `folded`, the one
+/// length there is; a manifest written before that carries it here as well,
+/// and it is not read.
 #[derive(Serialize, Deserialize)]
 struct SavedCursor {
-    folded: u32,
     tail: Option<u32>,
     reserved: u32,
     /// One past the highest slot written ([`Cursor::written`]); a manifest
@@ -557,6 +559,18 @@ pub(super) async fn save(held: &Held, tenant: &str, name: &str) -> Result<Value,
     }
     let Parts { kv, rs, cursor } = held.parts();
     let stores = store_registry::get(kv.model, kv.engine);
+    // What is kept states the frozen length too, and a load takes it as
+    // exact: a bound is not kept, and is refused before any byte is read.
+    let exact = store_registry::with_kv_lock(&stores.kv, "snapshot-host", |store| {
+        store.folded_exact(kv.id)
+    })
+    .map_err(|error| failed("reading the frozen length", error))?;
+    if !exact {
+        return Err(failed(
+            "reading the frozen length",
+            crate::store::kv::page_table::UNPLACED,
+        ));
+    }
     let (pin, set) = held.pinned().await.map_err(HandleError::moving)?;
     let wrote = async {
         let rs_set = match rs {
@@ -571,11 +585,6 @@ pub(super) async fn save(held: &Held, tenant: &str, name: &str) -> Result<Value,
             }
             None => None,
         };
-        // What is kept states the cursor's frozen length too, and a load
-        // takes it as exact: a bound is not kept.
-        cursor
-            .at_rest()
-            .map_err(|why| failed("reading the frozen length", why))?;
         let state = match &rs_set {
             Some((rs, set)) => Some(read_state(kv.engine, rs, set).await?),
             None => None,
@@ -791,7 +800,7 @@ async fn finish(
         Some((saved, bytes)) => (Some(saved), bytes),
         None => (None, Vec::new()),
     };
-    let tokens = u64::from(cursor.tail.unwrap_or(cursor.folded));
+    let tokens = cursor.tail.map_or(set.folded, u64::from);
     let bytes = spent.bytes + state_bytes.len() as u64;
     let manifest = Manifest {
         version: VERSION,
@@ -801,7 +810,6 @@ async fn finish(
         tokens,
         bytes,
         cursor: SavedCursor {
-            folded: cursor.folded,
             tail: cursor.tail,
             reserved: cursor.reserved,
             written: Some(cursor.written_end()),
@@ -957,9 +965,6 @@ pub(super) async fn load(holder: ProcessId, tenant: &str, name: &str) -> Result<
     .map_err(|error| failed("taking the pages in", error))?;
     let kv = KvWorkingSet::new(0, engine, id, stores.kv_page_size);
     let cursor = Cursor {
-        folded: cursor.folded,
-        folded_exact: true,
-        unsettled: 0,
         tail: cursor.tail,
         reserved: cursor.reserved,
         written: cursor.written.unwrap_or(cursor.reserved),
@@ -1195,18 +1200,17 @@ mod tests {
     /// by name, before any byte of it is read.
     #[tokio::test(flavor = "current_thread")]
     async fn a_save_of_a_set_whose_frozen_length_is_not_known_is_refused_by_name() {
-        use crate::handle::held::tests::{parked, unplaced};
-        use crate::inferlet::host::working_set::Cursor;
+        use crate::handle::held::tests::unplaced;
         configure(
             std::env::temp_dir().join(format!("pie-snapshots-{}", Uuid::new_v4())),
             u64::MAX,
         );
-        let held = parked(unplaced());
+        let held = unplaced();
         let refused = save(&held, "tenant", "bound").await;
         let refused = refused.expect_err("a bound is not kept");
         assert!(
             refused.message.contains("reading the frozen length")
-                && refused.message.contains(Cursor::UNPLACED),
+                && refused.message.contains(crate::store::kv::page_table::UNPLACED),
             "{}",
             refused.message
         );

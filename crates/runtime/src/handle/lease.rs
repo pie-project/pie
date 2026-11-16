@@ -395,7 +395,7 @@ fn take_out(
             held.rs_working_sets.remove(&(rs.model, rs.engine, rs.id));
         }
     }
-    // A fire that failed left the cursor ahead of what was written.
+    // What a failed pipeline's fires folded is frozen, and they did not run.
     if let Some(why) = kv.pipeline_failure() {
         kv.release();
         if let Some(rs) = rs {
@@ -479,25 +479,27 @@ mod tests {
                     save.err().map(|refused| refused.message),
                 );
             }
-            assert!(ending.cursor.lock().unwrap().at_rest().is_err());
+            let unsettled = ending.stores.kv.lock().unsettled(ending.kv_id());
+            assert_eq!(unsettled.unwrap(), 1, "{dropped}: the fold is on its way");
 
             ending.settle(3);
             let landed = tokio::time::timeout(std::time::Duration::from_secs(5), hears.recv());
             let landed = landed.await.expect("the process's end gets to its handles");
             let held = parked(landed.expect("the session hears"), name);
-            let cursor = &held.parts().cursor;
-            assert!(
-                cursor.at_rest().is_ok() && cursor.unsettled == 0 && cursor.folded == 7,
-                "{dropped}: {cursor:?}"
-            );
+            let kv = &held.parts().kv;
+            let length = {
+                let store = ending.stores.kv.lock();
+                (
+                    store.folded(kv.id).unwrap(),
+                    store.folded_exact(kv.id).unwrap(),
+                    store.unsettled(kv.id).unwrap(),
+                )
+            };
+            assert_eq!(length, (7, true, 0), "{dropped}");
             let child = held.fork(ProcessId::new_v4()).await;
             let child = child.expect("a set at rest forks");
             let pages = ending.stores.kv.lock().folded(child.parts().kv.id);
-            assert_eq!(
-                (child.parts().cursor.folded, pages.unwrap()),
-                (7, 7),
-                "{dropped}"
-            );
+            assert_eq!(pages.unwrap(), 7, "{dropped}");
             let label = format!("ordinary-{dropped}");
             let saved = snapshot::save(&held, "tenant", &label).await;
             let saved = saved.unwrap_or_else(|refused| panic!("{dropped}: {}", refused.message));
