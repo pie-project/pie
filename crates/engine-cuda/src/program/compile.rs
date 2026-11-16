@@ -663,7 +663,11 @@ pub struct Cache {
     /// The code each region source built, by its key under the region
     /// symbol: stages whose regions are the same text but for their entry
     /// names (a sampler region in every stage that samples) build it once.
-    built: Bounded<String, Arc<[u8]>>,
+    built: Bounded<String, Arc<Module>>,
+    /// The region modules a registration loaded or compiled because no
+    /// prewarm ([`Cache::warm`]) or earlier registration had: each one a
+    /// module built after ready.
+    late: u64,
     disk: Disk,
     stats: CacheStats,
 }
@@ -682,6 +686,7 @@ impl Cache {
             stages: Stages::new(MAX_STAGE_ENTRIES),
             negative: Bounded::new(MAX_NEGATIVE_ENTRIES),
             built: Bounded::new(MAX_STAGE_ENTRIES),
+            late: 0,
             disk,
             stats: CacheStats::default(),
         }
@@ -859,6 +864,91 @@ impl Cache {
         })
     }
 
+    /// The region modules registrations built that the load's prewarm had
+    /// not ([`Cache::warm`]).
+    #[must_use]
+    pub const fn built_late(&self) -> u64 {
+        self.late
+    }
+
+    /// Builds the region modules of `kernels` (a load's prewarm, before
+    /// ready): each region's text once, from the disk where it holds it,
+    /// the rest compiled side by side; a registration whose regions are the
+    /// same text then loads and compiles nothing.
+    pub fn warm(
+        &mut self,
+        target: &Target,
+        kernels: &[EmittedKernel],
+    ) -> std::result::Result<u64, Failure> {
+        let mut wanted: Vec<(String, String, u32)> = Vec::new();
+        for kernel in kernels {
+            if kernel.kind != KERNEL_FUSED || kernel.source.is_empty() {
+                continue;
+            }
+            let source = kernel.source.replace(&kernel.entry_name, REGION_SYMBOL);
+            let key = region_key(target, &source);
+            if self.built.get(&key).is_some() || wanted.iter().any(|(seen, _, _)| *seen == key) {
+                continue;
+            }
+            wanted.push((key, source, kernel.region_index));
+        }
+        let mut cubins: Vec<Option<Vec<u8>>> = wanted
+            .iter()
+            .map(|(key, _, _)| {
+                let cubin = self.disk.load(key, REGION_SYMBOL)?;
+                late_memory(&cubin).ok()?;
+                self.stats.persistent_hits += 1;
+                Some(cubin)
+            })
+            .collect();
+        let architecture = target.architecture();
+        let compiled: Vec<(usize, std::result::Result<Vec<u8>, Failure>)> =
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = cubins
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, cubin)| cubin.is_none())
+                    .map(|(at, _)| {
+                        let source = &wanted[at].1;
+                        let architecture = &architecture;
+                        (at, scope.spawn(move || compile(source, architecture)))
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|(at, handle)| {
+                        let built = handle.join().unwrap_or_else(|_| {
+                            Err(Failure::Retryable {
+                                reason: "a region's compile panicked".into(),
+                            })
+                        });
+                        (at, built)
+                    })
+                    .collect()
+            });
+        for (at, cubin) in compiled {
+            let (key, _, region_index) = &wanted[at];
+            let cubin = cubin?;
+            self.stats.compilations += 1;
+            late_memory(&cubin).map_err(|why| Failure::Deterministic {
+                reason: format!("region {region_index}: {why}"),
+            })?;
+            self.disk.store(key, REGION_SYMBOL, &cubin);
+            cubins[at] = Some(cubin);
+        }
+        for ((key, source, _), cubin) in wanted.iter().zip(cubins) {
+            let Some(cubin) = cubin else { continue };
+            let module =
+                Module::load(&cubin, REGION_SYMBOL, cut_state_bytes(source)).map_err(|error| {
+                    Failure::Retryable {
+                        reason: format!("loading a prewarmed region: {error}"),
+                    }
+                })?;
+            self.built.insert(key.clone(), Arc::new(module));
+        }
+        Ok(wanted.len() as u64)
+    }
+
     fn region_module(
         &mut self,
         target: &Target,
@@ -867,31 +957,15 @@ impl Cache {
         source: &str,
     ) -> std::result::Result<Arc<Module>, Failure> {
         // The region is built under one symbol, so its code is keyed by
-        // what it computes, never by the stage it sits in; the module keeps
-        // the region's own name.
+        // what it computes, never by the stage it sits in: stages whose
+        // regions are the same text share one module.
         let source = source.replace(entry, REGION_SYMBOL);
         let key = region_key(target, &source);
-        // CUDA keeps the exact cut's state in dynamic shared memory; HIP's
-        // text keeps it static.
-        let dynamic = if !cfg!(feature = "rocm")
-            && source.contains(eta_compiler::codegen::cuda::CUT_STATE_MARK)
-        {
-            eta_compiler::codegen::cuda::CUT_STATE_BYTES
-        } else {
-            0
-        };
-        let named = |mut module: Module| {
-            module.entry_name = entry.to_owned();
-            Arc::new(module)
-        };
-        if let Some(cubin) = self.built.get(&key).cloned() {
-            let module = Module::load(&cubin, REGION_SYMBOL, dynamic).map_err(|error| {
-                Failure::Retryable {
-                    reason: format!("loading `{entry}`: {error}"),
-                }
-            })?;
-            return Ok(named(module));
+        if let Some(module) = self.built.get(&key).cloned() {
+            return Ok(module);
         }
+        let dynamic = cut_state_bytes(&source);
+        self.late += 1;
         if let Some(cubin) = self.disk.load(&key, REGION_SYMBOL) {
             // One that asks for late memory was compiled before that was
             // refused: compiled again, and refused below if it still asks.
@@ -901,8 +975,9 @@ impl Cache {
             match loaded {
                 Some(module) => {
                     self.stats.persistent_hits += 1;
-                    self.built.insert(key, cubin.into());
-                    return Ok(named(module));
+                    let module = Arc::new(module);
+                    self.built.insert(key, Arc::clone(&module));
+                    return Ok(module);
                 }
                 None => self.disk.invalidate(&key),
             }
@@ -913,14 +988,24 @@ impl Cache {
         late_memory(&cubin).map_err(|why| Failure::Deterministic {
             reason: format!("region {region_index} (`{entry}`): {why}"),
         })?;
-        let module = Module::load(&cubin, REGION_SYMBOL, dynamic).map_err(|error| {
-            Failure::Retryable {
+        let module =
+            Module::load(&cubin, REGION_SYMBOL, dynamic).map_err(|error| Failure::Retryable {
                 reason: format!("loading `{entry}`: {error}"),
-            }
-        })?;
+            })?;
         self.disk.store(&key, REGION_SYMBOL, &cubin);
-        self.built.insert(key, cubin.into());
-        Ok(named(module))
+        let module = Arc::new(module);
+        self.built.insert(key, Arc::clone(&module));
+        Ok(module)
+    }
+}
+
+/// The dynamic shared memory a region's text asks: CUDA keeps the exact
+/// cut's state there; HIP's text keeps it static.
+fn cut_state_bytes(source: &str) -> u32 {
+    if !cfg!(feature = "rocm") && source.contains(eta_compiler::codegen::cuda::CUT_STATE_MARK) {
+        eta_compiler::codegen::cuda::CUT_STATE_BYTES
+    } else {
+        0
     }
 }
 
@@ -993,23 +1078,35 @@ mod tests {
         let directory = scratch("shared");
         let target = device_target();
         // Two stages' regions: other names, other region indices.
-        let (a, b) = ("ptir_fused_00000000000000aa_r0", "ptir_fused_00000000000000bb_r3");
+        let (a, b) = (
+            "ptir_fused_00000000000000aa_r0",
+            "ptir_fused_00000000000000bb_r3",
+        );
         let mut cache = Cache::new(Disk::at(&directory));
-        let first = cache.region_module(&target, 0, a, &region(a)).expect("builds");
-        let second = cache.region_module(&target, 3, b, &region(b)).expect("builds");
-        assert_eq!(cache.stats().compilations, 1, "the second stage's region is the first's code");
-        assert_eq!((first.entry_name(), second.entry_name()), (a, b), "each keeps its name");
+        let first = cache
+            .region_module(&target, 0, a, &region(a))
+            .expect("builds");
+        let second = cache
+            .region_module(&target, 3, b, &region(b))
+            .expect("builds");
+        assert_eq!(
+            cache.stats().compilations,
+            1,
+            "the second stage's region is the first's code"
+        );
+        assert!(Arc::ptr_eq(&first, &second), "and the first's module");
 
         // A later boot finds it on disk under a third name and index.
         let c = "ptir_fused_00000000000000cc_r5";
         let mut later = Cache::new(Disk::at(&directory));
-        let third = later.region_module(&target, 5, c, &region(c)).expect("loads");
+        let _third = later
+            .region_module(&target, 5, c, &region(c))
+            .expect("loads");
         assert_eq!(
             (later.stats().compilations, later.stats().persistent_hits),
             (0, 1),
             "the disk entry is the region's text's, not its stage's"
         );
-        assert_eq!(third.entry_name(), c);
         let _ = fs::remove_dir_all(&directory);
     }
 
@@ -1051,19 +1148,28 @@ mod tests {
             "a template edit bumps no version, so the source itself has to be \
              in the key — otherwise yesterday's cubin answers today's launch"
         );
-        let other_device = Target { device: 1, ..target };
+        let other_device = Target {
+            device: 1,
+            ..target
+        };
         assert_eq!(
             before,
             region_key(&other_device, "__global__ void k() { a(); }"),
             "a second card of the same architecture shares the build"
         );
-        let newer = Target { rtc: (12, 5), ..target };
+        let newer = Target {
+            rtc: (12, 5),
+            ..target
+        };
         assert_ne!(
             before,
             region_key(&newer, "__global__ void k() { a(); }"),
             "another runtime compiler builds it again"
         );
-        assert!(before.contains(&target.architecture()), "the target stays readable");
+        assert!(
+            before.contains(&target.architecture()),
+            "the target stays readable"
+        );
     }
 
     fn scratch(name: &str) -> PathBuf {

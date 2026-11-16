@@ -43,6 +43,8 @@ pub use wit_bindgen;
 pub use pie::inferlet::types;
 
 pub mod eta;
+/// The standard sampler's stage bodies ([`eta_dsl::sampler`]).
+pub use eta_dsl::sampler;
 pub mod mask;
 pub mod speculative;
 

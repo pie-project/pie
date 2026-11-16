@@ -115,6 +115,13 @@ impl Channel {
         channel
     }
 
+    /// The channel as the program traces it: what [`crate::sampler`]'s
+    /// stage bodies take and put.
+    #[must_use]
+    pub fn traced(&self) -> DslChannel {
+        self.dsl()
+    }
+
     fn dsl(&self) -> DslChannel {
         DslChannel::by_gid(self.gid).expect("channel token resolves in the DSL registry")
     }

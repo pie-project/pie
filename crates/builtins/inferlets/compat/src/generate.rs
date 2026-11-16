@@ -29,6 +29,7 @@ use inferlet::eta::prelude::*;
 use inferlet::grammar::Matcher;
 use inferlet::mask::unpack_mask;
 use inferlet::media;
+use inferlet::sampler::{self, Knobs, Slots};
 
 use crate::prompt::Prompt;
 
@@ -179,23 +180,6 @@ impl Sampling {
     }
 }
 
-/// The sampler's knob values as scalars. Which knobs exist is the program's
-/// shape; their values ride in channels, so requests that differ only in
-/// value share one program and fly as one batch.
-struct Knobs {
-    /// A program constant: a channel-fed divisor costs the fused sampler
-    /// ~20% of a decode step, more than mixed temperatures cost by splitting.
-    temperature: Option<f32>,
-    top_p: Option<Tensor>,
-    top_k: Option<Tensor>,
-    min_p: Option<Tensor>,
-    repetition: Option<Tensor>,
-    frequency: Option<Tensor>,
-    presence: Option<Tensor>,
-    /// A program constant: how many alternatives a step lands, if any.
-    logprobs: Option<u32>,
-}
-
 /// The channels a pass's knobs are seeded in.
 struct KnobChannels {
     temperature: Option<f32>,
@@ -244,106 +228,19 @@ impl KnobChannels {
     }
 }
 
-/// What a step lands beside its token when asked for logprobs: the sampled
-/// token's logprob then the alternatives' (`[1 + top]` f32), and the
-/// alternatives' ids (`[top]` i32, absent for none).
-struct Landed {
-    logprobs: Tensor,
-    ids: Option<Tensor>,
-}
-
-/// The sampled token as a rank-0 i32, the next output-token histogram, and
-/// the step's logprobs where the knobs ask. `histogram` is `(counts,
-/// present)`: how often each token was generated, and whether it was in the
-/// prompt.
-fn sample(
-    vocab: u32,
-    k: &Knobs,
-    r: &Tensor,
-    histogram: Option<(&Tensor, &Tensor)>,
-    mask: Option<&Tensor>,
-) -> (Tensor, Option<Tensor>, Option<Landed>) {
-    let mut logits = reshape(intrinsics::output(0, "logits"), [vocab]);
-    let raw = k.logprobs.map(|_| logits.clone());
-    if let Some((counts, present)) = histogram {
-        let zero = broadcast(0.0f32, [vocab]);
-        let seen_out = gt(counts, &zero);
-        let seen_prompt = gt(present, broadcast(0.5f32, [vocab]));
-        let seen = or(&seen_out, &seen_prompt);
-        if let Some(rep) = &k.repetition {
-            let rp = broadcast(rep, [vocab]);
-            let positive = gt(&logits, &zero);
-            let repenalized = select(&positive, &logits / &rp, &logits * &rp);
-            logits = select(&seen, &repenalized, &logits);
-        }
-        if let Some(freq) = &k.frequency {
-            logits = &logits - broadcast(freq, [vocab]) * counts;
-        }
-        if let Some(pres) = &k.presence {
-            logits = &logits - broadcast(pres, [vocab]) * cast(&seen_out, dtype::f32);
-        }
+/// A step's channels as the standard sampler's stage bodies take them.
+fn slots(
+    rng: Channel,
+    hist: Option<(Channel, Channel)>,
+    mask: Option<Channel>,
+    logprobs: Option<(Channel, Option<Channel>)>,
+) -> Slots {
+    Slots {
+        rng: rng.traced(),
+        hist: hist.map(|(c, p)| (c.traced(), p.traced())),
+        mask: mask.map(|m| m.traced()),
+        logprobs: logprobs.map(|(values, ids)| (values.traced(), ids.map(|ids| ids.traced()))),
     }
-    if let Some(mask) = mask {
-        logits = mask_apply(&logits, mask);
-    }
-    let token = match k.temperature {
-        None => reduce_argmax(&logits),
-        Some(temperature) => {
-            let scaled = &logits / temperature;
-            let mut keep: Option<Tensor> = None;
-            if k.top_k.is_some() || k.top_p.is_some() || k.min_p.is_some() {
-                let probs = softmax(&scaled);
-                if let Some(min_p) = &k.min_p {
-                    let floor = reduce_max(&probs) * min_p;
-                    keep = Some(ge(&probs, broadcast(&floor, [vocab])));
-                }
-                if let Some(top_k) = &k.top_k {
-                    let ranked = pivot_threshold(&probs, rank_le(top_k));
-                    keep = Some(match keep {
-                        Some(k) => and(&k, &ranked),
-                        None => ranked,
-                    });
-                }
-                if let Some(top_p) = &k.top_p {
-                    let nucleus = pivot_threshold(&probs, cummass_le(top_p));
-                    keep = Some(match keep {
-                        Some(k) => and(&k, &nucleus),
-                        None => nucleus,
-                    });
-                }
-            }
-            let truncated = match keep {
-                Some(keep) => mask_apply(&scaled, keep),
-                None => scaled,
-            };
-            gumbel_max(&truncated, r)
-        }
-    };
-    let next = histogram.map(|(counts, _)| scatter_add(counts, &token, 1.0f32));
-    let landed = raw.zip(k.logprobs).map(|(raw, top)| {
-        let lp = log_softmax(&raw);
-        let chosen = reshape(scalar_gather(&lp, reshape(&token, [1])), [1]);
-        if top == 0 {
-            return Landed {
-                logprobs: chosen,
-                ids: None,
-            };
-        }
-        let (values, ids) = top_k(&lp, top);
-        Landed {
-            logprobs: concat_f32(&chosen, &values, top),
-            ids: Some(cast(&ids, dtype::i32)),
-        }
-    });
-    (token, next, landed)
-}
-
-/// `[1]` and `[n]` f32 rows as one `[1 + n]` row.
-fn concat_f32(head: &Tensor, tail: &Tensor, n: u32) -> Tensor {
-    let at = iota(n + 1);
-    let first = eq(&at, broadcast(0u32, [n + 1]));
-    let shifted = gather(tail, select(&first, broadcast(0u32, [n + 1]), &at - 1u32));
-    select(&first, broadcast(reshape(head, []), [n + 1]), &shifted)
 }
 
 /// The host's read of a step's landed logprobs.
@@ -367,16 +264,6 @@ fn logprob_channels(logprobs: Option<u32>, capacity: u32) -> Option<(Channel, Op
             (top > 0).then(|| Channel::new([top], dtype::i32).capacity(capacity)),
         )
     })
-}
-
-/// A step's landed logprobs put in its channels, where asked.
-fn land(landed: Option<Landed>, channels: Option<(Channel, Option<Channel>)>) {
-    if let (Some(landed), Some((values, ids))) = (landed, channels) {
-        values.put(&landed.logprobs);
-        if let (Some(landed), Some(ids)) = (landed.ids, ids) {
-            ids.put(&landed);
-        }
-    }
 }
 
 /// A step's logprobs off the host side of its channels.
@@ -624,26 +511,16 @@ pub async fn generate(
     }
     fwd.state(&[&ws], StateGeometry::folding())?;
     fwd.epilogue(move || {
-        let r = rng.take();
-        let taken = hist.map(|(c, p)| (c.take(), p.take()));
-        let m = mask.map(|m| m.take());
-        let (token, counts_next, landed) = sample(
+        let carried_on = carried_on.map(|(tok_in, hist)| {
+            (tok_in.traced(), hist.map(|(c, p)| (c.traced(), p.traced())))
+        });
+        sampler::prefill(
             vocab,
             &knobs.read(),
-            &r,
-            taken.as_ref().map(|(c, p)| (c, p)),
-            m.as_ref(),
+            &slots(rng, hist, mask, lp_ch),
+            &g0_ch.traced(),
+            carried_on.as_ref(),
         );
-        let token = reshape(token, [1]);
-        g0_ch.put(&token);
-        land(landed, lp_ch);
-        if let Some((tok_in, hist)) = carried_on {
-            tok_in.put(&token);
-            if let (Some((c, p)), Some(next), Some((_, present))) = (hist, counts_next, taken) {
-                c.put(&next);
-                p.put(&present);
-            }
-        }
     });
     if let (Some(m), Some(guide)) = (mask, guide.as_deref_mut()) {
         m.put(unpack_mask(&guide.mask(), vocab));
@@ -707,29 +584,13 @@ pub async fn generate(
     fwd.embed(&tok_in, &lane1)?;
     fwd.state(&[&ws], StateGeometry::folding())?;
     fwd.epilogue(move || {
-        let r = rng.take();
-        let taken = hist.map(|(c, p)| (c.take(), p.take()));
-        let m = mask.map(|m| m.take());
-        let k = knobs.read();
-
-        let (token, counts_next, landed) = sample(
+        sampler::decode(
             vocab,
-            &k,
-            &r,
-            taken.as_ref().map(|(c, p)| (c, p)),
-            m.as_ref(),
+            &knobs.read(),
+            &slots(rng, hist, mask, lp_ch),
+            &tok_in.traced(),
+            &out.traced(),
         );
-        let token = reshape(token, [1]);
-        land(landed, lp_ch);
-        let r_next = &r + iota(2);
-
-        tok_in.put(&token);
-        out.put(&token);
-        rng.put(&r_next);
-        if let (Some((c, p)), Some(next), Some((_, present))) = (hist, counts_next, taken) {
-            c.put(&next);
-            p.put(&present);
-        }
     });
 
     let budget = max_tokens - 1;

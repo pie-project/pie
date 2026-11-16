@@ -397,6 +397,22 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         &metadata,
     )?;
 
+    // The standard samplers' guest code, built before ready: a request that
+    // registers one of them builds nothing. One that cannot be built fails
+    // the load, as a rung that cannot be armed does; a backend that builds
+    // no guest code keeps the default, which builds nothing.
+    for (at, engine) in engine_configs.iter_mut().enumerate() {
+        let backend =
+            crate::engine::verbs::codegen_backend(&engine.engine_backend).map(str::to_owned);
+        let registrations = crate::pipeline::standard::registrations(backend.as_deref())?;
+        engine
+            .engine_backend
+            .prewarm_programs(&registrations)
+            .map_err(|error| {
+                anyhow::anyhow!("engine {at}: the standard samplers' guest code: {error}")
+            })?;
+    }
+
     let scales: Vec<crate::policy::pressure::Scale> = engine_configs
         .iter()
         .map(|d| {
