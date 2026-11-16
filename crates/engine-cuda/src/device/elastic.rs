@@ -1179,7 +1179,12 @@ impl Range {
             self.held = held;
             return Ok(Commit::Committed);
         }
-        let want = self.wanted(self.committed, &held);
+        // What the span backs anew is all a hold commits: the committed
+        // segments and the spans held before are backed already, and a commit
+        // only adds the units it names (`Arena::grow`). Walking the range's
+        // whole want instead cost what the range holds on every hold, and a
+        // bind holds a span.
+        let want = Want::Ranges(vec![(from, bytes)]);
         let mut targets = [Target {
             arena: &mut self.arena,
             want: want.clone(),
