@@ -363,6 +363,23 @@ impl Printer<'_> {
         })
     }
 
+    /// A value's element `i` in a scalar loop over the chunk (a scalar's text as it is).
+    fn elem_of(&mut self, v: ValueId) -> R<String> {
+        if self.is_scalar_text(v) {
+            return self.operand(v);
+        }
+        let d = self.row_of(v)?;
+        Ok(if let Some(b) = d.strip_prefix('B') {
+            format!("b{b}[i]")
+        } else if let Some(k) = d.strip_prefix("IN") {
+            format!("in{k}[i]")
+        } else if let Some(t) = d.strip_prefix("T_") {
+            format!("T_{t}_a[i]")
+        } else {
+            return refuse(format!("value {v} has no array"));
+        })
+    }
+
     /// A row value's DSD text.
     fn row_of(&mut self, v: ValueId) -> R<String> {
         let s = self.operand(v)?;
@@ -389,7 +406,11 @@ impl Printer<'_> {
     fn op(&mut self, v: ValueId, op: &Op, k: usize) -> R<()> {
         let shape = self.shape(v);
         let elem = self.types[v as usize].1;
-        if elem != Elem::F32 && !matches!(op, Op::Broadcast(_)) {
+        // a row's comparisons (and their joins) over its values: 0 / 1 words, a scalar loop
+        let data_bool = elem == Elem::Bool
+            && shape == Shape::Row
+            && matches!(op, Op::Binary(b, ..) if b.compares() || b.logic());
+        if elem != Elem::F32 && !matches!(op, Op::Broadcast(_)) && !data_bool {
             return refuse(format!(
                 "op {k} ({op:?}): a row's bools or indices that depend on its values"
             ));
@@ -427,7 +448,27 @@ impl Printer<'_> {
                 }
                 e
             }
-            Op::Reduce(r, _) => return refuse(format!("op {k}: a row's {r:?} (sums only)")),
+            // a row's maximum or minimum: a scalar loop over the chunk, at one root
+            Op::Reduce(r @ (Reduce::Max | Reduce::Min), a) => {
+                if self.place.roots > 1 {
+                    return refuse(format!(
+                        "op {k}: a row's {r:?} over {} roots",
+                        self.place.roots
+                    ));
+                }
+                let x = self.elem_of(a)?;
+                let (init, cmp) = if r == Reduce::Max {
+                    ("-3.4e38", ">")
+                } else {
+                    ("3.4e38", "<")
+                };
+                let _ = writeln!(
+                    self.body,
+                    "  {name} = {init}; {{ var i: u16 = 0; while (i < C) : (i += 1) {{ if ({x} {cmp} {name}) {{ {name} = {x}; }} }} }}"
+                );
+                self.vals.insert(v, Val::Scal(name));
+                return Ok(());
+            }
             Op::Unary(u, a) => {
                 let x = self.operand(a)?;
                 match u {
@@ -601,6 +642,24 @@ impl Printer<'_> {
                     u => return refuse(format!("op {k}: a row's {u:?}")),
                 }
             }
+            // a comparison or a join of comparisons over the row's values: 0 / 1 words
+            Op::Binary(b, x, y) if b.compares() || b.logic() => {
+                let (xs, ys) = (self.elem_of(x)?, self.elem_of(y)?);
+                let e = match b {
+                    Binary::Gt => format!("{xs} > {ys}"),
+                    Binary::Ge => format!("{xs} >= {ys}"),
+                    Binary::Lt => format!("{xs} < {ys}"),
+                    Binary::Le => format!("{xs} <= {ys}"),
+                    Binary::Eq => format!("{xs} == {ys}"),
+                    Binary::Ne => format!("{xs} != {ys}"),
+                    Binary::And => format!("{xs} != 0.0 and {ys} != 0.0"),
+                    _ => format!("{xs} != 0.0 or {ys} != 0.0"),
+                };
+                let _ = writeln!(
+                    self.body,
+                    "  {{ var i: u16 = 0; while (i < C) : (i += 1) {{ b{dst}[i] = if ({e}) 1.0 else 0.0; }} }}"
+                );
+            }
             Op::Binary(b, x, y) => {
                 let f = match b {
                     Binary::Add => "@fadds",
@@ -654,10 +713,15 @@ impl Printer<'_> {
                     );
                 }
             }
+            // a select on the row's values (its 0 / 1 words): a scalar loop
+            Op::Select(cnd, a, b) if !self.statics[cnd as usize] => {
+                let (c, xa, xb) = (self.elem_of(cnd)?, self.elem_of(a)?, self.elem_of(b)?);
+                let _ = writeln!(
+                    self.body,
+                    "  {{ var i: u16 = 0; while (i < C) : (i += 1) {{ b{dst}[i] = if ({c} != 0.0) {xa} else {xb}; }} }}"
+                );
+            }
             Op::Select(cnd, a, b) => {
-                if !self.statics[cnd as usize] {
-                    return refuse(format!("op {k}: a select on the row's values"));
-                }
                 if self.shape(cnd) == Shape::Scalar {
                     let pick = if self.host[&cnd][0] != 0.0 { a } else { b };
                     let s = self.operand(pick)?;
