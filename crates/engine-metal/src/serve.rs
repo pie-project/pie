@@ -1424,7 +1424,16 @@ impl PreparedLoad<'_> {
             held: vec![0; paging.slots as usize],
             programs: {
                 let mut plane = crate::program::Plane::new();
-                plane.set_flight(boot.budget.max_lanes, arms, boot.budget.readouts_per_lane);
+                // A binding's readout rows are laid for the most one fire
+                // reads (the runtime's `max_readouts`), as CUDA and
+                // engine-gpu size them: a lane may take them all, as an MTP
+                // verify's k + 1 rows a drafted token can.
+                plane.set_flight(
+                    boot.budget.max_lanes,
+                    arms,
+                    u32::try_from(poem_compiler::arena::readouts_ceiling(&boot.budget))
+                        .unwrap_or(u32::MAX),
+                );
                 plane
             },
         };

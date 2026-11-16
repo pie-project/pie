@@ -492,7 +492,7 @@ impl Grouped {
                 "program::launch",
                 format!(
                     "this bind reads {readout_rows} readout rows a lane, and the load lays \
-                     the rows of {} (the readouts a lane may take in one fire)",
+                     the rows of {} (the readouts one fire may take)",
                     rows_bound.max(1)
                 ),
             ));
