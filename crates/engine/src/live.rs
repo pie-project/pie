@@ -53,15 +53,22 @@ pub enum Tally {
     /// ([`crate::chunk::ChunkFacts::eager_rungs`]): it ran uncaptured, as
     /// stated.
     Eager,
+    /// A pipeline, module or program built after ready: one a serving
+    /// fire, a registration or a bind reached that the load did not build,
+    /// whatever the backend (a kernel pipeline, a guest step's pipeline, a
+    /// guest region's module). The rule is that every one serving can
+    /// reach is built before ready, so this reads 0.
+    BuiltAfterReady,
 }
 
 impl Tally {
-    pub const ALL: [Tally; 5] = [
+    pub const ALL: [Tally; 6] = [
         Tally::Compiled,
         Tally::Fallback,
         Tally::Unrecorded,
         Tally::Refused,
         Tally::Eager,
+        Tally::BuiltAfterReady,
     ];
 
     /// Its name in the model status.
@@ -73,6 +80,7 @@ impl Tally {
             Tally::Unrecorded => "unrecorded",
             Tally::Refused => "refused",
             Tally::Eager => "eager",
+            Tally::BuiltAfterReady => "built_after_ready",
         }
     }
 }

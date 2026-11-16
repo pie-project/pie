@@ -5,15 +5,13 @@ use core::fmt::Write as _;
 use eta_ir::op::tags;
 
 use crate::codegen::op_view::{OpView, result_bases};
+pub use crate::codegen::steps::{REDUCE_LEVELS, SORT_ROUNDS};
+use crate::codegen::steps::{is_reduce, is_sort, one_row, reduce_levels, sort_rounds};
 use crate::plan::{CompiledStage, Region};
 
 pub const RUNTIME: &str = include_str!("../../runtime/wgsl/ptir_runtime.wgsl");
 
 pub const WORKGROUP: u32 = 256;
-
-const REDUCE_LEVELS: u32 = 7;
-
-const SORT_ROUNDS: u32 = 28;
 
 /// Words the runtime's one-row select keeps just below the temporary area
 /// (`SEL_WORDS` in the runtime), which a scratch layout must leave free.
@@ -111,17 +109,6 @@ pub fn emits(tag: u8) -> bool {
     )
 }
 
-const fn is_reduce(tag: u8) -> bool {
-    matches!(
-        tag,
-        tags::REDUCE_SUM | tags::REDUCE_MAX | tags::REDUCE_MIN | tags::REDUCE_ARGMAX
-    )
-}
-
-const fn is_sort(tag: u8) -> bool {
-    matches!(tag, tags::SORT_DESC | tags::TOP_K | tags::PIVOT_THRESHOLD)
-}
-
 #[must_use]
 pub fn is_boundary(tag: u8) -> bool {
     if tag == tags::OUTPUT {
@@ -142,77 +129,6 @@ pub fn launched_nodes(plan: &crate::codegen::launch::LaunchStagePlan) -> Vec<u32
         .filter(|&(at, op)| !is_boundary(op.tag) && fusion.emits_node(at))
         .map(|(at, _)| at as u32)
         .collect()
-}
-
-fn sort_rounds(plan: &crate::codegen::launch::LaunchStagePlan, at: usize) -> u32 {
-    let Some(op) = plan.ops.get(at) else {
-        return SORT_ROUNDS;
-    };
-    let Some(&arg) = op.args.first() else {
-        return SORT_ROUNDS;
-    };
-    let Some(value) = plan.value_types.get(arg as usize) else {
-        return SORT_ROUNDS;
-    };
-    let mut total: u64 = 1;
-    for axis in &value.axes {
-        let crate::plan::Dimension::Static(extent) = axis else {
-            return SORT_ROUNDS;
-        };
-        total *= u64::from(*extent);
-    }
-    let mut need = 0u32;
-    while (1u64 << need) < total {
-        need += 1;
-        if need >= SORT_ROUNDS {
-            return SORT_ROUNDS;
-        }
-    }
-    let rounds = need + (need & 1);
-    rounds.min(SORT_ROUNDS)
-}
-
-/// The fold levels a reduce over `at`'s argument needs: one per 32-fold
-/// until a row is one cell. A row of unknown length gets the full ladder.
-fn reduce_levels(plan: &crate::codegen::launch::LaunchStagePlan, at: usize) -> u32 {
-    let Some(mut len) = last_extent(plan, at) else {
-        return REDUCE_LEVELS;
-    };
-    let mut levels = 0;
-    while len > 1 && levels < REDUCE_LEVELS {
-        len = len.div_ceil(32);
-        levels += 1;
-    }
-    levels
-}
-
-fn arg_axes(
-    plan: &crate::codegen::launch::LaunchStagePlan,
-    at: usize,
-) -> Option<&[crate::plan::Dimension]> {
-    let arg = *plan.ops.get(at)?.args.first()?;
-    Some(&plan.value_types.get(arg as usize)?.axes)
-}
-
-fn last_extent(plan: &crate::codegen::launch::LaunchStagePlan, at: usize) -> Option<u64> {
-    match arg_axes(plan, at)?.last() {
-        Some(crate::plan::Dimension::Static(extent)) => Some(u64::from(*extent)),
-        None => Some(1),
-        _ => None,
-    }
-}
-
-/// Whether `at`'s argument is one row, which the runtime's select handles.
-fn one_row(plan: &crate::codegen::launch::LaunchStagePlan, at: usize) -> bool {
-    let Some(axes) = arg_axes(plan, at) else {
-        return false;
-    };
-    let Some((_, leading)) = axes.split_last() else {
-        return true;
-    };
-    leading
-        .iter()
-        .all(|axis| matches!(axis, crate::plan::Dimension::Static(1)))
 }
 
 // Native drivers recompile everything an entry point reaches per pipeline, so
