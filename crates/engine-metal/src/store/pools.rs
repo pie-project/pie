@@ -1139,6 +1139,39 @@ impl Pools {
         Ok((view.clone(), at, runs, shape.slot_bytes))
     }
 
+    /// `len` bytes from byte `at` of the run of shape `id`'s slots that
+    /// starts at slot ref `first` (a run lies in one chunk): the buffer they
+    /// lie in, their offset there, and their host runs. A guest pair's
+    /// batch tables are laid so (`engine::GuestState::per_pair`).
+    pub fn run_bytes(
+        &self,
+        id: ShapeId,
+        first: u32,
+        at: u64,
+        len: u64,
+    ) -> Result<(Buffer, u64, Vec<(u64, u64, std::ptr::NonNull<u8>)>)> {
+        let shape = *self.shape(id)?;
+        let (chunk, index) = self.place(&shape, first)?;
+        let run_room = u64::from(shape.per_chunk - index) * shape.slot_bytes;
+        if at.saturating_add(len) > run_room {
+            return Err(Fault::Ceiling {
+                what: "bytes of a run of slots inside its chunk",
+                need: at.saturating_add(len),
+                have: run_room,
+            });
+        }
+        let global =
+            u64::from(chunk) * self.layout.chunk_bytes + u64::from(index) * shape.slot_bytes + at;
+        self.pool.admit(chunk)?;
+        let runs = if len > 0 {
+            self.pool.host_runs(global, len)?
+        } else {
+            Vec::new()
+        };
+        let (view, offset) = self.pool.view_at(global);
+        Ok((view.clone(), offset, runs))
+    }
+
     /// The slots of shape `id` one chunk holds.
     pub fn slots_per_chunk(&self, id: ShapeId) -> Result<u32> {
         Ok(self.shape(id)?.per_chunk)

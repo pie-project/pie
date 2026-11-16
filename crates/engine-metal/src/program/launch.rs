@@ -97,6 +97,32 @@ pub fn scratch_held(ends: &[u64], chunk_bytes: u64) -> u64 {
     }
 }
 
+/// Tables of `bytes` packed one after another, each on the arena's
+/// boundary, in pieces of at most `unit` bytes, none crossing one: each
+/// piece's bytes in use (what [`scratch_held`] holds). A pair's batch
+/// tables lie so (`engine::GuestState::per_pair`); one past a piece is
+/// refused by name.
+pub fn pack_tables(bytes: impl IntoIterator<Item = u64>, unit: u64) -> Result<Vec<u64>> {
+    let mut ends: Vec<u64> = Vec::new();
+    for bytes in bytes {
+        let room = crate::arena::room(bytes);
+        if room > unit {
+            return Err(Fault::program(
+                "program::launch",
+                format!(
+                    "a batch table of {room} bytes, past a {unit}-byte piece of the \
+                     Instance room, and no table crosses a piece"
+                ),
+            ));
+        }
+        match ends.last_mut() {
+            Some(end) if *end + room <= unit => *end += room,
+            _ => ends.push(room),
+        }
+    }
+    Ok(ends)
+}
+
 /// The most pieces a stage's scratch lies in: each value in one, and the
 /// temporary area in one. What sizes a lane's piece bases from counts
 /// alone.
@@ -2080,31 +2106,23 @@ fn scratch_bases_of(pieces: &[ScratchAt]) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// The span bytes `pieces` take, each on the arena's boundary.
-fn batch_area(pieces: &[u64]) -> u64 {
-    pieces.iter().map(|&bytes| crate::arena::room(bytes)).sum()
-}
+/// Where a batch table of `bytes` lies once laid: the buffer, its offset
+/// there, and its host runs.
+pub type TablePlace = (Buffer, u64, Vec<(u64, u64, std::ptr::NonNull<u8>)>);
 
 impl Batch {
-    /// The span bytes this batch's tables take where it is laid.
+    /// Each table's bytes a batch of `lanes` lanes of a stage of `plan`
+    /// takes, in the order [`Batch::lay`] lays them, its instances carrying
+    /// `channels` channels and reading at most `rows` readout rows a lane:
+    /// what a pair states before any is laid (`engine::GuestState::per_pair`);
+    /// none for a stage with no grouped seat.
     #[must_use]
-    pub fn bytes(&self) -> u64 {
-        self.regions()
-            .map(|region| crate::arena::room(region.bytes()))
-            .sum()
-    }
-
-    /// The span bytes a batch of `lanes` lanes of a stage of `plan` takes,
-    /// its instances carrying `channels` channels and reading at most
-    /// `rows` readout rows a lane: what a fire term states before any is
-    /// laid; 0 for a stage with no grouped seat.
-    #[must_use]
-    pub fn bytes_for(plan: &LaunchStagePlan, channels: u32, lanes: u32, rows: u32) -> u64 {
+    pub fn tables_for(plan: &LaunchStagePlan, channels: u32, lanes: u32, rows: u32) -> Vec<u64> {
         if !plan.needs.grouped_valid {
-            return 0;
+            return Vec::new();
         }
         let values = plan.value_types.len() as u64;
-        batch_area(&batch_pieces(
+        batch_pieces(
             lanes.max(1),
             LaneShape::of(GROUPED_LANES, channels).channel_slots_per_lane,
             (
@@ -2119,25 +2137,7 @@ impl Batch {
                 pieces_bound(plan),
             ),
             plan.fused.len(),
-        ))
-    }
-
-    fn regions(&self) -> impl Iterator<Item = &SpanRegion> {
-        [
-            &self.table,
-            &self.descriptors,
-            &self.params,
-            &self.offsets,
-            &self.bindings,
-            &self.pending_flags,
-            &self.lane_indices,
-            &self.row_meta,
-            &self.row_indices,
-            &self.addresses,
-            &self.scratch_bases,
-        ]
-        .into_iter()
-        .chain(&self.layouts)
+        )
     }
 
     fn regions_mut(&mut self) -> impl Iterator<Item = &mut SpanRegion> {
@@ -2198,7 +2198,7 @@ impl Batch {
                 binding_bytes.len() as u64,
             ),
             rows_per_lane,
-            (table_bytes, template.scratch_pieces()),
+            (table_bytes, template.value_count.saturating_add(1)),
             grouped.layout_words.len(),
         );
         let mut regions = pieces
@@ -2231,26 +2231,17 @@ impl Batch {
         })
     }
 
-    /// Lays the batch's tables from `at` of `view` (the span's buffer)
-    /// upward, written through `host` (`(at, bytes)` to its host runs), and
-    /// writes what a batch holds from its first fire; the caller drained
-    /// every frame that read where it was. Returns where the next lies.
-    pub fn lay(
-        &mut self,
-        view: &Buffer,
-        at: u64,
-        host: &dyn Fn(u64, u64) -> Result<Vec<(u64, u64, std::ptr::NonNull<u8>)>>,
-    ) -> Result<u64> {
-        let mut next = at;
+    /// Lays the batch's tables one after another where `place` puts each
+    /// of its bytes (its pair's room, `engine::GuestState::per_pair`),
+    /// zeroed, and writes what a batch holds from its first fire; no frame
+    /// reads it where it was (its pair's first bind, or every frame
+    /// drained).
+    pub fn lay(&mut self, place: &mut dyn FnMut(u64) -> Result<TablePlace>) -> Result<()> {
         for region in self.regions_mut() {
             let bytes = region.bytes();
-            region.place(view.clone(), next);
-            region.rehost(if bytes > 0 {
-                host(next, bytes)?
-            } else {
-                Vec::new()
-            })?;
-            next += crate::arena::room(bytes);
+            let (view, at, host) = place(bytes)?;
+            region.place(view, at);
+            region.rehost(host)?;
         }
         self.table.write(
             0,
@@ -2276,7 +2267,7 @@ impl Batch {
         for (words, region) in self.layout_words.iter().zip(self.layouts.iter_mut()) {
             region.write(0, &record_bytes(words))?;
         }
-        Ok(next)
+        Ok(())
     }
 
     #[must_use]
