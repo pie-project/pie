@@ -1315,6 +1315,39 @@ impl Shell {
                 .saturating_mul(boot.budget.max_tokens as usize)
                 .saturating_mul(size_of::<u64>()),
         );
+        // A routed bank on the host that no table of the weight cache reads
+        // is staged by its fire: the most experts one fire routes to, laid
+        // here with the staged inputs. ROCm stages its own (`dispatch::hip`).
+        // A lane of it for each stream whose regions run such a select.
+        #[cfg(not(feature = "rocm"))]
+        let expert_staging = {
+            let mut streams = vec![0u32; boot.trace.nodes.len()];
+            for region in compiled.template() {
+                for node in region.nodes.clone() {
+                    if let Some(stream) = streams.get_mut(node as usize) {
+                        *stream = region.stream;
+                    }
+                }
+            }
+            crate::experts::staging::Staging::bound(
+                &crate::experts::staging::Staging::selects(
+                    &boot.trace,
+                    weights.table(),
+                    &pools.expert_params(),
+                    crate::device::alloc::is_host_pointer,
+                    |node| streams[node],
+                )?,
+                budgets.tokens.max_tokens,
+            )
+        };
+        #[cfg(feature = "rocm")]
+        let expert_staging = crate::experts::staging::Staging::default();
+        if expert_staging.bytes() > 0 {
+            expert_staging.fits(pools.spare_bytes()?)?;
+        }
+        if let Some(fact) = expert_staging.fact() {
+            eprintln!("{fact}");
+        }
         let adapter_seats = weights.adapter_seats();
         let adapter_fact = adapter_fact(&compiled.classes, &corrected);
         let compiled_towered = compiled.order_for(poem_ir::RowAxis::Patches).is_some();
@@ -1367,6 +1400,8 @@ impl Shell {
             adapters: crate::blob::Adapters::new(adapter_seats),
             held: vec![0; boot.slots as usize],
             readout_rows,
+            expert_staging,
+            expert_staged: None,
             exports,
             graphs: engine.graphs,
             copies: engine.copies,
@@ -1649,15 +1684,15 @@ pub(crate) struct Workspace {
 impl Shell {
     /// The runs of the activation's span a fire stages into and reads out
     /// of, in the order they lie from `inputs_at`: the staged inputs' slab,
-    /// the readout rows' table, the voxel store and the rs fold predicates,
-    /// each to
-    /// [`INPUTS_ALIGN`].
-    fn staged_runs(&self) -> [u64; 4] {
+    /// the readout rows' table, the voxel store, the rs fold predicates and
+    /// the host-resident experts' staging, each to [`INPUTS_ALIGN`].
+    fn staged_runs(&self) -> [u64; 5] {
         [
             self.inputs.bytes(),
             self.readout_rows.bytes() as u64,
             self.voxels.as_ref().map_or(0, crate::voxels::Store::bytes),
             self.predicate.bytes(),
+            self.expert_staging.bytes(),
         ]
         .map(|bytes| bytes.next_multiple_of(INPUTS_ALIGN))
     }
@@ -1668,8 +1703,8 @@ impl Shell {
         if let Some(buffers) = &self.buffers {
             buffers.lay_scratch(&mut self.pools)?;
         }
-        let [inputs, readouts, voxels, predicates] = self.staged_runs();
-        let staged = inputs + readouts + voxels + predicates;
+        let [inputs, readouts, voxels, predicates, experts] = self.staged_runs();
+        let staged = inputs + readouts + voxels + predicates + experts;
         self.pools
             .hold_activation_at(self.inputs_at, staged, false)?;
         let base = self.pools.activation_base() + self.inputs_at;
@@ -1680,6 +1715,9 @@ impl Shell {
             store.lay(base + inputs + readouts);
         }
         self.predicate.lay(base + inputs + readouts + voxels)?;
+        self.expert_staged = self
+            .expert_staging
+            .at(base + inputs + readouts + voxels + predicates);
         let Some(workspace) = &self.workspace else {
             return Ok(());
         };
@@ -1900,6 +1938,7 @@ fn footprint(shell: &Shell, device_total: u64, free_before: u64) -> Footprint {
         inputs: shell.inputs.bytes(),
         buffers: shell.buffer_bytes(),
         readout: shell.readout_rows.bytes() as u64,
+        experts: shell.expert_staging.bytes(),
         cache_rows: shell.pools.committed_bytes(),
         bodies: shell.cache.body_stats().census.bytes as u64,
     }
@@ -2042,6 +2081,7 @@ fn ledger(shell: &Shell, device_total: u64, free_before: u64) -> engine::memory:
     }
     ledger.enter(Class::Fire, "inputs", held.inputs);
     ledger.enter(Class::Fire, "readout rows", held.readout);
+    ledger.enter(Class::Fire, "staged experts", held.experts);
     // The heaps' chunks are this process's whatever load made them, and a
     // load carves its own cells from them (the readout rows among them),
     // so they are entered whole, less the cells entered by their owners,
@@ -2106,6 +2146,8 @@ struct Footprint {
     inputs: u64,
     buffers: u64,
     readout: u64,
+    /// The host-resident experts' staging (`experts::staging`).
+    experts: u64,
     cache_rows: u64,
     bodies: u64,
 }
@@ -2116,7 +2158,7 @@ impl core::fmt::Display for Footprint {
             f,
             "the device holds {} bytes, {} of them in use before this load began; this load \
              put down weights {}, activation arena {}, inputs {}, buffered activations {}, \
-             readout rows {}, cache rows {}, graph bodies {}",
+             readout rows {}, staged experts {}, cache rows {}, graph bodies {}",
             self.total,
             self.before,
             self.weights,
@@ -2124,6 +2166,7 @@ impl core::fmt::Display for Footprint {
             self.inputs,
             self.buffers,
             self.readout,
+            self.experts,
             self.cache_rows,
             self.bodies,
         )
