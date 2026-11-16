@@ -18,9 +18,12 @@
 //!   launches rotate through `engine::rates::weights_at(n, k)` weight planes, `engine::rates::WEIGHT_BYTES`
 //!   of them, several times what any last-level cache holds, so each reads
 //!   its weight from device memory as a layer's does.
-//! - `attn_flops_per_ns_by_keys`: the paged prefill attention at
+//! - `attn_flops_per_ns_by_keys_and_dim`: the paged prefill attention at
 //!   [`ATTN_SHAPE`]'s heads over each of [`ATTN_KEYS`] (a sequence of as many
-//!   rows attending itself), causal, in pages of [`PAGE`].
+//!   rows attending itself) and each head width of `ATTN_DIMS`, causal, in
+//!   pages of [`PAGE`]; its launches rotate through
+//!   `engine::rates::attn_sets_at` sets of q rows and kv pages, so each reads
+//!   them from device memory as a served layer's does.
 //! - `scan_elements_per_ns`: the causal conv and the chunked gated delta
 //!   scan at [`SCAN_SHAPE`].
 //! - `bytes_per_ns`: a [`COPY_BYTES`] device-to-device copy, read plus write.
@@ -346,17 +349,30 @@ mod on_device {
         let (q_heads, kv_heads) = (at.q_heads, at.kv_heads);
         let pages = rows.div_ceil(PAGE);
         let kv_width = kv_heads * d;
-        let cells = (pages * PAGE) as usize;
+        // `attn_sets_at` sets of q rows and kv pages, each fire the next
+        // set's, so each reads its q and kv from device memory as a served
+        // layer's do; the sets' pages share one pool.
+        let sets = engine::rates::attn_sets_at(at);
+        let cells = sets * (pages * PAGE) as usize;
+        let q_bytes = (rows * q_heads * d) as usize * 2;
         let keys = random.operand(cells * kv_width as usize * 2)?;
         let values = random.operand(cells * kv_width as usize * 2)?;
-        let q = random.operand((rows * q_heads * d) as usize * 2)?;
-        let o = zeroed((rows * q_heads * d) as usize * 2)?;
-        // The sequence's pages scattered over the pool as a served one's are.
-        let page_ids: Vec<i32> = engine::rates::attn_page_order(pages)
-            .into_iter()
-            .map(|p| p as i32)
-            .collect();
-        let indices = column(&page_ids)?;
+        let q = random.operand(sets * q_bytes)?;
+        let o = zeroed(q_bytes)?;
+        // Each set's pages scattered over its span of the pool as a served
+        // sequence's are.
+        let order = engine::rates::attn_page_order(pages);
+        let indices = (0..sets)
+            .map(|set| {
+                let first = set as u32 * pages;
+                column(
+                    &order
+                        .iter()
+                        .map(|&p| (first + p) as i32)
+                        .collect::<Vec<i32>>(),
+                )
+            })
+            .collect::<Result<Vec<Buffer>, String>>()?;
         let kv_indptr = [0, pages as i32];
         let indptr = column(&kv_indptr)?;
         let last = column(&[(rows - (pages - 1) * PAGE) as i32])?;
@@ -367,32 +383,34 @@ mod on_device {
         let i32s = |b: &Buffer, n: u32| Tensor::new(b.ptr(), n, 1, Dtype::I32);
         let plane = |b: &Buffer| Tensor::new(b.ptr(), cells as u32, kv_width, Dtype::Bf16);
         let absent = Tensor::new(0, 0, 0, Dtype::Bf16);
-        let pool = KvPool {
-            keys: plane(&keys),
-            values: plane(&values),
-            bf16_keys: absent,
-            bf16_values: absent,
-            key_scales: Tensor::ABSENT,
-            value_scales: Tensor::ABSENT,
-            page_indices: i32s(&indices, pages),
-            page_indptr: i32s(&indptr, 2),
-            last_page_lens: i32s(&last, 1),
-            row_valid: Tensor::ABSENT,
-            env_min: absent,
-            env_max: absent,
-            has_envelopes: false,
-            page_size: PAGE as i32,
-            seq_stride: i64::from(kv_width),
-            head_stride: i64::from(d),
-            layout: 0,
-            scheme_byte: 0,
-            block_size: 0,
-            max_pages_per_request: pages as i32,
-            pages_in_batch: pages as i32,
-            live: [0, 0],
-            page_stride: [0, 0],
-        }
-        .with_packed_stride();
+        let pool = |set: usize| {
+            KvPool {
+                keys: plane(&keys),
+                values: plane(&values),
+                bf16_keys: absent,
+                bf16_values: absent,
+                key_scales: Tensor::ABSENT,
+                value_scales: Tensor::ABSENT,
+                page_indices: i32s(&indices[set], pages),
+                page_indptr: i32s(&indptr, 2),
+                last_page_lens: i32s(&last, 1),
+                row_valid: Tensor::ABSENT,
+                env_min: absent,
+                env_max: absent,
+                has_envelopes: false,
+                page_size: PAGE as i32,
+                seq_stride: i64::from(kv_width),
+                head_stride: i64::from(d),
+                layout: 0,
+                scheme_byte: 0,
+                block_size: 0,
+                max_pages_per_request: pages as i32,
+                pages_in_batch: pages as i32,
+                live: [0, 0],
+                page_stride: [0, 0],
+            }
+            .with_packed_stride()
+        };
         let shape = Shape {
             num_requests: 1,
             lane_offset: 0,
@@ -431,15 +449,22 @@ mod on_device {
         )
         .map_err(say("the attention's plan"))?;
         plan.stage(ctx).map_err(say("the attention's plan"))?;
-        let fire = || {
+        let pools: Vec<KvPool> = (0..sets).map(pool).collect();
+        let fire = |i: usize| {
+            let set = i % sets;
             kernels_cuda::attn::prefill(
                 ctx,
                 RaggedTensor {
-                    data: Tensor::new(q.ptr(), rows, q_heads * d, Dtype::Bf16),
+                    data: Tensor::new(
+                        q.ptr() + (set * q_bytes) as u64,
+                        rows,
+                        q_heads * d,
+                        Dtype::Bf16,
+                    ),
                     indptr: i32s(&qo_at, 2),
                 },
                 &plan,
-                &pool,
+                &pools[set],
                 None,
                 d,
                 kv_heads,
@@ -447,8 +472,8 @@ mod on_device {
                 &mut Tensor::new(o.ptr(), rows, q_heads * d, Dtype::Bf16),
             )
         };
-        lay(held, fire)?;
-        let ns = clock.burst(ROUNDS, &mut |_| fire().map_err(say("the attention")))?;
+        lay(held, || fire(0))?;
+        let ns = clock.burst(ROUNDS, &mut |i| fire(i).map_err(say("the attention")))?;
         Ok(engine::rates::attn_flops(at) / ns)
     }
 
