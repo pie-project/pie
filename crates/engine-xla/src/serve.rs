@@ -152,6 +152,12 @@ pub struct Seated<'a> {
 
     pub held: Option<u32>,
 
+    /// The lane's set's committed boundary (`KvDelta::folded`, numbered as
+    /// `held`): column `c` of its mask is slot `folded + c`, and the slots
+    /// below it are read under the causal bound and no mask bit. 0 where
+    /// nothing is committed.
+    pub folded: u32,
+
     pub mask: Option<&'a Masking>,
 
     pub adapter: Option<u32>,
@@ -210,6 +216,7 @@ impl<'a> Seated<'a> {
             lane,
             pages: &[],
             held: None,
+            folded: 0,
             mask: None,
             adapter: None,
             positions: &[],
@@ -495,13 +502,7 @@ impl Shell {
                 device.kind()
             );
         }
-        let mut tuning = kernels_xla::tuning::Tuning::on(&chip, tpu.vmem_bytes());
-        // `PIE_XLA_MOE_GMM=0`: routed MLPs take no grouped-matmul (Mosaic)
-        // kernel, as the other Mosaic switches turn theirs off (a GPU
-        // plugin runs none).
-        if std::env::var("PIE_XLA_MOE_GMM").is_ok_and(|v| v == "0") {
-            tuning.moe_path = kernels_xla::tuning::MoePath::Auto { gmm: false };
-        }
+        let tuning = kernels_xla::tuning::Tuning::on(&chip, tpu.vmem_bytes());
         let engine = crate::chip::Engine::of(&chip);
         let pad = engine.pad;
         let mut boot = Boot {
@@ -621,11 +622,7 @@ impl Shell {
 
         // Windowed kv rows live in their own pool, a window per sequence
         // (engine-cuda `serve/load.rs`).
-        let window = if boot.device.window_pool {
-            crate::store::window_of(&boot.trace)?
-        } else {
-            None
-        };
+        let window = crate::store::window_of(&boot.trace)?;
         let paging_at = |pages: u64, slots: u32| -> Result<Paging> {
             Ok(Paging::of(boot.page_size, boot.context, slots, pages)?
                 .windowed(window, boot.budget.max_tokens)
@@ -688,15 +685,20 @@ impl Shell {
         // a lane at the most lanes a fire holds (at its rung), one a frame
         // in flight and one: a fire writes its readout rows into the next
         // in place, and every fire's plane has one shape, so the guest
-        // stages and host gathers reading it take one shape too. A fire
-        // reading more (a drafter's verify, up to `readouts_per_lane` rows
-        // a lane) returns its own plane, as before: laid for those, the
-        // rings would take 16 times the bytes (qwen3-0.6b c64: 2.2 GiB).
+        // stages and host gathers reading it take one shape too. No fire
+        // reads out more: the load states the ring's rows as its store
+        // (`ReadoutFacts::store_rows`), and the runtime cuts a fire's
+        // sequence lanes to them (a drafter's verify, up to
+        // `readouts_per_lane` rows a lane, fires fewer lanes). A float
+        // output (a kv-less lane's rows, token-shaped) lands in a ring of
+        // the top row rung's rows. Nothing is laid per fire.
         let readout_cap =
             poem_exec::fire::rung_of(&budgets.tokens.buckets, budgets.tokens.max_lanes);
         let readout_exports = poem_exec::feeds::class_outputs(&boot.trace, &compiled, boot.context, boot.page_size)
             .map_err(|why| Fault::Unbound { what: why })?;
-        let readout_specs = fixed_readouts(&readout_exports, readout_cap);
+        let top_tokens = budgets.tokens.buckets.last().copied().unwrap_or(0);
+        let readout_specs =
+            fixed_readouts(&boot.trace, &readout_exports, readout_cap, top_tokens);
         // As many fires as can be outstanding: the frames in flight of at
         // most `STEPS_MAX` fires each, and the one being written
         // (`Runahead::staging_depth`, the staging ring's own count). A ring
@@ -897,6 +899,19 @@ impl Shell {
                 (root, spec.dtype, spec.rows, spec.width)
             })
             .collect();
+        for spec in &readout_specs {
+            let names: Vec<&str> =
+                spec.exports.iter().map(|&e| readout_exports[e].decl.name.as_str()).collect();
+            tracing::info!(
+                outputs = ?names,
+                rows = spec.rows,
+                width = spec.width,
+                layers = spec.layers,
+                mib = (readout_depth as u64 * u64::from(spec.rows) * u64::from(spec.width) * 4)
+                    >> 20,
+                "xla readout ring laid"
+            );
+        }
         pools.lay_readouts(&device, &rings, readout_depth)?;
         tracing::info!(
             outputs = readout_specs.len(),
@@ -1248,6 +1263,15 @@ impl Shell {
     }
 
     #[must_use]
+    /// The rows a fire's sequence readouts land in (their ring's rows a
+    /// layer, `ReadoutFacts::store_rows`); `None` where the load reads out
+    /// no sequence rows.
+    pub fn readout_store_rows(&self) -> Option<u32> {
+        (self.readout_specs.iter())
+            .find(|spec| spec.exports.iter().any(|&e| self.exports[e].decl.readout))
+            .map(|spec| spec.cap)
+    }
+
     pub fn pools(&self) -> &Pools {
         &self.pools
     }
@@ -1931,6 +1955,7 @@ impl Shell {
                     base,
                     folded,
                     fold,
+                    lineage,
                 } => {
                     let id = rs_shape.ok_or_else(|| Fault::Program {
                         at: "serve::rs",
@@ -1941,14 +1966,17 @@ impl Shell {
                         base: *base,
                         folded: *folded,
                         fold: *fold,
+                        lineage: *lineage,
                     }
                 }
                 engine::fire::RsVerb::Fold => engine::fire::RsVerb::Fold,
             });
-            if let engine::fire::RsVerb::Buffer { folded, .. } = seated.rs {
-                let rows = seated.lane.tokens.len() as u32;
+            if let engine::fire::RsVerb::Buffer {
+                folded, lineage, ..
+            } = seated.rs
+            {
                 let first = seated.first.unwrap_or(have);
-                let reads = engine::fire::buffered_reads(seated.mask, *folded, first, rows)
+                let reads = engine::fire::buffered_reads(seated.mask, *folded, first, *lineage)
                     .map_err(|e| Fault::Program {
                         at: "serve::rs",
                         why: format!("lane {at}: {e}"),
@@ -2024,6 +2052,7 @@ impl Shell {
                 masks.push(crate::mask::LaneMask {
                     mask: None,
                     have: 0,
+                    folded: 0,
                     rows: row.rows,
                     wide: false,
                 });
@@ -2097,6 +2126,7 @@ impl Shell {
             masks.push(crate::mask::LaneMask {
                 mask: kv_mask,
                 have,
+                folded: seated.folded.min(have),
                 rows: row.rows,
                 wide: self.wide.contains(row.class as usize),
             });
@@ -2826,11 +2856,10 @@ impl Shell {
             }
             None => Vec::new(),
         };
-        let returned = planes.iter().filter(|plane| plane.fixed.is_none()).count();
-        if outs.len() != returned {
+        if !outs.is_empty() {
             return Err(Fault::Unbound {
                 what: format!(
-                    "{returned} output planes, of which the program returned {}",
+                    "{} output planes the program returned, past the rings every plane lands in",
                     outs.len()
                 ),
             });
@@ -2863,20 +2892,14 @@ impl Shell {
                 *slot = seat.have + seat.rows;
             }
         }
-        // Each plane's buffer: a ring's plane where the fire wrote one, else
-        // what it returned, in order.
-        let mut returned = outs.into_iter();
+        // Each plane's buffer: the ring's plane the fire wrote.
         let mut buffers: Vec<std::sync::Arc<crate::pjrt::Buffer>> =
             Vec::with_capacity(planes.len());
         for plane in &planes {
-            buffers.push(match plane.fixed {
-                Some((ring, _)) => self.pools.readout_current(ring).ok_or_else(|| Fault::Unbound {
-                    what: format!("readout ring {ring}'s plane, which the fire did not return"),
-                })?,
-                None => std::sync::Arc::new(returned.next().ok_or_else(|| Fault::Unbound {
-                    what: "an output plane, which the program did not return".to_string(),
-                })?),
-            });
+            let (ring, _) = plane.fixed;
+            buffers.push(self.pools.readout_current(ring).ok_or_else(|| Fault::Unbound {
+                what: format!("readout ring {ring}'s plane, which the fire did not write"),
+            })?);
         }
         let host = match host.filter(|table| table.at.iter().any(Option::is_some)) {
             Some(table) => Some(self.host_rows(table, &planes, &buffers)?),
@@ -2942,21 +2965,44 @@ impl Shell {
                     })
                 })
                 .collect::<Result<Vec<Tensor>>>()?;
-            let fixed = (out.decl.readout)
-                .then(|| {
-                    (self.readout_specs.iter())
-                        .position(|spec| spec.exports.contains(&export) && readouts <= spec.cap)
-                })
-                .flatten()
-                .map(|ring| (u16::try_from(ring).unwrap_or(u16::MAX), readouts));
+            // The rows this fire writes: its readout rows, or every row of a
+            // float output.
+            let rows = if out.decl.readout { readouts } else { handles[0].rows };
+            let Some(ring) =
+                (self.readout_specs.iter()).position(|spec| spec.exports.contains(&export))
+            else {
+                // An output whose row grows with the keys a row attends
+                // (`attn.scores`): a program's term at the rung its guest cut
+                // allows, a family the ladder does not enumerate yet. Refused,
+                // never laid for one fire.
+                return Err(Fault::Program {
+                    at: "serve::scored_fire",
+                    why: format!(
+                        "this fire reads output `{}` ({} layers of {} columns a row), whose \
+                         row grows with the keys it attends: a program's term, which no load \
+                         lays and the warm ladder does not enumerate yet",
+                        out.decl.name, out.decl.layers, out.decl.width
+                    ),
+                });
+            };
+            let cap = self.readout_specs[ring].cap;
+            if rows > cap {
+                return Err(Fault::Program {
+                    at: "serve::readout_plane",
+                    why: format!(
+                        "output `{}` reads out {rows} rows of a fire of {} lanes, past the {cap} \
+                         its ring holds: the load's store bounds a fire's readouts \
+                         (`ReadoutFacts::store_rows`)",
+                        out.decl.name,
+                        composition.lanes().len()
+                    ),
+                });
+            }
+            let fixed = (u16::try_from(ring).unwrap_or(u16::MAX), rows);
             planes.push(PlaneShape {
                 export,
                 fixed,
-                rows: match fixed {
-                    Some((ring, _)) => self.readout_specs[usize::from(ring)].cap,
-                    None if out.decl.readout => readouts,
-                    None => handles[0].rows,
-                },
+                rows: cap,
                 width: handles[0].width,
                 dtype: if out.decl.dtype == Dtype::I32 {
                     Dtype::I32
@@ -3338,7 +3384,8 @@ impl Shell {
                     Ok(f.convert(picked, elem))
                 })?);
             }
-            if let Some((ring, _)) = plane.fixed {
+            {
+                let (ring, _) = plane.fixed;
                 // Into the ring's next plane, in place: each layer's rows at
                 // the top of its `cap` rows (outputs of one value share a
                 // ring, written once).
@@ -3360,10 +3407,6 @@ impl Shell {
                 }
                 continue;
             }
-            extras.push(match layers.as_slice() {
-                [one] => *one,
-                _ => tracer.with(|f| f.concat(&layers, 0))?,
-            });
         }
         if let Some(seat) = pixels {
             for (value, what) in [(seat.plane, "plane"), (seat.grid, "grid")] {
@@ -3565,7 +3608,7 @@ struct PlaneShape {
     dtype: Dtype,
     /// The readout ring this plane lands in, and the readout rows the fire
     /// writes there (`rows` is then the ring's plane rows a layer).
-    fixed: Option<(u16, u32)>,
+    fixed: (u16, u32),
 }
 
 /// One readout ring: the exports landing in it (outputs of one value share
@@ -3580,16 +3623,42 @@ pub(crate) struct FixedReadout {
     pub width: u32,
 }
 
-/// The readout rings a load lays: every readout output a fire returns as a
-/// plane (f32 or i32 on the device, no clips of its own), outputs of one
-/// value sharing a ring.
-fn fixed_readouts(exports: &[poem_exec::feeds::ClassOutput], cap: u32) -> Vec<FixedReadout> {
+/// The rings a load lays: every output a fire returns as a plane (f32 or
+/// i32 on the device, no clips of its own), outputs of one value sharing a
+/// ring. A sequence readout's ring holds `cap` rows a layer (the rows a
+/// fire's sequence lanes read out, `ReadoutFacts::store_rows`). Past them,
+/// what makes a ring sizeable at load: an output whose row width is fixed by
+/// the model (token-shaped, whatever its class: a DiT's or encoder's
+/// outputs, a beam's device-read logits) gets a ring of `tokens` rows, the
+/// top row rung's, its bytes on the load line; an output whose row grows
+/// with the keys a row attends (`attn.scores`: layers x keys, written by
+/// `Attn::ScoreCapture`) is a program's term, cut by the guest cut, never a
+/// load's, and a fire reading one is refused by name until the scored
+/// family is in the warm ladder. No fire writes a plane of its own.
+fn fixed_readouts(
+    trace: &poem_ir::Trace,
+    exports: &[poem_exec::feeds::ClassOutput],
+    cap: u32,
+    tokens: u32,
+) -> Vec<FixedReadout> {
+    // The values a score capture writes: rows as wide as the keys attended.
+    let keyed: Vec<ValueId> = (trace.nodes.iter())
+        .filter_map(|node| match &node.op {
+            poem_ir::Operation::Attn(poem_ir::ops::attn::Attn::ScoreCapture { scores, .. }) => {
+                Some(*scores)
+            }
+            _ => None,
+        })
+        .collect();
     let mut out: Vec<FixedReadout> = Vec::new();
     let mut values: Vec<Vec<ValueId>> = Vec::new();
     for (at, export) in exports.iter().enumerate() {
         let decl = &export.decl;
-        if !decl.readout
-            || export.grid.is_some()
+        if !decl.readout && export.values.iter().any(|v| keyed.contains(v)) {
+            continue;
+        }
+        let cap = if decl.readout { cap } else { tokens };
+        if export.grid.is_some()
             || !matches!(decl.dtype, Dtype::Bf16 | Dtype::F32 | Dtype::I32)
             || cap == 0
         {

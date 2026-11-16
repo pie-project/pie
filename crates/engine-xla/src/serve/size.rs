@@ -119,6 +119,12 @@ impl Shell {
                 }
             })
             .collect();
+        // The most rows a fire reads out, the store's (`readout_store_rows`),
+        // shared over the lanes: each reads out its last rows up to its
+        // share, so the widest fire reads out what a served one can and no
+        // more (it once read every row, past the ring).
+        let store = self.readout_store_rows().unwrap_or(u32::MAX);
+        let share = (store / lanes.max(1)).max(1);
         // Every lane at the page bound: its slot's every page, its rows
         // last.
         let owned: Vec<(Vec<u32>, Vec<u32>, crate::store::Scratch, Option<Masking>)> = rows
@@ -127,7 +133,7 @@ impl Shell {
                 let n = n.min(context);
                 (
                     vec![0; n as usize],
-                    (0..n).collect(),
+                    (n.saturating_sub(share)..n).collect(),
                     self.pools.scratch(0, context.div_ceil(page) as usize),
                     with_mask.then(|| {
                         Masking::Extent(Mask {
@@ -154,6 +160,7 @@ impl Shell {
                         base: 0,
                         folded: first.saturating_sub(carried),
                         fold: FoldLen::Host(carried),
+                        lineage: engine::fire::Lineage::Set,
                     }
                 } else {
                     RsVerb::Fold

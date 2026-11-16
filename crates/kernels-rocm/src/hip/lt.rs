@@ -20,8 +20,24 @@ pub struct Refused {
 
 impl core::fmt::Display for Refused {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "`{}` answered {}", self.call, self.status)
+        if self.status == ABSENT {
+            write!(f, "`{}` has no hipBLASLt to call: the library did not load", self.call)
+        } else {
+            write!(f, "`{}` answered {}", self.call, self.status)
+        }
     }
+}
+
+/// The status a call is refused with where hipBLASLt did not load.
+const ABSENT: LtStatus = -1;
+
+/// hipBLASLt, which every dense product above a decode's few rows calls: a
+/// box without it is refused by name, at the load ([`open`]) and at a call.
+fn library(call: &'static str) -> Result<&'static sys::Hipblaslt, Refused> {
+    sys::hipblaslt().map_err(|_| Refused {
+        call,
+        status: ABSENT,
+    })
 }
 
 fn answered(call: &'static str, status: LtStatus) -> Result<(), Refused> {
@@ -135,11 +151,9 @@ fn device_of<'a>(
 
 /// Creates the current device's hipBLASLt handle now (its device memory,
 /// about 26 MiB, taken at create), so no product's first call takes it
-/// after the load sized its pools. A no-op where hipBLASLt is not offered.
+/// after the load sized its pools. Refused where hipBLASLt does not load.
 pub fn open() -> Result<(), Refused> {
-    let Ok(lt) = sys::hipblaslt() else {
-        return Ok(());
-    };
+    let lt = library("hipblasLtCreate")?;
     let mut devices = registry().lock().expect("lock poisoned");
     device_of(lt, &mut devices).map(|_| ())
 }
@@ -272,6 +286,9 @@ impl Plan {
                 for layout in [a, b, d] {
                     (lt.hipblasLtMatrixLayoutDestroy)(layout);
                 }
+                // A heuristic that fails is a fault; one that answers no
+                // algorithm says the shape is not hipBLASLt's.
+                answered("hipblasLtMatmulAlgoGetHeuristic", status)?;
                 return Ok(None);
             }
             Ok(Some(Self {
@@ -285,9 +302,9 @@ impl Plan {
     }
 }
 
-/// Enqueues `y = x · wᵀ (+ bias)` on `stream`. `Ok(false)` when hipBLASLt is
-/// absent or offers no algorithm for the shape, so the caller takes another
-/// tactic.
+/// Enqueues `y = x · wᵀ (+ bias)` on `stream`. `Ok(false)` when hipBLASLt
+/// offers no algorithm for the shape, which the caller then runs on
+/// rocBLAS; a hipBLASLt that did not load is refused.
 ///
 /// # Safety
 /// `x`, `w`, `y` (and `bias` when the shape has one) must be live device
@@ -303,9 +320,7 @@ pub unsafe fn matmul(
     stream: Stream,
 ) -> Result<bool, Refused> {
     const CALL: &str = "hipblasLtMatmul";
-    let Ok(lt) = sys::hipblaslt() else {
-        return Ok(false);
-    };
+    let lt = library(CALL)?;
     let mut devices = registry().lock().expect("lock poisoned");
     let dev = device_of(lt, &mut devices)?;
     let handle = dev.handle;

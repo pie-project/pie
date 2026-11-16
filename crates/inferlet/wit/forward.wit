@@ -84,9 +84,14 @@ interface forward {
         /// own. Set before `program`.
         group: func(lane: u32, id: u32) -> result<_, error>;
 
-        /// `[rows, n]` bools: per row, the slots `[0, kv-len)` it attends when
-        /// lanes read kv, else its attention group's rows in lane order. Set
-        /// before `program`.
+        /// `[rows, n]` bools. Where lanes read kv: per row, which slots of its
+        /// working set's buffer and of the pass's own rows it attends. Column
+        /// `c` is slot `folded + c`, `folded` the set's frozen length when the
+        /// pass runs; `n` covers the buffer and the lane's rows. The frozen
+        /// part is not the mask's: every row attends it under the model's own
+        /// bounds. A row attends no row of its lane after it, whatever its
+        /// bits say. Where lanes read no kv: per row, its attention group's
+        /// rows in lane order. Set before `program`.
         mask: func(rows: borrow<channel>) -> result<_, error>;
 
         /// Bind an optional readout-index channel separately from embedding.

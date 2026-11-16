@@ -39,6 +39,12 @@ pub struct TuneArgs {
     /// Fit the measurements the last run kept, without measuring again.
     #[arg(long)]
     pub refit: bool,
+
+    /// Time only the dense GEMM tactics each checked model's served load
+    /// arms (CUDA), into the user's table beside their profile, with no
+    /// profile search; the profile is not written.
+    #[arg(long)]
+    pub gemm_only: bool,
 }
 
 pub fn run(args: TuneArgs) -> Result<Answer> {
@@ -76,6 +82,12 @@ pub fn run(args: TuneArgs) -> Result<Answer> {
     let mut say = |line: &str| eprintln!("{}", palette.dim(line));
     let artifacts = crate::paths::pie_home().join("artifacts");
     let cache = crate::paths::pie_home().join("tune");
+    #[cfg(feature = "engine-cuda")]
+    let home = crate::paths::pie_home();
+    #[cfg(feature = "engine-cuda")]
+    let served_cuda = |artifact: &std::path::Path| {
+        worker::backend::served_cuda(artifact, &home).map_err(|e| format!("{e:#}"))
+    };
     let req = runtime::engine::profiles::TuneRequest {
         full: args.full,
         profiles: &dir,
@@ -84,6 +96,9 @@ pub fn run(args: TuneArgs) -> Result<Answer> {
         no_check: args.no_check,
         cache: &cache,
         refit: args.refit,
+        gemm_only: args.gemm_only,
+        #[cfg(feature = "engine-cuda")]
+        served_cuda: &served_cuda,
     };
     let tuned = tune(&req, &mut say).map_err(|e| anyhow!(e))?;
 
@@ -116,6 +131,10 @@ pub fn run(args: TuneArgs) -> Result<Answer> {
                 "  <- slower or different"
             }
         ));
+    }
+    if args.gemm_only {
+        out.push_str("--gemm-only: the dense GEMM tactics were timed into the user's table; the profile is not written\n");
+        return Ok(text(out));
     }
     if args.dry_run {
         out.push_str("\n--dry-run: nothing written. The profile:\n\n");

@@ -156,6 +156,9 @@ pub struct Seated<'a> {
     pub inputs: &'a [engine::fire::InputFeed],
     pub pages: &'a [u32],
     pub held: Option<u32>,
+    /// The set's committed boundary (`KvDelta::folded`): the lane's mask
+    /// speaks of the keys from it on.
+    pub folded: u32,
     pub mask: Option<&'a Masking>,
     /// A lane with no KV of its own: its mask is over its attention group.
     pub kv_less: bool,
@@ -200,6 +203,7 @@ impl<'a> Seated<'a> {
             inputs: &[],
             pages: &[],
             held: None,
+            folded: 0,
             mask: None,
             kv_less: false,
             adapter: None,
@@ -2047,6 +2051,7 @@ impl Shell {
                         base: 0,
                         folded: 0,
                         fold: engine::fire::FoldLen::Host(0),
+                        lineage: engine::fire::Lineage::Set,
                     },
                     0,
                 ),
@@ -2056,6 +2061,7 @@ impl Shell {
                         base: 0,
                         folded: 0,
                         fold: engine::fire::FoldLen::Host(held),
+                        lineage: engine::fire::Lineage::Set,
                     },
                     held,
                 ),
@@ -2910,6 +2916,13 @@ impl Shell {
     }
 
     /// Seat `slot`'s state rows, one after another.
+    /// The planes [`Shell::state_bytes`] lays end to end: each state row's
+    /// trace cache index, bytes and dtype.
+    #[must_use]
+    pub fn state_planes(&self) -> Vec<(u32, u64, Dtype)> {
+        self.pools.state_planes()
+    }
+
     pub fn state_bytes(&mut self, slot: u32) -> Result<Vec<u8>> {
         self.drain()?;
         let record = self.pools.record(None, slot)?;
@@ -3796,6 +3809,9 @@ impl Shell {
         let mut tokens: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut positions: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut rotations: Vec<i32> = Vec::with_capacity(rows as usize);
+        // Each row's stated position, the mrope table's fill where a row
+        // carries no stream of its own.
+        let mut stated_rows: Vec<i32> = Vec::with_capacity(rows as usize);
         // Each band's lane and row tables of record piece ids, filled lane
         // by lane and joined band after band below.
         let widths = self.pools.bands();
@@ -3939,6 +3955,7 @@ impl Shell {
             masks.push(crate::mask::LaneMask {
                 mask: masking,
                 have,
+                folded: seated.folded.min(have),
                 rows: row.rows,
                 wide: self.wide.contains(row.class as usize),
             });
@@ -4064,6 +4081,7 @@ impl Shell {
                     base,
                     folded,
                     fold,
+                    lineage,
                 } => {
                     let ahead = held_key.and_then(|key| self.frozen_ahead.get(&key).copied());
                     let folded = match ahead {
@@ -4082,6 +4100,7 @@ impl Shell {
                         base: *base,
                         folded,
                         fold: *fold,
+                        lineage: *lineage,
                     }
                 }
                 verb => verb.clone(),
@@ -4199,8 +4218,11 @@ impl Shell {
                             .collect(),
                         None => rows.clone(),
                     };
-                    positions.extend(if self.states_mrope { &rows } else { &stated });
-                    rotations.extend(stated);
+                    // The causal bound is the row order, the cache row; a
+                    // stated position rotates the row and bounds nothing.
+                    positions.extend(&rows);
+                    rotations.extend(if self.states_mrope { &rows } else { &stated });
+                    stated_rows.extend(&stated);
                     match &device_writes[source] {
                         Some((slots, offsets)) => {
                             for (&page, &off) in slots.iter().zip(offsets) {
@@ -4223,10 +4245,12 @@ impl Shell {
                             .positions
                             .get(at)
                             .map_or(row, |&p| narrow(u64::from(p)));
-                        // With mrope the rotation rides its own table, and the
-                        // plain one is the causal bound: a KV row.
-                        positions.push(if self.states_mrope { row } else { stated });
-                        rotations.push(stated);
+                        // The causal bound is the row order, the cache row; a
+                        // stated position rotates the row and bounds nothing.
+                        // With mrope the rotation rides its own table.
+                        positions.push(row);
+                        rotations.push(if self.states_mrope { row } else { stated });
+                        stated_rows.push(stated);
                         request_of_token.push(at_lane);
                     }
                     writes.extend(std::iter::repeat_n(None, rows_here));
@@ -4382,6 +4406,7 @@ impl Shell {
                 enabled: self.copies && masks.iter().all(|lane| lane.mask.is_none()),
                 page_tables: &geometries,
                 positions: &positions,
+                rotations: &rotations,
                 request_of_token: &request_of_token,
             },
         )?;
@@ -4460,7 +4485,7 @@ impl Shell {
                     }
                     None => {
                         for i in 0..row.rows as usize {
-                            let p = rotations[row.row_offset as usize + i];
+                            let p = stated_rows[row.row_offset as usize + i];
                             mrope_positions[at + 3 * i] = p;
                             mrope_positions[at + 3 * i + 1] = p;
                             mrope_positions[at + 3 * i + 2] = p;
@@ -4737,6 +4762,7 @@ impl Shell {
                 tokens: &tokens,
                 readout_rows: &readout_rows,
                 positions: &positions,
+                rotations: &rotations,
                 windows: &boundaries,
                 slot_ids: &slot_ids,
                 slot_of_row: &slot_of_row,
@@ -4828,6 +4854,7 @@ impl Shell {
         let bindings = FireBindings {
             tokens: bound.tokens,
             positions: bound.positions,
+            rotations: bound.rotations,
             adapter_routes: bound.adapter_routes,
             readout_rows: bound.readout_rows,
             readout_indptr,

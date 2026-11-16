@@ -4,6 +4,11 @@ use engine_metal::encode::Sink;
 use kernels_metal::{KvPool, PrefillPlan, RaggedTensor, Tensor, attn};
 use poem_ir::Dtype;
 
+/// A row's mask words, one u32 a row (its enable flag, its boundary 0).
+fn mask_words(v: &[u32]) -> Vec<u8> {
+    v.iter().flat_map(|w| w.to_le_bytes()).collect()
+}
+
 fn bf(x: f32) -> f32 {
     let b = x.to_bits();
     f32::from_bits((b + 0x7fff + ((b >> 16) & 1)) & 0xffff0000)
@@ -105,13 +110,13 @@ fn mpp_attention_over_a_bf16_pool_matches_fp64() {
         for (window, mode) in [(None, 0u8), (Some(19u32), 1), (None, 1), (None, 2)] {
             let mask: Vec<u8> = (0..m * np * page).map(|i| u8::from(i % 7 != 0)).collect();
             let mb = upload(&mask);
-            let eb = upload(&vec![mode; m]);
+            let eb = upload(&mask_words(&vec![u32::from(mode); m]));
             let plan = PrefillPlan {
                 positions: tensor(&po, m, 1, Dtype::I32),
                 last_page_len: tensor(&po, m, 1, Dtype::I32),
                 request_of_token: tensor(&ow, m, 1, Dtype::I32),
                 mask: tensor(&mb, mask.len(), 1, Dtype::U8),
-                mask_enabled: tensor(&eb, m, 1, Dtype::U8),
+                mask_enabled: tensor(&eb, m, 1, Dtype::U32),
                 mask_stride: (np * page) as u32,
             };
             let scale = 1. / (d as f32).sqrt();

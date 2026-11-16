@@ -44,12 +44,11 @@ pub fn outputs_bindable(ops: &[OpView], region: &Region) -> Result<(), EmitError
 
 pub fn nucleus_library_region_valid(stage: &CompiledStage, region: &Region) -> bool {
     let value_types = &stage.normalized.value_types;
-    let scaled = region.inputs.len() == 5;
     if !is_library(region)
         || library_op_byte(region) != LibraryOp::NucleusSample as u8
         || region.schedule != ScheduleTemplate::Library
         || region.nodes.len() != 13
-        || !(region.inputs.len() == 3 || scaled)
+        || region.inputs.len() != 3
         || region.outputs.len() != 1
         || !region.sinks.is_empty()
         || region
@@ -60,28 +59,17 @@ pub fn nucleus_library_region_valid(stage: &CompiledStage, region: &Region) -> b
     {
         return false;
     }
-    let raw_logits_type = &value_types[region.inputs[0] as usize];
-    let scale_type = &value_types[region.inputs[if scaled { 1 } else { 0 }] as usize];
-    let logits_type = &value_types[region.inputs[if scaled { 2 } else { 0 }] as usize];
-    let top_p_type = &value_types[region.inputs[if scaled { 3 } else { 1 }] as usize];
-    let state_type = &value_types[region.inputs[if scaled { 4 } else { 2 }] as usize];
+    let logits_type = &value_types[region.inputs[0] as usize];
+    let top_p_type = &value_types[region.inputs[1] as usize];
+    let state_type = &value_types[region.inputs[2] as usize];
     let output_type = &value_types[region.outputs[0] as usize];
     if logits_type.dtype != Dtype::F32 || logits_type.dims.is_empty() || logits_type.dims.len() > 2
-    {
-        return false;
-    }
-    if raw_logits_type.dtype != Dtype::F32
-        || raw_logits_type.dims.is_empty()
-        || raw_logits_type.dims.last() != logits_type.dims.last()
     {
         return false;
     }
     let row_dims = &logits_type.dims[..logits_type.dims.len() - 1];
     top_p_type.dtype == Dtype::F32
         && (top_p_type.dims.is_empty() || top_p_type.dims.len() == row_dims.len())
-        && (!scaled
-            || (scale_type.dtype == Dtype::F32
-                && (scale_type.dims.is_empty() || scale_type.dims.len() == row_dims.len())))
         && state_type.dtype == Dtype::U32
         && state_type.dims.len() == 1
         && state_type.dims[0] == Dimension::Static(2)

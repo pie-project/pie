@@ -4,11 +4,11 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use serde::Deserialize;
 
 pub use crate::boot::{Embedded, Engine, Loaded, Summary};
-use crate::config::removed::{self, Removed};
+use crate::config::retired;
 use crate::config::{ByteSize, Config, EngineKind, Runahead};
 
 /// The knobs an app sets (`PieServer.Configuration` in Swift and Kotlin, the
@@ -38,24 +38,6 @@ pub struct Settings {
     /// See [`crate::config::RuntimeConfig::frame_dispatch_depth`].
     pub frame_dispatch_depth: u32,
     pub verbose: bool,
-    #[serde(skip_serializing)]
-    pub max_forward_tokens: Removed<removed::MaxForwardTokens>,
-    #[serde(skip_serializing)]
-    pub max_forward_requests: Removed<removed::MaxForwardRequests>,
-    #[serde(skip_serializing)]
-    pub max_state_slots: Removed<removed::MaxStateSlots>,
-    #[serde(skip_serializing)]
-    pub max_model_len: Removed<removed::MaxModelLen>,
-    #[serde(skip_serializing)]
-    pub device_kv_budget: Removed<removed::DeviceKvBudget>,
-    #[serde(skip_serializing)]
-    pub device_memory_share: Removed<removed::DeviceMemoryShare>,
-    #[serde(skip_serializing)]
-    pub memory_tolerance: Removed<removed::MemoryTolerance>,
-    #[serde(skip_serializing)]
-    pub max_voxels: Removed<removed::MaxVoxels>,
-    #[serde(skip_serializing)]
-    pub max_clips: Removed<removed::MaxClips>,
 }
 
 impl Default for Settings {
@@ -71,15 +53,6 @@ impl Default for Settings {
             frame_size: u32::from(Runahead::STEPS_MAX),
             frame_dispatch_depth: 2,
             verbose: false,
-            max_forward_tokens: Removed::default(),
-            max_forward_requests: Removed::default(),
-            max_state_slots: Removed::default(),
-            max_model_len: Removed::default(),
-            device_kv_budget: Removed::default(),
-            device_memory_share: Removed::default(),
-            memory_tolerance: Removed::default(),
-            max_voxels: Removed::default(),
-            max_clips: Removed::default(),
         }
     }
 }
@@ -87,10 +60,15 @@ impl Default for Settings {
 impl Settings {
     /// TOML, or the same document as JSON.
     pub fn parse(text: &str) -> Result<Self> {
-        if text.trim_start().starts_with('{') {
-            return serde_json::from_str(text).context("parse the settings");
-        }
-        toml::from_str(text).context("parse the settings")
+        let parsed = if text.trim_start().starts_with('{') {
+            serde_json::from_str(text).map_err(|e| e.to_string())
+        } else {
+            toml::from_str(text).map_err(|e: toml::de::Error| e.message().to_string())
+        };
+        parsed.map_err(|e| {
+            let why = retired::explain_settings(&e).unwrap_or(e);
+            anyhow!("parse the settings: {why}")
+        })
     }
 
     /// The worker config that serves `artifact` from `home`: this build's
@@ -200,5 +178,32 @@ mod tests {
             .config(Path::new("model.zt"), Path::new("home"))
             .expect("the default settings validate");
         assert_eq!(config.runtime.frame_size, u32::from(Runahead::STEPS_MAX));
+    }
+
+    /// An app's settings that still state a retired key are refused with
+    /// what became of it, as JSON and as TOML; the current keys load.
+    #[test]
+    fn a_retired_setting_is_refused_by_name() {
+        let err = Settings::parse(r#"{"max_model_len": 8192}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("`max_model_len` was renamed to `max_context`"),
+            "{err}"
+        );
+        let err = Settings::parse("max_forward_requests = 8\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("`max_forward_requests` is no longer a setting: "),
+            "{err}"
+        );
+        let err = Settings::parse(r#"{"max_contxt": 8192}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown field `max_contxt`"), "{err}");
+        let settings = Settings::parse(r#"{"max_context": 8192, "budget_device": "1GiB"}"#)
+            .expect("the current keys load");
+        assert_eq!(settings.max_context, 8192);
     }
 }

@@ -1049,10 +1049,10 @@ impl Bodies {
         if !run.capturable() {
             if warmed == WARM_FIRES {
                 eprintln!(
-                    "engine-cuda: body {key} declines to capture — a schedule it \
-                     built refused its graph form ({}), so `graph_capturable` \
-                     is false and this composition walks eagerly for good. The \
-                     prefill float grant is sized at the lattice's top rung in \
+                    "engine-cuda: body {key} declines to capture ({}), so this \
+                     composition walks eagerly for good, each serving fire counted \
+                     unrecorded. A prefill schedule that refused its graph form: \
+                     the prefill float grant is sized at the lattice's top rung in \
                      `inputs::reserve` (`prefill_float_bytes`); a bucket that \
                      outgrows it is this line.",
                     run.uncapturable_why().join("; ")

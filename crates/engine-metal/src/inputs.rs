@@ -77,7 +77,10 @@ struct TableAt {
 #[derive(Debug, Clone)]
 pub struct Handles {
     pub tokens: Tensor,
+    /// Each row's cache row: what its attention is bounded by.
     pub positions: Tensor,
+    /// Each row's stated position: what rotates it.
+    pub rotations: Tensor,
     pub windows: u32,
     pub page_tables: Vec<TableHandles>,
     pub slot_ids: Tensor,
@@ -150,6 +153,7 @@ pub struct TableHandles {
 pub struct Fire<'a> {
     pub tokens: &'a [i32],
     pub positions: &'a [i32],
+    pub rotations: &'a [i32],
     pub windows: &'a [i32],
     pub slot_ids: &'a [i32],
     pub slot_of_row: &'a [i32],
@@ -357,6 +361,7 @@ pub struct Inputs {
     store: Region,
     tokens: u64,
     positions: u64,
+    rotations: u64,
     windows: u64,
     window_ints: u64,
     row_valid: u64,
@@ -412,7 +417,7 @@ pub fn window_ints(
     let lanes = u64::from(budget.max_lanes);
     let pages = u64::from(budget.max_lanes) * u64::from(paging.pages_per_slot);
     let intervals = (classes * (classes + 1) / 2) as u64;
-    let per_gathered = 3 * rows + page_tables as u64 * (2 * lanes + (lanes + 1) + pages);
+    let per_gathered = 4 * rows + page_tables as u64 * (2 * lanes + (lanes + 1) + pages);
     (intervals + 1 + gathered as u64) * (lanes + 1) + gathered as u64 * per_gathered
 }
 
@@ -455,6 +460,7 @@ impl Inputs {
         };
         let tokens = take(rows * 4);
         let positions = take(rows * 4);
+        let rotations = take(rows * 4);
         let windows = take(window_ints * 4);
         let row_valid = take(rows);
         let slot_ids = take(lanes * width * 4);
@@ -464,12 +470,12 @@ impl Inputs {
         let readout_rows = take(rows * 4);
         let readout_positions = take(rows * 4);
         let readout_request_of_token = take(rows * 4);
-        let readout_mask_enabled = take(rows);
+        let readout_mask_enabled = take(rows * 4);
         let context = u64::from(paging.pages_per_slot) * u64::from(paging.page_size);
         let mask_stride = u32::try_from(context).unwrap_or(u32::MAX);
         let mask_plane_bytes = rows * context;
         let mask_planes = take(mask_plane_bytes);
-        let mask_enabled = take(rows);
+        let mask_enabled = take(rows * 4);
         let page_tables: Vec<TableAt> = (0..page_tables)
             .map(|_| TableAt {
                 indptr: take((lanes + 1) * 4),
@@ -542,6 +548,7 @@ impl Inputs {
             store: Region::unplaced(total, Buffer::zeroed(device, 0)?),
             tokens,
             positions,
+            rotations,
             windows,
             window_ints,
             row_valid,
@@ -673,6 +680,7 @@ impl Inputs {
 
         self.store.write(self.tokens, bytes_of(fire.tokens))?;
         self.store.write(self.positions, bytes_of(fire.positions))?;
+        self.store.write(self.rotations, bytes_of(fire.rotations))?;
         if fire.windows.len() as u64 > self.window_ints {
             return Err(Fault::Ceiling {
                 what: "packed window boundaries",
@@ -694,7 +702,7 @@ impl Inputs {
         }
         self.store
             .write(self.readout_rows, bytes_of(fire.readout_rows))?;
-        let enabled = fire.mask.map(|staged| staged.enabled.as_slice());
+        let enabled = fire.mask.map(|staged| staged.words.as_slice());
         let mut readout_positions = Vec::with_capacity(fire.readout_rows.len());
         let mut readout_request_of_token = Vec::with_capacity(fire.readout_rows.len());
         let mut readout_mask_enabled = Vec::with_capacity(fire.readout_rows.len());
@@ -723,7 +731,7 @@ impl Inputs {
             bytes_of(&readout_request_of_token),
         )?;
         self.store
-            .write(self.readout_mask_enabled, &readout_mask_enabled)?;
+            .write(self.readout_mask_enabled, words_of(&readout_mask_enabled))?;
         self.store
             .write(self.slot_of_row, bytes_of(fire.slot_of_row))?;
         let rs_tables = match (fire.rs_replay, fire.rs_commit) {
@@ -780,7 +788,7 @@ impl Inputs {
         }
         match fire.mask {
             None => {
-                self.store.zero_span(self.mask_enabled, u64::from(rows))?;
+                self.store.zero_span(self.mask_enabled, u64::from(rows) * 4)?;
             }
             Some(staged) => {
                 if staged.bytes.len() as u64 > self.mask_plane_bytes {
@@ -791,7 +799,7 @@ impl Inputs {
                     });
                 }
                 self.store.write(self.mask_planes, &staged.bytes)?;
-                self.store.write(self.mask_enabled, &staged.enabled)?;
+                self.store.write(self.mask_enabled, words_of(&staged.words))?;
             }
         }
 
@@ -1154,6 +1162,12 @@ impl Inputs {
                 self.store.at(self.positions),
                 rows,
             )?,
+            rotations: i32s(
+                handles,
+                self.store.view(),
+                self.store.at(self.rotations),
+                rows,
+            )?,
             windows: handles.bind(
                 self.store.view(),
                 self.store.at(self.windows),
@@ -1233,11 +1247,11 @@ impl Inputs {
                 handles.bind(
                     self.store.view(),
                     self.store.at(self.readout_mask_enabled),
-                    fire.readout_rows.len() as u64,
+                    fire.readout_rows.len() as u64 * 4,
                 )?,
                 fire.readout_rows.len() as u32,
                 1,
-                Dtype::U8,
+                Dtype::U32,
             ),
             group_of_lane,
             packings,
@@ -1257,11 +1271,11 @@ impl Inputs {
                 handles.bind(
                     self.store.view(),
                     self.store.at(self.mask_enabled),
-                    u64::from(rows),
+                    u64::from(rows) * 4,
                 )?,
                 rows,
                 1,
-                Dtype::U8,
+                Dtype::U32,
             ),
             mask_stride: stride,
             patches,
@@ -1403,6 +1417,14 @@ fn bands(
 fn u32s(handles: &crate::device::Handles, store: &Buffer, at: u64, rows: u32) -> Result<Tensor> {
     let buf = handles.bind(store, at, u64::from(rows) * 4)?;
     Ok(Tensor::new(buf, rows, 1, Dtype::U32))
+}
+
+fn words_of(values: &[u32]) -> &[u8] {
+    // SAFETY: `u32` is `Copy` with no padding/niche; all bytes are init and
+    // readable as `u8`.
+    unsafe {
+        core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), core::mem::size_of_val(values))
+    }
 }
 
 fn bytes_of(values: &[i32]) -> &[u8] {

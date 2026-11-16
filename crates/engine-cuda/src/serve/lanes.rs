@@ -15,6 +15,9 @@ pub struct Seated<'a> {
     pub positions: &'a [u32],
     pub pages: &'a [u32],
     pub held: Option<u32>,
+    /// The set's committed boundary (`KvDelta::folded`): the lane's mask
+    /// speaks of the keys from it on.
+    pub folded: u32,
     pub kv_less: bool,
     pub translation: &'a [u32],
     pub window: &'a [u32],
@@ -47,6 +50,7 @@ impl<'a> Seated<'a> {
             positions: &[],
             pages: &[],
             held: None,
+            folded: 0,
             kv_less: false,
             translation: &[],
             window: &[],

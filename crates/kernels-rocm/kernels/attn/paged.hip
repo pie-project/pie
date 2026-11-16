@@ -235,8 +235,8 @@ __host__ __device__ constexpr int decode_fold_heads(int G, int D, int waves) {
 // with K straight from the pages (lane l holds keys 4(l/16)+t for head
 // l%16). The weights go through LDS to the value side, where a lane
 // accumulates 8 columns of P·V from 16-byte value reads; the wavefronts
-// fold through LDS at the end. Four wavefronts at 512-wide heads (eight
-// spill there); QL keeps Qᵀ in LDS for the registers.
+// fold through LDS at the end; QL keeps Qᵀ in LDS for the registers.
+// 512-wide heads take `paged_decode_cols`.
 
 // With PVM the round's P·V runs on the matrix core too: the wavefront lays
 // its 16 value rows in LDS and takes Oᵀ (16 columns × 16 heads) += Vᵀ · Pᵀ a
@@ -257,12 +257,15 @@ __global__ __launch_bounds__(64 * WAVES) void paged_decode_mfma(const Paged p) {
     constexpr int VR = SUB / KPI;        // value reads a round
     static_assert(G <= 16 && D % 32 == 0 && kWave % LPK == 0, "a group within one column tile");
     static_assert(!PVM || D <= 256, "the staged value rows of a round within LDS");
+    // A 512-wide head's key row, value reads and G·8 accumulators spill past
+    // the registers into scratch: those heads take `paged_decode_cols`.
+    static_assert(D < 512, "512-wide heads decode on paged_decode_cols");
     constexpr int VLD = D + 8;           // a staged value row's pitch
     __shared__ float ps[PVM ? 1 : WAVES][SUB][G];
     __shared__ float alph[WAVES][G];
     __shared__ float part_m[WAVES][G], part_l[WAVES][G];
     // The wavefronts' outputs fold through LDS HG heads at a time: all G at
-    // once where they fit beside the rest (D = 512 does not). Under PVM the
+    // once where they fit beside the rest. Under PVM the
     // fold reuses the rounds' value rows' LDS.
     constexpr int HG = decode_fold_heads(G, D, WAVES);
     constexpr int PO = WAVES * HG * D;
@@ -289,12 +292,9 @@ __global__ __launch_bounds__(64 * WAVES) void paged_decode_mfma(const Paged p) {
     const int g = l % 16, quad = l / 16;
 
     // Qᵀ as B operands: this lane's column is head g, k pairs 8·quad. Held in
-    // registers, except at 512-wide heads, where they would push the round's
-    // reads into scratch, or under QL: there every wavefront rereads them
-    // from LDS.
-    constexpr bool QLDS = D >= 512 || QL;
-    // (the round's reads in halves, at 512-wide heads only)
-    constexpr bool HALVES = D >= 512;
+    // registers, except under QL: there every wavefront rereads them from
+    // LDS.
+    constexpr bool QLDS = QL;
     mfma_ab2 qf[QLDS ? 1 : KP];
     // (only the G live columns: a lane past them reads head G - 1's, whose
     // score columns no head's softmax reads)
@@ -350,44 +350,28 @@ __global__ __launch_bounds__(64 * WAVES) void paged_decode_mfma(const Paged p) {
     for (int t0 = w0 + wave * SUB; t0 < wend; t0 += WAVES * SUB) {
         // The round's key and value reads, all issued before any is used
         // (past the chunk they reread its last key, which weighs zero).
-        // The key reads in halves (KH of them at once): a 512-wide head's
-        // whole key row beside its value reads would not fit the registers.
-        constexpr int KH = HALVES ? KP / 2 : KP;
         mfma_cd s[KT];
-        typename KV::Raw kr[KT][KH];
-        auto read_keys = [&](int half) {
+        typename KV::Raw kr[KT][KP];
 #pragma unroll
-            for (int kt = 0; kt < KT; ++kt) {
-                KV::keys(p.k, at(min(t0 + kt * 16 + g, wend - 1), 0), quad, half * KH, kr[kt]);
-            }
-        };
-        auto score_keys = [&](int half) {
-#pragma unroll
-            for (int kt = 0; kt < KT; ++kt)
-#pragma unroll
-                for (int st = 0; st < KH; ++st) s[kt] = mfma16x2(KV::ab2(kr[kt][st]), q_at(half * KH + st), s[kt]);
-        };
+        for (int kt = 0; kt < KT; ++kt) {
+            KV::keys(p.k, at(min(t0 + kt * 16 + g, wend - 1), 0), quad, 0, kr[kt]);
+        }
 #pragma unroll
         for (int kt = 0; kt < KT; ++kt) s[kt] = mfma_zero();
-        read_keys(0);
-        // The value reads ride ahead of the scores, except at 512-wide heads,
-        // which read them in halves after the weights (registers again).
+        // The value reads ride ahead of the scores.
         using VRaw = typename conditional<RE == 16, Pack8<bf16>, typename KV::Raw>::type;
         auto value_at = [&](int i) -> VRaw {
             const long long v = at(min(t0 + i * KPI + parity, wend - 1), col);
             if constexpr (RE == 16) return *reinterpret_cast<const VRaw*>(reinterpret_cast<const u8*>(p.v) + v);
             else return KV::raw(p.v, v);
         };
-        VRaw vr[HALVES ? 1 : VR];
-        if constexpr (!HALVES) {
+        VRaw vr[VR];
 #pragma unroll
-            for (int i = 0; i < VR; ++i) vr[i] = value_at(i);
-        }
-        score_keys(0);
-        if constexpr (KH < KP) {
-            read_keys(1);
-            score_keys(1);
-        }
+        for (int i = 0; i < VR; ++i) vr[i] = value_at(i);
+#pragma unroll
+        for (int kt = 0; kt < KT; ++kt)
+#pragma unroll
+            for (int st = 0; st < KP; ++st) s[kt] = mfma16x2(KV::ab2(kr[kt][st]), q_at(st), s[kt]);
         float tmax = neg_inf();
 #pragma unroll
         for (int kt = 0; kt < KT; ++kt)
@@ -417,7 +401,7 @@ __global__ __launch_bounds__(64 * WAVES) void paged_decode_mfma(const Paged p) {
         lsum = lsum * alpha + sum;
         m = m_new;
         if constexpr (PVM) {
-            static_assert(KT == 1 && !HALVES, "one 16-key tile a round");
+            static_assert(KT == 1, "one 16-key tile a round");
             // The round's value rows into this wavefront's LDS rows.
             bf16* vs = vbuf + wave * SUB * VLD;
 #pragma unroll
@@ -476,16 +460,6 @@ __global__ __launch_bounds__(64 * WAVES) void paged_decode_mfma(const Paged p) {
             }
         };
         if constexpr (PVM) {
-        } else if constexpr (HALVES) {
-            constexpr int VH = VR / 2;
-#pragma unroll
-            for (int half = 0; half < 2; ++half) {
-                VRaw vh[VH];
-#pragma unroll
-                for (int i = 0; i < VH; ++i) vh[i] = value_at(half * VH + i);
-#pragma unroll
-                for (int i = 0; i < VH; ++i) weigh(half * VH + i, vh[i]);
-            }
         } else {
 #pragma unroll
             for (int i = 0; i < VR; ++i) weigh(i, vr[i]);

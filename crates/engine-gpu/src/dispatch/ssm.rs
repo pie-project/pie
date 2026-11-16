@@ -81,7 +81,15 @@ impl<B: Backend> Run<'_, B> {
                 dilation,
                 y,
                 ..
-            } if self.rs_seat().is_some() => {
+            } if self
+                .rs_seat()
+                .is_some_and(|seat| seat.layout.out_of.contains_key(&y.0)) =>
+            {
+                // A conv the rs buffer covers (`poem_compiler::rs::
+                // buffered_convs`), whether it feeds a recurrence or none
+                // (Qwen4's PLE conv): its input rows extend by the lane's
+                // buffered ones, the kernel walks them over the state's
+                // `(w - 1) * dilation + 1` rows and commits as of the fold.
                 const OP: &str = "ssm.causal_conv1d_committed";
                 let seat = self.rs_seat().expect("guarded");
                 let ext_x = self.rs_extend(OP, &seat, *x)?;

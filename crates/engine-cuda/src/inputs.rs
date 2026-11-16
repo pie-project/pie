@@ -174,6 +174,9 @@ pub struct Handles {
     pub readout_live: u64,
     pub mask: Option<Tensor>,
     pub mask_indptr: Option<Tensor>,
+    /// Per lane its mask word: its committed boundary and its wide bit
+    /// (`mask::Staged::origins`).
+    pub mask_origin: Option<Tensor>,
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<PackingHandles>,
     pub lane_of_row: Tensor,
@@ -554,6 +557,7 @@ pub struct Inputs {
     mask_bits: u64,
     mask_bytes: u64,
     mask_indptr: u64,
+    mask_origin: u64,
     patch: Option<PatchAt>,
     mrope: Option<u64>,
     mrope_bytes: u64,
@@ -650,6 +654,7 @@ impl Inputs {
         let inject_runs = take(lanes * size_of::<kernels_cuda::runtime::channel::WordRun>() as u64);
         let mask_runs = take(lanes * size_of::<kernels_cuda::runtime::channel::BitRun>() as u64);
         let mask_indptr = take((lanes + 1) * 8);
+        let mask_origin = take(lanes * 4);
         let page_tables: Vec<TableAt> = (0..page_tables)
             .map(|_| TableAt {
                 indptr: take((lanes + 1) * 4),
@@ -768,6 +773,7 @@ impl Inputs {
             mask_bits,
             mask_bytes,
             mask_indptr,
+            mask_origin,
             patch,
             mrope,
             mrope_bytes: if mrope.is_some() { rows * AXES * 4 } else { 0 },
@@ -1045,7 +1051,22 @@ impl Inputs {
                     i64_bytes_of(&staged.indptr),
                     "staged mask indptr",
                 )?;
-                Some(u32::try_from(staged.bits.len()).unwrap_or(u32::MAX))
+                put(
+                    self.mask_origin,
+                    u32_bytes_of(&staged.origins),
+                    "staged mask origins",
+                )?;
+                Some(u32::try_from(staged.bits.len()).map_err(|_| {
+                    crate::error::Fault::program(
+                        "inputs::write_host",
+                        format!(
+                            "this fire stages {} bytes of mask bits, past the {} one fire's \
+                             mask states",
+                            staged.bits.len(),
+                            u32::MAX
+                        ),
+                    )
+                })?)
             }
         };
 
@@ -1338,8 +1359,12 @@ impl Inputs {
         let at_qo_absolute = self.qo_absolute;
         let at_live = self.live_rows;
         let (at_row_valid, at_slot_ids) = (self.row_valid, self.slot_ids);
-        let (at_routes, at_mask, at_mask_indptr) =
-            (self.adapter_routes, self.mask_bits, self.mask_indptr);
+        let (at_routes, at_mask, at_mask_indptr, at_mask_origin) = (
+            self.adapter_routes,
+            self.mask_bits,
+            self.mask_indptr,
+            self.mask_origin,
+        );
         let at_readouts = self.readout_rows;
         let at_readout_live = self.readout_live;
         let places: Vec<TableAt> = self.page_tables.clone();
@@ -1403,6 +1428,7 @@ impl Inputs {
         if let Some(bytes) = mask_bytes {
             copy(at_mask, *bytes as usize)?;
             copy(at_mask_indptr, (lanes as usize + 1) * 8)?;
+            copy(at_mask_origin, lanes as usize * 4)?;
         }
         let mut packings = Vec::with_capacity(packing_places.len());
         if packed {
@@ -1488,6 +1514,8 @@ impl Inputs {
             row_valid: Tensor::new(base + at_row_valid, rows, 1, Dtype::U8),
             mask: mask_bytes.map(|bytes| Tensor::new(base + at_mask, bytes, 1, Dtype::U8)),
             mask_indptr: mask_bytes.map(|_| i64s(base + at_mask_indptr, lanes + 1)),
+            mask_origin: mask_bytes
+                .map(|_| Tensor::new(base + at_mask_origin, lanes, 1, Dtype::U32)),
             group_of_lane: packed.then(|| i32s(base + at_group_of_lane, table_lanes)),
             packings,
             lane_of_row: i32s(base + at_lane_of_row, rows),
@@ -1544,25 +1572,36 @@ impl Inputs {
             .expect("the group mask buffer was just sized");
         buffer.stage(stream, 0, &image)?;
         let base = buffer.ptr();
-        Ok(masks
+        // A tensor's rows are a u32: a group mask past them is refused by
+        // name, never cut short.
+        let rows = |what: &str, len: usize| {
+            u32::try_from(len).map_err(|_| {
+                crate::error::Fault::program(
+                    "inputs::group_masks",
+                    format!("a group mask's {what} reach {len}, past the {} a table holds", u32::MAX),
+                )
+            })
+        };
+        masks
             .iter()
             .zip(placed)
-            .map(|((q, kv, mask), (indptr, bits))| GroupMaskHandles {
-                q: *q,
-                kv: *kv,
-                bits: Tensor::new(
-                    base + bits as u64,
-                    u32::try_from(mask.bits.len().max(1)).unwrap_or(u32::MAX),
-                    1,
-                    Dtype::U8,
-                ),
-                indptr: i64s(
-                    base + indptr as u64,
-                    u32::try_from(mask.indptr.len().max(table_lanes as usize + 1))
-                        .unwrap_or(u32::MAX),
-                ),
+            .map(|((q, kv, mask), (indptr, bits))| {
+                Ok(GroupMaskHandles {
+                    q: *q,
+                    kv: *kv,
+                    bits: Tensor::new(
+                        base + bits as u64,
+                        rows("bytes", mask.bits.len().max(1))?,
+                        1,
+                        Dtype::U8,
+                    ),
+                    indptr: i64s(
+                        base + indptr as u64,
+                        rows("offsets", mask.indptr.len().max(table_lanes as usize + 1))?,
+                    ),
+                })
             })
-            .collect())
+            .collect()
     }
 
     #[must_use]

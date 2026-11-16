@@ -431,7 +431,7 @@ fn attend_pool(
                 num_heads: num_q_heads,
                 page_size: entries.page_size,
                 ratio,
-                splits: latent::splits(ctx, rows, num_q_heads, max_list),
+                splits: latent::splits(ctx.multiprocessors(op)?, rows, num_q_heads, max_list),
                 scale_log2: read.sm_scale * core::f32::consts::LOG2_E,
                 compact: i32::from(compact),
                 ..latent::Gather::default()

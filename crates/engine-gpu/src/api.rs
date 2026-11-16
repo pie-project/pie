@@ -1246,6 +1246,7 @@ impl<B: Host> Gpu<B> {
                 },
                 pages: pages_of[at].as_deref().unwrap_or(&lane.kv.pages),
                 held: (!lane.kv.pages.is_empty() || pages_of[at].is_some()).then_some(lane.kv.held),
+                folded: lane.kv.folded,
                 kv_less: lane.kv_less,
 
                 mask: resolved_masks[at].as_ref().or(lane.mask.as_ref()),
