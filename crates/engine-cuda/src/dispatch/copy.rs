@@ -134,7 +134,7 @@ impl Run<'_> {
             let mut wide = slot.wide;
             let mut tight = slot.tight;
             if out {
-                gather::scatter_rows(self.ctx(), tight, index, &mut wide)?;
+                gather::scatter_rows(self.ctx(), tight, index, None, &mut wide)?;
             } else {
                 gather::gather_rows(self.ctx(), wide, index, &mut tight)?;
             }
