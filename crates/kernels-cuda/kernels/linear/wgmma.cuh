@@ -26,6 +26,20 @@ template <int R>
 struct Mma;
 
 template <>
+struct Mma<16> {
+    static __device__ __forceinline__ void run(float (&d)[8], unsigned long long a,
+                                               unsigned long long b, int acc) {
+        asm volatile(
+            "{\n.reg .pred p;\nsetp.ne.b32 p, %10, 0;\n"
+            "wgmma.mma_async.sync.aligned.m64n16k32.f32.e4m3.e4m3 "
+            "{%0,%1,%2,%3,%4,%5,%6,%7}, %8, %9, p, 1, 1;\n}\n"
+            : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]),
+              "+f"(d[7])
+            : "l"(a), "l"(b), "r"(acc));
+    }
+};
+
+template <>
 struct Mma<32> {
     static __device__ __forceinline__ void run(float (&d)[16], unsigned long long a,
                                                unsigned long long b, int acc) {

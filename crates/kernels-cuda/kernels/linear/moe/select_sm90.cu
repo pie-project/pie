@@ -1011,6 +1011,137 @@ __device__ __forceinline__ void tma(void* dst, unsigned long long* bar, const Tm
 
 }
 
+template <int kR>
+__global__ void __launch_bounds__(128) moe_select_fp8a8_wgtma(
+    const __grid_constant__ wgfp8tma::TmaMap map_w, const u8* __restrict__ xq,
+    const u8* __restrict__ xe, const i32* __restrict__ order, const i32* __restrict__ offsets,
+    const i32* __restrict__ work, const u8* __restrict__ atoms, bf16* __restrict__ out, int act_div,
+    int n, int k, int num_experts, const u64* __restrict__ expert_table, u64 window) {
+    constexpr int kA = 128 * 128;
+    constexpr int kStage = kA + kR * 128;
+    constexpr int kF = kR / 2;
+
+    const int slot = static_cast<int>(blockIdx.y);
+    if (slot >= offsets[num_experts + 1]) return;
+    const int item = work[slot];
+    const int expert = item >> 16;
+    const int begin = offsets[expert] + (item & 0xFFFF) * kR;
+    const int count = min(offsets[expert + 1] - begin, kR);
+    if (count <= 0) return;
+
+    extern __shared__ uint4 wgtma_smem[];
+    const unsigned base = static_cast<unsigned>(__cvta_generic_to_shared(wgtma_smem));
+    u8* smem = reinterpret_cast<u8*>(wgtma_smem) + ((1024u - (base & 1023u)) & 1023u);
+    unsigned long long* full = reinterpret_cast<unsigned long long*>(smem + kWgStages * kStage);
+    const int tid = static_cast<int>(threadIdx.x);
+    const int warp = tid >> 5, lane = tid & 31, g = lane >> 2, c = lane & 3;
+    const int row0 = static_cast<int>(blockIdx.x) * 128;
+    const int blocks = k / 128;
+    if (tid == 0) {
+        for (int s = 0; s < kWgStages; ++s) wgbf16gemm::bar_init(full + s, 1);
+        asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
+    }
+    __syncthreads();
+    const int wrow = static_cast<int>(expert_row(expert_table, 2, 0, expert, n, window, k)) + row0;
+    const ExpertAtoms ea = expert_atoms(atoms, expert_table, expert, n);
+    const u8* atoms_at = ea.at + atom_offset(ea.row0 + row0, 0, blocks);
+
+    auto load = [&](int kb, int st) {
+        u8* a = smem + st * kStage;
+        u8* b = a + kA;
+        if (tid == 0) {
+            wgfp8tma::expect(full + st, kA);
+            wgfp8tma::tma(a, full + st, &map_w, kb * 128, wrow);
+        }
+        for (int i = tid; i < kR * 8; i += 128) {
+            const int r = i >> 3, ch = i & 7;
+            u8* dst = b + r * 128 + ((ch ^ (r & 7)) << 4);
+            if (r < count) {
+                const long long row = order[begin + r] / act_div;
+                wgfp8::cp16(dst, xq + row * k + kb * 128 + ch * 16);
+            } else {
+                *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
+            }
+        }
+    };
+
+    int xrow[kR / 8][2];
+#pragma unroll
+    for (int j = 0; j < kR / 8; ++j)
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int tok = 8 * j + 2 * c + h;
+            xrow[j][h] = tok < count ? order[begin + tok] / act_div : -1;
+        }
+
+    float acc[2][kF], blk[2][kF];
+#pragma unroll
+    for (int t = 0; t < 2; ++t)
+#pragma unroll
+        for (int i = 0; i < kF; ++i) acc[t][i] = 0.f;
+
+#pragma unroll
+    for (int s = 0; s < kWgStages - 1; ++s) {
+        if (s < blocks) load(s, s);
+        asm volatile("cp.async.commit_group;\n" ::);
+    }
+    for (int kb = 0; kb < blocks; ++kb) {
+        const int st = kb % kWgStages;
+        const float sw = gfp8::exp2_biased(atoms_at[(kb / 4) * 512 + kb % 4]);
+        float sx[kR / 8][2];
+#pragma unroll
+        for (int j = 0; j < kR / 8; ++j)
+#pragma unroll
+            for (int h = 0; h < 2; ++h)
+                sx[j][h] = xrow[j][h] >= 0 ? gfp8::exp2_biased(xe[xrow[j][h] * blocks + kb]) : 0.f;
+        asm volatile("cp.async.wait_group %0;\n" ::"n"(kWgStages - 2));
+        wgbf16gemm::bar_wait(full + st, (kb / kWgStages) & 1);
+        __syncthreads();
+        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+        const int next = kb + kWgStages - 1;
+        if (next < blocks) load(next, next % kWgStages);
+        asm volatile("cp.async.commit_group;\n" ::);
+
+        const u8* a = smem + st * kStage;
+        const u8* b = a + kA;
+        asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
+#pragma unroll
+        for (int kk = 0; kk < 4; ++kk) {
+            const unsigned long long db = wgfp8::desc(b + kk * 32);
+#pragma unroll
+            for (int t = 0; t < 2; ++t) {
+                wgfp8::Mma<kR>::run(blk[t], wgfp8::desc(a + t * 64 * 128 + kk * 32), db, kk > 0);
+            }
+        }
+        asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
+        asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
+#pragma unroll
+        for (int j = 0; j < kR / 8; ++j) {
+            const float s0 = sw * sx[j][0], s1 = sw * sx[j][1];
+#pragma unroll
+            for (int t = 0; t < 2; ++t) {
+                acc[t][4 * j + 0] = fmaf(blk[t][4 * j + 0], s0, acc[t][4 * j + 0]);
+                acc[t][4 * j + 1] = fmaf(blk[t][4 * j + 1], s1, acc[t][4 * j + 1]);
+                acc[t][4 * j + 2] = fmaf(blk[t][4 * j + 2], s0, acc[t][4 * j + 2]);
+                acc[t][4 * j + 3] = fmaf(blk[t][4 * j + 3], s1, acc[t][4 * j + 3]);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int t = 0; t < 2; ++t)
+#pragma unroll
+        for (int j = 0; j < kR / 8; ++j)
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const int tok = 8 * j + 2 * c + (q & 1);
+                if (tok >= count) continue;
+                const int row = row0 + t * 64 + 16 * warp + g + (q >= 2 ? 8 : 0);
+                const long long route = order[begin + tok];
+                out[route * n + row] = f32_to_bf16(acc[t][4 * j + q]);
+            }
+}
+
 /// `moe_select_fp8a8_wsgemm<kStages, 2>` persistent, its weight rows landed
 /// by TMA (`map_w`: the bank's codes, `[experts n][k]`, 128-byte by 128-row
 /// boxes, 128B-swizzled) and the gathered route rows tracked by the stage's
