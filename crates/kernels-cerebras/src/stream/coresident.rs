@@ -104,6 +104,48 @@ pub fn combine(root: &Path, names: &[String]) -> R<Vec<Placed>> {
         let lay = std::fs::read_to_string(dir.join("layout.csl")).map_err(io(&dir))?;
         for line in lay.lines() {
             let l = line.trim_start();
+            // a loop over the reading's columns (a tiled program's): its x range moved, its
+            // tiles' files the reading's, gated on its id
+            if let Some(rest) = l.strip_prefix("for (@range(u16, ") {
+                let (x0, rest) = num_after(rest, "").ok_or("a loop's x")?;
+                let (x1, rest) = num_after(rest, ", ").ok_or("a loop's x")?;
+                let (sx, rest) = num_after(rest, ", ").ok_or("a loop's step")?;
+                let mut rest = rest.to_string();
+                if let Some(at) = rest.find("@set_tile_code(x, y, \"") {
+                    let inner = &rest[at..];
+                    let (y0, r2) = num_after(&rest, "@range(u16, ").ok_or("a loop's y")?;
+                    let (y1, r2) = num_after(r2, ", ").ok_or("a loop's y")?;
+                    let (sy, _) = num_after(r2, ", ").ok_or("a loop's step")?;
+                    let mut x = x0;
+                    while x < x1 {
+                        let mut y = y0;
+                        while y < y1 {
+                            covered.insert((x + p.x, y));
+                            y += sy;
+                        }
+                        x += sx;
+                    }
+                    let fixed = inner
+                        .replacen(
+                            "@set_tile_code(x, y, \"",
+                            &format!("@set_tile_code(x, y, \"{}/", p.name),
+                            1,
+                        )
+                        .replacen(
+                            ".memcpy_params = mp",
+                            &format!(".memcpy_params = mp, .RD = {rd}"),
+                            1,
+                        );
+                    rest = format!("{}{fixed}", &rest[..at]);
+                }
+                let _ = writeln!(
+                    body,
+                    "  for (@range(u16, {}, {}, {sx}{rest}",
+                    x0 + p.x,
+                    x1 + p.x
+                );
+                continue;
+            }
             if let Some(rest) = l.strip_prefix("@set_tile_code(") {
                 let (px, rest) = num_after(rest, "").ok_or("a tile's x")?;
                 let (py, rest) = num_after(rest, ", ").ok_or("a tile's y")?;
@@ -216,8 +258,8 @@ mod tests {
     use super::*;
 
     /// flux2-mini's text encoder and VAE decode, each compiled on its own, combine into one
-    /// program: the VAE's PEs after the text's columns, every kernel gated on its reading's id,
-    /// the VAE's arrays moved by its origin.
+    /// program: the VAE's PEs (a tiled program's loops over its array) after the text's
+    /// columns, every kernel gated on its reading's id, the VAE's arrays moved by its origin.
     #[test]
     fn two_readings_combine_into_one_program() {
         let trace = poem_compiler::catalog::repository()
@@ -262,9 +304,12 @@ mod tests {
         assert!(lay.contains(&format!("@set_tile_code({}, ", sizes[0].0)));
         assert!(lay.contains(".RD = 1"));
         assert!(lay.contains("@export_name(\"run\", fn(u16) void);"));
-        let gx =
-            std::fs::read_to_string(tmp.0.as_path().join("vae.decode/gx_0.csl")).expect("a kernel");
-        assert!(gx.contains(GATED) && gx.contains("param RD: u16;"));
+        // the VAE in the tiled regime (the cheaper): its loops over the array moved and gated
+        let pe =
+            std::fs::read_to_string(tmp.0.as_path().join("vae.decode/tpe.csl")).expect("a kernel");
+        assert!(pe.contains(GATED) && pe.contains("param RD: u16;"));
+        assert!(lay.contains(&format!("for (@range(u16, {}, ", sizes[0].0 + 1)));
+        assert!(lay.contains("\"vae.decode/tpe.csl\", .{ .memcpy_params = mp, .RD = 1"));
         let after: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(tmp.0.as_path().join("vae.decode/host.json"))
                 .expect("host.json"),

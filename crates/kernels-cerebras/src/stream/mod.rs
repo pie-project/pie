@@ -352,16 +352,51 @@ pub fn compile_pinned(
 }
 
 /// Compiles `trace`'s reading `o.reading` into `out` with no capture, whichever regime it reads
-/// in: a stream reading's units ([`compile`]), or a grid reading's passes ([`grid::compile`], on
-/// the clip `o.rows` token rows make: [`grid::clip_of`]). Returns its fabric's size.
+/// in: a stream reading's units ([`compile`]), or a grid reading ([`compile_grid`], on the clip
+/// `o.rows` token rows make: [`grid::clip_of`]). Returns its fabric's size.
 pub fn compile_reading(trace: &Trace, o: &Options, out: &std::path::Path) -> R<(u32, u32)> {
     if grid::is_grid(trace, &o.reading) {
         let clip = grid::clip_of(trace, &o.reading, o.rows);
-        let g = grid::compile(trace, &o.reading, clip, o.round16, out)?;
-        return Ok((g.stream.w, g.stream.h));
+        return compile_grid(trace, &o.reading, clip, o.round16, out);
     }
     let p = compile(trace, o, out, None)?;
     Ok((p.stream.w, p.stream.h))
+}
+
+/// A grid reading's regime, by price: the tiled regime's program ([`tiled`]: the image over the
+/// fabric, its top tile searched) and the rows regime's ([`grid`]: passes over one unit), the
+/// cheaper of those that place within a system's fabric. Returns the fabric's size.
+pub fn compile_grid(
+    trace: &Trace,
+    reading: &str,
+    clip: [u32; 3],
+    round16: bool,
+    out: &std::path::Path,
+) -> R<(u32, u32)> {
+    let b = crate::floorplan::stream::Bounds::system();
+    let t = tiled::program(trace, reading, clip, round16, None, Some((b.w, b.h)));
+    let g = grid::program(trace, reading, clip, round16);
+    let tc = t
+        .as_ref()
+        .map_or(f64::MAX, |p| crate::cost::tiled::time(p).cycles);
+    let gc = g
+        .as_ref()
+        .map_or(f64::MAX, |g| crate::cost::grid::time(g).cycles);
+    match (t, g) {
+        (Ok(p), Err(_)) => {
+            tiled::compile_program(&p, out)?;
+            Ok(p.fabric())
+        }
+        (Ok(p), Ok(_)) if tc <= gc => {
+            tiled::compile_program(&p, out)?;
+            Ok(p.fabric())
+        }
+        (_, Ok(_)) => {
+            let g = grid::compile(trace, reading, clip, round16, out)?;
+            Ok((g.stream.w, g.stream.h))
+        }
+        (Err(a), Err(b)) => Err(format!("{a}; {b}")),
+    }
 }
 
 /// `classes` with the rows of those `rows` names.
