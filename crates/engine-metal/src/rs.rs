@@ -362,37 +362,86 @@ impl Layout {
                 }
             }
         }
-        let mut slots: Vec<(u64, String, usize)> = Vec::new();
-        let mut place = |key: String, row_bytes: u64, span: Option<(usize, usize)>| -> usize {
-            let (start, end) = span.unwrap_or((0, usize::MAX));
-            if let Some(at) = slots
+        let members: Vec<(String, u64, Option<(usize, usize)>)> = self
+            .planes
+            .iter()
+            .map(|plane| (format!("plane {:?}", plane.role), plane.row_bytes))
+            .chain(
+                self.regions
+                    .iter()
+                    .map(|region| (format!("region {}", region.kind), region.row_bytes)),
+            )
+            .zip(spans)
+            .map(|((key, row_bytes), span)| (key, row_bytes, span))
+            .collect();
+        let (slot_of, slots) = share_slots(&members);
+        self.plane_slot = slot_of[..self.planes.len()].to_vec();
+        self.region_slot = slot_of[self.planes.len()..].to_vec();
+        self.slots = slots;
+    }
+}
+
+/// The scratch slot of each member (a key, its bytes a row, its live span
+/// over the plan's nodes; none where no node names it), and each slot's
+/// bytes a row: members of one key whose spans don't overlap share a slot,
+/// first-fit in the order their spans start, each slot as wide as its
+/// widest member. A member with no span takes a slot of its own.
+fn share_slots(members: &[(String, u64, Option<(usize, usize)>)]) -> (Vec<usize>, Vec<u64>) {
+    let mut order: Vec<usize> = (0..members.len()).collect();
+    order.sort_by_key(|&at| members[at].2.map_or(0, |span| span.0));
+    // Each slot: its key, its bytes a row, the last node of its latest member.
+    let mut slots: Vec<(&str, u64, usize)> = Vec::new();
+    let mut slot_of = vec![0; members.len()];
+    for at in order {
+        let (key, row_bytes, span) = (&members[at].0, members[at].1, members[at].2);
+        let free = span.and_then(|(start, _)| {
+            slots
                 .iter()
-                .position(|(_, k, last)| *k == key && *last < start && span.is_some())
-            {
-                slots[at].0 = slots[at].0.max(row_bytes);
-                slots[at].2 = end;
-                return at;
+                .position(|(k, _, last)| *k == key.as_str() && *last < start)
+        });
+        slot_of[at] = match free {
+            Some(slot) => {
+                slots[slot].1 = slots[slot].1.max(row_bytes);
+                slots[slot].2 = span.map_or(usize::MAX, |span| span.1);
+                slot
             }
-            slots.push((row_bytes, key, end));
-            slots.len() - 1
+            None => {
+                slots.push((key, row_bytes, span.map_or(usize::MAX, |span| span.1)));
+                slots.len() - 1
+            }
         };
-        let mut order: Vec<usize> = (0..spans.len()).collect();
-        order.sort_by_key(|&at| spans[at].map_or(0, |span| span.0));
-        let mut plane_slot = vec![0; self.planes.len()];
-        let mut region_slot = vec![0; self.regions.len()];
-        for at in order {
-            if at < self.planes.len() {
-                let plane = self.planes[at];
-                plane_slot[at] = place(format!("plane {:?}", plane.role), plane.row_bytes, spans[at]);
-            } else {
-                let region = self.regions[at - self.planes.len()];
-                region_slot[at - self.planes.len()] =
-                    place(format!("region {}", region.kind), region.row_bytes, spans[at]);
-            }
-        }
-        self.plane_slot = plane_slot;
-        self.region_slot = region_slot;
-        self.slots = slots.into_iter().map(|(row_bytes, ..)| row_bytes).collect();
+    }
+    (slot_of, slots.into_iter().map(|(_, row_bytes, _)| row_bytes).collect())
+}
+
+#[cfg(test)]
+mod share_tests {
+    use super::share_slots;
+
+    fn m(key: &str, row_bytes: u64, span: (usize, usize)) -> (String, u64, Option<(usize, usize)>) {
+        (key.to_string(), row_bytes, Some(span))
+    }
+
+    /// Two members of one key whose spans overlap take two slots; one
+    /// whose span starts after another's ends shares its slot, sized by the
+    /// wider; one overlapping both takes its own; another key never shares.
+    #[test]
+    fn a_slot_is_shared_only_by_members_whose_spans_never_overlap() {
+        let members = vec![
+            m("plane ConvX", 100, (0, 5)),
+            m("plane ConvX", 300, (3, 8)),
+            m("plane ConvX", 200, (6, 9)),
+            m("plane ConvX", 50, (2, 10)),
+            m("region conv", 400, (6, 9)),
+        ];
+        let (slot_of, slots) = share_slots(&members);
+        assert_ne!(slot_of[0], slot_of[1], "overlapping spans 0..5 and 3..8 share no slot");
+        assert_eq!(slot_of[0], slot_of[2], "0..5 is done before 6..9 starts: one slot");
+        assert_eq!(slots[slot_of[0]], 200, "the shared slot is as wide as its widest member");
+        assert_ne!(slot_of[3], slot_of[0], "2..10 overlaps 0..5 and 6..9");
+        assert_ne!(slot_of[3], slot_of[1], "and 3..8");
+        assert_ne!(slot_of[4], slot_of[2], "a region shares no plane's slot, overlap or not");
+        assert_eq!(slots.len(), 4);
     }
 }
 
