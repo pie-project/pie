@@ -20,8 +20,9 @@ launch no longer waits on its static arrays, §4.1), M2e (the rotation tables a 
 the K / V columns folded over two columns a head, the cost model held to the simulator unit by
 unit: a row's round trip through a unit; klein's step 1,326M -> 1,081M cycles, 1.77 s -> 1.44 s,
 end to end 7.54 s -> 6.21 s at 750 MHz; the roofline 10.9M cycles a step, §4.1), K1 (klein on
-the CS-3 from its real checkpoint: a program over more than one band hangs at its first launch,
-flux2-mini at a narrow fabric reproduces it, §4.1), M2f (the GEMM regime: a whole-sequence
+the CS-3 from its real checkpoint: a program over more than one band ran into two compiler bugs,
+fixed; klein at 64 + 64 runs, 69.7M cycles a step, its velocity 5.2e-2 from engine-cpu's f32,
+inside bf16 diffusers' own 8.5e-2; klein at 1024² runs, 2,651M cycles, 3.53 s a step, §4.1), M2f (the GEMM regime: a whole-sequence
 reading's ops over an array of PEs, rows and channels both cut, weights from tapes below it;
 flux2-mini's step on the simulator in 0.97M cycles, its 2-step loop 1.48e-3 from diffusers;
 klein's 1024² step 1,081M -> 115M cycles priced (1.44 s -> 0.15 s), links; end to end 6.21 s
@@ -1841,9 +1842,10 @@ milestone's tail.
     against transformers' `Qwen3ForCausalLM`, M1h's digits; 1.43M cycles (the first launch),
     70 min of simulator.
 
-- **K1** (FLUX.2 [klein] 4B on the CS-3, its real checkpoint; requests 1482-1488). **Blocked:
-  a stream program over more than one band hangs at its first launch on the system**, and every
-  klein program is one (64 + 64 rows: 4 bands; 1024²: more).
+- **K1** (FLUX.2 [klein] 4B on the CS-3, its real checkpoint; requests 1482-1506). A stream
+  program over more than one band hung at its first launch on the system, and every klein
+  program is one (64 + 64 rows: 4 bands; 1024²: more): two compiler bugs, fixed (below); klein
+  runs at both sizes.
   - **The checkpoint.** `black-forest-labs/FLUX.2-klein-4B`'s diffusers snapshot (transformer,
     text encoder, VAE: 15 GB, Apache-2.0, not gated), landed through the import contract as the
     engine does. engine-cerebras `klein_reading_files` (ignored; `READING_CKPT`,
@@ -1873,11 +1875,62 @@ milestone's tail.
     the search's own one-band program (57 x 62) runs, the simulator's numerics (velocity 4.72e-3 /
     0.9999888 and 6.33e-3, the latent after 2 steps 3.88e-3 / 0.9999925 against engine-cpu), its
     re-launched step **1.239M cycles, 2.33 ms** (the simulator's M2e step 1.127M plus 10%). No
-    multi-band program has run on the simulator: the band's wrap (`Stream::wrap`, the row stream
-    from a band's last unit back west and south into the next band's first) and the lane bus down
-    to a later band are the suspects, and the mini at a narrow fabric is a small repro.
-  - The M2e 1024² program (741 x 1152 PEs, 1,081.4M cycles, 1.44 s priced) is built and its
-    static arrays made (3.859G words); not run, being multi-band.
+    multi-band program had run on the simulator.
+  - **The two bugs** (both in a later band only, so one-band programs, decode, the VAE and text
+    readings build byte-identical):
+    - A weight PE's casts in (`C_XR`, `C_XC`: its unit's row and column casts) were looked up by
+      the unit whose columns hold the PE's x (`emit::stream::weight_params`), which is the first
+      band's unit there: a later band's weight PEs bound their cast queues to the first band's
+      colours (some routed from their ramp, some not routed at all) and waited for casts that
+      never came. The unit is passed in now. (The 64 + 64 program had 30% of its weight PEs so
+      bound.)
+    - The lane bus (`floorplan::stream::lane_tree`) skipped the lane root's own column (x 0), so
+      the CX roots of a later band's first unit, below the lane unit, got no lane vectors. A branch
+      runs south from the lane root to them now.
+    - `wafer-compile stream --fabric-width W` (`Pins::width`, `Bounds::narrowed`) builds for a
+      narrower fabric: more bands on a small model. `flux_2_mini_over_three_bands_reaches_every_lane_root`
+      (38 wide: three bands) checks every lane receiver is on the bus and every weight PE's casts
+      are routed to its ramp.
+  - **flux2-mini over three bands** (`--fabric-width 38`, 36 x 114 PEs) on the system (1492): its
+    2-step loop gives the one-band simulator's numbers to every printed digit (velocity 4.853e-3 /
+    0.9999882, 6.358e-3 / 0.9999798; the latent after 2 steps 3.861e-3 / 0.9999925 against
+    engine-cpu), 1.187M cycles a re-launched step. On the simulator (`--py 16 --tile 12288
+    --stages 3 --fabric-width 38`: 27 x 56 PEs, two bands) the rows 2.80e-3 / 0.999996 against the
+    capture, 6.17M cycles.
+  - **64 + 64 on the system** (1494; the search's 730 x 1148 PEs, the static arrays made again for
+    it, the inputs and goldens 1483's): link 934 s, load 126 s, the static arrays 57 s.
+
+    | | vs engine-cpu (rel L2 / cosine) | cycles | wall |
+    |---|---|---|---|
+    | step 0 velocity (sigma 1) | 5.22e-2 / 0.998825 | 69.67M | 128 ms |
+    | step 1 velocity (sigma 0.7672), re-launched | 8.25e-2 / 0.996611 | 69.67M | 121 ms |
+    | latent after 1 / 2 steps | 1.09e-2 / 0.999948, 4.86e-2 / 0.998824 | | |
+
+    - **The numerics are bf16's.** diffusers' klein transformer (0.40, the checkpoint's bf16
+      weights) at 64 + 64 tokens of drawn inputs, all bf16 as a GPU runs it, is 8.47e-2 / 0.99649
+      (sigma 1) and 1.38e-1 / 0.99040 (0.7672) from its own f32: the wafer is closer to f32 than
+      that. Error against depth (`--stages`, `wafer-bench --rows 1 --save-rows` against
+      `klein_reading_files READING_ROWS=1`'s engine-cpu rows): after double block 3 (stage 5)
+      9.14e-3 / 7.44e-3 (context / image rows), after block 4 (stage 6, its units in band 2)
+      7.68e-3 / 4.62e-3; stage 5 built over two bands (`--fabric-width 400`, every kernel file the
+      one-band build's) returns the one-band rows bit for bit. Bands change nothing numerically.
+    - **Cycles: 2x the price** (34.0M). The stamps (`wafer-bench --stamps`) are each PE's own
+      counter from its launch (`run` enables it; every start reads about 20), not one clock, so a
+      unit's last end is its own elapsed time: each double block ends about 2.7M cycles after the
+      one before at 64 + 64 rows (priced about 1.0M: 64 x (5.7k early + 10.1k late)); the lane
+      prologue's PEs end at 3.30M (priced 7.6k), in every cut alike (stages 2, 5, 6) and on both
+      launches. On the simulator (flux2-mini `--stages 2`, a stamp after each CX root's `lanes()`
+      and at the lane root's first gathered piece) the receivers finish the whole lane stream
+      49.6k cycles into their own launch while the lane unit's CY roots wait 3.17M cycles of
+      theirs before their first gather send: the wait is the lane unit's (its column chains and
+      launch), not the bus (a receiver's drain in one stride-0 op, not 64 words an op, gave the
+      same 3.30M on the system, 1508). Attributing it needs the counters aligned (the SDK's
+      bandwidth test syncs them against a reference PE); flux2-mini's lane unit (8 x 32) ends at
+      47.8k.
+  - **1024² on the system** (1497; 741 x 1152 PEs, its static arrays from the checkpoint, 3.859G
+    words): link 874 s (816 MB), load 133 s, the static arrays 37 s; a step **2,651.2M cycles,
+    3.53 s at 750 MHz** (3.76 s wall, the launch's rows back the rest), the same re-launched,
+    finite; priced 1,081.4M (2.45x). No golden at this size.
 
 - **M2f** (the GEMM regime: a whole-sequence reading over an array of PEs, layer by layer, every
   PE of the array on the current op; flux2-mini's denoise step on the simulator, klein-4B's 1024²
