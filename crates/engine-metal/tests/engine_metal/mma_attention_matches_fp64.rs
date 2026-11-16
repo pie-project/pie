@@ -4,6 +4,11 @@ use engine_metal::encode::Sink;
 use kernels_metal::{KvPool, PrefillPlan, RaggedTensor, Tensor, attn};
 use poem_ir::Dtype;
 
+/// A row's mask words, one u32 a row (its enable flag, its boundary 0).
+fn mask_words(v: &[u32]) -> Vec<u8> {
+    v.iter().flat_map(|w| w.to_le_bytes()).collect()
+}
+
 fn bf(x: f32) -> f32 {
     let b = x.to_bits();
     f32::from_bits((b + 0x7fff + ((b >> 16) & 1)) & 0xffff0000)
@@ -91,17 +96,28 @@ fn mma_attention_matches_fp64() {
             page_stride: [0; 2],
         }
         .paged_densely();
-        // mode 0 is plain causal, 1 a sparse mask, 2 a mask that also admits later keys.
-        for (window, mode) in [(None, 0u8), (Some(19u32), 1), (None, 1), (None, 2)] {
+        // mode 0 is plain causal, 1 a sparse mask, 2 a mask that also admits later keys,
+        // 3 a sparse mask past a committed boundary: every key below `base` is read
+        // whatever the plane says, and the plane's column `c` is key `base + c`.
+        for (window, mode) in [
+            (None, 0u8),
+            (Some(19u32), 1),
+            (None, 1),
+            (None, 2),
+            (None, 3),
+            (Some(19u32), 3),
+        ] {
+            let origin = if mode == 3 { base } else { 0 };
             let mask: Vec<u8> = (0..m * np * page).map(|i| u8::from(i % 7 != 0)).collect();
             let mb = upload(&mask);
-            let eb = upload(&vec![mode; m]);
+            let flag = if mode == 3 { 1 } else { u32::from(mode) };
+            let eb = upload(&mask_words(&vec![flag | ((origin as u32) << 2); m]));
             let plan = PrefillPlan {
                 positions: tensor(&po, m, 1, Dtype::I32),
                 last_page_len: tensor(&po, m, 1, Dtype::I32),
                 request_of_token: tensor(&ow, m, 1, Dtype::I32),
                 mask: tensor(&mb, mask.len(), 1, Dtype::U8),
-                mask_enabled: tensor(&eb, m, 1, Dtype::U8),
+                mask_enabled: tensor(&eb, m, 1, Dtype::U32),
                 mask_stride: (np * page) as u32,
             };
             let scale = 1. / (d as f32).sqrt();
@@ -116,9 +132,12 @@ fn mma_attention_matches_fp64() {
                     };
                     let mut scores = vec![];
                     for t in 0..=last {
-                        if window.is_some_and(|w| t + (w as usize) <= pos[row] as usize)
-                            || mode != 0 && mask[row * np * page + t] == 0
-                        {
+                        let hidden = match mode {
+                            0 => false,
+                            3 => t >= origin && mask[row * np * page + (t - origin)] == 0,
+                            _ => mask[row * np * page + t] == 0,
+                        };
+                        if window.is_some_and(|w| t + (w as usize) <= pos[row] as usize) || hidden {
                             continue;
                         }
                         let slot =
