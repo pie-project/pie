@@ -21,7 +21,7 @@
 //!   one frame.
 //!
 //! Each kernel is timed back to back with itself, as many to a frame as
-//! fill 5 ms, and the frame's time divided: serving runs hundreds of
+//! fill 20 ms, and the frame's time divided: serving runs hundreds of
 //! dispatches a fire, and a frame of one short dispatch times the clock
 //! state the device idled into, not the kernel.
 
@@ -41,9 +41,11 @@ pub const ROWS: [u32; 10] = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192];
 /// The matmul's width and contraction.
 const WIDTH: u32 = 4096;
 
-/// How long a timed frame runs: long enough that the device stays at its
-/// serving clock through it.
-const FRAME_SECONDS: f64 = 0.005;
+/// How long a timed frame runs: long enough that the device reaches and
+/// holds its serving clock through it. A narrow kernel's frame of 5 ms read
+/// the m = 16 matmul 26% apart run to run on an M1 Max (45% on an M5 Pro);
+/// 20 ms reads it within 0.25%.
+const FRAME_SECONDS: f64 = 0.020;
 
 /// The most of one measurement a timed frame repeats.
 const MAX_REPEATS: u32 = 512;
