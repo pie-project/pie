@@ -2049,14 +2049,15 @@ impl SharedPool {
     }
 
     /// The segments to commit ahead of need: enough that `bytes` (what
-    /// waiters lack, plus [`COMMIT_AHEAD_BYTES`]) stand ready; the mapped
-    /// target that takes, never past the pool.
+    /// waiters lack, plus [`COMMIT_AHEAD_BYTES`]) stand ready, a lowered
+    /// rung's lent span counted after the prefix; the mapped target that
+    /// takes, never past the pool.
     #[must_use]
     pub fn ahead_target(&self, bytes: u64) -> u32 {
-        let wanted = self
-            .pool
-            .commit_ahead(bytes.saturating_add(COMMIT_AHEAD_BYTES));
-        self.mapped_segments() + wanted.len() as u32
+        self.mapped_segments()
+            + self
+                .pool
+                .ahead_segments(bytes.saturating_add(COMMIT_AHEAD_BYTES))
     }
 
     // ---- governor ----

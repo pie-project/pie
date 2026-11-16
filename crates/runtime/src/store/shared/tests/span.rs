@@ -666,9 +666,12 @@ fn can_grow_is_whether_the_walk_s_next_step_maps_a_segment() {
                                 "{case}: the walk takes the step for no waiter"
                             );
                         }
-                        assert!(
-                            !matches!(step, Some(SegmentMove::CommitSpan { .. })),
-                            "{case}: nothing the walk goes toward backs the lent span"
+                        // The lent span is backed toward the target alone,
+                        // once the prefix is whole: never for a live waiter.
+                        assert_eq!(
+                            matches!(step, Some(SegmentMove::CommitSpan { .. })),
+                            waiter.is_none() && lent && !blocked && below && prefix_whole,
+                            "{case}: what backs the lent span"
                         );
                         cases += 1;
                     }
@@ -699,12 +702,13 @@ fn a_live_waiter_beside_an_unbacked_lent_span_is_told_the_pool_does_not_grow() {
         let _ = grow.retarget(u64::from(u32::MAX));
         assert!(!grow.can_grow(), "{short:?}: no step maps a segment");
         assert!(!grow.promise_grow(), "{short:?}: so nothing is promised");
-        assert_eq!(grow.goal_for_test(), mapped, "{short:?}: the prefix");
+        let goal = grow.goal_for_test();
         assert_eq!(
-            shared.lock().unwrap().next_move(mapped, 1),
+            shared.lock().unwrap().next_move(goal, 1),
             None,
-            "{short:?}: and the walk backs no span"
+            "{short:?}: and the walk backs no span for it"
         );
+        assert_eq!(shared.lock().unwrap().mapped_segments(), mapped);
     }
 }
 
@@ -784,12 +788,13 @@ fn a_press_narrows_the_rung_to_what_the_target_leaves_and_lifts_as_it_rises() {
 /// and nothing gives it back), and the lowered rung's lent span is backed
 /// and empty. Critical pressure sheds the empty lent span first
 /// (`PoolOp::ReleaseSpan`, nothing moves for it). Calm puts the target
-/// back at the budget, and the walk backs only what commits ahead of
-/// demand: the prefix's segments, never the lent span
-/// ([`SharedPool::walk_goal`], `SlotPool::commit_ahead`), so with the
-/// prefix whole nothing reaches the engine until something asks.
+/// back at the budget and backs the lent span again (`PoolOp::CommitSpan`):
+/// the prefix is whole and full, so what commits ahead of need is the lent
+/// span (`SlotPool::ahead_segments`), the load's own range. Then a raise to
+/// the top rung reaches the engine and a fire at it serves the parked
+/// lane.
 #[tokio::test(flavor = "current_thread")]
-async fn yield_sheds_the_empty_lent_span_first_under_critical_pressure() {
+async fn yield_sheds_the_empty_lent_span_under_critical_pressure_and_calm_backs_it_again() {
     use crate::governor::run::{Steer, step};
     use crate::scheduler::worker::{LaneStandIn, PoolOp};
     const ENGINE: usize = 73;
@@ -856,15 +861,36 @@ async fn yield_sheds_the_empty_lent_span_first_under_critical_pressure() {
         pool.pool().check();
     }
 
-    // Calm: back to the budget; the walk commits ahead of demand only, and
-    // the prefix is whole, so the lent span stays unbacked.
+    // Calm: back to the budget, and the lent span backed again.
     assert_eq!(
         step(&mut steer, &mut grow, Some(0.0), false),
         grow.hard_limit()
     );
     grow.walk().await;
     let calls = std::mem::take(&mut engine.lock().unwrap().calls);
-    assert!(calls.is_empty(), "calm backs nothing ahead of demand: {calls:?}");
-    assert_eq!(shared.lock().unwrap().pool().span_committed(), shed);
+    assert!(
+        calls.iter().any(|call| matches!(call, Call::CommitSpan(_))),
+        "calm backs the lent span again: {calls:?}"
+    );
+    assert_eq!(shared.lock().unwrap().pool().span_committed(), lent);
     shared.lock().unwrap().pool().check();
+
+    // The top rung: the raise reaches the engine, and a fire at it serves.
+    let lane = Lane(engine.clone());
+    let raised = take_raise(&shared, |_| 2048, &lane).await.unwrap();
+    assert!(raised.expect("raised").moves.is_empty(), "nothing to move");
+    assert_eq!(engine.lock().unwrap().calls, [Call::Rung(256, 2048)]);
+    let pool = shared.lock().unwrap();
+    assert_eq!(pool.rung(), 2048);
+    let facts = facts();
+    let engine = engine.lock().unwrap();
+    for &record in &parked {
+        let lane = ::engine::fire::Lane {
+            tokens: vec![1],
+            fixed: pool.lane_fixed(record, record),
+            ..::engine::fire::Lane::default()
+        };
+        engine.fire(&facts, &lane, 12);
+    }
+    pool.pool().check();
 }

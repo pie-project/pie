@@ -2028,6 +2028,36 @@ impl SlotPool {
         segments
     }
 
+    /// The segments to map ahead of need so `bytes` of headroom stand
+    /// ready: the prefix's ([`Self::commit_ahead`]), and, once those leave
+    /// the prefix whole, every span segment a lowered rung lends to state,
+    /// counted as `commit_span` maps them (the top `n` together,
+    /// [`Self::span_to_commit`]). The lent span is part of the range the
+    /// load stated, backed whole at the top rung: backing it again restores
+    /// the pool to what it held at load, never grows it past that.
+    pub fn ahead_segments(&self, bytes: u64) -> u32 {
+        let prefix = self.commit_ahead(bytes);
+        let ahead = prefix.len() as u32;
+        if !self.span_on_demand || self.ceiling < self.total {
+            return ahead;
+        }
+        let left = self
+            .segments
+            .uncommitted()
+            .filter(|&segment| segment < self.top_segment && self.backs(segment))
+            .count() as u32;
+        let start = self
+            .segments
+            .range(self.top_segment.min(self.segments.count()))
+            .start;
+        if left > ahead || self.top_segment >= self.segments.count() || self.state_limit() <= start
+        {
+            return ahead;
+        }
+        let span = self.segments.count() - self.top_segment;
+        ahead + span.saturating_sub(self.span_committed())
+    }
+
     /// Checks every internal invariant; for tests.
     #[cfg(test)]
     pub(crate) fn check(&self) {
