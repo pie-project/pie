@@ -2586,6 +2586,7 @@ fn golden_eager_resume() {
 /// process timed nothing. Under `time_tactics` (as `pie tune` runs) the same
 /// load times what the tables lack, which is the control: a model the
 /// checked-in table does not cover, so there is something to time.
+#[cfg(feature = "cuda")]
 #[test]
 #[ignore = "a probe run by hand: see the module's doc"]
 fn golden_two_fresh_loads_time_nothing() {
