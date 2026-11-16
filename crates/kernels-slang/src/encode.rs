@@ -91,6 +91,12 @@ pub enum Target {
 }
 
 pub trait Encode {
+    /// Dispatches `fire`: `fire.groups` workgroups of `fire.group`
+    /// invocations each, as `vkCmdDispatch` and `dispatch_workgroups` take
+    /// them. `groups` is a count of workgroups, never tiles times threads: a
+    /// kernel that picks its tile from `SV_GroupID` fires a group a tile,
+    /// and one that reads `SV_DispatchThreadID` states its invocations
+    /// through [`Fire::threads`].
     fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Error>;
 
     fn absent(&self) -> Result<ArgValue, Error>;
