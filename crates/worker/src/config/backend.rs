@@ -5,24 +5,10 @@ use serde::{Deserialize, Serialize};
 
 use units::ByteSize;
 
-use super::removed::{
-    DeviceMemory, KvPageSize, MaxForwardRequests, MaxForwardTokens, MaxModelLen, MaxStateSlots,
-    Removed,
-};
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CudaEngineOptions {
-    #[serde(skip_serializing)]
-    pub kv_page_size: Removed<KvPageSize>,
-    #[serde(skip_serializing)]
-    pub max_state_slots: Removed<MaxStateSlots>,
-    #[serde(skip_serializing)]
-    pub max_model_len: Removed<MaxModelLen>,
-    #[serde(skip_serializing)]
-    pub max_forward_tokens: Removed<MaxForwardTokens>,
-    #[serde(skip_serializing)]
-    pub max_forward_requests: Removed<MaxForwardRequests>,
     #[serde(skip)]
     pub device: String,
     #[serde(skip)]
@@ -43,16 +29,6 @@ pub struct CudaEngineOptions {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MetalEngineOptions {
-    #[serde(skip_serializing)]
-    pub kv_page_size: Removed<KvPageSize>,
-    #[serde(skip_serializing)]
-    pub max_state_slots: Removed<MaxStateSlots>,
-    #[serde(skip_serializing)]
-    pub max_model_len: Removed<MaxModelLen>,
-    #[serde(skip_serializing)]
-    pub max_forward_tokens: Removed<MaxForwardTokens>,
-    #[serde(skip_serializing)]
-    pub max_forward_requests: Removed<MaxForwardRequests>,
     pub diagnostics: Option<String>,
     #[serde(skip)]
     pub device: String,
@@ -67,16 +43,6 @@ pub struct VulkanEngineOptions {
     /// number in `[engine] device` (`vulkan:1`).
     #[serde(skip)]
     pub device_index: u32,
-    #[serde(skip_serializing)]
-    pub kv_page_size: Removed<KvPageSize>,
-    #[serde(skip_serializing)]
-    pub max_state_slots: Removed<MaxStateSlots>,
-    #[serde(skip_serializing)]
-    pub max_model_len: Removed<MaxModelLen>,
-    #[serde(skip_serializing)]
-    pub max_forward_tokens: Removed<MaxForwardTokens>,
-    #[serde(skip_serializing)]
-    pub max_forward_requests: Removed<MaxForwardRequests>,
     pub validation: bool,
     pub pipeline_cache: Option<PathBuf>,
 }
@@ -90,18 +56,6 @@ pub struct WgpuEngineOptions {
     pub adapter_index: u32,
     pub backends: Option<String>,
     pub power_preference: String,
-    #[serde(skip_serializing)]
-    pub kv_page_size: Removed<KvPageSize>,
-    #[serde(skip_serializing)]
-    pub max_state_slots: Removed<MaxStateSlots>,
-    #[serde(skip_serializing)]
-    pub max_model_len: Removed<MaxModelLen>,
-    #[serde(skip_serializing)]
-    pub max_forward_tokens: Removed<MaxForwardTokens>,
-    #[serde(skip_serializing)]
-    pub max_forward_requests: Removed<MaxForwardRequests>,
-    #[serde(skip_serializing)]
-    pub device_memory: Removed<DeviceMemory>,
 }
 
 impl Default for WgpuEngineOptions {
@@ -110,12 +64,6 @@ impl Default for WgpuEngineOptions {
             adapter_index: 0,
             backends: None,
             power_preference: "high-performance".to_string(),
-            kv_page_size: Removed::default(),
-            max_state_slots: Removed::default(),
-            max_model_len: Removed::default(),
-            max_forward_tokens: Removed::default(),
-            max_forward_requests: Removed::default(),
-            device_memory: Removed::default(),
         }
     }
 }
@@ -146,16 +94,6 @@ pub struct XlaEngineOptions {
     /// number in `[engine] device` (`tpu:1`).
     #[serde(skip)]
     pub device_index: u32,
-    #[serde(skip_serializing)]
-    pub kv_page_size: Removed<KvPageSize>,
-    #[serde(skip_serializing)]
-    pub max_state_slots: Removed<MaxStateSlots>,
-    #[serde(skip_serializing)]
-    pub max_model_len: Removed<MaxModelLen>,
-    #[serde(skip_serializing)]
-    pub max_forward_tokens: Removed<MaxForwardTokens>,
-    #[serde(skip_serializing)]
-    pub max_forward_requests: Removed<MaxForwardRequests>,
     /// Trace and compile the fire shapes a server meets first at load, so
     /// no early request waits on a compile. Slower to load.
     pub prewarm: bool,
@@ -164,10 +102,10 @@ pub struct XlaEngineOptions {
     pub device_headroom: Option<ByteSize>,
     /// The tokens one sequence is expected to hold, its prompt and output
     /// budget: a hybrid's state slots are balanced against the kv pages a
-    /// seat of this many tokens takes rather than one at `max_model_len`.
-    /// The pool still holds one sequence at `max_model_len`, and one that
+    /// seat of this many tokens takes rather than one at `max_context`.
+    /// The pool still holds one sequence at `max_context`, and one that
     /// outgrows its seat meets kv pressure as any other. Omit for
-    /// `max_model_len`.
+    /// `max_context`.
     pub seat_tokens: Option<u32>,
 }
 
@@ -184,16 +122,6 @@ pub struct CerebrasEngineOptions {
     pub cmaddr: Option<String>,
     /// Host threads the simulator uses.
     pub num_threads: u32,
-    #[serde(skip_serializing)]
-    pub kv_page_size: Removed<KvPageSize>,
-    #[serde(skip_serializing)]
-    pub max_state_slots: Removed<MaxStateSlots>,
-    #[serde(skip_serializing)]
-    pub max_model_len: Removed<MaxModelLen>,
-    #[serde(skip_serializing)]
-    pub max_forward_tokens: Removed<MaxForwardTokens>,
-    #[serde(skip_serializing)]
-    pub max_forward_requests: Removed<MaxForwardRequests>,
     /// Steps a greedy lane's token loop runs past its row in one wafer launch (0: off); omit
     /// for the engine's default.
     pub lookahead: Option<u32>,
@@ -221,11 +149,6 @@ impl Default for CerebrasEngineOptions {
             target: "wse3".to_string(),
             cmaddr: None,
             num_threads: 16,
-            kv_page_size: Removed::default(),
-            max_state_slots: Removed::default(),
-            max_model_len: Removed::default(),
-            max_forward_tokens: Removed::default(),
-            max_forward_requests: Removed::default(),
             lookahead: None,
             asynchronous: None,
             posted_loop: None,

@@ -995,11 +995,7 @@ pub(crate) fn build_options(e: &config::EngineConfig, flavor: Flavor) -> Result<
     match flavor {
         #[cfg(feature = "engine-cuda")]
         Flavor::Cuda => {
-            let mut c: CudaEngineOptions = e
-                .options
-                .clone()
-                .try_into()
-                .map_err(|why| anyhow!("[engine] options: {why}"))?;
+            let mut c: CudaEngineOptions = e.options_as()?;
             let device = e
                 .device
                 .first()
@@ -1009,50 +1005,30 @@ pub(crate) fn build_options(e: &config::EngineConfig, flavor: Flavor) -> Result<
         }
         #[cfg(all(feature = "metal", target_vendor = "apple"))]
         Flavor::Metal => {
-            let p: MetalEngineOptions = e
-                .options
-                .clone()
-                .try_into()
-                .map_err(|why| anyhow!("[engine] options: {why}"))?;
+            let p: MetalEngineOptions = e.options_as()?;
             Ok(EngineOptions::Metal(p))
         }
         #[cfg(feature = "vulkan")]
         Flavor::Vulkan => {
-            let mut v: VulkanEngineOptions = e
-                .options
-                .clone()
-                .try_into()
-                .map_err(|why| anyhow!("[engine] options: {why}"))?;
+            let mut v: VulkanEngineOptions = e.options_as()?;
             v.device_index = device_index(&e.device, &["vulkan"])?;
             Ok(EngineOptions::Vulkan(v))
         }
         #[cfg(feature = "wgpu")]
         Flavor::Wgpu => {
-            let mut w: WgpuEngineOptions = e
-                .options
-                .clone()
-                .try_into()
-                .map_err(|why| anyhow!("[engine] options: {why}"))?;
+            let mut w: WgpuEngineOptions = e.options_as()?;
             w.adapter_index = device_index(&e.device, &["wgpu"])?;
             Ok(EngineOptions::Wgpu(w))
         }
         #[cfg(feature = "xla")]
         Flavor::Xla => {
-            let mut x: XlaEngineOptions = e
-                .options
-                .clone()
-                .try_into()
-                .map_err(|why| anyhow!("[engine] options: {why}"))?;
+            let mut x: XlaEngineOptions = e.options_as()?;
             x.device_index = device_index(&e.device, &["tpu", "xla"])?;
             Ok(EngineOptions::Xla(x))
         }
         #[cfg(feature = "cerebras")]
         Flavor::Cerebras => {
-            let c: CerebrasEngineOptions = e
-                .options
-                .clone()
-                .try_into()
-                .map_err(|why| anyhow!("[engine] options: {why}"))?;
+            let c: CerebrasEngineOptions = e.options_as()?;
             Ok(EngineOptions::Cerebras(c))
         }
     }
