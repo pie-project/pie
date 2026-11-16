@@ -272,16 +272,17 @@ mod tests {
         }]
     }
 
-    /// The CUDA regions a program registers, each by its text under one
-    /// symbol: what engine-cuda keys a region's module by.
-    fn regions(traced: &Traced) -> std::collections::BTreeSet<String> {
+    /// The regions `backend`'s emitter gives a program, each by its text
+    /// under one symbol: what engine-cuda and engine-metal key a region's
+    /// module by.
+    fn regions(traced: &Traced, backend: &str) -> std::collections::BTreeSet<String> {
         let mut registry =
             super::super::program::Registry::new(std::num::NonZeroUsize::new(1).unwrap());
         let program = registry
             .register(traced.encode(), vec![outputs()], EngineCaps::default())
             .expect("registers");
         program
-            .emitted("cuda")
+            .emitted(backend)
             .expect("emits")
             .kernels
             .iter()
@@ -311,12 +312,14 @@ mod tests {
             let asked = passes(VOCAB, 16, &outputs(), 8, shape, &request).expect("traces");
             for (pass, (built, asked)) in ["prompt", "decode"].iter().zip(built.iter().zip(&asked))
             {
-                let (built, asked) = (regions(&built.1), regions(asked));
-                assert!(!built.is_empty(), "{name} ({pass}) emits no region");
-                assert_eq!(
-                    built, asked,
-                    "{name} ({pass}): a request builds a region the prewarm did not"
-                );
+                for backend in ["cuda", "metal"] {
+                    let (built, asked) = (regions(&built.1, backend), regions(asked, backend));
+                    assert!(!built.is_empty(), "{name} ({pass}, {backend}) emits no region");
+                    assert_eq!(
+                        built, asked,
+                        "{name} ({pass}, {backend}): a request builds a region the prewarm did not"
+                    );
+                }
             }
         }
     }
