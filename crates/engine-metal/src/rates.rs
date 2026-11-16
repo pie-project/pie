@@ -1,45 +1,33 @@
 //! `pie tune metal --rates`: the device's rates as pie's Metal kernels reach
-//! them, for a profile's `[rates]`. Every rate is the median of five fires
-//! timed by the GPU (`Frame::commit_timed`) after a warm one, each through
-//! the kernel serving dispatches under the device's own tuning, and none
-//! depends on a model:
+//! them, at the shapes every backend times ([`engine::rates`]), each through
+//! the kernel serving dispatches under the device's own tuning:
 //!
-//! * `bf16_flops_per_ns_by_rows`: a bf16 matmul of `m × 4096 × 4096`
-//!   (`linear::gemm::matmul`) at `m` = 16, 32, …, 8192, each repeat over
-//!   the next of 8 distinct weights so every one streams from memory;
-//! * `attn_flops_per_ns`: a causal prefill (`attn::arbiter::prefill`) of
-//!   2048 query rows over 2048 keys, 16 query and 8 kv heads of 128, over a
-//!   bf16 pool of the 16-token pages serving builds; its flops are
-//!   `4 · rows · keys · q_heads · d / 2` (causal: half the pairs);
-//! * `scan_elements_per_ns`: a gated-delta chunked scan
-//!   (`ssm::gated_delta_chunked`) and the width-4 causal conv before it
-//!   (`ssm::causal_conv1d_chunked`), 2048 tokens, 16 heads, `d_k = d_v =
-//!   128`; its elements are `tokens · heads · d_k · d_v`;
-//! * `bytes_per_ns`: a 256 MiB blit between two buffers, read and write
-//!   counted;
-//! * `launch_ns`: a dispatch's launch, the smallest matmul back to back in
-//!   one frame.
+//! * the matmul curve: `linear::gemm::matmul` at each of
+//!   [`engine::rates::LATTICE_ROWS`], each repeat over the next of 8
+//!   distinct weights so every one streams from memory, as a fire's do;
+//! * attention: `attn::arbiter::prefill` at [`engine::rates::ATTN_SHAPE`],
+//!   causal, over a bf16 pool of the 16-token pages serving builds;
+//! * the scan: `ssm::causal_conv1d_chunked` then `ssm::gated_delta_chunked`
+//!   at [`engine::rates::SCAN_SHAPE`];
+//! * a 256 MiB blit between two buffers (read and write counted), and a
+//!   dispatch's launch (the smallest matmul back to back in one frame).
 //!
-//! Each kernel is timed back to back with itself, as many to a frame as
-//! fill 20 ms, and the frame's time divided: serving runs hundreds of
+//! Each kernel is timed by the GPU (`Frame::commit_timed`) back to back
+//! with itself, as many to a frame as fill 20 ms, the median of five such
+//! frames after a warm one, over the count: serving runs hundreds of
 //! dispatches a fire, and a frame of one short dispatch times the clock
-//! state the device idled into, not the kernel.
-
-use std::path::Path;
+//! state the device idled into, not the kernel. The counts that turn the
+//! times into rates are [`engine::rates`]'.
 
 use kernels_metal::linear::gemm;
 use kernels_metal::tensor::{RaggedTensor, RecurrentPool};
+use engine::rates::{ATTN_SHAPE, GEMM_COLUMNS, GEMM_DEPTH, LATTICE_ROWS, SCAN_SHAPE};
 use kernels_metal::{KvPool, PrefillPlan, StateMap, Tensor, Tuning, attn, ssm};
 use poem_ir::Dtype;
+use profile::fire::Rates;
 
 use crate::device::{Buffer, Context, Handles, Pipelines};
 use crate::encode::Sink;
-
-/// The rows the matmul ladder is timed at: `m × 4096 × 4096`.
-pub const ROWS: [u32; 10] = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192];
-
-/// The matmul's width and contraction.
-const WIDTH: u32 = 4096;
 
 /// How long a timed frame runs: long enough that the device reaches and
 /// holds its serving clock through it. A narrow kernel's frame of 5 ms read
@@ -50,42 +38,10 @@ const FRAME_SECONDS: f64 = 0.020;
 /// The most of one measurement a timed frame repeats.
 const MAX_REPEATS: u32 = 512;
 
-/// The distinct `4096 × 4096` bf16 weights (32 MiB each) the matmul ladder
-/// rotates over: 256 MiB, well past any Apple GPU's system-level cache.
+/// The distinct bf16 weights (32 MiB each at 4096 × 4096) the matmul
+/// curve rotates over: 256 MiB, well past any Apple GPU's system-level
+/// cache.
 const WEIGHTS: u64 = 8;
-
-/// What one `pie tune metal --rates` measured.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Measured {
-    pub device: String,
-    /// `(m, bf16 flops a ns)` at each of [`ROWS`].
-    pub flops_by_rows: Vec<(u32, f64)>,
-    pub attn_flops_per_ns: f64,
-    pub scan_elements_per_ns: f64,
-    pub bytes_per_ns: f64,
-    pub launch_ns: u64,
-}
-
-impl Measured {
-    /// The profile's `[rates]` block.
-    #[must_use]
-    pub fn block(&self) -> String {
-        let ladder: Vec<String> = self
-            .flops_by_rows
-            .iter()
-            .map(|(m, r)| format!("[{m}, {r:.1}]"))
-            .collect();
-        format!(
-            "[rates]\nbf16_flops_per_ns_by_rows = [{}]\nattn_flops_per_ns = {:.1}\n\
-             scan_elements_per_ns = {:.1}\nbytes_per_ns = {:.1}\nlaunch_ns = {}\n",
-            ladder.join(", "),
-            self.attn_flops_per_ns,
-            self.scan_elements_per_ns,
-            self.bytes_per_ns,
-            self.launch_ns
-        )
-    }
-}
 
 fn median(mut times: Vec<f64>) -> f64 {
     times.sort_by(f64::total_cmp);
@@ -173,12 +129,12 @@ impl Bench<'_> {
     /// rotates over.
     fn matmul_flops(&self, m: u32, weights: &[Tensor]) -> Result<f64, String> {
         let (a, y) = (
-            self.zeroed(u64::from(m) * u64::from(WIDTH) * 2)?,
-            self.zeroed(u64::from(m) * u64::from(WIDTH) * 2)?,
+            self.zeroed(u64::from(m) * u64::from(GEMM_DEPTH) * 2)?,
+            self.zeroed(u64::from(m) * u64::from(GEMM_COLUMNS) * 2)?,
         );
         let (at, yt) = (
-            self.tensor(&a, m, WIDTH, Dtype::Bf16)?,
-            self.tensor(&y, m, WIDTH, Dtype::Bf16)?,
+            self.tensor(&a, m, GEMM_DEPTH, Dtype::Bf16)?,
+            self.tensor(&y, m, GEMM_COLUMNS, Dtype::Bf16)?,
         );
         // Each repeat reads the next weight: serving streams a layer's from
         // memory, and one weight repeated would sit in the system cache,
@@ -186,15 +142,15 @@ impl Bench<'_> {
         let seconds = self.timed(&|sink, at_k| {
             gemm::matmul(sink, self.tuning, at, weights[at_k as usize % weights.len()], yt)
         })?;
-        Ok(2.0 * f64::from(m) * f64::from(WIDTH) * f64::from(WIDTH) / (seconds * 1e9))
+        Ok(engine::rates::gemm_flops(m) / (seconds * 1e9))
     }
 
     fn attention_flops(&self) -> Result<f64, String> {
-        const ROWS: u32 = 2048;
-        const KEYS: u32 = 2048;
-        const Q_HEADS: u32 = 16;
-        const KV_HEADS: u32 = 8;
-        const D: u32 = 128;
+        const ROWS: u32 = ATTN_SHAPE.rows;
+        const KEYS: u32 = ATTN_SHAPE.keys;
+        const Q_HEADS: u32 = ATTN_SHAPE.q_heads;
+        const KV_HEADS: u32 = ATTN_SHAPE.kv_heads;
+        const D: u32 = ATTN_SHAPE.head_dim;
         const PAGE: u32 = 16;
         let pages = KEYS.div_ceil(PAGE);
         let slots = pages * PAGE;
@@ -242,17 +198,17 @@ impl Bench<'_> {
         let seconds = self.timed(&|sink, _| {
             attn::arbiter::prefill(sink, q, &plan, &pool, None, D, KV_HEADS, scale, o, 1, self.tuning)
         })?;
-        let flops = 4.0 * f64::from(ROWS) * f64::from(KEYS) * f64::from(Q_HEADS) * f64::from(D) / 2.0;
-        Ok(flops / (seconds * 1e9))
+        Ok(engine::rates::attn_flops(ATTN_SHAPE) / (seconds * 1e9))
     }
 
     fn scan_elements(&self) -> Result<f64, String> {
-        const TOKENS: u32 = 2048;
-        const HEADS: u32 = 16;
-        const DK: u32 = 128;
-        const DV: u32 = 128;
-        const CONV: u32 = 4;
-        let channels = 2 * HEADS * DK + HEADS * DV;
+        const TOKENS: u32 = SCAN_SHAPE.tokens;
+        const K_HEADS: u32 = SCAN_SHAPE.k_heads;
+        const HEADS: u32 = SCAN_SHAPE.v_heads;
+        const DK: u32 = SCAN_SHAPE.k_dim;
+        const DV: u32 = SCAN_SHAPE.v_dim;
+        const CONV: u32 = SCAN_SHAPE.conv_width;
+        let channels = SCAN_SHAPE.channels();
         let bank = u64::from(HEADS * DV * DK);
         let qkv_in = self.buffer(&bf16_noise((TOKENS * channels) as usize, 23, 0.5))?;
         let qkv = self.zeroed(u64::from(TOKENS * channels) * 2)?;
@@ -299,15 +255,14 @@ impl Bench<'_> {
                 convolved,
                 gates,
                 &pool,
-                HEADS,
+                K_HEADS,
                 HEADS,
                 DK,
                 DV,
                 y,
             )
         })?;
-        let elements = f64::from(TOKENS) * f64::from(HEADS) * f64::from(DK) * f64::from(DV);
-        Ok(elements / (seconds * 1e9))
+        Ok(engine::rates::scan_elements(SCAN_SHAPE) / (seconds * 1e9))
     }
 
     fn bytes_per_ns(&self) -> Result<f64, String> {
@@ -343,54 +298,49 @@ impl Bench<'_> {
     }
 }
 
-/// Measures this device's rates under its resolved profile (the user's
-/// shelf in `profiles`, else the shipped file), saying each as it lands.
-pub fn measure(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Measured, String> {
-    let device = Context::bind().map_err(|e| e.to_string())?;
-    let name = device.name().to_string();
-    let facts = crate::chip::measured(&device, crate::chip::perf_cores());
-    let (profile, report) = crate::chip::resolve(&name, &facts, profiles);
-    say(&format!("{name}: measuring the rates under {}", report.used));
+/// `device`'s rates under the kernel tuning of `profile` (the profile a
+/// load on it runs), saying each as it lands.
+pub fn measure(
+    device: &Context,
+    profile: profile::Profile,
+    say: &mut dyn FnMut(&str),
+) -> Result<Rates, String> {
     let tuning = Tuning::new(profile, false, device.cores()).with_family(device.family());
     let bench = Bench {
-        device: &device,
+        device,
         handles: Handles::new(),
         pipelines: Pipelines::new(),
         tuning: &tuning,
     };
     let weights = (0..WEIGHTS)
         .map(|seed| {
-            let w = bench.buffer(&bf16_noise((WIDTH * WIDTH) as usize, 7 + seed, 0.05))?;
-            Ok((bench.tensor(&w, WIDTH, WIDTH, Dtype::Bf16)?, w))
+            let w = bench.buffer(&bf16_noise((GEMM_COLUMNS * GEMM_DEPTH) as usize, 7 + seed, 0.05))?;
+            Ok((bench.tensor(&w, GEMM_COLUMNS, GEMM_DEPTH, Dtype::Bf16)?, w))
         })
         .collect::<Result<Vec<(Tensor, Buffer)>, String>>()?;
     let weight_tensors: Vec<Tensor> = weights.iter().map(|(t, _)| *t).collect();
-    let mut flops_by_rows = Vec::with_capacity(ROWS.len());
-    for m in ROWS {
+    let mut curve = Vec::with_capacity(LATTICE_ROWS.len());
+    for m in LATTICE_ROWS {
         let rate = bench.matmul_flops(m, &weight_tensors)?;
-        say(&format!("  bf16 matmul {m} x {WIDTH} x {WIDTH}: {:.2} TFLOP/s", rate / 1e3));
-        flops_by_rows.push((m, rate));
+        say(&format!(
+            "  bf16 matmul {m} x {GEMM_COLUMNS} x {GEMM_DEPTH}: {:.2} TFLOP/s",
+            rate / 1e3
+        ));
+        curve.push((m, rate));
     }
-    let attn_flops_per_ns = bench.attention_flops()?;
-    say(&format!(
-        "  causal prefill 2048 x 2048, 16/8 heads of 128: {:.2} TFLOP/s",
-        attn_flops_per_ns / 1e3
-    ));
-    let scan_elements_per_ns = bench.scan_elements()?;
-    say(&format!(
-        "  gated-delta scan + conv, 2048 tokens, 16 heads of 128x128: {:.1} G elements/s",
-        scan_elements_per_ns
-    ));
-    let bytes_per_ns = bench.bytes_per_ns()?;
-    say(&format!("  256 MiB blit: {bytes_per_ns:.1} GB/s read+write"));
-    let launch_ns = bench.launch_ns()?;
-    say(&format!("  launch: {launch_ns} ns a dispatch"));
-    Ok(Measured {
-        device: name,
-        flops_by_rows,
-        attn_flops_per_ns,
-        scan_elements_per_ns,
-        bytes_per_ns,
-        launch_ns,
+    let attn = bench.attention_flops()?;
+    say(&format!("  prefill attention: {:.2} TFLOP/s", attn / 1e3));
+    let scan = bench.scan_elements()?;
+    say(&format!("  gated-delta scan and its conv: {scan:.1} state elements a ns"));
+    let bytes = bench.bytes_per_ns()?;
+    say(&format!("  256 MiB blit: {bytes:.1} GB/s read and write"));
+    let launch = bench.launch_ns()?;
+    say(&format!("  launch: {launch} ns a dispatch"));
+    Ok(Rates {
+        bf16_flops_per_ns_by_rows: Some(curve),
+        attn_flops_per_ns: Some(attn),
+        scan_elements_per_ns: Some(scan),
+        bytes_per_ns: Some(bytes),
+        launch_ns: Some(launch),
     })
 }
