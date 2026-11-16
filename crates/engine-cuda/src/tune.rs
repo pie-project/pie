@@ -33,13 +33,28 @@ pub struct Rated {
 
 /// `pie tune cuda --rates`: GPU 0's rates measured at `engine::rates`'
 /// lattice ([`crate::rates::measure`]), its GEMMs under the tactics serving
-/// keeps in the engine cache beside `profiles` (`$PIE_HOME/cache`), laid
-/// over the profile it runs.
+/// reads (the device's checked-in table, then the user's beside
+/// `profiles`), a product they lack timed here and added to the user's, as
+/// every `pie tune` step times them; laid over the profile it runs.
 pub fn rates(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Rated, String> {
     let began = Instant::now();
     let (name, facts) = crate::chip::probe(0).ok_or("no CUDA device answers")?;
     let (base, report) = crate::chip::resolve(&name, &facts, profiles);
     say(&format!("{name}: starting from {}", report.used));
+    #[cfg(feature = "cuda")]
+    let _untime = {
+        let tactics = kernels_cuda::linear::gemm::install_tactics(
+            crate::chip::gemm_table(&name),
+            profiles.map(|profiles| crate::chip::user_gemm_table(profiles, &name)),
+        );
+        say(&format!(
+            "[rates]: dense GEMM tactics from the profile's tables: {} checked in, {} the \
+             user's; a product they lack is timed and added to the user's",
+            tactics.from_profile, tactics.from_user,
+        ));
+        kernels_cuda::linear::gemm::time_tactics(true);
+        Untime
+    };
     let cache = profiles
         .and_then(Path::parent)
         .map(|home| home.join("cache"));
