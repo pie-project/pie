@@ -13,7 +13,9 @@ attention and three taps on the row stream, a GQA miniature on the simulator; gr
 priced, the VAE's passes in weight groups; klein end to end 51.8 s predicted, the VAE decode
 its bottleneck, §4.1), M2d (the tiled regime: a VAE's image over the fabric; flux2-mini's decode on
 the simulator in 0.9M cycles, 81x fewer, 50.1 dB from diffusers; klein's 1024² decode links,
-0.13 s priced; klein end to end 6.5 s, §4.1) and M3 (the decode
+0.13 s priced; klein end to end 6.5 s, §4.1), M1j (flux2-mini on the CS-3: the denoise loop
+at 1.34M cycles a step, the simulator's numerics; `pie run text-to-media` on the system, 48.4 dB
+from diffusers, §4.1) and M3 (the decode
 layouts as points of the Floorplan, §2.5). ARCHITECTURE.md is what runs for decode.
 
 **Goal.** A `.poem` model the compiler has not seen runs on the wafer with no hand code. The
@@ -1540,6 +1542,65 @@ milestone's tail.
       unshuffle on the wafer); a clip other than a square of powers of two.
     - `pie run text-to-media` on the simulator with the tiled decode (compile on load now
       picks it; M1i's run used the rows regime); klein's VAE on a system.
+
+- **M1j** (flux2-mini on the CS-3: the stream, tiled and rows programs on a system for the first
+  time; requests 1458-1468, one session). Each program linked on the worker by its own cslc
+  against the system's whole fabric (762 x 1172, offsets 4, 1), the same CSL as the simulator's.
+  - **The denoise loop, standalone** (`wafer-bench --reading --grid 1,8,8 --steps 2`, the
+    engine's inputs and engine-cpu's goldens from `flux_2_minis_reading_files`; linked in 10 s):
+
+    | | 16 + 16 (77 x 28, request 1458) | 64 + 64 (80 x 28, request 1460) |
+    |---|---|---|
+    | step 0 velocity vs engine-cpu | 4.85e-3 / 0.9999882 | 4.89e-3 / 0.9999881 |
+    | step 1 velocity vs engine-cpu | 6.36e-3 / 0.9999798 | 6.01e-3 / 0.9999820 |
+    | latent after 2 vs engine-cpu | 3.86e-3 / 0.9999925 | 3.57e-3 / 0.9999936 |
+    | latent after 2 vs diffusers | **3.58e-3 / 0.9999936** | **3.49e-3 / 0.9999939** |
+    | step 0, the first launch | 1.91M cycles, 3.2 ms | 5.93M cycles, 9.3 ms |
+    | a re-launched step (7 of an 8-step loop) | **1.33-1.35M cycles, 2.37-2.45 ms** | **5.34-5.39M cycles, 8.5-8.6 ms** |
+    | the cost model (`--price`) | 1.2M | 5.0M |
+
+    - At 16 + 16 the velocities and latents are the simulator's (M1f's `wafer-bench --save`)
+      bit for bit.
+    - The re-launched step's stamps are the simulator's 1.27M plus 6%, the cost model's plus
+      11% (7% at 64 rows). The first launch's start-up is the simulator's artifact: 7.90M
+      cycles there, 1.91M on the system.
+    - A step's wall (its entries written, the launch, the rows read back) fits 0.3 ms a launch
+      plus 1.55 ms an M cycles of stamps over the two sizes, where 875 MHz would be 1.14: the
+      stamps' clock or the launch's host side is not yet resolved.
+  - **The text reading and the denoise loop through the engine** (`flux_2_minis_text_on_the_fabric`
+    with `READING_CMADDR`, request 1462): text, denoise and VAE decode co-resident in one
+    program (153 x 65 PEs), compiled and linked on load on the worker (16 s), loaded in 37 s.
+    The text rows: 7.86e-3 / 0.9999691 against engine-cpu, **8.74e-3 / 0.9999619 against
+    transformers** (the simulator's figures), 2.03M cycles. The guest's 2-step loop over them:
+    step 0 10.7M cycles (the co-resident program's first denoise launch; 130 ms with its static
+    arrays made from the checkpoint), step 1 1.33M cycles, 2.6 ms; the latent **3.88e-3 /
+    0.9999925 from diffusers' pipeline**, as on the simulator.
+  - **The VAE decode** (`flux_2_minis_vae_on_the_fabric` with `READING_CMADDR`, request 1462):
+
+    | flux2-mini's decode on the system | vs engine-cpu | vs diffusers | cycles |
+    |---|---|---|---|
+    | tiled (34 x 33 PEs) | 9.99e-3 / 0.99995013, 51.2 dB | 1.13e-2, **50.1 dB** | 1.09M (simulator 0.905M) |
+    | rows regime (9 x 19 PEs) | 1.03e-2 / 0.99994750, 51.0 dB | 1.16e-2, 49.8 dB | 77.1M (simulator 73.5M) |
+
+    Both the simulator's numerics.
+  - **`pie run text-to-media` on the CS-3** (request 1468; `--prompt "a red fox sleeping"
+    --width 64 --height 64 --steps 2 --seed 7 --guidance 4`, `[engine] cmaddr` the system's,
+    `stream_rows = 16`, the checkpoint `mk_tiny_flux2_pipe.py --ckpt`'s): one `pie` process
+    compiles the three readings, co-resident, links them for the system (17 s) and serves the
+    inferlet's text pass, 2 denoise steps and the tiled VAE decode on the wafer; a 64 x 64 PNG,
+    **48.4 dB against diffusers' pipeline** (max |diff| 4/255; the simulator's M1i run, rows
+    regime decode, 48.3; 49.5 dB between the two).
+
+    | step | cycles | fire |
+    |---|---|---|
+    | text (16 tokens; the program's load) | 2.06M | 37.1 s (36.7 s the load) |
+    | denoise step 0 (first launch, static arrays made) | 10.7M | 81 ms |
+    | denoise step 1 | 1.33M | 2.5 ms |
+    | VAE decode, tiled (static arrays made) | 1.07M | 14.6 ms |
+
+  - Left: the first launch of a co-resident program's denoise (10.7M cycles against 1.9M
+    standalone) and the 37 s load; a step's wall past its stamps (the host side of a launch);
+    the 64-row and klein programs through the engine on the system.
 
 ## 5. Risks
 
