@@ -396,15 +396,16 @@ fn write_stream(
 }
 
 /// Compiles `trace`'s decode step as a unit program (GENERIC.md G1: decode through the stream
-/// regime's units, one row a step, each attention layer's K / V column its cache of `positions`
-/// across steps) into `out`. Returns the program.
+/// regime's units, `lanes` rows a step, a row a lane, each attention layer's K / V column its
+/// cache of `positions` across steps, in pages: G1.8) into `out`. Returns the program.
 pub fn compile_decode(
     trace: &Trace,
     positions: u32,
+    lanes: u32,
     round16: bool,
     out: &std::path::Path,
 ) -> R<build::Program> {
-    let classes = program::decode_classes(trace, 1);
+    let classes = program::decode_classes(trace, lanes.max(1));
     let mut s = shape(trace, "decode", &classes)?;
     s.cache = Some(positions);
     let p = build::program_py(
@@ -436,13 +437,20 @@ pub fn compile_decode(
         &std::fs::read_to_string(&at).map_err(|e| format!("{}: {e}", at.display()))?,
     )
     .map_err(|e| e.to_string())?;
-    let pos: Vec<serde_json::Value> = e
-        .arrays
-        .iter()
-        .filter(|a| a.sym == "pos")
-        .map(|a| serde_json::json!({"x": a.at.x, "y": a.at.y}))
-        .collect();
-    h["pos"] = serde_json::json!(pos);
+    let pes = |sym: &str| -> Vec<serde_json::Value> {
+        (e.arrays.iter())
+            .filter(|a| a.sym == sym)
+            .map(|a| serde_json::json!({"x": a.at.x, "y": a.at.y}))
+            .collect()
+    };
+    h["pos"] = serde_json::json!(pes("pos"));
+    // the attention columns' pages (GENERIC.md G1.8): a step's rows' (lane slot, position) and
+    // each lane slot's pages, at every K / V PE
+    if let Some(g) = crate::emit::stream::paging(&p) {
+        h["paging"] = serde_json::json!({"size": g.size, "pages": g.pages, "lanes": g.lanes});
+        h["rowp"] = serde_json::json!(pes("rowp"));
+        h["ptab"] = serde_json::json!(pes("ptab"));
+    }
     std::fs::write(
         &at,
         serde_json::to_string_pretty(&h).map_err(|e| e.to_string())?,

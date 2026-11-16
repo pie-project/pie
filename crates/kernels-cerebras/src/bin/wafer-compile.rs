@@ -255,9 +255,13 @@ fn stream(args: &[String]) -> Result<(), String> {
         let positions: u32 = get("--positions")
             .map_or(Ok(4096), |r| r.parse())
             .map_err(|e| format!("--positions: {e}"))?;
+        let lanes: u32 = get("--lanes")
+            .map_or(Ok(1), |r| r.parse())
+            .map_err(|e| format!("--lanes: {e}"))?;
         let p = kernels_cerebras::stream::compile_decode(
             &trace,
             positions,
+            lanes,
             !ieee,
             std::path::Path::new(&out),
         )?;

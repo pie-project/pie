@@ -532,15 +532,35 @@ pub fn emit(p: &Program) -> R<Emitted> {
             let (params, role) = kv_pe_params(p, c);
             tiles.insert(c, (pname.clone(), params));
             arrays.extend(cfg_array(c, &[i, role]));
-            if p.shape.cache.is_some() || state.is_some() {
-                // a decode step's first position, the host's a step (0 at the load)
-                arrays.push(HostArray {
-                    at: c,
-                    sym: "pos".into(),
-                    u16: false,
-                    len: 1,
-                    fill: Fill::Words(vec![0]),
-                });
+            match (state, paging(p)) {
+                (None, Some(g)) => {
+                    // a step's rows' (lane slot, position), the lane slots' pages
+                    arrays.push(HostArray {
+                        at: c,
+                        sym: "rowp".into(),
+                        u16: false,
+                        len: 2 * g.lanes,
+                        fill: Fill::Words(vec![0; 2 * g.lanes as usize]),
+                    });
+                    arrays.push(HostArray {
+                        at: c,
+                        sym: "ptab".into(),
+                        u16: false,
+                        len: g.lanes * g.pages,
+                        fill: Fill::Words(vec![0; (g.lanes * g.pages) as usize]),
+                    });
+                }
+                _ if p.shape.cache.is_some() || state.is_some() => {
+                    // a decode step's first position, the host's a step (0 at the load)
+                    arrays.push(HostArray {
+                        at: c,
+                        sym: "pos".into(),
+                        u16: false,
+                        len: 1,
+                        fill: Fill::Words(vec![0]),
+                    });
+                }
+                _ => {}
             }
         }
     }
@@ -2396,13 +2416,58 @@ fn kv_root_file(p: &Program, k: usize, ks: &place::KvSched) -> R<(String, String
     Ok((name, t))
 }
 
+/// A decode program's paging (GENERIC.md G1.8): its K / V columns' slots in pages of `size`
+/// positions (a multiple of every column's rows, at least [`PAGE_MIN`]), `pages` of them a
+/// column (the cache's positions), `lanes` lane slots (a step's rows) each of at most `pages`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Paging {
+    pub size: u32,
+    pub pages: u32,
+    pub lanes: u32,
+}
+
+/// The fewest positions a page holds.
+pub const PAGE_MIN: u32 = 64;
+
+/// The paging of `p`'s attention columns: none in a stream reading's or a recurrence's.
+#[must_use]
+pub fn paging(p: &Program) -> Option<Paging> {
+    let cache = p.shape.cache?;
+    let attn: Vec<u32> = (p.stream.kv.iter())
+        .filter(|kc| kv_joint(p, &p.kv[kc.block as usize]).state.is_none())
+        .map(|kc| kc.pya)
+        .collect();
+    if attn.is_empty() {
+        return None;
+    }
+    let gcd = |mut a: u32, mut b: u32| {
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        a
+    };
+    let l = attn.iter().fold(1u32, |l, &y| l / gcd(l, y) * y);
+    let size = l * PAGE_MIN.div_ceil(l);
+    let lanes = p.class_rows.iter().map(|c| c.0).sum::<u32>().max(1);
+    Some(Paging {
+        size,
+        pages: cache.div_ceil(size),
+        lanes,
+    })
+}
+
 /// A K / V column's attention PE: the rows it keeps (q too), then every query.
 fn kv_pe_file(p: &Program, k: usize, ks: &place::KvSched) -> R<(String, String)> {
     let (qh, dc, _, sc) = kv_consts(p, ks);
     let total: u32 = ks.stores.iter().map(|s| s.1).sum();
     let pya = p.stream.kv[k].pya;
-    // a decode step's cache keeps its positions across steps; a stream step's rows its own
-    let ne = p.shape.cache.unwrap_or(total).div_ceil(pya);
+    // a decode step's cache keeps its positions across steps (in pages); a stream step's rows
+    // its own
+    let paged = paging(p);
+    let ne = match paged {
+        Some(g) => g.pages * (g.size / pya),
+        None => total.div_ceil(pya),
+    };
     let pmax = if p.round16 { "1.0e30" } else { "65504.0" };
     let causal = kv_joint(p, ks).causal;
     if causal && (ks.stores.len() != 1 || ks.stores[0].2 != 0) {
@@ -2425,8 +2490,17 @@ fn kv_pe_file(p: &Program, k: usize, ks: &place::KvSched) -> R<(String, String)>
     t.push_str("const red = @import_module(\"ops/schain.csl\", .{ .fab = fab, .IN1 = q_r, .OUT = q_s });\n");
     let _ = writeln!(
         t,
-        "const att = @import_module(\"ops/satt.csl\", .{{ .fab = fab, .math = math, .red = red, .YM = q_am, .Qh = {qh}, .Dc = {dc}, .NE = {ne}, .PYA = {}, .SC = {sc:?}, .PMAX = {pmax}, .QH = true{} }});",
+        "const att = @import_module(\"ops/satt.csl\", .{{ .fab = fab, .math = math, .red = red, .YM = q_am, .Qh = {qh}, .Dc = {dc}, .NE = {ne}, .PYA = {}, .SC = {sc:?}, .PMAX = {pmax}, .QH = true{}{} }});",
         pya,
+        match paged {
+            Some(g) => format!(
+                ", .PAGED = true, .EP = {}, .LANES = {}, .MAXP = {}, .ROWS = {total}",
+                g.size / pya,
+                g.lanes,
+                g.pages
+            ),
+            None => String::new(),
+        },
         if causal {
             match kv_joint(p, ks).window {
                 // a sliding window's: of the rows stored before a query, its last alone
@@ -2437,33 +2511,34 @@ fn kv_pe_file(p: &Program, k: usize, ks: &place::KvSched) -> R<(String, String)>
             String::new()
         }
     );
-    // a cache's step stores and queries from its first position (`pos`, the host's a step; a
-    // sequence's first step clears it)
-    let (init, at) = if p.shape.cache.is_some() {
-        t.push_str("var pos = @zeros([1]u32);\nvar pos_p: [*]u32 = &pos;\n");
-        (
-            "  if (pos[0] == 0) { att.init(@as(u16, pcfg[0])); } else { att.myrow = @as(u16, pcfg[0]); }\n",
-            "@as(u16, pos[0]) + ",
-        )
-    } else {
-        ("  att.init(@as(u16, pcfg[0]));\n", "")
-    };
-    let mut body = format!("  stamp(0);\n{init}  red.role = @as(u16, pcfg[1]);\n");
-    for &(_, rows, p0) in &ks.stores {
+    let mut body = String::from("  stamp(0);\n");
+    if paged.is_some() {
+        // a decode step's rows each at its lane's slot (`rowp`: lane slot, position; `ptab`:
+        // each lane slot's pages, the host's)
+        t.push_str("var rowp_p: [*]u32 = &att.rowp;\nvar ptab_p: [*]u32 = &att.ptab;\n");
+        body.push_str("  att.myrow = @as(u16, pcfg[0]);\n  red.role = @as(u16, pcfg[1]);\n");
         let _ = writeln!(
             body,
-            "  {{ var t: u16 = 0; while (t < {rows}) : (t += 1) {{ att.store_q({at}{p0} + t); }} }}"
+            "  {{ var t: u16 = 0; while (t < {total}) : (t += 1) {{ att.store_t(t); }} }}\n  {{ var t: u16 = 0; while (t < {total}) : (t += 1) {{ att.query_t(t); }} }}"
+        );
+    } else {
+        body.push_str("  att.init(@as(u16, pcfg[0]));\n  red.role = @as(u16, pcfg[1]);\n");
+        for &(_, rows, p0) in &ks.stores {
+            let _ = writeln!(
+                body,
+                "  {{ var t: u16 = 0; while (t < {rows}) : (t += 1) {{ att.store_q({p0} + t); }} }}"
+            );
+        }
+        let _ = writeln!(
+            body,
+            "  {{ var t: u16 = 0; while (t < {total}) : (t += 1) {{ att.query_q(t); }} }}"
         );
     }
-    let _ = writeln!(
-        body,
-        "  {{ var t: u16 = 0; while (t < {total}) : (t += 1) {{ att.query_q({at}t); }} }}"
-    );
     body.push_str("  stamp(1);\n  sys_mod.unblock_cmd_stream();\n");
     let _ = write!(t, "task go() void {{\n{body}}}\n");
     t.push_str("comptime {\n  @bind_local_task(go, T_GO);\n  @export_symbol(run);\n  @export_symbol(tsc_p, \"tsc\");\n  @export_symbol(pcfg_p, \"pcfg\");\n  @initialize_queue(q_am, .{ .color = @get_color(C_AM) });\n  @initialize_queue(q_r, .{ .color = @get_color(C_R) });\n  @initialize_queue(q_s, .{ .color = @get_color(C_S) });\n");
-    if p.shape.cache.is_some() {
-        t.push_str("  @export_symbol(pos_p, \"pos\");\n");
+    if paged.is_some() {
+        t.push_str("  @export_symbol(rowp_p, \"rowp\");\n  @export_symbol(ptab_p, \"ptab\");\n");
     }
     t.push_str("}\n");
     Ok((name, t))

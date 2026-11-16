@@ -143,7 +143,11 @@ fn main() {
                 .ok()
                 .and_then(|r| r.parse().ok())
                 .unwrap_or(4096);
-            match kernels_cerebras::stream::compile_decode(&trace, positions, true, &out) {
+            let lanes = std::env::var("LANES")
+                .ok()
+                .and_then(|r| r.parse().ok())
+                .unwrap_or(1);
+            match kernels_cerebras::stream::compile_decode(&trace, positions, lanes, true, &out) {
                 Ok(p) => line(
                     name,
                     "decode.units",

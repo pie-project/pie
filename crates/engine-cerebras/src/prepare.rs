@@ -574,7 +574,7 @@ pub fn unit_program(
     let dir = stage.path().join("decode");
     let compile = |at: u32| {
         let _ = std::fs::remove_dir_all(&dir);
-        stream::compile_decode(trace, at, true, &dir).map(|_| ())
+        stream::compile_decode(trace, at, 1, true, &dir).map(|_| ())
     };
     // the most positions that fit: the most a compile takes, by bisection (or the stated ones)
     let (mut hi, mut lo) = match positions {
