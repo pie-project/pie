@@ -1,8 +1,10 @@
-//! A decode program of stream units (GENERIC.md G1: `stream::compile_decode`'s), served as the
-//! template's [`ArtifactModel`](crate::artifact::ArtifactModel) is: one sequence a cache, a
-//! token a launch. Its statics are the checkpoint's (engine-cpu's [`Forward`]), written once as
-//! it opens; each step's entries are the host forward's, the K / V and state PEs told the step's
-//! position, and the head's rows (the logits) read back.
+//! A decode program of stream units (GENERIC.md G1: `stream::compile_decode`'s). Its statics are
+//! the checkpoint's (engine-cpu's [`Forward`]), written once as it opens; each launch runs the
+//! program's rows (B, a lane slot each: G1.8), each row a token at its position over its lane's
+//! pages ([`Row`]), the host forward's entries in, the argmax (or the logits) a row out. One
+//! sequence ([`UnitModel::forward`], the template's interface) is lane slot 0 over the pages in
+//! order; Pie's lanes ([`UnitModel::rows`]) their own pages, Pie's page ids. The column's last
+//! page is the scratch an idle row stores into.
 
 use engine_cpu::Forward;
 use engine_cpu::forward::Values;
@@ -24,6 +26,18 @@ pub struct UnitModel {
     pub vocab: usize,
     pub launches: u64,
     pub steps: u64,
+    /// The lane slots' page tables as last written (B x pages).
+    table: Vec<u32>,
+}
+
+/// A row of a launch: `token` at `pos` over its lane's `pages` (in order), its logits read back
+/// with `logits` (else its argmax alone).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Row {
+    pub token: u32,
+    pub pos: u32,
+    pub pages: Vec<u32>,
+    pub logits: bool,
 }
 
 impl UnitModel {
@@ -41,8 +55,6 @@ impl UnitModel {
         drop(weights);
         let host = Forward::host_for(trace.clone(), plane, &reading.entry_values())?;
         reading.write_statics(rt.as_mut(), &statics)?;
-        // one sequence: lane slot 0's pages in order
-        reading.write_pages(rt.as_mut(), &reading.one_sequence())?;
         let vocab = reading.outs.iter().map(|o| o.2).max().unwrap_or(0);
         // a served step reads no stamps (the per-PE cycles: 3 words a PE)
         reading.stamped = false;
@@ -56,7 +68,87 @@ impl UnitModel {
             vocab,
             launches: 0,
             steps: 0,
+            table: Vec::new(),
         })
+    }
+
+    /// The program's rows a launch (its lane slots).
+    #[must_use]
+    pub fn lanes(&self) -> usize {
+        self.reading.paging.map_or(1, |g| g.lanes as usize)
+    }
+
+    /// The pages a lane may hold (the column's but the scratch) and their positions each.
+    #[must_use]
+    pub fn pages(&self) -> Option<(u32, u32)> {
+        self.reading.paging.map(|g| (g.pages - 1, g.size))
+    }
+
+    /// `rows` run, B a launch (the last launch's idle rows at the scratch page): each row's
+    /// argmax, and its logits where it asks.
+    pub fn rows(&mut self, rows: &[Row]) -> R<Vec<(u32, Option<Vec<f32>>)>> {
+        let g = self
+            .reading
+            .paging
+            .ok_or("units: a program of no pages runs one sequence")?;
+        let (b, maxp) = (g.lanes as usize, g.pages as usize);
+        let scratch = g.pages - 1;
+        let mut out = Vec::with_capacity(rows.len());
+        for chunk in rows.chunks(b) {
+            // the lane slots' tables: a row's pages, an idle row's the scratch
+            let mut table = vec![scratch; b * maxp];
+            for (t, r) in chunk.iter().enumerate() {
+                if r.pages.len() > maxp - 1 || r.pos >= r.pages.len() as u32 * g.size {
+                    return Err(format!(
+                        "units: a row at {} over {} pages of {} positions",
+                        r.pos,
+                        r.pages.len(),
+                        g.size
+                    ));
+                }
+                table[t * maxp..t * maxp + r.pages.len()].copy_from_slice(&r.pages);
+            }
+            if table != self.table {
+                self.reading.write_pages(self.rt.as_mut(), &table)?;
+                self.table = table;
+            }
+            let toks: Vec<u32> = (0..b)
+                .map(|t| chunk.get(t).map_or(chunk[0].token, |r| r.token))
+                .collect();
+            let pos: Vec<u32> = (0..b).map(|t| chunk.get(t).map_or(0, |r| r.pos)).collect();
+            let (step, entries) =
+                self.reading
+                    .decode_step(&mut self.host, &self.trace, &toks, &pos)?;
+            self.reading.write_pos(self.rt.as_mut(), pos[0])?;
+            let slots: Vec<(u32, u32)> = (0..b).map(|t| (t as u32, pos[t])).collect();
+            self.reading.write_rows(self.rt.as_mut(), &slots)?;
+            self.launches += 1;
+            self.steps += chunk.len() as u64;
+            if !chunk.iter().any(|r| r.logits) && !self.reading.argmax.is_empty() {
+                // the argmax off the wafer: two words a head root a row, not the vocabulary
+                self.reading.write_entries(self.rt.as_mut(), &entries)?;
+                self.rt.launch(&self.reading)?;
+                if let Some(a) = self.rt.argmax(&self.reading)? {
+                    out.extend(a.into_iter().take(chunk.len()).map(|k| (k, None)));
+                    continue;
+                }
+            }
+            let (got, _) = self.reading.launch_on(self.rt.as_mut(), &step, &entries)?;
+            let back = self.reading.rows_back(&got)?;
+            let logits = back
+                .into_iter()
+                .max_by_key(|c| c.width)
+                .ok_or("units: no logits read back")?;
+            let Values::F32(v) = logits.values else {
+                return Err("units: the logits are not f32".into());
+            };
+            let w = logits.width;
+            for (t, r) in chunk.iter().enumerate() {
+                let l = &v[t * w..(t + 1) * w];
+                out.push((argmax_of(l), r.logits.then(|| l.to_vec())));
+            }
+        }
+        Ok(out)
     }
 
     /// One token at position `at`: the argmax after it and, with `logits` (or where the program
@@ -69,11 +161,22 @@ impl UnitModel {
             ));
         }
         let at = u32::try_from(at).map_err(|e| e.to_string())?;
+        if let Some((pages, size)) = self.pages() {
+            // one sequence: lane slot 0 over the pages in order
+            let need = (at / size + 1).min(pages);
+            let row = Row {
+                token,
+                pos: at,
+                pages: (0..need).collect(),
+                logits,
+            };
+            let mut got = self.rows(&[row])?;
+            return got.pop().ok_or_else(|| "units: no row back".to_string());
+        }
         let (step, entries) =
             self.reading
                 .decode_step(&mut self.host, &self.trace, &[token], &[at])?;
         self.reading.write_pos(self.rt.as_mut(), at)?;
-        self.reading.write_rows(self.rt.as_mut(), &[(0, at)])?;
         self.launches += 1;
         self.steps += 1;
         if !logits && !self.reading.argmax.is_empty() {

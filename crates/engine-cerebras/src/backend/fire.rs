@@ -201,6 +201,12 @@ impl CerebrasEngine {
         ))
     }
 
+    /// Whether the model is a unit program over pages (its lanes' rows run together, each over
+    /// its lane's own pages).
+    fn paged(&self) -> bool {
+        self.model.as_ref().is_some_and(|w| w.paging.is_some())
+    }
+
     /// Whether greedy loops are posted back to back (debug `posted = false`: one
     /// loop at a time).
     fn loop_posting(&self) -> bool {
@@ -447,6 +453,8 @@ impl CerebrasEngine {
         let mut read_rows: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
         // Lanes a token loop answered (their row a one-hot of the argmax).
         let mut fast: Vec<bool> = Vec::with_capacity(lanes.len());
+        // a unit program's lanes, run together after: (lane, its first position, greedy)
+        let mut paged: Vec<(usize, u32, bool)> = Vec::new();
         for (at, lane) in lanes.iter().enumerate() {
             let n = tokens[at].len() as u32;
             let rows: Vec<u32> = match &lane.readout {
@@ -484,19 +492,61 @@ impl CerebrasEngine {
                     .get(&at)
                     .is_some_and(|&instance| self.programs.greedy_reads(instance, &name))
                     && one_reader(step, at);
-                self.forward(
-                    lane.slot,
-                    &lane.kv.pages,
-                    &tokens[at],
-                    start,
-                    &rows,
-                    greedy,
-                    lane.fires_after,
-                )?
+                if self.paged() {
+                    // the lanes' rows run together below (a launch B rows, each over its
+                    // lane's pages)
+                    paged.push((at, start, greedy));
+                    (Vec::new(), false)
+                } else {
+                    self.forward(
+                        lane.slot,
+                        &lane.kv.pages,
+                        &tokens[at],
+                        start,
+                        &rows,
+                        greedy,
+                        lane.fires_after,
+                    )?
+                }
             };
             logits.push(out);
             fast.push(ran_ahead);
             read_rows.push(rows);
+        }
+        if !paged.is_empty() {
+            let mut all: Vec<crate::units::Row> = Vec::new();
+            for &(at, start, greedy) in &paged {
+                for (i, &token) in tokens[at].iter().enumerate() {
+                    all.push(crate::units::Row {
+                        token,
+                        pos: start + i as u32,
+                        pages: lanes[at].kv.pages.clone(),
+                        logits: !greedy && read_rows[at].contains(&(i as u32)),
+                    });
+                }
+            }
+            let (argmax, mut rows_logits) = self
+                .model()?
+                .rows(all)
+                .map_err(|e| Error::Device(format!("the wafer model: {e}")))?;
+            rows_logits.reverse();
+            let mut k = 0;
+            for &(at, _, greedy) in &paged {
+                let n = tokens[at].len();
+                let mine = &argmax[k..k + n];
+                k += n;
+                if greedy {
+                    // its one reader takes the argmax: the row a one-hot of it
+                    let last = read_rows[at].first().map_or(n - 1, |&r| r as usize);
+                    logits[at] = vec![one_hot(width as usize, mine.get(last).copied())];
+                    fast[at] = true;
+                } else {
+                    logits[at] = read_rows[at]
+                        .iter()
+                        .map(|_| rows_logits.pop().unwrap_or_default())
+                        .collect();
+                }
+            }
         }
         // Guest passes in the interpreter, each output it reads from this fire.
         for attachment in &step.attachments {

@@ -43,6 +43,8 @@ pub enum Logits {
 }
 
 enum Job {
+    /// Rows of Pie's lanes, each over its own pages (a unit program's: [`UnitModel::rows`]).
+    Rows(Vec<crate::units::Row>),
     Forward {
         tokens: Vec<u32>,
         start: usize,
@@ -72,6 +74,30 @@ impl Model {
         match self {
             Model::Artifact(m) => (m.cap, m.positions, m.vocab, m.hidden),
             Model::Units(m) => (1, m.positions, m.vocab, 0),
+        }
+    }
+
+    /// Rows over their own pages: each row's argmax, and the logits of those that ask (in
+    /// order).
+    fn rows(&mut self, rows: &[crate::units::Row]) -> Answer {
+        match self {
+            Model::Artifact(_) => {
+                Err("the decode template runs one sequence, not paged rows".into())
+            }
+            Model::Units(m) => {
+                let got = m.rows(rows)?;
+                let argmax = got.iter().map(|g| g.0).collect();
+                Ok((argmax, got.into_iter().filter_map(|g| g.1).collect()))
+            }
+        }
+    }
+
+    /// Its paging: (lane slots a launch, pages a lane may hold, positions a page); none for the
+    /// template's.
+    fn paging(&self) -> Option<(usize, u32, u32)> {
+        match self {
+            Model::Artifact(_) => None,
+            Model::Units(m) => m.pages().map(|(p, s)| (m.lanes(), p, s)),
         }
     }
 
@@ -117,6 +143,8 @@ pub struct Wafer {
     pub hidden: usize,
     /// The program's posted-loop length (its plan's; the config's `posted_loop` overrides it).
     pub posted_loop: usize,
+    /// A unit program's paging: (lane slots a launch, pages a lane may hold, positions a page).
+    pub paging: Option<(usize, u32, u32)>,
 }
 
 impl Wafer {
@@ -182,13 +210,14 @@ impl Wafer {
         let (job_tx, job_rx) = mpsc::channel::<Job>();
         let (ans_tx, ans_rx) = mpsc::channel::<Answer>();
         let (post_tx, post_rx) = mpsc::channel::<Answer>();
-        let (ready_tx, ready_rx) = mpsc::channel::<R<(usize, usize, usize, usize)>>();
+        let (ready_tx, ready_rx) =
+            mpsc::channel::<R<((usize, usize, usize, usize), Option<(usize, u32, u32)>)>>();
         let thread = std::thread::Builder::new()
             .name("spatial-wafer".into())
             .spawn(move || {
                 let mut m = match open() {
                     Ok(m) => {
-                        let _ = ready_tx.send(Ok(m.sizes()));
+                        let _ = ready_tx.send(Ok((m.sizes(), m.paging())));
                         m
                     }
                     Err(e) => {
@@ -237,6 +266,7 @@ impl Wafer {
                             start,
                             which,
                         } => (forward(&mut m, &tokens, start, which), &ans_tx),
+                        Job::Rows(rows) => (m.rows(&rows), &ans_tx),
                     };
                     idle_from = Instant::now();
                     let (launches, steps) = m.counts();
@@ -247,7 +277,7 @@ impl Wafer {
                 }
             })
             .map_err(|e| format!("spawning the wafer thread: {e}"))?;
-        let (cap, positions, vocab, hidden) = ready_rx
+        let ((cap, positions, vocab, hidden), paging) = ready_rx
             .recv()
             .map_err(|_| "the wafer thread died while loading".to_string())??;
         Ok(Wafer {
@@ -260,6 +290,7 @@ impl Wafer {
             vocab,
             hidden,
             posted_loop,
+            paging,
         })
     }
 
@@ -320,6 +351,14 @@ impl Wafer {
 
     /// `tokens` at `start..`: the argmax after each row and the logits `which` asks for (one row
     /// for `Last`, a row a token for `All`).
+    /// Rows of Pie's lanes over their own pages: each row's argmax, and the logits of those
+    /// that ask, in order.
+    pub fn rows(&mut self, rows: Vec<crate::units::Row>) -> Answer {
+        let _busy = Busy::start();
+        self.send(Job::Rows(rows))?;
+        self.answer()
+    }
+
     pub fn forward(&mut self, tokens: &[u32], start: usize, which: Logits) -> Answer {
         let _busy = Busy::start();
         self.send(Job::Forward {

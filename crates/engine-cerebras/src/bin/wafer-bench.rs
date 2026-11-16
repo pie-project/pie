@@ -304,8 +304,12 @@ fn decode(get: &HashMap<String, String>) -> Result<bool, String> {
                 .get("lanes")
                 .map_or(Ok(1), |p| p.parse::<u32>())
                 .map_err(|e| format!("--lanes: {e}"))?;
-            let (d, l, at) =
-                engine_cerebras::prepare::unit_program(&cfg, &trace, positions, lanes)?;
+            let (d, l, at) = engine_cerebras::prepare::unit_program(
+                &cfg,
+                &trace,
+                positions,
+                engine_cerebras::prepare::Lanes::Exactly(lanes),
+            )?;
             println!("DECODE_PROGRAM {} at {at} positions", d.display());
             (d.display().to_string(), l.display().to_string())
         }
@@ -432,8 +436,9 @@ fn decode(get: &HashMap<String, String>) -> Result<bool, String> {
         .map_or(Ok(3), |v| v.parse::<usize>())
         .map_err(|e| format!("--stagger: {e}"))?;
     if let Some(g) = reading.paging {
-        let per = g.pages / g.lanes;
-        let mut table = vec![0u32; (g.lanes * g.pages) as usize];
+        // (the column's last page the scratch)
+        let per = (g.pages - 1) / g.lanes;
+        let mut table = vec![g.pages - 1; (g.lanes * g.pages) as usize];
         for t in 0..g.lanes {
             for j in 0..per {
                 table[(t * g.pages + j) as usize] = t * per + j;

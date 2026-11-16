@@ -190,7 +190,12 @@ impl Engine for CerebrasEngine {
                 let units = if declared || self.debug.program.is_some() || host {
                     None
                 } else {
-                    match prepare::unit_program(&self.cfg, &trace, positions, 1) {
+                    match prepare::unit_program(
+                        &self.cfg,
+                        &trace,
+                        positions,
+                        prepare::Lanes::Upto(budgets.max_lanes.max(1)),
+                    ) {
                         Ok(p) => Some(p),
                         Err(u) => {
                             tracing::warn!(templates = %e, units = %u, "cerebras: no decode program");
@@ -235,6 +240,8 @@ impl Engine for CerebrasEngine {
         self.readout = facts.readout();
         // The context the model holds: the wafer program's positions.
         let model_context = u32::try_from(w.positions).unwrap_or(u32::MAX);
+        // a unit program's pages are Pie's (its K / V columns' own, a lane's ids its pages)
+        let wafer_pages = w.paging;
         self.model = Some(w);
         self.kv = Kv::default();
 
@@ -256,8 +263,11 @@ impl Engine for CerebrasEngine {
             },
             pools: PoolFacts {
                 // The pages hold tokens here (the program's cache is replayed from them).
-                kv_pages: u32::try_from(paging.pages()).unwrap_or(u32::MAX),
-                kv_page_size: paging.page_size,
+                kv_pages: wafer_pages.map_or(
+                    u32::try_from(paging.pages()).unwrap_or(u32::MAX),
+                    |(_, pages, _)| pages,
+                ),
+                kv_page_size: wafer_pages.map_or(paging.page_size, |(_, _, size)| size),
                 state_slots: if state_rows { paging.slots } else { 0 },
                 // recurrent state replays from tokens: no buffered verbs
                 buffer_pages: 0,
@@ -270,8 +280,9 @@ impl Engine for CerebrasEngine {
                 // after another, each cache brought back from its tokens.
                 max_lanes: budgets.max_lanes.max(1),
                 max_tokens: budgets.max_tokens,
-                max_page_refs: paging.pages_per_slot,
-                max_context: paging.context().min(model_context),
+                max_page_refs: wafer_pages.map_or(paging.pages_per_slot, |(_, pages, _)| pages),
+                max_context: wafer_pages
+                    .map_or(paging.context().min(model_context), |(_, p, s)| p * s),
                 prefill_rows: 0,
                 max_readouts: budgets.max_tokens,
             },
@@ -285,7 +296,8 @@ impl Engine for CerebrasEngine {
             geometry: GeometryClass::DeviceGeometry,
             kv_copy: KvCopyDomains {
                 // Pages are tokens here: a copy copies them.
-                device_to_device: true,
+                // (a unit program's pages hold its K / V on the wafer: no copy moves them)
+                device_to_device: wafer_pages.is_none(),
                 device_to_host: false,
                 host_to_device: false,
                 host_to_host: false,

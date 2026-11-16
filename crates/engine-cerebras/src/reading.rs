@@ -928,14 +928,15 @@ impl Reading {
         write_all(rt, &self.rowp, "rowp", &words)
     }
 
-    /// One sequence's page table: lane slot 0's pages in order (the rest none).
+    /// One sequence's page table: lane slot 0's pages in order.
     #[must_use]
     pub fn one_sequence(&self) -> Vec<u32> {
         let Some(g) = self.paging else {
             return Vec::new();
         };
-        let mut table = vec![0u32; (g.lanes * g.pages) as usize];
-        for (j, w) in table.iter_mut().take(g.pages as usize).enumerate() {
+        // (the rest, and past lane slot 0's, the scratch page: the column's last)
+        let mut table = vec![g.pages - 1; (g.lanes * g.pages) as usize];
+        for (j, w) in table.iter_mut().take(g.pages as usize - 1).enumerate() {
             *w = j as u32;
         }
         table

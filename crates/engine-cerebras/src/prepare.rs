@@ -545,6 +545,13 @@ fn link_stream(cfg: &Config, cslc: &Cslc, dir: &Path) -> R<()> {
     .map_err(|e| e.to_string())
 }
 
+/// The lanes a unit decode program runs a launch: so many, or the cheapest a token up to so many.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lanes {
+    Exactly(u32),
+    Upto(u32),
+}
+
 /// The positions a decode program of stream units is first tried at when the config states none,
 /// and the fewest it is searched down to.
 const UNIT_POSITIONS: (u32, u32) = (8192, 64);
@@ -558,7 +565,7 @@ pub fn unit_program(
     cfg: &Config,
     trace: &Trace,
     positions: Option<u32>,
-    lanes: u32,
+    lanes: Lanes,
 ) -> R<(PathBuf, PathBuf, u32)> {
     use kernels_cerebras::stream;
     let cache = Cache::open(cfg)?;
@@ -573,33 +580,58 @@ pub fn unit_program(
         .tempdir_in(&cache.root)
         .map_err(io(&cache.root))?;
     let dir = stage.path().join("decode");
-    let compile = |at: u32| {
+    let compile = |at: u32, b: u32| {
         let _ = std::fs::remove_dir_all(&dir);
-        stream::compile_decode(trace, at, lanes, true, &dir).map(|_| ())
+        stream::compile_decode(trace, at, b, true, &dir)
     };
-    // the most positions that fit: the most a compile takes, by bisection (or the stated ones)
+    // the most positions that fit one lane: the most a compile takes, by bisection (or the
+    // stated ones)
     let (mut hi, mut lo) = match positions {
         Some(p) => (p, p),
         None => UNIT_POSITIONS,
     };
     let mut at = hi;
-    if let Err(e) = compile(hi) {
+    if let Err(e) = compile(hi, 1) {
         if lo == hi {
             return Err(e);
         }
-        compile(lo)?;
+        compile(lo, 1)?;
         while hi > lo + lo.max(16) / 8 {
             let mid = lo + (hi - lo) / 2;
-            match compile(mid) {
-                Ok(()) => lo = mid,
+            match compile(mid, 1) {
+                Ok(_) => lo = mid,
                 Err(_) => hi = mid,
             }
         }
         // multiples of 16 positions
         lo -= lo % 16;
-        compile(lo)?;
         at = lo;
     }
+    // the lanes a launch: the stated, else the cheapest a token by the price (cycles a step over
+    // its rows) of those that place, up to the most the engine runs at once
+    let lanes = match lanes {
+        Lanes::Exactly(b) => b,
+        Lanes::Upto(most) => {
+            let mut best = (f64::MAX, 1);
+            let mut b = 1;
+            while b <= most.max(1) {
+                if let Ok(p) = compile(at, b) {
+                    let per = kernels_cerebras::cost::stream::time(&p).cycles / f64::from(b);
+                    tracing::info!(
+                        lanes = b,
+                        cycles_a_token = per,
+                        "cerebras: a unit decode program priced"
+                    );
+                    if per < best.0 {
+                        best = (per, b);
+                    }
+                }
+                b *= 2;
+            }
+            best.1
+        }
+    };
+    compile(at, lanes)?;
     let mut hasher = blake3::Hasher::new();
     let mut files = walk(&dir)?;
     files.sort();
