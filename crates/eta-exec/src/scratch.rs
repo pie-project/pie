@@ -542,14 +542,20 @@ mod tests {
         a_reserve_lies_below_the_temporary_arena();
         mismatched_lifetimes_fall_back_to_the_naive_layout();
         a_dead_value_takes_no_slot();
-        rows_of_one_class_share_only_at_one_offset();
+        rows_of_one_class_share_only_at_one_offset(None);
+        // In pieces of a chunk, a few values a piece: the same rule within
+        // each piece, and none past it.
+        rows_of_one_class_share_only_at_one_offset(Some(2048));
+        rows_of_one_class_share_only_at_one_offset(Some(4096));
     }
 
     /// Within a launch across blocks, block `b` owns row `b` of every value
     /// of a row class: a value that takes another's bytes there lies at the
     /// other's offset, so no block's row lands on another block's. Values
-    /// that share across launches may lie anywhere over each other.
-    fn rows_of_one_class_share_only_at_one_offset() {
+    /// that share across launches may lie anywhere over each other. With
+    /// `chunk`, laid in pieces of it ([`layout_chunked`]): two values share
+    /// bytes only in one piece, and the rule holds there.
+    fn rows_of_one_class_share_only_at_one_offset(chunk: Option<u64>) {
         let mut state = 0x2545_f491_4f6c_dd1du64;
         let mut next = |bound: u64| {
             state ^= state << 13;
@@ -576,7 +582,11 @@ mod tests {
                 let last = def + next(4) as u32;
                 // Steps 0..3 one launch across blocks, 4.. another.
                 let launch = |step: u32| u32::from(step >= 4);
-                let class = if next(5) == 0 { 0 } else { (1u64 << 40) | u64::from(width) * 4 };
+                let class = if next(5) == 0 {
+                    0
+                } else {
+                    (1u64 << 40) | u64::from(width) * 4
+                };
                 lifetimes.push(Lifetime {
                     dead: false,
                     def,
@@ -588,17 +598,33 @@ mod tests {
                     class_last: class,
                 });
             }
-            let laid = layout_reusing(&descriptors, &lifetimes, 0, 0).unwrap();
+            let places: Vec<Placed> = match chunk {
+                None => layout_reusing(&descriptors, &lifetimes, 0, 0)
+                    .unwrap()
+                    .values
+                    .into_iter()
+                    .map(|offset| Placed { piece: 0, offset })
+                    .collect(),
+                Some(chunk) => {
+                    let laid = layout_chunked(&descriptors, &lifetimes, 0, 0, chunk).unwrap();
+                    holds(&laid, &descriptors, &lifetimes, 0, chunk);
+                    laid.values
+                }
+            };
             let span = |i: usize| align_up(descriptors[i].device_bytes()).unwrap();
             for i in 0..count {
                 for j in 0..count {
                     let (a, b) = (lifetimes[i], lifetimes[j]);
-                    let (oi, oj) = (laid.values[i], laid.values[j]);
-                    let overlap = oi < oj + span(j) && oj < oi + span(i);
+                    let (pi, pj) = (places[i], places[j]);
+                    let (oi, oj) = (pi.offset, pj.offset);
+                    let overlap = pi.piece == pj.piece && oi < oj + span(j) && oj < oi + span(i);
                     if i == j || !overlap {
                         continue;
                     }
-                    assert!(a.last < b.def || b.last < a.def, "{i} and {j} live together");
+                    assert!(
+                        a.last < b.def || b.last < a.def,
+                        "{i} and {j} live together"
+                    );
                     let (early, late) = if a.last < b.def { (a, b) } else { (b, a) };
                     if early.launch_last >= late.launch_def {
                         assert_eq!(oi, oj, "{i} and {j} share a launch's rows at two offsets");
