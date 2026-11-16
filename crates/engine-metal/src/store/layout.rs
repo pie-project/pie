@@ -531,6 +531,7 @@ impl Layout {
             disk_persistent: false,
             disk_kept: false,
             weights: Vec::new(),
+            record_bytes: 0,
         }
     }
 }

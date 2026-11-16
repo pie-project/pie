@@ -1317,6 +1317,7 @@ impl Shell {
     #[must_use]
     pub fn tiered_facts(&self) -> engine::chunk::ChunkFacts {
         let mut facts = self.pools.facts();
+        facts.record_bytes = self.pools.state_slot_bytes();
         facts.weights = self.streamed.facts();
         facts.host_chunks = self.host.chunks();
         if let (Some(disk), Some(kv)) = (&self.disk, self.pools.layout().kv()) {

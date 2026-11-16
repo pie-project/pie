@@ -1094,6 +1094,7 @@ impl Chunks {
                         }),
                 )
                 .collect(),
+            record_bytes: 0,
         }
     }
 }

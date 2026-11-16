@@ -32,7 +32,8 @@ impl Shell {
 
     /// The pool as chunks: shared slot shapes over one chunk space.
     pub fn chunk_facts(&self) -> Result<ChunkFacts> {
-        let facts = self.pool_chunk_facts();
+        let mut facts = self.pool_chunk_facts();
+        facts.record_bytes = self.state_slot_bytes();
         facts
             .validate()
             .map_err(|why| crate::error::Fault::Unbound {

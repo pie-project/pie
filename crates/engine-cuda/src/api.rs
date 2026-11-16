@@ -714,6 +714,7 @@ impl Engine for Cuda {
             shell.drop_rungs();
         }
         let mut chunk_facts = shell.chunk_facts().map_err(fault)?;
+        chunk_facts.record_bytes = shell.state_slot_bytes();
         chunk_facts.disk_persistent = residency.disk_kv_persistent && chunk_facts.disk_chunks > 0;
         let trace_name = shell.trace().name.clone();
         let (weight_bytes, arena_bytes, pool_bytes, input_bytes) = shell.footprint();

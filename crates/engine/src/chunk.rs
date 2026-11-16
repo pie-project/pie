@@ -134,6 +134,11 @@ pub struct ChunkFacts {
     /// And what they held when the last run left is there still.
     #[serde(default)]
     pub disk_kept: bool,
+    /// One recurrent-state record's bytes as the model's state rows take
+    /// them (not the slots or chunks a pool lays it in); 0 where the model
+    /// holds no recurrent state.
+    #[serde(default)]
+    pub record_bytes: u64,
     /// The streamable weights' slot shapes ([`WeightShape`]), ids apart
     /// from [`ChunkFacts::shapes`]'. Empty where nothing streams.
     #[serde(default)]
@@ -582,6 +587,11 @@ impl ChunkFacts {
             disk_persistent: pools.disk_persistent,
             disk_kept: pools.disk_kept,
             weights: Vec::new(),
+            record_bytes: if pools.state_slots > 0 {
+                pools.state_slot_bytes
+            } else {
+                0
+            },
         }
     }
 
