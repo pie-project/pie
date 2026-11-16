@@ -44,8 +44,9 @@ pub fn attention_rate(
     device: &Context,
     tuning: &crate::tuning::Tuning,
     shape: engine::rates::AttnShape,
+    launch: f64,
 ) -> Result<f64> {
     let tier = <Api as engine_gpu::serve::Serve>::tier(device);
     let timer = |frame: Frame| Ok((None, (frame.commit_timed()? * 1e9) as u64));
-    engine_gpu::rates::attention_rate::<Api, _>(device, tuning, tier, &timer, shape)
+    engine_gpu::rates::attention_rate::<Api, _>(device, tuning, tier, &timer, shape, launch)
 }

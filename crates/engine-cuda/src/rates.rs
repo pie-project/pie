@@ -24,12 +24,15 @@
 //!   pages of [`PAGE`]; its launches rotate through
 //!   `engine::rates::attn_sets_at` sets of q rows and kv pages, so each reads
 //!   them from device memory as a served layer's does.
-//! - `scan_elements_per_ns`: the causal conv and the chunked gated delta
+//! - `scan_elements_per_ns_by_tokens`: at each of `engine::rates::SCAN_TOKENS`,
+//!   the causal conv and the chunked gated delta
 //!   scan at [`SCAN_SHAPE`].
 //! - `bytes_per_ns`: a [`COPY_BYTES`] device-to-device copy, read plus write.
-//! - `launch_ns`: [`LAUNCHES`] near-empty kernels captured in one graph, the
-//!   graph's time over [`LAUNCHES`]: a dispatch's cost inside a recorded
-//!   body, as serving replays them.
+//! - `launch_ns`: a chain of dependent near-empty kernels captured in one
+//!   graph against one kernel of the chain's whole work, at each length of
+//!   `engine::rates::LAUNCH_CHAINS` (`engine::rates::launch_from`): what a
+//!   dispatch adds to its work inside a recorded body, as serving replays
+//!   them.
 //!
 //! Every float operand the matmul, attention and scan read (activations,
 //! weight planes, the kv pages, the scan's input, conv weight and states) is
@@ -48,9 +51,6 @@ pub const PAGE: u32 = 16;
 
 /// The copy's bytes: past every last-level cache, so it moves device memory.
 pub const COPY_BYTES: usize = 256 << 20;
-
-/// The kernels the launch's graph captures.
-pub const LAUNCHES: u32 = 1000;
 
 /// A burst's length.
 pub const BURST_NS: f64 = 20e6;
@@ -298,6 +298,10 @@ mod on_device {
         let clock = Clock::new(stream)?;
         let mut held = Vec::new();
         let random = Random::new(stream)?;
+        // The launch first: every rate below takes its dispatches' launches
+        // off (engine::rates::rate_from).
+        let launch = launch(device.ctx(), stream, &clock, &mut held)?;
+        let gap = launch as f64;
         let warmed = warm(device.ctx(), &clock, &random, &mut held)?;
         eprintln!(
             "[rates]: warm-up: {} rotations of the {}^3 matmul, settled at {:.1} TFLOP/s",
@@ -305,20 +309,32 @@ mod on_device {
             engine::rates::WARM_SHAPE.0,
             warmed.rate / 1e3
         );
-        let grid = gemm(device.ctx(), &clock, &random, &mut held)?;
+        let grid = gemm(device.ctx(), &clock, &random, &mut held, gap)?;
         let mut attn = Vec::with_capacity(ATTN_KEYS.len() * ATTN_DIMS.len());
         for d in ATTN_DIMS {
             for keys in ATTN_KEYS {
                 attn.push((
                     keys,
                     d,
-                    attention(&device, &clock, &random, &mut held, keys, d)?,
+                    attention(&device, &clock, &random, &mut held, keys, d, gap)?,
                 ));
             }
         }
-        let scan = scan(device.ctx(), &clock, &random, &mut held)?;
-        let bytes = copy(stream, &clock)?;
-        let launch = launch(device.ctx(), stream, &clock, &mut held)?;
+        let mut scan_curve = Vec::with_capacity(engine::rates::SCAN_TOKENS.len());
+        for tokens in engine::rates::SCAN_TOKENS {
+            scan_curve.push((
+                tokens,
+                scan(
+                    device.ctx(),
+                    &clock,
+                    &random,
+                    &mut held,
+                    SCAN_SHAPE.at(tokens),
+                    gap,
+                )?,
+            ));
+        }
+        let bytes = copy(stream, &clock, gap)?;
         device.synchronize().map_err(say("the device"))?;
         eprintln!(
             "[rates]: the step held at most {} MiB of device buffers ({} MiB of slabs at its end)",
@@ -328,7 +344,7 @@ mod on_device {
         Ok(Rates {
             bf16_flops_per_ns_by_rows_n_k: Some(grid),
             attn_flops_per_ns_by_keys_and_dim: Some(attn),
-            scan_elements_per_ns: Some(scan),
+            scan_elements_per_ns_by_tokens: Some(scan_curve),
             bytes_per_ns: Some(bytes),
             launch_ns: Some(launch),
             ..Rates::default()
@@ -340,6 +356,7 @@ mod on_device {
         clock: &Clock,
         random: &Random,
         held: &mut Vec<Buffer>,
+        gap: f64,
     ) -> Result<Vec<(u32, u32, u32, f64)>, String> {
         // The shapes in engine::rates' spread order, so a drift left after
         // the warm-up spreads over the grid.
@@ -350,7 +367,7 @@ mod on_device {
         let mut grid = Vec::with_capacity(LATTICE_ROWS.len() * shapes.len());
         for at in engine::rates::spread_order(shapes.len()) {
             let (n, k) = shapes[at];
-            grid.extend(gemm_at(ctx, clock, random, held, n, k)?);
+            grid.extend(gemm_at(ctx, clock, random, held, n, k, gap)?);
         }
         grid.sort_by_key(|&(m, n, k, _)| (k, n, m));
         Ok(grid)
@@ -395,6 +412,7 @@ mod on_device {
         held: &mut Vec<Buffer>,
         n: u32,
         k: u32,
+        gap: f64,
     ) -> Result<Vec<(u32, u32, u32, f64)>, String> {
         let most = *LATTICE_ROWS.last().expect("rows") as usize;
         let act = random.operand(most * k as usize * 2)?;
@@ -416,7 +434,18 @@ mod on_device {
             };
             lay(held, || fire(0))?;
             let ns = clock.burst(ROUNDS, &mut |i| fire(i).map_err(say("the matmul")))?;
-            curve.push((m, n, k, engine::rates::gemm_flops(m, n, k) / ns));
+            curve.push((
+                m,
+                n,
+                k,
+                engine::rates::rate_from(
+                    &format!("matmul {m}x{n}x{k}"),
+                    ns,
+                    engine::rates::GEMM_DISPATCHES,
+                    gap,
+                    engine::rates::gemm_flops(m, n, k),
+                )?,
+            ));
         }
         Ok(curve)
     }
@@ -428,6 +457,7 @@ mod on_device {
         held: &mut Vec<Buffer>,
         keys_n: u32,
         head_dim: u32,
+        gap: f64,
     ) -> Result<f64, String> {
         let ctx = device.ctx();
         let at = ATTN_SHAPE.at(keys_n).with_dim(head_dim);
@@ -561,7 +591,13 @@ mod on_device {
         };
         lay(held, || fire(0))?;
         let ns = clock.burst(ROUNDS, &mut |i| fire(i).map_err(say("the attention")))?;
-        Ok(engine::rates::attn_flops(at) / ns)
+        engine::rates::rate_from(
+            &format!("attention {}x{} d {}", at.rows, at.keys, at.head_dim),
+            ns,
+            engine::rates::ATTN_DISPATCHES,
+            gap,
+            engine::rates::attn_flops(at),
+        )
     }
 
     fn scan(
@@ -569,8 +605,9 @@ mod on_device {
         clock: &Clock,
         random: &Random,
         held: &mut Vec<Buffer>,
+        shape: engine::rates::ScanShape,
+        gap: f64,
     ) -> Result<f64, String> {
-        let shape = SCAN_SHAPE;
         let (tokens, conv_width) = (shape.tokens, shape.conv_width);
         let channels = shape.channels();
         let conv_stride = conv_width * channels;
@@ -638,10 +675,16 @@ mod on_device {
         };
         lay(held, fire)?;
         let ns = clock.burst(ROUNDS, &mut |_| fire().map_err(say("the scan")))?;
-        Ok(engine::rates::scan_elements(shape) / ns)
+        engine::rates::rate_from(
+            &format!("scan of {} tokens", shape.tokens),
+            ns,
+            engine::rates::SCAN_DISPATCHES,
+            gap,
+            engine::rates::scan_elements(shape),
+        )
     }
 
-    fn copy(stream: *mut c_void, clock: &Clock) -> Result<f64, String> {
+    fn copy(stream: *mut c_void, clock: &Clock, gap: f64) -> Result<f64, String> {
         let from = zeroed(COPY_BYTES)?;
         let into = zeroed(COPY_BYTES)?;
         let ns = clock.burst(ROUNDS, &mut |_| {
@@ -649,7 +692,13 @@ mod on_device {
                 .map_err(say("the copy"))
         })?;
         // Every byte copied is read and written.
-        Ok(2.0 * COPY_BYTES as f64 / ns)
+        engine::rates::rate_from(
+            "copy",
+            ns,
+            engine::rates::COPY_DISPATCHES,
+            gap,
+            2.0 * COPY_BYTES as f64,
+        )
     }
 
     fn launch(
@@ -658,30 +707,51 @@ mod on_device {
         clock: &Clock,
         held: &mut Vec<Buffer>,
     ) -> Result<u64, String> {
-        let x = zeroed(256)?;
-        let y = zeroed(256)?;
-        let fire = || {
+        // A chain of `n` dependent residual adds captured in one graph
+        // (each adds into the buffer the one before wrote, the two
+        // alternating), against one add over the chain's whole length, at
+        // each length of engine::rates::LAUNCH_CHAINS.
+        let most = *engine::rates::LAUNCH_CHAINS.last().expect("chains") as usize;
+        let (x, y) = (zeroed(256)?, zeroed(256)?);
+        let (wide_x, wide_y) = (zeroed(16 * most)?, zeroed(16 * most)?);
+        let add = |from: &Buffer, into: &Buffer, width: u32| {
             kernels_cuda::elemwise::pointwise::residual_add(
                 ctx,
-                Tensor::new(x.ptr(), 1, 8, Dtype::Bf16),
-                &mut Tensor::new(y.ptr(), 1, 8, Dtype::Bf16),
+                Tensor::new(from.ptr(), 1, width, Dtype::Bf16),
+                &mut Tensor::new(into.ptr(), 1, width, Dtype::Bf16),
             )
         };
-        lay(held, fire)?;
-        fire().map_err(say("the launch"))?;
-        let graph = Graph::capture(stream, || {
-            for _ in 0..LAUNCHES {
-                fire().map_err(|e| crate::error::Fault::Unsupported(e.to_string()))?;
-            }
-            Ok(())
-        })
-        .map_err(say("the launch's graph"))?;
-        let exec = graph
-            .instantiate(stream)
-            .map_err(say("the launch's graph"))?;
-        let ns = clock.burst(LAUNCH_ROUNDS, &mut |_| {
-            exec.launch(stream).map_err(say("the launch's graph"))
-        })?;
-        Ok((ns / f64::from(LAUNCHES)).round() as u64)
+        lay(held, || add(&x, &y, 8))?;
+        add(&x, &y, 8).map_err(say("the launch"))?;
+        let timed = |work: &dyn Fn() -> Result<(), crate::error::Fault>| {
+            let graph = Graph::capture(stream, work).map_err(say("the launch's graph"))?;
+            let exec = graph
+                .instantiate(stream)
+                .map_err(say("the launch's graph"))?;
+            clock.burst(LAUNCH_ROUNDS, &mut |_| {
+                exec.launch(stream).map_err(say("the launch's graph"))
+            })
+        };
+        let unsupported = |e: kernels_cuda::Error| crate::error::Fault::Unsupported(e.to_string());
+        let mut gaps = Vec::new();
+        for n in engine::rates::LAUNCH_CHAINS {
+            let chain = timed(&|| {
+                for i in 0..n {
+                    let (from, into) = if i % 2 == 0 { (&x, &y) } else { (&y, &x) };
+                    add(from, into, 8).map_err(unsupported)?;
+                }
+                Ok(())
+            })?;
+            let one = timed(&|| add(&wide_x, &wide_y, 8 * n).map_err(unsupported))?;
+            gaps.push((n, engine::rates::launch_from(chain, one, n)));
+        }
+        eprintln!(
+            "[rates]: launch: {}",
+            gaps.iter()
+                .map(|(n, ns)| format!("{ns:.0} ns a dispatch over a chain of {n}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        Ok(gaps.last().map_or(0.0, |&(_, ns)| ns).round() as u64)
     }
 }

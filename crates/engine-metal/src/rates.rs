@@ -76,7 +76,10 @@ struct Bench<'a> {
 impl Bench<'_> {
     /// A buffer of `bytes` of the operand pattern.
     fn operand(&self, bytes: u64) -> Result<Buffer, String> {
-        self.buffer(&operand(&self.pattern, usize::try_from(bytes).map_err(|e| e.to_string())?))
+        self.buffer(&operand(
+            &self.pattern,
+            usize::try_from(bytes).map_err(|e| e.to_string())?,
+        ))
     }
 
     fn buffer(&self, bytes: &[u8]) -> Result<Buffer, String> {
@@ -134,7 +137,14 @@ impl Bench<'_> {
 
     /// An `m × k × k` matmul's rate, each repeat over the next of `weights`
     /// (`k × k` each).
-    fn matmul_flops(&self, m: u32, n: u32, k: u32, weights: &[Tensor]) -> Result<f64, String> {
+    fn matmul_flops(
+        &self,
+        m: u32,
+        n: u32,
+        k: u32,
+        weights: &[Tensor],
+        gap: f64,
+    ) -> Result<f64, String> {
         let (a, y) = (
             self.operand(u64::from(m) * u64::from(k) * 2)?,
             self.zeroed(u64::from(m) * u64::from(n) * 2)?,
@@ -155,10 +165,16 @@ impl Bench<'_> {
                 yt,
             )
         })?;
-        Ok(engine::rates::gemm_flops(m, n, k) / (seconds * 1e9))
+        engine::rates::rate_from(
+            &format!("matmul {m}x{n}x{k}"),
+            seconds * 1e9,
+            engine::rates::GEMM_DISPATCHES,
+            gap,
+            engine::rates::gemm_flops(m, n, k),
+        )
     }
 
-    fn attention_flops(&self, shape: AttnShape) -> Result<f64, String> {
+    fn attention_flops(&self, shape: AttnShape, gap: f64) -> Result<f64, String> {
         let (rows, keys, q_heads, kv_heads, d) = (
             shape.rows,
             shape.keys,
@@ -229,7 +245,10 @@ impl Bench<'_> {
                 sink,
                 RaggedTensor { data: q, indptr },
                 &plan,
-                &KvPool { page_indices, ..pool },
+                &KvPool {
+                    page_indices,
+                    ..pool
+                },
                 None,
                 d,
                 kv_heads,
@@ -240,11 +259,21 @@ impl Bench<'_> {
             )
         })?;
         drop(held);
-        Ok(engine::rates::attn_flops(shape) / (seconds * 1e9))
+        engine::rates::rate_from(
+            &format!(
+                "attention {}x{} d {}",
+                shape.rows, shape.keys, shape.head_dim
+            ),
+            seconds * 1e9,
+            engine::rates::ATTN_DISPATCHES,
+            gap,
+            engine::rates::attn_flops(shape),
+        )
     }
 
-    fn scan_elements(&self) -> Result<f64, String> {
-        const TOKENS: u32 = SCAN_SHAPE.tokens;
+    fn scan_elements(&self, tokens: u32, gap: f64) -> Result<f64, String> {
+        #[allow(non_snake_case)]
+        let TOKENS: u32 = tokens;
         const K_HEADS: u32 = SCAN_SHAPE.k_heads;
         const HEADS: u32 = SCAN_SHAPE.v_heads;
         const DK: u32 = SCAN_SHAPE.k_dim;
@@ -304,10 +333,16 @@ impl Bench<'_> {
                 y,
             )
         })?;
-        Ok(engine::rates::scan_elements(SCAN_SHAPE) / (seconds * 1e9))
+        engine::rates::rate_from(
+            &format!("scan of {tokens} tokens"),
+            seconds * 1e9,
+            engine::rates::SCAN_DISPATCHES,
+            gap,
+            engine::rates::scan_elements(SCAN_SHAPE.at(tokens)),
+        )
     }
 
-    fn bytes_per_ns(&self) -> Result<f64, String> {
+    fn bytes_per_ns(&self, gap: f64) -> Result<f64, String> {
         let bytes = 256u64 << 20;
         let (from, into) = (self.zeroed(bytes)?, self.zeroed(bytes)?);
         let mut times = Vec::with_capacity(5);
@@ -321,22 +356,55 @@ impl Bench<'_> {
                 times.push(seconds);
             }
         }
-        Ok(2.0 * bytes as f64 / (median(times) * 1e9))
+        // Every byte copied is read and written.
+        engine::rates::rate_from(
+            "copy",
+            median(times) * 1e9,
+            engine::rates::COPY_DISPATCHES,
+            gap,
+            2.0 * bytes as f64,
+        )
     }
 
-    fn launch_ns(&self) -> Result<u64, String> {
+    /// What a dependent dispatch adds to its work in one encoder
+    /// (engine::rates::launch_from): a chain of tiny matmuls, each reading
+    /// the one before's output, against one matmul of `n` times the rows,
+    /// at each length of engine::rates::LAUNCH_CHAINS; the longest chain's.
+    fn launch_ns(&self) -> Result<(u64, Vec<(u32, f64)>), String> {
         let (a, w, y) = (
-            self.zeroed(8 * 32 * 2)?,
             self.zeroed(32 * 32 * 2)?,
-            self.zeroed(8 * 32 * 2)?,
+            self.zeroed(32 * 32 * 2)?,
+            self.zeroed(32 * 32 * 2)?,
         );
         let (at, wt, yt) = (
-            self.tensor(&a, 8, 32, Dtype::Bf16)?,
+            self.tensor(&a, 32, 32, Dtype::Bf16)?,
             self.tensor(&w, 32, 32, Dtype::Bf16)?,
-            self.tensor(&y, 8, 32, Dtype::Bf16)?,
+            self.tensor(&y, 32, 32, Dtype::Bf16)?,
         );
-        let seconds = self.timed(&|sink, _| gemm::matmul(sink, self.tuning, at, wt, yt))?;
-        Ok((seconds * 1e9).round() as u64)
+        // One dispatch of the chain, timed back to back: each reads the
+        // output of the one before.
+        let link = self.timed(&|sink, i| {
+            let (from, into) = if i % 2 == 0 { (at, yt) } else { (yt, at) };
+            gemm::matmul(sink, self.tuning, from, wt, into)
+        })?;
+        let mut gaps = Vec::new();
+        for n in engine::rates::LAUNCH_CHAINS {
+            let (wa, wy) = (
+                self.zeroed(u64::from(32 * n) * 32 * 2)?,
+                self.zeroed(u64::from(32 * n) * 32 * 2)?,
+            );
+            let (wat, wyt) = (
+                self.tensor(&wa, 32 * n, 32, Dtype::Bf16)?,
+                self.tensor(&wy, 32 * n, 32, Dtype::Bf16)?,
+            );
+            let one = self.timed(&|sink, _| gemm::matmul(sink, self.tuning, wat, wt, wyt))?;
+            gaps.push((
+                n,
+                engine::rates::launch_from(link * 1e9 * f64::from(n), one * 1e9, n),
+            ));
+        }
+        let launch = gaps.last().map_or(0.0, |&(_, ns)| ns).round() as u64;
+        Ok((launch, gaps))
     }
 }
 
@@ -355,6 +423,17 @@ pub fn measure(
         tuning: &tuning,
         pattern: engine::rates::operand_pattern(),
     };
+    // The launch first: every rate below takes its dispatches' launches off
+    // (engine::rates::rate_from).
+    let (launch, gaps) = bench.launch_ns()?;
+    say(&format!(
+        "  launch: {}",
+        gaps.iter()
+            .map(|(n, ns)| format!("{ns:.0} ns a dispatch over a chain of {n}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    let gap = launch as f64;
     // Warm the device until its rate stops falling (engine::rates::warm_up):
     // rotations of the widest matmul over its planes.
     {
@@ -367,7 +446,7 @@ pub fn measure(
             })
             .collect::<Result<Vec<(Tensor, Buffer)>, String>>()?;
         let tensors: Vec<Tensor> = weights.iter().map(|(t, _)| *t).collect();
-        let warmed = engine::rates::warm_up(|| bench.matmul_flops(m, n, k, &tensors))?;
+        let warmed = engine::rates::warm_up(|| bench.matmul_flops(m, n, k, &tensors, 0.0))?;
         say(&format!(
             "  warm-up: {} rotations of the {m}^3 matmul, settled at {:.2} TFLOP/s",
             warmed.rotations,
@@ -403,7 +482,7 @@ pub fn measure(
             .into_iter()
             .map(|row| LATTICE_ROWS[row])
         {
-            let rate = bench.matmul_flops(m, n, k, &tensors)?;
+            let rate = bench.matmul_flops(m, n, k, &tensors, gap)?;
             say(&format!(
                 "  bf16 matmul {m} x {n} x {k}: {:.2} TFLOP/s",
                 rate / 1e3
@@ -418,7 +497,7 @@ pub fn measure(
         .flat_map(|&d| ATTN_KEYS.iter().map(move |&keys| (d, keys)))
     {
         bench.handles = Handles::new();
-        let rate = bench.attention_flops(ATTN_SHAPE.at(keys).with_dim(d))?;
+        let rate = bench.attention_flops(ATTN_SHAPE.at(keys).with_dim(d), gap)?;
         say(&format!(
             "  prefill attention, {keys} rows over {keys} keys, d {d}: {:.2} TFLOP/s",
             rate / 1e3
@@ -426,18 +505,20 @@ pub fn measure(
         keys_curve.push((keys, d, rate));
     }
     bench.handles = Handles::new();
-    let scan = bench.scan_elements()?;
+    let mut scan_curve = Vec::with_capacity(engine::rates::SCAN_TOKENS.len());
+    for tokens in engine::rates::SCAN_TOKENS {
+        scan_curve.push((tokens, bench.scan_elements(tokens, gap)?));
+    }
+    let scan = scan_curve.iter().map(|&(_, r)| r).fold(0.0, f64::max);
     say(&format!(
         "  gated-delta scan and its conv: {scan:.1} state elements a ns"
     ));
-    let bytes = bench.bytes_per_ns()?;
+    let bytes = bench.bytes_per_ns(gap)?;
     say(&format!("  256 MiB blit: {bytes:.1} GB/s read and write"));
-    let launch = bench.launch_ns()?;
-    say(&format!("  launch: {launch} ns a dispatch"));
     Ok(Rates {
         bf16_flops_per_ns_by_rows_n_k: Some(grid),
         attn_flops_per_ns_by_keys_and_dim: Some(keys_curve),
-        scan_elements_per_ns: Some(scan),
+        scan_elements_per_ns_by_tokens: Some(scan_curve),
         bytes_per_ns: Some(bytes),
         launch_ns: Some(launch),
     })

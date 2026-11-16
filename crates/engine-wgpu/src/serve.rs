@@ -69,7 +69,7 @@ impl Serve for Api {
             let rates = chip.rates();
             if rates.bf16_flops_per_ns_by_rows_n_k.is_some()
                 && rates.attn_flops_per_ns_by_keys_and_dim.is_some()
-                && rates.scan_elements_per_ns.is_some()
+                && rates.scan_elements_per_ns_by_tokens.is_some()
                 && rates.bytes_per_ns.is_some()
             {
                 tuning

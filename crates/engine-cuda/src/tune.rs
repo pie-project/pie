@@ -66,7 +66,7 @@ pub fn rates(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Rated
          elements/s, {:.0} GB/s, launch {} ns",
         r.attn_at(512, 128).unwrap_or(0.0) / 1e3,
         r.attn_at(16384, 128).unwrap_or(0.0) / 1e3,
-        r.scan_elements_per_ns.unwrap_or(0.0),
+        r.scan_at(2048).unwrap_or(0.0),
         r.bytes_per_ns.unwrap_or(0.0),
         r.launch_ns.unwrap_or(0),
     ));
@@ -80,7 +80,10 @@ pub fn rates(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Rated
         attn_flops_per_ns_by_keys_and_dim: Some(
             attn.iter().map(|&(k, d, v)| (k, d, tenth(v))).collect(),
         ),
-        scan_elements_per_ns: r.scan_elements_per_ns.map(tenth),
+        scan_elements_per_ns_by_tokens: r
+            .scan_elements_per_ns_by_tokens
+            .as_ref()
+            .map(|c| c.iter().map(|&(t, v)| (t, tenth(v))).collect()),
         bytes_per_ns: r.bytes_per_ns.map(tenth),
         ..r
     };
@@ -249,7 +252,7 @@ fn serve(artifact: &Path, deployment: &str, chip: Profile) -> Result<Serving, St
 
 /// How far the estimate's pick may fall short of the measured-best rung:
 /// its score, under the measured times, within this share of the best's.
-pub const CHECK_BOUND: f64 = 0.05;
+pub const CHECK_BOUND: f64 = engine::rates::AGREEMENT;
 
 /// The lanes a served CUDA load is asked (`pie serve`'s); its tokens are
 /// left to the engine (`engine.forward_tokens`, fitted to the card).
@@ -290,7 +293,8 @@ fn load_every_rung(
         patches: patches(&trace, SERVED_LANES),
         page_size: 16,
         context: 32_768,
-        slots: 1,
+        // A slot a lane: a decode-shaped rung's check fires a lane a slot.
+        slots: SERVED_LANES,
         kv_budget: None,
         allowance: engine::Allowance::WHOLE,
         context_declared: false,
@@ -311,28 +315,53 @@ fn load_every_rung(
     Ok((shell, trace))
 }
 
-/// One fire of `width` prompt tokens on a fresh slot 0: its wall time (ns)
-/// and whether it replayed a recorded body.
+/// One fire as the estimate weighs a rung (engine::load::CheckFire): its
+/// lanes each on a fresh slot of its own, each its tokens; its wall time
+/// (ns) and whether it replayed a recorded body.
 fn fire_once(
     shell: &mut crate::Shell,
     trace: &poem_ir::Trace,
-    width: u32,
+    fire: engine::load::CheckFire,
 ) -> Result<(f64, bool), String> {
     let token = |i: u32| 100 + (i * 7919) % 5000;
-    let prompt: Vec<u32> = (0..width).map(token).collect();
-    shell.open(0).map_err(|e| e.to_string())?;
-    let lane = crate::Lane {
-        slot: 0,
-        word: trace.facts.word(&poem::Request::new(width, false)),
-        tokens: &prompt,
-    };
+    let prompts: Vec<Vec<u32>> = (0..fire.lanes)
+        .map(|lane| {
+            (0..fire.tokens_per_lane)
+                .map(|i| token(lane * fire.tokens_per_lane + i))
+                .collect()
+        })
+        .collect();
+    for slot in 0..fire.lanes {
+        shell.open(slot).map_err(|e| e.to_string())?;
+    }
+    let word = trace
+        .facts
+        .word(&poem::Request::new(fire.tokens_per_lane, false));
+    let lanes: Vec<crate::Lane> = prompts
+        .iter()
+        .enumerate()
+        .map(|(slot, tokens)| crate::Lane {
+            slot: slot as u32,
+            word,
+            tokens,
+        })
+        .collect();
     let hits = shell.body_stats().tally.hits;
     let began = Instant::now();
-    shell
-        .fire(std::slice::from_ref(&lane))
-        .map_err(|e| e.to_string())?;
+    shell.fire(&lanes).map_err(|e| e.to_string())?;
     let ns = began.elapsed().as_secs_f64() * 1e9;
     Ok((ns, shell.body_stats().tally.hits > hits))
+}
+
+/// One prompt of `width` tokens on a fresh slot: the dissection's fire.
+fn prompt(width: u32) -> engine::load::CheckFire {
+    engine::load::CheckFire {
+        rows: width,
+        lanes: 1,
+        tokens_per_lane: width,
+        keys_per_lane: width,
+        sampled: 1,
+    }
 }
 
 /// The kind of work an op is, for the dissection's rollup.
@@ -385,10 +414,10 @@ fn dissect(
         .map_or(0.0, |&(_, ns, n)| ns as f64 / f64::from(n));
     for rung in rungs {
         let width = rung.tokens;
-        fire_once(&mut shell, &trace, width)?;
-        let (walk, _) = fire_once(&mut shell, &trace, width)?;
+        fire_once(&mut shell, &trace, prompt(width))?;
+        let (walk, _) = fire_once(&mut shell, &trace, prompt(width))?;
         crate::dissect::start();
-        let (wall, _) = fire_once(&mut shell, &trace, width)?;
+        let (wall, _) = fire_once(&mut shell, &trace, prompt(width))?;
         let mut ops = crate::dissect::take();
         ops.sort_by_key(|row| std::cmp::Reverse(row.1));
         let nodes: u32 = ops.iter().map(|row| row.2).sum();
@@ -469,11 +498,11 @@ fn check_estimate_of(
     let mut meas = Vec::new();
     for r in &rungs {
         for _ in 0..2 {
-            fire_once(&mut shell, &trace, r.tokens)?;
+            fire_once(&mut shell, &trace, r.check_fire())?;
         }
         let mut times = Vec::new();
         for _ in 0..TIMED_FIRES {
-            let (ns, replayed) = fire_once(&mut shell, &trace, r.tokens)?;
+            let (ns, replayed) = fire_once(&mut shell, &trace, r.check_fire())?;
             if !replayed {
                 return Err(format!(
                     "a fire of {} tokens of {model} was walked, not replayed: its time is not \

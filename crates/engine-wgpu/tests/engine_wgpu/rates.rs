@@ -41,7 +41,7 @@ fn the_micro_fires_state_rates_and_the_ruling_picks_by_them() {
     eprintln!("grid {grid:?}");
     for rate in [
         rates.attn_at(2048, 128).unwrap(),
-        rates.scan_elements_per_ns.unwrap(),
+        rates.scan_at(2048).unwrap(),
     ] {
         assert!((1.0..1e6).contains(&rate), "{rate}");
     }

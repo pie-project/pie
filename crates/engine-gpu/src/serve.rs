@@ -2249,6 +2249,19 @@ impl<B: Serve> Shell<B> {
     }
 
     pub fn fire_seated(&mut self, lanes: &[Seated<'_, B>]) -> Result<Vec<Vec<f32>>> {
+        let landed = self.fire_seated_landed(lanes)?;
+        self.rows_of(&landed)
+    }
+
+    /// [`Shell::fire`] up to its landing: the fire settled on the device,
+    /// its rows not yet read back ([`Shell::rows_of`] reads them), so a
+    /// check times the fire without its readback.
+    pub fn fire_landed(&mut self, lanes: &[Lane<'_>]) -> Result<Landed> {
+        let seated: Vec<Seated<'_, B>> = lanes.iter().copied().map(Seated::of).collect();
+        self.fire_seated_landed(&seated)
+    }
+
+    fn fire_seated_landed(&mut self, lanes: &[Seated<'_, B>]) -> Result<Landed> {
         use engine::frame::Shell as FrameShell;
         // A direct fire's seat-addressed lanes read the seats' runs: back
         // their segments first, off the fire's path.
@@ -2271,8 +2284,7 @@ impl<B: Serve> Shell<B> {
             None,
         )?;
         let enqueued = FrameShell::enqueue(self, prepared)?;
-        let landed = FrameShell::settle(self, enqueued)?;
-        self.rows_of(&landed)
+        FrameShell::settle(self, enqueued)
     }
 
     /// Fires `lanes` over their VAE `clips` and reads back the pixel plane

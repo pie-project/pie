@@ -660,7 +660,7 @@ fn serve(artifact: &Path, deployment: &str, device: &str, file: &str) -> Result<
 
 /// How far the estimate's pick may fall short of the measured-best rung:
 /// its score, under the measured times, within this share of the best's.
-pub const CHECK_BOUND: f64 = 0.05;
+pub const CHECK_BOUND: f64 = engine::rates::AGREEMENT;
 
 /// The fire size `--check-estimate` lays its rungs up to: what a served
 /// Metal load asks (`max_lanes`, `max_tokens`).
@@ -822,10 +822,11 @@ fn check_one(
     // on a fresh slot; up to them, a lane a token, each on a fresh slot of
     // its own (a second shell, of a slot a lane).
     let max_lanes = rungs.iter().map(|r| r.lanes).max().unwrap_or(1);
-    let (decode, prompts): (Vec<u32>, Vec<u32>) = rungs
-        .iter()
-        .map(|r| r.tokens)
-        .partition(|&w| rungs.iter().any(|r| r.tokens == w && r.decode_shaped()));
+    let (decode, prompts): (Vec<u32>, Vec<u32>) = rungs.iter().map(|r| r.tokens).partition(|&w| {
+        rungs
+            .iter()
+            .any(|r| r.tokens == w && r.check_fire().lanes > 1)
+    });
     say(&format!(
         "{model}: timing a fire at each rung, prompt-shaped {prompts:?}, decode-shaped {decode:?} \
          (a lane a token, each on a fresh slot, up to {max_lanes})"

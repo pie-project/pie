@@ -16,7 +16,7 @@
 //! ]
 //! # prefill attention flops a ns by keys and head width: a full grid
 //! attn_flops_per_ns_by_keys_and_dim = [[512, 128, 6000.0], [16384, 128, 11000.0]]
-//! scan_elements_per_ns = 1500.0    # recurrent state elements a ns (scan + conv)
+//! scan_elements_per_ns_by_tokens = [[512, 900.0], [16384, 1500.0]]  # scan + conv by tokens
 //! bytes_per_ns = 726.0             # device memory bytes a ns (GB/s)
 //! launch_ns = 3500                 # a dispatch's cost beside its work
 //! ```
@@ -35,9 +35,10 @@ pub struct Rates {
     /// by width then keys ([`grid`]; the count the estimate's attention
     /// term takes, over a prefill's rows and keys).
     pub attn_flops_per_ns_by_keys_and_dim: Option<Vec<(u32, u32, f64)>>,
-    /// Recurrent state elements a nanosecond: the scan's state elements a
-    /// token, the conv beside it folded in.
-    pub scan_elements_per_ns: Option<f64>,
+    /// Recurrent state elements a nanosecond by a prompt's tokens: `(tokens,
+    /// rate)`, non-empty and strictly ascending (the scan's state elements a
+    /// token, the conv beside it folded in).
+    pub scan_elements_per_ns_by_tokens: Option<Vec<(u32, f64)>>,
     /// Device memory bytes a nanosecond.
     pub bytes_per_ns: Option<f64>,
     /// What a launch costs beside its work, in nanoseconds.
@@ -55,7 +56,9 @@ impl Rates {
             attn_flops_per_ns_by_keys_and_dim: self
                 .attn_flops_per_ns_by_keys_and_dim
                 .or(below.attn_flops_per_ns_by_keys_and_dim),
-            scan_elements_per_ns: self.scan_elements_per_ns.or(below.scan_elements_per_ns),
+            scan_elements_per_ns_by_tokens: self
+                .scan_elements_per_ns_by_tokens
+                .or(below.scan_elements_per_ns_by_tokens),
             bytes_per_ns: self.bytes_per_ns.or(below.bytes_per_ns),
             launch_ns: self.launch_ns.or(below.launch_ns),
         }
@@ -79,6 +82,13 @@ impl Rates {
         flops_at(self.attn_flops_per_ns_by_keys_and_dim.as_deref()?, keys, d)
     }
 
+    /// The scan rate at a prompt of `tokens` ([`interpolate`]). `None` where
+    /// no curve is stated.
+    #[must_use]
+    pub fn scan_at(&self, tokens: u32) -> Option<f64> {
+        interpolate(self.scan_elements_per_ns_by_tokens.as_deref()?, tokens)
+    }
+
     /// The grid's fastest point: the rate a compute-bound matmul reaches.
     #[must_use]
     pub fn peak_flops(&self) -> Option<f64> {
@@ -86,6 +96,7 @@ impl Rates {
             .as_deref()?
             .iter()
             .map(|&(_, _, _, r)| r)
+            .filter(|r| r.is_finite())
             .reduce(f64::max)
     }
 
@@ -107,8 +118,13 @@ impl Rates {
             }
             let _ = writeln!(out, "]");
         }
-        if let Some(v) = self.scan_elements_per_ns {
-            let _ = writeln!(out, "scan_elements_per_ns = {v:?}");
+        if let Some(curve) = &self.scan_elements_per_ns_by_tokens {
+            let points: Vec<String> = curve.iter().map(|(t, r)| format!("[{t}, {r:?}]")).collect();
+            let _ = writeln!(
+                out,
+                "scan_elements_per_ns_by_tokens = [{}]",
+                points.join(", ")
+            );
         }
         if let Some(v) = self.bytes_per_ns {
             let _ = writeln!(out, "bytes_per_ns = {v:?}");
@@ -128,7 +144,7 @@ pub fn grid(mut points: Vec<(u32, u32, f64)>) -> Option<Vec<(u32, u32, f64)>> {
     if points.is_empty()
         || points
             .iter()
-            .any(|&(m, k, r)| m == 0 || k == 0 || !(r.is_finite() && r > 0.0))
+            .any(|&(m, k, r)| m == 0 || k == 0 || !(r > 0.0))
     {
         return None;
     }
@@ -184,7 +200,7 @@ pub fn gemm_grid(mut points: Vec<(u32, u32, u32, f64)>) -> Option<Vec<(u32, u32,
     if points.is_empty()
         || points
             .iter()
-            .any(|&(m, n, k, r)| m == 0 || n == 0 || k == 0 || !(r.is_finite() && r > 0.0))
+            .any(|&(m, n, k, r)| m == 0 || n == 0 || k == 0 || !(r > 0.0))
     {
         return None;
     }
@@ -286,7 +302,14 @@ pub fn interpolate(curve: &[(u32, f64)], x: u32) -> Option<f64> {
 
 fn lerp_log((lo, a): (u32, f64), (hi, b): (u32, f64), x: u32) -> f64 {
     let ln = |m: u32| f64::from(m.max(1)).ln();
-    a + (b - a) * (ln(x) - ln(lo)) / (ln(hi) - ln(lo))
+    let t = (ln(x) - ln(lo)) / (ln(hi) - ln(lo));
+    if a.is_infinite() || b.is_infinite() {
+        // A gap-bound point (no work at that size): the time a unit of work
+        // takes, not the rate, between the two.
+        let per = (1.0 / a) + ((1.0 / b) - (1.0 / a)) * t;
+        return if per > 0.0 { 1.0 / per } else { f64::INFINITY };
+    }
+    a + (b - a) * t
 }
 
 /// `(tokens, ns)` of a fire at each rung width, ascending in tokens: what a
@@ -388,6 +411,29 @@ mod tests {
         assert_eq!(rates.flops_at(256, 24576, 4096), Some(800.0));
         assert_eq!(rates.peak_flops(), Some(800.0));
         assert_eq!(Rates::default().flops_at(64, 1024, 1024), None);
+    }
+
+    #[test]
+    fn a_gap_bound_point_reads_as_no_work() {
+        // Rows 16 gap-bound (its work unmeasurable under a launch), 256 at
+        // 100 a ns: 64 rows halfway in log rows, half 256's time a unit.
+        let grid = gemm_grid(vec![
+            (16, 1024, 1024, f64::INFINITY),
+            (256, 1024, 1024, 100.0),
+        ])
+        .unwrap();
+        assert_eq!(gemm_at(&grid, 16, 1024, 1024), Some(f64::INFINITY));
+        assert!((gemm_at(&grid, 64, 1024, 1024).unwrap() - 200.0).abs() < 1e-9);
+        let rates = Rates {
+            bf16_flops_per_ns_by_rows_n_k: Some(grid),
+            ..Rates::default()
+        };
+        assert_eq!(rates.peak_flops(), Some(100.0));
+        assert!(
+            rates.toml().contains("[16, 1024, 1024, inf]"),
+            "{}",
+            rates.toml()
+        );
     }
 
     #[test]

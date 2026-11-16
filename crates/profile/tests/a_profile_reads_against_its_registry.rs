@@ -917,7 +917,7 @@ device = "Apple M9"
 [rates]
 bf16_flops_per_ns_by_rows_n_k = [[16, 4096, 4096, 5000.0], [4096, 4096, 4096, 50000]]  # 50 TFLOP/s wide
 attn_flops_per_ns_by_keys_and_dim = [[2048, 128, 20000.0]]
-scan_elements_per_ns = 3000.0
+scan_elements_per_ns_by_tokens = [[2048, 3000.0]]
 bytes_per_ns = 400           # 400 GB/s
 "#;
 
@@ -950,7 +950,7 @@ fn a_device_file_states_its_rates_and_a_layer_above_replaces_them() {
                 (4096, 4096, 4096, 50000.0)
             ]),
             attn_flops_per_ns_by_keys_and_dim: Some(vec![(2048, 128, 20000.0)]),
-            scan_elements_per_ns: Some(3000.0),
+            scan_elements_per_ns_by_tokens: Some(vec![(2048, 3000.0)]),
             bytes_per_ns: Some(400.0),
             launch_ns: None,
         }
@@ -997,7 +997,7 @@ fn rates_are_refused_where_they_do_not_read_and_fire_times_are_no_profiles() {
         // The scalar rate is gone: an unknown key like any other.
         (
             "[rates]\nbf16_flops_per_ns = 1.0\n",
-            "`scan_elements_per_ns`, `bytes_per_ns` and `launch_ns`, not `bf16_flops_per_ns`",
+            "`scan_elements_per_ns_by_tokens`, `bytes_per_ns` and `launch_ns`, not `bf16_flops_per_ns`",
         ),
         // The single-depth curve is gone: an unknown key like any other.
         (
@@ -1018,6 +1018,10 @@ fn rates_are_refused_where_they_do_not_read_and_fire_times_are_no_profiles() {
             "[rates]\nbf16_flops_per_ns_by_rows_n_k = [[16, 1024, 1024, 1.0], [256, 1024, \
              1024, 2.0], [16, 4096, 1024, 3.0]]\n",
             "not 3 points that leave a hole or state a point twice",
+        ),
+        (
+            "[rates]\nbf16_flops_per_ns_by_rows_n_k = [[16, 1024, 1024, nan]]\n",
+            "each rate positive, not",
         ),
         (
             "[rates]\nbf16_flops_per_ns_by_rows_n_k = [[16, 1024, 1024, -1.0]]\n",
@@ -1043,8 +1047,13 @@ fn rates_are_refused_where_they_do_not_read_and_fire_times_are_no_profiles() {
             "each rate positive, not an empty list",
         ),
         (
-            "[rates]\nscan_elements_per_ns = 0\n",
-            "`rates.scan_elements_per_ns` is a positive number",
+            "[rates]\nscan_elements_per_ns = 1.0\n",
+            "`launch_ns`, not `scan_elements_per_ns`",
+        ),
+        (
+            "[rates]\nscan_elements_per_ns_by_tokens = [[2048, 2.0], [512, 1.0]]\n",
+            "`rates.scan_elements_per_ns_by_tokens` is a non-empty list of [tokens, elements a \
+             ns] pairs, ascending in tokens, not",
         ),
         (
             "[rates]\nlaunch_ns = 1.5\n",

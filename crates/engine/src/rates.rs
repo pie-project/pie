@@ -17,12 +17,19 @@
 //!   ([`AttnShape::at`], [`AttnShape::with_dim`]), its pages laid in the pool
 //!   in [`attn_page_order`], through the attention kernel serving selects at
 //!   that shape, [`attn_flops`] over its time.
-//! - `scan_elements_per_ns`: the backend's prefill gated-delta scan and the
+//! - `scan_elements_per_ns_by_tokens`: at each `tokens` of [`SCAN_TOKENS`]
+//!   ([`ScanShape::at`]), over [`scan_sets_at`] cold sets, the backend's
+//!   prefill gated-delta scan and the
 //!   causal conv before it at [`SCAN_SHAPE`], [`scan_elements`] over the two
 //!   together's time.
-//! - `bytes_per_ns` (a copy of device memory, every byte read and written)
-//!   and `launch_ns` (a dispatch's own cost inside a recorded frame) as
-//!   before.
+//! - `bytes_per_ns`: a copy of device memory, every byte read and written.
+//! - `launch_ns`: what a dispatch adds to its work in a chain of dependent
+//!   ones submitted as serving submits them (a captured graph, one command
+//!   buffer, one encoder): a chain of `n` tiny kernels, each reading the one
+//!   before's output, against one kernel doing the chain's whole work, at
+//!   each `n` of [`LAUNCH_CHAINS`] ([`launch_from`]). Where a backend
+//!   overlaps its launches the gap comes out small; where it serializes
+//!   them, it is what each adds.
 
 /// The rows the matmul curve is measured at: powers of two from 16 (a
 /// decode fire's few lanes, one register or coopmat tile) to 8192 (past the
@@ -91,6 +98,64 @@ pub fn operand_pattern() -> Vec<u8> {
         bytes.extend_from_slice(&((v.to_bits() >> 16) as u16).to_le_bytes());
     }
     bytes
+}
+
+/// The dispatches one timed fire of each micro-fire issues: what
+/// [`rate_from`] takes their launches off for. A matmul, an attention and a
+/// copy are one each; a scan is its conv and its scan.
+pub const GEMM_DISPATCHES: u32 = 1;
+pub const ATTN_DISPATCHES: u32 = 1;
+pub const SCAN_DISPATCHES: u32 = 2;
+pub const COPY_DISPATCHES: u32 = 1;
+
+/// The tolerance two runs of a rates step agree within, and a check's
+/// estimate within the measured best: what [`rate_from`] allows a burst to
+/// fall below its launches before it calls the two a measurement fault.
+pub const AGREEMENT: f64 = 0.05;
+
+/// The rate a timed fire comes to once its dispatches' launches are off:
+/// `work / (burst_ns − dispatches · launch_ns)`, `burst_ns` one fire's time
+/// (its `dispatches` back to back), `work` its flops, bytes or elements.
+/// The estimate adds a launch a dispatch to the work at this rate
+/// (`crate::load::FireEstimate`), so a rate holding its launches would count
+/// them twice. A fire no longer than its launches is gap-bound: its work
+/// unmeasurable at that size, stated as an infinite rate (no work, the
+/// dispatch priced at its launch alone). One shorter than its launches by
+/// more than [`AGREEMENT`] means the launch probe and the burst disagree,
+/// and `what` is refused by name.
+pub fn rate_from(
+    what: &str,
+    burst_ns: f64,
+    dispatches: u32,
+    launch_ns: f64,
+    work: f64,
+) -> Result<f64, String> {
+    let launches = f64::from(dispatches) * launch_ns;
+    let left = burst_ns - launches;
+    if left > 0.0 {
+        return Ok(work / left);
+    }
+    if burst_ns < launches * (1.0 - AGREEMENT) {
+        return Err(format!(
+            "{what}: a fire of {dispatches} dispatches took {burst_ns:.0} ns, below their \
+             launches ({launch_ns:.0} ns each) by more than {:.0}%: the launch probe and the \
+             burst disagree, so neither is a measurement",
+            AGREEMENT * 100.0
+        ));
+    }
+    Ok(f64::INFINITY)
+}
+
+/// The chain lengths the launch probe runs: a few dozen dispatches (a
+/// layer's) and a thousand (a fire's), whose gaps should agree.
+pub const LAUNCH_CHAINS: [u32; 2] = [64, 1024];
+
+/// A dispatch's launch from a chain of `n` dependent kernels taking
+/// `chain_ns` against one kernel doing the chain's whole work in `one_ns`:
+/// what each dispatch adds, `(chain − one) / n`, never below nothing.
+#[must_use]
+pub fn launch_from(chain_ns: f64, one_ns: f64, n: u32) -> f64 {
+    ((chain_ns - one_ns) / f64::from(n.max(1))).max(0.0)
 }
 
 /// The matmul every backend's rates step warms the device with before it
@@ -265,7 +330,30 @@ pub struct ScanShape {
     pub conv_width: u32,
 }
 
+/// The prompt lengths the scan curve is measured at: the attention's keys
+/// (a scan's rate a token grows with the chunk it walks, as a paged
+/// attention's with its keys).
+pub const SCAN_TOKENS: [u32; 6] = ATTN_KEYS;
+
+/// The scan sets the timed scans of `shape` rotate through: [`ATTN_SET_BYTES`]
+/// of the shape's input rows (bf16) and its conv and scan state (f32), and
+/// never fewer than 2, so each reads its state cold as a served layer's.
+#[must_use]
+pub fn scan_sets_at(shape: ScanShape) -> usize {
+    let rows = shape.tokens as usize * shape.channels() as usize * 2;
+    let state = 4
+        * (shape.conv_width as usize * shape.channels() as usize
+            + (shape.v_heads * shape.k_dim * shape.v_dim) as usize);
+    ATTN_SET_BYTES.div_ceil((rows + state).max(1)).max(2)
+}
+
 impl ScanShape {
+    /// This shape's heads over a prompt of `tokens`.
+    #[must_use]
+    pub fn at(self, tokens: u32) -> ScanShape {
+        ScanShape { tokens, ..self }
+    }
+
     /// The conv's channels: the scan's `qkv` row, its keys and queries and
     /// its values.
     #[must_use]
@@ -373,6 +461,9 @@ mod tests {
         // 2048 tokens · 16 heads · 128 · 128.
         assert_eq!(scan_elements(SCAN_SHAPE), 2048.0 * 16.0 * 16384.0);
         assert_eq!(SCAN_SHAPE.channels(), 6144);
+        assert_eq!(SCAN_SHAPE.at(512).tokens, 512);
+        assert!(scan_sets_at(SCAN_SHAPE.at(512)) >= 2);
+        assert!(scan_sets_at(SCAN_SHAPE.at(512)) > scan_sets_at(SCAN_SHAPE.at(16384)));
         assert!(ATTN_KEYS.windows(2).all(|w| w[0] < w[1]));
         for pages in [1, 2, 7, 32, 1024, 7919, 15838] {
             let mut order = attn_page_order(pages);
@@ -416,6 +507,38 @@ mod tests {
     }
 
     #[test]
+    fn a_rate_holds_no_launches() {
+        // A large fire: 1 ms over a 2 us launch, its rate barely moved.
+        let rate = rate_from("big", 1_000_000.0, 1, 2000.0, 1e9).unwrap();
+        assert!((rate - 1e9 / 998_000.0).abs() < 1e-9);
+        // A small one the gap dominates: 3 us of a 2 us launch is 1 us of
+        // work, not 3.
+        assert_eq!(rate_from("small", 3000.0, 1, 2000.0, 1000.0).unwrap(), 1.0);
+        // A scan's two dispatches both come off.
+        assert_eq!(rate_from("scan", 5000.0, 2, 2000.0, 1000.0).unwrap(), 1.0);
+        // No longer than its launch (within the agreement): gap-bound.
+        assert_eq!(
+            rate_from("tiny", 1950.0, 1, 2000.0, 10.0).unwrap(),
+            f64::INFINITY
+        );
+        // Far below it: the two disagree, refused by name.
+        let err = rate_from("matmul 16x1024x1024", 1000.0, 1, 2000.0, 10.0).unwrap_err();
+        assert!(
+            err.starts_with("matmul 16x1024x1024: a fire of 1 dispatches"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_launch_is_what_each_dependent_dispatch_adds() {
+        // 64 dispatches over 1 ms of work in 1.112 ms: 1.75 us each.
+        assert!((launch_from(1_112_000.0, 1_000_000.0, 64) - 1750.0).abs() < 1e-6);
+        // A chain no slower than its one kernel: no gap.
+        assert_eq!(launch_from(990.0, 1000.0, 64), 0.0);
+        assert!(LAUNCH_CHAINS.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
     fn the_warm_up_runs_until_its_rate_stops_falling() {
         // A clock sinking 100, 96, 93, 92 then holding: four rotations to
         // the first not slower than the one before.
@@ -456,7 +579,7 @@ mod tests {
                 (8192, 2048, 1024, 900.5),
             ]),
             attn_flops_per_ns_by_keys_and_dim: Some(vec![(512, 128, 40.0), (16384, 128, 50.0)]),
-            scan_elements_per_ns: Some(7.0),
+            scan_elements_per_ns_by_tokens: Some(vec![(2048, 7.0)]),
             bytes_per_ns: Some(800.0),
             launch_ns: Some(3500),
         };
@@ -464,7 +587,7 @@ mod tests {
             tuned(&rates),
             "[rates]\nbf16_flops_per_ns_by_rows_n_k = [\n  [16, 2048, 1024, 100.0],\n  [8192, 2048, \
              1024, 900.5],\n]\n\
-             attn_flops_per_ns_by_keys_and_dim = [\n  [512, 128, 40.0],\n  [16384, 128, 50.0],\n]\nscan_elements_per_ns = 7.0\nbytes_per_ns = 800.0\n\
+             attn_flops_per_ns_by_keys_and_dim = [\n  [512, 128, 40.0],\n  [16384, 128, 50.0],\n]\nscan_elements_per_ns_by_tokens = [[2048, 7.0]]\nbytes_per_ns = 800.0\n\
              launch_ns = 3500\n"
         );
         let (key, text) = provenance("vulkan", "the matmul through Coopmat");

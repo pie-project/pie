@@ -39,13 +39,53 @@ pub struct RungFacts {
     pub infeasible: Option<&'static str>,
 }
 
+/// The fire a rung is weighed as, and the one a check of the estimate fires
+/// for it: `lanes` lanes of `tokens_per_lane` new tokens each (`rows` in
+/// all), each row attending `keys_per_lane` keys, `sampled` rows read out.
+/// Decode-shaped (a rung no wider than its lanes): a lane a token, each on
+/// a fresh slot, attending its one key, every row read out.
+/// Prefill-shaped: one prompt of the rung's tokens on a fresh slot,
+/// attending the rung's keys, its last row read out. The estimate's terms
+/// are computed from it and every backend's check builds its fire from it,
+/// so the two cannot weigh different fires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckFire {
+    pub rows: u32,
+    pub lanes: u32,
+    pub tokens_per_lane: u32,
+    pub keys_per_lane: u32,
+    pub sampled: u32,
+}
+
 impl RungFacts {
+    /// The fire this rung is weighed and checked as ([`CheckFire`]).
+    #[must_use]
+    pub fn check_fire(&self) -> CheckFire {
+        if self.decode_shaped() {
+            CheckFire {
+                rows: self.tokens,
+                lanes: self.tokens,
+                tokens_per_lane: 1,
+                keys_per_lane: 1,
+                sampled: self.tokens,
+            }
+        } else {
+            CheckFire {
+                rows: self.tokens,
+                lanes: 1,
+                tokens_per_lane: self.tokens,
+                keys_per_lane: self.keys,
+                sampled: 1,
+            }
+        }
+    }
+
     /// The rows a fire at this rung samples, as the estimate weighs it: a
     /// rung no wider than its lanes is decode-shaped (a lane a token, each
     /// sampled), a wider one prefill-shaped (one prompt, one row sampled).
     #[must_use]
     pub fn sampled(&self) -> u32 {
-        if self.decode_shaped() { self.tokens } else { 1 }
+        self.check_fire().sampled
     }
 
     /// Whether the estimate weighs this rung decode-shaped: no wider than
@@ -59,29 +99,27 @@ impl RungFacts {
 /// What a fire costs, as work over the device's rates (the one shared
 /// formula every engine weighs its top rung by):
 ///
-/// `t(r) = Σ_dispatches max(launch_ns, work_d(r))`: each of the fire's
-/// dispatches takes its own work or a launch, whichever is longer, and a
-/// dispatch of the compiled plan the model's counts name no work for takes
-/// a launch. A dispatch's work is its op's term over the dispatches the op
-/// takes (a matmul plane's read or compute, whichever is longer; an
-/// attention layer's flops and kv read; a scan layer's state steps; an
-/// elementwise op's bytes), so a fire of many short kernels pays a launch
-/// for each of them, and one whose kernels are long pays only their work.
-/// The terms, summed over the fire (the work, unfloored):
+/// `t(r) = Σ_dispatches (launch_ns + work_d(r))`: each of the fire's
+/// dispatches takes its own work and a launch, and a dispatch of the
+/// compiled plan the model's counts name no work for takes a launch. A
+/// dispatch's work is its op's term over the dispatches the op takes (a
+/// matmul plane's read or compute, whichever is longer; an attention
+/// layer's flops and kv read; a scan layer's state steps; an elementwise
+/// op's bytes). `launch_ns` is what a dependent dispatch adds to its work
+/// as the backend submits a fire (`crate::rates::launch_from`): where the
+/// backend overlaps its launches it is small and the sum is the work; where
+/// it serializes them, each adds it. The terms, summed over the fire (the
+/// work, without the launches):
 ///
 /// `work(r) = max(weights(r) / bytes_per_ns,
 ///             Σ_(n, k) padded_rows(r) · flops_per_row(n, k) / flops(padded_rows(r), n, k))
 ///       + sampled(r) · readout_flops / flops(sampled(r), vocab, hidden)
 ///       + tokens(r) · keys(r) · attn_flops_per_row_key / attn(keys(r), d)
 ///       + keys(r) · kv_bytes_per_key / bytes_per_ns
-///       + tokens(r) · state_elements_per_row / scan_elements_per_ns
+///       + tokens(r) · state_elements_per_row / scan(tokens_per_lane(r))
 ///       + tokens(r) · elementwise_bytes_per_row / bytes_per_ns`
 ///
-/// The rates are timed as back-to-back dispatches in a frame, so each
-/// already holds its dispatch's launch wherever they serialize: a launch
-/// decides a dispatch's time only when the dispatch is too short for its
-/// work to hide it. Where `weights(r) = dense_bytes + expert_bytes · (1 −
-/// (1 − k/E)^tokens)`:
+/// Where `weights(r) = dense_bytes + expert_bytes · (1 − (1 − k/E)^tokens)`:
 /// a fire reads every dense weight once (the output head's at its readout), and
 /// of a routed bank the experts its rows touch (each row picks `k` of `E`).
 /// `flops(m, n, k)` is the device's matmul rate at `m` rows, `n` columns
@@ -124,7 +162,7 @@ pub struct FireEstimate {
     pub attn_head_dim: u32,
     /// Recurrent state elements a nanosecond; read only where the model
     /// carries recurrent state.
-    pub scan_elements_per_ns: f64,
+    pub scan_by_tokens: Vec<(u32, f64)>,
     /// Device memory bytes a nanosecond.
     pub bytes_per_ns: f64,
     /// What one launch costs beside its work.
@@ -201,21 +239,20 @@ impl FireEstimate {
     /// The estimate's terms at `rung`, in ns: the one place its form lives.
     #[must_use]
     pub fn terms(&self, rung: &RungFacts) -> Terms {
-        let tokens = f64::from(rung.tokens);
-        // A row's keys, and the keys the fire reads: decode-shaped, a lane
-        // attends one key (its fresh slot's own); prefill-shaped, the rung's.
-        let (keys, keys_read) = if rung.decode_shaped() {
-            (1.0, tokens)
+        // The fire the rung is weighed as: its rows, the keys a row
+        // attends, and the keys the fire reads (each lane its own).
+        let fire = rung.check_fire();
+        let tokens = f64::from(fire.rows);
+        let keys = f64::from(fire.keys_per_lane);
+        let keys_read = if fire.lanes > 1 {
+            f64::from(fire.lanes) * keys
         } else {
-            (f64::from(rung.keys), f64::from(rung.keys))
+            keys
         };
         // Work over a rate, nothing where there is no work.
         let over = |work: f64, rate: f64| if work > 0.0 { work / rate } else { 0.0 };
-        // `count` dispatches sharing `work`, each its share or a launch.
-        let floored = |work: f64, count: u32| {
-            let count = f64::from(count.max(1));
-            count * (work / count).max(self.launch_ns)
-        };
+        // `count` dispatches sharing `work`, each its share and a launch.
+        let floored = |work: f64, count: u32| work + f64::from(count.max(1)) * self.launch_ns;
         let (mut dispatched, mut dispatches) = (0.0, 0u64);
         // The matmuls: each plane a dispatch, its read or its compute.
         let touched = self.touched(rung.tokens);
@@ -232,8 +269,8 @@ impl FireEstimate {
         // The head's bytes are the readout's alone, not the trunk's read.
         let head_read = over(self.head_bytes as f64, self.bytes_per_ns);
         let readout = over(
-            f64::from(rung.sampled()) * self.readout_flops,
-            self.flops_per_ns(rung.sampled(), self.readout_columns(), self.readout_depth),
+            f64::from(fire.sampled) * self.readout_flops,
+            self.flops_per_ns(fire.sampled, self.readout_columns(), self.readout_depth),
         );
         if self.readout_flops > 0.0 {
             dispatched += floored(readout.max(head_read), 1);
@@ -253,7 +290,10 @@ impl FireEstimate {
         }
         let recurrent = over(
             tokens * self.state_elements_per_row,
-            self.scan_elements_per_ns,
+            // The rate at a lane's prompt (a decode lane's one token at
+            // the curve's narrowest point).
+            profile::fire::interpolate(&self.scan_by_tokens, fire.tokens_per_lane)
+                .unwrap_or(f64::INFINITY),
         );
         if self.state_elements_per_row > 0.0 {
             dispatched += floored(recurrent, self.scan_dispatches);
@@ -400,7 +440,7 @@ pub struct Terms {
     pub elementwise: f64,
     /// The output head's bytes, over the bandwidth: the readout's read.
     pub head_read: f64,
-    /// The fire's time: each dispatch its work or a launch, summed.
+    /// The fire's time: each dispatch its work and a launch, summed.
     pub dispatched: f64,
 }
 
@@ -417,14 +457,13 @@ impl Terms {
             + self.elementwise
     }
 
-    /// The fire's time: each dispatch its work or a launch, summed.
+    /// The fire's time: each dispatch its work and a launch, summed.
     #[must_use]
     pub fn total(&self) -> f64 {
         self.dispatched
     }
 
-    /// What the launch floors add to the fire's work: its dispatches too
-    /// short to hide their launches.
+    /// What the launches add to the fire's work: one a dispatch.
     #[must_use]
     pub fn floor(&self) -> f64 {
         (self.dispatched - self.work()).max(0.0)
@@ -629,7 +668,7 @@ mod tests {
             flops_grid: vec![(1, 1, 1, 1.0)],
             attn_grid: Vec::new(),
             attn_head_dim: 0,
-            scan_elements_per_ns: 0.0,
+            scan_by_tokens: Vec::new(),
             bytes_per_ns: 1.0,
             launch_ns: 0.0,
             dense_bytes: fixed_ns,
@@ -818,7 +857,7 @@ mod tests {
             // 32 twice that.
             attn_grid: vec![(1, 8, 0.25), (16, 8, 1.0), (1, 32, 0.5), (16, 32, 2.0)],
             attn_head_dim: 8,
-            scan_elements_per_ns: 2.0,
+            scan_by_tokens: vec![(1, 2.0), (16, 4.0)],
             bytes_per_ns: 4.0,
             launch_ns: 3.0,
             dense_bytes: 200,
@@ -845,6 +884,34 @@ mod tests {
             infeasible: None,
         };
         (e, r)
+    }
+
+    #[test]
+    fn a_rung_is_weighed_and_checked_as_one_fire() {
+        let (_, r) = documented();
+        // Decode-shaped: four lanes of a token each, a key each, all read out.
+        assert_eq!(
+            r.check_fire(),
+            CheckFire {
+                rows: 4,
+                lanes: 4,
+                tokens_per_lane: 1,
+                keys_per_lane: 1,
+                sampled: 4
+            }
+        );
+        // Prefill-shaped: one prompt over the rung's keys, its last row.
+        let prompt = RungFacts { tokens: 8, ..r };
+        assert_eq!(
+            prompt.check_fire(),
+            CheckFire {
+                rows: 8,
+                lanes: 1,
+                tokens_per_lane: 8,
+                keys_per_lane: 16,
+                sampled: 1
+            }
+        );
     }
 
     #[test]
@@ -957,7 +1024,7 @@ mod tests {
         // A model with no state reads no scan rate.
         let none = FireEstimate {
             state_elements_per_row: 0.0,
-            scan_elements_per_ns: 0.0,
+            scan_by_tokens: Vec::new(),
             ..e
         };
         assert_eq!(none.terms(&r).recurrent, 0.0);
@@ -971,24 +1038,6 @@ mod tests {
     }
 
     #[test]
-    fn each_dispatch_takes_its_work_or_a_launch() {
-        let (e, r) = documented();
-        // The documented fire's five dispatches: the matmul's 80 (its read
-        // 50), the readout's 24, the attention's 8 + 8, the scan's 6, and
-        // the one elementwise op's 2, floored at a 3 ns launch.
-        let t = e.terms(&r);
-        assert!((t.work() - 128.0).abs() < 1e-9);
-        assert!((t.total() - 129.0).abs() < 1e-9);
-        assert!((t.floor() - 1.0).abs() < 1e-9);
-        // The plan's dispatches the counts name no work for: a launch each.
-        let more = RungFacts {
-            launches: 1000,
-            ..r
-        };
-        assert!((e.terms(&more).total() - (129.0 + 995.0 * 3.0)).abs() < 1e-9);
-    }
-
-    #[test]
     fn the_heads_bytes_are_the_readouts_alone() {
         let (e, r) = documented();
         let headed = FireEstimate {
@@ -999,7 +1048,7 @@ mod tests {
         // (100 ns past its 24 of compute), not again in the trunk's 50.
         let t = headed.terms(&r);
         assert_eq!((t.weights, t.head_read), (50.0, 100.0));
-        assert!((t.total() - (80.0 + 100.0 + 16.0 + 6.0 + 3.0)).abs() < 1e-9);
+        assert!((t.total() - (80.0 + 100.0 + 16.0 + 6.0 + 2.0 + 5.0 * 3.0)).abs() < 1e-9);
         assert!((t.work() - (80.0 + 100.0 + 16.0 + 6.0 + 2.0)).abs() < 1e-9);
         // Prefill-shaped (one row sampled), the trunk's compute past its
         // read: the head moves only the readout's dispatch.
@@ -1007,16 +1056,34 @@ mod tests {
         let (with, without) = (headed.terms(&prompt), e.terms(&prompt));
         assert_eq!(with.weights, without.weights);
         assert!(
-            (with.total() - without.total() - (100.0 - without.readout.max(3.0))).abs() < 1e-9,
+            (with.total() - without.total() - (100.0 - without.readout)).abs() < 1e-9,
             "{with:?} {without:?}"
         );
     }
 
     #[test]
-    fn a_model_of_many_tiny_ops_pays_a_launch_for_each() {
+    fn each_dispatch_adds_a_launch_to_its_work() {
+        let (e, r) = documented();
+        // The documented fire's five dispatches: the matmul's 80 (its read
+        // 50), the readout's 24, the attention's 8 + 8, the scan's 6 and
+        // the one elementwise op's 2, each and a 3 ns launch.
+        let t = e.terms(&r);
+        assert!((t.work() - 128.0).abs() < 1e-9);
+        assert!((t.total() - (128.0 + 5.0 * 3.0)).abs() < 1e-9);
+        assert!((t.floor() - 15.0).abs() < 1e-9);
+        // The plan's dispatches the counts name no work for: a launch each.
+        let more = RungFacts {
+            launches: 1000,
+            ..r
+        };
+        assert!((e.terms(&more).total() - (128.0 + 1000.0 * 3.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_chain_of_short_dispatches_adds_its_gaps() {
         let (e, r) = documented();
         // A hundred per-row ops of one byte a row: 1 ns of work each at 4
-        // tokens, 3 ns of launch each.
+        // tokens, and each a 3 ns gap: the gaps add, they do not hide.
         let tiny = FireEstimate {
             elementwise_ops: vec![1; 100],
             ..e
@@ -1024,31 +1091,24 @@ mod tests {
         let wide = RungFacts { launches: 104, ..r };
         let t = tiny.terms(&wide);
         assert!((t.elementwise - 100.0).abs() < 1e-9);
-        assert!((t.total() - (80.0 + 24.0 + 16.0 + 6.0 + 300.0)).abs() < 1e-9);
-        assert!((t.floor() - 200.0).abs() < 1e-9);
+        assert!((t.total() - (t.work() + 104.0 * 3.0)).abs() < 1e-9);
     }
 
     #[test]
-    fn a_long_matmul_buries_its_launch() {
+    fn a_backend_with_no_gap_is_its_work() {
         let (e, r) = documented();
-        // A wide fire: the one matmul plane's compute far past a launch,
-        // its time the work's, unchanged by the floor.
-        let wide = RungFacts {
-            tokens: 4096,
-            lanes: 4096,
-            padded_rows: 4096,
-            ..r
+        let overlapped = FireEstimate {
+            launch_ns: 0.0,
+            ..e
         };
-        let t = e.terms(&wide);
-        assert!(t.flops > 100.0 * e.launch_ns);
-        let matmul = t.flops.max(t.weights);
-        let floored = matmul + t.readout + (t.attention + t.kv) + t.recurrent + t.elementwise;
-        assert!((t.total() - floored).abs() < 1e-9, "{t:?}");
+        let t = overlapped.terms(&r);
+        assert!((t.total() - t.work()).abs() < 1e-9);
+        assert_eq!(t.floor(), 0.0);
     }
 
     #[test]
-    fn a_one_token_fire_is_its_launches() {
-        // The M5's rung 1: one row, every dispatch shorter than a launch.
+    fn a_one_token_fire_is_its_launches_and_its_little_work() {
+        // The M5's rung 1: one row, every dispatch's work far under a launch.
         let (e, r) = documented();
         let quick = FireEstimate {
             launch_ns: 1000.0,
@@ -1062,16 +1122,16 @@ mod tests {
             ..r
         };
         let t = quick.terms(&one);
-        assert!(t.work() < 1000.0, "{t:?}");
-        assert_eq!(t.total(), 40.0 * 1000.0);
+        assert!(t.work() < 100.0, "{t:?}");
+        assert!((t.total() - (40.0 * 1000.0 + t.work())).abs() < 1e-9);
     }
 
     #[test]
     fn the_estimate_is_its_documented_form() {
         let (e, r) = documented();
-        // Each of its five dispatches its work or a 3 ns launch: max(200/4,
-        // 32·10/4), 4·6/1, 4·1·0.5/0.25 + 4·8/4, 4·3/2, and 4·2/4 floored.
-        let want = 80.0 + 24.0 + (8.0 + 8.0) + 6.0 + 3.0;
+        // Each of its five dispatches its work and a 3 ns launch: max(200/4,
+        // 32·10/4), 4·6/1, 4·1·0.5/0.25 + 4·8/4, 4·3/2 and 4·2/4.
+        let want = 80.0 + 24.0 + (8.0 + 8.0) + 6.0 + 2.0 + 5.0 * 3.0;
         assert!((e.ns(&r) - want).abs() < 1e-9, "{}", e.ns(&r));
         assert_eq!(e.ns(&r), e.terms(&r).total());
     }

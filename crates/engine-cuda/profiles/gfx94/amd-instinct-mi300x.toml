@@ -17,7 +17,7 @@ match = { name_contains = ["MI300X"] }
 # the copy 1.8%, attention, scan and the launch under 0.5%).
 bf16_flops_per_ns_by_rows_n_k = [[16, 4096, 4096, 37781.5], [32, 4096, 4096, 73769.9], [64, 4096, 4096, 139548.9], [128, 4096, 4096, 236568.2], [256, 4096, 4096, 314245.3], [512, 4096, 4096, 442427.1], [1024, 4096, 4096, 505503.8], [2048, 4096, 4096, 670702.2], [4096, 4096, 4096, 718139.4], [8192, 4096, 4096, 824510.9]]
 attn_flops_per_ns_by_keys_and_dim = [[2048, 128, 238285.2]]
-scan_elements_per_ns = 3073.2
+scan_elements_per_ns_by_tokens = [[2048, 3073.2]]
 bytes_per_ns = 4071.0
 launch_ns = 1631
 

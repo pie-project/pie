@@ -992,10 +992,12 @@ impl<'a> Walk<'a> {
                     rates.attn_flops_per_ns_by_keys_and_dim =
                         self.grid(v, "attn_flops_per_ns_by_keys_and_dim", "keys, head width");
                 }
-                key @ ("scan_elements_per_ns" | "bytes_per_ns") => {
+                "scan_elements_per_ns_by_tokens" => {
+                    rates.scan_elements_per_ns_by_tokens = self.tokens_curve(v);
+                }
+                key @ "bytes_per_ns" => {
                     match positive(v.get_ref()) {
-                        Some(f) if key == "bytes_per_ns" => rates.bytes_per_ns = Some(f),
-                        Some(f) => rates.scan_elements_per_ns = Some(f),
+                        Some(f) => rates.bytes_per_ns = Some(f),
                         None => self.err(
                             v.span().start,
                             format!(
@@ -1019,12 +1021,62 @@ impl<'a> Walk<'a> {
                     k.span().start,
                     format!(
                         "`rates` holds `bf16_flops_per_ns_by_rows_n_k`, `attn_flops_per_ns_by_keys_and_dim`, \
-                         `scan_elements_per_ns`, `bytes_per_ns` and `launch_ns`, not `{other}`"
+                         `scan_elements_per_ns_by_tokens`, `bytes_per_ns` and `launch_ns`, not `{other}`"
                     ),
                 ),
             }
         }
         rates
+    }
+
+    /// `rates.scan_elements_per_ns_by_tokens`: `[tokens, elements a ns]`
+    /// pairs, whole tokens and a positive rate each, non-empty and strictly
+    /// ascending in tokens.
+    fn tokens_curve(&mut self, value: &Spanned<DeValue<'_>>) -> Option<Vec<(u32, f64)>> {
+        const WHAT: &str = "`rates.scan_elements_per_ns_by_tokens` is a non-empty list of \
+                            [tokens, elements a ns] pairs, ascending in tokens";
+        let DeValue::Array(points) = value.get_ref() else {
+            self.err(
+                value.span().start,
+                format!("{WHAT}, not {}", found(value.get_ref())),
+            );
+            return None;
+        };
+        let mut curve: Vec<(u32, f64)> = Vec::with_capacity(points.len());
+        for point in points.iter() {
+            let pair = match point.get_ref() {
+                DeValue::Array(pair) if pair.len() == 2 => {
+                    let tokens = int(pair[0].get_ref())
+                        .and_then(|i| u32::try_from(i).ok())
+                        .filter(|&m| m > 0);
+                    let rate = match pair[1].get_ref() {
+                        DeValue::Float(f) => f.as_str().replace('_', "").parse::<f64>().ok(),
+                        DeValue::Integer(_) => int(pair[1].get_ref()).map(|i| i as f64),
+                        _ => None,
+                    }
+                    .filter(|f| *f > 0.0);
+                    tokens.zip(rate)
+                }
+                _ => None,
+            };
+            match pair {
+                Some((m, r)) if curve.last().is_none_or(|&(last, _)| m > last) => {
+                    curve.push((m, r));
+                }
+                _ => {
+                    self.err(
+                        point.span().start,
+                        format!("{WHAT}, not {}", found(point.get_ref())),
+                    );
+                    return None;
+                }
+            }
+        }
+        if curve.is_empty() {
+            self.err(value.span().start, format!("{WHAT}, not an empty list"));
+            return None;
+        }
+        Some(curve)
     }
 
     /// `rates.bf16_flops_per_ns_by_rows_n_k`: `[rows, n, k, flops a ns]`,
@@ -1055,7 +1107,7 @@ impl<'a> Walk<'a> {
                         DeValue::Integer(_) => int(t[3].get_ref()).map(|i| i as f64),
                         _ => None,
                     }
-                    .filter(|f| f.is_finite() && *f > 0.0);
+                    .filter(|f| *f > 0.0);
                     match (
                         whole(t[0].get_ref()),
                         whole(t[1].get_ref()),
@@ -1128,7 +1180,7 @@ impl<'a> Walk<'a> {
                         DeValue::Integer(_) => int(t[2].get_ref()).map(|i| i as f64),
                         _ => None,
                     }
-                    .filter(|f| f.is_finite() && *f > 0.0);
+                    .filter(|f| *f > 0.0);
                     match (whole(t[0].get_ref()), whole(t[1].get_ref()), rate) {
                         (Some(m), Some(k), Some(r)) => Some((m, k, r)),
                         _ => None,

@@ -405,11 +405,6 @@ pub fn estimate(
     counts: &Counts,
     rates: &profile::fire::Rates,
 ) -> Result<FireEstimate, &'static str> {
-    let needed = |rate: Option<f64>, needed: bool, key: &'static str| match rate {
-        Some(rate) => Ok(rate),
-        None if !needed => Ok(0.0),
-        None => Err(key),
-    };
     Ok(FireEstimate {
         flops_grid: rates
             .bf16_flops_per_ns_by_rows_n_k
@@ -423,11 +418,11 @@ pub fn estimate(
             _ => return Err("attn_flops_per_ns_by_keys_and_dim"),
         },
         attn_head_dim: counts.attn_head_dim,
-        scan_elements_per_ns: needed(
-            rates.scan_elements_per_ns,
-            counts.state_elements_per_row > 0,
-            "scan_elements_per_ns",
-        )?,
+        scan_by_tokens: match &rates.scan_elements_per_ns_by_tokens {
+            Some(curve) if !curve.is_empty() => curve.clone(),
+            _ if counts.state_elements_per_row == 0 => Vec::new(),
+            _ => return Err("scan_elements_per_ns_by_tokens"),
+        },
         launch_ns: rates.launch_ns.unwrap_or(0) as f64,
         dense_bytes: counts.weight_bytes,
         expert_bytes: counts.expert_bytes,
@@ -619,7 +614,7 @@ mod tests {
             (vec![(2048, 128, 7.0)], 100.0, 5.0)
         );
         // No recurrent state: no scan rate read.
-        assert_eq!(e.scan_elements_per_ns, 0.0);
+        assert!(e.scan_by_tokens.is_empty());
         assert_eq!(e.dense_bytes, 1 << 30);
         // Each rate the model's work needs, unstated, is named.
         for (key, unstated) in [
@@ -651,14 +646,17 @@ mod tests {
             state_elements_per_row: 1 << 20,
             ..counts()
         };
-        assert_eq!(estimate(&recurrent, &rates), Err("scan_elements_per_ns"));
+        assert_eq!(
+            estimate(&recurrent, &rates),
+            Err("scan_elements_per_ns_by_tokens")
+        );
         let scanned = profile::fire::Rates {
-            scan_elements_per_ns: Some(3.0),
+            scan_elements_per_ns_by_tokens: Some(vec![(2048, 3.0)]),
             ..rates.clone()
         };
         assert_eq!(
-            estimate(&recurrent, &scanned).unwrap().scan_elements_per_ns,
-            3.0
+            estimate(&recurrent, &scanned).unwrap().scan_by_tokens,
+            vec![(2048, 3.0)]
         );
         // A model attending nothing reads no attention rate.
         let attending_nothing = Counts {

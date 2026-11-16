@@ -173,7 +173,7 @@ fn serve(artifact: &Path, deployment: &str, device: &str, file: &str) -> Result<
 
 /// How far the estimate's pick may fall short of the measured-best rung:
 /// its score, under the measured times, within this share of the best's.
-pub const CHECK_BOUND: f64 = 0.05;
+pub const CHECK_BOUND: f64 = engine::rates::AGREEMENT;
 
 /// `--check-estimate`: `artifact` loaded under `file` as a served load is
 /// asked ([`crate::FIRE`]), every rung one binding holds laid; a fire of
@@ -231,12 +231,34 @@ fn check_estimate(
         })
         .map_err(|e| e.to_string())
     };
+    // The rungs come of a load; the shell each check fire runs on is then
+    // sized from the fires (engine::load::CheckFire): its slots the most
+    // lanes one fires, its context a lane's keys and new tokens.
     let mut shell = load(1, tokens)?;
     let weighed = shell.weighed().cloned().ok_or_else(|| {
         format!(
             "{device} has no rates in its profile to estimate by: run `pie tune vulkan --rates`"
         )
     })?;
+    let sized = |decode: bool| {
+        weighed
+            .rungs
+            .iter()
+            .filter(|r| r.infeasible.is_none())
+            .map(engine::load::RungFacts::check_fire)
+            .filter(|f| (f.lanes > 1) == decode)
+            .fold((1u32, 1u32), |(slots, context), f| {
+                (
+                    slots.max(f.lanes),
+                    context.max(f.keys_per_lane + f.tokens_per_lane),
+                )
+            })
+    };
+    let (_, prompt_context) = sized(false);
+    if prompt_context != tokens {
+        drop(shell);
+        shell = load(1, prompt_context)?;
+    }
     let widths: Vec<u32> = weighed
         .rungs
         .iter()
@@ -376,7 +398,12 @@ fn check_estimate(
                     .with_dim(weighed.estimate.attn_head_dim);
                 crate::encode::capture_shapes(true);
                 crate::encode::reset_kernel_profile();
-                let rate = crate::rates::attention_rate(&shell.device, &shell.tuning, shape);
+                let rate = crate::rates::attention_rate(
+                    &shell.device,
+                    &shell.tuning,
+                    shape,
+                    weighed.estimate.launch_ns,
+                );
                 crate::encode::capture_shapes(false);
                 let micro_shapes = crate::encode::take_shapes();
                 let micro: Vec<String> = crate::encode::kernel_profile()
@@ -460,9 +487,23 @@ fn check_estimate(
     // (`RungFacts::sampled`): past the lanes, one prompt of its tokens on a
     // fresh slot; up to them, a lane a token, each on a fresh slot of its
     // own (a second shell, of a slot a lane).
-    let max_lanes = weighed.rungs.iter().map(|r| r.lanes).max().unwrap_or(1);
-    let (decode, prompts): (Vec<u32>, Vec<u32>) =
-        widths.iter().copied().partition(|&w| w <= max_lanes);
+    // Each rung's fire as the estimate weighs it (engine::load::CheckFire).
+    let fire_of = |width: u32| {
+        weighed
+            .rungs
+            .iter()
+            .find(|r| r.tokens == width)
+            .map(engine::load::RungFacts::check_fire)
+    };
+    let (decode, prompts): (Vec<u32>, Vec<u32>) = widths
+        .iter()
+        .copied()
+        .partition(|&w| fire_of(w).is_some_and(|f| f.lanes > 1));
+    let max_lanes = decode
+        .iter()
+        .filter_map(|&w| fire_of(w).map(|f| f.lanes))
+        .max()
+        .unwrap_or(1);
     let replayed = |c: Option<(u64, u64)>| c.map_or(0, |(replayed, _)| replayed);
     // Served fires replay what they recorded: a fire walked here times the
     // host's encoding beside the device's work, and is no fire time of this
@@ -485,10 +526,12 @@ fn check_estimate(
             };
             let before = shell.recordings();
             let began = Instant::now();
-            shell
-                .fire(std::slice::from_ref(&lane))
+            let landed = shell
+                .fire_landed(std::slice::from_ref(&lane))
                 .map_err(|e| e.to_string())?;
             let ns = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            // The rows read back outside the timed fire.
+            shell.rows_of(&landed).map_err(|e| e.to_string())?;
             if timed && replayed(shell.recordings()) <= replayed(before) {
                 return Err(walked(width, shell.recordings()));
             }
@@ -501,16 +544,18 @@ fn check_estimate(
         say(&format!(
             "decode-shaped rungs (up to {max_lanes} lanes): a lane a token, each on a fresh slot"
         ));
-        let mut shell = load(max_lanes, 16)?;
+        let (slots, context) = sized(true);
+        let mut shell = load(slots.max(max_lanes), context)?;
         let ones: Vec<[u32; 1]> = (0..max_lanes).map(|i| [token(i)]).collect();
         let word = trace.facts.word(&Request::new(1, false));
         measured.extend(search::time_fires(
             &decode,
             |width, timed| {
-                for slot in 0..width {
+                let lanes_n = fire_of(width).map_or(width, |f| f.lanes);
+                for slot in 0..lanes_n {
                     shell.open(slot).map_err(|e| e.to_string())?;
                 }
-                let lanes: Vec<engine_gpu::serve::Lane<'_>> = (0..width)
+                let lanes: Vec<engine_gpu::serve::Lane<'_>> = (0..lanes_n)
                     .map(|slot| engine_gpu::serve::Lane {
                         slot,
                         word,
@@ -519,8 +564,10 @@ fn check_estimate(
                     .collect();
                 let before = shell.recordings();
                 let began = Instant::now();
-                shell.fire(&lanes).map_err(|e| e.to_string())?;
+                let landed = shell.fire_landed(&lanes).map_err(|e| e.to_string())?;
                 let ns = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                // Every lane's row read back outside the timed fire.
+                shell.rows_of(&landed).map_err(|e| e.to_string())?;
                 if timed && replayed(shell.recordings()) <= replayed(before) {
                     return Err(walked(width, shell.recordings()));
                 }
@@ -777,7 +824,7 @@ fn rates(base: &Profile, say: &mut dyn FnMut(&str)) -> Result<profile::fire::Rat
         "[rates]: attention {:.1} TFLOP/s, scan {:.2} G state elements/s, {:.0} GB/s, launch \
          {:.2} us",
         rates.attn_at(16384, 128).unwrap_or(0.0) / 1e3,
-        rates.scan_elements_per_ns.unwrap_or(0.0),
+        rates.scan_at(2048).unwrap_or(0.0),
         rates.bytes_per_ns.unwrap_or(0.0),
         rates.launch_ns.unwrap_or(0) as f64 / 1e3
     ));
