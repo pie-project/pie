@@ -340,7 +340,7 @@ async fn a_program_s_fire_term_widens_the_span_before_its_bind_and_its_close_giv
             pool.pool().chunk_table(),
             "nothing moved"
         );
-        assert!(pool.raising().is_none());
+        assert!(pool.awaiting_notice().is_none());
         // What the engine relies on when it backs its own span: no state
         // slot lies in the widened span once the wait is through.
         let in_span: Vec<u32> = all
@@ -1161,7 +1161,7 @@ fn on_demand_at(rung: u32) -> (SharedPool, FakeEngine) {
     let (mut pool, engine) = on_demand_loaded();
     let raise = pool.plan_raise(rung).unwrap();
     assert_eq!(pool.raise_applied(&raise).unwrap(), Some((16, rung)));
-    pool.raise_carved();
+    pool.rung_told();
     assert_eq!(pool.told(), rung);
     (pool, engine)
 }
@@ -1204,7 +1204,7 @@ async fn binds_at_a_standing_rung_send_the_engine_no_notice() {
             .await
             .unwrap();
         let mut pool = shared.lock().unwrap();
-        assert!(pool.raising().is_none(), "bind {id}");
+        assert!(pool.awaiting_notice().is_none(), "bind {id}");
         assert_eq!(pool.told(), 256, "bind {id}");
         assert_eq!(pool.span_short(256), 0, "funded before bind {id} is sent");
         pool.instance_bound(InstanceId(id), key(PROGRAM));
@@ -1274,7 +1274,7 @@ async fn a_growth_at_a_standing_rung_over_the_span_s_cache_sends_nothing_once_it
         let pool = shared.lock().unwrap();
         assert_eq!(pool.pool().act_reserved(), 4 + 3);
         assert_eq!(pool.told(), 256);
-        assert!(pool.raising().is_none());
+        assert!(pool.awaiting_notice().is_none());
         assert_eq!(engine.table.as_slice(), pool.pool().chunk_table());
         assert!(
             below
@@ -1468,7 +1468,7 @@ async fn a_term_past_the_rung_the_engine_holds_brings_it_down_before_the_bind() 
         let pool = shared.lock().unwrap();
         assert_eq!(pool.pool().act_reserved(), 4 + 7, "the 256 rung's term");
         assert_eq!(pool.told(), 256);
-        assert!(pool.raising().is_none());
+        assert!(pool.awaiting_notice().is_none());
         assert_eq!(
             walk.step(&pool, u32::MAX, 256, 256, 6, 6).unwrap(),
             RungStep::Wait
@@ -1501,7 +1501,7 @@ fn a_steady_one_row_decode_moves_no_rung_and_no_cap() {
     assert_eq!(rung, 16);
     assert!(pool.stands_at(rung));
     assert_eq!(pool.raise_applied(&raise).unwrap(), None, "no notice");
-    assert!(pool.raising().is_none());
+    assert!(pool.awaiting_notice().is_none());
     assert_eq!(pool.pool().act_reserved(), 1 + 2);
     for epoch in 2..200 {
         assert_eq!(

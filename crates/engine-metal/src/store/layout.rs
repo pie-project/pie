@@ -493,6 +493,7 @@ impl Layout {
             // states the two apart, this is backed-on-demand false with
             // rungs told.
             span_backed_on_demand: !self.act().is_empty(),
+            tells_rungs: false,
             // The load pins the range below the segment the largest rung's
             // carve starts in (`Pool::reserve`): a carve reaches no lower
             // (`Pool::cover`), with its guests' terms.

@@ -441,6 +441,7 @@ impl Layout {
         }
         ChunkFacts {
             span_backed_on_demand: false,
+            tells_rungs: false,
             // The span is the pool's last segment, backed from the load on
             // and laid once: the largest rung's carve at its end and, under
             // any rung's, what a fire takes beside it. What no rung's carve

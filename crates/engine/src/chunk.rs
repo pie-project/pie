@@ -105,6 +105,17 @@ pub struct ChunkFacts {
     /// or not (Metal). `false`: the whole span is backed from the load.
     #[serde(default)]
     pub span_backed_on_demand: bool,
+    /// The engine is told every rung change ([`crate::Engine::set_rung`]),
+    /// from the smallest rung it starts at, whether or not its span is
+    /// backed on demand: its fires lay their regions by the rung it holds
+    /// (Metal's carve bookkeeping), so a raise reaches it before any fire
+    /// of the wider rung, and a lower once every wider fire has retired. On
+    /// a span backed from the load the notice moves bookkeeping only;
+    /// nothing is backed or refused. `false`: the engine takes a fire of
+    /// any rung as it comes. A span backed on demand is told rungs either
+    /// way.
+    #[serde(default)]
+    pub tells_rungs: bool,
     /// The chunks from the range's end a rung's activation may take as the
     /// engine stands, the guest term of its fires included
     /// ([`crate::GuestTerm`]). `None`: nothing of the engine's own bounds
@@ -523,6 +534,7 @@ impl ChunkFacts {
             held_bytes: 0,
             outside_bytes: 0,
             span_backed_on_demand: false,
+            tells_rungs: false,
             act_span_chunks: None,
             host_chunks: host,
             disk_chunks,

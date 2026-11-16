@@ -179,9 +179,9 @@ impl SharedGrow {
             let (step, goal) = {
                 let mut pool = self.shared.lock().unwrap();
                 pool.pool_mut().retire_through(retired);
-                // A raise's carve is still the engine's to back: nothing
+                // A raise's notice is still the engine's to take: nothing
                 // moves on until it has.
-                if pool.raising().is_some() {
+                if pool.awaiting_notice().is_some() {
                     return;
                 }
                 let goal = pool.rung_for(self.walk_rows());
