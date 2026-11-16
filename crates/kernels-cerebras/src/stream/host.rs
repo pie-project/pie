@@ -150,10 +150,11 @@ pub(crate) fn half_f32(h: u16) -> f32 {
 /// The trace row of a unit's own row `t`.
 fn trace_row(p: &Program, unit: usize, t: u32) -> usize {
     match &p.units[unit].sched {
-        Some(s) => {
-            let (c, k) = s.rows[t as usize];
-            (p.class_rows[c].1 + k) as usize
-        }
+        // (a row its schedule does not list: its own row t)
+        Some(s) => s
+            .rows
+            .get(t as usize)
+            .map_or(t as usize, |&(c, k)| (p.class_rows[c].1 + k) as usize),
         None => 0,
     }
 }

@@ -152,16 +152,24 @@ impl Layout {
             .unwrap_or(width)
             .max(width);
         if span > width {
+            // (at the head roots where they hold a value of it head by head, or where none of
+            // its values is placed yet: its consumers' head regions place them after it)
+            let at_heads = |c: &Cols| {
+                (0..self.heads).all(|h| {
+                    self.cols[h as usize]
+                        .iter()
+                        .any(|s| s.covers(c.base, c.from + h * (span / self.heads)))
+                })
+            };
+            let unplaced = |c: &Cols| {
+                !self.cols.iter().flatten().any(|s| {
+                    s.base == c.base.0 && s.from < c.from + c.width && c.from < s.from + s.len
+                })
+            };
             let on = self.heads > 0
                 && side == Side::Col
                 && span.is_multiple_of(self.heads * width)
-                && cands.iter().any(|c| {
-                    (0..self.heads).all(|h| {
-                        self.cols[h as usize]
-                            .iter()
-                            .any(|s| s.covers(c.base, c.from + h * (span / self.heads)))
-                    })
-                });
+                && (cands.iter().any(at_heads) || cands.iter().all(unplaced));
             return RegionAt {
                 first: 0,
                 roots: if on { self.heads } else { 0 },

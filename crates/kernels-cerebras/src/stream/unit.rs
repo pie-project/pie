@@ -405,8 +405,8 @@ fn alias(op: &Operation) -> bool {
     )
 }
 
-/// Whether `c`'s row values (each read whole) are of different widths wider than its region:
-/// head regions over values of several head counts.
+/// Whether `c`'s row values (each read whole) are of different widths: head regions over values
+/// of several head counts (a q of 2 heads a kv head beside its k).
 fn mixed(trace: &Trace, c: &Chain) -> bool {
     let width = |v: ValueId| match trace.values.get(v.0 as usize).map(|d| &d.ty) {
         Some(Ty::Tensor { shape, .. }) => match shape.last() {
@@ -423,7 +423,6 @@ fn mixed(trace: &Trace, c: &Chain) -> bool {
                 && i.from == 0
         })
         .map(|(_, i)| width(i.value))
-        .filter(|&w| w > c.region.width)
         .collect();
     ws.len() > 1
 }
@@ -433,8 +432,8 @@ fn regions(trace: &Trace, run: &[u32]) -> R<Vec<Chain>> {
     if run.is_empty() {
         return Ok(Vec::new());
     }
-    // (a part over row values of different widths, each wider than it — a q of 2 heads a kv
-    // head beside its v — places on no one set of roots: its nodes apart)
+    // (a part over row values of different widths — a q of 2 heads a kv head beside its v —
+    // places on no one set of roots: its nodes apart)
     if let Some(c) = chain::lower_run_parts(trace, run)
         && (run.len() == 1 || !c.iter().any(|c| mixed(trace, c)))
     {
