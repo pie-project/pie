@@ -581,6 +581,9 @@ pub fn emit_fused_region(
                 at += covered - 1;
                 continue;
             }
+            if op.tag == tags::OUTPUT && streams.intrinsic_unread(base) {
+                continue;
+            }
         }
         if op.tag == tags::RESHAPE
             && !op.args.is_empty()
