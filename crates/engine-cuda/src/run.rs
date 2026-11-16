@@ -2253,8 +2253,8 @@ impl<'c> Run<'c> {
 
     /// Where a select stages a host-resident bank's experts, if the load
     /// laid a staging for them.
-    pub(crate) fn expert_staging(&self) -> Option<crate::experts::staging::Staged> {
-        self.fire.tables.expert_staging
+    pub(crate) fn expert_staging(&self) -> Option<&crate::experts::staging::Staged> {
+        self.fire.tables.expert_staging.as_ref()
     }
 
     pub(crate) fn expert_bank(&self, id: ValueId) -> (Tensor, ExpertTable) {
@@ -2728,6 +2728,7 @@ impl<'c> Run<'c> {
         self.fire
             .tables
             .expert_staging
+            .as_ref()
             .map(|_| {
                 "a select stages a host-resident bank's experts by its routes, read back as \
                  the fire walks"

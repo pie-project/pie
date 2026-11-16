@@ -153,7 +153,7 @@ impl Shell {
             decoding: &self.decoding,
             tiers: &self.tiers,
             decoded_tiles: &self.decoded_tiles,
-            expert_staged: self.expert_staged,
+            expert_staged: self.expert_staged.as_ref(),
             seq,
         };
         super::btrace::mark("prepare_tail");
@@ -223,7 +223,7 @@ struct FireCtx<'a> {
     tiers: &'a record::Tiers,
     decoded_tiles: &'a [u64],
     /// Where a select stages a host-resident bank's experts.
-    expert_staged: Option<crate::experts::staging::Staged>,
+    expert_staged: Option<&'a crate::experts::staging::Staged>,
     seq: u64,
 }
 
@@ -720,7 +720,7 @@ impl FireCtx<'_> {
                 pool_state: self.pools.pool_slabs(),
                 row_tables: self.pools.row_tables(),
                 expert_tables: self.pools.expert_tables(),
-                expert_staging: self.expert_staged,
+                expert_staging: self.expert_staged.cloned(),
             },
             device: self.device.device(),
             toggles: self.device.toggles(),

@@ -21,9 +21,6 @@ use crate::error::{Fault, Result};
 /// What a run of the staging is aligned to.
 const ALIGN: u64 = 256;
 
-/// The most streams a load stages on.
-const LANES: usize = 8;
-
 /// One select of a host-resident bank, as its staging is sized.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Select {
@@ -58,16 +55,15 @@ pub struct Staging {
 }
 
 /// The staging as a fire reads it: where each run lies and what it holds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Staged {
     /// The first lane's runs, address and bytes: codes, scales, third,
     /// routes.
     runs: [(u64, u64); 4],
     /// From one lane to the next.
     stride: u64,
-    /// Each lane's stream; the first `lanes` hold one.
-    streams: [u32; LANES],
-    lanes: usize,
+    /// Each lane's stream, in lane order.
+    streams: std::sync::Arc<[u32]>,
     /// The rows a fire stages for at most.
     pub rows: u32,
 }
@@ -77,9 +73,7 @@ impl Staged {
     /// for.
     #[must_use]
     pub fn lane(&self, stream: u32) -> Option<[(u64, u64); 4]> {
-        let lane = self.streams[..self.lanes]
-            .iter()
-            .position(|&at| at == stream)? as u64;
+        let lane = self.streams.iter().position(|&at| at == stream)? as u64;
         Some(
             self.runs
                 .map(|(at, bytes)| (at + lane * self.stride, bytes)),
@@ -202,14 +196,6 @@ impl Staging {
 
     /// Refuses a staging `room` bytes do not hold, by its banks' names.
     pub fn fits(&self, room: u64) -> Result<()> {
-        if self.streams.len() > LANES {
-            return Err(Fault::Residency(format!(
-                "the routed bank(s) {} lie on the host and their selects run on {} streams; a \
-                 load stages experts on at most {LANES}",
-                self.names(),
-                self.streams.len(),
-            )));
-        }
         let need = self.bytes();
         if need <= room {
             return Ok(());
@@ -239,14 +225,10 @@ impl Staging {
             at += bytes.next_multiple_of(ALIGN);
             run
         });
-        let mut streams = [0u32; LANES];
-        let lanes = self.streams.len().min(LANES);
-        streams[..lanes].copy_from_slice(&self.streams[..lanes]);
         Some(Staged {
             runs,
             stride: self.lane_bytes(),
-            streams,
-            lanes,
+            streams: self.streams.as_slice().into(),
             rows: self.rows,
         })
     }
