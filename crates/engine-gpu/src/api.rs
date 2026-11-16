@@ -287,6 +287,7 @@ pub fn fault(fault: Fault) -> Error {
         Fault::Ceiling { what, need, have } => Error::Impossible(format!(
             "this fire wants {need} {what} and the load reserved {have}"
         )),
+        Fault::InputRows { .. } => Error::Impossible(fault.to_string()),
 
         Fault::Fragmented { .. } => Error::Device(fault.to_string()),
 

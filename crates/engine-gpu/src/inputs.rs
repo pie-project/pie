@@ -226,6 +226,8 @@ pub struct PatchFire<'a> {
 #[derive(Debug)]
 pub struct Inputs<B: Backend> {
     store: B::Buffer,
+    /// The rows the per-row fields were laid for: the load's `max_tokens`.
+    rows: u64,
     tokens: u64,
     positions: u64,
     readout_rows: u64,
@@ -381,6 +383,7 @@ impl<B: Backend> Inputs<B> {
         let store = B::Buffer::host(device, total, crate::books::owners::INPUTS)?;
         Ok(Inputs {
             store,
+            rows,
             tokens,
             positions,
             readout_rows,
@@ -524,6 +527,10 @@ impl<B: Backend> Inputs<B> {
         handles: &crate::handles::Handles<B>,
         fire: &Fire<'_>,
     ) -> Result<Handles> {
+        // Every per-row field was laid for the load's rows: a fire past them
+        // is refused by name before anything is written, never caught after
+        // a write ran into the field beside it.
+        rows_fit(self.rows, fire.tokens.len(), fire.positions.len())?;
         let rows = fire.tokens.len() as u32;
         let lanes = fire.slot_ids.len() as u32 / self.pieces;
 
@@ -1034,8 +1041,47 @@ fn csr(into: &mut Vec<i32>, staged: &[i32], ceiling: u32) {
     into.resize(ceiling as usize, last);
 }
 
+/// Whether a fire of `tokens` tokens and `positions` positions fits the
+/// `rows` the input store's per-row fields were laid for.
+fn rows_fit(rows: u64, tokens: usize, positions: usize) -> Result<()> {
+    for (what, len) in [("tokens", tokens), ("positions", positions)] {
+        let len = len as u64;
+        if len > rows {
+            return Err(Fault::InputRows {
+                what,
+                tokens: len,
+                rows,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn rows_table(into: &mut Vec<i32>, staged: &[i32], rows: u32) {
     into.clear();
     into.extend_from_slice(staged);
     into.resize(rows as usize, -1);
+}
+
+#[cfg(test)]
+mod rows_tests {
+    use super::*;
+
+    /// A fire past the rows the input store was laid for is refused by
+    /// name, tokens or positions alike; one at or under them goes.
+    #[test]
+    fn a_fire_past_the_input_store_s_rows_is_refused_before_any_write() {
+        assert!(rows_fit(256, 256, 256).is_ok());
+        assert!(rows_fit(256, 1, 1).is_ok());
+        let refused = rows_fit(256, 257, 257).unwrap_err();
+        assert_eq!(
+            refused.to_string(),
+            "a fire of 257 tokens is past the input store's 256 rows"
+        );
+        let refused = rows_fit(256, 256, 300).unwrap_err();
+        assert_eq!(
+            refused.to_string(),
+            "a fire of 300 positions is past the input store's 256 rows"
+        );
+    }
 }
