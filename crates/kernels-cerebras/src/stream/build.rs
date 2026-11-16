@@ -645,24 +645,8 @@ pub fn program_at(
             word,
             prologue: u.classes.is_empty(),
         };
-        // a row-side value its row roots hold padded (narrower than them, or of no multiple)
-        // passes through matvecs and the row stream; a decode step's row region runs over its
-        // padded chunks, its outputs' padding zeroed (a reading's regions divide its rows: its
-        // programs as they were)
-        for st in &u.steps {
-            if let Step::Region {
-                side: Side::Row,
-                chain,
-            } = st
-                && shape.cache.is_none()
-                && !chain.region.width.is_multiple_of(py)
-            {
-                return Err(format!(
-                    "{name}: {}: a row region of {} columns cuts over no {py} rows",
-                    u.name, chain.region.width
-                ));
-            }
-        }
+        // (a row-side value its row roots hold padded, narrower than them or of no multiple: a
+        // row region runs over its padded chunks, its outputs' padding zeroed)
         let layout = place::layout(&r, &u, py, tile, spill, split.widen)?;
         let mut regions = BTreeMap::new();
         for (i, s) in u.steps.iter().enumerate() {
