@@ -1058,6 +1058,11 @@ impl Shell {
                 &Exports::of(&boot.trace, &compiled, boot.context, boot.page_size)?.outputs,
             ),
         };
+        let scored = poem_ir::ClassSet::of(
+            engine::load::armed::scored_classes(&landing)
+                .iter()
+                .filter(|class| tiers.plain.contains(*class)),
+        );
         let drafting_words: std::collections::HashSet<u64> =
             crate::exports::drafting_of(&landing, &tiers.plain)
                 .into_iter()
@@ -1373,6 +1378,7 @@ impl Shell {
             corrected,
             decoding,
             drafting_words,
+            scored,
             tiers,
             landing,
             armed: None,
@@ -1477,11 +1483,8 @@ impl Shell {
         // Arming a scored class lends its fires' capture rows from a run
         // the load holds beside its staged inputs, the widest fire's lanes'
         // rows, counted before ready.
-        let scored = engine::load::armed::scored_classes(&shell.landing)
-            .iter()
-            .any(|class| shell.tiers.plain.contains(class));
         shell.arming_capture.0 = engine::load::armed::arming_capture_room(
-            scored,
+            !shell.scored.is_empty(),
             shell.fire_lanes(),
             boot.context,
             boot.page_size,

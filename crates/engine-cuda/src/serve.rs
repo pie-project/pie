@@ -101,6 +101,9 @@ pub struct Shell {
     /// The class words of a drafter's classes (`Shell::drafts_only`); none
     /// on a model without a drafter.
     drafting_words: std::collections::HashSet<u64>,
+    /// The scored classes the lattice arms (`engine::load::armed`): at its
+    /// octaves alone, a fire holding a lane of one padded up to the next.
+    scored: poem_ir::ClassSet,
     landing: Vec<Vec<poem_ir::Request>>,
     armed: Option<Armed>,
     media: poem_ir::ClassSet,
@@ -978,6 +981,16 @@ impl Shell {
             && self
                 .drafting_words
                 .contains(&(word & self.compiled.classes.mask))
+    }
+
+    /// Whether a lane of `word` lands in a scored class the lattice arms.
+    fn scored_word(&self, word: u64) -> bool {
+        !self.scored.is_empty()
+            && self
+                .compiled
+                .classes
+                .class_of(word & self.compiled.classes.mask)
+                .is_some_and(|class| self.scored.contains(class))
     }
 
     fn rs_rungs(&self) -> Vec<u32> {
