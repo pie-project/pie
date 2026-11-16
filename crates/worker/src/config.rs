@@ -487,9 +487,7 @@ pub struct ModelConfig {
     /// an `adapter.toml` and the plane files it names.
     #[serde(default)]
     pub adapter_dir: String,
-    /// Dtype weights are materialized in. Separate from `activation_dtype`
-    /// (in `[engine]`, the dtype compute happens in) — narrower weights and
-    /// wider compute is a normal combination.
+    /// Dtype weights are materialized in.
     #[serde(default = "default_weight_dtype")]
     pub weight_dtype: String,
     /// How many adapter seats this deployment intends to use, and which
@@ -824,11 +822,6 @@ pub struct EngineConfig {
     /// experts, which the busiest experts' replicas fill.
     #[serde(default)]
     pub expert_replicas: u32,
-    /// Compute dtype for activations, e.g. `"bfloat16"`. Separate from
-    /// `weight_dtype`: a deployment can store weights narrower than it
-    /// computes.
-    #[serde(default = "default_activation_dtype")]
-    pub activation_dtype: String,
     /// The longest sequence (prompt + output) one lane holds, in tokens: a
     /// product limit, not a memory one. Omit for the model's own context,
     /// shortened to what the device holds where one sequence at it would
@@ -1037,9 +1030,6 @@ fn default_tp_size() -> u32 {
 fn default_ep_size() -> u32 {
     1
 }
-fn default_activation_dtype() -> String {
-    "bfloat16".to_string()
-}
 /// Accept either a single string or a list of strings.
 fn deserialize_string_or_list<'de, D>(d: D) -> Result<Vec<String>, D::Error>
 where
@@ -1114,6 +1104,7 @@ device = ["metal:0"]
         an_empty_memory_table_is_the_dedicated_machine();
         the_memory_keys_are_seven_and_prefixed();
         the_dispatch_depth_is_bounded_by_the_engine_kind();
+        activation_dtype_is_an_unknown_key();
     }
 
     fn an_empty_memory_table_is_the_dedicated_machine() {
@@ -1173,6 +1164,19 @@ device = ["metal:0"]
 
     /// A staged engine keeps the 64-bit ring's 15 frames; only the cerebras
     /// shell, which posts frames to a host queue, takes more.
+    /// Nothing reads a compute dtype from the config: a file that states
+    /// one is refused as it would be for any key no struct declares.
+    fn activation_dtype_is_an_unknown_key() {
+        let err = Config::parse(&MINIMAL_METAL.replace(
+            "device = [\"metal:0\"]",
+            "device = [\"metal:0\"]\nactivation_dtype = \"bfloat16\"",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown field `activation_dtype`"), "{err}");
+        Config::parse(MINIMAL_METAL).expect("without it, the file loads");
+    }
+
     fn the_dispatch_depth_is_bounded_by_the_engine_kind() {
         for (depth, ok) in [(15, true), (16, false)] {
             let toml = format!("{MINIMAL_METAL}\n[runtime]\nframe_dispatch_depth = {depth}\n");

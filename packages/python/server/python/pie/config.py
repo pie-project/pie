@@ -96,7 +96,6 @@ class EngineConfig:
     type: str = "cuda"
     device: list[str] = field(default_factory=list)
     tensor_parallel_size: Optional[int] = None
-    activation_dtype: Optional[str] = None
     # The longest sequence one lane holds; omit for the model's own context.
     max_context: Optional[int] = None
     memory: MemoryConfig = field(default_factory=MemoryConfig)
@@ -206,7 +205,6 @@ class Config:
         e = self.engine
         engine: dict = {"type": e.type, "device": e.device}
         put(engine, "tensor_parallel_size", e.tensor_parallel_size)
-        put(engine, "activation_dtype", e.activation_dtype)
         put(engine, "max_context", e.max_context)
         for key, value in e.options.items():
             if key in engine or key == "memory":
