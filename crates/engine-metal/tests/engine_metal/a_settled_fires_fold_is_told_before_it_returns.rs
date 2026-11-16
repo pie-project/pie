@@ -45,7 +45,7 @@ fn a_settled_fires_fold_is_told_before_it_returns() {
         base: 0,
         folded: 0,
         fold: FoldLen::Host(3),
-        lineage: Default::default(),
+        lineage: engine::fire::Lineage::Set,
     };
     let lanes = [Seated {
         held: Some(0),

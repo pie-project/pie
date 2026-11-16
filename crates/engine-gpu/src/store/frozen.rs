@@ -231,7 +231,7 @@ mod tests {
             base: 0,
             folded,
             fold,
-            lineage: Default::default(),
+            lineage: engine::fire::Lineage::Set,
         }
     }
 

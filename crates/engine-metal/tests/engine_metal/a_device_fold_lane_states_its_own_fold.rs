@@ -112,7 +112,7 @@ fn buffering(shell: &Shell) -> RsVerb {
         base: 0,
         folded: 0,
         fold: FoldLen::Device,
-        lineage: Default::default(),
+        lineage: engine::fire::Lineage::Set,
     }
 }
 

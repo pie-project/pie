@@ -179,7 +179,7 @@ impl Set {
             base: PROMPT,
             folded,
             fold,
-            lineage: Default::default(),
+            lineage: engine::fire::Lineage::Set,
         };
         lane.rs_reset = RsReset::Held;
         lane.slot_copies = std::mem::take(&mut self.copies);

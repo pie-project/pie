@@ -24,7 +24,7 @@ fn buffer(pages: &[u32], folded: u32, fold: u32) -> RsVerb {
         base: 0,
         folded,
         fold: FoldLen::Host(fold),
-        lineage: Default::default(),
+        lineage: engine::fire::Lineage::Set,
     }
 }
 

@@ -624,7 +624,6 @@ pub enum RsVerb {
         /// Which buffered slots the lane's recurrence replays: a lane alone
         /// on its set replays every buffered slot of its set; lanes sharing
         /// a set replay the slots their mask admits, the ancestry they state.
-        #[serde(default)]
         lineage: Lineage,
     },
 }
@@ -632,10 +631,9 @@ pub enum RsVerb {
 /// Which of its set's buffered slots a lane's recurrent layers replay
 /// ([`RsVerb::Buffer`]). The mask is attention's; a recurrence reads a row
 /// of its lineage in order, and its own rows always.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Lineage {
     /// The lane is alone on its set in the fire: every buffered slot.
-    #[default]
     Set,
     /// The lane shares its set with other lanes of the fire: the slots its
     /// mask admits, the ancestry it states.
