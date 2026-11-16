@@ -35,6 +35,9 @@ impl LanePlan {
             fold,
         } = verb
         else {
+            // A lane that folds every row runs them in order too: its mask
+            // hides no row of its own before the row it masks.
+            buffered_reads(mask, first, first, rows)?;
             return Ok(LanePlan {
                 commit: rows,
                 ..LanePlan::default()

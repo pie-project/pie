@@ -137,41 +137,43 @@ impl Masking {
     }
 }
 
-/// The recurrent layers replay one run for all of a lane's rows, so every row
-/// must admit the same buffered slots. `folded` is the lane's boundary, the
-/// origin of its mask's columns ([`Lane::mask`]): the buffered slots
-/// `folded..first` are columns `0..first - folded`, its own rows the columns
-/// after. The reads are slots.
+/// The buffered slots a lane's recurrent layers replay, `folded..first`,
+/// whole and in order, then its own rows. A recurrence reads every row it
+/// carries in order and can decline none, so on a model with recurrent
+/// layers a lane's mask may hide no buffered slot of its working set and
+/// no row of its own before the row it masks: such a lane is refused by
+/// name, never run with rows its attention hides and its recurrence reads.
+/// `folded` is the lane's boundary, the origin of its mask's columns
+/// ([`Lane::mask`]): the buffered slots are columns `0..first - folded`,
+/// its own rows the columns after. The reads are slots.
 pub fn buffered_reads(
     masking: Option<&Masking>,
     folded: u32,
     first: u32,
     rows: u32,
 ) -> Result<Vec<Range<u32>>> {
-    let whole = || {
-        (folded < first)
-            .then_some(folded..first)
-            .into_iter()
-            .collect()
+    let whole: Vec<Range<u32>> = (folded < first)
+        .then_some(folded..first)
+        .into_iter()
+        .collect();
+    let Some(masking) = masking else {
+        return Ok(whole);
     };
     let buffer = u64::from(first.saturating_sub(folded));
-    let read = |mask: &Mask| -> Vec<Range<u32>> {
-        mask.admitted(0..buffer)
-            .map(|span| (span.start as u32 + folded)..(span.end as u32 + folded))
-            .collect()
-    };
-    let Some(masking) = masking else {
-        return Ok(whole());
-    };
-    let masks = masking.masks();
-    let Some(reads) = masks.first().map(read) else {
-        return Ok(whole());
-    };
-    for (row, mask) in masks.iter().enumerate() {
-        if read(mask) != reads {
+    for (row, mask) in masking.masks().iter().enumerate() {
+        let kept: u64 = mask
+            .admitted(0..buffer)
+            .map(|span| span.end - span.start)
+            .sum();
+        if kept != buffer {
+            let hidden = (0..buffer)
+                .find(|&column| mask.admitted(column..column + 1).next().is_none())
+                .unwrap_or(0);
             return Err(Error::Invalid(format!(
-                "row {row} admits other buffered slots than the lane's first row; its \
-                 recurrent layers replay one run of them for all its rows"
+                "row {row} hides buffered slot {} of its own working set; its recurrent \
+                 layers read the lane's rows in order and can skip none, so on a model \
+                 with recurrent layers a mask hides no row a lane's recurrence carries",
+                u64::from(folded) + hidden
             )));
         }
         let before = match masking {
@@ -185,12 +187,12 @@ pub fn buffered_reads(
             .sum();
         if kept != own.end - own.start {
             return Err(Error::Invalid(format!(
-                "row {row} hides a row of its own lane before it; its recurrent layers \
-                 run the lane's rows in order"
+                "row {row} hides a row of its own lane before it; its recurrent layers run \
+                 the lane's rows in order"
             )));
         }
     }
-    Ok(reads)
+    Ok(whole)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1129,27 +1131,30 @@ mod tests {
     }
 
     #[test]
-    fn a_lane_replays_the_buffered_slots_its_mask_admits() {
+    fn a_lane_replays_every_buffered_slot_and_a_mask_hiding_one_is_refused() {
         // Slots 0..2 are folded; the lane's one row is at slot 6. Its mask's
         // columns start at the boundary: column 0 is slot 2.
-        let ancestry = mask(&[false, true, false, true, true]);
-        assert_eq!(
-            ancestry.admitted(0..4).collect::<Vec<_>>(),
-            vec![1..2, 3..4],
-            "the kept spans in the range, in order"
-        );
-        let reads = buffered_reads(Some(&Masking::Rows(vec![ancestry.clone()])), 2, 6, 1);
-        assert_eq!(reads.unwrap(), vec![3..4, 5..6], "slots, not columns");
+        let all = mask(&[true, true, true, true, true]);
+        let reads = buffered_reads(Some(&Masking::Rows(vec![all.clone()])), 2, 6, 1);
+        assert_eq!(reads.unwrap(), vec![2..6], "slots, not columns");
         assert_eq!(buffered_reads(None, 2, 6, 1).unwrap(), vec![2..6]);
 
-        // Two rows from slot 5 that admit different buffered slots, and a
-        // second row that hides the first: a recurrence runs neither.
-        let other = mask(&[true, false, false, true, true]);
-        let rows = Masking::Rows(vec![ancestry.clone(), other]);
+        // Hiding a buffered slot: the recurrence would skip it.
+        let ancestry = mask(&[false, true, false, true, true]);
+        let refused = buffered_reads(Some(&Masking::Rows(vec![ancestry])), 2, 6, 1);
+        let refused = refused.expect_err("a hidden buffered slot is refused");
+        assert!(
+            refused.to_string().contains("hides buffered slot 2")
+                && refused.to_string().contains("in order"),
+            "{refused}"
+        );
+        // A row hiding its own lane's row before it.
+        let blind = mask(&[true, true, true, false, true]);
+        let rows = Masking::Rows(vec![all.clone(), blind]);
         assert!(buffered_reads(Some(&rows), 2, 5, 2).is_err());
-        let blind = mask(&[false, true, false, false, true]);
-        let rows = Masking::Rows(vec![ancestry, blind]);
-        assert!(buffered_reads(Some(&rows), 2, 5, 2).is_err());
+        // Hiding later rows (the causal edge) is every mask's own.
+        let causal = Masking::Rows(vec![mask(&[true, true, true, true, false]), all]);
+        assert_eq!(buffered_reads(Some(&causal), 2, 5, 2).unwrap(), vec![2..5]);
     }
 
     #[test]
