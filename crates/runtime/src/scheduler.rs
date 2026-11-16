@@ -217,6 +217,24 @@ pub(crate) async fn write_host_kv(engine_id: usize, slots: Vec<u32>, bytes: Vec<
         .map(drop)
 }
 
+/// Every engine is told a request was admitted (`Engine::expect_work`),
+/// before the request is placed on one: a device asleep wakes while the
+/// request is tokenized and its program launched.
+pub(crate) fn expect_work() {
+    let handles: Vec<SchedulerHandle> = handle_registry()
+        .read()
+        .unwrap()
+        .iter()
+        .flatten()
+        .cloned()
+        .collect();
+    for handle in handles {
+        if let Err(error) = handle.expect_work() {
+            tracing::debug!(%error, "telling an engine work is coming");
+        }
+    }
+}
+
 pub(crate) async fn pool(engine_id: usize, op: worker::PoolOp) -> Result<()> {
     scheduler_handle(engine_id)?.pool(op).await
 }

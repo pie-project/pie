@@ -2449,6 +2449,17 @@ impl Shell {
         self.voxel_seat.map(|seat| seat.dtype)
     }
 
+    /// Work is coming ([`crate::keepalive::KeepAlive::wake`]): a GPU that
+    /// idled down wakes now, not under the next fire.
+    pub fn expect_work(&self) {
+        #[cfg(target_vendor = "apple")]
+        if let Some(keepalive) = &self.keepalive
+            && let Err(error) = keepalive.wake(&self.device)
+        {
+            tracing::debug!(%error, "waking the device for work coming");
+        }
+    }
+
     #[must_use]
     pub fn weighed(&self) -> Option<&crate::top::Weighed> {
         self.weighed.as_ref()
