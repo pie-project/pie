@@ -16,5 +16,7 @@ bf16_flops_per_ns = 792000.0
 # A 256 MiB device-to-device copy, read and write counted: 4013 GB/s. Peak:
 # 5.3 TB/s of HBM3 (AMD Instinct MI300X data sheet).
 bytes_per_ns = 4013.0
-# An empty kernel's launch, back to back on one stream.
-launch_ns = 1544
+# An empty kernel's dispatch as serving pays it, inside a captured hipGraph
+# (1000 captured, the graph's time over 1000): 1532 ns. One by one on a
+# stream, 1539-1575 ns: on ROCm a graph saves no dispatch cost.
+launch_ns = 1532
