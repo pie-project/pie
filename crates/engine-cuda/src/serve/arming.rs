@@ -1005,6 +1005,7 @@ impl Shell {
         rest: &[(u32, Kind)],
         kept: usize,
         weighed: &[(usize, usize); Kind::COUNT],
+        unit_margin: u64,
     ) -> std::collections::BTreeSet<u32> {
         let Some((steps, from, mut fine)) = self.lattice else {
             return std::collections::BTreeSet::new();
@@ -1028,7 +1029,9 @@ impl Shell {
                 + kept * average
         };
         // What the allowance has left, or the card where it has less: the
-        // ceiling's spare stops arming as the allowance does.
+        // ceiling's spare stops arming as the allowance does, once it falls
+        // under the margin `arm_target` stops at, so that margin is no part
+        // of the room the bodies still to arm are fitted in.
         let allowance = self.bodies_mem.saturating_sub(spent.bytes);
         let spare = self
             .pools
@@ -1036,7 +1039,8 @@ impl Shell {
             .map_or(allowance, |spare| {
                 usize::try_from(spare).unwrap_or(usize::MAX)
             });
-        let room = allowance.min(spare);
+        let margin = usize::try_from(self.arming_margin(unit_margin)).unwrap_or(usize::MAX);
+        let room = allowance.min(spare.saturating_sub(margin));
         while need(&buckets) > room {
             if fine <= steps.max(1) {
                 eprintln!(
@@ -1076,8 +1080,23 @@ impl Shell {
             .filter(|b| !buckets.contains(b))
             .copied()
             .collect();
+        // The fires compose at the buckets left (`Shell::budgets`), as the
+        // lattice arms them: a bucket dropped here is one no fire pads to.
+        self.budgets.tokens.buckets.clone_from(&buckets);
         self.budget.buckets = buckets;
         dropped
+    }
+
+    /// The spare under which arming stops (`arm_target`), and which the
+    /// lattice's fit holds out of the room it prices the bodies still to
+    /// arm in (`fit_lattice`): two bodies at what the armed ones weigh on
+    /// average, or the map units the pool may still take beside them,
+    /// never past a quarter of the allowance (an allowance the fit held
+    /// under the margin would otherwise stop arming before its first body).
+    fn arming_margin(&self, unit_margin: u64) -> u64 {
+        let spent = self.cache.body_stats().census;
+        let price = (2 * spent.bytes / spent.bodies.max(1)) as u64;
+        price.max(unit_margin.min(self.bodies_mem as u64 / 4))
     }
 
     /// Forgets the recorded bodies and arms the lattice again within the
@@ -1501,7 +1520,7 @@ impl Shell {
                 )
                 .collect();
             let kept = st.targets.len() + 1 - rest.len();
-            let dropped = self.fit_lattice(&rest, kept, &st.weighed);
+            let dropped = self.fit_lattice(&rest, kept, &st.weighed, st.unit_margin);
             st.dropped.extend(dropped);
         }
         let weighed_before = self.cache.body_stats().census;
@@ -1515,11 +1534,7 @@ impl Shell {
         let spent = self.cache.body_stats();
         let room = (self.bodies_mem as u64).saturating_sub(spent.census.bytes as u64);
         let spare = self.pools.spare_bytes_for_bodies(room).unwrap_or(u64::MAX);
-        let price = (2 * spent.census.bytes / spent.census.bodies.max(1)) as u64;
-        // A map unit's margin never past a quarter of the allowance: an
-        // allowance the fit held under the margin would otherwise stop
-        // arming before its first body.
-        let margin = price.max(st.unit_margin.min(self.bodies_mem as u64 / 4));
+        let margin = self.arming_margin(st.unit_margin);
         // Estimated where nothing is known; a record's allowance is a
         // measurement, and the headroom estimate is not consulted.
         let headroom = !st.from_record && spare < margin;
