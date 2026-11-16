@@ -1975,28 +1975,34 @@ impl Shell {
         let standing = self.rung;
         self.warming = true;
         // The forms the walk fires, from the plan: every word a request
-        // reaches that serving arms (a plain one, and a drafter's verify:
-        // plain but for reading its pass's drafts), at each rung's prompt
+        // reaches that serving arms (a plain one, a drafter's verify: plain
+        // but for reading its pass's drafts, and one capturing its
+        // attention scores, alone or with drafts), at each rung's prompt
         // and at one row; and on a model serving rs verbs, each under every
         // verb a lane takes (a fold, a buffer folding nothing, a buffer
         // replaying what it held and folding it), so its verify and drain
         // kernels are built too. A guest program's pipelines are built at
         // its registration, not here.
         let facts = self.trace.facts.clone();
-        let mut drafting: Vec<bool> = facts
+        let mut forms: Vec<(bool, bool)> = facts
             .requests()
             .iter()
             .filter(|request| {
-                request.plain()
-                    || (request.drafts()
-                        && request.departures() == usize::from(request.query_len() != 1) + 1)
+                request.departures()
+                    == usize::from(request.query_len() != 1)
+                        + usize::from(request.drafts())
+                        + usize::from(request.captures_scores())
             })
-            .map(poem::Request::drafts)
+            .map(|request| (request.drafts(), request.captures_scores()))
             .collect();
-        drafting.sort_unstable();
-        drafting.dedup();
-        let word = |rows: u32, drafts: bool| {
-            facts.word(&poem::Request::new(rows, false).drafting(drafts))
+        forms.sort_unstable();
+        forms.dedup();
+        let word = |rows: u32, (drafts, scores): (bool, bool)| {
+            facts.word(
+                &poem::Request::new(rows, false)
+                    .drafting(drafts)
+                    .capturing_scores(scores),
+            )
         };
         // The walk's lanes name slot refs, as the runtime's do: each shape's
         // first slot past the null chunk, inside the pool whatever the seat
@@ -2044,7 +2050,7 @@ impl Shell {
             let mut fires = 0u32;
             for rung in self.arena.rung_tokens() {
                 self.set_rung(self.rung, rung)?;
-                for &drafts in &drafting {
+                for &form in &forms {
                     for (verb, held) in &verbs {
                         let prompt = rung
                             .min(self.budgets.tokens.max_tokens)
@@ -2062,7 +2068,7 @@ impl Shell {
                             windows: &windows,
                             ..Seated::of(Lane {
                                 slot: 0,
-                                word: word(prompt, drafts),
+                                word: word(prompt, form),
                                 tokens: &prompt_tokens,
                             })
                         }];
@@ -2076,7 +2082,7 @@ impl Shell {
                                 windows: &windows,
                                 ..Seated::of(Lane {
                                     slot,
-                                    word: word(1, drafts),
+                                    word: word(1, form),
                                     tokens: &one,
                                 })
                             })
