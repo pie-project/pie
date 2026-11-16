@@ -142,6 +142,11 @@ fn build(args: &[String]) -> Result<(), String> {
     let out = PathBuf::from(get(&f, "--out").ok_or(USAGE)?);
     let emit: Vec<&str> = get(&f, "--emit").map_or(EMITS.to_vec(), |e| e.split(',').collect());
     let levers = Levers::of(&plan.levers, get(&f, "--levers").unwrap_or(""))?;
+    // (a decode program's memory is its model's: its sizes are comptime functions)
+    let room = kernels_cerebras::cost::memory::room(
+        &plan,
+        kernels_cerebras::cost::memory::anchor(&plan.shape),
+    );
     let prog = Program::of(plan)?;
     build::emit(
         &prog,
@@ -149,7 +154,58 @@ fn build(args: &[String]) -> Result<(), String> {
         get(&f, "--kernels").map(Path::new),
         &out,
         &emit,
-    )
+    )?;
+    // the static check of what was emitted (routes, queues, a PE's memory)
+    if out.join("layout/layout.csl").is_file() {
+        let mut rep = kernels_cerebras::check::dir(&out.join("layout"))?;
+        rep.model_room = Some(room as i64);
+        println!("{}", rep.line());
+        rep.ok()?;
+    }
+    Ok(())
+}
+
+/// The static check of what `stream` wrote in `--out` (where it wrote a program).
+fn checked(args: &[String]) -> Result<(), String> {
+    let Some(out) = args
+        .iter()
+        .position(|a| a == "--out")
+        .and_then(|i| args.get(i + 1))
+    else {
+        return Ok(());
+    };
+    let dir = Path::new(out);
+    if !dir.join("layout.csl").is_file() || args.iter().any(|a| a == "--price") {
+        return Ok(());
+    }
+    let rep = kernels_cerebras::check::dir(dir)?;
+    println!("{}", rep.line());
+    rep.ok()
+}
+
+/// `check --dir <program dir>`: the static check of an emitted program (a stream program's
+/// directory, or a decode build's `layout/`).
+fn check(args: &[String]) -> Result<(), String> {
+    let f = flags(args, &["--dir"])?;
+    let rep = kernels_cerebras::check::dir(Path::new(get(&f, "--dir").ok_or(USAGE)?))?;
+    println!("{}", rep.line());
+    for e in rep.errors.iter().take(20) {
+        println!("  error: {e}");
+    }
+    for w in rep.warnings.iter().take(5) {
+        println!("  warning: {w}");
+    }
+    for (f, d, c) in rep.codes.iter().take(8) {
+        println!("  {f}: {d} B data + ~{c} B code");
+    }
+    if !rep.unknown.is_empty() {
+        println!(
+            "  {} array sizes not evaluated, e.g. {}",
+            rep.unknown.len(),
+            rep.unknown[0]
+        );
+    }
+    rep.ok()
 }
 
 /// `link`: a build directory compiled, checked and its artifact put beside it.
@@ -636,7 +692,8 @@ fn run() -> Result<(), String> {
         Some("link") => link(&args[1..]),
         Some("cost") => cost(&args[1..]),
         Some("search") => search(&args[1..]),
-        Some("stream") => stream(&args[1..]),
+        Some("stream") => stream(&args[1..]).and_then(|()| checked(&args[1..])),
+        Some("check") => check(&args[1..]),
         _ => Err(USAGE.to_string()),
     }
 }
