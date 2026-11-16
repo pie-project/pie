@@ -2197,18 +2197,19 @@ milestone's tail.
         copy. (Two runner bugs on the way, the compiler's output right: `run.py` read a 16-bit
         table written as f32 bits as numbers, every rotation's slot 0, and could not read a
         rectangle back; both fixed.)
-      - **Its cycles are not the price's yet.** That run's step is 1.75M cycles against 0.37M
-        priced. Bisected by dropping ops (a debug build): the qkv GEMM 192k (37k priced), and
-        about 320k before the first op that reads no weights, the same at 16 and 32 columns
-        (16 x 17 and 32 x 17 PEs: 175k, 328k: about 600 cycles a PE) while the tapes end at 31k.
-        `run.py`'s cycles are the latest end less the earliest start of PEs whose counters
-        start at their own launch, so a late launch is counted (K1); the denoise runs were read
-        by `wafer-bench` (969k, priced 0.96M). Open: the text step through the engine
-        (`flux_2_minis_text_on_the_fabric`, compile on load) and its stamps, to tell the
-        launch's skew from the GEMM's (on load the engine takes the GEMM regime for all three
-        of the mini's whole-sequence programs, text 16 x 19, denoise 32 x 43; its simulator run
-        holds every reading's program at once, 8,483 tiles, hours: not run); until then the price of a small text program is not to
-        be trusted (klein's text: GEMM 34.9M against the stream's 307M expected, a 9x margin).
+      - **Its cycles: the first launch's are the arrays landing.** That run's step read 1.75M
+        cycles against 0.37M priced. Dropping ops (a debug build) put about 320k before the
+        first op of a program that reads no weights, about 600 cycles a PE (175k at 16 x 17
+        PEs, 328k at 32 x 17), with the tapes done at 31k. The simulator's copies return before
+        their words land, and a PE's counter starts at its own launch, which waits behind its
+        words: the first launch after the arrays are written counts their landing (M1k's
+        "a first launch's cycles include its static arrays landing"). `run.py` with the step
+        launched again (`RELAUNCH=1`, the same arrays): the 6-op program **38.9k** (priced 40k),
+        the whole text step **309,234 cycles** (priced 0.37M: the model 1.2x pessimistic at
+        `tb` 1 and 16 columns). So a step needs no launch term; the first launch after a load
+        is the load's (the statics written once a model). `wafer-bench` launches after its
+        writes have landed, and K1 saw the same cycles on both launches on a system: K1's 3.3M
+        lane prologue is a stream program's, not this.
     - **klein for the chip**: compile on load's 1024² program (the GEMM regime, 384 x 1,078
       PEs; `wafer-compile stream --model flux2-klein-4b-bf16-kv-bf16 --rows 64 --class-rows
       context=512,latents=4096`, bf16) links in 151 s, 171 ELFs, 391 MB, the largest 47,390 B
@@ -2217,22 +2218,34 @@ milestone's tail.
       under 2 GiB, the tapes' 7.7 GB array split in five and joined on the worker): request 1511
       links it on the worker and runs the 2-step loop from K1's inputs; 1513 runs K1's stream
       program (1497's) again at the same shape and inputs, the two regimes measured side by side.
-    - **Batches** (several requests' rows in one launch; designed, not built). A row's request
-      is a third coordinate beside its class: the step's rows `B` requests x the classes' rows,
-      each request's rows contiguous within its class (the token blocks `tb` dividing a
-      request's rows, so a PE's rows are one request's). What changes:
-      - the lane vectors (timestep, guidance, adaLN's modulation) are a request's, not the
-        step's: a lane value of `B` rows, a PE reading the row of its block's request (a lane
-        region's `Lane` argument offset by the request, the host's entry `B` rows);
-      - the attention restricted to the request: a key block of another request is skipped
-        (each PE knows its block's request and a key block's from its index: a word of the op),
-        so the joint attention of a request's text and image rows is its own, and a batch costs
-        no cross-request scores;
-      - per-row values (positions, the context) are already per row.
-      The search prices `B` in 1..4 as it prices `(C, R, kbm)`: a GEMM's pieces, turns and
-      weights stream are paid once a launch, its MACs `B` times, so batching amortises the
-      per-op overheads (at klein `tb` 8 they are most of a GEMM) until the PE's memory or the
-      array's rows run out; the engine's scheduler hands it the step's requests.
+    - **Batches** (several requests' rows in one launch, `Lowering::batch`). A row's request
+      is a coordinate beside its class: the step's rows are `B` requests' rows in turn (each its
+      classes' rows), the token blocks `tb` dividing a request's rows, so a PE row is one
+      request's (`GemmProgram::row_req`, the PE's `pcfg[3]`). What it changes, and nothing
+      else:
+      - a PE's lane vectors (timestep, guidance, adaLN's modulation) are its request's: the
+        host's entry reads the request's lane row (a row a lane, a request's lanes in turn), and
+        the lane ops run on it as before (a PE row is one request's);
+      - the attention's column line is a request's rows of PEs (its routes end at the
+        request's first and last row; the key blocks and the causal index from the request's
+        first row `R0`), so a request attends to its own rows only and pays no other's turns;
+      - every other value is per row already.
+      `gemm::batched` prices `B` in 1 ..= most as the search prices `(C, R, kbm)`, the step's
+      price over its requests (the fewer on a tie): flux2-mini's step at 16 + 16 rows is 0.96M
+      priced at `B` 1, 2 and 4 (32 x 32, 32 x 64, 32 x 128 PEs), so 4 a launch serve each for a
+      quarter; klein at 1024² places no `B` above 1 (its rows at `tb` 16 do not fit a PE beside
+      the tapes). `wafer-compile stream --regime gemm --batch B | --batch-most B`; the
+      emulator runs a batch (two requests at timesteps 500 and 700, the second's latent the
+      first's reversed: 5.864e-3 against the two captures in turn, each alone 5.868e-3 and
+      5.859e-3; `flux_2_minis_batch_files` writes them). **On the simulator** (the two at
+      `--gemm 32,8,4 --batch 2`, 8 rows a PE, through double block 0's attention, a debug cut):
+      5.06e-3 and 5.35e-3 from each request's own capture on its own rows (each against the
+      other's: 1.05), the emulator's digits. (The whole step at that shape, its arrays landing
+      first, outlasts the simulator's half hour.) The compile-on-load program for `B` 1
+      changes only its PE's request (`pcfg` a word longer, the line's bounds `R0`, `RQ`): the
+      klein program staged for the chip is 902e22887's.
+      Next: the engine's side (a step's entries from `B` requests' host values, the
+      scheduler handing a launch its requests) and compile on load's `B`.
 
 ## G1: the poem survey
 
