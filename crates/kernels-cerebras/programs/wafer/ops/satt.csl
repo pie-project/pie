@@ -26,7 +26,7 @@
 // PAGED (a decode step of lanes over Pie's pages, GENERIC.md G1.8): the column's slots in pages
 // of P = EP x PYA positions (a page EP consecutive entries on each PE); `ptab` each lane slot's
 // pages in order (LANES x MAXP, the host's when a lane takes a page), `rowp` a step's rows'
-// (lane slot, position) (the host's a step). Row t stores at its lane's page q / P, offset q % P
+// (lane slot, state slot, position) (the host's a step; the state slot a recurrence's column's). Row t stores at its lane's page q / P, offset q % P
 // (PE row offset % PYA, entry page x EP + offset / PYA), its q held a row (ROWS rows, not an
 // entry each); its query attends its lane's pages before q / P whole and of page q / P the
 // offsets up to q % P (WIN > 0: and none WIN or more positions before q).
@@ -69,7 +69,7 @@ const SXW: u16 = if (QH) (Qh + 2) * Dc else 2 * Dc;
 var sx: [SXW]f32 align(16) = @zeros([SXW]f32);
 const QCW: u16 = if (PAGED) ROWS * Qh * Dc else if (QH) NE * Qh * Dc else 1;
 var ptab = @zeros([if (PAGED) LANES * MAXP else 1]u32);
-var rowp = @zeros([if (PAGED) 2 * ROWS else 1]u32);
+var rowp = @zeros([if (PAGED) 3 * ROWS else 1]u32);
 var mk = @zeros([if (PAGED) NE else 1]f32);
 const mk_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{if (PAGED) NE else 1} -> mk[i] });
 var qc = @zeros([QCW]u16);
@@ -153,8 +153,8 @@ var srow: u16 = 0;
 var sent: u16 = 0;
 fn slot(t: u16) void {
   const P: u32 = @as(u32, EP) * @as(u32, PYA);
-  const lane = rowp[2 * t];
-  const q = rowp[2 * t + 1];
+  const lane = rowp[3 * t];
+  const q = rowp[3 * t + 2];
   const page = ptab[lane * @as(u32, MAXP) + q / P];
   const off = q % P;
   srow = @as(u16, off % @as(u32, PYA));
@@ -197,8 +197,8 @@ fn unmask(page: u32, a: u32, b: u32) void {
 fn lane_mask(t: u16) void {
   const P: u32 = @as(u32, EP) * @as(u32, PYA);
   const Y: u32 = @as(u32, PYA);
-  const lane = rowp[2 * t];
-  const q = rowp[2 * t + 1];
+  const lane = rowp[3 * t];
+  const q = rowp[3 * t + 2];
   @fmovs(mk_d, @as(f32, 0.0));
   // the first position attended
   var lo: u32 = 0;

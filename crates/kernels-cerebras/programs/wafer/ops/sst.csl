@@ -9,17 +9,23 @@
 // a decay a head (Gated DeltaNet's, Mamba-2's: the vector constant) or one a key (KDA's), a delta
 // rule's delta or a plain increment (Mamba-2's dt x).
 //
+// SLOTS: a state a lane slot (row t of a step steps slot rowp[3 t + 1], cleared first at its
+// position 0: GENERIC.md G1.8's rows).
+//
 // Params: fab (ops/fabric.csl), red (the column chain: ops/schain.csl), YM (the root's multicast
-// input queue), DK / DV (the head's key / value dims), PYA (the column's PEs).
+// input queue), DK / DV (the head's key / value dims), PYA (the column's PEs), SLOTS, ROWS.
 param fab: imported_module;
 param red: imported_module;
 param YM: input_queue;
 param DK: u16;
 param DV: u16;
 param PYA: u16;
+param SLOTS: u16 = 1;
+param ROWS: u16 = 1;
 
 const NR: u16 = (DK + PYA - 1) / PYA;
-var st = @zeros([NR * DV]f32);
+var st = @zeros([SLOTS * NR * DV]f32);
+var rowp = @zeros([3 * ROWS]u32);
 var kq = @zeros([3 * DK]f32);
 var dd: [DV + DK]f32 align(16) = @zeros([DV + DK]f32);
 var acc: [2 * DV]f32 align(16) = @zeros([2 * DV]f32);
@@ -36,7 +42,21 @@ fn init(row: u16) void {
   while (e < NR * DV) : (e += 1) { st[e] = 0.0; }
 }
 
-fn step() void {
+// Slot s's state cleared.
+fn clear(s: u16) void {
+  @fmovs(@set_dsd_length(@increment_dsd_offset(st_d, @as(i16, s * NR * DV), f32), NR * DV), @as(f32, 0.0));
+}
+
+// Row t of a step: its slot's state, cleared at its position 0, stepped.
+fn row(t: u16) void {
+  const s = @as(u16, rowp[3 * t + 1]);
+  if (rowp[3 * t + 2] == 0) { clear(s); }
+  step_at(s * NR * DV);
+}
+
+fn step() void { step_at(0); }
+
+fn step_at(base: u16) void {
   @fmovs(kq_d, fab.fin(YM, 3 * DK));
   @fmovs(acc_d, @as(f32, 0.0));
   const sk = @set_dsd_length(acc_d, DV);
@@ -45,9 +65,9 @@ fn step() void {
   while (r < NR) : (r += 1) {
     const i = r * PYA + myrow;
     if (i < DK) {
-      const row = @increment_dsd_offset(st_d, @as(i16, r * DV), f32);
-      @fmacs(sk, sk, row, kq[i]);
-      @fmacs(sq, sq, row, kq[DK + i]);
+      const srw = @increment_dsd_offset(st_d, @as(i16, base + r * DV), f32);
+      @fmacs(sk, sk, srw, kq[i]);
+      @fmacs(sq, sq, srw, kq[DK + i]);
     }
   }
   red.send(acc_d, 2 * DV);
@@ -57,9 +77,9 @@ fn step() void {
   while (r < NR) : (r += 1) {
     const i = r * PYA + myrow;
     if (i < DK) {
-      const row = @increment_dsd_offset(st_d, @as(i16, r * DV), f32);
-      @fmuls(row, row, dd[DV + i]);
-      @fmacs(row, row, delta, kq[2 * DK + i]);
+      const srw = @increment_dsd_offset(st_d, @as(i16, base + r * DV), f32);
+      @fmuls(srw, srw, dd[DV + i]);
+      @fmacs(srw, srw, delta, kq[2 * DK + i]);
     }
   }
 }

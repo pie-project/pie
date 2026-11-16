@@ -514,13 +514,9 @@ pub fn emit(p: &Program) -> R<Emitted> {
                     (st.dt.0, h, 1),
                 ]),
             });
-            arrays.push(HostArray {
-                at: root,
-                sym: "pos".into(),
-                u16: false,
-                len: 1,
-                fill: Fill::Words(vec![0]),
-            });
+            if let Some(n) = rows_of(p) {
+                arrays.push(rowp_array(root, n));
+            }
         }
         let (pname, ptext) = match state {
             Some(_) => st_pe_file(p, k, ks)?,
@@ -532,16 +528,11 @@ pub fn emit(p: &Program) -> R<Emitted> {
             let (params, role) = kv_pe_params(p, c);
             tiles.insert(c, (pname.clone(), params));
             arrays.extend(cfg_array(c, &[i, role]));
-            match (state, paging(p)) {
-                (None, Some(g)) => {
-                    // a step's rows' (lane slot, position), the lane slots' pages
-                    arrays.push(HostArray {
-                        at: c,
-                        sym: "rowp".into(),
-                        u16: false,
-                        len: 2 * g.lanes,
-                        fill: Fill::Words(vec![0; 2 * g.lanes as usize]),
-                    });
+            if let Some(n) = rows_of(p) {
+                // a decode step's rows' (lane slot, state slot, position)
+                arrays.push(rowp_array(c, n));
+                if let (None, Some(g)) = (state, paging(p)) {
+                    // the lane slots' pages
                     arrays.push(HostArray {
                         at: c,
                         sym: "ptab".into(),
@@ -550,17 +541,6 @@ pub fn emit(p: &Program) -> R<Emitted> {
                         fill: Fill::Words(vec![0; (g.lanes * g.pages) as usize]),
                     });
                 }
-                _ if p.shape.cache.is_some() || state.is_some() => {
-                    // a decode step's first position, the host's a step (0 at the load)
-                    arrays.push(HostArray {
-                        at: c,
-                        sym: "pos".into(),
-                        u16: false,
-                        len: 1,
-                        fill: Fill::Words(vec![0]),
-                    });
-                }
-                _ => {}
             }
         }
     }
@@ -2416,6 +2396,23 @@ fn kv_root_file(p: &Program, k: usize, ks: &place::KvSched) -> R<(String, String
     Ok((name, t))
 }
 
+/// A decode program's rows a step (its lanes): none in a stream reading's.
+fn rows_of(p: &Program) -> Option<u32> {
+    p.shape.cache?;
+    Some(p.class_rows.iter().map(|c| c.0).sum::<u32>().max(1))
+}
+
+/// The array of a decode step's `n` rows' (lane slot, state slot, position) at `c`.
+fn rowp_array(c: Coord, n: u32) -> HostArray {
+    HostArray {
+        at: c,
+        sym: "rowp".into(),
+        u16: false,
+        len: 3 * n,
+        fill: Fill::Words(vec![0; 3 * n as usize]),
+    }
+}
+
 /// A decode program's paging (GENERIC.md G1.8): its K / V columns' slots in pages of `size`
 /// positions (a multiple of every column's rows, at least [`PAGE_MIN`]), `pages` of them a
 /// column (the cache's positions, and a scratch page last: an idle row's), `lanes` lane slots (a
@@ -2552,6 +2549,7 @@ fn st_root_file(p: &Program, k: usize, ks: &place::KvSched) -> R<(String, String
     let j = kv_joint(p, ks);
     let st = j.state.ok_or("a state column of no recurrence")?;
     let d = j.head_dim;
+    let n_rows = rows_of(p).unwrap_or(1);
     let name = format!("sr_{k}.csl");
     let mut t = String::new();
     let _ = writeln!(
@@ -2580,25 +2578,40 @@ fn st_root_file(p: &Program, k: usize, ks: &place::KvSched) -> R<(String, String
     );
     let _ = writeln!(
         t,
-        "const cy = @import_module(\"ops/cy_sst.csl\", .{{ .fab = fab, .math = math, .YO = q_am, .IN = q_ar, .DK = {d}, .DV = {d}, .CONV = {} }});",
+        "const cy = @import_module(\"ops/cy_sst.csl\", .{{ .fab = fab, .math = math, .YO = q_am, .IN = q_ar, .DK = {d}, .DV = {d}, .CONV = {}, .SLOTS = {n_rows}, .ROWS = {n_rows} }});",
         st.taps
     );
     let sw = 3 * d + 2;
     t.push_str(&buf("sx", sw));
     t.push_str(&buf("ob", d));
-    t.push_str(
-        "var stw_p: [*]f32 = &cy.cw;\nvar pos = @zeros([1]u32);\nvar pos_p: [*]u32 = &pos;\n",
-    );
-    let mut body = String::from("  stamp(0);\n  if (pos[0] == 0) { cy.init(); }\n");
+    // a decode step's rows each a lane's (its state slot's history; `rowp`, the host's)
+    t.push_str("var stw_p: [*]f32 = &cy.cw;\nvar rowp_p: [*]u32 = &cy.rowp;\n");
+    let decode = rows_of(p).is_some();
+    let mut body = String::from(if decode {
+        "  stamp(0);\n"
+    } else {
+        // (a stream step's rows one sequence's, from a cleared history)
+        "  stamp(0);\n  cy.init();\n"
+    });
+    let mut at = 0;
     for &(u, rows, _) in &ks.stores {
+        let step = if decode {
+            format!("cy.row({at} + t, &sx, &ob);")
+        } else {
+            "cy.step(&sx, &ob);".to_string()
+        };
         let _ = writeln!(
             body,
-            "  {{ var t: u16 = 0; while (t < {rows}) : (t += 1) {{ @fmovs(D_sx, fab.fin(q_i{u}, {sw})); cy.step(&sx, &ob); @fmovs(fab.fout(q_o{u}, {d}), D_ob); }} }}"
+            "  {{ var t: u16 = 0; while (t < {rows}) : (t += 1) {{ @fmovs(D_sx, fab.fin(q_i{u}, {sw})); {step} @fmovs(fab.fout(q_o{u}, {d}), D_ob); }} }}"
         );
+        at += rows;
     }
     body.push_str("  stamp(1);\n  sys_mod.unblock_cmd_stream();\n");
     let _ = write!(t, "task go() void {{\n{body}}}\n");
-    t.push_str("comptime {\n  @bind_local_task(go, T_GO);\n  @export_symbol(run);\n  @export_symbol(tsc_p, \"tsc\");\n  @export_symbol(stw_p, \"stw\");\n  @export_symbol(pos_p, \"pos\");\n");
+    t.push_str("comptime {\n  @bind_local_task(go, T_GO);\n  @export_symbol(run);\n  @export_symbol(tsc_p, \"tsc\");\n  @export_symbol(stw_p, \"stw\");\n");
+    if decode {
+        t.push_str("  @export_symbol(rowp_p, \"rowp\");\n");
+    }
     for u in 0..n {
         let _ = writeln!(
             t,
@@ -2628,14 +2641,25 @@ fn st_pe_file(p: &Program, k: usize, ks: &place::KvSched) -> R<(String, String)>
     t.push_str("const red = @import_module(\"ops/schain.csl\", .{ .fab = fab, .IN1 = q_r, .OUT = q_s });\n");
     let _ = writeln!(
         t,
-        "const st = @import_module(\"ops/sst.csl\", .{{ .fab = fab, .red = red, .YM = q_am, .DK = {d}, .DV = {d}, .PYA = {pya} }});"
+        "const st = @import_module(\"ops/sst.csl\", .{{ .fab = fab, .red = red, .YM = q_am, .DK = {d}, .DV = {d}, .PYA = {pya}, .SLOTS = {rows}, .ROWS = {rows} }});"
     );
-    t.push_str("var pos = @zeros([1]u32);\nvar pos_p: [*]u32 = &pos;\n");
+    // a decode step's rows each a lane's (its state slot; `rowp`, the host's)
+    t.push_str("var rowp_p: [*]u32 = &st.rowp;\n");
+    // (a stream step's rows one sequence's, from a cleared state)
+    let (init, step) = if rows_of(p).is_some() {
+        ("st.myrow = @as(u16, pcfg[0]);", "st.row(t);")
+    } else {
+        ("st.init(@as(u16, pcfg[0]));", "st.step();")
+    };
     let body = format!(
-        "  stamp(0);\n  if (pos[0] == 0) {{ st.init(@as(u16, pcfg[0])); }} else {{ st.myrow = @as(u16, pcfg[0]); }}\n  red.role = @as(u16, pcfg[1]);\n  {{ var t: u16 = 0; while (t < {rows}) : (t += 1) {{ st.step(); }} }}\n  stamp(1);\n  sys_mod.unblock_cmd_stream();\n"
+        "  stamp(0);\n  {init}\n  red.role = @as(u16, pcfg[1]);\n  {{ var t: u16 = 0; while (t < {rows}) : (t += 1) {{ {step} }} }}\n  stamp(1);\n  sys_mod.unblock_cmd_stream();\n"
     );
     let _ = write!(t, "task go() void {{\n{body}}}\n");
-    t.push_str("comptime {\n  @bind_local_task(go, T_GO);\n  @export_symbol(run);\n  @export_symbol(tsc_p, \"tsc\");\n  @export_symbol(pcfg_p, \"pcfg\");\n  @export_symbol(pos_p, \"pos\");\n  @initialize_queue(q_am, .{ .color = @get_color(C_AM) });\n  @initialize_queue(q_r, .{ .color = @get_color(C_R) });\n  @initialize_queue(q_s, .{ .color = @get_color(C_S) });\n}\n");
+    t.push_str("comptime {\n  @bind_local_task(go, T_GO);\n  @export_symbol(run);\n  @export_symbol(tsc_p, \"tsc\");\n  @export_symbol(pcfg_p, \"pcfg\");\n  @initialize_queue(q_am, .{ .color = @get_color(C_AM) });\n  @initialize_queue(q_r, .{ .color = @get_color(C_R) });\n  @initialize_queue(q_s, .{ .color = @get_color(C_S) });\n");
+    if rows_of(p).is_some() {
+        t.push_str("  @export_symbol(rowp_p, \"rowp\");\n");
+    }
+    t.push_str("}\n");
     Ok((name, t))
 }
 

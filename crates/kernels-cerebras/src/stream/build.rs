@@ -881,9 +881,13 @@ pub fn program_at(
     let pya = kv
         .iter()
         .map(|k| {
-            // a recurrence's column: its state's rows over the fewest PEs
+            // a recurrence's column: its state's rows over the fewest PEs (a decode step's a
+            // state a lane slot, a row a lane)
             if joint_of(k).is_some_and(|j| j.state.is_some()) {
-                return PYA;
+                let lanes = shape
+                    .cache
+                    .map_or(1, |_| class_rows.iter().map(|c| c.0).sum::<u32>());
+                return PYA * lanes.max(1);
             }
             let (qh, hd) = joint_of(k).map_or(
                 (
