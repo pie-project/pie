@@ -58,7 +58,8 @@ use serde_json::{Value, json};
 const USAGE: &str = "usage: wafer-bench --program <dir> --weights <dir>[:<prefix>] --golden \
                      <golden.json> [--steps N] [--tokens N] [--cmaddr <addr>] [--logits <out.json>] \
                      [--times <out.json>] [--forced N]\n       wafer-bench --reading <dir> --program <dir> \
-                     --inputs <dir> [--grid T,H,W] [--steps N] [--golden <dir>] [--save <dir>] [--reload 1] [--cmaddr <addr>]";
+                     --inputs <dir> [--grid T,H,W] [--steps N] [--golden <dir>] [--save <dir>] [--reload 1] [--cmaddr <addr>] [--statics <dir>] [--stamps <dir>] \
+                     [--rows 1 [--save-rows <dir>]]";
 
 fn main() {
     match run() {
@@ -433,6 +434,52 @@ fn decode(get: &HashMap<String, String>) -> Result<bool, String> {
     Ok(held == checked)
 }
 
+/// `--statics <dir>`: the static arrays made elsewhere (from a checkpoint), the `k`-th array's
+/// words in `<k>.u32`.
+fn statics_of(
+    reading: &engine_cerebras::reading::Reading,
+    dir: &str,
+) -> Result<Vec<Option<Vec<u32>>>, String> {
+    (0..reading.h2d.len())
+        .map(|k| {
+            let p = Path::new(dir).join(format!("{k}.u32"));
+            p.is_file().then(|| {
+                std::fs::read(&p).map(|b| {
+                    b.as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|c| u32::from_le_bytes(*c))
+                        .collect()
+                })
+            })
+        })
+        .map(Option::transpose)
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("{dir}: {e}"))
+}
+
+/// `--stamps <dir>`: step `i`'s stamps, every PE's three words, row major over the program's
+/// fabric, in files of at most 3 MB (`tsc<i>_<row>.tsc`: from fabric row `row` on).
+fn save_tsc(
+    rt: &mut Runtime,
+    reading: &engine_cerebras::reading::Reading,
+    dir: &str,
+    i: usize,
+) -> Result<(), String> {
+    let Some(ts) = rt.tsc(reading)? else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(dir).map_err(|e| format!("{dir}: {e}"))?;
+    let row = 3 * reading.w as usize;
+    let rows = ((3 << 20) / (4 * row)).max(1);
+    for (k, part) in ts.chunks(rows * row).enumerate() {
+        let p = Path::new(dir).join(format!("tsc{i}_{}.tsc", k * rows));
+        let b: Vec<u8> = part.iter().flat_map(|x| x.to_le_bytes()).collect();
+        std::fs::write(&p, b).map_err(|e| format!("{}: {e}", p.display()))?;
+    }
+    Ok(())
+}
+
 /// `--reading`: a stream reading's steps on the program, the host's ops the engine's.
 fn reading(get: &HashMap<String, String>) -> Result<bool, String> {
     use engine_cerebras::reading::{Denoise, Reading};
@@ -523,13 +570,34 @@ fn reading(get: &HashMap<String, String>) -> Result<bool, String> {
             .map_err(|e| e.to_string())?;
         rt.load();
         rt.run();
-        let (got, cycles) = reading.fire(&mut rt, &entries)?;
+        let (got, cycles) = match get.get("statics") {
+            Some(dir) => {
+                reading.write_statics(&mut rt, &statics_of(&reading, dir)?)?;
+                reading.launch(&mut rt, &entries)?
+            }
+            None => reading.fire(&mut rt, &entries)?,
+        };
+        if let Some(dir) = get.get("stamps") {
+            save_tsc(&mut rt, &reading, dir, 0)?;
+        }
         rt.stop();
         let mut ok = true;
         for c in reading.rows_back(&got)? {
             let engine_cpu::forward::Values::F32(v) = &c.values else {
                 continue;
             };
+            if let Some(dir) = get.get("save-rows") {
+                // the value's rows as read back (`<value>.f32`, rows x width)
+                std::fs::create_dir_all(dir).map_err(|e| format!("{dir}: {e}"))?;
+                let p = Path::new(dir).join(format!("{}.f32", c.value.0));
+                let b: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+                std::fs::write(&p, b).map_err(|e| format!("{}: {e}", p.display()))?;
+                println!(
+                    "READING_SAVED {}",
+                    json!({"value": c.value.0, "rows": c.rows, "width": c.width,
+                        "cycles": cycles, "finite": v.iter().all(|x| x.is_finite())})
+                );
+            }
             let Some((_, file)) = reading.refs.iter().find(|(r, _)| *r == c.value.0) else {
                 continue;
             };
@@ -584,25 +652,7 @@ fn reading(get: &HashMap<String, String>) -> Result<bool, String> {
         println!("PROGRESS running {:.1} s", t0.elapsed().as_secs_f64());
         match get.get("statics") {
             // the static arrays made elsewhere (from a checkpoint): the k-th array's words
-            Some(dir) => {
-                let words: Vec<Option<Vec<u32>>> = (0..reading.h2d.len())
-                    .map(|k| {
-                        let p = Path::new(dir).join(format!("{k}.u32"));
-                        p.is_file().then(|| {
-                            std::fs::read(&p).map(|b| {
-                                b.as_chunks::<4>()
-                                    .0
-                                    .iter()
-                                    .map(|c| u32::from_le_bytes(*c))
-                                    .collect()
-                            })
-                        })
-                    })
-                    .map(Option::transpose)
-                    .collect::<Result<_, _>>()
-                    .map_err(|e| format!("{dir}: {e}"))?;
-                reading.write_statics(&mut rt, &words)?;
-            }
+            Some(dir) => reading.write_statics(&mut rt, &statics_of(&reading, dir)?)?,
             None => reading.write_static(&mut rt)?,
         }
         println!(
@@ -630,6 +680,9 @@ fn reading(get: &HashMap<String, String>) -> Result<bool, String> {
         };
         let wall_ms = t0.elapsed().as_secs_f64() * 1e3;
         println!("PROGRESS step {i}: back, {cycles:?} cycles, {wall_ms:.3} ms");
+        if let (Some(dir), Some(rt)) = (get.get("stamps"), kept.as_mut()) {
+            save_tsc(rt, &reading, dir, i)?;
+        }
         // the step's host side by kind: the entries in, the launch (the call's wall), the rows
         // and the stamps back
         let io = kept.as_ref().zip(io0).map(|(r, a)| {

@@ -956,7 +956,9 @@ impl Reading {
 impl Runtime {
     /// The launch's cycles off its PEs' stamps (`tsc`: start, end, passes a PE) over the
     /// reading's rectangle, where the program stamps them.
-    fn stamps(&mut self, reading: &Reading) -> R<Option<u64>> {
+    /// Every PE's three stamp words (`tsc`, row major over the program's `w x h`), where the
+    /// program stamps.
+    pub fn tsc(&mut self, reading: &Reading) -> R<Option<Vec<u32>>> {
         if !self.rpc().symbols().contains_key("tsc") {
             return Ok(None);
         }
@@ -970,6 +972,13 @@ impl Runtime {
         };
         self.memcpy_d2h("tsc", &mut ts, rect, 3, Order::RowMajor, DataType::Bits32)
             .map_err(|x| x.to_string())?;
+        Ok(Some(ts))
+    }
+
+    fn stamps(&mut self, reading: &Reading) -> R<Option<u64>> {
+        let Some(ts) = self.tsc(reading)? else {
+            return Ok(None);
+        };
         let live = ts.chunks(3).filter(|s| s[0] != 0 || s[1] != 0);
         let (lo, hi) = live.fold((u64::MAX, 0u64), |(lo, hi), s| {
             (lo.min(u64::from(s[0])), hi.max(u64::from(s[1])))

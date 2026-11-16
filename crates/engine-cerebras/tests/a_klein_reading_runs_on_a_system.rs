@@ -7,7 +7,8 @@
 //! (`statics/<k>.u32`, the `k`-th array's words: `wafer-bench --statics`), a step's guest inputs
 //! (`inputs/<name>.f32`, drawn) and, unless `READING_GOLDEN=0`, engine-cpu's loop over the same
 //! inputs at the program's rows (`cpu_velocity<i>.f32`, `cpu_latent<n>.f32`, `READING_STEPS`
-//! steps, default 2), the host's ops the engine's.
+//! steps, default 2), the host's ops the engine's; with `READING_ROWS=1`, the values the program
+//! returns at that step (`rows/<value>.f32`, as `wafer-bench --rows 1 --save-rows` saves them).
 
 mod common;
 
@@ -146,6 +147,23 @@ fn klein_reading_files() {
         format!("{},{},{}\n", grid[0], grid[1], grid[2]),
     )
     .expect("grid.txt");
+    if std::env::var("READING_ROWS").is_ok_and(|r| r == "1") {
+        // the values the program returns, engine-cpu's, at the inputs' own step
+        // (`rows/<value>.f32`, rows x width: `wafer-bench --rows 1 --save-rows`'s files)
+        let t0 = std::time::Instant::now();
+        let step = reading.step(&trace, Some(grid), &inputs);
+        let rows = out.join("rows");
+        std::fs::create_dir_all(&rows).expect("rows/");
+        for c in weights
+            .stream_values(&step, &[], &reading.out_values())
+            .expect("the step's values")
+        {
+            if let engine_cpu::forward::Values::F32(v) = &c.values {
+                std::fs::write(rows.join(format!("{}.f32", c.value.0)), bytes(v)).expect("a row");
+            }
+        }
+        eprintln!("rows ({:.0} s)", t0.elapsed().as_secs_f64());
+    }
     if !golden {
         return;
     }
