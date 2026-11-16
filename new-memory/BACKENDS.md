@@ -126,12 +126,14 @@ re-encoded each fire. wgpu (no recording): 122.6 / 125.0 / 120.3, no gap. l36 Vu
 55.4. Next if it matters: stage through a per-fire binding a recording can replay (a ring of stages indexed by an
 input), so misses keep recording.
 
-ROCm flat range and pool size (MI300X, Qwen3-8B, f6fff8362): a larger flat range costs ~1-2 % a round at 73k
-against 63k kv pages (64 lanes: 199-202 against 184-190 ms for a one-token round, 823-840 against 803-824 ms for a
-65-token round), outside the host phases: boundary-trace's per-fire phases (windows_of, prepare_tail, stage, walk,
-launch, epilogue) and the device waits are the same at both sizes, so no per-fire walk or upload is sized by the
-pool. Suspected address translation over the larger single allocation; unconfirmed (rocprofv3 hangs pie, and no
-kernel-only timing was taken).
+ROCm flat range and pool size (MI300X, Qwen3-8B): the ~1-2 % a round at 73k against 63k kv pages, and a first
+round of 64 short prompts at 2.5x main's (125 against 49 ms), were one host cost: the per-bind walk over the whole
+range (`Range::hold`), fixed by 51e12420c. Every
+bind held a span through `Range::hold`, which collected and sorted the units of the range's whole want (its
+committed segments and every span held), so 64 lanes' binds cost 1.15 ms each on a 73k-page flat range.
+A hold now commits the span's units alone: the first round is 51 ms (main 49), a decode step 8.56 ms
+(main 8.76) at 21 % more pages. Found with `perf` (DWARF call graphs) on the engine thread; the fire's device
+time (synchronized around the body replay) was the same as main's throughout.
 
 Pre-existing parity gaps (not memory, but in scope for parity): ROCm synth codegen, ROCm graph replay with >= 2 MoE layers (AMD d); (concat_cols, FP8 m33 fixed M43);
 sm_100 tcgen05 W4A16 arms read no expert table; Metal MLA prefill unsupported. Metal MPP prompt attention has never served:
