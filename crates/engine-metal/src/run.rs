@@ -144,6 +144,24 @@ pub struct FireBindings {
     /// Each band's snapshot table (`crate::store::Pools::bands`), when a lane
     /// of the fire snapshots.
     pub rs_snap_bands: Vec<Tensor>,
+    /// Where the fire's capturing lanes add their scores, when a lane of it
+    /// captures.
+    pub capture: Option<CaptureSeat>,
+}
+
+/// A fire's capturing lanes' rows, as its score kernels read them: the
+/// span's buffer they lie in (bound from its start, f32), and each fire
+/// lane's key row and page row start in it (u64 elements; `u64::MAX` for a
+/// lane that captures nothing). A row is `keys` keys, or `pages` pages of
+/// `page_size`.
+#[derive(Clone, Copy, Debug)]
+pub struct CaptureSeat {
+    pub store: Tensor,
+    pub keys_at: Tensor,
+    pub pages_at: Tensor,
+    pub keys: u32,
+    pub pages: u32,
+    pub page_size: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
