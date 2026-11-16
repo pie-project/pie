@@ -58,6 +58,9 @@ use enqueue::{GuestBatch, Owed, Reap, reap_guest_fires};
 use segments::Segmented;
 
 pub struct Shell {
+    /// The rungs the load weighed its top by, and the estimate it weighed
+    /// them with; `None` where the profile states no rates.
+    weighed: Option<crate::top::Weighed>,
     device: Context,
     accounting: crate::store::Accounting,
     trace: Trace,

@@ -75,6 +75,27 @@ pub fn rung_facts(candidates: &[Candidate], max_lanes: u32, live: u64) -> Vec<Ru
         .collect()
 }
 
+/// The rungs a load weighed its top by, and the estimate it weighed them
+/// with, over its live range: what a check of the estimate reads
+/// (`pie tune --check-estimate`).
+#[derive(Debug, Clone)]
+pub struct Weighed {
+    pub rungs: Vec<RungFacts>,
+    pub estimate: engine::load::FireEstimate,
+    pub live: u64,
+}
+
+/// The widest feasible rung of `rungs`: the top a load that keeps every
+/// rung lays (`Knobs::every_rung`), so each can be timed.
+#[must_use]
+pub fn widest(rungs: &[RungFacts]) -> Option<u32> {
+    rungs
+        .iter()
+        .filter(|r| r.infeasible.is_none())
+        .map(|r| r.tokens)
+        .max()
+}
+
 /// The top rung of `rungs` on `device`, whose profile states `rates`, over
 /// a live range of `live` bytes ([`engine::load::choose`]).
 pub fn choose(

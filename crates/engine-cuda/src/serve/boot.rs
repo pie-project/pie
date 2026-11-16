@@ -88,6 +88,10 @@ pub struct Knobs {
     /// none, CUDA's default): an expert-parallel group whose ranks share a
     /// device wires only when its ranks' streams fit them.
     pub work_queues: Option<u32>,
+    /// Lay every rung the card holds rather than the ruling's top, keeping
+    /// the rungs and the estimate weighed ([`crate::Shell::weighed`]): what
+    /// `pie tune --check-estimate` times each rung of.
+    pub every_rung: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

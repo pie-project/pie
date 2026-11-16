@@ -329,6 +329,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // spanning its fire's working set and
     // needing one sequence and the bodies' floor beside it, over the room
     // the card has after the weight tier.
+    let weighed;
     let tokens = {
         let paging = Paging::of(boot.page_size, boot.context, boot.slots, 1)?;
         let mut candidates = Vec::new();
@@ -356,7 +357,17 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
                 chip.tuned()
             )
         );
-        top.tokens
+        weighed =
+            engine::load::estimate(&counts, &chip.rates()).map(|estimate| crate::top::Weighed {
+                rungs: rungs.clone(),
+                estimate,
+                live: after_weights,
+            });
+        if boot.knobs.every_rung {
+            crate::top::widest(&rungs).unwrap_or(top.tokens)
+        } else {
+            top.tokens
+        }
     };
     // The derived voxel rung's room is still the configured share of the
     // card past the weights (`engine.working_set_percent`).
@@ -488,6 +499,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         asked,
         stated_buckets: !stated_buckets.is_empty(),
         ceiling,
+        weighed,
     })
 }
 
@@ -805,6 +817,7 @@ impl Shell {
             asked,
             stated_buckets,
             ceiling,
+            weighed,
         } = bake(&mut boot)?;
         // What shapes this deployment's bodies, beside the engine build
         // the record's key carries ([`super::measured`]).
@@ -1323,6 +1336,7 @@ impl Shell {
             .then(|| crate::tap::row_layers(&boot.trace).and_then(|rows| pools.tap_groups(&rows)))
             .flatten();
         let mut shell = Shell {
+            weighed,
             device,
             accounting,
             trace: boot.trace,
@@ -2372,6 +2386,8 @@ pub(super) struct Baked {
     /// What the card may hold in all under the load's allowance, resolved
     /// before the load took anything (`elastic::ceiling_of`).
     pub(super) ceiling: u64,
+    /// The rungs the top was weighed of, and the estimate that weighed them.
+    pub(super) weighed: Option<crate::top::Weighed>,
 }
 
 /// The widest fire whose lanes of `rows` prompt rows put no more (lane,
