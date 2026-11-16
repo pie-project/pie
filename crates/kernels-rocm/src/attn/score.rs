@@ -15,6 +15,41 @@ const BLOCK: u32 = WAVES * 64;
 
 const STAMPS: [u32; 4] = [64, 128, 256, 512];
 
+/// A fire's capturing lanes as a window of it reads them: `lanes` (i32,
+/// one a capturing row, in lane order) names the fire lane each capturing
+/// row is, and the window's requests are the fire's lanes from
+/// `lane_offset`, `requests` of them (a capture counts them off its query
+/// boundaries). A capturing row whose lane lies outside the window is left
+/// as it is.
+#[derive(Clone, Copy, Debug)]
+pub struct CaptureRows {
+    pub lanes: Tensor,
+    pub lane_offset: u32,
+    pub requests: u32,
+}
+
+impl CaptureRows {
+    fn check(&self, op: &'static str, rows: &Tensor, what: &str) -> Result<(), Error> {
+        if self.lanes.dtype != Dtype::I32 || self.lanes.rows != rows.rows {
+            return Err(refuse(
+                op,
+                format!(
+                    "the capturing lanes' table is {} {:?} entries, and the {what} hold {} \
+                     capturing rows",
+                    self.lanes.rows, self.lanes.dtype, rows.rows
+                ),
+            ));
+        }
+        if rows.dtype != Dtype::F32 {
+            return Err(refuse(
+                op,
+                format!("the {what} are {:?}, and a mass is an f32 row", rows.dtype),
+            ));
+        }
+        Ok(())
+    }
+}
+
 fn row_heads(op: &'static str, what: &str, width: u32, head_dim: u32) -> Result<u32, Error> {
     if width == 0 || !width.is_multiple_of(head_dim) {
         return Err(refuse(
@@ -29,6 +64,11 @@ fn stamp_for(head_dim: u32) -> Option<u32> {
     STAMPS.into_iter().find(|stamp| head_dim <= *stamp)
 }
 
+/// Adds to each capturing lane's row of `scores` (`[capturing, context]`)
+/// the attention mass its query heads put on each key of its pages over its
+/// last `observe` query rows, averaged over the rows observed and over the
+/// model's `q_heads` query heads (each head this rank attends adds a
+/// `1 / q_heads` share). With `accumulate` false the rows are zeroed first.
 #[allow(clippy::too_many_arguments)]
 pub fn capture(
     ctx: &Ctx,
@@ -37,10 +77,11 @@ pub fn capture(
     pool: &KvPool,
     head_dim: u32,
     kv_heads: u32,
+    q_heads: u32,
     sm_scale: f32,
     observe: u32,
-    lane_offset: u32,
-    kv_max: u32,
+    rows: CaptureRows,
+    accumulate: bool,
     scores: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "attn.score_capture";
@@ -57,15 +98,7 @@ pub fn capture(
             ),
         ));
     }
-    if scores.dtype != Dtype::F32 {
-        return Err(refuse(
-            OP,
-            format!(
-                "the score rows are {:?}, and a per-key mass is an f32 rectangle",
-                scores.dtype
-            ),
-        ));
-    }
+    rows.check(OP, scores, "score rows")?;
     let head_dim = count(OP, "the head width this capture states", head_dim)?;
     let head_width = head_dim.unsigned_abs();
     let Some(stamp) = stamp_for(head_width) else {
@@ -86,6 +119,12 @@ pub fn capture(
             format!("{num_q_heads} query heads do not group over {num_kv_heads} kv heads"),
         ));
     }
+    if q_heads < num_q_heads {
+        return Err(refuse(
+            OP,
+            format!("the model states {q_heads} query heads, and this rank attends {num_q_heads}"),
+        ));
+    }
     if observe == 0 {
         return Err(refuse(
             OP,
@@ -93,25 +132,17 @@ pub fn capture(
              nothing; the caller states the width it wants, and zero is not one",
         ));
     }
-    let kv_ceiling = count(OP, "the slab's per-row kv ceiling", kv_max)?;
+    let context = count(OP, "the context a score row spans", scores.width)?;
     let page_size = count(OP, "the pool's page size", pool.page_size.unsigned_abs())?;
 
     let requests = kv::lanes_of(OP, q.indptr)?.unsigned_abs();
     debug_assert_eq!(
         num_q_heads, plan.shape.num_q_heads,
-        "`{OP}` captures one row per query head of the plan it was carved with"
+        "`{OP}` captures over the query heads of the plan it was carved with"
     );
-    if scores.width != num_q_heads.saturating_mul(kv_max)
-        || scores.rows < lane_offset.saturating_add(requests)
-    {
-        return Err(refuse(
-            OP,
-            format!(
-                "the score rows are {} by {}, and {requests} lanes from lane {lane_offset} \
-                 capture {num_q_heads} heads of {kv_max} keys",
-                scores.rows, scores.width
-            ),
-        ));
+    let capturing = scores.rows;
+    if capturing == 0 {
+        return Ok(());
     }
 
     let floats = head_width.saturating_add(2 * WAVES);
@@ -131,14 +162,30 @@ pub fn capture(
     } else {
         "::pie::true_type::value"
     };
+    let lane_offset = stated(OP, rows.lane_offset)?;
+    let requests = stated(OP, requests)?;
 
+    if !accumulate {
+        ctx.fire(
+            OP,
+            Fire::at(kernel(FILE, "::pie::attn::score_zero"))
+                .apply(Launch::grid([capturing, 1, 1], [BLOCK, 1, 1])),
+            &[
+                scores.arg(),
+                rows.lanes.arg(),
+                lane_offset.arg(),
+                requests.arg(),
+                context.arg(),
+            ],
+        )?;
+    }
     ctx.fire(
         OP,
         Fire::at(kernel(
             FILE,
             &format!("::pie::attn::score_capture<{stamp}, {WAVES}, {hnd}>"),
         ))
-        .apply(Launch::grid([requests, num_q_heads, 1], [BLOCK, 1, 1]).smem(smem)),
+        .apply(Launch::grid([capturing, num_q_heads, 1], [BLOCK, 1, 1]).smem(smem)),
         &[
             q.data.arg(),
             q.indptr.arg(),
@@ -147,15 +194,63 @@ pub fn capture(
             pool.page_indptr.arg(),
             pool.last_page_lens.arg(),
             scores.arg(),
+            rows.lanes.arg(),
+            lane_offset.arg(),
+            requests.arg(),
             page_size.arg(),
+            kv::page_elems(OP, pool, 0)?.arg(),
             stated(OP, num_q_heads)?.arg(),
             stated(OP, num_kv_heads)?.arg(),
             head_dim.arg(),
             sm_scale.arg(),
+            (1.0 / q_heads as f32).arg(),
             stated(OP, observe)?.arg(),
-            stated(OP, lane_offset)?.arg(),
-            kv_ceiling.arg(),
-            kv::page_elems(OP, pool, 0)?.arg(),
+            context.arg(),
+        ],
+    )
+}
+
+/// Each capturing lane's key row of `keys` (`[capturing, context]`) summed
+/// a kv page of `page_size` keys, into its row of `pages` (`[capturing,
+/// context pages]`).
+pub fn pages(
+    ctx: &Ctx,
+    keys: Tensor,
+    rows: CaptureRows,
+    page_size: u32,
+    pages: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "attn.score_pages";
+    rows.check(OP, &keys, "key rows")?;
+    rows.check(OP, pages, "page rows")?;
+    let page_size = count(OP, "the pool's page size", page_size)?;
+    let context = count(OP, "the context a score row spans", keys.width)?;
+    let want = keys.width.div_ceil(page_size.unsigned_abs());
+    if pages.width != want {
+        return Err(refuse(
+            OP,
+            format!(
+                "the page rows are {} wide, and {} keys in pages of {page_size} are {want}",
+                pages.width, keys.width
+            ),
+        ));
+    }
+    if keys.rows == 0 {
+        return Ok(());
+    }
+    ctx.fire(
+        OP,
+        Fire::at(kernel(FILE, "::pie::attn::score_pages"))
+            .apply(Launch::grid([keys.rows, 1, 1], [BLOCK, 1, 1])),
+        &[
+            keys.arg(),
+            pages.arg(),
+            rows.lanes.arg(),
+            stated(OP, rows.lane_offset)?.arg(),
+            stated(OP, rows.requests)?.arg(),
+            context.arg(),
+            page_size.arg(),
+            stated(OP, pages.width)?.arg(),
         ],
     )
 }

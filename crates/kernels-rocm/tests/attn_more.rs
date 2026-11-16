@@ -685,60 +685,46 @@ fn score_capture_averages_the_observed_rows_mass() {
         },
     )
     .unwrap();
-    let (observe, lane_offset, kv_max) = (3u32, 1u32, 40u32);
-    let rows = lane_offset + n;
+    // Lanes 0 and 2 capture, rows 0 and 1; lane 1 does not. A first layer
+    // zeroes the rows, a second adds into them.
+    let capturing = [0usize, 2];
+    let (observe, context) = (3u32, 40u32);
+    let rows_of = kernels_rocm::attn::score::CaptureRows {
+        lanes: gpu.column(&capturing.iter().map(|&r| r as i32).collect::<Vec<_>>()),
+        lane_offset: 0,
+        requests: n,
+    };
     let mut scores = gpu.tensor(
-        &vec![9.0; (rows * hq * kv_max) as usize],
-        rows,
-        hq * kv_max,
+        &vec![9.0; capturing.len() * context as usize],
+        capturing.len() as u32,
+        context,
         Dtype::F32,
     );
     let scale = 1.0 / (d as f32).sqrt();
-    kernels_rocm::attn::score::capture(
-        &ctx,
-        q,
-        &built,
-        &pool,
-        d,
-        hk,
-        scale,
-        observe,
-        lane_offset,
-        kv_max,
-        &mut scores,
-    )
-    .unwrap();
+    for accumulate in [false, true] {
+        kernels_rocm::attn::score::capture(
+            &ctx,
+            q,
+            &built,
+            &pool,
+            d,
+            hk,
+            hq,
+            scale,
+            observe,
+            rows_of,
+            accumulate,
+            &mut scores,
+        )
+        .unwrap();
+    }
     let got = gpu.read(&scores);
-    agrees(
-        &gpu,
-        "score capture",
-        &[pool],
-        &[],
-        &[out(&scores)],
-        |_, pools, _| {
-            let mut scores = scores;
-            kernels_rocm::attn::score::capture(
-                &ctx,
-                q,
-                &built,
-                &pools[0],
-                d,
-                hk,
-                scale,
-                observe,
-                lane_offset,
-                kv_max,
-                &mut scores,
-            )
-            .unwrap();
-        },
-    );
     let (d_, g) = (d as usize, (hq / hk) as usize);
-    for r in 0..n as usize {
+    for (c, &r) in capturing.iter().enumerate() {
         let kv = kv_lens[r] as usize;
         let rows = (observe as usize).min(fresh[r] as usize);
+        let mut want = vec![0f64; context as usize];
         for h in 0..hq as usize {
-            let mut want = vec![0f64; kv_max as usize];
             for w in 0..rows {
                 let t = qo[r + 1] as usize - rows + w;
                 let limit = (kv - rows + w + 1).min(kv);
@@ -754,28 +740,21 @@ fn score_capture_averages_the_observed_rows_mass() {
                     .collect();
                 let m = s.iter().copied().fold(f64::MIN, f64::max);
                 let z: f64 = s.iter().map(|x| (x - m).exp()).sum();
-                for (j, x) in s.iter().enumerate() {
-                    if j < kv_max as usize {
-                        want[j] += (x - m).exp() / z / rows as f64;
-                    }
+                for (j, x) in s.iter().enumerate().take(context as usize) {
+                    // Two layers, each the heads' average.
+                    want[j] += 2.0 * (x - m).exp() / z / (rows * hq as usize) as f64;
                 }
             }
-            let at = ((lane_offset as usize + r) * hq as usize + h) * kv_max as usize;
-            let want: Vec<f32> = want.iter().map(|&x| x as f32).collect();
-            close_abs(
-                &format!("score req {r} head {h}"),
-                &got[at..at + kv_max as usize],
-                &want,
-                2e-5,
-            );
         }
+        let at = c * context as usize;
+        let want: Vec<f32> = want.iter().map(|&x| x as f32).collect();
+        close_abs(
+            &format!("score row {c} (lane {r})"),
+            &got[at..at + context as usize],
+            &want,
+            2e-5,
+        );
     }
-    // The lanes before the capture's keep what they held.
-    assert!(
-        got[..(lane_offset * hq * kv_max) as usize]
-            .iter()
-            .all(|&x| x == 9.0)
-    );
 }
 
 // ------------------------------------------------------------- dynconv --

@@ -28,15 +28,62 @@ impl DispatchAttn for Run<'_> {
 impl Run<'_> {
     pub(super) fn attention(&mut self, op: &Attn) -> Result<(), kernels_cuda::Error> {
         match op {
-            // A capturing lane's rows lie in its reading program's guest
-            // region (`poem_ir::Dim::Capturing`); this backend lays none
-            // yet, so a capturing fire is refused by name.
-            Attn::ScoreCapture { .. } | Attn::ScorePages { .. } => Err(kernels_cuda::Error::Backend {
-                op: "attn.score_capture",
-                detail: "this backend does not yet lay a capturing lane's score rows in its \
-                         reading program's guest region"
-                    .to_string(),
-            }),
+            // A row a capturing lane, in its reading program's span
+            // (`crate::serve::enqueue`'s capture block); `into`, the
+            // layer before's, is the same row.
+            Attn::ScoreCapture {
+                q,
+                plan,
+                cache,
+                head_dim,
+                kv_heads,
+                q_heads,
+                sm_scale,
+                observe,
+                into,
+                scores,
+            } => {
+                let (rows, _) = self.capture_rows("attn.score_capture")?;
+                let mut out = self.tensor(*scores);
+                if let Some(into) = into
+                    && self.tensor(*into).ptr != out.ptr
+                {
+                    return Err(kernels_cuda::Error::Backend {
+                        op: "attn.score_capture",
+                        detail: format!(
+                            "value {} adds into value {}, which lies in another row; a \
+                             fire's captures share one",
+                            scores.0, into.0
+                        ),
+                    });
+                }
+                let mut q_rows = self.ragged(*q);
+                q_rows.data = self.windowed(q_rows.data);
+                attn::score::capture(
+                    self.ctx(),
+                    q_rows,
+                    self.prefill_plan(*plan),
+                    &self.pool(*cache),
+                    *head_dim,
+                    *kv_heads,
+                    *q_heads,
+                    *sm_scale,
+                    *observe,
+                    rows,
+                    into.is_some(),
+                    &mut out,
+                )
+            }
+            Attn::ScorePages { keys, pages } => {
+                let (rows, page_size) = self.capture_rows("attn.score_pages")?;
+                attn::score::pages(
+                    self.ctx(),
+                    self.tensor(*keys),
+                    rows,
+                    page_size,
+                    &mut self.tensor(*pages),
+                )
+            }
             Attn::Voxel {
                 q,
                 k,

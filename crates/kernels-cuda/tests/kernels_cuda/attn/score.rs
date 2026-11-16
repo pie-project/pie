@@ -1,24 +1,28 @@
 #![cfg(feature = "cuda")]
 
-//! `attn.score_capture` against the host softmax: each lane's mass over its
-//! first `kv_max` keys, averaged over its last `observe` query rows, a run a
-//! head, written at the lane's row of a `[lanes, heads * kv_max]` plane.
+//! `attn.score_capture` and `attn.score_pages` against the host softmax: a
+//! capturing lane's mass a key, averaged over its last `observe` query rows
+//! and over the query heads, summed into its own row (a row a capturing
+//! lane, in lane order); a lane that does not capture has none, and a
+//! second layer adds into the same row. Its pages sum the row a kv page.
 
 use crate::common::attn_ref::{col, pool, ten};
-use crate::common::spread::agrees;
 use crate::common::{Gpu, Lcg};
 use dtype::Dtype::{Bf16, F32, I32};
 use kernels_cuda::attn::plan::{self, Device, Live, Shape, Toggles, Workspace};
-use kernels_cuda::tensor::{KvPool, RaggedTensor};
+use kernels_cuda::attn::score::CaptureRows;
+use kernels_cuda::tensor::{KvPool, RaggedTensor, Tensor};
 
 const PAGE: usize = 16;
 
 #[test]
-fn a_score_capture_lands_each_lanes_mass_at_its_row() {
+fn a_score_capture_lands_each_capturing_lanes_mass_at_its_row() {
     let (qh, kvh, d) = (4usize, 2usize, 128usize);
     // (new rows, cached rows) a lane: a prefill, a decode, a fresh prompt.
     let reqs = [(5usize, 20usize), (1, 33), (2, 0)];
-    let (observe, lane_offset, kv_max) = (3usize, 1usize, 40usize);
+    // Lanes 0 and 2 capture, rows 0 and 1; lane 1 does not.
+    let capturing = [0usize, 2];
+    let (observe, context) = (3usize, 48usize);
     let (width, qw, scale) = (kvh * d, qh * d, (d as f32).sqrt().recip());
     let n = reqs.len();
     let (mut qo, mut kv_indptr, mut kv_len, mut last, mut pages) =
@@ -39,14 +43,14 @@ fn a_score_capture_lands_each_lanes_mass_at_its_row() {
     let (k_raw, k) = lcg.row(cells * width);
     let (q_raw, q) = lcg.row(rows * qw);
 
-    let mut want = vec![9.0f32; (lane_offset + n) * qh * kv_max];
-    for (r, &(new, prefix)) in reqs.iter().enumerate() {
+    // One layer's rows: the heads summed, each a 1 / qh share.
+    let mut once = vec![0.0f32; capturing.len() * context];
+    for (c, &r) in capturing.iter().enumerate() {
+        let (new, prefix) = reqs[r];
         let len = new + prefix;
         let seen = observe.min(new);
         let cell = |t: usize| pages[r][t / PAGE] * PAGE + t % PAGE;
         for h in 0..qh {
-            let at = ((lane_offset + r) * qh + h) * kv_max;
-            want[at..at + kv_max].fill(0.0);
             for w in 0..seen {
                 let row = qo[r + 1] as usize - seen + w;
                 let reach = len - seen + w + 1;
@@ -60,8 +64,8 @@ fn a_score_capture_lands_each_lanes_mass_at_its_row() {
                     .collect();
                 let top = dots.iter().copied().fold(f32::MIN, f32::max);
                 let sum: f32 = dots.iter().map(|x| (x - top).exp()).sum();
-                for (t, x) in dots.iter().enumerate().take(kv_max) {
-                    want[at + t] += (x - top).exp() / sum / seen as f32;
+                for (t, x) in dots.iter().enumerate().take(context) {
+                    once[c * context + t] += (x - top).exp() / sum / (seen * qh) as f32;
                 }
             }
         }
@@ -122,50 +126,60 @@ fn a_score_capture_lands_each_lanes_mass_at_its_row() {
     )
     .expect("the prefill plans");
     plan.stage(&ctx).expect("the plan uploads");
-    let at = gpu.up(&want.iter().map(|_| 9.0f32).collect::<Vec<_>>());
-    let mut scores = ten(at, lane_offset + n, qh * kv_max, F32);
-    kernels_cuda::attn::score::capture(
-        &ctx,
-        qt,
-        &plan,
-        &kvp,
-        d as u32,
-        kvh as u32,
-        scale,
-        observe as u32,
-        lane_offset as u32,
-        kv_max as u32,
-        &mut scores,
-    )
-    .expect("the capture fires");
-    gpu.sync();
-    let got: Vec<f32> = gpu.down(at, want.len());
-    for (i, (g, w)) in got.iter().zip(&want).enumerate() {
-        assert!((g - w).abs() <= 2e-3, "at {i}: got {g}, want {w}");
+    let lanes: Vec<i32> = capturing.iter().map(|&r| r as i32).collect();
+    let table = CaptureRows {
+        lanes: col(&mut gpu, &lanes, I32),
+        lane_offset: 0,
+        requests: n as u32,
+    };
+    let at = gpu.up(&vec![9.0f32; capturing.len() * context]);
+    let mut scores = ten(at, capturing.len(), context, F32);
+    // A first layer zeroes the rows; a second adds into them.
+    for (layers, accumulate) in [(1.0f32, false), (2.0, true)] {
+        kernels_cuda::attn::score::capture(
+            &ctx,
+            qt,
+            &plan,
+            &kvp,
+            d as u32,
+            kvh as u32,
+            qh as u32,
+            scale,
+            observe as u32,
+            table,
+            accumulate,
+            &mut scores,
+        )
+        .expect("the capture fires");
+        gpu.sync();
+        let got: Vec<f32> = gpu.down(at, once.len());
+        for (i, (g, w)) in got.iter().zip(&once).enumerate() {
+            assert!(
+                (g - layers * w).abs() <= 2e-3,
+                "{layers} layers at {i}: got {g}, want {}",
+                layers * w
+            );
+        }
     }
-    // The same capture over the pool's pages spread apart, byte for byte.
-    let outs = [(at, want.len() * 4)];
-    agrees(
-        &mut gpu,
-        "score capture",
-        &[kvp],
-        &[],
-        &outs,
-        |_, pools, _| {
-            kernels_cuda::attn::score::capture(
-                &ctx,
-                qt,
-                &plan,
-                &pools[0],
-                d as u32,
-                kvh as u32,
-                scale,
-                observe as u32,
-                lane_offset as u32,
-                kv_max as u32,
-                &mut scores,
-            )
-            .expect("the capture fires");
-        },
-    );
+
+    let width = context.div_ceil(PAGE);
+    let page_at = gpu.up(&vec![9.0f32; capturing.len() * width]);
+    let mut summed: Tensor = ten(page_at, capturing.len(), width, F32);
+    kernels_cuda::attn::score::pages(&ctx, scores, table, PAGE as u32, &mut summed)
+        .expect("the pages fire");
+    gpu.sync();
+    let got: Vec<f32> = gpu.down(page_at, capturing.len() * width);
+    for c in 0..capturing.len() {
+        for p in 0..width {
+            let want = 2.0
+                * once[c * context..][p * PAGE..((p + 1) * PAGE).min(context)]
+                    .iter()
+                    .sum::<f32>();
+            let g = got[c * width + p];
+            assert!(
+                (g - want).abs() <= 4e-3,
+                "row {c} page {p}: got {g}, want {want}"
+            );
+        }
+    }
 }

@@ -606,6 +606,43 @@ impl Rig {
         }
     }
 
+    /// An instance of `program`, a lane of `rows` rows, over a reader
+    /// channel of each of `shapes`.
+    #[allow(dead_code)]
+    pub fn bind_readers(
+        &mut self,
+        program: ProgramId,
+        shapes: &[Vec<u32>],
+        rows: u32,
+    ) -> InstanceId {
+        let channels: Vec<ChannelId> = shapes
+            .iter()
+            .map(|shape| self.channel(shape.clone(), HostRole::Reader))
+            .collect();
+        self.guest
+            .bind(
+                &mut self.engine,
+                InstanceBinding {
+                    program,
+                    channels,
+                    seeds: Vec::new(),
+                    geometry: GeometryClass::Host,
+                    device_resolved: Default::default(),
+                    extents: engine::program::BindExtents {
+                        row_count: rows,
+                        token_count: rows,
+                        sampled_rows: 1,
+                        query_len: rows,
+                        ..engine::program::BindExtents::default()
+                    },
+                    instance_slots: Vec::new(),
+                    ring_slots: Vec::new(),
+                    adapter_slots: Vec::new(),
+                },
+            )
+            .id
+    }
+
     pub fn publish(&mut self, instance: InstanceId, dense: u32, values: &[f32]) {
         let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
         let accepted = self

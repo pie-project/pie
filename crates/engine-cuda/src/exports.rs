@@ -10,6 +10,75 @@ use poem_exec::feeds::ClassOutput;
 #[derive(Debug, Clone)]
 pub(crate) struct Exports {
     pub(crate) outputs: Vec<ClassOutput>,
+    /// What a fire's capturing lanes hold ([`Captures`]).
+    pub(crate) captures: Captures,
+}
+
+/// The values a row a capturing lane ([`poem_ir::Dim::Capturing`]) and how
+/// wide the load lays them: a capturing lane's lane class is one running a
+/// score capture.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Captures {
+    pub(crate) classes: poem_ir::ClassSet,
+    /// Each value a row a capturing lane, and whether its row is a page row
+    /// (`Dim::ContextPages`) or a key row (`Dim::ContextTimes(1)`).
+    pub(crate) values: Vec<(ValueId, bool)>,
+    /// The keys a key row holds: the load's context.
+    pub(crate) context: u32,
+    /// The kv page a page row's entry sums, and the pages a row holds.
+    pub(crate) page_size: u32,
+    pub(crate) pages: u32,
+}
+
+impl Captures {
+    fn of(
+        trace: &Trace,
+        compiled: &CompiledModel,
+        context: u32,
+        page_size: u32,
+    ) -> Result<Captures> {
+        let mut values = Vec::new();
+        for (at, decl) in trace.values.iter().enumerate() {
+            let poem_ir::Ty::Tensor { shape, .. } = &decl.ty else {
+                continue;
+            };
+            if shape.first() != Some(&poem_ir::Dim::Capturing) {
+                continue;
+            }
+            let pages = match shape[1..] {
+                [poem_ir::Dim::ContextTimes(1)] => false,
+                [poem_ir::Dim::ContextPages] => true,
+                _ => {
+                    return Err(Fault::Recipe(format!(
+                        "value {at} is a row a capturing lane {shape:?} wide, and a capturing \
+                         lane holds a key row and a page row"
+                    )));
+                }
+            };
+            values.push((ValueId(at as u32), pages));
+        }
+        Ok(Captures {
+            classes: classes_running(trace, compiled, |op| {
+                matches!(
+                    op,
+                    poem_ir::Operation::Attn(poem_ir::Attn::ScoreCapture { .. })
+                )
+            }),
+            values,
+            context,
+            page_size,
+            pages: context.div_ceil(page_size.max(1)),
+        })
+    }
+
+    /// The bytes a capturing lane's rows take: its key row and its entry of
+    /// the fire's capturing table, and its page row.
+    pub(crate) fn rows(&self) -> crate::program::CaptureRows {
+        crate::program::CaptureRows {
+            keys: u64::from(self.context) * 4 + 4,
+            pages: u64::from(self.pages) * 4,
+        }
+    }
 }
 
 impl Exports {
@@ -19,14 +88,15 @@ impl Exports {
         context: u32,
         page_size: u32,
     ) -> Result<Exports> {
-        let outputs =
-            poem_exec::feeds::class_outputs(trace, compiled, context, page_size).map_err(Fault::Recipe)?;
+        let outputs = poem_exec::feeds::class_outputs(trace, compiled, context, page_size)
+            .map_err(Fault::Recipe)?;
         if outputs.is_empty() {
             return Err(Fault::Unbound {
                 what: "no output, so a fire would compute nothing a reader can take".to_string(),
             });
         }
-        Ok(Exports { outputs })
+        let captures = Captures::of(trace, compiled, context, page_size)?;
+        Ok(Exports { outputs, captures })
     }
 
     /// The outputs class `class` writes.
