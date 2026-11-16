@@ -214,6 +214,14 @@ pub trait Tactics: std::fmt::Debug {
     /// The dense matmul tactic for a fire of `rows` activation rows.
     fn gemm(&self, tier: kernels_slang::Tier, rows: u32) -> kernels_slang::linear::gemm::Tactic;
 
+    /// Every dense matmul tactic some fire of 1 to `capacity` rows takes:
+    /// [`Tactics::gemm`]'s answers over those rows, each once.
+    fn gemm_tactics(
+        &self,
+        tier: kernels_slang::Tier,
+        capacity: u32,
+    ) -> Vec<kernels_slang::linear::gemm::Tactic>;
+
     /// The tiles and sort a batched route of `pairs` over `experts` runs at.
     fn batch(&self, pairs: u32, experts: u32) -> kernels_slang::linear::moe::select::Batch;
 
