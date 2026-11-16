@@ -53,7 +53,6 @@ impl Run<'_> {
                     into.is_none(),
                     self.requests(),
                     attn::score::CaptureRows {
-                        store: seat.store,
                         rows: seat.keys_at,
                         first: self.window().span.lane_offset,
                     },
@@ -63,7 +62,6 @@ impl Run<'_> {
                 let seat = self.capture_seat()?;
                 attn::score::pages(
                     self.ctx(),
-                    seat.store,
                     seat.keys_at,
                     seat.pages_at,
                     self.window().span.lane_offset,

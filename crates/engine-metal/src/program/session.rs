@@ -81,6 +81,17 @@ pub struct Pooled<'a> {
     pub rings: &'a [engine::program::RingSlots],
 }
 
+/// The alignment an instance's score rows start at: a binding's, as the
+/// rows of a fire's guest region were.
+pub const CAPTURE_ALIGN: u64 = 256;
+
+/// The bytes from `held`'s start to its first [`CAPTURE_ALIGN`]ed GPU
+/// address (none off the device).
+fn capture_pad(held: &held::Held) -> u64 {
+    held.address_at(0)
+        .map_or(0, |first| first.next_multiple_of(CAPTURE_ALIGN) - first)
+}
+
 #[derive(Debug)]
 pub struct Session {
     /// The `Instance` slot refs the tables lie in, in order.
@@ -91,6 +102,9 @@ pub struct Session {
     shapes: Vec<ChannelShape>,
     cursors: Vec<Cursor>,
     prepared: Vec<Option<Prepared>>,
+    /// The score rows its capturing lanes write (a key row and its page
+    /// row), where its program reads them out.
+    capture: Option<held::Held>,
     /// The outputs bound, by name and lane.
     bound: Vec<(String, u32)>,
     poisoned: bool,
@@ -137,7 +151,7 @@ impl Session {
         self.prepared.len()
     }
 
-    pub fn table_sizes(compiled: &Compiled, channels: usize, rows: u32) -> Vec<u64> {
+    pub fn table_sizes(compiled: &Compiled, channels: usize, rows: u32, capture: u64) -> Vec<u64> {
         let channels = u32::try_from(channels).unwrap_or(u32::MAX);
         compiled
             .plans
@@ -145,7 +159,25 @@ impl Session {
             .enumerate()
             .filter(|(index, _)| launches(compiled, *index))
             .flat_map(|(_, plan)| Prepared::table_sizes(plan, channels, rows))
+            .chain((capture > 0).then_some(capture + CAPTURE_ALIGN))
             .collect()
+    }
+
+    /// Where this instance's score rows lie now: the buffer and its byte
+    /// offset there, at [`CAPTURE_ALIGN`] of the GPU address; `None` where
+    /// it holds none.
+    #[must_use]
+    pub fn capture_row(&self) -> Option<(&Buffer, u64)> {
+        let held = self.capture.as_ref()?;
+        Some((held.buffer(), held.offset() + capture_pad(held)))
+    }
+
+    /// Reads `into.len()` bytes of this instance's score rows from byte `at`.
+    pub fn read_capture(&self, at: u64, into: &mut [u8]) -> Result<()> {
+        let held = self.capture.as_ref().ok_or_else(|| {
+            Fault::program("program::session", "this instance holds no score rows")
+        })?;
+        held.read(capture_pad(held) + at, into)
     }
 
     /// The instance's bind-time tables and rings go in `pooled`'s slots.
@@ -157,6 +189,7 @@ impl Session {
         adopted: &[Option<std::sync::Arc<SharedRing>>],
         pooled: Pooled<'_>,
         rows: u32,
+        capture: u64,
     ) -> Result<Session> {
         stages_and_plans_agree(compiled)?;
         if plan.package.channels.is_empty() {
@@ -170,7 +203,7 @@ impl Session {
         let shapes: Vec<ChannelShape> =
             plan.package.channels.iter().map(ChannelShape::of).collect();
         let rings = Rings::allocate(&shapes, adopted, pooled.pools, pooled.rings)?;
-        let sizes = Session::table_sizes(compiled, shapes.len(), rows);
+        let sizes = Session::table_sizes(compiled, shapes.len(), rows, capture);
         let tables_run = TableLayout::of(&sizes, pooled.pools.slot_bytes(INSTANCE)?).run;
         let mut tables = Tables::pooled(pooled.pools, INSTANCE, pooled.instance, &sizes)?;
         let cursors = vec![Cursor { head: 0, tail: 0 }; shapes.len()];
@@ -190,6 +223,11 @@ impl Session {
                 None
             });
         }
+        // The score rows its fires' capturing lanes write, after the
+        // tables: state of the instance, parked and unparked with it.
+        let capture = (capture > 0)
+            .then(|| tables.take(capture + CAPTURE_ALIGN))
+            .transpose()?;
         tables.finish()?;
 
         let mut session = Session {
@@ -199,6 +237,7 @@ impl Session {
             shapes,
             cursors,
             prepared,
+            capture,
             bound: Vec::new(),
             poisoned: false,
             fires: 0,
@@ -227,6 +266,9 @@ impl Session {
     /// now (after an evacuation moved them).
     pub fn rebind(&mut self, pools: &Pools) -> Result<()> {
         self.rings.rebind(pools)?;
+        if let Some(capture) = self.capture.as_mut() {
+            capture.rebind(pools)?;
+        }
         self.prepared
             .iter_mut()
             .flatten()
@@ -268,6 +310,11 @@ impl Session {
         };
         for prepared in self.prepared.iter_mut().flatten() {
             prepared.retarget(pools, &to)?;
+        }
+        if let Some(capture) = self.capture.as_mut()
+            && let Some(slot) = capture.slot()
+        {
+            capture.retarget(pools, to(slot)?)?;
         }
         self.rings.retarget(pools, rings)?;
         self.instance_slots = instance.to_vec();
