@@ -610,7 +610,7 @@ pub fn emit_fused_region(
                 format!("ptir_at({value})")
             }
         };
-        let mut slots = Slots::of(op, base, resolve);
+        let mut slots = Slots::of(op, base, "scratch", resolve);
         let gumbel = direct.gumbel[node].map(|chain| GumbelSlots {
             intrinsic: chain.intrinsic,
             state: resolve(chain.state),

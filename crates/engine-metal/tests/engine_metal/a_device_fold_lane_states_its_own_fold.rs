@@ -166,22 +166,27 @@ fn fire_with_fold(lanes: u32, fold: &[u32]) -> Option<String> {
             }
         })
         .collect();
+    let extents = eta_exec::Extents {
+        row_count: lanes * ROWS,
+        token_count: lanes * ROWS,
+        sampled_rows: lanes,
+        query_len: ROWS,
+        ..eta_exec::Extents::default()
+    };
+    let (scratch, pair) =
+        crate::guest_places(&shell, program, &extents, slots[slots.len() - 1] + 1);
     let id = shell
         .bind_program(
             program,
             &[],
-            eta_exec::Extents {
-                row_count: lanes * ROWS,
-                token_count: lanes * ROWS,
-                sampled_rows: lanes,
-                query_len: ROWS,
-                ..eta_exec::Extents::default()
-            },
+            extents,
             GeometryClass::DeviceGeometry,
             PortMask::NONE,
             &[engine::ChannelId(7)],
             &slots,
             &rings,
+            &scratch,
+            &pair,
         )
         .expect("the device-geometry instance binds");
     let verbs: Vec<RsVerb> = (0..lanes).map(|_| buffering(&shell)).collect();

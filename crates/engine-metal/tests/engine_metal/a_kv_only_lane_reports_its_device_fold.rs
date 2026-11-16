@@ -130,22 +130,27 @@ fn report(shell: &mut Shell, vocab: u32, tokens: &[u32], fold: bool, slot: u32) 
             }
         })
         .collect();
+    let extents = eta_exec::Extents {
+        row_count: ROWS,
+        token_count: ROWS,
+        sampled_rows: 1,
+        query_len: ROWS,
+        ..eta_exec::Extents::default()
+    };
+    let (scratch, pair) =
+        crate::guest_places(&shell, program, &extents, slots[slots.len() - 1] + 1);
     let id = shell
         .bind_program(
             program,
             &[],
-            eta_exec::Extents {
-                row_count: ROWS,
-                token_count: ROWS,
-                sampled_rows: 1,
-                query_len: ROWS,
-                ..eta_exec::Extents::default()
-            },
+            extents,
             GeometryClass::DeviceGeometry,
             PortMask::NONE,
             &[engine::ChannelId(70 + u64::from(slot))],
             &slots,
             &rings,
+            &scratch,
+            &pair,
         )
         .expect("the device-geometry instance binds");
     shell.open(slot).expect("the slot opens");

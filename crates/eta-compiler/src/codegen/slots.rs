@@ -13,13 +13,20 @@ pub struct Slots {
 }
 
 impl Slots {
-    pub fn of(op: &OpView, base: u32, mut pointer: impl FnMut(u32) -> String) -> Self {
+    /// `blank` names the pointer an absent operand takes: any the kernel
+    /// holds, never read.
+    pub fn of(
+        op: &OpView,
+        base: u32,
+        blank: &str,
+        mut pointer: impl FnMut(u32) -> String,
+    ) -> Self {
         let mut slots = Self {
-            a0: "scratch".to_string(),
-            a1: "scratch".to_string(),
-            a2: "scratch".to_string(),
-            o0: "scratch".to_string(),
-            o1: "scratch".to_string(),
+            a0: blank.to_string(),
+            a1: blank.to_string(),
+            a2: blank.to_string(),
+            o0: blank.to_string(),
+            o1: blank.to_string(),
         };
         if !op.args.is_empty() {
             slots.a0 = pointer(op.args[0]);

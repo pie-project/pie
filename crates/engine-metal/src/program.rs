@@ -2024,7 +2024,7 @@ mod tests {
             },
         );
 
-        let peak = |plane: &mut Plane, at: u32| {
+        let peak = |plane: &mut Plane, pools: &Pools, at: u32| {
             let mut bf16 = vec![0u8; VOCAB as usize * 2];
             bf16[at as usize * 2..at as usize * 2 + 2].copy_from_slice(&0x3f80u16.to_le_bytes());
             let mut logits = logits.clone();
@@ -2052,7 +2052,7 @@ mod tests {
             }
             tokens
         };
-        assert_eq!(peak(&mut plane, 777), vec![777, 777]);
+        assert_eq!(peak(&mut plane, &pools, 777), vec![777, 777]);
         // Each lane table, read back from the pool, names its instance's
         // status word where it lies now (the address is baked in): what a
         // grouped kernel writes its verdict through.
@@ -2087,7 +2087,7 @@ mod tests {
         frame.commit().expect("the copies land");
         plane.rebind(&pools).expect("the rebind");
         names_status(&mut plane);
-        assert_eq!(peak(&mut plane, 123), vec![123, 123]);
+        assert_eq!(peak(&mut plane, &pools, 123), vec![123, 123]);
 
         // Park and unpark: the bytes copied to fresh refs, the old refs
         // zeroed (from a slot nothing wrote), the instance rebound.
@@ -2145,7 +2145,7 @@ mod tests {
             )
             .expect("the slots rebind");
         names_status(&mut plane);
-        assert_eq!(peak(&mut plane, 456), vec![456, 456]);
+        assert_eq!(peak(&mut plane, &pools, 456), vec![456, 456]);
 
         // Park to the host tier and back, as a process parked under pressure
         // is: the Instance and Channel slots copy out whole, the device
@@ -2224,7 +2224,7 @@ mod tests {
             )
             .expect("the slots rebind");
         names_status(&mut plane);
-        assert_eq!(peak(&mut plane, 789), vec![789, 789]);
+        assert_eq!(peak(&mut plane, &pools, 789), vec![789, 789]);
     }
 
     /// A bound program's role slots (its Instance tables and its Channel
@@ -2276,7 +2276,7 @@ mod tests {
         plane
             .bind_output(id, "logits", 0, &logits, 0, eta_ir::Dtype::Bf16, VOCAB, VOCAB)
             .expect("the logits bind");
-        let fire = |plane: &mut Plane, logits: &mut crate::device::Buffer, at: u32| -> i32 {
+        let fire = |plane: &mut Plane, pools: &Pools, logits: &mut crate::device::Buffer, at: u32| -> i32 {
             let mut bf16 = vec![0u8; VOCAB as usize * 2];
             bf16[at as usize * 2..at as usize * 2 + 2].copy_from_slice(&0x3f80u16.to_le_bytes());
             logits.write(0, &bf16).expect("the logits write");
@@ -2298,7 +2298,7 @@ mod tests {
                 .expect("the reseed");
             i32::from_le_bytes(cell[..4].try_into().expect("an i32"))
         };
-        assert_eq!(fire(&mut plane, &mut logits, 321), 321, "before the round trip");
+        assert_eq!(fire(&mut plane, &pools, &mut logits, 321), 321, "before the round trip");
 
         // The role slots, shape by shape, and their bytes on the device.
         let mut roles: Vec<(engine::chunk::ShapeId, Vec<u32>)> = vec![(INSTANCE, instance.clone())];
@@ -2384,7 +2384,7 @@ mod tests {
         }
         frame.commit().expect("the unpark lands");
         assert_eq!(read(&pools), before, "the device slots hold their bytes again");
-        assert_eq!(fire(&mut plane, &mut logits, 654), 654, "after the round trip");
+        assert_eq!(fire(&mut plane, &pools, &mut logits, 654), 654, "after the round trip");
 
         // A role slot asked to the disk tier is refused by name: only kv
         // pages and rs rows have slot files.
