@@ -14,7 +14,8 @@
 //! can overlap: each stream whose regions run one stages into a lane of
 //! its own.
 
-use poem_ir::{Def, Linear, Operation, Trace};
+use poem_ir::residency::{Residency, residency};
+use poem_ir::{Def, Operands, Trace};
 
 use crate::error::{Fault, Result};
 
@@ -114,10 +115,10 @@ impl Staging {
         }
     }
 
-    /// The selects of `trace` whose bank lies on the host (`host` of its
-    /// codes' address) and is not one the weight cache tables (`tabled`,
-    /// by param), each as `table` binds it and on the stream `stream_of`
-    /// gives its node.
+    /// The routed banks of `trace` that lie on the host (`host` of their
+    /// codes' address) and that the weight cache tables none of (`tabled`,
+    /// by param), each as `table` binds it, once for each stream
+    /// (`stream_of` a node) whose nodes read it, whatever op reads it.
     pub fn selects(
         trace: &Trace,
         table: &crate::run::WeightTable,
@@ -125,12 +126,24 @@ impl Staging {
         host: impl Fn(u64) -> bool,
         stream_of: impl Fn(usize) -> u32,
     ) -> Result<Vec<Select>> {
-        let mut out = Vec::new();
+        let classes = residency(trace);
+        let mut streams: Vec<Vec<u32>> = vec![Vec::new(); trace.params.len()];
+        let mut inputs = Vec::new();
         for (at, node) in trace.nodes.iter().enumerate() {
-            let Operation::Linear(Linear::MoeSelect { bank, routes, .. }) = &node.op else {
-                continue;
-            };
-            let Def::Weight(w) = &trace.values[bank.0 as usize].def else {
+            inputs.clear();
+            node.op.inputs(&mut inputs);
+            for value in &inputs {
+                if let Some(Def::Weight(w)) = trace.values.get(value.0 as usize).map(|v| &v.def)
+                    && let Some(read) = streams.get_mut(*w as usize)
+                    && !read.contains(&stream_of(at))
+                {
+                    read.push(stream_of(at));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for (w, param) in trace.params.iter().enumerate() {
+            let Residency::Expert(atom) = classes[w] else {
                 continue;
             };
             let Some(Some(crate::run::WeightRow::Planes {
@@ -138,40 +151,34 @@ impl Staging {
                 scales,
                 biases,
                 ..
-            })) = table.0.get(*w as usize)
+            })) = table.0.get(w)
             else {
                 continue;
             };
-            if tabled.contains(w) || !host(codes.ptr) {
+            if tabled.contains(&(w as u32)) || !host(codes.ptr) {
                 continue;
             }
-            let name = &trace.params[*w as usize].name;
-            let top_k = match &trace.values[routes.0 as usize].ty {
-                poem_ir::Ty::Tensor { shape, .. } => match shape.get(1) {
-                    Some(poem_ir::Dim::Const(k)) => u32::try_from(*k).ok(),
-                    None => Some(1),
-                    Some(_) => None,
-                },
-                poem_ir::Ty::Struct(_) => None,
-            }
-            .ok_or_else(|| {
-                Fault::Residency(format!(
-                    "`{name}` lies on the host and a fire stages the experts its routes name, \
+            if atom.top_k == 0 {
+                return Err(Fault::Residency(format!(
+                    "`{}` lies on the host and a fire stages the experts its routes name, \
                      which the load bounds by the routes a row picks; its select's routes \
-                     state no constant width"
-                ))
-            })?;
-            out.push(Select {
-                bank: name.clone(),
-                experts: codes.rows,
-                top_k,
-                planes: [
-                    u64::from(codes.width),
-                    u64::from(scales.width),
-                    biases.map_or(0, |third| u64::from(third.width)),
-                ],
-                stream: stream_of(at),
-            });
+                     state no constant width",
+                    param.name
+                )));
+            }
+            for &stream in &streams[w] {
+                out.push(Select {
+                    bank: param.name.clone(),
+                    experts: codes.rows,
+                    top_k: atom.top_k,
+                    planes: [
+                        u64::from(codes.width),
+                        u64::from(scales.width),
+                        biases.map_or(0, |third| u64::from(third.width)),
+                    ],
+                    stream,
+                });
+            }
         }
         Ok(out)
     }
@@ -194,23 +201,49 @@ impl Staging {
         &self.banks
     }
 
-    /// Refuses a staging `room` bytes do not hold, by its banks' names.
-    pub fn fits(&self, room: u64) -> Result<()> {
-        let need = self.bytes();
-        if need <= room {
-            return Ok(());
+    /// The bytes of each run of a lane: codes, scales, third, routes.
+    #[must_use]
+    pub fn runs(&self) -> [u64; 4] {
+        self.runs
+    }
+
+    /// The streams that run a staged select, a lane each.
+    #[must_use]
+    pub fn streams(&self) -> &[u32] {
+        &self.streams
+    }
+
+    /// The rows a fire stages for at most.
+    #[must_use]
+    pub fn rows(&self) -> u32 {
+        self.rows
+    }
+
+    /// The fit's refusal of a load that lays this staging, its banks named:
+    /// the staging is a run of the activation's span, a term of the fit as
+    /// the workspaces are, so a card the fit cannot seat it on refuses the
+    /// load there.
+    #[must_use]
+    pub fn short(&self, why: Fault) -> Fault {
+        if self.banks.is_empty() {
+            return why;
         }
-        Err(Fault::Residency(format!(
-            "the routed bank(s) {} lie on the host with no table of the weight cache to read \
-             them through, and a fire of {} rows stages the experts it routes to on the device, \
-             a lane for each of {} stream(s): {need} bytes laid at load, and the card has {room} \
-             bytes free for it. Serve fewer \
-             `max_forward_tokens`, let the weight cache take the bank(s), or free what else \
-             holds the device.",
+        let why = match why {
+            Fault::Residency(said) => said,
+            other => other.to_string(),
+        };
+        Fault::Residency(format!(
+            "{}. Of what this load lays, the routed bank(s) {} lie on the host with no \
+             table of the weight cache to read them through, and a fire of {} rows stages the \
+             experts it routes to on the device, a lane for each of {} stream(s): {} bytes of \
+             staged experts. Serve fewer `max_forward_tokens`, or let the weight cache take \
+             the bank(s).",
+            why.trim_end_matches('.'),
             self.names(),
             self.rows,
             self.streams.len(),
-        )))
+            self.bytes(),
+        ))
     }
 
     /// The staging laid from `base`; `None` where it stages nothing.
@@ -329,19 +362,19 @@ mod tests {
     fn a_staging_the_card_cannot_hold_is_refused_by_name() {
         let staging = Staging::bound(&[select("blk.3.gate_up", 64, 4, [1 << 20, 0, 0])], 1024);
         let need = staging.bytes();
-        staging.fits(need).expect("the room it needs holds it");
         let said = staging
-            .fits(need - 1)
-            .expect_err("a byte short refuses the load")
+            .short(Fault::Residency(
+                "the card does not hold this deployment".to_string(),
+            ))
             .to_string();
+        assert!(
+            said.contains("the card does not hold"),
+            "keeps the fit's: {said}"
+        );
         assert!(said.contains("`blk.3.gate_up`"), "names the bank: {said}");
         assert!(
-            said.contains(&format!("{need} bytes")),
+            said.contains(&format!("{need} bytes of staged experts")),
             "and the bytes: {said}"
-        );
-        assert!(
-            said.contains(&format!("{} bytes free", need - 1)),
-            "and the room: {said}"
         );
     }
 
@@ -350,6 +383,7 @@ mod tests {
         assert_eq!(staging.bytes(), 0);
         assert!(staging.at(1 << 20).is_none());
         assert!(staging.fact().is_none());
-        staging.fits(0).expect("nothing to hold");
+        let why = Fault::Residency("short".to_string());
+        assert_eq!(staging.short(why).to_string(), "weight residency: short");
     }
 }

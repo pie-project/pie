@@ -3029,17 +3029,31 @@ impl Run<'_> {
         let count = routes.rows as usize * routes.width as usize;
         let mut picked = vec![0i32; count];
         copy(picked.as_mut_ptr() as u64, routes.ptr, count * 4)?;
-        let mut unique: Vec<i32> = picked.iter().copied().filter(|e| *e >= 0).collect();
+        // A pad row's routes are whatever its rows last held: an id past
+        // the bank names no expert, and the select reads none for it.
+        let experts = codes.rows as i32;
+        let named = |e: i32| (0..experts).contains(&e);
+        let mut unique: Vec<i32> = picked.iter().copied().filter(|e| named(*e)).collect();
         unique.sort_unstable();
         unique.dedup();
+        // A size-only walk reads no routes: it stages the most experts the
+        // fire can route to, so its select asks the scratch a fire's can.
+        if crate::sizing::active() {
+            let most = (codes.rows as usize).min(count);
+            unique = (0..most as i32).collect();
+        }
         if unique.is_empty() {
             return Ok(None);
         }
         let over = |what: &str, need: u64, run: u64| {
             refused(format!(
-                "a fire of {} rows stages {need} bytes of {what}, past the {run} the load \
-                 laid for fires of up to {} rows",
-                routes.rows, staged.rows,
+                "a fire of {} rows, {} routes a row, stages {need} bytes of {what} ({} of a \
+                 bank's {} experts), past the {run} the load laid for fires of up to {} rows",
+                routes.rows,
+                routes.width,
+                unique.len(),
+                codes.rows,
+                staged.rows,
             ))
         };
         let stage = |plane: Tensor, (at, run): (u64, u64)| -> Result<Tensor, kernels_cuda::Error> {
@@ -3071,7 +3085,7 @@ impl Run<'_> {
         let slot_of = |expert: i32| unique.binary_search(&expert).map_or(-1, |at| at as i32);
         let remapped: Vec<i32> = picked
             .iter()
-            .map(|e| if *e < 0 { -1 } else { slot_of(*e) })
+            .map(|e| if named(*e) { slot_of(*e) } else { -1 })
             .collect();
         let (routes_at, routes_run) = lane[3];
         if (count * 4) as u64 > routes_run {
