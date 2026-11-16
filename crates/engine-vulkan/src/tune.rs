@@ -245,6 +245,71 @@ fn check_estimate(
         widths.len()
     ));
     let token = |i: u32| 100 + (i * 7919) % 5000;
+    // The narrowest widths' fires dissected, before any is recorded: the
+    // first walked and recorded with a timestamp around each dispatch, the
+    // second replaying that recording (the form a served fire takes), its
+    // timestamps written again and read back. Each dispatch's kernel and
+    // groups, and each kernel's device time, of both.
+    let mut dissect = |width: u32, say: &mut dyn FnMut(&str)| -> Result<(), String> {
+        let prompt: Vec<u32> = (0..width).map(token).collect();
+        let lane = engine_gpu::serve::Lane {
+            slot: 0,
+            word: trace.facts.word(&Request::new(width, false)),
+            tokens: &prompt,
+        };
+        crate::encode::profile_kernels(true);
+        let mut shapes = Vec::new();
+        for form in ["walked", "replayed"] {
+            shell.open(0).map_err(|e| e.to_string())?;
+            crate::encode::capture_shapes(form == "walked");
+            crate::encode::reset_kernel_profile();
+            let before = shell.recordings();
+            let began = Instant::now();
+            let fired = shell.fire(std::slice::from_ref(&lane));
+            let wall = began.elapsed().as_secs_f64() * 1e3;
+            crate::encode::capture_shapes(false);
+            if let Err(e) = fired {
+                crate::encode::profile_kernels(false);
+                return Err(e.to_string());
+            }
+            if form == "walked" {
+                shapes = crate::encode::take_shapes();
+            }
+            let replayed = shell.recordings().map_or(0, |c| c.0) > before.map_or(0, |c| c.0);
+            let mut rows = crate::encode::kernel_profile();
+            rows.sort_by_key(|row| std::cmp::Reverse(row.1));
+            let device: u64 = rows.iter().map(|row| row.1).sum();
+            let mut out = format!(
+                "dissected ({form}{}): a fire of {width} tokens of {model}: {wall:.2} ms wall, \
+                 {:.2} ms in {} kernels' dispatches on the device (frame span {:.2} ms; {} \
+                 dispatches encoded)\n",
+                if replayed { ", replayed" } else { "" },
+                device as f64 / 1e6,
+                rows.len(),
+                crate::encode::frame_span_ns() as f64 / 1e6,
+                shapes.len(),
+            );
+            for (name, ns, fires) in rows.iter().take(14) {
+                let groups: Vec<String> = shapes
+                    .iter()
+                    .filter(|s| s.entrypoint == name.as_str())
+                    .map(|s| format!("{:?}", s.groups))
+                    .take(3)
+                    .collect();
+                out.push_str(&format!(
+                    "  {:>9.3} ms  x{fires:<4} {name}  groups {}\n",
+                    *ns as f64 / 1e6,
+                    groups.join(" ")
+                ));
+            }
+            say(&out);
+        }
+        crate::encode::profile_kernels(false);
+        Ok(())
+    };
+    for width in widths.iter().copied().filter(|&w| w <= 16) {
+        dissect(width, say)?;
+    }
     let measured = search::time_fires(
         &widths,
         |width, timed| {
