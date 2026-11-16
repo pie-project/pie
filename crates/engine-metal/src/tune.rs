@@ -610,6 +610,268 @@ fn serve(artifact: &Path, deployment: &str, device: &str, file: &str) -> Result<
     })
 }
 
+/// How far the estimate's pick may fall short of the measured-best rung:
+/// its score, under the measured times, within this share of the best's.
+pub const CHECK_BOUND: f64 = 0.05;
+
+/// The fire size `--check-estimate` lays its rungs up to: what a served
+/// Metal load asks (`max_lanes`, `max_tokens`).
+const CHECK_FIRE: (u32, u32) = (256, 2048);
+
+/// The kinds of work a fire's time is told in: what each kernel does by
+/// its entrypoint.
+const KINDS: [&str; 5] = ["gemm", "attention", "recurrent", "norm+elementwise", "other"];
+
+fn kind_of(entrypoint: &str) -> usize {
+    let e = entrypoint.to_ascii_lowercase();
+    if ["gemm", "gemv", "qmm", "mpp", "matmul", "moe_"].iter().any(|k| e.contains(k)) {
+        0
+    } else if e.starts_with("attn") || e.contains("flash") || e.contains("paged") {
+        1
+    } else if ["gdn", "conv", "scan", "delta", "rs_", "recur", "ssm", "chunk_"]
+        .iter()
+        .any(|k| e.contains(k))
+    {
+        2
+    } else if ["norm", "rope", "silu", "gelu", "swiglu", "add", "mul", "act", "residual", "copy", "cast", "softmax", "sigmoid", "gate"]
+        .iter()
+        .any(|k| e.contains(k))
+    {
+        3
+    } else {
+        4
+    }
+}
+
+/// `pie tune metal --check-estimate`: each of `models` loaded under the
+/// user's profile with every rung of a served fire size laid; a fire of
+/// each rung's width timed through the serving path (one lane on a fresh
+/// slot), against the estimate the load weighs its top by. Each rung's
+/// fire is then dissected, every dispatch timed on the device alone, and
+/// its time told by kind of work. Refuses where the estimate's pick
+/// scores, under the measured times, more than [`CHECK_BOUND`] below the
+/// measured best.
+pub fn check_estimate(
+    profiles: Option<&Path>,
+    models: &[(PathBuf, String)],
+    say: &mut dyn FnMut(&str),
+) -> Result<Outcome, String> {
+    let began = Instant::now();
+    let device = Context::bind().map_err(|e| e.to_string())?;
+    let name = device.name().to_string();
+    drop(device);
+    if models.is_empty() {
+        return Err("--check-estimate times a model's fires: import one, or name it".into());
+    }
+    let mut lines = Vec::new();
+    let mut wrong = Vec::new();
+    for (artifact, deployment) in models {
+        match check_one(artifact, deployment, &name, profiles, say) {
+            Ok(out) => lines.push(Line {
+                id: "rates",
+                text: out,
+            }),
+            Err(why) => wrong.push(why),
+        }
+    }
+    Ok(Outcome {
+        device: name,
+        file: String::new(),
+        lines,
+        wrong,
+        checks: Vec::new(),
+        changed: false,
+        seconds: began.elapsed().as_secs_f64(),
+    })
+}
+
+fn check_one(
+    artifact: &Path,
+    deployment: &str,
+    device: &str,
+    profiles: Option<&Path>,
+    say: &mut dyn FnMut(&str),
+) -> Result<String, String> {
+    use poem::{Platform, Request};
+    let (lanes, tokens) = CHECK_FIRE;
+    let row = poem_compiler::catalog::deployment(deployment)
+        .ok_or_else(|| format!("no catalog row `{deployment}`"))?;
+    let trace = row.trace(Platform::Metal);
+    let model = engine::load::model_class(&trace).to_owned();
+    let source = ztensor_compat::index(artifact).map_err(|e| e.to_string())?;
+    let contract = poem::import::own_contract(&source, &trace.params, 1, Platform::Metal)
+        .map_err(|e| e.to_string())?;
+    drop(source);
+    let mut shell = crate::Shell::load(crate::Boot {
+        voxels: None,
+        trace: trace.clone(),
+        contract: &contract,
+        checkpoint: artifact,
+        budget: poem_compiler::Budget::new(lanes, tokens),
+        patches: patch_ladder(&trace),
+        profile: None,
+        page_size: 16,
+        context: tokens,
+        slots: 1,
+        kv_budget: None,
+        allowance: engine::Allowance::WHOLE,
+        runahead: engine::runahead::Runahead::F1,
+        profiles: profiles.map(Path::to_path_buf),
+        residency: crate::ResidencyPlan::default(),
+        top: crate::Top::EveryRung,
+    })
+    .map_err(|e| e.to_string())?;
+    shell.raise_whole().map_err(|e| e.to_string())?;
+    let weighed = shell.weighed().cloned().ok_or_else(|| {
+        format!("{device} has no rates in its profile to estimate by: run `pie tune --rates`")
+    })?;
+    let rungs: Vec<engine::load::RungFacts> = weighed
+        .rungs
+        .iter()
+        .filter(|r| r.infeasible.is_none())
+        .copied()
+        .collect();
+    let widths: Vec<u32> = rungs.iter().map(|r| r.tokens).collect();
+    say(&format!(
+        "{model}: timing a fire at each of {} rung widths {widths:?}",
+        widths.len()
+    ));
+    let token = |i: u32| 100 + (i * 7919) % 5000;
+    let fire = |shell: &mut crate::Shell, width: u32| -> Result<u64, String> {
+        let prompt: Vec<u32> = (0..width).map(token).collect();
+        shell.open(0).map_err(|e| e.to_string())?;
+        let lane = crate::Lane {
+            slot: 0,
+            word: trace.facts.word(&Request::new(width, false)),
+            tokens: &prompt,
+        };
+        let began = Instant::now();
+        shell
+            .fire(std::slice::from_ref(&lane))
+            .map_err(|e| e.to_string())?;
+        Ok(u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX))
+    };
+    let measured = search::time_fires(&widths, |width, _| fire(&mut shell, width), say)?;
+    // Each width dissected: every dispatch committed and timed alone, its
+    // device time told by its kernel's kind.
+    let mut dissected = Vec::new();
+    for &width in &widths {
+        crate::encode::reset_kernel_profile();
+        crate::encode::profile_kernels(true);
+        let fired = fire(&mut shell, width);
+        crate::encode::profile_kernels(false);
+        fired?;
+        let rows = crate::encode::kernel_profile();
+        crate::encode::reset_kernel_profile();
+        let mut by_kind = [0u64; KINDS.len()];
+        let mut dispatches = 0u64;
+        for (entry, ns, n) in &rows {
+            by_kind[kind_of(entry)] += ns;
+            dispatches += n;
+        }
+        dissected.push((width, by_kind, dispatches, rows));
+    }
+    drop(shell);
+
+    let est: Vec<f64> = rungs.iter().map(|r| weighed.estimate.ns(r)).collect();
+    let meas: Vec<f64> = rungs
+        .iter()
+        .map(|r| {
+            measured
+                .iter()
+                .find(|&&(t, _)| t == r.tokens)
+                .map_or(f64::NAN, |&(_, ns)| ns as f64)
+        })
+        .collect();
+    let by_est = engine::load::pick(&rungs, &est, weighed.live).map_err(|e| e.to_string())?;
+    let by_meas = engine::load::pick(&rungs, &meas, weighed.live).map_err(|e| e.to_string())?;
+    let scores = engine::load::scored(&rungs, &meas, weighed.live);
+    let score = |tokens: u32| {
+        scores
+            .iter()
+            .find(|&&(t, _)| t == tokens)
+            .map_or(0.0, |&(_, s)| s)
+    };
+    let (at_est, best) = (score(by_est.tokens), score(by_meas.tokens));
+    let e = &weighed.estimate;
+    let mut out = format!(
+        "{model} on {device}: rates {:.0} flop/ns, {:.0} B/ns, launch {:.0} ns; dense {:.2} GB, \
+         {:.2} GFLOP/row\n  rung  measured  estimated | est: launches  max(read,compute)  attn  kv \
+         | device by kind (ms, dispatches timed alone): {}  dispatches  sum  wall-sum\n",
+        e.flops_per_ns,
+        e.bytes_per_ns,
+        e.launch_ns,
+        e.dense_bytes as f64 / 1e9,
+        e.flops_per_row / 1e9,
+        KINDS.join(" / "),
+    );
+    for (k, r) in rungs.iter().enumerate() {
+        let tokens = f64::from(r.tokens);
+        let keys = f64::from(r.keys);
+        let launches = f64::from(r.launches) * e.launch_ns;
+        let read = e.weight_bytes(r.tokens) / e.bytes_per_ns;
+        let compute = f64::from(r.padded_rows) * e.flops_per_row / e.flops_per_ns;
+        let attn = tokens * keys * e.attn_flops_per_row_key / e.flops_per_ns;
+        let kv = keys * e.kv_bytes_per_key / e.bytes_per_ns;
+        let (_, by_kind, dispatches, _) = dissected
+            .iter()
+            .find(|d| d.0 == r.tokens)
+            .expect("each width dissected");
+        let sum: u64 = by_kind.iter().sum();
+        out.push_str(&format!(
+            "  {:>5} {:>8.2} {:>9.2} | {:>6.2} {:>6.2}({}) {:>6.2} {:>6.2} | {} {:>5} {:>7.2} {:>7.2}\n",
+            r.tokens,
+            meas[k] / 1e6,
+            est[k] / 1e6,
+            launches / 1e6,
+            read.max(compute) / 1e6,
+            if read >= compute { "read" } else { "compute" },
+            attn / 1e6,
+            kv / 1e6,
+            by_kind
+                .iter()
+                .map(|ns| format!("{:>6.2}", *ns as f64 / 1e6))
+                .collect::<Vec<_>>()
+                .join(" "),
+            dispatches,
+            sum as f64 / 1e6,
+            (meas[k] - sum as f64) / 1e6,
+        ));
+    }
+    for (width, _, _, rows) in &dissected {
+        out.push_str(&format!("  top kernels at {width}:"));
+        for (entry, ns, n) in rows.iter().take(8) {
+            out.push_str(&format!(
+                " {entry} {:.2}ms x{n} [{}];",
+                *ns as f64 / 1e6,
+                KINDS[kind_of(entry)]
+            ));
+        }
+        out.push('\n');
+    }
+    let short = if best > 0.0 { 1.0 - at_est / best } else { 0.0 };
+    out.push_str(&format!(
+        "  pick by the estimate {}, by the measured times {}; the estimate's scores {:.1}% below \
+         the best (bound {:.0}%)\n",
+        by_est.tokens,
+        by_meas.tokens,
+        100.0 * short,
+        100.0 * CHECK_BOUND
+    ));
+    say(&out);
+    if short > CHECK_BOUND {
+        return Err(format!(
+            "the estimate picks rung {} for {model}, {:.1}% below the measured best {}: past \
+             the {:.0}% bound\n{out}",
+            by_est.tokens,
+            100.0 * short,
+            by_meas.tokens,
+            100.0 * CHECK_BOUND
+        ));
+    }
+    Ok(out)
+}
+
 /// A hash of the fused trace and compiled plan a load under `text` runs:
 /// two files with the same plan serve the same.
 fn plan_of(deployment: &str, text: &str, cores: Option<u32>) -> Option<u64> {

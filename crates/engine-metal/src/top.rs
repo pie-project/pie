@@ -33,6 +33,16 @@ pub fn counts(trace: &Trace) -> Result<Counts> {
     ))
 }
 
+/// What a load weighed its rungs by: the rungs it offered, the estimate
+/// from its profile's rates and its model's counts, and the live range.
+#[derive(Debug, Clone)]
+pub struct Weighed {
+    pub rungs: Vec<RungFacts>,
+    pub estimate: engine::load::FireEstimate,
+    pub live: u64,
+    pub counts: Counts,
+}
+
 /// One rung offered: a fire of `tokens`, the chunks its span takes, the
 /// dispatches a recording of it issues, and the rows its matmuls compute
 /// (`tokens` padded to the tile Metal's dense kernel takes at that width,
