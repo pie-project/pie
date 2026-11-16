@@ -35,7 +35,10 @@ pub fn emit_word_arguments(source: &mut String, count: usize) {
 
 pub fn grouped_preamble() -> &'static str {
     static TEXT: LazyLock<String> = LazyLock::new(|| {
-        let mut out = String::from("\n");
+        let mut out = alloc::format!(
+            "\nconstant constexpr uint M3_SCRATCH_PIECES = {}u;\n",
+            super::M3_SCRATCH_PIECES
+        );
         for shared in layout::HOST_SHARED {
             out.push_str(&shared.emit_msl(M3));
         }

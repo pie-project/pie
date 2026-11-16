@@ -29,7 +29,7 @@ pub const SIGNATURE: &str = r#"(
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
     const device M1OpParams* params [[buffer(2)]],
     const device uint* offsets [[buffer(3)]],
-    device uchar* all_scratch [[buffer(4)]],
+    const device ulong* scratch_bases [[buffer(4)]],
     const device M3GroupLayout* layout [[buffer(5)]],
     const device uint* channel_bindings [[buffer(6)]],
     device uchar* pending_flags [[buffer(7)]],
@@ -60,8 +60,8 @@ pub const SIGNATURE: &str = r#"(
       all_descriptors + dispatch_lane * layout->value_count;
   const device M1OpParams* lane_params =
       params + dispatch_lane * layout->reserved2;
-  device uchar* scratch =
-      all_scratch + ulong(dispatch_lane) * ulong(layout->scratch_stride);
+  device uchar* scratch = reinterpret_cast<device uchar*>(
+      scratch_bases[ulong(dispatch_lane) * ulong(M3_SCRATCH_PIECES)]);
   device uchar* temporary = scratch + layout->temporary_offset;
 "#;
 
