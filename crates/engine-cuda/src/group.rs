@@ -369,20 +369,8 @@ impl Engine for Group {
 
     fn load(&mut self, request: LoadRequest) -> EngineResult<Loaded> {
         let mut answers = self.each_within(LOAD_WAIT, move |rank| rank.load(request.clone()))?;
-        // each rank pins and opens its own tiers; the group moves what all of them hold
-        let mut tiers = answers
-            .first()
-            .map(|loaded| loaded.caps.pools)
-            .unwrap_or_default();
-        tiers.least_tiers(answers.iter().map(|loaded| loaded.caps.pools));
-        for loaded in &mut answers {
-            let pools = &mut loaded.caps.pools;
-            pools.host_kv_pages = tiers.host_kv_pages;
-            pools.disk_kv_pages = tiers.disk_kv_pages;
-            pools.disk_kv_persistent = tiers.disk_kv_persistent;
-            pools.disk_kv_kept = tiers.disk_kv_kept;
-        }
-        // The shared pool's tiers (CONTRACT-BC 22): what every rank holds.
+        // The shared pool's tiers (CONTRACT-BC 22): each rank pins and opens
+        // its own, and the group moves what every rank holds.
         let least = |of: fn(&engine::chunk::ChunkFacts) -> u32| {
             answers
                 .iter()
@@ -391,9 +379,15 @@ impl Engine for Group {
                 .unwrap_or(0)
         };
         let (host_chunks, disk_chunks) = (least(|c| c.host_chunks), least(|c| c.disk_chunks));
+        let every = |of: fn(&engine::chunk::ChunkFacts) -> bool| {
+            answers.iter().all(|loaded| of(&loaded.caps.chunks))
+        };
+        let (persistent, kept) = (every(|c| c.disk_persistent), every(|c| c.disk_kept));
         for loaded in &mut answers {
             loaded.caps.chunks.host_chunks = host_chunks;
             loaded.caps.chunks.disk_chunks = disk_chunks;
+            loaded.caps.chunks.disk_persistent = persistent;
+            loaded.caps.chunks.disk_kept = kept;
         }
         // a rank's facts (codegen backend, pools) exist only once it has loaded;
         // the snapshot taken at open was empty, and a group that keeps it says

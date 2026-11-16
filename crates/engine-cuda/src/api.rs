@@ -684,7 +684,7 @@ impl Engine for Cuda {
         let mut shell = staged.finish().map_err(fault)?;
 
         shell.mount_adapters(self.boot.adapter_dir.clone());
-        let host_kv_pages = shell
+        shell
             .seat_host_kv(
                 residency.host_kv_budget,
                 residency.kv_seats.unwrap_or(budgets.max_lanes),
@@ -699,7 +699,7 @@ impl Engine for Cuda {
         } else {
             None
         };
-        let disk_kv_pages = shell
+        shell
             .seat_disk_kv(
                 residency.disk_kv_budget,
                 residency.disk_kv_dir.as_deref(),
@@ -742,11 +742,6 @@ impl Engine for Cuda {
                 codegen_backend: Some(CODEGEN.to_string()),
             },
             pools: PoolFacts {
-                kv_pages: u32::try_from(paging.pages()).unwrap_or(u32::MAX),
-                kv_page_size: paging.page_size,
-                state_slots: if state_rows { paging.slots } else { 0 },
-                state_slot_bytes: shell.state_slot_bytes(),
-                buffer_pages: shell.buffer_pages(),
                 adapter_banks: shell
                     .banks()
                     .iter()
@@ -754,10 +749,6 @@ impl Engine for Cuda {
                     .min()
                     .unwrap_or(0),
                 window_tokens: paging.window.map_or(0, |window| window.tokens),
-                host_kv_pages,
-                disk_kv_pages,
-                disk_kv_persistent: residency.disk_kv_persistent && disk_kv_pages > 0,
-                disk_kv_kept: shell.disk_kv_kept(),
                 seated_first: shell.seated_first(),
                 seat_to_end: shell.seat_to_end(),
                 seat_spread: shell.seat_spread(),

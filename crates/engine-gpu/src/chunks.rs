@@ -1,7 +1,7 @@
 //! The compiler's GPU recipe a load's one chunk pool is laid by (the chunk
 //! profile of a Vulkan or WebGPU device, and the plan under it), and what a
 //! load tells the runtime about its pool: the chunk facts of the one chunk
-//! pool, the legacy pool facts the runtime reads beside them.
+//! pool, and the pool facts beside them.
 
 use poem_compiler::chunk::ChunkProfile;
 use poem_compiler::{Budgets, DeviceProfile};
@@ -61,34 +61,12 @@ pub fn recipe(
     })
 }
 
-/// The pool's kv pages as its facts state them, a u32: a count past it is
-/// refused at the load, where a clamp would tell the runtime of fewer pages
-/// than the pool holds.
-fn stated_pages(pages: u64) -> Result<u32> {
-    u32::try_from(pages).map_err(|_| Fault::Ceiling {
-        what: "kv pages (the pool's facts state the count as a u32)",
-        need: pages,
-        have: u64::from(u32::MAX),
-    })
-}
-
 impl<B: Serve> Shell<B> {
-    /// The pool as the legacy facts state it: its kv pages, its records;
-    /// `disk_kv_pages` is what [`Shell::seat_disk_kv`] seated.
-    pub fn pool_facts(&self, disk_kv_pages: u32) -> Result<PoolFacts> {
-        let paging = self.paging();
-        let state_rows = self
-            .trace()
-            .caches
-            .iter()
-            .any(|row| matches!(row, poem_ir::CacheRow::State { .. }));
+    /// What the load states beside its chunk facts: its adapter banks and
+    /// the model's window.
+    pub fn pool_facts(&self) -> Result<PoolFacts> {
         Ok(PoolFacts {
-            kv_pages: stated_pages(paging.pages())?,
-            kv_page_size: paging.page_size,
-            state_slots: if state_rows { paging.slots } else { 0 },
-            state_slot_bytes: self.state_slot_bytes(),
             adapter_banks: u32::try_from(self.banks().len()).unwrap_or(u32::MAX),
-            disk_kv_pages,
             // The model's window; its rows lie in window lists.
             window_tokens: poem_exec::store::kv::declared_window(self.trace()).unwrap_or(0),
             ..PoolFacts::default()
@@ -102,26 +80,5 @@ impl<B: Serve> Shell<B> {
             what: format!("the pool's chunk facts: {why}"),
         })?;
         Ok(facts)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::stated_pages;
-    use crate::error::Fault;
-
-    /// The facts state every page the pool holds or the load is refused.
-    #[test]
-    fn a_page_count_past_u32_is_refused() {
-        assert_eq!(stated_pages(0).ok(), Some(0));
-        assert_eq!(stated_pages(u64::from(u32::MAX)).ok(), Some(u32::MAX));
-        let refused = stated_pages(1 << 32).expect_err("past u32");
-        assert!(
-            matches!(
-                refused,
-                Fault::Ceiling { need, have, .. } if need == 1 << 32 && have == u64::from(u32::MAX)
-            ),
-            "{refused}"
-        );
     }
 }

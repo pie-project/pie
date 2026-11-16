@@ -129,16 +129,13 @@ pub struct ModelConfig {
 }
 
 pub struct EngineConfig {
-    pub total_pages: usize,
     /// The pools as chunks: what the engine states
     /// ([`::engine::Capabilities::chunks`]).
     pub chunks: ::engine::chunk::ChunkFacts,
+    /// The model's window (`PoolFacts::window_tokens`).
     pub window_tokens: u32,
-    pub cpu_pages: usize,
-    pub disk_pages: u32,
     /// The disk tier is kept for the next run (`disk_kv_persistent`).
     pub disk_kept: Option<KeptDisk>,
-    pub rs_cache_slots: usize,
     /// The engine asks the planner to serve a decoding lane's pages before a
     /// prompt waiting to be seated (`PoolFacts::seated_first`).
     pub seated_first: bool,
@@ -148,7 +145,6 @@ pub struct EngineConfig {
     /// The engine asks the planner to spread the starts the pools do not hold
     /// to the end at once over a life (`PoolFacts::seat_spread`).
     pub seat_spread: bool,
-    pub rs_cache_slot_bytes: u64,
     pub draft_block: u32,
     pub draft_mask_token: u32,
     pub draft_proposals_from: u32,
@@ -280,7 +276,12 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     // charges each process the fixed set its working set holds against the
     // state pool, beside a copy-on-write set per lane a fire runs
     // (`ResidencyPlanner::admit`): no cap here.
-    let has_state = engine_configs.iter().any(|d| d.rs_cache_slots > 0);
+    let store_pools = engine_configs
+        .iter()
+        .map(|d| crate::store::chunks::StorePools::of(&d.chunks))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| anyhow::anyhow!("engine pools: {error}"))?;
+    let has_state = store_pools.iter().any(|pools| pools.state.slot_bytes > 0);
     let admission_cap = config
         .max_concurrent_processes
         .or_else(|| {
@@ -300,7 +301,11 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             let seats = engine_configs
                 .iter()
                 .filter(|d| d.seated_first && !d.seat_spread && d.limits.max_context > 0)
-                .map(|d| 5 * d.total_pages * kv_page_size / d.limits.max_context)
+                .map(|d| {
+                    5 * usize::try_from(d.chunks.kv_device_pages()).unwrap_or(usize::MAX)
+                        * kv_page_size
+                        / d.limits.max_context
+                })
                 .min();
             match seats {
                 Some(seats) if !has_state && cap > seats.max(1) => {
@@ -320,7 +325,9 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     let rs_caps = {
         let d0 = engine_configs.first();
         let mut caps = model::RsCaps {
-            state_size: d0.map(|d| d.rs_cache_slot_bytes).unwrap_or(0),
+            state_size: store_pools
+                .first()
+                .map_or(0, |pools| pools.state.slot_bytes),
             buffer_page_size: 0,
             window_tokens: d0.map_or(0, |d| d.window_tokens),
         };
@@ -403,7 +410,8 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             crate::store::shared::SharedPool::scale_of(&d.chunks).unwrap_or(
                 crate::policy::pressure::Scale {
                     kv_page_bytes: 0,
-                    state_slot_bytes: d.rs_cache_slot_bytes,
+                    state_slot_bytes: crate::store::chunks::StorePools::of(&d.chunks)
+                        .map_or(0, |pools| pools.state.slot_bytes),
                 },
             )
         })
@@ -483,7 +491,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         if crate::store::shared::SharedPool::states_shared(&d.chunks) {
             d.chunks.host_chunks > 0 || d.chunks.disk_chunks > 0
         } else {
-            d.cpu_pages > 0 || d.disk_pages > 0
+            d.chunks.kv_host_pages() > 0 || d.chunks.kv_disk_pages() > 0
         }
     });
     // The lanes one fire runs on each engine: the copy-on-write sets its
@@ -500,7 +508,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             // A shared pool states its tiers in chunks, not in the page
             // fields its engine leaves at 0.
             tracing::info!(
-                device_pages = d.total_pages,
+                device_pages = d.chunks.kv_device_pages(),
                 host_chunks = d.chunks.host_chunks,
                 disk_chunks = d.chunks.disk_chunks,
                 chunk_bytes = d.chunks.chunk_bytes,
@@ -508,14 +516,14 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             );
         } else if kv_swap_capable {
             tracing::info!(
-                device_pages = d.total_pages,
-                host_pages = d.cpu_pages,
-                disk_pages = d.disk_pages,
+                device_pages = d.chunks.kv_device_pages(),
+                host_pages = d.chunks.kv_host_pages(),
+                disk_pages = d.chunks.kv_disk_pages(),
                 "kv tiers: suspended kv goes to the host, then the disk"
             );
         } else {
             tracing::warn!(
-                device_pages = d.total_pages,
+                device_pages = d.chunks.kv_device_pages(),
                 "no host or disk kv tier: pie cannot compute kv again, so kv \
                  pressure restarts processes"
             );
@@ -802,11 +810,6 @@ fn verify_config(config: &Config) -> Result<()> {
         model.tokenizer_path
     );
     for (i, dev) in model.engines.iter().enumerate() {
-        ensure!(
-            dev.total_pages > 0,
-            "Model {:?} engine {i}: total_pages must be > 0",
-            model.name
-        );
         ensure!(
             dev.limits.max_forward_tokens > 0,
             "Model {:?} engine {i}: max_forward_tokens must be > 0",

@@ -533,7 +533,7 @@ where
         let (max_lanes, max_tokens) = (shell.budget().max_lanes, shell.budget().max_tokens);
         let max_readouts = u32::try_from(poem_compiler::arena::readouts_ceiling(shell.budget()))
             .unwrap_or(u32::MAX);
-        let disk_kv_pages = shell
+        shell
             .seat_disk_kv(
                 disk_kv_budget,
                 disk_kv_dir.as_deref(),
@@ -548,7 +548,7 @@ where
 
         let paging = shell.paging();
 
-        let pools = shell.pool_facts(disk_kv_pages).map_err(fault)?;
+        let pools = shell.pool_facts().map_err(fault)?;
         let chunks = shell.chunk_facts().map_err(fault)?;
 
         let caps = Capabilities {

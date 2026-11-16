@@ -1,6 +1,5 @@
 //! What a load tells the runtime about its pool: the chunk facts of the one
-//! chunk pool ([`crate::store::Pools`]), the legacy pool facts the runtime
-//! reads until it counts chunks, and the compiler's on-device Metal recipe
+//! chunk pool ([`crate::store::Pools`]), the pool facts beside them, and the compiler's on-device Metal recipe
 //! the chunk size starts from.
 
 use engine::caps::PoolFacts;
@@ -12,36 +11,22 @@ use crate::error::Result;
 use crate::serve::Shell;
 
 impl Shell {
-    /// Today's pools, as the load states them; `disk_kv_pages` is what
-    /// [`Shell::seat_disk_kv`] seated.
+    /// What the load states beside its chunk facts.
     #[must_use]
-    pub fn pool_facts(&self, disk_kv_pages: u32) -> PoolFacts {
-        let paging = self.paging();
-        let state_rows = self
-            .trace()
-            .caches
-            .iter()
-            .any(|row| matches!(row, poem_ir::CacheRow::State { .. }));
+    pub fn pool_facts(&self) -> PoolFacts {
         PoolFacts {
-            kv_pages: u32::try_from(paging.pages()).unwrap_or(u32::MAX),
-            kv_page_size: paging.page_size,
-            state_slots: if state_rows { paging.slots } else { 0 },
-            state_slot_bytes: self.state_slot_bytes(),
             adapter_banks: self
                 .banks()
                 .iter()
                 .map(|&(_, adapters, _)| adapters)
                 .min()
                 .unwrap_or(0),
-            disk_kv_pages,
             seated_first: false,
             seat_to_end: false,
             seat_spread: false,
-            buffer_pages: self.buffer_pages(),
             // The sliding rows are paged in full here: the model's window
             // is a fact of the model, its pool is not.
             window_tokens: poem_exec::store::kv::declared_window(self.trace()).unwrap_or(0),
-            ..PoolFacts::default()
         }
     }
 

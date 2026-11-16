@@ -595,7 +595,7 @@ impl Engine for Metal {
         // where its budget is stated (it frees room in the pool's heap, not
         // memory), and suspended slots otherwise go straight to disk.
         shell.seat_tier(residency.host_kv_budget.unwrap_or(0));
-        let disk_kv_pages = shell
+        shell
             .seat_disk_kv(
                 residency.disk_kv_budget,
                 residency.disk_kv_dir.as_deref(),
@@ -619,7 +619,7 @@ impl Engine for Metal {
         let weights_warm = shell.weights_warm();
 
         let paging = shell.paging();
-        let pools = shell.pool_facts(disk_kv_pages);
+        let pools = shell.pool_facts();
         let chunks = shell.chunk_facts().map_err(fault)?;
         shell.log_chunk_recipe(&chunks);
 
