@@ -1800,3 +1800,85 @@ fn a_keep_that_moves_nothing_is_a_fold_and_a_recurrent_keep_buffers_a_suffix() {
     ));
     assert_eq!(store.folded(ws).unwrap(), 16, "a refused keep changes nothing");
 }
+
+#[test]
+fn a_request_with_the_kept_tokens_finds_no_page_a_dropping_keep_wrote() {
+    use super::keep::Outcome::{Commit, Drop};
+    // Three pages of 16 logged; folded at 20, page 0 sealed.
+    let fresh = |seed| {
+        let mut store = KvStore::new(16, h(seed));
+        store.set_page_size(16);
+        let ws = store.create_working_set();
+        commit_opaque(&mut store, ws, 3);
+        let tokens: Vec<u32> = (0..48).map(|t| 7_000 + t).collect();
+        store.log_rows(ws, 0, &tokens).unwrap();
+        assert_eq!(store.fold(ws, 20, false).unwrap(), 1);
+        (store, ws, tokens)
+    };
+    // The control: folding every row seals pages 1 and 2, and a request with
+    // the same tokens finds all three.
+    let (mut store, ws, tokens) = fresh(5);
+    assert_eq!(store.fold(ws, 48, false).unwrap(), 2);
+    assert_eq!(on_device(&mut store, &tokens), 3);
+    // A keep that drops 22..30 and commits the rest: the 40 kept tokens
+    // fill pages 0, 1 and half of 2. Folding them all seals nothing past
+    // page 0, and a request with the kept tokens finds page 0 alone.
+    let (mut store, ws, tokens) = fresh(5);
+    let outcomes: Vec<_> = (20..48)
+        .map(|slot| if (22..30).contains(&slot) { Drop } else { Commit })
+        .collect();
+    let landing = store
+        .fold_keep(ws, 48, &outcomes, false, false)
+        .unwrap()
+        .expect("rows move");
+    store.settle(landing.epoch);
+    let kept: Vec<u32> = tokens[..22].iter().chain(&tokens[30..]).copied().collect();
+    assert_eq!(store.logged(ws).unwrap(), kept.as_slice());
+    assert_eq!(store.fold(ws, 40, false).unwrap(), 0);
+    assert_eq!(on_device(&mut store, &kept[..32]), 1);
+}
+
+#[test]
+fn a_keep_on_a_forked_set_leaves_the_sibling_its_pages() {
+    use super::keep::Outcome::{Commit, Drop};
+    let mut store = KvStore::new(16, h(6));
+    store.set_page_size(16);
+    let ws = store.create_working_set();
+    commit_opaque(&mut store, ws, 3);
+    let tokens: Vec<u32> = (0..48).collect();
+    store.log_rows(ws, 0, &tokens).unwrap();
+    let child = store.fork(ws).unwrap();
+    let siblings = flat(&mut store, child);
+    let parents = flat(&mut store, ws);
+    assert_eq!(siblings, parents);
+    let outcomes: Vec<_> = (0..48)
+        .map(|slot| if (5..20).contains(&slot) { Drop } else { Commit })
+        .collect();
+    let landing = store
+        .fold_keep(ws, 48, &outcomes, false, false)
+        .unwrap()
+        .expect("rows move");
+    assert_eq!(flat(&mut store, child), siblings, "the sibling keeps its pages");
+    let fresh = flat(&mut store, ws);
+    assert!(
+        fresh.iter().all(|page| !siblings.contains(page)),
+        "the keep lands in pages the sibling does not read: {fresh:?} vs {siblings:?}"
+    );
+    for m in &landing.moves {
+        assert!(!siblings.contains(&m.dst_page_id), "a move writes a sibling page: {m:?}");
+    }
+    store.settle(landing.epoch);
+    store.retire_idle();
+    assert_eq!(flat(&mut store, child), siblings);
+    // Nothing the sibling reads went back to the pool: every page the pool
+    // still hands out is another.
+    let mut handed = Vec::new();
+    while let Some(mut pages) = store.reserve_device_pages(1) {
+        handed.append(&mut pages);
+    }
+    let handed: Vec<u32> = handed.iter().map(|id| id.0).collect();
+    assert!(
+        handed.iter().all(|page| !siblings.contains(page)),
+        "the pool hands out a page the sibling reads: {handed:?} vs {siblings:?}"
+    );
+}

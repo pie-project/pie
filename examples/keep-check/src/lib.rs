@@ -36,6 +36,17 @@ struct Input {
     /// keeping run wherever the dropped rows mattered.
     #[serde(default)]
     reference_sees_all: bool,
+    /// The forked-sibling gate: the keeping run forks its set after the
+    /// prefill and keeps on the original; the sibling then decodes plainly,
+    /// and answers bit for bit as a never-forked lane.
+    #[serde(default)]
+    fork: bool,
+    /// The fork's control: fork in the reference run, which never keeps.
+    #[serde(default)]
+    fork_in_reference: bool,
+    /// A probe: the keep buffers every column (moves and folds nothing).
+    #[serde(default)]
+    keep_nothing: bool,
 }
 
 fn default_mask_after() -> bool {
@@ -82,10 +93,42 @@ struct Output {
     keep_top2: Vec<[(i32, f32); 2]>,
     ref_top2: Vec<[(i32, f32); 2]>,
     same_tokens: bool,
+    /// With `fork`: whether the sibling's top-16 logits and tokens equal a
+    /// never-forked lane's at every step.
+    sibling_same: Option<bool>,
+    sibling_tokens: Option<Vec<u32>>,
+    never_forked_tokens: Option<Vec<u32>>,
+    /// With `fork`: each step's largest top-16 logit difference, sibling
+    /// against a never-forked lane, and a second never-forked lane against
+    /// the first (the run-to-run noise).
+    sibling_diff: Option<Vec<Option<f32>>>,
+    rerun_diff: Option<Vec<Option<f32>>>,
+    /// With `fork`: a lane never forked, prefilled and decoded in the same
+    /// pipeline as the keep, against one in a pipeline of its own.
+    alongside_diff: Option<Vec<Option<f32>>>,
+}
+
+/// Each step's largest difference in the top logits where both rank the
+/// same top four; `None` where they do not.
+fn diffs(a: &[(Vec<f32>, Vec<i32>)], b: &[(Vec<f32>, Vec<i32>)]) -> Vec<Option<f32>> {
+    a.iter()
+        .zip(b)
+        .map(|((a, a_ids), (b, b_ids))| {
+            (a_ids[..4] == b_ids[..4]).then(|| {
+                a.iter()
+                    .zip(b)
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0f32, f32::max)
+            })
+        })
+        .collect()
 }
 
 /// The column's outcome: 2 dropped, 1 buffered, 0 committed.
 fn outcome(column: u32, drop: (u32, u32), buffer_from: Option<u32>) -> u32 {
+    if buffer_from == Some(0) {
+        return 1;
+    }
     if drop.0 <= column && column < drop.1 {
         2
     } else if buffer_from.is_some_and(|from| column >= from) {
@@ -103,7 +146,8 @@ async fn run(
     keep: bool,
     mask_after: bool,
     hides: bool,
-) -> Result<(Vec<u32>, Vec<(Vec<f32>, Vec<i32>)>)> {
+    fork: bool,
+) -> Result<(Vec<u32>, Vec<(Vec<f32>, Vec<i32>)>, Option<(Steps, Steps)>)> {
     let n = prompt.len() as u32;
     let v = model::output_vocab_size();
     let buffered = (0..n + 1)
@@ -123,6 +167,9 @@ async fn run(
     });
     fwd.submit(&pipe).map_err(|e| format!("prefill: {e}"))?;
     let mut token = first.take_host::<i32>().await?;
+    let opening = token;
+    // Shares the prompt's pages, the boundary page among them, copy on write.
+    let sibling = if fork { Some(ws.fork(&pipe)?) } else { None };
 
     let mut tokens = Vec::with_capacity(steps);
     let mut logits = Vec::with_capacity(steps);
@@ -184,8 +231,86 @@ async fn run(
         tokens.push(t as u32);
         token = t;
     }
+    let sibling = match sibling {
+        Some(sibling) => {
+            let forked = plain(&pipe, &sibling, opening, n, steps).await?;
+            // A lane never forked, in the same pipeline after the keep.
+            let fresh = WorkingSet::new();
+            let toks = Channel::from(prompt.to_vec());
+            let indptr = Channel::from(vec![0u32, n]);
+            let first = Channel::new([1], dtype::i32);
+            let fwd = ForwardPass::new();
+            fwd.embed(&toks, &indptr)?;
+            fwd.state(&[&fresh], StateGeometry::default())?;
+            fwd.epilogue(move || {
+                first.put(reshape(reduce_argmax(intrinsics::output(0, "logits")), [1]));
+            });
+            fwd.submit(&pipe).map_err(|e| format!("fresh prefill: {e}"))?;
+            let token = first.take_host::<i32>().await?;
+            let alongside = plain(&pipe, &fresh, token, n, steps).await?;
+            Some((forked, alongside))
+        }
+        None => None,
+    };
     pipe.close();
+    Ok((tokens, logits, sibling))
+}
+
+/// A run's tokens and each step's top logits and their tokens.
+type Steps = (Vec<u32>, Vec<(Vec<f32>, Vec<i32>)>);
+
+/// `steps` plain decodes of `ws` from `token`, its rows from slot `n` on.
+async fn plain(pipe: &Pipeline, ws: &WorkingSet, mut token: i32, n: u32, steps: usize) -> Result<Steps> {
+    let _ = n;
+    let v = model::output_vocab_size();
+    let mut tokens = Vec::with_capacity(steps);
+    let mut logits = Vec::with_capacity(steps);
+    for step in 0..steps {
+        let tok = Channel::from(vec![token]);
+        let lane = Channel::from(vec![0u32, 1]);
+        let out_tok = Channel::new([1], dtype::i32);
+        let out_values = Channel::new([TOP], dtype::f32);
+        let out_ids = Channel::new([TOP], dtype::i32);
+        let fwd = ForwardPass::new();
+        fwd.embed(&tok, &lane)?;
+        fwd.state(&[ws], StateGeometry::default())?;
+        fwd.epilogue(move || {
+            let l = reshape(intrinsics::output(0, "logits"), [v]);
+            out_tok.put(reshape(reduce_argmax(&l), [1]));
+            let (values, ids) = top_k(&l, TOP);
+            out_values.put(&values);
+            out_ids.put(cast(&ids, dtype::i32));
+        });
+        fwd.submit(pipe).map_err(|e| format!("plain decode {step}: {e}"))?;
+        let t = out_tok.take_host::<i32>().await?;
+        let values = out_values.take_host::<Vec<f32>>().await?;
+        let ids = out_ids.take_host::<Vec<i32>>().await?;
+        logits.push((values, ids));
+        tokens.push(t as u32);
+        token = t;
+    }
     Ok((tokens, logits))
+}
+
+/// A never-forked lane: the prompt prefilled unfolded, then plain decodes.
+async fn never_forked(prompt: &[i32], steps: usize) -> Result<Steps> {
+    let n = prompt.len() as u32;
+    let ws = WorkingSet::new();
+    let pipe = Pipeline::new();
+    let toks = Channel::from(prompt.to_vec());
+    let indptr = Channel::from(vec![0u32, n]);
+    let first = Channel::new([1], dtype::i32);
+    let fwd = ForwardPass::new();
+    fwd.embed(&toks, &indptr)?;
+    fwd.state(&[&ws], StateGeometry::default())?;
+    fwd.epilogue(move || {
+        first.put(reshape(reduce_argmax(intrinsics::output(0, "logits")), [1]));
+    });
+    fwd.submit(&pipe).map_err(|e| format!("prefill: {e}"))?;
+    let token = first.take_host::<i32>().await?;
+    let steps = plain(&pipe, &ws, token, n, steps).await?;
+    pipe.close();
+    Ok(steps)
 }
 
 #[inferlet::main]
@@ -195,26 +320,55 @@ async fn main(input: Input) -> Result<Output> {
     let prompt: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     let n = prompt.len() as u32;
     let drop = (input.drop_from, input.drop_to);
+    let buffer_from = if input.keep_nothing { Some(0) } else { input.buffer_from };
     if !(drop.0 < drop.1 && drop.1 < n) {
         return Err(format!(
             "drop {drop:?} must lie inside the {n}-token prompt, before its last token"
         ));
     }
-    if input.buffer_from.is_some_and(|from| from < drop.1) {
+    if !input.keep_nothing && input.buffer_from.is_some_and(|from| from < drop.1) {
         return Err("buffer_from must come after the dropped rows (a suffix)".into());
     }
-    let (keep_tokens, keep_logits) =
-        run(&prompt, input.steps, drop, input.buffer_from, true, input.mask_after, true).await?;
-    let (mask_tokens, mask_logits) = run(
+    let (keep_tokens, keep_logits, sibling) = run(
         &prompt,
         input.steps,
         drop,
-        input.buffer_from,
+        buffer_from,
+        true,
+        input.mask_after,
+        true,
+        input.fork && !input.fork_in_reference,
+    )
+    .await?;
+    let (mask_tokens, mask_logits, ref_sibling) = run(
+        &prompt,
+        input.steps,
+        drop,
+        buffer_from,
         false,
         false,
         !input.reference_sees_all,
+        input.fork && input.fork_in_reference,
     )
     .await?;
+    let sibling = sibling.or(ref_sibling);
+    let mut alongside_diff = None;
+    let (sibling_same, sibling_tokens, never_forked_tokens, sibling_diff, rerun_diff) =
+        match sibling {
+            Some((sibling, alongside)) => {
+                let alone = never_forked(&prompt, input.steps).await?;
+                let again = never_forked(&prompt, input.steps).await?;
+                alongside_diff = Some(diffs(&alongside.1, &alone.1));
+                (
+                    Some(sibling == alone),
+                    Some(sibling.0.clone()),
+                    Some(alone.0.clone()),
+                    Some(diffs(&sibling.1, &alone.1)),
+                    Some(diffs(&again.1, &alone.1)),
+                )
+            }
+            None => (None, None, None, None, None),
+        };
     let top_diff = keep_logits
         .iter()
         .zip(&mask_logits)
@@ -248,5 +402,11 @@ async fn main(input: Input) -> Result<Output> {
         margin,
         keep_top2,
         ref_top2,
+        sibling_same,
+        sibling_tokens,
+        never_forked_tokens,
+        sibling_diff,
+        rerun_diff,
+        alongside_diff,
     })
 }
