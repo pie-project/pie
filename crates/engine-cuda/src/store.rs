@@ -1199,21 +1199,22 @@ impl Pools {
         let slots = u32::from(self.has_state());
         let least = chunks_at(layout, &self.paging, one_slot, slots);
         let need = self.chunk_bytes(least);
-        // A stated budget is the pool's before the bodies and programs are
+        // A stated budget is the cache rows' bytes, and the pool takes it
+        // beside the weights it holds, before the bodies and programs are
         // held anything; with none, one working set is, and beside it every
         // weight the pool would hold wherever the card holds them with the
         // programs (the activation's span already out of `live`): the
         // bodies are held out of what is left after the weights, so their
         // allowance never turns weights that fit into weights that stream.
         // A card short of that streams them (the runtime's call).
-        let whole = need.saturating_add(self.weight_pool_bytes());
-        let claim = self
-            .budget
-            .unwrap_or(if live >= whole.saturating_add(programs) {
-                whole
-            } else {
-                need
-            });
+        let weights = self.weight_pool_bytes();
+        let stated = self.budget.map(|budget| budget.saturating_add(weights));
+        let whole = need.saturating_add(weights);
+        let claim = stated.unwrap_or(if live >= whole.saturating_add(programs) {
+            whole
+        } else {
+            need
+        });
         let (bodies, programs) = holds_within(bodies, programs, live.saturating_sub(claim));
         let stretch = if stretch && !settled && self.budget.is_none() {
             live.saturating_sub(claim)
@@ -1226,14 +1227,21 @@ impl Pools {
         let bodies = bodies.saturating_add(stretch);
         let held = programs.saturating_add(bodies);
         let room = live.saturating_sub(held);
-        if let Some(budget) = self.budget.filter(|&budget| budget > room) {
+        if let Some(budget) = self
+            .budget
+            .filter(|&budget| budget.saturating_add(weights) > room)
+        {
             return Err(Fault::Residency(
-                engine::fit::Short::Budget { budget, room }.to_string(),
+                engine::fit::Short::Budget {
+                    budget,
+                    room: room.saturating_sub(weights),
+                }
+                .to_string(),
             ));
         }
         // Whole map units of the room, in whole chunks, of the range's.
         let unit = self.chunks.map_unit().max(1);
-        let limit = self.budget.unwrap_or(room) / unit * unit;
+        let limit = stated.unwrap_or(room) / unit * unit;
         let fitted = match engine::chunk::fit(limit, chunk, 0, least) {
             Ok(chunks) => chunks.min(self.chunks.total()),
             Err(_) if self.budget.is_some() => {

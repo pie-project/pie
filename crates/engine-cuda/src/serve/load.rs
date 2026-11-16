@@ -771,12 +771,12 @@ impl Shell {
         let regions =
             crate::synth::Regions::load(&boot.trace, &folded, &anchored, &device.ctx().tuning())?;
         let (free_before, device_total) = crate::store::device_memory()?;
-        // The pool's address space is reserved for every page its bytes
-        // could hold, the stated budget or the share of the card before the
-        // weights land; `Pools::fit_the_card` sizes it within that.
-        let pool_bytes = boot.kv_budget.unwrap_or_else(|| {
-            crate::device::elastic::budget_bytes(free_before, device_total, boot.memory_share)
-        });
+        // The pool's address space is reserved for every page the share of
+        // the card could hold before the weights land, which holds the
+        // weights beside any stated budget; `Pools::fit_the_card` sizes it
+        // within that.
+        let pool_bytes =
+            crate::device::elastic::budget_bytes(free_before, device_total, boot.memory_share);
         let paging = Paging::of(
             boot.page_size,
             boot.context,
