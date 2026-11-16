@@ -238,9 +238,11 @@ impl Cuda {
         if let Some((replay, shell)) = self.replay.zip(self.shell.as_ref())
             && frame.steps.iter().any(|step| {
                 replay
-                    .split(step, |word| {
-                        shell.trace().facts.plain(word) && !shell.wide(word)
-                    })
+                    .split(
+                        step,
+                        |word| shell.trace().facts.plain(word) && !shell.wide(word),
+                        &shell.placed_lanes(step),
+                    )
                     .is_some()
             })
         {
@@ -1324,9 +1326,11 @@ impl Cuda {
                 .replay
                 .zip(self.shell.as_ref())
                 .and_then(|(replay, shell)| {
-                    replay.split(step, |word| {
-                        shell.trace().facts.plain(word) && !shell.wide(word)
-                    })
+                    replay.split(
+                        step,
+                        |word| shell.trace().facts.plain(word) && !shell.wide(word),
+                        &shell.placed_lanes(step),
+                    )
                 });
             if let Some((head, _)) = &split
                 && let Err(error) = self.fire_step(head, at, false)
@@ -1461,8 +1465,7 @@ impl Cuda {
             }
             records.push(record);
         }
-        // The lane's list refs are its table of pages, or, where a program
-        // places its rows, the table that translates the program's pages.
+        // The lane's refs of `shape`: the kv list's, or a window list's.
         fn table(lane: &engine::fire::Lane, shape: engine::chunk::ShapeId) -> Option<&[u32]> {
             lane.tables
                 .iter()
@@ -1479,6 +1482,13 @@ impl Cuda {
                     .collect()
             })
             .collect();
+        // A lane bound to no record carries no state: where the load holds
+        // state and lanes name refs, it reads and writes the null record.
+        let unbound = shell.null_record();
+        // A lane whose program places its rows (a device-geometry instance)
+        // names, in its list table, the working set's mapped pages its
+        // program's pages index; any other lane's list table is its pages.
+        let placed = shell.placed_lanes(submission);
         let seated: Vec<Seated<'_>> = submission
             .lanes
             .iter()
@@ -1491,26 +1501,27 @@ impl Cuda {
                         tokens: &lane.tokens,
                     },
                     positions: &lane.positions,
-                    pages: match table(lane, LIST) {
-                        Some(refs) if by_refs && lane.kv.translation.is_empty() => refs,
-                        _ => &lane.kv.pages,
+                    pages: if placed[at] {
+                        &[]
+                    } else {
+                        table(lane, LIST).unwrap_or(&[])
                     },
-                    held: (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
+                    held: table(lane, LIST)
+                        .filter(|_| !placed[at])
+                        .map(|_| lane.kv.held),
                     kv_less: lane.kv_less,
-                    translation: match table(lane, LIST) {
-                        Some(refs) if by_refs && !lane.kv.translation.is_empty() => refs,
-                        _ => &lane.kv.translation,
+                    translation: if placed[at] {
+                        table(lane, LIST).unwrap_or(&[])
+                    } else {
+                        &[]
                     },
-                    window: match table(lane, WINDOW) {
-                        Some(refs) if by_refs => refs,
-                        _ => &lane.kv.window,
-                    },
-                    more_windows: if by_refs { &more_windows[at] } else { &[] },
+                    window: table(lane, WINDOW).unwrap_or(&[]),
+                    more_windows: &more_windows[at],
                     mask: lane.mask.as_ref(),
                     adapter: lane_adapters[at].or(lane.adapter),
                     rs: lane.rs.clone(),
                     rs_reset: lane.rs_reset,
-                    rs_slot: records[at].map(|(_, written)| written).or(lane.rs_slot),
+                    rs_slot: records[at].map(|(_, written)| written).or(unbound),
                     rs_read: records[at].map(|(run, _)| run),
                     rs_snapshots: &lane.rs_snapshots,
                     readout: match &lane.readout {
