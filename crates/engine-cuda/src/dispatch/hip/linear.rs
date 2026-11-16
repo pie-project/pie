@@ -864,7 +864,15 @@ impl Run<'_> {
                     kernels_cuda::tensor::Tensor::new(x.ptr, rows, x.width / groups_nz, x.dtype);
                 let mut y =
                     kernels_cuda::tensor::Tensor::new(y.ptr, rows, y.width / groups_nz, y.dtype);
-                let (bank, experts) = self.expert_bank(*w);
+                // A split-plane (affine) projection is read as its bf16,
+                // decoded into a scratch a fire; a dense one where it lies.
+                let (bank, experts) = match self.maybe_planes(*w) {
+                    Some((codes, ..)) => (
+                        self.dense_or_decoded(OP, *w, codes.rows, x.width)?,
+                        linear::moe::ExpertTable::RESIDENT,
+                    ),
+                    None => self.expert_bank(*w),
+                };
                 // The weight is the groups' [n, k] blocks stacked as one
                 // [groups·n, k] matrix; the select reads it as `groups`
                 // experts of n·k, the shape its expert-ordered legs take.
