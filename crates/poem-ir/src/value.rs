@@ -234,6 +234,11 @@ impl Selection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RuntimeInput {
     Tokens,
+    /// `[Tokens]` i32: each row's lane's next token, the token of the row
+    /// after it in the same lane; a lane's last row, whose next token the
+    /// fire samples, holds its own. The input of a draft head fed, at row
+    /// i, the token i + 1 (vLLM's speculator shifts its ids so).
+    NextTokens,
     Positions,
     MropePositions,
     /// Each lane's mask bits over the All axis.

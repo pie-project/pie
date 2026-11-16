@@ -230,6 +230,22 @@ impl Input {
             .refined(self.over.clone())
     }
 
+    /// Each row's lane's next token: row i's is row i + 1's token in the
+    /// same lane, and a lane's last row holds its own (its next is the one
+    /// the fire samples, which a forward puts there itself).
+    #[must_use]
+    pub fn next_tokens(&self) -> Value {
+        self.rec
+            .input(
+                RuntimeInput::NextTokens,
+                Ty::Tensor {
+                    shape: vec![Dim::Tokens],
+                    dtype: Dtype::I32,
+                },
+            )
+            .refined(self.over.clone())
+    }
+
     #[must_use]
     pub fn positions(&self) -> Value {
         self.rec

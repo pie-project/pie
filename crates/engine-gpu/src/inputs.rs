@@ -129,6 +129,9 @@ pub struct Handles {
 
     pub request_of_token: Tensor,
 
+    /// Each row's lane's next token ([`next_tokens`]).
+    pub next_tokens: Tensor,
+
     pub mask: Tensor,
 
     pub mask_enabled: Tensor,
@@ -238,6 +241,7 @@ pub struct Inputs<B: Backend> {
     pieces: u32,
     adapter_routes: u64,
     request_of_token: u64,
+    next_tokens: u64,
     mask_planes: u64,
     mask_plane_bytes: u64,
     mask_enabled: u64,
@@ -314,6 +318,7 @@ impl<B: Backend> Inputs<B> {
 
         let adapter_routes = take(rows * 4);
         let request_of_token = take(rows * 4);
+        let next_tokens = take(rows * 4);
 
         let context = u64::from(paging.pages_per_slot) * u64::from(paging.page_size);
         let mask_stride = u32::try_from(context).unwrap_or(u32::MAX);
@@ -392,6 +397,7 @@ impl<B: Backend> Inputs<B> {
             pieces,
             adapter_routes,
             request_of_token,
+            next_tokens,
             mask_planes,
             mask_plane_bytes,
             mask_enabled,
@@ -552,6 +558,10 @@ impl<B: Backend> Inputs<B> {
         self.store.write(self.slot_ids, bytes_of(fire.slot_ids))?;
         self.store
             .write(self.request_of_token, bytes_of(fire.request_of_token))?;
+        self.store.write(
+            self.next_tokens,
+            bytes_of(&next_tokens(fire.tokens, fire.request_of_token)),
+        )?;
         self.store
             .write(self.slot_of_row, bytes_of(fire.slot_of_row))?;
         let rs_tables = match (fire.rs_replay, fire.rs_commit) {
@@ -921,6 +931,7 @@ impl<B: Backend> Inputs<B> {
                 Dtype::U8,
             ),
             request_of_token: i32s(handles, &self.store, self.request_of_token, rows)?,
+            next_tokens: i32s(handles, &self.store, self.next_tokens, rows)?,
 
             mask: Tensor::new(
                 handles.bind(
@@ -1038,4 +1049,18 @@ fn rows_table(into: &mut Vec<i32>, staged: &[i32], rows: u32) {
     into.clear();
     into.extend_from_slice(staged);
     into.resize(rows as usize, -1);
+}
+
+/// Each row's lane's next token, staged from the lane of each row: row i's
+/// is row i + 1's token when that row is the same lane's; a lane's last row
+/// holds its own (its next is the one the fire samples, which the forward
+/// puts there).
+#[must_use]
+pub fn next_tokens(tokens: &[i32], lane_of_row: &[i32]) -> Vec<i32> {
+    (0..tokens.len())
+        .map(|row| match (lane_of_row.get(row), lane_of_row.get(row + 1)) {
+            (Some(here), Some(next)) if here == next && row + 1 < tokens.len() => tokens[row + 1],
+            _ => tokens[row],
+        })
+        .collect()
 }

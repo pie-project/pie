@@ -3074,6 +3074,15 @@ pub(crate) static INPUTS: &[Op] = &[
     },
     Op {
         module: "inputs",
+        name: "next_tokens",
+        params: &["inputs"],
+        call: |a, heap| {
+            let inputs: Input = a.next()?;
+            result(heap, dsl("inputs.next_tokens", || inputs.next_tokens())?)
+        },
+    },
+    Op {
+        module: "inputs",
         name: "positions",
         params: &["inputs"],
         call: |a, heap| {

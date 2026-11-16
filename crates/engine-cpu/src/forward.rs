@@ -302,6 +302,11 @@ impl Forward {
                     width: 1,
                     v: tokens.iter().map(|&t| t as i32).collect(),
                 },
+                Def::Input(RuntimeInput::NextTokens) => Held::Ints {
+                    rows: n,
+                    width: 1,
+                    v: next_tokens(tokens),
+                },
                 Def::Input(RuntimeInput::Positions) => Held::Ints {
                     rows: n,
                     width: 1,
@@ -514,8 +519,39 @@ impl Run<'_> {
             Operation::Gather(op) => self.gather(op),
             Operation::Linear(op) => self.linear(op),
             Operation::Collective(op) => self.collective(op),
+            Operation::Sampling(poem_ir::Sampling::Argmax { xs, y }) => self.argmax(xs, *y),
             other => Err(format!("`{}` has no host forward", Operands::name(other))),
         }
+    }
+
+    /// Each row's first largest column of each of `xs`, side by side.
+    fn argmax(&mut self, xs: &[ValueId], y: ValueId) -> Result<(), String> {
+        let mut rows = None;
+        let mut picks: Vec<Vec<i32>> = Vec::with_capacity(xs.len());
+        for &x in xs {
+            let x = self.floats(x)?;
+            rows = Some(x.rows);
+            picks.push(
+                (0..x.rows)
+                    .map(|r| {
+                        let row = x.row(r);
+                        let mut best = 0;
+                        for (c, &v) in row.iter().enumerate() {
+                            if v > row[best] {
+                                best = c;
+                            }
+                        }
+                        best as i32
+                    })
+                    .collect(),
+            );
+        }
+        let rows = rows.ok_or("an argmax over no value")?;
+        let v = (0..rows)
+            .flat_map(|r| picks.iter().map(move |p| p[r]))
+            .collect();
+        self.put_ints(y, rows, xs.len(), v);
+        Ok(())
     }
 
     fn attn(&mut self, op: &Attn) -> Result<(), String> {
@@ -922,6 +958,34 @@ impl Run<'_> {
                 }
                 let rows = picks.rows;
                 self.put(y, rows, out)
+            }
+            Gather::ScatterRows {
+                src,
+                routes,
+                y,
+                y_out,
+            } => {
+                let (rows, out) = {
+                    let (from, at, into) =
+                        (self.floats(src)?, self.ints(routes)?, self.floats(y)?);
+                    if from.width != into.width || from.rows != at.rows {
+                        return Err(format!(
+                            "a scatter of {} rows of {} into rows of {} by {} routes",
+                            from.rows, from.width, into.width, at.rows
+                        ));
+                    }
+                    let (rows, width) = (into.rows, into.width);
+                    let mut out = into.v.to_vec();
+                    for (src_row, &dst) in at.v.iter().enumerate() {
+                        let dst = dst as usize;
+                        if dst >= rows {
+                            return Err(format!("a scatter to row {dst} of {rows}"));
+                        }
+                        out[dst * width..(dst + 1) * width].copy_from_slice(from.row(src_row));
+                    }
+                    (rows, out)
+                };
+                self.put(y_out, rows, out)
             }
             _ => Err(format!("`{}` has no host forward", Operands::name(op))),
         }
@@ -1373,4 +1437,16 @@ impl Run<'_> {
             _ => Err(format!("`{}` has no host forward", Operands::name(op))),
         }
     }
+}
+
+/// The step's lane's next token at each row: row i + 1's, and the last
+/// row its own (the token the step samples goes there in the forward).
+#[must_use]
+pub fn next_tokens(tokens: &[u32]) -> Vec<i32> {
+    tokens
+        .iter()
+        .skip(1)
+        .chain(tokens.last())
+        .map(|&t| t as i32)
+        .collect()
 }

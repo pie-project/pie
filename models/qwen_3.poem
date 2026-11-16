@@ -1149,12 +1149,13 @@ def forward(m, inputs):
     if dr != None:
         hb = arm(dr, inputs, fused, h_block, block_rows(dr))
         x = merge([hb, x])
+    every_row = x
     x = ops.gather.gather_rows(x, inputs.readout_rows())
     logits = ops.linear.lm_head(x, head)
     if dr != None:
         plant_readout(dr, logits, inputs, x, block_rows(dr))
     if m.mtp != None:
-        draft(m, inputs, x, logits, head)
+        draft(m, inputs, every_row, logits, head)
     elif m.dflash == None and m.layers[-1].attn != None and not m.layers[-1].mlp.routed:
         draft_self(m, inputs, x, logits, head)
     output("logits", logits)
@@ -1167,13 +1168,22 @@ def mlp(x, f):
     return run_moe(x, f)
 
 def draft(m, inputs, x, logits, head):
+    """The MTP head over every token row of a drafting lane, fed at row i
+    the trunk's hidden h_i and the embedding of token i + 1, as the MTP
+    designs (DeepSeek-V3's, Qwen3-Next's) and vLLM's speculator feed it:
+    the lane's next token (`inputs.next_tokens()`), and at a row read out
+    the token the trunk samples there. A prompt reads out its last row
+    alone, so its head runs over each prompt position with the true next
+    token; a verify window reads out every row, each fed its sample. The
+    head's lm_head runs at the read-out rows alone."""
     mtp = m.mtp
     input_draft = inputs.on(fact.drafts())
     dpos = input_draft.positions()
     plan = ops.attn.plan_prefill(input_draft, m.q_heads, m.kv_heads, m.head_dim, None)
     hidden = x.on(fact.drafts())
-    chosen = ops.sampling.argmax([logits.on(fact.drafts())])
-    e = ops.gather.embed(chosen, m.embed, m.vocab)
+    sampled = ops.gather.embed(ops.sampling.argmax([logits.on(fact.drafts())]), m.embed, m.vocab)
+    nexts = ops.gather.embed(input_draft.next_tokens(), m.embed, m.vocab)
+    e = ops.gather.scatter_rows(sampled, input_draft.readout_rows(), nexts)
     if mtp.pre_fc != None:
         pre = mtp.pre_fc
         e = ops.elemwise.rmsnorm_plus_one(e, pre.embedding, pre.eps)
@@ -1191,7 +1201,7 @@ def draft(m, inputs, x, logits, head):
     dy = ops.elemwise.residual_add(f, dy)
 
     read = ops.elemwise.rmsnorm_plus_one(dy, mtp.norm, mtp.norm_eps) if mtp.norm != None else dy
-    proposal = ops.linear.lm_head(read, head)
+    proposal = ops.linear.lm_head(ops.gather.gather_rows(read, input_draft.readout_rows()), head)
     output("mtp.logits", proposal)
     output("mtp.drafts", ops.sampling.argmax([proposal, proposal, proposal, proposal]))
 

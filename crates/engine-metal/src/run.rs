@@ -1546,6 +1546,10 @@ impl<'c> Run<'c> {
         let at = id.0 as usize;
         match &self.values[at].def {
             Def::Input(RuntimeInput::Tokens) => self.fire.tokens,
+            Def::Input(RuntimeInput::NextTokens) => panic!(
+                "value {at} reads each row's next token, which this engine stages none of: \
+                 its load refuses such a trace"
+            ),
             Def::Input(RuntimeInput::ReadoutRows) => self.fire.readout_rows,
             Def::Input(RuntimeInput::Positions) => self.fire.positions,
             Def::Input(RuntimeInput::Mask) => self.fire.tables.mask,

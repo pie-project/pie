@@ -177,6 +177,8 @@ pub struct Handles {
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<PackingHandles>,
     pub lane_of_row: Tensor,
+    /// Each row's lane's next token (`Fire::next_tokens`).
+    pub next_tokens: Tensor,
     /// The fire's rs tables, when it buffers recurrent rows.
     pub rs: Option<RsHandles>,
 }
@@ -302,6 +304,10 @@ pub struct Fire<'a> {
     pub mask: Option<&'a crate::mask::Staged>,
     pub live_rows: u32,
     pub lane_of_row: &'a [i32],
+    /// Each row's lane's next token: row i's is row i + 1's token in the
+    /// same lane, a lane's last row its own (the forward puts the sampled
+    /// one there). One a staged row, as `lane_of_row`.
+    pub next_tokens: &'a [i32],
     pub lane_reach: u32,
     pub group_of_lane: &'a [i32],
     pub packings: &'a [PackingFire<'a>],
@@ -559,6 +565,7 @@ pub struct Inputs {
     mrope_bytes: u64,
     seats: Vec<SeatAt>,
     lane_of_row: u64,
+    next_tokens: u64,
     group_of_lane: u64,
     packings: Vec<PackingAt>,
     page_tables: Vec<TableAt>,
@@ -661,6 +668,7 @@ impl Inputs {
             })
             .collect();
         let lane_of_row = take(rows * 4);
+        let next_tokens = take(rows * 4);
         let group_of_lane = take(lanes * 4);
         let packings: Vec<PackingAt> = (0..selections)
             .map(|_| PackingAt {
@@ -773,6 +781,7 @@ impl Inputs {
             mrope_bytes: if mrope.is_some() { rows * AXES * 4 } else { 0 },
             seats,
             lane_of_row,
+            next_tokens,
             group_of_lane,
             packings,
             page_tables,
@@ -978,6 +987,21 @@ impl Inputs {
             self.lane_of_row,
             bytes_of(fire.lane_of_row),
             "staged lane of row",
+        )?;
+        if fire.next_tokens.len() != rows as usize {
+            return Err(crate::error::Fault::program(
+                "inputs::write_host",
+                format!(
+                    "this fire stages {} next tokens for {rows} rows; the table is one token \
+                     a staged row, padding included",
+                    fire.next_tokens.len()
+                ),
+            ));
+        }
+        put(
+            self.next_tokens,
+            bytes_of(fire.next_tokens),
+            "staged next tokens",
         )?;
         put(self.slot_ids, bytes_of(fire.state_ids), "staged slot ids")?;
         let tabled = fire.state_ids.len() != fire.slot_ids.len();
@@ -1344,6 +1368,7 @@ impl Inputs {
         let at_readout_live = self.readout_live;
         let places: Vec<TableAt> = self.page_tables.clone();
         let at_lane_of_row = self.lane_of_row;
+        let at_next_tokens = self.next_tokens;
         let at_group_of_lane = self.group_of_lane;
         let packing_places: Vec<PackingAt> = self.packings.clone();
         let rs_at = self.rs;
@@ -1394,6 +1419,7 @@ impl Inputs {
         }
         copy(at_row_valid, rows as usize)?;
         copy(at_lane_of_row, rows as usize * 4)?;
+        copy(at_next_tokens, rows as usize * 4)?;
         copy(at_readouts, readouts as usize * 4)?;
         copy(at_readout_live, 4)?;
         copy(at_slot_ids, *state_ids as usize * 4)?;
@@ -1491,6 +1517,7 @@ impl Inputs {
             group_of_lane: packed.then(|| i32s(base + at_group_of_lane, table_lanes)),
             packings,
             lane_of_row: i32s(base + at_lane_of_row, rows),
+            next_tokens: i32s(base + at_next_tokens, rows),
             rs,
         })
     }
@@ -1624,4 +1651,22 @@ fn u32_bytes_of(values: &[u32]) -> &[u8] {
     unsafe {
         core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), core::mem::size_of_val(values))
     }
+}
+
+/// Each staged row's lane's next token: row i's is row i + 1's token when
+/// that row is live and the same lane's; a lane's last row and a pad row
+/// hold their own.
+#[must_use]
+pub fn next_tokens(tokens: &[i32], lane_of_row: &[i32], live: u32) -> Vec<i32> {
+    let live = live as usize;
+    (0..tokens.len())
+        .map(|row| {
+            let next = row + 1;
+            if next < live.min(tokens.len()) && lane_of_row.get(next) == lane_of_row.get(row) {
+                tokens[next]
+            } else {
+                tokens[row]
+            }
+        })
+        .collect()
 }

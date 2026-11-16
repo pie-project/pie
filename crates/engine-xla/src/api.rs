@@ -441,6 +441,13 @@ impl Engine for Xla {
             ordinal,
             frames_in_flight,
         } = request;
+        if trace.reads_next_tokens() {
+            return Err(Error::unsupported(
+                "xla",
+                "a trace reading each row's next token (`inputs.next_tokens`), a table this \
+                 engine does not stage yet",
+            ));
+        }
         let mut boot = self.boot.clone();
         // A fire's inputs wait in the staging ring until it runs: one slot
         // for each frame in flight, and the one being written.

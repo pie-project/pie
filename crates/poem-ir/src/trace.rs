@@ -285,6 +285,21 @@ pub struct Trace {
     pub inputs: Vec<GuestInput>,
 }
 
+impl Trace {
+    /// Whether a value of it reads each row's lane's next token
+    /// ([`crate::RuntimeInput::NextTokens`]), a table an engine stages per
+    /// fire or refuses the trace by name.
+    #[must_use]
+    pub fn reads_next_tokens(&self) -> bool {
+        self.values.iter().any(|decl| {
+            matches!(
+                decl.def,
+                crate::value::Def::Input(crate::value::RuntimeInput::NextTokens)
+            )
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuestInput {
     pub name: String,

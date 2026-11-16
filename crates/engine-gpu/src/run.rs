@@ -159,6 +159,9 @@ pub enum StructSlot {
 pub struct FireBindings {
     pub tokens: Tensor,
 
+    /// Each row's lane's next token (`inputs::next_tokens`).
+    pub next_tokens: Tensor,
+
     pub positions: Tensor,
 
     pub readout_rows: Tensor,
@@ -623,6 +626,7 @@ impl<'c, B: Backend> Run<'c, B> {
         let at = id.0 as usize;
         match &self.values[at].def {
             Def::Input(RuntimeInput::Tokens) => self.fire.tokens,
+            Def::Input(RuntimeInput::NextTokens) => self.fire.next_tokens,
             Def::Input(RuntimeInput::ReadoutRows) => self.fire.readout_rows,
             Def::Input(RuntimeInput::Positions) => self.fire.positions,
 

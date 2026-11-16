@@ -3778,6 +3778,7 @@ impl<B: Serve> Shell<B> {
             tokens_host: (!B::RECORDS).then(|| std::sync::Arc::from(tokens.as_slice())),
             group_masks,
             tokens: bound.tokens,
+            next_tokens: bound.next_tokens,
             positions: bound.positions,
             readout_rows: bound.readout_rows,
 

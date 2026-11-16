@@ -1867,6 +1867,10 @@ impl Shell {
             }
         }
 
+        // Each row's lane's next token: the row after it in the same lane,
+        // a lane's last row (and a pad) its own.
+        let next_tokens = crate::inputs::next_tokens(&tokens, &lane_of_row, rows);
+
         let mut qo_absolute: Vec<i32> = Vec::new();
         let mut lane_carve = composition.lane_count();
         if bodied {
@@ -1909,6 +1913,7 @@ impl Shell {
                 live_rows: rows,
                 lane_reach: lane_carve,
                 lane_of_row: &lane_of_row,
+                next_tokens: &next_tokens,
                 group_of_lane: &group_of_lane,
                 packings: &packing_fires,
                 rs: rs_body.buffers().then_some(crate::inputs::RsFire {

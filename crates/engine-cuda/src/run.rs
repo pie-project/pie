@@ -369,6 +369,8 @@ pub struct FireBindings {
     pub clip_lanes: Option<Tensor>,
 
     pub lane_of_row: Tensor,
+    /// Each row's lane's next token (`inputs::next_tokens`).
+    pub next_tokens: Tensor,
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<(poem_ir::Selection, crate::inputs::PackingHandles)>,
 
@@ -1834,6 +1836,7 @@ impl<'c> Run<'c> {
         let at = id.0 as usize;
         match &self.values[at].def {
             Def::Input(RuntimeInput::Tokens) => self.fire.tokens,
+            Def::Input(RuntimeInput::NextTokens) => self.fire.next_tokens,
             Def::Input(RuntimeInput::ReadoutRows) => self.fire.readout_rows,
             Def::Input(RuntimeInput::Positions) => self.fire.positions,
             Def::Input(RuntimeInput::Mask) => {
