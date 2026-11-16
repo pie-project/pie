@@ -164,7 +164,6 @@ pub struct Seated<'a> {
     pub readout: Option<&'a [u32]>,
     pub rs: &'a engine::fire::RsVerb,
     pub rs_reset: engine::fire::RsReset,
-    pub rs_slot: Option<u32>,
     /// Rows inside the lane whose recurrent state also lands in a slot of
     /// its own (`Lane::rs_snapshots`).
     pub rs_snapshots: &'a [engine::fire::RsSnapshot],
@@ -174,7 +173,7 @@ pub struct Seated<'a> {
     /// seat `lane.slot`'s own runs of the pool.
     pub refs: bool,
     /// The record the fire reads and writes, a slot ref a piece
-    /// (`Lane::fixed`'s cow side); `None`: `rs_slot`, else the seat's.
+    /// (`Lane::fixed`'s cow side); `None`: the seat's.
     pub record: Option<&'a [u32]>,
     /// The record's run side where it differs from `record` (a group's
     /// copy-on-write): a lane that folds nothing reads its state there
@@ -208,7 +207,6 @@ impl<'a> Seated<'a> {
             translation: &[],
             rs: &FOLD,
             rs_reset: engine::fire::RsReset::Inferred,
-            rs_slot: None,
             rs_snapshots: &[],
             refs: false,
             record: None,
@@ -1440,12 +1438,7 @@ impl Shell {
     /// The physical pieces of the record a lane's state sits in: the one
     /// its slot refs name, else its seat's.
     fn record_of(&self, seated: &Seated<'_>) -> Result<Vec<u32>> {
-        match (seated.record, seated.rs_slot) {
-            (Some(refs), _) => self.pools.record(Some(refs), seated.lane.slot),
-            (None, Some(slot)) if seated.refs => Ok(vec![self.pools.state_slot(slot, false)?]),
-            (None, Some(slot)) => self.pools.record(None, slot),
-            (None, None) => self.pools.record(None, seated.lane.slot),
-        }
+        self.pools.record(seated.record, seated.lane.slot)
     }
 
     /// The physical slot a lane's one-piece state sits in.

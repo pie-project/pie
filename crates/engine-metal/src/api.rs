@@ -1225,9 +1225,11 @@ impl Metal {
                 ))
             })?;
         }
-        // A lane stating its slot tables names its kv pages and its state
-        // record there; until the runtime states them, the legacy fields
-        // carry the same slot refs.
+        // A lane names its kv pages, its window pages and its state record
+        // in its slot tables (CONTRACT-BC 4): this engine states one shared
+        // pool, so the runtime states them. A device-geometry lane's list
+        // table is its working set's whole mapped table, which its ports'
+        // page indexes translate through.
         let mut pages_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
         let mut record_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
         let mut run_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
@@ -1240,11 +1242,9 @@ impl Metal {
                     .find(|(shape, _)| *shape == crate::store::layout::LIST)
                     .map(|(_, refs)| refs.clone()),
             );
-            // One table a window list, in the load's order; until the
-            // runtime states them, the legacy window pages are the first
-            // list's.
+            // One table a window list, in the load's order.
             let lists = shell.pool_layout().window_lists().count();
-            let mut windows: Vec<Vec<u32>> = crate::store::layout::WINDOWS[..lists]
+            let windows: Vec<Vec<u32>> = crate::store::layout::WINDOWS[..lists]
                 .iter()
                 .map(|id| {
                     lane.tables
@@ -1254,11 +1254,6 @@ impl Metal {
                         .unwrap_or_default()
                 })
                 .collect();
-            if let Some(first) = windows.first_mut()
-                && first.is_empty()
-            {
-                first.clone_from(&lane.kv.window);
-            }
             window_of.push(windows);
             let fixed = lane
                 .fixed
@@ -1305,9 +1300,8 @@ impl Metal {
                     },
                     group: lane.group,
                     inputs: &lane.inputs,
-                    pages: pages_of[at].as_deref().unwrap_or(&lane.kv.pages),
-                    held: (!lane.kv.pages.is_empty() || pages_of[at].is_some())
-                        .then_some(lane.kv.held),
+                    pages: pages_of[at].as_deref().unwrap_or(&[]),
+                    held: pages_of[at].is_some().then_some(lane.kv.held),
                     mask: lane.mask.as_ref(),
                     kv_less: lane.kv_less,
                     adapter: lane_adapters[at].or(lane.adapter),
@@ -1316,10 +1310,9 @@ impl Metal {
                         Readout::Rows(rows) => Some(rows.as_slice()),
                         Readout::Last | Readout::None => None,
                     },
-                    translation: &lane.kv.translation,
+                    translation: pages_of[at].as_deref().unwrap_or(&[]),
                     rs: &lane.rs,
                     rs_reset: lane.rs_reset,
-                    rs_slot: lane.rs_slot,
                     rs_snapshots: &lane.rs_snapshots,
                     refs: true,
                     record: record_of[at].as_deref(),
