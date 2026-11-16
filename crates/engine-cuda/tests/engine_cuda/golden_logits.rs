@@ -2600,9 +2600,20 @@ fn golden_two_fresh_loads_time_nothing() {
     let model =
         std::env::var("PIE_GOLDEN_FRESH").unwrap_or_else(|_| "qwen38-flash-next-mini".to_string());
     let fixture = fixture(&model, &cache);
+    let dir_of =
+        |n: u32| std::env::temp_dir().join(format!("pie-fresh-tactics-{}-{n}", std::process::id()));
+    // The probe's homes go when it ends, passing or not.
+    struct Homes<F: Fn(u32) -> std::path::PathBuf>(F);
+    impl<F: Fn(u32) -> std::path::PathBuf> Drop for Homes<F> {
+        fn drop(&mut self) {
+            for n in 0..3 {
+                let _ = std::fs::remove_dir_all((self.0)(n));
+            }
+        }
+    }
+    let _homes = Homes(dir_of);
     let fresh = |n: u32| {
-        let dir =
-            std::env::temp_dir().join(format!("pie-fresh-tactics-{}-{n}", std::process::id()));
+        let dir = dir_of(n);
         let _ = std::fs::remove_dir_all(&dir);
         let mut knobs = knobs();
         knobs.profiles = Some(dir);
