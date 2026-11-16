@@ -777,8 +777,10 @@ pub fn map_geometry_evaluated_with(
     };
     let device_keep = || EvaluatedGeometryError::BadValue {
         port: Port::Keep,
-        reason: "a keep the device computes is read back when its fire settles, which this \
-                 runtime does not do yet; state the keep from the host"
+        reason: "a keep is stated from the host: take the keep channel the device computed to \
+                 the host (`take_host`) and bind the values as the keeping pass's keep \
+                 (`Fold::Keep` over a host channel); the keeping fire waits on the fire before \
+                 it either way"
             .to_string(),
     };
     let fold = match optional_u32(Port::Keep) {

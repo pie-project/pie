@@ -443,7 +443,11 @@ class StateGeometry:
     """`[lanes, n]` u32, the fold that sorts a lane's buffer: per column (slot `folded() + c`), 0
     commits it, 1 leaves it buffered, 2 drops it. Committed columns freeze at `folded()` in order,
     buffered ones follow, dropped ones go. On a model with recurrent state the buffered columns are a
-    suffix. A lane alone on its working set; not with `fold` (a fold of `n` commits the first `n`)."""
+    suffix. A lane alone on its working set; not with `fold` (a fold of `n` commits the first `n`).
+
+    A keep is stated from the host: one the device computes is taken to the host (`take_host`) and
+    bound as a host channel; keep every few hundred steps and hide evicted rows with the mask between.
+    Per-slot state the guest holds follows the keep with `compact`."""
 
     @staticmethod
     def folding(**fields) -> "StateGeometry":
@@ -812,3 +816,26 @@ def scale(e: AdapterExpr, l: Channel) -> AdapterExpr:  # noqa: E741
     return AdapterExpr("scale", l, e)
 
 
+
+
+KEEP_COMMIT = 0
+"""A keep's column is committed."""
+KEEP_BUFFER = 1
+"""A keep's column stays buffered."""
+KEEP_DROP = 2
+"""A keep's column is dropped."""
+
+
+def keep_order(folded: int, keep: Sequence[int]) -> list[int]:
+    """Where each slot from `folded` on comes from after `keep`: committed columns' slots, then buffered ones'."""
+    commit = [folded + c for c, at in enumerate(keep) if at == KEEP_COMMIT]
+    buffer = [folded + c for c, at in enumerate(keep) if at == KEEP_BUFFER]
+    return commit + buffer
+
+
+def compact(values: Sequence, folded: int, keep: Sequence[int], fill) -> list:
+    """`values`, one a slot, as the slots stand after `keep`: those below `folded`, the kept ones, `fill` after."""
+    out = list(values[: min(folded, len(values))])
+    out += [values[slot] for slot in keep_order(folded, keep) if slot < len(values)]
+    out += [fill] * (len(values) - len(out))
+    return out

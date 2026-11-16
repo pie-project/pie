@@ -5410,8 +5410,9 @@ async fn fire_device_geometry<C: FireContext>(
     // Rows the device places land where the host learns only at settle; a
     // keep sorts rows the host places.
     if keeps {
-        return Ok(Err("pipeline: a keep on a pass whose rows the device places; a keep \
-                       sorts the buffer of a lane the host places"
+        return Ok(Err("pipeline: a keep on a pass whose rows the device places; a keep sorts \
+                       the buffer of a lane the host places, stated from the host (take a keep \
+                       the device computed to the host and bind it as the keeping pass's keep)"
             .to_string()));
     }
     // A recurrent state a device-counted fold left unsettled is read where

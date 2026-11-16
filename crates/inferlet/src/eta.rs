@@ -450,12 +450,85 @@ pub enum Fold<'a> {
     /// sharing a working set fold by the first one's.
     Count(&'a Channel),
     /// `[lanes, n]` u32: per column of the lane's buffer (slot `folded + c`),
-    /// 0 commits it, 1 leaves it buffered, 2 drops it. The committed columns
-    /// are frozen at `folded ..` in order, the buffered ones follow, the
-    /// dropped ones go; nothing below `folded` changes. On a model with
-    /// recurrent state the buffered columns are a suffix. A lane alone on
-    /// its working set. `Count(n)` is the keep that commits the first `n`.
+    /// [`keep::COMMIT`] commits it, [`keep::BUFFER`] leaves it buffered,
+    /// [`keep::DROP`] drops it. The committed columns are frozen at
+    /// `folded ..` in order, the buffered ones follow, the dropped ones go;
+    /// nothing below `folded` changes, and a row with no stated position
+    /// keeps the one it had. On a model with recurrent state the buffered
+    /// columns are a suffix. A lane alone on its working set. `Count(n)` is
+    /// the keep that commits the first `n`.
+    ///
+    /// A keep is stated from the host. One the device computes (from scores
+    /// in an epilogue) is taken to the host and bound as a host channel; the
+    /// keeping fire waits on the fire before it either way. Keep every few
+    /// hundred steps, not every step, and hide evicted rows with the mask in
+    /// between: they are buffered, so the mask may hide them. Per-slot state
+    /// the guest holds follows the keep with [`keep::compact`].
+    ///
+    /// ```ignore
+    /// // Every `cadence` steps: the outcomes the epilogue computed, then the keep.
+    /// let outcomes: Vec<u32> = keep_out.take_host().await?;
+    /// let keep = Channel::from_shaped([1, outcomes.len() as u32], outcomes.clone());
+    /// fwd.state(&[&ws], StateGeometry { fold: Fold::Keep(&keep), ..StateGeometry::default() })?;
+    /// scores = keep::compact(&scores, ws.folded(), &outcomes, 0.0);
+    /// ```
     Keep(&'a Channel),
+}
+
+/// What a keep ([`Fold::Keep`]) does with each column, and per-slot state
+/// that follows it.
+pub mod keep {
+    /// The column is committed: frozen at the set's committed length, in
+    /// order.
+    pub const COMMIT: u32 = 0;
+    /// The column stays buffered, after the committed ones.
+    pub const BUFFER: u32 = 1;
+    /// The column is dropped.
+    pub const DROP: u32 = 2;
+
+    /// Where each slot from `folded` on comes from after the keep `keep`
+    /// over a set folded at `folded`: the committed columns' slots, then the
+    /// buffered ones'.
+    #[must_use]
+    pub fn order(folded: u32, keep: &[u32]) -> Vec<u32> {
+        let slots = |outcome| {
+            keep.iter()
+                .enumerate()
+                .filter(move |&(_, &at)| at == outcome)
+                .map(move |(column, _)| folded + column as u32)
+        };
+        slots(COMMIT).chain(slots(BUFFER)).collect()
+    }
+
+    /// `values`, one a slot of a set folded at `folded`, as the slots stand
+    /// after the keep `keep`: the ones below `folded` unchanged, then the
+    /// kept slots' in [`order`], then `fill` to the same length.
+    #[must_use]
+    pub fn compact<T: Copy>(values: &[T], folded: u32, keep: &[u32], fill: T) -> Vec<T> {
+        let below = (folded as usize).min(values.len());
+        let mut out: Vec<T> = values[..below].to_vec();
+        out.extend(
+            order(folded, keep)
+                .into_iter()
+                .filter_map(|slot| values.get(slot as usize).copied()),
+        );
+        out.resize(values.len(), fill);
+        out
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{BUFFER as B, COMMIT as C, DROP as D, compact, order};
+
+        #[test]
+        fn a_keep_lands_its_committed_slots_then_its_buffered_ones() {
+            // Folded at 2; columns 2.. commit, drop, buffer, commit, drop.
+            let keep = [C, D, B, C, D];
+            assert_eq!(order(2, &keep), vec![2, 5, 4]);
+            let values = [10, 11, 12, 13, 14, 15, 16, 17];
+            assert_eq!(compact(&values, 2, &keep, 0), vec![10, 11, 12, 15, 14, 0, 0, 0]);
+        }
+    }
 }
 
 /// Where a pass's rows land and what they read. Left out, rows append, are
