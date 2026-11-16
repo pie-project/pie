@@ -44,7 +44,7 @@ pub const MEASURED: &[([u32; 3], f64)] = &[
     ([2560, 32, 9216], 0.4800),  // Qwen3.5 4B
     ([1024, 24, 3584], 0.2920),  // Qwen3.5 0.8B
     ([4096, 36, 12288], 0.5505), // Qwen3-8B
-    ([4096, 32, 14336], 0.4850), // Llama 3.1 8B
+    ([4096, 32, 14336], 0.4700), // Llama 3.1 8B
     ([1536, 35, 6144], 0.6830),  // Gemma 4 E2B
     ([2560, 42, 10240], 0.8765), // Gemma 4 E4B
     ([3840, 48, 15360], 0.9495), // Gemma 4 12B
@@ -120,16 +120,17 @@ mod tests {
         assert!(lr(10, 2, 2) <= lr(10, 2, 0) + 80.0);
     }
 
-    /// What moving a pinned plan's keys did to the bare step on the chip (requests 1151-1306),
-    /// from the keys the chip ran first, and what the model predicts it does: the same way where
-    /// the chip moved past its noise (5 µs: Llama's VR=216 and VR=180 ran in different sessions),
-    /// and within 6 µs of each but where the chains' cycles alone come short. The chains' critical
-    /// path gives each swept model the chip's best G2 (12 on the Qwen3.5s, E4B and Qwen3-8B, 16 on
-    /// the 12B, 8 of E2B's 8 / 16 / 24) but gpt-oss's (its row chains' halves are 64 attention and
-    /// 288 MoE columns, and the long half makes G2=8 cost 2.6 µs where the chip gained 2.5). It
-    /// gives the G2 moves about half their size on the chip (E4B's G2=12: 7 µs of 21, held at
-    /// 15), and the 0.8B's PX move and the 4B's PY move, which moved the chains with the KV and
-    /// the span, 12 and 7 µs short.
+    /// What moving a pinned plan's keys did to the bare step on the chip (requests 1151-1306 and
+    /// 1456), from the keys the chip ran first, and what the model predicts it does: the same way
+    /// where the chip moved past its noise (5 µs: Llama's VR=216 and VR=180 ran in different
+    /// sessions), and within 6 µs of each but where the chains' cycles alone come short. The
+    /// chains' critical path gives each swept model the chip's best G2 (12 on the Qwen3.5s, E4B
+    /// and Qwen3-8B, 16 on the 12B, 8 of E2B's 8 / 16 / 24) but gpt-oss's (its row chains' halves
+    /// are 64 attention and 288 MoE columns, and the long half makes G2=8 cost 2.6 µs where the
+    /// chip gained 2.5). It gives the G2 moves about half their size on the chip (E4B's G2=12:
+    /// 7 µs of 21, held at 15; Llama's G2=11, its pin since: 5 µs of 15, held at 11), and the
+    /// 0.8B's PX move and the 4B's PY move, which moved the chains with the KV and the span, 12
+    /// and 7 µs short.
     #[test]
     fn the_model_follows_the_chip_moves() {
         let l = "llama31-8b-bf16-kv-bf16";
@@ -143,10 +144,11 @@ mod tests {
         let o = "gptoss-20b-bf16-mxfp4-kv-bf16";
         #[rustfmt::skip]
         let moves = [
-            (l, "l3-8b", "VR=216", "VR=112", 0.488, 0.485, 6.0),
-            (l, "l3-8b", "VR=216", "VR=144", 0.488, 0.4865, 6.0),
-            (l, "l3-8b", "VR=216", "VR=180", 0.488, 0.4915, 6.0),
-            (l, "l3-8b", "", "G2=8", 0.485, 0.486, 6.0),
+            (l, "l3-8b", "G2=16,HR=1153,VR=216", "G2=16,HR=1153", 0.488, 0.485, 6.0),
+            (l, "l3-8b", "G2=16,HR=1153,VR=216", "G2=16,HR=1153,VR=144", 0.488, 0.4865, 6.0),
+            (l, "l3-8b", "G2=16,HR=1153,VR=216", "G2=16,HR=1153,VR=180", 0.488, 0.4915, 6.0),
+            (l, "l3-8b", "G2=16,HR=1153", "G2=8,HR=1153", 0.485, 0.486, 6.0),
+            (l, "l3-8b", "G2=16,HR=1153", "", 0.485, 0.470, 11.0),
             (q08, "0.8b", "G2=16", "PX=128,G2=10,G2Y=10", 0.296, 0.321, 12.5),
             (q08, "0.8b", "G2=16", "G2=8", 0.297, 0.2965, 6.0),
             (q08, "0.8b", "G2=16", "", 0.297, 0.292, 6.0),

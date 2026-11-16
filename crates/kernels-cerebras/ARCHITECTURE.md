@@ -331,7 +331,8 @@ gpt-oss's layer less than nothing: only the 4B's PY / NE move moves both, so the
 the chains' rate from the KV's. The columns cost nothing the chip resolves (`SPAN_COL` 0): halving
 the 0.8B's cost what its doubled matvec and KV elements do. Each layer's own cost is read off the
 measured step of the model's pinned plan (`time::MEASURED`: the bare step where the chip ran it,
-else Pie decode; a model the chip has not run takes the median).
+else Pie decode; a model the chip has not run takes the median). Llama's G2=11 (request 1456: 0.470
+ms from 0.485, not in the fit) is its pin since; the model gives it 5 µs of the 15.
 
 `cost::memory` is the PE image model. The bytes a partition moves are the weight PE's (its K
 layers' tiles, its KV cache, its scores' buffers) and the head PE's (its vocabulary rows' tiles and
