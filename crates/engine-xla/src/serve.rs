@@ -502,13 +502,7 @@ impl Shell {
                 device.kind()
             );
         }
-        let mut tuning = kernels_xla::tuning::Tuning::on(&chip, tpu.vmem_bytes());
-        // `PIE_XLA_MOE_GMM=0`: routed MLPs take no grouped-matmul (Mosaic)
-        // kernel, as the other Mosaic switches turn theirs off (a GPU
-        // plugin runs none).
-        if std::env::var("PIE_XLA_MOE_GMM").is_ok_and(|v| v == "0") {
-            tuning.moe_path = kernels_xla::tuning::MoePath::Auto { gmm: false };
-        }
+        let tuning = kernels_xla::tuning::Tuning::on(&chip, tpu.vmem_bytes());
         let engine = crate::chip::Engine::of(&chip);
         let pad = engine.pad;
         let mut boot = Boot {
@@ -628,11 +622,7 @@ impl Shell {
 
         // Windowed kv rows live in their own pool, a window per sequence
         // (engine-cuda `serve/load.rs`).
-        let window = if boot.device.window_pool {
-            crate::store::window_of(&boot.trace)?
-        } else {
-            None
-        };
+        let window = crate::store::window_of(&boot.trace)?;
         let paging_at = |pages: u64, slots: u32| -> Result<Paging> {
             Ok(Paging::of(boot.page_size, boot.context, slots, pages)?
                 .windowed(window, boot.budget.max_tokens)

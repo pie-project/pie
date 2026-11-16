@@ -39,9 +39,6 @@ pub(super) fn conv_step(
     let Some((pool, Elem::Bf16)) = f.view_parts(slab) else {
         return Ok(None);
     };
-    if !crate::blocks::on() {
-        return Ok(None);
-    }
     let (t, c) = (f.dims(x)[0], f.dims(x)[1]);
     let taps = f.dims(w)[1];
     let width = f.dims(slab)[1];

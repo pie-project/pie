@@ -551,15 +551,13 @@ fn tables(f: &mut Func, pos: Val, rows: i64, t: &Turn) -> Result<(Val, Val), Err
 /// more by their halves (`(i, i + d/2)`, one position axis): the sines and
 /// cosines are the table's, `[rows, d]` once a fire, each head's partner its
 /// halves crossed (a lane rotation). XLA lays the same rows out as `[rows,
-/// heads, d]` in f32, and back. `None` where it does not apply
-/// (`PIE_XLA_ROPE_KERNEL=0` turns it off).
+/// heads, d]` in f32, and back. `None` where it does not apply.
 fn turn_tall(f: &mut Func, x: Val, pos: Val, t: &Turn) -> Result<Option<Val>, Error> {
     use crate::mosaic::{Body, Grid, Kernel, Operand as Block, Sem, Window};
     let dims = f.dims(x).to_vec();
     let (rows, width) = (dims[0], dims[1]);
     let unit = t.unit;
-    if std::env::var("PIE_XLA_ROPE_KERNEL").is_ok_and(|v| v == "0")
-        || f.elem(x) != Elem::Bf16
+    if f.elem(x) != Elem::Bf16
         || rows < TALL_ROWS
         || !unit.is_multiple_of(128)
         || width % unit as i64 != 0
@@ -759,10 +757,7 @@ const LEAST_HEAD: i64 = 256;
 fn normed_rows(f: &Func, n: &Normed, t: &Turn) -> Option<i64> {
     use super::norm::{KERNEL_FROM, KERNEL_ROWS, KERNEL_WIDTH};
     let (rows, width, u) = (i64::from(n.x.rows), i64::from(n.x.width), t.unit as i64);
-    let off = |var: &str| std::env::var(var).is_ok_and(|v| v == "0");
-    if off("PIE_XLA_NORM_KERNEL")
-        || off("PIE_XLA_ROPE_KERNEL")
-        || f.elem(n.x.val) != Elem::Bf16
+    if f.elem(n.x.val) != Elem::Bf16
         || i64::from(n.weight.rows) * i64::from(n.weight.width) != u
         || rows < KERNEL_FROM
         || u < LEAST_HEAD

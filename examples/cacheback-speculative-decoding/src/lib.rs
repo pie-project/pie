@@ -44,6 +44,19 @@ struct Input {
     ckpt_sync: bool,
     #[serde(default)]
     rollback_mode: Option<String>,
+    /// Throughput-bench mode, named by the caller and never inferred: drafts
+    /// are accepted unverified and stop tokens are ignored, so every round
+    /// runs the full `draft_length + 1` window. The output is NOT the model's
+    /// answer. Off unless the request says `"bench_accept": true`.
+    #[serde(default)]
+    bench_accept: bool,
+    /// DIAGNOSTIC: report, for every generated token, the top-1 and top-2
+    /// logits of the row that produced it (`top_trace`, `margin_trace`), so a
+    /// parting between two runs reads as a near-tie or a real gap, and two
+    /// runs' logits can be compared row by row. A `top_k` over the vocabulary
+    /// in every fire's epilogue.
+    #[serde(default)]
+    margin: bool,
 }
 
 fn default_prompt() -> String {
@@ -93,6 +106,10 @@ struct Output {
     drafted: usize,
     accepted: usize,
     acceptance_rate: f64,
+    /// With `margin`: per token, the top-1 logit of the row that chose it.
+    top_trace: Vec<f32>,
+    /// With `margin`: per token, top-1 minus top-2 of that row.
+    margin_trace: Vec<f32>,
 }
 
 fn draft_from_cache(tokens: &[u32], draft_length: usize, max_ngram: usize) -> Vec<u32> {
@@ -129,7 +146,8 @@ async fn fire(
     base: u32,
     fold: Option<u32>,
     last_only: bool,
-) -> Result<Vec<u32>> {
+    margin: bool,
+) -> Result<(Vec<u32>, Vec<[f32; 2]>)> {
     let rows = tokens.len() as u32;
     let total = base + rows;
 
@@ -139,6 +157,8 @@ async fn fire(
     let read = if last_only { rows - 1 } else { 0 };
     let readout = Channel::from_iter(read..rows);
     let truth_out = Channel::new([rows - read], dtype::i32);
+    let read_rows = rows - read;
+    let top_out = margin.then(|| Channel::new([read_rows * 2], dtype::f32));
     let fold_len = fold.map(|n| Channel::from([n]));
     let fold = match &fold_len {
         Some(count) => Fold::Count(count),
@@ -157,79 +177,153 @@ async fn fire(
         },
     )?;
     fwd.epilogue(move || {
-        truth_out.put(reduce_argmax(intrinsics::output(0, "logits")));
+        let logits = intrinsics::output(0, "logits");
+        truth_out.put(reduce_argmax(&logits));
+        if let Some(top_out) = &top_out {
+            let (top, _) = top_k(&logits, 2);
+            top_out.put(reshape(top, [read_rows * 2]));
+        }
     });
     fwd.submit(pipeline).context("verify-and-extend")?;
 
-    Ok(truth_out
+    let truth = truth_out
         .take_host::<Vec<i32>>()
         .await?
         .into_iter()
         .map(|t| t as u32)
-        .collect())
+        .collect();
+    let tops = match top_out {
+        Some(top_out) => top_out
+            .take_host::<Vec<f32>>()
+            .await?
+            .chunks_exact(2)
+            .map(|pair| [pair[0], pair[1]])
+            .collect(),
+        None => Vec::new(),
+    };
+    Ok((truth, tops))
 }
 
-#[inferlet::main]
-async fn main(input: Input) -> Result<Output> {
-    let empty = || Output {
-        sampler: "cacheback-speculative",
-        text: String::new(),
-        tokens: Vec::new(),
-        prompt_tokens: 0,
-        count: 0,
-        draft_length: input.draft_length,
-        verification_steps: 0,
-        stopped: false,
-        drafted: 0,
-        accepted: 0,
-        acceptance_rate: 0.0,
-    };
-    if input.max_tokens == 0 {
-        return Ok(empty());
-    }
-
-    let k = input.draft_length as u32;
-    let w_max = k + 1;
-
-    let mut prompt = if let Some(toks) = input.prompt_tokens {
-        toks
-    } else {
-        let mut p = chat::system_user("Continue the requested text.", &input.prompt);
-        p.extend(chat::cue_without_thinking());
-        p
-    };
-    if prompt.is_empty() {
-        prompt.push(0);
-    }
-    let n = prompt.len() as u32;
-    let stop_tokens = if input.ignore_eos {
+/// What the decode loop needs from the target model: one greedy verify fire,
+/// and the checkpoint `ckpt_sync` takes before it and restores after.
+trait Target {
+    /// Writes `tokens` to slots `base..`, folding `fold` survivors (all when
+    /// `None`), and answers each read row's argmax — only the last row's when
+    /// `last_only`.
+    async fn fire(
+        &mut self,
+        tokens: &[u32],
+        base: u32,
+        fold: Option<u32>,
+        last_only: bool,
+    ) -> Result<Vec<u32>>;
+    fn checkpoint(&mut self) -> Result<()>;
+    /// Returns to the last checkpoint; `false` when none was taken.
+    fn restore(&mut self) -> bool;
+    /// The last fire's rows' top-1 and top-2 logits, when it reports them.
+    fn tops(&mut self) -> Vec<[f32; 2]> {
         Vec::new()
-    } else {
-        chat::stop_tokens()
-    };
-    let stream = input.stream;
+    }
+}
 
-    let mut ws = WorkingSet::new();
-    let pipeline = Pipeline::new();
+struct Live {
+    ws: WorkingSet,
+    pipeline: Pipeline,
+    ckpt: Option<WorkingSet>,
+    margin: bool,
+    tops: Vec<[f32; 2]>,
+}
 
-    let truth = fire(&ws, &pipeline, &prompt, 0, None, true).await?;
+impl Target for Live {
+    async fn fire(
+        &mut self,
+        tokens: &[u32],
+        base: u32,
+        fold: Option<u32>,
+        last_only: bool,
+    ) -> Result<Vec<u32>> {
+        let (truth, tops) = fire(
+            &self.ws,
+            &self.pipeline,
+            tokens,
+            base,
+            fold,
+            last_only,
+            self.margin,
+        )
+        .await?;
+        self.tops = tops;
+        Ok(truth)
+    }
+
+    fn tops(&mut self) -> Vec<[f32; 2]> {
+        std::mem::take(&mut self.tops)
+    }
+
+    fn checkpoint(&mut self) -> Result<()> {
+        self.ckpt = Some(
+            self.ws
+                .fork(&self.pipeline)
+                .context("ckpt_sync fork before verify")?,
+        );
+        Ok(())
+    }
+
+    fn restore(&mut self) -> bool {
+        match self.ckpt.take() {
+            Some(restored) => {
+                self.ws = restored;
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+struct Decoded {
+    generated: Vec<u32>,
+    /// Per generated token, its row's top-1 and top-2 logits, when the
+    /// target reports them.
+    tops: Vec<[f32; 2]>,
+    verification_steps: usize,
+    stopped: bool,
+    drafted: usize,
+    accepted: usize,
+}
+
+/// The prefill, then speculative rounds until a stop token or `max_tokens`.
+/// `emit(n)` hears each batch of `n > 0` newly committed tokens.
+async fn decode<T: Target>(
+    target: &mut T,
+    input: &Input,
+    prompt: &[u32],
+    stop_tokens: &[u32],
+    mut emit: impl FnMut(usize),
+) -> Result<Decoded> {
+    let w_max = input.draft_length + 1;
+    let n = prompt.len() as u32;
+
+    let truth = target.fire(prompt, 0, None, true).await?;
     let first = *truth.last().expect("a prefill answers its last row");
+    let seed_top = target.tops().last().copied();
+    let mut tops: Vec<[f32; 2]> = Vec::new();
 
-    let mut committed: Vec<u32> = prompt.clone();
+    let mut committed: Vec<u32> = prompt.to_vec();
     let mut generated: Vec<u32> = Vec::with_capacity(input.max_tokens);
     let (mut verification_steps, mut drafted, mut accepted) = (1usize, 0usize, 0usize);
 
+    // Bench mode is the caller's explicit choice; a long request with drafts
+    // is an ordinary request and gets verified tokens.
+    let bench_accept = input.bench_accept && input.draft_length > 0;
     // The seed token is the first thing the model said: nothing drafted it,
     // so nothing can reject it.
-    let bench_accept = input.max_tokens >= 128 && input.draft_length > 0;
     let mut x = first;
     let mut stopped = !bench_accept && stop_tokens.contains(&x);
     if !stopped {
         committed.push(x);
         generated.push(x);
-        if stream {
-            inferlet::session::send("t:1");
-        }
+        tops.extend(seed_top);
+        emit(1);
     }
     let mut base = n;
     let mut survivors: u32 = 0;
@@ -249,11 +343,11 @@ async fn main(input: Input) -> Result<Output> {
         let prev_len = generated.len();
         // ── The window: the pending correct token, then the drafts.
         let drafts = draft_from_cache(&committed, input.draft_length, input.max_ngram);
-        let mut window = Vec::with_capacity(w_max as usize);
+        let mut window = Vec::with_capacity(w_max);
         window.push(x);
         window.extend(drafts.iter().copied());
         if bench_accept {
-            while window.len() < w_max as usize {
+            while window.len() < w_max {
                 window.push(x);
             }
         }
@@ -261,20 +355,22 @@ async fn main(input: Input) -> Result<Output> {
         let proposed = window.len() - 1;
         drafted += proposed;
 
+        // Each window row's top-1/top-2, row `i` the one choosing window[i + 1].
+        let mut row_tops: Vec<[f32; 2]> = Vec::new();
         let (m, correction) = if is_stop_wait {
             let mut m = 0usize;
             let mut corr = 0u32;
             for idx in 0..window.len() {
-                let step_truth = fire(
-                    &ws,
-                    &pipeline,
-                    &window[idx..=idx],
-                    base + idx as u32,
-                    Some(if idx == 0 { survivors } else { 1 }),
-                    true,
-                )
-                .await?;
+                let step_truth = target
+                    .fire(
+                        &window[idx..=idx],
+                        base + idx as u32,
+                        Some(if idx == 0 { survivors } else { 1 }),
+                        true,
+                    )
+                    .await?;
                 verification_steps += 1;
+                row_tops.extend(target.tops().first().copied());
                 let pred = step_truth[0];
                 if idx < proposed
                     && (window[idx + 1] == pred
@@ -288,14 +384,13 @@ async fn main(input: Input) -> Result<Output> {
             }
             (m, corr)
         } else {
-            let mut ckpt = if is_ckpt_sync {
-                Some(ws.fork(&pipeline).context("ckpt_sync fork before verify")?)
-            } else {
-                None
-            };
+            if is_ckpt_sync {
+                target.checkpoint()?;
+            }
             let fold = if is_ckpt_sync { None } else { Some(survivors) };
-            let truth = fire(&ws, &pipeline, &window, base, fold, false).await?;
+            let truth = target.fire(&window, base, fold, false).await?;
             verification_steps += 1;
+            row_tops = target.tops();
 
             // ── Verify: the longest matching prefix, and nothing after it.
             let mut m = 0usize;
@@ -305,11 +400,8 @@ async fn main(input: Input) -> Result<Output> {
             if bench_accept {
                 m = proposed.saturating_sub(1);
             }
-            if is_ckpt_sync {
-                if let Some(restored) = ckpt.take() {
-                    ws = restored;
-                    let _ = fire(&ws, &pipeline, &window[..=m], base, None, true).await?;
-                }
+            if is_ckpt_sync && target.restore() {
+                let _ = target.fire(&window[..=m], base, None, true).await?;
             }
             (m, truth[m])
         };
@@ -319,38 +411,37 @@ async fn main(input: Input) -> Result<Output> {
 
         // ── Commit `window[1 ..= m]` — `window[0]` was committed last round as
         //    the correction that produced it — then the new correction.
-        for &token in &window[1..=m] {
+        for (row, &token) in window[1..=m].iter().enumerate() {
             if !bench_accept && stop_tokens.contains(&token) {
                 stopped = true;
                 break;
             }
             committed.push(token);
             generated.push(token);
+            tops.extend(row_tops.get(row).copied());
             if generated.len() == input.max_tokens {
                 break;
             }
         }
         if stopped || generated.len() == input.max_tokens {
             let emitted = generated.len() - prev_len;
-            if stream && emitted > 0 {
-                inferlet::session::send(&format!("t:{emitted}"));
+            if emitted > 0 {
+                emit(emitted);
             }
             break;
         }
         if !bench_accept && stop_tokens.contains(&correction) {
             stopped = true;
             let emitted = generated.len() - prev_len;
-            if stream && emitted > 0 {
-                inferlet::session::send(&format!("t:{emitted}"));
+            if emitted > 0 {
+                emit(emitted);
             }
             break;
         }
         committed.push(correction);
         generated.push(correction);
-        let emitted = generated.len() - prev_len;
-        if stream && emitted > 0 {
-            inferlet::session::send(&format!("t:{emitted}"));
-        }
+        tops.extend(row_tops.get(m).copied());
+        emit(generated.len() - prev_len);
 
         // Only the accepted run advances the sequence and survives in the
         // buffer; the next fire folds it ahead of its own rows.
@@ -358,6 +449,75 @@ async fn main(input: Input) -> Result<Output> {
         survivors = if is_stop_wait { 1 } else { (m + 1) as u32 };
         x = correction;
     }
+
+    Ok(Decoded {
+        generated,
+        tops,
+        verification_steps,
+        stopped,
+        drafted,
+        accepted,
+    })
+}
+
+#[inferlet::main]
+async fn main(input: Input) -> Result<Output> {
+    let empty = || Output {
+        sampler: "cacheback-speculative",
+        text: String::new(),
+        tokens: Vec::new(),
+        prompt_tokens: 0,
+        count: 0,
+        draft_length: input.draft_length,
+        verification_steps: 0,
+        stopped: false,
+        drafted: 0,
+        accepted: 0,
+        acceptance_rate: 0.0,
+        top_trace: Vec::new(),
+        margin_trace: Vec::new(),
+    };
+    if input.max_tokens == 0 {
+        return Ok(empty());
+    }
+
+    let mut prompt = if let Some(toks) = input.prompt_tokens.clone() {
+        toks
+    } else {
+        let mut p = chat::system_user("Continue the requested text.", &input.prompt);
+        p.extend(chat::cue_without_thinking());
+        p
+    };
+    if prompt.is_empty() {
+        prompt.push(0);
+    }
+    let stop_tokens = if input.ignore_eos {
+        Vec::new()
+    } else {
+        chat::stop_tokens()
+    };
+    let stream = input.stream;
+
+    let mut target = Live {
+        ws: WorkingSet::new(),
+        pipeline: Pipeline::new(),
+        ckpt: None,
+        margin: input.margin,
+        tops: Vec::new(),
+    };
+    let Decoded {
+        generated,
+        tops,
+        verification_steps,
+        stopped,
+        drafted,
+        accepted,
+    } = decode(&mut target, &input, &prompt, &stop_tokens, |emitted| {
+        if stream {
+            inferlet::session::send(&format!("t:{emitted}"));
+        }
+    })
+    .await?;
 
     let acceptance_rate = if drafted == 0 {
         0.0
@@ -376,5 +536,158 @@ async fn main(input: Input) -> Result<Output> {
         drafted,
         accepted,
         acceptance_rate,
+        top_trace: tops.iter().map(|t| t[0]).collect(),
+        margin_trace: tops.iter().map(|t| t[0] - t[1]).collect(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::Future;
+    use std::pin::pin;
+    use std::task::{Context, Poll, Waker};
+
+    /// A greedy model with no device: the next token is a fixed function of
+    /// the three before it. Its cache is the slot array a fire writes, so a
+    /// rejected draft left in a slot the next fire does not overwrite would
+    /// change what it answers — exactly the leak the equivalence would catch.
+    struct Toy {
+        slots: Vec<u32>,
+        saved: Option<Vec<u32>>,
+        /// The last fire's rows, top-1 standing for the token each chose.
+        tops: Vec<[f32; 2]>,
+    }
+
+    fn next(context: &[u32]) -> u32 {
+        let at = |back: usize| u64::from(context[context.len().saturating_sub(back)]);
+        let h = at(1) * 31 + at(2) * 17 + at(3) * 7;
+        100 + (h % 5) as u32
+    }
+
+    impl Target for Toy {
+        async fn fire(
+            &mut self,
+            tokens: &[u32],
+            base: u32,
+            _fold: Option<u32>,
+            last_only: bool,
+        ) -> Result<Vec<u32>> {
+            let base = base as usize;
+            assert!(base <= self.slots.len(), "a fire past the written slots");
+            self.slots.truncate(base);
+            self.slots.extend_from_slice(tokens);
+            let rows = tokens.len();
+            let from = if last_only { rows - 1 } else { 0 };
+            let truth: Vec<u32> = (from..rows)
+                .map(|row| next(&self.slots[..=base + row]))
+                .collect();
+            self.tops = truth.iter().map(|&t| [t as f32, 0.0]).collect();
+            Ok(truth)
+        }
+
+        fn tops(&mut self) -> Vec<[f32; 2]> {
+            std::mem::take(&mut self.tops)
+        }
+
+        fn checkpoint(&mut self) -> Result<()> {
+            self.saved = Some(self.slots.clone());
+            Ok(())
+        }
+
+        fn restore(&mut self) -> bool {
+            match self.saved.take() {
+                Some(saved) => {
+                    self.slots = saved;
+                    true
+                }
+                None => false,
+            }
+        }
+    }
+
+    fn ready<F: Future>(f: F) -> F::Output {
+        let mut f = pin!(f);
+        match f.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(out) => out,
+            Poll::Pending => panic!("the toy target never waits"),
+        }
+    }
+
+    fn request(max_tokens: usize, draft_length: usize, mode: &str) -> Input {
+        Input {
+            prompt: String::new(),
+            prompt_tokens: None,
+            max_tokens,
+            draft_length,
+            max_ngram: default_max_ngram(),
+            stream: false,
+            ignore_eos: false,
+            ckpt_sync: false,
+            rollback_mode: Some(mode.into()),
+            bench_accept: false,
+            margin: false,
+        }
+    }
+
+    fn run(input: &Input, stop_tokens: &[u32]) -> Decoded {
+        let mut toy = Toy {
+            slots: Vec::new(),
+            saved: None,
+            tops: Vec::new(),
+        };
+        ready(decode(&mut toy, input, &[100, 101, 102], stop_tokens, |_| {})).unwrap()
+    }
+
+    /// A 128-token request with drafts that does not name bench mode is an
+    /// ordinary request: it says exactly what sequential greedy decoding says.
+    #[test]
+    fn a_long_request_with_drafts_says_what_greedy_says() {
+        for mode in ["flush_free", "ckpt_sync", "stop_wait"] {
+            let greedy = run(&request(128, 0, mode), &[]);
+            let drafted = run(&request(128, 4, mode), &[]);
+            assert_eq!(greedy.generated.len(), 128, "{mode}");
+            assert!(
+                drafted.accepted > 0 && drafted.accepted < drafted.drafted,
+                "{mode}: speculation must both land and miss ({} of {})",
+                drafted.accepted,
+                drafted.drafted
+            );
+            assert_eq!(drafted.generated, greedy.generated, "{mode}");
+        }
+    }
+
+    /// The same request honors its stop tokens: it ends where greedy ends.
+    #[test]
+    fn a_long_request_with_drafts_stops_where_greedy_stops() {
+        let unbounded = run(&request(128, 0, "flush_free"), &[]);
+        let stop = unbounded.generated[40];
+        let end = unbounded.generated.iter().position(|&t| t == stop).unwrap();
+        let greedy = run(&request(128, 0, "flush_free"), &[stop]);
+        let drafted = run(&request(128, 4, "flush_free"), &[stop]);
+        assert!(greedy.stopped && greedy.generated.len() == end);
+        assert!(drafted.stopped);
+        assert_eq!(drafted.generated, greedy.generated);
+    }
+
+    /// Every generated token's margin is that of the row which chose it.
+    #[test]
+    fn each_tokens_margin_is_its_own_rows() {
+        for mode in ["flush_free", "ckpt_sync", "stop_wait"] {
+            for draft_length in [0, 4] {
+                let out = run(&request(128, draft_length, mode), &[]);
+                let chose: Vec<u32> = out.tops.iter().map(|t| t[0] as u32).collect();
+                assert_eq!(chose, out.generated, "{mode} at draft {draft_length}");
+            }
+        }
+    }
+
+    /// Bench mode is there only when named, and then it runs full windows.
+    #[test]
+    fn bench_mode_is_named_by_the_caller() {
+        let mut bench = request(128, 4, "flush_free");
+        bench.bench_accept = true;
+        let out = run(&bench, &[]);
+        assert_eq!(out.drafted, 4 * (out.verification_steps - 1));
+    }
 }

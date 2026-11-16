@@ -32,7 +32,6 @@ fn device_boot(doc: &toml::Table) -> DeviceBoot {
             .and_then(toml::Value::as_integer)
             .and_then(|v| u32::try_from(v).ok())
             .unwrap_or(0),
-        window_pool: true,
         stream_weights: false,
         pool_extra_chunks: 0,
         staging_slots: DeviceBoot::default().staging_slots,

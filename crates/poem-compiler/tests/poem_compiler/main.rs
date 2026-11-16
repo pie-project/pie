@@ -40,6 +40,7 @@ mod every_out_seam_holds_one_row_per_readout;
 mod every_row_is_a_deployment_its_model_checks;
 mod legs_join_into_what_a_package_once_packed;
 mod the_block_drafters_state_their_facts;
+mod a_draft_head_states_its_chain;
 mod the_bonsai_forward_wires_the_hadamard_rotation;
 mod the_bonsai_rht_signs_ingest_is_value_exact;
 mod the_dsv41_plan_is_the_published_one;

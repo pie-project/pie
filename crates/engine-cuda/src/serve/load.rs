@@ -61,6 +61,29 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         }
     };
     device.set_tuning(kernels_cuda::tuning::Tuning::of(&chip));
+    #[cfg(feature = "cuda")]
+    {
+        let user = boot
+            .knobs
+            .profiles
+            .as_deref()
+            .map(|profiles| crate::chip::user_gemm_table(profiles, device.name()));
+        let tactics = kernels_cuda::linear::gemm::install_tactics(
+            crate::chip::gemm_table(device.name()),
+            user,
+        );
+        if let Some((table, here)) = &tactics.stale {
+            eprintln!(
+                "engine-cuda: a dense GEMM tactic table is not read: it was timed under \
+                 `{table}`, and this is `{here}`; `pie tune` on this machine times it again"
+            );
+        }
+        eprintln!(
+            "engine-cuda: dense GEMM tactics from the profile's tables: {} checked in, {} the \
+             user's; a product they lack runs cuBLAS's own pick, and nothing is timed",
+            tactics.from_profile, tactics.from_user,
+        );
+    }
     let engine = crate::chip::Engine::of(&chip);
     if boot.budget.max_tokens == 0 {
         let params: u64 = boot
@@ -141,7 +164,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     let mut profile = DeviceProfile::of(&chip, device.device().num_sm, &crate::EXCLUSIVE, grouped);
     let mut kernels = poem_compiler::fuse::flags::on(&chip, &crate::FUSIONS);
     if !boot.knobs.diagnostics.fuse_chains {
-        kernels.retain(|rule| crate::UNCHAINED.contains(&rule.kernel()));
+        kernels.clear();
     }
     #[cfg(feature = "rocm")]
     {
@@ -178,8 +201,18 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     } else {
         std::collections::BTreeMap::new()
     };
+    // ROCm holds no contraction skeletons: a profile that asks for anchored
+    // regions there is refused, not served without them.
     #[cfg(feature = "rocm")]
-    let anchored = std::collections::BTreeMap::new();
+    let anchored = if profile.synth_anchors {
+        return Err(Fault::Unsupported(
+            "`compiler.synth_anchors` folds a product's epilogue into its contraction \
+             skeleton, which ROCm does not hold; serve it with the knob off"
+                .to_owned(),
+        ));
+    } else {
+        std::collections::BTreeMap::new()
+    };
     profile.synth_anchors = false;
     // `compiler.synth_regions`: each chain of elementwise and row ops the row
     // skeleton serves folded into one `fused.region`, its region kernels-ir's.
@@ -233,7 +266,11 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // halves toward its floor until they do, and the lattice follows.
     let (free, total) = crate::store::device_memory()?;
     let after_weights = crate::device::elastic::room_under(ceiling, free, total).saturating_sub(
-        crate::store::weight_tier_bytes(&boot.trace, boot.residency.device_demand(), 0)?,
+        crate::store::weight_tier_bytes(
+            &boot.trace,
+            boot.residency.resident_bytes(&boot.trace)?,
+            0,
+        )?,
     );
     let after_weights = held_beside(boot, after_weights)?;
     let facts = kv::probe(&boot.trace)?;
@@ -827,7 +864,7 @@ impl Shell {
         };
         let accounting = crate::store::admit_the_card(
             boot.allowance,
-            boot.residency.device_demand(),
+            boot.residency.resident_bytes(&boot.trace)?,
             decoded_dense,
             &boot.trace,
             paging,
@@ -1065,7 +1102,13 @@ impl Shell {
             &budgets,
             arena_bytes,
             boot.knobs.diagnostics.chunk_bytes,
-            boot.residency.cached_experts(),
+            // `untabled-experts`: the banks stay on the host tier with no
+            // shape, so no table reads them.
+            if boot.knobs.diagnostics.untabled_experts {
+                &[]
+            } else {
+                boot.residency.cached_experts()
+            },
             !boot.knobs.diagnostics.dense_weights,
             boot.knobs.diagnostics.one_window,
         )?;
@@ -1155,7 +1198,23 @@ impl Shell {
             .map(|map| (map.bytes, map.scores_from(&boot.trace)))
             .collect();
         let mut arena = Arena::reserve(arena_bytes).with_rungs(rungs, prefixes);
-        arena.ensure(&mut pools, unscored)?;
+        // The arena is backed here, at load, out of the elastic pool the
+        // allowance leaves past the weights: one it does not hold refuses
+        // the load by name.
+        arena
+            .ensure(&mut pools, unscored)
+            .map_err(|why| match why {
+                Fault::Ceiling { need, have, .. } | Fault::OutOfMemory { need, have } => {
+                    Fault::Residency(format!(
+                        "the card does not hold this deployment's activation arena: it backs \
+                         {need} bytes at load, and under the load's allowance (`[engine.memory] \
+                         budget_device`, or the whole card) the elastic pool past the weights \
+                         holds {have}. Raise `[engine.memory] budget_device`, or serve fewer \
+                         `max_forward_tokens`."
+                    ))
+                }
+                other => other,
+            })?;
         if arena.has_rungs() {
             pools.fit_range_whole();
         }
@@ -1282,6 +1341,35 @@ impl Shell {
                 .saturating_mul(boot.budget.max_tokens as usize)
                 .saturating_mul(size_of::<u64>()),
         );
+        // A routed bank on the host that no table of the weight cache reads
+        // is staged by its fire: the most experts one fire routes to, laid
+        // here with the staged inputs. A lane of it for each stream whose
+        // regions run such a select.
+        let expert_staging = {
+            let mut streams = vec![0u32; boot.trace.nodes.len()];
+            for region in compiled.template() {
+                for node in region.nodes.clone() {
+                    if let Some(stream) = streams.get_mut(node as usize) {
+                        *stream = region.stream;
+                    }
+                }
+            }
+            crate::experts::staging::Staging::bound(
+                &crate::experts::staging::Staging::selects(
+                    &boot.trace,
+                    weights.table(),
+                    &pools.expert_params(),
+                    crate::device::alloc::is_host_pointer,
+                    |node| streams[node],
+                )?,
+                budgets.tokens.max_tokens,
+            )
+        };
+        // It is a staged run of the activation's span: the fit seats it or
+        // refuses the load, naming it (`Staging::short`).
+        if let Some(fact) = expert_staging.fact() {
+            eprintln!("{fact}");
+        }
         let adapter_seats = weights.adapter_seats();
         let adapter_fact = adapter_fact(&compiled.classes, &corrected);
         let compiled_towered = compiled.order_for(poem_ir::RowAxis::Patches).is_some();
@@ -1334,6 +1422,10 @@ impl Shell {
             adapters: crate::blob::Adapters::new(adapter_seats),
             held: vec![0; boot.slots as usize],
             readout_rows,
+            // Lent at the stand-in span until laid, as the readout rows
+            // are: the size-only walk stages into it and copies nothing.
+            expert_staged: expert_staging.at(crate::sizing::STAND_IN),
+            expert_staging,
             exports,
             graphs: engine.graphs,
             copies: engine.copies,
@@ -1466,10 +1558,8 @@ impl Shell {
             let copies = format!("|{:?}", kernels_cuda::hip::sys::copy_queues());
             #[cfg(not(feature = "rocm"))]
             let copies = String::new();
-            let record = super::measured::path(
-                dir,
-                &format!("{bodies_shape}|{:?}{copies}", shell.budget),
-            );
+            let record =
+                super::measured::path(dir, &format!("{bodies_shape}|{:?}{copies}", shell.budget));
             if let Some(measured) = super::measured::read(&record) {
                 recorded = true;
                 let held = usize::try_from(measured.hold()).unwrap_or(usize::MAX);
@@ -1492,9 +1582,8 @@ impl Shell {
         // A flat range cannot grow after its bodies name it, so a load that
         // has no record of what they take measures it: no estimate stands
         // in for the figure.
-        shell.measuring = shell.records_bodies()
-            && !crate::device::elastic::mapped_on_demand()
-            && !recorded;
+        shell.measuring =
+            shell.records_bodies() && !crate::device::elastic::mapped_on_demand() && !recorded;
         let bodies = if shell.measuring {
             crate::store::MEASURING
         } else if shell.records_bodies() {
@@ -1559,7 +1648,8 @@ impl Shell {
         }
         let fitted = shell
             .pools
-            .fit_the_card(bodies, shell.held_for_fires, false, &resident)?;
+            .fit_the_card(bodies, shell.held_for_fires, false, &resident)
+            .map_err(|why| shell.expert_staging.short(why))?;
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
                 "[arm-trace] claim before arming: {} pages, {} chunks, room {} MiB (fresh {})",
@@ -1619,17 +1709,28 @@ pub(crate) struct Workspace {
 impl Shell {
     /// The runs of the activation's span a fire stages into and reads out
     /// of, in the order they lie from `inputs_at`: the staged inputs' slab,
-    /// the readout rows' table, the voxel store and the rs fold predicates,
-    /// each to
-    /// [`INPUTS_ALIGN`].
-    fn staged_runs(&self) -> [u64; 4] {
+    /// the readout rows' table, the voxel store, the rs fold predicates and
+    /// the host-resident experts' staging and the guests' samplers' lane
+    /// arenas, each to [`INPUTS_ALIGN`].
+    fn staged_runs(&self) -> [u64; 6] {
         [
             self.inputs.bytes(),
             self.readout_rows.bytes() as u64,
             self.voxels.as_ref().map_or(0, crate::voxels::Store::bytes),
             self.predicate.bytes(),
+            self.expert_staging.bytes(),
+            self.lane_arenas_bytes(),
         ]
         .map(|bytes| bytes.next_multiple_of(INPUTS_ALIGN))
+    }
+
+    /// Where a guest's sampler meets across its blocks: the most blocks one
+    /// of its launches runs, at the plane's flight on this device.
+    fn lane_arenas_bytes(&self) -> u64 {
+        crate::program::launch::Arenas::bytes_for(
+            self.programs.flight(),
+            self.device.device().num_sm,
+        )
     }
 
     /// Backs the workspaces where the range now lies, zeroes them, and has
@@ -1638,8 +1739,8 @@ impl Shell {
         if let Some(buffers) = &self.buffers {
             buffers.lay_scratch(&mut self.pools)?;
         }
-        let [inputs, readouts, voxels, predicates] = self.staged_runs();
-        let staged = inputs + readouts + voxels + predicates;
+        let [inputs, readouts, voxels, predicates, experts, arenas] = self.staged_runs();
+        let staged = inputs + readouts + voxels + predicates + experts + arenas;
         self.pools
             .hold_activation_at(self.inputs_at, staged, false)?;
         let base = self.pools.activation_base() + self.inputs_at;
@@ -1650,6 +1751,20 @@ impl Shell {
             store.lay(base + inputs + readouts);
         }
         self.predicate.lay(base + inputs + readouts + voxels)?;
+        self.expert_staged = self
+            .expert_staging
+            .at(base + inputs + readouts + voxels + predicates);
+        self.programs.set_arenas(crate::program::launch::Arenas {
+            at: base + inputs + readouts + voxels + predicates + experts,
+            bytes: arenas,
+        });
+        eprintln!(
+            "engine-cuda: guests' samplers meet in {} KiB of lane arenas laid at load ({} \
+             lanes a flight on {} units), no lane's",
+            arenas >> 10,
+            self.programs.flight(),
+            self.device.device().num_sm,
+        );
         let Some(workspace) = &self.workspace else {
             return Ok(());
         };
@@ -1870,12 +1985,20 @@ fn footprint(shell: &Shell, device_total: u64, free_before: u64) -> Footprint {
         inputs: shell.inputs.bytes(),
         buffers: shell.buffer_bytes(),
         readout: shell.readout_rows.bytes() as u64,
+        experts: shell.expert_staging.bytes(),
         cache_rows: shell.pools.committed_bytes(),
         bodies: shell.cache.body_stats().census.bytes as u64,
     }
 }
 
 impl Shell {
+    /// The staging a fire lays a host-resident bank's experts in, as the
+    /// load bounded it (`experts::staging`).
+    #[must_use]
+    pub fn expert_staging(&self) -> &crate::experts::staging::Staging {
+        &self.expert_staging
+    }
+
     /// The device's memory as this load holds it now ([`ledger`]).
     #[must_use]
     pub fn ledger(&self) -> engine::memory::Ledger {
@@ -2012,6 +2135,7 @@ fn ledger(shell: &Shell, device_total: u64, free_before: u64) -> engine::memory:
     }
     ledger.enter(Class::Fire, "inputs", held.inputs);
     ledger.enter(Class::Fire, "readout rows", held.readout);
+    ledger.enter(Class::Fire, "staged experts", held.experts);
     // The heaps' chunks are this process's whatever load made them, and a
     // load carves its own cells from them (the readout rows among them),
     // so they are entered whole, less the cells entered by their owners,
@@ -2076,6 +2200,8 @@ struct Footprint {
     inputs: u64,
     buffers: u64,
     readout: u64,
+    /// The host-resident experts' staging (`experts::staging`).
+    experts: u64,
     cache_rows: u64,
     bodies: u64,
 }
@@ -2086,7 +2212,7 @@ impl core::fmt::Display for Footprint {
             f,
             "the device holds {} bytes, {} of them in use before this load began; this load \
              put down weights {}, activation arena {}, inputs {}, buffered activations {}, \
-             readout rows {}, cache rows {}, graph bodies {}",
+             readout rows {}, staged experts {}, cache rows {}, graph bodies {}",
             self.total,
             self.before,
             self.weights,
@@ -2094,6 +2220,7 @@ impl core::fmt::Display for Footprint {
             self.inputs,
             self.buffers,
             self.readout,
+            self.experts,
             self.cache_rows,
             self.bodies,
         )

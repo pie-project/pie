@@ -1841,9 +1841,12 @@ impl Shell {
         }
         // A load that records bodies serves every composition it fires from
         // one: one that armed none, or stopped arming for want of room, would
-        // serve eagerly, which is never what a deployment asked for.
+        // serve eagerly, which is never what a deployment asked for. A load
+        // that stages host-resident experts reads each fire's routes back,
+        // so it records none by design (`Run::capturable`; stated at load).
         let attempted = st.wanted + st.never;
         if st.records
+            && self.expert_staged.is_none()
             && !st.verify
             && !st.group
             && attempted > 0

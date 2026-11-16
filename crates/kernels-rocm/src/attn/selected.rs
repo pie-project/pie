@@ -284,7 +284,7 @@ fn selected_mfma(
     let rows = o.rows;
     #[allow(clippy::cast_sign_loss)]
     let blocks = rows.saturating_mul(kv_heads as u32).max(1);
-    let splits = (ctx.multiprocessors().unwrap_or(304) / blocks).clamp(1, MAX_SPLITS);
+    let splits = (ctx.multiprocessors(op)? / blocks).clamp(1, MAX_SPLITS);
     let part = if splits > 1 {
         let floats = splits as usize * rows as usize * q_heads as usize * (head_dim as usize + 2);
         ctx.scratch(

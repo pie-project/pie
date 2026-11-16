@@ -146,6 +146,10 @@ pub struct FireTables {
 
     /// The expert table of each bank streamed by its experts, by its param.
     pub expert_tables: Vec<(u32, ExpertTable)>,
+
+    /// Where a select stages a host-resident bank's experts, laid at load
+    /// (`experts::staging`); `None` where the load stages none.
+    pub expert_staging: Option<crate::experts::staging::Staged>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,15 +185,17 @@ pub struct RsScratch {
     bytes: u64,
     rows: u32,
     next: Cell<u64>,
-    /// Each plane's place and the bytes of a row of it, in the order a
-    /// window's layer takes them.
-    planes: std::cell::RefCell<Vec<(u64, u64)>>,
+    /// Each plane's place and the bytes of a row of it, by the kind of layer
+    /// that takes it (a lone conv's, or a recurrence's) and the order its
+    /// windows take them: the two kinds lay planes of their own.
+    planes: std::cell::RefCell<std::collections::HashMap<(bool, usize), (u64, u64)>>,
     /// Each window's layout words (by its first lane and the op of its
     /// layer that lays them): their place and bytes.
     words: std::cell::RefCell<std::collections::HashMap<(u32, u32), (u64, u64)>>,
     /// The planes and the layouts each window (by its first lane) has
     /// taken of this layer.
-    taken: std::cell::RefCell<std::collections::HashMap<u32, (usize, u32)>>,
+    /// And whether the window's layer is a lone conv's.
+    taken: std::cell::RefCell<std::collections::HashMap<u32, (usize, u32, bool)>>,
     layouts: std::cell::RefCell<std::collections::HashMap<u32, RsLayout>>,
     ext: std::cell::RefCell<std::collections::HashMap<(u32, u32), Tensor>>,
 }
@@ -220,7 +226,7 @@ impl RsScratch {
             bytes,
             rows,
             next: Cell::new(0),
-            planes: std::cell::RefCell::new(Vec::new()),
+            planes: std::cell::RefCell::new(std::collections::HashMap::new()),
             words: std::cell::RefCell::new(std::collections::HashMap::new()),
             taken: std::cell::RefCell::new(std::collections::HashMap::new()),
             layouts: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -252,18 +258,20 @@ impl RsScratch {
     /// The next plane window `lane0` takes of its layer, a row of it
     /// `row_bytes`: the one every window takes there.
     fn plane(&self, lane0: u32, row_bytes: u64) -> crate::error::Result<u64> {
-        let at = {
+        let (at, lone) = {
             let mut taken = self.taken.borrow_mut();
-            let (planes, _) = taken.entry(lane0).or_default();
+            let (planes, _, lone) = taken.entry(lane0).or_default();
             *planes += 1;
-            *planes - 1
+            (*planes - 1, *lone)
         };
-        let held = self.planes.borrow().get(at).copied();
+        let held = self.planes.borrow().get(&(lone, at)).copied();
         let (base, held) = match held {
             Some(plane) => plane,
             None => {
                 let base = self.lay(u64::from(self.rows) * row_bytes)?;
-                self.planes.borrow_mut().push((base, row_bytes));
+                self.planes
+                    .borrow_mut()
+                    .insert((lone, at), (base, row_bytes));
                 (base, row_bytes)
             }
         };
@@ -283,7 +291,7 @@ impl RsScratch {
     fn layout(&self, lane0: u32, bytes: u64) -> crate::error::Result<u64> {
         let at = {
             let mut taken = self.taken.borrow_mut();
-            let (_, layouts) = taken.entry(lane0).or_default();
+            let (_, layouts, _) = taken.entry(lane0).or_default();
             *layouts += 1;
             *layouts - 1
         };
@@ -308,6 +316,12 @@ impl RsScratch {
 
     /// Window `lane0`'s layer is done: the next one takes its planes and
     /// layouts anew.
+    /// Window `lane0`'s layer is a lone conv's (Qwen4's PLE conv): it takes
+    /// the planes lone convs lay, not a recurrence's.
+    fn begin_lone(&self, lane0: u32) {
+        self.taken.borrow_mut().entry(lane0).or_default().2 = true;
+    }
+
     fn layer_done(&self, lane0: u32) {
         self.taken.borrow_mut().remove(&lane0);
         self.layouts.borrow_mut().remove(&lane0);
@@ -1280,6 +1294,20 @@ impl<'c> Run<'c> {
         }
     }
 
+    /// The extended op about to run is a lone conv's, a layer of its own.
+    pub(crate) fn rs_begin_lone(&self) {
+        if let Some(scratch) = self.rs.as_ref().and_then(|seat| seat.scratch) {
+            scratch.begin_lone(self.window().span().lane_offset);
+        }
+    }
+
+    /// Whether `id` is a lone conv's buffered rows.
+    pub(crate) fn rs_lone(&self, id: ValueId) -> bool {
+        self.rs
+            .as_ref()
+            .is_some_and(|seat| seat.buffers.planes().lone(id))
+    }
+
     pub(crate) fn rs_layer_done(&self) {
         if let Some(scratch) = self.rs.as_ref().and_then(|seat| seat.scratch) {
             scratch.layer_done(self.window().span().lane_offset);
@@ -1352,14 +1380,21 @@ impl<'c> Run<'c> {
     /// conditional body runs in the main stream's order and decodes into its
     /// tile; a load that warmed no tiles decodes as it did.
     pub(crate) fn decoded_tile_holds(&self, n: u32, k: u32) -> bool {
-        let at = match self.stream.get() {
-            _ if self.side.is_empty() => 0,
-            crate::window::BODY => 0,
-            n => n as usize,
-        };
+        let at = self.stream_index() as usize;
         self.decoded
             .get(at)
             .is_none_or(|tile| u64::from(n).saturating_mul(u64::from(k)).saturating_mul(2) <= *tile)
+    }
+
+    /// The stream this region launches on, as its region states it: 0 the
+    /// fire's main stream (a fire walked on no side stream, or a
+    /// conditional body, which runs in the main stream's order).
+    pub(crate) fn stream_index(&self) -> u32 {
+        match self.stream.get() {
+            _ if self.side.is_empty() => 0,
+            crate::window::BODY => 0,
+            n => n,
+        }
     }
 
     pub(crate) fn ctx(&self) -> &'c Ctx {
@@ -2254,6 +2289,12 @@ impl<'c> Run<'c> {
             .map_or(ExpertTable::RESIDENT, |(_, table)| *table)
     }
 
+    /// Where a select stages a host-resident bank's experts, if the load
+    /// laid a staging for them.
+    pub(crate) fn expert_staging(&self) -> Option<&crate::experts::staging::Staged> {
+        self.fire.tables.expert_staging.as_ref()
+    }
+
     pub(crate) fn expert_bank(&self, id: ValueId) -> (Tensor, ExpertTable) {
         let at = id.0 as usize;
         let Def::Weight(w) = &self.values[at].def else {
@@ -2709,21 +2750,38 @@ impl<'c> Run<'c> {
         sink.0.finish()
     }
 
+    /// Whether the fire can be recorded: not where a select stages a
+    /// host-resident bank's experts, which reads the fire's routes back to
+    /// the host (`experts::staging`), nor where a prefill plan refused its
+    /// graph form.
     pub(crate) fn capturable(&self) -> bool {
-        self.structs.iter().flatten().all(|(_, slot)| match slot {
-            StructSlot::Prefill(plan) => plan.graph_capturable,
-            _ => true,
-        })
+        self.fire.tables.expert_staging.is_none()
+            && self.structs.iter().flatten().all(|(_, slot)| match slot {
+                StructSlot::Prefill(plan) => plan.graph_capturable,
+                _ => true,
+            })
     }
 
     pub(crate) fn uncapturable_why(&self) -> Vec<String> {
-        self.structs
-            .iter()
-            .flatten()
-            .filter_map(|(_, slot)| match slot {
-                StructSlot::Prefill(plan) => plan.graph_refusal.clone(),
-                _ => None,
+        self.fire
+            .tables
+            .expert_staging
+            .as_ref()
+            .map(|_| {
+                "a select stages a host-resident bank's experts by its routes, read back as \
+                 the fire walks"
+                    .to_string()
             })
+            .into_iter()
+            .chain(
+                self.structs
+                    .iter()
+                    .flatten()
+                    .filter_map(|(_, slot)| match slot {
+                        StructSlot::Prefill(plan) => plan.graph_refusal.clone(),
+                        _ => None,
+                    }),
+            )
             .collect()
     }
 
@@ -2836,6 +2894,27 @@ mod tests {
         // A plane is one operand's for every window.
         scratch.layer_done(3);
         assert!(scratch.plane(3, 32).is_err());
+    }
+
+    /// A lone conv's layer (Qwen4's PLE conv) takes planes of its own: its
+    /// rows are not a recurrence's operands, and a recurrence after it takes
+    /// the recurrence's planes as before.
+    #[test]
+    fn a_lone_convs_layer_takes_planes_of_its_own() {
+        const BASE: u64 = 0x10_0000;
+        let rows = 512u32;
+        let scratch = RsScratch::new(BASE, RsScratch::need(rows, 96 + 40), rows);
+        let recurrence = [scratch.plane(0, 64).unwrap(), scratch.plane(0, 32).unwrap()];
+        scratch.layer_done(0);
+        scratch.begin_lone(0);
+        let lone = [scratch.plane(0, 20).unwrap(), scratch.plane(0, 20).unwrap()];
+        scratch.layer_done(0);
+        assert!(
+            lone.iter().all(|at| !recurrence.contains(at)),
+            "{lone:?} {recurrence:?}"
+        );
+        assert_eq!(scratch.plane(0, 64).unwrap(), recurrence[0]);
+        assert_eq!(scratch.plane(0, 32).unwrap(), recurrence[1]);
     }
 
     #[test]
