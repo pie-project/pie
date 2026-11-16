@@ -1378,9 +1378,10 @@ mod tests {
         assert!(printed >= 40, "{printed} root ops");
     }
 
-    /// A select on the row's own values has no static mask: refused by name.
+    /// A select on the row's own values has no static mask: its comparison and its pick a
+    /// scalar loop each over the chunk.
     #[test]
-    fn a_select_on_the_rows_values_is_refused() {
+    fn a_select_on_the_rows_values_prints_by_loops() {
         use kernels_ir::{Binary, Op, Region};
         let region = Region {
             width: 8,
@@ -1401,7 +1402,7 @@ mod tests {
             rope_lv: 4,
             rope_bits: 3,
         };
-        let why = print(&region, &place).expect_err("refused");
-        assert!(why.0.contains("bools") || why.0.contains("select"), "{why}");
+        let p = print(&region, &place).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(p.csl.matches("while (i < C)").count(), 2, "{}", p.csl);
     }
 }
