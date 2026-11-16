@@ -116,54 +116,20 @@ impl Lifetime {
     pub const SEQUENTIAL: u64 = u64::MAX;
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Vacant {
-    offset: u64,
-    span: u64,
-    launch: u32,
-    class: u64,
-}
-
-fn take(free: &mut Vec<Vacant>, span: u64, launch: u32, class: u64) -> Option<u64> {
-    let best = free
-        .iter()
-        .enumerate()
-        .filter(|(_, block)| {
-            block.span >= span && (block.launch < launch || (class != 0 && block.class == class))
-        })
-        .min_by_key(|(_, block)| block.span)
-        .map(|(index, _)| index)?;
-    let Vacant {
-        offset,
-        span: width,
-        ..
-    } = free[best];
-    if width == span {
-        free.remove(best);
-    } else {
-        free[best].offset = offset + span;
-        free[best].span = width - span;
+impl Lifetime {
+    /// Whether `later`, written after `self`'s last reader, may take its
+    /// bytes: `self` died before `later`'s launch began, or in it within
+    /// one class of rows; and `later` may lie in used bytes.
+    fn hands_on(&self, later: &Lifetime) -> bool {
+        self.last < later.def
+            && later.reusable
+            && (self.launch_last < later.launch_def
+                || (later.class_def != 0 && self.class_last == later.class_def))
     }
-    Some(offset)
-}
 
-fn release(free: &mut Vec<Vacant>, vacant: Vacant) {
-    let at = free.partition_point(|block| block.offset < vacant.offset);
-    free.insert(at, vacant);
-    let same = |a: &Vacant, b: &Vacant| a.launch == b.launch && a.class == b.class;
-    if at + 1 < free.len()
-        && free[at].offset + free[at].span == free[at + 1].offset
-        && same(&free[at], &free[at + 1])
-    {
-        free[at].span += free[at + 1].span;
-        free.remove(at + 1);
-    }
-    if at > 0
-        && free[at - 1].offset + free[at - 1].span == free[at].offset
-        && same(&free[at - 1], &free[at])
-    {
-        free[at - 1].span += free[at].span;
-        free.remove(at);
+    /// Whether the two may share bytes: one hands them on to the other.
+    fn parts_from(&self, other: &Lifetime) -> bool {
+        self.hands_on(other) || other.hands_on(self)
     }
 }
 
@@ -180,67 +146,37 @@ pub fn layout_reusing(
     if lifetimes.len() != descriptors.len() {
         return layout(descriptors);
     }
+    // The widest first, each at the lowest offset clear of every value
+    // laid so far that it may not share bytes with.
     let count = descriptors.len();
-    let mut by_def: Vec<usize> = (0..count).collect();
-    by_def.sort_by_key(|&i| {
-        (
-            lifetimes[i].def,
-            core::cmp::Reverse(descriptors[i].device_bytes()),
-            i,
-        )
-    });
-    let mut by_last: Vec<usize> = (0..count).collect();
-    by_last.sort_by_key(|&i| (lifetimes[i].last, i));
-    let mut expired = 0usize;
-
-    let mut free: Vec<Vacant> = Vec::new();
-    let mut values = vec![0u64; count];
     let mut spans = vec![0u64; count];
+    for (i, descriptor) in descriptors.iter().enumerate() {
+        if !lifetimes[i].dead {
+            spans[i] = align_up(descriptor.device_bytes()).ok_or(TooLarge::Overflow)?;
+        }
+    }
+    let mut order: Vec<usize> = (0..count).filter(|&i| spans[i] > 0).collect();
+    order.sort_by_key(|&i| (core::cmp::Reverse(spans[i]), lifetimes[i].def, i));
+    let mut values = vec![0u64; count];
+    let mut laid: Vec<usize> = Vec::with_capacity(order.len());
     let mut at = DUMMY_BYTES;
-    let mut step: Option<u32> = None;
-
-    for &i in &by_def {
-        let life = lifetimes[i];
-        if step != Some(life.def) {
-            while expired < count && lifetimes[by_last[expired]].last < life.def {
-                let dead = by_last[expired];
-                expired += 1;
-                if spans[dead] > 0 {
-                    release(
-                        &mut free,
-                        Vacant {
-                            offset: values[dead],
-                            span: spans[dead],
-                            launch: lifetimes[dead].launch_last,
-                            class: lifetimes[dead].class_last,
-                        },
-                    );
-                }
+    for &i in &order {
+        let mut blocking: Vec<(u64, u64)> = laid
+            .iter()
+            .filter(|&&j| !lifetimes[i].parts_from(&lifetimes[j]))
+            .map(|&j| (values[j], values[j] + spans[j]))
+            .collect();
+        blocking.sort_unstable();
+        let mut offset = DUMMY_BYTES;
+        for (start, end) in blocking {
+            if offset.checked_add(spans[i]).ok_or(TooLarge::Overflow)? <= start {
+                break;
             }
-            step = Some(life.def);
+            offset = offset.max(end);
         }
-        if life.dead {
-            values[i] = 0;
-            spans[i] = 0;
-            continue;
-        }
-        let span = align_up(descriptors[i].device_bytes()).ok_or(TooLarge::Overflow)?;
-        let taken = if life.reusable {
-            take(&mut free, span, life.launch_def, life.class_def)
-        } else {
-            None
-        };
-        let offset = match taken {
-            Some(offset) => offset,
-            None => {
-                at = align_up(at).ok_or(TooLarge::Overflow)?;
-                let offset = at;
-                at = at.checked_add(span).ok_or(TooLarge::Overflow)?;
-                offset
-            }
-        };
         values[i] = offset;
-        spans[i] = span;
+        at = at.max(offset.checked_add(spans[i]).ok_or(TooLarge::Overflow)?);
+        laid.push(i);
     }
 
     let temporary_bytes = align_up(temporary).ok_or(TooLarge::Overflow)?;
@@ -318,6 +254,21 @@ mod tests {
         a_reserve_lies_below_the_temporary_arena();
         mismatched_lifetimes_fall_back_to_the_naive_layout();
         a_dead_value_takes_no_slot();
+        a_small_value_between_does_not_split_a_wide_slot();
+    }
+
+    fn a_small_value_between_does_not_split_a_wide_slot() {
+        // A row dies, a small value is written while the next row lives,
+        // and a third row is written after both: it takes the first's bytes.
+        let descriptors = [desc(1024), desc(1024), desc(1), desc(1024)];
+        let lifetimes = [life(0, 1), life(1, 3), life(2, 3), life(3, 3)];
+        let reused = layout_reusing(&descriptors, &lifetimes, 0, 0).unwrap();
+        assert_eq!(reused.values[3], reused.values[0]);
+        assert_eq!(
+            reused.temporary,
+            DUMMY_BYTES + 2 * 4096 + ALIGN,
+            "two rows and the small value"
+        );
     }
 
     fn a_value_dead_before_the_next_region_hands_its_slot_on() {

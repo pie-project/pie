@@ -334,55 +334,6 @@ fn match_chain(
     })
 }
 
-struct LibraryInputs {
-    values: Vec<ValueId>,
-    scaled: Option<(ValueId, ValueId)>,
-}
-
-fn nucleus_library_inputs(
-    stage: &NormalizedStage,
-    chain: &Chain,
-    index: &StageIndex,
-) -> Option<LibraryInputs> {
-    let plain = LibraryInputs {
-        values: vec![chain.logits, chain.top_p, chain.rng_state],
-        scaled: None,
-    };
-    let Some(scale_node) = index.producer(chain.logits) else {
-        return Some(plain);
-    };
-    let Some(Op::Div(raw_logits, divisor)) = stage.ops.get(scale_node.index()) else {
-        return Some(plain);
-    };
-    let mut actual = index.consumers(chain.logits)?.to_vec();
-    actual.sort_unstable();
-    let mut expected = vec![
-        chain.softmax.maximum_node,
-        chain.softmax.centered_node,
-        chain.select_node,
-    ];
-    expected.sort_unstable();
-    if actual != expected {
-        return Some(plain);
-    }
-    let mut library_logits = *raw_logits;
-    if let Some(reshape_node) = index.producer(*raw_logits)
-        && let Some(Op::Reshape { value, .. }) = stage.ops.get(reshape_node.index())
-    {
-        library_logits = *value;
-    }
-    Some(LibraryInputs {
-        values: vec![
-            library_logits,
-            *divisor,
-            chain.logits,
-            chain.top_p,
-            chain.rng_state,
-        ],
-        scaled: Some((library_logits, *divisor)),
-    })
-}
-
 fn chain_is_exclusive(
     chain: &Chain,
     library_inputs: &[ValueId],
@@ -421,11 +372,7 @@ fn chain_is_exclusive(
     Some(ordered_nodes)
 }
 
-fn chain_types_agree(
-    stage: &NormalizedStage,
-    chain: &Chain,
-    scaled_input: Option<(ValueId, ValueId)>,
-) -> Option<()> {
+fn chain_types_agree(stage: &NormalizedStage, chain: &Chain) -> Option<()> {
     let value_type = |value: ValueId| stage.value_types.get(value as usize);
     let logits_type = value_type(chain.logits)?;
     if logits_type.dtype != Dtype::F32
@@ -435,21 +382,6 @@ fn chain_types_agree(
         return None;
     }
     let row_dims = &logits_type.dims[..logits_type.dims.len() - 1];
-    if let Some((raw_logits, divisor)) = scaled_input {
-        let raw_type = value_type(raw_logits)?;
-        if raw_type.dtype != Dtype::F32
-            || !(1..=2).contains(&raw_type.rank())
-            || raw_type.dims.last() != logits_type.dims.last()
-        {
-            return None;
-        }
-        let divisor_type = value_type(divisor)?;
-        if divisor_type.dtype != Dtype::F32
-            || (!divisor_type.is_scalar() && divisor_type.dims.as_slice() != row_dims)
-        {
-            return None;
-        }
-    }
     let top_p_type = value_type(chain.top_p)?;
     let threshold_ok = if chain.rank {
         matches!(top_p_type.dtype, Dtype::I32 | Dtype::U32)
@@ -521,9 +453,12 @@ fn match_nucleus_add_order(
     index: &StageIndex,
 ) -> Option<LibraryMatch> {
     let chain = match_chain(stage, final_node, perturbed, masked, noise, index)?;
-    let inputs = nucleus_library_inputs(stage, &chain, index)?;
-    let nodes = chain_is_exclusive(&chain, &inputs.values, index)?;
-    chain_types_agree(stage, &chain, inputs.scaled)?;
+    // The region reads the logits it cuts, the threshold and the key: a
+    // temperature divided in before it is the producer's, laid and dead
+    // before the region runs.
+    let inputs = vec![chain.logits, chain.top_p, chain.rng_state];
+    let nodes = chain_is_exclusive(&chain, &inputs, index)?;
+    chain_types_agree(stage, &chain)?;
 
     Some(LibraryMatch {
         library: if chain.rank {
@@ -532,7 +467,7 @@ fn match_nucleus_add_order(
             LibraryOp::NucleusSample
         },
         nodes,
-        inputs: inputs.values,
+        inputs,
         outputs: vec![chain.token],
     })
 }
