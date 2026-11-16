@@ -5,7 +5,8 @@
 //! depends on a model:
 //!
 //! * `bf16_flops_per_ns_by_rows`: a bf16 matmul of `m × 4096 × 4096`
-//!   (`linear::gemm::matmul`) at `m` = 16, 32, …, 8192;
+//!   (`linear::gemm::matmul`) at `m` = 16, 32, …, 8192, each repeat over
+//!   the next of 8 distinct weights so every one streams from memory;
 //! * `attn_flops_per_ns`: a causal prefill (`attn::arbiter::prefill`) of
 //!   2048 query rows over 2048 keys, 16 query and 8 kv heads of 128, over a
 //!   bf16 pool of the 16-token pages serving builds; its flops are
@@ -46,6 +47,10 @@ const FRAME_SECONDS: f64 = 0.005;
 
 /// The most of one measurement a timed frame repeats.
 const MAX_REPEATS: u32 = 512;
+
+/// The distinct `4096 × 4096` bf16 weights (32 MiB each) the matmul ladder
+/// rotates over: 256 MiB, well past any Apple GPU's system-level cache.
+const WEIGHTS: u64 = 8;
 
 /// What one `pie tune metal --rates` measured.
 #[derive(Debug, Clone, PartialEq)]
@@ -131,13 +136,13 @@ impl Bench<'_> {
     /// GPU seconds of one frame holding `k` of what `encode` fills.
     fn frame_of(
         &self,
-        encode: &dyn Fn(&Sink<'_>) -> Result<(), kernels_metal::Error>,
+        encode: &dyn Fn(&Sink<'_>, u32) -> Result<(), kernels_metal::Error>,
         k: u32,
     ) -> Result<f64, String> {
         let frame = self.device.frame().map_err(|e| e.to_string())?;
         let sink = Sink::new(self.device, &frame, &self.pipelines, &self.handles);
-        for _ in 0..k {
-            encode(&sink).map_err(|e| e.to_string())?;
+        for at in 0..k {
+            encode(&sink, at).map_err(|e| e.to_string())?;
         }
         frame.commit_timed().map_err(|e| e.to_string())
     }
@@ -150,7 +155,7 @@ impl Bench<'_> {
     /// (bimodal on an M5 Pro at m = 64..2048 of the matmul ladder).
     fn timed(
         &self,
-        encode: &dyn Fn(&Sink<'_>) -> Result<(), kernels_metal::Error>,
+        encode: &dyn Fn(&Sink<'_>, u32) -> Result<(), kernels_metal::Error>,
     ) -> Result<f64, String> {
         let once = self.frame_of(encode, 1)?.max(1e-7);
         let k = ((FRAME_SECONDS / once).ceil() as u32).clamp(1, MAX_REPEATS);
@@ -162,18 +167,23 @@ impl Bench<'_> {
         Ok(median(times))
     }
 
-    fn matmul_flops(&self, m: u32) -> Result<f64, String> {
-        let (a, w, y) = (
+    /// `weights` the [`WEIGHTS`] distinct weight buffers a matmul ladder
+    /// rotates over.
+    fn matmul_flops(&self, m: u32, weights: &[Tensor]) -> Result<f64, String> {
+        let (a, y) = (
             self.zeroed(u64::from(m) * u64::from(WIDTH) * 2)?,
-            self.buffer(&bf16_noise((WIDTH * WIDTH) as usize, 7, 0.05))?,
             self.zeroed(u64::from(m) * u64::from(WIDTH) * 2)?,
         );
-        let (at, wt, yt) = (
+        let (at, yt) = (
             self.tensor(&a, m, WIDTH, Dtype::Bf16)?,
-            self.tensor(&w, WIDTH, WIDTH, Dtype::Bf16)?,
             self.tensor(&y, m, WIDTH, Dtype::Bf16)?,
         );
-        let seconds = self.timed(&|sink| gemm::matmul(sink, self.tuning, at, wt, yt))?;
+        // Each repeat reads the next weight: serving streams a layer's from
+        // memory, and one weight repeated would sit in the system cache,
+        // by a share that changes run to run (2x at m = 16 on an M5 Pro).
+        let seconds = self.timed(&|sink, at_k| {
+            gemm::matmul(sink, self.tuning, at, weights[at_k as usize % weights.len()], yt)
+        })?;
         Ok(2.0 * f64::from(m) * f64::from(WIDTH) * f64::from(WIDTH) / (seconds * 1e9))
     }
 
@@ -227,7 +237,7 @@ impl Bench<'_> {
         };
         let o = self.tensor(&out, ROWS, Q_HEADS * D, Dtype::Bf16)?;
         let scale = 1.0 / (D as f32).sqrt();
-        let seconds = self.timed(&|sink| {
+        let seconds = self.timed(&|sink, _| {
             attn::arbiter::prefill(sink, q, &plan, &pool, None, D, KV_HEADS, scale, o, 1, self.tuning)
         })?;
         let flops = 4.0 * f64::from(ROWS) * f64::from(KEYS) * f64::from(Q_HEADS) * f64::from(D) / 2.0;
@@ -275,7 +285,7 @@ impl Bench<'_> {
         let weight = self.tensor(&weight, channels, CONV, Dtype::Bf16)?;
         let gates = self.tensor(&gates, TOKENS, 2 * HEADS, Dtype::F32)?;
         let y = self.tensor(&y, TOKENS, HEADS * DV, Dtype::F32)?;
-        let seconds = self.timed(&|sink| {
+        let seconds = self.timed(&|sink, _| {
             ssm::causal_conv1d_chunked(sink, x, weight, &pool, CONV, 1, convolved)?;
             ssm::gated_delta_chunked(
                 sink,
@@ -326,7 +336,7 @@ impl Bench<'_> {
             self.tensor(&w, 32, 32, Dtype::Bf16)?,
             self.tensor(&y, 8, 32, Dtype::Bf16)?,
         );
-        let seconds = self.timed(&|sink| gemm::matmul(sink, self.tuning, at, wt, yt))?;
+        let seconds = self.timed(&|sink, _| gemm::matmul(sink, self.tuning, at, wt, yt))?;
         Ok((seconds * 1e9).round() as u64)
     }
 }
@@ -346,9 +356,16 @@ pub fn measure(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Mea
         pipelines: Pipelines::new(),
         tuning: &tuning,
     };
+    let weights = (0..WEIGHTS)
+        .map(|seed| {
+            let w = bench.buffer(&bf16_noise((WIDTH * WIDTH) as usize, 7 + seed, 0.05))?;
+            Ok((bench.tensor(&w, WIDTH, WIDTH, Dtype::Bf16)?, w))
+        })
+        .collect::<Result<Vec<(Tensor, Buffer)>, String>>()?;
+    let weight_tensors: Vec<Tensor> = weights.iter().map(|(t, _)| *t).collect();
     let mut flops_by_rows = Vec::with_capacity(ROWS.len());
     for m in ROWS {
-        let rate = bench.matmul_flops(m)?;
+        let rate = bench.matmul_flops(m, &weight_tensors)?;
         say(&format!("  bf16 matmul {m} x {WIDTH} x {WIDTH}: {:.2} TFLOP/s", rate / 1e3));
         flops_by_rows.push((m, rate));
     }
