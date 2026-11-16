@@ -1460,8 +1460,7 @@ impl Cuda {
             }
             records.push(record);
         }
-        // The lane's list refs are its table of pages, or, where a program
-        // places its rows, the table that translates the program's pages.
+        // The lane's refs of `shape`: the kv list's, or a window list's.
         fn table(lane: &engine::fire::Lane, shape: engine::chunk::ShapeId) -> Option<&[u32]> {
             lane.tables
                 .iter()
@@ -1478,6 +1477,16 @@ impl Cuda {
                     .collect()
             })
             .collect();
+        // A lane's list table is its pages, or, where a translation is
+        // stated, the working set's mapped pages its program's pages index.
+        let pages: Vec<&[u32]> = submission
+            .lanes
+            .iter()
+            .map(|lane| match table(lane, LIST) {
+                Some(refs) if lane.kv.translation.is_empty() => refs,
+                _ => &[],
+            })
+            .collect();
         let seated: Vec<Seated<'_>> = submission
             .lanes
             .iter()
@@ -1490,21 +1499,15 @@ impl Cuda {
                         tokens: &lane.tokens,
                     },
                     positions: &lane.positions,
-                    pages: match table(lane, LIST) {
-                        Some(refs) if by_refs && lane.kv.translation.is_empty() => refs,
-                        _ => &lane.kv.pages,
-                    },
-                    held: (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
+                    pages: pages[at],
+                    held: (!pages[at].is_empty()).then_some(lane.kv.held),
                     kv_less: lane.kv_less,
                     translation: match table(lane, LIST) {
-                        Some(refs) if by_refs && !lane.kv.translation.is_empty() => refs,
-                        _ => &lane.kv.translation,
+                        Some(refs) if !lane.kv.translation.is_empty() => refs,
+                        _ => &[],
                     },
-                    window: match table(lane, WINDOW) {
-                        Some(refs) if by_refs => refs,
-                        _ => &lane.kv.window,
-                    },
-                    more_windows: if by_refs { &more_windows[at] } else { &[] },
+                    window: table(lane, WINDOW).unwrap_or(&[]),
+                    more_windows: &more_windows[at],
                     mask: lane.mask.as_ref(),
                     adapter: lane_adapters[at].or(lane.adapter),
                     rs: lane.rs.clone(),
