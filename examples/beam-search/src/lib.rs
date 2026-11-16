@@ -10,10 +10,12 @@
 //! (`slot = fill + lane`, computed on the device), and its ancestry is encoded
 //! in the per-beam mask — inherit the parent's mask (`gather(mask, parent)`)
 //! then set the one new cell (`eq(col, slot)`). That is the entire fork/prune
-//! mechanism. Every mask admits the prompt's slots. A beam's lane reads the
-//! pool up to its own slot, as every lane the host places does (it states no
-//! `kv_len`): its ancestors all stand at earlier steps' slots, below this
-//! step's, and its mask hides the other beams' cells among them.
+//! mechanism. The prompt is folded, so it is committed: every beam reads it
+//! and no mask speaks of it. A mask's column `c` is pool slot `n + c`, the
+//! cells past the prompt. A beam's lane reads the pool up to its own slot, as
+//! every lane the host places does (it states no `kv_len`): its ancestors all
+//! stand at earlier steps' slots, below this step's, and its mask hides the
+//! other beams' cells among them.
 //!
 //! The search runs `max_tokens` steps: a beam is not retired at end of
 //! sequence, so width 1 is greedy decoding of the same prompt to the same
@@ -171,12 +173,14 @@ async fn main(input: Input) -> Result<String> {
         fwd.embed(&toks, &lanes_b)?;
         let pool: Vec<&WorkingSet> = vec![&ws; b as usize];
 
-        // The first decode writes beam `i`'s token at slot `n + i`; it sees
-        // the prompt and its own cell.
+        // The first decode writes beam `i`'s token at slot `n + i`, column
+        // `i` of the cells past the committed prompt; it sees the prompt and
+        // its own cell.
+        let cells = pool_len - n;
         let init_mask: Vec<bool> = (0..b)
-            .flat_map(|lane| (0..pool_len).map(move |p| p < n || p == n + lane))
+            .flat_map(|lane| (0..cells).map(move |c| c == lane))
             .collect();
-        let mask = Channel::from_shaped([b, pool_len], init_mask);
+        let mask = Channel::from_shaped([b, cells], init_mask);
         let slots = Channel::from_iter(n..n + b);
         // A beam's RoPE position is its depth in the sequence, not its pool slot.
         let pos = Channel::from(vec![n; b as usize]);
@@ -213,10 +217,11 @@ async fn main(input: Input) -> Result<String> {
             let base_b = broadcast(reshape(&base, [1]), [b]); // [1] -> [B]
             let wpos = &base_b + iota(b); // [B]
 
-            let inherited = gather(mask.take(), &parent); // bool [B,pool_len]
-            let col = broadcast(reshape(iota(pool_len), [1, pool_len]), [b, pool_len]);
-            let wpos_b = broadcast(reshape(&wpos, [b, 1]), [b, pool_len]);
-            let newpos = eq(col, wpos_b); // bool [B,pool_len]
+            let inherited = gather(mask.take(), &parent); // bool [B,cells]
+            // Column `c` is slot `n + c`.
+            let col = broadcast(reshape(iota(cells) + n, [1, cells]), [b, cells]);
+            let wpos_b = broadcast(reshape(&wpos, [b, 1]), [b, cells]);
+            let newpos = eq(col, wpos_b); // bool [B,cells]
             mask.put(or(inherited, &newpos));
 
             // Device-resolved geometry is loop-carried: the host never drains
