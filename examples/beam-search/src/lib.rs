@@ -20,6 +20,18 @@
 //! The search runs `max_tokens` steps: a beam is not retired at end of
 //! sequence, so width 1 is greedy decoding of the same prompt to the same
 //! length (the beam identity, checked every step against the raw argmax).
+//!
+//! `--verify` rescores each final hypothesis alone and holds it to its
+//! beam's score within the readout's rounding: the logits are stored in the
+//! format `model::output_significand("logits")` names (bf16 on the GPU
+//! engines) and read widened, so two fires that compute the same
+//! log-probability through different kernels may round a logit to its
+//! neighbour, one step `2^(floor(log2 |x|) - (bits - 1))` apart (0.125 for a
+//! bf16 logit at 20). A beam's bound is the sum over its steps of
+//! `(1 - p_t) step(x_t) + sum_{i != t} p_i step(x_i)` (see `bound`), read off
+//! the rescoring fire's logits; no fixed tolerance.
+
+mod bound;
 
 use inferlet::chat;
 use inferlet::eta::prelude::*;
@@ -53,6 +65,10 @@ struct Input {
     /// its siblings'.
     #[serde(default)]
     verify: bool,
+    /// Debug: verify each beam against the next beam's hypothesis, a wrong
+    /// lane `--verify` must refuse (at widths of 2 and more).
+    #[serde(default)]
+    verify_wrong_lane: bool,
 }
 
 fn default_prompt() -> String {
@@ -344,23 +360,40 @@ async fn main(input: Input) -> Result<String> {
     }
     let text = model::decode(&hypotheses[best_lane])?;
     let verified = if input.verify {
-        let mut worst = 0f32;
-        for (lane, hypothesis) in hypotheses.iter().enumerate() {
-            let alone = rescore(&prompt, hypothesis).await?;
-            let apart = (alone - final_scores[lane]).abs();
-            // bf16 logits: a step's log-probability rounds to about 1e-2.
-            let room = 0.02 * hypothesis.len() as f32 + 0.05;
+        let significand = u32::from(model::output_significand("logits").ok_or(
+            "the model states no float format for `logits`, so --verify has no rounding to \
+             hold a beam to",
+        )?);
+        // The beam furthest from its hypothesis alone, and its bound.
+        let mut worst = (0f64, 0f64);
+        for lane in 0..hypotheses.len() {
+            let read = if input.verify_wrong_lane {
+                (lane + 1) % hypotheses.len()
+            } else {
+                lane
+            };
+            let (alone, steps) = rescore(&prompt, &hypotheses[read]).await?;
+            let apart = (f64::from(alone) - f64::from(final_scores[lane])).abs();
+            let room = bound::score_bound(significand, &steps);
             if apart > room {
                 return Err(format!(
                     "beam {lane} scored {:.4}, and its hypothesis alone scores {alone:.4}: \
-                     {apart:.4} apart, past {room:.3}; its recurrence or attention read \
+                     {apart:.4} apart, past the {room:.4} its logits' rounding allows \
+                     ({significand}-bit significand); its recurrence or attention read \
                      another beam's cells",
                     final_scores[lane]
                 ));
             }
-            worst = worst.max(apart);
+            if apart >= worst.0 {
+                worst = (apart, room);
+            }
         }
-        format!(" verified={} worst_apart={worst:.4}", hypotheses.len())
+        format!(
+            " verified={} worst_apart={:.4} its_bound={:.4}",
+            hypotheses.len(),
+            worst.0,
+            worst.1
+        )
     } else {
         String::new()
     };
@@ -373,11 +406,12 @@ async fn main(input: Input) -> Result<String> {
 /// The summed log-probability of `hypothesis` after `prompt`, teacher-forced
 /// one token a fire on a working set of its own: what a beam that read only
 /// its own ancestry scores.
-async fn rescore(prompt: &[u32], hypothesis: &[u32]) -> Result<f32> {
+async fn rescore(prompt: &[u32], hypothesis: &[u32]) -> Result<(f32, Vec<bound::Rescored>)> {
     let v = model::output_vocab_size();
     let ws = WorkingSet::new();
     let pipeline = Pipeline::new();
     let mut total = 0f32;
+    let mut steps = Vec::with_capacity(hypothesis.len());
     for (at, &target) in hypothesis.iter().enumerate() {
         let fed: Vec<i32> = if at == 0 {
             prompt.iter().map(|&t| t as i32).collect()
@@ -388,19 +422,72 @@ async fn rescore(prompt: &[u32], hypothesis: &[u32]) -> Result<f32> {
         let toks = Channel::from(&fed[..]);
         let indptr = Channel::from([0u32, rows]);
         let wanted = Channel::from([target]);
-        let out = Channel::new([1], dtype::f32);
+        let top = bound::TOP;
+        let out_lp = Channel::new([1], dtype::f32);
+        let out_x = Channel::new([1], dtype::f32);
+        let out_top_lp = Channel::new([top], dtype::f32);
+        let out_top_x = Channel::new([top], dtype::f32);
+        let out_top_ids = Channel::new([top], dtype::i32);
+        let out_max = Channel::new([1], dtype::f32);
         let fwd = ForwardPass::new();
         fwd.embed(&toks, &indptr)?;
         fwd.state(&[&ws], StateGeometry::folding())
             .context("bind the rescoring set")?;
         fwd.epilogue(move || {
             let logits = reshape(intrinsics::output(0, "logits"), [v]);
-            out.put(gather(log_softmax(&logits), wanted.take()));
+            let lsm = log_softmax(&logits);
+            let at = wanted.take();
+            // The chosen token's log-probability and logit, the likeliest
+            // tokens' log-probabilities and logits, and the largest |logit|.
+            out_lp.put(gather(&lsm, &at));
+            out_x.put(gather(&logits, &at));
+            let (top_lp, top_ids) = top_k(&lsm, top);
+            out_top_x.put(gather(&logits, &top_ids));
+            out_top_lp.put(top_lp);
+            out_top_ids.put(cast(&top_ids, dtype::i32));
+            out_max.put(reshape(reduce_max(abs(&logits)), [1]));
         });
         fwd.submit(&pipeline).context("rescore submit")?;
-        let got = out.take_host::<Vec<f32>>().await.context("rescore drain")?;
-        total += got.first().copied().ok_or("the rescoring fire returned nothing")?;
+        let one = |v: Vec<f32>| {
+            v.first()
+                .copied()
+                .ok_or("the rescoring fire returned nothing")
+        };
+        let logprob = one(out_lp
+            .take_host::<Vec<f32>>()
+            .await
+            .context("rescore drain")?)?;
+        let logit = one(out_x
+            .take_host::<Vec<f32>>()
+            .await
+            .context("rescore drain")?)?;
+        let top_logprobs = out_top_lp
+            .take_host::<Vec<f32>>()
+            .await
+            .context("rescore drain")?;
+        let top_logits = out_top_x
+            .take_host::<Vec<f32>>()
+            .await
+            .context("rescore drain")?;
+        let top_ids = out_top_ids
+            .take_host::<Vec<i32>>()
+            .await
+            .context("rescore drain")?;
+        let max_abs = one(out_max
+            .take_host::<Vec<f32>>()
+            .await
+            .context("rescore drain")?)?;
+        steps.push(bound::Rescored {
+            token: target,
+            logit,
+            logprob,
+            top_ids: top_ids.iter().map(|&id| id as u32).collect(),
+            top_logits,
+            top_logprobs,
+            max_abs,
+        });
+        total += logprob;
     }
     pipeline.close();
-    Ok(total)
+    Ok((total, steps))
 }

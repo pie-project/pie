@@ -35,6 +35,15 @@ export function maxPassRows(): number;
  */
 export function outputVocabSize(): number;
 /**
+ * The significand bits, the implicit one included, of the format the
+ * model stores output `name` in before a guest reads it widened: 8 for
+ * bf16, 11 for f16, 24 for f32. A guest reads such an output as f32, but
+ * its values carry this format's rounding: a value at |x| is a multiple
+ * of 2^(floor(log2 |x|) - (bits - 1)). None for an integer output or a
+ * name the model has no output of.
+ */
+export function outputSignificand(name: string): number | undefined;
+/**
  * Tokens per KV page for the bound model/engine.
  */
 export function kvPageSize(): number;

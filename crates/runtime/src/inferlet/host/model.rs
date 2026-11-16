@@ -154,6 +154,17 @@ impl pie::inferlet::model::Host for ProcessCtx {
         Ok(model::model().vocab_size())
     }
 
+    async fn output_significand(&mut self, name: String) -> Result<Option<u8>> {
+        let model = model::model();
+        let decl = model
+            .classes()
+            .classes
+            .iter()
+            .flat_map(|class| &class.outputs)
+            .find(|decl| decl.name == name);
+        Ok(decl.and_then(|decl| significand(decl.dtype)))
+    }
+
     async fn kv_page_size(&mut self) -> Result<u32> {
         Ok(model::model().kv_page_size())
     }
@@ -176,6 +187,16 @@ impl pie::inferlet::model::Host for ProcessCtx {
 
     async fn rs_state_size(&mut self) -> Result<u64> {
         Ok(model::model().rs_caps().state_size)
+    }
+}
+
+/// The significand bits, the implicit one included, of a float `dtype`.
+fn significand(dtype: poem_ir::Dtype) -> Option<u8> {
+    match dtype {
+        poem_ir::Dtype::F32 => Some(24),
+        poem_ir::Dtype::F16 => Some(11),
+        poem_ir::Dtype::Bf16 => Some(8),
+        _ => None,
     }
 }
 
