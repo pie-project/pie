@@ -348,16 +348,22 @@ pub fn raise_now(shared: &Shared, engine: usize, rows: u32) {
         let raise = match pool.plan_raise(at) {
             Ok(raise) => raise,
             Err(error) => {
-                // Idle cache lies in the span: the walk has its owner clear
-                // it, and raises then.
-                if error.span_cached() {
+                // Idle cache lies in the span, or the span is yield's to
+                // grow back: the walk has it cleared or waits on the grow.
+                if error.span_cached() || error.span_shed() {
                     ask_walk(engine);
                 }
                 return;
             }
         };
         let stood = pool.stands_at(at);
-        if pool.raise_waits(&raise) || pool.raise_applied(&raise).is_err() {
+        if pool.raise_waits(&raise) {
+            // The engine is told the rung first: the walk's, through its
+            // lane.
+            ask_walk(engine);
+            return;
+        }
+        if pool.raise_applied(&raise).is_err() {
             return;
         }
         raise_said(engine, at, stood);
@@ -681,13 +687,14 @@ pub enum SegmentMove {
     /// Give back segments `prefix..` (`release_segments(prefix)`), released
     /// in the pool already.
     Release { prefix: u32 },
-    /// Back the top `n` span segments (`commit_span(n)`), where the span is
-    /// backed on demand: the rung lends a chunk there no segment backs. The
-    /// pool opens their chunks once the engine has, [`SharedPool::span_committed`].
+    /// The governor's grow backs the top `n` span segments again
+    /// (`commit_span(n)`), the span whole: what yield gave back, before a
+    /// raise takes it. The pool opens their chunks once the engine has,
+    /// [`SharedPool::span_committed`].
     CommitSpan { n: u32 },
-    /// Give back the span segments below the top `n` (`release_span(n)`),
-    /// released in the pool already: no state chunk is open there and the
-    /// rung no longer lends them.
+    /// Yield's last shed: give back the span segments below the top `n`
+    /// (`release_span(n)`), released in the pool already: the activation
+    /// set aside does not reach them and no chunk is open there.
     ReleaseSpan { n: u32 },
     /// The highest committed segment cannot be emptied into the rest.
     NoRoom,
@@ -695,12 +702,12 @@ pub enum SegmentMove {
     Wait,
 }
 
-/// Whom the walk grows for: what decides whether the span a lowered rung
-/// lends is a step at all ([`SharedPool::grow_step`]).
+/// Whom the walk grows for: what decides whether backing the span again is
+/// a step at all ([`SharedPool::grow_step`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GrowFor {
     /// A waiter short of room for live state. Live state never opens in
-    /// the top rung's span, so backing the span it lends funds no such
+    /// the top rung's span, so backing the span again funds no such
     /// waiter: only the prefix grows for it.
     Live,
     /// No waiter: the governor's target alone (or its test pin).
@@ -712,7 +719,7 @@ pub enum GrowFor {
 pub enum GrowStep {
     /// Back segments `0..prefix` ([`SegmentMove::Commit`]).
     Commit { prefix: u32 },
-    /// Back the top `n` span segments ([`SegmentMove::CommitSpan`]).
+    /// Back the whole span again ([`SegmentMove::CommitSpan`]).
     CommitSpan { n: u32 },
 }
 
@@ -767,8 +774,9 @@ pub struct SharedPool {
     /// The engine is told every rung change (`ChunkFacts::tells_rungs`, or
     /// its span backed on demand): [`Self::tells_rungs`].
     tells_rungs: bool,
-    /// The engine refused the last `commit_span`: no span segment is asked
-    /// again until room is freed ([`Self::block_span_commit`]).
+    /// The engine refused the last `commit_span` (the governor's grow of the
+    /// span yield gave back): it is not asked again until room is freed
+    /// ([`Self::block_span_commit`]).
     span_commit_blocked: bool,
     /// The registered programs' fire terms ([`programs`]).
     programs: programs::ProgramFires,
@@ -978,13 +986,12 @@ impl SharedPool {
             reserved_chunks: reserved,
             shapes,
             act_chunks: facts.act_chunks.clone(),
-            span_on_demand: facts.span_backed_on_demand,
             act_span: facts.act_span_chunks,
         });
         // An engine told rungs starts at the smallest, the rung it lays its
         // fires by at load; passes raise it through `Engine::set_rung` as
         // fires need. One that is not: at the largest.
-        let tells_rungs = facts.tells_rungs || facts.span_backed_on_demand;
+        let tells_rungs = facts.tells_rungs;
         if !tells_rungs && let Some(&(rung, _)) = facts.act_chunks.last() {
             pool.set_rung(rung)
                 .expect("an empty pool takes its largest rung");
@@ -1707,32 +1714,6 @@ impl SharedPool {
         self.pool.plan_rung(rung).map_err(RungError::Pool)
     }
 
-    /// The chunks raising the activation to `rung` lacks now, and the kv
-    /// pages that many chunks hold: what must be freed before it fits.
-    #[must_use]
-    ///
-    /// The pages are what a grant of them leaves that many chunks freed past
-    /// what stands free now: every free slot of the kv list below the top
-    /// rung's span comes first, so it counts on top (a grant it covers frees
-    /// nothing). Idle cache in the span is no room to fund: it is cleared
-    /// ([`SlotPool::span_cached`]).
-    pub fn raise_short(&self, rung: u32) -> (u32, u32) {
-        let chunks = self.pool.rung_short(rung);
-        if chunks == 0 {
-            return (0, 0);
-        }
-        let Some(list) = self.list else {
-            return (chunks, chunks);
-        };
-        let spc = self
-            .pool
-            .shape(list.pool)
-            .map_or(1, |shape| shape.slots_per_chunk.max(1));
-        let free = self.pool.available(list.pool);
-        let pages = u64::from(chunks) * u64::from(spc) + free;
-        (chunks, u32::try_from(pages).unwrap_or(u32::MAX))
-    }
-
     /// The first of `tables`' slot refs (engine shape, refs) that names no
     /// slot handed out: a chunk not open for its shape, or a free slot in
     /// one; the null chunk's refs (a window's empty slot) pass.
@@ -1895,29 +1876,35 @@ impl SharedPool {
     }
 
     /// The next step toward `target` mapped segments, the top span counted;
-    /// `None` once there. A grow commits the lowest uncommitted segment, the
-    /// commit ahead of need included; a shrink evacuates the highest
+    /// `None` once there. A grow backs the span again where yield gave some
+    /// of it back, then commits the lowest uncommitted segment, the commit
+    /// ahead of need included. A shrink (yield) evacuates the highest
     /// committed segment of the prefix (applied here, for the engine to
     /// copy before the next fire; its chunks stay out until `epoch`
-    /// retires), and releases it once drained.
+    /// retires) and releases it once drained; only where the prefix gives
+    /// nothing more does it shed the span below the activation set aside,
+    /// its last ([`SlotPool::span_to_shed`]).
     pub fn next_move(&mut self, target: u32, epoch: u64) -> Option<SegmentMove> {
         let segments = self.pool.segments();
         let top = self.pool.top_segment();
         let prefix = (0..top)
             .take_while(|&s| segments.state(s) != SegmentState::Uncommitted)
             .count() as u32;
-        // A span segment backed on demand goes once the rung no longer
-        // lends it and it holds nothing.
-        if let Some(n) = self.pool.span_to_release() {
-            self.pool.release_span(n);
-            return Some(SegmentMove::ReleaseSpan { n });
-        }
         if let Some(step) = self.grow_step(target, self.grow_for()) {
             return Some(step.into());
         }
         let mapped = self.mapped_segments();
-        if mapped <= target || prefix == 0 {
+        if mapped <= target {
             return None;
+        }
+        // Yield sheds the span last, once the prefix gives nothing more.
+        let shed = |pool: &mut Self| {
+            let n = pool.pool.span_to_shed()?;
+            pool.pool.release_span(n);
+            Some(SegmentMove::ReleaseSpan { n })
+        };
+        if prefix == 0 {
+            return shed(self);
         }
         let last = prefix - 1;
         match segments.state(last) {
@@ -1936,7 +1923,7 @@ impl SharedPool {
             }
             SegmentState::Committed => {
                 let Some(evacuation) = self.pool.plan_evacuation(last) else {
-                    return Some(SegmentMove::NoRoom);
+                    return shed(self).or(Some(SegmentMove::NoRoom));
                 };
                 self.apply_evacuation(&evacuation, epoch);
                 Some(SegmentMove::Evacuate {
@@ -1965,25 +1952,27 @@ impl SharedPool {
     /// [`GrowFor::Live`], so the planner never waits on a grow the walk
     /// does not make.
     ///
-    /// The lowest uncommitted prefix segment the engine binds first. The
-    /// prefix whole, the span a lowered rung lends is backed next, before
-    /// state opens a chunk there, but never for a live waiter (live state
-    /// never opens in the top rung's span), and not while a refused commit
-    /// waits for room to be freed.
+    /// The span yield gave back is backed again first, whole, as it was
+    /// given back last (a raise waits on it), but never for a live waiter
+    /// (live state never opens in the top rung's span) and not while a
+    /// refused commit waits for room to be freed; then the lowest
+    /// uncommitted prefix segment the engine binds.
     #[must_use]
     pub fn grow_step(&self, goal: u32, who: GrowFor) -> Option<GrowStep> {
         if self.mapped_segments() >= goal {
             return None;
         }
+        if who == GrowFor::Target
+            && !self.span_commit_blocked()
+            && let Some(n) = self.pool.span_to_regrow()
+        {
+            return Some(GrowStep::CommitSpan { n });
+        }
         let prefix = self.pool.prefix_segments();
         if prefix < self.pool.top_segment() && self.pool.backs(prefix) {
             return Some(GrowStep::Commit { prefix: prefix + 1 });
         }
-        if who == GrowFor::Live || self.span_commit_blocked() {
-            return None;
-        }
-        let n = self.pool.span_to_commit()?;
-        Some(GrowStep::CommitSpan { n })
+        None
     }
 
     /// The segments the walk moves toward for the governor's `target`: on
@@ -2040,8 +2029,8 @@ impl SharedPool {
         self.span_commit_blocked
     }
 
-    /// The engine backed the top `n` span segments: the chunks of theirs the
-    /// rung lends go out now.
+    /// The engine backed the top `n` span segments again (the governor's
+    /// grow): their chunks go out as before yield gave them back.
     pub fn span_committed(&mut self, n: u32) {
         self.pool.commit_span(n);
     }
@@ -2134,6 +2123,13 @@ impl RungError {
     #[must_use]
     pub fn span_cached(&self) -> bool {
         matches!(self, Self::Pool(SlotError::SpanCached { .. }))
+    }
+
+    /// Whether the raise's activation lies in span segments yield gave
+    /// back ([`SlotError::SpanShed`]): it waits on the governor's grow.
+    #[must_use]
+    pub fn span_shed(&self) -> bool {
+        matches!(self, Self::Pool(SlotError::SpanShed { .. }))
     }
 }
 

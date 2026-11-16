@@ -487,7 +487,6 @@ impl Layout {
             // The span's heaps are all made at the load
             // (`Pool::back_whole_span`): nothing is backed on demand, and no
             // rung raise or lend makes a device allocation after ready.
-            span_backed_on_demand: false,
             // Every rung change is told the engine, so the runtime cuts a
             // guest fire to the widest rung its term fits beside; a change
             // moves only the carve's bookkeeping.

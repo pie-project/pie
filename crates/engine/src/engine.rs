@@ -247,21 +247,21 @@ pub trait Engine: Send {
         Err(self.unsupported("release_segments"))
     }
 
-    /// Backs the top `segments` segments of the span under the largest
-    /// rung's activation, counted from the top of the pool, ahead of the
-    /// runtime opening any chunk of theirs for state; never on a fire's
-    /// path. Monotone as [`Self::commit_segments`]' prefix, from the other
-    /// end. Only where [`crate::chunk::ChunkFacts::span_backed_on_demand`];
-    /// the engine backs its own activation carve itself.
+    /// The governor's grow: backs the top `segments` segments of the span
+    /// under the largest rung's activation again, counted from the top of
+    /// the pool, after yield gave some back ([`Self::release_span`]) and
+    /// before a raise takes them; never on a fire's path. The span is
+    /// backed whole from the load; this is its only re-commit.
     fn commit_span(&mut self, segments: u32) -> Result<()> {
         let _ = segments;
         Ok(())
     }
 
-    /// Keeps the top `segments` span segments backed and gives back the
-    /// span segments below them, which hold no state chunk and which no
-    /// rung lends any more ([`Self::commit_span`]'s counting). Whatever of
-    /// them the engine's own activation carve uses stays its own to back.
+    /// Yield's last shed under pressure: keeps the top `segments` span
+    /// segments backed and gives back the span segments below them
+    /// ([`Self::commit_span`]'s counting), which the activation set aside
+    /// does not reach and no chunk is open in. Given back only by yield;
+    /// the governor's grow backs them again ([`Self::commit_span`]).
     fn release_span(&mut self, segments: u32) -> Result<()> {
         let _ = segments;
         Ok(())
@@ -269,15 +269,13 @@ pub trait Engine: Send {
 
     /// The activation rung moves from `from`, the rung the engine was last
     /// told (the smallest, from the load), to `to` tokens; only where
-    /// [`crate::chunk::ChunkFacts::span_backed_on_demand`], through the
-    /// lane, never on a fire's path, and only where the two differ. A raise
-    /// (`to > from`) comes before any fire of the wider rung, and before
-    /// the raise's [`Self::evacuate`] where it moves state: the engine
-    /// backs its carve for `to` here, and a refusal (`Error::Exhausted`)
-    /// takes the raise back, no fire passing `from`. A lower (`to < from`)
-    /// is a notice once every fire wider than `to` has retired: the engine
-    /// may give back the carve above `to`; a failed notice is logged, not
-    /// fatal.
+    /// [`crate::chunk::ChunkFacts::tells_rungs`], through the lane, never
+    /// on a fire's path, and only where the two differ. A raise
+    /// (`to > from`) comes before any fire of the wider rung: the engine
+    /// lays its fires by it; a refusal takes the raise back, no fire
+    /// passing `from`. A lower (`to < from`) is a notice once every fire
+    /// wider than `to` has retired; a failed notice is logged, not fatal.
+    /// Nothing is backed here: the span is backed from the load.
     ///
     /// A guest term that grows at a standing rung is no rung change and
     /// sends none: the runtime sets the room aside before it sends the bind

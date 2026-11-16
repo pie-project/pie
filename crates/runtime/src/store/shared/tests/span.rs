@@ -1,10 +1,9 @@
-//! The activation span backed on demand (`ChunkFacts::span_backed_on_demand`,
-//! where a mapped heap is resident whether touched or not): no span segment
-//! is committed at load; a span chunk a lowered rung leaves is opened, for
-//! idle cache only (live state never opens in the top rung's span), only
-//! once `commit_span` backs its segment; a span segment goes back
-//! (`release_span`) once the rung is raised past it and it holds nothing.
-//! With the flag off, the span is backed from the load as before.
+//! The top rung's span, backed from the load on every engine; an engine
+//! told rungs (`ChunkFacts::tells_rungs`, Metal) hears each one. Yield gives
+//! span segments back under pressure, its last shed, below the activation
+//! set aside (`release_span`), and the governor's grow backs them again,
+//! whole, before a raise takes them (`commit_span`); a raise into them
+//! waits on that grow, never on a fire.
 //!
 //! The fixture's span: segments 6 and 7 (chunks 48..64), the largest rung's
 //! activation 52..64.
@@ -30,20 +29,18 @@ impl Mover for Lane {
     }
 }
 
-/// An on-demand pool as it loads: at the smallest rung.
-fn loaded_on_demand() -> (SharedPool, FakeEngine) {
+/// A pool whose engine is told rungs, as it loads: at the smallest rung,
+/// its span backed.
+fn loaded_told() -> (SharedPool, FakeEngine) {
     let mut facts = facts();
-    facts.span_backed_on_demand = true;
-    (
-        SharedPool::new(&facts, 256).unwrap(),
-        FakeEngine::on_demand(),
-    )
+    facts.tells_rungs = true;
+    (SharedPool::new(&facts, 256).unwrap(), FakeEngine::new())
 }
 
-/// An on-demand pool raised to the largest rung, as a first wide pass
-/// takes it (the engine told), nothing held yet.
-pub(super) fn on_demand_pool() -> (SharedPool, FakeEngine) {
-    let (mut pool, engine) = loaded_on_demand();
+/// [`loaded_told`] raised to the largest rung, as a first wide pass takes
+/// it (the engine told), nothing held yet.
+pub(super) fn told_pool() -> (SharedPool, FakeEngine) {
+    let (mut pool, engine) = loaded_told();
     let raise = pool.plan_raise(2048).unwrap();
     assert_eq!(
         pool.raise_applied(&raise).unwrap(),
@@ -77,131 +74,160 @@ fn state_chunks(pool: &SharedPool, records: &[u32]) -> Vec<u32> {
     chunks
 }
 
-#[test]
-fn no_span_segment_is_committed_at_load() {
-    let (pool, _) = on_demand_pool();
-    let segments = pool.pool().segments();
-    assert_eq!(pool.pool().top_segment(), 6);
-    for segment in 6..8 {
-        assert_eq!(segments.state(segment), SegmentState::Uncommitted);
-    }
-    assert_eq!(pool.pool().span_committed(), 0);
-    assert_eq!(pool.mapped_segments(), 2, "the committed prefix only");
-    // The rung's activation still counts as room the engine backs itself.
-    assert_eq!(pool.rung(), 2048);
-    assert_eq!(pool.pool().committed_chunks(), 2 * SEGMENT + 12);
-    pool.pool().check();
+/// [`told_pool`] lowered to the 256 rung with every segment mapped, and
+/// yield's pressure walked down to `target`: the idle prefix goes first,
+/// then the span below the activation, its last shed.
+pub(super) fn shed_pool(target: u32) -> (SharedPool, FakeEngine) {
+    let (mut pool, mut engine) = told_pool();
+    assert_eq!(
+        walk_segments(&mut pool, 8, 0, &mut engine),
+        Retarget::Reached
+    );
+    pool.lower_rung(256).unwrap();
+    engine.calls.clear();
+    // Past what yield can give back (the null chunk's segment stays): it
+    // ends with no room, having shed all it could.
+    assert!(matches!(
+        walk_segments(&mut pool, target, 1, &mut engine),
+        Retarget::NoRoom { .. }
+    ));
+    (pool, engine)
 }
 
 #[test]
-fn a_span_chunk_opens_for_cache_only_once_its_segment_is_committed() {
-    let (mut pool, mut engine) = on_demand_pool();
-    // The whole prefix, no more: the span stays unbacked.
+fn the_span_is_backed_at_load_on_every_engine() {
+    for tells in [false, true] {
+        let mut facts = facts();
+        facts.tells_rungs = tells;
+        let pool = SharedPool::new(&facts, 256).unwrap();
+        for segment in 6..8 {
+            assert_eq!(
+                pool.pool().segments().state(segment),
+                SegmentState::Committed
+            );
+        }
+        assert_eq!(pool.pool().span_committed(), 2);
+        assert_eq!(pool.pool().span_segments(), 2);
+        assert_eq!(pool.pool().span_to_regrow(), None);
+        assert_eq!(pool.mapped_segments(), 4, "the loaded prefix and the span");
+        assert_eq!(pool.rung(), if tells { 16 } else { 2048 });
+        pool.pool().check();
+    }
+}
+
+/// Yield sheds in PLEX order: the idle prefix first, then the span below
+/// the activation set aside, its last; the activation's own segment stays.
+/// A raise into what it gave back waits on the governor's grow, which backs
+/// the span again first, whole, and the raise then moves nothing.
+#[test]
+fn yield_sheds_the_span_last_and_the_governor_s_grow_backs_it_before_a_raise() {
+    let (mut pool, mut engine) = shed_pool(1);
+    let sheds: Vec<&Call> = engine
+        .calls
+        .iter()
+        .filter(|call| matches!(call, Call::Release(_) | Call::ReleaseSpan(_)))
+        .collect();
+    assert!(
+        matches!(sheds.last(), Some(Call::ReleaseSpan(1))),
+        "the span last: {:?}",
+        engine.calls
+    );
+    assert!(
+        sheds[..sheds.len() - 1]
+            .iter()
+            .all(|call| matches!(call, Call::Release(_))),
+        "the prefix first"
+    );
     assert_eq!(
-        walk_segments(&mut pool, 6, 0, &mut engine),
+        pool.pool().span_committed(),
+        1,
+        "the activation's own stays"
+    );
+    assert_eq!(pool.pool().segments().state(6), SegmentState::Uncommitted);
+    assert_eq!(pool.pool().segments().state(7), SegmentState::Committed);
+    pool.pool().check();
+
+    // A raise into what yield gave back: refused by name, nothing moved.
+    assert_eq!(
+        pool.plan_raise(2048).unwrap_err(),
+        RungError::Pool(SlotError::SpanShed {
+            rung: 2048,
+            segments: 2
+        })
+    );
+    assert_eq!(pool.rung(), 256);
+
+    // The pressure lifts: the grow backs the span first, whole.
+    engine.calls.clear();
+    assert_eq!(
+        walk_segments(&mut pool, 8, 2, &mut engine),
         Retarget::Reached
     );
+    assert_eq!(engine.calls.first(), Some(&Call::CommitSpan(2)));
+    assert_eq!(pool.pool().span_committed(), 2);
+    let table = pool.pool().chunk_table().to_vec();
+    let raise = pool.plan_raise(2048).unwrap();
+    pool.raise_applied(&raise).unwrap();
+    pool.rung_told();
+    assert_eq!(pool.rung(), 2048);
+    assert_eq!(pool.pool().chunk_table(), table.as_slice(), "nothing moved");
+    pool.pool().check();
+}
+
+/// Yield gives back no span segment state or cache holds a chunk in, nor
+/// one under the activation set aside: at the top rung it sheds only the
+/// prefix.
+#[test]
+fn yield_never_sheds_a_span_segment_in_use_or_under_the_activation() {
+    // At the top rung the activation reaches into segment 6.
+    let (mut pool, mut engine) = told_pool();
+    assert_eq!(
+        walk_segments(&mut pool, 8, 0, &mut engine),
+        Retarget::Reached
+    );
+    engine.calls.clear();
+    assert!(matches!(
+        walk_segments(&mut pool, 1, 1, &mut engine),
+        Retarget::NoRoom { .. }
+    ));
     assert!(
         !engine
             .calls
             .iter()
-            .any(|call| matches!(call, Call::CommitSpan(_)))
+            .any(|call| matches!(call, Call::ReleaseSpan(_))),
+        "{:?}",
+        engine.calls
     );
-    // The 256 rung leaves 52..60 to idle cache; none of it is backed yet.
-    pool.lower_rung(256).unwrap();
+    assert_eq!(pool.pool().span_committed(), 2);
+    // Lowered with cache in segment 6: it stays too.
+    let (mut pool, mut engine) = told_pool();
     assert_eq!(
-        pool.pool().span_to_commit(),
-        Some(1),
-        "60.. down: segment 7 first"
-    );
-    let first = pool
-        .take_records(pool.records_available() as usize)
-        .unwrap();
-    assert!(
-        state_chunks(&pool, &first).iter().all(|&chunk| chunk < 48),
-        "no state in an unbacked span segment"
-    );
-    // The governor wants one segment more: the walk backs span segment 7.
-    assert_eq!(
-        walk_segments(&mut pool, 7, 0, &mut engine),
+        walk_segments(&mut pool, 8, 0, &mut engine),
         Retarget::Reached
     );
-    assert_eq!(engine.calls.last(), Some(&Call::CommitSpan(1)));
-    assert_eq!(pool.pool().span_committed(), 1);
-    assert_eq!(
-        pool.records_available(),
-        0,
-        "live state takes nothing of the span once backed"
-    );
-    let cached = span_cache(&mut pool, 4);
-    let lent = chunks_of(&pool, &cached);
-    assert_eq!(lent, [56, 57], "cache opens in the backed span segment");
-    for &chunk in &lent {
-        assert!(engine.backed(chunk), "cache on unbacked chunk {chunk}");
-    }
+    pool.lower_rung(256).unwrap();
+    let cached = span_cache(&mut pool, 2);
+    assert_eq!(chunks_of(&pool, &cached), [52]);
+    engine.calls.clear();
+    assert!(matches!(
+        walk_segments(&mut pool, 1, 1, &mut engine),
+        Retarget::NoRoom { .. }
+    ));
+    assert_eq!(pool.pool().span_committed(), 2, "cache holds segment 6");
     pool.pool().check();
 }
 
 #[test]
-fn a_span_segment_goes_back_once_the_rung_is_raised_past_it() {
-    let (mut pool, mut engine) = on_demand_pool();
-    assert_eq!(
-        walk_segments(&mut pool, 6, 0, &mut engine),
-        Retarget::Reached
-    );
-    pool.lower_rung(256).unwrap();
-    assert_eq!(
-        walk_segments(&mut pool, 7, 0, &mut engine),
-        Retarget::Reached
-    );
-    let all = pool
-        .take_records(pool.records_available() as usize)
-        .unwrap();
-    assert!(state_chunks(&pool, &all).iter().all(|&chunk| chunk < 52));
-    let cached = span_cache(&mut pool, 4);
-    assert!(chunks_of(&pool, &cached).iter().all(|&chunk| chunk >= 56));
-    // Left to cache and holding it: it stays.
-    assert_eq!(pool.pool().span_to_release(), None);
-    // The rung raised past segment 7: its cache is let go, nothing moves.
-    assert!(
-        pool.plan_raise(2048)
-            .is_err_and(|error| error.span_cached())
-    );
-    clear_span_cache(&mut pool, &cached, 10);
-    let raise = pool.plan_raise(2048).unwrap();
-    pool.apply_rung(&raise).unwrap();
-    assert!(state_chunks(&pool, &all).iter().all(|&chunk| chunk < 52));
-    // Nothing fenced: no copy reads the span.
-    assert_eq!(pool.pool().span_to_release(), Some(0));
-    assert_eq!(
-        walk_segments(&mut pool, 6, 12, &mut engine),
-        Retarget::Reached
-    );
-    assert_eq!(engine.calls.last(), Some(&Call::ReleaseSpan(0)));
-    assert_eq!(pool.pool().span_committed(), 0);
-    assert_eq!(pool.pool().segments().state(7), SegmentState::Uncommitted);
-    pool.pool().check();
-}
-
-#[test]
-fn with_the_flag_off_the_span_is_backed_from_the_load_as_before() {
+fn an_engine_not_told_rungs_starts_at_the_largest_rung_and_leaves_the_span_to_cache() {
     let mut pool = pool();
     let mut engine = FakeEngine::new();
-    for segment in 6..8 {
-        assert_eq!(
-            pool.pool().segments().state(segment),
-            SegmentState::Committed
-        );
-    }
     assert_eq!(pool.pool().committed_chunks(), 4 * SEGMENT);
     assert_eq!(
         walk_segments(&mut pool, 8, 0, &mut engine),
         Retarget::Reached
     );
     pool.lower_rung(16).unwrap();
-    assert_eq!(pool.pool().span_to_commit(), None);
-    assert_eq!(pool.pool().span_to_release(), None);
-    assert_eq!(pool.pool().span_committed(), 0);
+    assert_eq!(pool.next_move(8, 1), None, "nothing to back or give back");
     assert!(
         engine
             .calls
@@ -224,49 +250,40 @@ fn with_the_flag_off_the_span_is_backed_from_the_load_as_before() {
     pool.pool().check();
 }
 
-/// A refused `commit_span` (the device has no room for the placement heap)
-/// is a refused lend: the span chunks stay closed, the rung stays where it
-/// is, and state goes below or waits as any waiter. Nothing faults; a later
-/// walk may try again.
+/// A refused `commit_span` (the governor's grow of the span yield gave
+/// back): the span stays as yield left it, a raise into it still waits, and
+/// the grow is not asked again until room is freed. Nothing faults.
 #[test]
-fn a_refused_commit_span_lends_nothing() {
-    let (mut pool, mut engine) = on_demand_pool();
-    assert_eq!(
-        walk_segments(&mut pool, 6, 0, &mut engine),
-        Retarget::Reached
-    );
-    pool.lower_rung(256).unwrap();
+fn a_refused_grow_of_the_span_keeps_the_raise_waiting() {
+    let (mut pool, mut engine) = shed_pool(1);
     engine.refuse = true;
     assert_eq!(
-        walk_segments(&mut pool, 7, 0, &mut engine),
-        Retarget::Reached
-    );
-    assert_eq!(pool.pool().span_committed(), 0);
-    assert_eq!(pool.rung(), 256, "the rung stays");
-    assert_eq!(pool.pool().span_to_commit(), Some(1), "asked again later");
-    let all = pool
-        .take_records(pool.records_available() as usize)
-        .unwrap();
-    assert!(state_chunks(&pool, &all).iter().all(|&chunk| chunk < 48));
-    pool.pool().check();
-    // The device has room again: the next walk lends it.
-    engine.refuse = false;
-    assert_eq!(
-        walk_segments(&mut pool, 7, 0, &mut engine),
+        walk_segments(&mut pool, 8, 2, &mut engine),
         Retarget::Reached
     );
     assert_eq!(pool.pool().span_committed(), 1);
+    assert!(pool.plan_raise(2048).is_err_and(|error| error.span_shed()));
+    pool.block_span_commit(true);
+    engine.refuse = false;
+    assert!(
+        !matches!(pool.next_move(8, 3), Some(SegmentMove::CommitSpan { .. })),
+        "not asked again on the next wake"
+    );
+    pool.block_span_commit(false);
+    assert!(matches!(
+        pool.next_move(8, 3),
+        Some(SegmentMove::CommitSpan { n: 2 })
+    ));
 }
 
-/// On an on-demand pool a raise that moves nothing still reaches the
-/// engine (`set_rung`), which backs its carve there; refused, the raise is
-/// taken back and fires stay at the rung in hand. With the span backed from
-/// the load, the same raise makes no engine call.
+/// On an engine told rungs a raise reaches it (`set_rung`) before any fire
+/// of the wider rung; refused, the raise is taken back and fires stay at
+/// the rung in hand. An engine not told rungs hears no raise.
 #[tokio::test(flavor = "current_thread")]
-async fn a_move_free_raise_reaches_an_on_demand_engine_and_can_be_refused() {
-    let (mut pool, mut engine) = on_demand_pool();
+async fn a_raise_reaches_an_engine_told_rungs_and_can_be_refused() {
+    let (mut pool, mut engine) = told_pool();
     assert_eq!(
-        walk_segments(&mut pool, 6, 0, &mut engine),
+        walk_segments(&mut pool, 8, 0, &mut engine),
         Retarget::Reached
     );
     assert_eq!(pool.lower_rung(256).unwrap(), Some((2048, 256)));
@@ -278,7 +295,7 @@ async fn a_move_free_raise_reaches_an_on_demand_engine_and_can_be_refused() {
 
     // Refused: taken back, and the refusal answered.
     let refused = take_raise(&shared, |_| 2048, &lane).await.unwrap_err();
-    assert!(refused.contains("refused the carve"), "{refused}");
+    assert!(refused.contains("refused rung 2048's notice"), "{refused}");
     {
         let pool = shared.lock().unwrap();
         assert_eq!(pool.rung(), 256, "the rung in hand");
@@ -288,7 +305,7 @@ async fn a_move_free_raise_reaches_an_on_demand_engine_and_can_be_refused() {
     }
     assert!(engine.lock().unwrap().calls.is_empty());
 
-    // Backed: the engine hears it before any fire of the wider rung.
+    // Taken: the engine hears it before any fire of the wider rung.
     engine.lock().unwrap().refuse = false;
     let taken = take_raise(&shared, |_| 2048, &lane).await.unwrap();
     taken.expect("raised");
@@ -299,7 +316,7 @@ async fn a_move_free_raise_reaches_an_on_demand_engine_and_can_be_refused() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn with_the_flag_off_a_move_free_raise_makes_no_engine_call() {
+async fn an_engine_not_told_rungs_hears_no_raise() {
     let mut pool = pool();
     let mut engine = FakeEngine::new();
     assert_eq!(
@@ -322,9 +339,9 @@ async fn with_the_flag_off_a_move_free_raise_makes_no_engine_call() {
 /// retire fence: once every fire cut to the old rung has retired.
 #[test]
 fn a_lower_notice_comes_after_the_retire_fence() {
-    let (mut pool, mut engine) = on_demand_pool();
+    let (mut pool, mut engine) = told_pool();
     assert_eq!(
-        walk_segments(&mut pool, 6, 0, &mut engine),
+        walk_segments(&mut pool, 8, 0, &mut engine),
         Retarget::Reached
     );
     let mut walk = RungWalk::default();
@@ -354,14 +371,14 @@ fn a_lower_notice_comes_after_the_retire_fence() {
     assert_eq!(pool.lower_rung(256).unwrap(), Some((2048, 256)));
 }
 
-/// An on-demand pool starts at the smallest rung, the one the engine backs
-/// at load, fires cut to it. A first wider pass does not widen fires in
+/// A pool whose engine is told rungs starts at the smallest rung, the one
+/// the engine lays its fires by at load, fires cut to it. A first wider pass does not widen fires in
 /// place: the raise reaches the engine (`set_rung`) first, and only then is
 /// the cap lifted for the pass's fire.
 #[tokio::test(flavor = "current_thread")]
-async fn an_on_demand_pool_starts_at_the_smallest_rung_and_raises_through_the_engine() {
+async fn an_engine_told_rungs_starts_at_the_smallest_rung_and_raises_through_the_engine() {
     const ENGINE: usize = 56;
-    let (pool, mut engine) = loaded_on_demand();
+    let (pool, mut engine) = loaded_told();
     assert_eq!(pool.rung(), 16, "the floor rung");
     assert_eq!(pool.pool().act_reserved(), 1);
     assert_eq!(pool.start_cap(), 16);
@@ -395,13 +412,13 @@ async fn an_on_demand_pool_starts_at_the_smallest_rung_and_raises_through_the_en
     assert_eq!(
         fire_cap(ENGINE),
         u32::MAX,
-        "the cap lifted after the engine backed it"
+        "the cap lifted after the engine was told"
     );
 }
 
-/// With the flag off, a pool starts at the largest rung, fires uncut.
+/// An engine not told rungs starts at the largest rung, fires uncut.
 #[test]
-fn with_the_flag_off_a_pool_starts_at_the_largest_rung() {
+fn an_engine_not_told_rungs_starts_at_the_largest_rung() {
     const ENGINE: usize = 55;
     let pool = pool();
     assert_eq!(pool.rung(), 2048);
@@ -410,15 +427,12 @@ fn with_the_flag_off_a_pool_starts_at_the_largest_rung() {
     assert_eq!(fire_cap(ENGINE), u32::MAX);
 }
 
-/// Every power of two from 1 to 2048, the span backed on demand.
-fn fine_on_demand() -> (SharedPool, FakeEngine) {
+/// Every power of two from 1 to 2048, the engine told rungs.
+fn fine_told() -> (SharedPool, FakeEngine) {
     let mut facts = facts();
-    facts.span_backed_on_demand = true;
+    facts.tells_rungs = true;
     facts.act_chunks = (0..12).map(|k| (1u32 << k, 1 + k)).collect();
-    (
-        SharedPool::new(&facts, 256).unwrap(),
-        FakeEngine::on_demand(),
-    )
+    (SharedPool::new(&facts, 256).unwrap(), FakeEngine::new())
 }
 
 /// Mac's footprint at rest: on an on-demand pool with one live lane, a
@@ -428,7 +442,7 @@ fn fine_on_demand() -> (SharedPool, FakeEngine) {
 #[tokio::test(flavor = "current_thread")]
 async fn a_small_pass_raises_to_the_rung_covering_it_and_an_idle_pool_lowers_after_patience() {
     const ENGINE: usize = 54;
-    let (mut pool, mut engine) = fine_on_demand();
+    let (mut pool, mut engine) = fine_told();
     pool.set_max_lanes(512);
     assert_eq!(
         walk_segments(&mut pool, 6, 0, &mut engine),
@@ -534,57 +548,29 @@ async fn the_walk_never_lowers_under_the_live_lanes_decode() {
     assert_eq!(fire_cap(ENGINE), u32::MAX);
 }
 
-/// A refused commit_span is not asked again on the walk's next wake, only
-/// once room is freed lifts the block.
-#[test]
-fn a_refused_commit_span_is_asked_again_only_once_room_is_freed() {
-    let (mut pool, mut engine) = on_demand_pool();
-    assert_eq!(
-        walk_segments(&mut pool, 6, 0, &mut engine),
-        Retarget::Reached
-    );
-    pool.lower_rung(256).unwrap();
-    assert!(matches!(
-        pool.next_move(7, 1),
-        Some(SegmentMove::CommitSpan { n: 1 })
-    ));
-    // The engine refused it: blocked.
-    pool.block_span_commit(true);
-    assert!(
-        !matches!(pool.next_move(7, 2), Some(SegmentMove::CommitSpan { .. })),
-        "not asked again on the next wake"
-    );
-    // Room freed lifts it.
-    pool.block_span_commit(false);
-    assert!(matches!(
-        pool.next_move(7, 3),
-        Some(SegmentMove::CommitSpan { n: 1 })
-    ));
-}
-
 /// `can_grow` is whether the walk's next step maps a segment, by the one
 /// function both take ([`SharedPool::grow_step`]), over every pool state
-/// the stall could stand in: the prefix whole or not, a span lent or not,
-/// a span commit refused or not, the target above what is mapped or at it,
-/// and a waiter short of kv, of state, or none. Spelled out apart from the
-/// code: a live waiter grows only into the prefix, under a target above it,
-/// and the lent span is never its step.
+/// the stall could stand in: the prefix whole or not, the span yield gave
+/// back or whole, a span commit refused or not, the target above what is
+/// mapped or at it, and a waiter short of kv, of state, or none. Spelled
+/// out apart from the code: a live waiter grows only into the prefix,
+/// under a target above it, and backing the span again is never its step.
 #[test]
 fn can_grow_is_whether_the_walk_s_next_step_maps_a_segment() {
     const ENGINE: usize = 46;
     let waiters = [None, Some(Short::Kv), Some(Short::State)];
     let mut cases = 0;
     for prefix_whole in [false, true] {
-        for lent in [false, true] {
+        for shed in [false, true] {
             for blocked in [false, true] {
                 for below in [false, true] {
                     for waiter in waiters {
                         let case = format!(
-                            "prefix_whole={prefix_whole} lent={lent} blocked={blocked} \
+                            "prefix_whole={prefix_whole} shed={shed} blocked={blocked} \
                              below={below} waiter={waiter:?}"
                         );
-                        let mut pool = grow_pool(prefix_whole, lent);
-                        assert_eq!(pool.pool().span_to_commit().is_some(), lent, "{case}");
+                        let mut pool = grow_pool(prefix_whole, shed);
+                        assert_eq!(pool.pool().span_to_regrow().is_some(), shed, "{case}");
                         pool.block_span_commit(blocked);
                         if let Some(short) = waiter {
                             wait_short(&mut pool, short);
@@ -614,8 +600,9 @@ fn can_grow_is_whether_the_walk_s_next_step_maps_a_segment() {
                             );
                         }
                         assert!(
-                            !matches!(step, Some(SegmentMove::CommitSpan { .. })),
-                            "{case}: nothing the walk goes toward backs the lent span"
+                            waiter.is_none()
+                                || !matches!(step, Some(SegmentMove::CommitSpan { .. })),
+                            "{case}: no live waiter's step backs the span again"
                         );
                         cases += 1;
                     }
@@ -626,19 +613,17 @@ fn can_grow_is_whether_the_walk_s_next_step_maps_a_segment() {
     assert_eq!(cases, 48);
 }
 
-/// Mac's over-demand stall (Metal, the span backed on demand): the prefix
-/// whole and a lowered rung lending span no segment backs, a live waiter
-/// short of room is told the pool does not grow, and the walk backs no span
-/// for it, so the planner goes on to demote, sweep and evict. Before,
-/// `can_grow` said yes for the lent span while the walk's goal stopped at
-/// the prefix: the planner waited on a grow that never came, and nothing
-/// was ever evicted.
+/// Mac's over-demand stall, on the span yield gave back: the prefix whole,
+/// a live waiter short of room is told the pool does not grow, and the walk
+/// backs no span for it (live state never opens there), so the planner goes
+/// on to demote, sweep and evict rather than wait on a grow that never
+/// comes.
 #[test]
-fn a_live_waiter_beside_an_unbacked_lent_span_is_told_the_pool_does_not_grow() {
+fn a_live_waiter_beside_the_span_yield_gave_back_is_told_the_pool_does_not_grow() {
     const ENGINE: usize = 48;
     for short in [Short::Kv, Short::State] {
         let mut pool = grow_pool(true, true);
-        assert_eq!(pool.pool().span_to_commit(), Some(1));
+        assert_eq!(pool.pool().span_to_regrow(), Some(2));
         wait_short(&mut pool, short);
         let mapped = pool.mapped_segments();
         let shared: Shared = Arc::new(Mutex::new(pool));
@@ -697,7 +682,6 @@ async fn a_promised_grow_the_walk_does_not_make_is_told_as_no_grow() {
 async fn an_engine_told_rungs_on_a_span_backed_at_load_hears_each_rung_and_nothing_else() {
     let mut facts = facts();
     facts.tells_rungs = true;
-    assert!(!facts.span_backed_on_demand);
     let mut pool = SharedPool::new(&facts, 256).unwrap();
     assert!(pool.tells_rungs(), "its own fact, the span backed at load");
     assert_eq!(pool.rung(), 16, "it starts at the smallest rung");

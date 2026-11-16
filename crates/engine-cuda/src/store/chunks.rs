@@ -1025,7 +1025,6 @@ impl Chunks {
         let max = u32::try_from(u64::from(total).div_ceil(u64::from(layout.segment_chunks.max(1))))
             .unwrap_or(u32::MAX);
         ChunkFacts {
-            span_backed_on_demand: false,
             tells_rungs: false,
             act_span_chunks: None,
             chunk_bytes: layout.chunk_bytes,

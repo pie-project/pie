@@ -106,12 +106,6 @@ pub struct SlotPoolFacts {
     pub shapes: Vec<SlotShape>,
     /// `(rung tokens, activation chunks)`, ascending.
     pub act_chunks: Vec<(u32, u32)>,
-    /// The span under the largest rung's activation is backed on demand
-    /// (`ChunkFacts::span_backed_on_demand`): not committed at load; the
-    /// engine backs its own activation carve, and a span segment is
-    /// committed here ([`SlotPool::commit_span`]) before state opens a
-    /// chunk in it.
-    pub span_on_demand: bool,
     /// The chunks a rung's activation may take as the engine stands
     /// (`ChunkFacts::act_span_chunks`); `None`: nothing of the engine's
     /// own bounds it.
@@ -192,6 +186,14 @@ pub enum SlotError {
     /// (`SharedPool::widest_fit`).
     #[error("rung {rung}'s activation takes {chunks} chunks, past the top rung's span of {span}")]
     PastSpan { rung: u32, chunks: u32, span: u32 },
+    /// A rung whose activation lies in span segments yield gave back under
+    /// pressure (its last shed): set aside once the governor's grow backs
+    /// them again (`Engine::commit_span`), never before.
+    #[error(
+        "rung {rung}'s activation needs the top {segments} span segments, which yield gave \
+         back: the governor's grow backs them again"
+    )]
+    SpanShed { rung: u32, segments: u32 },
     #[error("a rung evacuation no longer matches the pool")]
     StaleRung,
     /// A claim named a chunk that cannot be taken whole as it stands.
@@ -487,11 +489,11 @@ pub struct SlotPool {
     /// The largest rung's activation chunks, the top of the range.
     act_max: u32,
     /// The first segment under the largest rung's activation: it and those
-    /// above are committed from the load and never evacuated or released,
-    /// unless the span is backed on demand ([`SlotPoolFacts::span_on_demand`]).
+    /// above (the top rung's span) are committed from the load and never
+    /// evacuated; given back only by yield, its last shed, below the
+    /// activation set aside ([`Self::release_span`]), and backed again by
+    /// the governor's grow ([`Self::commit_span`]).
     top_segment: u32,
-    /// See [`SlotPoolFacts::span_on_demand`].
-    span_on_demand: bool,
     /// What the engine states its activation span covers as it stands
     /// ([`Self::set_act_span`]): the statement itself, nothing derived.
     act_span: Option<u32>,
@@ -533,15 +535,14 @@ impl SlotPool {
             "the reserved chunks and the largest rung's activation outgrow the pool"
         );
         let mut segments = Segments::new(total, facts.segment_chunks, facts.committed_segments);
-        // The largest rung's activation is backed from the load, unless the
-        // span is backed on demand.
+        // The top rung's span is backed from the load.
         let top_segment = if act_max == 0 {
             segments.count()
         } else {
             segments.of(total - act_max)
         };
         for segment in top_segment..segments.count() {
-            if !facts.span_on_demand && segments.state(segment) == SegmentState::Uncommitted {
+            if segments.state(segment) == SegmentState::Uncommitted {
                 segments.set_state(segment, SegmentState::Committed);
             }
         }
@@ -564,7 +565,6 @@ impl SlotPool {
             max_lanes: u32::MAX,
             act_max,
             top_segment,
-            span_on_demand: facts.span_on_demand,
             act_span: facts.act_span,
             chunks: vec![FREE_CHUNK; total as usize],
             logical_to_physical: (0..total).collect(),
@@ -654,27 +654,9 @@ impl SlotPool {
     }
 
     /// Chunks with memory under them for the pool's use: the committed
-    /// segments' and, where the span is backed on demand, the activation's
-    /// in span segments not committed here (the engine backs its carve).
+    /// segments'.
     pub fn committed_chunks(&self) -> u32 {
-        self.committed_for(self.act)
-    }
-
-    /// [`Self::committed_chunks`] with an activation of `act` chunks.
-    fn committed_for(&self, act: u32) -> u32 {
-        let committed = self.segments.committed_chunks();
-        if !self.span_on_demand {
-            return committed;
-        }
-        let from = self.total - act;
-        let carve: u32 = (self.top_segment..self.segments.count())
-            .filter(|&segment| self.segments.state(segment) == SegmentState::Uncommitted)
-            .map(|segment| {
-                let range = self.segments.range(segment);
-                range.end.saturating_sub(range.start.max(from))
-            })
-            .sum();
-        committed + carve
+        self.segments.committed_chunks()
     }
 
     /// Activation chunks a fire at `rung` tokens takes: the smallest rung at
@@ -871,7 +853,7 @@ impl SlotPool {
 
     fn rung_budget(&self, act: u32) -> Result<(), SlotError> {
         let needed = self.reserved + self.held + act;
-        let committed = self.committed_for(act);
+        let committed = self.committed_chunks();
         if needed > committed {
             return Err(SlotError::Budget { needed, committed });
         }
@@ -929,7 +911,8 @@ impl SlotPool {
     }
 
     /// The activation chunks rung `rung` takes, refused where they reach
-    /// past the top rung's span.
+    /// past the top rung's span, or into span segments yield gave back
+    /// ([`SlotError::SpanShed`]: the governor's grow backs them again).
     fn act_in_span(&self, rung: u32) -> Result<u32, SlotError> {
         let act = self.act_chunks(rung);
         if act > self.act_max {
@@ -939,7 +922,20 @@ impl SlotPool {
                 span: self.act_max,
             });
         }
+        let segments = self.span_for(act);
+        if segments > self.span_committed() {
+            return Err(SlotError::SpanShed { rung, segments });
+        }
         Ok(act)
+    }
+
+    /// The span segments, counted from the top, an activation of `act`
+    /// chunks lies in.
+    fn span_for(&self, act: u32) -> u32 {
+        if act == 0 {
+            return 0;
+        }
+        self.segments.count() - self.segments.of(self.total - act)
     }
 
     /// Whether any slot of physical chunk `physical` has a live reference.
@@ -974,15 +970,6 @@ impl SlotPool {
             from: self.rung(),
             act,
         })
-    }
-
-    /// The chunks raising the activation to `rung` lacks now: past what is
-    /// committed. Idle cache in the span is no room to fund: it is cleared
-    /// ([`Self::span_cached`]). 0 when the raise fits.
-    pub fn rung_short(&self, rung: u32) -> u32 {
-        let act = self.act_chunks(rung).min(self.act_max);
-        let cached = self.in_way(self.total - act).len() as u32;
-        (self.reserved + self.held - cached + act).saturating_sub(self.committed_for(act))
     }
 
     /// The chunks of idle cache in the span raising the activation to
@@ -1579,11 +1566,6 @@ impl SlotPool {
             SegmentState::Draining { .. }
         ) {
             Some("its segment is draining")
-        } else if self.span_on_demand
-            && self.segments.of(physical) >= self.top_segment
-            && self.segments.state(self.segments.of(physical)) == SegmentState::Uncommitted
-        {
-            Some("its span segment is not backed yet (commit_span)")
         } else {
             None
         }
@@ -1871,23 +1853,21 @@ impl SlotPool {
         self.reopen(physical);
     }
 
-    // ---- the span backed on demand ----
+    // ---- the span's yield shed and grow ----
 
-    /// Whether the span is backed on demand ([`SlotPoolFacts::span_on_demand`]).
-    pub fn span_on_demand(&self) -> bool {
-        self.span_on_demand
-    }
-
-    /// Span segments committed here, counted from the top of the pool: the
-    /// `n` of `commit_span(n)` (0 where the span is backed from the load).
+    /// Span segments committed, counted from the top of the pool: the `n`
+    /// of `commit_span(n)` and `release_span(n)`. Every one of them from
+    /// the load until yield gives some back.
     pub fn span_committed(&self) -> u32 {
-        if !self.span_on_demand {
-            return 0;
-        }
         (self.top_segment..self.segments.count())
             .rev()
             .take_while(|&segment| self.segments.state(segment) == SegmentState::Committed)
             .count() as u32
+    }
+
+    /// The span's segments, the top rung's span's whole.
+    pub fn span_segments(&self) -> u32 {
+        self.segments.count() - self.top_segment
     }
 
     /// The span segment counted `n`th from the top (`n` from 1).
@@ -1895,34 +1875,19 @@ impl SlotPool {
         self.segments.count() - n
     }
 
-    /// The `n` of the next `commit_span(n)` that backs a span chunk the
-    /// lowered rung leaves to idle cache and no segment backs yet: the highest
-    /// such segment's, so the span is backed from the top down. `None`
-    /// where every lent span chunk is backed, nothing is lent, or the
-    /// engine holds back part of the range (no state opens past it then).
-    pub fn span_to_commit(&self) -> Option<u32> {
-        if !self.span_on_demand || self.ceiling < self.total {
-            return None;
-        }
-        let limit = self.state_limit();
-        let start = self
-            .segments
-            .range(self.top_segment.min(self.segments.count()))
-            .start;
-        if self.top_segment >= self.segments.count() || limit <= start {
-            return None;
-        }
-        let highest_lent = self.segments.of(limit - 1);
-        (self.top_segment..=highest_lent)
-            .rev()
-            .find(|&segment| self.segments.state(segment) == SegmentState::Uncommitted)
-            .map(|segment| self.segments.count() - segment)
+    /// The `n` of the governor's grow's `commit_span(n)`: the whole span,
+    /// where yield gave some of it back and the engine binds it (no
+    /// ceiling held below it). `None` where the span is whole.
+    pub fn span_to_regrow(&self) -> Option<u32> {
+        let whole = self.span_segments();
+        (self.span_committed() < whole && self.ceiling >= self.total).then_some(whole)
     }
 
-    /// The engine backed the top `n` span segments (`commit_span(n)`):
-    /// their chunks the rung leaves open for idle cache.
+    /// The engine backed the top `n` span segments again
+    /// (`Engine::commit_span(n)`, the governor's grow): their chunks open
+    /// as before yield gave them back.
     pub fn commit_span(&mut self, n: u32) {
-        let n = n.min(self.segments.count() - self.top_segment);
+        let n = n.min(self.span_segments());
         for k in 1..=n {
             let segment = self.span_segment(k);
             if self.segments.state(segment) == SegmentState::Uncommitted {
@@ -1934,19 +1899,19 @@ impl SlotPool {
         }
     }
 
-    /// The `n` of the next `release_span(n)`: the lowest span segments
-    /// committed here that the rung no longer leaves to cache (wholly in
-    /// the activation, the rung raised past them) and hold no state chunk,
-    /// given back from the bottom up.
-    /// `None` where none is.
-    pub fn span_to_release(&self) -> Option<u32> {
+    /// The `n` of yield's last shed, `release_span(n)`: the lowest span
+    /// segments committed that the activation set aside does not reach
+    /// and that hold no chunk (the span a lowered rung leaves to idle
+    /// cache, the cache gone), given back from the bottom up. `None` where
+    /// none is.
+    pub fn span_to_shed(&self) -> Option<u32> {
         let committed = self.span_committed();
         let limit = self.state_limit();
         let mut keep = committed;
         while keep > 0 {
             let segment = self.span_segment(keep);
             let range = self.segments.range(segment);
-            let idle = range.start >= limit && self.segments.used(segment) == 0;
+            let idle = range.end <= limit && self.segments.used(segment) == 0;
             if !idle {
                 break;
             }
@@ -1955,9 +1920,9 @@ impl SlotPool {
         (keep < committed).then_some(keep)
     }
 
-    /// Gives back the span segments below the top `n` committed here
-    /// ([`Self::span_to_release`] says which may go), ahead of the
-    /// engine's `release_span(n)`.
+    /// Gives back the span segments below the top `n` committed
+    /// ([`Self::span_to_shed`] says which may go), ahead of the engine's
+    /// `release_span(n)`.
     pub fn release_span(&mut self, n: u32) {
         for k in n + 1..=self.span_committed() {
             let segment = self.span_segment(k);
@@ -2218,9 +2183,6 @@ impl SlotPool {
         assert_eq!(held, self.held);
         for segment in 0..self.segments.count() {
             assert_eq!(seg_used[segment as usize], self.segments.used(segment));
-            if segment >= self.top_segment && !self.span_on_demand {
-                assert_eq!(self.segments.state(segment), SegmentState::Committed);
-            }
             for chunk in self.segments.range(segment) {
                 assert_eq!(self.open.get(chunk), self.openable(chunk), "chunk {chunk}");
                 if !self.free.get(chunk) && chunk >= self.reserved {
@@ -2322,7 +2284,6 @@ mod tests {
                 })
                 .collect(),
             act_chunks: act_chunks.to_vec(),
-            span_on_demand: false,
             act_span: None,
         }
     }
@@ -2678,7 +2639,6 @@ mod tests {
         let (mut pool, live) = lowered_and_full();
         let cached = pool.acquire(cache(1), 0, 10).unwrap();
         assert_eq!(pool.span_cached(4096), 3, "chunks 90..93 hold cache");
-        assert_eq!(pool.rung_short(4096), 0, "no room to fund");
         assert_eq!(
             pool.plan_rung(4096).unwrap_err(),
             SlotError::SpanCached {

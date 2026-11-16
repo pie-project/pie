@@ -44,13 +44,13 @@ pub struct SharedGrow {
     /// span's idle cache let go behind it): none is tried again until room
     /// is freed ([`Self::room_freed`]), that fire's retirement.
     raise_blocked: Arc<AtomicBool>,
-    /// The engine refused the last raise's carve: the device is short of
-    /// the span's memory, which yield gave back under pressure (its last
-    /// shed, the rung). No fire's retirement brings it back; none is tried
-    /// again until the governor grows the pool again
-    /// ([`PoolTarget::retarget`] above the target it had), the balloon
-    /// re-inflating.
-    carve_refused: Arc<AtomicBool>,
+    /// The last raise's activation lies in span segments yield gave back
+    /// under pressure (its last shed, [`super::SlotError::SpanShed`]). No
+    /// fire's retirement brings them back; none is tried again until the
+    /// governor grows the pool again ([`PoolTarget::retarget`] above the
+    /// target it had, the balloon re-inflating) or the walk has backed the
+    /// span again (`commit_span`).
+    span_shed: Arc<AtomicBool>,
     /// The planner waits on a grow this walk was told to make
     /// ([`Self::promise_grow`]): a walk that ends with the promise standing
     /// tells it no grow is coming ([`Self::no_grow`]).
@@ -92,7 +92,7 @@ impl SharedGrow {
                 u32::try_from(live).unwrap_or(u32::MAX)
             }),
             raise_blocked: Arc::new(AtomicBool::new(false)),
-            carve_refused: Arc::new(AtomicBool::new(false)),
+            span_shed: Arc::new(AtomicBool::new(false)),
             grow_waiter: Arc::new(AtomicBool::new(false)),
             no_grow: Arc::new(move || {
                 if let Some(planner) = crate::planner::planner_for(model, engine) {
@@ -223,7 +223,7 @@ impl SharedGrow {
                 // A raise is taken in the hold it was planned in: no slot is
                 // handed out between, and the engine's notice follows.
                 let blocked = self.raise_blocked.load(Ordering::Acquire)
-                    || self.carve_refused.load(Ordering::Acquire);
+                    || self.span_shed.load(Ordering::Acquire);
                 // A raise that finds idle cache in its span asks it cleared:
                 // nothing opens there for cache from now, and its owner lets
                 // go what lies there (below, outside the pool's lock). A
@@ -265,6 +265,14 @@ impl SharedGrow {
             };
             let step = match step {
                 Ok(step) => step,
+                Err(error) if error.span_shed() => {
+                    // Its activation lies in span segments yield gave back:
+                    // the governor's grow backs them again, never a fire's
+                    // retirement.
+                    self.span_shed.store(true, Ordering::Release);
+                    tracing::debug!(engine = self.engine, %error, goal, "the activation rung waits for the governor's grow");
+                    return;
+                }
                 Err(error) => {
                     // Idle cache in the span is let go by its owner, behind
                     // the last fire that may read it. Where no such fire is
@@ -361,18 +369,18 @@ impl SharedGrow {
                     }
                 }
                 RungStep::Raise { rung, .. } => {
-                    // The engine backs its carve (on demand); refused, the
-                    // raise is taken back, fires stay cut to the rung in
-                    // hand, and no raise is tried again until the governor
-                    // grows the pool. Nothing moves.
+                    // The engine is told the rung it lays its fires by;
+                    // refused, the raise is taken back, fires stay cut to
+                    // the rung in hand, and no raise is tried again until
+                    // room is freed. Nothing moves.
                     let mover = super::programs::LaneMover {
                         engine: self.engine,
                     };
                     if let Err(refused) =
                         super::programs::carry_raise(&self.shared, owed.0, &mover).await
                     {
-                        tracing::debug!(engine = self.engine, %refused, "the walk's raise waits for the governor's grow");
-                        self.carve_refused.store(true, Ordering::Release);
+                        tracing::warn!(engine = self.engine, %refused, "the engine refused a raise's notice");
+                        self.raise_blocked.store(true, Ordering::Release);
                         super::rung_changed(self.engine);
                         return;
                     }
@@ -435,10 +443,10 @@ impl SharedGrow {
         self.raise_blocked.store(true, Ordering::Release);
     }
 
-    /// The engine refused the walk's last raise's carve; for a test.
+    /// The walk's last raise waits on the span yield gave back; for a test.
     #[cfg(test)]
-    pub(crate) fn refuse_carve_for_test(&self) {
-        self.carve_refused.store(true, Ordering::Release);
+    pub(crate) fn span_shed_for_test(&self) -> bool {
+        self.span_shed.load(Ordering::Acquire)
     }
 
     /// Looks again now: a waiter is short.
@@ -596,6 +604,11 @@ impl SharedGrow {
                     }
                     if let Some(n) = span {
                         self.shared.lock().unwrap().span_committed(n);
+                        // The span is whole again: a raise waiting on it is
+                        // tried now.
+                        self.span_shed.store(false, Ordering::Release);
+                        super::rung_changed(self.engine);
+                        super::ask_walk(self.engine);
                         if let Some(planner) = crate::planner::planner_for(self.model, self.engine)
                         {
                             planner.pages_freed();
@@ -614,8 +627,8 @@ impl SharedGrow {
                     if commit.is_some() || span.is_some() {
                         self.refused.store(true, Ordering::Release);
                     }
-                    // A refused lend is not asked again on the next wake,
-                    // only once room is freed.
+                    // A refused grow of the span is not asked again on the
+                    // next wake, only once room is freed.
                     if span.is_some() {
                         self.shared.lock().unwrap().block_span_commit(true);
                     }
@@ -673,10 +686,10 @@ impl PoolTarget for SharedGrow {
         let segments = u32::try_from(segments).unwrap_or(u32::MAX);
         let was = self.target.swap(segments, Ordering::AcqRel);
         // The governor grows the pool again (yield's pressure lifted): a
-        // raise whose carve the engine refused for want of the memory yield
-        // gave back may be tried now.
+        // raise into the span yield gave back may be tried now, the walk
+        // backing the span again first (`SharedPool::grow_step`).
         if segments > was {
-            self.carve_refused.store(false, Ordering::Release);
+            self.span_shed.store(false, Ordering::Release);
         }
         self.wake.notify_one();
         let mapped = self.shared.lock().unwrap().mapped_segments();
@@ -850,44 +863,54 @@ mod tests {
         );
     }
 
-    /// Yield's last shed gives the span's memory back under pressure (the
-    /// rung lowered, its carve given back): a raise asked then whose carve
-    /// the engine refuses for want of it re-arms on the governor's grow,
-    /// the pressure lifted, never on a fire's retirement (which brings no
-    /// device memory back). With nothing in flight it is applied after the
-    /// grow, no fire retiring.
+    /// Yield's last shed gives the span below the activation back under
+    /// pressure (`release_span`): a raise asked then, whose activation lies
+    /// in what it gave back, is refused by name and re-arms on the
+    /// governor's grow (the pressure lifted, the span backed again), never
+    /// on a fire's retirement, which brings no span back. With nothing in
+    /// flight it is applied after the grow, no fire retiring.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_raise_whose_carve_yield_gave_back_re_arms_on_the_governor_s_grow() {
+    async fn a_raise_into_the_span_yield_gave_back_re_arms_on_the_governor_s_grow() {
         const ENGINE: usize = 51;
-        let pool = super::super::tests::pool();
+        let mut pool = super::super::tests::pool();
         let mapped = u64::from(pool.mapped_segments());
+        // Under pressure, yield's last shed: lowered, the span below the
+        // activation given back.
+        pool.lower_rung(256).unwrap();
+        let n = pool
+            .pool()
+            .span_to_shed()
+            .expect("segment 6 below the 256 carve");
+        pool.pool_mut().release_span(n);
         let shared: Shared = Arc::new(std::sync::Mutex::new(pool));
         let mut grow = SharedGrow::new(0, ENGINE, shared.clone());
-        let _ = grow.retarget(mapped);
-        // Under pressure: the governor's target falls, and yield sheds the
-        // rung last, the span's memory given back.
-        let _ = grow.retarget(mapped - 2);
-        shared.lock().unwrap().lower_rung(16).unwrap();
-        // A raise asked then: the engine refuses its carve.
+        let _ = grow.retarget(mapped - 1);
+        // A raise asked then: its activation lies in the span given back.
         let _want = super::super::want_rows(ENGINE, 2048);
-        grow.refuse_carve_for_test();
         grow.walk_rung().await;
         assert_eq!(
             shared.lock().unwrap().rung(),
-            16,
+            256,
             "refused: the rung in hand"
         );
-        // A fire retiring frees no device memory: nothing is tried again.
+        assert!(grow.span_shed_for_test(), "it waits on the governor's grow");
+        // A fire retiring brings no span back: nothing is tried again.
         grow.room_freed();
         grow.walk_rung().await;
         assert_eq!(
             shared.lock().unwrap().rung(),
-            16,
+            256,
             "retirement does not re-arm it"
         );
-        // The pressure lifts: the governor grows the pool again, and the
-        // raise is applied, no fire retiring.
+        assert!(grow.span_shed_for_test());
+        // The pressure lifts: the governor grows the pool again and the
+        // span is backed again (the engine's `commit_span`); the raise is
+        // applied, no fire retiring.
         let _ = grow.retarget(mapped);
+        assert!(!grow.span_shed_for_test(), "the grow re-arms it");
+        let regrow = shared.lock().unwrap().pool().span_to_regrow();
+        assert_eq!(regrow, Some(2));
+        shared.lock().unwrap().span_committed(2);
         grow.walk_rung().await;
         assert_eq!(shared.lock().unwrap().rung(), 2048, "raised after the grow");
     }

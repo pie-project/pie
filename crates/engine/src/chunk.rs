@@ -95,25 +95,13 @@ pub struct ChunkFacts {
     /// nothing measured.
     #[serde(default)]
     pub outside_bytes: u64,
-    /// The span under the largest rung's activation is backed on demand,
-    /// not from the load: the engine backs its own activation carve before
-    /// a fire, and the runtime backs a span segment
-    /// ([`crate::Engine::commit_span`]) before it opens any chunk there for
-    /// state (lent by a lowered rung), giving it back
-    /// ([`crate::Engine::release_span`]) once no state chunk is open there
-    /// and no rung lends it. Where a mapped heap is resident whether touched
-    /// or not (Metal). `false`: the whole span is backed from the load.
-    #[serde(default)]
-    pub span_backed_on_demand: bool,
     /// The engine is told every rung change ([`crate::Engine::set_rung`]),
-    /// from the smallest rung it starts at, whether or not its span is
-    /// backed on demand: its fires lay their regions by the rung it holds
-    /// (Metal's carve bookkeeping), so a raise reaches it before any fire
-    /// of the wider rung, and a lower once every wider fire has retired. On
-    /// a span backed from the load the notice moves bookkeeping only;
-    /// nothing is backed or refused. `false`: the engine takes a fire of
-    /// any rung as it comes. A span backed on demand is told rungs either
-    /// way.
+    /// from the smallest rung it starts at: its fires lay their regions by
+    /// the rung it holds (Metal's carve bookkeeping), so a raise reaches it
+    /// before any fire of the wider rung, and a lower once every wider fire
+    /// has retired. The span is backed from the load on every engine, so
+    /// the notice moves bookkeeping only; nothing is backed or refused by
+    /// it. `false`: the engine takes a fire of any rung as it comes.
     #[serde(default)]
     pub tells_rungs: bool,
     /// The chunks from the range's end a rung's activation may take as the
@@ -533,7 +521,6 @@ impl ChunkFacts {
             eager_rungs: Vec::new(),
             held_bytes: 0,
             outside_bytes: 0,
-            span_backed_on_demand: false,
             tells_rungs: false,
             act_span_chunks: None,
             host_chunks: host,

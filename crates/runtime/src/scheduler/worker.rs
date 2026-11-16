@@ -519,14 +519,14 @@ pub(super) enum QueuedItem {
 /// carry, held as a rung want: the most they asked since the scheduler
 /// last slept with nothing to do, so a batch that breathes between its
 /// steps does not move the rung back and forth each step. A raise the ask
-/// cannot take at once is funded under one of the batch's passes, and the
-/// pipelines it carries wider than a row wait for it, before admission
-/// ([`Self::waits`]).
+/// cannot take at once is waited on while the batch carries a launch wider
+/// than a row, and the pipelines it carries wider than a row wait for it,
+/// before admission ([`Self::waits`]).
 #[derive(Default)]
 struct BatchWant {
     /// The rows asked, the ask, and the cap the raise toward them reaches.
     held: Option<(usize, crate::store::shared::RungWant, u32)>,
-    funding: Option<crate::pipeline::fire::BatchRaise>,
+    raise: Option<crate::pipeline::fire::BatchRaise>,
 }
 
 impl BatchWant {
@@ -536,8 +536,8 @@ impl BatchWant {
         }
         let rows32 = u32::try_from(rows).unwrap_or(u32::MAX);
         let want = crate::store::shared::want_rows(engine, rows32);
-        // A funding for a narrower ask is started again at this one.
-        self.funding = None;
+        // A wait for a narrower ask is started again at this one.
+        self.raise = None;
         // As a pass's ask does: the rung is raised at once where nothing
         // moves, and a cap the walker lowered behind a rung still up is
         // lifted back, so the batch is not cut while the walk catches up.
@@ -571,19 +571,18 @@ impl BatchWant {
             .is_some_and(|&(.., reach)| crate::store::shared::fire_cap(engine) < reach)
     }
 
-    /// Funds the raise the held ask lacks under `funder` (a queued pass's
-    /// process and its quorum), as a pass funds its own: the room is asked
-    /// of the planner, and the walker moves the span's state out. Once the
-    /// cap reaches the ask, the funding goes.
-    fn fund(&mut self, engine: usize, funder: impl FnOnce() -> Option<(uuid::Uuid, uuid::Uuid)>) {
+    /// Waits on the raise the held ask lacks while `wide` (a launch wider
+    /// than a row is queued), as a pass waits on its own. Once the cap
+    /// reaches the ask, the wait goes.
+    fn await_raise(&mut self, engine: usize, wide: bool) {
         if !self.short(engine) {
-            self.funding = None;
+            self.raise = None;
             return;
         }
-        if self.funding.is_some() {
+        if self.raise.is_some() {
             return;
         }
-        // The reach again, before a raise is funded toward it: the
+        // The reach again, before a raise is waited on toward it: the
         // programs' fire terms may have moved the widest rung that fits.
         let Some(shared) = crate::store::registry::try_get(0, engine).and_then(|s| s.shared) else {
             return;
@@ -596,29 +595,25 @@ impl BatchWant {
         if crate::store::shared::fire_cap(engine) >= *reach {
             return;
         }
-        if let Some((pid, quorum)) = funder() {
-            self.funding = crate::pipeline::fire::BatchRaise::start(engine, pid, quorum, rows);
+        if wide {
+            self.raise = crate::pipeline::fire::BatchRaise::start(engine, rows);
         }
     }
 
-    /// Whether the batch's wider launches wait for the raise the ask is
-    /// funded for: a wave arriving at a lowered rung is cut at the rung it
+    /// Whether the batch's wider launches wait for the raise the ask waits
+    /// on: a wave arriving at a lowered rung is cut at the rung it
     /// asked, never at the narrower one standing, as a pass waits for its
     /// own raise. They wait at the gate, before admission, each pipeline
     /// whole and in order (`scan_queue`): an admitted launch held back
     /// while one behind it in its pipeline went would advance its channels'
-    /// cursors out of order. A raise whose room is refused holds nothing
-    /// (the passes' own asks say so by name).
+    /// cursors out of order.
     fn waits(&self, engine: usize) -> bool {
-        self.funding
-            .as_ref()
-            .is_some_and(|funding| !funding.refused())
-            && self.short(engine)
+        self.raise.is_some() && self.short(engine)
     }
 
     fn release(&mut self) {
         self.held = None;
-        self.funding = None;
+        self.raise = None;
     }
 }
 
@@ -1127,7 +1122,6 @@ impl SchedulerHandle {
                     crate::store::shared::programs::fund_span(
                         &shared,
                         || crate::store::shared::fire_cap(engine),
-                        &crate::store::shared::programs::Planner { pid, quorum: pid },
                         &crate::store::shared::programs::LaneMover { engine },
                     ),
                 )
@@ -1380,18 +1374,17 @@ impl BatchScheduler {
                 queued.chain(flying),
                 limits.max_forward_tokens,
             );
-            // A raise the ask cannot take at once is funded under a queued
-            // pass's process, and the pipelines it carries wider than a row
-            // wait for it at the gate rather than be cut at the rung
-            // standing; decodes and controls (the raise's own) go on.
-            batch_want.fund(engine_id, || {
-                pending.items.iter().find_map(|item| match item {
-                    QueuedItem::Launch(launch) if launch.request.request.rung_rows() > 1 => {
-                        launch.request.process_id.zip(launch.request.pipeline_id)
-                    }
-                    _ => None,
-                })
-            });
+            // A raise the ask cannot take at once is waited on while a
+            // launch wider than a row is queued, and the pipelines it
+            // carries wider than a row wait for it at the gate rather than
+            // be cut at the rung standing; decodes and controls (the
+            // raise's own) go on.
+            batch_want.await_raise(
+                engine_id,
+                pending.items.iter().any(|item| {
+                    matches!(item, QueuedItem::Launch(launch) if launch.request.request.rung_rows() > 1)
+                }),
+            );
             let raise_waits = batch_want.waits(engine_id);
             let cap = crate::store::shared::fire_cap(engine_id);
             let mut stepped = limits;
@@ -2345,7 +2338,7 @@ impl BatchScheduler {
                     if stopping {
                         scan.drain_eligible.push(launch.fire_id);
                     }
-                    // While the batch's funded raise is pending, a launch
+                    // While the batch's raise is pending, a launch
                     // wider than a row is not admitted, nor anything its
                     // pipeline queued behind it: the pipeline waits whole and
                     // in order, before admission, and is cut at the raised
@@ -3120,7 +3113,7 @@ mod tests {
     }
 
     /// Where nothing moves the rung (no shared pool) the batch's ask is
-    /// never short, funds nothing and holds nothing back.
+    /// never short, waits on nothing and holds nothing back.
     #[test]
     fn an_ask_no_pool_moves_holds_nothing() {
         const ENGINE: usize = 9204;
@@ -3128,11 +3121,9 @@ mod tests {
         let mut count = RowCount::default();
         let mut want = BatchWant::default();
         want.ask_for(ENGINE, &mut count, &wave, 5120);
-        want.fund(ENGINE, || {
-            Some((uuid::Uuid::new_v4(), uuid::Uuid::new_v4()))
-        });
+        want.await_raise(ENGINE, true);
         assert!(!want.short(ENGINE));
-        assert!(want.funding.is_none());
+        assert!(want.raise.is_none());
         assert!(!want.waits(ENGINE));
     }
 
