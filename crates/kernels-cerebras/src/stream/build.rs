@@ -68,6 +68,9 @@ impl Default for KvSplit {
     }
 }
 
+/// The most replicas of a K / V head the search tries ([`program_at`]'s `rep`).
+pub const MAX_KV_REP: u32 = 16;
+
 /// The cuts the search tries: the fewest rest roots, a quarter and a half more of them; helpers
 /// below the rest roots; K / V columns over `sub` columns a head at `1 / sub` of the entries a
 /// PE (as many rows of the band, `sub` times the PEs: a query's work over them), the head
@@ -404,35 +407,43 @@ pub fn program_py(
     // built a few at a time (a whole-wafer program is large), the cheapest kept
     let mut best: Option<(f64, Program)> = None;
     let mut errs: Vec<(u32, u32, String)> = Vec::new();
-    for group in cands.chunks(8) {
-        let tried: Vec<(u32, u32, R<Program>)> = std::thread::scope(|sc| {
-            let hs: Vec<_> = group
-                .iter()
-                .map(|&(p, tile, kv)| {
-                    let shape = shape.clone();
-                    sc.spawn(move || {
-                        let r = program_at(
-                            trace, shape, round16, upto, taps, p, tile, kv, spill, bounds,
-                        );
-                        (p, tile, r)
+    // each K / V head over 1, then 2, 4 .. replicas (a head root's q heads and tiles fewer) while
+    // none builds
+    let mut rep = 1;
+    while best.is_none() && rep <= MAX_KV_REP {
+        for group in cands.chunks(8) {
+            let tried: Vec<(u32, u32, R<Program>)> = std::thread::scope(|sc| {
+                let hs: Vec<_> = group
+                    .iter()
+                    .map(|&(p, tile, kv)| {
+                        let shape = shape.clone();
+                        sc.spawn(move || {
+                            let r = program_at(
+                                trace, shape, round16, upto, taps, p, tile, kv, spill, bounds, rep,
+                            );
+                            (p, tile, r)
+                        })
                     })
-                })
-                .collect();
-            hs.into_iter()
-                .map(|h| h.join().unwrap_or_else(|_| (0, 0, Err("panicked".into()))))
-                .collect()
-        });
-        for (p, tile, r) in tried {
-            match r {
-                Ok(prog) => {
-                    let c = crate::cost::stream::time(&prog).cycles;
-                    if best.as_ref().is_none_or(|(b, _)| c < *b) {
-                        best = Some((c, prog));
+                    .collect();
+                hs.into_iter()
+                    .map(|h| h.join().unwrap_or_else(|_| (0, 0, Err("panicked".into()))))
+                    .collect()
+            });
+            for (p, tile, r) in tried {
+                match r {
+                    Ok(prog) => {
+                        let c = crate::cost::stream::time(&prog).cycles;
+                        if best.as_ref().is_none_or(|(b, _)| c < *b) {
+                            best = Some((c, prog));
+                        }
                     }
+                    // (a replica count no attention takes says nothing of the candidate)
+                    Err(e) if rep > 1 && e.contains("no attention's q heads split") => {}
+                    Err(e) => errs.push((p, tile, e)),
                 }
-                Err(e) => errs.push((p, tile, e)),
             }
         }
+        rep *= 2;
     }
     best.map(|(_, p)| p).ok_or_else(|| {
         // the farthest a candidate got: the most row roots at the whole tile budget
@@ -621,6 +632,7 @@ pub fn program_at(
     split: KvSplit,
     spill: bool,
     bounds: Bounds,
+    rep: u32,
 ) -> R<Program> {
     let prog = &shape.program;
     let name = &trace.name;
@@ -632,10 +644,28 @@ pub fn program_at(
     }
     let Lowered {
         class_rows,
-        units,
+        mut units,
         blocks,
         ..
     } = lower_units(trace, prog, upto, taps)?;
+    // each attention's K / V heads replicated `rep` times, a replica its share of the q heads
+    // (a head root's tiles that many times fewer)
+    if rep > 1 {
+        let mut any = false;
+        for (u, _) in &mut units {
+            if let Some(j) = u.joint.as_mut()
+                && j.state.is_none()
+                && (j.q_heads / j.kv_heads.max(1)).is_multiple_of(rep)
+            {
+                j.kv_heads *= rep;
+                j.kv_rep = rep;
+                any = true;
+            }
+        }
+        if !any {
+            return Err(format!("{name}: no attention's q heads split {rep} ways"));
+        }
+    }
 
     // layouts and regions
     let mut built: Vec<Built> = Vec::new();

@@ -314,17 +314,17 @@ fn layout_with(r: &Reader, u: &Unit, py: u32, rest: u32) -> Option<Layout> {
             match s {
                 Step::Store { q, k, v } => {
                     for h in 0..heads {
-                        let g = j.qk_head(h);
+                        let (qh, kh, vh) = (j.q_head(h), j.k_head(h), j.v_head(h));
                         push(
                             &mut cols,
                             h as usize,
-                            Slice::of(q.base, q.from + g * qw, qw),
+                            Slice::of(q.base, q.from + qh * qw, qw),
                         );
-                        push(&mut cols, h as usize, Slice::of(k.base, k.from + g * d, d));
+                        push(&mut cols, h as usize, Slice::of(k.base, k.from + kh * d, d));
                         push(
                             &mut cols,
                             h as usize,
-                            Slice::of(v.base, v.from + h * dv, dv),
+                            Slice::of(v.base, v.from + vh * dv, dv),
                         );
                         // a recurrence's head also its beta and decay logits
                         if let Some(st) = j.state {

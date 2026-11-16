@@ -150,6 +150,11 @@ pub struct Joint {
     /// `attn.sink` folded into the attention), where one is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sink: Option<ValueId>,
+    /// Each stored K / V head replicated over this many columns, a column its share of the
+    /// head's q heads (`kv_heads` the replicas': a head root's q heads and tiles that many times
+    /// fewer; the search's choice where a head root's tiles do not fit).
+    #[serde(skip_serializing_if = "is_one")]
+    pub kv_rep: u32,
 }
 
 /// A gated delta rule's column (P8, ops/sst.csl, ops/cy_sst.csl): each head's root also takes
@@ -198,10 +203,31 @@ fn is_zero(r: &u32) -> bool {
 }
 
 impl Joint {
-    /// The q / k head a head root `h` reads (a recurrence's key head over several value heads).
+    /// The q head (group) a head root `h` reads: a recurrence's key head over several value
+    /// heads, else its own.
     #[must_use]
-    pub fn qk_head(&self, h: u32) -> u32 {
+    pub fn q_head(&self, h: u32) -> u32 {
         h / self.state.map_or(1, |s| s.ratio.max(1))
+    }
+
+    /// The k head a head root `h` stores: a recurrence's key head, else the K / V head it
+    /// replicates.
+    #[must_use]
+    pub fn k_head(&self, h: u32) -> u32 {
+        match self.state {
+            Some(s) => h / s.ratio.max(1),
+            None => h / self.kv_rep.max(1),
+        }
+    }
+
+    /// The v head a head root `h` stores: a recurrence's own, else the K / V head it
+    /// replicates.
+    #[must_use]
+    pub fn v_head(&self, h: u32) -> u32 {
+        match self.state {
+            Some(_) => h,
+            None => h / self.kv_rep.max(1),
+        }
     }
 
     /// A head root's v (and output) width: a recurrence's value head's, else its q heads'.
@@ -828,6 +854,7 @@ pub fn lower_through(
                     window: None,
                     state: None,
                     sink: None,
+                    kv_rep: 1,
                 });
                 steps.push(Step::Store { q, k, v });
                 sides.insert(*o, Side::Col);
@@ -880,6 +907,7 @@ pub fn lower_through(
                     window: None,
                     state: None,
                     sink: None,
+                    kv_rep: 1,
                 });
                 steps.push(Step::Store { q, k, v });
                 sides.insert(*o, Side::Col);
@@ -1098,6 +1126,7 @@ pub fn lower_through(
                         mamba: Some(super::unit::Mamba { d: *d, bias: *cb }),
                     }),
                     sink: None,
+                    kv_rep: 1,
                 });
                 steps.push(Step::Store { q, k, v });
                 let raw = msynth(mn, MK::Raw);
@@ -1264,6 +1293,7 @@ pub fn lower_through(
                         mamba: None,
                     }),
                     sink: None,
+                    kv_rep: 1,
                 });
                 steps.push(Step::Store { q, k, v });
                 sides.insert(*y, Side::Col);
@@ -1344,6 +1374,7 @@ pub fn lower_through(
                     window: *window,
                     state: None,
                     sink,
+                    kv_rep: 1,
                 });
                 steps.push(Step::Store { q, k, v });
                 sides.insert(*o, Side::Col);

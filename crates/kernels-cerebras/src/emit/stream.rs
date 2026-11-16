@@ -502,8 +502,8 @@ pub fn emit(p: &Program) -> R<Emitted> {
             let j = kv_joint(p, ks);
             let (d, dv, t, h) = (j.head_dim, j.v_dim(), st.taps, kc.head);
             let (qc, kc_, vc) = (
-                st.q_from + j.qk_head(h) * d,
-                st.k_from + j.qk_head(h) * d,
+                st.q_from + j.q_head(h) * d,
+                st.k_from + j.k_head(h) * d,
                 st.v_from + h * dv,
             );
             let mut slices = vec![
@@ -1736,11 +1736,10 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
                 let qw = j.q_heads / j.kv_heads * j.head_dim;
                 let (d, dv) = (j.head_dim, j.v_dim());
                 kv_io = true;
-                let kh = j.qk_head(idx);
                 let mut parts = vec![
-                    (*q, q.from + kh * qw, qw),
-                    (*k, k.from + kh * d, d),
-                    (*v, v.from + idx * dv, dv),
+                    (*q, q.from + j.q_head(idx) * qw, qw),
+                    (*k, k.from + j.k_head(idx) * d, d),
+                    (*v, v.from + j.v_head(idx) * dv, dv),
                 ];
                 // a recurrence's head: its beta and decay logits after them
                 if let Some(st) = j.state {
@@ -2333,6 +2332,7 @@ fn kv_joint(p: &Program, ks: &place::KvSched) -> crate::stream::unit::Joint {
             window: None,
             state: None,
             sink: None,
+            kv_rep: 1,
         })
 }
 
