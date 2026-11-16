@@ -305,12 +305,40 @@ pub const UNIT: u32 = u32::MAX - 1;
 pub const HALF: u32 = 8;
 /// The word is the element's bf16 bits, rounded to nearest even (a tile of a bf16 build).
 pub const BF16: u32 = 16;
+/// With [`HALF`] or [`BF16`]: two 16-bit elements a word, the first in its low half (a tiled
+/// program's weight stream, two weights a wavelet). An array's packed elements pair across its
+/// spans; a span that is not packed starts on a whole word.
+pub const PACK: u32 = 32;
+
+/// The words `s` makes (its packed spans' elements two a word).
+#[must_use]
+pub fn span_words(s: &[Span]) -> u32 {
+    let mut halves = 0u32;
+    let mut words = 0u32;
+    for x in s {
+        let n = x[3] * x[6];
+        if x[5] & PACK != 0 {
+            halves += n;
+        } else {
+            words += halves.div_ceil(2) + n;
+            halves = 0;
+        }
+    }
+    words + halves.div_ceil(2)
+}
 
 /// `s`'s words (each an f32's bits, or a 16-bit word) from the values `get` holds, by value id.
 pub fn apply_spans(s: &[Span], get: &dyn Fn(u32) -> R<Rows>) -> R<Vec<u32>> {
     let mut held: BTreeMap<u32, Rows> = BTreeMap::new();
     let mut out = Vec::new();
+    // a packed element waiting for its word's high half
+    let mut half: Option<u32> = None;
     for &[v, row, col, len, stride, flags, count, step] in s {
+        if flags & PACK == 0
+            && let Some(lo) = half.take()
+        {
+            out.push(lo);
+        }
         if v == NONE {
             out.extend(std::iter::repeat_n(0, len as usize * count as usize));
             continue;
@@ -351,14 +379,24 @@ pub fn apply_spans(s: &[Span], get: &dyn Fn(u32) -> R<Rows>) -> R<Vec<u32>> {
             if flags & CLAMP != 0 {
                 x = x.clamp(-65504.0, 65504.0);
             }
-            out.push(if flags & HALF != 0 {
+            let w = if flags & HALF != 0 {
                 u32::from(half_bits(x))
             } else if flags & BF16 != 0 {
                 bits16(x, false)
             } else {
                 x.to_bits()
-            });
+            };
+            if flags & PACK == 0 {
+                out.push(w);
+            } else if let Some(lo) = half.take() {
+                out.push(lo | (w << 16));
+            } else {
+                half = Some(w);
+            }
         }
+    }
+    if let Some(lo) = half {
+        out.push(lo);
     }
     Ok(out)
 }

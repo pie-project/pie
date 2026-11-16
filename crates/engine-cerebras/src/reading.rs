@@ -279,6 +279,10 @@ pub struct Back {
     pub sym: String,
     pub x: i32,
     pub y: i32,
+    /// The rectangle of PEs read back alike (1 x 1: one PE), its rows in row-major order.
+    pub w: i32,
+    pub h: i32,
+    /// Words a PE.
     pub len: usize,
     pub rows: Vec<usize>,
     pub parts: Vec<(u32, u32, u32)>,
@@ -416,6 +420,8 @@ impl Reading {
                 sym: text(&o, "sym")?,
                 x: num(&o, "x")? as i32,
                 y: num(&o, "y")? as i32,
+                w: o["w"].as_i64().unwrap_or(1) as i32,
+                h: o["h"].as_i64().unwrap_or(1) as i32,
                 len: num(&o, "len")? as usize,
                 rows: ints("rows").into_iter().map(|r| r as usize).collect(),
                 parts,
@@ -911,12 +917,12 @@ impl Fabric for Runtime {
         self.launch("run", &args).map_err(e)?;
         let mut got = Vec::new();
         for b in &reading.d2h {
-            let mut out = vec![0u32; b.len];
+            let mut out = vec![0u32; b.len * (b.w * b.h) as usize];
             let rect = Rect {
                 x: b.x,
                 y: b.y,
-                w: 1,
-                h: 1,
+                w: b.w,
+                h: b.h,
             };
             self.memcpy_d2h(
                 &b.sym,
@@ -969,7 +975,7 @@ impl Fabric for HostFabric {
         let mut got = Vec::new();
         for b in &reading.d2h {
             let width: usize = b.parts.iter().map(|p| p.2 as usize).sum();
-            let mut buf = vec![0f32; b.len];
+            let mut buf = vec![0f32; b.len * (b.w * b.h) as usize];
             for (i, &tr) in b.rows.iter().enumerate() {
                 let mut off = 0;
                 for &(base, from, n) in &b.parts {

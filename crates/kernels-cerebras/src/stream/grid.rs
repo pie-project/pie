@@ -410,11 +410,11 @@ impl GridProgram {
 }
 
 /// Whether `ty` is a voxel row value.
-fn voxel_rows(ty: &Ty) -> bool {
+pub(crate) fn voxel_rows(ty: &Ty) -> bool {
     matches!(ty, Ty::Tensor { shape, .. } if matches!(shape.first(), Some(Dim::Voxels | Dim::VoxelsScaled(..))))
 }
 
-fn width(trace: &Trace, v: ValueId) -> u32 {
+pub(crate) fn width(trace: &Trace, v: ValueId) -> u32 {
     match &trace.values[v.0 as usize].ty {
         Ty::Tensor { shape, .. } => match shape.last() {
             Some(Dim::Const(n)) => *n as u32,
@@ -424,7 +424,7 @@ fn width(trace: &Trace, v: ValueId) -> u32 {
     }
 }
 
-fn dtype(trace: &Trace, v: ValueId) -> Option<Dtype> {
+pub(crate) fn dtype(trace: &Trace, v: ValueId) -> Option<Dtype> {
     match &trace.values[v.0 as usize].ty {
         Ty::Tensor { dtype, .. } => Some(*dtype),
         Ty::Struct(_) => None,
@@ -1268,7 +1268,7 @@ impl B<'_> {
 }
 
 /// The readers of `v` among the nodes `word` runs.
-fn readers(t: &Trace, word: u64, v: ValueId) -> usize {
+pub(crate) fn readers(t: &Trace, word: u64, v: ValueId) -> usize {
     let mut ins = Vec::new();
     t.nodes
         .iter()
@@ -1282,7 +1282,7 @@ fn readers(t: &Trace, word: u64, v: ValueId) -> usize {
 }
 
 /// `run` as regions, split where it does not lower as one (as a stream unit's).
-fn split_runs(t: &Trace, run: &[u32]) -> R<Vec<Chain>> {
+pub(crate) fn split_runs(t: &Trace, run: &[u32]) -> R<Vec<Chain>> {
     if let Some(c) = chain::lower_run(t, run) {
         return Ok(vec![c]);
     }
@@ -1300,7 +1300,7 @@ fn split_runs(t: &Trace, run: &[u32]) -> R<Vec<Chain>> {
 }
 
 /// `x + b` over a row of `width` (a convolution's bias), rounded where `round`.
-fn add_region(width: u32, round: bool) -> kernels_ir::Region {
+pub(crate) fn add_region(width: u32, round: bool) -> kernels_ir::Region {
     use kernels_ir::{Binary, Op, Region, Shape};
     Region {
         width,
@@ -1317,7 +1317,7 @@ fn add_region(width: u32, round: bool) -> kernels_ir::Region {
 
 /// A group norm's apply over a row of `width`: `x a + b` (the scale and shift its statistics
 /// made a channel), then SiLU where `silu`, rounded where `round`.
-fn norm_region(width: u32, silu: bool, round: bool) -> kernels_ir::Region {
+pub(crate) fn norm_region(width: u32, silu: bool, round: bool) -> kernels_ir::Region {
     use kernels_ir::{Binary, Literal, Op, Region, Shape, Unary};
     let mut ops = vec![Op::Fma(0, 1, 2)];
     let last = if silu {
@@ -1399,18 +1399,17 @@ pub fn program_unfit(
     build(trace, reading, clip, round16, None, false, WEIGHT_WORDS)
 }
 
-#[allow(clippy::too_many_lines)]
-/// `budget`: the 16-bit words a weight PE gives its tiles and stores ([`WEIGHT_WORDS`]; less
-/// to put a reading that fits in weight groups all the same).
-fn build(
-    trace: &Trace,
-    reading: &str,
-    clip: [u32; 3],
-    round16: bool,
-    upto: Option<usize>,
-    fit: bool,
-    budget: u32,
-) -> R<GridProgram> {
+/// What a grid reading's lowering starts from, in either regime ([`build`]'s passes, or the
+/// tiled regime's ops): its one class's word, the nodes it runs, those the host runs (their
+/// inputs all the host's), each grid value's extent on `clip`.
+pub(crate) struct Prelude {
+    pub word: u64,
+    pub runs: Vec<bool>,
+    pub host: Vec<bool>,
+    pub grids: BTreeMap<ValueId, [u32; 3]>,
+}
+
+pub(crate) fn prelude(trace: &Trace, reading: &str, clip: [u32; 3]) -> R<Prelude> {
     let name = &trace.name;
     let classes = poem_compiler::spatial::layer::stream::classes(trace, reading, 0);
     let [class] = &classes[..] else {
@@ -1459,6 +1458,33 @@ fn build(
             grids.insert(*y, out);
         }
     }
+    Ok(Prelude {
+        word,
+        runs,
+        host,
+        grids,
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+/// `budget`: the 16-bit words a weight PE gives its tiles and stores ([`WEIGHT_WORDS`]; less
+/// to put a reading that fits in weight groups all the same).
+fn build(
+    trace: &Trace,
+    reading: &str,
+    clip: [u32; 3],
+    round16: bool,
+    upto: Option<usize>,
+    fit: bool,
+    budget: u32,
+) -> R<GridProgram> {
+    let name = &trace.name;
+    let Prelude {
+        word,
+        runs,
+        host,
+        grids,
+    } = prelude(trace, reading, clip)?;
     // the values whole at the first column root: an attention's q / k / v (and what makes
     // them after the matvec) and its output
     let mut heads: BTreeSet<ValueId> = BTreeSet::new();
@@ -1962,15 +1988,22 @@ pub fn compile_within(
 /// `host.json` and its arrays' files, as a stream program's (`stream::host::write`): every
 /// array a memcpy rectangle of PEs with its words' source (the program's own words on file, a
 /// static array's spans, an entry's gather), the rows read back.
-fn write_host(g: &GridProgram, e: &crate::emit::grid::Emitted, out: &std::path::Path) -> R<()> {
+/// The `h2d` and `d2h` items of `host.json` for `arrays`, their files written under `out`: every
+/// array a memcpy rectangle of PEs with its words' source (the program's own words on file, a
+/// static array's spans, an entry's gather), the rows read back (a PE each, or with `rect` the
+/// rectangles of PEs reading back alike: their rows in the rectangle's order).
+pub(crate) fn host_arrays(
+    arrays: &[crate::emit::grid::GridArray],
+    out: &std::path::Path,
+    rect: bool,
+) -> R<(Vec<serde_json::Value>, Vec<serde_json::Value>)> {
     use crate::emit::grid::GridFill;
     use crate::emit::stream::{Fill, HostArray};
     use serde_json::json;
     for d in ["h2d", "entries", "statics"] {
         std::fs::create_dir_all(out.join(d)).map_err(|e| e.to_string())?;
     }
-    let ins: Vec<&crate::emit::grid::GridArray> = e
-        .arrays
+    let ins: Vec<&crate::emit::grid::GridArray> = arrays
         .iter()
         .filter(|a| !matches!(a.fill, GridFill::Back { .. }))
         .collect();
@@ -2019,7 +2052,7 @@ fn write_host(g: &GridProgram, e: &crate::emit::grid::Emitted, out: &std::path::
                     let GridFill::Spans(s) = &ins[m].fill else {
                         return Err(format!("`{}`: spans beside other fills", a0.sym));
                     };
-                    let words: u32 = s.iter().map(|x| x[3] * x[6]).sum();
+                    let words = crate::stream::host::span_words(s);
                     if words != a0.len {
                         return Err(format!(
                             "`{}` at ({}, {}): spans of {words} words for {}",
@@ -2054,11 +2087,54 @@ fn write_host(g: &GridProgram, e: &crate::emit::grid::Emitted, out: &std::path::
         h2d.push(item);
     }
     let mut d2h = Vec::new();
-    for a in &e.arrays {
-        if let GridFill::Back { rows, parts } = &a.fill {
-            d2h.push(json!({"sym": a.sym, "x": a.at.x, "y": a.at.y, "len": a.len, "rows": rows, "parts": parts}));
+    if rect {
+        // the Backs of one sym, length and parts, a rectangle at a time (row-major)
+        let backs: Vec<&crate::emit::grid::GridArray> = arrays
+            .iter()
+            .filter(|a| matches!(a.fill, GridFill::Back { .. }))
+            .collect();
+        let proxies: Vec<HostArray> = backs
+            .iter()
+            .map(|a| {
+                let GridFill::Back { parts, .. } = &a.fill else {
+                    unreachable!()
+                };
+                HostArray {
+                    at: a.at,
+                    sym: format!("{}@{parts:?}", a.sym),
+                    u16: false,
+                    len: a.len,
+                    fill: Fill::Stamps,
+                }
+            })
+            .collect();
+        let refs: Vec<&HostArray> = proxies.iter().collect();
+        for (x, y, w, h, members) in crate::stream::host::rects(&refs) {
+            let a0 = backs[members[0]];
+            let GridFill::Back { parts, .. } = &a0.fill else {
+                unreachable!()
+            };
+            let mut rows: Vec<usize> = Vec::new();
+            for &m in &members {
+                if let GridFill::Back { rows: r, .. } = &backs[m].fill {
+                    rows.extend(r);
+                }
+            }
+            d2h.push(json!({"sym": a0.sym, "x": x, "y": y, "w": w, "h": h, "len": a0.len, "rows": rows, "parts": parts}));
+        }
+    } else {
+        for a in arrays {
+            if let GridFill::Back { rows, parts } = &a.fill {
+                d2h.push(json!({"sym": a.sym, "x": a.at.x, "y": a.at.y, "len": a.len, "rows": rows, "parts": parts}));
+            }
         }
     }
+    Ok((h2d, d2h))
+}
+
+fn write_host(g: &GridProgram, e: &crate::emit::grid::Emitted, out: &std::path::Path) -> R<()> {
+    use serde_json::json;
+    let (h2d, d2h) = host_arrays(&e.arrays, out, false)?;
     let outs: Vec<serde_json::Value> = g
         .outs
         .iter()
