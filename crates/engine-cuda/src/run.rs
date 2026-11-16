@@ -183,15 +183,17 @@ pub struct RsScratch {
     bytes: u64,
     rows: u32,
     next: Cell<u64>,
-    /// Each plane's place and the bytes of a row of it, in the order a
-    /// window's layer takes them.
-    planes: std::cell::RefCell<Vec<(u64, u64)>>,
+    /// Each plane's place and the bytes of a row of it, by the kind of layer
+    /// that takes it (a lone conv's, or a recurrence's) and the order its
+    /// windows take them: the two kinds lay planes of their own.
+    planes: std::cell::RefCell<std::collections::HashMap<(bool, usize), (u64, u64)>>,
     /// Each window's layout words (by its first lane and the op of its
     /// layer that lays them): their place and bytes.
     words: std::cell::RefCell<std::collections::HashMap<(u32, u32), (u64, u64)>>,
     /// The planes and the layouts each window (by its first lane) has
     /// taken of this layer.
-    taken: std::cell::RefCell<std::collections::HashMap<u32, (usize, u32)>>,
+    /// And whether the window's layer is a lone conv's.
+    taken: std::cell::RefCell<std::collections::HashMap<u32, (usize, u32, bool)>>,
     layouts: std::cell::RefCell<std::collections::HashMap<u32, RsLayout>>,
     ext: std::cell::RefCell<std::collections::HashMap<(u32, u32), Tensor>>,
 }
@@ -222,7 +224,7 @@ impl RsScratch {
             bytes,
             rows,
             next: Cell::new(0),
-            planes: std::cell::RefCell::new(Vec::new()),
+            planes: std::cell::RefCell::new(std::collections::HashMap::new()),
             words: std::cell::RefCell::new(std::collections::HashMap::new()),
             taken: std::cell::RefCell::new(std::collections::HashMap::new()),
             layouts: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -254,18 +256,20 @@ impl RsScratch {
     /// The next plane window `lane0` takes of its layer, a row of it
     /// `row_bytes`: the one every window takes there.
     fn plane(&self, lane0: u32, row_bytes: u64) -> crate::error::Result<u64> {
-        let at = {
+        let (at, lone) = {
             let mut taken = self.taken.borrow_mut();
-            let (planes, _) = taken.entry(lane0).or_default();
+            let (planes, _, lone) = taken.entry(lane0).or_default();
             *planes += 1;
-            *planes - 1
+            (*planes - 1, *lone)
         };
-        let held = self.planes.borrow().get(at).copied();
+        let held = self.planes.borrow().get(&(lone, at)).copied();
         let (base, held) = match held {
             Some(plane) => plane,
             None => {
                 let base = self.lay(u64::from(self.rows) * row_bytes)?;
-                self.planes.borrow_mut().push((base, row_bytes));
+                self.planes
+                    .borrow_mut()
+                    .insert((lone, at), (base, row_bytes));
                 (base, row_bytes)
             }
         };
@@ -285,7 +289,7 @@ impl RsScratch {
     fn layout(&self, lane0: u32, bytes: u64) -> crate::error::Result<u64> {
         let at = {
             let mut taken = self.taken.borrow_mut();
-            let (_, layouts) = taken.entry(lane0).or_default();
+            let (_, layouts, _) = taken.entry(lane0).or_default();
             *layouts += 1;
             *layouts - 1
         };
@@ -310,6 +314,12 @@ impl RsScratch {
 
     /// Window `lane0`'s layer is done: the next one takes its planes and
     /// layouts anew.
+    /// Window `lane0`'s layer is a lone conv's (Qwen4's PLE conv): it takes
+    /// the planes lone convs lay, not a recurrence's.
+    fn begin_lone(&self, lane0: u32) {
+        self.taken.borrow_mut().entry(lane0).or_default().2 = true;
+    }
+
     fn layer_done(&self, lane0: u32) {
         self.taken.borrow_mut().remove(&lane0);
         self.layouts.borrow_mut().remove(&lane0);
@@ -1280,6 +1290,20 @@ impl<'c> Run<'c> {
                 .borrow_mut()
                 .remove(&self.window().span().lane_offset);
         }
+    }
+
+    /// The extended op about to run is a lone conv's, a layer of its own.
+    pub(crate) fn rs_begin_lone(&self) {
+        if let Some(scratch) = self.rs.as_ref().and_then(|seat| seat.scratch) {
+            scratch.begin_lone(self.window().span().lane_offset);
+        }
+    }
+
+    /// Whether `id` is a lone conv's buffered rows.
+    pub(crate) fn rs_lone(&self, id: ValueId) -> bool {
+        self.rs
+            .as_ref()
+            .is_some_and(|seat| seat.buffers.planes().lone(id))
     }
 
     pub(crate) fn rs_layer_done(&self) {
@@ -2856,6 +2880,27 @@ mod tests {
         // A plane is one operand's for every window.
         scratch.layer_done(3);
         assert!(scratch.plane(3, 32).is_err());
+    }
+
+    /// A lone conv's layer (Qwen4's PLE conv) takes planes of its own: its
+    /// rows are not a recurrence's operands, and a recurrence after it takes
+    /// the recurrence's planes as before.
+    #[test]
+    fn a_lone_convs_layer_takes_planes_of_its_own() {
+        const BASE: u64 = 0x10_0000;
+        let rows = 512u32;
+        let scratch = RsScratch::new(BASE, RsScratch::need(rows, 96 + 40), rows);
+        let recurrence = [scratch.plane(0, 64).unwrap(), scratch.plane(0, 32).unwrap()];
+        scratch.layer_done(0);
+        scratch.begin_lone(0);
+        let lone = [scratch.plane(0, 20).unwrap(), scratch.plane(0, 20).unwrap()];
+        scratch.layer_done(0);
+        assert!(
+            lone.iter().all(|at| !recurrence.contains(at)),
+            "{lone:?} {recurrence:?}"
+        );
+        assert_eq!(scratch.plane(0, 64).unwrap(), recurrence[0]);
+        assert_eq!(scratch.plane(0, 32).unwrap(), recurrence[1]);
     }
 
     #[test]
