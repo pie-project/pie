@@ -8,7 +8,7 @@ pub mod rung;
 pub mod top;
 
 pub use rung::{
-    FireEstimate, NoRung, RungFacts, TopRung, TopWhy, model_class, pick, scored, top_rung,
+    FireEstimate, NoRung, RungFacts, Terms, TopRung, TopWhy, model_class, pick, scored, top_rung,
 };
 pub use top::{Counts, Kept, Refused, choose, estimate, line_of, rectangle};
 

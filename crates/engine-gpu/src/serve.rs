@@ -1058,13 +1058,13 @@ impl<B: Serve> Shell<B> {
                 &padded,
             );
             if weighed.is_none() {
-                weighed = crate::top::estimate(&counts, &device_profile.rates()).map(|estimate| {
-                    Weighed {
+                weighed = crate::top::estimate(&counts, &device_profile.rates())
+                    .ok()
+                    .map(|estimate| Weighed {
                         rungs: rungs.clone(),
                         estimate,
                         live,
-                    }
-                });
+                    });
             }
             let pick = match (&chosen, boot.top) {
                 (None, Top::Ruled) => {

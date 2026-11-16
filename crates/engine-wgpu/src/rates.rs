@@ -4,13 +4,12 @@
 //! A browser's load calls it (its adapter is masked, so no profile states
 //! its rates); so does `pie tune wgpu --rates`.
 
-use engine_gpu::backend::Tactics as _;
 use engine_gpu::error::Result;
 use profile::fire::Rates;
 
 use crate::device::{Api, Context, Frame};
 
-/// The rates of `device`, under the matmul tactic `tuning` picks.
+/// The rates of `device`, under the tactics `tuning` picks.
 pub fn measure(device: &Context, tuning: &crate::tuning::Tuning) -> Result<Rates> {
     let tier = <Api as engine_gpu::serve::Serve>::tier(device);
     let timer = |frame: Frame| {
@@ -23,5 +22,5 @@ pub fn measure(device: &Context, tuning: &crate::tuning::Tuning) -> Result<Rates
             .filter(|&ns| ns > 0);
         Ok((span, (host * 1e9) as u64))
     };
-    engine_gpu::rates::measure::<Api>(device, tuning.gemm(tier), &timer)
+    engine_gpu::rates::measure::<Api, _>(device, tuning, tier, &timer)
 }

@@ -129,6 +129,9 @@ mod tests {
             flops_per_row: 16 << 30,
             attn_flops_per_row_key: 1 << 12,
             kv_bytes_per_key: 1 << 17,
+            readout_flops: 0,
+            state_elements_per_row: 0,
+            elementwise_bytes_per_row: 0,
             width: 4096,
         }
     }
@@ -137,6 +140,7 @@ mod tests {
     fn l40s() -> profile::fire::Rates {
         profile::fire::Rates {
             bf16_flops_per_ns_by_rows: Some(vec![(4096, 249_000.0)]),
+            attn_flops_per_ns: Some(100_000.0),
             bytes_per_ns: Some(654.0),
             launch_ns: Some(1620),
             ..profile::fire::Rates::default()
@@ -174,7 +178,8 @@ mod tests {
             "{err}"
         );
         assert!(
-            err.to_string().contains("`pie tune --rates` measures them"),
+            err.to_string()
+                .contains("`pie tune <backend> --rates` measures it"),
             "{err}"
         );
     }

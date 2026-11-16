@@ -366,8 +366,9 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
                 chip.tuned()
             )
         );
-        weighed =
-            engine::load::estimate(&counts, &chip.rates()).map(|estimate| crate::top::Weighed {
+        weighed = engine::load::estimate(&counts, &chip.rates())
+            .ok()
+            .map(|estimate| crate::top::Weighed {
                 rungs: rungs.clone(),
                 estimate,
                 live: after_weights,

@@ -28,6 +28,19 @@ fn the_micro_fires_state_rates_and_the_ruling_picks_by_them() {
     assert!((1.0..1e6).contains(&flops), "{flops}");
     assert!((1.0..1e4).contains(&bytes), "{bytes}");
     assert!(launch > 0);
+    // The curve at every row of the lattice, the attention and scan rates.
+    let curve = rates.bf16_flops_per_ns_by_rows.clone().unwrap();
+    assert_eq!(
+        curve.iter().map(|&(m, _)| m).collect::<Vec<_>>(),
+        engine::rates::LATTICE_ROWS
+    );
+    eprintln!("curve {curve:?}");
+    for rate in [
+        rates.attn_flops_per_ns.unwrap(),
+        rates.scan_elements_per_ns.unwrap(),
+    ] {
+        assert!((1.0..1e6).contains(&rate), "{rate}");
+    }
 
     let mut tuned = chip.tuned().clone();
     tuned.rates = rates;
@@ -48,6 +61,9 @@ fn the_micro_fires_state_rates_and_the_ruling_picks_by_them() {
         flops_per_row: 1 << 30,
         attn_flops_per_row_key: 1 << 16,
         kv_bytes_per_key: 1 << 16,
+        readout_flops: 1 << 28,
+        state_elements_per_row: 1 << 20,
+        elementwise_bytes_per_row: 1 << 16,
         width: 4096,
     };
     let (top, _) = choose(&rungs, 8 << 30, &profile, "adapter", &counts, 1 << 30).unwrap();

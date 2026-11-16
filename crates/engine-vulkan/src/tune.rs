@@ -563,21 +563,27 @@ fn rates(base: &Profile, say: &mut dyn FnMut(&str)) -> Result<profile::fire::Rat
     // The matmul path the profile selects on this card, which the rates
     // step measures through.
     let tier = <crate::device::Api as engine_gpu::serve::Serve>::tier(&device);
-    let path = kernels_slang::linear::gemm::tile_for(
-        kernels_slang::Target::Spirv,
-        engine_gpu::backend::Tactics::gemm(&tuning, tier),
-        engine_gpu::rates::GEMM,
-        engine_gpu::rates::GEMM,
-        engine_gpu::rates::GEMM,
-    );
+    let gemm = engine_gpu::backend::Tactics::gemm(&tuning, tier);
+    for &(m, rate) in rates.bf16_flops_per_ns_by_rows.as_deref().unwrap_or(&[]) {
+        let path = kernels_slang::linear::gemm::tile_for(
+            kernels_slang::Target::Spirv,
+            gemm,
+            m,
+            engine::rates::GEMM_COLUMNS,
+            engine::rates::GEMM_DEPTH,
+        );
+        say(&format!(
+            "[rates]: matmul m {m:>5}: {:6.1} TFLOP/s through {path:?} (tier {tier:?})",
+            rate / 1e3
+        ));
+    }
     say(&format!(
-        "[rates]: the matmul runs {path:?} (tier {tier:?})"
-    ));
-    say(&format!(
-        "[rates]: {:.1} TFLOP/s bf16, {:.0} GB/s, launch {} us",
-        rates.peak_flops().unwrap_or(0.0) / 1e3,
+        "[rates]: attention {:.1} TFLOP/s, scan {:.2} G state elements/s, {:.0} GB/s, launch \
+         {:.2} us",
+        rates.attn_flops_per_ns.unwrap_or(0.0) / 1e3,
+        rates.scan_elements_per_ns.unwrap_or(0.0),
         rates.bytes_per_ns.unwrap_or(0.0),
-        rates.launch_ns.unwrap_or(0) / 1000
+        rates.launch_ns.unwrap_or(0) as f64 / 1e3
     ));
     Ok(rates)
 }
