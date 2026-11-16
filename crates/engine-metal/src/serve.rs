@@ -1197,11 +1197,36 @@ impl PreparedLoad<'_> {
         // again under them (the rung's own carve, scratch and staged rows),
         // the weights kept: they do not depend on the fire's size.
         if ruled.is_none() && boot.top == Top::Ruled {
-            let counts = crate::top::Counts::of(&boot.trace, weights.bytes())?;
+            let counts = crate::top::counts(&boot.trace)?;
             let room = accounting(0).pool.saturating_add(fire_bytes);
             let live = boot.kv_budget.map_or(room, |budget| budget.min(room));
+            // A recording dispatches each node of the plan's launching
+            // regions once, whatever the rung (the rungs share one plan).
+            let launches = u32::try_from(
+                compiled
+                    .template()
+                    .iter()
+                    .filter(|region| region.launches())
+                    .map(|region| region.nodes.len())
+                    .sum::<usize>(),
+            )
+            .unwrap_or(u32::MAX);
+            let candidates: Vec<crate::top::Candidate> = act
+                .iter()
+                .map(|&(tokens, chunks)| crate::top::Candidate {
+                    tokens,
+                    chunks,
+                    launches,
+                    padded_rows: kernels_metal::linear::gemm::rows_computed(
+                        &tuning,
+                        tokens,
+                        counts.width,
+                        counts.width,
+                    ),
+                })
+                .collect();
             let rungs = crate::top::rung_facts(
-                &act,
+                &candidates,
                 rows.chunk_bytes,
                 budgets.tokens.max_lanes,
                 part_chunks,
@@ -1214,7 +1239,11 @@ impl PreparedLoad<'_> {
                 &counts,
             )?;
             let asked = budgets.tokens.max_tokens;
-            tracing::info!("{}", crate::top::line(&pick, asked, live, device.name()));
+            tracing::info!(
+                "{}: {}",
+                device.name(),
+                engine::load::line_of(&pick, pick.tokens, pick.span_bytes, live, chip.tuned())
+            );
             tracing::debug!(act = ?act, ?pick, live, ?counts, "the rungs the top is chosen of");
             if pick.tokens < asked {
                 budgets.tokens = crate::top::bounded(&budgets.tokens, pick.tokens);

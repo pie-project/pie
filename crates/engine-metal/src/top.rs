@@ -1,12 +1,12 @@
 //! The top rung a Metal load lays its fires up to ([`engine::load::top_rung`]):
 //! the rungs the requested fire size offers, each infeasible whose span
-//! passes what one buffer binds, weighed by the estimate from the device's
-//! measured rates (its profile's `[rates]`) and the model's counts. A
-//! device whose profile states no rates has nothing to weigh the rungs by,
-//! and the load is refused, naming it.
+//! passes what one buffer binds, every fire timed by the estimate from the
+//! device's measured rates (its profile's `[rates]`) and the model's counts
+//! ([`engine::load::Counts`]). A device whose profile states no rates has
+//! nothing to weigh the rungs by, and the load is refused, naming it.
 
-use engine::load::{FireEstimate, FireTimes, NoRung, RungFacts, TopRung, TopWhy};
-use poem_ir::{Def, Trace};
+use engine::load::{Counts, Kept, RungFacts, TopRung};
+use poem_ir::Trace;
 
 use crate::error::{Fault, Result};
 
@@ -14,96 +14,63 @@ use crate::error::{Fault, Result};
 /// buffer, and no buffer binds more than one.
 pub const PAST_ONE_BUFFER: &str = "past one buffer";
 
-/// What a fire of the model reads and computes, the estimate's counts.
+/// The counts of `trace` over the planes this engine keeps: its row-streamed
+/// token tables and its streamed expert banks apart from the dense weights
+/// (`store::streamed`), each plane at the bytes this engine stores it in.
+pub fn counts(trace: &Trace) -> Result<Counts> {
+    let planes = crate::weights::plane_bytes(trace)?;
+    let tables = crate::store::streamed::streamed_rows(trace);
+    let banks = crate::store::streamed::streamed_experts(trace);
+    let attention = poem_exec::store::kv::attention_counts(trace)?;
+    Ok(Counts::of(
+        trace,
+        Kept {
+            plane_bytes: &planes,
+            tables: &tables,
+            banks: &banks,
+        },
+        attention,
+    ))
+}
+
+/// One rung offered: a fire of `tokens`, the chunks its span takes, the
+/// dispatches a recording of it issues, and the rows its matmuls compute
+/// (`tokens` padded to the tile Metal's dense kernel takes at that width,
+/// [`kernels_metal::linear::gemm::rows_computed`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Counts {
-    /// The weight bytes every fire reads: the planes the device keeps.
-    pub weight_bytes: u64,
-    /// The flops a token takes through the weights its matmuls read.
-    pub flops_per_token: u64,
-    /// The flops a row takes a key it attends, summed over the kv rows.
-    pub attn_flops_per_row_key: u64,
+pub struct Candidate {
+    pub tokens: u32,
+    pub chunks: u32,
+    pub launches: u32,
+    pub padded_rows: u32,
 }
 
-impl Counts {
-    /// The counts of `trace` over `weight_bytes` kept: two flops a weight
-    /// element a token for every weight a matmul reads (each once), and four
-    /// a query element a key (the scores' product and the values') at each
-    /// kv row an attention reads, the widest query a row is read by.
-    pub fn of(trace: &Trace, weight_bytes: u64) -> Result<Counts> {
-        let mut read = std::collections::BTreeSet::new();
-        let mut elements = 0u64;
-        let mut query = std::collections::BTreeMap::new();
-        for node in &trace.nodes {
-            for (_, w, _) in crate::legs::matmuls(&node.op) {
-                if !read.insert(w) {
-                    continue;
-                }
-                let param = match trace.values.get(w.0 as usize).map(|decl| &decl.def) {
-                    Some(Def::Weight(at)) => trace.params.get(*at as usize),
-                    _ => None,
-                };
-                if let Some(param) = param {
-                    elements = elements.saturating_add(param.shape.iter().product::<u64>());
-                }
-            }
-            let Some(reader) = poem_exec::store::kv::reads(&node.op) else {
-                continue;
-            };
-            let Some(row) = poem_exec::store::kv::row_of(trace, reader.cache) else {
-                continue;
-            };
-            let width = poem_exec::store::kv::width_of(trace, reader.q)?;
-            let seat = query.entry(row).or_insert(0u64);
-            *seat = (*seat).max(width);
-        }
-        Ok(Counts {
-            weight_bytes,
-            flops_per_token: elements.saturating_mul(2),
-            attn_flops_per_row_key: query.values().sum::<u64>().saturating_mul(4),
-        })
-    }
-}
-
-/// The estimate of a fire's time on a device of `rates`: its weights read
-/// once, beside its launch, then its tokens' and row-keys' flops. `None`
-/// where the device states no compute rate or no bandwidth.
-#[must_use]
-pub fn estimate(counts: &Counts, rates: &profile::fire::Rates) -> Option<FireEstimate> {
-    let flops = rates.bf16_flops_per_ns?;
-    let bytes = rates.bytes_per_ns?;
-    let read = (counts.weight_bytes as f64 / bytes).ceil() as u64;
-    Some(FireEstimate {
-        fixed_ns: read.saturating_add(rates.launch_ns.unwrap_or(0)),
-        per_token_ns: counts.flops_per_token as f64 / flops,
-        per_row_key_ns: counts.attn_flops_per_row_key as f64 / flops,
-    })
-}
-
-/// The rungs `(tokens, span chunks)` offers as the ruling weighs them: a
-/// lane a token up to `max_lanes`, a row attending its fire's tokens, and
-/// infeasible where the span passes the `per_buffer` chunks one buffer
-/// binds.
+/// The rungs `candidates` offer as the ruling weighs them: a lane a token
+/// up to `max_lanes`, a row attending its fire's tokens, and infeasible
+/// where the span passes the `per_buffer` chunks one buffer binds.
 #[must_use]
 pub fn rung_facts(
-    act: &[(u32, u32)],
+    candidates: &[Candidate],
     chunk_bytes: u64,
     max_lanes: u32,
     per_buffer: u32,
 ) -> Vec<RungFacts> {
-    act.iter()
-        .map(|&(tokens, chunks)| RungFacts {
-            tokens,
-            lanes: tokens.min(max_lanes),
-            keys: tokens,
-            span_bytes: u64::from(chunks) * chunk_bytes,
-            infeasible: (chunks > per_buffer).then_some(PAST_ONE_BUFFER),
+    candidates
+        .iter()
+        .map(|c| RungFacts {
+            tokens: c.tokens,
+            lanes: c.tokens.min(max_lanes),
+            keys: c.tokens,
+            launches: c.launches,
+            padded_rows: c.padded_rows,
+            span_bytes: u64::from(c.chunks) * chunk_bytes,
+            infeasible: (c.chunks > per_buffer).then_some(PAST_ONE_BUFFER),
         })
         .collect()
 }
 
 /// The top rung of `rungs` on `device`, whose profile states `rates`, over
-/// a live range of `live` bytes, by the estimate from the rates alone.
+/// a live range of `live` bytes ([`engine::load::choose`]).
 pub fn choose(
     rungs: &[RungFacts],
     live: u64,
@@ -111,36 +78,9 @@ pub fn choose(
     device: &str,
     counts: &Counts,
 ) -> Result<TopRung> {
-    let Some(estimate) = estimate(counts, rates) else {
-        return Err(Fault::Residency(format!(
-            "device {device} has no rates in its profile (`[rates] bf16_flops_per_ns` and \
-             `bytes_per_ns`), so nothing weighs its top rung; measure them with the \
-             `the_device_rates` test and state them in its device file"
-        )));
-    };
-    let times = FireTimes {
-        measured: &[],
-        estimate,
-    };
-    engine::load::top_rung(rungs, live, &times).map_err(|no: NoRung| Fault::Residency(no.to_string()))
-}
-
-/// The load's one line on its top rung: which, why, and the span it
-/// reserves of the live range.
-#[must_use]
-pub fn line(rung: &TopRung, asked: u32, live: u64, device: &str) -> String {
-    let by = match rung.why {
-        TopWhy::Argmax { eff, live_share } => format!(
-            "by the estimate from {device}'s rates: eff {eff:.3} at a live share of {live_share:.3}"
-        ),
-        TopWhy::OnlyFeasible => "as the one feasible rung".to_string(),
-    };
-    let gib = live as f64 / f64::from(1u32 << 30);
-    format!(
-        "top rung {} of the {asked} asked {by}; span {} MiB of {gib:.1} GiB live",
-        rung.tokens,
-        rung.span_bytes >> 20
-    )
+    engine::load::choose(rungs, live, rates, device, counts)
+        .map(|(top, _)| top)
+        .map_err(|refused| Fault::Residency(refused.to_string()))
 }
 
 /// `budget` with fires of at most `top` tokens: its buckets below `top`,
@@ -168,22 +108,36 @@ mod tests {
     fn counts() -> Counts {
         Counts {
             weight_bytes: 1 << 30,
-            flops_per_token: 1 << 30,
+            expert_bytes: 0,
+            experts: None,
+            flops_per_row: 1 << 30,
             attn_flops_per_row_key: 1 << 10,
+            kv_bytes_per_key: 1 << 14,
+            width: 1024,
+        }
+    }
+
+    fn candidate(tokens: u32, chunks: u32) -> Candidate {
+        Candidate {
+            tokens,
+            chunks,
+            launches: 300,
+            padded_rows: tokens.next_multiple_of(32),
         }
     }
 
     #[test]
     fn a_span_past_one_buffer_is_no_rung() {
-        let rungs = rung_facts(&[(1024, 100), (2048, 300)], MIB, 256, 200);
+        let rungs = rung_facts(&[candidate(1024, 100), candidate(2048, 300)], MIB, 256, 200);
         assert_eq!(rungs[0].infeasible, None);
         assert_eq!((rungs[0].lanes, rungs[0].span_bytes), (256, 100 * MIB));
+        assert_eq!((rungs[0].launches, rungs[0].padded_rows), (300, 1024));
         assert_eq!(rungs[1].infeasible, Some(PAST_ONE_BUFFER));
     }
 
     #[test]
     fn without_rates_the_load_is_refused_by_name() {
-        let rungs = rung_facts(&[(1024, 100), (2048, 150)], MIB, 256, 200);
+        let rungs = rung_facts(&[candidate(1024, 100), candidate(2048, 150)], MIB, 256, 200);
         let err = choose(&rungs, 1 << 33, &profile::fire::Rates::default(), "Apple X", &counts())
             .unwrap_err();
         assert!(
@@ -197,7 +151,7 @@ mod tests {
         };
         let top = choose(&rungs, 1 << 33, &rated, "Apple X", &counts()).unwrap();
         assert!(matches!(top.tokens, 1024 | 2048));
-        let none = rung_facts(&[(1024, 300)], MIB, 256, 200);
+        let none = rung_facts(&[candidate(1024, 300)], MIB, 256, 200);
         let err = choose(&none, 1 << 33, &rated, "Apple X", &counts()).unwrap_err();
         assert!(
             err.to_string().contains("1024 tokens (span 300 MiB): past one buffer"),
