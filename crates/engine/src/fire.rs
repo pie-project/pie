@@ -231,8 +231,9 @@ pub struct Lane {
     #[serde(default)]
     pub tap: Option<Tap>,
     /// The lane's slot refs of the kv list and of each window list, in
-    /// token order (an engine that states [`crate::chunk::ChunkFacts`]);
-    /// empty during the migration, when `kv` and `rs` still say. A window
+    /// token order, by the shapes of the engine's [`crate::chunk::ChunkFacts`]
+    /// (pinned shapes' refs where it pins its pools); a list the lane holds
+    /// no slot of is left out. A window
     /// list's table is in its own token order, entry `i` its rows
     /// `[i * T_w, (i + 1) * T_w)` (`T_w` its shape's tokens), a slot trimmed
     /// behind its window ref 0 (CONTRACT-BC 19, 21).

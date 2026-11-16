@@ -3,9 +3,9 @@
 //! and the ids the paged kernels read slots by.
 //!
 //! A lane names slots by slot ref (`logical chunk * slots a chunk + index`).
-//! Until the runtime hands those out, a lane names today's page ids, and
-//! [`Seating`] seats each on a slot the first time it is named: the lowest
-//! free chunk opened for its shape, as the runtime's pool will.
+//! A lane that names no refs names page ids, and [`Seating`] seats each on a
+//! slot the first time it is named: the lowest free chunk opened for its
+//! shape, as the runtime's pool does.
 
 use engine::chunk::{ChunkTable, Evacuation};
 
