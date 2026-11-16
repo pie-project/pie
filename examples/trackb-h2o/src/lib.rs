@@ -1,6 +1,11 @@
 //! H2O — Heavy-Hitter Oracle (Zhang et al., 2023), <https://arxiv.org/abs/2306.14048>.
 //!
 //! Deviation: the paper re-ranks every step; here the keep-set is chosen once.
+//!
+//! The first enforcing decode keeps (`Fold::Keep`): it commits the kept
+//! pages' rows and every row written since the selection, and drops the
+//! rest. The decodes after it read what the set holds, unmasked, and on a
+//! model with recurrent layers replay nothing.
 
 use inferlet::eta::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -293,52 +298,68 @@ async fn main(input: Input) -> Result<Output> {
         let last = *generated.last().expect("prefill emitted a token") as i32;
         let at = sel_len;
         let tok_in = Channel::from([last]);
-        // Resume the Gumbel stream: each observation fire advanced `[s, k]` to `[s, k + 1]`.
-        let rng = Channel::from([input.seed ^ 0x5bd1, observe_fires as u32]);
-        let tok_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
         let lane1 = Channel::from([0u32, 1u32]);
-        let fill = Channel::from([at + 1]);
-
-        // A bound mask replaces the causal bound: the keep-set alone would admit unwritten slots.
-        let keep = Channel::from_shaped([1, kv_max], keep_row.clone());
-        let mask = Channel::from_shaped(
-            [1, kv_max],
-            keep_row
-                .iter()
-                .enumerate()
-                .map(|(j, k)| *k && (j as u32) <= at)
-                .collect::<Vec<bool>>(),
-        );
-
+        // The keeping decode: its row is slot `at`; nothing is folded
+        // before it, so its columns are slots.
+        use inferlet::eta::keep::{COMMIT, DROP};
+        let outcomes: Vec<u32> = keep_row[..=at as usize]
+            .iter()
+            .map(|&kept| if kept { COMMIT } else { DROP })
+            .collect();
+        let keep = Channel::from_shaped([1, at + 1], outcomes.clone());
+        let mask = Channel::from_shaped([1, at + 1], keep_row[..=at as usize].to_vec());
+        let first_out = Channel::new([1], dtype::i32);
+        // Resume the Gumbel stream: each observation fire advanced `[s, k]` to `[s, k + 1]`.
+        let rng_first = Channel::from([input.seed ^ 0x5bd1, observe_fires as u32]);
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &lane1)?;
         fwd.mask(&mask)?;
-        fwd.state(&[&ws], StateGeometry::default())?;
+        fwd.state(
+            &[&ws],
+            StateGeometry {
+                fold: Fold::Keep(&keep),
+                ..StateGeometry::default()
+            },
+        )?;
         fwd.epilogue(move || {
-            let length = fill.take();
-            let r = rng.take();
-            let logits = intrinsics::output(0, "logits");
-            let token = step(logits, temperature, &r);
-
-            tok_in.put(&token);
-            fill.put(&length + 1u32);
-            tok_out.put(&token);
-            rng.put(&(&r + iota(2)));
-
-            let k = keep.take();
-            mask.put(and(causal_mask(&length, kv_max), &k));
-            keep.put(&k);
+            let r = rng_first.take();
+            let token = step(intrinsics::output(0, "logits"), temperature, &r);
+            first_out.put(&token);
         });
+        fwd.submit(&pipe).context("keep submit")?;
+        let t = first_out.take_host::<i32>().await.context("keep drain")?;
+        pipe.close();
+        generated.push(t as u32);
 
-        run_ahead(&pipe, &fwd, enforce_tokens, async || {
-            let t = tok_out
-                .take_host::<i32>()
-                .await
-                .with_context(|| format!("enforce @{}", generated.len()))?;
-            generated.push(t as u32);
-            Ok(ControlFlow::Continue(()))
-        })
-        .await?;
+        // The rest of the enforcement reads what the set holds.
+        let rest = enforce_tokens - 1;
+        if rest > 0 && generated.len() < max_tokens {
+            // A pipeline's channels are its own.
+            let pipe = Pipeline::new();
+            let lane1 = Channel::from([0u32, 1u32]);
+            let tok_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
+            let tok_in = Channel::from([t]);
+            let rng = Channel::from([input.seed ^ 0x5bd1, observe_fires as u32 + 1]);
+            let fwd = ForwardPass::new();
+            fwd.embed(&tok_in, &lane1)?;
+            fwd.state(&[&ws], StateGeometry::default())?;
+            fwd.epilogue(move || {
+                let r = rng.take();
+                let token = step(intrinsics::output(0, "logits"), temperature, &r);
+                tok_in.put(&token);
+                tok_out.put(&token);
+                rng.put(&(&r + iota(2)));
+            });
+            run_ahead(&pipe, &fwd, rest, async || {
+                let t = tok_out
+                    .take_host::<i32>()
+                    .await
+                    .with_context(|| format!("enforce @{}", generated.len()))?;
+                generated.push(t as u32);
+                Ok(ControlFlow::Continue(()))
+            })
+            .await?;
+        }
     }
 
     let live = (last_kv_len as usize).min(last_scores.len());

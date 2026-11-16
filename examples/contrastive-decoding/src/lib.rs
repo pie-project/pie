@@ -5,6 +5,14 @@
 //! short attention window. Tokens are selected on-device by
 //! `log p_expert - lambda * log p_amateur`, restricted to tokens whose expert
 //! probability is at least `alpha` times the expert's maximum probability.
+//!
+//! Every `keep_every` decodes one decode keeps (`Fold::Keep`, a row a lane):
+//! the amateur drops the rows that left its window and leaves the window
+//! buffered, the expert commits all it holds. Between keeps the mask speaks
+//! of each lane's buffer (column `c` is slot `folded + c`): the amateur's
+//! window, the expert's rows since its keep. So the amateur holds its window
+//! and the rows since, and on a model with recurrent layers neither lane
+//! replays its history.
 
 use inferlet::chat;
 use inferlet::eta::prelude::*;
@@ -22,6 +30,22 @@ struct Input {
     lambda: f32,
     #[serde(default = "default_alpha")]
     alpha: f32,
+    /// Decodes between keeps.
+    #[serde(default = "default_keep_every")]
+    keep_every: u32,
+}
+
+fn default_keep_every() -> u32 {
+    256
+}
+
+/// Each lane's mask row over `width` columns for queries at buffer columns
+/// `query` (amateur, expert): the amateur's window, the expert's every row.
+fn lane_masks(width: u32, query: [u32; 2], window: u32) -> Vec<bool> {
+    (0..width)
+        .map(|key| key <= query[0] && key.saturating_add(window) > query[0])
+        .chain((0..width).map(|key| key <= query[1]))
+        .collect()
 }
 
 fn default_prompt() -> String {
@@ -145,52 +169,114 @@ async fn main(input: Input) -> Result<String> {
         return model::decode(&generated);
     }
 
-    let toks = Channel::from([first as i32, first as i32]);
-    let embed_indptr = Channel::from([0u32, 1, 2]);
-    let fill = Channel::from([n + 1]);
-    let decode_mask_init = (0..span)
-        .map(|key| key <= n && key.saturating_add(window) > n)
-        .chain((0..span).map(|key| key <= n))
-        .collect::<Vec<_>>();
-    let mask = Channel::from_shaped([2, span], decode_mask_init);
-    let out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
+    pipeline.close();
+    // Each lane's set: rows `0..end`, committed below `folded`; its next
+    // query is slot `end`. Amateur first, expert second.
+    let every = input.keep_every.max(1);
+    let mut folded = [0u32; 2];
+    let mut end = [n; 2];
+    let mut token = first as i32;
+    let mut stopped = false;
+    while !stopped && generated.len() < input.max_tokens {
+        let left = (input.max_tokens - generated.len()) as u32;
+        let steps = every.min(left).saturating_sub(1);
+        let query = [end[0] - folded[0], end[1] - folded[1]];
+        let width = query[0].max(query[1]) + steps + 1;
+        if steps > 0 {
+            let toks = Channel::from([token, token]);
+            let embed_indptr = Channel::from([0u32, 1, 2]);
+            let fill = Channel::from([query[0] + 1, query[1] + 1]);
+            let mask = Channel::from_shaped([2, width], lane_masks(width, query, window));
+            let out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
+            let decode = ForwardPass::new();
+            decode.embed(&toks, &embed_indptr)?;
+            decode.mask(&mask)?;
+            decode.state(&streams, StateGeometry::default())?;
+            decode.epilogue(move || {
+                let logits = reshape(intrinsics::output(0, "logits"), [2, vocab]);
+                let amateur = reshape(gather(&logits, iota(1)), [vocab]);
+                let expert = reshape(gather(&logits, iota(1) + 1u32), [vocab]);
+                let token = contrastive_pick(&expert, &amateur, lambda, alpha, vocab);
 
-    let decode = ForwardPass::new();
-    decode.embed(&toks, &embed_indptr)?;
-    decode.mask(&mask)?;
-    decode.state(&streams, StateGeometry::default())?;
-    decode.epilogue(move || {
-        let logits = reshape(intrinsics::output(0, "logits"), [2, vocab]);
-        let amateur = reshape(gather(&logits, iota(1)), [vocab]);
-        let expert = reshape(gather(&logits, iota(1) + 1u32), [vocab]);
-        let token = contrastive_pick(&expert, &amateur, lambda, alpha, vocab);
+                // Each lane's next query column: [amateur, expert].
+                let base = fill.take();
+                let flat = iota(2 * width);
+                let row = &flat / width;
+                let col = &flat - &row * width;
+                let base_cols = reshape(broadcast(reshape(&base, [2, 1]), [2, width]), [2 * width]);
+                let causal = le(&col, &base_cols);
+                let in_window = gt(&col + window, &base_cols);
+                let is_expert = eq(&row, 1u32);
+                let next_mask = reshape(and(&causal, or(&is_expert, &in_window)), [2, width]);
 
-        let base = fill.take();
-        let flat = iota(2 * span);
-        let row = &flat / span;
-        let col = &flat - &row * span;
-        let base_cols = broadcast(reshape(&base, [1]), [2 * span]);
-        let causal = le(&col, &base_cols);
-        let in_window = gt(&col + window, &base_cols);
-        let is_expert = eq(&row, 1u32);
-        let next_mask = reshape(and(&causal, or(&is_expert, &in_window)), [2, span]);
-
-        toks.put(broadcast(&token, [2]));
-        fill.put(&base + 1u32);
-        mask.put(next_mask);
-        out.put(token);
-    });
-
-    let budget = input.max_tokens.saturating_sub(generated.len());
-    run_ahead(&pipeline, &decode, budget, async || {
-        let token = read_expert_token(&out).await?;
-        if stop_tokens.contains(&token) {
-            return Ok(ControlFlow::Break(()));
+                toks.put(broadcast(&token, [2]));
+                fill.put(&base + 1u32);
+                mask.put(next_mask);
+                out.put(token);
+            });
+            // `run_ahead` closes its pipeline once its budget is posted.
+            let segment = Pipeline::new();
+            let mut taken = 0u32;
+            run_ahead(&segment, &decode, steps as usize, async || {
+                let next = read_expert_token(&out).await?;
+                taken += 1;
+                token = next as i32;
+                if stop_tokens.contains(&next) {
+                    stopped = true;
+                    return Ok(ControlFlow::Break(()));
+                }
+                generated.push(next);
+                Ok(ControlFlow::Continue(()))
+            })
+            .await?;
+            end = [end[0] + taken, end[1] + taken];
+            if stopped || generated.len() >= input.max_tokens {
+                break;
+            }
         }
-        generated.push(token);
-        Ok(ControlFlow::Continue(()))
-    })
-    .await?;
+        // The keeping decode: the amateur lets go of what left its window,
+        // the expert commits all it holds.
+        use inferlet::eta::keep::{BUFFER, COMMIT, DROP};
+        let query = [end[0] - folded[0], end[1] - folded[1]];
+        let width = query[0].max(query[1]) + 1;
+        let amateur: Vec<u32> = (0..width)
+            .map(|c| if c + window > query[0] { BUFFER } else { DROP })
+            .collect();
+        let rows: Vec<u32> = amateur.iter().copied().chain((0..width).map(|_| COMMIT)).collect();
+        let keep = Channel::from_shaped([2, width], rows);
+        let mask = Channel::from_shaped([2, width], lane_masks(width, query, window));
+        let toks = Channel::from([token, token]);
+        let out = Channel::new([1], dtype::i32);
+        let decode = ForwardPass::new();
+        decode.embed(&toks, &Channel::from([0u32, 1, 2]))?;
+        decode.mask(&mask)?;
+        decode.state(
+            &streams,
+            StateGeometry {
+                fold: Fold::Keep(&keep),
+                ..StateGeometry::default()
+            },
+        )?;
+        decode.epilogue(move || {
+            let logits = reshape(intrinsics::output(0, "logits"), [2, vocab]);
+            let amateur = reshape(gather(&logits, iota(1)), [vocab]);
+            let expert = reshape(gather(&logits, iota(1) + 1u32), [vocab]);
+            out.put(contrastive_pick(&expert, &amateur, lambda, alpha, vocab));
+        });
+        let keeping = Pipeline::new();
+        decode.submit(&keeping).context("contrastive keep")?;
+        let next = read_expert_token(&out).await?;
+        keeping.close();
+        let dropped = amateur[..=query[0] as usize].iter().filter(|&&at| at == DROP).count() as u32;
+        end = [end[0] + 1 - dropped, end[1] + 1];
+        folded = [folded[0], end[1]];
+        token = next as i32;
+        if stop_tokens.contains(&next) {
+            stopped = true;
+        } else {
+            generated.push(next);
+        }
+    }
 
     model::decode(&generated)
 }

@@ -241,6 +241,13 @@ async fn main(input: Input) -> Result<Output> {
     let slots_q = Channel::from_iter(ask_at..n);
     let mask_q = Channel::from_shaped([q, kv_max], rows);
     let tok_out_q = Channel::new([1], dtype::i32);
+    // The question keeps (`Fold::Keep`): the kept haystack rows and its own
+    // are committed, the evicted pages' rows let go.
+    use inferlet::eta::keep::{COMMIT, DROP};
+    let outcomes: Vec<u32> = (0..n)
+        .map(|j| if j >= ask_at || keep_row[j as usize] { COMMIT } else { DROP })
+        .collect();
+    let keep_q = Channel::from_shaped([1, n], outcomes);
 
     let fwd_q = ForwardPass::new();
     fwd_q.embed(&toks_q, &embed_indptr_q)?;
@@ -249,7 +256,8 @@ async fn main(input: Input) -> Result<Output> {
         &[&ws],
         StateGeometry {
             slots: Some(&slots_q),
-            ..StateGeometry::folding()
+            fold: Fold::Keep(&keep_q),
+            ..StateGeometry::default()
         },
     )?;
     fwd_q.epilogue(move || {

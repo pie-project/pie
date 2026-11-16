@@ -157,20 +157,60 @@ async fn main(input: Input) -> Result<Output> {
         .map_err(|e| format!("g0 take: {e}"))?;
     generated.push(g0 as u32);
 
+    // doc-isolation keeps once (`Fold::Keep`): its first decode drops the
+    // document and commits the rest, so the decodes after it read what the
+    // set holds; their mask speaks of the buffer (column `c` is slot
+    // `folded + c`), which starts empty.
+    let (mut g0, mut rng_at, mut query, mut doc_start) = (g0, 0u32, n, doc_start);
+    if doc_start > 0 && generated.len() < max_tokens {
+        use inferlet::eta::keep::{COMMIT, DROP};
+        let keep = Channel::from_shaped(
+            [1, n + 1],
+            (0..=n)
+                .map(|j| if j < doc_start { DROP } else { COMMIT })
+                .collect::<Vec<u32>>(),
+        );
+        let mask = Channel::from_shaped(
+            [1, n + 1],
+            (0..=n).map(|j| j >= doc_start).collect::<Vec<bool>>(),
+        );
+        let tok_in = Channel::from(vec![g0; 1]);
+        let rng = Channel::from(vec![input.seed ^ 0x5bd1, 0]);
+        let out = Channel::new([1], dtype::i32);
+        let fwd = ForwardPass::new();
+        fwd.embed(&tok_in, &Channel::from(vec![0u32, 1u32]))?;
+        fwd.mask(&mask)?;
+        fwd.state(
+            &[&ws],
+            StateGeometry {
+                fold: Fold::Keep(&keep),
+                ..StateGeometry::default()
+            },
+        )?;
+        fwd.epilogue(move || {
+            let r = rng.take();
+            out.put(&step(intrinsics::output(0, "logits"), temperature, &r));
+        });
+        fwd.submit(&pipe).map_err(|e| format!("keep submit: {e}"))?;
+        let t = out.take_host::<i32>().await.map_err(|e| format!("keep take: {e}"))?;
+        generated.push(t as u32);
+        (g0, rng_at, query, doc_start) = (t, 1, 0, 0);
+    }
+
     // ── DECODE LOOP (1-wide, run-ahead) — chat-completion's decode shape. ──
     if generated.len() < max_tokens {
         let tok_in = Channel::from(vec![g0; 1]);
-        let fill = Channel::from(vec![n + 1; 1]);
-        // Causal row for the fire-0 query at position n: attend all j <= n
-        // (doc-isolation additionally blocks j < doc_start).
-        let seed_mask: Vec<bool> = (0..span).map(|j| j >= doc_start && j <= n).collect();
+        let fill = Channel::from(vec![query + 1; 1]);
+        // Causal row for the fire-0 query at column `query`: attend all
+        // j <= query (doc-isolation additionally blocks j < doc_start).
+        let seed_mask: Vec<bool> = (0..span).map(|j| j >= doc_start && j <= query).collect();
         let mask = Channel::from_shaped([1, span], seed_mask);
         let doc_row = Channel::from_shaped(
             [span],
             (0..span).map(|j| j >= doc_start).collect::<Vec<bool>>(),
         );
         let tok_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
-        let rng = Channel::from(vec![input.seed ^ 0x5bd1, 0]);
+        let rng = Channel::from(vec![input.seed ^ 0x5bd1, rng_at]);
         let lane1 = Channel::from(vec![0u32, 1u32]);
 
         let fwd = ForwardPass::new();
@@ -219,7 +259,7 @@ async fn main(input: Input) -> Result<Output> {
             rng.put(&r_next);
         });
 
-        let budget = max_tokens - 1;
+        let budget = max_tokens - generated.len();
         run_ahead(&pipe, &fwd, budget, async || {
             let t = tok_out
                 .take_host::<i32>()
