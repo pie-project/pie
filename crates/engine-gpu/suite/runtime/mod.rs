@@ -9,4 +9,5 @@ mod roles;
 mod shared;
 mod slots;
 mod rs_layout;
+mod rs_runs;
 mod buffered_fold;
