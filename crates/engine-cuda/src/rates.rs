@@ -251,7 +251,11 @@ mod on_device {
     }
 
     /// Lays the scratch slabs `launch` takes on its context (a size-only
-    /// walk of it, as a load lays its fires'), in memory `held` keeps.
+    /// walk of it, as a load lays its fires'), in the one buffer `held`
+    /// keeps: zeroed again where it is wide enough, else replaced by a wider
+    /// one. Every fire before has landed (each timing waits on its stop
+    /// event) and the launch's graph is gone, so nothing still reads the
+    /// slabs laid before; one buffer a point would hold the grid's 1425.
     fn lay(
         held: &mut Vec<Buffer>,
         launch: impl FnOnce() -> Result<(), Kernel>,
@@ -262,11 +266,20 @@ mod on_device {
         if placed.is_empty() {
             return Ok(());
         }
-        let buffer = Buffer::zeroed(Slabs::placed_bytes(&placed)).map_err(say("the slabs"))?;
-        // SAFETY: `buffer` is zeroed device memory of the bytes these slabs
-        // take, kept in `held` past every launch that takes them.
+        let bytes = Slabs::placed_bytes(&placed);
+        match held.last_mut() {
+            Some(buffer) if buffer.bytes() >= bytes => {
+                buffer.zero_span(0, bytes).map_err(say("the slabs"))?;
+            }
+            _ => {
+                held.clear();
+                held.push(Buffer::zeroed(bytes).map_err(say("the slabs"))?);
+            }
+        }
+        let buffer = held.last().expect("laid just above");
+        // SAFETY: `buffer` is zeroed device memory of at least the bytes
+        // these slabs take, kept in `held` past every launch that takes them.
         unsafe { Slabs::place(buffer.ptr() as *mut c_void, &placed) };
-        held.push(buffer);
         Ok(())
     }
 
