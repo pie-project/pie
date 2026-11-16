@@ -210,9 +210,13 @@ pub(crate) fn act_x_wt(
                 cudarc::cublas::sys::cublasMath_t::CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION,
             )
         };
-        if status == cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-            return Ok(());
+        if status != cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            return Err(refuse(
+                op,
+                format!("`cublasGemmEx` answered {status:?} at M={m} N={n} K={k}"),
+            ));
         }
+        return Ok(());
     }
     let capturing = capture_status(stream);
     let (plan, tactic, lt_handle, want) = with_device(|device| {
@@ -230,80 +234,72 @@ pub(crate) fn act_x_wt(
             .and_then(|status| device.tactic_for(handle, stream, plan.as_deref(), call, status));
         (plan, tactic, device.lt.handle, device.lt.workspace_bytes)
     });
-    let (ws, ws_bytes) = match ctx.scratch_stream(op, LT_WORKSPACE, want) {
-        Ok(ws) if !ws.is_null() => (ws, want),
-        _ => (std::ptr::null_mut(), 0),
-    };
+    let (ws, ws_bytes) = lt_workspace(ctx, op, want);
     // SAFETY: `handle` is this context's live cuBLAS handle, bound to
     // `stream`; `ws` is a device slab of `ws_bytes` the context owns.
     unsafe {
         cublasSetWorkspace_v2(handle, ws, ws_bytes);
     }
-    if let Some(tactic) = tactic
-        && run_tactic(
-            handle,
-            stream,
-            lt_handle,
-            plan.as_deref(),
-            tactic,
-            call,
-            ws,
-            ws_bytes,
-            tuning,
-        )
-    {
-        return Ok(());
+    // Untimed (a capture, a shape past the tuning arena), the one-row
+    // kernel serves a row it takes and cuBLAS's tensor-op algorithm the rest.
+    // A cuBLASLt heuristic this context's workspace cannot hold is not
+    // chosen either.
+    let tactic = match tactic {
+        Some(Tactic::Lt(index)) if !fits(lt_handle, plan.as_deref(), index, ws_bytes) => None,
+        tactic => tactic,
     }
-    clear_error();
-
-    if m == 1
-        && gemv_bf16(
-            // SAFETY: `stream` is `ctx`'s, live by `Ctx::on`'s contract for `ctx`.
-            &unsafe { Ctx::on(stream) }.with_tuning(tuning),
-            w,
-            act,
-            y,
-            n,
-            k,
-        )
-        .is_ok()
-    {
-        return Ok(());
-    }
-    if gemm_ex(
+    .unwrap_or(if m == 1 && gemv_takes(w, act, k) {
+        Tactic::Gemv
+    } else {
+        Tactic::GemmEx
+    });
+    if !run_tactic(
         handle,
+        stream,
+        lt_handle,
+        plan.as_deref(),
+        tactic,
         call,
-        cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
-    ) == cublasStatus_t::CUBLAS_STATUS_SUCCESS
-    {
-        return Ok(());
+        ws,
+        ws_bytes,
+        tuning,
+    ) {
+        return Err(refuse(
+            op,
+            format!("its {tactic:?} tactic failed at M={m} N={n} K={k}"),
+        ));
     }
-    let status = gemm_ex(handle, call, cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT);
-    if status == cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-        return Ok(());
+    Ok(())
+}
+
+/// Whether the one-row kernel takes a product: K in whole eights over
+/// 16-byte aligned operands (`crate::linear::gemv::gemv`'s refusals).
+fn gemv_takes(w: u64, act: u64, k: i32) -> bool {
+    k > 0 && k % 8 == 0 && [w, act].iter().all(|&at| at != 0 && at % 16 == 0)
+}
+
+/// The cuBLASLt workspace a product runs with: the stream's slab of `want`
+/// bytes, or none on a context that lays no such slab (a heuristic that
+/// needs one is then not chosen, [`fits`]).
+fn lt_workspace(ctx: &Ctx, op: &'static str, want: usize) -> (*mut c_void, usize) {
+    match ctx.scratch_stream(op, LT_WORKSPACE, want) {
+        Ok(ws) if !ws.is_null() => (ws, want),
+        _ => (std::ptr::null_mut(), 0),
     }
-    if let Some(plan) = plan {
-        for heuristic in &plan.heuristics {
-            if run_lt(
-                lt_handle,
-                &plan,
-                &heuristic.algo,
-                stream,
-                call,
-                ws,
-                ws_bytes,
-            ) {
-                return Ok(());
-            }
-        }
-    }
-    Err(refuse(
-        op,
-        format!(
-            "`cublasGemmEx` answered {status:?} at M={m} N={n} K={k}, and the \
-             non-tensor-op and cuBLASLt retries failed too"
-        ),
-    ))
+}
+
+/// Whether cuBLASLt's heuristic `index` of `plan` runs here: a live handle
+/// and a workspace of at least what it asks.
+fn fits(
+    lt_handle: lt::cublasLtHandle_t,
+    plan: Option<&LtPlan>,
+    index: usize,
+    ws_bytes: usize,
+) -> bool {
+    !lt_handle.is_null()
+        && plan
+            .and_then(|plan| plan.heuristics.get(index))
+            .is_some_and(|heuristic| heuristic.workspaceSize <= ws_bytes)
 }
 
 /// `outs = epi(act . w^T)`, an anchored region over a dense bf16 bank of
@@ -477,10 +473,10 @@ pub(crate) fn anchored(
             ) else {
                 return unfused(ctx, op, epi, act, w, ins, outs, paging, m, n, k);
             };
-            let (ws, ws_bytes) = match ctx.scratch_stream(op, LT_WORKSPACE, want) {
-                Ok(ws) if !ws.is_null() => (ws, want),
-                _ => (std::ptr::null_mut(), 0),
-            };
+            let (ws, ws_bytes) = lt_workspace(ctx, op, want);
+            if !fits(lt_handle, Some(plan), index, ws_bytes) {
+                return unfused(ctx, op, epi, act, w, ins, outs, paging, m, n, k);
+            }
             let call = Call {
                 act,
                 w,
@@ -491,23 +487,23 @@ pub(crate) fn anchored(
                 anchor: None,
             };
             let bias = ins.first().map_or(0, |b| b.base());
-            if !lt_handle.is_null()
-                && run_lt_epilogue(
-                    lt_handle,
-                    plan,
-                    &heuristic.algo,
-                    stream,
-                    call,
-                    epilogue,
-                    bias,
-                    ws,
-                    ws_bytes,
-                )
-            {
-                return Ok(true);
+            if !run_lt_epilogue(
+                lt_handle,
+                plan,
+                &heuristic.algo,
+                stream,
+                call,
+                epilogue,
+                bias,
+                ws,
+                ws_bytes,
+            ) {
+                return Err(refuse(
+                    op,
+                    format!("cuBLASLt's epilogue at heuristic {index} failed at M={m} N={n} K={k}"),
+                ));
             }
-            clear_error();
-            unfused(ctx, op, epi, act, w, ins, outs, paging, m, n, k)
+            Ok(true)
         }
         Some(Tactic::Skeleton(skeleton)) => {
             skeleton.fire(ctx, epi, w, act, ins, outs, paging, m, n, k)?;
@@ -536,10 +532,11 @@ pub(crate) fn anchored(
     }
 }
 
-/// `out = epi(act . w^T)` on cuBLASLt's own epilogue alone, at the first of
-/// the plain product's heuristics that takes it: the fused candidate
+/// `out = epi(act . w^T)` on cuBLASLt's own epilogue alone, at the plain
+/// product's first heuristic the workspace holds: the fused candidate
 /// [`anchored`] times, run as it is. False, landing nothing, where the
-/// epilogue is none of cuBLASLt's or no heuristic takes it.
+/// epilogue is none of cuBLASLt's or no heuristic fits; the chosen one
+/// failing is a fault.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn on_lt(
     ctx: &Ctx,
@@ -588,28 +585,32 @@ pub(crate) fn on_lt(
     if lt_handle.is_null() {
         return Ok(false);
     }
-    let (ws, ws_bytes) = match ctx.scratch_stream(op, LT_WORKSPACE, want) {
-        Ok(ws) if !ws.is_null() => (ws, want),
-        _ => (std::ptr::null_mut(), 0),
+    let (ws, ws_bytes) = lt_workspace(ctx, op, want);
+    let Some(heuristic) = plan
+        .heuristics
+        .iter()
+        .find(|heuristic| heuristic.workspaceSize <= ws_bytes)
+    else {
+        return Ok(false);
     };
     let bias = ins.first().map_or(0, |b| b.base());
-    for heuristic in &plan.heuristics {
-        if run_lt_epilogue(
-            lt_handle,
-            &plan,
-            &heuristic.algo,
-            ctx.stream(),
-            call,
-            epilogue,
-            bias,
-            ws,
-            ws_bytes,
-        ) {
-            return Ok(true);
-        }
+    if !run_lt_epilogue(
+        lt_handle,
+        &plan,
+        &heuristic.algo,
+        ctx.stream(),
+        call,
+        epilogue,
+        bias,
+        ws,
+        ws_bytes,
+    ) {
+        return Err(refuse(
+            op,
+            format!("cuBLASLt's epilogue failed at M={m} N={n} K={k}"),
+        ));
     }
-    clear_error();
-    Ok(false)
+    Ok(true)
 }
 
 /// `outs = epi(act . w^T)` untimed on the unfused leg: the plain product
