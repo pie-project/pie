@@ -2311,9 +2311,50 @@ cut, the router's first experts), f32.
 
 | slice | program | host side | simulator |
 |---|---|---|---|
-| Qwen/Qwen3-0.6B -l2 | 3 units, 159 x 274, 64 positions, 0.023M cycles priced | lands, 187M static words, 1,040 entry words a step | halts before its first step: an `hcf` in a memcpy halo PE (x 2; rows 1, 2, 32 across three runs) at 5.8-44k cycles, after every write was issued: the launch or the first read back. The same halt under the Python SDK harness (`--export`, `run.py`: the arrays loaded, the launch returning at once, then the halt), so the program's, not the engine's runtime: the next suspect the first read back (`hout`, the logits a row at the head's column roots) |
+| Qwen/Qwen3-0.6B -l2 | 3 units, 159 x 274, 64 positions, 0.023M cycles priced | lands, 187M static words, 1,040 entry words a step | halts loading, before any launch: an `hcf` in the memcpy halo's command fan (x 2, the row varying run to run) at 5.8-44k cycles, under the engine's runtime and the Python SDK harness alike. Bisected (`run.py`, load only, `H2D=a:b` the arrays written, no launch, no read back): none written stops clean; every subset tried alone stops clean or outlasts 15 min unhalted (0:1, 1:2, 0:4, 0:38, 38:63, 63:72); all 72 halt within 6k cycles. The fan's own note (csl-libs `runtime/cmd_fan.csl`: a fourth command taken while the core still blocks its command colour is fatal) points at commands queued faster than a 159-wide row retires them; the next check bounds the commands in flight (`SYNC`). The simulator runs this fabric at ~48 cycles/s: the load alone (~700k cycles a row of weights) is hours, so the slice is verified on the CS-3 first (the engine's own load, G1.7) |
 | Qwen/Qwen3-30B-A3B layer 0, experts 0-15 | 2 units, 86 x 526 | lands (a range-fetched 2 GB slice), 414M static words | queued behind the above |
 | Qwen/Qwen3.5-0.8B -l1 (GDN) | 2 units, 422 x 154, 16 state columns | lands, 276M static words | queued behind the above |
+
+### G1.7 Compile on load
+
+A model the decode templates refuse (`target::plans` / its presets) loads its decode step as stream
+units with no flag: `prepare::unit_program` lowers it (`stream::compile_decode`) and links it into
+the engine's cache, at the config's context or, unstated, at the most positions its K / V columns
+hold (bisected over 64 .. 8192: the 0.6B -l2 links at 8192); `Wafer` runs the template's model or
+`UnitModel` (a token a launch, its statics the checkpoint's, a rewind replayed from 0) behind
+the same jobs. `wafer-bench --decode --model <deployment> --cache <dir>` runs the program the
+engine builds on load (the sim checks below use it). Where the templates take a model they still
+win (shipping builds unchanged); the choice by price, units against the template, follows once
+the unit path is measured.
+
+### G1.8 B lanes (design)
+
+A decode step through units is already a step of rows (a class's rows, as a reading's): B lanes
+are B rows, one a lane, each with its own position, pages and state.
+
+- **Positions and pages.** A K / V column holds `S` slots in pages of `P` positions (Pie's pages:
+  slot = page x P + offset, `P` a multiple of the column's rows so a page is `P / PYA` consecutive
+  entries on every PE of the column). Each K / V PE keeps a page table a lane slot (`ptab`, the
+  lane's pages in order), written only when a lane takes a page (every `P` tokens), and a step's
+  two words a row (`rowp`: its lane slot, its position `q`), written a step. Row `t` stores at
+  `ptab[lane][q / P] x P + q % P`; its query starts from every entry masked, unmasks the lane's
+  pages before `q / P` whole (a fill of `P / PYA` entries each) and of page `q / P` the offsets up
+  to `q % P`: the causal mask within the lane, from the page list alone (no position a slot).
+  Prefix sharing and forks are shared page ids, as Pie's are; nothing on the wafer is per
+  sequence but its pages.
+- **Recurrent state.** A state column holds `slots` states a head (the P8 column's `S_i` a slot);
+  row `t` names its slot; rows of one lane step in their order (a prefill piece's rows are a
+  lane's consecutive rows), rows of different lanes are independent.
+- **Mixed launches.** A launch's rows are any mix of prefill pieces and decode rows: stores before
+  queries (the QH structure), each row's mask its own.
+- **B by price.** The cost model prices a step at B rows (matvecs amortise the weights' stream over
+  B; K / V and the head scale with B); the search picks B against Pie's frames in flight (runahead)
+  and the PEs' memory (slots x S), no pins. The bar: the templates' 22.7k tok/s on the 0.6B (pipe
+  B4 x 8 micro-batches).
+- **Argmax on the wafer.** The head's column roots reduce their logits to (max, index) and one
+  word pair a row returns, not the vocabulary (the 600 KB a token the unit path reads back now).
+
+The sim checks run B = 4 with different prompts and positions a lane once B = 1 holds.
 
 ## 5. Risks
 
