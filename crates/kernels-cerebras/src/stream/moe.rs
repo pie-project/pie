@@ -53,6 +53,15 @@ pub fn synth(node: u32, kind: Kind) -> ValueId {
     ValueId(SYNTH | (node * KINDS) | kind as u32)
 }
 
+/// The experts' activation: gated (a gated unit's, over its gate, times its up) or not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Act {
+    Silu,
+    GeluTanh,
+    /// relu(x)², over the up alone (no gate).
+    Relu2,
+}
+
 /// A routed layer's nodes and widths.
 #[derive(Clone, Debug)]
 pub struct Group {
@@ -71,12 +80,13 @@ pub struct Group {
     pub x: ValueId,
     pub hidden: u32,
     /// The gate's and the up's bank, each expert's rows `stride` apart from `off` (a gate | up
-    /// bank's halves: stride `2 I`), and the down bank `[E, H, I]`.
-    pub gate: (ValueId, u32, u32),
+    /// bank's halves: stride `2 I`), and the down bank `[E, H, I]`; no gate for a non-gated
+    /// activation's experts.
+    pub gate: Option<(ValueId, u32, u32)>,
     pub up: (ValueId, u32, u32),
     pub down: ValueId,
     pub inter: u32,
-    pub silu: bool,
+    pub act: Act,
     /// The combine's output.
     pub y: ValueId,
     pub dtype: Dtype,
@@ -145,45 +155,56 @@ pub fn group(trace: &Trace, node: u32, nodes: &[u32]) -> R<Group> {
     };
     let (x, b1, y1) = select(s1);
     // the experts' activation over their gate | up rows (one bank, its halves), or over a gate
-    // and an up selected apart (a bank each)
-    let glu = after(&|op| {
-        matches!(op, Operation::Linear(Linear::Glu { packed, gate, up, weights: None,
-            limit: None, .. })
-            if *packed == Some(y1) || (*gate == Some(y1) && up.is_some()))
-    })
-    .ok_or_else(|| refuse("activates its experts by no plain gated unit"))?;
-    let Operation::Linear(Linear::Glu {
-        packed,
-        up,
-        intermediate,
-        act,
-        y: a,
-        ..
-    }) = &trace.nodes[glu as usize].op
-    else {
-        unreachable!()
-    };
-    let i = *intermediate;
-    let (gate_half, up_half, s_up) = if packed.is_some() {
-        ((b1, 2 * i, 0), (b1, 2 * i, i), None)
+    // and an up selected apart (a bank each), or a non-gated one over the up alone
+    let relu2 = after(&|op| matches!(op, Operation::Linear(Linear::Relu2 { x, .. }) if *x == y1));
+    let (act_node, a, mut i, gate_half, mut up_half, s_up, act) = if let Some(rn) = relu2 {
+        let Operation::Linear(Linear::Relu2 { y: a, .. }) = &trace.nodes[rn as usize].op else {
+            unreachable!()
+        };
+        // (its width the down bank's [E, H, I] last, below)
+        (rn, *a, 0, None, (b1, 0, 0), None, Act::Relu2)
     } else {
-        let u = up.ok_or_else(|| refuse("activates no up"))?;
-        let su = after(&|op| {
-            plain(op, *routes)
-                && matches!(op, Operation::Linear(Linear::MoeSelect { x: sx, y, .. })
-                    if *y == u && *sx == x)
+        let glu = after(&|op| {
+            matches!(op, Operation::Linear(Linear::Glu { packed, gate, up, weights: None,
+                limit: None, .. })
+                if *packed == Some(y1) || (*gate == Some(y1) && up.is_some()))
         })
-        .ok_or_else(|| refuse("selects its up apart from its input"))?;
-        let (_, b2, _) = select(su);
-        ((b1, i, 0), (b2, i, 0), Some(su))
-    };
-    let silu = match act {
-        poem_ir::GluAct::Swiglu => true,
-        poem_ir::GluAct::GegluTanh => false,
-        a => return Err(refuse(&format!("activates its experts by {a:?}"))),
+        .ok_or_else(|| refuse("activates its experts by no plain gated unit"))?;
+        let Operation::Linear(Linear::Glu {
+            packed,
+            up,
+            intermediate,
+            act,
+            y: a,
+            ..
+        }) = &trace.nodes[glu as usize].op
+        else {
+            unreachable!()
+        };
+        let i = *intermediate;
+        let (gate_half, up_half, s_up) = if packed.is_some() {
+            ((b1, 2 * i, 0), (b1, 2 * i, i), None)
+        } else {
+            let u = up.ok_or_else(|| refuse("activates no up"))?;
+            let su = after(&|op| {
+                plain(op, *routes)
+                    && matches!(op, Operation::Linear(Linear::MoeSelect { x: sx, y, .. })
+                        if *y == u && *sx == x)
+            })
+            .ok_or_else(|| refuse("selects its up apart from its input"))?;
+            let (_, b2, _) = select(su);
+            ((b1, i, 0), (b2, i, 0), Some(su))
+        };
+        let act = match act {
+            poem_ir::GluAct::Swiglu => Act::Silu,
+            poem_ir::GluAct::GegluTanh => Act::GeluTanh,
+            a => return Err(refuse(&format!("activates its experts by {a:?}"))),
+        };
+        (glu, *a, i, Some(gate_half), up_half, s_up, act)
     };
     let s2 = after(&|op| {
-        plain(op, *routes) && matches!(op, Operation::Linear(Linear::MoeSelect { x, .. }) if x == a)
+        plain(op, *routes)
+            && matches!(op, Operation::Linear(Linear::MoeSelect { x, .. }) if *x == a)
     })
     .ok_or_else(|| refuse("projects its experts down by no plain bank"))?;
     let Operation::Linear(Linear::MoeSelect {
@@ -192,6 +213,10 @@ pub fn group(trace: &Trace, node: u32, nodes: &[u32]) -> R<Group> {
     else {
         unreachable!()
     };
+    if act == Act::Relu2 {
+        i = width(trace, *down);
+        up_half = (b1, i, 0);
+    }
     let comb = after(&|op| {
         matches!(op, Operation::Linear(Linear::MoeCombine { routed, weights: Some(w),
             shared: None, .. }) if routed == dn && w == weights)
@@ -202,7 +227,7 @@ pub fn group(trace: &Trace, node: u32, nodes: &[u32]) -> R<Group> {
     };
     let mut nodes = vec![node, s1];
     nodes.extend(s_up);
-    nodes.extend([glu, s2, comb]);
+    nodes.extend([act_node, s2, comb]);
     Ok(Group {
         route: node,
         nodes,
@@ -218,7 +243,7 @@ pub fn group(trace: &Trace, node: u32, nodes: &[u32]) -> R<Group> {
         up: up_half,
         down: *down,
         inter: i,
-        silu,
+        act,
         y: *y,
         dtype: dtype(trace, *y),
     })
@@ -239,7 +264,7 @@ pub fn ty(trace: &Trace, v: ValueId) -> Option<(u32, Dtype)> {
     let nodes: Vec<u32> = (0..trace.nodes.len() as u32).collect();
     let g = group(trace, node, &nodes).ok()?;
     let ei = g.experts * g.inter;
-    let narrow = dtype(trace, g.gate.0);
+    let narrow = dtype(trace, g.up.0);
     Some(match kind {
         0 => (g.experts, Dtype::F32),
         1 => (ei, Dtype::F32),
@@ -367,35 +392,50 @@ pub fn router(trace: &Trace, g: &Group) -> R<Chain> {
 /// The experts' activation, gated: `act(gates) · ups · spread`, rounded as the activation's
 /// output is, then as the down projection's input.
 pub fn activation(g: &Group, narrow: Dtype) -> R<Chain> {
-    let mut b = Ops::new(3);
-    let (gate, up, spread) = (0, 1, 2);
-    let a = if g.silu {
-        let one = b.f32(1.0);
-        let neg = b.push(Op::Unary(Unary::Neg, gate));
-        let e = b.push(Op::Unary(Unary::Exp, neg));
-        let den = b.push(Op::Binary(Binary::Add, one, e));
-        let s = b.push(Op::Unary(Unary::Recip, den));
-        b.push(Op::Binary(Binary::Mul, gate, s))
-    } else {
-        // 0.5 t (1 + tanh(√(2/π) (t + 0.044715 t³)))
-        let t3 = b.push(Op::Binary(Binary::Mul, gate, gate));
-        let t3 = b.push(Op::Binary(Binary::Mul, t3, gate));
-        let c = b.f32(0.044_715);
-        let inner = b.push(Op::Fma(t3, c, gate));
-        let k = b.f32(0.797_884_6);
-        let inner = b.push(Op::Binary(Binary::Mul, inner, k));
-        let th = b.push(Op::Unary(Unary::Tanh, inner));
-        let one = b.f32(1.0);
-        let th = b.push(Op::Binary(Binary::Add, th, one));
-        let half = b.f32(0.5);
-        let h = b.push(Op::Binary(Binary::Mul, gate, half));
-        b.push(Op::Binary(Binary::Mul, h, th))
+    // the parameters: the gates (a gated activation's), the ups, the spread gate
+    let gated = g.gate.is_some();
+    let mut b = Ops::new(if gated { 3 } else { 2 });
+    let (gate, up, spread) = if gated { (0, 1, 2) } else { (0, 0, 1) };
+    let a = match g.act {
+        Act::Silu => {
+            let one = b.f32(1.0);
+            let neg = b.push(Op::Unary(Unary::Neg, gate));
+            let e = b.push(Op::Unary(Unary::Exp, neg));
+            let den = b.push(Op::Binary(Binary::Add, one, e));
+            let s = b.push(Op::Unary(Unary::Recip, den));
+            b.push(Op::Binary(Binary::Mul, gate, s))
+        }
+        Act::GeluTanh => {
+            // 0.5 t (1 + tanh(√(2/π) (t + 0.044715 t³)))
+            let t3 = b.push(Op::Binary(Binary::Mul, gate, gate));
+            let t3 = b.push(Op::Binary(Binary::Mul, t3, gate));
+            let c = b.f32(0.044_715);
+            let inner = b.push(Op::Fma(t3, c, gate));
+            let k = b.f32(0.797_884_6);
+            let inner = b.push(Op::Binary(Binary::Mul, inner, k));
+            let th = b.push(Op::Unary(Unary::Tanh, inner));
+            let one = b.f32(1.0);
+            let th = b.push(Op::Binary(Binary::Add, th, one));
+            let half = b.f32(0.5);
+            let h = b.push(Op::Binary(Binary::Mul, gate, half));
+            b.push(Op::Binary(Binary::Mul, h, th))
+        }
+        // relu(t)² over the up alone
+        Act::Relu2 => {
+            let zero = b.f32(0.0);
+            let r = b.push(Op::Binary(Binary::Max, up, zero));
+            b.push(Op::Binary(Binary::Mul, r, r))
+        }
     };
-    let act = b.push(Op::Binary(Binary::Mul, a, up));
+    let act = if gated {
+        b.push(Op::Binary(Binary::Mul, a, up))
+    } else {
+        a
+    };
     let out = b.push(Op::Binary(Binary::Mul, act, spread));
     let region = Region {
         width: g.experts * g.inter,
-        params: vec![Shape::Row; 3],
+        params: vec![Shape::Row; if gated { 3 } else { 2 }],
         ops: b.ops,
         results: vec![out],
         rounds: vec![(act, narrow), (out, narrow)],
@@ -403,13 +443,15 @@ pub fn activation(g: &Group, narrow: Dtype) -> R<Chain> {
     region
         .types()
         .map_err(|e| format!("node {}: the experts' activation: {e:?}", g.route))?;
+    let mut ins = Vec::new();
+    if gated {
+        ins.push(input(synth(g.route, Kind::Gates), narrow, false));
+    }
+    ins.push(input(synth(g.route, Kind::Ups), narrow, false));
+    ins.push(input(synth(g.route, Kind::Spread), Dtype::F32, false));
     Ok(Chain {
         nodes: vec![g.route],
-        ins: vec![
-            input(synth(g.route, Kind::Gates), narrow, false),
-            input(synth(g.route, Kind::Ups), narrow, false),
-            input(synth(g.route, Kind::Spread), Dtype::F32, false),
-        ],
+        ins,
         outs: vec![Out {
             value: synth(g.route, Kind::Acts),
             dtype: narrow,
@@ -435,11 +477,11 @@ mod tests {
             score,
             x: ValueId(0),
             hidden: 16,
-            gate: (ValueId(3), 8, 0),
+            gate: Some((ValueId(3), 8, 0)),
             up: (ValueId(3), 8, 4),
             down: ValueId(4),
             inter: 4,
-            silu: true,
+            act: Act::Silu,
             y: ValueId(5),
             dtype: Dtype::Bf16,
         }

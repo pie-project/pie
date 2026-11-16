@@ -707,7 +707,7 @@ fn lowers_explicitly(op: &Operation) -> bool {
             act: GluAct::Swiglu | GluAct::GegluTanh,
             ..
         }) | Operation::Elemwise(Elemwise::Standardize { .. } | Elemwise::RmsnormGated { .. })
-            | Operation::Linear(Linear::MoeSigmoidGateAdd { .. })
+            | Operation::Linear(Linear::MoeSigmoidGateAdd { .. } | Linear::Relu2 { .. })
     )
 }
 

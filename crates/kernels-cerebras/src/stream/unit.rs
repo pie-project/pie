@@ -445,7 +445,9 @@ fn rooted(op: &Operation) -> bool {
     matches!(
         op,
         Operation::Elemwise(_)
-            | Operation::Linear(Linear::Glu { .. } | Linear::MoeSigmoidGateAdd { .. })
+            | Operation::Linear(
+                Linear::Glu { .. } | Linear::MoeSigmoidGateAdd { .. } | Linear::Relu2 { .. }
+            )
     )
 }
 
@@ -956,7 +958,14 @@ pub fn lower_through(
                     }
                 };
                 let narrow = r.dtype(synth(at, Kind::Gates)).unwrap_or(Dtype::Bf16);
-                for (kind, (bank, stride, off)) in [(Kind::Gates, g.gate), (Kind::Ups, g.up)] {
+                // (a non-gated activation's experts: their ups alone)
+                let banks: Vec<(Kind, (ValueId, u32, u32))> = g
+                    .gate
+                    .map(|gt| (Kind::Gates, gt))
+                    .into_iter()
+                    .chain([(Kind::Ups, g.up)])
+                    .collect();
+                for (kind, (bank, stride, off)) in banks {
                     steps.push(Step::Matvec {
                         node: at,
                         from: gs,
