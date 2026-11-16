@@ -2509,6 +2509,7 @@ impl Shell {
                 narrow(u64::from(sink)),
                 paging.page_size,
                 g.indptr.len().saturating_sub(1),
+                self.tuning.chunks.append_page_rows,
                 self.scratch_fire || self.sizing.is_some(),
             )?;
             let mut indices = g.indices.clone();
@@ -3854,11 +3855,14 @@ fn append_runs(
     sink: i32,
     page_size: u32,
     lanes: usize,
+    page_rows: i64,
     scratch: bool,
 ) -> Result<()> {
     let n = page.len();
     let ps = i64::from(page_size);
-    let Some(m) = kernels_xla::attn::paged::append_run_capacity(n as i64, ps, lanes as i64) else {
+    let Some(m) =
+        kernels_xla::attn::paged::append_run_capacity(n as i64, ps, lanes as i64, page_rows)
+    else {
         return Ok(());
     };
     let refuse = |why: String| Fault::Program {
@@ -3915,14 +3919,14 @@ mod append_runs_tests {
     #[test]
     fn a_fire_within_the_run_capacity_is_taken() {
         let (page, off) = prompt(256, 3, 5);
-        append_runs(&page, &off, SINK, 16, 1, false).expect("one prompt's runs fit");
+        append_runs(&page, &off, SINK, 16, 1, 128, false).expect("one prompt's runs fit");
         // Padding rows bound for the sink are no run's.
         let (mut page, mut off) = prompt(240, 0, 0);
         page.extend([SINK; 16]);
         off.extend([0; 16]);
-        append_runs(&page, &off, SINK, 16, 2, false).expect("padding lays no run");
+        append_runs(&page, &off, SINK, 16, 2, 128, false).expect("padding lays no run");
         // A short fire lands row by row, whatever its layout.
-        append_runs(&[7; 64], &[0; 64], SINK, 16, 64, false)
+        append_runs(&[7; 64], &[0; 64], SINK, 16, 64, 128, false)
             .expect("a short fire is not run-checked");
     }
 
@@ -3932,7 +3936,7 @@ mod append_runs_tests {
         // against a capacity of 256 / 16 + 2.
         let page: Vec<i32> = (0..256).collect();
         let off = vec![7; 256];
-        let why = append_runs(&page, &off, SINK, 16, 1, false)
+        let why = append_runs(&page, &off, SINK, 16, 1, 128, false)
             .expect_err("more runs than the capacity is refused")
             .to_string();
         assert!(why.contains("exceed the append's capacity m"), "{why}");
@@ -3941,23 +3945,23 @@ mod append_runs_tests {
             "{why}"
         );
         // The same rows as 256 lanes of one row each fit.
-        append_runs(&page, &off, SINK, 16, 256, false).expect("a decode-wide fire's runs fit");
+        append_runs(&page, &off, SINK, 16, 256, 128, false).expect("a decode-wide fire's runs fit");
     }
 
     #[test]
     fn a_page_in_two_runs_or_a_skipped_offset_is_refused() {
         let (mut page, mut off) = prompt(128, 0, 0);
         page[100] = 0;
-        let why = append_runs(&page, &off, SINK, 16, 4, false)
+        let why = append_runs(&page, &off, SINK, 16, 4, 128, false)
             .expect_err("page 0 twice")
             .to_string();
         assert!(why.contains("in two runs"), "{why}");
         // A scratch fire's lanes share pages: held to the capacity alone.
-        append_runs(&page, &off, SINK, 16, 4, true).expect("a scratch fire may share pages");
+        append_runs(&page, &off, SINK, 16, 4, 128, true).expect("a scratch fire may share pages");
         let (page, _) = prompt(128, 0, 0);
         off = (0..128).map(|r| r % 16).collect();
         off[20] = 9;
-        let why = append_runs(&page, &off, SINK, 16, 4, false)
+        let why = append_runs(&page, &off, SINK, 16, 4, 128, false)
             .expect_err("a skipped offset")
             .to_string();
         assert!(why.contains("not the next offset"), "{why}");
