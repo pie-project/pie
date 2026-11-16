@@ -74,8 +74,13 @@ fn on(pass: &ForwardPass, at: u32, reading: &str, stream: &str) -> Result<()> {
     Ok(())
 }
 
-/// The prompt's hidden rows, zero-padded to the rows `context` takes, and their count.
-fn encode(pipe: &Pipeline, context: &model::InputDecl, prompt: &str) -> Result<(Channel, Channel)> {
+/// Each prompt's hidden rows, zero-padded to the rows `context` takes, and their count: one
+/// text pass, a lane a prompt, each its own group (so the prompts ride one fire).
+fn encode(
+    pipe: &Pipeline,
+    context: &model::InputDecl,
+    prompts: &[&str],
+) -> Result<Vec<(Channel, Channel)>> {
     let text =
         model::lane_of(&[("reading", "text")]).map_err(|_| "this model has no text reading")?;
     let width = text
@@ -89,41 +94,56 @@ fn encode(pipe: &Pipeline, context: &model::InputDecl, prompt: &str) -> Result<(
             context.width
         ));
     }
-    let mut ids = inferlet::chat::first_user(prompt);
-    ids.extend(inferlet::chat::cue());
-    let len = ids.len() as u32;
-    let rows = match context.rows {
-        None => len,
-        Some(model::RowCount::Exact(n)) if len <= n => n,
-        Some(model::RowCount::Multiple(n)) => len.next_multiple_of(n),
-        Some(rows) => {
-            return Err(format!(
-                "the prompt is {len} tokens and `context` takes {rows:?} rows"
-            ));
-        }
-    };
     let pass = ForwardPass::new();
-    pass.switch(0, "reading", "text")?;
-    pass.embed(
-        &Channel::from(ids.iter().map(|&id| id as i32).collect::<Vec<_>>()),
-        &Channel::from([0u32, len]),
-    )?;
-    pass.readout(&Channel::from_iter(0..len))?;
-    if text.state {
-        pass.state(&[&WorkingSet::new()], StateGeometry::default())?;
+    let (mut tokens, mut indptr, mut lens) = (Vec::new(), vec![0u32], Vec::new());
+    let mut out = Vec::with_capacity(prompts.len());
+    for (i, prompt) in prompts.iter().enumerate() {
+        let mut ids = inferlet::chat::first_user(prompt);
+        ids.extend(inferlet::chat::cue());
+        let len = ids.len() as u32;
+        let rows = match context.rows {
+            None => len,
+            Some(model::RowCount::Exact(n)) if len <= n => n,
+            Some(model::RowCount::Multiple(n)) => len.next_multiple_of(n),
+            Some(rows) => {
+                return Err(format!(
+                    "the prompt is {len} tokens and `context` takes {rows:?} rows"
+                ));
+            }
+        };
+        pass.switch(i as u32, "reading", "text")?;
+        if prompts.len() > 1 {
+            pass.group(i as u32, i as u32)?;
+        }
+        tokens.extend(ids.iter().map(|&id| id as i32));
+        indptr.push(indptr[i] + len);
+        lens.push((len, rows));
+        out.push((
+            Channel::new([rows, width], dtype::f32).queued(),
+            Channel::from([len as f32]),
+        ));
     }
-    let hidden = Channel::new([rows, width], dtype::f32).queued();
+    let all = indptr[prompts.len()];
+    pass.embed(&Channel::from(tokens), &Channel::from(indptr))?;
+    pass.readout(&Channel::from_iter(0..all))?;
+    if text.state {
+        let sets: Vec<WorkingSet> = prompts.iter().map(|_| WorkingSet::new()).collect();
+        pass.state(&sets.iter().collect::<Vec<_>>(), StateGeometry::default())?;
+    }
+    let hidden: Vec<Channel> = out.iter().map(|o| o.0).collect();
     pass.epilogue(move || {
-        let i = iota(rows);
-        let keep = cast(lt(&i, len), dtype::f32);
-        let h = gather(
-            intrinsics::output_rows(0, "hidden", len),
-            min_elem(&i, len - 1),
-        );
-        hidden.put(&h * &broadcast(reshape(&keep, [rows, 1]), [rows, width]));
+        for (i, (&(len, rows), h_ch)) in lens.iter().zip(&hidden).enumerate() {
+            let r = iota(rows);
+            let keep = cast(lt(&r, len), dtype::f32);
+            let h = gather(
+                intrinsics::output_rows(i as u32, "hidden", len),
+                min_elem(&r, len - 1),
+            );
+            h_ch.put(&h * &broadcast(reshape(&keep, [rows, 1]), [rows, width]));
+        }
     });
     pass.submit(pipe)?;
-    Ok((hidden, Channel::from([len as f32])))
+    Ok(out)
 }
 
 fn parse_rect(text: &str) -> Result<[u32; 4]> {
@@ -273,16 +293,14 @@ async fn main(input: Input) -> Result<Output> {
     let cfg = negative.is_some() && guidance > 1.0;
 
     let pipe = Pipeline::new();
-    // each image's prompt rows, and its negative's under guidance
-    let mut conds = Vec::with_capacity(images);
-    for prompt in &prompts {
-        let cond = encode(&pipe, context_in, prompt)?;
-        let uncond = match &negative {
-            Some(neg) if cfg => Some(encode(&pipe, context_in, neg)?),
-            _ => None,
-        };
-        conds.push((cond, uncond));
+    // each image's prompt rows, and the negative's under guidance: one text pass
+    let mut texts: Vec<&str> = prompts.iter().map(String::as_str).collect();
+    if let Some(neg) = negative.as_deref().filter(|_| cfg) {
+        texts.push(neg);
     }
+    let mut encoded = encode(&pipe, context_in, &texts)?;
+    let uncond = cfg.then(|| encoded.pop()).flatten();
+    let conds: Vec<_> = encoded.into_iter().map(|c| (c, uncond)).collect();
 
     let start = init
         .map(|init| -> Result<Channel> {
