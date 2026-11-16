@@ -1013,7 +1013,7 @@ impl<B: Serve> Shell<B> {
         // top again. `Top::EveryRung` (`pie tune`, timing each rung) keeps
         // every rung one binding holds instead.
         let binding = device.max_buffer();
-        let counts = crate::top::Counts::of(&boot.trace)?;
+        let counts = crate::top::counts(&boot.trace)?;
         let live = {
             let room = device.left().saturating_sub(counts.weight_bytes);
             kv_budget

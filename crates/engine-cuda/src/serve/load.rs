@@ -281,7 +281,10 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     let asked = boot.budget.clone();
     let floor = boot.budget.max_lanes.max(TOKENS_FLOOR).min(asked_tokens);
     let window = crate::store::window_of(&boot.trace)?;
-    let working = |tokens: u32, voxels: &Option<poem_compiler::VoxelLadder>| -> u64 {
+    // A fire of `tokens`' working set (the activation arena, the attention
+    // workspaces and one fire's windowed kv rows) and the launches its
+    // compiled plan issues; `None` where the plan does not compile.
+    let laid = |tokens: u32, voxels: &Option<poem_compiler::VoxelLadder>| -> Option<(u64, u32)> {
         let windowed = Paging::of(boot.page_size, boot.context, boot.slots, 1)
             .ok()
             .and_then(|paging| {
@@ -289,12 +292,10 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             })
             .unwrap_or(u64::MAX);
         let budget = budget_at(tokens);
-        let Ok(compiled) =
+        let compiled =
             poem_compiler::compile_axes(&boot.trace, &budgets_at(&budget, voxels), &profile)
-        else {
-            return u64::MAX;
-        };
-        compiled
+                .ok()?;
+        let bytes = compiled
             .arena
             .bytes
             .saturating_add(crate::inputs::attention_workspace_bytes(
@@ -304,21 +305,52 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
                 device.toggles(),
                 &crate::exports::schedule_streams(&boot.trace, &compiled),
             ))
-            .saturating_add(windowed)
+            .saturating_add(windowed);
+        let launches = u32::try_from(compiled.template().len()).unwrap_or(u32::MAX);
+        Some((bytes, launches))
     };
-    let working_at = |tokens: u32| working(tokens, &voxels);
+    let working = |tokens: u32, voxels: &Option<poem_compiler::VoxelLadder>| -> u64 {
+        laid(tokens, voxels).map_or(u64::MAX, |(bytes, _)| bytes)
+    };
+    // The top rung, the ruling's (`crate::top`): of the asked lattice's
+    // buckets from the floor up, each spanning its fire's working set and
+    // needing one sequence and the bodies' floor beside it, over the room
+    // the card has after the weight tier.
+    let tokens = {
+        let paging = Paging::of(boot.page_size, boot.context, boot.slots, 1)?;
+        let mut candidates = Vec::new();
+        for rung in budget_at(asked_tokens).buckets {
+            if rung < floor {
+                continue;
+            }
+            let (span, launches) = laid(rung, &voxels).unwrap_or((u64::MAX, 0));
+            let sequence =
+                crate::store::least_sequence_bytes(&boot.trace, paging.windowed(window, rung))?;
+            candidates.push(crate::top::Candidate {
+                tokens: rung,
+                span,
+                launches,
+                beside: sequence.saturating_add(crate::store::BODIES_FLOOR_BYTES),
+            });
+        }
+        let rungs = crate::top::rung_facts(&candidates, boot.budget.max_lanes, after_weights);
+        let counts = crate::top::counts(&boot.trace)?;
+        let top = crate::top::choose(&rungs, after_weights, &chip.rates(), device.name(), &counts)?;
+        eprintln!(
+            "engine-cuda: {}",
+            engine::load::line_of(
+                &top,
+                top.tokens,
+                top.span_bytes,
+                after_weights,
+                chip.tuned()
+            )
+        );
+        top.tokens
+    };
+    // The derived voxel rung's room is still the configured share of the
+    // card past the weights (`engine.working_set_percent`).
     let share = after_weights / 100 * u64::from(engine.working_set_percent);
-    let tokens = crate::store::tokens_within(asked_tokens, floor, share, working_at);
-    // The halving can land a whole step short: the widest bucket of the asked
-    // lattice past it that still fits serves more rows a fire.
-    let tokens = budget_at(asked_tokens)
-        .buckets
-        .iter()
-        .copied()
-        .filter(|&rows| rows > tokens && rows < asked_tokens)
-        .rev()
-        .find(|&rows| working_at(rows) <= share)
-        .unwrap_or(tokens);
     let voxels = match voxels.clone() {
         Some(ladder) if derive_voxels => {
             let floor = ladder.max_clips;
@@ -348,15 +380,6 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             .saturating_sub(crate::store::BODIES_FLOOR_BYTES)
     });
     if tokens != asked_tokens {
-        eprintln!(
-            "engine-cuda: a fire of {asked_tokens} tokens is served at {tokens}: at \
-             {asked_tokens} the activation arena, attention workspaces and one fire's windowed \
-             kv rows take {} MiB of the \
-             {} MiB this card has after the weight tier under the load's allowance, and \
-             the cache rows, graph bodies and guest programs need the other half.",
-            working_at(asked_tokens) >> 20,
-            after_weights >> 20,
-        );
         boot.budget = budget_at(tokens);
     }
     boot.voxels = voxels;
@@ -1466,10 +1489,8 @@ impl Shell {
             let copies = format!("|{:?}", kernels_cuda::hip::sys::copy_queues());
             #[cfg(not(feature = "rocm"))]
             let copies = String::new();
-            let record = super::measured::path(
-                dir,
-                &format!("{bodies_shape}|{:?}{copies}", shell.budget),
-            );
+            let record =
+                super::measured::path(dir, &format!("{bodies_shape}|{:?}{copies}", shell.budget));
             if let Some(measured) = super::measured::read(&record) {
                 recorded = true;
                 let held = usize::try_from(measured.hold()).unwrap_or(usize::MAX);
@@ -1492,9 +1513,8 @@ impl Shell {
         // A flat range cannot grow after its bodies name it, so a load that
         // has no record of what they take measures it: no estimate stands
         // in for the figure.
-        shell.measuring = shell.records_bodies()
-            && !crate::device::elastic::mapped_on_demand()
-            && !recorded;
+        shell.measuring =
+            shell.records_bodies() && !crate::device::elastic::mapped_on_demand() && !recorded;
         let bodies = if shell.measuring {
             crate::store::MEASURING
         } else if shell.records_bodies() {
