@@ -707,6 +707,9 @@ pub struct Prepared {
     /// `scratch_bytes` of it.
     scratch: Option<ScratchAt>,
     scratch_bytes: u64,
+    /// The lane's scratch bases (`scratch_bases_bytes(1)`), written at each
+    /// seat: the grouped kernels' buffer 4.
+    scratch_bases: Held,
     /// By output slot ([`eta_ir::op::output_slot`]): how the stage reads it,
     /// what is bound there and its table entry.
     reads: Vec<Option<Read>>,
@@ -957,6 +960,7 @@ impl Prepared {
             &mut self.offsets,
             &mut self.status,
             &mut self.addresses,
+            &mut self.scratch_bases,
         ]
         .into_iter()
         .chain(grouped)
@@ -978,6 +982,7 @@ impl Prepared {
             &mut self.offsets,
             &mut self.status,
             &mut self.addresses,
+            &mut self.scratch_bases,
         ]
         .into_iter()
         .chain(grouped)
@@ -1205,6 +1210,7 @@ impl Prepared {
             .next_multiple_of(SCRATCH_ALIGN);
         let status = tables.take(eta_exec::STATUS_BYTES as u64)?;
         let addresses = tables.take((pitch.max(1) * size_of::<OutputSeat>()) as u64)?;
+        let scratch_bases = tables.take(scratch_bases_bytes(1))?;
 
         let lanes = LaneShape::of(
             GROUPED_LANES,
@@ -1230,6 +1236,7 @@ impl Prepared {
             offsets,
             scratch: None,
             scratch_bytes,
+            scratch_bases,
             reads,
             outputs: vec![None; pitch],
             seats: vec![OutputSeat::default(); pitch],
@@ -1281,10 +1288,12 @@ impl Prepared {
         self.scratch_bytes
     }
 
-    /// Seats this fire's value scratch at `at` (the guest region under the
-    /// fire's model carve); a later fire seats its own.
-    pub fn seat_scratch(&mut self, at: ScratchAt) {
+    /// Seats this fire's value scratch at `at`, its bases written where the
+    /// grouped kernels read them; a later fire seats its own.
+    pub fn seat_scratch(&mut self, at: ScratchAt) -> Result<()> {
+        self.scratch_bases.write(0, &scratch_bases_of(&at)?)?;
         self.scratch = Some(at);
+        Ok(())
     }
 
     fn scratch(&self) -> Result<&ScratchAt> {
@@ -1499,11 +1508,19 @@ impl Prepared {
                     3,
                 );
                 {
+                    // The lane's scratch bases (buffer 4): addresses, so
+                    // the scratch's buffer is made resident by name.
                     let scratch = self.scratch()?;
                     encoder.setBuffer_offset_atIndex(
-                        Some(scratch.buffer.raw()),
-                        usize::try_from(scratch.offset).unwrap_or(usize::MAX),
+                        Some(self.scratch_bases.raw()),
+                        self.scratch_bases.offset() as usize,
                         4,
+                    );
+                    let resource: &ProtocolObject<dyn MTLResource> =
+                        ProtocolObject::from_ref(&**scratch.buffer.slab());
+                    encoder.useResource_usage(
+                        resource,
+                        MTLResourceUsage::Read | MTLResourceUsage::Write,
                     );
                 }
                 encoder.setBuffer_offset_atIndex(Some(layout.raw()), layout.offset() as usize, 5);
@@ -1718,11 +1735,19 @@ impl Prepared {
                     3,
                 );
                 {
+                    // The lane's scratch bases (buffer 4): addresses, so
+                    // the scratch's buffer is made resident by name.
                     let scratch = self.scratch()?;
                     encoder.setBuffer_offset_atIndex(
-                        Some(scratch.buffer.raw()),
-                        usize::try_from(scratch.offset).unwrap_or(usize::MAX),
+                        Some(self.scratch_bases.raw()),
+                        self.scratch_bases.offset() as usize,
                         4,
+                    );
+                    let resource: &ProtocolObject<dyn MTLResource> =
+                        ProtocolObject::from_ref(&**scratch.buffer.slab());
+                    encoder.useResource_usage(
+                        resource,
+                        MTLResourceUsage::Read | MTLResourceUsage::Write,
                     );
                 }
                 encoder.setBuffer_offset_atIndex(Some(layout.raw()), layout.offset() as usize, 5);
@@ -1884,9 +1909,12 @@ pub struct Batch {
     row_meta: SpanRegion,
     row_indices: SpanRegion,
     /// This fire's value scratch, seated per fire ([`Batch::seat_scratch`]):
-    /// a stride a member, in the span's guest region.
-    scratch: Option<ScratchAt>,
+    /// each member's own, wherever it lies.
+    scratch: Vec<ScratchAt>,
     addresses: SpanRegion,
+    /// Each lane's scratch bases ([`scratch_bases_bytes`]), written each
+    /// fire from its member's seat: the grouped kernels' buffer 4.
+    scratch_bases: SpanRegion,
     table_bytes: u64,
     layouts: Vec<SpanRegion>,
     layout_words: Vec<GroupLayout>,
@@ -1904,8 +1932,8 @@ type SpanRegion = crate::inputs::Region;
 
 /// A batch's tables' bytes, in the order [`Batch::lay`] lays them: the lane
 /// table, descriptors, params, offsets, bindings, pending flags, lane
-/// indices, row meta, row indices, output addresses and each fused
-/// region's layout.
+/// indices, row meta, row indices, output addresses, the lanes' scratch
+/// bases and each fused region's layout.
 #[allow(clippy::too_many_arguments)]
 fn batch_pieces(
     lanes: u32,
@@ -1929,9 +1957,31 @@ fn batch_pieces(
         lanes64 * size_of::<RowMeta>() as u64,
         (lanes64 * u64::from(rows) * size_of::<u32>() as u64).max(4),
         lanes64 * table_bytes,
+        scratch_bases_bytes(lanes),
     ];
     pieces.extend((0..fused).map(|_| size_of::<GroupLayout>() as u64));
     pieces
+}
+
+/// The bytes of a table of `lanes` lanes' scratch bases: a GPU address a
+/// piece (`M3_SCRATCH_PIECES`), the grouped kernels' buffer 4.
+fn scratch_bases_bytes(lanes: u32) -> u64 {
+    u64::from(lanes) * u64::from(eta_compiler::codegen::metal::M3_SCRATCH_PIECES) * 8
+}
+
+/// `scratch` as the grouped kernels read a lane's bases: piece 0 at its
+/// GPU address (one piece until eta_exec's chunk-aware layout).
+/// Tests' negative control: every lane of a batch handed member 0's
+/// scratch, as a kernel that ignored the bases table would address it.
+/// Per thread, so no other test's batch sees it.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static ALIAS_LANE_SCRATCH: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+fn scratch_bases_of(scratch: &ScratchAt) -> Result<Vec<u8>> {
+    Ok(address_of(&scratch.buffer, scratch.offset)?.to_le_bytes().to_vec())
 }
 
 /// The span bytes `pieces` take, each on the arena's boundary.
@@ -1985,6 +2035,7 @@ impl Batch {
             &self.row_meta,
             &self.row_indices,
             &self.addresses,
+            &self.scratch_bases,
         ]
         .into_iter()
         .chain(&self.layouts)
@@ -2002,6 +2053,7 @@ impl Batch {
             &mut self.row_meta,
             &mut self.row_indices,
             &mut self.addresses,
+            &mut self.scratch_bases,
         ]
         .into_iter()
         .chain(self.layouts.iter_mut())
@@ -2067,8 +2119,9 @@ impl Batch {
             lane_indices: next(),
             row_meta: next(),
             row_indices: next(),
-            scratch: None,
+            scratch: Vec::new(),
             addresses: next(),
+            scratch_bases: next(),
             table_bytes,
             layouts: (0..grouped.layout_words.len()).map(|_| next()).collect(),
             layout_words: grouped.layout_words.clone(),
@@ -2128,21 +2181,22 @@ impl Batch {
         Ok(next)
     }
 
-    /// The value scratch a fire of `members` members takes: a stride each.
+    /// The value scratch each member of a fire takes: its stride, aligned.
     #[must_use]
-    pub fn scratch_bytes(&self, members: u32) -> u64 {
-        (u64::from(members) * u64::from(self.key.scratch_stride))
+    pub fn member_scratch_bytes(&self) -> u64 {
+        u64::from(self.key.scratch_stride)
             .max(SCRATCH_ALIGN)
             .next_multiple_of(SCRATCH_ALIGN)
     }
 
-    /// Seats this fire's value scratch at `at`.
-    pub fn seat_scratch(&mut self, at: ScratchAt) {
-        self.scratch = Some(at);
+    /// Seats this fire's value scratch: `at[i]` member i's, wherever each
+    /// lies.
+    pub fn seat_scratch(&mut self, at: Vec<ScratchAt>) {
+        self.scratch = at;
     }
 
-    fn scratch(&self) -> Result<&ScratchAt> {
-        self.scratch.as_ref().ok_or_else(|| {
+    fn scratch(&self, member: usize) -> Result<&ScratchAt> {
+        self.scratch.get(member).ok_or_else(|| {
             Fault::program(
                 "program::launch",
                 "a batch fired before its fire seated its value scratch in the span",
@@ -2182,9 +2236,20 @@ impl Batch {
             0,
             u64::from(count) * u64::from(self.shape.channel_slots_per_lane),
         )?;
-        let scratch = self.scratch()?.clone();
-        #[cfg(target_vendor = "apple")]
-        poison_scratch(frame, scratch.buffer.slab(), scratch.offset, u64::from(count) * stride)?;
+        let mut bases = Vec::with_capacity(scratch_bases_bytes(count) as usize);
+        for member in 0..members.len() {
+            #[cfg(test)]
+            let member = if ALIAS_LANE_SCRATCH.with(std::cell::Cell::get) {
+                0
+            } else {
+                member
+            };
+            let scratch = self.scratch(member)?.clone();
+            #[cfg(target_vendor = "apple")]
+            poison_scratch(frame, scratch.buffer.slab(), scratch.offset, stride)?;
+            bases.extend(scratch_bases_of(&scratch)?);
+        }
+        self.scratch_bases.write(0, &bases)?;
         let frame: &Frame = frame;
         let vocab = members[0]
             .grouped
@@ -2270,12 +2335,8 @@ impl Batch {
             match region.form {
                 Form::Fused => {
                     for (index, member) in members.iter().enumerate() {
-                        member.encode_fused(
-                            frame,
-                            region,
-                            &scratch.buffer,
-                            scratch.offset + index as u64 * stride,
-                        )?;
+                        let scratch = self.scratch(index)?;
+                        member.encode_fused(frame, region, &scratch.buffer, scratch.offset)?;
                     }
                 }
                 Form::Grouped | Form::GroupedLibrary => {
@@ -2340,12 +2401,21 @@ impl Batch {
                     3,
                 );
                 {
-                    let scratch = self.scratch()?;
+                    // Each lane's scratch bases (buffer 4): addresses, so
+                    // every member's scratch buffer is made resident.
                     encoder.setBuffer_offset_atIndex(
-                        Some(scratch.buffer.raw()),
-                        usize::try_from(scratch.offset).unwrap_or(usize::MAX),
+                        Some(self.scratch_bases.view().raw()),
+                        self.scratch_bases.at(0) as usize,
                         4,
                     );
+                    for scratch in &self.scratch {
+                        let resource: &ProtocolObject<dyn MTLResource> =
+                            ProtocolObject::from_ref(&**scratch.buffer.slab());
+                        encoder.useResource_usage(
+                            resource,
+                            MTLResourceUsage::Read | MTLResourceUsage::Write,
+                        );
+                    }
                 }
                 encoder.setBuffer_offset_atIndex(
                     Some(layout.view().raw()),
@@ -2521,12 +2591,21 @@ impl Batch {
                     3,
                 );
                 {
-                    let scratch = self.scratch()?;
+                    // Each lane's scratch bases (buffer 4): addresses, so
+                    // every member's scratch buffer is made resident.
                     encoder.setBuffer_offset_atIndex(
-                        Some(scratch.buffer.raw()),
-                        usize::try_from(scratch.offset).unwrap_or(usize::MAX),
+                        Some(self.scratch_bases.view().raw()),
+                        self.scratch_bases.at(0) as usize,
                         4,
                     );
+                    for scratch in &self.scratch {
+                        let resource: &ProtocolObject<dyn MTLResource> =
+                            ProtocolObject::from_ref(&**scratch.buffer.slab());
+                        encoder.useResource_usage(
+                            resource,
+                            MTLResourceUsage::Read | MTLResourceUsage::Write,
+                        );
+                    }
                 }
                 encoder.setBuffer_offset_atIndex(
                     Some(layout.view().raw()),
