@@ -441,13 +441,12 @@ impl Layout {
         }
         ChunkFacts {
             span_backed_on_demand: false,
-            // The span is the pool's last segment, backed from the load on
-            // and laid once: the largest rung's carve at its end and, under
-            // any rung's, what a fire takes beside it. What no rung's carve
-            // takes is state's until a fire's term needs it.
-            act_span_chunks: act_chunks
-                .last()
-                .map(|_| self.total_chunks - (segments.max(1) - 1) * self.segment_chunks),
+            // The span lies at the end of the pool's last segment, backed
+            // from the load on and laid once: the top rung's chunks, which
+            // hold the largest rung's carve and, under any narrower rung's,
+            // what a fire takes beside it (`arena::span_room`). What of the
+            // segment lies under them is state's.
+            act_span_chunks: act_chunks.last().map(|&(_, chunks)| chunks),
             chunk_bytes: self.chunk_bytes,
             total_chunks: self.total_chunks,
             segment_chunks: self.segment_chunks,

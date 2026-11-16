@@ -148,6 +148,23 @@ impl Serve for Api {
         })
     }
 
+    /// Vulkan binds a storage buffer at any offset its descriptors state.
+    fn staging_align(_device: &Context) -> Option<u64> {
+        None
+    }
+
+    /// A Vulkan frame takes nothing of its own past its command buffer: its
+    /// scalars ride push constants and it stages nothing.
+    fn lay_frames(
+        _device: &Context,
+        _pipelines: &Pipelines,
+        _staged: engine_gpu::naming::Staged,
+        _dispatches: u32,
+        _frames: usize,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     fn forget(shelf: &mut Shelf) {
         // Recordings stand across a residency: a slot moved is an entry
         // rewritten in a table they bind, not a binding. A routed expert's
@@ -158,12 +175,8 @@ impl Serve for Api {
         shelf.recorder.forget();
     }
 
-    fn grown(_shell: &mut Shell<Api>, _arm: usize, _bytes: u64) -> Result<()> {
-        Ok(())
-    }
-
     fn plan(shell: &mut Shell<Api>, prepared: &mut Prepared<'_, Api>) -> Result<Plan<Api>> {
-        // The custom-mask buffer grows: a recording would keep the one it outgrew.
+        // A fire staging group masks binds what it stages for itself: not recorded.
         // A fire landing snapshots binds a table of its own: not recorded.
         let key = (shell.shelf.recorder.records()
             && prepared.bindings.group_masks.is_empty()

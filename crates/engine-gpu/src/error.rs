@@ -542,6 +542,19 @@ impl From<kernels_slang::Error> for Fault {
     }
 }
 
+/// A fire whose `what` of `need` bytes is past the `laid` bytes the load
+/// laid for it is refused by name at `at`: nothing serving can need is
+/// allocated after load, so nothing grows to take it.
+pub fn within_laid(at: &'static str, what: &str, need: u64, laid: u64) -> Result<()> {
+    if need > laid {
+        return Err(Fault::Program {
+            at,
+            why: format!("a fire's {what} of {need} bytes is past the {laid} laid at load"),
+        });
+    }
+    Ok(())
+}
+
 pub fn kernel(error: kernels_slang::Error) -> KernelError {
     match error {
         kernels_slang::Error::Unsupported { op } => KernelError::Unsupported { op },

@@ -145,17 +145,32 @@ impl Serve for Api {
         })
     }
 
-    fn forget(_shelf: &mut Shelf) {}
+    /// A storage buffer bound off the device's storage offset alignment is
+    /// staged in the frame's own scratch (`encode`).
+    fn staging_align(device: &Context) -> Option<u64> {
+        Some(device.storage_align())
+    }
 
-    fn grown(shell: &mut Shell<Api>, arm: usize, bytes: u64) -> Result<()> {
-        shell.shelf.mirror[arm] = Buffer::with(
-            &shell.device,
-            bytes,
-            crate::device::Memory::Readback,
-            engine_gpu::books::owners::READOUT,
-        )?;
+    /// The bind cache's uniform arena, and for each of `frames` frames a
+    /// room of the uniforms its staged dispatches take and one of the
+    /// scratch they stage, at what the load's widest fire stages.
+    fn lay_frames(
+        device: &Context,
+        pipelines: &Pipelines,
+        staged: engine_gpu::naming::Staged,
+        dispatches: u32,
+        frames: usize,
+    ) -> Result<()> {
+        pipelines.lay_uniforms(device, dispatches);
+        device.lay_frames(
+            frames,
+            u64::from(staged.dispatches) * pipelines.uniform_stride(device),
+            staged.bytes,
+        );
         Ok(())
     }
+
+    fn forget(_shelf: &mut Shelf) {}
 
     fn plan(_shell: &mut Shell<Api>, _prepared: &mut Prepared<'_, Api>) -> Result<Plan<Api>> {
         Ok(Plan::Walk {

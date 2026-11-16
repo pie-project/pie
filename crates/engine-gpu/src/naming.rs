@@ -48,11 +48,35 @@ struct Named {
     forks: Vec<Fork>,
 }
 
+/// What a walk's dispatches stage on a backend that binds no buffer at an
+/// offset off its storage alignment in place: the bytes of the frame's
+/// staging scratch they take, each view at its slot's alignment, and the
+/// dispatches that stage one (each a uniform slot of the frame's own).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Staged {
+    pub bytes: u64,
+    pub dispatches: u32,
+}
+
+impl Staged {
+    /// The more of each of `self` and `other`.
+    #[must_use]
+    pub fn most(self, other: Staged) -> Staged {
+        Staged {
+            bytes: self.bytes.max(other.bytes),
+            dispatches: self.dispatches.max(other.dispatches),
+        }
+    }
+}
+
 /// The naming sink and the set it leaves.
 #[derive(Debug)]
 pub struct Names {
     target: Target,
     named: RefCell<Named>,
+    /// What the walk so far stages ([`Names::stage`]): every way of a
+    /// forked host counted, the most any could.
+    staged: std::cell::Cell<Staged>,
     /// The most rows a fire of the load may bring ([`Names::bound_rows`]).
     most_rows: std::cell::Cell<u32>,
 }
@@ -63,6 +87,7 @@ impl Names {
         Names {
             target,
             named: RefCell::new(Named::default()),
+            staged: std::cell::Cell::new(Staged::default()),
             most_rows: std::cell::Cell::new(0),
         }
     }
@@ -119,6 +144,24 @@ impl Names {
         let mut named = self.named.borrow_mut();
         named.forks.clear();
         named.dispatches = 0;
+        self.staged.take();
+    }
+
+    /// One dispatch of the walk stages `bytes` (0: it stages nothing).
+    pub fn stage(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let held = self.staged.get();
+        self.staged.set(Staged {
+            bytes: held.bytes + bytes,
+            dispatches: held.dispatches + 1,
+        });
+    }
+
+    /// What the walk since the last take stages.
+    pub fn take_staged(&self) -> Staged {
+        self.staged.take()
     }
 
     /// The dispatches made since the last take, the walk still going: read
@@ -154,6 +197,10 @@ impl kernels_slang::Encode for Names {
 }
 
 impl kernels_slang::Naming for Names {
+    /// Names counts no staging: the sink over a backend's bindings does
+    /// ([`crate::named::Naming`]).
+    fn binds(&self, _args: &[ArgValue]) {}
+
     fn either(&self, alternatives: &[Fire]) -> Result<(), Error> {
         let kernels = alternatives
             .iter()

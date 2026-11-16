@@ -72,6 +72,7 @@ pub fn act_x_wt(
     let (m, n, k) = extent(op, act, w, y)?;
     let target = ctx.target();
     if let Some(names) = ctx.naming() {
+        names.binds(&[act.arg(), w.arg(), y.arg_mut()]);
         return names.either(&kernels(target, tactic, op, n, k)?);
     }
     if m == 0 {

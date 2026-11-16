@@ -169,10 +169,85 @@ struct BindCache {
 
     chunks: Vec<super::ctx::Held>,
     used: u64,
+    /// Where a load laid the arena ([`Pipelines::lay_uniforms`]): `chunks`
+    /// are its two epochs, and a cached group's uniforms lie in its cache
+    /// slot's ([`Arena`]). `None`: chunks are taken as the groups need them.
+    laid: Option<Arena>,
+}
+
+/// The bind cache's uniform arena as a load lays it: two epochs of `slots`
+/// cache slots each, slot `i` of epoch `e` the `stride` bytes at
+/// `(e * slots + i) * stride` (in chunks of `per_chunk` slots). A group
+/// takes the next slot of the epoch it is cached in; a full epoch evicts
+/// every group and the cache fills the other one. A slot is written again
+/// only two evictions after its group's: by then its group is gone from
+/// the cache, and no frame still encoding reads it, as a frame binds no
+/// more groups than an epoch holds (`slots` is at least a fire's
+/// dispatches). A frame already submitted reads what its groups held: a
+/// queue write lands after the work submitted before it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Arena {
+    pub(crate) slots: usize,
+    pub(crate) stride: u64,
+    pub(crate) per_chunk: u64,
+    epoch: usize,
+    next: usize,
+}
+
+impl Arena {
+    pub(crate) fn new(slots: usize, stride: u64) -> Arena {
+        Arena {
+            slots: slots.max(1),
+            stride,
+            per_chunk: (UNIFORM_ARENA_CHUNK / stride.max(1)).max(1),
+            epoch: 0,
+            next: 0,
+        }
+    }
+
+    /// The chunks both epochs take.
+    pub(crate) fn chunks(&self) -> usize {
+        (2 * self.slots as u64).div_ceil(self.per_chunk) as usize
+    }
+
+    /// Whether the epoch is full: the cache evicts every group, and the
+    /// next takes the other epoch's first slot.
+    pub(crate) fn full(&self) -> bool {
+        self.next >= self.slots
+    }
+
+    /// Evicts the epoch: the other one fills from its first slot.
+    pub(crate) fn flip(&mut self) {
+        self.epoch ^= 1;
+        self.next = 0;
+    }
+
+    /// The next slot of the epoch: its chunk and byte there.
+    pub(crate) fn take(&mut self) -> (usize, u64) {
+        let slot = (self.epoch * self.slots + self.next) as u64;
+        self.next += 1;
+        (
+            (slot / self.per_chunk) as usize,
+            (slot % self.per_chunk) * self.stride,
+        )
+    }
 }
 
 const BIND_CACHE_CAP: usize = 16 * 1024;
 const UNIFORM_ARENA_CHUNK: u64 = 1 << 20;
+
+/// One chunk of the bind cache's uniform arena.
+fn arena_chunk(core: &Core) -> super::ctx::Held {
+    core.held(
+        &wgpu::BufferDescriptor {
+            label: Some("pie uniform arena"),
+            size: UNIFORM_ARENA_CHUNK,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        },
+        engine_gpu::books::owners::UNIFORMS,
+    )
+}
 
 #[derive(Default)]
 pub struct Pipelines {
@@ -263,32 +338,43 @@ impl Pipelines {
         self.bind_misses.set(self.bind_misses.get() + 1);
         BIND_TRAFFIC[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut binds = self.binds.borrow_mut();
-        if binds.groups.len() >= BIND_CACHE_CAP {
-            binds.groups.clear();
-            // The groups that read the earlier chunks are gone: keep the one
-            // the next uniform is written to.
-            let from = binds.chunks.len().saturating_sub(1);
-            binds.chunks.drain(..from);
-            binds.used = 0;
-        }
-        let uniform = pipeline.uniform.map(|binding| {
-            let align = u64::from(core.limits.min_uniform_buffer_offset_alignment).max(16);
-            let at = binds.used.next_multiple_of(align);
-            if binds.chunks.is_empty() || at + uniform_bytes > UNIFORM_ARENA_CHUNK {
-                binds.chunks.push(core.held(
-                    &wgpu::BufferDescriptor {
-                        label: Some("pie uniform arena"),
-                        size: UNIFORM_ARENA_CHUNK,
-                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                        mapped_at_creation: false,
-                    },
-                    engine_gpu::books::owners::UNIFORMS,
-                ));
+        let binds = &mut *binds;
+        match binds.laid.as_mut() {
+            // A full epoch evicts every group its slots hold.
+            Some(arena) if arena.full() => {
+                binds.groups.clear();
+                arena.flip();
+            }
+            Some(_) => {}
+            None if binds.groups.len() >= BIND_CACHE_CAP => {
+                binds.groups.clear();
+                // The groups that read the earlier chunks are gone: keep
+                // the one the next uniform is written to.
+                let from = binds.chunks.len().saturating_sub(1);
+                binds.chunks.drain(..from);
                 binds.used = 0;
             }
-            let at = binds.used.next_multiple_of(align);
-            binds.used = at + uniform_bytes;
-            let chunk = (*binds.chunks.last().expect("non-empty")).clone();
+            None => {}
+        }
+        // The group's slot of the laid arena, whether or not it binds
+        // uniforms: slot and cache entry are one.
+        let slot = binds.laid.as_mut().map(Arena::take);
+        let uniform = pipeline.uniform.map(|binding| {
+            let (written, at) = match slot {
+                Some(slot) => slot,
+                None => {
+                    let align = u64::from(core.limits.min_uniform_buffer_offset_alignment).max(16);
+                    let at = binds.used.next_multiple_of(align);
+                    if binds.chunks.is_empty() || at + uniform_bytes > UNIFORM_ARENA_CHUNK {
+                        binds.chunks.push(arena_chunk(core));
+                        binds.used = 0;
+                    }
+                    let at = binds.used.next_multiple_of(align);
+                    binds.used = at + uniform_bytes;
+                    (binds.chunks.len() - 1, at)
+                }
+            };
+            let chunk = (*binds.chunks[written]).clone();
             let mut padded = scalars.to_vec();
             padded.resize(uniform_bytes as usize, 0);
             core.queue.write_buffer(&chunk, at, &padded);
@@ -325,6 +411,42 @@ impl Pipelines {
         });
         binds.groups.insert(key, group.clone());
         group
+    }
+
+    /// The uniform bytes a dispatch of any pipeline built takes, at the
+    /// device's uniform offset alignment.
+    #[must_use]
+    pub fn uniform_stride(&self, device: &Context) -> u64 {
+        let align = u64::from(device.core().limits.min_uniform_buffer_offset_alignment).max(16);
+        self.built
+            .borrow()
+            .values()
+            .map(|pipeline| u64::from(pipeline.push_bytes.next_multiple_of(16).max(16)))
+            .max()
+            .unwrap_or(16)
+            .next_multiple_of(align)
+    }
+
+    /// Lays the bind cache's uniform arena ([`Arena`]): two epochs of a
+    /// cache slot for every group the cache keeps, at least a fire's
+    /// `dispatches`, each at the most any built pipeline's uniforms take.
+    /// No dispatch takes a chunk past them. The groups cached before are
+    /// dropped, their uniforms written again where they are next bound.
+    pub fn lay_uniforms(&self, device: &Context, dispatches: u32) {
+        let arena = Arena::new(
+            BIND_CACHE_CAP.max(dispatches as usize),
+            self.uniform_stride(device),
+        );
+        let core = device.core();
+        let mut binds = self.binds.borrow_mut();
+        binds.groups.clear();
+        binds.chunks.truncate(arena.chunks());
+        while binds.chunks.len() < arena.chunks() {
+            let chunk = arena_chunk(core);
+            binds.chunks.push(chunk);
+        }
+        binds.used = 0;
+        binds.laid = Some(arena);
     }
 
     /// The pipeline of kernels-slang's module `key` (an instantiation at a
@@ -436,4 +558,54 @@ fn build(
         push_bytes: declared.push_bytes,
         local: declared.local,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Arena;
+
+    /// Fills the cache past two epochs: no slot a live group holds (one of
+    /// the epoch being filled, or of the one before, which a frame still
+    /// encoding may bind) is taken again; the free-running wrap over the
+    /// same bytes (the negative control) takes one.
+    #[test]
+    fn a_full_cache_overwrites_no_live_groups_uniforms() {
+        let (slots, stride) = (16 * 1024, 256);
+        let mut arena = Arena::new(slots, stride);
+        assert_eq!(arena.chunks(), 8, "two epochs of 16K slots of 256 bytes");
+        // Every live group's bytes: (chunk, byte) -> the epoch it is cached in.
+        let mut live: std::collections::HashMap<(usize, u64), usize> = Default::default();
+        let mut epoch = 0;
+        for _ in 0..5 * slots + 7 {
+            if arena.full() {
+                arena.flip();
+                epoch += 1;
+                // Two evictions on, a group is in no cache and no frame.
+                live.retain(|_, cached| *cached + 1 >= epoch);
+            }
+            let slot = arena.take();
+            assert!(
+                !live.contains_key(&slot),
+                "slot {slot:?} of a live group taken again at epoch {epoch}"
+            );
+            live.insert(slot, epoch);
+        }
+        // The negative control: one ring over the same chunks, wrapping
+        // as it runs out, overwrites a live group within the epoch after.
+        let ring = (arena.chunks() as u64 * arena.per_chunk) as usize;
+        let mut live: std::collections::HashMap<usize, usize> = Default::default();
+        let mut overwrote = false;
+        let mut epoch = 0;
+        for at in 0..3 * slots {
+            if at > 0 && at % slots == 0 {
+                epoch += 1;
+                live.retain(|_, cached| *cached + 1 >= epoch);
+            }
+            // A ring sized for one epoch's groups, as a free-running wrap
+            // over the cache's slots lays it.
+            let slot = at % (ring / 2);
+            overwrote |= live.insert(slot, epoch).is_some();
+        }
+        assert!(overwrote, "the free-running wrap takes a live group's slot");
+    }
 }

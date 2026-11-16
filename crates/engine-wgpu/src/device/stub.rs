@@ -81,6 +81,15 @@ impl Context {
     }
 
     #[must_use]
+    pub fn storage_align(&self) -> u64 {
+        match self.never {}
+    }
+
+    pub fn lay_frames(&self, _frames: usize, _uniform: u64, _scratch: u64) {
+        match self.never {}
+    }
+
+    #[must_use]
     pub fn subgroup_size(&self) -> u32 {
         match self.never {}
     }
@@ -391,6 +400,15 @@ impl Pipelines {
 
     pub fn hold(_device: &Context, _file: &'static str, _key: &'static str) -> Result<()> {
         Err(Fault::Deviceless)
+    }
+
+    #[must_use]
+    pub fn uniform_stride(&self, device: &Context) -> u64 {
+        device.storage_align()
+    }
+
+    pub fn lay_uniforms(&self, device: &Context, _dispatches: u32) {
+        device.lay_frames(0, 0, 0);
     }
 }
 

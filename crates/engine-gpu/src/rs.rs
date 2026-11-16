@@ -325,6 +325,22 @@ pub struct Seat {
 }
 
 impl Seat {
+    /// The extended rows a fire carries under a widest rung of `max_tokens`:
+    /// its own rows and the buffered rows it replays ahead of them, that
+    /// many of each at most (`engine::fire::rung_rows`: a fire's lanes
+    /// carry no more than the rung's tokens). The recurrent scratch is laid
+    /// at load for this many ([`Seat::scratch_bytes`]).
+    #[must_use]
+    pub fn widest_rows(max_tokens: u32) -> u32 {
+        max_tokens.saturating_mul(2)
+    }
+
+    /// A fire whose recurrent scratch of `need` bytes is past the `laid`
+    /// bytes the load laid is refused by name: nothing grows it.
+    pub fn fits(need: u64, laid: u64) -> Result<()> {
+        crate::error::within_laid("serve::rs", "recurrent scratch", need, laid)
+    }
+
     #[must_use]
     pub fn scratch_bytes(layout: &Layout, rows_ext: u32, lanes: u32) -> u64 {
         let rows = u64::from(rows_ext.max(1));
@@ -356,14 +372,10 @@ impl Seat {
         rows_ext: u32,
     ) -> Result<Seat> {
         let lane_count = u32::try_from(lanes.len()).unwrap_or(u32::MAX);
-        let need = Seat::scratch_bytes(layout, rows_ext, lane_count);
-        if scratch.bytes() < need {
-            return Err(Fault::Ceiling {
-                what: "recurrent buffer scratch bytes",
-                need,
-                have: scratch.bytes(),
-            });
-        }
+        Seat::fits(
+            Seat::scratch_bytes(layout, rows_ext, lane_count),
+            scratch.bytes(),
+        )?;
         let rows = u64::from(rows_ext.max(1));
         let mut at = 0u64;
         let mut take = |row_bytes: u64, width: u32, dtype: Dtype| -> Result<Tensor> {
@@ -480,5 +492,63 @@ pub fn snapshots(trace: &poem_ir::Trace) -> u32 {
         kernels_slang::ssm::RS_SNAPSHOTS
     } else {
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Layout, Plane, Region, Role, Seat};
+    use poem_ir::Dtype;
+
+    /// Two planes and a region of rows, and a lane's work.
+    fn layout() -> Layout {
+        let plane = |cache, width| Plane {
+            cache,
+            role: Role::ConvX,
+            width,
+            dtype: Dtype::Bf16,
+            row_bytes: u64::from(width) * 2,
+        };
+        Layout {
+            planes: vec![plane(0, 384), plane(1, 384)],
+            regions: vec![Region {
+                width: 128,
+                dtype: Dtype::F32,
+                row_bytes: 512,
+            }],
+            work_elems: 1024,
+            ..Layout::default()
+        }
+    }
+
+    /// The scratch laid at the widest rung's extended rows for the most
+    /// lanes holds every fire of those, and a fire past it is refused by
+    /// name with the bytes it wants and the bytes laid.
+    #[test]
+    fn a_fire_past_the_recurrent_scratch_laid_is_refused_by_name() {
+        let layout = layout();
+        let (top, lanes) = (256, 4);
+        let widest = Seat::widest_rows(top);
+        assert_eq!(
+            widest,
+            2 * top,
+            "a rung's tokens of own rows and as many replayed"
+        );
+        let laid = Seat::scratch_bytes(&layout, widest, lanes);
+        for (rows, lanes) in [(1, 1), (top, 1), (widest, lanes), (top + 7, lanes)] {
+            Seat::fits(Seat::scratch_bytes(&layout, rows, lanes), laid)
+                .unwrap_or_else(|why| panic!("{rows} rows of {lanes} lanes: {why}"));
+        }
+        let need = Seat::scratch_bytes(&layout, widest + 1, lanes);
+        assert!(need > laid);
+        let why = Seat::fits(need, laid)
+            .expect_err("a fire past the scratch laid is refused")
+            .to_string();
+        assert!(
+            why.contains(&format!(
+                "a fire's recurrent scratch of {need} bytes is past the {laid} laid at load"
+            )),
+            "{why}"
+        );
     }
 }
