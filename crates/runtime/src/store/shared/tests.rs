@@ -9,7 +9,7 @@ use ::engine::chunk::{
 use ::engine::fire::Lane;
 
 use super::*;
-use crate::governor::{PATIENCE, Retarget};
+use crate::governor::Retarget;
 
 const MIB: u64 = 1 << 20;
 const CHUNK: u64 = 16 * MIB;
@@ -1133,13 +1133,14 @@ async fn a_cap_down_that_frees_no_chunk_is_not_taken_however_long_it_stands() {
     grow.walk_rung().await;
     assert_eq!(fire_cap(ENGINE), 2);
 
-    // Its last fire settled: the ask is gone, one lane lives, none is short.
+    // Its last fire settled: the ask is gone, one lane lives, none is short;
+    // even under yield, a cut that frees nothing is not taken.
     drop(want);
     assert_eq!(wanted_rows(ENGINE), 0);
-    for tick in 0..32 * PATIENCE {
+    grow.press_for_test();
+    for walk in 0..64 {
         grow.walk_rung().await;
-        assert_eq!(fire_cap(ENGINE), 2, "no cut at tick {tick}");
-        grow.ticked_for_test();
+        assert_eq!(fire_cap(ENGINE), 2, "no cut at walk {walk}");
     }
     assert_eq!(
         shared.lock().unwrap().pool().act_reserved(),
@@ -1152,13 +1153,12 @@ async fn a_cap_down_that_frees_no_chunk_is_not_taken_however_long_it_stands() {
     assert_eq!(fire_cap(ENGINE), 2);
 }
 
-/// The lower that frees chunks is still taken once the pool has stood past
-/// what is asked for the governor's patience, the cap down before it; a
-/// taker short of records while the largest rung holds its span stays
-/// short (live state never opens in the top rung's span), and the span the
-/// lower leaves is idle cache's.
+/// The lower that frees chunks is taken under yield alone, the cap down
+/// before it; an idle pool keeps its rung. A taker short of records while
+/// the largest rung holds its span stays short (live state never opens in
+/// the top rung's span), and the span the lower leaves is idle cache's.
 #[tokio::test(flavor = "current_thread")]
-async fn a_lower_past_the_patience_leaves_the_span_to_cache_not_to_a_taker_short_of_records() {
+async fn a_lower_under_yield_leaves_the_span_to_cache_not_to_a_taker_short_of_records() {
     const ENGINE: usize = 9302;
     let mut pool = classed();
     let mut engine = FakeEngine::new();
@@ -1175,14 +1175,13 @@ async fn a_lower_past_the_patience_leaves_the_span_to_cache_not_to_a_taker_short
     let shared: Shared = Arc::new(Mutex::new(pool));
     let grow = SharedGrow::new(0, ENGINE, shared.clone()).with_live_lanes(|| 1);
     assert_eq!(fire_cap(ENGINE), u32::MAX);
-    for _ in 0..PATIENCE {
-        grow.ticked_for_test();
+    for _ in 0..8 {
         grow.walk_rung().await;
-        assert_eq!(fire_cap(ENGINE), u32::MAX, "not before the patience");
+        assert_eq!(fire_cap(ENGINE), u32::MAX, "idle: no cut without pressure");
     }
-    grow.ticked_for_test();
+    grow.press_for_test();
     grow.walk_rung().await;
-    assert_eq!(fire_cap(ENGINE), 1, "past the patience: fires cut");
+    assert_eq!(fire_cap(ENGINE), 1, "under yield: fires cut");
     grant_rung(ENGINE, 1);
     grow.walk_rung().await;
     grow.walk_rung().await;
@@ -1198,7 +1197,7 @@ async fn a_lower_past_the_patience_leaves_the_span_to_cache_not_to_a_taker_short
 
 /// A fire term appearing that the rung in hand cannot seat beside cuts
 /// fires at once, under a pass still asking the width and before any tick:
-/// the fit, not the patience, decides it.
+/// the fit, not yield, decides it.
 #[tokio::test(flavor = "current_thread")]
 async fn a_fire_term_appearing_under_a_standing_ask_cuts_fires_at_once() {
     const ENGINE: usize = 9303;

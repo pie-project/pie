@@ -4,12 +4,12 @@
 //! commit, evacuation and release is ordered with the fires around it.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use tokio::sync::Notify;
 
 use super::{GrowFor, RungStep, RungWalk, SegmentMove, Shared, SharedPool};
-use crate::governor::{Demand, Growth, PATIENCE, PoolTarget, Retarget};
+use crate::governor::{Demand, Growth, PoolTarget, Retarget};
 use crate::scheduler::worker::PoolOp;
 use crate::store::registry;
 
@@ -28,18 +28,12 @@ pub struct SharedGrow {
     /// ask of a fire (SPEC decision 6, by demand): the smallest rung while
     /// none asks past it.
     rung_walk: Arc<std::sync::Mutex<RungWalk>>,
-    /// The governor's ticks, counted ([`PoolTarget::ticked`]).
-    ticks: Arc<AtomicU64>,
     /// The lanes live now that may decode ([`Self::walk_rows`]).
     live_lanes: Arc<dyn Fn() -> u32 + Send + Sync>,
     /// The fire epochs a test stands in for the engine's stores' with
     /// ([`Self::with_epochs`]); `None`: the stores' own ([`Self::epochs`]).
     #[cfg(test)]
     epochs_for_test: Option<Arc<dyn Fn() -> (u64, u64) + Send + Sync>>,
-    /// The tick since which the rung has stood past what is asked: the
-    /// lower that frees its chunks, and the cap down before it, wait the
-    /// governor's patience from it.
-    idle_since: Arc<std::sync::Mutex<Option<u64>>>,
     /// The last raise waits on what a fire in flight still holds (the
     /// span's idle cache let go behind it): none is tried again until room
     /// is freed ([`Self::room_freed`]), that fire's retirement.
@@ -81,8 +75,6 @@ impl SharedGrow {
             refused: Arc::new(AtomicBool::new(false)),
             no_room: Arc::new(AtomicBool::new(false)),
             rung_walk: Arc::new(std::sync::Mutex::new(RungWalk::default())),
-            ticks: Arc::new(AtomicU64::new(0)),
-            idle_since: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             epochs_for_test: None,
             live_lanes: Arc::new(move || {
@@ -110,10 +102,11 @@ impl SharedGrow {
         self
     }
 
-    /// A governor tick; for a test.
+    /// The governor yields under pressure, its target down to nothing;
+    /// for a test.
     #[cfg(test)]
-    pub(crate) fn ticked_for_test(&self) {
-        self.ticks.fetch_add(1, Ordering::AcqRel);
+    pub(crate) fn press_for_test(&self) {
+        self.target.store(0, Ordering::Release);
     }
 
     /// The fire epochs (the last handed out, the last retired) the walk
@@ -187,31 +180,15 @@ impl SharedGrow {
                 let goal = pool.rung_for(self.walk_rows());
                 let cap = super::fire_cap(self.engine);
                 // The pool stands past what is asked: it comes down only
-                // once it has for the governor's patience, so a pause
-                // between batches moves no rung. On a span backed on
-                // demand an idle pool always comes down after it: the
-                // carve held costs resident memory there.
-                //
-                // Interim: the patience decides this lower, the one move
-                // down that frees chunks, only until the governor's `yield`
-                // does; it goes with the governor's other debounce
-                // constants then.
+                // under yield, the governor's target below what is mapped
+                // (pressure), whose last shed gives the span the lower
+                // leaves back; an idle pool keeps its rung. The governor's
+                // grow backs it again.
                 let past = pool.pool().act_chunks(goal) < pool.pool().act_reserved();
-                let tick = self.ticks.load(Ordering::Acquire);
-                // An engine holding a rung the terms no longer fit is
-                // brought down at once too: a bind waits on it.
+                let yielding = self.goal_in(&pool) < pool.mapped_segments();
+                // An engine holding a rung that no longer fits is brought
+                // down at once too: a bind waits on it.
                 let forced = cap > pool.fit_cap() || pool.told_unfit();
-                let waited = forced || {
-                    let mut since = self.idle_since.lock().unwrap();
-                    if past {
-                        tick >= since
-                            .get_or_insert(tick)
-                            .saturating_add(u64::from(PATIENCE))
-                    } else {
-                        *since = None;
-                        true
-                    }
-                };
                 let step = self.rung_walk.lock().unwrap().step(
                     &pool,
                     goal,
@@ -248,15 +225,17 @@ impl SharedGrow {
                             RungStep::Raise { rung, raise }
                         })
                     }
-                    // A lower before the patience is out.
-                    Ok(RungStep::Lower(_)) if !waited => Ok(RungStep::Wait),
+                    // No lower without yield's pressure.
+                    Ok(RungStep::Lower(_)) if !(forced || yielding) => Ok(RungStep::Wait),
                     // A cap down is taken for the chunks the lower after it
-                    // frees, once the patience is out, and at once for the
-                    // fit (the span holds no fire wider than the widest
-                    // rung that fits with the standing bytes). Within
-                    // a class it frees nothing and is not taken, however
-                    // long the cap stands above what is asked.
-                    Ok(RungStep::Cap(tokens)) if tokens < cap && !(forced || (past && waited)) => {
+                    // frees, under yield, and at once for the fit (the span
+                    // holds no fire wider than the widest rung that fits
+                    // with the standing bytes). Within a class it frees
+                    // nothing and is not taken, however long the cap stands
+                    // above what is asked.
+                    Ok(RungStep::Cap(tokens))
+                        if tokens < cap && !(forced || (past && yielding)) =>
+                    {
                         Ok(RungStep::Wait)
                     }
                     step => step,
@@ -706,10 +685,8 @@ impl PoolTarget for SharedGrow {
         self.refused.swap(false, Ordering::AcqRel)
     }
 
-    /// A governor tick: counted for the rung's patience, and the walk looks
-    /// again.
+    /// A governor tick: the walk looks again.
     fn ticked(&mut self) {
-        self.ticks.fetch_add(1, Ordering::AcqRel);
         self.wake.notify_one();
     }
 }
@@ -800,41 +777,37 @@ mod tests {
         assert_eq!(grow.held_back(settled), None, "said again: nothing moves");
     }
 
-    /// A pool that stands past what is asked comes down only once it has
-    /// for the governor's patience: a pause shorter than that moves no rung.
+    /// An idle pool keeps its rung: with nothing asked and no pressure, no
+    /// tick of the governor's, however many, cuts fires or lowers it. Only
+    /// yield (the governor's target below what is mapped) brings it down.
     #[tokio::test(flavor = "current_thread")]
-    async fn the_rung_comes_down_only_after_the_governor_s_patience() {
+    async fn an_idle_pool_keeps_its_rung_until_yield_presses() {
         const ENGINE: usize = 59;
         let pool = super::super::tests::pool();
         assert_eq!(pool.rung(), 2048);
         let shared: Shared = Arc::new(std::sync::Mutex::new(pool));
-        let mut grow = SharedGrow::new(0, ENGINE, shared);
+        let mut grow = SharedGrow::new(0, ENGINE, shared.clone());
         super::super::set_fire_cap_for_test(ENGINE, u32::MAX);
-        // Nothing asked: the walk would cap fires to the smallest rung.
-        grow.walk_rung().await;
-        assert_eq!(
-            super::super::fire_cap(ENGINE),
-            u32::MAX,
-            "not before a tick"
-        );
-        for tick in 1..PATIENCE {
+        for tick in 0..64 {
             grow.ticked();
+            super::super::grant_rung(ENGINE, super::super::fire_cap(ENGINE));
             grow.walk_rung().await;
             assert_eq!(super::super::fire_cap(ENGINE), u32::MAX, "tick {tick}");
         }
-        grow.ticked();
+        assert_eq!(shared.lock().unwrap().rung(), 2048, "the rung stood");
+        grow.press_for_test();
         grow.walk_rung().await;
         assert!(
             super::super::fire_cap(ENGINE) < u32::MAX,
-            "past the patience: fires are cut toward the rung asked"
+            "under yield: fires are cut toward the rung asked"
         );
     }
 
     /// Standing guest bytes the largest rung cannot hold cut fires to the
-    /// widest rung that fits at once, without the governor's patience: a
-    /// fire wider would take more than the span.
+    /// widest rung that fits at once, without yield's pressure: a fire
+    /// wider would take more than the span.
     #[tokio::test(flavor = "current_thread")]
-    async fn standing_bytes_past_the_largest_rung_cut_fires_without_patience() {
+    async fn standing_bytes_past_the_largest_rung_cut_fires_without_pressure() {
         const ENGINE: usize = 57;
         let mut pool = super::super::tests::pool();
         // 2048's 12 and 8 are past the top rung's span of 12; 256's 4 and 8
