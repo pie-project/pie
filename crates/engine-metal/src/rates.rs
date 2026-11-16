@@ -16,8 +16,13 @@
 //!   128`; its elements are `tokens · heads · d_k · d_v`;
 //! * `bytes_per_ns`: a 256 MiB blit between two buffers, read and write
 //!   counted;
-//! * `launch_ns`: a dispatch's launch, 512 of the smallest matmul back to
-//!   back in one frame.
+//! * `launch_ns`: a dispatch's launch, the smallest matmul back to back in
+//!   one frame.
+//!
+//! Each kernel is timed back to back with itself, as many to a frame as
+//! fill 5 ms, and the frame's time divided: serving runs hundreds of
+//! dispatches a fire, and a frame of one short dispatch times the clock
+//! state the device idled into, not the kernel.
 
 use std::path::Path;
 
@@ -34,6 +39,13 @@ pub const ROWS: [u32; 10] = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192];
 
 /// The matmul's width and contraction.
 const WIDTH: u32 = 4096;
+
+/// How long a timed frame runs: long enough that the device stays at its
+/// serving clock through it.
+const FRAME_SECONDS: f64 = 0.005;
+
+/// The most of one measurement a timed frame repeats.
+const MAX_REPEATS: u32 = 512;
 
 /// What one `pie tune metal --rates` measured.
 #[derive(Debug, Clone, PartialEq)]
@@ -116,20 +128,36 @@ impl Bench<'_> {
         Ok(Tensor::new(handle, rows, width, dtype))
     }
 
-    /// The median GPU seconds of five frames `encode` fills, after a warm one.
+    /// GPU seconds of one frame holding `k` of what `encode` fills.
+    fn frame_of(
+        &self,
+        encode: &dyn Fn(&Sink<'_>) -> Result<(), kernels_metal::Error>,
+        k: u32,
+    ) -> Result<f64, String> {
+        let frame = self.device.frame().map_err(|e| e.to_string())?;
+        let sink = Sink::new(self.device, &frame, &self.pipelines, &self.handles);
+        for _ in 0..k {
+            encode(&sink).map_err(|e| e.to_string())?;
+        }
+        frame.commit_timed().map_err(|e| e.to_string())
+    }
+
+    /// The GPU seconds one of what `encode` fills takes as serving runs it,
+    /// back to back with others: each frame holds `k` of them, `k` enough
+    /// for a frame of [`FRAME_SECONDS`], and the median of five such frames
+    /// after a warm one, over `k`. A frame of one short dispatch times the
+    /// clock state the device idled into between frames, not the kernel
+    /// (bimodal on an M5 Pro at m = 64..2048 of the matmul ladder).
     fn timed(
         &self,
         encode: &dyn Fn(&Sink<'_>) -> Result<(), kernels_metal::Error>,
     ) -> Result<f64, String> {
+        let once = self.frame_of(encode, 1)?.max(1e-7);
+        let k = ((FRAME_SECONDS / once).ceil() as u32).clamp(1, MAX_REPEATS);
+        self.frame_of(encode, k)?;
         let mut times = Vec::with_capacity(5);
-        for at in 0..6 {
-            let frame = self.device.frame().map_err(|e| e.to_string())?;
-            encode(&Sink::new(self.device, &frame, &self.pipelines, &self.handles))
-                .map_err(|e| e.to_string())?;
-            let seconds = frame.commit_timed().map_err(|e| e.to_string())?;
-            if at > 0 {
-                times.push(seconds);
-            }
+        for _ in 0..5 {
+            times.push(self.frame_of(encode, k)? / f64::from(k));
         }
         Ok(median(times))
     }
@@ -288,7 +316,6 @@ impl Bench<'_> {
     }
 
     fn launch_ns(&self) -> Result<u64, String> {
-        const LAUNCHES: u32 = 512;
         let (a, w, y) = (
             self.zeroed(8 * 32 * 2)?,
             self.zeroed(32 * 32 * 2)?,
@@ -299,13 +326,8 @@ impl Bench<'_> {
             self.tensor(&w, 32, 32, Dtype::Bf16)?,
             self.tensor(&y, 8, 32, Dtype::Bf16)?,
         );
-        let seconds = self.timed(&|sink| {
-            for _ in 0..LAUNCHES {
-                gemm::matmul(sink, self.tuning, at, wt, yt)?;
-            }
-            Ok(())
-        })?;
-        Ok((seconds * 1e9 / f64::from(LAUNCHES)).round() as u64)
+        let seconds = self.timed(&|sink| gemm::matmul(sink, self.tuning, at, wt, yt))?;
+        Ok((seconds * 1e9).round() as u64)
     }
 }
 
