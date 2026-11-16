@@ -29,6 +29,12 @@ use crate::handles::Handles;
 #[derive(Debug)]
 pub struct Pool<B: Backend> {
     segments: Vec<Option<B::Buffer>>,
+    /// A buffer of a few bytes for each segment, bound in its place while
+    /// it is not backed: what a fire binds of the pool is the same buffers'
+    /// places whatever is backed, and a backend that keeps recordings
+    /// rebinds each place as its segment comes and goes. Laid with the
+    /// load's first commit (the span's).
+    stand_ins: Vec<B::Buffer>,
     chunk_bytes: u64,
     total_chunks: u32,
     segment_chunks: u32,
@@ -180,6 +186,7 @@ impl<B: Backend> Pool<B> {
         }
         Ok(Pool {
             segments: (0..segments).map(|_| None).collect(),
+            stand_ins: Vec::new(),
             chunk_bytes,
             total_chunks,
             segment_chunks,
@@ -313,12 +320,23 @@ impl<B: Backend> Pool<B> {
         Ok((buffer, at % span))
     }
 
+    /// Each segment's buffer where it is backed, beside its stand-in
+    /// ([`Pool::bind`]); empty before the load's first commit.
+    #[must_use]
+    pub fn placed(&self) -> Vec<(Option<&B::Buffer>, &B::Buffer)> {
+        self.segments
+            .iter()
+            .zip(&self.stand_ins)
+            .map(|(backed, stand_in)| (backed.as_ref(), stand_in))
+            .collect()
+    }
+
     /// The pool as kernels bind it: every committed segment, the rest
-    /// absent.
+    /// their stand-ins (absent before the first commit).
     pub fn bind(&self, handles: &Handles<B>) -> Result<Segments> {
         let mut bufs = [kernels_slang::ABSENT; SEGMENTS];
         for (at, segment) in self.segments.iter().enumerate() {
-            if let Some(buffer) = segment {
+            if let Some(buffer) = segment.as_ref().or(self.stand_ins.get(at)) {
                 bufs[at] = handles.bind(buffer, 0, buffer.bytes())?;
             }
         }
@@ -340,6 +358,11 @@ impl<B: Backend> Pool<B> {
                 need: u64::from(segments),
                 have: u64::from(max),
             });
+        }
+        if self.stand_ins.is_empty() {
+            self.stand_ins = (0..max)
+                .map(|_| B::Buffer::zeroed(device, 16, crate::books::owners::DUMMY))
+                .collect::<Result<Vec<_>>>()?;
         }
         for segment in (0..segments).chain(self.top..max) {
             if self.segments[segment as usize].is_some() {

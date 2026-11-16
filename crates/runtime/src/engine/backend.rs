@@ -170,6 +170,9 @@ struct EngineRegistration {
     /// ([`::engine::chunk::ChunkFacts::eager_rungs`]): read by the model
     /// status, and by nothing that cuts a pass.
     eager_rungs: Vec<u32>,
+    /// Why the engine encodes every fire, where it states so
+    /// ([`::engine::chunk::ChunkFacts::encodes`]): read by the model status.
+    encodes: Option<String>,
 }
 
 fn registry() -> &'static Mutex<Vec<Option<EngineRegistration>>> {
@@ -181,6 +184,7 @@ pub fn register_engine_backend(
     mut spec: EngineSpec,
     backend: EngineBox,
     eager_rungs: Vec<u32>,
+    encodes: Option<String>,
 ) -> usize {
     let mut engines = registry().lock().unwrap();
     let id = engines.len();
@@ -193,6 +197,7 @@ pub fn register_engine_backend(
         backend: Some(backend),
         live,
         eager_rungs,
+        encodes,
     }));
     id
 }
@@ -207,6 +212,19 @@ pub fn eager_rungs() -> Vec<Vec<u32>> {
         .iter()
         .flatten()
         .map(|r| r.eager_rungs.clone())
+        .collect()
+}
+
+/// Why each registered engine encodes every fire, where it stated so at
+/// load, in engine order ([`::engine::chunk::ChunkFacts::encodes`]).
+#[must_use]
+pub fn encodes() -> Vec<Option<String>> {
+    registry()
+        .lock()
+        .unwrap()
+        .iter()
+        .flatten()
+        .map(|r| r.encodes.clone())
         .collect()
 }
 

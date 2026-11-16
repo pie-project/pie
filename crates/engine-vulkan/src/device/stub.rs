@@ -130,6 +130,56 @@ impl Context {
     pub fn frame_kept(&self) -> Result<Frame> {
         match self.never {}
     }
+
+    pub fn tails(&self, _arms: usize) -> Result<Tails> {
+        match self.never {}
+    }
+
+    pub fn made(&self) -> &engine_gpu::made::Made {
+        match self.never {}
+    }
+
+    pub fn lay_sets(&self, _pipelines: &Pipelines, _count: usize) -> Result<()> {
+        match self.never {}
+    }
+
+    pub fn rebinds(&self) -> bool {
+        match self.never {}
+    }
+
+    pub fn persist_pipelines(&self) -> Result<()> {
+        match self.never {}
+    }
+
+    pub fn rebind_segments(
+        &self,
+        _segments: &[(Option<&Buffer>, &Buffer)],
+        _kept: &[&Kept],
+    ) -> Result<()> {
+        match self.never {}
+    }
+}
+
+#[derive(Debug)]
+pub struct Tails {
+    never: std::convert::Infallible,
+}
+
+pub struct Tail<'t> {
+    _never: std::convert::Infallible,
+    _tails: std::marker::PhantomData<&'t Tails>,
+}
+
+impl Tails {
+    pub fn record(
+        &self,
+        _arm: usize,
+        _source: &Buffer,
+        _into: &Buffer,
+        _regions: &[(u64, u64, u64)],
+    ) -> Result<Tail<'_>> {
+        match self.never {}
+    }
 }
 
 pub struct Frame {
@@ -213,6 +263,7 @@ impl Kept {
 
     pub fn replay(
         &self,
+        _tail: Option<&Tail<'_>>,
         _on_done: Option<Box<dyn Fn(Option<String>) + Send + 'static>>,
     ) -> Result<Pending> {
         match self.never {}
@@ -397,6 +448,10 @@ pub struct Pipelines {
 }
 
 impl Pipelines {
+    pub fn set_layouts(&self) -> Vec<()> {
+        Vec::new()
+    }
+
     #[must_use]
     pub fn new() -> Pipelines {
         Pipelines::default()

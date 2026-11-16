@@ -119,6 +119,18 @@ pub trait Serve: Backend {
         Ok(())
     }
 
+    /// The device's note of what it makes once the load serves
+    /// ([`crate::made::Made`]); `None` where it notes nothing.
+    fn made(_device: &Self::Context) -> Option<&crate::made::Made> {
+        None
+    }
+
+    /// The load built every pipeline it serves with: a backend that keeps
+    /// a pipeline cache writes it now.
+    fn loaded(_device: &Self::Context) -> Result<()> {
+        Ok(())
+    }
+
     /// The pipelines compiled so far.
     fn compiled(pipelines: &Self::Pipelines) -> u64;
 
@@ -171,8 +183,32 @@ pub trait Serve: Backend {
         weights_stream: bool,
     ) -> Result<Self::Shelf>;
 
-    /// What a kept step binds moved: the segments, or a layer's stage.
+    /// What a kept step binds moved: a layer's stage.
     fn forget(shelf: &mut Self::Shelf);
+
+    /// The pool's segments were backed or given back: what a kept step
+    /// binds of them is bound again to what each segment is now
+    /// ([`Shell::placed_segments`]). The pool drained first.
+    fn rebind(shell: &mut Shell<Self>) -> Result<()> {
+        Self::forget(&mut shell.shelf);
+        Ok(())
+    }
+
+    /// Why the backend encodes every fire of this load afresh rather than
+    /// replaying the decode bodies the load records: a device or API limit,
+    /// stated once at load ([`engine::chunk::ChunkFacts::encodes`]). `None`
+    /// where it replays what the load armed.
+    fn encodes(_shelf: &Self::Shelf) -> Option<&'static str> {
+        None
+    }
+
+    /// Records `prepared`'s body to replay while the load serves, and
+    /// submits nothing: a decode fire of the lattice the load arms
+    /// ([`Shell::arm`]). `false` where the backend keeps no recording, and
+    /// encodes every fire.
+    fn arm(_shell: &mut Shell<Self>, _prepared: &mut Prepared<'_, Self>) -> Result<bool> {
+        Ok(false)
+    }
 
     /// Replays `prepared` where a kept step answers it, else how it walks.
     fn plan(shell: &mut Shell<Self>, prepared: &mut Prepared<'_, Self>) -> Result<Plan<Self>>;
@@ -193,6 +229,21 @@ pub trait Serve: Backend {
 
     /// Harvests the oldest step in flight, waiting for it.
     fn harvest_one(shell: &mut Shell<Self>) -> Result<()>;
+}
+
+/// Where arming's time went: staging its fires and recording them.
+#[derive(Default)]
+struct ArmSpent {
+    stage: std::time::Duration,
+    record: std::time::Duration,
+}
+
+/// A decode fire's place in the lattice a load arms ([`Shell::arm`]): its
+/// lanes, each one row of `class`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LatticePoint {
+    pub class: usize,
+    pub lanes: u32,
 }
 
 /// How a step goes to the device ([`Serve::plan`]).
@@ -713,6 +764,10 @@ pub struct Shell<B: Serve> {
     masked: poem_ir::ClassSet,
 
     corrected: poem_ir::ClassSet,
+
+    /// The classes a decode fire is of: the lattice the load arms
+    /// ([`Shell::arm`]).
+    decoding: poem_ir::ClassSet,
 
     adapter_fact: Option<u32>,
 
@@ -1493,6 +1548,17 @@ impl<B: Serve> Shell<B> {
 
         let adapter_fact = adapter_fact(&compiled.classes, &corrected);
         let adapter_slots = crate::adapter::Slots::new(weights.adapter_seats());
+        // The classes a decode fire is of: those every request landing in
+        // them reads one row of, a plain request among them.
+        let landing = poem_exec::feeds::landing_requests(&boot.trace.facts, &compiled.classes);
+        let outputs =
+            poem_exec::feeds::class_outputs(&boot.trace, &compiled).map_err(|why| program("serve::raise", why))?;
+        let plain = poem_exec::feeds::plain_of(&landing, &outputs);
+        let decoding = poem_ir::ClassSet::of(
+            poem_exec::feeds::decoding_of(&landing).iter().filter(|&class| {
+                plain.contains(class) && !asks.unservable.iter().any(|held| held.class == class)
+            }),
+        );
 
         let weights_stream = weights.streams() || weights.gathered().is_some();
         let shelf = B::shelf(&device, &readout, weights_stream)?;
@@ -1538,6 +1604,7 @@ impl<B: Serve> Shell<B> {
             copies: false,
             masked,
             corrected,
+            decoding,
             adapter_fact,
             adapters: adapter_slots,
 
@@ -1719,6 +1786,7 @@ impl<B: Serve> Shell<B> {
                     ..shape
                 })
                 .collect(),
+            encodes: B::encodes(&self.shelf).map(str::to_string),
             ..self.pools.chunk_facts()
         }
     }
@@ -1884,11 +1952,12 @@ impl<B: Serve> Shell<B> {
         if segments <= self.pools.chunk_facts().segments.committed {
             return Ok(());
         }
-        // The frames kept to replay bind the segments as they stood.
+        // The frames kept to replay bind the segments as they stood: each
+        // is rebound to the segments as they now stand.
         self.drain()?;
         self.handles.rewind();
-        B::forget(&mut self.shelf);
-        self.pools.commit_segments(&self.device, segments)
+        self.pools.commit_segments(&self.device, segments)?;
+        B::rebind(self)
     }
 
     /// Gives back every segment at and past `segments`, once every frame
@@ -1896,9 +1965,8 @@ impl<B: Serve> Shell<B> {
     pub fn release_segments(&mut self, segments: u32) -> Result<()> {
         self.drain()?;
         self.handles.rewind();
-        B::forget(&mut self.shelf);
         self.pools.release_segments(segments);
-        Ok(())
+        B::rebind(self)
     }
 
     /// Copies each evacuated chunk onto its new physical chunk, on the queue
@@ -2022,6 +2090,24 @@ impl<B: Serve> Shell<B> {
             return Vec::new();
         }
         B::built_since(&self.pipelines, from)
+    }
+
+    /// The load built every pipeline it serves with ([`Serve::loaded`]).
+    pub fn loaded(&self) -> Result<()> {
+        B::loaded(&self.device)
+    }
+
+    /// Marks the load serving: from here on what the device makes is noted
+    /// ([`Shell::made_serving`]).
+    pub fn serving(&self) {
+        if let Some(made) = B::made(&self.device) {
+            made.ready();
+        }
+    }
+
+    /// What the device made since the last count once the load served.
+    pub fn made_serving(&self) -> Vec<crate::made::Creation> {
+        B::made(&self.device).map_or_else(Vec::new, crate::made::Made::take)
     }
 
     /// The steps walked to be kept since the last count: each is a shape a
@@ -3919,6 +4005,7 @@ impl<B: Serve> Shell<B> {
             arm,
             readout_rows,
             readout_layout,
+            readout_copies: Vec::new(),
             descriptor,
             seats,
             kv_less,
@@ -3931,6 +4018,258 @@ impl<B: Serve> Shell<B> {
             demand,
             guests,
         })
+    }
+
+    /// Walks `p` into a frame kept to replay, submitting nothing: its frame,
+    /// the launches it made of its regions, and the host step of each
+    /// segment its expert stages cut.
+    pub fn walk_kept(
+        &self,
+        p: &Prepared<'_, B>,
+    ) -> Result<(B::Frame, u32, Vec<crate::store::experts::Cut<B>>)> {
+        let walked = self.walk_once(p, true, false)?;
+        let frame = walked.frame.expect("the walk opened a frame");
+        Ok((frame, walked.launches, walked.cuts))
+    }
+
+    /// The most lanes one decode fire carries: a lane a seat, within the
+    /// lanes and the rows a fire takes.
+    fn lane_ceiling(&self) -> u32 {
+        u32::try_from(self.held.len())
+            .unwrap_or(u32::MAX)
+            .min(self.budget().max_lanes)
+            .min(self.budget().max_tokens)
+    }
+
+    /// The classes of the decode lattice: those the load decodes whose
+    /// lanes carry no mask and run no image or clip.
+    fn lattice_classes(&self) -> Vec<usize> {
+        self.decoding
+            .iter()
+            .filter(|&class| {
+                !self.masked.contains(class)
+                    && !self.class_runs(class, poem_ir::RowAxis::Patches)
+                    && !self.class_runs(class, poem_ir::RowAxis::Voxels)
+            })
+            .collect()
+    }
+
+    /// Where `p` lies in the decode lattice the load armed: a fire whose
+    /// every lane reads one row of one lattice class, within the lane
+    /// ceiling. `None` for every other fire: prefill and mixed rows are
+    /// unbounded, and a backend encodes them each fire from objects the
+    /// load built.
+    #[must_use]
+    pub fn lattice_point(&self, p: &Prepared<'_, B>) -> Option<LatticePoint> {
+        let class = p.rows.first()?.class as usize;
+        let lanes = u32::try_from(p.rows.len()).ok()?;
+        let decode = p
+            .rows
+            .iter()
+            .all(|row| row.rows == 1 && row.class as usize == class && row.voxels == 0)
+            && p.lanes.iter().all(|lane| lane.mask.is_none())
+            && p.bindings.patches.is_none()
+            && p.bindings.voxels.is_none()
+            && lanes <= self.lane_ceiling()
+            && self.lattice_classes().contains(&class);
+        decode.then_some(LatticePoint { class, lanes })
+    }
+
+    /// Arms the decode lattice before the load returns: on each arm, for
+    /// each lattice class, a fire of every lane count to the ceiling, one
+    /// row a lane on seats the load sets aside for it (the fire is staged
+    /// and walked, never submitted, so no seat is written), which the
+    /// backend records ([`Serve::arm`]). A backend that keeps no recording
+    /// arms nothing. Nothing arms once the load serves.
+    pub fn arm(&mut self) -> Result<()> {
+        if let Some(why) = B::encodes(&self.shelf) {
+            tracing::warn!(
+                why,
+                "this load keeps no recording: every fire is encoded from objects the load built"
+            );
+            return Ok(());
+        }
+        let started = std::time::Instant::now();
+        let classes = self.lattice_classes();
+        let ceiling = self.lane_ceiling();
+        let depth = self.arms.depth();
+        // The synthetic seats lie in the pool's first segments: backed for
+        // the walk and given back after it, each recording rebound to the
+        // stand-ins bound in their place ([`Serve::rebind`]).
+        let committed = self.pools.chunk_facts().segments.committed;
+        let seats = self.pools.seat_segments();
+        self.commit_segments(seats)?;
+        let backed = started.elapsed();
+        let mut spent = ArmSpent::default();
+        let armed = self.arm_lattice(&classes, ceiling, depth, &mut spent);
+        let walked = started.elapsed();
+        self.release_segments(committed)?;
+        let Some(armed) = armed? else {
+            return Err(program(
+                "serve::arm",
+                "a backend that keeps recordings kept none of the decode lattice".to_string(),
+            ));
+        };
+        tracing::info!(
+            classes = ?classes,
+            lanes = ceiling,
+            arms = depth,
+            armed,
+            ms = started.elapsed().as_millis() as u64,
+            back_seats_ms = backed.as_millis() as u64,
+            stage_ms = spent.stage.as_millis() as u64,
+            record_ms = spent.record.as_millis() as u64,
+            give_back_seats_ms = (started.elapsed() - walked).as_millis() as u64,
+            "the load armed its decode lattice, a recording a composition and arm, each lane \
+             one row of a decoding class; prefill and mixed rows are unbounded, and they are \
+             encoded each fire from objects built at load"
+        );
+        Ok(())
+    }
+
+    /// [`Shell::arm`]'s fires: the recordings made, `None` where the
+    /// backend keeps none.
+    fn arm_lattice(
+        &mut self,
+        classes: &[usize],
+        ceiling: u32,
+        depth: usize,
+        spent: &mut ArmSpent,
+    ) -> Result<Option<u64>> {
+        let mut armed = 0u64;
+        for &class in classes {
+            let lane = self.naming_lane(class, 1)?;
+            for lanes in 1..=ceiling {
+                let owned: Vec<NamingLane<B>> = vec![lane.clone(); lanes as usize];
+                // Every lane on the first seat: the fire is walked and never
+                // submitted, so what its tables name is never read, and the
+                // seats a pool lays may be fewer than a fire's lanes.
+                let seated: Vec<Seated<'_, B>> = owned
+                    .iter()
+                    .map(|lane| Seated {
+                        held: Some(1),
+                        adapter: lane.adapter,
+                        inputs: &lane.inputs,
+                        ..Seated::of(Lane {
+                            slot: 0,
+                            word: lane.word,
+                            tokens: &lane.tokens,
+                        })
+                    })
+                    .collect();
+                for arm in 0..depth {
+                    // The fire takes `arm`: every other is held for it.
+                    for other in (0..depth).filter(|&other| other != arm) {
+                        self.arms.take(other);
+                    }
+                    let at = std::time::Instant::now();
+                    let staged = self.stage(StepView {
+                        lanes: &seated,
+                        attachments: &[],
+                        media: &[],
+                        clips: &[],
+                        folds: &[],
+                        done: None,
+                        guests: None,
+                    });
+                    spent.stage += at.elapsed();
+                    for other in (0..depth).filter(|&other| other != arm) {
+                        self.arms.give(other);
+                    }
+                    let mut prepared = staged?;
+                    let point = self.lattice_point(&prepared);
+                    if point != Some(LatticePoint { class, lanes }) || prepared.arm != arm {
+                        self.handles.rewind();
+                        return Err(program(
+                            "serve::arm",
+                            format!(
+                                "the load's decode fire of {lanes} lane(s) of class {class} at \
+                                 arm {arm} staged at {point:?}, arm {}",
+                                prepared.arm
+                            ),
+                        ));
+                    }
+                    let at = std::time::Instant::now();
+                    let kept = B::arm(self, &mut prepared);
+                    spent.record += at.elapsed();
+                    self.handles.rewind();
+                    if !kept? {
+                        return Ok(None);
+                    }
+                    armed += 1;
+                }
+            }
+        }
+        Ok(Some(armed))
+    }
+
+    /// Each pool segment's buffer where it is backed, beside the stand-in
+    /// bound in its place where it is not.
+    #[must_use]
+    pub fn placed_segments(&self) -> Vec<(Option<&B::Buffer>, &B::Buffer)> {
+        self.pools.placed_segments()
+    }
+
+    /// The buffer a fire's readout copies read ([`Prepared::readout_copies`]).
+    pub fn readout_source(&self) -> Result<&B::Buffer> {
+        self.span.buffer()
+    }
+
+    /// The copies that land `p`'s reads in its arm's readout seat: each
+    /// read plane's rows from the carve's row of each of its layers, at the
+    /// spans the fire's readout layout lays.
+    fn readout_copies(&self, p: &Prepared<'_, B>) -> Result<Vec<SpanCopy>> {
+        let mut bases: Vec<Option<Vec<u64>>> = vec![None; self.readouts.len()];
+        for span in p.readout_layout.iter().filter(|span| span.rows > 0) {
+            let at = span.plane as usize;
+            if bases[at].is_some() {
+                continue;
+            }
+            let plane = &self.readouts[at];
+            let mut layers = Vec::with_capacity(plane.values.len());
+            for value in &plane.values {
+                let rect = p.slots.0[value.0 as usize].ok_or_else(|| Fault::Unbound {
+                    what: format!(
+                        "value {}, of output `{}`, which the carve gave no rectangle",
+                        value.0, plane.output
+                    ),
+                })?;
+                if rect.width != plane.width {
+                    return Err(Fault::Ceiling {
+                        what: "elements in one readout row",
+                        need: u64::from(rect.width),
+                        have: u64::from(plane.width),
+                    });
+                }
+                let row = self.handles.get(rect.buf).ok_or_else(|| Fault::Unbound {
+                    what: format!(
+                        "handle {}, output `{}`'s, which this load minted no row for",
+                        rect.buf, plane.output
+                    ),
+                })?;
+                layers.push(row.offset());
+            }
+            bases[at] = Some(layers);
+        }
+        let mut copies = Vec::new();
+        for span in p.readout_layout.iter().filter(|span| span.rows > 0) {
+            let plane = &self.readouts[span.plane as usize];
+            let layers = bases[span.plane as usize]
+                .as_deref()
+                .expect("every read plane has a base");
+            let row_bytes = u64::from(plane.width) * elem(plane.dtype);
+            let gathered = self.gathers_readout && plane.seam == Kind::Readout;
+            let source_row = |k: u32| {
+                let cursor = u64::from(span.first + k);
+                if gathered {
+                    cursor
+                } else {
+                    u64::try_from(p.readout_rows[cursor as usize]).unwrap_or(0)
+                }
+            };
+            copies.extend(span_copies(span, layers, row_bytes, source_row));
+        }
+        Ok(copies)
     }
 
     fn walk_once(&self, p: &Prepared<'_, B>, keep: bool, split: bool) -> Result<Walked<B>> {
@@ -4083,6 +4422,9 @@ pub struct Prepared<'a, B: Serve> {
     pub arm: usize,
     readout_rows: Vec<i32>,
     readout_layout: Vec<ReadSpan>,
+    /// The copies that land the fire's reads in its arm's readout seat,
+    /// from the span ([`Shell::readout_source`]), set as the fire enqueues.
+    pub readout_copies: Vec<SpanCopy>,
     pub descriptor: FireDescriptor,
     pub seats: Vec<Seat>,
     kv_less: Vec<bool>,
@@ -4097,6 +4439,14 @@ pub struct Prepared<'a, B: Serve> {
     demand: Demand,
 
     pub guests: Option<B::Guests>,
+}
+
+impl<B: Serve> Prepared<'_, B> {
+    /// Where the fire's reads land in its arm's readout seat.
+    #[must_use]
+    pub fn readout_layout(&self) -> &[ReadSpan] {
+        &self.readout_layout
+    }
 }
 
 impl<B: Serve> PreparedPhase for Prepared<'_, B> {
@@ -4367,6 +4717,12 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
             need,
             self.readout[prepared.arm].bytes(),
         )?;
+        // The copies that land the fire's reads in its arm's seat, from the
+        // carve this fire's handles name: a walked fire encodes them after
+        // its body, a kept body replays without them and the backend copies
+        // them behind it, so the reads a fire's lanes make are no part of
+        // what a recording holds.
+        prepared.readout_copies = self.readout_copies(&prepared)?;
         let (keep, split) = match B::plan(self, &mut prepared)? {
             Plan::Replayed {
                 pending,
@@ -4393,58 +4749,11 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
         let walked = self.walk_once(&prepared, keep.is_some(), split)?;
         let mut frame = walked.frame.expect("the walk opened a frame");
 
-        let mut bases: Vec<Option<Vec<u64>>> = vec![None; self.readouts.len()];
-        for span in prepared.readout_layout.iter().filter(|span| span.rows > 0) {
-            let at = span.plane as usize;
-            if bases[at].is_some() {
-                continue;
-            }
-            let plane = &self.readouts[at];
-            let mut layers = Vec::with_capacity(plane.values.len());
-            for value in &plane.values {
-                let rect = prepared.slots.0[value.0 as usize].ok_or_else(|| Fault::Unbound {
-                    what: format!(
-                        "value {}, of output `{}`, which the carve gave no rectangle",
-                        value.0, plane.output
-                    ),
-                })?;
-                if rect.width != plane.width {
-                    return Err(Fault::Ceiling {
-                        what: "elements in one readout row",
-                        need: u64::from(rect.width),
-                        have: u64::from(plane.width),
-                    });
-                }
-                let row = self.handles.get(rect.buf).ok_or_else(|| Fault::Unbound {
-                    what: format!(
-                        "handle {}, output `{}`'s, which this load minted no row for",
-                        rect.buf, plane.output
-                    ),
-                })?;
-                layers.push(row.offset());
-            }
-            bases[at] = Some(layers);
-        }
-
-        let layout = prepared.readout_layout.clone();
-        for span in layout.iter().filter(|span| span.rows > 0) {
-            let plane = &self.readouts[span.plane as usize];
-            let layers = bases[span.plane as usize]
-                .as_deref()
-                .expect("every read plane has a base");
-            let row_bytes = u64::from(plane.width) * elem(plane.dtype);
-            let gathered = self.gathers_readout && plane.seam == Kind::Readout;
-            let source_row = |k: u32| {
-                let cursor = u64::from(span.first + k);
-                if gathered {
-                    cursor
-                } else {
-                    u64::try_from(prepared.readout_rows[cursor as usize]).unwrap_or(0)
-                }
-            };
-            for copy in span_copies(span, layers, row_bytes, source_row) {
+        if keep.is_none() {
+            let source = self.span.buffer()?;
+            for copy in &prepared.readout_copies {
                 frame.copy(
-                    self.span.buffer()?,
+                    source,
                     copy.from,
                     &self.readout[prepared.arm],
                     copy.to,
@@ -4452,6 +4761,7 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
                 )?;
             }
         }
+        let layout = prepared.readout_layout.clone();
 
         let pixels = self.copy_pixels(&mut frame, &prepared)?;
         self.walked = (
@@ -4613,10 +4923,10 @@ fn bf16(bits: u16) -> f32 {
 /// One copy of a read: `bytes` from byte `from` of the span's buffer to
 /// byte `to` of the arm's readout seat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SpanCopy {
-    from: u64,
-    to: u64,
-    bytes: u64,
+pub struct SpanCopy {
+    pub from: u64,
+    pub to: u64,
+    pub bytes: u64,
 }
 
 /// The copies that land `span` in the seat, `layers` each layer's base in
@@ -4895,6 +5205,7 @@ impl poem_exec::fire::Sink for Counting<'_> {
 }
 
 /// One lane of a naming fire: what its class has a lane carry, all zeros.
+#[derive(Clone)]
 struct NamingLane<B: Serve> {
     word: u64,
     tokens: Vec<u32>,
@@ -4903,9 +5214,10 @@ struct NamingLane<B: Serve> {
     media: Option<NamingMedia>,
     boxes: Vec<[u32; 3]>,
     payload: Vec<u8>,
-    inputs: Vec<(engine::fire::InputFeed, InputCell<Named<B>>)>,
+    inputs: Vec<(engine::fire::InputFeed, InputCell<B>)>,
 }
 
+#[derive(Clone)]
 struct NamingMedia {
     rows: Vec<u32>,
     patches: Vec<u8>,
@@ -4914,7 +5226,7 @@ struct NamingMedia {
     grids: Vec<i32>,
 }
 
-impl<B: Serve> Shell<Named<B>> {
+impl<B: Serve> Shell<B> {
     /// Whether a lane of `class` runs a region of `axis`.
     fn class_runs(&self, class: usize, axis: poem_ir::RowAxis) -> bool {
         self.compiled
@@ -4982,10 +5294,10 @@ impl<B: Serve> Shell<Named<B>> {
             let bytes = cells * seat.row_bytes();
             // A cell the device keeps arrives f32 and is cast where the
             // seat is bf16: the one kernel a fire asks for beside its walk.
-            let cell = if Named::<B>::CHANNEL_CELLS && seat.dtype == Dtype::Bf16 {
+            let cell = if B::CHANNEL_CELLS && seat.dtype == Dtype::Bf16 {
                 InputCell::Device {
                     cell: DeviceCell {
-                        buffer: crate::backend::Buffer::<Named<B>>::host(
+                        buffer: crate::backend::Buffer::<B>::host(
                             &self.device,
                             bytes * 2,
                             crate::books::owners::CHANNELS,
@@ -5024,6 +5336,9 @@ impl<B: Serve> Shell<Named<B>> {
         })
     }
 
+}
+
+impl<B: Serve> Shell<Named<B>> {
     /// The lanes of a fire of `rows` rows of `class` alone: as many as its
     /// seats take.
     fn alone(&self, class: usize, rows: u64) -> Vec<(usize, u32)> {
@@ -5126,7 +5441,7 @@ impl<B: Serve> Shell<Named<B>> {
         let owned = lanes
             .iter()
             .map(|&(class, rows)| self.naming_lane(class, rows))
-            .collect::<Result<Vec<NamingLane<B>>>>()?;
+            .collect::<Result<Vec<NamingLane<Named<B>>>>>()?;
         let seated: Vec<Seated<'_, Named<B>>> = owned
             .iter()
             .enumerate()

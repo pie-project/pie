@@ -521,6 +521,7 @@ impl Sink<'_> {
                     }),
                 });
             }
+            core.made.note("bind group", name);
             core.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some(name),
                 layout: &pipeline.layout,

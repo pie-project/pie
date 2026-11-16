@@ -951,6 +951,12 @@ impl<B: Backend> Pools<B> {
         self.pool.bind(handles)
     }
 
+    /// Each pool segment's buffer where it is backed, beside its stand-in.
+    #[must_use]
+    pub fn placed_segments(&self) -> Vec<(Option<&B::Buffer>, &B::Buffer)> {
+        self.pool.placed()
+    }
+
     #[must_use]
     pub fn state_slot_bytes(&self) -> u64 {
         self.rows

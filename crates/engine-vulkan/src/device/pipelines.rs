@@ -9,11 +9,31 @@ use ash::vk;
 use super::ctx::{Context, Core};
 use super::spirv;
 
+/// A descriptor set layout of some count of storage buffers, which every
+/// pipeline declaring that many shares: a set laid for one serves any of
+/// them ([`Pipelines::set_layouts`]).
+pub struct SetLayout {
+    core: Arc<Core>,
+    pub(crate) layout: vk::DescriptorSetLayout,
+}
+
+impl Drop for SetLayout {
+    fn drop(&mut self) {
+        // SAFETY: the last `Arc<SetLayout>` is gone with every pipeline
+        // whose layout named it.
+        unsafe {
+            self.core
+                .device
+                .destroy_descriptor_set_layout(self.layout, None);
+        }
+    }
+}
+
 pub struct Pipeline {
     core: Arc<Core>,
     pub(crate) pipeline: vk::Pipeline,
     pub(crate) layout: vk::PipelineLayout,
-    pub(crate) set_layout: vk::DescriptorSetLayout,
+    pub(crate) set: Arc<SetLayout>,
 
     pub bindings: u32,
 
@@ -33,7 +53,6 @@ impl Drop for Pipeline {
         unsafe {
             d.destroy_pipeline(self.pipeline, None);
             d.destroy_pipeline_layout(self.layout, None);
-            d.destroy_descriptor_set_layout(self.set_layout, None);
         }
     }
 }
@@ -41,6 +60,8 @@ impl Drop for Pipeline {
 #[derive(Default)]
 pub struct Pipelines {
     built: RefCell<HashMap<&'static str, Arc<Pipeline>>>,
+    /// The set layouts the pipelines share, by their bindings.
+    sets: RefCell<HashMap<u32, Arc<SetLayout>>>,
     /// The kernels built, in the order their pipelines were.
     order: RefCell<Vec<&'static str>>,
 }
@@ -63,6 +84,12 @@ impl Pipelines {
     #[must_use]
     pub fn compiled(&self) -> u64 {
         self.order.borrow().len() as u64
+    }
+
+    /// Every set layout the pipelines built so far share.
+    #[must_use]
+    pub fn set_layouts(&self) -> Vec<Arc<SetLayout>> {
+        self.sets.borrow().values().cloned().collect()
     }
 
     /// The kernels whose pipelines were built after the first `from`, in
@@ -92,7 +119,14 @@ impl Pipelines {
                 .to_string(),
         })?;
         let cache = device.pipeline_cache();
-        let pipeline = Arc::new(build(device.core(), cache.handle(), file, key, code)?);
+        let pipeline = Arc::new(build(
+            device.core(),
+            cache.handle(),
+            &self.sets,
+            file,
+            key,
+            code,
+        )?);
         cache.built();
         self.order.borrow_mut().push(key);
         self.built.borrow_mut().insert(key, Arc::clone(&pipeline));
@@ -131,9 +165,53 @@ impl Pipelines {
     }
 }
 
+/// The set layout of `bindings` storage buffers from `sets`, made there
+/// where no pipeline before declared as many.
+fn set_layout(
+    core: &Arc<Core>,
+    sets: &RefCell<HashMap<u32, Arc<SetLayout>>>,
+    bindings: u32,
+) -> Result<Arc<SetLayout>> {
+    if let Some(held) = sets.borrow().get(&bindings) {
+        return Ok(Arc::clone(held));
+    }
+    let entries: Vec<vk::DescriptorSetLayoutBinding> = (0..bindings)
+        .map(|i| {
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(i)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+        })
+        .collect();
+    // On a device that rebinds a recording's pool segments, each binding
+    // may be written after a recording binds the set.
+    let flags = vec![vk::DescriptorBindingFlags::UPDATE_AFTER_BIND; entries.len()];
+    let mut binding_flags =
+        vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&flags);
+    let mut info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&entries);
+    if core.features.rebinds {
+        info = info
+            .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL)
+            .push_next(&mut binding_flags);
+    }
+    // SAFETY: `core.device` is live and the create info, `entries` and
+    // `flags` outlive the call; the update-after-bind flags are chained
+    // only where the device enabled the feature.
+    let layout = unsafe { core.device.create_descriptor_set_layout(&info, None) }
+    .map_err(|e| core.fault("vkCreateDescriptorSetLayout", e))?;
+    let held = Arc::new(SetLayout {
+        core: Arc::clone(core),
+        layout,
+    });
+    sets.borrow_mut().insert(bindings, Arc::clone(&held));
+    Ok(held)
+}
+
 fn build(
     core: &Arc<Core>,
     cache: vk::PipelineCache,
+    sets: &RefCell<HashMap<u32, Arc<SetLayout>>>,
     file: &'static str,
     key: &'static str,
     code: &[u8],
@@ -145,15 +223,7 @@ fn build(
     };
     let words = spirv::words(code).map_err(shader)?;
     let declared = spirv::declared(&words).map_err(shader)?;
-    let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..declared.bindings)
-        .map(|i| {
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(i)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE)
-        })
-        .collect();
+    let set = set_layout(core, sets, declared.bindings)?;
     let d = &core.device;
     // SAFETY: `d` is live; every create info and the arrays it borrows are
     // locals that outlive their call. `words` is SPIR-V that `spirv::words`
@@ -161,13 +231,7 @@ fn build(
     // copies; the subgroup size is chained only when the device can pin it.
     // Each failure path destroys exactly what was made before it.
     unsafe {
-        let set_layout = d
-            .create_descriptor_set_layout(
-                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
-                None,
-            )
-            .map_err(|e| core.fault("vkCreateDescriptorSetLayout", e))?;
-        let set_layouts = [set_layout];
+        let set_layouts = [set.layout];
         let ranges = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
             .offset(0)
@@ -178,10 +242,7 @@ fn build(
         }
         let layout = match d.create_pipeline_layout(&info, None) {
             Ok(l) => l,
-            Err(e) => {
-                d.destroy_descriptor_set_layout(set_layout, None);
-                return Err(core.fault("vkCreatePipelineLayout", e));
-            }
+            Err(e) => return Err(core.fault("vkCreatePipelineLayout", e)),
         };
         let module = match d
             .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)
@@ -189,7 +250,6 @@ fn build(
             Ok(m) => m,
             Err(e) => {
                 d.destroy_pipeline_layout(layout, None);
-                d.destroy_descriptor_set_layout(set_layout, None);
                 return Err(core.fault("vkCreateShaderModule", e));
             }
         };
@@ -215,7 +275,7 @@ fn build(
                 core: Arc::clone(core),
                 pipeline: pipelines[0],
                 layout,
-                set_layout,
+                set,
                 bindings: declared.bindings,
                 used: declared.used,
                 writable: declared.writable,
@@ -224,7 +284,6 @@ fn build(
             }),
             Err((_, e)) => {
                 d.destroy_pipeline_layout(layout, None);
-                d.destroy_descriptor_set_layout(set_layout, None);
                 Err(core.fault("vkCreateComputePipelines", e))
             }
         }

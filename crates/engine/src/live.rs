@@ -50,8 +50,9 @@ pub enum Tally {
     /// A frame or registration the engine refused.
     Refused,
     /// A fire at a rung the engine stated eager at load
-    /// ([`crate::chunk::ChunkFacts::eager_rungs`]): it ran uncaptured, as
-    /// stated.
+    /// ([`crate::chunk::ChunkFacts::eager_rungs`]), or of rows the engine
+    /// states it encodes each fire (Vulkan's prefill, mixed and masked
+    /// rows; every wgpu fire): it ran uncaptured, as stated.
     Eager,
     /// A pipeline, module or program built after ready: one a serving
     /// fire, a registration or a bind reached that the load did not build,

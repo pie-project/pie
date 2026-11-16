@@ -72,6 +72,13 @@ impl Session {
                         format!("{}.engine.eager_rungs_by_engine", model_name),
                         serde_json::Value::from(crate::engine::backend::eager_rungs()),
                     );
+                    // Why each engine encodes every fire, where it stated a
+                    // device or API limit at load: `engine.eager` counts
+                    // every fire there, as stated.
+                    stats.insert(
+                        format!("{}.engine.encodes_by_engine", model_name),
+                        serde_json::Value::from(crate::engine::backend::encodes()),
+                    );
 
                     let inf = crate::scheduler::get_stats().await;
                     stats.insert(

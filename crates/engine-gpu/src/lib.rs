@@ -17,6 +17,7 @@ pub mod guest;
 pub mod handles;
 pub mod inputs;
 pub mod kernel_profile;
+pub mod made;
 pub mod mask;
 pub mod named;
 pub mod naming;

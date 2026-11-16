@@ -123,6 +123,10 @@ pub struct Gpu<B: Host> {
     /// The guest pipelines built after the load as of the last count
     /// (`Programs::built_serving`).
     guest_built: u64,
+
+    /// The objects guest sessions made after ready, counted apart from
+    /// [`engine::live::Tally::BuiltAfterReady`].
+    session_made: u64,
 }
 
 impl<B: Host> Gpu<B> {
@@ -142,6 +146,7 @@ impl<B: Host> Gpu<B> {
             handed: None,
             live: engine::live::Live::armed(),
             guest_built: 0,
+            session_made: 0,
         }
     }
 
@@ -152,11 +157,10 @@ impl<B: Host> Gpu<B> {
     /// And the steps a backend that keeps recordings walked to keep: a body
     /// recorded at a serving fire, which the load should have recorded
     /// ([`engine::live::Tally::RecordedAfterReady`]).
-    /// And the steps walked and kept by no recording: each ran eagerly. On a
-    /// backend that keeps recordings that is a fire it should have replayed
-    /// (a split step, bindings a recording cannot hold:
-    /// [`engine::live::Tally::Unrecorded`]); on one that keeps none it is
-    /// every fire, as the backend states ([`engine::live::Tally::Eager`]).
+    /// And the steps walked and kept by no recording: each was encoded
+    /// afresh, as the load stated ([`engine::live::Tally::Eager`]): every
+    /// fire on a backend that keeps none, a fire outside the decode lattice
+    /// on one that keeps it.
     fn count_built(&mut self) {
         let built = self
             .shell
@@ -169,6 +173,33 @@ impl<B: Host> Gpu<B> {
                 engine = B::KIND,
                 kernel,
                 "a serving fire asked for a pipeline no walk of the load named, and built it"
+            );
+        }
+        // Each object the device made once the load served: one the load
+        // did not make. A guest session's own per-bind buffers are said
+        // apart (they move into the instance's memory on their own course).
+        let made = self
+            .shell
+            .as_ref()
+            .map_or_else(Vec::new, Shell::made_serving);
+        for creation in made {
+            if creation.session {
+                self.session_made += 1;
+                tracing::warn!(
+                    engine = B::KIND,
+                    what = creation.what,
+                    by = creation.by,
+                    made = self.session_made,
+                    "a guest session made this after ready"
+                );
+                continue;
+            }
+            self.live.tally(engine::live::Tally::BuiltAfterReady, 1);
+            tracing::error!(
+                engine = B::KIND,
+                what = creation.what,
+                by = creation.by,
+                "the device made this after ready, which the load did not make"
             );
         }
         let recorded = self.shell.as_mut().map_or(0, Shell::recorded_serving);
@@ -186,14 +217,13 @@ impl<B: Host> Gpu<B> {
             );
             self.guest_built = guest;
         }
+        // A fire walked and kept by no recording: one the backend encodes
+        // each fire from objects the load built, as the load stated (every
+        // fire on a backend that keeps none; prefill, mixed and masked rows
+        // where it keeps the decode lattice's).
         let unkept = self.shell.as_mut().map_or(0, Shell::unkept_serving);
         if unkept > 0 {
-            let tally = if B::RECORDS {
-                engine::live::Tally::Unrecorded
-            } else {
-                engine::live::Tally::Eager
-            };
-            self.live.tally(tally, unkept);
+            self.live.tally(engine::live::Tally::Eager, unkept);
         }
     }
 
@@ -560,8 +590,13 @@ where
         })
         .map_err(fault)?;
         self.programs.load(&place(&shell)).map_err(refusal)?;
+        // Every decode body serving fires is recorded here, before ready.
+        shell.arm().map_err(fault)?;
+        // Every pipeline is built: a pipeline cache is written once, here.
+        shell.loaded().map_err(fault)?;
         // What the load itself walked is the load's: serving counts from here.
         shell.unkept_serving();
+        shell.recorded_serving();
         // The fire the shell took, which a binding may have bounded below
         // the one asked.
         let (max_lanes, max_tokens) = (shell.budget().max_lanes, shell.budget().max_tokens);
@@ -767,6 +802,8 @@ where
         self.pending = None;
         // The frame before can no longer be asked for its rows.
         if let Some(shell) = self.shell.as_mut() {
+            // A frame is served: the load made everything it uses by now.
+            shell.serving();
             shell.open_frame();
         }
 

@@ -533,6 +533,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 },
                 d.engine_backend,
                 d.chunks.eager_rungs,
+                d.chunks.encodes,
             );
             // What the driver holds outside the engine's span is a load
             // fact: the policy's ledger takes it once.

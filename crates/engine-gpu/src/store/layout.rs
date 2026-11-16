@@ -468,6 +468,7 @@ impl Layout {
             shapes,
             act_chunks: act_chunks.to_vec(),
             eager_rungs: Vec::new(),
+            encodes: None,
             held_bytes: 0,
             outside_bytes: 0,
             host_chunks,

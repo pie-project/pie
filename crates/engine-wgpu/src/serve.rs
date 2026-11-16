@@ -93,6 +93,15 @@ impl Serve for Api {
         )
     }
 
+    /// wgpu encodes each fire; WebGPU has no compute replay.
+    fn encodes(_shelf: &Self::Shelf) -> Option<&'static str> {
+        Some("wgpu encodes each fire; WebGPU has no compute replay")
+    }
+
+    fn made(device: &Context) -> Option<&engine_gpu::made::Made> {
+        Some(device.made())
+    }
+
     fn compiled(pipelines: &Pipelines) -> u64 {
         pipelines.compiled()
     }

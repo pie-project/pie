@@ -62,6 +62,7 @@ impl Widen {
             });
         core.take_error("create_pipeline_layout")?;
 
+        core.made.note("pipeline", "guest widen");
         let pipeline = crate::guest::validated(&core, "create_compute_pipeline", || {
             let module = core
                 .device
@@ -123,6 +124,7 @@ impl Widen {
         let (cfg, cfg_at) = config;
         self.core.queue.write_buffer(cfg, cfg_at, &bytes);
 
+        self.core.made.note("bind group", "guest widen");
         let group = self
             .core
             .device

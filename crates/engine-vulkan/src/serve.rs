@@ -9,10 +9,18 @@ use poem_ir::Dtype;
 use crate::device::{Api, Buffer, Context, Frame, Pending, Pipelines};
 use engine_gpu::error::{Fault, Result};
 
+/// The debug switch that has a load keep no recording and encode every
+/// fire, as a device without `descriptorBindingStorageBufferUpdateAfterBind`
+/// does: so that path is tested where every device has the feature.
+const ENCODE_EVERY_FIRE: &str = "PIE_VULKAN_ENCODE_EVERY_FIRE";
+
 /// What the shell keeps of Vulkan's own: the frames kept to replay, and
 /// what each harvested step read out, for readers behind it on the queue.
 pub struct Shelf {
     recorder: crate::record::Recorder,
+
+    /// Each arm's readout tail: a replayed body's reads, copied behind it.
+    tails: crate::device::Tails,
 
     landed_seats: BTreeMap<u64, LandedSeat>,
 
@@ -95,6 +103,18 @@ impl Serve for Api {
         kernels_slang::Tier::Subgroup
     }
 
+    fn loaded(device: &Context) -> Result<()> {
+        device.persist_pipelines()
+    }
+
+    fn encodes(shelf: &Shelf) -> Option<&'static str> {
+        shelf.recorder.refused()
+    }
+
+    fn made(device: &Context) -> Option<&engine_gpu::made::Made> {
+        Some(device.made())
+    }
+
     fn compiled(pipelines: &Pipelines) -> u64 {
         pipelines.compiled()
     }
@@ -133,16 +153,31 @@ impl Serve for Api {
         }
     }
 
-    fn shelf(_device: &Context, _readout: &[Buffer], weights_stream: bool) -> Result<Shelf> {
+    fn shelf(device: &Context, readout: &[Buffer], weights_stream: bool) -> Result<Shelf> {
         // Every fire records whatever is resident: a row table's misses are
         // staged by the host before the fire, a routed expert's between the
         // segments of the recording its stage cut ([`Kept::replay_cut`]).
         Ok(Shelf {
             recorder: if weights_stream {
                 crate::record::Recorder::refusing("the weights plane streams")
+            } else if std::env::var_os(ENCODE_EVERY_FIRE).is_some() {
+                // The debug switch: the path a device without the feature
+                // below takes, on any device, to test it.
+                crate::record::Recorder::refusing(
+                    "PIE_VULKAN_ENCODE_EVERY_FIRE is set (the debug switch that takes the path \
+                     of a device without descriptorBindingStorageBufferUpdateAfterBind)",
+                )
+            } else if !device.rebinds() {
+                // A recording binds the pool's segments, which come and go
+                // while the load serves.
+                crate::record::Recorder::refusing(
+                    "the device writes no descriptor a recording binds \
+                     (descriptorBindingStorageBufferUpdateAfterBind)",
+                )
             } else {
                 crate::record::Recorder::new()
             },
+            tails: device.tails(readout.len())?,
             landed_seats: BTreeMap::new(),
             generation: 0,
         })
@@ -153,14 +188,37 @@ impl Serve for Api {
         None
     }
 
-    /// A Vulkan frame takes nothing of its own past its command buffer: its
-    /// scalars ride push constants and it stages nothing.
+    /// A Vulkan frame's scalars ride push constants and it stages nothing;
+    /// what it takes of its own is a descriptor set a dispatch. A frame
+    /// encoded each fire takes its sets from what this lays: for each set
+    /// layout the load's pipelines share, the most dispatches one fire
+    /// makes for each arm a fire can be in flight on.
     fn lay_frames(
-        _device: &Context,
-        _pipelines: &Pipelines,
-        _facts: engine_gpu::serve::FrameFacts,
+        device: &Context,
+        pipelines: &Pipelines,
+        facts: engine_gpu::serve::FrameFacts,
     ) -> Result<()> {
+        let started = std::time::Instant::now();
+        let count = (facts.dispatches as usize).saturating_mul(facts.arms.max(1) as usize);
+        device.lay_sets(pipelines, count)?;
+        tracing::info!(
+            sets = count,
+            layouts = pipelines.set_layouts().len(),
+            ms = started.elapsed().as_millis() as u64,
+            "a frame encoded each fire takes its descriptor sets from these, laid for each set \
+             layout: the most dispatches a fire makes, for each arm"
+        );
         Ok(())
+    }
+
+    /// Every recording's descriptors of a pool segment are written to the
+    /// segment's buffer, or its stand-in where it is not backed: a
+    /// recording stands across the pool's growth and shrink.
+    fn rebind(shell: &mut Shell<Api>) -> Result<()> {
+        let kept: Vec<&crate::device::Kept> = shell.shelf.recorder.kept().collect();
+        shell
+            .device
+            .rebind_segments(&shell.placed_segments(), &kept)
     }
 
     fn forget(shelf: &mut Shelf) {
@@ -173,85 +231,14 @@ impl Serve for Api {
         shelf.recorder.forget();
     }
 
+    /// A decode fire of the lattice the load armed replays the recording of
+    /// its composition at its arm, its reads copied behind it. One the load
+    /// armed none of (or armed over other bindings) is a bug: it is
+    /// recorded at this fire, said by name and counted
+    /// ([`engine::live::Tally::RecordedAfterReady`]). Every other fire (prefill, mixed and masked rows, unbounded) is
+    /// encoded afresh from the pipelines, layouts and descriptor sets the
+    /// load laid, and kept by nothing.
     fn plan(shell: &mut Shell<Api>, prepared: &mut Prepared<'_, Api>) -> Result<Plan<Api>> {
-        // A fire staging group masks binds what it stages for itself: not recorded.
-        // A fire landing snapshots binds a table of its own: not recorded.
-        let key = (shell.shelf.recorder.records()
-            && prepared.bindings.group_masks.is_empty()
-            && prepared.bindings.rs_snaps.is_none()
-            && (prepared.bindings.row_ring.is_some() || shell.row_caches.whole()))
-        .then(|| record_key(shell, prepared));
-
-        let replayable = key
-            .and_then(|key| shell.shelf.recorder.get(key))
-            .map(|replay| (replay.layout.clone(), replay.launches));
-        if let Some((rows, launches)) = replayable {
-            let key = key.expect("a recording was found under a key");
-            let pixels = shell.pixel_spans(prepared)?;
-            shell.shelf.generation = shell.shelf.generation.wrapping_add(1);
-            let seq = shell.airborne.enter();
-            let counts = shell.airborne.clone();
-            let done = prepared.done.take();
-            let recording = shell
-                .shelf
-                .recorder
-                .get(key)
-                .expect("the recording was there a line ago");
-            // The segments an expert stage cut, each landed before its stage.
-            let staged = if recording.cuts.is_empty() {
-                Ok(())
-            } else {
-                match shell.weights.host() {
-                    None => Err(Fault::Unbound {
-                        what: "the host copy of the weight cache's banks".to_string(),
-                    }),
-                    Some(host) => {
-                        let planes = shell.weights.cached_planes(|at| {
-                            shell.row_caches.streams(at) || shell.expert_caches.streams(at)
-                        });
-                        recording.cuts.iter().enumerate().try_for_each(|(at, cut)| {
-                            recording.kept.replay_cut(at)?;
-                            shell.expert_caches.stage_cut(host, &planes, cut)
-                        })
-                    }
-                }
-            };
-            let pending = staged.and_then(|()| {
-                recording
-                    .kept
-                    .replay(Some(Box::new(move |refused: Option<String>| {
-                        counts.leave();
-                        if let Some(done) = done.as_ref() {
-                            let outcome = match &refused {
-                                None => done.settled(),
-                                Some(why) => engine::StepOutcome::Faulted(format!(
-                                    "vulkan replay for frame {} step {}: {why}",
-                                    done.at.frame, done.at.step
-                                )),
-                            };
-                            (done.sink)(done.at, outcome);
-                        }
-                    })))
-            });
-            let pending = match pending {
-                Ok(pending) => pending,
-                Err(fault) => {
-                    shell.airborne.abandon();
-                    shell.handles.rewind();
-                    return Err(fault);
-                }
-            };
-            shell.advance(prepared, &pending);
-            shell.handles.rewind();
-            return Ok(Plan::Replayed {
-                pending,
-                seq,
-                rows,
-                launches,
-                pixels,
-            });
-        }
-
         // A split step is not recorded: a recording replays as one submit.
         let split_rows = shell
             .tuning
@@ -262,29 +249,166 @@ impl Serve for Api {
         let split = (split_rows > 0
             && prepared.seats.iter().map(|seat| seat.rows).sum::<u32>() >= split_rows)
             || prepared.bindings.voxels.is_some();
-        let keep = key.filter(|_| !split && shell.shelf.recorder.has_room());
-        if keep.is_some() {
-            let composition = composition_key(prepared);
-            let why = shell.shelf.recorder.why_kept(composition, prepared.arm);
-            tracing::info!(
-                arm = prepared.arm,
-                rung = ?prepared.rung,
-                lanes = prepared.lanes.len(),
-                why,
-                "a fire keeps a recording"
-            );
+        let point = shell
+            .lattice_point(prepared)
+            .filter(|_| shell.shelf.recorder.records() && !split);
+        let Some(point) = point else {
+            return Ok(Plan::Walk { keep: None, split });
+        };
+        let key = composition_key(prepared);
+        let binds = binding_key(shell, prepared);
+        let launches = match shell.shelf.recorder.get(key) {
+            Some(recording) if recording.binds == binds => recording.launches,
+            held => {
+                tracing::error!(
+                    arm = prepared.arm,
+                    class = point.class,
+                    lanes = point.lanes,
+                    why = if held.is_some() {
+                        "the load armed it over other bindings"
+                    } else {
+                        "the load armed no recording of it"
+                    },
+                    "a decode fire records its body while the load serves"
+                );
+                return Ok(Plan::Walk {
+                    keep: Some(key),
+                    split,
+                });
+            }
+        };
+        let rows = prepared.readout_layout().to_vec();
+        let pixels = shell.pixel_spans(prepared)?;
+        shell.shelf.generation = shell.shelf.generation.wrapping_add(1);
+        let seq = shell.airborne.enter();
+        let counts = shell.airborne.clone();
+        let done = prepared.done.take();
+        let recording = shell
+            .shelf
+            .recorder
+            .get(key)
+            .expect("the recording was there a line ago");
+        // The segments an expert stage cut, each landed before its stage.
+        let staged = if recording.cuts.is_empty() {
+            Ok(())
+        } else {
+            match shell.weights.host() {
+                None => Err(Fault::Unbound {
+                    what: "the host copy of the weight cache's banks".to_string(),
+                }),
+                Some(host) => {
+                    let planes = shell.weights.cached_planes(|at| {
+                        shell.row_caches.streams(at) || shell.expert_caches.streams(at)
+                    });
+                    recording.cuts.iter().enumerate().try_for_each(|(at, cut)| {
+                        recording.kept.replay_cut(at)?;
+                        shell.expert_caches.stage_cut(host, &planes, cut)
+                    })
+                }
+            }
+        };
+        let tail = staged.and_then(|()| {
+            shell.shelf.tails.record(
+                prepared.arm,
+                shell.readout_source()?,
+                &shell.readout[prepared.arm],
+                &regions(prepared),
+            )
+        });
+        let pending = tail.and_then(|tail| {
+            recording.kept.replay(
+                Some(&tail),
+                Some(Box::new(move |refused: Option<String>| {
+                    counts.leave();
+                    if let Some(done) = done.as_ref() {
+                        let outcome = match &refused {
+                            None => done.settled(),
+                            Some(why) => engine::StepOutcome::Faulted(format!(
+                                "vulkan replay for frame {} step {}: {why}",
+                                done.at.frame, done.at.step
+                            )),
+                        };
+                        (done.sink)(done.at, outcome);
+                    }
+                })),
+            )
+        });
+        let pending = match pending {
+            Ok(pending) => pending,
+            Err(fault) => {
+                shell.airborne.abandon();
+                shell.handles.rewind();
+                return Err(fault);
+            }
+        };
+        shell.advance(prepared, &pending);
+        shell.handles.rewind();
+        Ok(Plan::Replayed {
+            pending,
+            seq,
+            rows,
+            launches,
+            pixels,
+        })
+    }
+
+    /// Records a decode fire of the lattice the load arms, submitting
+    /// nothing: its body, without its reads, kept under its composition
+    /// and arm with the bindings it was walked over.
+    fn arm(shell: &mut Shell<Api>, prepared: &mut Prepared<'_, Api>) -> Result<bool> {
+        if !shell.shelf.recorder.records() {
+            return Ok(false);
         }
-        Ok(Plan::Walk { keep, split })
+        // The descriptors a recording binds of a segment are noted as the
+        // pool now places its segments.
+        shell.device.rebind_segments(&shell.placed_segments(), &[])?;
+        // A fire staging group masks or landing snapshots binds a table of
+        // its own; one over a streamed row table stages its misses.
+        if !prepared.bindings.group_masks.is_empty()
+            || prepared.bindings.rs_snaps.is_some()
+            || (prepared.bindings.row_ring.is_none() && !shell.row_caches.whole())
+        {
+            return Err(Fault::Unbound {
+                what: format!(
+                    "a recording of the decode fire of {} lane(s) at arm {}: it binds a table \
+                     a recording cannot hold",
+                    prepared.lanes.len(),
+                    prepared.arm
+                ),
+            });
+        }
+        let key = composition_key(prepared);
+        let binds = binding_key(shell, prepared);
+        let (frame, launches, cuts) = shell.walk_kept(prepared)?;
+        let kept = frame.into_kept()?;
+        // Each segment a flush cut must have an expert stage's host step
+        // to replay after it; a flush of anything else would not repeat.
+        if kept.cuts() != cuts.len() {
+            return Err(Fault::Unbound {
+                what: format!(
+                    "a recording of the decode fire of {} lane(s) at arm {}: it cut {} \
+                     segment(s), {} of them an expert stage's",
+                    prepared.lanes.len(),
+                    prepared.arm,
+                    kept.cuts(),
+                    cuts.len()
+                ),
+            });
+        }
+        shell
+            .shelf
+            .recorder
+            .insert(key, crate::record::Recording::new(kept, launches, cuts, binds));
+        Ok(true)
     }
 
     fn submit(
         shell: &mut Shell<Api>,
         frame: Frame,
-        _prepared: &mut Prepared<'_, Api>,
+        prepared: &mut Prepared<'_, Api>,
         launch: Launch<'_, Api>,
     ) -> Result<Pending> {
         let Launch {
-            layout,
             launches,
             cuts,
             keep,
@@ -308,16 +432,21 @@ impl Serve for Api {
                 }
             });
         match keep {
+            // A decode fire the load did not arm (a bug, counted).
             Some(key) => frame.into_kept().and_then(|kept| {
-                let pending = kept.replay(Some(on_done))?;
-                // Each segment a flush cut must have an expert stage's host
-                // step to replay after it; a flush of anything else would
-                // not repeat, so such a fire is not kept.
+                let tail = shell.shelf.tails.record(
+                    prepared.arm,
+                    shell.readout_source()?,
+                    &shell.readout[prepared.arm],
+                    &regions(prepared),
+                )?;
+                let pending = kept.replay(Some(&tail), Some(on_done))?;
                 if kept.cuts() == cuts.len() {
-                    shell.shelf.recorder.insert(
-                        key,
-                        crate::record::Recording::new(kept, layout.to_vec(), launches, cuts),
-                    );
+                    let binds = binding_key(shell, prepared);
+                    shell
+                        .shelf
+                        .recorder
+                        .insert(key, crate::record::Recording::new(kept, launches, cuts, binds));
                 }
                 Ok(pending)
             }),
@@ -386,11 +515,13 @@ impl Serve for Api {
     }
 }
 
-fn record_key(shell: &Shell<Api>, p: &Prepared<'_, Api>) -> crate::record::Key {
+/// A decode fire's composition and arm: what its recording is kept under.
+/// A recording binds its tables at their capacity (the kv pages' indices,
+/// the bindings and windows over them), and copies its reads behind it, so
+/// the fire's lanes' pages and reads are no part of it.
+fn composition_key(p: &Prepared<'_, Api>) -> crate::record::Key {
     let mut key = crate::record::KeyBuilder::new();
     key.bytes(&p.descriptor.pack());
-    key.shown(&p.arm);
-    key.shown(&shell.readout[p.arm].bytes());
     // The tables run to a slot per traced value; hashing them field by
     // field rather than through their debug text keeps a step's key off
     // the CPU's critical path (1.6 ms of a token on a phone's core).
@@ -398,33 +529,28 @@ fn record_key(shell: &Shell<Api>, p: &Prepared<'_, Api>) -> crate::record::Key {
     // The rung names where its carve and rooms lie in the span: a fire of
     // another rung binds other bytes under the same handles.
     key.shown(&p.rung);
-    key.hashed(&p.caches);
-    key.shown(&p.bindings);
-    key.shown(&p.windows);
-    // Not the fire's demand: the pool only checks it against what is
-    // committed (a commit forgets every recording), so a recording reads
-    // it nowhere, and the kv refs it counts climb as lanes grow.
-
-    for lane in p.lanes {
-        key.shown(&lane.readout);
-        key.shown(&lane.reads);
-    }
-
+    key.shown(&p.arm);
     key.finish()
 }
 
-/// A fire's composition: its key less its arm and the tables a fire
-/// states afresh (the kv pages, the bindings and windows over them).
-fn composition_key(p: &Prepared<'_, Api>) -> crate::record::Key {
+/// What a fire binds beside its composition: the cache table, the
+/// bindings and the windows. A decode fire of the lattice binds them as
+/// the load's recording of its composition did, which a replay checks.
+fn binding_key(shell: &Shell<Api>, p: &Prepared<'_, Api>) -> crate::record::Key {
+    let _ = shell;
     let mut key = crate::record::KeyBuilder::new();
-    key.bytes(&p.descriptor.pack());
-    key.hashed(&p.slots);
-    key.shown(&p.rung);
-    for lane in p.lanes {
-        key.shown(&lane.readout);
-        key.shown(&lane.reads);
-    }
+    key.hashed(&p.caches);
+    key.shown(&p.bindings);
+    key.shown(&p.windows);
     key.finish()
+}
+
+/// A fire's readout copies as the device copies regions.
+fn regions(p: &Prepared<'_, Api>) -> Vec<(u64, u64, u64)> {
+    p.readout_copies
+        .iter()
+        .map(|copy| (copy.from, copy.to, copy.bytes))
+        .collect()
 }
 
 /// An output a lane read out: its seat, offset, element count, dtype and name.

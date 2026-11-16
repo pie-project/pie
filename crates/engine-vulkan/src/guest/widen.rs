@@ -44,6 +44,14 @@ impl std::fmt::Debug for Widen {
 
 impl Widen {
     pub fn new(device: &Context) -> Result<Widen> {
+        let widen = Widen::built(device)?;
+        // A set for each config slot: at most that many widens are on the
+        // queue at once, so no frame of the load allocates one.
+        device.lay_set(widen.set_layout, SLOTS as usize)?;
+        Ok(widen)
+    }
+
+    fn built(device: &Context) -> Result<Widen> {
         let words = super::lower(usize::MAX, STORAGE_SOURCE, &LAYOUT).map_err(|why| {
             engine_gpu::error::Fault::Program {
                 at: "guest::widen",
@@ -60,6 +68,7 @@ impl Widen {
 
         let bindings = LAYOUT.map(|(at, slot)| binding(at, super::descriptor_type(slot)));
         let d = &core.device;
+        core.made.note("pipeline", "guest widen");
         // SAFETY: `d` is live; each create info and what it borrows are locals
         // that outlive the call, and `words` is the SPIR-V the guest compiler
         // lowered from `STORAGE_SOURCE`, whose three storage bindings the layout

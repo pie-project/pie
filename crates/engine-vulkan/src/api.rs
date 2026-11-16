@@ -113,14 +113,7 @@ impl Host for Api {
         Ok((ticket, step_pending))
     }
 
-    fn submitted(gpu: &Vulkan) {
-        #[cfg(feature = "vulkan")]
-        if let Some(shell) = gpu.shell.as_ref() {
-            shell.device().pipeline_cache().settle();
-        }
-        #[cfg(not(feature = "vulkan"))]
-        let _ = gpu;
-    }
+    fn submitted(_gpu: &Vulkan) {}
 
     /// Before the step resolves its inputs: the forward reads the cells a prologue put.
     fn run_prologues(gpu: &mut Vulkan, step: &Step) -> EngineResult<()> {

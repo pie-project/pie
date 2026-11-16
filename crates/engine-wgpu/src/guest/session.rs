@@ -237,6 +237,33 @@ impl Session {
         tables: &Tables<'_>,
         widen_slots: u64,
     ) -> Result<Session> {
+        engine_gpu::made::in_session(|| {
+            Session::made(
+                device,
+                plans,
+                code,
+                args,
+                library,
+                extents,
+                tables,
+                widen_slots,
+            )
+        })
+    }
+
+    /// [`Session::new`]: what it makes is the session's
+    /// ([`engine_gpu::made::in_session`]).
+    #[allow(clippy::too_many_arguments)]
+    fn made(
+        device: &Context,
+        plans: &[LaunchStagePlan],
+        code: &[engine_gpu::guest::Lowered],
+        args: &[StepArgs],
+        library: Arc<Library>,
+        extents: &Extents,
+        tables: &Tables<'_>,
+        widen_slots: u64,
+    ) -> Result<Session> {
         if code.len() != plans.len() || args.len() != plans.len() {
             return Err(Fault::Program {
                 at: "guest::session",
@@ -632,6 +659,7 @@ fn group(
     args: &Buffer,
 ) -> Result<wgpu::BindGroup> {
     let [descs, params, offs, cfg] = tables;
+    core.made.note("bind group", "guest stage");
     let group = core.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("pie guest"),
         layout: binds,

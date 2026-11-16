@@ -129,6 +129,8 @@ pub fn take_shapes() -> Vec<DispatchShape> {
 #[derive(Default)]
 struct Scratch {
     infos: Vec<ash::vk::DescriptorBufferInfo>,
+    /// Whether each binds its buffer whole: a pool segment is bound so.
+    wholes: Vec<bool>,
     writes_at: Vec<bool>,
     extents: Vec<u64>,
     push: Vec<u8>,
@@ -296,6 +298,7 @@ impl Sink<'_> {
         let scratch = &mut *scratch;
 
         scratch.infos.clear();
+        scratch.wholes.clear();
         scratch.writes_at.clear();
         scratch.extents.clear();
         scratch.push.clear();
@@ -318,6 +321,7 @@ impl Sink<'_> {
                                 .offset(0)
                                 .range(dummy.size),
                         );
+                        scratch.wholes.push(false);
                         writes_at.push(false);
                         extents.push(0);
                         continue;
@@ -349,6 +353,9 @@ impl Sink<'_> {
                             .offset(binding.offset())
                             .range(view),
                     );
+                    scratch
+                        .wholes
+                        .push(binding.offset() == 0 && view == binding.buffer().bytes());
                     writes_at.push(mutable);
                     extents.push(binding.extent());
                     self.frame.retain(binding.buffer().slab());
@@ -426,7 +433,7 @@ impl Sink<'_> {
         let cmd = self.frame.cmd();
         let set = self
             .frame
-            .descriptor_set(pipeline.set_layout)
+            .descriptor_set(pipeline.set.layout)
             .map_err(|fault| Sink::refuse(fire, fault))?;
         scratch.sets.clear();
         for (at, info) in infos.iter().enumerate().take(declared) {
@@ -440,6 +447,9 @@ impl Sink<'_> {
             // while `infos` is untouched; `sets` is cleared before `infos`
             // changes again on the next fire, and no one reads it in between.
             let info: &'static vk::DescriptorBufferInfo = unsafe { std::mem::transmute(info) };
+            if scratch.wholes[at] {
+                self.frame.note_binding(set, at as u32, info.buffer);
+            }
             scratch.sets.push(
                 vk::WriteDescriptorSet::default()
                     .dst_set(set)

@@ -60,6 +60,7 @@ impl Raw {
         {
             usage |= wgpu::BufferUsages::UNIFORM;
         }
+        core.made.note("buffer", owner.name);
         let buffer = core.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size,
@@ -189,6 +190,7 @@ impl Raw {
             return;
         }
         core.destroy_spent();
+        core.made.note("buffer", "read staging");
         let staging = core.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("pie read"),
             size: span,

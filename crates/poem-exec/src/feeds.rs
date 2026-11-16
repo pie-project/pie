@@ -564,3 +564,66 @@ pub fn writer_classes(trace: &Trace, compiled: &CompiledModel, value: ValueId) -
     }
     classes
 }
+
+/// Each class's requests, the plainest first.
+#[must_use]
+pub fn landing_requests(
+    facts: &poem_ir::Facts,
+    classes: &poem_ir::ClassTable,
+) -> Vec<Vec<poem_ir::Request>> {
+    let mut landing = vec![Vec::new(); classes.classes.len()];
+    for request in facts.requests() {
+        let word = facts.word(&request) & classes.mask;
+        if let Some(class) = classes.class_of(word) {
+            landing[class].push(request);
+        }
+    }
+    landing
+}
+
+/// The classes the lattice keys and arms: those a plain request lands in,
+/// and, on a model with a drafter (an output only drafting classes write,
+/// MTP's `mtp.drafts`), those writing it that a request plain but for
+/// reading its pass's drafts lands in (the drafter's verify).
+#[must_use]
+pub fn plain_of(
+    landing: &[Vec<poem_ir::Request>],
+    outputs: &[ClassOutput],
+) -> poem_ir::ClassSet {
+    let plain = |class: usize| landing[class].iter().any(poem_ir::Request::plain);
+    // An output's name no plain class writes: the drafter's (a name written
+    // by several value sets is one output a set).
+    let plain_names: std::collections::HashSet<&str> = outputs
+        .iter()
+        .filter(|out| (0..landing.len()).any(|c| plain(c) && out.classes.contains(c)))
+        .map(|out| out.decl.name.as_str())
+        .collect();
+    let drafter = |class: usize| {
+        outputs
+            .iter()
+            .any(|out| out.classes.contains(class) && !plain_names.contains(out.decl.name.as_str()))
+    };
+    poem_ir::ClassSet::of((0..landing.len()).filter(|&class| {
+        plain(class) || (landing[class].iter().any(drafts_only) && drafter(class))
+    }))
+}
+
+/// Whether only its query length and its reading the pass's drafts set
+/// this request apart.
+#[must_use]
+pub fn drafts_only(request: &poem_ir::Request) -> bool {
+    request.drafts() && request.departures() == usize::from(request.query_len() != 1) + 1
+}
+
+#[must_use]
+pub fn decoding_of(landing: &[Vec<poem_ir::Request>]) -> poem_ir::ClassSet {
+    poem_ir::ClassSet::of(
+        landing
+            .iter()
+            .enumerate()
+            .filter(|(_, requests)| {
+                !requests.is_empty() && requests.iter().all(|request| request.query_len() == 1)
+            })
+            .map(|(class, _)| class),
+    )
+}

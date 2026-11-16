@@ -136,6 +136,10 @@ impl Context {
     pub fn frame(&self) -> Result<Frame> {
         match self.never {}
     }
+
+    pub fn made(&self) -> &engine_gpu::made::Made {
+        match self.never {}
+    }
 }
 
 pub struct Frame {

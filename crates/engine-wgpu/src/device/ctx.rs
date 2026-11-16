@@ -181,6 +181,8 @@ pub(crate) struct Core {
     /// `[engine.memory] budget_device`: what the load takes, all of it
     /// together. The environment reports no memory size, so it is stated.
     pub(crate) budget: u64,
+    /// What the device makes once the load serves.
+    pub(crate) made: engine_gpu::made::Made,
 }
 
 impl Core {
@@ -235,6 +237,7 @@ impl Core {
     /// A buffer outside any slab, entered in the books under `owner` while
     /// it stands.
     pub(crate) fn held(&self, descriptor: &wgpu::BufferDescriptor<'_>, owner: Owner) -> Held {
+        self.made.note("buffer", owner.name);
         let buffer = self.device.create_buffer(descriptor);
         self.books.take(owner, buffer.size());
         Held {
@@ -610,6 +613,7 @@ impl Context {
             books: Arc::new(engine_gpu::Books::new()),
             subgroup_min,
             budget,
+            made: engine_gpu::made::Made::default(),
         });
         let dummy = Raw::new(
             &core,
@@ -629,6 +633,12 @@ impl Context {
 
     pub(crate) fn core(&self) -> &Arc<Core> {
         &self.core
+    }
+
+    /// What the device made once the load served.
+    #[must_use]
+    pub fn made(&self) -> &engine_gpu::made::Made {
+        &self.core.made
     }
 
     /// The offset alignment a storage buffer binds at.

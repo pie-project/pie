@@ -191,6 +191,84 @@ pub(crate) struct Core {
     pub(crate) discrete: bool,
     pub(crate) api_version: u32,
     pub(crate) features: Enabled,
+    /// What the device makes once the load serves.
+    pub(crate) made: engine_gpu::made::Made,
+    /// The descriptor sets frames bind ([`Sets`]).
+    pub(crate) sets: Mutex<Sets>,
+    /// The pool's segment buffers and their stand-ins, by raw handle, each
+    /// to its segment: a kept frame notes each descriptor binding one, to
+    /// rebind it when the segment is backed or given back.
+    pub(crate) segments: Mutex<std::collections::HashMap<u64, u32>>,
+}
+
+/// The descriptor sets of the device's frames, from pools it holds for its
+/// life: a frame encoded once takes its sets from `free`, which a load lays
+/// for every frame it can have in flight ([`Context::lay_sets`]), and gives
+/// them back when it lands; a kept frame holds its own for the recording's
+/// life, drawn from `fresh`. A frame past what was laid allocates, which
+/// the device notes ([`engine_gpu::made::Made`]).
+#[derive(Default)]
+pub(crate) struct Sets {
+    pools: Vec<vk::DescriptorPool>,
+    free: std::collections::HashMap<u64, Vec<vk::DescriptorSet>>,
+    fresh: std::collections::HashMap<u64, Vec<vk::DescriptorSet>>,
+}
+
+impl Sets {
+    /// `count` sets of `layout`, from the last pool or a new one.
+    fn allocate(
+        &mut self,
+        core: &Core,
+        layout: vk::DescriptorSetLayout,
+        count: usize,
+    ) -> Result<Vec<vk::DescriptorSet>> {
+        let d = &core.device;
+        let layouts = vec![layout; count];
+        if let Some(&pool) = self.pools.last() {
+            let info = vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(pool)
+                .set_layouts(&layouts);
+            // SAFETY: the sets lock is held, which is the external sync the
+            // pool needs; `layout` is a live layout of `d`.
+            if let Ok(sets) = unsafe { d.allocate_descriptor_sets(&info) } {
+                core.made.note("descriptor sets", "frame");
+                return Ok(sets);
+            }
+        }
+        let sizes = [
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(BUFFERS_PER_POOL),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(SETS_PER_POOL),
+        ];
+        let flags = if core.features.rebinds {
+            vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND
+        } else {
+            vk::DescriptorPoolCreateFlags::empty()
+        };
+        // SAFETY: `d` is live and the create info is complete.
+        let pool = unsafe {
+            d.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .flags(flags)
+                    .max_sets(SETS_PER_POOL)
+                    .pool_sizes(&sizes),
+                None,
+            )
+        }
+        .map_err(|e| core.fault("vkCreateDescriptorPool", e))?;
+        core.made.note("descriptor pool", "frame");
+        self.pools.push(pool);
+        let info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(pool)
+            .set_layouts(&layouts);
+        core.made.note("descriptor sets", "frame");
+        // SAFETY: as above, under the sets lock, from the fresh pool.
+        unsafe { d.allocate_descriptor_sets(&info) }
+            .map_err(|e| core.fault("vkAllocateDescriptorSets", e))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -205,6 +283,13 @@ pub struct Enabled {
     pub memory_budget: bool,
 
     pub coopmat: bool,
+
+    /// A descriptor of a set a recording binds may be written after it is
+    /// recorded (`descriptorBindingStorageBufferUpdateAfterBind`): a
+    /// recording's pool segments are rebound when they are backed or given
+    /// back ([`Context::rebind_segments`]), so it stands for the load's
+    /// life. Without it the device keeps no recording.
+    pub rebinds: bool,
 }
 
 impl Core {
@@ -400,6 +485,10 @@ impl Drop for Core {
             for pool in pools.into_values() {
                 self.device.destroy_command_pool(pool, None);
             }
+            let sets = std::mem::take(self.sets.get_mut().expect("sets lock poisoned"));
+            for pool in sets.pools {
+                self.device.destroy_descriptor_pool(pool, None);
+            }
             // The instance is the process's (`shared_instance`).
             self.device.destroy_device(None);
         }
@@ -443,11 +532,7 @@ pub struct PipelineCache {
     cache: vk::PipelineCache,
     path: Option<std::path::PathBuf>,
     changed: std::sync::atomic::AtomicBool,
-    written: Mutex<std::time::Instant>,
 }
-
-/// How long a changed cache waits for more builds before it is written.
-const PIPELINE_CACHE_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl PipelineCache {
     fn open(core: &Arc<Core>, path: Option<std::path::PathBuf>) -> Result<PipelineCache> {
@@ -471,7 +556,6 @@ impl PipelineCache {
             cache,
             path,
             changed: std::sync::atomic::AtomicBool::new(false),
-            written: Mutex::new(std::time::Instant::now()),
         })
     }
 
@@ -490,25 +574,12 @@ impl PipelineCache {
         self.changed.store(true, Ordering::Release);
     }
 
-    /// Writes a changed cache once builds have paused for a moment.
-    pub fn settle(&self) {
-        let due = self.changed.load(Ordering::Acquire)
-            && self
-                .written
-                .lock()
-                .expect("written lock poisoned")
-                .elapsed()
-                >= PIPELINE_CACHE_SETTLE;
-        if due && let Err(fault) = self.persist() {
-            tracing::warn!(%fault, "writing the pipeline cache");
-        }
-    }
-
+    /// Writes the cache where a build changed it: once the load has built
+    /// every pipeline it serves with, and when the device drops.
     pub fn persist(&self) -> Result<()> {
         if !self.changed.swap(false, Ordering::AcqRel) {
             return Ok(());
         }
-        *self.written.lock().expect("written lock poisoned") = std::time::Instant::now();
         let Some(path) = &self.path else {
             return Ok(());
         };
@@ -785,6 +856,7 @@ impl Context {
                 && f12.shader_float16 == vk::TRUE
                 && f12.vulkan_memory_model == vk::TRUE
                 && (pinned == Some(32) || subgroup.subgroup_size == 32),
+            rebinds: f12.descriptor_binding_storage_buffer_update_after_bind == vk::TRUE,
         };
         if !enabled.shader_int16 || !enabled.storage_16bit {
             bail!(Fault::NoDevice {
@@ -806,7 +878,8 @@ impl Context {
                 f12.uniform_and_storage_buffer8_bit_access == vk::TRUE,
             )
             .vulkan_memory_model(f12.vulkan_memory_model == vk::TRUE)
-            .vulkan_memory_model_device_scope(f12.vulkan_memory_model_device_scope == vk::TRUE);
+            .vulkan_memory_model_device_scope(f12.vulkan_memory_model_device_scope == vk::TRUE)
+            .descriptor_binding_storage_buffer_update_after_bind(enabled.rebinds);
         let mut e13 = vk::PhysicalDeviceVulkan13Features::default()
             .subgroup_size_control(enabled.subgroup_size_control)
             .synchronization2(f13.synchronization2 == vk::TRUE);
@@ -943,6 +1016,9 @@ impl Context {
             discrete: props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU,
             api_version: props.api_version,
             features: enabled,
+            made: engine_gpu::made::Made::default(),
+            sets: Mutex::new(Sets::default()),
+            segments: Mutex::new(std::collections::HashMap::new()),
         });
 
         let dummy = Raw::new(
@@ -964,6 +1040,117 @@ impl Context {
 
     pub(crate) fn core(&self) -> &Arc<Core> {
         &self.core
+    }
+
+    /// What the device made once the load served.
+    #[must_use]
+    pub fn made(&self) -> &engine_gpu::made::Made {
+        &self.core.made
+    }
+
+    /// Writes the pipeline cache where a build changed it: once the load
+    /// has built every pipeline it serves with.
+    pub fn persist_pipelines(&self) -> Result<()> {
+        self.pipeline_cache().persist()
+    }
+
+    /// Whether a recording's descriptors can be rebound after it is
+    /// recorded ([`Enabled::rebinds`]).
+    #[must_use]
+    pub fn rebinds(&self) -> bool {
+        self.core.features.rebinds
+    }
+
+    /// States the pool's segments: for each, the buffer backing it (or
+    /// `None`) and its stand-in. Each kept frame's descriptor of a segment
+    /// is written to its buffer, or its stand-in where it is not backed;
+    /// every frame that reads them has landed (the pool drains first).
+    pub fn rebind_segments(
+        &self,
+        segments: &[(Option<&Buffer>, &Buffer)],
+        kept: &[&Kept],
+    ) -> Result<()> {
+        let bound: Vec<vk::Buffer> = segments
+            .iter()
+            .map(|(backed, stand_in)| backed.unwrap_or(stand_in).slab().buffer)
+            .collect();
+        {
+            let mut held = self.core.segments.lock().expect("segments lock poisoned");
+            held.clear();
+            for (at, (backed, stand_in)) in segments.iter().enumerate() {
+                let at = u32::try_from(at).unwrap_or(u32::MAX);
+                held.insert(vk::Handle::as_raw(stand_in.slab().buffer), at);
+                if let Some(backed) = backed {
+                    held.insert(vk::Handle::as_raw(backed.slab().buffer), at);
+                }
+            }
+        }
+        let infos: Vec<vk::DescriptorBufferInfo> = bound
+            .iter()
+            .map(|&buffer| {
+                vk::DescriptorBufferInfo::default()
+                    .buffer(buffer)
+                    .offset(0)
+                    .range(vk::WHOLE_SIZE)
+            })
+            .collect();
+        let mut writes: Vec<vk::WriteDescriptorSet<'_>> = Vec::new();
+        let rebinds: Vec<Vec<(vk::DescriptorSet, u32, u32)>> = kept
+            .iter()
+            .map(|kept| kept.inner.rebinds.lock().expect("rebinds lock poisoned").clone())
+            .collect();
+        for (set, binding, segment) in rebinds.iter().flatten() {
+            let info = infos.get(*segment as usize).ok_or_else(|| Fault::Unbound {
+                what: format!("pool segment {segment}, past the {} stated", infos.len()),
+            })?;
+            writes.push(
+                vk::WriteDescriptorSet::default()
+                    .dst_set(*set)
+                    .dst_binding(*binding)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(std::slice::from_ref(info)),
+            );
+        }
+        if writes.is_empty() {
+            return Ok(());
+        }
+        if !self.core.features.rebinds {
+            return Err(Fault::Unbound {
+                what: "a recording's pool segments rebound on a device that writes no \
+                       descriptor after it is bound"
+                    .to_string(),
+            });
+        }
+        // SAFETY: every set was allocated with an update-after-bind layout
+        // from an update-after-bind pool (the device rebinds), and no
+        // submission that binds it is pending: the pool drained first.
+        unsafe { self.core.device.update_descriptor_sets(&writes, &[]) };
+        Ok(())
+    }
+
+    /// Lays `count` descriptor sets of each set layout `pipelines` share,
+    /// for frames encoded once to take ([`Sets`]).
+    pub fn lay_sets(&self, pipelines: &super::Pipelines, count: usize) -> Result<()> {
+        for set in pipelines.set_layouts() {
+            self.lay_set(set.layout, count)?;
+        }
+        Ok(())
+    }
+
+    /// Lays `count` descriptor sets of `layout` past what is laid already.
+    pub(crate) fn lay_set(&self, layout: vk::DescriptorSetLayout, count: usize) -> Result<()> {
+        use ash::vk::Handle;
+        let core = &self.core;
+        let key = layout.as_raw();
+        let mut sets = core.sets.lock().expect("sets lock poisoned");
+        loop {
+            let have = sets.free.get(&key).map_or(0, Vec::len);
+            if have >= count {
+                return Ok(());
+            }
+            let batch = sets.allocate(core, layout, (count - have).min(SETS_PER_BATCH))?;
+            sets.free.entry(key).or_default().extend(batch);
+        }
     }
 
     #[must_use]
@@ -1230,11 +1417,12 @@ impl Context {
                 cuts: Mutex::new(Vec::new()),
                 cmd_pool: pool,
                 fence,
-                pools: Mutex::new(Vec::new()),
+                taken: Mutex::new(Vec::new()),
+                kept: !one_time,
+                rebinds: Mutex::new(Vec::new()),
                 keep: Mutex::new(Vec::new()),
                 submitted: std::sync::atomic::AtomicBool::new(false),
                 timing: Mutex::new(timing),
-                spare: Mutex::new(std::collections::HashMap::new()),
             }),
             open: true,
             kept: !one_time,
@@ -1272,14 +1460,19 @@ pub(crate) struct Inner {
     pub(crate) cmd_pool: vk::CommandPool,
     pub(crate) fence: vk::Fence,
 
-    pub(crate) pools: Mutex<Vec<vk::DescriptorPool>>,
+    /// The descriptor sets the frame took, by layout, given back to the
+    /// device's [`Sets`] when it drops.
+    taken: Mutex<Vec<(u64, vk::DescriptorSet)>>,
+    /// Kept to replay: its sets are a recording's, from `Sets::fresh`.
+    kept: bool,
+    /// A kept frame's descriptors that bind a pool segment: the set, the
+    /// binding and the segment ([`Context::rebind_segments`]).
+    pub(crate) rebinds: Mutex<Vec<(vk::DescriptorSet, u32, u32)>>,
 
     pub(crate) keep: Mutex<Vec<Slab>>,
     submitted: std::sync::atomic::AtomicBool,
 
     pub(crate) timing: Mutex<Option<Timing>>,
-
-    spare: Mutex<std::collections::HashMap<u64, Vec<vk::DescriptorSet>>>,
 }
 
 impl Inner {
@@ -1310,9 +1503,7 @@ impl Drop for Inner {
             if self.submitted.load(Ordering::Acquire) {
                 let _ = d.wait_for_fences(&[self.fence], true, FENCE_TIMEOUT_NS);
             }
-            for pool in self.pools.get_mut().expect("pools lock poisoned").drain(..) {
-                d.destroy_descriptor_pool(pool, None);
-            }
+            self.give_back_sets();
             if let Some(timing) = self.timing.get_mut().expect("timing lock poisoned").take() {
                 d.destroy_query_pool(timing.pool, None);
             }
@@ -1428,6 +1619,32 @@ impl Frame {
         self.inner.cmd()
     }
 
+    /// Notes that `set`'s `binding` binds `buffer` whole: where the frame is
+    /// kept and `buffer` is a pool segment's (or its stand-in), the binding
+    /// is rebound as the segment is backed or given back. A view into a
+    /// segment (the activation span lies in the last) is no segment's
+    /// binding.
+    pub(crate) fn note_binding(&self, set: vk::DescriptorSet, binding: u32, buffer: vk::Buffer) {
+        if !self.kept {
+            return;
+        }
+        let segment = self
+            .inner
+            .core
+            .segments
+            .lock()
+            .expect("segments lock poisoned")
+            .get(&vk::Handle::as_raw(buffer))
+            .copied();
+        if let Some(segment) = segment {
+            self.inner
+                .rebinds
+                .lock()
+                .expect("rebinds lock poisoned")
+                .push((set, binding, segment));
+        }
+    }
+
     pub(crate) fn barrier_owed(&self, reads: &[Span], writes: &[Span]) -> bool {
         let mut hazards = self.hazards.borrow_mut();
         let owed = hazards.owed(reads, writes);
@@ -1461,62 +1678,34 @@ impl Frame {
     ) -> Result<vk::DescriptorSet> {
         use ash::vk::Handle;
         let core = &self.inner.core;
-        let d = &core.device;
         let key = layout.as_raw();
-        {
-            let mut spare = self.inner.spare.lock().expect("spare lock poisoned");
-            if let Some(set) = spare.get_mut(&key).and_then(Vec::pop) {
-                return Ok(set);
-            }
-        }
-        let layouts = [layout; SETS_PER_BATCH];
-        let mut pools = self.inner.pools.lock().expect("pools lock poisoned");
-        let mut got: Option<Vec<vk::DescriptorSet>> = None;
-        if let Some(&pool) = pools.last() {
-            let info = vk::DescriptorSetAllocateInfo::default()
-                .descriptor_pool(pool)
-                .set_layouts(&layouts);
-            // SAFETY: the `pools` lock is held, which is the external sync
-            // the descriptor pool needs; `layout` is a live layout of `d`.
-            got = unsafe { d.allocate_descriptor_sets(&info) }.ok();
-        }
-        let mut sets = match got {
-            Some(sets) => sets,
+        let mut sets = core.sets.lock().expect("sets lock poisoned");
+        let held = if self.inner.kept {
+            &mut sets.fresh
+        } else {
+            &mut sets.free
+        };
+        let set = match held.get_mut(&key).and_then(Vec::pop) {
+            Some(set) => set,
             None => {
-                let sizes = [vk::DescriptorPoolSize::default()
-                    .ty(vk::DescriptorType::STORAGE_BUFFER)
-                    .descriptor_count(BUFFERS_PER_POOL)];
-                // SAFETY: `d` is live and the create info is complete.
-                let pool = unsafe {
-                    d.create_descriptor_pool(
-                        &vk::DescriptorPoolCreateInfo::default()
-                            .max_sets(SETS_PER_POOL)
-                            .pool_sizes(&sizes),
-                        None,
-                    )
-                }
-                .map_err(|e| core.fault("vkCreateDescriptorPool", e))?;
-                pools.push(pool);
-                let info = vk::DescriptorSetAllocateInfo::default()
-                    .descriptor_pool(pool)
-                    .set_layouts(&layouts);
-                // SAFETY: as above, under the `pools` lock, from the fresh pool.
-                unsafe { d.allocate_descriptor_sets(&info) }
-                    .map_err(|e| core.fault("vkAllocateDescriptorSets", e))?
+                let mut batch = sets.allocate(core, layout, SETS_PER_BATCH)?;
+                let one = batch.pop().expect("a batch of one or more");
+                let held = if self.inner.kept {
+                    &mut sets.fresh
+                } else {
+                    &mut sets.free
+                };
+                held.entry(key).or_default().extend(batch);
+                one
             }
         };
-        drop(pools);
-        let one = sets.pop().expect("a batch of one or more");
-        if !sets.is_empty() {
-            self.inner
-                .spare
-                .lock()
-                .expect("spare lock poisoned")
-                .entry(key)
-                .or_default()
-                .extend(sets);
-        }
-        Ok(one)
+        drop(sets);
+        self.inner
+            .taken
+            .lock()
+            .expect("taken lock poisoned")
+            .push((key, set));
+        Ok(set)
     }
 
     pub fn copy(
@@ -1884,8 +2073,11 @@ impl Kept {
         unsafe { d.reset_fences(&[self.inner.fence]) }.map_err(|e| core.fault("vkResetFences", e))
     }
 
+    /// Submits the kept frame's last segment, and `tail` behind it in the
+    /// same submission: what the fence signals covers both.
     pub fn replay(
         &self,
+        tail: Option<&Tail<'_>>,
         on_done: Option<Box<dyn Fn(Option<String>) + Send + 'static>>,
     ) -> Result<Pending> {
         let core = &self.inner.core;
@@ -1908,11 +2100,16 @@ impl Kept {
             .map_err(|e| core.fault("vkResetFences", e))?;
         let at = crate::encode::profiling().then(std::time::Instant::now);
         {
-            let bufs = [self.inner.cmd()];
-            let submits = [vk::SubmitInfo::default().command_buffers(&bufs)];
+            let bufs: &[vk::CommandBuffer] = match tail {
+                Some(tail) => &[self.inner.cmd(), tail.cmd],
+                None => &[self.inner.cmd()],
+            };
+            let submits = [vk::SubmitInfo::default().command_buffers(bufs)];
             let queue = core.queue.lock().expect("queue lock poisoned");
             // SAFETY: `cmd` is executable and no longer pending, the fence is
-            // unsignaled, and the queue is held under its lock.
+            // unsignaled, and the queue is held under its lock. A tail was
+            // ended by `Tails::record` and is not pending: its arm's last
+            // submission landed before the arm was free to record it.
             unsafe { d.queue_submit(*queue, &submits, self.inner.fence) }
                 .map_err(|e| core.fault("vkQueueSubmit", e))?;
         }
@@ -1932,6 +2129,170 @@ impl Kept {
             });
         }
         Ok(pending)
+    }
+}
+
+/// A command buffer for each arm, allocated at load from a pool of their
+/// own, that lands a replayed body's reads in the arm's readout seat: a
+/// body is recorded without its reads, and each replay re-records its
+/// arm's tail with the fire's copies and submits it behind the body.
+pub struct Tails {
+    core: Arc<Core>,
+    pool: vk::CommandPool,
+    cmds: Vec<vk::CommandBuffer>,
+}
+
+/// One arm's tail, recorded for one replay ([`Kept::replay`]).
+pub struct Tail<'t> {
+    cmd: vk::CommandBuffer,
+    _tails: std::marker::PhantomData<&'t Tails>,
+}
+
+impl std::fmt::Debug for Tails {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Tails").field("arms", &self.cmds.len()).finish()
+    }
+}
+
+impl Context {
+    /// A tail for each of `arms` arms ([`Tails`]).
+    pub fn tails(&self, arms: usize) -> Result<Tails> {
+        let core = &self.core;
+        let d = &core.device;
+        // SAFETY: `d` is live and `family` is its queue family.
+        let pool = unsafe {
+            d.create_command_pool(
+                &vk::CommandPoolCreateInfo::default()
+                    .queue_family_index(core.family)
+                    .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                None,
+            )
+        }
+        .map_err(|e| core.fault("vkCreateCommandPool", e))?;
+        let count = u32::try_from(arms.max(1)).unwrap_or(u32::MAX);
+        // SAFETY: `pool` was just made here and nothing else holds it.
+        let cmds = unsafe {
+            d.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(count),
+            )
+        };
+        match cmds {
+            Ok(cmds) => Ok(Tails {
+                core: Arc::clone(core),
+                pool,
+                cmds,
+            }),
+            Err(e) => {
+                // SAFETY: the pool holds nothing and nothing else names it.
+                unsafe { d.destroy_command_pool(pool, None) };
+                Err(core.fault("vkAllocateCommandBuffers", e))
+            }
+        }
+    }
+}
+
+impl Tails {
+    /// Records arm `arm`'s tail to copy each `(source_at, into_at, len)`
+    /// region of `source` into `into` once every command before it on the
+    /// queue has written, a host-mapped `into` made visible to the host.
+    /// The arm's last submission has landed: an arm is taken until its
+    /// fire is harvested.
+    pub fn record(
+        &self,
+        arm: usize,
+        source: &Buffer,
+        into: &Buffer,
+        regions: &[(u64, u64, u64)],
+    ) -> Result<Tail<'_>> {
+        let cmd = *self.cmds.get(arm).ok_or_else(|| Fault::Unbound {
+            what: format!("arm {arm}'s readout tail, past the {} laid", self.cmds.len()),
+        })?;
+        let regions: Vec<vk::BufferCopy> = regions
+            .iter()
+            .filter(|&&(_, _, len)| len > 0)
+            .map(|&(source_at, into_at, len)| {
+                source.span(source_at, len)?;
+                into.span(into_at, len)?;
+                Ok(vk::BufferCopy::default()
+                    .src_offset(source_at)
+                    .dst_offset(into_at)
+                    .size(len))
+            })
+            .collect::<Result<_>>()?;
+        let read_back = into.is_host();
+        let d = &self.core.device;
+        let core = &self.core;
+        // SAFETY: `cmd` came from this tails' pool, made with
+        // `RESET_COMMAND_BUFFER`, and is not pending (its arm's last
+        // submission landed); only the serving thread records tails. Both
+        // buffers are live slabs of this device that outlive the load's
+        // fires, and every region was checked to lie inside them.
+        unsafe {
+            d.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
+                .map_err(|e| core.fault("vkResetCommandBuffer", e))?;
+            d.begin_command_buffer(
+                cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )
+            .map_err(|e| core.fault("vkBeginCommandBuffer", e))?;
+            if !regions.is_empty() {
+                let before = vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+                d.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[before],
+                    &[],
+                    &[],
+                );
+                d.cmd_copy_buffer(cmd, source.slab().buffer, into.slab().buffer, &regions);
+                let (host_stage, host_read) = if read_back {
+                    (vk::PipelineStageFlags::HOST, vk::AccessFlags::HOST_READ)
+                } else {
+                    (vk::PipelineStageFlags::empty(), vk::AccessFlags::empty())
+                };
+                let after = vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(
+                        vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE | host_read,
+                    );
+                d.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER | host_stage,
+                    vk::DependencyFlags::empty(),
+                    &[after],
+                    &[],
+                    &[],
+                );
+            }
+            d.end_command_buffer(cmd)
+                .map_err(|e| core.fault("vkEndCommandBuffer", e))?;
+        }
+        Ok(Tail {
+            cmd,
+            _tails: std::marker::PhantomData,
+        })
+    }
+}
+
+impl Drop for Tails {
+    fn drop(&mut self) {
+        let d = &self.core.device;
+        let queue = self.core.queue.lock().expect("queue lock poisoned");
+        // SAFETY: the queue is idle once the wait returns, so no tail is
+        // pending; the pool and its buffers are this value's alone.
+        unsafe {
+            let _ = d.queue_wait_idle(*queue);
+            d.destroy_command_pool(self.pool, None);
+        }
     }
 }
 
@@ -1967,11 +2328,35 @@ impl Pending {
             crate::encode::credit_fence(at.elapsed().as_nanos() as u64);
         }
         self.inner.harvest_timing();
+        // The frame has landed: a frame encoded once gives its sets back
+        // now, before whoever still holds it lets it go.
+        if !self.inner.kept {
+            self.inner.give_back_sets();
+        }
         Ok(())
     }
 }
 
 impl Inner {
+    /// Gives the sets the frame took back to the device's [`Sets`]: a kept
+    /// frame's to `fresh`, another's to `free`. The frame has landed or was
+    /// never submitted.
+    fn give_back_sets(&self) {
+        let taken = std::mem::take(&mut *self.taken.lock().expect("taken lock poisoned"));
+        if taken.is_empty() {
+            return;
+        }
+        let mut sets = self.core.sets.lock().expect("sets lock poisoned");
+        let back = if self.kept {
+            &mut sets.fresh
+        } else {
+            &mut sets.free
+        };
+        for (layout, set) in taken {
+            back.entry(layout).or_default().push(set);
+        }
+    }
+
     fn harvest_timing(&self) {
         let mut slot = self.timing.lock().expect("timing lock poisoned");
         let Some(timing) = slot.as_mut() else {

@@ -82,6 +82,7 @@ impl Library {
             })
             .collect();
         let d = &core.device;
+        core.made.note("pipeline layout", "guest library");
         // SAFETY: `d` is live; the create infos and what they borrow are
         // locals that outlive their calls; the set layout is destroyed if
         // the pipeline layout is refused.
@@ -475,8 +476,29 @@ impl std::fmt::Debug for Session {
 }
 
 impl Session {
+    /// A bind's session: what its construction makes is the session's
+    /// ([`engine_gpu::made::in_session`]).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        device: &Context,
+        plans: &[LaunchStagePlan],
+        code: &[engine_gpu::guest::Lowered],
+        args: &[StepArgs],
+        extents: &Extents,
+        library: &Arc<Library>,
+        kept: Kept,
+        channels: Vec<engine::channel::ChannelId>,
+        tables: &Tables<'_>,
+    ) -> Result<Session> {
+        engine_gpu::made::in_session(|| {
+            Session::made(
+                device, plans, code, args, extents, library, kept, channels, tables,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn made(
         device: &Context,
         plans: &[LaunchStagePlan],
         code: &[engine_gpu::guest::Lowered],
@@ -557,6 +579,7 @@ impl Session {
         let pool = if stages.is_empty() {
             vk::DescriptorPool::null()
         } else {
+            core.made.note("descriptor pool", "guest session");
             // SAFETY: `core.device` is live and the create info and `sizes`
             // outlive the call.
             unsafe {
@@ -596,6 +619,7 @@ impl Session {
             // SAFETY: `&mut self` owns the pool, so its external sync holds;
             // it was sized for one set per stage and this runs once, at
             // construction. The layout is the stage's live set layout.
+            self.core.made.note("descriptor sets", "guest session");
             let set = unsafe {
                 let layouts = [self.set_layout];
                 d.allocate_descriptor_sets(
@@ -815,17 +839,21 @@ impl Session {
 
     /// A read-back buffer of its own for a pass that lands after the next
     /// one is recorded.
+    /// It is the session's: what it makes is noted as the session's
+    /// ([`engine_gpu::made::in_session`]).
     pub fn lend_landing(&mut self, device: &Context, stage: usize) -> Result<Buffer> {
         let bytes = self.stages[stage].landing.bytes();
         let spare = self.landings.lock().expect("landings lock poisoned").pop();
         match spare {
             Some(buffer) if buffer.bytes() >= bytes => Ok(buffer),
-            _ => Buffer::with(
-                device,
-                bytes,
-                Memory::Host,
-                engine_gpu::books::owners::GUEST,
-            ),
+            _ => engine_gpu::made::in_session(|| {
+                Buffer::with(
+                    device,
+                    bytes,
+                    Memory::Host,
+                    engine_gpu::books::owners::GUEST,
+                )
+            }),
         }
     }
 
@@ -1071,15 +1099,19 @@ pub struct StepArgs {
 }
 
 impl StepArgs {
+    /// A program's first bind makes them, as the session's
+    /// ([`engine_gpu::made::in_session`]).
     pub fn of(device: &Context, lowered: &engine_gpu::guest::Lowered) -> Result<StepArgs> {
         let stride = step_stride(device.core().limits.min_uniform_buffer_offset_alignment);
         let uniforms = step_uniforms(&lowered.steps, stride);
-        let mut buffer = Buffer::with(
-            device,
-            uniforms.len() as u64,
-            Memory::Host,
-            engine_gpu::books::owners::GUEST,
-        )?;
+        let mut buffer = engine_gpu::made::in_session(|| {
+            Buffer::with(
+                device,
+                uniforms.len() as u64,
+                Memory::Host,
+                engine_gpu::books::owners::GUEST,
+            )
+        })?;
         buffer.write(0, &uniforms)?;
         Ok(StepArgs { buffer, stride })
     }

@@ -1015,6 +1015,7 @@ impl Pools {
             shapes,
             act_chunks: self.act_chunks.clone(),
             eager_rungs: Vec::new(),
+            encodes: None,
             held_bytes: 0,
             outside_bytes: 0,
             host_chunks: 0,

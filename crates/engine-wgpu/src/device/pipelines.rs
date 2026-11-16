@@ -404,6 +404,7 @@ impl Pipelines {
                 }),
             });
         }
+        core.made.note("bind group", pipeline.name);
         let group = core.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(pipeline.name),
             layout: &pipeline.layout,

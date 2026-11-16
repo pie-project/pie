@@ -78,6 +78,14 @@ pub struct ChunkFacts {
     /// The runtime reads it for the model status only; it changes no cut.
     #[serde(default)]
     pub eager_rungs: Vec<u32>,
+    /// Why the engine encodes every fire afresh from objects its load
+    /// built, rather than replaying the decode bodies it recorded: a device
+    /// or API limit it states once at load (a Vulkan device without
+    /// `descriptorBindingStorageBufferUpdateAfterBind`; WebGPU, which has
+    /// no compute replay). `None`: it replays what the load armed. The
+    /// runtime reads it for the model status only.
+    #[serde(default)]
+    pub encodes: Option<String>,
     /// Bytes of the chunks stated here that the engine holds back for its
     /// fires and bodies: the runtime's pool takes no more than the range
     /// less this. A load fact the runtime seeds the pool's hold-back from;
@@ -520,6 +528,7 @@ impl ChunkFacts {
             shapes,
             act_chunks: Vec::new(),
             eager_rungs: Vec::new(),
+            encodes: None,
             held_bytes: 0,
             outside_bytes: 0,
             span_backed_on_demand: false,
