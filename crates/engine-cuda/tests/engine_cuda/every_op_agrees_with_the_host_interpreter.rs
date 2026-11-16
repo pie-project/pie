@@ -522,12 +522,21 @@ fn body(tag: u8, p: &mut Prog, r: u32, w: u32) {
             let idx = p.input_dims(&plane, Dtype::I32, Gen::Index(w));
             let y = p.op(Op::Gather { src: flat, idx });
             p.output(y, &plane, Dtype::U32, exact, "elements by index");
+            // A mask's rows by a parent index, as a beam carries its mask.
+            let mask = p.input_dims(&plane, Dtype::Bool, Gen::Bool);
+            let idx = p.input_dims(&[r], Dtype::I32, Gen::Index(r));
+            let y = p.op(Op::Gather { src: mask, idx });
+            p.output(y, &plane, Dtype::Bool, exact, "bool rows by index");
         }
         tags::GATHER_ROW => {
             let src = p.input_dims(&plane, f, Gen::Signed);
             let idx = p.input_dims(&[r], Dtype::I32, Gen::Index(w));
             let y = p.op(Op::GatherRow { src, idx });
             p.output(y, &[r], f, exact, "each row's pick");
+            let src = p.input_dims(&plane, Dtype::Bool, Gen::Bool);
+            let idx = p.input_dims(&[r], Dtype::I32, Gen::Index(w));
+            let y = p.op(Op::GatherRow { src, idx });
+            p.output(y, &[r], Dtype::Bool, exact, "each row's bool pick");
         }
         tags::SCATTER_ADD | tags::SCATTER_SET => {
             let op = |base, idx, vals| {
