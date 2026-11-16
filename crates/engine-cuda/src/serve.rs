@@ -1035,7 +1035,44 @@ impl Shell {
     /// their rows held at the top of its programs' span.
     #[must_use]
     pub fn captured(&self) -> (u32, u64) {
-        self.programs.captured()
+        let (lanes, _, bytes) = self.programs.captured();
+        (u32::try_from(lanes.len()).unwrap_or(u32::MAX), bytes)
+    }
+
+    /// The last fire's capturing lanes' rows, read back where it laid them:
+    /// each one's lane in the fire, its key row and its page row (none where
+    /// no lane of it captured). The next fire lays its own over them.
+    pub fn score_rows(&mut self) -> Result<Vec<(u32, Vec<f32>, Vec<f32>)>> {
+        self.device.synchronize()?;
+        let (lanes, base, _) = self.programs.captured();
+        let lanes = lanes.to_vec();
+        let captures = &self.exports.captures;
+        let (context, pages) = (captures.context as usize, captures.pages as usize);
+        let read = |at: u64, floats: usize| -> Result<Vec<f32>> {
+            let mut out = vec![0f32; floats];
+            crate::device::alloc::copy_any(
+                self.device.stream(),
+                out.as_mut_ptr() as u64,
+                at,
+                floats * 4,
+            )?;
+            self.device.synchronize()?;
+            Ok(out)
+        };
+        let n = lanes.len();
+        let keys = read(base, n * context)?;
+        let summed = read(base + (n * context * 4) as u64, n * pages)?;
+        Ok(lanes
+            .into_iter()
+            .enumerate()
+            .map(|(row, lane)| {
+                (
+                    lane,
+                    keys[row * context..][..context].to_vec(),
+                    summed[row * pages..][..pages].to_vec(),
+                )
+            })
+            .collect())
     }
 
     /// The most lanes one fire carries: the load's lanes, or fewer where

@@ -96,3 +96,4 @@ mod masked_axis;
 mod no_shell_reads_the_environment;
 mod routed_experts_stream;
 mod the_operators_fraction_sizes_the_pool;
+mod the_score_rows_are_the_oracles;
