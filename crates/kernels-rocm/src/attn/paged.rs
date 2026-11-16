@@ -241,10 +241,10 @@ pub fn decode(
     // The matrix-core decode takes a group within one 16-column tile; a
     // wider group takes the vector decode.
     let blocks = (info.padded_batch_size as u32).saturating_mul(shape.num_kv_heads);
-    let (entry, threads) = if group <= 16 && shape.head_dim >= 512 && !info.split_kv {
-        // An unsplit batch at the widest heads fills the grid: the decode
-        // whose columns split over its wavefronts keeps more blocks a CU
-        // (and their reads) in flight.
+    let (entry, threads) = if group <= 16 && shape.head_dim >= 512 {
+        // The widest heads split their columns over the wavefronts: a lane
+        // holding a 512-wide row's every column spills into scratch, which
+        // the HIP runtime allocates late and a load refuses.
         (
             format!(
                 "::pie::attn::paged_decode_cols<{}, {group}, {hnd}, {fp8}>",
@@ -257,21 +257,17 @@ pub fn decode(
         // (`PVM`), whose staged value rows hold four wavefronts' rounds at
         // 256-wide heads.
         let pvm = group >= 8 && shape.head_dim <= 256;
-        // Four wavefronts at 512-wide heads; below, eight, or four (three
-        // or four blocks a CU, not one) once the grid is two blocks a CU.
-        let waves = if shape.head_dim >= 512
-            || blocks >= 2 * plan.device.num_sm
-            || (pvm && shape.head_dim > 128)
-        {
+        // Eight wavefronts, or four (three or four blocks a CU, not one)
+        // once the grid is two blocks a CU.
+        let waves = if blocks >= 2 * plan.device.num_sm || (pvm && shape.head_dim > 128) {
             4
         } else {
             8
         };
         (
             format!(
-                "::pie::attn::paged_decode_mfma<{}, {group}, {hnd}, {waves}, {}, {pvm}, {fp8}>",
-                shape.head_dim,
-                shape.head_dim < 512
+                "::pie::attn::paged_decode_mfma<{}, {group}, {hnd}, {waves}, true, {pvm}, {fp8}>",
+                shape.head_dim
             ),
             64 * waves,
         )
