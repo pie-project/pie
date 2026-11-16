@@ -146,6 +146,8 @@ pub struct Handles {
     pub packings: Vec<PackingHandles>,
     pub inputs: Vec<(u32, Tensor)>,
     pub voxels: Option<VoxelHandles>,
+    /// The fire's capture table, where a lane of it captures scores.
+    pub capture: Option<Tensor>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -208,6 +210,8 @@ pub struct Fire<'a> {
     pub group_of_lane: &'a [i32],
     pub packings: &'a [PackingFire<'a>],
     pub voxels: Option<VoxelFire<'a>>,
+    /// The capture table (`Scored::table`), empty where no lane captures.
+    pub capture: &'a [i32],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -256,6 +260,9 @@ pub struct Inputs<B: Backend> {
     packings: Vec<PackingAt>,
     seats: Vec<SeatAt>,
     voxels: Option<VoxelAt>,
+    /// The capture table's ints, laid where the trace captures scores:
+    /// `TABLE_INTS` for each of a fire's lanes at most.
+    capture: Option<(u64, u64)>,
     /// Staged apart from the store: their size is the groups', not the load's.
     group_masks: Option<B::Buffer>,
     /// Smaller ones it outgrew, kept: an earlier fire may still read them.
@@ -286,6 +293,7 @@ impl<B: Backend> Inputs<B> {
         selections: usize,
         voxel: Option<VoxelSeat>,
         pieces: u32,
+        capture: bool,
     ) -> Result<Inputs<B>> {
         let pieces = pieces.max(1);
         let rows = u64::from(budget.max_tokens);
@@ -376,6 +384,10 @@ impl<B: Backend> Inputs<B> {
                 seat,
             }
         });
+        let capture = capture.then(|| {
+            let ints = lanes * u64::from(kernels_slang::attn::score::TABLE_INTS);
+            (take(ints * 4), ints)
+        });
         let total = at;
 
         let store = B::Buffer::host(device, total, crate::books::owners::INPUTS)?;
@@ -405,6 +417,7 @@ impl<B: Backend> Inputs<B> {
             packings,
             seats,
             voxels,
+            capture,
             group_masks: None,
             outgrown: Vec::new(),
         })
@@ -554,6 +567,31 @@ impl<B: Backend> Inputs<B> {
             .write(self.request_of_token, bytes_of(fire.request_of_token))?;
         self.store
             .write(self.slot_of_row, bytes_of(fire.slot_of_row))?;
+        let capture = if fire.capture.is_empty() {
+            None
+        } else {
+            let Some((at, ints)) = self.capture else {
+                return Err(Fault::Unbound {
+                    what: "the capture table, which this load laid no room for: its trace \
+                           captures no scores"
+                        .to_string(),
+                });
+            };
+            if fire.capture.len() as u64 > ints {
+                return Err(Fault::Ceiling {
+                    what: "capture table ints in one fire",
+                    need: fire.capture.len() as u64,
+                    have: ints,
+                });
+            }
+            self.store.write(at, bytes_of(fire.capture))?;
+            Some(i32s(
+                handles,
+                &self.store,
+                at,
+                u32::try_from(fire.capture.len()).unwrap_or(u32::MAX),
+            )?)
+        };
         let rs_tables = match (fire.rs_replay, fire.rs_commit) {
             (Some(replay), Some(commit)) => {
                 if replay.len() != lanes as usize || commit.len() != lanes as usize {
@@ -955,6 +993,7 @@ impl<B: Backend> Inputs<B> {
             packings,
             inputs,
             voxels,
+            capture,
         })
     }
 
