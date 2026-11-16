@@ -26,11 +26,6 @@ pub fn fp8_w8a8_capable() -> bool {
         .is_some_and(|cc| cc >= 89)
 }
 
-/// The fewest routes a block-FP8 select takes [`select_fp8_w8a8`] at, and
-/// the rows of a dense plane [`matmul_fp8_w8a8`] takes, between a decode's
-/// register-held W8A16 kernels and a prefill's widened cuBLAS GEMM.
-pub const FP8_W8A8_FROM: u32 = 64;
-
 pub const FP8_W8A8_DENSE: core::ops::RangeInclusive<u32> = 33..=256;
 
 /// Under an expert table an expert's atom-laid exponents are a run of their
