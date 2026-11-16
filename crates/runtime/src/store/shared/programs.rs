@@ -708,7 +708,7 @@ pub async fn take_raise(
             }
             Some(at)
                 if pool.pool().act_chunks(at) <= pool.pool().act_reserved()
-                    || pool.raising().is_some() =>
+                    || pool.awaiting_notice().is_some() =>
             {
                 None
             }
@@ -768,7 +768,7 @@ pub async fn carry_raise(
             "the engine refused the carve for rung {to}: {error}"
         ));
     }
-    shared.lock().unwrap().raise_carved();
+    shared.lock().unwrap().rung_told();
     Ok(())
 }
 
@@ -778,7 +778,7 @@ pub async fn carry_raise(
 /// ([`SharedPool::widest_fit`]). Where the span falls short, the room is
 /// asked of `funder` as a rung raise's is, then the raise taken (nothing
 /// moves: idle cache in the widened span is cleared first, and live state
-/// never lies there) and the engine's carve backed before this returns. Where fires are cut wider than the widest
+/// never lies there) and the engine's notice taken before this returns. Where fires are cut wider than the widest
 /// rung that fits, or the engine holds a wider rung than that
 /// ([`SharedPool::told_unfit`]), it waits on the walk to cut them and
 /// bring the engine down ([`super::SharedGrow`], asked to look at once:
@@ -802,7 +802,7 @@ pub async fn fund_span(
         let watch = super::rung_watch(engine);
         tokio::pin!(watch);
         watch.as_mut().enable();
-        let (short, raising, goal, cut) = {
+        let (short, awaiting, goal, cut) = {
             let pool = shared.lock().unwrap();
             let rows = cap();
             let fires = pool.rung_for(rows);
@@ -816,7 +816,7 @@ pub async fn fund_span(
             });
             (
                 short,
-                pool.raising().is_some(),
+                pool.awaiting_notice().is_some(),
                 goal,
                 rows <= pool.lifted(fires),
             )
@@ -828,11 +828,11 @@ pub async fn fund_span(
             watch.await;
             continue;
         };
-        if short == 0 && !raising && cut {
+        if short == 0 && !awaiting && cut {
             return Ok(());
         }
-        if raising || short == 0 {
-            // A raise's carve is the engine's to back, or the walk is to cut
+        if awaiting || short == 0 {
+            // A raise's notice is the engine's to take, or the walk is to cut
             // fires to the widest rung that fits: either tells the rung.
             if !cut {
                 super::ask_walk(engine);

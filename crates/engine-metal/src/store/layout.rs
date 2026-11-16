@@ -487,6 +487,7 @@ impl Layout {
             // A mapped placement heap is resident whether touched or not:
             // the span is backed as fires and lent state need it.
             span_backed_on_demand: !self.act().is_empty(),
+            tells_rungs: false,
             // The load pins the range below the segment the largest rung's
             // carve starts in (`Pool::reserve`): a carve reaches no lower
             // (`Pool::cover`), with its guests' terms.

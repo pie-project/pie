@@ -365,7 +365,7 @@ pub fn raise_now(shared: &Shared, engine: usize, rows: u32) {
     }
     // The rung holds `goal` now: fires may take its width, once a raise's
     // carve is the engine's.
-    if pool.raising().is_some() {
+    if pool.awaiting_notice().is_some() {
         return;
     }
     let cap = lifted(goal);
@@ -749,10 +749,9 @@ pub struct SharedPool {
     records_most: u32,
     /// Chunks one working set takes at the longest context.
     least_chunks: u32,
-    /// A raise is applied here and its chunks' copy is not yet the
-    /// engine's: no fire is let past the rung held before it
-    /// ([`Self::raise_applied`]).
-    raising: Option<u32>,
+    /// A raise is applied here and its notice is not yet the engine's: no
+    /// fire is let past the rung held before it ([`Self::raise_applied`]).
+    awaiting_notice: Option<u32>,
     /// The activation set aside before the raise whose copy is the
     /// engine's to take: what a refused raise goes back to.
     raise_from: Option<u32>,
@@ -765,6 +764,9 @@ pub struct SharedPool {
     /// [`Self::told`] before the raise whose copy is the engine's to take:
     /// what a refused raise goes back to.
     told_from: Option<u32>,
+    /// The engine is told every rung change (`ChunkFacts::tells_rungs`, or
+    /// its span backed on demand): [`Self::tells_rungs`].
+    tells_rungs: bool,
     /// The engine refused the last `commit_span`: no span segment is asked
     /// again until room is freed ([`Self::block_span_commit`]).
     span_commit_blocked: bool,
@@ -979,12 +981,11 @@ impl SharedPool {
             span_on_demand: facts.span_backed_on_demand,
             act_span: facts.act_span_chunks,
         });
-        // The span backed from the load: the pool starts at the largest
-        // rung. Backed on demand: at the smallest, the one the engine backs
-        // at load; passes raise it through `Engine::set_rung` as fires need.
-        if !facts.span_backed_on_demand
-            && let Some(&(rung, _)) = facts.act_chunks.last()
-        {
+        // An engine told rungs starts at the smallest, the rung it lays its
+        // fires by at load; passes raise it through `Engine::set_rung` as
+        // fires need. One that is not: at the largest.
+        let tells_rungs = facts.tells_rungs || facts.span_backed_on_demand;
+        if !tells_rungs && let Some(&(rung, _)) = facts.act_chunks.last() {
             pool.set_rung(rung)
                 .expect("an empty pool takes its largest rung");
         }
@@ -1005,10 +1006,11 @@ impl SharedPool {
             free_records: BTreeSet::new(),
             records_most: 0,
             least_chunks: 0,
-            raising: None,
+            awaiting_notice: None,
             raise_from: None,
             told: 0,
             told_from: None,
+            tells_rungs,
             span_commit_blocked: false,
             programs: programs::ProgramFires::default(),
         };
@@ -1561,9 +1563,12 @@ impl SharedPool {
     /// where the raise leaves it another rung than it holds and it is told
     /// rungs ([`Self::tells_rungs`]): decided here, in the hold that takes
     /// the raise. No fire is let past the rung held before until the engine
-    /// has backed the wider rung's carve ([`Self::raise_carved`]); it may
-    /// refuse ([`Self::raise_refused`]). A raise at the rung the engine
-    /// holds (a guest term grew under it) owes none.
+    /// has taken the notice ([`Self::rung_told`]): its fires are laid by
+    /// the rung it holds, so none of the wider rung may reach it first. One
+    /// lane trip; where the span is backed from the load nothing is backed
+    /// or refused by it. On a span backed on demand the engine backs its
+    /// carve there and may refuse ([`Self::raise_refused`]). A raise at the
+    /// rung the engine holds (a guest term grew under it) owes none.
     pub fn raise_applied(&mut self, raise: &RungRaise) -> Result<Option<(u32, u32)>, RungError> {
         let before = self.pool.rung();
         let act = self.pool.act_reserved();
@@ -1572,7 +1577,7 @@ impl SharedPool {
             self.tell(raise.rung);
             return Ok(None);
         }
-        self.raising = Some(self.raising.map_or(before, |held| held.min(before)));
+        self.awaiting_notice = Some(self.awaiting_notice.map_or(before, |held| held.min(before)));
         self.raise_from = Some(self.raise_from.map_or(act, |held| held.min(act)));
         self.told_from.get_or_insert(self.told);
         Ok(self.tell(raise.rung))
@@ -1648,7 +1653,7 @@ impl SharedPool {
     }
 
     /// The cap fires start at: the rung the pool starts at, lifted. The
-    /// largest's (no cap) unless the span is backed on demand, where fires
+    /// largest's (no cap) unless the engine is told rungs, where fires
     /// start cut to the smallest rung until a raise reaches the engine.
     #[must_use]
     pub fn start_cap(&self) -> u32 {
@@ -1656,15 +1661,18 @@ impl SharedPool {
     }
 
     /// Whether every rung change is told the engine (`Engine::set_rung`):
-    /// the span is backed on demand. A change is a move to another rung
-    /// than the engine holds ([`Self::told`]).
+    /// it says so (`ChunkFacts::tells_rungs`, its fires laid by the rung it
+    /// holds), or its span is backed on demand. Its own fact, whatever
+    /// backs the span: on a span backed from the load the notice moves
+    /// bookkeeping only. A change is a move to another rung than the
+    /// engine holds ([`Self::told`]).
     #[must_use]
     pub fn tells_rungs(&self) -> bool {
-        self.pool.span_on_demand()
+        self.tells_rungs
     }
 
-    /// The engine refused a raise (its carve for the wider rung): the raise
-    /// is taken back, the activation the rung in hand's. Fires stay cut to
+    /// The engine refused a raise's notice (on a span backed on demand, its
+    /// carve for the wider rung): the raise is taken back, the activation the rung in hand's. Fires stay cut to
     /// it; a later raise may try again. Nothing faults.
     pub fn raise_refused(&mut self) {
         if let Some(act) = self.raise_from.take() {
@@ -1673,21 +1681,22 @@ impl SharedPool {
         if let Some(told) = self.told_from.take() {
             self.told = told;
         }
-        self.raising = None;
+        self.awaiting_notice = None;
     }
 
-    /// The engine backed a raise's carve: fires may take the raised rung.
-    pub fn raise_carved(&mut self) {
-        self.raising = None;
+    /// The engine took a raise's notice (`Engine::set_rung`): fires may take
+    /// the raised rung.
+    pub fn rung_told(&mut self) {
+        self.awaiting_notice = None;
         self.raise_from = None;
         self.told_from = None;
     }
 
-    /// The rung fires may not pass while a raise's carve is the engine's to
-    /// back; `None` when none is.
+    /// The rung fires may not pass while a raise's notice is the engine's to
+    /// take (one lane trip); `None` when none is.
     #[must_use]
-    pub fn raising(&self) -> Option<u32> {
-        self.raising
+    pub fn awaiting_notice(&self) -> Option<u32> {
+        self.awaiting_notice
     }
 
     /// What raising the activation to `rung` takes: nothing moves; refused

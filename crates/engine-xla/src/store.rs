@@ -979,6 +979,7 @@ impl Pools {
             .collect();
         ChunkFacts {
             span_backed_on_demand: false,
+            tells_rungs: false,
             act_span_chunks: None,
             chunk_bytes: self.layout.chunk_bytes,
             // The sink lies past the stated range: the runtime never names it.

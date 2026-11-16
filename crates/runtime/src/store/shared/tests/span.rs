@@ -50,7 +50,7 @@ pub(super) fn on_demand_pool() -> (SharedPool, FakeEngine) {
         Some((16, 2048)),
         "the engine is told the rung it did not hold"
     );
-    pool.raise_carved();
+    pool.rung_told();
     assert_eq!(pool.told(), 2048);
     (pool, engine)
 }
@@ -283,7 +283,7 @@ async fn a_move_free_raise_reaches_an_on_demand_engine_and_can_be_refused() {
         let pool = shared.lock().unwrap();
         assert_eq!(pool.rung(), 256, "the rung in hand");
         assert_eq!(pool.pool().act_reserved(), 4);
-        assert!(pool.raising().is_none());
+        assert!(pool.awaiting_notice().is_none());
         pool.pool().check();
     }
     assert!(engine.lock().unwrap().calls.is_empty());
@@ -295,7 +295,7 @@ async fn a_move_free_raise_reaches_an_on_demand_engine_and_can_be_refused() {
     assert_eq!(engine.lock().unwrap().calls, [Call::Rung(256, 2048)]);
     let pool = shared.lock().unwrap();
     assert_eq!(pool.rung(), 2048);
-    assert!(pool.raising().is_none());
+    assert!(pool.awaiting_notice().is_none());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -685,4 +685,74 @@ async fn a_promised_grow_the_walk_does_not_make_is_told_as_no_grow() {
         1,
         "nothing promised: nothing told"
     );
+}
+
+/// An engine told rungs whose span is backed from the load (Metal with its
+/// span at load, `tells_rungs` its own fact): it starts at the smallest
+/// rung and hears every raise and lower (`Engine::set_rung`), and that is
+/// all it hears: no span segment is committed or released, nothing is
+/// backed by a raise. A guest term the top rung's span cannot seat with
+/// it is cut to the widest rung that can, as on any engine.
+#[tokio::test(flavor = "current_thread")]
+async fn an_engine_told_rungs_on_a_span_backed_at_load_hears_each_rung_and_nothing_else() {
+    let mut facts = facts();
+    facts.tells_rungs = true;
+    assert!(!facts.span_backed_on_demand);
+    let mut pool = SharedPool::new(&facts, 256).unwrap();
+    assert!(pool.tells_rungs(), "its own fact, the span backed at load");
+    assert_eq!(pool.rung(), 16, "it starts at the smallest rung");
+    assert_eq!(pool.told(), 16);
+    assert_eq!(pool.start_cap(), 16, "fires start cut to it");
+    let mut engine = FakeEngine::new();
+    assert_eq!(
+        walk_segments(&mut pool, 8, 0, &mut engine),
+        Retarget::Reached
+    );
+    let mapped = pool.mapped_segments();
+    engine.calls.clear();
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    let engine = Arc::new(Mutex::new(engine));
+
+    // The raise: the engine hears it before any fire of the wider rung.
+    let raised = take_raise(&shared, |_| 2048, &Lane(engine.clone()))
+        .await
+        .unwrap();
+    assert!(raised.is_some());
+    assert_eq!(engine.lock().unwrap().calls, [Call::Rung(16, 2048)]);
+    {
+        let pool = shared.lock().unwrap();
+        assert_eq!(pool.rung(), 2048);
+        assert_eq!(pool.told(), 2048);
+        assert!(pool.awaiting_notice().is_none(), "the notice was taken");
+        assert_eq!(pool.mapped_segments(), mapped, "nothing backed by it");
+    }
+
+    // The lower: its notice, past the retire fence.
+    let notice = shared.lock().unwrap().lower_rung(256).unwrap();
+    assert_eq!(notice, Some((2048, 256)));
+    engine.lock().unwrap().set_rung(2048, 256).unwrap();
+    assert_eq!(
+        engine.lock().unwrap().calls,
+        [Call::Rung(16, 2048), Call::Rung(2048, 256)],
+        "rung notices and nothing else: no span commit or release"
+    );
+    {
+        let mut pool = shared.lock().unwrap();
+        assert_eq!(
+            pool.next_move(8, 1),
+            None,
+            "no span segment to back or give back"
+        );
+        assert_eq!(pool.mapped_segments(), mapped);
+    }
+
+    // A guest term the top rung's span cannot seat with the largest rung
+    // (12 + 3 of 12): the widest rung that fits it, 256 (4 + 3).
+    {
+        let mut pool = shared.lock().unwrap();
+        pool.pool_mut().set_standing(3 * CHUNK);
+        assert_eq!(pool.widest_fit(), Some(256));
+        assert_eq!(pool.fit_cap(), 256);
+        assert_eq!(pool.rung_for(5000), 256);
+    }
 }
