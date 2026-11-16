@@ -820,10 +820,10 @@ impl GemmProgram {
         (self.c, self.r + self.tape)
     }
 
-    /// The step's rows, all classes.
+    /// The step's rows: every request's, all classes.
     #[must_use]
     pub fn step_rows(&self) -> u32 {
-        self.l.class_rows.iter().map(|c| c.0).sum()
+        self.l.request_rows() * self.l.batch.max(1)
     }
 }
 
@@ -1540,7 +1540,7 @@ pub fn compile_program(
                     let w = *s.last().unwrap_or(&1);
                     Ok((d.len() / w.max(1), w, d))
                 })?;
-                let file = format!("h2d/e{k}.npy");
+                let file = format!("h2d/{k}.npy");
                 crate::npy::write_f32(
                     &out.join(&file),
                     &shape[..shape.len().saturating_sub(1)],
@@ -1600,7 +1600,7 @@ pub fn compile_program(
     let host = json!({
         "model": p.l.trace.name, "reading": p.l.reading, "classes": classes, "outs": outs.clone(),
         "w": e.w, "h": e.h, "h2d": h2d, "d2h": d2h, "refs": [],
-        "round16": p.l.round16, "causal": p.l.shape.attn.causal,
+        "round16": p.l.round16, "causal": p.l.shape.attn.causal, "batch": p.l.batch,
         "units": [{"name": "array", "x": 0, "cols": p.c, "rows": p.r}],
     });
     let mut host = host;

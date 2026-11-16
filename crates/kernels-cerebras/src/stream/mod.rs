@@ -471,6 +471,10 @@ pub fn compile_reading(trace: &Trace, o: &Options, out: &std::path::Path) -> R<(
     compile_whole(trace, o, &[], out)
 }
 
+/// The most requests compile on load batches a launch: the price picks how many up to it,
+/// where the fabric and a PE's memory hold them (a batch's step serves its requests at once).
+pub const BATCH_MOST: u32 = 4;
+
 /// A whole-sequence reading's regime, by price: the stream regime's program (rows through
 /// units) and the GEMM regime's ([`gemm`]: every op over the whole fabric), the cheaper of those
 /// that place within a system's fabric. Returns the fabric's size.
@@ -491,10 +495,13 @@ pub fn compile_whole(
             trace, s, o.round16, o.upto, &o.taps, None, None, None, false, b,
         )
     });
-    let gm = gemm::program(trace, o, class_rows, None, (b.w, b.h), 1);
-    // (each regime's price as its runs measure it)
+    // (the GEMM regime's batch by price: a request's share of its step)
+    let gm = gemm::batched(trace, o, class_rows, (b.w, b.h), BATCH_MOST);
+    // (each regime's price as its runs measure it, a request's)
     let sc = st.as_ref().map_or(f64::MAX, crate::cost::stream::expected);
-    let gc = gm.as_ref().map_or(f64::MAX, crate::cost::gemm::expected);
+    let gc = gm.as_ref().map_or(f64::MAX, |g| {
+        crate::cost::gemm::expected(g) / f64::from(g.l.batch.max(1))
+    });
     match (st, gm) {
         (Ok(p), Ok(_)) if sc <= gc => {
             write_stream(&p, o, out, None)?;

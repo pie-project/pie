@@ -579,7 +579,9 @@ fn reading(get: &HashMap<String, String>) -> Result<bool, String> {
         }
         None => None,
     };
-    let dir = need("inputs")?;
+    // (`--inputs a,b`: a batch's requests' inputs, a directory each)
+    let dirs: Vec<String> = need("inputs")?.split(',').map(str::to_string).collect();
+    let dir = dirs[0].clone();
     let read_f32 = |p: &Path| -> Result<Vec<f32>, String> {
         let b = std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()))?;
         Ok(b.as_chunks::<4>()
@@ -597,8 +599,26 @@ fn reading(get: &HashMap<String, String>) -> Result<bool, String> {
     }
     let mut host = engine_cpu::Forward::host(trace.clone());
     if let Some(out) = get.get("entries") {
-        let step = reading.step(&trace, grid, &inputs);
-        let entries = reading.entries(&mut host, &step)?;
+        let mut batch: Vec<Vec<(String, Vec<f32>)>> = Vec::new();
+        for d in &dirs {
+            let mut ins = Vec::new();
+            for i in &trace.inputs {
+                let p = Path::new(d).join(format!("{}.f32", i.name));
+                if p.is_file() {
+                    ins.push((i.name.clone(), read_f32(&p)?));
+                }
+            }
+            batch.push(ins);
+        }
+        let steps: Vec<_> = batch
+            .iter()
+            .map(|i| reading.step(&trace, grid, i))
+            .collect();
+        let entries = if steps.len() > 1 {
+            reading.entries_batch(&mut host, &steps)?
+        } else {
+            reading.entries(&mut host, &steps[0])?
+        };
         std::fs::create_dir_all(out).map_err(|e| format!("{out}: {e}"))?;
         for (k, (a, e)) in reading.h2d.iter().zip(&entries).enumerate() {
             let Some(e) = e else { continue };

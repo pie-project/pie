@@ -195,6 +195,7 @@ impl Streams {
 }
 
 /// A step's lanes and inputs, owned (sent to the fabric's thread).
+#[derive(Clone)]
 struct Owned {
     lanes: Vec<StreamLane>,
     inputs: Vec<(String, Vec<f32>)>,
@@ -249,7 +250,23 @@ impl CerebrasEngine {
         };
         let invalid = |why: String| Error::Invalid(why);
         let words: Vec<u64> = step.lanes.iter().map(|l| l.word).collect();
-        let Some(ri) = streams.pick(&words) else {
+        // the step's requests: runs of lanes of one group (a pass's own group each; lanes of no
+        // group one request), each the reading's classes
+        let mut requests: Vec<std::ops::Range<usize>> = Vec::new();
+        let mut at0 = 0;
+        while at0 < step.lanes.len() {
+            let g = step.lanes[at0].group;
+            let mut end = at0 + 1;
+            while end < step.lanes.len() && step.lanes[end].group == g {
+                end += 1;
+            }
+            requests.push(at0..end);
+            at0 = end;
+        }
+        let Some(ri) = requests
+            .first()
+            .and_then(|r| streams.pick(&words[r.clone()]))
+        else {
             return Err(invalid(format!(
                 "no stream program runs lanes of words {words:x?}: the programs' are {:?}",
                 (streams.readings.iter())
@@ -260,72 +277,19 @@ impl CerebrasEngine {
                     .collect::<Vec<_>>()
             )));
         };
+        if requests[1..]
+            .iter()
+            .any(|r| streams.pick(&words[r.clone()]) != Some(ri))
+        {
+            return Err(invalid(format!(
+                "a step's groups read different readings: lanes of words {words:x?}"
+            )));
+        }
         let reading = Arc::clone(&streams.readings[ri].reading);
         let classes = &reading.classes;
         let mut clips: BTreeMap<usize, Vec<[u32; 3]>> = BTreeMap::new();
         for v in &step.voxels {
             clips.insert(v.lane as usize, v.clips.clone());
-        }
-        let mut lanes = Vec::with_capacity(classes.len());
-        // a lane's own rows (a causal reading's lane may bring fewer: the rest are padding)
-        let mut own: Vec<usize> = Vec::with_capacity(classes.len());
-        let mut tokens: Vec<u32> = Vec::new();
-        for (at, (lane, class)) in step.lanes.iter().zip(classes).enumerate() {
-            let short = reading.causal && lane.tokens.len() < class.rows as usize;
-            own.push(lane.tokens.len());
-            tokens.extend_from_slice(&lane.tokens);
-            if short {
-                let pad = lane.tokens.last().copied().unwrap_or(0);
-                tokens.resize(tokens.len() + class.rows as usize - lane.tokens.len(), pad);
-            }
-            // (a grid reading's rows are its clip's voxels: its lane's tokens are none of them)
-            if !reading.host_only
-                && reading.clip.is_none()
-                && lane.tokens.len() != class.rows as usize
-                && !short
-            {
-                return Err(invalid(format!(
-                    "lane {at} is word {:#x} of {} rows; the program's lane {at} is `{}` (word \
-                     {:#x}) of {} rows",
-                    lane.word,
-                    lane.tokens.len(),
-                    class.name,
-                    class.word,
-                    class.rows
-                )));
-            }
-            if lane.group != step.lanes[0].group {
-                return Err(invalid(
-                    "a stream step's lanes attend each other: one group".into(),
-                ));
-            }
-            let clip = match clips.get(&at).map(Vec::as_slice) {
-                None | Some([]) => None,
-                Some([c]) => Some(*c),
-                Some(more) => {
-                    return Err(invalid(format!(
-                        "lane {at} carries {} clips; the program's lane holds one",
-                        more.len()
-                    )));
-                }
-            };
-            if let (Some(want), Some(got)) = (reading.clip, clip)
-                && want != got
-            {
-                return Err(invalid(format!(
-                    "lane {at}'s clip is {got:?}; the `{}` program is compiled for {want:?}",
-                    reading.reading
-                )));
-            }
-            lanes.push(StreamLane {
-                word: lane.word,
-                rows: if reading.host_only {
-                    lane.tokens.len()
-                } else {
-                    class.rows as usize
-                },
-                clip,
-            });
         }
         // Each lane's inputs off the channels its attachment binds.
         let attached: BTreeMap<usize, engine::program::InstanceId> = step
@@ -336,100 +300,185 @@ impl CerebrasEngine {
                 (0..a.lanes.max(1)).map(move |k| (a.lane as usize + k as usize, a.instance))
             })
             .collect();
-        let n_rows: usize = lanes.iter().map(|l| l.rows).sum();
-        let n_voxels: usize = lanes
-            .iter()
-            .filter_map(|l| l.clip)
-            .map(|[t, h, w]| (t * h * w) as usize)
-            .sum();
-        let mut inputs: BTreeMap<u32, Vec<f32>> = BTreeMap::new();
-        let (mut row0, mut vox0) = (0usize, 0usize);
-        for (at, lane) in step.lanes.iter().enumerate() {
-            for feed in &lane.inputs {
-                let (axis, width) = streams.input_shape(feed.id).ok_or_else(|| {
-                    invalid(format!(
-                        "lane {at} feeds input {}, which the trace has not",
-                        feed.id
-                    ))
-                })?;
-                let instance = attached.get(&at).ok_or_else(|| {
-                    invalid(format!(
-                        "lane {at} feeds inputs and no program is attached to it"
-                    ))
-                })?;
-                let cell = match self
-                    .programs
-                    .feed_cell(*instance, feed.channel)
-                    .map_err(refusal)?
+        // each request's step: its lanes, tokens and inputs (a lane's own rows: a causal
+        // reading's lane may bring fewer, the rest padding)
+        let mut owned: Vec<Owned> = Vec::with_capacity(requests.len());
+        let mut lanes: Vec<StreamLane> = Vec::with_capacity(step.lanes.len());
+        let mut own: Vec<usize> = Vec::with_capacity(step.lanes.len());
+        for range in &requests {
+            let mut rlanes = Vec::with_capacity(classes.len());
+            let mut tokens: Vec<u32> = Vec::new();
+            for (at, lane) in step.lanes[range.clone()].iter().enumerate() {
+                let (at, class) = (range.start + at, &classes[at]);
+                let short = reading.causal && lane.tokens.len() < class.rows as usize;
+                own.push(lane.tokens.len());
+                tokens.extend_from_slice(&lane.tokens);
+                if short {
+                    let pad = lane.tokens.last().copied().unwrap_or(0);
+                    tokens.resize(tokens.len() + class.rows as usize - lane.tokens.len(), pad);
+                }
+                // (a grid reading's rows are its clip's voxels: its lane's tokens are none of them)
+                if !reading.host_only
+                    && reading.clip.is_none()
+                    && lane.tokens.len() != class.rows as usize
+                    && !short
                 {
-                    Value::F32(v) => v,
-                    Value::I32(v) => v.into_iter().map(|x| x as f32).collect(),
-                    Value::U32(v) => v.into_iter().map(|x| x as f32).collect(),
-                    Value::Bool(_) => {
-                        return Err(invalid(format!("input {}: a boolean cell", feed.id)));
-                    }
-                };
-                let (len, off, rows) = match axis {
-                    InputAxis::Lane => (classes.len() * width, at * width, 1),
-                    InputAxis::Row => (n_rows * width, row0 * width, lanes[at].rows),
-                    InputAxis::Voxel => {
-                        let [t, h, w] = lanes[at].clip.unwrap_or([0; 3]);
-                        (n_voxels * width, vox0 * width, (t * h * w) as usize)
-                    }
-                };
-                if cell.len() < rows * width {
                     return Err(invalid(format!(
-                        "lane {at}'s input `{}`: a cell of {} values for {rows} rows of {width}",
-                        streams.trace.inputs[feed.id as usize].name,
-                        cell.len()
+                        "lane {at} is word {:#x} of {} rows; the program's lane is `{}` (word \
+                         {:#x}) of {} rows",
+                        lane.word,
+                        lane.tokens.len(),
+                        class.name,
+                        class.word,
+                        class.rows
                     )));
                 }
-                let whole = inputs.entry(feed.id).or_insert_with(|| vec![0.0; len]);
-                whole[off..off + rows * width].copy_from_slice(&cell[..rows * width]);
+                let clip = match clips.get(&at).map(Vec::as_slice) {
+                    None | Some([]) => None,
+                    Some([c]) => Some(*c),
+                    Some(more) => {
+                        return Err(invalid(format!(
+                            "lane {at} carries {} clips; the program's lane holds one",
+                            more.len()
+                        )));
+                    }
+                };
+                if let (Some(want), Some(got)) = (reading.clip, clip)
+                    && want != got
+                {
+                    return Err(invalid(format!(
+                        "lane {at}'s clip is {got:?}; the `{}` program is compiled for {want:?}",
+                        reading.reading
+                    )));
+                }
+                rlanes.push(StreamLane {
+                    word: lane.word,
+                    rows: if reading.host_only {
+                        lane.tokens.len()
+                    } else {
+                        class.rows as usize
+                    },
+                    clip,
+                });
             }
-            row0 += lanes[at].rows;
-            if let Some([t, h, w]) = lanes[at].clip {
-                vox0 += (t * h * w) as usize;
+            let n_rows: usize = rlanes.iter().map(|l| l.rows).sum();
+            let n_voxels: usize = rlanes
+                .iter()
+                .filter_map(|l| l.clip)
+                .map(|[t, h, w]| (t * h * w) as usize)
+                .sum();
+            let mut inputs: BTreeMap<u32, Vec<f32>> = BTreeMap::new();
+            let (mut row0, mut vox0) = (0usize, 0usize);
+            for (k, lane) in step.lanes[range.clone()].iter().enumerate() {
+                let at = range.start + k;
+                for feed in &lane.inputs {
+                    let (axis, width) = streams.input_shape(feed.id).ok_or_else(|| {
+                        invalid(format!(
+                            "lane {at} feeds input {}, which the trace has not",
+                            feed.id
+                        ))
+                    })?;
+                    let instance = attached.get(&at).ok_or_else(|| {
+                        invalid(format!(
+                            "lane {at} feeds inputs and no program is attached to it"
+                        ))
+                    })?;
+                    let cell = match self
+                        .programs
+                        .feed_cell(*instance, feed.channel)
+                        .map_err(refusal)?
+                    {
+                        Value::F32(v) => v,
+                        Value::I32(v) => v.into_iter().map(|x| x as f32).collect(),
+                        Value::U32(v) => v.into_iter().map(|x| x as f32).collect(),
+                        Value::Bool(_) => {
+                            return Err(invalid(format!("input {}: a boolean cell", feed.id)));
+                        }
+                    };
+                    let (len, off, rows) = match axis {
+                        InputAxis::Lane => (classes.len() * width, k * width, 1),
+                        InputAxis::Row => (n_rows * width, row0 * width, rlanes[k].rows),
+                        InputAxis::Voxel => {
+                            let [t, h, w] = rlanes[k].clip.unwrap_or([0; 3]);
+                            (n_voxels * width, vox0 * width, (t * h * w) as usize)
+                        }
+                    };
+                    if cell.len() < rows * width {
+                        return Err(invalid(format!(
+                            "lane {at}'s input `{}`: a cell of {} values for {rows} rows of {width}",
+                            streams.trace.inputs[feed.id as usize].name,
+                            cell.len()
+                        )));
+                    }
+                    let whole = inputs.entry(feed.id).or_insert_with(|| vec![0.0; len]);
+                    whole[off..off + rows * width].copy_from_slice(&cell[..rows * width]);
+                }
+                row0 += rlanes[k].rows;
+                if let Some([t, h, w]) = rlanes[k].clip {
+                    vox0 += (t * h * w) as usize;
+                }
+            }
+            lanes.extend(rlanes.iter().cloned());
+            owned.push(Owned {
+                lanes: rlanes,
+                tokens,
+                inputs: inputs
+                    .into_iter()
+                    .map(|(id, v)| (streams.trace.inputs[id as usize].name.clone(), v))
+                    .collect(),
+            });
+        }
+        let device = |e: String| Error::Device(e);
+        // each request's rows back: a launch a batch of the program's requests (the last
+        // batch padded with its last request, its rows dropped); a reading with no program
+        // (the host fabric's): its every op the host's, in `finish`
+        let batch = reading.batch.max(1);
+        let mut backs: Vec<Vec<engine_cpu::forward::Captured>> = Vec::new();
+        let mut cycles: Option<u64> = None;
+        if reading.host_only {
+            backs.resize(owned.len(), Vec::new());
+        } else {
+            for chunk in owned.chunks(batch) {
+                let mut sent: Vec<Owned> = chunk.to_vec();
+                while sent.len() < batch {
+                    sent.push(chunk[chunk.len() - 1].clone());
+                }
+                let views: Vec<StreamStep<'_>> = sent.iter().map(Owned::step).collect();
+                let entries = if batch > 1 {
+                    reading.entries_batch(&mut streams.readings[ri].host, &views)
+                } else {
+                    reading.entries(&mut streams.readings[ri].host, &views[0])
+                }
+                .map_err(device)?;
+                drop(views);
+                // (a grid program in weight groups writes its groups' tiles a launch each)
+                let words = (reading.groups > 0).then(|| Arc::clone(&streams.readings[ri].statics));
+                let fabric = streams.fabric_for(ri).map_err(device)?;
+                let run = Arc::clone(&reading);
+                let (got, c) = fabric
+                    .call(move |f| {
+                        let views: Vec<StreamStep<'_>> = sent.iter().map(Owned::step).collect();
+                        run.launch_batch(
+                            f,
+                            &views,
+                            &entries,
+                            words.as_deref().map_or(&[], |w| &w[..]),
+                        )
+                    })
+                    .map_err(device)?;
+                if let Some(c) = c {
+                    cycles = Some(cycles.unwrap_or(0) + c);
+                }
+                let back = reading.rows_back(&got).map_err(device)?;
+                for b in 0..chunk.len() {
+                    backs.push(if batch > 1 {
+                        reading.request_of(&back, b)
+                    } else {
+                        back.clone()
+                    });
+                }
             }
         }
-        let owned = Owned {
-            lanes,
-            tokens,
-            inputs: inputs
-                .into_iter()
-                .map(|(id, v)| (streams.trace.inputs[id as usize].name.clone(), v))
-                .collect(),
-        };
-        let device = |e: String| Error::Device(e);
-        let step_view = owned.step();
-        // a reading with no program (the host fabric's): its every op the host's, in `finish`
-        let (back, cycles) = if reading.host_only {
-            (Vec::new(), None)
-        } else {
-            let entries = reading
-                .entries(&mut streams.readings[ri].host, &step_view)
-                .map_err(device)?;
-            // (a grid program in weight groups writes its groups' tiles a launch each)
-            let words = (reading.groups > 0).then(|| Arc::clone(&streams.readings[ri].statics));
-            let fabric = streams.fabric_for(ri).map_err(device)?;
-            let sent = Owned {
-                lanes: owned.lanes.clone(),
-                inputs: owned.inputs.clone(),
-                tokens: owned.tokens.clone(),
-            };
-            let run = Arc::clone(&reading);
-            let (got, cycles) = fabric
-                .call(move |f| {
-                    run.launch_with(
-                        f,
-                        &sent.step(),
-                        &entries,
-                        words.as_deref().map_or(&[], |w| &w[..]),
-                    )
-                })
-                .map_err(device)?;
-            (reading.rows_back(&got).map_err(device)?, cycles)
-        };
         // the outputs the attachments read, by name
         let mut names: Vec<String> = Vec::new();
         for a in step.attachments.iter().filter(|a| !a.adapter_only) {
@@ -459,30 +508,30 @@ impl CerebrasEngine {
             wanted.push(o.value);
         }
         let stream = &mut streams.readings[ri];
-        let made = reading
-            .finish_values(&mut stream.host, &step_view, &back, &wanted)
-            .map_err(device)?;
-        // a lane's own rows of a row output (a causal lane's padding dropped)
-        let made: Vec<Vec<f32>> = made
-            .into_iter()
-            .zip(&decls)
-            .map(|(v, (_, axis, width))| {
-                if *axis != InputAxis::Row
-                    || own.iter().zip(&owned.lanes).all(|(o, l)| *o == l.rows)
-                {
-                    return v;
+        // each request's outputs (a lane's own rows of a row output: a causal lane's padding
+        // dropped), the requests' in turn
+        let mut made: Vec<Vec<f32>> = vec![Vec::new(); wanted.len()];
+        let mut lane0 = 0;
+        for (o, back) in owned.iter().zip(&backs) {
+            let got = reading
+                .finish_values(&mut stream.host, &o.step(), back, &wanted)
+                .map_err(device)?;
+            let mine = &own[lane0..lane0 + o.lanes.len()];
+            lane0 += o.lanes.len();
+            for ((v, (_, axis, width)), all) in got.into_iter().zip(&decls).zip(&mut made) {
+                if *axis != InputAxis::Row || mine.iter().zip(&o.lanes).all(|(n, l)| *n == l.rows) {
+                    all.extend(v);
+                    continue;
                 }
-                let mut out = Vec::new();
                 let mut r0 = 0;
-                for (o, l) in own.iter().zip(&owned.lanes) {
-                    out.extend_from_slice(&v[r0 * width..(r0 + o) * width]);
+                for (n, l) in mine.iter().zip(&o.lanes) {
+                    all.extend_from_slice(&v[r0 * width..(r0 + n) * width]);
                     r0 += l.rows;
                 }
-                out
-            })
-            .collect();
+            }
+        }
         // a lane's rows of an output: its tokens', voxels' or own row
-        let lanes = &owned.lanes;
+        let lanes = &lanes;
         tracing::debug!(
             reading = %reading.reading,
             clips = ?lanes.iter().map(|l| l.clip).collect::<Vec<_>>(),

@@ -375,7 +375,8 @@ fn flux_2_minis_denoise_on_the_fabric() {
 /// Two requests' step (the second at another timestep, its latent the first's reversed) as one
 /// batch: each request's capture (`READING_OUT/a`, `/b`) and the batch's (`READING_OUT/gold`:
 /// every value the two requests' rows in turn, as a batched step lays them out), for
-/// `wafer-compile stream --regime gemm --batch 2 --values`.
+/// `wafer-compile stream --regime gemm --batch 2 --values`; each request's inputs
+/// (`READING_OUT/a-inputs`, `/b-inputs`) for `wafer-bench --reading --entries`.
 #[test]
 #[ignore = "writes files; set READING_OUT"]
 fn flux_2_minis_batch_files() {
@@ -401,6 +402,12 @@ fn flux_2_minis_batch_files() {
             &step_of(&trace, inputs),
             &out.join(tag),
         );
+        // (the step's inputs, as `wafer-bench --inputs` reads them)
+        let dir = out.join(format!("{tag}-inputs"));
+        std::fs::create_dir_all(&dir).expect("an inputs directory");
+        for (name, v) in inputs {
+            std::fs::write(dir.join(format!("{name}.f32")), bytes(v)).expect("an input");
+        }
     }
     let gold = out.join("gold");
     std::fs::create_dir_all(&gold).expect("a capture directory");
@@ -418,4 +425,82 @@ fn flux_2_minis_batch_files() {
         shape[0] *= 2;
         kernels_cerebras::npy::write_f32(&gold.join(&name), &shape, &va).expect("a batch value");
     }
+}
+
+/// A batch's entries: the engine's, from two requests' steps (`Reading::entries_batch`, each
+/// request's host values in turn), are word for word the ones the compile writes from the two
+/// requests' captures laid out as a batch (`--batch 2 --values`).
+#[test]
+fn a_batch_of_twos_entries_are_its_requests_in_turn() {
+    let trace = trace();
+    let tmp = tempfile::tempdir().expect("a scratch directory");
+    let mut forward = Forward::new(trace.clone(), None, &|n: &str, c: usize| {
+        common::plane(&trace, n, c)
+    })
+    .expect("flux2-mini loads");
+    let a = common::inputs();
+    let b: Vec<(String, Vec<f32>)> = a
+        .iter()
+        .map(|(n, v)| match n.as_str() {
+            "timestep" => (n.clone(), vec![700.0; v.len()]),
+            "latents" => (n.clone(), v.iter().rev().copied().collect()),
+            _ => (n.clone(), v.clone()),
+        })
+        .collect();
+    let (ca, cb, gold) = (
+        tmp.path().join("a"),
+        tmp.path().join("b"),
+        tmp.path().join("gold"),
+    );
+    capture(&mut forward, &trace, &step_of(&trace, &a), &ca);
+    capture(&mut forward, &trace, &step_of(&trace, &b), &cb);
+    std::fs::create_dir_all(&gold).expect("a capture directory");
+    for e in std::fs::read_dir(&ca).expect("a's capture") {
+        let name = e.expect("a file").file_name();
+        if !name.to_string_lossy().ends_with(".npy") {
+            std::fs::copy(ca.join(&name), gold.join(&name)).expect("the index");
+            continue;
+        }
+        let (sa, mut va) = kernels_cerebras::npy::read_f32_or_i32(&ca.join(&name)).expect("a");
+        let (_, vb) = kernels_cerebras::npy::read_f32_or_i32(&cb.join(&name)).expect("b");
+        va.extend(vb);
+        let mut shape = sa.clone();
+        shape[0] *= 2;
+        kernels_cerebras::npy::write_f32(&gold.join(&name), &shape, &va).expect("a batch value");
+    }
+    let o = kernels_cerebras::stream::Options {
+        reading: "denoise".into(),
+        rows: rows() as u32,
+        round16: true,
+        upto: None,
+        taps: Vec::new(),
+    };
+    let p = kernels_cerebras::stream::gemm::program(&trace, &o, &[], None, (762, 1172), 2)
+        .expect("a batch of two places");
+    let dir = tmp.path().join("prog");
+    kernels_cerebras::stream::gemm::compile_program(&p, &dir, Some(&gold)).expect("it compiles");
+    let reading = Reading::open(&dir).expect("its host.json");
+    assert_eq!(reading.batch, 2);
+    let mut host = Forward::host(trace.clone());
+    let steps = [step_of(&trace, &a), step_of(&trace, &b)];
+    let entries = reading
+        .entries_batch(&mut host, &steps)
+        .expect("the entries");
+    let mut seen = 0;
+    for (arr, got) in reading.h2d.iter().zip(&entries) {
+        let Some(got) = got else { continue };
+        let want = kernels_cerebras::npy::read_f32_or_i32(arr.file.as_deref().expect("on file"))
+            .expect("the compile's entry")
+            .1;
+        assert_eq!(got.len(), want.len(), "`{}`", arr.sym);
+        for (x, y) in got.iter().zip(&want) {
+            assert!(
+                x.to_bits() == y.to_bits() || (x.is_nan() && y.is_nan()),
+                "`{}`",
+                arr.sym
+            );
+        }
+        seen += 1;
+    }
+    assert!(seen > 0);
 }

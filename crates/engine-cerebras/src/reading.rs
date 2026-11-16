@@ -89,6 +89,16 @@ pub trait Fabric {
     /// Runs `step` on the arrays written: the rows back (each [`Back`]'s words) and the step's
     /// cycles where the program stamps them.
     fn run(&mut self, reading: &Reading, step: &StreamStep<'_>) -> R<(Vec<Vec<f32>>, Option<u64>)>;
+    /// Runs a batch's `steps` (a request's each, the program's [`Reading::batch`]) on the
+    /// arrays written: a device's program runs the arrays (the steps are the entries'), the
+    /// host's runs each step and lays their rows out as the batch's.
+    fn run_batch(
+        &mut self,
+        reading: &Reading,
+        steps: &[StreamStep<'_>],
+    ) -> R<(Vec<Vec<f32>>, Option<u64>)> {
+        self.run(reading, steps.first().ok_or("a batch of no steps")?)
+    }
     /// Opens the program linked in `link` in place of the one open (a fabric runs one
     /// program at a time; the host's runs every reading's and opens nothing). Returns whether
     /// it was loaded afresh (its arrays to be written again).
@@ -346,6 +356,9 @@ pub struct Reading {
     pub paging: Option<Paging>,
     pub rowp: Vec<Rect>,
     pub ptab: Vec<Rect>,
+    /// Requests a launch (the GEMM regime's batch): the step's rows each request's rows in
+    /// turn, its lane values a request's lanes in turn.
+    pub batch: usize,
 }
 
 /// A decode program's paging ([`Reading::paging`]).
@@ -533,6 +546,7 @@ impl Reading {
                 <[u32; 3]>::try_from(v).ok()
             }),
             groups: host["groups"].as_u64().unwrap_or(0) as usize,
+            batch: host["batch"].as_u64().unwrap_or(1).max(1) as usize,
             pos: pes(&host, "pos"),
             paging: host["paging"].as_object().map(|g| Paging {
                 size: g.get("size").and_then(Value::as_u64).unwrap_or(0) as u32,
@@ -583,6 +597,7 @@ impl Reading {
             paging: None,
             rowp: Vec::new(),
             ptab: Vec::new(),
+            batch: 1,
         }
     }
 
@@ -637,6 +652,75 @@ impl Reading {
                 .collect(),
             tokens: Vec::new(),
         }
+    }
+
+    /// A request's rows (every class's).
+    #[must_use]
+    pub fn request_rows(&self) -> usize {
+        self.classes.iter().map(|c| c.rows as usize).sum()
+    }
+
+    /// [`Reading::entries`] of a batch: `steps` a request's each (the program's [`Reading::batch`]
+    /// of them), every value the entries gather from the requests' rows in turn (a value of a
+    /// row a lane, its lanes in turn).
+    pub fn entries_batch(
+        &self,
+        host: &mut Forward,
+        steps: &[StreamStep<'_>],
+    ) -> R<Vec<Option<Vec<f32>>>> {
+        let wanted = self.entry_values();
+        let mut held: BTreeMap<u32, (usize, usize, Vec<f32>)> = BTreeMap::new();
+        for step in steps {
+            for c in host.stream_values(step, &[], &wanted)? {
+                let v = match c.values {
+                    Values::F32(v) => v,
+                    Values::I32(v) => v.into_iter().map(|x| x as f32).collect(),
+                };
+                let e = held.entry(c.value.0).or_insert((0, c.width, Vec::new()));
+                e.0 += c.rows;
+                e.2.extend(v);
+            }
+        }
+        let held: BTreeMap<u32, (usize, usize, Rc<Vec<f32>>)> = held
+            .into_iter()
+            .map(|(k, (r, w, v))| (k, (r, w, Rc::new(v))))
+            .collect();
+        self.h2d
+            .iter()
+            .map(|a| {
+                let Some(g) = &a.entry else {
+                    return Ok(None);
+                };
+                if a.u16 {
+                    return Err(format!("entry `{}`: a 16-bit entry", a.sym));
+                }
+                let get = |v: u32| {
+                    held.get(&v)
+                        .cloned()
+                        .ok_or_else(|| format!("value %{v}: not made"))
+                };
+                apply(g, &get).map(Some)
+            })
+            .collect()
+    }
+
+    /// Request `b`'s rows of a batch's values read back ([`Reading::rows_back`] of a batched
+    /// launch): each value's rows a request's in turn.
+    #[must_use]
+    pub fn request_of(&self, back: &[Captured], b: usize) -> Vec<Captured> {
+        back.iter()
+            .map(|c| {
+                let rows = c.rows / self.batch.max(1);
+                let Values::F32(v) = &c.values else {
+                    return c.clone();
+                };
+                Captured {
+                    rows,
+                    values: Values::F32(v[b * rows * c.width..(b + 1) * rows * c.width].to_vec()),
+                    ..c.clone()
+                }
+            })
+            .collect()
     }
 
     /// The values the entries gather from: what the host's forward makes of a step's inputs.
@@ -1008,6 +1092,18 @@ impl Reading {
         entries: &[Option<Vec<f32>>],
         statics: &[Option<Vec<u32>>],
     ) -> R<(Vec<Vec<f32>>, Option<u64>)> {
+        self.launch_batch(rt, std::slice::from_ref(step), entries, statics)
+    }
+
+    /// [`Reading::launch_with`] of a batch: `steps` a request's each, `entries` the batch's
+    /// ([`Reading::entries_batch`]).
+    pub fn launch_batch(
+        &self,
+        rt: &mut dyn Fabric,
+        steps: &[StreamStep<'_>],
+        entries: &[Option<Vec<f32>>],
+        statics: &[Option<Vec<u32>>],
+    ) -> R<(Vec<Vec<f32>>, Option<u64>)> {
         self.write_entries(rt, entries)?;
         // the groups' launches' cycles, summed
         let mut before: Option<u64> = None;
@@ -1027,7 +1123,7 @@ impl Reading {
                 before = Some(before.unwrap_or(0) + c);
             }
         }
-        let (got, cycles) = rt.run(self, step)?;
+        let (got, cycles) = rt.run_batch(self, steps)?;
         Ok((got, cycles.map(|c| c + before.unwrap_or(0))))
     }
 }
@@ -1278,17 +1374,41 @@ impl Fabric for HostFabric {
     }
 
     fn run(&mut self, reading: &Reading, step: &StreamStep<'_>) -> R<(Vec<Vec<f32>>, Option<u64>)> {
-        let made: BTreeMap<u32, Captured> = self
-            .forward
-            .stream_values(step, &[], &reading.out_values())?
-            .into_iter()
-            .map(|c| (c.value.0, c))
-            .collect();
+        self.run_batch(reading, std::slice::from_ref(step))
+    }
+
+    fn run_batch(
+        &mut self,
+        reading: &Reading,
+        steps: &[StreamStep<'_>],
+    ) -> R<(Vec<Vec<f32>>, Option<u64>)> {
+        // each request's values; the batch's row `tr` its request's row `tr % rows`
+        let mut made: Vec<BTreeMap<u32, Captured>> = Vec::new();
+        for step in steps {
+            made.push(
+                self.forward
+                    .stream_values(step, &[], &reading.out_values())?
+                    .into_iter()
+                    .map(|c| (c.value.0, c))
+                    .collect(),
+            );
+        }
+        let per = reading.request_rows().max(1);
         let mut got = Vec::new();
         for b in &reading.d2h {
             let width: usize = b.parts.iter().map(|p| p.2 as usize).sum();
             let mut buf = vec![0f32; b.len * (b.w * b.h) as usize];
             for (i, &tr) in b.rows.iter().enumerate() {
+                // (one step: its rows as they are, a grid reading's its voxels)
+                let (made, tr) = if steps.len() == 1 {
+                    (&made[0], tr)
+                } else {
+                    (
+                        made.get(tr / per)
+                            .ok_or_else(|| format!("row {tr}: a request past the batch's"))?,
+                        tr % per,
+                    )
+                };
                 let mut off = 0;
                 for &(base, from, n) in &b.parts {
                     let c = made
