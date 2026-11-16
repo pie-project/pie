@@ -2579,3 +2579,141 @@ fn golden_eager_resume() {
         small_pool_arms(&fixture, &cache);
     }
 }
+
+/// One lane's state after a fire of `tokens` that buffers them all past a
+/// fresh state, then a fire of `next` that replays the first `keep` of them
+/// and folds those (`RsVerb::Buffer` with `fold`), against slots that fold
+/// `tokens` whole and its first `keep` alone. Returns the three states.
+fn served_partial_fold(
+    fixture: &Fixture,
+    cache: &Path,
+    tokens: &[u32],
+    next: &[u32],
+    keep: u32,
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    use engine::fire::{FoldLen, RsVerb};
+    let mut shell = Shell::load(Boot {
+        trace: fixture.trace.clone(),
+        contract: &fixture.contract,
+        checkpoint: &fixture.container,
+        budget: Budget::new(1, TOKENS),
+        patches: None,
+        voxels: None,
+        page_size: PAGE,
+        context: CONTEXT,
+        slots: 4,
+        kv_budget: None,
+        allowance: engine::Allowance::WHOLE,
+        context_declared: false,
+        ordinal: 0,
+        knobs: buffering(knobs()),
+        cache_dir: Some(cache),
+        runahead: engine::runahead::Runahead::F1,
+        residency: engine_cuda::experts::Plan::default(),
+        world: engine_cuda::World::default(),
+        expert: engine_cuda::World::default(),
+        comm: core::ptr::null_mut(),
+    })
+    .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
+    shell.back_whole().expect("the fitted pool is backed whole");
+    let page = rs_page(&mut shell);
+    let fire = |shell: &mut Shell, slot: u32, tokens: &[u32], rs: RsVerb| {
+        let word = fixture.trace.facts.word(&Request::new(
+            u32::try_from(tokens.len()).expect("a count"),
+            false,
+        ));
+        shell
+            .fire_media(
+                &[Seated {
+                    rs,
+                    ..Seated::of(Lane { slot, word, tokens })
+                }],
+                &[],
+                &[],
+            )
+            .expect("the fire runs");
+    };
+    let held = u32::try_from(tokens.len()).expect("a count");
+    let end = held + u32::try_from(next.len()).expect("a count");
+    let pages: Vec<u32> = (0..end.div_ceil(page)).collect();
+    for slot in 0..3 {
+        shell.open(slot).expect("the slot opens");
+    }
+    fire(&mut shell, 0, tokens, RsVerb::Fold);
+    let whole = shell.state_bytes(0).expect("slot 0 reads back");
+    fire(&mut shell, 1, &tokens[..keep as usize], RsVerb::Fold);
+    let kept = shell.state_bytes(1).expect("slot 1 reads back");
+    let buffer = |fold: u32| RsVerb::Buffer {
+        pages: pages.clone(),
+        base: 0,
+        folded: 0,
+        fold: FoldLen::Host(fold),
+    };
+    fire(&mut shell, 2, tokens, buffer(0));
+    fire(&mut shell, 2, next, buffer(keep));
+    let partial = shell.state_bytes(2).expect("slot 2 reads back");
+    (whole, kept, partial)
+}
+
+/// How far apart `a` and `b` lie, read as bf16 words (the state pool's
+/// element): the root of the summed squared differences of the finite ones.
+fn bf16_apart(a: &[u8], b: &[u8]) -> f64 {
+    assert_eq!(a.len(), b.len(), "two slots of one pool");
+    let value = |w: &[u8]| {
+        f64::from(f32::from_bits(
+            u32::from(u16::from_le_bytes([w[0], w[1]])) << 16,
+        ))
+    };
+    a.chunks_exact(2)
+        .zip(b.chunks_exact(2))
+        .map(|(x, y)| (value(x), value(y)))
+        .filter(|(x, y)| x.is_finite() && y.is_finite())
+        .map(|(x, y)| (x - y) * (x - y))
+        .sum::<f64>()
+        .sqrt()
+}
+
+/// A fire that buffers a window's rows and a later fire that folds only the
+/// first `keep` of them (a speculative verify keeping fewer than its drafts)
+/// leave the state a fold of those `keep` rows leaves, to rounding — not one
+/// that also took the rows it did not keep. On a model whose PLE conv
+/// (Qwen4, Qwen3.8-Flash-Next) commits as it runs, the partial state holds
+/// that conv's row as the whole window left it, and so stands nearer the
+/// whole fold than the kept one. `PIE_GOLDEN_PARTIAL` names the model
+/// (`qwen38-flash-next-micro` by default; `qwen35-tiny` for GDN alone).
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn golden_partial_fold_keeps_its_rows() {
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    let cache = cache_dir();
+    let model = std::env::var("PIE_GOLDEN_PARTIAL")
+        .unwrap_or_else(|_| "qwen38-flash-next-micro".to_string());
+    let fixture = fixture(&model, &cache);
+    let tokens: Vec<u32> = (0..6).map(|t| (t * 7 + 11) % 1000).collect();
+    let next: Vec<u32> = (6..9).map(|t| (t * 7 + 11) % 1000).collect();
+    let keep = 3;
+    let (whole, kept, partial) = served_partial_fold(&fixture, &cache, &tokens, &next, keep);
+    let to_kept = bf16_apart(&partial, &kept);
+    let to_whole = bf16_apart(&partial, &whole);
+    let kept_whole = bf16_apart(&kept, &whole);
+    println!(
+        "golden {model}-partial-fold: the partial state lies {to_kept:.4} from the kept fold and \
+         {to_whole:.4} from the whole one (the two folds {kept_whole:.4} apart)"
+    );
+    assert!(
+        kept_whole > 0.0,
+        "folding {keep} rows and folding 6 leave one state"
+    );
+    // Rounding moves the state a little (the chunked and the step scans sum
+    // in other orders); a row the fold did not keep moves it by about the
+    // distance between the two folds.
+    assert!(
+        to_kept < 0.1 * kept_whole,
+        "a partial fold of {keep} rows left a state {to_kept:.4} from a fold of {keep}, against \
+         {kept_whole:.4} between the two folds — the rows it did not keep moved it ({to_whole:.4} \
+         from the whole fold)"
+    );
+}
