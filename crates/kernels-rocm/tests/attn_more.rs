@@ -777,7 +777,7 @@ fn score_capture_averages_the_observed_rows_mass() {
     }
     // The lanes before the capture's keep what they held.
     assert!(
-        got[..(lane_offset * hq * kv_max) as usize]
+        got[..(lane_offset * row) as usize]
             .iter()
             .all(|&x| x == 9.0)
     );
