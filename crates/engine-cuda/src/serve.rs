@@ -1119,6 +1119,33 @@ impl Shell {
         Ok(std::mem::take(&mut settled.pixels))
     }
 
+    /// [`Shell::fire`] of text lanes timed to its landing: the time from
+    /// its preparation to the device's last work done, its logits read back
+    /// after (`pie tune --check-estimate`'s fire).
+    pub fn fire_landed(
+        &mut self,
+        lanes: &[Lane<'_>],
+    ) -> Result<(std::time::Duration, Vec<Vec<f32>>)> {
+        let seated: Vec<Seated<'_>> = lanes.iter().copied().map(Seated::of).collect();
+        let began = std::time::Instant::now();
+        let prepared = FrameShell::prepare(
+            self,
+            StepView {
+                lanes: &seated,
+                attachments: &[],
+                media: &[],
+                voxels: &[],
+            },
+            None,
+        )?;
+        let enqueued = FrameShell::enqueue(self, prepared)?;
+        let mut settled = FrameShell::settle(self, enqueued)?;
+        self.device.synchronize()?;
+        let landed = began.elapsed();
+        Shell::read_out(self, &mut settled)?;
+        Ok((landed, std::mem::take(&mut settled.logits)))
+    }
+
     pub fn fire_media(
         &mut self,
         lanes: &[Seated<'_>],

@@ -612,24 +612,32 @@ mod on_device {
         let channels = shape.channels();
         let conv_stride = conv_width * channels;
         let state_stride = shape.v_heads * shape.k_dim * shape.v_dim;
-        let x = random.operand((tokens * channels) as usize * 2)?;
-        let conv_y = zeroed((tokens * channels) as usize * 2)?;
+        // `scan_sets_at` sets of input rows and conv and scan state, each
+        // fire the next set's (its rows at their offset, its state the slot
+        // of its index), so each reads them from device memory as a served
+        // layer's do.
+        let sets = engine::rates::scan_sets_at(shape);
+        let x_bytes = (tokens * channels) as usize * 2;
+        let x = random.operand(sets * x_bytes)?;
+        let conv_y = zeroed(x_bytes)?;
         let weight = random.operand((channels * conv_width) as usize * 2)?;
-        let conv_state = random.operand(conv_stride as usize * 2)?;
-        let state = random.operand(state_stride as usize * 2)?;
+        let conv_state = random.operand(sets * conv_stride as usize * 2)?;
+        let state = random.operand(sets * state_stride as usize * 2)?;
         let gates = zeroed((tokens * 2 * shape.v_heads) as usize * 4)?;
         let y = zeroed((tokens * shape.v_heads * shape.v_dim) as usize * 4)?;
-        let slot = column(&[0])?;
+        let slots = (0..sets)
+            .map(|set| column(&[set as i32]))
+            .collect::<Result<Vec<Buffer>, String>>()?;
         let indptr = column(&[0, tokens as i32])?;
-        let ragged = |data: &Buffer| RaggedTensor {
-            data: Tensor::new(data.ptr(), tokens, channels, Dtype::Bf16),
+        let ragged = |at: u64| RaggedTensor {
+            data: Tensor::new(at, tokens, channels, Dtype::Bf16),
             indptr: Tensor::new(indptr.ptr(), 2, 1, Dtype::I32),
         };
-        let pool = RecurrentPool {
-            slab: Tensor::new(state.ptr(), 1, state_stride, Dtype::Bf16),
-            slot_ids: Tensor::new(slot.ptr(), 1, 1, Dtype::I32),
+        let pool = |set: usize| RecurrentPool {
+            slab: Tensor::new(state.ptr(), sets as u32, state_stride, Dtype::Bf16),
+            slot_ids: Tensor::new(slots[set].ptr(), 1, 1, Dtype::I32),
             slot_stride_elems: i64::from(state_stride),
-            conv_slab: Tensor::new(conv_state.ptr(), 1, conv_stride, Dtype::Bf16),
+            conv_slab: Tensor::new(conv_state.ptr(), sets as u32, conv_stride, Dtype::Bf16),
             conv_stride: i64::from(conv_stride),
             write_state: true,
             write_state_mask: Tensor::ABSENT,
@@ -649,23 +657,25 @@ mod on_device {
         };
         #[cfg(feature = "rocm")]
         let out = Dtype::F32;
-        let fire = || {
+        let pools: Vec<RecurrentPool> = (0..sets).map(pool).collect();
+        let fire = |i: usize| {
+            let set = i % sets;
             kernels_cuda::ssm::causal_conv1d_chunked(
                 ctx,
-                ragged(&x),
+                ragged(x.ptr() + (set * x_bytes) as u64),
                 Tensor::new(weight.ptr(), channels, conv_width, Dtype::Bf16),
                 None,
-                &pool,
+                &pools[set],
                 conv_width,
                 1,
                 &mut Tensor::new(conv_y.ptr(), tokens, channels, Dtype::Bf16),
             )?;
             kernels_cuda::ssm::gated_delta_chunked(
                 ctx,
-                ragged(&conv_y),
+                ragged(conv_y.ptr()),
                 Tensor::ABSENT,
                 Tensor::new(gates.ptr(), tokens, 2 * shape.v_heads, Dtype::F32),
-                &pool,
+                &pools[set],
                 shape.k_heads,
                 shape.v_heads,
                 shape.k_dim,
@@ -673,8 +683,8 @@ mod on_device {
                 &mut Tensor::new(y.ptr(), tokens, shape.v_heads * shape.v_dim, out),
             )
         };
-        lay(held, fire)?;
-        let ns = clock.burst(ROUNDS, &mut |_| fire().map_err(say("the scan")))?;
+        lay(held, || fire(0))?;
+        let ns = clock.burst(ROUNDS, &mut |i| fire(i).map_err(say("the scan")))?;
         engine::rates::rate_from(
             &format!("scan of {} tokens", shape.tokens),
             ns,

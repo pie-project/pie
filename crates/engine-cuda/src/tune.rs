@@ -261,12 +261,31 @@ const SERVED_LANES: u32 = 512;
 /// The fires timed a rung, after two warm ones.
 const TIMED_FIRES: usize = 5;
 
+/// The shell a check fires on before its fires are known: as many slots as
+/// a served load's lanes, each [`ROOMY_CONTEXT`] long.
+const ROOMY: (u32, u32) = (SERVED_LANES, ROOMY_CONTEXT);
+const ROOMY_CONTEXT: u32 = 32_768;
+
+/// The `(slots, context)` a shell must hold to fire each of `fires`
+/// (engine::load::CheckFire): its slots the most lanes one fires, its
+/// context a lane's keys and new tokens, in whole pages.
+fn sized(fires: impl IntoIterator<Item = engine::load::CheckFire>) -> (u32, u32) {
+    let (slots, context) = fires.into_iter().fold((1u32, 1u32), |(slots, context), f| {
+        (
+            slots.max(f.lanes),
+            context.max(f.keys_per_lane + f.tokens_per_lane),
+        )
+    });
+    (slots, context.next_multiple_of(16))
+}
+
 /// A served-shape load of `artifact` under `chip`, every rung the card
-/// holds laid (`Knobs::every_rung`), one slot long enough for the widest.
+/// holds laid (`Knobs::every_rung`), on `slots` slots of `context` each.
 fn load_every_rung(
     artifact: &Path,
     deployment: &str,
     chip: Profile,
+    (slots, context): (u32, u32),
 ) -> Result<(crate::Shell, poem_ir::Trace), String> {
     use poem::Platform;
     let row = poem_compiler::catalog::deployment(deployment)
@@ -292,9 +311,9 @@ fn load_every_rung(
         budget,
         patches: patches(&trace, SERVED_LANES),
         page_size: 16,
-        context: 32_768,
+        context,
         // A slot a lane: a decode-shaped rung's check fires a lane a slot.
-        slots: SERVED_LANES,
+        slots,
         kv_budget: None,
         allowance: engine::Allowance::WHOLE,
         context_declared: false,
@@ -347,9 +366,9 @@ fn fire_once(
         })
         .collect();
     let hits = shell.body_stats().tally.hits;
-    let began = Instant::now();
-    shell.fire(&lanes).map_err(|e| e.to_string())?;
-    let ns = began.elapsed().as_secs_f64() * 1e9;
+    // Timed to its landing; its rows are read back after.
+    let (landed, _) = shell.fire_landed(&lanes).map_err(|e| e.to_string())?;
+    let ns = landed.as_secs_f64() * 1e9;
     Ok((ns, shell.body_stats().tally.hits > hits))
 }
 
@@ -401,7 +420,8 @@ fn dissect(
     say: &mut dyn FnMut(&str),
 ) -> Result<(), String> {
     let launch_ns = walked.rates().launch_ns.unwrap_or(0) as f64;
-    let (mut shell, trace) = load_every_rung(artifact, deployment, walked)?;
+    let fires = rungs.iter().map(|r| prompt(r.tokens));
+    let (mut shell, trace) = load_every_rung(artifact, deployment, walked, sized(fires))?;
     // A drained pair around nothing: what each node's drains cost beside
     // its work, taken off every node.
     crate::dissect::start();
@@ -479,21 +499,35 @@ fn check_estimate_of(
     walked: Profile,
     say: &mut dyn FnMut(&str),
 ) -> Result<String, String> {
-    let (mut shell, trace) = load_every_rung(artifact, deployment, chip)?;
+    // The rungs come of a load; the shell each check fire runs on is then
+    // sized from the fires (engine::load::CheckFire).
+    let checked = |shell: &crate::Shell| -> Result<_, String> {
+        let weighed = shell.weighed().cloned().ok_or_else(|| {
+            "this device has no rates in its profile to estimate by: run `pie tune --rates`"
+                .to_string()
+        })?;
+        let laid = shell.budget().max_tokens;
+        let rungs: Vec<engine::load::RungFacts> = weighed
+            .rungs
+            .iter()
+            .filter(|r| r.infeasible.is_none() && r.tokens <= laid)
+            .copied()
+            .collect();
+        Ok((weighed, laid, rungs))
+    };
+    let (shell, _) = load_every_rung(artifact, deployment, chip.clone(), ROOMY)?;
+    let (_, _, rungs) = checked(&shell)?;
+    drop(shell);
+    let size = sized(rungs.iter().map(engine::load::RungFacts::check_fire));
+    let (mut shell, trace) = load_every_rung(artifact, deployment, chip, size)?;
+    let (weighed, laid, rungs) = checked(&shell)?;
     let model = engine::load::model_class(&trace).to_owned();
-    let weighed = shell.weighed().cloned().ok_or_else(|| {
-        "this device has no rates in its profile to estimate by: run `pie tune --rates`".to_string()
-    })?;
-    let laid = shell.budget().max_tokens;
-    let rungs: Vec<engine::load::RungFacts> = weighed
-        .rungs
-        .iter()
-        .filter(|r| r.infeasible.is_none() && r.tokens <= laid)
-        .copied()
-        .collect();
     say(&format!(
-        "timing a fire at each of {} rung widths of {model} (laid to {laid})",
-        rungs.len()
+        "timing a fire at each of {} rung widths of {model} (laid to {laid}) on {} slots of {} \
+         tokens",
+        rungs.len(),
+        size.0,
+        size.1
     ));
     let mut meas = Vec::new();
     for r in &rungs {
