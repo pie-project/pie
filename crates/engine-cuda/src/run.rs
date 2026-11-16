@@ -2582,9 +2582,11 @@ impl<'c> Run<'c> {
                 gathered.page_indptr_host.as_slice(),
                 gathered.kv_len_host.as_slice(),
             ),
+            // The planner reads the live lanes' boundaries from the fire's
+            // first lane of this window, whatever its carve reaches.
             None => {
                 let first = span.lane_offset as usize;
-                let lanes = ceiling.map_or(span.lanes, |(_, lanes)| lanes) as usize;
+                let lanes = span.lanes as usize;
                 (
                     seat.kv_indptr
                         .get(first..=first + lanes)
@@ -2617,10 +2619,6 @@ impl<'c> Run<'c> {
         assert!(
             shape.num_requests >= live.requests,
             "a carve is never narrower than the fire"
-        );
-        assert!(
-            shape.lane_offset >= live.lane_offset,
-            "a carve starts at or before the fire"
         );
         assert!(shape.lane_offset + shape.num_requests >= live.lane_offset + live.requests);
         let rows = rows_ceiling.unwrap_or(span.rows);
