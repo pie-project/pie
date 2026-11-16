@@ -187,6 +187,30 @@ impl Plane {
         self.cache.stats()
     }
 
+    /// Compiles each of `registrations` into the cache without registering
+    /// it (the runtime's prewarm of its standard samplers, before ready): a
+    /// later registration of one, its knob values in its channels, finds
+    /// every stage built. Returns the region modules this compiled.
+    pub fn prewarm(
+        &mut self,
+        context: &Context,
+        registrations: &[ProgramRegistration],
+    ) -> Result<u64> {
+        let before = self.cache.stats().compilations;
+        for registration in registrations {
+            let plan = adopt_launch_package(registration.launch.clone())?;
+            self.cache.compile(
+                context,
+                registration.program_hash,
+                &plan,
+                &registration.emitted_kernels,
+                Versions::from_compiler(registration.emitter_version),
+                Target::of(context)?,
+            )?;
+        }
+        Ok(self.cache.stats().compilations - before)
+    }
+
     pub fn register(
         &mut self,
         context: &Context,
