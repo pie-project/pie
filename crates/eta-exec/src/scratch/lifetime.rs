@@ -7,7 +7,7 @@ use eta_ir::Dtype;
 use eta_ir::op::tags;
 use eta_ir::types::MAX_RANK;
 
-use super::{Layout, Lifetime, TooLarge, layout, layout_reusing};
+use super::{ChunkLayout, Layout, Lifetime, TooLarge, layout, layout_chunked, layout_reusing};
 use crate::extent::{Extents, Unresolvable, ValueDesc, describe};
 
 /// Nodes of a stage an engine runs together.
@@ -279,6 +279,20 @@ pub fn lay_out(
         Some(lifetimes) => layout_reusing(descriptors, &lifetimes, run.reserve, run.temporary),
         None => layout(descriptors),
     }
+}
+
+/// `plan`'s scratch under `run` in chunks of `chunk` bytes
+/// ([`layout_chunked`]): values share bytes where their lifetimes part, no
+/// value crosses a chunk, and each holds its own bytes where a node is
+/// neither launched nor idle.
+pub fn lay_out_chunked(
+    plan: &LaunchStagePlan,
+    descriptors: &[ValueDesc],
+    run: &Launches<'_>,
+    chunk: u64,
+) -> Result<ChunkLayout, TooLarge> {
+    let lifetimes = value_lifetimes(plan, run).unwrap_or_default();
+    layout_chunked(descriptors, &lifetimes, run.reserve, run.temporary, chunk)
 }
 
 /// The rows each of `plan`'s regions walks: its row value's, one where it
