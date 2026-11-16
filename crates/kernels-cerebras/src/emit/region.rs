@@ -698,10 +698,49 @@ impl Printer<'_> {
                                 e - hop
                             }
                     });
-                if !swap && !halves {
+                // a head's halves swapped and its rest kept (a partial rotation's): blocks of
+                // `per` columns, the first `2 hop` of each its halves' mates, the rest their own
+                let per = (!swap && !halves && hop > 0)
+                    .then(|| (2 * hop..=c).find(|&p| p == c || idx[p] as usize != p))
+                    .flatten()
+                    .filter(|&per| {
+                        per > 2 * hop
+                            && c.is_multiple_of(per)
+                            && idx.iter().enumerate().all(|(e, &m)| {
+                                let r = e % per;
+                                m as usize
+                                    == if r < hop {
+                                        e + hop
+                                    } else if r < 2 * hop {
+                                        e - hop
+                                    } else {
+                                        e
+                                    }
+                            })
+                    });
+                if !swap && !halves && per.is_none() {
                     return refuse(format!("op {k}: a gather other than a pair's mate"));
                 }
                 let s = self.row_of(src)?;
+                if let Some(per) = per {
+                    let part = |t: &str, o: usize, n: usize| {
+                        format!("@increment_dsd_offset(@set_dsd_length({t}, {n}), {o}, f32)")
+                    };
+                    for b in (0..c).step_by(per) {
+                        let _ = writeln!(
+                            self.body,
+                            "  @fmovs({}, {}); @fmovs({}, {}); @fmovs({}, {});",
+                            part(&d, b, hop),
+                            part(&s, b + hop, hop),
+                            part(&d, b + hop, hop),
+                            part(&s, b, hop),
+                            part(&d, b + 2 * hop, per - 2 * hop),
+                            part(&s, b + 2 * hop, per - 2 * hop)
+                        );
+                    }
+                    self.vals.insert(v, Val::Buf(dst));
+                    return Ok(());
+                }
                 if halves {
                     let part = |t: &str, o: usize| {
                         format!("@increment_dsd_offset(@set_dsd_length({t}, {hop}), {o}, f32)")

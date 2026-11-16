@@ -693,7 +693,7 @@ fn lowers_explicitly(op: &Operation) -> bool {
     matches!(
         op,
         Operation::Elemwise(Elemwise::RopeAxes {
-            form: RopeForm::Interleaved,
+            form: RopeForm::Interleaved | RopeForm::Split | RopeForm::Neox,
             ..
         }) | Operation::Elemwise(Elemwise::Rope {
             turn: Turn::Full { .. } | Turn::Partial { .. } | Turn::Last { .. } | Turn::Yarn { .. },
@@ -1622,6 +1622,39 @@ impl Builder {
                     }
                 }
                 let out = self.b.rotate_axes(self.get(*x)?, *head_dim, &axes);
+                self.set(*x_out, out);
+            }
+            // a rotation over position axes in a head's halves: each axis's run its own
+            // (split) or the axes' angles over the rotated half (NeoX), the rest of the head
+            // as it is
+            Elemwise::RopeAxes {
+                x,
+                positions,
+                dims,
+                thetas,
+                form: form @ (RopeForm::Split | RopeForm::Neox),
+                rotary_dim,
+                head_dim,
+                x_out,
+            } => {
+                let split = matches!(form, RopeForm::Split);
+                if *rotary_dim > *head_dim
+                    || dims.iter().sum::<u32>() != *rotary_dim
+                    || *head_dim == 0
+                    || !self.width.is_multiple_of(*head_dim)
+                    || dims.iter().any(|d| d % 2 != 0)
+                {
+                    return None;
+                }
+                let mut axes = Vec::new();
+                for (axis, (&dim, &theta)) in (0u32..).zip(dims.iter().zip(thetas)) {
+                    if dim > 0 {
+                        axes.push((dim, theta, self.part(*positions, axis)?));
+                    }
+                }
+                let out =
+                    self.b
+                        .rotate_axes_halves(self.get(*x)?, *head_dim, &axes, split, *rotary_dim);
                 self.set(*x_out, out);
             }
             // AttnRes's blend: each candidate (the closed blocks, then the
