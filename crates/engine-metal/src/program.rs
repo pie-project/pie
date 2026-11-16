@@ -1550,7 +1550,58 @@ mod tests {
         )
     }
 
-/// The guest-program contract (`eta_compiler::contract`) on this engine:
+/// A contract case's logits as the engine seats them
+    /// (`eta_compiler::contract::Case::seats`): `values`, `rows` rows of
+    /// the vocabulary, laid in a bf16 plane where the case's seats put each
+    /// row (one lane's seat holding every row, or a lane a row, laid last
+    /// first with NaN between), and every seat bound.
+    fn seat_case(
+        context: &Context,
+        plane: &mut Plane,
+        id: InstanceId,
+        case: &eta_compiler::contract::Case,
+        values: &[f32],
+    ) -> crate::device::Buffer {
+        let seats = case.seats();
+        let vocab = case.vocab as usize;
+        // Each row's first element in the plane, in elements: a lane a row
+        // at its own seat, else on the one seat's pitch.
+        let row_at = |row: usize| -> usize {
+            match seats.iter().find(|seat| seat.lane as usize == row) {
+                Some(seat) if seats.len() > 1 => (seat.offset / 4) as usize,
+                _ => (seats[0].offset / 4) as usize + row * seats[0].row_stride as usize,
+            }
+        };
+        let rows = values.len() / vocab;
+        let len = (0..rows).map(|row| row_at(row) + vocab).max().unwrap_or(vocab);
+        let mut laid = vec![0x7fc0u16; len];
+        for row in 0..rows {
+            for (at, x) in values[row * vocab..][..vocab].iter().enumerate() {
+                laid[row_at(row) + at] = (x.to_bits() >> 16) as u16;
+            }
+        }
+        let bytes: Vec<u8> = laid.iter().flat_map(|half| half.to_le_bytes()).collect();
+        let mut buffer =
+            crate::device::Buffer::zeroed(context, bytes.len() as u64).expect("a logits plane");
+        buffer.write(0, &bytes).expect("the logits upload");
+        for seat in &seats {
+            plane
+                .bind_output(
+                    id,
+                    "logits",
+                    seat.lane,
+                    &buffer,
+                    seat.offset / 2,
+                    eta_ir::Dtype::Bf16,
+                    seat.width,
+                    seat.row_stride,
+                )
+                .expect("the logits seat binds");
+        }
+        buffer
+    }
+
+    /// The guest-program contract (`eta_compiler::contract`) on this engine:
     /// each case's program registered, bound with its seeds, fired over its
     /// logits, and every channel the host reads exactly what the
     /// interpreter puts there.
@@ -1614,17 +1665,7 @@ mod tests {
                     },
                 )
                 .expect("the instance binds");
-            let mut logits = crate::device::Buffer::zeroed(&context, case.logits.len() as u64 * 2)
-                .expect("a logits plane");
-            let bytes: Vec<u8> = case
-                .logits
-                .iter()
-                .flat_map(|x| ((x.to_bits() >> 16) as u16).to_le_bytes())
-                .collect();
-            logits.write(0, &bytes).expect("the logits upload");
-            plane
-                .bind_output(id, "logits", 0, &logits, 0, eta_ir::Dtype::Bf16, case.vocab, case.vocab)
-                .expect("the logits bind");
+            let _logits = seat_case(&context, &mut plane, id, &case, &case.logits);
             let fired = plane
                 .fire(&context, id, Attach::Epilogue, &guests(&context))
                 .expect("the fire runs");
@@ -1645,7 +1686,82 @@ mod tests {
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
-/// [`a_beam_step_answers_what_the_interpreter_answers`] over many steps:
+/// A seat the program reads nothing at is refused by name at the fire,
+    /// never dropped: beam's step reads its logits at lane 0, `rows` rows,
+    /// so lanes 1.. of those rows are its rows (the LaneARow cases), and a
+    /// seat at lane `rows` is past every row it reads.
+    #[test]
+    fn a_seat_no_read_reaches_is_refused_by_name() {
+        use eta_compiler::codegen::program::{Backend, emit_program};
+        use eta_compiler::contract::beam_stage;
+        use eta_compiler::plan::compile_bound;
+        let Ok(context) = Context::bind() else {
+            eprintln!("no device: skipping");
+            return;
+        };
+        let case = beam_stage().into_iter().next().expect("a case");
+        let stages = compile_bound(&case.bound);
+        let backend = Backend::parse("metal").expect("the metal codegen");
+        let registration = ProgramRegistration {
+            program_hash: 0xbea2_0000 ^ u64::from(case.rows),
+            emitted_kernels: emit_program(backend, &stages, &case.bound),
+            emitter_version: backend.emitter_version(),
+            launch: eta_compiler::codegen::launch::build(&case.bound, &stages),
+            ..Default::default()
+        };
+        let pools = crate::store::Pools::guests_only(&context, CHUNK, 4).expect("a pool");
+        let mut plane = Plane::new();
+        plane.set_flight(1, 1, case.rows);
+        let program = plane.register(&context, &registration).expect("compiles");
+        let facts = plane.facts(program, &pools).expect("the program's facts");
+        let count = case.bound.container.channels.len();
+        let ids: Vec<ChannelId> = (1..=count as u64).map(ChannelId).collect();
+        let (instance, rings) = slots_for(&pools, &facts, 0);
+        let id = plane
+            .bind(
+                &context,
+                program,
+                &case.wire_seeds(),
+                Extents {
+                    row_count: case.rows,
+                    sampled_rows: case.rows,
+                    query_len: case.rows,
+                    ..Extents::default()
+                },
+                GeometryClass::Host,
+                PortMask::NONE,
+                &ids,
+                session::Pooled {
+                    pools: &pools,
+                    instance: &instance,
+                    rings: &rings,
+                },
+            )
+            .expect("binds");
+        let logits = seat_case(&context, &mut plane, id, &case, &case.logits);
+        plane
+            .bind_output(
+                id,
+                "logits",
+                case.rows,
+                &logits,
+                0,
+                eta_ir::Dtype::Bf16,
+                case.vocab,
+                case.vocab,
+            )
+            .expect("a seat binds; the fire refuses it");
+        let why = plane
+            .fire(&context, id, Attach::Epilogue, &guests(&context))
+            .expect_err("a seat no read reaches is refused")
+            .to_string();
+        assert!(
+            why.contains(&format!("`logits` is seated at lane {}", case.rows)),
+            "the refusal names the seat: {why}"
+        );
+    }
+
+    /// [`a_beam_step_answers_what_the_interpreter_answers`] over many steps:
     /// the stage's own state carried across fires on the device (its scores,
     /// tokens, the parents' mask rows, slots, positions), each step's logits
     /// new, every reader each step what the interpreter, stepped alongside,
@@ -1717,19 +1833,10 @@ mod tests {
                 )
                 .expect("binds");
             let mut reference = Instance::new(&case.bound, &case.seeds).expect("instantiates");
-            let mut logits = crate::device::Buffer::zeroed(&context, case.logits.len() as u64 * 2)
-                .expect("a logits plane");
             let carve = guests(&context);
             'steps: for step in 0..STEPS {
                 let values = step_logits(case.logits.len(), step);
-                let bytes: Vec<u8> = values
-                    .iter()
-                    .flat_map(|x| ((x.to_bits() >> 16) as u16).to_le_bytes())
-                    .collect();
-                logits.write(0, &bytes).expect("the logits upload");
-                plane
-                    .bind_output(id, "logits", 0, &logits, 0, eta_ir::Dtype::Bf16, case.vocab, case.vocab)
-                    .expect("the logits bind");
+                let _logits = seat_case(&context, &mut plane, id, &case, &values);
                 let fired = plane.fire(&context, id, Attach::Epilogue, &carve).expect("fires");
                 assert!(matches!(fired, Fired::Committed), "{} step {step}: {fired:?}", case.name);
                 let inputs = PassInputs {
@@ -1869,19 +1976,10 @@ mod tests {
                 )
                 .expect("binds");
             let mut reference = Instance::new(&case.bound, &case.seeds).expect("instantiates");
-            let mut logits = crate::device::Buffer::zeroed(&context, case.logits.len() as u64 * 2)
-                .expect("a logits plane");
             let carve = guests(&context);
             'steps: for step in 0..STEPS {
                 let values = step_logits(case.logits.len(), step);
-                let bytes: Vec<u8> = values
-                    .iter()
-                    .flat_map(|x| ((x.to_bits() >> 16) as u16).to_le_bytes())
-                    .collect();
-                logits.write(0, &bytes).expect("the logits upload");
-                plane
-                    .bind_output(id, "logits", 0, &logits, 0, eta_ir::Dtype::Bf16, case.vocab, case.vocab)
-                    .expect("the logits bind");
+                let _logits = seat_case(&context, &mut plane, id, &case, &values);
                 let fired = plane.fire(&context, id, Attach::Epilogue, &carve).expect("fires");
                 assert!(matches!(fired, Fired::Committed), "{} step {step}: {fired:?}", case.name);
                 let inputs = PassInputs {
@@ -2001,17 +2099,7 @@ mod tests {
                 .expect("binds");
             let before = plane.instance(id).expect("bound").head_cell(mask as u32).expect("reads");
             assert_eq!(before, seed, "{}: the head cell holds the seed at bind", case.name);
-            let mut logits = crate::device::Buffer::zeroed(&context, case.logits.len() as u64 * 2)
-                .expect("a logits plane");
-            let bytes: Vec<u8> = case
-                .logits
-                .iter()
-                .flat_map(|x| ((x.to_bits() >> 16) as u16).to_le_bytes())
-                .collect();
-            logits.write(0, &bytes).expect("upload");
-            plane
-                .bind_output(id, "logits", 0, &logits, 0, eta_ir::Dtype::Bf16, case.vocab, case.vocab)
-                .expect("the logits bind");
+            let _logits = seat_case(&context, &mut plane, id, &case, &case.logits);
             let carve = guests(&context);
             for step in 0..3 {
                 plane.fire(&context, id, Attach::Epilogue, &carve).expect("fires");

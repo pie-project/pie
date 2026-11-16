@@ -492,6 +492,9 @@ pub(super) fn emit_addressed_gather(
         "    const uint addressed_stride = \
          addressed_seat.stride == 0u ? addressed_width : addressed_seat.stride;\n",
     );
+    // Ids read an i32 seat (2); floats any other: f32 (0), bf16 (1), or a
+    // table of row addresses whose rows are bf16 (3) or f32 (4), a lane-0
+    // read's rows seated at the instance's lanes.
     let storage = if ints { "!= 2u" } else { "== 2u" };
     let _ = writeln!(
         source,
@@ -515,7 +518,13 @@ pub(super) fn emit_addressed_gather(
     } else {
         let _ = writeln!(
             source,
-            "      reinterpret_cast<device float*>({o0})[i] = addressed_seat.storage == 0u \
+            "      reinterpret_cast<device float*>({o0})[i] = addressed_seat.storage >= 3u \
+             ? (addressed_seat.storage == 4u \
+                ? reinterpret_cast<const device float*>(reinterpret_cast<const device ulong*>(\
+                    addressed_seat.at)[i / addressed_width])[i % addressed_width] \
+                : float(reinterpret_cast<const device bfloat*>(reinterpret_cast<const device ulong*>(\
+                    addressed_seat.at)[i / addressed_width])[i % addressed_width])) \
+             : addressed_seat.storage == 0u \
              ? reinterpret_cast<const device float*>(addressed_seat.at)[from] \
              : float(reinterpret_cast<const device bfloat*>(addressed_seat.at)[from]);"
         );
