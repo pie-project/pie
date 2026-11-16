@@ -638,8 +638,8 @@ impl FireCtx<'_> {
 
     /// Lays a row for each of the fire's capturing lanes (those of a class
     /// running a score capture), in lane order, at the top of its programs'
-    /// span: the key rows, then the page rows where a program the fire
-    /// carries reads them, then the capturing table (each row's lane).
+    /// span: the key rows, then the page rows, then the capturing table
+    /// (each row's lane): what every reader's term states a lane.
     /// Each capture value's slot is its rows; the programs lay under them,
     /// in what each reading program's term states a member.
     fn lay_captures(&mut self, p: &Prepared<'_>, slots: &mut SlotTable) -> Result<FireCaptures> {
@@ -658,39 +658,21 @@ impl FireCtx<'_> {
                 binding: None,
             });
         }
-        let mut pages_read = false;
-        for attached in p.attachments.iter().filter(|a| !a.adapter_only) {
-            pages_read |= self
-                .programs
-                .reads(attached.instance)?
-                .iter()
-                .any(|(name, _)| name == crate::program::SCORE_PAGES);
-        }
         let n = lanes.len() as u64;
         let keys = n * u64::from(captures.context) * 4;
-        let pages = if pages_read {
-            n * u64::from(captures.pages) * 4
-        } else {
-            0
-        };
+        let pages = n * u64::from(captures.pages) * 4;
         let rows = u32::try_from(n).unwrap_or(u32::MAX);
-        let base = self.programs.hold_captures(rows, keys + pages + n * 4)?;
+        // What each reader's term states a lane (`program::capture_term`).
+        let per_row = captures.rows();
+        let base = self
+            .programs
+            .hold_captures(rows, n * (per_row.keys + per_row.pages))?;
         for &(value, page_row) in &captures.values {
-            slots.0[value.0 as usize] = match (page_row, pages_read) {
-                (false, _) => Some(kernels_cuda::Tensor::new(
-                    base,
-                    rows,
-                    captures.context,
-                    Dtype::F32,
-                )),
-                (true, true) => Some(kernels_cuda::Tensor::new(
-                    base + keys,
-                    rows,
-                    captures.pages,
-                    Dtype::F32,
-                )),
-                (true, false) => None,
-            };
+            slots.0[value.0 as usize] = Some(if page_row {
+                kernels_cuda::Tensor::new(base + keys, rows, captures.pages, Dtype::F32)
+            } else {
+                kernels_cuda::Tensor::new(base, rows, captures.context, Dtype::F32)
+            });
         }
         let table = base + keys + pages;
         let bytes: Vec<u8> = lanes.iter().flat_map(|lane| lane.to_le_bytes()).collect();
