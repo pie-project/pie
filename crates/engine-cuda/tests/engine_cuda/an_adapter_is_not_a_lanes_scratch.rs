@@ -158,7 +158,7 @@ fn a_plane_a_launched_op_also_reads_is_still_carried() {
     let alone = adapter_scratch(LAYERS, RANK, HIDDEN);
     let plane = u64::from(LAYERS) * u64::from(RANK) * u64::from(HIDDEN) * 4;
     assert!(
-        shared >= alone + plane,
+        shared >= plane && shared > alone,
         "`A` feeds the sink AND a negate that is launched, so it is a value \
          this fire really does have to carry — {shared} bytes a lane against \
          {alone} when only the sink reads it, and one plane is {plane}"

@@ -124,12 +124,18 @@ struct Vacant {
     class: u64,
 }
 
+/// A value of at most this many bytes takes no hole sixteen times its size:
+/// a scalar split off a row's hole leaves the row that follows no room.
+const SMALL_BYTES: u64 = 4096;
+
 fn take(free: &mut Vec<Vacant>, span: u64, launch: u32, class: u64) -> Option<u64> {
     let best = free
         .iter()
         .enumerate()
         .filter(|(_, block)| {
-            block.span >= span && (block.launch < launch || (class != 0 && block.class == class))
+            block.span >= span
+                && !(span <= SMALL_BYTES && block.span >= 16 * span)
+                && (block.launch < launch || (class != 0 && block.class == class))
         })
         .min_by_key(|(_, block)| block.span)
         .map(|(index, _)| index)?;

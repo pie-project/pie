@@ -2,7 +2,7 @@
 use eta_compiler::codegen::cuda_steps;
 use eta_compiler::codegen::launch::LaunchStagePlan;
 use eta_compiler::plan::{LibraryOp, RegionKind};
-use eta_exec::tables::StageTables;
+use eta_exec::tables::SteppedTables;
 use eta_exec::{
     Extents, LANE_HEADER_BYTES, LANE_RECORD_BYTES, LaneChannelSlot, LaneHeader, LaneRecord,
     LaneShape, NO_TICKET, OpParams, SCRATCH_ALIGN, SCRATCH_DUMMY_BYTES, SCRATCH_POISON, ValueDesc,
@@ -135,8 +135,8 @@ pub struct Held {
     /// channels above.
     pub ring_bytes: Vec<Option<u64>>,
     /// Where each stage's tables lie in the instance's item: its
-    /// descriptors, op params, value offsets and config.
-    pub tables: Vec<[u64; 4]>,
+    /// descriptors, op params, value offsets and config, then its steps.
+    pub tables: Vec<[u64; 5]>,
 }
 
 /// What every cell span in an item starts a whole number of.
@@ -150,6 +150,7 @@ impl Held {
     pub fn of(
         channels: &[eta_compiler::codegen::launch::LaunchChannel],
         plans: &[LaunchStagePlan],
+        steps: &[usize],
     ) -> Held {
         let mut at = registry_bytes(channels.len()).next_multiple_of(CELL_ALIGN);
         let mut native_at = Vec::with_capacity(channels.len());
@@ -167,9 +168,12 @@ impl Held {
             }
         }
         let mut tables = Vec::with_capacity(plans.len());
-        for plan in plans {
-            let mut stage = [0u64; 4];
-            for (slot, bytes) in stage.iter_mut().zip(eta_exec::tables::table_sizes(plan)) {
+        for (index, plan) in plans.iter().enumerate() {
+            let mut stage = [0u64; 5];
+            let [descs, params, offs, cfg] = eta_exec::tables::table_sizes(plan);
+            let steps = (steps.get(index).copied().unwrap_or(0).max(1)
+                * cuda_steps::STEP_RECORD_BYTES) as u64;
+            for (slot, bytes) in stage.iter_mut().zip([descs, params, offs, cfg, steps]) {
                 at = at.next_multiple_of(TABLE_ALIGN);
                 *slot = at;
                 at += bytes;
@@ -318,9 +322,9 @@ impl Rings {
     }
 
     /// Where stage `stage`'s tables lie on the device now: its
-    /// descriptors, op params, value offsets and config.
+    /// descriptors, op params, value offsets and config, then its steps.
     #[must_use]
-    pub fn tables(&self, stage: usize) -> Option<[u64; 4]> {
+    pub fn tables(&self, stage: usize) -> Option<[u64; 5]> {
         let offsets = self.held.tables.get(stage)?;
         Some(offsets.map(|at| self.registry + at))
     }
@@ -516,6 +520,13 @@ pub struct Prepared {
     /// a bind writes them into each instance's `Instance` slots
     /// (`Held::tables`).
     tables: [Vec<u8>; 4],
+    /// Each node's temporary area, a word offset in a lane's scratch, which
+    /// its steps' records carry.
+    temporaries: Vec<u32>,
+    /// The bytes a sort's ladder keeps, one lane slot's share of the fire's
+    /// arena, and where that arena lies in the fire's span.
+    arena_bytes: u32,
+    arena: u64,
     /// The blocks a step runs a lane on.
     groups: u32,
     /// Where the fire's lane table, scratch and cells lie in its span,
@@ -523,6 +534,8 @@ pub struct Prepared {
     table: u64,
     table_host: Vec<u8>,
     scratch: u64,
+    /// Two words a lane slot, where a lane's blocks meet between steps.
+    barriers: u64,
     /// The lanes' intrinsic tables (bases, modes, widths, strides,
     /// offsets) and pending flags, one span staged in one copy a commit
     /// (`cell_at` their offsets, `cells_host` its image).
@@ -550,9 +563,16 @@ pub struct Prepared {
 /// What every span of a stage starts a whole number of in the fire's span.
 const SPAN_ALIGN: u64 = 256;
 
-/// The spans a stage lays in a fire's span: its lane table, scratch and
-/// cells.
-const SPANS: u64 = 3;
+/// The spans a stage lays in a fire's span: its lane table, scratch, cells,
+/// barriers and arena.
+const SPANS: u64 = 5;
+
+/// The most blocks a lane's stage runs on.
+const MAX_GROUPS: u32 = 64;
+
+/// The most lane slots a stage that sorts runs at once, each with its
+/// share of the fire's arena: its fire's other lanes take a slot after.
+const ARENA_SLOTS: u32 = 16;
 
 /// The blocks a step of a stage runs a lane on: enough for its widest
 /// value a thread an element, at most four a multiprocessor.
@@ -566,8 +586,8 @@ fn groups_for(descriptors: &[ValueDesc]) -> u32 {
 /// `plan`'s tables and a lane's scratch at `extents`. A sink's operands (an
 /// adapter's planes, landed at bind) are the engine's, and take no bytes of
 /// a lane.
-fn staged(plan: &LaunchStagePlan, extents: Extents) -> Result<StageTables> {
-    eta_exec::tables::stage_tables_launched(plan, &extents, |region| {
+fn staged(plan: &LaunchStagePlan, extents: Extents) -> Result<SteppedTables> {
+    eta_exec::tables::stepped_tables(plan, &extents, |region| {
         region.kind != RegionKind::Library(LibraryOp::SecondParty)
     })
     .map_err(|why| Fault::program("program::launch", why))
@@ -575,17 +595,17 @@ fn staged(plan: &LaunchStagePlan, extents: Extents) -> Result<StageTables> {
 
 /// Each of `plan`'s values as a bind at `extents` describes it.
 pub fn describe_values(plan: &LaunchStagePlan, extents: Extents) -> Result<Vec<ValueDesc>> {
-    staged(plan, extents).map(|staged| staged.descriptors)
+    staged(plan, extents).map(|staged| staged.tables.descriptors)
 }
 
 /// The bytes a lane of `plan` at `extents` takes of a fire's scratch.
 pub fn scratch_bytes(plan: &LaunchStagePlan, extents: Extents) -> Result<u64> {
-    staged(plan, extents).map(|staged| staged.scratch)
+    staged(plan, extents).map(|staged| staged.tables.scratch)
 }
 
 /// Where each of `plan`'s values lies in a lane's scratch at `extents`.
 pub fn scratch_offsets(plan: &LaunchStagePlan, extents: Extents) -> Result<Vec<u64>> {
-    staged(plan, extents).map(|staged| staged.offsets)
+    staged(plan, extents).map(|staged| staged.tables.offsets)
 }
 
 impl Prepared {
@@ -596,7 +616,11 @@ impl Prepared {
     ) -> Result<Prepared> {
         let channel_count = u32::try_from(plan.channel_bindings.len())
             .map_err(|_| Fault::program("program::launch", "more channels than a u32 can count"))?;
-        let staged = staged(plan, extents)?;
+        let SteppedTables {
+            tables: staged,
+            temporaries,
+            arena,
+        } = staged(plan, extents)?;
         let mut tables = staged.tables;
         // A put's cell bytes, which the shared params leave to the engine.
         let record = size_of::<OpParams>();
@@ -633,10 +657,15 @@ impl Prepared {
             .map_err(|_| Fault::program("program::launch", "a scratch stride past a u32"))?;
         Ok(Prepared {
             tables,
+            temporaries,
+            arena_bytes: u32::try_from(arena)
+                .map_err(|_| Fault::program("program::launch", "a sort's arena past a u32"))?,
+            arena: 0,
             groups: groups_for(&staged.descriptors),
             table: 0,
             table_host: Vec::new(),
             scratch: 0,
+            barriers: 0,
             cells: 0,
             cell_at: [0; 6],
             cells_host: Vec::new(),
@@ -662,6 +691,12 @@ impl Prepared {
         &self.tables
     }
 
+    /// Each node's temporary area at this stage's extents.
+    #[must_use]
+    pub fn temporaries(&self) -> &[u32] {
+        &self.temporaries
+    }
+
     /// The bytes of the spans whose size no lane count changes: the lane
     /// table's header, and the room every span's alignment may take.
     #[must_use]
@@ -669,8 +704,8 @@ impl Prepared {
         LANE_HEADER_BYTES + SPANS * SPAN_ALIGN + 6 * 16
     }
 
-    /// The bytes each lane adds: its record and channel slots, its scratch
-    /// and its intrinsic and pending cells.
+    /// The bytes each lane adds: its record and channel slots, its scratch,
+    /// its intrinsic and pending cells, its barrier and its arena share.
     #[must_use]
     pub fn lane_bytes(&self) -> u64 {
         let words = self.pitch as u64;
@@ -679,6 +714,10 @@ impl Prepared {
             + u64::from(self.scratch_stride)
             + words * (size_of::<u64>() + 4 * size_of::<u32>()) as u64
             + u64::from(self.channel_count).max(1)
+            + 2 * size_of::<u32>() as u64
+            // A lane slot's share of the arena: a fire lays one a lane, up to
+            // `ARENA_SLOTS`.
+            + u64::from(self.arena_bytes)
     }
 
     /// Lays this stage for `lanes` lanes in the fire's span from `at` up,
@@ -774,6 +813,10 @@ impl Prepared {
             self.cells_host = vec![0u8; cell_at];
         }
         self.cells = take(cell_at);
+        self.barriers = take(2 * size_of::<u32>() * lanes as usize);
+        // After the scratch, so a lane finds its slot's share words past it.
+        let (_, slots) = self.shape_for(lanes);
+        self.arena = take(self.arena_bytes as usize * slots as usize);
         self.lanes = lanes;
         Ok(next)
     }
@@ -918,15 +961,15 @@ impl Prepared {
         self.cells + self.cell_at[cell] as u64
     }
 
-    /// Launches `stage`'s steps for the lanes staged, in order, each a
-    /// kernel of the closed set over every lane at once: the stage's
-    /// tables at `tables` (where a bind laid them, in an instance of the
-    /// flight; every instance of it lays the same bytes), each lane over
-    /// its own scratch.
+    /// Launches `stage` for the lanes staged: one launch of the stage
+    /// kernel, which runs the stage's steps in order over every lane, the
+    /// stage's tables at `tables` (where a bind laid them, in an instance
+    /// of the flight; every instance of it lays the same bytes), each lane
+    /// over its own scratch.
     pub fn launch_steps(
         &self,
         stage: &Stage,
-        tables: [u64; 4],
+        tables: [u64; 5],
         stream: *mut core::ffi::c_void,
     ) -> Result<()> {
         if self.filled == 0 || stage.steps.is_empty() {
@@ -939,39 +982,61 @@ impl Prepared {
         if cfg!(feature = "test-slot-fill") {
             self.poison_dummy(stream)?;
         }
+        let (groups, slots) = self.shape();
+        // The lane slots' barriers start every launch at zero.
+        crate::device::zero_span_on(stream, self.barriers, 2 * size_of::<u32>() * slots as usize)?;
         let pitch = u32::try_from(self.pitch).unwrap_or(u32::MAX);
-        for step in stage.steps.iter() {
-            let mut args = Args::new();
-            args.ptr(self.table)
-                .ptr(self.lane_records_ptr())
-                .ptr(self.channel_slots_ptr())
-                .ptr(tables[0])
-                .ptr(tables[1])
-                .ptr(tables[2])
-                .ptr(tables[3])
-                .ptr(self.scratch)
-                .u32(self.scratch_stride)
-                .ptr(self.cell(5))
-                .ptr(self.cell(0))
-                .ptr(self.cell(1))
-                .ptr(self.cell(2))
-                .ptr(self.cell(3))
-                .ptr(self.cell(4))
-                .u32(pitch)
-                .u32(self.groups)
-                .u32(step.uniform.node)
-                .u32(step.uniform.rung)
-                .u32(step.uniform.selector);
-            launch(
-                &step.module,
-                self.filled.saturating_mul(self.groups),
-                cuda_steps::BLOCK,
-                &mut args,
-                cuda_steps::ARITY,
-                stream,
-            )?;
+        let steps = u32::try_from(stage.steps.len()).unwrap_or(u32::MAX);
+        let mut args = Args::new();
+        args.ptr(self.table)
+            .ptr(self.lane_records_ptr())
+            .ptr(self.channel_slots_ptr())
+            .ptr(tables[0])
+            .ptr(tables[1])
+            .ptr(tables[2])
+            .ptr(tables[3])
+            .ptr(self.scratch)
+            .u32(self.scratch_stride)
+            .ptr(self.cell(5))
+            .ptr(self.cell(0))
+            .ptr(self.cell(1))
+            .ptr(self.cell(2))
+            .ptr(self.cell(3))
+            .ptr(self.cell(4))
+            .u32(pitch)
+            .u32(groups)
+            .ptr(tables[4])
+            .u32(steps)
+            .ptr(self.barriers)
+            .ptr(self.arena)
+            .u32(self.arena_bytes);
+        launch(
+            &stage.module,
+            slots * groups,
+            cuda_steps::BLOCK,
+            &mut args,
+            cuda_steps::ARITY,
+            stream,
+        )
+    }
+
+    /// The blocks a lane runs on and the lane slots one launch holds: as
+    /// wide as the stage's widest value asks, at most [`MAX_GROUPS`], every
+    /// block of the launch resident at once (one a multiprocessor), its
+    /// lanes looped over the slots where the fire carries more.
+    fn shape(&self) -> (u32, u32) {
+        self.shape_for(self.filled)
+    }
+
+    fn shape_for(&self, lanes: u32) -> (u32, u32) {
+        let units = device_units().max(1);
+        let mut lanes = lanes.max(1);
+        if self.arena_bytes != 0 {
+            lanes = lanes.min(ARENA_SLOTS);
         }
-        Ok(())
+        let groups = (units / lanes).clamp(1, MAX_GROUPS).min(self.groups.max(1));
+        let slots = lanes.min((units / groups).max(1));
+        (groups, slots)
     }
 
     #[must_use]
@@ -1390,13 +1455,24 @@ mod tests {
     /// the temporary area's share of it; and what it was while the rows a
     /// scan of the model's row leaves unwritten, and the reshapes read as
     /// their sources, held bytes.
-    /// Every program inferlets ship runs as steps of the closed set, its
-    /// tables and a lane's scratch resolved at a bind's extents, the scratch
-    /// what a lane of a fire takes.
+    /// Every program inferlets ship runs as steps of the closed set, and a
+    /// lane of it takes no more scratch than the fused regions laid for it
+    /// (`WAS`, a lane at a vocabulary of 151,936): an output is read where
+    /// it lies, a value its one elementwise reader can compute is computed
+    /// there, and a ladder's buffers are the fire's arena's.
     #[test]
     fn a_shipped_program_runs_as_steps_of_the_set() {
+        const WAS: [(&str, u64); 6] = [
+            ("top-p", 2_898_432),
+            ("top-k + top-p", 3_658_240),
+            ("gumbel-max", 1_792),
+            ("greedy", 768),
+            ("top logprobs", 1_900_800),
+            ("sorted", 3_040_000),
+        ];
         let vocab = shipped::QWEN_VOCAB;
-        for (name, traced) in shipped::all(vocab) {
+        for ((name, traced), (was_name, was)) in shipped::all(vocab).into_iter().zip(WAS) {
+            assert_eq!(name, was_name);
             let package = shipped::package(&traced, vocab);
             let [plan] = &package.plans[..] else {
                 panic!("{name}: one stage");
@@ -1404,12 +1480,13 @@ mod tests {
             let steps = eta_compiler::codegen::cuda_steps::stage_steps(plan)
                 .unwrap_or_else(|tag| panic!("{name}: no kernel serves tag {tag:#x}"));
             assert!(!steps.is_empty(), "{name}: a stage of no steps");
-            let staged = eta_exec::tables::stage_tables(plan, &Extents::default())
-                .unwrap_or_else(|why| panic!("{name}: {why}"));
+            let scratch = staged(plan, Extents::default())
+                .unwrap_or_else(|why| panic!("{name}: {why:?}"))
+                .tables
+                .scratch;
             assert!(
-                staged.scratch < 16 << 20,
-                "{name}: {} bytes of scratch a lane",
-                staged.scratch
+                scratch <= was,
+                "{name}: {scratch} bytes of scratch a lane, {was} before"
             );
         }
     }

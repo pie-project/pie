@@ -17,7 +17,7 @@ use eta_ir::registry::{GeometryClass, PortMask, Stage as Attach};
 use crate::device::Context;
 use crate::error::{Fault, Result};
 
-pub use compile::{Cache, Compiled, Disk, Module, Stage, Step, Target};
+pub use compile::{Cache, Compiled, Disk, Module, Stage, Target};
 pub use endpoint::Endpoint;
 pub use launch::{
     ChannelShape, Cursor, Held, Place, Prepared, Rings, describe_values, scratch_bytes,
@@ -104,7 +104,7 @@ fn tables_of(
     instances: &BTreeMap<InstanceId, Bound>,
     members: &[InstanceId],
     index: usize,
-) -> Result<[u64; 4]> {
+) -> Result<[u64; 5]> {
     members
         .first()
         .and_then(|first| instances.get(first))
@@ -487,7 +487,11 @@ impl Plane {
             .find(|batch| batch.extents == extents)
             .map_or(&[][..], |batch| &batch.stages[..]);
         let place = slots.place(
-            &Held::of(&program.plan.package.channels, &program.plan.package.plans),
+            &Held::of(
+                &program.plan.package.channels,
+                &program.plan.package.plans,
+                &program.compiled.step_counts(),
+            ),
             span,
         )?;
         let endpoints = endpoints_for(&program.plan, adopted, stream)?;
@@ -531,7 +535,13 @@ impl Plane {
     pub fn held(&self, program_id: ProgramId) -> Result<Held> {
         self.programs
             .get(&program_id)
-            .map(|program| Held::of(&program.plan.package.channels, &program.plan.package.plans))
+            .map(|program| {
+                Held::of(
+                    &program.plan.package.channels,
+                    &program.plan.package.plans,
+                    &program.compiled.step_counts(),
+                )
+            })
             .ok_or_else(|| Fault::program("program::plane", format!("no program {program_id}")))
     }
 
@@ -543,7 +553,11 @@ impl Plane {
                 continue;
             };
             let place = bound.slots.place(
-                &Held::of(&program.plan.package.channels, &program.plan.package.plans),
+                &Held::of(
+                    &program.plan.package.channels,
+                    &program.plan.package.plans,
+                    &program.compiled.step_counts(),
+                ),
                 span,
             )?;
             bound.session.rebase(&place)?;
@@ -562,7 +576,11 @@ impl Plane {
             Fault::program("program::plane", format!("instance {id}'s program is gone"))
         })?;
         let place = slots.place(
-            &Held::of(&program.plan.package.channels, &program.plan.package.plans),
+            &Held::of(
+                &program.plan.package.channels,
+                &program.plan.package.plans,
+                &program.compiled.step_counts(),
+            ),
             span,
         )?;
         bound.session.rebase(&place)?;
@@ -824,9 +842,9 @@ impl Plane {
             }
         }
 
-        // Every group's steps are launches a block apart, none waiting on
-        // another's blocks.
-        let meet = vec![false; groups.len()];
+        // A stage's blocks wait on one another between its steps, so its
+        // launch needs them resident at once: no group flies beside another.
+        let meet = vec![true; groups.len()];
         // Each group's span, laid down from there: its flights fly one
         // after another in it, as wide as its widest.
         let mut places = Vec::with_capacity(groups.len());

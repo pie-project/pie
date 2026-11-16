@@ -111,7 +111,11 @@ impl Session {
         let rings = Rings::allocate(
             &shapes,
             endpoints,
-            super::launch::Held::of(&plan.package.channels, &plan.package.plans),
+            super::launch::Held::of(
+                &plan.package.channels,
+                &plan.package.plans,
+                &compiled.step_counts(),
+            ),
             place,
             stream,
         )?;
@@ -123,6 +127,9 @@ impl Session {
             };
             for (bytes, &address) in prepared.tables().iter().zip(&at) {
                 crate::device::stage_raw(stream, address, bytes)?;
+            }
+            if let Some(stage) = compiled.stages.get(index) {
+                crate::device::stage_raw(stream, at[4], &stage.table(prepared.temporaries()))?;
             }
         }
         let cursors = vec![Cursor { head: 0, tail: 0 }; shapes.len()];
@@ -187,7 +194,7 @@ impl Session {
 
     /// Where stage `stage`'s tables lie on the device now.
     #[must_use]
-    pub fn tables(&self, stage: usize) -> Option<[u64; 4]> {
+    pub fn tables(&self, stage: usize) -> Option<[u64; 5]> {
         self.rings.tables(stage)
     }
 

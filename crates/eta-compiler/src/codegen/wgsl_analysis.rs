@@ -121,18 +121,30 @@ fn uses(plan: &LaunchStagePlan, bases: &[u32]) -> Uses {
 
 #[must_use]
 pub fn analyze_stage(plan: &LaunchStagePlan) -> StageFusion {
+    analyze(plan, true)
+}
+
+/// [`analyze_stage`] for an engine that reads `channel_bindings` as the
+/// stage's channels and nothing else (the SIMT stepper,
+/// `codegen::cuda_steps`): every reshape that covers its source is its
+/// source's bytes.
+#[must_use]
+pub fn analyze_stepped(plan: &LaunchStagePlan) -> StageFusion {
+    analyze(plan, false)
+}
+
+fn analyze(plan: &LaunchStagePlan, honor_bound: bool) -> StageFusion {
     let types = symbolic_types(&plan.value_types);
     let bases = result_bases(plan);
     let uses = uses(plan, &bases);
-    let bound: Vec<bool> = {
-        let mut bound = alloc::vec![false; plan.value_types.len()];
+    let mut bound = alloc::vec![false; plan.value_types.len()];
+    if honor_bound {
         for &value in &plan.channel_bindings {
             if let Some(slot) = bound.get_mut(value as usize) {
                 *slot = true;
             }
         }
-        bound
-    };
+    }
 
     let mut table = AliasTable::new();
     let mut fusion = StageFusion::default();

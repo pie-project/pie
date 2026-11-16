@@ -13,8 +13,8 @@ use eta_compiler::codegen::{steps, wgsl, wgsl_analysis};
 use eta_ir::op::tags;
 
 use crate::{
-    Extents, Launch, Launches, OpParams, SELECT_RESERVE, ValueDesc, describe_launched, lay_out,
-    whole_value_temporaries,
+    Extents, Launch, Launches, Lifetime, OpParams, SELECT_RESERVE, ValueDesc, describe_launched,
+    lay_out, layout_reusing, value_lifetimes,
 };
 
 pub const DESC_WORDS: usize = 9;
@@ -75,6 +75,47 @@ pub struct Stepping {
     /// A launched node takes the one-row select's ladder, whose state lies
     /// just below the temporary area (`SELECT_RESERVE`).
     pub selects: bool,
+    /// What each launched node that keeps state in the temporary area
+    /// keeps there: the value it orders or folds, and how.
+    pub temporaries: Vec<(u32, Temporary)>,
+}
+
+/// What a launch keeps in the temporary area for the value it reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Temporary {
+    /// A sort's ladder: two key-and-index buffers of the value, which a
+    /// pivot's cut reuses (four words an element).
+    Sort,
+    /// A reduce's ladder: two buffers of each row's 32-fold partials, a
+    /// value and an index each.
+    Reduce,
+}
+
+impl Temporary {
+    /// The bytes it keeps for a value `d` describes.
+    #[must_use]
+    pub fn bytes(self, d: &ValueDesc) -> u64 {
+        match self {
+            Temporary::Sort => 16 * u64::from(d.len),
+            Temporary::Reduce => {
+                let rows = rows_of(d);
+                let len = u64::from(d.len) / rows.max(1);
+                16 * rows * len.div_ceil(32)
+            }
+        }
+    }
+}
+
+/// A value's rows as the runtime counts them: every axis but the last.
+fn rows_of(d: &ValueDesc) -> u64 {
+    if d.rank < 2 {
+        return 1;
+    }
+    d.dims
+        .iter()
+        .take(d.rank as usize - 1)
+        .map(|&dim| u64::from(dim))
+        .product()
 }
 
 impl Stepping {
@@ -106,20 +147,29 @@ impl Stepping {
             .into_iter()
             .map(|(result, _)| result)
             .collect();
-        stepping.selects = launched.iter().any(|&node| {
+        for &node in &launched {
             let at = node as usize;
-            matches!(
-                steps::ladder_of(plan, at, plan.ops[at].tag),
-                steps::Ladder::Select { .. }
-            )
-        });
+            let op = &plan.ops[at];
+            let ladder = steps::ladder_of(plan, at, op.tag);
+            stepping.selects |= matches!(ladder, steps::Ladder::Select { .. });
+            let kept = match ladder {
+                steps::Ladder::Sort { .. } | steps::Ladder::Select { rank: false, .. } => {
+                    Some(Temporary::Sort)
+                }
+                steps::Ladder::Reduce { .. } => Some(Temporary::Reduce),
+                _ => None,
+            };
+            if let (Some(kept), Some(&arg)) = (kept, op.args.first()) {
+                stepping.temporaries.push((arg, kept));
+            }
+        }
         stepping.launched = launched;
         stepping
     }
 
     /// The launches `descriptors` are laid over: below the temporary area
-    /// the one-row select's state, in it what a launch that sorts or
-    /// reduces a whole value takes.
+    /// the one-row select's state, in it the most a launch that sorts or
+    /// reduces keeps there.
     #[must_use]
     pub fn launches(&self, descriptors: &[ValueDesc]) -> Launches<'_> {
         Launches {
@@ -129,7 +179,16 @@ impl Stepping {
             kept: self.kept.clone(),
             hollow: self.hollow.clone(),
             reserve: if self.selects { SELECT_RESERVE } else { 0 },
-            temporary: whole_value_temporaries(descriptors).unwrap_or(u64::MAX),
+            temporary: self
+                .temporaries
+                .iter()
+                .map(|&(value, kept)| {
+                    descriptors
+                        .get(value as usize)
+                        .map_or(u64::MAX, |d| kept.bytes(d))
+                })
+                .max()
+                .unwrap_or(0),
         }
     }
 }
@@ -198,6 +257,245 @@ pub fn stage_tables_launched(
     .map_err(|why| format!("a guest pass's scratch does not fit: {why:?}"))?;
     alias_reshapes(plan, &mut scratch.values);
 
+    let tables = tables_of(
+        plan,
+        &descriptors,
+        &scratch.values,
+        u32::try_from(scratch.temporary / 4).unwrap_or(u32::MAX),
+    );
+    Ok(StageTables {
+        descriptors,
+        tables,
+        offsets: scratch.values,
+        scratch: scratch.total.max(256),
+    })
+}
+
+/// A value's dtype word where its elements are an output's rows, read
+/// where they lie (`codegen::cuda_steps`): the base dtype in the low byte,
+/// this bit, and the output's node from [`EXTERNAL_NODE_SHIFT`] up.
+pub const EXTERNAL: u32 = 0x100;
+
+/// A value's dtype word where its elements are computed where they are
+/// read (`codegen::cuda_steps::computed_where_read`), by its node (from
+/// [`EXTERNAL_NODE_SHIFT`] up).
+pub const COMPUTED: u32 = 0x200;
+
+/// Where an external or computed value's dtype word holds its node.
+pub const EXTERNAL_NODE_SHIFT: u32 = 10;
+
+/// What a stepper that runs each node's steps in the stage's order
+/// resolves at a bind ([`stepped_tables`]): the tables; each node's
+/// temporary area in a lane's scratch (a word offset: the one-row select's
+/// state lies just below it; 0 for a node that keeps none there); and the
+/// most bytes a ladder keeps, which lie in an arena of the fire's rather
+/// than in any lane's scratch.
+pub struct SteppedTables {
+    pub tables: StageTables,
+    pub temporaries: Vec<u32>,
+    pub arena: u64,
+}
+
+/// Resolves `plan` against `extents` for a stepper that runs every node in
+/// the stage's order, boundary ops among them (`codegen::cuda_steps`),
+/// where the regions `launches` says no to are another party's. Its
+/// scratch is laid tighter than [`stage_tables`] lays it:
+/// - an output's result (and a reshape of it) takes no bytes: it is read
+///   where the output lies ([`EXTERNAL`] in its descriptor);
+/// - a reshape that covers its source is the source's bytes
+///   (`wgsl_analysis::analyze_stepped`);
+/// - a read's, a take's and a constant's result is live from its node,
+///   and a put's value until it;
+/// - the one-row select keeps its state as a value of its own, live at its
+///   node only, in bytes a value dead by then held;
+/// - a ladder that orders or folds a value (a sort's, a top-k's, a
+///   pivot's, the one the one-row select hands a row to, a reduce's) keeps
+///   its buffers in the fire's arena ([`SteppedTables::arena`]), which a
+///   lane uses only while it runs that node.
+pub fn stepped_tables(
+    plan: &LaunchStagePlan,
+    extents: &Extents,
+    launches: impl Fn(&LaunchRegion) -> bool,
+) -> Result<SteppedTables, String> {
+    let mut descriptors = describe_launched(plan, extents, launches).map_err(|why| {
+        format!("a guest value's shape does not resolve against this fire: {why:?}")
+    })?;
+    let fusion = wgsl_analysis::analyze_stepped(plan);
+    let computed = eta_compiler::codegen::cuda_steps::computed_where_read(plan);
+    let values = descriptors.len();
+
+    let mut hollow: Vec<u32> = fusion.aliases.iter().map(|&(result, _)| result).collect();
+    let mut order: Vec<u32> = Vec::new();
+    let mut idle: Vec<u32> = Vec::new();
+    let mut result_base = 0u32;
+    for (node, op) in plan.ops.iter().enumerate() {
+        let results = result_base..result_base.saturating_add(u32::from(op.result_count));
+        result_base = results.end;
+        let node = u32::try_from(node).map_err(|_| "a stage past a u32 of nodes".to_string())?;
+        if op.tag == tags::OUTPUT {
+            for result in results {
+                if let Some(d) = descriptors.get_mut(result as usize) {
+                    d.dtype = (d.dtype & 0xFF) | EXTERNAL | (node << EXTERNAL_NODE_SHIFT);
+                }
+                hollow.push(result);
+            }
+            idle.push(node);
+            continue;
+        }
+        if computed[node as usize] {
+            for result in results {
+                if let Some(d) = descriptors.get_mut(result as usize) {
+                    d.dtype = (d.dtype & 0xFF) | COMPUTED | (node << EXTERNAL_NODE_SHIFT);
+                }
+                hollow.push(result);
+            }
+            idle.push(node);
+            continue;
+        }
+        let edge = matches!(op.tag, tags::CHAN_READ | tags::CHAN_TAKE | tags::CHAN_PUT);
+        if edge || (!wgsl::is_boundary(op.tag) && fusion.emits_node(node as usize)) {
+            order.push(node);
+        } else {
+            idle.push(node);
+        }
+    }
+    // A reshape of an output, or of a computed value, is it too.
+    for &(result, root) in &fusion.aliases {
+        let root_dtype = descriptors.get(root as usize).map(|d| d.dtype);
+        if let (Some(dtype), Some(d)) = (root_dtype, descriptors.get_mut(result as usize))
+            && dtype & (EXTERNAL | COMPUTED) != 0
+        {
+            d.dtype = dtype;
+        }
+    }
+
+    let run = Launches {
+        each: order.iter().map(Launch::of_node).collect(),
+        idle,
+        hollow,
+        ..Launches::default()
+    };
+    let mut lifetimes = value_lifetimes(plan, &run)
+        .ok_or_else(|| "a guest stage's nodes are neither run nor idle".to_string())?;
+    // A computed value's arguments live as long as it is read, latest
+    // first, so a chain carries its reader's step down to its roots.
+    let mut bases = Vec::with_capacity(plan.ops.len());
+    let mut base = 0u32;
+    for op in &plan.ops {
+        bases.push(base);
+        base += u32::from(op.result_count);
+    }
+    let alias_of = |value: u32| {
+        fusion
+            .aliases
+            .iter()
+            .find(|&&(result, _)| result == value)
+            .map_or(value, |&(_, root)| root)
+    };
+    for (node, op) in plan.ops.iter().enumerate().rev() {
+        if !computed[node] {
+            continue;
+        }
+        let last = lifetimes
+            .get(bases[node] as usize)
+            .map_or(0, |life| life.last);
+        for arg in op.reads() {
+            for value in [arg, alias_of(arg)] {
+                if let Some(life) = lifetimes.get_mut(value as usize) {
+                    life.last = life.last.max(last);
+                    life.launch_last = life.launch_last.max(last);
+                }
+            }
+        }
+    }
+    let mut laid = descriptors.clone();
+    let mut kept: Vec<(u32, u64, usize)> = Vec::new();
+    let mut arena = 0u64;
+    for (step, &node) in order.iter().enumerate() {
+        let at = node as usize;
+        let op = &plan.ops[at];
+        let ladder = steps::ladder_of(plan, at, op.tag);
+        let select = matches!(ladder, steps::Ladder::Select { .. });
+        let temporary = match ladder {
+            steps::Ladder::Sort { .. } | steps::Ladder::Select { rank: false, .. } => {
+                Some(Temporary::Sort)
+            }
+            steps::Ladder::Reduce { .. } => Some(Temporary::Reduce),
+            _ => None,
+        };
+        let bytes = op
+            .args
+            .first()
+            .and_then(|&arg| descriptors.get(arg as usize))
+            .zip(temporary)
+            .map_or(0, |(d, kept)| kept.bytes(d));
+        let reserve = if select { SELECT_RESERVE } else { 0 };
+        // A ladder's buffers are the fire's arena's; a lane keeps only the
+        // select's state.
+        arena = arena.max(bytes);
+        let bytes = 0;
+        if bytes + reserve == 0 {
+            continue;
+        }
+        let len = u32::try_from((bytes + reserve).div_ceil(4))
+            .map_err(|_| "a guest temporary past a u32 of words".to_string())?;
+        let step = u32::try_from(step).unwrap_or(u32::MAX);
+        kept.push((node, reserve, laid.len()));
+        laid.push(ValueDesc {
+            len,
+            rows: 1,
+            last: len,
+            rank: 1,
+            dtype: 0,
+            dims: [len, 0, 0, 0],
+        });
+        lifetimes.push(Lifetime {
+            dead: false,
+            def: step,
+            last: step,
+            reusable: true,
+            launch_def: step,
+            launch_last: step,
+            class_def: Lifetime::SEQUENTIAL,
+            class_last: Lifetime::SEQUENTIAL,
+        });
+    }
+    let layout = layout_reusing(&laid, &lifetimes, 0, 0)
+        .map_err(|why| format!("a guest pass's scratch does not fit: {why:?}"))?;
+    let mut offsets = layout.values[..values].to_vec();
+    for &(result, root) in &fusion.aliases {
+        if let Some(&at) = offsets.get(root as usize)
+            && let Some(slot) = offsets.get_mut(result as usize)
+        {
+            *slot = at;
+        }
+    }
+    let mut temporaries = vec![0u32; plan.ops.len()];
+    for (node, reserve, value) in kept {
+        temporaries[node as usize] =
+            u32::try_from((layout.values[value] + reserve) / 4).unwrap_or(u32::MAX);
+    }
+    let tables = tables_of(plan, &descriptors, &offsets, 0);
+    Ok(SteppedTables {
+        tables: StageTables {
+            descriptors,
+            offsets,
+            scratch: layout.total.max(256),
+            tables,
+        },
+        temporaries,
+        arena: arena.next_multiple_of(256),
+    })
+}
+
+/// The tables' bytes ([`table_sizes`] each): `descriptors`, the ops'
+/// params, `offsets`, and the config with `temporary` words.
+fn tables_of(
+    plan: &LaunchStagePlan,
+    descriptors: &[ValueDesc],
+    offsets: &[u64],
+    temporary: u32,
+) -> [Vec<u8>; 4] {
     let sizes = table_sizes(plan);
     let sized = |mut bytes: Vec<u8>, at: usize| {
         bytes.resize(usize::try_from(sizes[at]).unwrap_or(usize::MAX), 0);
@@ -213,26 +511,20 @@ pub fn stage_tables_launched(
         params.extend_from_slice(&OpParams::of(op, result_base, plan.output_slots).to_le_bytes());
         result_base += u32::from(op.result_count);
     }
-    let offsets: Vec<u32> = scratch
-        .values
+    let offsets: Vec<u32> = offsets
         .iter()
         .map(|&at| u32::try_from(at).unwrap_or(u32::MAX))
         .collect();
     let config = Cfg {
         value_count: u32::try_from(plan.value_types.len()).unwrap_or(u32::MAX),
-        temporary: u32::try_from(scratch.temporary / 4).unwrap_or(u32::MAX),
+        temporary,
         op_count: u32::try_from(plan.ops.len()).unwrap_or(u32::MAX),
         lane: 0,
     };
-    Ok(StageTables {
-        descriptors,
-        tables: [
-            sized(descs, 0),
-            sized(params, 1),
-            sized(words_le(&offsets), 2),
-            sized(config.to_le_bytes(), 3),
-        ],
-        offsets: scratch.values,
-        scratch: scratch.total.max(256),
-    })
+    [
+        sized(descs, 0),
+        sized(params, 1),
+        sized(words_le(&offsets), 2),
+        sized(config.to_le_bytes(), 3),
+    ]
 }

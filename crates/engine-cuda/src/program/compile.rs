@@ -1,14 +1,12 @@
 #![allow(unsafe_code)]
-use std::collections::HashMap;
 use std::fs;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use eta_compiler::codegen::cuda_steps::{self, Kernel};
+use eta_compiler::codegen::cuda_steps;
 use eta_compiler::codegen::launch::LaunchStagePlan;
-use eta_compiler::codegen::steps::StepUniform;
 use eta_exec::{
     Backend, Bounded, CacheStats, ExecPlan, Failure, MAX_NEGATIVE_ENTRIES, MAX_PROGRAM_ENTRIES,
 };
@@ -631,20 +629,31 @@ fn parse(bytes: &[u8], key: &str, entry: &str) -> Option<Vec<u8>> {
     Some(bytes[cubin_at..].to_vec())
 }
 
-/// A step of a stage: a kernel of the closed set, and the uniform it runs
-/// with (`eta_compiler::codegen::steps::StepUniform`).
-#[derive(Debug, Clone)]
-pub struct Step {
-    pub module: Arc<Module>,
-    pub uniform: StepUniform,
-}
-
 #[derive(Debug, Clone)]
 pub struct Stage {
     pub signature_hash: u64,
-    /// The steps the stage runs, in order; none for a stage the device runs
-    /// nothing for.
-    pub steps: Arc<Vec<Step>>,
+    /// The stage kernel, which interprets every stage of every program.
+    pub module: Arc<Module>,
+    /// The stage's steps, in order, as its table holds them
+    /// (`cuda_steps::record`): none for a stage the device runs nothing for.
+    pub steps: Arc<Vec<[u32; 4]>>,
+}
+
+impl Stage {
+    /// The bytes of the stage's step table, as a bind writes it: each
+    /// step's record, its node's temporary area (`temporaries`, a bind's)
+    /// in it.
+    #[must_use]
+    pub fn table(&self, temporaries: &[u32]) -> Vec<u8> {
+        self.steps
+            .iter()
+            .flat_map(|&[call, node, rung, selector]| {
+                let temporary = temporaries.get(node as usize).copied().unwrap_or(0);
+                [call, node, rung, selector, temporary, 0, 0, 0]
+            })
+            .flat_map(u32::to_le_bytes)
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -654,15 +663,23 @@ pub struct Compiled {
     pub kinds: Arc<Vec<Attach>>,
 }
 
-/// The kernels of the closed set (`eta_compiler::codegen::cuda_steps`),
-/// built once for the engine at load ([`Cache::arm`]), and the programs
-/// registered over them. A program names no kernel of its own: its stages'
-/// steps index the set, so a registration builds nothing.
+impl Compiled {
+    /// The steps each stage runs.
+    #[must_use]
+    pub fn step_counts(&self) -> Vec<usize> {
+        self.stages.iter().map(|stage| stage.steps.len()).collect()
+    }
+}
+
+/// The closed set (`eta_compiler::codegen::cuda_steps`) as one kernel that
+/// interprets a stage, built once for the engine at load ([`Cache::arm`]),
+/// and the programs registered over it. A program names no kernel of its
+/// own: its stages' steps index the set, so a registration builds nothing.
 #[derive(Debug)]
 pub struct Cache {
     programs: Bounded<u64, Compiled>,
     negative: Bounded<u64, String>,
-    kernels: HashMap<Kernel, Arc<Module>>,
+    stage: Option<Arc<Module>>,
     disk: Disk,
     stats: CacheStats,
     /// The kernels a registration found unbuilt and built: after ready
@@ -682,7 +699,7 @@ impl Cache {
         Cache {
             programs: Bounded::new(MAX_PROGRAM_ENTRIES),
             negative: Bounded::new(MAX_NEGATIVE_ENTRIES),
-            kernels: HashMap::new(),
+            stage: None,
             disk,
             stats: CacheStats::default(),
             late: 0,
@@ -699,95 +716,53 @@ impl Cache {
         self.stats
     }
 
-    /// The kernels a registration built because the set held none of them.
+    /// The kernels a registration built because the load had not.
     #[must_use]
     pub const fn built_late(&self) -> u64 {
         self.late
     }
 
-    /// Builds every kernel of the closed set for `target` (from the disk
-    /// where it holds them, the rest compiled side by side): what a load
-    /// does before ready.
+    /// Builds the stage kernel for `target`, or reads it from the disk:
+    /// what a load does before ready.
     pub fn arm(&mut self, target: &Target) -> std::result::Result<(), Failure> {
-        let missing: Vec<Kernel> = cuda_steps::kernels()
-            .into_iter()
-            .filter(|kernel| !self.kernels.contains_key(kernel))
-            .collect();
-        self.build(target, &missing)
+        self.stage_module(target).map(|_| ())
     }
 
-    fn build(&mut self, target: &Target, kernels: &[Kernel]) -> std::result::Result<(), Failure> {
-        let sources: Vec<(String, String, String)> = kernels
-            .iter()
-            .map(|&kernel| {
-                let source = cuda_steps::source(kernel);
-                let key = region_key(target, &source);
-                (cuda_steps::entry(kernel), key, source)
-            })
-            .collect();
-        let mut cubins: Vec<Option<Vec<u8>>> = sources
-            .iter()
-            .map(|(entry, key, _)| {
-                let cubin = self.disk.load(key, entry)?;
-                if late_memory(&cubin).is_err() {
-                    self.disk.invalidate(key);
-                    return None;
-                }
+    fn stage_module(&mut self, target: &Target) -> std::result::Result<Arc<Module>, Failure> {
+        if let Some(module) = &self.stage {
+            return Ok(Arc::clone(module));
+        }
+        let entry = cuda_steps::ENTRY;
+        let source = cuda_steps::source();
+        let key = region_key(target, &source);
+        let cubin = match self.disk.load(&key, entry) {
+            Some(cubin) if late_memory(&cubin).is_ok() => {
                 self.stats.persistent_hits += 1;
-                Some(cubin)
-            })
-            .collect();
-        let architecture = target.architecture();
-        let compiled: Vec<(usize, std::result::Result<Vec<u8>, Failure>)> =
-            std::thread::scope(|scope| {
-                let handles: Vec<_> = cubins
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, cubin)| cubin.is_none())
-                    .map(|(at, _)| {
-                        let source = &sources[at].2;
-                        let architecture = &architecture;
-                        (at, scope.spawn(move || compile(source, architecture)))
-                    })
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|(at, handle)| {
-                        (
-                            at,
-                            handle.join().unwrap_or_else(|_| {
-                                Err(Failure::Retryable {
-                                    reason: "a kernel's compile panicked".into(),
-                                })
-                            }),
-                        )
-                    })
-                    .collect()
-            });
-        for (at, cubin) in compiled {
-            let (entry, key, _) = &sources[at];
-            let cubin = cubin?;
-            self.stats.compilations += 1;
-            late_memory(&cubin).map_err(|why| Failure::Deterministic {
-                reason: format!("`{entry}`: {why}"),
-            })?;
-            self.disk.store(key, entry, &cubin);
-            cubins[at] = Some(cubin);
-        }
-        for ((&kernel, (entry, _, _)), cubin) in kernels.iter().zip(&sources).zip(cubins) {
-            let cubin = cubin.ok_or_else(|| Failure::Retryable {
-                reason: format!("`{entry}` was neither on disk nor compiled"),
-            })?;
-            let module = Module::load(&cubin, entry, 0).map_err(|error| Failure::Retryable {
-                reason: format!("loading `{entry}`: {error}"),
-            })?;
-            self.kernels.insert(kernel, Arc::new(module));
-        }
-        Ok(())
+                cubin
+            }
+            stale => {
+                if stale.is_some() {
+                    self.disk.invalidate(&key);
+                }
+                let cubin = compile(&source, &target.architecture())?;
+                self.stats.compilations += 1;
+                late_memory(&cubin).map_err(|why| Failure::Deterministic {
+                    reason: format!("`{entry}`: {why}"),
+                })?;
+                self.disk.store(&key, entry, &cubin);
+                cubin
+            }
+        };
+        let module = Module::load(&cubin, entry, 0).map_err(|error| Failure::Retryable {
+            reason: format!("loading `{entry}`: {error}"),
+        })?;
+        let module = Arc::new(module);
+        self.stage = Some(Arc::clone(&module));
+        Ok(module)
     }
 
-    /// The program's stages as steps of the set. A kernel the set does not
-    /// hold yet is built here and counted ([`Cache::built_late`]).
+    /// The program's stages as steps of the set. A stage kernel the load
+    /// did not build is built here and counted ([`Cache::built_late`]).
     pub fn compile(
         &mut self,
         program_hash: u64,
@@ -828,37 +803,35 @@ impl Cache {
         plan: &ExecPlan,
         target: &Target,
     ) -> std::result::Result<Vec<Stage>, Failure> {
+        if self.stage.is_none() {
+            self.stage_module(target)?;
+            self.late += 1;
+        }
+        let module = self.stage.clone().ok_or_else(|| Failure::Retryable {
+            reason: "the stage kernel is not built".into(),
+        })?;
+        let set = cuda_steps::kernels();
         let mut stages = Vec::with_capacity(plan.package.plans.len());
         for (index, stage_plan) in plan.package.plans.iter().enumerate() {
-            let planned =
-                cuda_steps::stage_steps(stage_plan).map_err(|tag| Failure::Deterministic {
-                    reason: format!(
-                        "stage {index} runs `{}` (tag {tag:#04x}), which no kernel of this \
-                         engine's closed set serves; a guest pass runs on the device whole \
-                         or not at all",
-                        eta_ir::op::spec(tag).map_or("?", |row| row.name)
-                    ),
-                })?;
-            let unbuilt: Vec<Kernel> = planned
+            let refused = |tag: u8| Failure::Deterministic {
+                reason: format!(
+                    "stage {index} runs `{}` (tag {tag:#04x}), which no kernel of this \
+                     engine's closed set serves; a guest pass runs on the device whole \
+                     or not at all",
+                    eta_ir::op::spec(tag).map_or("?", |row| row.name)
+                ),
+            };
+            let steps = cuda_steps::stage_steps(stage_plan)
+                .map_err(refused)?
                 .iter()
-                .map(|step| step.kernel)
-                .filter(|kernel| !self.kernels.contains_key(kernel))
-                .collect::<std::collections::HashSet<_>>()
-                .into_iter()
-                .collect();
-            if !unbuilt.is_empty() {
-                self.build(target, &unbuilt)?;
-                self.late += unbuilt.len() as u64;
-            }
-            let steps = planned
-                .iter()
-                .map(|step| Step {
-                    module: Arc::clone(&self.kernels[&step.kernel]),
-                    uniform: step.uniform,
+                .map(|step| {
+                    cuda_steps::record(step, &set)
+                        .ok_or_else(|| refused(stage_plan.ops[step.uniform.node as usize].tag))
                 })
-                .collect();
+                .collect::<std::result::Result<Vec<_>, _>>()?;
             stages.push(Stage {
                 signature_hash: stage_plan.signature_hash,
+                module: Arc::clone(&module),
                 steps: Arc::new(steps),
             });
         }
@@ -931,13 +904,12 @@ mod tests {
         let target = device_target();
         let mut cache = Cache::new(Disk::at(&directory));
         cache.arm(&target).expect("the set builds");
-        let every = eta_compiler::codegen::cuda_steps::kernels().len() as u64;
-        assert_eq!(cache.stats().compilations, every);
+        assert_eq!(cache.stats().compilations, 1);
         let mut later = Cache::new(Disk::at(&directory));
         later.arm(&target).expect("the set loads");
         assert_eq!(
             (later.stats().compilations, later.stats().persistent_hits),
-            (0, every),
+            (0, 1),
             "a later boot compiles nothing"
         );
         let _ = fs::remove_dir_all(&directory);

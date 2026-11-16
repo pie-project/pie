@@ -252,29 +252,91 @@ __device__ __forceinline__ ps_u32 ps_arith_u(ps_u32 which, ps_u32 x, ps_u32 y) {
   }
 }
 
+__device__ __forceinline__ float ps_intrinsic_load(const ps_u8* input, ps_u64 index, ps_u32 mode) {
+  if (mode == 0u) return reinterpret_cast<const float*>(input)[index];
+  return __uint_as_float((ps_u32)reinterpret_cast<const ps_u16*>(input)[index] << 16);
+}
+
+__device__ __forceinline__ float ps_intrinsic_row_load(
+    const ps_u8* input, ps_u64 row, ps_u32 column, ps_u32 stride, ps_u32 mode) {
+  if (mode != 2u) return ps_intrinsic_load(input, row * (ps_u64)stride + column, mode);
+  const ps_u64 row_address = reinterpret_cast<const ps_u64*>(input)[row];
+  const ps_u16 value = reinterpret_cast<const ps_u16*>(row_address)[column];
+  return __uint_as_float((ps_u32)value << 16);
+}
+
+// A value's dtype word where its elements are an output's rows, read where
+// they lie (`eta_exec::tables::EXTERNAL`): the output's node above.
+#define PS_EXTERNAL 0x100u
+// A value's dtype word where its elements are computed where they are read
+// (`eta_compiler::codegen::cuda_steps::computed_where_read`), by its node.
+#define PS_COMPUTED 0x200u
+#define PS_EXTERNAL_NODE_SHIFT 10u
+
+// A lane's scratch, read past L1: a stage's steps run in one launch, block
+// by block over a lane's rows, and a block reads what another wrote past
+// their barrier, where a line its own L1 kept would be stale. Unlike a
+// volatile access, a load at L2 is one the compiler may batch.
+#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
+__device__ __forceinline__ ps_u32 ps_load(const ps_u32* p) { return *(const volatile ps_u32*)p; }
+__device__ __forceinline__ void ps_store(ps_u32* p, ps_u32 v) { *(volatile ps_u32*)p = v; }
+#else
+__device__ __forceinline__ ps_u32 ps_load(const ps_u32* p) { return __ldcg(p); }
+__device__ __forceinline__ void ps_store(ps_u32* p, ps_u32 v) { __stcg(p, v); }
+#endif
+
+struct PsWord {
+  ps_u32* p;
+  __device__ __forceinline__ operator ps_u32() const { return ps_load(p); }
+  __device__ __forceinline__ PsWord& operator=(ps_u32 v) {
+    ps_store(p, v);
+    return *this;
+  }
+  __device__ __forceinline__ PsWord& operator=(const PsWord& other) {
+    ps_store(p, ps_load(other.p));
+    return *this;
+  }
+};
+
+struct PsHeap {
+  ps_u32* p;
+  __device__ __forceinline__ PsWord operator[](ps_u32 i) const { return PsWord{p + i}; }
+};
+
 // One lane's view of its stage: the tables and its scratch, as the WGSL
 // runtime's bindings and private variables hold them.
 struct Ps {
   const ps_u32* descs;
   const ps_u32* params;
   const ps_u32* offs;
-  ps_u32* heap;
+  PsHeap heap;
   ps_u32 temporary;
   ps_u32 tid;
   ps_u32 lanes;
   ps_u32 sel_lt;
   ps_u32 sel_group;
   ps_u32 sel_groups;
+  // The lane's output bindings, which an external value reads.
+  ps_u32 lane;
+  ps_u32 pitch;
+  const ps_u64* intrinsic_bases;
+  const ps_u32* intrinsic_modes;
+  const ps_u32* intrinsic_widths;
+  const ps_u32* intrinsic_strides;
+  const ps_u32* intrinsic_offsets;
 
   __device__ ps_u32 d_len(ps_u32 v) { return descs[v * DESC_WORDS + 0u]; }
   __device__ ps_u32 d_rows(ps_u32 v) { return descs[v * DESC_WORDS + 1u]; }
   __device__ ps_u32 d_last(ps_u32 v) { return descs[v * DESC_WORDS + 2u]; }
   __device__ ps_u32 d_rank(ps_u32 v) { return descs[v * DESC_WORDS + 3u]; }
-  __device__ ps_u32 d_dtype(ps_u32 v) { return descs[v * DESC_WORDS + 4u]; }
+  __device__ ps_u32 d_word(ps_u32 v) { return descs[v * DESC_WORDS + 4u]; }
+  __device__ ps_u32 d_dtype(ps_u32 v) { return d_word(v) & 0xFFu; }
   __device__ ps_u32 d_dim(ps_u32 v, ps_u32 k) { return descs[v * DESC_WORDS + 5u + k]; }
 
   __device__ ps_u32 base(ps_u32 v) { return offs[v] >> 2u; }
-  __device__ ps_u8* bytes(ps_u32 v) { return reinterpret_cast<ps_u8*>(heap) + offs[v]; }
+  __device__ volatile ps_u8* bytes(ps_u32 v) {
+    return reinterpret_cast<volatile ps_u8*>(heap.p) + offs[v];
+  }
 
   __device__ ps_u32 rows_of(ps_u32 v) {
     const ps_u32 rank = d_rank(v);
@@ -303,7 +365,88 @@ struct Ps {
   __device__ ps_u32 p_sink_bytes(ps_u32 p) { return p_at(p, 15u); }
   __device__ ps_u32 p_pred_payload(ps_u32 p) { return p_a1(p); }
 
-  __device__ ps_u32 ld_raw(ps_u32 v, ps_u32 i) { return heap[base(v) + i]; }
+  __device__ ps_u32 ld_raw(ps_u32 v, ps_u32 i) {
+    const ps_u32 word = d_word(v);
+    if ((word & PS_EXTERNAL) != 0u) return ld_external(word >> PS_EXTERNAL_NODE_SHIFT, i);
+    if ((word & PS_COMPUTED) != 0u) return ld_computed(word >> PS_EXTERNAL_NODE_SHIFT, i);
+    return heap[base(v) + i];
+  }
+
+  // A word as `st_as_f` / `st_as_i` would store it in a value of `odt`.
+  __device__ ps_u32 as_f_word(ps_u32 odt, float x) {
+    if (odt == DT_F32) return ps_bits(x);
+    if (odt == DT_I32) return (ps_u32)ps_f2i(x);
+    if (odt == DT_U32) return ps_f2u(x);
+    return 0u;
+  }
+  __device__ ps_u32 as_i_word(ps_u32 odt, int x) {
+    if (odt == DT_F32) return ps_bits((float)x);
+    return (ps_u32)x;
+  }
+
+  // Element `i` of node `p`'s result, computed here as its step would have
+  // stored it: a map, an arithmetic, a draw or an iota.
+  __device__ __noinline__ ps_u32 ld_computed(ps_u32 p, ps_u32 i) {
+    const ps_u32 tag = p_tag(p);
+    const ps_u32 o = p_o0(p);
+    const ps_u32 odt = d_dtype(o);
+    if (tag >= 0x01u && tag <= 0x0Bu) {
+      const ps_u32 a = p_a0(p);
+      const ps_u32 j = ps_pick(d_len(a), i);
+      const ps_u32 which = tag - 0x01u;
+      if (odt == DT_F32) return ps_bits(unary_f(which, a, j));
+      if (odt == DT_I32) return (ps_u32)unary_i(which, a, j);
+      return unary_u(which, a, j);
+    }
+    if ((tag >= 0x10u && tag <= 0x15u) || tag == 0x1Fu) {
+      const ps_u32 which = tag == 0x1Fu ? 6u : tag - 0x10u;
+      const ps_u32 a = p_a0(p);
+      const ps_u32 b = p_a1(p);
+      const ps_u32 ia = ps_pick(d_len(a), i);
+      const ps_u32 ib = ps_pick(d_len(b), i);
+      const ps_u32 adt = d_dtype(a);
+      if (adt == DT_F32) return as_f_word(odt, ps_arith_f(which, ld_f(a, ia), ld_f(b, ib)));
+      if (adt == DT_U32) {
+        const ps_u32 r = ps_arith_u(which, ld_u(a, ia), ld_u(b, ib));
+        return odt == DT_F32 ? ps_bits((float)r) : r;
+      }
+      return as_i_word(odt, ps_arith_i(which, ld_i(a, ia), ld_i(b, ib)));
+    }
+    if (tag == 0x70u || tag == 0x71u) {
+      ps_u64 seed;
+      if (tag == 0x71u) {
+        const ps_u32 st = p_a0(p);
+        const ps_u32 key = ld_u(st, 0u);
+        const ps_u32 ctr = d_len(st) > 1u ? ld_u(st, 1u) : 0u;
+        seed = ps_rng_keyed_seed(key, ctr);
+      } else {
+        seed = ps_rng_seed_eff_stream(0u, p_imm(p));
+      }
+      const ps_u32 kind = p_kind(p);
+      if (kind == 2u) return ps_bits(ps_rng_hash_normal(seed, i));
+      const float u = ps_rng_hash_uniform(seed, i);
+      return ps_bits(kind == 1u ? -logf(-logf(u)) : u);
+    }
+    if (tag == 0x64u) {
+      if (odt == DT_F32) return ps_bits((float)i);
+      return i;
+    }
+    return 0u;
+  }
+
+  // Element `i` of output node `p`'s result, as its word would hold it:
+  // an f32 (of f32, bf16, or bf16 rows by pointer) or an id as stored.
+  __device__ __noinline__ ps_u32 ld_external(ps_u32 p, ps_u32 i) {
+    const ps_u32 at = lane * pitch + p_intr(p);
+    const ps_u8* input = reinterpret_cast<const ps_u8*>(intrinsic_bases[at]);
+    const ps_u32 mode = intrinsic_modes[at];
+    const ps_u32 last = d_last(p_o0(p));
+    const ps_u32 width = last == 0u ? intrinsic_widths[at] : last;
+    const ps_u32 stride = intrinsic_strides[at] == 0u ? width : intrinsic_strides[at];
+    const ps_u64 row = (ps_u64)intrinsic_offsets[at] + (ps_u64)p_imm2(p) + i / width;
+    if (mode == 3u) return reinterpret_cast<const ps_u32*>(input)[row * stride + i % width];
+    return ps_bits(ps_intrinsic_row_load(input, row, i % width, stride, mode));
+  }
 
   __device__ ps_u32 ld_byte(ps_u32 v, ps_u32 i) {
     const ps_u32 w = heap[base(v) + (i >> 2u)];
@@ -617,6 +760,48 @@ struct Ps {
     if (n_in <= 1u) return;
     const ps_u32 n_out = (n_in + 31u) / 32u;
     const ps_u32 total = rows * n_out;
+#if !defined(__HIPCC__) && !defined(__HIP_PLATFORM_AMD__)
+    // A warp a chunk: lane k holds the chunk's element k, and the fold is the
+    // same tree, each level a shuffle down.
+    const ps_u32 me = tid & 31u;
+    for (ps_u32 job = tid >> 5; job < total; job += lanes >> 5) {
+      const ps_u32 row = job / n_out;
+      const ps_u32 c = job % n_out;
+      const ps_u32 count = ps_minu(32u, n_in - c * 32u);
+      float v = ps_red_identity(kind);
+      ps_u32 x = 0u;
+      if (me < count) {
+        const ps_u32 at = c * 32u + me;
+        if (level == 0u) {
+          v = ld_f(a, row * len + at);
+          x = at;
+        } else {
+          const ps_u32 cell = tmp_v(row, stride, at, level % 2u, rows * stride);
+          v = ps_f(heap[cell]);
+          x = heap[cell + 1u];
+        }
+      }
+      for (ps_u32 off = 16u; off >= 1u; off = off / 2u) {
+        const float ov = __shfl_down_sync(0xFFFFFFFFu, v, off);
+        const ps_u32 ox = __shfl_down_sync(0xFFFFFFFFu, x, off);
+        if (me < off) {
+          if (kind == RED_ARGMAX) {
+            if (ps_arg_takes(v, x, ov, ox, count, me, off)) {
+              v = ov;
+              x = ox;
+            }
+          } else {
+            v = ps_red_combine(kind, v, ov);
+          }
+        }
+      }
+      if (me == 0u) {
+        const ps_u32 cell = tmp_v(row, stride, c, (level + 1u) % 2u, rows * stride);
+        heap[cell] = ps_bits(v);
+        heap[cell + 1u] = x;
+      }
+    }
+#else
     for (ps_u32 job = tid; job < total; job += lanes) {
       const ps_u32 row = job / n_out;
       const ps_u32 c = job % n_out;
@@ -655,6 +840,7 @@ struct Ps {
       heap[cell] = ps_bits(vs[0]);
       heap[cell + 1u] = ix[0];
     }
+#endif
   }
 
   __device__ void op_reduce_finish(ps_u32 p, ps_u32 kind) {
@@ -1523,21 +1709,33 @@ struct Ps {
         __syncthreads();
       }
     }
-    if (sel_lt != 0u) return;
-    const float cut = ld_f(p_pred_payload(p), 0u);
-    float excl = 0.0f;
-    bool reached = false;
-    for (ps_u32 t = 0u; t < held; ++t) {
-      if (!(excl < cut)) {
-        reached = true;
-        break;
+    // The walk's values in its order, loaded side by side; one thread sums
+    // them in that order, as the reference does, and every thread marks
+    // the lanes it kept.
+    for (ps_u32 t = sel_lt; t < held; t += PTIR_WG) sel_wg_key[t] = ps_bits(ld_f(a, sel_wg_idx[t]));
+    __syncthreads();
+    if (sel_lt == 0u) {
+      const float cut = ld_f(p_pred_payload(p), 0u);
+      float excl = 0.0f;
+      bool reached = false;
+      ps_u32 t = 0u;
+      for (; t < held; ++t) {
+        if (!(excl < cut)) {
+          reached = true;
+          break;
+        }
+        excl = excl + ps_f(sel_wg_key[t]);
       }
-      const ps_u32 index = sel_wg_idx[t];
-      st_b_on(o, index);
-      excl = excl + ld_f(a, index);
+      sel_wg_skip = t;
+      const bool whole = held == d_len(a);
+      heap[sel_at(SEL_MODE)] = (reached || !(excl < cut) || whole) ? SEL_DECIDED : SEL_LADDER;
     }
-    const bool whole = held == d_len(a);
-    heap[sel_at(SEL_MODE)] = (reached || !(excl < cut) || whole) ? SEL_DECIDED : SEL_LADDER;
+    __syncthreads();
+    const ps_u32 marked = sel_wg_skip;
+    for (ps_u32 t = sel_lt; t < marked; t += PTIR_WG) {
+      const ps_u32 index = sel_wg_idx[t];
+      atomicOr(heap.p + base(o) + index / 4u, 0xFFu << (8u * (index % 4u)));
+    }
   }
 
   __device__ void op_matmul(ps_u32 p) {
@@ -1571,23 +1769,51 @@ struct Ps {
 
 // ---- the edges the engine runs here ----
 
-__device__ __forceinline__ float ps_intrinsic_load(const ps_u8* input, ps_u64 index, ps_u32 mode) {
-  if (mode == 0u) return reinterpret_cast<const float*>(input)[index];
-  return __uint_as_float((ps_u32)reinterpret_cast<const ps_u16*>(input)[index] << 16);
+// One step of a stage, as its table holds it: the call (its index in the
+// closed set, `PS_GUARDED` set where it runs only for a row the one-row
+// select handed the sort ladder), and the uniform it runs with.
+struct PsStep {
+  ps_u32 call;
+  ps_u32 node;
+  ps_u32 rung;
+  ps_u32 selector;
+  // The node's temporary area, a word offset in the lane's scratch.
+  ps_u32 temporary;
+  ps_u32 pad[3];
+};
+
+#define PS_GUARDED 0x80000000u
+// A call that keeps a sort's buffers, in the fire's arena: one a lane slot.
+#define PS_ARENA 0x40000000u
+
+static_assert(sizeof(PsStep) == 32, "step ABI");
+
+// The blocks of one lane meet here between steps: what each wrote is the
+// others' to read past it. `bar` is the lane slot's two words (arrivals,
+// generation); arrivals end every meeting back at zero.
+__device__ __forceinline__ void ps_barrier(ps_u32* bar, ps_u32 blocks) {
+  __syncthreads();
+  if (blocks > 1u && threadIdx.x == 0u) {
+    volatile ps_u32* generation = bar + 1;
+    const ps_u32 seen = *generation;
+    __threadfence();
+    if (atomicAdd(bar, 1u) == blocks - 1u) {
+      atomicExch(bar, 0u);
+      __threadfence();
+      atomicAdd(bar + 1, 1u);
+    } else {
+      while (*generation == seen) {
+      }
+    }
+    __threadfence();
+  }
+  __syncthreads();
 }
 
-__device__ __forceinline__ float ps_intrinsic_row_load(
-    const ps_u8* input, ps_u64 row, ps_u32 column, ps_u32 stride, ps_u32 mode) {
-  if (mode != 2u) return ps_intrinsic_load(input, row * (ps_u64)stride + column, mode);
-  const ps_u64 row_address = reinterpret_cast<const ps_u64*>(input)[row];
-  const ps_u16 value = reinterpret_cast<const ps_u16*>(row_address)[column];
-  return __uint_as_float((ps_u32)value << 16);
-}
-
-// The arguments every call takes: the fire's lane table, the stage's tables,
-// the lanes' scratch, their pending flags and output bindings, then the
-// launch's shape and the step's uniform (node, rung, selector).
-#define PS_ARGS                                                                \
+// The arguments the stage kernel takes: the fire's lane table, the stage's
+// tables, the lanes' scratch, their pending flags and output bindings, the
+// blocks a lane runs on, the stage's steps, and the lane slots' barriers.
+#define PS_STAGE_ARGS                                                          \
   const PtirLaneTableHeader *header, const PtirLaneRecord *lane_records,       \
       const PtirLaneChannelSlot *channels, const ps_u32 *descs,                \
       const ps_u32 *params, const ps_u32 *offs, const PsCfg *cfg,              \
@@ -1595,37 +1821,8 @@ __device__ __forceinline__ float ps_intrinsic_row_load(
       const ps_u64 *intrinsic_bases, const ps_u32 *intrinsic_modes,            \
       const ps_u32 *intrinsic_widths, const ps_u32 *intrinsic_strides,         \
       const ps_u32 *intrinsic_offsets, ps_u32 pitch, ps_u32 groups,            \
-      ps_u32 node, ps_u32 rung, ps_u32 selector
-
-// A block finds its lane and group, and runs only where its lane's fire was
-// admitted (the commit word the pull set) and still stands.
-#define PS_ENTER                                                               \
-  const ps_u32 ps_lane = blockIdx.x / groups;                                  \
-  const ps_u32 ps_group = blockIdx.x % groups;                                 \
-  if (header == nullptr || ps_lane >= header->lane_count) return;              \
-  const PtirLaneRecord& lane = lane_records[ps_lane];                          \
-  ps_u32* commit = reinterpret_cast<ps_u32*>(lane.commit_slot);                \
-  if (threadIdx.x == 0u) ps_go = commit == nullptr ? 0u : *commit;             \
-  __syncthreads();                                                             \
-  if (ps_go == 0u) return;                                                     \
-  Ps c;                                                                        \
-  c.descs = descs;                                                             \
-  c.params = params;                                                           \
-  c.offs = offs;                                                               \
-  c.heap = reinterpret_cast<ps_u32*>(all_scratch +                             \
-                                     (ps_u64)ps_lane * scratch_stride);        \
-  c.temporary = cfg->temporary;                                                \
-  c.tid = ps_group * PTIR_WG + threadIdx.x;                                    \
-  c.lanes = groups * PTIR_WG;                                                  \
-  c.sel_lt = threadIdx.x;                                                      \
-  c.sel_group = ps_group;                                                      \
-  c.sel_groups = groups;                                                       \
-  (void)channels; (void)pending_flags; (void)intrinsic_bases;                  \
-  (void)intrinsic_modes; (void)intrinsic_widths; (void)intrinsic_strides;      \
-  (void)intrinsic_offsets; (void)pitch; (void)rung; (void)selector;            \
-  (void)lane; (void)commit
-
-#define PS_GUARD if (c.sel_ladder_idle()) return
+      const PsStep *steps, ps_u32 step_count, ps_u32 *barriers,                 \
+      ps_u8 *arena, ps_u32 arena_bytes
 
 // A channel read or take: the cell this fire reads (the pending one where
 // this stage put it already) into the value's bytes.
@@ -1635,9 +1832,9 @@ __device__ __forceinline__ void ps_edge_read(
   const ps_u32 o = c.p_o0(p);
   const ps_u32 index = lane.channel_slot_offset + c.p_channel(p);
   const PtirLaneChannelSlot slot = channels[index];
-  const ps_u8* input = reinterpret_cast<const ps_u8*>(
-      pending_flags[index] != 0u ? slot.pending_cell : slot.committed_cell);
-  ps_u8* output = c.bytes(o);
+  const volatile ps_u8* input = reinterpret_cast<const volatile ps_u8*>(
+      reinterpret_cast<const volatile ps_u8*>(pending_flags)[index] != 0u ? slot.pending_cell : slot.committed_cell);
+  volatile ps_u8* output = c.bytes(o);
   const ps_u32 bytes = c.d_dtype(o) == DT_BOOL ? c.d_len(o) : c.d_len(o) * 4u;
   for (ps_u32 at = c.tid; at < bytes; at += c.lanes) output[at] = input[at];
 }
@@ -1660,13 +1857,15 @@ __device__ __forceinline__ void ps_edge_put(
     if (c.tid == 0u) *commit = 0u;
     return;
   }
-  const ps_u8* input = c.bytes(a);
-  ps_u8* output = reinterpret_cast<ps_u8*>(slot.pending_cell);
+  const volatile ps_u8* input = c.bytes(a);
+  volatile ps_u8* output = reinterpret_cast<volatile ps_u8*>(slot.pending_cell);
   const ps_u8* committed = reinterpret_cast<const ps_u8*>(slot.committed_cell);
   const ps_u8* row_valid = reinterpret_cast<const ps_u8*>(lane.row_valid);
   const bool lane_active = row_valid == nullptr || row_valid[lane.row_valid_offset] != 0u;
   const bool sample_output = (lane.sample_output_channel_mask & (1ull << chan)) != 0ull;
   const ps_u32 element_bytes = dtype == DT_BOOL ? 1u : 4u;
+  // An output put whole reads its rows where they lie.
+  const bool external = (c.d_word(a) & (PS_EXTERNAL | PS_COMPUTED)) != 0u;
   ps_u32 per_row = 0u;
   if (lane.token_count != 0u) {
     if (c.d_rows(a) == lane.token_count) per_row = c.d_last(a);
@@ -1682,48 +1881,10 @@ __device__ __forceinline__ void ps_edge_put(
       const ps_u32 row = (byte / element_bytes) / per_row;
       if (row < lane.token_count) row_active = row_valid[lane.row_valid_offset + row] != 0u;
     }
-    if (row_active) output[byte] = input[byte];
+    if (row_active) output[byte] = external ? (ps_u8)(c.ld_raw(a, byte >> 2u) >> ((byte & 3u) * 8u)) : input[byte];
     else if (sample_output) output[byte] = 0xffu;
     else if (committed != nullptr) output[byte] = committed[byte];
     else *commit = 0u;
   }
   if (c.tid == 0u) pending_flags[index] = 1u;
 }
-
-// An output: the lane's bound rows of it (f32, bf16 or rows of bf16 by
-// pointer; ids as stored) into the value.
-__device__ __forceinline__ void ps_edge_output(
-    Ps& c, ps_u32 lane_index, const ps_u64* intrinsic_bases, const ps_u32* intrinsic_modes,
-    const ps_u32* intrinsic_widths, const ps_u32* intrinsic_strides,
-    const ps_u32* intrinsic_offsets, ps_u32 pitch, ps_u32* commit, ps_u32 p) {
-  const ps_u32 o = c.p_o0(p);
-  const ps_u32 at = lane_index * pitch + c.p_intr(p);
-  const ps_u8* input = reinterpret_cast<const ps_u8*>(intrinsic_bases[at]);
-  const ps_u32 mode = intrinsic_modes[at];
-  const ps_u32 last = c.d_last(o);
-  const ps_u32 width = last == 0u ? intrinsic_widths[at] : last;
-  const ps_u32 stride = intrinsic_strides[at] == 0u ? width : intrinsic_strides[at];
-  const ps_u64 first_row = (ps_u64)intrinsic_offsets[at] + (ps_u64)c.p_imm2(p);
-  const ps_u32 n = c.d_len(o);
-  if (input == nullptr || width == 0u || stride < width) {
-    if (c.tid == 0u) *commit = 0u;
-    return;
-  }
-  if (c.d_dtype(o) == DT_I32) {
-    if (mode != 3u) {
-      if (c.tid == 0u) *commit = 0u;
-      return;
-    }
-    for (ps_u32 i = c.tid; i < n; i += c.lanes)
-      c.st_i(o, i, reinterpret_cast<const int*>(input)[(first_row + i / width) * stride + i % width]);
-    return;
-  }
-  if (c.d_dtype(o) != DT_F32 || mode > 2u) {
-    if (c.tid == 0u) *commit = 0u;
-    return;
-  }
-  for (ps_u32 i = c.tid; i < n; i += c.lanes)
-    c.st_f(o, i, ps_intrinsic_row_load(input, first_row + i / width, i % width, stride, mode));
-}
-
-// ---- the entry points ----
