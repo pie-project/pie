@@ -1549,7 +1549,7 @@ impl PreparedLoad<'_> {
         }
         // The span is backed whole, yet the shell stands at the smallest rung
         // as the runtime's pool starts it: the runtime still tells every rung
-        // change (`span_backed_on_demand`), so a guest fire runs at the
+        // change (`tells_rungs`), so a guest fire runs at the
         // widest rung whose carve and term fit the span. A change then moves
         // only the carve's bookkeeping: its heaps are made.
         tracing::info!(
