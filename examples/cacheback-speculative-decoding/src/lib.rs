@@ -25,6 +25,7 @@ use inferlet::eta::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Input {
     #[serde(default = "default_prompt")]
     prompt: String,
@@ -44,12 +45,6 @@ struct Input {
     ckpt_sync: bool,
     #[serde(default)]
     rollback_mode: Option<String>,
-    /// Throughput-bench mode, named by the caller and never inferred: drafts
-    /// are accepted unverified and stop tokens are ignored, so every round
-    /// runs the full `draft_length + 1` window. The output is NOT the model's
-    /// answer. Off unless the request says `"bench_accept": true`.
-    #[serde(default)]
-    bench_accept: bool,
     /// DIAGNOSTIC: report, for every generated token, the top-1 and top-2
     /// logits of the row that produced it (`top_trace`, `margin_trace`), so a
     /// parting between two runs reads as a near-tie or a real gap, and two
@@ -312,13 +307,10 @@ async fn decode<T: Target>(
     let mut generated: Vec<u32> = Vec::with_capacity(input.max_tokens);
     let (mut verification_steps, mut drafted, mut accepted) = (1usize, 0usize, 0usize);
 
-    // Bench mode is the caller's explicit choice; a long request with drafts
-    // is an ordinary request and gets verified tokens.
-    let bench_accept = input.bench_accept && input.draft_length > 0;
     // The seed token is the first thing the model said: nothing drafted it,
     // so nothing can reject it.
     let mut x = first;
-    let mut stopped = !bench_accept && stop_tokens.contains(&x);
+    let mut stopped = stop_tokens.contains(&x);
     if !stopped {
         committed.push(x);
         generated.push(x);
@@ -346,11 +338,6 @@ async fn decode<T: Target>(
         let mut window = Vec::with_capacity(w_max);
         window.push(x);
         window.extend(drafts.iter().copied());
-        if bench_accept {
-            while window.len() < w_max {
-                window.push(x);
-            }
-        }
 
         let proposed = window.len() - 1;
         drafted += proposed;
@@ -372,10 +359,7 @@ async fn decode<T: Target>(
                 verification_steps += 1;
                 row_tops.extend(target.tops().first().copied());
                 let pred = step_truth[0];
-                if idx < proposed
-                    && (window[idx + 1] == pred
-                        || (bench_accept && idx < proposed.saturating_sub(1)))
-                {
+                if idx < proposed && window[idx + 1] == pred {
                     m += 1;
                 } else {
                     corr = pred;
@@ -397,9 +381,6 @@ async fn decode<T: Target>(
             while m < proposed && window[m + 1] == truth[m] {
                 m += 1;
             }
-            if bench_accept {
-                m = proposed.saturating_sub(1);
-            }
             if is_ckpt_sync && target.restore() {
                 let _ = target.fire(&window[..=m], base, None, true).await?;
             }
@@ -412,7 +393,7 @@ async fn decode<T: Target>(
         // ── Commit `window[1 ..= m]` — `window[0]` was committed last round as
         //    the correction that produced it — then the new correction.
         for (row, &token) in window[1..=m].iter().enumerate() {
-            if !bench_accept && stop_tokens.contains(&token) {
+            if stop_tokens.contains(&token) {
                 stopped = true;
                 break;
             }
@@ -430,7 +411,7 @@ async fn decode<T: Target>(
             }
             break;
         }
-        if !bench_accept && stop_tokens.contains(&correction) {
+        if stop_tokens.contains(&correction) {
             stopped = true;
             let emitted = generated.len() - prev_len;
             if emitted > 0 {
@@ -544,6 +525,17 @@ async fn main(input: Input) -> Result<Output> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A key the request does not name is refused by name, not ignored: a
+    /// removed option (`bench_accept`) cannot quietly run something else.
+    #[test]
+    fn an_unknown_key_is_refused() {
+        let why = serde_json::from_str::<Input>(r#"{"bench_accept": true}"#)
+            .err()
+            .expect("an unknown key is refused")
+            .to_string();
+        assert!(why.contains("unknown field `bench_accept`"), "{why}");
+    }
     use std::future::Future;
     use std::pin::pin;
     use std::task::{Context, Poll, Waker};
@@ -625,7 +617,6 @@ mod tests {
             ignore_eos: false,
             ckpt_sync: false,
             rollback_mode: Some(mode.into()),
-            bench_accept: false,
             margin: false,
         }
     }
@@ -639,8 +630,8 @@ mod tests {
         ready(decode(&mut toy, input, &[100, 101, 102], stop_tokens, |_| {})).unwrap()
     }
 
-    /// A 128-token request with drafts that does not name bench mode is an
-    /// ordinary request: it says exactly what sequential greedy decoding says.
+    /// A 128-token request with drafts says exactly what sequential greedy
+    /// decoding says.
     #[test]
     fn a_long_request_with_drafts_says_what_greedy_says() {
         for mode in ["flush_free", "ckpt_sync", "stop_wait"] {
@@ -680,14 +671,5 @@ mod tests {
                 assert_eq!(chose, out.generated, "{mode} at draft {draft_length}");
             }
         }
-    }
-
-    /// Bench mode is there only when named, and then it runs full windows.
-    #[test]
-    fn bench_mode_is_named_by_the_caller() {
-        let mut bench = request(128, 4, "flush_free");
-        bench.bench_accept = true;
-        let out = run(&bench, &[]);
-        assert_eq!(out.drafted, 4 * (out.verification_steps - 1));
     }
 }

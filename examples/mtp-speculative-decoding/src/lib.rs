@@ -32,6 +32,7 @@ use inferlet::eta::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Input {
     #[serde(default = "default_prompt")]
     prompt: String,
@@ -64,18 +65,6 @@ struct Input {
     ckpt_sync: bool,
     #[serde(default)]
     rollback_mode: Option<String>,
-    /// Throughput-bench mode, named by the caller and never inferred: every
-    /// round accepts `k - 1` drafts unverified and stop tokens are ignored, so
-    /// the output is NOT the model's answer. Off unless the request says
-    /// `"bench_accept": true`; it takes no `trace`, `margin` or `pad`.
-    #[serde(default)]
-    bench_accept: bool,
-}
-
-/// Bench mode is the caller's explicit choice; a long request with drafts is
-/// an ordinary request and gets verified tokens.
-fn bench_mode(input: &Input, k: u32) -> bool {
-    input.bench_accept && !input.trace && !input.margin && input.pad == 0 && k > 0
 }
 
 /// The prompt's prefill spans: with drafts on, runs of at most `limit` rows
@@ -283,9 +272,7 @@ async fn main(input: Input) -> Result<Output> {
     let mut truth_trace: Vec<Vec<u32>> = Vec::new();
     let tracing = input.trace;
     let margin = input.margin;
-    let bench_accept = bench_mode(&input, k);
-    let mut stopped =
-        (!bench_accept && stop_tokens.contains(&x)) || generated.len() >= input.max_tokens;
+    let mut stopped = stop_tokens.contains(&x) || generated.len() >= input.max_tokens;
 
     // ── DECODE: one window per fire, loop-carried on the device ──────────
     //
@@ -354,12 +341,7 @@ async fn main(input: Input) -> Result<Output> {
                 let proposed = gather(&window, iota(k) + &one); // window[1..=k]
                 let said = gather(&truth, iota(k)); // truth[0..k]
                 let hit = cast(eq(&proposed, &said), dtype::u32);
-                let exact = reshape(reduce_sum(cumprod(&hit)), [1]);
-                if bench_accept {
-                    broadcast(Tensor::constant(k.saturating_sub(1)), [1])
-                } else {
-                    exact
-                }
+                reshape(reduce_sum(cumprod(&hit)), [1])
             } else {
                 broadcast(Tensor::constant(0u32), [1])
             };
@@ -399,11 +381,7 @@ async fn main(input: Input) -> Result<Output> {
             fold.put(&m + &one);
         });
 
-        let budget = if bench_accept && k > 0 {
-            input.max_tokens.div_ceil(k as usize)
-        } else {
-            input.max_tokens
-        };
+        let budget = input.max_tokens;
         let mode = input
             .rollback_mode
             .as_deref()
@@ -485,8 +463,7 @@ async fn main(input: Input) -> Result<Output> {
                 }
                 for t in live {
                     generated.push(t);
-                    if (!bench_accept && stop_tokens.contains(&t))
-                        || generated.len() >= input.max_tokens
+                    if stop_tokens.contains(&t) || generated.len() >= input.max_tokens
                     {
                         stopped = true;
                         break;
@@ -495,59 +472,6 @@ async fn main(input: Input) -> Result<Output> {
                 if stopped {
                     break;
                 }
-            }
-        } else if bench_accept {
-            let mut cur_win: Vec<i32> = seed.clone();
-            let mut cur_base: u32 = n;
-            let mut survivors: u32 = 0;
-            let accept_m = k.saturating_sub(1) as usize;
-            while !stopped && generated.len() < input.max_tokens {
-                let ids = Channel::from(cur_win.as_slice());
-                let embed_indptr = Channel::from([0u32, w]);
-                let slots_ch = Channel::from_iter(cur_base..cur_base + w);
-                let readout_ch = Channel::from_iter(0..w);
-                let fold_ch = Channel::from([survivors]);
-                let truth_out = Channel::new([w], dtype::i32);
-                let fwd_fast = ForwardPass::new();
-                fwd_fast.embed(&ids, &embed_indptr)?;
-                fwd_fast.readout(&readout_ch)?;
-                fwd_fast.state(
-                    &[&ws],
-                    StateGeometry {
-                        slots: Some(&slots_ch),
-                        fold: Fold::Count(&fold_ch),
-                        ..StateGeometry::default()
-                    },
-                )?;
-                fwd_fast.epilogue(move || {
-                    let truth = reshape(reduce_argmax(intrinsics::output(0, "logits")), [w]);
-                    let chains = reshape(intrinsics::output(0, "mtp.drafts"), [w * width]);
-                    let _ = gather(&chains, iota(w));
-                    truth_out.put(&truth);
-                });
-                fwd_fast.submit(&pipe)?;
-                let truth = truth_out.take_host::<Vec<i32>>().await?;
-                rounds += 1;
-                drafted += k as usize;
-                accepted += accept_m;
-                commits_trace.push((accept_m + 1) as u32);
-                for &tok in &cur_win[1..=accept_m] {
-                    generated.push(tok as u32);
-                    if generated.len() >= input.max_tokens {
-                        stopped = true;
-                        break;
-                    }
-                }
-                let corr = truth[accept_m];
-                if !stopped {
-                    generated.push(corr as u32);
-                    if generated.len() >= input.max_tokens {
-                        stopped = true;
-                    }
-                }
-                cur_base += (accept_m + 1) as u32;
-                survivors = (accept_m + 1) as u32;
-                cur_win.fill(corr);
             }
         } else {
             run_ahead(&pipe, &fwd, budget, async || {
@@ -580,8 +504,7 @@ async fn main(input: Input) -> Result<Output> {
                 commits_trace.push(live.len() as u32);
                 for t in live {
                     generated.push(t);
-                    if (!bench_accept && stop_tokens.contains(&t))
-                        || generated.len() >= input.max_tokens
+                    if stop_tokens.contains(&t) || generated.len() >= input.max_tokens
                     {
                         stopped = true;
                         break;
@@ -600,10 +523,8 @@ async fn main(input: Input) -> Result<Output> {
 
     // A stop token ends the text; anything the last window committed past
     // it is not the answer.
-    if !bench_accept {
-        if let Some(at) = generated.iter().position(|t| stop_tokens.contains(t)) {
-            generated.truncate(at + 1);
-        }
+    if let Some(at) = generated.iter().position(|t| stop_tokens.contains(t)) {
+        generated.truncate(at + 1);
     }
     generated.truncate(input.max_tokens);
     let acceptance_rate = if drafted == 0 {
@@ -636,25 +557,15 @@ async fn main(input: Input) -> Result<Output> {
 mod tests {
     use super::*;
 
-    fn request(json: &str) -> Input {
-        serde_json::from_str(json).unwrap()
-    }
-
-    /// A long request with drafts is an ordinary request: verified, stopping.
+    /// A key the request does not name is refused by name, not ignored: a
+    /// removed option (`bench_accept`) cannot quietly run something else.
     #[test]
-    fn a_long_request_with_drafts_is_not_a_bench() {
-        let input = request(r#"{"max_tokens": 128, "k": 4}"#);
-        assert!(!bench_mode(&input, working_k(input.k, 4)));
-        let input = request(r#"{"max_tokens": 4096, "k": 4}"#);
-        assert!(!bench_mode(&input, working_k(input.k, 4)));
-    }
-
-    #[test]
-    fn bench_mode_is_named_by_the_caller() {
-        let input = request(r#"{"max_tokens": 16, "k": 4, "bench_accept": true}"#);
-        assert!(bench_mode(&input, working_k(input.k, 4)));
-        let input = request(r#"{"max_tokens": 16, "k": 0, "bench_accept": true}"#);
-        assert!(!bench_mode(&input, working_k(input.k, 4)));
+    fn an_unknown_key_is_refused() {
+        let why = serde_json::from_str::<Input>(r#"{"bench_accept": true}"#)
+            .err()
+            .expect("an unknown key is refused")
+            .to_string();
+        assert!(why.contains("unknown field `bench_accept`"), "{why}");
     }
 
     /// With drafts on, every prompt row is in a span the head runs over.
