@@ -161,6 +161,8 @@ async fn main(input: Input) -> Result<Output> {
     // document and commits the rest, so the decodes after it read what the
     // set holds, with nothing left to hide: they bind no mask.
     let (mut g0, mut rng_at, mut query, mut doc_start) = (g0, 0u32, n, doc_start);
+    // Past the keep nothing is hidden again: the decodes fold their rows.
+    let mut folds = false;
     if doc_start > 0 && generated.len() < max_tokens {
         use inferlet::eta::keep::{COMMIT, DROP};
         let keep = Channel::from_shaped(
@@ -195,6 +197,7 @@ async fn main(input: Input) -> Result<Output> {
         generated.push(t as u32);
         (g0, rng_at, query, doc_start) = (t, 1, 0, 0);
         masked = false;
+        folds = true;
     }
 
     // ── DECODE LOOP (1-wide, run-ahead) — chat-completion's decode shape. ──
@@ -218,7 +221,14 @@ async fn main(input: Input) -> Result<Output> {
         if masked {
             fwd.mask(&mask)?;
         }
-        fwd.state(&[&ws], StateGeometry::default())?;
+        fwd.state(
+            &[&ws],
+            if folds {
+                StateGeometry::folding()
+            } else {
+                StateGeometry::default()
+            },
+        )?;
         fwd.epilogue(move || {
             // TAKES + compute first, PUTS last (value-id discipline).
             let base = fill.take(); // [1] u32

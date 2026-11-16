@@ -340,9 +340,10 @@ async fn main(input: Input) -> Result<Output> {
             let tok_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
             let tok_in = Channel::from([t]);
             let rng = Channel::from([input.seed ^ 0x5bd1, observe_fires as u32 + 1]);
+            // Nothing past the keep is hidden again: each decode folds its row.
             let fwd = ForwardPass::new();
             fwd.embed(&tok_in, &lane1)?;
-            fwd.state(&[&ws], StateGeometry::default())?;
+            fwd.state(&[&ws], StateGeometry::folding())?;
             fwd.epilogue(move || {
                 let r = rng.take();
                 let token = step(intrinsics::output(0, "logits"), temperature, &r);

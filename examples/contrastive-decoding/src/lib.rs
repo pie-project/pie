@@ -185,13 +185,24 @@ async fn main(input: Input) -> Result<String> {
         if steps > 0 {
             let toks = Channel::from([token, token]);
             let embed_indptr = Channel::from([0u32, 1, 2]);
-            let fill = Channel::from([query[0] + 1, query[1] + 1]);
+            // After the first decode the expert has folded everything: its
+            // next query is column 0 from then on.
+            let fill = Channel::from([query[0] + 1, 0]);
             let mask = Channel::from_shaped([2, width], lane_masks(width, query, window));
             let out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
+            // The expert hides nothing: it folds every row as it decodes, so
+            // its buffer stays empty; the amateur buffers until its keep.
+            let folds = Channel::from([0u32, u32::MAX]);
             let decode = ForwardPass::new();
             decode.embed(&toks, &embed_indptr)?;
             decode.mask(&mask)?;
-            decode.state(&streams, StateGeometry::default())?;
+            decode.state(
+                &streams,
+                StateGeometry {
+                    fold: Fold::Count(&folds),
+                    ..StateGeometry::default()
+                },
+            )?;
             decode.epilogue(move || {
                 let logits = reshape(intrinsics::output(0, "logits"), [2, vocab]);
                 let amateur = reshape(gather(&logits, iota(1)), [vocab]);
@@ -210,7 +221,8 @@ async fn main(input: Input) -> Result<String> {
                 let next_mask = reshape(and(&causal, or(&is_expert, &in_window)), [2, width]);
 
                 toks.put(broadcast(&token, [2]));
-                fill.put(&base + 1u32);
+                // The amateur's next column moves on; the expert's stays 0.
+                fill.put(&base + cast(eq(iota(2), 0u32), dtype::u32));
                 mask.put(next_mask);
                 out.put(token);
             });
@@ -230,6 +242,7 @@ async fn main(input: Input) -> Result<String> {
             })
             .await?;
             end = [end[0] + taken, end[1] + taken];
+            folded[1] = end[1];
             if stopped || generated.len() >= input.max_tokens {
                 break;
             }
