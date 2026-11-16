@@ -71,12 +71,7 @@ impl SharedGrow {
             rung_walk: Arc::new(std::sync::Mutex::new(RungWalk::default())),
             ticks: Arc::new(AtomicU64::new(0)),
             idle_since: Arc::new(std::sync::Mutex::new(None)),
-            live_lanes: Arc::new(move || {
-                let most = crate::engine::get_spec(engine)
-                    .map_or(usize::MAX, |spec| spec.limits.max_forward_requests);
-                let live = crate::inferlet::process::live_count().min(most);
-                u32::try_from(live).unwrap_or(u32::MAX)
-            }),
+            live_lanes: Arc::new(move || super::live_lanes(engine)),
             raise_blocked: Arc::new(AtomicBool::new(false)),
             grow_waiter: Arc::new(AtomicBool::new(false)),
             no_grow: Arc::new(move || {
@@ -127,8 +122,9 @@ impl SharedGrow {
     /// asks the width: the cap stays where the last pass left it, and the
     /// pause between two passes of one process moves no cap.
     /// The rows the walk holds the rung to: what passes and decode batches
-    /// ask ([`super::wanted_rows`]), and never fewer than the lanes live now
-    /// (a live process each, at most the engine's lane count), whose decode
+    /// ask ([`super::wanted_rows`]), and never fewer than the lanes that
+    /// fire now ([`super::live_lanes`]: the seats working sets hold, not the
+    /// processes, so one process decoding 64 sequences holds 64), whose decode
     /// frames the scheduler holds rather than cuts. The rung never lowers
     /// under the decode fire the live lanes take, so their decodes never
     /// wait on a raise nobody funds; a lane joins through its prompt's pass,

@@ -520,6 +520,9 @@ pub struct Seats {
     held: HashMap<WorkingSetId, Vec<Slot>>,
     /// A working set let its seats go: a fire short of seats looks again.
     freed: Arc<tokio::sync::Notify>,
+    /// The engine whose rung counts the lanes seated here
+    /// ([`crate::store::shared::live_lanes`]); none where no rung does.
+    engine: Option<usize>,
 }
 
 /// The seats a model without state slots holds at once at most.
@@ -586,6 +589,30 @@ impl Seats {
             of_state_slots: state_slots != 0,
             held: HashMap::new(),
             freed: Arc::new(tokio::sync::Notify::new()),
+            engine: None,
+        }
+    }
+
+    /// The lanes seated here are `engine`'s live lanes: each change of
+    /// [`Seats::staging`] is told its rung.
+    pub fn count_for(&mut self, engine: usize) {
+        self.engine = Some(engine);
+        self.tell();
+    }
+
+    /// The lanes that fire: the seats held, a seat for each lane a working
+    /// set fires at once, from its first fire until it is released, so a
+    /// lane counts from its prompt's first piece until its sequence ends,
+    /// between its steps too.
+    #[must_use]
+    pub fn staging(&self) -> u32 {
+        let lanes: usize = self.held.values().map(Vec::len).sum();
+        u32::try_from(lanes).unwrap_or(u32::MAX)
+    }
+
+    fn tell(&self) {
+        if let Some(engine) = self.engine {
+            crate::store::shared::set_live_lanes(engine, self.staging());
         }
     }
 
@@ -605,6 +632,7 @@ impl Seats {
                     of_state_slots: self.of_state_slots,
                 })?;
             self.held.entry(ws).or_default().extend(fresh);
+            self.tell();
         }
         Ok(self.held.get(&ws).map_or_else(Vec::new, |held| {
             held[..lanes as usize]
@@ -620,6 +648,7 @@ impl Seats {
             self.slots
                 .release(Holder::WorkingSet(ws.to_bits()), &held, 0);
             self.freed.notify_waiters();
+            self.tell();
         }
     }
 
@@ -890,6 +919,37 @@ mod seats_tests {
 
     fn working_set() -> WorkingSetId {
         GenMap::<_, ()>::new().insert(())
+    }
+
+    /// The lanes that fire are the seats the working sets hold, told to the
+    /// engine's rung as they change: one set of 64 lanes is 64, not the one
+    /// process it is. The negative control: seats counted for no engine
+    /// tell none.
+    #[test]
+    fn the_lanes_that_fire_are_the_seats_held_not_the_processes() {
+        const ENGINE: usize = 77;
+        const UNTOLD: usize = 78;
+        let mut sets = GenMap::<_, ()>::new();
+        let (a, b): (WorkingSetId, WorkingSetId) = (sets.insert(()), sets.insert(()));
+        let mut seats = Seats::new(256);
+        seats.count_for(ENGINE);
+        assert_eq!(crate::store::shared::live_lanes(ENGINE), 0);
+        // One process's working set firing 64 lanes, another's 32.
+        seats.seats(a, 64).unwrap();
+        seats.seats(b, 32).unwrap();
+        // A set firing the lanes it has again takes no more seats.
+        seats.seats(a, 64).unwrap();
+        assert_eq!(seats.staging(), 96);
+        assert_eq!(crate::store::shared::live_lanes(ENGINE), 96);
+        seats.release(a);
+        assert_eq!(crate::store::shared::live_lanes(ENGINE), 32);
+        seats.release(b);
+        assert_eq!(crate::store::shared::live_lanes(ENGINE), 0);
+
+        let mut untold = Seats::new(256);
+        untold.seats(a, 8).unwrap();
+        assert_eq!(untold.staging(), 8);
+        assert_eq!(crate::store::shared::live_lanes(UNTOLD), 0, "no engine told");
     }
 
     /// A fire past a stateless model's seats is refused with the seats

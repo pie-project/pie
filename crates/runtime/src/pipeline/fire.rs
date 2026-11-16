@@ -936,7 +936,8 @@ impl RaiseFunding {
                 if pages == 0 {
                     // The room is there and state lies in the span: the
                     // walker moves it out, the engine copying it, and
-                    // tells the rung.
+                    // tells the rung; asked now, not at its next wake.
+                    crate::store::shared::ask_walk(engine);
                     tokio::select! {
                         () = &mut watch => {}
                         () = stop.notified() => return,

@@ -90,6 +90,8 @@ struct RungGate {
     /// The pool's walker is asked to look now ([`ask_walk`]): a bind or a
     /// raise waits on a cut or a lower that is the walk's to take.
     walk: tokio::sync::Notify,
+    /// The lanes that fire on the engine ([`live_lanes`]).
+    lanes: std::sync::atomic::AtomicU32,
 }
 
 /// Every engine's rung gate by its id: one for each engine named here,
@@ -114,6 +116,7 @@ fn rung_gate(engine: usize) -> &'static RungGate {
                 grant: std::sync::atomic::AtomicU32::new(u32::MAX),
                 event: tokio::sync::Notify::new(),
                 walk: tokio::sync::Notify::new(),
+                lanes: std::sync::atomic::AtomicU32::new(0),
             }))
         })
 }
@@ -287,6 +290,25 @@ pub(crate) fn raise_said(engine: usize, rung: u32, moved: usize, stood: bool) {
     }
 }
 
+/// The lanes that fire on `engine`: the seats its working sets hold, each
+/// from its set's first fire until the set is released
+/// ([`crate::store::chunks::Seats::staging`]). Lanes, not processes: one
+/// process decoding 64 sequences is 64 rows a step, and a process that
+/// has fired nothing yet holds none.
+#[must_use]
+pub fn live_lanes(engine: usize) -> u32 {
+    rung_gate(engine)
+        .lanes
+        .load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// The seats tell the lanes they hold ([`live_lanes`]).
+pub(crate) fn set_live_lanes(engine: usize, lanes: u32) {
+    rung_gate(engine)
+        .lanes
+        .store(lanes, std::sync::atomic::Ordering::Release);
+}
+
 /// Raises `shared`'s rung at once to the one fires of `rows` take, where
 /// nothing lies in the larger span and the room is there (a raise that must
 /// move state is the walker's, through the engine's copy): the pass asking
@@ -311,7 +333,15 @@ pub fn raise_now(shared: &Shared, engine: usize, rows: u32) {
             return;
         };
         let stood = pool.stands_at(at);
-        if pool.raise_waits(&evacuation) || pool.raise_applied(&evacuation).is_err() {
+        // A raise that goes through the engine first (it moves state, or
+        // the span is backed on demand) is the walker's: the ask wakes it
+        // here, so the raise starts at the ask, not at its next wake for
+        // another reason.
+        if pool.raise_waits(&evacuation) {
+            ask_walk(engine);
+            return;
+        }
+        if pool.raise_applied(&evacuation).is_err() {
             return;
         }
         raise_said(engine, at, 0, stood);
@@ -1806,21 +1836,34 @@ impl SharedPool {
         (ceiling / seg).min(top)
     }
 
-    /// The smallest rung whose fires carry `rows`, the largest past every
-    /// rung's; the smallest where `rows` is 0.
-    #[must_use]
+    /// The widest rung of the chunk class of the smallest rung whose fires
+    /// carry `rows` (the largest past every rung's; the smallest where
+    /// `rows` is 0): rungs whose activation sets aside as many chunks lend
+    /// state nothing between them, so a pool at one of them fires as wide
+    /// as what it holds, never narrower.
     ///
     /// No wider than the widest rung that fits with the programs' fire
     /// terms ([`Self::widest_fit`]): past it, fires are cut to it.
+    #[must_use]
     pub fn rung_for(&self, rows: u32) -> u32 {
         let rungs = self.pool.rungs();
-        let goal = rungs
+        let most = self.fit_rung();
+        let Some(goal) = rungs
             .iter()
             .copied()
             .find(|&rung| rung >= rows)
             .or_else(|| rungs.last().copied())
-            .unwrap_or(u32::MAX);
-        goal.min(self.fit_rung())
+        else {
+            return u32::MAX.min(most);
+        };
+        let goal = goal.min(most);
+        let chunks = self.pool.act_chunks(goal);
+        rungs
+            .into_iter()
+            .filter(|&wider| wider >= goal && wider <= most)
+            .filter(|&wider| self.pool.act_chunks(wider) == chunks)
+            .max()
+            .unwrap_or(goal)
     }
 
     /// Every activation rung's tokens, ascending.

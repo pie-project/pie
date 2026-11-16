@@ -927,9 +927,10 @@ fn rungs_sharing_their_chunks_are_one_class_the_walk_never_moves_within() {
 
 /// The cap thrash of a host-paced decode: each two-row pass lifted the cap
 /// to 2 and its settle had the walker cut it back to the live lane's one
-/// row, a cut a fire, the pool's span the same before and after. A cut
-/// within a class frees no chunk, so the walker takes none: the pass gone
-/// and nobody short, the cap stays where the pass left it, for any time.
+/// row, a cut a fire, the pool's span the same before and after. A goal is
+/// the widest rung of its chunk class, so a pool resting at rung 1's class
+/// fires 16 rows wide: a two-row pass finds its width standing, and its
+/// settle cuts nothing, for any time.
 #[tokio::test(flavor = "current_thread")]
 async fn a_cap_down_that_frees_no_chunk_is_not_taken_however_long_it_stands() {
     const ENGINE: usize = 9301;
@@ -940,21 +941,21 @@ async fn a_cap_down_that_frees_no_chunk_is_not_taken_however_long_it_stands() {
     let grow = SharedGrow::new(0, ENGINE, shared.clone()).with_live_lanes(|| 1);
     set_fire_cap_for_test(ENGINE, 1);
     grow.walk_rung().await;
-    assert_eq!(fire_cap(ENGINE), 1, "one live lane, nothing asked");
+    assert_eq!(fire_cap(ENGINE), 16, "one live lane: its class's widest");
 
-    // A two-row pass asks, and is cut at its width at once.
+    // A two-row pass asks: its width stands already.
     let want = want_rows(ENGINE, 2);
     raise_now(&shared, ENGINE, 2);
-    assert_eq!(fire_cap(ENGINE), 2);
+    assert_eq!(fire_cap(ENGINE), 16);
     grow.walk_rung().await;
-    assert_eq!(fire_cap(ENGINE), 2);
+    assert_eq!(fire_cap(ENGINE), 16);
 
     // Its last fire settled: the ask is gone, one lane lives, none is short.
     drop(want);
     assert_eq!(wanted_rows(ENGINE), 0);
     for tick in 0..32 * PATIENCE {
         grow.walk_rung().await;
-        assert_eq!(fire_cap(ENGINE), 2, "no cut at tick {tick}");
+        assert_eq!(fire_cap(ENGINE), 16, "no cut at tick {tick}");
         grow.ticked_for_test();
     }
     assert_eq!(
@@ -962,10 +963,9 @@ async fn a_cap_down_that_frees_no_chunk_is_not_taken_however_long_it_stands() {
         1,
         "the span set aside never moved"
     );
-    // The next pass finds its width standing: nothing to lift.
     let _want = want_rows(ENGINE, 2);
     raise_now(&shared, ENGINE, 2);
-    assert_eq!(fire_cap(ENGINE), 2);
+    assert_eq!(fire_cap(ENGINE), 16);
 }
 
 /// The lower that frees chunks is still taken once the pool has stood past
@@ -997,8 +997,12 @@ async fn a_lower_past_the_patience_seats_a_taker_short_of_records() {
     }
     grow.ticked_for_test();
     grow.walk_rung().await;
-    assert_eq!(fire_cap(ENGINE), 1, "past the patience: fires cut");
-    grant_rung(ENGINE, 1);
+    assert_eq!(
+        fire_cap(ENGINE),
+        16,
+        "past the patience: fires cut to the lane's class, its widest"
+    );
+    grant_rung(ENGINE, 16);
     grow.walk_rung().await;
     grow.walk_rung().await;
     let mut pool = shared.lock().unwrap();

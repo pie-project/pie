@@ -738,3 +738,78 @@ async fn a_promised_grow_the_walk_does_not_make_is_told_as_no_grow() {
         "nothing promised: nothing told"
     );
 }
+
+/// A rung goal is the widest rung of the chunk class of the smallest rung
+/// covering the rows: rungs 1 to 64 set aside the same 2 chunks here, so 5
+/// rows take 64, and fires at a pool resting in the class are never cut
+/// narrower than what it holds. The negative control: rows whose smallest
+/// covering rung is alone in its class (128) take that rung, and a class
+/// is never widened past the widest rung the fire terms fit.
+#[test]
+fn a_rung_goal_is_the_widest_rung_of_its_chunk_class() {
+    let mut facts = facts();
+    facts.act_chunks = vec![(1, 2), (8, 2), (64, 2), (128, 3), (256, 4), (2048, 12)];
+    let pool = SharedPool::new(&facts, 256).unwrap();
+    for rows in [0, 1, 5, 8, 64] {
+        assert_eq!(pool.rung_for(rows), 64, "{rows} rows");
+    }
+    assert_eq!(pool.rung_for(65), 128, "alone in its class");
+    assert_eq!(pool.rung_for(200), 256);
+    assert_eq!(pool.rung_for(4096), 2048, "past every rung: the largest");
+    // Each goal sets aside what the smallest covering rung does: no chunk
+    // more is held for the width.
+    for rows in [1, 5, 8] {
+        let smallest = [1, 8, 64].into_iter().find(|&r| r >= rows).unwrap();
+        assert_eq!(
+            pool.pool().act_chunks(pool.rung_for(rows)),
+            pool.pool().act_chunks(smallest)
+        );
+    }
+}
+
+/// A wave arriving at a pool resting at rung 1, the span backed on demand:
+/// the scheduler's ask for 64 rows cannot widen fires in the call (the
+/// engine backs the carve first), so the ask wakes the walk itself. The
+/// raise reaches the lane with no governor tick and no room freed between.
+/// The negative control: with nothing asked, nothing reaches the lane.
+#[tokio::test(flavor = "current_thread")]
+async fn an_ask_the_call_cannot_take_wakes_the_walk_at_the_ask() {
+    use crate::scheduler::worker::{LaneStandIn, PoolOp};
+    const ENGINE: usize = 74;
+    let wait = std::time::Duration::from_millis(200);
+    let (mut pool, mut engine) = fine_on_demand();
+    pool.set_max_lanes(512);
+    assert_eq!(
+        walk_segments(&mut pool, 6, 0, &mut engine),
+        Retarget::Reached
+    );
+    assert_eq!(pool.rung(), 1);
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    let mut lane = LaneStandIn::install(ENGINE);
+    let grow = SharedGrow::new(0, ENGINE, shared.clone()).with_live_lanes(|| 1);
+    grant_rung(ENGINE, 1);
+    grow.start();
+    assert!(
+        tokio::time::timeout(wait, lane.next_pool_op()).await.is_err(),
+        "nothing asked: nothing reaches the lane"
+    );
+    assert_eq!(shared.lock().unwrap().rung(), 1);
+
+    // The batch's ask, as the scheduler makes it: its rows wanted, and the
+    // raise tried in the call.
+    let _want = want_rows(ENGINE, 64);
+    raise_now(&shared, ENGINE, 64);
+    assert_eq!(fire_cap(ENGINE), 1, "not in the call: the engine comes first");
+    // No tick and no room freed: the ask alone woke the walk.
+    let Ok(Some((PoolOp::Rung { from: 1, to: 64 }, answer))) =
+        tokio::time::timeout(wait, lane.next_pool_op()).await
+    else {
+        panic!("the raise is at the lane, carried at the ask");
+    };
+    answer.send(Ok(())).unwrap();
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(shared.lock().unwrap().rung(), 64);
+    assert_eq!(fire_cap(ENGINE), 64, "the next step takes the 64 rows");
+}
