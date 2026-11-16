@@ -209,26 +209,29 @@ fn check_estimate(
         profiles: Some(dir.clone()),
         ..crate::api::DeviceBoot::default()
     };
-    // One slot holds the widest fire's tokens: its rows are all a fire
-    // reads beside the weights.
-    let mut shell = engine_gpu::serve::Shell::<crate::device::Api>::load(engine_gpu::serve::Boot {
-        trace: trace.clone(),
-        contract: &contract,
-        checkpoint: artifact,
-        budget: poem_compiler::Budget::new(lanes, tokens),
-        patches: patches(&trace, 1),
-        voxels: None,
-        profile: None,
-        page_size: 16,
-        context: tokens,
-        slots: 1,
-        runahead: engine::runahead::Runahead::F1,
-        device: &boot,
-        residency: engine::load::Residency::default(),
-        handed: None,
-        top: engine_gpu::serve::Top::EveryRung,
-    })
-    .map_err(|e| e.to_string())?;
+    // A shell of `slots` slots of `context` tokens each: one slot holding
+    // the widest prompt, or a slot a lane for decode-shaped fires.
+    let load = |slots: u32, context: u32| {
+        engine_gpu::serve::Shell::<crate::device::Api>::load(engine_gpu::serve::Boot {
+            trace: trace.clone(),
+            contract: &contract,
+            checkpoint: artifact,
+            budget: poem_compiler::Budget::new(lanes, tokens),
+            patches: patches(&trace, 1),
+            voxels: None,
+            profile: None,
+            page_size: 16,
+            context,
+            slots,
+            runahead: engine::runahead::Runahead::F1,
+            device: &boot,
+            residency: engine::load::Residency::default(),
+            handed: None,
+            top: engine_gpu::serve::Top::EveryRung,
+        })
+        .map_err(|e| e.to_string())
+    };
+    let mut shell = load(1, tokens)?;
     let weighed = shell.weighed().cloned().ok_or_else(|| {
         format!(
             "{device} has no rates in its profile to estimate by: run `pie tune vulkan --rates`"
@@ -368,8 +371,25 @@ fn check_estimate(
         rates_out.push('\n');
     }
     say(&rates_out);
-    let measured = search::time_fires(
-        &widths,
+    // Each rung timed at the shape the estimate weighs it
+    // (`RungFacts::sampled`): past the lanes, one prompt of its tokens on a
+    // fresh slot; up to them, a lane a token, each on a fresh slot of its
+    // own (a second shell, of a slot a lane).
+    let max_lanes = weighed.rungs.iter().map(|r| r.lanes).max().unwrap_or(1);
+    let (decode, prompts): (Vec<u32>, Vec<u32>) =
+        widths.iter().copied().partition(|&w| w <= max_lanes);
+    let replayed = |c: Option<(u64, u64)>| c.map_or(0, |(replayed, _)| replayed);
+    // Served fires replay what they recorded: a fire walked here times the
+    // host's encoding beside the device's work, and is no fire time of this
+    // model.
+    let walked = |width: u32, recordings| {
+        format!(
+            "a fire of {width} tokens of {model} was walked, not replayed (recordings \
+             {recordings:?}): its time is not what serving runs, so it is no measurement"
+        )
+    };
+    let mut measured = search::time_fires(
+        &prompts,
         |width, timed| {
             let prompt: Vec<u32> = (0..width).map(token).collect();
             shell.open(0).map_err(|e| e.to_string())?;
@@ -384,22 +404,46 @@ fn check_estimate(
                 .fire(std::slice::from_ref(&lane))
                 .map_err(|e| e.to_string())?;
             let ns = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
-            // Served fires replay what they recorded: a fire walked here
-            // times the host's encoding beside the device's work, and is no
-            // fire time of this model.
-            let replayed = |c: Option<(u64, u64)>| c.map_or(0, |(replayed, _)| replayed);
             if timed && replayed(shell.recordings()) <= replayed(before) {
-                return Err(format!(
-                    "a fire of {width} tokens of {model} was walked, not replayed (recordings \
-                     {:?}): its time is not what serving runs, so it is no measurement",
-                    shell.recordings()
-                ));
+                return Err(walked(width, shell.recordings()));
             }
             Ok(ns)
         },
         say,
     )?;
     drop(shell);
+    if !decode.is_empty() {
+        say(&format!(
+            "decode-shaped rungs (up to {max_lanes} lanes): a lane a token, each on a fresh slot"
+        ));
+        let mut shell = load(max_lanes, 16)?;
+        let ones: Vec<[u32; 1]> = (0..max_lanes).map(|i| [token(i)]).collect();
+        let word = trace.facts.word(&Request::new(1, false));
+        measured.extend(search::time_fires(
+            &decode,
+            |width, timed| {
+                for slot in 0..width {
+                    shell.open(slot).map_err(|e| e.to_string())?;
+                }
+                let lanes: Vec<engine_gpu::serve::Lane<'_>> = (0..width)
+                    .map(|slot| engine_gpu::serve::Lane {
+                        slot,
+                        word,
+                        tokens: &ones[slot as usize],
+                    })
+                    .collect();
+                let before = shell.recordings();
+                let began = Instant::now();
+                shell.fire(&lanes).map_err(|e| e.to_string())?;
+                let ns = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                if timed && replayed(shell.recordings()) <= replayed(before) {
+                    return Err(walked(width, shell.recordings()));
+                }
+                Ok(ns)
+            },
+            say,
+        )?);
+    }
     let _ = std::fs::remove_dir_all(&dir);
 
     let rungs: Vec<engine::load::RungFacts> = weighed

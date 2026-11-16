@@ -39,13 +39,27 @@ pub struct RungFacts {
     pub infeasible: Option<&'static str>,
 }
 
+impl RungFacts {
+    /// The rows a fire at this rung samples, as the estimate weighs it: a
+    /// rung no wider than its lanes is decode-shaped (a lane a token, each
+    /// sampled), a wider one prefill-shaped (one prompt, one row sampled).
+    #[must_use]
+    pub fn sampled(&self) -> u32 {
+        if self.tokens <= self.lanes {
+            self.tokens
+        } else {
+            1
+        }
+    }
+}
+
 /// What a fire costs, as work over the device's rates (the one shared
 /// formula every engine weighs its top rung by):
 ///
 /// `t(r) = launches(r) · launch_ns
 ///       + max(weights(r) / bytes_per_ns,
 ///             padded_rows(r) · flops_per_row / flops(padded_rows(r)))
-///       + lanes(r) · readout_flops / flops(lanes(r))
+///       + sampled(r) · readout_flops / flops(sampled(r))
 ///       + tokens(r) · keys(r) · attn_flops_per_row_key / attn_flops_per_ns
 ///       + keys(r) · kv_bytes_per_key / bytes_per_ns
 ///       + tokens(r) · state_elements_per_row / scan_elements_per_ns
@@ -57,7 +71,14 @@ pub struct RungFacts {
 /// `flops(m)` is the device's matmul rate at `m` rows, its measured curve
 /// interpolated in `log m` ([`profile::fire::flops_at`]). The output head
 /// runs once a lane (the readout), not once a row, so its flops are their
-/// own term. Sources: the rates are the profile's `[rates]` (measured by
+/// own term, over the rows the rung samples ([`RungFacts::sampled`]): a
+/// rung no wider than its lanes is weighed decode-shaped (a lane a token,
+/// every row sampled), and a wider rung prefill-shaped (one prompt, its
+/// last row sampled), since only prompt rows reach past the lanes and
+/// decode rides the narrow rungs. A mixed fire (decode lanes riding a
+/// prompt's piece) reads those lanes' head beside the prompt's, which this
+/// leaves out; a backend whose check shows that matters revisits it.
+/// Sources: the rates are the profile's `[rates]` (measured by
 /// `pie tune --rates` at `crate::rates`' lattice, through the backend's own
 /// paths); the byte, flop, attention, state and elementwise counts are the
 /// trace's ([`super::Counts`]); `launches` and `padded_rows` are the
@@ -134,8 +155,8 @@ impl FireEstimate {
                 self.flops_per_ns(rung.padded_rows),
             ),
             readout: over(
-                f64::from(rung.lanes) * self.readout_flops,
-                self.flops_per_ns(rung.lanes),
+                f64::from(rung.sampled()) * self.readout_flops,
+                self.flops_per_ns(rung.sampled()),
             ),
             attention: over(
                 tokens * keys * self.attn_flops_per_row_key,
@@ -166,7 +187,7 @@ pub struct Terms {
     pub weights: f64,
     /// The padded rows' matmul flops, over the matmul rate at those rows.
     pub flops: f64,
-    /// The output head's flops over the lanes, over the rate at the lanes.
+    /// The output head's flops over the rows sampled, over the rate there.
     pub readout: f64,
     /// The attention's flops, over the attention rate.
     pub attention: f64,
@@ -557,8 +578,8 @@ mod tests {
         );
     }
 
-    /// Every term at once: 5 launches, 8 tokens over 4 lanes attending 16
-    /// keys, the matmuls padded to 32 rows.
+    /// Every term at once: 5 launches, 4 tokens a lane each (decode-shaped)
+    /// attending 16 keys, the matmuls padded to 32 rows.
     fn documented() -> (FireEstimate, RungFacts) {
         let e = FireEstimate {
             // 1 a ns at 4 rows, 5 at 64: 3 at 16, 4 at 32 (log rows).
@@ -578,7 +599,7 @@ mod tests {
             elementwise_bytes_per_row: 2.0,
         };
         let r = RungFacts {
-            tokens: 8,
+            tokens: 4,
             lanes: 4,
             keys: 16,
             launches: 5,
@@ -603,31 +624,42 @@ mod tests {
     }
 
     #[test]
-    fn the_readout_runs_once_a_lane_at_the_lanes_rate() {
+    fn the_readout_runs_once_a_sampled_row_decode_shaped_or_prefill_shaped() {
         let (e, r) = documented();
-        // 4 lanes · 6 flops at 1 a ns (the curve at 4 rows).
+        // At the lanes (max_lanes 4): decode-shaped, 4 rows sampled, 4 · 6
+        // flops at 1 a ns (the curve at 4 rows).
+        assert_eq!((r.tokens, r.lanes, r.sampled()), (4, 4, 4));
         assert_eq!(e.terms(&r).readout, 24.0);
-        let wide = RungFacts { lanes: 16, ..r };
-        // 16 · 6 at 3 a ns; the readout does not grow with the tokens.
+        // At 16 lanes and 16 tokens: 16 · 6 at 3 a ns.
+        let wide = RungFacts {
+            tokens: 16,
+            lanes: 16,
+            ..r
+        };
         assert!((e.terms(&wide).readout - 32.0).abs() < 1e-9);
+        // At twice the lanes: prefill-shaped, one prompt, one row sampled
+        // (6 flops at the curve's 1 a ns below 4 rows).
+        let prompt = RungFacts { tokens: 8, ..r };
+        assert_eq!(prompt.sampled(), 1);
+        assert_eq!(e.terms(&prompt).readout, 6.0);
         let long = RungFacts { tokens: 64, ..r };
-        assert_eq!(e.terms(&long).readout, 24.0);
+        assert_eq!(e.terms(&long).readout, 6.0);
     }
 
     #[test]
     fn attention_reads_its_own_rate_and_kv_the_bandwidth() {
         let (e, r) = documented();
         let t = e.terms(&r);
-        // 8 · 16 · 0.5 at 0.25 a ns; 16 · 8 bytes at 4 a ns.
-        assert_eq!(t.attention, 256.0);
+        // 4 · 16 · 0.5 at 0.25 a ns; 16 · 8 bytes at 4 a ns.
+        assert_eq!(t.attention, 128.0);
         assert_eq!(t.kv, 32.0);
     }
 
     #[test]
     fn the_recurrent_state_is_stepped_a_token_at_the_scan_rate() {
         let (e, r) = documented();
-        // 8 tokens · 3 elements at 2 a ns.
-        assert_eq!(e.terms(&r).recurrent, 12.0);
+        // 4 tokens · 3 elements at 2 a ns.
+        assert_eq!(e.terms(&r).recurrent, 6.0);
         // A model with no state reads no scan rate.
         let none = FireEstimate {
             state_elements_per_row: 0.0,
@@ -640,16 +672,16 @@ mod tests {
     #[test]
     fn the_elementwise_bytes_are_read_at_the_bandwidth_a_token() {
         let (e, r) = documented();
-        // 8 tokens · 2 bytes at 4 a ns.
-        assert_eq!(e.terms(&r).elementwise, 4.0);
+        // 4 tokens · 2 bytes at 4 a ns.
+        assert_eq!(e.terms(&r).elementwise, 2.0);
     }
 
     #[test]
     fn the_estimate_is_its_documented_form() {
         let (e, r) = documented();
-        // 5·3 + max(200/4, 32·10/4) + 4·6/1 + 8·16·0.5/0.25 + 16·8/4
-        //     + 8·3/2 + 8·2/4
-        let want = 15.0 + 80.0 + 24.0 + 256.0 + 32.0 + 12.0 + 4.0;
+        // 5·3 + max(200/4, 32·10/4) + 4·6/1 + 4·16·0.5/0.25 + 16·8/4
+        //     + 4·3/2 + 4·2/4
+        let want = 15.0 + 80.0 + 24.0 + 128.0 + 32.0 + 6.0 + 2.0;
         assert!((e.ns(&r) - want).abs() < 1e-9, "{}", e.ns(&r));
         assert_eq!(e.ns(&r), e.terms(&r).total());
     }
