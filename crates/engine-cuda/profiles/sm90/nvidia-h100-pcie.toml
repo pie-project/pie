@@ -20,6 +20,12 @@ prefill_lattice_from = 160  # 1.0% faster end to end
 [compiler]
 dag_streams = true  # 2.6% faster end to end
 
+[rates]
+# 756 TFLOPS dense bf16 (NVIDIA H100 datasheet, PCIe; 1513 with sparsity).
+bf16_flops_per_ns = 756000.0
+# 2.0 TB/s of HBM2e (H100 datasheet, PCIe).
+bytes_per_ns = 2000.0
+
 [provenance]
 source = "pie tune (quick, gptoss-20b) on RunPod; 512-token prompt 31.7 -> 32.2 ms, 1-lane step 3.92 -> 3.68 ms, 4-lane step 6.54 -> 6.30 ms, 8-lane step 8.86 -> 8.79 ms, readout cosine 1.0000"
 measured = [

@@ -491,6 +491,7 @@ where
             residency,
             device: &self.boot,
             handed: self.handed.take(),
+            top: crate::serve::Top::Ruled,
         })
         .map_err(fault)?;
         // The fire the shell took, which a binding may have bounded below

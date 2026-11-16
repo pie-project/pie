@@ -19,6 +19,11 @@ Legend: ✅ verified on hardware · 🟡 in progress / compile-only · 🔴 not 
 | Snapshots (rs_snapshots) | ✅ | ✅ | ✅ | ✅ VK3 (4 a lane, per piece; conv, GDN, KDA) | ✅ VK3 | 🔴 XLA | — |
 | K2 (no kv spaces) | ✅ M39 | ✅ | ✅ M42 | compile | compile | compile | compile |
 
+XLA/TPU serving correctness (TPU session): gated delta: served tokens equal the CUDA reference (Qwen3.5-0.8B, 64
+greedy; v6e against L40S, identical ids and text, 38 prompt tokens). Mamba-2 and KDA kernels: unverified in serving,
+their kernel tests fail the same way (`kernels_ssm`: right magnitude, wrong element, a test-side layout under
+investigation). A Mamba-2 or KDA model served on XLA before that investigation gets the same token check first.
+
 Cerebras realization (CB, `sc/cb-chunk-pool`): the column is the host-traced `Cerebras` engine. State lives in
 one host chunk arena (shared, unpinned shapes: the kv list, one window list of the widest window with T_w = kv
 page, the fixed record cut into equal word-range pieces, the rs list with T_rs = kv page); each fire stages the

@@ -55,6 +55,20 @@ pub struct Boot<'a> {
     /// `$PIE_HOME/profiles`, where a user's device profiles live; `None`
     /// reads only the checked-in ones.
     pub profiles: Option<std::path::PathBuf>,
+    /// How the top rung is chosen.
+    pub top: Top,
+}
+
+/// How a load chooses the top rung of its fires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Top {
+    /// The ruling (`engine::load::top_rung`) over the estimate from the
+    /// device's measured rates: every served load.
+    #[default]
+    Ruled,
+    /// Every rung one buffer holds, up to the requested fire size: what a
+    /// caller timing each rung lays.
+    EveryRung,
 }
 
 const PATCH_ROUTE_DROP: i32 = -1;
@@ -628,8 +642,21 @@ impl Shell {
             keepalive,
             budgets,
             compiled,
+            profile,
+            placed: None,
+            ruled: None,
         })
     }
+}
+
+/// What a load placed before its top rung is ruled, which a load narrowed
+/// to the ruled top keeps: the weights do not depend on the fire's size.
+struct Placed {
+    handles: Handles,
+    weights: Weights,
+    ane: Option<crate::ane::Ane>,
+    recipe: poem_compiler::chunk::ChunkRecipe,
+    weight_caches: Vec<crate::store::streamed::Cache>,
 }
 
 /// A load compiled and not yet placed; [`PreparedLoad::load`] places it.
@@ -643,6 +670,12 @@ pub struct PreparedLoad<'a> {
     keepalive: Option<crate::keepalive::KeepAlive>,
     budgets: Budgets,
     compiled: CompiledModel,
+    /// What the axes are compiled under, so a load narrowed to its ruled
+    /// top compiles them again.
+    profile: DeviceProfile,
+    placed: Option<Placed>,
+    /// The top rung the ruling picked, once this load is laid at it.
+    ruled: Option<engine::load::TopRung>,
 }
 
 impl PreparedLoad<'_> {
@@ -666,9 +699,13 @@ impl PreparedLoad<'_> {
             tuning,
             outside,
             keepalive,
-            budgets,
+            mut budgets,
             compiled,
+            profile,
+            placed,
+            ruled,
         } = self;
+        let mut boot = boot;
 
         let facts = kv::probe(&boot.trace)?;
         crate::window::no_schedule_straddles_its_readers(&boot.trace, &compiled)?;
@@ -760,53 +797,71 @@ impl PreparedLoad<'_> {
             }
         }
 
-        let handles = Handles::new();
-        let mut weights = Weights::resident(
-            &device,
-            &handles,
-            &boot.trace,
-            boot.contract,
-            boot.checkpoint,
-            &boot.residency,
-        )?;
-        weights.decode_absorbed(&device, &handles, &boot.trace)?;
-        weights.relabel_conv_weights(&device, &handles, &boot.trace)?;
-        weights.repack_mpp(
-            &device,
-            &handles,
-            &boot.trace,
-            *chip.get::<crate::chip::WeightsLayout>(),
-        )?;
-        let ane = crate::ane::load(&device, &handles, &boot.trace, &weights, &chip).unwrap_or_else(
-            |why| {
-                eprintln!("the Neural Engine stays out of this load: {why}");
-                None
-            },
-        );
-        // The compiler's on-device Metal recipe is the one layout source: the
-        // chunk, the list slot (its tokens are the kv page size), where
-        // every fixed row's pieces lie in a record, and the weight slots.
-        let recipe =
-            crate::chunks::recipe_near(&boot.trace, &budgets, boot.residency.chunk_bytes())?;
-        let weight_caches = if boot.residency.whole_weights() {
-            Vec::new()
-        } else {
-            Shell::weight_caches(
-                &device,
-                &handles,
-                &mut weights,
-                &boot.trace,
-                &recipe,
-                boot.residency.rows_streamed(),
-            )?
+        let Placed {
+            handles,
+            mut weights,
+            ane,
+            recipe,
+            weight_caches,
+        } = match placed {
+            Some(placed) => placed,
+            None => {
+                let handles = Handles::new();
+                let mut weights = Weights::resident(
+                    &device,
+                    &handles,
+                    &boot.trace,
+                    boot.contract,
+                    boot.checkpoint,
+                    &boot.residency,
+                )?;
+                weights.decode_absorbed(&device, &handles, &boot.trace)?;
+                weights.relabel_conv_weights(&device, &handles, &boot.trace)?;
+                weights.repack_mpp(
+                    &device,
+                    &handles,
+                    &boot.trace,
+                    *chip.get::<crate::chip::WeightsLayout>(),
+                )?;
+                let ane = crate::ane::load(&device, &handles, &boot.trace, &weights, &chip).unwrap_or_else(
+                    |why| {
+                        eprintln!("the Neural Engine stays out of this load: {why}");
+                        None
+                    },
+                );
+                // The compiler's on-device Metal recipe is the one layout source: the
+                // chunk, the list slot (its tokens are the kv page size), where
+                // every fixed row's pieces lie in a record, and the weight slots.
+                let recipe =
+                    crate::chunks::recipe_near(&boot.trace, &budgets, boot.residency.chunk_bytes())?;
+                let weight_caches = if boot.residency.whole_weights() {
+                    Vec::new()
+                } else {
+                    Shell::weight_caches(
+                        &device,
+                        &handles,
+                        &mut weights,
+                        &boot.trace,
+                        &recipe,
+                        boot.residency.rows_streamed(),
+                    )?
+                };
+                // A weight kept apart that no cache takes is read whole, in place.
+                let claimed: std::collections::BTreeSet<usize> = weight_caches
+                    .iter()
+                    .flat_map(|cache| cache.shape.planes.iter().map(|plane| plane.param))
+                    .collect();
+                weights.open_unclaimed(&device, &handles, &claimed)?;
+                handles.seal();
+                Placed {
+                    handles,
+                    weights,
+                    ane,
+                    recipe,
+                    weight_caches,
+                }
+            }
         };
-        // A weight kept apart that no cache takes is read whole, in place.
-        let claimed: std::collections::BTreeSet<usize> = weight_caches
-            .iter()
-            .flat_map(|cache| cache.shape.planes.iter().map(|plane| plane.param))
-            .collect();
-        weights.open_unclaimed(&device, &handles, &claimed)?;
-        handles.seal();
 
         // The kv pool and the recurrent-state buffers beside it: both are
         // wired for the life of the load, in what the device's measured
@@ -1133,6 +1188,61 @@ impl PreparedLoad<'_> {
             arms as u64,
             rows.chunk_bytes,
         );
+        // The top rung (`crate::top`): of the rungs the requested fire size
+        // offers, the one the ruling picks by the estimate from the device's
+        // rates, over the live range kv and activation share at load. A
+        // rung whose span passes what one buffer binds is no rung of this
+        // device: the span lies in the pool's last buffer. Picked narrower
+        // than asked, the axes are compiled again at it and the load laid
+        // again under them (the rung's own carve, scratch and staged rows),
+        // the weights kept: they do not depend on the fire's size.
+        if ruled.is_none() && boot.top == Top::Ruled {
+            let counts = crate::top::Counts::of(&boot.trace, weights.bytes())?;
+            let room = accounting(0).pool.saturating_add(fire_bytes);
+            let live = boot.kv_budget.map_or(room, |budget| budget.min(room));
+            let rungs = crate::top::rung_facts(
+                &act,
+                rows.chunk_bytes,
+                budgets.tokens.max_lanes,
+                part_chunks,
+            );
+            let pick = crate::top::choose(
+                &rungs,
+                live,
+                &chip.tuned().rates,
+                device.name(),
+                &counts,
+            )?;
+            let asked = budgets.tokens.max_tokens;
+            tracing::info!("{}", crate::top::line(&pick, asked, live, device.name()));
+            tracing::debug!(act = ?act, ?pick, live, ?counts, "the rungs the top is chosen of");
+            if pick.tokens < asked {
+                budgets.tokens = crate::top::bounded(&budgets.tokens, pick.tokens);
+                boot.budget = budgets.tokens.clone();
+                let compiled = compile_axes(&boot.trace, &budgets, &profile)?;
+                drop(scratch);
+                return PreparedLoad {
+                    boot,
+                    device,
+                    chip,
+                    tuning,
+                    outside,
+                    keepalive,
+                    budgets,
+                    compiled,
+                    profile,
+                    placed: Some(Placed {
+                        handles,
+                        weights,
+                        ane,
+                        recipe,
+                        weight_caches,
+                    }),
+                    ruled: Some(pick),
+                }
+                .load();
+            }
+        }
         let span = act.last().map_or(0, |&(_, chunks)| chunks);
         // One chunk pool holds every kv page and every record (the rs
         // buffer's rows inside it), in what the room holds of whole chunks,
@@ -1320,6 +1430,11 @@ impl PreparedLoad<'_> {
         }
         // The null chunk and the floor stand from the load on.
         pools.commit_segments(1)?;
+        // The activation span is backed whole now, before ready: the top
+        // rung's carve and every segment a lower lends to state, so a raise
+        // or a lend mid-serve maps nothing (a placement heap made after
+        // ready is a device allocation after ready).
+        pools.back_whole_span()?;
         // A load whose weights the runtime holds seats every atom in pool
         // slots itself, from the serving file where it reads them there,
         // and states where (`WeightShape::seated`); the runtime adopts it.
@@ -1425,6 +1540,23 @@ impl PreparedLoad<'_> {
             },
         };
         shell.settle_ane()?;
+        if let Some(&(tokens, bytes)) = shell.arena.rs_rooms().last() {
+            tracing::info!(
+                tokens,
+                mib = bytes >> 20,
+                "metal: the widest rung's recurrent scratch"
+            );
+        }
+        // The span is backed whole, yet the shell stands at the smallest rung
+        // as the runtime's pool starts it: the runtime still tells every rung
+        // change (`span_backed_on_demand`), so a guest fire runs at the
+        // widest rung whose carve and term fit the span. A change then moves
+        // only the carve's bookkeeping: its heaps are made.
+        tracing::info!(
+            span_mib = shell.pools.span_held_bytes() >> 20,
+            heaps = shell.pools.span_heaps_made(),
+            "metal: the activation span is backed whole at the load"
+        );
         Ok(shell)
     }
 }
@@ -1605,6 +1737,12 @@ impl Shell {
         self.arena.rs_rooms()
     }
 
+    /// The rungs' tokens the load laid, ascending; the last the widest.
+    #[must_use]
+    pub fn rung_tokens(&self) -> Vec<u32> {
+        self.arena.rung_tokens()
+    }
+
     /// See `Engine::set_rung`: a raise backs the carve of `to` before any
     /// fire of it, refused as [`Fault::Refused`]; a lower gives back the
     /// carve above it. Either way, where the rung's staged regions move,
@@ -1616,8 +1754,9 @@ impl Shell {
         if crate::diag::on().tier_trace {
             eprintln!(
                 "residency: rung {from} -> {to}, the carve {reach} bytes from the span's top \
-                 (span backed {})",
-                self.pools.span_held_bytes()
+                 (span backed {}, {} span heaps made)",
+                self.pools.span_held_bytes(),
+                self.pools.span_heaps_made()
             );
         }
         if to >= from {
@@ -1737,6 +1876,14 @@ impl Shell {
         );
         self.batch_bottom = bottom;
         Ok(())
+    }
+
+    /// Placement heaps made for the activation span since the load: the
+    /// load backs it whole before ready, so a rung raise or a span lend
+    /// after makes none.
+    #[must_use]
+    pub fn span_heaps_made(&self) -> u64 {
+        self.pools.span_heaps_made()
     }
 
     /// Raises the rung to the widest, backing its carve: what a caller that
@@ -1966,53 +2113,138 @@ impl Shell {
         let seats = 1u32;
         let context = self.paging().context().max(1);
         let standing = self.rung;
-        let committed = self.pools.committed_segments();
-        // The walk's lanes lie in the first `seats` seat runs: those
-        // segments, not every seat's.
-        {
-            let facts = self.pool_chunk_facts();
-            let per = facts
-                .shape(crate::store::layout::LIST)
-                .map_or(1, |shape| shape.slots_per_chunk.max(1));
-            let run = self.paging().pages_per_slot.div_ceil(per).max(1);
-            let chunks = 1 + seats.saturating_mul(run);
-            let segments = chunks.div_ceil(facts.segment_chunks.max(1));
-            if segments > committed {
-                self.commit_segments(segments)?;
-            }
-        }
         self.warming = true;
+        // The forms the walk fires, from the plan: every word a request
+        // reaches that serving arms (a plain one, and a drafter's verify:
+        // plain but for reading its pass's drafts), at each rung's prompt
+        // and at one row; and on a model serving rs verbs, each under every
+        // verb a lane takes (a fold, a buffer folding nothing, a buffer
+        // replaying what it held and folding it), so its verify and drain
+        // kernels are built too. A guest program's pipelines are built at
+        // its registration, not here.
+        let facts = self.trace.facts.clone();
+        let mut drafting: Vec<bool> = facts
+            .requests()
+            .iter()
+            .filter(|request| {
+                request.plain()
+                    || (request.drafts()
+                        && request.departures() == usize::from(request.query_len() != 1) + 1)
+            })
+            .map(poem::Request::drafts)
+            .collect();
+        drafting.sort_unstable();
+        drafting.dedup();
+        let word = |rows: u32, drafts: bool| {
+            facts.word(&poem::Request::new(rows, false).drafting(drafts))
+        };
+        // The walk's lanes name slot refs, as the runtime's do: each shape's
+        // first slot past the null chunk, inside the pool whatever the seat
+        // count (seat 0's own runs, laid shape by shape for every seat, can
+        // lie past the pool's last chunk). No kernel reads them.
+        let layout = *self.pools.layout();
+        let first = |shape: Option<crate::store::layout::Slots>| shape.map_or(0, |s| s.per_chunk);
+        let page_size = self.paging().page_size.max(1);
+        let kv_pages = vec![first(layout.list); context.div_ceil(page_size) as usize];
+        let record = vec![first(layout.fixed); layout.pieces as usize];
+        let windows: Vec<Vec<u32>> = layout
+            .window_lists()
+            .map(|window| vec![window.slots.per_chunk; context.div_ceil(window.tokens.max(1)) as usize])
+            .collect();
+        let verbs: Vec<(engine::fire::RsVerb, u32)> = if self.serves_rs_verbs() {
+            let per = layout.rs_tokens.max(1);
+            let rs_ref = first(layout.rs);
+            let pages = |tokens: u32| vec![rs_ref; tokens.div_ceil(per).max(1) as usize];
+            let held = 1u32;
+            vec![
+                (engine::fire::RsVerb::Fold, 0),
+                (
+                    engine::fire::RsVerb::Buffer {
+                        pages: pages(context),
+                        base: 0,
+                        folded: 0,
+                        fold: engine::fire::FoldLen::Host(0),
+                    },
+                    0,
+                ),
+                (
+                    engine::fire::RsVerb::Buffer {
+                        pages: pages(context),
+                        base: 0,
+                        folded: 0,
+                        fold: engine::fire::FoldLen::Host(held),
+                    },
+                    held,
+                ),
+            ]
+        } else {
+            vec![(engine::fire::RsVerb::Fold, 0)]
+        };
         let walked = (|| -> Result<u32> {
             let mut fires = 0u32;
             for rung in self.arena.rung_tokens() {
                 self.set_rung(self.rung, rung)?;
-                let prompt = rung.min(self.budgets.tokens.max_tokens).min(context).max(1);
-                let lanes = rung.min(self.budgets.tokens.max_lanes).min(seats).max(1);
-                let prompt_tokens = vec![0u32; prompt as usize];
-                let one = [0u32];
-                let prefill = [Seated {
-                    held: Some(0),
-                    ..Seated::of(Lane {
-                        slot: 0,
-                        word: self.trace.facts.word(&poem::Request::new(prompt, false)),
-                        tokens: &prompt_tokens,
-                    })
-                }];
-                let word = self.trace.facts.word(&poem::Request::new(1, false));
-                let decode: Vec<Seated<'_>> = (0..lanes)
-                    .map(|slot| Seated {
-                        held: Some(0),
-                        ..Seated::of(Lane { slot, word, tokens: &one })
-                    })
-                    .collect();
-                for lanes in [&prefill[..], &decode[..]] {
-                    let prepared = FrameShell::prepare(
-                        self,
-                        StepView { lanes, attachments: &[], media: &[], clips: &[], done: None },
-                        None,
-                    )?;
-                    drop(self.walk(&prepared, true)?);
-                    fires += 1;
+                for &drafts in &drafting {
+                    for (verb, held) in &verbs {
+                        let prompt = rung
+                            .min(self.budgets.tokens.max_tokens)
+                            .min(context.saturating_sub(*held))
+                            .max(1);
+                        let lanes = rung.min(self.budgets.tokens.max_lanes).min(seats).max(1);
+                        let prompt_tokens = vec![0u32; prompt as usize];
+                        let one = [0u32];
+                        let prefill = [Seated {
+                            held: Some(*held),
+                            rs: verb,
+                            refs: true,
+                            pages: &kv_pages,
+                            record: (!record.is_empty()).then_some(&record[..]),
+                            windows: &windows,
+                            ..Seated::of(Lane {
+                                slot: 0,
+                                word: word(prompt, drafts),
+                                tokens: &prompt_tokens,
+                            })
+                        }];
+                        let decode: Vec<Seated<'_>> = (0..lanes)
+                            .map(|slot| Seated {
+                                held: Some(*held),
+                                rs: verb,
+                                refs: true,
+                                pages: &kv_pages,
+                                record: (!record.is_empty()).then_some(&record[..]),
+                                windows: &windows,
+                                ..Seated::of(Lane {
+                                    slot,
+                                    word: word(1, drafts),
+                                    tokens: &one,
+                                })
+                            })
+                            .collect();
+                        for lanes in [&prefill[..], &decode[..]] {
+                            // Each dropped fire's command buffer goes back
+                            // with its own pool: left to the thread's, a
+                            // walk of more fires than the queue holds
+                            // command buffers blocks making the next one.
+                            let walked = pooled(|| -> Result<()> {
+                                let prepared = FrameShell::prepare(
+                                    self,
+                                    StepView {
+                                        lanes,
+                                        attachments: &[],
+                                        media: &[],
+                                        clips: &[],
+                                        done: None,
+                                    },
+                                    None,
+                                )?;
+                                drop(self.walk(&prepared, true)?);
+                                Ok(())
+                            });
+                            walked?;
+                            fires += 1;
+                        }
+                    }
                 }
             }
             Ok(fires)
@@ -2023,9 +2255,6 @@ impl Shell {
         // stood.
         if self.rung != standing {
             self.set_rung(self.rung, standing)?;
-        }
-        if self.pools.committed_segments() > committed {
-            self.release_segments(committed)?;
         }
         Ok((fires, self.pipelines.compiled() - before))
     }
@@ -4143,8 +4372,15 @@ impl Shell {
         // backed, ref by ref: a page in an uncommitted chunk under the
         // highest one (two-ended growth backs a bottom run and the span's
         // top, not what lies between) is refused by name, not read.
+        // The load's pipeline walk (`warming`) stages fires it drops
+        // uncommitted: no kernel reads or writes what they name, so nothing
+        // is checked backed and no record is zeroed for them. Its lanes are
+        // seat 0's, and a recurrent model's seat-0 record lies past every
+        // seat's kv run (seat runs follow one another shape by shape): the
+        // walk refused such a load ("this fire wants 13113 committed chunks
+        // of the state pool and the load reserved 58").
         for ((seat, table), &free) in seats.iter().zip(&tables).zip(&kv_less) {
-            if free || table.is_empty() {
+            if free || table.is_empty() || self.warming {
                 continue;
             }
             let after = u64::from(seat.have).saturating_add(u64::from(seat.rows));
@@ -4153,18 +4389,18 @@ impl Shell {
                 self.pools.admit_list_page(page)?;
             }
         }
-        for &(page, _) in writes.iter().flatten() {
+        for &(page, _) in writes.iter().flatten().filter(|_| !self.warming) {
             self.pools.admit_list_page(page.max(0) as u32)?;
         }
-        for &id in &state_ids {
+        for &id in state_ids.iter().filter(|_| !self.warming) {
             self.pools.admit_state_slot(id)?;
         }
 
-        if !beginning.is_empty() && self.pools.has_state() {
+        if !beginning.is_empty() && self.pools.has_state() && !self.warming {
             self.drain()?;
         }
-        for record in beginning {
-            self.pools.clear(&record)?;
+        for record in beginning.iter().filter(|_| !self.warming) {
+            self.pools.clear(record)?;
         }
         let slot_ids: Vec<i32> = lane_bands.concat();
         let rs_snaps: Vec<i32> = snap_bands.concat();
@@ -4589,6 +4825,35 @@ impl Shell {
                 have: readouts_ceiling,
             });
         }
+        let fire = FireRows {
+            tokens: u64::from(rows),
+            lanes: u64::from(lane_count),
+            patches: u64::from(composition.patch_rows()),
+            images: u64::from(composition.images()),
+            voxels: u64::from(composition.voxel_widest()),
+            clips: u64::from(composition.clips()),
+            readouts: readout_rows.len() as u64,
+        };
+        // The rung's carve was backed when the runtime raised to it
+        // (`set_rung`); a fire never backs anything. A fire wider than the
+        // rung held is refused here, before its rows are staged: the staged
+        // regions are the held rung's, each field laid for its tokens and
+        // lanes, and a wider fire's rows would run into the next field
+        // though its carve rounds to the held one's.
+        let held_tokens = self.arena.current_tokens();
+        if fire.tokens > u64::from(held_tokens)
+            || fire.lanes > u64::from(held_tokens)
+            || !self.pools.covers(self.arena.reach(fire))
+        {
+            return Err(Fault::Program {
+                at: "serve::stage",
+                why: format!(
+                    "a fire of {} tokens over {} lanes is wider than the rung the runtime \
+                     raised to, whose carve alone is backed",
+                    fire.tokens, fire.lanes
+                ),
+            });
+        }
         let bound = self.inputs[self.arena.current()][arm].write(
             &self.handles,
             &crate::inputs::Fire {
@@ -4628,27 +4893,6 @@ impl Shell {
         let group_masks = self.inputs[self.arena.current()][arm]
             .stage_group_masks(&self.handles, &group_masks)?;
 
-        let fire = FireRows {
-            tokens: u64::from(rows),
-            lanes: u64::from(lane_count),
-            patches: u64::from(composition.patch_rows()),
-            images: u64::from(composition.images()),
-            voxels: u64::from(composition.voxel_widest()),
-            clips: u64::from(composition.clips()),
-            readouts: readout_rows.len() as u64,
-        };
-        // The rung's carve was backed when the runtime raised to it
-        // (`set_rung`); a fire never backs anything.
-        if !self.pools.covers(self.arena.reach(fire)) {
-            return Err(Fault::Program {
-                at: "serve::stage",
-                why: format!(
-                    "a fire of {} tokens over {} lanes is wider than the rung the runtime \
-                     raised to, whose carve alone is backed",
-                    fire.tokens, fire.lanes
-                ),
-            });
-        }
         let slots = self.arena.fire_slots(&self.handles, fire)?;
         let caches = self.pools.table(
             &self.handles,
@@ -5530,4 +5774,16 @@ fn activation_rungs(
     }
     rungs.push((max, compiled.arena.clone()));
     Ok(rungs)
+}
+
+/// `f` under an autorelease pool of its own on Apple: what it autoreleases
+/// (a dropped frame's command buffer) goes back when it returns.
+#[cfg(target_vendor = "apple")]
+fn pooled<T>(f: impl FnOnce() -> T) -> T {
+    objc2::rc::autoreleasepool(|_| f())
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn pooled<T>(f: impl FnOnce() -> T) -> T {
+    f()
 }

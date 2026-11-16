@@ -39,6 +39,16 @@ pub struct TuneArgs {
     /// Fit the measurements the last run kept, without measuring again.
     #[arg(long)]
     pub refit: bool,
+
+    /// Run the `[fire_ns]` step alone: time the check models' fires at
+    /// each rung width, leaving every decision as it is.
+    #[arg(long)]
+    pub fire_only: bool,
+
+    /// Run the `[rates]` step alone: measure the device's bf16 matmul rate,
+    /// its memory bandwidth and a fire's launch cost on it.
+    #[arg(long)]
+    pub rates: bool,
 }
 
 pub fn run(args: TuneArgs) -> Result<Answer> {
@@ -84,6 +94,8 @@ pub fn run(args: TuneArgs) -> Result<Answer> {
         no_check: args.no_check,
         cache: &cache,
         refit: args.refit,
+        fire_only: args.fire_only,
+        rates: args.rates,
     };
     let tuned = tune(&req, &mut say).map_err(|e| anyhow!(e))?;
 

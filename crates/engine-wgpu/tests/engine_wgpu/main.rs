@@ -82,6 +82,7 @@ mod gpu;
 mod linear;
 #[path = "../../../engine-gpu/suite/model_logits.rs"]
 mod model_logits;
+mod rates;
 #[path = "../../../engine-gpu/suite/runtime/mod.rs"]
 mod runtime;
 #[path = "../../../engine-gpu/suite/sampling/mod.rs"]

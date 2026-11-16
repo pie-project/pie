@@ -484,8 +484,14 @@ impl Layout {
             }
         }
         ChunkFacts {
-            // A mapped placement heap is resident whether touched or not:
-            // the span is backed as fires and lent state need it.
+            // The runtime tells every rung change (`tells_rungs`) and cuts a
+            // guest fire to the widest rung its term fits beside. The span's
+            // heaps are all made at the load (`Pool::back_whole_span`), so a
+            // change moves only the carve's bookkeeping: no rung raise or lend
+            // makes a device allocation after ready. Interim: the runtime
+            // tells rungs only where the span is backed on demand; once it
+            // states the two apart, this is backed-on-demand false with
+            // rungs told.
             span_backed_on_demand: !self.act().is_empty(),
             tells_rungs: false,
             // The load pins the range below the segment the largest rung's

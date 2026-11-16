@@ -1,0 +1,20 @@
+api = 1
+
+# Every MI300X, the virtual function a cloud instance exposes ("AMD Instinct
+# MI300X VF") as the card itself; the rest of the family (MI300A, MI325X)
+# states its own rates.
+[target]
+match = { name_contains = ["MI300X"] }
+
+# What pie's kernels reach here (MI300X VF, ROCm 7, median of 5 after a warm
+# run; the vendor's peaks are the upper bounds).
+[rates]
+# A 4096^3 bf16 hipBLASLt GEMM, fp32 compute: 792 TFLOPS (758-810 over the
+# five). Peak: 1307.4 TFLOPS dense bf16 (AMD Instinct MI300X data sheet;
+# 2614.9 with sparsity).
+bf16_flops_per_ns = 792000.0
+# A 256 MiB device-to-device copy, read and write counted: 4013 GB/s. Peak:
+# 5.3 TB/s of HBM3 (AMD Instinct MI300X data sheet).
+bytes_per_ns = 4013.0
+# An empty kernel's launch, back to back on one stream.
+launch_ns = 1544

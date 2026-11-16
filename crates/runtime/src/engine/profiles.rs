@@ -41,6 +41,11 @@ pub struct TuneRequest<'a> {
     pub cache: &'a Path,
     /// Fit the kept measurements again instead of measuring.
     pub refit: bool,
+    /// Run the `[fire_ns]` step alone: time the check models' fires at each
+    /// rung width, every decision left as it is.
+    pub fire_only: bool,
+    /// Run the `[rates]` step alone: the device's rates measured on it.
+    pub rates: bool,
 }
 
 /// What a tune produced.
@@ -157,7 +162,7 @@ macro_rules! tuned {
 }
 
 /// `pie tune` on a backend that measures a kernel grid at a depth.
-#[cfg(any(feature = "vulkan", all(feature = "metal", target_vendor = "apple")))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 macro_rules! tune_grid {
     ($name:ident, $engine:ident, $backend:literal) => {
         fn $name(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String> {
@@ -170,11 +175,50 @@ macro_rules! tune_grid {
     };
 }
 
+/// `pie tune` on Vulkan: the kernel grid and the search, then the
+/// `[fire_ns]` step (or that step alone).
 #[cfg(feature = "vulkan")]
-tune_grid!(tune_vulkan, engine_vulkan, "vulkan");
+fn tune_vulkan(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String> {
+    use engine_vulkan::tune::{Depth, Steps, run};
+    let depth = if req.full { Depth::Full } else { Depth::Quick };
+    let models = pick_models("vulkan", req)?;
+    let out = run(
+        depth,
+        Some(req.profiles),
+        req.cache,
+        req.refit,
+        Steps {
+            rates: req.rates,
+            fire_ns: req.fire_only,
+        },
+        &models,
+        say,
+    )?;
+    Ok(tuned!(out, wrong: out.wrong))
+}
 
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 tune_grid!(tune_metal, engine_metal, "metal");
+
+/// `pie tune wgpu`: the `[rates]` step alone.
+#[cfg(feature = "wgpu")]
+fn tune_wgpu(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String> {
+    if !req.rates || req.fire_only {
+        return Err(
+            "`pie tune wgpu` measures the device's rates alone: pass --rates".to_string(),
+        );
+    }
+    let out = engine_wgpu::tune::rates(Some(req.profiles), say)?;
+    Ok(Tuned {
+        device: out.device,
+        file: out.file,
+        lines: Vec::new(),
+        wrong: Vec::new(),
+        checks: Vec::new(),
+        changed: true,
+        seconds: out.seconds,
+    })
+}
 
 #[cfg(feature = "engine-cuda")]
 fn tune_cuda(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String> {
@@ -206,6 +250,15 @@ pub fn backends() -> Vec<Backend> {
         probe: engine_vulkan::chip::probe,
         resolve: engine_vulkan::chip::resolve_facts,
         tune: Some(tune_vulkan),
+    });
+    #[cfg(feature = "wgpu")]
+    out.push(Backend {
+        name: "wgpu",
+        registry: engine_wgpu::chip::registry,
+        shelf: &engine_wgpu::chip::SHELF,
+        probe: engine_wgpu::tune::probe,
+        resolve: engine_wgpu::tune::resolve_facts,
+        tune: Some(tune_wgpu),
     });
     #[cfg(feature = "xla")]
     out.push(Backend {

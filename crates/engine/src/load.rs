@@ -4,6 +4,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::caps::Capabilities;
 
+pub mod rung;
+
+pub use rung::{
+    FireEstimate, FireTimes, NoRung, RungFacts, TimesUsed, TopRung, TopWhy, model_class, top_rung,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Budgets {
     pub max_lanes: u32,

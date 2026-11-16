@@ -100,6 +100,8 @@ fn serve(artifact: &Path, deployment: &str, device: &str, file: &str) -> Result<
         device: &boot,
         residency: engine::load::Residency::default(),
         handed: None,
+        // A device untuned has no rates to rule its top by; every rung is laid.
+        top: engine_gpu::serve::Top::EveryRung,
     })
     .map_err(|e| e.to_string())?;
     let token = |i: u32| 100 + (i * 7919) % 5000;
@@ -167,6 +169,99 @@ fn serve(artifact: &Path, deployment: &str, device: &str, file: &str) -> Result<
         read,
         refused: None,
     })
+}
+
+/// The `[fire_ns]` step: `artifact` loaded under `file` as a served load
+/// is asked ([`crate::FIRE`]), every rung one binding holds laid, and a
+/// fire of each rung's width timed, one lane on a fresh slot. Returns the
+/// model class it is filed under and its table.
+fn fire_ns(
+    artifact: &Path,
+    deployment: &str,
+    device: &str,
+    file: &str,
+    say: &mut dyn FnMut(&str),
+) -> Result<(String, profile::fire::FireTable), String> {
+    use poem::{Platform, Request};
+    let (lanes, tokens) = crate::FIRE;
+    let dir = std::env::temp_dir().join(format!("pie-tune-vulkan-fire-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = crate::chip::SHELF.user_path(&dir, device);
+    std::fs::create_dir_all(path.parent().expect("a parent")).map_err(|e| e.to_string())?;
+    std::fs::write(&path, file).map_err(|e| e.to_string())?;
+    let row = poem_compiler::catalog::deployment(deployment)
+        .ok_or_else(|| format!("no catalog row `{deployment}`"))?;
+    let trace = row.trace(Platform::Vulkan);
+    let model = engine::load::model_class(&trace).to_owned();
+    let source = ztensor_compat::index(artifact).map_err(|e| e.to_string())?;
+    let contract =
+        poem::import::own_contract(&source, &trace.params, row.deploy.tp, Platform::Vulkan)
+            .map_err(|e| e.to_string())?;
+    drop(source);
+    let boot = crate::api::DeviceBoot {
+        profiles: Some(dir.clone()),
+        ..crate::api::DeviceBoot::default()
+    };
+    // One slot holds the widest fire's tokens: its rows are all a fire
+    // reads beside the weights.
+    let mut shell = engine_gpu::serve::Shell::<crate::device::Api>::load(engine_gpu::serve::Boot {
+        trace: trace.clone(),
+        contract: &contract,
+        checkpoint: artifact,
+        budget: poem_compiler::Budget::new(lanes, tokens),
+        patches: patches(&trace, 1),
+        voxels: None,
+        profile: None,
+        page_size: 16,
+        context: tokens,
+        slots: 1,
+        runahead: engine::runahead::Runahead::F1,
+        device: &boot,
+        residency: engine::load::Residency::default(),
+        handed: None,
+        top: engine_gpu::serve::Top::EveryRung,
+    })
+    .map_err(|e| e.to_string())?;
+    let widths = shell.rung_tokens();
+    say(&format!(
+        "timing a fire at each of {} rung widths of {model}",
+        widths.len()
+    ));
+    let token = |i: u32| 100 + (i * 7919) % 5000;
+    let table = search::time_fires(
+        &widths,
+        |width| {
+            let prompt: Vec<u32> = (0..width).map(token).collect();
+            shell.open(0).map_err(|e| e.to_string())?;
+            let lane = engine_gpu::serve::Lane {
+                slot: 0,
+                word: trace.facts.word(&Request::new(width, false)),
+                tokens: &prompt,
+            };
+            let before = shell.recordings();
+            let began = Instant::now();
+            shell
+                .fire(std::slice::from_ref(&lane))
+                .map_err(|e| e.to_string())?;
+            let ns = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            // Served fires replay what they recorded: a fire walked here
+            // times the host's encoding beside the device's work, and is no
+            // fire time of this model.
+            let replayed = |c: Option<(u64, u64)>| c.map_or(0, |(replayed, _)| replayed);
+            if replayed(shell.recordings()) <= replayed(before) {
+                return Err(format!(
+                    "a fire of {width} tokens of {model} was walked, not replayed (it records {:?}): \
+                     its time is not what serving runs, so no [fire_ns] entry is written",
+                    shell.recordings()
+                ));
+            }
+            Ok(ns)
+        },
+        say,
+    )?;
+    drop(shell);
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok((model, table))
 }
 
 /// A fingerprint of the fused trace and plan a load under `text` runs, as
@@ -291,15 +386,53 @@ fn measure(_: &Profile, _: &qmm::Grid, _: &mut dyn FnMut(&str)) -> Result<qmm::M
     Err("this build carries no Vulkan device code".to_string())
 }
 
+/// The steps a `pie tune` run takes: every decision's search, then the
+/// `[fire_ns]` step, by default; one step alone, or the two named, else.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Steps {
+    /// The `[rates]` step alone ([`crate::rates::measure`]).
+    pub rates: bool,
+    /// The `[fire_ns]` step alone.
+    pub fire_ns: bool,
+}
+
+impl Steps {
+    fn search(self) -> bool {
+        !self.rates && !self.fire_ns
+    }
+
+    fn fires(self) -> bool {
+        self.fire_ns || !self.rates
+    }
+}
+
+/// The `[rates]` step: the device's rates measured on it under `base`.
+fn rates(base: &Profile, say: &mut dyn FnMut(&str)) -> Result<profile::fire::Rates, String> {
+    let device =
+        crate::device::Context::bind(&crate::api::DeviceBoot::default(), engine::Allowance::WHOLE)
+            .map_err(|e| e.to_string())?;
+    let tuning = crate::tuning::Tuning::new(base.clone(), device.limits());
+    let rates = crate::rates::measure(&device, &tuning).map_err(|e| e.to_string())?;
+    say(&format!(
+        "[rates]: {:.1} TFLOP/s bf16, {:.0} GB/s, launch {} us",
+        rates.bf16_flops_per_ns.unwrap_or(0.0) / 1e3,
+        rates.bytes_per_ns.unwrap_or(0.0),
+        rates.launch_ns.unwrap_or(0) / 1000
+    ));
+    Ok(rates)
+}
+
 /// Tune the device a load opens. `say` hears progress.
 pub fn run(
     depth: Depth,
     profiles: Option<&Path>,
     cache: &Path,
     refit: bool,
+    steps: Steps,
     models: &[(PathBuf, String)],
     say: &mut dyn FnMut(&str),
 ) -> Result<Outcome, String> {
+    let fire_only = !steps.search();
     let began = Instant::now();
     let (name, facts) = crate::chip::probe().ok_or("no Vulkan device answers")?;
     let cores = facts
@@ -312,7 +445,11 @@ pub fn run(
         facts.describe().join(", "),
         report.used
     ));
-    let (fitted, mut lines, wrong) = bench_qmm(depth, &name, &base, cores, cache, refit, say)?;
+    let (fitted, mut lines, wrong) = if fire_only {
+        (Vec::new(), Vec::new(), Vec::new())
+    } else {
+        bench_qmm(depth, &name, &base, cores, cache, refit, say)?
+    };
     // The fitted ladder must also win end to end to be kept.
     let mut knobs: Vec<search::Knob> = Vec::new();
     for (id, value) in &fitted {
@@ -331,7 +468,9 @@ pub fn run(
             });
         }
     }
-    knobs.extend(search::knobs(&base, SEARCH_SKIPS, ""));
+    if !fire_only {
+        knobs.extend(search::knobs(&base, SEARCH_SKIPS, ""));
+    }
     let mut bench = Vulkan {
         models,
         device: &name,
@@ -348,7 +487,7 @@ pub fn run(
                 text: "not searched: no model to serve (import one, or pass --check)".to_string(),
             });
         }
-    } else {
+    } else if !fire_only {
         let names: Vec<&str> = models.iter().map(|(_, d)| d.as_str()).collect();
         say(&format!(
             "searching {} decisions end to end on {}",
@@ -359,9 +498,25 @@ pub fn run(
         chosen = found;
         lines.extend(searched);
     }
-    let tuned = search::render_overrides(&chosen);
+    let mut tuned = search::render_overrides(&chosen);
+    if steps.rates {
+        let r = rates(&base, say)?;
+        tuned.push_str(&format!(
+            "[rates]\nbf16_flops_per_ns = {:?}\nbytes_per_ns = {:?}\nlaunch_ns = {}\n",
+            r.bf16_flops_per_ns.unwrap_or(1.0),
+            r.bytes_per_ns.unwrap_or(1.0),
+            r.launch_ns.unwrap_or(0)
+        ));
+    }
     let today = bench.file(&[])?;
     let draft = bench.file(&chosen)?;
+    // The fire times of each model under the file this writes.
+    let mut fires = Vec::new();
+    for (artifact, deployment) in models.iter().filter(|_| steps.fires()) {
+        say(&format!("[fire_ns]: {deployment}"));
+        fires.push(fire_ns(artifact, deployment, &name, &draft, say)?);
+    }
+    tuned.push_str(&search::render_fire_ns(&fires));
     let mut checks = Vec::new();
     let unchanged = draft == today;
     if unchanged && !models.is_empty() {
@@ -412,6 +567,17 @@ pub fn run(
         ("pie", format!("\"{}\"", env!("CARGO_PKG_VERSION"))),
         ("seconds", format!("{seconds:.0}")),
         ("checked", format!("\"{}\"", checked.replace('"', "'"))),
+        (
+            "fire_ns",
+            format!(
+                "[{}]",
+                fires
+                    .iter()
+                    .map(|(model, _)| format!("\"{model}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ),
     ];
     let file = search::assemble(
         crate::chip::registry(),
