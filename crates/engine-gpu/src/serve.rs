@@ -1191,7 +1191,7 @@ impl<B: Serve> Shell<B> {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let class_outputs = poem_exec::feeds::class_outputs(&boot.trace, &compiled)
+        let class_outputs = poem_exec::feeds::class_outputs(&boot.trace, &compiled, boot.context, boot.page_size)
             .map_err(|why| Fault::Unbound { what: why })?;
         if class_outputs.is_empty() {
             return Err(Fault::Unbound {
@@ -1911,7 +1911,13 @@ impl<B: Serve> Shell<B> {
     #[must_use]
     pub fn classes(&self) -> poem_ir::LaneClasses {
         let outputs =
-            poem_exec::feeds::class_outputs(&self.trace, &self.compiled).unwrap_or_default();
+            poem_exec::feeds::class_outputs(
+                &self.trace,
+                &self.compiled,
+                self.paging().context(),
+                self.paging().page_size,
+            )
+                .unwrap_or_default();
         poem_exec::feeds::lane_classes(&self.trace, &self.compiled, &outputs)
     }
 
