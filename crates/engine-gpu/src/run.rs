@@ -23,80 +23,93 @@ pub enum WeightRow {
 #[derive(Clone, Debug, Default)]
 pub struct WeightTable(pub Vec<Option<WeightRow>>);
 
-/// A fire's carve: each value's rectangle, and the lanes its capture
-/// planes hold a row for.
+/// A fire's carve: each value's rectangle, and its capturing lanes.
 #[derive(Clone, Debug, Default, Hash)]
 pub struct SlotTable(pub Vec<Option<Tensor>>, pub Scored);
 
-impl SlotTable {
-    /// The row of `value`'s rectangle that lane `lane` of the fire starts
-    /// at: the lane itself, and for a capture plane the capturing lanes
-    /// before it.
-    #[must_use]
-    pub fn lane_row(&self, value: ValueId, lane: u32) -> u32 {
-        if self.1.planes.binary_search(&value.0).is_ok() {
-            self.1.row(lane)
-        } else {
-            lane
-        }
-    }
-}
-
-/// The lanes of a fire whose class captures into the planes the compiler
-/// lifted over every other slot (`ArenaMap::scores_from`): a plane holds a
-/// row for each of them, in lane order, and none for the fire's other
-/// lanes, so a fire is seated the planes its own capturing lanes write.
+/// A fire's capturing lanes (`poem_ir::Dim::Capturing`), compacted: each
+/// takes a key row in lane order, and those whose program reads pages a
+/// page row too, in lane order among themselves. The fire's other lanes
+/// take none.
 #[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
 pub struct Scored {
-    /// For each lane, the capturing lanes before it; empty where none
-    /// captures.
-    before: Vec<u32>,
-    rows: u32,
-    /// The values the planes back, ascending: the carve's to state.
-    planes: Vec<u32>,
+    /// For each capturing lane in lane order: the fire lane, and its page
+    /// row where it reads pages.
+    capturing: Vec<(u32, Option<u32>)>,
+    /// For each lane of the fire, its key row where it captures.
+    rows: Vec<Option<u32>>,
+    pages: u32,
 }
 
 impl Scored {
-    /// The fire's lanes in order, each capturing or not.
+    /// The fire's lanes in order, each as `(captures, reads pages)`.
     #[must_use]
-    pub fn of(capturing: impl IntoIterator<Item = bool>) -> Scored {
-        let mut rows = 0u32;
-        let before: Vec<u32> = capturing
-            .into_iter()
-            .map(|captures| {
-                let at = rows;
-                rows += u32::from(captures);
-                at
-            })
-            .collect();
-        if rows == 0 {
+    pub fn of(lanes: impl IntoIterator<Item = (bool, bool)>) -> Scored {
+        let mut scored = Scored::default();
+        for (lane, (captures, pages)) in lanes.into_iter().enumerate() {
+            if !captures {
+                scored.rows.push(None);
+                continue;
+            }
+            let row = u32::try_from(scored.capturing.len()).unwrap_or(u32::MAX);
+            let page = pages.then(|| {
+                scored.pages += 1;
+                scored.pages - 1
+            });
+            scored.rows.push(Some(row));
+            scored
+                .capturing
+                .push((u32::try_from(lane).unwrap_or(u32::MAX), page));
+        }
+        if scored.capturing.is_empty() {
             return Scored::default();
         }
-        Scored {
-            before,
-            rows,
-            planes: Vec::new(),
-        }
+        scored
     }
 
-    /// The rows a plane holds: the fire's capturing lanes.
+    /// The key rows: the fire's capturing lanes.
     #[must_use]
     pub fn rows(&self) -> u32 {
-        self.rows
+        u32::try_from(self.capturing.len()).unwrap_or(u32::MAX)
     }
 
-    /// The plane row lane `lane` writes, where it captures: the capturing
-    /// lanes before it.
+    /// The page rows: the capturing lanes whose program reads pages.
     #[must_use]
-    pub fn row(&self, lane: u32) -> u32 {
-        self.before.get(lane as usize).copied().unwrap_or(self.rows)
+    pub fn page_rows(&self) -> u32 {
+        self.pages
     }
 
-    /// With `planes`, the values the planes back (ascending).
+    /// The key row lane `lane` writes, where it captures.
     #[must_use]
-    pub fn backing(mut self, planes: Vec<u32>) -> Scored {
-        self.planes = planes;
-        self
+    pub fn row(&self, lane: u32) -> Option<u32> {
+        self.rows.get(lane as usize).copied().flatten()
+    }
+
+    /// The page row lane `lane` writes, where it captures and reads pages.
+    #[must_use]
+    pub fn page_row(&self, lane: u32) -> Option<u32> {
+        let row = self.row(lane)?;
+        self.capturing.get(row as usize)?.1
+    }
+
+    /// The capture table a fire stages for its kernels
+    /// (`kernels_slang::attn::score::TABLE_INTS` a capturing lane): each
+    /// capturing lane's fire lane, its first and end query row by
+    /// `indptr` (the fire's), and its page row or -1.
+    #[must_use]
+    pub fn table(&self, indptr: &[i32]) -> Vec<i32> {
+        let at = |lane: u32| indptr.get(lane as usize).copied().unwrap_or(0);
+        self.capturing
+            .iter()
+            .flat_map(|&(lane, page)| {
+                [
+                    i32::try_from(lane).unwrap_or(i32::MAX),
+                    at(lane),
+                    at(lane + 1),
+                    page.map_or(-1, |page| i32::try_from(page).unwrap_or(i32::MAX)),
+                ]
+            })
+            .collect()
     }
 }
 
@@ -205,6 +218,8 @@ pub struct FireBindings {
     pub group_masks: Vec<crate::inputs::GroupMaskHandles>,
     pub inputs: Vec<(u32, Tensor)>,
     pub voxels: Option<crate::inputs::VoxelHandles>,
+    /// The fire's capture table, where a lane of it captures scores.
+    pub capture: Option<Tensor>,
 }
 
 pub struct Run<'c, B: Backend> {
@@ -522,12 +537,11 @@ impl<'c, B: Backend> Run<'c, B> {
         let (skip, keep) = match shape.first() {
             Some(Dim::Tokens) => (window.row_offset, window.rows),
             Some(Dim::TokensTimes(k)) => (window.row_offset * k, window.rows * k),
-            // A capture plane holds a row a capturing lane: the window's
-            // lanes all capture, and start at the capturing lanes before.
-            Some(Dim::Lanes) => (self.arena.lane_row(id, window.lane_offset), window.lanes),
+            Some(Dim::Lanes) => (window.lane_offset, window.lanes),
             Some(Dim::LanesPlus(k)) => (window.lane_offset, window.lanes + k),
             Some(Dim::Readouts) => return handle,
-            // A capturing fire is refused before a value of either is cut.
+            // A capture's rows are the fire's capturing lanes, whatever the
+            // window: its kernels walk them through the capture table.
             Some(Dim::Capturing | Dim::ContextTimes(_) | Dim::ContextPages) => return handle,
             Some(Dim::Const(_)) | None => return handle,
             Some(Dim::Patches) => (patch.row_offset, patch.rows),
@@ -1027,6 +1041,18 @@ impl<'c, B: Backend> Run<'c, B> {
         }))
     }
 
+    /// A score capture's normalisers' room, where the trace captures.
+    pub fn score_stats(&self) -> Option<Tensor> {
+        Some(self.scratch.score_stats(self.handles)?.unwrap_or_else(|fault| {
+            panic!("the score normalisers' room this load reserved does not mint: {fault}")
+        }))
+    }
+
+    /// The fire's capturing lanes: the rows of a capture.
+    pub fn scored(&self) -> &Scored {
+        &self.arena.1
+    }
+
     pub fn index_scores(&self) -> Option<Tensor> {
         Some(
             self.scratch
@@ -1170,36 +1196,44 @@ impl<'c, B: Backend> Run<'c, B> {
 
 #[cfg(test)]
 mod tests {
-    use poem_ir::ValueId;
+    use super::Scored;
 
-    use super::{Scored, SlotTable};
-
-    /// A capture plane holds a row for each capturing lane, in lane order:
-    /// a lane's row in it is the capturing lanes before it, whatever lanes
-    /// lie between; every other rectangle keeps a row a lane.
+    /// The capturing lanes compact in lane order, whatever lanes lie
+    /// between: a key row each, and a page row each among those that read
+    /// pages; the table names each one's fire lane, query rows and page row.
     #[test]
-    fn a_capture_plane_holds_a_row_a_capturing_lane() {
-        let scored = Scored::of([false, true, true, false, true]);
-        assert_eq!(scored.rows(), 3);
+    fn the_capturing_lanes_compact_in_lane_order() {
+        let scored = Scored::of([
+            (false, false),
+            (true, true),
+            (true, false),
+            (false, false),
+            (true, true),
+        ]);
+        assert_eq!((scored.rows(), scored.page_rows()), (3, 2));
         assert_eq!(
-            [1, 2, 4].map(|lane| scored.row(lane)),
-            [0, 1, 2],
-            "the capturing lanes take the plane's rows in order"
+            [0, 1, 2, 3, 4].map(|lane| scored.row(lane)),
+            [None, Some(0), Some(1), None, Some(2)]
         );
-        let slots = SlotTable(Vec::new(), scored.backing(vec![4, 9]));
-        assert_eq!(slots.lane_row(ValueId(9), 4), 2);
-        assert_eq!(slots.lane_row(ValueId(4), 1), 0);
-        assert_eq!(slots.lane_row(ValueId(5), 4), 4, "no plane: a row a lane");
+        assert_eq!(
+            [1, 2, 4].map(|lane| scored.page_row(lane)),
+            [Some(0), None, Some(1)]
+        );
+        let indptr = [0, 5, 6, 7, 9, 10];
+        assert_eq!(
+            scored.table(&indptr),
+            [1, 5, 6, 0, 2, 6, 7, -1, 4, 9, 10, 1],
+            "lane, its rows, its page row"
+        );
     }
 
-    /// A fire none of whose lanes captures holds no plane row, and its slot
-    /// table is the one a load without planes makes.
+    /// A fire none of whose lanes captures holds no row and stages no
+    /// table.
     #[test]
-    fn a_fire_without_a_capturing_lane_holds_no_plane_row() {
-        let scored = Scored::of([false, false, false]);
+    fn a_fire_without_a_capturing_lane_holds_no_row() {
+        let scored = Scored::of([(false, false); 3]);
         assert_eq!(scored, Scored::default());
-        assert_eq!(scored.rows(), 0);
-        let slots = SlotTable(Vec::new(), scored.backing(vec![4]));
-        assert_eq!(slots.lane_row(ValueId(7), 2), 2);
+        assert_eq!((scored.rows(), scored.page_rows()), (0, 0));
+        assert!(scored.table(&[0, 1, 2, 3]).is_empty());
     }
 }

@@ -646,8 +646,8 @@ where
         self.programs.facts(program, &place(shell)).map_err(refusal)
     }
 
-    /// A program reading captured attention scores takes the capture
-    /// planes' rows for its lanes beside the fire's carve, in the span.
+    /// A program reading captured attention scores lays its lanes' score
+    /// rows in a fire's guest region: its per-member term.
     fn fire_facts(
         &self,
         program: ProgramId,
