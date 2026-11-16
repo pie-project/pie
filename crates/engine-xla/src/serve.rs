@@ -279,6 +279,9 @@ pub struct Shell {
     /// A fire on scratch slots every lane shares (the warm ladder's): what it
     /// writes is never read back, so its rows may lay a page in two runs.
     pub(crate) scratch_fire: bool,
+    /// The profile the load resolved: what it read of it is what `pie
+    /// tune xla` serves a candidate for (`Shell::chip_read`).
+    chip: profile::Profile,
     /// The stage-only pass (`size`): a fire stops once its inputs are
     /// staged, before anything is traced, leaving their rows here.
     sizing: Option<u32>,
@@ -385,6 +388,13 @@ fn declared_width(trace: &Trace, want: poem_ir::RuntimeInput) -> u64 {
 const FILL_PAGES: u64 = 65536;
 
 impl Shell {
+    /// The decisions of its profile this load has read so far
+    /// (`profile::Profile::read`).
+    #[must_use]
+    pub fn chip_read(&self) -> Vec<&'static str> {
+        self.chip.read()
+    }
+
     #[must_use]
     pub fn tpu(&self) -> crate::chip::Tpu {
         self.tpu
@@ -1039,6 +1049,7 @@ impl Shell {
             fire_streamed: None,
             stage_all: false,
             scratch_fire: false,
+            chip: chip.clone(),
             sizing: None,
             staging_facts: staging_facts.clone(),
             host: crate::store::tier::Host::default(),

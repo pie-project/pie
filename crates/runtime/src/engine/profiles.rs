@@ -72,6 +72,7 @@ pub struct Tuned {
 #[cfg(any(
     feature = "engine-cuda",
     feature = "vulkan",
+    feature = "xla",
     all(feature = "metal", target_vendor = "apple")
 ))]
 fn pick_models(
@@ -122,6 +123,7 @@ fn pick_models(
 #[cfg(any(
     feature = "engine-cuda",
     feature = "vulkan",
+    feature = "xla",
     all(feature = "metal", target_vendor = "apple")
 ))]
 fn artifacts(store: &Path, backend: &str) -> Vec<(std::path::PathBuf, String)> {
@@ -156,6 +158,7 @@ fn artifacts(store: &Path, backend: &str) -> Vec<(std::path::PathBuf, String)> {
 #[cfg(any(
     feature = "engine-cuda",
     feature = "vulkan",
+    feature = "xla",
     all(feature = "metal", target_vendor = "apple")
 ))]
 macro_rules! tuned {
@@ -244,6 +247,36 @@ fn tune_wgpu(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, 
     })
 }
 
+/// `pie tune xla`: the end-to-end search over XLA's searchable decisions,
+/// each candidate served on the check models through the serving path.
+#[cfg(feature = "xla")]
+fn tune_xla(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String> {
+    if req.rates {
+        return Err(
+            "`pie tune xla --rates` is not in this build: the v6e rates step lands with its \
+             measured block"
+                .to_string(),
+        );
+    }
+    if req.check_estimate {
+        return Err("`pie tune xla --check-estimate` is not in this build".to_string());
+    }
+    let mut models = Vec::new();
+    for (artifact, deployment) in pick_models("xla", req)? {
+        let trace = crate::engine::load::trace(&deployment, crate::engine::load::Platform::Xla)
+            .map_err(|e| format!("{e:#}"))?;
+        let contract = crate::engine::load::contract_for(&trace, &artifact)?;
+        models.push(engine_xla::tune::Model {
+            name: deployment,
+            trace,
+            contract,
+            checkpoint: artifact,
+        });
+    }
+    let out = engine_xla::tune::run(Some(req.profiles), &models, say)?;
+    Ok(tuned!(out, wrong: Vec::new()))
+}
+
 #[cfg(feature = "engine-cuda")]
 fn tune_cuda(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String> {
     if req.rates {
@@ -306,7 +339,7 @@ pub fn backends() -> Vec<Backend> {
         // name one with `--device`.
         probe: || None,
         resolve: |kind, _, profiles| engine_xla::chip::resolve(kind, profiles),
-        tune: None,
+        tune: Some(tune_xla),
     });
     #[cfg(feature = "metal")]
     out.push(Backend {

@@ -27,6 +27,7 @@ pub mod settle;
 pub mod snapshot;
 pub mod store;
 pub mod trace;
+pub mod tune;
 pub mod weights;
 pub mod window;
 
