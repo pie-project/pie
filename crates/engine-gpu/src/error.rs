@@ -48,6 +48,16 @@ pub enum Fault {
         have: u64,
     },
 
+    /// A fire's tokens (or positions) past the rows the input store's
+    /// fields were laid for at load: refused before anything is written.
+    InputRows {
+        what: &'static str,
+
+        tokens: u64,
+
+        rows: u64,
+    },
+
     /// One dispatch asks more workgroups on an axis than the device takes.
     Workgroups {
         kernel: String,
@@ -246,6 +256,10 @@ impl fmt::Display for Fault {
             Self::Ceiling { what, need, have } => write!(
                 f,
                 "this fire asks for {need} {what} and the load reserved {have}"
+            ),
+            Self::InputRows { what, tokens, rows } => write!(
+                f,
+                "a fire of {tokens} {what} is past the input store's {rows} rows"
             ),
             Self::Workgroups {
                 kernel,
