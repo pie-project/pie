@@ -29,18 +29,19 @@ pub use streamed_topk::emit_streamed_topk;
 pub use topk::emit_grouped_topk;
 pub use validate::validate_singleton_plan;
 
-pub const METAL_M1_EMITTER_VERSION: u16 = 64;
+pub const METAL_M1_EMITTER_VERSION: u16 = 65;
 
-/// The pieces a lane's scratch lies in: the grouped kernels read lane L's
-/// base for piece P at `scratch_bases[L * M3_SCRATCH_PIECES + P]` (buffer
-/// 4, GPU addresses), so a lane's scratch lies wherever its instance holds
-/// it, not a stride from the batch's first. One piece until eta_exec's
-/// chunk-aware layout states a program's pieces (no value crosses one).
-pub const M3_SCRATCH_PIECES: u32 = 1;
-
-/// The line every grouped kernel takes its lane's scratch by: piece 0's base.
-pub const M3_LANE_SCRATCH: &str = "  device uchar* scratch = reinterpret_cast<device uchar*>(\
-     scratch_bases[ulong(dispatch_lane) * ulong(M3_SCRATCH_PIECES)]);\n";
+/// The lines every grouped kernel takes its lane's scratch by. A lane's
+/// scratch lies in pieces (`eta_exec::ChunkLayout`), wherever its instance
+/// holds them: lane L's base for piece P at
+/// `scratch_bases[L * layout->scratch_pieces + P]` (buffer 4, GPU
+/// addresses). A value lies at its piece's base plus its offset (`PTIR_AT`
+/// in the runtime template); the temporary area at its own piece's.
+pub const M3_LANE_SCRATCH: &str = "  const uint ptir_values = layout->value_count;\n\
+  const device ulong* lane_bases =\n\
+      scratch_bases + ulong(dispatch_lane) * ulong(layout->scratch_pieces);\n\
+  device uchar* temporary = reinterpret_cast<device uchar*>(\n\
+      lane_bases[layout->temporary_piece]) + layout->temporary_offset;\n";
 
 pub const METAL_M1_MAX_CHANNELS: usize = 29;
 

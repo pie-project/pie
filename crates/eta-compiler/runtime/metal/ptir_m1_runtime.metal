@@ -2,6 +2,13 @@
 #include "ptir_rng.generated.metal"
 using namespace metal;
 
+// A guest value's bytes: its piece's base for this lane plus its offset in
+// that piece (eta_exec::ChunkLayout). `offsets` holds each value's offset,
+// then each value's piece `ptir_values` words past; a kernel names
+// `lane_bases` (this lane's piece bases) and `ptir_values`.
+#define PTIR_AT(v) \
+  (reinterpret_cast<device uchar*>(lane_bases[offsets[ptir_values + (v)]]) + offsets[(v)])
+
 struct M1Status {
   uint state;
   uint fault;

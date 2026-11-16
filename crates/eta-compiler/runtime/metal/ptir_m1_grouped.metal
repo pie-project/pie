@@ -39,12 +39,14 @@ struct M3ChannelMeta {
 struct M3GroupLayout {
   uint lane_count;
   uint value_count;
-  uint scratch_stride;
+  uint temporary_bytes;
   uint temporary_offset;
   uint vocab;
   uint reserved0;
   uint reserved1;
   uint reserved2;
+  uint scratch_pieces;
+  uint temporary_piece;
 };
 struct M3RowMeta {
   uint offset;

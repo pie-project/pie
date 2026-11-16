@@ -20,7 +20,7 @@ use crate::codegen::op_view::{OpView, result_bases};
 use crate::codegen::slots::Slots;
 
 fn value_ptr(value: u32) -> String {
-    format!("scratch + offsets[{value}]")
+    format!("PTIR_AT({value})")
 }
 
 fn argument_name(at: usize) -> String {
@@ -102,7 +102,7 @@ pub fn emit_fused_region(
     source.push_str("    const device M1ValueDesc* descriptors [[buffer(1)]],\n");
     source.push_str("    const device M1OpParams* params [[buffer(2)]],\n");
     source.push_str("    const device uint* offsets [[buffer(3)]],\n");
-    source.push_str("    device uchar* scratch [[buffer(4)]],\n");
+    source.push_str("    const device ulong* lane_bases [[buffer(4)]],\n");
     source.push_str("    device uchar* temporary [[buffer(5)]],\n");
     source.push_str("    const device uchar* logits [[buffer(6)]]");
     for channel in 0..channel_bindings.len() {
@@ -128,6 +128,13 @@ pub fn emit_fused_region(
     }
     source.push_str(",\n    uint gid [[thread_position_in_grid]]) {\n");
     source.push_str("  if (gid != 0 || status->state != 1) return;\n");
+    // The lane's piece bases are buffer 4; the pieces table lies the
+    // stage's value count past the offsets (`PTIR_AT`).
+    let _ = writeln!(
+        source,
+        "  constexpr uint ptir_values = {}u;",
+        stage.normalized.value_types.len()
+    );
     for channel in 0..channel_bindings.len() {
         let _ = writeln!(
             source,
@@ -247,7 +254,6 @@ pub fn emit_grouped_fused_region(
          dispatch_lane * layout->reserved2;\n",
     );
     source.push_str(super::M3_LANE_SCRATCH);
-    source.push_str("  device uchar* temporary = scratch + layout->temporary_offset;\n");
     source.push_str(
         "  const device bfloat* logits = \
          reinterpret_cast<const device bfloat*>(lane.logits_base);\n",

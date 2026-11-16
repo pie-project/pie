@@ -60,9 +60,11 @@ pub const SIGNATURE: &str = r#"(
       all_descriptors + dispatch_lane * layout->value_count;
   const device M1OpParams* lane_params =
       params + dispatch_lane * layout->reserved2;
-  device uchar* scratch = reinterpret_cast<device uchar*>(
-      scratch_bases[ulong(dispatch_lane) * ulong(M3_SCRATCH_PIECES)]);
-  device uchar* temporary = scratch + layout->temporary_offset;
+  const uint ptir_values = layout->value_count;
+  const device ulong* lane_bases =
+      scratch_bases + ulong(dispatch_lane) * ulong(layout->scratch_pieces);
+  device uchar* temporary = reinterpret_cast<device uchar*>(
+      lane_bases[layout->temporary_piece]) + layout->temporary_offset;
 "#;
 
 const BODY: &str = r#"
@@ -70,12 +72,12 @@ const BODY: &str = r#"
   if (row >= input_desc.rows) return;
   const uint len = input_desc.last;
   const device float* input =
-      reinterpret_cast<const device float*>(scratch + offsets[kInput]) +
+      reinterpret_cast<const device float*>(PTIR_AT(kInput)) +
       ulong(row) * len;
   device float* top_values =
-      reinterpret_cast<device float*>(scratch + offsets[kValues]);
+      reinterpret_cast<device float*>(PTIR_AT(kValues));
   device uint* top_indices =
-      reinterpret_cast<device uint*>(scratch + offsets[kIndices]);
+      reinterpret_cast<device uint*>(PTIR_AT(kIndices));
   device uint* order_a =
       reinterpret_cast<device uint*>(
           temporary + ulong(row) * len * 8ul);
@@ -160,12 +162,12 @@ const SELECT_BODY: &str = r#"
   if (row >= input_desc.rows) return;
   const uint len = input_desc.last;
   const device float* input =
-      reinterpret_cast<const device float*>(scratch + offsets[kInput]) +
+      reinterpret_cast<const device float*>(PTIR_AT(kInput)) +
       ulong(row) * len;
   device float* top_values =
-      reinterpret_cast<device float*>(scratch + offsets[kValues]);
+      reinterpret_cast<device float*>(PTIR_AT(kValues));
   device uint* top_indices =
-      reinterpret_cast<device uint*>(scratch + offsets[kIndices]);
+      reinterpret_cast<device uint*>(PTIR_AT(kIndices));
   const uint count = min(k, len);
   if (count == 0u) return;
   const uint simd_lane_id = thread_index & 31u;

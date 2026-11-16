@@ -59,8 +59,11 @@ pub const SIGNATURE: &str = r#"(
   if (status->state != 1u) return;
   const device M1ValueDesc* descriptors =
       all_descriptors + dispatch_lane * layout->value_count;
-  device uchar* scratch = reinterpret_cast<device uchar*>(
-      scratch_bases[ulong(dispatch_lane) * ulong(M3_SCRATCH_PIECES)]);
+  const uint ptir_values = layout->value_count;
+  const device ulong* lane_bases =
+      scratch_bases + ulong(dispatch_lane) * ulong(layout->scratch_pieces);
+  device uchar* temporary = reinterpret_cast<device uchar*>(
+      lane_bases[layout->temporary_piece]) + layout->temporary_offset;
 "#;
 
 const BODY: &str = r#"
@@ -70,21 +73,21 @@ const BODY: &str = r#"
   if (len == 0u) {
     if (thread_index == 0u) {
       reinterpret_cast<device int*>(
-          scratch + offsets[kOutput])[row] = 0;
+          PTIR_AT(kOutput))[row] = 0;
     }
     return;
   }
   const device float* logits =
-      reinterpret_cast<const device float*>(scratch + offsets[kLogits]) +
+      reinterpret_cast<const device float*>(PTIR_AT(kLogits)) +
       ulong(row) * len;
   const device float* top_p_values =
-      reinterpret_cast<const device float*>(scratch + offsets[kTopP]);
+      reinterpret_cast<const device float*>(PTIR_AT(kTopP));
   const device uint* state =
-      reinterpret_cast<const device uint*>(scratch + offsets[kState]);
+      reinterpret_cast<const device uint*>(PTIR_AT(kState));
   device int* sampled =
-      reinterpret_cast<device int*>(scratch + offsets[kOutput]);
+      reinterpret_cast<device int*>(PTIR_AT(kOutput));
   device uchar* workspace_bytes =
-      scratch + layout->temporary_offset + ulong(row) * len * 16ul;
+      temporary + ulong(row) * len * 16ul;
   device uint* order_a = reinterpret_cast<device uint*>(workspace_bytes);
   device uint* order_b = order_a + len;
   device float* probabilities =
