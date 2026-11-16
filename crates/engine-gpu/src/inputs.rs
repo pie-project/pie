@@ -131,6 +131,8 @@ pub struct Handles {
 
     pub mask: Tensor,
 
+    /// One u32 a row: its enable flag (bits 0-1) and its lane's committed
+    /// boundary (bits 2-31), the key the row's plane column 0 is.
     pub mask_enabled: Tensor,
 
     pub mask_stride: u32,
@@ -320,7 +322,7 @@ impl<B: Backend> Inputs<B> {
         let mask_plane_bytes = rows * context;
         let mask_planes = take(mask_plane_bytes);
 
-        let mask_enabled = take(rows);
+        let mask_enabled = take(rows * 4);
         let page_tables: Vec<TableAt> = (0..page_tables)
             .map(|_| TableAt {
                 indptr: take((lanes + 1) * 4),
@@ -581,14 +583,15 @@ impl<B: Backend> Inputs<B> {
         let stride = fire.mask.map_or(0, |staged| staged.stride);
         if u64::from(stride) > u64::from(self.mask_stride) {
             return Err(Fault::Ceiling {
-                what: "key positions in one mask row",
+                what: "columns in one mask row",
                 need: u64::from(stride),
                 have: u64::from(self.mask_stride),
             });
         }
         match fire.mask {
             None => {
-                self.store.zero_span(self.mask_enabled, u64::from(rows))?;
+                self.store
+                    .zero_span(self.mask_enabled, u64::from(rows) * 4)?;
             }
             Some(staged) => {
                 if staged.bytes.len() as u64 > self.mask_plane_bytes {
@@ -599,7 +602,8 @@ impl<B: Backend> Inputs<B> {
                     });
                 }
                 self.store.write(self.mask_planes, &staged.bytes)?;
-                self.store.write(self.mask_enabled, &staged.enabled)?;
+                let words: Vec<u8> = staged.words.iter().flat_map(|w| w.to_le_bytes()).collect();
+                self.store.write(self.mask_enabled, &words)?;
             }
         }
 
@@ -933,10 +937,10 @@ impl<B: Backend> Inputs<B> {
                 Dtype::U8,
             ),
             mask_enabled: Tensor::new(
-                handles.bind(&self.store, self.mask_enabled, u64::from(rows))?,
+                handles.bind(&self.store, self.mask_enabled, u64::from(rows) * 4)?,
                 rows,
                 1,
-                Dtype::U8,
+                Dtype::U32,
             ),
             mask_stride: stride,
             patches,

@@ -899,6 +899,92 @@ fn state_lent_in_the_span_outlives_a_narrow_rungs_fires() {
     );
 }
 
+/// A masked fire after a partial fold: a lane's mask speaks of the keys from
+/// its committed boundary on (`KvDelta::folded`). Past a boundary at 100 of
+/// a 150-key prompt, a mask over the buffer and the fire's own rows lands
+/// the same logits, bit for bit, as the same bits over the whole context
+/// from a boundary at 0, its committed columns set; the mask is read (it
+/// lands other logits than all set), and one short of its buffer and rows
+/// is refused for that extent.
+#[test]
+fn a_masked_fire_after_a_partial_fold_admits_the_committed_keys() {
+    let fixture = fixture("qwen3-micro-text", None);
+    let Some(mut shell) = load(&fixture, CONTEXT) else {
+        return;
+    };
+    let [prompt, _] = prompts();
+    let have = prompt.len() as u32;
+    shell
+        .fire_seated(&[Seated {
+            held: Some(0),
+            ..Seated::of(Lane {
+                slot: 0,
+                word: word(&fixture.trace, have),
+                tokens: &prompt,
+            })
+        }])
+        .expect("the prefill lands");
+
+    const ROWS: u32 = 4;
+    const FOLDED: u32 = 100;
+    let tokens: Vec<u32> = (0..ROWS).map(|at| (at * 29 + 3) % 256).collect();
+    let masked = fixture.trace.facts.word(&Request::new(ROWS, true));
+    let buffer = u64::from(have - FOLDED);
+    // Hides every third buffered key; admits the fire's own rows.
+    let hidden = |column: u64| column < buffer && column % 3 == 1;
+    let bits = |committed: u64, hide: &dyn Fn(u64) -> bool| {
+        let total = committed + buffer + u64::from(ROWS);
+        let mut runs = vec![0u32];
+        let mut admitted = false;
+        for column in 0..total {
+            let keep = column < committed || !hide(column - committed);
+            if keep != admitted {
+                runs.push(0);
+                admitted = keep;
+            }
+            *runs.last_mut().unwrap() += 1;
+        }
+        engine::fire::Masking::Extent(engine::fire::Mask::new(runs, total))
+    };
+    let mut fire = |folded: u32, mask: &engine::fire::Masking| {
+        shell.fire_seated(&[Seated {
+            held: Some(have),
+            folded,
+            mask: Some(mask),
+            ..Seated::of(Lane {
+                slot: 0,
+                word: masked,
+                tokens: &tokens,
+            })
+        }])
+    };
+    let past = fire(FOLDED, &bits(0, &hidden)).expect("the masked fire lands");
+    let whole = fire(0, &bits(u64::from(FOLDED), &hidden)).expect("the whole mask lands");
+    same("a mask past the boundary against the whole", &past, &whole);
+    let all = fire(FOLDED, &bits(0, &|_| false)).expect("an all-set mask lands");
+    assert!(
+        past[0]
+            .iter()
+            .zip(&all[0])
+            .any(|(a, b)| a.to_bits() != b.to_bits()),
+        "the mask hid nothing"
+    );
+    let short = {
+        let engine::fire::Masking::Extent(mask) = bits(0, &hidden) else {
+            unreachable!()
+        };
+        let total = mask.total - 1;
+        engine::fire::Masking::Extent(engine::fire::Mask::new(mask.runs, total))
+    };
+    let refused = fire(FOLDED, &short).expect_err("a mask short of its extent");
+    assert!(
+        refused
+            .to_string()
+            .contains(&format!("will read {}", buffer + u64::from(ROWS))),
+        "{refused}"
+    );
+}
+
 /// Panics at the first row whose logits differ in a bit.
 pub fn same(what: &str, got: &[Vec<f32>], want: &[Vec<f32>]) {
     assert_eq!(got.len(), want.len(), "{what}: rows");

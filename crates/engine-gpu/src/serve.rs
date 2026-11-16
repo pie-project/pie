@@ -395,6 +395,9 @@ pub struct Seated<'a, B: Serve> {
     pub pages: &'a [u32],
 
     pub held: Option<u32>,
+    /// The set's committed boundary (`KvDelta::folded`): the lane's mask
+    /// speaks of the keys from it on.
+    pub folded: u32,
     pub kv_less: bool,
 
     pub mask: Option<&'a Masking>,
@@ -455,6 +458,7 @@ impl<'a, B: Serve> Seated<'a, B> {
             lane,
             pages: &[],
             held: None,
+            folded: 0,
             kv_less: false,
             mask: None,
             adapter: None,
@@ -3143,6 +3147,7 @@ impl<B: Serve> Shell<B> {
             masks.push(crate::mask::LaneMask {
                 mask: masking,
                 have,
+                folded: seated.folded.min(have),
                 rows: row.rows,
             });
 
