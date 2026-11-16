@@ -441,6 +441,11 @@ fn a_guest_reads_lane_layer_and_id_outputs_by_name() {
         }
     }
     eprintln!("ids {ids:?} and both stacked layers read back");
+    assert_eq!(
+        engine.live().tallied(engine::live::Tally::Unrecorded),
+        0,
+        "a fire a guest reads built a pipeline the load did not"
+    );
     drop(engine);
     let _ = std::fs::remove_dir_all(&dir);
 }

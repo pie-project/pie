@@ -960,10 +960,7 @@ impl Plane {
         }
 
         if self.widen.is_none() {
-            match crate::guest::widen::Widen::new(device) {
-                Ok(widen) => self.widen = Some(Arc::new(widen)),
-                Err(why) => return Err(format!("the readout widen did not build: {why}")),
-            }
+            return Err("the plane built no readout widen at the load".to_owned());
         }
         let extents = eta_exec::Extents {
             row_count: binding.extents.row_count,
@@ -1135,6 +1132,17 @@ fn runs_of(row: &[u8]) -> Vec<u32> {
 impl engine_gpu::program::Programs<crate::device::Api> for Plane {
     fn register(&mut self, registration: &ProgramRegistration) -> Result<ProgramId, Refusal> {
         Plane::register(self, registration)
+    }
+
+    fn load(
+        &mut self,
+        place: &engine_gpu::program::Place<'_, crate::device::Api>,
+    ) -> Result<(), Refusal> {
+        let widen = crate::guest::widen::Widen::new(place.device).map_err(|why| {
+            Refusal::Program(format!("the readout widen did not build: {why}"))
+        })?;
+        self.widen = Some(Arc::new(widen));
+        Ok(())
     }
 
     fn package(&self, program: ProgramId) -> Option<&eta_compiler::codegen::launch::LaunchPackage> {

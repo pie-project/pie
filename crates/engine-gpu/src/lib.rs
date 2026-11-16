@@ -18,6 +18,8 @@ pub mod handles;
 pub mod inputs;
 pub mod kernel_profile;
 pub mod mask;
+pub mod named;
+pub mod naming;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod pread;
 pub mod probe;

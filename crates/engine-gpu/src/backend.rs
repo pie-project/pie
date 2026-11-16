@@ -42,6 +42,11 @@ pub trait Backend:
     /// The storage target a checkpoint lands for.
     const STORAGE: checkpoint::types::BackendKind;
 
+    /// Whether a load lands the checkpoint's bytes in what it reserves.
+    /// One that reserves nothing takes where each plane lies and which the
+    /// checkpoint publishes from the load plan, and reads no byte.
+    const LANDS: bool = true;
+
     /// The device one load binds.
     type Context: Context<Self>;
 
@@ -55,7 +60,7 @@ pub trait Backend:
     type Pending: Pending;
 
     /// The device's tuning profile, as the dispatch reads it.
-    type Tuning: Tactics;
+    type Tuning: Tactics + Clone;
 
     /// Whether `domain` names this API's device.
     fn is_device(domain: engine::transfer::MemoryDomain) -> bool;
@@ -161,6 +166,9 @@ pub trait Frame<B: Backend>: 'static {
         into.write_shared(at, bytes)
     }
 
+    /// The dispatches the frame has encoded so far.
+    fn dispatches(&self) -> u64;
+
     /// Submits what the frame holds so far; it records on.
     fn flush(&self) -> Result<()>;
 
@@ -186,6 +194,16 @@ pub trait Tactics: std::fmt::Debug {
     fn qmm_ladder(
         &self,
         rows: u32,
+        columns: u32,
+        contraction: u32,
+        bank: kernels_slang::Bank,
+    ) -> Vec<kernels_slang::linear::qmm::Qmm>;
+
+    /// Every `kernel.qmm` rung some batch of 1 to `capacity` rows reaches
+    /// at this shape: [`Tactics::qmm_ladder`]'s answers over those rows.
+    fn qmm_rungs(
+        &self,
+        capacity: u32,
         columns: u32,
         contraction: u32,
         bank: kernels_slang::Bank,
@@ -225,6 +243,26 @@ pub trait Tactics: std::fmt::Debug {
             per_expert: i64::from(pairs / experts),
         };
         self.profile().pick::<crate::tuning::MoeTileRows>(&at).0
+    }
+
+    /// Every row tile a routed matmul of up to `pairs` pairs sorts into:
+    /// what [`Tactics::moe_tile_rows`] answers some count of them.
+    fn moe_tiles(&self, pairs: u32, experts: u32) -> Vec<u32> {
+        if experts == 0 {
+            return vec![1];
+        }
+        let cell = [profile::Set::span(0, i64::from(pairs / experts))];
+        let mut tiles: Vec<u32> = Vec::new();
+        for tile in self
+            .profile()
+            .ladder::<crate::tuning::MoeTileRows>()
+            .meeting(&cell)
+        {
+            if !tiles.contains(&tile.0) {
+                tiles.push(tile.0);
+            }
+        }
+        tiles
     }
 
     /// The rows a batched route sorts into: every touched expert's run

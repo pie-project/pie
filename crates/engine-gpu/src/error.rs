@@ -73,6 +73,17 @@ pub enum Fault {
         limit: u32,
     },
 
+    /// A kernel's layout declares more storage buffers than the device
+    /// binds a shader stage.
+    StageBuffers {
+        kernel: String,
+
+        /// The storage buffers its layout declares.
+        binds: u32,
+
+        limit: u32,
+    },
+
     PatchPayload {
         lane: u32,
 
@@ -269,6 +280,15 @@ impl fmt::Display for Fault {
                  {pool} pool segments) and this adapter binds a stage {limit} \
                  (`maxStorageBuffersPerShaderStage`)",
                 own + pool
+            ),
+            Self::StageBuffers {
+                kernel,
+                binds,
+                limit,
+            } => write!(
+                f,
+                "`{kernel}`'s layout declares {binds} storage buffers and this device binds a \
+                 shader stage {limit} (`maxPerStageDescriptorStorageBuffers`)"
             ),
             Self::PatchPayload {
                 lane,

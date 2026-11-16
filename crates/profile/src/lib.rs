@@ -16,6 +16,7 @@ pub mod vendor;
 pub mod when;
 
 pub use ladder::{Anywhere, Decision, Ladder, Pick, Point, Rung};
+pub use region::{Region, Set};
 pub use profile::{Candidate, Facts, Pair, Profile, Report, Source, coord};
 pub use profile_macros::Decision;
 pub use registry::{API, Diagnostic, File, Refusal, Registry, Strict, Target};
