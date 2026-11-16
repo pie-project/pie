@@ -170,6 +170,9 @@ pub struct RsRows {
     pub tokens: u32,
     pub bytes: u64,
     pub plane_at: Vec<u64>,
+    /// Every plane of every rs row the recipe lays in the slot: its offset
+    /// and the bytes a token takes there (a token run moves these).
+    pub runs: Vec<(u64, u64)>,
 }
 
 /// How a load's rows lay into the recipe's slots, before any pool.
@@ -501,11 +504,13 @@ fn rs_rows(recipe: &ChunkRecipe, layout: &crate::rs::Layout) -> Result<RsRows> {
     }
     let tokens = u64::from(rs.tokens);
     let mut plane_at: Vec<Option<u64>> = vec![None; layout.planes.len()];
+    let mut runs = Vec::new();
     for (id, row) in &rs.rows {
         let run = rs
             .run(*id)
             .ok_or_else(|| disagree(format!("lays no run for rs row {id:?}")))?;
         for (at, plane) in row.planes.iter().enumerate() {
+            runs.push((run.offset + row.plane_at(at, tokens), plane.bytes));
             let Some(&mine) = layout.in_of.get(&plane.value.0) else {
                 return Err(disagree(format!(
                     "buffers value {} in rs row {id:?}, which this shell does not buffer",
@@ -547,6 +552,7 @@ fn rs_rows(recipe: &ChunkRecipe, layout: &crate::rs::Layout) -> Result<RsRows> {
         tokens: rs.tokens,
         bytes: rs.bytes,
         plane_at,
+        runs,
     })
 }
 
@@ -1161,14 +1167,35 @@ impl<B: Backend> Pools<B> {
 
     /// Copies token runs between kv pages (slot refs of the list shape).
     pub fn copy_kv(&self, frame: &mut B::Frame, moves: &[KvRun]) -> Result<()> {
-        let page_size = u64::from(self.paging.page_size);
-        let runs = self.kv_runs();
+        self.copy_token_runs(frame, LIST, moves)
+    }
+
+    /// The tokens a slot of list shape `id` holds, and every run of its
+    /// rows: the run's offset in the slot and the bytes a token takes
+    /// there. `None` where the shape holds no tokens.
+    fn token_rows(&self, id: ShapeId) -> Option<(u32, Vec<(u64, u64)>)> {
+        if id == LIST {
+            Some((self.paging.page_size, self.kv_runs()))
+        } else if id == RS {
+            self.rs.as_ref().map(|rs| (rs.tokens, rs.runs.clone()))
+        } else {
+            None
+        }
+    }
+
+    /// Copies token runs between slots (slot refs) of list shape `id`: each
+    /// of the shape's row runs, row for row.
+    fn copy_token_runs(&self, frame: &mut B::Frame, id: ShapeId, moves: &[KvRun]) -> Result<()> {
+        let (tokens, runs) = self.token_rows(id).ok_or_else(|| Fault::Unbound {
+            what: format!("token runs of slot shape {id}, which holds no tokens"),
+        })?;
+        let page_size = u64::from(tokens);
         for span in moves {
             for token in [span.src_token, span.dst_token] {
                 let end = u64::from(token) + u64::from(span.tokens);
                 if end > page_size {
                     return Err(Fault::Ceiling {
-                        what: "token slots in one kv page",
+                        what: "token slots in one slot of a list shape",
                         need: end,
                         have: page_size,
                     });
@@ -1177,8 +1204,8 @@ impl<B: Backend> Pools<B> {
             if span.tokens == 0 {
                 continue;
             }
-            let src = self.slot_offset(LIST, span.src_page)?;
-            let dst = self.slot_offset(LIST, span.dst_page)?;
+            let src = self.slot_offset(id, span.src_page)?;
+            let dst = self.slot_offset(id, span.dst_page)?;
             for &(offset, cell) in &runs {
                 let from = src + offset + u64::from(span.src_token) * cell;
                 let to = dst + offset + u64::from(span.dst_token) * cell;
@@ -1268,7 +1295,7 @@ impl<B: Backend> Pools<B> {
     }
 
     /// Slots of one shape copied as [`engine::Engine::copy_slots`] states
-    /// them: on the device (whole slots, and token runs of the list),
+    /// them: on the device (whole slots, and token runs of a list shape),
     /// between the device and the host chunks, or between the device and
     /// the slot file. A host or disk copy waits out its frame. A record's
     /// own frozen position goes where its slot does ([`frozen`]).
@@ -1302,14 +1329,6 @@ impl<B: Backend> Pools<B> {
             (src, dst) if here(src) && here(dst) => {
                 self.copy_shape(frame, copy.shape, &copy.slots)?;
                 if !copy.runs.is_empty() {
-                    if copy.shape != LIST {
-                        return Err(Fault::Unbound {
-                            what: format!(
-                                "token runs of slot shape {}, which holds no tokens",
-                                copy.shape
-                            ),
-                        });
-                    }
                     let runs: Vec<KvRun> = copy
                         .runs
                         .iter()
@@ -1321,7 +1340,7 @@ impl<B: Backend> Pools<B> {
                             tokens: run.tokens,
                         })
                         .collect();
-                    self.copy_kv(frame, &runs)?;
+                    self.copy_token_runs(frame, copy.shape, &runs)?;
                 }
                 Ok(())
             }
