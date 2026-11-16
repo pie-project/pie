@@ -1887,7 +1887,8 @@ fn tier_key(tier: crate::serve::Tier, shape: engine::chunk::ShapeId, slot: u32) 
 /// shape's first piece, `[run, cow]` (a fork's `cow` differs); none where
 /// it holds no record.
 fn record_key(lane: &engine::fire::Lane) -> Option<(u64, u64)> {
-    let (id, &[run, cow]) = lane.fixed.first().and_then(|(id, pieces)| Some((*id, pieces.first()?)))?;
+    let (id, &[run, cow]) =
+        lane.fixed.first().and_then(|(id, pieces)| Some((*id, pieces.first()?)))?;
     Some((ref_key(id, run), ref_key(id, cow)))
 }
 

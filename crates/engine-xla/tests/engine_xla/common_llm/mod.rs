@@ -420,7 +420,8 @@ impl Seq {
                 .shapes
                 .iter()
                 .find(|s| {
-                    matches!(s.kind, SlotKind::List { window: None, .. }) && s.role == SlotRole::State
+                    matches!(s.kind, SlotKind::List { window: None, .. })
+                        && s.role == SlotRole::State
                 })
                 .expect("a kv list")
                 .id;
