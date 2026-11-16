@@ -1989,9 +1989,12 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
         let mut f =
             String::from("fn amax(t: u16) void {\n  var m: f32 = -3.0e38;\n  var k: u32 = 0;\n");
         for &(o, len, from) in &amax {
+            // (its column a config word: the roots one image)
+            g.cfg.push(from);
+            let w = g.cfg.len() - 1;
             let _ = writeln!(
                 f,
-                "  {{ var i: u16 = 0; while (i < {len}) : (i += 1) {{ const v = hout[t * HOUTW + {o} + i]; if (v > m) {{ m = v; k = {from} + @as(u32, i); }} }} }}"
+                "  {{ var i: u16 = 0; while (i < {len}) : (i += 1) {{ const v = hout[t * HOUTW + {o} + i]; if (v > m) {{ m = v; k = pcfg[{w}] + @as(u32, i); }} }} }}"
             );
         }
         f.push_str("  hmax[2 * t] = @bitcast(u32, m);\n  hmax[2 * t + 1] = k;\n}\n");
