@@ -484,9 +484,12 @@ impl Layout {
             }
         }
         ChunkFacts {
-            // The whole span is backed at the load (`Pool::back_whole_span`):
-            // no rung raise or lend makes a device allocation after ready.
-            span_backed_on_demand: false,
+            // The runtime tells every rung change (`tells_rungs`) and cuts a
+            // guest fire to the widest rung its term fits beside. The span's
+            // heaps are all made at the load (`Pool::back_whole_span`), so a
+            // change moves only the carve's bookkeeping: no rung raise or lend
+            // makes a device allocation after ready.
+            span_backed_on_demand: !self.act().is_empty(),
             // The load pins the range below the segment the largest rung's
             // carve starts in (`Pool::reserve`): a carve reaches no lower
             // (`Pool::cover`), with its guests' terms.

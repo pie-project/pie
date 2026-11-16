@@ -1476,7 +1476,7 @@ impl PreparedLoad<'_> {
             )?),
             false => None,
         };
-        let mut shell = Shell {
+        let shell = Shell {
             tuning,
             device,
             outside,
@@ -1547,10 +1547,11 @@ impl PreparedLoad<'_> {
                 "metal: the widest rung's recurrent scratch"
             );
         }
-        // The span is backed whole, so the shell stands at the largest rung
-        // from the load, as the runtime's pool starts (a span not backed on
-        // demand is not raised through `set_rung`).
-        shell.raise_whole()?;
+        // The span is backed whole, yet the shell stands at the smallest rung
+        // as the runtime's pool starts it: the runtime still tells every rung
+        // change (`span_backed_on_demand`), so a guest fire runs at the
+        // widest rung whose carve and term fit the span. A change then moves
+        // only the carve's bookkeeping: its heaps are made.
         tracing::info!(
             span_mib = shell.pools.span_held_bytes() >> 20,
             heaps = shell.pools.span_heaps_made(),
@@ -1747,8 +1748,9 @@ impl Shell {
         if crate::diag::on().tier_trace {
             eprintln!(
                 "residency: rung {from} -> {to}, the carve {reach} bytes from the span's top \
-                 (span backed {})",
-                self.pools.span_held_bytes()
+                 (span backed {}, {} span heaps made)",
+                self.pools.span_held_bytes(),
+                self.pools.span_heaps_made()
             );
         }
         if to >= from {
