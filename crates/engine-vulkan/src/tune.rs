@@ -671,12 +671,22 @@ pub fn run(
     let today = bench.file(&[])?;
     let draft = bench.file(&chosen)?;
     // The estimate each model's load weighs its top by, against its fires
-    // measured, under the file this writes.
+    // measured, under the file this writes: its decisions and the rates this
+    // run measured.
+    let checked_under = search::assemble(
+        crate::chip::registry(),
+        &base,
+        &name,
+        &facts,
+        &tuned,
+        &[],
+        ASSUME,
+    )?;
     // Every model is checked before the run fails on any.
     let mut failed = Vec::new();
     for (artifact, deployment) in models.iter().filter(|_| steps.checks()) {
         say(&format!("check of the estimate: {deployment}"));
-        if let Err(why) = check_estimate(artifact, deployment, &name, &draft, say) {
+        if let Err(why) = check_estimate(artifact, deployment, &name, &checked_under, say) {
             failed.push(why);
         }
     }
