@@ -433,13 +433,14 @@ impl Plane {
                 id,
                 instance,
                 rings,
+                scratch,
                 ..
             } => self
                 .instances
                 .get_mut(id)
                 .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?
                 .session
-                .retarget(pools, instance, rings),
+                .retarget(pools, instance, rings, scratch),
             engine::Rebind::Channel { id, slots } => self
                 .channels
                 .get(id)
@@ -629,7 +630,7 @@ impl Plane {
         context: &Context,
         id: InstanceId,
         at: Attach,
-        carve: &GuestCarve,
+        pools: &Pools,
     ) -> Result<Fired> {
         let bound = self
             .instances
@@ -650,46 +651,33 @@ impl Plane {
             &program.compiled,
             &program.plan,
             at,
-            carve,
+            pools,
         )
     }
 
-    /// What a fire holding lanes of `program` bound at `extents` lays in
-    /// the span's guest region, a lane: its value scratch; the tables stay
-    /// the instance's and the batch's own. The engine's own placement,
-    /// until the scratch moves into its instances' state
-    /// (`engine::GuestState`).
-    pub fn lane_scratch(&self, program: ProgramId, extents: &Extents) -> Result<u64> {
+    /// What an instance of `program` bound at `extents` holds for its
+    /// lanes' scratch in the pool's `Instance` room
+    /// (`engine::GuestState::per_instance`, [`Session::scratch_for`]): no
+    /// fire takes anything of the span for it. A value past a piece of
+    /// the room is refused by name.
+    pub fn lane_scratch(&self, program: ProgramId, extents: &Extents, pools: &Pools) -> Result<u64> {
         let program = self
             .programs
             .get(&program)
             .ok_or_else(|| Fault::program("program::plane", format!("no program {program}")))?;
-        Session::scratch_for(&program.compiled, extents)
-    }
-
-    /// Each live (program, extents) pair's lane scratch, once a pair, with
-    /// each pair's live instances: no fire carries more lanes of a pair
-    /// than it has bound.
-    pub fn live_terms(&self) -> Result<Vec<(u64, u64)>> {
-        let mut pairs: Vec<((ProgramId, Extents), u64)> = Vec::new();
-        for bound in self.instances.values() {
-            let pair = (bound.program_id, bound.extents);
-            match pairs.iter_mut().find(|(seen, _)| *seen == pair) {
-                Some((_, live)) => *live += 1,
-                None => pairs.push((pair, 1)),
-            }
-        }
-        pairs
-            .iter()
-            .map(|((program, extents), live)| Ok((self.lane_scratch(*program, extents)?, *live)))
-            .collect()
+        Session::scratch_for(
+            &program.compiled,
+            extents,
+            launch::scratch_unit(pools)?,
+            pools.layout().chunk_bytes,
+        )
     }
 
     pub fn stage_batched(
         &mut self,
         frame: &mut Frame,
         ids: &[InstanceId],
-        carve: &GuestCarve,
+        pools: &Pools,
         arm: usize,
     ) -> Result<Vec<(InstanceId, Launched)>> {
         let mut results = Vec::with_capacity(ids.len());
@@ -711,7 +699,7 @@ impl Plane {
             })?;
             match bound
                 .session
-                .prepare_airborne(&program.compiled, &program.plan)?
+                .prepare_airborne(&program.compiled, &program.plan, pools)?
             {
                 Some(fired) => {
                     refused = true;
@@ -744,9 +732,6 @@ impl Plane {
                 {
                     continue;
                 }
-                // Stages fire one after another: each lays its scratch from
-                // the region's top afresh.
-                let mut room = carve.clone();
                 let mut groups: BTreeMap<Option<launch::BatchKey>, Vec<&mut launch::Prepared>> =
                     BTreeMap::new();
                 // Each member's rings, by identity: members that share one
@@ -778,16 +763,14 @@ impl Plane {
                 }
                 for (key, mut group) in groups {
                     let Some(key) = key else {
-                        // Each member's scratch is taken one under another.
-                        // No value is read before its step writes it, so the
-                        // scratch goes unfilled; test builds poison it.
-                        #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
-                        let mark = room.mark();
-                        for prepared in group.iter_mut() {
-                            prepared.seat_scratch(room.take(prepared.scratch_bytes())?)?;
-                        }
+                        // Each member's scratch is its instance's, seated
+                        // at its staging. No value is read before its step
+                        // writes it, so the scratch goes unfilled; test
+                        // builds poison it.
                         #[cfg(target_vendor = "apple")]
-                        room.poison_since(mark, frame)?;
+                        for prepared in group.iter_mut() {
+                            prepared.poison_scratch_on(frame)?;
+                        }
                         // Members are independent (each its own scratch and
                         // rings): a stage of streamed regions fires them in
                         // one concurrent pass, step k of every member, then a
@@ -839,11 +822,6 @@ impl Plane {
                             need: u64::from(needed),
                             have: u64::from(self.lanes),
                         })?;
-                    let each = batch.member_scratch_bytes();
-                    let seats = (0..group.len())
-                        .map(|_| room.take(each))
-                        .collect::<Result<Vec<_>>>()?;
-                    batch.seat_scratch(seats);
                     batch.encode(frame, &stage.regions, &mut group)?;
                 }
             }
@@ -988,8 +966,8 @@ impl Plane {
 #[derive(Debug)]
 struct Bound {
     program_id: ProgramId,
-    /// The extents it was bound at: with the program, the pair whose fire
-    /// scratch a fire lays (`Plane::lane_scratch`).
+    /// The extents it was bound at: with the program and its channels, the
+    /// pair whose batch tables it shares.
     extents: Extents,
     session: Session,
     geometry: GeometryClass,
@@ -998,85 +976,6 @@ struct Bound {
     device: eta_ir::registry::PortMask,
     shared: Vec<Option<Arc<SharedRing>>>,
     ids: Vec<ChannelId>,
-}
-
-/// One fire's guest region: the span's bytes under the model's carve,
-/// handed out from the top down (`next`), never under `floor` (the backed
-/// span's bottom). A stage starts again from the top, since stages fire one
-/// after another and none reads another's scratch.
-#[derive(Debug, Clone)]
-pub struct GuestCarve {
-    buffer: crate::device::Buffer,
-    next: u64,
-    floor: u64,
-    /// Bytes left between one take and the next: 0 but in tests that lay
-    /// a batch's members apart.
-    gap: u64,
-}
-
-impl GuestCarve {
-    #[must_use]
-    pub fn new(buffer: crate::device::Buffer, top: u64, floor: u64) -> GuestCarve {
-        GuestCarve {
-            buffer,
-            next: top,
-            floor,
-            gap: 0,
-        }
-    }
-
-    /// Tests: the region's bytes as they stand.
-    #[cfg(test)]
-    pub fn bytes(&self) -> Vec<u8> {
-        let mut out = vec![0u8; self.buffer.bytes() as usize];
-        self.buffer.read(0, &mut out).expect("the guest region reads back");
-        out
-    }
-
-    /// Tests: the same region, `gap` bytes left between takes, so no two
-    /// members' scratch lie a stride apart.
-    #[cfg(test)]
-    #[must_use]
-    pub fn spaced(self, gap: u64) -> GuestCarve {
-        GuestCarve { gap, ..self }
-    }
-
-    /// Where the next take ends: what [`GuestCarve::poison_since`]
-    /// poisons down from.
-    #[must_use]
-    pub fn mark(&self) -> u64 {
-        self.next
-    }
-
-    /// Test builds (`test-slot-fill`): poisons everything taken since
-    /// `mark` in `frame`, the scratch of every member a stage seated one
-    /// after another, so a value read before it is written fails its test.
-    /// Elsewhere nothing: no guest value is read before it is written.
-    #[cfg(target_vendor = "apple")]
-    pub fn poison_since(&self, mark: u64, frame: &mut crate::device::ctx::Frame) -> Result<()> {
-        if mark <= self.next {
-            return Ok(());
-        }
-        launch::poison_scratch(frame, self.buffer.slab(), self.next, mark - self.next)
-    }
-
-    /// `bytes` of the region, below what was taken.
-    pub fn take(&mut self, bytes: u64) -> Result<launch::ScratchAt> {
-        let at = self
-            .next
-            .checked_sub(bytes)
-            .filter(|&at| at >= self.floor)
-            .ok_or(Fault::Ceiling {
-                what: "bytes of the span's guest region the rung backs",
-                need: bytes,
-                have: self.next.saturating_sub(self.floor),
-            })?;
-        self.next = at.saturating_sub(self.gap).max(self.floor);
-        Ok(launch::ScratchAt {
-            buffer: self.buffer.clone(),
-            offset: at,
-        })
-    }
 }
 
 fn release_seats(shared: &[Option<Arc<SharedRing>>]) {
