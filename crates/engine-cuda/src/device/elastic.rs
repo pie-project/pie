@@ -154,7 +154,9 @@ impl Beside {
                      process's queues are not readable ({why})"
                 ))
             })?;
-            if areas.counted == kernels_cuda::hip::kfd::Counted::Driver && areas.queues != areas.rule {
+            if areas.counted == kernels_cuda::hip::kfd::Counted::Driver
+                && areas.queues != areas.rule
+            {
                 eprintln!(
                     "engine-cuda: KFD lists {} queues for this process where HIP's rule \
                      counts {}: a load in another PID namespace, which counts by the rule, would \
@@ -609,7 +611,11 @@ impl Arena {
                     "the flat range of {} bytes was sized to what the card had free less what \
                      the driver holds beside it ({}), and the device refused it: {why}",
                     self.virtual_bytes,
-                    if pool.beside.said.is_empty() { "nothing" } else { &pool.beside.said },
+                    if pool.beside.said.is_empty() {
+                        "nothing"
+                    } else {
+                        &pool.beside.said
+                    },
                 ))
             })?;
             self.base = base as u64;
@@ -1070,6 +1076,18 @@ impl Range {
         covered
     }
 
+    /// Where the last span held backed that starts at or past `from` ends,
+    /// as bytes past `from`: 0 where none is.
+    #[must_use]
+    pub fn held_end_past(&self, from: u64) -> u64 {
+        self.held
+            .iter()
+            .filter(|span| span.0 >= from)
+            .map(|span| span.0.saturating_add(span.1) - from)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Every byte backed: the committed segments' and the held span's.
     #[must_use]
     pub fn committed_bytes(&self) -> u64 {
@@ -1148,7 +1166,8 @@ impl Range {
     /// they lie this way: its first segments at its base, its last ones
     /// under what lies above them.
     pub fn part(&mut self, from: u64, by: u64) -> Result<()> {
-        if !from.is_multiple_of(self.segment_bytes) || u64::from(self.committed) * self.segment_bytes > from
+        if !from.is_multiple_of(self.segment_bytes)
+            || u64::from(self.committed) * self.segment_bytes > from
         {
             return Err(Fault::program(
                 "device::elastic",

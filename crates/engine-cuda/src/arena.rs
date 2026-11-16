@@ -145,6 +145,16 @@ impl Arena {
         self
     }
 
+    /// Each rung's tokens and its carve's bytes without its score planes:
+    /// what the span weighs a rung by.
+    #[must_use]
+    pub fn carves(&self) -> Vec<(u32, u64)> {
+        self.rungs
+            .iter()
+            .map(|(tokens, map)| (*tokens, self.unscored(map)))
+            .collect()
+    }
+
     /// Whether this load lays carves at the reservation's end.
     #[must_use]
     pub fn has_rungs(&self) -> bool {

@@ -151,10 +151,23 @@ fn a_score_reader_states_its_planes_and_nothing_backs_them() {
     assert_eq!(backed, span, "the span is backed whole at load");
     let facts = shell.chunk_facts().expect("the chunk facts");
     let stated = facts.act_chunks.last().expect("the top rung").1;
-    assert!(
-        u64::from(stated) * facts.chunk_bytes >= span,
-        "the top rung's chunks hold the span"
+    // The top rung's chunks are the activation's whole span (the arena and
+    // the runs past it): what its runs were asked, to a chunk, all backed.
+    let ledger = shell.activation_ledger();
+    assert_eq!(
+        stated, ledger.chunks,
+        "the top rung states the span's chunks"
     );
+    assert_eq!(
+        u64::from(stated),
+        ledger.asked.div_ceil(facts.chunk_bytes),
+        "the span states the chunks its runs reach and no more: {ledger:?}"
+    );
+    assert_eq!(
+        ledger.held_end, ledger.asked,
+        "every run asked is backed: {ledger:?}"
+    );
+    assert!(ledger.held >= span, "the arena is backed in it: {ledger:?}");
     eprintln!(
         "span {span} bytes, backed {backed}, {holds} holds at load, rungs {:?}",
         facts.act_chunks
