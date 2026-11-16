@@ -905,15 +905,14 @@ fn check_one(
     let (at_est, best) = (score(by_est.tokens), score(by_meas.tokens));
     let e = &weighed.estimate;
     let mut out = format!(
-        "{model} on {device}: peak {:.0} flop/ns, {:.0} B/ns, launch {:.0} ns; dense {:.2} GB, \
-         {:.2} GFLOP/row\n  rung  measured  estimated | est (ms): launch weights flops readout \
+        "{model} on {device}: {:.0} flop/ns at 8192 x 4096, {:.0} B/ns, launch {:.0} ns; dense \
+         {:.2} GB\n  rung  measured  estimated | est (ms): launch weights flops readout \
          attn kv recur elem | device by kind (ms, dispatches timed alone): {}  dispatches  sum  \
          wall-sum\n",
-        e.flops_per_ns(u32::MAX),
+        e.flops_per_ns(8192, 4096),
         e.bytes_per_ns,
         e.launch_ns,
         e.dense_bytes as f64 / 1e9,
-        e.flops_per_row / 1e9,
         KINDS.join(" / "),
     );
     for (k, r) in rungs.iter().enumerate() {

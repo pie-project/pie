@@ -5,20 +5,59 @@ api = 1
 device = "Apple M1 Max"
 assumes = { cores = 24 }
 
-# What pie's Metal kernels reach here (M1 Max, 24-core GPU, macOS 27; median
-# of 5 timed by the GPU after a warm run, `the_device_rates`; the vendor's
-# peaks are the upper bounds).
+# What pie's Metal kernels reach here (M1 Max, 24-core GPU, macOS 27), as
+# `pie tune metal --rates` measured them at engine::rates' lattice (two runs
+# agreed within 0.9%): the matmul m x k x k (simdgroup-matrix, f32
+# accumulation) 1.10 TFLOPS at 16 x 1024 to 5.28 at 8192 x 4096 (peak 7.96
+# TFLOPS of f32 FMA); the causal prefill 4.51 TFLOPS at 512 keys to 6.34 at
+# 16384; the blit against 400 GB/s of LPDDR5.
 [rates]
-# A 4096^3 bf16 GEMM through the dense kernel serving dispatches
-# (simdgroup-matrix, f32 accumulation): 5.28 TFLOPS. Peak: 7.96 TFLOPS of f32
-# FMA (24 cores x 128 ALUs x 2 x 1.296 GHz); the GPU has no faster bf16 path.
-bf16_flops_per_ns_by_rows_and_depth = [[4096, 4096, 5282.0]]
-# A 256 MiB blit between two buffers, read and write counted: 377 GB/s. Peak:
-# 400 GB/s of LPDDR5 (Apple's M1 Max figure).
-bytes_per_ns = 377.2
-# A dispatch's launch, back to back in one serial pass (512 of the smallest
-# GEMM in one frame).
-launch_ns = 4867
+bf16_flops_per_ns_by_rows_and_depth = [
+  [16, 1024, 1098.891871857936],
+  [32, 1024, 1476.6236377964542],
+  [64, 1024, 2725.510472121549],
+  [128, 1024, 3940.118709271162],
+  [256, 1024, 4413.690007721753],
+  [512, 1024, 4561.344414981133],
+  [1024, 1024, 4954.94430955113],
+  [2048, 1024, 5082.185544693844],
+  [4096, 1024, 5159.507232871448],
+  [8192, 1024, 5187.985375748263],
+  [16, 2048, 2236.005709613473],
+  [32, 2048, 2768.998300128078],
+  [64, 2048, 4164.672467627589],
+  [128, 2048, 4497.915420627523],
+  [256, 2048, 4687.830556701494],
+  [512, 2048, 5039.593492206321],
+  [1024, 2048, 5149.883738059034],
+  [2048, 2048, 5223.999593009021],
+  [4096, 2048, 5246.545950742607],
+  [8192, 2048, 5264.683651705265],
+  [16, 4096, 2373.2500615393647],
+  [32, 4096, 4130.090181168138],
+  [64, 4096, 4526.595600674239],
+  [128, 4096, 4723.145489289022],
+  [256, 4096, 5068.576361677644],
+  [512, 4096, 5173.796668238787],
+  [1024, 4096, 5246.137026363076],
+  [2048, 4096, 5265.549254640787],
+  [4096, 4096, 5287.435473290958],
+  [8192, 4096, 5291.87616350568],
+  [16, 8192, 2549.032046010438],
+  [32, 8192, 4465.672972500993],
+  [64, 8192, 4633.786653243366],
+  [128, 8192, 4975.335799694995],
+  [256, 8192, 5084.984979062304],
+  [512, 8192, 5155.539623923865],
+  [1024, 8192, 5175.1465095752255],
+  [2048, 8192, 5193.050633357024],
+  [4096, 8192, 5198.556641800389],
+  [8192, 8192, 5202.069747178679],
+]
+attn_flops_per_ns_by_keys = [[512, 4515.858346404292], [1024, 5453.926686974824], [2048, 6016.468529066921], [4096, 6229.527634020914], [8192, 6310.286193967598], [16384, 6346.17531266507]]
+scan_elements_per_ns = 90.28367072484787
+bytes_per_ns = 377.87857197629756
+launch_ns = 4681
 
 [provenance]
-rates = "the_device_rates test on a 24-core M1 Max on 2026-11-15, through the dense kernel serving dispatches"
+rates = "pie tune metal --rates on 2026-11-16 (pie 0.6.0): each kernel through the dispatch serving runs, back to back in 20 ms frames timed by the GPU, the matmul over 8 distinct weights; at engine::rates' lattice (matmul m x k x k, m 16..8192, k 1024..8192; attention keys x keys, keys 512..16384, 16/8 heads of 128; scan 2048 tokens, 16/16 heads of 128x128, conv 4)"
