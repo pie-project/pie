@@ -77,6 +77,9 @@ pub struct CacheGeometry {
 pub struct FireTables {
     pub request_of_token: Tensor,
 
+    /// Each row's lane's next token (`inputs::next_tokens`).
+    pub next_tokens: Tensor,
+
     /// Each readout row's position, lane and mask flag (`inputs::Handles`).
     pub readout_positions: Tensor,
 
@@ -1555,10 +1558,7 @@ impl<'c> Run<'c> {
         let at = id.0 as usize;
         match &self.values[at].def {
             Def::Input(RuntimeInput::Tokens) => self.fire.tokens,
-            Def::Input(RuntimeInput::NextTokens) => panic!(
-                "value {at} reads each row's next token, which this engine stages none of: \
-                 its load refuses such a trace"
-            ),
+            Def::Input(RuntimeInput::NextTokens) => self.fire.tables.next_tokens,
             Def::Input(RuntimeInput::ReadoutRows) => self.fire.readout_rows,
             Def::Input(RuntimeInput::Positions) => self.fire.rotations,
             Def::Input(RuntimeInput::Mask) => self.fire.tables.mask,

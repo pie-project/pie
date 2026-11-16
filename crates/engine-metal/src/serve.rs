@@ -152,6 +152,9 @@ pub struct Lane<'a> {
 #[derive(Debug, Clone, Copy)]
 pub struct Seated<'a> {
     pub lane: Lane<'a>,
+    /// The lane's token after its last row, when the runtime holds it
+    /// (`engine::fire::Lane::lookahead`): that row's next token.
+    pub lookahead: Option<u32>,
     pub group: Option<u32>,
     pub inputs: &'a [engine::fire::InputFeed],
     pub pages: &'a [u32],
@@ -199,6 +202,7 @@ impl<'a> Seated<'a> {
         const FOLD: engine::fire::RsVerb = engine::fire::RsVerb::Fold;
         Seated {
             lane,
+            lookahead: None,
             group: None,
             inputs: &[],
             pages: &[],
@@ -3800,6 +3804,8 @@ impl Shell {
         let mut snap_bands: Vec<Vec<i32>> = Vec::new();
         let mut snap_slots = 0u32;
         let mut request_of_token: Vec<i32> = Vec::with_capacity(rows as usize);
+        // Each fire lane's token past its last row, when the runtime holds it.
+        let mut lookahead: Vec<Option<i32>> = Vec::with_capacity(lanes.len());
         let mut masks: Vec<crate::mask::LaneMask<'_>> = Vec::with_capacity(lanes.len());
         let mut adapter_routes: Vec<i32> = Vec::new();
         let any_adapter = lanes.iter().any(|seated| seated.adapter.is_some());
@@ -3953,6 +3959,10 @@ impl Shell {
             }
             // This lane's index: its seat was pushed above.
             let at_lane = seats.len() as i32 - 1;
+            if let Ok(at) = usize::try_from(at_lane) {
+                lookahead.resize(lookahead.len().max(at + 1), None);
+                lookahead[at] = seated.lookahead.map(|token| token as i32);
+            }
             {
                 const MAX: usize = kernels_metal::ssm::RS_SNAPSHOTS as usize;
                 let snaps = seated.rs_snapshots;
@@ -4740,6 +4750,7 @@ impl Shell {
                 rs_snaps: (!rs_snaps.is_empty()).then_some(rs_snaps.as_slice()),
                 rs_pages: rs_pages.as_deref(),
                 request_of_token: &request_of_token,
+                next_tokens: &crate::inputs::next_tokens(&tokens, &request_of_token, &lookahead),
                 adapter_routes: any_adapter.then_some(adapter_routes.as_slice()),
                 page_tables: &geometries,
                 mask: staged.as_ref(),
@@ -4868,6 +4879,7 @@ impl Shell {
                 .collect(),
             tables: FireTables {
                 request_of_token: bound.request_of_token,
+                next_tokens: bound.next_tokens,
                 readout_positions: bound.readout_positions,
                 readout_request_of_token: bound.readout_request_of_token,
                 readout_mask_enabled: bound.readout_mask_enabled,

@@ -414,13 +414,6 @@ impl Engine for Metal {
         if ordinal > 0 {
             return Err(Error::unsupported("metal", "device ordinal selection"));
         }
-        if trace.reads_next_tokens() {
-            return Err(Error::unsupported(
-                "metal",
-                "a trace reading each row's next token (`inputs.next_tokens`), a table this \
-                 engine does not stage yet",
-            ));
-        }
 
         let Checkpoint::Path(path) = checkpoint else {
             return Err(Error::Load(
@@ -1305,6 +1298,7 @@ impl Metal {
             .enumerate()
             .map(|(at, lane)| {
                 Ok(Seated {
+                    lookahead: lane.lookahead,
                     lane: Lane {
                         slot: lane.slot,
                         word: words[at],

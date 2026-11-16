@@ -18,6 +18,7 @@ mod a_lane_with_a_page_in_every_buffer_serves_the_seats_logits;
 mod a_page_in_an_uncommitted_chunk_is_refused_by_name;
 mod a_parked_lane_serves_the_never_parked_logits;
 mod a_prompt_scan_lands_its_snapshots;
+mod a_row_takes_its_lanes_next_token;
 mod a_scattered_pool_serves_the_same_logits;
 mod a_settled_fires_fold_is_told_before_it_returns;
 mod a_stated_position_bounds_no_key;

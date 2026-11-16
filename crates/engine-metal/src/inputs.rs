@@ -92,6 +92,8 @@ pub struct Handles {
     pub row_valid: Tensor,
     pub adapter_routes: Option<Tensor>,
     pub request_of_token: Tensor,
+    /// Each row's lane's next token ([`next_tokens`]).
+    pub next_tokens: Tensor,
     pub readout_rows: Tensor,
     /// Each readout row's position, lane and mask flag: the tables a decode
     /// attention over readout rows reads in place of the tokens'.
@@ -159,6 +161,8 @@ pub struct Fire<'a> {
     pub slot_of_row: &'a [i32],
     pub adapter_routes: Option<&'a [i32]>,
     pub request_of_token: &'a [i32],
+    /// Each row's lane's next token ([`next_tokens`]).
+    pub next_tokens: &'a [i32],
     pub readout_rows: &'a [i32],
     pub page_tables: &'a [Geometry],
     pub mask: Option<&'a crate::mask::Staged>,
@@ -371,6 +375,7 @@ pub struct Inputs {
     bands: Vec<u32>,
     adapter_routes: u64,
     request_of_token: u64,
+    next_tokens: u64,
     readout_rows: u64,
     readout_positions: u64,
     readout_request_of_token: u64,
@@ -467,6 +472,7 @@ impl Inputs {
         let slot_of_row = take(rows * width * 4);
         let adapter_routes = take(rows * 4);
         let request_of_token = take(rows * 4);
+        let next_tokens = take(rows * 4);
         let readout_rows = take(rows * 4);
         let readout_positions = take(rows * 4);
         let readout_request_of_token = take(rows * 4);
@@ -561,6 +567,7 @@ impl Inputs {
             },
             adapter_routes,
             request_of_token,
+            next_tokens,
             readout_rows,
             readout_positions,
             readout_request_of_token,
@@ -693,6 +700,8 @@ impl Inputs {
         self.store.write(self.slot_ids, bytes_of(fire.slot_ids))?;
         self.store
             .write(self.request_of_token, bytes_of(fire.request_of_token))?;
+        self.store
+            .write(self.next_tokens, bytes_of(fire.next_tokens))?;
         if fire.readout_rows.len() > rows as usize {
             return Err(Fault::Ceiling {
                 what: "readout rows in one fire",
@@ -1225,6 +1234,12 @@ impl Inputs {
                 self.store.at(self.request_of_token),
                 rows,
             )?,
+            next_tokens: i32s(
+                handles,
+                self.store.view(),
+                self.store.at(self.next_tokens),
+                rows,
+            )?,
             readout_rows: i32s(
                 handles,
                 self.store.view(),
@@ -1432,5 +1447,41 @@ fn bytes_of(values: &[i32]) -> &[u8] {
     // readable as `u8`.
     unsafe {
         core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), core::mem::size_of_val(values))
+    }
+}
+
+/// Each row's lane's next token: row i's is row i + 1's token when that row
+/// is the same lane's; a lane's last row holds the token past it the runtime
+/// holds (`lookahead`, by lane), else its own (its next is the one the fire
+/// samples, which the forward puts there). Device-fed tokens are resolved on
+/// the host before they are staged, so `tokens` holds them already.
+#[must_use]
+pub fn next_tokens(tokens: &[i32], lane_of_row: &[i32], lookahead: &[Option<i32>]) -> Vec<i32> {
+    (0..tokens.len())
+        .map(|row| match (lane_of_row.get(row), lane_of_row.get(row + 1)) {
+            (Some(here), Some(next)) if here == next && row + 1 < tokens.len() => tokens[row + 1],
+            (Some(&here), _) => usize::try_from(here)
+                .ok()
+                .and_then(|lane| lookahead.get(lane).copied().flatten())
+                .unwrap_or(tokens[row]),
+            _ => tokens[row],
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod next_token_tests {
+    use super::next_tokens;
+
+    #[test]
+    fn a_row_takes_its_lanes_next_token() {
+        // Lane 0: rows 10 11 12 with a held next piece starting 13; lane 1:
+        // rows 20 21 with no lookahead, its last row keeping its own.
+        let tokens = [10, 11, 12, 20, 21];
+        let lanes = [0, 0, 0, 1, 1];
+        assert_eq!(
+            next_tokens(&tokens, &lanes, &[Some(13), None]),
+            vec![11, 12, 13, 21, 21]
+        );
     }
 }
