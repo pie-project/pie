@@ -104,7 +104,11 @@ pub struct SlotPoolFacts {
     /// for lanes the runtime does not seat. Logical = physical for them.
     pub reserved_chunks: u32,
     pub shapes: Vec<SlotShape>,
-    /// `(rung tokens, activation chunks)`, ascending.
+    /// `(rung tokens, activation chunks)`, ascending. None stated (a load
+    /// whose activation lies outside the pool) is one rung of fires of any
+    /// tokens whose carve takes no chunk of it, its span the room the load
+    /// backs for it (`act_span`, else none): the guest term is cut and
+    /// refused against that span as against any top rung's.
     pub act_chunks: Vec<(u32, u32)>,
     /// The chunks a rung's activation may take as the engine stands
     /// (`ChunkFacts::act_span_chunks`); `None`: nothing of the engine's
@@ -529,7 +533,15 @@ impl SlotPool {
         assert!(facts.shapes.len() < NO_SHAPE as usize);
         let mut act_chunks = facts.act_chunks;
         act_chunks.sort_unstable();
-        let act_max = act_chunks.last().map_or(0, |&(_, chunks)| chunks);
+        // The top rung's span: its carve's chunks; a load stating no rung
+        // is the one rung of no carve, its span the room the load backs.
+        let act_max = match act_chunks.last() {
+            Some(&(_, chunks)) => chunks,
+            None => {
+                act_chunks.push((u32::MAX, 0));
+                facts.act_span.unwrap_or(0)
+            }
+        };
         assert!(
             facts.reserved_chunks + act_max <= total,
             "the reserved chunks and the largest rung's activation outgrow the pool"
