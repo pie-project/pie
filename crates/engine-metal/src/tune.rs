@@ -747,26 +747,48 @@ fn check_one(
     let contract = poem::import::own_contract(&source, &trace.params, 1, Platform::Metal)
         .map_err(|e| e.to_string())?;
     drop(source);
-    let mut shell = crate::Shell::load(crate::Boot {
-        voxels: None,
-        trace: trace.clone(),
-        contract: &contract,
-        checkpoint: artifact,
-        budget: poem_compiler::Budget::new(lanes, tokens),
-        patches: patch_ladder(&trace),
-        profile: None,
-        page_size: 16,
-        context: tokens,
-        slots: 1,
-        kv_budget: None,
-        allowance: engine::Allowance::WHOLE,
-        runahead: engine::runahead::Runahead::F1,
-        profiles: profiles.map(Path::to_path_buf),
-        residency: crate::ResidencyPlan::default(),
-        top: crate::Top::EveryRung,
-    })
-    .map_err(|e| e.to_string())?;
-    shell.raise_whole().map_err(|e| e.to_string())?;
+    // A shell of `slots` slots of `context` tokens each: one slot holding the
+    // widest prompt, or a slot a lane for decode-shaped fires. Both lay the
+    // same rungs, the served fire size's.
+    let load = |slots: u32, context: u32, kv_budget: Option<u64>| -> Result<crate::Shell, String> {
+        let mut shell = crate::Shell::load(crate::Boot {
+            voxels: None,
+            trace: trace.clone(),
+            contract: &contract,
+            checkpoint: artifact,
+            budget: poem_compiler::Budget::new(lanes, tokens),
+            patches: patch_ladder(&trace),
+            profile: None,
+            page_size: 16,
+            context,
+            slots,
+            kv_budget,
+            allowance: engine::Allowance::WHOLE,
+            runahead: engine::runahead::Runahead::F1,
+            profiles: profiles.map(Path::to_path_buf),
+            residency: crate::ResidencyPlan::default(),
+            top: crate::Top::EveryRung,
+        })
+        .map_err(|e| e.to_string())?;
+        shell.raise_whole().map_err(|e| e.to_string())?;
+        // No runtime commits the pool here: a bounded pool's every whole
+        // segment under the activation span is committed, as a runtime does
+        // once the state its lanes hold reaches it (a slot a lane's records,
+        // recurrent ones among them, pass the bottom's first chunks).
+        if kv_budget.is_none() {
+            return Ok(shell);
+        }
+        let below = shell
+            .pool_chunk_facts()
+            .total_chunks
+            .saturating_sub(shell.pool_layout().act_span());
+        let segment = shell.pool_chunk_facts().segment_chunks.max(1);
+        shell
+            .commit_segments(below / segment)
+            .map_err(|e| e.to_string())?;
+        Ok(shell)
+    };
+    let mut shell = load(1, tokens, None)?;
     let weighed = shell.weighed().cloned().ok_or_else(|| {
         format!("{device} has no rates in its profile to estimate by: run `pie tune --rates`")
     })?;
@@ -776,13 +798,21 @@ fn check_one(
         .filter(|r| r.infeasible.is_none())
         .copied()
         .collect();
-    let widths: Vec<u32> = rungs.iter().map(|r| r.tokens).collect();
+    // Each rung timed at the shape the estimate weighs it
+    // (`RungFacts::decode_shaped`): past the lanes, one prompt of its tokens
+    // on a fresh slot; up to them, a lane a token, each on a fresh slot of
+    // its own (a second shell, of a slot a lane).
+    let max_lanes = rungs.iter().map(|r| r.lanes).max().unwrap_or(1);
+    let (decode, prompts): (Vec<u32>, Vec<u32>) = rungs
+        .iter()
+        .map(|r| r.tokens)
+        .partition(|&w| rungs.iter().any(|r| r.tokens == w && r.decode_shaped()));
     say(&format!(
-        "{model}: timing a fire at each of {} rung widths {widths:?}",
-        widths.len()
+        "{model}: timing a fire at each rung, prompt-shaped {prompts:?}, decode-shaped {decode:?} \
+         (a lane a token, each on a fresh slot, up to {max_lanes})"
     ));
     let token = |i: u32| 100 + (i * 7919) % 5000;
-    let fire = |shell: &mut crate::Shell, width: u32| -> Result<u64, String> {
+    let prompt_fire = |shell: &mut crate::Shell, width: u32| -> Result<u64, String> {
         let prompt: Vec<u32> = (0..width).map(token).collect();
         shell.open(0).map_err(|e| e.to_string())?;
         let lane = crate::Lane {
@@ -796,14 +826,32 @@ fn check_one(
             .map_err(|e| e.to_string())?;
         Ok(u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX))
     };
-    let measured = search::time_fires(&widths, |width, _| fire(&mut shell, width), say)?;
-    // Each width dissected: every dispatch committed and timed alone, its
-    // device time told by its kernel's kind.
-    let mut dissected = Vec::new();
-    for &width in &widths {
+    let ones: Vec<[u32; 1]> = (0..max_lanes).map(|i| [token(i)]).collect();
+    let one = trace.facts.word(&Request::new(1, false));
+    let decode_fire = |shell: &mut crate::Shell, width: u32| -> Result<u64, String> {
+        for slot in 0..width {
+            shell.open(slot).map_err(|e| e.to_string())?;
+        }
+        let lanes: Vec<crate::Lane<'_>> = (0..width)
+            .map(|slot| crate::Lane {
+                slot,
+                word: one,
+                tokens: &ones[slot as usize],
+            })
+            .collect();
+        let began = Instant::now();
+        shell.fire(&lanes).map_err(|e| e.to_string())?;
+        Ok(u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX))
+    };
+    // Each width dissected after its timing: every dispatch committed and
+    // timed alone, its device time told by its kernel's kind.
+    let dissect = |shell: &mut crate::Shell,
+                   width: u32,
+                   fire: &dyn Fn(&mut crate::Shell, u32) -> Result<u64, String>|
+     -> Result<(u32, [u64; KINDS.len()], u64, Vec<(String, u64, u64)>), String> {
         crate::encode::reset_kernel_profile();
         crate::encode::profile_kernels(true);
-        let fired = fire(&mut shell, width);
+        let fired = fire(shell, width);
         crate::encode::profile_kernels(false);
         fired?;
         let rows = crate::encode::kernel_profile();
@@ -814,9 +862,26 @@ fn check_one(
             by_kind[kind_of(entry)] += ns;
             dispatches += n;
         }
-        dissected.push((width, by_kind, dispatches, rows));
+        Ok((width, by_kind, dispatches, rows))
+    };
+    let mut measured = search::time_fires(&prompts, |width, _| prompt_fire(&mut shell, width), say)?;
+    let mut dissected = Vec::new();
+    for &width in &prompts {
+        dissected.push(dissect(&mut shell, width, &prompt_fire)?);
     }
     drop(shell);
+    if !decode.is_empty() {
+        // A slot a lane of 16 tokens: its pool bounded to what they hold.
+        let mut shell = load(max_lanes, 16, Some(6 << 30))?;
+        measured.extend(search::time_fires(
+            &decode,
+            |width, _| decode_fire(&mut shell, width),
+            say,
+        )?);
+        for &width in &decode {
+            dissected.push(dissect(&mut shell, width, &decode_fire)?);
+        }
+    }
 
     let est: Vec<f64> = rungs.iter().map(|r| weighed.estimate.ns(r)).collect();
     let meas: Vec<f64> = rungs
