@@ -652,11 +652,25 @@ impl AxisCarve<'_> {
         self.prefix(span, u32::MAX)
     }
 
+    /// The lanes a window's carve reaches: from the least lane it can start
+    /// at under this key (one lane for each class before it), its classes'
+    /// lane rungs. Where a fire's own classes before it put its lanes is no
+    /// part of it, so every fire of the key carves the lanes its body was
+    /// armed at.
     #[must_use]
     pub fn lanes(&self, span: MaskSpan) -> Option<(u32, u32)> {
         let cap = self.lane_ceiling?;
         let (_, own) = self.prefix(span, cap)?;
-        Some((span.lane_offset, own.min(cap)))
+        let before = self
+            .ladder
+            .rungs()
+            .iter()
+            .filter(|(class, _)| {
+                let window = self.classes.class(*class as usize);
+                window.row_offset + window.rows <= span.row_offset
+            })
+            .count();
+        Some((u32::try_from(before).ok()?, own.min(cap)))
     }
 
     fn prefix(&self, span: MaskSpan, cap: u32) -> Option<(u32, u32)> {

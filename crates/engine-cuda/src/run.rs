@@ -560,13 +560,18 @@ impl Standing {
         (rows >= span.rows).then_some(rows)
     }
 
+    /// The lanes a captured window launches over: its carve's lane ceiling
+    /// within the staged boundary words, whether its rows are a plane's or
+    /// the whole bucket's. A whole window launched over its fire's live
+    /// lanes would hold a body only for fires of that many lanes, while
+    /// every fire of its key replays it.
     pub(crate) fn lanes(&self, windows: &Windows, span: MaskSpan) -> Option<u32> {
-        let Held::Captured {
-            plane: true, lanes, ..
-        } = self.held
-        else {
+        let Held::Captured { plane, lanes, .. } = self.held else {
             return None;
         };
+        if !(plane || self.whole) {
+            return None;
+        }
         let (before, own) = lanes?;
         let staged = windows
             .qo_absolute()
@@ -2577,9 +2582,11 @@ impl<'c> Run<'c> {
                 gathered.page_indptr_host.as_slice(),
                 gathered.kv_len_host.as_slice(),
             ),
+            // The planner reads the live lanes' boundaries from the fire's
+            // first lane of this window, whatever its carve reaches.
             None => {
                 let first = span.lane_offset as usize;
-                let lanes = ceiling.map_or(span.lanes, |(_, lanes)| lanes) as usize;
+                let lanes = span.lanes as usize;
                 (
                     seat.kv_indptr
                         .get(first..=first + lanes)
@@ -2612,10 +2619,6 @@ impl<'c> Run<'c> {
         assert!(
             shape.num_requests >= live.requests,
             "a carve is never narrower than the fire"
-        );
-        assert!(
-            shape.lane_offset >= live.lane_offset,
-            "a carve starts at or before the fire"
         );
         assert!(shape.lane_offset + shape.num_requests >= live.lane_offset + live.requests);
         let rows = rows_ceiling.unwrap_or(span.rows);
