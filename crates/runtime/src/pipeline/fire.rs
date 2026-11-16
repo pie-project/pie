@@ -823,6 +823,10 @@ fn mask_rows(share: u32, span: u64, context: u64, rung: impl Fn(u32) -> u64) -> 
 
 /// `PIE_FIRE_ROWS` overrides it, so a test compares outputs cut at the same
 /// rows.
+///
+/// Counts processes (requests), not lanes, by the user's ruling: the
+/// process is the unit of admission and yield, and prefill is shared among
+/// requests, so an inferlet flying many lanes is not favoured.
 fn prefill_share(page: u32, engine: usize) -> u32 {
     if let Some(rows) = fire_rows() {
         return rows;
@@ -844,6 +848,10 @@ fn prefill_share(page: u32, engine: usize) -> u32 {
 /// ([`crate::inferlet::host::model::prefill_share`]), up to what the
 /// largest activation rung holds: what a pass asks the rung for
 /// ([`crate::store::shared::want_rows`]).
+///
+/// Counts processes (requests), not lanes, by the user's ruling: the
+/// process is the unit of admission and yield, and prefill is shared among
+/// requests, so an inferlet flying many lanes is not favoured.
 fn prefill_want(rows: usize, engine: usize) -> u32 {
     if let Some(fire) = fire_rows() {
         return fire.min(u32::try_from(rows).unwrap_or(u32::MAX));
