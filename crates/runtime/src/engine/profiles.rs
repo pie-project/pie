@@ -191,7 +191,11 @@ fn tune_vulkan(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned
 /// alone: every rung's fire timed against the estimate, and dissected.
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 fn tune_metal(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String> {
-    use engine_metal::tune::{Depth, check_estimate, run};
+    use engine_metal::tune::{Depth, check_estimate, rates, run};
+    if req.rates && !req.check_estimate {
+        let out = rates(Some(req.profiles), say)?;
+        return Ok(tuned!(out, wrong: out.wrong));
+    }
     let models = pick_models("metal", req)?;
     if req.check_estimate {
         let out = check_estimate(Some(req.profiles), &models, say)?;
