@@ -62,9 +62,6 @@ const UNIFORM_CHUNK: u64 = 1 << 20;
 
 const SCRATCH_CHUNK: u64 = 8 << 20;
 
-/// The bounce a copy within one buffer takes a piece at a time.
-const BOUNCE_BYTES: u64 = 1 << 20;
-
 const TIMING_QUERIES: u32 = 4096;
 
 const SPAN_AT: u64 = (TIMING_QUERIES as u64) * 8;
@@ -171,8 +168,9 @@ pub(crate) struct Core {
     /// kernel's test) takes chunks as it needs.
     rooms: Mutex<Option<Rooms>>,
     /// What a copy between two spans of one buffer goes through
-    /// ([`Frame::copy`]), a piece at a time: laid once, on the device's
-    /// first such copy or when a load lays its frames.
+    /// ([`Frame::copy`]), a piece at a time: a load lays it at the most
+    /// such a copy moves at once (its pool's chunk); outside a load, a copy
+    /// takes one as long as itself.
     bounce: Mutex<Option<Held>>,
 
     pub(crate) last_error: Arc<Mutex<Option<String>>>,
@@ -272,11 +270,15 @@ impl Core {
         )
     }
 
-    /// The bounce a copy within one buffer goes through, laid once.
-    pub(crate) fn bounce(&self) -> wgpu::Buffer {
+    /// The bounce a copy of `len` bytes within one buffer goes through: the
+    /// one a load laid, else one at least `len` long.
+    pub(crate) fn bounce(&self, len: u64) -> wgpu::Buffer {
+        let laid = self.rooms().is_some();
         let mut bounce = self.bounce.lock().expect("bounce lock poisoned");
-        let held = bounce.get_or_insert_with(|| self.scratch_buffer(BOUNCE_BYTES));
-        (**held).clone()
+        if !laid && bounce.as_ref().is_none_or(|held| held.size() < len) {
+            *bounce = Some(self.scratch_buffer(len.next_multiple_of(4).max(4)));
+        }
+        (**bounce.as_ref().expect("a load lays the bounce with the frames")).clone()
     }
 
     fn rooms(&self) -> Option<Rooms> {
@@ -640,7 +642,7 @@ impl Context {
     /// frames took before: from now on a frame takes one of each it needs
     /// and gives it back when it lands, and one past its room, or past every
     /// room in flight, is refused by name.
-    pub fn lay_frames(&self, frames: usize, uniform: u64, scratch: u64) {
+    pub fn lay_frames(&self, frames: usize, uniform: u64, scratch: u64, bounce: u64) {
         let core = &self.core;
         let mut uniforms = core.uniforms.lock().expect("uniforms lock poisoned");
         let mut scratches = core.scratch.lock().expect("scratch lock poisoned");
@@ -654,7 +656,8 @@ impl Context {
                 scratches.push(core.scratch_buffer(scratch));
             }
         }
-        drop(core.bounce());
+        *core.bounce.lock().expect("bounce lock poisoned") =
+            Some(core.scratch_buffer(bounce.next_multiple_of(4).max(4)));
         *core.rooms.lock().expect("rooms lock poisoned") = Some(Rooms {
             uniform,
             scratch,
@@ -664,6 +667,7 @@ impl Context {
             frames,
             uniform,
             scratch,
+            bounce,
             "a frame's uniforms and staging scratch are laid for the load's frames at once"
         );
     }
@@ -785,7 +789,6 @@ impl Context {
                 done: AtomicBool::new(false),
                 timing: Mutex::new(Vec::new()),
                 pass: Mutex::new(None),
-                widens: AtomicU64::new(0),
             }),
             open: true,
             dispatches: std::cell::Cell::new(0),
@@ -809,8 +812,6 @@ pub(crate) struct Inner {
     timing: Mutex<Vec<Timing>>,
 
     pass: Mutex<Option<wgpu::ComputePass<'static>>>,
-    /// The guest widens the frame encoded (`guest::widen`).
-    widens: AtomicU64,
 }
 
 impl Inner {
@@ -885,14 +886,6 @@ impl Frame {
             why: "this frame was already submitted".to_string(),
         })?;
         Ok(f(encoder))
-    }
-
-    /// Counts one more widen the frame encodes: how many it has.
-    pub(crate) fn widened(&self) -> u64 {
-        self.inner
-            .widens
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            + 1
     }
 
     pub(crate) fn uniform_slot(&self, bytes: u64) -> Result<(wgpu::Buffer, u64)> {
@@ -1001,7 +994,7 @@ impl Frame {
         // move takes (from the far end where the ends overlap upward), so
         // overlapping ends read as they were. The queue runs every copy in
         // order, so one bounce serves every frame.
-        let bounce = self.inner.core.bounce();
+        let bounce = self.inner.core.bounce(len);
         let piece = bounce.size();
         let pieces = len.div_ceil(piece);
         self.encode(|encoder| {
@@ -1266,7 +1259,7 @@ mod tests {
         drop(unlaid);
 
         let (uniform, scratch) = (4096, 1 << 20);
-        device.lay_frames(2, uniform, scratch);
+        device.lay_frames(2, uniform, scratch, scratch);
         let reserved = device.books().reserved();
         let frame = device.frame().unwrap();
         frame

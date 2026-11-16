@@ -155,17 +155,13 @@ pub trait Serve: Backend {
     /// binds a buffer at any offset.
     fn staging_align(device: &Self::Context) -> Option<u64>;
 
-    /// Lays what a frame takes of its own beside the load's buffers, for
-    /// `frames` frames at once, each at what the load's widest fire stages
-    /// (`staged`, [`Asks::staged`]), and its pipelines' uniforms for a
-    /// fire's `dispatches` at least: no frame of the serving load
-    /// allocates, and one past them is refused.
+    /// Lays what a frame takes of its own beside the load's buffers, from
+    /// what the load's fires can ask ([`FrameFacts`]): no frame of the
+    /// serving load allocates, and one past what was laid is refused.
     fn lay_frames(
         device: &Self::Context,
         pipelines: &Self::Pipelines,
-        staged: crate::naming::Staged,
-        dispatches: u32,
-        frames: usize,
+        facts: FrameFacts,
     ) -> Result<()>;
 
     /// The backend's state of a fresh load over its `readout` seats.
@@ -1370,6 +1366,14 @@ impl<B: Serve> Shell<B> {
                 )
             })
             .transpose()?;
+        if let Some(scratch) = &rs_scratch {
+            tracing::info!(
+                bytes = scratch.bytes(),
+                rows = crate::rs::Seat::widest_rows(budgets.tokens.max_tokens),
+                lanes = budgets.tokens.max_lanes,
+                "the recurrent scratch is laid at the widest rung's extended rows"
+            );
+        }
         // The snapshot table, where a record holds state: a lane's entry
         // for every lane a fire carries at most (`snapshot_table_bytes`).
         let snaps = (rows.fixed_bytes > 0)
@@ -1381,9 +1385,18 @@ impl<B: Serve> Shell<B> {
                 )
             })
             .transpose()?;
-        // What a frame takes of its own: one encoding while each arm's is in
-        // flight, each at what the load's widest fire stages.
-        B::lay_frames(&device, &pipelines, asks.staged, asks.dispatches, arms + 1)?;
+        // What a frame takes of its own, from what the load's fires ask.
+        B::lay_frames(
+            &device,
+            &pipelines,
+            FrameFacts {
+                staged: asks.staged,
+                dispatches: asks.dispatches,
+                rungs: u32::try_from(span.rungs().len()).unwrap_or(u32::MAX),
+                arms: u32::try_from(arms).unwrap_or(u32::MAX),
+                chunk_bytes: chunk,
+            },
+        )?;
         // Every pipeline a fire asks for is built by now: what is left is
         // past what the driver took for them.
         let left = device.left();
@@ -4744,6 +4757,26 @@ impl<B: Serve> Shell<B> {
         }
         Ok(staged)
     }
+}
+
+/// What the load's fires can ask of a frame's own buffers, each counted at
+/// load ([`Serve::lay_frames`]).
+#[derive(Debug, Clone, Copy)]
+pub struct FrameFacts {
+    /// What one fire's frame stages at most ([`Asks::staged`]).
+    pub staged: crate::naming::Staged,
+    /// The most dispatches one fire makes ([`Asks::dispatches`]): each
+    /// binds one group.
+    pub dispatches: u32,
+    /// The rungs of the span: a fire's carve, and the views its groups
+    /// bind, are its rung's.
+    pub rungs: u32,
+    /// The arms fires take turns on, each its inputs' own: one arm's fire
+    /// binds other buffers than another's.
+    pub arms: u32,
+    /// The pool's chunk: no copy within one of its buffers moves more at
+    /// once (a slot lies in one chunk, a move takes a chunk).
+    pub chunk_bytes: u64,
 }
 
 /// What a load's fires can ask of its device, named before the device holds

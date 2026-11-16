@@ -85,7 +85,7 @@ impl Context {
         match self.never {}
     }
 
-    pub fn lay_frames(&self, _frames: usize, _uniform: u64, _scratch: u64) {
+    pub fn lay_frames(&self, _frames: usize, _uniform: u64, _scratch: u64, _bounce: u64) {
         match self.never {}
     }
 
@@ -414,8 +414,8 @@ impl Pipelines {
         device.storage_align()
     }
 
-    pub fn lay_uniforms(&self, device: &Context, _dispatches: u32) {
-        device.lay_frames(0, 0, 0);
+    pub fn lay_uniforms(&self, device: &Context, _groups: usize) {
+        device.lay_frames(0, 0, 0, 0);
     }
 }
 

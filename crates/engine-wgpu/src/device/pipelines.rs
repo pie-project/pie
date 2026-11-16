@@ -427,16 +427,15 @@ impl Pipelines {
             .next_multiple_of(align)
     }
 
-    /// Lays the bind cache's uniform arena ([`Arena`]): two epochs of a
-    /// cache slot for every group the cache keeps, at least a fire's
-    /// `dispatches`, each at the most any built pipeline's uniforms take.
-    /// No dispatch takes a chunk past them. The groups cached before are
-    /// dropped, their uniforms written again where they are next bound.
-    pub fn lay_uniforms(&self, device: &Context, dispatches: u32) {
-        let arena = Arena::new(
-            BIND_CACHE_CAP.max(dispatches as usize),
-            self.uniform_stride(device),
-        );
+    /// Lays the bind cache's uniform arena ([`Arena`]): two epochs, the one
+    /// being filled and the one before it whose groups a frame still
+    /// encoding may bind, of `groups` cache slots each (the most groups
+    /// serving binds again, at least a fire's), each at the most any built
+    /// pipeline's uniforms take. No dispatch takes a chunk past them. The
+    /// groups cached before are dropped, their uniforms written again where
+    /// they are next bound.
+    pub fn lay_uniforms(&self, device: &Context, groups: usize) {
+        let arena = Arena::new(groups, self.uniform_stride(device));
         let core = device.core();
         let mut binds = self.binds.borrow_mut();
         binds.groups.clear();
@@ -447,6 +446,12 @@ impl Pipelines {
         }
         binds.used = 0;
         binds.laid = Some(arena);
+        tracing::info!(
+            groups,
+            stride = arena.stride,
+            bytes = arena.chunks() as u64 * UNIFORM_ARENA_CHUNK,
+            "the bind cache's uniform arena is laid for two epochs of the groups serving binds"
+        );
     }
 
     /// The pipeline of kernels-slang's module `key` (an instantiation at a
@@ -570,9 +575,14 @@ mod tests {
     /// same bytes (the negative control) takes one.
     #[test]
     fn a_full_cache_overwrites_no_live_groups_uniforms() {
-        let (slots, stride) = (16 * 1024, 256);
+        // A fire's 420 dispatches at 9 rungs on 2 arms, 256 bytes a slot.
+        let (slots, stride) = (420 * 9 * 2, 256);
         let mut arena = Arena::new(slots, stride);
-        assert_eq!(arena.chunks(), 8, "two epochs of 16K slots of 256 bytes");
+        assert_eq!(
+            arena.chunks() as u64,
+            (2 * slots as u64 * stride).div_ceil(1 << 20),
+            "two epochs of the groups serving binds"
+        );
         // Every live group's bytes: (chunk, byte) -> the epoch it is cached in.
         let mut live: std::collections::HashMap<(usize, u64), usize> = Default::default();
         let mut epoch = 0;
@@ -597,7 +607,7 @@ mod tests {
         let mut overwrote = false;
         let mut epoch = 0;
         for at in 0..3 * slots {
-            if at > 0 && at % slots == 0 {
+            if at > 0 && at.is_multiple_of(slots) {
                 epoch += 1;
                 live.retain(|_, cached| *cached + 1 >= epoch);
             }

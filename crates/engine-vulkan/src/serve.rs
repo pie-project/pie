@@ -158,9 +158,7 @@ impl Serve for Api {
     fn lay_frames(
         _device: &Context,
         _pipelines: &Pipelines,
-        _staged: engine_gpu::naming::Staged,
-        _dispatches: u32,
-        _frames: usize,
+        _facts: engine_gpu::serve::FrameFacts,
     ) -> Result<()> {
         Ok(())
     }

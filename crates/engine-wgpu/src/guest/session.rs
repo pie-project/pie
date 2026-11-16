@@ -117,6 +117,11 @@ pub struct Session {
     run: bool,
 
     code: Arc<Code>,
+    /// A widen config slot for each output root of its widest stage
+    /// ([`Session::widen_config`]): a stage's frame widens each root once.
+    widens: Option<crate::device::ctx::Held>,
+    widen_slots: u64,
+    widen_stride: u64,
 }
 
 impl std::fmt::Debug for Session {
@@ -132,12 +137,27 @@ impl std::fmt::Debug for Session {
 }
 
 impl Session {
+    /// The config slot of a stage frame's `n`th widen: one an output root.
+    pub fn widen_config(&self, n: u64) -> Result<(wgpu::Buffer, u64)> {
+        match &self.widens {
+            Some(held) if n < self.widen_slots => Ok(((**held).clone(), n * self.widen_stride)),
+            _ => Err(Fault::Program {
+                at: "guest::widen",
+                why: format!(
+                    "a stage's widen {n} is past the {} its package's output roots laid",
+                    self.widen_slots
+                ),
+            }),
+        }
+    }
+
     pub fn new(
         device: &Context,
         plans: &[LaunchStagePlan],
         code: Arc<Code>,
         extents: &Extents,
         tables: &Tables<'_>,
+        widen_slots: u64,
     ) -> Result<Session> {
         if code.stages() != plans.len() {
             return Err(Fault::Program {
@@ -190,6 +210,18 @@ impl Session {
             )?);
         }
 
+        let widen_stride = u64::from(core.limits.min_uniform_buffer_offset_alignment).max(16);
+        let widens = (widen_slots > 0).then(|| {
+            core.held(
+                &wgpu::BufferDescriptor {
+                    label: Some("pie widen configs"),
+                    size: widen_slots * widen_stride,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                },
+                engine_gpu::books::owners::GUEST,
+            )
+        });
         Ok(Session {
             core,
             status,
@@ -197,6 +229,9 @@ impl Session {
             slots: tables.slots.to_vec(),
             run,
             code,
+            widens,
+            widen_slots,
+            widen_stride,
         })
     }
 

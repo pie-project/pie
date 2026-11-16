@@ -2,26 +2,16 @@ use std::sync::Arc;
 
 use crate::device::Context;
 use crate::device::alloc::Buffer;
-use crate::device::ctx::{Core, Frame, Held};
+use crate::device::ctx::{Core, Frame};
 use engine_gpu::guest::widen::{Cfg, UNIFORM_SOURCE, WG, config_bytes, word};
 
 use engine_gpu::error::{Fault, Result};
-
-/// The configs one frame's widens take at most: each its own slot of the
-/// widen's uniform ring, laid with it.
-pub const WIDENS_A_FRAME: u64 = 1024;
 
 pub struct Widen {
     core: Arc<Core>,
 
     binds: wgpu::BindGroupLayout,
     pipeline: wgpu::ComputePipeline,
-    /// The configs' ring, laid with the widen: a frame's widens take
-    /// consecutive slots, so no two of one frame share one, and a queue
-    /// write lands after the work submitted before it.
-    configs: Held,
-    stride: u64,
-    next: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for Widen {
@@ -95,29 +85,20 @@ impl Widen {
             why: format!("the readout widen was refused: {error}"),
         })?;
 
-        let stride = u64::from(core.limits.min_uniform_buffer_offset_alignment).max(16);
-        let configs = core.held(
-            &wgpu::BufferDescriptor {
-                label: Some("pie widen configs"),
-                size: WIDENS_A_FRAME * stride,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            },
-            engine_gpu::books::owners::UNIFORMS,
-        );
         Ok(Widen {
             core,
             binds,
             pipeline,
-            configs,
-            stride,
-            next: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
+    /// Widens `lanes` values into `dst`, its config written to `config` (a
+    /// slot the caller's session laid: no two of one frame share one).
+    #[allow(clippy::too_many_arguments)]
     pub fn encode(
         &self,
         frame: &Frame,
+        config: (&wgpu::Buffer, u64),
         src: &Buffer,
         src_at: u64,
         dst: &Buffer,
@@ -139,18 +120,7 @@ impl Widen {
             lanes,
             pad: 0,
         });
-        let widens = frame.widened();
-        if widens > WIDENS_A_FRAME {
-            return Err(Fault::Program {
-                at: "guest::widen",
-                why: format!(
-                    "a frame's widens number {widens}, past the {WIDENS_A_FRAME} configs laid \
-                     with the widen"
-                ),
-            });
-        }
-        let slot = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % WIDENS_A_FRAME;
-        let (cfg, cfg_at) = (&*self.configs, slot * self.stride);
+        let (cfg, cfg_at) = config;
         self.core.queue.write_buffer(cfg, cfg_at, &bytes);
 
         let group = self

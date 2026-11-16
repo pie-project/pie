@@ -151,21 +151,28 @@ impl Serve for Api {
         Some(device.storage_align())
     }
 
-    /// The bind cache's uniform arena, and for each of `frames` frames a
-    /// room of the uniforms its staged dispatches take and one of the
-    /// scratch they stage, at what the load's widest fire stages.
+    /// The bind cache's uniform arena, an epoch of it a group for every
+    /// dispatch of a fire at each rung on each arm (the groups serving
+    /// binds again: a group's views are its rung's carve and its arm's
+    /// inputs); for each frame one encoding while each arm's is in flight,
+    /// a room of the uniforms its staged dispatches take and one of the
+    /// scratch they stage, at what the load's widest fire stages; and the
+    /// bounce a copy within one buffer goes through, a chunk, the most such
+    /// a copy moves at once.
     fn lay_frames(
         device: &Context,
         pipelines: &Pipelines,
-        staged: engine_gpu::naming::Staged,
-        dispatches: u32,
-        frames: usize,
+        facts: engine_gpu::serve::FrameFacts,
     ) -> Result<()> {
-        pipelines.lay_uniforms(device, dispatches);
+        let groups = u64::from(facts.dispatches)
+            * u64::from(facts.rungs.max(1))
+            * u64::from(facts.arms.max(1));
+        pipelines.lay_uniforms(device, usize::try_from(groups).unwrap_or(usize::MAX));
         device.lay_frames(
-            frames,
-            u64::from(staged.dispatches) * pipelines.uniform_stride(device),
-            staged.bytes,
+            facts.arms as usize + 1,
+            u64::from(facts.staged.dispatches) * pipelines.uniform_stride(device),
+            facts.staged.bytes,
+            facts.chunk_bytes,
         );
         Ok(())
     }

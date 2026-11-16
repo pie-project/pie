@@ -980,6 +980,23 @@ impl Plane {
                 code
             }
         };
+        // A stage's frame widens each of its output roots once at most.
+        let package = &plan.package;
+        let widens = (0..package.plans.len())
+            .map(|at| {
+                (0..package.values.len())
+                    .filter(|&global| {
+                        package.values[global].source
+                            == eta_compiler::codegen::launch::ValueOrigin::Output
+                            && matches!(
+                                crate::guest::run::local_of(package, at, global as u32),
+                                Ok(Some(_))
+                            )
+                    })
+                    .count() as u64
+            })
+            .max()
+            .unwrap_or(0);
         crate::guest::session::Session::new(
             device,
             &plan.package.plans,
@@ -990,6 +1007,7 @@ impl Plane {
                 slots: &binding.instance_slots,
                 align: place.align,
             },
+            widens,
         )
         .map_err(|why| format!("its device half did not build: {why}"))
     }

@@ -543,9 +543,7 @@ impl<B: Serve> Serve for Named<B> {
     fn lay_frames(
         _device: &Facts,
         _pipelines: &Asked<B>,
-        _staged: crate::naming::Staged,
-        _dispatches: u32,
-        _frames: usize,
+        _facts: crate::serve::FrameFacts,
     ) -> Result<()> {
         Ok(())
     }
