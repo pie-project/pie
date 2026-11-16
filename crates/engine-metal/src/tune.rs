@@ -624,10 +624,12 @@ const KINDS: [&str; 5] = ["gemm", "attention", "recurrent", "norm+elementwise", 
 
 fn kind_of(entrypoint: &str) -> usize {
     let e = entrypoint.to_ascii_lowercase();
-    if ["gemm", "gemv", "qmm", "mpp", "matmul", "moe_"].iter().any(|k| e.contains(k)) {
-        0
-    } else if e.starts_with("attn") || e.contains("flash") || e.contains("paged") {
+    // Attention first: Apple10's attention runs on the tensor ops too
+    // (`sdpa_mpp_*`), and its visits read the kv pages (`sdpa_visit_*`).
+    if e.starts_with("attn") || e.starts_with("sdpa") || e.contains("flash") {
         1
+    } else if ["gemm", "gemv", "qmm", "mpp", "matmul", "moe_"].iter().any(|k| e.contains(k)) {
+        0
     } else if ["gdn", "conv", "scan", "delta", "rs_", "recur", "ssm", "chunk_"]
         .iter()
         .any(|k| e.contains(k))
