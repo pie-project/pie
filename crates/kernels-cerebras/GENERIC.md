@@ -2273,6 +2273,24 @@ milestone's tail.
         (`a_batch_of_twos_entries_are_its_requests_in_turn`), and on the simulator with them
         (the 32 x 8 cut through double block 0's attention, `run.py --entries`, 7.6 min): the
         same 5.196e-3 / 0.9999865 over both requests' 64 rows, the capture's entries' digits.
+      - **The fire limits are the programs'.** The runtime's batch limits are what the engine
+        reports at load (`FireLimits`): a stream load reports what a launch holds, the largest
+        of its readings' batch x lanes and batch x rows (at the least the configured budgets,
+        so a larger stated one stands). flux2-mini's `B` 4 denoise: 8 lanes, 128 rows; the
+        two-prompt run above with no `max_forward_*` in the config gives the same two images,
+        byte for byte.
+      - **The text passes ride one fire too.** text-to-media encodes its prompts (and the
+        negative under guidance) in one text pass, a lane a prompt, each its own group: one
+        fire of the text reading's batch. The two-prompt run: 5 stream steps (one text pass,
+        two denoise steps, two decodes), the same two images; a one-prompt run is unchanged
+        (its image byte for byte, one lane of no group).
+      - **A lone request on a batch program.** Its padding costs the device nothing (the same
+        cycles: the batch's rows of PEs run whether or not they hold a request), and the host's
+        share is made once: the padded requests are the last request's values repeated
+        (`entries_batch`, the host fabric's rows), not recomputed. flux2-mini's lone request on
+        the host fabric: a text fire 101 -> 38 ms, a denoise fire 524 -> 134 ms. A `B` 1
+        program beside the batch one for a lone request is not built: the same cycles on the
+        device, a second program's PEs, link and statics for none.
 
 ## G1: the poem survey
 
