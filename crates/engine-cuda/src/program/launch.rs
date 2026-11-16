@@ -20,7 +20,7 @@ use crate::error::{Fault, Result};
 use super::compile::{Module, Region};
 use super::endpoint::Endpoint;
 
-const FUSED_ARITY: usize = 18;
+const FUSED_ARITY: usize = 19;
 
 pub const ORDER_ROW_BLOCKS: u32 = 32;
 /// The most blocks a lane's sampler region runs on (`sample_lane.cuh`); a
@@ -29,6 +29,46 @@ pub const LANE_SAMPLER_BLOCKS: u32 = 16;
 /// A sampler block's arena: a barrier word's line, two exchange buffers and
 /// two buffers of 512 gathered elements (`M1_FAST_GATHER`).
 const LANE_SAMPLER_ARENA: u64 = 64 + 2 * 24_576 + 2 * 512 * 8;
+
+/// What a sampler block's arena takes of the lane arenas, a block to the next.
+fn lane_arena_stride() -> u64 {
+    LANE_SAMPLER_ARENA.next_multiple_of(SCRATCH_ALIGN)
+}
+
+/// The engine's lane arenas: where a sampler's blocks meet, laid once at
+/// load for the most blocks a fire's sampler launch runs (lanes run their
+/// launches one after another on the fire's main stream, `fan::Fan::fork`).
+/// They are no lane's: a lane's scratch holds none of them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Arenas {
+    /// Their device address.
+    pub at: u64,
+    pub bytes: u64,
+}
+
+impl Arenas {
+    /// The bytes they take for flights of up to `flight` lanes on a device
+    /// of `units` multiprocessors: the most blocks one launch runs, its
+    /// lanes times the blocks each is given (`launch_region`).
+    #[must_use]
+    pub fn bytes_for(flight: u32, units: u32) -> u64 {
+        // Past the units a lane takes one block, so the widest flight runs
+        // the most; under them a lane's blocks share the units.
+        let flight = flight.max(1);
+        let under = (1..=flight.min(units.max(1)))
+            .map(|filled| u64::from(filled) * u64::from(lane_blocks(units, filled)))
+            .max()
+            .unwrap_or(0);
+        let past = if flight > units { u64::from(flight) } else { 0 };
+        under.max(past) * lane_arena_stride()
+    }
+}
+
+/// The blocks each of `filled` lanes' samplers runs on: as many as the
+/// device holds at once with them, from one to [`LANE_SAMPLER_BLOCKS`].
+fn lane_blocks(units: u32, filled: u32) -> u32 {
+    (units / filled.max(1)).clamp(1, LANE_SAMPLER_BLOCKS)
+}
 
 /// Whether `kind` is a lane sampler region: its lane's blocks split each row
 /// and meet at a barrier (`LANE_SAMPLER_BLOCKS`).
@@ -707,8 +747,8 @@ fn block_temporary(
         RegionKind::Generated => {
             eta_compiler::codegen::launch::generated_temporary_bytes(plan, region, widest)
         }
-        // A sampler block's arena (`sample_lane.cuh`).
-        kind if lane_sampler(kind) => LANE_SAMPLER_ARENA,
+        // A sampler's blocks meet in the engine's lane arenas, not here.
+        kind if lane_sampler(kind) => 0,
         // A select keeps its candidates in the block's shared memory.
         RegionKind::Library(LibraryOp::TopK) if selects(plan, region) => 0,
         // An order block sorts through two rows of indices (`order_a`,
@@ -1172,7 +1212,12 @@ impl Prepared {
         self.cells + self.cell_at[cell] as u64
     }
 
-    pub fn launch_region(&self, region: &Region, stream: *mut core::ffi::c_void) -> Result<()> {
+    pub fn launch_region(
+        &self,
+        region: &Region,
+        arenas: Arenas,
+        stream: *mut core::ffi::c_void,
+    ) -> Result<()> {
         if self.filled == 0 {
             return Ok(());
         }
@@ -1199,7 +1244,6 @@ impl Prepared {
             .copied()
             .unwrap_or(1)
             .max(1);
-        let stride = (self.temporary_bytes / rows) & !(SCRATCH_ALIGN as u32 - 1);
         let sampler = self
             .samplers
             .get(region.region_index as usize)
@@ -1207,14 +1251,25 @@ impl Prepared {
             .unwrap_or(false);
         // A sampler lane runs on as many blocks as the device holds at once
         // with the fire's lanes (its blocks wait on one another), each over
-        // its own arena; the lanes' barrier words start at zero.
+        // its own arena of the engine's; the lanes' barrier words start at
+        // zero.
         let rows = if sampler {
-            self.zero_barriers(stream)?;
-            (device_units() / self.filled.max(1)).clamp(1, LANE_SAMPLER_BLOCKS.min(rows))
+            let rows = lane_blocks(device_units(), self.filled).min(rows);
+            let need = u64::from(self.filled) * u64::from(rows) * lane_arena_stride();
+            if need > arenas.bytes {
+                return Err(Fault::Ceiling {
+                    what: "bytes of the engine's lane arenas a fire's samplers meet in",
+                    need,
+                    have: arenas.bytes,
+                });
+            }
+            self.zero_barriers(arenas, u64::from(rows) * lane_arena_stride(), stream)?;
+            rows
         } else {
             rows
         };
-        args.u32(rows).u32(stride);
+        let stride = (self.temporary_bytes / rows) & !(SCRATCH_ALIGN as u32 - 1);
+        args.u32(rows).u32(stride).ptr(arenas.at);
         // A value stated to take no bytes lies on the lane's dummy bytes: a
         // build with `test-slot-fill` poisons them before every launch, so a
         // kernel that reads one answers wrongly where a golden sees it.
@@ -1352,16 +1407,23 @@ impl Args {
 impl Prepared {
     /// The fire's lanes' sampler barrier words (the first 64 bytes of each
     /// lane's temporary arena: a word a block) back to zero.
-    fn zero_barriers(&self, stream: *mut core::ffi::c_void) -> Result<()> {
+    /// The first line of each lane's arenas, `pitch` apart from the lane
+    /// arenas' start: the lanes' barrier words.
+    fn zero_barriers(
+        &self,
+        arenas: Arenas,
+        pitch: u64,
+        stream: *mut core::ffi::c_void,
+    ) -> Result<()> {
         #[cfg(feature = "device")]
         {
             use crate::device::dr;
-            // SAFETY: the scratch holds `filled` lanes `scratch_stride` apart,
-            // each with its temporary arena at `temporary_offset`.
+            // SAFETY: the lane arenas hold `filled` lanes' blocks `pitch`
+            // apart, checked against their bytes before this.
             let code = unsafe {
                 dr::cuMemsetD2D32Async(
-                    self.scratch + u64::from(self.temporary_offset),
-                    self.scratch_stride as usize,
+                    arenas.at,
+                    pitch as usize,
                     0,
                     16,
                     self.filled as usize,
@@ -1376,7 +1438,7 @@ impl Prepared {
             }
         }
         #[cfg(not(feature = "device"))]
-        let _ = stream;
+        let _ = (arenas, pitch, stream);
         Ok(())
     }
 
@@ -1784,8 +1846,8 @@ mod tests {
         assert_eq!(
             totals,
             [
-                ("top-p", 9_312_512, 2_290_176, 921_600),
-                ("top-k + top-p", 9_616_896, 3_658_240, 921_600),
+                ("top-p", 9_312_512, 1_368_576, 0),
+                ("top-k + top-p", 9_616_896, 2_812_672, 76_032),
                 ("gumbel-max", 5_512_960, 1_792, 0),
                 ("greedy", 3_688_704, 768, 0),
                 ("top logprobs", 6_728_960, 1_900_800, 76_032),
@@ -1998,10 +2060,39 @@ mod tests {
         at.dedup();
         assert_eq!(at.len(), touched.len(), "each its own bytes");
         assert_eq!(
-            laid.temporary_bytes,
-            u64::from(LANE_SAMPLER_BLOCKS) * LANE_SAMPLER_ARENA.next_multiple_of(SCRATCH_ALIGN),
-            "the sampler's blocks' arenas and nothing else"
+            laid.temporary_bytes, 0,
+            "the sampler's blocks meet in the engine's lane arenas, not the lane's"
         );
+    }
+
+    /// The kernel steps a block's arena as the launcher lays the lane
+    /// arenas, and they hold the most blocks a launch runs.
+    #[test]
+    fn the_lane_arenas_hold_every_launch_s_blocks() {
+        let (stage, _) = shipped::compiled(&shipped::all(shipped::QWEN_VOCAB)[0].1, shipped::QWEN_VOCAB);
+        let stage = &stage[0];
+        let region = stage
+            .fused
+            .regions
+            .iter()
+            .find(|region| lane_sampler(region.kind))
+            .expect("top-p has a sampler");
+        let source = eta_compiler::codegen::cuda::emit_region("kernel", stage, region)
+            .expect("the sampler emits");
+        assert!(source.contains("g.stride = M1_LANE_ARENA_STRIDE;"));
+        assert_eq!(
+            lane_arena_stride(),
+            (64 + 2 * 24_576 + 2 * 512 * 8 + 255) & !255,
+            "the kernel's M1_LANE_ARENA_STRIDE"
+        );
+        for (units, flight) in [(142, 128), (304, 256), (1, 1), (8, 4), (20, 32)] {
+            let most = (1..=flight)
+                .map(|filled| u64::from(filled) * u64::from(lane_blocks(units, filled)))
+                .max()
+                .unwrap();
+            assert_eq!(Arenas::bytes_for(flight, units), most * lane_arena_stride());
+            assert!(most <= u64::from(units.max(flight)));
+        }
     }
 
     #[test]
