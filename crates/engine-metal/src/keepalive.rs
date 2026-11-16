@@ -11,6 +11,10 @@ pub struct KeepAlive {
     stop: Arc<AtomicBool>,
     epoch: std::time::Instant,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// The spin kernel, for [`KeepAlive::wake`]'s dispatch on the frames'
+    /// own queue.
+    #[cfg(target_vendor = "apple")]
+    wake: crate::device::library::Pipeline,
 }
 
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
@@ -65,6 +69,7 @@ impl KeepAlive {
         let fire = Fire::at("runtime/keepalive.metal", "keepalive_spin")
             .apply(Grid::of([32, 1, 1], [32, 1, 1]));
         let pipeline = pipelines.at(device.device(), fire)?;
+        let wake = pipeline.clone();
         // One of the three tiny fixed buffers outside the pool (this, the
         // warm-load bind placeholder, the shared empty buffer), left there by
         // ruling: what the keepalive kernel writes nothing anyone reads into.
@@ -144,7 +149,54 @@ impl KeepAlive {
             stop,
             epoch,
             thread: Some(thread),
+            wake,
         })
+    }
+
+    /// Work is coming (`Engine::expect_work`): one spin dispatch on the
+    /// frames' own queue, in a frame that declares every slab a fire runs
+    /// on, committed without a wait; and the spin thread lingers from now.
+    /// After 1 s or more of quiet, the frames' queue's first commit waits
+    /// before the GPU starts, by what it names (15 ms over a fixture's
+    /// pool, 40-60 ms over Qwen3.5-0.8B's on an M1 Max); a spin on the
+    /// keepalive's own queue does not take it. Committed 20 ms or more
+    /// ahead of the next fire, this one takes all of it.
+    #[cfg(target_vendor = "apple")]
+    pub fn wake(&self, device: &Context) -> Result<()> {
+        use objc2_metal::MTLComputeCommandEncoder as _;
+        self.touch();
+        let frame = device.frame()?;
+        {
+            let encoder = frame.encoder();
+            encoder.setComputePipelineState(&self.wake);
+            let sink = device.empty();
+            let iters: u32 = 1;
+            // SAFETY: the shared empty slab outlives the frame (the context
+            // holds it), and the kernel writes it only on a value its one
+            // iteration never reaches; `iters` is copied by `setBytes:`
+            // before the call returns.
+            unsafe {
+                encoder.setBuffer_offset_atIndex(Some(&*sink), 0, 0);
+                encoder.setBytes_length_atIndex(
+                    std::ptr::NonNull::from(&iters).cast(),
+                    size_of::<u32>(),
+                    1,
+                );
+            }
+            let one = objc2_metal::MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            };
+            let lanes = objc2_metal::MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            };
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(one, lanes);
+        }
+        drop(frame.commit_async(None)?);
+        Ok(())
     }
 
     #[cfg(not(target_vendor = "apple"))]
