@@ -204,7 +204,7 @@ impl Rung {
         );
         // The carve ends where the capture planes start: a fire is seated
         // those by its capturing lanes, under the carve.
-        let unscored = map.scores_from(trace);
+        let unscored = map.bytes;
         let lifted = Lifted::of(&map, unscored).map_err(|fault| match fault {
             Fault::Program { at, why } => Fault::Program {
                 at,

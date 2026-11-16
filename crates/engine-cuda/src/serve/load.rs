@@ -997,7 +997,7 @@ impl Shell {
         facts.mark_rows_a_lane(&read_only_by_decoders(&boot.trace, &compiled, &decoding));
         let feeds = Feeds::of(&boot.trace, &compiled);
         let tiers = crate::record::Tiers {
-            plain: plain_of(&landing, &Exports::of(&boot.trace, &compiled)?.outputs),
+            plain: plain_of(&landing, &Exports::of(&boot.trace, &compiled, boot.context, boot.page_size)?.outputs),
         };
         let drafting_words: std::collections::HashSet<u64> = compiled
             .classes
@@ -1132,11 +1132,8 @@ impl Shell {
         );
         // Committed whole: a fire reading out past one row a lane (a verify
         // reads every row) would otherwise grow it outside the fit.
-        let unscored = compiled.arena.scores_from(&boot.trace).max(
-            compiled
-                .arena_forked
-                .as_ref()
-                .map_or(0, |forked| forked.scores_from(&boot.trace)),
+        let unscored = compiled.arena.bytes.max(
+            compiled.arena_forked.as_ref().map_or(0, |forked| forked.bytes),
         );
         // The activation rungs a pool may drop to (SPEC decision 6), each a
         // bucket's carve laid at the reservation's end.
@@ -1152,7 +1149,7 @@ impl Shell {
         let prefixes: Vec<(u64, u64)> = std::iter::once(&compiled.arena)
             .chain(compiled.arena_forked.as_ref())
             .chain(rungs.iter().map(|(_, map)| map))
-            .map(|map| (map.bytes, map.scores_from(&boot.trace)))
+            .map(|map| (map.bytes, map.bytes))
             .collect();
         let mut arena = Arena::reserve(arena_bytes).with_rungs(rungs, prefixes);
         arena.ensure(&mut pools, unscored)?;
@@ -1265,7 +1262,7 @@ impl Shell {
             buffers.as_ref().map(crate::store::rs::Buffers::page_tokens),
         )?;
 
-        let exports = Exports::of(&boot.trace, &compiled)?;
+        let exports = Exports::of(&boot.trace, &compiled, boot.context, boot.page_size)?;
 
         let airborne = crate::settle::Airborne::new();
         let mut pools = pools;

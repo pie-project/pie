@@ -28,33 +28,15 @@ impl DispatchAttn for Run<'_> {
 impl Run<'_> {
     pub(super) fn attention(&mut self, op: &Attn) -> Result<(), kernels_cuda::Error> {
         match op {
-            Attn::ScoreCapture {
-                q,
-                plan,
-                cache,
-                head_dim,
-                kv_heads,
-                sm_scale,
-                observe,
-                kv_max,
-                scores,
-            } => {
-                let mut q_rows = self.ragged(*q);
-                q_rows.data = self.windowed(q_rows.data);
-                kernels_cuda::attn::score::capture(
-                    self.ctx(),
-                    q_rows,
-                    self.prefill_plan(*plan),
-                    &self.pool(*cache),
-                    *head_dim,
-                    *kv_heads,
-                    *sm_scale,
-                    *observe,
-                    self.window().span().lane_offset,
-                    *kv_max,
-                    &mut self.tensor(*scores),
-                )
-            }
+            // A capturing lane's rows lie in its reading program's guest
+            // region (`poem_ir::Dim::Capturing`); this backend lays none
+            // yet, so a capturing fire is refused by name.
+            Attn::ScoreCapture { .. } | Attn::ScorePages { .. } => Err(kernels_cuda::Error::Backend {
+                op: "attn.score_capture",
+                detail: "this backend does not yet lay a capturing lane's score rows in its \
+                         reading program's guest region"
+                    .to_string(),
+            }),
             Attn::Voxel {
                 q,
                 k,

@@ -1007,7 +1007,7 @@ impl PreparedLoad<'_> {
         };
 
         let outputs =
-            poem_exec::feeds::class_outputs(&boot.trace, &compiled).map_err(Fault::Recipe)?;
+            poem_exec::feeds::class_outputs(&boot.trace, &compiled, boot.context, boot.page_size).map_err(Fault::Recipe)?;
         let grid_chains = outputs
             .iter()
             .map(|out| out.grid.and_then(&grid_chain))

@@ -177,31 +177,15 @@ impl<B: Backend> Run<'_, B> {
 
     fn attention(&mut self, op: &Attn) -> Result<(), kernels_slang::Error> {
         match op {
-            Attn::ScoreCapture {
-                q,
-                plan,
-                cache,
-                head_dim,
-                kv_heads,
-                sm_scale,
-                observe,
-                kv_max,
-                scores,
-            } => kernels_slang::attn::score::capture(
-                self.ctx,
-                self.ragged(*q),
-                self.prefill_plan(*plan).positions,
-                self.pool(*cache),
-                *head_dim,
-                *kv_heads,
-                *sm_scale,
-                *observe,
-                // The rows are the window's lanes already.
-                0,
-                *kv_max,
-                self.requests(),
-                self.tensor(*scores),
-            ),
+            // A capturing lane's rows lie in its reading program's guest
+            // region (`poem_ir::Dim::Capturing`); this backend lays none
+            // yet, so a capturing fire is refused by name.
+            Attn::ScoreCapture { .. } | Attn::ScorePages { .. } => Err(kernels_slang::Error::Backend {
+                op: "attn.score_capture",
+                detail: "this backend does not yet lay a capturing lane's score rows in its \
+                         reading program's guest region"
+                    .to_string(),
+            }),
             Attn::Voxel {
                 q,
                 k,

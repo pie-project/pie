@@ -694,7 +694,7 @@ impl Shell {
         // rings would take 16 times the bytes (qwen3-0.6b c64: 2.2 GiB).
         let readout_cap =
             poem_exec::fire::rung_of(&budgets.tokens.buckets, budgets.tokens.max_lanes);
-        let readout_exports = poem_exec::feeds::class_outputs(&boot.trace, &compiled)
+        let readout_exports = poem_exec::feeds::class_outputs(&boot.trace, &compiled, boot.context, boot.page_size)
             .map_err(|why| Fault::Unbound { what: why })?;
         let readout_specs = fixed_readouts(&readout_exports, readout_cap);
         // As many fires as can be outstanding: the frames in flight of at
@@ -925,7 +925,7 @@ impl Shell {
             );
         }
 
-        let exports = poem_exec::feeds::class_outputs(&boot.trace, &compiled)
+        let exports = poem_exec::feeds::class_outputs(&boot.trace, &compiled, boot.context, boot.page_size)
             .map_err(|why| Fault::Unbound { what: why })?;
         if exports.is_empty() {
             return Err(Fault::Unbound {
