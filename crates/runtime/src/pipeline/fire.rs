@@ -816,17 +816,14 @@ fn prefill_want(rows: usize, engine: usize) -> u32 {
 /// only while they are queued.
 const RUNG_WANT_FROM: usize = 16;
 
-/// How many of a pass's pieces run ahead of the one being cut while its
-/// rung's raise is pending: the device stays fed, and the rest is cut wider
-/// once the raise lands.
-const PIECES_AHEAD: usize = 2;
-
-/// A pass's wait for the raise its rows ask: beside the pass, which keeps
-/// firing at the rung it has, the rung is raised at once where it can be
-/// ([`crate::store::shared::raise_now`]) and the walk is asked to look
-/// otherwise (it clears the span's idle cache, takes a raise the engine
-/// must be told of, or waits on the governor's grow of the span yield
-/// gave back), until the raise lands or the pass is through (dropped).
+/// A pass's wait for the raise its rows ask: the rung is raised at once
+/// where it can be ([`crate::store::shared::raise_now`]) and the walk is
+/// asked to look otherwise (it clears the span's idle cache, takes a raise
+/// the engine must be told of, or waits on the governor's grow of the span
+/// yield gave back), until the raise lands or the pass is through
+/// (dropped). The pass is cut once it lands ([`RungAsk::raised`]), never
+/// to the rung standing below it, unless the walker holds the rung down
+/// ([`crate::store::shared::rung_held`]).
 /// Nothing is asked of the planner: live state never lies in the top
 /// rung's span, so a raise never lacks room it could free.
 struct RaiseWait {
@@ -896,9 +893,10 @@ struct RungAsk {
     pid: uuid::Uuid,
     /// Held (the walker cuts nothing under it) until dropped.
     want: crate::store::shared::RungWant,
-    /// The raise it waits on beside the pass; `None` where fires may take
+    /// The raise in flight it waits on, and the cap that raise reaches
+    /// ([`crate::store::shared::reach_for`]); `None` where fires may take
     /// the rows now.
-    raise: Option<RaiseWait>,
+    raise: Option<(RaiseWait, u32)>,
 }
 
 /// Asks the rung on `engine` for the `rows` a fire of a pass of `own` rows
@@ -923,7 +921,12 @@ fn ask_rung(
     let raise = stores.shared.as_ref().and_then(|shared| {
         crate::store::shared::raise_now(shared, engine, rows);
         (crate::store::shared::fire_cap(engine) < crate::store::shared::cap_for(shared, rows))
-            .then(|| RaiseWait::start(shared.clone(), engine, rows))
+            .then(|| {
+                (
+                    RaiseWait::start(shared.clone(), engine, rows),
+                    crate::store::shared::reach_for(shared, rows),
+                )
+            })
     });
     Some(RungAsk {
         engine,
@@ -934,6 +937,28 @@ fn ask_rung(
 }
 
 impl RungAsk {
+    /// Returns once the raise the pass asked has landed, before the pass is
+    /// cut: a pass is never cut below the rung it asked while a raise
+    /// covering the ask is in flight. Only where the walker holds the rung
+    /// down (yield gave its span back, [`crate::store::shared::rung_held`])
+    /// does it return at the rung standing, the pass cut to it. One wait on
+    /// the rung's events, at once where no raise is in flight.
+    async fn raised(&self) {
+        let Some(&(_, reach)) = self.raise.as_ref() else {
+            return;
+        };
+        let engine = self.engine;
+        crate::inferlet::process::said(
+            "enqueue: the activation rung",
+            self.pid,
+            crate::store::shared::rung_wait_until(engine, || {
+                crate::store::shared::fire_cap(engine) >= reach
+                    || crate::store::shared::rung_held(engine)
+            }),
+        )
+        .await;
+    }
+
     /// Returns once fires may take `width` rows: a fire wider than the
     /// rung waits for the raise its pass asked.
     async fn wait(&self, width: u32) {
@@ -1002,20 +1027,6 @@ fn host_cuts(
     forced: &[u32],
     tail: u32,
 ) -> Vec<(u32, u32)> {
-    host_cuts_from(req, cuttable, share, page, forced, tail, 0)
-}
-
-/// [`host_cuts`] of the rows from `start` on: the rest of a pass cut again
-/// once its rung was raised.
-fn host_cuts_from(
-    req: &crate::engine::FireRequest,
-    cuttable: bool,
-    share: u32,
-    page: u32,
-    forced: &[u32],
-    tail: u32,
-    start: u32,
-) -> Vec<(u32, u32)> {
     let rows = |lane: &::engine::Lane| u32::try_from(lane.tokens.len()).unwrap_or(u32::MAX);
     let [lane] = req.lanes.as_slice() else {
         return vec![(0, req.lanes.first().map_or(0, rows))];
@@ -1031,10 +1042,10 @@ fn host_cuts_from(
         .iter()
         .copied()
         .chain(media.map(|row| ((held + row) / page * page).saturating_sub(held)))
-        .filter(|&end| start < end && end < rows)
+        .filter(|&end| 0 < end && end < rows)
         .collect();
     if share > 0 {
-        let mut from = start;
+        let mut from = 0;
         while rows - from > share {
             let mut to = ((held + from + share) / page * page).saturating_sub(held);
             if to <= from {
@@ -1048,7 +1059,7 @@ fn host_cuts_from(
     ends.push(rows);
     ends.sort_unstable();
     ends.dedup();
-    let mut from = start;
+    let mut from = 0;
     ends.into_iter()
         .map(|to| {
             let cut = (from, to);
@@ -3693,8 +3704,12 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // itself asks as a wider pass does.
         let taken = rows_total.max(carried as usize);
         let rung_ask = ask_rung(&stores, engine, pid, taken, wanted);
-        let mut cut_at = crate::store::shared::fire_cap(engine);
-        let mut cuts = pass_pieces(
+        // Cut once the raise the pass asked has landed, at the rung it
+        // asked; at the rung standing only where the walker holds it down.
+        if let Some(ask) = rung_ask.as_ref() {
+            ask.raised().await;
+        }
+        let cuts = pass_pieces(
             &full,
             cuttable,
             rs_ws_ids.is_empty(),
@@ -3703,8 +3718,6 @@ pub async fn submit_pass_stamped<C: FireContext>(
             &forced,
             &switched.tails,
         );
-        // Only a lone lane's rest is cut again once a raise lands.
-        let recuttable = full.lanes.len() == 1 && cuts.len() > 1;
         // A piece that would not cut to the rung asks for its own width,
         // and one that carries more rows than its own for those.
         let pieces: Vec<FireRows> = cuts
@@ -3787,76 +3800,20 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // The pieces in frames of their own, in the order they are cut, so
         // the pieces of concurrent prompts seal together.
         let frame_size = crate::scheduler::configured_frame_size().max(1);
-        let mut frames = {
+        let frames = {
             let pipeline = ctx.resources().get(&this)?;
             piece_frames(frame, cuts.len(), frame_size, || pipeline.next_frame_seq())
         };
-        let framed = matches!(frame, Some(stamp) if stamp.fires == 1);
         let mut submitted: Vec<crate::engine::completion::WorkItemCompletion> = Vec::new();
         // The working sets a piece of this pass has moved the cursor of.
         let mut advanced = vec![false; groups.len()];
         let mut at = 0;
         while at < cuts.len() {
-            if recuttable && at > 0 && at + 1 < cuts.len() {
-                // While the raise is pending the pass runs no further ahead
-                // of the device than a few pieces, so what is left is cut at
-                // the raised rung once it lands.
-                // A framed piece waits only on a frame already whole.
-                let ahead = PIECES_AHEAD.max(frame_size);
-                if at >= ahead && wanted > cut_at {
-                    let behind = submitted[at - ahead].clone();
-                    // The piece behind settling or the cap rising, each its
-                    // own event.
-                    loop {
-                        let watch = crate::store::shared::rung_watch(engine);
-                        tokio::pin!(watch);
-                        watch.as_mut().enable();
-                        if behind.is_settled() || crate::store::shared::fire_cap(engine) > cut_at {
-                            break;
-                        }
-                        tokio::select! {
-                            () = &mut watch => {}
-                            _ = behind.clone() => {}
-                        }
-                    }
-                }
-                let cap = crate::store::shared::fire_cap(engine);
-                if cap > cut_at && (!framed || at % frame_size == 0) {
-                    cut_at = cap;
-                    let start = cuts[at - 1][0].map_or(0, |(_, to)| to);
-                    let rest = host_cuts_from(
-                        &full,
-                        cuttable,
-                        prefill_share(page_size, engine),
-                        page_size,
-                        &forced,
-                        switched.tails.first().copied().unwrap_or(0),
-                        start,
-                    );
-                    cuts.truncate(at);
-                    cuts.extend(rest.into_iter().map(|cut| vec![Some(cut)]));
-                    let stamp = if framed {
-                        let pipeline = ctx.resources().get(&this)?;
-                        frame.map(|stamp| crate::scheduler::FrameStamp {
-                            seq: pipeline.next_frame_seq(),
-                            ..stamp
-                        })
-                    } else {
-                        frame
-                    };
-                    let pipeline = ctx.resources().get(&this)?;
-                    frames.truncate(at);
-                    frames.extend(piece_frames(stamp, cuts.len() - at, frame_size, || {
-                        pipeline.next_frame_seq()
-                    }));
-                }
-            }
             let piece = cuts[at].clone();
             let piece = &piece;
             // A piece wider than the rung (one no cut brings under it) waits
             // for the raise its pass funds, or fails with what the planner
-            // said: it never waits on a rung that does not come. A piece
-            // cut again once a raise landed is counted as it is cut now.
+            // said: it never waits on a rung that does not come.
             let counted = piece_rows(&full, piece, &frozen, folds_each && at > 0);
             if let Err(refusal) = check_largest_rung(counted, largest) {
                 return Ok(Err(refusal));
@@ -6235,6 +6192,178 @@ mod rung_wait_tests {
         }
         assert_eq!(crate::store::shared::fire_cap(ENGINE), 1);
     }
+    /// The told engine's lane as a raise meets it: it takes every notice,
+    /// and says which it took.
+    struct Lane {
+        engine: usize,
+        told: std::sync::Mutex<Vec<(u32, u32)>>,
+    }
+
+    impl crate::store::shared::programs::Mover for Lane {
+        async fn set_rung(&self, from: u32, to: u32) -> Result<(), String> {
+            self.told.lock().unwrap().push((from, to));
+            Ok(())
+        }
+
+        fn engine(&self) -> usize {
+            self.engine
+        }
+    }
+
+    /// Yields until the spawned waits have run as far as they can without
+    /// an event.
+    async fn settle() {
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A 33-row prompt lane, as Metal's first request was.
+    fn prompt_of(rows: u32) -> crate::engine::FireRequest {
+        let mut lane = ::engine::Lane::decode(0, 0, 1, 0);
+        lane.tokens = (0..rows).map(|t| t + 100).collect();
+        lane.kv.pages = (0..rows.div_ceil(16)).collect();
+        lane.readout = ::engine::Readout::Last;
+        crate::engine::FireRequest::one(lane)
+    }
+
+    /// The pieces a pass of `req` is cut to at `engine`'s cap now.
+    fn cut_now(engine: usize, req: &crate::engine::FireRequest) -> Vec<(u32, u32)> {
+        super::host_cuts(req, true, crate::store::shared::fire_cap(engine), 16, &[], 0)
+    }
+
+    /// At ready the pool stands at its top rung on every engine, told rungs
+    /// or not: fires are uncut, and a first request's 33-row prefill asks
+    /// no raise and is one piece of its rows.
+    #[tokio::test(flavor = "current_thread")]
+    async fn at_ready_the_rung_is_the_top_and_a_first_prefill_is_one_piece() {
+        for (engine, told) in [(64usize, false), (65, true)] {
+            let rungs = vec![(1, 1), (16, 2), (64, 3), (256, 4)];
+            let stores = if told {
+                super::unfolded_tests::told_pool_with_rungs(rungs)
+            } else {
+                super::unfolded_tests::pool_with_rungs(rungs)
+            };
+            let shared = stores.shared.clone().expect("a shared pool");
+            {
+                let pool = shared.lock().unwrap();
+                assert_eq!(pool.rung(), 256, "the top rung the load chose");
+                assert_eq!(pool.told(), 256, "the engine holds it from the load");
+                assert_eq!(pool.start_cap(), u32::MAX);
+            }
+            let _grow = crate::store::shared::SharedGrow::new(0, engine, shared.clone());
+            assert_eq!(crate::store::shared::fire_cap(engine), u32::MAX, "uncut");
+
+            let ask = super::ask_rung(&stores, engine, uuid::Uuid::new_v4(), 33, 33)
+                .expect("33 rows ask");
+            assert!(ask.raise.is_none(), "no raise: the rung holds them");
+            ask.raised().await;
+            let req = prompt_of(33);
+            assert_eq!(cut_now(engine, &req), [(0, 33)], "one piece of its rows");
+        }
+    }
+
+    /// A told pool lowered to its smallest rung, as yield's walk leaves
+    /// it: the engine told, fires cut to it.
+    fn told_at_the_floor(engine: usize) -> crate::store::registry::Stores {
+        let stores =
+            super::unfolded_tests::told_pool_with_rungs(vec![(1, 1), (16, 2), (64, 3), (256, 4)]);
+        let shared = stores.shared.clone().expect("a shared pool");
+        {
+            let mut pool = shared.lock().unwrap();
+            assert_eq!(pool.lower_rung(1).unwrap(), Some((256, 1)));
+        }
+        crate::store::shared::set_fire_cap_for_test(engine, 1);
+        crate::store::shared::hold_rung(engine, false);
+        stores
+    }
+
+    /// A pass asking a rung while the raise to it is in flight (its notice
+    /// still the engine's to take, through its lane) waits for it before it
+    /// is cut, and is cut at the raised rung: one piece of its 33 rows,
+    /// never pieces of the one row standing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pass_waits_for_the_raise_in_flight_and_is_cut_at_its_rung() {
+        const ENGINE: usize = 66;
+        let stores = told_at_the_floor(ENGINE);
+        let shared = stores.shared.clone().expect("a shared pool");
+        let ask = super::ask_rung(&stores, ENGINE, uuid::Uuid::new_v4(), 33, 33)
+            .expect("33 rows ask");
+        assert!(ask.raise.is_some(), "the raise is in flight: the engine is told first");
+        assert_eq!(crate::store::shared::fire_cap(ENGINE), 1, "nothing wider yet");
+
+        let ask = std::sync::Arc::new(ask);
+        let waiting = tokio::spawn({
+            let ask = ask.clone();
+            async move { ask.raised().await }
+        });
+        settle().await;
+        assert!(!waiting.is_finished(), "the pass is not cut at the rung standing");
+
+        // The walk takes the raise through the engine's lane.
+        let lane = Lane {
+            engine: ENGINE,
+            told: std::sync::Mutex::new(Vec::new()),
+        };
+        let taken = crate::store::shared::programs::take_raise(
+            &shared,
+            |pool| pool.rung_for(33),
+            &lane,
+        )
+        .await
+        .unwrap();
+        assert!(taken.is_some());
+        assert_eq!(*lane.told.lock().unwrap(), [(1, 64)]);
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .expect("it waits for the raise and no longer")
+            .unwrap();
+        assert!(crate::store::shared::fire_cap(ENGINE) >= 33);
+        assert_eq!(
+            cut_now(ENGINE, &prompt_of(33)),
+            [(0, 33)],
+            "cut at the rung it asked"
+        );
+    }
+
+    /// The negative control: where the walker holds the rung down (yield
+    /// gave the span back, the raise waits on the governor's grow), the
+    /// pass waits for nothing and is cut to the rung standing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn under_yield_a_pass_is_cut_to_the_held_rung() {
+        const ENGINE: usize = 67;
+        let stores = told_at_the_floor(ENGINE);
+        // As the walker says once a raise meets the span yield gave back.
+        crate::store::shared::hold_rung(ENGINE, true);
+        let ask = super::ask_rung(&stores, ENGINE, uuid::Uuid::new_v4(), 33, 33)
+            .expect("33 rows ask");
+        assert!(ask.raise.is_some());
+        tokio::time::timeout(std::time::Duration::from_secs(5), ask.raised())
+            .await
+            .expect("no wait under yield");
+        assert_eq!(crate::store::shared::fire_cap(ENGINE), 1);
+        let cuts = cut_now(ENGINE, &prompt_of(33));
+        assert_eq!(cuts.len(), 33, "cut to the held rung: {cuts:?}");
+
+        // Held down mid-wait: the waiting pass is cut to it at once.
+        crate::store::shared::hold_rung(ENGINE, false);
+        let ask = std::sync::Arc::new(
+            super::ask_rung(&stores, ENGINE, uuid::Uuid::new_v4(), 33, 33).expect("it asks"),
+        );
+        let waiting = tokio::spawn({
+            let ask = ask.clone();
+            async move { ask.raised().await }
+        });
+        settle().await;
+        assert!(!waiting.is_finished(), "a raise in flight is waited on");
+        crate::store::shared::hold_rung(ENGINE, true);
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .expect("held down: it goes at the rung standing")
+            .unwrap();
+        assert_eq!(crate::store::shared::fire_cap(ENGINE), 1);
+        crate::store::shared::hold_rung(ENGINE, false);
+    }
 }
 
 #[cfg(test)]
@@ -6251,24 +6380,6 @@ mod cut_tests {
         a_lane_only_in_the_last_piece_is_not_written_before_it();
         a_pass_with_media_is_cut_before_its_first_span();
         a_pass_with_media_keys_the_rows_before_it();
-        the_rest_of_a_pass_is_cut_again_wider();
-    }
-
-    /// A raise landing mid-pass: what is left from the last cut is cut at
-    /// the wider share, on the same page boundaries and checkpoint rows.
-    fn the_rest_of_a_pass_is_cut_again_wider() {
-        let req = prefill_lane(5, 200, 16);
-        let narrow = host_cuts(&req, true, 32, 16, &[123], 0);
-        assert_eq!(narrow[..2], [(0, 27), (27, 59)]);
-        assert_eq!(
-            host_cuts_from(&req, true, 160, 16, &[123], 0, 59),
-            [(59, 123), (123, 200)],
-            "the checkpoint row still cuts"
-        );
-        assert_eq!(
-            host_cuts_from(&req, true, 64, 16, &[], 0, 59),
-            [(59, 123), (123, 187), (187, 200)]
-        );
     }
 
     fn prefill_lane(held: u32, rows: u32, page: u32) -> crate::engine::FireRequest {
@@ -8995,6 +9106,19 @@ mod unfolded_tests {
     /// That pool with activation rungs `act_chunks` (tokens, chunks), its
     /// span backed from the load: it starts at the largest.
     pub(super) fn pool_with_rungs(act_chunks: Vec<(u32, u32)>) -> crate::store::registry::Stores {
+        pool_with(act_chunks, false)
+    }
+
+    /// [`pool_with_rungs`] whose engine is told every rung change
+    /// (`ChunkFacts::tells_rungs`, Metal's): a raise reaches it through its
+    /// lane before any fire of the wider rung.
+    pub(super) fn told_pool_with_rungs(
+        act_chunks: Vec<(u32, u32)>,
+    ) -> crate::store::registry::Stores {
+        pool_with(act_chunks, true)
+    }
+
+    fn pool_with(act_chunks: Vec<(u32, u32)>, tells_rungs: bool) -> crate::store::registry::Stores {
         use ::engine::chunk::{
             ChunkFacts, Growth, Reserved, ReservedRun, SegmentFacts, ShapeId, SlotKind, SlotRole,
             SlotShape,
@@ -9035,6 +9159,7 @@ mod unfolded_tests {
                 shape(2, SlotKind::Fixed { pieces: 1 }, SlotRole::State),
             ],
             act_chunks,
+            tells_rungs,
             ..ChunkFacts::default()
         };
         let pool = crate::store::shared::SharedPool::new(&facts, 1024).unwrap();

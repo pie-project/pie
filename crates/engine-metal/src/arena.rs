@@ -89,7 +89,7 @@ impl Arena {
     /// pool's buffer: `scratch` plane bytes at its top, then each rung's
     /// staged regions (`io`, `arms` frames' of them), its rs scratch (`rs`)
     /// and then its carve, the last rung the whole arena. It starts at the
-    /// smallest rung.
+    /// largest rung, the one the runtime's pool starts at.
     #[must_use]
     pub fn over(
         store: Buffer,
@@ -100,6 +100,7 @@ impl Arena {
         rs: Vec<u64>,
         arms: u64,
     ) -> Arena {
+        let rungs_len = rungs.len();
         Arena {
             store,
             end: offset + bytes,
@@ -107,7 +108,7 @@ impl Arena {
             rungs,
             io,
             arms: arms.max(1),
-            current: 0,
+            current: rungs_len.saturating_sub(1),
             rs,
         }
     }
@@ -246,11 +247,11 @@ impl Arena {
         self.scratch_at() - self.over_carve(self.current)
     }
 
-    /// The smallest rung's tokens: where the runtime starts an on-demand
-    /// pool's rung.
+    /// The largest rung's tokens: where the runtime starts the pool's rung,
+    /// and the shell stands from the load.
     #[must_use]
-    pub fn floor_tokens(&self) -> u32 {
-        self.rungs.first().map_or(1, |(tokens, _)| *tokens)
+    pub fn top_tokens(&self) -> u32 {
+        self.rungs.last().map_or(1, |(tokens, _)| *tokens)
     }
 
     /// Where the span ends in its buffer: the plane's end.
@@ -295,11 +296,11 @@ impl Arena {
             + self.rungs.get(index).map_or(0, |(_, map)| room(map.bytes))
     }
 
-    /// The bytes from the span's end the smallest rung takes: the floor a
-    /// refused raise falls back to.
+    /// The bytes from the span's end the largest rung takes: what the
+    /// load backs first, the rung the shell stands at from it.
     #[must_use]
-    pub fn floor_reach(&self) -> u64 {
-        self.rung_reach(0)
+    pub fn top_reach(&self) -> u64 {
+        self.rung_reach(self.top_tokens())
     }
 
     /// A fire's slots: [`Arena::carve_for`]'s carve, laid ending where the

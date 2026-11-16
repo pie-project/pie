@@ -96,7 +96,7 @@ pub struct ChunkFacts {
     #[serde(default)]
     pub outside_bytes: u64,
     /// The engine is told every rung change ([`crate::Engine::set_rung`]),
-    /// from the smallest rung it starts at: its fires lay their regions by
+    /// from the largest rung it starts at, as every engine does: its fires lay their regions by
     /// the rung it holds (Metal's carve bookkeeping), so a raise reaches it
     /// before any fire of the wider rung, and a lower once every wider fire
     /// has retired. The span is backed from the load on every engine, so

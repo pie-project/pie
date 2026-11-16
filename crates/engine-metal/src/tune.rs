@@ -572,8 +572,6 @@ fn serve(artifact: &Path, deployment: &str, device: &str, file: &str) -> Result<
         top: crate::Top::EveryRung,
     })
     .map_err(|e| e.to_string())?;
-    // No runtime raises the rung here: the widest carve is backed.
-    shell.raise_whole().map_err(|e| e.to_string())?;
     // Time the load as it serves, not the GPU-alone stretch before the
     // Neural Engine's programs compile.
     let mut refused = None;
@@ -789,7 +787,6 @@ fn check_one(
             top: crate::Top::EveryRung,
         })
         .map_err(|e| e.to_string())?;
-        shell.raise_whole().map_err(|e| e.to_string())?;
         // No runtime commits the pool here: a bounded pool's every whole
         // segment under the activation span is committed, as a runtime does
         // once the state its lanes hold reaches it (a slot a lane's records,

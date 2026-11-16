@@ -330,7 +330,6 @@ pub(super) fn load_near(fixture: &Fixture, context: u32, chunk: Option<u64>) -> 
         profiles: None,
         top: engine_metal::Top::EveryRung,
     })
-    .and_then(|mut shell| shell.raise_whole().map(|()| shell))
     .unwrap_or_else(|why| panic!("the shell loads: {why}"))
 }
 

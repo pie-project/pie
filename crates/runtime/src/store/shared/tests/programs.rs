@@ -295,7 +295,8 @@ fn a_zero_term_never_refuses_a_bind_on_a_pool_with_rungs() {
 /// The fixture's pool with its engine told rungs, stating as Metal does
 /// that its activation span covers the segments from the one the largest
 /// rung's carve starts in (6 and 7: 16 chunks); every segment committed.
-/// The engine holds the smallest rung.
+/// The engine holds the smallest rung, lowered to from the top rung it
+/// loads at.
 fn told_loaded() -> (SharedPool, FakeEngine) {
     let mut facts = facts();
     facts.tells_rungs = true;
@@ -306,7 +307,9 @@ fn told_loaded() -> (SharedPool, FakeEngine) {
         walk_segments(&mut pool, 8, 0, &mut engine),
         Retarget::Reached
     );
-    assert_eq!(pool.told(), 16, "the load's rung");
+    assert_eq!(pool.told(), 2048, "the load's rung: the top");
+    assert_eq!(pool.lower_rung(16).unwrap(), Some((2048, 16)));
+    assert_eq!(pool.told(), 16);
     // The top rung's span bounds it, under the 16 the engine states.
     assert_eq!(pool.act_most(), 12);
     (pool, engine)

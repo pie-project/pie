@@ -90,6 +90,11 @@ struct RungGate {
     /// the cap once no step past it is (the scheduler holds back a launch
     /// past the cap), so the walker may lower the pool's rung behind it.
     grant: std::sync::atomic::AtomicU32,
+    /// The walker holds the rung down: a raise waits on the governor's grow
+    /// of the span yield gave back under pressure, no fire's retirement.
+    /// What a pass waits on before it is cut otherwise lands; under this, a
+    /// pass is cut to the rung standing ([`rung_held`]).
+    held: std::sync::atomic::AtomicBool,
     /// The event every wait on the activation rung waits on: the fire cap
     /// moved, a raise was applied, copied or refused, the rung was lowered,
     /// segments were committed, or room was freed (a fire retired).
@@ -119,6 +124,7 @@ fn rung_gate(engine: usize) -> &'static RungGate {
             Box::leak(Box::new(RungGate {
                 cap: std::sync::atomic::AtomicU32::new(u32::MAX),
                 grant: std::sync::atomic::AtomicU32::new(u32::MAX),
+                held: std::sync::atomic::AtomicBool::new(false),
                 event: tokio::sync::Notify::new(),
                 walk: tokio::sync::Notify::new(),
             }))
@@ -212,6 +218,27 @@ fn set_fire_cap(engine: usize, tokens: u32) {
         .cap
         .store(tokens, std::sync::atomic::Ordering::Release);
     rung_changed(engine);
+}
+
+/// Whether `engine`'s walker holds the rung down: a raise past it waits on
+/// the governor's grow of the span yield gave back (pressure), so a pass
+/// asking past it is cut to the rung standing rather than wait.
+#[must_use]
+pub fn rung_held(engine: usize) -> bool {
+    rung_gate(engine)
+        .held
+        .load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// The walker of `engine` holds the rung down, or no longer does; every wait
+/// on the rung looks again.
+pub(crate) fn hold_rung(engine: usize, held: bool) {
+    let was = rung_gate(engine)
+        .held
+        .swap(held, std::sync::atomic::Ordering::AcqRel);
+    if was != held {
+        rung_changed(engine);
+    }
 }
 
 /// The scheduler of `engine` has no step wider than `cap` in flight, and
@@ -829,10 +856,11 @@ impl SharedPool {
     }
 
     /// The pool `facts` state, and `max_context` tokens the longest a
-    /// working set holds. The rung starts at the largest: state never takes
-    /// the top span until a rung is lowered. Where the span is backed on
-    /// demand, at the smallest, the rung the engine backs at load
-    /// ([`Self::start_cap`]).
+    /// working set holds. The rung starts at the largest, the top rung the
+    /// load chose, on every engine: the span is backed at load and live
+    /// state never takes it, so fires are uncut from ready on
+    /// ([`Self::start_cap`]). Only yield's pressure or a forced fit lowers
+    /// it.
     pub fn new(facts: &ChunkFacts, max_context: u32) -> Result<Self, SharedError> {
         facts
             .validate()
@@ -989,11 +1017,11 @@ impl SharedPool {
             act_chunks: facts.act_chunks.clone(),
             act_span: facts.act_span_chunks,
         });
-        // An engine told rungs starts at the smallest, the rung it lays its
-        // fires by at load; passes raise it through `Engine::set_rung` as
-        // fires need. One that is not: at the largest.
+        // Every engine starts at the largest rung, the one it lays its fires
+        // by at load (an engine told rungs as well: it hears each change
+        // from there).
         let tells_rungs = facts.tells_rungs;
-        if !tells_rungs && let Some(&(rung, _)) = facts.act_chunks.last() {
+        if let Some(&(rung, _)) = facts.act_chunks.last() {
             pool.set_rung(rung)
                 .expect("an empty pool takes its largest rung");
         }
@@ -1670,8 +1698,7 @@ impl SharedPool {
     }
 
     /// The cap fires start at: the rung the pool starts at, lifted. The
-    /// largest's (no cap) unless the engine is told rungs, where fires
-    /// start cut to the smallest rung until a raise reaches the engine.
+    /// largest's on every engine: no cap.
     #[must_use]
     pub fn start_cap(&self) -> u32 {
         self.lifted(self.rung())
