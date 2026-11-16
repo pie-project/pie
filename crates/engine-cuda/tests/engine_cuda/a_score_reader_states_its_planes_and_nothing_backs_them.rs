@@ -18,19 +18,19 @@ use eta_ir::types::{Dtype as EtaDtype, Shape};
 use poem::{Dtype, ForwardHybrid, Input, Platform, Request, StateRows, Weight, ops};
 use poem_compiler::Budget;
 
-const VOCAB: u32 = 64;
+pub(crate) const VOCAB: u32 = 64;
 const WIDTH: u64 = 128;
 const HEAD_DIM: u32 = 64;
 const HEADS: u32 = 2;
 const KV_ROW: &str = "kv";
-const PAGE: u32 = 16;
-const PROMPT: u32 = 20;
+pub(crate) const PAGE: u32 = 16;
+pub(crate) const PROMPT: u32 = 20;
 const LANES: u32 = 4;
 /// The keys a score plane holds a run of per query head (`attend`'s).
 const KV_MAX: u64 = 2048;
 
 /// One attention layer that captures its scores.
-struct Scored;
+pub(crate) struct Scored;
 
 impl ForwardHybrid for Scored {
     fn states(&self) -> StateRows {
@@ -65,7 +65,8 @@ impl ForwardHybrid for Scored {
     }
 }
 
-fn shell(trace: poem::Trace, path: &Path) -> Shell {
+/// A shell of `trace`, recording bodies or not as `graphs` says.
+pub(crate) fn shell(trace: poem::Trace, path: &Path, graphs: Graphs) -> Shell {
     let contract = contract_for(&trace, path).expect("the random planes fit the trace");
     let mut shell = Shell::load(Boot {
         voxels: None,
@@ -83,7 +84,7 @@ fn shell(trace: poem::Trace, path: &Path) -> Shell {
         context_declared: false,
         ordinal: 0,
         knobs: engine_cuda::Knobs {
-            chip: Some(engine_cuda::chip::pinned(Graphs::Off, None)),
+            chip: Some(engine_cuda::chip::pinned(graphs, None)),
             ..engine_cuda::Knobs::default()
         },
         cache_dir: None,
@@ -100,7 +101,7 @@ fn shell(trace: poem::Trace, path: &Path) -> Shell {
 }
 
 /// An epilogue that sums lane 0's `attn.scores` row into a reader channel.
-fn reader() -> TraceContainer {
+pub(crate) fn reader() -> TraceContainer {
     let width = u32::try_from(u64::from(HEADS) * KV_MAX).expect("a row's width");
     TraceContainer {
         names: vec!["attn.scores".into()],
@@ -146,7 +147,7 @@ fn a_score_reader_states_its_planes_and_nothing_backs_them() {
     let trace = poem::trace_hybrid("scored-micro", &Scored, Platform::Cuda);
     let dir = tempfile::tempdir().expect("a scratch directory");
     let path = Weights::random(&trace, 4409).write(dir.path());
-    let mut shell = shell(trace.clone(), &path);
+    let mut shell = shell(trace.clone(), &path, Graphs::Off);
     let (span, backed, holds) = shell.activation_span();
     assert_eq!(backed, span, "the span is backed whole at load");
     let facts = shell.chunk_facts().expect("the chunk facts");

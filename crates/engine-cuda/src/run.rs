@@ -344,6 +344,15 @@ pub(crate) fn one_token(pool: RecurrentPool) -> RecurrentPool {
     }
 }
 
+/// Where a fire's score planes lie: the device word a recorded capture
+/// reads them through (staged each fire), and the address it holds now, 0
+/// for a fire that captures none.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ScorePlanes {
+    pub word: u64,
+    pub base: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct FireBindings {
     pub tokens: Tensor,
@@ -356,6 +365,10 @@ pub struct FireBindings {
 
     /// A device word: how many of `readout_rows` are live.
     pub readout_live: u64,
+
+    /// Where a scored fire's planes lie: the device word a capture reads
+    /// them through, and what it holds this fire.
+    pub score_planes: ScorePlanes,
 
     pub patches: Option<Tensor>,
     pub patch_segments: Option<Tensor>,

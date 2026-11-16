@@ -41,6 +41,18 @@ impl Run<'_> {
             } => {
                 let mut q_rows = self.ragged(*q);
                 q_rows.data = self.windowed(q_rows.data);
+                // The rows as an offset into the planes, read through the
+                // fire's word: a recorded capture replays wherever the
+                // reader's pair holds them then.
+                let planes = self.bindings().score_planes;
+                let rows = self.tensor(*scores);
+                let scores = kernels_cuda::attn::score::Rows {
+                    word: planes.word,
+                    offset: rows.ptr.wrapping_sub(planes.base),
+                    rows: rows.rows,
+                    width: rows.width,
+                    dtype: rows.dtype,
+                };
                 kernels_cuda::attn::score::capture(
                     self.ctx(),
                     q_rows,
@@ -52,7 +64,7 @@ impl Run<'_> {
                     *observe,
                     self.window().span().lane_offset,
                     *kv_max,
-                    &mut self.tensor(*scores),
+                    scores,
                 )
             }
             Attn::Voxel {

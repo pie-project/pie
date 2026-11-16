@@ -4,7 +4,7 @@ use crate::attn::kv;
 use crate::attn::plan::PrefillPlan;
 use crate::error::Error;
 use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, kernel, refuse, stated};
-use crate::tensor::{KvPool, RaggedTensor, Tensor};
+use crate::tensor::{KvPool, RaggedTensor};
 
 const SCORE: &str = "attn/score.cu";
 
@@ -28,6 +28,20 @@ fn stamp_for(head_dim: u32) -> Option<u32> {
     STAMPS.into_iter().find(|stamp| head_dim <= *stamp)
 }
 
+/// The rows a capture writes: `rows` by `width` of `dtype` (f32), `offset`
+/// bytes past the address the device word at `word` holds when the kernel
+/// runs. A recorded launch keeps the word's address and not the rows', so
+/// the rows may lie elsewhere at each replay: whoever moves them writes the
+/// word.
+#[derive(Debug, Clone, Copy)]
+pub struct Rows {
+    pub word: u64,
+    pub offset: u64,
+    pub rows: u32,
+    pub width: u32,
+    pub dtype: Dtype,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn capture(
     ctx: &Ctx,
@@ -40,7 +54,7 @@ pub fn capture(
     observe: u32,
     lane_offset: u32,
     kv_max: u32,
-    scores: &mut Tensor,
+    scores: Rows,
 ) -> Result<(), Error> {
     const OP: &str = "attn.score_capture";
     plan.accepts(OP, head_dim, Some(kv_heads), None)?;
@@ -143,7 +157,8 @@ pub fn capture(
             pool.page_indices.arg(),
             pool.page_indptr.arg(),
             pool.last_page_lens.arg(),
-            scores.arg(),
+            scores.word.arg(),
+            scores.offset.arg(),
             page_size.arg(),
             kv::page_elems(OP, pool, 0)?.arg(),
             stated(OP, num_q_heads)?.arg(),

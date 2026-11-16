@@ -133,6 +133,20 @@ impl Guest {
         (scratch, pair)
     }
 
+    /// Fresh room for an instance's scratch and its pair's state, as an
+    /// unpark takes it: elsewhere than any taken before.
+    pub fn moved(
+        &mut self,
+        program: ProgramId,
+        extents: eta_exec::Extents,
+        state: GuestState,
+    ) -> (ScratchPlace, ScratchPlace) {
+        let extents = bind_extents(extents);
+        self.pairs
+            .retain(|(held, at, _)| *held != program || *at != extents);
+        self.scratch(program, &extents, state)
+    }
+
     /// The slots an instance of a program with `facts` and `state` at
     /// `extents` takes on a shell: its tables', its rings', its scratch's
     /// and its pair's.

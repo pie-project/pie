@@ -11,7 +11,8 @@ __global__ void score_capture(
     const i32* __restrict__ kv_page_indices,
     const i32* __restrict__ kv_page_indptr,
     const i32* __restrict__ kv_last_page_lens,
-    float* __restrict__ scores,
+    const unsigned long long* __restrict__ scores_word,
+    long long scores_offset,
     int page_size,
     long long stride_page,
     int num_q_heads,
@@ -38,6 +39,9 @@ __global__ void score_capture(
     const long long out_row =
         (static_cast<long long>(lane_offset + request) * num_q_heads + head) *
         static_cast<long long>(kv_max);
+    // The rows lie where the word says now: a recorded launch keeps the
+    // word, and the rows move with the state that holds them.
+    float* const scores = reinterpret_cast<float*>(*scores_word + scores_offset);
     float* out = scores + out_row;
 
     for (int i = static_cast<int>(threadIdx.x); i < kv_max; i += threads) {

@@ -229,6 +229,8 @@ struct Staged {
     group_masks: Vec<crate::inputs::GroupMaskHandles>,
     inputs: Vec<crate::run::InputBinding>,
     slots: SlotTable,
+    /// Where the fire's score planes lie (0: it captures none).
+    planes: u64,
     caches: CacheTable,
     paging: Paging,
 }
@@ -618,6 +620,7 @@ impl FireCtx<'_> {
             group_masks,
             inputs,
             slots,
+            planes: planes.unwrap_or(0),
             caches,
             paging,
         })
@@ -686,6 +689,10 @@ impl FireCtx<'_> {
             adapter_routes: handles.adapter_routes,
             readout_rows: handles.readout_rows,
             readout_live: handles.readout_live,
+            score_planes: crate::run::ScorePlanes {
+                word: handles.score_planes,
+                base: staged.planes,
+            },
             patches: staged.patches.as_ref().map(|seats| seats.patches),
             patch_segments: staged.patches.as_ref().map(|seats| seats.segments),
             patch_routes: staged.patches.as_ref().map(|seats| seats.routes),

@@ -14,7 +14,8 @@ template <int HEAD_DIM_MAX, int WAVES, bool HND>
 __global__ __launch_bounds__(WAVES * 64) void score_capture(
     const bf16* __restrict__ q, const i32* __restrict__ qo_indptr, const bf16* __restrict__ k_pages,
     const i32* __restrict__ page_indices, const i32* __restrict__ page_indptr,
-    const i32* __restrict__ last_page_lens, float* __restrict__ scores, int page_size,
+    const i32* __restrict__ last_page_lens, const unsigned long long* __restrict__ scores_word,
+    long long scores_offset, int page_size,
     int num_q_heads, int num_kv_heads, int head_dim, float sm_scale, int observe, int lane_offset,
     int kv_max, long long stride) {
     static_assert(HEAD_DIM_MAX % kWave == 0, "a lane takes whole elements of the head");
@@ -29,6 +30,9 @@ __global__ __launch_bounds__(WAVES * 64) void score_capture(
     const int ln = lane();
     const int wave = static_cast<int>(threadIdx.x) / kWave;
 
+    // The rows lie where the word says now: a recorded launch keeps the
+    // word, and the rows move with the state that holds them.
+    float* const scores = reinterpret_cast<float*>(*scores_word + scores_offset);
     float* out = scores + (static_cast<long long>(lane_offset + request) * num_q_heads + head) *
                               static_cast<long long>(kv_max);
     for (int i = threadIdx.x; i < kv_max; i += blockDim.x) out[i] = 0.f;

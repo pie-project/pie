@@ -123,7 +123,15 @@ fn a_score_capture_lands_each_lanes_mass_at_its_row() {
     .expect("the prefill plans");
     plan.stage(&ctx).expect("the plan uploads");
     let at = gpu.up(&want.iter().map(|_| 9.0f32).collect::<Vec<_>>());
-    let mut scores = ten(at, lane_offset + n, qh * kv_max, F32);
+    // The rows lie where a device word says, as a recorded capture reads
+    // them.
+    let scores = kernels_cuda::attn::score::Rows {
+        word: gpu.up(&[at]),
+        offset: 0,
+        rows: (lane_offset + n) as u32,
+        width: (qh * kv_max) as u32,
+        dtype: F32,
+    };
     kernels_cuda::attn::score::capture(
         &ctx,
         qt,
@@ -135,7 +143,7 @@ fn a_score_capture_lands_each_lanes_mass_at_its_row() {
         observe as u32,
         lane_offset as u32,
         kv_max as u32,
-        &mut scores,
+        scores,
     )
     .expect("the capture fires");
     gpu.sync();
@@ -163,7 +171,7 @@ fn a_score_capture_lands_each_lanes_mass_at_its_row() {
                 observe as u32,
                 lane_offset as u32,
                 kv_max as u32,
-                &mut scores,
+                scores,
             )
             .expect("the capture fires");
         },

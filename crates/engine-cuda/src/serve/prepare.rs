@@ -1801,21 +1801,27 @@ impl Shell {
         let body_lanes = crate::window::body_lanes(max_lanes, composition.bucket());
         let lanes_fit = composition.lane_count() <= body_lanes;
         // A fire capturing scores lays its planes in a reader's pair's
-        // state, which moves when the pair is parked: a body would keep
-        // where they lay when it was recorded, so such a fire is walked.
+        // state, which moves when the pair is parked: its captures read
+        // where through a staged word, so a body replays wherever they lie.
         let scored = composition
             .lanes()
             .iter()
             .any(|row| self.arena.captures(row.class as usize));
-        let scores_fit = !scored;
+        let score_planes = if scored {
+            self.programs.planes_at().ok_or_else(|| Fault::Unbound {
+                what: "the attn.scores planes of a fire capturing them: no pair bound now \
+                       reads them, so none holds them"
+                    .to_string(),
+            })?
+        } else {
+            0
+        };
         // Why a fire of a load that records bodies walks its plan, for the
         // warning it raises (`Bodies::eager_unbodied`).
-        let fits = readouts_fit && lanes_fit && scores_fit;
+        let fits = readouts_fit && lanes_fit;
         let unbodied = (records_bodies && !arming && !(bodied && fits)).then(|| {
             let why = if tapped {
                 "it is tapped"
-            } else if !scores_fit {
-                "it captures scores, whose planes lie in a pair's state that moves"
             } else if !snapshots_fit {
                 "it takes more snapshots than a body holds"
             } else if !Self::keyable_units(&self.compiled) {
@@ -1912,6 +1918,7 @@ impl Shell {
                 windows: &boundaries,
                 readout_rows: &readout_rows,
                 readout_live,
+                score_planes,
                 qo_absolute: &qo_absolute,
                 live: if bodied { windows.live() } else { &[] },
                 slot_ids: &slot_ids,
