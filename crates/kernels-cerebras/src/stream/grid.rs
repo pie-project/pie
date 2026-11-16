@@ -1707,6 +1707,7 @@ fn print_regions(g: &mut GridProgram) -> R<()> {
                 rope_lv: 1,
                 rope_bits: 3,
                 straddle: false,
+                columns: None,
             },
         )
         .map_err(|e| format!("{}: region {ri}: {e}", g.trace.name))?;

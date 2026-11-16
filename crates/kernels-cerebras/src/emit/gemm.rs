@@ -251,7 +251,7 @@ pub fn table(p: &GemmProgram) -> R<Table> {
             GOp::Region(ri) => {
                 let g = &p.l.regs[*ri];
                 let pr = g.printed.as_ref().ok_or("an unprinted region")?;
-                let ch = g.region.width / p.c;
+                let ch = g.chunk;
                 a.extend([
                     u32::from(g.mask),
                     u32::from(g.lane),
@@ -361,7 +361,7 @@ pub fn table(p: &GemmProgram) -> R<Table> {
         + kb.max(
             p.l.vals
                 .values()
-                .map(|v| v.width / p.c + 1)
+                .map(|v| crate::stream::gemm::local_width(v, p.c, 0) + 1)
                 .max()
                 .unwrap_or(1),
         );
@@ -413,7 +413,7 @@ fn reg_fn(p: &GemmProgram) -> String {
         let Some(g) = p.l.regs.iter().find(|r| r.module == mi) else {
             continue;
         };
-        let ch = g.region.width / p.c;
+        let ch = g.chunk;
         let _ = writeln!(o, "  if (m == {mi}) {{");
         // (the residents and static scalars in the parameters' order: the stream's)
         for (k, at) in g.params.iter().enumerate() {
@@ -866,11 +866,8 @@ pub fn emit(p: &GemmProgram) -> R<Emitted> {
                     .unwrap_or_default()
                 {
                     let n = tbl.of_chunk.iter().map(Vec::len).max().unwrap_or(1).max(1) as u32;
-                    let row = &tbl.of_chunk[if tbl.of_chunk.len() == 1 {
-                        0
-                    } else {
-                        x as usize
-                    }];
+                    // (a head region's chunk its place in the head's band)
+                    let row = &tbl.of_chunk[x as usize % tbl.of_chunk.len().max(1)];
                     let mut ws: Vec<u32> = row
                         .iter()
                         .map(|&v| if tbl.u16 { v as u32 } else { v.to_bits() })

@@ -686,6 +686,7 @@ pub fn program_at(
                     rope_lv: lv.max(1),
                     rope_bits: 3,
                     straddle: false,
+                    columns: None,
                 },
             )
             .map_err(|e| format!("{}: step {i}: {e}", u.name))?;
@@ -742,6 +743,7 @@ pub fn program_at(
                             rope_lv: lv.max(1),
                             rope_bits: 3,
                             straddle: false,
+                            columns: None,
                         },
                     )
                     .map_err(|e| format!("{}: step {i} (helpers): {e}", u.name))?;

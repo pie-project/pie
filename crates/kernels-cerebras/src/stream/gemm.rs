@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use poem_ir::{Def, Dtype, Trace, ValueId};
 
 use super::build::{self, Lowered};
-use super::host::{BF16, CLAMP, FLAT, HALF, LIT, NONE, ONE, PACK, Span};
+use super::host::{BF16, CLAMP, FLAT, HALF, LIT, NONE, ONE, PACK, Span, Word};
 use super::unit::{Cols, Reader, Step, Unit, unmoved};
 use super::{Options, StreamShape};
 use crate::emit::region::{self, ParamAt, Place, Printed};
@@ -62,6 +62,10 @@ pub struct GReg {
     /// Placed: its print at the program's chunk, and its module.
     pub printed: Option<Printed>,
     pub module: usize,
+    /// Placed: the columns of its row a PE holds; a head region (its row a head, run over every
+    /// head, its sums the head's band's).
+    pub chunk: u32,
+    pub head: bool,
 }
 
 /// The joint attention's operands for one unit's rows.
@@ -128,9 +132,52 @@ pub struct GVal {
     pub mask: u16,
     /// Read only by GEMMs and the host (its pieces may be uneven).
     pub free: bool,
+    /// The segments (by their first column) laid out other than in order.
+    pub maps: BTreeMap<u32, SegMap>,
+}
+
+/// A segment laid out other than its columns in order: grouped-query attention's k and v a
+/// copy a q head (`expand` q heads a kv head of `hd` columns), and a NeoX rotation's halves
+/// side by side in each PE's chunk (`perm`, over blocks of its length: position `p`'s column).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SegMap {
+    pub expand: u32,
+    pub hd: u32,
+    pub perm: Option<Vec<u32>>,
+}
+
+impl SegMap {
+    /// The segment's own column (from its start) at layout position `p`.
+    #[must_use]
+    pub fn src(&self, p: u32) -> u32 {
+        let u = match &self.perm {
+            Some(m) => {
+                let n = m.len() as u32;
+                (p / n) * n + m[(p % n) as usize]
+            }
+            None => p,
+        };
+        if self.expand > 1 {
+            (u / self.hd / self.expand) * self.hd + u % self.hd
+        } else {
+            u
+        }
+    }
+
+    /// The layout's width of a segment of `w` columns.
+    #[must_use]
+    pub fn width(&self, w: u32) -> u32 {
+        w * self.expand.max(1)
+    }
 }
 
 impl GVal {
+    /// Segment `from`'s layout width (its columns, or a copy a q head of each).
+    #[must_use]
+    pub fn lwidth(&self, from: u32, w: u32) -> u32 {
+        self.maps.get(&from).map_or(w, |m| m.width(w))
+    }
+
     /// Its segments: (from, width).
     #[must_use]
     pub fn segs(&self) -> Vec<(u32, u32)> {
@@ -246,6 +293,7 @@ impl Lw<'_> {
             round,
             mask: 0,
             free: true,
+            maps: BTreeMap::new(),
         });
         e.mask |= mask;
         e.lane |= lane;
@@ -294,7 +342,14 @@ impl Lw<'_> {
             Step::Region { chain, .. } => {
                 let mut args = Vec::new();
                 let mut params = Vec::new();
-                let w = chain.region.width;
+                // a head region (a head's ops, its row a head) runs over every head of the
+                // values it reads: its rows' reads `reps` heads wide
+                let reps = chain
+                    .outs
+                    .first()
+                    .map_or(1, |o| self.width(o.value) / chain.region.width.max(1))
+                    .max(1);
+                let w = chain.region.width * reps;
                 for (k, input) in chain.ins.iter().enumerate() {
                     let base = self.canon(r.cols(input.value).base);
                     let from = r.cols(input.value).from + input.from;
@@ -365,6 +420,8 @@ impl Lw<'_> {
                     lane,
                     printed: None,
                     module: 0,
+                    chunk: 0,
+                    head: false,
                 });
                 self.ops.push(GOp::Region(ri));
                 Ok(())
@@ -470,15 +527,6 @@ pub fn lower(trace: &Trace, o: &Options, class_rows: &[(String, u32)]) -> R<Lowe
     if nclasses > 16 {
         return Err(refuse(trace, "more than 16 row classes"));
     }
-    if s.attn.q_heads != s.attn.kv_heads {
-        return Err(refuse(
-            trace,
-            format!(
-                "grouped-query attention ({} q heads over {} kv heads): a head's band holds its q, k and v alike",
-                s.attn.q_heads, s.attn.kv_heads
-            ),
-        ));
-    }
     // a merge of the classes' arms is one value
     let mut alias = BTreeMap::new();
     for (i, d) in trace.values.iter().enumerate() {
@@ -572,38 +620,65 @@ pub fn lower(trace: &Trace, o: &Options, class_rows: &[(String, u32)]) -> R<Lowe
         }
         i = group.iter().max().map_or(i, |m| m + 1);
     }
-    // (`GEMM_UPTO=n`, a debugging cut: the first n ops, the last value one makes read out)
-    if let Some(n) = std::env::var("GEMM_UPTO")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-    {
-        lw.ops.truncate(n);
-        lw.ops.retain(|o| !matches!(o, GOp::Out { .. }));
-        let l = Lowering {
-            trace: trace.clone(),
-            reading: o.reading.clone(),
-            shape: s.clone(),
-            class_rows: crows.clone(),
-            vals: lw.vals.clone(),
-            ops: lw.ops.clone(),
-            regs: lw.regs.clone(),
-            round16: o.round16,
-            alias: lw.alias.clone(),
+    // grouped-query attention: k and v laid out a copy a q head (every head's band then holds
+    // its q, k and v alike), and every region over them so (a head region runs over the copies)
+    if s.attn.kv_heads > 0 && s.attn.q_heads > s.attn.kv_heads {
+        let (g, hd) = (s.attn.q_heads / s.attn.kv_heads, s.attn.head_dim);
+        if g * s.attn.kv_heads != s.attn.q_heads {
+            return Err(refuse(
+                trace,
+                "q heads that are no multiple of the kv heads",
+            ));
+        }
+        let m = SegMap {
+            expand: g,
+            hd,
+            perm: None,
         };
-        let last = lw.ops.iter().rev().find_map(|op| {
-            let (_, outs) = op_io(&l, op);
-            outs.into_iter()
-                .find(|v| lw.vals.get(v).is_some_and(|x| !x.lane))
-        });
-        if let Some(v) = last {
-            let x = lw.vals[&v].clone();
-            for (from, width) in x.segs() {
-                lw.ops.push(GOp::Out {
-                    v,
-                    from,
-                    width,
-                    mask: x.mask,
-                });
+        let mut seed: Vec<(ValueId, u32)> = Vec::new();
+        for op in &lw.ops {
+            if let GOp::Attend { sides, .. } = op {
+                for x in sides {
+                    seed.push(x.k);
+                    seed.push(x.v);
+                }
+            }
+        }
+        for (v, f) in seed {
+            if let Some(x) = lw.vals.get_mut(&v) {
+                x.maps.insert(f, m.clone());
+            }
+        }
+        loop {
+            let mut more = Vec::new();
+            for g2 in &lw.regs {
+                let rows: Vec<(ValueId, u32)> = g2
+                    .args
+                    .iter()
+                    .filter_map(|a| match a {
+                        RArg::Row { v, from } => Some((*v, *from)),
+                        _ => None,
+                    })
+                    .chain(g2.outs.iter().map(|o| (*o, 0)))
+                    .collect();
+                let any = rows
+                    .iter()
+                    .any(|(v, f)| lw.vals.get(v).is_some_and(|x| x.maps.contains_key(f)));
+                if any {
+                    more.extend(
+                        rows.into_iter().filter(|(v, f)| {
+                            lw.vals.get(v).is_some_and(|x| !x.maps.contains_key(f))
+                        }),
+                    );
+                }
+            }
+            if more.is_empty() {
+                break;
+            }
+            for (v, f) in more {
+                if let Some(x) = lw.vals.get_mut(&v) {
+                    x.maps.insert(f, m.clone());
+                }
             }
         }
     }
@@ -658,6 +733,7 @@ pub fn local(v: &GVal, c: u32, ci: u32) -> Vec<(u32, u32, u32, u32, u32)> {
     v.segs()
         .into_iter()
         .map(|(f, w)| {
+            let w = v.lwidth(f, w);
             let (lo, hi) = piece(ci, c, w);
             let r = (f, w, off, lo, hi - lo);
             off += hi - lo;
@@ -670,6 +746,18 @@ pub fn local(v: &GVal, c: u32, ci: u32) -> Vec<(u32, u32, u32, u32, u32)> {
 #[must_use]
 pub fn local_width(v: &GVal, c: u32, ci: u32) -> u32 {
     local(v, c, ci).iter().map(|x| x.4).sum()
+}
+
+/// Runs of consecutive numbers: (first, length).
+fn runs(xs: impl Iterator<Item = u32>) -> Vec<(u32, u32)> {
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    for x in xs {
+        match out.last_mut() {
+            Some(r) if r.0 + r.1 == x => r.1 += 1,
+            _ => out.push((x, 1)),
+        }
+    }
+    out
 }
 
 /// The local offset of the segment of `v` starting at `from` (every column alike: even
@@ -748,7 +836,8 @@ pub fn place(l: &Lowering, c: u32, r: u32, kbm: u32) -> R<GemmProgram> {
         if v.free {
             continue;
         }
-        for (_, w) in v.segs() {
+        for (f, w) in v.segs() {
+            let w = v.lwidth(f, w);
             if !w.is_multiple_of(c) {
                 return Err(refuse(
                     t,
@@ -757,44 +846,7 @@ pub fn place(l: &Lowering, c: u32, r: u32, kbm: u32) -> R<GemmProgram> {
             }
         }
     }
-    // the regions printed at their chunk
-    let top = l.class_rows.iter().map(|x| x.0).max().unwrap_or(1).max(2) - 1;
-    let lv = (32 - top.leading_zeros()).div_ceil(3);
-    let mut regs = l.regs.clone();
-    let mut modules: Vec<(String, String)> = Vec::new();
-    for (ri, g) in regs.iter_mut().enumerate() {
-        let ch = chunk_of(g.region.width, c).ok_or_else(|| {
-            refuse(
-                t,
-                format!("region {ri}: {} columns over {c}", g.region.width),
-            )
-        })?;
-        let pr = region::print(
-            &g.region,
-            &Place {
-                chunk: ch,
-                roots: c,
-                params: g.params.clone(),
-                round16: l.round16,
-                rope_lv: lv.max(1),
-                rope_bits: 3,
-                straddle: true,
-            },
-        )
-        .map_err(|e| refuse(t, format!("region {ri}: {e}")))?;
-        let m = match modules.iter().position(|(_, s)| *s == pr.csl) {
-            Some(m) => m,
-            None => {
-                modules.push((format!("greg{}.csl", modules.len()), pr.csl.clone()));
-                modules.len() - 1
-            }
-        };
-        g.printed = Some(pr);
-        g.module = m;
-    }
-    let mut l2 = l.clone();
-    l2.regs = regs;
-    // the attention's band
+    // the attention's band: a head's columns over the PEs of a row
     let (mut band, mut qchunk) = (1, 1);
     for op in &l.ops {
         if let GOp::Attend {
@@ -802,11 +854,12 @@ pub fn place(l: &Lowering, c: u32, r: u32, kbm: u32) -> R<GemmProgram> {
         } = op
         {
             for s in sides {
-                let qw = l.vals[&s.q.0]
+                let qv = &l.vals[&s.q.0];
+                let qw = qv
                     .segs()
                     .iter()
                     .find(|x| x.0 == s.q.1)
-                    .map_or(0, |x| x.1);
+                    .map_or(0, |x| qv.lwidth(x.0, x.1));
                 let qc = chunk_of(qw, c)
                     .ok_or_else(|| refuse(t, format!("q of {qw} columns over {c}")))?;
                 if !head_dim.is_multiple_of(qc) {
@@ -828,6 +881,171 @@ pub fn place(l: &Lowering, c: u32, r: u32, kbm: u32) -> R<GemmProgram> {
                     ),
                 ));
             }
+        }
+    }
+    // the regions printed at their chunk: a region's span (the layout width of what its rows
+    // read) over the columns, its row the region's own width (a head region's a head, run over
+    // every head: its sums over the head's band); a rotation whose mates another PE holds has its
+    // halves gathered into each chunk (the columns permuted, and every row segment it touches)
+    let top = l.class_rows.iter().map(|x| x.0).max().unwrap_or(1).max(2) - 1;
+    let lv = (32 - top.leading_zeros()).div_ceil(3);
+    let mut l2 = l.clone();
+    let rows_of = |g: &GReg| -> Vec<(ValueId, u32)> {
+        g.args
+            .iter()
+            .filter_map(|a| match a {
+                RArg::Row { v, from } => Some((*v, *from)),
+                _ => None,
+            })
+            .chain(g.outs.iter().map(|o| (*o, 0)))
+            .collect()
+    };
+    let span_of = |vals: &BTreeMap<ValueId, GVal>, g: &GReg| -> u32 {
+        rows_of(g)
+            .first()
+            .and_then(|(v, f)| {
+                let x = vals.get(v)?;
+                x.segs()
+                    .into_iter()
+                    .find(|s| s.0 == *f)
+                    .map(|s| x.lwidth(s.0, s.1))
+            })
+            .unwrap_or(g.region.width)
+    };
+    let place_of = |g: &GReg, span: u32, columns: Option<Vec<u32>>| -> R<Place> {
+        let ch = chunk_of(span, c)
+            .filter(|ch| g.region.width.is_multiple_of(*ch))
+            .ok_or_else(|| {
+                refuse(
+                    t,
+                    format!("a region of {} over {span} / {c}", g.region.width),
+                )
+            })?;
+        Ok(Place {
+            chunk: ch,
+            roots: g.region.width / ch,
+            params: g.params.clone(),
+            round16: l.round16,
+            rope_lv: lv.max(1),
+            rope_bits: 3,
+            straddle: true,
+            columns,
+        })
+    };
+    // the rotations' layouts first (a region's rows alike: a reader of a permuted row prints
+    // permuted too), to a fixed point
+    loop {
+        let mut changed = false;
+        for ri in 0..l2.regs.len() {
+            let g = &l2.regs[ri];
+            let rows = rows_of(g);
+            let mut perms: Vec<Vec<u32>> = rows
+                .iter()
+                .filter_map(|(v, f)| l2.vals[v].maps.get(f).and_then(|m| m.perm.clone()))
+                .collect();
+            perms.dedup();
+            if perms.len() > 1 {
+                return Err(refuse(t, format!("region {ri}: rows of two layouts")));
+            }
+            let span = span_of(&l2.vals, g);
+            let perm = match perms.pop() {
+                Some(p) => Some(p),
+                None if region::print(&g.region, &place_of(g, span, None)?).is_err() => {
+                    // the mates gathered into each chunk: chunk k the row's pairs k ch / 2 ..
+                    // in order, their firsts then their seconds
+                    let h = (span / c / 2) as usize;
+                    region::mates(&g.region).first().and_then(|m| {
+                        let pairs: Vec<(u32, u32)> = (0..m.len() as u32)
+                            .filter(|&i| m[i as usize] > i)
+                            .map(|i| (i, m[i as usize]))
+                            .collect();
+                        (h > 0 && 2 * pairs.len() == m.len()).then(|| {
+                            pairs
+                                .chunks(h)
+                                .flat_map(|b| b.iter().map(|x| x.0).chain(b.iter().map(|x| x.1)))
+                                .collect()
+                        })
+                    })
+                }
+                None => None,
+            };
+            if let Some(perm) = perm {
+                for (v, f) in rows {
+                    let x = l2.vals.get_mut(&v).ok_or("a region's value")?;
+                    let e = x.maps.entry(f).or_default();
+                    if e.perm.as_ref() != Some(&perm) {
+                        e.perm = Some(perm.clone());
+                        e.hd = e.hd.max(perm.len() as u32);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut modules: Vec<(String, String)> = Vec::new();
+    for ri in 0..l2.regs.len() {
+        let g = l2.regs[ri].clone();
+        let span = span_of(&l2.vals, &g);
+        let head = span > g.region.width;
+        let held = rows_of(&g)
+            .iter()
+            .find_map(|(v, f)| l2.vals[v].maps.get(f).and_then(|m| m.perm.clone()));
+        let mut pr = region::print(&g.region, &place_of(&g, span, held)?)
+            .map_err(|e| refuse(t, format!("region {ri}: {e}")))?;
+        if head {
+            // a head region's row sums are its band's
+            if pr.head_reduces > 0 || (pr.all_reduces > 0 && g.region.width / (span / c) != band) {
+                return Err(refuse(
+                    t,
+                    format!("region {ri}: a head region's sums over other than its band"),
+                ));
+            }
+            pr.csl = pr.csl.replace("seg.all_reduce(", "seg.head_reduce(");
+        }
+        let m = match modules.iter().position(|(_, s)| *s == pr.csl) {
+            Some(m) => m,
+            None => {
+                modules.push((format!("greg{}.csl", modules.len()), pr.csl.clone()));
+                modules.len() - 1
+            }
+        };
+        let gm = &mut l2.regs[ri];
+        gm.chunk = span / c;
+        gm.head = head;
+        gm.printed = Some(pr);
+        gm.module = m;
+    }
+    // what the host writes and reads, and a GEMM's input, are in the columns' order; a head's
+    // q and k alike
+    for op in &l2.ops {
+        let mapped = |v: &ValueId| l2.vals.get(v).is_some_and(|x| !x.maps.is_empty());
+        match op {
+            GOp::In { v, .. } | GOp::Out { v, .. } if mapped(v) => {
+                return Err(refuse(
+                    t,
+                    format!("value %{}: the host's, laid out otherwise", v.0),
+                ));
+            }
+            GOp::Gemm { x, .. } if mapped(x) => {
+                return Err(refuse(
+                    t,
+                    format!("value %{}: a GEMM's input laid out otherwise", x.0),
+                ));
+            }
+            GOp::Attend { sides, .. } => {
+                for sd in sides {
+                    let perm = |(v, f): (ValueId, u32)| {
+                        l2.vals[&v].maps.get(&f).and_then(|m| m.perm.clone())
+                    };
+                    if perm(sd.q) != perm(sd.k) || perm(sd.v).is_some() {
+                        return Err(refuse(t, "an attention's q and k laid out apart"));
+                    }
+                }
+            }
+            _ => {}
         }
     }
     // slots: each value's words a PE, first fit over the ops' intervals
@@ -884,12 +1102,21 @@ pub fn place(l: &Lowering, c: u32, r: u32, kbm: u32) -> R<GemmProgram> {
         // chunk each
         if let GOp::Region(ri) = op {
             let g = &l2.regs[*ri];
-            let ch = g.region.width / c;
+            let ch = g.chunk;
+            let roots = g.region.width / ch;
+            // (its columns in the rows' layout: a rotation's halves gathered)
+            let perm = rows_of(g)
+                .iter()
+                .find_map(|(v, f)| l2.vals[v].maps.get(f).and_then(|m| m.perm.clone()));
             for a in &g.args {
                 for (ci, ws) in wstream.iter_mut().enumerate() {
                     match a {
                         RArg::Static { v, from } => {
-                            ws.push([v.0, 0, from + ci as u32 * ch, ch, 1, FLAT, 1, 0]);
+                            let p0 = (ci as u32 % roots) * ch;
+                            let src = |p: u32| perm.as_ref().map_or(p, |m| m[p as usize]);
+                            for (a0, n) in runs((p0..p0 + ch).map(src)) {
+                                ws.push([v.0, 0, from + a0, n, 1, FLAT, 1, 0]);
+                            }
                             wcol[ci] += u64::from(ch);
                         }
                         RArg::One { v, col } => {
@@ -921,7 +1148,11 @@ pub fn place(l: &Lowering, c: u32, r: u32, kbm: u32) -> R<GemmProgram> {
         if !xv.free || xv.segs().len() > 1 {
             seg_off(t, *x, xv, c, *from, *k)?;
         }
-        let ysegs = yv.segs();
+        let ysegs: Vec<(u32, u32)> = yv
+            .segs()
+            .into_iter()
+            .map(|(f, w)| (f, yv.lwidth(f, w)))
+            .collect();
         // an output of one segment read only by GEMMs and the host may cut unevenly
         let un = ysegs.len() == 1 && yv.free && !ysegs[0].1.is_multiple_of(c);
         for &(_, sw) in &ysegs {
@@ -952,8 +1183,19 @@ pub fn place(l: &Lowering, c: u32, r: u32, kbm: u32) -> R<GemmProgram> {
                     }
                     wbn = wbn.max(kc * p / 2);
                     wcol[ci] += u64::from(kc * p / 2);
-                    if p > 0 {
-                        ws.push([w.0, sf + lo, k0, p, *k, f16, kc, 1]);
+                    match yv.maps.get(&sf) {
+                        _ if p == 0 => {}
+                        None => ws.push([w.0, sf + lo, k0, p, *k, f16, kc, 1]),
+                        // (an output laid out otherwise: its weights' rows in that order, a run
+                        // of them a span, an input column's runs after another's)
+                        Some(m) => {
+                            let rs = runs((lo..hi).map(|q| m.src(q)));
+                            for j in k0..k1 {
+                                for &(a0, n) in &rs {
+                                    ws.push([w.0, sf + a0, j, n, *k, f16, 1, 0]);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1221,6 +1463,34 @@ pub fn compile_program(
     if let Some(dir) = values {
         let vals = super::host::Values::open(dir)?;
         for (k, item) in h2d.iter_mut().enumerate() {
+            // (an entry: its gather over the capture's rows)
+            if let Some(f) = item["entry"].as_str() {
+                let (shape, g) = crate::npy::read_f32_or_i32(&out.join(f))?;
+                let words: Vec<Word> = g
+                    .chunks(4)
+                    .map(|x| {
+                        [
+                            x[0].to_bits(),
+                            x[1].to_bits(),
+                            x[2].to_bits(),
+                            x[3].to_bits(),
+                        ]
+                    })
+                    .collect();
+                let data = super::host::apply(&words, &|id| {
+                    let (s, d) = vals.get(ValueId(id))?;
+                    let w = *s.last().unwrap_or(&1);
+                    Ok((d.len() / w.max(1), w, d))
+                })?;
+                let file = format!("h2d/e{k}.npy");
+                crate::npy::write_f32(
+                    &out.join(&file),
+                    &shape[..shape.len().saturating_sub(1)],
+                    &data,
+                )?;
+                item["file"] = json!(file);
+                continue;
+            }
             let Some(f) = item["static"].as_str() else {
                 continue;
             };
@@ -1391,36 +1661,41 @@ pub fn emulate(l: &Lowering, vals: &super::host::Values) -> R<BTreeMap<ValueId, 
             GOp::Region(ri) => {
                 let g = &l.regs[*ri];
                 let w = g.region.width as usize;
+                // (a head region: its row a head, run over every head)
+                let reps = g
+                    .outs
+                    .first()
+                    .map_or(1, |o| l.vals[o].width as usize / w.max(1))
+                    .max(1);
                 let nr = if g.lane { 1 } else { rows as usize };
                 let mut res: Vec<Vec<f32>> = vec![Vec::new(); g.outs.len()];
-                for t in 0..nr {
+                for (t, hh) in (0..nr).flat_map(|t| (0..reps).map(move |h| (t, h))) {
                     if !g.lane && (g.mask >> class_of(t as u32)) & 1 == 0 {
                         for r in &mut res {
                             r.extend(std::iter::repeat_n(f32::NAN, w));
                         }
                         continue;
                     }
+                    let from_h = |from: u32| from as usize + hh * w;
                     let mut args = Vec::new();
                     for a in &g.args {
                         args.push(match a {
                             RArg::Row { v, from } => {
                                 let vw = l.vals[v].width as usize;
                                 let d = &m[v];
-                                kernels_ir::interp::Arg::Row(
-                                    d[t * vw + *from as usize..t * vw + *from as usize + w]
-                                        .to_vec(),
-                                )
+                                let f = from_h(*from);
+                                kernels_ir::interp::Arg::Row(d[t * vw + f..t * vw + f + w].to_vec())
                             }
                             RArg::Lane { v, from } => {
                                 let d = &m[v];
-                                kernels_ir::interp::Arg::Row(
-                                    d[*from as usize..*from as usize + w].to_vec(),
-                                )
+                                let f = from_h(*from);
+                                kernels_ir::interp::Arg::Row(d[f..f + w].to_vec())
                             }
                             RArg::Static { v, from } => {
                                 let (_, _, d) = get(*v)?;
+                                let f = from_h(*from);
                                 kernels_ir::interp::Arg::Row(
-                                    (0..w).map(|i| d[(*from as usize + i) % d.len()]).collect(),
+                                    (0..w).map(|i| d[(f + i) % d.len()]).collect(),
                                 )
                             }
                             RArg::Each { v, col } => {
@@ -1479,6 +1754,13 @@ pub fn emulate(l: &Lowering, vals: &super::host::Values) -> R<BTreeMap<ValueId, 
                     r16(m[&v][t * vw + from as usize + j])
                 };
                 let ow = l.vals[&sides[0].o].width as usize;
+                // (grouped-query attention: a kv head serves q heads `group` in turn)
+                let kw = l.vals[&sides[0].k.0]
+                    .segs()
+                    .iter()
+                    .find(|x| x.0 == sides[0].k.1)
+                    .map_or(hd, |x| x.1 as usize);
+                let group = (*heads as usize / (kw / hd).max(1)).max(1);
                 let mut out: BTreeMap<ValueId, Vec<f32>> = BTreeMap::new();
                 for s in sides {
                     out.entry(s.o).or_insert_with(|| {
@@ -1494,7 +1776,7 @@ pub fn emulate(l: &Lowering, vals: &super::host::Values) -> R<BTreeMap<ValueId, 
                             let mut a = 0f32;
                             for j in 0..hd {
                                 a += col(s.q.0, s.q.1, t, h * hd + j)
-                                    * col(su.k.0, su.k.1, u, h * hd + j);
+                                    * col(su.k.0, su.k.1, u, h / group * hd + j);
                             }
                             *scu = if *causal && u > t {
                                 f32::NEG_INFINITY
@@ -1509,7 +1791,7 @@ pub fn emulate(l: &Lowering, vals: &super::host::Values) -> R<BTreeMap<ValueId, 
                             let mut a = 0f32;
                             for (u, pu) in p.iter().enumerate() {
                                 let su = side(u);
-                                a += r16(*pu) * col(su.v.0, su.v.1, u, h * hd + j);
+                                a += r16(*pu) * col(su.v.0, su.v.1, u, h / group * hd + j);
                             }
                             let x = a / lsum;
                             out.get_mut(&s.o).ok_or("emulate: an output")?[t * ow + h * hd + j] =
@@ -1582,11 +1864,57 @@ mod tests {
                 rope_lv: 4,
                 rope_bits: 3,
                 straddle: false,
+                columns: None,
             },
         );
         assert!(off.is_err());
         // every PE's memory within its 48 KB, the step priced
         assert!(crate::cost::gemm::memory(&p).total <= crate::cost::gemm::PE_WORDS);
         assert!(crate::cost::gemm::time(&p).cycles > 0.0);
+    }
+
+    /// flux2-mini-gqa's text reading (a Qwen3: 4 q heads over 2 kv heads of 128, NeoX's
+    /// rotation): k and v laid out a copy a q head, the rotated rows' halves gathered into each
+    /// PE's chunk, the norms and rotations head regions over the heads' bands.
+    #[test]
+    fn grouped_query_text_places_with_its_heads_copied_and_halves_gathered() {
+        let o = Options {
+            reading: "text".into(),
+            rows: 16,
+            round16: true,
+            upto: None,
+            taps: Vec::new(),
+        };
+        let t = trace("flux2-mini-gqa-bf16-kv-bf16");
+        let l = lower(&t, &o, &[]).unwrap_or_else(|e| panic!("{e}"));
+        let expanded = l
+            .vals
+            .values()
+            .flat_map(|v| v.maps.values())
+            .filter(|m| m.expand == 2 && m.hd == 128)
+            .count();
+        assert!(expanded > 0, "k and v a copy a q head");
+        let p = place(&l, 16, 16, 16).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!((p.band, p.qchunk), (4, 32));
+        let perm =
+            p.l.vals
+                .values()
+                .flat_map(|v| v.maps.values())
+                .find_map(|m| m.perm.clone())
+                .expect("a rotation's halves gathered");
+        // chunk 0: pairs 0 .. 16, their firsts then their seconds (NeoX: a column's mate 64 on)
+        assert_eq!(
+            &perm[..17],
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 64]
+        );
+        let m = SegMap {
+            expand: 2,
+            hd: 128,
+            perm: Some(perm),
+        };
+        // the layout's column 16 of q head 3's copy: kv head 1's column 64
+        assert_eq!(m.src(3 * 128 + 16), 128 + 64);
+        assert!(p.l.regs.iter().any(|g| g.head));
+        assert!(crate::cost::gemm::memory(&p).total <= crate::cost::gemm::PE_WORDS);
     }
 }

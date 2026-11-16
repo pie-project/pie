@@ -58,6 +58,42 @@ pub struct Place {
     /// A head may be wider than the chunk (cut over whole chunks of consecutive roots): its sums
     /// all-reduced over those roots (`seg.head_reduce`). Otherwise such a head is refused.
     pub straddle: bool,
+    /// The row's columns in the order the roots hold them (`columns[p]` the region's column at
+    /// position `p`; `None`: in order): a rotation's mates gathered into one root's chunk.
+    pub columns: Option<Vec<u32>>,
+}
+
+/// The mates `region`'s static gathers name, each a row over the region's columns (a rotation's
+/// pair mate, a NeoX head's other half).
+#[must_use]
+pub fn mates(region: &Region) -> Vec<Vec<u32>> {
+    let ats: Vec<ValueId> = region
+        .ops
+        .iter()
+        .filter_map(|o| match *o {
+            Op::Peer(_, at) => Some(at),
+            _ => None,
+        })
+        .collect();
+    if ats.is_empty() {
+        return Vec::new();
+    }
+    let mut probe = region.clone();
+    probe.results = ats;
+    probe.rounds.clear();
+    let args: Vec<Arg> = (region.params.iter())
+        .map(|s| match s {
+            Shape::Scalar => Arg::Scalar(0.0),
+            _ => Arg::Row(vec![0.0; region.width as usize]),
+        })
+        .collect();
+    interp::eval(&probe, &args)
+        .map(|rows| {
+            rows.into_iter()
+                .map(|r| r.into_iter().map(|x| x as u32).collect())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// A static table the host writes into each root: `of_chunk[r]` root `r`'s words.
@@ -294,7 +330,38 @@ impl Printer<'_> {
             .collect();
         let rows =
             interp::eval(&probe, &args).map_err(|e| Refused(format!("static values: {e}")))?;
+        // the columns in the roots' order: each row's elements moved, a gather's index its
+        // mate's new place
+        let at_of: Vec<ValueId> = self
+            .region
+            .ops
+            .iter()
+            .filter_map(|o| match *o {
+                Op::Peer(_, at) => Some(at),
+                _ => None,
+            })
+            .collect();
+        let w = self.region.width as usize;
         for (v, row) in wanted.into_iter().zip(rows) {
+            let row = match &self.place.columns {
+                Some(cols) if row.len() == w => {
+                    let mut inv = vec![0u32; w];
+                    for (p, &c) in cols.iter().enumerate() {
+                        inv[c as usize] = p as u32;
+                    }
+                    cols.iter()
+                        .map(|&c| {
+                            let x = row[c as usize];
+                            if at_of.contains(&v) {
+                                inv[(x as usize).min(w - 1)] as f32
+                            } else {
+                                x
+                            }
+                        })
+                        .collect()
+                }
+                _ => row,
+            };
             self.host.insert(v, row);
         }
         Ok(())
@@ -1401,6 +1468,7 @@ mod tests {
                 rope_lv: 4,
                 rope_bits: 3,
                 straddle: false,
+                columns: None,
             };
             let p = print(reg, &place).unwrap_or_else(|e| panic!("node {at} ({name}): {e}"));
             if name == "elemwise.layernorm" {
@@ -1439,6 +1507,7 @@ mod tests {
             rope_lv: 4,
             rope_bits: 3,
             straddle: false,
+            columns: None,
         };
         let p = print(&region, &place).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(p.csl.matches("while (i < C)").count(), 2, "{}", p.csl);

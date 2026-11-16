@@ -174,6 +174,7 @@ fn main() {
                 .unwrap_or(4),
             rope_bits: 3,
             straddle: false,
+            columns: None,
         },
     )
     .unwrap_or_else(|e| panic!("{e}"));

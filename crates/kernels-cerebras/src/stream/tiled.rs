@@ -709,6 +709,7 @@ fn print_regions(p: &mut TileProgram) -> R<()> {
                 rope_lv: 1,
                 rope_bits: 3,
                 straddle: false,
+                columns: None,
             },
         )
         .map_err(|e| format!("{}: region {ri}: {e}", p.trace.name))?;

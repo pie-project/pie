@@ -131,14 +131,14 @@ pub fn time(p: &GemmProgram) -> GemmCost {
             GOp::Region(ri) => {
                 let g = &p.l.regs[*ri];
                 let rows = if g.lane { 1 } else { tb };
-                let ch = g.region.width / c;
+                let ch = g.chunk;
                 let pr = g.printed.as_ref();
                 let f = pr.map_or_else(RegionFeatures::default, |pr| {
                     RegionFeatures::of(&pr.csl, ch)
                 });
                 let heads = pr.map_or(0, |pr| pr.head_reduces);
                 let row = f.cycles(ch) - f.all_reduces * ALL_REDUCE
-                    + f.all_reduces * allred(1, c)
+                    + f.all_reduces * allred(1, if g.head { p.band } else { c })
                     + f64::from(heads) * allred(1, p.band)
                     + f64::from((g.args.len() + g.outs.len()) as u32) * (CALL + f64::from(ch));
                 ("region", f64::from(rows) * row)
@@ -214,7 +214,7 @@ pub fn memory(p: &GemmProgram) -> Memory {
         .map(|(mi, _)| {
             let g = p.l.regs.iter().find(|r| r.module == mi);
             g.map_or(0, |g| {
-                let ch = g.region.width / p.c;
+                let ch = g.chunk;
                 let pr = g.printed.as_ref();
                 let bufs = pr.map_or(0, |pr| pr.csl.matches("]f32 align(16)").count() as u32);
                 let tables: u32 = pr.map_or(0, |pr| {
