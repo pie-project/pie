@@ -1425,6 +1425,13 @@ impl PreparedLoad<'_> {
             },
         };
         shell.settle_ane()?;
+        if let Some(&(tokens, bytes)) = shell.arena.rs_rooms().last() {
+            tracing::info!(
+                tokens,
+                mib = bytes >> 20,
+                "metal: the widest rung's recurrent scratch"
+            );
+        }
         Ok(shell)
     }
 }

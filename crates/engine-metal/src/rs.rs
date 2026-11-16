@@ -30,6 +30,9 @@ pub struct Plane {
 
 #[derive(Clone, Copy, Debug)]
 pub struct Region {
+    /// What the region holds (`conv`, `scan`, `gates`, `ngram`): regions
+    /// of one kind may share a scratch slot.
+    pub kind: &'static str,
     pub width: u32,
     pub dtype: Dtype,
     pub row_bytes: u64,
@@ -39,6 +42,14 @@ pub struct Region {
 pub struct Layout {
     pub planes: Vec<Plane>,
     pub regions: Vec<Region>,
+    /// The scratch slot each plane's extended rows lie in, and each
+    /// region's ([`Layout::share`]): a plane's or region's own place in a
+    /// fire's rs scratch, which planes of one role (regions of one kind)
+    /// whose ops never overlap share, a recurrent layer after another.
+    pub plane_slot: Vec<usize>,
+    pub region_slot: Vec<usize>,
+    /// Each scratch slot's bytes a row: the widest that lies in it.
+    pub slots: Vec<u64>,
     pub in_of: HashMap<u32, usize>,
     pub out_of: HashMap<u32, usize>,
     pub token_bytes: u64,
@@ -179,6 +190,7 @@ impl Layout {
                     Some(&at) => at,
                     None => {
                         layout.regions.push(Region {
+                            kind: what,
                             width,
                             dtype,
                             row_bytes,
@@ -314,7 +326,122 @@ impl Layout {
             return Ok(None);
         }
         layout.token_bytes = layout.planes.iter().map(|plane| plane.row_bytes).sum();
+        layout.share(trace);
         Ok(Some(layout))
+    }
+
+    /// Lays the planes and regions in scratch slots: one of a role (a
+    /// kind) whose live span (from the first node naming one of its values
+    /// to the last that reads one) ends before another's starts shares its
+    /// slot, as one recurrent layer's extended rows are done with before the
+    /// next layer's are made. A fire's recurrent ops run in the forward's
+    /// serial pass, a dispatch after another (`Shell::walk`; the only
+    /// concurrent passes are a guest program's grouped steps, which run no
+    /// recurrent op), so a slot is read and rewritten in node order. The
+    /// scratch then holds the widest layer's planes, not every layer's.
+    fn share(&mut self, trace: &Trace) {
+        use poem_ir::Operands;
+        let mut spans: Vec<Option<(usize, usize)>> =
+            vec![None; self.planes.len() + self.regions.len()];
+        let mut widen = |at: usize, node: usize| {
+            let span = spans[at].get_or_insert((node, node));
+            span.0 = span.0.min(node);
+            span.1 = span.1.max(node);
+        };
+        let mut values = Vec::new();
+        for (node, n) in trace.nodes.iter().enumerate() {
+            values.clear();
+            n.op.inputs(&mut values);
+            n.op.outputs(&mut values);
+            for value in &values {
+                if let Some(&plane) = self.in_of.get(&value.0) {
+                    widen(plane, node);
+                }
+                if let Some(&region) = self.out_of.get(&value.0) {
+                    widen(self.planes.len() + region, node);
+                }
+            }
+        }
+        let members: Vec<(String, u64, Option<(usize, usize)>)> = self
+            .planes
+            .iter()
+            .map(|plane| (format!("plane {:?}", plane.role), plane.row_bytes))
+            .chain(
+                self.regions
+                    .iter()
+                    .map(|region| (format!("region {}", region.kind), region.row_bytes)),
+            )
+            .zip(spans)
+            .map(|((key, row_bytes), span)| (key, row_bytes, span))
+            .collect();
+        let (slot_of, slots) = share_slots(&members);
+        self.plane_slot = slot_of[..self.planes.len()].to_vec();
+        self.region_slot = slot_of[self.planes.len()..].to_vec();
+        self.slots = slots;
+    }
+}
+
+/// The scratch slot of each member (a key, its bytes a row, its live span
+/// over the plan's nodes; none where no node names it), and each slot's
+/// bytes a row: members of one key whose spans don't overlap share a slot,
+/// first-fit in the order their spans start, each slot as wide as its
+/// widest member. A member with no span takes a slot of its own.
+fn share_slots(members: &[(String, u64, Option<(usize, usize)>)]) -> (Vec<usize>, Vec<u64>) {
+    let mut order: Vec<usize> = (0..members.len()).collect();
+    order.sort_by_key(|&at| members[at].2.map_or(0, |span| span.0));
+    // Each slot: its key, its bytes a row, the last node of its latest member.
+    let mut slots: Vec<(&str, u64, usize)> = Vec::new();
+    let mut slot_of = vec![0; members.len()];
+    for at in order {
+        let (key, row_bytes, span) = (&members[at].0, members[at].1, members[at].2);
+        let free = span.and_then(|(start, _)| {
+            slots
+                .iter()
+                .position(|(k, _, last)| *k == key.as_str() && *last < start)
+        });
+        slot_of[at] = match free {
+            Some(slot) => {
+                slots[slot].1 = slots[slot].1.max(row_bytes);
+                slots[slot].2 = span.map_or(usize::MAX, |span| span.1);
+                slot
+            }
+            None => {
+                slots.push((key, row_bytes, span.map_or(usize::MAX, |span| span.1)));
+                slots.len() - 1
+            }
+        };
+    }
+    (slot_of, slots.into_iter().map(|(_, row_bytes, _)| row_bytes).collect())
+}
+
+#[cfg(test)]
+mod share_tests {
+    use super::share_slots;
+
+    fn m(key: &str, row_bytes: u64, span: (usize, usize)) -> (String, u64, Option<(usize, usize)>) {
+        (key.to_string(), row_bytes, Some(span))
+    }
+
+    /// Two members of one key whose spans overlap take two slots; one
+    /// whose span starts after another's ends shares its slot, sized by the
+    /// wider; one overlapping both takes its own; another key never shares.
+    #[test]
+    fn a_slot_is_shared_only_by_members_whose_spans_never_overlap() {
+        let members = vec![
+            m("plane ConvX", 100, (0, 5)),
+            m("plane ConvX", 300, (3, 8)),
+            m("plane ConvX", 200, (6, 9)),
+            m("plane ConvX", 50, (2, 10)),
+            m("region conv", 400, (6, 9)),
+        ];
+        let (slot_of, slots) = share_slots(&members);
+        assert_ne!(slot_of[0], slot_of[1], "overlapping spans 0..5 and 3..8 share no slot");
+        assert_eq!(slot_of[0], slot_of[2], "0..5 is done before 6..9 starts: one slot");
+        assert_eq!(slots[slot_of[0]], 200, "the shared slot is as wide as its widest member");
+        assert_ne!(slot_of[3], slot_of[0], "2..10 overlaps 0..5 and 6..9");
+        assert_ne!(slot_of[3], slot_of[1], "and 3..8");
+        assert_ne!(slot_of[4], slot_of[2], "a region shares no plane's slot, overlap or not");
+        assert_eq!(slots.len(), 4);
     }
 }
 
@@ -487,11 +614,8 @@ impl Seat {
     pub fn scratch_bytes(layout: &Layout, rows_ext: u32, lanes: u32) -> u64 {
         let rows = u64::from(rows_ext.max(1));
         let mut at = 0u64;
-        for plane in &layout.planes {
-            at += (rows * plane.row_bytes).max(4).next_multiple_of(256);
-        }
-        for region in &layout.regions {
-            at += (rows * region.row_bytes).max(4).next_multiple_of(256);
+        for &slot in &layout.slots {
+            at += (rows * slot).max(4).next_multiple_of(256);
         }
         at += (u64::from(lanes.max(1)) * layout.work_elems * 4)
             .max(4)
@@ -522,25 +646,34 @@ impl Seat {
             });
         }
         let rows = u64::from(rows_ext.max(1));
+        // Each scratch slot's place; a plane or region binds its own rows
+        // at its slot's.
         let mut at = 0u64;
-        let mut take = |row_bytes: u64, width: u32, dtype: Dtype| -> Result<Tensor> {
+        let slot_at: Vec<u64> = layout
+            .slots
+            .iter()
+            .map(|&slot| {
+                let here = at;
+                at += (rows * slot).max(4).next_multiple_of(256);
+                here
+            })
+            .collect();
+        let take = |slot: usize, row_bytes: u64, width: u32, dtype: Dtype| -> Result<Tensor> {
             let bytes = rows * row_bytes;
-            let here = at;
-            at += bytes.next_multiple_of(256);
             Ok(Tensor::new(
-                handles.bind(scratch, base + here, bytes.max(4))?,
+                handles.bind(scratch, base + slot_at[slot], bytes.max(4))?,
                 rows_ext.max(1),
                 width,
                 dtype,
             ))
         };
         let mut ext_in = Vec::with_capacity(layout.planes.len());
-        for plane in &layout.planes {
-            ext_in.push(take(plane.row_bytes, plane.width, plane.dtype)?);
+        for (plane, &slot) in layout.planes.iter().zip(&layout.plane_slot) {
+            ext_in.push(take(slot, plane.row_bytes, plane.width, plane.dtype)?);
         }
         let mut ext_out = Vec::with_capacity(layout.regions.len());
-        for region in &layout.regions {
-            ext_out.push(take(region.row_bytes, region.width, region.dtype)?);
+        for (region, &slot) in layout.regions.iter().zip(&layout.region_slot) {
+            ext_out.push(take(slot, region.row_bytes, region.width, region.dtype)?);
         }
         let work_bytes = u64::from(lane_count.max(1)) * layout.work_elems * 4;
         let work = Tensor::new(
