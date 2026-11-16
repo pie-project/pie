@@ -267,29 +267,6 @@ mod tests {
         the_summary_stops_at_the_blank_doc_line();
         a_derived_field_has_no_default_to_print();
         a_free_form_table_is_a_leaf_not_the_options_struct();
-        no_listed_key_is_retired();
-    }
-
-    /// No key `pie config list` offers is one the retired table refuses on
-    /// that engine.
-    fn no_listed_key_is_retired() {
-        for engine in [
-            EngineKind::Cuda,
-            EngineKind::Metal,
-            EngineKind::Vulkan,
-            EngineKind::Wgpu,
-            EngineKind::Xla,
-            EngineKind::Cerebras,
-        ] {
-            for field in fields(engine) {
-                assert!(
-                    crate::config::retired::refusal_for(&field.key, Some(engine)).is_none(),
-                    "{} lists the retired key {}",
-                    engine.as_str(),
-                    field.key
-                );
-            }
-        }
     }
 
     fn a_free_form_table_is_a_leaf_not_the_options_struct() {

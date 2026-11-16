@@ -7,9 +7,6 @@ use serde::{Deserialize, Serialize};
 
 /// Backend-specific option structs (typed views over `EngineConfig::options`).
 pub mod backend;
-/// Keys that are retired: each refuses a file that still states it, saying
-/// what became of it.
-pub mod retired;
 /// The dotted-path schema `pie config set`/`get` walk.
 pub mod schema;
 
@@ -54,25 +51,7 @@ impl Config {
     ///
     /// Pure: no file IO, no env, no clap.
     pub fn parse(s: &str) -> Result<Self> {
-        let cfg: Config = toml::from_str(s).map_err(|e| {
-            if let Some(refusal) = retired::explain(e.message(), None) {
-                let line = e
-                    .span()
-                    .map(|span| s[..span.start].matches('\n').count() + 1);
-                match line {
-                    Some(line) => anyhow::anyhow!("parse config: line {line}: {refusal}"),
-                    None => anyhow::anyhow!("parse config: {refusal}"),
-                }
-            } else if s.contains("[[model]]") {
-                anyhow::anyhow!(
-                    "parse config: {e}\n\
-                     hint: pie serves exactly one model — use a single `[model]` table, \
-                     not a `[[model]]` list."
-                )
-            } else {
-                anyhow::anyhow!("parse config: {e}")
-            }
-        })?;
+        let cfg: Config = toml::from_str(s).map_err(|e| anyhow::anyhow!("parse config: {e}"))?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -428,7 +407,6 @@ fn default_network_allowed_hosts() -> Vec<String> {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RopeScalingConfig {
-    #[serde(alias = "type")]
     pub rope_type: String,
     pub factor: f64,
     #[serde(default)]
@@ -973,8 +951,7 @@ impl MemoryConfig {
 }
 
 impl EngineConfig {
-    /// The named engine's own keys as its options struct. A retired key is
-    /// refused with what became of it.
+    /// The named engine's own keys as its options struct.
     ///
     /// # Errors
     ///
@@ -983,10 +960,8 @@ impl EngineConfig {
         toml::Value::Table(self.options.clone())
             .try_into()
             .map_err(|e: toml::de::Error| {
-                let why = retired::explain(e.message(), Some(self.kind))
-                    .unwrap_or_else(|| e.to_string());
                 anyhow::anyhow!(
-                    "invalid [engine] options for engine type {:?}: {why}",
+                    "invalid [engine] options for engine type {:?}: {e}",
                     self.kind,
                 )
             })
@@ -1138,93 +1113,7 @@ device = ["metal:0"]
         an_adapter_past_its_seats_or_on_a_relative_path_is_refused_by_name();
         an_empty_memory_table_is_the_dedicated_machine();
         the_memory_keys_are_seven_and_prefixed();
-        a_retired_key_is_refused_with_its_fate();
         the_dispatch_depth_is_bounded_by_the_engine_kind();
-    }
-
-    /// Every retired key, stated where main read it, is refused with what
-    /// became of it, on the line that states it; a typo is still only
-    /// unknown, and the keys that replaced them load.
-    fn a_retired_key_is_refused_with_its_fate() {
-        const ENGINE_KEYS: &[&str] = &[
-            "max_model_len",
-            "max_forward_tokens",
-            "max_forward_requests",
-            "max_state_slots",
-            "kv_page_size",
-            "device_memory",
-            "pipeline_cache",
-        ];
-        for r in retired::RETIRED {
-            let kind = r.engine.unwrap_or(EngineKind::Metal).as_str();
-            let line = format!("{} = 1", r.key);
-            let (model, engine) = if ENGINE_KEYS.contains(&r.key) {
-                ("", line.as_str())
-            } else {
-                (line.as_str(), "")
-            };
-            let toml = format!(
-                "[model]\nname = \"default\"\nsource = \"Qwen/Qwen3-0.6B\"\n{model}\n\
-                 [engine]\ntype = \"{kind}\"\ndevice = [\"{kind}:0\"]\n{engine}\n"
-            );
-            let err = Config::parse(&toml).unwrap_err().to_string();
-            let refusal = retired::refusal_for(r.key, r.engine).unwrap();
-            assert!(err.contains(&refusal), "{}: {err}", r.key);
-            assert!(!err.contains("unknown field"), "{}: {err}", r.key);
-            if !model.is_empty() {
-                assert!(err.contains("line 4: "), "{}: {err}", r.key);
-            }
-        }
-        let err = Config::parse(&MINIMAL_METAL.replace(
-            "device = [\"metal:0\"]",
-            "device = [\"metal:0\"]\nmax_model_len = 8192",
-        ))
-        .unwrap_err()
-        .to_string();
-        assert!(
-            err.contains("`max_model_len` was renamed to `max_context` in `[engine]`"),
-            "{err}"
-        );
-        let err = Config::parse(&MINIMAL_METAL.replace(
-            "device = [\"metal:0\"]",
-            "device = [\"metal:0\"]\nmax_forward_requests = 64",
-        ))
-        .unwrap_err()
-        .to_string();
-        assert!(
-            err.contains("`max_forward_requests` is no longer a setting: "),
-            "{err}"
-        );
-
-        // The negative control: a key that was never a setting is only
-        // unknown, and names no fate.
-        for (at, typo) in [
-            ("source = \"Qwen/Qwen3-0.6B\"", "max_contxt = 8192"),
-            ("device = [\"metal:0\"]", "max_contxt = 8192"),
-        ] {
-            let err = Config::parse(&MINIMAL_METAL.replace(at, &format!("{at}\n{typo}")))
-                .unwrap_err()
-                .to_string();
-            assert!(
-                err.contains("unknown field `max_contxt`") && !err.contains("renamed"),
-                "{err}"
-            );
-        }
-
-        // What replaced them loads, and the vulkan engine keeps the
-        // `pipeline_cache` the wgpu engine retired.
-        let current = MINIMAL_METAL.replace(
-            "device = [\"metal:0\"]",
-            "device = [\"metal:0\"]\nmax_context = 8192",
-        ) + "\n[engine.memory]\nbudget_host = \"8GiB\"\nbudget_disk = \"20GiB\"\n\
-              disk_path = \"/nvme\"\ndisk_persistent = false\n";
-        let cfg = Config::parse(&current).expect("the current keys load");
-        assert_eq!(cfg.engine.max_context, Some(8192));
-        assert_eq!(cfg.engine.memory.budget_host, Some(ByteSize::from_mib(8 * 1024)));
-        let vulkan = "[model]\nname = \"default\"\nsource = \"Qwen/Qwen3-0.6B\"\n\
-                      [engine]\ntype = \"vulkan\"\ndevice = [\"vulkan:0\"]\n\
-                      pipeline_cache = \"/tmp/p.bin\"\n";
-        Config::parse(vulkan).expect("vulkan reads pipeline_cache");
     }
 
     fn an_empty_memory_table_is_the_dedicated_machine() {
