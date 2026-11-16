@@ -1589,6 +1589,100 @@ mod tests {
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
+    /// The beam step's loop-carried mask, as the engine's `AttnMask` port
+    /// reads it (`ports::resolve`: the cell at the channel's head): the
+    /// epilogue takes and puts it every fire, each step's admitting the
+    /// slot it wrote, so after a fire the head cell is no longer the seed.
+    /// Served, it read the seed every step, and the recurrence replayed one
+    /// row and the attention saw the prompt alone.
+    #[test]
+    fn the_beam_masks_head_cell_is_what_its_epilogue_put() {
+        use eta_compiler::codegen::program::{Backend, emit_program};
+        use eta_compiler::contract::{beam_stage, wire};
+        use eta_compiler::plan::compile_bound;
+        let Ok(context) = Context::bind() else {
+            return;
+        };
+        let mut wrong = Vec::new();
+        for case in beam_stage() {
+            let channels = &case.bound.container.channels;
+            let Some(mask) = channels.iter().position(|decl| {
+                matches!(decl.dtype, eta_ir::container::ChanDType::Concrete(eta_ir::types::Dtype::Bool))
+            }) else {
+                wrong.push(format!("{}: no bool channel to read", case.name));
+                continue;
+            };
+            let seed = case
+                .seeds
+                .iter()
+                .find(|(at, _)| *at as usize == mask)
+                .map(|(_, value)| wire(value))
+                .expect("the mask is seeded");
+            let stages = compile_bound(&case.bound);
+            let backend = Backend::parse("metal").expect("the metal codegen");
+            let registration = ProgramRegistration {
+                program_hash: 0xbea3_0000 ^ u64::from(case.rows),
+                emitted_kernels: emit_program(backend, &stages, &case.bound),
+                emitter_version: backend.emitter_version(),
+                launch: eta_compiler::codegen::launch::build(&case.bound, &stages),
+                ..Default::default()
+            };
+            let pools = crate::store::Pools::guests_only(&context, CHUNK, 4).expect("a pool");
+            let mut plane = Plane::new();
+            plane.set_flight(1, 1, case.rows);
+            let program = plane.register(&context, &registration).expect("registers");
+            let facts = plane.facts(program, &pools).expect("facts");
+            let ids: Vec<ChannelId> = (1..=channels.len() as u64).map(ChannelId).collect();
+            let (instance, rings) = slots_for(&pools, &facts, 0);
+            let id = plane
+                .bind(
+                    &context,
+                    program,
+                    &case.wire_seeds(),
+                    Extents {
+                        row_count: case.rows,
+                        sampled_rows: case.rows,
+                        query_len: case.rows,
+                        ..Extents::default()
+                    },
+                    GeometryClass::Host,
+                    PortMask::NONE,
+                    &ids,
+                    session::Pooled {
+                        pools: &pools,
+                        instance: &instance,
+                        rings: &rings,
+                    },
+                )
+                .expect("binds");
+            let before = plane.instance(id).expect("bound").head_cell(mask as u32).expect("reads");
+            assert_eq!(before, seed, "{}: the head cell holds the seed at bind", case.name);
+            let mut logits = crate::device::Buffer::zeroed(&context, case.logits.len() as u64 * 2)
+                .expect("a logits plane");
+            let bytes: Vec<u8> = case
+                .logits
+                .iter()
+                .flat_map(|x| ((x.to_bits() >> 16) as u16).to_le_bytes())
+                .collect();
+            logits.write(0, &bytes).expect("upload");
+            plane
+                .bind_output(id, "logits", 0, &logits, 0, eta_ir::Dtype::Bf16, case.vocab, case.vocab)
+                .expect("the logits bind");
+            let carve = guests(&context);
+            for step in 0..3 {
+                plane.fire(&context, id, Attach::Epilogue, &carve).expect("fires");
+                for &reader in &case.readers {
+                    let _ = plane.instance_mut(id).expect("bound").take(reader);
+                }
+                let now = plane.instance(id).expect("bound").head_cell(mask as u32).expect("reads");
+                if now == seed {
+                    wrong.push(format!("{} step {step}: the mask's head cell is still the seed", case.name));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
     fn slots_for(
         pools: &crate::store::Pools,
         facts: &engine::ProgramFacts,

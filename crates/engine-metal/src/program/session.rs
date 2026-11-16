@@ -304,6 +304,14 @@ impl Session {
         cursors
     }
 
+    /// The cell at channel `channel`'s head, as the engine's port reads see
+    /// it (`ports::resolve`): for a test of the port's view.
+    #[cfg(test)]
+    pub fn head_cell(&self, channel: u32) -> Result<Vec<u8>> {
+        let head = self.cursors_now()[channel as usize].head;
+        self.rings.read_cell(channel as usize, head)
+    }
+
     #[must_use]
     pub const fn fires(&self) -> u64 {
         self.fires
