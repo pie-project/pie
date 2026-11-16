@@ -2480,6 +2480,30 @@ impl Shell {
         self.programs.register(&self.device, registration)
     }
 
+    /// The runtime's prewarm: each of `registrations` (its standard
+    /// samplers) compiled into the program cache before ready, so a request
+    /// that registers one builds nothing.
+    pub fn prewarm_programs(
+        &mut self,
+        registrations: &[engine::program::ProgramRegistration],
+    ) -> Result<()> {
+        let started = std::time::Instant::now();
+        let compiled = self.programs.prewarm(&self.device, registrations)?;
+        eprintln!(
+            "engine-metal: guest regions prewarmed for {} standard program(s): {} compiled, in {} ms",
+            registrations.len(),
+            compiled,
+            started.elapsed().as_millis()
+        );
+        Ok(())
+    }
+
+    /// The guest region modules the program cache has compiled.
+    #[must_use]
+    pub fn program_compilations(&self) -> u64 {
+        self.programs.stats().compilations
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn bind_program(
         &mut self,
