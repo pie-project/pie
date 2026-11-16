@@ -21,6 +21,105 @@ pub struct Outcome {
     pub seconds: f64,
 }
 
+/// What `pie tune cuda --rates` produced.
+pub struct Rated {
+    pub device: String,
+    /// The complete profile, its `[rates]` the ones measured.
+    pub file: String,
+    /// The `[rates]` block and its `[provenance]` line alone.
+    pub block: String,
+    pub seconds: f64,
+}
+
+/// `pie tune cuda --rates`: GPU 0's rates measured at `engine::rates`'
+/// lattice ([`crate::rates::measure`]), its GEMMs under the tactics serving
+/// keeps in the engine cache beside `profiles` (`$PIE_HOME/cache`), laid
+/// over the profile it runs.
+pub fn rates(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Rated, String> {
+    let began = Instant::now();
+    let (name, facts) = crate::chip::probe(0).ok_or("no CUDA device answers")?;
+    let (base, report) = crate::chip::resolve(&name, &facts, profiles);
+    say(&format!("{name}: starting from {}", report.used));
+    let cache = profiles
+        .and_then(Path::parent)
+        .map(|home| home.join("cache"));
+    let r = crate::rates::measure(0, &base, cache.as_deref())?;
+    let curve = r.bf16_flops_per_ns_by_rows.clone().unwrap_or_default();
+    let at = |rows: u32| curve.iter().find(|p| p.0 == rows).map_or(0.0, |p| p.1);
+    say(&format!(
+        "[rates]: bf16 {:.1} TFLOP/s at 16 rows to {:.1} at 8192, attention {:.1} TFLOP/s, \
+         scan {:.0} G elements/s, {:.0} GB/s, launch {} ns",
+        at(16) / 1e3,
+        at(8192) / 1e3,
+        r.attn_flops_per_ns.unwrap_or(0.0) / 1e3,
+        r.scan_elements_per_ns.unwrap_or(0.0),
+        r.bytes_per_ns.unwrap_or(0.0),
+        r.launch_ns.unwrap_or(0),
+    ));
+    let tenth = |v: f64| (v * 10.0).round() / 10.0;
+    let r = profile::fire::Rates {
+        bf16_flops_per_ns_by_rows: Some(curve.iter().map(|&(m, v)| (m, tenth(v))).collect()),
+        attn_flops_per_ns: r.attn_flops_per_ns.map(tenth),
+        scan_elements_per_ns: r.scan_elements_per_ns.map(tenth),
+        bytes_per_ns: r.bytes_per_ns.map(tenth),
+        ..r
+    };
+    let tuned = engine::rates::tuned(&r);
+    let how = format!(
+        "{name}; the matmul through {} under serving's GEMM tactics, each rate a 20 ms burst on \
+         the stream timed by events, the median of 5 (the launch of 15); at {}",
+        if cfg!(feature = "rocm") {
+            "hipBLASLt"
+        } else {
+            "cuBLASLt"
+        },
+        sitting()
+    );
+    let provenance = engine::rates::provenance("cuda", &how);
+    let file = search::assemble(
+        crate::chip::registry(),
+        &base,
+        &name,
+        &facts,
+        &tuned,
+        std::slice::from_ref(&provenance),
+        &[crate::chip::ARCH],
+    )?;
+    let block = format!(
+        "{tuned}\n[provenance]\n{} = {}\n",
+        provenance.0, provenance.1
+    );
+    Ok(Rated {
+        device: name,
+        file,
+        block,
+        seconds: began.elapsed().as_secs_f64(),
+    })
+}
+
+/// The commit of the tree this pie was built from: the build's `PIE_COMMIT`
+/// where it embedded one, else the source tree's `HEAD`, else `unknown`.
+fn sitting() -> String {
+    if let Some(commit) = option_env!("PIE_COMMIT") {
+        return commit.to_string();
+    }
+    std::process::Command::new("git")
+        .args([
+            "-C",
+            env!("CARGO_MANIFEST_DIR"),
+            "rev-parse",
+            "--short",
+            "HEAD",
+        ])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map_or_else(|| "commit unknown".to_string(), |s| format!("commit {s}"))
+}
+
 /// Serve `artifact` under `chip`: a prompt, then steps at each lane count.
 fn serve(artifact: &Path, deployment: &str, chip: Profile) -> Result<Serving, String> {
     use poem::{Platform, Request};

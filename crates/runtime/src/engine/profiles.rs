@@ -62,6 +62,9 @@ pub struct Tuned {
     /// Whether the tuned file differs from today's at all.
     pub changed: bool,
     pub seconds: f64,
+    /// The `[rates]` block and its provenance line, where the run measured
+    /// them: what `--rates --dry-run` prints.
+    pub rates: Option<String>,
 }
 
 /// The check models among the artifacts stamped for `backend`: those
@@ -157,6 +160,7 @@ macro_rules! tuned {
                 .collect(),
             changed: $out.changed,
             seconds: $out.seconds,
+            rates: None,
         }
     };
 }
@@ -204,9 +208,7 @@ tune_grid!(tune_metal, engine_metal, "metal");
 #[cfg(feature = "wgpu")]
 fn tune_wgpu(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String> {
     if !req.rates || req.check_estimate {
-        return Err(
-            "`pie tune wgpu` measures the device's rates alone: pass --rates".to_string(),
-        );
+        return Err("`pie tune wgpu` measures the device's rates alone: pass --rates".to_string());
     }
     let out = engine_wgpu::tune::rates(Some(req.profiles), say)?;
     Ok(Tuned {
@@ -217,11 +219,25 @@ fn tune_wgpu(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, 
         checks: Vec::new(),
         changed: true,
         seconds: out.seconds,
+        rates: None,
     })
 }
 
 #[cfg(feature = "engine-cuda")]
 fn tune_cuda(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String> {
+    if req.rates {
+        let out = engine_cuda::tune::rates(Some(req.profiles), say)?;
+        return Ok(Tuned {
+            device: out.device,
+            file: out.file,
+            lines: Vec::new(),
+            wrong: Vec::new(),
+            checks: Vec::new(),
+            changed: true,
+            seconds: out.seconds,
+            rates: Some(out.block),
+        });
+    }
     let models = pick_models("cuda", req)?;
     let out = engine_cuda::tune::run(Some(req.profiles), &models, req.check_estimate, say)?;
     Ok(tuned!(out, wrong: Vec::new()))
