@@ -240,14 +240,24 @@ pub fn run(
         }
     }
     let _ = std::fs::remove_dir_all(&shelf);
-    // Every decision the search served is measured on this device: its
-    // provenance names it, kept with what the base already measured.
+    // A searched decision is measured on this device where the search
+    // decided it: a winner that beat the noise, or today's value kept under
+    // a noise bar within AGREEMENT. One kept under a wider bar, or that no
+    // candidate or model served, was not decided: its line (with its bar)
+    // stays in `decisions`, but not in `measured`, so the load keeps naming
+    // it (`chip::unmeasured`). The base's measured decisions the search did
+    // not touch stay measured.
+    let searched: Vec<&Line> = lines
+        .iter()
+        .filter(|l| !l.text.starts_with("not searched"))
+        .collect();
     let mut measured: Vec<String> = report
         .measured
         .iter()
+        .filter(|id| !searched.iter().any(|l| l.id == **id))
         .map(|id| format!("\"{id}\""))
         .collect();
-    for l in lines.iter().filter(|l| !l.text.starts_with("not searched")) {
+    for l in searched.iter().filter(|l| decided(&l.text)) {
         let id = format!("\"{}\"", l.id);
         if !measured.contains(&id) {
             measured.push(id);
@@ -307,4 +317,39 @@ pub fn run(
         changed: !unchanged,
         seconds,
     })
+}
+
+/// Whether a search line decided its decision: a winner beat the noise
+/// ("…% faster end to end"), or today's value was kept under a noise bar
+/// within `engine::rates::AGREEMENT` ("a change must beat X%"). A decision kept
+/// under a wider bar, or that nothing served, was not decided.
+fn decided(text: &str) -> bool {
+    if text.contains("faster end to end") {
+        return true;
+    }
+    let Some(at) = text.find("a change must beat ") else {
+        return false;
+    };
+    let rest = &text[at + "a change must beat ".len()..];
+    let bar: Option<f64> = rest.split('%').next().and_then(|n| n.trim().parse().ok());
+    bar.is_some_and(|bar| bar <= engine::rates::AGREEMENT * 100.0)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_line_is_measured_only_where_the_search_decided_it() {
+        use super::decided;
+        assert!(decided("64: 2.8% faster end to end"));
+        assert!(decided(
+            "kept; the best other, 64, was -4.1% (a change must beat 4.1%)"
+        ));
+        assert!(!decided(
+            "kept; the best other, 128, was -13.6% (a change must beat 27.1%)"
+        ));
+        assert!(!decided(
+            "kept; no other candidate served (64 costs a model)"
+        ));
+        assert!(!decided("kept; no check model reads it"));
+    }
 }
