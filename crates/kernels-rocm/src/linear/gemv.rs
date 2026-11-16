@@ -155,6 +155,18 @@ pub struct SkinnyPlan {
     pub ks: u32,
 }
 
+/// The registers a lane of the diagonal skinny kernel holds its sums and
+/// reads in: of the 128 a lane of a 1024-thread block has, the rest for its
+/// row pointers and indices. Past them the kernel spills into scratch.
+const SKINNY_REGISTERS: u32 = 112;
+
+/// The registers a lane holds for `m` activation rows, `wr` weight rows and
+/// `unrl` reads of each in flight: a 4-float sum per row pair, a 16-byte
+/// read per row and round.
+const fn skinny_registers(m: u32, wr: u32, unrl: u32) -> u32 {
+    4 * (m * wr + (wr + m) * unrl)
+}
+
 /// The LDS the skinny kernel stages its activation rows in.
 pub(crate) const SKINNY_LDS: u32 = 64 << 10;
 
@@ -257,6 +269,19 @@ pub(crate) fn skinny_plan(
         (yt, unrl)
     };
     let (yt, unrl) = if swiglu && m > 4 { (1, 1) } else { (yt, unrl) };
+    // Within the registers a lane of a 1024-thread block has: fewer reads in
+    // flight first, then fewer rows a wavefront (neither moves the order a
+    // lane sums its packs in).
+    let (mut yt, mut unrl) = (yt, unrl);
+    while skinny_registers(m, if swiglu { 2 * yt } else { yt }, unrl) > SKINNY_REGISTERS {
+        if unrl > 1 {
+            unrl -= 1;
+        } else if yt > 1 {
+            yt /= 2;
+        } else {
+            break;
+        }
+    }
     let rounds = |waves: u32| n.div_ceil(cus * waves * yt);
     let target = rounds(SKINNY_WAVES);
     let waves = (1..=SKINNY_WAVES)
