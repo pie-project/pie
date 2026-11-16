@@ -1196,6 +1196,7 @@ impl Shell {
                     base,
                     folded,
                     fold,
+                    lineage,
                 } => {
                     rs_pages.extend_from_slice(pages);
                     // A device-counted fold not yet settled left the state
@@ -1225,7 +1226,7 @@ impl Shell {
                             ),
                         ));
                     }
-                    let reads = engine::fire::buffered_reads(masking, *folded, first, row.rows)
+                    let reads = engine::fire::buffered_reads(masking, *folded, first, *lineage)
                         .map_err(|error| {
                             Fault::program("serve::rs", format!("lane {}: {error}", row.source))
                         })?;

@@ -68,6 +68,7 @@ impl LaneFold {
             base,
             folded,
             fold,
+            lineage,
         } = verb
         else {
             return Ok(LaneFold {
@@ -82,6 +83,7 @@ impl LaneFold {
                 base: *base,
                 folded: from,
                 fold: *fold,
+                lineage: *lineage,
             },
             rows,
             first,
@@ -229,6 +231,7 @@ mod tests {
             base: 0,
             folded,
             fold,
+            lineage: engine::fire::Lineage::Set,
         }
     }
 
