@@ -526,11 +526,12 @@ fn check_estimate(
             };
             let before = shell.recordings();
             let began = Instant::now();
-            let landed = shell
-                .fire_landed(std::slice::from_ref(&lane))
+            // Timed to the device's finish (the fire's fence); its rows read
+            // back after, outside the time.
+            let (landed, _) = shell
+                .fire_waited(std::slice::from_ref(&lane))
                 .map_err(|e| e.to_string())?;
             let ns = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
-            // The rows read back outside the timed fire.
             shell.rows_of(&landed).map_err(|e| e.to_string())?;
             if timed && replayed(shell.recordings()) <= replayed(before) {
                 return Err(walked(width, shell.recordings()));
@@ -546,12 +547,22 @@ fn check_estimate(
         ));
         let (slots, context) = sized(true);
         let mut shell = load(slots.max(max_lanes), context)?;
-        let ones: Vec<[u32; 1]> = (0..max_lanes).map(|i| [token(i)]).collect();
-        let word = trace.facts.word(&Request::new(1, false));
+        // Each lane's tokens: as many as the check fire lays on a lane.
+        let most = decode
+            .iter()
+            .filter_map(|&w| fire_of(w).map(|f| f.tokens_per_lane))
+            .max()
+            .unwrap_or(1);
+        let ones: Vec<Vec<u32>> = (0..max_lanes)
+            .map(|i| (0..most).map(|t| token(i * most + t)).collect())
+            .collect();
         measured.extend(search::time_fires(
             &decode,
             |width, timed| {
-                let lanes_n = fire_of(width).map_or(width, |f| f.lanes);
+                let fire = fire_of(width);
+                let lanes_n = fire.map_or(width, |f| f.lanes);
+                let per = fire.map_or(1, |f| f.tokens_per_lane) as usize;
+                let word = trace.facts.word(&Request::new(per as u32, false));
                 for slot in 0..lanes_n {
                     shell.open(slot).map_err(|e| e.to_string())?;
                 }
@@ -559,14 +570,15 @@ fn check_estimate(
                     .map(|slot| engine_gpu::serve::Lane {
                         slot,
                         word,
-                        tokens: &ones[slot as usize],
+                        tokens: &ones[slot as usize][..per],
                     })
                     .collect();
                 let before = shell.recordings();
                 let began = Instant::now();
-                let landed = shell.fire_landed(&lanes).map_err(|e| e.to_string())?;
+                // Timed to the device's finish; every lane's row read back
+                // after, outside the time.
+                let (landed, _) = shell.fire_waited(&lanes).map_err(|e| e.to_string())?;
                 let ns = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                // Every lane's row read back outside the timed fire.
                 shell.rows_of(&landed).map_err(|e| e.to_string())?;
                 if timed && replayed(shell.recordings()) <= replayed(before) {
                     return Err(walked(width, shell.recordings()));

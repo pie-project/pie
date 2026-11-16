@@ -37,13 +37,18 @@ pub struct RungFacts {
     pub padded_rows: u32,
     pub span_bytes: u64,
     pub infeasible: Option<&'static str>,
+    /// The most lanes one fire carries: the engine's own cap (a wider wave
+    /// the runtime fires as fires of this many), stated by each engine.
+    pub fire_lanes: u32,
 }
 
 /// The fire a rung is weighed as, and the one a check of the estimate fires
 /// for it: `lanes` lanes of `tokens_per_lane` new tokens each (`rows` in
 /// all), each row attending `keys_per_lane` keys, `sampled` rows read out.
-/// Decode-shaped (a rung no wider than its lanes): a lane a token, each on
-/// a fresh slot, attending its one key, every row read out.
+/// Decode-shaped (a rung no wider than its lanes, nor than the lanes one
+/// fire carries, `RungFacts::fire_lanes`): a lane a token, each on a fresh
+/// slot, attending its one key, every row read out. A wider decode wave is
+/// fires of the narrower rungs, so a rung past either is prefill-shaped.
 /// Prefill-shaped: one prompt of the rung's tokens on a fresh slot,
 /// attending the rung's keys, its last row read out. The estimate's terms
 /// are computed from it and every backend's check builds its fire from it,
@@ -89,10 +94,10 @@ impl RungFacts {
     }
 
     /// Whether the estimate weighs this rung decode-shaped: no wider than
-    /// its lanes.
+    /// its lanes, nor than the lanes one fire carries.
     #[must_use]
     pub fn decode_shaped(&self) -> bool {
-        self.tokens <= self.lanes
+        self.tokens <= self.lanes.min(self.fire_lanes)
     }
 }
 
@@ -658,6 +663,7 @@ mod tests {
             padded_rows: tokens,
             span_bytes: span_mib * MIB,
             infeasible: None,
+            fire_lanes: 4096,
         }
     }
 
@@ -882,6 +888,7 @@ mod tests {
             padded_rows: 32,
             span_bytes: 0,
             infeasible: None,
+            fire_lanes: 4096,
         };
         (e, r)
     }
@@ -910,6 +917,46 @@ mod tests {
                 tokens_per_lane: 8,
                 keys_per_lane: 16,
                 sampled: 1
+            }
+        );
+    }
+
+    #[test]
+    fn a_rung_past_the_lanes_one_fire_carries_is_a_prompt() {
+        let (_, r) = documented();
+        // 512 rows, but one fire carries 256 lanes: a 512-lane decode is two
+        // fires of the 256 rung, so this rung is one prompt of 512.
+        let wide = RungFacts {
+            tokens: 512,
+            lanes: 512,
+            keys: 512,
+            fire_lanes: 256,
+            ..r
+        };
+        assert_eq!(
+            wide.check_fire(),
+            CheckFire {
+                rows: 512,
+                lanes: 1,
+                tokens_per_lane: 512,
+                keys_per_lane: 512,
+                sampled: 1
+            }
+        );
+        // 256 rows: 256 lanes of a token each.
+        let at = RungFacts {
+            tokens: 256,
+            lanes: 256,
+            ..wide
+        };
+        assert_eq!(
+            at.check_fire(),
+            CheckFire {
+                rows: 256,
+                lanes: 256,
+                tokens_per_lane: 1,
+                keys_per_lane: 1,
+                sampled: 256
             }
         );
     }

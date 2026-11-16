@@ -352,13 +352,20 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         };
         #[cfg(feature = "rocm")]
         let computed = |rows| rows;
-        // A rung's lanes are those one fire carries (`Shell::fire_lanes`):
-        // the runtime fires a wider wave as fires of this many.
+        // The lanes one fire carries (`Shell::fire_lanes`): the runtime
+        // fires a wider wave as fires of this many, and a rung's check fire
+        // (`RungFacts::check_fire`) lays its rows over them.
         let fire_lanes = match engine.fire_lanes {
             0 => boot.budget.max_lanes,
             cap => boot.budget.max_lanes.min(cap),
         };
-        let rungs = crate::top::rung_facts(&candidates, fire_lanes, after_weights, computed);
+        let rungs = crate::top::rung_facts(
+            &candidates,
+            boot.budget.max_lanes,
+            fire_lanes,
+            after_weights,
+            computed,
+        );
         let counts = crate::top::counts(&boot.trace)?;
         let top = crate::top::choose(&rungs, after_weights, &chip.rates(), device.name(), &counts)?;
         eprintln!(

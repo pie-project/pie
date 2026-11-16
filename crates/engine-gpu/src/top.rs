@@ -54,6 +54,8 @@ pub fn rung_facts(
             padded_rows: padded(tokens),
             span_bytes,
             infeasible: (span_bytes > binding).then_some(PAST_ONE_BINDING),
+            // One fire carries every lane the budget seats.
+            fire_lanes: max_lanes,
         })
         .collect()
 }

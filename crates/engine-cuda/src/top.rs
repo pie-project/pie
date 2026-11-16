@@ -57,6 +57,7 @@ pub struct Candidate {
 pub fn rung_facts(
     candidates: &[Candidate],
     max_lanes: u32,
+    fire_lanes: u32,
     live: u64,
     computed: impl Fn(u32) -> u32,
 ) -> Vec<RungFacts> {
@@ -76,6 +77,7 @@ pub fn rung_facts(
             } else {
                 None
             },
+            fire_lanes,
         })
         .collect()
 }
@@ -171,6 +173,7 @@ mod tests {
         let rungs = rung_facts(
             &[candidate(1024, 100), candidate(2048, 200)],
             256,
+            256,
             8 << 30,
             |rows| rows,
         );
@@ -207,7 +210,7 @@ mod tests {
             },
         ];
         let live = 3 << 30;
-        let rungs = rung_facts(&candidates, 256, live, |rows| rows);
+        let rungs = rung_facts(&candidates, 256, 256, live, |rows| rows);
         assert_eq!(rungs[0].lanes, 256);
         assert_eq!(rungs[3].infeasible, Some(NO_ROOM));
         assert_eq!(rungs[4].infeasible, Some(NO_PLAN));

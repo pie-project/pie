@@ -188,6 +188,14 @@ pub trait Serve: Backend {
 
     /// Harvests the oldest step in flight, waiting for it.
     fn harvest_one(shell: &mut Shell<Self>) -> Result<()>;
+
+    /// Waits for every step in flight to finish on the device, harvesting
+    /// none: a check of the estimate stops its timer here and reads the
+    /// rows back after. `false` where the backend cannot wait apart from
+    /// its harvest.
+    fn wait_flown(_shell: &Shell<Self>) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 /// How a step goes to the device ([`Serve::plan`]).
@@ -2253,12 +2261,16 @@ impl<B: Serve> Shell<B> {
         self.rows_of(&landed)
     }
 
-    /// [`Shell::fire`] up to its landing: the fire settled on the device,
-    /// its rows not yet read back ([`Shell::rows_of`] reads them), so a
-    /// check times the fire without its readback.
-    pub fn fire_landed(&mut self, lanes: &[Lane<'_>]) -> Result<Landed> {
+    /// [`Shell::fire`] for a check of the estimate: the fire submitted and
+    /// waited for on the device ([`Serve::wait_flown`]), its rows not yet
+    /// read back ([`Shell::rows_of`] reads them, outside a timer); `false`
+    /// where the backend cannot wait apart from its harvest, so nothing
+    /// was waited for and the fire is no timing.
+    pub fn fire_waited(&mut self, lanes: &[Lane<'_>]) -> Result<(Landed, bool)> {
         let seated: Vec<Seated<'_, B>> = lanes.iter().copied().map(Seated::of).collect();
-        self.fire_seated_landed(&seated)
+        let landed = self.fire_seated_landed(&seated)?;
+        let waited = B::wait_flown(self)?;
+        Ok((landed, waited))
     }
 
     fn fire_seated_landed(&mut self, lanes: &[Seated<'_, B>]) -> Result<Landed> {

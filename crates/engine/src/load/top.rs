@@ -536,6 +536,7 @@ mod tests {
             padded_rows: tokens,
             span_bytes: span,
             infeasible,
+            fire_lanes: 256,
         }
     }
 

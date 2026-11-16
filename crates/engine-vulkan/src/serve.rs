@@ -326,6 +326,15 @@ impl Serve for Api {
         Ok(())
     }
 
+    fn wait_flown(shell: &Shell<Api>) -> Result<bool> {
+        // Each step's fence: the landing copy is inside its submission, so
+        // the device is done with the step when it signals.
+        for flight in &shell.inflight {
+            flight.api.pending.wait()?;
+        }
+        Ok(true)
+    }
+
     fn harvest_one(shell: &mut Shell<Api>) -> Result<()> {
         let Some(flight) = shell.inflight.pop_front() else {
             return Ok(());

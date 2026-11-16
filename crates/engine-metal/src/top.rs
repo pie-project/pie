@@ -75,6 +75,8 @@ pub fn rung_facts(
             padded_rows: c.padded_rows,
             span_bytes: u64::from(c.chunks) * chunk_bytes,
             infeasible: (c.chunks > per_buffer).then_some(PAST_ONE_BUFFER),
+            // One fire carries every lane the budget seats.
+            fire_lanes: max_lanes,
         })
         .collect()
 }
