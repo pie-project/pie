@@ -2746,6 +2746,7 @@ fn served_partial_fold(
         base: 0,
         folded: 0,
         fold: FoldLen::Host(fold),
+        lineage: engine::fire::Lineage::Set,
     };
     fire(&mut shell, 2, tokens, buffer(0));
     fire(&mut shell, 2, next, buffer(keep));

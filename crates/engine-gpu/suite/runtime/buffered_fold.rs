@@ -144,6 +144,7 @@ impl Model {
             base: 0,
             folded,
             fold: FoldLen::Host(fold),
+            lineage: engine::fire::Lineage::Set,
         }
     }
 
