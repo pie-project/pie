@@ -199,6 +199,7 @@ pub fn emit_sampler_region(
   g.slice = lane_row;
   g.slices = lane_blocks;
   g.arena = scratch + temporary_offset;
+  g.words = reinterpret_cast<m1_u32*>(lane_line);
   g.stride = temporary_stride;
   g.parity = 0u;
   g.arrivals = 0u;

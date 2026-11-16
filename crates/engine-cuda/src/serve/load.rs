@@ -302,7 +302,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
                 .ok()?;
         // The span the rung weighs is the carve the load backs: the larger
         // of the in-order and forked arenas, without their `attn.scores`
-        // planes (a reader's program term, never a load's).
+        // planes (a reader's pair's state, never a load's).
         let unscored = compiled.arena.scores_from(&boot.trace).max(
             compiled
                 .arena_forked
@@ -1081,7 +1081,7 @@ impl Shell {
         // (`CompiledModel::arena_forked`): the larger of the two, without
         // its `attn.scores` planes, is what the pool keeps under its end for
         // a fire's activation. No load reserves score planes: a fire that
-        // captures them lays them in its programs' term (`Arena`).
+        // captures them lays them in a reader's pair's state (`Arena`).
         let arena_bytes = compiled.arena.scores_from(&boot.trace).max(
             compiled
                 .arena_forked
@@ -1472,15 +1472,16 @@ impl Shell {
         let flight = 1 << shell.device.device().num_sm.max(1).ilog2();
         shell.programs.set_flight(flight);
         shell.programs.set_fire_lanes(shell.fire_lanes());
-        // A program reading `attn.scores` states the planes it switches on
-        // in its term (`engine::GuestState::per_pair`): no load backs them.
+        shell.programs.set_room(shell.pools.instance_room()?);
+        // A program reading `attn.scores` holds the planes it switches on in
+        // its pair's state (`engine::GuestState::per_pair`): no load backs
+        // them.
         let widest = shell.arena.widest_planes(
             std::iter::once(&shell.compiled.arena).chain(shell.compiled.arena_forked.as_ref()),
         );
         shell.programs.set_scores(widest);
-        // A program's fires lay their tables and scratch in the span the
-        // runtime widens for them when it binds (`Shell::guest_state`):
-        // nothing is held for them here.
+        // A program's tables and scratch are its instances' state
+        // (`Shell::guest_state`): nothing is held for them here.
         let programs = 0u64;
         // A plane stored as codes and scales is decoded to bf16 before a
         // prefill's dense gemm, into one tile a stream: a scratch slab like
@@ -2461,7 +2462,7 @@ fn activation_rungs(
     for rung in tokens {
         let map = poem_compiler::arena_rung(trace, budgets, compiled, rung)?;
         // A rung narrower than the span, both weighed without their score
-        // planes: a fire's planes lie in its reader's term, under the carve.
+        // planes: a fire's planes lie in its reader's pair's state.
         if map.scores_from(trace) < span {
             rungs.push((rung, map));
         }

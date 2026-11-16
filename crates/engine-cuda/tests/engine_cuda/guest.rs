@@ -5,12 +5,16 @@
 use engine::Engine;
 use engine::channel::{ChannelId, ChannelRegistration};
 use engine::chunk::{ChunkFacts, SlotRole};
-use engine::program::{BoundInstance, Footprint, InstanceBinding, ProgramFacts, RingSlots};
+use engine::program::{
+    BindExtents, BoundInstance, Footprint, InstanceBinding, ProgramFacts, RingSlots,
+};
+use engine::{GuestState, ProgramId, ScratchPlace};
 
 /// Slots of one role's shape, handed out from one chunk upward.
 #[derive(Debug, Clone, Copy)]
 struct Shape {
     per_chunk: u32,
+    slot_bytes: u64,
     next: u32,
 }
 
@@ -23,8 +27,37 @@ impl Shape {
             .expect("the load states the guest shapes");
         Shape {
             per_chunk: shape.slots_per_chunk,
+            slot_bytes: shape.slot_bytes,
             next: chunk * shape.slots_per_chunk,
         }
+    }
+
+    /// Room for `bytes` of guest scratch, as the runtime's role store
+    /// takes it: one run of slots in a chunk where they fit a chunk's,
+    /// else whole chunks (`engine::ScratchPlace`), each below `end`.
+    fn scratch(&mut self, bytes: u64, chunk_bytes: u64, end: u32) -> ScratchPlace {
+        let per_chunk = self.per_chunk;
+        let place = if bytes == 0 {
+            return ScratchPlace::None;
+        } else if bytes <= u64::from(per_chunk) * self.slot_bytes {
+            let slots = u32::try_from(bytes.div_ceil(self.slot_bytes)).expect("a run's slots");
+            if self.next % per_chunk + slots > per_chunk {
+                self.next = self.next.next_multiple_of(per_chunk);
+            }
+            let first = self.next;
+            self.next += slots;
+            ScratchPlace::Run { first, slots }
+        } else {
+            let chunks = u32::try_from(bytes.div_ceil(chunk_bytes)).expect("whole chunks");
+            let first = self.next.div_ceil(per_chunk);
+            self.next = (first + chunks) * per_chunk;
+            ScratchPlace::Chunks((first..first + chunks).collect())
+        };
+        assert!(
+            self.next.div_ceil(per_chunk) <= end,
+            "a test's guest scratch lies in the chunks backed"
+        );
+        place
     }
 
     fn take(&mut self, footprint: &Footprint) -> Vec<u32> {
@@ -39,11 +72,17 @@ impl Shape {
     }
 }
 
-/// The two guest shapes, each in a chunk of its own.
-#[derive(Debug, Clone, Copy)]
+/// The two guest shapes, each in a chunk of its own, and the guests'
+/// scratch in the chunks past them.
+#[derive(Debug, Clone)]
 pub struct Guest {
     instance: Shape,
     channel: Shape,
+    scratch: Shape,
+    chunk_bytes: u64,
+    committed: u32,
+    /// Each (program, extents) pair's state, taken at its first bind.
+    pairs: Vec<(ProgramId, BindExtents, ScratchPlace)>,
 }
 
 impl Guest {
@@ -62,6 +101,55 @@ impl Guest {
             // first chunks, and a fire lays its programs in the last.
             instance: Shape::of(facts, SlotRole::Instance, committed / 2 + 1),
             channel: Shape::of(facts, SlotRole::Channel, committed / 2),
+            scratch: Shape::of(facts, SlotRole::Instance, committed / 2 + 2),
+            chunk_bytes: facts.chunk_bytes,
+            committed,
+            pairs: Vec::new(),
+        }
+    }
+
+    /// Where an instance of `program` at `extents` with `state` keeps its
+    /// scratch, and its pair's state: taken at the pair's first bind.
+    pub fn scratch(
+        &mut self,
+        program: ProgramId,
+        extents: &BindExtents,
+        state: GuestState,
+    ) -> (ScratchPlace, ScratchPlace) {
+        let (chunk, end) = (self.chunk_bytes, self.committed);
+        let scratch = self.scratch.scratch(state.per_instance, chunk, end);
+        let pair = match self
+            .pairs
+            .iter()
+            .find(|(held, at, _)| *held == program && at == extents)
+        {
+            Some((_, _, place)) => place.clone(),
+            None => {
+                let place = self.scratch.scratch(state.per_pair, chunk, end);
+                self.pairs.push((program, extents.clone(), place.clone()));
+                place
+            }
+        };
+        (scratch, pair)
+    }
+
+    /// The slots an instance of a program with `facts` and `state` at
+    /// `extents` takes on a shell: its tables', its rings', its scratch's
+    /// and its pair's.
+    pub fn shell_slots(
+        &mut self,
+        program: ProgramId,
+        facts: &ProgramFacts,
+        extents: eta_exec::Extents,
+        state: GuestState,
+    ) -> engine_cuda::program::Slots {
+        let (instance, rings) = self.slots(facts, |_| false);
+        let (scratch, pair) = self.scratch(program, &bind_extents(extents), state);
+        engine_cuda::program::Slots {
+            instance,
+            rings,
+            scratch,
+            pair,
         }
     }
 
@@ -117,19 +205,36 @@ impl Guest {
         let named: Vec<ChannelId> = binding.channels.clone();
         let (instance_slots, ring_slots) =
             self.slots(&facts, |channel| named.get(channel as usize).is_some());
+        let state = engine
+            .guest_state(binding.program, &binding.extents)
+            .expect("the program's guest state");
+        let (scratch, pair) = self.scratch(binding.program, &binding.extents, state);
         engine
             .bind_instance(&InstanceBinding {
                 instance_slots,
                 ring_slots,
+                scratch,
+                pair,
                 ..binding
             })
             .expect("the instance binds")
     }
 }
 
-/// The slots of an instance on a plane with no pool: none, and a ring for
-/// each channel that is an item of its own. Its items lie where
-/// [`alone_span`] puts them.
+/// `extents` as a binding states them.
+fn bind_extents(extents: eta_exec::Extents) -> BindExtents {
+    BindExtents {
+        row_count: extents.row_count,
+        token_count: extents.token_count,
+        sampled_rows: extents.sampled_rows,
+        query_len: extents.query_len,
+        key_len: extents.key_len,
+    }
+}
+
+/// The slots of an instance on a plane with no pool: none, a ring for each
+/// channel that is an item of its own, and a run each for its scratch and
+/// its pair's state. Its items lie where [`alone_span`] puts them.
 pub fn alone_slots(
     plane: &engine_cuda::ProgramPlane,
     program: engine::ProgramId,
@@ -147,23 +252,23 @@ pub fn alone_slots(
                 slots: Vec::new(),
             })
             .collect(),
+        scratch: ScratchPlace::Run { first: 0, slots: 1 },
+        pair: ScratchPlace::Run { first: 0, slots: 1 },
     }
 }
 
 /// A guest item of a plane with no pool: a buffer of its own, the test
 /// process's until it ends.
 pub fn alone_span(_: SlotRole, _: &[u32], bytes: u64) -> engine_cuda::Result<u64> {
-    let buffer = engine_cuda::device::Buffer::zeroed(bytes as usize)?;
+    let buffer = engine_cuda::device::Buffer::zeroed(bytes.max(256) as usize)?;
     Ok(Box::leak(Box::new(buffer)).ptr())
 }
 
-/// A plane with no pool: its fires lay their programs' tables and scratch
-/// in a buffer of its own, the test process's until it ends.
+/// A plane with no pool: its programs' tables and scratch lie in buffers of
+/// their own ([`alone_span`]), its fires of up to 256 lanes.
 pub fn alone_plane() -> engine_cuda::ProgramPlane {
-    const SPAN: usize = 256 << 20;
-    let buffer = engine_cuda::device::Buffer::zeroed(SPAN).expect("the span's buffer");
-    let end = Box::leak(Box::new(buffer)).ptr() + SPAN as u64;
     let mut plane = engine_cuda::ProgramPlane::new(engine_cuda::program::compile::Disk::disabled());
-    plane.set_span((end, SPAN as u64));
+    plane.set_flight(256);
+    plane.set_fire_lanes(256);
     plane
 }

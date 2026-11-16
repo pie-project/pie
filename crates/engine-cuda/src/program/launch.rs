@@ -20,14 +20,15 @@ use crate::error::{Fault, Result};
 use super::compile::{Module, Region};
 use super::endpoint::Endpoint;
 
-const FUSED_ARITY: usize = 18;
+const FUSED_ARITY: usize = 17;
 
 pub const ORDER_ROW_BLOCKS: u32 = 32;
 /// The most blocks a lane's sampler region runs on (`sample_lane.cuh`); a
 /// fire runs as many as the device holds at once with its lanes, from one.
 pub const LANE_SAMPLER_BLOCKS: u32 = 16;
-/// A sampler block's arena: a barrier word's line, two exchange buffers and
-/// two buffers of 512 gathered elements (`M1_FAST_GATHER`).
+/// A sampler block's arena: a 64-byte head (unused: the lane's barrier
+/// words are its line of the fire's tables), two exchange buffers and two
+/// buffers of 512 gathered elements (`M1_FAST_GATHER`).
 const LANE_SAMPLER_ARENA: u64 = 64 + 2 * 24_576 + 2 * 512 * 8;
 
 /// Whether `kind` is a lane sampler region: its lane's blocks split each row
@@ -273,11 +274,13 @@ const fn registry_bytes(slots: usize) -> u64 {
 
 /// Where an instance's items lie on the device now: the instance's item,
 /// and each ring that is an item of its own (0 for a channel whose cells
-/// are in the instance's item or its endpoint's).
+/// are in the instance's item or its endpoint's), and its scratch: each
+/// piece's address (`engine::InstanceBinding::scratch`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Place {
     pub instance: u64,
     pub rings: Vec<u64>,
+    pub scratch: Vec<u64>,
 }
 
 #[derive(Debug)]
@@ -583,8 +586,9 @@ pub struct Cursor {
 }
 #[derive(Debug)]
 pub struct Prepared {
-    /// Where this stage's tables and scratch lie in the fire's span, laid
-    /// by [`Prepared::lay`]: each an address in it.
+    /// Where this stage's tables lie in its (program, extents) pair's
+    /// state ([`Prepared::place`]): each an address there. A lane's
+    /// scratch is its instance's, at [`Prepared::scratch_at`] of it.
     table: u64,
     table_host: Vec<u8>,
     descriptors: u64,
@@ -594,12 +598,12 @@ pub struct Prepared {
     params_host: Vec<u8>,
     offsets: u64,
     offsets_host: Vec<u8>,
-    scratch: u64,
     /// The lanes' intrinsic tables (bases, modes, widths, strides,
-    /// offsets) and pending flags, one span staged in one copy a commit
-    /// (`cell_at` their offsets, `cells_host` its image).
+    /// offsets), pending flags, lines and scratch base tables, one span
+    /// staged in one copy a commit (`cell_at` their offsets, `cells_host`
+    /// its image).
     cells: u64,
-    cell_at: [usize; 6],
+    cell_at: [usize; CELLS],
     cells_host: Vec<u8>,
     intrinsic_bases_host: Vec<u64>,
     intrinsic_modes_host: Vec<u32>,
@@ -614,22 +618,38 @@ pub struct Prepared {
     output_slots: u32,
     channel_count: u32,
     value_count: u32,
+    /// A lane's scratch bytes for this stage.
     scratch_stride: u32,
+    /// Where this stage's scratch lies in its instance's.
+    scratch_at: u64,
     temporary_offset: u32,
     temporary_bytes: u32,
     region_rows: Vec<u32>,
     samplers: Vec<bool>,
     lanes: u32,
+    /// The tables were placed anew since they were last staged.
+    moved: bool,
     filled: u32,
     bindings: Vec<u32>,
 }
 
-/// What every span of a stage starts a whole number of in the fire's span.
-const SPAN_ALIGN: u64 = 256;
+/// What every span of a stage starts a whole number of.
+pub const SPAN_ALIGN: u64 = 256;
 
-/// The spans a stage lays: its params, offsets, table, descriptors, scratch
-/// and cells.
-const SPANS: u64 = 6;
+/// The spans a stage lays in its pair's state: its params, offsets, lane
+/// table, descriptors and cells ([`Prepared::spans`]).
+pub const SPANS: usize = 5;
+
+/// The cells a stage stages each commit: five intrinsic tables, the
+/// pending flags, the lanes' lines and their scratch base tables.
+const CELLS: usize = 8;
+const PENDING: usize = 5;
+const LINES: usize = 6;
+const BASES: usize = 7;
+
+/// A lane's line of a stage's cells, zeroed each commit: a lane sampler's
+/// barrier words, one a block (`sample_lane.cuh`).
+const LINE_BYTES: usize = 64;
 
 #[must_use]
 pub(crate) fn shell_launches(region: &LaunchRegion) -> bool {
@@ -853,9 +873,8 @@ impl Prepared {
             params_host: records_bytes(&records),
             offsets: 0,
             offsets_host,
-            scratch: 0,
             cells: 0,
-            cell_at: [0; 6],
+            cell_at: [0; CELLS],
             cells_host: Vec::new(),
             intrinsic_bases_host: Vec::new(),
             intrinsic_modes_host: Vec::new(),
@@ -868,75 +887,114 @@ impl Prepared {
             channel_count,
             value_count,
             scratch_stride,
+            scratch_at: 0,
             temporary_offset,
             temporary_bytes,
             region_rows,
             samplers,
             lanes: 0,
+            moved: true,
             filled: 0,
             bindings: plan.channel_bindings.clone(),
         })
     }
 
-    /// The bytes of the spans whose size no lane count changes: the params
-    /// and offsets, the table's header, and the room every span's
-    /// alignment may take.
+    /// A lane's scratch bytes for this stage, aligned: its share of the
+    /// instance's scratch (`engine::GuestState::per_instance`).
     #[must_use]
-    pub fn fixed_bytes(&self) -> u64 {
-        (self.params_host.len().max(size_of::<CudaOpParams>())
-            + self.offsets_host.len().max(size_of::<u32>())) as u64
-            + LANE_HEADER_BYTES
-            + SPANS * SPAN_ALIGN
-            + 6 * 16
+    pub fn scratch_bytes(&self) -> u64 {
+        u64::from(self.scratch_stride).next_multiple_of(SCRATCH_ALIGN)
     }
 
-    /// The bytes each lane adds: its record and channel slots, its
-    /// descriptor row, its scratch and its intrinsic and pending cells.
-    #[must_use]
-    pub fn lane_bytes(&self) -> u64 {
-        let words = self.pitch as u64;
-        LANE_RECORD_BYTES
-            + u64::from(self.channel_count) * size_of::<LaneChannelSlot>() as u64
-            + self.descriptor_row.len().max(1) as u64
-            + u64::from(self.scratch_stride)
-            + words * (size_of::<u64>() + 4 * size_of::<u32>()) as u64
-            + u64::from(self.channel_count).max(1)
+    /// This stage's scratch lies at `at` of its instance's.
+    pub fn set_scratch_at(&mut self, at: u64) {
+        self.scratch_at = at;
     }
 
-    /// Lays this stage for `lanes` lanes in the fire's span from `at` up,
-    /// and returns where its bytes end. `fresh`: the span was laid
-    /// otherwise since this stage last lay here, so the tables no lane
-    /// changes are staged again. Nothing is kept there between fires: a
-    /// span is the fire's.
+    /// The bytes of this stage's spans for flights of up to `lanes` lanes,
+    /// in [`SPANS`] order, each a whole number of [`SPAN_ALIGN`].
+    #[must_use]
+    pub fn spans(&self, lanes: u32) -> [u64; SPANS] {
+        let lanes = lanes.max(1);
+        let table = LaneShape::of(lanes, self.channel_count)
+            .bytes()
+            .unwrap_or(u64::MAX);
+        [
+            self.params_host.len().max(size_of::<CudaOpParams>()) as u64,
+            self.offsets_host.len().max(size_of::<u32>()) as u64,
+            table,
+            (self.descriptor_row.len().max(1) * lanes as usize) as u64,
+            Self::cell_layout(self.pitch, self.channel_count, self.lane_lines(), lanes).1 as u64,
+        ]
+        .map(|bytes| bytes.next_multiple_of(SPAN_ALIGN))
+    }
+
+    /// Whether a lane of this stage has a line ([`LINE_BYTES`]).
+    fn lane_lines(&self) -> bool {
+        self.meets_across_blocks()
+    }
+
+    /// The cells' offsets in their span for `lanes` lanes, and its bytes.
+    fn cell_layout(
+        pitch: usize,
+        channels: u32,
+        lines: bool,
+        lanes: u32,
+    ) -> ([usize; CELLS], usize) {
+        let words = pitch * lanes as usize;
+        let pending = (channels as usize * lanes as usize).max(1);
+        let mut cell_at = [0usize; CELLS];
+        let mut at = 0usize;
+        for (cell, bytes) in [
+            words * size_of::<u64>(),
+            words * size_of::<u32>(),
+            words * size_of::<u32>(),
+            words * size_of::<u32>(),
+            words * size_of::<u32>(),
+            pending,
+            if lines {
+                LINE_BYTES * lanes as usize
+            } else {
+                0
+            },
+            size_of::<u64>() * lanes as usize,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            cell_at[cell] = at;
+            at += bytes.div_ceil(16) * 16;
+        }
+        (cell_at, at)
+    }
+
+    /// This stage's spans lie at `at` ([`Prepared::spans`]' order), laid
+    /// for flights of up to `lanes` lanes: the next lay stages its tables
+    /// there again.
+    pub fn place(&mut self, at: [u64; SPANS]) {
+        let [params, offsets, table, descriptors, cells] = at;
+        self.params = params;
+        self.offsets = offsets;
+        self.table = table;
+        self.descriptors = descriptors;
+        self.cells = cells;
+        self.moved = true;
+    }
+
+    /// Lays this stage for a flight of `lanes` lanes where it was placed
+    /// ([`Prepared::place`], for no fewer lanes): its lane table and
+    /// descriptor rows built again where the lanes differ from the last
+    /// lay, and its tables staged again where they moved too.
     pub fn lay(
         &mut self,
         extents: Extents,
         lanes: u32,
-        at: u64,
-        fresh: bool,
         stream: *mut core::ffi::c_void,
-    ) -> Result<u64> {
+    ) -> Result<()> {
         self.filled = 0;
         let lanes = lanes.max(1);
-        let total = u64::from(self.scratch_stride) * u64::from(lanes);
-        if total > eta_exec::SCRATCH_MAX_BYTES {
-            return Err(Fault::Ceiling {
-                what: "a wave's fused-region scratch",
-                need: total,
-                have: eta_exec::SCRATCH_MAX_BYTES,
-            });
-        }
-        let mut next = at.next_multiple_of(SPAN_ALIGN);
-        let mut take = |bytes: usize| {
-            let here = next;
-            next = (here + bytes as u64).next_multiple_of(SPAN_ALIGN);
-            here
-        };
-        let params = take(self.params_host.len().max(size_of::<CudaOpParams>()));
-        let offsets = take(self.offsets_host.len().max(size_of::<u32>()));
-        let moved = fresh || params != self.params || lanes != self.lanes;
-        self.params = params;
-        self.offsets = offsets;
+        let moved = self.moved || lanes != self.lanes;
+        self.moved = false;
         let shape = LaneShape::of(lanes, self.channel_count);
         let table_bytes = shape
             .bytes()
@@ -978,12 +1036,6 @@ impl Prepared {
                 );
             }
             self.table_host = table_host;
-        }
-        self.table = take(table_bytes);
-
-        let row = self.descriptor_row.len().max(1);
-        self.descriptors = take(row * lanes as usize);
-        if lanes != self.lanes {
             self.descriptors_host = self
                 .descriptor_row
                 .iter()
@@ -991,48 +1043,37 @@ impl Prepared {
                 .cycle()
                 .take(self.descriptor_row.len() * lanes as usize)
                 .collect();
+            let words = self.pitch * lanes as usize;
+            self.intrinsic_bases_host.resize(words, 0u64);
+            self.intrinsic_modes_host.resize(words, 0u32);
+            self.intrinsic_widths_host.resize(words, 0u32);
+            self.intrinsic_strides_host.resize(words, 0u32);
+            self.intrinsic_offsets_host.resize(words, 0u32);
+            let (cell_at, bytes) =
+                Self::cell_layout(self.pitch, self.channel_count, self.lane_lines(), lanes);
+            self.cell_at = cell_at;
+            self.cells_host = vec![0u8; bytes];
         }
-
-        self.scratch = take(
-            (self.scratch_stride as usize * lanes as usize)
-                .max(usize::try_from(SCRATCH_ALIGN).unwrap_or(256)),
-        );
-        let words = self.pitch * lanes as usize;
-        self.intrinsic_bases_host.resize(words, 0u64);
-        self.intrinsic_modes_host.resize(words, 0u32);
-        self.intrinsic_widths_host.resize(words, 0u32);
-        self.intrinsic_strides_host.resize(words, 0u32);
-        self.intrinsic_offsets_host.resize(words, 0u32);
-        let pending = (self.channel_count as usize * lanes as usize).max(1);
-        let mut cell_at = 0usize;
-        for (cell, bytes) in [
-            words * size_of::<u64>(),
-            words * size_of::<u32>(),
-            words * size_of::<u32>(),
-            words * size_of::<u32>(),
-            words * size_of::<u32>(),
-            pending,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            self.cell_at[cell] = cell_at;
-            cell_at += bytes.div_ceil(16) * 16;
-        }
-        if self.cells_host.len() != cell_at {
-            self.cells_host = vec![0u8; cell_at];
-        }
-        self.cells = take(cell_at);
         self.lanes = lanes;
         if moved {
             crate::device::stage_raw(stream, self.params, &self.params_host)?;
             crate::device::stage_raw(stream, self.offsets, &self.offsets_host)?;
             crate::device::stage_raw(stream, self.descriptors, &self.descriptors_host)?;
         }
-        Ok(next)
+        Ok(())
     }
 
-    pub fn stage_lane(&mut self, rings: &Rings, cursors: &[Cursor], commit: u64) -> Result<u32> {
+    /// Stages the next lane of the flight: its commit slot, its channels'
+    /// cells, and its scratch where its instance holds it (`scratch`, its
+    /// pieces' addresses, the first holding this stage's at
+    /// [`Prepared::scratch_at`]).
+    pub fn stage_lane(
+        &mut self,
+        rings: &Rings,
+        cursors: &[Cursor],
+        commit: u64,
+        scratch: &[u64],
+    ) -> Result<u32> {
         let lane = self.filled;
         if lane >= self.lanes {
             return Err(Fault::program(
@@ -1052,6 +1093,18 @@ impl Prepared {
         let commit_at = record_at + std::mem::offset_of!(LaneRecord, commit_slot);
         self.table_host[commit_at..commit_at + size_of::<u64>()]
             .copy_from_slice(&commit.to_le_bytes());
+        let piece = scratch.first().copied().ok_or_else(|| {
+            Fault::program(
+                "program::launch",
+                "a lane staged whose instance holds no scratch",
+            )
+        })?;
+        let row = self.cell_at[BASES] + lane as usize * size_of::<u64>();
+        self.cells_host[row..row + size_of::<u64>()]
+            .copy_from_slice(&(piece + self.scratch_at).to_le_bytes());
+        let table_at = record_at + std::mem::offset_of!(LaneRecord, scratch_table);
+        self.table_host[table_at..table_at + size_of::<u64>()]
+            .copy_from_slice(&(self.cells + row as u64).to_le_bytes());
 
         for (local, &dense) in self.bindings.iter().enumerate() {
             let channel = dense as usize;
@@ -1122,7 +1175,7 @@ impl Prepared {
         {
             image[at[cell]..at[cell] + bytes.len()].copy_from_slice(bytes);
         }
-        image[at[5]..].fill(0);
+        image[at[PENDING]..at[BASES]].fill(0);
         crate::device::stage_raw(stream, self.cells, image)?;
         Ok(())
     }
@@ -1183,11 +1236,10 @@ impl Prepared {
             .ptr(self.descriptors)
             .ptr(self.params)
             .ptr(self.offsets)
-            .ptr(self.scratch)
+            .ptr(self.cell(LINES))
             .u32(self.value_count)
-            .u32(self.scratch_stride)
             .u32(self.temporary_offset)
-            .ptr(self.cell(5))
+            .ptr(self.cell(PENDING))
             .ptr(self.cell(0))
             .ptr(self.cell(1))
             .ptr(self.cell(2))
@@ -1207,9 +1259,9 @@ impl Prepared {
             .unwrap_or(false);
         // A sampler lane runs on as many blocks as the device holds at once
         // with the fire's lanes (its blocks wait on one another), each over
-        // its own arena; the lanes' barrier words start at zero.
+        // its own arena; the lanes' barrier words (their lines) start at
+        // zero, staged so with the cells.
         let rows = if sampler {
-            self.zero_barriers(stream)?;
             (device_units() / self.filled.max(1)).clamp(1, LANE_SAMPLER_BLOCKS.min(rows))
         } else {
             rows
@@ -1237,16 +1289,6 @@ impl Prepared {
     #[must_use]
     pub fn meets_across_blocks(&self) -> bool {
         self.samplers.iter().any(|&sampler| sampler)
-    }
-
-    #[must_use]
-    pub fn lane_ceiling(&self) -> u32 {
-        if self.scratch_stride == 0 {
-            return u32::MAX;
-        }
-        u32::try_from(eta_exec::SCRATCH_MAX_BYTES / u64::from(self.scratch_stride))
-            .unwrap_or(u32::MAX)
-            .max(1)
     }
 
     #[must_use]
@@ -1350,36 +1392,6 @@ impl Args {
 }
 
 impl Prepared {
-    /// The fire's lanes' sampler barrier words (the first 64 bytes of each
-    /// lane's temporary arena: a word a block) back to zero.
-    fn zero_barriers(&self, stream: *mut core::ffi::c_void) -> Result<()> {
-        #[cfg(feature = "device")]
-        {
-            use crate::device::dr;
-            // SAFETY: the scratch holds `filled` lanes `scratch_stride` apart,
-            // each with its temporary arena at `temporary_offset`.
-            let code = unsafe {
-                dr::cuMemsetD2D32Async(
-                    self.scratch + u64::from(self.temporary_offset),
-                    self.scratch_stride as usize,
-                    0,
-                    16,
-                    self.filled as usize,
-                    stream.cast(),
-                )
-            };
-            if code != dr::CUresult::CUDA_SUCCESS {
-                return Err(Fault::Device {
-                    call: "cuMemsetD2D32Async",
-                    code: code as i32,
-                });
-            }
-        }
-        #[cfg(not(feature = "device"))]
-        let _ = stream;
-        Ok(())
-    }
-
     /// The fire's lanes' dummy bytes (the first [`SCRATCH_DUMMY_BYTES`] of
     /// each lane's scratch, where every value that takes no bytes lies)
     /// filled with [`SCRATCH_POISON`].
@@ -1387,23 +1399,28 @@ impl Prepared {
         #[cfg(feature = "device")]
         {
             use crate::device::dr;
-            // SAFETY: the scratch holds `filled` lanes `scratch_stride` apart,
-            // each no shorter than its dummy bytes.
-            let code = unsafe {
-                dr::cuMemsetD2D32Async(
-                    self.scratch,
-                    self.scratch_stride as usize,
-                    SCRATCH_POISON,
-                    (SCRATCH_DUMMY_BYTES / 4) as usize,
-                    self.filled as usize,
-                    stream.cast(),
-                )
-            };
-            if code != dr::CUresult::CUDA_SUCCESS {
-                return Err(Fault::Device {
-                    call: "cuMemsetD2D32Async",
-                    code: code as i32,
-                });
+            for lane in 0..self.filled as usize {
+                let row = self.cell_at[BASES] + lane * size_of::<u64>();
+                let mut word = [0u8; size_of::<u64>()];
+                word.copy_from_slice(&self.cells_host[row..row + size_of::<u64>()]);
+                // SAFETY: the lane's scratch, its instance's, is no shorter
+                // than its dummy bytes.
+                let code = unsafe {
+                    dr::cuMemsetD2D32Async(
+                        u64::from_le_bytes(word),
+                        SCRATCH_DUMMY_BYTES as usize,
+                        SCRATCH_POISON,
+                        (SCRATCH_DUMMY_BYTES / 4) as usize,
+                        1,
+                        stream.cast(),
+                    )
+                };
+                if code != dr::CUresult::CUDA_SUCCESS {
+                    return Err(Fault::Device {
+                        call: "cuMemsetD2D32Async",
+                        code: code as i32,
+                    });
+                }
             }
         }
         #[cfg(not(feature = "device"))]

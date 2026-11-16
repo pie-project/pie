@@ -180,6 +180,7 @@ pub const LANE_RECORD: DeviceStruct = DeviceStruct {
         Field::u64("mtp_drafts_base"),
         Field::u32("mtp_drafts_depth"),
         Field::u32("reserved2"),
+        Field::u64("scratch_table"),
     ],
 };
 
@@ -287,6 +288,7 @@ mod static_assertions {
         mtp_drafts_base,
         mtp_drafts_depth,
         reserved2,
+        scratch_table,
     );
 
     pin_layout!(

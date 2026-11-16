@@ -13,9 +13,9 @@
 // width-32 tree (`canonical_reduce`), and the cut is `m1_cut_row` /
 // `m1_rank_row` over the group's hooks.
 //
-// The arena, per block (`temporary_stride` apart): a 64-byte line (block 0's
-// holds the lane's barrier words, one a block; zeroed before the launch),
-// two exchange buffers, used by alternate merges (a block is at most one
+// The arena, per block (`temporary_stride` apart): a 64-byte line (unused:
+// the lane's barrier words, one a block, are its line of the fire's tables,
+// zeroed before the launch), two exchange buffers, used by alternate merges (a block is at most one
 // merge ahead of the slowest), and two buffers of gathered elements.
 
 #define M1_LANE_HALF 24576u
@@ -532,6 +532,8 @@ struct M1Lane {
   m1_u32 slice;
   m1_u32 slices;
   m1_u8* arena;
+  // The lane's barrier words, one a block.
+  m1_u32* words;
   m1_u32 stride;
   m1_u32 parity;
   m1_u32 arrivals;
@@ -578,7 +580,6 @@ struct M1Lane {
     __syncthreads();
     arrivals += 1u;
     if (threadIdx.x < 32u) {
-      m1_u32* words = reinterpret_cast<m1_u32*>(arena);
       if (threadIdx.x == 0u) M1_LANE_PUT32(words + slice, arrivals);
       bool ready = threadIdx.x >= slices;
       for (;;) {

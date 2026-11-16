@@ -73,6 +73,9 @@ pub struct Session {
     /// The channels that are only a `lora` sink's planes: the bank is landed
     /// from their seeds at bind, so a fire never pulls their cells again.
     sink_planes: Vec<usize>,
+    /// Where the instance's scratch lies now: each piece's address
+    /// ([`super::launch::Place::scratch`]).
+    scratch: Vec<u64>,
 }
 
 #[derive(Debug)]
@@ -143,6 +146,7 @@ impl Session {
                         .collect()
                 })
                 .unwrap_or_default(),
+            scratch: place.scratch.clone(),
         };
         for (channel, wire) in seeds {
             if shadow
@@ -174,9 +178,13 @@ impl Session {
         Ok(session)
     }
 
-    /// Points the rings at `place`, where their pool slots lie now.
+    /// Points the rings and the scratch at `place`, where their pool slots
+    /// lie now. The scratch's contents are dead between fires: nothing is
+    /// copied.
     pub fn rebase(&mut self, place: &super::launch::Place) -> Result<()> {
-        self.rings.rebase(place)
+        self.rings.rebase(place)?;
+        self.scratch.clone_from(&place.scratch);
+        Ok(())
     }
 
     #[must_use]
@@ -546,7 +554,7 @@ impl Session {
         };
         let commit = self.commits[minted.slot].device();
         for prepared in stages {
-            let lane = prepared.stage_lane(&self.rings, &minted.before, commit)?;
+            let lane = prepared.stage_lane(&self.rings, &minted.before, commit, &self.scratch)?;
             for ((name, at), output) in &self.outputs {
                 let Some(slot) = prepared.slot_of(name, *at) else {
                     continue;

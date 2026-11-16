@@ -232,13 +232,14 @@ fn a_score_reader_states_its_planes_and_nothing_backs_them() {
         term >= planes,
         "a reader's term {term} holds the widest fire's planes, {planes}"
     );
-    // The decode below fires only where its programs and planes lie in that
-    // term under its carve, in the span (`Pools::program_span`,
-    // `Arena::fire_slots`): it is refused by name otherwise.
+    // The decode below lays its planes in the reader's pair's state
+    // (`Plane::planes_at`, `Arena::fire_slots`), never in the span.
 
-    let slots = crate::guest::Guest::of(&facts, segments * facts.segment_chunks).slots(
+    let slots = crate::guest::Guest::of(&facts, segments * facts.segment_chunks).shell_slots(
+        program,
         &shell.program_facts(program).expect("the program's facts"),
-        |_| false,
+        extents,
+        state,
     );
     let ids = [engine::ChannelId(1)];
     let instance = shell
@@ -250,10 +251,7 @@ fn a_score_reader_states_its_planes_and_nothing_backs_them() {
             PortMask::NONE,
             &[None],
             &ids,
-            engine_cuda::program::Slots {
-                instance: slots.0,
-                rings: slots.1,
-            },
+            slots,
         )
         .expect("the reader binds");
     assert_eq!(

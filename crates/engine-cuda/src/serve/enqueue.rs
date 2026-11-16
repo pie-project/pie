@@ -115,7 +115,6 @@ impl Shell {
             .as_ref()
             .map(|buffers| buffers.scratch(&self.pools));
         let tapping = self.tapping(p.lanes)?;
-        let fire_lanes = self.fire_lanes();
         let mut fire = FireCtx {
             live: &self.live,
             tapping: tapping.as_ref(),
@@ -144,7 +143,6 @@ impl Shell {
             predicate: &mut self.predicate,
             readout_rows: &mut self.readout_rows,
             budget: &self.budget,
-            fire_lanes,
             owed: &mut self.owed,
             spare_events: &mut self.spare_events,
             airborne: &self.airborne,
@@ -211,8 +209,6 @@ struct FireCtx<'a> {
     predicate: &'a mut Predicate,
     readout_rows: &'a mut Buffer,
     budget: &'a Budget,
-    /// The most lanes a fire carries, as the runtime is told.
-    fire_lanes: u32,
     owed: &'a mut Owed,
     spare_events: &'a mut Vec<Event>,
     airborne: &'a Airborne,
@@ -254,11 +250,6 @@ impl Shell {
             "prepare.prologue",
             Reap::Landed,
         )?;
-        // The fire is not composed yet: its prologues lay under the carve of
-        // the smallest rung that holds its lanes, which no rung the fire is
-        // cut to lies under.
-        let lanes = attachments.len() as u64;
-        self.point_programs(lanes, lanes)?;
         let mut verdicts: Vec<(usize, Fired)> = Vec::new();
         let mut launched = AirborneFires::default();
         for (at, attached) in attachments.iter().enumerate() {
@@ -525,12 +516,23 @@ impl FireCtx<'_> {
             _ => (&self.compiled.arena, false),
         };
         // A fire holding a lane that captures scores lays its carve's
-        // score planes, under the carve, in the term its programs state.
+        // score planes in the state of a pair whose program reads them.
         let scored = p
             .composition
             .lanes()
             .iter()
             .any(|row| self.arena.captures(row.class as usize));
+        let planes = if scored {
+            Some(self.programs.planes_at().ok_or_else(|| {
+                Fault::Unbound {
+                    what: "the attn.scores planes of a fire capturing them: no pair bound \
+                       now reads them, so none holds them"
+                        .to_string(),
+                }
+            })?)
+        } else {
+            None
+        };
         let mut slots = self.arena.fire_slots(
             self.pools,
             map,
@@ -544,20 +546,8 @@ impl FireCtx<'_> {
                 clips: u64::from(p.composition.clips()),
                 readouts: p.readout_rows.len() as u64,
             },
-            scored,
-        )?;
-        // The fire's guests' programs lay their tables and scratch under
-        // this carve.
-        let span = super::program_span(
-            self.arena,
-            self.pools,
-            self.programs,
-            self.compiled.arena_forked.as_ref(),
-            (self.budget.max_tokens, self.fire_lanes),
-            carve_rows,
-            carve_lanes,
-        )?;
-        self.programs.set_span(span);
+            planes,
+        );
         if let Some(ep) = self.ep {
             ep.seats(forked)
                 .seat(ep.wire(), p.composition.bucket(), &mut slots);

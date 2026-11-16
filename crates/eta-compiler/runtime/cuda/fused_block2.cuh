@@ -13,8 +13,14 @@ u) {
   __syncthreads();
   const M1ValueDesc* descriptors =
       all_descriptors + (m1_u64)dispatch_lane * value_count;
-  m1_u8* scratch =
-      all_scratch + (m1_u64)dispatch_lane * scratch_stride;
+  // The lane's scratch is its instance's, wherever the pool holds it: the
+  // first piece of its base table (`lane.scratch_table`, a device address
+  // a piece). Its 64-byte line of the fire's tables, zeroed each fire, is
+  // its own too (a lane sampler's barrier words).
+  m1_u8* scratch = reinterpret_cast<m1_u8*>(
+      reinterpret_cast<const m1_u64*>(lane.scratch_table)[0]);
+  m1_u8* lane_line = lane_lines + (m1_u64)dispatch_lane * 64u;
+  (void)lane_line;
 
   m1_u8* temporary = scratch + temporary_offset + (m1_u64)lane_row * temporary_stride;
   (void)temporary;

@@ -2099,34 +2099,15 @@ impl Pools {
         self.records.remove(&key);
     }
 
-    /// Where a fire whose carve leaves `under` bytes of the span below it
-    /// lays its guests' programs, of `term` bytes at its rung: its end and
-    /// its bytes, right under the fire's own carve, in the span backed at
-    /// load. Where the state's chunks end where the activation starts, the
-    /// runtime lends the whole chunks under a rung's carve and keeps the
-    /// term's chunks of them free at every rung it cuts a guest fire to,
-    /// so the term ends at the last whole chunk under the carve. Where it
-    /// lends none, every byte under the carve is free. A term past that
-    /// room is refused by name, never backed: the runtime cuts no guest
-    /// fire to such a rung. `planes`: the fire's score planes, right under
-    /// its carve and counted in the term; the programs end under them.
-    pub fn program_span(&self, under: u64, term: u64, planes: u64) -> Result<(u64, u64)> {
-        let chunk = self.chunks.layout().chunk_bytes.max(1);
-        let room = if self.chunks.state_meets_activation() {
-            under / chunk * chunk
-        } else {
-            under
-        };
-        if term > room {
-            return Err(Fault::Ceiling {
-                what: "bytes of the activation's span under a fire's carve its guests' \
-                       programs lay",
-                need: term,
-                have: room,
-            });
-        }
-        let end = room.min(under.saturating_sub(planes));
-        Ok((self.chunks.activation_base() + end, term))
+    /// The room guest state lies in: the `Instance` shape's slots a
+    /// chunk and their bytes, and a chunk's bytes.
+    pub fn instance_room(&self) -> Result<crate::program::Room> {
+        let shape = self.chunks.shape(Kind::Instance)?;
+        Ok(crate::program::Room {
+            per_chunk: shape.per_chunk,
+            slot_bytes: shape.slot_bytes,
+            chunk: self.chunks.layout().chunk_bytes,
+        })
     }
 
     /// The whole chunks of the span under a carve that leaves `under`

@@ -1800,21 +1800,14 @@ impl Shell {
         // load's capacity: a fire of the bucket holds no more.
         let body_lanes = crate::window::body_lanes(max_lanes, composition.bucket());
         let lanes_fit = composition.lane_count() <= body_lanes;
-        // A body carves for its window table's lanes, which may be a wider
-        // rung than the fire's own. A fire capturing scores lays its rung's
-        // planes, which the runtime sets aside for the rung it cut the fire
-        // to and no wider: it runs at its own rung's carve, walked.
+        // A fire capturing scores lays its planes in a reader's pair's
+        // state, which moves when the pair is parked: a body would keep
+        // where they lay when it was recorded, so such a fire is walked.
         let scored = composition
             .lanes()
             .iter()
             .any(|row| self.arena.captures(row.class as usize));
-        let scores_fit = !scored
-            || self
-                .arena
-                .carve_rung(u64::from(launched), u64::from(body_lanes))
-                == self
-                    .arena
-                    .carve_rung(u64::from(launched), u64::from(composition.lane_count()));
+        let scores_fit = !scored;
         // Why a fire of a load that records bodies walks its plan, for the
         // warning it raises (`Bodies::eager_unbodied`).
         let fits = readouts_fit && lanes_fit && scores_fit;
@@ -1822,7 +1815,7 @@ impl Shell {
             let why = if tapped {
                 "it is tapped"
             } else if !scores_fit {
-                "it captures scores and its body carves a rung wider than its own"
+                "it captures scores, whose planes lie in a pair's state that moves"
             } else if !snapshots_fit {
                 "it takes more snapshots than a body holds"
             } else if !Self::keyable_units(&self.compiled) {

@@ -23,6 +23,7 @@ struct M3LaneRecord {
   ulong mtp_drafts_base;
   uint mtp_drafts_depth;
   uint reserved2;
+  ulong scratch_table;
 };
 struct M3LaneChannelSlot {
   ulong committed_cell;
