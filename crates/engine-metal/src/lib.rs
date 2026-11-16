@@ -39,6 +39,7 @@ pub mod serve;
 pub mod settle;
 pub mod store;
 pub mod top;
+pub mod rates;
 pub mod tune;
 pub mod weights;
 pub mod window;
