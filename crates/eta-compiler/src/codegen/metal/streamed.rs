@@ -801,7 +801,7 @@ pub(super) fn kernel_head(
     source.push_str("    const device M1ValueDesc* all_descriptors [[buffer(1)]],\n");
     source.push_str("    const device M1OpParams* params [[buffer(2)]],\n");
     source.push_str("    const device uint* offsets [[buffer(3)]],\n");
-    source.push_str("    device uchar* all_scratch [[buffer(4)]],\n");
+    source.push_str("    const device ulong* scratch_bases [[buffer(4)]],\n");
     source.push_str("    const device M3GroupLayout* layout [[buffer(5)]],\n");
     source.push_str("    const device uint* channel_bindings [[buffer(6)]],\n");
     source.push_str("    device uchar* pending_flags [[buffer(7)]],\n");
@@ -862,9 +862,7 @@ pub(super) fn kernel_head(
         "  const device M1OpParams* lane_params = params + \
          dispatch_lane * layout->reserved2;\n",
     );
-    source.push_str(
-        "  device uchar* scratch = all_scratch + ulong(dispatch_lane) * ulong(layout->scratch_stride);\n",
-    );
+    source.push_str(super::M3_LANE_SCRATCH);
     source.push_str("  device uchar* temporary = scratch + layout->temporary_offset;\n");
     source.push_str(
         "  const device bfloat* logits = \
