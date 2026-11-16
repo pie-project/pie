@@ -1685,16 +1685,27 @@ impl Shell {
     /// The runs of the activation's span a fire stages into and reads out
     /// of, in the order they lie from `inputs_at`: the staged inputs' slab,
     /// the readout rows' table, the voxel store, the rs fold predicates and
-    /// the host-resident experts' staging, each to [`INPUTS_ALIGN`].
-    fn staged_runs(&self) -> [u64; 5] {
+    /// the host-resident experts' staging and the guests' samplers' lane
+    /// arenas, each to [`INPUTS_ALIGN`].
+    fn staged_runs(&self) -> [u64; 6] {
         [
             self.inputs.bytes(),
             self.readout_rows.bytes() as u64,
             self.voxels.as_ref().map_or(0, crate::voxels::Store::bytes),
             self.predicate.bytes(),
             self.expert_staging.bytes(),
+            self.lane_arenas_bytes(),
         ]
         .map(|bytes| bytes.next_multiple_of(INPUTS_ALIGN))
+    }
+
+    /// Where a guest's sampler meets across its blocks: the most blocks one
+    /// of its launches runs, at the plane's flight on this device.
+    fn lane_arenas_bytes(&self) -> u64 {
+        crate::program::launch::Arenas::bytes_for(
+            self.programs.flight(),
+            self.device.device().num_sm,
+        )
     }
 
     /// Backs the workspaces where the range now lies, zeroes them, and has
@@ -1703,8 +1714,8 @@ impl Shell {
         if let Some(buffers) = &self.buffers {
             buffers.lay_scratch(&mut self.pools)?;
         }
-        let [inputs, readouts, voxels, predicates, experts] = self.staged_runs();
-        let staged = inputs + readouts + voxels + predicates + experts;
+        let [inputs, readouts, voxels, predicates, experts, arenas] = self.staged_runs();
+        let staged = inputs + readouts + voxels + predicates + experts + arenas;
         self.pools
             .hold_activation_at(self.inputs_at, staged, false)?;
         let base = self.pools.activation_base() + self.inputs_at;
@@ -1718,6 +1729,17 @@ impl Shell {
         self.expert_staged = self
             .expert_staging
             .at(base + inputs + readouts + voxels + predicates);
+        self.programs.set_arenas(crate::program::launch::Arenas {
+            at: base + inputs + readouts + voxels + predicates + experts,
+            bytes: arenas,
+        });
+        eprintln!(
+            "engine-cuda: guests' samplers meet in {} KiB of lane arenas laid at load ({} \
+             lanes a flight on {} units), no lane's",
+            arenas >> 10,
+            self.programs.flight(),
+            self.device.device().num_sm,
+        );
         let Some(workspace) = &self.workspace else {
             return Ok(());
         };
