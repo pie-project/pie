@@ -317,6 +317,45 @@ fn decode(get: &HashMap<String, String>) -> Result<bool, String> {
         reading.model,
         t0.elapsed().as_secs_f64()
     );
+    if let Some(dir) = get.get("export") {
+        // every array's words for step 0 (the statics and the first step's entries) as the
+        // h2d files a capture-fed program's are, its host.json naming them: what
+        // tools/wafer/stream/run.py loads
+        let (_, entries) = reading.decode_step(&mut host, &trace, &seq[0..=0], 0)?;
+        let dir = Path::new(dir);
+        std::fs::create_dir_all(dir.join("h2d")).map_err(|e| e.to_string())?;
+        let path = reading.dir.join("host.json");
+        let mut h: Value = serde_json::from_str(
+            &std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?,
+        )
+        .map_err(|e| e.to_string())?;
+        for (k, a) in reading.h2d.iter().enumerate() {
+            let shape = [a.rect.h as usize, a.rect.w as usize, a.len];
+            let file = format!("h2d/{k}.npy");
+            match (&statics[k], &entries[k]) {
+                (_, Some(e)) => kernels_cerebras::npy::write_f32(&dir.join(&file), &shape, e)?,
+                (Some(w), None) if a.u16 => {
+                    kernels_cerebras::npy::write_u32(&dir.join(&file), &shape, w)?;
+                }
+                (Some(w), None) => {
+                    let f: Vec<f32> = w.iter().map(|x| f32::from_bits(*x)).collect();
+                    kernels_cerebras::npy::write_f32(&dir.join(&file), &shape, &f)?;
+                }
+                (None, None) => continue,
+            }
+            h["h2d"][k]["file"] = json!(file);
+            if let Some(o) = h["h2d"][k].as_object_mut() {
+                o.remove("entry");
+            }
+        }
+        std::fs::write(
+            dir.join("host.json"),
+            serde_json::to_string_pretty(&h).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        println!("DECODE_EXPORT {}", dir.display());
+        return Ok(true);
+    }
     if get.contains_key("dry") {
         // the host's side alone: the statics made, each step's entries
         let words: usize = statics.iter().flatten().map(Vec::len).sum();
