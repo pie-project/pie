@@ -3,7 +3,7 @@
 //! same registry against AMD's chips, keyed by their gfx version.
 #![allow(unsafe_code)]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use profile::{Anywhere, Decision, Domain, Facts, Profile, Registry, Report, Shelf, Var};
@@ -257,6 +257,38 @@ shelved!(
     ],
     rocm: ["gfx94.toml"],
 );
+
+/// The checked-in dense GEMM tactic tables, beside the device profiles they
+/// belong to (`sm89/nvidia-l40s.toml` has `sm89/nvidia-l40s.gemm`): what
+/// `pie tune` and loads on that device timed, read before the user's own.
+#[cfg(not(feature = "rocm"))]
+pub const GEMM_TABLES: &[(&str, &str)] = &[
+    (
+        "sm89/nvidia-l40s.gemm",
+        include_str!("../profiles/sm89/nvidia-l40s.gemm"),
+    ),
+    (
+        "sm120/nvidia-rtx-pro-4500-blackwell.gemm",
+        include_str!("../profiles/sm120/nvidia-rtx-pro-4500-blackwell.gemm"),
+    ),
+];
+
+/// The checked-in tactic table of `device`'s profile, if it has one.
+#[cfg(not(feature = "rocm"))]
+#[must_use]
+pub fn gemm_table(device: &str) -> Option<&'static str> {
+    let file = format!("/{}.gemm", profile::id_of(device));
+    GEMM_TABLES
+        .iter()
+        .find(|(path, _)| path.ends_with(&file))
+        .map(|(_, text)| *text)
+}
+
+/// Where the user's tactic table for `device` lives, beside their profile.
+#[must_use]
+pub fn user_gemm_table(profiles: &Path, device: &str) -> PathBuf {
+    SHELF.user_path(profiles, device).with_extension("gemm")
+}
 
 pub static SHELF: Shelf = Shelf {
     backend: "cuda",

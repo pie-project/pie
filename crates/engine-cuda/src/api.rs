@@ -420,7 +420,7 @@ pub(crate) const DEFAULT_FORWARD_TOKENS: u32 = 8192;
 /// The load's budgets for `trace`: its logit readouts sized to what the
 /// trace drafts, not the general 16 a lane, so a vocab-wide head carves only
 /// the rows a fire can read out.
-fn bake_budgets(budgets: &LoadBudgets, trace: &Trace) -> Budget {
+pub(crate) fn bake_budgets(budgets: &LoadBudgets, trace: &Trace) -> Budget {
     Budget {
         max_lanes: budgets.max_lanes,
         max_tokens: budgets.max_tokens,
