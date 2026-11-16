@@ -1189,9 +1189,9 @@ impl<B: Host> Gpu<B> {
                 ))
             })?;
         }
-        // A lane stating its slot tables names its kv pages and its record
-        // there (CONTRACT-BC 4); until the runtime states them, the legacy
-        // fields carry the same slot refs.
+        // A lane names its kv pages and its record in its slot tables
+        // (CONTRACT-BC 4): this engine states one shared pool, so the
+        // runtime states them.
         let mut pages_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
         let mut record_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
         let mut run_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
@@ -1244,8 +1244,8 @@ impl<B: Host> Gpu<B> {
                     word: words[at],
                     tokens: resolved[at].as_deref().unwrap_or(&lane.tokens),
                 },
-                pages: pages_of[at].as_deref().unwrap_or(&lane.kv.pages),
-                held: (!lane.kv.pages.is_empty() || pages_of[at].is_some()).then_some(lane.kv.held),
+                pages: pages_of[at].as_deref().unwrap_or(&[]),
+                held: pages_of[at].is_some().then_some(lane.kv.held),
                 kv_less: lane.kv_less,
 
                 mask: resolved_masks[at].as_ref().or(lane.mask.as_ref()),
