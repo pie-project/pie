@@ -28,10 +28,12 @@ pub const LATTICE_ROWS: [u32; 10] = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096
 
 /// The depths the matmul grid is measured at (its columns the same): the
 /// contractions of the dense layers served, from a small model's 1024
-/// (Qwen3-0.6B's hidden) through 4096 (Qwen3-8B's) to 8192 (a 30B-class
-/// hidden, or an MLP's down leg), since a device's rate at the same rows
-/// falls with the depth (a narrower contraction feeds fewer tiles).
-pub const DEPTHS: [u32; 4] = [1024, 2048, 4096, 8192];
+/// (Qwen3-0.6B's hidden) through 4096 (Qwen3-8B's) and 8192 (a 30B-class
+/// hidden) to 16384, past the down projections of the 8B and Llama-class
+/// MLPs (12288 and 14336 deep), so none is priced at a clamped point; a
+/// device's rate at the same rows falls with the depth (a narrower
+/// contraction feeds fewer tiles).
+pub const DEPTHS: [u32; 5] = [1024, 2048, 4096, 8192, 16384];
 
 /// The flops of one matmul of `rows` at `depth` (its columns the same):
 /// two a multiply-add.
@@ -174,7 +176,7 @@ pub fn tuned(rates: &profile::fire::Rates) -> String {
 pub fn provenance(backend: &str, how: &str) -> (&'static str, String) {
     let text = format!(
         "pie tune {backend} --rates on {} (pie {}): {how}; at engine::rates' lattice (matmul \
-         m x k x k, m 16..8192, k 1024..8192; attention keys x keys, keys 512..16384, {}/{} \
+         m x k x k, m 16..8192, k 1024..16384; attention keys x keys, keys 512..16384, {}/{} \
          heads of {}; scan {} tokens, {}/{} heads of {}x{}, conv {})",
         today(),
         env!("CARGO_PKG_VERSION"),
@@ -225,6 +227,8 @@ mod tests {
         assert!(DEPTHS.windows(2).all(|w| w[0] < w[1]));
         assert_eq!(weights_at(1024), 384);
         assert_eq!(weights_at(8192), 12);
+        assert_eq!(weights_at(16384), 12);
+        assert_eq!(DEPTHS.last(), Some(&16384));
         assert_eq!(gemm_flops(16, 1024), 2.0 * 16.0 * 1024.0 * 1024.0);
         // 4 · 2048 · 2048 · 16 · 128.
         assert_eq!(attn_flops(ATTN_SHAPE), 4.0 * 2048.0 * 2048.0 * 2048.0);
