@@ -308,6 +308,8 @@ fn the_paged_attention_answers_the_reference() {
         ([64, 8, 64], dec, None, both, all, read(false, true, 0, 0), none, true),
         ([64, 8, 64], dec, None, both, all, deep(read(false, true, 0, 4), false), none, true),
         ([32, 16, 256], dec, None, sunk, all, read(false, true, 0, 8), none, true),
+        ([32, 4, 128], dec, None, both, all, read(true, true, 0, 0), none, true),
+        ([32, 4, 128], dec, w200, both, lanes, read(false, true, 256, 0), none, true),
         ([8, 2, 128], chunks, w100, sunk, pre, fa2, none, true),
         ([32, 4, 128], chunks, None, rec, pre, tuned(|t| t.prefill_tc5 = true), none, true),
     ];
