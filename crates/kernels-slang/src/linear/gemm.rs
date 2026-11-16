@@ -143,8 +143,10 @@ fn kernel(
             if tiles > 65_535 {
                 return Err(refuse(op, format!("the grid will not launch: {m} rows")));
             }
+            // A workgroup a tile: the shader takes its tile from
+            // `SV_GroupID`.
             Fire::at(REGISTER, entry)
-                .groups([n.div_ceil(cols) * tx, tiles * ty, 1])
+                .groups([n.div_ceil(cols), tiles, 1])
                 .group([tx, ty, 1])
         }
         Target::Spirv => Fire::at(GEMM, "linear_gemm_tiled_bf16")
