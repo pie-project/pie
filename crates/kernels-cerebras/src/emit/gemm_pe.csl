@@ -52,13 +52,13 @@ fn xsend(src: mem1d_dsd, n: u16) void {
     route(C_XF, 0x12);
   }
 }
-// a column line member's turn (south root 0x84, north root 0x88)
+// a column line member's turn (south root 0x84, north root 0x88), the line its request's rows
 fn csend(cf: u16, cb: u16, src: mem1d_dsd, n: u16) void {
-  if (Y > 0) {
+  if (Y > R0) {
     route(cb, 0x88); fab.oqc(3, cb); @mov32(fab.fout(q_co, n), src); drain(3);
     route(cb, 0x58);
   }
-  if (Y + 1 < GY) {
+  if (Y + 1 < R0 + RQ) {
     route(cf, 0x84); fab.oqc(3, cf); @mov32(fab.fout(q_co, n), src); drain(3);
     route(cf, 0x74);
   }
@@ -186,8 +186,9 @@ fn attend(a: u16) void {
   }
   fab.iqc(6, C_KF);
   const half = TB * nc;
-  var j: u16 = 0;
-  while (j < GY) : (j += kbm) {
+  // (the request's rows of PEs: its keys)
+  var j: u16 = R0;
+  while (j < R0 + RQ) : (j += kbm) {
     var i: u16 = 0;
     while (i < kbm) : (i += 1) {
       const m = j + i;
@@ -221,9 +222,9 @@ fn attend(a: u16) void {
     if (causal != 0) {
       t = 0;
       while (t < TB) : (t += 1) {
-        const qi = Y * TB + t;
+        const qi = (Y - R0) * TB + t;
         var c: u16 = 0;
-        while (c < KB) : (c += 1) { if (j * TB + c > qi) { mem[SC + t * KB + c] = -1.0e30; } }
+        while (c < KB) : (c += 1) { if ((j - R0) * TB + c > qi) { mem[SC + t * KB + c] = -1.0e30; } }
       }
     }
     t = 0;

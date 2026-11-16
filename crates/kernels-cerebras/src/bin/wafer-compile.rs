@@ -44,7 +44,7 @@ const USAGE: &str = "usage: wafer-compile plan (--model <deployment> | --shape <
      --build <dir> [--fabric simulator|system]\n       wafer-compile cost --plan <plan.json>\n       \
      wafer-compile search --model <deployment> [--positions N] [--set K=V,...] [--keep N]\n       \
      wafer-compile stream --model <deployment> [--reading R] [--rows N] [--ieee] --out <dir> \
-     [--regime auto|stream|gemm|tiled] [--gemm C,R,KBM] [--values <dir>] [--stages N] [--tap v,..] [--py N] [--tile W] [--spill] \
+     [--regime auto|stream|gemm|tiled] [--gemm C,R,KBM] [--batch B | --batch-most B] [--values <dir>] [--stages N] [--tap v,..] [--py N] [--tile W] [--spill] \
      [--cut THIN,SUB,WIDEN,HELP] [--fabric-width W] [--class-rows context=512,latents=4096] \
      [--price context=512,latents=4096 [--parts]] [--clip t,h,w]";
 
@@ -429,6 +429,8 @@ fn stream(args: &[String]) -> Result<(), String> {
     let pins = [
         "--regime",
         "--gemm",
+        "--batch",
+        "--batch-most",
         "--py",
         "--tile",
         "--cut",
@@ -467,12 +469,31 @@ fn stream(args: &[String]) -> Result<(), String> {
         };
         let crow = kernels_cerebras::stream::parse_rows(&get("--class-rows").unwrap_or_default())?;
         let bounds = kernels_cerebras::floorplan::stream::Bounds::system();
-        let p =
-            kernels_cerebras::stream::gemm::program(&trace, &o, &crow, pin, (bounds.w, bounds.h))?;
+        let p = match get("--batch-most") {
+            // the batch by price, at most so many requests a launch
+            Some(m) if pin.is_none() => kernels_cerebras::stream::gemm::batched(
+                &trace,
+                &o,
+                &crow,
+                (bounds.w, bounds.h),
+                m.parse().map_err(|e| format!("--batch-most: {e}"))?,
+            )?,
+            _ => kernels_cerebras::stream::gemm::program(
+                &trace,
+                &o,
+                &crow,
+                pin,
+                (bounds.w, bounds.h),
+                get("--batch")
+                    .map_or(Ok(1), |b| b.parse::<u32>())
+                    .map_err(|e| format!("--batch: {e}"))?,
+            )?,
+        };
         let c = kernels_cerebras::cost::gemm::time(&p);
         let m = kernels_cerebras::cost::gemm::memory(&p);
         println!(
-            "{model} {reading}: gemm, {} ops ({} modules) over {} x {} PEs, {} rows a PE, key blocks of {} rows, stream {} words a column ({} rows of tapes), {} words a PE, {:.2}M cycles ({:.3} ms at 750 MHz)",
+            "{model} {reading}: gemm, {} requests a launch, {} ops ({} modules) over {} x {} PEs, {} rows a PE, key blocks of {} rows, stream {} words a column ({} rows of tapes), {} words a PE, {:.2}M cycles ({:.3} ms at 750 MHz)",
+            p.l.batch,
             p.l.ops.len(),
             p.modules.len(),
             p.c,

@@ -519,9 +519,10 @@ fn pe_file(p: &GemmProgram, tb: &Table) -> String {
     }
     let _ = writeln!(
         t,
-        "const GX: u16 = {};\nconst GY: u16 = {};\nconst TB: u16 = {};\nconst BAND: u16 = {};\nconst HROW = [{}]u16 {{ {} }};\nconst NOPS: u16 = {};\nconst OPN: u16 = {};\nvar prog = @zeros([OPN]u16);\nconst D_prog = @get_dsd(mem1d_dsd, .{{ .tensor_access = |i|{{OPN}} -> prog[i] }});\nvar D_progw = D_prog;\nconst fk = [{}]f32 {{ {} }};",
+        "const GX: u16 = {};\nconst GY: u16 = {};\nconst RQ: u16 = {};\nvar R0: u16 = 0;\nconst TB: u16 = {};\nconst BAND: u16 = {};\nconst HROW = [{}]u16 {{ {} }};\nconst NOPS: u16 = {};\nconst OPN: u16 = {};\nvar prog = @zeros([OPN]u16);\nconst D_prog = @get_dsd(mem1d_dsd, .{{ .tensor_access = |i|{{OPN}} -> prog[i] }});\nvar D_progw = D_prog;\nconst fk = [{}]f32 {{ {} }};",
         p.c,
         p.r,
+        p.r / p.l.batch.max(1),
         p.tb,
         p.band,
         tb.hout_cols.len(),
@@ -567,7 +568,7 @@ fn pe_file(p: &GemmProgram, tb: &Table) -> String {
          var hin: [{hin}]f32 align(16) = @zeros([{hin}]f32);\nvar hin_p: [*]f32 = &hin;\nconst D_hin = @get_dsd(mem1d_dsd, .{{ .tensor_access = |i|{{{hin}}} -> hin[i] }});\n\
          var hsc: [{hsc}]f32 = @zeros([{hsc}]f32);\nvar hsc_p: [*]f32 = &hsc;\n\
          var hout: [{hout}]f32 align(16) = @zeros([{hout}]f32);\nvar hout_p: [*]f32 = &hout;\nconst D_hout = @get_dsd(mem1d_dsd, .{{ .tensor_access = |i|{{{hout}}} -> hout[i] }});\n\
-         var pcfg = @zeros([3]u32);\nvar pcfg_p: [*]u32 = &pcfg;",
+         var pcfg = @zeros([4]u32);\nvar pcfg_p: [*]u32 = &pcfg;",
         aw = tb.aw,
         sc = tb.sc,
         rt = tb.rt,
@@ -605,7 +606,7 @@ fn pe_file(p: &GemmProgram, tb: &Table) -> String {
     }
     let _ = write!(
         t,
-        "task go() void {{\n  stamp(0);\n  X = @as(u16, pcfg[0]);\n  Y = @as(u16, pcfg[1]);\n  CLS = @as(u16, pcfg[2]);\n  D_xhw = @set_dsd_base_addr(D_wb, @ptrcast([*]u32, &xh[0]));\n  D_progw = @set_dsd_base_addr(D_wb, @ptrcast([*]u32, &prog[0]));\n  D_kvw = @set_dsd_base_addr(D_wb, @ptrcast([*]u32, &kvh[0]));\n  gseg.setup(X, GX, BAND);\n  fab.iqc(2, C_XF);\n  fab.iqc(6, C_KF);\n{init}  run_all();\n  stamp(1);\n  sys_mod.unblock_cmd_stream();\n}}\n"
+        "task go() void {{\n  stamp(0);\n  X = @as(u16, pcfg[0]);\n  Y = @as(u16, pcfg[1]);\n  CLS = @as(u16, pcfg[2]);\n  R0 = @as(u16, pcfg[3]) * RQ;\n  D_xhw = @set_dsd_base_addr(D_wb, @ptrcast([*]u32, &xh[0]));\n  D_progw = @set_dsd_base_addr(D_wb, @ptrcast([*]u32, &prog[0]));\n  D_kvw = @set_dsd_base_addr(D_wb, @ptrcast([*]u32, &kvh[0]));\n  gseg.setup(X, GX, BAND);\n  fab.iqc(2, C_XF);\n  fab.iqc(6, C_KF);\n{init}  run_all();\n  stamp(1);\n  sys_mod.unblock_cmd_stream();\n}}\n"
     );
     t.push_str("comptime {\n  @bind_local_task(go, T_GO);\n  @export_symbol(run);\n  @export_symbol(tsc_p, \"tsc\");\n  @export_symbol(pcfg_p, \"pcfg\");\n  @export_symbol(hin_p, \"hin\");\n  @export_symbol(hsc_p, \"hsc\");\n  @export_symbol(hout_p, \"hout\");\n");
     for s in &exports {
@@ -694,11 +695,15 @@ fn layout_file(p: &GemmProgram) -> String {
     rule(C_XF, (w - 1, w, 1), ay, "WEST", &["RAMP"]);
     rule(C_XB, (0, 1, 1), ay, "EAST", &["RAMP"]);
     rule(C_XB, (1, w, 1), ay, "EAST", &["WEST", "RAMP"]);
-    // the column line: south, north
-    rule(C_KF, ax, (0, h - 1, 1), "NORTH", &["SOUTH", "RAMP"]);
-    rule(C_KF, ax, (h - 1, h, 1), "NORTH", &["RAMP"]);
-    rule(C_KB, ax, (0, 1, 1), "SOUTH", &["RAMP"]);
-    rule(C_KB, ax, (1, h, 1), "SOUTH", &["NORTH", "RAMP"]);
+    // the column line, a request's rows of PEs each: south, north
+    let rq = h / p.l.batch.max(1);
+    for b in 0..p.l.batch.max(1) {
+        let (y0, y1) = (b * rq, (b + 1) * rq);
+        rule(C_KF, ax, (y0, y1 - 1, 1), "NORTH", &["SOUTH", "RAMP"]);
+        rule(C_KF, ax, (y1 - 1, y1, 1), "NORTH", &["RAMP"]);
+        rule(C_KB, ax, (y0, y0 + 1, 1), "SOUTH", &["RAMP"]);
+        rule(C_KB, ax, (y0 + 1, y1, 1), "SOUTH", &["NORTH", "RAMP"]);
+    }
     // the weight tree: the tape's head north, up the column to every PE's ramp
     rule(C_WT, ax, (h, h + 1, 1), "RAMP", &["NORTH"]);
     rule(C_WT, ax, (1, h, 1), "SOUTH", &["NORTH", "RAMP"]);
@@ -788,6 +793,7 @@ pub fn emit(p: &GemmProgram) -> R<Emitted> {
     }
     for y in 0..p.r {
         let cls = p.row_class[y as usize];
+        let req = p.row_req[y as usize];
         let step_row = |t: u32| y * p.tb + t;
         for x in 0..p.c {
             let at = Coord::new(x, y);
@@ -795,8 +801,8 @@ pub fn emit(p: &GemmProgram) -> R<Emitted> {
                 at,
                 sym: "pcfg".into(),
                 u16: false,
-                len: 3,
-                fill: GridFill::Words(vec![x, y, cls as u32]),
+                len: 4,
+                fill: GridFill::Words(vec![x, y, cls as u32, req]),
                 group: None,
             });
             // the step's entries: the host's values on the PE's rows, the rows' scalars
@@ -814,7 +820,14 @@ pub fn emit(p: &GemmProgram) -> R<Emitted> {
                     let cl = if ieee { CLAMP } else { 0 };
                     let lw: u32 = local(val, p.c, x).iter().map(|s| s.4).sum();
                     for tt in 0..rows {
-                        let (row, one) = if *lane { (0, 0) } else { (step_row(tt), ONE) };
+                        // (a lane vector: a row a lane, a request's lanes in turn: its
+                        // first's)
+                        let lanes = p.l.class_rows.len() as u32;
+                        let (row, one) = if *lane {
+                            (req * lanes, 0)
+                        } else {
+                            (step_row(tt), ONE)
+                        };
                         let mut e = 0;
                         for s in local(val, p.c, x) {
                             for i in 0..s.4 {

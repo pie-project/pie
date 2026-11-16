@@ -161,7 +161,8 @@ pub fn time(p: &GemmProgram) -> GemmCost {
                 let kb = p.kbm * tb;
                 let nc = p.qchunk;
                 let half = tb * nc;
-                let blocks = p.r / p.kbm;
+                // (a request's key blocks: its rows of PEs')
+                let blocks = p.r / p.l.batch.max(1) / p.kbm;
                 let sl = kb / p.band.max(1);
                 let blk = f64::from(p.kbm)
                     * (TURN

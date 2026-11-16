@@ -491,7 +491,7 @@ pub fn compile_whole(
             trace, s, o.round16, o.upto, &o.taps, None, None, None, false, b,
         )
     });
-    let gm = gemm::program(trace, o, class_rows, None, (b.w, b.h));
+    let gm = gemm::program(trace, o, class_rows, None, (b.w, b.h), 1);
     // (each regime's price as its runs measure it)
     let sc = st.as_ref().map_or(f64::MAX, crate::cost::stream::expected);
     let gc = gm.as_ref().map_or(f64::MAX, crate::cost::gemm::expected);

@@ -371,3 +371,51 @@ fn flux_2_minis_denoise_on_the_fabric() {
     }
     assert!(ok, "a latent is past the bf16 tolerance");
 }
+
+/// Two requests' step (the second at another timestep, its latent the first's reversed) as one
+/// batch: each request's capture (`READING_OUT/a`, `/b`) and the batch's (`READING_OUT/gold`:
+/// every value the two requests' rows in turn, as a batched step lays them out), for
+/// `wafer-compile stream --regime gemm --batch 2 --values`.
+#[test]
+#[ignore = "writes files; set READING_OUT"]
+fn flux_2_minis_batch_files() {
+    let out = PathBuf::from(std::env::var("READING_OUT").expect("set READING_OUT"));
+    let trace = trace();
+    let mut forward = Forward::new(trace.clone(), None, &|n: &str, c: usize| {
+        common::plane(&trace, n, c)
+    })
+    .expect("flux2-mini loads");
+    let a = common::inputs();
+    let b: Vec<(String, Vec<f32>)> = a
+        .iter()
+        .map(|(n, v)| match n.as_str() {
+            "timestep" => (n.clone(), vec![700.0; v.len()]),
+            "latents" => (n.clone(), v.iter().rev().copied().collect()),
+            _ => (n.clone(), v.clone()),
+        })
+        .collect();
+    for (tag, inputs) in [("a", &a), ("b", &b)] {
+        capture(
+            &mut forward,
+            &trace,
+            &step_of(&trace, inputs),
+            &out.join(tag),
+        );
+    }
+    let gold = out.join("gold");
+    std::fs::create_dir_all(&gold).expect("a capture directory");
+    for e in std::fs::read_dir(out.join("a")).expect("a's capture") {
+        let name = e.expect("a file").file_name();
+        let (pa, pb) = (out.join("a").join(&name), out.join("b").join(&name));
+        if !name.to_string_lossy().ends_with(".npy") {
+            std::fs::copy(&pa, gold.join(&name)).expect("the index");
+            continue;
+        }
+        let (sa, mut va) = kernels_cerebras::npy::read_f32_or_i32(&pa).expect("a's value");
+        let (_, vb) = kernels_cerebras::npy::read_f32_or_i32(&pb).expect("b's value");
+        va.extend(vb);
+        let mut shape = sa.clone();
+        shape[0] *= 2;
+        kernels_cerebras::npy::write_f32(&gold.join(&name), &shape, &va).expect("a batch value");
+    }
+}

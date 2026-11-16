@@ -207,6 +207,27 @@ pub struct Lowering {
     pub round16: bool,
     /// Every value's alias (a merge of class arms: one slot).
     pub alias: BTreeMap<ValueId, ValueId>,
+    /// Requests a launch: the step's rows `batch` requests' rows in turn (each its classes'
+    /// rows, its lane vectors its own row), its attention its own rows'.
+    pub batch: u32,
+}
+
+impl Lowering {
+    /// A request's rows (every class's).
+    #[must_use]
+    pub fn request_rows(&self) -> u32 {
+        self.class_rows.iter().map(|x| x.0).sum()
+    }
+
+    /// Step row `t`'s class.
+    #[must_use]
+    pub fn class_of(&self, t: u32) -> usize {
+        let t = t % self.request_rows().max(1);
+        self.class_rows
+            .iter()
+            .position(|&(n, f)| t >= f && t < f + n)
+            .unwrap_or(0)
+    }
 }
 
 /// A placed program: the lowering at `c x r` PEs.
@@ -216,8 +237,9 @@ pub struct GemmProgram {
     pub c: u32,
     pub r: u32,
     pub tb: u32,
-    /// Each PE row's class.
+    /// Each PE row's class and request.
     pub row_class: Vec<usize>,
+    pub row_req: Vec<u32>,
     /// The printed modules (name, text).
     pub modules: Vec<(String, String)>,
     /// Arena offsets (f32 words) by value, its size.
@@ -692,6 +714,7 @@ pub fn lower(trace: &Trace, o: &Options, class_rows: &[(String, u32)]) -> R<Lowe
         regs: lw.regs,
         round16: o.round16,
         alias: lw.alias,
+        batch: 1,
     })
 }
 
@@ -816,21 +839,28 @@ fn w16(round16: bool) -> u32 {
 #[allow(clippy::too_many_lines)]
 pub fn place(l: &Lowering, c: u32, r: u32, kbm: u32) -> R<GemmProgram> {
     let t = &l.trace;
-    let total: u32 = l.class_rows.iter().map(|x| x.0).sum();
+    let per = l.request_rows();
+    let total = per * l.batch.max(1);
     if c == 0 || r == 0 || !total.is_multiple_of(r) {
         return Err(refuse(t, format!("{total} rows over {r} rows of PEs")));
     }
     let tb = total / r;
-    let mut row_class = Vec::new();
-    for (ci, &(rows, _)) in l.class_rows.iter().enumerate() {
-        if !rows.is_multiple_of(tb) {
-            return Err(refuse(
-                t,
-                format!("class {ci}'s {rows} rows over blocks of {tb}"),
-            ));
+    // (a PE row's rows one request's, one class's)
+    let (mut row_class, mut row_req) = (Vec::new(), Vec::new());
+    for b in 0..l.batch.max(1) {
+        for (ci, &(rows, _)) in l.class_rows.iter().enumerate() {
+            if !rows.is_multiple_of(tb) {
+                return Err(refuse(
+                    t,
+                    format!("class {ci}'s {rows} rows over blocks of {tb}"),
+                ));
+            }
+            row_class.extend(std::iter::repeat_n(ci, (rows / tb) as usize));
+            row_req.extend(std::iter::repeat_n(b, (rows / tb) as usize));
         }
-        row_class.extend(std::iter::repeat_n(ci, (rows / tb) as usize));
     }
+    // (a request's rows of PEs)
+    let rq = r / l.batch.max(1);
     // every value read by a region or attention cuts evenly
     for (vid, v) in &l.vals {
         if v.free {
@@ -872,11 +902,11 @@ pub fn place(l: &Lowering, c: u32, r: u32, kbm: u32) -> R<GemmProgram> {
                 qchunk = qc;
             }
             // (a key block's keys are the dim-major tile's stride: a DSD stride is 8 bits)
-            if !r.is_multiple_of(kbm) || !(kbm * tb).is_multiple_of(band) || kbm * tb > 127 {
+            if !rq.is_multiple_of(kbm) || !(kbm * tb).is_multiple_of(band) || kbm * tb > 127 {
                 return Err(refuse(
                     t,
                     format!(
-                        "key blocks of {kbm} rows of PEs over {r} ({} keys over a band of {band})",
+                        "key blocks of {kbm} rows of PEs over {rq} ({} keys over a band of {band})",
                         kbm * tb
                     ),
                 ));
@@ -1231,6 +1261,7 @@ pub fn place(l: &Lowering, c: u32, r: u32, kbm: u32) -> R<GemmProgram> {
         r,
         tb,
         row_class,
+        row_req,
         modules,
         slots,
         arena,
@@ -1341,9 +1372,11 @@ pub fn program(
     class_rows: &[(String, u32)],
     pin: Option<(u32, u32, u32)>,
     bounds: (u32, u32),
+    batch: u32,
 ) -> R<GemmProgram> {
-    let l = lower(trace, o, class_rows)?;
-    let total: u32 = l.class_rows.iter().map(|x| x.0).sum();
+    let mut l = lower(trace, o, class_rows)?;
+    l.batch = batch.max(1);
+    let total = l.request_rows() * l.batch;
     let mut cands: Vec<(u32, u32, u32)> = Vec::new();
     match pin {
         Some(p) => cands.push(p),
@@ -1419,6 +1452,31 @@ pub fn program(
             why
         }
     })
+}
+
+/// The batch of at most `most` requests a launch whose program serves a request cheapest (its
+/// step's price over its requests; the fewer requests on a tie), and that program.
+pub fn batched(
+    trace: &Trace,
+    o: &Options,
+    class_rows: &[(String, u32)],
+    bounds: (u32, u32),
+    most: u32,
+) -> R<GemmProgram> {
+    let mut best: Option<(f64, GemmProgram)> = None;
+    let mut why = String::new();
+    for b in 1..=most.max(1) {
+        match program(trace, o, class_rows, None, bounds, b) {
+            Ok(p) => {
+                let each = crate::cost::gemm::time(&p).cycles / f64::from(b);
+                if best.as_ref().is_none_or(|(c, _)| each < *c) {
+                    best = Some((each, p));
+                }
+            }
+            Err(e) => why = e,
+        }
+    }
+    best.map(|(_, p)| p).ok_or(why)
 }
 
 /// Compiles `p` into `out`: its CSL and its host's files (`host.json`: the classes, the arrays'
@@ -1581,13 +1639,12 @@ pub fn emulate(l: &Lowering, vals: &super::host::Values) -> R<BTreeMap<ValueId, 
             f32::from_bits(((b.wrapping_add(0x7fff + ((b >> 16) & 1))) >> 16) << 16)
         }
     };
-    let rows: u32 = l.class_rows.iter().map(|c| c.0).sum();
-    let class_of = |t: u32| {
-        l.class_rows
-            .iter()
-            .position(|&(n, f)| t >= f && t < f + n)
-            .unwrap_or(0)
-    };
+    // (a batch: the requests' rows in turn, a lane vector a request's row)
+    let per = l.request_rows();
+    let nb = l.batch.max(1);
+    let rows: u32 = per * nb;
+    let class_of = |t: u32| l.class_of(t);
+    let req = |t: usize| t / per.max(1) as usize;
     // (a value's step rows, a lane vector's one)
     let mut m: BTreeMap<ValueId, Vec<f32>> = BTreeMap::new();
     let get = |v: ValueId| -> R<(usize, usize, std::rc::Rc<Vec<f32>>)> {
@@ -1602,7 +1659,11 @@ pub fn emulate(l: &Lowering, vals: &super::host::Values) -> R<BTreeMap<ValueId, 
                 let (_, w, d) = get(*v)?;
                 let mut x: Vec<f32> = d.to_vec();
                 if *lane {
-                    x.truncate(w);
+                    // (a row a lane, a request's lanes in turn: each request's first)
+                    let lanes = l.class_rows.len().max(1);
+                    x = (0..nb as usize)
+                        .flat_map(|b| d[b * lanes * w..b * lanes * w + w].to_vec())
+                        .collect();
                 }
                 if ieee {
                     for e in &mut x {
@@ -1630,7 +1691,7 @@ pub fn emulate(l: &Lowering, vals: &super::host::Values) -> R<BTreeMap<ValueId, 
                     .ok_or_else(|| format!("emulate: %{} unmade", x.0))?
                     .clone();
                 let xw = l.vals[x].width as usize;
-                let nr = if *lane { 1 } else { rows as usize };
+                let nr = if *lane { nb as usize } else { rows as usize };
                 let mut out = m.remove(y).unwrap_or_else(|| vec![0.0; nr * *n as usize]);
                 out.resize(nr * *n as usize, 0.0);
                 for t in 0..nr {
@@ -1667,7 +1728,7 @@ pub fn emulate(l: &Lowering, vals: &super::host::Values) -> R<BTreeMap<ValueId, 
                     .first()
                     .map_or(1, |o| l.vals[o].width as usize / w.max(1))
                     .max(1);
-                let nr = if g.lane { 1 } else { rows as usize };
+                let nr = if g.lane { nb as usize } else { rows as usize };
                 let mut res: Vec<Vec<f32>> = vec![Vec::new(); g.outs.len()];
                 for (t, hh) in (0..nr).flat_map(|t| (0..reps).map(move |h| (t, h))) {
                     if !g.lane && (g.mask >> class_of(t as u32)) & 1 == 0 {
@@ -1687,8 +1748,8 @@ pub fn emulate(l: &Lowering, vals: &super::host::Values) -> R<BTreeMap<ValueId, 
                                 kernels_ir::interp::Arg::Row(d[t * vw + f..t * vw + f + w].to_vec())
                             }
                             RArg::Lane { v, from } => {
-                                let d = &m[v];
-                                let f = from_h(*from);
+                                let (d, vw) = (&m[v], l.vals[v].width as usize);
+                                let f = from_h(*from) + if g.lane { t } else { req(t) } * vw;
                                 kernels_ir::interp::Arg::Row(d[f..f + w].to_vec())
                             }
                             RArg::Static { v, from } => {
@@ -1772,6 +1833,10 @@ pub fn emulate(l: &Lowering, vals: &super::host::Values) -> R<BTreeMap<ValueId, 
                     for h in 0..*heads as usize {
                         let mut sc = vec![0f32; nr];
                         for (u, scu) in sc.iter_mut().enumerate() {
+                            if req(u) != req(t) {
+                                *scu = f32::NEG_INFINITY;
+                                continue;
+                            }
                             let su = side(u);
                             let mut a = 0f32;
                             for j in 0..hd {
@@ -1916,5 +1981,33 @@ mod tests {
         assert_eq!(m.src(3 * 128 + 16), 128 + 64);
         assert!(p.l.regs.iter().any(|g| g.head));
         assert!(crate::cost::gemm::memory(&p).total <= crate::cost::gemm::PE_WORDS);
+    }
+
+    /// Two requests a launch: their rows in turn over the array, each PE row one request's, the
+    /// attention's key blocks a request's own, the step's price the array's (half a request's).
+    #[test]
+    fn a_batch_of_two_places_each_request_on_its_own_rows() {
+        let o = Options {
+            reading: "denoise".into(),
+            rows: 16,
+            round16: true,
+            upto: None,
+            taps: Vec::new(),
+        };
+        let t = trace("flux2-mini-bf16-kv-bf16");
+        let one = program(&t, &o, &[], Some((32, 4, 4)), (762, 1172), 1)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let two = program(&t, &o, &[], Some((32, 8, 4)), (762, 1172), 2)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!((one.tb, two.tb), (8, 8));
+        assert_eq!(two.row_req, vec![0, 0, 0, 0, 1, 1, 1, 1]);
+        assert_eq!(&two.row_class[..4], &one.row_class[..]);
+        let (a, b) = (
+            crate::cost::gemm::time(&one).cycles,
+            crate::cost::gemm::time(&two).cycles,
+        );
+        assert!((a - b).abs() < 1e-6 * a, "{a} against {b}");
+        // a request's key blocks only: the rows of PEs a request's, not the array's
+        assert!(place(&two.l, 32, 8, 8).is_err());
     }
 }
