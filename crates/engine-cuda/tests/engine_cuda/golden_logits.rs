@@ -1688,7 +1688,6 @@ fn submitted_buffered(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
             tokens,
             kv: KvDelta {
                 held: fed,
-                pages: pages.clone(),
                 ..KvDelta::default()
             },
             rs,
