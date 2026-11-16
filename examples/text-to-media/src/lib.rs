@@ -9,6 +9,11 @@ use serde::{Deserialize, Serialize};
 #[serde(default)]
 struct Input {
     prompt: String,
+    /// More than one image a run: a prompt each (a list, or one string of them split by `|`),
+    /// denoised together (each a pass's group of its own, its seed `seed + i`), each written
+    /// as `<out>_<i>`.
+    #[serde(deserialize_with = "prompt_list")]
+    prompts: Vec<String>,
     negative_prompt: Option<String>,
     width: Option<u32>,
     height: Option<u32>,
@@ -30,6 +35,22 @@ struct Input {
     no_send: bool,
     format: Option<String>,
     out: Option<String>,
+}
+
+/// A list of prompts, or one string of them split by `|` (as `pie run -- --prompts "a|b"`).
+fn prompt_list<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Prompts {
+        List(Vec<String>),
+        Joined(String),
+    }
+    Ok(match Prompts::deserialize(d)? {
+        Prompts::List(v) => v,
+        Prompts::Joined(s) => s.split('|').map(|p| p.trim().to_string()).collect(),
+    })
 }
 
 #[derive(Serialize)]
@@ -139,9 +160,15 @@ fn need(value: Option<u32>, name: &str) -> Result<u32> {
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    if input.prompt.is_empty() {
+    let prompts: Vec<String> = if input.prompts.is_empty() {
+        vec![input.prompt.clone()]
+    } else {
+        input.prompts.clone()
+    };
+    if prompts.iter().any(String::is_empty) {
         return Err("empty prompt".into());
     }
+    let images = prompts.len();
     let space = model::latent().ok_or("this model states no latent space")?;
     let (sc, tc, first, c) = (
         space.spatial_compression,
@@ -201,6 +228,9 @@ async fn main(input: Input) -> Result<Output> {
     if mask.is_some() && init.is_none() {
         return Err("a mask needs the picture it is cut from: attach `init`".into());
     }
+    if images > 1 && (init.is_some() || input.solver.as_deref() == Some("dpm2m")) {
+        return Err("a batch of prompts takes no `init`, mask or `dpm2m`".into());
+    }
 
     let fact = model::schedule().ok_or("this model states no schedule")?;
     let steps = match input.steps {
@@ -243,11 +273,16 @@ async fn main(input: Input) -> Result<Output> {
     let cfg = negative.is_some() && guidance > 1.0;
 
     let pipe = Pipeline::new();
-    let cond = encode(&pipe, context_in, &input.prompt)?;
-    let uncond = match &negative {
-        Some(neg) if cfg => Some(encode(&pipe, context_in, neg)?),
-        _ => None,
-    };
+    // each image's prompt rows, and its negative's under guidance
+    let mut conds = Vec::with_capacity(images);
+    for prompt in &prompts {
+        let cond = encode(&pipe, context_in, prompt)?;
+        let uncond = match &negative {
+            Some(neg) if cfg => Some(encode(&pipe, context_in, neg)?),
+            _ => None,
+        };
+        conds.push((cond, uncond));
+    }
 
     let start = init
         .map(|init| -> Result<Channel> {
@@ -288,7 +323,10 @@ async fn main(input: Input) -> Result<Output> {
         })
         .transpose()?;
 
-    let x = Channel::new(lat, dtype::f32).queued();
+    let xs: Vec<Channel> = (0..images)
+        .map(|_| Channel::new(lat, dtype::f32).queued())
+        .collect();
+    let x = xs[0];
     let use_dpm2m = input.solver.as_deref() == Some("dpm2m");
     let x0_prev = use_dpm2m.then(|| Channel::new([n, c], dtype::f32).queued());
     let dpm_tables = use_dpm2m.then(|| Dpm2m::of(&sched).channels());
@@ -302,15 +340,25 @@ async fn main(input: Input) -> Result<Output> {
     let guidance_ch = Channel::from([guidance]);
     let mask = mask.map(|m| Channel::from_shaped([n, 1], m.as_slice()));
     let seed = input.seed;
-    let seed_ch = Channel::from([seed, 0u32]);
+    // (image i's noise keyed by `seed + i`)
+    let seeds: Vec<Channel> = (0..images as u32)
+        .map(|i| Channel::from([seed + i, 0u32]))
+        .collect();
+    let seed_ch = seeds[0];
     let key = move |i: &Tensor| scatter_set(seed_ch.read(), Tensor::constant([1u32]), i);
+    let xs_pro = xs.clone();
+    let seeds_pro = seeds.clone();
     let prologue = move || {
         let zero = Tensor::constant([0u32]);
-        let eps = normal(key(&zero), lat);
-        x.put(match start {
-            None => eps,
-            Some(start) => &(&reshape(start.read(), lat) * (1.0 - sigma0)) + &(&eps * sigma0),
-        });
+        for (i, (x, sd)) in xs_pro.iter().zip(&seeds_pro).enumerate() {
+            let eps = normal(scatter_set(sd.read(), Tensor::constant([1u32]), &zero), lat);
+            x.put(match start {
+                Some(start) if i == 0 => {
+                    &(&reshape(start.read(), lat) * (1.0 - sigma0)) + &(&eps * sigma0)
+                }
+                _ => eps,
+            });
+        }
         if let Some(prev) = &x0_prev {
             prev.put(broadcast(Tensor::constant([0f32]), [n, c]));
         }
@@ -320,8 +368,13 @@ async fn main(input: Input) -> Result<Output> {
     let denoise = |first: bool, with_sync: bool| -> Result<(ForwardPass, Option<Channel>)> {
         let pass = ForwardPass::new();
         let step_sync = with_sync.then(|| Channel::new([1], dtype::u32));
-        let groups = [Some(&cond), uncond.as_ref()].into_iter().flatten();
-        for (g, (ctx, len)) in groups.enumerate() {
+        // each image its group (and its negative's): a context lane and a latents lane each
+        let groups = conds.iter().zip(&xs).flat_map(|((cond, uncond), x)| {
+            [Some((cond, x)), uncond.as_ref().map(|u| (u, x))]
+                .into_iter()
+                .flatten()
+        });
+        for (g, ((ctx, len), x)) in groups.enumerate() {
             for (s, (stream, lane)) in [("context", &context), ("latents", &latents)]
                 .into_iter()
                 .enumerate()
@@ -331,7 +384,7 @@ async fn main(input: Input) -> Result<Output> {
                 pass.group(at, g as u32)?;
                 for decl in &lane.inputs {
                     let ch = match decl.name.as_str() {
-                        "latents" => &x,
+                        "latents" => x,
                         "timestep" => &t,
                         "guidance" => &guidance_ch,
                         "context" => ctx,
@@ -347,12 +400,35 @@ async fn main(input: Input) -> Result<Output> {
             }
         }
         if first {
-            pass.prologue(prologue);
+            pass.prologue(prologue.clone());
         }
         let sync_ep = step_sync;
+        let xs_ep = xs.clone();
         pass.epilogue(move || {
             let step = k.take();
             let next = &step + 1u32;
+            let sig = sigmas.read();
+            // (each image's velocity: its latents lane's, its group's lanes in turn)
+            let per = if cfg { 4 } else { 2 };
+            for (i, xi) in xs_ep.iter().enumerate().skip(1) {
+                let base = per * i as u32;
+                let v = intrinsics::output_rows(base + 1, "velocity", n);
+                let v = if cfg {
+                    cfg_combine(
+                        &v,
+                        &intrinsics::output_rows(base + 3, "velocity", n),
+                        &Tensor::constant([guidance]),
+                    )
+                } else {
+                    v
+                };
+                let x1 = euler_step(
+                    &reshape(xi.take(), [n, c]),
+                    &v,
+                    &(&at(&sig, &next) - &at(&sig, &step)),
+                );
+                xi.put(reshape(&x1, lat));
+            }
             let v = intrinsics::output_rows(1, "velocity", n);
             let v = if cfg {
                 cfg_combine(
@@ -363,7 +439,6 @@ async fn main(input: Input) -> Result<Output> {
             } else {
                 v
             };
-            let sig = sigmas.read();
             let mut x1 = if let (Some(prev_ch), Some(tables)) = (&x0_prev, &dpm_tables) {
                 let current = reshape(x.take(), [n, c]);
                 let scalar = |table: &Channel, idx: &Tensor| {
@@ -435,47 +510,52 @@ async fn main(input: Input) -> Result<Output> {
     }
 
     let vae = lane("vae.decode", "latents")?;
-    let ws = WorkingSet::new();
-    let j = Channel::new([1], dtype::u32).queued();
-    let decode = |first: bool| -> Result<(ForwardPass, Channel)> {
-        let pass = ForwardPass::new();
-        on(&pass, 0, "vae.decode", "latents")?;
-        if vae.state {
-            pass.state(&[&ws], StateGeometry::default())?;
+    // each image's frames decoded in turn
+    let mut media = Vec::with_capacity(images);
+    for &x in &xs {
+        let ws = WorkingSet::new();
+        let j = Channel::new([1], dtype::u32).queued();
+        let decode = |first: bool| -> Result<(ForwardPass, Channel)> {
+            let pass = ForwardPass::new();
+            on(&pass, 0, "vae.decode", "latents")?;
+            if vae.state {
+                pass.state(&[&ws], StateGeometry::default())?;
+            }
+            let frame = Channel::new([lh, lw, c], dtype::f32).queued();
+            pass.input(0, "latents", &frame)?;
+            pass.prologue(move || {
+                let at = if first {
+                    Tensor::constant([0u32])
+                } else {
+                    j.take()
+                };
+                frame.put(reshape(
+                    gather(reshape(x.read(), [lt, lh * lw * c]), &at),
+                    [lh, lw, c],
+                ));
+                j.put(&at + 1u32);
+            });
+            let rows = pixel_frames(u32::from(!first)) * height * width;
+            let pixels = Channel::new([rows, 3], dtype::f32);
+            pass.epilogue(move || {
+                frame.take();
+                pixels.put(intrinsics::output_rows(0, "pixels", rows));
+            });
+            Ok((pass, pixels))
+        };
+        let (head, rest) = (decode(true)?, decode(false)?);
+        let mut clips = Vec::new();
+        for f in 0..lt {
+            let (pass, pixels) = if f == 0 { &head } else { &rest };
+            pass.submit(&pipe)?;
+            clips.push(pixels.take_frames(
+                width,
+                height,
+                pixel_frames(f),
+                input.fps.unwrap_or(24.0),
+            )?);
         }
-        let frame = Channel::new([lh, lw, c], dtype::f32).queued();
-        pass.input(0, "latents", &frame)?;
-        pass.prologue(move || {
-            let at = if first {
-                Tensor::constant([0u32])
-            } else {
-                j.take()
-            };
-            frame.put(reshape(
-                gather(reshape(x.read(), [lt, lh * lw * c]), &at),
-                [lh, lw, c],
-            ));
-            j.put(&at + 1u32);
-        });
-        let rows = pixel_frames(u32::from(!first)) * height * width;
-        let pixels = Channel::new([rows, 3], dtype::f32);
-        pass.epilogue(move || {
-            frame.take();
-            pixels.put(intrinsics::output_rows(0, "pixels", rows));
-        });
-        Ok((pass, pixels))
-    };
-    let (head, rest) = (decode(true)?, decode(false)?);
-    let mut clips = Vec::new();
-    for f in 0..lt {
-        let (pass, pixels) = if f == 0 { &head } else { &rest };
-        pass.submit(&pipe)?;
-        clips.push(pixels.take_frames(
-            width,
-            height,
-            pixel_frames(f),
-            input.fps.unwrap_or(24.0),
-        )?);
+        media.push(clips);
     }
     pipe.close();
 
@@ -495,13 +575,22 @@ async fn main(input: Input) -> Result<Output> {
                 ));
             }
         };
-    let file = format!("{}.{ext}", input.out.as_deref().unwrap_or("out"));
-    if !input.no_send {
-        let media = Frames::concat(&clips.iter().collect::<Vec<_>>())?;
-        inferlet::session::send_frames(&media, format, &file)?;
+    let stem = input.out.as_deref().unwrap_or("out");
+    let mut files = Vec::with_capacity(images);
+    for (i, clips) in media.iter().enumerate() {
+        let file = if images == 1 {
+            format!("{stem}.{ext}")
+        } else {
+            format!("{stem}_{i}.{ext}")
+        };
+        if !input.no_send {
+            let media = Frames::concat(&clips.iter().collect::<Vec<_>>())?;
+            inferlet::session::send_frames(&media, format, &file)?;
+        }
+        files.push(file);
     }
     Ok(Output {
-        file,
+        file: files.join(","),
         size: format!("{width}x{height}"),
         frames,
         steps: num_steps,
