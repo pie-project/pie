@@ -11,6 +11,15 @@ use crate::device::{Api, Context, Frame};
 
 /// The rates of `device`, under the tactics `tuning` picks.
 pub fn measure(device: &Context, tuning: &crate::tuning::Tuning) -> Result<Rates> {
+    measure_saying(device, tuning, &mut |_| {})
+}
+
+/// [`measure`], saying how the warm-up ended.
+pub fn measure_saying(
+    device: &Context,
+    tuning: &crate::tuning::Tuning,
+    say: &mut dyn FnMut(&str),
+) -> Result<Rates> {
     let tier = <Api as engine_gpu::serve::Serve>::tier(device);
     let timer = |frame: Frame| {
         crate::encode::reset_kernel_profile();
@@ -22,5 +31,5 @@ pub fn measure(device: &Context, tuning: &crate::tuning::Tuning) -> Result<Rates
             .filter(|&ns| ns > 0);
         Ok((span, (host * 1e9) as u64))
     };
-    engine_gpu::rates::measure::<Api, _>(device, tuning, tier, &timer)
+    engine_gpu::rates::measure_saying::<Api, _>(device, tuning, tier, &timer, say)
 }

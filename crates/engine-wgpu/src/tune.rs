@@ -23,7 +23,7 @@ pub fn rates(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Outco
     let (base, report) = crate::chip::resolve(&chip, profiles);
     say(&format!("{}: starting from {}", chip.name, report.used));
     let tuning = crate::tuning::Tuning::new(base.clone(), device.cores());
-    let r = crate::rates::measure(&device, &tuning).map_err(|e| e.to_string())?;
+    let r = crate::rates::measure_saying(&device, &tuning, say).map_err(|e| e.to_string())?;
     for &(m, n, k, rate) in r.bf16_flops_per_ns_by_rows_n_k.as_deref().unwrap_or(&[]) {
         say(&format!(
             "[rates]: matmul m {m:>5} n {n:>5} k {k:>5}: {:6.1} TFLOP/s",

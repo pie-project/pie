@@ -333,10 +333,34 @@ pub fn measure(
         pipelines: Pipelines::new(),
         tuning: &tuning,
     };
+    // Warm the device until its rate stops falling (engine::rates::warm_up):
+    // rotations of the widest matmul over its planes.
+    {
+        let (m, n, k) = engine::rates::WARM_SHAPE;
+        let noise = bf16_noise((n * k) as usize, 5, 0.05);
+        let weights = (0..engine::rates::weights_at(n, k))
+            .map(|_| {
+                let w = bench.buffer(&noise)?;
+                Ok((bench.tensor(&w, n, k, Dtype::Bf16)?, w))
+            })
+            .collect::<Result<Vec<(Tensor, Buffer)>, String>>()?;
+        let tensors: Vec<Tensor> = weights.iter().map(|(t, _)| *t).collect();
+        let warmed = engine::rates::warm_up(|| bench.matmul_flops(m, n, k, &tensors))?;
+        say(&format!(
+            "  warm-up: {} rotations of the {m}^3 matmul, settled at {:.2} TFLOP/s",
+            warmed.rotations,
+            warmed.rate / 1e3
+        ));
+    }
     let mut grid = Vec::with_capacity(LATTICE_ROWS.len() * DEPTHS.len() * DEPTHS.len());
-    for (k, n) in DEPTHS
+    // The shapes, and each shape's rows, in engine::rates' spread order.
+    let shapes: Vec<(u32, u32)> = DEPTHS
         .iter()
         .flat_map(|&k| DEPTHS.iter().map(move |&n| (k, n)))
+        .collect();
+    for (k, n) in engine::rates::spread_order(shapes.len())
+        .into_iter()
+        .map(|at| shapes[at])
     {
         // The planes every backend rotates through (engine::rates::weights_at:
         // 768 MiB, at least 12), each its own memory so each repeat streams
@@ -349,7 +373,10 @@ pub fn measure(
             })
             .collect::<Result<Vec<(Tensor, Buffer)>, String>>()?;
         let tensors: Vec<Tensor> = weights.iter().map(|(t, _)| *t).collect();
-        for m in LATTICE_ROWS {
+        for m in engine::rates::spread_order(LATTICE_ROWS.len())
+            .into_iter()
+            .map(|row| LATTICE_ROWS[row])
+        {
             let rate = bench.matmul_flops(m, n, k, &tensors)?;
             say(&format!(
                 "  bf16 matmul {m} x {n} x {k}: {:.2} TFLOP/s",
@@ -358,6 +385,7 @@ pub fn measure(
             grid.push((m, n, k, rate));
         }
     }
+    grid.sort_by_key(|&(m, n, k, _)| (k, n, m));
     let mut keys_curve = Vec::with_capacity(ATTN_KEYS.len() * ATTN_DIMS.len());
     for (d, keys) in ATTN_DIMS
         .iter()

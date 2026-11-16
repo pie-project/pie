@@ -93,6 +93,49 @@ pub fn operand_pattern() -> Vec<u8> {
     bytes
 }
 
+/// The matmul every backend's rates step warms the device with before it
+/// times anything ([`warm_up`]): the widest the grid times, `m x n x k`.
+pub const WARM_SHAPE: (u32, u32, u32) = (8192, 8192, 8192);
+
+/// How a warm-up ended: the rotations of [`WARM_SHAPE`] over its
+/// [`weights_at`] planes it ran, and the rate (flops a ns) of the last.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Warmed {
+    pub rotations: u32,
+    pub rate: f64,
+}
+
+/// Warm the device until its clock stops falling: run `rotation` (one
+/// rotation of [`WARM_SHAPE`] back to back over its [`weights_at`] planes,
+/// returning its rate) while each rotation's rate is below the one before
+/// it (the clock still sinking under its power cap), and stop at the first
+/// rotation that is not slower than its predecessor (the descent over).
+/// Every backend's rates step calls it first, so its timings start on a
+/// settled clock rather than a cold one.
+pub fn warm_up<E>(mut rotation: impl FnMut() -> Result<f64, E>) -> Result<Warmed, E> {
+    let mut last = rotation()?;
+    let mut rotations = 1;
+    loop {
+        let rate = rotation()?;
+        rotations += 1;
+        if rate >= last {
+            return Ok(Warmed { rotations, rate });
+        }
+        last = rate;
+    }
+}
+
+/// The order a rates step times `len` points in: a fixed stride through
+/// them ([`attn_page_order`]'s), not ascending, so a drift left after the
+/// warm-up spreads over the grid rather than biasing its widest rows.
+#[must_use]
+pub fn spread_order(len: usize) -> Vec<usize> {
+    attn_page_order(u32::try_from(len).unwrap_or(u32::MAX))
+        .into_iter()
+        .map(|i| i as usize)
+        .collect()
+}
+
 /// The bytes of q, k and v sets an attention's timed fires rotate through
 /// at least: [`WEIGHT_BYTES`]' bound, past every last-level cache, since a
 /// served fire reads each layer's kv (and its q) cold.
@@ -370,6 +413,32 @@ mod tests {
         assert!(values.iter().any(|&v| v != values[0]));
         let mean = values.iter().map(|&v| f64::from(v)).sum::<f64>() / values.len() as f64;
         assert!(mean.abs() < 0.01, "{mean}");
+    }
+
+    #[test]
+    fn the_warm_up_runs_until_its_rate_stops_falling() {
+        // A clock sinking 100, 96, 93, 92 then holding: four rotations to
+        // the first not slower than the one before.
+        let mut rates = [100.0, 96.0, 93.0, 92.0, 92.5, 80.0].into_iter();
+        let warmed = warm_up(|| Ok::<f64, ()>(rates.next().unwrap())).unwrap();
+        assert_eq!((warmed.rotations, warmed.rate), (5, 92.5));
+        // A warm device: two rotations.
+        let mut rates = [100.0, 100.0].into_iter();
+        assert_eq!(
+            warm_up(|| Ok::<f64, ()>(rates.next().unwrap()))
+                .unwrap()
+                .rotations,
+            2
+        );
+    }
+
+    #[test]
+    fn the_points_are_timed_in_a_spread_order() {
+        let order = spread_order(250);
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..250).collect::<Vec<usize>>());
+        assert!(!order.windows(2).all(|w| w[0] < w[1]));
     }
 
     #[test]

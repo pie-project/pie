@@ -755,7 +755,7 @@ fn rates(base: &Profile, say: &mut dyn FnMut(&str)) -> Result<profile::fire::Rat
         crate::device::Context::bind(&crate::api::DeviceBoot::default(), engine::Allowance::WHOLE)
             .map_err(|e| e.to_string())?;
     let tuning = crate::tuning::Tuning::new(base.clone(), device.limits());
-    let rates = crate::rates::measure(&device, &tuning).map_err(|e| e.to_string())?;
+    let rates = crate::rates::measure_saying(&device, &tuning, say).map_err(|e| e.to_string())?;
     // The matmul path the profile selects on this card, which the rates
     // step measures through.
     let tier = <crate::device::Api as engine_gpu::serve::Serve>::tier(&device);

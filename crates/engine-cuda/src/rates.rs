@@ -261,6 +261,13 @@ mod on_device {
         let clock = Clock::new(stream)?;
         let mut held = Vec::new();
         let random = Random::new(stream)?;
+        let warmed = warm(device.ctx(), &clock, &random, &mut held)?;
+        eprintln!(
+            "[rates]: warm-up: {} rotations of the {}^3 matmul, settled at {:.1} TFLOP/s",
+            warmed.rotations,
+            engine::rates::WARM_SHAPE.0,
+            warmed.rate / 1e3
+        );
         let grid = gemm(device.ctx(), &clock, &random, &mut held)?;
         let mut attn = Vec::with_capacity(ATTN_KEYS.len() * ATTN_DIMS.len());
         for d in ATTN_DIMS {
@@ -292,13 +299,50 @@ mod on_device {
         random: &Random,
         held: &mut Vec<Buffer>,
     ) -> Result<Vec<(u32, u32, u32, f64)>, String> {
-        let mut grid = Vec::with_capacity(LATTICE_ROWS.len() * DEPTHS.len() * DEPTHS.len());
-        for &k in &DEPTHS {
-            for &n in &DEPTHS {
-                grid.extend(gemm_at(ctx, clock, random, held, n, k)?);
-            }
+        // The shapes in engine::rates' spread order, so a drift left after
+        // the warm-up spreads over the grid.
+        let shapes: Vec<(u32, u32)> = DEPTHS
+            .iter()
+            .flat_map(|&k| DEPTHS.iter().map(move |&n| (n, k)))
+            .collect();
+        let mut grid = Vec::with_capacity(LATTICE_ROWS.len() * shapes.len());
+        for at in engine::rates::spread_order(shapes.len()) {
+            let (n, k) = shapes[at];
+            grid.extend(gemm_at(ctx, clock, random, held, n, k)?);
         }
+        grid.sort_by_key(|&(m, n, k, _)| (k, n, m));
         Ok(grid)
+    }
+
+    /// The device warmed (engine::rates::warm_up): bursts of the widest
+    /// matmul over its planes until its rate stops falling.
+    fn warm(
+        ctx: &Ctx,
+        clock: &Clock,
+        random: &Random,
+        held: &mut Vec<Buffer>,
+    ) -> Result<engine::rates::Warmed, String> {
+        let (m, n, k) = engine::rates::WARM_SHAPE;
+        let act = random.operand(m as usize * k as usize * 2)?;
+        let y = zeroed(m as usize * n as usize * 2)?;
+        let planes = weights_at(n, k);
+        let weights = (0..planes)
+            .map(|_| random.operand(n as usize * k as usize * 2))
+            .collect::<Result<Vec<Buffer>, String>>()?;
+        let fire = |w: usize| {
+            kernels_cuda::linear::gemm::matmul(
+                ctx,
+                Tensor::new(act.ptr(), m, k, Dtype::Bf16),
+                Tensor::new(weights[w % planes].ptr(), n, k, Dtype::Bf16),
+                &mut Tensor::new(y.ptr(), m, n, Dtype::Bf16),
+            )
+        };
+        lay(held, || fire(0))?;
+        engine::rates::warm_up(|| {
+            let ns = clock
+                .time(&mut || (0..planes).try_for_each(|w| fire(w).map_err(say("the matmul"))))?;
+            Ok(engine::rates::gemm_flops(m, n, k) * planes as f64 / ns.max(1.0))
+        })
     }
 
     /// The matmul `m x n x k` at every row count of the lattice.
@@ -318,7 +362,8 @@ mod on_device {
             .map(|_| random.operand(n as usize * k as usize * 2))
             .collect::<Result<Vec<Buffer>, String>>()?;
         let mut curve = Vec::with_capacity(LATTICE_ROWS.len());
-        for &m in &LATTICE_ROWS {
+        for row in engine::rates::spread_order(LATTICE_ROWS.len()) {
+            let m = LATTICE_ROWS[row];
             let fire = |w: usize| {
                 kernels_cuda::linear::gemm::matmul(
                     ctx,

@@ -206,7 +206,25 @@ pub fn measure<B: Serve, T: Tactics + ?Sized>(
     tier: kernels_slang::Tier,
     timer: Timer<'_, B>,
 ) -> Result<Rates> {
+    measure_saying::<B, T>(device, tactics, tier, timer, &mut |_| {})
+}
+
+/// [`measure`], saying how the warm-up ended.
+pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
+    device: &B::Context,
+    tactics: &T,
+    tier: kernels_slang::Tier,
+    timer: Timer<'_, B>,
+    say: &mut dyn FnMut(&str),
+) -> Result<Rates> {
     let mut rig = Rig::<B>::new(device);
+    let warmed = warm(&mut rig, tactics.gemm(tier), timer)?;
+    say(&format!(
+        "[rates]: warm-up: {} rotations of the {}^3 matmul, settled at {:.1} TFLOP/s",
+        warmed.rotations,
+        engine::rates::WARM_SHAPE.0,
+        warmed.rate / 1e3
+    ));
     let grid = grid(&mut rig, tactics.gemm(tier), timer)?;
     let mut attn = Vec::with_capacity(ATTN_KEYS.len() * ATTN_DIMS.len());
     for d in ATTN_DIMS {
@@ -227,43 +245,81 @@ pub fn measure<B: Serve, T: Tactics + ?Sized>(
     })
 }
 
+/// The device warmed ([`engine::rates::warm_up`]): rotations of
+/// [`engine::rates::WARM_SHAPE`] over its planes, each one frame timed by
+/// the host's clock around its one submit, until the rate stops falling.
+fn warm<B: Serve>(
+    rig: &mut Rig<'_, B>,
+    tactic: kernels_slang::linear::gemm::Tactic,
+    timer: Timer<'_, B>,
+) -> Result<engine::rates::Warmed> {
+    let (m, n, k) = engine::rates::WARM_SHAPE;
+    let act = rig.operand(m, k, Dtype::Bf16)?;
+    let weights = (0..weights_at(n, k))
+        .map(|_| rig.operand(n, k, Dtype::Bf16))
+        .collect::<Result<Vec<Tensor>>>()?;
+    let y = rig.zeros(m, n, Dtype::Bf16)?;
+    let next = std::cell::Cell::new(0usize);
+    let fire = |sink: &kernels_slang::Ctx<'_>| {
+        let w = weights[next.get() % weights.len()];
+        next.set(next.get() + 1);
+        kernels_slang::linear::gemm::matmul(sink, tactic, act, w, y).map_err(fault("rates: matmul"))
+    };
+    let planes = u32::try_from(weights.len()).unwrap_or(u32::MAX);
+    let nothing = |_: &mut B::Frame| Ok(());
+    let warmed = engine::rates::warm_up(|| {
+        let (_, wall) = rig.frame(timer, planes, &fire, &nothing)?;
+        Ok::<f64, Fault>(gemm_flops(m, n, k) * f64::from(planes) / wall.max(1) as f64)
+    })?;
+    rig.release();
+    Ok(warmed)
+}
+
 /// The matmul rate at each row count, column count and depth of the
-/// lattice: `(m, n, k, flops a ns)`, by depth, then columns, then rows.
+/// lattice: `(m, n, k, flops a ns)`, ordered by depth, then columns, then
+/// rows. The shapes are timed in [`engine::rates::spread_order`], and each
+/// shape's rows in it too, so a drift left after the warm-up spreads over
+/// the grid.
 fn grid<B: Serve>(
     rig: &mut Rig<'_, B>,
     tactic: kernels_slang::linear::gemm::Tactic,
     timer: Timer<'_, B>,
 ) -> Result<Vec<(u32, u32, u32, f64)>> {
     let widest = LATTICE_ROWS[LATTICE_ROWS.len() - 1];
-    let mut out = Vec::with_capacity(LATTICE_ROWS.len() * DEPTHS.len() * DEPTHS.len());
-    for k in DEPTHS {
-        for n in DEPTHS {
-            let act = rig.operand(widest, k, Dtype::Bf16)?;
-            // Each fire reads the next of these, past the last-level cache.
-            let weights = (0..weights_at(n, k))
-                .map(|_| rig.operand(n, k, Dtype::Bf16))
-                .collect::<Result<Vec<Tensor>>>()?;
-            let y = rig.zeros(widest, n, Dtype::Bf16)?;
-            let next = std::cell::Cell::new(0usize);
-            for m in LATTICE_ROWS {
-                let ns = rig.each(timer, &|sink| {
-                    let w = weights[next.get() % weights.len()];
-                    next.set(next.get() + 1);
-                    kernels_slang::linear::gemm::matmul(
-                        sink,
-                        tactic,
-                        Tensor { rows: m, ..act },
-                        w,
-                        Tensor { rows: m, ..y },
-                    )
-                    .map_err(fault("rates: matmul"))
-                })?;
-                out.push((m, n, k, gemm_flops(m, n, k) / ns as f64));
-            }
-            // This shape's planes go before the next shape's are laid.
-            rig.release();
+    let shapes: Vec<(u32, u32)> = DEPTHS
+        .iter()
+        .flat_map(|&k| DEPTHS.iter().map(move |&n| (n, k)))
+        .collect();
+    let mut out = Vec::with_capacity(LATTICE_ROWS.len() * shapes.len());
+    for at in engine::rates::spread_order(shapes.len()) {
+        let (n, k) = shapes[at];
+        let act = rig.operand(widest, k, Dtype::Bf16)?;
+        // Each fire reads the next of these, past the last-level cache.
+        let weights = (0..weights_at(n, k))
+            .map(|_| rig.operand(n, k, Dtype::Bf16))
+            .collect::<Result<Vec<Tensor>>>()?;
+        let y = rig.zeros(widest, n, Dtype::Bf16)?;
+        let next = std::cell::Cell::new(0usize);
+        for row in engine::rates::spread_order(LATTICE_ROWS.len()) {
+            let m = LATTICE_ROWS[row];
+            let ns = rig.each(timer, &|sink| {
+                let w = weights[next.get() % weights.len()];
+                next.set(next.get() + 1);
+                kernels_slang::linear::gemm::matmul(
+                    sink,
+                    tactic,
+                    Tensor { rows: m, ..act },
+                    w,
+                    Tensor { rows: m, ..y },
+                )
+                .map_err(fault("rates: matmul"))
+            })?;
+            out.push((m, n, k, gemm_flops(m, n, k) / ns as f64));
         }
+        // This shape's planes go before the next shape's are laid.
+        rig.release();
     }
+    out.sort_by_key(|&(m, n, k, _)| (k, n, m));
     Ok(out)
 }
 
