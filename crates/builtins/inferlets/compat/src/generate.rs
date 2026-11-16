@@ -4,8 +4,8 @@
 //! behind the runtime's run-ahead window.
 //!
 //! The sampler is one ETA epilogue: the OpenAI penalties (presence,
-//! frequency, and the multiplicative repetition penalty) over a vocabulary
-//! histogram carried on the device, an optional grammar mask, temperature,
+//! frequency, and the multiplicative repetition penalty) over the lane's
+//! tokens carried on the device, an optional grammar mask, temperature,
 //! then min-p, top-k and top-p truncation and a Gumbel-max draw. Temperature
 //! zero is exact greedy. Asked for logprobs, the epilogue also lands the
 //!
@@ -173,9 +173,15 @@ impl Sampling {
     }
 
     fn penalized(&self) -> bool {
-        self.presence_penalty != 0.0
-            || self.frequency_penalty != 0.0
-            || self.repetition_penalty != 1.0
+        self.repeats() || self.counted()
+    }
+
+    fn repeats(&self) -> bool {
+        self.repetition_penalty != 1.0
+    }
+
+    fn counted(&self) -> bool {
+        self.presence_penalty != 0.0 || self.frequency_penalty != 0.0
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -283,39 +289,103 @@ struct Landed {
     ids: Option<Tensor>,
 }
 
-/// The sampled token as a rank-0 i32, the next output-token histogram, and
-/// the step's logprobs where the knobs ask. `histogram` is `(counts,
-/// present)`: how often each token was generated, and whether it was in the
-/// prompt.
+#[derive(Clone, Copy)]
+struct History<T> {
+    seen: Option<T>,
+    counts: Option<T>,
+}
+
+impl<T> History<T> {
+    fn map<U>(self, mut f: impl FnMut(T) -> U) -> History<U> {
+        History {
+            seen: self.seen.map(&mut f),
+            counts: self.counts.map(f),
+        }
+    }
+
+    fn as_ref(&self) -> History<&T> {
+        History {
+            seen: self.seen.as_ref(),
+            counts: self.counts.as_ref(),
+        }
+    }
+}
+
+impl History<Channel> {
+    fn seeded(s: &Sampling, vocab: u32, prompt: &[u32], generated: Option<i32>) -> Self {
+        let at = |t: i64| usize::try_from(t).ok().filter(|&t| t < vocab as usize);
+        let generated = generated.and_then(|t| at(i64::from(t)));
+        History {
+            seen: s.repeats().then(|| {
+                let mut seen = vec![false; vocab as usize];
+                for t in prompt.iter().filter_map(|&t| at(i64::from(t))).chain(generated) {
+                    seen[t] = true;
+                }
+                Channel::from(seen)
+            }),
+            counts: s.counted().then(|| {
+                let mut counts = vec![0.0f32; vocab as usize];
+                if let Some(t) = generated {
+                    counts[t] = 1.0;
+                }
+                Channel::from(counts)
+            }),
+        }
+    }
+
+    fn queued(s: &Sampling, vocab: u32) -> Self {
+        History {
+            seen: s
+                .repeats()
+                .then(|| Channel::new([vocab], dtype::bool).queued()),
+            counts: s
+                .counted()
+                .then(|| Channel::new([vocab], dtype::f32).queued()),
+        }
+    }
+
+    fn take(&self) -> History<Tensor> {
+        self.map(|c| c.take())
+    }
+
+    fn put(&self, next: &History<Tensor>) {
+        if let (Some(c), Some(v)) = (self.seen, &next.seen) {
+            c.put(v);
+        }
+        if let (Some(c), Some(v)) = (self.counts, &next.counts) {
+            c.put(v);
+        }
+    }
+}
+
+/// The sampled token as a rank-0 i32, the lane's history past it, and the
+/// step's logprobs where the knobs ask.
 fn sample(
     vocab: u32,
     k: &Knobs,
     r: &Tensor,
-    histogram: Option<(&Tensor, &Tensor)>,
+    history: History<&Tensor>,
     mask: Option<&Tensor>,
-) -> (Tensor, Option<Tensor>, Option<Landed>) {
+) -> (Tensor, History<Tensor>, Option<Landed>) {
     let mut logits = reshape(intrinsics::output(0, "logits"), [vocab]);
     let processed = k.logprobs.is_some() && k.logprobs_mode.processed();
     let raw = k
         .logprobs
         .filter(|_| !k.logprobs_mode.processed())
         .map(|_| logits.clone());
-    if let Some((counts, present)) = histogram {
-        let zero = broadcast(0.0f32, [vocab]);
-        let seen_out = gt(counts, &zero);
-        let seen_prompt = gt(present, broadcast(0.5f32, [vocab]));
-        let seen = or(&seen_out, &seen_prompt);
-        if let Some(rep) = &k.repetition {
-            let rp = broadcast(rep, [vocab]);
-            let positive = gt(&logits, &zero);
-            let repenalized = select(&positive, &logits / &rp, &logits * &rp);
-            logits = select(&seen, &repenalized, &logits);
-        }
+    let zero = broadcast(0.0f32, [vocab]);
+    if let (Some(rep), Some(seen)) = (&k.repetition, history.seen) {
+        let rp = broadcast(rep, [vocab]);
+        let positive = gt(&logits, &zero);
+        let repenalized = select(&positive, &logits / &rp, &logits * &rp);
+        logits = select(seen, &repenalized, &logits);
+    }
+    if let Some(counts) = history.counts {
         if let Some(freq) = &k.frequency {
             logits = &logits - broadcast(freq, [vocab]) * counts;
         }
         if let Some(pres) = &k.presence {
-            logits = &logits - broadcast(pres, [vocab]) * cast(&seen_out, dtype::f32);
+            logits = &logits - broadcast(pres, [vocab]) * cast(gt(counts, &zero), dtype::f32);
         }
     }
     if let Some(mask) = mask {
@@ -357,7 +427,10 @@ fn sample(
             )
         }
     };
-    let next = histogram.map(|(counts, _)| scatter_add(counts, &token, 1.0f32));
+    let next = History {
+        seen: history.seen.map(|seen| scatter_set(seen, &token, true)),
+        counts: history.counts.map(|counts| scatter_add(counts, &token, 1.0f32)),
+    };
     let landed = raw.or(drawn_from).zip(k.logprobs).map(|(scored, top)| {
         let lp = if k.logprobs_mode.logits() {
             scored
@@ -603,19 +676,6 @@ pub async fn generate(
 
     let ws = WorkingSet::new();
 
-    let penalized = sampling.penalized();
-    let present: Vec<f32> = if penalized {
-        let mut v = vec![0.0f32; vocab as usize];
-        for &t in prompt {
-            if (t as usize) < v.len() {
-                v[t as usize] = 1.0;
-            }
-        }
-        v
-    } else {
-        Vec::new()
-    };
-
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     // Scored, every prompt row but the last is prefilled by the scoring
     // passes, and only the last token is left to sample after.
@@ -637,23 +697,13 @@ pub async fn generate(
     let carried_on = (guide.is_none() && sampling.logprobs.is_none()).then(|| {
         (
             Channel::new([1], dtype::i32).queued(),
-            penalized.then(|| {
-                (
-                    Channel::new([vocab], dtype::f32).queued(),
-                    Channel::new([vocab], dtype::f32).queued(),
-                )
-            }),
+            History::queued(&sampling, vocab),
         )
     });
     let toks = Channel::from(&prompt_i32[base..]);
     let embed_indptr = Channel::from([0u32, n - base as u32]);
     let rng = Channel::from([sampling.seed, 0u32]);
-    let hist = penalized.then(|| {
-        (
-            Channel::from(vec![0.0f32; vocab as usize]),
-            Channel::from(present.clone()),
-        )
-    });
+    let hist = History::seeded(&sampling, vocab, prompt, None);
     let mask = guide.is_some().then(|| Channel::new([vocab], dtype::bool));
     let g0_ch = Channel::new([1], dtype::i32);
     let lp_ch = logprob_channels(sampling.logprobs, 1);
@@ -669,24 +719,15 @@ pub async fn generate(
     fwd.state(&[&ws], StateGeometry::folding())?;
     fwd.epilogue(move || {
         let r = rng.take();
-        let taken = hist.map(|(c, p)| (c.take(), p.take()));
+        let taken = hist.take();
         let m = mask.map(|m| m.take());
-        let (token, counts_next, landed) = sample(
-            vocab,
-            &knobs.read(),
-            &r,
-            taken.as_ref().map(|(c, p)| (c, p)),
-            m.as_ref(),
-        );
+        let (token, next, landed) = sample(vocab, &knobs.read(), &r, taken.as_ref(), m.as_ref());
         let token = reshape(token, [1]);
         g0_ch.put(&token);
         land(landed, lp_ch);
-        if let Some((tok_in, hist)) = carried_on {
+        if let Some((tok_in, carried)) = carried_on {
             tok_in.put(&token);
-            if let (Some((c, p)), Some(next), Some((_, present))) = (hist, counts_next, taken) {
-                c.put(&next);
-                p.put(&present);
-            }
+            carried.put(&next);
         }
     });
     if let (Some(m), Some(guide)) = (mask, guide.as_deref_mut()) {
@@ -734,17 +775,8 @@ pub async fn generate(
     let knobs = KnobChannels::new(&sampling);
     let lp_ch = logprob_channels(sampling.logprobs, channel_capacity() as u32);
     let lane1 = Channel::from([0u32, 1u32]);
-    let hist = carried_hist.unwrap_or_else(|| {
-        penalized.then(|| {
-            let mut counts0 = vec![0.0f32; vocab as usize];
-            if let Ok(g0) = usize::try_from(g0)
-                && g0 < counts0.len()
-            {
-                counts0[g0] = 1.0;
-            }
-            (Channel::from(counts0), Channel::from(present.clone()))
-        })
-    });
+    let hist =
+        carried_hist.unwrap_or_else(|| History::seeded(&sampling, vocab, prompt, Some(g0)));
     let mask = guide.is_some().then(|| Channel::new([vocab], dtype::bool));
 
     let fwd = ForwardPass::new();
@@ -753,17 +785,11 @@ pub async fn generate(
     fwd.state(&[&ws], StateGeometry::folding())?;
     fwd.epilogue(move || {
         let r = rng.take();
-        let taken = hist.map(|(c, p)| (c.take(), p.take()));
+        let taken = hist.take();
         let m = mask.map(|m| m.take());
         let k = knobs.read();
 
-        let (token, counts_next, landed) = sample(
-            vocab,
-            &k,
-            &r,
-            taken.as_ref().map(|(c, p)| (c, p)),
-            m.as_ref(),
-        );
+        let (token, next, landed) = sample(vocab, &k, &r, taken.as_ref(), m.as_ref());
         let token = reshape(token, [1]);
         land(landed, lp_ch);
         let r_next = &r + iota(2);
@@ -771,10 +797,7 @@ pub async fn generate(
         tok_in.put(&token);
         out.put(&token);
         rng.put(&r_next);
-        if let (Some((c, p)), Some(next), Some((_, present))) = (hist, counts_next, taken) {
-            c.put(&next);
-            p.put(&present);
-        }
+        hist.put(&next);
     });
 
     let budget = max_tokens - 1;
