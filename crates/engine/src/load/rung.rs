@@ -45,11 +45,14 @@ impl RungFacts {
     /// sampled), a wider one prefill-shaped (one prompt, one row sampled).
     #[must_use]
     pub fn sampled(&self) -> u32 {
-        if self.tokens <= self.lanes {
-            self.tokens
-        } else {
-            1
-        }
+        if self.decode_shaped() { self.tokens } else { 1 }
+    }
+
+    /// Whether the estimate weighs this rung decode-shaped: no wider than
+    /// its lanes.
+    #[must_use]
+    pub fn decode_shaped(&self) -> bool {
+        self.tokens <= self.lanes
     }
 }
 
@@ -77,7 +80,11 @@ impl RungFacts {
 /// last row sampled), since only prompt rows reach past the lanes and
 /// decode rides the narrow rungs. A mixed fire (decode lanes riding a
 /// prompt's piece) reads those lanes' head beside the prompt's, which this
-/// leaves out; a backend whose check shows that matters revisits it.
+/// leaves out; a backend whose check shows that matters revisits it. A
+/// decode-shaped rung's lanes attend one key each (a fresh slot's own), so
+/// its attention counts `tokens` row-keys and its kv read `tokens` keys:
+/// its score is for picking the top, not a prediction of a long-context
+/// decode's time, which the narrow rungs serve whatever they score.
 /// Sources: the rates are the profile's `[rates]` (measured by
 /// `pie tune --rates` at `crate::rates`' lattice, through the backend's own
 /// paths); the byte, flop, attention, state and elementwise counts are the
@@ -144,7 +151,13 @@ impl FireEstimate {
     #[must_use]
     pub fn terms(&self, rung: &RungFacts) -> Terms {
         let tokens = f64::from(rung.tokens);
-        let keys = f64::from(rung.keys);
+        // A row's keys, and the keys the fire reads: decode-shaped, a lane
+        // attends one key (its fresh slot's own); prefill-shaped, the rung's.
+        let (keys, keys_read) = if rung.decode_shaped() {
+            (1.0, tokens)
+        } else {
+            (f64::from(rung.keys), f64::from(rung.keys))
+        };
         // Work over a rate, nothing where there is no work.
         let over = |work: f64, rate: f64| if work > 0.0 { work / rate } else { 0.0 };
         Terms {
@@ -162,7 +175,7 @@ impl FireEstimate {
                 tokens * keys * self.attn_flops_per_row_key,
                 self.attn_flops_per_ns,
             ),
-            kv: over(keys * self.kv_bytes_per_key, self.bytes_per_ns),
+            kv: over(keys_read * self.kv_bytes_per_key, self.bytes_per_ns),
             recurrent: over(
                 tokens * self.state_elements_per_row,
                 self.scan_elements_per_ns,
@@ -650,8 +663,16 @@ mod tests {
     fn attention_reads_its_own_rate_and_kv_the_bandwidth() {
         let (e, r) = documented();
         let t = e.terms(&r);
-        // 4 · 16 · 0.5 at 0.25 a ns; 16 · 8 bytes at 4 a ns.
-        assert_eq!(t.attention, 128.0);
+        // Decode-shaped: 4 lanes of one key each, 4 · 1 · 0.5 at 0.25 a ns,
+        // and 4 keys' 8 bytes at 4 a ns.
+        assert!(r.decode_shaped());
+        assert_eq!(t.attention, 8.0);
+        assert_eq!(t.kv, 8.0);
+        // Prefill-shaped (one prompt of 8 rows over 16 keys): 8 · 16 · 0.5
+        // at 0.25 a ns, and 16 keys' 8 bytes at 4 a ns.
+        let prompt = RungFacts { tokens: 8, ..r };
+        let t = e.terms(&prompt);
+        assert_eq!(t.attention, 256.0);
         assert_eq!(t.kv, 32.0);
     }
 
@@ -679,9 +700,9 @@ mod tests {
     #[test]
     fn the_estimate_is_its_documented_form() {
         let (e, r) = documented();
-        // 5·3 + max(200/4, 32·10/4) + 4·6/1 + 4·16·0.5/0.25 + 16·8/4
+        // 5·3 + max(200/4, 32·10/4) + 4·6/1 + 4·1·0.5/0.25 + 4·8/4
         //     + 4·3/2 + 4·2/4
-        let want = 15.0 + 80.0 + 24.0 + 128.0 + 32.0 + 6.0 + 2.0;
+        let want = 15.0 + 80.0 + 24.0 + 8.0 + 8.0 + 6.0 + 2.0;
         assert!((e.ns(&r) - want).abs() < 1e-9, "{}", e.ns(&r));
         assert_eq!(e.ns(&r), e.terms(&r).total());
     }
