@@ -1,5 +1,6 @@
 pub mod hash;
 pub mod journal;
+pub mod keep;
 pub mod page_table;
 pub mod working_set;
 pub mod write;
@@ -43,6 +44,19 @@ pub enum KvStoreError {
     HostSwapFull { requested: usize, available: usize },
     #[error("another residency move holds pages of these working sets")]
     MoveInFlight,
+    #[error(transparent)]
+    Keep(#[from] keep::KeepError),
+}
+
+/// What a keep that moves rows leaves its caller: the token moves that land
+/// the set's rows from its boundary page on in the fresh pages it now maps,
+/// to be issued on the engine's stream before the set's next fire, and the
+/// epoch the pages it let go wait on, settled once the copy has landed.
+#[derive(Debug)]
+pub struct KeepLanding {
+    pub plan: keep::KeepPlan,
+    pub moves: Vec<::engine::transfer::KvMove>,
+    pub epoch: u64,
 }
 
 #[derive(Debug)]
@@ -1833,10 +1847,13 @@ impl KvStore {
         }
         let sealed = self.table.sealed_prefix(ws)?;
         let logged = self.table.logged(ws)?;
+        // A keep that dropped rows left pages whose K/V no token run names.
+        let keyless = self.table.keyless_from(ws)?.unwrap_or(u64::MAX);
         let full = (logged.len() as u64)
             .min(folded)
             .div_euclid(page)
-            .min(self.table.mapped_len(ws)?);
+            .min(self.table.mapped_len(ws)?)
+            .min(keyless);
         if full <= sealed {
             return Ok(0);
         }
@@ -1856,6 +1873,66 @@ impl KvStore {
 
     pub fn folded(&self, ws: WorkingSetId) -> Result<u64, KvStoreError> {
         Ok(self.table.folded(ws)?)
+    }
+
+    /// Settles a fold that sorts `ws`'s buffer: `outcomes` states each
+    /// column of `[folded, end)` (`keep`). The committed columns are frozen
+    /// at `folded ..` and the buffered ones follow them; the dropped ones
+    /// are let go. Where no row moves, it is a plain fold. Otherwise the
+    /// rows from the boundary page on are mapped to fresh pool pages, and
+    /// the returned moves fill them: the caller issues them on the engine's
+    /// stream before the set's next fire and settles the epoch once they
+    /// land. The rows below `folded` never change.
+    pub fn fold_keep(
+        &mut self,
+        ws: WorkingSetId,
+        end: u64,
+        outcomes: &[keep::Outcome],
+        recurrent: bool,
+        decoded: bool,
+    ) -> Result<Option<KeepLanding>, KvStoreError> {
+        let folded = self.table.folded(ws)?;
+        let plan = keep::plan(folded, end, outcomes, recurrent)?;
+        if plan.in_place() {
+            self.fold(ws, plan.folded_after(), decoded)?;
+            return Ok(None);
+        }
+        let page = self.page_size;
+        let first = plan.first_page(page);
+        let count = usize::try_from(plan.pages_after(page)).unwrap_or(usize::MAX);
+        let available = self.pool.available();
+        let fresh = self
+            .pool
+            .try_alloc_n(count)
+            .ok_or(KvStoreError::OutOfPages {
+                requested: count,
+                available,
+            })?;
+        let pages: Vec<u32> = self.flat_table(ws)?.iter().map(|id| id.0).collect();
+        let fresh_ids: Vec<u32> = fresh.iter().map(|id| id.0).collect();
+        let moves = plan.moves(page, &pages, &fresh_ids);
+        let epoch = self.begin_fire();
+        let published = fresh
+            .into_iter()
+            .map(|id| PublishedPage {
+                id,
+                token_hashes: Vec::new(),
+                page_hash: None,
+            })
+            .collect();
+        let freed = match self.table.replace_tail(ws, first, published) {
+            Ok(freed) => freed,
+            Err(error) => {
+                self.settle(epoch);
+                return Err(error.into());
+            }
+        };
+        self.refresh_flat(ws);
+        self.recycle_backings(freed, epoch);
+        self.table
+            .compact_log(ws, folded, &plan.kept, first, plan.dropped > 0)?;
+        self.table.freeze(ws, plan.folded_after())?;
+        Ok(Some(KeepLanding { plan, moves, epoch }))
     }
 
     pub fn keeps(&self) -> bool {

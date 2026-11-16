@@ -148,6 +148,10 @@ struct WorkingSetEntry {
     logged: Vec<u32>,
     /// One that never settles leaves the log cut there.
     pending: BTreeMap<u64, u64>,
+    /// The first page a keep that dropped rows rewrote: from it on the
+    /// set's pages hold K/V computed with rows its log no longer names, so
+    /// none is sealed or keyed.
+    keyless_from: Option<u64>,
 }
 
 impl WorkingSetEntry {
@@ -164,6 +168,7 @@ impl WorkingSetEntry {
             owner: None,
             logged: Vec::new(),
             pending: BTreeMap::new(),
+            keyless_from: None,
         }
     }
 }
@@ -269,10 +274,12 @@ impl KvPageTable {
         if let Some(&cut) = entry.pending.values().min() {
             logged.truncate(cut as usize);
         }
-        let (folded, prompt_pages) = (entry.folded, entry.prompt_pages);
+        let (folded, prompt_pages, keyless_from) =
+            (entry.folded, entry.prompt_pages, entry.keyless_from);
         let mut child_entry = WorkingSetEntry::new(terminal, page_len, mapped_len);
         child_entry.logged = logged;
         child_entry.folded = folded;
+        child_entry.keyless_from = keyless_from;
         child_entry.prompt_pages = prompt_pages;
         let child = self.working_sets.insert(child_entry);
         if let Some(terminal) = terminal {
@@ -510,6 +517,40 @@ impl KvPageTable {
 
     pub fn folded(&self, ws: WorkingSetId) -> Result<u64, KvTableError> {
         Ok(self.entry(ws)?.folded)
+    }
+
+    /// The first page no fold seals, where a keep dropped rows.
+    pub fn keyless_from(&self, ws: WorkingSetId) -> Result<Option<u64>, KvTableError> {
+        Ok(self.entry(ws)?.keyless_from)
+    }
+
+    /// A keep's rewrite of the log: the rows below `folded` stay, and slot
+    /// `folded + i` logs what `kept[i]` did. A row the log never reached
+    /// cuts it there. `dropped`: the keep released rows, so from
+    /// `first_page` on nothing is sealed or keyed.
+    pub fn compact_log(
+        &mut self,
+        ws: WorkingSetId,
+        folded: u64,
+        kept: &[u64],
+        first_page: u64,
+        dropped: bool,
+    ) -> Result<(), KvTableError> {
+        let entry = self.entry_mut(ws)?;
+        let mut logged: Vec<u32> = entry.logged.iter().take(folded as usize).copied().collect();
+        if logged.len() as u64 == folded {
+            for &slot in kept {
+                match entry.logged.get(slot as usize) {
+                    Some(&token) => logged.push(token),
+                    None => break,
+                }
+            }
+        }
+        entry.logged = logged;
+        if dropped {
+            entry.keyless_from = Some(entry.keyless_from.map_or(first_page, |at| at.min(first_page)));
+        }
+        Ok(())
     }
 
     /// What is frozen stays frozen.
