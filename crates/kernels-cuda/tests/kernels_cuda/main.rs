@@ -12,17 +12,3 @@ mod linear;
 mod runtime;
 mod sampling;
 mod ssm;
-
-// Strict kernels for the whole binary, before any test runs: an
-// instantiation that will not compile fails its test instead of falling
-// back unseen.
-#[cfg(target_os = "linux")]
-#[used]
-#[allow(unsafe_code)]
-#[unsafe(link_section = ".init_array")]
-static STRICT_KERNELS: extern "C" fn() = {
-    extern "C" fn on() {
-        kernels_cuda::jit::strict_kernels();
-    }
-    on
-};

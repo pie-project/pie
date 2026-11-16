@@ -155,7 +155,6 @@ pub struct PrefillPlan {
     pub window: Option<u32>,
     pub causal: bool,
     pub graph_capturable: bool,
-    pub graph_refusal: Option<String>,
     pub mask_indptr: Option<Tensor>,
     pub device: Device,
 }
@@ -450,20 +449,7 @@ pub fn plan_prefill(
         ctas_per_sm: toggles.prefill_ctas_per_sm,
     };
 
-    let (built, capturable, graph_refusal) =
-        match prefill::plan(OP, &req, device, workspace.int_bytes, workspace.float_bytes) {
-            Ok(built) => (built, enable_cuda_graph, None),
-            Err(declined) if enable_cuda_graph => {
-                let req = prefill::Request {
-                    enable_cuda_graph: false,
-                    ..req
-                };
-                let built =
-                    prefill::plan(OP, &req, device, workspace.int_bytes, workspace.float_bytes)?;
-                (built, false, Some(declined.to_string()))
-            }
-            Err(declined) => return Err(declined),
-        };
+    let built = prefill::plan(OP, &req, device, workspace.int_bytes, workspace.float_bytes)?;
 
     let cta_tile_q = u32::try_from(built.info.cta_tile_q).unwrap_or(0);
     if shape.head_dim >= 256 && cta_tile_q == 128 {
@@ -487,8 +473,7 @@ pub fn plan_prefill(
         total_tokens,
         window,
         causal,
-        graph_capturable: capturable,
-        graph_refusal,
+        graph_capturable: enable_cuda_graph,
         mask_indptr,
         device: *device,
     })

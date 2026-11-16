@@ -2702,17 +2702,6 @@ impl<'c> Run<'c> {
         })
     }
 
-    pub(crate) fn uncapturable_why(&self) -> Vec<String> {
-        self.structs
-            .iter()
-            .flatten()
-            .filter_map(|(_, slot)| match slot {
-                StructSlot::Prefill(plan) => plan.graph_refusal.clone(),
-                _ => None,
-            })
-            .collect()
-    }
-
     pub(crate) fn put(&mut self, id: ValueId, built: StructSlot) {
         let at = self.struct_at(id);
         let admit = self

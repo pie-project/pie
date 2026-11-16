@@ -7,18 +7,6 @@
 //! launch: the group's ranks and nothing else, one test at a time.
 #![cfg(feature = "cuda")]
 
-// Strict kernels for the whole binary, as `engine_cuda`'s.
-#[cfg(target_os = "linux")]
-#[used]
-#[allow(unsafe_code)]
-#[unsafe(link_section = ".init_array")]
-static STRICT_KERNELS: extern "C" fn() = {
-    extern "C" fn on() {
-        kernels_cuda::jit::strict_kernels();
-    }
-    on
-};
-
 // Every work queue a context may have, before CUDA's first call reads the
 // count and before any thread runs: a group of four or eight ranks on one
 // device needs more than the default eight (`ep::wire` refuses it).

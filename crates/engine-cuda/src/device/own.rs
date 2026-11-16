@@ -4,33 +4,41 @@
 //! the context's own; the driver says whose they are.
 #![allow(unsafe_code)]
 
+use crate::error::{Fault, Result};
+
 /// What this process took of the bound device before a load of its own
 /// resolved a ceiling: the context and what binding it puts down, which the
 /// card counts held and no other process put there. `latch` keeps the
 /// reading for the loads after the first, whose process holds an earlier
-/// load's bytes too. Zero where the driver does not answer for this process
-/// (no management library installed, another pid namespace).
-#[must_use]
-pub fn before_loads(latch: bool) -> u64 {
+/// load's bytes too. Refused where the driver does not answer for this
+/// process (no management library installed, another pid namespace).
+pub fn before_loads(latch: bool) -> Result<u64> {
     static TAKEN: std::sync::Mutex<Vec<(i32, u64)>> = std::sync::Mutex::new(Vec::new());
-    let Some(device) = bound() else {
-        return 0;
-    };
+    let device = bound()?;
     let mut taken = TAKEN
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(&(_, bytes)) = taken.iter().find(|(of, _)| *of == device) {
-        return bytes;
+        return Ok(bytes);
     }
-    let bytes = held(device).unwrap_or(0);
+    let bytes = held(device).ok_or_else(|| {
+        Fault::program(
+            "device::own",
+            format!(
+                "the driver does not say what this process holds of device {device} \
+                 (NVML on CUDA, KFD on ROCm: the library is missing, or this process \
+                 runs in another pid namespace than the driver's)"
+            ),
+        )
+    })?;
     if latch {
         taken.push((device, bytes));
     }
-    bytes
+    Ok(bytes)
 }
 
 /// The device this thread is bound to.
-fn bound() -> Option<i32> {
+fn bound() -> Result<i32> {
     #[cfg(feature = "device")]
     {
         use crate::device::rt;
@@ -38,11 +46,12 @@ fn bound() -> Option<i32> {
         let mut device: i32 = 0;
         // SAFETY: a live local; the call only writes it.
         let asked = unsafe { rt::cudaGetDevice(&raw mut device) };
-        (asked == rt::cudaError::cudaSuccess).then_some(device)
+        crate::device::ctx::check("cudaGetDevice", asked)?;
+        Ok(device)
     }
     #[cfg(not(feature = "device"))]
     {
-        None
+        Err(Fault::Runtimeless)
     }
 }
 
