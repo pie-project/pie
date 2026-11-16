@@ -1,4 +1,5 @@
-//! A capturing lane's score rows served end to end, against the CPU oracle
+//! The score capture's contract (Mac's `the_score_rows_are_the_oracles`,
+//! engine-metal), and a capturing lane's score rows served end to end, against the CPU oracle
 //! (`engine_cpu::Forward::at_context`): Qwen3's miniature loaded by the
 //! shell, four lanes prefilled together and then decoded together, the
 //! second and the fourth capturing scores (the first and the third not, so
@@ -15,45 +16,15 @@
 
 use engine_cpu::forward::{Output, Values};
 use engine_cpu::Forward;
-use poem::{Dtype, Request};
-use poem_ir::{ParamSource, Trace};
+use poem::Request;
+use poem_ir::Trace;
 
 use crate::backend::{Lane, Seated};
-use crate::model_logits::{PAGE, fixture, load};
+use crate::model_logits::{PAGE, fixture, load, load_lanes, seeded_bf16};
 
 const MODEL: &str = "qwen3-micro-text";
 const KEYS: &str = "attn.scores";
 const PAGES: &str = "attn.scores.pages";
-
-fn fnv(name: &str) -> u64 {
-    name.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
-    })
-}
-
-/// The fixture checkpoint's plane `name` as the suite writes it
-/// (`model_logits::write_checkpoint`): seeded by name, a bf16 plane cut to
-/// its bf16 bits.
-fn plane(trace: &Trace, name: &str, count: usize) -> Vec<f32> {
-    let param = trace
-        .params
-        .iter()
-        .find(|param| param.name == name && param.source == ParamSource::Checkpoint)
-        .unwrap_or_else(|| panic!("`{name}` is a checkpoint plane"));
-    let norm = name.ends_with("norm");
-    let mut seed = fnv(name);
-    (0..count)
-        .map(|_| {
-            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-            let unit = ((seed >> 33) as f32 / (1u64 << 31) as f32) - 0.5;
-            let value = if norm { 1.0 + 0.05 * unit } else { 0.08 * unit };
-            match param.dtype {
-                Dtype::Bf16 => f32::from_bits(value.to_bits() & 0xffff_0000),
-                _ => value,
-            }
-        })
-        .collect()
-}
 
 fn word(trace: &Trace, rows: u32, captures: bool) -> u64 {
     trace
@@ -86,7 +57,7 @@ const DECODE: [u32; 2] = [17, 101];
 
 /// The oracle's key and page rows for `prompt` and then each of `DECODE`.
 fn oracle(trace: &Trace, context: u32, prompt: &[u32]) -> Vec<[Vec<f32>; 2]> {
-    let mut me = Forward::new(trace.clone(), None, &|name, count| plane(trace, name, count))
+    let mut me = Forward::new(trace.clone(), None, &seeded_bf16)
         .unwrap_or_else(|why| panic!("the oracle loads {MODEL}: {why}"))
         .at_context(context, PAGE);
     let read = |outs: Vec<Output>| -> [Vec<f32>; 2] {
@@ -150,8 +121,23 @@ fn served(context: u32, pattern: &[Reads]) {
         .map(|(prompt, captures, _)| captures.then(|| oracle(trace, context, prompt)))
         .collect();
 
+    // The device's reservations by owner, but for the per-dispatch scalars
+    // wgpu stages in a uniform arena every fire draws on (grown a chunk at a
+    // time by the dispatches it binds, whatever they are): what a fire must
+    // leave as it found it.
     let books = |shell: &crate::backend::Shell| {
-        engine_gpu::backend::Context::books(shell.device()).device()
+        let ledger = engine_gpu::backend::Context::books(shell.device()).ledger();
+        let uniforms: u64 = ledger
+            .entries()
+            .filter(|&(_, owner, _)| owner == "uniforms")
+            .map(|(.., bytes)| bytes)
+            .sum();
+        let held: Vec<_> = ledger
+            .entries()
+            .filter(|&(_, owner, _)| owner != "uniforms")
+            .map(|(class, owner, bytes)| (format!("{class:?}"), owner, bytes))
+            .collect();
+        (held, uniforms)
     };
     let mut held = vec![0u32; n];
     for step in 0..=DECODE.len() {
@@ -170,11 +156,12 @@ fn served(context: u32, pattern: &[Reads]) {
                 })
             })
             .collect();
-        let before = books(&shell);
+        let (before, uniforms) = books(&shell);
         let outs = shell.fire_outputs(&seated).expect("the fire lands");
+        let (after, grown) = books(&shell);
+        eprintln!("context {context}, step {step}: the uniform arena {uniforms} -> {grown} bytes");
         assert_eq!(
-            books(&shell),
-            before,
+            after, before,
             "context {context}, step {step}: a capturing fire takes no device byte past the load's"
         );
         for (lane, (_, _, pages)) in lanes.iter().enumerate() {
@@ -274,4 +261,104 @@ fn the_arena_holds_no_score_row() {
         assert_eq!(placed.bytes(), 0, "value {at} takes arena bytes");
     }
     assert!(captures > 0, "{MODEL} captures");
+}
+
+/// The score capture's contract. A fire lays one score row a capturing lane
+/// and none for a lane that captures nothing. Its rows are the CPU oracle's
+/// (`engine_cpu::Forward` on this backend's own trace and the fixture's
+/// planes): the attention mass a key of the load's context, summed over the
+/// layers and averaged over the query heads, and that summed a kv page of
+/// the load's own (its chunk recipe's, not the boot's). A fire of 256 lanes,
+/// one capturing, lays that lane's rows alone.
+#[test]
+fn the_score_rows_are_the_oracles() {
+    const LANES: u32 = 256;
+    const CONTEXT: u32 = 64;
+    let fixture = fixture(MODEL, None);
+    let trace = &fixture.trace;
+    let Some(mut shell) = load_lanes(&fixture, PAGE, CONTEXT, LANES, 512) else {
+        return;
+    };
+    let prompt: Vec<u32> = (0..6u32).map(|at| (11 + at * 37) % 256).collect();
+    let one: Vec<Vec<u32>> = (1..LANES).map(|lane| vec![(lane * 7) % 256]).collect();
+    let reads = vec![KEYS.to_string(), PAGES.to_string()];
+    let fire = |shell: &mut crate::backend::Shell, captures: bool| {
+        let seated: Vec<Seated<'_>> = (0..LANES)
+            .map(|slot| {
+                let tokens: &[u32] = if slot == 0 { &prompt } else { &one[slot as usize - 1] };
+                let capturing = captures && slot == 0;
+                Seated {
+                    held: Some(0),
+                    reads: if capturing { &reads } else { &[] },
+                    ..Seated::of(Lane {
+                        slot,
+                        word: word(trace, tokens.len() as u32, capturing),
+                        tokens,
+                    })
+                }
+            })
+            .collect();
+        shell.fire_seated(&seated).expect("the fire lands");
+    };
+
+    // A fire of no capturing lane lays no row.
+    fire(&mut shell, false);
+    assert!(
+        shell.score_rows().expect("the rows read back").is_empty(),
+        "a fire of no capturing lane laid a score row"
+    );
+
+    // One capturing lane among 256 lays one lane's rows.
+    fire(&mut shell, true);
+    let rows = shell.score_rows().expect("the rows read back");
+    assert_eq!(rows.len(), 1, "one capturing lane of {LANES} laid {} rows", rows.len());
+    let (source, keys, pages) = &rows[0];
+    assert_eq!(*source, 0, "the row is the capturing lane's");
+    assert_eq!(keys.len(), CONTEXT as usize, "a mass a key of the context");
+    // The load's kv page, as its chunk recipe lays it.
+    let page = shell.paging().page_size;
+    assert_eq!(pages.len(), CONTEXT.div_ceil(page) as usize, "a mass a page of it");
+
+    let mut oracle = Forward::new(trace.clone(), None, &seeded_bf16)
+        .expect("the oracle loads")
+        .at_context(CONTEXT, page);
+    let outs = oracle
+        .step(&prompt, 0, word(trace, prompt.len() as u32, true))
+        .expect("the oracle steps");
+    let floats = |name: &str| -> Vec<f32> {
+        match outs.iter().find(|out| out.name == name) {
+            Some(Output {
+                values: Values::F32(v),
+                ..
+            }) => v.clone(),
+            _ => panic!("the oracle reads out no `{name}`"),
+        }
+    };
+    let (want_keys, want_pages) = (floats(KEYS), floats(PAGES));
+    let most = |got: &[f32], want: &[f32]| -> f32 {
+        assert_eq!(got.len(), want.len());
+        got.iter().zip(want).map(|(g, w)| (g - w).abs()).fold(0.0, f32::max)
+    };
+    let layers = trace
+        .nodes
+        .iter()
+        .filter(|node| {
+            matches!(
+                node.op,
+                poem_ir::Operation::Attn(poem_ir::Attn::ScoreCapture { .. })
+            )
+        })
+        .count() as f32;
+    let mass: f32 = keys.iter().sum();
+    let (keys_apart, pages_apart) = (most(keys, &want_keys), most(pages, &want_pages));
+    eprintln!(
+        "the row against the oracle: keys {keys_apart:e}, pages {pages_apart:e} apart at most, a \
+         row of mass {mass} ({layers} layers)"
+    );
+    // bf16 activations against the oracle's: a few hundredths of one
+    // layer's mass a key at most; a row of another head, layer or lane is
+    // off by tenths.
+    assert!(keys_apart < 2e-2, "the key row is not the oracle's: {keys_apart} apart");
+    assert!(pages_apart < 4e-2, "the page row is not the oracle's: {pages_apart} apart");
+    assert!((mass - layers).abs() < 1e-3 * layers, "a row of mass {mass}, not {layers}");
 }

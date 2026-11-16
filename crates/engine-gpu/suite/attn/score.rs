@@ -166,21 +166,24 @@ fn agrees(got: &[f32], want: &[f64]) -> Result<f64, String> {
     Ok(worst)
 }
 
-/// The capture table the engine stages: lane, rows, page row.
-fn table(f: &Fixture) -> Vec<i32> {
+/// The capture table the engine stages: lane, rows, and the bases of its
+/// key row and page row.
+fn table(f: &Fixture, context: usize) -> Vec<i32> {
     let mut page_row = 0;
+    let pages = context.div_ceil(PAGE) as i32;
     f.lanes
         .iter()
         .enumerate()
         .filter(|(_, at)| at.captures)
-        .flat_map(|(lane, at)| {
+        .enumerate()
+        .flat_map(|(row, (lane, at))| {
             let page = if at.pages {
                 page_row += 1;
-                page_row - 1
+                (page_row - 1) * pages
             } else {
                 -1
             };
-            [lane as i32, f.qo[lane], f.qo[lane + 1], page]
+            [lane as i32, f.qo[lane], f.qo[lane + 1], (row * context) as i32, page]
         })
         .collect()
 }
@@ -198,9 +201,9 @@ fn case(gpu: &mut Gpu, context: usize, observe: usize, q_heads: usize) {
     let pi = gpu.up_u32(&f.page_indices);
     let pp = gpu.up_u32(&f.page_indptr);
     let pos = gpu.up_i32(&f.positions);
-    let capture_table = table(&f);
+    let capture_table = table(&f, context);
     let capturing = (capture_table.len() / TABLE_INTS as usize) as u32;
-    let page_rows = capture_table.chunks(4).filter(|e| e[3] >= 0).count();
+    let page_rows = capture_table.chunks(TABLE_INTS as usize).filter(|e| e[4] >= 0).count();
     let tb = gpu.up_i32(&capture_table);
     let pools: Vec<KvPool> = (0..2)
         .map(|layer| {

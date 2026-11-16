@@ -708,6 +708,10 @@ pub struct Shell<B: Serve> {
     rs_layout: Option<std::sync::Arc<crate::rs::Layout>>,
     /// The snapshot table a fire whose lanes snapshot binds (CONTRACT-BC 16).
     snaps: Option<B::Buffer>,
+    /// The last staged fire's capturing lanes' rows ([`Shell::score_rows`]):
+    /// each one's source lane and the bytes its key row, and its page row
+    /// where it has one, start at in the span's buffer.
+    last_capture: Vec<(u32, u64, Option<u64>)>,
 
     rs_buffers: Option<crate::rs::Buffers>,
 
@@ -1544,6 +1548,7 @@ impl<B: Serve> Shell<B> {
             held: vec![0; slots as usize],
             rs_layout,
             snaps: None,
+            last_capture: Vec::new(),
             rs_buffers,
             rs_scratch: None,
             out,
@@ -2296,6 +2301,78 @@ impl<B: Serve> Shell<B> {
     #[must_use]
     pub fn kv_page_bytes(&self) -> u64 {
         self.pools.page_bytes()
+    }
+
+    /// Where `slots` lays each capturing lane's rows: its source lane, and
+    /// the bytes of the span's buffer its key row and page row start at.
+    fn capture_rows(&self, composition: &Composition, slots: &SlotTable) -> Vec<(u32, u64, Option<u64>)> {
+        let Some(rows) = self.span.capture() else {
+            return Vec::new();
+        };
+        let start = |grain: crate::arena::Grain| {
+            slots.0.iter().enumerate().find_map(|(at, slot)| {
+                let slot = (*slot)?;
+                (crate::arena::grain(&self.compiled.arena, ValueId(at as u32)) == Some(grain))
+                    .then(|| self.handles.get(slot.buf).map(|row| row.offset()))
+                    .flatten()
+            })
+        };
+        let (Some(keys), pages) = (
+            start(crate::arena::Grain::Keys),
+            start(crate::arena::Grain::Pages),
+        ) else {
+            return Vec::new();
+        };
+        let scored = &slots.1;
+        composition
+            .lanes()
+            .iter()
+            .enumerate()
+            .filter_map(|(lane, row)| {
+                let lane = u32::try_from(lane).unwrap_or(u32::MAX);
+                let key = scored.row(lane)?;
+                let page = scored
+                    .page_row(lane)
+                    .zip(pages)
+                    .map(|(page, at)| at + u64::from(page) * rows.page_bytes());
+                Some((row.source, keys + u64::from(key) * rows.key_bytes(), page))
+            })
+            .collect()
+    }
+
+    /// The last fire's capturing lanes' rows, read back where it laid them
+    /// once every fire has landed: each one's source lane, key row and page
+    /// row (empty where its program reads no pages). None where no lane of
+    /// it captured; a later fire lays its own over them.
+    pub fn score_rows(&mut self) -> Result<Vec<(u32, Vec<f32>, Vec<f32>)>> {
+        self.drain()?;
+        let Some(rows) = self.span.capture() else {
+            return Ok(Vec::new());
+        };
+        let buffer = self.span.buffer()?;
+        let read = |at: u64, bytes: u64| -> Result<Vec<f32>> {
+            let mut raw = vec![0u8; usize::try_from(bytes).unwrap_or(usize::MAX)];
+            buffer.read(at, &mut raw)?;
+            Ok(raw
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|w| f32::from_le_bytes(*w))
+                .collect())
+        };
+        self.last_capture
+            .iter()
+            .map(|&(source, keys, pages)| {
+                Ok((
+                    source,
+                    read(keys, rows.key_bytes())?,
+                    match pages {
+                        Some(at) => read(at, rows.page_bytes())?,
+                        None => Vec::new(),
+                    },
+                ))
+            })
+            .collect()
     }
 
     pub fn drain(&mut self) -> Result<()> {
@@ -3712,7 +3789,12 @@ impl<B: Serve> Shell<B> {
                     .any(|name| name == SCORE_PAGES);
             (captures, pages)
         }));
-        let capture_table = scored.table(&indptr_host);
+        // Each capturing lane's rows by their bases in the guest region's
+        // key and page rows ([`crate::arena::Span::slots`] binds them).
+        let capture_table = self
+            .span
+            .capture()
+            .map_or_else(Vec::new, |rows| scored.table(&indptr_host, rows.keys, rows.pages));
         let (readout_rows, readout_layout) =
             readout_table(&composition, lanes, &self.readouts, &scored, |class| {
                 self.readout_for(class)
@@ -3802,6 +3884,7 @@ impl<B: Serve> Shell<B> {
         // place under the span's end.
         let rung = self.span.rung_of(fire_rows);
         let slots = self.span.slots(&self.handles, rung, fire_rows, scored)?;
+        self.last_capture = self.capture_rows(&composition, &slots);
         let caches = self.pools.table(
             &self.handles,
             &self.inputs[arm].seats(&self.handles, &bound, pages, rows, lane_count),
