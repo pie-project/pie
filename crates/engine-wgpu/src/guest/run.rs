@@ -62,6 +62,7 @@ impl<'a> OnDevice<'a> {
     ) -> Result<()> {
         let plan = &package.plans[at];
         let mut frame = self.device.frame()?;
+        let mut widens = 0u64;
 
         for &global in roots {
             let Some(local) = local_of(package, at, global)? else {
@@ -103,8 +104,18 @@ impl<'a> OnDevice<'a> {
                     let heap = heap.clone();
                     frame.copy(seat.seat, seat.at, &heap, into, u64::from(values) * 4)?;
                 } else {
-                    self.widen
-                        .encode(&frame, seat.seat, seat.at, heap, into, values)?;
+                    let heap = heap.clone();
+                    let (config, config_at) = self.session.widen_config(widens)?;
+                    widens += 1;
+                    self.widen.encode(
+                        &frame,
+                        (&config, config_at),
+                        seat.seat,
+                        seat.at,
+                        &heap,
+                        into,
+                        values,
+                    )?;
                 }
                 continue;
             }

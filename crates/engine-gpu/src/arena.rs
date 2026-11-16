@@ -44,7 +44,11 @@ pub struct Rung {
     capacity: Vec<u32>,
     /// Where the rooms start, past the carve.
     rooms_at: u64,
-    /// The carve and the rooms.
+    /// The recurrent scratch, past the rooms: the extended rows and work of
+    /// a fire at this rung (`rs::Seat::scratch_bytes` at
+    /// `rs::Seat::widest_rows(tokens)`, its most lanes), as `(at, bytes)`.
+    rs: (u64, u64),
+    /// The carve, the rooms and the recurrent scratch.
     bytes: u64,
     /// The capture planes, which the carve leaves out.
     lifted: Lifted,
@@ -180,6 +184,7 @@ fn planes_under(carve: u64, planes: u64, room: u64) -> Result<u64> {
 }
 
 impl Rung {
+    #[allow(clippy::too_many_arguments)]
     fn lay<T: Tactics + ?Sized>(
         trace: &Trace,
         compiled: &CompiledModel,
@@ -188,6 +193,7 @@ impl Rung {
         paging: Paging,
         tuning: &T,
         routers: &[u32],
+        rs: Option<&crate::rs::Layout>,
     ) -> Result<Rung> {
         let map = if tokens >= budgets.tokens.max_tokens {
             compiled.arena.clone()
@@ -213,13 +219,22 @@ impl Rung {
             other => other,
         })?;
         let rooms_at = unscored.next_multiple_of(ALIGN);
-        let bytes = (rooms_at + rooms.bytes()).next_multiple_of(ALIGN);
+        let rs_at = (rooms_at + rooms.bytes()).next_multiple_of(ALIGN);
+        let rs_bytes = rs.map_or(0, |layout| {
+            crate::rs::Seat::scratch_bytes(
+                layout,
+                crate::rs::Seat::widest_rows(tokens),
+                tokens.min(budgets.tokens.max_lanes),
+            )
+        });
+        let bytes = (rs_at + rs_bytes).next_multiple_of(ALIGN);
         Ok(Rung {
             tokens,
             capacity: capacities(&map),
             map,
             rooms,
             rooms_at,
+            rs: (rs_at, rs_bytes),
             bytes,
             lifted,
         })
@@ -266,9 +281,30 @@ impl<B: Backend> Span<B> {
         tuning: &B::Tuning,
     ) -> Result<Span<B>> {
         let routers = crate::scratch::routers(trace);
+        let rs = crate::rs::Layout::read(trace)?;
+        if let Some(layout) = &rs {
+            tracing::info!(
+                summed = layout.planes.iter().map(|p| p.row_bytes).sum::<u64>()
+                    + layout.regions.iter().map(|r| r.row_bytes).sum::<u64>(),
+                grouped = crate::rs::Seat::row_bytes(layout),
+                work = layout.work_elems * 4,
+                "the recurrent scratch's bytes a row: every layer's, and one group's at most"
+            );
+        }
         let rungs = tokens
             .iter()
-            .map(|&tokens| Rung::lay(trace, compiled, budgets, tokens, paging, tuning, &routers))
+            .map(|&tokens| {
+                Rung::lay(
+                    trace,
+                    compiled,
+                    budgets,
+                    tokens,
+                    paging,
+                    tuning,
+                    &routers,
+                    rs.as_ref(),
+                )
+            })
             .collect::<Result<Vec<_>>>()?;
         Ok(Span {
             widest: (0..rungs.len()).collect(),
@@ -457,6 +493,14 @@ impl<B: Backend> Span<B> {
             )));
         }
         Ok(SlotTable(slots, scored.backing(backed)))
+    }
+
+    /// Rung `rung`'s recurrent scratch: the span's buffer, the byte its
+    /// scratch starts at, and its bytes.
+    pub fn rs_scratch(&self, rung: usize) -> Result<(&B::Buffer, u64, u64)> {
+        let (buffer, _) = self.placed()?;
+        let (at, bytes) = self.rungs[rung].rs;
+        Ok((buffer, self.base(rung)? + at, bytes))
     }
 
     /// A fire's rooms at rung `rung`.

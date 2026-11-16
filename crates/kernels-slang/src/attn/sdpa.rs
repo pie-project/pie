@@ -329,6 +329,16 @@ pub fn decode(
         // The rows and the keys a fire holds say whether it splits: where
         // the planes are there to split into, either walk, then the fold.
         let [whole, ranges] = decode_kernels(ctx.target(), tactic, head_dim, lse.is_some())?;
+        // Either walk binds the rows' own planes; a split one its partial
+        // planes beside them.
+        let mut extra = Vec::new();
+        if let Some(lse) = lse {
+            extra.push(lse_plane(OP, lse, &shape)?);
+        }
+        if let Some(planes) = &split {
+            extra.extend([planes.part_out.arg_mut(), planes.part_lse.arg_mut()]);
+        }
+        names.binds(&args(OP, q, pool, tables, &shape, sm_scale, o, &extra)?);
         if split.is_none() {
             return names.either(&[whole]);
         }
@@ -686,6 +696,8 @@ mod tests {
     }
 
     impl crate::Naming for Counted {
+        fn binds(&self, _args: &[ArgValue]) {}
+
         fn either(&self, _alternatives: &[Fire]) -> Result<(), Error> {
             self.fired.set(self.fired.get() + 1);
             Ok(())

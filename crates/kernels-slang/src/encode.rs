@@ -131,6 +131,11 @@ pub trait Naming {
     /// pick.
     fn either(&self, alternatives: &[Fire]) -> Result<(), Error>;
 
+    /// The buffers the dispatch [`Naming::either`] names binds, as its fire
+    /// would pass them: a backend that stages a binding it cannot bind in
+    /// place counts what a fire stages from these.
+    fn binds(&self, args: &[ArgValue]);
+
     /// Opens the ways a host goes by a fire's rows, each a run of
     /// dispatches: what is named until [`Naming::or`] or [`Naming::join`]
     /// is the first way.

@@ -187,26 +187,28 @@ pub fn gated_delta_chunked(
             "ssm_gdn_recurrent_chunked_bf16",
         )
     };
+    let [kh, vh, kd, vd] = heads.args(OP)?;
+    let args = [
+        &[
+            qkv.data.arg(),
+            qkv.indptr.arg(),
+            gates.arg(),
+            state.slots.arg(),
+            y.arg_mut(),
+        ][..],
+        &state.snap_table(),
+        &state.piece_args(true),
+        &[kh, vh, kd, vd],
+        &state.snap_lane0(OP)?,
+    ]
+    .concat();
     if let Some(names) = ctx.naming() {
+        names.binds(&args);
         return names.either(&every(&scan_breaks(tactic), kernel)?);
     }
-    let [kh, vh, kd, vd] = heads.args(OP)?;
     ctx.fire(
         kernel(qkv.data.rows)?.apply(heads.grid(requests(OP, qkv)?)),
-        &[
-            &[
-                qkv.data.arg(),
-                qkv.indptr.arg(),
-                gates.arg(),
-                state.slots.arg(),
-                y.arg_mut(),
-            ][..],
-            &state.snap_table(),
-            &state.piece_args(true),
-            &[kh, vh, kd, vd],
-            &state.snap_lane0(OP)?,
-        ]
-        .concat(),
+        &args,
     )
 }
 
@@ -241,28 +243,30 @@ pub fn gated_delta_committed(
             "ssm_gdn_recurrent_committed_bf16",
         )
     };
+    let [kh, vh, kd, vd] = heads.args(OP)?;
+    let args = [
+        &[
+            qkv.arg(),
+            indptr.arg(),
+            committed.replay.arg(),
+            committed.commit.arg(),
+            committed.slots.arg(),
+            gates.arg(),
+            work.arg_mut(),
+            y.arg_mut(),
+        ][..],
+        &state.snap_table(),
+        &state.piece_args(true),
+        &[stated(OP, committed.lane0)?.arg(), kh, vh, kd, vd],
+        &state.snap_lane0(OP)?,
+    ]
+    .concat();
     if let Some(names) = ctx.naming() {
+        names.binds(&args);
         return names.either(&every(&scan_breaks(tactic), kernel)?);
     }
-    let [kh, vh, kd, vd] = heads.args(OP)?;
     ctx.fire(
         kernel(qkv.rows)?.apply(heads.grid(window_lanes(OP, indptr)?)),
-        &[
-            &[
-                qkv.arg(),
-                indptr.arg(),
-                committed.replay.arg(),
-                committed.commit.arg(),
-                committed.slots.arg(),
-                gates.arg(),
-                work.arg_mut(),
-                y.arg_mut(),
-            ][..],
-            &state.snap_table(),
-            &state.piece_args(true),
-            &[stated(OP, committed.lane0)?.arg(), kh, vh, kd, vd],
-            &state.snap_lane0(OP)?,
-        ]
-        .concat(),
+        &args,
     )
 }

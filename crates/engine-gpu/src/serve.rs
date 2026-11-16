@@ -150,6 +150,20 @@ pub trait Serve: Backend {
     /// A frame a step walks into; `keep` where it is kept to replay.
     fn walk_frame(device: &Self::Context, keep: bool) -> Result<Self::Frame>;
 
+    /// The storage offset alignment off which the backend binds no buffer
+    /// in place and stages it in its frame's own scratch; `None` where it
+    /// binds a buffer at any offset.
+    fn staging_align(device: &Self::Context) -> Option<u64>;
+
+    /// Lays what a frame takes of its own beside the load's buffers, from
+    /// what the load's fires can ask ([`FrameFacts`]): no frame of the
+    /// serving load allocates, and one past what was laid is refused.
+    fn lay_frames(
+        device: &Self::Context,
+        pipelines: &Self::Pipelines,
+        facts: FrameFacts,
+    ) -> Result<()>;
+
     /// The backend's state of a fresh load over its `readout` seats.
     fn shelf(
         device: &Self::Context,
@@ -159,9 +173,6 @@ pub trait Serve: Backend {
 
     /// What a kept step binds moved: the segments, or a layer's stage.
     fn forget(shelf: &mut Self::Shelf);
-
-    /// Arm `arm`'s readout seat grew to `bytes`.
-    fn grown(shell: &mut Shell<Self>, arm: usize, bytes: u64) -> Result<()>;
 
     /// Replays `prepared` where a kept step answers it, else how it walks.
     fn plan(shell: &mut Shell<Self>, prepared: &mut Prepared<'_, Self>) -> Result<Plan<Self>>;
@@ -717,8 +728,6 @@ pub struct Shell<B: Serve> {
 
     rs_buffers: Option<crate::rs::Buffers>,
 
-    rs_scratch: Option<B::Buffer>,
-
     out: Option<ValueId>,
     readouts: Vec<ReadoutPlane>,
     feeds: poem_exec::feeds::Feeds,
@@ -1194,6 +1203,7 @@ impl<B: Serve> Shell<B> {
                     feeds.selections.len(),
                     voxel_seat,
                     rows.pieces,
+                    feeds.ragged.len(),
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1327,34 +1337,46 @@ impl<B: Serve> Shell<B> {
             None => Vec::new(),
         };
 
-        // Sized for the host's read back; a fire reading more grows its arm's.
+        // Every plane's rows a fire can read back at once, each at the most
+        // its seam lets one fire carry (`readout_bound`): no fire grows it.
+        let readout_bytes = readout_bound(
+            &readouts,
+            poem_compiler::arena::readouts_ceiling(&boot.budget),
+            boot.budget.max_lanes,
+            boot.budget.max_tokens,
+            budgets.max_voxels(),
+        );
         let readout = (0..arms)
-            .map(|_| {
-                B::Buffer::host(
-                    &device,
-                    readouts
-                        .iter()
-                        .filter(|plane| plane.hosts())
-                        .map(|plane| {
-                            u64::from(match plane.seam {
-                                Kind::Readout => readout_rows(boot.budget.max_lanes),
-                                _ if plane.voxels => budgets.max_voxels(),
-                                _ => boot.budget.max_tokens,
-                            }) * u64::from(plane.width)
-                                * elem(plane.dtype)
-                        })
-                        .max()
-                        .unwrap_or(0)
-                        .max(1),
-                    crate::books::owners::READOUT,
-                )
-            })
+            .map(|_| B::Buffer::host(&device, readout_bytes, crate::books::owners::READOUT))
             .collect::<Result<Vec<_>>>()?;
 
         // The pool takes the bytes `[model] device_kv_budget` states, or all
         // the weights and the working set leave of the share, in whole
         // chunks; the kernels bind it in at most four segments, none past
         // the device's binding limit.
+        // The snapshot table, where a record holds state: a lane's entry
+        // for every lane a fire carries at most (`snapshot_table_bytes`).
+        let snaps = (rows.fixed_bytes > 0)
+            .then(|| {
+                B::Buffer::host(
+                    &device,
+                    snapshot_table_bytes(budgets.tokens.max_lanes, rows.pieces),
+                    crate::books::owners::SNAPSHOTS,
+                )
+            })
+            .transpose()?;
+        // What a frame takes of its own, from what the load's fires ask.
+        B::lay_frames(
+            &device,
+            &pipelines,
+            FrameFacts {
+                staged: asks.staged,
+                dispatches: asks.dispatches,
+                rungs: u32::try_from(span.rungs().len()).unwrap_or(u32::MAX),
+                arms: u32::try_from(arms).unwrap_or(u32::MAX),
+                chunk_bytes: chunk,
+            },
+        )?;
         // Every pipeline a fire asks for is built by now: what is left is
         // past what the driver took for them.
         let left = device.left();
@@ -1522,9 +1544,8 @@ impl<B: Serve> Shell<B> {
             blobs: crate::blob::Store::new(),
             held: vec![0; slots as usize],
             rs_layout,
-            snaps: None,
+            snaps,
             rs_buffers,
-            rs_scratch: None,
             out,
             readouts,
             feeds,
@@ -3538,25 +3559,14 @@ impl<B: Serve> Shell<B> {
         let rs_replay: Vec<i32> = rs_plans.iter().map(|plan| plan.replay as i32).collect();
         let rs_commit: Vec<i32> = rs_plans.iter().map(|plan| plan.commit as i32).collect();
         let rows_ext = rows.saturating_add(rs_plans.iter().map(|plan| plan.replay).sum::<u32>());
-        if rs_active {
-            let layout = self
-                .rs_layout
-                .as_ref()
-                .expect("rs_active implies a layout, checked at the lane");
-            let need = crate::rs::Seat::scratch_bytes(layout, rows_ext, lane_count);
-            if self
-                .rs_scratch
-                .as_ref()
-                .is_none_or(|scratch| scratch.bytes() < need)
-            {
-                self.drain()?;
-                self.rs_scratch = Some(B::Buffer::zeroed(
-                    &self.device,
-                    need,
-                    crate::books::owners::RS_SCRATCH,
-                )?);
-            }
-        }
+        // The rows the fire carries at its rung: each lane's own or the
+        // buffered rows it replays, the more of them (`engine::fire::rung_rows`).
+        let carried: u32 = composition
+            .lanes()
+            .iter()
+            .zip(&rs_plans)
+            .map(|(row, plan)| engine::fire::rung_rows(row.rows, plan.replay))
+            .sum();
 
         let (group_of_lane, packings) = if self.feeds.selections.is_empty() {
             (Vec::new(), Vec::new())
@@ -3682,8 +3692,7 @@ impl<B: Serve> Shell<B> {
                 }),
             },
         )?;
-        let group_masks =
-            self.inputs[arm].stage_group_masks(&self.device, &self.handles, &group_masks)?;
+        let group_masks = self.inputs[arm].stage_group_masks(&self.handles, &group_masks)?;
         windows.bind(&self.handles, bound.windows)?;
         let input_copies = self.feed_inputs(arm, &composition, lanes, &clips_of)?;
         let mut merge_lands: Vec<MergeLand> = Vec::new();
@@ -3729,9 +3738,22 @@ impl<B: Serve> Shell<B> {
             clips: u64::from(composition.clips()),
             readouts,
         };
-        // The narrowest rung that holds the fire: its carve at its fixed
-        // place under the span's end.
-        let rung = self.span.rung_of(fire_rows);
+        // The narrowest rung that holds the fire and the rows its lanes
+        // replay: its carve at its fixed place under the span's end.
+        let rung = self.span.rung_of(FireRows {
+            tokens: fire_rows.tokens.max(u64::from(carried)),
+            ..fire_rows
+        });
+        if rs_active {
+            let layout = self
+                .rs_layout
+                .as_ref()
+                .expect("rs_active implies a layout, checked at the lane");
+            crate::rs::Seat::fits(
+                crate::rs::Seat::scratch_bytes(layout, rows_ext, lane_count),
+                self.span.rs_scratch(rung)?.2,
+            )?;
+        }
         let slots = self.span.slots(&self.handles, rung, fire_rows, scored)?;
         let caches = self.pools.table(
             &self.handles,
@@ -3762,16 +3784,18 @@ impl<B: Serve> Shell<B> {
                 .flatten()
                 .flat_map(|v| v.to_le_bytes())
                 .collect();
-            self.drain()?;
             let bytes = table.len() as u64;
-            if self.snaps.as_ref().is_none_or(|held| held.bytes() < bytes) {
-                self.snaps = Some(B::Buffer::host(
-                    &self.device,
-                    bytes.next_power_of_two().max(256),
-                    crate::books::owners::SNAPSHOTS,
-                )?);
-            }
-            let held = self.snaps.as_mut().expect("just made");
+            crate::error::within_laid(
+                "serve::rs",
+                "snapshot table",
+                bytes,
+                self.snaps.as_ref().map_or(0, B::Buffer::bytes),
+            )?;
+            self.drain()?;
+            let held = self
+                .snaps
+                .as_mut()
+                .expect("a table past none laid is refused");
             held.write(0, &table)?;
             let handle = self.handles.bind(held, 0, bytes)?;
             Some(kernels_slang::Tensor::new(
@@ -3841,9 +3865,8 @@ impl<B: Serve> Shell<B> {
             inputs: bound.inputs,
             voxels: bound.voxels,
             rs: if rs_active {
-                let (Some(layout), Some(buffers), Some(scratch)) =
-                    (&self.rs_layout, &self.rs_buffers, &self.rs_scratch)
-                else {
+                let scratch = self.span.rs_scratch(rung)?;
+                let (Some(layout), Some(buffers)) = (&self.rs_layout, &self.rs_buffers) else {
                     return Err(Fault::Unbound {
                         what: "the recurrent seat of a fire whose plan buffers nothing".to_string(),
                     });
@@ -4110,8 +4133,6 @@ pub struct Landed {
     pub launches: u32,
 }
 
-pub const READOUT_ROWS_PER_LANE: u32 = 8;
-
 type ReadoutTable = (Vec<i32>, Vec<ReadSpan>);
 
 /// Each lane's host span (at its index) and then a span of every other
@@ -4248,10 +4269,39 @@ fn readout_table<B: Serve>(
     Ok((table, layout))
 }
 
-fn readout_rows(max_lanes: u32) -> u32 {
-    max_lanes
-        .saturating_mul(READOUT_ROWS_PER_LANE)
-        .max(max_lanes)
+/// The bytes one fire's readout seat takes at most ([`readout_table`]):
+/// every plane's rows at once, each read by a lane once, the rows at most
+/// its seam lets a fire carry: a readout plane's the `readouts` rows a fire
+/// reads logits for, a lane plane's a row a lane of `lanes`, a row plane's
+/// every token (`tokens`) or voxel (`voxels`).
+fn readout_bound(
+    planes: &[ReadoutPlane],
+    readouts: u64,
+    lanes: u32,
+    tokens: u32,
+    voxels: u32,
+) -> u64 {
+    planes
+        .iter()
+        .map(|plane| {
+            let rows = match plane.seam {
+                Kind::Readout => readouts,
+                Kind::Lane => u64::from(lanes),
+                Kind::Rows if plane.voxels => u64::from(voxels),
+                Kind::Rows => u64::from(tokens),
+            };
+            rows * u64::from(plane.width) * plane.values.len() as u64 * elem(plane.dtype)
+        })
+        .sum::<u64>()
+        .max(1)
+}
+
+/// The bytes of a fire's snapshot table (`kernels_slang::ssm::Snapshots`)
+/// of `lanes` lanes, each its rows and every snapshot's record of `pieces`
+/// units: what the load lays for its most lanes.
+fn snapshot_table_bytes(lanes: u32, pieces: u32) -> u64 {
+    let entry = u64::from(kernels_slang::ssm::RS_SNAPSHOTS) * (1 + u64::from(pieces.max(1)));
+    (u64::from(lanes.max(1)) * entry * 4).max(256)
 }
 
 /// Lanes' rows of a guest input's seat (zeros where a lane feeds none),
@@ -4311,11 +4361,12 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
             .map(|span| span.at + span.bytes())
             .max()
             .unwrap_or(0);
-        if need > self.readout[prepared.arm].bytes() {
-            self.readout[prepared.arm] =
-                B::Buffer::host(&self.device, need, crate::books::owners::READOUT)?;
-            B::grown(self, prepared.arm, need)?;
-        }
+        crate::error::within_laid(
+            "serve::readout",
+            "readout",
+            need,
+            self.readout[prepared.arm].bytes(),
+        )?;
         let (keep, split) = match B::plan(self, &mut prepared)? {
             Plan::Replayed {
                 pending,
@@ -4721,6 +4772,26 @@ impl<B: Serve> Shell<B> {
     }
 }
 
+/// What the load's fires can ask of a frame's own buffers, each counted at
+/// load ([`Serve::lay_frames`]).
+#[derive(Debug, Clone, Copy)]
+pub struct FrameFacts {
+    /// What one fire's frame stages at most ([`Asks::staged`]).
+    pub staged: crate::naming::Staged,
+    /// The most dispatches one fire makes ([`Asks::dispatches`]): each
+    /// binds one group.
+    pub dispatches: u32,
+    /// The rungs of the span: a fire's carve, and the views its groups
+    /// bind, are its rung's.
+    pub rungs: u32,
+    /// The arms fires take turns on, each its inputs' own: one arm's fire
+    /// binds other buffers than another's.
+    pub arms: u32,
+    /// The pool's chunk: no copy within one of its buffers moves more at
+    /// once (a slot lies in one chunk, a move takes a chunk).
+    pub chunk_bytes: u64,
+}
+
 /// What a load's fires can ask of its device, named before the device holds
 /// a byte of the model: every kernel a walk of it asks for, the most
 /// dispatches one fire makes, whatever classes its lanes mix, and the
@@ -4732,6 +4803,10 @@ pub struct Asks {
     pub unservable: Vec<crate::naming::Unservable>,
     /// The rungs of the load's span, the one named from among them.
     pub rungs: Vec<u32>,
+    /// What one fire's frame stages at most on a backend that stages a
+    /// buffer it cannot bind in place, the fires at the top rung named
+    /// with the rest ([`Serve::staging_align`]).
+    pub staged: crate::naming::Staged,
 }
 
 /// What a rung's naming fires found of the regions: which ran, which a fire
@@ -4743,6 +4818,7 @@ struct Found {
     launch: Vec<u32>,
     whole: Vec<u32>,
     rest: u32,
+    staged: crate::naming::Staged,
 }
 
 impl Found {
@@ -4753,6 +4829,7 @@ impl Found {
             launch: vec![0; regions],
             whole: vec![0; regions],
             rest: 0,
+            staged: crate::naming::Staged::default(),
         }
     }
 
@@ -5126,6 +5203,7 @@ impl<B: Serve> Shell<Named<B>> {
         }
         let Counting { made, .. } = sink;
         let fire = self.pipelines.0.take_dispatches();
+        found.staged = found.staged.most(self.pipelines.0.take_staged());
         for (at, &made) in made.iter().enumerate() {
             if whole[at] {
                 found.launch[at] = found.launch[at].max(made);
@@ -5163,16 +5241,22 @@ impl<B: Serve> Shell<Named<B>> {
         let regions = self.compiled.template().len();
         let span: Vec<u32> = self.span.rungs().iter().map(|rung| rung.tokens).collect();
         let mixes = self.held.len() >= 3;
-        let rungs: Vec<u32> = rung
+        let named = rung
             .or_else(|| {
                 span.iter()
                     .copied()
                     .filter(|&tokens| !mixes || tokens >= 3)
                     .min()
             })
-            .or_else(|| span.iter().copied().max())
-            .into_iter()
-            .collect();
+            .or_else(|| span.iter().copied().max());
+        // Where the backend stages what it cannot bind in place, the top
+        // rung's fires too: what a frame stages grows with its rows.
+        let top = span.iter().copied().max().filter(|&top| {
+            rung.is_none()
+                && named != Some(top)
+                && <Named<B> as Serve>::staging_align(&self.device).is_some()
+        });
+        let rungs: Vec<u32> = named.into_iter().chain(top).collect();
         self.pipelines
             .0
             .bound_rows(span.iter().copied().max().unwrap_or(1));
@@ -5201,6 +5285,7 @@ impl<B: Serve> Shell<Named<B>> {
         let mut cut = vec![false; regions];
         let mut mixed = false;
         let mut dispatches = 0;
+        let mut staged = crate::naming::Staged::default();
         for tokens in rungs {
             let tokens = tokens.max(1);
             let mut found = Found::new(regions);
@@ -5237,6 +5322,7 @@ impl<B: Serve> Shell<Named<B>> {
                 }
             }
             dispatches = dispatches.max(found.most(&runs));
+            staged = staged.most(found.staged);
             for at in 0..regions {
                 walked[at] |= found.walked[at];
                 cut[at] |= found.cut[at];
@@ -5297,14 +5383,17 @@ impl<B: Serve> Shell<Named<B>> {
             dispatches,
             unservable,
             rungs: span,
+            staged,
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ReadSpan, SpanCopy, span_copies};
-    use poem_ir::Dtype;
+    use super::{
+        Kind, ReadSpan, ReadoutPlane, SpanCopy, readout_bound, snapshot_table_bytes, span_copies,
+    };
+    use poem_ir::{Dtype, ValueId};
 
     const SENTINEL: u8 = 0xAA;
     const ROW_BYTES: u64 = 16;
@@ -5442,6 +5531,87 @@ mod tests {
                     bytes: 16
                 },
             ]
+        );
+    }
+
+    fn plane(seam: Kind, width: u32, layers: u32, dtype: Dtype, voxels: bool) -> ReadoutPlane {
+        ReadoutPlane {
+            values: (0..layers).map(ValueId).collect(),
+            output: "plane".to_string(),
+            seam,
+            classes: poem_ir::ClassSet::default(),
+            width,
+            dtype,
+            voxels,
+            captured: false,
+        }
+    }
+
+    /// The readout laid at load is every plane's rows a fire can read at
+    /// once, each at the most its seam carries: a fire reading every plane
+    /// at its most lands in it, and one more row of any is past it.
+    #[test]
+    fn the_readout_laid_at_load_holds_every_plane_at_its_most() {
+        let (readouts, lanes, tokens, voxels) = (12u64, 4u32, 64u32, 96u32);
+        let planes = [
+            plane(Kind::Readout, 1000, 1, Dtype::F32, false),
+            plane(Kind::Rows, 16, 2, Dtype::Bf16, false),
+            plane(Kind::Rows, 8, 1, Dtype::Bf16, true),
+            plane(Kind::Lane, 4, 1, Dtype::I32, false),
+        ];
+        let laid = readout_bound(&planes, readouts, lanes, tokens, voxels);
+        let span = |rows: u64, plane: &ReadoutPlane| ReadSpan {
+            rows: u32::try_from(rows).expect("rows"),
+            width: plane.width,
+            layers: plane.values.len() as u32,
+            dtype: plane.dtype,
+            ..ReadSpan::empty(0)
+        };
+        let most: [u64; 4] = [readouts, tokens.into(), voxels.into(), lanes.into()];
+        let widest: u64 = planes
+            .iter()
+            .zip(most)
+            .map(|(plane, rows)| span(rows, plane).bytes())
+            .sum();
+        crate::error::within_laid("serve::readout", "readout", widest, laid)
+            .expect("the widest fire's readout lands in what was laid");
+        for (at, plane) in planes.iter().enumerate() {
+            let past = widest + span(1, plane).bytes();
+            let why = crate::error::within_laid("serve::readout", "readout", past, laid)
+                .expect_err("a row past a plane's most is refused")
+                .to_string();
+            assert!(
+                why.contains(&format!(
+                    "a fire's readout of {past} bytes is past the {laid}"
+                )),
+                "plane {at}: {why}"
+            );
+        }
+    }
+
+    /// The snapshot table laid at load holds an entry for each of a fire's
+    /// most lanes, and one lane more is past it.
+    #[test]
+    fn the_snapshot_table_laid_at_load_holds_the_most_lanes() {
+        let (lanes, pieces) = (16u32, 3u32);
+        let laid = snapshot_table_bytes(lanes, pieces);
+        let entry = u64::from(kernels_slang::ssm::RS_SNAPSHOTS) * u64::from(1 + pieces) * 4;
+        crate::error::within_laid(
+            "serve::rs",
+            "snapshot table",
+            u64::from(lanes) * entry,
+            laid,
+        )
+        .expect("the most lanes' entries land");
+        assert!(
+            crate::error::within_laid(
+                "serve::rs",
+                "snapshot table",
+                u64::from(lanes + 1) * entry,
+                laid
+            )
+            .is_err(),
+            "a lane past the most is refused"
         );
     }
 }

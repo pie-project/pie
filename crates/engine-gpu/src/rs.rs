@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use engine::rs::{LanePlan, Run};
 use kernels_slang::{Segments, Tensor};
-use poem_ir::{Def, Dim, Dtype, Gather, Operation, Ssm, Trace, Ty, ValueId};
+use poem_ir::{Def, Dim, Dtype, Gather, Operands as _, Operation, Ssm, Trace, Ty, ValueId};
 
-use crate::backend::{Backend, Buffer as _};
+use crate::backend::Backend;
 use crate::error::{Fault, Result};
 use crate::handles::Handles;
 
@@ -52,6 +52,12 @@ pub struct Layout {
     pub token_bytes: u64,
 
     pub work_elems: u64,
+
+    /// Each plane's group, then each region's ([`Layout::group`]): the
+    /// recurrent ops a group's extended rows live through end before the
+    /// next group's begin, so every group lays its rows over the same
+    /// scratch.
+    pub groups: Vec<usize>,
 }
 
 fn row_of(trace: &Trace, id: ValueId) -> Result<(u32, Dtype, u64)> {
@@ -259,7 +265,56 @@ impl Layout {
             return Ok(None);
         }
         layout.token_bytes = layout.planes.iter().map(|plane| plane.row_bytes).sum();
+        layout.groups = layout.group(trace);
         Ok(Some(layout))
+    }
+
+    /// The group of each plane, then each region: the extended rows an op
+    /// reads or writes live from the first recurrent op that names their
+    /// value to the last, and rows whose spans overlap are one group. A
+    /// layer's conv, gates and scan are one; the next layer's begins after.
+    fn group(&self, trace: &Trace) -> Vec<usize> {
+        let items = self.planes.len() + self.regions.len();
+        let mut spans: Vec<Option<(usize, usize)>> = vec![None; items];
+        for (at, node) in trace.nodes.iter().enumerate() {
+            if !matches!(
+                node.op,
+                Operation::Ssm(_)
+                    | Operation::Gather(Gather::NgramIds { .. } | Gather::NgramIdsChunked { .. })
+            ) {
+                continue;
+            }
+            let mut values = Vec::new();
+            node.op.inputs(&mut values);
+            node.op.outputs(&mut values);
+            for value in values {
+                let item = self.in_of.get(&value.0).copied().or_else(|| {
+                    self.out_of
+                        .get(&value.0)
+                        .map(|&region| self.planes.len() + region)
+                });
+                if let Some(item) = item {
+                    let span = spans[item].get_or_insert((at, at));
+                    span.0 = span.0.min(at);
+                    span.1 = span.1.max(at);
+                }
+            }
+        }
+        let mut order: Vec<usize> = (0..items).collect();
+        order.sort_by_key(|&item| spans[item].map_or((0, 0), |span| span));
+        let mut groups = vec![0; items];
+        let mut group = 0;
+        let mut end: Option<usize> = None;
+        for item in order {
+            let (from, to) = spans[item].unwrap_or((0, 0));
+            if end.is_some_and(|end| from > end) {
+                group += 1;
+                end = None;
+            }
+            end = Some(end.map_or(to, |end| end.max(to)));
+            groups[item] = group;
+        }
+        groups
     }
 }
 
@@ -318,21 +373,75 @@ pub struct Seat {
 }
 
 impl Seat {
+    /// The extended rows a fire at a rung of `tokens` carries: its own rows
+    /// and the buffered rows it replays ahead of them, that many of each at
+    /// most (`engine::fire::rung_rows`: a fire's lanes carry no more than
+    /// its rung's tokens). Each rung lays its recurrent scratch for this
+    /// many ([`Seat::scratch_bytes`], `arena::Rung`).
+    #[must_use]
+    pub fn widest_rows(tokens: u32) -> u32 {
+        tokens.saturating_mul(2)
+    }
+
+    /// A fire whose recurrent scratch of `need` bytes is past the `laid`
+    /// bytes its rung laid is refused by name: nothing grows it.
+    pub fn fits(need: u64, laid: u64) -> Result<()> {
+        crate::error::within_laid("serve::rs", "recurrent scratch", need, laid)
+    }
+
+    /// Where each plane's extended rows lie, then each region's, and the
+    /// work: a group's rows one after another from the scratch's start,
+    /// every group over the same bytes ([`Layout::groups`]), the work past
+    /// the widest group.
+    fn placed(layout: &Layout, rows_ext: u32) -> (Vec<u64>, u64) {
+        let rows = u64::from(rows_ext.max(1));
+        let widths = layout
+            .planes
+            .iter()
+            .map(|plane| plane.row_bytes)
+            .chain(layout.regions.iter().map(|region| region.row_bytes));
+        let mut cursor: Vec<u64> = Vec::new();
+        let mut at = Vec::with_capacity(layout.groups.len());
+        for (item, row_bytes) in widths.enumerate() {
+            let group = layout.groups.get(item).copied().unwrap_or(0);
+            if cursor.len() <= group {
+                cursor.resize(group + 1, 0);
+            }
+            at.push(cursor[group]);
+            cursor[group] += (rows * row_bytes).max(4).next_multiple_of(256);
+        }
+        (at, cursor.into_iter().max().unwrap_or(0))
+    }
+
+    /// The bytes an extended row takes in its widest group.
+    #[must_use]
+    pub fn row_bytes(layout: &Layout) -> u64 {
+        let mut groups: Vec<u64> = Vec::new();
+        let widths = layout
+            .planes
+            .iter()
+            .map(|plane| plane.row_bytes)
+            .chain(layout.regions.iter().map(|region| region.row_bytes));
+        for (item, row_bytes) in widths.enumerate() {
+            let group = layout.groups.get(item).copied().unwrap_or(0);
+            if groups.len() <= group {
+                groups.resize(group + 1, 0);
+            }
+            groups[group] += row_bytes;
+        }
+        groups.into_iter().max().unwrap_or(0)
+    }
+
+    /// The scratch a fire of `rows_ext` extended rows and `lanes` lanes
+    /// takes: its widest group's rows and the lanes' work.
     #[must_use]
     pub fn scratch_bytes(layout: &Layout, rows_ext: u32, lanes: u32) -> u64 {
-        let rows = u64::from(rows_ext.max(1));
-        let mut at = 0u64;
-
-        for plane in &layout.planes {
-            at += (rows * plane.row_bytes).max(4).next_multiple_of(256);
-        }
-        for region in &layout.regions {
-            at += (rows * region.row_bytes).max(4).next_multiple_of(256);
-        }
-        at += (u64::from(lanes.max(1)) * layout.work_elems * 4)
-            .max(4)
-            .next_multiple_of(256);
-        at.max(256)
+        let (_, work_at) = Seat::placed(layout, rows_ext);
+        (work_at
+            + (u64::from(lanes.max(1)) * layout.work_elems * 4)
+                .max(4)
+                .next_multiple_of(256))
+        .max(256)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -341,7 +450,7 @@ impl Seat {
         layout: &Arc<Layout>,
         buffers: &Buffers,
         pool: Segments,
-        scratch: &B::Buffer,
+        scratch: (&B::Buffer, u64, u64),
         lanes: Vec<LanePlan>,
         replay: Tensor,
         commit: Tensor,
@@ -349,38 +458,34 @@ impl Seat {
         rows_ext: u32,
     ) -> Result<Seat> {
         let lane_count = u32::try_from(lanes.len()).unwrap_or(u32::MAX);
-        let need = Seat::scratch_bytes(layout, rows_ext, lane_count);
-        if scratch.bytes() < need {
-            return Err(Fault::Ceiling {
-                what: "recurrent buffer scratch bytes",
-                need,
-                have: scratch.bytes(),
-            });
-        }
+        Seat::fits(Seat::scratch_bytes(layout, rows_ext, lane_count), scratch.2)?;
         let rows = u64::from(rows_ext.max(1));
-        let mut at = 0u64;
-        let mut take = |row_bytes: u64, width: u32, dtype: Dtype| -> Result<Tensor> {
-            let bytes = rows * row_bytes;
-            let here = at;
-            at += bytes.next_multiple_of(256);
+        let (placed, work_at) = Seat::placed(layout, rows_ext);
+        let (scratch, base, _) = scratch;
+        let take = |item: usize, row_bytes: u64, width: u32, dtype: Dtype| -> Result<Tensor> {
             Ok(Tensor::new(
-                handles.bind(scratch, here, bytes.max(4))?,
+                handles.bind(scratch, base + placed[item], (rows * row_bytes).max(4))?,
                 rows_ext.max(1),
                 width,
                 dtype,
             ))
         };
         let mut ext_in = Vec::with_capacity(layout.planes.len());
-        for plane in &layout.planes {
-            ext_in.push(take(plane.row_bytes, plane.width, plane.dtype)?);
+        for (at, plane) in layout.planes.iter().enumerate() {
+            ext_in.push(take(at, plane.row_bytes, plane.width, plane.dtype)?);
         }
         let mut ext_out = Vec::with_capacity(layout.regions.len());
-        for region in &layout.regions {
-            ext_out.push(take(region.row_bytes, region.width, region.dtype)?);
+        for (at, region) in layout.regions.iter().enumerate() {
+            ext_out.push(take(
+                layout.planes.len() + at,
+                region.row_bytes,
+                region.width,
+                region.dtype,
+            )?);
         }
         let work_bytes = u64::from(lane_count.max(1)) * layout.work_elems * 4;
         let work = Tensor::new(
-            handles.bind(scratch, at, work_bytes.max(4))?,
+            handles.bind(scratch, base + work_at, work_bytes.max(4))?,
             lane_count.max(1),
             u32::try_from(layout.work_elems).unwrap_or(u32::MAX),
             Dtype::F32,
@@ -473,5 +578,81 @@ pub fn snapshots(trace: &poem_ir::Trace) -> u32 {
         kernels_slang::ssm::RS_SNAPSHOTS
     } else {
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Layout, Plane, Region, Role, Seat};
+    use poem_ir::Dtype;
+
+    /// Two planes and a region of rows, and a lane's work.
+    fn layout() -> Layout {
+        let plane = |cache, width| Plane {
+            cache,
+            role: Role::ConvX,
+            width,
+            dtype: Dtype::Bf16,
+            row_bytes: u64::from(width) * 2,
+        };
+        Layout {
+            planes: vec![plane(0, 384), plane(1, 384)],
+            regions: vec![Region {
+                width: 128,
+                dtype: Dtype::F32,
+                row_bytes: 512,
+            }],
+            work_elems: 1024,
+            ..Layout::default()
+        }
+    }
+
+    /// The scratch laid at the widest rung's extended rows for the most
+    /// lanes holds every fire of those, and a fire past it is refused by
+    /// name with the bytes it wants and the bytes laid.
+    #[test]
+    fn a_fire_past_the_recurrent_scratch_laid_is_refused_by_name() {
+        let layout = layout();
+        let (top, lanes) = (256, 4);
+        let widest = Seat::widest_rows(top);
+        assert_eq!(
+            widest,
+            2 * top,
+            "a rung's tokens of own rows and as many replayed"
+        );
+        let laid = Seat::scratch_bytes(&layout, widest, lanes);
+        for (rows, lanes) in [(1, 1), (top, 1), (widest, lanes), (top + 7, lanes)] {
+            Seat::fits(Seat::scratch_bytes(&layout, rows, lanes), laid)
+                .unwrap_or_else(|why| panic!("{rows} rows of {lanes} lanes: {why}"));
+        }
+        let need = Seat::scratch_bytes(&layout, widest + 1, lanes);
+        assert!(need > laid);
+        let why = Seat::fits(need, laid)
+            .expect_err("a fire past the scratch laid is refused")
+            .to_string();
+        assert!(
+            why.contains(&format!(
+                "a fire's recurrent scratch of {need} bytes is past the {laid} laid at load"
+            )),
+            "{why}"
+        );
+    }
+
+    /// Two layers whose extended rows live through ops that do not overlap
+    /// are two groups over the same bytes: the scratch is the wider layer's,
+    /// not the two together.
+    #[test]
+    fn layers_lay_their_extended_rows_over_the_same_scratch() {
+        let mut layout = layout();
+        let (rows, lanes) = (512, 4);
+        let together = Seat::scratch_bytes(&layout, rows, lanes);
+        // Planes of caches 0 and 1, the region with cache 0's.
+        layout.groups = vec![0, 1, 0];
+        let apart = Seat::scratch_bytes(&layout, rows, lanes);
+        let plane = (u64::from(rows) * 768).next_multiple_of(256);
+        assert_eq!(together - apart, plane, "one layer's plane less");
+        let (placed, work_at) = Seat::placed(&layout, rows);
+        assert_eq!(placed, vec![0, 0, plane], "each group from the scratch's start");
+        assert_eq!(work_at, plane + (u64::from(rows) * 512).next_multiple_of(256));
     }
 }

@@ -164,6 +164,7 @@ fn fire(
     let b = bounds(op, act, w, y)?;
     let target = ctx.target();
     if let Some(names) = ctx.naming() {
+        names.binds(&args(op, &b)?);
         return names.either(&kernels(target, op, ladder, &b, capacity_rows)?);
     }
     if b.m == 0 {

@@ -309,6 +309,20 @@ fn load_alone(
     )
 }
 
+/// [`load`] with fires of at most `tokens` tokens: the top rung's.
+pub fn load_fires(fixture: &Fixture, context: u32, tokens: u32) -> Option<Shell> {
+    let _alone = loading();
+    let device = DeviceBoot::default();
+    let residency = allowed(&device, engine::load::Residency::default())?;
+    Some(
+        Shell::load(Boot {
+            budget: Budget::new(SEATS, tokens),
+            ..boot(fixture, PAGE, context, &device, residency)
+        })
+        .unwrap_or_else(|why| panic!("the shell loads: {why}")),
+    )
+}
+
 /// The boot of a suite load of `fixture` on `device`.
 fn boot<'a>(
     fixture: &'a Fixture,

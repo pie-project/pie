@@ -160,6 +160,18 @@ pub(crate) struct Core {
 
     pub(crate) uniforms: Mutex<Vec<Held>>,
     pub(crate) scratch: Mutex<Vec<Held>>,
+    /// The room each frame's uniforms and staging scratch take, laid at a
+    /// load for its frames at once ([`Context::lay_frames`]): `uniforms`
+    /// and `scratch` then hold those rooms, a frame takes one of each it
+    /// needs and gives it back when it lands, and nothing is allocated for
+    /// a frame. `None` until a load lays them: a frame outside any load (a
+    /// kernel's test) takes chunks as it needs.
+    rooms: Mutex<Option<Rooms>>,
+    /// What a copy between two spans of one buffer goes through
+    /// ([`Frame::copy`]), a piece at a time: a load lays it at the most
+    /// such a copy moves at once (its pool's chunk); outside a load, a copy
+    /// takes one as long as itself.
+    bounce: Mutex<Option<Held>>,
 
     pub(crate) last_error: Arc<Mutex<Option<String>>>,
     pub(crate) books: Arc<engine_gpu::Books>,
@@ -232,14 +244,11 @@ impl Core {
         }
     }
 
-    pub(crate) fn uniform_chunk(&self) -> Held {
-        if let Some(chunk) = self.uniforms.lock().expect("uniforms lock poisoned").pop() {
-            return chunk;
-        }
+    fn uniform_buffer(&self, size: u64) -> Held {
         self.held(
             &wgpu::BufferDescriptor {
                 label: Some("pie uniforms"),
-                size: UNIFORM_CHUNK,
+                size,
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             },
@@ -247,23 +256,11 @@ impl Core {
         )
     }
 
-    pub(crate) fn return_uniforms(&self, chunks: Vec<Held>) {
-        self.uniforms
-            .lock()
-            .expect("uniforms lock poisoned")
-            .extend(chunks);
-    }
-
-    pub(crate) fn scratch_chunk(&self, bytes: u64) -> Held {
-        if bytes <= SCRATCH_CHUNK
-            && let Some(chunk) = self.scratch.lock().expect("scratch lock poisoned").pop()
-        {
-            return chunk;
-        }
+    fn scratch_buffer(&self, size: u64) -> Held {
         self.held(
             &wgpu::BufferDescriptor {
                 label: Some("pie scratch"),
-                size: bytes.max(SCRATCH_CHUNK),
+                size,
                 usage: wgpu::BufferUsages::STORAGE
                     | wgpu::BufferUsages::COPY_SRC
                     | wgpu::BufferUsages::COPY_DST,
@@ -273,11 +270,105 @@ impl Core {
         )
     }
 
+    /// The bounce a copy of `len` bytes within one buffer goes through: the
+    /// one a load laid, else one at least `len` long.
+    pub(crate) fn bounce(&self, len: u64) -> wgpu::Buffer {
+        let laid = self.rooms().is_some();
+        let mut bounce = self.bounce.lock().expect("bounce lock poisoned");
+        if !laid && bounce.as_ref().is_none_or(|held| held.size() < len) {
+            *bounce = Some(self.scratch_buffer(len.next_multiple_of(4).max(4)));
+        }
+        (**bounce.as_ref().expect("a load lays the bounce with the frames")).clone()
+    }
+
+    fn rooms(&self) -> Option<Rooms> {
+        *self.rooms.lock().expect("rooms lock poisoned")
+    }
+
+    /// A chunk of a frame's uniforms for `bytes` of them: a laid room where
+    /// a load laid them, else one taken as needed.
+    pub(crate) fn uniform_chunk(&self, bytes: u64) -> Result<Held> {
+        let free = self.uniforms.lock().expect("uniforms lock poisoned").pop();
+        match self.rooms() {
+            Some(rooms) => {
+                Rooms::within("uniforms", bytes, rooms.uniform)?;
+                free.ok_or_else(|| rooms.taken("uniforms"))
+            }
+            None => Ok(free.unwrap_or_else(|| self.uniform_buffer(UNIFORM_CHUNK))),
+        }
+    }
+
+    pub(crate) fn return_uniforms(&self, chunks: Vec<Held>) {
+        let keep = self.rooms().map_or(UNIFORM_CHUNK, |rooms| rooms.uniform);
+        self.uniforms
+            .lock()
+            .expect("uniforms lock poisoned")
+            .extend(chunks.into_iter().filter(|c| c.size() == keep));
+    }
+
+    /// A chunk of a frame's staging scratch for `bytes` of it: a laid room
+    /// where a load laid them, else one taken as needed.
+    pub(crate) fn scratch_chunk(&self, bytes: u64) -> Result<Held> {
+        if let Some(rooms) = self.rooms() {
+            Rooms::within("staging scratch", bytes, rooms.scratch)?;
+            return self
+                .scratch
+                .lock()
+                .expect("scratch lock poisoned")
+                .pop()
+                .ok_or_else(|| rooms.taken("staging scratch"));
+        }
+        if bytes <= SCRATCH_CHUNK
+            && let Some(chunk) = self.scratch.lock().expect("scratch lock poisoned").pop()
+        {
+            return Ok(chunk);
+        }
+        Ok(self.scratch_buffer(bytes.max(SCRATCH_CHUNK)))
+    }
+
     pub(crate) fn return_scratch(&self, chunks: Vec<Held>) {
+        let keep = self.rooms().map_or(SCRATCH_CHUNK, |rooms| rooms.scratch);
         self.scratch
             .lock()
             .expect("scratch lock poisoned")
-            .extend(chunks.into_iter().filter(|c| c.size() == SCRATCH_CHUNK));
+            .extend(chunks.into_iter().filter(|c| c.size() == keep));
+    }
+}
+
+/// What each frame takes of its own at most, laid for a load's frames at
+/// once ([`Context::lay_frames`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Rooms {
+    /// Each frame's uniform bytes.
+    pub(crate) uniform: u64,
+    /// Each frame's staging scratch bytes.
+    pub(crate) scratch: u64,
+    /// The frames laid for.
+    pub(crate) frames: usize,
+}
+
+impl Rooms {
+    /// A frame whose `what` of `need` bytes are past the `laid` bytes of its
+    /// room is refused by name: nothing grows it.
+    pub(crate) fn within(what: &str, need: u64, laid: u64) -> Result<()> {
+        if need > laid {
+            return Err(Fault::Program {
+                at: "wgpu::frame",
+                why: format!("a frame's {what} of {need} bytes are past the {laid} laid at load"),
+            });
+        }
+        Ok(())
+    }
+
+    /// Every frame's room of `what` is held by a frame in flight.
+    fn taken(self, what: &str) -> Fault {
+        Fault::Program {
+            at: "wgpu::frame",
+            why: format!(
+                "every one of the {} frames' {what} laid at load is held by a frame in flight",
+                self.frames
+            ),
+        }
     }
 }
 
@@ -513,6 +604,8 @@ impl Context {
             poller,
             uniforms: Mutex::new(Vec::new()),
             scratch: Mutex::new(Vec::new()),
+            rooms: Mutex::new(None),
+            bounce: Mutex::new(None),
             last_error,
             books: Arc::new(engine_gpu::Books::new()),
             subgroup_min,
@@ -536,6 +629,47 @@ impl Context {
 
     pub(crate) fn core(&self) -> &Arc<Core> {
         &self.core
+    }
+
+    /// The offset alignment a storage buffer binds at.
+    #[must_use]
+    pub fn storage_align(&self) -> u64 {
+        u64::from(self.core.limits.min_storage_buffer_offset_alignment)
+    }
+
+    /// Lays a room of `uniform` uniform bytes and one of `scratch` staging
+    /// scratch bytes for each of `frames` frames at once, in place of what
+    /// frames took before: from now on a frame takes one of each it needs
+    /// and gives it back when it lands, and one past its room, or past every
+    /// room in flight, is refused by name.
+    pub fn lay_frames(&self, frames: usize, uniform: u64, scratch: u64, bounce: u64) {
+        let core = &self.core;
+        let mut uniforms = core.uniforms.lock().expect("uniforms lock poisoned");
+        let mut scratches = core.scratch.lock().expect("scratch lock poisoned");
+        uniforms.clear();
+        scratches.clear();
+        for _ in 0..frames {
+            if uniform > 0 {
+                uniforms.push(core.uniform_buffer(uniform));
+            }
+            if scratch > 0 {
+                scratches.push(core.scratch_buffer(scratch));
+            }
+        }
+        *core.bounce.lock().expect("bounce lock poisoned") =
+            Some(core.scratch_buffer(bounce.next_multiple_of(4).max(4)));
+        *core.rooms.lock().expect("rooms lock poisoned") = Some(Rooms {
+            uniform,
+            scratch,
+            frames,
+        });
+        tracing::info!(
+            frames,
+            uniform,
+            scratch,
+            bounce,
+            "a frame's uniforms and staging scratch are laid for the load's frames at once"
+        );
     }
 
     #[must_use]
@@ -766,18 +900,25 @@ impl Frame {
         Ok(f(encoder))
     }
 
-    pub(crate) fn uniform_slot(&self, bytes: u64) -> (wgpu::Buffer, u64) {
+    pub(crate) fn uniform_slot(&self, bytes: u64) -> Result<(wgpu::Buffer, u64)> {
         let core = &self.inner.core;
         let align = u64::from(core.limits.min_uniform_buffer_offset_alignment).max(16);
         let mut ring = self.inner.uniforms.lock().expect("uniforms lock poisoned");
         let at = ring.used.next_multiple_of(align);
-        if ring.chunks.is_empty() || at + bytes > UNIFORM_CHUNK {
-            ring.chunks.push(core.uniform_chunk());
+        let room = ring.chunks.last().map_or(0, |chunk| chunk.size());
+        if ring.chunks.is_empty() || at + bytes > room {
+            if let Some(rooms) = core.rooms()
+                && !ring.chunks.is_empty()
+            {
+                // A laid frame has its one room: past it is past the load's.
+                Rooms::within("uniforms", at + bytes, rooms.uniform)?;
+            }
+            ring.chunks.push(core.uniform_chunk(bytes)?);
             ring.used = bytes;
-            return ((*ring.chunks.last().expect("just pushed")).clone(), 0);
+            return Ok(((*ring.chunks.last().expect("just pushed")).clone(), 0));
         }
         ring.used = at + bytes;
-        ((*ring.chunks.last().expect("non-empty")).clone(), at)
+        Ok(((*ring.chunks.last().expect("non-empty")).clone(), at))
     }
 
     pub(crate) fn timestamp_slot(&self, name: &str) -> Option<(wgpu::QuerySet, u32)> {
@@ -804,18 +945,25 @@ impl Frame {
         Some((set, 2 * at))
     }
 
-    pub(crate) fn scratch_slot(&self, bytes: u64) -> (wgpu::Buffer, u64) {
+    pub(crate) fn scratch_slot(&self, bytes: u64) -> Result<(wgpu::Buffer, u64)> {
         let core = &self.inner.core;
-        let align = u64::from(core.limits.min_storage_buffer_offset_alignment).max(256);
+        let align = u64::from(core.limits.min_storage_buffer_offset_alignment)
+            .max(engine_gpu::named::STAGING_SLOT_ALIGN);
         let mut ring = self.inner.scratch.lock().expect("scratch lock poisoned");
         let at = ring.used.next_multiple_of(align);
-        if ring.chunks.is_empty() || at + bytes > SCRATCH_CHUNK {
-            ring.chunks.push(core.scratch_chunk(bytes));
+        let room = ring.chunks.last().map_or(0, |chunk| chunk.size());
+        if ring.chunks.is_empty() || at + bytes > room {
+            if let Some(rooms) = core.rooms()
+                && !ring.chunks.is_empty()
+            {
+                Rooms::within("staging scratch", at + bytes, rooms.scratch)?;
+            }
+            ring.chunks.push(core.scratch_chunk(bytes)?);
             ring.used = bytes;
-            return ((*ring.chunks.last().expect("just pushed")).clone(), 0);
+            return Ok(((*ring.chunks.last().expect("just pushed")).clone(), 0));
         }
         ring.used = at + bytes;
-        ((*ring.chunks.last().expect("non-empty")).clone(), at)
+        Ok(((*ring.chunks.last().expect("non-empty")).clone(), at))
     }
 
     /// Writes `bytes` into `into` from `at` in queue order: the queue lands
@@ -849,12 +997,29 @@ impl Frame {
         let (from, to) = (&source.slab().buffer, &into.slab().buffer);
         // wgpu refuses a copy whose ends are one buffer: it goes through
         // scratch, which also reads overlapping ends as they were.
-        let stage = (from == to).then(|| self.scratch_slot(len));
-        self.encode(|encoder| match &stage {
-            None => encoder.copy_buffer_to_buffer(from, source_at, to, into_at, Some(len)),
-            Some((scratch, at)) => {
-                encoder.copy_buffer_to_buffer(from, source_at, scratch, *at, Some(len));
-                encoder.copy_buffer_to_buffer(scratch, *at, to, into_at, Some(len));
+        if from != to {
+            return self.encode(|encoder| {
+                encoder.copy_buffer_to_buffer(from, source_at, to, into_at, Some(len));
+            });
+        }
+        // Through the device's bounce, a piece at a time in the order a
+        // move takes (from the far end where the ends overlap upward), so
+        // overlapping ends read as they were. The queue runs every copy in
+        // order, so one bounce serves every frame.
+        let bounce = self.inner.core.bounce(len);
+        let piece = bounce.size();
+        let pieces = len.div_ceil(piece);
+        self.encode(|encoder| {
+            for n in 0..pieces {
+                let k = if into_at > source_at {
+                    pieces - 1 - n
+                } else {
+                    n
+                };
+                let at = k * piece;
+                let bytes = piece.min(len - at);
+                encoder.copy_buffer_to_buffer(from, source_at + at, &bounce, 0, Some(bytes));
+                encoder.copy_buffer_to_buffer(&bounce, 0, to, into_at + at, Some(bytes));
             }
         })
     }
@@ -1083,5 +1248,72 @@ mod tests {
         buffer.read(0, &mut got).unwrap();
         assert_eq!(got[32..48], ramp[..16]);
         assert_eq!(got[8..24], ramp[..16]);
+    }
+
+    /// A frame of a load that laid its rooms takes them and allocates
+    /// nothing: within its rooms its slots land, past its uniforms or its
+    /// staging scratch it is refused by name, and with every room held by
+    /// a frame in flight the next is refused too. Without a laid load (the
+    /// negative control) a frame takes what it needs.
+    #[test]
+    fn a_frame_past_the_rooms_laid_at_load_is_refused_by_name() {
+        if !present() {
+            return;
+        }
+        let allowance = engine::Allowance {
+            budget: Some(1 << 30),
+        };
+        let device = Context::bind(&DeviceBoot::default(), allowance).unwrap();
+        let unlaid = device.frame().unwrap();
+        unlaid
+            .scratch_slot(64 << 20)
+            .expect("an unlaid frame takes what it needs");
+        drop(unlaid);
+
+        let (uniform, scratch) = (4096, 1 << 20);
+        device.lay_frames(2, uniform, scratch, scratch);
+        let reserved = device.books().reserved();
+        let frame = device.frame().unwrap();
+        frame
+            .uniform_slot(uniform)
+            .expect("a frame's uniforms within its room");
+        frame
+            .scratch_slot(scratch)
+            .expect("a frame's staging within its room");
+        let why = frame
+            .uniform_slot(16)
+            .expect_err("past the uniforms laid")
+            .to_string();
+        assert!(
+            why.contains("a frame's uniforms of")
+                && why.contains(&format!("past the {uniform} laid at load")),
+            "{why}"
+        );
+        let why = frame
+            .scratch_slot(256)
+            .expect_err("past the scratch laid")
+            .to_string();
+        assert!(
+            why.contains("a frame's staging scratch of")
+                && why.contains(&format!("past the {scratch} laid at load")),
+            "{why}"
+        );
+        let why = device
+            .frame()
+            .unwrap()
+            .scratch_slot(scratch + 1)
+            .expect_err("one slot past a room")
+            .to_string();
+        assert!(why.contains("past the"), "{why}");
+        let second = device.frame().unwrap();
+        second.scratch_slot(256).expect("the second frame's room");
+        let third = device.frame().unwrap();
+        let why = third
+            .scratch_slot(256)
+            .expect_err("every room in flight")
+            .to_string();
+        assert!(why.contains("held by a frame in flight"), "{why}");
+        drop((frame, second, third));
+        assert_eq!(device.books().reserved(), reserved, "no frame allocated");
     }
 }

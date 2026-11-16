@@ -272,10 +272,52 @@ pub struct Inputs<B: Backend> {
     packings: Vec<PackingAt>,
     seats: Vec<SeatAt>,
     voxels: Option<VoxelAt>,
-    /// Staged apart from the store: their size is the groups', not the load's.
+    /// Staged apart from the store, laid at load where the model packs an
+    /// attention group (`group_mask_bytes`): no fire grows it.
     group_masks: Option<B::Buffer>,
-    /// Smaller ones it outgrew, kept: an earlier fire may still read them.
-    outgrown: Vec<B::Buffer>,
+}
+
+/// A fire's group masks as they are staged, each its group offsets then
+/// its bits, every part aligned; and where each mask's two parts start.
+fn mask_image<'a>(
+    masks: impl Iterator<Item = &'a poem_exec::fire::GroupMask>,
+) -> (Vec<u8>, Vec<(usize, usize)>) {
+    let mut image: Vec<u8> = Vec::new();
+    let mut placed = Vec::new();
+    for mask in masks {
+        let indptr = image.len();
+        image.extend_from_slice(bytes_of(&mask.indptr));
+        image.resize(image.len().next_multiple_of(ALIGN as usize), 0);
+        let bits = image.len();
+        // The kernel reads the bits a word at a time.
+        image.extend_from_slice(&mask.bits);
+        image.resize(image.len().next_multiple_of(ALIGN as usize), 0);
+        placed.push((indptr, bits));
+    }
+    (image, placed)
+}
+
+/// A fire whose group masks of `bytes` are past the `laid` bytes the load
+/// laid is refused by name: nothing grows them.
+fn mask_fits(bytes: u64, laid: u64) -> Result<()> {
+    crate::error::within_laid("serve::mask", "group masks", bytes, laid)
+}
+
+/// The bytes a fire's group masks take at most ([`Inputs::stage_group_masks`])
+/// for `ragged` packed pairs of `budget`'s fires: each pair's group offsets,
+/// one a group of at most a group a lane, then a bit for every (query, key)
+/// pair of its groups' rows, at most the fire's tokens squared, each group's
+/// rounded up to a byte.
+#[must_use]
+pub fn group_mask_bytes(budget: &Budget, ragged: usize) -> u64 {
+    let lanes = u64::from(budget.max_lanes.max(1));
+    let tokens = u64::from(budget.max_tokens);
+    let indptr = (4 * (lanes + 1)).next_multiple_of(ALIGN);
+    let bits = (tokens * tokens)
+        .div_ceil(8)
+        .saturating_add(lanes)
+        .next_multiple_of(ALIGN);
+    ragged as u64 * (indptr + bits)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -302,6 +344,7 @@ impl<B: Backend> Inputs<B> {
         selections: usize,
         voxel: Option<VoxelSeat>,
         pieces: u32,
+        ragged: usize,
     ) -> Result<Inputs<B>> {
         let pieces = pieces.max(1);
         let rows = u64::from(budget.max_tokens);
@@ -424,14 +467,20 @@ impl<B: Backend> Inputs<B> {
             packings,
             seats,
             voxels,
-            group_masks: None,
-            outgrown: Vec::new(),
+            group_masks: (ragged > 0)
+                .then(|| {
+                    B::Buffer::host(
+                        device,
+                        group_mask_bytes(budget, ragged),
+                        crate::books::owners::INPUTS,
+                    )
+                })
+                .transpose()?,
         })
     }
 
     pub fn stage_group_masks(
         &mut self,
-        device: &B::Context,
         handles: &crate::handles::Handles<B>,
         masks: &[(
             poem_ir::Selection,
@@ -442,36 +491,15 @@ impl<B: Backend> Inputs<B> {
         if masks.is_empty() {
             return Ok(Vec::new());
         }
-        let mut image: Vec<u8> = Vec::new();
-        let mut placed = Vec::with_capacity(masks.len());
-        for (_, _, mask) in masks {
-            let indptr = image.len();
-            image.extend_from_slice(bytes_of(&mask.indptr));
-            image.resize(image.len().next_multiple_of(ALIGN as usize), 0);
-            let bits = image.len();
-            // The kernel reads the bits a word at a time.
-            image.extend_from_slice(&mask.bits);
-            image.resize(image.len().next_multiple_of(ALIGN as usize), 0);
-            placed.push((indptr, bits));
-        }
-        if self
-            .group_masks
-            .as_ref()
-            .is_none_or(|held| held.bytes() < image.len() as u64)
-        {
-            let grown = B::Buffer::host(
-                device,
-                (image.len() as u64).next_power_of_two(),
-                crate::books::owners::INPUTS,
-            )?;
-            if let Some(old) = self.group_masks.replace(grown) {
-                self.outgrown.push(old);
-            }
-        }
+        let (image, placed) = mask_image(masks.iter().map(|(_, _, mask)| mask));
+        mask_fits(
+            image.len() as u64,
+            self.group_masks.as_ref().map_or(0, B::Buffer::bytes),
+        )?;
         let buffer = self
             .group_masks
             .as_mut()
-            .expect("the group mask buffer was just sized");
+            .expect("masks past none laid are refused");
         buffer.write(0, &image)?;
         let buffer = &*buffer;
         masks
@@ -1056,4 +1084,69 @@ fn rows_table(into: &mut Vec<i32>, staged: &[i32], rows: u32) {
     into.clear();
     into.extend_from_slice(staged);
     into.resize(rows as usize, -1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{group_mask_bytes, mask_fits, mask_image};
+    use poem_compiler::Budget;
+    use poem_exec::fire::{GroupMask, GuestRows, LaneMask, LaneRow, group_mask, pack};
+    use poem_ir::Selection;
+
+    /// The masks of a fire of `lanes` kv-less lanes of `rows` rows each,
+    /// every lane in `groups` groups stating a mask, for `ragged` packings.
+    fn masks(lanes: u32, rows: u32, groups: u32, ragged: usize) -> Vec<GroupMask> {
+        let rows_of: Vec<LaneRow> = (0..lanes)
+            .map(|at| LaneRow {
+                source: at,
+                row_offset: at * rows,
+                rows,
+                ..LaneRow::default()
+            })
+            .collect();
+        let group_of_lane: Vec<i32> = (0..lanes).map(|at| (at % groups) as i32).collect();
+        let packed = pack(Selection::ALL, &rows_of, &group_of_lane, lanes * rows).expect("packs");
+        let stated = LaneMask {
+            rows: (0..rows).map(|row| vec![0..u64::from(row) + 1]).collect(),
+        };
+        let masks: Vec<Option<&LaneMask>> = (0..lanes).map(|_| Some(&stated)).collect();
+        let guests: Vec<GuestRows> = (0..lanes)
+            .map(|_| GuestRows {
+                count: u64::from(rows),
+                of_token: None,
+            })
+            .collect();
+        (0..ragged)
+            .map(|_| {
+                group_mask(&rows_of, &group_of_lane, &packed, &packed, &masks, &guests)
+                    .expect("the masks compose")
+                    .expect("every lane states one")
+            })
+            .collect()
+    }
+
+    /// The group masks laid at load hold the widest fire's, at its most
+    /// lanes in one group or a group a lane; a fire past the budget's
+    /// tokens is past them, refused by name.
+    #[test]
+    fn group_masks_laid_at_load_hold_the_widest_fire_and_refuse_past_it() {
+        let budget = Budget::new(4, 64);
+        let ragged = 2;
+        let laid = group_mask_bytes(&budget, ragged);
+        for (lanes, rows, groups) in [(1, 64, 1), (4, 16, 1), (4, 16, 4), (4, 15, 4)] {
+            let (image, _) = mask_image(masks(lanes, rows, groups, ragged).iter());
+            mask_fits(image.len() as u64, laid)
+                .unwrap_or_else(|why| panic!("{lanes} lanes of {rows} rows: {why}"));
+        }
+        // Past the budget: a fire of twice its tokens.
+        let (image, _) = mask_image(masks(1, 128, 1, ragged).iter());
+        let why = mask_fits(image.len() as u64, laid)
+            .expect_err("masks past those laid are refused")
+            .to_string();
+        assert!(
+            why.contains("a fire's group masks of") && why.contains("laid at load"),
+            "{why}"
+        );
+        assert_eq!(group_mask_bytes(&budget, 0), 0, "no packing, nothing laid");
+    }
 }

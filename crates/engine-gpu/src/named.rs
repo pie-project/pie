@@ -63,6 +63,7 @@ pub struct Facts {
     outside: u64,
     table_align: u64,
     tier: kernels_slang::Tier,
+    staging_align: Option<u64>,
     books: Arc<Books>,
 }
 
@@ -78,6 +79,7 @@ impl Facts {
             outside: device.outside().saturating_add(device.books().device()),
             table_align: B::table_align(device),
             tier: B::tier(device),
+            staging_align: B::staging_align(device),
             books: Arc::new(Books::apart()),
         }
     }
@@ -344,34 +346,108 @@ impl<B: Serve> Default for Asked<B> {
 /// The naming sink over a walk. As a backend's own sink does, it is this
 /// thread's recording frame for as long as it lives: what a dispatch does
 /// in the frame's order beside its kernel (a staged table, a settled read)
-/// reaches the frame that records nothing.
-pub struct Naming<'f>(&'f Names, crate::probe::Recording);
+/// reaches the frame that records nothing. Where the backend stages a
+/// buffer it cannot bind in place (`Serve::staging_align`), it counts what
+/// each dispatch's bindings stage ([`Names::stage`]).
+pub struct Naming<'f, B: Serve> {
+    names: &'f Names,
+    recording: crate::probe::Recording,
+    handles: &'f Handles<Named<B>>,
+    staging_align: Option<u64>,
+}
 
-impl Drop for Naming<'_> {
+impl<B: Serve> Drop for Naming<'_, B> {
     fn drop(&mut self) {
-        crate::probe::restore(self.1);
+        crate::probe::restore(self.recording);
     }
 }
 
-impl kernels_slang::Encode for Naming<'_> {
+impl<B: Serve> Naming<'_, B> {
+    /// Counts what a dispatch binding `args` stages: each buffer bound off
+    /// the storage alignment, its view in whole words at the scratch slot's
+    /// alignment (as the backend's frame stages it).
+    fn stage(&self, args: &[kernels_slang::ArgValue]) {
+        let Some(align) = self.staging_align.filter(|&align| align > 1) else {
+            return;
+        };
+        let slot = align.max(STAGING_SLOT_ALIGN);
+        let bytes = args
+            .iter()
+            .filter_map(|arg| match *arg {
+                kernels_slang::ArgValue::Buffer(handle)
+                | kernels_slang::ArgValue::BufferMut(handle)
+                    if handle != crate::handles::NIL =>
+                {
+                    self.handles.get(handle)
+                }
+                _ => None,
+            })
+            .filter(|binding| !binding.offset().is_multiple_of(align))
+            .map(|binding| {
+                binding
+                    .extent()
+                    .min(binding.remaining())
+                    .next_multiple_of(4)
+                    .next_multiple_of(slot)
+            })
+            .sum();
+        self.names.stage(bytes);
+    }
+}
+
+/// The least alignment a backend's frame lays a staged view at in its
+/// scratch.
+pub const STAGING_SLOT_ALIGN: u64 = 256;
+
+impl<B: Serve> kernels_slang::Encode for Naming<'_, B> {
     fn fire(
         &self,
         fire: kernels_slang::Fire,
         args: &[kernels_slang::ArgValue],
     ) -> std::result::Result<(), kernels_slang::Error> {
-        self.0.fire(fire, args)
+        self.stage(args);
+        kernels_slang::Encode::fire(self.names, fire, args)
     }
 
     fn absent(&self) -> std::result::Result<kernels_slang::ArgValue, kernels_slang::Error> {
-        self.0.absent()
+        kernels_slang::Encode::absent(self.names)
     }
 
     fn target(&self) -> kernels_slang::Target {
-        self.0.target()
+        kernels_slang::Encode::target(self.names)
     }
 
     fn naming(&self) -> Option<&dyn kernels_slang::Naming> {
-        self.0.naming()
+        Some(self)
+    }
+}
+
+impl<B: Serve> kernels_slang::Naming for Naming<'_, B> {
+    fn either(
+        &self,
+        alternatives: &[kernels_slang::Fire],
+    ) -> std::result::Result<(), kernels_slang::Error> {
+        kernels_slang::Naming::either(self.names, alternatives)
+    }
+
+    fn binds(&self, args: &[kernels_slang::ArgValue]) {
+        self.stage(args);
+    }
+
+    fn fork(&self) {
+        kernels_slang::Naming::fork(self.names);
+    }
+
+    fn or(&self) {
+        kernels_slang::Naming::or(self.names);
+    }
+
+    fn join(&self) {
+        kernels_slang::Naming::join(self.names);
+    }
+
+    fn most_rows(&self) -> u32 {
+        kernels_slang::Naming::most_rows(self.names)
     }
 }
 
@@ -382,7 +458,7 @@ impl<B: Serve> Serve for Named<B> {
 
     type Pipelines = Asked<B>;
 
-    type Sink<'f> = Naming<'f>;
+    type Sink<'f> = Naming<'f, B>;
 
     type Guests = std::convert::Infallible;
 
@@ -443,19 +519,33 @@ impl<B: Serve> Serve for Named<B> {
     }
 
     fn sink<'f>(
-        _device: &'f Facts,
+        device: &'f Facts,
         frame: &'f NoFrame,
         pipelines: &'f Asked<B>,
-        _handles: &'f Handles<Named<B>>,
-    ) -> Naming<'f> {
-        Naming(
-            &pipelines.0,
-            crate::probe::set_frame(std::ptr::from_ref(frame)),
-        )
+        handles: &'f Handles<Named<B>>,
+    ) -> Naming<'f, B> {
+        Naming {
+            names: &pipelines.0,
+            recording: crate::probe::set_frame(std::ptr::from_ref(frame)),
+            handles,
+            staging_align: device.staging_align,
+        }
+    }
+
+    fn staging_align(device: &Facts) -> Option<u64> {
+        device.staging_align
     }
 
     fn walk_frame(_device: &Facts, _keep: bool) -> Result<NoFrame> {
         Ok(NoFrame)
+    }
+
+    fn lay_frames(
+        _device: &Facts,
+        _pipelines: &Asked<B>,
+        _facts: crate::serve::FrameFacts,
+    ) -> Result<()> {
+        Ok(())
     }
 
     fn shelf(_device: &Facts, _readout: &[NoBuffer], _weights_stream: bool) -> Result<()> {
@@ -463,10 +553,6 @@ impl<B: Serve> Serve for Named<B> {
     }
 
     fn forget(_shelf: &mut ()) {}
-
-    fn grown(_shell: &mut Shell<Named<B>>, _arm: usize, _bytes: u64) -> Result<()> {
-        Ok(())
-    }
 
     fn plan(
         _shell: &mut Shell<Named<B>>,

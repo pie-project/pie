@@ -37,6 +37,6 @@ pub mod window;
 
 pub use backend::{Backend, Buffer, Memory};
 pub use books::{Books, Owner};
-pub use error::{Fault, Result, kernel, storage_buffers, workgroups};
+pub use error::{Fault, Result, kernel, storage_buffers, within_laid, workgroups};
 pub use handles::{Binding, Handles, NIL};
 pub use settle::{Airborne, Arms, Done};

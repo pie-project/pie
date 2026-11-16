@@ -92,9 +92,13 @@ impl Widen {
         })
     }
 
+    /// Widens `lanes` values into `dst`, its config written to `config` (a
+    /// slot the caller's session laid: no two of one frame share one).
+    #[allow(clippy::too_many_arguments)]
     pub fn encode(
         &self,
         frame: &Frame,
+        config: (&wgpu::Buffer, u64),
         src: &Buffer,
         src_at: u64,
         dst: &Buffer,
@@ -116,8 +120,8 @@ impl Widen {
             lanes,
             pad: 0,
         });
-        let (cfg, cfg_at) = frame.uniform_slot(bytes.len() as u64);
-        self.core.queue.write_buffer(&cfg, cfg_at, &bytes);
+        let (cfg, cfg_at) = config;
+        self.core.queue.write_buffer(cfg, cfg_at, &bytes);
 
         let group = self
             .core
@@ -137,7 +141,7 @@ impl Widen {
                     wgpu::BindGroupEntry {
                         binding: 2,
                         resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                            buffer: &cfg,
+                            buffer: cfg,
                             offset: cfg_at,
                             size: std::num::NonZeroU64::new(bytes.len() as u64),
                         }),
