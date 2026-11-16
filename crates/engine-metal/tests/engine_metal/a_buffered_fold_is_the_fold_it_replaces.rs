@@ -219,58 +219,6 @@ fn argmax(logits: &[f32]) -> usize {
 
 const LOGIT_FLOOR: f32 = 0.05;
 
-/// Whether two states' bytes are the same state: every word equal, but a
-/// normal f32 within rounding of the other's at the state's own magnitude
-/// (a fold and the replay it stands for sum a scan in different chunks), a
-/// few ulps of its largest element. A word below the normal range (an
-/// integer row's small values, an n-gram id, read as a denormal) is compared
-/// exactly, so a leaked row of ids is never let through; a leaked float row
-/// moves its values by far more than rounding.
-fn same_state(a: &[u8], b: &[u8]) -> Result<(), String> {
-    if a.len() != b.len() {
-        return Err(format!("{} bytes against {}", a.len(), b.len()));
-    }
-    let words = |bytes: &[u8]| -> Vec<u32> {
-        bytes
-            .chunks_exact(4)
-            .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
-            .collect()
-    };
-    let (x, y) = (words(a), words(b));
-    let normal = |w: u32| (w >> 23) & 0xff != 0 && (w >> 23) & 0xff != 0xff;
-    let largest = x
-        .iter()
-        .filter(|&&w| normal(w))
-        .map(|&w| f32::from_bits(w).abs())
-        .fold(0f32, f32::max);
-    let tolerance = largest * f32::EPSILON * 16.0;
-    let mut apart = 0usize;
-    let mut worst = 0f32;
-    let mut first = None;
-    for (at, (&p, &q)) in x.iter().zip(&y).enumerate() {
-        if p == q {
-            continue;
-        }
-        let gap = (f32::from_bits(p) - f32::from_bits(q)).abs();
-        if normal(p) && normal(q) && gap <= tolerance {
-            worst = worst.max(gap);
-            continue;
-        }
-        apart += 1;
-        first.get_or_insert(at);
-    }
-    if worst > 0.0 {
-        eprintln!("states within rounding: {worst:e} at most, against {tolerance:e}");
-    }
-    match first {
-        None => Ok(()),
-        Some(at) => Err(format!(
-            "{apart} of {} words apart past rounding ({tolerance:e}), the first at byte {}",
-            x.len(),
-            at * 4
-        )),
-    }
-}
 
 /// Each state plane `(name, bytes, dtype)` the record lays end to end.
 type Planes = Vec<(String, u64, poem_ir::Dtype)>;
@@ -359,10 +307,73 @@ fn tell_planes(got: &[u8], want: &[u8], planes: &Planes) {
     }
 }
 
-fn assert_same_state(got: &[u8], want: &[u8], what: &str, planes: &Planes) {
-    if let Err(why) = same_state(got, want) {
+/// A float plane's elements, read in its dtype; `None` for an integer plane
+/// (n-gram ids, which a fold carries exactly).
+fn floats(bytes: &[u8], dtype: poem_ir::Dtype) -> Option<Vec<f64>> {
+    match dtype {
+        poem_ir::Dtype::F32 => Some(
+            bytes
+                .chunks_exact(4)
+                .map(|c| f64::from(f32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+                .collect(),
+        ),
+        poem_ir::Dtype::Bf16 => Some(
+            bytes
+                .chunks_exact(2)
+                .map(|c| f64::from(f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16)))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// The distance between two states: the L2 norm of their difference over
+/// every float plane. With `exact`, `Err` names an integer plane that
+/// differs at all; without, integer planes are not counted (two different
+/// folds carry different n-gram ids).
+fn distance(a: &[u8], b: &[u8], planes: &Planes, exact: bool) -> Result<f64, String> {
+    let mut at = 0usize;
+    let mut sum = 0f64;
+    for (name, bytes, dtype) in planes {
+        let len = *bytes as usize;
+        let (x, y) = (&a[at..at + len], &b[at..at + len]);
+        match (floats(x, *dtype), floats(y, *dtype)) {
+            (Some(x), Some(y)) => {
+                sum += x.iter().zip(&y).map(|(p, q)| (p - q) * (p - q)).sum::<f64>();
+            }
+            _ if exact && x != y => {
+                return Err(format!("integer plane {name} ({dtype:?}) differs"));
+            }
+            _ => {}
+        }
+        at += len;
+    }
+    assert_eq!(at, a.len(), "the planes cover the record");
+    Ok(sum.sqrt())
+}
+
+/// `got` is the state `want` is, as the fold the test compares against: its
+/// distance from `want` is under a tenth of `scale`, the distance between
+/// two different folds of the same window (the fold of `j` tokens and of
+/// `k`). A fold that took rows it should not have moves the state by about
+/// `scale`. Rounding carried through the layers moves it by a small
+/// fraction of it, since each layer takes the last one's slightly
+/// different output. Integer planes are exact.
+fn assert_same_state(got: &[u8], want: &[u8], what: &str, planes: &Planes, scale: f64) {
+    let d = match distance(got, want, planes, true) {
+        Ok(d) => d,
+        Err(why) => {
+            tell_planes(got, want, planes);
+            panic!("{what}: {why}");
+        }
+    };
+    eprintln!("state {d:e} from the fold, against {scale:e} between two folds ({:.1e} of it)", d / scale);
+    if d >= scale / 10.0 {
         tell_planes(got, want, planes);
-        panic!("{what}: {why}");
+        panic!(
+            "{what}: the state is {d:e} from the fold, past a tenth of the {scale:e} between \
+             the fold of {WINDOW} tokens and of 3"
+        );
     }
 }
 
@@ -434,6 +445,7 @@ fn holds_the_contract(mut shell: Shell) {
         folded_j, folded,
         "folding {j} tokens and folding {k} leave the same banks, so claim 3 can't tell them apart"
     );
+    let scale = distance(&folded_j, &folded, &planes, false).expect("float planes only");
     shell.open(3).expect("slot 3 opens");
     shell
         .fire_seated(&[seated(3, &tokens, &buffer(0, 0), RsReset::Fresh)])
@@ -446,6 +458,7 @@ fn holds_the_contract(mut shell: Shell) {
         &folded_j,
         &format!("a replay truncated at {j} did not leave the banks a fold of {j} leaves"),
         &planes,
+        scale,
     );
 
     shell.open(4).expect("slot 4 opens");
@@ -457,6 +470,7 @@ fn holds_the_contract(mut shell: Shell) {
         &folded_j,
         &format!("the mixed row did not land the fold at row {j}"),
         &planes,
+        scale,
     );
     let d = spread(&reference[0], &mixed[0]);
     eprintln!("claim 4: mixed row vs folding window, last-row logit spread {d:.4}");
@@ -477,6 +491,7 @@ fn holds_the_contract(mut shell: Shell) {
         &folded,
         "replaying A ahead of B did not leave the banks Fold(A) leaves",
         &planes,
+        scale,
     );
     shell.open(6).expect("slot 6 opens");
     shell
@@ -515,6 +530,7 @@ fn holds_the_contract(mut shell: Shell) {
         &alone_state,
         "a folding lane's banks changed for having a buffering peer",
         &planes,
+        scale,
     );
     assert_eq!(
         shell.state_bytes(1).expect("slot 1"),
@@ -596,18 +612,15 @@ fn holds_the_contract(mut shell: Shell) {
                     k + r - 1,
                 )])
                 .expect("a one-row fold fires");
-            let same = same_state(
+            assert_same_state(
                 &shell.state_bytes(0).expect("slot 0"),
                 &shell.state_bytes(6).expect("slot 6"),
-            )
-            .is_ok();
-            eprintln!(
-                "claim 9: round {r} — banks after folding s_{} through the discard path equal the plain fold: {same}",
-                r - 1
-            );
-            assert!(
-                same,
-                "round {r}: replaying and folding one survivor of a two-row window left other banks than folding it plainly"
+                &format!(
+                    "claim 9, round {r}: replaying and folding one survivor of a two-row window \
+                     left other banks than folding it plainly"
+                ),
+                &planes,
+                scale,
             );
         }
     }
