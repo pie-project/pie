@@ -385,7 +385,7 @@ fn reading(get: &HashMap<String, String>) -> Result<bool, String> {
                 "READING_ROWS {}",
                 json!({"value": c.value.0, "rows": a.len() / c.width.max(1), "rel_l2": rel,
                     "cosine": cos, "finite": a.iter().all(|x| x.is_finite()), "cycles": cycles,
-                    "wall_s": t0.elapsed().as_secs()})
+                    "wall_s": t0.elapsed().as_secs(), "wall_ms": t0.elapsed().as_secs_f64() * 1e3})
             );
         }
         return Ok(ok);
@@ -436,7 +436,7 @@ fn reading(get: &HashMap<String, String>) -> Result<bool, String> {
             .finish(&mut host, &trace, &step, &back, &[d.velocity.as_str()])?
             .remove(0);
         let mut line = json!({"step": i, "sigma": d.sigmas[i], "cycles": cycles,
-            "wall_s": t0.elapsed().as_secs(), "finite": v.iter().all(|x| x.is_finite())});
+            "wall_s": t0.elapsed().as_secs(), "wall_ms": t0.elapsed().as_secs_f64() * 1e3, "finite": v.iter().all(|x| x.is_finite())});
         if let Some(g) = &golden {
             let p = g.join(format!("cpu_velocity{i}.f32"));
             if p.is_file() {

@@ -71,6 +71,8 @@ fn engine_at(cache: &Path, fabric: Option<&str>) -> engine_cerebras::CerebrasEng
     let mut cfg = engine_cerebras::Config {
         cache_dir: Some(cache.to_path_buf()),
         num_threads: 8,
+        // a system's programs are linked against its whole wafer (`prepare::stream_programs`)
+        cmaddr: std::env::var("READING_CMADDR").ok(),
         ..engine_cerebras::Config::default()
     };
     cfg.wafer.stream_rows = Some(rows() as u32);
@@ -300,7 +302,7 @@ fn flux_2_minis_text_runs_through_the_engine() {
     assert_eq!(after, 1, "the second load finds the programs");
 }
 
-/// The text pass on the fabric (the simulator, or the system at the config's cmaddr): the
+/// The text pass on the fabric (the simulator, or the system at `READING_CMADDR`): the
 /// programs compiled and linked on load into `READING_CACHE`, the checkpoint written to
 /// `READING_OUT/ckpt`, the rows to `READING_OUT/text.f32`, held to transformers'.
 #[test]
@@ -323,7 +325,12 @@ fn flux_2_minis_text_on_the_fabric() {
     let got = if let Ok(ctx) = std::env::var("READING_CONTEXT") {
         f32s(&std::fs::read(ctx).expect("the text rows"))
     } else {
+        let t0 = std::time::Instant::now();
         let got = text_pass(&mut engine, &PROMPT);
+        println!(
+            "READING_TEXT the text pass: {:.1} ms (its program's first launch)",
+            t0.elapsed().as_secs_f64() * 1e3
+        );
         std::fs::write(
             out.join("text.f32"),
             got.iter()
@@ -343,7 +350,12 @@ fn flux_2_minis_text_on_the_fabric() {
             .unwrap()
             .parse()
             .expect("steps");
+        let t0 = std::time::Instant::now();
         let ran = common::guest::loop_on(&mut engine, &caps, steps, &got);
+        println!(
+            "READING_TEXT the {steps}-step loop: {:.1} ms",
+            t0.elapsed().as_secs_f64() * 1e3
+        );
         let host = host_loop(steps, &host_text(&PROMPT));
         for (i, x) in ran.latents.iter().enumerate() {
             std::fs::write(

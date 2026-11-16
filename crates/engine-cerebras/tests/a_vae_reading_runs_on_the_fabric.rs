@@ -330,7 +330,11 @@ fn flux_2_minis_vae_on_the_fabric() {
             std::fs::write(ops.join(n), src).expect("an op");
         }
         let cslc = kernels_cerebras::toolchain::Cslc::find(&cfg.toolchain).expect("cslc");
-        let (fabric_dims, fabric_offsets) = kernels_cerebras::toolchain::memcpy_fabric(w, h);
+        let (mut fabric_dims, fabric_offsets) = kernels_cerebras::toolchain::memcpy_fabric(w, h);
+        // a system runs a program linked against its whole wafer
+        if std::env::var("READING_CMADDR").is_ok() {
+            fabric_dims = kernels_cerebras::toolchain::Arch::Wse3.system_fabric();
+        }
         let t0 = std::time::Instant::now();
         cslc.compile(&kernels_cerebras::toolchain::Compile {
             arch: kernels_cerebras::toolchain::Arch::Wse3,
@@ -378,8 +382,8 @@ fn flux_2_minis_vae_on_the_fabric() {
         .launch_with(&mut fab, &st, &entries, &statics)
         .expect("the decode runs");
     eprintln!(
-        "the decode: {cycles:?} cycles, {:.0} s",
-        t0.elapsed().as_secs_f64()
+        "the decode: {cycles:?} cycles, {:.1} ms",
+        t0.elapsed().as_secs_f64() * 1e3
     );
     let back = reading.rows_back(&got).expect("the rows back");
     if upto.is_some() {
