@@ -1606,6 +1606,131 @@ mod tests {
         );
     }
 
+    /// A view reshape feeding a broadcast inside one streamed step
+    /// broadcasts by its own shape: `broadcast(reshape(iota(8), [1, 8]),
+    /// [1, 8])` is `[0..8]`, and the cell it equals 3 at is cell 3 (beam
+    /// search's `eq(col, wpos)`). The elided view read its viewed value's
+    /// descriptor before, an `[8]` whose axis lines up with the output's
+    /// first, so every cell read element 0: `col` was all zeros, no cell
+    /// matched, and the argmax answered 0. Each form answers 3.
+    #[test]
+    fn a_view_reshape_broadcasts_by_its_own_shape() {
+        use crate::store::Pools;
+        use eta_compiler::codegen::program::KernelKind;
+        const CELLS: u32 = 8;
+        let context = Context::bind().expect("a Metal 4 device");
+        let indptr: &'static Channel = Box::leak(Box::new(Channel::from(vec![0u32, 1])));
+        let token: &'static Channel =
+            Box::leak(Box::new(Channel::new([1], dtype::i32).capacity(4)));
+        let mut b = Builder::new(VOCAB, 16);
+        let logits = OutputDecl {
+            name: "logits".into(),
+            axis: Axis::Row,
+            width: VOCAB,
+            dtype: eta_ir::Dtype::F32,
+            layers: 0,
+            readout: true,
+        };
+        b.outputs(vec![vec![logits.clone()]]);
+        b.bind_port(Port::EmbedIndptr, indptr);
+        b.stage(Attach::Epilogue, move || {
+            let _ = intrinsics::output(0, "logits");
+            let col = broadcast(reshape(iota(CELLS), [1, CELLS]), [1, CELLS]);
+            let slot = reshape(reduce_sum(iota(3)), [1, 1]);
+            let hit = cast(eq(col, broadcast(slot, [1, CELLS])), dtype::f32);
+            token.put(reshape(reduce_argmax(reshape(hit, [CELLS])), [1]));
+        });
+        token.note_host_take();
+        let traced = b.build().expect("the program traces");
+        let bound = eta_ir::validate::bind(
+            traced.container().clone(),
+            vec![vec![logits]],
+            EngineCaps {
+                lora: true,
+                attn_page_mask: true,
+            },
+        )
+        .expect("the program binds");
+        let stages = compile_bound(&bound);
+        let backend = Backend::parse("metal").expect("the metal codegen backend");
+        let count = bound.container.channels.len();
+        let order = traced.channel_order();
+        let at = order.iter().position(|&gid| gid == indptr.gid()).expect("the indptr channel");
+        let seeds = vec![(
+            u32::try_from(at).expect("a channel index"),
+            [0u32, 1].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+        )];
+        let taken = u32::try_from(order.iter().position(|&gid| gid == token.gid()).expect("the token channel"))
+            .expect("a channel index");
+        let registration = ProgramRegistration {
+            program_hash: bound.hash,
+            emitted_kernels: emit_program(backend, &stages, &bound),
+            emitter_version: backend.emitter_version(),
+            launch: eta_compiler::codegen::launch::build(&bound, &stages),
+            ..Default::default()
+        };
+        let mut answers = Vec::new();
+        for (form, dropped) in [
+            (compile::Form::Streamed, &[][..]),
+            (compile::Form::Grouped, &[KernelKind::Streamed][..]),
+            (compile::Form::Fused, &[KernelKind::Streamed, KernelKind::Grouped][..]),
+        ] {
+            let pools = Pools::guests_only(&context, CHUNK, 4).expect("a pool");
+            let mut plane = Plane::new();
+            let mut registration = registration.clone();
+            registration.emitted_kernels.retain(|kernel| !dropped.contains(&kernel.kind));
+            let program = plane.register(&context, &registration).expect("the program registers");
+            let forms = plane.region_forms(program);
+            if form == compile::Form::Streamed {
+                assert!(forms.contains(&compile::Form::Streamed), "a region streams: {forms:?}");
+            }
+            let facts = plane.facts(program, &pools).expect("the program's facts");
+            let ids: Vec<ChannelId> = (1..=count as u64).map(ChannelId).collect();
+            let (instance, rings) = slots_for(&pools, &facts, 0);
+            let id = plane
+                .bind(
+                    &context,
+                    program,
+                    &seeds,
+                    Extents {
+                        row_count: 1,
+                        sampled_rows: 1,
+                        query_len: 1,
+                        ..Extents::default()
+                    },
+                    GeometryClass::Host,
+                    PortMask::NONE,
+                    &ids,
+                    session::Pooled {
+                        pools: &pools,
+                        instance: &instance,
+                        rings: &rings,
+                    },
+                )
+                .expect("the lane binds");
+            let logits_plane = crate::device::Buffer::zeroed(&context, u64::from(VOCAB) * 2)
+                .expect("a logits plane");
+            plane
+                .bind_output(id, "logits", 0, &logits_plane, 0, eta_ir::Dtype::Bf16, VOCAB, VOCAB)
+                .expect("the logits bind");
+            let fired = plane
+                .fire(&context, id, Attach::Epilogue, &guests(&context))
+                .expect("the stage fires");
+            assert!(matches!(fired, Fired::Committed), "{form:?} fires: {fired:?}");
+            let cell = plane
+                .instance_mut(id)
+                .expect("bound")
+                .take(taken)
+                .expect("the take")
+                .expect("a token");
+            answers.push((form, i32::from_le_bytes(cell[..4].try_into().expect("an i32"))));
+        }
+        assert!(
+            answers.iter().all(|&(_, got)| got == 3),
+            "the cell `eq(col, 3)` holds at is cell 3 in every form: {answers:?}"
+        );
+    }
+
     /// A program that launched its lanes together leaves no batch behind
     /// once it is closed.
     #[test]
