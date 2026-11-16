@@ -2115,8 +2115,8 @@ program of `KernelSet` x `Shape` (ARCHITECTURE.md).
 | poem | deployment | reading | before | after |
 |---|---|---|---|---|
 | qwen3_dense | qwen3-0.6b | decode | template PASS | template PASS; **units PASS** (549 x 274, 0.29M cycles priced) |
-| qwen_3 | qwen35-d0.8b | decode | template PASS | template PASS; units: `ssm.causal_conv1d` (state step, G1.4) |
-| qwen_3 MoE | qwen35-122b-a10b / qwen36-35b-a3b / qwen3-next-80b / qwen38-max minis | decode | `moe_sigmoid_gate_add` | the same (shared-expert gate) |
+| qwen_3 | qwen35-d0.8b | decode | template PASS | template PASS; units: **-l1 / -l3 PASS** (GDN state columns, linked); the full model's attention unit over its head columns' tile budget |
+| qwen_3 MoE | qwen35-122b-a10b / qwen36-35b-a3b / qwen3-next-80b / qwen38-max minis | decode | `moe_sigmoid_gate_add` | units: GDN of more value heads than key heads (one state column a head of each) |
 | qwen3_moe | qwen3-30b-a3b-mini | decode | template PASS | template PASS; **units PASS** (149 x 547) |
 | llama_3 | llama31-8b | decode | template PASS | template PASS; **units PASS** (738 x 1072, 0.43M cycles priced) |
 | llama_3 | llama33-70b-mini-l4 | decode | EMIT: a head turn off a column source | **template PASS** (search keeps PEs' words that build) |
@@ -2183,6 +2183,15 @@ klein's text, denoise and VAE programs are sha-identical across every commit.
   each expert's columns by a constant matvec; gate, up and down are one matvec each over the bank
   as a weight view lays it; the gated activation is a region. Exact (an unpicked expert adds
   zeros) and per-PE bound as a dense layer of the experts' width.
+- **Recurrent state as a state column** (P8: `ops/sst.csl`, `ops/cy_sst.csl`). The K / V
+  column's PEs and chain hold a head's state `S` instead of rows: its root sends `[decay k |
+  decay q | k]`, the PEs return their partials of `Sᵀk`, `Sᵀq`, the root forms `delta` and the
+  output in one pass (`o = decay Sᵀq + (k·q) delta`), and `[delta | decay a key]` updates `S`.
+  The PE side is one form for a decay a head (Gated DeltaNet, Mamba-2) or a key (KDA) and a delta
+  rule or a plain increment; Gated DeltaNet's root runs its conv (the history at the root),
+  SiLU, q / k norms and gates. A product whose q is cut into its heads' halves (an output gate)
+  is a matvec a part over its weight's rows. Qwen3.5-0.8B's GDN layers build and link through
+  the units; Mamba-2's and KDA's roots, and more value heads than key heads, are next.
 - **Placement.** The decode search keeps a partition only where every PE's words build (rcfg),
   so a searched plan cannot fail at the emitter (llama33-70b-mini-l4). Each stream block's K / V
   columns are its own attention's (its first unit's heads, head width and scale), so a reading's
@@ -2204,11 +2213,10 @@ klein's text, denoise and VAE programs are sha-identical across every commit.
 
 ### G1.4 What is left, by class
 
-- **Recurrent state** (GDN's `causal_conv1d` + `gated_delta`, Mamba2, KDA, short conv): qwen_3 (dense
-  and MoE), nemotron_h, kimi_k3, inkling, glm_5_next. One state step: a state column per head
-  (the K / V column's shape, persisting across launches), its update `S = decay ⊙ S + k ⊗ u`
-  (`u = β (v - Sᵀk)` with the delta rule, `dt x` without; decay a scalar or a vector a key), its
-  read `Sᵀq`, the gates and normalisations around it regions; a conv a ring of rows a channel.
+- **Recurrent state, the rest** (G1.2's state column built for Gated DeltaNet): Mamba-2's root
+  (`delta = dt x`, its group's B and C, `D x`, the gated group norm after) for nemotron_h, KDA's
+  (a decay a key) for kimi_k3 and glm_5_next, short conv (a conv history alone) for inkling;
+  more value heads than key heads (Qwen3.5's larger models, the MoE minis).
 - **Attention variants**: sinks (gpt-oss), shared KV (gemma e2b), cross-attention (wan), unequal
   q / k / v (mimo), MLA, the DSA indexer, pooled attention; per-block attention shapes.
 - **Hyper-connections** (deepseek_v4, glm_5_next, hy_4, qwen_4) and ops outside the layer frame
