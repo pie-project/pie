@@ -993,6 +993,19 @@ impl Fabric for Runtime {
         };
         // a band of the rectangle's rows a call, each at most MEMCPY_WORDS (one call of an
         // array a decode program's head holds, 155M words, the simulator's memcpy halts on)
+        if std::env::var("PIE_WRITE_LOG").is_ok() {
+            println!(
+                "WRITE {} at ({}, {}) {} x {} of {} ({}-bit), {} words",
+                a.sym,
+                a.rect.x,
+                a.rect.y,
+                a.rect.w,
+                a.rect.h,
+                a.len,
+                if a.u16 { 16 } else { 32 },
+                words.len()
+            );
+        }
         let row = (a.rect.w.max(1) as usize) * a.len.max(1);
         let band = (MEMCPY_WORDS / row).max(1);
         let mut y = 0;
