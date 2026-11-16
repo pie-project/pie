@@ -164,25 +164,11 @@ __global__ void mla_naive_paged_kernel(
 
 namespace mma_detail {
 
-#ifndef PIE_MLA_MMA_BK
-#define PIE_MLA_MMA_BK 64
-#endif
-#ifndef PIE_MLA_MMA_WARPS
-#define PIE_MLA_MMA_WARPS 8
-#endif
-
-#ifndef PIE_MLA_MMA_STAGES
-#define PIE_MLA_MMA_STAGES 1
-#endif
-
-#ifndef PIE_MLA_MMA_MINBLK
-#define PIE_MLA_MMA_MINBLK 2
-#endif
-
 constexpr int kBM = 16;
-constexpr int kBK = PIE_MLA_MMA_BK;
-constexpr int kWarps = PIE_MLA_MMA_WARPS;
-constexpr int kStages = PIE_MLA_MMA_STAGES;
+constexpr int kBK = 64;
+constexpr int kWarps = 8;
+constexpr int kStages = 1;
+constexpr int kMinBlocks = 2;
 static_assert(kStages >= 1, "kStages must be at least 1");
 constexpr int kThreads = kWarps * 32;
 constexpr int kCkv = 512;
@@ -200,7 +186,7 @@ static_assert(kBK % 16 == 0, "kBK must be a multiple of the mma k step");
 // 1, at `ckv_pages`; each staged chunk is widened to bf16 as it lands (the
 // tcgen05 sparse pass reads them otherwise).
 template <int KPE, bool kFp8 = false>
-__global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_kernel(
+__global__ __launch_bounds__(kThreads, kMinBlocks) void mla_mma_paged_kernel(
     const __nv_bfloat16* __restrict__ q_nope,
     const __nv_bfloat16* __restrict__ q_pe,
     const __nv_bfloat16* __restrict__ ckv_pages,

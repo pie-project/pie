@@ -14,7 +14,6 @@ pub struct Request<'a> {
     pub page_size: u32,
     pub head_dim: u32,
     pub enable_cuda_graph: bool,
-    pub chunk_floor_128: bool,
     /// The sliding window's `window_left`: a request's tiles cover only the
     /// keys its one query row sees, the last `window_left + 1`.
     pub window_left: Option<u32>,
@@ -80,11 +79,7 @@ pub fn estimate(
         });
     }
 
-    let mut low = if req.chunk_floor_128 {
-        (128 / req.page_size).max(1)
-    } else {
-        1
-    };
+    let mut low = 1;
     let mut high = pages.iter().copied().max().unwrap_or(0);
     while low < high {
         let mid = u32::midpoint(low, high);
