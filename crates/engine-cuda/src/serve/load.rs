@@ -137,6 +137,9 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
 
     let grouped: &[&str] = if engine.grouped { &crate::GROUPED } else { &[] };
     let mut profile = DeviceProfile::of(&chip, device.device().num_sm, &crate::EXCLUSIVE, grouped);
+    #[cfg(not(feature = "rocm"))]
+    let mut kernels = crate::fusions(&chip);
+    #[cfg(feature = "rocm")]
     let mut kernels = poem_compiler::fuse::flags::on(&chip, &crate::FUSIONS);
     if !boot.knobs.diagnostics.fuse_chains {
         kernels.retain(|rule| crate::UNCHAINED.contains(&rule.kernel()));
@@ -179,6 +182,13 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     #[cfg(feature = "rocm")]
     let anchored = std::collections::BTreeMap::new();
     profile.synth_anchors = false;
+    #[cfg(not(feature = "rocm"))]
+    if boot.knobs.diagnostics.fuse_chains {
+        let norms = crate::residual_norms(&chip, profile.synth_regions);
+        if !norms.is_empty() {
+            boot.trace = poem_compiler::fuse::fuse(boot.trace.clone(), norms);
+        }
+    }
     // `compiler.synth_regions`: each chain of elementwise and row ops the row
     // skeleton serves folded into one `fused.region`, its region kernels-ir's.
     // Folded once, here, the trace is the one the load runs and every plan
