@@ -11,3 +11,4 @@ pub mod rcfg;
 pub mod region;
 pub mod stamps;
 pub mod stream;
+pub mod tiled;

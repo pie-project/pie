@@ -21,6 +21,7 @@ pub mod coresident;
 pub mod grid;
 pub mod host;
 pub mod place;
+pub mod tiled;
 pub mod unit;
 
 type R<T> = Result<T, String>;

@@ -6,6 +6,7 @@
 pub mod grid;
 pub mod memory;
 pub mod stream;
+pub mod tiled;
 pub mod time;
 
 use serde::Serialize;

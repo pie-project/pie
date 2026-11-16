@@ -20,7 +20,7 @@ use std::rc::Rc;
 
 use engine_cpu::Forward;
 use engine_cpu::forward::{StreamLane, StreamStep, Values};
-use kernels_cerebras::stream::grid;
+use kernels_cerebras::stream::{grid, tiled};
 use poem_ir::ValueId;
 
 /// diffusers' decode of the pipeline's latent (`mk_tiny_flux2_pipe.py --vae`): 64 x 64 pixels.
@@ -166,6 +166,55 @@ fn flux_2_minis_vae_program_is_the_reference() {
     assert!(psnr(px, &gold) >= 40.0);
 }
 
+/// The tiled program's decode on the host (`tiled::emulate`: its ops over the whole image, each
+/// convolution's weights read off its own stream) against engine-cpu's and diffusers'.
+#[test]
+fn flux_2_minis_tiled_vae_program_is_the_reference() {
+    let trace = common::trace();
+    let tmp = tempfile::tempdir().expect("a scratch directory");
+    let mut f = forward(&trace, &tmp.path().join("ckpt"));
+    let clip = [1, 8, 8];
+    let g = tiled::program(&trace, "vae.decode", clip, true, Some((2, 2)), None)
+        .unwrap_or_else(|e| panic!("{e}"));
+    let lat = f32s(PIPE_LATENT);
+    let st = step(g.word, clip, &lat);
+    let want: Vec<ValueId> = g.outs.clone();
+    let reference: Vec<Vec<f32>> = f
+        .stream_values(&st, &[], &want)
+        .expect("engine-cpu decodes")
+        .iter()
+        .map(floats)
+        .collect();
+    let cache: std::cell::RefCell<BTreeMap<u32, grid::Rows>> =
+        std::cell::RefCell::new(BTreeMap::new());
+    let f = std::cell::RefCell::new(f);
+    let got = tiled::emulate(&g, &|v| {
+        if let Some(x) = cache.borrow().get(&v) {
+            return Ok(x.clone());
+        }
+        let c = f
+            .borrow_mut()
+            .stream_values(&st, &[], &[ValueId(v)])?
+            .remove(0);
+        let r = (c.rows, c.width, Rc::new(floats(&c)));
+        cache.borrow_mut().insert(v, r.clone());
+        Ok(r)
+    })
+    .unwrap_or_else(|e| panic!("{e}"));
+    let px = &got[&want[0].0];
+    let (rel, cos) = rel_cos(px, &reference[0]);
+    let gold = f32s(VAE_GOLDEN);
+    let (drel, dcos) = rel_cos(px, &gold);
+    eprintln!(
+        "the tiled program on the host vs engine-cpu: rel L2 {rel:.3e}, cosine {cos:.8}, PSNR {:.1} dB; \
+         vs diffusers: rel L2 {drel:.3e}, cosine {dcos:.8}, PSNR {:.1} dB",
+        psnr(px, &reference[0]),
+        psnr(px, &gold)
+    );
+    assert!(rel <= 1e-2 && cos >= 0.9999, "rel L2 {rel}, cosine {cos}");
+    assert!(psnr(px, &gold) >= 40.0);
+}
+
 /// The decode on the simulator (or `READING_CMADDR`'s system): the program compiled and
 /// linked into `READING_OUT/vae`, run through `Reading` as the engine does.
 #[test]
@@ -190,18 +239,54 @@ fn flux_2_minis_vae_on_the_fabric() {
         .ok()
         .and_then(|n| n.parse().ok())
         .unwrap_or(grid::WEIGHT_WORDS);
-    let g = grid::compile_within(&trace, "vae.decode", clip, true, upto, budget, &dir)
-        .unwrap_or_else(|e| panic!("{e}"));
-    eprintln!(
-        "compiled: {} passes over {} x {} roots, {} x {} PEs, weight groups {:?} ({:.1} s)",
-        g.passes.len(),
-        g.p,
-        g.p,
-        g.stream.w,
-        g.stream.h,
-        g.groups,
-        t0.elapsed().as_secs_f64()
-    );
+    // `READING_REGIME=tiled`: the image over the fabric (GENERIC.md M2d), `READING_TILE=h,w` its
+    // top tile; `READING_PASSES` then counts its ops
+    let tiled_pin = std::env::var("READING_TILE").ok().map(|t| {
+        let v: Vec<u32> = t.split(',').filter_map(|x| x.parse().ok()).collect();
+        (v[0], v[1])
+    });
+    let tiled = (std::env::var("READING_REGIME").as_deref() == Ok("tiled")).then(|| {
+        tiled::compile(
+            &trace,
+            "vae.decode",
+            clip,
+            true,
+            tiled_pin,
+            None,
+            upto,
+            &dir,
+        )
+        .unwrap_or_else(|e| panic!("{e}"))
+    });
+    let g = match &tiled {
+        Some(p) => {
+            let (w, h) = p.fabric();
+            eprintln!(
+                "compiled: tiled, {} ops over a {} x {} array, {w} x {h} PEs, tape {} ({:.1} s)",
+                p.ops.len(),
+                p.gx,
+                p.gy,
+                p.tape,
+                t0.elapsed().as_secs_f64()
+            );
+            None
+        }
+        None => {
+            let g = grid::compile_within(&trace, "vae.decode", clip, true, upto, budget, &dir)
+                .unwrap_or_else(|e| panic!("{e}"));
+            eprintln!(
+                "compiled: {} passes over {} x {} roots, {} x {} PEs, weight groups {:?} ({:.1} s)",
+                g.passes.len(),
+                g.p,
+                g.p,
+                g.stream.w,
+                g.stream.h,
+                g.groups,
+                t0.elapsed().as_secs_f64()
+            );
+            Some(g)
+        }
+    };
     let cfg = engine_cerebras::Config::default();
     let (root, (w, h)) = if combine {
         let mut names = Vec::new();
@@ -228,7 +313,11 @@ fn flux_2_minis_vae_on_the_fabric() {
             .collect();
         (out.clone(), (v[0], v[1]))
     } else {
-        (dir.clone(), (g.stream.w, g.stream.h))
+        match (&g, &tiled) {
+            (Some(g), _) => (dir.clone(), (g.stream.w, g.stream.h)),
+            (None, Some(p)) => (dir.clone(), p.fabric()),
+            (None, None) => unreachable!(),
+        }
     };
     let link = root.join("out");
     if !link.join("out.json").is_file() {
@@ -259,7 +348,7 @@ fn flux_2_minis_vae_on_the_fabric() {
         eprintln!("linked ({:.1} s)", t0.elapsed().as_secs_f64());
     }
     let reading = Reading::open(&dir).expect("the reading");
-    let st = step(g.word, clip, &lat);
+    let st = step(reading.classes[0].word, clip, &lat);
     let statics = reading.statics(&mut f, &st).expect("the static arrays");
     let mut host = Forward::host_for(
         trace.clone(),
@@ -298,7 +387,7 @@ fn flux_2_minis_vae_on_the_fabric() {
         let cache: std::cell::RefCell<BTreeMap<u32, grid::Rows>> =
             std::cell::RefCell::new(BTreeMap::new());
         let f = std::cell::RefCell::new(f);
-        let want = grid::emulate(&g, &|v| {
+        let get = |v: u32| {
             if let Some(x) = cache.borrow().get(&v) {
                 return Ok(x.clone());
             }
@@ -309,14 +398,23 @@ fn flux_2_minis_vae_on_the_fabric() {
             let r = (c.rows, c.width, Rc::new(floats(&c)));
             cache.borrow_mut().insert(v, r.clone());
             Ok(r)
-        })
-        .expect("the program emulated");
+        };
+        let (want, out) = match (&g, &tiled) {
+            (Some(g), _) => (
+                grid::emulate(g, &get).expect("the program emulated"),
+                g.outs[0].0,
+            ),
+            (None, Some(p)) => (
+                tiled::emulate(p, &get).expect("the program emulated"),
+                p.outs[0].0,
+            ),
+            (None, None) => unreachable!(),
+        };
         let got = floats(&back[0]);
-        let want = &want[&g.outs[0].0];
+        let want = &want[&out];
         let (rel, cos) = rel_cos(&got, want);
         println!(
-            "READING_VAE pass {:?}'s value %{} vs the host's program: rel L2 {rel:.3e}, cosine {cos:.8}",
-            upto, g.outs[0].0
+            "READING_VAE pass {upto:?}'s value %{out} vs the host's program: rel L2 {rel:.3e}, cosine {cos:.8}"
         );
         // (the attention's 16-bit probabilities, amplified by the norms after it: a few keys
         // of a small clip average none of their roundings)
@@ -388,4 +486,54 @@ fn flux_2_minis_vae_reading_serves_on_the_host_fabric() {
     assert!(rel == 0.0, "rel L2 {rel}");
     let gold = f32s(VAE_GOLDEN);
     eprintln!("host fabric vs diffusers: PSNR {:.1} dB", psnr(&px, &gold));
+}
+
+/// The tiled program's host side on the host fabric: its entries (the latent on its layout's
+/// busy rows), its rows read back a rectangle at a time, as engine-cpu's decode.
+#[test]
+fn flux_2_minis_tiled_vae_reading_serves_on_the_host_fabric() {
+    use engine_cerebras::reading::{HostFabric, Reading};
+    let trace = common::trace();
+    let tmp = tempfile::tempdir().expect("a scratch directory");
+    let mut f = forward(&trace, &tmp.path().join("ckpt"));
+    let dir = tmp.path().join("vae");
+    let clip = [1, 8, 8];
+    tiled::compile(
+        &trace,
+        "vae.decode",
+        clip,
+        true,
+        Some((2, 2)),
+        None,
+        None,
+        &dir,
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    let reading = Reading::open(&dir).expect("the reading");
+    assert!(reading.d2h.iter().any(|b| b.w * b.h > 1));
+    let lat = f32s(PIPE_LATENT);
+    let st = step(reading.classes[0].word, clip, &lat);
+    let mut host = Forward::host_for(
+        trace.clone(),
+        &|n: &str, c: usize| common::plane(&trace, n, c),
+        &reading.entry_values(),
+    )
+    .expect("the host forward");
+    let entries = reading.entries(&mut host, &st).expect("the entries");
+    let mut fab = HostFabric::new(forward(&trace, &tmp.path().join("ckpt2")));
+    let (got, _) = reading
+        .launch_on(&mut fab, &st, &entries)
+        .expect("the decode runs");
+    let back = reading.rows_back(&got).expect("the rows back");
+    let px = reading
+        .finish(&mut host, &trace, &st, &back, &["pixels"])
+        .expect("the pixels")
+        .remove(0);
+    let reference = floats(
+        &f.stream_values(&st, &[], &reading.out_values())
+            .expect("engine-cpu decodes")[0],
+    );
+    assert_eq!(px.len(), reference.len());
+    let (rel, _) = rel_cos(&px, &reference);
+    assert!(rel == 0.0, "rel L2 {rel}");
 }

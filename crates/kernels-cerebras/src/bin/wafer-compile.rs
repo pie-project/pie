@@ -258,6 +258,63 @@ fn stream(args: &[String]) -> Result<(), String> {
             }
             None => kernels_cerebras::stream::grid::clip_of(&trace, &reading, rows),
         };
+        // `--regime tiled`: the image over the fabric (M2d), `--tile H,W` its top tile pinned
+        let tile = match get("--tile") {
+            Some(t) => {
+                let v: Vec<u32> = t.split(',').filter_map(|x| x.parse().ok()).collect();
+                let [a, b] = v[..] else {
+                    return Err(format!("--tile {t}: h,w"));
+                };
+                Some((a, b))
+            }
+            None => None,
+        };
+        if get("--regime").as_deref() == Some("tiled") {
+            let bounds = kernels_cerebras::floorplan::stream::Bounds::system();
+            let p = kernels_cerebras::stream::tiled::program(
+                &trace,
+                &reading,
+                clip,
+                !ieee,
+                tile,
+                Some((bounds.w, bounds.h)),
+            )?;
+            let c = kernels_cerebras::cost::tiled::time(&p);
+            let (fw, fh) = p.fabric();
+            println!(
+                "{model} {reading} on {clip:?}: tiled, {} ops over a {} x {} array ({fw} x {fh} PEs, tape {}), arena {} + staging {} + block {} words, {:.1}M cycles ({:.2} ms at 875 MHz)",
+                p.ops.len(),
+                p.gx,
+                p.gy,
+                p.tape,
+                p.arena,
+                p.hx / 2,
+                p.wb,
+                c.cycles / 1e6,
+                c.cycles / 875e3
+            );
+            if args.iter().any(|a| a == "--parts") {
+                let (by_at, by_what) = c.by();
+                for (at, cy) in by_at {
+                    println!("  {}x{}: {:.2}M", at.0, at.1, cy / 1e6);
+                }
+                for (w, cy) in by_what {
+                    println!("  {w}: {:.2}M", cy / 1e6);
+                }
+                for o in &c.ops {
+                    println!(
+                        "  op {} {} {:?}: {:.0} cycles",
+                        o.op, o.what, o.at, o.cycles
+                    );
+                }
+                let (at, live) = p.peak();
+                println!("  the arena's peak at op {at}: {live:?}");
+            }
+            if !args.iter().any(|a| a == "--price") {
+                kernels_cerebras::stream::tiled::compile_program(&p, std::path::Path::new(&out))?;
+            }
+            return Ok(());
+        }
         if args.iter().any(|a| a == "--price") {
             // the cost model's time for the reading on `clip`, its placement aside
             let g = kernels_cerebras::stream::grid::program_unfit(&trace, &reading, clip, !ieee)?;
