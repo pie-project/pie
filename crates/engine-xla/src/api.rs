@@ -493,6 +493,34 @@ impl Engine for Xla {
             // from here a program built is a fire the ladder missed
             shell.device().seal();
         }
+        // The room every fire's temporaries take. The TPU runtime reserves a
+        // program's temp at each execute, at the bottom of HBM, and holds
+        // nothing between (v6e: a program of 256 MiB temp that ran three
+        // times failed `RuntimeProgramAllocationFailure` once 248 MiB was
+        // left free): a fire whose temp the free memory does not hold fails
+        // late. So the largest temp of every program the load compiled (the
+        // warm ladder's and the maintenance programs', `load_temp`) must fit
+        // in what the load leaves free, and nothing allocates into it after
+        // ready; a load that leaves less is refused by name, not served.
+        let temp = shell.device().load_temp();
+        if let Some(free) = shell.device().free_now() {
+            tracing::info!(
+                temp_mib = temp >> 20,
+                free_mib = free >> 20,
+                "xla temp room: the load's largest program temp, and the memory it leaves free"
+            );
+            if temp > free {
+                return Err(fault(Fault::Program {
+                    at: "load::temp_room",
+                    why: format!(
+                        "the load's largest program temp is {} MiB and it leaves {} MiB free: a \
+                         fire would fail at its execute, so the load is refused",
+                        temp >> 20,
+                        free >> 20
+                    ),
+                }));
+            }
+        }
         let trace_name = shell.trace().name.clone();
         let (weight_bytes, pool_bytes) = shell.footprint();
         let paging = shell.paging();

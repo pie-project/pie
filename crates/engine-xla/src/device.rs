@@ -204,6 +204,19 @@ impl Device {
         self.limit
     }
 
+    /// Device memory free now: the plugin's limit less what is in use
+    /// (`None` dry or where the plugin reports no limit). What it counts in
+    /// use is buffers alone: a program's temporaries are reserved at each
+    /// execute, beside them, and never show here.
+    #[must_use]
+    pub fn free_now(&self) -> Option<u64> {
+        let limit = self.limit?;
+        let client = self.client.as_ref()?;
+        let device = client.device(self.ordinal)?;
+        let used = client.memory_stats(device).ok()?.bytes_in_use;
+        Some(limit.saturating_sub(u64::try_from(used).unwrap_or(0)))
+    }
+
     /// Device memory in use when it opened, before this load landed
     /// anything (zero when the plugin reports none).
     #[must_use]
