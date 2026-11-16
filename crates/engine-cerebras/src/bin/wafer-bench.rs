@@ -422,6 +422,9 @@ fn decode(get: &HashMap<String, String>) -> Result<bool, String> {
         let t1 = std::time::Instant::now();
         let (got, cycles) = reading.launch(&mut rt, &entries)?;
         let wall_ms = t1.elapsed().as_secs_f64() * 1e3;
+        // the program's own argmax (its head roots'), against the logits read back
+        let on_wafer = engine_cerebras::reading::Fabric::argmax(&mut rt, &reading)?
+            .and_then(|a| a.first().copied());
         let back = reading.rows_back(&got)?;
         let logits = back
             .iter()
@@ -447,7 +450,7 @@ fn decode(get: &HashMap<String, String>) -> Result<bool, String> {
             "DECODE_STEP {}",
             json!({"step": s, "token": seq[s], "argmax": best, "logit": top, "want": want,
                 "checked": past, "ok": best as u32 == want, "cycles": cycles, "wall_ms": wall_ms,
-                "finite": v.iter().all(|x| x.is_finite()),
+                "finite": v.iter().all(|x| x.is_finite()), "wafer_argmax": on_wafer,
                 "golden_top": if past { gtop.clone() } else { Value::Null }})
         );
     }

@@ -103,6 +103,12 @@ pub trait Fabric {
         let _ = reading;
         Ok(None)
     }
+    /// A decode program's argmax a row after a launch ([`Reading::argmax`]): each row's largest
+    /// logit's column, the first on a tie; `None` where the fabric reads none.
+    fn argmax(&mut self, reading: &Reading) -> R<Option<Vec<u32>>> {
+        let _ = reading;
+        Ok(None)
+    }
 }
 
 /// The SDK runtime of one program at a time, each created on the thread that holds this (the
@@ -124,6 +130,10 @@ impl Fabric for Programs {
 
     fn launch(&mut self, reading: &Reading) -> R<Option<u64>> {
         Fabric::launch(self.rt.as_mut().ok_or("no program is open")?, reading)
+    }
+
+    fn argmax(&mut self, reading: &Reading) -> R<Option<Vec<u32>>> {
+        Fabric::argmax(self.rt.as_mut().ok_or("no program is open")?, reading)
     }
 
     fn switch(&mut self, link: &Path) -> R<bool> {
@@ -301,6 +311,9 @@ pub struct Reading {
     pub classes: Vec<Class>,
     pub h2d: Vec<Array>,
     pub d2h: Vec<Back>,
+    /// A decode program's argmax a row (`host.json`'s `argmax`): each root's two words a row,
+    /// its largest logit and that logit's column (`parts`: its columns, `(0, from, len)`).
+    pub argmax: Vec<Back>,
     /// The values read back whole: (value, rows, width).
     pub outs: Vec<(u32, usize, usize)>,
     /// The capture the program was compiled from, if any: each value read back, its file there.
@@ -401,39 +414,47 @@ impl Reading {
                 group: a["group"].as_u64().map(|g| g as usize),
             });
         }
-        let mut d2h = Vec::new();
-        for o in list("d2h")? {
-            let ints = |k: &str| -> Vec<u64> {
-                o[k].as_array()
-                    .map(|a| a.iter().filter_map(Value::as_u64).collect())
-                    .unwrap_or_default()
-            };
-            let parts = o["parts"]
-                .as_array()
-                .map(|ps| {
-                    ps.iter()
-                        .filter_map(|p| {
-                            let p = p.as_array()?;
-                            Some((
-                                p.first()?.as_u64()? as u32,
-                                p.get(1)?.as_u64()? as u32,
-                                p.get(2)?.as_u64()? as u32,
-                            ))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            d2h.push(Back {
-                sym: text(&o, "sym")?,
-                x: num(&o, "x")? as i32,
-                y: num(&o, "y")? as i32,
-                w: o["w"].as_i64().unwrap_or(1) as i32,
-                h: o["h"].as_i64().unwrap_or(1) as i32,
-                len: num(&o, "len")? as usize,
-                rows: ints("rows").into_iter().map(|r| r as usize).collect(),
-                parts,
-            });
-        }
+        let backs = |key: &str| -> R<Vec<Back>> {
+            let mut d2h = Vec::new();
+            for o in host[key].as_array().into_iter().flatten() {
+                let ints = |k: &str| -> Vec<u64> {
+                    o[k].as_array()
+                        .map(|a| a.iter().filter_map(Value::as_u64).collect())
+                        .unwrap_or_default()
+                };
+                let parts = o["parts"]
+                    .as_array()
+                    .map(|ps| {
+                        ps.iter()
+                            .filter_map(|p| {
+                                let p: Vec<u32> = (p.as_array()?.iter())
+                                    .map(|x| x.as_u64().map(|x| x as u32))
+                                    .collect::<Option<_>>()?;
+                                // (an argmax's parts: (from, len), of the logits)
+                                match p[..] {
+                                    [b, f, n] => Some((b, f, n)),
+                                    [f, n] => Some((0, f, n)),
+                                    _ => None,
+                                }
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                d2h.push(Back {
+                    sym: text(o, "sym")?,
+                    x: num(o, "x")? as i32,
+                    y: num(o, "y")? as i32,
+                    w: o["w"].as_i64().unwrap_or(1) as i32,
+                    h: o["h"].as_i64().unwrap_or(1) as i32,
+                    len: num(o, "len")? as usize,
+                    rows: ints("rows").into_iter().map(|r| r as usize).collect(),
+                    parts,
+                });
+            }
+            Ok(d2h)
+        };
+        let d2h = backs("d2h")?;
+        let argmax = backs("argmax")?;
         let outs = list("outs")?
             .iter()
             .map(|o| {
@@ -459,6 +480,7 @@ impl Reading {
             classes,
             h2d,
             d2h,
+            argmax,
             outs,
             w: num(&host, "w")? as u32,
             h: num(&host, "h")? as u32,
@@ -514,6 +536,7 @@ impl Reading {
                 .collect(),
             h2d: Vec::new(),
             d2h: Vec::new(),
+            argmax: Vec::new(),
             outs: Vec::new(),
             refs: Vec::new(),
             w: 0,
@@ -910,16 +933,8 @@ impl Reading {
         self.launch_with(rt, step, entries, &[])
     }
 
-    /// [`Reading::launch_on`], a grid program in weight groups a launch a group: each group's
-    /// arrays written before its launch (a static's words from `statics`, as
-    /// [`Reading::statics`] made them, else its file's), the rows read back after the last.
-    pub fn launch_with(
-        &self,
-        rt: &mut dyn Fabric,
-        step: &StreamStep<'_>,
-        entries: &[Option<Vec<f32>>],
-        statics: &[Option<Vec<u32>>],
-    ) -> R<(Vec<Vec<f32>>, Option<u64>)> {
+    /// A step's entries written (each from `entries`, else its file).
+    pub fn write_entries(&self, rt: &mut dyn Fabric, entries: &[Option<Vec<f32>>]) -> R<()> {
         for (a, words) in self.h2d.iter().zip(entries) {
             if a.entry.is_none() {
                 continue;
@@ -930,6 +945,20 @@ impl Reading {
             };
             rt.write(a, &data)?;
         }
+        Ok(())
+    }
+
+    /// [`Reading::launch_on`], a grid program in weight groups a launch a group: each group's
+    /// arrays written before its launch (a static's words from `statics`, as
+    /// [`Reading::statics`] made them, else its file's), the rows read back after the last.
+    pub fn launch_with(
+        &self,
+        rt: &mut dyn Fabric,
+        step: &StreamStep<'_>,
+        entries: &[Option<Vec<f32>>],
+        statics: &[Option<Vec<u32>>],
+    ) -> R<(Vec<Vec<f32>>, Option<u64>)> {
+        self.write_entries(rt, entries)?;
         // the groups' launches' cycles, summed
         let mut before: Option<u64> = None;
         for k in 0..self.groups {
@@ -1049,13 +1078,16 @@ impl Fabric for Runtime {
         let args: Vec<u32> = reading.rd.into_iter().collect();
         self.launch("run", &args).map_err(e)?;
         let mut got = Vec::new();
-        for b in &reading.d2h {
-            let mut out = vec![0u32; b.len * (b.w * b.h) as usize];
+        // a run of one-PE reads along a row (a head's column roots, the logits) one memcpy
+        for run in runs(&reading.d2h) {
+            let (b, n) = (&reading.d2h[run.start], run.len() as i32);
+            let (w, h) = if n > 1 { (n, 1) } else { (b.w, b.h) };
+            let mut out = vec![0u32; b.len * (w * h) as usize];
             let rect = Rect {
                 x: b.x,
                 y: b.y,
-                w: b.w,
-                h: b.h,
+                w,
+                h,
             };
             self.memcpy_d2h(
                 &b.sym,
@@ -1066,11 +1098,75 @@ impl Fabric for Runtime {
                 DataType::Bits32,
             )
             .map_err(e)?;
-            got.push(out.into_iter().map(f32::from_bits).collect());
+            let per = out.len() / run.len();
+            for c in out.chunks(per) {
+                got.push(c.iter().map(|&x| f32::from_bits(x)).collect());
+            }
         }
         let cycles = self.stamps(reading)?;
         Ok((got, cycles))
     }
+
+    fn argmax(&mut self, reading: &Reading) -> R<Option<Vec<u32>>> {
+        if reading.argmax.is_empty() {
+            return Ok(None);
+        }
+        let rows = reading
+            .argmax
+            .iter()
+            .flat_map(|b| &b.rows)
+            .max()
+            .map_or(0, |r| r + 1);
+        let mut best: Vec<(f32, u32)> = vec![(f32::NEG_INFINITY, u32::MAX); rows];
+        for run in runs(&reading.argmax) {
+            let (b, n) = (&reading.argmax[run.start], run.len() as i32);
+            let mut out = vec![0u32; b.len * n as usize];
+            let rect = Rect {
+                x: b.x,
+                y: b.y,
+                w: n,
+                h: 1,
+            };
+            self.memcpy_d2h(
+                &b.sym,
+                &mut out,
+                rect,
+                b.len,
+                Order::RowMajor,
+                DataType::Bits32,
+            )
+            .map_err(|x| x.to_string())?;
+            for (back, words) in reading.argmax[run].iter().zip(out.chunks(b.len)) {
+                for (i, &tr) in back.rows.iter().enumerate() {
+                    let (m, k) = (f32::from_bits(words[2 * i]), words[2 * i + 1]);
+                    let have = &mut best[tr];
+                    if m > have.0 || (m == have.0 && k < have.1) {
+                        *have = (m, k);
+                    }
+                }
+            }
+        }
+        Ok(Some(best.into_iter().map(|(_, k)| k).collect()))
+    }
+}
+
+/// `d2h` in runs read by one memcpy each: consecutive one-PE reads of one symbol and length, at
+/// consecutive columns of one row.
+fn runs(d2h: &[Back]) -> Vec<std::ops::Range<usize>> {
+    let mut out: Vec<std::ops::Range<usize>> = Vec::new();
+    for (i, b) in d2h.iter().enumerate() {
+        if let Some(r) = out.last_mut() {
+            let a = &d2h[r.end - 1];
+            let one = |b: &Back| b.w == 1 && b.h == 1;
+            if one(a) && one(b) && a.sym == b.sym && a.len == b.len && a.y == b.y && b.x == a.x + 1
+            {
+                r.end = i + 1;
+                continue;
+            }
+        }
+        out.push(i..i + 1);
+    }
+    out
 }
 
 /// A fabric with no wafer: a step's rows as engine-cpu's forward over the checkpoint makes the

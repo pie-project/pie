@@ -55,8 +55,9 @@ impl UnitModel {
         })
     }
 
-    /// One token at position `at`: the logits after it.
-    fn step(&mut self, token: u32, at: usize) -> R<Vec<f32>> {
+    /// One token at position `at`: the argmax after it and, with `logits` (or where the program
+    /// reduces none on the wafer), the logits.
+    fn step(&mut self, token: u32, at: usize, logits: bool) -> R<(u32, Option<Vec<f32>>)> {
         if at >= self.positions {
             return Err(format!(
                 "units: position {at} past the program's {}",
@@ -68,16 +69,24 @@ impl UnitModel {
             self.reading
                 .decode_step(&mut self.host, &self.trace, &[token], at)?;
         self.reading.write_pos(self.rt.as_mut(), at)?;
-        let (got, _) = self.reading.launch_on(self.rt.as_mut(), &step, &entries)?;
         self.launches += 1;
         self.steps += 1;
+        if !logits && !self.reading.argmax.is_empty() {
+            // the argmax off the wafer: two words a head root, not the vocabulary
+            self.reading.write_entries(self.rt.as_mut(), &entries)?;
+            self.rt.launch(&self.reading)?;
+            if let Some(a) = self.rt.argmax(&self.reading)? {
+                return Ok((*a.first().ok_or("units: no argmax read back")?, None));
+            }
+        }
+        let (got, _) = self.reading.launch_on(self.rt.as_mut(), &step, &entries)?;
         let back = self.reading.rows_back(&got)?;
         let logits = back
             .into_iter()
             .max_by_key(|c| c.width)
             .ok_or("units: no logits read back")?;
         match logits.values {
-            Values::F32(v) => Ok(v),
+            Values::F32(v) => Ok((argmax_of(&v), Some(v))),
             _ => Err("units: the logits are not f32".into()),
         }
     }
@@ -102,7 +111,7 @@ impl UnitModel {
         );
         self.fed.clear();
         for (i, &t) in keep.iter().enumerate() {
-            self.step(t, i)?;
+            self.step(t, i, false)?;
             self.fed.push(t);
         }
         Ok(())
@@ -118,10 +127,11 @@ impl UnitModel {
         self.seat(start)?;
         let (mut argmax, mut last) = (Vec::with_capacity(tokens.len()), None);
         for (i, &t) in tokens.iter().enumerate() {
-            let l = self.step(t, start + i)?;
+            let read = logits && i + 1 == tokens.len();
+            let (a, l) = self.step(t, start + i, read)?;
             self.fed.push(t);
-            argmax.push(argmax_of(&l));
-            last = Some(l);
+            argmax.push(a);
+            last = l;
         }
         Ok((argmax, if logits { last } else { None }))
     }
