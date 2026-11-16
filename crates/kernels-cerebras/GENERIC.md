@@ -2250,7 +2250,17 @@ poem's miniature (a real prefix with fewer experts) or a shrunk config, marked:
 
 ### G1.6 On the simulator
 
-(filled as the sims land)
+Each slice runs teacher-forced (`wafer-bench --reading <program> --decode <golden.json>
+--checkpoint <dir>`: the golden's tokens fed one a launch, each step's argmax past the prompt held
+to HF's next token; `--dry 1` the host's side alone, `--export <dir>` the first step's arrays for
+`tools/wafer/stream/run.py`). Goldens: HF transformers 5.23 on the slice (`num_hidden_layers`
+cut, the router's first experts), f32.
+
+| slice | program | host side | simulator |
+|---|---|---|---|
+| Qwen/Qwen3-0.6B -l2 | 3 units, 159 x 274, 64 positions, 0.023M cycles priced | lands, 187M static words, 1,040 entry words a step | halts before its first step: an `hcf` in a memcpy halo PE (x 2; rows 1, 2, 32 across three runs) at 5.8-44k cycles, after every write was issued: the launch or the first read back |
+| Qwen/Qwen3-30B-A3B layer 0, experts 0-15 | 2 units, 86 x 526 | lands (a range-fetched 2 GB slice), 414M static words | queued behind the above |
+| Qwen/Qwen3.5-0.8B -l1 (GDN) | 2 units, 422 x 154, 16 state columns | lands, 276M static words | queued behind the above |
 
 ## 5. Risks
 
