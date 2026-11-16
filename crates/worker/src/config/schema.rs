@@ -97,9 +97,7 @@ fn parse_structs_in(source: &str) -> BTreeMap<String, Vec<Parsed>> {
                         .map(|s| s.as_str())
                         .collect::<Vec<_>>()
                         .join(" "),
-                    skip: attr_text.contains("skip)")
-                        || attr_text.contains("skip,")
-                        || ty.trim().starts_with("Removed<"),
+                    skip: attr_text.contains("skip)") || attr_text.contains("skip,"),
                     required: !struct_defaults_all && !attr_text.contains("default"),
                 });
             }
@@ -269,18 +267,12 @@ mod tests {
         the_summary_stops_at_the_blank_doc_line();
         a_derived_field_has_no_default_to_print();
         a_free_form_table_is_a_leaf_not_the_options_struct();
-        a_removed_key_is_not_listed();
+        no_listed_key_is_retired();
     }
 
-    fn a_removed_key_is_not_listed() {
-        let source = "pub struct Options {\n    \
-                      pub kept: Option<u32>,\n    \
-                      #[serde(default, skip_serializing)]\n    \
-                      pub old_knob: Removed<OldKnob>,\n}\n";
-        let parsed = parse_structs_in(source);
-        let options = &parsed["Options"];
-        let listed: Vec<(&str, bool)> = options.iter().map(|f| (f.name.as_str(), f.skip)).collect();
-        assert_eq!(listed, [("kept", false), ("old_knob", true)]);
+    /// No key `pie config list` offers is one the retired table refuses on
+    /// that engine.
+    fn no_listed_key_is_retired() {
         for engine in [
             EngineKind::Cuda,
             EngineKind::Metal,
@@ -291,8 +283,8 @@ mod tests {
         ] {
             for field in fields(engine) {
                 assert!(
-                    crate::config::removed::refusal_for(&field.key).is_none(),
-                    "{} lists the removed key {}",
+                    crate::config::retired::refusal_for(&field.key, Some(engine)).is_none(),
+                    "{} lists the retired key {}",
                     engine.as_str(),
                     field.key
                 );
