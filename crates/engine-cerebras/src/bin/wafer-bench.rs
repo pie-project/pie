@@ -28,7 +28,7 @@
 //! ```text
 //! wafer-bench --reading <stream program dir> --program <compiled out dir> --inputs <dir>
 //!             [--grid T,H,W] [--steps N] [--golden <dir>] [--save <dir>] [--reload 1]
-//!             [--cmaddr <addr>]
+//!             [--statics <dir>] [--cmaddr <addr>]
 //! wafer-bench --reading <stream program dir> --inputs <dir> --entries <out dir> [--grid T,H,W]
 //! ```
 //!
@@ -37,9 +37,10 @@
 //! (`engine_cerebras::reading`), loads the program, writes its arrays, runs the step, reads the
 //! rows back and runs the exit's ops; `--steps` steps of the poem's flow schedule, an Euler step
 //! each. The program is loaded and its static arrays (tiles, tables) written once; a step is its
-//! entries and a launch (`--reload 1`: the program loaded afresh a step). With `--golden`, each
-//! step's velocity is held to `cpu_velocity<i>.f32` and the latent after it to
-//! `cpu_latent<i + 1>.f32` (relative L2 1e-2, cosine 0.999); `--save` writes them
+//! entries and a launch (`--reload 1`: the program loaded afresh a step; `--statics <dir>`: the
+//! static arrays' words from `<dir>/<k>.u32`, made from a checkpoint, not the program's files).
+//! With `--golden`, each step's velocity is held to `cpu_velocity<i>.f32` and the latent after it
+//! to `cpu_latent<i + 1>.f32` (relative L2 1e-2, cosine 0.999); `--save` writes them
 //! (`velocity<i>.f32`, `latent<i + 1>.f32`). `--entries` writes the first step's entries as the
 //! h2d files they replace (`<k>.npy`) and runs nothing: `tools/wafer/stream/run.py --entries`
 //! takes them. `--rows 1`: one step at the inputs' own timestep, the rows read back held to the
@@ -416,7 +417,29 @@ fn reading(get: &HashMap<String, String>) -> Result<bool, String> {
         rt.load();
         let loaded = t0.elapsed().as_secs_f64();
         rt.run();
-        reading.write_static(&mut rt)?;
+        match get.get("statics") {
+            // the static arrays made elsewhere (from a checkpoint): the k-th array's words
+            Some(dir) => {
+                let words: Vec<Option<Vec<u32>>> = (0..reading.h2d.len())
+                    .map(|k| {
+                        let p = Path::new(dir).join(format!("{k}.u32"));
+                        p.is_file().then(|| {
+                            std::fs::read(&p).map(|b| {
+                                b.as_chunks::<4>()
+                                    .0
+                                    .iter()
+                                    .map(|c| u32::from_le_bytes(*c))
+                                    .collect()
+                            })
+                        })
+                    })
+                    .map(Option::transpose)
+                    .collect::<Result<_, _>>()
+                    .map_err(|e| format!("{dir}: {e}"))?;
+                reading.write_statics(&mut rt, &words)?;
+            }
+            None => reading.write_static(&mut rt)?,
+        }
         println!(
             "READING_LOAD {}",
             json!({"load_s": loaded, "run_and_statics_s": t0.elapsed().as_secs_f64() - loaded,
