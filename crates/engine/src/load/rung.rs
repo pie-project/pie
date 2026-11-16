@@ -91,18 +91,48 @@ impl FireEstimate {
         self.dense_bytes as f64 + self.expert_bytes as f64 * touched
     }
 
-    /// The estimated time of a fire at `rung`: the one place the estimate's
-    /// form lives.
+    /// The estimate's terms at `rung`, in ns: the one place its form lives.
     #[must_use]
-    pub fn ns(&self, rung: &RungFacts) -> f64 {
+    pub fn terms(&self, rung: &RungFacts) -> Terms {
         let tokens = f64::from(rung.tokens);
         let keys = f64::from(rung.keys);
-        let read = self.weight_bytes(rung.tokens) / self.bytes_per_ns;
-        let compute = f64::from(rung.padded_rows) * self.flops_per_row / self.flops_per_ns;
-        f64::from(rung.launches) * self.launch_ns
-            + read.max(compute)
-            + tokens * keys * self.attn_flops_per_row_key / self.flops_per_ns
-            + keys * self.kv_bytes_per_key / self.bytes_per_ns
+        Terms {
+            launch: f64::from(rung.launches) * self.launch_ns,
+            weights: self.weight_bytes(rung.tokens) / self.bytes_per_ns,
+            flops: f64::from(rung.padded_rows) * self.flops_per_row / self.flops_per_ns,
+            attention: tokens * keys * self.attn_flops_per_row_key / self.flops_per_ns,
+            kv: keys * self.kv_bytes_per_key / self.bytes_per_ns,
+        }
+    }
+
+    /// The estimated time of a fire at `rung`.
+    #[must_use]
+    pub fn ns(&self, rung: &RungFacts) -> f64 {
+        self.terms(rung).total()
+    }
+}
+
+/// The estimate's terms of one fire, in ns ([`FireEstimate::terms`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Terms {
+    /// `launches · launch_ns`.
+    pub launch: f64,
+    /// The weight bytes the fire reads, over the bandwidth.
+    pub weights: f64,
+    /// The padded rows' matmul flops, over the compute rate.
+    pub flops: f64,
+    /// The attention's flops, over the compute rate.
+    pub attention: f64,
+    /// The kv bytes the keys read, over the bandwidth.
+    pub kv: f64,
+}
+
+impl Terms {
+    /// The fire's time: the launches, the larger of the weights' read and
+    /// the matmuls' compute, the attention and the kv read.
+    #[must_use]
+    pub fn total(&self) -> f64 {
+        self.launch + self.weights.max(self.flops) + self.attention + self.kv
     }
 }
 

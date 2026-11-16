@@ -157,3 +157,67 @@ pub fn measure<B: Serve>(
         launch_ns: Some(launch),
     })
 }
+
+/// The matmuls a [`gemm_rate`] frame carries back to back: the frame's one
+/// submit and wait amortise against them, as a fire's dispatches do.
+pub const GEMM_REPEATS: u32 = 16;
+
+/// The bf16 flops a nanosecond a matmul of `m` rows, `n` columns and depth
+/// `k` reaches through the backend's own matmul path under `tactic`, inside
+/// a frame: [`GEMM_REPEATS`] of it against one, the host's clock around each
+/// frame's single submit, the median of [`ROUNDS`] after a warm one.
+pub fn gemm_rate<B: Serve>(
+    device: &B::Context,
+    tactic: kernels_slang::linear::gemm::Tactic,
+    timer: Timer<'_, B>,
+    (m, n, k): (u32, u32, u32),
+) -> Result<f64> {
+    let owner = crate::books::owners::TUNING;
+    let handles = Handles::<B>::new();
+    let pipelines = B::Pipelines::default();
+    let bytes = |rows: u32, cols: u32| u64::from(rows) * u64::from(cols) * 2;
+    let act = B::Buffer::zeroed(device, bytes(m, k), owner)?;
+    let w = B::Buffer::zeroed(device, bytes(n, k), owner)?;
+    let y = B::Buffer::zeroed(device, bytes(m, n), owner)?;
+    let ha = handles.bind(&act, 0, act.bytes())?;
+    let hw = handles.bind(&w, 0, w.bytes())?;
+    let hy = handles.bind(&y, 0, y.bytes())?;
+    let frame = |count: u32| {
+        let f = device.frame()?;
+        {
+            let sink = B::sink(device, &f, &pipelines, &handles);
+            for _ in 0..count {
+                kernels_slang::linear::gemm::matmul(
+                    &sink,
+                    tactic,
+                    Tensor::new(ha, m, k, Dtype::Bf16),
+                    Tensor::new(hw, n, k, Dtype::Bf16),
+                    Tensor::new(hy, m, n, Dtype::Bf16),
+                )
+                .map_err(|e| Fault::Device {
+                    call: "rates: matmul",
+                    why: e.to_string(),
+                })?;
+            }
+        }
+        timer(f).map(|(_, wall)| wall)
+    };
+    let median = |mut v: Vec<u64>| {
+        v.sort_unstable();
+        v[v.len() / 2].max(1)
+    };
+    frame(1)?;
+    frame(GEMM_REPEATS)?;
+    let one = median(
+        (0..ROUNDS)
+            .map(|_| frame(1))
+            .collect::<Result<Vec<u64>>>()?,
+    );
+    let many = median(
+        (0..ROUNDS)
+            .map(|_| frame(GEMM_REPEATS))
+            .collect::<Result<Vec<u64>>>()?,
+    );
+    let each = (many.saturating_sub(one) / u64::from(GEMM_REPEATS - 1)).max(1);
+    Ok(2.0 * f64::from(m) * f64::from(n) * f64::from(k) / each as f64)
+}
