@@ -784,7 +784,7 @@ impl Plane {
                         #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
                         let mark = room.mark();
                         for prepared in group.iter_mut() {
-                            prepared.seat_scratch(room.take(prepared.scratch_bytes())?);
+                            prepared.seat_scratch(room.take(prepared.scratch_bytes())?)?;
                         }
                         #[cfg(target_vendor = "apple")]
                         room.poison_since(mark, frame)?;
@@ -839,7 +839,11 @@ impl Plane {
                             need: u64::from(needed),
                             have: u64::from(self.lanes),
                         })?;
-                    batch.seat_scratch(room.take(batch.scratch_bytes(needed))?);
+                    let each = batch.member_scratch_bytes();
+                    let seats = (0..group.len())
+                        .map(|_| room.take(each))
+                        .collect::<Result<Vec<_>>>()?;
+                    batch.seat_scratch(seats);
                     batch.encode(frame, &stage.regions, &mut group)?;
                 }
             }
@@ -1005,6 +1009,9 @@ pub struct GuestCarve {
     buffer: crate::device::Buffer,
     next: u64,
     floor: u64,
+    /// Bytes left between one take and the next: 0 but in tests that lay
+    /// a batch's members apart.
+    gap: u64,
 }
 
 impl GuestCarve {
@@ -1014,7 +1021,16 @@ impl GuestCarve {
             buffer,
             next: top,
             floor,
+            gap: 0,
         }
+    }
+
+    /// Tests: the same region, `gap` bytes left between takes, so no two
+    /// members' scratch lie a stride apart.
+    #[cfg(test)]
+    #[must_use]
+    pub fn spaced(self, gap: u64) -> GuestCarve {
+        GuestCarve { gap, ..self }
     }
 
     /// Where the next take ends: what [`GuestCarve::poison_since`]
@@ -1047,7 +1063,7 @@ impl GuestCarve {
                 need: bytes,
                 have: self.next.saturating_sub(self.floor),
             })?;
-        self.next = at;
+        self.next = at.saturating_sub(self.gap).max(self.floor);
         Ok(launch::ScratchAt {
             buffer: self.buffer.clone(),
             offset: at,
@@ -1481,9 +1497,53 @@ mod tests {
     /// and as a batch, answers each lane's own peak.
     #[test]
     fn every_form_answers_through_an_unfilled_scratch() {
+        let context = Context::bind().expect("a Metal 4 device");
+        let wrong = alone_and_together(&context, 0);
+        assert!(
+            wrong.is_empty(),
+            "a lane answered another index than its peak (poisoned scratch: {}): {wrong:#?}",
+            cfg!(feature = "test-slot-fill")
+        );
+    }
+
+    /// A batch whose members' scratch lies apart (each instance's own, not a
+    /// stride from the first) answers in every form what each lane fired
+    /// alone does: the grouped kernels take each lane's scratch from its
+    /// bases (buffer 4). The negative control hands every lane member 0's
+    /// scratch, as a kernel addressing lane L at L x stride from one base
+    /// would miss them, and the streamed and grouped forms answer wrongly
+    /// together.
+    #[test]
+    fn a_batch_whose_lanes_lie_apart_answers_what_lone_fires_do() {
+        let context = Context::bind().expect("a Metal 4 device");
+        // Past any stride, and not a multiple of one.
+        const GAP: u64 = (3 << 20) + 4096;
+        let wrong = alone_and_together(&context, GAP);
+        assert!(wrong.is_empty(), "lanes laid apart: {wrong:#?}");
+        launch::ALIAS_LANE_SCRATCH.with(|alias| alias.set(true));
+        let aliased = alone_and_together(&context, GAP);
+        launch::ALIAS_LANE_SCRATCH.with(|alias| alias.set(false));
+        for form in ["Streamed", "Grouped"] {
+            assert!(
+                aliased.iter().any(|line| line.starts_with(form) && line.contains("together")),
+                "the control (every lane on member 0's scratch) answered right in {form}: \
+                 the test does not see where a lane's scratch lies: {aliased:#?}"
+            );
+        }
+        assert!(
+            aliased.iter().all(|line| line.contains("together")),
+            "the control touched a lone fire: {aliased:#?}"
+        );
+    }
+
+    /// Each form's lanes fired alone, then together, from a guest region
+    /// laid `gap` bytes between takes: every lane whose answer is not its
+    /// own peak, by form and how it fired.
+    fn alone_and_together(context: &Context, gap: u64) -> Vec<String> {
         use crate::store::Pools;
         use eta_compiler::codegen::program::KernelKind;
-        let context = Context::bind().expect("a Metal 4 device");
+        let context = context;
+        let guests = |context: &Context| guests(context).spaced(gap);
         let (registration, count, seeds, token) = registration_of(true);
         let mut wrong = Vec::new();
         for (form, dropped) in [
@@ -1593,11 +1653,7 @@ mod tests {
                 }
             }
         }
-        assert!(
-            wrong.is_empty(),
-            "a lane answered another index than its peak (poisoned scratch: {}): {wrong:#?}",
-            cfg!(feature = "test-slot-fill")
-        );
+        wrong
     }
 
     /// A program that launched its lanes together leaves no batch behind

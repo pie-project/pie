@@ -454,7 +454,7 @@ impl Session {
             // the frame of the stage's first region: the one queue orders it
             // after whatever frame still reads the span, with no submission
             // or wait of its own.
-            prepared.seat_scratch(carve.clone().take(prepared.scratch_bytes())?);
+            prepared.seat_scratch(carve.clone().take(prepared.scratch_bytes())?)?;
             for (at, region) in stage.regions.iter().enumerate() {
                 prepared.launch_region(device, pipelines, &self.rings, region, at == 0)?;
             }
