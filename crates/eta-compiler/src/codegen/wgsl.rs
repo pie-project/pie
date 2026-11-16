@@ -356,7 +356,7 @@ pub struct Stepwise {
 /// 1: every step a call of the closed set, reading its node, rung and
 /// selector from a uniform; before, each stage one module with its nodes
 /// spelled in.
-pub const WGSL_STEP_EMITTER_VERSION: u16 = 1;
+pub const WGSL_STEP_EMITTER_VERSION: u16 = 2;
 
 /// The binding of the uniform a step module reads its node, rung and
 /// selector from ([`StepUniform`]), beside the runtime's (0 to 5): a
