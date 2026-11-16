@@ -11,7 +11,9 @@
 //! stages, so it is the same body wherever the rows lie; at arm time no
 //! reader is bound, and arming lends the rows from room the load holds for
 //! its synthetic fires, sized by the widest scored fire
-//! ([`arming_capture_room`]).
+//! ([`arming_capture_room`]). A scored class is armed at the lattice's
+//! octaves alone ([`scored_buckets`]), beside every plain bucket: its fires
+//! pad up to the next and replay there.
 
 use poem_ir::{ClassSet, Request};
 
@@ -48,6 +50,35 @@ pub fn lattice_classes(landing: &[Vec<Request>], drafter: impl Fn(usize) -> bool
 #[must_use]
 pub fn scored_classes(landing: &[Vec<Request>]) -> ClassSet {
     ClassSet::of((0..landing.len()).filter(|&class| landing[class].iter().any(scores_only)))
+}
+
+/// The buckets a scored class is armed at, of a lattice's `buckets`
+/// (ascending): its octaves, the power-of-two points, and its top where that
+/// is none, so every fire the lattice holds has one. A structural subset of
+/// the plain lattice, never a tuned count: a scored fire pads up to the next
+/// of them ([`scored_bucket`]) and replays its body there.
+#[must_use]
+pub fn scored_buckets(buckets: &[u32]) -> Vec<u32> {
+    let mut octaves: Vec<u32> = buckets
+        .iter()
+        .copied()
+        .filter(|bucket| bucket.is_power_of_two())
+        .collect();
+    if let Some(&top) = buckets.last()
+        && octaves.last() != Some(&top)
+    {
+        octaves.push(top);
+    }
+    octaves
+}
+
+/// The bucket a fire of `rows` rows holding a scored lane pads to: the
+/// first of [`scored_buckets`] that holds it; none past the lattice's top.
+#[must_use]
+pub fn scored_bucket(buckets: &[u32], rows: u32) -> Option<u32> {
+    scored_buckets(buckets)
+        .into_iter()
+        .find(|&bucket| bucket >= rows)
 }
 
 /// The bytes of a capturing lane's score rows: a key row of the load's
@@ -89,6 +120,17 @@ mod tests {
             "a scored lane with an adapter is not plain but for scores"
         );
         assert_eq!(scored_classes(&landing), ClassSet::of([1usize]));
+    }
+
+    #[test]
+    fn a_scored_fire_pads_to_the_lattices_next_octave() {
+        let lattice = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96];
+        assert_eq!(scored_buckets(&lattice), [1, 2, 4, 8, 16, 32, 64, 96]);
+        assert_eq!(scored_bucket(&lattice, 5), Some(8));
+        assert_eq!(scored_bucket(&lattice, 64), Some(64));
+        assert_eq!(scored_bucket(&lattice, 65), Some(96));
+        assert_eq!(scored_bucket(&lattice, 97), None);
+        assert_eq!(scored_buckets(&[1, 2, 4, 256]), [1, 2, 4, 256]);
     }
 
     #[test]
