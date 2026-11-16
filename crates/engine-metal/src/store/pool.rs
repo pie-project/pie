@@ -107,6 +107,11 @@ pub struct Pool {
     /// a raise, a lower, a lend and its release change what the span is
     /// used for, never what memory is behind it.
     whole: bool,
+    /// Where yield's last shed left the span backed from (bytes from the
+    /// range's start), on a `whole` pool: the heaps below it are given back
+    /// until the governor's grow ([`Pool::commit_span`]) backs the whole
+    /// span again. `None`: the span is backed whole.
+    shed_from: Option<u64>,
     table: ChunkTable,
     /// How a page id splits its slot ([`Pool::split_slots`]): `None` where
     /// every paged shape's slots tile a chunk, so an id is its slot in its
@@ -299,6 +304,7 @@ impl Pool {
                 carve: 0,
                 span: 0,
                 whole: false,
+                shed_from: None,
                 table: ChunkTable::identity(total_chunks),
                 slot_shift: None,
                 part_shift: part_shift(parts),
@@ -591,6 +597,19 @@ impl Pool {
         if bytes <= self.carve {
             return Ok(());
         }
+        // A carve into what yield shed waits on the governor's grow: the
+        // runtime refuses such a raise first (`SlotError::SpanShed`), and a
+        // fire never makes a heap after ready.
+        if let Some(from) = self.shed_from
+            && self.bytes().saturating_sub(bytes) < from
+        {
+            return Err(Fault::Ceiling {
+                what: "bytes of the activation span backed since yield shed the rest (the \
+                       governor's grow backs it again)",
+                need: bytes,
+                have: self.bytes() - from,
+            });
+        }
         let span = self.bytes() - self.pinned_from();
         if bytes > span {
             return Err(Fault::Ceiling {
@@ -682,6 +701,23 @@ impl Pool {
                 have: u64::from(self.span_segments()),
             });
         }
+        if self.whole {
+            self.span = self.span.max(segments);
+            // The governor's grow after yield's shed: the whole span is
+            // backed again, as at the load.
+            if self.shed_from.take().is_some() {
+                #[cfg(target_vendor = "apple")]
+                {
+                    let from = self.pinned_from() - self.last_start();
+                    let part = self
+                        .parts
+                        .last_mut()
+                        .expect("a pool has one buffer at least");
+                    part.store.map_top(from)?;
+                }
+            }
+            return Ok(());
+        }
         if segments <= self.span {
             return Ok(());
         }
@@ -697,15 +733,21 @@ impl Pool {
     /// No frame reads the chunks given back: the caller has drained every
     /// frame, and the runtime holds no state in them.
     pub unsafe fn release_span(&mut self, segments: u32) -> Result<()> {
-        if segments >= self.span {
+        // A `whole` pool lends no span segment (`span` stays as the load
+        // left it), so its shed is never short of one: what it keeps is the
+        // top `segments` and the carve.
+        if segments >= self.span && !self.whole {
             return Ok(());
         }
         self.span = segments;
-        if self.whole {
-            return Ok(());
-        }
         #[cfg(target_vendor = "apple")]
         {
+            if self.whole {
+                // Yield's last shed: the heaps below what the carve and the
+                // kept segments take go back to the system.
+                let want = self.top_want();
+                self.shed_from = Some(self.shed_from.map_or(want, |from| from.max(want)));
+            }
             let want = self.top_want() - self.last_start();
             let part = self
                 .parts

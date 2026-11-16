@@ -2484,6 +2484,13 @@ impl Shell {
         ledger
     }
 
+    /// What the device holds for this process now: allocations and the
+    /// heaps mapped under the pool, the span's included as backed.
+    #[must_use]
+    pub fn device_allocated(&self) -> u64 {
+        self.device.allocated()
+    }
+
     /// The ledger against what the device holds for this process now.
     #[must_use]
     pub fn audit(&self) -> engine::memory::Audit {
