@@ -998,19 +998,21 @@ impl Shell {
     /// instead. A coarser default lattice's buckets are the finer one's
     /// every other past the fine rows, so nothing compiled changes. Returns
     /// the buckets dropped; says so, and loudly where even the coarsest
-    /// lattice does not fit.
+    /// lattice does not fit. A load that arms scored classes keeps the
+    /// plain lattice whole: where its plain and scored bodies together do
+    /// not fit, it is refused by name.
     fn fit_lattice(
         &mut self,
         rest: &[(u32, Kind)],
         kept: usize,
         weighed: &[(usize, usize); Kind::COUNT],
-    ) -> std::collections::BTreeSet<u32> {
+    ) -> Result<std::collections::BTreeSet<u32>> {
         let Some((steps, from, mut fine)) = self.lattice else {
-            return std::collections::BTreeSet::new();
+            return Ok(std::collections::BTreeSet::new());
         };
         let spent = self.cache.body_stats().census;
         if spent.bodies == 0 {
-            return std::collections::BTreeSet::new();
+            return Ok(std::collections::BTreeSet::new());
         }
         let average = spent.bytes / spent.bodies;
         let price = |kind: Kind| match weighed[kind.at()] {
@@ -1030,6 +1032,15 @@ impl Shell {
         // what the armed ones took as they were instantiated: the bytes
         // `arm_target` stops on.
         let room = usize::try_from(self.bodies_room()).unwrap_or(usize::MAX);
+        if !self.scored.is_empty() && need(&buckets) > room {
+            return Err(Fault::Ceiling {
+                what: "bytes of the bodies of the plain lattice and its scored classes' \
+                       octaves, which a load arming scored classes holds whole \
+                       ([engine] bodies_mem, or the card)",
+                need: (need(&buckets) + spent.bytes) as u64,
+                have: (room + spent.bytes) as u64,
+            });
+        }
         while need(&buckets) > room {
             if fine <= steps.max(1) {
                 eprintln!(
@@ -1073,7 +1084,7 @@ impl Shell {
         // lattice arms them: a bucket dropped here is one no fire pads to.
         self.budgets.tokens.buckets.clone_from(&buckets);
         self.budget.buckets = buckets;
-        dropped
+        Ok(dropped)
     }
 
     /// What the bodies may still take: the allowance past the bytes the
@@ -1141,6 +1152,15 @@ impl Shell {
     /// Every composition the lattice arms, in arming's order (the top
     /// bucket's first, then by kind and bucket), each with its recurrent
     /// rows' treatment; `None` where there is nothing to arm.
+    /// Whether a composition holds a lane of a scored class.
+    fn holds_scored(&self, target: &BodySynth) -> bool {
+        target
+            .lanes()
+            .0
+            .iter()
+            .any(|&(class, _)| self.scored.contains(class))
+    }
+
     fn lattice_targets(&self) -> Option<LatticeTargets> {
         let ceiling = self.lane_ceiling();
         if ceiling == 0 {
@@ -1191,40 +1211,44 @@ impl Shell {
             (true, Some(ladder)) => ladder.buckets.clone(),
             _ => Vec::new(),
         };
-        let deployment = Deployment {
+        // The plain lattice is keyed over the plain classes alone, whole;
+        // the scored classes' compositions beside it, at its octaves alone
+        // (`engine::load::armed::scored_buckets`): a fire holding a scored
+        // lane pads up to the next (`Shell::scored_word`).
+        let plain = poem_ir::ClassSet::of(
+            self.tiers
+                .plain
+                .iter()
+                .filter(|class| !self.scored.contains(*class)),
+        );
+        let deployment_of = |armed: &poem_ir::ClassSet, points: Vec<LatticePoint>| Deployment {
             points,
             buckets: self.budget.buckets.clone(),
-            patch_points,
+            patch_points: patch_points.clone(),
             decoders: self
                 .decoding
                 .iter()
-                .filter(|class| textual(*class) && self.tiers.plain.contains(*class))
+                .filter(|class| textual(*class) && armed.contains(*class))
                 .collect(),
             prefilling: (0..classes)
                 .filter(|class| {
-                    !self.decoding.contains(*class)
-                        && textual(*class)
-                        && self.tiers.plain.contains(*class)
+                    !self.decoding.contains(*class) && textual(*class) && armed.contains(*class)
                 })
                 .collect(),
             media: self
                 .media
                 .iter()
-                .filter(|class| self.tiers.plain.contains(*class))
+                .filter(|class| armed.contains(*class))
                 .collect(),
             wide: self
                 .decoding
                 .iter()
                 .chain((0..classes).filter(|class| !self.decoding.contains(*class)))
                 .filter(|class| {
-                    textual(*class)
-                        && !self.landing[*class].is_empty()
-                        && self.tiers.plain.contains(*class)
+                    textual(*class) && !self.landing[*class].is_empty() && armed.contains(*class)
                 })
                 .collect(),
-            drafting: (0..classes)
-                .filter(|class| !self.landing[*class].iter().any(poem_ir::Request::plain))
-                .collect(),
+            drafting: crate::exports::drafting_of(&self.landing, armed),
             rs_rungs: self.rs_rungs(),
             decoding: self.decoding.clone(),
             seats,
@@ -1236,12 +1260,35 @@ impl Shell {
         };
         let mut found = Targets::default();
         for enumerate in ARMS {
-            enumerate(&deployment, &mut found);
+            enumerate(&deployment_of(&plain, points.clone()), &mut found);
         }
+        let octaves = engine::load::armed::scored_buckets(&self.budget.buckets);
+        let mut scored_found = Targets::default();
+        if !self.scored.is_empty() {
+            for enumerate in ARMS {
+                enumerate(
+                    &deployment_of(&self.tiers.plain, points.clone()),
+                    &mut scored_found,
+                );
+            }
+        }
+        let scored = scored_found
+            .targets
+            .into_iter()
+            .filter(|(bucket, target)| self.holds_scored(target) && octaves.contains(bucket))
+            .collect::<Vec<_>>();
+        eprintln!(
+            "engine-cuda: lattice keys {} plain and {} scored (the scored at the \
+             lattice's {} octaves)",
+            found.targets.len(),
+            scored.len(),
+            octaves.len(),
+        );
         let Targets {
             mut targets,
             unfireable,
         } = found;
+        targets.extend(scored);
         let top = targets.iter().map(|(bucket, _)| *bucket).max();
         let rank = |kind: Kind| match kind {
             Kind::Decode => 0u8,
@@ -1479,6 +1526,21 @@ impl Shell {
     }
 
     fn arm_lattice_fenced(&mut self, verify: bool) -> Result<()> {
+        // A scored class's fires capture into rows no reader holds yet:
+        // each lane's lent from the run the load holds for them.
+        let (room, at) = self.arming_capture;
+        let row = self.programs.capture().bytes();
+        self.arming_rows = if room == 0 {
+            Vec::new()
+        } else {
+            (0..room / row).map(|lane| at + lane * row).collect()
+        };
+        let armed = self.arm_lattice_rows(verify);
+        self.arming_rows = Vec::new();
+        armed
+    }
+
+    fn arm_lattice_rows(&mut self, verify: bool) -> Result<()> {
         let Some(mut st) = self.arm_begin(verify) else {
             return Ok(());
         };
@@ -1510,7 +1572,7 @@ impl Shell {
                 )
                 .collect();
             let kept = st.targets.len() + 1 - rest.len();
-            let dropped = self.fit_lattice(&rest, kept, &st.weighed);
+            let dropped = self.fit_lattice(&rest, kept, &st.weighed)?;
             st.dropped.extend(dropped);
         }
         let weighed_before = self.cache.body_stats().census;

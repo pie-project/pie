@@ -231,6 +231,11 @@ impl Shell {
                         ),
                     });
                 }
+                // A size-only walk launches nothing: no row is written.
+                None if crate::sizing::active() => Some(0),
+                // Arming: no reader is bound, and the lane captures into
+                // rows lent for it.
+                None if self.arming => self.arming_rows.get(at).copied(),
                 None => None,
             };
             rows[at] = row.ok_or_else(|| Fault::Unbound {
@@ -673,8 +678,16 @@ impl Shell {
         let buffering = lanes.iter().any(|seated| {
             matches!(seated.rs, RsVerb::Buffer { .. }) || self.drafts_only(seated.lane.word)
         });
+        // One holding a scored lane pads to the lattice's next octave, where
+        // its body is armed (`engine::load::armed::scored_bucket`).
+        let scored = lanes
+            .iter()
+            .any(|seated| self.scored_word(seated.lane.word));
         let at = self.forced_bucket.take().or_else(|| {
             let rows: u32 = lane_rows.iter().sum();
+            if scored {
+                return engine::load::armed::scored_bucket(&self.budget.buckets, rows);
+            }
             buffering
                 .then(|| self.rs_rungs().into_iter().find(|&bucket| bucket >= rows))
                 .flatten()
