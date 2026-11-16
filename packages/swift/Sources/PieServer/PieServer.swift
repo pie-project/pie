@@ -101,7 +101,7 @@ public final class PieServer: Sendable {
         let config = try String(decoding: JSONEncoder().encode(configuration), as: UTF8.self)
         let handle = try await blocking {
             var pointer: OpaquePointer?
-            try check { error in pie_server_start(model.path(), config, home.path(), listen, &pointer, error) }
+            try check { error in pie_server_start(model.path(percentEncoded: false), config, home.path(percentEncoded: false), listen, &pointer, error) }
             return Handle(pointer: pointer!)
         }
         let server: PieServer
