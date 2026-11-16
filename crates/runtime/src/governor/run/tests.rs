@@ -231,3 +231,32 @@ fn at_yield_zero_the_loop_decides_what_the_dedicated_default_did() {
         }
     }
 }
+
+/// The ruled formula, `target = floor + (budget_device - floor) * (1 -
+/// yield * pressure)`, at its four named points, through the loop's own
+/// step: yield 0 never retargets at any pressure (pie holds its budget);
+/// yield 1 at critical goes to the floor; yield 0.5 at critical goes
+/// halfway; calm brings it back to the budget.
+#[test]
+fn the_ruled_formula_at_yield_zero_half_and_one() {
+    // Budget 1000 MiB, floor 200 MiB.
+    for pressure in [0.0, 0.5, 1.0] {
+        assert!(asked(0.0, pressure).is_empty(), "yield 0, pressure {pressure}");
+    }
+    for (share, segments) in [(1.0, FLOOR / MIB), (0.5, (FLOOR + (HARD - FLOOR) / 2) / MIB)] {
+        let mut pool = Fake::new();
+        let mut steer = Steer::new(&pool, share);
+        assert_eq!(
+            step(&mut steer, &mut pool, Some(1.0), false),
+            segments * MIB,
+            "yield {share} at critical"
+        );
+        assert_eq!(pool.take(), [format!("retarget {segments}")]);
+        assert_eq!(
+            step(&mut steer, &mut pool, Some(0.0), false),
+            HARD,
+            "yield {share}: calm brings it back to the budget"
+        );
+        assert_eq!(pool.take(), [format!("retarget {}", HARD / MIB)]);
+    }
+}

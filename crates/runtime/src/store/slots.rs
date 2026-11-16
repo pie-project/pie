@@ -1793,6 +1793,25 @@ impl SlotPool {
         (keep < committed).then_some(keep)
     }
 
+    /// The `n` of a `release_span(n)` that gives back the lowest span
+    /// segment committed here while the rung lends it, where it holds no
+    /// chunk and none a raise's copy still reads: what a shrink below the
+    /// mapped segments takes first, since nothing moves for it. The lend
+    /// stands and the walk backs it again once the target rises
+    /// ([`Self::span_to_commit`]). `None` where the lowest committed span
+    /// segment holds anything, or none is committed.
+    pub fn lent_span_to_shed(&self) -> Option<u32> {
+        let committed = self.span_committed();
+        if committed == 0 {
+            return None;
+        }
+        let segment = self.span_segment(committed);
+        let range = self.segments.range(segment);
+        let idle = self.segments.used(segment) == 0
+            && range.clone().all(|chunk| !self.fenced.get(chunk));
+        idle.then_some(committed - 1)
+    }
+
     /// Gives back the span segments below the top `n` committed here
     /// ([`Self::span_to_release`] says which may go), ahead of the
     /// engine's `release_span(n)`.

@@ -41,7 +41,78 @@ pub type Reading = tokio::sync::watch::Receiver<f64>;
 #[must_use]
 pub fn pressure() -> Option<Reading> {
     static READING: OnceLock<Option<Reading>> = OnceLock::new();
-    READING.get_or_init(watch).clone()
+    READING
+        .get_or_init(|| told::watch().or_else(watch))
+        .clone()
+}
+
+/// A test hook: while `PIE_PRESSURE_FILE` names a file, that file is the
+/// system's reading in place of the platform's, read each [`TICK`], so a
+/// test can induce pressure mid-run under `yield` alone.
+mod told {
+    use super::Reading;
+
+    /// The pressure the hook's file states ([`read`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn watch() -> Option<Reading> {
+        let path = std::path::PathBuf::from(std::env::var_os("PIE_PRESSURE_FILE")?);
+        let at = |path: &std::path::Path| {
+            std::fs::read_to_string(path).map_or(0.0, |text| read(&text))
+        };
+        let (tell, reading) = tokio::sync::watch::channel(at(&path));
+        tracing::info!(path = %path.display(), "memory pressure: read from PIE_PRESSURE_FILE");
+        std::thread::Builder::new()
+            .name("pie-pressure-file".into())
+            .spawn(move || {
+                while !tell.is_closed() {
+                    std::thread::sleep(super::TICK);
+                    let pressure = at(&path);
+                    tell.send_if_modified(|last| {
+                        let changed = *last != pressure;
+                        *last = pressure;
+                        changed
+                    });
+                }
+            })
+            .ok()?;
+        Some(reading)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn watch() -> Option<Reading> {
+        None
+    }
+
+    /// `critical` reads 1, `congested` 0.5, `calm` 0, a number its value
+    /// clamped to `[0, 1]`; anything else reads 0.
+    pub fn read(text: &str) -> f64 {
+        match text.trim() {
+            "critical" => 1.0,
+            "congested" => 0.5,
+            text => text
+                .parse::<f64>()
+                .ok()
+                .filter(|p| p.is_finite())
+                .map_or(0.0, |p| p.clamp(0.0, 1.0)),
+        }
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn the_file_states_the_pressure_by_name_or_number() {
+        for (text, pressure) in [
+            ("critical\n", 1.0),
+            ("congested", 0.5),
+            ("calm", 0.0),
+            ("0.25", 0.25),
+            ("7", 1.0),
+            ("-1", 0.0),
+            ("NaN", 0.0),
+            ("", 0.0),
+        ] {
+            assert_eq!(read(text), pressure, "{text:?}");
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]

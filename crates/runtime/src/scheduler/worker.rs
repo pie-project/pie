@@ -1159,6 +1159,46 @@ impl SchedulerHandle {
     }
 }
 
+/// A lane's stand-in, for a test of what reaches the engine: installs a
+/// handle for `engine_id` and hands the test each pool op sent to it with
+/// where its answer goes; what else is sent (a nudge) is passed over.
+#[cfg(test)]
+pub(crate) struct LaneStandIn(tokio::sync::mpsc::UnboundedReceiver<SchedulerItem>);
+
+#[cfg(test)]
+impl LaneStandIn {
+    pub(crate) fn install(engine_id: usize) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<SchedulerItem>();
+        let handle = SchedulerHandle {
+            inner: Arc::new(SchedulerControl {
+                tx,
+                active_senders: AtomicUsize::new(0),
+                shutdown_wait: Condvar::new(),
+                shutdown_gate: Mutex::new(()),
+                program_ids: Mutex::new(HashMap::new()),
+                accepting: AtomicBool::new(true),
+                stats: Arc::new(SchedulerStats::default()),
+                device_domain: crate::scheduler::device_domain(engine_id),
+            }),
+        };
+        crate::scheduler::install_scheduler_handle(engine_id, handle);
+        Self(rx)
+    }
+
+    /// The next pool op sent to the lane, waited for; `None` once every
+    /// sender is gone.
+    pub(crate) async fn next_pool_op(
+        &mut self,
+    ) -> Option<(PoolOp, tokio::sync::oneshot::Sender<Result<()>>)> {
+        while let Some(item) = self.0.recv().await {
+            if let SchedulerItem::Pool { op, response } = item {
+                return Some((op, response));
+            }
+        }
+        None
+    }
+}
+
 pub struct BatchScheduler {
     engine_id: EngineId,
     handle: SchedulerHandle,

@@ -1898,7 +1898,16 @@ impl SharedPool {
             return Some(step.into());
         }
         let mapped = self.mapped_segments();
-        if mapped <= target || prefix == 0 {
+        if mapped <= target {
+            return None;
+        }
+        // Pressed under what is mapped: an empty lent span segment goes
+        // first, as nothing moves for it.
+        if let Some(n) = self.pool.lent_span_to_shed() {
+            self.pool.release_span(n);
+            return Some(SegmentMove::ReleaseSpan { n });
+        }
+        if prefix == 0 {
             return None;
         }
         let last = prefix - 1;

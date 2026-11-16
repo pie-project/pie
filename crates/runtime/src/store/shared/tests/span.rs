@@ -776,3 +776,95 @@ fn a_press_narrows_the_rung_to_what_the_target_leaves_and_lifts_as_it_rises() {
     assert_eq!(from_load.pressed(), None);
     assert_eq!(from_load.rung_for(2048), 2048);
 }
+
+/// The governor's shed through an engine, end to end, the span backed on
+/// demand: the governor's own step at `yield = 1` steers the pool's own
+/// walker, whose pool ops reach a fake engine through a stand-in lane.
+/// A parked lane's kv fills the prefix (live state: the floor counts it,
+/// and nothing gives it back), and the lowered rung's lent span is backed
+/// and empty. Critical pressure sheds the empty lent span first
+/// (`PoolOp::ReleaseSpan`, nothing moves for it). Calm puts the target
+/// back at the budget, and the walk backs only what commits ahead of
+/// demand: the prefix's segments, never the lent span
+/// ([`SharedPool::walk_goal`], `SlotPool::commit_ahead`), so with the
+/// prefix whole nothing reaches the engine until something asks.
+#[tokio::test(flavor = "current_thread")]
+async fn yield_sheds_the_empty_lent_span_first_under_critical_pressure() {
+    use crate::governor::run::{Steer, step};
+    use crate::scheduler::worker::{LaneStandIn, PoolOp};
+    const ENGINE: usize = 73;
+    let (mut pool, mut engine) = on_demand_pool();
+    assert_eq!(
+        walk_segments(&mut pool, 6, 0, &mut engine),
+        Retarget::Reached
+    );
+    pool.lower_rung(256).unwrap();
+    // The parked lane: every record the prefix holds, none in the span.
+    let parked = pool
+        .take_records(pool.records_available() as usize)
+        .unwrap();
+    assert!(state_chunks(&pool, &parked).iter().all(|&chunk| chunk < 48));
+    assert_eq!(
+        walk_segments(&mut pool, 8, 0, &mut engine),
+        Retarget::Reached
+    );
+    let lent = pool.pool().span_committed();
+    assert!(lent > 0, "the lent span is backed");
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    engine.calls.clear();
+    let engine = Arc::new(Mutex::new(engine));
+    let mut stand_in = LaneStandIn::install(ENGINE);
+    let lane = engine.clone();
+    tokio::spawn(async move {
+        while let Some((op, answer)) = stand_in.next_pool_op().await {
+            let mut engine = lane.lock().unwrap();
+            let done = match op {
+                PoolOp::CommitSegments(n) => engine.commit_segments(n),
+                PoolOp::ReleaseSegments(n) => engine.release_segments(n),
+                PoolOp::CommitSpan(n) => engine.commit_span(n),
+                PoolOp::ReleaseSpan(n) => {
+                    engine.release_span(n);
+                    Ok(())
+                }
+                PoolOp::Rung { from, to } => engine.set_rung(from, to),
+                PoolOp::Evacuate(evacuation) => engine.evacuate(&evacuation),
+                PoolOp::Rebind(_) => Ok(()),
+            };
+            let _ = answer.send(done.map_err(|error| anyhow::anyhow!("{error}")));
+        }
+    });
+    let mut grow = SharedGrow::new(0, ENGINE, shared.clone()).with_live_lanes(|| 1);
+    let mut steer = Steer::new(&grow, 1.0);
+
+    // Critical: the target is the floor, and the empty lent span goes first.
+    let floor = grow.floor();
+    assert_eq!(step(&mut steer, &mut grow, Some(1.0), false), floor);
+    grow.walk().await;
+    let calls = std::mem::take(&mut engine.lock().unwrap().calls);
+    assert!(
+        matches!(calls.first(), Some(Call::ReleaseSpan(_))),
+        "the empty lent span is the first shed: {calls:?}"
+    );
+    let shed = shared.lock().unwrap().pool().span_committed();
+    assert!(shed < lent, "a lent span segment is given back");
+    {
+        let pool = shared.lock().unwrap();
+        assert!(
+            state_chunks(&pool, &parked).iter().all(|&chunk| chunk < 48),
+            "the parked lane's kv stays in the prefix"
+        );
+        pool.pool().check();
+    }
+
+    // Calm: back to the budget; the walk commits ahead of demand only, and
+    // the prefix is whole, so the lent span stays unbacked.
+    assert_eq!(
+        step(&mut steer, &mut grow, Some(0.0), false),
+        grow.hard_limit()
+    );
+    grow.walk().await;
+    let calls = std::mem::take(&mut engine.lock().unwrap().calls);
+    assert!(calls.is_empty(), "calm backs nothing ahead of demand: {calls:?}");
+    assert_eq!(shared.lock().unwrap().pool().span_committed(), shed);
+    shared.lock().unwrap().pool().check();
+}
