@@ -160,16 +160,20 @@ impl Layout {
                 Ok(())
             };
 
+        // The convs the rs buffer covers: the chunk plan's rule
+        // (`poem_compiler::rs::buffered_convs`), the one the recipe's rs rows
+        // read, not a walk of this shell's own. A conv feeding a recurrence
+        // and a conv no recurrence reads (Qwen4's PLE conv, `Feeds::Alone`)
+        // alike buffer their input and replay it at a fold. This shell
+        // replays no Mamba-2 layer, so a Mamba-2 conv commits with it and
+        // keeps no plane.
+        for conv in poem_compiler::rs::buffered_convs(trace, false) {
+            let cache = cache_of(trace, conv.state)?;
+            plane(&mut layout, cache, Role::ConvX, conv.x)?;
+            region(&mut layout, cache, "conv", conv.y)?;
+        }
         for node in &trace.nodes {
             match &node.op {
-                Operation::Ssm(
-                    Ssm::CausalConv1d { x, state, y, .. }
-                    | Ssm::CausalConv1dChunked { x, state, y, .. },
-                ) => {
-                    let cache = cache_of(trace, *state)?;
-                    plane(&mut layout, cache, Role::ConvX, *x)?;
-                    region(&mut layout, cache, "conv", *y)?;
-                }
                 Operation::Ssm(
                     Ssm::GatedDelta {
                         gates,
@@ -229,22 +233,11 @@ impl Layout {
                         .max(u64::from(*heads) * u64::from(*head_dim) * u64::from(*head_dim));
                 }
                 Operation::Gather(
-                    Gather::NgramIds {
-                        ids,
-                        state,
-                        ngram_ids,
-                        ..
-                    }
-                    | Gather::NgramIdsChunked {
-                        ids,
-                        state,
-                        ngram_ids,
-                        ..
-                    },
+                    Gather::NgramIds { ids, state, .. } | Gather::NgramIdsChunked { ids, state, .. },
                 ) => {
-                    let cache = cache_of(trace, *state)?;
-                    plane(&mut layout, cache, Role::Ids, *ids)?;
-                    region(&mut layout, cache, "ngram", *ngram_ids)?;
+                    // Its own rows' table ids land where the fire's land
+                    // (`gather.ngram_ids_committed`): no extended region.
+                    plane(&mut layout, cache_of(trace, *state)?, Role::Ids, *ids)?;
                 }
                 _ => {}
             }
