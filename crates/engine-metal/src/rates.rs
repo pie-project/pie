@@ -3,8 +3,8 @@
 //! the kernel serving dispatches under the device's own tuning:
 //!
 //! * the matmul curve: `linear::gemm::matmul` at each of
-//!   [`engine::rates::LATTICE_ROWS`], each repeat over the next of 8
-//!   distinct weights so every one streams from memory, as a fire's do;
+//!   [`engine::rates::LATTICE_ROWS`], each repeat over the next of
+//!   engine::rates::weights_at's distinct weights so every one streams from memory, as a fire's do;
 //! * attention: `attn::arbiter::prefill` at [`engine::rates::ATTN_SHAPE`],
 //!   causal, over a bf16 pool of the 16-token pages serving builds;
 //! * the scan: `ssm::causal_conv1d_chunked` then `ssm::gated_delta_chunked`
@@ -38,11 +38,6 @@ const FRAME_SECONDS: f64 = 0.020;
 /// The most of one measurement a timed frame repeats.
 const MAX_REPEATS: u32 = 512;
 
-/// The bytes the distinct weights a matmul's repeats rotate over add up to
-/// at least: well past any Apple GPU's system-level cache, so each repeat
-/// streams its weight as a fire's matmul does (8 of 32 MiB at depth 4096,
-/// 2 of 128 MiB at 8192).
-const ROTATED_BYTES: u64 = 256 << 20;
 
 fn median(mut times: Vec<f64>) -> f64 {
     times.sort_by(f64::total_cmp);
@@ -312,11 +307,13 @@ pub fn measure(
     };
     let mut grid = Vec::with_capacity(LATTICE_ROWS.len() * DEPTHS.len());
     for k in DEPTHS {
-        let weight_bytes = u64::from(k) * u64::from(k) * 2;
-        let count = ROTATED_BYTES.div_ceil(weight_bytes).max(2);
-        let weights = (0..count)
-            .map(|seed| {
-                let w = bench.buffer(&bf16_noise((k * k) as usize, 7 + seed, 0.05))?;
+        // The planes every backend rotates through (engine::rates::weights_at:
+        // 768 MiB, at least 12), each its own memory so each repeat streams
+        // its weight as a layer's matmul does; one noise plane fills them.
+        let noise = bf16_noise((k * k) as usize, 7 + u64::from(k), 0.05);
+        let weights = (0..engine::rates::weights_at(k))
+            .map(|_| {
+                let w = bench.buffer(&noise)?;
                 Ok((bench.tensor(&w, k, k, Dtype::Bf16)?, w))
             })
             .collect::<Result<Vec<(Tensor, Buffer)>, String>>()?;
