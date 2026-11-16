@@ -143,6 +143,17 @@ const PERMUTES: &[&str] = &[
     "gather.unpack_rows",
 ];
 
+/// Whether `op` selects the rows a reading reads out (`gather.rows` by the readout rows).
+fn readout(trace: &Trace, op: &Operation) -> bool {
+    match op {
+        Operation::Gather(Gather::Rows { rows, .. }) => matches!(
+            trace.values.get(rows.0 as usize).map(|d| &d.def),
+            Some(Def::Input(poem_ir::RuntimeInput::ReadoutRows))
+        ),
+        _ => false,
+    }
+}
+
 /// Whether `ty` is a row a request (a lane vector).
 fn per_lane(ty: &Ty) -> bool {
     matches!(ty, Ty::Tensor { shape, .. } if matches!(shape.first(), Some(Dim::Lanes | Dim::LanesPlus(_))))
@@ -200,7 +211,9 @@ impl Body<'_, '_> {
             // the rows a reading reads out (a prefill's last rows): a row selection commutes
             // with every row's own op after it, so the rows flow on and the host keeps the
             // ones it names from the reading's outputs (no op across rows after it: `lower`)
-            Operation::Gather(Gather::Rows { .. }) => self.elementwise(op, acts, outs),
+            Operation::Gather(Gather::Rows { .. }) if readout(self.r.trace, node) => {
+                self.elementwise(op, acts, outs)
+            }
             Operation::Attn(Attn::Ragged {
                 q,
                 head_dim,
@@ -345,8 +358,7 @@ pub fn lower(
         return Err(format!("{name}: the stream step runs no layers"));
     };
     // a row selection commutes only with each row's own ops: none across rows after it
-    if let Some(at) = (0..nodes)
-        .find(|&at| any[at] && matches!(trace.nodes[at].op, Operation::Gather(Gather::Rows { .. })))
+    if let Some(at) = (0..nodes).find(|&at| any[at] && readout(trace, &trace.nodes[at].op))
         && let Some(after) = (at + 1..nodes).find(|&n| {
             any[n]
                 && matches!(
