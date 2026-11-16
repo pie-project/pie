@@ -144,6 +144,8 @@ pub struct RsRows {
     pub tokens: u32,
     pub bytes: u64,
     pub plane_at: Vec<u64>,
+    /// Each plane's bytes a token, in the order of `plane_at`.
+    pub row_bytes: Vec<u64>,
 }
 
 /// The list a kv row's slots lie in, so the page table it reads: the kv
@@ -544,6 +546,7 @@ fn rs_rows(recipe: &ChunkRecipe, layout: &crate::rs::Layout) -> Result<RsRows> {
         tokens: rs.tokens,
         bytes: rs.bytes,
         plane_at,
+        row_bytes: layout.planes.iter().map(|plane| plane.row_bytes).collect(),
     })
 }
 
@@ -1840,6 +1843,47 @@ impl Pools {
         Ok(())
     }
 
+    /// Token runs of the rs list (slot refs): a run's rows of every rs
+    /// plane, at the plane's offset in the slot (CONTRACT-BC 18), as a
+    /// keep that moves a set's buffered rows to a new start names them.
+    fn copy_rs_runs(&self, frame: &mut Frame, runs: &[engine::chunk::SlotRun]) -> Result<()> {
+        let Some(rs) = self.rs.as_ref() else {
+            return Err(Fault::Unbound {
+                what: "token runs of the rs list, which this load does not lay".to_string(),
+            });
+        };
+        for run in runs {
+            if run.tokens == 0 {
+                continue;
+            }
+            for token in [run.src_token, run.dst_token] {
+                let end = u64::from(token) + u64::from(run.tokens);
+                if end > u64::from(rs.tokens) {
+                    return Err(Fault::Ceiling {
+                        what: "token rows in one rs list slot",
+                        need: end,
+                        have: u64::from(rs.tokens),
+                    });
+                }
+            }
+            let from = self.slot_offset(RS, run.src)?;
+            let to = self.slot_offset(RS, run.dst)?;
+            for at in [from, to] {
+                self.pool
+                    .admit(u32::try_from(at / self.layout.chunk_bytes).unwrap_or(u32::MAX))?;
+            }
+            for (plane_at, row_bytes) in rs.plane_at.iter().zip(&rs.row_bytes) {
+                let src = from + plane_at + u64::from(run.src_token) * row_bytes;
+                let dst = to + plane_at + u64::from(run.dst_token) * row_bytes;
+                if src != dst {
+                    self.pool
+                        .copy(frame, src, dst, u64::from(run.tokens) * row_bytes)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// A kv page's bytes, as the slot file holds one: a list slot.
     pub fn page_bytes(&self) -> Result<u64> {
         Ok(self.layout.list.map_or(0, |list| list.slot_bytes))
@@ -1884,6 +1928,9 @@ impl Pools {
         match (copy.src, copy.dst) {
             (src, dst) if src == device && dst == device => {
                 self.copy_whole(frame, copy.shape, &copy.slots)?;
+                if !copy.runs.is_empty() && copy.shape == RS {
+                    return self.copy_rs_runs(frame, &copy.runs);
+                }
                 if !copy.runs.is_empty() {
                     if copy.shape != LIST {
                         return Err(Fault::Unbound {
