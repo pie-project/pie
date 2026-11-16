@@ -279,7 +279,6 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     };
     let asked_tokens = boot.budget.max_tokens;
     let asked = boot.budget.clone();
-    let floor = boot.budget.max_lanes.max(TOKENS_FLOOR).min(asked_tokens);
     let window = crate::store::window_of(&boot.trace)?;
     // A fire of `tokens`' working set (the activation arena, the attention
     // workspaces and one fire's windowed kv rows) and the launches its
@@ -312,17 +311,15 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     let working = |tokens: u32, voxels: &Option<poem_compiler::VoxelLadder>| -> u64 {
         laid(tokens, voxels).map_or(u64::MAX, |(bytes, _)| bytes)
     };
-    // The top rung, the ruling's (`crate::top`): of the asked lattice's
-    // buckets from the floor up, each spanning its fire's working set and
+    // The top rung, the ruling's (`crate::top`): of every bucket of the asked
+    // lattice (the rule weighs them all; no floor stands in for it), each
+    // spanning its fire's working set and
     // needing one sequence and the bodies' floor beside it, over the room
     // the card has after the weight tier.
     let tokens = {
         let paging = Paging::of(boot.page_size, boot.context, boot.slots, 1)?;
         let mut candidates = Vec::new();
         for rung in budget_at(asked_tokens).buckets {
-            if rung < floor {
-                continue;
-            }
             let (span, launches) = laid(rung, &voxels).unwrap_or((u64::MAX, 0));
             let sequence =
                 crate::store::least_sequence_bytes(&boot.trace, paging.windowed(window, rung))?;
