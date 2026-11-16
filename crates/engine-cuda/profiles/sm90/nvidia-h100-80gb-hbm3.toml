@@ -59,6 +59,10 @@ moe.fp8a8_tma = true
 # second top-8 token) rather than 64: Qwen3-Coder-30B-A3B FP8 decode GPU time a step 2 lanes 5.18 -> 5.01,
 # 4 lanes 6.61 -> 6.37 ms
 moe.fp8a8_from = 16
+# a decode's block-FP8 select on the one-warpgroup wgmma kernel with its weight rows landed by TMA, 16-route
+# slices up to 8 routes an expert on average: Qwen3-Coder-30B-A3B FP8 decode GPU time a step 16 lanes
+# 10.58 -> 10.03, 48 lanes 16.21 -> 15.22 ms, the same sums bit for bit
+moe.fp8a8_wgtma = true
 
 [engine]
 working_set_percent = 90  # 1.9% faster end to end

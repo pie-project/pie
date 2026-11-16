@@ -397,6 +397,13 @@ pub struct MoeFp8a8WsFrom(pub u32);
 #[decision(id = "kernel.moe.fp8a8_ws_narrow", flag, default = false, tune = search)]
 pub struct MoeFp8a8WsNarrow;
 
+/// The one-warpgroup block-FP8 select (a decode's few routes an expert)
+/// with its weight rows landed by TMA, on a bank the device holds. Off but
+/// where a chip's profile says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.fp8a8_wgtma", flag, default = false, tune = search)]
+pub struct MoeFp8a8Wgtma;
+
 /// The warp-specialized block-FP8 select (where N takes 256) persistent, its
 /// weight rows landed by TMA (`kernel.moe.fp8a8_ws_from`). Off but where a
 /// chip's profile says.
@@ -1031,6 +1038,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeFp8a8WsFrom>()
         .add::<MoeFp8a8WsNarrow>()
         .add::<MoeFp8a8Tma>()
+        .add::<MoeFp8a8Wgtma>()
         .add::<MoeFp8MmaFill>()
         .add::<MoeFp8MmaDepth>()
         .add::<MoeMxfp4Bf16Keep>()
@@ -1196,6 +1204,7 @@ tuning! {
     fp8a8_ws_from: u32 = 0, get MoeFp8a8WsFrom;
     fp8a8_ws_narrow: bool = false, on MoeFp8a8WsNarrow;
     fp8a8_tma: bool = false, on MoeFp8a8Tma;
+    fp8a8_wgtma: bool = false, on MoeFp8a8Wgtma;
     fp8_mma_fill: u32 = 4, get MoeFp8MmaFill;
     fp8_mma_depth: u32 = 4, get MoeFp8MmaDepth;
     mxfp4_bf16_keep: u32 = 0, get MoeMxfp4Bf16Keep;
