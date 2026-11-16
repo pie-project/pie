@@ -255,8 +255,6 @@ pub fn head_dim_instantiated(head_dim: u32) -> bool {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Toggles {
-    pub chunk_floor_128: bool,
-
     pub prefill_ctas_per_sm: u32,
 
     pub decode_gqa: crate::attn::decode_gqa::Gate,
@@ -266,7 +264,6 @@ impl Toggles {
     #[must_use]
     pub fn of(tuning: crate::tuning::Tuning) -> Self {
         Self {
-            chunk_floor_128: tuning.decode_chunk_floor_128(),
             prefill_ctas_per_sm: tuning.prefill_ctas_per_sm(),
             decode_gqa: crate::attn::decode_gqa::Gate::of(tuning),
         }
@@ -375,7 +372,6 @@ pub fn plan_decode(
         page_size: shape.page_size,
         head_dim: shape.head_dim,
         enable_cuda_graph,
-        chunk_floor_128: toggles.chunk_floor_128,
         window_left: u32::try_from(window_left).ok(),
         whole: ranks > 0
             || toggles

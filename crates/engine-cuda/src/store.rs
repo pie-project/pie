@@ -2359,11 +2359,6 @@ impl Pools {
             .map_or(1, |fixed| fixed.ids_a_lane().max(1))
     }
 
-    /// Lets go of the name [`Pools::name_record`] gave `key`.
-    pub fn forget_record(&mut self, key: u32) {
-        self.records.remove(&key);
-    }
-
     /// The whole chunks of the span under a carve that leaves `under`
     /// bytes below it, as the rungs state them lent: none where the
     /// state's chunks do not end where the activation starts

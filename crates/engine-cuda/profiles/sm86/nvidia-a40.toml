@@ -107,7 +107,6 @@ measured = [
   "kernel.qmm.split_thin_max",
   "kernel.qmm.split_warps_per_sm",
   "kernel.qmm.split_wide_max",
-  "kernel.sdpa.decode.chunk_floor_128",
   "kernel.sdpa.decode.gqa",
   "kernel.sdpa.decode.gqa_cluster",
   "kernel.sdpa.decode.gqa_deep_64",

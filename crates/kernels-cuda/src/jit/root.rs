@@ -166,18 +166,6 @@ impl Root {
     }
 
     #[must_use]
-    pub const fn options(mut self, options: &'static [&'static str]) -> Self {
-        self.options = options;
-        self
-    }
-
-    #[must_use]
-    pub const fn since(mut self, major: u32, minor: u32) -> Self {
-        self.floor = Toolchain::new(major, minor);
-        self
-    }
-
-    #[must_use]
     pub const fn arch_specific(mut self) -> Self {
         self.specific = true;
         self

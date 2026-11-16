@@ -1,14 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 const TREES: [(&str, &str); 2] = [("kernels", "kernels"), ("shim", "shim")];
-
-fn is_header(path: &Path) -> bool {
-    !matches!(
-        path.file_name().and_then(|n| n.to_str()),
-        Some("LICENSE" | "MODIFICATIONS" | "README.md")
-    )
-}
 
 fn walk(dir: &Path, base: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -19,7 +12,7 @@ fn walk(dir: &Path, base: &Path, out: &mut Vec<PathBuf>) {
     for path in sorted {
         if path.is_dir() {
             walk(&path, base, out);
-        } else if is_header(&path) {
+        } else {
             out.push(
                 path.strip_prefix(base)
                     .expect("walked from base")
@@ -34,34 +27,6 @@ fn spell(rel: &Path) -> String {
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
         .collect::<Vec<_>>()
         .join("/")
-}
-
-fn quoted_includes(source: &str) -> Vec<&str> {
-    source
-        .lines()
-        .filter_map(|line| {
-            let rest = line.strip_prefix("#include")?;
-            let rest = rest.strip_prefix([' ', '\t'])?.trim_start();
-            let rest = rest.strip_prefix('"')?;
-            rest.split('"').next()
-        })
-        .collect()
-}
-
-fn normalise(base: &Path, spelling: &str) -> Option<PathBuf> {
-    let mut out = base.to_path_buf();
-    for part in spelling.split('/') {
-        match part {
-            "." | "" => {}
-            ".." => {
-                if !out.pop() {
-                    return None;
-                }
-            }
-            other => out.push(other),
-        }
-    }
-    Some(out)
 }
 
 fn main() {
@@ -87,23 +52,6 @@ fn main() {
         named.insert(spell(rel), (kernels_tree, rel.clone()));
     }
 
-    let mut extra: BTreeSet<(String, String)> = BTreeSet::new();
-    for rel in &kernel_files {
-        let text = std::fs::read_to_string(kernels.join(rel)).unwrap_or_default();
-        let dir = rel.parent().unwrap_or(Path::new("")).to_path_buf();
-        for spelling in quoted_includes(&text) {
-            if named.contains_key(spelling) {
-                continue;
-            }
-            let Some(target) = normalise(&dir, spelling) else {
-                continue;
-            };
-            if kernels.join(&target).is_file() {
-                extra.insert((spelling.to_owned(), spell(&target)));
-            }
-        }
-    }
-
     let row = |name: &str, root: &str, rel: &str| {
         format!(
             "    Header {{ name: {name:?}, \
@@ -119,9 +67,6 @@ fn main() {
         } else {
             lib_rows.push_str(&line);
         }
-    }
-    for (spelling, target) in &extra {
-        lib_rows.push_str(&row(spelling, kernels_tree, target));
     }
 
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("cargo sets this")).join("headers.rs");
