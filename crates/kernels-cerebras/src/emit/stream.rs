@@ -507,8 +507,8 @@ pub fn emit(p: &Program) -> R<Emitted> {
                 u16: false,
                 len: (3 * d) * t + 2,
                 fill: Fill::Slices(vec![
-                    (st.conv.0, h * d * t, d * t),
-                    (st.conv.0, (st.k_from + h * d) * t, d * t),
+                    (st.conv.0, j.qk_head(h) * d * t, d * t),
+                    (st.conv.0, (st.k_from + j.qk_head(h) * d) * t, d * t),
                     (st.conv.0, (st.v_from + h * d) * t, d * t),
                     (st.a_log.0, h, 1),
                     (st.dt.0, h, 1),
@@ -1711,9 +1711,10 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
                 let qw = j.q_heads / j.kv_heads * j.head_dim;
                 let d = j.head_dim;
                 kv_io = true;
+                let kh = j.qk_head(idx);
                 let mut parts = vec![
-                    (*q, q.from + idx * qw, qw),
-                    (*k, k.from + idx * d, d),
+                    (*q, q.from + kh * qw, qw),
+                    (*k, k.from + kh * d, d),
                     (*v, v.from + idx * d, d),
                 ];
                 // a recurrence's head: its beta and decay logits after them

@@ -165,6 +165,21 @@ pub struct State {
     /// v]` layout).
     pub k_from: u32,
     pub v_from: u32,
+    /// Value heads a key head (a head root `h`'s q / k the key head `h / ratio`'s).
+    #[serde(skip_serializing_if = "is_one")]
+    pub ratio: u32,
+}
+
+fn is_one(r: &u32) -> bool {
+    *r == 1
+}
+
+impl Joint {
+    /// The q / k head a head root `h` reads (a recurrence's key head over several value heads).
+    #[must_use]
+    pub fn qk_head(&self, h: u32) -> u32 {
+        h / self.state.map_or(1, |s| s.ratio.max(1))
+    }
 }
 
 impl Serialize for Cols {
@@ -975,10 +990,11 @@ pub fn lower_through(
                 else {
                     unreachable!()
                 };
-                if k_heads != v_heads || k_dim != v_dim {
+                // (a state column a value head; several value heads a key head share its q / k)
+                if k_dim != v_dim || *k_heads == 0 || !v_heads.is_multiple_of(*k_heads) {
                     return Err(refuse_at(&format!(
                         "into {k_heads} key heads of {k_dim} beside {v_heads} value heads of \
-                         {v_dim}: one state column a head of each"
+                         {v_dim}: a state column a value head, its key head's q / k"
                     )));
                 }
                 let gn = find(&|op| {
@@ -999,7 +1015,7 @@ pub fn lower_through(
                     unreachable!()
                 };
                 skip.extend([gn, gd]);
-                let (h, d) = (*v_heads, *k_dim);
+                let (h, hk, d) = (*v_heads, *k_heads, *k_dim);
                 let xc = r.cols(*x);
                 let bac = r.cols(*ba);
                 for c in [xc, bac] {
@@ -1007,14 +1023,17 @@ pub fn lower_through(
                         return Err(refuse_at("reads a value not at the column roots"));
                     }
                 }
-                let q = Cols { width: h * d, ..xc };
+                let q = Cols {
+                    width: hk * d,
+                    ..xc
+                };
                 let k = Cols {
-                    from: xc.from + h * d,
-                    width: h * d,
+                    from: xc.from + hk * d,
+                    width: hk * d,
                     ..xc
                 };
                 let v = Cols {
-                    from: xc.from + 2 * h * d,
+                    from: xc.from + 2 * hk * d,
                     width: h * d,
                     ..xc
                 };
@@ -1036,8 +1055,9 @@ pub fn lower_through(
                         taps: *conv_width,
                         a_log: *a_log,
                         dt: *dt_bias,
-                        k_from: h * d,
-                        v_from: 2 * h * d,
+                        k_from: hk * d,
+                        v_from: 2 * hk * d,
+                        ratio: h / hk,
                     }),
                     sink: None,
                 });
