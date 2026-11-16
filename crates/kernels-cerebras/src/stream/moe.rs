@@ -4,9 +4,10 @@
 //! `moe_combine` is the gated sum of every expert, the unpicked ones gated by zero:
 //!
 //! - the router's logits through a root region: the scores as the route states them (its
-//!   softmax or sigmoid, a pick bias), the top `k` by `k` masked maxima (the threshold the `k`th
-//!   largest key, a pick every key at or past it), the picked scores weighted (the softmax over
-//!   them, or the sigmoid's renormalized and scaled): one weight an expert, zero unpicked;
+//!   softmax or sigmoid, a pick bias), the top `k` a round at a time (the largest key left, the
+//!   lowest expert holding it on a tie, as a route picks), the picked scores weighted (the
+//!   softmax over them, or the sigmoid's renormalized and scaled): one weight an expert, zero
+//!   unpicked;
 //! - that gate expanded to each expert's columns by a matvec of constant ones;
 //! - every expert's gate and up as one matvec each over its bank (an expert's rows a block);
 //! - the activation times the expanded gate, a root region;
@@ -14,8 +15,7 @@
 //!
 //! The sum over the picked experts is exact (an unpicked expert adds zeros); its cost is a dense
 //! layer's of the experts' width spread over their PEs (skipping a zero gate's PEs is a speed
-//! lever, not a numerics one). A key tied with the `k`th largest is picked too (a route picks
-//! the lower expert): the routes of a trace whose router ties at the cut are not its own.
+//! lever, not a numerics one).
 
 use poem_ir::{Dtype, Linear, Operation, RouteScore, Trace, ValueId};
 
@@ -258,18 +258,23 @@ pub fn router(trace: &Trace, g: &Group) -> R<Chain> {
         Some(_) => b.push(Op::Binary(Binary::Add, s, 1)),
         None => s,
     };
-    // the k-th largest key: k maxima, each over the keys under the last
-    let top = b.push(Op::Reduce(Reduce::Max, key));
-    let lowest = b.f32(-3.0e38);
-    let mut t = top;
-    for _ in 1..g.top_k {
-        let under = b.push(Op::Binary(Binary::Lt, key, t));
-        let rest = b.push(Op::Select(under, key, lowest));
-        t = b.push(Op::Reduce(Reduce::Max, rest));
-    }
-    let picked = b.push(Op::Binary(Binary::Ge, key, t));
+    // the top k keys, one a round: the largest, the lowest expert holding it on a tie (as a
+    // route picks), that one out of the next rounds
+    let top = b.push(Op::Reduce(Reduce::Max, logits));
+    let col = b.push(Op::Column);
+    let col = b.push(Op::Cast(col, kernels_ir::Elem::F32));
+    let (lowest, past) = (b.f32(-3.0e38), b.f32(3.0e38));
     let (one, zero) = (b.f32(1.0), b.f32(0.0));
-    let mask = b.push(Op::Select(picked, one, zero));
+    let (mut left, mut mask) = (key, zero);
+    for _ in 0..g.top_k {
+        let m = b.push(Op::Reduce(Reduce::Max, left));
+        let at = b.push(Op::Binary(Binary::Eq, left, m));
+        let cand = b.push(Op::Select(at, col, past));
+        let first = b.push(Op::Reduce(Reduce::Min, cand));
+        let hit = b.push(Op::Binary(Binary::Eq, col, first));
+        mask = b.push(Op::Select(hit, one, mask));
+        left = b.push(Op::Select(hit, lowest, left));
+    }
     let gate = match g.score {
         RouteScore::Sigmoid {
             renormalize,
