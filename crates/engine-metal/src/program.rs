@@ -1782,7 +1782,7 @@ mod tests {
             f32::from_bits((b + 0x7fff + ((b >> 16) & 1)) & 0xffff_0000)
         };
         let step_logits = |len: usize, step: u32| -> Vec<f32> {
-            let mut state = 0x9e37_79b9_7f4a_7c15u64 ^ (u64::from(step) * 0x2545_f491_4f6c_dd1d);
+            let mut state = 0x9e37_79b9_7f4a_7c15u64 ^ u64::from(step).wrapping_mul(0x2545_f491_4f6c_dd1d);
             (0..len)
                 .map(|_| {
                     state ^= state << 13;
@@ -1906,7 +1906,7 @@ mod tests {
             f32::from_bits((b + 0x7fff + ((b >> 16) & 1)) & 0xffff_0000)
         };
         let step_logits = |len: usize, step: u32| -> Vec<f32> {
-            let mut state = 0x9e37_79b9_7f4a_7c15u64 ^ (u64::from(step) * 0x2545_f491_4f6c_dd1d);
+            let mut state = 0x9e37_79b9_7f4a_7c15u64 ^ u64::from(step).wrapping_mul(0x2545_f491_4f6c_dd1d);
             (0..len)
                 .map(|_| {
                     state ^= state << 13;

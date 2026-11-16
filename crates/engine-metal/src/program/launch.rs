@@ -469,11 +469,11 @@ struct Grouped {
     row_meta: Held,
     row_indices: Held,
     readout_rows: u32,
-    /// Each readout row's row on the readout plane, from `logits_base` in
-    /// the plane's pitch: 0, 1, 2, ... where the lane's rows lie one after
+    /// Each readout row's first element on the readout plane, from
+    /// `logits_base`: a row a pitch where the lane's rows lie one after
     /// another; where the rows are seated at the instance's lanes, each
-    /// row's own.
-    row_index: Vec<u32>,
+    /// row's own, wherever it lies.
+    row_at: Vec<u32>,
     layout_words: Vec<GroupLayout>,
     record: LaneRecord,
 }
@@ -639,7 +639,7 @@ impl Grouped {
             row_meta,
             row_indices,
             readout_rows,
-            row_index: (0..readout_rows).collect(),
+            row_at: Vec::new(),
             layout_words,
             record,
         }))
@@ -654,7 +654,7 @@ impl Grouped {
     }
 
     fn set_rows(&mut self) -> Result<()> {
-        let bytes: Vec<u8> = self.row_index.iter().copied().flat_map(u32::to_le_bytes).collect();
+        let bytes: Vec<u8> = self.row_at.iter().copied().flat_map(u32::to_le_bytes).collect();
         if !bytes.is_empty() {
             self.row_indices.write(0, &bytes)?;
         }
@@ -1557,37 +1557,45 @@ impl Prepared {
             return Ok(());
         };
         let width = plane.width;
-        // The rows on the plane: from lane 0's seat one after another, or,
-        // where the lanes' rows are seated apart, each row's own row of the
-        // plane from the lowest, every one on the plane's pitch.
+        // Each row's first element on the plane: from lane 0's seat one
+        // after another, or, where the lanes' rows are seated apart, each
+        // row's own from the lowest.
+        let element = |apart: u64| -> Result<u32> {
+            u32::try_from(apart / 2).map_err(|_| {
+                Fault::program(
+                    "program::launch",
+                    format!(
+                        "output `{}`'s rows lie {apart} bytes apart, past a u32 of \
+                         elements the grouped kernels address rows by",
+                        self.names[slot % self.output_slots as usize]
+                    ),
+                )
+            })
+        };
+        let pitch = u64::from(width) * 2;
+        let readout_rows = self.grouped.as_ref().map_or(0, |grouped| grouped.readout_rows);
         let (base, rows) = match self.row_addresses(slot)? {
-            None => (address_of(&plane.base, plane.offset)?, None),
+            None => (
+                address_of(&plane.base, plane.offset)?,
+                (0..u64::from(readout_rows))
+                    .map(|row| element(row * pitch))
+                    .collect::<Result<Vec<u32>>>()?,
+            ),
             Some(addresses) => {
-                let pitch = u64::from(width) * 2;
                 let low = addresses.iter().copied().min().unwrap_or(0);
-                let mut rows = Vec::with_capacity(addresses.len());
-                for (row, &address) in addresses.iter().enumerate() {
-                    let apart = address - low;
-                    let index = u32::try_from(apart / pitch).ok().filter(|_| apart % pitch == 0);
-                    rows.push(index.ok_or_else(|| {
-                        Fault::program(
-                            "program::launch",
-                            format!(
-                                "output `{}` row {row}, seated at lane {row}, lies {apart} \
-                                 bytes from the lowest row, not on the readout plane's \
-                                 {pitch}-byte pitch the grouped kernels read rows on",
-                                self.names[slot % self.output_slots as usize]
-                            ),
-                        )
-                    })?);
-                }
-                (low, Some(rows))
+                (
+                    low,
+                    addresses
+                        .iter()
+                        .map(|&address| element(address - low))
+                        .collect::<Result<Vec<u32>>>()?,
+                )
             }
         };
         let grouped = self.grouped.as_mut().expect("checked above");
         grouped.set_vocab(width)?;
         grouped.set_logits(base, 0, grouped.readout_rows)?;
-        grouped.row_index = rows.unwrap_or_else(|| (0..grouped.readout_rows).collect());
+        grouped.row_at = rows;
         grouped.set_rows()
     }
 
@@ -2441,7 +2449,7 @@ impl Batch {
                 &record_bytes(&meta),
             )?;
             let rows: Vec<u8> = grouped
-                .row_index
+                .row_at
                 .iter()
                 .copied()
                 .flat_map(u32::to_le_bytes)
