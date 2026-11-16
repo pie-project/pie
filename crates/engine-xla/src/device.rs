@@ -815,14 +815,11 @@ fn packed(bytes: &[u8]) -> Vec<u8> {
     zstd::bulk::compress(bytes, 1).unwrap_or_else(|_| bytes.to_vec())
 }
 
-/// A cached program's bytes, unpacked when `packed` wrote them (a zstd
-/// frame); an older raw file is read as it is.
+/// A cached program's bytes, unpacked as `packed` wrote them (a zstd
+/// frame); a file that is no such frame is no cached program (`None`, a
+/// miss).
 fn unpacked(bytes: Vec<u8>) -> Option<Vec<u8>> {
-    if bytes.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
-        zstd::stream::decode_all(bytes.as_slice()).ok()
-    } else {
-        Some(bytes)
-    }
+    zstd::stream::decode_all(bytes.as_slice()).ok()
 }
 
 /// Marks a cached program as just used, so `make_room` keeps it longest.

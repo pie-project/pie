@@ -195,19 +195,13 @@ impl Module {
     }
 }
 
+/// Safe math and precise floating-point functions. Both options are macOS
+/// 15's; the engine runs on macOS 26 or newer only (Metal 4, which
+/// `Context::bind` refuses a device without), so no older form is set.
 #[cfg(target_vendor = "apple")]
 fn set_safe_math(options: &objc2_metal::MTLCompileOptions) {
-    use objc2::runtime::NSObjectProtocol as _;
-
-    if options.respondsToSelector(objc2::sel!(setMathMode:)) {
-        options.setMathMode(objc2_metal::MTLMathMode::Safe);
-    } else {
-        #[allow(deprecated)]
-        options.setFastMathEnabled(false);
-    }
-    if options.respondsToSelector(objc2::sel!(setMathFloatingPointFunctions:)) {
-        options.setMathFloatingPointFunctions(objc2_metal::MTLMathFloatingPointFunctions::Precise);
-    }
+    options.setMathMode(objc2_metal::MTLMathMode::Safe);
+    options.setMathFloatingPointFunctions(objc2_metal::MTLMathFloatingPointFunctions::Precise);
 }
 
 #[cfg(target_vendor = "apple")]

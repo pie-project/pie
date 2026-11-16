@@ -360,7 +360,8 @@ table!(Hipblaslt from "libhipblaslt.so" {
     ) -> LtStatus;
 });
 
-/// hipBLASLt, opened on first use; a box without it falls back to rocBLAS.
+/// hipBLASLt, opened on first use; a box without it is refused by name
+/// (`lt::open`, at the load).
 pub fn hipblaslt() -> Result<&'static Hipblaslt, String> {
     static LT: OnceLock<Result<Hipblaslt, String>> = OnceLock::new();
     LT.get_or_init(Hipblaslt::open)

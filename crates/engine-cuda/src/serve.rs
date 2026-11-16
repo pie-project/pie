@@ -114,6 +114,11 @@ pub struct Shell {
     adapters: crate::blob::Adapters,
     held: Vec<u32>,
     readout_rows: crate::device::Buffer,
+    /// The run a fire stages a host-resident bank's experts in, bounded at
+    /// load and laid with the staged inputs (`experts::staging`).
+    expert_staging: crate::experts::staging::Staging,
+    /// Where it lies once laid; `None` where the load stages none.
+    expert_staged: Option<crate::experts::staging::Staged>,
     exports: Exports,
     graphs: Graphs,
     copies: bool,

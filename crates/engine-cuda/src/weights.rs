@@ -113,7 +113,7 @@ pub fn device_demand(trace: &Trace) -> Result<u64> {
         .map_or(0, |place| place.offset + place.reserved))
 }
 
-pub(crate) fn plane_bytes(trace: &Trace) -> Result<Vec<u64>> {
+pub fn plane_bytes(trace: &Trace) -> Result<Vec<u64>> {
     trace
         .params
         .iter()

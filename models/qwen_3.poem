@@ -1194,11 +1194,13 @@ def draft(m, inputs, x, logits, head):
     proposal = ops.linear.lm_head(read, head)
     output("mtp.logits", proposal)
     output("mtp.drafts", ops.sampling.argmax([proposal, proposal, proposal, proposal]))
+    draft_depth(1)
 
 def draft_self(m, inputs, x, logits, head):
     proposal = logits.on(fact.drafts())
     output("mtp.logits", proposal)
     output("mtp.drafts", ops.sampling.argmax([proposal, proposal, proposal, proposal]))
+    draft_depth(1)
 
 def rotate(q, k, inputs, m, a):
     vision = m.tower != None

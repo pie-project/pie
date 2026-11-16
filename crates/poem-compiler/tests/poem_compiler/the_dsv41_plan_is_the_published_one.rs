@@ -41,21 +41,21 @@ fn the_dsv41_plan_is_the_published_one() {
     // reads theirs.
     for source in [2, 8, 14, 20] {
         assert!(
-            kv_rows.contains(&format!("pool.{source}").as_str()),
+            kv_rows.contains(&format!("layers.{source}.attn.pool.entries").as_str()),
             "{kv_rows:?}"
         );
         assert!(
-            kv_rows.contains(&format!("index.{source}").as_str()),
+            kv_rows.contains(&format!("layers.{source}.attn.indexer.keys").as_str()),
             "{kv_rows:?}"
         );
     }
     for reuse in [3, 21, 24] {
         assert!(
-            !kv_rows.contains(&format!("pool.{reuse}").as_str()),
+            !kv_rows.contains(&format!("layers.{reuse}.attn.pool.entries").as_str()),
             "{kv_rows:?}"
         );
         assert!(
-            !kv_rows.contains(&format!("index.{reuse}").as_str()),
+            !kv_rows.contains(&format!("layers.{reuse}.attn.indexer.keys").as_str()),
             "{kv_rows:?}"
         );
     }
@@ -161,7 +161,7 @@ fn the_dsv41_dspark_head_drafts_through_its_stages() {
         .collect();
     for stage in 0..3 {
         assert!(
-            kv_rows.contains(&format!("dspark.{stage}").as_str()),
+            kv_rows.contains(&format!("dspark.stages.{stage}.attn.kv").as_str()),
             "{kv_rows:?}"
         );
     }

@@ -32,6 +32,11 @@ export function draftBlock(): BlockDrafter | undefined {
   return _model.draftBlock();
 }
 
+/** Tokens the model's draft head chains in one pass; 0 with no head. */
+export function draftDepth(): number {
+  return _model.draftDepth();
+}
+
 /** Fires one lane may have submitted and not yet taken. */
 export function runAheadWindow(): number {
   return _model.runAheadWindow();

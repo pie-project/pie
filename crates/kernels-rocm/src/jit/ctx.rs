@@ -517,14 +517,22 @@ impl Ctx {
 
     #[allow(clippy::unused_self)]
     #[must_use]
-    pub fn multiprocessors(&self) -> Option<u32> {
+    /// The device's compute units, which the launchers shape their grids
+    /// by: a device that does not answer is refused by name.
+    pub fn multiprocessors(&self, op: &'static str) -> Result<u32, Error> {
         #[cfg(feature = "rocm")]
         {
-            crate::jit::device::multiprocessors()
+            crate::jit::device::multiprocessors().ok_or_else(|| {
+                refuse(
+                    op,
+                    "the device did not answer its compute-unit count, which the launchers \
+                     shape their grids by",
+                )
+            })
         }
         #[cfg(not(feature = "rocm"))]
         {
-            None
+            Err(crate::jit::runtimeless(op))
         }
     }
 

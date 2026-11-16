@@ -200,6 +200,9 @@ pub struct Plane {
     /// What a fire carrying a program that reads `attn.scores` lays for
     /// the score planes, at the most ([`Plane::set_scores`]).
     scores: u64,
+    /// The engine's lane arenas, where a sampler's blocks meet
+    /// ([`launch::Arenas`]): laid at load ([`Plane::set_arenas`]).
+    arenas: launch::Arenas,
 }
 
 /// What a fire of one program at one bind's extents takes of the fire's
@@ -297,7 +300,19 @@ impl Plane {
             term: crate::guest_term::GuestTerm::default(),
             laid: Vec::new(),
             scores: 0,
+            arenas: launch::Arenas::default(),
         }
+    }
+
+    /// The flight the load set ([`Plane::set_flight`]).
+    #[must_use]
+    pub fn flight(&self) -> u32 {
+        self.flight
+    }
+
+    /// The lane arenas the load laid.
+    pub fn set_arenas(&mut self, arenas: launch::Arenas) {
+        self.arenas = arenas;
     }
 
     /// Opens the side streams a wave's groups fan out to, so no fire opens
@@ -820,8 +835,10 @@ impl Plane {
             at,
             fan,
             laid,
+            arenas,
             ..
         } = self;
+        let arenas = *arenas;
         let at = *at;
 
         let mut groups: Vec<(ProgramId, Extents, Vec<InstanceId>)> = Vec::new();
@@ -878,7 +895,7 @@ impl Plane {
             |(((program_id, extents, members), stream), (base, lanes))| {
                 Plane::fly_group(
                     programs, instances, program_id, extents, &members, lanes, base, fresh, at,
-                    stream,
+                    arenas, stream,
                 )
             },
         );
@@ -899,11 +916,13 @@ impl Plane {
         base: u64,
         fresh: bool,
         at: Attach,
+        arenas: launch::Arenas,
         stream: *mut core::ffi::c_void,
     ) -> Result<()> {
         for flight in members.chunks(lanes.max(1) as usize) {
             Plane::fly_one(
-                programs, instances, program_id, extents, flight, lanes, base, fresh, at, stream,
+                programs, instances, program_id, extents, flight, lanes, base, fresh, at, arenas,
+                stream,
             )?;
         }
         Ok(())
@@ -920,6 +939,7 @@ impl Plane {
         base: u64,
         fresh: bool,
         at: Attach,
+        arenas: launch::Arenas,
         stream: *mut core::ffi::c_void,
     ) -> Result<()> {
         {
@@ -975,7 +995,7 @@ impl Plane {
                     continue;
                 };
                 for region in stage.regions.iter() {
-                    prepared.launch_region(region, stream)?;
+                    prepared.launch_region(region, arenas, stream)?;
                 }
             }
         }
@@ -1297,7 +1317,9 @@ mod term_tests {
             };
             for n in 1..=256 {
                 let mut plane = Plane::default();
-                plane.pairs.push((ProgramId(1), Extents::default(), bytes, n));
+                plane
+                    .pairs
+                    .push((ProgramId(1), Extents::default(), bytes, n));
                 plane.fit_term();
                 // What `Plane::fly` lays for a group of `n` members.
                 let lays = bytes.at(flight_lanes(n).min(bytes.max_lanes).max(1));

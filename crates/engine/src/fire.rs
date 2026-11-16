@@ -29,6 +29,10 @@ impl std::fmt::Display for FrameId {
     }
 }
 
+/// One row's mask, run-length: runs alternate hidden and admitted columns,
+/// hidden first. Column `c` of a lane's mask is slot `kv.folded + c` of its
+/// working set ([`Lane::mask`]); `total` is how many columns it states, at
+/// least the lane's extent (its buffer, then its own rows).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Mask {
     pub runs: Vec<u32>,
@@ -54,6 +58,25 @@ impl Mask {
     #[must_use]
     pub fn words(&self) -> usize {
         usize::try_from(self.total.div_ceil(32)).unwrap_or(usize::MAX)
+    }
+
+    /// The mask without its first `columns` columns: what a piece whose
+    /// boundary stands `columns` slots further on reads of the slots past
+    /// it.
+    #[must_use]
+    pub fn after(&self, columns: u64) -> Mask {
+        let columns = columns.min(self.total);
+        let mut runs = Vec::new();
+        let mut at = columns;
+        for span in self.admitted(columns..self.total) {
+            runs.push(u32::try_from(span.start - at).unwrap_or(u32::MAX));
+            runs.push(u32::try_from(span.end - span.start).unwrap_or(u32::MAX));
+            at = span.end;
+        }
+        Mask {
+            runs,
+            total: self.total - columns,
+        }
     }
 
     pub fn admitted(&self, range: Range<u64>) -> impl Iterator<Item = Range<u64>> + '_ {
@@ -114,52 +137,42 @@ impl Masking {
     }
 }
 
-/// The recurrent layers replay one run for all of a lane's rows, so every row
-/// must admit the same buffered slots.
+/// The buffered slots a lane's recurrent layers replay, as slots: every one
+/// of `folded..first` for a lane alone on its set ([`Lineage::Set`]), the
+/// ones its mask admits for a lane sharing its set ([`Lineage::Admitted`]).
+/// A lane's own rows follow, in order, whatever its mask says: the mask is
+/// attention's. One run serves all of a lane's rows, so where the mask
+/// names the lineage every row must admit the same buffered slots.
+/// `folded` is the lane's boundary, the origin of its mask's columns
+/// ([`Lane::mask`]): the buffered slots are columns `0..first - folded`.
 pub fn buffered_reads(
     masking: Option<&Masking>,
     folded: u32,
     first: u32,
-    rows: u32,
+    lineage: Lineage,
 ) -> Result<Vec<Range<u32>>> {
-    let whole = || {
-        (folded < first)
-            .then_some(folded..first)
-            .into_iter()
-            .collect()
+    let whole: Vec<Range<u32>> = (folded < first)
+        .then_some(folded..first)
+        .into_iter()
+        .collect();
+    let (Lineage::Admitted, Some(masking)) = (lineage, masking) else {
+        return Ok(whole);
     };
+    let buffer = u64::from(first.saturating_sub(folded));
     let read = |mask: &Mask| -> Vec<Range<u32>> {
-        mask.admitted(u64::from(folded)..u64::from(first))
-            .map(|span| span.start as u32..span.end as u32)
+        mask.admitted(0..buffer)
+            .map(|span| (span.start as u32 + folded)..(span.end as u32 + folded))
             .collect()
-    };
-    let Some(masking) = masking else {
-        return Ok(whole());
     };
     let masks = masking.masks();
     let Some(reads) = masks.first().map(read) else {
-        return Ok(whole());
+        return Ok(whole);
     };
     for (row, mask) in masks.iter().enumerate() {
         if read(mask) != reads {
             return Err(Error::Invalid(format!(
                 "row {row} admits other buffered slots than the lane's first row; its \
                  recurrent layers replay one run of them for all its rows"
-            )));
-        }
-        let before = match masking {
-            Masking::Rows(_) => row as u64,
-            Masking::Extent(_) => u64::from(rows.saturating_sub(1)),
-        };
-        let own = u64::from(first)..u64::from(first) + before;
-        let kept: u64 = mask
-            .admitted(own.clone())
-            .map(|span| span.end - span.start)
-            .sum();
-        if kept != own.end - own.start {
-            return Err(Error::Invalid(format!(
-                "row {row} hides a row of its own lane before it; its recurrent layers \
-                 run the lane's rows in order"
             )));
         }
     }
@@ -169,6 +182,19 @@ pub fn buffered_reads(
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KvDelta {
     pub held: u32,
+    /// The set's committed boundary, in the set's own slot numbering. Every
+    /// slot below it is committed: the lane's rows read `[0, folded)` under
+    /// the model's own bounds (causal, window, sink) and no mask bit. The
+    /// lane's mask speaks of the slots from `folded` on and of nothing else.
+    /// `folded <= held`: a lane writes no committed slot.
+    ///
+    /// It is the boundary as the runtime knows it when it stages the fire.
+    /// While a device-counted fold is in flight it is the boundary before
+    /// that fold; the slots the fold freezes are then read through the mask
+    /// like any buffered slot. A lane that carries [`RsVerb::Buffer`] states
+    /// the same `folded` there.
+    #[serde(default)]
+    pub folded: u32,
     pub pages: Vec<u32>,
     #[serde(default)]
     pub translation: Vec<u32>,
@@ -194,6 +220,31 @@ pub struct Lane {
     pub tokens: Vec<u32>,
     pub positions: Vec<u32>,
     pub kv: KvDelta,
+    /// What the lane's rows read of the slots from `kv.folded` on. Column
+    /// `c` of a mask is slot `kv.folded + c`. The extent is `end -
+    /// kv.folded` columns, `end` one past the lane's last row: the buffer
+    /// the fire found, then the lane's own rows in row order. A set bit
+    /// admits the slot, a clear bit hides it. A mask's `total` is at least
+    /// the extent; columns past it are not read. A plane is `rows x (buffer
+    /// + rows)` bits and no more.
+    ///
+    /// Among the lane's own rows the order is the row order: row `q` reads
+    /// own rows `0..=q` its bits admit and no later row, whatever its bits
+    /// or its stated position say. A wide lane's rows read every own row
+    /// their bits admit. Bits of own rows above the diagonal are not read.
+    ///
+    /// Lanes of one set in one fire read one buffer, as the fire found it,
+    /// and their own rows: a slot a sibling lane writes in the same fire is
+    /// hidden by the guest's mask.
+    ///
+    /// The mask is attention's: a lane alone on its set replays every
+    /// buffered slot of its set; lanes sharing a set replay the slots their
+    /// mask admits, the ancestry they state ([`Lineage`]).
+    ///
+    /// `None`: every row reads every slot before its own and its own.
+    /// `Masking::Extent`: one mask for every row. `Masking::Rows`: one per
+    /// row, as many as the lane's rows. A kv-less lane's mask is over its
+    /// attention group's rows, as before.
     pub mask: Option<Masking>,
     pub adapter: Option<u32>,
     #[serde(default)]
@@ -543,8 +594,9 @@ pub enum RsReset {
 pub enum RsVerb {
     #[default]
     Fold,
-    /// Replays the buffered slots `folded..first` its mask admits, then freezes
-    /// `fold` slots past the row the record stands at into the state.
+    /// Replays the buffered slots `folded..first` its lineage names, then
+    /// its own rows in order, then freezes `fold` slots past the row the
+    /// record stands at into the state.
     Buffer {
         /// The buffer's pages: token `t` of page `p` holds slot
         /// `base + p * page + t`.
@@ -569,7 +621,23 @@ pub enum RsVerb {
         /// the stated number is exact again.
         folded: u32,
         fold: FoldLen,
+        /// Which buffered slots the lane's recurrence replays: a lane alone
+        /// on its set replays every buffered slot of its set; lanes sharing
+        /// a set replay the slots their mask admits, the ancestry they state.
+        lineage: Lineage,
     },
+}
+
+/// Which of its set's buffered slots a lane's recurrent layers replay
+/// ([`RsVerb::Buffer`]). The mask is attention's; a recurrence reads a row
+/// of its lineage in order, and its own rows always.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Lineage {
+    /// The lane is alone on its set in the fire: every buffered slot.
+    Set,
+    /// The lane shares its set with other lanes of the fire: the slots its
+    /// mask admits, the ancestry it states.
+    Admitted,
 }
 
 /// The rows a fire asks its activation rung for: `own` rows of its lanes,
@@ -1068,26 +1136,46 @@ mod tests {
     }
 
     #[test]
-    fn a_lane_replays_the_buffered_slots_its_mask_admits() {
-        // Slots 0..2 are folded; the lane's one row is at slot 6.
-        let ancestry = mask(&[true, true, false, true, false, true, true]);
-        assert_eq!(
-            ancestry.admitted(2..6).collect::<Vec<_>>(),
-            vec![3..4, 5..6],
-            "the kept spans in the range, in order"
-        );
-        let reads = buffered_reads(Some(&Masking::Rows(vec![ancestry.clone()])), 2, 6, 1);
+    fn a_lane_replays_its_lineage_whatever_its_mask_hides_from_attention() {
+        // Slots 0..2 are folded; the lane's one row is at slot 6. Its mask's
+        // columns start at the boundary: column 0 is slot 2.
+        let ancestry = mask(&[false, true, false, true, true]);
+        let one = Masking::Rows(vec![ancestry.clone()]);
+        // Alone on its set: every buffered slot, the mask unread.
+        assert_eq!(buffered_reads(Some(&one), 2, 6, Lineage::Set).unwrap(), vec![2..6]);
+        assert_eq!(buffered_reads(None, 2, 6, Lineage::Set).unwrap(), vec![2..6]);
+        // Sharing a set: the ancestry its mask states, as slots.
+        let reads = buffered_reads(Some(&one), 2, 6, Lineage::Admitted);
         assert_eq!(reads.unwrap(), vec![3..4, 5..6]);
-        assert_eq!(buffered_reads(None, 2, 6, 1).unwrap(), vec![2..6]);
+        assert_eq!(buffered_reads(None, 2, 6, Lineage::Admitted).unwrap(), vec![2..6]);
 
-        // Two rows from slot 5 that admit different buffered slots, and a
-        // second row that hides the first: a recurrence runs neither.
-        let other = mask(&[true, true, true, false, false, true, true]);
-        let rows = Masking::Rows(vec![ancestry.clone(), other]);
-        assert!(buffered_reads(Some(&rows), 2, 5, 2).is_err());
-        let blind = mask(&[true, true, false, true, false, false, true]);
-        let rows = Masking::Rows(vec![ancestry, blind]);
-        assert!(buffered_reads(Some(&rows), 2, 5, 2).is_err());
+        // A row hiding its own lane's earlier row reads it in its recurrence:
+        // the own rows run in order. Two rows admitting other buffered slots
+        // than each other cannot share one run.
+        let blind = mask(&[false, true, false, false, true]);
+        let rows = Masking::Rows(vec![ancestry.clone(), blind]);
+        assert_eq!(buffered_reads(Some(&rows), 2, 5, Lineage::Admitted).unwrap(), vec![3..4]);
+        let other = mask(&[true, false, false, true, true]);
+        let rows = Masking::Rows(vec![ancestry, other]);
+        assert!(buffered_reads(Some(&rows), 2, 5, Lineage::Admitted).is_err());
+        assert_eq!(buffered_reads(Some(&rows), 2, 5, Lineage::Set).unwrap(), vec![2..5]);
+    }
+
+    #[test]
+    fn a_mask_after_its_first_columns_reads_the_same_slots() {
+        let bits = [true, false, false, true, true, false, true];
+        let whole = mask(&bits);
+        for columns in 0..=bits.len() {
+            let after = whole.after(columns as u64);
+            assert_eq!(after.total, (bits.len() - columns) as u64);
+            let mut kept = vec![false; bits.len() - columns];
+            for span in after.admitted(0..after.total) {
+                for column in span {
+                    kept[column as usize] = true;
+                }
+            }
+            assert_eq!(kept, bits[columns..], "after {columns}");
+        }
     }
 
     #[test]

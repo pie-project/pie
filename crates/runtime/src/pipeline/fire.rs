@@ -775,6 +775,52 @@ fn lora_program_of<C: FireContext>(ctx: &mut C, fwd: &Resource<ForwardPass>) -> 
     Ok(container_has_lora_sink(&p.instance.program.bound.container))
 }
 
+/// The rows a piece of a lone masked lane takes so its mask plane fits the
+/// room of the rung it runs at: a rung of `t` tokens holds `max(t * t,
+/// max_context)` mask bits ([`::engine::Lane::mask`]), and a piece of `r`
+/// rows over a buffer of `b` stages `r * (b + r)`. Bounded by the buffer the
+/// pass's last piece finds (`b0 + rows - r`), every piece fits; nothing is
+/// refused for a long buffer, the pass takes more fires.
+fn mask_share(
+    req: &crate::engine::FireRequest,
+    share: u32,
+    stores: &crate::store::registry::Stores,
+    engine: usize,
+) -> u32 {
+    let [lane] = req.lanes.as_slice() else {
+        return share;
+    };
+    if lane.mask.is_none() || lane.kv_less {
+        return share;
+    }
+    let context = crate::engine::get_spec(engine).map_or(0, |spec| spec.limits.max_context) as u64;
+    let rows = lane.tokens.len() as u64;
+    let span = u64::from(lane.kv.held.saturating_sub(lane.kv.folded)) + rows;
+    let rung = |r: u32| -> u64 {
+        stores
+            .shared
+            .as_ref()
+            .map_or(r, |shared| shared.lock().unwrap().rung_for(r).max(r))
+            .into()
+    };
+    mask_rows(share, span, context, rung)
+}
+
+/// The largest `r <= share` with `r * span <= max(rung(r)^2, context)`, at
+/// least one row: [`mask_share`] apart from the stores.
+fn mask_rows(share: u32, span: u64, context: u64, rung: impl Fn(u32) -> u64) -> u32 {
+    let room = |r: u32| {
+        let t = rung(r);
+        t.saturating_mul(t).max(context)
+    };
+    let mut r = share.max(1);
+    while r > 1 && u64::from(r).saturating_mul(span) > room(r) {
+        let fits = u32::try_from(room(r) / span.max(1)).unwrap_or(u32::MAX);
+        r = fits.min(r - 1).max(1);
+    }
+    r
+}
+
 /// `PIE_FIRE_ROWS` overrides it, so a test compares outputs cut at the same
 /// rows.
 fn prefill_share(page: u32, engine: usize) -> u32 {
@@ -920,13 +966,14 @@ fn ask_rung(
     let want = crate::store::shared::want_rows(engine, rows);
     let raise = stores.shared.as_ref().and_then(|shared| {
         crate::store::shared::raise_now(shared, engine, rows);
-        (crate::store::shared::fire_cap(engine) < crate::store::shared::cap_for(shared, rows))
-            .then(|| {
+        (crate::store::shared::fire_cap(engine) < crate::store::shared::cap_for(shared, rows)).then(
+            || {
                 (
                     RaiseWait::start(shared.clone(), engine, rows),
                     crate::store::shared::reach_for(shared, rows),
                 )
-            })
+            },
+        )
     });
     Some(RungAsk {
         engine,
@@ -1131,7 +1178,8 @@ fn rows_of_lanes(
             if !lane.positions.is_empty() {
                 lane.positions = lane.positions[a..b].to_vec();
             }
-            // A row's mask names absolute keys: it is the same in any piece.
+            // A row's mask counts its columns from the boundary its piece
+            // states ([`restate_boundary`]): its rows are cut, its columns not.
             if let Some(::engine::Masking::Rows(masks)) = &mut lane.mask {
                 *masks = masks[a..b].to_vec();
             }
@@ -3047,6 +3095,27 @@ fn fold_at(
     })
 }
 
+/// A piece states the boundary its prepare found, which a cut pass that
+/// folds as it goes moves on from the one the pass was staged on: the
+/// columns of the lane's mask between the two are now committed slots, read
+/// as every committed slot is, and the mask starts past them.
+fn restate_boundary(lane: &mut ::engine::Lane, folded: u64) {
+    let folded = u32::try_from(folded).unwrap_or(u32::MAX).min(lane.kv.held);
+    let moved = u64::from(folded.saturating_sub(lane.kv.folded));
+    if moved > 0 {
+        match &mut lane.mask {
+            Some(::engine::Masking::Extent(mask)) => *mask = mask.after(moved),
+            Some(::engine::Masking::Rows(masks)) => {
+                for mask in masks.iter_mut() {
+                    *mask = mask.after(moved);
+                }
+            }
+            None => {}
+        }
+    }
+    lane.kv.folded = lane.kv.folded.max(folded);
+}
+
 /// The last step of a piece's prepare on a working set it writes from
 /// `start`: its log begins there, and what it folds by a count the host
 /// knows is frozen through `freeze`. A piece that starts inside what the
@@ -3713,7 +3782,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             &full,
             cuttable,
             rs_ws_ids.is_empty(),
-            prefill_share(page_size, engine),
+            mask_share(&full, prefill_share(page_size, engine), &stores, engine),
             page_size,
             &forced,
             &switched.tails,
@@ -4003,6 +4072,11 @@ pub async fn submit_pass_stamped<C: FireContext>(
                         return Ok(Err(reason));
                     }
                 };
+                for &lane in lanes {
+                    if let Some(lane) = req.lanes.get_mut(lane) {
+                        restate_boundary(lane, folded);
+                    }
+                }
                 let Some(seq) = seq else {
                     let reason = format!(
                         "pipeline: a fire writes slot {}, inside its working set's frozen \
@@ -5126,7 +5200,7 @@ async fn fire_device_geometry<C: FireContext>(
             } else {
                 None
             };
-            Ok::<_, crate::store::kv::KvStoreError>((seq, pages))
+            Ok::<_, crate::store::kv::KvStoreError>((seq, pages, cut))
         });
         match entry {
             Ok(entry) => logged.push(entry),
@@ -5265,14 +5339,21 @@ async fn fire_device_geometry<C: FireContext>(
     let plain_decode =
         !reads_each_other && switched.plain() && plain_decode(&req, lora_program, fire_wide_mask);
     let mut parts = Vec::with_capacity(group_sets.len());
-    for (((((set, (log_seq, log_pages)), lease), kvtxn), (_, lanes)), &stated) in group_sets
-        .iter()
-        .zip(logged)
-        .zip(leases)
-        .zip(kvtxns)
-        .zip(&groups)
-        .zip(&stated)
+    for (((((set, (log_seq, log_pages, boundary)), lease), kvtxn), (_, lanes)), &stated) in
+        group_sets
+            .iter()
+            .zip(logged)
+            .zip(leases)
+            .zip(kvtxns)
+            .zip(&groups)
+            .zip(&stated)
     {
+        // Each lane's mask speaks of the slots from the set's boundary on.
+        for &lane in lanes {
+            if let Some(lane) = req.lanes.get_mut(lane) {
+                lane.kv.folded = u32::try_from(boundary).unwrap_or(u32::MAX);
+            }
+        }
         let mut tags = Vec::new();
         let rows = match log_pages.filter(|_| plain_decode) {
             Some(pages) => LogRows::Reported {
@@ -5880,12 +5961,27 @@ mod static_admission_tests {
         // the fires' instances: 1 reserved first, 2 second.
         let cases: [(&str, Submissions); 7] = [
             ("in reservation order", vec![vec![vec![1, 2]]]),
-            ("the seal leaves the earlier frame for later", vec![vec![vec![2]], vec![vec![1]]]),
+            (
+                "the seal leaves the earlier frame for later",
+                vec![vec![vec![2]], vec![vec![1]]],
+            ),
             ("a held prompt waits a wave", vec![vec![vec![2], vec![1]]]),
-            ("the earlier lane stands later in the wave", vec![vec![vec![2, 1]]]),
-            ("a boundary falls between them", vec![vec![vec![2]], vec![vec![1]]]),
-            ("the later is a rider ahead of the framed", vec![vec![vec![2]], vec![vec![1]]]),
-            ("the later is framed ahead of a rider", vec![vec![vec![2]], vec![vec![1]]]),
+            (
+                "the earlier lane stands later in the wave",
+                vec![vec![vec![2, 1]]],
+            ),
+            (
+                "a boundary falls between them",
+                vec![vec![vec![2]], vec![vec![1]]],
+            ),
+            (
+                "the later is a rider ahead of the framed",
+                vec![vec![vec![2]], vec![vec![1]]],
+            ),
+            (
+                "the later is framed ahead of a rider",
+                vec![vec![vec![2]], vec![vec![1]]],
+            ),
         ];
         let limits = crate::engine::SchedulerLimits {
             max_forward_requests: 8,
@@ -6229,7 +6325,14 @@ mod rung_wait_tests {
 
     /// The pieces a pass of `req` is cut to at `engine`'s cap now.
     fn cut_now(engine: usize, req: &crate::engine::FireRequest) -> Vec<(u32, u32)> {
-        super::host_cuts(req, true, crate::store::shared::fire_cap(engine), 16, &[], 0)
+        super::host_cuts(
+            req,
+            true,
+            crate::store::shared::fire_cap(engine),
+            16,
+            &[],
+            0,
+        )
     }
 
     /// At ready the pool stands at its top rung on every engine, told rungs
@@ -6287,10 +6390,17 @@ mod rung_wait_tests {
         const ENGINE: usize = 66;
         let stores = told_at_the_floor(ENGINE);
         let shared = stores.shared.clone().expect("a shared pool");
-        let ask = super::ask_rung(&stores, ENGINE, uuid::Uuid::new_v4(), 33, 33)
-            .expect("33 rows ask");
-        assert!(ask.raise.is_some(), "the raise is in flight: the engine is told first");
-        assert_eq!(crate::store::shared::fire_cap(ENGINE), 1, "nothing wider yet");
+        let ask =
+            super::ask_rung(&stores, ENGINE, uuid::Uuid::new_v4(), 33, 33).expect("33 rows ask");
+        assert!(
+            ask.raise.is_some(),
+            "the raise is in flight: the engine is told first"
+        );
+        assert_eq!(
+            crate::store::shared::fire_cap(ENGINE),
+            1,
+            "nothing wider yet"
+        );
 
         let ask = std::sync::Arc::new(ask);
         let waiting = tokio::spawn({
@@ -6298,20 +6408,20 @@ mod rung_wait_tests {
             async move { ask.raised().await }
         });
         settle().await;
-        assert!(!waiting.is_finished(), "the pass is not cut at the rung standing");
+        assert!(
+            !waiting.is_finished(),
+            "the pass is not cut at the rung standing"
+        );
 
         // The walk takes the raise through the engine's lane.
         let lane = Lane {
             engine: ENGINE,
             told: std::sync::Mutex::new(Vec::new()),
         };
-        let taken = crate::store::shared::programs::take_raise(
-            &shared,
-            |pool| pool.rung_for(33),
-            &lane,
-        )
-        .await
-        .unwrap();
+        let taken =
+            crate::store::shared::programs::take_raise(&shared, |pool| pool.rung_for(33), &lane)
+                .await
+                .unwrap();
         assert!(taken.is_some());
         assert_eq!(*lane.told.lock().unwrap(), [(1, 64)]);
         tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
@@ -6335,8 +6445,8 @@ mod rung_wait_tests {
         let stores = told_at_the_floor(ENGINE);
         // As the walker says once a raise meets the span yield gave back.
         crate::store::shared::hold_rung(ENGINE, true);
-        let ask = super::ask_rung(&stores, ENGINE, uuid::Uuid::new_v4(), 33, 33)
-            .expect("33 rows ask");
+        let ask =
+            super::ask_rung(&stores, ENGINE, uuid::Uuid::new_v4(), 33, 33).expect("33 rows ask");
         assert!(ask.raise.is_some());
         tokio::time::timeout(std::time::Duration::from_secs(5), ask.raised())
             .await
@@ -7791,7 +7901,12 @@ pub(crate) mod fold_tests {
         cursor: &CursorCell,
         failure: &PipelineFailure,
         fold: &geometry::Fold,
-    ) -> (crate::engine::WorkItemCompletion, u64, PendingFire, Unqueued) {
+    ) -> (
+        crate::engine::WorkItemCompletion,
+        u64,
+        PendingFire,
+        Unqueued,
+    ) {
         let stores = crate::store::registry::get(kv.model, kv.engine);
         let pass = lanes_on(&stores, kv.id, &[cursor]);
         let mut req = request(1);
@@ -8060,10 +8175,7 @@ pub(crate) mod fold_tests {
                 }
                 fork.await?.expect("the fold was placed")
             };
-            assert!(
-                flight.length() == (7, true, 0),
-                "{child:?}"
-            );
+            assert!(flight.length() == (7, true, 0), "{child:?}");
             let pages = {
                 let mut kv = flight.stores.kv.lock();
                 let forked = kv.fork(flight.kv.id).unwrap();
@@ -8143,7 +8255,10 @@ pub(crate) mod fold_tests {
             );
             match ended {
                 "dropped" | "no count" => {
-                    assert_eq!(refused, format!("working set: {}", crate::store::kv::page_table::UNPLACED));
+                    assert_eq!(
+                        refused,
+                        format!("working set: {}", crate::store::kv::page_table::UNPLACED)
+                    );
                     assert!(flight.failure.lock().unwrap().is_none(), "{ended}");
                 }
                 _ => assert!(
@@ -8167,10 +8282,7 @@ pub(crate) mod fold_tests {
         );
         let refused = fork.now_or_never().expect("it never hangs")?;
         let unreported = RsError::DeviceFoldFailed(RsDeviceFold::UNREPORTED.to_string());
-        assert_eq!(
-            refused.map(|_| ()),
-            Err(unreported.to_string())
-        );
+        assert_eq!(refused.map(|_| ()), Err(unreported.to_string()));
         Ok(())
     }
 
@@ -8901,8 +9013,13 @@ mod unfolded_tests {
                         // Anywhere from its state to the furthest row written:
                         // on, or rewound over rows it rejects.
                         let first = folded + pick(end - folded + 1);
-                        let reads =
-                            ::engine::fire::buffered_reads(None, folded, first, fire.own).unwrap();
+                        let reads = ::engine::fire::buffered_reads(
+                            None,
+                            folded,
+                            first,
+                            ::engine::fire::Lineage::Set,
+                        )
+                        .unwrap();
                         let carried: u32 = reads.iter().map(|span| span.end - span.start).sum();
                         assert!(
                             carried <= fire.stated,
@@ -9282,11 +9399,7 @@ mod unfolded_tests {
             };
             // A count the host knows over a folded length it knows is a
             // slot; the device's count is placed when the fire settles.
-            assert_eq!(
-                matches!(by, Some(FoldBy::Settled { .. })),
-                counts,
-                "{what}"
-            );
+            assert_eq!(matches!(by, Some(FoldBy::Settled { .. })), counts, "{what}");
             assert_eq!(req.lanes[0].reports != 0, counts, "{what}");
             assert_eq!(untagged_device_fold(&req), None, "{what}");
         }
@@ -9399,5 +9512,69 @@ mod unfolded_tests {
         // what it reserved is buffered, and is no count of what it carries.
         let ahead = groups(device(13 + 64).expect("planned whatever it reserved"));
         assert_eq!(ahead[0].writes, Some(13..13 + 64));
+    }
+}
+
+#[cfg(test)]
+mod mask_cut_tests {
+    use super::*;
+
+    /// A mask plane fits the room of the rung its piece runs at, `max(t *
+    /// t, max_context)` bits, by cutting rows and never by refusing: a
+    /// long buffer takes more fires, down to one row a fire, and a row
+    /// over any buffer the context holds fits.
+    #[test]
+    fn a_masked_pass_is_cut_to_the_room_of_its_rung() {
+        let rung = |r: u32| u64::from(r.next_power_of_two().max(16));
+        // An empty buffer: a full-width prompt fits its own rung.
+        assert_eq!(mask_rows(512, 512, 4096, rung), 512);
+        // A prompt of 512 over a buffer of 3584: 512 * 4096 bits is past
+        // what a 512-token rung holds (512 * 512 = 262144, or 4096).
+        let r = mask_rows(512, 3584 + 512, 4096, rung);
+        assert!(u64::from(r) * 4096 <= rung(r) * rung(r) || u64::from(r) * 4096 <= 4096);
+        assert!(r < 512 && r >= 1);
+        // One row over a buffer as long as the context fits.
+        assert_eq!(mask_rows(1, 4096, 4096, rung), 1);
+        // A decode row over 100,000 buffered keys: one row a fire.
+        assert_eq!(mask_rows(64, 100_001, 131_072, |r| u64::from(r)), 1);
+    }
+
+    /// A piece of a cut pass that folds as it goes states the boundary its
+    /// prepare found, and its mask starts past the columns between.
+    #[test]
+    fn a_piece_restates_the_boundary_and_its_mask_starts_there() {
+        let bits = [true, false, true, true, false, true];
+        let mut runs = vec![0u32];
+        let mut keeping = false;
+        for &bit in &bits {
+            if bit != keeping {
+                runs.push(0);
+                keeping = bit;
+            }
+            *runs.last_mut().unwrap() += 1;
+        }
+        let mask = ::engine::Mask::new(runs, bits.len() as u64);
+        let mut lane = ::engine::Lane {
+            tokens: vec![0; 2],
+            kv: ::engine::KvDelta {
+                held: 14,
+                folded: 10,
+                ..Default::default()
+            },
+            mask: Some(::engine::Masking::Rows(vec![mask.clone(), mask.clone()])),
+            ..::engine::Lane::default()
+        };
+        restate_boundary(&mut lane, 12);
+        assert_eq!(lane.kv.folded, 12);
+        let Some(::engine::Masking::Rows(masks)) = &lane.mask else {
+            panic!("the lane keeps a mask a row");
+        };
+        assert_eq!(masks[0], mask.after(2));
+        // A boundary past the lane's first row is the lane's first row.
+        restate_boundary(&mut lane, 20);
+        assert_eq!(lane.kv.folded, 14);
+        // One behind what the lane states moves nothing.
+        restate_boundary(&mut lane, 3);
+        assert_eq!(lane.kv.folded, 14);
     }
 }

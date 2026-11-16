@@ -2310,8 +2310,7 @@ pub fn attend_fresh(
                     || f.view_parts(keys).map(|v| v.0) == f.view_parts(values).map(|v| v.0)
                         // pages in the row-pair order (rows of whole pairs)
                         && f.view_order(keys).is_some()
-                        && f.view_order(keys) == f.view_order(values)
-                        && crate::blocks::on())
+                        && f.view_order(keys) == f.view_order(values))
                 && super::pages::fits(geom.span, &heads, tuning.vmem_cap()) =>
         {
             // A decode's rows copy their own pages; a fire whose rows carry
@@ -2903,7 +2902,6 @@ fn append_pool_planes(
     let w = i64::from(keys.width);
     let slots = i64::from(keys.rows);
     if pool != pool_v
-        || !crate::blocks::on()
         || f.view_order(keys.val) != f.view_order(values.val)
         || values.width != keys.width
         || k.width != keys.width

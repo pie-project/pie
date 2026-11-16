@@ -225,7 +225,7 @@ fn dense_affine(
     if y.rows == 0 {
         return Ok(());
     }
-    let cus = ctx.multiprocessors().unwrap_or(304).max(1);
+    let cus = ctx.multiprocessors(op)?;
     let axis = offset.axis();
     if y.rows > Stream::ROWS
         && let Some(tile) = Tile::plan(bits, group, offset, k, y.rows)

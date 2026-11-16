@@ -131,14 +131,6 @@ pub fn retired() -> Vec<poem_compiler::fuse::Rule> {
     ]
 }
 
-/// The fused kernels left on with `fuse-chains=off`: none on CUDA, the
-/// residual norms being generated row kernels.
-#[cfg(not(feature = "rocm"))]
-pub const UNCHAINED: &[&str] = &[];
-/// On ROCm the hand residual norm stays on with `fuse-chains=off` (as on main).
-#[cfg(feature = "rocm")]
-pub const UNCHAINED: &[&str] = &["fused.residual_add_rmsnorm"];
-
 /// What `op` reads of a seat's rows: the seat table's entry for its name,
 /// but a gated unit of routed rows (each times its route's weight) reads
 /// routed rows, none of the seat's, a predicted route only the prediction's,
@@ -204,20 +196,6 @@ pub use window::{Cursor, Window, WindowShape, Windows};
 mod tests {
     use poem_ir::Operation;
 
-    /// What `fuse-chains=off` keeps is a rule this backend holds.
-    #[test]
-    fn what_fuse_chains_off_keeps_is_a_rule_held() {
-        let held: Vec<&str> = super::FUSIONS
-            .iter()
-            .map(poem_compiler::fuse::Rule::kernel)
-            .collect();
-        let stray: Vec<&&str> = super::UNCHAINED
-            .iter()
-            .filter(|k| !held.contains(k))
-            .collect();
-        assert!(stray.is_empty(), "kept, and no rule: {stray:?}");
-    }
-
     /// Every table this backend keys by op name names an op: an entry under
     /// a name no op carries is never read, and the op it meant falls to the
     /// table's default without a word.
@@ -227,7 +205,6 @@ mod tests {
             .iter()
             .map(|entry| entry.name)
             .chain(super::FUSIONS.iter().map(poem_compiler::fuse::Rule::kernel))
-            .chain(super::UNCHAINED.iter().copied())
             .chain(super::GROUPED)
             .chain(super::PLANNED)
             .chain(super::EXCLUSIVE)

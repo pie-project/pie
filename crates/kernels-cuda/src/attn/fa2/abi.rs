@@ -118,6 +118,10 @@ pub struct PrefillPagedParams {
     pub token_pos_in_items_len: u32,
     pub maybe_max_item_len_ptr: DevicePtr,
     pub maybe_sinks: DevicePtr,
+    /// Per request, the committed boundary its mask speaks of the keys past
+    /// (bits 0-30) and whether its rows read both ways (bit 31); null: every
+    /// boundary 0 and every row wide (`variants.cuh`).
+    pub maybe_mask_origin: DevicePtr,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
