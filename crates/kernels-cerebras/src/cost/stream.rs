@@ -3,9 +3,9 @@
 //!
 //! - P1-stream: the busiest weight PE's tile elements a row x [`P1_STREAM`] (M1c: 0.545 - 0.572
 //!   cycles an element, f32 accumulation).
-//! - P4 regions: their ops over the chunk at [`REGION_OP`] an element, [`ALL_REDUCE`] a segment
-//!   all-reduce, [`ROTATION`] a rotation's P5 digit products (v0's scalar loops, M1c's measured
-//!   region cycles).
+//! - P4 regions: their ops over the chunk at [`DSD_ELEM`] an element, [`ALL_REDUCE`] a segment
+//!   all-reduce, a rotation's P5 tables by the levels it recomputes a row ([`ROT_CALL`],
+//!   [`ROT_CHANGE`], [`ROT_LEVEL`]).
 //! - P7: [`STORE`] a stored row, [`QUERY`] a query (M1c, 16 entries a PE).
 //!
 //! A unit's phase costs its rows x its slowest PE a row (the PEs of a unit pipeline the rows);
@@ -33,8 +33,19 @@ pub const SUM_LEVEL: f64 = 20.0;
 pub const SCALAR_MATH: f64 = 60.0;
 /// A segment all-reduce over a unit's CX roots.
 pub const ALL_REDUCE: f64 = 210.0;
-/// A position's cos / sin from P5 tables (one axis: LV levels of NROT-wide products).
-pub const ROTATION: f64 = 1_215.0;
+/// A position's cos / sin from P5 tables (`ops/srope.csl`: LV levels of NROT-wide products, the
+/// levels above the highest digit that changed kept from the row before). A call (an axis's
+/// tables) costs [`ROT_CALL`] (its table offsets, the test against the last position, its share
+/// of the rotation's strided moves); a row whose position moved, [`ROT_CHANGE`] (the digits'
+/// test) and [`ROT_LEVEL`] a level recomputed. Rows are taken to reach a root with one axis
+/// advancing a step a row (a raster of cells, a token index): `2^B / (2^B - 1)` levels a row at
+/// `B` bits a digit, every other axis holding. Fitted on the simulator (`prims/reg`, a per-head
+/// RMS norm and four-axis rotation, 2 x 128, LV 4, BITS 3): 2,821 cycles a row with every
+/// position held, 3,435 with one axis advancing a row, 7,663 with every level of every axis
+/// recomputed (M2a's tables, recomputed whole every row: 7,011).
+pub const ROT_CALL: f64 = 170.0;
+pub const ROT_CHANGE: f64 = 429.0;
+pub const ROT_LEVEL: f64 = 152.0;
 /// The row store: a held word cast out or summed back, a hop of the row chain.
 pub const STORE_WORD: f64 = 1.0;
 pub const CHAIN_HOP: f64 = 2.0;
@@ -55,6 +66,8 @@ pub struct RegionFeatures {
     pub scalar_math: f64,
     pub all_reduces: f64,
     pub rotations: f64,
+    /// The rotation tables' bits a digit (`srope.csl`'s `BITS`; 0 without tables).
+    pub rope_bits: f64,
 }
 
 impl RegionFeatures {
@@ -67,6 +80,14 @@ impl RegionFeatures {
             return f;
         };
         let c = f64::from(chunk);
+        if let Some(i) = csl.find("ops/srope.csl") {
+            f.rope_bits = csl[i..]
+                .split(".BITS = ")
+                .nth(1)
+                .and_then(|t| t.split(|ch: char| !ch.is_ascii_digit()).next())
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0.0);
+        }
         for line in csl[at..].lines().skip(1) {
             if line.starts_with('}') {
                 break;
@@ -109,8 +130,26 @@ impl RegionFeatures {
     /// Cycles a row.
     #[must_use]
     pub fn cycles(&self, chunk: u32) -> f64 {
+        self.cycles_reps(chunk, 1)
+    }
+
+    /// The tables' levels recomputed a row (once a row however many calls read the row's
+    /// positions: the calls after the first find them held).
+    #[must_use]
+    pub fn rotation_advance(&self) -> f64 {
+        if self.rotations == 0.0 {
+            return 0.0;
+        }
+        let d = self.rope_bits.max(1.0).exp2();
+        ROT_CHANGE + ROT_LEVEL * d / (d - 1.0)
+    }
+
+    /// Cycles a row of `reps` runs of the region over a root's heads (the row's positions
+    /// moving the tables once).
+    #[must_use]
+    pub fn cycles_reps(&self, chunk: u32, reps: u32) -> f64 {
         let levels = f64::from(chunk.max(2)).log2().ceil();
-        self.dsd_ops * DSD_OP
+        let one = self.dsd_ops * DSD_OP
             + self.dsd_elems * DSD_ELEM
             + self.exp_elems * EXP_ELEM
             + self.recip_elems * RECIP_ELEM
@@ -118,7 +157,8 @@ impl RegionFeatures {
             + self.sums * levels * SUM_LEVEL
             + self.scalar_math * SCALAR_MATH
             + self.all_reduces * ALL_REDUCE
-            + self.rotations * ROTATION
+            + self.rotations * ROT_CALL;
+        f64::from(reps.max(1)) * one + self.rotation_advance()
     }
 }
 
@@ -176,7 +216,7 @@ fn region_cycles(p: &Program, u: usize, step: usize) -> f64 {
                 + (np * c + np * q + 2.0 * nout * q) * DSD_ELEM
                 + (np + nout) * (c - q) * FABRIC_WORD
         }
-        _ => f64::from(at.reps) * RegionFeatures::of(&printed.csl, at.chunk).cycles(at.chunk),
+        _ => RegionFeatures::of(&printed.csl, at.chunk).cycles_reps(at.chunk, at.reps),
     }
 }
 
@@ -470,6 +510,24 @@ mod tests {
         assert_eq!((f.dsd_ops, f.dsd_elems), (3.0, 384.0));
         assert_eq!((f.sums, f.sum_elems), (3.0, 256.0));
         assert_eq!((f.scalar_math, f.all_reduces), (2.0, 1.0));
+    }
+
+    /// A rotation's tables priced by the levels a row recomputes: once a row (a head region's
+    /// later heads find the positions held), each call its fixed cost.
+    #[test]
+    fn a_rotation_is_priced_by_the_levels_it_recomputes() {
+        let csl = "const rp = @import_module(\"ops/srope.csl\", .{ .rot = &T_rot_a, .rc = &rc, \
+                   .rs = &rs, .NROT = 64, .LV = 4, .BITS = 3 });\nfn row() void {\n  \
+                   rp.tables(@as(u32, sc2), b, b, n);\n  rp.tables(@as(u32, sc3), b, b, n);\n}\n";
+        let f = RegionFeatures::of(csl, 128);
+        assert_eq!((f.rotations, f.rope_bits), (2.0, 3.0));
+        let advance = ROT_CHANGE + ROT_LEVEL * 8.0 / 7.0;
+        assert!((f.cycles(128) - (2.0 * ROT_CALL + advance)).abs() < 1e-9);
+        assert!((f.cycles_reps(128, 5) - (10.0 * ROT_CALL + advance)).abs() < 1e-9);
+        assert_eq!(
+            RegionFeatures::of("fn row() void {\n}\n", 128).rotation_advance(),
+            0.0
+        );
     }
 
     /// P7 v1's columns: flux at 1024² (4,608 rows, a q head of 128 a kv head) takes about a
