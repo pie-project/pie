@@ -44,7 +44,7 @@ const USAGE: &str = "usage: wafer-compile plan (--model <deployment> | --shape <
      --build <dir> [--fabric simulator|system]\n       wafer-compile cost --plan <plan.json>\n       \
      wafer-compile search --model <deployment> [--positions N] [--set K=V,...] [--keep N]\n       \
      wafer-compile stream --model <deployment> [--reading R] [--rows N] [--ieee] --out <dir> \
-     [--values <dir>] [--stages N] [--tap v,..] [--py N] [--tile W] [--spill] \
+     [--regime auto|stream|gemm|tiled] [--gemm C,R,KBM] [--values <dir>] [--stages N] [--tap v,..] [--py N] [--tile W] [--spill] \
      [--cut THIN,SUB,WIDEN,HELP] [--fabric-width W] [--class-rows context=512,latents=4096] \
      [--price context=512,latents=4096 [--parts]] [--clip t,h,w]";
 
@@ -423,6 +423,35 @@ fn stream(args: &[String]) -> Result<(), String> {
         upto,
         taps,
     };
+    // with nothing pinned, the regime and its every choice the engine's compile on load makes
+    // (`stream::compile_whole`, by the regimes' expected prices); `--regime stream|gemm` and the
+    // levers pin them (debugging)
+    let pins = [
+        "--regime",
+        "--gemm",
+        "--py",
+        "--tile",
+        "--cut",
+        "--spill",
+        "--fabric-width",
+        "--price",
+        "--values",
+        "--emulate",
+    ];
+    if get("--regime").as_deref() == Some("auto")
+        || !args.iter().any(|a| pins.contains(&a.as_str()))
+    {
+        let crow = kernels_cerebras::stream::parse_rows(&get("--class-rows").unwrap_or_default())?;
+        let (w, h) =
+            kernels_cerebras::stream::compile_whole(&trace, &o, &crow, std::path::Path::new(&out))?;
+        let gemm = std::fs::read_to_string(std::path::Path::new(&out).join("stream.json"))
+            .is_ok_and(|t| t.contains("\"regime\": \"gemm\""));
+        println!(
+            "{model} {reading}: the {} regime, {w} x {h} PEs (compile on load's choice)",
+            if gemm { "GEMM" } else { "stream" }
+        );
+        return Ok(());
+    }
     if get("--regime").as_deref() == Some("gemm") {
         // the GEMM regime (M2f): the reading over the whole fabric, `--gemm C,R,KBM` its array
         // and key block pinned

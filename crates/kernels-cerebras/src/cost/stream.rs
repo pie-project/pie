@@ -245,6 +245,20 @@ pub fn query_cycles(rows: u32, pya: u32, q_heads: u32) -> f64 {
     QUERY + QUERY_ENTRY * f64::from(ne * q_heads)
 }
 
+/// What a step measures over [`time`]'s price, at the least over every stream program run:
+/// flux2-mini's 16 + 16 step (57 x 62, one band) 1.127M cycles on the simulator, 1.239M on a
+/// system, priced 0.80M (1.41x, 1.55x); klein-4B's 64 + 64 step 69.67M on a system (730 x 1148)
+/// and its 1024² step 2,651M (741 x 1152, priced 1,081M: 2.45x). The price's terms miss what
+/// those steps spend between units (GENERIC.md K1); a regime's choice ([`expected`]) reads the
+/// price so corrected, the stream search's own choices (one model, one factor) unchanged.
+pub const MEASURED: f64 = 1.41;
+
+/// The step time a run of `p` is expected to measure: [`time`] by [`MEASURED`].
+#[must_use]
+pub fn expected(p: &Program) -> f64 {
+    time(p).cycles * MEASURED
+}
+
 /// The step time of `p`.
 #[must_use]
 pub fn time(p: &Program) -> StreamCost {

@@ -30,6 +30,11 @@ pub const PIECE: f64 = 280.0;
 /// A `mac32` instruction's fixed cycles and an element's (16-bit operands, f32 accumulation).
 pub const MAC_CALL: f64 = 1.84;
 pub const MAC_ELEM: f64 = 0.5;
+/// A `mac32`'s loop around it in `mv.csl` (its operands' DSDs stepped, the count), fitted to a
+/// klein-shaped slice on the simulator: flux2-mini at `tb` 8 (32 x 4 PEs, 16 + 16 rows; a GEMM's
+/// piece `8 x 8` of an `8 x 8` block, klein's at 1024²) measured 2,527,668 cycles a step where the
+/// rest of this model prices 1.936M, its 127k `mac32`s the difference (4.65 each).
+pub const MAC_LOOP: f64 = 4.65;
 /// A PE's hop of an all-reduce's chain (an `fadds` from the fabric into the fabric).
 pub const HOP: f64 = 12.0;
 /// A DSD op's fixed cycles.
@@ -78,7 +83,7 @@ impl GemmCost {
 }
 
 fn mac(n: u32) -> f64 {
-    MAC_CALL + MAC_ELEM * f64::from(n)
+    MAC_CALL + MAC_LOOP + MAC_ELEM * f64::from(n)
 }
 
 /// An all-reduce of `n` words over `members` PEs.
@@ -87,6 +92,15 @@ fn allred(n: u32, members: u32) -> f64 {
         return 0.0;
     }
     2.0 * f64::from(n) + f64::from(members) * HOP + 2.0 * CALL
+}
+
+/// What a step measures over [`time`]'s price (its terms fitted to the simulator's runs).
+pub const MEASURED: f64 = 1.0;
+
+/// The step time a run of `p` is expected to measure: [`time`] by [`MEASURED`].
+#[must_use]
+pub fn expected(p: &GemmProgram) -> f64 {
+    time(p).cycles * MEASURED
 }
 
 /// The program's time.

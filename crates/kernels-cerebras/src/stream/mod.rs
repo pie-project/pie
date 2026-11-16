@@ -468,31 +468,33 @@ pub fn compile_reading(trace: &Trace, o: &Options, out: &std::path::Path) -> R<(
         let clip = grid::clip_of(trace, &o.reading, o.rows);
         return compile_grid(trace, &o.reading, clip, o.round16, out);
     }
-    compile_whole(trace, o, out)
+    compile_whole(trace, o, &[], out)
 }
 
 /// A whole-sequence reading's regime, by price: the stream regime's program (rows through
 /// units) and the GEMM regime's ([`gemm`]: every op over the whole fabric), the cheaper of those
 /// that place within a system's fabric. Returns the fabric's size.
-pub fn compile_whole(trace: &Trace, o: &Options, out: &std::path::Path) -> R<(u32, u32)> {
+pub fn compile_whole(
+    trace: &Trace,
+    o: &Options,
+    class_rows: &[(String, u32)],
+    out: &std::path::Path,
+) -> R<(u32, u32)> {
     let b = crate::floorplan::stream::Bounds::system();
     let st = shape(
         trace,
         &o.reading,
-        &program::classes(trace, &o.reading, o.rows),
+        &with_rows(program::classes(trace, &o.reading, o.rows), class_rows),
     )
     .and_then(|s| {
         build::program_py(
             trace, s, o.round16, o.upto, &o.taps, None, None, None, false, b,
         )
     });
-    let gm = gemm::program(trace, o, &[], None, (b.w, b.h));
-    let sc = st
-        .as_ref()
-        .map_or(f64::MAX, |p| crate::cost::stream::time(p).cycles);
-    let gc = gm
-        .as_ref()
-        .map_or(f64::MAX, |p| crate::cost::gemm::time(p).cycles);
+    let gm = gemm::program(trace, o, class_rows, None, (b.w, b.h));
+    // (each regime's price as its runs measure it)
+    let sc = st.as_ref().map_or(f64::MAX, crate::cost::stream::expected);
+    let gc = gm.as_ref().map_or(f64::MAX, crate::cost::gemm::expected);
     match (st, gm) {
         (Ok(p), Ok(_)) if sc <= gc => {
             write_stream(&p, o, out, None)?;
