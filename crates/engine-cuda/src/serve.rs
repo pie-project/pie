@@ -781,7 +781,13 @@ impl Shell {
         &mut self,
         registration: &engine::program::ProgramRegistration,
     ) -> Result<engine::ProgramId> {
-        self.programs.register(&self.device, registration)
+        let before = self.programs.built_late();
+        let registered = self.programs.register(&self.device, registration);
+        let late = self.programs.built_late() - before;
+        if late != 0 {
+            self.live.tally(engine::live::Tally::BuiltAfterReady, late);
+        }
+        registered
     }
 
     #[allow(clippy::too_many_arguments)]

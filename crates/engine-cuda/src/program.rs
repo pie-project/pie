@@ -11,13 +11,13 @@ use std::collections::BTreeMap;
 use engine::channel::ChannelId;
 use engine::ports::Envelope;
 use engine::program::{InstanceId, ProgramId, ProgramRegistration};
-use eta_exec::{Boundaries, ExecPlan, Extents, Versions, adopt_launch_package_with};
+use eta_exec::{Boundaries, ExecPlan, Extents, adopt_launch_package_with};
 use eta_ir::registry::{GeometryClass, PortMask, Stage as Attach};
 
 use crate::device::Context;
 use crate::error::{Fault, Result};
 
-pub use compile::{Cache, Compiled, Disk, Module, Region, Stage, Target};
+pub use compile::{Cache, Compiled, Disk, Module, Stage, Step, Target};
 pub use endpoint::Endpoint;
 pub use launch::{
     ChannelShape, Cursor, Held, Place, Prepared, Rings, describe_values, scratch_bytes,
@@ -71,7 +71,7 @@ impl Program {
                 .compiled
                 .stages
                 .get(index)
-                .is_some_and(|stage| !stage.regions.is_empty());
+                .is_some_and(|stage| !stage.steps.is_empty());
             stages.push(if launches {
                 Some(Prepared::build(stage_plan, &shapes, extents)?)
             } else {
@@ -96,6 +96,25 @@ fn fire_bytes(stages: &[Option<Prepared>], flight: u32) -> FireBytes {
             .min(flight)
             .max(1),
     }
+}
+
+/// Where stage `index`'s tables lie for a flight of `members`: in its first
+/// instance's item, the same bytes every member's holds.
+fn tables_of(
+    instances: &BTreeMap<InstanceId, Bound>,
+    members: &[InstanceId],
+    index: usize,
+) -> Result<[u64; 4]> {
+    members
+        .first()
+        .and_then(|first| instances.get(first))
+        .and_then(|bound| bound.session.tables(index))
+        .ok_or_else(|| {
+            Fault::program(
+                "program::plane",
+                format!("a flight's first instance lays no tables for stage {index}"),
+            )
+        })
 }
 
 fn at_point<'a>(stages: &'a mut [Option<Prepared>], runs: &[bool]) -> Vec<&'a mut Prepared> {
@@ -184,10 +203,6 @@ pub struct Plane {
     /// count of lanes ([`Plane::fire_term`]): built when an instance is
     /// bound or closed ([`Plane::fit_term`]), never in a fire.
     term: engine::GuestTerm,
-    /// How the last fire laid that span: each group's program, extents and
-    /// lanes, in order. A fire that lays it the same finds its bind-time
-    /// tables where it staged them.
-    laid: Vec<(ProgramId, Extents, u32)>,
 }
 
 /// What a fire of one program at one bind's extents takes of the fire's
@@ -203,11 +218,10 @@ pub struct FireBytes {
 /// The lanes a flight of `members` instances is laid for: the power of two
 /// over them, stated to the runtime in `engine::FireFacts::laid`
 /// (`Session::fire_facts`). The lanes laid key what a stage keeps between
-/// fires: its lane table and descriptor rows are built again, and its
-/// tables staged again, whenever the lanes differ from the last lay
-/// (`launch::Prepared::lay`, and `Plane::fly`'s `laid`). A wave whose
-/// members come and go fire by fire stays in one layout at a power of two,
-/// where the exact count would build and stage the tables every fire. The
+/// fires: its lane table is built again whenever the lanes differ from the
+/// last lay (`launch::Prepared::lay`). A wave whose members come and go
+/// fire by fire stays in one layout at a power of two, where the exact
+/// count would build the table every fire. The
 /// guest term counts the same lanes, here and in the runtime
 /// (`engine::GuestTerm`), so a fire never lays more than the term its rung
 /// backs.
@@ -268,7 +282,6 @@ impl Plane {
             fire_lanes: 0,
             pairs: Vec::new(),
             term: engine::GuestTerm::default(),
-            laid: Vec::new(),
         }
     }
 
@@ -293,9 +306,6 @@ impl Plane {
     /// The fire in hand lays its programs in `span`: its end and the bytes
     /// backed below it.
     pub fn set_span(&mut self, span: (u64, u64)) {
-        if self.span != span {
-            self.laid.clear();
-        }
         self.span = span;
     }
 
@@ -399,6 +409,24 @@ impl Plane {
         self.cache.stats()
     }
 
+    /// Builds every kernel a guest stage can dispatch (the closed set) and
+    /// loads the channel kernels a fire runs around them, so that no
+    /// registration, bind or fire builds one: what a load does before
+    /// ready.
+    pub fn arm(&mut self, context: &Context) -> Result<()> {
+        self.cache.arm(&Target::of(context)?)?;
+        kernels_cuda::runtime::channel::load()
+            .map_err(|why| Fault::program("program::plane", format!("{why}")))?;
+        Ok(())
+    }
+
+    /// The kernels a registration built because the load had not: the
+    /// engine's `Tally::BuiltAfterReady` from registrations.
+    #[must_use]
+    pub const fn built_late(&self) -> u64 {
+        self.cache.built_late()
+    }
+
     pub fn register(
         &mut self,
         context: &Context,
@@ -408,13 +436,9 @@ impl Plane {
             return Ok(existing);
         }
         let plan = adopt_launch_package_with(registration.launch.clone(), Boundaries::CUDA)?;
-        let compiled = self.cache.compile(
-            registration.program_hash,
-            &plan,
-            &registration.emitted_kernels,
-            Versions::from_compiler(registration.emitter_version),
-            Target::of(context)?,
-        )?;
+        let compiled =
+            self.cache
+                .compile(registration.program_hash, &plan, Target::of(context)?)?;
         let id = ProgramId(self.next_program);
         self.next_program += 1;
         self.programs.insert(
@@ -457,7 +481,15 @@ impl Plane {
             .ok_or_else(|| Fault::program("program::plane", format!("no program {program_id}")))?;
         program.batch(extents)?;
         let program = &*program;
-        let place = slots.place(&Held::of(&program.plan.package.channels), span)?;
+        let stages = program
+            .batches
+            .iter()
+            .find(|batch| batch.extents == extents)
+            .map_or(&[][..], |batch| &batch.stages[..]);
+        let place = slots.place(
+            &Held::of(&program.plan.package.channels, &program.plan.package.plans),
+            span,
+        )?;
         let endpoints = endpoints_for(&program.plan, adopted, stream)?;
         let held = endpoints.clone();
         let mut session = match Session::bind(
@@ -467,6 +499,7 @@ impl Plane {
             extents,
             endpoints,
             &place,
+            stages,
             self.shadow,
             stream,
         ) {
@@ -498,7 +531,7 @@ impl Plane {
     pub fn held(&self, program_id: ProgramId) -> Result<Held> {
         self.programs
             .get(&program_id)
-            .map(|program| Held::of(&program.plan.package.channels))
+            .map(|program| Held::of(&program.plan.package.channels, &program.plan.package.plans))
             .ok_or_else(|| Fault::program("program::plane", format!("no program {program_id}")))
     }
 
@@ -509,9 +542,10 @@ impl Plane {
             let Some(program) = self.programs.get(&bound.program_id) else {
                 continue;
             };
-            let place = bound
-                .slots
-                .place(&Held::of(&program.plan.package.channels), span)?;
+            let place = bound.slots.place(
+                &Held::of(&program.plan.package.channels, &program.plan.package.plans),
+                span,
+            )?;
             bound.session.rebase(&place)?;
         }
         Ok(())
@@ -527,7 +561,10 @@ impl Plane {
         let program = self.programs.get(&bound.program_id).ok_or_else(|| {
             Fault::program("program::plane", format!("instance {id}'s program is gone"))
         })?;
-        let place = slots.place(&Held::of(&program.plan.package.channels), span)?;
+        let place = slots.place(
+            &Held::of(&program.plan.package.channels, &program.plan.package.plans),
+            span,
+        )?;
         bound.session.rebase(&place)?;
         bound.slots = slots;
         Ok(())
@@ -772,7 +809,6 @@ impl Plane {
             flight,
             at,
             fan,
-            laid,
             ..
         } = self;
         let at = *at;
@@ -788,27 +824,11 @@ impl Plane {
             }
         }
 
-        let mut meet = Vec::with_capacity(groups.len());
-        for (program_id, extents, _) in &groups {
-            let program = programs.get_mut(program_id).ok_or_else(|| {
-                Fault::program(
-                    "program::plane",
-                    format!("a staged fire names program {program_id}, which is gone"),
-                )
-            })?;
-            let runs: Vec<bool> = (0..program.compiled.stages.len())
-                .map(|index| program.plan.runs_at(index, at))
-                .collect();
-            let batch = program.batch(*extents)?;
-            meet.push(
-                at_point(&mut batch.stages, &runs)
-                    .iter()
-                    .any(|prepared| prepared.meets_across_blocks()),
-            );
-        }
+        // Every group's steps are launches a block apart, none waiting on
+        // another's blocks.
+        let meet = vec![false; groups.len()];
         // Each group's span, laid down from there: its flights fly one
         // after another in it, as wide as its widest.
-        let mut laying = Vec::with_capacity(groups.len());
         let mut places = Vec::with_capacity(groups.len());
         for (program_id, extents, members) in &groups {
             let program = programs.get_mut(program_id).ok_or_else(|| {
@@ -821,17 +841,13 @@ impl Plane {
             let lanes = flight_lanes(u32::try_from(members.len()).unwrap_or(u32::MAX))
                 .min(bytes.max_lanes)
                 .max(1);
-            laying.push((*program_id, *extents, lanes));
             places.push((lay(bytes.at(lanes))?, lanes));
         }
-        let fresh = *laid != laying;
-        *laid = laying;
         let streams = fan.fork(&meet, main)?;
         let flown = groups.into_iter().zip(streams).zip(places).try_for_each(
             |(((program_id, extents, members), stream), (base, lanes))| {
                 Plane::fly_group(
-                    programs, instances, program_id, extents, &members, lanes, base, fresh, at,
-                    stream,
+                    programs, instances, program_id, extents, &members, lanes, base, at, stream,
                 )
             },
         );
@@ -850,13 +866,12 @@ impl Plane {
         members: &[InstanceId],
         lanes: u32,
         base: u64,
-        fresh: bool,
         at: Attach,
         stream: *mut core::ffi::c_void,
     ) -> Result<()> {
         for flight in members.chunks(lanes.max(1) as usize) {
             Plane::fly_one(
-                programs, instances, program_id, extents, flight, lanes, base, fresh, at, stream,
+                programs, instances, program_id, extents, flight, lanes, base, at, stream,
             )?;
         }
         Ok(())
@@ -871,7 +886,6 @@ impl Plane {
         members: &[InstanceId],
         lanes: u32,
         base: u64,
-        fresh: bool,
         at: Attach,
         stream: *mut core::ffi::c_void,
     ) -> Result<()> {
@@ -890,7 +904,7 @@ impl Plane {
             // same at every point of the fire.
             let mut next = base;
             for prepared in batch.stages.iter_mut().flatten() {
-                next = prepared.lay(extents, lanes, next, fresh, stream)?;
+                next = prepared.lay(extents, lanes, next)?;
             }
             for instance in members {
                 let bound = instances.get_mut(instance).ok_or_else(|| {
@@ -927,9 +941,7 @@ impl Plane {
                 else {
                     continue;
                 };
-                for region in stage.regions.iter() {
-                    prepared.launch_region(region, stream)?;
-                }
+                prepared.launch_steps(stage, tables_of(instances, members, index)?, stream)?;
             }
         }
         Ok(())

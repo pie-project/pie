@@ -186,6 +186,28 @@ const _: () = assert!(
     "channel::Rings: a registry is four addresses, a slot count and its padding",
 );
 
+/// The kernels a guest fire runs around its stages: the pull, bump,
+/// publish and settle of its tickets, and the gathers a decode envelope's
+/// mask takes.
+const FIRE_KERNELS: [&str; 8] = [
+    "::pie::channel::gather_words",
+    "::pie::channel::pull_validate",
+    "::pie::channel::commit_bump",
+    "::pie::channel::scatter_publish",
+    "::pie::channel::settle",
+    "::pie::channel::mask_from_commit",
+    "::pie::channel::gather_bits",
+    "::pie::channel::gather_bit_runs",
+];
+
+/// Loads every kernel a guest fire runs ([`FIRE_KERNELS`]) on the current
+/// device, so that no fire builds one.
+pub fn load() -> Result<(), Error> {
+    FIRE_KERNELS
+        .iter()
+        .try_for_each(|name| kernel(FILE, name).load())
+}
+
 pub fn pull_validate(
     ctx: &Ctx,
     tickets: DevicePtr,

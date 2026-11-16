@@ -8,12 +8,12 @@
 //! at a bind, against the bind's extents; [`table_sizes`] is what they
 //! take, fixed by the stage's value and op counts.
 
-use eta_compiler::codegen::launch::LaunchStagePlan;
-use eta_compiler::codegen::{wgsl, wgsl_analysis};
+use eta_compiler::codegen::launch::{LaunchRegion, LaunchStagePlan};
+use eta_compiler::codegen::{steps, wgsl, wgsl_analysis};
 use eta_ir::op::tags;
 
 use crate::{
-    Extents, Launch, Launches, OpParams, SELECT_RESERVE, ValueDesc, describe, lay_out,
+    Extents, Launch, Launches, OpParams, SELECT_RESERVE, ValueDesc, describe_launched, lay_out,
     whole_value_temporaries,
 };
 
@@ -72,6 +72,9 @@ pub struct Stepping {
     /// The results of the reshapes not launched: their source's bytes
     /// ([`alias_reshapes`]).
     pub hollow: Vec<u32>,
+    /// A launched node takes the one-row select's ladder, whose state lies
+    /// just below the temporary area (`SELECT_RESERVE`).
+    pub selects: bool,
 }
 
 impl Stepping {
@@ -103,6 +106,13 @@ impl Stepping {
             .into_iter()
             .map(|(result, _)| result)
             .collect();
+        stepping.selects = launched.iter().any(|&node| {
+            let at = node as usize;
+            matches!(
+                steps::ladder_of(plan, at, plan.ops[at].tag),
+                steps::Ladder::Select { .. }
+            )
+        });
         stepping.launched = launched;
         stepping
     }
@@ -118,7 +128,7 @@ impl Stepping {
             staged: self.staged.clone(),
             kept: self.kept.clone(),
             hollow: self.hollow.clone(),
-            reserve: SELECT_RESERVE,
+            reserve: if self.selects { SELECT_RESERVE } else { 0 },
             temporary: whole_value_temporaries(descriptors).unwrap_or(u64::MAX),
         }
     }
@@ -166,15 +176,20 @@ pub struct StageTables {
 
 /// Resolves `plan` against `extents`.
 pub fn stage_tables(plan: &LaunchStagePlan, extents: &Extents) -> Result<StageTables, String> {
-    let descriptors = plan
-        .value_types
-        .iter()
-        .map(|value| {
-            describe(value, extents).map_err(|why| {
-                format!("a guest value's shape does not resolve against this fire: {why:?}")
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    stage_tables_launched(plan, extents, |_| true)
+}
+
+/// Resolves `plan` against `extents` where the regions `launches` says no
+/// to are another party's (a sink the engine serves): a value only they
+/// read is described empty, and takes no bytes.
+pub fn stage_tables_launched(
+    plan: &LaunchStagePlan,
+    extents: &Extents,
+    launches: impl Fn(&LaunchRegion) -> bool,
+) -> Result<StageTables, String> {
+    let descriptors = describe_launched(plan, extents, launches).map_err(|why| {
+        format!("a guest value's shape does not resolve against this fire: {why:?}")
+    })?;
     let mut scratch = lay_out(
         plan,
         &descriptors,

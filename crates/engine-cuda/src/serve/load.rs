@@ -1055,6 +1055,9 @@ impl Shell {
             boot.cache_dir.map(|dir| dir.join(CODE_DIR)),
         ));
         programs.open_fan()?;
+        // Every kernel a guest stage can dispatch, built (or read from the
+        // disk) now: a program registered while serving builds nothing.
+        programs.arm(&device)?;
         let pools = Pools::reserve(
             device.ordinal(),
             ceiling,
