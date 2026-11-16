@@ -1652,6 +1652,8 @@ impl<'c> Run<'c> {
             Dim::Patches => row(1),
             Dim::Readouts => return handle,
             Dim::Lanes => return handle,
+            // A capturing fire is refused before a value of either is cut.
+            Dim::Capturing | Dim::ContextTimes(_) | Dim::ContextPages => return handle,
             Dim::LanesPlus(k) => lane(k),
             Dim::Images => lane(0),
             Dim::ImagesPlus(k) => lane(k),

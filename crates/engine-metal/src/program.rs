@@ -86,6 +86,10 @@ pub struct Plane {
     /// The readout rows a lane may take in one fire: what an instance's
     /// row table is laid for.
     rows: u32,
+    /// The guest-region bytes a capturing lane's score rows take
+    /// (`crate::serve::CaptureLayout`), a term of each member of a program
+    /// that reads them out; 0 where the load reads out no scores.
+    capture: u64,
     next_program: u64,
     next_instance: u64,
 }
@@ -111,6 +115,7 @@ impl Plane {
             lanes: 64,
             arms: 1,
             rows: 1,
+            capture: 0,
             next_program: 1,
             next_instance: 1,
         }
@@ -282,6 +287,12 @@ impl Plane {
     /// The most lanes one fire flies, the frames in flight and the
     /// readout rows a lane may take in one fire: what the tables a binding
     /// opens are laid for.
+    /// The guest-region bytes a capturing lane's score rows take, laid for
+    /// each member of a program reading them out.
+    pub fn set_capture(&mut self, bytes: u64) {
+        self.capture = bytes;
+    }
+
     pub fn set_flight(&mut self, lanes: u32, arms: usize, rows: u32) {
         self.lanes = lanes.max(1);
         self.arms = arms.max(1);
@@ -662,8 +673,16 @@ impl Plane {
             .programs
             .get(&program)
             .ok_or_else(|| Fault::program("program::plane", format!("no program {program}")))?;
+        // A member reading the scores out holds its lane's score rows in the
+        // fire's guest region beside its own scratch.
+        let captures = program
+            .plan
+            .outputs()
+            .into_iter()
+            .any(|(name, _)| matches!(name, "attn.scores" | "attn.scores.pages"));
+        let capture = if captures { self.capture } else { 0 };
         Ok(engine::FireFacts {
-            a_lane: Session::scratch_for(&program.compiled, extents)?,
+            a_lane: Session::scratch_for(&program.compiled, extents)? + capture,
             // Its batch tables stand beside every fire, laid once a set
             // under the model's carve and counted at bind and close
             // (`engine::Engine::standing_after`), not in a fire's term.
