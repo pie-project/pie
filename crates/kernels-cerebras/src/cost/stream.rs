@@ -8,15 +8,25 @@
 //!   [`ROT_CHANGE`], [`ROT_LEVEL`]).
 //! - P7: [`STORE`] a stored row, [`QUERY`] a query (M1c, 16 entries a PE).
 //!
-//! A unit's phase costs its rows x its slowest PE a row (the PEs of a unit pipeline the rows);
-//! the step is the units' phases along the stream: a unit's pre-barrier phase starts when its
-//! rows reach it, its post-barrier phase when every unit of its block has stored.
+//! A unit's phase costs its rows x its pace a row: a row's path through the phase's steps (a
+//! unit's weight PEs and roots finish a row before they take the next, their chains synchronous:
+//! a step starts when what it reads has landed, and a row waits on what comes back to its row
+//! roots, not on a dead end such as a store), or one PE's own work a row where that is longer
+//! (a column root's steps, the busiest weight column's tiles). The step is the units' phases
+//! along the stream: a unit's pre-barrier phase starts when its rows reach it, its post-barrier
+//! phase when every unit of its block has stored. Against the simulator (flux2-mini's re-launched
+//! step, a unit's segment ends stamped): each unit's pace within 5-10%; the entries' fill (their
+//! f32 host rows, 5-8k cycles a row) is short of it, 0.1M cycles of the mini's 1.2-1.4M.
 
 use serde::Serialize;
 
 use crate::stream::build::{Program, kv_pya};
 use crate::stream::place;
-use crate::stream::unit::{Side, Step};
+use std::collections::BTreeMap;
+
+use poem_ir::ValueId;
+
+use crate::stream::unit::{self, Side, Step};
 
 /// P1-stream cycles an element a row.
 pub const P1_STREAM: f64 = 0.55;
@@ -195,6 +205,14 @@ pub struct StreamCost {
     pub cycles: f64,
 }
 
+/// A matvec's tile passes a row: two over an f32 input (`smv.csl`'s `X32`: its 16-bit halves).
+fn passes(s: &Step) -> f64 {
+    match s {
+        Step::Matvec { x32: true, .. } => 2.0,
+        _ => 1.0,
+    }
+}
+
 /// A word a root sends to or takes from the fabric (a helper's cast, its sums back).
 pub const FABRIC_WORD: f64 = 1.0;
 
@@ -261,15 +279,38 @@ pub fn time_at(p: &Program, class_rows: &[u32]) -> StreamCost {
                         .iter()
                         .enumerate()
                         .filter(|(i, _)| (*i >= b.unit.split) == phase)
-                        .filter_map(|(_, s)| place::tile_dims(s, l, c))
-                        .map(|(a, bb)| f64::from(a * bb) * P1_STREAM)
+                        .filter_map(|(_, s)| place::tile_dims(s, l, c).map(|t| (t, passes(s))))
+                        .map(|((a, bb), x)| f64::from(a * bb) * P1_STREAM * x)
                         .sum::<f64>()
                 })
                 .fold(0.0, f64::max);
             mv = mv.max(busiest);
-            // the roots: their regions a row, on the slowest side
+            // the roots: the row roots' regions a row; a column root's steps a row (the head
+            // roots' stores and queries, each region on the roots it runs on)
             let mut row_side = 0.0;
-            let mut col_side = 0.0;
+            // a row's path through the phase's steps: each value's time in the row, a step
+            // starting when what it reads is (the weight PEs and roots finish a row before the
+            // next, their chains synchronous)
+            let rd = unit::Reader {
+                trace: &p.trace,
+                word: b.word,
+                prologue: b.unit.classes.is_empty(),
+            };
+            let mut ready: BTreeMap<u32, f64> = BTreeMap::new();
+            let at_of = |ready: &BTreeMap<u32, f64>, v: ValueId| {
+                ready
+                    .get(&v.0)
+                    .or_else(|| ready.get(&unit::unmoved(v).0))
+                    .copied()
+                    .unwrap_or(0.0)
+            };
+            let mut path = 0.0f64;
+            let mut col_root = vec![0.0f64; l.px().max(1) as usize];
+            let mut on = |first: u32, n: u32, c: f64| {
+                for r in first..(first + n).min(l.px()) {
+                    col_root[r as usize] += c;
+                }
+            };
             for (i, s) in b.unit.steps.iter().enumerate() {
                 if (i >= b.unit.split) != phase {
                     continue;
@@ -283,6 +324,45 @@ pub fn time_at(p: &Program, class_rows: &[u32]) -> StreamCost {
                     chunk: at.map_or(0, |a| a.chunk),
                     cycles,
                 };
+                // the step on the row's path
+                let (start, cost, made): (f64, f64, Vec<ValueId>) = match s {
+                    Step::In { value, .. } => (0.0, 0.0, vec![*value]),
+                    Step::Region { chain, .. } => (
+                        place::row_params(&rd, chain)
+                            .iter()
+                            .map(|(_, c)| at_of(&ready, c.base))
+                            .fold(0.0, f64::max),
+                        region_cycles(p, ui, i),
+                        chain
+                            .outs
+                            .iter()
+                            .flat_map(|o| [o.value, rd.cols(o.value).base])
+                            .collect(),
+                    ),
+                    Step::Matvec { input, output, .. } => {
+                        // (its busiest column's tile: the sum the next step waits on)
+                        let elems = (0..l.px())
+                            .filter_map(|c| place::tile_dims(s, l, c))
+                            .map(|(a, bb)| f64::from(a * bb))
+                            .fold(0.0, f64::max);
+                        (
+                            at_of(&ready, input.base),
+                            elems * P1_STREAM * passes(s),
+                            vec![*output],
+                        )
+                    }
+                    Step::Store { q, k, v } => (
+                        [q.base, k.base, v.base]
+                            .iter()
+                            .map(|&x| at_of(&ready, x))
+                            .fold(0.0, f64::max),
+                        STORE,
+                        Vec::new(),
+                    ),
+                    Step::Attend { out, .. } => (0.0, 0.0, vec![*out]),
+                    Step::Out { value, .. } => (at_of(&ready, value.base), 0.0, Vec::new()),
+                };
+                let mut end = start + cost;
                 match s {
                     Step::Region {
                         side: Side::Row, ..
@@ -295,11 +375,22 @@ pub fn time_at(p: &Program, class_rows: &[u32]) -> StreamCost {
                         side: Side::Col, ..
                     } => {
                         let c = region_cycles(p, ui, i);
-                        col_side += c;
+                        let a = at.unwrap_or(place::RegionAt {
+                            first: 0,
+                            roots: l.px(),
+                            chunk: 0,
+                            reps: 1,
+                        });
+                        // (a region placed on no roots of its own: on all of them)
+                        if a.roots == 0 {
+                            on(0, l.px(), c);
+                        } else {
+                            on(a.first, a.roots, c);
+                        }
                         parts.push(part("col", c));
                     }
                     Step::Store { .. } => {
-                        col_side += STORE;
+                        on(0, l.heads, STORE);
                         parts.push(part("store", STORE));
                     }
                     Step::Attend { .. } => {
@@ -316,10 +407,32 @@ pub fn time_at(p: &Program, class_rows: &[u32]) -> StreamCost {
                             .first()
                             .map_or_else(|| kv_pya(block, qh, a.head_dim), |k| k.pya);
                         let c = query_cycles(block, pya, qh);
-                        col_side += c;
+                        on(0, l.heads, c);
+                        end += c;
                         parts.push(part("query", c));
                     }
                     _ => {}
+                }
+                for v in made {
+                    ready.insert(v.0, end);
+                }
+                // (a row waits on what comes back to its row roots: a step whose output lands
+                // there; a dead end on the column side, a store, paces only its own roots)
+                let back = matches!(
+                    s,
+                    Step::Region {
+                        side: Side::Row,
+                        ..
+                    } | Step::Matvec {
+                        from: Side::Col,
+                        ..
+                    } | Step::Out {
+                        side: Side::Row,
+                        ..
+                    }
+                );
+                if back {
+                    path = path.max(end);
                 }
             }
             if l.spill {
@@ -338,7 +451,8 @@ pub fn time_at(p: &Program, class_rows: &[u32]) -> StreamCost {
                         0.0
                     };
             }
-            *acc = busiest.max(row_side).max(col_side);
+            let col_side = col_root.iter().copied().fold(0.0, f64::max);
+            *acc = busiest.max(row_side).max(col_side).max(path);
         }
         units.push(UnitCost {
             name: b.unit.name.clone(),
