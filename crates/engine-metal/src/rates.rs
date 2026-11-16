@@ -19,6 +19,13 @@
 //! dispatches a fire, and a frame of one short dispatch times the clock
 //! state the device idled into, not the kernel. The counts that turn the
 //! times into rates are [`engine::rates`]'.
+//!
+//! Every float operand the matmul, attention and scan read (activations,
+//! weight planes, q and the kv pages, the scan's input, conv weight and
+//! states) is `engine::rates::operand_pattern` repeated, not zeros: some
+//! devices run a compute-bound kernel faster on zeros than on the real data
+//! serving runs, and every backend times the same bytes. Index and page
+//! tables, gates, outputs and the launch probe stay as laid.
 
 use engine::rates::{
     ATTN_DIMS, ATTN_KEYS, ATTN_SHAPE, AttnShape, DEPTHS, LATTICE_ROWS, SCAN_SHAPE,
@@ -47,16 +54,9 @@ fn median(mut times: Vec<f64>) -> f64 {
 }
 
 /// Deterministic bf16 values in `[-scale, scale)`.
-fn bf16_noise(n: usize, seed: u64, scale: f32) -> Vec<u8> {
-    let mut out = Vec::with_capacity(n * 2);
-    for at in 0..n as u64 {
-        let mut x = at.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ seed;
-        x ^= x >> 33;
-        x = x.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
-        let v = ((x >> 40) as f32 / 16_777_216.0 - 0.5) * 2.0 * scale;
-        out.extend_from_slice(&((v.to_bits() >> 16) as u16).to_le_bytes());
-    }
-    out
+/// `bytes` of `engine::rates::operand_pattern`, repeated.
+fn operand(pattern: &[u8], bytes: usize) -> Vec<u8> {
+    pattern.iter().copied().cycle().take(bytes).collect()
 }
 
 fn words<T: Copy>(v: &[T], to: impl Fn(T) -> [u8; 4]) -> Vec<u8> {
@@ -68,9 +68,16 @@ struct Bench<'a> {
     handles: Handles,
     pipelines: Pipelines,
     tuning: &'a Tuning,
+    /// `engine::rates::operand_pattern`, made once.
+    pattern: Vec<u8>,
 }
 
 impl Bench<'_> {
+    /// A buffer of `bytes` of the operand pattern.
+    fn operand(&self, bytes: u64) -> Result<Buffer, String> {
+        self.buffer(&operand(&self.pattern, usize::try_from(bytes).map_err(|e| e.to_string())?))
+    }
+
     fn buffer(&self, bytes: &[u8]) -> Result<Buffer, String> {
         let mut b =
             Buffer::zeroed(self.device, bytes.len().max(4) as u64).map_err(|e| e.to_string())?;
@@ -128,7 +135,7 @@ impl Bench<'_> {
     /// (`k × k` each).
     fn matmul_flops(&self, m: u32, n: u32, k: u32, weights: &[Tensor]) -> Result<f64, String> {
         let (a, y) = (
-            self.zeroed(u64::from(m) * u64::from(k) * 2)?,
+            self.operand(u64::from(m) * u64::from(k) * 2)?,
             self.zeroed(u64::from(m) * u64::from(n) * 2)?,
         );
         let (at, yt) = (
@@ -162,9 +169,9 @@ impl Bench<'_> {
         let pages = keys.div_ceil(PAGE);
         let slots = pages * PAGE;
         let kv = (slots * kv_heads * d) as usize;
-        let keys = self.buffer(&bf16_noise(kv, 11, 1.0))?;
-        let values = self.buffer(&bf16_noise(kv, 13, 1.0))?;
-        let q = self.buffer(&bf16_noise((rows * q_heads * d) as usize, 17, 1.0))?;
+        let keys = self.operand(kv as u64 * 2)?;
+        let values = self.operand(kv as u64 * 2)?;
+        let q = self.operand(u64::from(rows * q_heads * d) * 2)?;
         let out = self.zeroed(u64::from(rows * q_heads * d) * 2)?;
         let positions: Vec<u32> = (0..rows).collect();
         // The pool pages scattered as a served pool lays a sequence's, the
@@ -231,17 +238,17 @@ impl Bench<'_> {
         const CONV: u32 = SCAN_SHAPE.conv_width;
         let channels = SCAN_SHAPE.channels();
         let bank = u64::from(HEADS * DV * DK);
-        let qkv_in = self.buffer(&bf16_noise((TOKENS * channels) as usize, 23, 0.5))?;
+        let qkv_in = self.operand(u64::from(TOKENS * channels) * 2)?;
         let qkv = self.zeroed(u64::from(TOKENS * channels) * 2)?;
-        let weight = self.buffer(&bf16_noise((channels * CONV) as usize, 29, 0.5))?;
+        let weight = self.operand(u64::from(channels * CONV) * 2)?;
         let mut gates = Vec::with_capacity((TOKENS * 2 * HEADS) as usize);
         for t in 0..TOKENS {
             gates.extend((0..HEADS).map(|h| -0.05 - 0.001 * ((t + h) % 7) as f32));
             gates.extend((0..HEADS).map(|h| 0.5 + 0.01 * ((t * 3 + h) % 11) as f32));
         }
         let gates = self.buffer(&words(&gates, f32::to_le_bytes))?;
-        let state = self.zeroed(bank * 4)?;
-        let conv_state = self.zeroed(u64::from(CONV * channels) * 2)?;
+        let state = self.operand(bank * 4)?;
+        let conv_state = self.operand(u64::from(CONV * channels) * 2)?;
         let new_conv_state = self.zeroed(u64::from(CONV * channels) * 2)?;
         let y = self.zeroed(u64::from(TOKENS * HEADS * DV) * 4)?;
         let slot = self.buffer(&0u32.to_le_bytes())?;
@@ -332,6 +339,7 @@ pub fn measure(
         handles: Handles::new(),
         pipelines: Pipelines::new(),
         tuning: &tuning,
+        pattern: engine::rates::operand_pattern(),
     };
     // Warm the device until its rate stops falling (engine::rates::warm_up):
     // rotations of the widest matmul over its planes.
@@ -364,11 +372,12 @@ pub fn measure(
     {
         // The planes every backend rotates through (engine::rates::weights_at:
         // 768 MiB, at least 12), each its own memory so each repeat streams
-        // its weight as a layer's matmul does; one noise plane fills them.
-        let noise = bf16_noise((n * k) as usize, 7 + u64::from(k) + u64::from(n), 0.05);
+        // its weight as a layer's matmul does; one plane of the operand
+        // pattern fills them.
+        let plane = operand(&bench.pattern, (n * k) as usize * 2);
         let weights = (0..engine::rates::weights_at(n, k))
             .map(|_| {
-                let w = bench.buffer(&noise)?;
+                let w = bench.buffer(&plane)?;
                 Ok((bench.tensor(&w, n, k, Dtype::Bf16)?, w))
             })
             .collect::<Result<Vec<(Tensor, Buffer)>, String>>()?;
