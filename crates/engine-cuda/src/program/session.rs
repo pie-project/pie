@@ -12,7 +12,10 @@ use crate::error::{Fault, Result};
 
 use super::compile::Compiled;
 use super::endpoint::Endpoint;
-use super::launch::{ChannelShape, Cursor, Prepared, Rings, native_to_wire, wire_to_native};
+use super::launch::{
+    ChannelShape, Cursor, INTRINSIC_STORAGE_F32, INTRINSIC_STORAGE_RAW_BF16, Prepared, Rings,
+    native_to_wire, wire_to_native,
+};
 use super::ports;
 use super::wave::Wave;
 
@@ -49,6 +52,11 @@ pub struct Session {
     /// reading outputs seats them in its own table (`Prepared::slot_of`),
     /// whose names are that stage's, not another's.
     outputs: Vec<((String, u32), Output)>,
+    /// The outputs whose seats are rows: the program reads the output of
+    /// lane 0 alone, rows of it, and each row is its own lane's seat (the
+    /// readout rows of an instance's lanes), resolved through a row table
+    /// ([`Prepared::bind_rows`]).
+    row_sets: Vec<String>,
     poisoned: bool,
     fires: u64,
     /// A commit slot (two words the device writes) for each fire airborne
@@ -124,6 +132,7 @@ impl Session {
             cursors,
             extents,
             outputs: Vec::new(),
+            row_sets: Vec::new(),
             poisoned: false,
             fires: 0,
             commits: Vec::new(),
@@ -523,9 +532,45 @@ impl Session {
         Ok(Launched::Airborne)
     }
 
-    /// An unbound output would make the emitted kernel dereference the side table's zero.
-    fn outputs_bound(&self, plan: &ExecPlan) -> Result<()> {
-        for (name, lane) in plan.outputs() {
+    /// An unbound output would make the emitted kernel dereference the side
+    /// table's zero; a seat no read of the program reaches is refused, not
+    /// dropped. Seats past lane 0 of an output the program reads only at
+    /// lane 0 are its rows, lane `r` the row `r`.
+    fn outputs_bound(&mut self, plan: &ExecPlan) -> Result<()> {
+        let reads = plan.outputs();
+        let read = |name: &str, lane: u32| reads.iter().any(|&(n, l)| n == name && l == lane);
+        let mut row_sets: Vec<String> = Vec::new();
+        for ((name, at), _) in &self.outputs {
+            if read(name, *at) {
+                continue;
+            }
+            let rows = read(name, 0) && !reads.iter().any(|&(n, l)| n == name && l > 0);
+            let lanes = self
+                .outputs
+                .iter()
+                .filter(|((n, _), _)| n == name)
+                .count() as u32;
+            if !rows || *at >= lanes {
+                return Err(Fault::program(
+                    "program::session",
+                    format!(
+                        "output `{name}` is bound at lane {at}, which this program reads no \
+                         row of: it reads {}",
+                        reads
+                            .iter()
+                            .filter(|(n, _)| *n == name)
+                            .map(|(_, l)| format!("lane {l}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                ));
+            }
+            if !row_sets.iter().any(|set| set == name) {
+                row_sets.push(name.clone());
+            }
+        }
+        self.row_sets = row_sets;
+        for (name, lane) in reads {
             if !self.bound(name, lane) {
                 return Err(Fault::program(
                     "program::session",
@@ -547,7 +592,52 @@ impl Session {
         let commit = self.commits[minted.slot].device();
         for prepared in stages {
             let lane = prepared.stage_lane(&self.rings, &minted.before, commit)?;
+            for name in &self.row_sets {
+                let Some(slot) = prepared.slot_of(name, 0).filter(|_| prepared.reads(name, 0))
+                else {
+                    continue;
+                };
+                let mut seats: Vec<(u32, &Output)> = self
+                    .outputs
+                    .iter()
+                    .filter(|((n, _), _)| n == name)
+                    .map(|((_, at), output)| (*at, output))
+                    .collect();
+                seats.sort_unstable_by_key(|(at, _)| *at);
+                let mut rows = Vec::with_capacity(seats.len());
+                let mut bf16 = None;
+                for (at, output) in &seats {
+                    let (elem, is_bf16) = match output.storage {
+                        INTRINSIC_STORAGE_F32 => (4u64, false),
+                        INTRINSIC_STORAGE_RAW_BF16 => (2u64, true),
+                        other => {
+                            return Err(Fault::program(
+                                "program::session",
+                                format!(
+                                    "output `{name}`'s lane {at} is seated in storage {other}, \
+                                     and only f32 or bf16 rows are read a row a lane"
+                                ),
+                            ));
+                        }
+                    };
+                    if bf16.is_some_and(|was| was != is_bf16) || output.width != seats[0].1.width {
+                        return Err(Fault::program(
+                            "program::session",
+                            format!("output `{name}`'s rows are not one width and one storage"),
+                        ));
+                    }
+                    bf16 = Some(is_bf16);
+                    rows.push(
+                        output.base
+                            + u64::from(output.row_offset) * u64::from(output.row_stride) * elem,
+                    );
+                }
+                prepared.bind_rows(lane, slot, &rows, seats[0].1.width, bf16.unwrap_or(false))?;
+            }
             for ((name, at), output) in &self.outputs {
+                if self.row_sets.contains(name) || !prepared.reads(name, *at) {
+                    continue;
+                }
                 let Some(slot) = prepared.slot_of(name, *at) else {
                     continue;
                 };

@@ -96,7 +96,7 @@ __device__ __forceinline__ void ptir_m1_execute(
             reinterpret_cast<const int*>(a0)[(first_row + index / width) * stride + index % width]);
       return;
     }
-    if (p.imm == 0u || p.intrinsic_dtype > 2u || a0 == nullptr) {
+    if (p.imm == 0u || p.intrinsic_dtype == 3u || p.intrinsic_dtype > 4u || a0 == nullptr) {
       m1_fault(status, p.tag);
       return;
     }
