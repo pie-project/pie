@@ -104,8 +104,12 @@ pub fn search(shape: &Shape, ask: &Asked, keep: usize) -> R<Vec<Scored>> {
     let mut out = Vec::new();
     let mut why = Vec::new();
     for c in all {
-        match Program::build(c.planned.plan.clone()) {
-            Ok(_) => out.push(c),
+        // a partition builds where its program does and every PE's words do (a head's turns
+        // where its roles take them: what the emitter reads, checked here, not after the pick)
+        match Program::build(c.planned.plan.clone())
+            .and_then(|p| crate::emit::rcfg::all(&p).map(|_| ()))
+        {
+            Ok(()) => out.push(c),
             Err(e) => why.push(format!("{}: {e}", c.planned.preset.name)),
         }
         if out.len() == keep {
