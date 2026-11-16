@@ -122,14 +122,27 @@ struct Vacant {
     span: u64,
     launch: u32,
     class: u64,
+    /// One dead value's own bytes, from its offset: neither cut nor joined
+    /// to another's.
+    whole: bool,
 }
 
+/// Bytes for a value written in `launch` of rows `class`: a vacancy a
+/// launch before it, or one its own launch left of the same class. Within a
+/// launch across blocks, block `b` owns row `b` of every value of a class,
+/// so a value takes there only a dead one's own bytes, at its offset: any
+/// other place would lay a block's row over another block's, which may
+/// still be reading it.
 fn take(free: &mut Vec<Vacant>, span: u64, launch: u32, class: u64) -> Option<u64> {
     let best = free
         .iter()
         .enumerate()
         .filter(|(_, block)| {
-            block.span >= span && (block.launch < launch || (class != 0 && block.class == class))
+            block.span >= span
+                && (block.launch < launch
+                    || (class != 0
+                        && block.class == class
+                        && (class == Lifetime::SEQUENTIAL || block.whole)))
         })
         .min_by_key(|(_, block)| block.span)
         .map(|(index, _)| index)?;
@@ -143,6 +156,7 @@ fn take(free: &mut Vec<Vacant>, span: u64, launch: u32, class: u64) -> Option<u6
     } else {
         free[best].offset = offset + span;
         free[best].span = width - span;
+        free[best].whole = false;
     }
     Some(offset)
 }
@@ -156,6 +170,7 @@ fn release(free: &mut Vec<Vacant>, vacant: Vacant) {
         && same(&free[at], &free[at + 1])
     {
         free[at].span += free[at + 1].span;
+        free[at].whole = false;
         free.remove(at + 1);
     }
     if at > 0
@@ -163,6 +178,7 @@ fn release(free: &mut Vec<Vacant>, vacant: Vacant) {
         && same(&free[at - 1], &free[at])
     {
         free[at - 1].span += free[at].span;
+        free[at - 1].whole = false;
         free.remove(at);
     }
 }
@@ -213,6 +229,7 @@ pub fn layout_reusing(
                             span: spans[dead],
                             launch: lifetimes[dead].launch_last,
                             class: lifetimes[dead].class_last,
+                            whole: true,
                         },
                     );
                 }
@@ -318,6 +335,70 @@ mod tests {
         a_reserve_lies_below_the_temporary_arena();
         mismatched_lifetimes_fall_back_to_the_naive_layout();
         a_dead_value_takes_no_slot();
+        rows_of_one_class_share_only_at_one_offset();
+    }
+
+    /// Within a launch across blocks, block `b` owns row `b` of every value
+    /// of a row class: a value that takes another's bytes there lies at the
+    /// other's offset, so no block's row lands on another block's. Values
+    /// that share across launches may lie anywhere over each other.
+    fn rows_of_one_class_share_only_at_one_offset() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % bound
+        };
+        for _ in 0..20_000 {
+            let count = 2 + next(10) as usize;
+            let mut descriptors = Vec::new();
+            let mut lifetimes = Vec::new();
+            for _ in 0..count {
+                let rows = 1 + next(4) as u32;
+                let width = [64u32, 64, 64, 96][next(4) as usize];
+                descriptors.push(ValueDesc {
+                    len: rows * width,
+                    rows,
+                    last: width,
+                    rank: 2,
+                    dtype: 0,
+                    dims: [0; MAX_RANK],
+                });
+                let def = next(8) as u32;
+                let last = def + next(4) as u32;
+                // Steps 0..3 one launch across blocks, 4.. another.
+                let launch = |step: u32| u32::from(step >= 4);
+                let class = if next(5) == 0 { 0 } else { (1u64 << 40) | u64::from(width) * 4 };
+                lifetimes.push(Lifetime {
+                    dead: false,
+                    def,
+                    last,
+                    reusable: next(6) != 0,
+                    launch_def: launch(def),
+                    launch_last: launch(last),
+                    class_def: class,
+                    class_last: class,
+                });
+            }
+            let laid = layout_reusing(&descriptors, &lifetimes, 0, 0).unwrap();
+            let span = |i: usize| align_up(descriptors[i].device_bytes()).unwrap();
+            for i in 0..count {
+                for j in 0..count {
+                    let (a, b) = (lifetimes[i], lifetimes[j]);
+                    let (oi, oj) = (laid.values[i], laid.values[j]);
+                    let overlap = oi < oj + span(j) && oj < oi + span(i);
+                    if i == j || !overlap {
+                        continue;
+                    }
+                    assert!(a.last < b.def || b.last < a.def, "{i} and {j} live together");
+                    let (early, late) = if a.last < b.def { (a, b) } else { (b, a) };
+                    if early.launch_last >= late.launch_def {
+                        assert_eq!(oi, oj, "{i} and {j} share a launch's rows at two offsets");
+                    }
+                }
+            }
+        }
     }
 
     fn a_value_dead_before_the_next_region_hands_its_slot_on() {
