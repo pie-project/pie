@@ -1602,7 +1602,7 @@ fn lane_index(lane: u32) -> Result<usize, String> {
 }
 
 /// An output as a program reads it: an i32 output as i32, any float one f32.
-fn eta_output(output: &poem_ir::OutputDecl) -> eta_ir::registry::OutputDecl {
+pub(crate) fn eta_output(output: &poem_ir::OutputDecl) -> eta_ir::registry::OutputDecl {
     use eta_ir::registry::Axis;
     eta_ir::registry::OutputDecl {
         name: output.name.clone(),

@@ -397,6 +397,17 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         &metadata,
     )?;
 
+    // The standard samplers' guest code, built before ready: a request that
+    // registers one of them builds nothing.
+    for engine in &mut engine_configs {
+        let backend =
+            crate::engine::verbs::codegen_backend(&engine.engine_backend).map(str::to_owned);
+        let registrations = crate::pipeline::standard::registrations(backend.as_deref());
+        if let Err(error) = engine.engine_backend.prewarm_programs(&registrations) {
+            tracing::warn!(%error, "the standard samplers were not prewarmed");
+        }
+    }
+
     let scales: Vec<crate::policy::pressure::Scale> = engine_configs
         .iter()
         .map(|d| {

@@ -399,6 +399,39 @@ impl Plane {
         self.cache.stats()
     }
 
+    /// The region modules registrations built that the load's prewarm had
+    /// not: the engine's `Tally::BuiltAfterReady` from registrations.
+    #[must_use]
+    pub const fn built_late(&self) -> u64 {
+        self.cache.built_late()
+    }
+
+    /// Builds the region modules every one of `registrations` emits, once a
+    /// text, the regions compiled side by side: the runtime's prewarm of
+    /// its standard samplers, before ready.
+    pub fn prewarm(
+        &mut self,
+        context: &Context,
+        registrations: &[ProgramRegistration],
+    ) -> Result<()> {
+        let started = std::time::Instant::now();
+        let kernels: Vec<eta_exec::EmittedKernel> = registrations
+            .iter()
+            .flat_map(|registration| registration.emitted_kernels.iter().cloned())
+            .collect();
+        let compiled_before = self.cache.stats().compilations;
+        let regions = self.cache.warm(&Target::of(context)?, &kernels)?;
+        eprintln!(
+            "engine-cuda: guest regions prewarmed for {} standard program(s): {} region(s), \
+             {} compiled, in {} ms",
+            registrations.len(),
+            regions,
+            self.cache.stats().compilations - compiled_before,
+            started.elapsed().as_millis()
+        );
+        Ok(())
+    }
+
     pub fn register(
         &mut self,
         context: &Context,

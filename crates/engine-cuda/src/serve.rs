@@ -781,7 +781,22 @@ impl Shell {
         &mut self,
         registration: &engine::program::ProgramRegistration,
     ) -> Result<engine::ProgramId> {
-        self.programs.register(&self.device, registration)
+        let before = self.programs.built_late();
+        let registered = self.programs.register(&self.device, registration);
+        let late = self.programs.built_late() - before;
+        if late != 0 {
+            self.live.tally(engine::live::Tally::BuiltAfterReady, late);
+        }
+        registered
+    }
+
+    /// Builds the region modules of `registrations` (the runtime's prewarm,
+    /// before ready) and registers none of them.
+    pub fn prewarm_programs(
+        &mut self,
+        registrations: &[engine::program::ProgramRegistration],
+    ) -> Result<()> {
+        self.programs.prewarm(&self.device, registrations)
     }
 
     #[allow(clippy::too_many_arguments)]
