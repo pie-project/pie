@@ -630,7 +630,7 @@ pub fn program_at(
             let Step::Region { side, chain } = s else {
                 continue;
             };
-            let at = layout.region_at(*side, chain.region.width, &place::region_cols(&r, chain));
+            let at = layout.region_of(*side, &chain.region, &place::region_cols(&r, chain));
             let params: Vec<ParamAt> = chain
                 .ins
                 .iter()

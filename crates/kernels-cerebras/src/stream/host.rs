@@ -157,19 +157,14 @@ const PAD: usize = usize::MAX;
 
 /// A tile's cells: its rows (the weight's input columns), its columns (the weight's output
 /// rows; [`PAD`] past a value the row roots pad), the weight's width and the weight.
-fn tile_cells(
-    p: &Program,
-    unit: usize,
-    step: usize,
-    col: u32,
-    row: u32,
-) -> R<(Vec<usize>, Vec<usize>, usize, ValueId)> {
+fn tile_cells(p: &Program, unit: usize, step: usize, col: u32, row: u32) -> R<Cells> {
     let b = &p.units[unit];
     let l = &b.layout;
     let Step::Matvec {
         from,
         input,
         weight,
+        view,
         output,
         k,
         n,
@@ -215,7 +210,45 @@ fn tile_cells(
             )
         }
     };
-    Ok((rows, cols, *k as usize, *weight))
+    Ok(Cells {
+        rows,
+        cols,
+        k: *k as usize,
+        n: *n as usize,
+        weight: *weight,
+        view: *view,
+    })
+}
+
+/// A tile's cells ([`tile_cells`]).
+struct Cells {
+    rows: Vec<usize>,
+    cols: Vec<usize>,
+    k: usize,
+    n: usize,
+    weight: ValueId,
+    view: super::unit::View,
+}
+
+impl Cells {
+    /// Whether the cell of input `xr`, output `oc` is a constant one (an identity's, a spread's).
+    fn one(&self, xr: usize, oc: usize) -> bool {
+        if xr == PAD || oc == PAD || self.weight.0 != UNIT {
+            return false;
+        }
+        match self.view {
+            super::unit::View::Spread { rep } => oc / rep as usize == xr,
+            _ => xr == oc,
+        }
+    }
+
+    /// The weight's element the cell is, `None` for a constant or padded one.
+    fn at(&self, xr: usize, oc: usize) -> Option<usize> {
+        if xr == PAD || oc == PAD || self.weight.0 == UNIT {
+            return None;
+        }
+        self.view.at(oc, xr, self.k, self.n)
+    }
 }
 
 /// One array's words (f32, or 16-bit words in u32).
@@ -230,12 +263,13 @@ fn fill(p: &Program, vals: Option<&Values>, a: &HostArray) -> R<Vec<f32>> {
             col,
             row,
         } => {
-            let (rows, cols, kk, weight) = tile_cells(p, *unit, *step, *col, *row)?;
+            let cells = tile_cells(p, *unit, *step, *col, *row)?;
+            let (rows, cols, weight) = (&cells.rows, &cells.cols, cells.weight);
             if weight.0 == UNIT {
-                // an identity's tile: one where the input column is the output's
+                // an identity's (a spread's) tile: its constant ones
                 for (ri, &xr) in rows.iter().enumerate() {
                     for (ci, &oc) in cols.iter().enumerate() {
-                        if xr == oc && xr != PAD {
+                        if cells.one(xr, oc) {
                             out[1 + ri * cols.len() + ci] = f32::from_bits(bits16(1.0, ieee));
                         }
                     }
@@ -246,11 +280,7 @@ fn fill(p: &Program, vals: Option<&Values>, a: &HostArray) -> R<Vec<f32>> {
             // tile[r][c] = W[out c, in r]
             for (ri, &xr) in rows.iter().enumerate() {
                 for (ci, &oc) in cols.iter().enumerate() {
-                    let wv = if xr == PAD || oc == PAD {
-                        0.0
-                    } else {
-                        w[oc * kk + xr]
-                    };
+                    let wv = cells.at(xr, oc).map_or(0.0, |e| w[e]);
                     out[1 + ri * cols.len() + ci] = f32::from_bits(bits16(wv, ieee));
                 }
             }
@@ -454,36 +484,33 @@ pub fn spans(p: &Program, a: &HostArray) -> R<Option<Vec<Span>>> {
     else {
         return Ok(None);
     };
-    let (rows, cols, kk, weight) = tile_cells(p, *unit, *step, *col, *row)?;
+    let cells = tile_cells(p, *unit, *step, *col, *row)?;
+    let (rows, cols, kk, weight) = (
+        cells.rows.clone(),
+        cells.cols.clone(),
+        cells.k,
+        cells.weight,
+    );
     let cast = if p.round16 { BF16 } else { HALF };
     // word 0 is none; then tile[r][c] = W[out c, in r]: each row of the tile a run a stretch
     // of consecutive output columns, the rows one span where they are consecutive inputs and
     // the row is one stretch
     let mut stretches: Vec<(usize, usize)> = Vec::new();
-    if rows.contains(&PAD) || cols.contains(&PAD) {
-        // a padded tile: each cell a span of its own, a padded one none's
+    if rows.contains(&PAD) || cols.contains(&PAD) || cells.view != super::unit::View::Plain {
+        // a padded tile, or a view's: each cell a span of its own (a padded one none's, a
+        // constant one the unit's)
         let flags = FLAT | cast;
         let mut s: Vec<Span> = vec![[NONE, 0, 0, 1, 0, 0, 1, 0]];
         for &xr in &rows {
             for &oc in &cols {
-                s.push(
-                    if xr == PAD || oc == PAD || (weight.0 == UNIT && xr != oc) {
-                        [NONE, 0, 0, 1, 0, 0, 1, 0]
-                    } else if weight.0 == UNIT {
-                        [UNIT, 0, 0, 1, 0, flags, 1, 0]
-                    } else {
-                        [
-                            weight.0,
-                            0,
-                            (oc * kk + xr) as u32,
-                            1,
-                            kk as u32,
-                            flags,
-                            1,
-                            0,
-                        ]
-                    },
-                );
+                s.push(if cells.one(xr, oc) {
+                    [UNIT, 0, 0, 1, 0, flags, 1, 0]
+                } else {
+                    match cells.at(xr, oc) {
+                        Some(e) => [weight.0, 0, e as u32, 1, kk as u32, flags, 1, 0],
+                        None => [NONE, 0, 0, 1, 0, 0, 1, 0],
+                    }
+                });
             }
         }
         let used = 1 + rows.len() * cols.len();

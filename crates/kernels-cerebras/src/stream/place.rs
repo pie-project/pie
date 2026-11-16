@@ -116,6 +116,29 @@ impl Layout {
         self.parts(r, c).iter().map(|(_, s)| s.len).sum()
     }
 
+    /// Where `region` over `cands` runs ([`Layout::region_at`]), a region whose row reduces
+    /// other than by a sum (a maximum: a router's top k) whole at the first rest root, its row
+    /// in one chunk.
+    #[must_use]
+    pub fn region_of(&self, side: Side, region: &kernels_ir::Region, cands: &[Cols]) -> RegionAt {
+        let at = self.region_at(side, region.width, cands);
+        let whole = region.ops.iter().any(|o| {
+            matches!(
+                o,
+                kernels_ir::Op::Reduce(kernels_ir::Reduce::Max | kernels_ir::Reduce::Min, _)
+            )
+        });
+        if whole && side == Side::Col && at.roots > 1 && at.first == self.heads {
+            return RegionAt {
+                first: self.heads,
+                roots: 1,
+                chunk: region.width,
+                reps: 1,
+            };
+        }
+        at
+    }
+
     /// Where the region of `width` columns over `cands` (its row parameters' and results'
     /// columns) runs: on the head roots where they hold one of them chunk by chunk, else on the
     /// rest.
@@ -310,7 +333,7 @@ fn layout_with(r: &Reader, u: &Unit, py: u32, rest: u32) -> Option<Layout> {
             continue;
         };
         let w = chain.region.width;
-        let at = lay(cols.clone()).region_at(Side::Col, w, &region_cols(r, chain));
+        let at = lay(cols.clone()).region_of(Side::Col, &chain.region, &region_cols(r, chain));
         if at.roots == 0 || (at.reps == 1 && !w.is_multiple_of(at.roots)) {
             return None;
         }
@@ -572,7 +595,7 @@ pub fn layout(r: &Reader, u: &Unit, py: u32, tile: u32, spill: bool, widen: u32)
             side: Side::Col,
             chain,
         } => {
-            l0.region_at(Side::Col, chain.region.width, &region_cols(r, chain))
+            l0.region_of(Side::Col, &chain.region, &region_cols(r, chain))
                 .first
                 == l0.heads
         }

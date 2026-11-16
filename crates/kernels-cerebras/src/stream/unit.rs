@@ -63,12 +63,14 @@ pub enum Step {
     },
     /// A root region: `chain`'s region at the roots of `side`.
     Region { side: Side, chain: Chain },
-    /// A matvec from the roots of `from` to the other side's: `n` x `k` weights.
+    /// A matvec from the roots of `from` to the other side's: `n` x `k` weights, `weight` read
+    /// as `view` lays them.
     Matvec {
         node: u32,
         from: Side,
         input: Cols,
         weight: ValueId,
+        view: View,
         output: ValueId,
         k: u32,
         n: u32,
@@ -88,6 +90,42 @@ pub enum Step {
         host: bool,
         lane: bool,
     },
+}
+
+/// How a matvec's `n` x `k` weights lie in its weight value (`W[o, i]`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum View {
+    /// Row-major `[n, k]`.
+    #[default]
+    Plain,
+    /// Output `o` the value's row `(o / block) stride + off + o % block`: a bank's experts'
+    /// `block` rows each, `off` into each expert's `stride` (an expert's gate or up half).
+    Rows { block: u32, stride: u32, off: u32 },
+    /// Input `i` in block `i / block` of `[k / block, n, block]`: each block its expert's own
+    /// `[n, block]` (a bank's down projections side by side).
+    Blocks { block: u32 },
+    /// Constant: one where `o / rep == i` (an expert's gate over its `rep` columns).
+    Spread { rep: u32 },
+}
+
+impl View {
+    /// The element of the weight value `W[o, i]` is, of `k` inputs and `n` outputs; `None`
+    /// for a constant view's.
+    #[must_use]
+    pub fn at(self, o: usize, i: usize, k: usize, n: usize) -> Option<usize> {
+        match self {
+            View::Plain => Some(o * k + i),
+            View::Rows { block, stride, off } => {
+                let (b, s, f) = (block as usize, stride as usize, off as usize);
+                Some(((o / b) * s + f + o % b) * k + i)
+            }
+            View::Blocks { block } => {
+                let b = block as usize;
+                Some((i / b) * n * b + o * b + i % b)
+            }
+            View::Spread { .. } => None,
+        }
+    }
 }
 
 /// The joint attention a unit's rows take part in.
@@ -172,6 +210,9 @@ impl Reader<'_> {
 
     #[must_use]
     pub fn width(&self, v: ValueId) -> u32 {
+        if let Some((w, _)) = super::moe::ty(self.trace, unmoved(v)) {
+            return w;
+        }
         match self.trace.values.get(unmoved(v).0 as usize).map(|d| &d.ty) {
             Some(Ty::Tensor { shape, .. }) => match shape.last() {
                 Some(Dim::Const(n)) => *n as u32,
@@ -183,6 +224,9 @@ impl Reader<'_> {
 
     #[must_use]
     pub fn dtype(&self, v: ValueId) -> Option<Dtype> {
+        if let Some((_, d)) = super::moe::ty(self.trace, unmoved(v)) {
+            return Some(d);
+        }
         match self.trace.values.get(unmoved(v).0 as usize).map(|d| &d.ty) {
             Some(Ty::Tensor { dtype, .. }) => Some(*dtype),
             _ => None,
@@ -420,8 +464,14 @@ pub fn lower_through(
     let mut appended: Vec<(ValueId, Cols, Cols)> = Vec::new();
     let mut ins = Vec::new();
     let mut i = 0;
+    // the nodes a routed layer's lowering stands for, past its route
+    let mut skip: BTreeSet<u32> = BTreeSet::new();
     while i <= nodes.len() {
         let next = nodes.get(i).copied();
+        if next.is_some_and(|n| skip.contains(&n)) {
+            i += 1;
+            continue;
+        }
         let rooted_next = next.is_some_and(|n| rooted(&trace.nodes[n as usize].op));
         let alias_next = next.is_some_and(|n| alias(&trace.nodes[n as usize].op));
         if rooted_next {
@@ -515,6 +565,7 @@ pub fn lower_through(
                     from,
                     input: x,
                     weight: *w,
+                    view: View::Plain,
                     output: *y,
                     k: r.width(*act),
                     n: r.width(*y),
@@ -605,6 +656,113 @@ pub fn lower_through(
                     out: *o,
                     round: r.round(*o),
                 });
+            }
+            // routed experts: their gated sum over every expert ([`super::moe`])
+            Operation::Linear(Linear::MoeRoute { .. }) => {
+                use super::moe::{self, Kind, synth};
+                let g = moe::group(trace, at, nodes).map_err(|e| refuse(at, e))?;
+                skip.extend(g.nodes[1..].iter().copied());
+                let l = r.cols(g.logits);
+                let gs = side_of(&sides, l).ok_or_else(|| {
+                    refuse(at, "linear.moe_route reads logits no root has".into())
+                })?;
+                let (e, ei, h) = (g.experts, g.experts * g.inter, g.hidden);
+                let gate = synth(at, Kind::Gate);
+                steps.push(Step::Region {
+                    side: gs,
+                    chain: moe::router(trace, &g).map_err(|e| refuse(at, e))?,
+                });
+                sides.insert(gate, gs);
+                let o = gs.flip();
+                let spread = synth(at, Kind::Spread);
+                steps.push(Step::Matvec {
+                    node: at,
+                    from: gs,
+                    input: Cols {
+                        base: gate,
+                        from: 0,
+                        width: e,
+                    },
+                    weight: ValueId(super::host::UNIT),
+                    view: View::Spread { rep: g.inter },
+                    output: spread,
+                    k: e,
+                    n: ei,
+                    x32: true,
+                    round: false,
+                });
+                sides.insert(spread, o);
+                // the layer's input where the gate is: its projections land with the spread
+                let xc = r.cols(g.x);
+                let xs = side_of(&sides, xc).ok_or_else(|| {
+                    refuse(at, "linear.moe_select reads a value no root has".into())
+                })?;
+                let xin = if xs == gs {
+                    xc
+                } else {
+                    let moved = synth(at, Kind::Input);
+                    steps.push(Step::Matvec {
+                        node: at,
+                        from: xs,
+                        input: xc,
+                        weight: ValueId(super::host::UNIT),
+                        view: View::Plain,
+                        output: moved,
+                        k: h,
+                        n: h,
+                        x32: r.dtype(g.x) == Some(Dtype::F32),
+                        round: r.round(g.x),
+                    });
+                    sides.insert(moved, gs);
+                    Cols {
+                        base: moved,
+                        from: 0,
+                        width: h,
+                    }
+                };
+                let narrow = r.dtype(synth(at, Kind::Gates)).unwrap_or(Dtype::Bf16);
+                for (kind, off) in [(Kind::Gates, 0), (Kind::Ups, g.inter)] {
+                    steps.push(Step::Matvec {
+                        node: at,
+                        from: gs,
+                        input: xin,
+                        weight: g.gate_up,
+                        view: View::Rows {
+                            block: g.inter,
+                            stride: 2 * g.inter,
+                            off,
+                        },
+                        output: synth(at, kind),
+                        k: h,
+                        n: ei,
+                        x32: r.dtype(g.x) == Some(Dtype::F32),
+                        round: true,
+                    });
+                    sides.insert(synth(at, kind), o);
+                }
+                steps.push(Step::Region {
+                    side: o,
+                    chain: moe::activation(&g, narrow).map_err(|e| refuse(at, e))?,
+                });
+                let acts = synth(at, Kind::Acts);
+                sides.insert(acts, o);
+                steps.push(Step::Matvec {
+                    node: at,
+                    from: o,
+                    input: Cols {
+                        base: acts,
+                        from: 0,
+                        width: ei,
+                    },
+                    weight: g.down,
+                    view: View::Blocks { block: g.inter },
+                    output: g.y,
+                    k: ei,
+                    n: h,
+                    x32: false,
+                    round: r.round(g.y),
+                });
+                sides.insert(g.y, gs);
             }
             // a decode step's attention over its layer's cache: the row stored with its query
             // (at its position), then attending every row stored at or before it
@@ -855,6 +1013,7 @@ fn move_across(
         from: Side::Col,
         input,
         weight: ValueId(super::host::UNIT),
+        view: View::Plain,
         output: m,
         k: w,
         n: w,

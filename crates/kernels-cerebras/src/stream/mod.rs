@@ -20,6 +20,7 @@ pub mod build;
 pub mod coresident;
 pub mod grid;
 pub mod host;
+pub mod moe;
 pub mod place;
 pub mod tiled;
 pub mod unit;
