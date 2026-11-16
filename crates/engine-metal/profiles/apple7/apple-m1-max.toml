@@ -5,20 +5,26 @@ api = 1
 device = "Apple M1 Max"
 assumes = { cores = 24 }
 
-# What pie's Metal kernels reach here (M1 Max, 24-core GPU, macOS 27; median
-# of 5 timed by the GPU after a warm run, `the_device_rates`; the vendor's
-# peaks are the upper bounds).
+# What pie's Metal kernels reach here (M1 Max, 24-core GPU, macOS 27), as
+# `pie tune metal --rates` measured them at engine::rates' lattice; the
+# vendor's peaks are the upper bounds.
 [rates]
-# A 4096^3 bf16 GEMM through the dense kernel serving dispatches
-# (simdgroup-matrix, f32 accumulation): 5.28 TFLOPS. Peak: 7.96 TFLOPS of f32
-# FMA (24 cores x 128 ALUs x 2 x 1.296 GHz); the GPU has no faster bf16 path.
-bf16_flops_per_ns_by_rows = [[4096, 5282.0]]
+# A bf16 matmul m x 4096 x 4096 through the dense kernel serving dispatches
+# (simdgroup-matrix, f32 accumulation), at m = 16..8192: 2.40 TFLOPS at 16,
+# 4.71 at 128, 5.29 from 4096. Peak: 7.96 TFLOPS of f32 FMA (24 cores x 128
+# ALUs x 2 x 1.296 GHz); the GPU has no faster bf16 path.
+bf16_flops_per_ns_by_rows = [[16, 2399.918564823344], [32, 4146.00586567381], [64, 4519.238891190512], [128, 4710.518914575571], [256, 5065.6185214061325], [512, 5169.40432800617], [1024, 5241.210516003774], [2048, 5263.314352621611], [4096, 5288.189851490357], [8192, 5293.914472161867]]
+# A causal prefill, 2048 rows over 2048 keys, 16 query and 8 kv heads of
+# 128, counted over the full rectangle: 6.02 TFLOPS.
+attn_flops_per_ns = 6017.994229766975
+# A gated-delta chunked scan and its width-4 conv, 2048 tokens, 16 heads of
+# 128 x 128: 89.8 state elements a ns.
+scan_elements_per_ns = 89.83971652251407
 # A 256 MiB blit between two buffers, read and write counted: 377 GB/s. Peak:
 # 400 GB/s of LPDDR5 (Apple's M1 Max figure).
-bytes_per_ns = 377.2
-# A dispatch's launch, back to back in one serial pass (512 of the smallest
-# GEMM in one frame).
-launch_ns = 4867
+bytes_per_ns = 377.480063768957
+# A dispatch's launch, the smallest matmul back to back in one frame.
+launch_ns = 4480
 
 [provenance]
-rates = "the_device_rates test on a 24-core M1 Max on 2026-11-15, through the dense kernel serving dispatches"
+rates = "pie tune metal --rates on 2026-11-16 (pie 0.6.0): each kernel through the dispatch serving runs, back to back in 20 ms frames timed by the GPU, the matmul over 8 distinct weights; at engine::rates' lattice (matmul m x 4096 x 4096, m 16..8192; attention 2048x2048 keys, 16/8 heads of 128; scan 2048 tokens, 16/16 heads of 128x128, conv 4)"

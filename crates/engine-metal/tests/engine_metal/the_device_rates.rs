@@ -13,7 +13,7 @@ fn the_device_rates() {
     if !engine_metal::device::present() {
         return;
     }
-    let measured =
-        engine_metal::rates::measure(None, &mut |line| println!("{line}")).expect("the rates");
-    print!("{}", measured.block());
+    let outcome =
+        engine_metal::tune::rates(None, &mut |line| println!("{line}")).expect("the rates");
+    print!("{}", outcome.file);
 }
