@@ -59,8 +59,9 @@ impl RungFacts {
 /// What a fire costs, as work over the device's rates (the one shared
 /// formula every engine weighs its top rung by):
 ///
-/// `t(r) = launches(r) · launch_ns
-///       + max(weights(r) / bytes_per_ns,
+/// `t(r) = max(launches(r) · launch_ns, work(r))`,
+///
+/// `work(r) = max(weights(r) / bytes_per_ns,
 ///             Σ_(n, k) padded_rows(r) · flops_per_row(n, k) / flops(padded_rows(r), k))
 ///       + sampled(r) · readout_flops / flops(sampled(r), hidden)
 ///       + tokens(r) · keys(r) · attn_flops_per_row_key / attn(keys(r))
@@ -68,7 +69,11 @@ impl RungFacts {
 ///       + tokens(r) · state_elements_per_row / scan_elements_per_ns
 ///       + tokens(r) · elementwise_bytes_per_row / bytes_per_ns`
 ///
-/// where `weights(r) = dense_bytes + expert_bytes · (1 − (1 − k/E)^tokens)`:
+/// The rates are timed as back-to-back dispatches in a frame, so each
+/// already holds its dispatches' launches wherever they serialize: the
+/// launches decide a fire's time only when it is too small for its work to
+/// hide its dispatches. Where `weights(r) = dense_bytes + expert_bytes · (1
+/// − (1 − k/E)^tokens)`:
 /// a fire reads every dense weight once (the output head's among them), and
 /// of a routed bank the experts its rows touch (each row picks `k` of `E`).
 /// `flops(m, k)` is the device's matmul rate at `m` rows and depth `k`, its
@@ -280,17 +285,23 @@ pub struct Terms {
 }
 
 impl Terms {
-    /// The fire's time: the launches, the larger of the weights' read and
-    /// the matmuls' compute, then each other term in turn.
+    /// The fire's work: the larger of the weights' read and the matmuls'
+    /// compute, then each other term in turn.
     #[must_use]
-    pub fn total(&self) -> f64 {
-        self.launch
-            + self.weights.max(self.flops)
+    pub fn work(&self) -> f64 {
+        self.weights.max(self.flops)
             + self.readout
             + self.attention
             + self.kv
             + self.recurrent
             + self.elementwise
+    }
+
+    /// The fire's time: its work, or its launches where they take longer
+    /// (a fire too small for its work to hide its dispatches).
+    #[must_use]
+    pub fn total(&self) -> f64 {
+        self.work().max(self.launch)
     }
 }
 
@@ -511,13 +522,15 @@ mod tests {
     /// estimate's `max` of the two holds this where launches carry the
     /// fixed part.
     fn summed(fixed_ns: u64, per_token_ns: f64) -> (FireEstimate, impl Fn(u32, u64) -> RungFacts) {
+        // The fixed part a prefill-shaped fire's one readout: one lane, so
+        // every rung samples one row, at the grid's one flop a ns.
         let e = FireEstimate {
-            launch_ns: fixed_ns as f64,
+            readout_flops: fixed_ns as f64,
             dense_bytes: 0,
             ..estimate(0, per_token_ns)
         };
         (e, |tokens, span| RungFacts {
-            launches: 1,
+            lanes: 1,
             ..rung(tokens, span)
         })
     }
@@ -802,11 +815,38 @@ mod tests {
     }
 
     #[test]
+    fn the_launches_decide_only_a_fire_too_small_to_hide_them() {
+        let (e, r) = documented();
+        // The documented fire's 128 ns of work hide its 5 · 3 ns launches.
+        let t = e.terms(&r);
+        assert_eq!(t.launch, 15.0);
+        assert!((t.work() - 128.0).abs() < 1e-9);
+        assert_eq!(t.total(), t.work());
+        // A thousand dispatches over the same work: they take the fire.
+        let tiny = RungFacts {
+            launches: 1000,
+            ..r
+        };
+        assert_eq!(e.terms(&tiny).total(), 3000.0);
+        // A wide fire's work buries them again.
+        let wide = RungFacts {
+            launches: 1000,
+            tokens: 4096,
+            lanes: 4096,
+            padded_rows: 4096,
+            ..r
+        };
+        let t = e.terms(&wide);
+        assert!(t.work() > t.launch, "{t:?}");
+        assert_eq!(t.total(), t.work());
+    }
+
+    #[test]
     fn the_estimate_is_its_documented_form() {
         let (e, r) = documented();
-        // 5·3 + max(200/4, 32·10/4) + 4·6/1 + 4·1·0.5/0.25 + 4·8/4
-        //     + 4·3/2 + 4·2/4
-        let want = 15.0 + 80.0 + 24.0 + 8.0 + 8.0 + 6.0 + 2.0;
+        // max(5·3, max(200/4, 32·10/4) + 4·6/1 + 4·1·0.5/0.25 + 4·8/4
+        //     + 4·3/2 + 4·2/4)
+        let want = 80.0 + 24.0 + 8.0 + 8.0 + 6.0 + 2.0;
         assert!((e.ns(&r) - want).abs() < 1e-9, "{}", e.ns(&r));
         assert_eq!(e.ns(&r), e.terms(&r).total());
     }

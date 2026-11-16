@@ -497,15 +497,15 @@ fn check_estimate_of(
     let (at_est, best) = (score(by_est.tokens), score(by_meas.tokens));
     let mut out = format!(
         "{model}: rung, measured ms, estimated ms, measured/estimated, measured tok/s, estimated \
-         tok/s; the estimate's terms (ms): launches, weight read, matmul, readout, attention, kv, \
-         recurrent, elementwise\n"
+         tok/s; the estimate = max(launches, work) (ms): launches, work; work's terms: weight \
+         read, matmul, readout, attention, kv, recurrent, elementwise\n"
     );
     for (k, r) in rungs.iter().enumerate() {
         let tokens = f64::from(r.tokens);
         let t = e.terms(r);
         out.push_str(&format!(
-            "  {:>6} {:>9.2} {:>9.2} {:>6.2}x {:>9.0} {:>9.0}   {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} \
-             {:.2} {:.2}\n",
+            "  {:>6} {:>9.2} {:>9.2} {:>6.2}x {:>9.0} {:>9.0}   {:.2} {:.2}; {:.2} {:.2} {:.2} {:.2} \
+             {:.2} {:.2} {:.2}\n",
             r.tokens,
             meas[k] / 1e6,
             est[k] / 1e6,
@@ -513,6 +513,7 @@ fn check_estimate_of(
             tokens / meas[k] * 1e9,
             tokens / est[k] * 1e9,
             t.launch / 1e6,
+            t.work() / 1e6,
             t.weights / 1e6,
             t.flops / 1e6,
             t.readout / 1e6,
