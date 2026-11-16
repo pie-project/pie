@@ -85,6 +85,8 @@ pub enum HostKind {
 /// An op the host runs on the step's rows.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Host {
+    /// Its trace node.
+    pub node: u32,
     pub op: Op,
     pub kind: HostKind,
 }
@@ -183,22 +185,22 @@ impl Body<'_, '_> {
         outs: &[poem_ir::ValueId],
     ) -> R<()> {
         match node {
-            Operation::Elemwise(e)
-                if matches!(
-                    e.name(),
-                    "elemwise.layernorm"
-                        | "elemwise.modulate"
-                        | "elemwise.rope_axes"
-                        | "elemwise.binary"
-                        | "elemwise.sinusoid"
-                ) =>
-            {
-                self.elementwise(op, acts, outs)
-            }
+            // every elementwise op is a root op (or the lanes' / the host's): whether its region
+            // prints is the unit's lowering's question (`fuse::chain::lower_run`, `emit::region`),
+            // not a list of names here
+            Operation::Elemwise(_) => self.elementwise(op, acts, outs),
+            // the head's logits: a matvec as any other, over the vocabulary's rows
+            Operation::Linear(Linear::Matmul {
+                act, logits: true, ..
+            }) => self.matvec(self.r.resolve(*act), op, None, outs),
             // the order keys and values are stored in
             Operation::Gather(Gather::PackRows { .. }) => self.mixer(op, None, acts, outs),
             // each row's output back in its place: with the attention that made it
             Operation::Gather(Gather::UnpackRows { .. }) => self.elementwise(op, acts, outs),
+            // the rows a reading reads out (a prefill's last rows): a row selection commutes
+            // with every row's own op after it, so the rows flow on and the host keeps the
+            // ones it names from the reading's outputs (no op across rows after it: `lower`)
+            Operation::Gather(Gather::Rows { .. }) => self.elementwise(op, acts, outs),
             Operation::Attn(Attn::Ragged {
                 q,
                 head_dim,
@@ -308,6 +310,25 @@ pub fn lower(
     let (Some(first), Some(last)) = (first, last) else {
         return Err(format!("{name}: the stream step runs no layers"));
     };
+    // a row selection commutes only with each row's own ops: none across rows after it
+    if let Some(at) = (0..nodes)
+        .find(|&at| any[at] && matches!(trace.nodes[at].op, Operation::Gather(Gather::Rows { .. })))
+        && let Some(after) = (at + 1..nodes).find(|&n| {
+            any[n]
+                && matches!(
+                    trace.nodes[n].op,
+                    Operation::Attn(_)
+                        | Operation::Ssm(_)
+                        | Operation::Gather(Gather::PackRows { .. } | Gather::UnpackRows { .. })
+                )
+        })
+    {
+        return Err(format!(
+            "{name}: node {after}: {} after the rows node {at} reads out: a row selection \
+             commutes with each row's own ops only",
+            trace.nodes[after].op.name()
+        ));
+    }
 
     let out_ty = |at: usize| {
         let mut outs = Vec::new();
@@ -347,20 +368,22 @@ pub fn lower(
             _ => false,
         };
         let matmul = matches!(node.op, Operation::Linear(Linear::Matmul { .. }));
+        let weight = |v: &poem_ir::ValueId| {
+            matches!(
+                trace.values.get(v.0 as usize).map(|d| &d.def),
+                Some(Def::Weight(_))
+            )
+        };
         // a token embedding is a lookup of the table's rows by the host's ids: the rows it
         // makes enter the units as a host input's do (no arithmetic; the table stays host-side)
         let embed = matches!(
             node.op,
             Operation::Gather(Gather::Embed { weights: None, .. })
-        ) && ins.iter().all(|v| {
-            own(v)
-                || matches!(
-                    trace.values.get(v.0 as usize).map(|d| &d.def),
-                    Some(Def::Weight(_))
-                )
-        });
-        // a permutation of a unit's rows (the velocity out) is the host's too
-        if permutes || embed || (!matmul && ins.iter().all(own)) {
+        );
+        // a permutation of a unit's rows (the velocity out) is the host's too; so is every
+        // other op over the host's values and the checkpoint's constants alone (a table's
+        // lookup, a position's affine map, its bounds), but a matvec
+        if permutes || (!matmul && ins.iter().all(|v| own(v) || weight(v))) {
             host[at] = Some(permutes || embed);
         }
     }
@@ -512,6 +535,7 @@ pub fn lower(
                 false => HostKind::Table,
             };
             Some(Host {
+                node: at as u32,
                 op: Op {
                     op: trace.nodes[at].op.name(),
                     width: hidden_of(at),

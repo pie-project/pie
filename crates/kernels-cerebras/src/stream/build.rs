@@ -5,8 +5,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use poem_compiler::spatial::layer::stream::{HostKind, Stage};
-use poem_ir::{Def, Operands, Trace, ValueId};
+use poem_compiler::spatial::layer::stream::Stage;
+use poem_ir::{Def, Linear, Operands, Operation, Trace, ValueId};
 
 use super::StreamShape;
 use super::place::{self, KvSched, Layout, UnitSched};
@@ -469,43 +469,26 @@ pub fn program_at(
             prog.hidden
         ));
     }
-    // the host's nodes: its permutations and tables, and the lane ops it computes from its own
-    // inputs alone (a sinusoid of the timestep)
-    let mut host: BTreeSet<u32> = BTreeSet::new();
-    for (at, node) in trace.nodes.iter().enumerate() {
-        let _ = node;
-        let _ = at;
-    }
+    // the host's nodes: the stream program's (its permutations and tables), and the lane ops it
+    // computes from its own inputs, the checkpoint's constants and its other lane ops alone (a
+    // sinusoid of the timestep, the timestep's affine map before it), a matvec aside
+    let mut host: BTreeSet<u32> = prog.host.iter().map(|h| h.node).collect();
     {
-        // the stream program names its host ops by op; read them off the nodes again
-        let names: Vec<&str> = prog.host.iter().map(|h| h.op.op).collect();
-        let kinds: Vec<HostKind> = prog.host.iter().map(|h| h.kind).collect();
-        let _ = kinds;
         let mut ins = Vec::new();
-        for (at, node) in trace.nodes.iter().enumerate() {
-            let op = node.op.name();
-            if !names.contains(&op) || prog.lane_nodes.contains(&(at as u32)) {
-                continue;
-            }
-            if prog
-                .stages
-                .iter()
-                .any(|s| s.nodes.iter().any(|n| n.contains(&(at as u32))))
-            {
-                continue;
-            }
-            host.insert(at as u32);
-        }
         for &at in &prog.lane_nodes {
             let node = &trace.nodes[at as usize];
+            if matches!(node.op, Operation::Linear(Linear::Matmul { .. })) {
+                continue;
+            }
             ins.clear();
             node.op.inputs(&mut ins);
-            let own = ins.iter().all(|v| {
-                matches!(
-                    trace.values.get(v.0 as usize).map(|d| &d.def),
-                    Some(Def::Input(_))
-                )
-            });
+            let own = ins
+                .iter()
+                .all(|v| match trace.values.get(v.0 as usize).map(|d| &d.def) {
+                    Some(Def::Input(_) | Def::Weight(_)) => true,
+                    Some(Def::Op(n)) => host.contains(n),
+                    _ => false,
+                });
             if own {
                 host.insert(at);
             }

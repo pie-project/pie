@@ -209,6 +209,14 @@ impl Reader<'_> {
     /// The columns `v` is of the value it was split, packed or unpacked from.
     #[must_use]
     pub fn cols(&self, v: ValueId) -> Cols {
+        // a moved copy is a value of its own, whole
+        if v.0 & MOVED != 0 {
+            return Cols {
+                base: v,
+                from: 0,
+                width: self.width(v),
+            };
+        }
         let v = self.resolve(v);
         let width = self.width(v);
         let Some(Def::Op(n)) = self.def(v) else {
@@ -247,9 +255,9 @@ impl Reader<'_> {
                 };
                 up(*packed, off)
             }
-            Operation::Gather(Gather::PackRows { x, .. } | Gather::UnpackRows { x, .. }) => {
-                up(*x, 0)
-            }
+            Operation::Gather(
+                Gather::PackRows { x, .. } | Gather::UnpackRows { x, .. } | Gather::Rows { x, .. },
+            ) => up(*x, 0),
             _ => Cols {
                 base: v,
                 from: 0,
@@ -298,6 +306,7 @@ fn alias(op: &Operation) -> bool {
                 | Gather::SplitQkv { .. }
                 | Gather::PackRows { .. }
                 | Gather::UnpackRows { .. }
+                | Gather::Rows { .. }
         )
     )
 }
@@ -455,14 +464,15 @@ pub fn lower_through(
                         if s == Side::Row {
                             continue;
                         }
-                        if cc.from != 0 || cc.width != r.width(cc.base) {
-                            return Err(refuse(
-                                c.nodes[0],
-                                "a root region over values on both sides reads part of a column value".into(),
-                            ));
-                        }
-                        move_across(&r, &mut steps, &mut sides, cc.base, c.nodes[0]);
-                        c.ins[k].value = moved(cc.base);
+                        // the columns it reads moved across: the value whole, or its part (a
+                        // split's half: its own moved copy)
+                        let key = if cc.from == 0 && cc.width == r.width(cc.base) {
+                            cc.base
+                        } else {
+                            c.ins[k].value
+                        };
+                        move_across(&r, &mut steps, &mut sides, key, cc, c.nodes[0]);
+                        c.ins[k].value = moved(key);
                     }
                     side = Some(Side::Row);
                 }
@@ -483,8 +493,8 @@ pub fn lower_through(
                 input_scales: None,
                 scales: None,
                 quant: None,
-                logits: false,
                 y,
+                ..
             }) => {
                 let x = r.cols(*act);
                 if !sides.contains_key(&x.base) {
@@ -642,7 +652,18 @@ pub fn lower_through(
                     c.base.0
                 ));
             }
-            move_across(&r, &mut steps, &mut sides, c.base, u32::MAX);
+            move_across(
+                &r,
+                &mut steps,
+                &mut sides,
+                c.base,
+                Cols {
+                    base: c.base,
+                    from: 0,
+                    width: c.width,
+                },
+                u32::MAX,
+            );
             (
                 Cols {
                     base: moved(c.base),
@@ -767,21 +788,18 @@ fn move_across(
     steps: &mut Vec<Step>,
     sides: &mut BTreeMap<ValueId, Side>,
     v: ValueId,
+    input: Cols,
     node: u32,
 ) {
     let m = moved(v);
     if sides.contains_key(&m) {
         return;
     }
-    let w = r.width(v);
+    let w = input.width;
     steps.push(Step::Matvec {
         node,
         from: Side::Col,
-        input: Cols {
-            base: v,
-            from: 0,
-            width: w,
-        },
+        input,
         weight: ValueId(super::host::UNIT),
         output: m,
         k: w,

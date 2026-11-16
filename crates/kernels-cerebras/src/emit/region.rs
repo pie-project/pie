@@ -586,6 +586,18 @@ impl Printer<'_> {
                         self.recip = true;
                         let _ = writeln!(self.body, "  vrecip({d}, {x});");
                     }
+                    // tanh(x) = 1 - 2 / (e^2x + 1): the row's exp and reciprocal
+                    Unary::Tanh => {
+                        (self.exp, self.recip) = (true, true);
+                        let t = self.new_buf();
+                        let _ = writeln!(
+                            self.body,
+                            "  @fadds({d}, {x}, {x}); vexp({d}); @fadds({d}, {d}, @as(f32, 1.0)); \
+                             vrecip(B{t}, {d}); @fmuls(B{t}, B{t}, @as(f32, -2.0)); \
+                             @fadds({d}, B{t}, @as(f32, 1.0));"
+                        );
+                        self.bufs_free.push(t);
+                    }
                     u => return refuse(format!("op {k}: a row's {u:?}")),
                 }
             }
