@@ -152,8 +152,11 @@ fn trace_row(p: &Program, unit: usize, t: u32) -> usize {
     }
 }
 
+/// A padded row's or column of a tile ([`tile_cells`]): no weight's, a zero.
+const PAD: usize = usize::MAX;
+
 /// A tile's cells: its rows (the weight's input columns), its columns (the weight's output
-/// rows), the weight's width and the weight.
+/// rows; [`PAD`] past a value the row roots pad), the weight's width and the weight.
 fn tile_cells(
     p: &Program,
     unit: usize,
@@ -177,7 +180,9 @@ fn tile_cells(
     };
     let (rows, cols): (Vec<usize>, Vec<usize>) = match from {
         Side::Row => {
-            let a = k / l.py;
+            // (a value narrower than the row roots, or of no multiple of them, is padded: a
+            // padded input's row of the tile is [`PAD`])
+            let a = k.div_ceil(l.py);
             let outs = l.parts(
                 col,
                 Cols {
@@ -187,14 +192,16 @@ fn tile_cells(
                 },
             );
             (
-                (row * a..(row + 1) * a).map(|x| x as usize).collect(),
+                (row * a..(row + 1) * a)
+                    .map(|x| if x < *k { x as usize } else { PAD })
+                    .collect(),
                 outs.iter()
                     .flat_map(|(_, s)| (s.from..s.from + s.len).map(|x| x as usize))
                     .collect(),
             )
         }
         Side::Col => {
-            let b2 = n / l.py;
+            let b2 = n.div_ceil(l.py);
             let ins = l.parts(col, *input);
             (
                 ins.iter()
@@ -202,7 +209,9 @@ fn tile_cells(
                         (s.from - input.from..s.from - input.from + s.len).map(|x| x as usize)
                     })
                     .collect(),
-                (row * b2..(row + 1) * b2).map(|x| x as usize).collect(),
+                (row * b2..(row + 1) * b2)
+                    .map(|x| if x < *n { x as usize } else { PAD })
+                    .collect(),
             )
         }
     };
@@ -226,7 +235,7 @@ fn fill(p: &Program, vals: Option<&Values>, a: &HostArray) -> R<Vec<f32>> {
                 // an identity's tile: one where the input column is the output's
                 for (ri, &xr) in rows.iter().enumerate() {
                     for (ci, &oc) in cols.iter().enumerate() {
-                        if xr == oc {
+                        if xr == oc && xr != PAD {
                             out[1 + ri * cols.len() + ci] = f32::from_bits(bits16(1.0, ieee));
                         }
                     }
@@ -237,7 +246,11 @@ fn fill(p: &Program, vals: Option<&Values>, a: &HostArray) -> R<Vec<f32>> {
             // tile[r][c] = W[out c, in r]
             for (ri, &xr) in rows.iter().enumerate() {
                 for (ci, &oc) in cols.iter().enumerate() {
-                    let wv = w[oc * kk + xr];
+                    let wv = if xr == PAD || oc == PAD {
+                        0.0
+                    } else {
+                        w[oc * kk + xr]
+                    };
                     out[1 + ri * cols.len() + ci] = f32::from_bits(bits16(wv, ieee));
                 }
             }
@@ -447,6 +460,38 @@ pub fn spans(p: &Program, a: &HostArray) -> R<Option<Vec<Span>>> {
     // of consecutive output columns, the rows one span where they are consecutive inputs and
     // the row is one stretch
     let mut stretches: Vec<(usize, usize)> = Vec::new();
+    if rows.contains(&PAD) || cols.contains(&PAD) {
+        // a padded tile: each cell a span of its own, a padded one none's
+        let flags = FLAT | cast;
+        let mut s: Vec<Span> = vec![[NONE, 0, 0, 1, 0, 0, 1, 0]];
+        for &xr in &rows {
+            for &oc in &cols {
+                s.push(
+                    if xr == PAD || oc == PAD || (weight.0 == UNIT && xr != oc) {
+                        [NONE, 0, 0, 1, 0, 0, 1, 0]
+                    } else if weight.0 == UNIT {
+                        [UNIT, 0, 0, 1, 0, flags, 1, 0]
+                    } else {
+                        [
+                            weight.0,
+                            0,
+                            (oc * kk + xr) as u32,
+                            1,
+                            kk as u32,
+                            flags,
+                            1,
+                            0,
+                        ]
+                    },
+                );
+            }
+        }
+        let used = 1 + rows.len() * cols.len();
+        if used < a.len as usize {
+            s.push([NONE, 0, 0, (a.len as usize - used) as u32, 0, 0, 1, 0]);
+        }
+        return Ok(Some(s));
+    }
     for &c in &cols {
         match stretches.last_mut() {
             Some((from, n)) if *from + *n == c => *n += 1,
@@ -620,8 +665,14 @@ pub fn gather(p: &Program, a: &HostArray) -> R<Option<Gather>> {
                     } else {
                         (tr, ONE)
                     };
+                    let whole = width_of_value(&p.trace, base);
                     for e in 0..len {
-                        g[(t * width + o + e) as usize] = [base, row, from + e, one | clamp];
+                        // (past a value the row roots pad: a zero)
+                        g[(t * width + o + e) as usize] = if from + e < whole {
+                            [base, row, from + e, one | clamp]
+                        } else {
+                            [NONE, 0, 0, 0]
+                        };
                     }
                     o += len;
                 }
@@ -863,4 +914,19 @@ pub fn write(p: &Program, arrays: &[HostArray], gold: Option<&Path>, out: &Path)
     )
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// `v`'s row width in `trace` (a moved copy's, its value's).
+fn width_of_value(trace: &poem_ir::Trace, v: u32) -> u32 {
+    match trace
+        .values
+        .get((v & !super::unit::MOVED) as usize)
+        .map(|d| &d.ty)
+    {
+        Some(poem_ir::Ty::Tensor { shape, .. }) => match shape.last() {
+            Some(poem_ir::Dim::Const(n)) => *n as u32,
+            _ => 0,
+        },
+        _ => 0,
+    }
 }

@@ -609,35 +609,18 @@ pub fn program_at(
             word,
             prologue: u.classes.is_empty(),
         };
-        // every row-side value cuts evenly over the row roots
+        // a row-side value its row roots hold padded (narrower than them, or of no multiple)
+        // passes through matvecs and the row stream; a row region reads it whole
         for st in &u.steps {
-            let w = match st {
-                Step::In {
-                    value,
-                    side: Side::Row,
-                    ..
-                } => r.width(*value),
-                Step::Out {
-                    value,
-                    side: Side::Row,
-                    ..
-                } => value.width,
-                Step::Matvec {
-                    from: Side::Col, n, ..
-                } => *n,
-                Step::Matvec {
-                    from: Side::Row, k, ..
-                } => *k,
-                Step::Region {
-                    side: Side::Row,
-                    chain,
-                } => chain.region.width,
-                _ => 0,
-            };
-            if !w.is_multiple_of(py) {
+            if let Step::Region {
+                side: Side::Row,
+                chain,
+            } = st
+                && !chain.region.width.is_multiple_of(py)
+            {
                 return Err(format!(
-                    "{name}: {}: a row-side value of {w} columns cuts over no {py} rows",
-                    u.name
+                    "{name}: {}: a row region of {} columns cuts over no {py} rows",
+                    u.name, chain.region.width
                 ));
             }
         }

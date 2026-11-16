@@ -864,7 +864,7 @@ fn weight_file(
         let mut keep = String::new();
         if spill && si < b.unit.split {
             for v in held_rows(b, st) {
-                let len = r.width(v) / l.py;
+                let len = r.width(v).div_ceil(l.py);
                 let off: u32 = kept.iter().sum();
                 kept.push(len);
                 drn = drn.max(len);
@@ -932,7 +932,7 @@ fn weight_file(
             }
             None => match from {
                 Side::Row => {
-                    let hc = k / l.py;
+                    let hc = k.div_ceil(l.py);
                     drn = drn.max(hc);
                     let _ = writeln!(
                         body,
@@ -941,7 +941,7 @@ fn weight_file(
                 }
                 Side::Col => {
                     if east.iter().any(|&c2| place::tile_dims(st, l, c2).is_some()) {
-                        let no = n / l.py;
+                        let no = n.div_ceil(l.py);
                         zer = zer.max(no);
                         let _ = writeln!(
                             body,
@@ -1080,7 +1080,7 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
     let rows = u.rows;
     let held = |v: ValueId| u.held.contains(&v);
     // a row-side value's chunk at this root
-    let hc = |w: u32| w / l.py;
+    let hc = |w: u32| w.div_ceil(l.py);
     // this root's columns of `base` (Row: its chunk; Col: its slices)
     let mine = |base: ValueId, width: u32| -> Vec<(u32, u32)> {
         match side {

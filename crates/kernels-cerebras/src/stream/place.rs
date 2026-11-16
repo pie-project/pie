@@ -416,7 +416,7 @@ pub fn tile_dims(s: &Step, l: &Layout, col: u32) -> Option<(u32, u32)> {
     };
     let (a, b) = match from {
         Side::Row => (
-            k / l.py,
+            k.div_ceil(l.py),
             l.words(
                 col,
                 Cols {
@@ -426,7 +426,7 @@ pub fn tile_dims(s: &Step, l: &Layout, col: u32) -> Option<(u32, u32)> {
                 },
             ),
         ),
-        Side::Col => (l.words(col, *input), n / l.py),
+        Side::Col => (l.words(col, *input), n.div_ceil(l.py)),
     };
     (a > 0 && b > 0).then_some((a, b))
 }
@@ -488,7 +488,7 @@ fn row_held_words(r: &Reader, u: &Unit, py: u32) -> (u32, u32) {
                 side: Side::Row,
                 host: true,
             } => {
-                host += u.rows * (r.width(*value) / py);
+                host += u.rows * r.width(*value).div_ceil(py);
                 hin.push(*value);
             }
             Step::Out {
@@ -496,13 +496,13 @@ fn row_held_words(r: &Reader, u: &Unit, py: u32) -> (u32, u32) {
                 side: Side::Row,
                 host: true,
                 lane: false,
-            } => host += u.rows * (value.width / py),
+            } => host += u.rows * value.width.div_ceil(py),
             _ => {}
         }
     }
     for v in &u.held {
         if u.sides.get(v) == Some(&Side::Row) && !hin.contains(v) {
-            over += u.rows * (r.width(*v) / py);
+            over += u.rows * r.width(*v).div_ceil(py);
         }
     }
     (host, over)
