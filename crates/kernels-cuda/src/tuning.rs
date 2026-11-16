@@ -377,6 +377,12 @@ pub struct MoeMxfp4Fp8From(pub u32);
 #[decision(id = "kernel.moe.mxfp4_bf16_from", constant(range(0..=65_536)), default = 0, tune = search)]
 pub struct MoeMxfp4Bf16From(pub u32);
 
+/// The fewest routes a block-FP8 select quantizes its rows for and runs on
+/// the FP8 MMA (W8A8); fewer keep the register-held W8A16 kernels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.fp8a8_from", constant(range(1..=65_536)), default = 64, tune = search)]
+pub struct MoeFp8a8From(pub u32);
+
 /// The fewest routes an expert, on average, a block-FP8 select runs on
 /// Hopper's warp-specialized wgmma GEMM (128 routes by 128 weight rows a CTA,
 /// a producer warpgroup and two consumers); fewer keep the one-warpgroup
@@ -1021,6 +1027,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeMxfp4Fp8From>()
         .add::<MoeMxfp4Bf16From>()
         .add::<MoeMxfp4Bf16Down>()
+        .add::<MoeFp8a8From>()
         .add::<MoeFp8a8WsFrom>()
         .add::<MoeFp8a8WsNarrow>()
         .add::<MoeFp8a8Tma>()
@@ -1185,6 +1192,7 @@ tuning! {
     mxfp4_fp8_from: u32 = 0, get MoeMxfp4Fp8From;
     mxfp4_bf16_from: u32 = 0, get MoeMxfp4Bf16From;
     mxfp4_bf16_down: bool = false, on MoeMxfp4Bf16Down;
+    fp8a8_from: u32 = 64, get MoeFp8a8From;
     fp8a8_ws_from: u32 = 0, get MoeFp8a8WsFrom;
     fp8a8_ws_narrow: bool = false, on MoeFp8a8WsNarrow;
     fp8a8_tma: bool = false, on MoeFp8a8Tma;
