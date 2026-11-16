@@ -420,7 +420,10 @@ mod tests {
             "kernel.attn.append_page_rows",
             "kernel.attn.decode_chunk_keys",
         ] {
-            assert!(ids.contains(&id), "{id} runs unmeasured and is named: {ids:?}");
+            assert!(
+                ids.contains(&id),
+                "{id} runs unmeasured and is named: {ids:?}"
+            );
         }
         // A decision the file measured is not named.
         assert!(!ids.contains(&"kernel.attn.decode_pages"), "{ids:?}");
