@@ -32,7 +32,7 @@ pub const SELECT_GROUPS: u32 = 64;
 /// The words the one-row select keeps just below a node's temporary area
 /// (the runtime's `SEL_WORDS`): its state, each group's histogram and
 /// counts, and the candidates.
-pub const SELECT_WORDS: u32 = 16 + SELECT_GROUPS * 258 + 2 * 1024;
+pub const SELECT_WORDS: u32 = 32 + SELECT_GROUPS * 514 + 2 * 1024;
 
 /// The stage kernel's entry point.
 pub const ENTRY: &str = "ptir_stage";
@@ -43,6 +43,10 @@ pub const STEP_RECORD_BYTES: usize = 32;
 /// A record's call word where the call runs only for a row the one-row
 /// select handed the sort ladder (`PS_GUARDED`).
 pub const GUARDED: u32 = 0x8000_0000;
+
+/// A record's call word where the call is folded into the step after it
+/// (`PS_SKIP`: a one-row select's pick), which runs nothing and meets none.
+pub const SKIP: u32 = 0x2000_0000;
 
 /// A record's call word where the call keeps a ladder's buffers (a sort's,
 /// a reduce's), which lie in the fire's arena (`PS_ARENA`,
@@ -281,6 +285,7 @@ extern "C" __global__ void __launch_bounds__(256) ptir_stage(PS_STAGE_ARGS) {
       c.temporary = step.temporary;
       // The select's ladder state was written before the last meeting, so
       // every block of the lane skips a guarded step alike.
+      if ((step.call & PS_SKIP) != 0u) continue;
       if ((step.call & PS_GUARDED) != 0u && c.sel_ladder_idle()) continue;
       if ((step.call & PS_ARENA) != 0u) c.temporary = arena_words;
       const ps_u32 node = step.node;
@@ -288,7 +293,7 @@ extern "C" __global__ void __launch_bounds__(256) ptir_stage(PS_STAGE_ARGS) {
       const ps_u32 selector = step.selector;
       (void)rung;
       (void)selector;
-      switch (step.call & ~(PS_GUARDED | PS_ARENA)) {
+      switch (step.call & ~(PS_GUARDED | PS_ARENA | PS_SKIP)) {
 "#;
 
 const STAGE_TAIL: &str = r"        default: break;
@@ -517,8 +522,13 @@ pub fn record(step: &Step, set: &[Kernel]) -> Option<[u32; 4]> {
     } else {
         0
     };
+    let skip = if step.kernel == Kernel::Step(Call::SelPick) {
+        SKIP
+    } else {
+        0
+    };
     Some([
-        at | guard | arena,
+        at | guard | arena | skip,
         step.uniform.node,
         step.uniform.rung,
         step.uniform.selector,

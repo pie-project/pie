@@ -32,16 +32,18 @@ typedef unsigned long long ps_u64;
 #define SEL_CAP 1024u
 // A lane's blocks a one-row select splits the row over, and the state it
 // keeps below the temporary area (`cuda_steps::SELECT_WORDS`):
-// 16 + SEL_GROUPS * 258 + 2 * SEL_CAP.
+// SEL_HEAD + SEL_GROUPS * 514 + 2 * SEL_CAP.
 #define SEL_GROUPS 64u
-#define SEL_WORDS 18576u
-#define SEL_MODE 0u
-#define SEL_ACTIVE 1u
-#define SEL_WANT 2u
-#define SEL_PREFIX 3u
-#define SEL_REMAINING 4u
-#define SEL_TOTAL_LT 5u
-#define SEL_KEEP 6u
+#define SEL_HEAD 32u
+#define SEL_WORDS 34976u
+#define SEL_ACTIVE 0u
+#define SEL_WANT 1u
+#define SEL_KEEP 2u
+#define SEL_TOTAL_LT 3u
+#define SEL_WALK 4u
+#define SEL_MODE_AT 8u
+#define SEL_PREFIX_AT 16u
+#define SEL_REMAINING_AT 24u
 #define SEL_RUNS 0u
 #define SEL_DECIDED 1u
 #define SEL_LADDER 2u
@@ -107,6 +109,7 @@ __shared__ ps_u32 sel_wg_fill[2];
 __shared__ ps_u32 sel_wg_key[1024];
 __shared__ ps_u32 sel_wg_idx[1024];
 __shared__ ps_u32 sel_wg_skip;
+__shared__ ps_u32 sel_wg_state[3];
 
 __device__ __forceinline__ float ps_f(ps_u32 bits) { return __uint_as_float(bits); }
 __device__ __forceinline__ ps_u32 ps_bits(float x) { return __float_as_uint(x); }
@@ -1474,24 +1477,26 @@ struct Ps {
   }
 
   // ---- the one-row select ----
+  //
+  // Its state, below the node's temporary area: the busy blocks, the
+  // count wanted, what a decided rank keeps, the count below the cut, the
+  // walk's verdict, then each sweep's mode, prefix and count remaining
+  // (`SEL_MODE_AT + s` and on: sweep s's start, s + 1 its pick's result),
+  // each block's histogram of a sweep (two, by the sweep's parity), its
+  // counts, and the candidates. A sweep's pick is folded into the step
+  // that follows it, every block computing it alike from the histograms
+  // the last step left, so the ladder meets once a sweep.
 
   __device__ ps_u32 sel_at(ps_u32 k) { return temporary - SEL_WORDS + k; }
-  __device__ ps_u32 sel_part(ps_u32 g, ps_u32 b) { return sel_at(16u + g * 256u + b); }
-  __device__ ps_u32 sel_count(ps_u32 g, ps_u32 which) {
-    return sel_at(16u + SEL_GROUPS * 256u + g * 2u + which);
+  __device__ ps_u32 sel_part(ps_u32 parity, ps_u32 g, ps_u32 b) {
+    return sel_at(SEL_HEAD + (parity * SEL_GROUPS + g) * 256u + b);
   }
-  __device__ ps_u32 sel_cand_key(ps_u32 i) { return sel_at(16u + SEL_GROUPS * 258u + i); }
-  __device__ ps_u32 sel_cand_idx(ps_u32 i) { return sel_at(16u + SEL_GROUPS * 258u + SEL_CAP + i); }
-
-  // Whether this block sits the step out; uniform across it.
-  __device__ bool sel_skips(bool only_first) {
-    if (sel_lt == 0u) {
-      const ps_u32 busy = heap[sel_at(SEL_ACTIVE)];
-      const bool idle = only_first ? sel_group != 0u : sel_group >= busy;
-      sel_wg_skip = (heap[sel_at(SEL_MODE)] != SEL_RUNS || idle) ? 1u : 0u;
-    }
-    __syncthreads();
-    return sel_wg_skip != 0u;
+  __device__ ps_u32 sel_count(ps_u32 g, ps_u32 which) {
+    return sel_at(SEL_HEAD + SEL_GROUPS * 512u + g * 2u + which);
+  }
+  __device__ ps_u32 sel_cand_key(ps_u32 i) { return sel_at(SEL_HEAD + SEL_GROUPS * 514u + i); }
+  __device__ ps_u32 sel_cand_idx(ps_u32 i) {
+    return sel_at(SEL_HEAD + SEL_GROUPS * 514u + SEL_CAP + i);
   }
 
   __device__ uint2 sel_chunk(ps_u32 n) {
@@ -1501,7 +1506,108 @@ struct Ps {
     return make_uint2(lo, ps_minu(lo + chunk, n));
   }
 
-  __device__ bool sel_ladder_idle() { return heap[sel_at(SEL_MODE)] != SEL_LADDER; }
+  // The state sweep `s` starts from, into the block's copy.
+  __device__ void sel_load(ps_u32 s) {
+    if (sel_lt == 0u) {
+      sel_wg_state[0] = heap[sel_at(SEL_MODE_AT + s)];
+      sel_wg_state[1] = heap[sel_at(SEL_PREFIX_AT + s)];
+      sel_wg_state[2] = heap[sel_at(SEL_REMAINING_AT + s)];
+    }
+    __syncthreads();
+  }
+
+  // Sweep `s`'s pick, from the histograms it left: into the block's copy,
+  // and the first block lands it as sweep s + 1's start.
+  __device__ void sel_fold(ps_u32 p, ps_u32 s) {
+    const ps_u32 mode = heap[sel_at(SEL_MODE_AT + s)];
+    if (mode == SEL_RUNS) {
+      const ps_u32 busy = heap[sel_at(SEL_ACTIVE)];
+      ps_u32 here = 0u;
+      for (ps_u32 g = 0u; g < busy; ++g) here = here + heap[sel_part(s & 1u, g, sel_lt)];
+      sel_wg_key[sel_lt] = here;
+    }
+    __syncthreads();
+    if (sel_lt == 0u) {
+      ps_u32 next = mode;
+      ps_u32 prefix = heap[sel_at(SEL_PREFIX_AT + s)];
+      ps_u32 remaining = heap[sel_at(SEL_REMAINING_AT + s)];
+      const bool lands = sel_group == 0u;
+      bool picks = mode == SEL_RUNS;
+      if (picks && s == 0u) {
+        const ps_u32 n = d_len(p_a0(p));
+        ps_u32 count = 0u;
+        ps_u32 negative = 0u;
+        for (ps_u32 b = 0u; b < 256u; ++b) {
+          count = count + sel_wg_key[b];
+          if (b >= 128u) negative = negative + sel_wg_key[b];
+        }
+        const ps_u32 payload = p_pred_payload(p);
+        ps_u32 want = 0u;
+        if (p_pred_tag(p) == 0u) {
+          const int k = ld_i(payload, 0u);
+          if (k <= 0 || (ps_u32)k >= count) {
+            if (lands) heap[sel_at(SEL_KEEP)] = k <= 0 ? SEL_KEEP_NONE : SEL_KEEP_ALL;
+            next = SEL_DECIDED;
+            picks = false;
+          }
+          want = k > 0 ? (ps_u32)k : 0u;
+        } else {
+          const float cut = ld_f(payload, 0u);
+          if (!(0.0f < cut)) {
+            next = SEL_DECIDED;
+            picks = false;
+          } else if (negative != 0u || count != n || count == 0u) {
+            next = SEL_LADDER;
+            picks = false;
+          }
+          want = ps_minu(SEL_CAP, count);
+        }
+        if (picks) {
+          if (lands) heap[sel_at(SEL_WANT)] = want;
+          remaining = want;
+        }
+      }
+      if (picks) {
+        const ps_u32 shift = 24u - 8u * s;
+        ps_u32 before = 0u;
+        ps_u32 digit = 0u;
+        for (;;) {
+          if (digit + 1u >= 256u) break;
+          const ps_u32 count = sel_wg_key[digit];
+          if (before + count >= remaining) break;
+          before = before + count;
+          digit = digit + 1u;
+        }
+        prefix = prefix | (digit << shift);
+        remaining = remaining - before;
+        if (s == 3u && lands) {
+          heap[sel_at(SEL_TOTAL_LT)] = heap[sel_at(SEL_WANT)] - remaining;
+        }
+      }
+      sel_wg_state[0] = next;
+      sel_wg_state[1] = prefix;
+      sel_wg_state[2] = remaining;
+      if (lands) {
+        heap[sel_at(SEL_MODE_AT + s + 1u)] = next;
+        heap[sel_at(SEL_PREFIX_AT + s + 1u)] = prefix;
+        heap[sel_at(SEL_REMAINING_AT + s + 1u)] = remaining;
+      }
+    }
+    __syncthreads();
+  }
+
+  // Whether this block sits the step out, by its copy of the state.
+  __device__ bool sel_idle(bool only_first) {
+    const ps_u32 busy = heap[sel_at(SEL_ACTIVE)];
+    const bool idle = only_first ? sel_group != 0u : sel_group >= busy;
+    return sel_wg_state[0] != SEL_RUNS || idle;
+  }
+
+  __device__ bool sel_ladder_idle() {
+    const ps_u32 last = heap[sel_at(SEL_MODE_AT + 4u)];
+    const ps_u32 mode = last != SEL_RUNS ? last : heap[sel_at(SEL_WALK)];
+    return mode != SEL_LADDER;
+  }
 
   __device__ void sel_init(ps_u32 p) {
     const ps_u32 o = p_o0(p);
@@ -1509,19 +1615,22 @@ struct Ps {
     const ps_u32 words = (n + 3u) / 4u;
     for (ps_u32 w = tid; w < words; w += lanes) heap[base(o) + w] = 0u;
     if (tid == 0u) {
-      heap[sel_at(SEL_MODE)] = SEL_RUNS;
       heap[sel_at(SEL_ACTIVE)] = ps_maxu(ps_minu(SEL_GROUPS, sel_groups), 1u);
-      heap[sel_at(SEL_PREFIX)] = 0u;
       heap[sel_at(SEL_KEEP)] = SEL_KEEP_CUT;
+      heap[sel_at(SEL_WALK)] = SEL_RUNS;
+      heap[sel_at(SEL_MODE_AT)] = SEL_RUNS;
+      heap[sel_at(SEL_PREFIX_AT)] = 0u;
+      heap[sel_at(SEL_REMAINING_AT)] = 0u;
     }
   }
 
   __device__ void sel_hist(ps_u32 p, ps_u32 sweep) {
-    if (sel_skips(false)) return;
+    if (sweep == 0u) sel_load(0u); else sel_fold(p, sweep - 1u);
+    if (sel_idle(false)) return;
     const ps_u32 a = p_a0(p);
     const uint2 span = sel_chunk(d_len(a));
     const ps_u32 shift = 24u - 8u * sweep;
-    const ps_u32 prefix = heap[sel_at(SEL_PREFIX)];
+    const ps_u32 prefix = sel_wg_state[1];
     sel_wg_hist[sel_lt] = 0u;
     __syncthreads();
     for (ps_u32 i = span.x + sel_lt; i < span.y; i += PTIR_WG) {
@@ -1532,77 +1641,22 @@ struct Ps {
         atomicAdd(&sel_wg_hist[(key >> shift) & 255u], 1u);
     }
     __syncthreads();
-    heap[sel_part(sel_group, sel_lt)] = sel_wg_hist[sel_lt];
+    heap[sel_part(sweep & 1u, sel_group, sel_lt)] = sel_wg_hist[sel_lt];
   }
 
+  // Folded into the step after it ([`sel_fold`]); its record skips it.
   __device__ void sel_pick(ps_u32 p, ps_u32 sweep) {
-    if (sel_skips(true)) return;
-    const ps_u32 busy = heap[sel_at(SEL_ACTIVE)];
-    ps_u32 here = 0u;
-    for (ps_u32 g = 0u; g < busy; ++g) here = here + heap[sel_part(g, sel_lt)];
-    sel_wg_key[sel_lt] = here;
-    __syncthreads();
-    if (sel_lt != 0u) return;
-    ps_u32 remaining = heap[sel_at(SEL_REMAINING)];
-    if (sweep == 0u) {
-      const ps_u32 n = d_len(p_a0(p));
-      ps_u32 count = 0u;
-      ps_u32 negative = 0u;
-      for (ps_u32 b = 0u; b < 256u; ++b) {
-        count = count + sel_wg_key[b];
-        if (b >= 128u) negative = negative + sel_wg_key[b];
-      }
-      const ps_u32 payload = p_pred_payload(p);
-      ps_u32 want = 0u;
-      if (p_pred_tag(p) == 0u) {
-        const int k = ld_i(payload, 0u);
-        if (k <= 0) {
-          heap[sel_at(SEL_KEEP)] = SEL_KEEP_NONE;
-          heap[sel_at(SEL_MODE)] = SEL_DECIDED;
-          return;
-        }
-        if ((ps_u32)k >= count) {
-          heap[sel_at(SEL_KEEP)] = SEL_KEEP_ALL;
-          heap[sel_at(SEL_MODE)] = SEL_DECIDED;
-          return;
-        }
-        want = (ps_u32)k;
-      } else {
-        const float cut = ld_f(payload, 0u);
-        if (!(0.0f < cut)) {
-          heap[sel_at(SEL_MODE)] = SEL_DECIDED;
-          return;
-        }
-        if (negative != 0u || count != n || count == 0u) {
-          heap[sel_at(SEL_MODE)] = SEL_LADDER;
-          return;
-        }
-        want = ps_minu(SEL_CAP, count);
-      }
-      heap[sel_at(SEL_WANT)] = want;
-      remaining = want;
-    }
-    const ps_u32 shift = 24u - 8u * sweep;
-    ps_u32 before = 0u;
-    ps_u32 digit = 0u;
-    for (;;) {
-      if (digit + 1u >= 256u) break;
-      const ps_u32 count = sel_wg_key[digit];
-      if (before + count >= remaining) break;
-      before = before + count;
-      digit = digit + 1u;
-    }
-    heap[sel_at(SEL_PREFIX)] = heap[sel_at(SEL_PREFIX)] | (digit << shift);
-    heap[sel_at(SEL_REMAINING)] = remaining - before;
-    if (sweep == 3u) heap[sel_at(SEL_TOTAL_LT)] = heap[sel_at(SEL_WANT)] - (remaining - before);
+    (void)p;
+    (void)sweep;
   }
 
   __device__ void sel_rank_mask(ps_u32 p) {
+    sel_fold(p, 3u);
     const ps_u32 a = p_a0(p);
     const ps_u32 o = p_o0(p);
     const ps_u32 n = d_len(a);
     const ps_u32 keep = heap[sel_at(SEL_KEEP)];
-    const ps_u32 cut = heap[sel_at(SEL_PREFIX)];
+    const ps_u32 cut = sel_wg_state[1];
     const ps_u32 words = (n + 3u) / 4u;
     for (ps_u32 w = tid; w < words; w += lanes) {
       bool b[4];
@@ -1620,10 +1674,11 @@ struct Ps {
   }
 
   __device__ void sel_tally(ps_u32 p) {
-    if (sel_skips(false)) return;
+    sel_fold(p, 3u);
+    if (sel_idle(false)) return;
     const ps_u32 a = p_a0(p);
     const uint2 span = sel_chunk(d_len(a));
-    const ps_u32 cut = heap[sel_at(SEL_PREFIX)];
+    const ps_u32 cut = sel_wg_state[1];
     if (sel_lt < 2u) sel_wg_fill[sel_lt] = 0u;
     __syncthreads();
     for (ps_u32 i = span.x + sel_lt; i < span.y; i += PTIR_WG) {
@@ -1636,10 +1691,11 @@ struct Ps {
   }
 
   __device__ void sel_place(ps_u32 p) {
-    if (sel_skips(false)) return;
+    sel_load(4u);
+    if (sel_idle(false)) return;
     const ps_u32 a = p_a0(p);
     const uint2 span = sel_chunk(d_len(a));
-    const ps_u32 cut = heap[sel_at(SEL_PREFIX)];
+    const ps_u32 cut = sel_wg_state[1];
     const ps_u32 below = heap[sel_at(SEL_TOTAL_LT)];
     ps_u32 lt_at = 0u;
     ps_u32 eq_at = 0u;
@@ -1665,13 +1721,9 @@ struct Ps {
     }
   }
 
-  __device__ void st_b_on(ps_u32 v, ps_u32 i) {
-    const ps_u32 at = base(v) + i / 4u;
-    heap[at] = heap[at] | (0xFFu << (8u * (i % 4u)));
-  }
-
   __device__ void sel_walk(ps_u32 p) {
-    if (sel_skips(true)) return;
+    sel_load(4u);
+    if (sel_idle(true)) return;
     const ps_u32 a = p_a0(p);
     const ps_u32 o = p_o0(p);
     const ps_u32 busy = heap[sel_at(SEL_ACTIVE)];
@@ -1735,7 +1787,7 @@ struct Ps {
       }
       sel_wg_skip = t;
       const bool whole = held == d_len(a);
-      heap[sel_at(SEL_MODE)] = (reached || !(excl < cut) || whole) ? SEL_DECIDED : SEL_LADDER;
+      heap[sel_at(SEL_WALK)] = (reached || !(excl < cut) || whole) ? SEL_DECIDED : SEL_LADDER;
     }
     __syncthreads();
     const ps_u32 marked = sel_wg_skip;
@@ -1792,6 +1844,8 @@ struct PsStep {
 #define PS_GUARDED 0x80000000u
 // A call that keeps a sort's buffers, in the fire's arena: one a lane slot.
 #define PS_ARENA 0x40000000u
+// A call folded into the step after it (a one-row select's pick).
+#define PS_SKIP 0x20000000u
 
 static_assert(sizeof(PsStep) == 32, "step ABI");
 
