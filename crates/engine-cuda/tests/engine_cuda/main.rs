@@ -4,20 +4,6 @@
 #[cfg(feature = "rocm")]
 extern crate kernels_rocm as kernels_cuda;
 
-// Strict kernels for the whole binary, before any test runs: an
-// instantiation that will not compile fails its test instead of falling
-// back unseen.
-#[cfg(all(any(feature = "cuda", feature = "rocm"), target_os = "linux"))]
-#[used]
-#[allow(unsafe_code)]
-#[unsafe(link_section = ".init_array")]
-static STRICT_KERNELS: extern "C" fn() = {
-    extern "C" fn on() {
-        kernels_cuda::jit::strict_kernels();
-    }
-    on
-};
-
 /// The pool a test's load states: a served load takes what the card has
 /// left, and the tests of one process load beside each other.
 pub const POOL: u64 = 256 << 20;
@@ -40,7 +26,6 @@ mod a_beam_step_answers_what_the_interpreter_answers;
 mod a_bidirectional_attention_adds_its_relative_bias_through_the_engine;
 #[cfg(feature = "rocm")]
 mod blocks_that_meet_run_on_a_few_units;
-mod a_stated_group_mask_reads_only_the_rows_it_admits;
 mod a_bound_guest_holds_its_scratch_as_state;
 mod a_buffer_frees_after_another_context_closes;
 mod a_closed_contexts_kept_memory_serves_the_next;
@@ -86,6 +71,7 @@ mod a_second_fire_reads_the_input_cells_it_was_handed;
 mod a_served_models_lanes_answer_as_each_lane_alone;
 mod a_shared_adapter_is_one_slot_and_one_load;
 mod a_shifted_body_admits_the_split_that_moved;
+mod a_stated_group_mask_reads_only_the_rows_it_admits;
 mod a_stored_k_quant_row_serves_as_stored;
 mod a_synthesized_region_serves_the_logits_of_its_ops;
 mod a_tapped_fire_reads_each_layer_out_as_the_pool_holds_it;

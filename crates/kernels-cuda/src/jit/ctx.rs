@@ -425,14 +425,8 @@ impl Ctx {
     ) -> Result<*mut c_void, Error> {
         #[cfg(feature = "cuda")]
         {
-            crate::jit::device::take(
-                self.slabs.0,
-                self.stream,
-                name,
-                self.region.get(),
-                bytes,
-            )
-            .map_err(|fault| fault.at(op))
+            crate::jit::device::take(self.slabs.0, self.stream, name, self.region.get(), bytes)
+                .map_err(|fault| fault.at(op))
         }
         #[cfg(not(feature = "cuda"))]
         {
@@ -453,14 +447,8 @@ impl Ctx {
     ) -> Result<*mut c_void, Error> {
         #[cfg(feature = "cuda")]
         {
-            crate::jit::device::take(
-                self.slabs.0,
-                self.owner,
-                name,
-                NO_REGION,
-                bytes,
-            )
-            .map_err(|fault| fault.at(op))
+            crate::jit::device::take(self.slabs.0, self.owner, name, NO_REGION, bytes)
+                .map_err(|fault| fault.at(op))
         }
         #[cfg(not(feature = "cuda"))]
         {
@@ -479,14 +467,8 @@ impl Ctx {
     ) -> Result<*mut c_void, Error> {
         #[cfg(feature = "cuda")]
         {
-            crate::jit::device::take(
-                self.slabs.0,
-                self.owner,
-                name,
-                NO_REGION,
-                bytes,
-            )
-            .map_err(|fault| fault.at(op))
+            crate::jit::device::take(self.slabs.0, self.owner, name, NO_REGION, bytes)
+                .map_err(|fault| fault.at(op))
         }
         #[cfg(not(feature = "cuda"))]
         {
@@ -658,7 +640,7 @@ impl Ctx {
     ) -> Result<(), Error> {
         let resolved = match kernel.resolve() {
             Ok(resolved) => resolved,
-            Err(why) => return Err(said(kernel, why).at(op)),
+            Err(why) => unfireable(op, kernel, &why),
         };
 
         if let Some(why) = mismatch(&resolved.params, args) {
@@ -679,7 +661,7 @@ impl Ctx {
         };
         match fired {
             Ok(()) => Ok(()),
-            Err(why) => Err(said(kernel, why).at(op)),
+            Err(why) => unfireable(op, kernel, &why),
         }
     }
 
@@ -719,24 +701,6 @@ fn mismatch(params: &[usize], args: &[ArgValue]) -> Option<String> {
     None
 }
 
-/// Whether a device instantiation that will not fire (it does not compile,
-/// or its module does not load) panics rather than falling back: on under
-/// `PIE_STRICT_KERNELS=1` or [`strict_kernels`], as the test harnesses run.
-/// Off, the fallback serves (another chip's toolchain may lack what one
-/// unit asks) and the fault is said once.
-#[must_use]
-pub fn kernels_strict() -> bool {
-    STRICT.load(std::sync::atomic::Ordering::Relaxed)
-        || std::env::var_os("PIE_STRICT_KERNELS").is_some_and(|v| v == "1")
-}
-
-/// Turns [`kernels_strict`] on for this process.
-pub fn strict_kernels() {
-    STRICT.store(true, std::sync::atomic::Ordering::Relaxed);
-}
-
-static STRICT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 /// Turns on, for this process, the count [`fires`] reads: each fire an op
 /// issues (eagerly or into a capture), so a test can tell a fused kernel
 /// that took its fire from one that declined to its primitives.
@@ -766,29 +730,15 @@ static COUNTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 static FIRES: std::sync::Mutex<std::collections::BTreeMap<&'static str, u64>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// A device instantiation that will not fire (it does not compile, its
+/// module does not load, or its launch is refused): a fault, never a
+/// fallback that serves in its place.
 #[cfg(feature = "cuda")]
-fn said(kernel: &Kernel, why: crate::jit::Fault) -> crate::jit::Fault {
-    use std::collections::HashSet;
-    use std::sync::{Mutex, OnceLock};
-
-    let (root, instantiation) = (kernel.file, kernel.name);
-    assert!(
-        !kernels_strict(),
-        "strict kernels: `{root}` {instantiation} will not fire: {why}"
-    );
-    static SAID: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    let said = SAID.get_or_init(|| Mutex::new(HashSet::new()));
-    if let Ok(mut said) = said.lock()
-        && said.insert(instantiation.to_owned())
-    {
-        tracing::error!(
-            root,
-            instantiation,
-            why = %why,
-            "a device instantiation will not fire"
-        );
-    }
-    why
+fn unfireable(op: &str, kernel: &Kernel, why: &crate::jit::Fault) -> ! {
+    panic!(
+        "{op}: `{}` {} will not fire: {why}",
+        kernel.file, kernel.name
+    )
 }
 
 fn trace_fires() -> bool {

@@ -32,7 +32,7 @@ pub(crate) use root::FLOAT_CONTRACT;
 
 pub use abi::{Arg, ArgValue};
 pub use ctx::{
-    Ctx, Fire, Launch, PLACED_ALIGN, Pad, SlabKey, Slabs, count_fires, fire_counts, fires, kernels_strict, strict_kernels,
+    Ctx, Fire, Launch, PLACED_ALIGN, Pad, SlabKey, Slabs, count_fires, fire_counts, fires,
 };
 pub(crate) use kernel::generated;
 pub use kernel::{Kernel, kernel};
