@@ -15,7 +15,8 @@ its bottleneck, §4.1), M2d (the tiled regime: a VAE's image over the fabric; fl
 the simulator in 0.9M cycles, 81x fewer, 50.1 dB from diffusers; klein's 1024² decode links,
 0.13 s priced; klein end to end 6.5 s, §4.1), M1j (flux2-mini on the CS-3: the denoise loop
 at 1.34M cycles a step, the simulator's numerics; `pie run text-to-media` on the system, 48.4 dB
-from diffusers, §4.1) and M3 (the decode
+from diffusers, §4.1), M1k (the PE clock is 750 MHz; a step's wall split; a reading's first
+launch no longer waits on its static arrays, §4.1) and M3 (the decode
 layouts as points of the Floorplan, §2.5). ARCHITECTURE.md is what runs for decode.
 
 **Goal.** A `.poem` model the compiler has not seen runs on the wafer with no hand code. The
@@ -1564,9 +1565,8 @@ milestone's tail.
     - The re-launched step's stamps are the simulator's 1.27M plus 6%, the cost model's plus
       11% (7% at 64 rows). The first launch's start-up is the simulator's artifact: 7.90M
       cycles there, 1.91M on the system.
-    - A step's wall (its entries written, the launch, the rows read back) fits 0.3 ms a launch
-      plus 1.55 ms an M cycles of stamps over the two sizes, where 875 MHz would be 1.14: the
-      stamps' clock or the launch's host side is not yet resolved.
+    - A step's wall (its entries written, the launch, the rows read back) is its stamps at the
+      PE clock, 750 MHz, not 875, plus the host's copies (M1k).
   - **The text reading and the denoise loop through the engine** (`flux_2_minis_text_on_the_fabric`
     with `READING_CMADDR`, request 1462): text, denoise and VAE decode co-resident in one
     program (153 x 65 PEs), compiled and linked on load on the worker (16 s), loaded in 37 s.
@@ -1599,8 +1599,67 @@ milestone's tail.
     | VAE decode, tiled (static arrays made) | 1.07M | 14.6 ms |
 
   - Left: the first launch of a co-resident program's denoise (10.7M cycles against 1.9M
-    standalone) and the 37 s load; a step's wall past its stamps (the host side of a launch);
-    the 64-row and klein programs through the engine on the system.
+    standalone) and the 37 s load (M1k); the 64-row and klein programs through the engine on the
+    system.
+
+- **M1k** (the CS-3's clock, a step's wall split, the first launch; requests 1470-1480).
+  - **The PE clock is 750 MHz.** A spin kernel (`fmuls` over 256 words, 267 cycles a round) timed
+    against host wall over 0.5 to 2.9 s spins: 750.0 MHz on one PE (requests 0119, 1470) and on
+    every PE of 80 x 28, 400 x 400 and 750 x 990 rectangles at once (742,500 PEs, 1472; the
+    slope between the 2M- and 8M-round spins 750.0 MHz at every size): no throttling under load.
+    Every "ms at 875 MHz" above is 7/6 of it. A stream kernel's `run` restarts its PE's TSC
+    (`enable_tsc`), so a launch's stamps are each PE's own time since its launch arrived (every
+    start reads 10-11) and a launch's cycles the longest PE's.
+  - **Decode agrees.** Llama 3.1 8B's pin with `TSTAMP:1` (request 1478): the token loop's
+    stamps 353.5k cycles a step (median of 31), 0.4713 ms at 750 MHz; the bare step at the pin
+    0.4711 ms (1466). At 875 MHz the stamps would say 0.404.
+  - **A denoise step's wall, split** (wafer-bench `--reading`, the runtime's copies timed by
+    kind; then the same reads again with nothing running, for their own cost; 1470, 1476):
+
+    | re-launched step | 16 + 16 | 64 + 64 |
+    |---|---|---|
+    | entries in (9 copies) | 0.13 ms | 0.13 ms |
+    | the launch call (returns at once) | 0.01 ms | 0.01 ms |
+    | on the wafer: the stamps at 750 MHz | 1.328M, 1.771 ms | 5.34M, 7.12 ms |
+    | the rows back (their own cost) | 0.38 ms | 0.95-1.10 ms |
+    | the stamps back (77 x 28 x 3 words) | 0.20 ms | 0.20 ms |
+    | **wall** | **2.40-2.45 ms** | **8.4-8.6 ms** |
+
+    The parts sum to the wall within 3% (the rows' copy waits on the program's end, so it
+    overlaps the tail). The same for the VAE decode in one launch: the rows regime 77.05M cycles,
+    102.7 ms at 750 MHz, 107.6 ms with its entries and pixels; tiled 1.107M, 1.48 ms, 2.1 ms.
+    The cost model's seconds now take the clock from one constant (`cost::CLOCK_HZ`): the decode
+    model's stamped rates (a weight and a head element, the max-reduce's cycle) at 750 MHz, the
+    chains' fitted rate 0.82 of a cycle; no plan or build changes (plan + build `diff -r`
+    identical for qwen35-d0.8b, qwen35-d9b, gptoss-20b, gemma4-e2b and tiny t08; Llama's is its
+    G2=11 pin's).
+  - **The first launch: the static arrays still landing.** The runtime's host-to-device copies
+    return before their words are on the PEs (flux2-mini's 6.6M words of denoise arrays: 107
+    copies in 11.2 ms, landing about 12 ms more). The engine wrote a reading's arrays at its
+    first step, just before its launch, so 240 PEs (rows 18-27 of the K / V and exit columns)
+    waited 8.96M cycles (11.9 ms) on them: the co-resident program's first denoise launch 10.8M
+    cycles, the second 1.33M. With 300 ms between the write and the launch, the first launch is
+    1.33M standalone and co-resident alike (1474); the standalone runs' 1.9M first launches were
+    the same wait, shorter. The engine now makes every reading's static arrays at load (they are
+    the weights' alone: made from a step of no inputs, word for word the first step's) and
+    opens a wafer's program at load, writing every co-resident reading's arrays at once (the
+    host fabric still writes a reading's at its first step). Through the engine on the system
+    (1480):
+
+    | | before (1462, 1468) | at load (1480) |
+    |---|---|---|
+    | load (the program loaded and its arrays written) | | 36.8 s |
+    | text step | 2.04M cycles, 37.1 s (the load) | 0.55-0.58M cycles, 58-110 ms |
+    | denoise step 0 | 10.7M cycles, 81-130 ms | **1.33-1.35M cycles, 2.7-2.9 ms** |
+    | denoise step 1 | 1.33M cycles, 2.5 ms | 1.33M cycles, 2.5-2.7 ms |
+    | VAE decode (tiled) | 1.07M cycles, 14.6 ms | 0.756M cycles, 1.8 ms |
+
+    `pie run text-to-media`'s PNG is 1468's byte for byte (48.4 dB from diffusers).
+  - **The load.** `SdkRuntime::load` on the system takes 26 s for the 77 x 28 denoise program
+    alone and 36 s for the three co-resident (153 x 65): the SDK's, not the engine's.
+  - Left: the text step's 58-110 ms past its 0.77 ms on the wafer (the host side of a reading's
+    first fire); the stamps read back every step (0.2 ms, 8% of the 16-row step) only where the
+    cycles are wanted; the rows' copies (0.38 ms for 2k words).
 
 ## 5. Risks
 
