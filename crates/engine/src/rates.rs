@@ -58,6 +58,37 @@ pub fn weights_at(k: u32) -> usize {
     WEIGHT_BYTES.div_ceil(plane.max(1)).max(12)
 }
 
+/// The seed of [`operand_pattern`]'s xorshift.
+pub const OPERAND_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// The bytes of [`operand_pattern`]: a backend uploads them once and copies
+/// them device to device over and over to fill a larger operand (the
+/// [`WEIGHT_BYTES`] rotation, depth-16384 planes), so laying random operands
+/// costs one upload.
+pub const OPERAND_BYTES: usize = 16 << 20;
+
+/// What every float operand a rate times is filled with: [`OPERAND_BYTES`]
+/// of little-endian bf16 values uniform in [-1, 1), from a xorshift64 seeded
+/// [`OPERAND_SEED`], the same on every backend and every run. Not zeros:
+/// some devices run a compute-bound kernel faster on zeros than on real data
+/// (an MI300X's matmul and attention 15-25% faster, its power and clock
+/// following the bits toggled), and serving runs real data.
+#[must_use]
+pub fn operand_pattern() -> Vec<u8> {
+    let mut x = OPERAND_SEED;
+    let mut bytes = Vec::with_capacity(OPERAND_BYTES);
+    while bytes.len() < OPERAND_BYTES {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        // 24 random bits to [-1, 1) as an f32, its bf16 the top half
+        // (truncation only shrinks a magnitude, so -1 <= v < 1 holds).
+        let v = (x >> 40) as f32 / (1u32 << 23) as f32 - 1.0;
+        bytes.extend_from_slice(&((v.to_bits() >> 16) as u16).to_le_bytes());
+    }
+    bytes
+}
+
 /// A prefill attention the attention rate is timed at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AttnShape {
@@ -283,6 +314,21 @@ mod tests {
         assert_eq!(&attn_page_order(32)[..4], &[0, 15, 30, 13]);
         assert_eq!(ATTN_SHAPE.at(512).rows, 512);
         assert_eq!(attn_flops(ATTN_SHAPE.at(512)), 4.0 * 512.0 * 512.0 * 2048.0);
+    }
+
+    #[test]
+    fn the_operand_pattern_is_fixed_bf16_in_range_and_varied() {
+        let a = operand_pattern();
+        assert_eq!(a.len(), OPERAND_BYTES);
+        assert_eq!(a, operand_pattern());
+        let values: Vec<f32> = a
+            .chunks_exact(2)
+            .map(|b| f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16))
+            .collect();
+        assert!(values.iter().all(|v| (-1.0..1.0).contains(v)));
+        assert!(values.iter().any(|&v| v != values[0]));
+        let mean = values.iter().map(|&v| f64::from(v)).sum::<f64>() / values.len() as f64;
+        assert!(mean.abs() < 0.01, "{mean}");
     }
 
     #[test]

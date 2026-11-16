@@ -26,6 +26,12 @@
 //! - `launch_ns`: [`LAUNCHES`] near-empty kernels captured in one graph, the
 //!   graph's time over [`LAUNCHES`]: a dispatch's cost inside a recorded
 //!   body, as serving replays them.
+//!
+//! Every float operand the matmul, attention and scan read (activations,
+//! weight planes, the kv pages, the scan's input, conv weight and states) is
+//! `engine::rates::operand_pattern` repeated, not zeros: some devices run a
+//! compute-bound kernel faster on zeros than on the real data serving runs.
+//! Index and page tables, gates, outputs and workspace stay as laid.
 
 #[cfg_attr(not(feature = "device"), allow(unused_imports))]
 use engine::rates::{ATTN_KEYS, ATTN_SHAPE, DEPTHS, LATTICE_ROWS, SCAN_SHAPE, weights_at};
@@ -203,6 +209,38 @@ mod on_device {
         Buffer::zeroed(bytes).map_err(say("an operand"))
     }
 
+    /// `engine::rates::operand_pattern` on the device, uploaded once and
+    /// copied device to device to fill each operand.
+    struct Random {
+        pattern: Buffer,
+        stream: *mut c_void,
+    }
+
+    impl Random {
+        fn new(stream: *mut c_void) -> Result<Random, String> {
+            let bytes = engine::rates::operand_pattern();
+            let mut pattern = zeroed(bytes.len())?;
+            pattern
+                .write(0, &bytes)
+                .map_err(say("the operand pattern"))?;
+            Ok(Random { pattern, stream })
+        }
+
+        /// `bytes` of device memory, the pattern repeated over them, ordered
+        /// on the stream before any launch that reads it.
+        fn operand(&self, bytes: usize) -> Result<Buffer, String> {
+            let b = zeroed(bytes)?;
+            let mut at = 0;
+            while at < bytes {
+                let n = self.pattern.bytes().min(bytes - at);
+                crate::device::copy_d2d(self.stream, b.ptr() + at as u64, self.pattern.ptr(), n)
+                    .map_err(say("an operand"))?;
+                at += n;
+            }
+            Ok(b)
+        }
+    }
+
     fn column(values: &[i32]) -> Result<Buffer, String> {
         let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
         let mut b = zeroed(bytes.len())?;
@@ -216,12 +254,13 @@ mod on_device {
         let stream = device.stream();
         let clock = Clock::new(stream)?;
         let mut held = Vec::new();
-        let grid = gemm(device.ctx(), &clock, &mut held)?;
+        let random = Random::new(stream)?;
+        let grid = gemm(device.ctx(), &clock, &random, &mut held)?;
         let mut attn = Vec::with_capacity(ATTN_KEYS.len());
         for keys in ATTN_KEYS {
-            attn.push((keys, attention(&device, &clock, &mut held, keys)?));
+            attn.push((keys, attention(&device, &clock, &random, &mut held, keys)?));
         }
-        let scan = scan(device.ctx(), &clock, &mut held)?;
+        let scan = scan(device.ctx(), &clock, &random, &mut held)?;
         let bytes = copy(stream, &clock)?;
         let launch = launch(device.ctx(), stream, &clock, &mut held)?;
         device.synchronize().map_err(say("the device"))?;
@@ -238,11 +277,12 @@ mod on_device {
     fn gemm(
         ctx: &Ctx,
         clock: &Clock,
+        random: &Random,
         held: &mut Vec<Buffer>,
     ) -> Result<Vec<(u32, u32, f64)>, String> {
         let mut grid = Vec::with_capacity(LATTICE_ROWS.len() * DEPTHS.len());
         for &k in &DEPTHS {
-            grid.extend(gemm_at(ctx, clock, held, k)?);
+            grid.extend(gemm_at(ctx, clock, random, held, k)?);
         }
         Ok(grid)
     }
@@ -251,16 +291,17 @@ mod on_device {
     fn gemm_at(
         ctx: &Ctx,
         clock: &Clock,
+        random: &Random,
         held: &mut Vec<Buffer>,
         k: u32,
     ) -> Result<Vec<(u32, u32, f64)>, String> {
         let n = k;
         let most = *LATTICE_ROWS.last().expect("rows") as usize;
-        let act = zeroed(most * k as usize * 2)?;
+        let act = random.operand(most * k as usize * 2)?;
         let y = zeroed(most * n as usize * 2)?;
         let planes = weights_at(k);
         let weights = (0..planes)
-            .map(|_| zeroed(n as usize * k as usize * 2))
+            .map(|_| random.operand(n as usize * k as usize * 2))
             .collect::<Result<Vec<Buffer>, String>>()?;
         let mut curve = Vec::with_capacity(LATTICE_ROWS.len());
         for &m in &LATTICE_ROWS {
@@ -282,6 +323,7 @@ mod on_device {
     fn attention(
         device: &Context,
         clock: &Clock,
+        random: &Random,
         held: &mut Vec<Buffer>,
         keys_n: u32,
     ) -> Result<f64, String> {
@@ -293,9 +335,9 @@ mod on_device {
         let pages = rows.div_ceil(PAGE);
         let kv_width = kv_heads * d;
         let cells = (pages * PAGE) as usize;
-        let keys = zeroed(cells * kv_width as usize * 2)?;
-        let values = zeroed(cells * kv_width as usize * 2)?;
-        let q = zeroed((rows * q_heads * d) as usize * 2)?;
+        let keys = random.operand(cells * kv_width as usize * 2)?;
+        let values = random.operand(cells * kv_width as usize * 2)?;
+        let q = random.operand((rows * q_heads * d) as usize * 2)?;
         let o = zeroed((rows * q_heads * d) as usize * 2)?;
         // The sequence's pages scattered over the pool as a served one's are.
         let page_ids: Vec<i32> = engine::rates::attn_page_order(pages)
@@ -398,17 +440,22 @@ mod on_device {
         Ok(engine::rates::attn_flops(at) / ns)
     }
 
-    fn scan(ctx: &Ctx, clock: &Clock, held: &mut Vec<Buffer>) -> Result<f64, String> {
+    fn scan(
+        ctx: &Ctx,
+        clock: &Clock,
+        random: &Random,
+        held: &mut Vec<Buffer>,
+    ) -> Result<f64, String> {
         let shape = SCAN_SHAPE;
         let (tokens, conv_width) = (shape.tokens, shape.conv_width);
         let channels = shape.channels();
         let conv_stride = conv_width * channels;
         let state_stride = shape.v_heads * shape.k_dim * shape.v_dim;
-        let x = zeroed((tokens * channels) as usize * 2)?;
+        let x = random.operand((tokens * channels) as usize * 2)?;
         let conv_y = zeroed((tokens * channels) as usize * 2)?;
-        let weight = zeroed((channels * conv_width) as usize * 2)?;
-        let conv_state = zeroed(conv_stride as usize * 2)?;
-        let state = zeroed(state_stride as usize * 2)?;
+        let weight = random.operand((channels * conv_width) as usize * 2)?;
+        let conv_state = random.operand(conv_stride as usize * 2)?;
+        let state = random.operand(state_stride as usize * 2)?;
         let gates = zeroed((tokens * 2 * shape.v_heads) as usize * 4)?;
         let y = zeroed((tokens * shape.v_heads * shape.v_dim) as usize * 4)?;
         let slot = column(&[0])?;

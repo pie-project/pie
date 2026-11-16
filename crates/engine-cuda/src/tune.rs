@@ -83,7 +83,7 @@ pub fn rates(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Rated
     let tuned = engine::rates::tuned(&r);
     let how = format!(
         "{name}; the matmul through {} under serving's GEMM tactics, each rate a 20 ms burst on \
-         the stream timed by events, the median of 5 (the launch of 15); at {}",
+         the stream timed by events, the median of 5 (the launch of 15); operands: engine::rates' pattern; at {}",
         if cfg!(feature = "rocm") {
             "hipBLASLt"
         } else {
