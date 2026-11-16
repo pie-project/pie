@@ -68,11 +68,11 @@ impl Default for KvSplit {
     }
 }
 
-/// The cuts the search tries: the fewest rest roots, a quarter and a half more of them. (A K /
-/// V column over several columns, `wafer-compile stream --cut`, builds for flux2-mini;
-/// at klein's 24 heads the links from the head roots to columns two wide meet more K / V
-/// chains than the palette's colours, so the search does not try it.)
-pub const KV_SPLITS: [KvSplit; 6] = [
+/// The cuts the search tries: the fewest rest roots, a quarter and a half more of them; helpers
+/// below the rest roots; K / V columns over `sub` columns a head at `1 / sub` of the entries a
+/// PE (as many rows of the band, `sub` times the PEs: a query's work over them), the head
+/// columns of a block's first unit `sub` apart ([`crate::floorplan::stream::KvColumn`]).
+pub const KV_SPLITS: [KvSplit; 11] = [
     KvSplit {
         thin: 1,
         sub: 1,
@@ -106,6 +106,36 @@ pub const KV_SPLITS: [KvSplit; 6] = [
     KvSplit {
         thin: 1,
         sub: 1,
+        widen: 0,
+        help: 15,
+    },
+    KvSplit {
+        thin: 2,
+        sub: 2,
+        widen: 0,
+        help: 0,
+    },
+    KvSplit {
+        thin: 2,
+        sub: 2,
+        widen: 0,
+        help: 7,
+    },
+    KvSplit {
+        thin: 2,
+        sub: 2,
+        widen: 0,
+        help: 15,
+    },
+    KvSplit {
+        thin: 2,
+        sub: 2,
+        widen: 0,
+        help: 23,
+    },
+    KvSplit {
+        thin: 3,
+        sub: 3,
         widen: 0,
         help: 15,
     },
@@ -835,15 +865,19 @@ pub fn program_at(
         })
         .max()
         .unwrap_or(PYA);
-    // helpers below a unit's rest roots: within the band's K / V rows, and not under a block
-    // whose later units' links pass west below its first unit
+    // helpers below a unit's rest roots: within the band's K / V rows (where a K / V column
+    // takes several columns, above the K / V roots' row, which they push down), and not under a
+    // block whose later units' links pass west below its first unit to K / V columns there (at
+    // `sub > 1` they pass above them)
     let space = if blocks.is_empty() {
         0
+    } else if split.sub > 1 {
+        u32::MAX
     } else {
         heads + pya.div_ceil(split.sub.max(1))
     };
     for (bi, b) in built.iter_mut().enumerate() {
-        let under = kv.iter().any(|k| k.units.len() > 1 && k.units[0] == bi);
+        let under = split.sub == 1 && kv.iter().any(|k| k.units.len() > 1 && k.units[0] == bi);
         if under || b.helper.as_ref().is_some_and(|h| h.1 >= space) {
             b.helper = None;
         }
@@ -1006,7 +1040,8 @@ mod tests {
             p.stream.w * p.stream.h,
             images.len()
         );
-        assert!(images.len() < 120, "{} images", images.len());
+        // (a folded K / V column's first unit takes a few more: its pitched columns' chains)
+        assert!(images.len() < 140, "{} images", images.len());
         let pcfg = e.arrays.iter().filter(|a| a.sym == "pcfg").count();
         assert!(pcfg > 0);
     }

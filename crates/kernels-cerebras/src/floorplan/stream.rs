@@ -13,8 +13,11 @@
 //! coloured by [`crate::fabric::Palette::allocate`] with no preferred colours.
 //!
 //! Unit `u` at `(x0, y0)`: CX root `j` at `(x0, y0 + 1 + j)`, weight PE `(i, j)` at
-//! `(x0 + 1 + i, y0 + 1 + j)`, CY root `i` at `(x0 + 1 + i, y0 + 1 + py)`; row 0 carries the lane
-//! bus.
+//! `(x0 + 1 + c(i), y0 + 1 + j)`, CY root `i` at `(x0 + 1 + c(i), y0 + 1 + py)`; row 0 carries the
+//! lane bus. Column `i` sits at `c(i) = i`, but in a block's first unit under K / V columns over
+//! `sub > 1` columns a head ([`StreamUnit::col`]): head column `h` at `c = h sub`, the rest in the
+//! columns between and after, so each head's K / V column (`sub` wide) is straight below its head
+//! root.
 //!
 //! The units fill bands left to right, a band as high as a unit and its K / V columns, as many
 //! bands as the fabric's width asks for (no block split over two). The row stream from a band's
@@ -48,6 +51,8 @@ pub struct StreamUnit {
     pub on_path: bool,
     /// Helper PEs below each rest root (`cy(i)` for `i >= heads`): [`StreamUnit::helper`].
     pub helpers: u32,
+    /// The head columns' pitch (1: the heads first; [`StreamUnit::col`]).
+    pub pitch: u32,
 }
 
 impl StreamUnit {
@@ -56,14 +61,43 @@ impl StreamUnit {
         Coord::new(self.x, self.y + 1 + j)
     }
 
+    /// Column `i`'s offset in the unit: head column `h` at `h pitch`, the rest roots in order in
+    /// the columns left between the heads and after them.
+    #[must_use]
+    pub fn col(&self, i: u32) -> u32 {
+        let (p, h) = (self.pitch.max(1), self.heads());
+        if p == 1 || h == 0 {
+            return i;
+        }
+        if i < h {
+            return i * p;
+        }
+        // the `k`-th rest column: `p - 1` between each head, then the rest past the last
+        let k = i - h;
+        let between = h * (p - 1);
+        if k < between {
+            (k / (p - 1)) * p + 1 + k % (p - 1)
+        } else {
+            h * p + (k - between)
+        }
+    }
+
+    /// The unit's columns in their order on the fabric, west to east.
+    #[must_use]
+    pub fn west_to_east(&self) -> Vec<u32> {
+        let mut v: Vec<u32> = (0..self.cols()).collect();
+        v.sort_by_key(|&i| self.col(i));
+        v
+    }
+
     #[must_use]
     pub fn w(&self, i: u32, j: u32) -> Coord {
-        Coord::new(self.x + 1 + i, self.y + 1 + j)
+        Coord::new(self.x + 1 + self.col(i), self.y + 1 + j)
     }
 
     #[must_use]
     pub fn cy(&self, i: u32) -> Coord {
-        Coord::new(self.x + 1 + i, self.y + 1 + self.rows())
+        Coord::new(self.x + 1 + self.col(i), self.y + 1 + self.rows())
     }
 
     #[must_use]
@@ -93,8 +127,13 @@ impl StreamUnit {
 }
 
 /// A K / V column a kv head of one attending block: its root under the first unit's head
-/// columns (`sub` of them a head), `pya` attention PEs below it, a snake over `sub` columns
-/// (down the first, up the next, ...) so a long column takes `pya / sub` rows of the band.
+/// columns, `pya` attention PEs below it, a snake over `sub` columns (down the first, up the
+/// next, ...) so a long column takes `pya / sub` rows of the band. At `sub = 1` head `h`'s root
+/// is `h` rows below the unit's (the links from later units turn west on its row); at `sub > 1`
+/// the first unit's head columns are `sub` apart ([`StreamUnit::col`]), every root on the row
+/// below the later units' turns, each column straight below its head root: the first unit's
+/// links go straight down, a later unit's turn west on their head's row and down the head root's
+/// column, and no link crosses a K / V column.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct KvColumn {
     pub block: u32,
@@ -144,6 +183,9 @@ pub struct Stream {
     pub path: Vec<usize>,
     pub kv: Vec<KvColumn>,
     pub lanes: Option<LaneBus>,
+    /// The rows between the units' column roots and the K / V roots where K / V columns take
+    /// several columns a head: the later units' turns (one a head) and the helpers above them.
+    pub turns: u32,
 }
 
 /// What a stream unit asks the floorplan for (the builder's reading of its steps).
@@ -165,10 +207,10 @@ impl KvColumn {
     #[must_use]
     pub fn root(&self, s: &Stream) -> Coord {
         let u = &s.units[self.units[0]];
-        Coord::new(
-            u.x + 1 + self.head * self.sub.max(1),
-            u.y + s.py + 2 + self.head,
-        )
+        if self.sub > 1 {
+            return Coord::new(u.cy(self.head).x, u.y + s.py + 2 + s.turns);
+        }
+        Coord::new(u.x + 1 + self.head, u.y + s.py + 2 + self.head)
     }
 
     /// The rows its PEs take below its root.
@@ -187,18 +229,26 @@ impl KvColumn {
         Coord::new(r.x + c, r.y + 1 + dy)
     }
 
-    /// The route from unit `k`'s head root down, and west or east, to the column's root.
+    /// The route from unit `k`'s head root down, and west or east, to the column's root: down
+    /// to the head's turn (the root's row at `sub = 1`), along it, and down to the root.
     #[must_use]
     pub fn link(&self, s: &Stream, k: usize) -> Vec<Coord> {
         let root = self.root(s);
         let u = &s.units[self.units[k]];
         let top = u.cy(self.head);
-        let mut pts: Vec<Coord> = (top.y..=root.y).map(|y| Coord::new(top.x, y)).collect();
+        let turn = s.units[self.units[0]].y + s.py + 2 + self.head;
+        let turn = if top.x == root.x {
+            root.y
+        } else {
+            turn.min(root.y)
+        };
+        let mut pts: Vec<Coord> = (top.y..=turn).map(|y| Coord::new(top.x, y)).collect();
         let mut x = top.x;
         while x != root.x {
             x = if x > root.x { x - 1 } else { x + 1 };
-            pts.push(Coord::new(x, root.y));
+            pts.push(Coord::new(x, turn));
         }
+        pts.extend((turn + 1..=root.y).map(|y| Coord::new(root.x, y)));
         pts
     }
 }
@@ -223,10 +273,17 @@ impl Stream {
         if !requests.stream {
             return Err("stream floorplan: no row stream asked for".into());
         }
+        // (K / V columns over several columns a head: their roots on one row below the turns
+        // and the helpers)
+        let turns = if sub > 1 {
+            asks.iter().map(|a| a.helpers).fold(heads, u32::max)
+        } else {
+            heads
+        };
         let band = py
             + 2
             + if requests.joint && !blocks.is_empty() {
-                heads + pya.div_ceil(sub)
+                turns + pya.div_ceil(sub) + u32::from(sub > 1)
             } else {
                 0
             };
@@ -272,6 +329,8 @@ impl Stream {
                 layers: 1,
                 kv_rows: 0,
             };
+            // a block's first unit holds its K / V columns: its heads at their pitch
+            let first = blocks.iter().any(|b| b.first() == Some(&u));
             units.push(StreamUnit {
                 name: a.name.clone(),
                 shape,
@@ -280,14 +339,21 @@ impl Stream {
                 segment: a.segment,
                 on_path: a.on_path,
                 helpers: a.helpers,
+                pitch: if first && requests.joint && a.heads > 0 {
+                    sub
+                } else {
+                    1
+                },
             });
             x += a.cols + 1;
             w = w.max(x);
         }
         let h = y + band;
-        if let Some(a) = asks.iter().find(|a| py + 2 + a.helpers > band) {
+        // (at `sub > 1` the helpers stay above the K / V roots' row)
+        let room = if sub > 1 { py + 2 + turns } else { band };
+        if let Some(a) = asks.iter().find(|a| py + 2 + a.helpers > room) {
             return Err(format!(
-                "stream floorplan: {}'s {} helpers a root outgrow its band of {band} rows",
+                "stream floorplan: {}'s {} helpers a root outgrow its band's {room} rows",
                 a.name, a.helpers
             ));
         }
@@ -358,6 +424,7 @@ impl Stream {
             path,
             kv,
             lanes,
+            turns,
         })
     }
 
@@ -399,9 +466,10 @@ impl Stream {
         let mut w = Wiring::default();
         for (u, unit) in self.units.iter().enumerate() {
             let py = unit.rows();
+            let order = unit.west_to_east();
             for j in 0..py {
                 let mut pts = vec![unit.cx(j)];
-                pts.extend((0..unit.cols()).map(|i| unit.w(i, j)));
+                pts.extend(order.iter().map(|&i| unit.w(i, j)));
                 w.chain(Chain {
                     pts,
                     root: 0,
@@ -691,7 +759,9 @@ mod tests {
     }
 
     /// A K / V column over two columns a head: a snake (each PE next to the one before it, the
-    /// first under the root), the band shorter by half the column, no PE of two heads.
+    /// first under the root) straight below its head root, the first unit's head columns two
+    /// apart, the band shorter by half the column (and the roots' row), no PE of two heads, the
+    /// first unit's links straight down and no link through another head's K / V PEs.
     #[test]
     fn a_kv_column_folds_over_two_columns() {
         let asks: Vec<UnitAsk> = (0..3).map(|u| ask(&format!("u{u}"), 9, 2)).collect();
@@ -714,8 +784,16 @@ mod tests {
             )
         };
         let s = at(2).unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(s.h, 4 + 2 + 2 + 4);
+        assert_eq!(s.h, 4 + 2 + 2 + 1 + 4);
+        let first = &s.units[1];
+        assert_eq!(first.pitch, 2);
+        assert_eq!(
+            (0..9).map(|i| first.col(i)).collect::<Vec<_>>(),
+            [0, 2, 1, 3, 4, 5, 6, 7, 8]
+        );
+        assert_eq!(s.units[2].pitch, 1);
         let mut seen = std::collections::BTreeSet::new();
+        let mut kv_pes = Vec::new();
         for kc in &s.kv {
             let mut pts = vec![kc.root(&s)];
             pts.extend((0..kc.pya).map(|k| kc.pe(&s, k)));
@@ -723,9 +801,30 @@ mod tests {
                 assert_eq!(p[0].x.abs_diff(p[1].x) + p[0].y.abs_diff(p[1].y), 1);
             }
             assert!(pts.iter().all(|&c| seen.insert(c) && c.y < s.h));
+            assert_eq!(kc.root(&s).x, first.cy(kc.head).x);
+            kv_pes.push(pts);
+        }
+        for kc in &s.kv {
             for k in 0..kc.units.len() {
-                assert_eq!(kc.link(&s, k).last(), Some(&kc.root(&s)));
+                let l = kc.link(&s, k);
+                assert_eq!(l.last(), Some(&kc.root(&s)));
+                for p in l.windows(2) {
+                    assert_eq!(p[0].x.abs_diff(p[1].x) + p[0].y.abs_diff(p[1].y), 1);
+                }
+                if k == 0 {
+                    assert!(l.iter().all(|c| c.x == kc.root(&s).x));
+                }
+                for (o, pes) in s.kv.iter().zip(&kv_pes) {
+                    if o.head != kc.head {
+                        assert!(l.iter().all(|c| !pes.contains(c)));
+                    }
+                }
             }
+        }
+        // the row chains still run west to east, a PE to the next
+        let order = first.west_to_east();
+        for p in order.windows(2) {
+            assert_eq!(first.w(p[1], 0).x, first.w(p[0], 0).x + 1);
         }
         // wider than the block's first unit: refused
         assert!(at(5).is_err());

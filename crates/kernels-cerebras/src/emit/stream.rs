@@ -843,9 +843,13 @@ fn weight_file(
         cfg.push(v);
         format!("@as(u16, pcfg[{}])", cfg.len() - 1)
     };
+    // the columns east of this one on the fabric (the row chain's order: a unit's head columns
+    // may sit apart, `StreamUnit::col`)
+    let su = &p.stream.units[ui];
+    let east: Vec<u32> = (0..l.px()).filter(|&c2| su.col(c2) > su.col(col)).collect();
     let keeper = if spill { word(col) } else { String::new() };
     let fetch_role = if spill {
-        word(u32::from(col + 1 < l.px()))
+        word(u32::from(!east.is_empty()))
     } else {
         String::new()
     };
@@ -897,7 +901,7 @@ fn weight_file(
                 );
                 if *from == Side::Col {
                     // the leaf: the easternmost column holding the matvec
-                    let leaf = (col + 1..l.px()).all(|c2| place::tile_dims(st, l, c2).is_none());
+                    let leaf = east.iter().all(|&c2| place::tile_dims(st, l, c2).is_none());
                     let _ = writeln!(body, "  rw.role = {};", word(u32::from(!leaf)));
                 }
                 let _ = writeln!(body, "  m{m}.row(t);");
@@ -930,8 +934,7 @@ fn weight_file(
                     );
                 }
                 Side::Col => {
-                    let east = (col + 1..l.px()).any(|c2| place::tile_dims(st, l, c2).is_some());
-                    if east {
+                    if east.iter().any(|&c2| place::tile_dims(st, l, c2).is_some()) {
                         let no = n / l.py;
                         zer = zer.max(no);
                         let _ = writeln!(

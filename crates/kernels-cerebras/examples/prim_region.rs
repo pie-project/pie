@@ -167,7 +167,11 @@ fn main() {
             roots: reg.width / chunk,
             params: place.clone(),
             round16,
-            rope_lv: 4,
+            // (`PRIM_ROPE_LV`: the rotation tables' levels, 4 by default)
+            rope_lv: std::env::var("PRIM_ROPE_LV")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4),
             rope_bits: 3,
         },
     )
