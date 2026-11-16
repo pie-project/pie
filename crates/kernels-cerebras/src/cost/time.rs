@@ -15,14 +15,15 @@
 use super::Features;
 use crate::plan::{Plan, Shape};
 
-/// One cycle at 875 MHz, in ms.
-const CYCLE: f64 = 1e3 / 875e6;
+/// One PE cycle ([`super::CLOCK_HZ`]), in ms.
+const CYCLE: f64 = 1e3 / super::CLOCK_HZ;
 /// ms a weight element: a weight PE's stamped matvec phases (1,524 cycles for 3,328 elements).
 pub const MATVEC: f64 = 1524.0 / 3328.0 * CYCLE;
 /// ms a KV element a row PE reads (fitted: the scores' and the values' passes on the CY column).
 pub const KV: f64 = 6.436e-6;
 /// ms a cycle of the reductions' chains ([`Features::chain`], fitted with KV and the span held):
-/// 0.96 of a cycle at 875 MHz, so the simulator's hop cycles price the chip's chains. Fitted with
+/// 0.82 of a PE cycle (fitted when the clock was taken for 875 MHz: 0.96 of a cycle there), so the
+/// simulator's hop cycles overprice the chip's chains by a fifth. Fitted with
 /// KV free it takes 2.2 cycles and the G2 gains' full size, but KV then costs 15 cycles an element
 /// and gpt-oss's layer less than nothing: the 4B's PY / NE move is the only one that moves both.
 pub const CHAIN: f64 = 1.093e-6;
@@ -77,8 +78,8 @@ pub fn layer(shape: &Shape, reference: Option<&Plan>) -> f64 {
     }
 }
 
-/// The median layer cost of the measured models (their `layer`s), ms.
-pub const MEDIAN_LAYER: f64 = 0.0078;
+/// The median layer cost of the measured models (their `layer`s, the 9B's), ms.
+pub const MEDIAN_LAYER: f64 = 0.0073;
 
 /// A step of `plan`, in ms, with each layer costing `layer`.
 #[must_use]

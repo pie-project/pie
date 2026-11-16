@@ -3,6 +3,12 @@
 //! ranks partitions by these; a model is calibrated against what the chip and the linker
 //! measured, and says how far off it was there (`ARCHITECTURE.md`, "Cost").
 
+/// The CS-3's PE clock, Hz: the TSC a stamp reads against host wall time over spins of 0.5 to 2.9
+/// s, on one PE and on all 742,500 of a 750 x 990 rectangle at once (requests 0119, 1470, 1472;
+/// 750.0 MHz to four digits at every size). Every cycle count the cost model and the stamps give
+/// is seconds at this rate.
+pub const CLOCK_HZ: f64 = 750e6;
+
 pub mod grid;
 pub mod memory;
 pub mod stream;

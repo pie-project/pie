@@ -31,6 +31,7 @@
 use std::path::{Path, PathBuf};
 
 use kernels_cerebras::build::{self, EMITS, Fabric};
+use kernels_cerebras::cost::CLOCK_HZ;
 use kernels_cerebras::emit::params::Levers;
 use kernels_cerebras::plan::{Plan, Shape};
 use kernels_cerebras::program::Program;
@@ -282,7 +283,7 @@ fn stream(args: &[String]) -> Result<(), String> {
             let c = kernels_cerebras::cost::tiled::time(&p);
             let (fw, fh) = p.fabric();
             println!(
-                "{model} {reading} on {clip:?}: tiled, {} ops over a {} x {} array ({fw} x {fh} PEs, tape {}), arena {} + staging {} + block {} words, {:.1}M cycles ({:.2} ms at 875 MHz)",
+                "{model} {reading} on {clip:?}: tiled, {} ops over a {} x {} array ({fw} x {fh} PEs, tape {}), arena {} + staging {} + block {} words, {:.1}M cycles ({:.2} ms at 750 MHz)",
                 p.ops.len(),
                 p.gx,
                 p.gy,
@@ -291,7 +292,7 @@ fn stream(args: &[String]) -> Result<(), String> {
                 p.hx / 2,
                 p.wb,
                 c.cycles / 1e6,
-                c.cycles / 875e3
+                c.cycles / CLOCK_HZ * 1e3
             );
             if args.iter().any(|a| a == "--parts") {
                 let (by_at, by_what) = c.by();
@@ -320,12 +321,12 @@ fn stream(args: &[String]) -> Result<(), String> {
             let g = kernels_cerebras::stream::grid::program_unfit(&trace, &reading, clip, !ieee)?;
             let c = kernels_cerebras::cost::grid::time(&g);
             println!(
-                "{model} {reading} on {clip:?}: {} passes over {} x {} roots, {:.1}M cycles ({:.1} ms at 875 MHz)",
+                "{model} {reading} on {clip:?}: {} passes over {} x {} roots, {:.1}M cycles ({:.1} ms at 750 MHz)",
                 g.passes.len(),
                 g.p,
                 g.p,
                 c.cycles / 1e6,
-                c.cycles / 875e3
+                c.cycles / CLOCK_HZ * 1e3
             );
             if args.iter().any(|a| a == "--parts") {
                 for q in &c.passes {
@@ -436,9 +437,9 @@ fn stream(args: &[String]) -> Result<(), String> {
             .collect();
         let c = kernels_cerebras::cost::stream::time_at(&p, &rows);
         println!(
-            "priced at {at}: {:.1}M cycles ({:.1} ms at 875 MHz)",
+            "priced at {at}: {:.1}M cycles ({:.1} ms at 750 MHz)",
             c.cycles / 1e6,
-            c.cycles / 875e3
+            c.cycles / CLOCK_HZ * 1e3
         );
         for u in &c.units {
             println!(

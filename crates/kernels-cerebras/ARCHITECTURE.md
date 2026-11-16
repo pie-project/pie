@@ -318,8 +318,9 @@ The chip's rate a chain cycle is fitted to what moving a pinned plan's keys did 
 (requests 1151-1306, 25 moves: Llama VR=112 / 144 / 180 and G2=8, 0.8B PX=128 and G2=8 / 12, Gemma
 12B's pick and G2=8 / 12, 4B PY=192 and G2=8 / 12, Qwen3-8B G2=8 / 16, G2=8 / 12 / 24 on the 9B,
 E4B, E2B and gpt-oss), with the KV elements' and the rows' span held at the earlier fit's: it comes
-to 0.96 of a cycle at 875 MHz, so the simulator's hop cycles price the chip's chains. The model
-then gives every swept model the chip's best G2 but gpt-oss's (`time::tests`): its row chains'
+to 0.82 of a PE cycle (750 MHz, `cost::CLOCK_HZ`), so the simulator's hop cycles overprice the
+chip's chains by a fifth. The model then gives every swept model the chip's best G2 but gpt-oss's
+(`time::tests`): its row chains'
 halves are the 64 attention and 288 MoE columns, the long half makes G2=8 cost 2.6 µs, and the chip
 gained 2.5. It gives the G2 moves about half their size on the chip (E4B's G2=12: 7 µs of 21), and
 the 0.8B's PX move and the 4B's PY move, which moved the chains with the KV and the span, 12 and 7
