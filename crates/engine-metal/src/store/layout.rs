@@ -488,7 +488,10 @@ impl Layout {
             // guest fire to the widest rung its term fits beside. The span's
             // heaps are all made at the load (`Pool::back_whole_span`), so a
             // change moves only the carve's bookkeeping: no rung raise or lend
-            // makes a device allocation after ready.
+            // makes a device allocation after ready. Interim: the runtime
+            // tells rungs only where the span is backed on demand; once it
+            // states the two apart, this is backed-on-demand false with
+            // rungs told.
             span_backed_on_demand: !self.act().is_empty(),
             // The load pins the range below the segment the largest rung's
             // carve starts in (`Pool::reserve`): a carve reaches no lower
