@@ -79,6 +79,15 @@ pub fn loaded(
     bind(container, vec![decls; lanes as usize], caps())
 }
 
+/// One lane reading `decls`.
+#[allow(dead_code)]
+pub fn reading(
+    container: TraceContainer,
+    decls: Vec<OutputDecl>,
+) -> Result<BoundTrace, ValidateError> {
+    bind(container, vec![decls], caps())
+}
+
 fn caps() -> EngineCaps {
     EngineCaps {
         lora: true,

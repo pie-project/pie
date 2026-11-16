@@ -1268,7 +1268,13 @@ impl Shell {
             buffers.as_ref().map(crate::store::rs::Buffers::page_tokens),
         )?;
 
-        let exports = Exports::of(&boot.trace, &compiled, boot.context, boot.page_size)?;
+        // A page row sums the pages the pool lays, as its paging states them.
+        let exports = Exports::of(
+            &boot.trace,
+            &compiled,
+            boot.context,
+            pools.paging().page_size,
+        )?;
 
         let airborne = crate::settle::Airborne::new();
         let mut pools = pools;

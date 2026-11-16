@@ -664,9 +664,13 @@ impl FireCtx<'_> {
         let rows = u32::try_from(n).unwrap_or(u32::MAX);
         // What each reader's term states a lane (`program::capture_term`).
         let per_row = captures.rows();
+        let sources: Vec<u32> = lanes
+            .iter()
+            .map(|&at| p.composition.lanes()[at as usize].source)
+            .collect();
         let base = self
             .programs
-            .hold_captures(rows, n * (per_row.keys + per_row.pages))?;
+            .hold_captures(sources, n * (per_row.keys + per_row.pages))?;
         for &(value, page_row) in &captures.values {
             slots.0[value.0 as usize] = Some(if page_row {
                 kernels_cuda::Tensor::new(base + keys, rows, captures.pages, Dtype::F32)

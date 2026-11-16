@@ -191,8 +191,9 @@ pub struct Plane {
     /// The bytes at the top of the span the fire in hand's capturing lanes
     /// hold ([`Plane::hold_captures`]): its programs lay under them.
     captured: u64,
-    /// The capturing lanes those bytes are the rows of.
-    captured_rows: u32,
+    /// The capturing lanes those bytes are the rows of, by their lane in
+    /// the fire as submitted, a row each in order.
+    captured_lanes: Vec<u32>,
     /// What a capturing lane's rows take ([`Plane::set_capture_rows`]).
     capture_rows: CaptureRows,
 }
@@ -311,7 +312,7 @@ impl Plane {
             term: engine::GuestTerm::default(),
             laid: Vec::new(),
             captured: 0,
-            captured_rows: 0,
+            captured_lanes: Vec::new(),
             capture_rows: CaptureRows::default(),
         }
     }
@@ -341,7 +342,7 @@ impl Plane {
             self.laid.clear();
         }
         self.span = span;
-        self.hold_at_top(0, 0);
+        self.hold_at_top(0, Vec::new());
     }
 
     /// What a capturing lane's score rows take, as the load lays them: a
@@ -350,10 +351,11 @@ impl Plane {
         self.capture_rows = rows;
     }
 
-    /// The fire in hand's `rows` capturing lanes hold `bytes` at the top of
-    /// its span: where they start. Its programs lay under them, in the room
-    /// their terms state the rows a member in.
-    pub fn hold_captures(&mut self, rows: u32, bytes: u64) -> Result<u64> {
+    /// The fire in hand's capturing `lanes` (a row each, by their lane in
+    /// the fire) hold `bytes` at the top of its span: where they start. Its
+    /// programs lay under them, in the room their terms state the rows a
+    /// member in.
+    pub fn hold_captures(&mut self, lanes: Vec<u32>, bytes: u64) -> Result<u64> {
         let (end, room) = self.span;
         let held = bytes.next_multiple_of(256);
         if held > room {
@@ -363,23 +365,27 @@ impl Plane {
                 have: room,
             });
         }
-        self.hold_at_top(held, rows);
+        self.hold_at_top(held, lanes);
         Ok(end - held)
     }
 
-    /// The rows the last fire's capturing lanes held at its span's top, and
-    /// their bytes.
+    /// The last fire's capturing lanes (a row each, by their lane in the
+    /// fire), where their rows start, and the bytes they hold.
     #[must_use]
-    pub fn captured(&self) -> (u32, u64) {
-        (self.captured_rows, self.captured)
+    pub fn captured(&self) -> (&[u32], u64, u64) {
+        (
+            &self.captured_lanes,
+            self.span.0 - self.captured,
+            self.captured,
+        )
     }
 
-    fn hold_at_top(&mut self, held: u64, rows: u32) {
+    fn hold_at_top(&mut self, held: u64, lanes: Vec<u32>) {
         if self.captured != held {
             self.laid.clear();
         }
         self.captured = held;
-        self.captured_rows = rows;
+        self.captured_lanes = lanes;
     }
 
     /// What a fire of `program_id` bound at `extents` takes of the fire's
