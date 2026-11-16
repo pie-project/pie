@@ -21,7 +21,17 @@ pub struct Outcome {
     pub seconds: f64,
 }
 
-/// Load `artifact` under `chip` for `slots` lanes and `budget`: the
+/// How a load is shaped: its slots and compiled budget, its patch ladder,
+/// its pages and context.
+struct Shape {
+    slots: u32,
+    budget: poem_compiler::Budget,
+    patches: Option<poem_compiler::PatchLadder>,
+    page_size: u32,
+    context: u32,
+}
+
+/// Load `artifact` under `chip` shaped by `shape` (from the trace): the
 /// products its arming times land in the user's tactic table under
 /// `profiles`.
 fn load(
@@ -29,8 +39,7 @@ fn load(
     deployment: &str,
     chip: &Profile,
     profiles: Option<&Path>,
-    slots: u32,
-    budget: poem_compiler::Budget,
+    shape: impl FnOnce(&poem_ir::Trace) -> Shape,
 ) -> Result<(crate::Shell, poem_ir::Trace), String> {
     use poem::Platform;
     let row = poem_compiler::catalog::deployment(deployment)
@@ -46,15 +55,22 @@ fn load(
     let prospect =
         crate::weights::prospect(&trace, &contract, artifact, target).map_err(|e| e.to_string())?;
     let residency = crate::experts::Plan::cut(&prospect.ranking);
+    let Shape {
+        slots,
+        budget,
+        patches,
+        page_size,
+        context,
+    } = shape(&trace);
     let shell = crate::Shell::load(crate::Boot {
         voxels: None,
         trace: trace.clone(),
         contract: &contract,
         checkpoint: artifact,
         budget,
-        patches: patches(&trace, slots),
-        page_size: 16,
-        context: CONTEXT,
+        patches,
+        page_size,
+        context,
         slots,
         kv_budget: None,
         allowance: engine::Allowance::WHOLE,
@@ -88,15 +104,17 @@ fn arm_served(
     chip: &Profile,
     profiles: Option<&Path>,
 ) -> Result<(), String> {
-    let lanes = engine::load::Budgets::default().max_lanes;
-    let (shell, _) = load(
-        artifact,
-        deployment,
-        chip,
-        profiles,
-        lanes,
-        poem_compiler::Budget::new(lanes, 0),
-    )?;
+    // The budgets `pie serve` loads with when none is stated, baked as its
+    // load bakes them (`api::bake_budgets`, `api::patch_ladder`), so the
+    // lattice armed is the one serving arms, wide compositions included.
+    let budgets = engine::load::Budgets::default();
+    let (shell, _) = load(artifact, deployment, chip, profiles, |trace| Shape {
+        slots: budgets.slots,
+        budget: crate::api::bake_budgets(&budgets, trace),
+        patches: crate::api::patch_ladder(trace, &budgets),
+        page_size: budgets.page_size,
+        context: budgets.max_context,
+    })?;
     drop(shell);
     Ok(())
 }
@@ -111,14 +129,13 @@ fn serve(
 ) -> Result<Serving, String> {
     use poem::Request;
     let slots = *LANES.iter().max().expect("lanes") as u32;
-    let (mut shell, trace) = load(
-        artifact,
-        deployment,
-        &chip,
-        profiles,
+    let (mut shell, trace) = load(artifact, deployment, &chip, profiles, |trace| Shape {
         slots,
-        poem_compiler::Budget::new(slots, CONTEXT),
-    )?;
+        budget: poem_compiler::Budget::new(slots, CONTEXT),
+        patches: patches(trace, slots),
+        page_size: 16,
+        context: CONTEXT,
+    })?;
     let token = |i: u32| 100 + (i * 7919) % 5000;
     let prompt: Vec<u32> = (0..PROMPT).map(token).collect();
     let fire =
