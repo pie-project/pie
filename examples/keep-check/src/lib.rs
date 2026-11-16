@@ -76,6 +76,11 @@ struct Output {
     /// tie, not a disagreement.
     top_logit: Vec<f32>,
     margin: Vec<f32>,
+    /// Each step's top two tokens and logits, keeping run then reference:
+    /// where the runs pick differently, the same two at a margin within the
+    /// noise is a tie.
+    keep_top2: Vec<[(i32, f32); 2]>,
+    ref_top2: Vec<[(i32, f32); 2]>,
     same_tokens: bool,
 }
 
@@ -222,6 +227,12 @@ async fn main(input: Input) -> Result<Output> {
             })
         })
         .collect();
+    let top2 = |run: &[(Vec<f32>, Vec<i32>)]| -> Vec<[(i32, f32); 2]> {
+        run.iter()
+            .map(|(values, ids)| [(ids[0], values[0]), (ids[1], values[1])])
+            .collect()
+    };
+    let (keep_top2, ref_top2) = (top2(&keep_logits), top2(&mask_logits));
     let top_logit = mask_logits.iter().map(|(values, _)| values[0]).collect();
     let margin = mask_logits
         .iter()
@@ -235,5 +246,7 @@ async fn main(input: Input) -> Result<Output> {
         top_diff,
         top_logit,
         margin,
+        keep_top2,
+        ref_top2,
     })
 }
