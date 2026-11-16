@@ -405,12 +405,39 @@ fn alias(op: &Operation) -> bool {
     )
 }
 
+/// Whether `c`'s row values (each read whole) are of different widths wider than its region:
+/// head regions over values of several head counts.
+fn mixed(trace: &Trace, c: &Chain) -> bool {
+    let width = |v: ValueId| match trace.values.get(v.0 as usize).map(|d| &d.ty) {
+        Some(Ty::Tensor { shape, .. }) => match shape.last() {
+            Some(Dim::Const(n)) => *n as u32,
+            _ => 0,
+        },
+        _ => 0,
+    };
+    let ws: BTreeSet<u32> = (c.ins.iter().enumerate())
+        .filter(|(k, i)| {
+            c.region.params[*k] != kernels_ir::Shape::Scalar
+                && !i.shared
+                && i.by.is_none()
+                && i.from == 0
+        })
+        .map(|(_, i)| width(i.value))
+        .filter(|&w| w > c.region.width)
+        .collect();
+    ws.len() > 1
+}
+
 /// The region of `run`, split where a run does not lower as one (each part lowered alone).
 fn regions(trace: &Trace, run: &[u32]) -> R<Vec<Chain>> {
     if run.is_empty() {
         return Ok(Vec::new());
     }
-    if let Some(c) = chain::lower_run_parts(trace, run) {
+    // (a part over row values of different widths, each wider than it — a q of 2 heads a kv
+    // head beside its v — places on no one set of roots: its nodes apart)
+    if let Some(c) = chain::lower_run_parts(trace, run)
+        && (run.len() == 1 || !c.iter().any(|c| mixed(trace, c)))
+    {
         return Ok(c);
     }
     if run.len() == 1 {
