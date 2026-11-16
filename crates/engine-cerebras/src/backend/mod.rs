@@ -242,6 +242,8 @@ impl Engine for CerebrasEngine {
         let model_context = u32::try_from(w.positions).unwrap_or(u32::MAX);
         // a unit program's pages are Pie's (its K / V columns' own, a lane's ids its pages)
         let wafer_pages = w.paging;
+        // (a unit program's state slots its lane slots)
+        let wafer_lanes = w.lanes;
         self.model = Some(w);
         self.kv = Kv::default();
 
@@ -268,7 +270,11 @@ impl Engine for CerebrasEngine {
                     |(_, pages, _)| pages,
                 ),
                 kv_page_size: wafer_pages.map_or(paging.page_size, |(_, _, size)| size),
-                state_slots: if state_rows { paging.slots } else { 0 },
+                state_slots: match (state_rows, wafer_lanes) {
+                    (false, _) => 0,
+                    (true, Some(b)) => u32::try_from(b).unwrap_or(u32::MAX),
+                    (true, None) => paging.slots,
+                },
                 // recurrent state replays from tokens: no buffered verbs
                 buffer_pages: 0,
                 state_slot_bytes: facts.state_slot_bytes(),

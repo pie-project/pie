@@ -201,10 +201,10 @@ impl CerebrasEngine {
         ))
     }
 
-    /// Whether the model is a unit program over pages (its lanes' rows run together, each over
-    /// its lane's own pages).
+    /// Whether the model is a unit program (its lanes' rows run together, each over its lane's
+    /// own pages and state slot).
     fn paged(&self) -> bool {
-        self.model.as_ref().is_some_and(|w| w.paging.is_some())
+        self.model.as_ref().is_some_and(|w| w.lanes.is_some())
     }
 
     /// Whether greedy loops are posted back to back (debug `posted = false`: one

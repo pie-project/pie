@@ -101,6 +101,14 @@ impl Model {
         }
     }
 
+    /// A unit program's lane slots a launch; none for the template's.
+    fn lanes(&self) -> Option<usize> {
+        match self {
+            Model::Artifact(_) => None,
+            Model::Units(m) => Some(m.lanes()),
+        }
+    }
+
     fn counts(&self) -> (u64, u64) {
         match self {
             Model::Artifact(m) => (m.launches, m.steps),
@@ -145,6 +153,8 @@ pub struct Wafer {
     pub posted_loop: usize,
     /// A unit program's paging: (lane slots a launch, pages a lane may hold, positions a page).
     pub paging: Option<(usize, u32, u32)>,
+    /// A unit program's lane slots a launch (its rows: Pie's lanes run together).
+    pub lanes: Option<usize>,
 }
 
 impl Wafer {
@@ -210,14 +220,19 @@ impl Wafer {
         let (job_tx, job_rx) = mpsc::channel::<Job>();
         let (ans_tx, ans_rx) = mpsc::channel::<Answer>();
         let (post_tx, post_rx) = mpsc::channel::<Answer>();
-        let (ready_tx, ready_rx) =
-            mpsc::channel::<R<((usize, usize, usize, usize), Option<(usize, u32, u32)>)>>();
+        let (ready_tx, ready_rx) = mpsc::channel::<
+            R<(
+                (usize, usize, usize, usize),
+                Option<(usize, u32, u32)>,
+                Option<usize>,
+            )>,
+        >();
         let thread = std::thread::Builder::new()
             .name("spatial-wafer".into())
             .spawn(move || {
                 let mut m = match open() {
                     Ok(m) => {
-                        let _ = ready_tx.send(Ok((m.sizes(), m.paging())));
+                        let _ = ready_tx.send(Ok((m.sizes(), m.paging(), m.lanes())));
                         m
                     }
                     Err(e) => {
@@ -277,7 +292,7 @@ impl Wafer {
                 }
             })
             .map_err(|e| format!("spawning the wafer thread: {e}"))?;
-        let ((cap, positions, vocab, hidden), paging) = ready_rx
+        let ((cap, positions, vocab, hidden), paging, lanes) = ready_rx
             .recv()
             .map_err(|_| "the wafer thread died while loading".to_string())??;
         Ok(Wafer {
@@ -291,6 +306,7 @@ impl Wafer {
             hidden,
             posted_loop,
             paging,
+            lanes,
         })
     }
 
