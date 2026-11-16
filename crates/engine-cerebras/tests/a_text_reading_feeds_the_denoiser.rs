@@ -319,7 +319,12 @@ fn flux_2_minis_text_on_the_fabric() {
     let ckpt = out.join("ckpt");
     common::checkpoint(&common::trace(), &ckpt);
     let mut engine = engine_at(&cache, None);
+    let t0 = std::time::Instant::now();
     let caps = load(&mut engine, &ckpt);
+    println!(
+        "READING_TEXT the load: {:.1} s (the programs compiled or found, opened, arrays written)",
+        t0.elapsed().as_secs_f64()
+    );
     // the simulator holds one program a process: `READING_CONTEXT` (a text pass's rows a run
     // before wrote) runs the denoise loop alone
     let got = if let Ok(ctx) = std::env::var("READING_CONTEXT") {
@@ -328,7 +333,7 @@ fn flux_2_minis_text_on_the_fabric() {
         let t0 = std::time::Instant::now();
         let got = text_pass(&mut engine, &PROMPT);
         println!(
-            "READING_TEXT the text pass: {:.1} ms (its program's first launch)",
+            "READING_TEXT the text pass: {:.1} ms (its program opened at load)",
             t0.elapsed().as_secs_f64() * 1e3
         );
         std::fs::write(

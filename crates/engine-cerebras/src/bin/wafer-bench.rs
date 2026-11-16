@@ -405,6 +405,7 @@ fn reading(get: &HashMap<String, String>) -> Result<bool, String> {
     // launch (`--reload`: the program loaded afresh a step, as M1e ran it)
     let reload = get.contains_key("reload");
     let load = || -> Result<Runtime, String> {
+        let t0 = std::time::Instant::now();
         let mut rt = Runtime::new(
             sdk.clone(),
             Path::new(&program),
@@ -413,8 +414,14 @@ fn reading(get: &HashMap<String, String>) -> Result<bool, String> {
         )
         .map_err(|e| e.to_string())?;
         rt.load();
+        let loaded = t0.elapsed().as_secs_f64();
         rt.run();
         reading.write_static(&mut rt)?;
+        println!(
+            "READING_LOAD {}",
+            json!({"load_s": loaded, "run_and_statics_s": t0.elapsed().as_secs_f64() - loaded,
+                "statics": rt.io.to_string()})
+        );
         Ok(rt)
     };
     let mut kept = if reload { None } else { Some(load()?) };
@@ -422,6 +429,7 @@ fn reading(get: &HashMap<String, String>) -> Result<bool, String> {
         let step = reading.step(&trace, grid, ins);
         let entries = reading.entries(&mut host, &step)?;
         let t0 = std::time::Instant::now();
+        let io0 = kept.as_ref().map(|r| r.io);
         let (got, cycles) = match kept.as_mut() {
             Some(rt) => reading.launch(rt, &entries)?,
             None => {
@@ -431,12 +439,24 @@ fn reading(get: &HashMap<String, String>) -> Result<bool, String> {
                 r
             }
         };
+        let wall_ms = t0.elapsed().as_secs_f64() * 1e3;
+        // the step's host side by kind: the entries in, the launch (the call's wall), the rows
+        // and the stamps back
+        let io = kept.as_ref().zip(io0).map(|(r, a)| {
+            let b = r.io;
+            let ms = |x: u64, y: u64| (x - y) as f64 / 1e6;
+            json!({"h2d_ms": ms(b.h2d.1, a.h2d.1), "h2d_calls": b.h2d.0 - a.h2d.0,
+                "h2d_words": b.h2d.2 - a.h2d.2, "launch_ms": ms(b.launch.1, a.launch.1),
+                "d2h_ms": ms(b.d2h.1, a.d2h.1), "d2h_calls": b.d2h.0 - a.d2h.0,
+                "d2h_words": b.d2h.2 - a.d2h.2})
+        });
         let back = reading.rows_back(&got)?;
         let v = reading
             .finish(&mut host, &trace, &step, &back, &[d.velocity.as_str()])?
             .remove(0);
         let mut line = json!({"step": i, "sigma": d.sigmas[i], "cycles": cycles,
-            "wall_s": t0.elapsed().as_secs(), "wall_ms": t0.elapsed().as_secs_f64() * 1e3, "finite": v.iter().all(|x| x.is_finite())});
+            "wall_s": t0.elapsed().as_secs(), "wall_ms": wall_ms, "io": io,
+            "finite": v.iter().all(|x| x.is_finite())});
         if let Some(g) = &golden {
             let p = g.join(format!("cpu_velocity{i}.f32"));
             if p.is_file() {

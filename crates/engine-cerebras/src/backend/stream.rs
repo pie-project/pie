@@ -6,8 +6,8 @@
 //! attachment binds (the cell the instance's own `take` would read, after the prologues ran),
 //! laid out as the trace's input axes do: a value a lane, a row a token, a row a voxel. The
 //! entries are the host forward's ([`Reading::entries`]), the static arrays the checkpoint's
-//! ([`Reading::statics`], written once a load, on the first step), and the exit's ops run over
-//! the rows read back ([`Reading::finish`]); the epilogues read the outputs, a lane's rows and
+//! ([`Reading::statics`], made at load, written as its program opens), and the exit's ops run
+//! over the rows read back ([`Reading::finish`]); the epilogues read the outputs, a lane's rows and
 //! the pass's later lanes' as for decode. The denoise loop is the guest's: its schedule, its
 //! Euler steps and its channels; the engine runs a step a fire.
 
@@ -105,9 +105,9 @@ pub(crate) struct Stream {
     host: Forward,
     /// cslc's output for the SDK runtime.
     link: std::path::PathBuf,
-    /// The static arrays' words, made from the checkpoint at the reading's first step and
-    /// written each time its program is opened.
-    statics: Option<Arc<Vec<Option<Vec<u32>>>>>,
+    /// The static arrays' words, made from the checkpoint at load and written each time its
+    /// program is opened.
+    statics: Arc<Vec<Option<Vec<u32>>>>,
     /// Its static arrays are on the program open.
     written: bool,
     steps: u64,
@@ -118,14 +118,11 @@ pub(crate) struct Stream {
 pub(crate) struct Streams {
     pub(crate) trace: Trace,
     pub(crate) readings: Vec<Stream>,
-    /// The forward over the checkpoint's planes the static arrays are made from, until every
-    /// reading's are.
-    weights: Option<Forward>,
     /// The fabric (the host's, or the SDK runtime's programs, a reading's at a time), on a
     /// thread of its own for the load.
     fabric: Remote,
     host_fabric: bool,
-    /// The program open (the SDK's link): its readings' static arrays written as they run.
+    /// The program open (the SDK's link), every reading's static arrays on it written.
     open: Option<std::path::PathBuf>,
 }
 
@@ -152,52 +149,48 @@ impl Streams {
     }
 
     /// The fabric reading `ri` runs on, its program open and its static arrays written.
-    fn fabric_for(&mut self, ri: usize, step: &StreamStep<'_>) -> R<&Remote> {
-        if self.readings[ri].statics.is_none() {
-            let weights = self
-                .weights
-                .as_mut()
-                .ok_or("the checkpoint's forward is dropped")?;
-            let s0 = std::time::Instant::now();
-            let words = self.readings[ri].reading.statics(weights, step)?;
-            self.readings[ri].statics = Some(Arc::new(words));
-            tracing::info!(
-                s = s0.elapsed().as_secs_f64(),
-                reading = %self.readings[ri].reading.reading,
-                "spatial: a stream program's static arrays made from the checkpoint"
-            );
-            if self.readings.iter().all(|s| s.statics.is_some()) {
-                self.weights = None;
-            }
-        }
+    fn fabric_for(&mut self, ri: usize) -> R<&Remote> {
         // the host fabric keeps each reading's arrays apart: a reading's are written on its first
-        // step; the SDK's program a link at a time (co-resident readings share one), a reading's
-        // arrays written the first time it runs on the program open
-        let link = self.readings[ri].link.clone();
-        let fresh = if self.host_fabric {
-            self.readings[ri].steps == 0
-        } else {
-            if self.open.as_ref() != Some(&link) {
-                self.open = None;
-                let l = link.clone();
-                // a program loaded afresh holds none of its readings' arrays
-                if self.fabric.call(move |f| f.switch(&l))? {
-                    for s in self.readings.iter_mut().filter(|s| s.link == link) {
-                        s.written = false;
-                    }
-                }
-                self.open = Some(link);
+        // step; the SDK's program a link at a time (co-resident readings share one)
+        if self.host_fabric {
+            if !self.readings[ri].written {
+                self.write(ri)?;
             }
-            !self.readings[ri].written
-        };
-        self.readings[ri].written = true;
-        if fresh {
-            let words = Arc::clone(self.readings[ri].statics.as_ref().ok_or("no statics")?);
-            let reading = Arc::clone(&self.readings[ri].reading);
-            self.fabric
-                .call(move |f| reading.write_statics(f, &words))?;
+        } else {
+            let link = self.readings[ri].link.clone();
+            if self.open.as_ref() != Some(&link) {
+                self.open_link(&link)?;
+            }
         }
         Ok(&self.fabric)
+    }
+
+    /// Opens the program `link` and writes the static arrays of every reading on it: a
+    /// co-resident program's all at once, so a reading's first launch does not wait on its
+    /// arrays still landing (the SDK's copies return before the words are on the PEs:
+    /// flux2-mini's 26 MB of denoise arrays held its first launch 12 ms on the CS-3).
+    fn open_link(&mut self, link: &std::path::Path) -> R<()> {
+        self.open = None;
+        let l = link.to_path_buf();
+        // a program loaded afresh holds none of its readings' arrays
+        let fresh = self.fabric.call(move |f| f.switch(&l))?;
+        for ri in 0..self.readings.len() {
+            if self.readings[ri].link == link && (fresh || !self.readings[ri].written) {
+                self.write(ri)?;
+            }
+        }
+        self.open = Some(link.to_path_buf());
+        Ok(())
+    }
+
+    /// Writes reading `ri`'s static arrays on the fabric.
+    fn write(&mut self, ri: usize) -> R<()> {
+        let words = Arc::clone(&self.readings[ri].statics);
+        let reading = Arc::clone(&self.readings[ri].reading);
+        self.fabric
+            .call(move |f| reading.write_statics(f, &words))?;
+        self.readings[ri].written = true;
+        Ok(())
     }
 }
 
@@ -417,12 +410,8 @@ impl CerebrasEngine {
                 .entries(&mut streams.readings[ri].host, &step_view)
                 .map_err(device)?;
             // (a grid program in weight groups writes its groups' tiles a launch each)
-            let words = if reading.groups > 0 {
-                streams.readings[ri].statics.clone()
-            } else {
-                None
-            };
-            let fabric = streams.fabric_for(ri, &step_view).map_err(device)?;
+            let words = (reading.groups > 0).then(|| Arc::clone(&streams.readings[ri].statics));
+            let fabric = streams.fabric_for(ri).map_err(device)?;
             let sent = Owned {
                 lanes: owned.lanes.clone(),
                 inputs: owned.inputs.clone(),
@@ -673,7 +662,7 @@ impl CerebrasEngine {
         let t0 = std::time::Instant::now();
         let landed = crate::prepare::land(&trace, contract, checkpoint).map_err(load)?;
         let of = |name: &str, count: usize| plane(&landed, name, count);
-        let weights = Forward::new(trace.clone(), None, &of).map_err(load)?;
+        let mut weights = Forward::new(trace.clone(), None, &of).map_err(load)?;
         tracing::info!(
             s = t0.elapsed().as_secs_f64(),
             "spatial: the checkpoint landed for a stream program"
@@ -691,15 +680,26 @@ impl CerebrasEngine {
             }
             let host =
                 Forward::host_for(trace.clone(), &of, &reading.entry_values()).map_err(load)?;
+            // the static arrays are the weights' alone: made from a step of no inputs
+            let s0 = std::time::Instant::now();
+            let statics = reading
+                .statics(&mut weights, &reading.step(&trace, None, &[]))
+                .map_err(load)?;
+            tracing::info!(
+                s = s0.elapsed().as_secs_f64(),
+                reading = %reading.reading,
+                "spatial: a stream program's static arrays made from the checkpoint"
+            );
             readings.push(Stream {
                 reading: Arc::new(reading),
                 host,
                 link: link.clone(),
-                statics: None,
+                statics: Arc::new(statics),
                 written: false,
                 steps: 0,
             });
         }
+        drop(weights);
         let host_fabric = self.debug.stream_fabric.as_deref() == Some("host");
         // On the host fabric, a reading no program runs (the stream compiler refuses it: a
         // VAE's convolutions) is served whole by the host's forward: a debug fallback, never
@@ -722,7 +722,7 @@ impl CerebrasEngine {
                     reading: Arc::new(Reading::host_only(&trace.name, &r, &classes)),
                     host: Forward::host_for(trace.clone(), &of, &all).map_err(load)?,
                     link: std::path::PathBuf::new(),
-                    statics: Some(Arc::new(Vec::new())),
+                    statics: Arc::new(Vec::new()),
                     written: false,
                     steps: 0,
                 });
@@ -805,14 +805,25 @@ impl CerebrasEngine {
             );
         }
         let trace_name = trace.name.clone();
-        self.stream = Some(Streams {
+        let mut streams = Streams {
             trace,
             readings,
-            weights: Some(weights),
             fabric,
             host_fabric,
             open: None,
-        });
+        };
+        // a wafer's program opened now, its readings' arrays written as it loads: a reading's
+        // first step neither loads it nor waits on its arrays
+        if !host_fabric && let Some(link) = streams.readings.first().map(|s| s.link.clone()) {
+            let s0 = std::time::Instant::now();
+            streams.open_link(&link).map_err(load)?;
+            tracing::info!(
+                s = s0.elapsed().as_secs_f64(),
+                link = %link.display(),
+                "spatial: a stream program opened at load, its static arrays written"
+            );
+        }
+        self.stream = Some(streams);
         self.facts = Some(facts);
         self.caps = Some(caps.clone());
         Ok(engine::load::Loaded {
