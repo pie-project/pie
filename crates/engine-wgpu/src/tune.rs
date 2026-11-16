@@ -26,21 +26,20 @@ pub fn rates(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Outco
     let r = crate::rates::measure(&device, &tuning).map_err(|e| e.to_string())?;
     say(&format!(
         "[rates]: {:.1} TFLOP/s bf16, {:.0} GB/s, launch {} us",
-        r.bf16_flops_per_ns.unwrap_or(0.0) / 1e3,
+        r.peak_flops().unwrap_or(0.0) / 1e3,
         r.bytes_per_ns.unwrap_or(0.0),
         r.launch_ns.unwrap_or(0) / 1000
     ));
-    let tuned = format!(
-        "[rates]\nbf16_flops_per_ns = {:?}\nbytes_per_ns = {:?}\nlaunch_ns = {}\n",
-        r.bf16_flops_per_ns.unwrap_or(1.0),
-        r.bytes_per_ns.unwrap_or(1.0),
-        r.launch_ns.unwrap_or(0)
-    );
+    let tuned = engine::rates::tuned(&r);
     let seconds = began.elapsed().as_secs_f64();
     let provenance = [
         (
             "source",
             "\"pie tune wgpu --rates on this machine\"".to_string(),
+        ),
+        engine::rates::provenance(
+            "wgpu",
+            "the matmul through the profile's path, the adapter's timestamps where it has them",
         ),
         ("from", format!("\"{}\"", report.used)),
         ("pie", format!("\"{}\"", env!("CARGO_PKG_VERSION"))),

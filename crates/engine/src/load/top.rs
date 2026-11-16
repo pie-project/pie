@@ -141,7 +141,8 @@ fn routing(trace: &Trace) -> Option<(u32, u32)> {
 #[must_use]
 pub fn estimate(counts: &Counts, rates: &profile::fire::Rates) -> Option<FireEstimate> {
     Some(FireEstimate {
-        flops_per_ns: rates.bf16_flops_per_ns?,
+        // The curve's widest point until the estimate reads it by rows.
+        flops_per_ns: rates.flops_at(u32::MAX)?,
         bytes_per_ns: rates.bytes_per_ns?,
         launch_ns: rates.launch_ns.unwrap_or(0) as f64,
         dense_bytes: counts.weight_bytes,
@@ -167,8 +168,9 @@ impl fmt::Display for Refused {
         match self {
             Refused::NoRates { device } => write!(
                 f,
-                "device {device} has no rates in its profile (`[rates] bf16_flops_per_ns` and \
-                 `bytes_per_ns`), so nothing weighs its top rung; `pie tune --rates` measures them"
+                "device {device} has no rates in its profile (`[rates] bf16_flops_per_ns_by_rows` \
+                 and `bytes_per_ns`), so nothing weighs its top rung; `pie tune --rates` measures \
+                 them"
             ),
             Refused::NoRung(no) => no.fmt(f),
         }
@@ -208,10 +210,10 @@ pub fn line_of(
     live: u64,
     tuned: &profile::fire::Tuned,
 ) -> String {
-    let r = tuned.rates;
+    let r = &tuned.rates;
     let rates = format!(
         "{:.1} TFLOP/s bf16, {:.0} GB/s, launch {} us",
-        r.bf16_flops_per_ns.unwrap_or(0.0) / 1e3,
+        r.peak_flops().unwrap_or(0.0) / 1e3,
         r.bytes_per_ns.unwrap_or(0.0),
         r.launch_ns.unwrap_or(0) / 1000
     );
@@ -280,9 +282,9 @@ mod tests {
         // No feasible rung at all: the ruling's refusal.
         let none = [rung(1024, 300 * MIB, Some("past one binding"))];
         let rated = profile::fire::Rates {
-            bf16_flops_per_ns: Some(1.0),
+            bf16_flops_per_ns_by_rows: Some(vec![(4096, 1.0)]),
             bytes_per_ns: Some(1.0),
-            launch_ns: None,
+            ..profile::fire::Rates::default()
         };
         let err = choose(&none, 1 << 33, &rated, "Card X", &counts()).unwrap_err();
         assert!(matches!(err, Refused::NoRung(_)), "{err}");
@@ -296,9 +298,10 @@ mod tests {
     #[test]
     fn the_estimate_reads_the_rates_and_the_counts() {
         let rates = profile::fire::Rates {
-            bf16_flops_per_ns: Some(10.0),
+            bf16_flops_per_ns_by_rows: Some(vec![(16, 1.0), (4096, 10.0)]),
             bytes_per_ns: Some(100.0),
             launch_ns: Some(5),
+            ..profile::fire::Rates::default()
         };
         let e = estimate(&counts(), &rates).unwrap();
         assert_eq!(
@@ -308,7 +311,7 @@ mod tests {
         assert_eq!(e.dense_bytes, 1 << 30);
         let unstated = profile::fire::Rates {
             bytes_per_ns: None,
-            ..rates
+            ..rates.clone()
         };
         assert_eq!(estimate(&counts(), &unstated), None);
     }
@@ -333,9 +336,10 @@ mod tests {
         };
         let tuned = profile::fire::Tuned {
             rates: profile::fire::Rates {
-                bf16_flops_per_ns: Some(249_000.0),
+                bf16_flops_per_ns_by_rows: Some(vec![(4096, 249_000.0)]),
                 bytes_per_ns: Some(654.0),
                 launch_ns: Some(1620),
+                ..profile::fire::Rates::default()
             },
             measured_this_load: false,
         };

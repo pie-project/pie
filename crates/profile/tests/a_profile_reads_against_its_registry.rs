@@ -915,7 +915,9 @@ api = 1
 [target]
 device = "Apple M9"
 [rates]
-bf16_flops_per_ns = 50000.0  # 50 TFLOP/s
+bf16_flops_per_ns_by_rows = [[16, 5000.0], [4096, 50000]]  # 50 TFLOP/s wide
+attn_flops_per_ns = 20000.0
+scan_elements_per_ns = 3000.0
 bytes_per_ns = 400           # 400 GB/s
 "#;
 
@@ -943,7 +945,9 @@ fn a_device_file_states_its_rates_and_a_layer_above_replaces_them() {
     assert_eq!(
         p.rates(),
         profile::fire::Rates {
-            bf16_flops_per_ns: Some(50000.0),
+            bf16_flops_per_ns_by_rows: Some(vec![(16, 5000.0), (4096, 50000.0)]),
+            attn_flops_per_ns: Some(20000.0),
+            scan_elements_per_ns: Some(3000.0),
             bytes_per_ns: Some(400.0),
             launch_ns: None,
         }
@@ -985,7 +989,33 @@ fn rates_are_refused_where_they_do_not_read_and_fire_times_are_no_profiles() {
         ),
         (
             "[rates]\nflops = 1.0\n",
-            "`rates` holds `bf16_flops_per_ns`",
+            "`rates` holds `bf16_flops_per_ns_by_rows`",
+        ),
+        // The scalar rate is gone: an unknown key like any other.
+        (
+            "[rates]\nbf16_flops_per_ns = 1.0\n",
+            "`scan_elements_per_ns`, `bytes_per_ns` and `launch_ns`, not `bf16_flops_per_ns`",
+        ),
+        (
+            "[rates]\nbf16_flops_per_ns_by_rows = []\n",
+            "`rates.bf16_flops_per_ns_by_rows` is a non-empty list of [rows, flops a ns] \
+             pairs, ascending in rows, not an empty list",
+        ),
+        (
+            "[rates]\nbf16_flops_per_ns_by_rows = [[256, 2.0], [16, 1.0]]\n",
+            "ascending in rows, not",
+        ),
+        (
+            "[rates]\nbf16_flops_per_ns_by_rows = [[16, -1.0]]\n",
+            "ascending in rows, not",
+        ),
+        (
+            "[rates]\nbf16_flops_per_ns_by_rows = 1.0\n",
+            "ascending in rows, not",
+        ),
+        (
+            "[rates]\nscan_elements_per_ns = 0\n",
+            "`rates.scan_elements_per_ns` is a positive number",
         ),
         (
             "[rates]\nlaunch_ns = 1.5\n",
@@ -1003,7 +1033,7 @@ fn the_notice_names_rates_measured_on_the_device_and_what_is_untuned() {
     let r = registry();
     let rated = |provenance: &str| {
         format!(
-            "api = 1\n[target]\ndevice = \"Apple M9\"\n[rates]\nbf16_flops_per_ns = 5000.0\n\
+            "api = 1\n[target]\ndevice = \"Apple M9\"\n[rates]\nbf16_flops_per_ns_by_rows = [[4096, 5000.0]]\n\
              bytes_per_ns = 300.0\n{provenance}"
         )
     };

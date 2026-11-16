@@ -248,7 +248,7 @@ impl Profile {
     /// The device's rates, each where a layer states it.
     #[must_use]
     pub fn rates(&self) -> crate::fire::Rates {
-        self.1.rates
+        self.1.rates.clone()
     }
 
     /// This profile with the rates `tuned` states.

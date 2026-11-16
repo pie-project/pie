@@ -24,6 +24,7 @@ pub mod memory;
 pub mod placement;
 pub mod ports;
 pub mod program;
+pub mod rates;
 pub mod rs;
 pub mod runahead;
 pub mod transfer;

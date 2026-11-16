@@ -87,7 +87,12 @@ pub fn choose(
 /// then `top`, and as many lanes at most.
 #[must_use]
 pub fn bounded(budget: &poem_compiler::Budget, top: u32) -> poem_compiler::Budget {
-    let mut buckets: Vec<u32> = budget.buckets.iter().copied().filter(|&b| b < top).collect();
+    let mut buckets: Vec<u32> = budget
+        .buckets
+        .iter()
+        .copied()
+        .filter(|&b| b < top)
+        .collect();
     if !budget.buckets.is_empty() {
         buckets.push(top);
     }
@@ -138,23 +143,32 @@ mod tests {
     #[test]
     fn without_rates_the_load_is_refused_by_name() {
         let rungs = rung_facts(&[candidate(1024, 100), candidate(2048, 150)], MIB, 256, 200);
-        let err = choose(&rungs, 1 << 33, &profile::fire::Rates::default(), "Apple X", &counts())
-            .unwrap_err();
+        let err = choose(
+            &rungs,
+            1 << 33,
+            &profile::fire::Rates::default(),
+            "Apple X",
+            &counts(),
+        )
+        .unwrap_err();
         assert!(
-            err.to_string().contains("device Apple X has no rates in its profile"),
+            err.to_string()
+                .contains("device Apple X has no rates in its profile"),
             "{err}"
         );
         let rated = profile::fire::Rates {
-            bf16_flops_per_ns: Some(5000.0),
+            bf16_flops_per_ns_by_rows: Some(vec![(4096, 5000.0)]),
             bytes_per_ns: Some(400.0),
             launch_ns: Some(5000),
+            ..profile::fire::Rates::default()
         };
         let top = choose(&rungs, 1 << 33, &rated, "Apple X", &counts()).unwrap();
         assert!(matches!(top.tokens, 1024 | 2048));
         let none = rung_facts(&[candidate(1024, 300)], MIB, 256, 200);
         let err = choose(&none, 1 << 33, &rated, "Apple X", &counts()).unwrap_err();
         assert!(
-            err.to_string().contains("1024 tokens (span 300 MiB): past one buffer"),
+            err.to_string()
+                .contains("1024 tokens (span 300 MiB): past one buffer"),
             "{err}"
         );
     }

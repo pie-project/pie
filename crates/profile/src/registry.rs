@@ -985,17 +985,23 @@ impl<'a> Walk<'a> {
         };
         for (k, v) in t.iter() {
             match k.get_ref().as_ref() {
-                key @ ("bf16_flops_per_ns" | "bytes_per_ns") => match positive(v.get_ref()) {
-                    Some(f) if key == "bytes_per_ns" => rates.bytes_per_ns = Some(f),
-                    Some(f) => rates.bf16_flops_per_ns = Some(f),
-                    None => self.err(
-                        v.span().start,
-                        format!(
-                            "`rates.{key}` is a positive number, not {}",
-                            found(v.get_ref())
+                "bf16_flops_per_ns_by_rows" => {
+                    rates.bf16_flops_per_ns_by_rows = self.curve(v);
+                }
+                key @ ("attn_flops_per_ns" | "scan_elements_per_ns" | "bytes_per_ns") => {
+                    match positive(v.get_ref()) {
+                        Some(f) if key == "bytes_per_ns" => rates.bytes_per_ns = Some(f),
+                        Some(f) if key == "attn_flops_per_ns" => rates.attn_flops_per_ns = Some(f),
+                        Some(f) => rates.scan_elements_per_ns = Some(f),
+                        None => self.err(
+                            v.span().start,
+                            format!(
+                                "`rates.{key}` is a positive number, not {}",
+                                found(v.get_ref())
+                            ),
                         ),
-                    ),
-                },
+                    }
+                }
                 "launch_ns" => match int(v.get_ref()).and_then(|i| u64::try_from(i).ok()) {
                     Some(ns) => rates.launch_ns = Some(ns),
                     None => self.err(
@@ -1009,13 +1015,63 @@ impl<'a> Walk<'a> {
                 other => self.err(
                     k.span().start,
                     format!(
-                        "`rates` holds `bf16_flops_per_ns`, `bytes_per_ns` and `launch_ns`, \
-                         not `{other}`"
+                        "`rates` holds `bf16_flops_per_ns_by_rows`, `attn_flops_per_ns`, \
+                         `scan_elements_per_ns`, `bytes_per_ns` and `launch_ns`, not `{other}`"
                     ),
                 ),
             }
         }
         rates
+    }
+
+    /// `rates.bf16_flops_per_ns_by_rows`: `[rows, flops a ns]` pairs, a
+    /// whole number of rows and a positive rate each, non-empty and strictly
+    /// ascending in rows.
+    fn curve(&mut self, value: &Spanned<DeValue<'_>>) -> Option<Vec<(u32, f64)>> {
+        const WHAT: &str = "`rates.bf16_flops_per_ns_by_rows` is a non-empty list of \
+                            [rows, flops a ns] pairs, ascending in rows";
+        let DeValue::Array(points) = value.get_ref() else {
+            self.err(
+                value.span().start,
+                format!("{WHAT}, not {}", found(value.get_ref())),
+            );
+            return None;
+        };
+        let mut curve: Vec<(u32, f64)> = Vec::with_capacity(points.len());
+        for point in points.iter() {
+            let pair = match point.get_ref() {
+                DeValue::Array(pair) if pair.len() == 2 => {
+                    let rows = int(pair[0].get_ref())
+                        .and_then(|i| u32::try_from(i).ok())
+                        .filter(|&m| m > 0);
+                    let rate = match pair[1].get_ref() {
+                        DeValue::Float(f) => f.as_str().replace('_', "").parse::<f64>().ok(),
+                        DeValue::Integer(_) => int(pair[1].get_ref()).map(|i| i as f64),
+                        _ => None,
+                    }
+                    .filter(|f| f.is_finite() && *f > 0.0);
+                    rows.zip(rate)
+                }
+                _ => None,
+            };
+            match pair {
+                Some((m, r)) if curve.last().is_none_or(|&(last, _)| m > last) => {
+                    curve.push((m, r));
+                }
+                _ => {
+                    self.err(
+                        point.span().start,
+                        format!("{WHAT}, not {}", found(point.get_ref())),
+                    );
+                    return None;
+                }
+            }
+        }
+        if curve.is_empty() {
+            self.err(value.span().start, format!("{WHAT}, not an empty list"));
+            return None;
+        }
+        Some(curve)
     }
 
     fn target(&mut self, value: &Spanned<DeValue<'_>>) -> Target {

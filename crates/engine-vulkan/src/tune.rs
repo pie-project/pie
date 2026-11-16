@@ -575,7 +575,7 @@ fn rates(base: &Profile, say: &mut dyn FnMut(&str)) -> Result<profile::fire::Rat
     ));
     say(&format!(
         "[rates]: {:.1} TFLOP/s bf16, {:.0} GB/s, launch {} us",
-        rates.bf16_flops_per_ns.unwrap_or(0.0) / 1e3,
+        rates.peak_flops().unwrap_or(0.0) / 1e3,
         rates.bytes_per_ns.unwrap_or(0.0),
         rates.launch_ns.unwrap_or(0) / 1000
     ));
@@ -661,12 +661,7 @@ pub fn run(
     let mut tuned = search::render_overrides(&chosen);
     if steps.rates {
         let r = rates(&base, say)?;
-        tuned.push_str(&format!(
-            "[rates]\nbf16_flops_per_ns = {:?}\nbytes_per_ns = {:?}\nlaunch_ns = {}\n",
-            r.bf16_flops_per_ns.unwrap_or(1.0),
-            r.bytes_per_ns.unwrap_or(1.0),
-            r.launch_ns.unwrap_or(0)
-        ));
+        tuned.push_str(&engine::rates::tuned(&r));
     }
     let today = bench.file(&[])?;
     let draft = bench.file(&chosen)?;
@@ -733,7 +728,7 @@ pub fn run(
         )
     };
     let seconds = began.elapsed().as_secs_f64();
-    let provenance = [
+    let mut provenance = vec![
         (
             "source",
             format!("\"pie tune --{} on this machine\"", depth.word()),
@@ -744,6 +739,12 @@ pub fn run(
         ("seconds", format!("{seconds:.0}")),
         ("checked", format!("\"{}\"", checked.replace('"', "'"))),
     ];
+    if steps.rates {
+        provenance.push(engine::rates::provenance(
+            "vulkan",
+            "the matmul through the profile's path, the host's clock around each frame",
+        ));
+    }
     let file = search::assemble(
         crate::chip::registry(),
         &base,

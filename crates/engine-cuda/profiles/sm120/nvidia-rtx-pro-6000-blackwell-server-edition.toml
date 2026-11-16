@@ -91,7 +91,7 @@ seat_spread = true
 # Blackwell Server Edition datasheet) is 2000 dense, and bf16 runs at a
 # quarter of FP4's rate: 500 TFLOPS. Replace with a direct vendor dense bf16
 # figure when one is published.
-bf16_flops_per_ns = 500000.0
+bf16_flops_per_ns_by_rows = [[4096, 500000.0]]
 # 1597 GB/s of GDDR7 (RTX PRO 6000 Blackwell Server Edition datasheet).
 bytes_per_ns = 1597.0
 

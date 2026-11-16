@@ -151,9 +151,10 @@ pub fn measure<B: Serve>(
 
     let flops = 2.0 * f64::from(GEMM).powi(3);
     Ok(Rates {
-        bf16_flops_per_ns: Some(flops / gemm_ns as f64),
+        bf16_flops_per_ns_by_rows: Some(vec![(GEMM, flops / gemm_ns as f64)]),
         // Every byte copied is read and written.
         bytes_per_ns: Some(2.0 * copy as f64 / copy_ns as f64),
         launch_ns: Some(launch),
+        ..Rates::default()
     })
 }

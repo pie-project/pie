@@ -55,7 +55,9 @@ fn the_device_rates() {
         Tensor::new(bind(&w), n, n, Dtype::Bf16),
         Tensor::new(bind(&y), n, n, Dtype::Bf16),
     );
-    let gemm_s = median(timed(&|sink| gemm::matmul(sink, &tuning, at, wt, yt).expect("the gemm")));
+    let gemm_s = median(timed(&|sink| {
+        gemm::matmul(sink, &tuning, at, wt, yt).expect("the gemm")
+    }));
     let flops_per_ns = 2.0 * f64::from(n).powi(3) / (gemm_s * 1e9);
 
     let bytes = 256u64 << 20;
@@ -64,7 +66,9 @@ fn the_device_rates() {
         (0..6)
             .map(|_| {
                 let mut frame = device.frame().expect("a frame");
-                frame.copy_span(&from, 0, &into, 0, bytes).expect("the copy");
+                frame
+                    .copy_span(&from, 0, &into, 0, bytes)
+                    .expect("the copy");
                 frame.commit_timed().expect("it lands")
             })
             .skip(1)
@@ -92,7 +96,13 @@ fn the_device_rates() {
         gemm_s * 1e3,
         flops_per_ns / 1e3
     );
-    println!("256 MiB blit: {:.2} ms, {:.1} GB/s read+write", copy_s * 1e3, bytes_per_ns);
+    println!(
+        "256 MiB blit: {:.2} ms, {:.1} GB/s read+write",
+        copy_s * 1e3,
+        bytes_per_ns
+    );
     println!("launch: {launch_ns} ns a dispatch ({LAUNCHES} small gemms in one frame)");
-    println!("[rates]\nbf16_flops_per_ns = {flops_per_ns:.1}\nbytes_per_ns = {bytes_per_ns:.1}\nlaunch_ns = {launch_ns}");
+    println!(
+        "[rates]\nbf16_flops_per_ns_by_rows = [[4096, {flops_per_ns:.1}]]\nbytes_per_ns = {bytes_per_ns:.1}\nlaunch_ns = {launch_ns}"
+    );
 }

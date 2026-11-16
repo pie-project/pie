@@ -79,7 +79,7 @@ branches = true
 
 [rates]
 # 149.7 TFLOPS dense bf16 (NVIDIA A40 datasheet; 299.4 with sparsity).
-bf16_flops_per_ns = 149700.0
+bf16_flops_per_ns_by_rows = [[4096, 149700.0]]
 # 696 GB/s of GDDR6 (A40 datasheet).
 bytes_per_ns = 696.0
 

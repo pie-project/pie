@@ -85,7 +85,7 @@ dag_streams_until = 256
 # 165.2 TFLOPS dense bf16 with FP32 accumulation, as pie's products
 # accumulate (NVIDIA Ada Lovelace architecture whitepaper; 330.3
 # accumulating in FP16).
-bf16_flops_per_ns = 165200.0
+bf16_flops_per_ns_by_rows = [[4096, 165200.0]]
 # 1008 GB/s of GDDR6X (Ada whitepaper).
 bytes_per_ns = 1008.0
 

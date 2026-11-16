@@ -46,7 +46,7 @@ norm.rope_from = 1024
 # Measured on a v6e through XLA's own path (one PJRT execute a program, as a fire), median of 5 after a
 # warm one: a 4096^3 bf16 dot (`matmul_nt`, 0.165 ms). Google's 918 TFLOPS dense bf16 a chip is the upper
 # bound; XLA reaches 91%.
-bf16_flops_per_ns = 834000.0
+bf16_flops_per_ns_by_rows = [[4096, 834000.0]]
 # A 256 MiB elementwise pass (a negate) counted read plus write (0.418 ms); the chip's 1640 GB/s of HBM
 # is the upper bound (78%).
 bytes_per_ns = 1283.0

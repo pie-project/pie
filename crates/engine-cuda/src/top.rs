@@ -110,9 +110,10 @@ mod tests {
     /// The L40S device file's rates.
     fn l40s() -> profile::fire::Rates {
         profile::fire::Rates {
-            bf16_flops_per_ns: Some(249_000.0),
+            bf16_flops_per_ns_by_rows: Some(vec![(4096, 249_000.0)]),
             bytes_per_ns: Some(654.0),
             launch_ns: Some(1620),
+            ..profile::fire::Rates::default()
         }
     }
 
