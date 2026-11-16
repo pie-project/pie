@@ -317,6 +317,20 @@ fn decode(get: &HashMap<String, String>) -> Result<bool, String> {
         reading.model,
         t0.elapsed().as_secs_f64()
     );
+    if get.contains_key("dry") {
+        // the host's side alone: the statics made, each step's entries
+        let words: usize = statics.iter().flatten().map(Vec::len).sum();
+        for s in 0..seq.len().saturating_sub(1).min(3) {
+            let (_, e) = reading.decode_step(&mut host, &trace, &seq[s..=s], s as u32)?;
+            let n: usize = e.iter().flatten().map(Vec::len).sum();
+            println!("DECODE_DRY step {s}: {n} entry words");
+        }
+        println!(
+            "DECODE_DRY {words} static words, {} pos PEs",
+            reading.pos.len()
+        );
+        return Ok(true);
+    }
     let platform = match get.get("cmaddr") {
         Some(c) => Platform::System { cmaddr: c.clone() },
         None => Platform::Simulator(Simulator {
