@@ -2610,7 +2610,7 @@ fn every_armed_composition_of_an_mtp_deployment_is_sized() {
     let mut shell = load(&fixture, &cache);
     shell.open(0).expect("slot 0 opens");
     let served = shell.body_tally();
-    let mut fire = |shell: &mut Shell, tokens: &[u32], drafts: bool| {
+    let fire = |shell: &mut Shell, tokens: &[u32], drafts: bool| {
         let rows = u32::try_from(tokens.len()).expect("a count");
         let word = fixture
             .trace

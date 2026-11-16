@@ -521,7 +521,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod tests {
+mod media_tests {
     use super::*;
 
     /// A load's lattice keys a text prefill for every plain class that is no

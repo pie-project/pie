@@ -578,8 +578,12 @@ pub struct Inputs {
     /// for: where the slab lies decides their addresses ([`Inputs::lay`]).
     grants: Vec<Option<Grant>>,
     runs: u32,
-    /// The staged run table of [`inject_tokens`] in the slab: a run a lane.
+    /// The staged run table of [`inject_tokens`] in the slab: a run a lane,
+    /// and a second a lane for its shifted copy into the next tokens.
     inject_runs: u64,
+    /// The trace reads `inputs.next_tokens()`: a lane's tokens fed from the
+    /// device are fed there too, a row earlier ([`Inputs::set_shifts_next`]).
+    shifts_next: bool,
     /// The staged run table of [`inject_masks`] in the slab: a run a lane.
     mask_runs: u64,
     /// Staged apart from the slab: their size is the groups', not the load's.
@@ -598,6 +602,14 @@ pub struct GroupMaskHandles {
 }
 
 impl Inputs {
+    /// The trace reads each row's next token: a lane whose tokens are fed
+    /// from the device (a draft, a runahead sample) has its next tokens fed
+    /// from the same words, one row earlier, as the host stages them for
+    /// tokens it holds.
+    pub fn set_shifts_next(&mut self, shifts: bool) {
+        self.shifts_next = shifts;
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn reserve(
         budget: &Budget,
@@ -654,7 +666,8 @@ impl Inputs {
         };
         let mask_bits = take(mask_bytes);
         // A lane feeds its tokens, and its mask, from the device in one run.
-        let inject_runs = take(lanes * size_of::<kernels_cuda::runtime::channel::WordRun>() as u64);
+        let inject_runs =
+            take(2 * lanes * size_of::<kernels_cuda::runtime::channel::WordRun>() as u64);
         let mask_runs = take(lanes * size_of::<kernels_cuda::runtime::channel::BitRun>() as u64);
         let mask_indptr = take((lanes + 1) * 8);
         let page_tables: Vec<TableAt> = (0..page_tables)
@@ -789,6 +802,7 @@ impl Inputs {
             max_lanes: crate::window::lane_capacity(budget.max_lanes),
             max_rows: budget.max_tokens,
             inject_runs,
+            shifts_next: false,
             mask_runs,
             group_masks: None,
             outgrown: Vec::new(),
@@ -1382,6 +1396,7 @@ impl Inputs {
                 have: u64::from(self.max_lanes),
             });
         }
+        let shifts_next = self.shifts_next;
         let Inputs {
             store,
             staging,
@@ -1479,6 +1494,28 @@ impl Inputs {
         // SAFETY: the sources are the slot's pinned bytes, held until the `SlotGuard` drops.
         unsafe { store.stage_batch_from(stream, &spans)? };
 
+        // A lane's device-fed words land in its next tokens a row earlier:
+        // row i takes word i + 1, its last row keeping what the host staged
+        // (the token past it, else its own). The next tokens lie past the
+        // tokens in the slab, so one table carries both.
+        let shifted: Vec<TokenInject>;
+        let token_injects = if shifts_next && !token_injects.is_empty() {
+            let gap = at_next_tokens - at_tokens;
+            shifted = token_injects
+                .iter()
+                .copied()
+                .chain(token_injects.iter().filter(|inject| inject.bytes > 4).map(|inject| {
+                    TokenInject {
+                        dst_off: gap + inject.dst_off,
+                        src: inject.src + 4,
+                        bytes: inject.bytes - 4,
+                    }
+                }))
+                .collect();
+            &shifted[..]
+        } else {
+            token_injects
+        };
         inject_tokens(
             device,
             (&mut *store, *inject_runs),

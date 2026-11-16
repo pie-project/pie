@@ -405,7 +405,7 @@ pub fn lane_classes(
         ))
     });
     let embeds = classes_reading(trace, compiled, |def| {
-        matches!(def, Def::Input(RuntimeInput::Tokens))
+        matches!(def, Def::Input(RuntimeInput::Tokens | RuntimeInput::NextTokens))
     });
     let wide = classes_running(trace, compiled, |op| {
         matches!(

@@ -1243,7 +1243,7 @@ impl Shell {
                 crate::device::free_bytes().unwrap_or(0) >> 20
             );
         }
-        let inputs = Inputs::reserve(
+        let mut inputs = Inputs::reserve(
             &boot.budget,
             paging,
             page_tables,
@@ -1264,6 +1264,7 @@ impl Shell {
             pools.ids_a_lane(),
             buffers.as_ref().map(crate::store::rs::Buffers::page_tokens),
         )?;
+        inputs.set_shifts_next(boot.trace.reads_next_tokens());
 
         let exports = Exports::of(&boot.trace, &compiled)?;
 
