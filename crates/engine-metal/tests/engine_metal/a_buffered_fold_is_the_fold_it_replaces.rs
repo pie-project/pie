@@ -87,6 +87,7 @@ fn ready() -> Option<Shell> {
         runahead: engine::runahead::Runahead::F1,
         allowance: engine::Allowance::WHOLE,
         profiles: None,
+        top: engine_metal::Top::EveryRung,
         residency: engine_metal::ResidencyPlan::default(),
     })
     .and_then(|mut shell| shell.raise_whole().map(|()| shell))
