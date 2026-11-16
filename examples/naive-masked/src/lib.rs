@@ -82,7 +82,7 @@ async fn main(input: Input) -> Result<Output> {
     ) {
         return Err(format!("unknown mask_mode: {mask_mode}"));
     }
-    let masked = matches!(mask_mode.as_str(), "dense" | "structured" | "doc-isolation");
+    let mut masked = matches!(mask_mode.as_str(), "dense" | "structured" | "doc-isolation");
 
     let structured = mask_mode == "structured";
     let masked_prefill = mask_mode == "dense-prefill";
@@ -159,8 +159,7 @@ async fn main(input: Input) -> Result<Output> {
 
     // doc-isolation keeps once (`Fold::Keep`): its first decode drops the
     // document and commits the rest, so the decodes after it read what the
-    // set holds; their mask speaks of the buffer (column `c` is slot
-    // `folded + c`), which starts empty.
+    // set holds, with nothing left to hide: they bind no mask.
     let (mut g0, mut rng_at, mut query, mut doc_start) = (g0, 0u32, n, doc_start);
     if doc_start > 0 && generated.len() < max_tokens {
         use inferlet::eta::keep::{COMMIT, DROP};
@@ -195,6 +194,7 @@ async fn main(input: Input) -> Result<Output> {
         let t = out.take_host::<i32>().await.map_err(|e| format!("keep take: {e}"))?;
         generated.push(t as u32);
         (g0, rng_at, query, doc_start) = (t, 1, 0, 0);
+        masked = false;
     }
 
     // ── DECODE LOOP (1-wide, run-ahead) — chat-completion's decode shape. ──
