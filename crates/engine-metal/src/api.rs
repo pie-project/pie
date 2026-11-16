@@ -1255,17 +1255,33 @@ impl Metal {
                 })
                 .collect();
             window_of.push(windows);
-            let fixed = lane
-                .fixed
-                .iter()
-                .find(|(shape, _)| *shape == crate::store::layout::FIXED);
-            run_of.push(fixed.and_then(|(_, pieces)| {
+            // A load that holds state is told every lane's record: its
+            // pieces, or none (the null record).
+            let fixed: Option<Vec<[u32; 2]>> = match &lane.record {
+                engine::fire::LaneRecord::Pieces(pieces) => pieces
+                    .iter()
+                    .find(|(shape, _)| *shape == crate::store::layout::FIXED)
+                    .map(|(_, pieces)| pieces.clone()),
+                engine::fire::LaneRecord::Null => shell
+                    .null_record()
+                    .map(|null| null.iter().map(|&r| [r, r]).collect()),
+                engine::fire::LaneRecord::Unstated if shell.null_record().is_some() => {
+                    return Err(Error::Invalid(format!(
+                        "lane in slot {} states no record, and this load holds recurrent \
+                         state: the runtime states every lane's record, or that it has none",
+                        lane.slot
+                    )));
+                }
+                engine::fire::LaneRecord::Unstated => None,
+            };
+            let fixed = fixed.as_ref();
+            run_of.push(fixed.and_then(|pieces| {
                 pieces
                     .iter()
                     .any(|&[run, cow]| run != cow)
                     .then(|| pieces.iter().map(|&[run, _]| run).collect())
             }));
-            record_of.push(fixed.map(|(_, pieces)| {
+            record_of.push(fixed.map(|pieces| {
                 // `cow != run`: the record is copied before the fire, once
                 // for every lane of a group naming the same pair.
                 for &[run, cow] in pieces {
@@ -1310,7 +1326,12 @@ impl Metal {
                         Readout::Rows(rows) => Some(rows.as_slice()),
                         Readout::Last | Readout::None => None,
                     },
-                    translation: pages_of[at].as_deref().unwrap_or(&[]),
+                    translation: match lane.list {
+                        engine::fire::ListKind::Translation => {
+                            pages_of[at].as_deref().unwrap_or(&[])
+                        }
+                        engine::fire::ListKind::Pages => &[],
+                    },
                     rs: &lane.rs,
                     rs_reset: lane.rs_reset,
                     rs_snapshots: &lane.rs_snapshots,

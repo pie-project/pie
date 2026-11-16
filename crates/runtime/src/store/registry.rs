@@ -56,6 +56,9 @@ pub struct Stores {
     /// The kv pages' pinned run, where the engine pins its pools (the
     /// degenerate mode): lanes name their pages by its slot refs.
     pub pinned_kv: Option<super::chunks::ShapeRun>,
+    /// The state records' pinned run, where the engine pins its pools and
+    /// the model holds recurrent state: lanes name their record by its refs.
+    pub pinned_state: Option<super::chunks::ShapeRun>,
 }
 
 fn context_pages(max_context: usize, kv_page_size: u32) -> u64 {
@@ -187,6 +190,7 @@ pub fn register_model_with_chunks(kv_page_size: u32, engines: &[EngineStores]) -
                 host: None,
                 roles: None,
                 pinned_kv: (pools.kv.device > 0).then_some(pools.kv),
+                pinned_state: (pools.state.device > 0).then_some(pools.state),
             })
         })
         .collect();
@@ -238,6 +242,7 @@ pub fn shared_stores(
         roles: super::roles::Roles::new(shared, tiers.host.as_ref())
             .map(|roles| Arc::new(Mutex::new(roles))),
         pinned_kv: None,
+        pinned_state: None,
     }
 }
 
@@ -317,6 +322,7 @@ mod tests {
             host: None,
             roles: None,
             pinned_kv: None,
+            pinned_state: None,
         });
         Ok(())
     }

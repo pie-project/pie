@@ -1435,6 +1435,15 @@ impl PreparedLoad<'_> {
 }
 
 impl Shell {
+    /// The null record's refs (ref 0 a piece), where the load holds state:
+    /// what a lane that carries no state reads and writes.
+    #[must_use]
+    pub fn null_record(&self) -> Option<Vec<u32>> {
+        self.pools
+            .has_state()
+            .then(|| vec![0; self.pools.layout().pieces as usize])
+    }
+
     /// The physical pieces of the record a lane's state sits in: the one
     /// its slot refs name, else its seat's.
     fn record_of(&self, seated: &Seated<'_>) -> Result<Vec<u32>> {

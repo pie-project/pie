@@ -249,7 +249,7 @@ impl Set {
             },
             readout: Readout::Last,
             tables: vec![(LIST, self.kv[..upto.div_ceil(PAGE) as usize].to_vec())],
-            fixed: vec![(FIXED, self.record.clone())],
+            record: engine::fire::LaneRecord::Pieces(vec![(FIXED, self.record.clone())]),
             tokens,
             ..Lane::default()
         }

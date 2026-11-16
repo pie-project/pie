@@ -1203,17 +1203,33 @@ impl<B: Host> Gpu<B> {
                     .find(|(shape, _)| *shape == crate::store::layout::LIST)
                     .map(|(_, refs)| refs.clone()),
             );
-            let fixed = lane
-                .fixed
-                .iter()
-                .find(|(shape, _)| *shape == crate::store::layout::FIXED);
-            run_of.push(fixed.and_then(|(_, pieces)| {
+            // A load that holds state is told every lane's record: its
+            // pieces, or none (the null record, ref 0 a piece).
+            let fixed = match &lane.record {
+                engine::fire::LaneRecord::Pieces(pieces) => pieces
+                    .iter()
+                    .find(|(shape, _)| *shape == crate::store::layout::FIXED)
+                    .map(|(_, pieces)| pieces.clone()),
+                engine::fire::LaneRecord::Null => {
+                    Some(vec![[0, 0]; shell.pools().pieces() as usize])
+                }
+                engine::fire::LaneRecord::Unstated if shell.pools().has_state() => {
+                    return Err(Error::Invalid(format!(
+                        "lane in slot {} states no record, and this load holds recurrent \
+                         state: the runtime states every lane's record, or that it has none",
+                        lane.slot
+                    )));
+                }
+                engine::fire::LaneRecord::Unstated => None,
+            };
+            let fixed = fixed.as_ref();
+            run_of.push(fixed.and_then(|pieces| {
                 pieces
                     .iter()
                     .any(|&[run, cow]| run != cow)
                     .then(|| pieces.iter().map(|&[run, _]| run).collect())
             }));
-            record_of.push(fixed.map(|(_, pieces)| {
+            record_of.push(fixed.map(|pieces| {
                 // `cow != run`: the record is copied before the fire, once
                 // for every lane of a group naming the same pair.
                 for &[run, cow] in pieces {

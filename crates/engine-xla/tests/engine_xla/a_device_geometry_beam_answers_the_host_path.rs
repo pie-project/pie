@@ -278,6 +278,8 @@ fn a_device_resolved_beam_answers_what_the_host_path_answers() {
                     ..Lane::default()
                 };
                 lane.kv.translation = vec![shared, device_own[b as usize]];
+                lane.tables.push((kv, vec![shared, device_own[b as usize]]));
+                lane.list = engine::fire::ListKind::Translation;
                 lane
             })
             .collect();

@@ -1129,7 +1129,12 @@ impl Xla {
                 }
                 let lane = &lanes[source];
                 let ports = envelope.lane(at, source).map_err(port_error)?;
-                let table = &lane.kv.translation;
+                let table: &[u32] = match lane.list {
+                    engine::fire::ListKind::Translation => {
+                        kv_shape.and_then(|id| table_of(lane, id)).unwrap_or(&[])
+                    }
+                    engine::fire::ListKind::Pages => &[],
+                };
                 let translate = |page: u32, port: &str| -> EngineResult<u32> {
                     table.get(page as usize).copied().ok_or_else(|| {
                         program(format!(
@@ -1635,6 +1640,20 @@ impl Xla {
             (shell.pools().kv_shape(), shell.pools().window_shape())
         });
         let shell = self.loaded_mut()?;
+        // A load that holds state is told every lane's record: its pieces,
+        // or none (`LaneRecord::Null`, which names no piece).
+        if shell.state_slot_bytes() > 0
+            && let Some(lane) = submission
+                .lanes
+                .iter()
+                .find(|lane| matches!(lane.record, engine::fire::LaneRecord::Unstated))
+        {
+            return Err(Error::Invalid(format!(
+                "lane in slot {} states no record, and this load holds recurrent state: the \
+                 runtime states every lane's record, or that it has none",
+                lane.slot
+            )));
+        }
         let mut words: Vec<u64> = submission.lanes.iter().map(|lane| lane.word).collect();
         for (at, slot) in lane_adapters.iter().enumerate() {
             if slot.is_none() {
@@ -1712,7 +1731,7 @@ impl Xla {
                         .and_then(|id| table_of(lane, id))
                         .unwrap_or(&[]),
                 },
-                fixed: &lane.fixed,
+                fixed: lane.record.pieces(),
                 copies: &lane.slot_copies,
             })
             .collect();
@@ -1888,7 +1907,7 @@ fn tier_key(tier: crate::serve::Tier, shape: engine::chunk::ShapeId, slot: u32) 
 /// it holds no record.
 fn record_key(lane: &engine::fire::Lane) -> Option<(u64, u64)> {
     let (id, &[run, cow]) =
-        lane.fixed.first().and_then(|(id, pieces)| Some((*id, pieces.first()?)))?;
+        lane.record.pieces().first().and_then(|(id, pieces)| Some((*id, pieces.first()?)))?;
     Some((ref_key(id, run), ref_key(id, cow)))
 }
 

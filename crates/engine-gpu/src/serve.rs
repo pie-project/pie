@@ -2986,12 +2986,21 @@ impl<B: Serve> Shell<B> {
 
             // The lane's slots as kernels address them: slot refs the
             // runtime names, or a seat's runs for a direct fire.
-            // A lane by refs names its record in its fixed table; one that
-            // names none carries no state, and reads and writes the null
-            // record (ref 0, the null chunk).
+            // A lane by refs names its record (the null record where it
+            // carries no state); a load that holds state is told one for
+            // every lane.
             let seat_slot = lane.slot;
-            let null = vec![0; self.pools.pieces() as usize];
-            let record_ref = seated.refs.then(|| seated.record.unwrap_or(&null));
+            let record_ref = match (seated.refs, seated.record) {
+                (false, _) => None,
+                (true, Some(record)) => Some(record),
+                (true, None) if self.pools.has_state() => {
+                    return Err(program(
+                        "serve::rs",
+                        format!("lane {} names no record of this load's state", row.source),
+                    ));
+                }
+                (true, None) => None,
+            };
             let record = self.pools.record(record_ref, seat_slot)?;
             // The slots the record stands in: where its own frozen position
             // is kept.

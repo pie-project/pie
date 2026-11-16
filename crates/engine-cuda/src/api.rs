@@ -1412,7 +1412,9 @@ impl Cuda {
         // differ.
         use crate::store::layout::{FIXED, LIST, WINDOW};
         let by_refs = submission.lanes.iter().any(|lane| {
-            !lane.tables.is_empty() || !lane.fixed.is_empty() || !lane.slot_copies.is_empty()
+            !lane.tables.is_empty()
+                || !matches!(lane.record, engine::fire::LaneRecord::Unstated)
+                || !lane.slot_copies.is_empty()
         });
         if by_refs {
             shell.take_refs();
@@ -1426,9 +1428,25 @@ impl Cuda {
         }
         // Each lane's record: the one it reads and the one its fire writes.
         let mut records: Vec<Option<(u32, u32)>> = Vec::with_capacity(submission.lanes.len());
+        // The lanes stated to carry no state: they read and write the null
+        // record.
+        let mut nulls: Vec<bool> = Vec::with_capacity(submission.lanes.len());
         let mut forked: Vec<(u32, u32)> = Vec::new();
         for lane in &submission.lanes {
-            let record = match lane.fixed.as_slice() {
+            let pieces = match &lane.record {
+                engine::fire::LaneRecord::Pieces(pieces) => pieces.as_slice(),
+                engine::fire::LaneRecord::Null => &[],
+                engine::fire::LaneRecord::Unstated if shell.null_record().is_some() => {
+                    return Err(Error::Invalid(format!(
+                        "lane in slot {} states no record, and this load holds recurrent \
+                         state: the runtime states every lane's record, or that it has none",
+                        lane.slot
+                    )));
+                }
+                engine::fire::LaneRecord::Unstated => &[],
+            };
+            nulls.push(matches!(lane.record, engine::fire::LaneRecord::Null));
+            let record = match pieces {
                 [] => None,
                 [(shape, pieces)] if *shape == FIXED => {
                     let runs: Vec<u32> = pieces.iter().map(|[run, _]| *run).collect();
@@ -1482,13 +1500,14 @@ impl Cuda {
                     .collect()
             })
             .collect();
-        // A lane bound to no record carries no state: where the load holds
-        // state and lanes name refs, it reads and writes the null record.
-        let unbound = shell.null_record();
-        // A lane whose program places its rows (a device-geometry instance)
-        // names, in its list table, the working set's mapped pages its
-        // program's pages index; any other lane's list table is its pages.
-        let placed = shell.placed_lanes(submission);
+        // A lane's list kind says what its list table holds: its pages, or
+        // the working set's mapped pages its program's page indexes address
+        // (a device-geometry instance's lane).
+        let placed: Vec<bool> = submission
+            .lanes
+            .iter()
+            .map(|lane| lane.list == engine::fire::ListKind::Translation)
+            .collect();
         let seated: Vec<Seated<'_>> = submission
             .lanes
             .iter()
@@ -1521,7 +1540,9 @@ impl Cuda {
                     adapter: lane_adapters[at].or(lane.adapter),
                     rs: lane.rs.clone(),
                     rs_reset: lane.rs_reset,
-                    rs_slot: records[at].map(|(_, written)| written).or(unbound),
+                    rs_slot: records[at]
+                        .map(|(_, written)| written)
+                        .or(nulls[at].then_some(0)),
                     rs_read: records[at].map(|(run, _)| run),
                     rs_snapshots: &lane.rs_snapshots,
                     readout: match &lane.readout {

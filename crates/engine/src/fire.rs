@@ -179,6 +179,49 @@ pub struct KvDelta {
     pub window: Vec<u32>,
 }
 
+/// A lane's recurrent-state record, as the runtime states it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LaneRecord {
+    /// Not stated: the load holds no recurrent state. An engine whose load
+    /// holds state refuses a lane that states none.
+    #[default]
+    Unstated,
+    /// The lane carries no state: it reads and writes the null record (ref
+    /// 0 a piece).
+    Null,
+    /// The lane's slot refs of each fixed shape, one `[run, cow]` a piece,
+    /// in piece order. `cow == run` writes the record in place (the normal
+    /// case); `cow != run` has the engine copy `run` onto `cow` on the
+    /// stream before the fire, which then reads and writes `cow` (a fork, or
+    /// a snapshot restored, within the fire).
+    Pieces(Vec<(ShapeId, Vec<[u32; 2]>)>),
+}
+
+impl LaneRecord {
+    /// The pieces a record names; none for [`LaneRecord::Null`] and
+    /// [`LaneRecord::Unstated`].
+    #[must_use]
+    pub fn pieces(&self) -> &[(ShapeId, Vec<[u32; 2]>)] {
+        match self {
+            LaneRecord::Pieces(pieces) => pieces,
+            LaneRecord::Null | LaneRecord::Unstated => &[],
+        }
+    }
+}
+
+/// What a lane's kv list table holds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ListKind {
+    /// The lane's kv pages in token order: entry `i` holds its rows
+    /// `[i * T, (i + 1) * T)`.
+    #[default]
+    Pages,
+    /// The working set's pages its program addresses by page index (a
+    /// device-geometry instance's lane): entry `i` is the page index `i`
+    /// names, the rows' order the program's.
+    Translation,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Readout {
     #[default]
@@ -239,13 +282,14 @@ pub struct Lane {
     /// behind its window ref 0 (CONTRACT-BC 19, 21).
     #[serde(default)]
     pub tables: Vec<(ShapeId, Vec<u32>)>,
-    /// The lane's slot refs of each fixed shape, one `[run, cow]` a piece,
-    /// in piece order. `cow == run` writes the record in place (the normal
-    /// case); `cow != run` has the engine copy `run` onto `cow` on the
-    /// stream before the fire, which then reads and writes `cow` (a fork, or
-    /// a snapshot restored, within the fire).
+    /// What the kv list's table in `tables` holds: the rows' pages, or a
+    /// translation its program's page indexes address.
     #[serde(default)]
-    pub fixed: Vec<(ShapeId, Vec<[u32; 2]>)>,
+    pub list: ListKind,
+    /// The lane's recurrent-state record. The runtime states one for every
+    /// lane of a load that holds recurrent state, a record or none.
+    #[serde(default)]
+    pub record: LaneRecord,
     /// Whole-slot copies `[src, dst]` (logical slot refs) of each list
     /// shape, made on the stream before the fire runs, after the fires
     /// before it: the rs list, where a lane writes buffered rows into a
@@ -367,7 +411,10 @@ impl Lane {
     }
 
     fn validate_chunk_refs(&self, serves: Serves) -> Result<()> {
-        if self.tables.is_empty() && self.fixed.is_empty() && self.slot_copies.is_empty() {
+        if self.tables.is_empty()
+            && matches!(self.record, LaneRecord::Unstated)
+            && self.slot_copies.is_empty()
+        {
             return Ok(());
         }
         if !serves.chunks {
@@ -377,7 +424,7 @@ impl Lane {
             .tables
             .iter()
             .map(|(shape, _)| *shape)
-            .chain(self.fixed.iter().map(|(shape, _)| *shape));
+            .chain(self.record.pieces().iter().map(|(shape, _)| *shape));
         let mut seen: Vec<ShapeId> = Vec::new();
         for shape in shapes {
             if seen.contains(&shape) {
@@ -388,7 +435,12 @@ impl Lane {
             }
             seen.push(shape);
         }
-        if let Some((shape, _)) = self.fixed.iter().find(|(_, pieces)| pieces.is_empty()) {
+        if let Some((shape, _)) = self
+            .record
+            .pieces()
+            .iter()
+            .find(|(_, pieces)| pieces.is_empty())
+        {
             return Err(Error::Invalid(format!(
                 "lane in slot {} names fixed shape {shape} with no piece",
                 self.slot
@@ -402,7 +454,7 @@ impl Lane {
     /// named, every ref inside the pool (or the shape's pinned run) and off
     /// the reserved chunks, but a window list's null ref 0 in its table.
     pub fn validate_chunks(&self, facts: &ChunkFacts) -> Result<()> {
-        for (id, pieces) in &self.fixed {
+        for (id, pieces) in self.record.pieces() {
             if let Some(SlotKind::Fixed { pieces: stated }) = facts.shape(*id).map(|s| s.kind)
                 && pieces.len() != stated as usize
             {
@@ -414,7 +466,8 @@ impl Lane {
             }
         }
         let fixed: Vec<(ShapeId, Vec<u32>)> = self
-            .fixed
+            .record
+            .pieces()
             .iter()
             .map(|(shape, pieces)| (*shape, pieces.iter().flatten().copied().collect()))
             .collect();

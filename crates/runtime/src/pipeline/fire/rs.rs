@@ -281,6 +281,11 @@ pub fn apply_shared(
     };
     let pool = shared.lock().unwrap();
     for (row, lane) in req.lanes.iter_mut().enumerate() {
+        lane.list = if lane.kv.translation.is_empty() {
+            ::engine::ListKind::Pages
+        } else {
+            ::engine::ListKind::Translation
+        };
         let list = if lane.kv.translation.is_empty() {
             &lane.kv.pages
         } else {
@@ -301,7 +306,13 @@ pub fn apply_shared(
             })
             .unwrap_or_default();
         let records = rs.filter(|rs| rs.shared).and_then(|rs| rs.run_cow(row));
-        lane.fixed = records.map_or_else(Vec::new, |(run, cow)| pool.lane_fixed(run, cow));
+        // A load that holds state states every lane's record: its pieces,
+        // or none.
+        lane.record = match records {
+            Some((run, cow)) => ::engine::LaneRecord::Pieces(pool.lane_fixed(run, cow)),
+            None if pool.holds_records() => ::engine::LaneRecord::Null,
+            None => ::engine::LaneRecord::Unstated,
+        };
         lane.slot_copies = rs
             .filter(|rs| rs.shared)
             .zip(pool.rs_list())
@@ -335,15 +346,37 @@ pub fn apply_shared(
 
 /// Names each lane's kv pages by the slot refs of `pinned`, the kv run an
 /// engine that pins its pools states (the degenerate mode): its list table
-/// ([`::engine::chunk::DEGENERATE_KV`]). Nothing where `pinned` is `None`.
+/// ([`::engine::chunk::DEGENERATE_KV`]), and, where it pins state records
+/// (`state`), each lane's record. Nothing where `pinned` is `None`.
 pub fn apply_pinned(
     req: &mut crate::engine::FireRequest,
     pinned: Option<&crate::store::chunks::ShapeRun>,
+    state: Option<&crate::store::chunks::ShapeRun>,
+    rs: Option<&PreparedRs>,
 ) {
+    // A load that holds state states every lane's record: the state slot
+    // its rs store bound it, by the pinned run's refs, or none.
+    if let Some(run) = state {
+        let at = |id: u32| id - run.ids_from + run.ref_from;
+        for (row, lane) in req.lanes.iter_mut().enumerate() {
+            lane.record = match rs.and_then(|rs| rs.run_cow(row)) {
+                Some((read, write)) => ::engine::LaneRecord::Pieces(vec![(
+                    ::engine::chunk::DEGENERATE_STATE,
+                    vec![[at(read), at(write)]],
+                )]),
+                None => ::engine::LaneRecord::Null,
+            };
+        }
+    }
     let Some(run) = pinned else {
         return;
     };
     for lane in &mut req.lanes {
+        lane.list = if lane.kv.translation.is_empty() {
+            ::engine::ListKind::Pages
+        } else {
+            ::engine::ListKind::Translation
+        };
         let list = if lane.kv.translation.is_empty() {
             &lane.kv.pages
         } else {

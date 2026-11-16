@@ -489,7 +489,11 @@ impl Seq {
                 self.record.push((fixed.id, pairs));
             }
         }
-        lane.fixed = self.record.clone();
+        lane.record = if self.record.is_empty() {
+            engine::fire::LaneRecord::Unstated
+        } else {
+            engine::fire::LaneRecord::Pieces(self.record.clone())
+        };
         lane
     }
 }

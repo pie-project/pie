@@ -185,7 +185,7 @@ impl FakeEngine {
             lane.tables
                 .iter()
                 .flat_map(|(shape, refs)| refs.iter().map(move |&r| (*shape, r)))
-                .chain(lane.fixed.iter().flat_map(|(shape, pieces)| {
+                .chain(lane.record.pieces().iter().flat_map(|(shape, pieces)| {
                     pieces.iter().flatten().map(move |&r| (*shape, r))
                 }));
         for (shape, slot) in refs {
@@ -403,8 +403,9 @@ fn beam_lanes_leave_their_rows_unfolded_in_rs_list_slots() {
         assert_eq!(buffer_of(lane).0, pages, "every lane reads one buffer");
         assert!(lane.slot_copies.is_empty(), "fresh slots copy nothing");
         assert!(
-            !lane.fixed.is_empty() && lane.fixed.iter().all(|(_, pieces)| !pieces.is_empty()),
-            "a lane bound to a record names it in its fixed table"
+            matches!(&lane.record, ::engine::LaneRecord::Pieces(pieces)
+                if !pieces.is_empty() && pieces.iter().all(|(_, p)| !p.is_empty())),
+            "a lane bound to a record names it"
         );
         lane.validate_chunks(&facts).unwrap();
     }
@@ -790,7 +791,7 @@ fn the_rung_walk_caps_fires_then_lowers_and_raises_back_with_an_evacuation() {
     for &record in &kept {
         let lane = Lane {
             tokens: vec![1],
-            fixed: pool.lane_fixed(record, record),
+            record: ::engine::LaneRecord::Pieces(pool.lane_fixed(record, record)),
             ..Lane::default()
         };
         engine.fire(&facts, &lane, 12);
@@ -1317,4 +1318,89 @@ async fn an_engine_past_the_sixty_fourth_has_its_own_rung_gate() {
     );
     rung_changed(PAST);
     assert!(futures::poll!(watch.as_mut()).is_ready(), "its own does");
+}
+
+/// A lane's kv list table says what it holds: a translation where the
+/// runtime stamped one (a device-geometry instance's lane), else the
+/// lane's pages, though the lane beside it is a device-geometry one; a
+/// lane with neither states no list table, and pages as its kind.
+#[test]
+fn a_lane_s_list_kind_is_stated_beside_its_table() {
+    let facts = fixed_facts();
+    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
+    let mut placed = crate::engine::fire::lane_of(0, vec![1], 0, Vec::new());
+    placed.kv.pages = vec![5];
+    placed.kv.translation = vec![7, 8];
+    let mut req = crate::engine::FireRequest {
+        lanes: vec![
+            placed,
+            crate::engine::fire::lane_of(1, vec![1], 0, vec![9]),
+            crate::engine::fire::lane_of(2, vec![1], 0, Vec::new()),
+        ],
+        ..crate::engine::FireRequest::default()
+    };
+    crate::pipeline::fire::rs::apply_shared(&mut req, Some(&shared), None);
+    let list = |lane: &Lane| {
+        lane.tables
+            .iter()
+            .find(|(shape, _)| *shape == LIST)
+            .map(|(_, refs)| refs.clone())
+    };
+    let [placed, unattached, bare] = req.lanes.as_slice() else {
+        panic!("three lanes");
+    };
+    assert_eq!(placed.list, ::engine::ListKind::Translation);
+    assert_eq!(list(placed), Some(vec![7, 8]), "the translation, not the pages");
+    assert_eq!(unattached.list, ::engine::ListKind::Pages, "beside it, pages");
+    assert_eq!(list(unattached), Some(vec![9]));
+    assert_eq!((bare.list, list(bare)), (::engine::ListKind::Pages, None));
+}
+
+/// A load that holds recurrent state states every lane's record: the one
+/// its working set binds, or none, never left unsaid; a load without
+/// state states none.
+#[test]
+fn every_lane_of_a_state_holding_load_states_its_record() {
+    use crate::pipeline::fire::rs::{GroupFold, GroupPlan, RsPlan, prepare_many, settle};
+    use crate::store::rs::RsGeometry;
+
+    let facts = fixed_facts();
+    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
+    let stores = crate::store::registry::shared_stores(&shared, &Tiers::default(), 16, 256);
+    let mut rs = stores.rs.lock().unwrap();
+    let geometry = RsGeometry {
+        state_size: 1024,
+        buffer_page_tokens: 16,
+    };
+    let bound = rs.create_working_set(geometry.clone());
+    let unbound = rs.create_working_set(geometry);
+    // Lane 0's working set writes its state; lane 1's is in no group.
+    let plan = RsPlan::Groups(vec![GroupPlan {
+        lanes: vec![0],
+        writes: None,
+        fold: GroupFold::Host(3),
+        snapshots: Vec::new(),
+    }]);
+    let out = prepare_many(&mut rs, &[bound, unbound], &plan, None).unwrap();
+    let lanes = shared_lanes(&out, &shared, 2);
+    assert!(
+        matches!(&lanes[0].record, ::engine::LaneRecord::Pieces(pieces) if !pieces.is_empty()),
+        "{:?}",
+        lanes[0].record
+    );
+    assert_eq!(lanes[1].record, ::engine::LaneRecord::Null, "stated: no state");
+    settle(&mut rs, out.txn);
+
+    // The negative control: a pool that lays no record states none.
+    let mut stateless = facts.clone();
+    stateless.shapes.retain(|shape| {
+        shape.role != SlotRole::State || !matches!(shape.kind, SlotKind::Fixed { .. })
+    });
+    let stateless: Shared = Arc::new(Mutex::new(SharedPool::new(&stateless, 256).unwrap()));
+    let mut req = crate::engine::FireRequest {
+        lanes: vec![crate::engine::fire::lane_of(0, vec![1], 0, vec![3])],
+        ..crate::engine::FireRequest::default()
+    };
+    crate::pipeline::fire::rs::apply_shared(&mut req, Some(&stateless), None);
+    assert_eq!(req.lanes[0].record, ::engine::LaneRecord::Unstated);
 }
