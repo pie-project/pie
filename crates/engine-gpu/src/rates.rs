@@ -8,12 +8,16 @@
 //! - a dense bf16 matmul of [`GEMM`] rows, columns and depth, through the
 //!   backend's own matmul path, for flops a nanosecond;
 //! - a buffer copy of [`COPY_BYTES`], for bytes a nanosecond;
-//! - the narrowest matmul alone in a frame, for what a fire's launch costs
-//!   beside its work.
+//! - [`LAUNCHES`] of the narrowest matmul back to back in one frame, against
+//!   one alone, for what each dispatch inside a frame costs beside its work:
+//!   `(t(LAUNCHES) − t(1)) / (LAUNCHES − 1)`, so the frame's one submit and
+//!   wait cancel and what is left is a dispatch's own cost in a recorded
+//!   frame (its launch, the barrier after it, its near-nothing of work).
 //!
 //! The backend times a frame ([`Timer`]): by its adapter's timestamps where
 //! it has them, else by the host's clock around submit and wait. The launch
-//! is always the host's (it is the submit and the wait).
+//! is the host's clock's difference of two frames either way: one submit
+//! each, so neither the clock nor the adapter's span start biases it.
 
 use kernels_slang::Tensor;
 use poem_ir::Dtype;
@@ -42,6 +46,11 @@ pub const COPY_BYTES: u64 = 256 << 20;
 /// The matmul a launch is timed with: its work is nothing beside a launch.
 pub const LAUNCH: u32 = 16;
 
+/// The launches one frame of [`LAUNCH`] matmuls carries: enough that the
+/// frame's submit and wait (tens of microseconds) amortise to well under a
+/// dispatch's cost (fractions of a microsecond to a few).
+pub const LAUNCHES: u32 = 1024;
+
 /// Timed fires of each kind; the median is kept.
 pub const ROUNDS: usize = 5;
 
@@ -67,26 +76,29 @@ pub fn measure<B: Serve>(
     let hw = handles.bind(&w, 0, w.bytes())?;
     let hy = handles.bind(&y, 0, y.bytes())?;
 
-    // A frame of one matmul of `side`, then `then` on the frame, timed.
-    let frame = |side: u32, then: &dyn Fn(&mut B::Frame) -> Result<()>| {
+    // A frame of `count` matmuls of `side`, then `then` on the frame, timed.
+    let frames = |side: u32, count: u32, then: &dyn Fn(&mut B::Frame) -> Result<()>| {
         let mut f = device.frame()?;
         {
             let sink = B::sink(device, &f, &pipelines, &handles);
-            kernels_slang::linear::gemm::matmul(
-                &sink,
-                tactic,
-                Tensor::new(ha, side, side, Dtype::Bf16),
-                Tensor::new(hw, side, side, Dtype::Bf16),
-                Tensor::new(hy, side, side, Dtype::Bf16),
-            )
-            .map_err(|e| Fault::Device {
-                call: "rates: matmul",
-                why: e.to_string(),
-            })?;
+            for _ in 0..count {
+                kernels_slang::linear::gemm::matmul(
+                    &sink,
+                    tactic,
+                    Tensor::new(ha, side, side, Dtype::Bf16),
+                    Tensor::new(hw, side, side, Dtype::Bf16),
+                    Tensor::new(hy, side, side, Dtype::Bf16),
+                )
+                .map_err(|e| Fault::Device {
+                    call: "rates: matmul",
+                    why: e.to_string(),
+                })?;
+            }
         }
         then(&mut f)?;
         timer(f)
     };
+    let frame = |side: u32, then: &dyn Fn(&mut B::Frame) -> Result<()>| frames(side, 1, then);
     let median = |mut v: Vec<u64>| {
         v.sort_unstable();
         v[v.len() / 2].max(1)
@@ -108,13 +120,21 @@ pub fn measure<B: Serve>(
     };
     let nothing = |_: &mut B::Frame| Ok(());
 
-    // The launch is the host's: the submit, the dispatch, the wait.
+    // A dispatch's own cost inside a frame: LAUNCHES of the narrowest
+    // matmul against one, the host's clock around each frame's one submit.
     frame(LAUNCH, &nothing)?;
-    let launch = median(
+    frames(LAUNCH, LAUNCHES, &nothing)?;
+    let single = median(
         (0..ROUNDS)
             .map(|_| frame(LAUNCH, &nothing).map(|(_, wall)| wall))
             .collect::<Result<Vec<u64>>>()?,
     );
+    let many = median(
+        (0..ROUNDS)
+            .map(|_| frames(LAUNCH, LAUNCHES, &nothing).map(|(_, wall)| wall))
+            .collect::<Result<Vec<u64>>>()?,
+    );
+    let launch = many.saturating_sub(single) / u64::from(LAUNCHES - 1);
     let (gemm_ns, _) = timed(GEMM, &nothing)?;
 
     let copy = COPY_BYTES.min(device.max_buffer()) & !3;
@@ -125,7 +145,7 @@ pub fn measure<B: Serve>(
     let alone = if by_adapter {
         timed(LAUNCH, &nothing)?.0
     } else {
-        launch
+        single
     };
     let copy_ns = with_copy.saturating_sub(alone).max(1);
 
