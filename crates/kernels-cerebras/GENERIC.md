@@ -19,7 +19,9 @@ from diffusers, §4.1), M1k (the PE clock is 750 MHz; a step's wall split; a rea
 launch no longer waits on its static arrays, §4.1), M2e (the rotation tables a level at a time,
 the K / V columns folded over two columns a head, the cost model held to the simulator unit by
 unit: a row's round trip through a unit; klein's step 1,326M -> 1,081M cycles, 1.77 s -> 1.44 s,
-end to end 7.54 s -> 6.21 s at 750 MHz; the roofline 10.9M cycles a step, §4.1) and M3 (the
+end to end 7.54 s -> 6.21 s at 750 MHz; the roofline 10.9M cycles a step, §4.1), K1 (klein on
+the CS-3 from its real checkpoint: a program over more than one band hangs at its first launch,
+flux2-mini at a narrow fabric reproduces it, §4.1) and M3 (the
 decode layouts as points of the Floorplan, §2.5). ARCHITECTURE.md is what runs for decode.
 
 **Goal.** A `.poem` model the compiler has not seen runs on the wafer with no hand code. The
@@ -1834,6 +1836,44 @@ milestone's tail.
     programs, linked on load): 7.860e-3 / 0.99996911 against engine-cpu, 8.735e-3 / 0.99996185
     against transformers' `Qwen3ForCausalLM`, M1h's digits; 1.43M cycles (the first launch),
     70 min of simulator.
+
+- **K1** (FLUX.2 [klein] 4B on the CS-3, its real checkpoint; requests 1482-1488). **Blocked:
+  a stream program over more than one band hangs at its first launch on the system**, and every
+  klein program is one (64 + 64 rows: 4 bands; 1024²: more).
+  - **The checkpoint.** `black-forest-labs/FLUX.2-klein-4B`'s diffusers snapshot (transformer,
+    text encoder, VAE: 15 GB, Apache-2.0, not gated), landed through the import contract as the
+    engine does. engine-cerebras `klein_reading_files` (ignored; `READING_CKPT`,
+    `READING_PROGRAM`, `READING_OUT`) writes, for a program `wafer-compile stream` built, its
+    static arrays made from the checkpoint (3.856G words at 64 + 64, 15.4 GB of 32-bit words;
+    staged as 9 gzip tars of 0.7-1.0 GB), a step's drawn inputs and engine-cpu's 2-step loop at the
+    program's rows (6.5 min a step on the shared host). `wafer-bench --reading --statics <dir>`
+    writes them on the program.
+  - **64 + 64** (the search's 730 x 1160 PEs, 33 units; 34.0M cycles, 45 ms priced): cslc on the
+    worker links it for the system in 15 min (811 MB). The load takes 120 s, the static arrays
+    41 s (1,092 copies, 94M words a second); the first launch never returns (1483: 40 min,
+    1483_b: 17 min; the probe after passed, so the hang does not outlive the program).
+  - **Where** (M2e's compiler, `--stages N`, each cut linked and run on the system, its static
+    arrays from the checkpoint; a cut reads back no velocity, so the step's cycles are the
+    check):
+
+    | stages | units | PEs | bands | first launch |
+    |---|---|---|---|---|
+    | 1 (the entry) | 1 | 3 x 258 | 1 | 67.7k cycles |
+    | 2 (+ the lane prologue, double block 0) | 4 | 246 x 286 | 1 | 7.24M cycles, 109 ms |
+    | 5 (+ double blocks 1-3) | 10 | 684 x 286 | 1 | 15.2M cycles, 139 ms |
+    | 6 (+ double block 4, the first unit of band 2) | 12 | 684 x 572 | 2 | **hangs** |
+
+    (A first launch's cycles include its static arrays landing, M1k.)
+  - **flux2-mini reproduces it.** The same 16 + 16 program built within a fabric 45 wide (the
+    compiler's bounds narrowed: three bands, 36 x 114 PEs) hangs at its first launch on the system;
+    the search's own one-band program (57 x 62) runs, the simulator's numerics (velocity 4.72e-3 /
+    0.9999888 and 6.33e-3, the latent after 2 steps 3.88e-3 / 0.9999925 against engine-cpu), its
+    re-launched step **1.239M cycles, 2.33 ms** (the simulator's M2e step 1.127M plus 10%). No
+    multi-band program has run on the simulator: the band's wrap (`Stream::wrap`, the row stream
+    from a band's last unit back west and south into the next band's first) and the lane bus down
+    to a later band are the suspects, and the mini at a narrow fabric is a small repro.
+  - The M2e 1024² program (741 x 1152 PEs, 1,081.4M cycles, 1.44 s priced) is built and its
+    static arrays made (3.859G words); not run, being multi-band.
 
 ## 5. Risks
 
