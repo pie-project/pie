@@ -20,7 +20,7 @@ use crate::error::{Fault, Result};
 use super::compile::{Module, Region};
 use super::endpoint::Endpoint;
 
-const FUSED_ARITY: usize = 17;
+const FUSED_ARITY: usize = 19;
 
 pub const ORDER_ROW_BLOCKS: u32 = 32;
 /// The most blocks a lane's sampler region runs on (`sample_lane.cuh`); a
@@ -588,7 +588,8 @@ pub struct Cursor {
 pub struct Prepared {
     /// Where this stage's tables lie in its (program, extents) pair's
     /// state ([`Prepared::place`]): each an address there. A lane's
-    /// scratch is its instance's, at [`Prepared::scratch_at`] of it.
+    /// scratch is its instance's: each of this stage's pieces at
+    /// [`Prepared::pieces_at`] of it.
     table: u64,
     table_host: Vec<u8>,
     descriptors: u64,
@@ -618,10 +619,14 @@ pub struct Prepared {
     output_slots: u32,
     channel_count: u32,
     value_count: u32,
-    /// A lane's scratch bytes for this stage.
-    scratch_stride: u32,
-    /// Where this stage's scratch lies in its instance's.
-    scratch_at: u64,
+    /// Each of this stage's scratch pieces' bytes in use
+    /// ([`eta_exec::ChunkLayout::ends`]).
+    ends: Vec<u64>,
+    /// Where each of its pieces lies in its instance's scratch, and the
+    /// bytes a piece of that holds ([`Prepared::set_pieces_at`]).
+    pieces_at: Vec<u64>,
+    unit: u64,
+    temporary_piece: u32,
     temporary_offset: u32,
     temporary_bytes: u32,
     region_rows: Vec<u32>,
@@ -775,10 +780,16 @@ fn launches<'a>(plan: &'a LaunchStagePlan, blocks: &[u32], temporary: u64) -> La
     }
 }
 
-fn lay_out(plan: &LaunchStagePlan, descriptors: &[ValueDesc]) -> Result<Layout> {
+/// The launches `plan`'s regions make over `descriptors`, and what its
+/// temporary area keeps.
+fn run_of<'a>(plan: &'a LaunchStagePlan, descriptors: &[ValueDesc]) -> Launches<'a> {
     let blocks = region_blocks(plan, descriptors);
     let temporary = temporary_bytes(plan, descriptors, &blocks);
-    eta_exec::lay_out(plan, descriptors, &launches(plan, &blocks, temporary)).map_err(|why| {
+    launches(plan, &blocks, temporary)
+}
+
+fn lay_out(plan: &LaunchStagePlan, descriptors: &[ValueDesc]) -> Result<Layout> {
+    eta_exec::lay_out(plan, descriptors, &run_of(plan, descriptors)).map_err(|why| {
         Fault::program(
             "program::launch",
             format!("this fire's scratch does not fit: {why:?}"),
@@ -796,11 +807,39 @@ pub fn scratch_offsets(plan: &LaunchStagePlan, extents: Extents) -> Result<Vec<u
     lay_out(plan, &descriptors).map(|layout| layout.values)
 }
 
+/// `plan`'s scratch at `extents` in pieces of at most `chunk` bytes, the
+/// layout a guest lane's scratch takes: a value past a chunk is refused by
+/// name ([`eta_exec::TooLarge::PastChunk`]).
+pub fn scratch_chunked(
+    plan: &LaunchStagePlan,
+    extents: Extents,
+    chunk: u64,
+) -> Result<eta_exec::ChunkLayout> {
+    let descriptors = describe_values(plan, extents)?;
+    lay_out_chunked(plan, &descriptors, chunk)
+}
+
+fn lay_out_chunked(
+    plan: &LaunchStagePlan,
+    descriptors: &[ValueDesc],
+    chunk: u64,
+) -> Result<eta_exec::ChunkLayout> {
+    eta_exec::lay_out_chunked(plan, descriptors, &run_of(plan, descriptors), chunk).map_err(|why| {
+        Fault::program(
+            "program::launch",
+            format!("a lane's scratch does not lie in chunks of {chunk} bytes: {why}"),
+        )
+    })
+}
+
 impl Prepared {
+    /// The stage at `extents`, its scratch laid in pieces of at most
+    /// `chunk` bytes.
     pub fn build(
         plan: &LaunchStagePlan,
         shapes: &[ChannelShape],
         extents: Extents,
+        chunk: u64,
     ) -> Result<Prepared> {
         let channel_count = u32::try_from(plan.channel_bindings.len())
             .map_err(|_| Fault::program("program::launch", "more channels than a u32 can count"))?;
@@ -808,10 +847,8 @@ impl Prepared {
             .map_err(|_| Fault::program("program::launch", "more values than a u32 can count"))?;
 
         let descriptors = describe_values(plan, extents)?;
-        let scratch_layout = lay_out(plan, &descriptors)?;
-        let scratch_stride = u32::try_from(scratch_layout.total)
-            .map_err(|_| Fault::program("program::launch", "a scratch stride past a u32"))?;
-        let temporary_offset = u32::try_from(scratch_layout.temporary)
+        let scratch_layout = lay_out_chunked(plan, &descriptors, chunk)?;
+        let temporary_offset = u32::try_from(scratch_layout.temporary.offset)
             .map_err(|_| Fault::program("program::launch", "a temporary offset past a u32"))?;
         let temporary_bytes = u32::try_from(scratch_layout.temporary_bytes)
             .map_err(|_| Fault::program("program::launch", "a temporary arena past a u32"))?;
@@ -856,10 +893,13 @@ impl Prepared {
             result_base += u32::from(op.result_count);
         }
 
+        // Each value's offset in its piece, then each value's piece: one
+        // span, the pieces `value_count` words past the offsets.
         let offsets_host: Vec<u8> = scratch_layout
             .values
             .iter()
-            .map(|&at| u32::try_from(at).unwrap_or(u32::MAX))
+            .map(|placed| u32::try_from(placed.offset).unwrap_or(u32::MAX))
+            .chain(scratch_layout.values.iter().map(|placed| placed.piece))
             .flat_map(u32::to_le_bytes)
             .collect();
 
@@ -886,8 +926,10 @@ impl Prepared {
             output_slots: plan.output_slots,
             channel_count,
             value_count,
-            scratch_stride,
-            scratch_at: 0,
+            pieces_at: Vec::new(),
+            unit: chunk,
+            temporary_piece: scratch_layout.temporary.piece,
+            ends: scratch_layout.ends,
             temporary_offset,
             temporary_bytes,
             region_rows,
@@ -899,16 +941,18 @@ impl Prepared {
         })
     }
 
-    /// A lane's scratch bytes for this stage, aligned: its share of the
+    /// Each of this stage's scratch pieces' bytes: its share of an
     /// instance's scratch (`engine::GuestState::per_instance`).
     #[must_use]
-    pub fn scratch_bytes(&self) -> u64 {
-        u64::from(self.scratch_stride).next_multiple_of(SCRATCH_ALIGN)
+    pub fn pieces(&self) -> &[u64] {
+        &self.ends
     }
 
-    /// This stage's scratch lies at `at` of its instance's.
-    pub fn set_scratch_at(&mut self, at: u64) {
-        self.scratch_at = at;
+    /// This stage's pieces lie at `at` of its instance's scratch, laid in
+    /// pieces of `unit` bytes ([`Prepared::pieces`]' order).
+    pub fn set_pieces_at(&mut self, at: Vec<u64>, unit: u64) {
+        self.pieces_at = at;
+        self.unit = unit.max(1);
     }
 
     /// The bytes of this stage's spans for flights of up to `lanes` lanes,
@@ -924,7 +968,14 @@ impl Prepared {
             self.offsets_host.len().max(size_of::<u32>()) as u64,
             table,
             (self.descriptor_row.len().max(1) * lanes as usize) as u64,
-            Self::cell_layout(self.pitch, self.channel_count, self.lane_lines(), lanes).1 as u64,
+            Self::cell_layout(
+                self.pitch,
+                self.channel_count,
+                self.lane_lines(),
+                self.ends.len(),
+                lanes,
+            )
+            .1 as u64,
         ]
         .map(|bytes| bytes.next_multiple_of(SPAN_ALIGN))
     }
@@ -939,6 +990,7 @@ impl Prepared {
         pitch: usize,
         channels: u32,
         lines: bool,
+        pieces: usize,
         lanes: u32,
     ) -> ([usize; CELLS], usize) {
         let words = pitch * lanes as usize;
@@ -957,7 +1009,7 @@ impl Prepared {
             } else {
                 0
             },
-            size_of::<u64>() * lanes as usize,
+            size_of::<u64>() * pieces * lanes as usize,
         ]
         .into_iter()
         .enumerate()
@@ -1049,8 +1101,13 @@ impl Prepared {
             self.intrinsic_widths_host.resize(words, 0u32);
             self.intrinsic_strides_host.resize(words, 0u32);
             self.intrinsic_offsets_host.resize(words, 0u32);
-            let (cell_at, bytes) =
-                Self::cell_layout(self.pitch, self.channel_count, self.lane_lines(), lanes);
+            let (cell_at, bytes) = Self::cell_layout(
+                self.pitch,
+                self.channel_count,
+                self.lane_lines(),
+                self.ends.len(),
+                lanes,
+            );
             self.cell_at = cell_at;
             self.cells_host = vec![0u8; bytes];
         }
@@ -1064,9 +1121,9 @@ impl Prepared {
     }
 
     /// Stages the next lane of the flight: its commit slot, its channels'
-    /// cells, and its scratch where its instance holds it (`scratch`, its
-    /// pieces' addresses, the first holding this stage's at
-    /// [`Prepared::scratch_at`]).
+    /// cells, and its scratch where its instance holds it (`scratch`, the
+    /// address of each piece of the instance's): the lane's base table, an
+    /// address for each of this stage's pieces, which its record names.
     pub fn stage_lane(
         &mut self,
         rings: &Rings,
@@ -1093,15 +1150,25 @@ impl Prepared {
         let commit_at = record_at + std::mem::offset_of!(LaneRecord, commit_slot);
         self.table_host[commit_at..commit_at + size_of::<u64>()]
             .copy_from_slice(&commit.to_le_bytes());
-        let piece = scratch.first().copied().ok_or_else(|| {
-            Fault::program(
-                "program::launch",
-                "a lane staged whose instance holds no scratch",
-            )
-        })?;
-        let row = self.cell_at[BASES] + lane as usize * size_of::<u64>();
-        self.cells_host[row..row + size_of::<u64>()]
-            .copy_from_slice(&(piece + self.scratch_at).to_le_bytes());
+        let pieces = self.ends.len();
+        let row = self.cell_at[BASES] + lane as usize * pieces * size_of::<u64>();
+        for (index, &at) in self.pieces_at.iter().enumerate() {
+            let base = scratch
+                .get(usize::try_from(at / self.unit).unwrap_or(usize::MAX))
+                .ok_or_else(|| {
+                    Fault::program(
+                        "program::launch",
+                        format!(
+                            "a lane's scratch piece {index} lies at byte {at} of its \
+                             instance's, which holds {} piece(s)",
+                            scratch.len()
+                        ),
+                    )
+                })?
+                + at % self.unit;
+            let entry = row + index * size_of::<u64>();
+            self.cells_host[entry..entry + size_of::<u64>()].copy_from_slice(&base.to_le_bytes());
+        }
         let table_at = record_at + std::mem::offset_of!(LaneRecord, scratch_table);
         self.table_host[table_at..table_at + size_of::<u64>()]
             .copy_from_slice(&(self.cells + row as u64).to_le_bytes());
@@ -1236,8 +1303,10 @@ impl Prepared {
             .ptr(self.descriptors)
             .ptr(self.params)
             .ptr(self.offsets)
+            .ptr(self.offsets + u64::from(self.value_count) * size_of::<u32>() as u64)
             .ptr(self.cell(LINES))
             .u32(self.value_count)
+            .u32(self.temporary_piece)
             .u32(self.temporary_offset)
             .ptr(self.cell(PENDING))
             .ptr(self.cell(0))
@@ -1400,7 +1469,8 @@ impl Prepared {
         {
             use crate::device::dr;
             for lane in 0..self.filled as usize {
-                let row = self.cell_at[BASES] + lane * size_of::<u64>();
+                // Piece 0 opens with the dummy bytes.
+                let row = self.cell_at[BASES] + lane * self.ends.len() * size_of::<u64>();
                 let mut word = [0u8; size_of::<u64>()];
                 word.copy_from_slice(&self.cells_host[row..row + size_of::<u64>()]);
                 // SAFETY: the lane's scratch, its instance's, is no shorter
@@ -1886,7 +1956,7 @@ mod tests {
         // What every kernel's preamble says of the area, and a stream's
         // pointer to it, which only its reductions go through.
         const UNUSED: [&str; 3] = [
-            "m1_u8* temporary = scratch + temporary_offset + (m1_u64)lane_row * temporary_stride;",
+            "m1_u8* temporary = reinterpret_cast<m1_u8*>(scratch_bases[temporary_piece]) +\n      temporary_offset + (m1_u64)lane_row * temporary_stride;",
             "(void)temporary;",
             "float* stream_work = reinterpret_cast<float*>(temporary);",
         ];

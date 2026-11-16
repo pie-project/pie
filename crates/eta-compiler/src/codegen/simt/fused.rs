@@ -583,7 +583,7 @@ pub fn emit_fused_region(
         if let Some(streams) = &streams {
             let mut pointer = |value: u32| {
                 let value = aliases.resolve(value);
-                format!("scratch + offsets[{value}] + ptir_rowshift[{value}]")
+                format!("ptir_at({value}) + ptir_rowshift[{value}]")
             };
             if let Some(covered) =
                 super::stream::emit_stream(&mut source, streams, at - 1, &mut pointer, TAIL)
@@ -605,9 +605,9 @@ pub fn emit_fused_region(
         let resolve = |value: u32| {
             let value = aliases.resolve(value);
             if row_parallel {
-                format!("scratch + offsets[{value}] + ptir_rowshift[{value}]")
+                format!("ptir_at({value}) + ptir_rowshift[{value}]")
             } else {
-                format!("scratch + offsets[{value}]")
+                format!("ptir_at({value})")
             }
         };
         let mut slots = Slots::of(op, base, resolve);
@@ -696,6 +696,7 @@ fn emit_table_staging(source: &mut String, ops: usize, values: usize) {
     let _ = writeln!(source, "  __shared__ M1OpParams ptir_params[{ops}u];");
     let _ = writeln!(source, "  __shared__ M1ValueDesc ptir_descs[{values}u];");
     let _ = writeln!(source, "  __shared__ m1_u32 ptir_offsets[{values}u];");
+    let _ = writeln!(source, "  __shared__ m1_u32 ptir_pieces[{values}u];");
     let _ = writeln!(
         source,
         "  for (m1_u32 i = threadIdx.x; i < {ops}u; i += blockDim.x) ptir_params[i] = params[i];"
@@ -711,6 +712,7 @@ fn emit_table_staging(source: &mut String, ops: usize, values: usize) {
     );
     source.push_str("      ptir_descs[v] = descriptors[v];\n");
     source.push_str("      ptir_offsets[v] = offsets[v];\n");
+    source.push_str("      ptir_pieces[v] = pieces[v];\n");
     source.push_str("    }\n");
     source.push_str("  }\n");
     source.push_str("  __syncthreads();\n");
@@ -718,6 +720,7 @@ fn emit_table_staging(source: &mut String, ops: usize, values: usize) {
     source.push_str("  if (ptir_staged) {\n");
     source.push_str("    descriptors = ptir_descs;\n");
     source.push_str("    offsets = ptir_offsets;\n");
+    source.push_str("    pieces = ptir_pieces;\n");
     source.push_str("  }\n");
 }
 

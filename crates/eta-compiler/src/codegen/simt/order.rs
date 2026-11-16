@@ -39,9 +39,9 @@ const BODY: &str = r#"
   __shared__ m1_u32 order_digit_base[kOrderDigits];
 
   const M1ValueDesc order_input_desc = descriptors[kInput];
-  const m1_u8* order_input = scratch + offsets[kInput];
-  m1_u8* order_values = scratch + offsets[kValues];
-  m1_u8* order_indices = scratch + offsets[kIndices];
+  const m1_u8* order_input = ptir_at(kInput);
+  m1_u8* order_values = ptir_at(kValues);
+  m1_u8* order_indices = ptir_at(kIndices);
   const m1_u32 order_len = order_input_desc.last;
   const m1_u32 order_rows = order_input_desc.rows;
   const m1_u32 order_width = kWidth == kOrderFullRow ? order_len : kWidth;
@@ -156,9 +156,9 @@ const BODY_SELECT: &str = r#"
   (void)kOrderWorkerCap;
   (void)kOrderFullRow;
   const M1ValueDesc order_input_desc = descriptors[kInput];
-  const m1_u8* order_input = scratch + offsets[kInput];
-  m1_u8* order_values = scratch + offsets[kValues];
-  m1_u8* order_indices = scratch + offsets[kIndices];
+  const m1_u8* order_input = ptir_at(kInput);
+  m1_u8* order_values = ptir_at(kValues);
+  m1_u8* order_indices = ptir_at(kIndices);
   const m1_u32 order_len = order_input_desc.last;
   const m1_u32 order_rows = order_input_desc.rows;
   const m1_u32 order_width = kWidth;
@@ -173,7 +173,7 @@ const BODY_SELECT: &str = r#"
   const m1_u64 direct_row0 =
       direct ? (m1_u64)intrinsic_offsets[direct_index] + (m1_u64)params[kDirectNode].imm2 : 0u;
   const float direct_divisor = (direct && kDirectDivisor != 0xFFFFFFFFu)
-      ? m1_load_f(scratch + offsets[kDirectDivisor], 0u, descriptors[kDirectDivisor].dtype)
+      ? m1_load_f(ptir_at(kDirectDivisor), 0u, descriptors[kDirectDivisor].dtype)
       : 1.0f;
   auto order_value = [&](m1_u32 order_row, m1_u32 column) -> float {
     if (direct)

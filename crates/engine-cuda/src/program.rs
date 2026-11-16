@@ -56,7 +56,7 @@ impl Program {
         {
             return Ok(&mut self.batches[at]);
         }
-        let mut stages = self.stages(extents)?;
+        let mut stages = self.stages(extents, shape.room.unit())?;
         let laid = lay_pair(&mut stages, shape)?;
         self.batches.push(Batch {
             extents,
@@ -81,9 +81,10 @@ impl Program {
             })
     }
 
-    /// The program's stages prepared for binds at `extents`: their tables
-    /// and what each lays. Nothing is put on the device.
-    fn stages(&self, extents: Extents) -> Result<Vec<Option<Prepared>>> {
+    /// The program's stages prepared for binds at `extents`, their scratch
+    /// in pieces of at most `chunk` bytes: their tables and what each lays.
+    /// Nothing is put on the device.
+    fn stages(&self, extents: Extents, chunk: u64) -> Result<Vec<Option<Prepared>>> {
         let shapes: Vec<ChannelShape> = self
             .plan
             .package
@@ -99,7 +100,7 @@ impl Program {
                 .get(index)
                 .is_some_and(|stage| !stage.regions.is_empty());
             stages.push(if launches {
-                Some(Prepared::build(stage_plan, &shapes, extents)?)
+                Some(Prepared::build(stage_plan, &shapes, extents, chunk)?)
             } else {
                 None
             });
@@ -217,25 +218,22 @@ pub struct Laid {
 }
 
 /// Lays a pair's state and its instances' scratch for `stages`, each
-/// stage told where its scratch lies in an instance's. A lane's scratch is
-/// one piece of its instance's (the kernels address it from the first of
-/// its base table), so one past a piece is refused by name.
+/// stage told where its pieces lie in an instance's scratch: a stage's
+/// first piece where the instance's last has room for it, each further one
+/// a piece of its own, so that one stage's scratch holds what
+/// [`eta_exec::ChunkLayout::held_bytes`] says.
 fn lay_pair(stages: &mut [Option<Prepared>], shape: PairShape) -> Result<Laid> {
     let unit = shape.room.unit().max(1);
-    let mut scratch = 0u64;
+    let mut scratch = Packer { unit, end: 0 };
     for prepared in stages.iter_mut().flatten() {
-        prepared.set_scratch_at(scratch);
-        scratch += prepared.scratch_bytes();
-    }
-    if stages.iter().flatten().next().is_some() {
-        scratch = scratch.max(eta_exec::SCRATCH_ALIGN);
-    }
-    if scratch > unit {
-        return Err(Fault::Ceiling {
-            what: "bytes of a lane's scratch, which lies in one piece of its instance's",
-            need: scratch,
-            have: unit,
-        });
+        let mut at = Vec::with_capacity(prepared.pieces().len());
+        for (index, &bytes) in prepared.pieces().iter().enumerate() {
+            if index > 0 {
+                scratch.end = scratch.end.next_multiple_of(unit);
+            }
+            at.push(scratch.take(bytes.max(1), "bytes of a piece of a lane's scratch")?);
+        }
+        prepared.set_pieces_at(at, unit);
     }
     let mut pack = Packer { unit, end: 0 };
     let wave = (
@@ -265,7 +263,7 @@ fn lay_pair(stages: &mut [Option<Prepared>], shape: PairShape) -> Result<Laid> {
         });
     }
     Ok(Laid {
-        per_instance: scratch,
+        per_instance: scratch.end,
         per_pair: pack.end,
         stages: laid,
         wave,
@@ -507,7 +505,8 @@ impl Plane {
             .programs
             .get(&program_id)
             .ok_or_else(|| Fault::program("program::plane", format!("no program {program_id}")))?;
-        let laid = lay_pair(&mut program.stages(extents)?, self.pair_shape(program))?;
+        let shape = self.pair_shape(program);
+        let laid = lay_pair(&mut program.stages(extents, shape.room.unit())?, shape)?;
         Ok(engine::GuestState {
             per_instance: self.room.stated(laid.per_instance),
             per_pair: self.room.stated(laid.per_pair),
@@ -540,17 +539,19 @@ impl Plane {
             Target::of(context)?,
         )?;
         let id = ProgramId(self.next_program);
-        self.next_program += 1;
-        self.programs.insert(
+        let program = Program {
             id,
-            Program {
-                id,
-                hash: registration.program_hash,
-                plan,
-                compiled,
-                batches: Vec::new(),
-            },
-        );
+            hash: registration.program_hash,
+            plan,
+            compiled,
+            batches: Vec::new(),
+        };
+        // A value past a piece of the room is refused here, by name
+        // (`eta_exec::TooLarge::PastChunk`), at the extents a bind states
+        // by default; a bind's own are laid again at its bind.
+        program.stages(Extents::default(), self.room.unit())?;
+        self.next_program += 1;
+        self.programs.insert(id, program);
         self.by_hash.insert(registration.program_hash, id);
         Ok(id)
     }
