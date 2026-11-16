@@ -17,7 +17,7 @@ struct Span {
 
 #[derive(Debug, Default)]
 pub struct Wave {
-    /// Where the wave's tables lie in the fire's span, laid at each fly.
+    /// Where the wave's tables lie, in a pair's state, laid at each fly.
     arena: u64,
     tickets: Vec<Ticket>,
     taken: Vec<u32>,
@@ -82,7 +82,7 @@ impl Wave {
         self.pull.len()
     }
 
-    /// Stages the wave's tables at `base`, in the fire's span.
+    /// Stages the wave's tables at `base`, in a pair's state.
     pub(super) fn fly(&mut self, context: &Context, base: u64) -> Result<()> {
         let lanes = self.pull.len();
         if lanes == 0 {
@@ -185,7 +185,7 @@ impl Wave {
         }
     }
 
-    /// The bytes the staged wave's tables take of the fire's span.
+    /// The bytes the staged wave's tables take.
     pub(super) fn bytes(&self) -> u64 {
         if self.pull.is_empty() {
             0

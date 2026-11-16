@@ -18,17 +18,17 @@ use eta_ir::registry::{GeometryClass, Stage};
 use eta_ir::types::{Dtype, Literal, Predicate, RngKind, Shape};
 use eta_ir::validate::BoundTrace;
 
-const VOCAB: u32 = 151_936;
+pub(crate) const VOCAB: u32 = 151_936;
 
 /// Fires of each draw (its seed, and so its token, the same each time).
 const REPEATS: usize = 4;
 
-const STATE: u32 = 0;
-const KNOB: u32 = 1;
-const LOGITS: u32 = 2;
-const TOKEN: u32 = 3;
+pub(crate) const STATE: u32 = 0;
+pub(crate) const KNOB: u32 = 1;
+pub(crate) const LOGITS: u32 = 2;
+pub(crate) const TOKEN: u32 = 3;
 
-fn sampler(rank: bool) -> TraceContainer {
+pub(crate) fn sampler(rank: bool) -> TraceContainer {
     let row = Shape::vector(VOCAB);
     let ops = vec![
         Op::ChanRead(STATE),
@@ -109,10 +109,10 @@ fn sampler(rank: bool) -> TraceContainer {
     }
 }
 
-struct Noise(u64);
+pub(crate) struct Noise(pub(crate) u64);
 
 impl Noise {
-    fn unit(&mut self) -> f32 {
+    pub(crate) fn unit(&mut self) -> f32 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
         self.0 ^= self.0 << 17;
@@ -128,7 +128,7 @@ fn bf16(x: f32) -> f32 {
     f32::from_bits((x.to_bits() + 0x8000) & 0xffff_0000)
 }
 
-fn host_token(bound: &BoundTrace, seeds: &[(u32, Value)]) -> i32 {
+pub(crate) fn host_token(bound: &BoundTrace, seeds: &[(u32, Value)]) -> i32 {
     let mut reference = Instance::new(bound, seeds).expect("the interpreter instantiates");
     let stepped = reference
         .step(bound, &PassInputs::default(), &mut NoKernels)

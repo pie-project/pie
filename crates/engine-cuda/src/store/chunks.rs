@@ -642,7 +642,7 @@ impl Chunks {
         self.range.release_segments(pool, segments)
     }
 
-    fn shape(&self, kind: Kind) -> Result<&SlotShape> {
+    pub(crate) fn shape(&self, kind: Kind) -> Result<&SlotShape> {
         self.layout.shape(kind).ok_or_else(|| {
             Fault::program(
                 "store::chunks",

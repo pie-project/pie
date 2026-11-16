@@ -923,10 +923,20 @@ impl Engine for Cuda {
                 id,
                 instance,
                 rings,
+                scratch,
+                pair,
                 ..
             } => self
                 .loaded_mut()?
-                .rebind_program(id, crate::program::Slots { instance, rings })
+                .rebind_program(
+                    id,
+                    crate::program::Slots {
+                        instance,
+                        rings,
+                        scratch,
+                        pair,
+                    },
+                )
                 .map_err(fault),
             engine::program::Rebind::Channel { id, slots } => {
                 let old = self.channels.get(&id).cloned().ok_or_else(|| {
@@ -1178,6 +1188,8 @@ impl Engine for Cuda {
                 crate::program::Slots {
                     instance: binding.instance_slots.clone(),
                     rings: binding.ring_slots.clone(),
+                    scratch: binding.scratch.clone(),
+                    pair: binding.pair.clone(),
                 },
             )
             .map_err(fault)?;
@@ -1206,8 +1218,8 @@ impl Engine for Cuda {
         if let Some(held) = held {
             shell.release_adapter(held);
         }
-        // CUDA lays its guests' tables in the fire's span: it keeps none
-        // standing.
+        // CUDA's guests' tables and scratch are their instances' state: it
+        // keeps none standing.
         shell.close_program_instance(id).map_err(fault)?;
         Ok(0)
     }

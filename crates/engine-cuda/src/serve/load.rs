@@ -301,15 +301,15 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             poem_compiler::compile_axes(&boot.trace, &budgets_at(&budget, voxels), &profile)
                 .ok()?;
         // The span the rung weighs is the carve the load backs: the larger
-        // of the in-order and forked arenas, without their `attn.scores`
-        // planes (a reader's program term, never a load's).
-        let unscored = compiled.arena.scores_from(&boot.trace).max(
+        // of the in-order and forked arenas (a capturing lane's score rows
+        // are its reader's state, never the arena's).
+        let carve = compiled.arena.bytes.max(
             compiled
                 .arena_forked
                 .as_ref()
-                .map_or(0, |forked| forked.scores_from(&boot.trace)),
+                .map_or(0, |forked| forked.bytes),
         );
-        let bytes = unscored
+        let bytes = carve
             .saturating_add(crate::inputs::attention_workspace_bytes(
                 &budget,
                 &facts,
@@ -1053,7 +1053,10 @@ impl Shell {
         facts.mark_rows_a_lane(&read_only_by_decoders(&boot.trace, &compiled, &decoding));
         let feeds = Feeds::of(&boot.trace, &compiled);
         let tiers = crate::record::Tiers {
-            plain: plain_of(&landing, &Exports::of(&boot.trace, &compiled)?.outputs),
+            plain: plain_of(
+                &landing,
+                &Exports::of(&boot.trace, &compiled, boot.context, boot.page_size)?.outputs,
+            ),
         };
         let drafting_words: std::collections::HashSet<u64> = compiled
             .classes
@@ -1078,15 +1081,14 @@ impl Shell {
             );
         }
         // The fires that run the side streams carve their own arena
-        // (`CompiledModel::arena_forked`): the larger of the two, without
-        // its `attn.scores` planes, is what the pool keeps under its end for
-        // a fire's activation. No load reserves score planes: a fire that
-        // captures them lays them in its programs' term (`Arena`).
-        let arena_bytes = compiled.arena.scores_from(&boot.trace).max(
+        // (`CompiledModel::arena_forked`): the larger of the two is what the
+        // pool keeps under its end for a fire's activation. A capturing
+        // lane's score rows take none of it: they are its reader's state.
+        let arena_bytes = compiled.arena.bytes.max(
             compiled
                 .arena_forked
                 .as_ref()
-                .map_or(0, |forked| forked.scores_from(&boot.trace)),
+                .map_or(0, |forked| forked.bytes),
         );
         // What allocates on the device beside the pools allocates before
         // they read the card: the guests' fan streams, and on ROCm what the
@@ -1195,10 +1197,9 @@ impl Shell {
         // Backed whole, before ready: every chunk the runtime may open state
         // in under a rung's carve, and a fire reading out past one row a
         // lane (a verify reads every row), lie in it.
-        let mut arena = Arena::reserve(arena_bytes, crate::arena::score_values(&boot.trace))
+        let mut arena = Arena::reserve(arena_bytes)
             .with_rungs(rungs)
             .with_scoring(crate::arena::scoring_classes(&boot.trace, &compiled));
-        // Each rung's carve as the span weighs it: without its score planes.
         eprintln!(
             "engine-cuda: activation rungs {:?} under an arena of {arena_bytes} bytes",
             arena.carves(),
@@ -1318,7 +1319,7 @@ impl Shell {
             buffers.as_ref().map(crate::store::rs::Buffers::page_tokens),
         )?;
 
-        let exports = Exports::of(&boot.trace, &compiled)?;
+        let exports = Exports::of(&boot.trace, &compiled, boot.context, boot.page_size)?;
 
         let airborne = crate::settle::Airborne::new();
         let mut pools = pools;
@@ -1472,15 +1473,12 @@ impl Shell {
         let flight = 1 << shell.device.device().num_sm.max(1).ilog2();
         shell.programs.set_flight(flight);
         shell.programs.set_fire_lanes(shell.fire_lanes());
-        // A program reading `attn.scores` states the planes it switches on
-        // in its term (`engine::GuestState::per_pair`): no load backs them.
-        let widest = shell.arena.widest_planes(
-            std::iter::once(&shell.compiled.arena).chain(shell.compiled.arena_forked.as_ref()),
-        );
-        shell.programs.set_scores(widest);
-        // A program's fires lay their tables and scratch in the span the
-        // runtime widens for them when it binds (`Shell::guest_state`):
-        // nothing is held for them here.
+        shell.programs.set_room(shell.pools.instance_room()?);
+        // A capturing lane's score rows are its reader's state, a row of
+        // the load's context a grain (`engine::GuestState::per_instance`).
+        shell.programs.set_capture(boot.context, boot.page_size);
+        // A program's tables and scratch are its instances' state
+        // (`Shell::guest_state`): nothing is held for them here.
         let programs = 0u64;
         // A plane stored as codes and scales is decoded to bf16 before a
         // prefill's dense gemm, into one tile a stream: a scratch slab like
@@ -2460,9 +2458,8 @@ fn activation_rungs(
     let mut rungs = Vec::new();
     for rung in tokens {
         let map = poem_compiler::arena_rung(trace, budgets, compiled, rung)?;
-        // A rung narrower than the span, both weighed without their score
-        // planes: a fire's planes lie in its reader's term, under the carve.
-        if map.scores_from(trace) < span {
+        // A rung narrower than the span.
+        if map.bytes < span {
             rungs.push((rung, map));
         }
     }

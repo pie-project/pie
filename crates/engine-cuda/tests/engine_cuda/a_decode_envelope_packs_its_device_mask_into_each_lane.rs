@@ -209,29 +209,31 @@ fn bind(shell: &mut Shell, beams: u32, device: PortMask) -> engine::InstanceId {
     shell
         .commit_segments(segments)
         .expect("the first segment commits");
-    let slots = crate::guest::Guest::of(&facts, segments * facts.segment_chunks).slots(
+    let extents = Extents {
+        row_count: beams,
+        token_count: beams,
+        sampled_rows: beams,
+        query_len: beams,
+        ..Extents::default()
+    };
+    let slots = crate::guest::Guest::of(&facts, segments * facts.segment_chunks).shell_slots(
+        program,
         &shell.program_facts(program).expect("the program's facts"),
-        |_| false,
+        extents,
+        shell
+            .guest_state(program, extents)
+            .expect("the program's guest state"),
     );
     shell
         .bind_program(
             program,
             &[(TOKENS, tokens), (MASK, mask), (POSITIONS, positions)],
-            Extents {
-                row_count: beams,
-                token_count: beams,
-                sampled_rows: beams,
-                query_len: beams,
-                ..Extents::default()
-            },
+            extents,
             GeometryClass::DecodeEnvelope,
             device,
             &vec![None; count],
             &ids,
-            engine_cuda::program::Slots {
-                instance: slots.0,
-                rings: slots.1,
-            },
+            slots,
         )
         .expect("the instance binds")
 }

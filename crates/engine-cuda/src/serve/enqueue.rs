@@ -115,7 +115,6 @@ impl Shell {
             .as_ref()
             .map(|buffers| buffers.scratch(&self.pools));
         let tapping = self.tapping(p.lanes)?;
-        let fire_lanes = self.fire_lanes();
         let mut fire = FireCtx {
             live: &self.live,
             tapping: tapping.as_ref(),
@@ -144,7 +143,6 @@ impl Shell {
             predicate: &mut self.predicate,
             readout_rows: &mut self.readout_rows,
             budget: &self.budget,
-            fire_lanes,
             owed: &mut self.owed,
             spare_events: &mut self.spare_events,
             airborne: &self.airborne,
@@ -211,8 +209,6 @@ struct FireCtx<'a> {
     predicate: &'a mut Predicate,
     readout_rows: &'a mut Buffer,
     budget: &'a Budget,
-    /// The most lanes a fire carries, as the runtime is told.
-    fire_lanes: u32,
     owed: &'a mut Owed,
     spare_events: &'a mut Vec<Event>,
     airborne: &'a Airborne,
@@ -254,11 +250,6 @@ impl Shell {
             "prepare.prologue",
             Reap::Landed,
         )?;
-        // The fire is not composed yet: its prologues lay under the carve of
-        // the smallest rung that holds its lanes, which no rung the fire is
-        // cut to lies under.
-        let lanes = attachments.len() as u64;
-        self.point_programs(lanes, lanes)?;
         let mut verdicts: Vec<(usize, Fired)> = Vec::new();
         let mut launched = AirborneFires::default();
         for (at, attached) in attachments.iter().enumerate() {
@@ -524,13 +515,6 @@ impl FireCtx<'_> {
             Some(forked) if forks => (forked, true),
             _ => (&self.compiled.arena, false),
         };
-        // A fire holding a lane that captures scores lays its carve's
-        // score planes, under the carve, in the term its programs state.
-        let scored = p
-            .composition
-            .lanes()
-            .iter()
-            .any(|row| self.arena.captures(row.class as usize));
         let mut slots = self.arena.fire_slots(
             self.pools,
             map,
@@ -544,20 +528,7 @@ impl FireCtx<'_> {
                 clips: u64::from(p.composition.clips()),
                 readouts: p.readout_rows.len() as u64,
             },
-            scored,
-        )?;
-        // The fire's guests' programs lay their tables and scratch under
-        // this carve.
-        let span = super::program_span(
-            self.arena,
-            self.pools,
-            self.programs,
-            self.compiled.arena_forked.as_ref(),
-            (self.budget.max_tokens, self.fire_lanes),
-            carve_rows,
-            carve_lanes,
-        )?;
-        self.programs.set_span(span);
+        );
         if let Some(ep) = self.ep {
             ep.seats(forked)
                 .seat(ep.wire(), p.composition.bucket(), &mut slots);
@@ -696,6 +667,11 @@ impl FireCtx<'_> {
             adapter_routes: handles.adapter_routes,
             readout_rows: handles.readout_rows,
             readout_live: handles.readout_live,
+            score_rows: crate::run::ScoreRows {
+                table: handles.score_rows,
+                context: self.programs.capture().context,
+                page_size: self.programs.capture().page_size,
+            },
             patches: staged.patches.as_ref().map(|seats| seats.patches),
             patch_segments: staged.patches.as_ref().map(|seats| seats.segments),
             patch_routes: staged.patches.as_ref().map(|seats| seats.routes),
@@ -1196,6 +1172,40 @@ impl FireCtx<'_> {
         first_voxel: u32,
     ) -> Result<()> {
         let name = &out.decl.name;
+        // A capturing lane's score row lies in the reading instance, not in
+        // the carve: its key row, or the page row right after it.
+        let root = self.compiled.arena.root(out.values[0]);
+        if let Some(poem_compiler::Placement::Capture { width, dtype }) =
+            self.compiled.arena.placements.get(root.0 as usize)
+        {
+            let capture = self.programs.capture();
+            let row = self
+                .programs
+                .capture_row(instance)?
+                .ok_or_else(|| Fault::Unbound {
+                    what: format!(
+                        "output `{name}`, a capturing lane's score row: instance {instance}'s \
+                     program holds no score rows"
+                    ),
+                })?;
+            let (base, entries) = match width {
+                poem_ir::Dim::ContextPages => (
+                    row + u64::from(capture.context) * size_of::<f32>() as u64,
+                    capture.pages(),
+                ),
+                _ => (row, capture.context),
+            };
+            return self.programs.bind_output(
+                instance,
+                name,
+                k,
+                base,
+                storage_of(*dtype)?,
+                entries,
+                entries,
+                0,
+            );
+        }
         let plane = plane_of(out.values[0], name)?;
         let storage = storage_of(plane.dtype)?;
         let width = plane.width;

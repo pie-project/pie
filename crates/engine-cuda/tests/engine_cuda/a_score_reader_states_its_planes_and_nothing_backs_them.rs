@@ -18,19 +18,19 @@ use eta_ir::types::{Dtype as EtaDtype, Shape};
 use poem::{Dtype, ForwardHybrid, Input, Platform, Request, StateRows, Weight, ops};
 use poem_compiler::Budget;
 
-const VOCAB: u32 = 64;
+pub(crate) const VOCAB: u32 = 64;
 const WIDTH: u64 = 128;
 const HEAD_DIM: u32 = 64;
 const HEADS: u32 = 2;
 const KV_ROW: &str = "kv";
-const PAGE: u32 = 16;
-const PROMPT: u32 = 20;
+pub(crate) const PAGE: u32 = 16;
+pub(crate) const PROMPT: u32 = 20;
 const LANES: u32 = 4;
-/// The keys a score plane holds a run of per query head (`attend`'s).
-const KV_MAX: u64 = 2048;
+/// The load's context: a capturing lane's key row's width.
+const CONTEXT: u32 = 256;
 
 /// One attention layer that captures its scores.
-struct Scored;
+pub(crate) struct Scored;
 
 impl ForwardHybrid for Scored {
     fn states(&self) -> StateRows {
@@ -65,7 +65,8 @@ impl ForwardHybrid for Scored {
     }
 }
 
-fn shell(trace: poem::Trace, path: &Path) -> Shell {
+/// A shell of `trace`, recording bodies or not as `graphs` says.
+pub(crate) fn shell(trace: poem::Trace, path: &Path, graphs: Graphs) -> Shell {
     let contract = contract_for(&trace, path).expect("the random planes fit the trace");
     let mut shell = Shell::load(Boot {
         voxels: None,
@@ -76,14 +77,14 @@ fn shell(trace: poem::Trace, path: &Path) -> Shell {
         budget: Budget::new(LANES, 256),
         patches: None,
         page_size: PAGE,
-        context: 256,
+        context: CONTEXT,
         slots: LANES,
         kv_budget: Some(crate::POOL),
         allowance: engine::Allowance::WHOLE,
         context_declared: false,
         ordinal: 0,
         knobs: engine_cuda::Knobs {
-            chip: Some(engine_cuda::chip::pinned(Graphs::Off, None)),
+            chip: Some(engine_cuda::chip::pinned(graphs, None)),
             ..engine_cuda::Knobs::default()
         },
         cache_dir: None,
@@ -99,9 +100,10 @@ fn shell(trace: poem::Trace, path: &Path) -> Shell {
     shell
 }
 
-/// An epilogue that sums lane 0's `attn.scores` row into a reader channel.
-fn reader() -> TraceContainer {
-    let width = u32::try_from(u64::from(HEADS) * KV_MAX).expect("a row's width");
+/// An epilogue that sums lane 0's `attn.scores` row (a key of the load's
+/// context each) into a reader channel.
+pub(crate) fn reader() -> TraceContainer {
+    let width = CONTEXT;
     TraceContainer {
         names: vec!["attn.scores".into()],
         channels: vec![ChannelDecl {
@@ -130,13 +132,13 @@ fn reader() -> TraceContainer {
     }
 }
 
-/// No load backs a score plane, and nothing backs the span after the load:
+/// No load backs a score row, and nothing backs the span after the load:
 /// the span the arena states is what it backed, a program reading
-/// `attn.scores` states the planes a fire carrying it lays in its term
-/// (`GuestState::per_pair`: the widest carve's, `HEADS × KV_MAX` f32 a lane of
-/// it), and neither its register, its bind nor a fire that captures the
-/// scores it reads maps anything: its programs and its planes lie in the
-/// span, under the decode's carve.
+/// `attn.scores` holds its lane's rows as its instance's state
+/// (`GuestState::per_instance`: a key row of the context and its page row,
+/// f32), and neither its register, its bind nor a fire that captures the
+/// scores it reads maps anything. The one layer's mass, averaged over the
+/// query heads, sums to one.
 #[test]
 fn a_score_reader_states_its_planes_and_nothing_backs_them() {
     if !engine_cuda::device::present() {
@@ -146,7 +148,7 @@ fn a_score_reader_states_its_planes_and_nothing_backs_them() {
     let trace = poem::trace_hybrid("scored-micro", &Scored, Platform::Cuda);
     let dir = tempfile::tempdir().expect("a scratch directory");
     let path = Weights::random(&trace, 4409).write(dir.path());
-    let mut shell = shell(trace.clone(), &path);
+    let mut shell = shell(trace.clone(), &path, Graphs::Off);
     let (span, backed, holds) = shell.activation_span();
     assert_eq!(backed, span, "the span is backed whole at load");
     let facts = shell.chunk_facts().expect("the chunk facts");
@@ -224,21 +226,19 @@ fn a_score_reader_states_its_planes_and_nothing_backs_them() {
     let state = shell
         .guest_state(program, extents)
         .expect("the reader's guest state");
-    // The widest carve's planes: a row of `HEADS × KV_MAX` f32 for each of
-    // the fire's lanes, whoever's they are, counted once a fire carrying it.
-    let planes = u64::from(LANES) * u64::from(HEADS) * KV_MAX * 4;
-    let term = state.per_pair;
+    // A lane's rows: its key row and its page row, f32.
+    let rows = u64::from(CONTEXT + CONTEXT.div_ceil(PAGE)) * 4;
     assert!(
-        term >= planes,
-        "a reader's term {term} holds the widest fire's planes, {planes}"
+        state.per_instance >= rows,
+        "a reader's instance {} holds its lane's score rows, {rows}",
+        state.per_instance
     );
-    // The decode below fires only where its programs and planes lie in that
-    // term under its carve, in the span (`Pools::program_span`,
-    // `Arena::fire_slots`): it is refused by name otherwise.
 
-    let slots = crate::guest::Guest::of(&facts, segments * facts.segment_chunks).slots(
+    let slots = crate::guest::Guest::of(&facts, segments * facts.segment_chunks).shell_slots(
+        program,
         &shell.program_facts(program).expect("the program's facts"),
-        |_| false,
+        extents,
+        state,
     );
     let ids = [engine::ChannelId(1)];
     let instance = shell
@@ -250,10 +250,7 @@ fn a_score_reader_states_its_planes_and_nothing_backs_them() {
             PortMask::NONE,
             &[None],
             &ids,
-            engine_cuda::program::Slots {
-                instance: slots.0,
-                rings: slots.1,
-            },
+            slots,
         )
         .expect("the reader binds");
     assert_eq!(
@@ -290,14 +287,6 @@ fn a_score_reader_states_its_planes_and_nothing_backs_them() {
         }],
         &[],
     );
-    match &fired {
-        Ok(_) => eprintln!("the scored decode fired inside the span"),
-        Err(refused) => {
-            let said = refused.to_string();
-            assert!(said.contains("attn.scores"), "{said}");
-            eprintln!("the scored decode was refused by name: {said}");
-        }
-    }
     assert_eq!(
         shell.activation_span().2,
         holds,
@@ -308,5 +297,18 @@ fn a_score_reader_states_its_planes_and_nothing_backs_them() {
         maps,
         "a scored fire maps nothing"
     );
-    fired.expect("a one-token fire's planes fit under its carve");
+    fired.expect("the scored decode fires");
+    shell.drain().expect("the decode lands");
+    let cell = shell
+        .program_instance(instance)
+        .expect("the reader's instance")
+        .expect("bound")
+        .take(0)
+        .expect("the sum reads")
+        .expect("a sum");
+    let mass = f32::from_le_bytes(cell[..4].try_into().expect("an f32"));
+    assert!(
+        (mass - 1.0).abs() < 1e-3,
+        "one layer's mass a key, averaged over the heads, sums to one: {mass}"
+    );
 }
