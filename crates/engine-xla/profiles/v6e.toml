@@ -32,6 +32,15 @@ moe.gmm_glu = 1
 moe.gmm_fuse_from = 1024
 # a decode of 64 rows and more reads each row's own pages through the page-copy kernel
 attn.decode_pages = 64
+# a fire of two kv rows or fewer lands them in place, one by one, below a row-scatter call's launch (v6e MoE decode
+# of one lane: a 2 KiB scatter call a layer); from 128 rows its pages land whole by runs, a row scatter paying for
+# every row it is handed (~0.12 us a row: a 1792-row prefill's plane 0.22 ms, its pages whole 0.02 ms). Both were
+# constants in the code; stated here until `pie tune xla` measures the crossovers.
+attn.append_rows_in_place = 2
+attn.append_page_rows = 128
+# a decode walk's chunk is as many keys as the chunk budget holds (no cap), until `pie tune xla` measures where a
+# capped chunk's loop beats one body
+attn.decode_chunk_keys = 0
 # a prompt's GeGLU rows land before the down dot reads them, not fused into its operand (Gemma-4-31B cut's
 # 2304-row fire 74.8 -> 72.2 ms, pf256-512 28.3k -> 29.3k tok/s)
 glu.land_from = 1024

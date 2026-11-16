@@ -1083,6 +1083,14 @@ pub(crate) fn per_row(
     };
     let width = (h.kvh * (h.d + h.dv)).max(h.qh()).max(1);
     let c = pow2_floor((ch.budget / (r * width)).max(8)).min(round_up(total, 8));
+    // A chunk's body is laid out whole: capped (the profile's
+    // `kernel.attn.decode_chunk_keys`), a long walk loops one small body
+    // rather than lay one large one.
+    let c = if ch.decode_chunk_keys > 0 {
+        c.min(pow2_floor(ch.decode_chunk_keys.max(8)))
+    } else {
+        c
+    };
     // A windowed row admits at most `window` keys: chunks of about that
     // width (whole pages), walked from the lowest admitted one, read the
     // window and not the whole span.
@@ -2791,7 +2799,7 @@ pub(crate) fn scatter_slots_mapped(
     page_size: i32,
     write_page: Operand,
     write_offset: Operand,
-    vmem_cap: Option<i64>,
+    cuts: Cuts,
     lanes: i64,
 ) -> Result<Vec<Val>, Error> {
     if maps.len() != pairs.len() {
@@ -2807,7 +2815,7 @@ pub(crate) fn scatter_slots_mapped(
             page_size,
             write_page,
             write_offset,
-            vmem_cap,
+            cuts,
             lanes,
         );
     }
@@ -2819,7 +2827,7 @@ pub(crate) fn scatter_slots_mapped(
         page_size,
         write_page,
         write_offset,
-        vmem_cap,
+        cuts,
         lanes,
     )? {
         return Ok(out);
@@ -2846,7 +2854,7 @@ pub(crate) fn scatter_slots_mapped(
             page_size,
             write_page,
             write_offset,
-            vmem_cap,
+            cuts,
             lanes,
         )?;
         out.push(one[0]);
@@ -2879,7 +2887,7 @@ fn append_pool_planes(
     page_size: i32,
     write_page: Operand,
     write_offset: Operand,
-    vmem_cap: Option<i64>,
+    cuts: Cuts,
     lanes: i64,
 ) -> Result<Option<Vec<Val>>, Error> {
     let [(k, keys), (v, values)] = pairs else {
@@ -2941,11 +2949,12 @@ fn append_pool_planes(
             all,
             slots,
             dims,
+            cuts.rows_in_place,
         )
     };
     // A short fire (a decode's): every row by itself, both planes' rows in
     // one block scatter (no runs, no case).
-    if n64 < PAGE_WRITE_ROWS || n64 % ps != 0 {
+    if n64 < cuts.page_rows || n64 % ps != 0 {
         let done = rows_into(f)?[0];
         return Ok(Some(vec![
             rebase(f, keys.val, done)?,
@@ -2997,7 +3006,7 @@ fn append_pool_planes(
     // fire's run capacity), else every page whole by the XLA form. The host
     // refuses a fire whose runs pass the capacity or break a run
     // (`append_run_capacity`), so neither reads past what it was laid for.
-    let done = match vmem_cap {
+    let done = match cuts.vmem_cap {
         Some(cap) if super::append::fits(n64, w, slots, ps, m, cap) => {
             let total = f.reshape(runs.total, &[1])?;
             let page = clamp_i(f, runs.page, 0, bound - 1)?;
@@ -3023,9 +3032,26 @@ fn append_pool_planes(
     ]))
 }
 
-/// The most rows a plane of a fire writes in place, one by one, rather than
-/// by a DMA kernel call.
-const ROWS_IN_PLACE: i64 = 2;
+/// What a fire's kv append reads from the device's profile: the VMEM a
+/// kernel may take (none: no kernel), and the measured crossovers between
+/// its ways of landing rows (`kernel.attn.append_rows_in_place`,
+/// `kernel.attn.append_page_rows`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Cuts {
+    pub vmem_cap: Option<i64>,
+    pub rows_in_place: i64,
+    pub page_rows: i64,
+}
+
+impl Cuts {
+    pub(crate) fn of(tuning: &Tuning, kernel: bool) -> Self {
+        Cuts {
+            vmem_cap: kernel.then(|| tuning.vmem_cap()),
+            rows_in_place: tuning.chunks.append_rows_in_place,
+            page_rows: tuning.chunks.append_page_rows,
+        }
+    }
+}
 
 /// Both pool planes' rows, each by itself: row `i` of plane `x` to page
 /// `maps[x](page[i])` at offset `off[i]` (a row whose page or offset is out
@@ -3045,6 +3071,7 @@ fn pool_rows(
     all: i64,
     slots: i64,
     dims: &[i64],
+    rows_in_place: i64,
 ) -> Built<Vec<Val>> {
     let n64 = f.dims(page)[0];
     let token_rows = o.rpt;
@@ -3072,7 +3099,7 @@ fn pool_rows(
     // page · B + j · T + t.
     let nt = 2 * n64;
     let packed = f.pack_rows(ups, nt * token_rows)?;
-    if n64 <= ROWS_IN_PLACE {
+    if n64 <= rows_in_place {
         // A lane or two (a decode's): no kernel call, whose launch costs
         // the host and the device more than these few rows (v6e MoE decode
         // of one lane: a 2 KiB scatter call a layer). A token of one pool
@@ -3158,7 +3185,7 @@ fn scatter_slots_one_map(
     page_size: i32,
     write_page: Operand,
     write_offset: Operand,
-    vmem_cap: Option<i64>,
+    cuts: Cuts,
     lanes: i64,
 ) -> Result<Vec<Val>, Error> {
     let Some(&(first, _)) = pairs.first() else {
@@ -3170,7 +3197,7 @@ fn scatter_slots_one_map(
     let off = read_rows_i32(f, op, write_offset, n)?;
     let ps = i64::from(page_size);
     let slots = i64::from(pairs[0].1.rows);
-    let paged = i64::from(n) >= PAGE_WRITE_ROWS
+    let paged = i64::from(n) >= cuts.page_rows
         && ps >= 8
         && slots % ps == 0
         && i64::from(n) % ps == 0
@@ -3197,7 +3224,7 @@ fn scatter_slots_one_map(
         && v.width == values.width
         && f.elem(keys.val) == Elem::Bf16
         && f.elem(values.val) == Elem::Bf16
-        && let Some(vmem_cap) = vmem_cap
+        && let Some(vmem_cap) = cuts.vmem_cap
         && let Some(parts) = [1, 2, 4].into_iter().find(|&p| {
             let rows = i64::from(n) / p;
             i64::from(n) % (p * ps) == 0
@@ -3274,7 +3301,7 @@ fn scatter_slots_one_map(
         && (f.view_order(plane.val).is_some_and(|o| o.tokens == ps) || w <= 256)
         && src.width == plane.width
         && f.elem(src.val) == Elem::Bf16
-        && let Some(vmem_cap) = vmem_cap
+        && let Some(vmem_cap) = cuts.vmem_cap
         && super::append::fits(i64::from(n), w, slots, ps, f.dims(runs.page)[0], vmem_cap)
     {
         let (src, plane) = (*src, *plane);
@@ -3321,20 +3348,15 @@ fn run_capacity(n: i64, ps: i64, lanes: i64) -> i64 {
 
 /// The page runs a fire of `n` rows over `lanes` lanes, pages of `ps` rows,
 /// may lay, where its rows are landed by runs (a tall fire: at least
-/// [`PAGE_WRITE_ROWS`] rows, whole pages of them); `None` where they land
-/// row by row and any layout is taken. A fire whose live rows break into
+/// `page_rows` rows, the profile's `kernel.attn.append_page_rows`, whole
+/// pages of them); `None` where they land row by row and any layout is
+/// taken. A fire whose live rows break into
 /// more runs, lay a page in two runs, or skip an offset inside a run is
 /// refused before dispatch: the device takes none of those.
 #[must_use]
-pub fn append_run_capacity(n: i64, ps: i64, lanes: i64) -> Option<i64> {
-    (n >= PAGE_WRITE_ROWS && ps >= 8 && n % ps == 0).then(|| run_capacity(n, ps, lanes))
+pub fn append_run_capacity(n: i64, ps: i64, lanes: i64, page_rows: i64) -> Option<i64> {
+    (n >= page_rows && ps >= 8 && n % ps == 0).then(|| run_capacity(n, ps, lanes))
 }
-
-/// Rows from which `scatter_slots` writes whole pages: a fire this tall is a
-/// prefill's, whose rows fill a lane's pages in runs, and a TPU row scatter
-/// pays for every row it is handed, landing or not (v6e: ~0.12 us a row, a
-/// 1792-row prefill's plane 0.22 ms; its pages written whole, 0.02 ms).
-const PAGE_WRITE_ROWS: i64 = 128;
 
 /// Each row of `src` written to its own slot, one row scatter a plane.
 fn slot_rows(
@@ -3658,7 +3680,7 @@ fn append(
     head_stride: u64,
     write_page: Operand,
     write_offset: Operand,
-    vmem_cap: Option<i64>,
+    cuts: Cuts,
     maps: [PageMap; 2],
     lanes: i64,
 ) -> Result<(Val, Val), Error> {
@@ -3687,7 +3709,7 @@ fn append(
         page_size,
         write_page,
         write_offset,
-        vmem_cap,
+        cuts,
         lanes,
     )?;
     Ok((planes[0], planes[1]))
@@ -3724,7 +3746,7 @@ pub fn kv_append(
         pool.head_stride,
         write_page,
         write_offset,
-        Some(tuning.vmem_cap()),
+        Cuts::of(&tuning, true),
         [pool.keys_map, pool.values_map],
         fire_lanes(pool),
     )
@@ -3740,6 +3762,7 @@ pub fn kv_append_shared(
     pool: &KvPool<impl Stored>,
     write_page: Operand,
     write_offset: Operand,
+    tuning: Tuning,
 ) -> Result<(Val, Val), Error> {
     append(
         f,
@@ -3753,7 +3776,7 @@ pub fn kv_append_shared(
         pool.head_stride,
         write_page,
         write_offset,
-        None,
+        Cuts::of(&tuning, false),
         [pool.keys_map, pool.values_map],
         fire_lanes(pool),
     )

@@ -346,6 +346,7 @@ pub fn kv_append(
     pool: &KvPool<impl Stored>,
     write_page: Operand,
     write_offset: Operand,
+    tuning: crate::tuning::Tuning,
 ) -> Result<(Val, Option<Val>), Error> {
     const OP: &str = "attn.mla_kv_append";
     expect(OP, kv_c, &[Dtype::Bf16])?;
@@ -374,7 +375,7 @@ pub fn kv_append(
         pool.page_size,
         write_page,
         write_offset,
-        None,
+        super::paged::Cuts::of(&tuning, false),
         super::paged::fire_lanes(pool),
     )?;
     Ok((planes[0], planes.get(1).copied()))

@@ -233,6 +233,32 @@ pub struct AttnBudgetMi(pub u32);
 #[decision(id = "kernel.attn.decode_pages", constant(set(0, 1, 8, 16, 32, 64, 128)), default = 0, tune = search)]
 pub struct AttnDecodePages(pub u32);
 
+/// The most rows of a fire whose kv rows land in place, one by one (a
+/// dynamic-update-slice a row), rather than by one row-scatter call: below
+/// it the call's launch costs more than the rows. A measured crossover of
+/// the device (`pie tune xla`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.attn.append_rows_in_place", constant(range(0..=16)), default = 2, tune = search)]
+pub struct AttnAppendRowsInPlace(pub u32);
+
+/// The rows from which a fire's kv rows land by whole pages (runs: the
+/// Mosaic kernel, else the XLA pages form) rather than one row scatter: a
+/// row scatter pays for every row it is handed. A measured crossover of the
+/// device (`pie tune xla`); never below the kernel's floor of two 16-row
+/// source tiles, which `append::fits` states on its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.attn.append_page_rows", constant(set(32, 64, 128, 256, 512)), default = 128, tune = search)]
+pub struct AttnAppendPageRows(pub u32);
+
+/// The most keys one chunk of a decode's per-row walk takes (0: as many as
+/// the chunk budget holds): a chunk's body is laid out whole, so a walk of
+/// one large chunk is a large program, and a walk of several loops one
+/// smaller body. The crossover between one body and a loop is measured
+/// (`pie tune xla`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.attn.decode_chunk_keys", constant(set(0, 256, 512, 1024, 2048, 4096)), default = 0, tune = search)]
+pub struct AttnDecodeChunkKeys(pub u32);
+
 /// Query rows per block of the blocked attention walk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.attn.block_rows", constant(set(128, 256, 512, 1024, 2048)), default = 512, tune = search)]
@@ -326,6 +352,9 @@ pub fn register(registry: &mut Registry) {
         .add::<AttnBlockKeys>()
         .add::<AttnUnrolledBlocks>()
         .add::<AttnFlashNarrowRows>()
+        .add::<AttnAppendRowsInPlace>()
+        .add::<AttnAppendPageRows>()
+        .add::<AttnDecodeChunkKeys>()
         .add::<SsmChunk>()
         .add::<SsmLongChunk>()
         .add::<SsmKdaChunk>()
@@ -373,6 +402,15 @@ pub struct Chunks {
     /// A flash prefill block's query rows for narrow heads (see
     /// [`AttnFlashNarrowRows`]).
     pub flash_narrow_rows: i64,
+    /// The most rows a fire's kv append lands in place (see
+    /// [`AttnAppendRowsInPlace`]).
+    pub append_rows_in_place: i64,
+    /// Rows from which a fire's kv append lands by pages (see
+    /// [`AttnAppendPageRows`]).
+    pub append_page_rows: i64,
+    /// The most keys a decode walk's chunk takes, 0 no cap (see
+    /// [`AttnDecodeChunkKeys`]).
+    pub decode_chunk_keys: i64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -474,6 +512,9 @@ impl Tuning {
             window_reach: true,
             decode_pages: 0,
             flash_narrow_rows: 256,
+            append_rows_in_place: 2,
+            append_page_rows: 128,
+            decode_chunk_keys: 0,
         },
         ssm: SsmChunks {
             chunk: 64,
@@ -540,6 +581,9 @@ impl Tuning {
                 window_reach: true,
                 decode_pages: n(profile.get::<AttnDecodePages>().0),
                 flash_narrow_rows: n(profile.get::<AttnFlashNarrowRows>().0),
+                append_rows_in_place: n(profile.get::<AttnAppendRowsInPlace>().0),
+                append_page_rows: n(profile.get::<AttnAppendPageRows>().0),
+                decode_chunk_keys: n(profile.get::<AttnDecodeChunkKeys>().0),
             },
             ssm: SsmChunks {
                 chunk: n(profile.get::<SsmChunk>().0),

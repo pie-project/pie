@@ -257,7 +257,8 @@ pub fn kv_append_shared(
         let p = l.read(plane)?;
         let keys = l.read(pool.keys)?;
         let values = l.read(pool.values)?;
-        let (keys, values) = paged::kv_append_shared(l.f(), p, keys, values, pool, wp, wo)?;
+        let tuning = l.tuning();
+        let (keys, values) = paged::kv_append_shared(l.f(), p, keys, values, pool, wp, wo, tuning)?;
         l.land(pool.keys, keys)?;
         l.land(pool.values, values)
     })
@@ -562,7 +563,8 @@ pub mod mla {
             } else {
                 Some((l.read(k_pe)?, l.read(pool.values)?))
             };
-            let (keys, pe) = mla::kv_append(l.f(), c, keys, rope, pool, wp, wo)?;
+            let tuning = l.tuning();
+            let (keys, pe) = mla::kv_append(l.f(), c, keys, rope, pool, wp, wo, tuning)?;
             Ok(vec![Some(keys), pe])
         })
     }
