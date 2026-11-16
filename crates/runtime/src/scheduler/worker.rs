@@ -326,6 +326,9 @@ pub(crate) enum PoolOp {
     /// An instance's tables or a ring were unparked into these slots
     /// (`Engine::rebind_slots`), ahead of every fire queued after it.
     Rebind(::engine::Rebind),
+    /// A request was admitted (`Engine::expect_work`): its first fire is
+    /// coming. Nothing waits on the answer.
+    ExpectWork,
 }
 
 /// A read or write of host kv slots' bytes, behind every copy queued before
@@ -1199,6 +1202,16 @@ impl SchedulerHandle {
     pub(crate) async fn pool(&self, op: PoolOp) -> Result<()> {
         self.request(|response| SchedulerItem::Pool { op, response })
             .await?
+    }
+
+    /// Tells the engine work is coming ([`PoolOp::ExpectWork`]), waiting
+    /// for nothing.
+    pub(crate) fn expect_work(&self) -> Result<()> {
+        let (response, _) = tokio::sync::oneshot::channel();
+        self.send(SchedulerItem::Pool {
+            op: PoolOp::ExpectWork,
+            response,
+        })
     }
 
     pub fn close_instance(&self, id: ::engine::InstanceId, pacing_wait_id: u64) -> Result<()> {

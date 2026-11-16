@@ -759,6 +759,12 @@ impl Engine for Metal {
         self.loaded_mut()?.set_rung(from, to).map_err(fault)
     }
 
+    fn expect_work(&mut self) {
+        if let Some(shell) = self.shell.as_ref() {
+            shell.expect_work();
+        }
+    }
+
     fn commit_span(&mut self, segments: u32) -> EngineResult<()> {
         self.loaded_mut()?.commit_span(segments).map_err(fault)
     }
