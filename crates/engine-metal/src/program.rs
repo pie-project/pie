@@ -655,28 +655,22 @@ impl Plane {
     }
 
     /// What a fire holding lanes of `program` bound at `extents` lays in
-    /// the span's guest region (`engine::Engine::fire_facts`): a lane's
-    /// value scratch; the tables stay the instance's and the batch's own.
-    pub fn fire_facts(&self, program: ProgramId, extents: &Extents) -> Result<engine::FireFacts> {
+    /// the span's guest region, a lane: its value scratch; the tables stay
+    /// the instance's and the batch's own. The engine's own placement,
+    /// until the scratch moves into its instances' state
+    /// (`engine::GuestState`).
+    pub fn lane_scratch(&self, program: ProgramId, extents: &Extents) -> Result<u64> {
         let program = self
             .programs
             .get(&program)
             .ok_or_else(|| Fault::program("program::plane", format!("no program {program}")))?;
-        Ok(engine::FireFacts {
-            a_lane: Session::scratch_for(&program.compiled, extents)?,
-            // Its batch tables stand beside every fire, laid once a set
-            // under the model's carve and counted at bind and close
-            // (`engine::Engine::standing_after`), not in a fire's term.
-            fixed: 0,
-            max_lanes: 0,
-            laid: engine::LaidLanes::Exact,
-        })
+        Session::scratch_for(&program.compiled, extents)
     }
 
-    /// Each live (program, extents) pair's fire term, once a pair, with each
-    /// pair's live instances: no fire carries more lanes of a
-    /// pair than it has bound, as the runtime counts the term.
-    pub fn live_terms(&self) -> Result<Vec<(engine::FireFacts, u64)>> {
+    /// Each live (program, extents) pair's lane scratch, once a pair, with
+    /// each pair's live instances: no fire carries more lanes of a pair
+    /// than it has bound.
+    pub fn live_terms(&self) -> Result<Vec<(u64, u64)>> {
         let mut pairs: Vec<((ProgramId, Extents), u64)> = Vec::new();
         for bound in self.instances.values() {
             let pair = (bound.program_id, bound.extents);
@@ -687,7 +681,7 @@ impl Plane {
         }
         pairs
             .iter()
-            .map(|((program, extents), live)| Ok((self.fire_facts(*program, extents)?, *live)))
+            .map(|((program, extents), live)| Ok((self.lane_scratch(*program, extents)?, *live)))
             .collect()
     }
 
@@ -991,7 +985,7 @@ impl Plane {
 struct Bound {
     program_id: ProgramId,
     /// The extents it was bound at: with the program, the pair whose fire
-    /// term the runtime counts (`engine::Engine::fire_facts`).
+    /// scratch a fire lays (`Plane::lane_scratch`).
     extents: Extents,
     session: Session,
     geometry: GeometryClass,
@@ -2027,6 +2021,8 @@ mod tests {
                     instance: fresh_instance.clone(),
                     rings: fresh_rings.clone(),
                     adapter: Vec::new(),
+                    scratch: engine::ScratchPlace::None,
+                    pair: engine::ScratchPlace::None,
                 },
             )
             .expect("the slots rebind");
@@ -2104,6 +2100,8 @@ mod tests {
                     instance,
                     rings,
                     adapter: Vec::new(),
+                    scratch: engine::ScratchPlace::None,
+                    pair: engine::ScratchPlace::None,
                 },
             )
             .expect("the slots rebind");

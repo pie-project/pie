@@ -1081,8 +1081,8 @@ fn registration_compiles_every_pass(device: &Device) {
         .expect("every stage compiles at registration");
     assert_eq!(device.misses(), before, "registration compiles are not ladder misses");
     let compiled = stages.len();
-    let facts = stages.fire_facts(key, &carried, device.load_temp());
-    eprintln!("registration compiled {compiled} stage program(s); fire facts {facts:?}");
+    let facts = stages.pass_bytes(key, &carried, device.load_temp());
+    eprintln!("registration compiled {compiled} stage program(s); pass bytes {facts:?}");
     assert_eq!(facts.max_lanes, 4, "every lane rung up to the widest fire");
     assert!(
         facts.fixed + 4 * facts.a_lane > 0,

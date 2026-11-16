@@ -729,10 +729,10 @@ impl Plane {
     /// from its stages as registration compiled them; none for a program
     /// the host interprets.
     #[must_use]
-    pub fn fire_facts(&self, program: ProgramId, load_temp: u64) -> engine::program::FireFacts {
+    pub fn pass_bytes(&self, program: ProgramId, load_temp: u64) -> crate::guest::run::PassBytes {
         self.forms
             .get(program)
-            .map(|form| self.stages.fire_facts(form.key, &form.pooled(), load_temp))
+            .map(|form| self.stages.pass_bytes(form.key, &form.pooled(), load_temp))
             .unwrap_or_default()
     }
 

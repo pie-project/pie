@@ -133,7 +133,7 @@ fn reader() -> TraceContainer {
 /// No load backs a score plane, and nothing backs the span after the load:
 /// the span the arena states is what it backed, a program reading
 /// `attn.scores` states the planes a fire carrying it lays in its term
-/// (`FireFacts::fixed`: the widest carve's, `HEADS × KV_MAX` f32 a lane of
+/// (`GuestState::per_pair`: the widest carve's, `HEADS × KV_MAX` f32 a lane of
 /// it), and neither its register, its bind nor a fire that captures the
 /// scores it reads maps anything: its programs and its planes lie in the
 /// span, under the decode's carve.
@@ -221,13 +221,13 @@ fn a_score_reader_states_its_planes_and_nothing_backs_them() {
         query_len: 1,
         ..Extents::default()
     };
-    let fire = shell
-        .fire_facts(program, extents)
-        .expect("the reader's fire facts");
+    let state = shell
+        .guest_state(program, extents)
+        .expect("the reader's guest state");
     // The widest carve's planes: a row of `HEADS × KV_MAX` f32 for each of
     // the fire's lanes, whoever's they are, counted once a fire carrying it.
     let planes = u64::from(LANES) * u64::from(HEADS) * KV_MAX * 4;
-    let term = fire.bytes(1);
+    let term = state.per_pair;
     assert!(
         term >= planes,
         "a reader's term {term} holds the widest fire's planes, {planes}"

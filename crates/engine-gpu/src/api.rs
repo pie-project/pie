@@ -648,18 +648,19 @@ where
         self.programs.facts(program, &place(shell)).map_err(refusal)
     }
 
-    /// A program reading captured attention scores takes the capture
-    /// planes' rows for its lanes beside the fire's carve, in the span.
-    fn fire_facts(
+    /// A program reading captured attention scores holds the capture
+    /// planes' rows for its lanes as its instances' state
+    /// ([`Shell::capture_state`]).
+    fn guest_state(
         &self,
         program: ProgramId,
         _extents: &engine::BindExtents,
-    ) -> EngineResult<engine::FireFacts> {
+    ) -> EngineResult<engine::GuestState> {
         let (Some(shell), Some(package)) = (self.shell.as_ref(), self.programs.package(program))
         else {
-            return Ok(engine::FireFacts::default());
+            return Ok(engine::GuestState::default());
         };
-        Ok(shell.capture_term(
+        Ok(shell.capture_state(
             package
                 .values
                 .iter()

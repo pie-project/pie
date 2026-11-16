@@ -14,7 +14,7 @@ use crate::store::Pools;
 /// The span is the largest carve without its `attn.scores` planes: no load
 /// reserves or backs score planes. A fire that captures scores (a program
 /// reading them is in it) lays its planes under its carve, in the room the
-/// runtime sets aside for that program's term (its `engine::FireFacts`
+/// runtime sets aside for that program's term (its `engine::GuestState`
 /// `fixed`, [`Arena::widest_planes`]), and a fire whose planes would not
 /// lie in the span is refused by name.
 #[derive(Debug)]

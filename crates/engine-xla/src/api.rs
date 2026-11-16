@@ -727,18 +727,17 @@ impl Engine for Xla {
             .map_err(refusal)
     }
 
-    /// What a fire holding lanes of `program` takes beside the model's own:
-    /// its stages' temp past the load's largest (they share the runtime's
-    /// one reservation) and their outputs, as registration compiled them.
-    /// The same at any extents: every stage was compiled for every rung.
-    fn fire_facts(
+    /// None in the pool: a pass's stages take their temp past the load's
+    /// largest in the runtime's one reservation outside the pool, and the
+    /// pool states no `Instance` shape to hold scratch in
+    /// ([`crate::program::Plane::pass_bytes`] measures it).
+    fn guest_state(
         &self,
         program: ProgramId,
         extents: &engine::program::BindExtents,
-    ) -> EngineResult<engine::program::FireFacts> {
-        let _ = extents;
-        let load_temp = self.shell.as_ref().map_or(0, |shell| shell.device().load_temp());
-        Ok(self.programs.fire_facts(program, load_temp))
+    ) -> EngineResult<engine::GuestState> {
+        let _ = (program, extents);
+        Ok(engine::GuestState::default())
     }
 
     /// An instance's carried rings, or a registered channel's ring, moved to

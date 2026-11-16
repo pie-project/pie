@@ -446,11 +446,8 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 // starts with says there what it still holds
                 // (`Shared::<Steered>::boot`), before the load returns.
                 pool.hold_back(d.chunks.held_bytes);
-                // A rung of `r` tokens carries `min(r, max_lanes)` lanes, as
-                // the engine counts them: what a program's fire term takes.
-                pool.set_max_lanes(u32::try_from(d.limits.max_forward_requests).unwrap_or(u32::MAX));
-                // The rows a fire reads out: counted beside the guest term
-                // where they land beside the activation, a lane reading
+                // The rows a fire reads out: counted beside the carve where
+                // they land beside the activation, a lane reading
                 // more than a fixed store holds refused at its bind.
                 pool.set_readouts(
                     readouts,

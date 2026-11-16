@@ -43,11 +43,11 @@
 //! the rung only ever clears cache there ([`RungWalk`],
 //! [`SharedPool::plan_raise`], [`SlotError::SpanCached`]): its owner lets
 //! it go, and the fires reading it retire, before the rung is taken. No
-//! raise moves live state: no rung's activation, a guest term's included,
-//! is set aside past the span ([`SlotError::PastSpan`]); a guest fire is
-//! cut to the widest rung whose activation and term fit it
-//! ([`SharedPool::widest_fit`]), and a program whose term fits at no rung
-//! is refused by name at its bind ([`programs::ProgramOpen`]). The top
+//! raise moves live state: no rung's activation, its readout and standing
+//! bytes included, is set aside past the span ([`SlotError::PastSpan`]);
+//! fires are cut to the widest rung whose activation fits it
+//! ([`SharedPool::widest_fit`]). A guest program's scratch is state of its
+//! instance, taken at its bind ([`super::roles`]). The top
 //! `act_chunks_max` span is committed from the load (unless backed on
 //! demand). Segments commit as a prefix (`commit_segments(n)`) ahead of need,
 //! off the fire path; a shrink evacuates the highest committed segment of
@@ -307,15 +307,15 @@ pub fn cap_for(shared: &Shared, rows: u32) -> u32 {
 }
 
 /// The cap a raise toward `rows` reaches: the rung that holds them, within
-/// the widest rung the programs' fire terms fit.
+/// the widest rung that fits with the standing and readout bytes.
 #[must_use]
 pub fn reach_for(shared: &Shared, rows: u32) -> u32 {
     let pool = shared.lock().unwrap();
     pool.lifted(pool.rung_for(rows)).min(pool.fit_cap())
 }
 
-/// One line for a raise taken: at debug where the rung stood (a guest term
-/// that grew under it, once a bind), at info where the rung moved.
+/// One line for a raise taken: at debug where the rung stood (standing
+/// bytes that grew under it, once a bind), at info where the rung moved.
 pub(crate) fn raise_said(engine: usize, rung: u32, stood: bool) {
     if stood {
         tracing::debug!(engine, rung, "the activation at a standing rung is raised");
@@ -441,9 +441,9 @@ impl RungWalk {
             .filter(|&rung| rung <= goal.min(pool.fit_rung()))
             .max()
             .unwrap_or(rungs[0]);
-        // Fires cut wider than the widest rung that fits with the programs'
-        // fire terms are cut to it first, whatever else the walk does: no
-        // span holds a wider fire with the terms.
+        // Fires cut wider than the widest rung that fits with the standing
+        // and readout bytes are cut to it first, whatever else the walk
+        // does: no span holds a wider fire with them.
         let fit_cap = pool.fit_cap();
         if cap > fit_cap {
             self.lowering = None;
@@ -454,9 +454,8 @@ impl RungWalk {
         // one class: the pool sets aside the same span for each, so a move
         // within a class only caps fires, never lowers or raises (and a
         // cap down there, freeing nothing, is one the walker leaves:
-        // `SharedGrow::walk_rung`). A
-        // program's fire term registered or dropped since moves the span a
-        // rung takes ([`programs`]).
+        // `SharedGrow::walk_rung`). Standing bytes booked or given back
+        // since move the span a rung takes ([`programs`]).
         let want = pool.pool().act_chunks(goal);
         let have = pool.pool().act_reserved();
         let lifted = if goal == largest { u32::MAX } else { goal };
@@ -536,8 +535,8 @@ pub struct PoolRoom {
     pub chunk_bytes: u64,
     pub total_chunks: u32,
     pub reserved_chunks: u32,
-    /// The top rung's span (the largest rung's activation, a guest term at
-    /// the smallest rung past it included): live state never opens there,
+    /// The top rung's span (the largest rung's activation, the standing
+    /// bytes at the smallest rung past it included): live state never opens there,
     /// whatever rung is set aside; a lowered rung leaves it to idle cache.
     pub act_chunks: u32,
     /// The chunks the weights' pinned slots take.
@@ -778,7 +777,7 @@ pub struct SharedPool {
     /// span yield gave back): it is not asked again until room is freed
     /// ([`Self::block_span_commit`]).
     span_commit_blocked: bool,
-    /// The registered programs' fire terms ([`programs`]).
+    /// The engine's standing guest bytes and readout store ([`programs`]).
     programs: programs::ProgramFires,
 }
 
@@ -1173,8 +1172,8 @@ impl SharedPool {
         // Live state never opens in the top rung's span, at any rung: what
         // it can ever be backed in is below the span, the chunks under what
         // the engine binds that lie in segments the pool may map
-        // ([`Self::backable_below_span`]); a guest term past the span at
-        // the smallest rung takes its excess below it too.
+        // ([`Self::backable_below_span`]); standing bytes past the span at
+        // the smallest rung take their excess below it too.
         let act_chunks = pool.act_max().max(pool.act_chunks(0));
         let state_chunks = self
             .backable_below_span()
@@ -1286,6 +1285,15 @@ impl SharedPool {
         }
     }
 
+    /// The slots of `shape` one chunk holds: a slot ref's chunk is the ref
+    /// over it.
+    #[must_use]
+    pub fn chunk_slots(&self, shape: ShapeId) -> u32 {
+        self.pool
+            .shape(shape)
+            .map_or(1, |s| s.slots_per_chunk.max(1))
+    }
+
     /// `n` fresh slots of `shape` for the store, as slot refs; none when
     /// they do not all fit.
     pub fn take_refs(&mut self, shape: ShapeId, n: u64) -> Option<Vec<u32>> {
@@ -1325,8 +1333,8 @@ impl SharedPool {
 
     /// The chunks live state may take: every chunk but the reserved ones
     /// and the top rung's span ([`SlotPool::live_limit`]), at every rung,
-    /// and none the activation set aside now takes past the span's base (a
-    /// guest term).
+    /// and none the activation set aside now takes past the span's base
+    /// (standing bytes).
     #[must_use]
     pub fn state_chunks_now(&self) -> u32 {
         self.pool
@@ -1577,7 +1585,7 @@ impl SharedPool {
     /// lane trip; where the span is backed from the load nothing is backed
     /// or refused by it. On a span backed on demand the engine backs its
     /// carve there and may refuse ([`Self::raise_refused`]). A raise at the
-    /// rung the engine holds (a guest term grew under it) owes none.
+    /// rung the engine holds (standing bytes grew under it) owes none.
     pub fn raise_applied(&mut self, raise: &RungRaise) -> Result<Option<(u32, u32)>, RungError> {
         let before = self.pool.rung();
         let act = self.pool.act_reserved();
@@ -1596,9 +1604,9 @@ impl SharedPool {
     /// leaves an engine that is told rungs (the span backed on demand)
     /// another rung than it holds, where the engine backs its carve for the
     /// wider rung first (`Engine::set_rung`). No lane trip with the span
-    /// backed from the load, nor at the rung the engine holds: a guest term
-    /// that grew under it is covered by the engine inside the bind that
-    /// grew it.
+    /// backed from the load, nor at the rung the engine holds: standing
+    /// bytes that grew under it are covered by the engine inside the bind
+    /// that grew them.
     #[must_use]
     pub fn raise_waits(&self, raise: &RungRaise) -> bool {
         self.tells_rungs() && self.pool.rung_of(raise.rung) != self.told
@@ -1618,12 +1626,12 @@ impl SharedPool {
     }
 
     /// Whether an engine that is told rungs holds one wider than the
-    /// widest that fits with the programs' guest terms
-    /// ([`Self::widest_fit`]): a term grew past it. The walk brings it
-    /// down at once ([`RungWalk::step`]), and a bind that grew the term is
-    /// not sent before ([`programs::fund_span`]): the engine covers a
-    /// bind's term at the rung it holds, so it is never asked to at one
-    /// whose term was not held against its span here.
+    /// widest that fits ([`Self::widest_fit`]): its standing bytes grew
+    /// past it. The walk brings it down at once ([`RungWalk::step`]), and
+    /// a bind that grew them is not sent before ([`programs::fund_span`]):
+    /// the engine covers a bind's standing bytes at the rung it holds, so
+    /// it is never asked to at one where they were not held against its
+    /// span here.
     #[must_use]
     pub fn told_unfit(&self) -> bool {
         self.tells_rungs() && self.told > self.fit_rung()
@@ -1845,11 +1853,11 @@ impl SharedPool {
     /// span is backed on demand and the engine holds another rung, the
     /// notice it is sent (`Engine::set_rung(from, to)`), after the walk's
     /// retire fence: every fire wider than `rung` has retired, so it may
-    /// give back the carve above it. A lower that only gives back what a
-    /// dropped guest term took, the rung standing, sends none.
+    /// give back the carve above it. A lower that only gives back what
+    /// dropped standing bytes took, the rung standing, sends none.
     ///
     /// Where `rung`'s activation takes more than is set aside, only an
-    /// engine holding a wider rung is brought down to it (a guest term
+    /// engine holding a wider rung is brought down to it (standing bytes
     /// grew past the rung it holds, [`Self::told_unfit`]): what is set
     /// aside stays, and a raise at `rung` follows.
     pub fn lower_rung(&mut self, rung: u32) -> Result<Option<(u32, u32)>, RungError> {
@@ -2074,7 +2082,7 @@ impl SharedPool {
     }
 
     /// The reserved chunks and the top span, held from the load; past it,
-    /// what the programs' fire term has the activation take.
+    /// what the standing bytes have the activation take.
     fn fixed_bytes(&self) -> u64 {
         let act = self.pool.act_max().max(self.pool.act_reserved());
         u64::from(self.pool.reserved_chunks() + act) * self.pool.chunk_bytes()

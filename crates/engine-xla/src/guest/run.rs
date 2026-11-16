@@ -259,19 +259,15 @@ impl Stages {
     }
 
     /// What a pass of the program `key` names takes on the device beyond
-    /// the load's own (`Engine::fire_facts`), from its stages as
+    /// the load's own, in the runtime's temp outside the pool, from its
+    /// stages as
     /// registration compiled them: at each lane rung, the largest temp past
     /// `load_temp` (the runtime's one temp reservation is the largest loaded
     /// program's) and the outputs its stages return (not the pool they
     /// alias). `fixed + lanes · a_lane` covers every rung, up to `top`.
     /// `carried` names the group variant (the program's carried channels).
     #[must_use]
-    pub fn fire_facts(
-        &self,
-        key: [u8; 32],
-        carried: &[u32],
-        load_temp: u64,
-    ) -> engine::program::FireFacts {
+    pub fn pass_bytes(&self, key: [u8; 32], carried: &[u32], load_temp: u64) -> PassBytes {
         let mut by_lanes: BTreeMap<u32, (u64, u64)> = BTreeMap::new();
         // A group's passes (the carried variants): what a fire holds.
         for ((k, _, batch, c), staged) in &self.map {
@@ -294,11 +290,10 @@ impl Stages {
             .map(|&r| bytes(r).saturating_sub(one).div_ceil(u64::from(r - 1)))
             .max()
             .unwrap_or(0);
-        engine::program::FireFacts {
+        PassBytes {
             a_lane,
             fixed: one.saturating_sub(a_lane),
             max_lanes: by_lanes.keys().copied().max().unwrap_or(0),
-            laid: engine::program::LaidLanes::PowerOfTwo,
         }
     }
 
@@ -1266,4 +1261,15 @@ fn commit(
         }
     }
     (StepOutcome::Committed, left)
+}
+
+/// What a pass of a guest program takes beyond the load's own
+/// ([`Stages::pass_bytes`]): `fixed + lanes · a_lane` at every lane rung up
+/// to `max_lanes`, in the runtime's temp outside the state pool. No state
+/// of the pool's (`engine::GuestState`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PassBytes {
+    pub a_lane: u64,
+    pub fixed: u64,
+    pub max_lanes: u32,
 }

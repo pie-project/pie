@@ -253,7 +253,7 @@ impl SharedGrow {
                     // A cap down is taken for the chunks the lower after it
                     // frees, once the patience is out, and at once for the
                     // fit (the span holds no fire wider than the widest
-                    // rung that fits with the programs' fire terms). Within
+                    // rung that fits with the standing bytes). Within
                     // a class it frees nothing and is not taken, however
                     // long the cap stands above what is asked.
                     Ok(RungStep::Cap(tokens)) if tokens < cap && !(forced || (past && waited)) => {
@@ -830,27 +830,16 @@ mod tests {
         );
     }
 
-    /// A program's fire term the largest rung cannot hold cuts fires to
-    /// the widest rung that fits at once, without the governor's patience:
-    /// a fire wider would take more than the span.
+    /// Standing guest bytes the largest rung cannot hold cut fires to the
+    /// widest rung that fits at once, without the governor's patience: a
+    /// fire wider would take more than the span.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_fire_term_past_the_largest_rung_cuts_fires_without_patience() {
+    async fn standing_bytes_past_the_largest_rung_cut_fires_without_patience() {
         const ENGINE: usize = 57;
         let mut pool = super::super::tests::pool();
-        let key = super::super::programs::FireKey {
-            program: ::engine::ProgramId(1),
-            extents: ::engine::BindExtents::default(),
-        };
-        pool.fire_facts_learned(
-            key,
-            &::engine::FireFacts {
-                // 2048's 12 and 8 are past the top rung's span of 12;
-                // 256's 4 and 8 fit it.
-                fixed: 8 * pool.pool().chunk_bytes(),
-                ..::engine::FireFacts::default()
-            },
-        );
-        pool.instance_bound(::engine::InstanceId(1), key);
+        // 2048's 12 and 8 are past the top rung's span of 12; 256's 4 and 8
+        // fit it.
+        pool.standing_stated(8 * pool.pool().chunk_bytes());
         assert_eq!(pool.fit_cap(), 256);
         let shared: Shared = Arc::new(std::sync::Mutex::new(pool));
         let grow = SharedGrow::new(0, ENGINE, shared);

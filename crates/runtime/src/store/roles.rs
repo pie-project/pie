@@ -28,8 +28,23 @@
 //!
 //! [`Engine::adapter_key`]: ::engine::Engine::adapter_key
 //!
+//! A guest program's scratch is state too ([`::engine::GuestState`]): each
+//! instance's, held while it is bound ([`InstanceBinding::scratch`]), and
+//! its (program, extents) pair's, taken at the pair's first bind and given
+//! back at its last close ([`InstanceBinding::pair`]), held as an adapter
+//! is. Either lies in the `Instance` role ([`::engine::ScratchPlace`]): one
+//! run of adjacent slots in a chunk where it fits a chunk's slots, else
+//! whole chunks. Their contents are dead between fires: a park gives them
+//! back and copies nothing, an unpark takes a fresh run or fresh chunks,
+//! and the engine is told where ([`Rebind::Instance`]) before the next
+//! fire.
+//!
 //! An engine that states neither shape has no [`Roles`]: it keeps its
 //! tables and rings itself, as before.
+//!
+//! [`InstanceBinding::scratch`]: ::engine::InstanceBinding::scratch
+//! [`InstanceBinding::pair`]: ::engine::InstanceBinding::pair
+//! [`Rebind::Instance`]: ::engine::Rebind::Instance
 //!
 //! [`Engine::program_facts`]: ::engine::Engine::program_facts
 //! [`Engine::ring_facts`]: ::engine::Engine::ring_facts
@@ -44,10 +59,11 @@ use std::sync::{Arc, Mutex};
 
 use ::engine::chunk::{ShapeId as EngineShape, SlotRole};
 use ::engine::{
-    BoundInstance, ChannelId, ChannelRegistration, Engine, InstanceBinding, InstanceId,
-    ProgramFacts, ProgramId, Rebind, RingFacts, RingSlots,
+    BoundInstance, ChannelId, ChannelRegistration, Engine, GuestState, InstanceBinding,
+    InstanceId, ProgramFacts, ProgramId, Rebind, RingFacts, RingSlots, ScratchPlace,
 };
 
+use super::shared::programs::FireKey;
 use super::shared::{FixedShape, RoleShapes, Shared};
 use super::slots::SlotError;
 
@@ -59,6 +75,9 @@ pub enum Owner {
     Channel(ChannelId),
     /// An adapter, by its content key, shared by the instances that land it.
     Adapter(u128),
+    /// A guest (program, extents) pair's state, shared by its instances
+    /// ([`::engine::GuestState::per_pair`]).
+    Pair(FireKey),
 }
 
 impl Owner {
@@ -105,6 +124,10 @@ pub enum RolesError {
     },
     #[error("the adapter this binding lands is parked with the instances that hold it")]
     AdapterParked,
+    #[error("{0}'s state is parked with the instances that hold it")]
+    PairParked(FireKey),
+    #[error("the device pool has no room for {what}, {bytes} bytes of Instance slots")]
+    GuestShort { what: String, bytes: u64 },
     #[error(
         "no chunk has {slots} adjacent free {role:?} slots for an item that must lie in one run"
     )]
@@ -133,12 +156,24 @@ enum Tier {
 
 /// One role's slots of an item, as refs of the tier the item lies on;
 /// `contiguous`, adjacent in one chunk ([`::engine::Footprint::contiguous`]),
-/// and taken so again on every tier it moves to.
+/// and taken so again on every tier it moves to. Guest scratch, whose
+/// contents are dead between fires, is never copied and holds nothing off
+/// the device (`refs` empty there), fresh room taken when it comes back:
+/// `whole` chunks of slots, or (`run`) one run of that many slots.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Part {
     role: SlotRole,
     refs: Vec<u32>,
     contiguous: bool,
+    whole: u32,
+    run: u32,
+}
+
+impl Part {
+    /// Guest scratch, dead between fires.
+    fn dead(&self) -> bool {
+        self.whole > 0 || self.run > 0
+    }
 }
 
 #[derive(Debug)]
@@ -155,6 +190,8 @@ struct Item {
     channels: Vec<ChannelId>,
     /// An instance: the adapter it holds, by its key.
     adapter: Option<u128>,
+    /// An instance: the guest pair whose state it shares.
+    pair: Option<FireKey>,
     /// A channel or an adapter: the instances bound to it.
     attached: BTreeSet<InstanceId>,
     /// A channel: still registered. An instance: still bound.
@@ -172,6 +209,7 @@ impl Item {
             rings: Vec::new(),
             channels: Vec::new(),
             adapter: None,
+            pair: None,
             attached: BTreeSet::new(),
             open: true,
             stale: false,
@@ -199,6 +237,12 @@ pub struct Taken {
     /// The adapter the binding lands: its key, its slots, and whether they
     /// were taken for it (the first holder) or are another's.
     adapter: Option<(u128, Part, bool)>,
+    /// The guest pair's state: its key, its chunks, and whether they were
+    /// taken for this bind (the pair's first) or are its instances'.
+    pair: Option<(FireKey, Part, bool)>,
+    /// The slots of an `Instance` chunk: a whole part's chunks are its
+    /// refs over it.
+    chunk_slots: u32,
 }
 
 impl Taken {
@@ -223,6 +267,47 @@ impl Taken {
             .as_ref()
             .map_or_else(Vec::new, |(_, part, _)| part.refs.clone())
     }
+
+    /// [`::engine::InstanceBinding::scratch`].
+    #[must_use]
+    pub fn scratch(&self) -> ScratchPlace {
+        scratch(&self.parts).map_or(ScratchPlace::None, |part| place(part, self.chunk_slots))
+    }
+
+    /// [`::engine::InstanceBinding::pair`].
+    #[must_use]
+    pub fn pair(&self) -> ScratchPlace {
+        self.pair
+            .as_ref()
+            .map_or(ScratchPlace::None, |(_, part, _)| place(part, self.chunk_slots))
+    }
+}
+
+/// An instance's scratch: its dead part.
+fn scratch(parts: &[Part]) -> Option<&Part> {
+    parts.iter().find(|part| part.dead())
+}
+
+/// Where a dead part lies: its run's first slot ref and slots, or the
+/// chunks its whole chunks' refs lie in, a chunk each `chunk_slots`.
+fn place(part: &Part, chunk_slots: u32) -> ScratchPlace {
+    let Some(&first) = part.refs.first() else {
+        return ScratchPlace::None;
+    };
+    if part.whole == 0 {
+        return ScratchPlace::Run {
+            first,
+            slots: u32::try_from(part.refs.len()).unwrap_or(u32::MAX),
+        };
+    }
+    let spc = chunk_slots.max(1);
+    ScratchPlace::Chunks(
+        part.refs
+            .iter()
+            .step_by(spc as usize)
+            .map(|&r| r / spc)
+            .collect(),
+    )
 }
 
 /// The slots taken for a channel about to register:
@@ -276,6 +361,8 @@ pub struct Roles {
     /// The host writes held while their instance's slots are parked or
     /// not yet rebound, in the order they were asked.
     held: Vec<(InstanceId, Pump)>,
+    /// The slots of an `Instance` chunk (1 where the pool states none).
+    chunk_slots: u32,
 }
 
 impl Roles {
@@ -283,7 +370,14 @@ impl Roles {
     /// states neither shape.
     #[must_use]
     pub fn new(device: &Shared, host: Option<&Shared>) -> Option<Self> {
-        let shapes = device.lock().unwrap().roles();
+        let (shapes, chunk_slots) = {
+            let pool = device.lock().unwrap();
+            let shapes = pool.roles();
+            let spc = shapes
+                .of(SlotRole::Instance)
+                .map_or(1, |shape| pool.chunk_slots(shape.pool));
+            (shapes, spc)
+        };
         if shapes.is_empty() {
             return None;
         }
@@ -294,6 +388,7 @@ impl Roles {
             programs: HashMap::new(),
             items: HashMap::new(),
             held: Vec::new(),
+            chunk_slots,
         })
     }
 
@@ -314,6 +409,8 @@ impl Roles {
             role,
             refs,
             contiguous,
+            whole: 0,
+            run: 0,
         };
         if slots == 0 {
             return Ok(part(Vec::new()));
@@ -338,6 +435,62 @@ impl Roles {
         }
     }
 
+    /// Room on the device for `bytes` of guest scratch (`what`): one run of
+    /// `Instance` slots in a chunk where they fit a chunk's slots, else
+    /// whole chunks; all or none, refused by name.
+    fn take_scratch(&self, bytes: u64, what: impl Fn() -> String) -> Result<Part, RolesError> {
+        let shape = self.shape(SlotRole::Instance)?;
+        let slot = shape.slot_bytes.max(1);
+        let (whole, run) = if bytes <= u64::from(self.chunk_slots) * slot {
+            (0, u32::try_from(bytes.div_ceil(slot)).unwrap_or(u32::MAX))
+        } else {
+            let chunk = self.device.lock().unwrap().pool().chunk_bytes().max(1);
+            (u32::try_from(bytes.div_ceil(chunk)).unwrap_or(u32::MAX), 0)
+        };
+        let part = Part {
+            role: SlotRole::Instance,
+            refs: Vec::new(),
+            contiguous: true,
+            whole,
+            run,
+        };
+        self.retake(&part).map_err(|_| RolesError::GuestShort {
+            what: what(),
+            bytes,
+        })
+    }
+
+    /// Fresh device room for dead part `like`: its run, or its whole
+    /// chunks, all or none.
+    fn retake(&self, like: &Part) -> Result<Part, RolesError> {
+        let shape = self.shape(SlotRole::Instance)?;
+        let mut pool = self.device.lock().unwrap();
+        let mut refs = Vec::new();
+        let runs = if like.whole > 0 {
+            vec![self.chunk_slots; like.whole as usize]
+        } else {
+            vec![like.run]
+        };
+        for slots in runs {
+            match pool.take_run(shape.pool, u64::from(slots)) {
+                Ok(taken) => refs.extend(taken),
+                Err(_) => {
+                    if !refs.is_empty() {
+                        pool.give_refs(shape.pool, &refs);
+                    }
+                    return Err(RolesError::NoRun {
+                        role: SlotRole::Instance,
+                        slots,
+                    });
+                }
+            }
+        }
+        Ok(Part {
+            refs,
+            ..like.clone()
+        })
+    }
+
     fn give(&self, on: &Shared, parts: &[Part]) {
         let mut pool = on.lock().unwrap();
         for part in parts.iter().filter(|part| !part.refs.is_empty()) {
@@ -347,11 +500,25 @@ impl Roles {
         }
     }
 
-    /// Takes the slots of every part, all or none.
-    fn take_parts(&self, on: &Shared, like: &[Part]) -> Result<Vec<Part>, RolesError> {
+    /// Takes the slots of every part, all or none: a whole part's fresh
+    /// chunks on the device, nothing off it (`device`: `on` is the device).
+    fn take_parts(
+        &self,
+        on: &Shared,
+        like: &[Part],
+        device: bool,
+    ) -> Result<Vec<Part>, RolesError> {
         let mut taken = Vec::with_capacity(like.len());
         for part in like {
-            match self.take(on, part.role, part.refs.len() as u32, part.contiguous) {
+            let took = match (part.dead(), device) {
+                (false, _) => self.take(on, part.role, part.refs.len() as u32, part.contiguous),
+                (true, true) => self.retake(part),
+                (true, false) => Ok(Part {
+                    refs: Vec::new(),
+                    ..part.clone()
+                }),
+            };
+            match took {
                 Ok(part) => taken.push(part),
                 Err(error) => {
                     self.give(on, &taken);
@@ -381,13 +548,16 @@ impl Roles {
     /// registered channel covers (`registered`), its slots of the `Channel`
     /// shape, and for the adapter it lands (`adapter`, its key) the slots
     /// of the `Adapter` shape another instance already holds for that key,
-    /// else fresh ones.
+    /// else fresh ones. A guest program's state ([`GuestState`], of the
+    /// pair `pair`): the instance's scratch, whole `Instance` chunks, and
+    /// the pair's chunks its other instances hold already, else fresh ones.
     pub fn take_instance(
         &mut self,
         program: ProgramId,
         channels: &[ChannelId],
         registered: impl Fn(ChannelId) -> bool,
         adapter: Option<u128>,
+        (pair, state): (FireKey, GuestState),
     ) -> Result<Taken, RolesError> {
         let facts = self
             .programs
@@ -409,6 +579,7 @@ impl Roles {
         let device = Arc::clone(&self.device);
         let mut taken = Taken {
             channels: shared,
+            chunk_slots: self.chunk_slots,
             ..Taken::default()
         };
         let footprint = facts.instance;
@@ -466,6 +637,37 @@ impl Roles {
                 },
             };
         }
+        if state.per_instance > 0 {
+            match self.take_scratch(state.per_instance, || {
+                format!("an instance of {pair}'s scratch")
+            }) {
+                Ok(part) => taken.parts.push(part),
+                Err(error) => {
+                    self.untake(taken);
+                    return Err(error);
+                }
+            }
+        }
+        if state.per_pair > 0 {
+            taken.pair = match self.items.get(&Owner::Pair(pair)) {
+                Some(item) if item.tier == Tier::Device => {
+                    Some((pair, item.parts[0].clone(), false))
+                }
+                Some(_) => {
+                    self.untake(taken);
+                    return Err(RolesError::PairParked(pair));
+                }
+                None => {
+                    match self.take_scratch(state.per_pair, || format!("{pair}'s state")) {
+                        Ok(part) => Some((pair, part, true)),
+                        Err(error) => {
+                            self.untake(taken);
+                            return Err(error);
+                        }
+                    }
+                }
+            };
+        }
         Ok(taken)
     }
 
@@ -473,6 +675,9 @@ impl Roles {
     pub fn untake(&mut self, taken: Taken) {
         self.give(&self.device, &taken.parts);
         if let Some((_, part, true)) = taken.adapter {
+            self.give(&self.device, &[part]);
+        }
+        if let Some((_, part, true)) = taken.pair {
             self.give(&self.device, &[part]);
         }
     }
@@ -500,9 +705,20 @@ impl Roles {
             shared.attached.insert(id);
             item.adapter = Some(key);
         }
+        if let Some((key, part, _)) = taken.pair {
+            let shared = self.items.entry(Owner::Pair(key)).or_insert_with(|| {
+                let mut pair = Item::new(holder, vec![part]);
+                // Held by its instances alone: freed at the last close.
+                pair.open = false;
+                pair
+            });
+            shared.attached.insert(id);
+            item.pair = Some(key);
+        }
         if item.parts.iter().all(|part| part.refs.is_empty())
             && item.channels.is_empty()
             && item.adapter.is_none()
+            && item.pair.is_none()
         {
             return;
         }
@@ -523,6 +739,7 @@ impl Roles {
             .iter()
             .map(|&channel| Owner::Channel(channel))
             .chain(item.adapter.map(Owner::Adapter))
+            .chain(item.pair.map(Owner::Pair))
             .collect();
         self.free_if_done(owner);
         for owner in shared {
@@ -602,7 +819,7 @@ impl Roles {
                         instance(id).is_some_and(|instance| instance.holder == Some(holder))
                     })
             }
-            Owner::Adapter(_) => {
+            Owner::Adapter(_) | Owner::Pair(_) => {
                 item.attached.iter().any(|id| {
                     instance(id).is_some_and(|instance| instance.holder == Some(holder))
                 }) && item.attached.iter().all(|id| {
@@ -618,7 +835,7 @@ impl Roles {
     /// an adapter one of its instances holds.
     fn unparks_with(&self, owner: Owner, item: &Item, holder: Holder) -> bool {
         match owner {
-            Owner::Adapter(_) => item.attached.iter().any(|id| {
+            Owner::Adapter(_) | Owner::Pair(_) => item.attached.iter().any(|id| {
                 self.items
                     .get(&Owner::Instance(*id))
                     .is_some_and(|instance| instance.holder == Some(holder))
@@ -643,7 +860,7 @@ impl Roles {
         let mut items = Vec::new();
         for owner in owners {
             let parts = &self.items[&owner].parts;
-            match self.take_parts(&host, parts) {
+            match self.take_parts(&host, parts, false) {
                 Ok(to) => {
                     self.items.get_mut(&owner).expect("present").tier = Tier::Moving;
                     items.push((owner, to));
@@ -670,7 +887,7 @@ impl Roles {
         let device = Arc::clone(&self.device);
         let mut items: Vec<(Owner, Vec<Part>)> = Vec::new();
         for owner in owners {
-            match self.take_parts(&device, &self.items[&owner].parts) {
+            match self.take_parts(&device, &self.items[&owner].parts, true) {
                 Ok(to) => items.push((owner, to)),
                 Err(error) => {
                     for (_, parts) in &items {
@@ -693,6 +910,10 @@ impl Roles {
         for (owner, to) in &items {
             let from = &self.items[owner].parts;
             for (from, to) in from.iter().zip(to) {
+                // Scratch: dead between fires, nothing to copy.
+                if from.dead() {
+                    continue;
+                }
                 let Some(shape) = self.shapes.of(from.role) else {
                     continue;
                 };
@@ -780,7 +1001,9 @@ impl Roles {
                 }
                 // Its holders on the device; a parked one is rebound when it
                 // unparks.
-                Owner::Adapter(_) if item.stale && self.unparks_with(*owner, item, holder) => {
+                Owner::Adapter(_) | Owner::Pair(_)
+                    if item.stale && self.unparks_with(*owner, item, holder) =>
+                {
                     instances.extend(item.attached.iter().copied().filter(|id| {
                         self.items
                             .get(&Owner::Instance(*id))
@@ -806,6 +1029,14 @@ impl Roles {
                     instance: item.parts.first().map_or_else(Vec::new, |p| p.refs.clone()),
                     rings: own_rings(&item.rings, &item.parts),
                     adapter: self.adapter_refs(item),
+                    scratch: scratch(&item.parts)
+                        .map_or(ScratchPlace::None, |part| place(part, self.chunk_slots)),
+                    pair: item
+                        .pair
+                        .and_then(|key| self.items.get(&Owner::Pair(key)))
+                        .map_or(ScratchPlace::None, |pair| {
+                            place(&pair.parts[0], self.chunk_slots)
+                        }),
                 })
             }))
             .collect()
@@ -858,15 +1089,19 @@ impl Roles {
 
     /// The engine took `owner`'s new slots.
     pub fn rebound(&mut self, owner: Owner) {
-        let adapter = match self.items.get_mut(&owner) {
+        let (adapter, pair) = match self.items.get_mut(&owner) {
             Some(item) => {
                 item.stale = false;
-                item.adapter
+                (item.adapter, item.pair)
             }
-            None => None,
+            None => (None, None),
         };
-        // An instance rebound names its adapter's new slots too.
+        // An instance rebound names its adapter's and its pair's new slots
+        // too.
         if let Some(item) = adapter.and_then(|key| self.items.get_mut(&Owner::Adapter(key))) {
+            item.stale = false;
+        }
+        if let Some(item) = pair.and_then(|key| self.items.get_mut(&Owner::Pair(key))) {
             item.stale = false;
         }
     }
@@ -948,9 +1183,13 @@ pub fn register_channel<T>(
 }
 
 /// Binds `binding` on `engine` over the `Instance` and `Channel` slots its
-/// program's facts state, held for `holder` until the instance closes; a
-/// ring of a channel `registered` names is the channel's. Without `roles`,
-/// `binding` as it is.
+/// program's facts state, and the whole chunks of its guest state
+/// ([`Engine::guest_state`], asked at every bind), held for `holder` until
+/// the instance closes; a ring of a channel `registered` names is the
+/// channel's. A pool short of them refuses the bind by name. Without
+/// `roles`, `binding` as it is: the engine keeps it all itself.
+///
+/// [`Engine::guest_state`]: ::engine::Engine::guest_state
 pub fn bind_instance(
     roles: Option<&RolesHandle>,
     engine: &mut dyn Engine,
@@ -963,16 +1202,24 @@ pub fn bind_instance(
     };
     learn_program(roles, engine, binding.program)?;
     let adapter = engine.adapter_key(binding)?;
+    let state = engine.guest_state(binding.program, &binding.extents)?;
+    let pair = FireKey {
+        program: binding.program,
+        extents: binding.extents,
+    };
     let taken = roles.lock().unwrap().take_instance(
         binding.program,
         &binding.channels,
         registered,
         adapter,
+        (pair, state),
     )?;
     let binding = InstanceBinding {
         instance_slots: taken.instance_slots(),
         ring_slots: taken.ring_slots(),
         adapter_slots: taken.adapter_slots(),
+        scratch: taken.scratch(),
+        pair: taken.pair(),
         ..binding.clone()
     };
     match engine.bind_instance(&binding) {
@@ -1090,3 +1337,6 @@ fn own_rings(rings: &[u32], parts: &[Part]) -> Vec<RingSlots> {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+mod guest_tests;

@@ -1,9 +1,64 @@
-//! The guest term (REDESIGN §6): what a fire takes of the span for the
-//! guest programs it carries, counted for the fire from each open pair's
-//! [`FireFacts`]. The runtime sets it aside at every rung and an engine
-//! that backs its own carve counts the same, both from this one function.
+//! What a fire lays in its span for the guest programs it carries, as
+//! this engine lays it today: the worst fire of a rung's lanes over the
+//! (program, extents) pairs bound, each laid as a flight at the power of
+//! two over its members. The engine's own placement until its guests'
+//! scratch moves into their instances' state (`engine::GuestState`); the
+//! runtime sets nothing of the span aside for it.
 
-use super::{FireFacts, LaidLanes};
+/// The lanes a flight of `members` is laid for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LaidLanes {
+    /// The members themselves.
+    #[default]
+    Exact,
+    /// The power of two over the members.
+    PowerOfTwo,
+}
+
+impl LaidLanes {
+    /// The lanes laid for a flight of `members`.
+    #[must_use]
+    pub fn of(self, members: u64) -> u64 {
+        match self {
+            LaidLanes::Exact => members,
+            LaidLanes::PowerOfTwo if members == 0 => 0,
+            LaidLanes::PowerOfTwo => members.checked_next_power_of_two().unwrap_or(u64::MAX),
+        }
+    }
+}
+
+/// What a fire of one pair's members lays: `fixed + lanes × a_lane`, its
+/// lanes `laid` over the members, capped by `max_lanes` (0: none).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FireFacts {
+    pub a_lane: u64,
+    pub fixed: u64,
+    pub max_lanes: u32,
+    pub laid: LaidLanes,
+}
+
+impl FireFacts {
+    /// The lanes a fire carrying `members` of the pair lays.
+    #[must_use]
+    pub fn lanes(&self, members: u64) -> u64 {
+        let laid = self.laid.of(members);
+        if self.max_lanes == 0 {
+            laid
+        } else {
+            laid.min(u64::from(self.max_lanes))
+        }
+    }
+
+    /// The bytes a fire of `members` of the pair lays; none for none.
+    #[must_use]
+    pub fn bytes(&self, members: u64) -> u64 {
+        if members == 0 {
+            return 0;
+        }
+        self.fixed
+            .saturating_add(self.lanes(members).saturating_mul(self.a_lane))
+    }
+}
 
 /// One open (program, extents) pair of a rung's guest term: the facts the
 /// engine stated for it and the instances of it that can be in a fire

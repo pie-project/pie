@@ -408,6 +408,8 @@ fn an_adapter_lies_in_its_slots() {
                 instance: Vec::new(),
                 rings: Vec::new(),
                 adapter: moved.clone(),
+                scratch: ::engine::ScratchPlace::None,
+                pair: ::engine::ScratchPlace::None,
             })
             .expect("the holder is rebound");
     }

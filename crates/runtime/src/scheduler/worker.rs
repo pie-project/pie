@@ -233,10 +233,6 @@ enum SchedulerItem {
         program: Box<ProgramRegistration>,
         response: tokio::sync::oneshot::Sender<Result<::engine::ProgramId>>,
     },
-    FireFacts {
-        key: crate::store::shared::programs::FireKey,
-        response: tokio::sync::oneshot::Sender<Result<()>>,
-    },
     /// Asks the engine what its standing guest bytes would be once a
     /// binding is bound, and answers what that adds to the pool's booked
     /// total (`store::shared::programs`).
@@ -476,12 +472,6 @@ pub(super) enum QueuedItem {
         program: Box<ProgramRegistration>,
         response: tokio::sync::oneshot::Sender<Result<::engine::ProgramId>>,
     },
-    /// Asks the engine what fires of a program bound at given extents take
-    /// beside the model's activation, for the pool's rung arithmetic.
-    FireFacts {
-        key: crate::store::shared::programs::FireKey,
-        response: tokio::sync::oneshot::Sender<Result<()>>,
-    },
     /// Asks the engine what its standing guest bytes would be once a
     /// binding is bound, and answers what that adds to the pool's booked
     /// total (`store::shared::programs`).
@@ -586,7 +576,8 @@ impl BatchWant {
             return;
         }
         // The reach again, before a raise is waited on toward it: the
-        // programs' fire terms may have moved the widest rung that fits.
+        // engine's standing guest bytes may have moved the widest rung that
+        // fits.
         let Some(shared) = crate::store::registry::try_get(0, engine).and_then(|s| s.shared) else {
             return;
         };
@@ -1085,10 +1076,11 @@ impl SchedulerHandle {
             }
         };
         bind.binding.program = program_id;
-        // The fire term of the program at these extents counts while the
-        // bind is under way, and the activation the fires may take holds it
-        // before the bind is sent (`store::shared::programs`). The engine is
-        // asked the pair's facts once, at its first bind.
+        // The engine's standing guest bytes the bind adds are held while it
+        // is under way, and the activation the fires may take holds them
+        // before the bind is sent (`store::shared::programs`). The program's
+        // scratch is state, taken on the lane at the bind
+        // (`store::roles::bind_instance`).
         let _open = match crate::store::registry::try_get(0, bind.engine_id)
             .and_then(|stores| stores.shared)
         {
@@ -1097,14 +1089,10 @@ impl SchedulerHandle {
                     program: program_id,
                     extents: bind.binding.extents,
                 };
-                if !shared.lock().unwrap().knows_fire(&key) {
-                    self.request(|response| SchedulerItem::FireFacts { key, response })
-                        .await??;
-                }
                 // What the bind adds to the engine's standing guest bytes,
-                // asked on the lane before anything is bound: held with the
-                // term, refused with it by name, and backed with it below
-                // the carve before the bind is sent.
+                // asked on the lane before anything is bound: held, refused
+                // by name where no rung holds it, and backed below the
+                // carve before the bind is sent.
                 let standing = self
                     .request(|response| SchedulerItem::StandingAfter {
                         binding: Box::new(bind.binding.clone()),
@@ -1120,7 +1108,7 @@ impl SchedulerHandle {
                 let engine = bind.engine_id;
                 let pid = pipeline_id.unwrap_or_default();
                 crate::inferlet::process::said(
-                    "bind: the program's fire span",
+                    "bind: the program's standing span",
                     pid,
                     crate::store::shared::programs::fund_span(
                         &shared,
@@ -1130,7 +1118,7 @@ impl SchedulerHandle {
                 )
                 .await
                 .map_err(|why| {
-                    anyhow!("pipeline: a program's fires need a wider activation span: {why}")
+                    anyhow!("pipeline: a program's standing bytes need a wider activation span: {why}")
                 })?;
                 Some(open)
             }
@@ -1340,7 +1328,6 @@ impl BatchScheduler {
                     &mut in_flight_control,
                     &mut frame_policy,
                     &nudge_tx,
-                    engine_id,
                 );
                 progress = true;
             }
@@ -1547,7 +1534,6 @@ impl BatchScheduler {
                         &mut in_flight_control,
                         &mut frame_policy,
                         &nudge_tx,
-                        engine_id,
                     );
                 }
                 tracing::debug!(
@@ -1716,7 +1702,6 @@ impl BatchScheduler {
                     plan, pipeline_id, ..
                 } => format!("PreLaunchCopy({}) pipeline {pipeline_id:?}", plan.label()),
                 QueuedItem::RegisterProgram { .. } => "RegisterProgram".to_string(),
-                QueuedItem::FireFacts { key, .. } => format!("FireFacts({key})"),
                 QueuedItem::StandingAfter { binding, .. } => {
                     format!("StandingAfter(program {})", binding.program)
                 }
@@ -1918,9 +1903,6 @@ impl BatchScheduler {
             SchedulerItem::RegisterProgram { program, response } => {
                 pending.push_back(QueuedItem::RegisterProgram { program, response });
             }
-            SchedulerItem::FireFacts { key, response } => {
-                pending.push_back(QueuedItem::FireFacts { key, response });
-            }
             SchedulerItem::StandingAfter { binding, response } => {
                 pending.push_back(QueuedItem::StandingAfter { binding, response });
             }
@@ -2059,7 +2041,6 @@ impl BatchScheduler {
                 | QueuedItem::HostKv { .. }
                 | QueuedItem::Pool { .. }
                 | QueuedItem::RegisterProgram { .. }
-                | QueuedItem::FireFacts { .. }
                 | QueuedItem::StandingAfter { .. }
         )
     }
@@ -2817,7 +2798,6 @@ impl BatchScheduler {
         in_flight_control: &mut InFlightControls,
         frame_policy: &mut FramePolicy,
         rollback_tx: &SchedTx,
-        engine_id: EngineId,
     ) {
         match reply {
             LaneReply::Launch(result) => {
@@ -2834,7 +2814,6 @@ impl BatchScheduler {
                 instances,
                 frame_policy,
                 rollback_tx,
-                engine_id,
             ),
         }
     }
@@ -2846,7 +2825,6 @@ impl BatchScheduler {
         instances: &mut HashMap<::engine::InstanceId, TrackedInstance>,
         frame_policy: &mut FramePolicy,
         rollback_tx: &SchedTx,
-        engine_id: EngineId,
     ) {
         match commit {
             LaneCommit::None => {}
@@ -2917,13 +2895,6 @@ impl BatchScheduler {
             LaneCommit::CloseInstance { id } => {
                 if let Some(instance) = instances.remove(&id) {
                     instance.close_wait_slots();
-                }
-                // The lane dropped the instance's count; the guest term is
-                // built here, off the lane and outside the pool's lock.
-                if let Some(shared) =
-                    crate::store::registry::try_get(0, engine_id).and_then(|stores| stores.shared)
-                {
-                    crate::store::shared::programs::fit_fire(&shared);
                 }
             }
             LaneCommit::AsyncControl { result } => {

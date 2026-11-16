@@ -1209,19 +1209,8 @@ async fn a_fire_term_appearing_under_a_standing_ask_cuts_fires_at_once() {
     assert_eq!(fire_cap(ENGINE), u32::MAX, "asked and held");
     let fit = {
         let mut pool = shared.lock().unwrap();
-        let key = crate::store::shared::programs::FireKey {
-            program: ::engine::ProgramId(1),
-            extents: ::engine::BindExtents::default(),
-        };
-        let fixed = 55 * pool.pool().chunk_bytes();
-        pool.fire_facts_learned(
-            key,
-            &::engine::FireFacts {
-                fixed,
-                ..::engine::FireFacts::default()
-            },
-        );
-        pool.instance_bound(::engine::InstanceId(1), key);
+        let standing = 55 * pool.pool().chunk_bytes();
+        pool.standing_stated(standing);
         pool.fit_cap()
     };
     assert!(fit < u32::MAX, "the largest rung no longer fits");

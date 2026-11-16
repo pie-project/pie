@@ -184,9 +184,6 @@ fn fail_request(request: LaneRequest, why: &str) {
                 QueuedItem::RegisterProgram { response, .. } => {
                     let _ = response.send(Err(anyhow!("{why}")));
                 }
-                QueuedItem::FireFacts { response, .. } => {
-                    let _ = response.send(Err(anyhow!("{why}")));
-                }
                 QueuedItem::StandingAfter { response, .. } => {
                     let _ = response.send(Err(anyhow!("{why}")));
                 }
@@ -563,7 +560,6 @@ impl Lane {
             | QueuedItem::HostKv { .. }
             | QueuedItem::Pool { .. }
             | QueuedItem::RegisterProgram { .. }
-            | QueuedItem::FireFacts { .. }
             | QueuedItem::StandingAfter { .. } => LaneCommit::None,
         }
     }
@@ -764,19 +760,6 @@ impl Lane {
                 let _ = response.send(registered);
                 LaneCommit::None
             }
-            QueuedItem::FireFacts { key, response } => {
-                let asked = backend(engine).and_then(|engine| {
-                    let facts = engine.fire_facts(key.program, &key.extents)?;
-                    if let Some(shared) =
-                        crate::store::registry::try_get(0, engine_idx).and_then(|s| s.shared)
-                    {
-                        shared.lock().unwrap().fire_facts_learned(key, &facts);
-                    }
-                    Ok(())
-                });
-                let _ = response.send(asked);
-                LaneCommit::None
-            }
             QueuedItem::StandingAfter { binding, response } => {
                 let asked = backend(engine).and_then(|engine| {
                     let total = engine.standing_after(&binding)?;
@@ -843,20 +826,11 @@ impl Lane {
                 }
                 match Self::bind(engine, channels, &bind, roles.as_ref(), pipeline_id) {
                     Ok((bound, standing)) => {
-                        // Its program can be in a fire until it closes, and
-                        // the engine's standing guest bytes are its total.
+                        // The engine's standing guest bytes are its total.
                         if let Some(shared) =
                             crate::store::registry::try_get(0, engine_idx).and_then(|s| s.shared)
                         {
-                            let mut pool = shared.lock().unwrap();
-                            pool.instance_bound(
-                                bound.instance_id,
-                                crate::store::shared::programs::FireKey {
-                                    program: bind.program_id(),
-                                    extents: bind.binding.extents,
-                                },
-                            );
-                            pool.standing_stated(standing);
+                            shared.lock().unwrap().standing_stated(standing);
                         }
                         LaneCommit::BindInstance {
                             pipeline_id,
@@ -984,9 +958,7 @@ impl Lane {
                         if let Some(shared) =
                             crate::store::registry::try_get(0, engine_idx).and_then(|s| s.shared)
                         {
-                            let mut pool = shared.lock().unwrap();
-                            pool.instance_closed(id);
-                            pool.standing_stated(standing);
+                            shared.lock().unwrap().standing_stated(standing);
                         }
                         LaneCommit::CloseInstance { id }
                     }

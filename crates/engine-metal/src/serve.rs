@@ -1858,25 +1858,23 @@ impl Shell {
     }
 
     /// The span's bytes from its end a rung of `to` tokens takes, as the
-    /// runtime counts it: the model's chunks, then one ceil over the guest
-    /// term at the lanes such a fire flies. The term is a fire's
-    /// (`engine::GuestTerm`): what the worst fire of those lanes lays for
-    /// the live (program, extents) pairs, each paying for the members the
-    /// fire gives it and nothing where it gives none.
+    /// engine lays it: the model's chunks, then one ceil over the guest
+    /// scratch at the lanes such a fire flies, the worst fire of those
+    /// lanes over the live (program, extents) pairs, the dearest lanes
+    /// first, each pair no more than it has live.
     fn span_for(&self, to: u32) -> Result<u64> {
         let chunk = self.pools.layout().chunk_bytes.max(1);
         let model = self.arena.rung_reach(to).div_ceil(chunk);
         let most = self.budgets.tokens.max_lanes;
-        let pairs: Vec<engine::FirePair> = self
-            .programs
-            .live_terms()?
-            .into_iter()
-            .map(|(facts, live)| engine::FirePair {
-                facts,
-                live: u32::try_from(live).unwrap_or(u32::MAX),
-            })
-            .collect();
-        let guests = engine::GuestTerm::new(&pairs, most).bytes(to.min(most));
+        let mut pairs = self.programs.live_terms()?;
+        pairs.sort_unstable_by_key(|&(a_lane, _)| std::cmp::Reverse(a_lane));
+        let mut lanes = u64::from(to.min(most));
+        let mut guests = 0u64;
+        for (a_lane, live) in pairs {
+            let take = live.min(lanes);
+            guests = guests.saturating_add(take.saturating_mul(a_lane));
+            lanes -= take;
+        }
         // The batch tables stand under the carve beside the fire term: one
         // ceil over the two, as the runtime backs them.
         let standing = self.programs.batch_bytes();
@@ -2750,8 +2748,8 @@ impl Shell {
                  the span backs {}",
                 program_id.0,
                 self.programs
-                    .fire_facts(program_id, &extents)
-                    .map_or(0, |facts| facts.a_lane),
+                    .lane_scratch(program_id, &extents)
+                    .unwrap_or(0),
                 self.pools.covered()
             );
         }
@@ -2770,14 +2768,17 @@ impl Shell {
         self.programs.rebind_slots(&self.pools, rebind)
     }
 
-    /// What a fire holding lanes of `program_id` bound at `extents` lays
-    /// in the span (`Engine::fire_facts`).
-    pub fn fire_facts(
+    /// What `program_id` bound at `extents` holds as state
+    /// (`Engine::guest_state`), a mechanical port: none, its fires lay
+    /// their lanes' scratch in the span as before (`Shell::span_for`),
+    /// until it moves into the instance's scratch chunks.
+    pub fn guest_state(
         &self,
         program_id: engine::ProgramId,
         extents: &eta_exec::Extents,
-    ) -> Result<engine::FireFacts> {
-        self.programs.fire_facts(program_id, extents)
+    ) -> Result<engine::GuestState> {
+        let _ = self.programs.lane_scratch(program_id, extents)?;
+        Ok(engine::GuestState::default())
     }
 
     /// What an instance of `program_id` holds in pool slots

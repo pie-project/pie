@@ -1473,13 +1473,13 @@ impl Shell {
         shell.programs.set_flight(flight);
         shell.programs.set_fire_lanes(shell.fire_lanes());
         // A program reading `attn.scores` states the planes it switches on
-        // in its term (`engine::FireFacts::fixed`): no load backs them.
+        // in its term (`engine::GuestState::per_pair`): no load backs them.
         let widest = shell.arena.widest_planes(
             std::iter::once(&shell.compiled.arena).chain(shell.compiled.arena_forked.as_ref()),
         );
         shell.programs.set_scores(widest);
         // A program's fires lay their tables and scratch in the span the
-        // runtime widens for them when it binds (`Shell::fire_facts`):
+        // runtime widens for them when it binds (`Shell::guest_state`):
         // nothing is held for them here.
         let programs = 0u64;
         // A plane stored as codes and scales is decoded to bf16 before a

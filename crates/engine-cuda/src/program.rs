@@ -192,7 +192,7 @@ pub struct Plane {
     /// What a fire takes of its span for the pairs bound now, at every
     /// count of lanes ([`Plane::fire_term`]): built when an instance is
     /// bound or closed ([`Plane::fit_term`]), never in a fire.
-    term: engine::GuestTerm,
+    term: crate::guest_term::GuestTerm,
     /// How the last fire laid that span: each group's program, extents and
     /// lanes, in order. A fire that lays it the same finds its bind-time
     /// tables where it staged them.
@@ -203,7 +203,8 @@ pub struct Plane {
 }
 
 /// What a fire of one program at one bind's extents takes of the fire's
-/// span (`engine::Engine::fire_facts`).
+/// span, as this engine lays it; the runtime is told its `fixed` as the
+/// pair's state ([`FireBytes::state`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FireBytes {
     pub a_lane: u64,
@@ -216,17 +217,16 @@ pub struct FireBytes {
 }
 
 /// The lanes a flight of `members` instances is laid for: the power of two
-/// over them, stated to the runtime in `engine::FireFacts::laid`
-/// (`Session::fire_facts`). The lanes laid key what a stage keeps between
+/// over them, the engine's own term's (`crate::guest_term`). The lanes laid key what a stage keeps between
 /// fires: its lane table and descriptor rows are built again, and its
 /// tables staged again, whenever the lanes differ from the last lay
 /// (`launch::Prepared::lay`, and `Plane::fly`'s `laid`). A wave whose
 /// members come and go fire by fire stays in one layout at a power of two,
 /// where the exact count would build and stage the tables every fire. The
 /// guest term counts the same lanes, here and in the runtime
-/// (`engine::GuestTerm`), so a fire never lays more than the term its rung
+/// (`crate::guest_term::GuestTerm`), so a fire never lays more than the term its rung
 /// backs.
-pub const LAID: engine::LaidLanes = engine::LaidLanes::PowerOfTwo;
+pub const LAID: crate::guest_term::LaidLanes = crate::guest_term::LaidLanes::PowerOfTwo;
 
 /// [`LAID`] over a flight's `members`.
 #[must_use]
@@ -235,19 +235,31 @@ pub fn flight_lanes(members: u32) -> u32 {
 }
 
 impl FireBytes {
+    /// What the engine states to the runtime as the pair's state
+    /// (`engine::Engine::guest_state`), a mechanical port of its fire
+    /// facts: `fixed` held once for the pair, nothing per instance. Its
+    /// fires still lay their scratch in the span as before
+    /// ([`Plane::fire_term`]); real per-instance placement replaces both.
+    #[must_use]
+    pub fn state(&self) -> engine::GuestState {
+        engine::GuestState {
+            per_instance: 0,
+            per_pair: self.fixed,
+        }
+    }
+
     /// The bytes `lanes` lanes take.
     #[must_use]
     pub fn at(&self, lanes: u32) -> u64 {
         self.fixed + u64::from(lanes.min(self.max_lanes)) * self.a_lane
     }
 
-    /// The same as the engine states it to the runtime
-    /// (`engine::Engine::fire_facts`), laid as [`Plane::fly`] lays a
-    /// flight's members ([`LAID`]): what the guest term is counted from on
-    /// both sides.
+    /// What a fire of the pair's members lays, as [`Plane::fly`] lays a
+    /// flight's members ([`LAID`]): what the engine's own term is counted
+    /// from ([`crate::guest_term::GuestTerm`]).
     #[must_use]
-    pub fn facts(&self) -> engine::FireFacts {
-        engine::FireFacts {
+    pub fn facts(&self) -> crate::guest_term::FireFacts {
+        crate::guest_term::FireFacts {
             a_lane: self.a_lane,
             fixed: self.fixed,
             max_lanes: self.max_lanes,
@@ -282,7 +294,7 @@ impl Plane {
             span: (0, 0),
             fire_lanes: 0,
             pairs: Vec::new(),
-            term: engine::GuestTerm::default(),
+            term: crate::guest_term::GuestTerm::default(),
             laid: Vec::new(),
             scores: 0,
         }
@@ -359,10 +371,9 @@ impl Plane {
     }
 
     /// What a fire of up to `lanes` lanes takes of its span for the pairs
-    /// bound now, whichever of them its members are of: what the runtime
-    /// keeps free at a rung (`engine::Engine::fire_facts`,
-    /// `engine::GuestTerm`). A fire lays, for each pair it carries, a
-    /// flight as wide as the power of two over the pair's members in it
+    /// bound now, whichever of them its members are of
+    /// (`crate::guest_term::GuestTerm`). A fire lays, for each pair it
+    /// carries, a flight as wide as the power of two over the pair's members in it
     /// (`Plane::fly`), and nothing for a pair it carries none of; the term
     /// is the worst such fire.
     #[must_use]
@@ -376,12 +387,12 @@ impl Plane {
     /// count, and builds the table only where the change shows in it: a
     /// pair's flights grow at 1, 2 and one past each power of two, so a
     /// wave of binds builds it a few times a pair. What a build costs is
-    /// measured in `engine::GuestTerm` (30 pairs of 256 lanes: 39 - 53 us).
+    /// measured in `crate::guest_term::GuestTerm` (30 pairs of 256 lanes: 39 - 53 us).
     fn fit_term(&mut self) {
-        let pairs: Vec<engine::FirePair> = self
+        let pairs: Vec<crate::guest_term::FirePair> = self
             .pairs
             .iter()
-            .map(|(_, _, bytes, bound)| engine::FirePair {
+            .map(|(_, _, bytes, bound)| crate::guest_term::FirePair {
                 facts: bytes.facts(),
                 live: *bound,
             })
@@ -1295,8 +1306,8 @@ mod term_tests {
                     lays,
                     "{n} bound, flights of {max_lanes}"
                 );
-                // And what the runtime counts from the facts stated to it
-                // (`Session::fire_facts`) for `n` members.
+                // And what the engine's term counts from its facts for `n`
+                // members.
                 let stated = bytes.facts();
                 assert_eq!(
                     stated.bytes(u64::from(n)),

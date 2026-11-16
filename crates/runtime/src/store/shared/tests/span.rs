@@ -443,7 +443,6 @@ fn fine_told() -> (SharedPool, FakeEngine) {
 async fn a_small_pass_raises_to_the_rung_covering_it_and_an_idle_pool_lowers_after_patience() {
     const ENGINE: usize = 54;
     let (mut pool, mut engine) = fine_told();
-    pool.set_max_lanes(512);
     assert_eq!(
         walk_segments(&mut pool, 6, 0, &mut engine),
         Retarget::Reached

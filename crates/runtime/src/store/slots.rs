@@ -107,8 +107,8 @@ pub struct SlotPoolFacts {
     /// `(rung tokens, activation chunks)`, ascending. None stated (a load
     /// whose activation lies outside the pool) is one rung of fires of any
     /// tokens whose carve takes no chunk of it, its span the room the load
-    /// backs for it (`act_span`, else none): the guest term is cut and
-    /// refused against that span as against any top rung's.
+    /// backs for it (`act_span`, else none): its readout and standing bytes
+    /// are cut and refused against that span as against any top rung's.
     pub act_chunks: Vec<(u32, u32)>,
     /// The chunks a rung's activation may take as the engine stands
     /// (`ChunkFacts::act_span_chunks`); `None`: nothing of the engine's
@@ -184,10 +184,10 @@ pub enum SlotError {
     Budget { needed: u32, committed: u32 },
     #[error("rung {rung}'s activation takes {chunks} chunks state holds")]
     Occupied { rung: u32, chunks: u32 },
-    /// A rung whose activation, the guest term's included, takes more than
-    /// the top rung's span: never set aside (live state lies below the
-    /// span), so a guest fire is cut to the widest rung that fits
-    /// (`SharedPool::widest_fit`).
+    /// A rung whose activation, its readout rows and the engine's standing
+    /// guest bytes included, takes more than the top rung's span: never set
+    /// aside (live state lies below the span), so fires are cut to the
+    /// widest rung that fits (`SharedPool::widest_fit`).
     #[error("rung {rung}'s activation takes {chunks} chunks, past the top rung's span of {span}")]
     PastSpan { rung: u32, chunks: u32, span: u32 },
     /// A rung whose activation lies in span segments yield gave back under
@@ -475,21 +475,14 @@ pub struct SlotPool {
     shapes: Vec<ShapeState>,
     act_chunks: Vec<(u32, u32)>,
     act: u32,
-    /// What a fire takes for the guest programs it carries, on top of
-    /// every rung's activation ([`Self::act_chunks`]): the term of the
-    /// pairs that can be in a fire ([`::engine::GuestTerm`]).
-    fire: ::engine::GuestTerm,
-    /// The engine's standing guest bytes, beside the fire term below every
-    /// rung's carve ([`Self::set_standing`]).
+    /// The engine's standing guest bytes, below every rung's carve
+    /// ([`Self::set_standing`]).
     standing: u64,
     /// The readout term ([`Self::set_readouts`]): the bytes a row a fire
     /// reads out takes beside the model's activation (0: inside the span),
     /// and the most rows one fire reads out.
     readout_row_bytes: u64,
     readout_rows: u32,
-    /// The most lanes a fire carries (the engine's `FireLimits::max_lanes`):
-    /// a rung of `r` tokens allows `min(r, max_lanes)`.
-    max_lanes: u32,
     /// The largest rung's activation chunks, the top of the range.
     act_max: u32,
     /// The first segment under the largest rung's activation: it and those
@@ -570,11 +563,9 @@ impl SlotPool {
             shapes: facts.shapes.into_iter().map(ShapeState::new).collect(),
             act_chunks,
             act: 0,
-            fire: ::engine::GuestTerm::default(),
             standing: 0,
             readout_row_bytes: 0,
             readout_rows: u32::MAX,
-            max_lanes: u32::MAX,
             act_max,
             top_segment,
             act_span: facts.act_span,
@@ -672,9 +663,10 @@ impl SlotPool {
     }
 
     /// Activation chunks a fire at `rung` tokens takes: the smallest rung at
-    /// or above it, else the largest; with the chunks the guest term takes
-    /// at that rung's lanes ([`Self::set_fire`]) and the engine's standing
-    /// guest bytes ([`Self::set_standing`]), one ceil over the two.
+    /// or above it, else the largest; with the engine's standing guest
+    /// bytes ([`Self::set_standing`]) and the rung's readout rows, one ceil
+    /// over the two. A guest program takes nothing here: its scratch is
+    /// state of its instance (`::engine::GuestState`).
     pub fn act_chunks(&self, rung: u32) -> u32 {
         self.act_chunks
             .iter()
@@ -685,17 +677,13 @@ impl SlotPool {
             })
     }
 
-    /// The chunks the guests take at a rung of `tokens`: what the worst
-    /// fire of `min(tokens, max_lanes)` lanes lays for the pairs open
-    /// ([`::engine::GuestTerm::bytes`]), beside it what the engine keeps
-    /// standing for every live instance whatever the fire, and the rows
-    /// such a fire reads out where they land beside the activation
+    /// The chunks a rung of `tokens` takes beside its carve: what the
+    /// engine keeps standing for every live instance whatever the fire, and
+    /// the rows such a fire reads out where they land beside the activation
     /// ([`Self::readout_bytes`]).
     fn fire_chunks(&self, tokens: u32) -> u32 {
         let bytes = self
-            .fire
-            .bytes(tokens.min(self.max_lanes))
-            .saturating_add(self.standing)
+            .standing
             .saturating_add(self.readout_bytes(tokens));
         u32::try_from(bytes.div_ceil(self.chunk_bytes.max(1))).unwrap_or(u32::MAX)
     }
@@ -712,8 +700,8 @@ impl SlotPool {
     /// The readout term from now on, of the engine's
     /// [`::engine::ReadoutFacts`]: `row_bytes` a row beside the activation
     /// (0: inside the span, no term) for up to `rows` rows a fire (0: no
-    /// bound but the fire's tokens). Nothing moves here, as with
-    /// [`Self::set_fire`].
+    /// bound but the fire's tokens). Nothing moves here: a term that raises
+    /// the rung's need is taken by a raise ([`Self::plan_rung`]).
     pub fn set_readouts(&mut self, row_bytes: u64, rows: u32) {
         self.readout_row_bytes = row_bytes;
         self.readout_rows = if rows == 0 { u32::MAX } else { rows };
@@ -726,40 +714,12 @@ impl SlotPool {
         self.readout_rows
     }
 
-    /// The bytes the guest term takes at the rung fires of `rung` tokens
-    /// take, before they are rounded to chunks.
-    #[must_use]
-    pub fn fire_bytes(&self, rung: u32) -> u64 {
-        self.fire.bytes(self.rung_of(rung).min(self.max_lanes))
-    }
-
-    /// The guest term of the pairs that can be in a fire from now on,
-    /// built for fires of up to [`Self::max_lanes`] lanes. Nothing moves
-    /// here: a term that raises the rung's need is taken by a raise
-    /// ([`Self::plan_rung`], [`Self::apply_rung`]), and one that drops
-    /// gives the room back at the next lower ([`Self::set_rung`]).
-    /// The term it replaces is handed back.
-    pub fn set_fire(&mut self, fire: ::engine::GuestTerm) -> ::engine::GuestTerm {
-        std::mem::replace(&mut self.fire, fire)
-    }
-
-    /// Makes the guest term the one of `pairs` in place
-    /// ([`::engine::GuestTerm::fit`]): whether it changed.
-    pub fn fit_fire(&mut self, pairs: &[::engine::FirePair]) -> bool {
-        self.fire.fit(pairs, self.max_lanes)
-    }
-
-    /// See [`Self::set_fire`].
-    pub fn fire(&self) -> &::engine::GuestTerm {
-        &self.fire
-    }
-
     /// The engine's standing guest bytes from now on
     /// ([`::engine::Engine::standing_after`]): the span bytes it keeps for
     /// the live instances of registered programs beside every fire, with
     /// what the binds under way may add. Set aside below the carve at
     /// every rung ([`Self::act_chunks`]); nothing moves here, as with
-    /// [`Self::set_fire`]. The bytes it replaces are handed back.
+    /// [`Self::set_readouts`]. The bytes it replaces are handed back.
     pub fn set_standing(&mut self, bytes: u64) -> u64 {
         std::mem::replace(&mut self.standing, bytes)
     }
@@ -770,22 +730,11 @@ impl SlotPool {
         self.standing
     }
 
-    /// Whether the guests take nothing of the span at any rung: no fire
-    /// term, nothing standing, and no readout row beside the activation.
+    /// Whether nothing takes the span beside a rung's carve at any rung:
+    /// nothing standing, and no readout row beside the activation.
     #[must_use]
     pub fn guests_zero(&self) -> bool {
-        self.fire.is_zero() && self.standing == 0 && self.readout_row_bytes == 0
-    }
-
-    /// The most lanes a fire carries: the engine's `FireLimits::max_lanes`.
-    pub fn set_max_lanes(&mut self, lanes: u32) {
-        self.max_lanes = lanes.max(1);
-    }
-
-    /// See [`Self::set_max_lanes`].
-    #[must_use]
-    pub fn max_lanes(&self) -> u32 {
-        self.max_lanes
+        self.standing == 0 && self.readout_row_bytes == 0
     }
 
     /// The engine states its activation span covers `chunks` from the
@@ -825,9 +774,9 @@ impl SlotPool {
     }
 
     /// The rung the activation is set aside for now: the largest whose
-    /// chunks it holds, the fire term's included (0 where no rung is
-    /// stated, or where a fire term registered since leaves it holding
-    /// none until a raise).
+    /// chunks it holds, the standing and readout bytes included (0 where
+    /// no rung is stated, or where standing bytes booked since leave it
+    /// holding none until a raise).
     pub fn rung(&self) -> u32 {
         self.act_chunks
             .iter()
@@ -2685,9 +2634,9 @@ mod tests {
         pool.release(Holder::WorkingSet(1), &live, 0);
     }
 
-    /// No rung whose activation, a guest term's included, reaches past the
-    /// top rung's span is set aside: neither raised to nor lowered to, so
-    /// no raise ever has live state in its way (a guest fire is cut to the
+    /// No rung whose activation, its standing bytes included, reaches past
+    /// the top rung's span is set aside: neither raised to nor lowered to,
+    /// so no raise ever has live state in its way (fires are cut to the
     /// widest rung that fits instead, `SharedPool::widest_fit`).
     #[test]
     fn a_rung_whose_activation_reaches_past_the_span_is_never_set_aside() {

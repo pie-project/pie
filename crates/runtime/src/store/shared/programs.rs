@@ -1,56 +1,34 @@
-//! The bound programs' guest term (REDESIGN §6): what a fire holding guest
-//! programs' lanes needs beside the model's activation, each program's
-//! per-batch tables and value scratch, sized by the bind's extents
-//! ([`::engine::Engine::fire_facts`]). A program registers and binds after
-//! load, so the engine cannot state it in [`::engine::chunk::ChunkFacts`];
-//! the pool folds it into every rung's activation instead
-//! ([`super::super::slots::SlotPool::act_chunks`]).
+//! What a bound guest program asks of the activation span beside the
+//! model's carve (REDESIGN §6): nothing of its own. A program's scratch is
+//! state ([`::engine::GuestState`]): each instance's lanes' scratch and its
+//! (program, extents) pair's, whole `Instance` chunks taken at the bind and
+//! held while bound ([`super::super::roles`]), refused or waited on at the
+//! bind like any state and counted by admission. A rung's activation is the
+//! model's carve, the rows a fire reads out where they land beside it, and
+//! the engine's standing guest bytes ([`super::super::slots::SlotPool::act_chunks`]).
 //!
-//! The facts are a pair's, a live (program, extents) ([`FireKey`]); the
-//! term is a fire's ([`::engine::GuestTerm`]): the worst a fire of a rung's
-//! lanes takes whatever pairs its members are of, each pair paying only
-//! for the members a fire gives it. A pair counts from the first bind of
-//! those extents (under way, [`ProgramOpen`], or bound) to the last one's
-//! close. A pair that raises the activation the fires may take now is
-//! taken before its first bind is sent, through the raise a pass's wider
-//! rung takes, its room funded as a planner waiter ([`fund_span`]). Once
-//! the pair's last bind closes its part of the term drops, and the walk's
-//! next lower gives the room back, once every fire cut to the old rung has
-//! retired.
-//!
-//! Beside the term, the engine keeps standing guest bytes in the span for
-//! the live instances of registered programs, whatever the fire (Metal:
-//! the batch tables it lays once a set, every set together;
+//! The engine keeps standing guest bytes in the span for the live
+//! instances of registered programs, whatever the fire (Metal: the batch
+//! tables it lays once a set, every set together;
 //! [`::engine::Engine::standing_after`]). They change only at a bind and a
 //! close, a set shared by instances counted once. A bind asks the engine,
 //! on the lane, what the total would be once it is bound, and holds what
 //! that adds to the total booked ([`ProgramOpen`]) while it is under way:
-//! a total that does not fit the span with the term at the smallest rung
-//! refuses the bind by name before the engine is asked to bind, and one
-//! that does is backed below the carve, at every rung, before the bind is
-//! sent ([`fund_span`]), so the engine lays it in room set aside. The
-//! engine's total after each bind and each close is booked on the lane
+//! a total that does not fit the span at the smallest rung refuses the bind
+//! by name before the engine is asked to bind, and one that does is backed
+//! below the carve, at every rung, before the bind is sent ([`fund_span`]),
+//! so the engine lays it in room set aside. The engine's total after each
+//! bind and each close is booked on the lane
 //! ([`SharedPool::standing_stated`]). Programs are never unregistered, but
 //! a set that no live instance shares any more is given back at the close
 //! that leaves it so.
-//!
-//! The term is a table, built when the pairs change and never in a fire.
-//! No build runs under the pool's lock on a task that waits on nothing
-//! else there, and none on the engine's lane: a bind builds the table it
-//! would leave on its own task, beside the span it funds ([`ProgramOpen`]);
-//! the lane's bind takes over the count that bind held and changes
-//! nothing; a close drops the count on the lane and the scheduler builds
-//! the table at the close's commit ([`fit_fire`]). Until then the pool's
-//! term is the one of before the close, which is never under what a fire
-//! takes.
 
-use std::collections::HashMap;
-
-use ::engine::{BindExtents, FireFacts, FirePair, InstanceId, ProgramId};
+use ::engine::{BindExtents, ProgramId};
 
 use super::{RungRaise, Shared, SharedPool};
 
-/// A fire term's key: a program bound at given extents.
+/// A program bound at given extents: the pair whose state
+/// ([`::engine::GuestState::per_pair`]) its instances share.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FireKey {
     pub program: ProgramId,
@@ -63,22 +41,10 @@ impl std::fmt::Display for FireKey {
     }
 }
 
-/// Each pair's fire facts, and who keeps it counted.
+/// The engine's standing guest bytes and its readout store, as the binds
+/// read them.
 #[derive(Debug, Default)]
 pub struct ProgramFires {
-    facts: HashMap<FireKey, FireFacts>,
-    /// The instances of each pair that can be in a fire: bound, and
-    /// binding (a guard out whose bind the lane has not counted).
-    open: HashMap<FireKey, u32>,
-    /// The guards out for each pair ([`ProgramOpen`]) and, of them, those
-    /// whose count an instance took over ([`SharedPool::instance_bound`]).
-    guards: HashMap<FireKey, (u32, u32)>,
-    instances: HashMap<InstanceId, FireKey>,
-    /// Moves with every change to what the term is built from (a count,
-    /// a pair's facts, the fire's lanes); the pool's term is the one of
-    /// `fitted`.
-    generation: u64,
-    fitted: u64,
     /// The engine's standing guest bytes as it last stated them, after a
     /// bind or a close; and what the binds under way may add to them, each
     /// held by its [`ProgramOpen`].
@@ -90,91 +56,15 @@ pub struct ProgramFires {
     readout_store: Option<u32>,
 }
 
-impl ProgramFires {
-    /// The pairs that can be in a fire now, each with its live instances
-    /// (bound or binding): what the term is built from.
-    fn pairs(&self) -> Vec<FirePair> {
-        self.open
-            .iter()
-            .filter_map(|(key, &live)| {
-                let facts = *self.facts.get(key)?;
-                Some(FirePair { facts, live })
-            })
-            .collect()
-    }
-
-    /// [`Self::pairs`] with one more of `key` counted: what a bind of it
-    /// would leave.
-    fn pairs_with(&self, key: &FireKey) -> Vec<FirePair> {
-        let mut pairs: Vec<FirePair> = self
-            .open
-            .iter()
-            .filter(|(open, _)| *open != key)
-            .filter_map(|(open, &live)| {
-                let facts = *self.facts.get(open)?;
-                Some(FirePair { facts, live })
-            })
-            .collect();
-        if let Some(&facts) = self.facts.get(key) {
-            let live = self.open.get(key).copied().unwrap_or(0) + 1;
-            pairs.push(FirePair { facts, live });
-        }
-        pairs
-    }
-
-    /// One more of `key` can be in a fire.
-    fn count(&mut self, key: FireKey) {
-        *self.open.entry(key).or_default() += 1;
-        self.generation += 1;
-    }
-
-    /// One of `key` less can be in a fire; the pair drops with its last.
-    fn uncount(&mut self, key: FireKey) {
-        let Some(open) = self.open.get_mut(&key) else {
-            return;
-        };
-        *open -= 1;
-        if *open == 0 {
-            self.open.remove(&key);
-        }
-        self.generation += 1;
-    }
-}
-
-/// A pair's own cap on the lanes a fire gives it, as a line shows it:
-/// `FireFacts::max_lanes` of 0 states none, not a cap of no lanes.
-fn own_cap(max_lanes: u32) -> String {
-    if max_lanes == 0 {
-        "no cap of its own".to_owned()
-    } else {
-        max_lanes.to_string()
-    }
-}
-
 impl std::fmt::Display for ProgramFires {
-    /// Every open pair with the facts it counts, pair after pair in the
-    /// keys' order: what a refused submission is read against
-    /// ([`impossible_submission`]).
+    /// The standing bytes booked and pending: what a refused submission is
+    /// read against ([`impossible_submission`]).
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut open: Vec<_> = self.open.iter().collect();
-        open.sort_unstable_by_key(|(key, _)| (key.program.0, format!("{:?}", key.extents)));
-        for (at, (key, live)) in open.into_iter().enumerate() {
-            if at > 0 {
-                f.write_str("; ")?;
-            }
-            match self.facts.get(key) {
-                Some(facts) => write!(
-                    f,
-                    "{key}: live {live}, a_lane {}, fixed {}, max_lanes {}, laid {:?}",
-                    facts.a_lane,
-                    facts.fixed,
-                    own_cap(facts.max_lanes),
-                    facts.laid
-                )?,
-                None => write!(f, "{key}: live {live}, facts not learned")?,
-            }
-        }
-        Ok(())
+        write!(
+            f,
+            "standing {} booked, {} pending",
+            self.standing_booked, self.standing_pending
+        )
     }
 }
 
@@ -183,9 +73,8 @@ impl std::fmt::Display for ProgramFires {
 /// the engine backs, which the rung arithmetic is there to rule out. One
 /// line with what that arithmetic held when it came back: the pool's rung
 /// and the one the engine holds, the cap fires are cut to, the activation
-/// reserved, the rung's own with the term, the term's bytes at that rung,
-/// the span the engine states and the most a rung may take under it, and
-/// every open pair's facts.
+/// reserved, the rung's own, its readout and standing bytes, the span the
+/// engine states and the most a rung may take under it.
 pub fn impossible_submission(engine: usize, error: &::engine::Error) {
     let Some(shared) = crate::store::registry::try_get(0, engine).and_then(|stores| stores.shared)
     else {
@@ -205,32 +94,20 @@ pub fn impossible_submission(engine: usize, error: &::engine::Error) {
         cap = super::fire_cap(engine),
         act_reserved = pool.pool().act_reserved(),
         act_chunks = pool.pool().act_chunks(rung),
-        term_bytes = pool.pool().fire_bytes(rung),
         readout_bytes = pool.pool().readout_bytes(pool.pool().rung_of(rung)),
         standing_bytes = pool.pool().standing(),
         act_span_chunks = %span,
         act_most = pool.act_most(),
-        max_lanes = pool.pool().max_lanes(),
-        terms = %pool.programs,
+        guests = %pool.programs,
         "the engine called a submission impossible"
     );
 }
 
 impl SharedPool {
-    /// The most lanes a fire on the engine carries (`FireLimits::max_lanes`):
-    /// a rung of `r` tokens holds `min(r, lanes)`, and the term is built
-    /// for fires of up to that many.
-    pub fn set_max_lanes(&mut self, lanes: u32) {
-        self.pool.set_max_lanes(lanes);
-        self.programs.generation += 1;
-        self.refit();
-    }
-
     /// The engine's readout facts ([`::engine::Engine::readout_facts`]),
     /// with its own ceiling on the rows a fire reads out
     /// (`FireLimits::max_readouts`, 0: none): every rung counts the rows a
-    /// fire of it reads out beside the guest term where they land beside
-    /// the activation, so fires are cut to the widest rung that holds
+    /// fire of it reads out where they land beside the activation, so fires are cut to the widest rung that holds
     /// them; and a fixed store's rows bound every fire's sequence readouts
     /// and refuse a sequence lane that alone reads more
     /// ([`Self::readouts_refused`]). With `float_lanes` (the model has a
@@ -283,52 +160,33 @@ impl SharedPool {
         })
     }
 
-    /// The engine said fires of `key` need `facts`
-    /// ([`::engine::Engine::fire_facts`]), asked once a pair, before its
-    /// first bind counts: nothing is built here unless the pair is open
-    /// already and its facts differ.
-    pub fn fire_facts_learned(&mut self, key: FireKey, facts: &FireFacts) {
-        let known = self.programs.facts.insert(key, *facts);
-        if known.as_ref() != Some(facts) && self.programs.open.contains_key(&key) {
-            self.programs.generation += 1;
-            self.refit();
-        }
-    }
-
-    /// Whether `key`'s fire facts were asked already.
-    #[must_use]
-    pub fn knows_fire(&self, key: &FireKey) -> bool {
-        self.programs.facts.contains_key(key)
-    }
-
-    /// The chunks a rung's activation may take at most, its guest term
-    /// included: the top rung's span (`act_chunks_max`, below which live
+    /// The chunks a rung's activation may take at most, its readout and
+    /// standing bytes included: the top rung's span (`act_chunks_max`, below which live
     /// state lies at every rung, so no raise ever moves it), and no more
     /// than the engine states its span covers as it stands
     /// (`ChunkFacts::act_span_chunks`), read here at each fit: a span the
     /// engine states anew ([`SlotPool::set_act_span`]) counts from the
-    /// next. A guest fire is cut as the readout term is: to the widest rung
-    /// whose activation and term fit it ([`Self::widest_fit`]).
+    /// next. Fires are cut to the widest rung whose activation fits it
+    /// ([`Self::widest_fit`]).
     #[must_use]
     pub fn act_most(&self) -> u32 {
         let span = self.pool.act_max();
         self.pool.act_span().map_or(span, |stated| stated.min(span))
     }
 
-    /// Whether every rung fits unasked: no pair takes anything and the
-    /// engine states no span of its own, so a rung's activation is the
+    /// Whether every rung fits unasked: nothing stands or reads out beside
+    /// the carve and the engine states no span of its own, so a rung's activation is the
     /// model's, which the pool was built to hold.
     fn fits_unasked(&self) -> bool {
         self.pool.guests_zero() && self.pool.act_span().is_none()
     }
 
-    /// The widest rung whose activation, the guest term of the programs
-    /// that can be in a fire included, is no more than a rung may take
-    /// ([`Self::act_most`]); `None` where even the smallest is. Without a
-    /// term or a stated span, the largest. No rung past it is set aside:
+    /// The widest rung whose activation, its readout rows and the
+    /// standing bytes included, is no more than a rung may take
+    /// ([`Self::act_most`]); `None` where even the smallest is. Without
+    /// either or a stated span, the largest. No rung past it is set aside:
     /// every goal a raise is planned for is cut to it
-    /// ([`Self::rung_for`], [`RungWalk::step`]), so no engine is asked for
-    /// a rung whose term was not held against its span here.
+    /// ([`Self::rung_for`], [`super::RungWalk::step`]).
     #[must_use]
     pub fn widest_fit(&self) -> Option<u32> {
         let rungs = self.pool.rungs();
@@ -342,12 +200,12 @@ impl SharedPool {
             .max()
     }
 
-    /// Whether the guest term leaves no rung room in the top rung's span:
-    /// never where no pair takes anything (a zero term is no term). A pool
-    /// stating no rungs is one rung, its span the room its load backs
-    /// ([`SlotPool::new`]), and is refused the same way.
-    fn term_refused(&self) -> bool {
-        !self.pool.guests_zero() && self.widest_fit().is_none()
+    /// Whether the engine's standing guest bytes leave no rung room in the
+    /// top rung's span: never where nothing stands. A pool stating no rungs
+    /// is one rung, its span the room its load backs
+    /// ([`super::super::slots::SlotPool::new`]), and is refused the same way.
+    fn standing_refused(&self) -> bool {
+        self.pool.standing() > 0 && self.widest_fit().is_none()
     }
 
     /// The widest rung fires may take: [`Self::widest_fit`], the smallest
@@ -377,72 +235,11 @@ impl SharedPool {
         }
     }
 
-    /// The widest cap fires may take with the programs' guest term: the
-    /// widest rung that fits, lifted; `u32::MAX` without a term.
+    /// The widest cap fires may take: the widest rung that fits, lifted;
+    /// `u32::MAX` where nothing stands or reads out beside the carve.
     #[must_use]
     pub fn fit_cap(&self) -> u32 {
         self.lifted(self.fit_rung())
-    }
-
-    /// The engine bound `instance` as `key`: it can be in a fire until it
-    /// closes. The bind that sent it counted the pair already and holds
-    /// that count ([`ProgramOpen`]); the instance takes it over here, so
-    /// the term stands as it is and nothing is built on the lane. Where no
-    /// such bind is left (its task was dropped before the lane reached the
-    /// bind), the instance is counted here and the term built under the
-    /// lock.
-    pub fn instance_bound(&mut self, instance: InstanceId, key: FireKey) {
-        if self.programs.instances.insert(instance, key).is_some() {
-            return;
-        }
-        if let Some((out, taken)) = self.programs.guards.get_mut(&key)
-            && *taken < *out
-        {
-            *taken += 1;
-            return;
-        }
-        self.programs.count(key);
-        self.refit();
-    }
-
-    /// The engine closed `instance`: one of its pair less can be in a
-    /// fire. The count drops here, on the lane; the term is built where
-    /// the close commits ([`fit_fire`]), and until then counts the
-    /// instance still.
-    pub fn instance_closed(&mut self, instance: InstanceId) {
-        if let Some(key) = self.programs.instances.remove(&instance) {
-            self.programs.uncount(key);
-        }
-    }
-
-    /// A bind of `key` is through, either way: the count it held is its
-    /// instance's where the lane bound one, and drops otherwise. Whether
-    /// it dropped (the term is then to be built, [`fit_fire`]).
-    fn guard_back(&mut self, key: FireKey) -> bool {
-        let Some((out, taken)) = self.programs.guards.get_mut(&key) else {
-            return false;
-        };
-        *out -= 1;
-        let kept = *taken > 0;
-        if kept {
-            *taken -= 1;
-        }
-        if *out == 0 {
-            self.programs.guards.remove(&key);
-        }
-        if !kept {
-            self.programs.uncount(key);
-        }
-        !kept
-    }
-
-    /// The term of the pairs open now, built under the lock: for the
-    /// changes no task builds it for ([`Self::set_max_lanes`], facts that
-    /// change under an open pair, an instance no bind holds a count for).
-    pub fn refit(&mut self) {
-        let pairs = self.programs.pairs();
-        self.pool.fit_fire(&pairs);
-        self.programs.fitted = self.programs.generation;
     }
 
     /// What a bind that would leave the engine's standing guest bytes at
@@ -479,12 +276,11 @@ impl SharedPool {
     }
 
     /// Why a bind of `key` is refused: the smallest rung's activation with
-    /// the term the bind would leave and the standing bytes it would hold,
-    /// read while the pool holds both.
+    /// the standing bytes the bind would leave, read while the pool holds
+    /// them.
     fn refusal(&self, key: FireKey) -> String {
         let most = self.act_most();
         let smallest = self.pool.act_chunks(0);
-        let facts = self.programs.facts.get(&key).copied().unwrap_or_default();
         let of = match self.pool.act_span() {
             Some(span) if span <= most => {
                 format!("{span} chunks the engine's activation span covers")
@@ -492,17 +288,15 @@ impl SharedPool {
             _ => format!("{most} of the top rung's span"),
         };
         format!(
-            "{key}'s fires need {} bytes and {} bytes a lane beside the model's \
-             activation, the engine's standing guest bytes would be {} beside every \
-             fire, and the smallest rung would then take {smallest} chunks of the {of}",
-            facts.fixed,
-            facts.a_lane,
+            "{key}'s bind would leave the engine's standing guest bytes at {} beside \
+             every fire, and the smallest rung would then take {smallest} chunks of the {of}",
             self.pool.standing()
         )
     }
 
     /// The chunks the activation lacks for fires of `rows` (the rung that
-    /// holds them, the guest term's included); 0 where it holds them.
+    /// holds them, its readout and standing bytes included); 0 where it
+    /// holds them.
     #[must_use]
     pub fn span_short(&self, rows: u32) -> u32 {
         let rung = self.rung_for(rows);
@@ -512,74 +306,28 @@ impl SharedPool {
     }
 }
 
-/// Makes `shared`'s term the one of the pairs open now: the table is built
-/// outside the pool's lock from the pairs read under it, and installed
-/// only where nothing it was built from changed since (else it is built
-/// again from what stands). What a close's commit and a dropped bind call,
-/// on their own threads; nothing where the term is current.
-pub fn fit_fire(shared: &Shared) {
-    loop {
-        let (pairs, most, generation, mut term) = {
-            let pool = shared.lock().unwrap();
-            if pool.programs.fitted == pool.programs.generation {
-                return;
-            }
-            (
-                pool.programs.pairs(),
-                pool.pool.max_lanes(),
-                pool.programs.generation,
-                pool.pool.fire().clone(),
-            )
-        };
-        term.fit(&pairs, most);
-        let mut pool = shared.lock().unwrap();
-        if pool.programs.generation == generation {
-            pool.pool.set_fire(term);
-            pool.programs.fitted = generation;
-            return;
-        }
-    }
-}
-
-/// A bind of a program at given extents under way: the pair counts one
-/// more while it is held. The lane's bind hands that count to the instance
-/// ([`SharedPool::instance_bound`]), so the guard is dropped once the bind
-/// is through, either way, and gives back only a count no instance took.
+/// A bind of a program at given extents under way: the standing bytes it
+/// may add are held beside the booked total until it is through, either
+/// way.
 pub struct ProgramOpen {
     shared: Shared,
-    key: FireKey,
     /// What the bind may add to the engine's standing guest bytes, held
     /// beside the booked total until the bind is through.
     standing: u64,
 }
 
 impl ProgramOpen {
-    /// One more bind of `key` can be in a fire: the pair counts from now,
-    /// and the `standing` bytes the bind may add to the engine's standing
-    /// guest bytes ([`SharedPool::standing_added`]) are held beside the
-    /// booked total. Refused where even the smallest rung's activation, the
-    /// term and the standing bytes included, is more than a rung may take
-    /// ([`SharedPool::act_most`]: the top rung's span, and no more than the
-    /// engine states its span covers), by the pair's name; a narrower fit
-    /// cuts fires to the widest rung that does
-    /// ([`SharedPool::widest_fit`]).
-    ///
-    /// Every bind is checked so, not only a pair's first: a later bind
-    /// whose extents give a term (with the pairs already open) that fits at
-    /// no rung is refused the same way, by name, the pool untouched (the
-    /// term, the count and the standing bytes as they were). A refused
-    /// bind is never retried at narrower extents here: that is the
-    /// binder's to ask.
-    ///
-    /// The term grows with each bind, so each builds the table it would
-    /// leave: here, on the binding task, outside the pool's lock, from the
-    /// pairs read under it with this one counted. It is installed, with
-    /// the count, in one hold of the pool and only where nothing it was
-    /// built from changed since; a bind refused leaves the pool as it
-    /// found it, its term never seen by a fire.
+    /// The `standing` bytes a bind of `key` may add to the engine's
+    /// standing guest bytes ([`SharedPool::standing_added`]) are held
+    /// beside the booked total. Refused, by the pair's name and the pool as
+    /// it was, where a lane of it reads out more than the engine's readout
+    /// store holds ([`SharedPool::readouts_refused`]), or where even the
+    /// smallest rung's activation with the standing bytes is more than a
+    /// rung may take ([`SharedPool::act_most`]); a narrower fit cuts fires
+    /// to the widest rung that does ([`SharedPool::widest_fit`]). The
+    /// program's own scratch is state, taken at the bind
+    /// ([`super::super::roles::bind_instance`]).
     pub fn new(shared: &Shared, key: FireKey, standing: u64) -> Result<Self, String> {
-        // A lane that alone reads out more than the readout store holds:
-        // no fire seats it, whatever the rung.
         if let Some(why) = shared.lock().unwrap().readouts_refused(&key) {
             return Err(why);
         }
@@ -589,74 +337,35 @@ impl ProgramOpen {
     /// [`Self::new`] for a float pass's bind (a kv-less encoder's or
     /// embedding's): its lanes read out every row they embed through the
     /// engine's readout landing, not its fixed store, so the store refuses
-    /// nothing of it; the term and the standing bytes are held as for any.
+    /// nothing of it; the standing bytes are held as for any.
     pub fn float(shared: &Shared, key: FireKey, standing: u64) -> Result<Self, String> {
         Self::open(shared, key, standing)
     }
 
     fn open(shared: &Shared, key: FireKey, standing: u64) -> Result<Self, String> {
-        loop {
-            let (pairs, most, generation, mut term) = {
-                let pool = shared.lock().unwrap();
-                (
-                    pool.programs.pairs_with(&key),
-                    pool.pool.max_lanes(),
-                    pool.programs.generation,
-                    pool.pool.fire().clone(),
-                )
-            };
-            term.fit(&pairs, most);
-            let mut pool = shared.lock().unwrap();
-            if pool.programs.generation != generation {
-                continue;
-            }
-            let before = pool.pool.set_fire(term);
-            pool.programs.standing_pending += standing;
+        let mut pool = shared.lock().unwrap();
+        pool.programs.standing_pending += standing;
+        pool.sync_standing();
+        if pool.standing_refused() {
+            let why = pool.refusal(key);
+            pool.programs.standing_pending -= standing;
             pool.sync_standing();
-            if pool.term_refused() {
-                let why = pool.refusal(key);
-                pool.pool.set_fire(before);
-                pool.programs.standing_pending -= standing;
-                pool.sync_standing();
-                return Err(why);
-            }
-            let first = !pool.programs.open.contains_key(&key);
-            pool.programs.count(key);
-            pool.programs.fitted = pool.programs.generation;
-            let (out, _) = pool.programs.guards.entry(key).or_default();
-            *out += 1;
-            if first && let Some(facts) = pool.programs.facts.get(&key) {
-                tracing::debug!(
-                    %key,
-                    a_lane = facts.a_lane,
-                    fixed = facts.fixed,
-                    max_lanes = %own_cap(facts.max_lanes),
-                    laid = ?facts.laid,
-                    "a pair's first bind counts its fire facts"
-                );
-            }
-            return Ok(Self {
-                shared: Shared::clone(shared),
-                key,
-                standing,
-            });
+            return Err(why);
         }
+        Ok(Self {
+            shared: Shared::clone(shared),
+            standing,
+        })
     }
 }
 
 impl Drop for ProgramOpen {
     fn drop(&mut self) {
-        let dropped = {
-            let mut pool = self.shared.lock().unwrap();
-            // What the bind added is the engine's total now, booked on the
-            // lane; a bind refused added nothing.
-            pool.programs.standing_pending -= self.standing;
-            pool.sync_standing();
-            pool.guard_back(self.key)
-        };
-        if dropped {
-            fit_fire(&self.shared);
-        }
+        let mut pool = self.shared.lock().unwrap();
+        // What the bind added is the engine's total now, booked on the
+        // lane; a bind refused added nothing.
+        pool.programs.standing_pending -= self.standing;
+        pool.sync_standing();
     }
 }
 
@@ -694,8 +403,8 @@ pub async fn take_raise(
         // it no narrower one, and its activation is what falls short.
         match pool.raise_at(goal) {
             None => {
-                // The engine holds a rung the terms no longer fit: the
-                // walk brings it down first, behind the retire fence.
+                // The engine holds a rung that no longer fits: the walk
+                // brings it down first, behind the retire fence.
                 super::ask_walk(mover.engine());
                 None
             }
@@ -743,8 +452,8 @@ pub async fn take_raise(
 /// apply said it owes ([`SharedPool::raise_applied`]): `set_rung` where the
 /// raise leaves the engine another rung than it holds (it backs its carve
 /// for the wider rung). A raise at the rung the engine holds sends none:
-/// the engine covers a guest term that grew under its rung inside the bind
-/// that grew it. Refused, the raise is taken back
+/// the engine covers standing bytes that grew under its rung inside the
+/// bind that grew them. Refused, the raise is taken back
 /// ([`SharedPool::raise_refused`]) and fires stay at the rung in hand; the
 /// refusal answered. Nothing faults.
 pub async fn carry_raise(
@@ -765,9 +474,8 @@ pub async fn carry_raise(
 }
 
 /// Waits until `shared`'s activation holds what fires may take now, the
-/// fire terms of the programs that can be in a fire included: fires cut to
-/// `cap()` rows, and no wider than the widest rung that fits with the terms
-/// ([`SharedPool::widest_fit`]). Where the span falls short the raise is
+/// engine's standing guest bytes included: fires cut to `cap()` rows, and
+/// no wider than the widest rung that fits ([`SharedPool::widest_fit`]). Where the span falls short the raise is
 /// taken: nothing moves and no room is asked of anyone (idle cache in the
 /// widened span is cleared first, live state never lies there, and the
 /// span is reserved at load: given back only by yield, which the
@@ -776,14 +484,14 @@ pub async fn carry_raise(
 /// rung that fits, or the engine holds a wider rung than that
 /// ([`SharedPool::told_unfit`]), it waits on the walk to cut them and
 /// bring the engine down ([`super::SharedGrow`], asked to look at once:
-/// [`super::ask_walk`]). The engine covers the bind's term at the rung it
-/// holds, so the room is set aside at that rung where it is wider than
-/// the fires' ([`SharedPool::raise_at`]), and the bind is sent only once
-/// that rung fits with the term. What a bind of a program whose term
+/// [`super::ask_walk`]). The engine covers the bind's standing bytes at
+/// the rung it holds, so the room is set aside at that rung where it is
+/// wider than the fires' ([`SharedPool::raise_at`]), and the bind is sent
+/// only once that rung fits with them. What a bind whose standing bytes
 /// raised the span waits on before it is sent; an `Err` refuses the bind.
 ///
-/// At a rung the engine holds, the raise the term asks sends the engine
-/// no notice ([`carry_raise`]).
+/// At a rung the engine holds, the raise sends the engine no notice
+/// ([`carry_raise`]).
 pub async fn fund_span(
     shared: &Shared,
     cap: impl Fn() -> u32,
@@ -800,7 +508,7 @@ pub async fn fund_span(
             let rows = cap();
             let fires = pool.rung_for(rows);
             // Set aside at the rung the engine holds where that is wider:
-            // it covers the bind's term there.
+            // it covers the bind's standing bytes there.
             let goal = pool.raise_at(fires);
             let short = goal.map_or(0, |goal| {
                 pool.pool()
@@ -815,7 +523,7 @@ pub async fn fund_span(
             )
         };
         if goal.is_none() {
-            // The engine holds a rung the terms no longer fit: the walk
+            // The engine holds a rung that no longer fits: the walk
             // brings it down, and tells the rung.
             super::ask_walk(engine);
             watch.await;

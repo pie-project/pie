@@ -58,7 +58,7 @@ fn launches<'a>(
 }
 
 /// A stage's scratch as Metal lays it ([`launches`]): what the kernels'
-/// offsets, `FireFacts::a_lane` and the stride all read, the same at
+/// offsets, `Plane::lane_scratch` and the stride all read, the same at
 /// every call.
 fn layout_of(
     plan: &LaunchStagePlan,

@@ -825,7 +825,7 @@ impl Shell {
     }
 
     /// The lanes a fire of `rung` tokens carries of a guest program, as the
-    /// runtime counts them (`engine::Engine::fire_facts`).
+    /// engine lays them ([`crate::program::Plane::fire_term`]).
     fn program_lanes(&self, rung: u32) -> u32 {
         rung.min(self.fire_lanes())
     }
@@ -865,13 +865,14 @@ impl Shell {
         Ok(())
     }
 
-    /// What a fire of `program` bound at `extents` takes of a fire's span.
-    pub fn fire_facts(
+    /// What `program` bound at `extents` holds as state
+    /// (`engine::Engine::guest_state`).
+    pub fn guest_state(
         &self,
         program: engine::ProgramId,
         extents: eta_exec::Extents,
-    ) -> Result<engine::program::FireFacts> {
-        Ok(self.programs.fire_bytes(program, extents)?.facts())
+    ) -> Result<engine::GuestState> {
+        Ok(self.programs.fire_bytes(program, extents)?.state())
     }
 
     /// What an instance of `program` keeps in the pool's `Instance` and

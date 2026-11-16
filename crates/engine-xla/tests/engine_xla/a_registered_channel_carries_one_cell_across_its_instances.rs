@@ -89,6 +89,7 @@ fn bind(rig: &mut Rig, program: ProgramId, seeded: bool) -> InstanceId {
             ring_slots: Vec::new(),
             adapter_slots: Vec::new(),
             extents: BindExtents::default(),
+            ..Default::default()
         })
         .expect("an instance bound to the registered counter binds")
         .id

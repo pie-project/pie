@@ -2140,20 +2140,23 @@ impl<B: Serve> Shell<B> {
             .any(|plane| plane.captured && plane.classes.contains(class))
     }
 
-    /// What a fire takes beside its rung's carve for the lanes of one
-    /// instance of a program reading `reads` (`(output, lane)` each): a row
+    /// What one instance of a program reading `reads` (`(output, lane)`
+    /// each) holds for score capture, as state (`engine::GuestState`): a row
     /// of every capture plane for each lane a read of which switches score
-    /// capture on, and the planes' alignment once. The switch is the
-    /// runtime's rule: a read sets it where every class writing the output
-    /// holds it in every word.
+    /// capture on, the instance's, and the planes' alignment once, the
+    /// pair's. A mechanical port: a fire still seats the planes under its
+    /// carve in the span as before (`Span::slots`), until they move into
+    /// the instance's scratch chunks. The switch is the runtime's rule: a
+    /// read sets it where every class writing the output holds it in every
+    /// word.
     #[must_use]
-    pub fn capture_term<'a>(
+    pub fn capture_state<'a>(
         &self,
         reads: impl IntoIterator<Item = (&'a str, u32)>,
-    ) -> engine::FireFacts {
+    ) -> engine::GuestState {
         let (a_lane, aligned) = self.span.capture_term();
         if a_lane == 0 {
-            return engine::FireFacts::default();
+            return engine::GuestState::default();
         }
         let classes = self.classes();
         let switches = |name: &str| {
@@ -2176,12 +2179,11 @@ impl<B: Serve> Shell<B> {
             .map(|(_, lane)| lane)
             .collect();
         if lanes.is_empty() {
-            return engine::FireFacts::default();
+            return engine::GuestState::default();
         }
-        engine::FireFacts {
-            a_lane: lanes.len() as u64 * a_lane,
-            fixed: aligned,
-            ..engine::FireFacts::default()
+        engine::GuestState {
+            per_instance: lanes.len() as u64 * a_lane,
+            per_pair: aligned,
         }
     }
 

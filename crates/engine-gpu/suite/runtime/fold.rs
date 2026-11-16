@@ -143,6 +143,7 @@ fn bind_fold(engine: &mut backend::Engine, slots: &mut Slots) -> InstanceId {
                 query_len: ROWS,
                 ..engine::program::BindExtents::default()
             },
+            ..Default::default()
         },
         &channels,
     );

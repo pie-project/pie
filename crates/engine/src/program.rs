@@ -7,10 +7,6 @@ use eta_ir::registry::GeometryClass;
 
 use crate::channel::ChannelSeed;
 
-mod term;
-
-pub use term::{FirePair, GuestTerm};
-
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
 )]
@@ -90,6 +86,15 @@ pub struct InstanceBinding {
     /// program binds none.
     #[serde(default)]
     pub adapter_slots: Vec<u32>,
+    /// Where this instance's lanes' scratch lies
+    /// ([`GuestState::per_instance`]).
+    #[serde(default)]
+    pub scratch: ScratchPlace,
+    /// Where its pair's lies ([`GuestState::per_pair`]): the same on every
+    /// instance of the pair, taken at the pair's first bind and given back
+    /// at its last close.
+    #[serde(default)]
+    pub pair: ScratchPlace,
 }
 
 /// What an instance of a registered program holds in the pool, beside the
@@ -110,99 +115,37 @@ pub struct ProgramFacts {
     pub adapter: Footprint,
 }
 
-/// The lanes an engine lays a guest program's flight of `members` lanes
-/// for, stated in [`FireFacts::laid`]: what a fire of `members` takes of
-/// the span is the bytes of the lanes laid, not of the members in it, so
-/// the term a rung backs counts these lanes.
-#[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
-pub enum LaidLanes {
-    /// The members themselves: each takes its own lane's bytes.
-    #[default]
-    Exact,
-    /// The power of two over the members: the engine keeps one layout of a
-    /// flight's lane tables (or one executable) for every count in a power
-    /// of two, so 170 members are laid as 256.
-    PowerOfTwo,
-}
-
-impl LaidLanes {
-    /// The lanes laid for a flight of `members`.
-    #[must_use]
-    pub fn of(self, members: u64) -> u64 {
-        match self {
-            LaidLanes::Exact => members,
-            // No member lays no lane (the power of two over 0 is 1).
-            LaidLanes::PowerOfTwo if members == 0 => 0,
-            LaidLanes::PowerOfTwo => members.checked_next_power_of_two().unwrap_or(u64::MAX),
-        }
-    }
-}
-
-/// What a fire holding lanes of a program bound at given extents needs
-/// beside the model's own activation (REDESIGN 2.4, §6): the per-batch
-/// tables and value scratch of the program's stage, sized by the binding's
-/// [`BindExtents`] (the same program at 256 and 4096 rows differs 16x).
-///
-/// The facts are a pair's, a (program, extents) bound; the term is a
-/// fire's. A fire of a rung of `r` tokens carries `min(r,
-/// FireLimits::max_lanes)` members in all, split among the pairs open. A
-/// pair given `m ≥ 1` of them (no more than its bound instances) is laid
-/// as `l = min(laid.of(m), max_lanes)` lanes and needs `fixed + l ×
-/// a_lane` bytes; a pair given none needs nothing, its `fixed` neither.
-/// The runtime sets aside, at every rung, what the worst such fire takes
-/// ([`GuestTerm`], [`crate::Engine::fire_facts`]), and an engine that
-/// backs its own carve counts the same, from the same function. A program
-/// registers after load, so `ChunkFacts` cannot state it.
-///
-/// `fixed` is charged to each pair a fire carries. An engine may charge to
-/// it a table it lays once a fire whatever the pairs in it (CUDA: its
-/// wave's rows): the term then counts that table once for every pair
-/// carried where the fire lays it once, an upper bound over what the fire
-/// lays by `(pairs carried − 1) ×` that table.
+/// What a guest program bound at given extents holds in the pool, as state
+/// (REDESIGN §6): the scratch each bound instance keeps for its lanes, and
+/// what the (program, extents) pair keeps once while any instance of it is
+/// bound ([`crate::Engine::guest_state`]). Each lies in the `Instance` role,
+/// taken at the bind and held while bound ([`InstanceBinding::scratch`],
+/// [`InstanceBinding::pair`], [`ScratchPlace`]); no fire takes anything of
+/// the activation span for a program. Their contents are dead between
+/// fires: a park gives them back and an unpark takes fresh room, nothing
+/// copied, the engine told where ([`Rebind::Instance`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FireFacts {
+pub struct GuestState {
+    /// Bytes each bound instance holds for its lanes' scratch.
     #[serde(default)]
-    pub a_lane: u64,
+    pub per_instance: u64,
+    /// Bytes the pair holds once while any instance of it is bound.
     #[serde(default)]
-    pub fixed: u64,
-    /// The most lanes one fire of the program flies (CUDA: its flight, a
-    /// power of two under the SM count); 0: no cap of its own, the fire's
-    /// `FireLimits::max_lanes` only.
-    #[serde(default)]
-    pub max_lanes: u32,
-    /// The lanes the engine lays for a flight's members. The engine states
-    /// it and lays by it; the runtime sizes the term by it and has no rule
-    /// of its own.
-    #[serde(default)]
-    pub laid: LaidLanes,
+    pub per_pair: u64,
 }
 
-impl FireFacts {
-    /// The lanes a fire carrying `members` instances of the program lays:
-    /// [`Self::laid`] over them, capped by [`Self::max_lanes`] where it
-    /// states one.
-    #[must_use]
-    pub fn lanes(&self, members: u64) -> u64 {
-        let laid = self.laid.of(members);
-        if self.max_lanes == 0 {
-            laid
-        } else {
-            laid.min(u64::from(self.max_lanes))
-        }
-    }
-
-    /// The bytes a fire of `members` instances needs for the program; a
-    /// fire that carries none of it needs none, its `fixed` neither.
-    #[must_use]
-    pub fn bytes(&self, members: u64) -> u64 {
-        if members == 0 {
-            return 0;
-        }
-        self.fixed
-            .saturating_add(self.lanes(members).saturating_mul(self.a_lane))
-    }
+/// Where a guest's scratch lies in the pool ([`GuestState`]): bytes that fit
+/// in a chunk's `Instance` slots (its slots times their bytes) as one run of
+/// adjacent slots in one chunk, else whole chunks.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScratchPlace {
+    /// None held.
+    #[default]
+    None,
+    /// `slots` adjacent `Instance` slots from slot ref `first`, in its chunk.
+    Run { first: u32, slots: u32 },
+    /// Whole chunks, by logical chunk id.
+    Chunks(Vec<u32>),
 }
 
 /// Where the rows a fire reads out land ([`ReadoutFacts::landing`]).
@@ -223,7 +166,7 @@ pub enum ReadoutLanding {
 /// ([`crate::Engine::readout_facts`]): a fire bound, never a load
 /// allocation sized at a ceiling. The facts are the engine's, whatever
 /// programs a fire carries: every fire reads out (a plain decode its last
-/// row), so they are no (program, extents) pair's [`FireFacts`].
+/// row), so they are no (program, extents) pair's [`GuestState`].
 ///
 /// The rows one fire's sequence lanes read out (sampled rows: a decode's
 /// last, a verify's block) are at most its tokens, at most the engine's
@@ -320,6 +263,12 @@ pub enum Rebind {
         /// [`InstanceBinding::adapter_slots`].
         #[serde(default)]
         adapter: Vec<u32>,
+        /// Its scratch, as [`InstanceBinding::scratch`].
+        #[serde(default)]
+        scratch: ScratchPlace,
+        /// Its pair's, as [`InstanceBinding::pair`].
+        #[serde(default)]
+        pair: ScratchPlace,
     },
     /// A registered channel's ring (`Channel` slots, as
     /// [`crate::channel::ChannelRegistration::slots`]).

@@ -711,6 +711,7 @@ impl Rig {
                     query_len: rows,
                     ..engine::program::BindExtents::default()
                 },
+                ..Default::default()
             })
             .expect("the instance binds")
             .id

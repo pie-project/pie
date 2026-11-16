@@ -954,13 +954,13 @@ impl Engine for Metal {
         self.loaded()?.program_facts(program).map_err(fault)
     }
 
-    fn fire_facts(
+    fn guest_state(
         &self,
         program: ProgramId,
         extents: &engine::BindExtents,
-    ) -> EngineResult<engine::FireFacts> {
+    ) -> EngineResult<engine::GuestState> {
         self.loaded()?
-            .fire_facts(
+            .guest_state(
                 program,
                 &eta_exec::Extents {
                     row_count: extents.row_count,

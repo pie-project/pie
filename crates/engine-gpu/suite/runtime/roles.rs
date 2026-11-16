@@ -9,7 +9,9 @@ use engine::channel::{ChannelRegistration, ChannelSeed};
 use engine::chunk::{Evacuation, ShapeId, SlotCopy};
 use engine::fire::{Attachment, FrameSubmission, InputFeed, Lane, Readout, Step};
 use engine::load::{Budgets, Checkpoint, LoadRequest, Residency};
-use engine::program::{InstanceBinding, InstanceId, ProgramRegistration, Rebind, RingSlots};
+use engine::program::{
+    InstanceBinding, InstanceId, ProgramRegistration, Rebind, RingSlots, ScratchPlace,
+};
 use engine::transfer::MemoryDomain;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use eta_ir::op::Op;
@@ -336,6 +338,7 @@ fn an_instance_in_pool_slots_fires_through_moves() {
             instance_slots: Vec::new(),
             ring_slots: Vec::new(),
             adapter_slots: Vec::new(),
+            ..Default::default()
         },
         &registered,
     );
@@ -456,6 +459,8 @@ fn an_instance_in_pool_slots_fires_through_moves() {
             instance: binding.instance_slots.clone(),
             rings: binding.ring_slots.clone(),
             adapter: Vec::new(),
+            scratch: ScratchPlace::None,
+            pair: ScratchPlace::None,
         })
         .expect("the slots rebind");
     // The stale pass kept its ids where the cell no longer is: `seen` reads
@@ -540,6 +545,8 @@ fn an_instance_in_pool_slots_fires_through_moves() {
                 })
                 .collect(),
             adapter: Vec::new(),
+            scratch: ScratchPlace::None,
+            pair: ScratchPlace::None,
         })
         .expect("the unparked slots rebind");
     last = before;

@@ -8,7 +8,7 @@ use crate::error::{Error, Result};
 use crate::fire::{FrameId, FrameSubmission, FrameTicket, MediaEncode, Step};
 use crate::load::{LoadRequest, Loaded};
 use crate::program::{
-    BindExtents, BoundInstance, FireFacts, InstanceBinding, InstanceId, ProgramFacts, ProgramId,
+    BindExtents, BoundInstance, GuestState, InstanceBinding, InstanceId, ProgramFacts, ProgramId,
     ProgramRegistration, ReadoutFacts, Rebind, RingFacts,
 };
 use crate::transfer::{KvCopy, KvHandle, StateCopy};
@@ -124,21 +124,19 @@ pub trait Engine: Send {
         Ok(None)
     }
 
-    /// What a fire holding lanes of `program` bound at `extents` needs
-    /// beside the model's activation, asked before the first bind of those
-    /// extents is sent. The facts are the pair's; what a rung backs is a
-    /// fire's ([`crate::GuestTerm`]): the worst fire of the rung's lanes
-    /// over the pairs bound, each paying for the members the fire gives it
-    /// and nothing where it gives none. The default states none.
-    fn fire_facts(&self, program: ProgramId, extents: &BindExtents) -> Result<FireFacts> {
+    /// What `program` bound at `extents` holds as state ([`GuestState`]):
+    /// each instance's scratch and the pair's, taken in the `Instance` role
+    /// at the bind ([`crate::ScratchPlace`]). Asked at every bind, on the lane, before it is sent. The
+    /// default states none.
+    fn guest_state(&self, program: ProgramId, extents: &BindExtents) -> Result<GuestState> {
         let _ = (program, extents);
-        Ok(FireFacts::default())
+        Ok(GuestState::default())
     }
 
     /// What the rows a fire reads out take ([`ReadoutFacts`]): the bytes a
     /// row beside the model's activation, or none where they land inside
     /// the span already, and the rows a fixed store holds, if any. Asked
-    /// once, after load. A sibling of [`Engine::fire_facts`], not a field
+    /// once, after load. A sibling of [`Engine::guest_state`], not a field
     /// of it: every fire reads out, programs or none, so the facts are the
     /// engine's, not a (program, extents) pair's. The default states the
     /// rows inside the span and no store: no term, no bound, nothing
@@ -277,12 +275,8 @@ pub trait Engine: Send {
     /// wider than `to` has retired; a failed notice is logged, not fatal.
     /// Nothing is backed here: the span is backed from the load.
     ///
-    /// A guest term that grows at a standing rung is no rung change and
-    /// sends none: the runtime sets the room aside before it sends the bind
-    /// that grows it, and the engine covers it inside that bind, both
-    /// counting the same [`crate::GuestTerm`]. An engine that cannot cover
-    /// it answers the bind with what it lacks (`Error::Impossible`), and
-    /// the runtime gives the room back when the bind is through.
+    /// A guest program takes nothing of the span: its scratch is state of
+    /// its instance ([`GuestState`]), so a bind sends no rung change.
     fn set_rung(&mut self, from: u32, to: u32) -> Result<()> {
         let _ = (from, to);
         Ok(())

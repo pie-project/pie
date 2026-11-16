@@ -14,8 +14,8 @@
 //! layer each: `ArenaMap::scores_from`) are no part of a rung's carve. The
 //! span is laid for fires that capture nothing; a fire some of whose lanes
 //! capture is seated the planes' rows for those lanes, one a lane, right
-//! under its rung's carve, inside the span (`Engine::fire_facts` states
-//! them to the runtime, which cuts such a fire to a rung they fit beside).
+//! under its rung's carve, inside the span (`Engine::guest_state` states
+//! them to the runtime as the capturing instance's state).
 
 use kernels_slang::Tensor;
 use poem_compiler::{ArenaMap, Budgets, CompiledModel, FireRows, Placement, RowExpr};

@@ -881,16 +881,16 @@ impl Engine for Cuda {
         Ok(readout_facts())
     }
 
-    fn fire_facts(
+    fn guest_state(
         &self,
         program: ProgramId,
         extents: &engine::program::BindExtents,
-    ) -> EngineResult<engine::program::FireFacts> {
+    ) -> EngineResult<engine::GuestState> {
         match self.shell.as_ref() {
             Some(shell) => shell
-                .fire_facts(program, self::extents(extents))
+                .guest_state(program, self::extents(extents))
                 .map_err(fault),
-            None => Ok(engine::program::FireFacts::default()),
+            None => Ok(engine::GuestState::default()),
         }
     }
 

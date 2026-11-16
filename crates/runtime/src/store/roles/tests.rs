@@ -447,6 +447,8 @@ fn a_park_and_unpark_moves_through_the_host_and_rebinds_the_new_refs() {
             slots: now[3..].to_vec(),
         }],
         adapter: Vec::new(),
+        scratch: ::engine::ScratchPlace::None,
+        pair: ::engine::ScratchPlace::None,
     }));
     assert!(engine.rebinds.contains(&Rebind::Channel {
         id: channel,

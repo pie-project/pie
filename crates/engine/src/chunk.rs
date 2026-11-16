@@ -105,8 +105,8 @@ pub struct ChunkFacts {
     #[serde(default)]
     pub tells_rungs: bool,
     /// The chunks from the range's end a rung's activation may take as the
-    /// engine stands, the guest term of its fires included
-    /// ([`crate::GuestTerm`]). `None`: nothing of the engine's own bounds
+    /// engine stands, a fire's readout rows and the engine's standing
+    /// guest bytes included. `None`: nothing of the engine's own bounds
     /// it, and the activation may take every chunk state can move out of.
     /// The runtime sets aside no rung whose activation with the term is
     /// over it (fires are cut to the widest rung under it), and reads it
