@@ -501,7 +501,8 @@ pub fn rates(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Outco
         engine::rates::provenance(
             "metal",
             "each kernel through the dispatch serving runs, back to back in 20 ms frames \
-             timed by the GPU, the matmul over engine::rates::weights_at planes; operands: \
+             timed by the GPU, the matmul over engine::rates::weights_at planes, attention \
+             over engine::rates::attn_sets_at sets; operands: \
              engine::rates' pattern",
         ),
         ("from", format!("\"{}\"", report.used)),

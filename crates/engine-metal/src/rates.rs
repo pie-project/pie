@@ -7,7 +7,8 @@
 //!   engine::rates::weights_at's distinct weights so every one streams from memory, as a fire's do;
 //! * attention: `attn::arbiter::prefill` at [`engine::rates::ATTN_SHAPE`],
 //!   causal, over a bf16 pool of the 16-token pages serving builds, laid
-//!   in engine::rates::attn_page_order's scattered order;
+//!   in engine::rates::attn_page_order's scattered order, each repeat the
+//!   next of engine::rates::attn_sets_at's q / kv sets so each reads cold;
 //! * the scan: `ssm::causal_conv1d_chunked` then `ssm::gated_delta_chunked`
 //!   at [`engine::rates::SCAN_SHAPE`];
 //! * a 256 MiB blit between two buffers (read and write counted), and a
@@ -167,18 +168,32 @@ impl Bench<'_> {
         );
         const PAGE: u32 = 16;
         let pages = keys.div_ceil(PAGE);
-        let slots = pages * PAGE;
-        let kv = (slots * kv_heads * d) as usize;
-        let keys = self.operand(kv as u64 * 2)?;
-        let values = self.operand(kv as u64 * 2)?;
-        let q = self.operand(u64::from(rows * q_heads * d) * 2)?;
+        // The sets each timed fire takes the next of (engine::rates::
+        // attn_sets_at): a served fire reads each layer's q and kv cold, and
+        // one set repeated would sit in the system cache. Every set's pages
+        // lie in one pool plane, scattered over it as a served pool lays a
+        // sequence's (engine::rates::attn_page_order), each set its own q.
+        let sets = u32::try_from(engine::rates::attn_sets_at(shape)).map_err(|e| e.to_string())?;
+        let all = pages * sets;
+        let slots = all * PAGE;
+        let kv = u64::from(slots) * u64::from(kv_heads * d) * 2;
+        let keys = self.operand(kv)?;
+        let values = self.operand(kv)?;
         let out = self.zeroed(u64::from(rows * q_heads * d) * 2)?;
         let positions: Vec<u32> = (0..rows).collect();
-        // The pool pages scattered as a served pool lays a sequence's, the
-        // same order every backend times (engine::rates::attn_page_order).
-        let page_ids: Vec<u32> = engine::rates::attn_page_order(pages);
+        let order: Vec<u32> = engine::rates::attn_page_order(all);
         let le = u32::to_le_bytes;
-        let page_indices = self.buffer(&words(&page_ids, le))?;
+        let mut held = Vec::with_capacity(2 * sets as usize);
+        let mut sets_of = Vec::with_capacity(sets as usize);
+        for set in order.chunks_exact(pages as usize) {
+            let q = self.operand(u64::from(rows * q_heads * d) * 2)?;
+            let ids = self.buffer(&words(set, le))?;
+            sets_of.push((
+                self.tensor(&q, rows, q_heads * d, Dtype::Bf16)?,
+                self.tensor(&ids, pages, 1, Dtype::U32)?,
+            ));
+            held.extend([q, ids]);
+        }
         let page_indptr = self.buffer(&words(&[0, pages], le))?;
         let positions = self.buffer(&words(&positions, le))?;
         let owner = self.buffer(&words(&vec![0u32; rows as usize], le))?;
@@ -188,7 +203,7 @@ impl Bench<'_> {
         let pool = KvPool {
             keys: self.tensor(&keys, slots, kv_heads * d, Dtype::Bf16)?,
             values: self.tensor(&values, slots, kv_heads * d, Dtype::Bf16)?,
-            page_indices: self.tensor(&page_indices, pages, 1, Dtype::U32)?,
+            page_indices: sets_of[0].1,
             page_indptr: self.tensor(&page_indptr, 2, 1, Dtype::U32)?,
             page_size: PAGE as i32,
             seq_stride: u64::from(kv_heads * d),
@@ -205,18 +220,16 @@ impl Bench<'_> {
             mask_enabled: self.tensor(&masked, rows, 1, Dtype::U8)?,
             mask_stride: 0,
         };
-        let q = RaggedTensor {
-            data: self.tensor(&q, rows, q_heads * d, Dtype::Bf16)?,
-            indptr: self.tensor(&q_indptr, 2, 1, Dtype::I32)?,
-        };
+        let indptr = self.tensor(&q_indptr, 2, 1, Dtype::I32)?;
         let o = self.tensor(&out, rows, q_heads * d, Dtype::Bf16)?;
         let scale = 1.0 / (d as f32).sqrt();
-        let seconds = self.timed(&|sink, _| {
+        let seconds = self.timed(&|sink, at| {
+            let (q, page_indices) = sets_of[at as usize % sets_of.len()];
             attn::arbiter::prefill(
                 sink,
-                q,
+                RaggedTensor { data: q, indptr },
                 &plan,
-                &pool,
+                &KvPool { page_indices, ..pool },
                 None,
                 d,
                 kv_heads,
@@ -226,6 +239,7 @@ impl Bench<'_> {
                 self.tuning,
             )
         })?;
+        drop(held);
         Ok(engine::rates::attn_flops(shape) / (seconds * 1e9))
     }
 
