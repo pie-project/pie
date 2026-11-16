@@ -152,6 +152,12 @@ pub struct Seated<'a> {
 
     pub held: Option<u32>,
 
+    /// The lane's set's committed boundary (`KvDelta::folded`, numbered as
+    /// `held`): column `c` of its mask is slot `folded + c`, and the slots
+    /// below it are read under the causal bound and no mask bit. 0 where
+    /// nothing is committed.
+    pub folded: u32,
+
     pub mask: Option<&'a Masking>,
 
     pub adapter: Option<u32>,
@@ -210,6 +216,7 @@ impl<'a> Seated<'a> {
             lane,
             pages: &[],
             held: None,
+            folded: 0,
             mask: None,
             adapter: None,
             positions: &[],
@@ -2055,6 +2062,7 @@ impl Shell {
                 masks.push(crate::mask::LaneMask {
                     mask: None,
                     have: 0,
+                    folded: 0,
                     rows: row.rows,
                     wide: false,
                 });
@@ -2128,6 +2136,7 @@ impl Shell {
             masks.push(crate::mask::LaneMask {
                 mask: kv_mask,
                 have,
+                folded: seated.folded.min(have),
                 rows: row.rows,
                 wide: self.wide.contains(row.class as usize),
             });

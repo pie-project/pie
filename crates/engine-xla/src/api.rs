@@ -1674,6 +1674,7 @@ impl Xla {
                     }) => Some(*have),
                     _ => (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
                 },
+                folded: lane.kv.folded,
                 mask: device[at]
                     .as_ref()
                     .and_then(|resolved| resolved.mask.as_ref())
