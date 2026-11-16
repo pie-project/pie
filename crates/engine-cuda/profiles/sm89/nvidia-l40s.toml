@@ -58,8 +58,10 @@ bf16_flops_per_ns = 249000.0
 # A 256 MiB device-to-device copy counted read plus write (0.821 ms); the
 # vendor's 864 GB/s of GDDR6 is the upper bound (76%).
 bytes_per_ns = 654.0
-# An empty kernel launched back to back, 1000 in a row.
-launch_ns = 1620
+# A kernel's launch inside a captured graph, as serving replays its bodies:
+# 1000 empty kernels in one graph, the graph's time / 1000 (574 ns). Launched
+# one by one on a stream each costs 1620 ns, which no served fire pays.
+launch_ns = 574
 
 [provenance]
 measured = [
