@@ -73,7 +73,7 @@ fn shell(trace: poem::Trace, path: &Path) -> Shell {
         trace,
         contract: &contract,
         checkpoint: path,
-        budget: Budget::new(LANES, 64),
+        budget: Budget::new(LANES, 256),
         patches: None,
         page_size: PAGE,
         context: 256,
@@ -132,10 +132,11 @@ fn reader() -> TraceContainer {
 
 /// No load backs a score plane, and nothing backs the span after the load:
 /// the span the arena states is what it backed, a program reading
-/// `attn.scores` states its planes a row of the fire (`FireFacts::a_row`,
-/// `HEADS × KV_MAX` f32 a layer), and neither its register, its bind nor a
-/// fire that captures the scores it reads maps anything: its programs and
-/// its planes lie in the span.
+/// `attn.scores` states the planes a fire carrying it lays in its term
+/// (`FireFacts::fixed`: the widest carve's, `HEADS × KV_MAX` f32 a lane of
+/// it), and neither its register, its bind nor a fire that captures the
+/// scores it reads maps anything: its programs and its planes lie in the
+/// span, under the decode's carve.
 #[test]
 fn a_score_reader_states_its_planes_and_nothing_backs_them() {
     if !engine_cuda::device::present() {
@@ -210,11 +211,17 @@ fn a_score_reader_states_its_planes_and_nothing_backs_them() {
     let fire = shell
         .fire_facts(program, extents)
         .expect("the reader's fire facts");
-    assert_eq!(
-        fire.a_row,
-        u64::from(HEADS) * KV_MAX * 4,
-        "its planes a row of the fire: one layer's, f32"
+    // The widest carve's planes: a row of `HEADS × KV_MAX` f32 for each of
+    // the fire's lanes, whoever's they are, counted once a fire carrying it.
+    let planes = u64::from(LANES) * u64::from(HEADS) * KV_MAX * 4;
+    let term = fire.bytes(1);
+    assert!(
+        term >= planes,
+        "a reader's term {term} holds the widest fire's planes, {planes}"
     );
+    // The decode below fires only where its programs and planes lie in that
+    // term under its carve, in the span (`Pools::program_span`,
+    // `Arena::fire_slots`): it is refused by name otherwise.
 
     let slots = crate::guest::Guest::of(&facts, segments * facts.segment_chunks).slots(
         &shell.program_facts(program).expect("the program's facts"),

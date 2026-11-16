@@ -165,7 +165,7 @@ impl Shell {
     /// ([`crate::store::Pools::chunk_facts`]).
     pub fn chunk_facts(&mut self) -> crate::Result<engine::chunk::ChunkFacts> {
         let max_tokens = self.budget().max_tokens;
-        let rungs = self.arena.rungs(self.compiled.arena_forked.as_ref(), false);
+        let rungs = self.arena.rungs(self.compiled.arena_forked.as_ref());
         let mut facts = self.pools.chunk_facts(max_tokens, &rungs)?;
         (facts.held_bytes, facts.outside_bytes) = self.held_and_outside();
         Ok(facts)

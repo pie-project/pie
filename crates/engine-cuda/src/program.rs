@@ -95,7 +95,7 @@ fn fire_bytes(stages: &[Option<Prepared>], flight: u32) -> FireBytes {
             .unwrap_or(u32::MAX)
             .min(flight)
             .max(1),
-        a_row: 0,
+        scores: false,
     }
 }
 
@@ -197,9 +197,9 @@ pub struct Plane {
     /// lanes, in order. A fire that lays it the same finds its bind-time
     /// tables where it staged them.
     laid: Vec<(ProgramId, Extents, u32)>,
-    /// What a program reading `attn.scores` takes a row of the fire, and
-    /// once a fire, for the score planes ([`Plane::set_scores`]).
-    scores: (u64, u64),
+    /// What a fire carrying a program that reads `attn.scores` lays for
+    /// the score planes, at the most ([`Plane::set_scores`]).
+    scores: u64,
 }
 
 /// What a fire of one program at one bind's extents takes of the fire's
@@ -210,9 +210,9 @@ pub struct FireBytes {
     pub fixed: u64,
     /// The most lanes one flight carries.
     pub max_lanes: u32,
-    /// The `attn.scores` planes' bytes a row of the fire, where the
-    /// program reads them ([`Plane::set_scores`]): `engine::FireFacts::a_row`.
-    pub a_row: u64,
+    /// The program reads `attn.scores`: its `fixed` counts the planes a
+    /// fire carrying it lays ([`Plane::set_scores`]).
+    pub scores: bool,
 }
 
 /// The lanes a flight of `members` instances is laid for: the power of two
@@ -252,7 +252,6 @@ impl FireBytes {
             fixed: self.fixed,
             max_lanes: self.max_lanes,
             laid: LAID,
-            a_row: self.a_row,
         }
     }
 }
@@ -285,7 +284,7 @@ impl Plane {
             pairs: Vec::new(),
             term: engine::GuestTerm::default(),
             laid: Vec::new(),
-            scores: (0, 0),
+            scores: 0,
         }
     }
 
@@ -308,18 +307,19 @@ impl Plane {
     }
 
     /// A program reading `attn.scores` switches the score planes on in
-    /// every fire it is in: they take `a_row` bytes a row of the fire (a
-    /// row for each of its lanes, at most its tokens) and at most `slack`
-    /// more for their alignment, stated in its pairs' `a_row` and `fixed`.
-    pub fn set_scores(&mut self, a_row: u64, slack: u64) {
-        self.scores = (a_row, slack);
+    /// every fire it is in, a plane's row for every lane of the fire,
+    /// whichever pairs its lanes are of: the term counts them in the
+    /// pair's `fixed`, at `bytes`, the widest carve's planes (its lanes
+    /// and their alignment), so any fire of any rung lays no more.
+    pub fn set_scores(&mut self, bytes: u64) {
+        self.scores = bytes;
     }
 
     /// Whether a pair bound now reads `attn.scores`: a fire then lays the
     /// score planes under its carve and its programs under them.
     #[must_use]
     pub fn scores_bound(&self) -> bool {
-        self.pairs.iter().any(|(_, _, bytes, _)| bytes.a_row > 0)
+        self.pairs.iter().any(|(_, _, bytes, _)| bytes.scores)
     }
 
     /// The fire in hand lays its programs in `span`: its end and the bytes
@@ -352,8 +352,8 @@ impl Plane {
         let (lane, fixed) = Wave::lane_bytes(program.plan.package.channels.len());
         bytes.fixed += lane * u64::from(self.fire_lanes) + fixed + 256;
         if reads_scores(&program.plan) {
-            bytes.a_row = self.scores.0;
-            bytes.fixed += self.scores.1;
+            bytes.scores = true;
+            bytes.fixed += self.scores;
         }
         Ok(bytes)
     }
@@ -1282,7 +1282,7 @@ mod term_tests {
                 a_lane: 455_990,
                 fixed: 1 << 20,
                 max_lanes,
-                a_row: 0,
+                scores: false,
             };
             for n in 1..=256 {
                 let mut plane = Plane::default();
@@ -1314,26 +1314,26 @@ mod term_tests {
         }
     }
 
-    /// A program reading `attn.scores` states the planes a row of the fire
-    /// beside its guest term, and a fire then lays them.
+    /// A program reading `attn.scores` states the planes a fire carrying
+    /// it lays in its `fixed`, and a fire then lays them.
     #[test]
-    fn a_score_reader_states_its_planes_a_row_beside_its_term() {
-        let reader = FireBytes {
-            a_lane: 4096,
-            fixed: 1 << 20,
-            max_lanes: 64,
-            a_row: 196_608,
-        };
-        let stated = reader.facts();
-        assert_eq!(stated.a_row, 196_608, "the planes a row, as stated");
-        // Not in the guest term: the runtime counts it a row of the rung.
-        assert_eq!(stated.bytes(3), reader.at(flight_lanes(3)));
+    fn a_score_reader_states_its_planes_in_its_term() {
         let mut plane = Plane::default();
         plane.set_fire_lanes(64);
+        plane.set_scores(196_608);
+        let reader = FireBytes {
+            a_lane: 4096,
+            fixed: (1 << 20) + 196_608,
+            max_lanes: 64,
+            scores: true,
+        };
         plane.pairs.push((
             ProgramId(1),
             Extents::default(),
-            FireBytes { a_row: 0, ..reader },
+            FireBytes {
+                scores: false,
+                ..reader
+            },
             1,
         ));
         assert!(!plane.scores_bound());
@@ -1341,6 +1341,8 @@ mod term_tests {
             .pairs
             .push((ProgramId(2), Extents::default(), reader, 1));
         assert!(plane.scores_bound(), "a reader bound lays the planes");
+        // One member of the reader alone in a fire: the planes whole.
+        assert!(reader.facts().bytes(1) >= 196_608);
     }
 
     /// The term is a fire's, not a pair's. Fourteen pairs with 256 bound
@@ -1355,7 +1357,7 @@ mod term_tests {
             a_lane: 455_990,
             fixed: 1 << 20,
             max_lanes: 256,
-            a_row: 0,
+            scores: false,
         };
         let mut plane = Plane::default();
         plane.set_fire_lanes(256);

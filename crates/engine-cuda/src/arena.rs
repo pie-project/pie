@@ -14,8 +14,9 @@ use crate::store::Pools;
 /// The span is the largest carve without its `attn.scores` planes: no load
 /// reserves or backs score planes. A fire that captures scores (a program
 /// reading them is in it) lays its planes under its carve, in the room the
-/// runtime sets aside for that program's term (`engine::FireFacts::a_row`),
-/// and a fire whose planes would not lie in the span is refused by name.
+/// runtime sets aside for that program's term (its `engine::FireFacts`
+/// `fixed`, [`Arena::widest_planes`]), and a fire whose planes would not
+/// lie in the span is refused by name.
 #[derive(Debug)]
 pub struct Arena {
     committed: u64,
@@ -49,35 +50,6 @@ pub fn score_values(trace: &poem_ir::Trace) -> Vec<ValueId> {
         .collect()
 }
 
-/// What a fire capturing scores takes of its span for them, as `(bytes a
-/// row of the fire, bytes a fire)`: a row of every `attn.scores` plane for
-/// each lane the fire holds (a plane's rows are the fire's lanes, at most
-/// its tokens), at the width the trace lays it, and the most the planes'
-/// alignment adds. Zero where the trace captures none.
-#[must_use]
-pub fn score_term(trace: &poem_ir::Trace) -> (u64, u64) {
-    let mut planes = 0u64;
-    let row: u64 = score_values(trace)
-        .into_iter()
-        .filter_map(|value| match &trace.values.get(value.0 as usize)?.ty {
-            poem_ir::Ty::Tensor { shape, dtype } => {
-                planes += 1;
-                let width: u64 = shape
-                    .iter()
-                    .skip(1)
-                    .map(|dim| match dim {
-                        poem_ir::Dim::Const(n) => *n,
-                        _ => 1,
-                    })
-                    .product();
-                Some(width * poem_compiler::arena::elem_bytes(*dtype).unwrap_or(4))
-            }
-            _ => None,
-        })
-        .sum();
-    (row, planes * PLANE_ALIGN)
-}
-
 /// The classes whose nodes capture scores.
 #[must_use]
 pub fn scoring_classes(
@@ -97,9 +69,6 @@ pub fn scoring_classes(
     }
     scoring
 }
-
-/// What a plane's offset is aligned to in a carve.
-const PLANE_ALIGN: u64 = 256;
 
 const SCORES: &str = "attn.scores";
 
@@ -134,6 +103,35 @@ impl Arena {
             .iter()
             .map(|&(rung, _)| rung)
             .find(|&rung| u64::from(rung) >= tokens && u64::from(rung) >= lanes)
+    }
+
+    /// The bytes of `map`'s `attn.scores` planes, laid aligned for its
+    /// lanes.
+    #[must_use]
+    pub fn planes(&self, map: &ArenaMap) -> u64 {
+        map.bytes - self.unscored(map)
+    }
+
+    /// The planes a fire of `tokens` tokens carving for `lanes` lanes lays
+    /// under its carve ([`Arena::fire_slots`]), `forked`'s where wider.
+    #[must_use]
+    pub fn planes_at(&self, forked: Option<&ArenaMap>, tokens: u64, lanes: u64) -> u64 {
+        let rung = self
+            .rungs
+            .iter()
+            .find(|(rung, _)| u64::from(*rung) >= tokens && u64::from(*rung) >= lanes)
+            .map_or(0, |(_, map)| self.planes(map));
+        rung.max(forked.map_or(0, |forked| self.planes(forked)))
+    }
+
+    /// The most any of `maps`' carves (the in-order and forked arenas,
+    /// widest of all) lays for its planes.
+    #[must_use]
+    pub fn widest_planes<'a>(&self, maps: impl IntoIterator<Item = &'a ArenaMap>) -> u64 {
+        maps.into_iter()
+            .map(|map| self.planes(map))
+            .max()
+            .unwrap_or(0)
     }
 
     /// Whether a lane of `class` captures scores.
@@ -182,18 +180,12 @@ impl Arena {
 
     /// Each rung's tokens and the bytes of the span under what a fire of
     /// it takes at the top (its carve, or `forked`'s where a fire that forks
-    /// is wider) that state may take at that rung. A carve is its bytes
-    /// without its score planes; with `scored` (a program reading them is
-    /// bound), with them: what lies under the planes.
+    /// is wider) that state may take at that rung, a carve its bytes
+    /// without its score planes: a fire's planes, under it, lie in the
+    /// term the runtime sets aside below.
     #[must_use]
-    pub fn rungs(&self, forked: Option<&ArenaMap>, scored: bool) -> Vec<(u32, u64)> {
-        let size = |map: &ArenaMap| {
-            if scored {
-                map.bytes
-            } else {
-                self.unscored(map)
-            }
-        };
+    pub fn rungs(&self, forked: Option<&ArenaMap>) -> Vec<(u32, u64)> {
+        let size = |map: &ArenaMap| self.unscored(map);
         self.rungs
             .iter()
             .map(|(tokens, _)| {
@@ -225,9 +217,8 @@ impl Arena {
         tokens: u64,
         lanes: u64,
         top: u32,
-        scored: bool,
     ) -> (u32, u64) {
-        self.rungs(forked, scored)
+        self.rungs(forked)
             .into_iter()
             .find(|&(rung, _)| u64::from(rung) >= tokens && u64::from(rung) >= lanes)
             .unwrap_or((top, 0))
@@ -236,8 +227,8 @@ impl Arena {
     /// Every rung's tokens and the bytes under its carve, the whole arena's
     /// (`top` tokens, nothing under it) last.
     #[must_use]
-    pub fn every_rung(&self, forked: Option<&ArenaMap>, top: u32, scored: bool) -> Vec<(u32, u64)> {
-        let mut rungs = self.rungs(forked, scored);
+    pub fn every_rung(&self, forked: Option<&ArenaMap>, top: u32) -> Vec<(u32, u64)> {
+        let mut rungs = self.rungs(forked);
         rungs.push((top, 0));
         rungs
     }
@@ -295,9 +286,9 @@ impl Arena {
     /// carve's score planes lie under the rest of it, inside the span where
     /// it has room for them; else they get no slot. A `scored` fire runs
     /// at its own rung's carve (`Shell::prepare` walks one whose body
-    /// carves wider), so its planes are no more than the term the runtime
-    /// set aside at the rung it cut the fire to; one past the span is a
-    /// wrong count, refused by name, never backed. The place each carve
+    /// carves wider), its planes no more than the widest carve's, which its
+    /// reader's term states; one past the span is a wrong count, refused by
+    /// name, never backed. The place each carve
     /// takes is fixed, so a body recorded at any rung stays good at every
     /// rung its fire fits.
     pub fn fire_slots_at(
@@ -488,7 +479,7 @@ mod tests {
     /// span holds below it. A fire capturing scores lays its rung's planes
     /// under that carve, inside the span, where it has room; one past it is
     /// refused by name; and the planes are no more than the term a program
-    /// reading them states (`a_row` a row of the rung's tokens, `slack`).
+    /// reading them states (the widest carve's planes).
     #[test]
     fn a_scored_carve_lies_in_the_span_its_unscored_top_backs() {
         let (trace, compiled) = compiled();
@@ -509,11 +500,11 @@ mod tests {
         let mut arena = Arena::reserve(span, score_values(&trace)).with_rungs(rungs.clone());
         // What `Arena::back` leaves it at.
         arena.committed = arena.reserved;
-        let (a_row, slack) = score_term(&trace);
-        assert!(a_row > 0);
+        let widest = arena.widest_planes([&compiled.arena]);
+        assert!(widest > 0);
         let scores = score_values(&trace);
         let mut fitted = 0;
-        for (&(tokens, ref map), (stated, under)) in rungs.iter().zip(arena.rungs(None, false)) {
+        for (&(tokens, ref map), (stated, under)) in rungs.iter().zip(arena.rungs(None)) {
             assert_eq!(stated, tokens);
             let unscored = arena.unscored(map);
             assert_eq!(unscored, map.scores_from(&trace));
@@ -523,9 +514,10 @@ mod tests {
                 "{tokens} tokens: what state may take"
             );
             let planes = map.bytes - unscored;
+            assert_eq!(planes, arena.planes(map));
             assert!(
-                planes <= u64::from(tokens) * a_row + slack,
-                "{tokens} tokens: {planes} bytes of planes past the term {a_row} a row, {slack}"
+                planes <= widest,
+                "{tokens} tokens: {planes} bytes of planes past the term's {widest}"
             );
             let rows =
                 poem_compiler::FireRows::text_only(u64::from(tokens), u64::from(tokens.min(4)));
@@ -560,9 +552,7 @@ mod tests {
                     assert!(handle.ptr >= span - unscored);
                 }
             }
-            // With a reader bound, state is stated under the planes.
-            let (_, scored_under) = arena.rung_of(None, u64::from(tokens), 1, 64, true);
-            assert_eq!(scored_under, span - map.bytes);
+            assert_eq!(arena.planes_at(None, u64::from(tokens), 1), planes);
         }
         assert!(fitted > 0, "no rung's planes fit the span");
         // The whole arena's planes lie past the span: its fires are cut.

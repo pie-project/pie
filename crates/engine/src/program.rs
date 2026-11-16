@@ -177,15 +177,6 @@ pub struct FireFacts {
     /// of its own.
     #[serde(default)]
     pub laid: LaidLanes,
-    /// The bytes a pair's fire takes for each row of the fire, whatever
-    /// lanes of it the pair's members are: rows the engine lays for every
-    /// lane (or row) a fire holds once a pair of the program is in it
-    /// (CUDA: the `attn.scores` planes a program reading them switches on,
-    /// a row for every lane of the fire). Not in [`Self::bytes`] nor in
-    /// [`crate::GuestTerm`]: the runtime counts `tokens × max a_row` of
-    /// the pairs open at a rung of `tokens` beside the guest term. 0: none.
-    #[serde(default)]
-    pub a_row: u64,
 }
 
 impl FireFacts {
