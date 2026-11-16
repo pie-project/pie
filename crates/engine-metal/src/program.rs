@@ -1075,6 +1075,177 @@ mod tests {
     use eta_dsl::prelude::*;
     use eta_ir::registry::{Axis, EngineCaps, OutputDecl, Port, PortMask};
 
+    /// Every op that moves elements writes a Bool output: a gather of a
+    /// mask's rows (beam's `inherited = gather(mask, parent)`), a gather of
+    /// a 1-D mask, a row gather and a transpose, each a ring the host reads,
+    /// over two fires with different seeds. An op that skipped a Bool store
+    /// would answer the first fire's bits (or zeros), not the second's.
+    #[test]
+    fn bool_outputs_are_written_by_every_op_that_moves_them() {
+        use crate::store::Pools;
+        const ROWS: u32 = 4;
+        const COLS: u32 = 6;
+        const LONG: u32 = 8;
+        let Ok(context) = Context::bind() else {
+            eprintln!("no device: skipping");
+            return;
+        };
+        let leak = |c: Channel| -> &'static Channel { Box::leak(Box::new(c)) };
+        let rows = leak(Channel::seeded([ROWS, COLS], dtype::bool));
+        let line = leak(Channel::seeded([LONG], dtype::bool));
+        let parent = leak(Channel::seeded([ROWS], dtype::u32));
+        let indptr = leak(Channel::from(vec![0u32, 1]));
+        let gathered = leak(Channel::new([ROWS, COLS], dtype::bool).capacity(1));
+        let picked = leak(Channel::new([ROWS], dtype::bool).capacity(1));
+        let by_row = leak(Channel::new([ROWS], dtype::bool).capacity(1));
+        let flipped = leak(Channel::new([COLS, ROWS], dtype::bool).capacity(1));
+        let vocab = 8u32;
+        let logits = OutputDecl {
+            name: "logits".into(),
+            axis: Axis::Row,
+            width: vocab,
+            dtype: eta_ir::Dtype::F32,
+            layers: 0,
+            readout: true,
+        };
+        let mut b = Builder::new(vocab, 16);
+        b.outputs(vec![vec![logits.clone()]]);
+        b.bind_port(Port::EmbedIndptr, indptr);
+        b.stage(Attach::Epilogue, move || {
+            let mask = rows.take();
+            let flat = line.take();
+            let at = parent.read();
+            gathered.put(gather(&mask, &at));
+            picked.put(gather(&flat, &at));
+            by_row.put(gather_row(&mask, &at));
+            flipped.put(transpose(&mask));
+        });
+        rows.note_host_put();
+        line.note_host_put();
+        for reader in [gathered, picked, by_row, flipped] {
+            reader.note_host_take();
+        }
+        let traced = b.build().expect("the program traces");
+        let bound = eta_ir::validate::bind(
+            traced.container().clone(),
+            vec![vec![logits]],
+            EngineCaps {
+                lora: true,
+                attn_page_mask: true,
+            },
+        )
+        .expect("the program binds");
+        let stages = compile_bound(&bound);
+        let backend = Backend::parse("metal").expect("the metal codegen backend");
+        let registration = ProgramRegistration {
+            program_hash: bound.hash,
+            emitted_kernels: emit_program(backend, &stages, &bound),
+            emitter_version: backend.emitter_version(),
+            launch: eta_compiler::codegen::launch::build(&bound, &stages),
+            ..Default::default()
+        };
+        let order = traced.channel_order();
+        let index = |c: &Channel| -> u32 {
+            let at = order.iter().position(|&gid| gid == c.gid()).expect("a channel");
+            u32::try_from(at).expect("a channel index")
+        };
+        let bits = |v: &[bool]| -> Vec<u8> {
+            let mut out = vec![0u8; v.len().div_ceil(8)];
+            for (k, &bit) in v.iter().enumerate() {
+                if bit {
+                    out[k / 8] |= 1 << (k % 8);
+                }
+            }
+            out
+        };
+        // The parents, each a row of the mask and a column of it.
+        let at = [2u32, 0, 3, 2];
+        let mask_of = |salt: u32| -> Vec<bool> {
+            (0..ROWS * COLS).map(|k| (k * 7 + salt) % 3 == 0).collect()
+        };
+        let line_of = |salt: u32| -> Vec<bool> { (0..LONG).map(|k| (k + salt) % 2 == 0).collect() };
+        let want = |mask: &[bool], line: &[bool]| -> [Vec<u8>; 4] {
+            let (r, c) = (ROWS as usize, COLS as usize);
+            let gathered: Vec<bool> =
+                at.iter().flat_map(|&p| mask[p as usize * c..][..c].to_vec()).collect();
+            let picked: Vec<bool> = at.iter().map(|&p| line[p as usize]).collect();
+            let by_row: Vec<bool> = (0..r).map(|row| mask[row * c + at[row] as usize]).collect();
+            let flipped: Vec<bool> = (0..c * r).map(|k| mask[(k % r) * c + k / r]).collect();
+            [bits(&gathered), bits(&picked), bits(&by_row), bits(&flipped)]
+        };
+
+        let pools = Pools::guests_only(&context, CHUNK, 4).expect("a pool");
+        let mut plane = Plane::new();
+        let program = plane.register(&context, &registration).expect("registers");
+        let facts = plane.facts(program, &pools).expect("the program's facts");
+        let count = bound.container.channels.len();
+        let ids: Vec<ChannelId> = (1..=count as u64).map(ChannelId).collect();
+        let (instance, rings) = slots_for(&pools, &facts, 0);
+        let parents: Vec<u8> = at.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let seeds = vec![
+            (index(indptr), [0u32, 1].iter().flat_map(|v| v.to_le_bytes()).collect()),
+            (index(parent), parents),
+            (index(rows), bits(&mask_of(0))),
+            (index(line), bits(&line_of(0))),
+        ];
+        let id = plane
+            .bind(
+                &context,
+                program,
+                &seeds,
+                Extents {
+                    row_count: 1,
+                    sampled_rows: 1,
+                    query_len: 1,
+                    ..Extents::default()
+                },
+                GeometryClass::Host,
+                PortMask::NONE,
+                &ids,
+                session::Pooled {
+                    pools: &pools,
+                    instance: &instance,
+                    rings: &rings,
+                },
+            )
+            .expect("the instance binds");
+        let logits = crate::device::Buffer::zeroed(&context, u64::from(vocab) * 2).expect("a plane");
+        plane
+            .bind_output(id, "logits", 0, &logits, 0, eta_ir::Dtype::Bf16, vocab, vocab)
+            .expect("the logits bind");
+        let readers = [
+            ("gather of rows", index(gathered)),
+            ("gather of a line", index(picked)),
+            ("gather_row", index(by_row)),
+            ("transpose", index(flipped)),
+        ];
+        let mut wrong = Vec::new();
+        for salt in [0u32, 1] {
+            if salt > 0 {
+                let instance = plane.instance_mut(id).expect("bound");
+                assert!(instance.publish(index(rows), &bits(&mask_of(salt))).expect("a put"));
+                assert!(instance.publish(index(line), &bits(&line_of(salt))).expect("a put"));
+            }
+            let fired = plane
+                .fire(&context, id, Attach::Epilogue, &guests(&context))
+                .expect("the stage fires");
+            assert!(matches!(fired, Fired::Committed), "fire {salt}: {fired:?}");
+            let expected = want(&mask_of(salt), &line_of(salt));
+            for ((name, channel), want) in readers.iter().zip(&expected) {
+                let got = plane
+                    .instance_mut(id)
+                    .expect("bound")
+                    .take(*channel)
+                    .expect("a take")
+                    .expect("a cell");
+                if &got != want {
+                    wrong.push(format!("fire {salt}, {name}: {got:02x?} != {want:02x?}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
     /// The select's mode: top-p at a threshold, or top-k.
     #[derive(Clone, Copy, Debug)]
     enum Cut {
