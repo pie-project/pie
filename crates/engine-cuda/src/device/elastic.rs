@@ -258,8 +258,13 @@ impl PhysicalPool {
             let mut handle: dr::CUmemGenericAllocationHandle = 0;
             // SAFETY: `handle` and `prop` are live locals; the handle is
             // released exactly once, by `release_handle`.
-            let made =
-                unsafe { dr::cuMemCreate(&raw mut handle, bytes as usize, &raw const prop, 0) };
+            let create = |handle: &mut dr::CUmemGenericAllocationHandle| unsafe {
+                dr::cuMemCreate(handle, bytes as usize, &raw const prop, 0)
+            };
+            let mut made = create(&mut handle);
+            if made != dr::CUresult::CUDA_SUCCESS && crate::device::held::release_idle() > 0 {
+                made = create(&mut handle);
+            }
             said("cuMemCreate", made)?;
             Ok(handle)
         }
@@ -505,9 +510,14 @@ impl Arena {
 
             let mut base: *mut core::ffi::c_void = core::ptr::null_mut();
             // SAFETY: a live out-parameter; freed exactly once, in `Drop`.
-            crate::device::ctx::check("cudaMalloc", unsafe {
-                rt::cudaMalloc(&raw mut base, self.virtual_bytes as usize)
-            })?;
+            let allocate = |base: &mut *mut core::ffi::c_void| unsafe {
+                rt::cudaMalloc(base, self.virtual_bytes as usize)
+            };
+            let mut made = allocate(&mut base);
+            if made != rt::cudaError::cudaSuccess && crate::device::held::release_idle() > 0 {
+                made = allocate(&mut base);
+            }
+            crate::device::ctx::check("cudaMalloc", made)?;
             self.base = base as u64;
             self.units.fill(Some(FLAT));
             self.mapped = self.units.len() as u64;
