@@ -135,7 +135,7 @@ mod tests {
         // No feasible rung at all: the ruling's refusal, with the binding.
         let none = facts(&[(1024, 300 * MIB)], 200 * MIB);
         let rated = profile(
-            "api = 1\n[rates]\nbf16_flops_per_ns_by_rows_and_depth = [[4096, 4096, 1.0]]\nattn_flops_per_ns_by_keys_and_dim = [[2048, 128, 1.0]]\nbytes_per_ns = 1.0\n",
+            "api = 1\n[rates]\nbf16_flops_per_ns_by_rows_n_k = [[4096, 4096, 4096, 1.0]]\nattn_flops_per_ns_by_keys_and_dim = [[2048, 128, 1.0]]\nbytes_per_ns = 1.0\n",
         );
         let err = choose(&none, 1 << 33, &rated, "Card X", &counts(), 200 * MIB).unwrap_err();
         assert!(

@@ -11,10 +11,11 @@
 //!
 //! Every shape is `engine::rates`' lattice, and its counts turn the times
 //! into rates, so the CUDA and ROCm rates mean what every backend's do:
-//! - `bf16_flops_per_ns_by_rows_and_depth`: the matmul `m x k x k` at each
-//!   row count of [`LATTICE_ROWS`] and depth of [`DEPTHS`] through `linear::gemm` (cuBLAS(Lt) on CUDA,
+//! - `bf16_flops_per_ns_by_rows_n_k`: the matmul `m x n x k` at each row
+//!   count of [`LATTICE_ROWS`] and each column count and depth of [`DEPTHS`]
+//!   through `linear::gemm` (cuBLAS(Lt) on CUDA,
 //!   hipBLASLt/rocBLAS on ROCm) under the GEMM tactics serving runs; its
-//!   launches rotate through `engine::rates::weights_at` weight planes, `engine::rates::WEIGHT_BYTES`
+//!   launches rotate through `engine::rates::weights_at(n, k)` weight planes, `engine::rates::WEIGHT_BYTES`
 //!   of them, several times what any last-level cache holds, so each reads
 //!   its weight from device memory as a layer's does.
 //! - `attn_flops_per_ns_by_keys`: the paged prefill attention at
@@ -273,7 +274,7 @@ mod on_device {
         let launch = launch(device.ctx(), stream, &clock, &mut held)?;
         device.synchronize().map_err(say("the device"))?;
         Ok(Rates {
-            bf16_flops_per_ns_by_rows_and_depth: Some(grid),
+            bf16_flops_per_ns_by_rows_n_k: Some(grid),
             attn_flops_per_ns_by_keys_and_dim: Some(attn),
             scan_elements_per_ns: Some(scan),
             bytes_per_ns: Some(bytes),
@@ -287,27 +288,29 @@ mod on_device {
         clock: &Clock,
         random: &Random,
         held: &mut Vec<Buffer>,
-    ) -> Result<Vec<(u32, u32, f64)>, String> {
-        let mut grid = Vec::with_capacity(LATTICE_ROWS.len() * DEPTHS.len());
+    ) -> Result<Vec<(u32, u32, u32, f64)>, String> {
+        let mut grid = Vec::with_capacity(LATTICE_ROWS.len() * DEPTHS.len() * DEPTHS.len());
         for &k in &DEPTHS {
-            grid.extend(gemm_at(ctx, clock, random, held, k)?);
+            for &n in &DEPTHS {
+                grid.extend(gemm_at(ctx, clock, random, held, n, k)?);
+            }
         }
         Ok(grid)
     }
 
-    /// The matmul `m x k x k` at every row count of the lattice.
+    /// The matmul `m x n x k` at every row count of the lattice.
     fn gemm_at(
         ctx: &Ctx,
         clock: &Clock,
         random: &Random,
         held: &mut Vec<Buffer>,
+        n: u32,
         k: u32,
-    ) -> Result<Vec<(u32, u32, f64)>, String> {
-        let n = k;
+    ) -> Result<Vec<(u32, u32, u32, f64)>, String> {
         let most = *LATTICE_ROWS.last().expect("rows") as usize;
         let act = random.operand(most * k as usize * 2)?;
         let y = zeroed(most * n as usize * 2)?;
-        let planes = weights_at(k);
+        let planes = weights_at(n, k);
         let weights = (0..planes)
             .map(|_| random.operand(n as usize * k as usize * 2))
             .collect::<Result<Vec<Buffer>, String>>()?;
@@ -323,7 +326,7 @@ mod on_device {
             };
             lay(held, || fire(0))?;
             let ns = clock.burst(ROUNDS, &mut |i| fire(i).map_err(say("the matmul")))?;
-            curve.push((m, k, engine::rates::gemm_flops(m, k) / ns));
+            curve.push((m, n, k, engine::rates::gemm_flops(m, n, k) / ns));
         }
         Ok(curve)
     }

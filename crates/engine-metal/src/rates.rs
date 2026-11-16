@@ -126,14 +126,14 @@ impl Bench<'_> {
 
     /// An `m × k × k` matmul's rate, each repeat over the next of `weights`
     /// (`k × k` each).
-    fn matmul_flops(&self, m: u32, k: u32, weights: &[Tensor]) -> Result<f64, String> {
+    fn matmul_flops(&self, m: u32, n: u32, k: u32, weights: &[Tensor]) -> Result<f64, String> {
         let (a, y) = (
             self.zeroed(u64::from(m) * u64::from(k) * 2)?,
-            self.zeroed(u64::from(m) * u64::from(k) * 2)?,
+            self.zeroed(u64::from(m) * u64::from(n) * 2)?,
         );
         let (at, yt) = (
             self.tensor(&a, m, k, Dtype::Bf16)?,
-            self.tensor(&y, m, k, Dtype::Bf16)?,
+            self.tensor(&y, m, n, Dtype::Bf16)?,
         );
         // Each repeat reads the next weight: serving streams a layer's from
         // memory, and one weight repeated would sit in the system cache,
@@ -147,7 +147,7 @@ impl Bench<'_> {
                 yt,
             )
         })?;
-        Ok(engine::rates::gemm_flops(m, k) / (seconds * 1e9))
+        Ok(engine::rates::gemm_flops(m, n, k) / (seconds * 1e9))
     }
 
     fn attention_flops(&self, shape: AttnShape) -> Result<f64, String> {
@@ -333,26 +333,29 @@ pub fn measure(
         pipelines: Pipelines::new(),
         tuning: &tuning,
     };
-    let mut grid = Vec::with_capacity(LATTICE_ROWS.len() * DEPTHS.len());
-    for k in DEPTHS {
+    let mut grid = Vec::with_capacity(LATTICE_ROWS.len() * DEPTHS.len() * DEPTHS.len());
+    for (k, n) in DEPTHS
+        .iter()
+        .flat_map(|&k| DEPTHS.iter().map(move |&n| (k, n)))
+    {
         // The planes every backend rotates through (engine::rates::weights_at:
         // 768 MiB, at least 12), each its own memory so each repeat streams
         // its weight as a layer's matmul does; one noise plane fills them.
-        let noise = bf16_noise((k * k) as usize, 7 + u64::from(k), 0.05);
-        let weights = (0..engine::rates::weights_at(k))
+        let noise = bf16_noise((n * k) as usize, 7 + u64::from(k) + u64::from(n), 0.05);
+        let weights = (0..engine::rates::weights_at(n, k))
             .map(|_| {
                 let w = bench.buffer(&noise)?;
-                Ok((bench.tensor(&w, k, k, Dtype::Bf16)?, w))
+                Ok((bench.tensor(&w, n, k, Dtype::Bf16)?, w))
             })
             .collect::<Result<Vec<(Tensor, Buffer)>, String>>()?;
         let tensors: Vec<Tensor> = weights.iter().map(|(t, _)| *t).collect();
         for m in LATTICE_ROWS {
-            let rate = bench.matmul_flops(m, k, &tensors)?;
+            let rate = bench.matmul_flops(m, n, k, &tensors)?;
             say(&format!(
-                "  bf16 matmul {m} x {k} x {k}: {:.2} TFLOP/s",
+                "  bf16 matmul {m} x {n} x {k}: {:.2} TFLOP/s",
                 rate / 1e3
             ));
-            grid.push((m, k, rate));
+            grid.push((m, n, k, rate));
         }
     }
     let mut keys_curve = Vec::with_capacity(ATTN_KEYS.len() * ATTN_DIMS.len());
@@ -376,7 +379,7 @@ pub fn measure(
     let launch = bench.launch_ns()?;
     say(&format!("  launch: {launch} ns a dispatch"));
     Ok(Rates {
-        bf16_flops_per_ns_by_rows_and_depth: Some(grid),
+        bf16_flops_per_ns_by_rows_n_k: Some(grid),
         attn_flops_per_ns_by_keys_and_dim: Some(keys_curve),
         scan_elements_per_ns: Some(scan),
         bytes_per_ns: Some(bytes),

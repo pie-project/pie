@@ -760,15 +760,16 @@ fn rates(base: &Profile, say: &mut dyn FnMut(&str)) -> Result<profile::fire::Rat
     // step measures through.
     let tier = <crate::device::Api as engine_gpu::serve::Serve>::tier(&device);
     let gemm = engine_gpu::backend::Tactics::gemm(&tuning, tier);
-    for &(m, k, rate) in rates
-        .bf16_flops_per_ns_by_rows_and_depth
+    for &(m, n, k, rate) in rates
+        .bf16_flops_per_ns_by_rows_n_k
         .as_deref()
         .unwrap_or(&[])
     {
         let path =
-            kernels_slang::linear::gemm::tile_for(kernels_slang::Target::Spirv, gemm, m, k, k);
+            kernels_slang::linear::gemm::tile_for(kernels_slang::Target::Spirv, gemm, m, n, k);
         say(&format!(
-            "[rates]: matmul m {m:>5} k {k:>5}: {:6.1} TFLOP/s through {path:?} (tier {tier:?})",
+            "[rates]: matmul m {m:>5} n {n:>5} k {k:>5}: {:6.1} TFLOP/s through {path:?} (tier \
+             {tier:?})",
             rate / 1e3
         ));
     }

@@ -24,13 +24,9 @@ pub fn rates(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Outco
     say(&format!("{}: starting from {}", chip.name, report.used));
     let tuning = crate::tuning::Tuning::new(base.clone(), device.cores());
     let r = crate::rates::measure(&device, &tuning).map_err(|e| e.to_string())?;
-    for &(m, k, rate) in r
-        .bf16_flops_per_ns_by_rows_and_depth
-        .as_deref()
-        .unwrap_or(&[])
-    {
+    for &(m, n, k, rate) in r.bf16_flops_per_ns_by_rows_n_k.as_deref().unwrap_or(&[]) {
         say(&format!(
-            "[rates]: matmul m {m:>5} k {k:>5}: {:6.1} TFLOP/s",
+            "[rates]: matmul m {m:>5} n {n:>5} k {k:>5}: {:6.1} TFLOP/s",
             rate / 1e3
         ));
     }

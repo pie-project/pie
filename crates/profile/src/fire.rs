@@ -8,10 +8,11 @@
 //!
 //! ```toml
 //! [rates]
-//! # bf16 matmul flops a ns at m rows and depth k (m x k x k): a full grid
-//! bf16_flops_per_ns_by_rows_and_depth = [
-//!   [16, 1024, 600.0], [8192, 1024, 15000.0],
-//!   [16, 4096, 1900.0], [8192, 4096, 26000.0],
+//! # bf16 matmul flops a ns at m rows, n columns and depth k: every (n, k)
+//! # stated at every row
+//! bf16_flops_per_ns_by_rows_n_k = [
+//!   [16, 1024, 1024, 600.0], [8192, 1024, 1024, 15000.0],
+//!   [16, 4096, 4096, 1900.0], [8192, 4096, 4096, 26000.0],
 //! ]
 //! # prefill attention flops a ns by keys and head width: a full grid
 //! attn_flops_per_ns_by_keys_and_dim = [[512, 128, 6000.0], [16384, 128, 11000.0]]
@@ -25,10 +26,10 @@ use std::fmt::Write as _;
 /// A device's rates, each where a layer states it.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Rates {
-    /// Dense bf16 matmul flops a nanosecond by a matmul's rows and depth:
-    /// `(m, k, rate)` over a full grid of rows by depths, ordered by depth
-    /// then rows ([`Rates::flops_at`]).
-    pub bf16_flops_per_ns_by_rows_and_depth: Option<Vec<(u32, u32, f64)>>,
+    /// Dense bf16 matmul flops a nanosecond by a matmul's rows, columns and
+    /// depth: `(m, n, k, rate)`, every stated `(n, k)` at every stated row,
+    /// ordered by `(k, n, m)` ([`gemm_grid`], [`Rates::flops_at`]).
+    pub bf16_flops_per_ns_by_rows_n_k: Option<Vec<(u32, u32, u32, f64)>>,
     /// Attention flops a nanosecond by the keys a row attends and the head
     /// width: `(keys, d, rate)` over a full grid of keys by widths, ordered
     /// by width then keys ([`grid`]; the count the estimate's attention
@@ -48,9 +49,9 @@ impl Rates {
     #[must_use]
     pub fn over(self, below: Rates) -> Rates {
         Rates {
-            bf16_flops_per_ns_by_rows_and_depth: self
-                .bf16_flops_per_ns_by_rows_and_depth
-                .or(below.bf16_flops_per_ns_by_rows_and_depth),
+            bf16_flops_per_ns_by_rows_n_k: self
+                .bf16_flops_per_ns_by_rows_n_k
+                .or(below.bf16_flops_per_ns_by_rows_n_k),
             attn_flops_per_ns_by_keys_and_dim: self
                 .attn_flops_per_ns_by_keys_and_dim
                 .or(below.attn_flops_per_ns_by_keys_and_dim),
@@ -64,15 +65,11 @@ impl Rates {
         *self == Rates::default()
     }
 
-    /// The matmul rate at `rows` and depth `depth` ([`flops_at`]). `None`
-    /// where no grid is stated.
+    /// The matmul rate at `rows`, `n` columns and depth `k` ([`gemm_at`]).
+    /// `None` where no grid is stated.
     #[must_use]
-    pub fn flops_at(&self, rows: u32, depth: u32) -> Option<f64> {
-        flops_at(
-            self.bf16_flops_per_ns_by_rows_and_depth.as_deref()?,
-            rows,
-            depth,
-        )
+    pub fn flops_at(&self, rows: u32, n: u32, k: u32) -> Option<f64> {
+        gemm_at(self.bf16_flops_per_ns_by_rows_n_k.as_deref()?, rows, n, k)
     }
 
     /// The attention rate at `keys` and head width `d` ([`flops_at`]: in
@@ -85,10 +82,10 @@ impl Rates {
     /// The grid's fastest point: the rate a compute-bound matmul reaches.
     #[must_use]
     pub fn peak_flops(&self) -> Option<f64> {
-        self.bf16_flops_per_ns_by_rows_and_depth
+        self.bf16_flops_per_ns_by_rows_n_k
             .as_deref()?
             .iter()
-            .map(|&(_, _, r)| r)
+            .map(|&(_, _, _, r)| r)
             .reduce(f64::max)
     }
 
@@ -96,10 +93,10 @@ impl Rates {
     #[must_use]
     pub fn toml(&self) -> String {
         let mut out = String::from("[rates]\n");
-        if let Some(grid) = &self.bf16_flops_per_ns_by_rows_and_depth {
-            let _ = writeln!(out, "bf16_flops_per_ns_by_rows_and_depth = [");
-            for (m, k, r) in grid {
-                let _ = writeln!(out, "  [{m}, {k}, {r:?}],");
+        if let Some(grid) = &self.bf16_flops_per_ns_by_rows_n_k {
+            let _ = writeln!(out, "bf16_flops_per_ns_by_rows_n_k = [");
+            for (m, n, k, r) in grid {
+                let _ = writeln!(out, "  [{m}, {n}, {k}, {r:?}],");
             }
             let _ = writeln!(out, "]");
         }
@@ -177,6 +174,101 @@ pub fn flops_at(grid: &[(u32, u32, f64)], rows: u32, depth: u32) -> Option<f64> 
     Some(lerp_log((lo, along(lo)?), (hi, along(hi)?), depth))
 }
 
+/// `points` (`(m, n, k, rate)`) checked and ordered by `(k, n, m)`: `None`
+/// where it is empty, a point is not positive, or a stated `(n, k)` lacks a
+/// row another states (or states one twice). The `(n, k)` pairs are the
+/// file's own: a full product of columns by depths, or (a file measured
+/// square) its diagonal.
+#[must_use]
+pub fn gemm_grid(mut points: Vec<(u32, u32, u32, f64)>) -> Option<Vec<(u32, u32, u32, f64)>> {
+    if points.is_empty()
+        || points
+            .iter()
+            .any(|&(m, n, k, r)| m == 0 || n == 0 || k == 0 || !(r.is_finite() && r > 0.0))
+    {
+        return None;
+    }
+    points.sort_by_key(|&(m, n, k, _)| (k, n, m));
+    let mut rows: Vec<u32> = points.iter().map(|&(m, ..)| m).collect();
+    rows.sort_unstable();
+    rows.dedup();
+    let mut pairs: Vec<(u32, u32)> = points.iter().map(|&(_, n, k, _)| (k, n)).collect();
+    pairs.dedup();
+    let full = points.len() == rows.len() * pairs.len()
+        && points
+            .iter()
+            .enumerate()
+            .all(|(i, &(m, n, k, _))| m == rows[i % rows.len()] && (k, n) == pairs[i / rows.len()]);
+    full.then_some(points)
+}
+
+/// The rate of `grid` (checked by [`gemm_grid`]) at `rows`, `n` and `k`:
+/// each stated `(n, k)`'s row curve read at `rows` (linear in `log rows`),
+/// then, where the pairs are a full product of columns by depths,
+/// interpolated in `log n` and `log k` between the four around `(n, k)`;
+/// where they are not (a square grid's diagonal), in `log k` between the
+/// depths around `k`. Clamped to the grid's edges past them. `None` for an
+/// empty grid.
+#[must_use]
+pub fn gemm_at(grid: &[(u32, u32, u32, f64)], rows: u32, n: u32, k: u32) -> Option<f64> {
+    let along = |nn: u32, kk: u32| -> Option<f64> {
+        let curve: Vec<(u32, f64)> = grid
+            .iter()
+            .filter(|&&(_, gn, gk, _)| gn == nn && gk == kk)
+            .map(|&(m, _, _, r)| (m, r))
+            .collect();
+        interpolate(&curve, rows)
+    };
+    let mut pairs: Vec<(u32, u32)> = grid.iter().map(|&(_, n, k, _)| (n, k)).collect();
+    pairs.sort_unstable();
+    pairs.dedup();
+    let mut ns: Vec<u32> = pairs.iter().map(|&(n, _)| n).collect();
+    ns.sort_unstable();
+    ns.dedup();
+    let mut ks: Vec<u32> = pairs.iter().map(|&(_, k)| k).collect();
+    ks.sort_unstable();
+    ks.dedup();
+    // The two stated values around `x` (one where `x` is past an end).
+    let around = |axis: &[u32], x: u32| -> Option<(u32, u32)> {
+        let (&first, &last) = (axis.first()?, axis.last()?);
+        if x <= first {
+            return Some((first, first));
+        }
+        if x >= last {
+            return Some((last, last));
+        }
+        let at = axis.partition_point(|&a| a <= x);
+        Some((axis[at - 1], axis[at]))
+    };
+    let blend = |(lo, a): (u32, f64), (hi, b): (u32, f64), x: u32| {
+        if lo == hi {
+            a
+        } else {
+            lerp_log((lo, a), (hi, b), x.clamp(lo, hi))
+        }
+    };
+    if pairs.len() == ns.len() * ks.len() {
+        let (k0, k1) = around(&ks, k)?;
+        let (n0, n1) = around(&ns, n)?;
+        let at_k =
+            |kk: u32| -> Option<f64> { Some(blend((n0, along(n0, kk)?), (n1, along(n1, kk)?), n)) };
+        return Some(blend((k0, at_k(k0)?), (k1, at_k(k1)?), k));
+    }
+    // Not a full product: each depth at its stated columns nearest `n` in
+    // log, then in `log k`.
+    let nearest = |kk: u32| -> Option<f64> {
+        let ln = |x: u32| f64::from(x.max(1)).ln();
+        let nn = pairs
+            .iter()
+            .filter(|&&(_, pk)| pk == kk)
+            .map(|&(pn, _)| pn)
+            .min_by(|&a, &b| (ln(a) - ln(n)).abs().total_cmp(&(ln(b) - ln(n)).abs()))?;
+        along(nn, kk)
+    };
+    let (k0, k1) = around(&ks, k)?;
+    Some(blend((k0, nearest(k0)?), (k1, nearest(k1)?), k))
+}
+
 /// `curve` (`(x, rate)`, ascending in `x`) at `x`, linear in `log x`,
 /// clamped at its ends. `None` for an empty curve.
 #[must_use]
@@ -237,7 +329,7 @@ mod tests {
     fn an_upper_layer_replaces_key_by_key() {
         let mut low = Tuned {
             rates: Rates {
-                bf16_flops_per_ns_by_rows_and_depth: Some(vec![(4096, 4096, 1.0)]),
+                bf16_flops_per_ns_by_rows_n_k: Some(vec![(4096, 4096, 4096, 1.0)]),
                 bytes_per_ns: Some(2.0),
                 ..Rates::default()
             },
@@ -255,7 +347,7 @@ mod tests {
         assert_eq!(
             low.rates,
             Rates {
-                bf16_flops_per_ns_by_rows_and_depth: Some(vec![(4096, 4096, 1.0)]),
+                bf16_flops_per_ns_by_rows_n_k: Some(vec![(4096, 4096, 4096, 1.0)]),
                 bytes_per_ns: Some(3.0),
                 launch_ns: Some(7),
                 ..Rates::default()
@@ -264,56 +356,65 @@ mod tests {
     }
 
     #[test]
-    fn the_grid_interpolates_in_log_rows_and_log_depth_and_clamps_at_its_edges() {
+    fn the_gemm_grid_interpolates_in_log_rows_columns_and_depth_and_clamps() {
+        // A full product: n and k each 1024 and 4096, rows 16 and 256.
+        let mut points = Vec::new();
+        for (n, k, base) in [
+            (1024, 1024, 100.0),
+            (4096, 1024, 200.0),
+            (1024, 4096, 300.0),
+            (4096, 4096, 400.0),
+        ] {
+            points.push((16, n, k, base));
+            points.push((256, n, k, 2.0 * base));
+        }
         let rates = Rates {
-            bf16_flops_per_ns_by_rows_and_depth: grid(vec![
-                (16, 1024, 100.0),
-                (256, 1024, 500.0),
-                (16, 4096, 300.0),
-                (256, 4096, 900.0),
-            ]),
+            bf16_flops_per_ns_by_rows_n_k: gemm_grid(points),
             ..Rates::default()
         };
-        assert_eq!(rates.flops_at(16, 1024), Some(100.0));
-        assert_eq!(rates.flops_at(1, 1), Some(100.0), "clamped below both");
+        assert_eq!(rates.flops_at(16, 1024, 1024), Some(100.0));
+        assert_eq!(rates.flops_at(1, 1, 1), Some(100.0), "clamped below all");
         assert_eq!(
-            rates.flops_at(8192, 8192),
-            Some(900.0),
-            "clamped above both"
+            rates.flops_at(1 << 20, 1 << 20, 1 << 20),
+            Some(800.0),
+            "above all"
         );
-        // 64 is halfway from 16 to 256 in log rows; 2048 from 1024 to 4096
-        // in log depth.
-        assert!((rates.flops_at(64, 1024).unwrap() - 300.0).abs() < 1e-9);
-        assert!((rates.flops_at(16, 2048).unwrap() - 200.0).abs() < 1e-9);
-        assert!((rates.flops_at(64, 2048).unwrap() - 450.0).abs() < 1e-9);
-        assert_eq!(rates.peak_flops(), Some(900.0));
-        assert_eq!(Rates::default().flops_at(64, 1024), None);
+        // 64 rows halfway in log rows: 150 at (1024, 1024).
+        assert!((rates.flops_at(64, 1024, 1024).unwrap() - 150.0).abs() < 1e-9);
+        // n 2048 halfway from 1024 to 4096: 150 at k 1024; k 2048 the same.
+        assert!((rates.flops_at(16, 2048, 1024).unwrap() - 150.0).abs() < 1e-9);
+        assert!((rates.flops_at(16, 2048, 2048).unwrap() - 250.0).abs() < 1e-9);
+        // An 8B gate_up (n 24576, k 4096) reads the widest columns stated.
+        assert_eq!(rates.flops_at(256, 24576, 4096), Some(800.0));
+        assert_eq!(rates.peak_flops(), Some(800.0));
+        assert_eq!(Rates::default().flops_at(64, 1024, 1024), None);
     }
 
     #[test]
-    fn the_attention_grid_interpolates_in_log_keys_and_log_width_and_clamps() {
-        let rates = Rates {
-            attn_flops_per_ns_by_keys_and_dim: grid(vec![
-                (512, 128, 100.0),
-                (2048, 128, 300.0),
-                (512, 256, 200.0),
-                (2048, 256, 600.0),
-            ]),
-            ..Rates::default()
-        };
+    fn a_square_grid_reads_its_diagonal_by_depth() {
+        // A file measured n = k: (1024, 1024) and (4096, 4096) only.
+        let grid = gemm_grid(vec![(16, 1024, 1024, 100.0), (16, 4096, 4096, 300.0)]).unwrap();
+        assert_eq!(gemm_at(&grid, 16, 6144, 1024), Some(100.0), "k 1024's");
+        assert!((gemm_at(&grid, 16, 4096, 2048).unwrap() - 200.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_gemm_grid_states_every_row_at_each_of_its_pairs_or_is_refused() {
         assert_eq!(
-            rates.attn_at(1, 128),
-            Some(100.0),
-            "a decode lane's one key"
+            gemm_grid(vec![(256, 64, 64, 2.0), (16, 64, 64, 1.0)]),
+            Some(vec![(16, 64, 64, 1.0), (256, 64, 64, 2.0)])
         );
-        assert!((rates.attn_at(1024, 128).unwrap() - 200.0).abs() < 1e-9);
-        assert_eq!(rates.attn_at(2048, 256), Some(600.0));
-        // 181 is about halfway from 128 to 256 in log width; a 64-wide
-        // head clamps to the narrowest stated.
-        assert_eq!(rates.attn_at(512, 64), Some(100.0));
-        assert!((rates.attn_at(1024, 256).unwrap() - 400.0).abs() < 1e-9);
-        assert_eq!(rates.attn_at(1 << 20, 1 << 20), Some(600.0));
-        assert_eq!(Rates::default().attn_at(2048, 128), None);
+        assert_eq!(gemm_grid(vec![]), None, "empty");
+        assert_eq!(
+            gemm_grid(vec![
+                (16, 64, 64, 1.0),
+                (256, 64, 64, 2.0),
+                (16, 128, 64, 3.0)
+            ]),
+            None,
+            "a pair short of a row"
+        );
+        assert_eq!(gemm_grid(vec![(16, 64, 64, 0.0)]), None, "not positive");
     }
 
     #[test]

@@ -75,7 +75,7 @@ dag_streams_until = 256
 
 [rates]
 # 989 TFLOPS dense bf16 (NVIDIA H200 datasheet, SXM; 1979 with sparsity).
-bf16_flops_per_ns_by_rows_and_depth = [[4096, 4096, 989000.0]]
+bf16_flops_per_ns_by_rows_n_k = [[4096, 4096, 4096, 989000.0]]
 # 4.8 TB/s of HBM3e (H200 datasheet).
 bytes_per_ns = 4800.0
 

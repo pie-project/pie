@@ -486,7 +486,10 @@ pub fn rates(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Outco
     let name = device.name().to_string();
     let facts = crate::chip::measured(&device, crate::chip::perf_cores());
     let (base, report) = crate::chip::resolve(&name, &facts, profiles);
-    say(&format!("{name}: measuring the rates, starting from {}", report.used));
+    say(&format!(
+        "{name}: measuring the rates, starting from {}",
+        report.used
+    ));
     let rates = crate::rates::measure(&device, base.clone(), say)?;
     let tuned = engine::rates::tuned(&rates);
     let seconds = began.elapsed().as_secs_f64();
@@ -663,7 +666,13 @@ const CHECK_FIRE: (u32, u32) = (256, 2048);
 
 /// The kinds of work a fire's time is told in: what each kernel does by
 /// its entrypoint.
-const KINDS: [&str; 5] = ["gemm", "attention", "recurrent", "norm+elementwise", "other"];
+const KINDS: [&str; 5] = [
+    "gemm",
+    "attention",
+    "recurrent",
+    "norm+elementwise",
+    "other",
+];
 
 fn kind_of(entrypoint: &str) -> usize {
     let e = entrypoint.to_ascii_lowercase();
@@ -671,16 +680,24 @@ fn kind_of(entrypoint: &str) -> usize {
     // (`sdpa_mpp_*`), and its visits read the kv pages (`sdpa_visit_*`).
     if e.starts_with("attn") || e.starts_with("sdpa") || e.contains("flash") {
         1
-    } else if ["gemm", "gemv", "qmm", "mpp", "matmul", "moe_"].iter().any(|k| e.contains(k)) {
-        0
-    } else if ["gdn", "conv", "scan", "delta", "rs_", "recur", "ssm", "chunk_"]
+    } else if ["gemm", "gemv", "qmm", "mpp", "matmul", "moe_"]
         .iter()
         .any(|k| e.contains(k))
     {
+        0
+    } else if [
+        "gdn", "conv", "scan", "delta", "rs_", "recur", "ssm", "chunk_",
+    ]
+    .iter()
+    .any(|k| e.contains(k))
+    {
         2
-    } else if ["norm", "rope", "silu", "gelu", "swiglu", "add", "mul", "act", "residual", "copy", "cast", "softmax", "sigmoid", "gate"]
-        .iter()
-        .any(|k| e.contains(k))
+    } else if [
+        "norm", "rope", "silu", "gelu", "swiglu", "add", "mul", "act", "residual", "copy", "cast",
+        "softmax", "sigmoid", "gate",
+    ]
+    .iter()
+    .any(|k| e.contains(k))
     {
         3
     } else {
@@ -864,7 +881,8 @@ fn check_one(
         }
         Ok((width, by_kind, dispatches, rows))
     };
-    let mut measured = search::time_fires(&prompts, |width, _| prompt_fire(&mut shell, width), say)?;
+    let mut measured =
+        search::time_fires(&prompts, |width, _| prompt_fire(&mut shell, width), say)?;
     let mut dissected = Vec::new();
     for &width in &prompts {
         dissected.push(dissect(&mut shell, width, &prompt_fire)?);
@@ -909,7 +927,7 @@ fn check_one(
          {:.2} GB\n  rung  measured  estimated | est (ms): launch work weights flops \
          readout attn kv recur elem | device by kind (ms, dispatches timed alone): {}  dispatches  sum  \
          wall-sum\n",
-        e.flops_per_ns(8192, 4096),
+        e.flops_per_ns(8192, 4096, 4096),
         e.bytes_per_ns,
         e.launch_ns,
         e.dense_bytes as f64 / 1e9,

@@ -26,11 +26,12 @@ pub struct Counts {
     /// `k` merged (their count, flops and bytes), dense and routed apart, the
     /// output head's aside. Ordered by `(n, k)`.
     pub gemm_shapes: Vec<GemmShape>,
-    /// The output head's bytes on the device, read every fire.
+    /// The output head's bytes on the device, read every fire by the
+    /// readout alone (not in `weight_bytes`).
     pub head_bytes: u64,
     /// The output head's flops a sampled row: two a head element. A fire
     /// reads out once a sampled row, not once a row; the head's bytes are
-    /// in `weight_bytes`.
+    /// `head_bytes`.
     pub readout_flops: u64,
     /// The output head's depth (the model's hidden width).
     pub readout_depth: u32,
@@ -92,7 +93,6 @@ impl Counts {
                 // much as its own plane), multiplied once a lane.
                 let (rows, cols) = rectangle(&param.shape);
                 let bytes = kept.plane_bytes.get(at).copied().unwrap_or(0);
-                weight_bytes = weight_bytes.saturating_add(bytes);
                 head_bytes = head_bytes.saturating_add(bytes);
                 readout = readout.saturating_add(rows.saturating_mul(cols));
                 readout_depth = readout_depth.max(cols);
@@ -412,10 +412,10 @@ pub fn estimate(
     };
     Ok(FireEstimate {
         flops_grid: rates
-            .bf16_flops_per_ns_by_rows_and_depth
+            .bf16_flops_per_ns_by_rows_n_k
             .clone()
             .filter(|grid| !grid.is_empty())
-            .ok_or("bf16_flops_per_ns_by_rows_and_depth")?,
+            .ok_or("bf16_flops_per_ns_by_rows_n_k")?,
         bytes_per_ns: rates.bytes_per_ns.ok_or("bytes_per_ns")?,
         attn_grid: match &rates.attn_flops_per_ns_by_keys_and_dim {
             Some(grid) if !grid.is_empty() => grid.clone(),
@@ -582,7 +582,7 @@ mod tests {
         // No feasible rung at all: the ruling's refusal.
         let none = [rung(1024, 300 * MIB, Some("past one binding"))];
         let rated = profile::fire::Rates {
-            bf16_flops_per_ns_by_rows_and_depth: Some(vec![(4096, 4096, 1.0)]),
+            bf16_flops_per_ns_by_rows_n_k: Some(vec![(4096, 4096, 4096, 1.0)]),
             attn_flops_per_ns_by_keys_and_dim: Some(vec![(2048, 128, 1.0)]),
             bytes_per_ns: Some(1.0),
             ..profile::fire::Rates::default()
@@ -599,14 +599,20 @@ mod tests {
     #[test]
     fn the_estimate_reads_the_rates_and_the_counts() {
         let rates = profile::fire::Rates {
-            bf16_flops_per_ns_by_rows_and_depth: Some(vec![(16, 4096, 1.0), (4096, 4096, 10.0)]),
+            bf16_flops_per_ns_by_rows_n_k: Some(vec![
+                (16, 4096, 4096, 1.0),
+                (4096, 4096, 4096, 10.0),
+            ]),
             attn_flops_per_ns_by_keys_and_dim: Some(vec![(2048, 128, 7.0)]),
             bytes_per_ns: Some(100.0),
             launch_ns: Some(5),
             ..profile::fire::Rates::default()
         };
         let e = estimate(&counts(), &rates).unwrap();
-        assert_eq!(e.flops_grid, vec![(16, 4096, 1.0), (4096, 4096, 10.0)]);
+        assert_eq!(
+            e.flops_grid,
+            vec![(16, 4096, 4096, 1.0), (4096, 4096, 4096, 10.0)]
+        );
         assert_eq!(e.gemm_shapes, counts().gemm_shapes);
         assert_eq!(
             (e.attn_grid.clone(), e.bytes_per_ns, e.launch_ns),
@@ -625,9 +631,9 @@ mod tests {
                 },
             ),
             (
-                "bf16_flops_per_ns_by_rows_and_depth",
+                "bf16_flops_per_ns_by_rows_n_k",
                 profile::fire::Rates {
-                    bf16_flops_per_ns_by_rows_and_depth: None,
+                    bf16_flops_per_ns_by_rows_n_k: None,
                     ..rates.clone()
                 },
             ),
@@ -670,7 +676,7 @@ mod tests {
     fn the_refusal_names_the_key_unstated() {
         let rungs = [rung(1024, 100 * MIB, None)];
         let rates = profile::fire::Rates {
-            bf16_flops_per_ns_by_rows_and_depth: Some(vec![(4096, 4096, 1.0)]),
+            bf16_flops_per_ns_by_rows_n_k: Some(vec![(4096, 4096, 4096, 1.0)]),
             bytes_per_ns: Some(1.0),
             ..profile::fire::Rates::default()
         };
@@ -836,7 +842,7 @@ mod tests {
         };
         let tuned = profile::fire::Tuned {
             rates: profile::fire::Rates {
-                bf16_flops_per_ns_by_rows_and_depth: Some(vec![(4096, 4096, 249_000.0)]),
+                bf16_flops_per_ns_by_rows_n_k: Some(vec![(4096, 4096, 4096, 249_000.0)]),
                 bytes_per_ns: Some(654.0),
                 launch_ns: Some(1620),
                 ..profile::fire::Rates::default()

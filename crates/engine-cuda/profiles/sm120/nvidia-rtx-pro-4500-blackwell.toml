@@ -84,7 +84,7 @@ window_spare = true
 # dense, and Blackwell's fifth generation tensor cores run bf16 at a quarter
 # of FP4's rate: 202 TFLOPS. The same figure as engine-vulkan's derived
 # file.
-bf16_flops_per_ns_by_rows_and_depth = [[4096, 4096, 202000.0]]
+bf16_flops_per_ns_by_rows_n_k = [[4096, 4096, 4096, 202000.0]]
 # 896 GB/s of GDDR7 (nvidia.com, RTX PRO 4500 Blackwell specifications).
 bytes_per_ns = 896.0
 

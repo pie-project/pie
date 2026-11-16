@@ -9,8 +9,9 @@
 //! its pipelines), so the frame's one submit and wait cancel and what is
 //! left is the work's own time beside a dispatch's:
 //! - the backend's own bf16 matmul at each row count of
-//!   `engine::rates::LATTICE_ROWS` and each depth of `engine::rates::DEPTHS`,
-//!   `m x k x k`, each fire reading the next of `engine::rates::weights_at(k)`
+//!   `engine::rates::LATTICE_ROWS` and each column count and depth of
+//!   `engine::rates::DEPTHS`, `m x n x k`, each fire reading the next of
+//!   `engine::rates::weights_at(n, k)`
 //!   weight planes (past the last-level cache), for the matmul grid;
 //! - its prefill attention at `engine::rates::ATTN_SHAPE`'s heads over each
 //!   `engine::rates::ATTN_KEYS` and head width of `engine::rates::ATTN_DIMS`,
@@ -218,7 +219,7 @@ pub fn measure<B: Serve, T: Tactics + ?Sized>(
     let scan = scan(&mut rig, tactics.recurrent(), timer)?;
     let (bytes_per_ns, launch_ns) = copy_and_launch(&mut rig, tactics.gemm(tier), timer)?;
     Ok(Rates {
-        bf16_flops_per_ns_by_rows_and_depth: Some(grid),
+        bf16_flops_per_ns_by_rows_n_k: Some(grid),
         attn_flops_per_ns_by_keys_and_dim: Some(attn),
         scan_elements_per_ns: Some(scan),
         bytes_per_ns: Some(bytes_per_ns),
@@ -226,40 +227,42 @@ pub fn measure<B: Serve, T: Tactics + ?Sized>(
     })
 }
 
-/// The matmul rate at each row count and depth of the lattice: `(m, k,
-/// flops a ns)`, `m x k x k`, by depth then rows.
+/// The matmul rate at each row count, column count and depth of the
+/// lattice: `(m, n, k, flops a ns)`, by depth, then columns, then rows.
 fn grid<B: Serve>(
     rig: &mut Rig<'_, B>,
     tactic: kernels_slang::linear::gemm::Tactic,
     timer: Timer<'_, B>,
-) -> Result<Vec<(u32, u32, f64)>> {
+) -> Result<Vec<(u32, u32, u32, f64)>> {
     let widest = LATTICE_ROWS[LATTICE_ROWS.len() - 1];
-    let mut out = Vec::with_capacity(LATTICE_ROWS.len() * DEPTHS.len());
+    let mut out = Vec::with_capacity(LATTICE_ROWS.len() * DEPTHS.len() * DEPTHS.len());
     for k in DEPTHS {
-        let act = rig.operand(widest, k, Dtype::Bf16)?;
-        // Each fire reads the next of these, past the last-level cache.
-        let weights = (0..weights_at(k))
-            .map(|_| rig.operand(k, k, Dtype::Bf16))
-            .collect::<Result<Vec<Tensor>>>()?;
-        let y = rig.zeros(widest, k, Dtype::Bf16)?;
-        let next = std::cell::Cell::new(0usize);
-        for m in LATTICE_ROWS {
-            let ns = rig.each(timer, &|sink| {
-                let w = weights[next.get() % weights.len()];
-                next.set(next.get() + 1);
-                kernels_slang::linear::gemm::matmul(
-                    sink,
-                    tactic,
-                    Tensor { rows: m, ..act },
-                    w,
-                    Tensor { rows: m, ..y },
-                )
-                .map_err(fault("rates: matmul"))
-            })?;
-            out.push((m, k, gemm_flops(m, k) / ns as f64));
+        for n in DEPTHS {
+            let act = rig.operand(widest, k, Dtype::Bf16)?;
+            // Each fire reads the next of these, past the last-level cache.
+            let weights = (0..weights_at(n, k))
+                .map(|_| rig.operand(n, k, Dtype::Bf16))
+                .collect::<Result<Vec<Tensor>>>()?;
+            let y = rig.zeros(widest, n, Dtype::Bf16)?;
+            let next = std::cell::Cell::new(0usize);
+            for m in LATTICE_ROWS {
+                let ns = rig.each(timer, &|sink| {
+                    let w = weights[next.get() % weights.len()];
+                    next.set(next.get() + 1);
+                    kernels_slang::linear::gemm::matmul(
+                        sink,
+                        tactic,
+                        Tensor { rows: m, ..act },
+                        w,
+                        Tensor { rows: m, ..y },
+                    )
+                    .map_err(fault("rates: matmul"))
+                })?;
+                out.push((m, n, k, gemm_flops(m, n, k) / ns as f64));
+            }
+            // This shape's planes go before the next shape's are laid.
+            rig.release();
         }
-        // This depth's planes go before the next depth's are laid.
-        rig.release();
     }
     Ok(out)
 }
@@ -278,24 +281,32 @@ fn attention<B: Serve, T: Tactics + ?Sized>(
     let tactic = tactics.sdpa(tier, s.head_dim);
     let tiled = tactics.sdpa_tiles(s.rows);
     let kv_width = s.kv_heads * s.head_dim;
-    let q = rig.operand(s.rows, s.q_heads * s.head_dim, Dtype::Bf16)?;
     let o = rig.zeros(s.rows, s.q_heads * s.head_dim, Dtype::Bf16)?;
-    let keys = rig.operand(s.keys, kv_width, Dtype::Bf16)?;
-    let values = rig.operand(s.keys, kv_width, Dtype::Bf16)?;
     let pages = s.keys.div_ceil(PAGE);
     // The sequence's pages scattered over the pool as a served one's are.
     let indices: Vec<u32> = engine::rates::attn_page_order(pages);
     let page_indices = rig.words(&indices, pages, 1, Dtype::U32)?;
     let page_indptr = rig.words(&[0, pages], 2, 1, Dtype::U32)?;
-    let pool = KvPool::planes(
-        keys,
-        values,
-        page_indices,
-        page_indptr,
-        PAGE as i32,
-        u64::from(kv_width),
-        u64::from(s.head_dim),
-    );
+    // Each fire reads the next of these q / k / v sets, past the last-level
+    // cache, as a served fire reads each layer's kv cold.
+    let sets = (0..engine::rates::attn_sets_at(s))
+        .map(|_| {
+            let q = rig.operand(s.rows, s.q_heads * s.head_dim, Dtype::Bf16)?;
+            let keys = rig.operand(s.keys, kv_width, Dtype::Bf16)?;
+            let values = rig.operand(s.keys, kv_width, Dtype::Bf16)?;
+            let pool = KvPool::planes(
+                keys,
+                values,
+                page_indices,
+                page_indptr,
+                PAGE as i32,
+                u64::from(kv_width),
+                u64::from(s.head_dim),
+            );
+            Ok((q, pool))
+        })
+        .collect::<Result<Vec<(Tensor, KvPool)>>>()?;
+    let next = std::cell::Cell::new(0usize);
     // The rows' own positions, all of request 0, no row masked.
     let positions: Vec<u32> = (0..s.rows).collect();
     const MASK_STRIDE: u32 = 4;
@@ -308,13 +319,16 @@ fn attention<B: Serve, T: Tactics + ?Sized>(
     };
     let scale = 1.0 / (s.head_dim as f32).sqrt();
     let ns = rig.each(timer, &|sink| {
+        let (q, pool) = &sets[next.get() % sets.len()];
+        let (q, pool) = (*q, pool);
+        next.set(next.get() + 1);
         if tiled {
             kernels_slang::attn::sdpa::prefill(
-                sink, tactic, q, &tables, &pool, None, s.head_dim, scale, o, None,
+                sink, tactic, q, &tables, pool, None, s.head_dim, scale, o, None,
             )
         } else {
             kernels_slang::attn::sdpa::decode(
-                sink, tactic, q, &tables, &pool, None, s.head_dim, scale, o, None, None,
+                sink, tactic, q, &tables, pool, None, s.head_dim, scale, o, None, None,
             )
         }
         .map_err(fault("rates: attention"))

@@ -6,9 +6,11 @@
 //! the counts here turn its times into rates, and [`tuned`] and
 //! [`provenance`] write them.
 //!
-//! - `bf16_flops_per_ns_by_rows_and_depth`: a bf16 matmul `m x k x k` (`m`
-//!   rows, `k` columns, depth `k`) at each `m` of [`LATTICE_ROWS`] and each
-//!   `k` of [`DEPTHS`], [`gemm_flops`] a matmul over its time.
+//! - `bf16_flops_per_ns_by_rows_n_k`: a bf16 matmul of `m` rows, `n`
+//!   columns and depth `k` at each `m` of [`LATTICE_ROWS`] and each `n` and
+//!   each `k` of [`DEPTHS`] (a serving projection is seldom square: a gate
+//!   and up leg runs wide and shallow, a down leg narrow and deep),
+//!   [`gemm_flops`] a matmul over its time.
 //! - `attn_flops_per_ns_by_keys_and_dim`: the backend's prefill attention
 //!   at [`ATTN_SHAPE`]'s heads, one sequence of `keys` rows attending itself
 //!   at each `keys` of [`ATTN_KEYS`] and head width `d` of [`ATTN_DIMS`]
@@ -37,11 +39,11 @@ pub const LATTICE_ROWS: [u32; 10] = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096
 /// contraction feeds fewer tiles).
 pub const DEPTHS: [u32; 5] = [1024, 2048, 4096, 8192, 16384];
 
-/// The flops of one matmul of `rows` at `depth` (its columns the same):
-/// two a multiply-add.
+/// The flops of one matmul of `rows`, `n` columns and depth `k`: two a
+/// multiply-add.
 #[must_use]
-pub fn gemm_flops(rows: u32, depth: u32) -> f64 {
-    2.0 * f64::from(rows) * f64::from(depth) * f64::from(depth)
+pub fn gemm_flops(rows: u32, n: u32, k: u32) -> f64 {
+    2.0 * f64::from(rows) * f64::from(n) * f64::from(k)
 }
 
 /// The bytes of weight planes a matmul's timed fires rotate through at
@@ -51,12 +53,12 @@ pub fn gemm_flops(rows: u32, depth: u32) -> f64 {
 /// its rates there moved 4% run to run.
 pub const WEIGHT_BYTES: usize = 768 << 20;
 
-/// The weight planes the timed matmuls at depth `k` rotate through:
-/// [`WEIGHT_BYTES`] of `k x k` bf16 planes, and never fewer than 12, so each
-/// reads its weight from device memory as a layer's does.
+/// The weight planes the timed matmuls of `n` columns at depth `k` rotate
+/// through: [`WEIGHT_BYTES`] of `n x k` bf16 planes, and never fewer than
+/// 12, so each reads its weight from device memory as a layer's does.
 #[must_use]
-pub fn weights_at(k: u32) -> usize {
-    let plane = k as usize * k as usize * 2;
+pub fn weights_at(n: u32, k: u32) -> usize {
+    let plane = n as usize * k as usize * 2;
     WEIGHT_BYTES.div_ceil(plane.max(1)).max(12)
 }
 
@@ -89,6 +91,21 @@ pub fn operand_pattern() -> Vec<u8> {
         bytes.extend_from_slice(&((v.to_bits() >> 16) as u16).to_le_bytes());
     }
     bytes
+}
+
+/// The bytes of q, k and v sets an attention's timed fires rotate through
+/// at least: [`WEIGHT_BYTES`]' bound, past every last-level cache, since a
+/// served fire reads each layer's kv (and its q) cold.
+pub const ATTN_SET_BYTES: usize = WEIGHT_BYTES;
+
+/// The q / k / v sets the timed attentions of `shape` rotate through:
+/// [`ATTN_SET_BYTES`] of the shape's q rows and k and v keys (bf16), and
+/// never fewer than 2.
+#[must_use]
+pub fn attn_sets_at(shape: AttnShape) -> usize {
+    let q = shape.rows as usize * (shape.q_heads * shape.head_dim) as usize;
+    let kv = 2 * shape.keys as usize * (shape.kv_heads * shape.head_dim) as usize;
+    ATTN_SET_BYTES.div_ceil(((q + kv) * 2).max(1)).max(2)
 }
 
 /// A prefill attention the attention rate is timed at.
@@ -254,7 +271,7 @@ pub fn tuned(rates: &profile::fire::Rates) -> String {
 pub fn provenance(backend: &str, how: &str) -> (&'static str, String) {
     let text = format!(
         "pie tune {backend} --rates on {} (pie {}): {how}; at engine::rates' lattice (matmul \
-         m x k x k, m 16..8192, k 1024..16384; attention keys x keys, keys 512..16384, {}/{} \
+         m x n x k, m 16..8192, n and k 1024..16384; attention keys x keys, keys 512..16384, {}/{} \
          heads of 64..256; scan {} tokens, {}/{} heads of {}x{}, conv {})",
         today(),
         env!("CARGO_PKG_VERSION"),
@@ -302,11 +319,12 @@ mod tests {
     fn the_lattice_ascends_and_the_counts_are_the_estimates() {
         assert!(LATTICE_ROWS.windows(2).all(|w| w[0] < w[1]));
         assert!(DEPTHS.windows(2).all(|w| w[0] < w[1]));
-        assert_eq!(weights_at(1024), 384);
-        assert_eq!(weights_at(8192), 12);
-        assert_eq!(weights_at(16384), 12);
+        assert_eq!(weights_at(1024, 1024), 384);
+        assert_eq!(weights_at(16384, 1024), 24);
+        assert_eq!(weights_at(8192, 8192), 12);
+        assert_eq!(weights_at(16384, 16384), 12);
         assert_eq!(DEPTHS.last(), Some(&16384));
-        assert_eq!(gemm_flops(16, 1024), 2.0 * 16.0 * 1024.0 * 1024.0);
+        assert_eq!(gemm_flops(16, 2048, 1024), 2.0 * 16.0 * 2048.0 * 1024.0);
         // 4 · 2048 · 2048 · 16 · 128.
         assert_eq!(attn_flops(ATTN_SHAPE), 4.0 * 2048.0 * 2048.0 * 2048.0);
         // 2048 tokens · 16 heads · 128 · 128.
@@ -327,6 +345,10 @@ mod tests {
         assert_eq!(&attn_page_order(32)[..4], &[0, 15, 30, 13]);
         assert_eq!(ATTN_SHAPE.at(512).rows, 512);
         assert!(ATTN_DIMS.windows(2).all(|w| w[0] < w[1]));
+        // 512 keys at d 64: 1 MiB of q, 1 MiB of k and v; 16384 at 256: 256
+        // MiB, three sets past 768 MiB.
+        assert_eq!(attn_sets_at(ATTN_SHAPE.at(512).with_dim(64)), 384);
+        assert_eq!(attn_sets_at(ATTN_SHAPE.at(16384).with_dim(256)), 3);
         assert_eq!(ATTN_SHAPE.at(512).with_dim(256).head_dim, 256);
         assert_eq!(
             attn_flops(ATTN_SHAPE.at(512).with_dim(256)),
@@ -360,7 +382,10 @@ mod tests {
     #[test]
     fn the_writer_writes_what_the_profile_reads() {
         let rates = profile::fire::Rates {
-            bf16_flops_per_ns_by_rows_and_depth: Some(vec![(16, 1024, 100.0), (8192, 1024, 900.5)]),
+            bf16_flops_per_ns_by_rows_n_k: Some(vec![
+                (16, 2048, 1024, 100.0),
+                (8192, 2048, 1024, 900.5),
+            ]),
             attn_flops_per_ns_by_keys_and_dim: Some(vec![(512, 128, 40.0), (16384, 128, 50.0)]),
             scan_elements_per_ns: Some(7.0),
             bytes_per_ns: Some(800.0),
@@ -368,8 +393,8 @@ mod tests {
         };
         assert_eq!(
             tuned(&rates),
-            "[rates]\nbf16_flops_per_ns_by_rows_and_depth = [\n  [16, 1024, 100.0],\n  [8192, 1024, \
-             900.5],\n]\n\
+            "[rates]\nbf16_flops_per_ns_by_rows_n_k = [\n  [16, 2048, 1024, 100.0],\n  [8192, 2048, \
+             1024, 900.5],\n]\n\
              attn_flops_per_ns_by_keys_and_dim = [\n  [512, 128, 40.0],\n  [16384, 128, 50.0],\n]\nscan_elements_per_ns = 7.0\nbytes_per_ns = 800.0\n\
              launch_ns = 3500\n"
         );

@@ -83,6 +83,14 @@ fn pick_models(
     }
     let found = artifacts(req.artifacts, backend);
     if req.check.is_empty() {
+        if found.is_empty() && req.check_estimate {
+            return Err(format!(
+                "a check of the estimate needs a model stamped for {backend}, and none under {} \
+                 is; make one with the import `pie serve` runs, `pie model import <its source, \
+                 e.g. Qwen/Qwen3-0.6B>`",
+                req.artifacts.display()
+            ));
+        }
         return Ok(found.into_iter().take(1).collect());
     }
     let mut picked = Vec::new();
@@ -90,14 +98,18 @@ fn pick_models(
         let hit = found
             .iter()
             .find(|(path, d)| {
-                d == name || d.contains(name.as_str()) || path.to_string_lossy().contains(name.as_str())
+                d == name
+                    || d.contains(name.as_str())
+                    || path.to_string_lossy().contains(name.as_str())
             })
             .ok_or_else(|| {
                 let have: Vec<&str> = found.iter().map(|(_, d)| d.as_str()).collect();
                 format!(
-                    "no stamped artifact for this backend matches `{name}` (servable here: {have:?}); \
-                     `pie model list` marks the rest unstamped, which an import from this \
-                     pie restamps: `pie model import <source>`"
+                    "the check of `{name}` needs its artifact stamped for {backend}, and none \
+                     under {} is (stamped for {backend} here: {have:?}); make it with the import \
+                     `pie serve` runs, `pie model import <its source, e.g. Qwen/Qwen3-0.6B>`, \
+                     which also restamps one another pie imported",
+                    req.artifacts.display()
                 )
             })?;
         picked.push(hit.clone());
@@ -202,7 +214,14 @@ fn tune_metal(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned,
         return Ok(tuned!(out, wrong: out.wrong));
     }
     let depth = if req.full { Depth::Full } else { Depth::Quick };
-    let out = run(depth, Some(req.profiles), req.cache, req.refit, &models, say)?;
+    let out = run(
+        depth,
+        Some(req.profiles),
+        req.cache,
+        req.refit,
+        &models,
+        say,
+    )?;
     Ok(tuned!(out, wrong: out.wrong))
 }
 
