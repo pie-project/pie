@@ -185,8 +185,10 @@ impl Library {
         let (major, minor) = (version / 100_000, version / 100 % 1000);
         if (major, minor) != (KNOWN_MAJOR, KNOWN_MINOR) {
             return Err(format!(
-                "hipBLASLt {major}.{minor} (version {version}); the grouped arguments are \
-                 known for {KNOWN_MAJOR}.{KNOWN_MINOR}"
+                "hipBLASLt {major}.{minor} (version {version}) is not the \
+                 {KNOWN_MAJOR}.{KNOWN_MINOR} this build requires: its grouped kernels are \
+                 launched by their kernarg ABI (UserArguments, internalArgs), which this \
+                 module builds by hand as {KNOWN_MAJOR}.{KNOWN_MINOR} lays it out"
             ));
         }
         let tag = match dtype {

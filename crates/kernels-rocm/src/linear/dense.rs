@@ -287,17 +287,19 @@ pub(crate) fn act_x_wt_live(
 ) -> Result<bool, Error> {
     use crate::hip::lt_grouped::{USER_ARGS_BYTES, library};
     use crate::jit::{ArgValue, Fire, Launch};
-    let Ok(lib) = library(dtype::Dtype::Bf16) else {
-        return Ok(false);
-    };
+    let lib = library(dtype::Dtype::Bf16).map_err(|why| refuse(op, why))?;
     let tiles = ctx.tuning().gemm_live_tiles;
-    let Some(at) = tiles
+    let at = tiles
         .iter()
-        .map(|&t| lib.pick(t))
-        .collect::<Option<Vec<usize>>>()
-    else {
-        return Ok(false);
-    };
+        .map(|&t| {
+            lib.pick(t).ok_or_else(|| {
+                refuse(
+                    op,
+                    format!("the profile's live-row tile {t} is not in hipBLASLt's grouped library"),
+                )
+            })
+        })
+        .collect::<Result<Vec<usize>, Error>>()?;
     // Launch r takes live rows up to its tile's MT1 (the last, up to m).
     let bound = |r: usize| {
         if r == 2 {
