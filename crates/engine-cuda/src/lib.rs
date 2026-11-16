@@ -39,6 +39,7 @@ pub mod staged_h2d;
 pub mod store;
 pub mod synth;
 pub mod tap;
+pub mod top;
 pub mod tune;
 pub mod voxels;
 pub mod weights;

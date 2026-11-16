@@ -11,6 +11,7 @@ use checkpoint::plan::{LoadPlan, StorageTarget, compile, compile_streaming};
 use checkpoint::serving::Stamp;
 use checkpoint::types::{ScaleForm, TensorId};
 use engine::load::Tiers;
+pub(crate) use engine::load::rectangle;
 use kernels_slang::Tensor;
 use poem_ir::{Dtype, ParamSource, Trace};
 
@@ -827,13 +828,6 @@ pub fn plane_bytes(trace: &Trace) -> Result<Vec<u64>> {
             })
         })
         .collect()
-}
-
-pub(crate) fn rectangle(shape: &[u64]) -> (u64, u64) {
-    match shape.split_first() {
-        Some((rows, rest)) => (*rows, rest.iter().product()),
-        None => (1, 1),
-    }
 }
 
 fn places(trace: &Trace, layout: &Layout) -> Result<Vec<Place>> {
