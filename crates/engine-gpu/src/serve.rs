@@ -1430,34 +1430,53 @@ impl<B: Serve> Shell<B> {
         act_chunks.dedup_by_key(|&mut (_, chunks)| chunks);
         act_chunks.reverse();
         span.widen(&act_chunks, chunk);
-        let layout = crate::store::layout::Layout::new(
-            chunk,
-            total,
-            segment_chunks,
-            page_size,
-            [rows.list_bytes, rows.fixed_bytes],
-            rows.pieces,
-            boot.slots,
-            asked.pages_per_slot,
-        )?
-        .with_rs(rs_bytes, rs_tokens, asked.pages_per_slot)?
-        .with_guests(B::CHANNEL_CELLS)?;
-        let layout = rows
-            .windows
-            .iter()
-            .enumerate()
-            .try_fold(layout, |layout, (k, w)| {
-                layout.with_window(
-                    k,
-                    w.bytes,
-                    w.window,
-                    w.tokens,
-                    asked.context().div_ceil(w.tokens.max(1)),
-                )
-            })?;
+        // The load lays every seat a run of each shape for its
+        // seat-addressed fires (its own naming walk among them): as many
+        // seats as `boot.slots` asks whose runs fit the pool it laid, below
+        // the activation span, so no such fire names a chunk past the pool.
+        let lay = |seats: u32| -> Result<crate::store::layout::Layout> {
+            let layout = crate::store::layout::Layout::new(
+                chunk,
+                total,
+                segment_chunks,
+                page_size,
+                [rows.list_bytes, rows.fixed_bytes],
+                rows.pieces,
+                seats,
+                asked.pages_per_slot,
+            )?
+            .with_rs(rs_bytes, rs_tokens, asked.pages_per_slot)?
+            .with_guests(B::CHANNEL_CELLS)?;
+            rows.windows
+                .iter()
+                .enumerate()
+                .try_fold(layout, |layout, (k, w)| {
+                    layout.with_window(
+                        k,
+                        w.bytes,
+                        w.window,
+                        w.tokens,
+                        asked.context().div_ceil(w.tokens.max(1)),
+                    )
+                })
+        };
+        let state_chunks = total.saturating_sub(act_chunks.last().map_or(0, |&(_, c)| c));
+        let slots = crate::store::layout::seats_within(boot.slots, state_chunks, |seats| {
+            lay(seats).map(|layout| layout.seat_chunks())
+        })?;
+        let layout = lay(slots)?;
+        if slots < boot.slots {
+            tracing::info!(
+                asked = boot.slots,
+                seats = slots,
+                seat_chunks = layout.seat_chunks(),
+                state_chunks,
+                "the seats are fitted to the pool the load laid: each takes a run of every \
+                 shape below the activation span"
+            );
+        }
         let pages =
             u64::from(layout.list.map_or(0, |list| list.per_chunk)) * u64::from(total - unindexed);
-        let slots = boot.slots;
         tracing::info!(
             chunk,
             total,
