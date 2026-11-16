@@ -78,6 +78,9 @@ pub enum Fill {
         unit: usize,
         parts: Vec<(u32, u32, u32)>,
     },
+    /// A row's argmax over a root's columns of the logits (`(from, len)` spans, in order): two
+    /// words a row, the largest logit's bits and its column.
+    HostArgmax { unit: usize, parts: Vec<(u32, u32)> },
     /// The concatenation of each `(value, from, len)`'s flat elements (a state column root's
     /// conv taps and decay parameters, its head's of the layer's).
     Slices(Vec<(u32, u32, u32)>),
@@ -1101,6 +1104,23 @@ fn root_params(p: &Program, ui: usize, c: Coord, side: Side) -> Vec<(String, u32
 /// A unit's CX roots' file (`side` Row) or column root `idx`'s (Col), its arrays the host
 /// fills, its printed regions.
 #[allow(clippy::too_many_lines)]
+/// The value a decode program's roots reduce to its argmax a row: the widest the host reads
+/// back (the logits); none in a stream reading.
+fn argmax_of(p: &Program) -> Option<ValueId> {
+    p.shape.cache?;
+    p.units
+        .iter()
+        .flat_map(|b| &b.unit.steps)
+        .filter_map(|s| match s {
+            Step::Out {
+                value, host: true, ..
+            } => Some(*value),
+            _ => None,
+        })
+        .max_by_key(|c| c.width)
+        .map(|c| c.base)
+}
+
 fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32) -> R<RootFile> {
     let u = &b.unit;
     let l = &b.layout;
@@ -1186,6 +1206,8 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
     let mut hin_parts: Vec<(u32, u32, u32)> = Vec::new();
     let mut hout_w = 0u32;
     let mut hout_parts: Vec<(u32, u32, u32)> = Vec::new();
+    // the logits' spans in `hout` (offset, len, column): a decode step's argmax a row
+    let mut amax: Vec<(u32, u32, u32)> = Vec::new();
     let mut scal: Vec<(usize, usize)> = Vec::new();
     let carried = if side == Side::Col {
         carry(p, b)
@@ -1727,6 +1749,9 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
                                 &format!("  @fmovs({}, {src});\n", at("D_hout", &off, m)),
                             );
                         }
+                        if argmax_of(p) == Some(value.base) {
+                            amax.push((hout_w, len, f));
+                        }
                         hout_parts.push((value.base.0, f, len));
                         hout_w += len;
                     }
@@ -1935,6 +1960,38 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
                 parts: hout_parts,
             },
         });
+    }
+    if !amax.is_empty() {
+        // a row's (largest logit, its column): the first column on a tie, torch.argmax's
+        let _ = writeln!(
+            t,
+            "var hmax = @zeros([{}]u32);\nvar hmax_p: [*]u32 = &hmax;",
+            2 * rows
+        );
+        let mut f =
+            String::from("fn amax(t: u16) void {\n  var m: f32 = -3.0e38;\n  var k: u32 = 0;\n");
+        for &(o, len, from) in &amax {
+            let _ = writeln!(
+                f,
+                "  {{ var i: u16 = 0; while (i < {len}) : (i += 1) {{ const v = hout[t * HOUTW + {o} + i]; if (v > m) {{ m = v; k = {from} + @as(u32, i); }} }} }}"
+            );
+        }
+        f.push_str("  hmax[2 * t] = @bitcast(u32, m);\n  hmax[2 * t + 1] = k;\n}\n");
+        t.push_str(&f);
+        g.exports.push(("hmax_p".into(), "hmax".into(), false));
+        arrays.push(HostArray {
+            at: Coord::new(0, 0),
+            sym: "hmax".into(),
+            u16: false,
+            len: 2 * rows,
+            fill: Fill::HostArgmax {
+                unit: ui,
+                parts: amax.iter().map(|&(_, len, from)| (from, len)).collect(),
+            },
+        });
+        g.end.push_str(&format!(
+            "  {{ var t: u16 = 0; while (t < {rows}) : (t += 1) {{ amax(t); }} }}\n"
+        ));
     }
     if !scal.is_empty() {
         let ns = scal.len() as u32;
@@ -2526,18 +2583,17 @@ fn layout_file(p: &Program, tiles: &Tiles, arrays: &[HostArray]) -> String {
             }
         }
     }
-    let mut names: BTreeMap<String, bool> = BTreeMap::new();
+    // an array's element type: words (config, positions, stamps, an argmax's) u32
+    let mut names: BTreeMap<String, &str> = BTreeMap::new();
     for a in arrays {
-        names.insert(a.sym.clone(), a.u16);
-    }
-    for (n, u16) in &names {
-        let ty = if n == "tsc" || n == "pcfg" || n == "pos" {
-            "u32"
-        } else if *u16 {
-            "u16"
-        } else {
-            "f32"
+        let ty = match a.fill {
+            Fill::Words(_) | Fill::Stamps | Fill::HostArgmax { .. } => "u32",
+            _ if a.u16 => "u16",
+            _ => "f32",
         };
+        names.insert(a.sym.clone(), ty);
+    }
+    for (n, ty) in &names {
         let _ = writeln!(t, "  @export_name(\"{n}\", [*]{ty}, true);");
     }
     t.push_str("  @export_name(\"run\", fn() void);\n}\n");

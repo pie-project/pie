@@ -316,7 +316,7 @@ fn fill(p: &Program, vals: Option<&Values>, a: &HostArray) -> R<Vec<f32>> {
             })?;
         }
         Fill::Words(w) => out = w.iter().map(|&x| f32::from_bits(x)).collect(),
-        Fill::HostOut { .. } | Fill::Stamps => {}
+        Fill::HostOut { .. } | Fill::HostArgmax { .. } | Fill::Stamps => {}
     }
     Ok(out)
 }
@@ -847,7 +847,12 @@ pub fn write(p: &Program, arrays: &[HostArray], gold: Option<&Path>, out: &Path)
     }
     let ins: Vec<&HostArray> = arrays
         .iter()
-        .filter(|a| !matches!(a.fill, Fill::HostOut { .. } | Fill::Stamps))
+        .filter(|a| {
+            !matches!(
+                a.fill,
+                Fill::HostOut { .. } | Fill::HostArgmax { .. } | Fill::Stamps
+            )
+        })
         .collect();
     let mut memo = BTreeMap::new();
     let mut h2d = Vec::new();
@@ -941,6 +946,16 @@ pub fn write(p: &Program, arrays: &[HostArray], gold: Option<&Path>, out: &Path)
             d2h.push(json!({"sym": a.sym, "x": a.at.x, "y": a.at.y, "len": a.len, "rows": rows, "parts": parts}));
         }
     }
+    // a decode program's argmax a row, each root's over its columns of the logits
+    let mut argmax = Vec::new();
+    for a in arrays {
+        if let Fill::HostArgmax { unit, parts } = &a.fill {
+            let rows: Vec<usize> = (0..p.units[*unit].unit.rows)
+                .map(|t| trace_row(p, *unit, t))
+                .collect();
+            argmax.push(json!({"sym": a.sym, "x": a.at.x, "y": a.at.y, "len": a.len, "rows": rows, "parts": parts}));
+        }
+    }
     // the reference: the host values the outputs are compared to
     let mut refs = Vec::new();
     for a in arrays {
@@ -989,6 +1004,9 @@ pub fn write(p: &Program, arrays: &[HostArray], gold: Option<&Path>, out: &Path)
             "name": b.unit.name, "x": su.x, "cols": su.cols(), "rows": p.stream.py,
         })).collect::<Vec<_>>(),
     });
+    if !argmax.is_empty() {
+        host["argmax"] = json!(argmax);
+    }
     if let Some(gold) = gold {
         // (absolute: the runners read it from another directory)
         let gold = std::fs::canonicalize(gold).unwrap_or_else(|_| gold.to_path_buf());
