@@ -141,7 +141,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     let mut profile = DeviceProfile::of(&chip, device.device().num_sm, &crate::EXCLUSIVE, grouped);
     let mut kernels = poem_compiler::fuse::flags::on(&chip, &crate::FUSIONS);
     if !boot.knobs.diagnostics.fuse_chains {
-        kernels.retain(|rule| crate::UNCHAINED.contains(&rule.kernel()));
+        kernels.clear();
     }
     #[cfg(feature = "rocm")]
     {
@@ -178,8 +178,18 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     } else {
         std::collections::BTreeMap::new()
     };
+    // ROCm holds no contraction skeletons: a profile that asks for anchored
+    // regions there is refused, not served without them.
     #[cfg(feature = "rocm")]
-    let anchored = std::collections::BTreeMap::new();
+    let anchored = if profile.synth_anchors {
+        return Err(Fault::Unsupported(
+            "`compiler.synth_anchors` folds a product's epilogue into its contraction \
+             skeleton, which ROCm does not hold; serve it with the knob off"
+                .to_owned(),
+        ));
+    } else {
+        std::collections::BTreeMap::new()
+    };
     profile.synth_anchors = false;
     // `compiler.synth_regions`: each chain of elementwise and row ops the row
     // skeleton serves folded into one `fused.region`, its region kernels-ir's.

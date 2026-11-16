@@ -196,7 +196,8 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     // HIP graphs have no conditional node: one is priced past any launch it
     // could skip, so the compiler lowers every region to `AlwaysLaunch`. The
     // residual norms run as generated row kernels there too; the products'
-    // epilogues keep their hand rules until ROCm holds contraction skeletons.
+    // epilogues run on their hand rules (`FUSIONS`), ROCm holding no
+    // contraction skeletons.
     #[cfg(feature = "rocm")]
     poem_compiler::costs::register_regions_for(
         &mut r,
