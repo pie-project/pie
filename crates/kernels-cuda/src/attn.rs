@@ -398,6 +398,9 @@ fn fa2_prefill_with(
     if let Some((bits, indptr)) = &mask {
         params.maybe_custom_mask = bits.ptr;
         params.maybe_mask_indptr = indptr.ptr;
+        if let Some(origin) = &plan.mask_origin {
+            params.maybe_mask_origin = origin.ptr;
+        }
     }
     // Unsplit rows land their sinks in the kernel's epilogue (no sink pass after).
     let sunk = sinks

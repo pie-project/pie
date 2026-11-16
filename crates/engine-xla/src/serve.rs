@@ -1958,6 +1958,7 @@ impl Shell {
                     base,
                     folded,
                     fold,
+                    lineage,
                 } => {
                     let id = rs_shape.ok_or_else(|| Fault::Program {
                         at: "serve::rs",
@@ -1968,14 +1969,17 @@ impl Shell {
                         base: *base,
                         folded: *folded,
                         fold: *fold,
+                        lineage: *lineage,
                     }
                 }
                 engine::fire::RsVerb::Fold => engine::fire::RsVerb::Fold,
             });
-            if let engine::fire::RsVerb::Buffer { folded, .. } = seated.rs {
-                let rows = seated.lane.tokens.len() as u32;
+            if let engine::fire::RsVerb::Buffer {
+                folded, lineage, ..
+            } = seated.rs
+            {
                 let first = seated.first.unwrap_or(have);
-                let reads = engine::fire::buffered_reads(seated.mask, *folded, first, rows)
+                let reads = engine::fire::buffered_reads(seated.mask, *folded, first, *lineage)
                     .map_err(|e| Fault::Program {
                         at: "serve::rs",
                         why: format!("lane {at}: {e}"),

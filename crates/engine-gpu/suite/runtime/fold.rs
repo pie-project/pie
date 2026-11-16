@@ -264,6 +264,7 @@ impl Set {
                 base: PROMPT,
                 folded,
                 fold,
+                lineage: engine::fire::Lineage::Set,
             },
             rs_reset: RsReset::Held,
             slot_copies: std::mem::take(&mut self.copies),

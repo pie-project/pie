@@ -653,7 +653,8 @@ class ForwardPass:
         _wit(self.wit.group, int(lane), int(id), what="group")
 
     def mask(self, rows: Channel) -> None:
-        """Per row, the kv slots it attends, or its attention group's rows without kv."""
+        """Per row, what it attends past the frozen part (column c is slot folded() + c:
+        the buffer, then the pass's rows), or its attention group's rows without kv."""
         self._ensure_ports_available([Port.ATTN_MASK])
         _wit(self.wit.mask, rows._wit(), what="mask")
         self._ports.append((Port.ATTN_MASK, rows))

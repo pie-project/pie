@@ -97,3 +97,15 @@ inline device T* pie_kv_plane(device T* plane, ulong offset) {
   (void)offset;
   return plane;
 }
+
+// Whether a masked row admits key `kp`. A row's mask speaks of the slots from
+// its lane's committed boundary `origin` on: every key below it is committed
+// and read under the model's own bounds alone, and the plane's column `c` is
+// key `origin + c`. A row's mask word packs its enable flag (bits 0-1: 1
+// masked, 2 wide) and `origin` (bits 2-31).
+inline bool pie_mask_admits(const device uchar* plane, uint stride, uint origin, uint row,
+                            uint kp) {
+  if (kp < origin) return true;
+  const uint column = kp - origin;
+  return column < stride && plane[ulong(row) * ulong(stride) + column] != 0;
+}

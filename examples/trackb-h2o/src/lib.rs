@@ -158,7 +158,7 @@ async fn main(input: Input) -> Result<Output> {
 
     let fwd_p = ForwardPass::new();
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
-    fwd_p.state(&[&ws], StateGeometry::folding())?;
+    fwd_p.state(&[&ws], StateGeometry::default())?;
     fwd_p.epilogue(move || {
         let r = rng_p.take();
         let logits = intrinsics::output(0, "logits");
@@ -209,7 +209,7 @@ async fn main(input: Input) -> Result<Output> {
 
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &lane1)?;
-        fwd.state(&[&ws], StateGeometry::folding())?;
+        fwd.state(&[&ws], StateGeometry::default())?;
 
         fwd.epilogue(move || {
             let r = rng.take();
@@ -313,7 +313,7 @@ async fn main(input: Input) -> Result<Output> {
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &lane1)?;
         fwd.mask(&mask)?;
-        fwd.state(&[&ws], StateGeometry::folding())?;
+        fwd.state(&[&ws], StateGeometry::default())?;
         fwd.epilogue(move || {
             let length = fill.take();
             let r = rng.take();
