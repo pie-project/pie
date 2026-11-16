@@ -839,7 +839,11 @@ impl Reading {
                 value: ValueId(v as u32),
                 rows: tokens.len(),
                 width: 1,
-                values: Values::I32((0..tokens.len()).map(|i| (at as usize + i) as i32).collect()),
+                values: Values::I32(
+                    (0..tokens.len())
+                        .map(|i| (at as usize + i) as i32)
+                        .collect(),
+                ),
             })
             .collect();
         let entries = self.entries_given(host, &step, &given)?;

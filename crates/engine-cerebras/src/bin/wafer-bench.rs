@@ -288,7 +288,12 @@ fn decode(get: &HashMap<String, String>) -> Result<bool, String> {
     let ids = |k: &str| -> Vec<u32> {
         golden[k]
             .as_array()
-            .map(|a| a.iter().filter_map(|t| t.as_u64()).map(|t| t as u32).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|t| t.as_u64())
+                    .map(|t| t as u32)
+                    .collect()
+            })
             .unwrap_or_default()
     };
     let (prompt, seq) = (ids("prompt"), ids("tokens"));
@@ -297,8 +302,8 @@ fn decode(get: &HashMap<String, String>) -> Result<bool, String> {
     let d = poem_compiler::catalog::repository()
         .parse(&reading.model)
         .ok_or_else(|| format!("{}: no such deployment", reading.model))?;
-    let source = checkpoint::file::snapshot::open(&ckpt)
-        .map_err(|e| format!("{}: {e}", ckpt.display()))?;
+    let source =
+        checkpoint::file::snapshot::open(&ckpt).map_err(|e| format!("{}: {e}", ckpt.display()))?;
     let contract = d
         .contract(&source, poem_ir::Platform::Cerebras)
         .map_err(|e| format!("the import contract of {}: {e}", reading.model))?;
@@ -346,10 +351,11 @@ fn decode(get: &HashMap<String, String>) -> Result<bool, String> {
         let engine_cpu::forward::Values::F32(v) = &logits.values else {
             return Err("logits not f32".into());
         };
-        let (best, top) = v
-            .iter()
-            .enumerate()
-            .fold((0usize, f32::MIN), |b, (i, &x)| if x > b.1 { (i, x) } else { b });
+        let (best, top) =
+            v.iter().enumerate().fold(
+                (0usize, f32::MIN),
+                |b, (i, &x)| if x > b.1 { (i, x) } else { b },
+            );
         let want = seq[s + 1];
         let past = s + 1 >= prompt.len();
         if past {
@@ -367,7 +373,10 @@ fn decode(get: &HashMap<String, String>) -> Result<bool, String> {
         );
     }
     rt.stop();
-    println!("DECODE_RESULT {}", json!({"held": held, "checked": checked}));
+    println!(
+        "DECODE_RESULT {}",
+        json!({"held": held, "checked": checked})
+    );
     Ok(held == checked)
 }
 

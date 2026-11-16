@@ -253,7 +253,9 @@ fn input_methods(builder: &mut MethodsBuilder) {
         let rec = input_of(*this).recorder().clone();
         let heap = eval.heap();
         let mut carried = carried;
-        let keep = DEPTH.with(std::cell::Cell::get).map_or(usize::MAX, |n| n as usize);
+        let keep = DEPTH
+            .with(std::cell::Cell::get)
+            .map_or(usize::MAX, |n| n as usize);
         for (l, layer) in layers.items.into_iter().enumerate().take(keep) {
             rec.enter(l as u32);
             let out = eval.eval_function(block, &[heap.alloc(l as u32), layer, carried], &[]);

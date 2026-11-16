@@ -146,17 +146,18 @@ pub fn shape(trace: &Trace, reading: &str, classes: &[RowClass]) -> R<StreamShap
                 sm_scale,
                 ..
             }) => {
-                let kv_heads = match trace
-                    .values
-                    .get(plan.0 as usize)
-                    .map(|d| &d.def)
-                    .and_then(|d| match d {
-                        poem_ir::Def::Op(n) => trace.nodes.get(*n as usize).map(|n| &n.op),
-                        _ => None,
-                    }) {
-                    Some(Operation::Attn(Attn::PlanDecode { kv_heads, .. })) => *kv_heads,
-                    _ => return Err(refuse("attn.decode: its plan is no decode plan".into())),
-                };
+                let kv_heads =
+                    match trace
+                        .values
+                        .get(plan.0 as usize)
+                        .map(|d| &d.def)
+                        .and_then(|d| match d {
+                            poem_ir::Def::Op(n) => trace.nodes.get(*n as usize).map(|n| &n.op),
+                            _ => None,
+                        }) {
+                        Some(Operation::Attn(Attn::PlanDecode { kv_heads, .. })) => *kv_heads,
+                        _ => return Err(refuse("attn.decode: its plan is no decode plan".into())),
+                    };
                 let spec = JointSpec {
                     q_heads: width_of(trace, *q) / (*head_dim).max(1),
                     kv_heads,

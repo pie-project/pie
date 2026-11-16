@@ -1564,10 +1564,14 @@ impl Builder {
             } if f.mscale == 1.0 => {
                 let turn = rotation(self.width, *head_dim, *theta, turn)?;
                 let pos = self.get(*positions)?;
-                let qo = self.b.rotate_with(self.get(*q)?, pos, &turn, Some(&f.inv_freq));
+                let qo = self
+                    .b
+                    .rotate_with(self.get(*q)?, pos, &turn, Some(&f.inv_freq));
                 self.set(*q_out, qo);
                 if let (Some(k), Some(k_out)) = (k, k_out) {
-                    let ko = self.b.rotate_with(self.get(*k)?, pos, &turn, Some(&f.inv_freq));
+                    let ko = self
+                        .b
+                        .rotate_with(self.get(*k)?, pos, &turn, Some(&f.inv_freq));
                     self.set(*k_out, ko);
                 }
             }
