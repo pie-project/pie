@@ -11,14 +11,15 @@
 //!
 //! Every shape is `engine::rates`' lattice, and its counts turn the times
 //! into rates, so the CUDA and ROCm rates mean what every backend's do:
-//! - `bf16_flops_per_ns_by_rows`: the matmul at each row count of
-//!   [`LATTICE_ROWS`] through `linear::gemm` (cuBLAS(Lt) on CUDA,
+//! - `bf16_flops_per_ns_by_rows_and_depth`: the matmul `m x k x k` at each
+//!   row count of [`LATTICE_ROWS`] and depth of [`DEPTHS`] through `linear::gemm` (cuBLAS(Lt) on CUDA,
 //!   hipBLASLt/rocBLAS on ROCm) under the GEMM tactics serving runs; its
 //!   launches rotate through [`WEIGHTS`] weight planes, more than any
 //!   last-level cache holds, so each reads its weight from device memory as
 //!   a layer's does.
-//! - `attn_flops_per_ns`: the paged prefill attention at [`ATTN_SHAPE`],
-//!   causal, in pages of [`PAGE`].
+//! - `attn_flops_per_ns_by_keys`: the paged prefill attention at
+//!   [`ATTN_SHAPE`]'s heads over each of [`ATTN_KEYS`] (a sequence of as many
+//!   rows attending itself), causal, in pages of [`PAGE`].
 //! - `scan_elements_per_ns`: the causal conv and the chunked gated delta
 //!   scan at [`SCAN_SHAPE`].
 //! - `bytes_per_ns`: a [`COPY_BYTES`] device-to-device copy, read plus write.
@@ -27,7 +28,7 @@
 //!   body, as serving replays them.
 
 #[cfg_attr(not(feature = "device"), allow(unused_imports))]
-use engine::rates::{ATTN_SHAPE, GEMM_COLUMNS, GEMM_DEPTH, LATTICE_ROWS, SCAN_SHAPE};
+use engine::rates::{ATTN_KEYS, ATTN_SHAPE, DEPTHS, LATTICE_ROWS, SCAN_SHAPE};
 use profile::fire::Rates;
 
 /// The weight planes a matmul burst rotates through: 12 x 32 MiB, past the
@@ -220,15 +221,18 @@ mod on_device {
         let stream = device.stream();
         let clock = Clock::new(stream)?;
         let mut held = Vec::new();
-        let curve = gemm(device.ctx(), &clock, &mut held)?;
-        let attn = attention(&device, &clock, &mut held)?;
+        let grid = gemm(device.ctx(), &clock, &mut held)?;
+        let mut attn = Vec::with_capacity(ATTN_KEYS.len());
+        for keys in ATTN_KEYS {
+            attn.push((keys, attention(&device, &clock, &mut held, keys)?));
+        }
         let scan = scan(device.ctx(), &clock, &mut held)?;
         let bytes = copy(stream, &clock)?;
         let launch = launch(device.ctx(), stream, &clock, &mut held)?;
         device.synchronize().map_err(say("the device"))?;
         Ok(Rates {
-            bf16_flops_per_ns_by_rows: Some(curve),
-            attn_flops_per_ns: Some(attn),
+            bf16_flops_per_ns_by_rows_and_depth: Some(grid),
+            attn_flops_per_ns_by_keys: Some(attn),
             scan_elements_per_ns: Some(scan),
             bytes_per_ns: Some(bytes),
             launch_ns: Some(launch),
@@ -236,8 +240,26 @@ mod on_device {
         })
     }
 
-    fn gemm(ctx: &Ctx, clock: &Clock, held: &mut Vec<Buffer>) -> Result<Vec<(u32, f64)>, String> {
-        let (n, k) = (GEMM_COLUMNS, GEMM_DEPTH);
+    fn gemm(
+        ctx: &Ctx,
+        clock: &Clock,
+        held: &mut Vec<Buffer>,
+    ) -> Result<Vec<(u32, u32, f64)>, String> {
+        let mut grid = Vec::with_capacity(LATTICE_ROWS.len() * DEPTHS.len());
+        for &k in &DEPTHS {
+            grid.extend(gemm_at(ctx, clock, held, k)?);
+        }
+        Ok(grid)
+    }
+
+    /// The matmul `m x k x k` at every row count of the lattice.
+    fn gemm_at(
+        ctx: &Ctx,
+        clock: &Clock,
+        held: &mut Vec<Buffer>,
+        k: u32,
+    ) -> Result<Vec<(u32, u32, f64)>, String> {
+        let n = k;
         let most = *LATTICE_ROWS.last().expect("rows") as usize;
         let act = zeroed(most * k as usize * 2)?;
         let y = zeroed(most * n as usize * 2)?;
@@ -256,17 +278,22 @@ mod on_device {
             };
             lay(held, || fire(0))?;
             let ns = clock.burst(ROUNDS, &mut |i| fire(i).map_err(say("the matmul")))?;
-            curve.push((m, engine::rates::gemm_flops(m) / ns));
+            curve.push((m, k, engine::rates::gemm_flops(m, k) / ns));
         }
         Ok(curve)
     }
 
-    fn attention(device: &Context, clock: &Clock, held: &mut Vec<Buffer>) -> Result<f64, String> {
+    fn attention(
+        device: &Context,
+        clock: &Clock,
+        held: &mut Vec<Buffer>,
+        keys_n: u32,
+    ) -> Result<f64, String> {
         let ctx = device.ctx();
+        let at = ATTN_SHAPE.at(keys_n);
         // One sequence attending its own keys, written before the attention.
-        let (rows, d) = (ATTN_SHAPE.rows, ATTN_SHAPE.head_dim);
-        let (q_heads, kv_heads) = (ATTN_SHAPE.q_heads, ATTN_SHAPE.kv_heads);
-        debug_assert_eq!(ATTN_SHAPE.keys, rows);
+        let (rows, d) = (at.rows, at.head_dim);
+        let (q_heads, kv_heads) = (at.q_heads, at.kv_heads);
         let pages = rows.div_ceil(PAGE);
         let kv_width = kv_heads * d;
         let cells = (pages * PAGE) as usize;
@@ -368,7 +395,7 @@ mod on_device {
         };
         lay(held, fire)?;
         let ns = clock.burst(ROUNDS, &mut |_| fire().map_err(say("the attention")))?;
-        Ok(engine::rates::attn_flops(ATTN_SHAPE) / ns)
+        Ok(engine::rates::attn_flops(at) / ns)
     }
 
     fn scan(ctx: &Ctx, clock: &Clock, held: &mut Vec<Buffer>) -> Result<f64, String> {

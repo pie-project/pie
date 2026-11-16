@@ -50,7 +50,7 @@ prefill_lattice_steps = 8
 
 [rates]
 # 121 TFLOPS dense bf16 (NVIDIA L4 datasheet; 242 with sparsity).
-bf16_flops_per_ns_by_rows = [[4096, 121000.0]]
+bf16_flops_per_ns_by_rows_and_depth = [[4096, 4096, 121000.0]]
 # 300 GB/s of GDDR6 (L4 datasheet).
 bytes_per_ns = 300.0
 

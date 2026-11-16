@@ -67,8 +67,8 @@ impl Serve for Api {
         let tuning = {
             let chip = tuning.profile().clone();
             let rates = chip.rates();
-            if rates.bf16_flops_per_ns_by_rows.is_some()
-                && rates.attn_flops_per_ns.is_some()
+            if rates.bf16_flops_per_ns_by_rows_and_depth.is_some()
+                && rates.attn_flops_per_ns_by_keys.is_some()
                 && rates.scan_elements_per_ns.is_some()
                 && rates.bytes_per_ns.is_some()
             {

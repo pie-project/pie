@@ -57,8 +57,8 @@ dag_streams_until = 256
 # weights so each reads device memory; the vendor's 362 TFLOPS dense bf16 is
 # the bound (~76% from 1024 rows). Two runs agree within 0.1% up to 256 rows
 # and 1.4% past (the compute-bound points move with the card's clocks).
-bf16_flops_per_ns_by_rows = [[16, 10833.3], [32, 21725.1], [64, 43024.3], [128, 72548.6], [256, 161101.1], [512, 268854.9], [1024, 273717.9], [2048, 275023.2], [4096, 277940.1], [8192, 277082.8]]
-attn_flops_per_ns = 283166.8
+bf16_flops_per_ns_by_rows_and_depth = [[16, 4096, 10833.3], [32, 4096, 21725.1], [64, 4096, 43024.3], [128, 4096, 72548.6], [256, 4096, 161101.1], [512, 4096, 268854.9], [1024, 4096, 273717.9], [2048, 4096, 275023.2], [4096, 4096, 277940.1], [8192, 4096, 277082.8]]
+attn_flops_per_ns_by_keys = [[2048, 283166.8]]
 scan_elements_per_ns = 2683.2
 bytes_per_ns = 653.3
 launch_ns = 907

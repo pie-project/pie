@@ -103,6 +103,6 @@ fn the_device_rates() {
     );
     println!("launch: {launch_ns} ns a dispatch ({LAUNCHES} small gemms in one frame)");
     println!(
-        "[rates]\nbf16_flops_per_ns_by_rows = [[4096, {flops_per_ns:.1}]]\nbytes_per_ns = {bytes_per_ns:.1}\nlaunch_ns = {launch_ns}"
+        "[rates]\nbf16_flops_per_ns_by_rows_and_depth = [[4096, 4096, {flops_per_ns:.1}]]\nbytes_per_ns = {bytes_per_ns:.1}\nlaunch_ns = {launch_ns}"
     );
 }

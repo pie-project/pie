@@ -44,22 +44,38 @@ pub fn rates(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Rated
         .and_then(Path::parent)
         .map(|home| home.join("cache"));
     let r = crate::rates::measure(0, &base, cache.as_deref())?;
-    let curve = r.bf16_flops_per_ns_by_rows.clone().unwrap_or_default();
-    let at = |rows: u32| curve.iter().find(|p| p.0 == rows).map_or(0.0, |p| p.1);
+    let grid = r
+        .bf16_flops_per_ns_by_rows_and_depth
+        .clone()
+        .unwrap_or_default();
+    let attn = r.attn_flops_per_ns_by_keys.clone().unwrap_or_default();
+    for &k in &engine::rates::DEPTHS {
+        let at = |rows: u32| {
+            grid.iter()
+                .find(|p| p.0 == rows && p.1 == k)
+                .map_or(0.0, |p| p.2)
+        };
+        say(&format!(
+            "[rates]: bf16 at depth {k}: {:.1} TFLOP/s at 16 rows to {:.1} at 8192",
+            at(16) / 1e3,
+            at(8192) / 1e3
+        ));
+    }
     say(&format!(
-        "[rates]: bf16 {:.1} TFLOP/s at 16 rows to {:.1} at 8192, attention {:.1} TFLOP/s, \
-         scan {:.0} G elements/s, {:.0} GB/s, launch {} ns",
-        at(16) / 1e3,
-        at(8192) / 1e3,
-        r.attn_flops_per_ns.unwrap_or(0.0) / 1e3,
+        "[rates]: attention {:.1} TFLOP/s at 512 keys to {:.1} at 16384, scan {:.0} G \
+         elements/s, {:.0} GB/s, launch {} ns",
+        r.attn_at(512).unwrap_or(0.0) / 1e3,
+        r.attn_at(16384).unwrap_or(0.0) / 1e3,
         r.scan_elements_per_ns.unwrap_or(0.0),
         r.bytes_per_ns.unwrap_or(0.0),
         r.launch_ns.unwrap_or(0),
     ));
     let tenth = |v: f64| (v * 10.0).round() / 10.0;
     let r = profile::fire::Rates {
-        bf16_flops_per_ns_by_rows: Some(curve.iter().map(|&(m, v)| (m, tenth(v))).collect()),
-        attn_flops_per_ns: r.attn_flops_per_ns.map(tenth),
+        bf16_flops_per_ns_by_rows_and_depth: Some(
+            grid.iter().map(|&(m, k, v)| (m, k, tenth(v))).collect(),
+        ),
+        attn_flops_per_ns_by_keys: Some(attn.iter().map(|&(k, v)| (k, tenth(v))).collect()),
         scan_elements_per_ns: r.scan_elements_per_ns.map(tenth),
         bytes_per_ns: r.bytes_per_ns.map(tenth),
         ..r

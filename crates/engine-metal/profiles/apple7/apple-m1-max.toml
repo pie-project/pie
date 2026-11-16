@@ -12,7 +12,7 @@ assumes = { cores = 24 }
 # A 4096^3 bf16 GEMM through the dense kernel serving dispatches
 # (simdgroup-matrix, f32 accumulation): 5.28 TFLOPS. Peak: 7.96 TFLOPS of f32
 # FMA (24 cores x 128 ALUs x 2 x 1.296 GHz); the GPU has no faster bf16 path.
-bf16_flops_per_ns_by_rows = [[4096, 5282.0]]
+bf16_flops_per_ns_by_rows_and_depth = [[4096, 4096, 5282.0]]
 # A 256 MiB blit between two buffers, read and write counted: 377 GB/s. Peak:
 # 400 GB/s of LPDDR5 (Apple's M1 Max figure).
 bytes_per_ns = 377.2

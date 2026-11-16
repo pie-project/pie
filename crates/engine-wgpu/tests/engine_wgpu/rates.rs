@@ -28,15 +28,17 @@ fn the_micro_fires_state_rates_and_the_ruling_picks_by_them() {
     assert!((1.0..1e6).contains(&flops), "{flops}");
     assert!((1.0..1e4).contains(&bytes), "{bytes}");
     assert!(launch > 0);
-    // The curve at every row of the lattice, the attention and scan rates.
-    let curve = rates.bf16_flops_per_ns_by_rows.clone().unwrap();
+    // The grid at every row and depth of the lattice, the attention and
+    // scan rates.
+    let grid = rates.bf16_flops_per_ns_by_rows_and_depth.clone().unwrap();
     assert_eq!(
-        curve.iter().map(|&(m, _)| m).collect::<Vec<_>>(),
-        engine::rates::LATTICE_ROWS
+        grid.len(),
+        engine::rates::LATTICE_ROWS.len() * engine::rates::DEPTHS.len()
     );
-    eprintln!("curve {curve:?}");
+    assert_eq!(profile::fire::grid(grid.clone()), Some(grid.clone()));
+    eprintln!("grid {grid:?}");
     for rate in [
-        rates.attn_flops_per_ns.unwrap(),
+        rates.attn_at(2048).unwrap(),
         rates.scan_elements_per_ns.unwrap(),
     ] {
         assert!((1.0..1e6).contains(&rate), "{rate}");
@@ -58,10 +60,11 @@ fn the_micro_fires_state_rates_and_the_ruling_picks_by_them() {
         weight_bytes: 1 << 30,
         expert_bytes: 0,
         experts: None,
-        flops_per_row: 1 << 30,
+        gemm_shapes: vec![(4096, 4096, 1 << 30)],
         attn_flops_per_row_key: 1 << 16,
         kv_bytes_per_key: 1 << 16,
         readout_flops: 1 << 28,
+        readout_depth: 4096,
         state_elements_per_row: 1 << 20,
         elementwise_bytes_per_row: 1 << 16,
         width: 4096,

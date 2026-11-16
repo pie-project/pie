@@ -31,7 +31,7 @@ walk_fire_rows = 4096
 [rates]
 # 2.25 PFLOPS dense bf16 (NVIDIA B200: 4.5 PFLOPS with sparsity, the HGX
 # B200 summary's 36 PFLOPS over 8 GPUs, halved for dense).
-bf16_flops_per_ns_by_rows = [[4096, 2250000.0]]
+bf16_flops_per_ns_by_rows_and_depth = [[4096, 4096, 2250000.0]]
 # 8 TB/s of HBM3e (NVIDIA B200 specifications).
 bytes_per_ns = 8000.0
 

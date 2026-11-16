@@ -6,11 +6,13 @@
 //! the counts here turn its times into rates, and [`tuned`] and
 //! [`provenance`] write them.
 //!
-//! - `bf16_flops_per_ns_by_rows`: a bf16 matmul `m x` [`GEMM_COLUMNS`] `x`
-//!   [`GEMM_DEPTH`] at each `m` of [`LATTICE_ROWS`], [`gemm_flops`] a
-//!   matmul over its time.
-//! - `attn_flops_per_ns`: the backend's prefill attention at [`ATTN_SHAPE`],
-//!   [`attn_flops`] over its time.
+//! - `bf16_flops_per_ns_by_rows_and_depth`: a bf16 matmul `m x k x k` (`m`
+//!   rows, `k` columns, depth `k`) at each `m` of [`LATTICE_ROWS`] and each
+//!   `k` of [`DEPTHS`], [`gemm_flops`] a matmul over its time.
+//! - `attn_flops_per_ns_by_keys`: the backend's prefill attention at
+//!   [`ATTN_SHAPE`]'s heads, one sequence of `keys` rows attending itself at
+//!   each `keys` of [`ATTN_KEYS`] ([`AttnShape::at`]), [`attn_flops`] over its
+//!   time.
 //! - `scan_elements_per_ns`: the backend's prefill gated-delta scan and the
 //!   causal conv before it at [`SCAN_SHAPE`], [`scan_elements`] over the two
 //!   together's time.
@@ -24,22 +26,18 @@
 /// matmul is compute bound).
 pub const LATTICE_ROWS: [u32; 10] = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192];
 
-/// The matmul's columns: a dense layer's width at the scale of the models
-/// served (Qwen3-8B's hidden is 4096; the 0.6B's projections run 1024 to
-/// 3072, the 8B's MLP 12288), wide enough that every column tile of every
-/// backend's kernel fills, so the curve tells the rows' effect alone.
-pub const GEMM_COLUMNS: u32 = 4096;
+/// The depths the matmul grid is measured at (its columns the same): the
+/// contractions of the dense layers served, from a small model's 1024
+/// (Qwen3-0.6B's hidden) through 4096 (Qwen3-8B's) to 8192 (a 30B-class
+/// hidden, or an MLP's down leg), since a device's rate at the same rows
+/// falls with the depth (a narrower contraction feeds fewer tiles).
+pub const DEPTHS: [u32; 4] = [1024, 2048, 4096, 8192];
 
-/// The matmul's depth, for the same reason as [`GEMM_COLUMNS`]: its
-/// operands (32 MiB each at 4096 rows) fit the binding WebGPU grants by
-/// default (128 MiB) at every row of [`LATTICE_ROWS`].
-pub const GEMM_DEPTH: u32 = 4096;
-
-/// The flops of one matmul of `rows` at [`GEMM_COLUMNS`] by [`GEMM_DEPTH`]:
+/// The flops of one matmul of `rows` at `depth` (its columns the same):
 /// two a multiply-add.
 #[must_use]
-pub fn gemm_flops(rows: u32) -> f64 {
-    2.0 * f64::from(rows) * f64::from(GEMM_COLUMNS) * f64::from(GEMM_DEPTH)
+pub fn gemm_flops(rows: u32, depth: u32) -> f64 {
+    2.0 * f64::from(rows) * f64::from(depth) * f64::from(depth)
 }
 
 /// A prefill attention the attention rate is timed at.
@@ -66,6 +64,24 @@ pub const ATTN_SHAPE: AttnShape = AttnShape {
     kv_heads: 8,
     head_dim: 128,
 };
+
+/// The keys the attention curve is measured at (each a sequence of as many
+/// rows attending itself): powers of two from 512 (a short prompt's piece)
+/// to 16384 (past the widest rung a load lays), since a paged prefill's
+/// rate a flop grows with the keys its tiles stream.
+pub const ATTN_KEYS: [u32; 6] = [512, 1024, 2048, 4096, 8192, 16384];
+
+impl AttnShape {
+    /// This shape's heads over one sequence of `keys` rows attending itself.
+    #[must_use]
+    pub fn at(self, keys: u32) -> AttnShape {
+        AttnShape {
+            rows: keys,
+            keys,
+            ..self
+        }
+    }
+}
 
 /// The flops the estimate counts for an attention of `shape`: four a query
 /// element a key (the scores' product and the values'), over every row and
@@ -142,12 +158,10 @@ pub fn tuned(rates: &profile::fire::Rates) -> String {
 pub fn provenance(backend: &str, how: &str) -> (&'static str, String) {
     let text = format!(
         "pie tune {backend} --rates on {} (pie {}): {how}; at engine::rates' lattice (matmul \
-         m x {GEMM_COLUMNS} x {GEMM_DEPTH}, m 16..8192; attention {}x{} keys, {}/{} heads of \
-         {}; scan {} tokens, {}/{} heads of {}x{}, conv {})",
+         m x k x k, m 16..8192, k 1024..8192; attention keys x keys, keys 512..16384, {}/{} \
+         heads of {}; scan {} tokens, {}/{} heads of {}x{}, conv {})",
         today(),
         env!("CARGO_PKG_VERSION"),
-        ATTN_SHAPE.rows,
-        ATTN_SHAPE.keys,
         ATTN_SHAPE.q_heads,
         ATTN_SHAPE.kv_heads,
         ATTN_SHAPE.head_dim,
@@ -192,12 +206,16 @@ mod tests {
     #[test]
     fn the_lattice_ascends_and_the_counts_are_the_estimates() {
         assert!(LATTICE_ROWS.windows(2).all(|w| w[0] < w[1]));
-        assert_eq!(gemm_flops(16), 2.0 * 16.0 * 4096.0 * 4096.0);
+        assert!(DEPTHS.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(gemm_flops(16, 1024), 2.0 * 16.0 * 1024.0 * 1024.0);
         // 4 · 2048 · 2048 · 16 · 128.
         assert_eq!(attn_flops(ATTN_SHAPE), 4.0 * 2048.0 * 2048.0 * 2048.0);
         // 2048 tokens · 16 heads · 128 · 128.
         assert_eq!(scan_elements(SCAN_SHAPE), 2048.0 * 16.0 * 16384.0);
         assert_eq!(SCAN_SHAPE.channels(), 6144);
+        assert!(ATTN_KEYS.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(ATTN_SHAPE.at(512).rows, 512);
+        assert_eq!(attn_flops(ATTN_SHAPE.at(512)), 4.0 * 512.0 * 512.0 * 2048.0);
     }
 
     #[test]
@@ -210,16 +228,17 @@ mod tests {
     #[test]
     fn the_writer_writes_what_the_profile_reads() {
         let rates = profile::fire::Rates {
-            bf16_flops_per_ns_by_rows: Some(vec![(16, 100.0), (8192, 900.5)]),
-            attn_flops_per_ns: Some(50.0),
+            bf16_flops_per_ns_by_rows_and_depth: Some(vec![(16, 1024, 100.0), (8192, 1024, 900.5)]),
+            attn_flops_per_ns_by_keys: Some(vec![(512, 40.0), (16384, 50.0)]),
             scan_elements_per_ns: Some(7.0),
             bytes_per_ns: Some(800.0),
             launch_ns: Some(3500),
         };
         assert_eq!(
             tuned(&rates),
-            "[rates]\nbf16_flops_per_ns_by_rows = [[16, 100.0], [8192, 900.5]]\n\
-             attn_flops_per_ns = 50.0\nscan_elements_per_ns = 7.0\nbytes_per_ns = 800.0\n\
+            "[rates]\nbf16_flops_per_ns_by_rows_and_depth = [\n  [16, 1024, 100.0],\n  [8192, 1024, \
+             900.5],\n]\n\
+             attn_flops_per_ns_by_keys = [[512, 40.0], [16384, 50.0]]\nscan_elements_per_ns = 7.0\nbytes_per_ns = 800.0\n\
              launch_ns = 3500\n"
         );
         let (key, text) = provenance("vulkan", "the matmul through Coopmat");

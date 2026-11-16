@@ -61,9 +61,9 @@ impl RungFacts {
 ///
 /// `t(r) = launches(r) · launch_ns
 ///       + max(weights(r) / bytes_per_ns,
-///             padded_rows(r) · flops_per_row / flops(padded_rows(r)))
-///       + sampled(r) · readout_flops / flops(sampled(r))
-///       + tokens(r) · keys(r) · attn_flops_per_row_key / attn_flops_per_ns
+///             Σ_(n, k) padded_rows(r) · flops_per_row(n, k) / flops(padded_rows(r), k))
+///       + sampled(r) · readout_flops / flops(sampled(r), hidden)
+///       + tokens(r) · keys(r) · attn_flops_per_row_key / attn(keys(r))
 ///       + keys(r) · kv_bytes_per_key / bytes_per_ns
 ///       + tokens(r) · state_elements_per_row / scan_elements_per_ns
 ///       + tokens(r) · elementwise_bytes_per_row / bytes_per_ns`
@@ -71,8 +71,14 @@ impl RungFacts {
 /// where `weights(r) = dense_bytes + expert_bytes · (1 − (1 − k/E)^tokens)`:
 /// a fire reads every dense weight once (the output head's among them), and
 /// of a routed bank the experts its rows touch (each row picks `k` of `E`).
-/// `flops(m)` is the device's matmul rate at `m` rows, its measured curve
-/// interpolated in `log m` ([`profile::fire::flops_at`]). The output head
+/// `flops(m, k)` is the device's matmul rate at `m` rows and depth `k`, its
+/// measured grid interpolated in `log m` and `log k`
+/// ([`profile::fire::flops_at`]), and each of the model's dense shapes
+/// (`n` columns at depth `k`, [`super::Counts::gemm_shapes`]) is read at its
+/// own depth: a narrow model's matmuls run below a wide one's at the same
+/// rows. `attn(keys)` is the device's attention rate at a row's keys, its
+/// measured curve interpolated in `log keys` and clamped (a paged prefill
+/// streams long keys faster a flop than short). The output head
 /// runs once a lane (the readout), not once a row, so its flops are their
 /// own term, over the rows the rung samples ([`RungFacts::sampled`]): a
 /// rung no wider than its lanes is weighed decode-shaped (a lane a token,
@@ -93,10 +99,12 @@ impl RungFacts {
 /// rung's rows.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FireEstimate {
-    /// Dense bf16 matmul flops a nanosecond by rows: `(m, rate)`, ascending.
-    pub flops_by_rows: Vec<(u32, f64)>,
-    /// Attention flops a nanosecond; read only where the model attends.
-    pub attn_flops_per_ns: f64,
+    /// Dense bf16 matmul flops a nanosecond by rows and depth: `(m, k,
+    /// rate)`, a full grid ([`profile::fire::grid`]).
+    pub flops_grid: Vec<(u32, u32, f64)>,
+    /// Attention flops a nanosecond by the keys a row attends: `(keys,
+    /// rate)`, ascending; read only where the model attends.
+    pub attn_by_keys: Vec<(u32, f64)>,
     /// Recurrent state elements a nanosecond; read only where the model
     /// carries recurrent state.
     pub scan_elements_per_ns: f64,
@@ -111,12 +119,12 @@ pub struct FireEstimate {
     /// `(k, E)`: the experts a row picks, of how many; `None` without a
     /// routed bank.
     pub experts: Option<(u32, u32)>,
-    /// The matmul flops a row takes: two a weight element it multiplies
-    /// (the dense ones but the output head, and the `k` experts' a row
-    /// picks).
-    pub flops_per_row: f64,
+    /// The matmuls a row takes, by shape: `(n, k, flops a row)`.
+    pub gemm_shapes: Vec<(u32, u32, f64)>,
     /// The output head's flops a lane: two a head element.
     pub readout_flops: f64,
+    /// The output head's depth (the model's hidden width).
+    pub readout_depth: u32,
     /// The flops a row takes a key it attends, all layers together.
     pub attn_flops_per_row_key: f64,
     /// The kv bytes a key read takes, all layers together.
@@ -141,10 +149,30 @@ impl FireEstimate {
         self.dense_bytes as f64 + self.expert_bytes as f64 * touched
     }
 
-    /// The matmul rate at `rows`.
+    /// The matmul rate at `rows` and `depth`.
     #[must_use]
-    pub fn flops_per_ns(&self, rows: u32) -> f64 {
-        profile::fire::flops_at(&self.flops_by_rows, rows).unwrap_or(f64::INFINITY)
+    pub fn flops_per_ns(&self, rows: u32, depth: u32) -> f64 {
+        profile::fire::flops_at(&self.flops_grid, rows, depth).unwrap_or(f64::INFINITY)
+    }
+
+    /// Each dense shape's matmul time at `rung`, in ns: `(n, k, ns)`, the
+    /// padded rows' flops at that shape over the rate at its depth. Their
+    /// sum is [`Terms::flops`].
+    #[must_use]
+    pub fn matmuls(&self, rung: &RungFacts) -> Vec<(u32, u32, f64)> {
+        let rows = rung.padded_rows;
+        self.gemm_shapes
+            .iter()
+            .map(|&(n, k, per_row)| {
+                let work = f64::from(rows) * per_row;
+                let ns = if work > 0.0 {
+                    work / self.flops_per_ns(rows, k)
+                } else {
+                    0.0
+                };
+                (n, k, ns)
+            })
+            .collect()
     }
 
     /// The estimate's terms at `rung`, in ns: the one place its form lives.
@@ -163,17 +191,17 @@ impl FireEstimate {
         Terms {
             launch: f64::from(rung.launches) * self.launch_ns,
             weights: over(self.weight_bytes(rung.tokens), self.bytes_per_ns),
-            flops: over(
-                f64::from(rung.padded_rows) * self.flops_per_row,
-                self.flops_per_ns(rung.padded_rows),
-            ),
+            flops: self.matmuls(rung).iter().map(|&(_, _, ns)| ns).sum(),
             readout: over(
                 f64::from(rung.sampled()) * self.readout_flops,
-                self.flops_per_ns(rung.sampled()),
+                self.flops_per_ns(rung.sampled(), self.readout_depth),
             ),
             attention: over(
                 tokens * keys * self.attn_flops_per_row_key,
-                self.attn_flops_per_ns,
+                // The rate at the keys a row attends: one at a decode lane,
+                // the curve's narrowest point.
+                profile::fire::interpolate(&self.attn_by_keys, keys as u32)
+                    .unwrap_or(f64::INFINITY),
             ),
             kv: over(keys_read * self.kv_bytes_per_key, self.bytes_per_ns),
             recurrent: over(
@@ -198,7 +226,8 @@ pub struct Terms {
     pub launch: f64,
     /// The weight bytes the fire reads, over the bandwidth.
     pub weights: f64,
-    /// The padded rows' matmul flops, over the matmul rate at those rows.
+    /// The padded rows' matmul flops, each shape over the rate at those
+    /// rows and its depth.
     pub flops: f64,
     /// The output head's flops over the rows sampled, over the rate there.
     pub readout: f64,
@@ -422,16 +451,17 @@ mod tests {
     /// a byte a ns, one flop a ns.
     fn estimate(fixed_ns: u64, per_token_ns: f64) -> FireEstimate {
         FireEstimate {
-            flops_by_rows: vec![(1, 1.0)],
-            attn_flops_per_ns: 0.0,
+            flops_grid: vec![(1, 1, 1.0)],
+            attn_by_keys: Vec::new(),
             scan_elements_per_ns: 0.0,
             bytes_per_ns: 1.0,
             launch_ns: 0.0,
             dense_bytes: fixed_ns,
             expert_bytes: 0,
             experts: None,
-            flops_per_row: per_token_ns,
+            gemm_shapes: vec![(1, 1, per_token_ns)],
             readout_flops: 0.0,
+            readout_depth: 1,
             attn_flops_per_row_key: 0.0,
             kv_bytes_per_key: 0.0,
             state_elements_per_row: 0.0,
@@ -595,17 +625,20 @@ mod tests {
     /// attending 16 keys, the matmuls padded to 32 rows.
     fn documented() -> (FireEstimate, RungFacts) {
         let e = FireEstimate {
-            // 1 a ns at 4 rows, 5 at 64: 3 at 16, 4 at 32 (log rows).
-            flops_by_rows: vec![(4, 1.0), (64, 5.0)],
-            attn_flops_per_ns: 0.25,
+            // At depth 64: 1 a ns at 4 rows, 5 at 64: 3 at 16, 4 at 32 (log
+            // rows). At depth 256: twice that.
+            flops_grid: vec![(4, 64, 1.0), (64, 64, 5.0), (4, 256, 2.0), (64, 256, 10.0)],
+            // 0.25 a ns at one key, 1 at 16 and past.
+            attn_by_keys: vec![(1, 0.25), (16, 1.0)],
             scan_elements_per_ns: 2.0,
             bytes_per_ns: 4.0,
             launch_ns: 3.0,
             dense_bytes: 200,
             expert_bytes: 0,
             experts: None,
-            flops_per_row: 10.0,
+            gemm_shapes: vec![(64, 64, 10.0)],
             readout_flops: 6.0,
+            readout_depth: 64,
             attn_flops_per_row_key: 0.5,
             kv_bytes_per_key: 8.0,
             state_elements_per_row: 3.0,
@@ -626,14 +659,34 @@ mod tests {
     #[test]
     fn the_matmul_rate_is_the_curve_at_the_padded_rows() {
         let (e, r) = documented();
-        assert!((e.flops_per_ns(32) - 4.0).abs() < 1e-12);
-        assert!((e.flops_per_ns(16) - 3.0).abs() < 1e-12);
-        assert_eq!(e.flops_per_ns(1), 1.0, "clamped below");
-        assert_eq!(e.flops_per_ns(4096), 5.0, "clamped above");
+        assert!((e.flops_per_ns(32, 64) - 4.0).abs() < 1e-12);
+        assert!((e.flops_per_ns(16, 64) - 3.0).abs() < 1e-12);
+        assert_eq!(e.flops_per_ns(1, 64), 1.0, "clamped below");
+        assert_eq!(e.flops_per_ns(4096, 64), 5.0, "clamped above");
+        // Halfway from 64 to 256 in log depth: halfway from 4 to 8 a ns.
+        assert!((e.flops_per_ns(32, 128) - 6.0).abs() < 1e-12);
         // 32 · 10 flops at 4 a ns: compute bound past the 200 / 4 read.
         let t = e.terms(&r);
         assert!((t.flops - 80.0).abs() < 1e-9);
         assert_eq!(t.weights, 50.0);
+    }
+
+    #[test]
+    fn a_model_of_two_depths_reads_each_shape_at_its_own_depth() {
+        let (e, r) = documented();
+        let two = FireEstimate {
+            gemm_shapes: vec![(64, 64, 10.0), (256, 256, 10.0)],
+            ..e
+        };
+        // 32 · 10 at 4 a ns (depth 64), and 32 · 10 at 8 a ns (depth 256).
+        let shapes = two.matmuls(&r);
+        assert_eq!(shapes.len(), 2);
+        assert!((shapes[0].2 - 80.0).abs() < 1e-9);
+        assert!((shapes[1].2 - 40.0).abs() < 1e-9);
+        assert!(
+            (two.terms(&r).flops - 120.0).abs() < 1e-9,
+            "the shapes' sum"
+        );
     }
 
     #[test]
@@ -669,10 +722,13 @@ mod tests {
         assert_eq!(t.attention, 8.0);
         assert_eq!(t.kv, 8.0);
         // Prefill-shaped (one prompt of 8 rows over 16 keys): 8 · 16 · 0.5
-        // at 0.25 a ns, and 16 keys' 8 bytes at 4 a ns.
+        // at the curve's 1 a ns at 16 keys, and 16 keys' 8 bytes at 4 a ns.
         let prompt = RungFacts { tokens: 8, ..r };
         let t = e.terms(&prompt);
-        assert_eq!(t.attention, 256.0);
+        assert_eq!(t.attention, 64.0);
+        // 4 keys, halfway from 1 to 16 in log keys: 0.625 a ns.
+        let short = RungFacts { keys: 4, ..prompt };
+        assert!((e.terms(&short).attention - 8.0 * 4.0 * 0.5 / 0.625).abs() < 1e-9);
         assert_eq!(t.kv, 32.0);
     }
 

@@ -11,7 +11,7 @@ assumes = { cores = 20 }
 [rates]
 # A 4096^3 bf16 GEMM through the dense kernel serving dispatches (Apple10's
 # tensor-op (mpp) form): 28.57 TFLOPS.
-bf16_flops_per_ns_by_rows = [[4096, 28570.0]]
+bf16_flops_per_ns_by_rows_and_depth = [[4096, 4096, 28570.0]]
 # A 256 MiB blit between two buffers, read and write counted: 275 GB/s.
 bytes_per_ns = 275.1
 # A dispatch's launch, back to back in one serial pass (512 of the smallest

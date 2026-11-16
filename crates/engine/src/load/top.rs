@@ -12,7 +12,7 @@ use poem_ir::{Def, Dim, Operation, Trace, Ty};
 use super::rung::{FireEstimate, NoRung, RungFacts, TopRung, TopWhy};
 
 /// What a fire of the model reads and computes: the estimate's counts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Counts {
     /// The weight bytes every fire reads: the planes the device keeps, less
     /// the token tables (a gather reads a row of them a token) and the
@@ -22,13 +22,17 @@ pub struct Counts {
     pub expert_bytes: u64,
     /// `(k, E)` of the routed banks: the experts a row picks, of how many.
     pub experts: Option<(u32, u32)>,
-    /// The matmul flops a row takes: two a dense weight element (the output
-    /// head's aside), and two a routed element of the `k` of `E` experts a
-    /// row picks.
-    pub flops_per_row: u64,
-    /// The output head's flops a lane: two a head element. A fire reads out
-    /// once a lane, not once a row; the head's bytes are in `weight_bytes`.
+    /// The matmuls a row takes, by shape: `(n, k, flops a row)`, the planes
+    /// of `n` columns at depth `k` merged, two flops a dense weight element
+    /// (the output head's aside) and two a routed element of the `k` of `E`
+    /// experts a row picks. Ordered by `(n, k)`.
+    pub gemm_shapes: Vec<(u32, u32, u64)>,
+    /// The output head's flops a sampled row: two a head element. A fire
+    /// reads out once a sampled row, not once a row; the head's bytes are
+    /// in `weight_bytes`.
     pub readout_flops: u64,
+    /// The output head's depth (the model's hidden width).
+    pub readout_depth: u32,
     /// The flops a row takes a key it attends, summed over the layers: four
     /// a query element (the scores' product and the values').
     pub attn_flops_per_row_key: u64,
@@ -65,10 +69,14 @@ impl Counts {
     #[must_use]
     pub fn of(trace: &Trace, kept: Kept<'_>, attention: (u64, u64)) -> Counts {
         let (mut weight_bytes, mut expert_bytes) = (0u64, 0u64);
-        let (mut dense, mut routed) = (0u64, 0u64);
         let (mut largest, mut width) = (0u64, 0u64);
         let heads = heads(trace);
-        let mut readout = 0u64;
+        let (mut readout, mut readout_depth) = (0u64, 0u64);
+        let experts = routing(trace);
+        // `(n, k)` to the elements a row multiplies at that shape.
+        let mut shapes: std::collections::BTreeMap<(u32, u32), u64> =
+            std::collections::BTreeMap::new();
+        let to = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
         for (at, param) in trace.params.iter().enumerate() {
             if heads.contains(&at) {
                 // The output head: read whole every fire (a tied table as
@@ -77,43 +85,52 @@ impl Counts {
                 weight_bytes =
                     weight_bytes.saturating_add(kept.plane_bytes.get(at).copied().unwrap_or(0));
                 readout = readout.saturating_add(rows.saturating_mul(cols));
+                readout_depth = readout_depth.max(cols);
                 continue;
             }
             if kept.tables.contains(&at) {
                 continue;
             }
             let bytes = kept.plane_bytes.get(at).copied().unwrap_or(0);
-            let (rows, cols) = rectangle(&param.shape);
-            let elements = if param.shape.len() >= 2 {
-                rows.saturating_mul(cols)
-            } else {
-                0
-            };
             if kept.banks.contains(&at) {
                 expert_bytes = expert_bytes.saturating_add(bytes);
-                routed = routed.saturating_add(elements);
+                // `[E, n, k...]`: an expert's plane, `k` of `E` a row.
+                if let [e, n, rest @ ..] = param.shape.as_slice()
+                    && !rest.is_empty()
+                {
+                    let k: u64 = rest.iter().product();
+                    let per_row = match experts {
+                        Some((picks, _)) => n.saturating_mul(k).saturating_mul(u64::from(picks)),
+                        // A bank whose routing does not read: every expert,
+                        // every row.
+                        None => e.saturating_mul(*n).saturating_mul(k),
+                    };
+                    *shapes.entry((to(*n), to(k))).or_default() += per_row;
+                }
             } else {
                 weight_bytes = weight_bytes.saturating_add(bytes);
-                dense = dense.saturating_add(elements);
-                if elements > largest {
-                    largest = elements;
-                    width = cols;
+                if param.shape.len() >= 2 {
+                    let (n, k) = rectangle(&param.shape);
+                    let elements = n.saturating_mul(k);
+                    *shapes.entry((to(n), to(k))).or_default() += elements;
+                    if elements > largest {
+                        largest = elements;
+                        width = k;
+                    }
                 }
             }
         }
-        let experts = routing(trace);
-        let routed_per_row = match experts {
-            Some((k, e)) if e > 0 => routed.saturating_mul(u64::from(k)) / u64::from(e),
-            // A bank whose routing does not read: every expert, every row.
-            _ => routed,
-        };
         let (attn_flops_per_row_key, kv_bytes_per_key) = attention;
         Counts {
             weight_bytes,
             expert_bytes,
             experts,
-            flops_per_row: dense.saturating_add(routed_per_row).saturating_mul(2),
+            gemm_shapes: shapes
+                .into_iter()
+                .map(|((n, k), elements)| (n, k, elements.saturating_mul(2)))
+                .collect(),
             readout_flops: readout.saturating_mul(2),
+            readout_depth: to(readout_depth),
             attn_flops_per_row_key,
             kv_bytes_per_key,
             state_elements_per_row: state_elements(trace),
@@ -288,17 +305,17 @@ pub fn estimate(
         None => Err(key),
     };
     Ok(FireEstimate {
-        flops_by_rows: rates
-            .bf16_flops_per_ns_by_rows
+        flops_grid: rates
+            .bf16_flops_per_ns_by_rows_and_depth
             .clone()
-            .filter(|curve| !curve.is_empty())
-            .ok_or("bf16_flops_per_ns_by_rows")?,
+            .filter(|grid| !grid.is_empty())
+            .ok_or("bf16_flops_per_ns_by_rows_and_depth")?,
         bytes_per_ns: rates.bytes_per_ns.ok_or("bytes_per_ns")?,
-        attn_flops_per_ns: needed(
-            rates.attn_flops_per_ns,
-            counts.attn_flops_per_row_key > 0,
-            "attn_flops_per_ns",
-        )?,
+        attn_by_keys: match &rates.attn_flops_per_ns_by_keys {
+            Some(curve) if !curve.is_empty() => curve.clone(),
+            _ if counts.attn_flops_per_row_key == 0 => Vec::new(),
+            _ => return Err("attn_flops_per_ns_by_keys"),
+        },
         scan_elements_per_ns: needed(
             rates.scan_elements_per_ns,
             counts.state_elements_per_row > 0,
@@ -308,8 +325,13 @@ pub fn estimate(
         dense_bytes: counts.weight_bytes,
         expert_bytes: counts.expert_bytes,
         experts: counts.experts,
-        flops_per_row: counts.flops_per_row as f64,
+        gemm_shapes: counts
+            .gemm_shapes
+            .iter()
+            .map(|&(n, k, flops)| (n, k, flops as f64))
+            .collect(),
         readout_flops: counts.readout_flops as f64,
+        readout_depth: counts.readout_depth,
         attn_flops_per_row_key: counts.attn_flops_per_row_key as f64,
         kv_bytes_per_key: counts.kv_bytes_per_key as f64,
         state_elements_per_row: counts.state_elements_per_row as f64,
@@ -421,10 +443,11 @@ mod tests {
             weight_bytes: 1 << 30,
             expert_bytes: 0,
             experts: None,
-            flops_per_row: 1 << 30,
+            gemm_shapes: vec![(4096, 4096, 1 << 30)],
             attn_flops_per_row_key: 1 << 10,
             kv_bytes_per_key: 1 << 10,
             readout_flops: 0,
+            readout_depth: 4096,
             state_elements_per_row: 0,
             elementwise_bytes_per_row: 0,
             width: 4096,
@@ -449,8 +472,8 @@ mod tests {
         // No feasible rung at all: the ruling's refusal.
         let none = [rung(1024, 300 * MIB, Some("past one binding"))];
         let rated = profile::fire::Rates {
-            bf16_flops_per_ns_by_rows: Some(vec![(4096, 1.0)]),
-            attn_flops_per_ns: Some(1.0),
+            bf16_flops_per_ns_by_rows_and_depth: Some(vec![(4096, 4096, 1.0)]),
+            attn_flops_per_ns_by_keys: Some(vec![(2048, 1.0)]),
             bytes_per_ns: Some(1.0),
             ..profile::fire::Rates::default()
         };
@@ -466,17 +489,18 @@ mod tests {
     #[test]
     fn the_estimate_reads_the_rates_and_the_counts() {
         let rates = profile::fire::Rates {
-            bf16_flops_per_ns_by_rows: Some(vec![(16, 1.0), (4096, 10.0)]),
-            attn_flops_per_ns: Some(7.0),
+            bf16_flops_per_ns_by_rows_and_depth: Some(vec![(16, 4096, 1.0), (4096, 4096, 10.0)]),
+            attn_flops_per_ns_by_keys: Some(vec![(2048, 7.0)]),
             bytes_per_ns: Some(100.0),
             launch_ns: Some(5),
             ..profile::fire::Rates::default()
         };
         let e = estimate(&counts(), &rates).unwrap();
-        assert_eq!(e.flops_by_rows, vec![(16, 1.0), (4096, 10.0)]);
+        assert_eq!(e.flops_grid, vec![(16, 4096, 1.0), (4096, 4096, 10.0)]);
+        assert_eq!(e.gemm_shapes, vec![(4096, 4096, (1u64 << 30) as f64)]);
         assert_eq!(
-            (e.attn_flops_per_ns, e.bytes_per_ns, e.launch_ns),
-            (7.0, 100.0, 5.0)
+            (e.attn_by_keys.clone(), e.bytes_per_ns, e.launch_ns),
+            (vec![(2048, 7.0)], 100.0, 5.0)
         );
         // No recurrent state: no scan rate read.
         assert_eq!(e.scan_elements_per_ns, 0.0);
@@ -491,16 +515,16 @@ mod tests {
                 },
             ),
             (
-                "bf16_flops_per_ns_by_rows",
+                "bf16_flops_per_ns_by_rows_and_depth",
                 profile::fire::Rates {
-                    bf16_flops_per_ns_by_rows: None,
+                    bf16_flops_per_ns_by_rows_and_depth: None,
                     ..rates.clone()
                 },
             ),
             (
-                "attn_flops_per_ns",
+                "attn_flops_per_ns_by_keys",
                 profile::fire::Rates {
-                    attn_flops_per_ns: None,
+                    attn_flops_per_ns_by_keys: None,
                     ..rates.clone()
                 },
             ),
@@ -526,7 +550,7 @@ mod tests {
             ..counts()
         };
         let no_attn = profile::fire::Rates {
-            attn_flops_per_ns: None,
+            attn_flops_per_ns_by_keys: None,
             ..rates
         };
         assert!(estimate(&attending_nothing, &no_attn).is_ok());
@@ -536,7 +560,7 @@ mod tests {
     fn the_refusal_names_the_key_unstated() {
         let rungs = [rung(1024, 100 * MIB, None)];
         let rates = profile::fire::Rates {
-            bf16_flops_per_ns_by_rows: Some(vec![(4096, 1.0)]),
+            bf16_flops_per_ns_by_rows_and_depth: Some(vec![(4096, 4096, 1.0)]),
             bytes_per_ns: Some(1.0),
             ..profile::fire::Rates::default()
         };
@@ -544,7 +568,7 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "device Card X has no rates in its profile for this model: `[rates] \
-             attn_flops_per_ns` is unstated, so nothing weighs its top rung; `pie tune <backend> \
+             attn_flops_per_ns_by_keys` is unstated, so nothing weighs its top rung; `pie tune <backend> \
              --rates` measures it"
         );
     }
@@ -569,7 +593,7 @@ mod tests {
         };
         let tuned = profile::fire::Tuned {
             rates: profile::fire::Rates {
-                bf16_flops_per_ns_by_rows: Some(vec![(4096, 249_000.0)]),
+                bf16_flops_per_ns_by_rows_and_depth: Some(vec![(4096, 4096, 249_000.0)]),
                 bytes_per_ns: Some(654.0),
                 launch_ns: Some(1620),
                 ..profile::fire::Rates::default()

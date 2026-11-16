@@ -85,7 +85,7 @@ recording = { use = "bodies", mem_mb = 1024 }
 [rates]
 # 209.5 TFLOPS dense bf16 with FP32 accumulation (NVIDIA RTX Blackwell GPU
 # architecture whitepaper; 419 with sparsity).
-bf16_flops_per_ns_by_rows = [[4096, 209500.0]]
+bf16_flops_per_ns_by_rows_and_depth = [[4096, 4096, 209500.0]]
 # 1792 GB/s of GDDR7 (RTX 5090 specifications, nvidia.com).
 bytes_per_ns = 1792.0
 

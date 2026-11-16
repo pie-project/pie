@@ -126,10 +126,11 @@ mod tests {
             weight_bytes: 16 << 30,
             expert_bytes: 0,
             experts: None,
-            flops_per_row: 16 << 30,
+            gemm_shapes: vec![(4096, 4096, 16 << 30)],
             attn_flops_per_row_key: 1 << 12,
             kv_bytes_per_key: 1 << 17,
             readout_flops: 0,
+            readout_depth: 4096,
             state_elements_per_row: 0,
             elementwise_bytes_per_row: 0,
             width: 4096,
@@ -139,8 +140,8 @@ mod tests {
     /// The L40S device file's rates.
     fn l40s() -> profile::fire::Rates {
         profile::fire::Rates {
-            bf16_flops_per_ns_by_rows: Some(vec![(4096, 249_000.0)]),
-            attn_flops_per_ns: Some(100_000.0),
+            bf16_flops_per_ns_by_rows_and_depth: Some(vec![(4096, 4096, 249_000.0)]),
+            attn_flops_per_ns_by_keys: Some(vec![(2048, 100_000.0)]),
             bytes_per_ns: Some(654.0),
             launch_ns: Some(1620),
             ..profile::fire::Rates::default()

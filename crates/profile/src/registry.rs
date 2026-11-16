@@ -985,13 +985,15 @@ impl<'a> Walk<'a> {
         };
         for (k, v) in t.iter() {
             match k.get_ref().as_ref() {
-                "bf16_flops_per_ns_by_rows" => {
-                    rates.bf16_flops_per_ns_by_rows = self.curve(v);
+                "bf16_flops_per_ns_by_rows_and_depth" => {
+                    rates.bf16_flops_per_ns_by_rows_and_depth = self.grid(v);
                 }
-                key @ ("attn_flops_per_ns" | "scan_elements_per_ns" | "bytes_per_ns") => {
+                "attn_flops_per_ns_by_keys" => {
+                    rates.attn_flops_per_ns_by_keys = self.curve(v);
+                }
+                key @ ("scan_elements_per_ns" | "bytes_per_ns") => {
                     match positive(v.get_ref()) {
                         Some(f) if key == "bytes_per_ns" => rates.bytes_per_ns = Some(f),
-                        Some(f) if key == "attn_flops_per_ns" => rates.attn_flops_per_ns = Some(f),
                         Some(f) => rates.scan_elements_per_ns = Some(f),
                         None => self.err(
                             v.span().start,
@@ -1015,7 +1017,7 @@ impl<'a> Walk<'a> {
                 other => self.err(
                     k.span().start,
                     format!(
-                        "`rates` holds `bf16_flops_per_ns_by_rows`, `attn_flops_per_ns`, \
+                        "`rates` holds `bf16_flops_per_ns_by_rows_and_depth`, `attn_flops_per_ns_by_keys`, \
                          `scan_elements_per_ns`, `bytes_per_ns` and `launch_ns`, not `{other}`"
                     ),
                 ),
@@ -1024,12 +1026,12 @@ impl<'a> Walk<'a> {
         rates
     }
 
-    /// `rates.bf16_flops_per_ns_by_rows`: `[rows, flops a ns]` pairs, a
-    /// whole number of rows and a positive rate each, non-empty and strictly
-    /// ascending in rows.
+    /// `rates.attn_flops_per_ns_by_keys`: `[keys, flops a ns]` pairs, whole
+    /// keys and a positive rate each, non-empty and strictly ascending in
+    /// keys.
     fn curve(&mut self, value: &Spanned<DeValue<'_>>) -> Option<Vec<(u32, f64)>> {
-        const WHAT: &str = "`rates.bf16_flops_per_ns_by_rows` is a non-empty list of \
-                            [rows, flops a ns] pairs, ascending in rows";
+        const WHAT: &str = "`rates.attn_flops_per_ns_by_keys` is a non-empty list of [keys, \
+                            flops a ns] pairs, ascending in keys";
         let DeValue::Array(points) = value.get_ref() else {
             self.err(
                 value.span().start,
@@ -1041,7 +1043,7 @@ impl<'a> Walk<'a> {
         for point in points.iter() {
             let pair = match point.get_ref() {
                 DeValue::Array(pair) if pair.len() == 2 => {
-                    let rows = int(pair[0].get_ref())
+                    let keys = int(pair[0].get_ref())
                         .and_then(|i| u32::try_from(i).ok())
                         .filter(|&m| m > 0);
                     let rate = match pair[1].get_ref() {
@@ -1050,7 +1052,7 @@ impl<'a> Walk<'a> {
                         _ => None,
                     }
                     .filter(|f| f.is_finite() && *f > 0.0);
-                    rows.zip(rate)
+                    keys.zip(rate)
                 }
                 _ => None,
             };
@@ -1072,6 +1074,66 @@ impl<'a> Walk<'a> {
             return None;
         }
         Some(curve)
+    }
+
+    /// `rates.bf16_flops_per_ns_by_rows_and_depth`: `[rows, depth, flops a
+    /// ns]` triples, whole rows and depths and a positive rate each, over a
+    /// full grid of rows by depths ([`crate::fire::grid`]).
+    fn grid(&mut self, value: &Spanned<DeValue<'_>>) -> Option<Vec<(u32, u32, f64)>> {
+        const WHAT: &str = "`rates.bf16_flops_per_ns_by_rows_and_depth` is a full grid of \
+                            [rows, depth, flops a ns], every depth at every row, each rate \
+                            positive";
+        let DeValue::Array(points) = value.get_ref() else {
+            self.err(
+                value.span().start,
+                format!("{WHAT}, not {}", found(value.get_ref())),
+            );
+            return None;
+        };
+        let whole = |v: &DeValue<'_>| {
+            int(v)
+                .and_then(|i| u32::try_from(i).ok())
+                .filter(|&m| m > 0)
+        };
+        let mut triples: Vec<(u32, u32, f64)> = Vec::with_capacity(points.len());
+        for point in points.iter() {
+            let triple = match point.get_ref() {
+                DeValue::Array(t) if t.len() == 3 => {
+                    let rate = match t[2].get_ref() {
+                        DeValue::Float(f) => f.as_str().replace('_', "").parse::<f64>().ok(),
+                        DeValue::Integer(_) => int(t[2].get_ref()).map(|i| i as f64),
+                        _ => None,
+                    }
+                    .filter(|f| f.is_finite() && *f > 0.0);
+                    match (whole(t[0].get_ref()), whole(t[1].get_ref()), rate) {
+                        (Some(m), Some(k), Some(r)) => Some((m, k, r)),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            let Some(triple) = triple else {
+                self.err(
+                    point.span().start,
+                    format!("{WHAT}, not {}", found(point.get_ref())),
+                );
+                return None;
+            };
+            triples.push(triple);
+        }
+        if triples.is_empty() {
+            self.err(value.span().start, format!("{WHAT}, not an empty list"));
+            return None;
+        }
+        let n = triples.len();
+        let grid = crate::fire::grid(triples);
+        if grid.is_none() {
+            self.err(
+                value.span().start,
+                format!("{WHAT}, not {n} points that leave a hole or state a point twice"),
+            );
+        }
+        grid
     }
 
     fn target(&mut self, value: &Spanned<DeValue<'_>>) -> Target {

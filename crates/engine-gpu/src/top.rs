@@ -102,10 +102,11 @@ mod tests {
             weight_bytes: 1 << 30,
             expert_bytes: 0,
             experts: None,
-            flops_per_row: 1 << 30,
+            gemm_shapes: vec![(4096, 4096, 1 << 30)],
             attn_flops_per_row_key: 1 << 10,
             kv_bytes_per_key: 1 << 10,
             readout_flops: 0,
+            readout_depth: 4096,
             state_elements_per_row: 0,
             elementwise_bytes_per_row: 0,
             width: 4096,
@@ -130,7 +131,7 @@ mod tests {
         // No feasible rung at all: the ruling's refusal, with the binding.
         let none = facts(&[(1024, 300 * MIB)], 200 * MIB);
         let rated = profile(
-            "api = 1\n[rates]\nbf16_flops_per_ns_by_rows = [[4096, 1.0]]\nattn_flops_per_ns = 1.0\nbytes_per_ns = 1.0\n",
+            "api = 1\n[rates]\nbf16_flops_per_ns_by_rows_and_depth = [[4096, 4096, 1.0]]\nattn_flops_per_ns_by_keys = [[2048, 1.0]]\nbytes_per_ns = 1.0\n",
         );
         let err = choose(&none, 1 << 33, &rated, "Card X", &counts(), 200 * MIB).unwrap_err();
         assert!(

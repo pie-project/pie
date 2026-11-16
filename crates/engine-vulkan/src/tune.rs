@@ -329,6 +329,31 @@ fn check_estimate(
                 "  recurrent scan and conv dispatches: {:.3} ms\n",
                 recurrent / 1e6
             ));
+            // The attention's dispatches against the estimate's attention
+            // term at this rung, and any fused matmul (a matmul fused with
+            // its activation or a second matmul), which need not run at the
+            // plain matmul's rates.
+            let share = |words: &[&str]| -> f64 {
+                rows.iter()
+                    .filter(|(name, ..)| words.iter().any(|w| name.contains(w)))
+                    .map(|row| row.1 as f64)
+                    .sum()
+            };
+            let estimated = weighed
+                .rungs
+                .iter()
+                .find(|r| r.tokens == width)
+                .map_or(0.0, |r| weighed.estimate.terms(r).attention);
+            out.push_str(&format!(
+                "  attention (sdpa) dispatches: {:.3} ms; the estimate's attention term at this \
+                 rung {:.3} ms\n",
+                share(&["sdpa", "attn_"]) / 1e6,
+                estimated / 1e6
+            ));
+            out.push_str(&format!(
+                "  fused matmul dispatches (swiglu, glu, a matmul with its epilogue): {:.3} ms\n",
+                share(&["swiglu", "matmul_glu", "fused"]) / 1e6
+            ));
             if form == "replayed" || width <= 16 {
                 say(&out);
             }
@@ -493,6 +518,46 @@ fn check_estimate(
             t.recurrent / 1e6,
             t.elementwise / 1e6
         ));
+    }
+    // Each dense shape's matmul at each rung, and its share of the weight
+    // read (its flops' share of the dense ones): whether a narrow rung's
+    // fire runs the read and the compute one after the other or together.
+    out.push_str(
+        "  per (n x k) shape: matmul ms at the rung's padded rows / its read ms; then the \
+         sums, read + matmul against max(read, matmul) and the measured fire\n",
+    );
+    let total: f64 = weighed
+        .estimate
+        .gemm_shapes
+        .iter()
+        .map(|&(_, _, f)| f)
+        .sum();
+    for (k, r) in rungs.iter().enumerate() {
+        let t = weighed.estimate.terms(r);
+        let mut line = format!("  {:>6}", r.tokens);
+        for &(n, depth, ns) in &weighed.estimate.matmuls(r) {
+            let per_row = weighed
+                .estimate
+                .gemm_shapes
+                .iter()
+                .find(|&&(nn, kk, _)| nn == n && kk == depth)
+                .map_or(0.0, |&(_, _, f)| f);
+            let read = if total > 0.0 {
+                t.weights * per_row / total
+            } else {
+                0.0
+            };
+            line.push_str(&format!(" | {n}x{depth} {:.2}/{:.2}", ns / 1e6, read / 1e6));
+        }
+        line.push_str(&format!(
+            " | sum {:.2}/{:.2}: read + matmul {:.2}, max {:.2}, measured {:.2}\n",
+            t.flops / 1e6,
+            t.weights / 1e6,
+            (t.flops + t.weights) / 1e6,
+            t.flops.max(t.weights) / 1e6,
+            meas[k] / 1e6
+        ));
+        out.push_str(&line);
     }
     let short = if best > 0.0 { 1.0 - at_est / best } else { 0.0 };
     out.push_str(&format!(
@@ -670,23 +735,22 @@ fn rates(base: &Profile, say: &mut dyn FnMut(&str)) -> Result<profile::fire::Rat
     // step measures through.
     let tier = <crate::device::Api as engine_gpu::serve::Serve>::tier(&device);
     let gemm = engine_gpu::backend::Tactics::gemm(&tuning, tier);
-    for &(m, rate) in rates.bf16_flops_per_ns_by_rows.as_deref().unwrap_or(&[]) {
-        let path = kernels_slang::linear::gemm::tile_for(
-            kernels_slang::Target::Spirv,
-            gemm,
-            m,
-            engine::rates::GEMM_COLUMNS,
-            engine::rates::GEMM_DEPTH,
-        );
+    for &(m, k, rate) in rates
+        .bf16_flops_per_ns_by_rows_and_depth
+        .as_deref()
+        .unwrap_or(&[])
+    {
+        let path =
+            kernels_slang::linear::gemm::tile_for(kernels_slang::Target::Spirv, gemm, m, k, k);
         say(&format!(
-            "[rates]: matmul m {m:>5}: {:6.1} TFLOP/s through {path:?} (tier {tier:?})",
+            "[rates]: matmul m {m:>5} k {k:>5}: {:6.1} TFLOP/s through {path:?} (tier {tier:?})",
             rate / 1e3
         ));
     }
     say(&format!(
         "[rates]: attention {:.1} TFLOP/s, scan {:.2} G state elements/s, {:.0} GB/s, launch \
          {:.2} us",
-        rates.attn_flops_per_ns.unwrap_or(0.0) / 1e3,
+        rates.attn_at(16384).unwrap_or(0.0) / 1e3,
         rates.scan_elements_per_ns.unwrap_or(0.0),
         rates.bytes_per_ns.unwrap_or(0.0),
         rates.launch_ns.unwrap_or(0) as f64 / 1e3

@@ -9,9 +9,10 @@
 //! its pipelines), so the frame's one submit and wait cancel and what is
 //! left is the work's own time beside a dispatch's:
 //! - the backend's own bf16 matmul at each row count of
-//!   `engine::rates::LATTICE_ROWS`, `m x 4096 x 4096`, for the matmul curve;
-//! - its prefill attention at `engine::rates::ATTN_SHAPE`, for the attention
-//!   rate;
+//!   `engine::rates::LATTICE_ROWS` and each depth of `engine::rates::DEPTHS`,
+//!   `m x k x k`, for the matmul grid;
+//! - its prefill attention at `engine::rates::ATTN_SHAPE`'s heads over each
+//!   `engine::rates::ATTN_KEYS`, for the attention curve;
 //! - its chunked gated-delta scan, the causal conv before it, at
 //!   `engine::rates::SCAN_SHAPE`, for the scan rate;
 //! - a buffer copy of [`COPY_BYTES`], for bytes a nanosecond;
@@ -26,8 +27,7 @@
 //! biases it.
 
 use engine::rates::{
-    ATTN_SHAPE, GEMM_COLUMNS, GEMM_DEPTH, LATTICE_ROWS, SCAN_SHAPE, attn_flops, gemm_flops,
-    scan_elements,
+    ATTN_KEYS, ATTN_SHAPE, DEPTHS, LATTICE_ROWS, SCAN_SHAPE, attn_flops, gemm_flops, scan_elements,
 };
 use kernels_slang::{KvPool, RaggedTensor, Tensor};
 use poem_ir::Dtype;
@@ -89,6 +89,12 @@ impl<'a, B: Serve> Rig<'a, B> {
             pipelines: B::Pipelines::default(),
             held: Vec::new(),
         }
+    }
+
+    /// Every buffer laid so far, let go (their handles with them).
+    fn release(&mut self) {
+        self.handles = Handles::<B>::new();
+        self.held.clear();
     }
 
     /// A zeroed buffer of `rows x width` of `dtype`, bound.
@@ -168,54 +174,66 @@ pub fn measure<B: Serve, T: Tactics + ?Sized>(
     timer: Timer<'_, B>,
 ) -> Result<Rates> {
     let mut rig = Rig::<B>::new(device);
-    let curve = curve(&mut rig, tactics.gemm(tier), timer)?;
-    let attn = attention(&mut rig, tactics.sdpa(tier, ATTN_SHAPE.head_dim), timer)?;
+    let grid = grid(&mut rig, tactics.gemm(tier), timer)?;
+    let sdpa = tactics.sdpa(tier, ATTN_SHAPE.head_dim);
+    let mut attn = Vec::with_capacity(ATTN_KEYS.len());
+    for keys in ATTN_KEYS {
+        attn.push((keys, attention(&mut rig, sdpa, timer, keys)?));
+        rig.release();
+    }
     let scan = scan(&mut rig, tactics.recurrent(), timer)?;
     let (bytes_per_ns, launch_ns) = copy_and_launch(&mut rig, tactics.gemm(tier), timer)?;
     Ok(Rates {
-        bf16_flops_per_ns_by_rows: Some(curve),
-        attn_flops_per_ns: Some(attn),
+        bf16_flops_per_ns_by_rows_and_depth: Some(grid),
+        attn_flops_per_ns_by_keys: Some(attn),
         scan_elements_per_ns: Some(scan),
         bytes_per_ns: Some(bytes_per_ns),
         launch_ns: Some(launch_ns),
     })
 }
 
-/// The matmul rate at each row count of the lattice: `(m, flops a ns)`.
-fn curve<B: Serve>(
+/// The matmul rate at each row count and depth of the lattice: `(m, k,
+/// flops a ns)`, `m x k x k`, by depth then rows.
+fn grid<B: Serve>(
     rig: &mut Rig<'_, B>,
     tactic: kernels_slang::linear::gemm::Tactic,
     timer: Timer<'_, B>,
-) -> Result<Vec<(u32, f64)>> {
+) -> Result<Vec<(u32, u32, f64)>> {
     let widest = LATTICE_ROWS[LATTICE_ROWS.len() - 1];
-    let act = rig.zeros(widest, GEMM_DEPTH, Dtype::Bf16)?;
-    let w = rig.zeros(GEMM_COLUMNS, GEMM_DEPTH, Dtype::Bf16)?;
-    let y = rig.zeros(widest, GEMM_COLUMNS, Dtype::Bf16)?;
-    let mut out = Vec::with_capacity(LATTICE_ROWS.len());
-    for m in LATTICE_ROWS {
-        let ns = rig.each(timer, &|sink| {
-            kernels_slang::linear::gemm::matmul(
-                sink,
-                tactic,
-                Tensor { rows: m, ..act },
-                w,
-                Tensor { rows: m, ..y },
-            )
-            .map_err(fault("rates: matmul"))
-        })?;
-        out.push((m, gemm_flops(m) / ns as f64));
+    let mut out = Vec::with_capacity(LATTICE_ROWS.len() * DEPTHS.len());
+    for k in DEPTHS {
+        let act = rig.zeros(widest, k, Dtype::Bf16)?;
+        let w = rig.zeros(k, k, Dtype::Bf16)?;
+        let y = rig.zeros(widest, k, Dtype::Bf16)?;
+        for m in LATTICE_ROWS {
+            let ns = rig.each(timer, &|sink| {
+                kernels_slang::linear::gemm::matmul(
+                    sink,
+                    tactic,
+                    Tensor { rows: m, ..act },
+                    w,
+                    Tensor { rows: m, ..y },
+                )
+                .map_err(fault("rates: matmul"))
+            })?;
+            out.push((m, k, gemm_flops(m, k) / ns as f64));
+        }
+        // This depth's planes go before the next depth's are laid.
+        rig.release();
     }
     Ok(out)
 }
 
-/// The prefill attention's rate at [`ATTN_SHAPE`]: one sequence attending
-/// itself, causal, its kv laid in pages of [`PAGE`].
+/// The prefill attention's rate at [`ATTN_SHAPE`]'s heads over `keys`: one
+/// sequence of `keys` rows attending itself, causal, its kv laid in pages of
+/// [`PAGE`].
 fn attention<B: Serve>(
     rig: &mut Rig<'_, B>,
     tactic: kernels_slang::attn::sdpa::Tactic,
     timer: Timer<'_, B>,
+    keys: u32,
 ) -> Result<f64> {
-    let s = ATTN_SHAPE;
+    let s = ATTN_SHAPE.at(keys);
     let kv_width = s.kv_heads * s.head_dim;
     let q = rig.zeros(s.rows, s.q_heads * s.head_dim, Dtype::Bf16)?;
     let o = rig.zeros(s.rows, s.q_heads * s.head_dim, Dtype::Bf16)?;
