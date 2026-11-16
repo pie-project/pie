@@ -746,7 +746,8 @@ impl Reading {
             for s in a.statics.iter().flatten() {
                 let v = ValueId(s[0]);
                 let constant = s[0] == kernels_cerebras::stream::host::NONE
-                    || s[0] == kernels_cerebras::stream::host::UNIT;
+                    || s[0] == kernels_cerebras::stream::host::UNIT
+                    || s[0] == kernels_cerebras::stream::host::LIT;
                 if !constant && !wanted.contains(&v) {
                     wanted.push(v);
                 }

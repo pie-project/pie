@@ -9,6 +9,7 @@
 /// is seconds at this rate.
 pub const CLOCK_HZ: f64 = 750e6;
 
+pub mod gemm;
 pub mod grid;
 pub mod memory;
 pub mod stream;

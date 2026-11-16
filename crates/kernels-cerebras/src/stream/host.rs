@@ -66,6 +66,12 @@ impl Values {
         })
     }
 
+    /// The capture's file holding `v`, if it has one.
+    #[must_use]
+    pub fn file(&self, v: ValueId) -> Option<&str> {
+        self.files.get(&v.0).map(String::as_str)
+    }
+
     pub fn get(&self, v: ValueId) -> R<Held> {
         if let Some(x) = self.cache.borrow().get(&v.0) {
             return Ok(x.clone());
@@ -344,6 +350,10 @@ pub type Span = [u32; 8];
 /// tile's diagonal).
 pub const UNIT: u32 = u32::MAX - 1;
 
+/// No value but a literal: `row` itself, `len · count` times (a 16-bit one with [`PACK`]: a
+/// program's words streamed with its weights).
+pub const LIT: u32 = u32::MAX - 2;
+
 /// The word is the element's IEEE f16 bits (a tile of an IEEE build).
 pub const HALF: u32 = 8;
 /// The word is the element's bf16 bits, rounded to nearest even (a tile of a bf16 build).
@@ -384,6 +394,18 @@ pub fn apply_spans(s: &[Span], get: &dyn Fn(u32) -> R<Rows>) -> R<Vec<u32>> {
         }
         if v == NONE {
             out.extend(std::iter::repeat_n(0, len as usize * count as usize));
+            continue;
+        }
+        if v == LIT {
+            for _ in 0..len as usize * count as usize {
+                if flags & PACK == 0 {
+                    out.push(row);
+                } else if let Some(lo) = half.take() {
+                    out.push(lo | ((row & 0xffff) << 16));
+                } else {
+                    half = Some(row & 0xffff);
+                }
+            }
             continue;
         }
         if v == UNIT {

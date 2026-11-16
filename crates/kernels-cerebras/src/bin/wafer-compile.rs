@@ -419,6 +419,77 @@ fn stream(args: &[String]) -> Result<(), String> {
         upto,
         taps,
     };
+    if get("--regime").as_deref() == Some("gemm") {
+        // the GEMM regime (M2f): the reading over the whole fabric, `--gemm C,R,KBM` its array
+        // and key block pinned
+        let pin = match get("--gemm") {
+            Some(g) => {
+                let v: Vec<u32> = g.split(',').filter_map(|x| x.parse().ok()).collect();
+                let [c, r, k] = v[..] else {
+                    return Err(format!("--gemm {g}: C,R,KBM"));
+                };
+                Some((c, r, k))
+            }
+            None => None,
+        };
+        let crow = kernels_cerebras::stream::parse_rows(&get("--class-rows").unwrap_or_default())?;
+        let bounds = kernels_cerebras::floorplan::stream::Bounds::system();
+        let p =
+            kernels_cerebras::stream::gemm::program(&trace, &o, &crow, pin, (bounds.w, bounds.h))?;
+        let c = kernels_cerebras::cost::gemm::time(&p);
+        let m = kernels_cerebras::cost::gemm::memory(&p);
+        println!(
+            "{model} {reading}: gemm, {} ops ({} modules) over {} x {} PEs, {} rows a PE, key blocks of {} rows, stream {} words a column ({} rows of tapes), {} words a PE, {:.2}M cycles ({:.3} ms at 750 MHz)",
+            p.l.ops.len(),
+            p.modules.len(),
+            p.c,
+            p.r,
+            p.tb,
+            p.kbm,
+            p.wwords,
+            p.tape,
+            m.total,
+            c.cycles / 1e6,
+            c.cycles / CLOCK_HZ * 1e3
+        );
+        if args.iter().any(|a| a == "--parts") {
+            for (w, cy) in c.by() {
+                println!("  {w}: {:.3}M", cy / 1e6);
+            }
+            println!("  memory {m:?}");
+            for o in &c.ops {
+                println!("  op {} {}: {:.0}", o.op, o.what, o.cycles);
+            }
+        }
+        if args.iter().any(|a| a == "--emulate") {
+            // the program on the host over the capture's values, its outputs against it
+            let dir = values.as_deref().ok_or("--emulate: --values")?;
+            let vals = kernels_cerebras::stream::host::Values::open(std::path::Path::new(dir))?;
+            for (v, got) in kernels_cerebras::stream::gemm::emulate(&p.l, &vals)? {
+                let (_, want) = vals.get(v)?;
+                let (mut a, mut b) = (0f64, 0f64);
+                for (x, y) in got.iter().zip(want.iter()) {
+                    if x.is_finite() && y.is_finite() {
+                        a += f64::from(x - y).powi(2);
+                        b += f64::from(*y).powi(2);
+                    }
+                }
+                println!(
+                    "EMULATE value %{} rel L2 {:.3e}",
+                    v.0,
+                    (a / b.max(1e-30)).sqrt()
+                );
+            }
+        }
+        if !args.iter().any(|a| a == "--price") {
+            kernels_cerebras::stream::gemm::compile_program(
+                &p,
+                std::path::Path::new(&out),
+                values.as_deref().map(std::path::Path::new),
+            )?;
+        }
+        return Ok(());
+    }
     // `--cut T,S,W,H`: K / V PEs at 1 / T of their entries over S columns a head, W quarters more
     // rest roots, up to H helper PEs a rest root
     let kv = get("--cut")

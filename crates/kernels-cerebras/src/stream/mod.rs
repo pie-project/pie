@@ -18,6 +18,7 @@ use crate::plan::Act;
 
 pub mod build;
 pub mod coresident;
+pub mod gemm;
 pub mod grid;
 pub mod host;
 pub mod moe;
@@ -347,7 +348,18 @@ pub fn compile_pinned(
         pins.spill,
         crate::floorplan::stream::Bounds::system().narrowed(pins.width),
     )?;
-    let e = crate::emit::stream::emit(&p)?;
+    write_stream(&p, o, out, gold)?;
+    Ok(p)
+}
+
+/// A built stream program's files into `out` (as [`compile_pinned`] writes them).
+fn write_stream(
+    p: &build::Program,
+    o: &Options,
+    out: &std::path::Path,
+    gold: Option<&std::path::Path>,
+) -> R<()> {
+    let e = crate::emit::stream::emit(p)?;
     std::fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
     for (name, text) in &e.files {
         std::fs::write(out.join(name), text).map_err(|e| format!("{name}: {e}"))?;
@@ -367,15 +379,15 @@ pub fn compile_pinned(
         "palette": p.palette.map.iter().map(|(k, c)| (format!("{}{}", k.name, k.index), c.0)).collect::<std::collections::BTreeMap<_, _>>(),
         "lane_words": p.lane_words,
         "py": p.stream.py,
-        "cost": crate::cost::stream::time(&p),
+        "cost": crate::cost::stream::time(p),
     });
     std::fs::write(
         out.join("stream.json"),
         serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
-    host::write(&p, &e.arrays, gold, out)?;
-    Ok(p)
+    host::write(p, &e.arrays, gold, out)?;
+    Ok(())
 }
 
 /// Compiles `trace`'s decode step as a unit program (GENERIC.md G1: decode through the stream
@@ -443,8 +455,46 @@ pub fn compile_reading(trace: &Trace, o: &Options, out: &std::path::Path) -> R<(
         let clip = grid::clip_of(trace, &o.reading, o.rows);
         return compile_grid(trace, &o.reading, clip, o.round16, out);
     }
-    let p = compile(trace, o, out, None)?;
-    Ok((p.stream.w, p.stream.h))
+    compile_whole(trace, o, out)
+}
+
+/// A whole-sequence reading's regime, by price: the stream regime's program (rows through
+/// units) and the GEMM regime's ([`gemm`]: every op over the whole fabric), the cheaper of those
+/// that place within a system's fabric. Returns the fabric's size.
+pub fn compile_whole(trace: &Trace, o: &Options, out: &std::path::Path) -> R<(u32, u32)> {
+    let b = crate::floorplan::stream::Bounds::system();
+    let st = shape(
+        trace,
+        &o.reading,
+        &program::classes(trace, &o.reading, o.rows),
+    )
+    .and_then(|s| {
+        build::program_py(
+            trace, s, o.round16, o.upto, &o.taps, None, None, None, false, b,
+        )
+    });
+    let gm = gemm::program(trace, o, &[], None, (b.w, b.h));
+    let sc = st
+        .as_ref()
+        .map_or(f64::MAX, |p| crate::cost::stream::time(p).cycles);
+    let gc = gm
+        .as_ref()
+        .map_or(f64::MAX, |p| crate::cost::gemm::time(p).cycles);
+    match (st, gm) {
+        (Ok(p), Ok(_)) if sc <= gc => {
+            write_stream(&p, o, out, None)?;
+            Ok((p.stream.w, p.stream.h))
+        }
+        (_, Ok(g)) => {
+            gemm::compile_program(&g, out, None)?;
+            Ok(g.fabric())
+        }
+        (Ok(p), Err(_)) => {
+            write_stream(&p, o, out, None)?;
+            Ok((p.stream.w, p.stream.h))
+        }
+        (Err(a), Err(b)) => Err(format!("{a}; {b}")),
+    }
 }
 
 /// A grid reading's regime, by price: the tiled regime's program ([`tiled`]: the image over the
