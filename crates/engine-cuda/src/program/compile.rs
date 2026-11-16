@@ -328,8 +328,16 @@ pub struct Module {
     block_threads: u32,
     /// The dynamic shared memory each launch hands it.
     dynamic_shared: u32,
+    /// The blocks of `RESIDENT_THREADS` threads a multiprocessor holds at
+    /// once of it (at least one).
+    resident: u32,
     entry_name: String,
 }
+
+/// The block width [`Module::resident`] counts blocks of: a stage
+/// kernel's (`cuda_steps::BLOCK`).
+#[cfg_attr(not(feature = "device"), allow(dead_code))]
+const RESIDENT_THREADS: u32 = 256;
 
 // SAFETY: `CUmodule`/`CUfunction` are context-scoped, and this crate binds one
 // primary context per device, so a handle is valid on every thread that has
@@ -407,6 +415,7 @@ impl Module {
                 function,
                 block_threads: launch_width(function),
                 dynamic_shared,
+                resident: resident_blocks(function, dynamic_shared),
                 entry_name: entry_name.to_string(),
             })
         }
@@ -420,6 +429,14 @@ impl Module {
     #[must_use]
     pub const fn dynamic_shared(&self) -> u32 {
         self.dynamic_shared
+    }
+
+    /// The blocks of 256 threads a multiprocessor holds at once of this
+    /// module's entry: what a launch whose blocks wait on one another may
+    /// run a unit.
+    #[must_use]
+    pub const fn resident(&self) -> u32 {
+        self.resident
     }
 
     #[cfg(feature = "device")]
@@ -447,6 +464,34 @@ impl Drop for Module {
             // ignored because a `Drop` has nowhere to report it.
             unsafe { crate::device::dr::cuModuleUnload(self.module) };
         }
+    }
+}
+
+#[cfg(feature = "device")]
+fn resident_blocks(function: crate::device::dr::CUfunction, dynamic_shared: u32) -> u32 {
+    #[cfg(not(feature = "rocm"))]
+    {
+        use crate::device::dr;
+        let mut blocks = 0i32;
+        // SAFETY: `blocks` is a live out-parameter and `function` was just
+        // resolved out of a loaded module.
+        let code = unsafe {
+            dr::cuOccupancyMaxActiveBlocksPerMultiprocessor(
+                &raw mut blocks,
+                function,
+                RESIDENT_THREADS as i32,
+                dynamic_shared as usize,
+            )
+        };
+        if code == dr::CUresult::CUDA_SUCCESS {
+            return u32::try_from(blocks).unwrap_or(1).max(1);
+        }
+        1
+    }
+    #[cfg(feature = "rocm")]
+    {
+        let _ = (function, dynamic_shared, RESIDENT_THREADS);
+        1
     }
 }
 

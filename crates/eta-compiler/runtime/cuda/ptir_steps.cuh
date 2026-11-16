@@ -391,7 +391,8 @@ struct Ps {
   }
 
   // Element `i` of node `p`'s result, computed here as its step would have
-  // stored it: a map, an arithmetic, a draw or an iota.
+  // stored it: a map, an arithmetic, a select, a draw, an iota or a
+  // broadcast of one element.
   __device__ __noinline__ ps_u32 ld_computed(ps_u32 p, ps_u32 i) {
     const ps_u32 tag = p_tag(p);
     const ps_u32 o = p_o0(p);
@@ -433,9 +434,27 @@ struct Ps {
       const float u = ps_rng_hash_uniform(seed, i);
       return ps_bits(kind == 1u ? -logf(-logf(u)) : u);
     }
+    if (tag == 0x20u) {
+      const ps_u32 cond = p_a0(p);
+      const ps_u32 x = p_a1(p);
+      const ps_u32 y = p_a2(p);
+      const bool take = ld_b(cond, ps_pick(d_len(cond), i));
+      const ps_u32 from = take ? x : y;
+      const ps_u32 at = ps_pick(d_len(from), i);
+      if (odt == DT_F32) return ps_bits(ld_f(from, at));
+      if (odt == DT_I32) return (ps_u32)ld_i(from, at);
+      return ld_u(from, at);
+    }
     if (tag == 0x64u) {
       if (odt == DT_F32) return ps_bits((float)i);
       return i;
+    }
+    if (tag == 0x38u) {
+      // One element only ([`computed_where_read`]): every lane reads it.
+      const ps_u32 a = p_a0(p);
+      if (odt == DT_F32) return ps_bits(ld_f(a, 0u));
+      if (odt == DT_I32) return (ps_u32)ld_i(a, 0u);
+      return ld_u(a, 0u);
     }
     return 0u;
   }

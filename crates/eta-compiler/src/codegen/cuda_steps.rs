@@ -384,14 +384,30 @@ pub fn stage_steps(plan: &LaunchStagePlan) -> Result<Vec<Step>, u8> {
 const COMPUTED_DEPTH: u32 = 4;
 
 /// Whether `tag`'s result is cheap to compute where it is read, element by
-/// element: a map, an arithmetic, a draw or an iota. (A broadcast's index
-/// walks the shapes an element, which costs its reader more than the row
-/// it would lay.)
+/// element: a map, an arithmetic, a select, a draw or an iota. (A broadcast
+/// is, of one element only: its index otherwise walks the shapes an
+/// element, which costs its reader more than the row it would lay.)
 const fn computable(tag: u8) -> bool {
     matches!(
         tag,
-        0x01..=0x0B | 0x10..=0x15 | 0x1F | tags::RNG | tags::RNG_KEYED | tags::IOTA
+        0x01..=0x0B
+            | 0x10..=0x15
+            | 0x1F
+            | tags::SELECT
+            | tags::RNG
+            | tags::RNG_KEYED
+            | tags::IOTA
+            | tags::BROADCAST
     )
+}
+
+/// Whether `value` is one element, whatever a bind resolves.
+fn one_element(plan: &LaunchStagePlan, value: u32) -> bool {
+    plan.value_types.get(value as usize).is_some_and(|ty| {
+        ty.axes
+            .iter()
+            .all(|axis| matches!(axis, crate::plan::Dimension::Static(1)))
+    })
 }
 
 /// Whether a node of `tag` reads each element of its arguments where it
@@ -463,6 +479,9 @@ pub fn computed_where_read(plan: &LaunchStagePlan) -> Vec<bool> {
         let result = base;
         base += u32::from(op.result_count);
         if op.result_count != 1 || !computable(op.tag) {
+            continue;
+        }
+        if op.tag == tags::BROADCAST && !op.args.first().is_some_and(|&a| one_element(plan, a)) {
             continue;
         }
         let Some(ty) = plan.value_types.get(result as usize) else {

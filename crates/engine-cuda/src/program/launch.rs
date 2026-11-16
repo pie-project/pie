@@ -976,7 +976,7 @@ impl Prepared {
         if cfg!(feature = "test-slot-fill") {
             self.poison_dummy(stream)?;
         }
-        let (groups, slots) = self.shape();
+        let (groups, slots) = self.shape(stage.module.resident());
         // The lane slots' barriers start every launch at zero.
         crate::device::zero_span_on(stream, self.barriers, 2 * size_of::<u32>() * slots as usize)?;
         let pitch = u32::try_from(self.pitch).unwrap_or(u32::MAX);
@@ -1017,12 +1017,12 @@ impl Prepared {
     /// The blocks a lane runs on and the lane slots one launch holds: every
     /// lane a slot of its own, so no fire loops its lanes; a lane's blocks
     /// as many as the device holds at once with the fire's lanes (they meet
-    /// between steps, so they must be resident together), from one (which
-    /// meets no other, past the units) to [`MAX_GROUPS`], and no more than
-    /// the stage's widest value asks.
-    fn shape(&self) -> (u32, u32) {
+    /// between steps, so they must be resident together: `resident` a
+    /// multiprocessor), from one (which meets no other, past them) to
+    /// [`MAX_GROUPS`], and no more than the stage's widest value asks.
+    fn shape(&self, resident: u32) -> (u32, u32) {
         let lanes = self.filled.max(1);
-        let groups = (device_units().max(1) / lanes)
+        let groups = (device_units().max(1).saturating_mul(resident.max(1)) / lanes)
             .clamp(1, MAX_GROUPS)
             .min(self.groups.max(1));
         (groups, lanes)
