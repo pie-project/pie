@@ -7,12 +7,14 @@ api = 1
 device = "NVIDIA RTX PRO 4500 Blackwell"
 
 [rates]
-# `pie tune vulkan --rates` at 78e16ecf7 on this card, in one quiet hold
-# (nr_throttled +4 over the run): the matmul through the profile's path,
-# Coopmat; the copy and the launch by the host's clock.
-bf16_flops_per_ns = 26300.0
-bytes_per_ns = 778.0
-launch_ns = 34000
+# `pie tune vulkan --rates` at 27955c910 on this card, in one quiet hold
+# (nr_throttled +2 over the run): the matmul through the profile's path,
+# Coopmat, 26.2 TFLOPS; the 256 MiB copy 813 GB/s; the launch a dispatch's
+# own cost inside a recorded frame (1024 of the narrowest matmul against
+# one, in-graph), 3.57 us.
+bf16_flops_per_ns = 26200.0
+bytes_per_ns = 813.0
+launch_ns = 3573
 # Vendor peaks, bounds and not rates: dense bf16 about 202 TFLOPS (NVIDIA
 # and Lenovo publish no bf16 or FP16 tensor figure for this card; 1617
 # TFLOPS of FP4 with sparsity, Lenovo Press LP2443, is 808 dense, and
@@ -21,4 +23,4 @@ launch_ns = 34000
 # specifications).
 
 [provenance]
-rates = "pie tune vulkan --rates at 78e16ecf7 on 2026-11-15, the matmul through Coopmat"
+rates = "pie tune vulkan --rates at 27955c910 on 2026-11-16: the matmul through Coopmat, the launch inside a recorded frame (in-graph)"
