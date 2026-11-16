@@ -3,8 +3,8 @@
 //! `inputs.next_tokens()`, the table a draft head's ids are read from: row
 //! i of a lane is fed token i + 1 of the same lane, as vLLM's speculator
 //! shifts its ids, and a lane's last row its own (the forward puts the
-//! sampled token there). Two lanes in one fire, every row read out: each
-//! row's embedding is the next token's row of the table, never across the
+//! sampled token there). Two lanes in one fire, each row read out in turn:
+//! each row's embedding is the next token's row of the table, never across the
 //! lane boundary, eagerly and recorded.
 
 use std::path::Path;
@@ -42,11 +42,7 @@ fn shell(trace: poem::Trace, path: &Path, graphs: Graphs) -> Shell {
         trace,
         contract: &contract,
         checkpoint: path,
-        // Every row of a lane is read out.
-        budget: Budget {
-            readouts_per_lane: 16,
-            ..Budget::new(LANES, 64)
-        },
+        budget: Budget::new(LANES, 64),
         patches: None,
         page_size: 16,
         context: 256,
@@ -86,7 +82,11 @@ fn fire_and_compare(graphs: Graphs) {
     let table = weights.get("embed");
     let lanes: [Vec<u32>; 2] = [vec![3, 41, 7, 0, 63, 2, 19], vec![1, 54, 8, 5]];
     let mut shell = shell(trace.clone(), &path, graphs);
-    for _ in 0..2 {
+    let w = WIDTH as usize;
+    // A plain lane reads one row out a fire: each row in turn, both lanes
+    // in every fire (they hold no state, so each fire is the same).
+    let longest = lanes.iter().map(Vec::len).max().unwrap_or(0);
+    for row in 0..longest {
         let seated: Vec<Seated<'_>> = lanes
             .iter()
             .enumerate()
@@ -101,20 +101,18 @@ fn fire_and_compare(graphs: Graphs) {
             .collect();
         let want: Vec<Readout> = lanes
             .iter()
-            .map(|tokens| Readout::Rows((0..tokens.len() as u32).collect()))
+            .map(|tokens| Readout::Rows(vec![row.min(tokens.len() - 1) as u32]))
             .collect();
         let readouts = shell.fire_rows(&seated, &want).expect("the fire runs");
-        let w = WIDTH as usize;
         for (lane, (tokens, got)) in lanes.iter().zip(&readouts).enumerate() {
-            assert_eq!(got.len(), tokens.len() * w, "lane {lane}: every row read out");
-            for (row, &next) in shifted(tokens).iter().enumerate() {
-                let want = &table[next as usize * w..][..w];
-                let have = &got[row * w..][..w];
-                assert_eq!(
-                    have, want,
-                    "{graphs:?} lane {lane} row {row}: fed token {next}, the lane's next"
-                );
-            }
+            let at = row.min(tokens.len() - 1);
+            let next = shifted(tokens)[at];
+            assert_eq!(got.len(), w, "lane {lane}: the one row read out");
+            assert_eq!(
+                got.as_slice(),
+                &table[next as usize * w..][..w],
+                "{graphs:?} lane {lane} row {at}: fed token {next}, the lane's next"
+            );
         }
     }
 }

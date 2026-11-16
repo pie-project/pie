@@ -167,12 +167,14 @@ async fn main(input: Input) -> Result<Output> {
         .context("reserve the decode's slots")?;
     let pipe = Pipeline::new();
 
-    // One pass over the prompt, its last row read out. With drafts on it
-    // drafts: the head runs over every prompt row, fed each row's next
-    // prompt token and at the read-out row the sampled one, so its KV is
-    // written at every position the decode attends.
+    // The drafting pass is the last prompt token alone: a draft head attends
+    // as its readout rows, so every row of a drafting fire is read out.
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-    let spans = [(0, n)];
+    let spans = if k > 0 && n > 1 {
+        vec![(0, n - 1), (n - 1, n)]
+    } else {
+        vec![(0, n)]
+    };
     let last_span = spans.len() - 1;
     let mut seed: Vec<i32> = Vec::new();
     for (at, &(base, end)) in spans.iter().enumerate() {
