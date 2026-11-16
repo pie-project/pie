@@ -280,6 +280,9 @@ pub struct EtaCaps {
     pub draft_mask_token: u32,
     pub draft_proposals_from: u32,
     pub has_attn_page_mask: bool,
+    /// Every engine reads a lane's mask from its set's committed boundary on
+    /// ([`::engine::Capabilities::buffer_masks`]).
+    pub buffer_masks: bool,
     pub has_lora: bool,
     pub adapter_attachments: bool,
     /// [`::engine::Capabilities::rs_snapshots`], the least of the engines'.

@@ -79,6 +79,33 @@ impl Mask {
         }
     }
 
+    /// The mask with `columns` admitted columns before it: over the whole
+    /// context, for an engine that reads a lane's mask from slot 0
+    /// ([`crate::Capabilities::buffer_masks`]), its committed slots read.
+    #[must_use]
+    pub fn behind(&self, columns: u64) -> Mask {
+        let mut runs = Vec::with_capacity(self.runs.len() + 2);
+        let mut at = columns;
+        let mut admitted_to = columns;
+        runs.push(0);
+        runs.push(u32::try_from(columns).unwrap_or(u32::MAX));
+        for span in self.admitted(0..self.total) {
+            let (start, end) = (span.start + columns, span.end + columns);
+            if start == admitted_to {
+                *runs.last_mut().unwrap() += u32::try_from(end - start).unwrap_or(u32::MAX);
+            } else {
+                runs.push(u32::try_from(start - at).unwrap_or(u32::MAX));
+                runs.push(u32::try_from(end - start).unwrap_or(u32::MAX));
+            }
+            at = end;
+            admitted_to = end;
+        }
+        Mask {
+            runs,
+            total: self.total + columns,
+        }
+    }
+
     pub fn admitted(&self, range: Range<u64>) -> impl Iterator<Item = Range<u64>> + '_ {
         let mut at = 0u64;
         self.runs
@@ -1150,6 +1177,33 @@ mod tests {
         let blind = mask(&[false, true, false, false, true]);
         let rows = Masking::Rows(vec![ancestry, blind]);
         assert!(buffered_reads(Some(&rows), 2, 5, 2).is_err());
+    }
+
+    #[test]
+    fn a_mask_behind_its_committed_columns_admits_them_and_reads_the_rest() {
+        for bits in [
+            vec![true, false, false, true, true, false, true],
+            vec![false, false, true],
+            vec![true, true],
+            vec![],
+        ] {
+            let buffer = mask(&bits);
+            for columns in [0u64, 1, 5] {
+                let whole = buffer.behind(columns);
+                assert_eq!(whole.total, bits.len() as u64 + columns);
+                let mut kept = vec![false; whole.total as usize];
+                for span in whole.admitted(0..whole.total) {
+                    for column in span {
+                        kept[column as usize] = true;
+                    }
+                }
+                let mut want = vec![true; columns as usize];
+                want.extend(&bits);
+                assert_eq!(kept, want, "{bits:?} behind {columns}");
+                assert_eq!(whole.after(columns).admitted(0..bits.len() as u64).collect::<Vec<_>>(),
+                    buffer.admitted(0..bits.len() as u64).collect::<Vec<_>>());
+            }
+        }
     }
 
     #[test]

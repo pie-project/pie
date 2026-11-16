@@ -777,6 +777,9 @@ impl Engine for Cuda {
             },
             has_lora: true,
             has_attn_page_mask: false,
+            // CUDA's paged prefill reads a lane's mask from its committed
+            // boundary on; ROCm's refuses a mask there.
+            buffer_masks: !cfg!(feature = "rocm"),
             draft_block: drafter.map_or(0, |d| d.rows),
             draft_mask_token: drafter.map_or(0, |d| d.mask_token),
             draft_proposals_from: drafter.map_or(1, |d| d.proposals_from),

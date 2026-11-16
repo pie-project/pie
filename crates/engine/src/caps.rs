@@ -134,6 +134,14 @@ pub struct Capabilities {
     #[serde(default)]
     pub has_attn_page_mask: bool,
 
+    /// The engine reads a lane's mask from its set's committed boundary on
+    /// ([`crate::fire::KvDelta::folded`], [`crate::fire::Lane::mask`]). Where
+    /// it does not, the runtime hands it the mask over the whole context: the
+    /// committed slots admitted, then the guest's columns. Goes with the last
+    /// engine that reads masks from the boundary.
+    #[serde(default)]
+    pub buffer_masks: bool,
+
     #[serde(default)]
     pub draft_block: u32,
     #[serde(default)]
