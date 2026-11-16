@@ -352,7 +352,12 @@ fn decode(get: &HashMap<String, String>) -> Result<bool, String> {
         reading.model,
         t0.elapsed().as_secs_f64()
     );
-    let lanes = reading.paging.map_or(1, |g| g.lanes as usize);
+    let lanes = reading
+        .classes
+        .iter()
+        .map(|c| c.rows as usize)
+        .sum::<usize>()
+        .max(1);
     if let Some(dir) = get.get("export") {
         // every array's words for step 0 (the statics and the first step's entries) as the
         // h2d files a capture-fed program's are, its host.json naming them: what
@@ -461,8 +466,9 @@ fn decode(get: &HashMap<String, String>) -> Result<bool, String> {
         let pos: Vec<u32> = local.iter().map(|s| s.unwrap_or(0) as u32).collect();
         let (_, entries) = reading.decode_step(&mut host, &trace, &toks, &pos)?;
         reading.write_pos(&mut rt, pos[0])?;
-        let rows: Vec<(u32, u32)> = (0..lanes).map(|t| (t as u32, pos[t])).collect();
-        reading.write_rows(&mut rt, &rows)?;
+        // lane t its own lane slot and state slot
+        let rows: Vec<(u32, u32, u32)> = (0..lanes).map(|t| (t as u32, t as u32, pos[t])).collect();
+        reading.write_rows(&mut rt, lanes, &rows)?;
         let t1 = std::time::Instant::now();
         let (got, cycles) = reading.launch(&mut rt, &entries)?;
         let wall_ms = t1.elapsed().as_secs_f64() * 1e3;

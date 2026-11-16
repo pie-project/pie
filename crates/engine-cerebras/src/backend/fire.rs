@@ -521,6 +521,7 @@ impl CerebrasEngine {
                         token,
                         pos: start + i as u32,
                         pages: lanes[at].kv.pages.clone(),
+                        state: lanes[at].slot,
                         logits: !greedy && read_rows[at].contains(&(i as u32)),
                     });
                 }

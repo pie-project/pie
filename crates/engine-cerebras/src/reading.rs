@@ -914,16 +914,14 @@ impl Reading {
         write_all(rt, &self.pos, "pos", &[at])
     }
 
-    /// The attention PEs told a step's rows' (lane slot, position) ([`Reading::rowp`]; rows
-    /// past `rows` lane slot 0 at position 0).
-    pub fn write_rows(&self, rt: &mut dyn Fabric, rows: &[(u32, u32)]) -> R<()> {
-        let Some(g) = self.paging else {
-            return Ok(());
-        };
-        let mut words = vec![0u32; 2 * g.lanes as usize];
-        for (t, &(lane, at)) in rows.iter().enumerate().take(g.lanes as usize) {
-            words[2 * t] = lane;
-            words[2 * t + 1] = at;
+    /// The attention and state PEs told a step's rows' (lane slot, state slot, position)
+    /// ([`Reading::rowp`]; `n` rows a step, those past `rows` slot 0 at position 0).
+    pub fn write_rows(&self, rt: &mut dyn Fabric, n: usize, rows: &[(u32, u32, u32)]) -> R<()> {
+        let mut words = vec![0u32; 3 * n];
+        for (t, &(lane, state, at)) in rows.iter().enumerate().take(n) {
+            words[3 * t] = lane;
+            words[3 * t + 1] = state;
+            words[3 * t + 2] = at;
         }
         write_all(rt, &self.rowp, "rowp", &words)
     }
