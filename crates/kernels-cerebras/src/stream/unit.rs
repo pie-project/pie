@@ -144,6 +144,10 @@ pub struct Joint {
     /// PEs holding each head's state), where one is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<State>,
+    /// Each q head's sink logit (a weight of `q_heads`), joining its softmax's sum (gpt-oss's
+    /// `attn.sink` folded into the attention), where one is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sink: Option<ValueId>,
 }
 
 /// A gated delta rule's column (P8, ops/sst.csl, ops/cy_sst.csl): each head's root also takes
@@ -345,6 +349,8 @@ impl Reader<'_> {
             Operation::Gather(
                 Gather::PackRows { x, .. } | Gather::UnpackRows { x, .. } | Gather::Rows { x, .. },
             ) => up(*x, 0),
+            // (a sink's output is its attention's, the sink folded into the Attend)
+            Operation::Attn(Attn::Sink { o, .. }) => up(*o, 0),
             _ => Cols {
                 base: v,
                 from: 0,
@@ -735,6 +741,7 @@ pub fn lower_through(
                     causal: false,
                     window: None,
                     state: None,
+                    sink: None,
                 });
                 steps.push(Step::Store { q, k, v });
                 sides.insert(*o, Side::Col);
@@ -786,6 +793,7 @@ pub fn lower_through(
                     causal: *causal,
                     window: None,
                     state: None,
+                    sink: None,
                 });
                 steps.push(Step::Store { q, k, v });
                 sides.insert(*o, Side::Col);
@@ -1005,6 +1013,7 @@ pub fn lower_through(
                         k_from: h * d,
                         v_from: 2 * h * d,
                     }),
+                    sink: None,
                 });
                 steps.push(Step::Store { q, k, v });
                 sides.insert(*y, Side::Col);
@@ -1023,8 +1032,32 @@ pub fn lower_through(
                 sm_scale,
                 window,
                 o,
+                lse,
                 ..
             }) => {
+                // its log-sum-exp read by a sink alone: the sink folded in (the Attend's)
+                let sink = match lse {
+                    None => None,
+                    Some(l) => {
+                        let sn = nodes
+                            .iter()
+                            .copied()
+                            .find(|&n| {
+                                matches!(&trace.nodes[n as usize].op,
+                                    Operation::Attn(Attn::Sink { o: so, lse: sl, .. })
+                                        if so == o && sl == l)
+                            })
+                            .ok_or_else(|| {
+                                refuse(at, "attn.decode's log-sum-exp is read by no sink".into())
+                            })?;
+                        let Operation::Attn(Attn::Sink { sink, .. }) = &trace.nodes[sn as usize].op
+                        else {
+                            unreachable!()
+                        };
+                        skip.insert(sn);
+                        Some(*sink)
+                    }
+                };
                 let Some(&(_, k, v)) = appended.iter().find(|(c, _, _)| c == cache) else {
                     return Err(refuse(
                         at,
@@ -1060,6 +1093,7 @@ pub fn lower_through(
                     causal: true,
                     window: *window,
                     state: None,
+                    sink,
                 });
                 steps.push(Step::Store { q, k, v });
                 sides.insert(*o, Side::Col);

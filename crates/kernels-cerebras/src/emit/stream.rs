@@ -479,6 +479,24 @@ pub fn emit(p: &Program) -> R<Emitted> {
         files.push((rname.clone(), rtext));
         let root = kc.root(s);
         tiles.insert(root, (rname, kv_root_params(p, kc, root)));
+        if let Some(sk) = kv_joint(p, ks).sink {
+            // the root's heads' sink logits, its step's first position
+            let (qh, ..) = kv_consts(p, ks);
+            arrays.push(HostArray {
+                at: root,
+                sym: "snk".into(),
+                u16: false,
+                len: qh,
+                fill: Fill::Slices(vec![(sk.0, kc.head * qh, qh)]),
+            });
+            arrays.push(HostArray {
+                at: root,
+                sym: "pos".into(),
+                u16: false,
+                len: 1,
+                fill: Fill::Words(vec![0]),
+            });
+        }
         if let Some(st) = state {
             // the root's conv taps for its head's channels, its decay's parameters
             let j = kv_joint(p, ks);
@@ -2285,6 +2303,7 @@ fn kv_joint(p: &Program, ks: &place::KvSched) -> crate::stream::unit::Joint {
             causal: a.causal,
             window: None,
             state: None,
+            sink: None,
         })
 }
 
@@ -2298,6 +2317,7 @@ fn kv_consts(p: &Program, ks: &place::KvSched) -> (u32, u32, u32, f32) {
 /// then each query's output back to the unit that asked it.
 fn kv_root_file(p: &Program, k: usize, ks: &place::KvSched) -> R<(String, String)> {
     let (qh, dc, qd, _) = kv_consts(p, ks);
+    let sink = kv_joint(p, ks).sink.is_some();
     let (lo, hi) = if p.round16 {
         ("1.0e-30", "1.0e30")
     } else {
@@ -2331,12 +2351,23 @@ fn kv_root_file(p: &Program, k: usize, ks: &place::KvSched) -> R<(String, String
     );
     let _ = writeln!(
         t,
-        "const cy = @import_module(\"ops/cy_satt.csl\", .{{ .fab = fab, .math = math, .YO = q_am, .IN = q_ar, .Qh = {qh}, .Dc = {dc}, .LO = {lo}, .HI = {hi} }});"
+        "const cy = @import_module(\"ops/cy_satt.csl\", .{{ .fab = fab, .math = math, .YO = q_am, .IN = q_ar, .Qh = {qh}, .Dc = {dc}, .LO = {lo}, .HI = {hi}{} }});",
+        if sink { ", .SINK = true" } else { "" }
     );
+    if sink {
+        // its heads' sink logits (the checkpoint's), and the step's first position (the
+        // reference the PEs start from at 0)
+        t.push_str(
+            "var snk_p: [*]f32 = &cy.sk;\nvar pos = @zeros([1]u32);\nvar pos_p: [*]u32 = &pos;\n",
+        );
+    }
     let sw = qd + 2 * dc;
     t.push_str(&buf("sx", sw));
     t.push_str(&buf("ob", qd));
     let mut body = String::from("  stamp(0);\n  cy.passes = 0;\n");
+    if sink {
+        body.push_str("  if (pos[0] == 0) { cy.init(); }\n");
+    }
     for &(u, rows, _) in &ks.stores {
         let _ = writeln!(
             body,
@@ -2357,6 +2388,9 @@ fn kv_root_file(p: &Program, k: usize, ks: &place::KvSched) -> R<(String, String
             t,
             "  @initialize_queue(q_i{u}, .{{ .color = @get_color(C_I{u}) }});\n  @initialize_queue(q_o{u}, .{{ .color = @get_color(C_O{u}) }});"
         );
+    }
+    if sink {
+        t.push_str("  @export_symbol(snk_p, \"snk\");\n  @export_symbol(pos_p, \"pos\");\n");
     }
     t.push_str("  @initialize_queue(q_ar, .{ .color = @get_color(C_AR) });\n  @initialize_queue(q_am, .{ .color = @get_color(C_AM) });\n}\n");
     Ok((name, t))
