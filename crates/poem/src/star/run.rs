@@ -292,9 +292,11 @@ impl Package {
                 m,
                 failed: RefCell::new(None),
             };
+            crate::star::forward::DEPTH.with(|d| d.set(deploy.layers));
             let traced = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 crate::trace_hybrid(name, &model, platform)
             }));
+            crate::star::forward::DEPTH.with(|d| d.set(None));
             TRAIL.with(|t| *t.borrow_mut() = Trail::default());
             if let Some(why) = model.failed.borrow_mut().take() {
                 return Err(why);
