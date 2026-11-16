@@ -238,10 +238,13 @@ __global__ void gather_rows(const U* __restrict__ wide, U* __restrict__ tight,
     for (int i = threadIdx.x; i < units; i += blockDim.x) dst[i] = src[i];
 }
 
-// wide[index[n]] = tight[n], `units` U per row. One block per row.
+// wide[index[n]] = tight[n], `units` U per row. One block per row. With
+// `live`, entries from `*live - base` on pad a body's ceiling and are skipped.
 template <class U>
 __global__ void scatter_rows(const U* __restrict__ tight, U* __restrict__ wide,
-                             const i32* __restrict__ index, int units) {
+                             const i32* __restrict__ index, int units,
+                             const u32* __restrict__ live, int base) {
+    if (live != nullptr && static_cast<int>(blockIdx.x) + base >= static_cast<int>(*live)) return;
     const U* src = tight + static_cast<long long>(blockIdx.x) * units;
     U* dst = wide + static_cast<long long>(index[blockIdx.x]) * units;
     for (int i = threadIdx.x; i < units; i += blockDim.x) dst[i] = src[i];

@@ -561,6 +561,7 @@ fn move_rows(
     tight: Tensor,
     index: Tensor,
     args: [Tensor; 3],
+    extra: &[ArgValue<'_>],
 ) -> Result<(), Error> {
     if index.dtype != Dtype::I32 {
         return Err(refuse(
@@ -591,16 +592,18 @@ fn move_rows(
     let bytes = row_bytes(op, tight)?;
     let (unit, width) = unit(bytes, wide.ptr, tight.ptr);
     let per_row = u32::try_from(bytes / width).unwrap_or(u32::MAX);
+    let mut argv = vec![
+        args[0].arg(),
+        args[1].arg(),
+        args[2].arg(),
+        stated(op, per_row)?.arg(),
+    ];
+    argv.extend_from_slice(extra);
     ctx.fire(
         op,
         Fire::at(kernel(FILE, &format!("::pie::layout::{entry}<{unit}>")))
             .apply(route_rows(rows, per_row)),
-        &[
-            args[0].arg(),
-            args[1].arg(),
-            args[2].arg(),
-            stated(op, per_row)?.arg(),
-        ],
+        &argv,
     )
 }
 
@@ -619,16 +622,23 @@ pub fn gather_rows(
         *tight,
         index,
         [wide, *tight, index],
+        &[],
     )
 }
 
+/// `wide[index[n]] = tight[n]`. With `live` (a device word counting the
+/// live entries of `index` past its first `base`), an entry from that count
+/// on is skipped: a body's padded readout rows name row 0, and a pad's row
+/// is no sample of the fire's to place.
 pub fn scatter_rows(
     ctx: &Ctx,
     tight: Tensor,
     index: Tensor,
+    live: Option<(u64, u32)>,
     wide: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "gather.scatter_rows";
+    let (live, base) = live.unwrap_or((0, 0));
     move_rows(
         ctx,
         OP,
@@ -637,6 +647,7 @@ pub fn scatter_rows(
         tight,
         index,
         [tight, *wide, index],
+        &[ArgValue::Ptr(live), stated(OP, base)?.arg()],
     )
 }
 

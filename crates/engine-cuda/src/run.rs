@@ -1851,6 +1851,18 @@ impl<'c> Run<'c> {
         self.whole(id)
     }
 
+    /// Where `routes` is the fire's readout rows: the device word counting
+    /// the live ones and the entry its cut starts at. A body pads its readout
+    /// rows to its ceiling with row 0 and replays the launch at that width,
+    /// so a scatter over them bounds itself by the word, not the launch.
+    pub(crate) fn live_readouts(&self, routes: ValueId) -> Option<(u64, u32)> {
+        matches!(
+            self.values[routes.0 as usize].def,
+            Def::Input(RuntimeInput::ReadoutRows)
+        )
+        .then(|| (self.fire.readout_live, self.row_base(routes)))
+    }
+
     /// The fire row `tensor(id)`'s row 0 stands at; fire-wide grids add it back.
     fn row_base(&self, id: ValueId) -> u32 {
         let (cut, whole) = (self.tensor(id), self.whole(id));

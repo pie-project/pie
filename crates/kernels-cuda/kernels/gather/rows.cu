@@ -278,14 +278,19 @@ __global__ void gather_rows(
     }
 }
 
+// wide[index[n]] = tight[n]; with `live`, entries from `*live - base` on
+// pad a body's ceiling and are skipped.
 template <class U>
 __global__ void scatter_rows(
     const U* __restrict__ tight,
     U* __restrict__ wide,
     const i32* __restrict__ index,
-    int units)
+    int units,
+    const u32* __restrict__ live,
+    int base)
 {
     const int n = static_cast<int>(blockIdx.x);
+    if (live != nullptr && n + base >= static_cast<int>(*live)) return;
     const U* src = tight + static_cast<long long>(n) * units;
     U* dst = wide + static_cast<long long>(index[n]) * units;
     for (int i = static_cast<int>(threadIdx.x); i < units;

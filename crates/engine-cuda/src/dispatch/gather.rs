@@ -381,6 +381,7 @@ impl Run<'_> {
                 self.ctx(),
                 self.tensor(*src),
                 self.tensor(*routes),
+                self.live_readouts(*routes),
                 &mut self.fire_wide(*y),
             ),
             Gather::PackRows { x, perm, y } => gather::pack_rows(
