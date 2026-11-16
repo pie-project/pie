@@ -255,6 +255,11 @@ pub struct Inputs<B: Backend> {
 
     mask_stride: u32,
     page_tables: Vec<TableAt>,
+    /// The page ids a table holds at most: what a fire binds its indices
+    /// at, whatever it holds, so a recording binds what every later fire of
+    /// its composition does (the kernels read a lane's pages from its
+    /// indptr, written each fire).
+    page_capacity: u32,
 
     patch: Option<PatchAt>,
 
@@ -410,6 +415,7 @@ impl<B: Backend> Inputs<B> {
             mask_enabled,
             mask_stride,
             page_tables,
+            page_capacity: u32::try_from(pages).unwrap_or(u32::MAX),
             patch,
             mrope,
             rs_replay,
@@ -899,12 +905,7 @@ impl<B: Backend> Inputs<B> {
                 .write(at.write_offset, bytes_of(&geometry.write_offset))?;
             page_tables.push(TableHandles {
                 indptr: i32s(handles, &self.store, at.indptr, lanes + 1)?,
-                indices: i32s(
-                    handles,
-                    &self.store,
-                    at.indices,
-                    geometry.indices.len() as u32,
-                )?,
+                indices: i32s(handles, &self.store, at.indices, self.page_capacity)?,
                 last_page_len: i32s(handles, &self.store, at.last_page_len, lanes)?,
                 kv_len: i32s(handles, &self.store, at.kv_len, lanes)?,
                 write_page: u32s(handles, &self.store, at.write_page, rows)?,
