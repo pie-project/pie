@@ -2090,6 +2090,160 @@ milestone's tail.
     NeoX rotation, its mate half a head away, across PEs: refused by the printer).
 
 
+## G1: the poem survey
+
+**Goal.** Every `.poem` in `models/` runs: it compiles with no per-model code (placement searched
+from the layer graph, ops lowered into the existing op modules, nothing refused by name), and a
+slice of the real model (its first layers, real embedding and head, real weights) answers the
+model's reference (HF / diffusers) on the fabric simulator.
+
+**The survey.** `cargo run --release -p kernels-cerebras --example poems -- <deployment>...` runs a
+deployment through the pipeline the engine runs on load: the decode program (`target::plan`,
+`Program::of`, `build::emit`) and every value of the trace's `reading` switch through the stream
+compiler (`stream::compile_reading`: the stream regime at 16 rows a class, a grid reading on the
+clip 256 token rows make); `UNITS=1` also the decode step through the units (below), `DECODE=1`
+the decode program for a trace with readings. One line a (deployment, reading): `PASS` or the
+stage it stops at and why. `NODES=a,b` prints those nodes and their inputs' makers.
+
+### G1.1 The matrix
+
+Deployments: each poem's miniature (real dimensions, a prefix of the real model's layers and
+experts) or a depth cut (`-l{n}`) of a real model, bf16. Before: f272089df. After: this branch.
+"units" is the decode step through the stream regime's units (G1.2); "template" the decode
+program of `KernelSet` x `Shape` (ARCHITECTURE.md).
+
+| poem | deployment | reading | before | after |
+|---|---|---|---|---|
+| qwen3_dense | qwen3-0.6b | decode | template PASS | template PASS; **units PASS** (549 x 274, 0.29M cycles priced) |
+| qwen_3 | qwen35-d0.8b | decode | template PASS | template PASS; units: `ssm.causal_conv1d` (state step, G1.4) |
+| qwen_3 MoE | qwen35-122b-a10b / qwen36-35b-a3b / qwen3-next-80b / qwen38-max minis | decode | `moe_sigmoid_gate_add` | the same (shared-expert gate) |
+| qwen3_moe | qwen3-30b-a3b-mini | decode | template PASS | template PASS; **units PASS** (149 x 547) |
+| llama_3 | llama31-8b | decode | template PASS | template PASS; **units PASS** (738 x 1072, 0.43M cycles priced) |
+| llama_3 | llama33-70b-mini-l4 | decode | EMIT: a head turn off a column source | **template PASS** (search keeps PEs' words that build) |
+| gemma_4 | e2b; e4b-mini-l1 | decode | template PASS | template PASS; units: shared KV (e2b), `gather.embed` per layer (PLE) |
+| gemma_4 | 26b-a4b-mini-e64 | decode | router form refused | units: one attention shape a reading (global vs sliding head dims) |
+| gemma_4 | 31b -l2 | decode | no partition | units: an emitter column gap |
+| gpt_oss | 20b | decode | template PASS | template PASS; units: `attn.sink` |
+| glm_4 | glm45-air-mini, glm47-mini | decode | router form refused | units: an emitter column gap (shared expert); heads straddling chunks |
+| minimax_m2 | minimax-m25-mini | decode | router form refused | **units PASS** (517 x 798, 0.13M cycles priced) |
+| minimax_m3 | m3-mini, m31-flash-mini | decode | DSA indexer | DSA indexer |
+| mimo_v2 | flash-l6, pro-mini | decode | `split_qkv_padded` | the same |
+| muse_glimmer | 30b-mini-l8 | decode | phase order | units: tiles do not fit at py 832 (a 30B layer in one unit) |
+| muse_spark | open-mini-l4 | decode | `norm_gate` | units: `norm_gate` lowers to no region |
+| nemotron_h | nano-mini, ultra-mini | decode | `ssm.mamba2` | the same (state step) |
+| inkling | mini-l7-e8 | decode | `ssm.short_conv` | the same (state step) |
+| kimi_k3 | mini, l4 | decode | `ssm.kda` | the same (state step), then MLA |
+| dots3_note, glm_5, hy_4 | minis | decode | DSA indexer / MLA / hyper-connections | the same |
+| glm_5_next, deepseek_v4, qwen_4 | minis | decode | hyper-connections, pooled attention | the same |
+| flux_2 | mini; klein-4b | text, denoise, vae.decode | PASS | PASS (sha-identical programs) |
+| flux_2 | mini; klein | vae.encode | mini PASS at a 256-row clip (16 rows make a 1 x 1 grid its downsamplings do not map); klein: a weight PE over its words | the same |
+| z_image | mini | denoise | `elemwise.clamp` | an emitter gap in the lanes (a moved part) |
+| ltx_2 | mini | denoise | `elemwise.clamp` | one attention shape a reading (audio 64, video 128) |
+| minimax_h3 | mini | denoise | `gather.concat_cols` | a lane column on no bus word |
+| wan_2 | mini-nano, mini-d128 | denoise | cross-attention | cross-attention |
+| hunyuan_image_3 | mini | decode / text / denoise | `rope_axes`; `gather.rows` | an emitter column gap (after MoE and the split rotation) |
+| hunyuan_image_3 | mini | image.in / image.out | grid gaps | the same |
+| qwen3_asr | 0.6b | decode | template PASS (the decoder) | template PASS; **units PASS** |
+| qwen3_asr | 0.6b | text / audio.encode / audio.conv | `gather.rows`; no layers; a 1-D grid | the vocabulary's rows held; no layers; a 1-D grid |
+| qwen3_tts | 0.6b | talker, predictor, codec.* | `gather.rows`, no layers, stacked prefill, grid gaps | `concat_cols`; a select of a sub-model; no layers; stacked prefill; grid gaps |
+
+### G1.2 What moved, by mechanism
+
+Each is one mechanism, not a model's case; the shipping decode programs (plan + build of
+qwen35-d0.8b, qwen35-d9b, llama31-8b, gptoss-20b, gemma4-e2b, tiny t08) and flux2-mini's and
+klein's text, denoise and VAE programs are sha-identical across every commit.
+
+- **Slices for any poem** (pie-poem): a deployment cut to a depth (`-l{n}`) folds its poem's first
+  `n` layers, whatever its package lays out; the trace reads only their weights (Qwen3-0.6B -l2:
+  22 params). Twelve poems had a per-poem hook; the cut is now the fold's.
+- **The stream regime lowers by capability.** Every elementwise op is a root op; whether its
+  region prints is `fuse::chain` / `emit::region`'s question (the allow-list of names is gone).
+  The host's ops are any op but a matvec over its values and the checkpoint's constants (the token
+  embedding no case of its own; the host's lane ops a closure, read by node, not by re-matching op
+  names). A readout's row selection (`gather.rows` by the readout rows) commutes with each row's
+  ops after it. The head's logits are a matvec. A row-side value of no multiple of the row roots
+  is held padded. An op reading a stream mixer's output after other phases runs at the column
+  roots. The stream shape states its first MLP and rotation and no longer refuses others.
+- **Regions print more.** `fuse::chain` (explicit runs only; the chains CUDA forms are unchanged)
+  lowers stated-frequency and YaRN rotations, gated RMS norms, and rotations over position axes in
+  a head's halves (split, NeoX, partial); `emit::region` prints a row's tanh, comparisons and their
+  joins, selects on them, and a row's maximum or minimum (one root), by DSD ops or scalar loops.
+- **Decode through the units.** A decode step is a stream program at one row a step
+  (`stream::compile_decode`, `wafer-compile stream --reading decode --positions N`): each
+  attention layer's K / V column is its cache across launches (a step's row stored at its
+  position, `pos` at the K / V PEs, a sequence's first step clearing it; causal; a sliding
+  window's mask). Every op the units lower runs: biases, q / k norms of any form, sandwich norms,
+  any activation the regions print. `wafer-bench --reading <dir> --decode <golden.json>
+  --checkpoint <dir>` runs it token by token from the real checkpoint (entries from the host
+  forward, logits back). The templates stay the fast path for the shapes they serve; the units
+  take what they refuse; the end state is the templates deletable (G1.5).
+- **Routed experts as existing steps** (`stream::moe`): the gated sum of every expert. The router
+  is a printed region (its scores, a pick bias, the top k a round at a time with the lowest
+  expert on a tie, the picked weights: a gate an expert, zero unpicked); the gate is spread over
+  each expert's columns by a constant matvec; gate, up and down are one matvec each over the bank
+  as a weight view lays it; the gated activation is a region. Exact (an unpicked expert adds
+  zeros) and per-PE bound as a dense layer of the experts' width.
+- **Placement.** The decode search keeps a partition only where every PE's words build (rcfg),
+  so a searched plan cannot fail at the emitter (llama33-70b-mini-l4).
+
+### G1.3 Special cases a general mechanism would remove
+
+- `spatial::layer::Body::node`: the decode elementwise allow-list (7 names) and `target::shape`'s
+  feature reads; `compose::refuse`'s per-kernel-set feature matrix; `KernelSet {Own, Shared,
+  Windows, Experts}` itself: the decode templates. The units take every model they refuse; once a
+  unit program is as fast, they go.
+- `target::shape`: the router refusal (`Softmax` with no bias only); `compose::bias_on` /
+  `head_norm` read parameters by name (`q_bias`, `o_bias`, `router_bias`, `q_norm`).
+- `spatial::layer::stream::classes`: the stream values `context` / `latents` by name (flux's
+  `reference` and ltx's audio streams are not classes).
+- `PERMUTES` (a list of names for the host's permutations).
+- `stream::shape`'s one attention shape a reading (`JointSpec`): the K / V columns share one
+  shape; per-block shapes would take gemma's and ltx's mixed heads.
+- The stream floorplan's one-unit-a-layer bands: a layer too wide for 512 rest roots is refused
+  (a 30B layer); the template's K layers a unit is the missing axis.
+
+### G1.4 What is left, by class
+
+- **Recurrent state** (GDN's `causal_conv1d` + `gated_delta`, Mamba2, KDA, short conv): qwen_3 (dense
+  and MoE), nemotron_h, kimi_k3, inkling, glm_5_next. One state step: a state column per head
+  (the K / V column's shape, persisting across launches), its update `S = decay ⊙ S + k ⊗ u`
+  (`u = β (v - Sᵀk)` with the delta rule, `dt x` without; decay a scalar or a vector a key), its
+  read `Sᵀq`, the gates and normalisations around it regions; a conv a ring of rows a channel.
+- **Attention variants**: sinks (gpt-oss), shared KV (gemma e2b), cross-attention (wan), unequal
+  q / k / v (mimo), MLA, the DSA indexer, pooled attention; per-block attention shapes.
+- **Hyper-connections** (deepseek_v4, glm_5_next, hy_4, qwen_4) and ops outside the layer frame
+  (qwen_4).
+- **Shared-expert gate** (`moe_sigmoid_gate_add`) and shared experts beside routed ones (glm).
+- **Emitter column gaps**: a value's column at no root buffer (gemma 31b, glm45, hunyuan, z_image
+  lanes), heads straddling a region's chunks (glm47), a lane column on no bus word (minimax_h3).
+- **Speech / grid readings**: layerless readings (asr's audio encoder, tts's codec), a stacked
+  prefill (tts's codec prenet), 1-D grids and resamplings across frames, host-kept voxel inputs
+  in the tiled regime.
+
+### G1.5 Slices for the simulator
+
+The slice each poem is verified with (its HF repo; layers kept so every layer kind is present;
+embed and head real). Where the real slice is over the ~10 GB budget, gated or missing, the
+poem's miniature (a real prefix with fewer experts) or a shrunk config, marked:
+
+| poem | slice | note |
+|---|---|---|
+| qwen3_dense | Qwen/Qwen3-0.6B `-l2` | 1.5 GB |
+| qwen_3 | Qwen/Qwen3.5-0.8B `-l4` (GDN x 3 + full) | MoE: Qwen3.5-35B-A3B `-l4-e64` |
+| qwen3_moe | Qwen/Qwen3-30B-A3B layer 0, 16 experts (`qwen3-30b-a3b-mini -l1`) | 5.1 GB fetched |
+| gpt_oss | openai/gpt-oss-20b `-l2` | 3.3 GB |
+| nemotron_h | Nemotron-3-Nano-30B-A3B `-l6` (M, E, *) | 6.9 GB |
+| glm_4 / minimax_m2 / mimo_v2 / minimax_m3 / glm_5 / glm_5_next / muse_glimmer | their minis or `-l{n}-e{e}` | under budget with an expert cut |
+| llama_3 | unsloth/Llama-3.1-8B-Instruct `-l1` (meta's is gated) | |
+| gemma_4 | google/gemma-4-E2B-it whole (KV sharing from layer 15) | 8.3 GB |
+| flux_2 / z_image / wan_2 | DiT 1 block of each kind + VAE (+ text encoder or its embeddings) | |
+| deepseek_v4, dots3_note, hy_4, inkling, qwen_4 | minis: real prefix, 8-16 experts | real `-l{n}` 16-126 GB |
+| kimi_k3, muse_spark, hunyuan_image_3, ltx_2, minimax_h3 | shrunk configs | over budget or gated |
+
+### G1.6 On the simulator
+
+(filled as the sims land)
+
 ## 5. Risks
 
 - **Numerics: f16.** The decode kernels hold IEEE f16 tiles and f16 activations, with f16
