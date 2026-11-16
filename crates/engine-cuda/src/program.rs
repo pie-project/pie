@@ -206,6 +206,26 @@ pub struct CaptureRows {
     pub pages: u64,
 }
 
+/// What a member of a program reading `reads` (by name and lane) states of
+/// its capturing lanes' rows, a member and fixed: for each lane it reads a
+/// capture output at, a key row (with its table entry) and a page row, the
+/// rows a fire lays for every capturing lane whichever it reads; and the
+/// block's alignment.
+#[must_use]
+pub fn capture_term(reads: &[(&str, u32)], rows: CaptureRows) -> (u64, u64) {
+    let mut lanes: Vec<u32> = reads
+        .iter()
+        .filter(|(name, _)| [SCORES, SCORE_PAGES].contains(name))
+        .map(|&(_, lane)| lane)
+        .collect();
+    lanes.sort_unstable();
+    lanes.dedup();
+    match lanes.len() as u64 {
+        0 => (0, 0),
+        capturing => (capturing * (rows.keys + rows.pages), 256),
+    }
+}
+
 /// The outputs a capturing lane's rows are read out through: its key row
 /// and its page row.
 pub const SCORES: &str = "attn.scores";
@@ -382,27 +402,9 @@ impl Plane {
         let mut bytes = fire_bytes(&program.stages(extents)?, self.flight);
         let (lane, fixed) = Wave::lane_bytes(program.plan.package.channels.len());
         bytes.fixed += lane * u64::from(self.fire_lanes) + fixed + 256;
-        // A member reading its lanes' scores holds a row for each lane it
-        // reads them at, at the span's top (`Plane::hold_captures`): the key
-        // row whichever it reads, and the page row where it reads that.
-        let reads = program.plan.outputs();
-        let lanes_reading = |names: &[&str]| -> u64 {
-            let mut lanes: Vec<u32> = reads
-                .iter()
-                .filter(|(name, _)| names.contains(name))
-                .map(|&(_, lane)| lane)
-                .collect();
-            lanes.sort_unstable();
-            lanes.dedup();
-            lanes.len() as u64
-        };
-        let capturing = lanes_reading(&[SCORES, SCORE_PAGES]);
-        if capturing > 0 {
-            bytes.a_lane += capturing * self.capture_rows.keys
-                + lanes_reading(&[SCORE_PAGES]) * self.capture_rows.pages;
-            // The rows are held whole, rounded up to an aligned block.
-            bytes.fixed += 256;
-        }
+        let (a_lane, fixed) = capture_term(&program.plan.outputs(), self.capture_rows);
+        bytes.a_lane += a_lane;
+        bytes.fixed += fixed;
         Ok(bytes)
     }
 
@@ -1315,6 +1317,29 @@ fn release_seats(endpoints: &[Option<std::sync::Arc<Endpoint>>]) {
 #[cfg(test)]
 mod term_tests {
     use super::*;
+
+    /// A member reading either capture output, at any lane, states a key
+    /// row, its table entry and a page row a lane it reads at: what a fire
+    /// lays for each capturing lane (`serve::enqueue`'s `lay_captures`),
+    /// whichever it reads. A member reading neither states none.
+    #[test]
+    fn a_capture_reader_states_every_row_its_lane_lays() {
+        let rows = CaptureRows {
+            keys: 2048 * 4 + 4,
+            pages: 128 * 4,
+        };
+        let laid = 2048 * 4 + 128 * 4 + 4;
+        assert_eq!(capture_term(&[("logits", 0)], rows), (0, 0));
+        for reads in [
+            vec![(SCORES, 0)],
+            vec![(SCORE_PAGES, 0)],
+            vec![(SCORES, 0), (SCORE_PAGES, 0), ("logits", 0)],
+        ] {
+            assert_eq!(capture_term(&reads, rows), (laid, 256), "{reads:?}");
+        }
+        let two = [(SCORE_PAGES, 1), (SCORES, 0), (SCORES, 1)];
+        assert_eq!(capture_term(&two, rows), (2 * laid, 256));
+    }
 
     /// The term a rung backs for `n` bound instances is what a fire of `n`
     /// lays, for every `n` up to the flight's lanes: the fire lays a flight
