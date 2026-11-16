@@ -268,7 +268,7 @@ pub fn class_outputs(trace: &Trace, compiled: &CompiledModel) -> Result<Vec<Clas
                 out.classes.insert(class);
                 continue;
             }
-            let decl = output_decl(trace, name, &values)?;
+            let decl = output_decl(trace, name, &values, &mine)?;
             outs.push(ClassOutput {
                 decl,
                 values,
@@ -280,7 +280,12 @@ pub fn class_outputs(trace: &Trace, compiled: &CompiledModel) -> Result<Vec<Clas
     Ok(outs)
 }
 
-fn output_decl(trace: &Trace, name: &str, values: &[ValueId]) -> Result<OutputDecl, String> {
+fn output_decl(
+    trace: &Trace,
+    name: &str,
+    values: &[ValueId],
+    outputs: &[&poem_ir::Output],
+) -> Result<OutputDecl, String> {
     let shape = |value: ValueId| match trace.values.get(value.0 as usize).map(|decl| &decl.ty) {
         Some(Ty::Tensor { shape, dtype }) => Ok((shape.first().copied(), *dtype)),
         _ => Err(format!("output `{name}` reads out no tensor")),
@@ -319,6 +324,18 @@ fn output_decl(trace: &Trace, name: &str, values: &[ValueId]) -> Result<OutputDe
     } else {
         0
     };
+    // How one entry factors: every layer's write states the same, and the
+    // runs multiply to the width.
+    let planes = outputs.first().map(|output| output.planes.clone()).unwrap_or_default();
+    if outputs.iter().any(|output| output.planes != planes) {
+        return Err(format!("output `{name}` is written at different planes by its layers"));
+    }
+    if !planes.is_empty() && planes.iter().map(|&p| u64::from(p)).product::<u64>() != width {
+        return Err(format!(
+            "output `{name}` states its {width} values an entry as planes {planes:?}, whose \
+             product differs"
+        ));
+    }
     let tail = values
         .iter()
         .filter_map(|value| observed(trace, *value))
@@ -332,6 +349,7 @@ fn output_decl(trace: &Trace, name: &str, values: &[ValueId]) -> Result<OutputDe
         layers,
         readout: first == Some(Dim::Readouts),
         tail,
+        planes,
     })
 }
 

@@ -328,11 +328,18 @@ impl Recorder {
     }
 
     pub fn output(&self, name: &str, value: &Value, grid: Option<&Value>) {
+        self.output_in_planes(name, value, grid, &[]);
+    }
+
+    /// [`Recorder::output`], with how one entry's width factors
+    /// ([`poem_ir::Output::planes`]).
+    pub fn output_in_planes(&self, name: &str, value: &Value, grid: Option<&Value>, planes: &[u32]) {
         self.inner.borrow_mut().outputs.push(Output {
             name: name.to_string(),
             value: value.id,
             layer: self.at.get(),
             grid: grid.map(|grid| grid.id),
+            planes: planes.to_vec(),
         });
     }
 

@@ -655,6 +655,7 @@ mod tests {
                 value: v,
                 layer: None,
                 grid: None,
+                planes: Vec::new(),
             });
             self
         }
