@@ -71,6 +71,7 @@ def _make_model() -> types.ModuleType:
     m.run_ahead_window = lambda: 4
     m.BlockDrafter = BlockDrafterStub
     m.draft_block = lambda: None
+    m.draft_depth = lambda: 0
     m.switches = lambda: [SwitchDeclStub("mode", ["encode", "denoise"])]
     m.lane = _lane
     return m
