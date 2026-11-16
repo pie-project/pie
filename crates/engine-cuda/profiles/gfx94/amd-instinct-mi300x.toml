@@ -9,17 +9,69 @@ match = { name_contains = ["MI300X"] }
 [rates]
 # `pie tune cuda --rates` on this MI300X VF at engine::rates' lattice, each
 # rate a 20 ms burst of its kernel back to back, the median of 5 (the launch
-# of 15). The matmul through hipBLASLt under serving's GEMM tactics; the
-# vendor's 1307 TFLOPS dense bf16 (AMD Instinct MI300X data sheet) is the
-# bound (~63% at 8192 rows). The copy against 5.3 TB/s of HBM3 (~77%). The
-# launch is a kernel's inside a captured hipGraph, as serving replays its
-# bodies. Two runs agree within 1.8% on every key (the matmul within 1.8%,
-# the copy 1.8%, attention, scan and the launch under 0.5%).
-bf16_flops_per_ns_by_rows_and_depth = [[16, 4096, 37781.5], [32, 4096, 73769.9], [64, 4096, 139548.9], [128, 4096, 236568.2], [256, 4096, 314245.3], [512, 4096, 442427.1], [1024, 4096, 505503.8], [2048, 4096, 670702.2], [4096, 4096, 718139.4], [8192, 4096, 824510.9]]
-attn_flops_per_ns_by_keys = [[2048, 238285.2]]
-scan_elements_per_ns = 3073.2
-bytes_per_ns = 4071.0
-launch_ns = 1631
+# of 15). The matmul through hipBLASLt under serving's GEMM tactics over 12
+# rotating k x k planes a depth; the vendor's 1307 TFLOPS dense bf16 (AMD
+# Instinct MI300X data sheet) is the bound (~63% at its best). Attention
+# over pages in engine::rates::attn_page_order, keys x keys causal; the copy
+# against 5.3 TB/s of HBM3 (~77%); the launch a kernel's inside a captured
+# hipGraph, as serving replays its bodies. Two runs agree within 7% on every
+# key (the scan 7%, the 16-row k=1024 matmul 5.6%, the rest under 4.2%).
+bf16_flops_per_ns_by_rows_and_depth = [
+  [16, 1024, 6275.9],
+  [32, 1024, 11766.9],
+  [64, 1024, 25786.0],
+  [128, 1024, 49191.0],
+  [256, 1024, 87444.7],
+  [512, 1024, 149801.0],
+  [1024, 1024, 253358.0],
+  [2048, 1024, 350929.9],
+  [4096, 1024, 441267.4],
+  [8192, 1024, 498841.8],
+  [16, 2048, 20770.0],
+  [32, 2048, 39608.7],
+  [64, 2048, 71187.3],
+  [128, 2048, 125797.4],
+  [256, 2048, 210216.2],
+  [512, 2048, 303784.1],
+  [1024, 2048, 410733.2],
+  [2048, 2048, 480254.4],
+  [4096, 2048, 530852.0],
+  [8192, 2048, 712664.8],
+  [16, 4096, 36888.5],
+  [32, 4096, 72100.6],
+  [64, 4096, 134451.3],
+  [128, 4096, 233792.0],
+  [256, 4096, 313182.1],
+  [512, 4096, 438940.4],
+  [1024, 4096, 504694.0],
+  [2048, 4096, 667649.9],
+  [4096, 4096, 714139.4],
+  [8192, 4096, 822358.8],
+  [16, 8192, 48147.3],
+  [32, 8192, 97097.7],
+  [64, 8192, 182475.5],
+  [128, 8192, 309470.8],
+  [256, 8192, 458277.2],
+  [512, 8192, 513604.4],
+  [1024, 8192, 648764.9],
+  [2048, 8192, 681265.9],
+  [4096, 8192, 813974.2],
+  [8192, 8192, 828660.8],
+  [16, 16384, 62415.4],
+  [32, 16384, 118431.7],
+  [64, 16384, 207762.1],
+  [128, 16384, 376022.4],
+  [256, 16384, 520044.2],
+  [512, 16384, 605116.0],
+  [1024, 16384, 693910.8],
+  [2048, 16384, 693285.8],
+  [4096, 16384, 801743.0],
+  [8192, 16384, 752819.6],
+]
+attn_flops_per_ns_by_keys = [[512, 63076.5], [1024, 141185.7], [2048, 235634.2], [4096, 410239.6], [8192, 625393.5], [16384, 680735.2]]
+scan_elements_per_ns = 3293.1
+bytes_per_ns = 4064.3
+launch_ns = 1675
 
 [provenance]
-rates = "pie tune cuda --rates on 2026-11-16 (pie 0.6.0): AMD Instinct MI300X VF; the matmul through hipBLASLt under serving's GEMM tactics, each rate a 20 ms burst on the stream timed by events, the median of 5 (the launch of 15); at commit f5704ee69; at engine::rates' lattice (matmul m x 4096 x 4096, m 16..8192; attention 2048x2048 keys, 16/8 heads of 128; scan 2048 tokens, 16/16 heads of 128x128, conv 4)"
+rates = "pie tune cuda --rates on 2026-11-16 (pie 0.6.0): AMD Instinct MI300X VF; the matmul through hipBLASLt under serving's GEMM tactics, each rate a 20 ms burst on the stream timed by events, the median of 5 (the launch of 15); at commit 711c6faec; at engine::rates' lattice (matmul m x k x k, m 16..8192, k 1024..16384; attention keys x keys, keys 512..16384, 16/8 heads of 128; scan 2048 tokens, 16/16 heads of 128x128, conv 4)"
