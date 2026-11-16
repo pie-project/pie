@@ -430,7 +430,7 @@ impl CerebrasEngine {
         }
         let device = |e: String| Error::Device(e);
         // each request's rows back: a launch a batch of the program's requests (the last
-        // batch padded with its last request, its rows dropped); a reading with no program
+        // batch padded with its last request, those rows dropped); a reading with no program
         // (the host fabric's): its every op the host's, in `finish`
         let batch = reading.batch.max(1);
         let mut backs: Vec<Vec<engine_cpu::forward::Captured>> = Vec::new();
@@ -439,10 +439,9 @@ impl CerebrasEngine {
             backs.resize(owned.len(), Vec::new());
         } else {
             for chunk in owned.chunks(batch) {
-                let mut sent: Vec<Owned> = chunk.to_vec();
-                while sent.len() < batch {
-                    sent.push(chunk[chunk.len() - 1].clone());
-                }
+                // (a batch short of the program's: its last request's values stand for the
+                // rest, made once)
+                let sent: Vec<Owned> = chunk.to_vec();
                 let views: Vec<StreamStep<'_>> = sent.iter().map(Owned::step).collect();
                 let entries = if batch > 1 {
                     reading.entries_batch(&mut streams.readings[ri].host, &views)
@@ -772,6 +771,22 @@ impl CerebrasEngine {
         }
         .map_err(load)?;
         drop(landed);
+        // a fire holds what a launch of the programs does: a batch's requests, each a
+        // reading's lanes and rows (at the least the budgets', so a stated larger one stands)
+        let held = |f: &dyn Fn(&Reading) -> usize| {
+            readings
+                .iter()
+                .map(|s: &Stream| s.reading.batch.max(1) * f(&s.reading))
+                .max()
+                .unwrap_or(0)
+        };
+        let max_lanes = budgets
+            .max_lanes
+            .max(u32::try_from(held(&|r| r.classes.len())).unwrap_or(u32::MAX))
+            .max(1);
+        let max_tokens = budgets
+            .max_tokens
+            .max(u32::try_from(held(&Reading::request_rows)).unwrap_or(u32::MAX));
         let slots = poem_compiler::state_slots(budgets.slots, &trace, super::DEFAULT_STATE_SLOTS);
         let facts = crate::facts::Facts::of(trace.clone(), budgets, slots).map_err(load)?;
         let paging = facts.paging();
@@ -793,12 +808,12 @@ impl CerebrasEngine {
                 ..PoolFacts::default()
             },
             limits: FireLimits {
-                max_lanes: budgets.max_lanes.max(1),
-                max_tokens: budgets.max_tokens,
+                max_lanes,
+                max_tokens,
                 max_page_refs: paging.pages_per_slot,
                 max_context: paging.context(),
                 prefill_rows: 0,
-                max_readouts: budgets.max_tokens,
+                max_readouts: max_tokens,
             },
             has_lora: false,
             has_attn_page_mask: false,

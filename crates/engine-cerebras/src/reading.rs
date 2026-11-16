@@ -660,9 +660,10 @@ impl Reading {
         self.classes.iter().map(|c| c.rows as usize).sum()
     }
 
-    /// [`Reading::entries`] of a batch: `steps` a request's each (the program's [`Reading::batch`]
-    /// of them), every value the entries gather from the requests' rows in turn (a value of a
-    /// row a lane, its lanes in turn).
+    /// [`Reading::entries`] of a batch: `steps` a request's each (at most the program's
+    /// [`Reading::batch`]; fewer: the last request's values stand for the rest, made once),
+    /// every value the entries gather from the requests' rows in turn (a value of a row a
+    /// lane, its lanes in turn).
     pub fn entries_batch(
         &self,
         host: &mut Forward,
@@ -670,15 +671,19 @@ impl Reading {
     ) -> R<Vec<Option<Vec<f32>>>> {
         let wanted = self.entry_values();
         let mut held: BTreeMap<u32, (usize, usize, Vec<f32>)> = BTreeMap::new();
-        for step in steps {
+        let n = steps.len();
+        for (k, step) in steps.iter().enumerate() {
+            let copies = if k + 1 == n { self.batch.max(n) - k } else { 1 };
             for c in host.stream_values(step, &[], &wanted)? {
                 let v = match c.values {
                     Values::F32(v) => v,
                     Values::I32(v) => v.into_iter().map(|x| x as f32).collect(),
                 };
                 let e = held.entry(c.value.0).or_insert((0, c.width, Vec::new()));
-                e.0 += c.rows;
-                e.2.extend(v);
+                for _ in 0..copies {
+                    e.0 += c.rows;
+                    e.2.extend_from_slice(&v);
+                }
             }
         }
         let held: BTreeMap<u32, (usize, usize, Rc<Vec<f32>>)> = held
@@ -1400,14 +1405,12 @@ impl Fabric for HostFabric {
             let mut buf = vec![0f32; b.len * (b.w * b.h) as usize];
             for (i, &tr) in b.rows.iter().enumerate() {
                 // (one step: its rows as they are, a grid reading's its voxels)
-                let (made, tr) = if steps.len() == 1 {
+                // (one request on a program of one: its rows as they are, a grid reading's its
+                // voxels; else request `tr / per`, a padded one the last's)
+                let (made, tr) = if reading.batch <= 1 {
                     (&made[0], tr)
                 } else {
-                    (
-                        made.get(tr / per)
-                            .ok_or_else(|| format!("row {tr}: a request past the batch's"))?,
-                        tr % per,
-                    )
+                    (&made[(tr / per).min(made.len() - 1)], tr % per)
                 };
                 let mut off = 0;
                 for &(base, from, n) in &b.parts {
