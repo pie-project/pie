@@ -294,9 +294,16 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         let compiled =
             poem_compiler::compile_axes(&boot.trace, &budgets_at(&budget, voxels), &profile)
                 .ok()?;
-        let bytes = compiled
-            .arena
-            .bytes
+        // The span the rung weighs is the carve the load backs: the larger
+        // of the in-order and forked arenas, without their `attn.scores`
+        // planes (a reader's program term, never a load's).
+        let unscored = compiled.arena.scores_from(&boot.trace).max(
+            compiled
+                .arena_forked
+                .as_ref()
+                .map_or(0, |forked| forked.scores_from(&boot.trace)),
+        );
+        let bytes = unscored
             .saturating_add(crate::inputs::attention_workspace_bytes(
                 &budget,
                 &facts,
