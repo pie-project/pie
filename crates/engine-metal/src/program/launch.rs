@@ -1483,6 +1483,7 @@ impl Prepared {
     }
 
     /// Every seat this stage reads, its lanes' rows among them.
+    #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
     fn seated(&self) -> impl Iterator<Item = &Slot> {
         self.outputs.iter().flatten().chain(self.row_seats.values())
     }
