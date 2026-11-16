@@ -840,10 +840,11 @@ fn check_one(
     let (at_est, best) = (score(by_est.tokens), score(by_meas.tokens));
     let e = &weighed.estimate;
     let mut out = format!(
-        "{model} on {device}: rates {:.0} flop/ns, {:.0} B/ns, launch {:.0} ns; dense {:.2} GB, \
-         {:.2} GFLOP/row\n  rung  measured  estimated | est: launches  max(read,compute)  attn  kv \
-         | device by kind (ms, dispatches timed alone): {}  dispatches  sum  wall-sum\n",
-        e.flops_per_ns,
+        "{model} on {device}: peak {:.0} flop/ns, {:.0} B/ns, launch {:.0} ns; dense {:.2} GB, \
+         {:.2} GFLOP/row\n  rung  measured  estimated | est (ms): launch weights flops readout \
+         attn kv recur elem | device by kind (ms, dispatches timed alone): {}  dispatches  sum  \
+         wall-sum\n",
+        e.flops_per_ns(u32::MAX),
         e.bytes_per_ns,
         e.launch_ns,
         e.dense_bytes as f64 / 1e9,
@@ -851,28 +852,26 @@ fn check_one(
         KINDS.join(" / "),
     );
     for (k, r) in rungs.iter().enumerate() {
-        let tokens = f64::from(r.tokens);
-        let keys = f64::from(r.keys);
-        let launches = f64::from(r.launches) * e.launch_ns;
-        let read = e.weight_bytes(r.tokens) / e.bytes_per_ns;
-        let compute = f64::from(r.padded_rows) * e.flops_per_row / e.flops_per_ns;
-        let attn = tokens * keys * e.attn_flops_per_row_key / e.flops_per_ns;
-        let kv = keys * e.kv_bytes_per_key / e.bytes_per_ns;
+        let t = e.terms(r);
         let (_, by_kind, dispatches, _) = dissected
             .iter()
             .find(|d| d.0 == r.tokens)
             .expect("each width dissected");
         let sum: u64 = by_kind.iter().sum();
+        let ms = |ns: f64| format!("{:>6.2}", ns / 1e6);
         out.push_str(&format!(
-            "  {:>5} {:>8.2} {:>9.2} | {:>6.2} {:>6.2}({}) {:>6.2} {:>6.2} | {} {:>5} {:>7.2} {:>7.2}\n",
+            "  {:>5} {:>8.2} {:>9.2} | {} {} {} {} {} {} {} {} | {} {:>5} {:>7.2} {:>7.2}\n",
             r.tokens,
             meas[k] / 1e6,
             est[k] / 1e6,
-            launches / 1e6,
-            read.max(compute) / 1e6,
-            if read >= compute { "read" } else { "compute" },
-            attn / 1e6,
-            kv / 1e6,
+            ms(t.launch),
+            ms(t.weights),
+            ms(t.flops),
+            ms(t.readout),
+            ms(t.attention),
+            ms(t.kv),
+            ms(t.recurrent),
+            ms(t.elementwise),
             by_kind
                 .iter()
                 .map(|ns| format!("{:>6.2}", *ns as f64 / 1e6))
