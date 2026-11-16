@@ -50,9 +50,12 @@ fn default_mask_after() -> bool {
 /// The logits a step is compared by: the top `TOP`, with their tokens.
 const TOP: u32 = 16;
 
+/// A fact the answer needs, in the rows the default keep drops: the control
+/// (`--reference_sees_all`) answers it, the keeping run and its reference do
+/// not, so the gate can fail on tokens on any backend.
 fn default_prompt() -> String {
-    "The quick brown fox jumps over the lazy dog, and then it runs into the forest \
-     where it finds a small river. Tell me what happens next in the story."
+    "My locker code is 4817 and my cat is named Pelican. Please remember both. Now, \
+     what is my locker code? Answer with the number only."
         .into()
 }
 
@@ -61,11 +64,13 @@ fn default_steps() -> usize {
 }
 
 fn default_drop_from() -> u32 {
-    5
+    1
 }
 
+/// Rows 1..16 hold the code; 15 rows, a count no rs list slot divides, so a
+/// buffered suffix (`--buffer_from 16`) takes the rs token-run path.
 fn default_drop_to() -> u32 {
-    12
+    16
 }
 
 #[derive(Serialize)]
