@@ -1477,19 +1477,19 @@ impl<'c> Run<'c> {
     }
 
     /// The fire's capturing rows as this window reads them, and the kv page
-    /// a page's score sums.
+    /// a page's score sums; none where no lane of the fire has a row (no
+    /// program it carries reads its scores), and its score ops are skipped.
     pub(crate) fn capture_rows(
         &self,
         op: &'static str,
-    ) -> Result<(kernels_cuda::attn::score::CaptureRows, u32), kernels_cuda::Error> {
+    ) -> Result<Option<(kernels_cuda::attn::score::CaptureRows, u32)>, kernels_cuda::Error> {
         let refuse = |detail: &str| kernels_cuda::Error::Backend {
             op,
             detail: detail.to_string(),
         };
-        let captures = self
-            .fire
-            .captures
-            .ok_or_else(|| refuse("a capture on a fire whose lanes capture nothing"))?;
+        let Some(captures) = self.fire.captures else {
+            return Ok(None);
+        };
         let window = self.window();
         if window.gathered.is_some() {
             return Err(refuse(
@@ -1498,14 +1498,14 @@ impl<'c> Run<'c> {
             ));
         }
         let span = window.span();
-        Ok((
+        Ok(Some((
             kernels_cuda::attn::score::CaptureRows {
                 lanes: captures.lanes,
                 lane_offset: span.lane_offset,
                 requests: span.lanes,
             },
             captures.page_size,
-        ))
+        )))
     }
 
     pub(crate) fn window(&self) -> &'c Window {

@@ -28,9 +28,10 @@ impl DispatchAttn for Run<'_> {
 impl Run<'_> {
     pub(super) fn attention(&mut self, op: &Attn) -> Result<(), kernels_cuda::Error> {
         match op {
-            // A row a capturing lane, in its reading program's span
+            // A row a read capturing lane, in its reading program's span
             // (`crate::serve::enqueue`'s capture block); `into`, the
-            // layer before's, is the same row.
+            // layer before's, is the same row. A fire no program reads the
+            // scores of lays no row, and skips these.
             Attn::ScoreCapture {
                 q,
                 plan,
@@ -43,7 +44,9 @@ impl Run<'_> {
                 into,
                 scores,
             } => {
-                let (rows, _) = self.capture_rows("attn.score_capture")?;
+                let Some((rows, _)) = self.capture_rows("attn.score_capture")? else {
+                    return Ok(());
+                };
                 let mut out = self.tensor(*scores);
                 if let Some(into) = into
                     && self.tensor(*into).ptr != out.ptr
@@ -75,7 +78,9 @@ impl Run<'_> {
                 )
             }
             Attn::ScorePages { keys, pages } => {
-                let (rows, page_size) = self.capture_rows("attn.score_pages")?;
+                let Some((rows, page_size)) = self.capture_rows("attn.score_pages")? else {
+                    return Ok(());
+                };
                 attn::score::pages(
                     self.ctx(),
                     self.tensor(*keys),

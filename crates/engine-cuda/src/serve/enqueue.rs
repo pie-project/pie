@@ -636,18 +636,35 @@ impl FireCtx<'_> {
         })
     }
 
-    /// Lays a row for each of the fire's capturing lanes (those of a class
-    /// running a score capture), in lane order, at the top of its programs'
-    /// span: the key rows, then the page rows, then the capturing table
-    /// (each row's lane): what every reader's term states a lane.
-    /// Each capture value's slot is its rows; the programs lay under them,
-    /// in what each reading program's term states a member.
+    /// Lays a row for each of the fire's read capturing lanes (those of a
+    /// class running a score capture that a program attached to them in
+    /// this fire reads the scores of), in lane order, at the top of its
+    /// programs' span: the key rows, then the page rows, then the capturing
+    /// table (each row's lane): what every reader's term states a lane. A
+    /// capturing lane no program reads this fire (a long prompt's leading
+    /// pieces, the reader attached to the last) has no row: the kernels
+    /// skip it, and a fire with no row skips the score ops. Each capture
+    /// value's slot is its rows; the programs lay under them, in what each
+    /// reading program's term states a member.
     fn lay_captures(&mut self, p: &Prepared<'_>, slots: &mut SlotTable) -> Result<FireCaptures> {
+        // The fire lanes (as submitted) a program attached here reads the
+        // scores of.
+        let mut read = std::collections::BTreeSet::new();
+        for attached in p.attachments.iter().filter(|a| !a.adapter_only) {
+            let reads = self.programs.reads(attached.instance)?;
+            for (name, k) in reads {
+                if (name == crate::program::SCORES || name == crate::program::SCORE_PAGES)
+                    && k < attached.lanes
+                {
+                    read.insert(attached.lane + k);
+                }
+            }
+        }
         let captures = &self.exports.captures;
         let mut row_of = vec![None; p.composition.lanes().len()];
         let mut lanes: Vec<i32> = Vec::new();
         for (at, row) in p.composition.lanes().iter().enumerate() {
-            if captures.classes.contains(row.class as usize) {
+            if captures.classes.contains(row.class as usize) && read.contains(&row.source) {
                 row_of[at] = Some(u32::try_from(lanes.len()).unwrap_or(u32::MAX));
                 lanes.push(i32::try_from(at).unwrap_or(i32::MAX));
             }

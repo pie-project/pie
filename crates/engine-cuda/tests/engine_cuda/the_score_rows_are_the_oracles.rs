@@ -6,7 +6,8 @@
 //! load's context, summed over the layers and averaged over the query heads,
 //! and that summed a kv page of the load's own pages. A fire of 256 lanes,
 //! one capturing, lays one lane's rows, in the span of the program reading
-//! them (a capturing lane's rows are its reader's term).
+//! them (a capturing lane's rows are its reader's term); the same lane with
+//! no program reading it that fire lays none.
 
 use std::path::{Path, PathBuf};
 
@@ -215,7 +216,7 @@ fn the_score_rows_are_the_oracles() {
     };
     let page = shell.paging().page_size;
     let instance = bind_reader(&mut shell, CONTEXT, CONTEXT.div_ceil(page));
-    let fire = |shell: &mut Shell, captures: bool| {
+    let fire = |shell: &mut Shell, captures: bool, reads: bool| {
         for slot in 0..LANES {
             shell.open(slot).expect("a slot opens");
         }
@@ -239,7 +240,7 @@ fn the_score_rows_are_the_oracles() {
             instance,
             adapter_only: false,
         }];
-        let attached: &[Attached] = if captures { &attached } else { &[] };
+        let attached: &[Attached] = if reads { &attached } else { &[] };
         shell
             .fire_media(&lanes, attached, &[])
             .expect("the fire lands");
@@ -248,12 +249,19 @@ fn the_score_rows_are_the_oracles() {
 
     // A fire of no capturing lane lays no row.
     assert!(
-        fire(&mut shell, false).is_empty(),
+        fire(&mut shell, false, false).is_empty(),
         "a fire of no capturing lane laid a row"
     );
 
+    // The capturing lane with no program reading it this fire (a long
+    // prompt's leading piece, its reader attached to the last) lays none.
+    assert!(
+        fire(&mut shell, true, false).is_empty(),
+        "a capturing lane no program reads laid a row"
+    );
+
     // One capturing lane among 256 lays one lane's rows.
-    let rows = fire(&mut shell, true);
+    let rows = fire(&mut shell, true, true);
     assert_eq!(
         rows.len(),
         1,
