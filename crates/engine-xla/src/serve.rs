@@ -166,8 +166,6 @@ pub struct Seated<'a> {
 
     pub rs_reset: engine::fire::RsReset,
 
-    pub rs_slot: Option<u32>,
-
     pub rs: &'a engine::fire::RsVerb,
 
     pub media: Option<Media<'a>>,
@@ -216,7 +214,6 @@ impl<'a> Seated<'a> {
             readout: None,
             quiet: false,
             rs_reset: engine::fire::RsReset::Inferred,
-            rs_slot: None,
             rs: &FOLD,
             media: None,
             inputs: &[],

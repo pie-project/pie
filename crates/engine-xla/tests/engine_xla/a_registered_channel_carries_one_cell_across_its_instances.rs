@@ -96,8 +96,11 @@ fn bind(rig: &mut Rig, program: ProgramId, seeded: bool) -> InstanceId {
 
 /// One pass of `instance` on a lane of one token: the count it put.
 fn pass(rig: &mut Rig, instance: InstanceId, page: u32) -> u32 {
+    let kv = crate::common_llm::Refs::of_facts(rig.loaded.caps.chunks.clone())
+        .shapes(|s| s.role == engine::chunk::SlotRole::State)[0]
+        .id;
     rig.fire(
-        vec![host_lane(1, vec![3], vec![page], 0)],
+        vec![host_lane(kv, 1, vec![3], vec![page], 0)],
         vec![attach(0, instance)],
         Vec::new(),
     );

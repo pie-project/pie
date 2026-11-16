@@ -310,6 +310,9 @@ pub fn bits(values: &[f32]) -> Vec<u32> {
 #[derive(Debug, Default)]
 pub struct Refs {
     pub facts: Option<engine::chunk::ChunkFacts>,
+    /// The load's facts as stated, shared pool or not: the shapes a lane's
+    /// tables name.
+    stated: engine::chunk::ChunkFacts,
     next_chunk: u32,
     open: std::collections::BTreeMap<u32, (u32, u32)>,
 }
@@ -320,12 +323,14 @@ impl Refs {
     }
 
     pub fn of_facts(facts: engine::chunk::ChunkFacts) -> Refs {
+        let stated = facts.clone();
         let facts = Some(facts).filter(|facts| {
             !facts.shapes.is_empty() && facts.shapes.iter().all(|s| s.pinned.is_none())
         });
         let next_chunk = 0;
         Refs {
             facts,
+            stated,
             next_chunk,
             open: Default::default(),
         }
@@ -401,18 +406,27 @@ impl Seq {
             word,
             tokens,
             readout: Readout::Last,
+            // What the runtime states beside the record (the engine's own
+            // check of a snapshotting lane reads it); XLA reads the record.
             rs_slot: Some(self.slot),
             ..Lane::default()
         };
+        lane.kv.held = self.held;
         if !refs.shared() {
-            lane.kv = engine::fire::KvDelta {
-                held: self.held,
-                pages: (0..need as u32)
-                    .map(|p| self.slot * (context / PAGE) + p)
-                    .collect(),
-                translation: Vec::new(),
-                window: Vec::new(),
-            };
+            // A pool the load fixed: the slot's own pages, as its kv list's
+            // table (a lane's pages are its tables, and nothing else).
+            let kv = refs
+                .stated
+                .shapes
+                .iter()
+                .find(|s| {
+                    matches!(s.kind, SlotKind::List { window: None, .. })
+                        && s.role == SlotRole::State
+                })
+                .expect("a kv list")
+                .id;
+            lane.tables
+                .push((kv, (0..need as u32).map(|p| self.slot * (context / PAGE) + p).collect()));
             return lane;
         }
         for list in refs.shapes(|s| {
@@ -476,12 +490,6 @@ impl Seq {
             }
         }
         lane.fixed = self.record.clone();
-        lane.kv = engine::fire::KvDelta {
-            held: self.held,
-            pages: self.kv[..need.min(self.kv.len())].to_vec(),
-            translation: Vec::new(),
-            window: Vec::new(),
-        };
         lane
     }
 }
