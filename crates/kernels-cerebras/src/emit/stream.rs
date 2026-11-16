@@ -1626,6 +1626,15 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
                     continue;
                 }
                 g.put(late, &format!("  rg{k}.row();\n"));
+                // a padded row region: its outputs' padding zeroed (a padded value's padding is
+                // zero wherever it is read)
+                let valid = chain.region.width.saturating_sub(ri * c).min(c);
+                if side == Side::Row && valid < c && help.is_none() {
+                    for o in 0..chain.outs.len() {
+                        let pad = at(&format!("rg{k}.OUT{o}"), &valid.to_string(), c - valid);
+                        g.put(late, &format!("  @fmovs({pad}, @as(f32, 0.0));\n"));
+                    }
+                }
                 for (o, out) in chain.outs.iter().enumerate() {
                     if help.is_some() {
                         let o32 = o as u32;

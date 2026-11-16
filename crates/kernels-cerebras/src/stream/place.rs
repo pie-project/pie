@@ -178,10 +178,12 @@ impl Layout {
             };
         }
         if side == Side::Row {
+            // (padded where the roots do not divide it: each root's chunk a value's, as it
+            // holds it)
             return RegionAt {
                 first: 0,
                 roots: self.py,
-                chunk: width / self.py,
+                chunk: width.div_ceil(self.py),
                 reps: 1,
             };
         }

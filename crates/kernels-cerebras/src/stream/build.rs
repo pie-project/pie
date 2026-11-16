@@ -646,12 +646,15 @@ pub fn program_at(
             prologue: u.classes.is_empty(),
         };
         // a row-side value its row roots hold padded (narrower than them, or of no multiple)
-        // passes through matvecs and the row stream; a row region reads it whole
+        // passes through matvecs and the row stream; a decode step's row region runs over its
+        // padded chunks, its outputs' padding zeroed (a reading's regions divide its rows: its
+        // programs as they were)
         for st in &u.steps {
             if let Step::Region {
                 side: Side::Row,
                 chain,
             } = st
+                && shape.cache.is_none()
                 && !chain.region.width.is_multiple_of(py)
             {
                 return Err(format!(

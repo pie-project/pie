@@ -156,7 +156,8 @@ struct RopeUse {
 pub fn print(region: &Region, place: &Place) -> R<Printed> {
     let types = region.types().map_err(|e| Refused(e.to_string()))?;
     let c = place.chunk;
-    if c == 0 || place.roots == 0 || c * place.roots != region.width {
+    // (the roots' chunks hold the row, the last ones padded: a padded value's padding zero)
+    if c == 0 || place.roots == 0 || c * place.roots < region.width {
         return refuse(format!(
             "{} roots of {c} columns do not hold a row of {}",
             place.roots, region.width
