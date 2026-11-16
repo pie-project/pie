@@ -54,6 +54,9 @@ impl Serve for Api {
 
     type Flight = Flight;
 
+    /// The tokens Vulkan's served loads are asked ([`crate::FIRE`]).
+    const ROWS_TOP: u32 = crate::FIRE.1;
+
     type Keep = crate::record::Key;
 
     const FUSIONS: &'static [poem_compiler::fuse::Rule] = &crate::FUSIONS;

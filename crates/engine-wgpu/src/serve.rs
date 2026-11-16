@@ -32,6 +32,9 @@ impl Serve for Api {
 
     type Flight = ();
 
+    /// The tokens wgpu's served loads are asked ([`crate::FIRE`]).
+    const ROWS_TOP: u32 = crate::FIRE.1;
+
     type Keep = std::convert::Infallible;
 
     const FUSIONS: &'static [poem_compiler::fuse::Rule] = &crate::FUSIONS;

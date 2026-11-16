@@ -402,12 +402,7 @@ fn compile(
     })
 }
 
-fn build(
-    core: &Arc<Core>,
-    file: &'static str,
-    name: &'static str,
-    wgsl: &str,
-) -> Result<Pipeline> {
+fn build(core: &Arc<Core>, file: &'static str, name: &'static str, wgsl: &str) -> Result<Pipeline> {
     let shader = |why: String| Fault::Shader {
         file,
         entrypoint: name,

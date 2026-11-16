@@ -218,22 +218,32 @@ pub fn gemm_grid(mut points: Vec<(u32, u32, u32, f64)>) -> Option<Vec<(u32, u32,
     full.then_some(points)
 }
 
+/// The rows `grid` states, ascending: the rung lattice it was timed at.
+#[must_use]
+pub fn gemm_rows(grid: &[(u32, u32, u32, f64)]) -> Vec<u32> {
+    let mut rows: Vec<u32> = grid.iter().map(|&(m, ..)| m).collect();
+    rows.sort_unstable();
+    rows.dedup();
+    rows
+}
+
 /// The rate of `grid` (checked by [`gemm_grid`]) at `rows`, `n` and `k`:
-/// each stated `(n, k)`'s row curve read at `rows` (linear in `log rows`),
-/// then, where the pairs are a full product of columns by depths,
+/// each stated `(n, k)` read at `rows` exactly (`None` for a row the grid
+/// does not state: the rows are a rung lattice, not interpolated), then,
+/// where the pairs are a full product of columns by depths,
 /// interpolated in `log n` and `log k` between the four around `(n, k)`;
 /// where they are not (a square grid's diagonal), in `log k` between the
 /// depths around `k`. Clamped to the grid's edges past them. `None` for an
 /// empty grid.
 #[must_use]
 pub fn gemm_at(grid: &[(u32, u32, u32, f64)], rows: u32, n: u32, k: u32) -> Option<f64> {
+    // A row count is read where the grid states it, never between: the
+    // rows are the rung lattice a load lays its fires at, each timed through
+    // the kernel serving runs (its own padding and tile in the rate).
     let along = |nn: u32, kk: u32| -> Option<f64> {
-        let curve: Vec<(u32, f64)> = grid
-            .iter()
-            .filter(|&&(_, gn, gk, _)| gn == nn && gk == kk)
-            .map(|&(m, _, _, r)| (m, r))
-            .collect();
-        interpolate(&curve, rows)
+        grid.iter()
+            .find(|&&(m, gn, gk, _)| m == rows && gn == nn && gk == kk)
+            .map(|&(_, _, _, r)| r)
     };
     let mut pairs: Vec<(u32, u32)> = grid.iter().map(|&(_, n, k, _)| (n, k)).collect();
     pairs.sort_unstable();
@@ -379,7 +389,7 @@ mod tests {
     }
 
     #[test]
-    fn the_gemm_grid_interpolates_in_log_rows_columns_and_depth_and_clamps() {
+    fn the_gemm_grid_reads_its_rows_exactly_and_interpolates_columns_and_depth() {
         // A full product: n and k each 1024 and 4096, rows 16 and 256.
         let mut points = Vec::new();
         for (n, k, base) in [
@@ -396,34 +406,39 @@ mod tests {
             ..Rates::default()
         };
         assert_eq!(rates.flops_at(16, 1024, 1024), Some(100.0));
-        assert_eq!(rates.flops_at(1, 1, 1), Some(100.0), "clamped below all");
         assert_eq!(
-            rates.flops_at(1 << 20, 1 << 20, 1 << 20),
+            rates.flops_at(256, 1 << 20, 1 << 20),
             Some(800.0),
-            "above all"
+            "n, k clamped"
         );
-        // 64 rows halfway in log rows: 150 at (1024, 1024).
-        assert!((rates.flops_at(64, 1024, 1024).unwrap() - 150.0).abs() < 1e-9);
+        // A row the grid does not state is no rate: never interpolated.
+        assert_eq!(rates.flops_at(64, 1024, 1024), None);
+        assert_eq!(rates.flops_at(1, 1024, 1024), None);
+        assert_eq!(
+            gemm_rows(rates.bf16_flops_per_ns_by_rows_n_k.as_deref().unwrap()),
+            vec![16, 256]
+        );
         // n 2048 halfway from 1024 to 4096: 150 at k 1024; k 2048 the same.
         assert!((rates.flops_at(16, 2048, 1024).unwrap() - 150.0).abs() < 1e-9);
         assert!((rates.flops_at(16, 2048, 2048).unwrap() - 250.0).abs() < 1e-9);
         // An 8B gate_up (n 24576, k 4096) reads the widest columns stated.
         assert_eq!(rates.flops_at(256, 24576, 4096), Some(800.0));
         assert_eq!(rates.peak_flops(), Some(800.0));
-        assert_eq!(Rates::default().flops_at(64, 1024, 1024), None);
+        assert_eq!(Rates::default().flops_at(16, 1024, 1024), None);
     }
 
     #[test]
     fn a_gap_bound_point_reads_as_no_work() {
-        // Rows 16 gap-bound (its work unmeasurable under a launch), 256 at
-        // 100 a ns: 64 rows halfway in log rows, half 256's time a unit.
+        // Depth 1024 gap-bound at 16 rows (its work unmeasurable under a
+        // launch), 4096 at 100 a ns: 2048 halfway in log depth, half 4096's
+        // time a unit.
         let grid = gemm_grid(vec![
             (16, 1024, 1024, f64::INFINITY),
-            (256, 1024, 1024, 100.0),
+            (16, 4096, 4096, 100.0),
         ])
         .unwrap();
         assert_eq!(gemm_at(&grid, 16, 1024, 1024), Some(f64::INFINITY));
-        assert!((gemm_at(&grid, 64, 1024, 1024).unwrap() - 200.0).abs() < 1e-9);
+        assert!((gemm_at(&grid, 16, 2048, 2048).unwrap() - 200.0).abs() < 1e-9);
         let rates = Rates {
             bf16_flops_per_ns_by_rows_n_k: Some(grid),
             ..Rates::default()

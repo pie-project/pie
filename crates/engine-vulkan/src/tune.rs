@@ -810,9 +810,14 @@ impl Steps {
 
 /// The `[rates]` step: the device's rates measured on it under `base`.
 fn rates(base: &Profile, say: &mut dyn FnMut(&str)) -> Result<profile::fire::Rates, String> {
-    let device =
-        crate::device::Context::bind(&crate::api::DeviceBoot::default(), engine::Allowance::WHOLE)
-            .map_err(|e| e.to_string())?;
+    // The step's device takes what its own fires lay, no load's budget.
+    let device = crate::device::Context::bind(
+        &crate::api::DeviceBoot::default(),
+        engine::Allowance {
+            budget: Some(engine::rates::step_bytes(crate::FIRE.1)),
+        },
+    )
+    .map_err(|e| e.to_string())?;
     let tuning = crate::tuning::Tuning::new(base.clone(), device.limits());
     let rates = crate::rates::measure_saying(&device, &tuning, say).map_err(|e| e.to_string())?;
     // The matmul path the profile selects on this card, which the rates
@@ -827,7 +832,7 @@ fn rates(base: &Profile, say: &mut dyn FnMut(&str)) -> Result<profile::fire::Rat
         let path =
             kernels_slang::linear::gemm::tile_for(kernels_slang::Target::Spirv, gemm, m, n, k);
         say(&format!(
-            "[rates]: matmul m {m:>5} n {n:>5} k {k:>5}: {:6.1} TFLOP/s through {path:?} (tier \
+            "[rates]: matmul m {m:>5} n {n:>5} k {k:>5}: {:.4} TFLOP/s through {path:?} (tier \
              {tier:?})",
             rate / 1e3
         ));

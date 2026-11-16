@@ -91,8 +91,8 @@ const VULKAN_FIRE: Fire = Fire {
 };
 #[cfg(feature = "wgpu")]
 const WGPU_FIRE: Fire = Fire {
-    lanes: 512,
-    tokens: 10240,
+    lanes: runtime::engine::backend::open::WGPU_FIRE.0,
+    tokens: runtime::engine::backend::open::WGPU_FIRE.1,
 };
 #[cfg(feature = "xla")]
 const XLA_FIRE: Fire = Fire {

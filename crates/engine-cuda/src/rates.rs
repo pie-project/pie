@@ -12,7 +12,7 @@
 //! Every shape is `engine::rates`' lattice, and its counts turn the times
 //! into rates, so the CUDA and ROCm rates mean what every backend's do:
 //! - `bf16_flops_per_ns_by_rows_n_k`: the matmul `m x n x k` at each row
-//!   count of [`LATTICE_ROWS`] and each column count and depth of [`DEPTHS`]
+//!   count of the rung lattice ([`lattice_rows`]) and each column count and depth of [`DEPTHS`]
 //!   through `linear::gemm` (cuBLAS(Lt) on CUDA,
 //!   hipBLASLt/rocBLAS on ROCm) under the GEMM tactics serving runs; its
 //!   launches rotate through `engine::rates::weights_at(n, k)` weight planes, `engine::rates::WEIGHT_BYTES`
@@ -41,10 +41,21 @@
 //! Index and page tables, gates, outputs and workspace stay as laid.
 
 #[cfg_attr(not(feature = "device"), allow(unused_imports))]
-use engine::rates::{
-    ATTN_DIMS, ATTN_KEYS, ATTN_SHAPE, DEPTHS, LATTICE_ROWS, SCAN_SHAPE, weights_at,
-};
+use engine::rates::{ATTN_DIMS, ATTN_KEYS, ATTN_SHAPE, DEPTHS, SCAN_SHAPE, weights_at};
 use profile::fire::Rates;
+
+/// The widest fire this backend's grid is timed to, the top of its rung
+/// lattice: the rows a fire takes when nothing states them
+/// ([`crate::api::DEFAULT_FORWARD_TOKENS`]). A chip whose profile states its
+/// own fire rows needs its lattice to reach them.
+pub const ROWS_TOP: u32 = crate::api::DEFAULT_FORWARD_TOKENS;
+
+/// The rows the matmul grid is timed at: the rung lattice up to
+/// [`ROWS_TOP`] (`engine::rates::row_lattice`, the one definition).
+#[must_use]
+pub fn lattice_rows() -> Vec<u32> {
+    engine::rates::row_lattice(ROWS_TOP)
+}
 
 /// The kv cache's page, as a served load pages it.
 pub const PAGE: u32 = 16;
@@ -364,7 +375,7 @@ mod on_device {
             .iter()
             .flat_map(|&k| DEPTHS.iter().map(move |&n| (n, k)))
             .collect();
-        let mut grid = Vec::with_capacity(LATTICE_ROWS.len() * shapes.len());
+        let mut grid = Vec::with_capacity(lattice_rows().len() * shapes.len());
         for at in engine::rates::spread_order(shapes.len()) {
             let (n, k) = shapes[at];
             grid.extend(gemm_at(ctx, clock, random, held, n, k, gap)?);
@@ -414,16 +425,16 @@ mod on_device {
         k: u32,
         gap: f64,
     ) -> Result<Vec<(u32, u32, u32, f64)>, String> {
-        let most = *LATTICE_ROWS.last().expect("rows") as usize;
+        let most = *lattice_rows().last().expect("rows") as usize;
         let act = random.operand(most * k as usize * 2)?;
         let y = zeroed(most * n as usize * 2)?;
         let planes = weights_at(n, k);
         let weights = (0..planes)
             .map(|_| random.operand(n as usize * k as usize * 2))
             .collect::<Result<Vec<Buffer>, String>>()?;
-        let mut curve = Vec::with_capacity(LATTICE_ROWS.len());
-        for row in engine::rates::spread_order(LATTICE_ROWS.len()) {
-            let m = LATTICE_ROWS[row];
+        let mut curve = Vec::with_capacity(lattice_rows().len());
+        for row in engine::rates::spread_order(lattice_rows().len()) {
+            let m = lattice_rows()[row];
             let fire = |w: usize| {
                 kernels_cuda::linear::gemm::matmul(
                     ctx,

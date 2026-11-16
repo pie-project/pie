@@ -76,7 +76,7 @@ pub fn choose(
             Refused::NoRung(no) => {
                 format!("{no}; this device binds no more than {} MiB", binding >> 20)
             }
-            refused @ Refused::NoRates { .. } => refused.to_string(),
+            refused @ (Refused::NoRates { .. } | Refused::OffGrid { .. }) => refused.to_string(),
         })
     })
 }

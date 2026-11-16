@@ -64,6 +64,11 @@ pub trait Serve: Backend {
     /// What a step in flight keeps until it is harvested.
     type Flight;
 
+    /// The widest fire this backend lays: the tokens its served loads are
+    /// asked, the top of its rung lattice (`engine::rates::row_lattice`) and
+    /// of the rows its rates grid is timed at.
+    const ROWS_TOP: u32;
+
     /// The key a walked step is kept under to replay.
     type Keep;
 
@@ -1038,10 +1043,16 @@ impl<B: Serve> Shell<B> {
         let mut weighed: Option<Weighed> = None;
         let (compiled, mut span) = loop {
             let compiled = compile_axes(&boot.trace, &budgets, &profile)?;
+            // The rungs the rung lattice offers up to this load's top: the
+            // rows the rates grid was timed at, so the estimate never weighs
+            // a rung it did not measure.
             let top = budgets.tokens.max_tokens;
-            let mut rung_tokens = engine::memory::rungs(1, top);
-            if rung_tokens.last() != Some(&top) {
-                rung_tokens.push(top);
+            let mut rung_tokens: Vec<u32> = engine::rates::row_lattice(B::ROWS_TOP)
+                .into_iter()
+                .filter(|&t| t <= top)
+                .collect();
+            if rung_tokens.is_empty() {
+                rung_tokens.push(1);
             }
             let span = Span::plan(
                 &boot.trace,

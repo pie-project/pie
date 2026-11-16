@@ -3,7 +3,7 @@
 //! the kernel serving dispatches under the device's own tuning:
 //!
 //! * the matmul curve: `linear::gemm::matmul` at each of
-//!   [`engine::rates::LATTICE_ROWS`], each repeat over the next of
+//!   the rung lattice ([`lattice_rows`]), each repeat over the next of
 //!   engine::rates::weights_at's distinct weights so every one streams from memory, as a fire's do;
 //! * attention: `attn::arbiter::prefill` at [`engine::rates::ATTN_SHAPE`],
 //!   causal, over a bf16 pool of the 16-token pages serving builds, laid
@@ -28,14 +28,26 @@
 //! serving runs, and every backend times the same bytes. Index and page
 //! tables, gates, outputs and the launch probe stay as laid.
 
-use engine::rates::{
-    ATTN_DIMS, ATTN_KEYS, ATTN_SHAPE, AttnShape, DEPTHS, LATTICE_ROWS, SCAN_SHAPE,
-};
+use engine::rates::{ATTN_DIMS, ATTN_KEYS, ATTN_SHAPE, AttnShape, DEPTHS, SCAN_SHAPE};
 use kernels_metal::linear::gemm;
 use kernels_metal::tensor::{RaggedTensor, RecurrentPool};
 use kernels_metal::{KvPool, PrefillPlan, StateMap, Tensor, Tuning, attn, ssm};
 use poem_ir::Dtype;
 use profile::fire::Rates;
+
+/// The widest fire this backend's grid is timed to: the top of its rung
+/// lattice. Held at the top of the lattice this step timed before (the
+/// shared row list's last, 8192) until the backend's owner states the
+/// widest rung its loads lay; every row a load fires must be a point of
+/// the lattice.
+pub const ROWS_TOP: u32 = 8192;
+
+/// The rows the matmul grid is timed at: the rung lattice up to
+/// [`ROWS_TOP`] (`engine::rates::row_lattice`, the one definition).
+#[must_use]
+pub fn lattice_rows() -> Vec<u32> {
+    engine::rates::row_lattice(ROWS_TOP)
+}
 
 use crate::device::{Buffer, Context, Handles, Pipelines};
 use crate::encode::Sink;
@@ -453,7 +465,7 @@ pub fn measure(
             warmed.rate / 1e3
         ));
     }
-    let mut grid = Vec::with_capacity(LATTICE_ROWS.len() * DEPTHS.len() * DEPTHS.len());
+    let mut grid = Vec::with_capacity(lattice_rows().len() * DEPTHS.len() * DEPTHS.len());
     // The shapes, and each shape's rows, in engine::rates' spread order.
     let shapes: Vec<(u32, u32)> = DEPTHS
         .iter()
@@ -478,9 +490,9 @@ pub fn measure(
             })
             .collect::<Result<Vec<(Tensor, Buffer)>, String>>()?;
         let tensors: Vec<Tensor> = weights.iter().map(|(t, _)| *t).collect();
-        for m in engine::rates::spread_order(LATTICE_ROWS.len())
+        for m in engine::rates::spread_order(lattice_rows().len())
             .into_iter()
-            .map(|row| LATTICE_ROWS[row])
+            .map(|row| lattice_rows()[row])
         {
             let rate = bench.matmul_flops(m, n, k, &tensors, gap)?;
             say(&format!(

@@ -120,6 +120,10 @@ pub mod open {
             .map_err(::anyhow::Error::msg)
     }
 
+    /// The fire a served wgpu load is asked ([`engine_wgpu::FIRE`]).
+    #[cfg(feature = "wgpu")]
+    pub const WGPU_FIRE: (u32, u32) = engine_wgpu::FIRE;
+
     #[cfg(feature = "wgpu")]
     pub fn wgpu(config_bytes: &[u8]) -> Result<EngineBox> {
         engine_wgpu::open(config_bytes, crate::engine::load::contract_for)

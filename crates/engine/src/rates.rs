@@ -7,7 +7,8 @@
 //! [`provenance`] write them.
 //!
 //! - `bf16_flops_per_ns_by_rows_n_k`: a bf16 matmul of `m` rows, `n`
-//!   columns and depth `k` at each `m` of [`LATTICE_ROWS`] and each `n` and
+//!   columns and depth `k` at each `m` of the rung lattice ([`row_lattice`]
+//!   up to the backend's widest fire) and each `n` and
 //!   each `k` of [`DEPTHS`] (a serving projection is seldom square: a gate
 //!   and up leg runs wide and shallow, a down leg narrow and deep),
 //!   [`gemm_flops`] a matmul over its time.
@@ -31,11 +32,71 @@
 //!   overlaps its launches the gap comes out small; where it serializes
 //!   them, it is what each adds.
 
-/// The rows the matmul curve is measured at: powers of two from 16 (a
-/// decode fire's few lanes, one register or coopmat tile) to 8192 (past the
-/// widest rung a load lays on any device today, where every device's
-/// matmul is compute bound).
-pub const LATTICE_ROWS: [u32; 10] = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192];
+/// The rows the matmul grid is timed at, and the rungs a load lays its
+/// fires at: the one rung lattice, every power of two of tokens from 1 to
+/// `top` and `top` itself ([`crate::memory::rungs`]), `top` the backend's
+/// widest fire. Each point is timed through the kernel serving runs at
+/// that many rows (its own padding and tile in the rate), the estimate
+/// reads a rung's tokens exactly there, and a load lays no rung off it.
+#[must_use]
+pub fn row_lattice(top: u32) -> Vec<u32> {
+    let mut rows = crate::memory::rungs(1, top.max(1));
+    if rows.last() != Some(&top.max(1)) {
+        rows.push(top.max(1));
+    }
+    rows
+}
+
+/// The bytes the rates step lays on the device at once, at most, for a
+/// lattice up to `top` rows: the largest of the warm-up's planes and
+/// operands, one grid shape's rotation and operands, one attention point's
+/// cold sets, one scan point's cold sets, and the copy's two buffers. What
+/// the step's device binds, so it needs no load budget.
+#[must_use]
+pub fn step_bytes(top: u32) -> u64 {
+    let bf16 = |elements: u64| elements * 2;
+    let (wm, wn, wk) = WARM_SHAPE;
+    let warm = bf16(u64::from(wm) * u64::from(wk))
+        + weights_at(wn, wk) as u64 * bf16(u64::from(wn) * u64::from(wk))
+        + bf16(u64::from(wm) * u64::from(wn));
+    let rows = u64::from(top.max(1));
+    let grid = DEPTHS
+        .iter()
+        .flat_map(|&k| DEPTHS.iter().map(move |&n| (n, k)))
+        .map(|(n, k)| {
+            bf16(rows * u64::from(k))
+                + weights_at(n, k) as u64 * bf16(u64::from(n) * u64::from(k))
+                + bf16(rows * u64::from(n))
+        })
+        .max()
+        .unwrap_or(0);
+    let attn = ATTN_DIMS
+        .iter()
+        .flat_map(|&d| {
+            ATTN_KEYS
+                .iter()
+                .map(move |&keys| ATTN_SHAPE.at(keys).with_dim(d))
+        })
+        .map(|s| {
+            let q = u64::from(s.rows) * u64::from(s.q_heads * s.head_dim);
+            let kv = 2 * u64::from(s.keys) * u64::from(s.kv_heads * s.head_dim);
+            attn_sets_at(s) as u64 * bf16(q + kv) + bf16(q)
+        })
+        .max()
+        .unwrap_or(0);
+    let scan = SCAN_TOKENS
+        .iter()
+        .map(|&t| {
+            let s = SCAN_SHAPE.at(t);
+            let rows = u64::from(s.tokens) * u64::from(s.channels());
+            let state = u64::from(s.conv_width * s.channels() + s.v_heads * s.k_dim * s.v_dim);
+            scan_sets_at(s) as u64 * (bf16(rows) + 4 * state) + bf16(rows) * 2
+        })
+        .max()
+        .unwrap_or(0);
+    let copy = 2 * (256u64 << 20);
+    warm.max(grid).max(attn).max(scan).max(copy)
+}
 
 /// The depths the matmul grid is measured at (its columns the same): the
 /// contractions of the dense layers served, from a small model's 1024
@@ -402,7 +463,7 @@ pub fn tuned(rates: &profile::fire::Rates) -> String {
 pub fn provenance(backend: &str, how: &str) -> (&'static str, String) {
     let text = format!(
         "pie tune {backend} --rates on {} (pie {}): {how}; at engine::rates' lattice (matmul \
-         m x n x k, m 16..8192, n and k 1024..16384; attention keys x keys, keys 512..16384, {}/{} \
+         m x n x k, m the rung lattice, n and k 1024..16384; attention keys x keys, keys 512..16384, {}/{} \
          heads of 64..256; scan {} tokens, {}/{} heads of {}x{}, conv {})",
         today(),
         env!("CARGO_PKG_VERSION"),
@@ -448,7 +509,10 @@ mod tests {
 
     #[test]
     fn the_lattice_ascends_and_the_counts_are_the_estimates() {
-        assert!(LATTICE_ROWS.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(row_lattice(10240)[..3], [1, 2, 4]);
+        assert_eq!(row_lattice(10240).last(), Some(&10240));
+        assert_eq!(row_lattice(8192).len(), 14);
+        assert!(step_bytes(10240) >= 6 << 30, "a 16384^2 rotation");
         assert!(DEPTHS.windows(2).all(|w| w[0] < w[1]));
         assert_eq!(weights_at(1024, 1024), 384);
         assert_eq!(weights_at(16384, 1024), 24);

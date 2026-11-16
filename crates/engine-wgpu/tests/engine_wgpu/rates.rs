@@ -33,7 +33,7 @@ fn the_micro_fires_state_rates_and_the_ruling_picks_by_them() {
     let grid = rates.bf16_flops_per_ns_by_rows_n_k.clone().unwrap();
     assert_eq!(
         grid.len(),
-        engine::rates::LATTICE_ROWS.len()
+        engine::rates::row_lattice(engine_wgpu::FIRE.1).len()
             * engine::rates::DEPTHS.len()
             * engine::rates::DEPTHS.len()
     );

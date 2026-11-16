@@ -448,6 +448,14 @@ pub enum Refused {
     NoRates { device: String, key: &'static str },
     /// No rung offered is feasible.
     NoRung(NoRung),
+    /// The device's matmul grid states no rate at rows a rung fires (its
+    /// rows are the rung lattice it was timed at): measured on another
+    /// lattice, or a load laying a rung off it.
+    OffGrid {
+        device: String,
+        rows: Vec<u32>,
+        grid: Vec<u32>,
+    },
 }
 
 impl fmt::Display for Refused {
@@ -460,6 +468,13 @@ impl fmt::Display for Refused {
                  it"
             ),
             Refused::NoRung(no) => no.fmt(f),
+            Refused::OffGrid { device, rows, grid } => write!(
+                f,
+                "device {device}'s matmul grid (`[rates] bf16_flops_per_ns_by_rows_n_k`) states \
+                 no rows {rows:?} a rung of this load fires (it states {grid:?}, the rung \
+                 lattice it was timed at); `pie tune <backend> --rates` measures the lattice \
+                 this backend lays"
+            ),
         }
     }
 }
@@ -481,6 +496,23 @@ pub fn choose(
         device: device.to_owned(),
         key,
     })?;
+    // Every row a feasible rung fires, and its readout's, on the grid.
+    let grid = profile::fire::gemm_rows(&estimate.flops_grid);
+    let mut off: Vec<u32> = rungs
+        .iter()
+        .filter(|r| r.infeasible.is_none())
+        .flat_map(|r| [r.tokens, r.check_fire().sampled])
+        .filter(|rows| grid.binary_search(rows).is_err())
+        .collect();
+    off.sort_unstable();
+    off.dedup();
+    if !off.is_empty() {
+        return Err(Refused::OffGrid {
+            device: device.to_owned(),
+            rows: off,
+            grid,
+        });
+    }
     let top = super::rung::top_rung(rungs, live, &estimate).map_err(Refused::NoRung)?;
     Ok((top, estimate))
 }
@@ -560,6 +592,31 @@ mod tests {
         }
     }
 
+    /// A grid at every row of the rung lattice, at 4096 x 4096.
+    fn lattice(rate: f64) -> Vec<(u32, u32, u32, f64)> {
+        crate::rates::row_lattice(16384)
+            .into_iter()
+            .map(|m| (m, 4096, 4096, rate))
+            .collect()
+    }
+
+    #[test]
+    fn a_rung_off_the_grid_is_refused_by_name() {
+        let rungs = [rung(1024, 100 * MIB, None), rung(3000, 150 * MIB, None)];
+        let rates = profile::fire::Rates {
+            bf16_flops_per_ns_by_rows_n_k: Some(lattice(1.0)),
+            attn_flops_per_ns_by_keys_and_dim: Some(vec![(2048, 128, 1.0)]),
+            bytes_per_ns: Some(1.0),
+            ..profile::fire::Rates::default()
+        };
+        let err = choose(&rungs, 1 << 33, &rates, "Card X", &counts()).unwrap_err();
+        assert!(
+            matches!(err, Refused::OffGrid { ref rows, .. } if rows == &vec![3000]),
+            "{err}"
+        );
+        assert!(err.to_string().contains("states no rows [3000]"), "{err}");
+    }
+
     #[test]
     fn without_rates_the_load_is_refused_by_name() {
         let rungs = [rung(1024, 100 * MIB, None), rung(2048, 150 * MIB, None)];
@@ -578,7 +635,7 @@ mod tests {
         // No feasible rung at all: the ruling's refusal.
         let none = [rung(1024, 300 * MIB, Some("past one binding"))];
         let rated = profile::fire::Rates {
-            bf16_flops_per_ns_by_rows_n_k: Some(vec![(4096, 4096, 4096, 1.0)]),
+            bf16_flops_per_ns_by_rows_n_k: Some(lattice(1.0)),
             attn_flops_per_ns_by_keys_and_dim: Some(vec![(2048, 128, 1.0)]),
             bytes_per_ns: Some(1.0),
             ..profile::fire::Rates::default()
@@ -675,7 +732,7 @@ mod tests {
     fn the_refusal_names_the_key_unstated() {
         let rungs = [rung(1024, 100 * MIB, None)];
         let rates = profile::fire::Rates {
-            bf16_flops_per_ns_by_rows_n_k: Some(vec![(4096, 4096, 4096, 1.0)]),
+            bf16_flops_per_ns_by_rows_n_k: Some(lattice(1.0)),
             bytes_per_ns: Some(1.0),
             ..profile::fire::Rates::default()
         };
@@ -841,7 +898,7 @@ mod tests {
         };
         let tuned = profile::fire::Tuned {
             rates: profile::fire::Rates {
-                bf16_flops_per_ns_by_rows_n_k: Some(vec![(4096, 4096, 4096, 249_000.0)]),
+                bf16_flops_per_ns_by_rows_n_k: Some(lattice(249_000.0)),
                 bytes_per_ns: Some(654.0),
                 launch_ns: Some(1620),
                 ..profile::fire::Rates::default()

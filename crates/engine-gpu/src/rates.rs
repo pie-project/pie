@@ -9,7 +9,8 @@
 //! its pipelines), so the frame's one submit and wait cancel and what is
 //! left is the work's own time beside a dispatch's:
 //! - the backend's own bf16 matmul at each row count of
-//!   `engine::rates::LATTICE_ROWS` and each column count and depth of
+//!   the rung lattice (`engine::rates::row_lattice` up to the backend's
+//!   `Serve::ROWS_TOP`) and each column count and depth of
 //!   `engine::rates::DEPTHS`, `m x n x k`, each fire reading the next of
 //!   `engine::rates::weights_at(n, k)`
 //!   weight planes (past the last-level cache), for the matmul grid;
@@ -36,8 +37,8 @@
 //! biases it.
 
 use engine::rates::{
-    ATTN_DIMS, ATTN_KEYS, ATTN_SHAPE, DEPTHS, LATTICE_ROWS, SCAN_SHAPE, attn_flops, gemm_flops,
-    scan_elements, weights_at,
+    ATTN_DIMS, ATTN_KEYS, ATTN_SHAPE, DEPTHS, SCAN_SHAPE, attn_flops, gemm_flops, scan_elements,
+    weights_at,
 };
 use kernels_slang::{KvPool, RaggedTensor, Tensor};
 use poem_ir::Dtype;
@@ -225,7 +226,8 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         engine::rates::WARM_SHAPE.0,
         warmed.rate / 1e3
     ));
-    let grid = grid(&mut rig, tactics.gemm(tier), timer, launch)?;
+    let rows = engine::rates::row_lattice(B::ROWS_TOP);
+    let grid = grid(&mut rig, tactics.gemm(tier), timer, launch, &rows)?;
     let mut attn = Vec::with_capacity(ATTN_KEYS.len() * ATTN_DIMS.len());
     for d in ATTN_DIMS {
         for keys in ATTN_KEYS {
@@ -296,13 +298,14 @@ fn grid<B: Serve>(
     tactic: kernels_slang::linear::gemm::Tactic,
     timer: Timer<'_, B>,
     launch: f64,
+    lattice: &[u32],
 ) -> Result<Vec<(u32, u32, u32, f64)>> {
-    let widest = LATTICE_ROWS[LATTICE_ROWS.len() - 1];
+    let widest = lattice.iter().copied().max().unwrap_or(1);
     let shapes: Vec<(u32, u32)> = DEPTHS
         .iter()
         .flat_map(|&k| DEPTHS.iter().map(move |&n| (n, k)))
         .collect();
-    let mut out = Vec::with_capacity(LATTICE_ROWS.len() * shapes.len());
+    let mut out = Vec::with_capacity(lattice.len() * shapes.len());
     for at in engine::rates::spread_order(shapes.len()) {
         let (n, k) = shapes[at];
         let act = rig.operand(widest, k, Dtype::Bf16)?;
@@ -312,8 +315,8 @@ fn grid<B: Serve>(
             .collect::<Result<Vec<Tensor>>>()?;
         let y = rig.zeros(widest, n, Dtype::Bf16)?;
         let next = std::cell::Cell::new(0usize);
-        for row in engine::rates::spread_order(LATTICE_ROWS.len()) {
-            let m = LATTICE_ROWS[row];
+        for row in engine::rates::spread_order(lattice.len()) {
+            let m = lattice[row];
             let ns = rig.each(timer, &|sink| {
                 let w = weights[next.get() % weights.len()];
                 next.set(next.get() + 1);
