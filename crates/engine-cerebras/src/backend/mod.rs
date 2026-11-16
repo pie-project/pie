@@ -190,7 +190,7 @@ impl Engine for CerebrasEngine {
                 let units = if declared || self.debug.program.is_some() || host {
                     None
                 } else {
-                    match prepare::unit_program(&self.cfg, &trace, positions) {
+                    match prepare::unit_program(&self.cfg, &trace, positions, 1) {
                         Ok(p) => Some(p),
                         Err(u) => {
                             tracing::warn!(templates = %e, units = %u, "cerebras: no decode program");

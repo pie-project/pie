@@ -60,8 +60,8 @@ const USAGE: &str = "usage: wafer-bench --program <dir> --weights <dir>[:<prefix
                      [--times <out.json>] [--forced N]\n       wafer-bench --reading <dir> --program <dir> \
                      --inputs <dir> [--grid T,H,W] [--steps N] [--golden <dir>] [--save <dir>] [--reload 1] [--cmaddr <addr>] [--statics <dir>] [--stamps <dir>] \
                      [--rows 1 [--save-rows <dir>]]\n       wafer-bench --decode <golden.json> --checkpoint <dir> \
-                     (--reading <dir> --program <dir> | --model <deployment> --cache <dir> [--positions N]) \
-                     [--steps N] [--cmaddr <addr>] [--export <dir>] [--dry 1]";
+                     (--reading <dir> --program <dir> | --model <deployment> --cache <dir> [--positions N] \
+                     [--lanes B]) [--steps N] [--stagger S] [--cmaddr <addr>] [--export <dir>] [--dry 1]";
 
 fn main() {
     match run() {
@@ -300,7 +300,12 @@ fn decode(get: &HashMap<String, String>) -> Result<bool, String> {
                 .get("positions")
                 .map(|p| p.parse::<u32>().map_err(|e| format!("--positions: {e}")))
                 .transpose()?;
-            let (d, l, at) = engine_cerebras::prepare::unit_program(&cfg, &trace, positions)?;
+            let lanes = get
+                .get("lanes")
+                .map_or(Ok(1), |p| p.parse::<u32>())
+                .map_err(|e| format!("--lanes: {e}"))?;
+            let (d, l, at) =
+                engine_cerebras::prepare::unit_program(&cfg, &trace, positions, lanes)?;
             println!("DECODE_PROGRAM {} at {at} positions", d.display());
             (d.display().to_string(), l.display().to_string())
         }
@@ -343,11 +348,13 @@ fn decode(get: &HashMap<String, String>) -> Result<bool, String> {
         reading.model,
         t0.elapsed().as_secs_f64()
     );
+    let lanes = reading.paging.map_or(1, |g| g.lanes as usize);
     if let Some(dir) = get.get("export") {
         // every array's words for step 0 (the statics and the first step's entries) as the
         // h2d files a capture-fed program's are, its host.json naming them: what
         // tools/wafer/stream/run.py loads
-        let (_, entries) = reading.decode_step(&mut host, &trace, &seq[0..=0], &[0])?;
+        let (_, entries) =
+            reading.decode_step(&mut host, &trace, &vec![seq[0]; lanes], &vec![0; lanes])?;
         let dir = Path::new(dir);
         std::fs::create_dir_all(dir.join("h2d")).map_err(|e| e.to_string())?;
         let path = reading.dir.join("host.json");
@@ -385,8 +392,17 @@ fn decode(get: &HashMap<String, String>) -> Result<bool, String> {
     if get.contains_key("dry") {
         // the host's side alone: the statics made, each step's entries
         let words: usize = statics.iter().flatten().map(Vec::len).sum();
-        for s in 0..seq.len().saturating_sub(1).min(3) {
-            let (_, e) = reading.decode_step(&mut host, &trace, &seq[s..=s], &[s as u32])?;
+        for (s, &tok) in seq
+            .iter()
+            .enumerate()
+            .take(seq.len().saturating_sub(1).min(3))
+        {
+            let (_, e) = reading.decode_step(
+                &mut host,
+                &trace,
+                &vec![tok; lanes],
+                &vec![s as u32; lanes],
+            )?;
             let n: usize = e.iter().flatten().map(Vec::len).sum();
             println!("DECODE_DRY step {s}: {n} entry words");
         }
@@ -409,53 +425,78 @@ fn decode(get: &HashMap<String, String>) -> Result<bool, String> {
     rt.load();
     rt.run();
     reading.write_statics(&mut rt, &statics)?;
-    // one sequence: lane slot 0's pages in order
-    reading.write_pages(&mut rt, &reading.one_sequence())?;
+    // B lanes (the program's rows): lane t teacher-forced through the golden from global step
+    // t x stagger (each at its own positions), its pages its own run of the column's
+    let stagger = get
+        .get("stagger")
+        .map_or(Ok(3), |v| v.parse::<usize>())
+        .map_err(|e| format!("--stagger: {e}"))?;
+    if let Some(g) = reading.paging {
+        let per = g.pages / g.lanes;
+        let mut table = vec![0u32; (g.lanes * g.pages) as usize];
+        for t in 0..g.lanes {
+            for j in 0..per {
+                table[(t * g.pages + j) as usize] = t * per + j;
+            }
+        }
+        reading.write_pages(&mut rt, &table)?;
+    }
     let steps = get
         .get("steps")
         .map_or(Ok(seq.len().saturating_sub(1)), |v| v.parse::<usize>())
         .map_err(|e| format!("--steps: {e}"))?
         .min(seq.len().saturating_sub(1));
     let (mut held, mut checked) = (0, 0);
-    for s in 0..steps {
-        let at = u32::try_from(s).map_err(|e| e.to_string())?;
-        let (_, entries) = reading.decode_step(&mut host, &trace, &seq[s..=s], &[at])?;
-        reading.write_pos(&mut rt, at)?;
-        reading.write_rows(&mut rt, &[(0, at)])?;
+    for gs in 0..steps + (lanes - 1) * stagger {
+        // each lane's step (an idle lane's row at its first position, re-stored when it starts)
+        let local: Vec<Option<usize>> = (0..lanes)
+            .map(|t| gs.checked_sub(t * stagger).filter(|&s| s < steps))
+            .collect();
+        let toks: Vec<u32> = local.iter().map(|s| seq[s.unwrap_or(0)]).collect();
+        let pos: Vec<u32> = local.iter().map(|s| s.unwrap_or(0) as u32).collect();
+        let (_, entries) = reading.decode_step(&mut host, &trace, &toks, &pos)?;
+        reading.write_pos(&mut rt, pos[0])?;
+        let rows: Vec<(u32, u32)> = (0..lanes).map(|t| (t as u32, pos[t])).collect();
+        reading.write_rows(&mut rt, &rows)?;
         let t1 = std::time::Instant::now();
         let (got, cycles) = reading.launch(&mut rt, &entries)?;
         let wall_ms = t1.elapsed().as_secs_f64() * 1e3;
         // the program's own argmax (its head roots'), against the logits read back
-        let on_wafer = engine_cerebras::reading::Fabric::argmax(&mut rt, &reading)?
-            .and_then(|a| a.first().copied());
+        let on_wafer = engine_cerebras::reading::Fabric::argmax(&mut rt, &reading)?;
         let back = reading.rows_back(&got)?;
         let logits = back
             .iter()
             .max_by_key(|c| c.width)
             .ok_or("no logits read back")?;
-        let engine_cpu::forward::Values::F32(v) = &logits.values else {
+        let engine_cpu::forward::Values::F32(all) = &logits.values else {
             return Err("logits not f32".into());
         };
-        let (best, top) =
-            v.iter().enumerate().fold(
-                (0usize, f32::MIN),
-                |b, (i, &x)| if x > b.1 { (i, x) } else { b },
+        let w = logits.width;
+        for (t, s) in local.iter().enumerate() {
+            let Some(s) = *s else { continue };
+            let v = &all[t * w..(t + 1) * w];
+            let (best, top) =
+                v.iter().enumerate().fold(
+                    (0usize, f32::MIN),
+                    |b, (i, &x)| if x > b.1 { (i, x) } else { b },
+                );
+            let want = seq[s + 1];
+            let past = s + 1 >= prompt.len();
+            if past {
+                checked += 1;
+                held += usize::from(best as u32 == want);
+            }
+            // the golden's top-5 at this step (HF's own logits), for the margin a miss had
+            let gtop = &golden["top5"][s + 1 - prompt.len().min(s + 1)];
+            println!(
+                "DECODE_STEP {}",
+                json!({"lane": t, "step": s, "token": seq[s], "argmax": best, "logit": top, "want": want,
+                    "checked": past, "ok": best as u32 == want, "cycles": cycles, "wall_ms": wall_ms,
+                    "finite": v.iter().all(|x| x.is_finite()),
+                    "wafer_argmax": on_wafer.as_ref().and_then(|a| a.get(t)),
+                    "golden_top": if past { gtop.clone() } else { Value::Null }})
             );
-        let want = seq[s + 1];
-        let past = s + 1 >= prompt.len();
-        if past {
-            checked += 1;
-            held += usize::from(best as u32 == want);
         }
-        // the golden's top-5 at this step (HF's own logits), for the margin a miss had
-        let gtop = &golden["top5"][s + 1 - prompt.len().min(s + 1)];
-        println!(
-            "DECODE_STEP {}",
-            json!({"step": s, "token": seq[s], "argmax": best, "logit": top, "want": want,
-                "checked": past, "ok": best as u32 == want, "cycles": cycles, "wall_ms": wall_ms,
-                "finite": v.iter().all(|x| x.is_finite()), "wafer_argmax": on_wafer,
-                "golden_top": if past { gtop.clone() } else { Value::Null }})
-        );
     }
     rt.stop();
     println!(

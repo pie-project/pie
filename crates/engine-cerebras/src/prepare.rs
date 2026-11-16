@@ -552,12 +552,13 @@ const UNIT_POSITIONS: (u32, u32) = (8192, 64);
 /// A decode program of stream units (GENERIC.md G1), compiled on load into the cache unless it
 /// holds it: the model's decode step lowered to units (`stream::compile_decode`) at `positions`
 /// (the config's context), else at the most positions in `UNIT_POSITIONS` its K / V columns
-/// hold (a refusal at the fewest is the model's). Returns its files' directory, its link and
-/// its positions.
+/// hold (a refusal at the fewest is the model's), `lanes` rows a step. Returns its files'
+/// directory, its link and its positions.
 pub fn unit_program(
     cfg: &Config,
     trace: &Trace,
     positions: Option<u32>,
+    lanes: u32,
 ) -> R<(PathBuf, PathBuf, u32)> {
     use kernels_cerebras::stream;
     let cache = Cache::open(cfg)?;
@@ -574,7 +575,7 @@ pub fn unit_program(
     let dir = stage.path().join("decode");
     let compile = |at: u32| {
         let _ = std::fs::remove_dir_all(&dir);
-        stream::compile_decode(trace, at, 1, true, &dir).map(|_| ())
+        stream::compile_decode(trace, at, lanes, true, &dir).map(|_| ())
     };
     // the most positions that fit: the most a compile takes, by bisection (or the stated ones)
     let (mut hi, mut lo) = match positions {
@@ -621,7 +622,8 @@ pub fn unit_program(
     hasher.update(fabric.as_bytes());
     hasher.update(cslc.frontend().to_string_lossy().as_bytes());
     let key = hasher.finalize().to_hex()[..16].to_string();
-    let parts = serde_json::json!({ "decode": "units", "positions": at, "fabric": fabric });
+    let parts =
+        serde_json::json!({ "decode": "units", "positions": at, "lanes": lanes, "fabric": fabric });
     let made = cache.entry("u", &trace.name, &key, &parts, |tmp| {
         if cfg.wafer.build == Build::Never {
             return Err(format!(
