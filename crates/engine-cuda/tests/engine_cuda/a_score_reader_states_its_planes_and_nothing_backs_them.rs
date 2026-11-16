@@ -65,6 +65,17 @@ impl ForwardHybrid for Scored {
     }
 }
 
+/// The plain decode request `trace` lands: a one-row query and nothing
+/// else set apart.
+pub(crate) fn decoding(trace: &poem::Trace) -> Request {
+    trace
+        .facts
+        .requests()
+        .into_iter()
+        .find(|request| request.plain() && request.query_len() == 1)
+        .expect("the trace lands a plain decode")
+}
+
 /// A shell of `trace`, recording bodies or not as `graphs` says.
 pub(crate) fn shell(trace: poem::Trace, path: &Path, graphs: Graphs) -> Shell {
     let contract = contract_for(&trace, path).expect("the random planes fit the trace");
@@ -273,9 +284,7 @@ fn a_score_reader_states_its_planes_and_nothing_backs_them() {
             positions: &depth,
             ..Seated::of(Lane {
                 slot: 0,
-                word: trace
-                    .facts
-                    .word(&Request::new(1, true).capturing_scores(true)),
+                word: trace.facts.word(&decoding(&trace).capturing_scores(true)),
                 tokens: &token,
             })
         }],

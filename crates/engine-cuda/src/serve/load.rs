@@ -1107,16 +1107,16 @@ impl Shell {
                 &Exports::of(&boot.trace, &compiled, boot.context, boot.page_size)?.outputs,
             ),
         };
-        let drafting_words: std::collections::HashSet<u64> = compiled
-            .classes
-            .classes
-            .iter()
-            .enumerate()
-            .filter(|(class, _)| {
-                tiers.plain.contains(*class) && !landing[*class].iter().any(poem_ir::Request::plain)
-            })
-            .flat_map(|(_, class)| class.words.iter().copied())
-            .collect();
+        let scored = poem_ir::ClassSet::of(
+            engine::load::armed::scored_classes(&landing)
+                .iter()
+                .filter(|class| tiers.plain.contains(*class)),
+        );
+        let drafting_words: std::collections::HashSet<u64> =
+            crate::exports::drafting_of(&landing, &tiers.plain)
+                .into_iter()
+                .flat_map(|class| compiled.classes.classes[class].words.iter().copied())
+                .collect();
         let media = media_classes(&boot.trace, &compiled);
         let shifted = regions_shifting(&boot.trace, &compiled);
         let lane_shifted = regions_lane_shifting(&boot.trace, &compiled);
@@ -1476,6 +1476,7 @@ impl Shell {
             corrected,
             decoding,
             drafting_words,
+            scored,
             tiers,
             landing,
             armed: None,
@@ -1518,6 +1519,8 @@ impl Shell {
             inputs_at: 0,
             decoded_tiles: Vec::new(),
             arming: false,
+            arming_rows: Vec::new(),
+            arming_capture: (0, 0),
             armed_body: None,
             arm_cold: false,
             arm_rs: crate::record::RsBody::Folds,
@@ -1579,6 +1582,15 @@ impl Shell {
         // A capturing lane's score rows are its reader's state, a row of
         // the load's context a grain (`engine::GuestState::per_instance`).
         shell.programs.set_capture(boot.context, boot.page_size);
+        // Arming a scored class lends its fires' capture rows from a run
+        // the load holds beside its staged inputs, the widest fire's lanes'
+        // rows, counted before ready.
+        shell.arming_capture.0 = engine::load::armed::arming_capture_room(
+            !shell.scored.is_empty(),
+            shell.fire_lanes(),
+            boot.context,
+            boot.page_size,
+        );
         // A program's tables and scratch are its instances' state
         // (`Shell::guest_state`): nothing is held for them here.
         let programs = 0u64;
@@ -1780,10 +1792,11 @@ pub(crate) struct Workspace {
 impl Shell {
     /// The runs of the activation's span a fire stages into and reads out
     /// of, in the order they lie from `inputs_at`: the staged inputs' slab,
-    /// the readout rows' table, the voxel store, the rs fold predicates and
-    /// the host-resident experts' staging and the guests' samplers' lane
-    /// arenas, each to [`INPUTS_ALIGN`].
-    fn staged_runs(&self) -> [u64; 6] {
+    /// the readout rows' table, the voxel store, the rs fold predicates,
+    /// the host-resident experts' staging, the guests' samplers' lane arenas
+    /// and the run arming lends scored fires' capture rows from, each to
+    /// [`INPUTS_ALIGN`].
+    fn staged_runs(&self) -> [u64; 7] {
         [
             self.inputs.bytes(),
             self.readout_rows.bytes() as u64,
@@ -1791,6 +1804,7 @@ impl Shell {
             self.predicate.bytes(),
             self.expert_staging.bytes(),
             self.lane_arenas_bytes(),
+            self.arming_capture.0,
         ]
         .map(|bytes| bytes.next_multiple_of(INPUTS_ALIGN))
     }
@@ -1810,8 +1824,16 @@ impl Shell {
         if let Some(buffers) = &self.buffers {
             buffers.lay_scratch(&mut self.pools)?;
         }
-        let [inputs, readouts, voxels, predicates, experts, arenas] = self.staged_runs();
-        let staged = inputs + readouts + voxels + predicates + experts + arenas;
+        let [
+            inputs,
+            readouts,
+            voxels,
+            predicates,
+            experts,
+            arenas,
+            capture,
+        ] = self.staged_runs();
+        let staged = inputs + readouts + voxels + predicates + experts + arenas + capture;
         self.pools
             .hold_activation_at(self.inputs_at, staged, false)?;
         let base = self.pools.activation_base() + self.inputs_at;
@@ -1836,6 +1858,7 @@ impl Shell {
             self.programs.flight(),
             self.device.device().num_sm,
         );
+        self.arming_capture.1 = base + inputs + readouts + voxels + predicates + experts + arenas;
         let Some(workspace) = &self.workspace else {
             return Ok(());
         };

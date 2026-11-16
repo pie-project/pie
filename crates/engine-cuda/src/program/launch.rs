@@ -2148,7 +2148,8 @@ mod tests {
     /// arenas, and they hold the most blocks a launch runs.
     #[test]
     fn the_lane_arenas_hold_every_launch_s_blocks() {
-        let (stage, _) = shipped::compiled(&shipped::all(shipped::QWEN_VOCAB)[0].1, shipped::QWEN_VOCAB);
+        let (stage, _) =
+            shipped::compiled(&shipped::all(shipped::QWEN_VOCAB)[0].1, shipped::QWEN_VOCAB);
         let stage = &stage[0];
         let region = stage
             .fused

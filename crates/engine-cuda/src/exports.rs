@@ -19,8 +19,8 @@ impl Exports {
         context: u32,
         page_size: u32,
     ) -> Result<Exports> {
-        let outputs =
-            poem_exec::feeds::class_outputs(trace, compiled, context, page_size).map_err(Fault::Recipe)?;
+        let outputs = poem_exec::feeds::class_outputs(trace, compiled, context, page_size)
+            .map_err(Fault::Recipe)?;
         if outputs.is_empty() {
             return Err(Fault::Unbound {
                 what: "no output, so a fire would compute nothing a reader can take".to_string(),
@@ -169,10 +169,9 @@ pub(crate) fn landing_requests(
     landing
 }
 
-/// The classes the lattice keys and arms: those a plain request lands in,
-/// and, on a model with a drafter (an output only drafting classes write,
-/// MTP's `mtp.drafts`), those writing it that a request plain but for
-/// reading its pass's drafts lands in (the drafter's verify).
+/// The classes the lattice keys and arms (`engine::load::armed`): a plain
+/// request's, a scored one's, and, on a model with a drafter (an output only
+/// drafting classes write, MTP's `mtp.drafts`), the drafter's verify.
 #[must_use]
 pub(crate) fn plain_of(
     landing: &[Vec<poem_ir::Request>],
@@ -186,21 +185,29 @@ pub(crate) fn plain_of(
         .filter(|out| (0..landing.len()).any(|c| plain(c) && out.classes.contains(c)))
         .map(|out| out.decl.name.as_str())
         .collect();
-    let drafter = |class: usize| {
+    engine::load::armed::lattice_classes(landing, |class| {
         outputs
             .iter()
             .any(|out| out.classes.contains(class) && !plain_names.contains(out.decl.name.as_str()))
-    };
-    poem_ir::ClassSet::of((0..landing.len()).filter(|&class| {
-        plain(class) || (landing[class].iter().any(drafts_only) && drafter(class))
-    }))
+    })
 }
 
-/// Whether only its query length and its reading the pass's drafts set
-/// this request apart.
+/// The classes a drafter's verify lands in: those only a request plain but
+/// for reading the drafts lands in, of `armed`.
 #[must_use]
-pub(crate) fn drafts_only(request: &poem_ir::Request) -> bool {
-    request.drafts() && request.departures() == usize::from(request.query_len() != 1) + 1
+pub(crate) fn drafting_of(
+    landing: &[Vec<poem_ir::Request>],
+    armed: &poem_ir::ClassSet,
+) -> Vec<usize> {
+    (0..landing.len())
+        .filter(|&class| {
+            armed.contains(class)
+                && landing[class]
+                    .iter()
+                    .any(|request| engine::load::armed::drafts_only(request))
+                && !landing[class].iter().any(poem_ir::Request::plain)
+        })
+        .collect()
 }
 
 #[must_use]
