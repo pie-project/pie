@@ -81,6 +81,35 @@ pub struct Pooled<'a> {
     pub rings: &'a [engine::program::RingSlots],
     /// Where its lanes' scratch lies (`engine::InstanceBinding::scratch`).
     pub scratch: &'a engine::ScratchPlace,
+    /// Where its (program, extents) pair's state lies
+    /// (`engine::InstanceBinding::pair`): the batch tables.
+    pub pair: &'a engine::ScratchPlace,
+}
+
+/// The pieces `place` holds in the pool's `Instance` room: a run's first
+/// slot ref and bytes, or each whole chunk's first slot ref and the bytes
+/// of its slots.
+pub fn pieces_of(place: &engine::ScratchPlace, pools: &Pools) -> Result<Vec<(u32, u64)>> {
+    let slot_bytes = pools.slot_bytes(INSTANCE)?;
+    let per_chunk = pools.slots_per_chunk(INSTANCE)?;
+    match place {
+        engine::ScratchPlace::None => Ok(Vec::new()),
+        engine::ScratchPlace::Run { first, slots } => {
+            Ok(vec![(*first, u64::from(*slots) * slot_bytes)])
+        }
+        engine::ScratchPlace::Chunks(chunks) => chunks
+            .iter()
+            .map(|&chunk| {
+                let first = chunk.checked_mul(per_chunk).ok_or_else(|| {
+                    Fault::program(
+                        "program::session",
+                        format!("chunk {chunk} of a guest's room lies past a u32 slot ref"),
+                    )
+                })?;
+                Ok((first, u64::from(per_chunk) * slot_bytes))
+            })
+            .collect(),
+    }
 }
 
 #[derive(Debug)]
@@ -138,46 +167,37 @@ impl Session {
     /// view, each with the bytes it holds. The pool may have moved them
     /// since the last fire (an evacuation, an unpark), so a fire asks anew.
     pub fn scratch_at(&self, pools: &Pools) -> Result<Vec<ScratchAt>> {
-        let slot_bytes = pools.slot_bytes(INSTANCE)?;
-        let per_chunk = pools.slots_per_chunk(INSTANCE)?;
-        let at = |slot: u32, slots: u32| -> Result<ScratchAt> {
-            let (buffer, offset, _, _) = pools.slot_place(INSTANCE, slot)?;
-            Ok(ScratchAt {
-                buffer,
-                offset,
-                bytes: u64::from(slots) * slot_bytes,
-            })
-        };
-        match &self.scratch {
-            engine::ScratchPlace::None => Ok(Vec::new()),
-            engine::ScratchPlace::Run { first, slots } => Ok(vec![at(*first, *slots)?]),
-            engine::ScratchPlace::Chunks(chunks) => chunks
-                .iter()
-                .map(|&chunk| {
-                    let first = chunk.checked_mul(per_chunk).ok_or_else(|| {
-                        Fault::program(
-                            "program::session",
-                            format!("scratch chunk {chunk} lies past a u32 slot ref"),
-                        )
-                    })?;
-                    at(first, per_chunk)
+        pieces_of(&self.scratch, pools)?
+            .into_iter()
+            .map(|(first, bytes)| {
+                let (buffer, offset, _, _) = pools.slot_place(INSTANCE, first)?;
+                Ok(ScratchAt {
+                    buffer,
+                    offset,
+                    bytes,
                 })
-                .collect(),
-        }
+            })
+            .collect()
     }
 
-    /// The span bytes the batch tables of `lanes` lanes take for every
-    /// launching stage of `compiled` ([`super::launch::Batch::bytes_for`]).
+    /// The batch tables of `lanes` lanes each launching stage of
+    /// `compiled` takes, stage by stage, in the order a batch lays them
+    /// ([`super::launch::Batch::tables_for`]).
     #[must_use]
-    pub fn batch_bytes_for(compiled: &Compiled, channels: usize, lanes: u32, rows: u32) -> u64 {
+    pub fn batch_tables_for(
+        compiled: &Compiled,
+        channels: usize,
+        lanes: u32,
+        rows: u32,
+    ) -> Vec<Vec<u64>> {
         let channels = u32::try_from(channels).unwrap_or(u32::MAX);
         compiled
             .plans
             .iter()
             .enumerate()
             .filter(|(index, _)| launches(compiled, *index))
-            .map(|(_, plan)| super::launch::Batch::bytes_for(plan, channels, lanes, rows))
-            .sum()
+            .map(|(_, plan)| super::launch::Batch::tables_for(plan, channels, lanes, rows))
+            .collect()
     }
 
     /// The stages this instance carries, launching or not.

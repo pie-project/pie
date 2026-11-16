@@ -1035,9 +1035,9 @@ impl Engine for Metal {
                 &binding.instance_slots,
                 &binding.ring_slots,
                 &binding.scratch,
+                &binding.pair,
             )
             .map_err(fault)?;
-        let standing_guest_bytes = shell.standing_guest_bytes();
         let landed = adapter_of(shell, binding.program, id, &seeds, &binding.adapter_slots);
         let bound = match landed {
             Ok(bound) => bound,
@@ -1053,18 +1053,11 @@ impl Engine for Metal {
             id,
             program: binding.program,
             geometry: binding.geometry,
-            standing_guest_bytes,
+            // A guest's tables and scratch are its instance's and its
+            // pair's state in the pool (`Engine::guest_state`): nothing
+            // stands in the span.
+            standing_guest_bytes: 0,
         })
-    }
-
-    fn standing_after(&self, binding: &InstanceBinding) -> EngineResult<u64> {
-        self.loaded()?
-            .standing_after(
-                binding.program,
-                &extents(&binding.extents),
-                &binding.channels,
-            )
-            .map_err(fault)
     }
 
     fn close_instance(&mut self, id: InstanceId) -> EngineResult<u64> {
@@ -1072,7 +1065,7 @@ impl Engine for Metal {
         let shell = self.loaded_mut()?;
         shell.detach_adapter(id);
         shell.close_program_instance(id).map_err(fault)?;
-        Ok(shell.standing_guest_bytes())
+        Ok(0)
     }
 
     fn close_channel(&mut self, id: ChannelId) -> EngineResult<()> {

@@ -1836,9 +1836,7 @@ impl Shell {
                 index,
                 true,
             )?;
-            // The batches lie under the rung's carve: they move with it.
             self.rung = to;
-            self.lay_batches()?;
         }
         if to >= from {
             self.rung = to;
@@ -1853,56 +1851,13 @@ impl Shell {
     }
 
     /// The span's bytes from its end a rung of `to` tokens takes, as the
-    /// engine lays it: the model's chunks, then the guests' batch tables
-    /// standing under the carve, one ceil. A guest's value scratch is its
-    /// instance's state in the pool's `Instance` room
-    /// (`engine::GuestState`), no fire's term.
+    /// engine lays it: the model's carve, in chunks. A guest's tables and
+    /// scratch are its instance's and its pair's state in the pool's
+    /// `Instance` room (`engine::GuestState`), placed at its bind and
+    /// refused there by name: no term of the span.
     fn span_for(&self, to: u32) -> Result<u64> {
         let chunk = self.pools.layout().chunk_bytes.max(1);
-        let model = self.arena.rung_reach(to).div_ceil(chunk);
-        let standing = self.programs.batch_bytes();
-        Ok((model + standing.div_ceil(chunk)) * chunk)
-    }
-
-    /// See `Engine::standing_after`: the batch tables' bytes once an
-    /// instance of `program_id` at `extents` over `channels` is bound.
-    pub fn standing_after(
-        &self,
-        program_id: engine::ProgramId,
-        extents: &eta_exec::Extents,
-        channels: &[engine::ChannelId],
-    ) -> Result<u64> {
-        self.programs.standing_after(program_id, extents, channels)
-    }
-
-    /// The batch tables' bytes the live instances hold now: what a bind and
-    /// a close leave (`engine::BoundInstance::standing_guest_bytes`).
-    #[must_use]
-    pub fn standing_guest_bytes(&self) -> u64 {
-        self.programs.batch_bytes()
-    }
-
-    /// Lays every guest batch under the rung's widest carve, every frame
-    /// drained first: where they lie moves with the rung, and a bind or a
-    /// close that plans or drops one packs them again.
-    fn lay_batches(&mut self) -> Result<()> {
-        self.drain()?;
-        let top = self.arena.rung_guest_top(self.rung);
-        let pools = &self.pools;
-        let bottom = self
-            .programs
-            .lay_batches(self.arena.store(), top, &|at, bytes| {
-                span_host(pools, at, bytes)
-            })?;
-        // The runtime backed the tables below the carve before the bind
-        // (`engine::Engine::standing_after`), and the span covers them.
-        debug_assert!(
-            bottom >= self.arena.end() - self.pools.covered(),
-            "the guests' batch tables take {} bytes under the carve, past the {} the span backs",
-            top - bottom,
-            top.saturating_sub(self.arena.end() - self.pools.covered()),
-        );
-        Ok(())
+        Ok(self.arena.rung_reach(to).div_ceil(chunk) * chunk)
     }
 
     /// Placement heaps made for the activation span since the load: the
@@ -2668,17 +2623,15 @@ impl Shell {
         instance_slots: &[u32],
         ring_slots: &[engine::RingSlots],
         scratch: &engine::ScratchPlace,
+        pair: &engine::ScratchPlace,
     ) -> Result<engine::InstanceId> {
         let pooled = crate::program::session::Pooled {
             pools: &self.pools,
             instance: instance_slots,
             rings: ring_slots,
             scratch,
+            pair,
         };
-        #[cfg(debug_assertions)]
-        let predicted = self
-            .programs
-            .standing_after(program_id, &extents, channels)?;
         let id = self.programs.bind(
             &self.device,
             program_id,
@@ -2689,42 +2642,15 @@ impl Shell {
             channels,
             pooled,
         )?;
-        #[cfg(debug_assertions)]
-        debug_assert!(
-            self.programs.batch_bytes() <= predicted,
-            "a bind laid {} bytes of batch tables, past the {predicted} standing_after stated",
-            self.programs.batch_bytes()
-        );
-        // A pair the bind opens lays batch tables under the rung's carve:
-        // backed here, and the bind refused (`Fault::Refused`) where
-        // the system refuses the heap.
-        let backed = self
-            .span_for(self.rung)
-            .and_then(|span| self.pools.cover(span));
-        if let Err(why) = backed {
-            let _ = self.programs.close_instance(id);
-            return Err(why);
-        }
-        // A pair's first bind planned its batches: laid now, every frame
-        // drained, so no fire reads a batch where another is laid.
-        if !self.programs.batches_laid() {
-            if let Err(why) = self.lay_batches() {
-                let _ = self.programs.close_instance(id);
-                let _ = self.lay_batches();
-                return Err(why);
-            }
-        }
         if crate::diag::on().tier_trace {
-            let fire = self.programs.batch_bytes();
             eprintln!(
                 "residency: program {} bound at {extents:?}: each instance holds {} bytes of \
-                 scratch in its Instance room; the guests' batch tables take {fire} bytes \
-                 of the span; the span backs {}",
+                 scratch, its pair {} bytes of batch tables, in the Instance room",
                 program_id.0,
                 self.programs
                     .lane_scratch(program_id, &extents, &self.pools)
                     .unwrap_or(0),
-                self.pools.covered()
+                self.programs.pair_bytes(program_id, &self.pools).unwrap_or(0),
             );
         }
         Ok(id)
@@ -2744,9 +2670,9 @@ impl Shell {
 
     /// What `program_id` bound at `extents` holds as state
     /// (`Engine::guest_state`): each instance its lanes' value scratch, in
-    /// pieces of its `Instance` room (`Plane::lane_scratch`); the pair
-    /// nothing, its batch tables standing in the span
-    /// (`Engine::standing_after`). A value past a piece is refused by name.
+    /// pieces of its `Instance` room (`Plane::lane_scratch`); the pair its
+    /// lanes' batch tables (`Plane::pair_bytes`). A value or a table past a
+    /// piece is refused by name.
     pub fn guest_state(
         &self,
         program_id: engine::ProgramId,
@@ -2756,7 +2682,7 @@ impl Shell {
             per_instance: self
                 .programs
                 .lane_scratch(program_id, extents, &self.pools)?,
-            per_pair: 0,
+            per_pair: self.programs.pair_bytes(program_id, &self.pools)?,
         })
     }
 
@@ -2807,12 +2733,7 @@ impl Shell {
 
     pub fn close_program_instance(&mut self, instance_id: engine::InstanceId) -> Result<()> {
         self.fence_instances(&[instance_id])?;
-        self.programs.close_instance(instance_id)?;
-        // The last instance of a pair drops its batches: the rest packed.
-        if !self.programs.batches_laid() {
-            self.lay_batches()?;
-        }
-        Ok(())
+        self.programs.close_instance(instance_id)
     }
 
     #[must_use]
