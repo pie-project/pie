@@ -414,9 +414,12 @@ fn reading(get: &HashMap<String, String>) -> Result<bool, String> {
             "WARNING",
         )
         .map_err(|e| e.to_string())?;
+        println!("PROGRESS runtime made {:.1} s", t0.elapsed().as_secs_f64());
         rt.load();
         let loaded = t0.elapsed().as_secs_f64();
+        println!("PROGRESS loaded {loaded:.1} s");
         rt.run();
+        println!("PROGRESS running {:.1} s", t0.elapsed().as_secs_f64());
         match get.get("statics") {
             // the static arrays made elsewhere (from a checkpoint): the k-th array's words
             Some(dir) => {
@@ -451,6 +454,7 @@ fn reading(get: &HashMap<String, String>) -> Result<bool, String> {
     let (_, vs) = d.run(&mut inputs, lanes, |i, ins| {
         let step = reading.step(&trace, grid, ins);
         let entries = reading.entries(&mut host, &step)?;
+        println!("PROGRESS step {i}: entries made, launching");
         let t0 = std::time::Instant::now();
         let io0 = kept.as_ref().map(|r| r.io);
         let (got, cycles) = match kept.as_mut() {
@@ -463,6 +467,7 @@ fn reading(get: &HashMap<String, String>) -> Result<bool, String> {
             }
         };
         let wall_ms = t0.elapsed().as_secs_f64() * 1e3;
+        println!("PROGRESS step {i}: back, {cycles:?} cycles, {wall_ms:.3} ms");
         // the step's host side by kind: the entries in, the launch (the call's wall), the rows
         // and the stamps back
         let io = kept.as_ref().zip(io0).map(|(r, a)| {
