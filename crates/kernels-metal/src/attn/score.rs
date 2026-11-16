@@ -24,22 +24,24 @@ fn stamp_for(head_dim: u32) -> Option<usize> {
     STAMPS.iter().position(|stamp| head_dim <= *stamp)
 }
 
+const PAGES: &str = "attn_score_pages";
+
 /// Where a fire's capturing lanes lay their score rows: `store`, the
-/// buffer the rows lie in (bound from its start), and `rows`, each
-/// capturing lane's first element in it, by its place among the fire's
-/// capturing lanes. This window's first capturing lane is `first`; this
-/// layer's row lies `layer_at` elements past each lane's start.
+/// buffer the rows lie in (bound from its start), and `rows`, each fire
+/// lane's row's first element in it (a u64; `u64::MAX` for a lane that
+/// captures nothing). This window's first lane is `first`.
 #[derive(Clone, Copy, Debug)]
 pub struct CaptureRows {
     pub store: Tensor,
     pub rows: Tensor,
     pub first: u32,
-    pub layer_at: u64,
 }
 
-/// Each capturing request's attention mass over its first `kv_max` keys
-/// (the load's context), averaged over its last `observe` query rows, a
-/// `kv_max` run a query head, written to its own rows ([`CaptureRows`]).
+/// Each capturing request's attention mass a key of its first `kv_max`
+/// (the load's context), averaged over its last `observe` query rows and
+/// over the model's `total_heads` query heads (this launch attends its
+/// `q` heads of them), added to its row ([`CaptureRows`]); with `zero`, the
+/// row is cleared first.
 #[allow(clippy::too_many_arguments)]
 pub fn capture(
     ctx: &Ctx<'_>,
@@ -51,6 +53,8 @@ pub fn capture(
     sm_scale: f32,
     observe: u32,
     kv_max: u32,
+    total_heads: u32,
+    zero: bool,
     requests: u32,
     rows: CaptureRows,
 ) -> Result<(), Error> {
@@ -137,7 +141,16 @@ pub fn capture(
              nothing; the caller states the width it wants, and zero is not one",
         ));
     }
-    nonzero(OP, "the per-head kv ceiling", kv_max)?;
+    nonzero(OP, "the keys a row holds", kv_max)?;
+    if total_heads < num_q_heads {
+        return Err(refuse(
+            OP,
+            format!(
+                "this launch attends {num_q_heads} query heads of a model stated to have \
+                 {total_heads}"
+            ),
+        ));
+    }
     nonzero(OP, "the requests this capture answers", requests)?;
     let page_size = u32::try_from(pool.page_size)
         .ok()
@@ -166,7 +179,7 @@ pub fn capture(
     })?;
 
     ctx.fire(
-        Fire::at(FILE, CAPTURE[at]).apply(Grid::of([lanes, num_q_heads, 1], [THREADS, 1, 1])),
+        Fire::at(FILE, CAPTURE[at]).apply(Grid::of([lanes, 1, 1], [THREADS, 1, 1])),
         &[
             q.data.arg(),
             q.indptr.arg(),
@@ -188,7 +201,58 @@ pub fn capture(
             crate::tensor::PLANE_AT_BINDING.arg(),
             rows.rows.arg(),
             rows.first.arg(),
-            rows.layer_at.arg(),
+            stated(OP, total_heads)?.arg(),
+            u32::from(zero).arg(),
+        ],
+    )
+}
+
+/// Each capturing request's key row (`keys`' starts, `keys_len` keys)
+/// summed a page of `page_size` into its page row (`pages`' starts, the
+/// pages the keys come to), for `requests` requests from the window's
+/// first.
+#[allow(clippy::too_many_arguments)]
+pub fn pages(
+    ctx: &Ctx<'_>,
+    store: Tensor,
+    keys: Tensor,
+    pages: Tensor,
+    first: u32,
+    keys_len: u32,
+    page_size: u32,
+    requests: u32,
+) -> Result<(), Error> {
+    const OP: &str = "attn.score_pages";
+    if store.dtype != Dtype::F32 || keys.dtype != Dtype::U64 || pages.dtype != Dtype::U64 {
+        return Err(refuse(
+            OP,
+            "the rows are f32 and each row's start a u64 element offset",
+        ));
+    }
+    nonzero(OP, "the keys a row holds", keys_len)?;
+    nonzero(OP, "the keys a page holds", page_size)?;
+    nonzero(OP, "the requests this sum answers", requests)?;
+    let page_count = keys_len.div_ceil(page_size);
+    if keys.rows < first.saturating_add(requests) || pages.rows < first.saturating_add(requests) {
+        return Err(refuse(
+            OP,
+            format!(
+                "the row tables hold {} and {} capturing lanes, and this window's {requests} \
+                 start at {first}",
+                keys.rows, pages.rows
+            ),
+        ));
+    }
+    ctx.fire(
+        Fire::at(FILE, PAGES).apply(Grid::of([page_count, requests, 1], [64.min(page_count), 1, 1])),
+        &[
+            store.arg_mut(),
+            keys.arg(),
+            pages.arg(),
+            first.arg(),
+            keys_len.arg(),
+            page_size.arg(),
+            page_count.arg(),
         ],
     )
 }
@@ -219,7 +283,6 @@ mod tests {
             store: Tensor::new(4, 1, 1, Dtype::F32),
             rows: Tensor::new(10, lanes, 1, Dtype::U64),
             first: 0,
-            layer_at: 0,
         }
     }
 
@@ -271,6 +334,8 @@ mod tests {
             0.125,
             observe,
             KV_MAX,
+            16,
+            true,
             2,
             scores,
         )

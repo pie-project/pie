@@ -321,6 +321,9 @@ pub struct Shell {
     outputs: Vec<poem_exec::feeds::ClassOutput>,
     /// Each voxel output's walk from the port grid to its own.
     grid_chains: Vec<Option<Vec<poem_ir::GridRule>>>,
+    /// Where a capturing lane's score rows lie ([`CaptureLayout`]), when the
+    /// trace reads scores out.
+    capture: Option<CaptureLayout>,
     arms: Arms,
     airborne: Airborne,
     inflight: VecDeque<Flight>,
@@ -1528,6 +1531,15 @@ impl PreparedLoad<'_> {
                 }
             })
         });
+        let capture = CaptureLayout::of(
+            &device,
+            &outputs,
+            boot.context,
+            page_size,
+            boot.budget.max_lanes,
+            arms,
+        )?;
+        let capture_bytes = capture.as_ref().map_or(0, CaptureLayout::member_bytes);
         let shell = Shell {
             weighed,
             tuning,
@@ -1557,6 +1569,7 @@ impl PreparedLoad<'_> {
             inputs,
             readout,
             readout_row_bytes,
+            capture,
             outputs,
             grid_chains,
             arms: Arms::of(arms),
@@ -1588,6 +1601,7 @@ impl PreparedLoad<'_> {
             programs: {
                 let mut plane = crate::program::Plane::new();
                 plane.set_flight(boot.budget.max_lanes, arms, boot.budget.readouts_per_lane);
+                plane.set_capture(capture_bytes);
                 plane
             },
         };
@@ -3359,8 +3373,31 @@ impl Shell {
                     {
                         continue;
                     }
-                    let (offset, width, dtype, stride) =
-                        self.output_seat(prepared, out, at, fire_lane, &row_of)?;
+                    let (offset, width, dtype, stride) = match decl.name.as_str() {
+                        // A capturing lane's rows lie where its fire laid
+                        // them in the guest region, not in the arena.
+                        name @ ("attn.scores" | "attn.scores.pages") => {
+                            let (_, keys_at, pages_at) = prepared
+                                .capture_rows
+                                .0
+                                .iter()
+                                .find(|(source, ..)| *source as usize == at)
+                                .copied()
+                                .ok_or_else(|| Fault::Program {
+                                    at: "serve::stage",
+                                    why: format!(
+                                        "lane {at} reads `{name}`, and its fire laid it no score row"
+                                    ),
+                                })?;
+                            let (offset, width) = if name == "attn.scores" {
+                                (keys_at, decl.width)
+                            } else {
+                                (pages_at, decl.width)
+                            };
+                            (offset, width, eta_ir::Dtype::F32, width)
+                        }
+                        _ => self.output_seat(prepared, out, at, fire_lane, &row_of)?,
+                    };
                     let name = self.outputs[out].decl.name.clone();
                     self.programs.bind_output(
                         attached.instance,
@@ -4896,6 +4933,10 @@ impl Shell {
             });
         }
         let patch_seats = bound.patches;
+        // The capturing lanes' score rows, laid in the guest region before
+        // any program stage takes its scratch there.
+        let mut guest = self.guest_carve();
+        let (capture_seat, capture_rows) = self.lay_capture(&composition, &mut guest, arm)?;
         let bindings = FireBindings {
             tokens: bound.tokens,
             positions: bound.positions,
@@ -4957,6 +4998,7 @@ impl Shell {
             },
             rs_snaps: bound.rs_snaps,
             rs_snap_bands: bound.rs_snap_bands.clone(),
+            capture: capture_seat,
             rs: if rs_active {
                 let (Some(layout), Some(buffers)) = (&self.rs_layout, &self.rs_buffers) else {
                     return Err(Fault::Unbound {
@@ -4986,6 +5028,7 @@ impl Shell {
         };
 
         Ok(Prepared {
+            capture_rows,
             ends,
             lanes,
             input_feeds,
@@ -5006,6 +5049,71 @@ impl Shell {
             bindings,
             demand,
         })
+    }
+
+    /// Each capturing lane of `composition`, in lane order, given its key
+    /// row and page row from `guest`, and the arm's tables of every lane's
+    /// row starts written for the fire's score kernels.
+    fn lay_capture(
+        &mut self,
+        composition: &Composition,
+        guest: &mut crate::program::GuestCarve,
+        arm: usize,
+    ) -> Result<(Option<crate::run::CaptureSeat>, CaptureRows)> {
+        let Some(layout) = self.capture.as_mut() else {
+            return Ok((None, CaptureRows::default()));
+        };
+        let lanes = composition.lanes();
+        let (key_bytes, page_bytes) = capture_row_bytes(layout.keys, layout.pages);
+        let mut keys_at = vec![u64::MAX; lanes.len().max(1)];
+        let mut pages_at = vec![u64::MAX; lanes.len().max(1)];
+        let mut rows = Vec::new();
+        for (at, row) in lanes.iter().enumerate() {
+            if !layout.classes.contains(row.class as usize) {
+                continue;
+            }
+            let taken = guest.take(key_bytes + page_bytes)?;
+            keys_at[at] = taken.offset / 4;
+            pages_at[at] = (taken.offset + key_bytes) / 4;
+            rows.push((row.source, taken.offset, taken.offset + key_bytes));
+        }
+        if rows.is_empty() {
+            return Ok((None, CaptureRows::default()));
+        }
+        let count = layout.tables.len();
+        let (keys_table, pages_table) = &mut layout.tables[arm % count];
+        let words = |offsets: &[u64]| -> Vec<u8> {
+            offsets.iter().flat_map(|offset| offset.to_le_bytes()).collect()
+        };
+        keys_table.write(0, &words(&keys_at))?;
+        pages_table.write(0, &words(&pages_at))?;
+        let table_bytes = keys_at.len() as u64 * 8;
+        let lanes_u32 = u32::try_from(keys_at.len()).unwrap_or(u32::MAX);
+        let store = self.arena.store();
+        let seat = crate::run::CaptureSeat {
+            store: kernels_metal::Tensor::new(
+                self.handles.bind(store, 0, store.bytes())?,
+                1,
+                1,
+                Dtype::F32,
+            ),
+            keys_at: kernels_metal::Tensor::new(
+                self.handles.bind(keys_table, 0, table_bytes)?,
+                lanes_u32,
+                1,
+                Dtype::U64,
+            ),
+            pages_at: kernels_metal::Tensor::new(
+                self.handles.bind(pages_table, 0, table_bytes)?,
+                lanes_u32,
+                1,
+                Dtype::U64,
+            ),
+            keys: layout.keys,
+            pages: layout.pages,
+            page_size: layout.page_size,
+        };
+        Ok((Some(seat), CaptureRows(rows)))
     }
 
     fn feed_inputs(&self, frame: &mut Frame, p: &Prepared<'_>) -> Result<()> {
@@ -5246,7 +5354,78 @@ pub struct Clips<'a> {
     pub payload: &'a [u8],
 }
 
+/// A load's capturing lanes' score rows ([`poem_ir::Dim::Capturing`]):
+/// each one's key row (`keys` f32s, the load's context) and page row
+/// (`pages` f32s), laid together in the guest region of the fire it
+/// captures in, the term of its reading program's members
+/// ([`crate::program::Plane::fire_facts`]). `classes` are the classes that
+/// compute them: a lane of one captures. Each arm keeps the two tables of
+/// its fire's lanes' row starts the kernels read, one u64 a lane.
+pub struct CaptureLayout {
+    keys: u32,
+    pages: u32,
+    page_size: u32,
+    classes: poem_ir::ClassSet,
+    tables: Vec<(crate::device::Buffer, crate::device::Buffer)>,
+}
+
+/// What a capturing lane's rows take of a guest region: its key row and its
+/// page row, each at a binding's alignment.
+fn capture_row_bytes(keys: u32, pages: u32) -> (u64, u64) {
+    let at = |floats: u32| (u64::from(floats) * 4).next_multiple_of(256);
+    (at(keys), at(pages))
+}
+
+impl CaptureLayout {
+    fn of(
+        device: &Context,
+        outputs: &[poem_exec::feeds::ClassOutput],
+        context: u32,
+        page_size: u32,
+        lanes: u32,
+        arms: usize,
+    ) -> Result<Option<CaptureLayout>> {
+        let mut classes = poem_ir::ClassSet::default();
+        for out in outputs
+            .iter()
+            .filter(|out| matches!(out.decl.name.as_str(), "attn.scores" | "attn.scores.pages"))
+        {
+            for class in out.classes.iter() {
+                classes.insert(class);
+            }
+        }
+        if classes.is_empty() {
+            return Ok(None);
+        }
+        let bytes = u64::from(lanes.max(1)) * 8;
+        let tables = (0..arms.max(1))
+            .map(|_| Ok((Buffer::zeroed(device, bytes)?, Buffer::zeroed(device, bytes)?)))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(CaptureLayout {
+            keys: context,
+            pages: context.div_ceil(page_size.max(1)),
+            page_size: page_size.max(1),
+            classes,
+            tables,
+        }))
+    }
+
+    /// What a capturing lane's rows take of a guest region, together.
+    #[must_use]
+    pub fn member_bytes(&self) -> u64 {
+        let (keys, pages) = capture_row_bytes(self.keys, self.pages);
+        keys + pages
+    }
+}
+
+/// A fire's capturing lanes' rows: each source lane's key row and page row,
+/// byte offsets in the span's buffer.
+#[derive(Clone, Debug, Default)]
+pub struct CaptureRows(Vec<(u32, u64, u64)>);
+
 pub struct Prepared<'a> {
+    /// Where this fire's capturing lanes' score rows lie.
+    capture_rows: CaptureRows,
     /// What the fire reports where it settles: each port-placed reporting
     /// lane's written end.
     ends: Vec<engine::KvWrites>,
