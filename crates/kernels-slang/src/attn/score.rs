@@ -6,10 +6,12 @@
 //! once, the final row summed a kv page.
 //!
 //! A fire's capturing lanes are compacted ([`TABLE_INTS`] a lane, in lane
-//! order): row `c` of the rows is the `c`th capturing lane's. Two passes a
-//! layer: the normalisers of each (lane, head, observed row), into a scratch
-//! of [`stats_floats`]; then the mass, a thread a key, every head and
-//! observed row summed in the thread, so no per-head row is laid.
+//! order), each lane's rows addressed through the bases its entry states.
+//! Every head and observed row is summed inside the dispatch, so no
+//! per-head row is laid, and in one order a key, so a run reproduces. Two
+//! dispatches a layer, wide over the keys: the normalisers of each (lane,
+//! head, observed row) into a scratch of [`stats_floats`], then the mass, a
+//! thread a key.
 #![allow(clippy::too_many_arguments)]
 
 use dtype::Dtype;
@@ -39,9 +41,11 @@ const MASS: [&str; 3] = [
 const PAGES: &str = "attn_score_pages";
 
 /// The ints a capturing lane's entry of the capture table holds: the fire
-/// lane, its first and end query row in the fire, and its page row (-1
-/// where its program reads no pages).
-pub const TABLE_INTS: u32 = 4;
+/// lane, its first and end query row in the fire, and the f32 its key row
+/// starts at in the key rows and its page row in the page rows (-1 where
+/// its program reads no pages). A lane's rows are addressed through those
+/// two bases alone.
+pub const TABLE_INTS: u32 = 5;
 
 /// The f32s the normalisers of `capturing` lanes take, `heads` query heads
 /// of this rank each and `observe` rows a head: a maximum and an inverse
@@ -162,10 +166,10 @@ pub fn capture(
             ),
         ));
     };
-    if !head_dim.is_multiple_of(2) {
+    if !head_dim.is_multiple_of(16) {
         return Err(refuse(
             OP,
-            format!("the {head_dim}-wide head is read a bf16 pair at a time, and is odd"),
+            format!("the {head_dim}-wide head is read eight bf16 pairs at a time, and is no multiple of 16"),
         ));
     }
     let heads = super::row_heads(OP, q.width, head_dim)?;
@@ -217,14 +221,6 @@ pub fn capture(
             ),
         ));
     }
-    let need = stats_floats(at.capturing, heads, observe);
-    let have = u64::from(at.stats.rows) * u64::from(at.stats.width);
-    if have < need {
-        return Err(refuse(
-            OP,
-            format!("the normalisers take {need} f32, and the scratch holds {have}"),
-        ));
-    }
     let tiles = context.div_ceil(THREADS);
     let launches = |what: &str, groups: u64| {
         u32::try_from(groups).map_err(|_| {
@@ -257,24 +253,42 @@ pub fn capture(
         pool.page_indptr.arg(),
         at.positions.arg(),
     ];
+    let need = stats_floats(at.capturing, heads, observe);
+    let have = u64::from(at.stats.rows) * u64::from(at.stats.width);
+    if have < need {
+        return Err(refuse(
+            OP,
+            format!("the normalisers take {need} f32, and the scratch holds {have}"),
+        ));
+    }
+    wide_capture(ctx, at, pool, stamp, heads, norm_x, mass_x, &reads, &scalars(into)?)
+}
+
+/// The two dispatches of a layer's capture.
+#[allow(clippy::too_many_arguments)]
+fn wide_capture(
+    ctx: &Ctx<'_>,
+    at: &Capture,
+    pool: &KvPool,
+    stamp: usize,
+    heads: u32,
+    norm_x: u32,
+    mass_x: u32,
+    reads: &[ArgValue],
+    scalars: &[ArgValue],
+) -> Result<(), Error> {
     ctx.fire(
         Fire::at(SCORE, NORM[stamp]).apply(Grid::of([norm_x, heads, 1], [THREADS, 1, 1])),
-        &[
-            &reads[..],
-            &[at.stats.arg_mut()],
-            &pool.pool.args(false),
-            &scalars(into)?,
-        ]
-        .concat(),
+        &[reads, &[at.stats.arg_mut()], &pool.pool.args(false), scalars].concat(),
     )?;
     ctx.fire(
         Fire::at(SCORE, MASS[stamp])
             .apply(Grid::of([mass_x, at.capturing, 1], [THREADS, 1, 1])),
         &[
-            &reads[..],
+            reads,
             &[at.stats.arg(), at.scores.arg_mut()],
             &pool.pool.args(false),
-            &scalars(into)?,
+            scalars,
         ]
         .concat(),
     )

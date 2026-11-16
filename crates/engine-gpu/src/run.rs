@@ -94,19 +94,24 @@ impl Scored {
 
     /// The capture table a fire stages for its kernels
     /// (`kernels_slang::attn::score::TABLE_INTS` a capturing lane): each
-    /// capturing lane's fire lane, its first and end query row by
-    /// `indptr` (the fire's), and its page row or -1.
+    /// capturing lane's fire lane, its first and end query row by `indptr`
+    /// (the fire's), and the base of its key row and of its page row (or
+    /// -1), in f32s from the start of the rows the fire binds: `keys` and
+    /// `pages` f32s a row, its row among them.
     #[must_use]
-    pub fn table(&self, indptr: &[i32]) -> Vec<i32> {
+    pub fn table(&self, indptr: &[i32], keys: u32, pages: u32) -> Vec<i32> {
         let at = |lane: u32| indptr.get(lane as usize).copied().unwrap_or(0);
+        let int = |n: u64| i32::try_from(n).unwrap_or(i32::MAX);
         self.capturing
             .iter()
-            .flat_map(|&(lane, page)| {
+            .enumerate()
+            .flat_map(|(row, &(lane, page))| {
                 [
-                    i32::try_from(lane).unwrap_or(i32::MAX),
+                    int(u64::from(lane)),
                     at(lane),
                     at(lane + 1),
-                    page.map_or(-1, |page| i32::try_from(page).unwrap_or(i32::MAX)),
+                    int(row as u64 * u64::from(keys)),
+                    page.map_or(-1, |page| int(u64::from(page) * u64::from(pages))),
                 ]
             })
             .collect()
@@ -1219,11 +1224,11 @@ mod tests {
             [1, 2, 4].map(|lane| scored.page_row(lane)),
             [Some(0), None, Some(1)]
         );
-        let indptr = [0, 5, 6, 7, 9, 10];
+        let indptr = [0, 5, 6, 7, 9, 11];
         assert_eq!(
-            scored.table(&indptr),
-            [1, 5, 6, 0, 2, 6, 7, -1, 4, 9, 10, 1],
-            "lane, its rows, its page row"
+            scored.table(&indptr, 100, 7),
+            [1, 5, 6, 0, 0, 2, 6, 7, 100, -1, 4, 9, 11, 200, 7],
+            "lane, its rows, its key row's base and its page row's"
         );
     }
 
@@ -1234,6 +1239,6 @@ mod tests {
         let scored = Scored::of([(false, false); 3]);
         assert_eq!(scored, Scored::default());
         assert_eq!((scored.rows(), scored.page_rows()), (0, 0));
-        assert!(scored.table(&[0, 1, 2, 3]).is_empty());
+        assert!(scored.table(&[0, 1, 2, 3], 8, 1).is_empty());
     }
 }
