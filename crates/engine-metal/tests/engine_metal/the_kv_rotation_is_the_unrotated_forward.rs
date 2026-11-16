@@ -240,7 +240,6 @@ pub(crate) fn try_load(dir: &Path, w: Dtype, rotate: bool) -> Result<Shell, Stri
         profiles: None,
         top: engine_metal::Top::EveryRung,
     })
-    .and_then(|mut shell| shell.raise_whole().map(|()| shell))
     .map_err(|e| e.to_string())
 }
 

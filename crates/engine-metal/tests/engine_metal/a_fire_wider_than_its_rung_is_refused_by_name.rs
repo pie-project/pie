@@ -68,12 +68,12 @@ fn a_fire_wider_than_its_rung_is_refused_by_name() {
         never.rung_tokens()
     );
     never.open(0).expect("slot 0 opens");
-    never.set_rung(0, 4).expect("the 4-token rung");
+    never.set_rung(u32::MAX, 4).expect("the rung lowers to 4 tokens");
     let want = argmax(&fire(&mut never, &fixture, &prompt, 0).expect("the fire lands")[0]);
 
     let mut shell = load(&fixture);
     shell.open(0).expect("slot 0 opens");
-    shell.set_rung(0, 4).expect("the 4-token rung");
+    shell.set_rung(u32::MAX, 4).expect("the rung lowers to 4 tokens");
     let refused = fire(&mut shell, &fixture, &wide, 0).expect_err("a 100-token fire at rung 4");
     assert!(
         refused.to_string().contains("is wider than the rung the runtime raised to"),

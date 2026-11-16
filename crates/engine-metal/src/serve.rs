@@ -1454,11 +1454,11 @@ impl PreparedLoad<'_> {
         }
         // The span is mapped untouched; the kernel scratch plane is the one
         // part a kernel reads before it writes.
-        // The smallest rung's fire is backed from the load, so a raise the
-        // system refuses always has a rung in hand to cut back to.
-        pools.cover(arena.floor_reach())?;
-        // Every rung's staged regions laid in the span; the floor's hosted,
-        // where frames stage until the runtime raises.
+        // The largest rung's fire is backed from the load: the shell stands
+        // at it from ready, as the runtime's pool starts.
+        pools.cover(arena.top_reach())?;
+        // Every rung's staged regions laid in the span; the largest's
+        // hosted, where frames stage until the runtime lowers.
         for (index, (inputs, readout)) in inputs.iter_mut().zip(&mut readout).enumerate() {
             for (arm, (inputs, readout)) in inputs.iter_mut().zip(readout.iter_mut()).enumerate() {
                 let ((inputs_at, _), (readout_at, _)) = arena.regions(index, arm as u64);
@@ -1550,10 +1550,10 @@ impl PreparedLoad<'_> {
             budgets,
             ane,
             weights,
-            rung: arena.floor_tokens(),
+            rung: arena.top_tokens(),
             warming: false,
             frozen_ahead: std::collections::HashMap::new(),
-            batch_bottom: arena.rung_guest_top(arena.floor_tokens()),
+            batch_bottom: arena.rung_guest_top(arena.top_tokens()),
             arena,
             pools,
             rs_layout,
@@ -1604,7 +1604,7 @@ impl PreparedLoad<'_> {
                 "metal: the widest rung's recurrent scratch"
             );
         }
-        // The span is backed whole, yet the shell stands at the smallest rung
+        // The span is backed whole, and the shell stands at the largest rung
         // as the runtime's pool starts it: the runtime still tells every rung
         // change (`tells_rungs`), so a guest fire runs at the
         // widest rung whose carve and term fit the span. A change then moves
@@ -1939,13 +1939,6 @@ impl Shell {
     #[must_use]
     pub fn span_heaps_made(&self) -> u64 {
         self.pools.span_heaps_made()
-    }
-
-    /// Raises the rung to the widest, backing its carve: what a caller that
-    /// fires this shell itself, with no runtime raising the rung, asks
-    /// first (tuning, the tests).
-    pub fn raise_whole(&mut self) -> Result<()> {
-        self.set_rung(0, u32::MAX)
     }
 
     /// See `Engine::release_span`: every frame drains first.
