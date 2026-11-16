@@ -363,16 +363,59 @@ impl Shell {
             .copy_tier_slots(self.device.stream(), swap, shape, from, to, pairs)
     }
 
-    /// Copies whole slots and token runs of a kv shape (`windowed`: the windowed
-    /// rows') within the state pool.
+    /// Copies whole slots `(src, dst)` and token runs of a list shape (the
+    /// kv list, the first window list or the rs list) within the state pool.
     pub fn copy_token_slots(
         &mut self,
-        windowed: bool,
+        shape: engine::chunk::ShapeId,
+        pairs: &[[u32; 2]],
         runs: &[engine::transfer::KvRun],
     ) -> crate::Result<()> {
-        self.pools.fence_all_swaps(self.device.stream())?;
-        let (list, windowed): (&[_], &[_]) = if windowed { (&[], runs) } else { (runs, &[]) };
-        self.pools.copy_kv(self.device.stream(), list, windowed)
+        use crate::store::layout::{LIST, RS, WINDOW};
+        let stream = self.device.stream();
+        if shape == RS {
+            self.pools.copy_whole_slots(stream, shape, pairs)?;
+            return self.pools.copy_rs_runs(stream, runs);
+        }
+        if shape != LIST && shape != WINDOW {
+            return Err(crate::Fault::program(
+                "store::chunks",
+                format!("token runs of shape {shape}, whose slots are copied whole"),
+            ));
+        }
+        let page = self.paging().page_size;
+        let runs: Vec<engine::transfer::KvRun> = pairs
+            .iter()
+            .map(|&[src, dst]| engine::transfer::KvRun {
+                src_page: src,
+                src_token: 0,
+                dst_page: dst,
+                dst_token: 0,
+                tokens: page,
+            })
+            .chain(runs.iter().copied())
+            .collect();
+        self.pools.fence_all_swaps(stream)?;
+        let (list, windowed): (&[_], &[_]) = if shape == WINDOW {
+            (&[], &runs)
+        } else {
+            (&runs, &[])
+        };
+        self.pools.copy_kv(stream, list, windowed)
+    }
+
+    /// The rs list as the load lays it: the tokens a slot holds, and each
+    /// rs row's `(offset, bytes a token)` in a slot.
+    #[must_use]
+    pub fn rs_layout(&self) -> Option<(u32, Vec<(u64, u64)>)> {
+        self.pools.rs_layout()
+    }
+
+    /// The address of `bytes` at `offset` of rs list slot `slot`, seated
+    /// and backed first.
+    pub fn rs_span(&mut self, slot: u32, offset: u64, bytes: u64) -> crate::Result<u64> {
+        self.pools.seat_rs(&[slot])?;
+        self.pools.rs_span(slot, offset, bytes)
     }
 
     /// The pool's bytes with memory behind them now, and the most that ever
