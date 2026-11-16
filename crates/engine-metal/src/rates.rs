@@ -359,10 +359,10 @@ pub fn measure(
     // rotations of the widest matmul over its planes.
     {
         let (m, n, k) = engine::rates::WARM_SHAPE;
-        let noise = bf16_noise((n * k) as usize, 5, 0.05);
+        let plane = operand(&bench.pattern, (n * k) as usize * 2);
         let weights = (0..engine::rates::weights_at(n, k))
             .map(|_| {
-                let w = bench.buffer(&noise)?;
+                let w = bench.buffer(&plane)?;
                 Ok((bench.tensor(&w, n, k, Dtype::Bf16)?, w))
             })
             .collect::<Result<Vec<(Tensor, Buffer)>, String>>()?;
