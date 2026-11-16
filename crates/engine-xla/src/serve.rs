@@ -910,7 +910,8 @@ impl Shell {
                 rows = spec.rows,
                 width = spec.width,
                 layers = spec.layers,
-                mib = (readout_depth as u64 * u64::from(spec.rows) * u64::from(spec.width) * 4) >> 20,
+                mib = (readout_depth as u64 * u64::from(spec.rows) * u64::from(spec.width) * 4)
+                    >> 20,
                 "xla readout ring laid"
             );
         }
