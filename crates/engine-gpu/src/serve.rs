@@ -395,6 +395,9 @@ pub struct Seated<'a, B: Serve> {
     pub pages: &'a [u32],
 
     pub held: Option<u32>,
+    /// The set's committed boundary (`KvDelta::folded`): the lane's mask
+    /// speaks of the keys from it on.
+    pub folded: u32,
     pub kv_less: bool,
 
     pub mask: Option<&'a Masking>,
@@ -455,6 +458,7 @@ impl<'a, B: Serve> Seated<'a, B> {
             lane,
             pages: &[],
             held: None,
+            folded: 0,
             kv_less: false,
             mask: None,
             adapter: None,
@@ -2926,6 +2930,9 @@ impl<B: Serve> Shell<B> {
         let mut tokens: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut positions: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut rotations: Vec<i32> = Vec::with_capacity(rows as usize);
+        // Each row's stated position, the mrope table's fill where a row
+        // carries no stream of its own.
+        let mut stated_rows: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut slot_ids: Vec<i32> = Vec::with_capacity(lanes.len());
 
         let mut request_of_token: Vec<i32> = Vec::with_capacity(rows as usize);
@@ -3143,6 +3150,7 @@ impl<B: Serve> Shell<B> {
             masks.push(crate::mask::LaneMask {
                 mask: masking,
                 have,
+                folded: seated.folded.min(have),
                 rows: row.rows,
             });
 
@@ -3265,10 +3273,12 @@ impl<B: Serve> Shell<B> {
                             .positions
                             .get(at)
                             .map_or(row, |&p| narrow(u64::from(p)));
-                        // With mrope the rotation rides its own table, and the
-                        // plain one is the causal bound: a KV row.
-                        positions.push(if self.states_mrope { row } else { stated });
-                        rotations.push(stated);
+                        // The causal bound is the row order, the cache row; a
+                        // stated position rotates the row and bounds nothing.
+                        // With mrope the rotation rides its own table.
+                        positions.push(row);
+                        rotations.push(if self.states_mrope { row } else { stated });
+                        stated_rows.push(stated);
                         request_of_token.push(at_lane);
                         slot_of_row.extend_from_slice(&state);
                     }
@@ -3417,6 +3427,7 @@ impl<B: Serve> Shell<B> {
                 enabled: self.copies && masks.iter().all(|lane| lane.mask.is_none()),
                 page_tables: &geometries,
                 positions: &positions,
+                rotations: &rotations,
                 request_of_token: &request_of_token,
             },
             &[],
@@ -3499,7 +3510,7 @@ impl<B: Serve> Shell<B> {
                     }
                     None => {
                         for i in 0..row.rows as usize {
-                            let p = rotations[row.row_offset as usize + i];
+                            let p = stated_rows[row.row_offset as usize + i];
                             mrope_positions[at + 3 * i] = p;
                             mrope_positions[at + 3 * i + 1] = p;
                             mrope_positions[at + 3 * i + 2] = p;
@@ -3627,6 +3638,7 @@ impl<B: Serve> Shell<B> {
             &crate::inputs::Fire {
                 tokens: &tokens,
                 positions: &positions,
+                rotations: &rotations,
                 readout_rows: &readout_rows,
                 windows: &boundaries,
                 slot_ids: &slot_ids,
@@ -3781,6 +3793,7 @@ impl<B: Serve> Shell<B> {
             group_masks,
             tokens: bound.tokens,
             positions: bound.positions,
+            rotations: bound.rotations,
             readout_rows: bound.readout_rows,
 
             adapter_routes: bound.adapter_routes,

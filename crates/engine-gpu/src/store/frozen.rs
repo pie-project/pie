@@ -77,6 +77,13 @@ impl LaneFold {
             });
         };
         let from = held.map_or(*folded, |held| held.max(*folded));
+        // The mask's columns start at the stated boundary (`KvDelta::folded`,
+        // the verb's `folded`); replayed from `from`, the columns between are
+        // committed slots now.
+        let shifted = mask
+            .filter(|_| from > *folded)
+            .map(|mask| after(mask, u64::from(from - *folded)));
+        let mask = shifted.as_ref().or(mask);
         let plan = LanePlan::of(
             &RsVerb::Buffer {
                 pages: pages.clone(),
@@ -104,6 +111,14 @@ impl LaneFold {
             fold: Some(self.plan.froze),
             ..engine::KvWrites::default()
         })
+    }
+}
+
+/// `masking` without its first `columns` columns.
+fn after(masking: &Masking, columns: u64) -> Masking {
+    match masking {
+        Masking::Extent(mask) => Masking::Extent(mask.after(columns)),
+        Masking::Rows(masks) => Masking::Rows(masks.iter().map(|m| m.after(columns)).collect()),
     }
 }
 
@@ -223,7 +238,7 @@ mod tests {
     use super::{
         DeviceFold, Frozen, LaneFold, Tier, counted_on_device, lane_report, merged, reads_count,
     };
-    use engine::fire::{FoldLen, RsVerb};
+    use engine::fire::{FoldLen, Lineage, Mask, Masking, RsVerb};
 
     fn buffer(folded: u32, fold: FoldLen) -> RsVerb {
         RsVerb::Buffer {
@@ -231,7 +246,7 @@ mod tests {
             base: 0,
             folded,
             fold,
-            lineage: engine::fire::Lineage::Set,
+            lineage: Lineage::Set,
         }
     }
 
@@ -317,6 +332,34 @@ mod tests {
         assert_eq!((host.plan.replay, host.left), (1, Some(4)));
         let caught = LaneFold::of(&buffer(4, FoldLen::Host(1)), 2, 6, None, None, Some(4)).unwrap();
         assert_eq!(caught.left, None);
+    }
+
+    /// A record replayed from past its stated boundary reads its mask from
+    /// that boundary still: the columns between are committed slots now, no
+    /// bit of them read. A lane sharing its set replays the buffered slots
+    /// its mask admits (`Lineage::Admitted`), counted from the boundary.
+    #[test]
+    fn a_replay_past_the_stated_boundary_reads_the_mask_from_it() {
+        let replay = |runs: Vec<u32>| {
+            let mask = Masking::Extent(Mask::new(runs, 6));
+            // Stated 0 frozen, the record at 3, 2 rows at 4: slot 3 is the
+            // one buffered slot it replays.
+            let verb = RsVerb::Buffer {
+                pages: vec![0],
+                base: 0,
+                folded: 0,
+                fold: FoldLen::Device,
+                lineage: Lineage::Admitted,
+            };
+            LaneFold::of(&verb, 2, 4, Some(&mask), Some(0), Some(3))
+                .expect("the lane plans")
+                .plan
+                .replay
+        };
+        // Columns 0 and 2 hidden: slots committed past the record's own fold.
+        assert_eq!(replay(vec![1, 1, 1, 3]), 1, "slot 3 is replayed");
+        // Column 3 hidden: slot 3, which the lane's lineage leaves out.
+        assert_eq!(replay(vec![0, 3, 1, 2]), 0, "slot 3 is not its ancestry");
     }
 
     /// A record stands where the last fold that went to the device left

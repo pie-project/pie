@@ -39,6 +39,10 @@ pub struct Gathered {
 
     pub positions: Tensor,
 
+    pub rotations_host: Vec<i32>,
+
+    pub rotations: Tensor,
+
     pub request_of_token_host: Vec<i32>,
 
     pub request_of_token: Tensor,
@@ -75,6 +79,8 @@ pub struct Copies<'a> {
 
     pub positions: &'a [i32],
 
+    pub rotations: &'a [i32],
+
     pub request_of_token: &'a [i32],
 }
 
@@ -86,6 +92,7 @@ impl Copies<'_> {
             enabled: false,
             page_tables: &[],
             positions: &[],
+            rotations: &[],
             request_of_token: &[],
         }
     }
@@ -153,6 +160,7 @@ fn gather_of(runs: &[MaskSpan], indptr_host: &[i32], copies: Copies<'_>) -> Wind
             .collect()
     };
     let positions_host = relay(copies.positions);
+    let rotations_host = relay(copies.rotations);
     let request_of_token_host = relay(copies.request_of_token);
 
     let page_tables = copies
@@ -200,6 +208,8 @@ fn gather_of(runs: &[MaskSpan], indptr_host: &[i32], copies: Copies<'_>) -> Wind
             rows_host,
             positions: Tensor::new(NIL, 0, 1, Dtype::I32),
             positions_host,
+            rotations: Tensor::new(NIL, 0, 1, Dtype::I32),
+            rotations_host,
             request_of_token: Tensor::new(NIL, 0, 1, Dtype::I32),
             request_of_token_host,
             page_tables,
@@ -349,6 +359,7 @@ impl Windows {
             };
             out.extend_from_slice(&gathered.rows_host);
             out.extend_from_slice(&gathered.positions_host);
+            out.extend_from_slice(&gathered.rotations_host);
             out.extend_from_slice(&gathered.request_of_token_host);
             for table in &gathered.page_tables {
                 out.extend_from_slice(&table.page_indptr_host);
@@ -376,6 +387,7 @@ impl Windows {
             };
             gathered.rows = take(&gathered.rows_host)?;
             gathered.positions = take(&gathered.positions_host)?;
+            gathered.rotations = take(&gathered.rotations_host)?;
             gathered.request_of_token = take(&gathered.request_of_token_host)?;
             for table in &mut gathered.page_tables {
                 table.page_indptr = take(&table.page_indptr_host)?;
