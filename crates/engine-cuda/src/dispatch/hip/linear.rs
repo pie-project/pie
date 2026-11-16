@@ -1047,7 +1047,7 @@ impl Run<'_> {
         let (codes, scales, biases, routes) = if experts.tabled() {
             (codes, scales, biases, routes)
         } else {
-            self.staged_experts(codes, scales, biases, routes)
+            self.staged_experts(codes, scales, biases, routes)?
                 .unwrap_or((codes, scales, biases, routes))
         };
         linear::moe::matmul_select_quant(
@@ -1127,7 +1127,7 @@ impl Run<'_> {
         let x = self.tensor(x);
         let (codes, scales, biases) = self.planes(bank);
         let routes = self.tensor(routes);
-        let (codes, scales, routes) = match self.staged_experts(codes, scales, biases, routes) {
+        let (codes, scales, routes) = match self.staged_experts(codes, scales, biases, routes)? {
             Some((codes, scales, _, routes)) => (codes, scales, routes),
             None => (codes, scales, routes),
         };
@@ -1304,152 +1304,111 @@ impl Run<'_> {
     }
 }
 
-const STAGED_EXPERT_BYTES: u64 = 1536 * 1024 * 1024;
-
 impl Run<'_> {
+    /// A host-resident bank's experts this fire routes to, copied into the
+    /// staging the load laid for them (`experts::staging`), and the routes
+    /// renumbered to their places there; `None` for a bank on the device,
+    /// or routes that name no expert. The routes are read back to the host,
+    /// so a load that stages records no body (`Run::capturable`).
     fn staged_experts(
         &self,
         codes: Tensor,
         scales: Tensor,
         biases: Option<Tensor>,
         routes: Tensor,
-    ) -> Option<(Tensor, Tensor, Option<Tensor>, Tensor)> {
+    ) -> Result<Option<(Tensor, Tensor, Option<Tensor>, Tensor)>, kernels_cuda::Error> {
+        const OP: &str = "linear.moe_select";
         if routes.rows == 0 || !crate::device::alloc::is_host_pointer(codes.ptr) {
-            return None;
+            return Ok(None);
         }
+        let refused = |detail: String| kernels_cuda::Error::Backend { op: OP, detail };
+        let Some(staged) = self.expert_staging() else {
+            return Err(refused(
+                "a select reads a routed bank on the host that no table of the weight cache \
+                 reads, and the load laid no staging for its experts"
+                    .to_string(),
+            ));
+        };
+        // A select on a side stream may overlap one on another: each stream
+        // stages into its own lane.
+        let Some(lane) = staged.lane(self.stream_index()) else {
+            return Err(refused(format!(
+                "a select of a host-resident bank runs on stream {}, which the load laid no \
+                 staging lane for",
+                self.stream_index()
+            )));
+        };
         let stream = self.ctx().stream();
         if crate::device::alloc::is_capturing(stream) {
-            return over_the_bus(|| "a capture cannot read the routes back".to_owned());
+            return Err(refused(
+                "a host-resident bank's experts are staged by the fire's routes, read back to \
+                 the host, which no capture records"
+                    .to_string(),
+            ));
         }
+        let copy = |dst: u64, src: u64, bytes: usize| {
+            crate::device::copy_any(stream, dst, src, bytes)
+                .map_err(|fault| refused(fault.to_string()))
+        };
         let count = routes.rows as usize * routes.width as usize;
         let mut picked = vec![0i32; count];
-        if crate::device::copy_any(stream, picked.as_mut_ptr() as u64, routes.ptr, count * 4)
-            .is_err()
-        {
-            return over_the_bus(|| "the routes did not read back".to_owned());
-        }
+        copy(picked.as_mut_ptr() as u64, routes.ptr, count * 4)?;
         let mut unique: Vec<i32> = picked.iter().copied().filter(|e| *e >= 0).collect();
         unique.sort_unstable();
         unique.dedup();
         if unique.is_empty() {
-            return None;
+            return Ok(None);
         }
-        let per_expert = |plane: Tensor| u64::from(plane.width);
-        let bytes_each = per_expert(codes) + per_expert(scales) + biases.map_or(0, per_expert);
-        if unique.len() as u64 * bytes_each > STAGED_EXPERT_BYTES {
-            return over_the_bus(|| {
-                format!(
-                    "{} experts of {} KiB each are past the {} MiB the stage holds",
-                    unique.len(),
-                    bytes_each >> 10,
-                    STAGED_EXPERT_BYTES >> 20
-                )
-            });
-        }
-        let slot_of = |expert: i32| unique.binary_search(&expert).map_or(-1, |at| at as i32);
-        let remapped: Vec<i32> = picked
-            .iter()
-            .map(|e| if *e < 0 { -1 } else { slot_of(*e) })
-            .collect();
-        let stage = |name: &'static str, plane: Tensor| -> Option<Tensor> {
-            let width = plane.width as usize;
-            let ptr = staging(name, unique.len() * width)?;
-            for (slot, expert) in unique.iter().enumerate() {
-                crate::device::copy_any(
-                    stream,
-                    ptr + (slot * width) as u64,
-                    plane.ptr + u64::from(*expert as u32) * width as u64,
-                    width,
-                )
-                .ok()?;
+        let over = |what: &str, need: u64, run: u64| {
+            refused(format!(
+                "a fire of {} rows stages {need} bytes of {what}, past the {run} the load \
+                 laid for fires of up to {} rows",
+                routes.rows, staged.rows,
+            ))
+        };
+        let stage = |plane: Tensor, (at, run): (u64, u64)| -> Result<Tensor, kernels_cuda::Error> {
+            let width = u64::from(plane.width);
+            let need = unique.len() as u64 * width;
+            if need > run {
+                return Err(over("an expert plane", need, run));
             }
-            Some(Tensor::new(
-                ptr,
+            for (slot, expert) in unique.iter().enumerate() {
+                copy(
+                    at + slot as u64 * width,
+                    plane.ptr + u64::from(*expert as u32) * width,
+                    plane.width as usize,
+                )?;
+            }
+            Ok(Tensor::new(
+                at,
                 unique.len() as u32,
                 plane.width,
                 plane.dtype,
             ))
         };
-        let staged = (|| {
-            let codes = stage("moe.staged.codes", codes)?;
-            let scales = stage("moe.staged.scales", scales)?;
-            let biases = match biases {
-                Some(biases) => Some(stage("moe.staged.biases", biases)?),
-                None => None,
-            };
-            let routes_ptr = staging("moe.staged.routes", count * 4)?;
-            crate::device::copy_any(stream, routes_ptr, remapped.as_ptr() as u64, count * 4)
-                .ok()?;
-            Some((codes, scales, biases, routes_ptr))
-        })();
-        let Some((staged_codes, staged_scales, staged_biases, routes_ptr)) = staged else {
-            return over_the_bus(|| "the stage could not be allocated or filled".to_owned());
+        let staged_codes = stage(codes, lane[0])?;
+        let staged_scales = stage(scales, lane[1])?;
+        let staged_biases = match biases {
+            Some(biases) => Some(stage(biases, lane[2])?),
+            None => None,
         };
-        Some((
+        let slot_of = |expert: i32| unique.binary_search(&expert).map_or(-1, |at| at as i32);
+        let remapped: Vec<i32> = picked
+            .iter()
+            .map(|e| if *e < 0 { -1 } else { slot_of(*e) })
+            .collect();
+        let (routes_at, routes_run) = lane[3];
+        if (count * 4) as u64 > routes_run {
+            return Err(over("routes", (count * 4) as u64, routes_run));
+        }
+        copy(routes_at, remapped.as_ptr() as u64, count * 4)?;
+        Ok(Some((
             staged_codes,
             staged_scales,
             staged_biases,
-            Tensor::new(routes_ptr, routes.rows, routes.width, routes.dtype),
-        ))
+            Tensor::new(routes_at, routes.rows, routes.width, routes.dtype),
+        )))
     }
-}
-
-/// A select whose host-resident experts are not staged reads them where
-/// they lie, across the bus: counted, and said at the first and at every
-/// doubling of the count, with why.
-fn over_the_bus<T>(why: impl FnOnce() -> String) -> Option<T> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static READ: AtomicU64 = AtomicU64::new(0);
-    kernels_rocm::tally::declined();
-    let read = READ.fetch_add(1, Ordering::Relaxed) + 1;
-    if read.is_power_of_two() {
-        eprintln!(
-            "engine-cuda: WARNING: a select reads its host-resident experts across the bus, \
-             unstaged: {}; {read} such select(s) so far",
-            why()
-        );
-    }
-    None
-}
-
-/// A staging buffer per `name`, grown by doubling. A buffer it outgrows is
-/// kept, never freed: copies queued on it may still be in flight, and a
-/// free here would either race them or synchronise the device (illegal
-/// mid-capture). Doubling keeps what is retired under the live buffer's
-/// size.
-fn staging(name: &'static str, bytes: usize) -> Option<u64> {
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-    struct Held {
-        live: HashMap<&'static str, (u64, usize)>,
-        retired: Vec<(u64, usize)>,
-    }
-    static HELD: Mutex<Option<Held>> = Mutex::new(None);
-    if bytes == 0 {
-        return None;
-    }
-    let mut held = HELD.lock().expect("held lock poisoned");
-    let held = held.get_or_insert_with(|| Held {
-        live: HashMap::new(),
-        retired: Vec::new(),
-    });
-    let cap = held.live.get(name).map_or(0, |(_, cap)| *cap);
-    if let Some((ptr, _)) = held.live.get(name).filter(|_| cap >= bytes) {
-        return Some(*ptr);
-    }
-    let size = bytes.max(cap * 2);
-    let fresh = crate::device::alloc::raw_alloc(size)?;
-    if let Some((old, old_size)) = held.live.insert(name, (fresh, size)) {
-        held.retired.push((old, old_size));
-    }
-    let retired: usize = held.retired.iter().map(|(_, size)| size).sum();
-    eprintln!(
-        "engine-cuda: the experts' stage `{name}` grows to {} MiB beside the pool ({} MiB \
-         retired, kept for copies in flight)",
-        size >> 20,
-        retired >> 20
-    );
-    Some(fresh)
 }
 
 /// NVFP4 activations (`nvfp4a4`) are a tcgen05 product, CUDA's alone.
