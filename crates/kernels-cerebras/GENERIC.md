@@ -21,7 +21,11 @@ the K / V columns folded over two columns a head, the cost model held to the sim
 unit: a row's round trip through a unit; klein's step 1,326M -> 1,081M cycles, 1.77 s -> 1.44 s,
 end to end 7.54 s -> 6.21 s at 750 MHz; the roofline 10.9M cycles a step, §4.1), K1 (klein on
 the CS-3 from its real checkpoint: a program over more than one band hangs at its first launch,
-flux2-mini at a narrow fabric reproduces it, §4.1) and M3 (the
+flux2-mini at a narrow fabric reproduces it, §4.1), M2f (the GEMM regime: a whole-sequence
+reading's ops over an array of PEs, rows and channels both cut, weights from tapes below it;
+flux2-mini's step on the simulator in 0.97M cycles, its 2-step loop 1.48e-3 from diffusers;
+klein's 1024² step 1,081M -> 115M cycles priced (1.44 s -> 0.15 s), links; end to end 6.21 s
+-> 1.05 s, §4.1) and M3 (the
 decode layouts as points of the Floorplan, §2.5). ARCHITECTURE.md is what runs for decode.
 
 **Goal.** A `.poem` model the compiler has not seen runs on the wafer with no hand code. The
@@ -1874,6 +1878,217 @@ milestone's tail.
     to a later band are the suspects, and the mini at a narrow fabric is a small repro.
   - The M2e 1024² program (741 x 1152 PEs, 1,081.4M cycles, 1.44 s priced) is built and its
     static arrays made (3.859G words); not run, being multi-band.
+
+- **M2f** (the GEMM regime: a whole-sequence reading over an array of PEs, layer by layer, every
+  PE of the array on the current op; flux2-mini's denoise step on the simulator, klein-4B's 1024²
+  step builds and links). Seconds here are at 750 MHz.
+  - **Why.** The stream regime streams rows through units, one unit working at a time (M2e: a
+    row's round trip through a unit; its floor 657M cycles a step, 60x the roofline). The
+    roofline wants every PE on the current layer: a layer's GEMM `Y[T, N] = X[T, K] W[K, N]` cut
+    over the fabric by its rows **and** its channels, as the tiled regime (M2d) cuts a VAE's
+    image, with the channel split M2d left open.
+  - **One mechanism for every whole-sequence reading** (`stream::gemm`, `emit::gemm`,
+    `cost::gemm`; `wafer-compile stream --regime gemm [--gemm C,R,KBM] [--price --parts]`). The
+    regime reads the stream regime's own lowering (`stream::build::lower_units`, factored out of
+    the stream build: the stream program's units, each a side of a stage as a list of `Step`s:
+    rows in, root regions, matvecs, the joint attention's store and attend, rows out; the lane
+    prologue a unit of one row). Only the placement differs: a unit's steps become **ops over
+    the whole array** in the program's order (a block's units' steps before the barrier, one
+    attention op over all their rows, the steps after it), each lowered by its family: a
+    matvec a GEMM (an identity matvec, the stream's move across a unit, is nothing here: an
+    alias), a root region the printer's (`emit::region`, unchanged but for one option), the
+    attention's store and attend one op, a host row in or out an entry or a read-back. A
+    trace merge of the classes' arms (the single blocks' rows, both classes') is one value. So
+    a DiT block, a text encoder's layer (causal prefill; MHA: grouped-query attention is
+    refused by name, a head's band holding its q, k and v alike) and an exit's projection are
+    the same ops; nothing names a model. The stream regime stays: compile on load (and
+    `stream::compile_whole`) builds both and takes the cheaper by the cost models.
+  - **Layout.** An array of `C x R` PEs and, below it, the weights' tapes:
+    - column `c` of the array is channel block `c`, row `r` token block `r` (`tb = T / R`
+      consecutive rows of the step, all of one class: every class's rows cut into whole
+      blocks);
+    - a value of width `N` is cut into **segments** at every column a reader takes apart (a
+      split's q / k / v, a gated MLP's gate and up halves, a packed modulation's shift / scale /
+      gate), each segment evenly over the `C` columns; PE `(c, r)` holds, f32, its `tb` rows x
+      its piece of every segment, side by side. A region, a matvec input or an attention
+      operand reads one whole segment, so its chunk at PE `c` is the segment's `c`-th piece (the
+      region printer's chunk `c`, its tables the chunk's). A value only GEMMs and the host read
+      may cut unevenly (klein's 128-wide patches over 384 columns: a column or none);
+    - a lane vector (the timestep's modulations) is a value of one row held at every row of
+      PEs, made by every row (its GEMMs a row each);
+    - the residual stays f32 at its owner; values share the arena by lifetime (first fit).
+  - **The GEMM** (output-stationary). PE `(c, r)` makes `Y[tb, its columns]`:
+    - `X`'s pieces come along the row, a **line stream** (below): PE `c'`'s piece
+      (`tb x K/C`, 16-bit, two a wavelet) in turn, every PE of the row taking every piece; an
+      f32 input (`x32`) as two 16-bit halves;
+    - the weights of the PE's columns come up its column from the column's **tape**: every
+      GEMM's weight blocks in op order (a block a piece of `X` and an output segment,
+      `K/C x` the segment's piece, 16-bit), the regions' static residents (a norm's gain, f32)
+      where their regions are, and **the program itself**: each op's words stream in just
+      before its weights (16-bit, `host::LIT` spans), so a PE holds one op's words, not the
+      program (klein's 270 ops would be 2,666 words a PE; the op buffer is 18);
+    - a piece: its block off the column's tree, `mv.csl`'s `mac32` a row (f32 accumulation);
+    - the rows of a class the op is not for drain its blocks.
+  - **Stationary or streamed, from memory.** Activations are stationary (a PE's rows of each
+    value, klein's busiest arena 1,944 words). Weights cannot be: resident in the compute PEs,
+    klein's 3.85G 16-bit weights are 17 KB a PE even over 442k of them, beside the kernel's
+    29 KB of code and 16 KB of data (the linked ELF below): past 48 KB. So every layer's
+    weights stream, once a step, from tapes that hold nothing else, at a word a cycle against a
+    PE's `tb x 0.5` cycles a weight of `mac32` (the tape is never the bound: a column's 5.02M
+    words a step against its 115M cycles). The search prices only that; a layer resident where
+    a smaller model leaves room is the same blocks from a PE's memory (not built).
+  - **The tapes** (M2d's, a column each): `TAPE_WORDS` (10,000) a PE in rows below the array,
+    PE `k` sending its words then forwarding those of the PEs past it north, the head into the
+    column's tree (every PE of the column takes every word, the routers multicasting). The
+    compute PEs hold no weights: klein's 3.85G 16-bit weights are 5.02M words a column, 502
+    rows of tapes under 576 rows of array.
+  - **Line streams** (the row's input pieces, the column's keys and values; measured on the
+    simulator before anything was built on them, `flux2f/probe/line`: 6 members x 64 words,
+    three streams in a row, every word in order, about 210 cycles a turn). A line's members take
+    turns as the root in index order; every member gets every piece in that order, no CPU
+    forwarding, no hub:
+    - two colours a line, one each way, every route at rest a pass-through to the next PE and
+      the ramp; a member's input queue is bound to the forward colour until its turn, the
+      backward one after (a WSE-3 colour takes one input direction: `rx = { WEST, RAMP }` is
+      refused by cslc, so turns are route rewrites);
+    - at its turn a member, every earlier piece taken, makes the backward colour a root's
+      (`rx RAMP`), sends its piece, waits for the output queue to drain, makes it a
+      pass-through again, then the same on the forward colour. The next member sends only once
+      it has the whole piece off the forward colour, so no route changes under a flow;
+    - one input and one output queue a line, rebound at the turn.
+  - **Norms and heads** (`emit::region` as it is, a chunk of `N / C` columns): a row's sum is the
+    chunk's sum and an **all-reduce over the row's `C` PEs** (`gseg.csl`: a chain east on two
+    colours by parity, `fadds` in and out; the last PE's sum back west over the row's broadcast
+    colour); a head wider than the chunk (128 over chunks of 8) is cut over consecutive PEs and
+    its sums all-reduced over them (`seg.head_reduce`, the printer's new `Place::straddle`: off
+    for every other regime, whose programs are byte-identical). Modulation, the gated
+    residuals, SwiGLU and the four-axis rotation (P5 tables of the PE's chunk, the rows'
+    positions their scalars) are local.
+  - **Attention** (flash-style over the step's rows; a head's band of `head_dim / chunk`
+    columns): the column's K / V line stream brings every row's `[k | v]` (its `tb x chunk`)
+    in blocks of `KB = kbm x tb` keys (`KB` at most 127: the keys' dim-major tile is a DSD
+    stride); a PE's queries' partial scores over the block (`mac32`: `q` its `x`, the keys its
+    tile), the band's all-reduce of them (`gseg`), the block's max and the running max and sum
+    (alike at every PE of the band: the same sums), each PE's `KB / band` keys' exponents, the
+    band's all-reduce of the probabilities (zeros outside each PE's keys), then `P V` over the
+    PE's columns (`mac32`, `P` 16-bit) and the output's rescale; a causal reading masks a key
+    past its query.
+  - **No bands, no turns** (K1's hang is a stream program's second band): the array is one
+    rectangle, its tapes the rows straight below it; every line runs along one row or one
+    column, every tape up its own column into its column's tree, the all-reduces along a row.
+    No route turns a corner and nothing crosses a band; `fabric()` is `C x (R + tapes)`, refused
+    past the system's 755 x 1,170.
+  - **Colours** (11 of 21; laid by loops): the row line (2), the K / V line (2), the weight tree
+    (1), the tape (2, by parity), the all-reduce chain (2, by parity), the row's and the band's
+    broadcasts (2). Input queues: the row line, the weights, the K / V line, the chain, the
+    broadcast; output: the row line, the K / V line, the chain, the broadcast.
+  - **Memory a PE** (the linked ELFs; `cost::gemm::memory` is fitted to hold them). klein-4B's
+    compute PE at 1024² (`C x R` = 384 x 576, `tb` 8): **46,962 bytes of 49,152** (text 28.7 KB:
+    the interpreter and 7 printed regions; bss 15.9 KB: the arena of values, 1,944 words, the
+    lines' and the attention's buffers, the regions' chunks and P5 tables; the task table 1 KB).
+    Two things made it fit: the weights out of the compute PEs (in the tapes) and the program
+    streamed in with them (its 270 ops' 2,666 words were not held). A tape PE: its 10,000 words.
+  - **Cycles from first principles** (`cost::gemm`; measured rates: `mac32` 1.84 + 0.5 n cycles
+    an instruction of `n` (`probe/p`: 0.73 a MAC at n 8, 0.53 at 72); a fabric word a cycle; a
+    line's turn 150; an all-reduce's hop 12; an async fabric receive alongside `mac32` costs it
+    nothing (`probe/p`), not used yet: everything here is synchronous):
+    - a GEMM, a piece of its input: a turn, the piece's words (three times at its root: two sends
+      and the copy), each output segment's block off the tree, `tb x K/C` `mac32`s of the
+      segment's piece; `C` pieces;
+    - a region: its `row()` ([`RegionFeatures`]) a row, its chunks in and out, an all-reduce a
+      row's sum (`2 n + C hops`) or a head's (`band` hops);
+    - the attention a key block: its `kbm` turns of the K / V line, the scores' `mac32`s, two
+      band all-reduces of `tb x KB`, the softmax (two halving trees a query, `KB / band`
+      exponents), the values' `mac32`s.
+  - **On the simulator** (flux2-mini, 16 + 16 rows; the search's program: `C x R` 32 x 32, a row
+    a PE, key blocks of the whole step, 11 rows of tapes: 32 x 43 PEs; `wafer-bench --reading
+    --steps 2`, the 2-step loop from the engine's inputs, one load; rel L2 / cosine):
+
+    | | vs engine-cpu | vs diffusers | cycles | simulator |
+    |---|---|---|---|---|
+    | entries and lanes alone (`--stages 1`): the context's and patches' embeddings | 1.686e-3 / 0.9999986 | | 251k | 10 min |
+    | through double block 0's attention (`GEMM_UPTO=24`, a debugging cut) | 5.06e-3 / 0.9999872 (its output) | | 377k | 12 min |
+    | step 0 velocity (sigma 1) | 5.77e-3 / 0.9999834 | | 969,671 | 41 min |
+    | step 1 velocity (sigma 0.7672), re-launched | 6.26e-3 / 0.9999804 | | **969,202** | 16 min |
+    | latent after step 1 | 1.42e-3 / 0.9999990 | | | |
+    | latent after step 2 | 3.86e-3 / 0.9999925 | **1.48e-3 / 0.999999** | | |
+
+    The stream regime's re-launched step on the same simulator (M2e) is 1,126,817 cycles, so
+    the miniature's step is 14% fewer (its 32 rows and 256 channels leave little to cut: a
+    GEMM's pieces are its overhead). The velocities are a regime's own rounding (IEEE f16
+    activations and 16-bit weights, f32 accumulation; the stream regime's 4.85e-3 / 6.36e-3):
+    the host program (`stream::gemm::emulate`, `wafer-compile stream --regime gemm --emulate
+    --values`, every op as the PEs run it) is 1.686e-3, 3.1e-3 and 5.87e-3 from the capture at
+    the entries, double block 0 and the velocity, the simulator's digits: the lowering is the
+    host's and the fabric adds nothing. Against diffusers' 2-step loop (f32) the wafer is
+    closer than engine-cpu's (3.66e-3: its bf16 trunk). The step's stamps start where the
+    launch reaches a PE, so the first launch is the step: no start-up (the stream regime's first
+    launch was 7.9M).
+  - **The cost model against it**: as first written (`TURN` 150, `mac32` as measured, the
+    tree's words) it priced the step 0.55M; a GEMM's piece costs more than its turn and words
+    (its loop and blocks' setup, and its bounds: two u32 divisions). The entries' 251k and the
+    step's 969k give 353 and 395 cycles a piece. The bounds' divisions are now one a GEMM where
+    its input cuts evenly (every klein GEMM's but the patches'): the entries rerun at **218,651
+    cycles** (-13%, the same digits), 253 a piece; `PIECE` = 280 prices the entries 0.23M and
+    the step 0.85M (the step not rerun: an hour of simulator, the band fix's queue).
+  - **klein-4B at 1024²** (the search's choice over every `(C, R, kbm)` that places, fits a PE
+    and prices lowest: `C x R` = 384 x 576, `tb` 8, key blocks of 8 rows of PEs (64 keys); 221k
+    compute PEs and 502 rows of tapes, 384 x 1,078 PEs; the search takes 60 s):
+    **115.2M cycles, 154 ms a step** (the stream regime's M2e program: 1,081M, 1.44 s; 9.4x):
+
+    | ops (klein, a step) | count | cycles |
+    |---|---|---|
+    | GEMMs | 108 | 80.6M (a single block's in_proj 1.44M, out_mlp 0.75M, out_attn 0.36M; a double block's side 2.75M, the sides in turn) |
+    | attention | 25 | 30.5M (1.22M a block: 72 key blocks of 17k) |
+    | regions | 133 | 4.0M |
+    | in / out | 4 | 0.0M |
+
+    **It links for the system fabric** (`cslc --fabric-dims=762,1172`; the program as it stood
+    before the per-class entries, its code the same): 171 ELFs, 151 s, about 1 GB at its peak,
+    391 MB of ELFs, rc 0 (the stream regime's program: 1,264 ELFs, 965 s, 36 GB). The compile
+    writes 1.5 GB (the tapes' spans).
+  - **Served through Pie** (a step's wall as M1k splits it): the step's entries are 10.4M words
+    (the context's rows on the text PEs, the patches on the image PEs, every row's four
+    positions on every PE of its row: arrays a class, a scalar no region reads not written),
+    about 18 ms at M1k's measured 2.4 GB/s of h2d; the velocity back 0.5M words, about 1 ms: a
+    step through Pie about 173 ms, 154 of it on the wafer.
+  - **klein end to end at 1024²** (priced; one CS-3, readings in turn; the text reading is
+    grouped-query attention, refused by the GEMM regime, so the stream regime's):
+
+    | reading | footprint | M2e | M2f |
+    |---|---|---|---|
+    | text (512 tokens) | 723 x 559 PEs | 218.0M, 0.29 s | 0.29 s (stream) |
+    | denoise, 4 steps | 384 x 1,078 PEs | 4 x 1,081.4M, 5.77 s | 4 x 115.2M, **0.61 s** (0.69 s with entries) |
+    | VAE decode | 514 x 1,029 PEs | 0.15 s | 0.15 s |
+    | **total** | | **6.21 s** | **1.05 s** (1.13 s with the denoise's entries) |
+
+  - **What is left, in order of what it buys** (klein, a step):
+    - **Half the fabric idle**: the tapes take 502 of 1,170 rows, so the array is 576 rows
+      (`tb` 8, 221k PEs); every class's rows cut into powers of two leave no 1,152-row array
+      with room for tapes. Weights beside the array (a staircase of feeds from the east, each a
+      colour relay at its turn) or a second array of the other half's tokens (the weights
+      replicated, the keys exchanged) are the two ways; the roofline at 442k compute PEs is
+      about 2x nearer.
+    - **Synchronous everything**: a weight block's receive, the input's piece, the K / V
+      pieces wait on their sends (`probe/p`: an async receive alongside `mac32` is free); the
+      double blocks' two sides run in turn (each class's rows drain the other's blocks); the
+      turns (384 a GEMM, 576 an attention) are about a quarter of the step.
+    - The step's entries: the context and the positions are constant across a request's steps
+      (written once a request: 18 ms -> 1 ms a step).
+    - Grouped-query attention (klein's Qwen3-4B text reading): a band holding a kv head's q
+      heads; a NeoX rotation whose mate is on another PE of the band (an exchange of halves).
+    - klein on the simulator (only the miniature ran) and on a system (K1's band hang is the
+      stream regime's: this program has one rectangle).
+  - Decode is unchanged: plan + build `diff -r` identical against abce3a126's wafer-compile for
+    qwen35-d0.8b, qwen35-d9b, llama31-8b, gptoss-20b, gemma4-e2b and tiny t08. flux2-mini's text
+    (16 rows), denoise (16 rows, and M1g's pins), the GQA miniature's text and both VAE programs
+    (rows, tiled), and klein's VAE byte-identical (`wafer-compile stream` without `--regime`);
+    compile on load (`stream::compile_whole`, by price) takes the GEMM regime's denoise for klein
+    (115M against 1,081M) and keeps the stream regime's for flux2-mini (its bf16 build at 16 rows
+    priced 0.85M against the stream's 0.81M; measured 0.97M against 1.13M: the stream model is
+    the optimistic one there) and every text reading (klein's grouped-query; the miniature's
+    NeoX rotation, its mate half a head away, across PEs: refused by the printer).
+
 
 ## 5. Risks
 
