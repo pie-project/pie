@@ -661,6 +661,19 @@ impl Printer<'_> {
                         );
                         self.bufs_free.push(t);
                     }
+                    // a row's (reciprocal) square root: a scalar loop
+                    Unary::Rsqrt | Unary::Sqrt => {
+                        let xs = self.elem_of(a)?;
+                        let e = if u == Unary::Rsqrt {
+                            format!("math.rsqrt({xs})")
+                        } else {
+                            format!("({xs}) * math.rsqrt({xs})")
+                        };
+                        let _ = writeln!(
+                            self.body,
+                            "  {{ var i: u16 = 0; while (i < C) : (i += 1) {{ b{dst}[i] = {e}; }} }}"
+                        );
+                    }
                     u => return refuse(format!("op {k}: a row's {u:?}")),
                 }
             }

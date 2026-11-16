@@ -106,6 +106,8 @@ pub enum View {
     Blocks { block: u32 },
     /// Constant: one where `o / rep == i` (an expert's gate over its `rep` columns).
     Spread { rep: u32 },
+    /// Constant: one where `i / rep == o` (a group's sum of its `rep` columns).
+    Sum { rep: u32 },
 }
 
 impl View {
@@ -123,7 +125,7 @@ impl View {
                 let b = block as usize;
                 Some((i / b) * n * b + o * b + i % b)
             }
-            View::Spread { .. } => None,
+            View::Spread { .. } | View::Sum { .. } => None,
         }
     }
 }
@@ -168,10 +170,31 @@ pub struct State {
     /// Value heads a key head (a head root `h`'s q / k the key head `h / ratio`'s).
     #[serde(skip_serializing_if = "is_one")]
     pub ratio: u32,
+    /// The q channels' first column in the conv's input (0: `[q | k | v]`).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub q_from: u32,
+    /// A value head's width where it is not the key head's (Mamba-2's head beside its state).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub v_dim: u32,
+    /// Mamba-2's recurrence in place of the delta rule (ops/cy_sst.csl's MAMBA): `d` a head's
+    /// skip, `bias` the conv's a channel.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mamba: Option<Mamba>,
+}
+
+/// Mamba-2's own parameters of a state column ([`State::mamba`]).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct Mamba {
+    pub d: ValueId,
+    pub bias: ValueId,
 }
 
 fn is_one(r: &u32) -> bool {
     *r == 1
+}
+
+fn is_zero(r: &u32) -> bool {
+    *r == 0
 }
 
 impl Joint {
@@ -179,6 +202,26 @@ impl Joint {
     #[must_use]
     pub fn qk_head(&self, h: u32) -> u32 {
         h / self.state.map_or(1, |s| s.ratio.max(1))
+    }
+
+    /// A head root's v (and output) width: a recurrence's value head's, else its q heads'.
+    #[must_use]
+    pub fn v_dim(&self) -> u32 {
+        match self.state {
+            Some(s) if s.v_dim > 0 => s.v_dim,
+            Some(_) => self.head_dim,
+            None => self.head_dim,
+        }
+    }
+
+    /// A head root's output width: its q heads' (attention) or its value head's (a
+    /// recurrence).
+    #[must_use]
+    pub fn out_dim(&self) -> u32 {
+        match self.state {
+            Some(_) => self.v_dim(),
+            None => self.q_heads / self.kv_heads.max(1) * self.head_dim,
+        }
     }
 }
 
@@ -958,6 +1001,155 @@ pub fn lower_through(
             }
             // a gated delta rule (its conv, its gates, its recurrence): a step's row through
             // its heads' state columns (P8), the conv's history and the gates at their roots
+            // Mamba-2 (its conv, its scan, its gated group norm): a step's row through its heads'
+            // state columns (P8's MAMBA), the norm as root regions and constant matvecs
+            // (super::mamba)
+            Operation::Ssm(Ssm::CausalConv1d {
+                x,
+                weight,
+                bias: Some(cb),
+                conv_width,
+                dilation: 1,
+                y: conv_y,
+                ..
+            }) if nodes.iter().any(|&n| {
+                matches!(&trace.nodes[n as usize].op,
+                    Operation::Ssm(Ssm::Mamba2 { xbc, .. }) if xbc == conv_y)
+            }) =>
+            {
+                use super::mamba::{Kind as MK, synth as msynth};
+                let refuse_at = |what: &str| refuse(at, format!("ssm.mamba2 {what}"));
+                let mn = nodes
+                    .iter()
+                    .copied()
+                    .find(|&n| {
+                        matches!(&trace.nodes[n as usize].op,
+                            Operation::Ssm(Ssm::Mamba2 { xbc, .. }) if xbc == conv_y)
+                    })
+                    .unwrap_or_else(|| unreachable!());
+                let Operation::Ssm(Ssm::Mamba2 {
+                    dt,
+                    z,
+                    a_log,
+                    dt_bias,
+                    d,
+                    norm,
+                    eps,
+                    y,
+                    ..
+                }) = &trace.nodes[mn as usize].op
+                else {
+                    unreachable!()
+                };
+                let (h, g, n, p, inner) =
+                    super::mamba::dims(trace, mn).ok_or_else(|| refuse_at("of no inner width"))?;
+                if g == 0 || !h.is_multiple_of(g) || !inner.is_multiple_of(g) {
+                    return Err(refuse_at(&format!("of {h} heads over {g} groups")));
+                }
+                skip.insert(mn);
+                let xc = r.cols(*x);
+                let dtc = r.cols(*dt);
+                for c in [xc, dtc] {
+                    if side_of(&sides, c) != Some(Side::Col) {
+                        return Err(refuse_at("reads a value not at the column roots"));
+                    }
+                }
+                // xbc: [x (inner) | B (a group's n each) | C]: q C, k B, v x
+                let q = Cols {
+                    from: xc.from + inner + g * n,
+                    width: g * n,
+                    ..xc
+                };
+                let k = Cols {
+                    from: xc.from + inner,
+                    width: g * n,
+                    ..xc
+                };
+                let v = Cols { width: inner, ..xc };
+                let dth = Cols { width: h, ..dtc };
+                joint = Some(Joint {
+                    q_heads: h,
+                    kv_heads: h,
+                    head_dim: n,
+                    scale: 1.0,
+                    causal: true,
+                    window: None,
+                    state: Some(State {
+                        b: dth,
+                        a: dth,
+                        conv: *weight,
+                        taps: *conv_width,
+                        a_log: *a_log,
+                        dt: *dt_bias,
+                        k_from: inner,
+                        v_from: 0,
+                        ratio: h / g,
+                        q_from: inner + g * n,
+                        v_dim: p,
+                        mamba: Some(super::unit::Mamba { d: *d, bias: *cb }),
+                    }),
+                    sink: None,
+                });
+                steps.push(Step::Store { q, k, v });
+                let raw = msynth(mn, MK::Raw);
+                sides.insert(raw, Side::Col);
+                steps.push(Step::Attend {
+                    out: raw,
+                    round: false,
+                });
+                // the gate, each group's sum of squares and its spread, the norm
+                let zd = r.dtype(*z).unwrap_or(Dtype::Bf16);
+                steps.push(Step::Region {
+                    side: Side::Col,
+                    chain: super::mamba::gate(mn, *z, zd, inner).map_err(|e| refuse(at, e))?,
+                });
+                for kind in [MK::Gated, MK::Squares] {
+                    sides.insert(msynth(mn, kind), Side::Col);
+                }
+                let gw = inner / g;
+                steps.push(Step::Matvec {
+                    node: mn,
+                    from: Side::Col,
+                    input: Cols {
+                        base: msynth(mn, MK::Squares),
+                        from: 0,
+                        width: inner,
+                    },
+                    weight: ValueId(super::host::UNIT),
+                    view: View::Sum { rep: gw },
+                    output: msynth(mn, MK::Sums),
+                    k: inner,
+                    n: g,
+                    x32: true,
+                    round: false,
+                });
+                sides.insert(msynth(mn, MK::Sums), Side::Row);
+                steps.push(Step::Matvec {
+                    node: mn,
+                    from: Side::Row,
+                    input: Cols {
+                        base: msynth(mn, MK::Sums),
+                        from: 0,
+                        width: g,
+                    },
+                    weight: ValueId(super::host::UNIT),
+                    view: View::Spread { rep: gw },
+                    output: msynth(mn, MK::Spread),
+                    k: g,
+                    n: inner,
+                    x32: true,
+                    round: false,
+                });
+                sides.insert(msynth(mn, MK::Spread), Side::Col);
+                let wd = r.dtype(*norm).unwrap_or(Dtype::Bf16);
+                let yd = r.dtype(*y).unwrap_or(Dtype::Bf16);
+                steps.push(Step::Region {
+                    side: Side::Col,
+                    chain: super::mamba::norm(mn, gw, *eps, *norm, wd, *y, yd, inner)
+                        .map_err(|e| refuse(at, e))?,
+                });
+                sides.insert(*y, Side::Col);
+            }
             Operation::Ssm(Ssm::CausalConv1d {
                 x,
                 weight,
@@ -1058,6 +1250,9 @@ pub fn lower_through(
                         k_from: hk * d,
                         v_from: 2 * hk * d,
                         ratio: h / hk,
+                        q_from: 0,
+                        v_dim: 0,
+                        mamba: None,
                     }),
                     sink: None,
                 });

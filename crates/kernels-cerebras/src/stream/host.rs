@@ -245,6 +245,7 @@ impl Cells {
         }
         match self.view {
             super::unit::View::Spread { rep } => oc / rep as usize == xr,
+            super::unit::View::Sum { rep } => xr / rep as usize == oc,
             _ => xr == oc,
         }
     }

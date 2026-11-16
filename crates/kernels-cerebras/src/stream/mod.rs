@@ -21,6 +21,7 @@ pub mod coresident;
 pub mod gemm;
 pub mod grid;
 pub mod host;
+pub mod mamba;
 pub mod moe;
 pub mod place;
 pub mod tiled;

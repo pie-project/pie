@@ -232,6 +232,10 @@ pub fn ty(trace: &Trace, v: ValueId) -> Option<(u32, Dtype)> {
     }
     let raw = v.0 & !SYNTH;
     let (node, kind) = (raw / KINDS, raw % KINDS);
+    // (a Mamba-2's own: super::mamba)
+    if let Some(t) = super::mamba::ty(trace, node, kind) {
+        return Some(t);
+    }
     let nodes: Vec<u32> = (0..trace.nodes.len() as u32).collect();
     let g = group(trace, node, &nodes).ok()?;
     let ei = g.experts * g.inter;

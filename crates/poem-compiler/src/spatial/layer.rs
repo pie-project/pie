@@ -631,6 +631,18 @@ impl Body<'_, '_> {
                 };
                 self.mixer(op, Some(kind), &acts, &outs)
             }
+            // Mamba-2's scan: a stream unit's state column a head (as a delta rule's)
+            Operation::Ssm(Ssm::Mamba2 {
+                heads, state_dim, ..
+            }) if self.r.stream => {
+                let kind = Mixer::Gdn {
+                    k_heads: *heads,
+                    v_heads: *heads,
+                    k_dim: *state_dim,
+                    v_dim: *state_dim,
+                };
+                self.mixer(op, Some(kind), &acts, &outs)
+            }
             Operation::Ssm(Ssm::GatedDelta {
                 k_heads,
                 v_heads,

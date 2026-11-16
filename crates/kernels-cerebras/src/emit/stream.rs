@@ -500,19 +500,35 @@ pub fn emit(p: &Program) -> R<Emitted> {
         if let Some(st) = state {
             // the root's conv taps for its head's channels, its decay's parameters
             let j = kv_joint(p, ks);
-            let (d, t, h) = (j.head_dim, st.taps, kc.head);
+            let (d, dv, t, h) = (j.head_dim, j.v_dim(), st.taps, kc.head);
+            let (qc, kc_, vc) = (
+                st.q_from + j.qk_head(h) * d,
+                st.k_from + j.qk_head(h) * d,
+                st.v_from + h * dv,
+            );
+            let mut slices = vec![
+                (st.conv.0, qc * t, d * t),
+                (st.conv.0, kc_ * t, d * t),
+                (st.conv.0, vc * t, dv * t),
+                (st.a_log.0, h, 1),
+                (st.dt.0, h, 1),
+            ];
+            // Mamba-2's: its head's skip, its channels' conv bias
+            if let Some(m) = st.mamba {
+                slices.extend([
+                    (m.d.0, h, 1),
+                    (m.bias.0, qc, d),
+                    (m.bias.0, kc_, d),
+                    (m.bias.0, vc, dv),
+                ]);
+            }
+            let len = slices.iter().map(|s| s.2).sum();
             arrays.push(HostArray {
                 at: root,
                 sym: "stw".into(),
                 u16: false,
-                len: (3 * d) * t + 2,
-                fill: Fill::Slices(vec![
-                    (st.conv.0, j.qk_head(h) * d * t, d * t),
-                    (st.conv.0, (st.k_from + j.qk_head(h) * d) * t, d * t),
-                    (st.conv.0, (st.v_from + h * d) * t, d * t),
-                    (st.a_log.0, h, 1),
-                    (st.dt.0, h, 1),
-                ]),
+                len,
+                fill: Fill::Slices(slices),
             });
             if let Some(n) = rows_of(p) {
                 arrays.push(rowp_array(root, n));
@@ -1709,13 +1725,13 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
             Step::Store { q, k, v } if side == Side::Col && idx < l.heads => {
                 let j = u.joint.ok_or("a store with no attention")?;
                 let qw = j.q_heads / j.kv_heads * j.head_dim;
-                let d = j.head_dim;
+                let (d, dv) = (j.head_dim, j.v_dim());
                 kv_io = true;
                 let kh = j.qk_head(idx);
                 let mut parts = vec![
                     (*q, q.from + kh * qw, qw),
                     (*k, k.from + kh * d, d),
-                    (*v, v.from + idx * d, d),
+                    (*v, v.from + idx * dv, dv),
                 ];
                 // a recurrence's head: its beta and decay logits after them
                 if let Some(st) = j.state {
@@ -1730,7 +1746,7 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
             }
             Step::Attend { out, round } if side == Side::Col && idx < l.heads => {
                 let j = u.joint.ok_or("an attend with no attention")?;
-                let qw = j.q_heads / j.kv_heads * j.head_dim;
+                let qw = j.out_dim();
                 g.decls.push_str(&buf("ob", qw));
                 g.put(late, &format!("  @fmovs(D_ob, fab.fin(q_kr, {qw}));\n"));
                 if *round {
@@ -2552,7 +2568,7 @@ fn kv_pe_file(p: &Program, k: usize, ks: &place::KvSched) -> R<(String, String)>
 fn st_root_file(p: &Program, k: usize, ks: &place::KvSched) -> R<(String, String)> {
     let j = kv_joint(p, ks);
     let st = j.state.ok_or("a state column of no recurrence")?;
-    let d = j.head_dim;
+    let (d, dv) = (j.head_dim, j.v_dim());
     let n_rows = rows_of(p).unwrap_or(1);
     let name = format!("sr_{k}.csl");
     let mut t = String::new();
@@ -2582,12 +2598,17 @@ fn st_root_file(p: &Program, k: usize, ks: &place::KvSched) -> R<(String, String
     );
     let _ = writeln!(
         t,
-        "const cy = @import_module(\"ops/cy_sst.csl\", .{{ .fab = fab, .math = math, .YO = q_am, .IN = q_ar, .DK = {d}, .DV = {d}, .CONV = {}, .SLOTS = {n_rows}, .ROWS = {n_rows} }});",
-        st.taps
+        "const cy = @import_module(\"ops/cy_sst.csl\", .{{ .fab = fab, .math = math, .YO = q_am, .IN = q_ar, .DK = {d}, .DV = {dv}, .CONV = {}, .SLOTS = {n_rows}, .ROWS = {n_rows}{} }});",
+        st.taps,
+        if st.mamba.is_some() {
+            ", .MAMBA = true"
+        } else {
+            ""
+        }
     );
-    let sw = 3 * d + 2;
+    let sw = 2 * d + dv + 2;
     t.push_str(&buf("sx", sw));
-    t.push_str(&buf("ob", d));
+    t.push_str(&buf("ob", dv));
     // a decode step's rows each a lane's (its state slot's history; `rowp`, the host's)
     t.push_str("var stw_p: [*]f32 = &cy.cw;\nvar rowp_p: [*]u32 = &cy.rowp;\n");
     let decode = rows_of(p).is_some();
@@ -2606,7 +2627,7 @@ fn st_root_file(p: &Program, k: usize, ks: &place::KvSched) -> R<(String, String
         };
         let _ = writeln!(
             body,
-            "  {{ var t: u16 = 0; while (t < {rows}) : (t += 1) {{ @fmovs(D_sx, fab.fin(q_i{u}, {sw})); {step} @fmovs(fab.fout(q_o{u}, {d}), D_ob); }} }}"
+            "  {{ var t: u16 = 0; while (t < {rows}) : (t += 1) {{ @fmovs(D_sx, fab.fin(q_i{u}, {sw})); {step} @fmovs(fab.fout(q_o{u}, {dv}), D_ob); }} }}"
         );
         at += rows;
     }
@@ -2629,7 +2650,7 @@ fn st_root_file(p: &Program, k: usize, ks: &place::KvSched) -> R<(String, String
 /// A state column's PE (P8, ops/sst.csl): its rows of each head's state, a step a row.
 fn st_pe_file(p: &Program, k: usize, ks: &place::KvSched) -> R<(String, String)> {
     let j = kv_joint(p, ks);
-    let d = j.head_dim;
+    let (d, dv) = (j.head_dim, j.v_dim());
     let pya = p.stream.kv[k].pya;
     let rows: u32 = ks.stores.iter().map(|s| s.1).sum();
     let name = format!("sp_{k}.csl");
@@ -2645,7 +2666,7 @@ fn st_pe_file(p: &Program, k: usize, ks: &place::KvSched) -> R<(String, String)>
     t.push_str("const red = @import_module(\"ops/schain.csl\", .{ .fab = fab, .IN1 = q_r, .OUT = q_s });\n");
     let _ = writeln!(
         t,
-        "const st = @import_module(\"ops/sst.csl\", .{{ .fab = fab, .red = red, .YM = q_am, .DK = {d}, .DV = {d}, .PYA = {pya}, .SLOTS = {rows}, .ROWS = {rows} }});"
+        "const st = @import_module(\"ops/sst.csl\", .{{ .fab = fab, .red = red, .YM = q_am, .DK = {d}, .DV = {dv}, .PYA = {pya}, .SLOTS = {rows}, .ROWS = {rows} }});"
     );
     // a decode step's rows each a lane's (its state slot; `rowp`, the host's)
     t.push_str("var rowp_p: [*]u32 = &st.rowp;\n");
