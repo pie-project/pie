@@ -6,7 +6,8 @@
 //! plain and drafting words alone before, so trackb-h2o, trackb-snapkv and
 //! snapkv-eviction on Qwen3-0.6B were refused at their first capturing fire
 //! ("`attn_score_capture_bfloat16_d_128` would not enqueue: ... which the
-//! load did not build before ready").
+//! load did not build before ready"). Each capturing fire has its reader,
+//! the program its rows are a term of.
 
 use engine_metal::serve::Seated;
 use engine_metal::{Boot, Lane, Shell};
@@ -61,24 +62,31 @@ fn a_load_walks_its_score_capturing_forms() {
     };
     let tokens: Vec<u32> = (0..6u32).map(|at| (11 + at * 37) % 256).collect();
     shell.open(0).expect("a slot opens");
-    shell
-        .fire_seated(&[Seated {
+    // A capturing lane's rows are its reader's term: one program reads them.
+    let context = shell.paging().context();
+    let reader = super::the_score_rows_are_the_oracles::bind_score_reader(&mut shell, context, 0);
+    super::the_score_rows_are_the_oracles::fire_read(
+        &mut shell,
+        &[Seated {
             held: Some(0),
             ..Seated::of(Lane {
                 slot: 0,
                 word: scores(tokens.len() as u32),
                 tokens: &tokens,
             })
-        }])
-        .expect("a prompt capturing its scores is served after the sealed walk");
-    shell
-        .fire_seated(&[Seated {
+        }],
+        reader,
+    );
+    super::the_score_rows_are_the_oracles::fire_read(
+        &mut shell,
+        &[Seated {
             held: Some(tokens.len() as u32),
             ..Seated::of(Lane {
                 slot: 0,
                 word: scores(1),
                 tokens: &[5],
             })
-        }])
-        .expect("a decode capturing its scores is served after the sealed walk");
+        }],
+        reader,
+    );
 }

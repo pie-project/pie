@@ -4823,7 +4823,7 @@ impl Shell {
         // The capturing lanes' score rows, laid in the guest region before
         // any program stage takes its scratch there.
         let mut guest = self.guest_carve();
-        let (capture_seat, capture_rows) = self.lay_capture(&composition, &mut guest, arm)?;
+        let (capture_seat, capture_rows) = self.lay_capture(&composition, attachments, &mut guest, arm)?;
         self.last_capture = capture_rows.clone();
         let bindings = FireBindings {
             tokens: bound.tokens,
@@ -4946,9 +4946,32 @@ impl Shell {
     fn lay_capture(
         &mut self,
         composition: &Composition,
+        attachments: &[Attached],
         guest: &mut crate::program::GuestCarve,
         arm: usize,
     ) -> Result<(Option<crate::run::CaptureSeat>, CaptureRows)> {
+        // A capturing lane's rows are a term of the program that reads them
+        // (`Plane::fire_facts`): one no program attached in this fire reads
+        // (a prompt's earlier pieces, whose program rides the last) lays
+        // none, and its capture is skipped, as nothing can read it. The dry
+        // walk before ready lays every capturing lane's, to build the score
+        // kernels; it commits nothing.
+        let mut readers = Vec::new();
+        for row in composition.lanes() {
+            if self.warming {
+                readers.push(true);
+                continue;
+            }
+            let reads = attachments
+                .iter()
+                .filter(|a| (a.lane..a.lane + a.lanes.max(1)).contains(&row.source))
+                .map(|a| self.programs.reads(a.instance))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .any(|(name, _)| matches!(name.as_str(), "attn.scores" | "attn.scores.pages"));
+            readers.push(reads);
+        }
         let Some(layout) = self.capture.as_mut() else {
             return Ok((None, CaptureRows::default()));
         };
@@ -4958,7 +4981,7 @@ impl Shell {
         let mut pages_at = vec![u64::MAX; lanes.len().max(1)];
         let mut rows = Vec::new();
         for (at, row) in lanes.iter().enumerate() {
-            if !layout.classes.contains(row.class as usize) {
+            if !layout.classes.contains(row.class as usize) || !readers[at] {
                 continue;
             }
             let taken = guest.take(key_bytes + page_bytes)?;

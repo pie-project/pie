@@ -15,13 +15,10 @@ impl Run<'_> {
         u32::try_from(self.qo_indptr_host().len().saturating_sub(1)).unwrap_or(u32::MAX)
     }
 
-    /// The fire's capturing lanes' rows: a score op runs only in a fire one
-    /// of whose lanes captures.
-    fn capture_seat(&self) -> Result<crate::run::CaptureSeat, kernels_metal::Error> {
-        self.bindings().capture.ok_or_else(|| kernels_metal::Error::Backend {
-            op: "attn.score_capture",
-            detail: "this fire runs a score capture and none of its lanes captures".to_string(),
-        })
+    /// The fire's capturing lanes' rows; none where no lane of it has a
+    /// reader, and the score ops then have nothing to write.
+    fn capture_seat(&self) -> Option<crate::run::CaptureSeat> {
+        self.bindings().capture
     }
 
     fn attention(&mut self, op: &Attn) -> Result<(), kernels_metal::Error> {
@@ -38,7 +35,9 @@ impl Run<'_> {
                 into,
                 ..
             } => {
-                let seat = self.capture_seat()?;
+                let Some(seat) = self.capture_seat() else {
+                    return Ok(());
+                };
                 attn::score::capture(
                     self.ctx(),
                     self.ragged(*q),
@@ -60,7 +59,9 @@ impl Run<'_> {
                 )
             }
             Attn::ScorePages { .. } => {
-                let seat = self.capture_seat()?;
+                let Some(seat) = self.capture_seat() else {
+                    return Ok(());
+                };
                 attn::score::pages(
                     self.ctx(),
                     seat.store,
