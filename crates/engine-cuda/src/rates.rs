@@ -88,13 +88,50 @@ pub fn measure(
 #[allow(unsafe_code)]
 mod on_device {
     use core::ffi::c_void;
+    use core::sync::atomic::{AtomicUsize, Ordering};
 
     use kernels_cuda::attn::plan::{Live, Shape, Workspace};
     use kernels_cuda::{Ctx, KvPool, RaggedTensor, RecurrentPool, Slabs, Tensor};
     use poem_ir::Dtype;
 
     use super::*;
-    use crate::device::{Buffer, Context, Graph, rt};
+    use crate::device::{Context, Graph, rt};
+
+    /// The device bytes the step's buffers hold now, and the most they held.
+    static LIVE: AtomicUsize = AtomicUsize::new(0);
+    static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+    /// A device buffer the step holds, counted in [`LIVE`] and [`PEAK`]
+    /// while it lives.
+    struct Buffer(crate::device::Buffer);
+
+    impl Buffer {
+        fn zeroed(bytes: usize) -> crate::error::Result<Buffer> {
+            let b = crate::device::Buffer::zeroed(bytes)?;
+            let live = LIVE.fetch_add(b.bytes(), Ordering::Relaxed) + b.bytes();
+            PEAK.fetch_max(live, Ordering::Relaxed);
+            Ok(Buffer(b))
+        }
+    }
+
+    impl core::ops::Deref for Buffer {
+        type Target = crate::device::Buffer;
+        fn deref(&self) -> &crate::device::Buffer {
+            &self.0
+        }
+    }
+
+    impl core::ops::DerefMut for Buffer {
+        fn deref_mut(&mut self) -> &mut crate::device::Buffer {
+            &mut self.0
+        }
+    }
+
+    impl Drop for Buffer {
+        fn drop(&mut self) {
+            LIVE.fetch_sub(self.0.bytes(), Ordering::Relaxed);
+        }
+    }
 
     type Kernel = kernels_cuda::Error;
 
@@ -283,6 +320,11 @@ mod on_device {
         let bytes = copy(stream, &clock)?;
         let launch = launch(device.ctx(), stream, &clock, &mut held)?;
         device.synchronize().map_err(say("the device"))?;
+        eprintln!(
+            "[rates]: the step held at most {} MiB of device buffers ({} MiB of slabs at its end)",
+            PEAK.load(Ordering::Relaxed) >> 20,
+            held.iter().map(|b| b.bytes()).sum::<usize>() >> 20
+        );
         Ok(Rates {
             bf16_flops_per_ns_by_rows_n_k: Some(grid),
             attn_flops_per_ns_by_keys_and_dim: Some(attn),
