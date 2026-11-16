@@ -222,9 +222,13 @@ fn state_elements(trace: &Trace) -> u64 {
         .sum()
 }
 
-/// The activation bytes a row's elementwise nodes read and write: each
-/// operand whose rows are the fire's tokens, its row at its element's
-/// size (an op in place reads its row and writes it back, both counted).
+/// The activation bytes a row's per-row ops read and write: each operand
+/// whose rows are the fire's tokens, its row at its element's size (an op in
+/// place reads its row and writes it back, both counted), over the
+/// elementwise nodes (norms over the hidden width and over each head,
+/// RoPE, activations, residual adds), the q / k / v splits, the fused
+/// norm and RoPE forms, and the kv append (its k and v rows read and
+/// written to the pool).
 fn elementwise_bytes(trace: &Trace) -> u64 {
     use poem_ir::Operands as _;
     let row_bytes = |value: &poem_ir::ValueId| -> u64 {
@@ -251,13 +255,45 @@ fn elementwise_bytes(trace: &Trace) -> u64 {
     let mut operands = Vec::new();
     let mut total = 0u64;
     for node in &trace.nodes {
-        if !matches!(node.op, Operation::Elemwise(_)) {
-            continue;
-        }
+        // Each counted node's operands, and how many times its rows move:
+        // once each, or twice for an append (read, then written to the
+        // pool, whose own value is no row of the fire's).
+        let times = match &node.op {
+            Operation::Elemwise(_) => 1,
+            Operation::Gather(
+                poem_ir::Gather::SplitQkv { .. }
+                | poem_ir::Gather::SplitQGate { .. }
+                | poem_ir::Gather::SplitQkvPadded { .. },
+            ) => 1,
+            Operation::Fused(
+                poem_ir::Fused::ResidualAddRmsnorm { .. }
+                | poem_ir::Fused::RmsnormResidualAdd { .. }
+                | poem_ir::Fused::NormRope { .. }
+                | poem_ir::Fused::NormRopePair { .. }
+                | poem_ir::Fused::NormModulate { .. }
+                | poem_ir::Fused::GatedResidualNormModulate { .. }
+                | poem_ir::Fused::ResBlendRmsnorm { .. },
+            ) => 1,
+            Operation::Fused(
+                poem_ir::Fused::NormRopeLastAppend { .. }
+                | poem_ir::Fused::QGateNormRopeAppend { .. }
+                | poem_ir::Fused::QkvFusedQknormRopeVnormWrite { .. }
+                | poem_ir::Fused::RopeYarnAppend { .. }
+                | poem_ir::Fused::SplitRopeYarnAppend { .. },
+            ) => 2,
+            Operation::Attn(
+                poem_ir::Attn::KvAppend { .. }
+                | poem_ir::Attn::MlaKvAppend { .. }
+                | poem_ir::Attn::PoolKvAppend { .. }
+                | poem_ir::Attn::IndexKvAppend { .. },
+            ) => 2,
+            _ => continue,
+        };
         operands.clear();
         node.op.inputs(&mut operands);
         node.op.outputs(&mut operands);
-        total = total.saturating_add(operands.iter().map(row_bytes).sum::<u64>());
+        let bytes: u64 = operands.iter().map(row_bytes).sum();
+        total = total.saturating_add(bytes.saturating_mul(times));
     }
     total
 }
@@ -571,6 +607,127 @@ mod tests {
              attn_flops_per_ns_by_keys` is unstated, so nothing weighs its top rung; `pie tune <backend> \
              --rates` measures it"
         );
+    }
+
+    /// A trace of `nodes` over values of `[tokens, width]` bf16 each (one a
+    /// width), and a cache value (no row of the fire's) at the end.
+    fn per_row(widths: &[u64], nodes: Vec<Operation>) -> Trace {
+        let bf16 = |width: u64| poem_ir::ValueDecl {
+            def: Def::Op(0),
+            ty: Ty::Tensor {
+                shape: vec![Dim::Tokens, Dim::Const(width)],
+                dtype: poem_ir::Dtype::Bf16,
+            },
+        };
+        let mut values: Vec<poem_ir::ValueDecl> = widths.iter().map(|&w| bf16(w)).collect();
+        values.push(poem_ir::ValueDecl {
+            def: Def::Cache(0),
+            ty: Ty::Tensor {
+                shape: vec![Dim::Const(1024), Dim::Const(256)],
+                dtype: poem_ir::Dtype::Bf16,
+            },
+        });
+        Trace {
+            name: "per-row".into(),
+            platform: poem_ir::Platform::Vulkan,
+            params: Vec::new(),
+            caches: Vec::new(),
+            values,
+            nodes: nodes
+                .into_iter()
+                .map(|op| poem_ir::Node {
+                    op,
+                    guard: poem_ir::Guard::Always,
+                    layer: None,
+                })
+                .collect(),
+            outputs: Vec::new(),
+            drafter: None,
+            facts: poem_ir::Facts::default(),
+            inputs: Vec::new(),
+        }
+    }
+
+    fn v(i: u32) -> poem_ir::ValueId {
+        poem_ir::ValueId(i)
+    }
+
+    #[test]
+    fn a_norm_over_the_hidden_and_over_each_head_reads_and_writes_its_row() {
+        // rms over a 1024-wide row: 2 KiB in, 2 KiB out; over q's 16 heads
+        // of 128 (a per-head norm): 4 KiB in and out.
+        let rms = |x, y, axis| {
+            Operation::Elemwise(poem_ir::Elemwise::Rmsnorm {
+                x: v(x),
+                weight: poem_ir::NormWeight::None,
+                axis,
+                eps: 1e-6,
+                y: v(y),
+            })
+        };
+        let trace = per_row(
+            &[1024, 1024, 2048, 2048],
+            vec![
+                rms(0, 1, poem_ir::NormAxis::Row),
+                rms(2, 3, poem_ir::NormAxis::Head(128)),
+            ],
+        );
+        assert_eq!(elementwise_bytes(&trace), 2 * 2048 + 2 * 4096);
+    }
+
+    #[test]
+    fn the_qkv_split_reads_its_packed_row_and_writes_three() {
+        // 2048 + 512 + 512 packed: 6 KiB in, 4 + 1 + 1 KiB out.
+        let trace = per_row(
+            &[3072, 2048, 512, 512],
+            vec![Operation::Gather(poem_ir::Gather::SplitQkv {
+                packed: v(0),
+                q_width: 2048,
+                kv_width: 512,
+                q: v(1),
+                k: v(2),
+                v: v(3),
+            })],
+        );
+        assert_eq!(elementwise_bytes(&trace), 6144 + 4096 + 1024 + 1024);
+    }
+
+    #[test]
+    fn rope_turns_q_and_k_in_place() {
+        // q (2048 wide) and k (512) read and written; the positions are no
+        // bf16 row here (a cache-shaped value).
+        let trace = per_row(
+            &[2048, 512],
+            vec![Operation::Elemwise(poem_ir::Elemwise::Rope {
+                q: v(0),
+                k: Some(v(1)),
+                positions: v(2),
+                head_dim: 128,
+                theta: 1e6,
+                turn: poem_ir::Turn::Full { interleaved: false },
+                freqs: None,
+                q_out: v(0),
+                k_out: Some(v(1)),
+            })],
+        );
+        assert_eq!(elementwise_bytes(&trace), 2 * (4096 + 1024));
+    }
+
+    #[test]
+    fn the_kv_append_reads_its_rows_and_writes_them_to_the_pool() {
+        // k and v rows of 512 read, then written: the pool's own value is no
+        // row of the fire's.
+        let trace = per_row(
+            &[512, 512],
+            vec![Operation::Attn(poem_ir::Attn::KvAppend {
+                k: v(0),
+                v: Some(v(1)),
+                cache: v(2),
+                write_page: v(2),
+                write_offset: v(2),
+            })],
+        );
+        assert_eq!(elementwise_bytes(&trace), 2 * (1024 + 1024));
     }
 
     #[test]

@@ -297,7 +297,11 @@ mod on_device {
         let values = zeroed(cells * kv_width as usize * 2)?;
         let q = zeroed((rows * q_heads * d) as usize * 2)?;
         let o = zeroed((rows * q_heads * d) as usize * 2)?;
-        let page_ids: Vec<i32> = (0..pages as i32).collect();
+        // The sequence's pages scattered over the pool as a served one's are.
+        let page_ids: Vec<i32> = engine::rates::attn_page_order(pages)
+            .into_iter()
+            .map(|p| p as i32)
+            .collect();
         let indices = column(&page_ids)?;
         let kv_indptr = [0, pages as i32];
         let indptr = column(&kv_indptr)?;

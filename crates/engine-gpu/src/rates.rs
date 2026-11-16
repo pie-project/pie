@@ -248,7 +248,8 @@ fn attention<B: Serve>(
     let keys = rig.zeros(s.keys, kv_width, Dtype::Bf16)?;
     let values = rig.zeros(s.keys, kv_width, Dtype::Bf16)?;
     let pages = s.keys.div_ceil(PAGE);
-    let indices: Vec<u32> = (0..pages).collect();
+    // The sequence's pages scattered over the pool as a served one's are.
+    let indices: Vec<u32> = engine::rates::attn_page_order(pages);
     let page_indices = rig.words(&indices, pages, 1, Dtype::U32)?;
     let page_indptr = rig.words(&[0, pages], 2, 1, Dtype::U32)?;
     let pool = KvPool::planes(

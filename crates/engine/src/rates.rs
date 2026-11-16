@@ -11,8 +11,8 @@
 //!   `k` of [`DEPTHS`], [`gemm_flops`] a matmul over its time.
 //! - `attn_flops_per_ns_by_keys`: the backend's prefill attention at
 //!   [`ATTN_SHAPE`]'s heads, one sequence of `keys` rows attending itself at
-//!   each `keys` of [`ATTN_KEYS`] ([`AttnShape::at`]), [`attn_flops`] over its
-//!   time.
+//!   each `keys` of [`ATTN_KEYS`] ([`AttnShape::at`]), its pages laid in the
+//!   pool in [`attn_page_order`], [`attn_flops`] over its time.
 //! - `scan_elements_per_ns`: the backend's prefill gated-delta scan and the
 //!   causal conv before it at [`SCAN_SHAPE`], [`scan_elements`] over the two
 //!   together's time.
@@ -88,6 +88,39 @@ pub const ATTN_SHAPE: AttnShape = AttnShape {
 /// to 16384 (past the widest rung a load lays), since a paged prefill's
 /// rate a flop grows with the keys its tiles stream.
 pub const ATTN_KEYS: [u32; 6] = [512, 1024, 2048, 4096, 8192, 16384];
+
+/// The step the attention's page table walks its pool by: page `i` of the
+/// sequence is pool page `i · ATTN_PAGE_STRIDE mod pages`
+/// ([`attn_page_order`]). A served fire reads pages the pool laid scattered,
+/// not 0, 1, 2, ... in order, and a prefill streams them slower so; the
+/// curve is timed over the same scatter on every backend. A prime past any
+/// page count the lattice lays (16384 keys in pages of 16 are 1024), so it
+/// is coprime with every one and the order a permutation.
+pub const ATTN_PAGE_STRIDE: u32 = 7919;
+
+/// The pool page each of `pages` sequence pages lies in, in sequence order:
+/// a fixed permutation of `0..pages` (no RNG), the same on every backend.
+#[must_use]
+pub fn attn_page_order(pages: u32) -> Vec<u32> {
+    let n = u64::from(pages.max(1));
+    // A stride coprime with the count, so the walk visits every page once.
+    let gcd = |mut a: u64, mut b: u64| {
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        a
+    };
+    // Past two pages, a stride of neither 0 nor 1 (mod the count): the walk
+    // never keeps the pages in order.
+    let mut stride = u64::from(ATTN_PAGE_STRIDE) % n;
+    while n > 2 && (stride <= 1 || gcd(stride, n) != 1) {
+        stride = (stride + 1) % n;
+    }
+    let stride = stride.max(1);
+    (0..u64::from(pages))
+        .map(|i| u32::try_from(i * stride % n).unwrap_or(0))
+        .collect()
+}
 
 impl AttnShape {
     /// This shape's heads over one sequence of `keys` rows attending itself.
@@ -236,6 +269,18 @@ mod tests {
         assert_eq!(scan_elements(SCAN_SHAPE), 2048.0 * 16.0 * 16384.0);
         assert_eq!(SCAN_SHAPE.channels(), 6144);
         assert!(ATTN_KEYS.windows(2).all(|w| w[0] < w[1]));
+        for pages in [1, 2, 7, 32, 1024, 7919, 15838] {
+            let mut order = attn_page_order(pages);
+            let in_order = order.windows(2).all(|w| w[0] < w[1]);
+            assert!(pages <= 2 || !in_order, "{pages} pages scattered");
+            order.sort_unstable();
+            assert_eq!(
+                order,
+                (0..pages).collect::<Vec<u32>>(),
+                "a permutation of {pages}"
+            );
+        }
+        assert_eq!(&attn_page_order(32)[..4], &[0, 15, 30, 13]);
         assert_eq!(ATTN_SHAPE.at(512).rows, 512);
         assert_eq!(attn_flops(ATTN_SHAPE.at(512)), 4.0 * 512.0 * 512.0 * 2048.0);
     }
