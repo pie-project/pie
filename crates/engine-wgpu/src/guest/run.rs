@@ -156,7 +156,7 @@ impl<'a> OnDevice<'a> {
             };
             let dtype = plan.value_types[local as usize].dtype;
             let held = self.session.bytes(at, local).unwrap_or(0);
-            let raw = self.session.taken(at, local)?;
+            let raw = self.session.taken(self.device, at, local)?;
             tracing::trace!(
                 stage = at,
                 global,

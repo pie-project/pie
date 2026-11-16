@@ -229,6 +229,23 @@ fn an_instance_in_pool_slots_fires_through_moves() {
         })
         .expect("the miniature loads");
     let chunks = loaded.caps.chunks.clone();
+    let creations = |engine: &mut backend::Engine| {
+        engine
+            .shell_mut()
+            .expect("loaded")
+            .device()
+            .books()
+            .creations()
+    };
+    let ready = creations(&mut engine);
+    // The miniature's declared outputs bound a lane's room in the guest ring
+    // (`FireLimits::guest_lane_bytes`); `last`'s cell is wider, so its seed
+    // and its puts move through the device's transfer staging.
+    let room = loaded.caps.limits.guest_lane_bytes;
+    assert!(
+        room > 0 && room < u64::from(WIDE) * 4,
+        "a lane's room ({room}) is narrower than `last`'s cell"
+    );
     let top = chunks.segment_chunks;
     assert!(top >= 10, "segment 0 holds the test's chunks: {top}");
     assert!(
@@ -568,6 +585,23 @@ fn an_instance_in_pool_slots_fires_through_moves() {
         0,
         "a fire through pool slots and their moves built a pipeline the load did not"
     );
+    // Moves, parks, a seed past the ring's room: nothing allocated since
+    // the load was ready.
+    assert_eq!(
+        creations(&mut bound.engine),
+        ready,
+        "the instance's passes and moves created buffers after the load was ready"
+    );
+    if backend::NAME == "vulkan" {
+        assert!(
+            bound
+                .engine
+                .live()
+                .tallied(engine::live::Tally::Staged)
+                > 0,
+            "the seed past the ring's room staged through the transfer staging"
+        );
+    }
 
     drop(bound);
     let _ = std::fs::remove_dir_all(&dir);

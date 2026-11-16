@@ -3889,8 +3889,12 @@ impl<B: Serve> Shell<B> {
 
         // The lanes whose class captures, compacted in lane order: a key row
         // each, and a page row each of those whose program reads pages.
+        // A lane captures where its class writes score rows and a reader
+        // holds its rows: a fire with no reader bound (the load's warm and
+        // arming fires among them) lays none, and its captures skip.
         let scored = Scored::of(composition.lanes().iter().map(|row| {
-            let captures = self.captures(row.class as usize);
+            let captures = self.captures(row.class as usize)
+                && lanes[row.source as usize].scores.is_some();
             let pages = captures
                 && lanes[row.source as usize]
                     .reads

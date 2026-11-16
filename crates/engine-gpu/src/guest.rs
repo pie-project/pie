@@ -49,15 +49,6 @@ pub enum Refused {
     /// The stage's scratch does not lie in the load's chunks: a value, or
     /// the temporary area, is larger than a chunk.
     Chunk { stage: usize, why: String },
-
-    /// A pass of the stage moves more between the host and the device than
-    /// the load's staging holds for its lanes (`FireLimits::guest_lane_bytes`).
-    LaneIo {
-        stage: usize,
-        way: &'static str,
-        bytes: u64,
-        bound: u64,
-    },
 }
 
 impl std::fmt::Display for Refused {
@@ -88,16 +79,6 @@ impl std::fmt::Display for Refused {
                 )
             }
             Self::Chunk { stage, why } => write!(f, "stage {stage}'s scratch: {why}"),
-            Self::LaneIo {
-                stage,
-                way,
-                bytes,
-                bound,
-            } => write!(
-                f,
-                "a pass of stage {stage} {way} {bytes} bytes, past the {bound} this load's \
-                 guest staging holds for its lanes"
-            ),
         }
     }
 }
@@ -187,6 +168,8 @@ pub fn step_source(stage: usize, plan: &LaunchStagePlan) -> Result<wgsl::Stepwis
 
 pub struct Compiled<L: Lower> {
     stages: Vec<Lowered<L::Code>>,
+    /// Where its passes move past their lanes' rooms ([`past_rooms`]).
+    past: Vec<PastRooms>,
 }
 
 pub struct Lowered<C> {
@@ -271,36 +254,71 @@ pub fn pass_io(package: &LaunchPackage, at: usize, tables: &session::StageTables
 }
 
 /// Refuses, by name, a program whose stage `at` lays no scratch in the
-/// load's chunks or moves more than its staging holds, at `extents`.
+/// load's chunks at `extents`.
 pub fn within(
     package: &LaunchPackage,
     at: usize,
     extents: &eta_exec::Extents,
     bounds: Bounds,
 ) -> Result<session::StageTables, Refused> {
-    let plan = &package.plans[at];
-    let tables = session::stage_tables(plan, extents, bounds.chunk)
-        .map_err(|why| Refused::Chunk { stage: at, why })?;
-    let bound = u64::from(pass_lanes(package)) * bounds.io.lane_bytes;
-    let (staged, landed) = pass_io(package, at, &tables);
-    for (way, bytes) in [("stages", staged), ("lands", landed)] {
-        if bytes > bound {
-            return Err(Refused::LaneIo {
-                stage: at,
-                way,
-                bytes,
-                bound,
-            });
-        }
+    session::stage_tables(&package.plans[at], extents, bounds.chunk)
+        .map_err(|why| Refused::Chunk { stage: at, why })
+}
+
+/// Where a pass of stage `at` moves more between the host and the device
+/// than its lanes' rooms in the ring hold (`FireLimits::guest_lane_bytes`):
+/// each way it does (`stages`, `lands`), its bytes and the rooms' room. Such
+/// a root or put moves through the device's transfer staging instead
+/// ([`engine::live::Tally::Staged`]): one mechanism with a size rule, stated
+/// at registration.
+#[must_use]
+pub fn past_rooms(
+    package: &LaunchPackage,
+    at: usize,
+    tables: &session::StageTables,
+    bounds: Bounds,
+) -> Vec<PastRooms> {
+    let room = u64::from(pass_lanes(package)) * bounds.io.lane_bytes;
+    let (staged, landed) = pass_io(package, at, tables);
+    [("stages", staged), ("lands", landed)]
+        .into_iter()
+        .filter(|&(_, bytes)| bytes > room)
+        .map(|(way, bytes)| PastRooms {
+            stage: at,
+            way,
+            bytes,
+            room,
+        })
+        .collect()
+}
+
+/// A way a pass moves past its lanes' rooms ([`past_rooms`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PastRooms {
+    pub stage: usize,
+    pub way: &'static str,
+    pub bytes: u64,
+    pub room: u64,
+}
+
+impl std::fmt::Display for PastRooms {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "a pass of stage {} {} {} bytes, past the {} its lanes' rooms in the guest ring \
+             hold, so it moves through the device's transfer staging",
+            self.stage, self.way, self.bytes, self.room
+        )
     }
-    Ok(tables)
 }
 
 impl<L: Lower> Compiled<L> {
     pub fn of(package: &LaunchPackage, bounds: Bounds) -> Result<Compiled<L>, Refused> {
         scratch_holds_the_hosts_values(package)?;
+        let mut past = Vec::new();
         for at in 0..package.plans.len() {
-            within(package, at, &eta_exec::Extents::default(), bounds)?;
+            let tables = within(package, at, &eta_exec::Extents::default(), bounds)?;
+            past.extend(past_rooms(package, at, &tables, bounds));
         }
         let mut stages = Vec::with_capacity(package.plans.len());
         for (at, plan) in package.plans.iter().enumerate() {
@@ -311,7 +329,20 @@ impl<L: Lower> Compiled<L> {
                 strides_the_grid: true,
             });
         }
-        Ok(Compiled { stages })
+        Ok(Compiled { stages, past })
+    }
+
+    /// Where its passes move past their lanes' rooms ([`past_rooms`]).
+    #[must_use]
+    pub fn past_rooms(&self) -> &[PastRooms] {
+        &self.past
+    }
+
+    /// Whether a pass of it lands a put past its rooms: it then lands where
+    /// the pass ran, never later than its fire.
+    #[must_use]
+    pub fn lands_past_rooms(&self) -> bool {
+        self.past.iter().any(|past| past.way == "lands")
     }
 
     #[must_use]
@@ -380,6 +411,9 @@ impl<L: Lower> Forms<L> {
         };
         match Compiled::of(package, bounds) {
             Ok(compiled) => {
+                for past in compiled.past_rooms() {
+                    tracing::info!(program = program.0, "guest program {program}: {past}");
+                }
                 self.compiled.insert(program, Arc::new(compiled));
                 true
             }
@@ -657,10 +691,11 @@ mod tests {
         assert_eq!(totals, shipped::EXPECTED);
     }
 
-    /// A program whose value is past a chunk, or whose lane moves more than
-    /// a lane's staging holds, is refused at registration by name.
+    /// A program whose value is past a chunk is refused at registration by
+    /// name; one whose lane moves more than its room in the ring is stated
+    /// by name and staged through the transfer staging.
     #[test]
-    fn a_program_past_the_loads_bounds_is_refused_by_name() {
+    fn a_program_past_the_loads_bounds_is_named() {
         let vocab = shipped::QWEN_VOCAB;
         let package = shipped::package(&shipped::sorted(vocab), vocab);
         let io = crate::program::GuestIo {
@@ -677,29 +712,27 @@ mod tests {
             matches!(&refused, Some(Refused::Chunk { stage: 0, why }) if why.contains("past a 1048576-byte chunk")),
             "{refused:?}"
         );
-        // A model declaring the logits row alone bounds a lane at that row
-        // (`Shell::guest_io`): the whole row's ids and the token beside
-        // them are four bytes past it, refused by name.
+        // A model declaring the logits row alone bounds a lane's room at
+        // that row (`Shell::guest_io`): the whole row's ids and the token
+        // beside them are four bytes past it, stated by name and staged
+        // through the device's transfer staging, not refused.
         let bounds = Bounds {
             chunk: shipped::QWEN_CHUNK,
             io,
         };
-        let refused = within(&package, 0, &Extents::default(), bounds).err();
-        assert!(
-            matches!(
-                refused,
-                Some(Refused::LaneIo { stage: 0, way: "lands", bytes, bound })
-                    if bytes == bound + 4
-            ),
-            "{refused:?}"
+        let tables = within(&package, 0, &Extents::default(), bounds).expect("lays out");
+        let past = past_rooms(&package, 0, &tables, bounds);
+        assert_eq!(
+            past,
+            [PastRooms {
+                stage: 0,
+                way: "lands",
+                bytes: 607_748,
+                room: 607_744,
+            }]
         );
-        assert!(
-            refused
-                .expect("refused")
-                .to_string()
-                .contains("lands 607748 bytes, past the 607744"),
-        );
-        // One that declares a sampled token beside it holds them.
+        assert!(past[0].to_string().contains("lands 607748 bytes, past the 607744"));
+        // One that declares a sampled token beside it holds them in its room.
         let with_token = Bounds {
             io: crate::program::GuestIo {
                 lane_bytes: (u64::from(vocab) + 1) * 4,
@@ -707,9 +740,10 @@ mod tests {
             },
             ..bounds
         };
-        assert!(within(&package, 0, &Extents::default(), with_token).is_ok());
+        assert!(past_rooms(&package, 0, &tables, with_token).is_empty());
         let top_p = shipped::package(&shipped::top_p(vocab), vocab);
-        assert!(within(&top_p, 0, &Extents::default(), bounds).is_ok());
+        let tables = within(&top_p, 0, &Extents::default(), bounds).expect("lays out");
+        assert!(past_rooms(&top_p, 0, &tables, bounds).is_empty());
     }
 
     /// An instance's score rows lie whole in pieces beside its scratch: in

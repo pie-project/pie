@@ -52,6 +52,8 @@ impl Instance {
 #[derive(Default)]
 pub(crate) struct Tally {
     device: AtomicU64,
+    /// The engine's serving tallies, from its load on.
+    live: std::sync::OnceLock<engine::live::Live>,
 }
 
 use engine_gpu::serve::InputCell;
@@ -89,6 +91,12 @@ impl Half {
         let outcome =
             eta_exec::step_with(&mut self.inst, &self.plan, &inputs, &mut runner, pass.at);
         let ran = runner.ran().len();
+        drop(runner);
+        if self.session.slabbed()
+            && let Some(live) = tally.live.get()
+        {
+            live.tally(engine::live::Tally::Staged, 1);
+        }
         if self.inst.poisoned {
             self.poisoned.store(true, Ordering::Release);
         }
@@ -338,8 +346,7 @@ impl Plane {
             "guest program registered"
         );
         if let Some(
-            why @ (engine_gpu::guest::Refused::Chunk { .. }
-            | engine_gpu::guest::Refused::LaneIo { .. }),
+            why @ engine_gpu::guest::Refused::Chunk { .. },
         ) = self.forms.refusal(id)
         {
             let why = why.to_string();
@@ -1191,6 +1198,10 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
 
     fn package(&self, program: ProgramId) -> Option<&eta_compiler::codegen::launch::LaunchPackage> {
         Plane::package(self, program)
+    }
+
+    fn watch(&mut self, live: engine::live::Live) {
+        let _ = self.tally.live.set(live);
     }
 
     fn facts(

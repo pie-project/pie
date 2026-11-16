@@ -100,6 +100,12 @@ pub trait Programs<B: Serve>: Default {
     /// then builds its own stages and nothing else.
     fn load(&mut self, place: &Place<'_, B>) -> Result<(), Refusal>;
 
+    /// The engine's serving tallies, which a pass staged past its rooms
+    /// counts into ([`engine::live::Tally::Staged`]).
+    fn watch(&mut self, live: engine::live::Live) {
+        let _ = live;
+    }
+
     /// What an instance of `program` holds in the pool's `Instance` and
     /// `Channel` slots (`Engine::program_facts`).
     fn facts(&self, program: ProgramId, place: &Place<'_, B>) -> Result<ProgramFacts, Refusal>;

@@ -199,8 +199,22 @@ impl<'a> OnDevice<'a> {
                 continue;
             }
             if let Some(local) = local_of(package, at, global)? {
-                let ring_at = self.session.read_back(&mut frame, at, local)?;
-                landed_at.push((global, ring_at));
+                match self.session.read_back(&mut frame, at, local)? {
+                    Some(ring_at) => landed_at.push((global, ring_at)),
+                    // A put past the rooms lands where it lies, read once the
+                    // pass has landed: no deferred pass takes one
+                    // (`Plane::defers`).
+                    None if deferring => {
+                        return Err(Fault::Program {
+                            at: "guest::run",
+                            why: format!(
+                                "stage {at} recorded to land later puts value {local} past \
+                                 its lanes' ring rooms"
+                            ),
+                        });
+                    }
+                    None => {}
+                }
             }
         }
         self.session.land_status(&mut frame)?;

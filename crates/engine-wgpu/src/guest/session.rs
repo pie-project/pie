@@ -12,7 +12,7 @@ use engine_gpu::store::layout::INSTANCE;
 
 use engine_gpu::guest::held::{self, consecutive};
 use engine_gpu::guest::session::{
-    BINDINGS, CFG_BINDING, InstanceLay, PiecePlace, RING_ALIGN, ScoreRows, ScoreSpec, SEGMENT_BINDINGS, StageTables, bases_at,
+    BINDINGS, CFG_BINDING, InstanceLay, PiecePlace, ScoreRows, ScoreSpec, SEGMENT_BINDINGS, StageTables, bases_at,
     groups_for, lay_instance, piece_places, score_rows, stage_tables,
 };
 
@@ -114,6 +114,9 @@ struct Stage {
 
     /// The values landed in the pass's ring rooms: (value, ring byte).
     landed: Vec<(u32, u64)>,
+    /// The values past the rooms' room: read once the pass lands, through
+    /// the rooms a piece at a time ([`Session::taken`]).
+    over: Vec<u32>,
 }
 
 /// A piece of the instance's scratch: where it lies, and its segment's
@@ -146,6 +149,9 @@ pub struct Session {
     lanes: u32,
     /// The rooms of the pass being recorded.
     pass: Option<Region>,
+    /// Whether the pass landed a put past its rooms
+    /// ([`engine::live::Tally::Staged`]).
+    slabbed: bool,
 
     code: Arc<Code>,
 }
@@ -231,6 +237,7 @@ impl Session {
                 descriptors,
                 tables,
                 landed: Vec::new(),
+                over: Vec::new(),
             });
         }
 
@@ -250,6 +257,7 @@ impl Session {
             ring: Arc::clone(tables.ring),
             lanes: tables.lanes,
             pass: None,
+            slabbed: false,
             code,
         })
     }
@@ -389,6 +397,8 @@ impl Session {
             .get_mut(stage)
             .ok_or_else(|| program(format!("stage {stage} is past this package's")))?;
         stage.landed.clear();
+        stage.over.clear();
+        self.slabbed = false;
         if self.pass.is_none() {
             self.pass = Some(self.ring.take(self.lanes)?);
         }
@@ -469,31 +479,64 @@ impl Session {
             STATUS_SPAN,
         )?;
         let mut landed = Vec::with_capacity(values.len());
+        let mut over = Vec::new();
         for &value in values {
-            if landed.iter().any(|&(seated, _)| seated == value) {
+            if landed.iter().any(|&(seated, _)| seated == value) || over.contains(&value) {
                 continue;
             }
             let (from, from_at, len) = self.placed(stage, value)?;
             let len = len.next_multiple_of(4);
             if at + len > bound {
-                return Err(program(format!(
-                    "stage {stage} lands past the {} bytes its lanes' ring rooms hold",
-                    region.bound()
-                )));
+                over.push(value);
+                continue;
             }
             frame.copy(&from, from_at, &ring, at, len)?;
             landed.push((value, at));
-            at = (at + len).next_multiple_of(RING_ALIGN);
+            at = (at + len).next_multiple_of(<crate::device::Api as engine_gpu::backend::Backend>::COPY_GRAIN);
         }
+        self.slabbed = !over.is_empty();
         self.stages[stage].landed = landed;
+        self.stages[stage].over = over;
         Ok(())
     }
 
-    /// What `value` landed in the pass's ring rooms.
-    pub fn taken(&self, stage: usize, value: u32) -> Result<Vec<u8>> {
+    /// Whether the pass landed a put past its rooms.
+    #[must_use]
+    pub fn slabbed(&self) -> bool {
+        self.slabbed
+    }
+
+    /// What `value` landed in the pass's ring rooms; one past their room is
+    /// copied through them a piece at a time once the pass has landed, each
+    /// piece a frame of `device`'s waited on.
+    pub fn taken(&self, device: &Context, stage: usize, value: u32) -> Result<Vec<u8>> {
         let len = self
             .bytes(stage, value)
             .ok_or_else(|| program(format!("value {value} is not stage {stage}'s")))?;
+        if self.stages[stage].over.contains(&value) {
+            let region = self.region()?;
+            let (from, from_at, _) = self.placed(stage, value)?;
+            let room = region.bound() & !3;
+            let mut out = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
+            let mut done = 0u64;
+            while done < len {
+                let piece = (len - done).min(room);
+                let mut frame = device.frame()?;
+                frame.copy(
+                    &from,
+                    from_at + done,
+                    region.buffer(),
+                    region.landed(),
+                    piece.next_multiple_of(4),
+                )?;
+                frame.commit_async(None)?.wait()?;
+                let mut part = vec![0u8; usize::try_from(piece).unwrap_or(0)];
+                region.read(region.landed(), &mut part)?;
+                out.extend(part);
+                done += piece;
+            }
+            return Ok(out);
+        }
         let &(_, at) = self.stages[stage]
             .landed
             .iter()

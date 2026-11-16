@@ -148,6 +148,9 @@ pub struct Plane {
     #[cfg(feature = "vulkan")]
     ring: Option<Arc<crate::guest::session::Ring>>,
 
+    /// The engine's serving tallies.
+    live: engine::live::Live,
+
     /// Passes run on the device.
     tally: u64,
 }
@@ -174,8 +177,7 @@ impl Plane {
             "guest program registered"
         );
         if let Some(
-            why @ (engine_gpu::guest::Refused::Chunk { .. }
-            | engine_gpu::guest::Refused::LaneIo { .. }),
+            why @ engine_gpu::guest::Refused::Chunk { .. },
         ) = self.forms.refusal(id)
         {
             let why = why.to_string();
@@ -799,6 +801,8 @@ impl Plane {
             tally,
             #[cfg(feature = "vulkan")]
             widen,
+            #[cfg(feature = "vulkan")]
+            live,
             ..
         } = self;
         let seat = instances.get_mut(&instance).ok_or(Refusal::Closed {
@@ -833,7 +837,11 @@ impl Plane {
             let mut runner = crate::guest::run::OnDevice::new(device_half, session, widen, seats);
             let outcome = eta_exec::step_with(&mut seat.inst, &seat.plan, &inputs, &mut runner, at);
             let ran = runner.ran().len();
+            drop(runner);
             widen.disarm();
+            if seat.session.slabbed() {
+                live.tally(engine::live::Tally::Staged, 1);
+            }
             (outcome, ran)
         };
 
@@ -897,6 +905,12 @@ impl Plane {
                 seat.plan.package.plans.len() == 1
                     && !seat.inst.poisoned
                     && !seat.faulted.load(Ordering::Acquire)
+                    // A put past its rooms lands where the pass ran, read
+                    // once it has: not later than its fire.
+                    && self
+                        .forms
+                        .get(seat.program)
+                        .is_some_and(|compiled| !compiled.lands_past_rooms())
             })
     }
 
@@ -916,6 +930,7 @@ impl Plane {
             instances,
             tally,
             widen,
+            live,
             ..
         } = self;
         let seat = instances.get_mut(&instance).ok_or(Refusal::Closed {
@@ -938,7 +953,11 @@ impl Plane {
             Stage::Epilogue,
         );
         let deferral = runner.take_deferral().unwrap_or_default();
+        drop(runner);
         widen.disarm();
+        if seat.session.slabbed() {
+            live.tally(engine::live::Tally::Staged, 1);
+        }
         let program = seat.program;
         match outcome {
             StepOutcome::Committed => {}
@@ -1147,6 +1166,10 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
 
     fn package(&self, program: ProgramId) -> Option<&eta_compiler::codegen::launch::LaunchPackage> {
         Plane::package(self, program)
+    }
+
+    fn watch(&mut self, live: engine::live::Live) {
+        self.live = live;
     }
 
     fn facts(

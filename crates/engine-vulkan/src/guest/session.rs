@@ -14,7 +14,7 @@ use engine_gpu::store::layout::{CHANNEL, INSTANCE};
 
 use engine_gpu::guest::held::{self, consecutive};
 use engine_gpu::guest::session::{
-    BINDINGS, InstanceLay, PiecePlace, RING_ALIGN, ScoreRows, ScoreSpec, SEGMENT_BINDINGS, StageTables, bases_at, groups_for,
+    BINDINGS, InstanceLay, PiecePlace, ScoreRows, ScoreSpec, SEGMENT_BINDINGS, StageTables, bases_at, groups_for,
     lay_instance, piece_places, score_rows, stage_tables,
 };
 
@@ -81,8 +81,11 @@ struct Stage {
     staged: Vec<(u64, u32)>,
     /// The constants filled on the device: (value, word).
     filled: Vec<(u32, u32)>,
-    /// The values landed in the pass's ring region: (value, ring byte).
+    /// The values landed in the pass's ring rooms: (value, ring byte).
     landed: Vec<(u32, u64)>,
+    /// The values past the ring rooms' room, read where they lie through
+    /// the device's transfer staging once the pass lands.
+    slab_landed: Vec<u32>,
 }
 
 /// The cells of channels the device keeps between fires, by channel: one
@@ -244,6 +247,9 @@ pub struct Session {
     lanes: u32,
     /// The rooms of the pass being recorded.
     pass: Option<Region>,
+    /// Whether the pass moved a root or put through the device's transfer
+    /// staging, past its rooms ([`engine::live::Tally::Staged`]).
+    slabbed: bool,
 
     kept: Kept,
     /// The engine's channel behind each of the program's.
@@ -347,6 +353,7 @@ impl Session {
                 staged: Vec::new(),
                 filled: Vec::new(),
                 landed: Vec::new(),
+                slab_landed: Vec::new(),
             });
         }
         let status = placed.next().expect("the fault word after the tables");
@@ -394,6 +401,7 @@ impl Session {
             ring: Arc::clone(tables.ring),
             lanes: tables.lanes,
             pass: None,
+            slabbed: false,
             kept,
             channels,
             airborne: std::collections::VecDeque::new(),
@@ -630,6 +638,8 @@ impl Session {
         stage.staged.clear();
         stage.filled.clear();
         stage.landed.clear();
+        stage.slab_landed.clear();
+        self.slabbed = false;
         if self.pass.is_none() {
             self.pass = Some(self.ring.take(self.lanes)?);
         }
@@ -665,15 +675,17 @@ impl Session {
             .map(|&(_, staged)| {
                 self.bytes(stage, staged)
                     .unwrap_or(0)
-                    .next_multiple_of(RING_ALIGN)
+                    .next_multiple_of(<crate::device::Api as engine_gpu::backend::Backend>::COPY_GRAIN)
             })
             .sum();
         if used + len > region.bound() {
-            return Err(program(format!(
-                "stage {stage} stages {} bytes, past the {} its lanes' ring rooms hold",
-                used + len,
-                region.bound()
-            )));
+            // Past the lanes' rooms: written where it lies, through the
+            // device's transfer staging, once the passes reading it landed.
+            let (into, into_at, _) = self.placed(stage, value)?;
+            self.settle()?;
+            into.write_shared(into_at, bytes)?;
+            self.slabbed = true;
+            return Ok(());
         }
         let at = region.staged() + used;
         region.buffer().write_shared(at, bytes)?;
@@ -715,14 +727,19 @@ impl Session {
     }
 
     /// Records `value`'s copy into the pass's ring rooms; the ring byte it
-    /// lands at.
-    pub fn read_back(&mut self, frame: &mut Frame, stage: usize, value: u32) -> Result<u64> {
+    /// lands at, or `None` where it is past the rooms' room and is read
+    /// where it lies through the device's transfer staging once the pass
+    /// lands ([`Session::taken`]).
+    pub fn read_back(&mut self, frame: &mut Frame, stage: usize, value: u32) -> Result<Option<u64>> {
         if let Some(&(_, at)) = self.stages[stage]
             .landed
             .iter()
             .find(|&&(landed, _)| landed == value)
         {
-            return Ok(at);
+            return Ok(Some(at));
+        }
+        if self.stages[stage].slab_landed.contains(&value) {
+            return Ok(None);
         }
         let (from, from_at, len) = self.placed(stage, value)?;
         let region = self.region()?;
@@ -732,21 +749,26 @@ impl Session {
             .map(|&(landed, _)| {
                 self.bytes(stage, landed)
                     .unwrap_or(0)
-                    .next_multiple_of(RING_ALIGN)
+                    .next_multiple_of(<crate::device::Api as engine_gpu::backend::Backend>::COPY_GRAIN)
             })
             .sum();
         if used + len > region.bound() {
-            return Err(program(format!(
-                "stage {stage} lands {} bytes, past the {} its lanes' ring rooms hold",
-                used + len,
-                region.bound()
-            )));
+            self.stages[stage].slab_landed.push(value);
+            self.slabbed = true;
+            return Ok(None);
         }
         let at = region.landed() + used;
         let ring = region.buffer().clone();
         frame.copy(&from, from_at, &ring, at, len)?;
         self.stages[stage].landed.push((value, at));
-        Ok(at)
+        Ok(Some(at))
+    }
+
+    /// Whether the pass moved a root or put through the device's transfer
+    /// staging, past its rooms.
+    #[must_use]
+    pub fn slabbed(&self) -> bool {
+        self.slabbed
     }
 
     /// Records the pass's fault word into its ring rooms, behind its
@@ -797,6 +819,12 @@ impl Session {
         let len = self
             .bytes(stage, value)
             .ok_or_else(|| program(format!("value {value} is not stage {stage}'s")))?;
+        if self.stages[stage].slab_landed.contains(&value) {
+            let (from, at, _) = self.placed(stage, value)?;
+            let mut out = vec![0u8; usize::try_from(len).unwrap_or(0)];
+            from.read(at, &mut out)?;
+            return Ok(out);
+        }
         let &(_, at) = self.stages[stage]
             .landed
             .iter()

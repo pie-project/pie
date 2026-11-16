@@ -53,15 +53,22 @@ pub enum Tally {
     /// ([`crate::chunk::ChunkFacts::eager_rungs`]): it ran uncaptured, as
     /// stated.
     Eager,
+    /// A guest pass a root or put of which is wider than a lane's room in
+    /// the engine's host staging ring (`FireLimits::guest_lane_bytes`), so
+    /// it moved through the device's transfer staging instead: slower,
+    /// stated once at the program's registration, and counted so a hot path
+    /// landing there shows.
+    Staged,
 }
 
 impl Tally {
-    pub const ALL: [Tally; 5] = [
+    pub const ALL: [Tally; 6] = [
         Tally::Compiled,
         Tally::Fallback,
         Tally::Unrecorded,
         Tally::Refused,
         Tally::Eager,
+        Tally::Staged,
     ];
 
     /// Its name in the model status.
@@ -73,6 +80,7 @@ impl Tally {
             Tally::Unrecorded => "unrecorded",
             Tally::Refused => "refused",
             Tally::Eager => "eager",
+            Tally::Staged => "staged",
         }
     }
 }
