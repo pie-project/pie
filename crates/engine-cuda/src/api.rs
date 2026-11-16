@@ -420,7 +420,7 @@ pub(crate) const DEFAULT_FORWARD_TOKENS: u32 = 8192;
 /// The load's budgets for `trace`: its logit readouts sized to what the
 /// trace drafts, not the general 16 a lane, so a vocab-wide head carves only
 /// the rows a fire can read out.
-fn bake_budgets(budgets: &LoadBudgets, trace: &Trace) -> Budget {
+pub(crate) fn bake_budgets(budgets: &LoadBudgets, trace: &Trace) -> Budget {
     Budget {
         max_lanes: budgets.max_lanes,
         max_tokens: budgets.max_tokens,
@@ -1504,6 +1504,7 @@ impl Cuda {
                         _ => &lane.kv.pages,
                     },
                     held: (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
+                    folded: lane.kv.folded,
                     kv_less: lane.kv_less,
                     translation: match table(lane, LIST) {
                         Some(refs) if by_refs && !lane.kv.translation.is_empty() => refs,

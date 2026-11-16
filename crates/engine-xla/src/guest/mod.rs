@@ -169,11 +169,6 @@ pub struct Forms {
 
 /// Whether every stage of `package` lowers.
 pub fn admits(package: &LaunchPackage) -> Result<(), Refused> {
-    if std::env::var_os("PIE_XLA_GUESTS_ON_HOST").is_some_and(|v| v != "0") {
-        return Err(Refused(
-            "PIE_XLA_GUESTS_ON_HOST asks for the host interpreter".into(),
-        ));
-    }
     for at in 0..package.stages.len() {
         lower::lower(
             package,

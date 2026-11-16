@@ -71,6 +71,11 @@ def draft_block() -> BlockDrafter | None:
     return BlockDrafter(d.rows, d.mask_token, d.proposals_from) if d is not None else None
 
 
+def draft_depth() -> int:
+    """Tokens the model's draft head chains in one pass; 0 with no head."""
+    return _model.draft_depth()
+
+
 def run_ahead_window() -> int:
     """Fires one lane may have submitted and not yet taken."""
     return _model.run_ahead_window()

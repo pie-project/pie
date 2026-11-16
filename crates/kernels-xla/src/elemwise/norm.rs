@@ -110,7 +110,7 @@ pub(super) const KERNEL_WIDTH: i64 = 2048;
 /// and sums; Qwen3-0.6B's 16 q and 8 k heads of 128, pf256-512: v6e 236k ->
 /// 272k tok/s, v5e 106k -> 113k). `None` where it does not apply: heads
 /// narrower than 128, rows narrower than `KERNEL_WIDTH` and 8 heads, fires
-/// under `KERNEL_FROM` rows (`PIE_XLA_NORM_KERNEL=0` turns it off).
+/// under `KERNEL_FROM` rows.
 fn heads_kernel(
     f: &mut Func,
     x: Val,
@@ -121,8 +121,7 @@ fn heads_kernel(
     use crate::mosaic::{Body, Grid, Kernel, Operand as Block, Sem, Window};
     let dims = f.dims(x).to_vec();
     let (rows, width) = (dims[0], dims[1]);
-    if std::env::var("PIE_XLA_NORM_KERNEL").is_ok_and(|v| v == "0")
-        || f.elem(x) != Elem::Bf16
+    if f.elem(x) != Elem::Bf16
         || rows < KERNEL_FROM
         || axis < 128
         || axis % 128 != 0
@@ -221,7 +220,7 @@ const GATED_FROM: i64 = 2304;
 /// heads, axis]` view of the rows out for the sums and back (v5e
 /// Qwen3.8-27B's GDN output, 48 heads of 128, 2816-row fires: ~0.6 ms a
 /// layer). `None` where it does not apply: from `GATED_FROM` rows in whole
-/// blocks (`PIE_XLA_NORM_KERNEL=0` turns it off).
+/// blocks.
 fn gated_kernel(
     f: &mut Func,
     x: Val,
@@ -235,8 +234,7 @@ fn gated_kernel(
     let dims = f.dims(x).to_vec();
     let (rows, width) = (dims[0], dims[1]);
     let xe = f.elem(x);
-    if std::env::var("PIE_XLA_NORM_KERNEL").is_ok_and(|v| v == "0")
-        || !matches!(xe, Elem::F32 | Elem::Bf16)
+    if !matches!(xe, Elem::F32 | Elem::Bf16)
         || f.elem(z) != Elem::Bf16
         || f.dims(z) != dims.as_slice()
         || rows < GATED_FROM

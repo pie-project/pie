@@ -22,17 +22,6 @@ const PROJECT_SLICES: u32 = 64;
 /// single wavefront, whose f32 MFMA chains and stream reads then stall it.
 const PROJECT_BLOCKS_PER_CU: u32 = 2;
 
-fn compute_units() -> u32 {
-    #[cfg(feature = "rocm")]
-    {
-        crate::linear::compute_units()
-    }
-    #[cfg(not(feature = "rocm"))]
-    {
-        304
-    }
-}
-
 /// How the tiled projection cuts its rows and K: `nt` 16-row tiles a
 /// wavefront (two past one tile), `tiles` row blocks, and K in `slices`
 /// slices of `per`, sliced until the blocks fill every compute unit
@@ -47,11 +36,11 @@ struct Slicing {
 }
 
 impl Slicing {
-    fn of(rows: u32, fan: u32) -> Self {
+    fn of(rows: u32, fan: u32, cus: u32) -> Self {
         let nt = if rows > PROJECT_ROWS { 2 } else { 1 };
         let tiles = rows.div_ceil(PROJECT_ROWS * nt);
         let grain = 64 * PROJECT_WAVES;
-        let want = (compute_units() * PROJECT_BLOCKS_PER_CU)
+        let want = (cus * PROJECT_BLOCKS_PER_CU)
             .div_ceil(tiles)
             .clamp(1, fan.div_ceil(grain).min(PROJECT_SLICES));
         let per = fan.div_ceil(want).div_ceil(grain) * grain;
@@ -155,7 +144,7 @@ pub fn project(
         );
     }
 
-    let plan = Slicing::of(rows, fan);
+    let plan = Slicing::of(rows, fan, ctx.multiprocessors(OP)?);
     let part = plan.part(ctx, OP, rows, mix_hc, false)?;
     ctx.fire(
         OP,
@@ -243,7 +232,7 @@ pub fn norm_project(
             ),
         ));
     }
-    let plan = Slicing::of(rows, fan);
+    let plan = Slicing::of(rows, fan, ctx.multiprocessors(OP)?);
     let part = plan.part(ctx, OP, rows, mix_hc + 1, true)?;
     ctx.fire(
         OP,

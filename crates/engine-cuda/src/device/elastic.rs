@@ -154,16 +154,6 @@ impl Beside {
                      process's queues are not readable ({why})"
                 ))
             })?;
-            if areas.counted == kernels_cuda::hip::kfd::Counted::Driver
-                && areas.queues != areas.rule
-            {
-                eprintln!(
-                    "engine-cuda: KFD lists {} queues for this process where HIP's rule \
-                     counts {}: a load in another PID namespace, which counts by the rule, would \
-                     hold the wrong figure",
-                    areas.queues, areas.rule
-                );
-            }
             Ok(Beside {
                 said: format!("the driver holds {areas}"),
             })

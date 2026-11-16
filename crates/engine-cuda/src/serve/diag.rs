@@ -29,6 +29,10 @@ pub struct Diagnostics {
     /// States no expert shape: the routed banks stay dense on the device,
     /// while the tables streamed by their rows are stated.
     pub dense_experts: bool,
+    /// States no expert shape and still moves the routed banks the weight
+    /// cache would stream to the host tier: no table reads them, and each
+    /// fire stages the experts it routes to (`experts::staging`).
+    pub untabled_experts: bool,
     /// Lays every windowed kv row in one window list, of the widest window:
     /// a row of a narrower window then keeps pages its kernels no longer
     /// read. The same logits as a list a window.
@@ -69,6 +73,7 @@ impl Default for Diagnostics {
             chunk_bytes: None,
             dense_weights: false,
             dense_experts: false,
+            untabled_experts: false,
             one_window: false,
             tier_inline: false,
         }
@@ -128,6 +133,9 @@ impl Diagnostics {
         if self.dense_experts {
             words.push("dense-experts".to_string());
         }
+        if self.untabled_experts {
+            words.push("untabled-experts".to_string());
+        }
         if self.one_window {
             words.push("one-window".to_string());
         }
@@ -153,7 +161,7 @@ const WORDS: &str = "`golden-probe`, `arm-trace`, \
      `plan-trace=<rows|all>`, `arm-bench=<key>`, `capture-serial`, `boundary-trace`, `reap-trace`, \
      `trace-census`, `nan-check`, `fuse-chains=off`, \
      `sync-guard[=panic]`, `chunk-bytes=<bytes>`, `dense-weights`, \
-     `dense-experts`, `one-window`, `tier-inline`";
+     `dense-experts`, `untabled-experts`, `one-window`, `tier-inline`";
 
 impl std::str::FromStr for Diagnostics {
     type Err = String;
@@ -179,6 +187,7 @@ impl std::str::FromStr for Diagnostics {
                 "nan-check" => diag.nan_check = switch(word, value)?,
                 "dense-weights" => diag.dense_weights = switch(word, value)?,
                 "dense-experts" => diag.dense_experts = switch(word, value)?,
+                "untabled-experts" => diag.untabled_experts = switch(word, value)?,
                 "one-window" => diag.one_window = switch(word, value)?,
                 "tier-inline" => diag.tier_inline = switch(word, value)?,
                 "fuse-chains" => diag.fuse_chains = switch(word, value)?,

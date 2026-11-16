@@ -842,8 +842,8 @@ pub(crate) mod latent {
     /// How many splits a gathered walk cuts each row's key list into: enough
     /// blocks to fill the device twice over, no split under two tiles.
     #[must_use]
-    pub fn splits(ctx: &Ctx, rows: u32, heads: i32, max_list: i64) -> i32 {
-        let cus = u64::from(ctx.multiprocessors().unwrap_or(304).max(1));
+    pub fn splits(cus: u32, rows: u32, heads: i32, max_list: i64) -> i32 {
+        let cus = u64::from(cus);
         let base = u64::from(rows).max(1) * u64::from(heads.unsigned_abs().div_ceil(BLOCK_ROWS));
         let want = (2 * cus).div_ceil(base.max(1));
         let cap = max_list.max(1).unsigned_abs().div_ceil(MIN_SHARE);
@@ -1007,7 +1007,7 @@ fn dispatch_dense(
                 num_heads,
                 page_size: layer.page_size,
                 ratio: 1,
-                splits: latent::splits(ctx, o.rows, num_heads, i64::from(window)),
+                splits: latent::splits(ctx.multiprocessors(op)?, o.rows, num_heads, i64::from(window)),
                 causal: i32::from(causal),
                 scale_log2: layer.scale_log2(sm_scale),
                 window,
@@ -1178,7 +1178,7 @@ fn selected(
                 num_heads: heads,
                 page_size: layer.page_size,
                 ratio: 1,
-                splits: latent::splits(ctx, o.rows, heads, i64::from(top_k)),
+                splits: latent::splits(ctx.multiprocessors(op)?, o.rows, heads, i64::from(top_k)),
                 causal: i32::from(causal),
                 scale_log2: layer.scale_log2(sm_scale),
                 ..latent::Gather::default()

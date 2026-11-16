@@ -19,12 +19,18 @@ pub struct Plane {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct Planes(HashMap<u32, Plane>);
+pub struct Planes(HashMap<u32, Plane>, std::collections::HashSet<u32>);
 
 impl Planes {
     #[must_use]
     pub fn of(&self, id: ValueId) -> Option<Plane> {
         self.0.get(&id.0).copied()
+    }
+
+    /// Whether `id` is a lone conv's rows, a layer of its own.
+    #[must_use]
+    pub fn lone(&self, id: ValueId) -> bool {
+        self.1.contains(&id.0)
     }
 
     #[must_use]
@@ -82,29 +88,34 @@ impl Buffers {
     pub fn reserve(trace: &Trace, max_rows: u32, pools: &Pools) -> Result<Option<Buffers>> {
         let layout = pools.rs_layout();
         let tokens = layout.as_ref().map_or(1, |(tokens, _)| (*tokens).max(1));
-        let Some((planes, per_token, layers)) = read(trace, tokens)? else {
+        let Some((planes, widths)) = read(trace, tokens)? else {
             return Ok(None);
         };
-        // The list's runs of a layer's bytes a token, in the layers' order;
-        // a run of another size buffers what this engine does not (an
-        // n-gram window's ids).
+        // The list's runs, a buffered layer's each, in the layers' order;
+        // the runs after them buffer what this engine does not (an n-gram
+        // window's ids).
         let held = layout.map_or_else(Vec::new, |(_, runs)| runs);
-        let rows: Vec<u64> = held
-            .iter()
-            .filter(|&&(_, bytes)| bytes == per_token * ELEMENT)
-            .map(|&(offset, _)| offset)
-            .take(layers as usize)
-            .collect();
-        if rows.len() != layers as usize {
+        let fits = held.len() >= widths.len()
+            && held
+                .iter()
+                .zip(&widths)
+                .all(|(&(_, bytes), width)| bytes == width * ELEMENT);
+        if !fits {
             return Err(Fault::program(
                 "store::rs",
                 format!(
-                    "the plan buffers {layers} recurrent layer(s) of {} bytes a token, and the \
-                     chunk recipe's rs list lays runs of {held:?}",
-                    per_token * ELEMENT
+                    "the plan buffers {} layer(s) of {:?} bytes a token, and the chunk recipe's \
+                     rs list lays runs of {held:?}",
+                    widths.len(),
+                    widths.iter().map(|w| w * ELEMENT).collect::<Vec<_>>()
                 ),
             ));
         }
+        let rows: Vec<u64> = held
+            .iter()
+            .take(widths.len())
+            .map(|&(offset, _)| offset)
+            .collect();
         let ext_row_bytes = ext_row_bytes(trace)?;
         let reach = RsScratch::need(Self::rows_ext(max_rows), ext_row_bytes);
         Ok(Some(Buffers {
@@ -143,9 +154,24 @@ fn ext_row_bytes(trace: &Trace) -> Result<u64> {
         })?;
         Ok(*width * elem)
     };
+    let lone: std::collections::HashSet<usize> = poem_compiler::rs::buffered_convs(trace, true)
+        .filter(|conv| conv.feeds == poem_compiler::rs::Feeds::Alone)
+        .map(|conv| conv.node)
+        .collect();
+    // A recurrence's operands and a lone conv's are laid side by side in the
+    // extended run (`run::RsScratch` keeps the two kinds apart): the widest
+    // of each.
     let mut widest = 0u64;
-    for node in &trace.nodes {
+    let mut widest_lone = 0u64;
+    for (at, node) in trace.nodes.iter().enumerate() {
         let total = match &node.op {
+            // A lone conv runs extended over its own rows when a lane replays.
+            Operation::Ssm(
+                Ssm::CausalConv1dChunked { x, y, .. } | Ssm::CausalConv1d { x, y, .. },
+            ) if lone.contains(&at) => {
+                widest_lone = widest_lone.max(row_bytes(*x)? + row_bytes(*y)?);
+                continue;
+            }
             // A one-token class's recurrences run extended too, when a lane
             // of its fire replays (`dispatch::ssm`).
             Operation::Ssm(
@@ -201,7 +227,7 @@ fn ext_row_bytes(trace: &Trace) -> Result<u64> {
         };
         widest = widest.max(total);
     }
-    Ok(widest)
+    Ok(widest + widest_lone)
 }
 
 /// The planes a recurrence reads besides the conv's rows: the gated-delta
@@ -225,7 +251,13 @@ enum Reads {
     },
 }
 
-pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, u64, u32)>> {
+/// The buffered planes of `trace` and the elements a token each buffered
+/// layer lays, in the order the chunk recipe's rs list lays their runs: the
+/// recurrences and the lone convs (`poem_compiler::rs::buffered_convs`,
+/// `Feeds::Alone`, Qwen4's PLE conv) in node order. A recurrence buffers its
+/// conv's rows and the planes it reads beside them; a lone conv its own
+/// input. A layer's prompt and step forms pair in that order, at one width.
+pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, Vec<u64>)>> {
     {
         let paging = page_tokens;
         let mut defined: HashMap<u32, usize> = HashMap::new();
@@ -238,10 +270,38 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, u64, u32)
         }
 
         let mut planes: HashMap<u32, Plane> = HashMap::new();
-        let mut per_token: Option<u64> = None;
+        // The elements a token of each layer, prompt forms and step forms.
+        let mut widths: Vec<u64> = Vec::new();
+        let mut decode_widths: Vec<u64> = Vec::new();
         let mut layers = 0u32;
         let mut decode_layers = 0u32;
+        // CUDA replays Mamba-2, so a conv feeding its scan is buffered.
+        let lone: HashMap<usize, (ValueId, bool)> = poem_compiler::rs::buffered_convs(trace, true)
+            .filter(|conv| conv.feeds == poem_compiler::rs::Feeds::Alone)
+            .map(|conv| (conv.node, (conv.x, conv.chunked)))
+            .collect();
         for (at, node) in trace.nodes.iter().enumerate() {
+            if let Some(&(x, chunked)) = lone.get(&at) {
+                let width =
+                    width_of(trace, x).ok_or_else(|| unsized_plane("a lone conv's rows", x))?;
+                let layer = if chunked { layers } else { decode_layers };
+                planes.insert(
+                    x.0,
+                    Plane {
+                        layer,
+                        at: 0,
+                        width,
+                    },
+                );
+                if chunked {
+                    widths.push(width);
+                    layers += 1;
+                } else {
+                    decode_widths.push(width);
+                    decode_layers += 1;
+                }
+                continue;
+            }
             // The fused decode step reads the planes its primitives would:
             // the conv's rows (the split it lands) and the gate prep's
             // `[b | a]`.
@@ -263,19 +323,7 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, u64, u32)
                     );
                     here += width;
                 }
-                match per_token {
-                    None => per_token = Some(here),
-                    Some(first) if first == here => {}
-                    Some(first) => {
-                        return Err(Fault::Unbound {
-                            what: format!(
-                                "recurrent layer {decode_layers} buffers {here} elements a token \
-                                 where layer 0 buffers {first} — this pool cuts one page-slot \
-                                 stride for every layer"
-                            ),
-                        });
-                    }
-                }
+                decode_widths.push(here);
                 decode_layers += 1;
                 continue;
             }
@@ -398,37 +446,28 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, u64, u32)
                 );
                 here += width;
             }
-            match per_token {
-                None => per_token = Some(here),
-                Some(first) if first == here => {}
-                Some(first) => {
-                    return Err(Fault::Unbound {
-                        what: format!(
-                            "recurrent layer {layer} buffers {here} elements a token where \
-                             layer 0 buffers {first} — this pool cuts one page-slot stride \
-                             for every layer"
-                        ),
-                    });
-                }
-            }
             if chunked {
+                widths.push(here);
                 layers += 1;
             } else {
+                decode_widths.push(here);
                 decode_layers += 1;
             }
         }
-        if decode_layers != 0 && decode_layers != layers {
+        if decode_layers != 0 && decode_widths != widths {
             return Err(Fault::Unbound {
                 what: format!(
-                    "the plan runs {decode_layers} step recurrence(s) and {layers} chunked \
-                     one(s); the buffered planes pair the two chains layer by layer"
+                    "the plan's step forms buffer {decode_widths:?} elements a token, layer by \
+                     layer, and its chunked forms {widths:?}; the buffered planes pair the two \
+                     chains layer by layer, at one width"
                 ),
             });
         }
-        let Some(per_token) = per_token else {
+        if widths.is_empty() {
             return Ok(None);
-        };
-        Ok(Some((Planes(planes), per_token, layers)))
+        }
+        let lone_rows = lone.values().map(|(x, _)| x.0).collect();
+        Ok(Some((Planes(planes, lone_rows), widths)))
     }
 }
 
@@ -940,10 +979,10 @@ mod tests {
                 kda_chunked(3),
             ],
         );
-        let (planes, per_token, layers) = read(&trace, PAGE)
+        let (planes, widths) = read(&trace, PAGE)
             .expect("the KDA pair reads clean")
             .expect("the KDA pair reserves buffered planes");
-        assert_eq!((layers, per_token), (1, 3 * wide + wide + HEADS));
+        assert_eq!(widths, vec![3 * wide + wide + HEADS]);
         assert_eq!(planes.len(), 3);
         let page = u64::from(PAGE);
         let plane = |at: u64, width: u64| {
@@ -960,6 +999,59 @@ mod tests {
             ext_row_bytes(&trace).expect("the extended run's rows size"),
             2 * (3 * wide) + 2 * (3 * wide) + 2 * wide + 2 * HEADS + 4 * wide
         );
+    }
+
+    /// A causal conv no recurrence reads (Qwen4's PLE conv), whose state is
+    /// a cache row, buffers its own input as a layer of its own, after the
+    /// recurrence before it and at its own width: a buffered fire leaves its
+    /// state as it was, and a fold replays its rows.
+    #[test]
+    fn a_lone_conv_buffers_its_own_rows_as_a_layer_of_its_own() {
+        let wide = HEADS * HEAD_DIM;
+        let mut values = kda_values();
+        let lone = values.len() as u32;
+        values.push(row(2 * wide, Dtype::Bf16));
+        values.push(row(4, Dtype::Bf16));
+        values.push(ValueDecl {
+            def: Def::Cache(0),
+            ty: Ty::Tensor {
+                shape: vec![Dim::Const(3), Dim::Const(2 * wide)],
+                dtype: Dtype::Bf16,
+            },
+        });
+        values.push(row(2 * wide, Dtype::Bf16));
+        let conv = |x: u32, state: u32, y: u32| {
+            Operation::Ssm(Ssm::CausalConv1dChunked {
+                x: ValueId(x),
+                weight: ValueId(1),
+                bias: None,
+                state: ValueId(state),
+                conv_width: 4,
+                dilation: 3,
+                y: ValueId(y),
+            })
+        };
+        let trace = plan(
+            values,
+            vec![
+                conv(0, 2, 3),
+                kda_chunked(3),
+                conv(lone, lone + 2, lone + 3),
+            ],
+        );
+        let (planes, widths) = read(&trace, PAGE)
+            .expect("a KDA layer and a lone conv read clean")
+            .expect("both buffer planes");
+        assert_eq!(widths, vec![3 * wide + wide + HEADS, 2 * wide]);
+        assert_eq!(
+            planes.of(ValueId(lone)),
+            Some(Plane {
+                layer: 1,
+                at: 0,
+                width: 2 * wide,
+            })
+        );
+        assert!(ext_row_bytes(&trace).expect("the extended run's rows size") >= 2 * (2 * wide) * 2);
     }
 
     /// A chunked KDA scan whose `mixed` no chunked conv writes has no plane

@@ -735,7 +735,7 @@ impl PrefillTile {
 /// where those leave more than two fifths of a round of CUs idle; up to
 /// `kernel.fp8.narrow_until` rows 64 x 128 at three a SIMD, a wave a strip,
 /// so a short prefill's tiles fill the card.
-fn prefill_tile(ctx: &Ctx, sb: u32, rows: u32, n: u32) -> PrefillTile {
+fn prefill_tile(ctx: &Ctx, cus: u32, sb: u32, rows: u32, n: u32) -> PrefillTile {
     if sb == 0 && rows <= ctx.tuning().fp8_narrow_until {
         return PrefillTile {
             nb: 3,
@@ -764,7 +764,6 @@ fn prefill_tile(ctx: &Ctx, sb: u32, rows: u32, n: u32) -> PrefillTile {
         ms: 8,
         occ: 2,
     };
-    let cus = ctx.multiprocessors().unwrap_or(304);
     let tiles = rows.div_ceil(wide.rows()) * n.div_ceil(wide.cols());
     if 5 * tiles < 3 * cus * wide.held_a_cu() {
         PrefillTile { ms: 4, ..wide }
@@ -803,9 +802,10 @@ fn fire_fp8_tiles(
         ));
     }
     let stages = k / FP8_BLOCK;
-    let t = prefill_tile(ctx, sb, q.rows, n);
+    let cus = ctx.multiprocessors(op)?;
+    let t = prefill_tile(ctx, cus, sb, q.rows, n);
     let tiles = q.rows.div_ceil(t.rows()) * n.div_ceil(t.cols());
-    let held = ctx.multiprocessors().unwrap_or(304) * t.held_a_cu();
+    let held = cus * t.held_a_cu();
     let rem = if tiles < held { tiles } else { tiles % held };
     // The slices that finish the last round soonest: its rounds of blocks
     // times a slice's stages and the three a block spends filling and

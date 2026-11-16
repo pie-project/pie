@@ -3045,9 +3045,18 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                                   kv_head_idx);
 
         if (MASK_MODE == MaskMode::kCustom) {
-          logits_mask<KTraits>(params, variant, request_idx, qo_packed_idx_base,
-                               kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
-                               kv_head_idx);
+          // PIE: a warp's keys wholly below the request's committed boundary and
+          // its chunk's end read no mask bit: only the causal and window bounds
+          // apply, as the plain arm applies them.
+          const uint32_t warp_kv_end = kv_idx_base + KTraits::NUM_MMA_KV * 16;
+          const bool committed =
+              warp_kv_end <= variant.mask_origin && warp_kv_end <= chunk_end;
+          if (!committed || (!variant.mask_wide && iter >= mask_iteration) ||
+              iter < window_iteration) {
+            logits_mask<KTraits>(params, variant, request_idx, qo_packed_idx_base,
+                                 kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
+                                 kv_head_idx);
+          }
         } else {
           if constexpr (MASK_MODE != MaskMode::kMultiItemScoring) {
             if (iter >= mask_iteration || iter < window_iteration) {

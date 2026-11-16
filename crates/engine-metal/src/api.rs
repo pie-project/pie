@@ -1323,6 +1323,7 @@ impl Metal {
                     pages: pages_of[at].as_deref().unwrap_or(&lane.kv.pages),
                     held: (!lane.kv.pages.is_empty() || pages_of[at].is_some())
                         .then_some(lane.kv.held),
+                    folded: lane.kv.folded,
                     mask: lane.mask.as_ref(),
                     kv_less: lane.kv_less,
                     adapter: lane_adapters[at].or(lane.adapter),
