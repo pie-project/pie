@@ -860,6 +860,9 @@ fn check_one(
         let mut by_kind = [0u64; KINDS.len()];
         let mut dispatches = 0u64;
         for (entry, ns, n) in &rows {
+            if kind_of(entry) == 0 {
+                eprintln!("GEMM width {width}: {entry} {:.3} ms over {n}", *ns as f64 / 1e6);
+            }
             by_kind[kind_of(entry)] += ns;
             dispatches += n;
         }
