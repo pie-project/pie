@@ -305,6 +305,12 @@ pub struct Plane {
     #[cfg(feature = "wgpu")]
     library: Option<Arc<crate::guest::session::Library>>,
 
+    /// Each program's stages' step uniforms, made at its first bind and
+    /// shared by every bind after: a round that binds the program afresh
+    /// makes none.
+    #[cfg(feature = "wgpu")]
+    step_args: BTreeMap<ProgramId, Vec<crate::guest::session::StepArgs>>,
+
     tally: Arc<Tally>,
 }
 
@@ -974,10 +980,24 @@ impl Plane {
             query_len: binding.extents.query_len,
             key_len: binding.extents.key_len,
         };
+        let args = match self.step_args.get(&binding.program) {
+            Some(args) => args.clone(),
+            None => {
+                let args = compiled
+                    .all()
+                    .iter()
+                    .map(|lowered| crate::guest::session::StepArgs::of(device, lowered))
+                    .collect::<engine_gpu::error::Result<Vec<_>>>()
+                    .map_err(|why| format!("its step uniforms did not build: {why}"))?;
+                self.step_args.insert(binding.program, args.clone());
+                args
+            }
+        };
         crate::guest::session::Session::new(
             device,
             &plan.package.plans,
             compiled.all(),
+            &args,
             library,
             &extents,
             &crate::guest::session::Tables {

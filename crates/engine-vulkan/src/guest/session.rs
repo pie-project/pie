@@ -480,6 +480,7 @@ impl Session {
         device: &Context,
         plans: &[LaunchStagePlan],
         code: &[engine_gpu::guest::Lowered],
+        args: &[StepArgs],
         extents: &Extents,
         library: &Arc<Library>,
         kept: Kept,
@@ -524,10 +525,20 @@ impl Session {
             held::place_tables(tables.pools, INSTANCE, tables.slots, &bytes, tables.align)?;
         let mut placed = placed.into_iter();
         let mut stages = Vec::with_capacity(plans.len());
-        for ((plan, lowered), resolved) in plans.iter().zip(code).zip(resolved) {
+        if args.len() != plans.len() {
+            return Err(Fault::Program {
+                at: "guest::session",
+                why: format!(
+                    "{} stage plans but {} stages' step uniforms",
+                    plans.len(),
+                    args.len()
+                ),
+            });
+        }
+        for (((plan, lowered), resolved), args) in plans.iter().zip(code).zip(resolved).zip(args) {
             let tables = [(); 4].map(|()| placed.next().expect("four tables a stage"));
             stages.push(build_stage(
-                device, plan, lowered, resolved, tables, library,
+                device, plan, lowered, resolved, tables, library, args,
             )?);
         }
 
@@ -1051,6 +1062,29 @@ impl Drop for Session {
     }
 }
 
+/// A stage's step uniforms ([`step_uniforms`]), `stride` apart: what a
+/// program's steps fix, so every bind of the program shares one.
+#[derive(Clone)]
+pub struct StepArgs {
+    buffer: Buffer,
+    stride: u64,
+}
+
+impl StepArgs {
+    pub fn of(device: &Context, lowered: &engine_gpu::guest::Lowered) -> Result<StepArgs> {
+        let stride = step_stride(device.core().limits.min_uniform_buffer_offset_alignment);
+        let uniforms = step_uniforms(&lowered.steps, stride);
+        let mut buffer = Buffer::with(
+            device,
+            uniforms.len() as u64,
+            Memory::Host,
+            engine_gpu::books::owners::GUEST,
+        )?;
+        buffer.write(0, &uniforms)?;
+        Ok(StepArgs { buffer, stride })
+    }
+}
+
 fn build_stage(
     device: &Context,
     plan: &LaunchStagePlan,
@@ -1058,6 +1092,7 @@ fn build_stage(
     resolved: StageTables,
     tables: [Held; 4],
     library: &Library,
+    args: &StepArgs,
 ) -> Result<Stage> {
     let _ = plan;
     let StageTables {
@@ -1071,15 +1106,6 @@ fn build_stage(
         .iter()
         .map(|step| library.pipeline(device, step.call))
         .collect::<Result<Vec<_>>>()?;
-    let stride = step_stride(device.core().limits.min_uniform_buffer_offset_alignment);
-    let uniforms = step_uniforms(&lowered.steps, stride);
-    let mut args = Buffer::with(
-        device,
-        uniforms.len() as u64,
-        Memory::Host,
-        engine_gpu::books::owners::GUEST,
-    )?;
-    args.write(0, &uniforms)?;
     let heap = Buffer::zeroed(device, scratch, engine_gpu::books::owners::GUEST_STATE)?;
     let staging = Buffer::with(
         device,
@@ -1096,8 +1122,8 @@ fn build_stage(
 
     Ok(Stage {
         steps,
-        args,
-        stride,
+        args: args.buffer.clone(),
+        stride: args.stride,
         groups: if lowered.strides_the_grid {
             groups_for(&descriptors, device.cores())
         } else {
