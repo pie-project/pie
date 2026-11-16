@@ -23,6 +23,10 @@
 //!   one alone, for what each dispatch inside a frame costs beside its work:
 //!   `(t(LAUNCHES) − t(1)) / (LAUNCHES − 1)`.
 //!
+//! Every float operand a rate reads holds `engine::rates::operand_pattern`
+//! repeated (outputs, index tables and the scan's gates as laid), as every
+//! backend's do.
+//!
 //! The backend times a frame ([`Timer`]): by its adapter's timestamps where
 //! it has them, else by the host's clock around submit and wait. The
 //! repeated fires are the host's clock's difference of two frames either
@@ -83,6 +87,8 @@ struct Rig<'a, B: Serve> {
     handles: Handles<B>,
     pipelines: B::Pipelines,
     held: Vec<B::Buffer>,
+    /// `engine::rates::operand_pattern`, made once.
+    pattern: Option<Vec<u8>>,
 }
 
 impl<'a, B: Serve> Rig<'a, B> {
@@ -92,6 +98,7 @@ impl<'a, B: Serve> Rig<'a, B> {
             handles: Handles::<B>::new(),
             pipelines: B::Pipelines::default(),
             held: Vec::new(),
+            pattern: None,
         }
     }
 
@@ -99,6 +106,27 @@ impl<'a, B: Serve> Rig<'a, B> {
     fn release(&mut self) {
         self.handles = Handles::<B>::new();
         self.held.clear();
+    }
+
+    /// A buffer of `rows x width` of `dtype` holding
+    /// `engine::rates::operand_pattern` repeated, bound: what every float
+    /// operand a rate reads holds (not zeros, which some kernels run faster
+    /// over than over a served fire's values).
+    fn operand(&mut self, rows: u32, width: u32, dtype: Dtype) -> Result<Tensor> {
+        let bytes = (u64::from(rows) * u64::from(width) * dtype.bits()).div_ceil(8);
+        let mut buf = B::Buffer::zeroed(self.device, bytes.max(4), crate::books::owners::TUNING)?;
+        let pattern = self
+            .pattern
+            .get_or_insert_with(engine::rates::operand_pattern);
+        let mut at = 0u64;
+        while at < bytes {
+            let n = (pattern.len() as u64).min(bytes - at);
+            buf.write(at, &pattern[..n as usize])?;
+            at += n;
+        }
+        let handle = self.handles.bind(&buf, 0, buf.bytes())?;
+        self.held.push(buf);
+        Ok(Tensor::new(handle, rows, width, dtype))
     }
 
     /// A zeroed buffer of `rows x width` of `dtype`, bound.
@@ -208,10 +236,10 @@ fn grid<B: Serve>(
     let widest = LATTICE_ROWS[LATTICE_ROWS.len() - 1];
     let mut out = Vec::with_capacity(LATTICE_ROWS.len() * DEPTHS.len());
     for k in DEPTHS {
-        let act = rig.zeros(widest, k, Dtype::Bf16)?;
+        let act = rig.operand(widest, k, Dtype::Bf16)?;
         // Each fire reads the next of these, past the last-level cache.
         let weights = (0..weights_at(k))
-            .map(|_| rig.zeros(k, k, Dtype::Bf16))
+            .map(|_| rig.operand(k, k, Dtype::Bf16))
             .collect::<Result<Vec<Tensor>>>()?;
         let y = rig.zeros(widest, k, Dtype::Bf16)?;
         let next = std::cell::Cell::new(0usize);
@@ -250,10 +278,10 @@ fn attention<B: Serve, T: Tactics + ?Sized>(
     let tactic = tactics.sdpa(tier, s.head_dim);
     let tiled = tactics.sdpa_tiles(s.rows);
     let kv_width = s.kv_heads * s.head_dim;
-    let q = rig.zeros(s.rows, s.q_heads * s.head_dim, Dtype::Bf16)?;
+    let q = rig.operand(s.rows, s.q_heads * s.head_dim, Dtype::Bf16)?;
     let o = rig.zeros(s.rows, s.q_heads * s.head_dim, Dtype::Bf16)?;
-    let keys = rig.zeros(s.keys, kv_width, Dtype::Bf16)?;
-    let values = rig.zeros(s.keys, kv_width, Dtype::Bf16)?;
+    let keys = rig.operand(s.keys, kv_width, Dtype::Bf16)?;
+    let values = rig.operand(s.keys, kv_width, Dtype::Bf16)?;
     let pages = s.keys.div_ceil(PAGE);
     // The sequence's pages scattered over the pool as a served one's are.
     let indices: Vec<u32> = engine::rates::attn_page_order(pages);
@@ -304,13 +332,13 @@ fn scan<B: Serve>(
 ) -> Result<f64> {
     let s = SCAN_SHAPE;
     let channels = s.channels();
-    let raw = rig.zeros(s.tokens, channels, Dtype::Bf16)?;
+    let raw = rig.operand(s.tokens, channels, Dtype::Bf16)?;
     let qkv = rig.zeros(s.tokens, channels, Dtype::Bf16)?;
     let indptr = rig.words(&[0, s.tokens], 2, 1, Dtype::I32)?;
-    let weight = rig.zeros(channels, s.conv_width, Dtype::Bf16)?;
+    let weight = rig.operand(channels, s.conv_width, Dtype::Bf16)?;
     let slots = rig.zeros(s.tokens, 1, Dtype::U32)?;
-    let conv_bank = rig.zeros(1, s.conv_width * channels, Dtype::F32)?;
-    let scan_bank = rig.zeros(1, s.v_heads * s.k_dim * s.v_dim, Dtype::F32)?;
+    let conv_bank = rig.operand(1, s.conv_width * channels, Dtype::F32)?;
+    let scan_bank = rig.operand(1, s.v_heads * s.k_dim * s.v_dim, Dtype::F32)?;
     let gates = rig.zeros(s.tokens, 2 * s.v_heads, Dtype::F32)?;
     let y = rig.zeros(s.tokens, s.v_heads * s.v_dim, Dtype::F32)?;
     let conv_state = kernels_slang::ssm::StatePool::bank(conv_bank, slots);
@@ -422,8 +450,8 @@ pub fn gemm_rate<B: Serve>(
     (m, n, k): (u32, u32, u32),
 ) -> Result<f64> {
     let mut rig = Rig::<B>::new(device);
-    let act = rig.zeros(m, k, Dtype::Bf16)?;
-    let w = rig.zeros(n, k, Dtype::Bf16)?;
+    let act = rig.operand(m, k, Dtype::Bf16)?;
+    let w = rig.operand(n, k, Dtype::Bf16)?;
     let y = rig.zeros(m, n, Dtype::Bf16)?;
     let ns = rig.each(timer, &|sink| {
         kernels_slang::linear::gemm::matmul(sink, tactic, act, w, y).map_err(fault("rates: matmul"))
