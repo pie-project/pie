@@ -524,6 +524,13 @@ impl FireCtx<'_> {
             Some(forked) if forks => (forked, true),
             _ => (&self.compiled.arena, false),
         };
+        // A fire holding a lane that captures scores lays its carve's
+        // score planes, under the carve, in the term its programs state.
+        let scored = p
+            .composition
+            .lanes()
+            .iter()
+            .any(|row| self.arena.captures(row.class as usize));
         let mut slots = self.arena.fire_slots(
             self.pools,
             map,
@@ -537,7 +544,8 @@ impl FireCtx<'_> {
                 clips: u64::from(p.composition.clips()),
                 readouts: p.readout_rows.len() as u64,
             },
-        );
+            scored,
+        )?;
         // The fire's guests' programs lay their tables and scratch under
         // this carve.
         let span = super::program_span(

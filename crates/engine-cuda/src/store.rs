@@ -620,6 +620,9 @@ pub struct Pools {
     /// holds, not the asked count (reserved for the asked count,
     /// Qwen3.5-0.8B's c64 ran ~1% slower on sm_120).
     whole_fit: bool,
+    /// How many times the activation's span was asked backed
+    /// ([`Pools::activation_holds`]).
+    activation_holds: u64,
     /// The pool's chunks lie in one run from its base
     /// ([`Pools::keep_contiguous`]).
     contiguous: bool,
@@ -1029,6 +1032,7 @@ impl Pools {
             pinned: false,
             stated: None,
             whole_fit: false,
+            activation_holds: 0,
             contiguous: false,
             airborne: None,
             host: None,
@@ -1626,6 +1630,7 @@ impl Pools {
     /// Backs the first `bytes` of the activation's span, beside the pool's
     /// budget where `beside` and the budget refuses them.
     pub(crate) fn hold_activation(&mut self, bytes: u64, beside: bool) -> Result<()> {
+        self.activation_holds += 1;
         match self.chunks.hold_activation(&mut self.pool, bytes, beside)? {
             Commit::Committed => Ok(()),
             refusal => Err(refuse(&self.pool, refusal)),
@@ -1637,6 +1642,20 @@ impl Pools {
     /// stated to no runtime ([`chunks::Chunks::skip_past`]).
     pub fn fit_range_whole(&mut self) {
         self.whole_fit = true;
+    }
+
+    /// The bytes of the activation's span held backed, wherever in it.
+    #[must_use]
+    pub fn activation_held_bytes(&self) -> u64 {
+        self.chunks.activation_held_bytes()
+    }
+
+    /// How many times a range of the activation's span was asked backed
+    /// ([`Pools::hold_activation`], [`Pools::hold_activation_at`]): none
+    /// after the load is ready.
+    #[must_use]
+    pub fn activation_holds(&self) -> u64 {
+        self.activation_holds
     }
 
     /// The bytes of the activation's span under the pool's end.
@@ -1658,6 +1677,7 @@ impl Pools {
         bytes: u64,
         beside: bool,
     ) -> Result<()> {
+        self.activation_holds += 1;
         match self
             .chunks
             .hold_activation_at(&mut self.pool, offset, bytes, beside)?
@@ -2047,32 +2067,43 @@ impl Pools {
     /// runtime keeps free of state at every rung the fire may be cut to.
     /// The span is lent only where the state's chunks end where the
     /// activation starts (`Pools::lent_bytes`), so the span is one.
-    pub fn program_span(&self, under: u64, term: u64) -> Result<(u64, u64)> {
+    /// `scored`: `under` is what lies under the carve's score planes, which
+    /// take the top of that room, so the programs' span ends right under
+    /// them, not at the whole chunk under the carve.
+    pub fn program_span(&self, under: u64, term: u64, scored: bool) -> Result<(u64, u64)> {
         let chunk = self.chunks.layout().chunk_bytes.max(1);
         let term = term.div_ceil(chunk) * chunk;
-        Ok((self.chunks.state_end() + self.lent_bytes(under), term))
+        Ok((
+            self.chunks.state_end() + self.lent_bytes(under, scored),
+            term,
+        ))
     }
 
-    /// The whole chunks of the span under a carve that leaves `under`
-    /// bytes below it, as the rungs state them lent: none where the
-    /// state's chunks do not end where the activation starts
-    /// ([`chunks::Chunks::state_fitted`]), since what is lent and the state's last
-    /// chunks would not be one span.
-    fn lent_bytes(&self, under: u64) -> u64 {
+    /// The chunks of the span under a carve that leaves `under` bytes
+    /// below it, as the rungs state them lent (whole chunks; every byte of
+    /// it where `exact`): none where the state's chunks do not end where
+    /// the activation starts ([`chunks::Chunks::state_fitted`]), since what
+    /// is lent and the state's last chunks would not be one span.
+    fn lent_bytes(&self, under: u64, exact: bool) -> u64 {
         if !self.chunks.state_meets_activation() {
             return 0;
         }
         let chunk = self.chunks.layout().chunk_bytes.max(1);
-        let act = u64::from(self.chunks.act_chunks());
-        (under / chunk).min(act.saturating_sub(1)) * chunk
+        let most = u64::from(self.chunks.act_chunks()).saturating_sub(1) * chunk;
+        if exact {
+            under.min(most)
+        } else {
+            (under / chunk * chunk).min(most)
+        }
     }
 
     /// The bytes of a fire's programs of `term` bytes that lie under the
-    /// state's end, where its carve leaves `under` bytes of the span.
+    /// state's end, where its carve leaves `under` bytes of the span
+    /// ([`Pools::program_span`]).
     #[must_use]
-    pub fn program_bytes_under_state(&self, under: u64, term: u64) -> u64 {
+    pub fn program_bytes_under_state(&self, under: u64, term: u64, scored: bool) -> u64 {
         let chunk = self.chunks.layout().chunk_bytes.max(1);
-        (term.div_ceil(chunk) * chunk).saturating_sub(self.lent_bytes(under))
+        (term.div_ceil(chunk) * chunk).saturating_sub(self.lent_bytes(under, scored))
     }
 
     /// States the range whole to the runtime: every chunk it reserved, the
@@ -3630,7 +3661,7 @@ impl Pools {
         let rungs: Vec<(u32, u32)> = rungs
             .iter()
             .map(|&(tokens, under)| {
-                let lent = u32::try_from(self.lent_bytes(under) / chunk).unwrap_or(u32::MAX);
+                let lent = u32::try_from(self.lent_bytes(under, false) / chunk).unwrap_or(u32::MAX);
                 (tokens, act - lent)
             })
             .collect();
