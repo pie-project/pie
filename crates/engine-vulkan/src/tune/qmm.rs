@@ -368,7 +368,7 @@ pub fn fit(measured: &Measured, grid: &Grid, cores: u32) -> Result<(Entries, Vec
 pub use device::measure;
 
 #[cfg(feature = "vulkan")]
-mod device {
+pub(super) mod device {
     use std::cell::RefCell;
 
     use crate::tuning::Tuning;
@@ -404,23 +404,23 @@ mod device {
         }
     }
 
-    fn noise(at: u64) -> u8 {
+    pub(in crate::tune) fn noise(at: u64) -> u8 {
         let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x1234_5678_9ABC_DEF0;
         x ^= x >> 33;
         x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
         (x >> 40) as u8
     }
 
-    fn bf16(v: f32) -> [u8; 2] {
+    pub(in crate::tune) fn bf16(v: f32) -> [u8; 2] {
         let bits = v.to_bits();
         [(bits >> 16) as u8, (bits >> 24) as u8]
     }
 
-    fn seen(v: f32) -> f64 {
+    pub(in crate::tune) fn seen(v: f32) -> f64 {
         f64::from(f32::from_bits(v.to_bits() & 0xFFFF_0000))
     }
 
-    fn to_f32(lo: u8, hi: u8) -> f32 {
+    pub(in crate::tune) fn to_f32(lo: u8, hi: u8) -> f32 {
         f32::from_bits((u32::from(hi) << 24) | (u32::from(lo) << 16))
     }
 
@@ -448,8 +448,8 @@ mod device {
     }
 
     /// More than any GPU's last-level cache.
-    const STREAM_BYTES: u64 = 256 << 20;
-    const SHAPE_BYTES: u64 = 1 << 30;
+    pub(in crate::tune) const STREAM_BYTES: u64 = 256 << 20;
+    pub(in crate::tune) const SHAPE_BYTES: u64 = 1 << 30;
 
     fn weights(
         device: &Context,
@@ -736,7 +736,7 @@ mod device {
 
     /// Seconds per launch for each of `live`, timed round-robin so drift
     /// lands on every candidate alike.
-    fn time(
+    pub(in crate::tune) fn time(
         device: &Context,
         pipelines: &Pipelines,
         handles: &Handles<Api>,

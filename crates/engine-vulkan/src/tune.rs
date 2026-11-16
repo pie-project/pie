@@ -1,6 +1,8 @@
-//! `pie tune` on Vulkan: `kernel.qmm` is fitted to a kernel bench (`qmm`),
-//! then it and the other decisions are searched end to end on served models.
+//! `pie tune` on Vulkan: `kernel.qmm` and `kernel.gemm.path` are fitted to
+//! kernel benches (`qmm`, `gemm`), then they and the other decisions are
+//! searched end to end on served models.
 
+mod gemm;
 mod qmm;
 
 pub use qmm::Depth;
@@ -11,10 +13,11 @@ use std::time::Instant;
 use profile::search::{self, Bench, CONTEXT, Check, LANES, Line, PROMPT, STEPS, Serving};
 use profile::{Facts, Profile};
 
-/// The kernel bench fits `kernel.qmm`; one device with one queue has no
-/// collectives or side streams.
+/// The kernel benches fit `kernel.qmm` and `kernel.gemm.path`; one device
+/// with one queue has no collectives or side streams.
 const SEARCH_SKIPS: &[&str] = &[
     "kernel.qmm",
+    "kernel.gemm.path",
     "compiler.cost.collective_us",
     "compiler.side_streams",
 ];
@@ -274,6 +277,64 @@ fn bench_qmm(
     Ok((fitted, lines, wrong))
 }
 
+/// Measure `kernel.gemm.path` by rows and fit its crossover; the
+/// measurements are kept under `cache`, where `refit` reads them back.
+fn bench_gemm(
+    depth: Depth,
+    name: &str,
+    base: &Profile,
+    cache: &Path,
+    refit: bool,
+    say: &mut dyn FnMut(&str),
+) -> Result<(search::Entries, Vec<Line>, Vec<String>), String> {
+    let grid = gemm::Grid::of(depth);
+    let kept = cache
+        .join(profile::id_of(name))
+        .join(format!("vulkan-gemm-{}.txt", depth.word()));
+    let measured = if refit {
+        let text = std::fs::read_to_string(&kept)
+            .map_err(|e| format!("no measurements at {}: {e}", kept.display()))?;
+        say(&format!("refitting the measurements in {}", kept.display()));
+        gemm::Measured::from_text(&text)?
+    } else {
+        let m = measure_gemm(base, &grid, say)?;
+        if let Some(dir) = kept.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        std::fs::write(&kept, m.to_text(name)).map_err(|e| e.to_string())?;
+        say(&format!("measurements kept in {}", kept.display()));
+        m
+    };
+    let (fitted, lines) = gemm::fit(&measured)?;
+    let wrong = measured
+        .wrong
+        .iter()
+        .map(|(body, n, first)| format!("{body}: wrong at {n} points; first at {first}"))
+        .collect();
+    Ok((fitted, lines, wrong))
+}
+
+#[cfg(feature = "vulkan")]
+fn measure_gemm(
+    base: &Profile,
+    grid: &gemm::Grid,
+    say: &mut dyn FnMut(&str),
+) -> Result<gemm::Measured, String> {
+    let device =
+        crate::device::Context::bind(&crate::api::DeviceBoot::default(), engine::Allowance::WHOLE)
+            .map_err(|e| e.to_string())?;
+    gemm::measure(&device, base, grid, say)
+}
+
+#[cfg(not(feature = "vulkan"))]
+fn measure_gemm(
+    _: &Profile,
+    _: &gemm::Grid,
+    _: &mut dyn FnMut(&str),
+) -> Result<gemm::Measured, String> {
+    Err("this build carries no Vulkan device code".to_string())
+}
+
 #[cfg(feature = "vulkan")]
 fn measure(
     base: &Profile,
@@ -312,7 +373,12 @@ pub fn run(
         facts.describe().join(", "),
         report.used
     ));
-    let (fitted, mut lines, wrong) = bench_qmm(depth, &name, &base, cores, cache, refit, say)?;
+    let (mut fitted, mut lines, mut wrong) =
+        bench_qmm(depth, &name, &base, cores, cache, refit, say)?;
+    let (crossover, gemm_lines, gemm_wrong) = bench_gemm(depth, &name, &base, cache, refit, say)?;
+    fitted.extend(crossover);
+    lines.extend(gemm_lines);
+    wrong.extend(gemm_wrong);
     // The fitted ladder must also win end to end to be kept.
     let mut knobs: Vec<search::Knob> = Vec::new();
     for (id, value) in &fitted {
@@ -342,7 +408,10 @@ pub fn run(
     let mut chosen = Vec::new();
     if models.is_empty() {
         chosen = fitted;
-        for k in knobs.iter().filter(|k| k.id != "kernel.qmm") {
+        for k in knobs
+            .iter()
+            .filter(|k| !matches!(k.id, "kernel.qmm" | "kernel.gemm.path"))
+        {
             lines.push(Line {
                 id: k.id,
                 text: "not searched: no model to serve (import one, or pass --check)".to_string(),

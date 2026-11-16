@@ -56,7 +56,7 @@ impl<B: Backend> Run<'_, B> {
                     ),
                     None => kernels_slang::linear::gemm::matmul(
                         self.ctx,
-                        self.gemm_tactic(),
+                        self.gemm_tactic(self.tensor(*act).rows),
                         self.tensor(*act),
                         self.tensor(*w),
                         self.tensor(*y),
@@ -88,7 +88,7 @@ impl<B: Backend> Run<'_, B> {
                     ),
                     None => kernels_slang::linear::gemm::lm_head(
                         self.ctx,
-                        self.gemm_tactic(),
+                        self.gemm_tactic(self.tensor(*act).rows),
                         self.tensor(*act),
                         self.tensor(*w),
                         self.tensor(*y),
@@ -666,9 +666,9 @@ impl<B: Backend> Run<'_, B> {
 }
 
 impl<B: Backend> Run<'_, B> {
-    /// The device's gemm tactic.
-    fn gemm_tactic(&self) -> kernels_slang::linear::gemm::Tactic {
-        self.tuning().gemm(self.tier())
+    /// The device's gemm tactic for `rows` activation rows.
+    fn gemm_tactic(&self, rows: u32) -> kernels_slang::linear::gemm::Tactic {
+        self.tuning().gemm(self.tier(), rows)
     }
 
     /// The `kernel.qmm` rungs a matmul tries, in order, at its rows; to a

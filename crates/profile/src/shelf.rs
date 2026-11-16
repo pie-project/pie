@@ -135,21 +135,28 @@ impl Shelf {
         })
     }
 
+    /// What [`Shelf::tell_untuned`] says of `device`: that it runs without
+    /// a profile measured on it, and how to make one; `None` where a layer
+    /// measured what it runs.
+    #[must_use]
+    pub fn untuned(&self, device: &str, report: &Report) -> Option<String> {
+        report
+            .untuned()
+            .then(|| crate::untuned_hint(device, self.backend, &id_of(device), report))
+    }
+
     /// Say once per device, on stderr, that it runs without a profile
     /// measured on it, and how to make one.
     pub fn tell_untuned(&self, device: &str, report: &Report) {
         use std::collections::BTreeSet;
         use std::sync::Mutex;
         static TOLD: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
-        if !report.untuned() {
+        let Some(hint) = self.untuned(device, report) else {
             return;
-        }
+        };
         let mut told = TOLD.lock().expect("told lock poisoned");
         if told.insert(format!("{}/{device}", self.backend)) {
-            eprintln!(
-                "{}",
-                crate::untuned_hint(device, self.backend, &id_of(device), report)
-            );
+            eprintln!("{hint}");
         }
     }
 

@@ -1,0 +1,15 @@
+api = 1
+
+[target]
+device = "NVIDIA RTX PRO 4500 Blackwell"
+assumes = { coopmat = true }
+
+[provenance]
+measured = ["kernel.gemm.path"]
+
+[kernel]
+# `pie tune --quick` over Qwen3-0.6B's and Qwen3-8B's bf16 projections: below
+# 96 rows the 64-row cooperative-matrix tile launches one row of workgroups
+# and runs 1.2-1.8x the 32x32 tiled kernel's time; from 96 it runs 0.5-0.95x.
+# The fitted path runs at 1.011x the per-point best, coopmat everywhere 1.164x.
+gemm.path = [{ when = "rows < 96", use = "tiled" }, "coopmat"]

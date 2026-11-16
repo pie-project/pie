@@ -98,9 +98,12 @@ impl Qmm {
     }
 }
 
-/// How unquantised matmuls read prompt rows.
+/// How unquantised matmuls read prompt rows, by the rows a fire lands: the
+/// cooperative-matrix tile is 64 rows tall, so below its crossover it
+/// launches a row of workgroups that each walk the whole contraction, and
+/// the tiled or register-tiled kernel lands the same rows sooner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.gemm.path", default = "tiled", tune = search)]
+#[decision(id = "kernel.gemm.path", shape(rows), default = "tiled", tune = search)]
 pub enum GemmPath {
     Tiled,
     #[requires("coopmat")]
@@ -257,9 +260,13 @@ impl Tuning {
             .collect()
     }
 
+    /// Whether a dense matmul over `rows` rows takes cooperative matrices.
     #[must_use]
-    pub fn gemm_coopmat(&self) -> bool {
-        *self.profile.get::<GemmPath>() == GemmPath::Coopmat
+    pub fn gemm_coopmat(&self, rows: u32) -> bool {
+        let at = GemmPathAt {
+            rows: i64::from(rows),
+        };
+        *self.profile.pick::<GemmPath>(&at) == GemmPath::Coopmat
     }
 
     #[must_use]
@@ -348,10 +355,10 @@ impl engine_gpu::backend::Tactics for Tuning {
         }
     }
 
-    /// Cooperative-matrix tiles where the profile takes them.
-    fn gemm(&self, _tier: kernels_slang::Tier) -> kernels_slang::linear::gemm::Tactic {
+    /// Cooperative-matrix tiles where the profile takes them at `rows`.
+    fn gemm(&self, _tier: kernels_slang::Tier, rows: u32) -> kernels_slang::linear::gemm::Tactic {
         kernels_slang::linear::gemm::Tactic {
-            tier: if self.gemm_coopmat() {
+            tier: if self.gemm_coopmat(rows) {
                 kernels_slang::Tier::Coopmat
             } else {
                 kernels_slang::Tier::Baseline
