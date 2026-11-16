@@ -246,6 +246,7 @@ impl<B: Backend> Run<'_, B> {
                     *sm_scale,
                     *observe,
                     into.is_some(),
+                    self.tuning().workgroup_bytes(),
                 )
             }
             Attn::ScorePages { keys, pages } => {

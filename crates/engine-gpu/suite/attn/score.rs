@@ -188,9 +188,13 @@ fn table(f: &Fixture, context: usize) -> Vec<i32> {
         .collect()
 }
 
-fn case(gpu: &mut Gpu, context: usize, observe: usize, q_heads: usize) {
+/// `workgroup_bytes`: the workgroup memory the device is taken to state,
+/// which picks the mass kernel's form.
+fn case(gpu: &mut Gpu, context: usize, observe: usize, q_heads: usize, workgroup_bytes: u32) {
     let f = fixture(context);
-    let what = format!("context {context}, observe {observe}, {q_heads} model heads");
+    let what = format!(
+        "{workgroup_bytes} B of workgroup memory: context {context}, observe {observe}, {q_heads} model heads"
+    );
     let rows = *f.qo.last().unwrap() as usize;
     let slots = f.pool_pages * PAGE;
     let row = KV_HEADS * HEAD_DIM;
@@ -247,6 +251,7 @@ fn case(gpu: &mut Gpu, context: usize, observe: usize, q_heads: usize) {
                 SCALE as f32,
                 observe as u32,
                 layer > 0,
+                workgroup_bytes,
             )?;
         }
         kernels_slang::attn::score::pages(
@@ -310,7 +315,9 @@ fn score_capture_answers_the_cpu_oracles_sum() {
         eprintln!("not asked: no device");
         return;
     };
-    for (context, observe, q_heads) in [(32, 2, 4), (40, 5, 8), (300, 1, 4), (300, 32, 8)] {
-        case(&mut gpu, context, observe, q_heads);
+    for workgroup_bytes in [16 << 10, 32 << 10] {
+        for (context, observe, q_heads) in [(32, 2, 4), (40, 5, 8), (300, 1, 4), (300, 32, 8)] {
+            case(&mut gpu, context, observe, q_heads, workgroup_bytes);
+        }
     }
 }
