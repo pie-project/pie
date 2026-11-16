@@ -32,11 +32,6 @@ pub struct Arena {
     /// The classes that capture scores: a fire holding a lane of one lays
     /// its carve's score planes ([`Arena::fire_slots`]).
     scoring: poem_ir::ClassSet,
-    /// The lanes every fire carves for, whatever its own: a fire that
-    /// replays a recorded body lays its lane tables at the body's capacity
-    /// (`window::lane_capacity`), so its carve is the smallest rung's that
-    /// holds that many lanes. 0 where fires carve for their own lanes.
-    lane_reach: u32,
 }
 
 /// The `attn.scores` outputs of `trace`.
@@ -84,7 +79,6 @@ impl Arena {
             rungs: Vec::new(),
             scores,
             scoring: poem_ir::ClassSet::default(),
-            lane_reach: 0,
         }
     }
 
@@ -140,12 +134,6 @@ impl Arena {
         self.scoring.contains(class)
     }
 
-    /// Every fire of this load carves for `lanes` lanes at least: what the
-    /// rungs state to the runtime follows the carve a fire really lays.
-    pub fn reach_lanes(&mut self, lanes: u32) {
-        self.lane_reach = lanes;
-    }
-
     /// With `rungs`, each a carve no larger than the reservation without
     /// its score planes, smallest first: a fire carves the smallest that
     /// holds it, at the reservation's end ([`Arena::fire_slots`]).
@@ -188,17 +176,12 @@ impl Arena {
         let size = |map: &ArenaMap| self.unscored(map);
         self.rungs
             .iter()
-            .map(|(tokens, _)| {
-                // The carve a fire cut to this rung lays: the smallest
-                // rung's that holds its tokens and the lanes it carves
-                // for, the whole arena past every rung
-                // ([`Arena::fire_slots`]).
-                let carve = self
-                    .rungs
-                    .iter()
-                    .find(|(rung, _)| rung >= tokens && *rung >= self.lane_reach)
-                    .map_or(self.reserved, |(_, map)| size(map));
-                let bytes = carve.max(forked.map_or(0, size));
+            .map(|(tokens, map)| {
+                // The carve a fire cut to this rung lays: its own. A fire
+                // replaying a body carves for the body's lanes, which are
+                // no more than its bucket's rows (`window::body_lanes`),
+                // so no wider rung's ([`Arena::fire_slots`]).
+                let bytes = size(map).max(forked.map_or(0, size));
                 (
                     *tokens,
                     self.reserved.saturating_sub(bytes).min(self.committed),

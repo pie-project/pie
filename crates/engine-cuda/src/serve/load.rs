@@ -1456,15 +1456,6 @@ impl Shell {
             std::iter::once(&shell.compiled.arena).chain(shell.compiled.arena_forked.as_ref()),
         );
         shell.programs.set_scores(widest);
-        // A fire that replays a recorded body carves for the body's lane
-        // capacity, not its own lanes: the rungs stated to the runtime
-        // follow that carve, so state is never lent under a carve a fire
-        // cut to the rung still lays.
-        if shell.records_bodies() {
-            shell
-                .arena
-                .reach_lanes(crate::window::lane_capacity(shell.budget.max_lanes));
-        }
         // A program's fires lay their tables and scratch in the span the
         // runtime widens for them when it binds (`Shell::fire_facts`):
         // nothing is held for them here.
