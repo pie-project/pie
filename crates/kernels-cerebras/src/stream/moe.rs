@@ -8,7 +8,9 @@
 //!   lowest expert holding it on a tie, as a route picks), the picked scores weighted (the
 //!   softmax over them, or the sigmoid's renormalized and scaled): one weight an expert, zero
 //!   unpicked;
-//! - that gate expanded to each expert's columns by a matvec of constant ones;
+//! - that gate, on the rows, expanded to each expert's columns by a matvec of constant ones (the
+//!   experts' columns over the column roots: the most PEs; the gate and the layer's input moved
+//!   to the rows first where they are not);
 //! - every expert's gate and up as one matvec each over its bank (an expert's rows a block);
 //! - the activation times the expanded gate, a root region;
 //! - every expert's down as one matvec over its bank (an expert's columns a block of the input).
@@ -43,8 +45,10 @@ pub enum Kind {
     Ups = 3,
     /// The activation, gated (E x I).
     Acts = 4,
-    /// The layer's input moved to the side the gate is on (H).
+    /// The layer's input moved to the rows (H).
     Input = 5,
+    /// The gate moved to the rows (E, f32).
+    GateRows = 6,
 }
 
 /// The synthetic value of `kind` of the route at `node`.
@@ -266,7 +270,7 @@ pub fn ty(trace: &Trace, v: ValueId) -> Option<(u32, Dtype)> {
     let ei = g.experts * g.inter;
     let narrow = dtype(trace, g.up.0);
     Some(match kind {
-        0 => (g.experts, Dtype::F32),
+        0 | 6 => (g.experts, Dtype::F32),
         1 => (ei, Dtype::F32),
         2..=4 => (
             ei,

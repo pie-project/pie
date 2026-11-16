@@ -393,12 +393,14 @@ fn layout_with(r: &Reader, u: &Unit, py: u32, rest: u32) -> Option<Layout> {
         if left.is_empty() {
             return Some(());
         }
-        if rest == 0 || !(left.len() as u32).is_multiple_of(rest) {
+        if rest == 0 {
             return None;
         }
-        let per = left.len() / rest as usize;
+        // (a share a root, the last ones a column fewer where the roots do not divide them)
+        let (base, extra) = (left.len() / rest as usize, left.len() % rest as usize);
         for i in 0..rest as usize {
-            let part = &left[i * per..(i + 1) * per];
+            let lo = i * base + i.min(extra);
+            let part = &left[lo..lo + base + usize::from(i < extra)];
             let mut a = 0;
             while a < part.len() {
                 let mut b = a + 1;
@@ -641,6 +643,10 @@ pub fn layout(r: &Reader, u: &Unit, py: u32, tile: u32, spill: bool, widen: u32)
     Ok(layout_fewest(r, u, py, tile, spill, want).unwrap_or(l0))
 }
 
+/// A layout's worst tile past the budget: (rest roots, the root, its words, its matvecs' (step,
+/// words)).
+type OverTile = (u32, u32, u32, Vec<(usize, u32)>);
+
 /// [`layout`]'s fewest rest roots from `from` on.
 fn layout_fewest(r: &Reader, u: &Unit, py: u32, tile: u32, spill: bool, from: u32) -> R<Layout> {
     let (host, over) = row_held_words(r, u, py);
@@ -654,11 +660,23 @@ fn layout_fewest(r: &Reader, u: &Unit, py: u32, tile: u32, spill: bool, from: u3
     };
     let mut short: Option<(u32, u32)> = None;
     let mut unstored = false;
+    // the most rest roots' worst tile: its root, its words, its matvecs' (step: words)
+    let mut over_tile: Option<OverTile> = None;
     for rest in from..=MAX_REST {
         let Some(l) = layout_with(r, u, py, rest) else {
             continue;
         };
-        if l.px() == 0 || !(0..l.px()).all(|c| tile_words(u, &l, c) < tile) {
+        if l.px() == 0 {
+            continue;
+        }
+        if !(0..l.px()).all(|c| tile_words(u, &l, c) < tile) {
+            let worst = (0..l.px())
+                .max_by_key(|&c| tile_words(u, &l, c))
+                .unwrap_or(0);
+            let steps = (u.steps.iter().enumerate())
+                .filter_map(|(i, s)| tile_dims(s, &l, worst).map(|(a, b)| (i, a * b)))
+                .collect();
+            over_tile = Some((rest, worst, tile_words(u, &l, worst), steps));
             continue;
         }
         if spill && !stored(&l) {
@@ -687,8 +705,12 @@ fn layout_fewest(r: &Reader, u: &Unit, py: u32, tile: u32, spill: bool, from: u3
             over / u.rows.max(1)
         ),
         None => format!(
-            "{}: no column roots up to {MAX_REST} fit its tiles ({tile} words)",
-            u.name
+            "{}: no column roots up to {MAX_REST} fit its tiles ({tile} words){}",
+            u.name,
+            over_tile.map_or(String::new(), |(rest, c, w, steps)| format!(
+                " (at {rest} rest roots, root {c} of {} head roots: {w} words, step: words {steps:?})",
+                u.joint.map_or(0, |j| j.kv_heads)
+            ))
         ),
     })
 }

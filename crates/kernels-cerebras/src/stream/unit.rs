@@ -938,16 +938,57 @@ pub fn lower_through(
                     chain: super::moe::router(trace, &g).map_err(|e| refuse(at, e))?,
                 });
                 sides.insert(gate, gs);
-                let o = gs.flip();
-                let spread = synth(at, Kind::Spread);
-                steps.push(Step::Matvec {
-                    node: at,
-                    from: gs,
-                    input: Cols {
+                // the experts' columns over the column roots (the most PEs), from the rows: the
+                // gate and the layer's input on the rows, moved there where they are not
+                let (rows, o) = (Side::Row, Side::Col);
+                let to_rows = |steps: &mut Vec<Step>,
+                               sides: &mut BTreeMap<ValueId, Side>,
+                               c: Cols,
+                               from: Side,
+                               kind: Kind,
+                               x32: bool,
+                               round: bool| {
+                    if from == rows {
+                        return c;
+                    }
+                    let moved = synth(at, kind);
+                    steps.push(Step::Matvec {
+                        node: at,
+                        from,
+                        input: c,
+                        weight: ValueId(super::host::UNIT),
+                        view: View::Plain,
+                        output: moved,
+                        k: c.width,
+                        n: c.width,
+                        x32,
+                        round,
+                    });
+                    sides.insert(moved, rows);
+                    Cols {
+                        base: moved,
+                        from: 0,
+                        width: c.width,
+                    }
+                };
+                let gin = to_rows(
+                    &mut steps,
+                    &mut sides,
+                    Cols {
                         base: gate,
                         from: 0,
                         width: e,
                     },
+                    gs,
+                    Kind::GateRows,
+                    true,
+                    false,
+                );
+                let spread = synth(at, Kind::Spread);
+                steps.push(Step::Matvec {
+                    node: at,
+                    from: rows,
+                    input: gin,
                     weight: ValueId(super::host::UNIT),
                     view: View::Spread { rep: g.inter },
                     output: spread,
@@ -957,34 +998,19 @@ pub fn lower_through(
                     round: false,
                 });
                 sides.insert(spread, o);
-                // the layer's input where the gate is: its projections land with the spread
                 let xc = r.cols(g.x);
                 let xs = side_of(&sides, xc).ok_or_else(|| {
                     refuse(at, "linear.moe_select reads a value no root has".into())
                 })?;
-                let xin = if xs == gs {
-                    xc
-                } else {
-                    let moved = synth(at, Kind::Input);
-                    steps.push(Step::Matvec {
-                        node: at,
-                        from: xs,
-                        input: xc,
-                        weight: ValueId(super::host::UNIT),
-                        view: View::Plain,
-                        output: moved,
-                        k: h,
-                        n: h,
-                        x32: r.dtype(g.x) == Some(Dtype::F32),
-                        round: r.round(g.x),
-                    });
-                    sides.insert(moved, gs);
-                    Cols {
-                        base: moved,
-                        from: 0,
-                        width: h,
-                    }
-                };
+                let xin = to_rows(
+                    &mut steps,
+                    &mut sides,
+                    xc,
+                    xs,
+                    Kind::Input,
+                    r.dtype(g.x) == Some(Dtype::F32),
+                    r.round(g.x),
+                );
                 let narrow = r.dtype(synth(at, Kind::Gates)).unwrap_or(Dtype::Bf16);
                 // (a non-gated activation's experts: their ups alone)
                 let banks: Vec<(Kind, (ValueId, u32, u32))> = g
@@ -996,7 +1022,7 @@ pub fn lower_through(
                 for (kind, (bank, stride, off)) in banks {
                     steps.push(Step::Matvec {
                         node: at,
-                        from: gs,
+                        from: rows,
                         input: xin,
                         weight: bank,
                         view: View::Rows {
@@ -1034,7 +1060,7 @@ pub fn lower_through(
                     x32: false,
                     round: r.round(g.y),
                 });
-                sides.insert(g.y, gs);
+                sides.insert(g.y, rows);
             }
             // a gated delta rule (its conv, its gates, its recurrence): a step's row through
             // its heads' state columns (P8), the conv's history and the gates at their roots
