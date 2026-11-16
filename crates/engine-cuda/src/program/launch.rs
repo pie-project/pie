@@ -1572,8 +1572,10 @@ impl Prepared {
     }
 }
 
-/// The device's multiprocessors, which a sampler fire's blocks may fill.
-fn device_units() -> u32 {
+/// The device's multiprocessors, which a sampler fire's blocks may fill
+/// and its lane arenas are sized by ([`Arenas::bytes_for`]).
+#[must_use]
+pub fn device_units() -> u32 {
     static UNITS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *UNITS.get_or_init(|| {
         #[cfg(feature = "device")]

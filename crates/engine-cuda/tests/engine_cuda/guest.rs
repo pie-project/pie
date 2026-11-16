@@ -165,5 +165,14 @@ pub fn alone_plane() -> engine_cuda::ProgramPlane {
     let end = Box::leak(Box::new(buffer)).ptr() + SPAN as u64;
     let mut plane = engine_cuda::ProgramPlane::new(engine_cuda::program::compile::Disk::disabled());
     plane.set_span((end, SPAN as u64));
+    // The flight and the lane arenas a load lays: the widest flight a
+    // power of two of the device's units, its samplers' arenas beside.
+    use engine_cuda::program::launch::{Arenas, device_units};
+    let units = device_units().max(1);
+    plane.set_flight(1 << units.ilog2());
+    let bytes = Arenas::bytes_for(plane.flight(), units);
+    let arenas = engine_cuda::device::Buffer::zeroed(bytes as usize).expect("the lane arenas");
+    let at = Box::leak(Box::new(arenas)).ptr();
+    plane.set_arenas(Arenas { at, bytes });
     plane
 }
