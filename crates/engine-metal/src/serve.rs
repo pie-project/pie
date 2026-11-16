@@ -2034,6 +2034,7 @@ impl Shell {
                         base: 0,
                         folded: 0,
                         fold: engine::fire::FoldLen::Host(0),
+                        lineage: engine::fire::Lineage::Set,
                     },
                     0,
                 ),
@@ -2043,6 +2044,7 @@ impl Shell {
                         base: 0,
                         folded: 0,
                         fold: engine::fire::FoldLen::Host(held),
+                        lineage: engine::fire::Lineage::Set,
                     },
                     held,
                 ),
@@ -4029,6 +4031,7 @@ impl Shell {
                     base,
                     folded,
                     fold,
+                    lineage,
                 } => {
                     let ahead = held_key.and_then(|key| self.frozen_ahead.get(&key).copied());
                     let folded = match ahead {
@@ -4047,6 +4050,7 @@ impl Shell {
                         base: *base,
                         folded,
                         fold: *fold,
+                        lineage: *lineage,
                     }
                 }
                 verb => verb.clone(),

@@ -412,6 +412,7 @@ impl Seq {
                     .collect(),
                 translation: Vec::new(),
                 window: Vec::new(),
+                ..Default::default()
             };
             return lane;
         }
@@ -481,6 +482,7 @@ impl Seq {
             pages: self.kv[..need.min(self.kv.len())].to_vec(),
             translation: Vec::new(),
             window: Vec::new(),
+            ..Default::default()
         };
         lane
     }

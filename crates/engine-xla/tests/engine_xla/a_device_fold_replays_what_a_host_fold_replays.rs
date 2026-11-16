@@ -179,6 +179,7 @@ impl Set {
             base: PROMPT,
             folded,
             fold,
+            lineage: Default::default(),
         };
         lane.rs_reset = RsReset::Held;
         lane.slot_copies = std::mem::take(&mut self.copies);

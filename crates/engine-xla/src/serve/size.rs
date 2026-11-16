@@ -160,6 +160,7 @@ impl Shell {
                         base: 0,
                         folded: first.saturating_sub(carried),
                         fold: FoldLen::Host(carried),
+                        lineage: Default::default(),
                     }
                 } else {
                     RsVerb::Fold

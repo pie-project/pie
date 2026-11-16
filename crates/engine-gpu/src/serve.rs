@@ -3022,6 +3022,7 @@ impl<B: Serve> Shell<B> {
                     base,
                     folded,
                     fold,
+                    lineage,
                 } if self.pools.rs_rows().is_some() => engine::fire::RsVerb::Buffer {
                     pages: self
                         .pools
@@ -3029,6 +3030,7 @@ impl<B: Serve> Shell<B> {
                     base: *base,
                     folded: *folded,
                     fold: *fold,
+                    lineage: *lineage,
                 },
                 other => other.clone(),
             };

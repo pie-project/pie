@@ -31,6 +31,7 @@ fn the_rs_scratch_is_the_widest_layers() {
         base: 0,
         folded: 0,
         fold: FoldLen::Host(fold),
+        lineage: Default::default(),
     };
     let (hold, replay) = (buffer(0), buffer(6));
     let fold = RsVerb::Fold;

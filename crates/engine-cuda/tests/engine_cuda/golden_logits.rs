@@ -1276,6 +1276,7 @@ fn served_buffered(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
                 base,
                 folded,
                 fold: FoldLen::Host(fold),
+                lineage: Default::default(),
             },
         );
         fed = end;
@@ -1406,6 +1407,7 @@ fn served_carrying(fixture: &Fixture, cache: &Path, buffer: bool) -> (Vec<Vec<f3
                 base,
                 folded,
                 fold: FoldLen::Host(if at == CARRIED { CARRIED + 1 } else { 0 }),
+                lineage: Default::default(),
             }
         } else {
             RsVerb::Fold
@@ -1530,6 +1532,7 @@ fn served_pair_buffered(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
                         base,
                         folded: folded[lane],
                         fold: FoldLen::Host(fold),
+                        lineage: Default::default(),
                     },
                     fold,
                 )
@@ -1762,6 +1765,7 @@ fn submitted_buffered(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
                 base,
                 folded,
                 fold: FoldLen::Host(fold),
+                lineage: Default::default(),
             },
             copies,
         );

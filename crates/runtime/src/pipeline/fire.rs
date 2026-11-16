@@ -9035,7 +9035,8 @@ mod unfolded_tests {
                         // on, or rewound over rows it rejects.
                         let first = folded + pick(end - folded + 1);
                         let reads =
-                            ::engine::fire::buffered_reads(None, folded, first, fire.own).unwrap();
+                            ::engine::fire::buffered_reads(None, folded, first, Default::default())
+                                .unwrap();
                         let carried: u32 = reads.iter().map(|span| span.end - span.start).sum();
                         assert!(
                             carried <= fire.stated,
