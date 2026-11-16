@@ -2310,7 +2310,7 @@ impl<B: Serve> Shell<B> {
     /// Where `slots` lays each capturing lane's rows: its source lane, and
     /// the bytes of the span's buffer its key row and page row start at.
     fn capture_rows(&self, composition: &Composition, slots: &SlotTable) -> Vec<(u32, u64, Option<u64>)> {
-        let Some(rows) = self.span.capture() else {
+        let Some(rows) = self.span.capture().filter(|_| slots.1.rows() > 0) else {
             return Vec::new();
         };
         let start = |grain: crate::arena::Grain| {

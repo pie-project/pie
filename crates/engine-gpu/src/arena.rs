@@ -401,7 +401,10 @@ impl<B: Backend> Span<B> {
         let mut slots: Vec<Option<Tensor>> = Vec::with_capacity(at.map.placements.len());
         for value in 0..at.map.placements.len() {
             let value = ValueId(value as u32);
-            slots.push(match (grain(&at.map, value), captured) {
+            // A fire that captures nothing lays no row: a capture's value
+            // has no rectangle, so it binds none.
+            let grain = captured.and_then(|_| grain(&at.map, value));
+            slots.push(match (grain, captured) {
                 (Some(Grain::Keys), Some((keys, _))) => Some(keys),
                 (Some(Grain::Pages), Some((_, pages))) => pages,
                 (Some(_), None) => None,
