@@ -1,5 +1,6 @@
 //! poem-compiler's integration tests, one binary: each module was a test file.
 
+mod a_score_output_states_its_heads_and_keys;
 mod common;
 mod flux_2_dims;
 mod hunyuan_image_3_dims;

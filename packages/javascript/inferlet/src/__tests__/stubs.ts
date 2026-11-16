@@ -27,7 +27,7 @@ export const modelStub = {
       : [],
     state: true,
     embeds: true,
-    outputs: [{ name: 'logits', axis: 'row', width: 151936, dtype: 'f32', layers: 0, maxRows: 256, readout: true }],
+    outputs: [{ name: 'logits', axis: 'row', width: 151936, dtype: 'f32', layers: 0, maxRows: 256, readout: true, planes: new Uint32Array() }],
   }),
 };
 
