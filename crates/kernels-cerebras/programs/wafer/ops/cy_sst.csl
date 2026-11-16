@@ -1,0 +1,78 @@
+// wafer/ops/cy_sst.csl: P8 (GENERIC.md §3.1, G1), a state column's root: a head's gated delta
+// rule a step (the PEs' side: ops/sst.csl). The head root's row [q | k | v | b | a] (the head's
+// raw q / k channels DK each, its v channels DV, its beta and decay logits) in:
+//   the short causal conv of each channel over its last CONV rows (the history the root keeps,
+//   cleared at a sequence's first step) and its SiLU; q and k l2-normed, q times 1/sqrt(DK);
+//   beta = sigmoid(b), decay = exp(-exp(A) softplus(a + dt));
+//   [k | q] down the column; [Sᵀk | Sᵀq] (the state before the step) up its chain;
+//   delta = beta (v - decay Sᵀk); o = decay Sᵀq + (k . q) delta (the state after the step read
+//   at q); [delta | decay] down the column for its update; o out.
+//
+// Interface: cw ([3 DK? channels][CONV] the conv's taps, the oldest row's first, then A, dt), the
+// host's; the conv's history the root's own.
+//
+// Params: fab (ops/fabric.csl), math (ops/math.csl), YO (the column multicast's output queue),
+// IN (the chain's input queue), DK, DV, CONV.
+param fab: imported_module;
+param math: imported_module;
+param YO: output_queue;
+param IN: input_queue;
+param DK: u16;
+param DV: u16;
+param CONV: u16 = 4;
+
+const NCH: u16 = 2 * DK + DV;
+const L2EPS: f32 = 1.0e-6;
+var cw = @zeros([NCH * CONV + 2]f32);
+var hist = @zeros([(CONV - 1) * NCH]f32);
+var y = @zeros([NCH]f32);
+var sk: [2 * DV]f32 align(16) = @zeros([2 * DV]f32);
+var dd: [DV + 1]f32 align(16) = @zeros([DV + 1]f32);
+const y_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NCH} -> y[i] });
+const sk_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2 * DV} -> sk[i] });
+const dd_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DV + 1} -> dd[i] });
+
+// A sequence's first step: the conv's history cleared.
+fn init() void {
+  var e: u16 = 0;
+  while (e < (CONV - 1) * NCH) : (e += 1) { hist[e] = 0.0; }
+}
+
+// One step: x [q | k | v | b | a] (NCH + 2 f32) in, o (DV f32) out.
+fn step(x: [*]f32, o: [*]f32) void {
+  // the conv over the history (oldest first) and this row, its SiLU; the history shifted
+  var c: u16 = 0;
+  while (c < NCH) : (c += 1) {
+    var acc: f32 = cw[c * CONV + CONV - 1] * x[c];
+    var j: u16 = 0;
+    while (j < CONV - 1) : (j += 1) { acc += cw[c * CONV + j] * hist[j * NCH + c]; }
+    j = 0;
+    while (j + 1 < CONV - 1) : (j += 1) { hist[j * NCH + c] = hist[(j + 1) * NCH + c]; }
+    hist[(CONV - 2) * NCH + c] = x[c];
+    y[c] = math.silu(acc);
+  }
+  // q, k l2-normed; q scaled
+  var qq: f32 = 0.0;
+  var kk: f32 = 0.0;
+  var i: u16 = 0;
+  while (i < DK) : (i += 1) { qq += y[i] * y[i]; kk += y[DK + i] * y[DK + i]; }
+  const rq = math.rsqrt(qq + L2EPS) * math.rsqrt(@as(f32, DK));
+  const rk = math.rsqrt(kk + L2EPS);
+  i = 0;
+  var kq: f32 = 0.0;
+  while (i < DK) : (i += 1) { y[i] *= rq; y[DK + i] *= rk; kq += y[i] * y[DK + i]; }
+  const beta = math.sigm(x[NCH]);
+  const decay = math.exp1(-math.exp1(cw[NCH * CONV]) * math.softplus(x[NCH + 1] + cw[NCH * CONV + 1]));
+  // [k | q] down, [Sᵀk | Sᵀq] up
+  @fmovs(fab.fout(YO, DK), @increment_dsd_offset(@set_dsd_length(y_d, DK), @as(i16, DK), f32));
+  @fmovs(fab.fout(YO, DK), @set_dsd_length(y_d, DK));
+  @fmovs(sk_d, fab.fin(IN, 2 * DV));
+  i = 0;
+  while (i < DV) : (i += 1) {
+    const d = beta * (y[2 * DK + i] - decay * sk[i]);
+    dd[i] = d;
+    o[i] = decay * sk[DV + i] + kq * d;
+  }
+  dd[DV] = decay;
+  @fmovs(fab.fout(YO, DV + 1), dd_d);
+}

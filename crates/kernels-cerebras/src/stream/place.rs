@@ -306,6 +306,19 @@ fn layout_with(r: &Reader, u: &Unit, py: u32, rest: u32) -> Option<Layout> {
                         );
                         push(&mut cols, h as usize, Slice::of(k.base, k.from + h * d, d));
                         push(&mut cols, h as usize, Slice::of(v.base, v.from + h * d, d));
+                        // a recurrence's head also its beta and decay logits
+                        if let Some(st) = j.state {
+                            push(
+                                &mut cols,
+                                h as usize,
+                                Slice::of(st.b.base, st.b.from + h, 1),
+                            );
+                            push(
+                                &mut cols,
+                                h as usize,
+                                Slice::of(st.a.base, st.a.from + h, 1),
+                            );
+                        }
                     }
                 }
                 Step::Attend { out, .. } => {

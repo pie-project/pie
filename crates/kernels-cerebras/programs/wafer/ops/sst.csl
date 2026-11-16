@@ -1,0 +1,64 @@
+// wafer/ops/sst.csl: P8 (GENERIC.md §3.1, G1), a state PE's side of a gated linear recurrence a
+// head (the root's side: ops/cy_sst.csl), one step a row. A column of these PEs holds a head's
+// state S (DK x DV, f32): row r of the column keeps state rows i = r (mod PYA) as rows i / PYA.
+//
+// step(): the root's multicast [k | q] (2 DK f32); the PE's partial [Sᵀk | Sᵀq] of its rows (the
+// state before the step) up the column chain; then the root's multicast [delta | decay]
+// (DV + 1): each row it keeps S_i = decay S_i + k_i delta (the delta rule's rank-one update; a
+// recurrence with no delta rule sends delta its own increment).
+//
+// Params: fab (ops/fabric.csl), red (the column chain: ops/schain.csl), YM (the root's multicast
+// input queue), DK / DV (the head's key / value dims), PYA (the column's PEs).
+param fab: imported_module;
+param red: imported_module;
+param YM: input_queue;
+param DK: u16;
+param DV: u16;
+param PYA: u16;
+
+const NR: u16 = (DK + PYA - 1) / PYA;
+var st = @zeros([NR * DV]f32);
+var kq = @zeros([2 * DK]f32);
+var dd: [DV + 1]f32 align(16) = @zeros([DV + 1]f32);
+var acc: [2 * DV]f32 align(16) = @zeros([2 * DV]f32);
+var myrow: u16 = 0;
+const st_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DV} -> st[i] });
+const kq_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2 * DK} -> kq[i] });
+const dd_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DV + 1} -> dd[i] });
+const acc_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2 * DV} -> acc[i] });
+
+// A sequence's first step: the state cleared, the PE's row in the column.
+fn init(row: u16) void {
+  myrow = row;
+  var e: u16 = 0;
+  while (e < NR * DV) : (e += 1) { st[e] = 0.0; }
+}
+
+fn step() void {
+  @fmovs(kq_d, fab.fin(YM, 2 * DK));
+  @fmovs(acc_d, @as(f32, 0.0));
+  const sk = @set_dsd_length(acc_d, DV);
+  const sq = @increment_dsd_offset(sk, @as(i16, DV), f32);
+  var r: u16 = 0;
+  while (r < NR) : (r += 1) {
+    const i = r * PYA + myrow;
+    if (i < DK) {
+      const row = @increment_dsd_offset(st_d, @as(i16, r * DV), f32);
+      @fmacs(sk, sk, row, kq[i]);
+      @fmacs(sq, sq, row, kq[DK + i]);
+    }
+  }
+  red.send(acc_d, 2 * DV);
+  @fmovs(dd_d, fab.fin(YM, DV + 1));
+  const decay = dd[DV];
+  const delta = @set_dsd_length(dd_d, DV);
+  r = 0;
+  while (r < NR) : (r += 1) {
+    const i = r * PYA + myrow;
+    if (i < DK) {
+      const row = @increment_dsd_offset(st_d, @as(i16, r * DV), f32);
+      @fmuls(row, row, decay);
+      @fmacs(row, row, delta, kq[i]);
+    }
+  }
+}

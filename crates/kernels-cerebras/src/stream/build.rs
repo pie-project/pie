@@ -881,6 +881,10 @@ pub fn program_at(
     let pya = kv
         .iter()
         .map(|k| {
+            // a recurrence's column: its state's rows over the fewest PEs
+            if joint_of(k).is_some_and(|j| j.state.is_some()) {
+                return PYA;
+            }
             let (qh, hd) = joint_of(k).map_or(
                 (
                     shape.attn.q_heads / shape.attn.kv_heads.max(1),

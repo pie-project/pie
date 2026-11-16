@@ -226,7 +226,15 @@ pub fn shape(trace: &Trace, reading: &str, classes: &[RowClass]) -> R<StreamShap
             _ => {}
         }
     }
-    let mut attn = attn.ok_or_else(|| format!("{name}: the stream step attends nothing"))?;
+    // (a step of no attention: its blocks are its recurrences', each its own spec)
+    let mut attn = attn.unwrap_or(JointSpec {
+        q_heads: 1,
+        kv_heads: 1,
+        head_dim: 1,
+        sm_scale: 1.0,
+        qk_norm: false,
+        causal: true,
+    });
     attn.qk_norm = qk_norm;
     // (no gated MLP: the shape states none)
     let (intermediate, act) = glu.unwrap_or((0, Act::Silu));
@@ -428,12 +436,11 @@ pub fn compile_decode(
         &std::fs::read_to_string(&at).map_err(|e| format!("{}: {e}", at.display()))?,
     )
     .map_err(|e| e.to_string())?;
-    let pos: Vec<serde_json::Value> = p
-        .stream
-        .kv
+    let pos: Vec<serde_json::Value> = e
+        .arrays
         .iter()
-        .flat_map(|kc| (0..kc.pya).map(|i| kc.pe(&p.stream, i)))
-        .map(|c| serde_json::json!({"x": c.x, "y": c.y}))
+        .filter(|a| a.sym == "pos")
+        .map(|a| serde_json::json!({"x": a.at.x, "y": a.at.y}))
         .collect();
     h["pos"] = serde_json::json!(pos);
     std::fs::write(

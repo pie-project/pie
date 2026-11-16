@@ -305,6 +305,7 @@ fn fill(p: &Program, vals: Option<&Values>, a: &HostArray) -> R<Vec<f32>> {
         Fill::Resident { .. }
         | Fill::Scalars { .. }
         | Fill::RowScalars { .. }
+        | Fill::Slices(_)
         | Fill::HostIn { .. } => {
             let g = gather(p, a)?.ok_or("an array of no gather")?;
             let vals = held()?;
@@ -674,6 +675,15 @@ pub fn gather(p: &Program, a: &HostArray) -> R<Option<Gather>> {
     let ieee = !p.round16;
     let mut g: Gather = vec![[NONE, 0, 0, 0]; a.len as usize];
     match &a.fill {
+        Fill::Slices(parts) => {
+            let mut k = 0;
+            for &(v, from, len) in parts {
+                for e in 0..len {
+                    g[k] = [v, 0, from + e, FLAT];
+                    k += 1;
+                }
+            }
+        }
         Fill::Resident {
             unit,
             step,

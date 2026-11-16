@@ -19,8 +19,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use poem_compiler::fuse::chain::{self, Chain};
 use poem_ir::{
-    Attn, Def, Dim, Dtype, Gather, InputAxis, Linear, Operands, Operation, RuntimeInput, Trace, Ty,
-    ValueId,
+    Attn, Def, Dim, Dtype, Gather, InputAxis, Linear, Operands, Operation, RuntimeInput, Ssm,
+    Trace, Ty, ValueId,
 };
 
 type R<T> = Result<T, String>;
@@ -140,6 +140,33 @@ pub struct Joint {
     /// And of them, the last `window` alone (a sliding window's), where one is stated.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window: Option<u32>,
+    /// A recurrence's state in place of the stored rows (a gated delta rule: P8, its column's
+    /// PEs holding each head's state), where one is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<State>,
+}
+
+/// A gated delta rule's column (P8, ops/sst.csl, ops/cy_sst.csl): each head's root also takes
+/// its `b` and `a` (the beta and decay logits, a column a head), and holds the conv's taps
+/// (`conv`, `taps` a channel) and the decay's `a_log` and `dt` (one a head).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct State {
+    pub b: Cols,
+    pub a: Cols,
+    pub conv: ValueId,
+    pub taps: u32,
+    pub a_log: ValueId,
+    pub dt: ValueId,
+    /// The q / k channels' first column and the v channels' in the conv's input (its `[q | k |
+    /// v]` layout).
+    pub k_from: u32,
+    pub v_from: u32,
+}
+
+impl Serialize for Cols {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        (self.base.0, self.from, self.width).serialize(s)
+    }
 }
 
 use serde::Serialize;
@@ -285,6 +312,19 @@ impl Reader<'_> {
             Operation::Gather(Gather::SplitRows {
                 x, width: w, right, ..
             }) => up(*x, if *right == v { *w } else { 0 }),
+            // (a q | k | v whose q is cut into its heads' halves: each part its own matvec's,
+            // the packed product never made)
+            Operation::Gather(Gather::SplitQkv { q, .. })
+                if self.trace.nodes.iter().any(|n| {
+                    matches!(&n.op, Operation::Gather(Gather::SplitQGate { packed, .. }) if packed == q)
+                }) =>
+            {
+                Cols {
+                    base: v,
+                    from: 0,
+                    width,
+                }
+            }
             Operation::Gather(Gather::SplitQkv {
                 packed,
                 q_width,
@@ -562,6 +602,98 @@ pub fn lower_through(
                 }
                 let from = side_of(&sides, x)
                     .ok_or_else(|| refuse(at, "linear.matmul reads a value no root has".into()))?;
+                // a product its heads' halves are cut from (a query and its gate a head, maybe
+                // after a q | k | v split): a matvec a part, each over its rows of the weight (a
+                // strided split of the output is a view of the weight)
+                let find = |pick: &dyn Fn(&Operation) -> bool| {
+                    nodes
+                        .iter()
+                        .copied()
+                        .find(|&n| pick(&trace.nodes[n as usize].op))
+                };
+                let qkv = find(
+                    &|op| matches!(op, Operation::Gather(Gather::SplitQkv { packed, .. }) if packed == y),
+                );
+                let qsrc = match qkv {
+                    Some(n) => match &trace.nodes[n as usize].op {
+                        Operation::Gather(Gather::SplitQkv { q, .. }) => *q,
+                        _ => unreachable!(),
+                    },
+                    None => *y,
+                };
+                let halves = find(
+                    &|op| matches!(op, Operation::Gather(Gather::SplitQGate { packed, .. }) if *packed == qsrc),
+                );
+                if let Some(hn) = halves {
+                    let Operation::Gather(Gather::SplitQGate {
+                        head_dim: d,
+                        q,
+                        gate,
+                        ..
+                    }) = &trace.nodes[hn as usize].op
+                    else {
+                        unreachable!()
+                    };
+                    let mut parts = vec![
+                        (
+                            *q,
+                            View::Rows {
+                                block: *d,
+                                stride: 2 * d,
+                                off: 0,
+                            },
+                        ),
+                        (
+                            *gate,
+                            View::Rows {
+                                block: *d,
+                                stride: 2 * d,
+                                off: *d,
+                            },
+                        ),
+                    ];
+                    skip.insert(hn);
+                    if let Some(n) = qkv {
+                        let Operation::Gather(Gather::SplitQkv {
+                            q_width,
+                            kv_width,
+                            k,
+                            v,
+                            ..
+                        }) = &trace.nodes[n as usize].op
+                        else {
+                            unreachable!()
+                        };
+                        skip.insert(n);
+                        for (out, off) in [(*k, *q_width), (*v, q_width + kv_width)] {
+                            parts.push((
+                                out,
+                                View::Rows {
+                                    block: *kv_width,
+                                    stride: *kv_width,
+                                    off,
+                                },
+                            ));
+                        }
+                    }
+                    for (out, view) in parts {
+                        sides.insert(out, from.flip());
+                        steps.push(Step::Matvec {
+                            node: at,
+                            from,
+                            input: x,
+                            weight: *w,
+                            view,
+                            output: out,
+                            k: r.width(*act),
+                            n: r.width(out),
+                            x32: r.dtype(*act) == Some(Dtype::F32),
+                            round: r.round(out),
+                        });
+                    }
+                    i += 1;
+                    continue;
+                }
                 sides.insert(*y, from.flip());
                 steps.push(Step::Matvec {
                     node: at,
@@ -602,6 +734,7 @@ pub fn lower_through(
                     scale: *sm_scale,
                     causal: false,
                     window: None,
+                    state: None,
                 });
                 steps.push(Step::Store { q, k, v });
                 sides.insert(*o, Side::Col);
@@ -652,6 +785,7 @@ pub fn lower_through(
                     scale: *sm_scale,
                     causal: *causal,
                     window: None,
+                    state: None,
                 });
                 steps.push(Step::Store { q, k, v });
                 sides.insert(*o, Side::Col);
@@ -773,6 +907,112 @@ pub fn lower_through(
                 });
                 sides.insert(g.y, gs);
             }
+            // a gated delta rule (its conv, its gates, its recurrence): a step's row through
+            // its heads' state columns (P8), the conv's history and the gates at their roots
+            Operation::Ssm(Ssm::CausalConv1d {
+                x,
+                weight,
+                bias: None,
+                conv_width,
+                dilation: 1,
+                y: conv_y,
+                ..
+            }) => {
+                let refuse_at = |what: &str| refuse(at, format!("ssm.causal_conv1d {what}"));
+                let find = |pick: &dyn Fn(&Operation) -> bool| {
+                    nodes
+                        .iter()
+                        .copied()
+                        .find(|&n| n > at && pick(&trace.nodes[n as usize].op))
+                };
+                let gd = find(&|op| {
+                    matches!(op, Operation::Ssm(Ssm::GatedDelta { qkv, .. }) if qkv == conv_y)
+                })
+                .ok_or_else(|| refuse_at("feeds no gated delta rule"))?;
+                let Operation::Ssm(Ssm::GatedDelta {
+                    gates,
+                    k_heads,
+                    v_heads,
+                    k_dim,
+                    v_dim,
+                    y,
+                    ..
+                }) = &trace.nodes[gd as usize].op
+                else {
+                    unreachable!()
+                };
+                if k_heads != v_heads || k_dim != v_dim {
+                    return Err(refuse_at(&format!(
+                        "into {k_heads} key heads of {k_dim} beside {v_heads} value heads of \
+                         {v_dim}: one state column a head of each"
+                    )));
+                }
+                let gn = find(&|op| {
+                    matches!(op, Operation::Ssm(Ssm::GdnGates { gates: g, .. }) if g == gates)
+                })
+                .or_else(|| {
+                    // (the gates made before the conv)
+                    nodes.iter().copied().find(|&n| {
+                        matches!(&trace.nodes[n as usize].op,
+                            Operation::Ssm(Ssm::GdnGates { gates: g, .. }) if g == gates)
+                    })
+                })
+                .ok_or_else(|| refuse_at("gated by no gdn_gates"))?;
+                let Operation::Ssm(Ssm::GdnGates {
+                    ba, dt_bias, a_log, ..
+                }) = &trace.nodes[gn as usize].op
+                else {
+                    unreachable!()
+                };
+                skip.extend([gn, gd]);
+                let (h, d) = (*v_heads, *k_dim);
+                let xc = r.cols(*x);
+                let bac = r.cols(*ba);
+                for c in [xc, bac] {
+                    if side_of(&sides, c) != Some(Side::Col) {
+                        return Err(refuse_at("reads a value not at the column roots"));
+                    }
+                }
+                let q = Cols { width: h * d, ..xc };
+                let k = Cols {
+                    from: xc.from + h * d,
+                    width: h * d,
+                    ..xc
+                };
+                let v = Cols {
+                    from: xc.from + 2 * h * d,
+                    width: h * d,
+                    ..xc
+                };
+                joint = Some(Joint {
+                    q_heads: h,
+                    kv_heads: h,
+                    head_dim: d,
+                    scale: 1.0,
+                    causal: true,
+                    window: None,
+                    state: Some(State {
+                        b: Cols { width: h, ..bac },
+                        a: Cols {
+                            from: bac.from + h,
+                            width: h,
+                            ..bac
+                        },
+                        conv: *weight,
+                        taps: *conv_width,
+                        a_log: *a_log,
+                        dt: *dt_bias,
+                        k_from: h * d,
+                        v_from: 2 * h * d,
+                    }),
+                });
+                steps.push(Step::Store { q, k, v });
+                sides.insert(*y, Side::Col);
+                steps.push(Step::Attend {
+                    out: *y,
+                    round: r.round(*y),
+                });
+            }
             // a decode step's attention over its layer's cache: the row stored with its query
             // (at its position), then attending every row stored at or before it
             Operation::Attn(Attn::Decode {
@@ -803,7 +1043,12 @@ pub fn lower_through(
                     if side_of(&sides, c) != Some(Side::Col) {
                         return Err(refuse(
                             at,
-                            "attn.decode reads a q / k / v not at the column roots".into(),
+                            format!(
+                                "attn.decode reads a q / k / v not at the column roots (value \
+                                 %{} at {:?})",
+                                c.base.0,
+                                side_of(&sides, c)
+                            ),
                         ));
                     }
                 }
@@ -814,6 +1059,7 @@ pub fn lower_through(
                     scale: *sm_scale,
                     causal: true,
                     window: *window,
+                    state: None,
                 });
                 steps.push(Step::Store { q, k, v });
                 sides.insert(*o, Side::Col);

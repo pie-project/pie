@@ -82,6 +82,11 @@ pub const STREAM_OPS: &[(&str, &str)] = &[
     ),
     ("smv.csl", include_str!("../programs/wafer/ops/smv.csl")),
     ("srope.csl", include_str!("../programs/wafer/ops/srope.csl")),
+    ("sst.csl", include_str!("../programs/wafer/ops/sst.csl")),
+    (
+        "cy_sst.csl",
+        include_str!("../programs/wafer/ops/cy_sst.csl"),
+    ),
 ];
 
 /// The source of the kernel file `name`.
