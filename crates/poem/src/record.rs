@@ -106,6 +106,25 @@ impl Recorder {
         made
     }
 
+    /// The value last carried under `key` ([`Recorder::carry`]), if one is.
+    pub(crate) fn carried(&self, key: &str) -> Option<Value> {
+        let (id, over, ty) = self.once.borrow().get(key).cloned()?;
+        Some(Value {
+            rec: self.clone(),
+            id,
+            over,
+            ty,
+        })
+    }
+
+    /// Carries `value` under `key`, in place of what was: a value each layer
+    /// adds to and the next reads.
+    pub(crate) fn carry(&self, key: &str, value: &Value) {
+        self.once
+            .borrow_mut()
+            .insert(key.to_string(), (value.id, value.over.clone(), value.ty.clone()));
+    }
+
     /// The platform this trace is recorded for.
     #[must_use]
     pub fn platform(&self) -> Platform {
@@ -365,6 +384,14 @@ impl Recorder {
     }
 
     pub fn finish(self) -> Trace {
+        // The score row the layers added into, read out by key and by page:
+        // the mass summed over the layers, averaged over the query heads.
+        if let Some(keys) = self.carried(crate::ops::attn::SCORE_ROW) {
+            let pages = crate::ops::attn::score_pages(&keys);
+            self.output("attn.scores", &keys, None);
+            self.output("attn.scores.pages", &pages, None);
+        }
+        self.once.borrow_mut().clear();
         let mut plan = Rc::try_unwrap(self.inner)
             .unwrap_or_else(|_| panic!("a Value outlived its trace"))
             .into_inner();

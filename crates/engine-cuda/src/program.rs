@@ -111,14 +111,37 @@ impl Program {
 
 /// What a pair's state holds beside its stages' tables, and the pieces it
 /// lies in: the lanes its tables are laid for (a flight's most), the bytes
-/// its share of a wave's tables may take, the score planes where its
-/// program reads them, and the room.
+/// its share of a wave's tables may take, the bytes of an instance's score
+/// rows where its program reads them ([`Capture`]), and the room.
 #[derive(Debug, Clone, Copy)]
 struct PairShape {
     lanes: u32,
     wave: u64,
-    planes: Option<u64>,
+    capture: Option<u64>,
     room: Room,
+}
+
+/// A capturing lane's score rows (`poem_compiler::Placement::Capture`): a
+/// key row of the load's context and the page row right after it, f32,
+/// held by the instance of the program reading them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Capture {
+    pub context: u32,
+    pub page_size: u32,
+}
+
+impl Capture {
+    /// The page row's entries: the context over its pages.
+    #[must_use]
+    pub fn pages(self) -> u32 {
+        self.context.div_ceil(self.page_size.max(1))
+    }
+
+    /// The bytes of a lane's rows, both grains.
+    #[must_use]
+    pub fn bytes(self) -> u64 {
+        u64::from(self.context + self.pages()) * size_of::<f32>() as u64
+    }
 }
 
 /// The `Instance` room guest state lies in: a piece is one run of a
@@ -206,15 +229,16 @@ impl Packer {
 
 /// How a pair's state and its instances' scratch are laid
 /// (`engine::GuestState`): each stage's spans' offsets in the pair's state
-/// and its scratch's in an instance's, the wave's share and the score
-/// planes in the pair's, and each state's bytes.
+/// and its scratch's in an instance's, the wave's share in the pair's, an
+/// instance's score rows in its scratch where the program reads them, and
+/// each state's bytes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Laid {
     pub per_instance: u64,
     pub per_pair: u64,
     pub stages: Vec<Option<[u64; SPANS]>>,
     pub wave: (u64, u64),
-    pub planes: Option<u64>,
+    pub capture: Option<u64>,
 }
 
 /// Lays a pair's state and its instances' scratch for `stages`, each
@@ -235,20 +259,15 @@ fn lay_pair(stages: &mut [Option<Prepared>], shape: PairShape) -> Result<Laid> {
         }
         prepared.set_pieces_at(at, unit);
     }
+    let capture = shape
+        .capture
+        .map(|bytes| scratch.take(bytes, "bytes of a capturing lane's score rows"))
+        .transpose()?;
     let mut pack = Packer { unit, end: 0 };
     let wave = (
         pack.take(shape.wave, "bytes of a pair's share of a wave's tables")?,
         shape.wave,
     );
-    let planes = shape
-        .planes
-        .map(|bytes| {
-            pack.take(
-                bytes,
-                "bytes of the attn.scores planes a reader's pair holds",
-            )
-        })
-        .transpose()?;
     let mut laid = Vec::with_capacity(stages.len());
     for prepared in stages.iter() {
         laid.push(match prepared {
@@ -267,7 +286,7 @@ fn lay_pair(stages: &mut [Option<Prepared>], shape: PairShape) -> Result<Laid> {
         per_pair: pack.end,
         stages: laid,
         wave,
-        planes,
+        capture,
     })
 }
 
@@ -285,12 +304,13 @@ fn place_pair(batch: &mut Batch, room: Room) -> Result<()> {
     Ok(())
 }
 
-/// Whether a program reads the `attn.scores` output.
+/// Whether a program reads a capturing lane's score rows (`attn.scores`,
+/// `attn.scores.pages`).
 #[must_use]
 pub fn reads_scores(plan: &ExecPlan) -> bool {
     plan.outputs()
         .iter()
-        .any(|(name, _)| *name == "attn.scores")
+        .any(|(name, _)| matches!(*name, "attn.scores" | "attn.scores.pages"))
 }
 
 fn at_point<'a>(stages: &'a mut [Option<Prepared>], runs: &[bool]) -> Vec<&'a mut Prepared> {
@@ -368,9 +388,8 @@ pub struct Plane {
     fan: fan::Fan,
     /// The most lanes one fire carries: the rows of a wave's own tables.
     fire_lanes: u32,
-    /// What a pair whose program reads `attn.scores` holds for the score
-    /// planes, the widest carve's ([`Plane::set_scores`]).
-    scores: u64,
+    /// A capturing lane's score rows' widths ([`Plane::set_capture`]).
+    capture: Capture,
     /// The room guest state lies in ([`Plane::set_room`]).
     room: Room,
 }
@@ -415,7 +434,7 @@ impl Plane {
             closing: std::collections::BTreeSet::new(),
             fan: fan::Fan::default(),
             fire_lanes: 0,
-            scores: 0,
+            capture: Capture::default(),
             room: Room::ALONE,
         }
     }
@@ -437,13 +456,17 @@ impl Plane {
         self.fire_lanes = lanes;
     }
 
-    /// A program reading `attn.scores` switches the score planes on in
-    /// every fire it is in, a plane's row for every lane of the fire,
-    /// whichever pairs its lanes are of: its pair holds them, at `bytes`,
-    /// the widest carve's planes (its lanes and their alignment), so any
-    /// fire of any rung lays no more ([`Plane::planes_at`]).
-    pub fn set_scores(&mut self, bytes: u64) {
-        self.scores = bytes;
+    /// A capturing lane's score rows are a row of `context` keys and one
+    /// of its pages of `page_size`: an instance of a program reading them
+    /// holds its lane's ([`Plane::capture_row`]).
+    pub fn set_capture(&mut self, context: u32, page_size: u32) {
+        self.capture = Capture { context, page_size };
+    }
+
+    /// The rows' widths.
+    #[must_use]
+    pub fn capture(&self) -> Capture {
+        self.capture
     }
 
     /// Guest state lies in `room`: the pool's `Instance` shape.
@@ -451,18 +474,27 @@ impl Plane {
         self.room = room;
     }
 
-    /// Where a fire capturing scores lays its planes: in the state of a
-    /// pair bound now whose program reads them; none while none is.
-    #[must_use]
-    pub fn planes_at(&self) -> Option<u64> {
-        self.programs.values().find_map(|program| {
-            program.batches.iter().find_map(|batch| {
-                let offset = batch.laid.planes?;
-                (batch.bound > 0)
-                    .then(|| self.room.at(&batch.pair, offset).ok())
-                    .flatten()
-            })
-        })
+    /// Where instance `id`'s lane has its score rows (its key row; the
+    /// page row right after it), where they lie now: none where its
+    /// program reads none.
+    pub fn capture_row(&self, id: InstanceId) -> Result<Option<u64>> {
+        let bound = self
+            .instances
+            .get(&id)
+            .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
+        let Some(program) = self.programs.get(&bound.program_id) else {
+            return Ok(None);
+        };
+        let extents = bound.session.extents();
+        let Some(offset) = program
+            .batches
+            .iter()
+            .find(|batch| batch.extents == extents)
+            .and_then(|batch| batch.laid.capture)
+        else {
+            return Ok(None);
+        };
+        self.room.at(bound.session.scratch(), offset).map(Some)
     }
 
     /// The lanes a pair's tables are laid for: a flight's most, no more
@@ -486,16 +518,16 @@ impl Plane {
         PairShape {
             lanes: self.table_lanes(),
             wave: lane * u64::from(lanes) + fixed,
-            planes: reads_scores(&program.plan).then_some(self.scores),
+            capture: reads_scores(&program.plan).then(|| self.capture.bytes()),
             room: self.room,
         }
     }
 
     /// What `program_id` bound at `extents` holds as state
-    /// (`engine::Engine::guest_state`): each instance its lanes' scratch,
-    /// every stage's share of it; the pair its stages' tables for a
-    /// flight, its share of a wave's tables, and the score planes where
-    /// its program reads them.
+    /// (`engine::Engine::guest_state`): each instance its lane's scratch,
+    /// every stage's share of it, and its lane's score rows where its
+    /// program reads them; the pair its stages' tables for a flight and its
+    /// share of a wave's tables.
     pub fn guest_state(
         &self,
         program_id: ProgramId,

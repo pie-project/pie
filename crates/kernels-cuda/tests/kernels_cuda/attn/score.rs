@@ -1,8 +1,10 @@
 #![cfg(feature = "cuda")]
 
-//! `attn.score_capture` against the host softmax: each lane's mass over its
-//! first `kv_max` keys, averaged over its last `observe` query rows, a run a
-//! head, written at the lane's row of a `[lanes, heads * kv_max]` plane.
+//! `attn.score_capture` against the host softmax: each capturing lane's mass
+//! over its first `kv_max` keys (the load's context), averaged over its last
+//! `observe` query rows and over the query heads, written at the row its
+//! entry of the table names; `attn.score_pages` sums it a page into the row
+//! after it.
 
 use crate::common::attn_ref::{col, pool, ten};
 use crate::common::spread::agrees;
@@ -39,14 +41,18 @@ fn a_score_capture_lands_each_lanes_mass_at_its_row() {
     let (k_raw, k) = lcg.row(cells * width);
     let (q_raw, q) = lcg.row(rows * qw);
 
-    let mut want = vec![9.0f32; (lane_offset + n) * qh * kv_max];
+    // A lane's row: its key row of `kv_max` (the load's context), then its
+    // page row. The lanes before `lane_offset` capture none.
+    let page_count = kv_max.div_ceil(PAGE);
+    let row = kv_max + page_count;
+    let mut want = vec![9.0f32; (lane_offset + n) * row];
     for (r, &(new, prefix)) in reqs.iter().enumerate() {
         let len = new + prefix;
         let seen = observe.min(new);
         let cell = |t: usize| pages[r][t / PAGE] * PAGE + t % PAGE;
+        let at = (lane_offset + r) * row;
+        want[at..at + kv_max].fill(0.0);
         for h in 0..qh {
-            let at = ((lane_offset + r) * qh + h) * kv_max;
-            want[at..at + kv_max].fill(0.0);
             for w in 0..seen {
                 let row = qo[r + 1] as usize - seen + w;
                 let reach = len - seen + w + 1;
@@ -61,9 +67,14 @@ fn a_score_capture_lands_each_lanes_mass_at_its_row() {
                 let top = dots.iter().copied().fold(f32::MIN, f32::max);
                 let sum: f32 = dots.iter().map(|x| (x - top).exp()).sum();
                 for (t, x) in dots.iter().enumerate().take(kv_max) {
-                    want[at + t] += (x - top).exp() / sum / seen as f32;
+                    want[at + t] += (x - top).exp() / sum / seen as f32 / qh as f32;
                 }
             }
+        }
+        for p in 0..page_count {
+            want[at + kv_max + p] = want[at + p * PAGE..at + ((p + 1) * PAGE).min(kv_max)]
+                .iter()
+                .sum();
         }
     }
 
@@ -123,29 +134,41 @@ fn a_score_capture_lands_each_lanes_mass_at_its_row() {
     .expect("the prefill plans");
     plan.stage(&ctx).expect("the plan uploads");
     let at = gpu.up(&want.iter().map(|_| 9.0f32).collect::<Vec<_>>());
-    // The rows lie where a device word says, as a recorded capture reads
-    // them.
+    // Each lane's row where its entry of the table says, as a recorded
+    // capture reads them; the lanes before the window's none.
+    let table: Vec<u64> = (0..lane_offset + n)
+        .map(|lane| {
+            if lane < lane_offset {
+                0
+            } else {
+                at + (lane * row * 4) as u64
+            }
+        })
+        .collect();
     let scores = kernels_cuda::attn::score::Rows {
-        word: gpu.up(&[at]),
-        offset: 0,
-        rows: (lane_offset + n) as u32,
-        width: (qh * kv_max) as u32,
-        dtype: F32,
+        table: gpu.up(&table),
+        context: kv_max as u32,
     };
-    kernels_cuda::attn::score::capture(
-        &ctx,
-        qt,
-        &plan,
-        &kvp,
-        d as u32,
-        kvh as u32,
-        scale,
-        observe as u32,
-        lane_offset as u32,
-        kv_max as u32,
-        scores,
-    )
-    .expect("the capture fires");
+    let fire = |ctx: &kernels_cuda::jit::Ctx, pool: &KvPool| {
+        kernels_cuda::attn::score::capture(
+            ctx,
+            qt,
+            &plan,
+            pool,
+            d as u32,
+            kvh as u32,
+            qh as u32,
+            scale,
+            observe as u32,
+            lane_offset as u32,
+            scores,
+            false,
+        )
+        .expect("the capture fires");
+        kernels_cuda::attn::score::pages(ctx, scores, n as u32, lane_offset as u32, PAGE as u32)
+            .expect("the pages sum");
+    };
+    fire(&ctx, &kvp);
     gpu.sync();
     let got: Vec<f32> = gpu.down(at, want.len());
     for (i, (g, w)) in got.iter().zip(&want).enumerate() {
@@ -159,21 +182,6 @@ fn a_score_capture_lands_each_lanes_mass_at_its_row() {
         &[kvp],
         &[],
         &outs,
-        |_, pools, _| {
-            kernels_cuda::attn::score::capture(
-                &ctx,
-                qt,
-                &plan,
-                &pools[0],
-                d as u32,
-                kvh as u32,
-                scale,
-                observe as u32,
-                lane_offset as u32,
-                kv_max as u32,
-                scores,
-            )
-            .expect("the capture fires");
-        },
+        |_, pools, _| fire(&ctx, &pools[0]),
     );
 }

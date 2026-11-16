@@ -26,8 +26,8 @@ const KV_ROW: &str = "kv";
 pub(crate) const PAGE: u32 = 16;
 pub(crate) const PROMPT: u32 = 20;
 const LANES: u32 = 4;
-/// The keys a score plane holds a run of per query head (`attend`'s).
-const KV_MAX: u64 = 2048;
+/// The load's context: a capturing lane's key row's width.
+const CONTEXT: u32 = 256;
 
 /// One attention layer that captures its scores.
 pub(crate) struct Scored;
@@ -77,7 +77,7 @@ pub(crate) fn shell(trace: poem::Trace, path: &Path, graphs: Graphs) -> Shell {
         budget: Budget::new(LANES, 256),
         patches: None,
         page_size: PAGE,
-        context: 256,
+        context: CONTEXT,
         slots: LANES,
         kv_budget: Some(crate::POOL),
         allowance: engine::Allowance::WHOLE,
@@ -100,9 +100,10 @@ pub(crate) fn shell(trace: poem::Trace, path: &Path, graphs: Graphs) -> Shell {
     shell
 }
 
-/// An epilogue that sums lane 0's `attn.scores` row into a reader channel.
+/// An epilogue that sums lane 0's `attn.scores` row (a key of the load's
+/// context each) into a reader channel.
 pub(crate) fn reader() -> TraceContainer {
-    let width = u32::try_from(u64::from(HEADS) * KV_MAX).expect("a row's width");
+    let width = CONTEXT;
     TraceContainer {
         names: vec!["attn.scores".into()],
         channels: vec![ChannelDecl {
@@ -131,13 +132,13 @@ pub(crate) fn reader() -> TraceContainer {
     }
 }
 
-/// No load backs a score plane, and nothing backs the span after the load:
+/// No load backs a score row, and nothing backs the span after the load:
 /// the span the arena states is what it backed, a program reading
-/// `attn.scores` states the planes a fire carrying it lays in its term
-/// (`GuestState::per_pair`: the widest carve's, `HEADS × KV_MAX` f32 a lane of
-/// it), and neither its register, its bind nor a fire that captures the
-/// scores it reads maps anything: its programs and its planes lie in the
-/// span, under the decode's carve.
+/// `attn.scores` holds its lane's rows as its instance's state
+/// (`GuestState::per_instance`: a key row of the context and its page row,
+/// f32), and neither its register, its bind nor a fire that captures the
+/// scores it reads maps anything. The one layer's mass, averaged over the
+/// query heads, sums to one.
 #[test]
 fn a_score_reader_states_its_planes_and_nothing_backs_them() {
     if !engine_cuda::device::present() {
@@ -225,16 +226,13 @@ fn a_score_reader_states_its_planes_and_nothing_backs_them() {
     let state = shell
         .guest_state(program, extents)
         .expect("the reader's guest state");
-    // The widest carve's planes: a row of `HEADS × KV_MAX` f32 for each of
-    // the fire's lanes, whoever's they are, counted once a fire carrying it.
-    let planes = u64::from(LANES) * u64::from(HEADS) * KV_MAX * 4;
-    let term = state.per_pair;
+    // A lane's rows: its key row and its page row, f32.
+    let rows = u64::from(CONTEXT + CONTEXT.div_ceil(PAGE)) * 4;
     assert!(
-        term >= planes,
-        "a reader's term {term} holds the widest fire's planes, {planes}"
+        state.per_instance >= rows,
+        "a reader's instance {} holds its lane's score rows, {rows}",
+        state.per_instance
     );
-    // The decode below lays its planes in the reader's pair's state
-    // (`Plane::planes_at`, `Arena::fire_slots`), never in the span.
 
     let slots = crate::guest::Guest::of(&facts, segments * facts.segment_chunks).shell_slots(
         program,
@@ -289,14 +287,6 @@ fn a_score_reader_states_its_planes_and_nothing_backs_them() {
         }],
         &[],
     );
-    match &fired {
-        Ok(_) => eprintln!("the scored decode fired inside the span"),
-        Err(refused) => {
-            let said = refused.to_string();
-            assert!(said.contains("attn.scores"), "{said}");
-            eprintln!("the scored decode was refused by name: {said}");
-        }
-    }
     assert_eq!(
         shell.activation_span().2,
         holds,
@@ -307,5 +297,18 @@ fn a_score_reader_states_its_planes_and_nothing_backs_them() {
         maps,
         "a scored fire maps nothing"
     );
-    fired.expect("a one-token fire's planes fit under its carve");
+    fired.expect("the scored decode fires");
+    shell.drain().expect("the decode lands");
+    let cell = shell
+        .program_instance(instance)
+        .expect("the reader's instance")
+        .expect("bound")
+        .take(0)
+        .expect("the sum reads")
+        .expect("a sum");
+    let mass = f32::from_le_bytes(cell[..4].try_into().expect("an f32"));
+    assert!(
+        (mass - 1.0).abs() < 1e-3,
+        "one layer's mass a key, averaged over the heads, sums to one: {mass}"
+    );
 }

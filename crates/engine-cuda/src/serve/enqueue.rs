@@ -229,8 +229,6 @@ struct Staged {
     group_masks: Vec<crate::inputs::GroupMaskHandles>,
     inputs: Vec<crate::run::InputBinding>,
     slots: SlotTable,
-    /// Where the fire's score planes lie (0: it captures none).
-    planes: u64,
     caches: CacheTable,
     paging: Paging,
 }
@@ -517,24 +515,6 @@ impl FireCtx<'_> {
             Some(forked) if forks => (forked, true),
             _ => (&self.compiled.arena, false),
         };
-        // A fire holding a lane that captures scores lays its carve's
-        // score planes in the state of a pair whose program reads them.
-        let scored = p
-            .composition
-            .lanes()
-            .iter()
-            .any(|row| self.arena.captures(row.class as usize));
-        let planes = if scored {
-            Some(self.programs.planes_at().ok_or_else(|| {
-                Fault::Unbound {
-                    what: "the attn.scores planes of a fire capturing them: no pair bound \
-                       now reads them, so none holds them"
-                        .to_string(),
-                }
-            })?)
-        } else {
-            None
-        };
         let mut slots = self.arena.fire_slots(
             self.pools,
             map,
@@ -548,7 +528,6 @@ impl FireCtx<'_> {
                 clips: u64::from(p.composition.clips()),
                 readouts: p.readout_rows.len() as u64,
             },
-            planes,
         );
         if let Some(ep) = self.ep {
             ep.seats(forked)
@@ -620,7 +599,6 @@ impl FireCtx<'_> {
             group_masks,
             inputs,
             slots,
-            planes: planes.unwrap_or(0),
             caches,
             paging,
         })
@@ -689,9 +667,10 @@ impl FireCtx<'_> {
             adapter_routes: handles.adapter_routes,
             readout_rows: handles.readout_rows,
             readout_live: handles.readout_live,
-            score_planes: crate::run::ScorePlanes {
-                word: handles.score_planes,
-                base: staged.planes,
+            score_rows: crate::run::ScoreRows {
+                table: handles.score_rows,
+                context: self.programs.capture().context,
+                page_size: self.programs.capture().page_size,
             },
             patches: staged.patches.as_ref().map(|seats| seats.patches),
             patch_segments: staged.patches.as_ref().map(|seats| seats.segments),
@@ -1193,6 +1172,40 @@ impl FireCtx<'_> {
         first_voxel: u32,
     ) -> Result<()> {
         let name = &out.decl.name;
+        // A capturing lane's score row lies in the reading instance, not in
+        // the carve: its key row, or the page row right after it.
+        let root = self.compiled.arena.root(out.values[0]);
+        if let Some(poem_compiler::Placement::Capture { width, dtype }) =
+            self.compiled.arena.placements.get(root.0 as usize)
+        {
+            let capture = self.programs.capture();
+            let row = self
+                .programs
+                .capture_row(instance)?
+                .ok_or_else(|| Fault::Unbound {
+                    what: format!(
+                        "output `{name}`, a capturing lane's score row: instance {instance}'s \
+                     program holds no score rows"
+                    ),
+                })?;
+            let (base, entries) = match width {
+                poem_ir::Dim::ContextPages => (
+                    row + u64::from(capture.context) * size_of::<f32>() as u64,
+                    capture.pages(),
+                ),
+                _ => (row, capture.context),
+            };
+            return self.programs.bind_output(
+                instance,
+                name,
+                k,
+                base,
+                storage_of(*dtype)?,
+                entries,
+                entries,
+                0,
+            );
+        }
         let plane = plane_of(out.values[0], name)?;
         let storage = storage_of(plane.dtype)?;
         let width = plane.width;

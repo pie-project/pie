@@ -686,37 +686,45 @@ fn score_capture_averages_the_observed_rows_mass() {
     )
     .unwrap();
     let (observe, lane_offset, kv_max) = (3u32, 1u32, 40u32);
-    let rows = lane_offset + n;
-    let scores = gpu.tensor(
-        &vec![9.0; (rows * hq * kv_max) as usize],
-        rows,
-        hq * kv_max,
-        Dtype::F32,
-    );
-    // The rows lie where a device word says, as a recorded capture reads
-    // them.
+    // A lane's row: its key row of `kv_max` (the load's context), then its
+    // page row; the lanes before `lane_offset` capture none.
+    let page_count = kv_max.div_ceil(ps);
+    let row = kv_max + page_count;
+    let lanes = lane_offset + n;
+    let scores = gpu.tensor(&vec![9.0; (lanes * row) as usize], lanes, row, Dtype::F32);
+    let table: Vec<u64> = (0..lanes)
+        .map(|lane| {
+            if lane < lane_offset {
+                0
+            } else {
+                scores.ptr + u64::from(lane * row * 4)
+            }
+        })
+        .collect();
     let rows_at = kernels_rocm::attn::score::Rows {
-        word: gpu.up(&[scores.ptr]),
-        offset: 0,
-        rows: scores.rows,
-        width: scores.width,
-        dtype: Dtype::F32,
+        table: gpu.up(&table),
+        context: kv_max,
     };
     let scale = 1.0 / (d as f32).sqrt();
-    kernels_rocm::attn::score::capture(
-        &ctx,
-        q,
-        &built,
-        &pool,
-        d,
-        hk,
-        scale,
-        observe,
-        lane_offset,
-        kv_max,
-        rows_at,
-    )
-    .unwrap();
+    let fire = |pool: &kernels_rocm::tensor::KvPool| {
+        kernels_rocm::attn::score::capture(
+            &ctx,
+            q,
+            &built,
+            pool,
+            d,
+            hk,
+            hq,
+            scale,
+            observe,
+            lane_offset,
+            rows_at,
+            false,
+        )
+        .unwrap();
+        kernels_rocm::attn::score::pages(&ctx, rows_at, n, lane_offset, ps).unwrap();
+    };
+    fire(&pool);
     let got = gpu.read(&scores);
     agrees(
         &gpu,
@@ -724,29 +732,14 @@ fn score_capture_averages_the_observed_rows_mass() {
         &[pool],
         &[],
         &[out(&scores)],
-        |_, pools, _| {
-            kernels_rocm::attn::score::capture(
-                &ctx,
-                q,
-                &built,
-                &pools[0],
-                d,
-                hk,
-                scale,
-                observe,
-                lane_offset,
-                kv_max,
-                rows_at,
-            )
-            .unwrap();
-        },
+        |_, pools, _| fire(&pools[0]),
     );
     let (d_, g) = (d as usize, (hq / hk) as usize);
     for r in 0..n as usize {
         let kv = kv_lens[r] as usize;
         let rows = (observe as usize).min(fresh[r] as usize);
+        let mut want = vec![0f64; kv_max as usize];
         for h in 0..hq as usize {
-            let mut want = vec![0f64; kv_max as usize];
             for w in 0..rows {
                 let t = qo[r + 1] as usize - rows + w;
                 let limit = (kv - rows + w + 1).min(kv);
@@ -764,19 +757,23 @@ fn score_capture_averages_the_observed_rows_mass() {
                 let z: f64 = s.iter().map(|x| (x - m).exp()).sum();
                 for (j, x) in s.iter().enumerate() {
                     if j < kv_max as usize {
-                        want[j] += (x - m).exp() / z / rows as f64;
+                        want[j] += (x - m).exp() / z / rows as f64 / f64::from(hq);
                     }
                 }
             }
-            let at = ((lane_offset as usize + r) * hq as usize + h) * kv_max as usize;
-            let want: Vec<f32> = want.iter().map(|&x| x as f32).collect();
-            close_abs(
-                &format!("score req {r} head {h}"),
-                &got[at..at + kv_max as usize],
-                &want,
-                2e-5,
-            );
         }
+        let pages: Vec<f64> = want
+            .chunks(ps as usize)
+            .map(|page| page.iter().sum())
+            .collect();
+        let at = (lane_offset as usize + r) * row as usize;
+        let want: Vec<f32> = want.iter().chain(&pages).map(|&x| x as f32).collect();
+        close_abs(
+            &format!("score req {r}"),
+            &got[at..at + row as usize],
+            &want,
+            2e-5,
+        );
     }
     // The lanes before the capture's keep what they held.
     assert!(

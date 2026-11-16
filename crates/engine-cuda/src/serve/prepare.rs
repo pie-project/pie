@@ -200,6 +200,48 @@ fn readout_extent(rows: u32, bucket: u32, readouts: usize) -> u64 {
 }
 
 impl Shell {
+    /// Where each of a fire's `lanes` has its score rows: a capturing
+    /// lane's are those of the instance attached at it, whose program reads
+    /// them ([`crate::program::Plane::capture_row`]); 0 for every other.
+    fn score_rows(
+        &self,
+        lanes: &[poem_exec::fire::LaneRow],
+        attachments: &[super::Attached],
+    ) -> Result<Vec<u64>> {
+        let mut rows = vec![0u64; lanes.len()];
+        for (at, lane) in lanes.iter().enumerate() {
+            if !self.arena.captures(lane.class as usize) {
+                continue;
+            }
+            let lane_at = u32::try_from(at).unwrap_or(u32::MAX);
+            let attached = attachments.iter().find(|attached| {
+                !attached.adapter_only
+                    && (attached.lane..attached.lane + attached.lanes).contains(&lane_at)
+            });
+            let row = match attached {
+                Some(attached) if attached.lanes == 1 => {
+                    self.programs.capture_row(attached.instance)?
+                }
+                Some(attached) => {
+                    return Err(Fault::Unbound {
+                        what: format!(
+                            "the score rows of lane {at}, which captures them: instance {} \
+                             is attached at {} lanes, and an instance holds one lane's",
+                            attached.instance, attached.lanes
+                        ),
+                    });
+                }
+                None => None,
+            };
+            rows[at] = row.ok_or_else(|| Fault::Unbound {
+                what: format!(
+                    "the score rows of lane {at}, which captures them: no instance whose \
+                     program reads them is attached at it"
+                ),
+            })?;
+        }
+        Ok(rows)
+    }
     /// Prepares a step: its lanes' pages, records and tables, ahead of its
     /// fire.
     fn prepare_step<'a>(&mut self, step: StepView<'a>) -> Result<Prepared<'a>> {
@@ -1800,22 +1842,11 @@ impl Shell {
         // load's capacity: a fire of the bucket holds no more.
         let body_lanes = crate::window::body_lanes(max_lanes, composition.bucket());
         let lanes_fit = composition.lane_count() <= body_lanes;
-        // A fire capturing scores lays its planes in a reader's pair's
-        // state, which moves when the pair is parked: its captures read
-        // where through a staged word, so a body replays wherever they lie.
-        let scored = composition
-            .lanes()
-            .iter()
-            .any(|row| self.arena.captures(row.class as usize));
-        let score_planes = if scored {
-            self.programs.planes_at().ok_or_else(|| Fault::Unbound {
-                what: "the attn.scores planes of a fire capturing them: no pair bound now \
-                       reads them, so none holds them"
-                    .to_string(),
-            })?
-        } else {
-            0
-        };
+        // A capturing lane's score rows are its reading program's
+        // instance's, which moves when the instance is parked: its captures
+        // read where through a staged table, so a body replays wherever they
+        // lie.
+        let score_rows = self.score_rows(composition.lanes(), attachments)?;
         // Why a fire of a load that records bodies walks its plan, for the
         // warning it raises (`Bodies::eager_unbodied`).
         let fits = readouts_fit && lanes_fit;
@@ -1918,7 +1949,7 @@ impl Shell {
                 windows: &boundaries,
                 readout_rows: &readout_rows,
                 readout_live,
-                score_planes,
+                score_rows: &score_rows,
                 qo_absolute: &qo_absolute,
                 live: if bodied { windows.live() } else { &[] },
                 slot_ids: &slot_ids,

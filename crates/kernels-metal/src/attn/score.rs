@@ -24,6 +24,22 @@ fn stamp_for(head_dim: u32) -> Option<usize> {
     STAMPS.iter().position(|stamp| head_dim <= *stamp)
 }
 
+/// Where a fire's capturing lanes lay their score rows: `store`, the
+/// buffer the rows lie in (bound from its start), and `rows`, each
+/// capturing lane's first element in it, by its place among the fire's
+/// capturing lanes. This window's first capturing lane is `first`; this
+/// layer's row lies `layer_at` elements past each lane's start.
+#[derive(Clone, Copy, Debug)]
+pub struct CaptureRows {
+    pub store: Tensor,
+    pub rows: Tensor,
+    pub first: u32,
+    pub layer_at: u64,
+}
+
+/// Each capturing request's attention mass over its first `kv_max` keys
+/// (the load's context), averaged over its last `observe` query rows, a
+/// `kv_max` run a query head, written to its own rows ([`CaptureRows`]).
 #[allow(clippy::too_many_arguments)]
 pub fn capture(
     ctx: &Ctx<'_>,
@@ -36,7 +52,7 @@ pub fn capture(
     observe: u32,
     kv_max: u32,
     requests: u32,
-    scores: Tensor,
+    rows: CaptureRows,
 ) -> Result<(), Error> {
     const OP: &str = "attn.score_capture";
     if super::q8::enabled(pool, head_dim) {
@@ -57,12 +73,22 @@ pub fn capture(
             ),
         ));
     }
-    if scores.dtype != Dtype::F32 {
+    if rows.store.dtype != Dtype::F32 {
         return Err(refuse(
             OP,
             format!(
                 "the score rows are {:?}, and a per-key mass is an f32 rectangle",
-                scores.dtype
+                rows.store.dtype
+            ),
+        ));
+    }
+    if rows.rows.dtype != Dtype::U64 {
+        return Err(refuse(
+            OP,
+            format!(
+                "the capturing lanes' row table is {:?}, and each start is a u64 element \
+                 offset",
+                rows.rows.dtype
             ),
         ));
     }
@@ -118,13 +144,13 @@ pub fn capture(
         .filter(|size| *size > 0)
         .ok_or_else(|| refuse(OP, "the kv page size is zero"))?;
 
-    if scores.width != num_q_heads.saturating_mul(kv_max) || scores.rows < requests {
+    if rows.rows.rows < rows.first.saturating_add(requests) {
         return Err(refuse(
             OP,
             format!(
-                "the score rows are {} by {}, and {requests} lanes capture {num_q_heads} \
-                 heads of {kv_max} keys",
-                scores.rows, scores.width
+                "the row table holds {} capturing lanes, and this window's {requests} start at \
+                 {}",
+                rows.rows.rows, rows.first
             ),
         ));
     }
@@ -148,7 +174,7 @@ pub fn capture(
             pool.page_indices.arg(),
             pool.page_indptr.arg(),
             plan.last_page_len.arg(),
-            scores.arg_mut(),
+            rows.store.arg_mut(),
             stated(OP, page_size)?.arg(),
             stated(OP, num_q_heads)?.arg(),
             stated(OP, kv_heads)?.arg(),
@@ -160,6 +186,9 @@ pub fn capture(
             pool.page_stride[1].arg(),
             crate::tensor::PLANE_AT_BINDING.arg(),
             crate::tensor::PLANE_AT_BINDING.arg(),
+            rows.rows.arg(),
+            rows.first.arg(),
+            rows.layer_at.arg(),
         ],
     )
 }
@@ -184,8 +213,14 @@ mod tests {
         Tensor::new(3, rows, 1, Dtype::U32)
     }
 
-    fn rows(heads: u32) -> Tensor {
-        Tensor::new(4, 2, heads * KV_MAX, Dtype::F32)
+    /// The rows of `lanes` capturing lanes, from the window's first.
+    fn rows(lanes: u32) -> CaptureRows {
+        CaptureRows {
+            store: Tensor::new(4, 1, 1, Dtype::F32),
+            rows: Tensor::new(10, lanes, 1, Dtype::U64),
+            first: 0,
+            layer_at: 0,
+        }
     }
 
     fn pool(kv_heads: u32, head_dim: u32, keys: Dtype) -> KvPool {
@@ -221,7 +256,7 @@ mod tests {
         head_dim: u32,
         keys: Dtype,
         observe: u32,
-        scores: Tensor,
+        scores: CaptureRows,
     ) -> Result<(), Error> {
         capture(
             probe,
@@ -245,7 +280,7 @@ mod tests {
     fn score_every_case() {
         the_head_lands_on_the_tightest_stamp_that_holds_it();
         a_quantized_key_plane_is_refused_by_name();
-        rows_that_are_not_heads_of_the_ceiling_are_refused();
+        a_row_table_short_of_the_windows_lanes_is_refused();
         an_observation_window_of_zero_rows_is_refused_by_name();
         a_head_past_the_last_stamp_is_refused_by_name();
         an_element_this_plane_has_no_point_for_is_refused_by_dtype();
@@ -264,7 +299,7 @@ mod tests {
 
     fn a_quantized_key_plane_is_refused_by_name() {
         let probe = Probe::default();
-        let why = fire(&probe, bf16(40, 16 * 64), 8, 64, Dtype::U8, 32, rows(16))
+        let why = fire(&probe, bf16(40, 16 * 64), 8, 64, Dtype::U8, 32, rows(2))
             .expect_err("a quantized pool has no scores to give");
         assert!(format!("{why}").contains("dequantizes nothing"), "{why}");
         assert!(
@@ -273,13 +308,16 @@ mod tests {
         );
     }
 
-    fn rows_that_are_not_heads_of_the_ceiling_are_refused() {
+    fn a_row_table_short_of_the_windows_lanes_is_refused() {
         let probe = Probe::default();
-        let why = fire(&probe, bf16(40, 16 * 64), 8, 64, Dtype::Bf16, 32, rows(8))
-            .expect_err("a row holds every head's keys");
-        assert!(format!("{why}").contains("capture 16 heads"), "{why}");
+        let why = fire(&probe, bf16(40, 16 * 64), 8, 64, Dtype::Bf16, 32, rows(1))
+            .expect_err("each of the window's two capturing lanes has its row's start");
+        assert!(format!("{why}").contains("the row table holds 1"), "{why}");
 
-        let bf16_rows = Tensor::new(4, 2, 16 * KV_MAX, Dtype::Bf16);
+        let bf16_rows = CaptureRows {
+            store: Tensor::new(4, 1, 1, Dtype::Bf16),
+            ..rows(2)
+        };
         let dtype = fire(&probe, bf16(40, 16 * 64), 8, 64, Dtype::Bf16, 32, bf16_rows)
             .expect_err("a per-key mass is an f32 rectangle");
         assert!(format!("{dtype}").contains("f32 rectangle"), "{dtype}");
@@ -287,7 +325,7 @@ mod tests {
 
     fn an_observation_window_of_zero_rows_is_refused_by_name() {
         let probe = Probe::default();
-        let why = fire(&probe, bf16(40, 16 * 64), 8, 64, Dtype::Bf16, 0, rows(16))
+        let why = fire(&probe, bf16(40, 16 * 64), 8, 64, Dtype::Bf16, 0, rows(2))
             .expect_err("a capture that observes nothing is not a capture");
         assert!(format!("{why}").contains("observes nothing"), "{why}");
     }
@@ -310,7 +348,7 @@ mod tests {
     fn an_element_this_plane_has_no_point_for_is_refused_by_dtype() {
         let probe = Probe::default();
         let q = Tensor::new(1, 40, 16 * 64, Dtype::F32);
-        let why = fire(&probe, q, 8, 64, Dtype::Bf16, 32, rows(16))
+        let why = fire(&probe, q, 8, 64, Dtype::Bf16, 32, rows(2))
             .expect_err("this capture is stamped for bf16 alone");
         assert!(matches!(why, Error::DtypeUnsupported { .. }), "{why}");
     }

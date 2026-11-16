@@ -344,13 +344,14 @@ pub(crate) fn one_token(pool: RecurrentPool) -> RecurrentPool {
     }
 }
 
-/// Where a fire's score planes lie: the device word a recorded capture
-/// reads them through (staged each fire), and the address it holds now, 0
-/// for a fire that captures none.
+/// Where a fire's lanes have their score rows: a staged table of an address
+/// a lane (0: none), which a recorded capture reads, and the load's context
+/// and page size, a row's widths ([`kernels_cuda::attn::score::Rows`]).
 #[derive(Debug, Clone, Copy, Default)]
-pub struct ScorePlanes {
-    pub word: u64,
-    pub base: u64,
+pub struct ScoreRows {
+    pub table: u64,
+    pub context: u32,
+    pub page_size: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -366,9 +367,8 @@ pub struct FireBindings {
     /// A device word: how many of `readout_rows` are live.
     pub readout_live: u64,
 
-    /// Where a scored fire's planes lie: the device word a capture reads
-    /// them through, and what it holds this fire.
-    pub score_planes: ScorePlanes,
+    /// Where the fire's capturing lanes have their score rows.
+    pub score_rows: ScoreRows,
 
     pub patches: Option<Tensor>,
     pub patch_segments: Option<Tensor>,
@@ -1616,6 +1616,8 @@ impl<'c> Run<'c> {
             Dim::Patches => row(1),
             Dim::Readouts => return handle,
             Dim::Lanes => return handle,
+            // A capturing fire is refused before a value of either is cut.
+            Dim::Capturing | Dim::ContextTimes(_) | Dim::ContextPages => return handle,
             Dim::LanesPlus(k) => lane(k),
             Dim::Images => lane(0),
             Dim::ImagesPlus(k) => lane(k),

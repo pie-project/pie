@@ -178,6 +178,12 @@ impl Session {
         Ok(session)
     }
 
+    /// Where the instance's scratch lies now: each piece's address.
+    #[must_use]
+    pub fn scratch(&self) -> &[u64] {
+        &self.scratch
+    }
+
     /// Points the rings and the scratch at `place`, where their pool slots
     /// lie now. The scratch's contents are dead between fires: nothing is
     /// copied.
