@@ -1379,6 +1379,101 @@ mod tests {
         )
     }
 
+/// The guest-program contract (`eta_compiler::contract`) on this engine:
+    /// each case's program registered, bound with its seeds, fired over its
+    /// logits, and every channel the host reads exactly what the
+    /// interpreter puts there.
+    #[test]
+    fn a_beam_step_answers_what_the_interpreter_answers() {
+        use eta_compiler::codegen::program::{Backend, emit_program};
+        use eta_compiler::contract::beam_stage;
+        use eta_compiler::plan::compile_bound;
+        let Ok(context) = Context::bind() else {
+            eprintln!("no device: skipping");
+            return;
+        };
+        let mut wrong = Vec::new();
+        for mut case in beam_stage() {
+            // Metal's logits are bf16, and its plane read gathers them so:
+            // each logit is rounded to the nearest bf16 first (ties to even),
+            // and the interpreter answers over the very values the device
+            // reads.
+            for x in &mut case.logits {
+                let b = x.to_bits();
+                *x = f32::from_bits((b + 0x7fff + ((b >> 16) & 1)) & 0xffff_0000);
+            }
+            let stages = compile_bound(&case.bound);
+            let backend = Backend::parse("metal").expect("the metal codegen");
+            let registration = ProgramRegistration {
+                program_hash: 0xbea0_0000 ^ u64::from(case.rows),
+                emitted_kernels: emit_program(backend, &stages, &case.bound),
+                emitter_version: backend.emitter_version(),
+                launch: eta_compiler::codegen::launch::build(&case.bound, &stages),
+                ..Default::default()
+            };
+            let pools = crate::store::Pools::guests_only(&context, CHUNK, 4).expect("a pool");
+            let mut plane = Plane::new();
+            // One lane, one arm, its beams' rows read out.
+            plane.set_flight(1, 1, case.rows);
+            let program = plane
+                .register(&context, &registration)
+                .expect("the program compiles for the device");
+            let facts = plane.facts(program, &pools).expect("the program's facts");
+            let count = case.bound.container.channels.len();
+            let ids: Vec<ChannelId> = (1..=count as u64).map(ChannelId).collect();
+            let (instance, rings) = slots_for(&pools, &facts, 0);
+            let id = plane
+                .bind(
+                    &context,
+                    program,
+                    &case.wire_seeds(),
+                    Extents {
+                        row_count: case.rows,
+                        sampled_rows: case.rows,
+                        query_len: case.rows,
+                        ..Extents::default()
+                    },
+                    GeometryClass::Host,
+                    PortMask::NONE,
+                    &ids,
+                    session::Pooled {
+                        pools: &pools,
+                        instance: &instance,
+                        rings: &rings,
+                    },
+                )
+                .expect("the instance binds");
+            let mut logits = crate::device::Buffer::zeroed(&context, case.logits.len() as u64 * 2)
+                .expect("a logits plane");
+            let bytes: Vec<u8> = case
+                .logits
+                .iter()
+                .flat_map(|x| ((x.to_bits() >> 16) as u16).to_le_bytes())
+                .collect();
+            logits.write(0, &bytes).expect("the logits upload");
+            plane
+                .bind_output(id, "logits", 0, &logits, 0, eta_ir::Dtype::Bf16, case.vocab, case.vocab)
+                .expect("the logits bind");
+            let fired = plane
+                .fire(&context, id, Attach::Epilogue, &guests(&context))
+                .expect("the fire runs");
+            assert!(matches!(fired, Fired::Committed), "{}: {fired:?}", case.name);
+            let want = case.expected();
+            for (&channel, want) in case.readers.iter().zip(&want) {
+                let got = plane
+                    .instance_mut(id)
+                    .expect("the instance")
+                    .take(channel)
+                    .expect("a channel reads")
+                    .expect("the channel holds a cell");
+                if &got != want {
+                    wrong.push(format!("{}: channel {channel}: {got:02x?} != {want:02x?}", case.name));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
     fn slots_for(
         pools: &crate::store::Pools,
         facts: &engine::ProgramFacts,
