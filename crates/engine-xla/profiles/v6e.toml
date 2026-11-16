@@ -50,8 +50,9 @@ bf16_flops_per_ns = 834000.0
 # A 256 MiB elementwise pass (a negate) counted read plus write (0.418 ms); the chip's 1640 GB/s of HBM
 # is the upper bound (78%).
 bytes_per_ns = 1283.0
-# A one-tile program executed back to back, 1000 in a row (80 us; 158 us each waited for): PJRT's own
-# dispatch a program.
+# A one-tile program executed back to back, 1000 in a row, only the last waited for (80 us; 158 us each
+# waited for): PJRT's own dispatch a program. A served fire is one execute of one program, queued behind
+# the frame before it as these are, so this is its launch cost whole: one launch a fire, not a kernel count.
 launch_ns = 79900
 
 [provenance]
