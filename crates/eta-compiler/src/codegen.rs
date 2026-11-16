@@ -13,6 +13,7 @@ pub mod rng;
 mod runtime_scan;
 pub mod simt;
 pub mod slots;
+pub mod steps;
 pub mod wellformed;
 pub mod wgsl;
 pub mod wgsl_analysis;

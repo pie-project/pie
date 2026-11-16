@@ -11,7 +11,10 @@ use engine_gpu::store::Pools;
 use engine_gpu::store::layout::INSTANCE;
 
 use engine_gpu::guest::held::{self, consecutive};
-use engine_gpu::guest::session::{BINDINGS, CFG_BINDING, StageTables, groups_for, stage_tables};
+use engine_gpu::guest::session::{
+    BINDINGS, CFG_BINDING, STEP_BINDING, StageTables, groups_for, stage_tables, step_stride,
+    step_uniforms,
+};
 
 /// A span of a pool slot (or run) a guest holds.
 pub type Held = held::Held<crate::device::Api>;
@@ -32,28 +35,33 @@ const OUTBOX_FLOOR: u64 = 256;
 
 const OUTBOX_KIND: Memory = Memory::Host;
 
-pub struct Code {
+/// Every guest pipeline: one a call of the closed set
+/// ([`engine_gpu::guest::step_calls`]), each from a module of its own, all
+/// on one layout. Built at load, before the engine serves, and shared by
+/// every session: a program registered while serving dispatches these and
+/// builds none. One a bind finds missing it builds then and counts
+/// ([`Library::built_serving`]).
+pub struct Library {
+    core: Arc<Core>,
     binds: wgpu::BindGroupLayout,
-    _layout: wgpu::PipelineLayout,
-    stages: Vec<Vec<wgpu::ComputePipeline>>,
-
-    strides: Vec<bool>,
+    layout: wgpu::PipelineLayout,
+    /// By call; why one is missing where it did not build.
+    pipelines: std::sync::Mutex<Vec<std::result::Result<wgpu::ComputePipeline, String>>>,
+    /// Pipelines built after the load, at a bind.
+    serving: std::sync::atomic::AtomicU64,
 }
 
-impl std::fmt::Debug for Code {
+impl std::fmt::Debug for Library {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Code")
-            .field("stages", &self.stages.len())
-            .field(
-                "dispatches",
-                &self.stages.iter().map(Vec::len).sum::<usize>(),
-            )
+        f.debug_struct("Library")
+            .field("calls", &engine_gpu::guest::step_calls())
+            .field("built", &self.built())
             .finish()
     }
 }
 
-impl Code {
-    pub fn new(device: &Context, code: &[engine_gpu::guest::Lowered<String>]) -> Result<Code> {
+impl Library {
+    pub fn build(device: &Context) -> Result<Library> {
         let core = device.core().clone();
         let binds = bind_layout(&core);
         let layout = core
@@ -64,29 +72,97 @@ impl Code {
                 immediate_size: 0,
             });
         core.take_error("create_pipeline_layout")?;
-        let stages = code
-            .iter()
-            .map(|lowered| build_pipelines(&core, &layout, lowered))
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Code {
+        let started = crate::device::host::Instant::now();
+        let pipelines: Vec<_> = (0..engine_gpu::guest::step_calls())
+            .map(|call| build_call(&core, &layout, call))
+            .collect();
+        let library = Library {
+            core: core.clone(),
             binds,
-            _layout: layout,
-            stages,
-            strides: code
-                .iter()
-                .map(|lowered| lowered.strides_the_grid)
-                .collect(),
-        })
+            layout,
+            pipelines: std::sync::Mutex::new(pipelines),
+            serving: std::sync::atomic::AtomicU64::new(0),
+        };
+        for (call, why) in library
+            .pipelines
+            .lock()
+            .expect("library lock poisoned")
+            .iter()
+            .enumerate()
+            .filter_map(|(at, built)| built.as_ref().err().map(|why| (at, why)))
+        {
+            tracing::warn!(call, %why, "a guest step's pipeline did not build");
+        }
+        tracing::info!(
+            calls = engine_gpu::guest::step_calls(),
+            built = library.built(),
+            ms = started.elapsed().as_millis() as u64,
+            "every guest step's pipeline is built"
+        );
+        Ok(library)
     }
 
+    /// The calls whose pipelines are built.
     #[must_use]
-    pub fn stages(&self) -> usize {
-        self.stages.len()
+    pub fn built(&self) -> usize {
+        let pipelines = self.pipelines.lock().expect("library lock poisoned");
+        pipelines.iter().filter(|built| built.is_ok()).count()
+    }
+
+    /// The pipelines built after the load, each at a bind that found its
+    /// call missing: none, where the load built every call.
+    #[must_use]
+    pub fn built_serving(&self) -> u64 {
+        self.serving.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Takes call `call`'s pipeline out, so the next bind that dispatches
+    /// it builds it: the counter's control. A session that holds it keeps
+    /// its own handle.
+    pub fn forget(&self, call: u32) {
+        let mut pipelines = self.pipelines.lock().expect("library lock poisoned");
+        if let Some(slot) = pipelines.get_mut(call as usize) {
+            *slot = Err("forgotten".to_owned());
+        }
+    }
+
+    /// Call `call`'s pipeline; one the load did not build is built now,
+    /// counted, and named.
+    fn pipeline(&self, call: u32) -> Result<wgpu::ComputePipeline> {
+        let mut pipelines = self.pipelines.lock().expect("library lock poisoned");
+        let count = pipelines.len();
+        let slot = pipelines
+            .get_mut(call as usize)
+            .ok_or_else(|| Fault::Program {
+                at: "guest::session",
+                why: format!("guest step call {call} is past the {count} the library holds"),
+            })?;
+        if let Ok(pipeline) = slot {
+            return Ok(pipeline.clone());
+        }
+        let built = build_call(&self.core, &self.layout, call as usize);
+        self.serving
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        tracing::error!(
+            call,
+            "a bind built a guest step's pipeline the load did not"
+        );
+        *slot = built.clone();
+        built.map_err(|why| Fault::Program {
+            at: "guest::session",
+            why: format!("guest step call {call} has no pipeline: {why}"),
+        })
     }
 }
 
 struct Stage {
     group: wgpu::BindGroup,
+
+    /// Its steps' pipelines, in dispatch order.
+    steps: Vec<wgpu::ComputePipeline>,
+    /// Its steps' uniforms, `stride` apart ([`STEP_BINDING`]).
+    args: Buffer,
+    stride: u64,
 
     groups: u32,
 
@@ -116,7 +192,7 @@ pub struct Session {
     slots: Vec<u32>,
     run: bool,
 
-    code: Arc<Code>,
+    library: Arc<Library>,
 }
 
 impl std::fmt::Debug for Session {
@@ -135,17 +211,19 @@ impl Session {
     pub fn new(
         device: &Context,
         plans: &[LaunchStagePlan],
-        code: Arc<Code>,
+        code: &[engine_gpu::guest::Lowered],
+        args: &[StepArgs],
+        library: Arc<Library>,
         extents: &Extents,
         tables: &Tables<'_>,
     ) -> Result<Session> {
-        if code.stages() != plans.len() {
+        if code.len() != plans.len() || args.len() != plans.len() {
             return Err(Fault::Program {
                 at: "guest::session",
                 why: format!(
                     "{} stage plans but {} compiled forms; a session runs every stage or none",
                     plans.len(),
-                    code.stages()
+                    code.len()
                 ),
             });
         }
@@ -177,16 +255,10 @@ impl Session {
             held::place_tables(tables.pools, INSTANCE, tables.slots, &bytes, tables.align)?;
         let mut placed = placed.into_iter();
         let mut stages = Vec::with_capacity(plans.len());
-        for (at, resolved) in resolved.into_iter().enumerate() {
+        for ((lowered, resolved), args) in code.iter().zip(resolved).zip(args) {
             let tables = [(); 4].map(|()| placed.next().expect("four tables a stage"));
             stages.push(build_stage(
-                device,
-                &core,
-                &code.binds,
-                &status,
-                resolved,
-                tables,
-                code.strides[at],
+                device, &core, &library, &status, resolved, tables, lowered, args,
             )?);
         }
 
@@ -196,7 +268,7 @@ impl Session {
             stages,
             slots: tables.slots.to_vec(),
             run,
-            code,
+            library,
         })
     }
 
@@ -242,10 +314,11 @@ impl Session {
         for stage in &mut self.stages {
             stage.group = group(
                 &self.core,
-                &self.code.binds,
+                &self.library.binds,
                 &self.status,
                 &stage.tables,
                 &stage.heap,
+                &stage.args,
             )?;
         }
         Ok(())
@@ -314,8 +387,17 @@ impl Session {
             at: "guest::session",
             why: format!("stage {at} is past this package's {}", self.stages.len()),
         })?;
-        for pipeline in &self.code.stages[at] {
-            frame.dispatch("guest", pipeline, &stage.group, [stage.groups, 1, 1])?;
+        for (step, pipeline) in stage.steps.iter().enumerate() {
+            // The step's node, rung and selector, at its own offset.
+            let offset = u32::try_from(step as u64 * stage.stride)
+                .expect("a stage's step uniforms fit a dynamic offset");
+            frame.dispatch_at(
+                "guest",
+                pipeline,
+                &stage.group,
+                &[offset],
+                [stage.groups, 1, 1],
+            )?;
         }
         Ok(())
     }
@@ -427,6 +509,18 @@ fn whole(buffer: &Buffer) -> wgpu::BindingResource<'_> {
 }
 
 fn bind_layout(core: &Core) -> wgpu::BindGroupLayout {
+    let step = wgpu::BindGroupLayoutEntry {
+        binding: STEP_BINDING,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: true,
+            min_binding_size: std::num::NonZeroU64::new(u64::from(
+                eta_compiler::codegen::wgsl::STEP_BYTES,
+            )),
+        },
+        count: None,
+    };
     let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..BINDINGS)
         .map(|at| wgpu::BindGroupLayoutEntry {
             binding: at,
@@ -444,6 +538,7 @@ fn bind_layout(core: &Core) -> wgpu::BindGroupLayout {
             },
             count: None,
         })
+        .chain([step])
         .collect();
     core.device
         .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -452,52 +547,34 @@ fn bind_layout(core: &Core) -> wgpu::BindGroupLayout {
         })
 }
 
-fn build_pipelines(
+/// Builds call `call`'s pipeline from its own module.
+fn build_call(
     core: &Arc<Core>,
     pipeline_layout: &wgpu::PipelineLayout,
-    lowered: &engine_gpu::guest::Lowered<String>,
-) -> Result<Vec<wgpu::ComputePipeline>> {
-    if lowered.entries.is_empty() {
-        return Ok(Vec::new());
-    }
-    let started = crate::device::host::Instant::now();
-    let built = crate::guest::validated(core, "create_compute_pipeline", || {
+    call: usize,
+) -> std::result::Result<wgpu::ComputePipeline, String> {
+    let source =
+        engine_gpu::guest::step_module(call).ok_or_else(|| format!("no step call {call}"))?;
+    let source = <crate::device::Api as engine_gpu::guest::Lower>::lower(call, source)
+        .map_err(|why| why.to_string())?;
+    crate::guest::validated(core, "create_compute_pipeline", || {
         let module = core
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("pie guest"),
-                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&lowered.code)),
+                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&source)),
             });
-        lowered
-            .entries
-            .iter()
-            .map(|entry| {
-                core.device
-                    .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                        label: Some("pie guest"),
-                        layout: Some(pipeline_layout),
-                        module: &module,
-                        entry_point: Some(entry),
-                        compilation_options: wgpu::PipelineCompilationOptions::default(),
-                        cache: None,
-                    })
+        core.device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("pie guest"),
+                layout: Some(pipeline_layout),
+                module: &module,
+                entry_point: Some(engine_gpu::guest::ENTRY),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
             })
-            .collect()
     })
-    .map_err(|error| Fault::Wgpu {
-        what: "create_compute_pipeline",
-        why: format!(
-            "a guest stage's {} step(s) ({}) were refused: {error}",
-            lowered.entries.len(),
-            lowered.entries.join(", ")
-        ),
-    });
-    tracing::info!(
-        entries = lowered.entries.len(),
-        ms = started.elapsed().as_millis() as u64,
-        "guest stage pipelines built"
-    );
-    built
+    .map_err(|error| format!("guest step call {call} was refused: {error}"))
 }
 
 fn span(held: &Held) -> wgpu::BindingResource<'_> {
@@ -517,6 +594,7 @@ fn group(
     status: &Buffer,
     tables: &[Held; 4],
     heap: &Buffer,
+    args: &Buffer,
 ) -> Result<wgpu::BindGroup> {
     let [descs, params, offs, cfg] = tables;
     let group = core.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -547,20 +625,55 @@ fn group(
                 binding: CFG_BINDING,
                 resource: span(cfg),
             },
+            wgpu::BindGroupEntry {
+                binding: STEP_BINDING,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &args.slab().buffer,
+                    offset: 0,
+                    size: std::num::NonZeroU64::new(u64::from(
+                        eta_compiler::codegen::wgsl::STEP_BYTES,
+                    )),
+                }),
+            },
         ],
     });
     core.take_error("create_bind_group")?;
     Ok(group)
 }
 
+/// A stage's step uniforms ([`step_uniforms`]), `stride` apart: what a
+/// program's steps fix, so every bind of the program shares one.
+#[derive(Clone)]
+pub struct StepArgs {
+    buffer: Buffer,
+    stride: u64,
+}
+
+impl StepArgs {
+    pub fn of(device: &Context, lowered: &engine_gpu::guest::Lowered) -> Result<StepArgs> {
+        let stride = step_stride(u64::from(
+            device.core().limits.min_uniform_buffer_offset_alignment,
+        ));
+        let uniforms = step_uniforms(&lowered.steps, stride);
+        let mut buffer = Buffer::zeroed(
+            device,
+            uniforms.len() as u64,
+            engine_gpu::books::owners::GUEST,
+        )?;
+        buffer.write(0, &uniforms)?;
+        Ok(StepArgs { buffer, stride })
+    }
+}
+
 fn build_stage(
     device: &Context,
     core: &Arc<Core>,
-    binds: &wgpu::BindGroupLayout,
+    library: &Library,
     status: &Buffer,
     resolved: StageTables,
     tables: [Held; 4],
-    strides_the_grid: bool,
+    lowered: &engine_gpu::guest::Lowered,
+    args: &StepArgs,
 ) -> Result<Stage> {
     let StageTables {
         descriptors,
@@ -568,6 +681,12 @@ fn build_stage(
         scratch,
         ..
     } = resolved;
+    let steps = lowered
+        .steps
+        .iter()
+        .map(|step| library.pipeline(step.call))
+        .collect::<Result<Vec<_>>>()?;
+    let (args, stride) = (args.buffer.clone(), args.stride);
     let heap = Buffer::zeroed(device, scratch, engine_gpu::books::owners::GUEST_STATE)?;
     let outbox = Buffer::with(
         device,
@@ -575,11 +694,14 @@ fn build_stage(
         OUTBOX_KIND,
         engine_gpu::books::owners::GUEST,
     )?;
-    let group = group(core, binds, status, &tables, &heap)?;
+    let group = group(core, &library.binds, status, &tables, &heap, &args)?;
 
     Ok(Stage {
         group,
-        groups: if strides_the_grid {
+        steps,
+        args,
+        stride,
+        groups: if lowered.strides_the_grid {
             groups_for(&descriptors, device.cores())
         } else {
             1

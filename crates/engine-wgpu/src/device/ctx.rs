@@ -716,6 +716,18 @@ impl Frame {
         group: &wgpu::BindGroup,
         groups: [u32; 3],
     ) -> Result<()> {
+        self.dispatch_at(label, pipeline, group, &[], groups)
+    }
+
+    /// [`Frame::dispatch`] with `group`'s dynamic offsets.
+    pub(crate) fn dispatch_at(
+        &self,
+        label: &'static str,
+        pipeline: &wgpu::ComputePipeline,
+        group: &wgpu::BindGroup,
+        offsets: &[u32],
+        groups: [u32; 3],
+    ) -> Result<()> {
         let groups = engine_gpu::workgroups(
             label,
             groups,
@@ -739,7 +751,7 @@ impl Frame {
         }
         let pass = pass.as_mut().expect("just opened");
         pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, group, &[]);
+        pass.set_bind_group(0, group, offsets);
         pass.dispatch_workgroups(groups[0], groups[1], groups[2]);
         Ok(())
     }

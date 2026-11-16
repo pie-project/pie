@@ -155,7 +155,11 @@ fn epilogue() -> TraceContainer {
                     shape: Shape::matrix(LAYERS, WIDTH),
                     dtype: EtaDtype::F32,
                 },
-                Op::ChanPut { chan: 1, value: 1 },
+                // Negated twice on the device, so the pass dispatches steps
+                // of the closed set and reads back what it read out.
+                Op::Neg(1),
+                Op::Neg(2),
+                Op::ChanPut { chan: 1, value: 3 },
             ],
         }],
         externs: Vec::new(),
@@ -247,6 +251,15 @@ pub(super) fn loaded(tag: &str, model: &impl ForwardHybrid) -> Option<Loaded> {
 
 /// `None` without a device. `tag` names the scratch directory.
 fn bound(tag: &str) -> Option<Bound> {
+    bound_with(tag, |_, _| {})
+}
+
+/// [`bound`], with `before` run on the engine and the registered program
+/// before the instance binds.
+fn bound_with(
+    tag: &str,
+    before: impl FnOnce(&mut backend::Engine, engine::program::ProgramId),
+) -> Option<Bound> {
     let Loaded {
         mut engine,
         caps: loaded,
@@ -292,6 +305,7 @@ fn bound(tag: &str) -> Option<Bound> {
             ..Default::default()
         })
         .expect("the program registers");
+    before(&mut engine, program);
     let chunks = &loaded.caps.chunks;
     let mut slots =
         super::slots::Slots::of(chunks, chunks.segment_chunks - 1, chunks.segment_chunks - 2);
@@ -442,7 +456,7 @@ fn a_guest_reads_lane_layer_and_id_outputs_by_name() {
     }
     eprintln!("ids {ids:?} and both stacked layers read back");
     assert_eq!(
-        engine.live().tallied(engine::live::Tally::Unrecorded),
+        engine.live().tallied(engine::live::Tally::BuiltAfterReady),
         0,
         "a fire a guest reads built a pipeline the load did not"
     );
@@ -504,6 +518,146 @@ fn a_frame_of_many_steps_settles_every_step_one_frame_in_flight() {
             "token {token}'s step read its own row: {got:?} against {row:?}"
         );
     }
+    drop(engine);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// What the engine tallies of a serving fire (`engine::live::Tally`): a
+/// guest program registered and bound after the load, and its fire, build
+/// no pipeline, since the load built every guest step's and every kernel
+/// its walks named, so `BuiltAfterReady` reads 0; where the backend records,
+/// the first fire records and the second replays, and neither counts
+/// `Unrecorded`; where it keeps no recording, each fire walks eagerly and
+/// counts `Eager`. The negative controls: a kernel pipeline the load did not
+/// build, built after it, is counted `BuiltAfterReady` by the next fire, and
+/// so is a guest step's pipeline a bind builds after the load.
+#[test]
+fn a_pipeline_built_after_the_load_is_counted() {
+    use engine::live::Tally;
+    use engine_gpu::serve::Serve;
+    let Some(Bound {
+        mut engine,
+        instance,
+        channels,
+        t_input,
+        word,
+        dir,
+        ..
+    }) = bound("tally")
+    else {
+        return;
+    };
+    let live = engine.live();
+    let built = |live: &engine::live::Live| live.tallied(Tally::BuiltAfterReady);
+    let fire = |engine: &mut backend::Engine| {
+        let lane = Lane {
+            slot: 0,
+            word,
+            tokens: vec![3, 11, 7],
+            readout: Readout::Last,
+            kv_less: true,
+            inputs: vec![InputFeed {
+                id: t_input,
+                channel: channels[2],
+            }],
+            ..Lane::default()
+        };
+        let mut ticket = engine
+            .submit(&FrameSubmission::of(Step {
+                lanes: vec![lane],
+                attachments: vec![Attachment {
+                    lane: 0,
+                    lanes: 1,
+                    instance,
+                    adapter_only: false,
+                }],
+                media: Vec::new(),
+                voxels: Vec::new(),
+            }))
+            .expect("the frame fires");
+        engine.settle_frame(&mut ticket).expect("the frame settles");
+        for dense in [0, 1] {
+            engine
+                .take_channel(instance, dense)
+                .expect("the channel reads")
+                .expect("the channel holds a cell");
+        }
+        // The next fire's timestep, where the ring has room for it (a
+        // full ring still holds this one's).
+        engine
+            .publish_channel(instance, 2, &T.to_le_bytes())
+            .expect("the timestep publishes");
+    };
+
+    fire(&mut engine);
+    fire(&mut engine);
+    assert_eq!(
+        built(&live),
+        0,
+        "a guest program bound after the load and its fires built no pipeline"
+    );
+    assert_eq!(
+        live.tallied(Tally::Unrecorded),
+        0,
+        "where the backend records, the second fire replays what the first recorded"
+    );
+    if !<backend::Api as Serve>::RECORDS {
+        assert_eq!(
+            live.tallied(Tally::Eager),
+            2,
+            "a backend that keeps no recording walks each fire eagerly, as it states"
+        );
+    }
+    assert_eq!(live.tallied(Tally::Refused), 0);
+
+    // A kernel no walk of the load named, built now, as a fire would.
+    let shell = engine.shell_mut().expect("loaded");
+    let before = shell.compiled();
+    let unnamed = kernels_slang::CENSUS.iter().find(|&&(key, _, _, unit)| {
+        <backend::Api as Serve>::build(shell.device(), shell.pipelines(), unit, key).is_ok()
+            && shell.compiled() > before
+    });
+    let Some(&(key, ..)) = unnamed else {
+        panic!("the load built every kernel of the census, so none is left to build after it");
+    };
+    fire(&mut engine);
+    assert_eq!(
+        built(&live),
+        1,
+        "`{key}`, built after the load, is counted by the fire after it"
+    );
+    drop(engine);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // A guest step's pipeline the load built, taken out before the bind:
+    // the bind that dispatches it builds it while serving, and that counts.
+    let Some(Bound { engine, dir, .. }) = bound_with("tally-guest", |engine, program| {
+        use engine_gpu::program::Programs as _;
+        let package = engine
+            .programs
+            .package(program)
+            .cloned()
+            .expect("the program is registered");
+        let first = package
+            .plans
+            .iter()
+            .flat_map(|plan| {
+                eta_compiler::codegen::wgsl::emit_launch_steps("main", plan)
+                    .expect("the stage emits")
+                    .steps
+            })
+            .next()
+            .expect("a stage of the program takes a step")
+            .call;
+        engine.programs.forget_step(first);
+    }) else {
+        return;
+    };
+    assert_eq!(
+        engine.live().tallied(Tally::BuiltAfterReady),
+        1,
+        "a bind that built a guest step's pipeline after the load is counted"
+    );
     drop(engine);
     let _ = std::fs::remove_dir_all(&dir);
 }
