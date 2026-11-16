@@ -1737,6 +1737,12 @@ impl Shell {
         self.arena.rs_rooms()
     }
 
+    /// The rungs' tokens the load laid, ascending; the last the widest.
+    #[must_use]
+    pub fn rung_tokens(&self) -> Vec<u32> {
+        self.arena.rung_tokens()
+    }
+
     /// See `Engine::set_rung`: a raise backs the carve of `to` before any
     /// fire of it, refused as [`Fault::Refused`]; a lower gives back the
     /// carve above it. Either way, where the rung's staged regions move,
@@ -4819,6 +4825,35 @@ impl Shell {
                 have: readouts_ceiling,
             });
         }
+        let fire = FireRows {
+            tokens: u64::from(rows),
+            lanes: u64::from(lane_count),
+            patches: u64::from(composition.patch_rows()),
+            images: u64::from(composition.images()),
+            voxels: u64::from(composition.voxel_widest()),
+            clips: u64::from(composition.clips()),
+            readouts: readout_rows.len() as u64,
+        };
+        // The rung's carve was backed when the runtime raised to it
+        // (`set_rung`); a fire never backs anything. A fire wider than the
+        // rung held is refused here, before its rows are staged: the staged
+        // regions are the held rung's, each field laid for its tokens and
+        // lanes, and a wider fire's rows would run into the next field
+        // though its carve rounds to the held one's.
+        let held_tokens = self.arena.current_tokens();
+        if fire.tokens > u64::from(held_tokens)
+            || fire.lanes > u64::from(held_tokens)
+            || !self.pools.covers(self.arena.reach(fire))
+        {
+            return Err(Fault::Program {
+                at: "serve::stage",
+                why: format!(
+                    "a fire of {} tokens over {} lanes is wider than the rung the runtime \
+                     raised to, whose carve alone is backed",
+                    fire.tokens, fire.lanes
+                ),
+            });
+        }
         let bound = self.inputs[self.arena.current()][arm].write(
             &self.handles,
             &crate::inputs::Fire {
@@ -4858,27 +4893,6 @@ impl Shell {
         let group_masks = self.inputs[self.arena.current()][arm]
             .stage_group_masks(&self.handles, &group_masks)?;
 
-        let fire = FireRows {
-            tokens: u64::from(rows),
-            lanes: u64::from(lane_count),
-            patches: u64::from(composition.patch_rows()),
-            images: u64::from(composition.images()),
-            voxels: u64::from(composition.voxel_widest()),
-            clips: u64::from(composition.clips()),
-            readouts: readout_rows.len() as u64,
-        };
-        // The rung's carve was backed when the runtime raised to it
-        // (`set_rung`); a fire never backs anything.
-        if !self.pools.covers(self.arena.reach(fire)) {
-            return Err(Fault::Program {
-                at: "serve::stage",
-                why: format!(
-                    "a fire of {} tokens over {} lanes is wider than the rung the runtime \
-                     raised to, whose carve alone is backed",
-                    fire.tokens, fire.lanes
-                ),
-            });
-        }
         let slots = self.arena.fire_slots(&self.handles, fire)?;
         let caches = self.pools.table(
             &self.handles,
