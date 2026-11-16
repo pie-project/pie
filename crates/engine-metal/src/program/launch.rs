@@ -1375,6 +1375,7 @@ impl Prepared {
     }
 
     /// The temporary area's first byte, where the seated scratch lies.
+    #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
     fn temporary_at(&self) -> Result<(&Buffer, u64)> {
         let piece = self
             .scratch()?
