@@ -273,6 +273,9 @@ pub struct Attached {
 }
 
 pub struct Shell {
+    /// What the load weighed its rungs by, where its profile states rates:
+    /// the rungs, the estimate and the live range (`--check-estimate`).
+    weighed: Option<crate::top::Weighed>,
     /// The load's pipeline walk is running ([`Shell::warm_pipelines`]): a
     /// seat-addressed fire backs only what the walk backed for it.
     warming: bool,
@@ -1196,41 +1199,55 @@ impl PreparedLoad<'_> {
         // than asked, the axes are compiled again at it and the load laid
         // again under them (the rung's own carve, scratch and staged rows),
         // the weights kept: they do not depend on the fire's size.
-        if ruled.is_none() && boot.top == Top::Ruled {
-            let counts = crate::top::counts(&boot.trace)?;
-            let room = accounting(0).pool.saturating_add(fire_bytes);
-            let live = boot.kv_budget.map_or(room, |budget| budget.min(room));
-            // A recording dispatches each node of the plan's launching
-            // regions once, whatever the rung (the rungs share one plan).
-            let launches = u32::try_from(
-                compiled
-                    .template()
+        // What the rungs weigh, the load's own top still to choose: under
+        // `Top::EveryRung` too, for `pie tune --check-estimate`, which times
+        // every rung against it.
+        let weighed = if ruled.is_none() {
+            let counts = match boot.top {
+                Top::Ruled => Some(crate::top::counts(&boot.trace)?),
+                Top::EveryRung => crate::top::counts(&boot.trace).ok(),
+            };
+            counts.map(|counts| {
+                let room = accounting(0).pool.saturating_add(fire_bytes);
+                let live = boot.kv_budget.map_or(room, |budget| budget.min(room));
+                // A recording dispatches each node of the plan's launching
+                // regions once, whatever the rung (the rungs share one plan).
+                let launches = u32::try_from(
+                    compiled
+                        .template()
+                        .iter()
+                        .filter(|region| region.launches())
+                        .map(|region| region.nodes.len())
+                        .sum::<usize>(),
+                )
+                .unwrap_or(u32::MAX);
+                let candidates: Vec<crate::top::Candidate> = act
                     .iter()
-                    .filter(|region| region.launches())
-                    .map(|region| region.nodes.len())
-                    .sum::<usize>(),
-            )
-            .unwrap_or(u32::MAX);
-            let candidates: Vec<crate::top::Candidate> = act
-                .iter()
-                .map(|&(tokens, chunks)| crate::top::Candidate {
-                    tokens,
-                    chunks,
-                    launches,
-                    padded_rows: kernels_metal::linear::gemm::rows_computed(
-                        &tuning,
+                    .map(|&(tokens, chunks)| crate::top::Candidate {
                         tokens,
-                        counts.width,
-                        counts.width,
-                    ),
-                })
-                .collect();
-            let rungs = crate::top::rung_facts(
-                &candidates,
-                rows.chunk_bytes,
-                budgets.tokens.max_lanes,
-                part_chunks,
-            );
+                        chunks,
+                        launches,
+                        padded_rows: kernels_metal::linear::gemm::rows_computed(
+                            &tuning,
+                            tokens,
+                            counts.width,
+                            counts.width,
+                        ),
+                    })
+                    .collect();
+                let rungs = crate::top::rung_facts(
+                    &candidates,
+                    rows.chunk_bytes,
+                    budgets.tokens.max_lanes,
+                    part_chunks,
+                );
+                (counts, rungs, live)
+            })
+        } else {
+            None
+        };
+        if let Some((counts, rungs, live)) = weighed.as_ref().filter(|_| boot.top == Top::Ruled) {
+            let (live, rungs) = (*live, rungs.clone());
             let pick = crate::top::choose(
                 &rungs,
                 live,
@@ -1505,7 +1522,18 @@ impl PreparedLoad<'_> {
             )?),
             false => None,
         };
+        let weighed = weighed.and_then(|(counts, rungs, live)| {
+            engine::load::estimate(&counts, &chip.tuned().rates).map(|estimate| {
+                crate::top::Weighed {
+                    rungs,
+                    estimate,
+                    live,
+                    counts,
+                }
+            })
+        });
         let shell = Shell {
+            weighed,
             tuning,
             device,
             outside,
@@ -2422,6 +2450,10 @@ impl Shell {
     }
 
     #[must_use]
+    pub fn weighed(&self) -> Option<&crate::top::Weighed> {
+        self.weighed.as_ref()
+    }
+
     pub fn paging(&self) -> Paging {
         self.pools.paging()
     }
@@ -5444,7 +5476,11 @@ impl engine::frame::Shell for Shell {
         });
         let walked = self.walk_once(&prepared)?;
         fire_trace(|| "forward-encoded".to_string());
-        let profile = crate::encode::kernel_profile();
+        let profile = if crate::diag::on().kernel_profile.on() {
+            crate::encode::kernel_profile()
+        } else {
+            Vec::new()
+        };
         if !profile.is_empty() {
             let total: u64 = profile.iter().map(|(_, ns, _)| ns).sum();
             eprintln!(
