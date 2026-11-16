@@ -49,12 +49,17 @@ pub struct Candidate {
 
 /// The rungs `candidates` offer as the ruling weighs them over `live`
 /// bytes: a lane a token up to `max_lanes`, a row attending its fire's
-/// tokens, a matmul's rows unpadded (cuBLAS and the GEMM skeletons pick
-/// their tile per shape inside the call, which the load does not read),
+/// tokens, a matmul's rows as `computed` states them (the tile the dense
+/// product takes at that width: `kernels_cuda::linear::gemm::rows_computed`),
 /// infeasible where the plan does not compile or the span leaves no room
 /// beside it.
 #[must_use]
-pub fn rung_facts(candidates: &[Candidate], max_lanes: u32, live: u64) -> Vec<RungFacts> {
+pub fn rung_facts(
+    candidates: &[Candidate],
+    max_lanes: u32,
+    live: u64,
+    computed: impl Fn(u32) -> u32,
+) -> Vec<RungFacts> {
     candidates
         .iter()
         .map(|c| RungFacts {
@@ -62,7 +67,7 @@ pub fn rung_facts(candidates: &[Candidate], max_lanes: u32, live: u64) -> Vec<Ru
             lanes: c.tokens.min(max_lanes),
             keys: c.tokens,
             launches: c.launches,
-            padded_rows: c.tokens,
+            padded_rows: computed(c.tokens),
             span_bytes: c.span,
             infeasible: if c.span == u64::MAX {
                 Some(NO_PLAN)
@@ -148,7 +153,12 @@ mod tests {
 
     #[test]
     fn a_load_without_rates_is_refused_by_name() {
-        let rungs = rung_facts(&[candidate(1024, 100), candidate(2048, 200)], 256, 8 << 30);
+        let rungs = rung_facts(
+            &[candidate(1024, 100), candidate(2048, 200)],
+            256,
+            8 << 30,
+            |rows| rows,
+        );
         let err = choose(
             &rungs,
             8 << 30,
@@ -181,7 +191,7 @@ mod tests {
             },
         ];
         let live = 3 << 30;
-        let rungs = rung_facts(&candidates, 256, live);
+        let rungs = rung_facts(&candidates, 256, live, |rows| rows);
         assert_eq!(rungs[0].lanes, 256);
         assert_eq!(rungs[3].infeasible, Some(NO_ROOM));
         assert_eq!(rungs[4].infeasible, Some(NO_PLAN));

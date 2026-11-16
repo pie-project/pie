@@ -15,6 +15,29 @@ pub(crate) mod cublas;
 #[cfg(feature = "cuda")]
 pub mod cublas_lt_fp8;
 
+/// The rows cuBLAS's tile M: the 128 of the 128x128 and 256x128 tiles its
+/// bf16 algorithms (and the retiles the tuner offers) take past the skinny
+/// skeleton's rows.
+pub const TILE_M: u32 = 128;
+
+/// The skinny skeleton's mma.sync tile: 16 rows.
+pub const SKINNY_M: u32 = 16;
+
+/// The rows a dense bf16 product of `rows` rows computes under `tuning`:
+/// the row skeleton's rows as they are (each row streams the weight once),
+/// the skinny skeleton's to its 16-row tile, and past it cuBLAS's to its
+/// 128-row tile.
+#[must_use]
+pub fn rows_computed(tuning: &crate::tuning::Tuning, rows: u32) -> u32 {
+    if rows <= crate::linear::skeleton::ROWS_M {
+        rows
+    } else if rows <= tuning.gemm_skinny_rows.max(crate::linear::skeleton::ROWS_M) {
+        rows.next_multiple_of(SKINNY_M)
+    } else {
+        rows.next_multiple_of(TILE_M)
+    }
+}
+
 pub fn matmul(ctx: &Ctx, act: Tensor, w: Tensor, y: &mut Tensor) -> Result<(), Error> {
     act_x_wt(ctx, "linear.matmul", act, w, y)
 }

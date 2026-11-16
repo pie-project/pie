@@ -18,6 +18,11 @@ const GRANT_INT_BYTES: u64 = 1 << 20;
 
 const GRANT_FLOAT_BYTES: u64 = 64 << 20;
 
+/// The float workspace a captured prefill plan of `rows` rows takes at its
+/// widest, over every lane count a composition of them may carry (one to
+/// `lanes`): the fewer the lanes, the longer each lane's rows and the wider
+/// the CTA tile, so the fewest lanes, not the most, lay the largest
+/// partials (Qwen3-8B at 512 rows: 142 MB over one lane, 42 MB over 512).
 fn prefill_float_bytes(
     facts: &SpaceFacts,
     rows: u32,
@@ -25,20 +30,23 @@ fn prefill_float_bytes(
     device: &Device,
     toggles: Toggles,
 ) -> u64 {
-    let (tile, padded) = prefill_graph_padding(
-        rows,
-        lanes,
-        facts.q_heads,
-        facts.kv_heads,
-        facts.head_dim,
-        device,
-        toggles.prefill_ctas_per_sm,
-    );
-    let heads = u64::from(facts.q_heads);
-    let rows = prefill_partial_rows(tile, facts.q_heads, facts.kv_heads);
-    let v = heads * padded * rows * u64::from(facts.head_dim) * 4;
-    let s = heads * padded * rows * 4;
-    (v + s).next_multiple_of(ALIGN) + 2 * ALIGN
+    let at = |lanes: u32| {
+        let (tile, padded) = prefill_graph_padding(
+            rows,
+            lanes,
+            facts.q_heads,
+            facts.kv_heads,
+            facts.head_dim,
+            device,
+            toggles.prefill_ctas_per_sm,
+        );
+        let heads = u64::from(facts.q_heads);
+        let rows = prefill_partial_rows(tile, facts.q_heads, facts.kv_heads);
+        let v = heads * padded * rows * u64::from(facts.head_dim) * 4;
+        let s = heads * padded * rows * 4;
+        (v + s).next_multiple_of(ALIGN) + 2 * ALIGN
+    };
+    (1..=lanes.min(rows).max(1)).map(at).max().unwrap_or(0)
 }
 
 /// A floor on the decode room, well past what the decode grid uses: the token
@@ -1623,5 +1631,83 @@ fn u32_bytes_of(values: &[u32]) -> &[u8] {
     // SAFETY: as [`bytes_of`] — `u32` is `Copy`, no padding or niche.
     unsafe {
         core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), core::mem::size_of_val(values))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kernels_cuda::attn::plan::{Live, Shape, plan_prefill};
+
+    /// Qwen3-8B's attention: 32 query heads over 8 kv heads of 128.
+    const QWEN3_8B: SpaceFacts = SpaceFacts {
+        head_dim: 128,
+        kv_heads: 8,
+        q_heads: 32,
+        window: None,
+    };
+
+    /// A prefill rung's captured plan fits the grant the load sizes for it
+    /// at every lane count a composition of it carries: at a 512-row top
+    /// over 512 lanes, 256 lanes of 2 rows (a 128-row tile, 271 work items)
+    /// included.
+    #[test]
+    fn every_lane_count_of_a_prefill_rung_captures_in_its_grant() {
+        let device = Device::L40S;
+        let toggles = Toggles::of(kernels_cuda::tuning::Tuning::DEFAULT);
+        let (rows, lanes, page) = (512u32, 512u32, 16u32);
+        let grant = prefill_float_bytes(&QWEN3_8B, rows, lanes, &device, toggles);
+        for requests in 1..=lanes {
+            let base = rows / requests;
+            let lens: Vec<u32> = (0..requests)
+                .map(|r| base + u32::from(r < rows % requests))
+                .collect();
+            let mut qo = vec![0i32];
+            let mut kv = vec![0i32];
+            for len in &lens {
+                qo.push(qo.last().unwrap() + *len as i32);
+                kv.push(kv.last().unwrap() + len.div_ceil(page) as i32);
+            }
+            let kv_len: Vec<i32> = lens.iter().map(|&l| l as i32).collect();
+            let plan = plan_prefill(
+                &qo,
+                &kv,
+                &kv_len,
+                rows,
+                Shape {
+                    num_requests: requests,
+                    lane_offset: 0,
+                    num_q_heads: QWEN3_8B.q_heads,
+                    num_kv_heads: QWEN3_8B.kv_heads,
+                    head_dim: QWEN3_8B.head_dim,
+                    page_size: page,
+                    hnd_layout: false,
+                },
+                Live {
+                    requests,
+                    lane_offset: 0,
+                    row_offset: 0,
+                    rows,
+                },
+                None,
+                true,
+                true,
+                None,
+                &device,
+                toggles,
+                Workspace {
+                    int_ptr: 0,
+                    int_bytes: GRANT_INT_BYTES as usize,
+                    float_ptr: 0,
+                    float_bytes: grant as usize,
+                },
+            )
+            .expect("a prefill plan");
+            assert!(
+                plan.graph_capturable,
+                "{requests} lanes of {rows} rows decline capture in a {grant}-byte grant: {:?}",
+                plan.graph_refusal
+            );
+        }
     }
 }
