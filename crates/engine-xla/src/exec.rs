@@ -107,10 +107,21 @@ fn bind_and_run(
         .iter()
         .filter_map(|r| r.map(|(_, param)| param))
         .collect();
+    // A readout ring's next plane, still read, refuses the fire before it
+    // takes the pool or anything else.
+    for (at, source) in sig.params.iter().enumerate() {
+        if let (true, Source::Readout { index }) = (donated.contains(&at), source) {
+            pools.readout_ready(*index)?;
+        }
+    }
     let mut taken: Vec<(usize, Buffer)> = Vec::new();
     for (at, source) in sig.params.iter().enumerate() {
-        if let (true, Source::Pool { row, plane }) = (donated.contains(&at), source) {
-            taken.push((at, pools.take(*row, *plane)?));
+        match (donated.contains(&at), source) {
+            (true, Source::Pool { row, plane }) => taken.push((at, pools.take(*row, *plane)?)),
+            (true, Source::Readout { index }) => {
+                taken.push((at, pools.readout_take(device, *index)?));
+            }
+            _ => {}
         }
     }
     let mut args: Vec<Arg<'_>> = Vec::with_capacity(sig.params.len());
@@ -132,7 +143,10 @@ fn bind_and_run(
                 .iter()
                 .find(|(i, _)| *i == input)
                 .and_then(|&(_, at)| pools.bulk_buffer(at)),
-            Source::Temp | Source::Staged { .. } | Source::Streamed { .. } => None,
+            Source::Readout { .. }
+            | Source::Temp
+            | Source::Staged { .. }
+            | Source::Streamed { .. } => None,
         }
         .ok_or_else(|| Fault::Unbound {
             what: format!("parameter {at} ({source:?}), which nothing on this device holds"),
@@ -158,6 +172,7 @@ fn bind_and_run(
     for (out, result) in outs.into_iter().zip(&sig.results) {
         match result {
             Some((Source::Pool { row, plane }, _)) => pools.put(*row, *plane, out),
+            Some((Source::Readout { index }, _)) => pools.readout_put(*index, out),
             Some((other, _)) => {
                 return Err(Fault::Unbound {
                     what: format!("a result aliasing {other:?}, which is not a pool"),

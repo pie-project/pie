@@ -47,6 +47,10 @@ pub enum Source {
     /// (pinned host memory, `crate::store::Pools::bulk`), read through
     /// `to_device` of slices (`crate::inputs::Inputs::bulk`).
     Bulk { input: u32 },
+    /// A readout output's plane, laid at load for the largest readout set
+    /// (`crate::store::Pools::lay_readouts`): one of a ring of buffers a
+    /// fire is handed, writes its readout rows into in place and returns.
+    Readout { index: u16 },
     /// An activation computed by this fire; zeros until written.
     Temp,
     /// A streamed weight (`crate::store::streamed`): it lives in the pool,
@@ -69,7 +73,7 @@ impl Source {
 
     #[must_use]
     pub const fn persistent(self) -> bool {
-        matches!(self, Source::Pool { .. })
+        matches!(self, Source::Pool { .. } | Source::Readout { .. })
     }
 }
 

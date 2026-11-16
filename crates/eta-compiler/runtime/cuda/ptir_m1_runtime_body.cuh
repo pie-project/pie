@@ -363,21 +363,28 @@ __device__ __forceinline__ void ptir_m1_execute(
     for (m1_u32 linear = 0; linear < out0.len; ++linear) {
       m1_u32 rem = linear;
       m1_u32 source_index = 0;
+      // Unrolled to the four dims a descriptor holds, as the region's
+      // broadcast is (`ptir_parallel_broadcast`).
       m1_u32 source_stride[4] = {1, 1, 1, 1};
-      for (int dim = (int)out0.rank - 2; dim >= 0; --dim) {
-        source_stride[dim] =
-            source_stride[dim + 1] *
-            ((m1_u32)(dim + 1) < d0.rank ? d0.dims[dim + 1] : 1u);
+#pragma unroll
+      for (int dim = 2; dim >= 0; --dim) {
+        if (dim <= (int)out0.rank - 2)
+          source_stride[dim] =
+              source_stride[dim + 1] *
+              ((m1_u32)(dim + 1) < d0.rank ? m1_dim(d0, dim + 1) : 1u);
       }
-      for (m1_u32 dim = 0; dim < out0.rank; ++dim) {
+#pragma unroll
+      for (m1_u32 dim = 0; dim < 4u; ++dim) {
+        if (dim >= out0.rank) break;
         m1_u32 stride = 1;
-        for (m1_u32 next = dim + 1; next < out0.rank; ++next)
-          stride *= out0.dims[next];
+#pragma unroll
+        for (m1_u32 next = dim + 1; next < 4u; ++next)
+          if (next < out0.rank) stride *= out0.dims[next];
         if (stride == 0) stride = 1;
         const m1_u32 coordinate = rem / stride;
         rem %= stride;
         const m1_u32 source_dim =
-            dim < d0.rank ? d0.dims[dim] : 1u;
+            dim < d0.rank ? m1_dim(d0, dim) : 1u;
         if (source_dim != 1)
           source_index += coordinate * source_stride[dim];
       }
@@ -748,7 +755,7 @@ __device__ __forceinline__ void ptir_m1_execute(
   }
   if (p.tag == 0x65) {
     const m1_u32 mask_width =
-        d0.rank == 0 ? 1u : d0.dims[d0.rank - 1];
+        d0.rank == 0 ? 1u : m1_dim(d0, d0.rank - 1);
     for (m1_u32 i = 0; i < d0.len; ++i) {
       const m1_u32 column = i % mask_width;
       const m1_u32 word = column >> 5;

@@ -357,7 +357,7 @@ __device__ __forceinline__ void ptir_parallel_elementwise(
       continue;
     }
     if (tag == 0x65u) {
-      const m1_u32 width = d0.rank == 0u ? 1u : d0.dims[d0.rank - 1u];
+      const m1_u32 width = d0.rank == 0u ? 1u : m1_dim(d0, d0.rank - 1u);
       const m1_u32 column = i % width;
       const m1_u32 word = column >> 5;
       const m1_u32 mask =
@@ -464,23 +464,30 @@ __device__ __forceinline__ void ptir_parallel_broadcast(
        linear += blockDim.x) {
     m1_u32 rem = linear;
     m1_u32 source_index = 0;
+    // Every walk over the dims is unrolled to the four a descriptor holds,
+    // so the strides are read at constant indices (`m1_dim`).
     m1_u32 source_stride[4] = {1, 1, 1, 1};
-    for (int dim = (int)output_desc.rank - 2; dim >= 0; --dim) {
-      source_stride[dim] =
-          source_stride[dim + 1] *
-          ((m1_u32)(dim + 1) + skip < input_desc.rank
-               ? input_desc.dims[dim + 1 + skip]
-               : 1u);
+#pragma unroll
+    for (int dim = 2; dim >= 0; --dim) {
+      if (dim <= (int)output_desc.rank - 2)
+        source_stride[dim] =
+            source_stride[dim + 1] *
+            ((m1_u32)(dim + 1) + skip < input_desc.rank
+                 ? m1_dim(input_desc, dim + 1 + skip)
+                 : 1u);
     }
-    for (m1_u32 dim = 0; dim < output_desc.rank; ++dim) {
+#pragma unroll
+    for (m1_u32 dim = 0; dim < 4u; ++dim) {
+      if (dim >= output_desc.rank) break;
       m1_u32 stride = 1;
-      for (m1_u32 next = dim + 1; next < output_desc.rank; ++next)
-        stride *= output_desc.dims[next];
+#pragma unroll
+      for (m1_u32 next = dim + 1; next < 4u; ++next)
+        if (next < output_desc.rank) stride *= output_desc.dims[next];
       if (stride == 0u) stride = 1u;
       const m1_u32 coordinate = rem / stride;
       rem %= stride;
       const m1_u32 source_dim =
-          dim + skip < input_desc.rank ? input_desc.dims[dim + skip] : 1u;
+          dim + skip < input_desc.rank ? m1_dim(input_desc, dim + skip) : 1u;
       if (source_dim != 1u)
         source_index += coordinate * source_stride[dim];
     }

@@ -19,6 +19,11 @@ Legend: ✅ verified on hardware · 🟡 in progress / compile-only · 🔴 not 
 | Snapshots (rs_snapshots) | ✅ | ✅ | ✅ | ✅ VK3 (4 a lane, per piece; conv, GDN, KDA) | ✅ VK3 | 🔴 XLA | — |
 | K2 (no kv spaces) | ✅ M39 | ✅ | ✅ M42 | compile | compile | compile | compile |
 
+XLA/TPU serving correctness (TPU session): gated delta: served tokens equal the CUDA reference (Qwen3.5-0.8B, 64
+greedy; v6e against L40S, identical ids and text, 38 prompt tokens). Mamba-2 and KDA kernels: unverified in serving,
+their kernel tests fail the same way (`kernels_ssm`: right magnitude, wrong element, a test-side layout under
+investigation). A Mamba-2 or KDA model served on XLA before that investigation gets the same token check first.
+
 Cerebras realization (CB, `sc/cb-chunk-pool`): the column is the host-traced `Cerebras` engine. State lives in
 one host chunk arena (shared, unpinned shapes: the kv list, one window list of the widest window with T_w = kv
 page, the fixed record cut into equal word-range pieces, the rs list with T_rs = kv page); each fire stages the
@@ -134,3 +139,15 @@ the kernel takes 32-token kv pages only and a served model's chunk plan builds 1
 fell through silently (to the scalar tiled kernel at 128 until sc/mac-sdpa-mma128; the load now says which form runs).
 
 Owners: L40S (CUDA), AMD (ROCm), BM agent (Metal, Mac Studio), VK agent (Vulkan + wgpu), TPU session (XLA/TPU, with hardware; took over sc/xla2), TIER agent (host/disk tiers), CB agent (Cerebras, sc/cb-chunk-pool; no hardware — lib tests + host simulation, rest unverified).
+
+Open no-regression item, short-burst first fire (CUDA sm_120, Qwen3-0.6B, sc/np-batch-rows): 64 short prompts
+arriving together reach every first token in 0.049-0.052 s against main's 0.042-0.046 s (~5 ms). The batch ask
+counts rows, so the burst is one fire of 64 lanes x 32 rows at cap 2048 (the tip ran 32 fires of 2 lanes at 0.111
+s), but the rung steps 1 -> 32 -> 64 -> 2048 before that fire. Owner: the rung shape, whose raise always fits and
+goes straight to min(rows asked, r_top) in one step; its gate reruns this row and must close it.
+
+Open no-regression item, over-demand under a device budget (Vulkan, Qwen3-0.6B, 256 single-lane greedy requests
+of 128 + 160 tokens, budget_device 7597 MiB, sc/np-batch-rows): the wide ask raises toward the wave's rows and
+today's lending moves live state out of the span: 89 against the tip's 62 evictions, 286 against 47 grow waits,
+145 against 20 process waits (both complete 256/256 with no fault). Owner: the rung shape, whose raise only clears
+cache; its gate reruns this over-demand and must come in at or under the tip's counts.
