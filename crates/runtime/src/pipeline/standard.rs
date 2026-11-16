@@ -273,9 +273,9 @@ mod tests {
     }
 
     /// The regions `backend`'s emitter gives a program, each by its text
-    /// under one symbol: what engine-cuda keys a region's module by. For
-    /// `wgsl`, the step calls its stages dispatch, each by its module's
-    /// text: the pipelines engine-vulkan and engine-wgpu run it on.
+    /// under one symbol: what engine-cuda and engine-metal key a region's
+    /// module by. For `wgsl`, the step calls its stages dispatch, each by its
+    /// module's text: the pipelines engine-vulkan and engine-wgpu run it on.
     fn regions(traced: &Traced, backend: &str) -> std::collections::BTreeSet<String> {
         use eta_compiler::codegen::wgsl;
         let mut registry =
@@ -339,7 +339,7 @@ mod tests {
                 for (pass, (built, asked)) in
                     ["prompt", "decode"].iter().zip(built.iter().zip(&asked))
                 {
-                    for backend in ["cuda", "wgsl"] {
+                    for backend in ["cuda", "metal", "wgsl"] {
                         let (built, asked) = (regions(&built.1, backend), regions(asked, backend));
                         assert!(
                             !built.is_empty(),
