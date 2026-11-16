@@ -87,11 +87,17 @@ fn fire_and_compare(graphs: Graphs) {
     // in every fire (they hold no state, so each fire is the same).
     let longest = lanes.iter().map(Vec::len).max().unwrap_or(0);
     for row in 0..longest {
+        let reads: Vec<[u32; 1]> = lanes
+            .iter()
+            .map(|tokens| [row.min(tokens.len() - 1) as u32])
+            .collect();
         let seated: Vec<Seated<'_>> = lanes
             .iter()
+            .zip(&reads)
             .enumerate()
-            .map(|(slot, tokens)| Seated {
+            .map(|(slot, (tokens, read))| Seated {
                 kv_less: true,
+                readout: Some(read.as_slice()),
                 ..Seated::of(Lane {
                     slot: slot as u32,
                     word: trace.facts.word(&Request::new(tokens.len() as u32, false)),
@@ -108,10 +114,11 @@ fn fire_and_compare(graphs: Graphs) {
             let at = row.min(tokens.len() - 1);
             let next = shifted(tokens)[at];
             assert_eq!(got.len(), w, "lane {lane}: the one row read out");
+            let fed = (0..VOCAB as usize).find(|&id| &table[id * w..][..w] == got.as_slice());
             assert_eq!(
-                got.as_slice(),
-                &table[next as usize * w..][..w],
-                "{graphs:?} lane {lane} row {at}: fed token {next}, the lane's next"
+                fed,
+                Some(next as usize),
+                "{graphs:?} lane {lane} row {at} of {tokens:?}: fed token {next}, the lane's next"
             );
         }
     }
