@@ -7,6 +7,14 @@
 //! loop binds: the prompt's last fire and the decode fire. An engine keys a
 //! program's regions by their text, which a request's knob values do not
 //! change, so a request of one of these shapes builds nothing.
+//!
+//! The limit: the channels and ports a pass binds here mirror the built-in
+//! inferlets' generation loop (compat's `generate`), not taken from it.
+//! compat builds in its own wasm32-wasip3 workspace and the SDK's `Channel`
+//! and `ForwardPass` call WIT imports, so the runtime cannot trace compat
+//! itself; a change to that loop's channels or ports (not to the sampler's
+//! stage bodies) is not caught by this module's test, and its programs
+//! then build at registration, counted in `Tally::BuiltAfterReady`.
 
 use eta_dsl::Traced;
 use eta_dsl::prelude::*;
