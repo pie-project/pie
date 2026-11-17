@@ -57,6 +57,56 @@ pub fn ring_facts(
     })
 }
 
+/// A registration prepared on the engine's thread ([`Plane::prepare_register`]):
+/// [`Registering::compile`] runs its compile on any thread.
+pub struct Registering {
+    hash: u64,
+    step: Step,
+}
+
+enum Step {
+    Registered(ProgramId),
+    Held(ExecPlan, Compiled),
+    Run(ExecPlan, compile::Job),
+}
+
+/// A registration compiled ([`Registering::compile`]), for
+/// [`Plane::finish_register`] on the engine's thread.
+pub struct Registered {
+    hash: u64,
+    step: Done,
+}
+
+enum Done {
+    Registered(ProgramId),
+    Held(ExecPlan, Compiled),
+    Built(ExecPlan, compile::Built),
+}
+
+// SAFETY: a registration in flight holds its plan, its compiled stages
+// (immutable libraries and pipeline states, which Metal states safe from any
+// thread) and a compile job (`compile::Job`); one thread holds it at a time.
+#[allow(unsafe_code)]
+unsafe impl Send for Registering {}
+#[allow(unsafe_code)]
+unsafe impl Send for Registered {}
+
+impl Registering {
+    /// Builds the libraries and pipelines the cache did not hold: the slow
+    /// half of a registration, on whatever thread runs it.
+    #[must_use]
+    pub fn compile(self) -> Registered {
+        Registered {
+            hash: self.hash,
+            step: match self.step {
+                Step::Registered(id) => Done::Registered(id),
+                Step::Held(plan, compiled) => Done::Held(plan, compiled),
+                Step::Run(plan, job) => Done::Built(plan, job.run()),
+            },
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Program {
     pub id: ProgramId,
@@ -192,11 +242,27 @@ impl Plane {
         context: &Context,
         registration: &ProgramRegistration,
     ) -> Result<ProgramId> {
+        let registering = self.prepare_register(context, registration)?;
+        self.finish_register(registering.compile())
+    }
+
+    /// The first half of a registration, on the engine's thread
+    /// (`engine::Engine::prepare_program`): the program held already, or
+    /// its plan and the compile of the stages the cache does not hold,
+    /// which [`Registering::compile`] runs on any thread.
+    pub fn prepare_register(
+        &mut self,
+        context: &Context,
+        registration: &ProgramRegistration,
+    ) -> Result<Registering> {
         if let Some(&existing) = self.by_hash.get(&registration.program_hash) {
-            return Ok(existing);
+            return Ok(Registering {
+                hash: registration.program_hash,
+                step: Step::Registered(existing),
+            });
         }
         let plan = adopt_launch_package(registration.launch.clone())?;
-        let compiled = self.cache.compile(
+        let planned = self.cache.plan(
             context,
             registration.program_hash,
             &plan,
@@ -204,19 +270,40 @@ impl Plane {
             Versions::from_compiler(registration.emitter_version),
             Target::of(context)?,
         )?;
+        Ok(Registering {
+            hash: registration.program_hash,
+            step: match planned {
+                compile::Planned::Held(compiled) => Step::Held(plan, compiled),
+                compile::Planned::Run(job) => Step::Run(plan, job),
+            },
+        })
+    }
 
+    /// The second half, on the engine's thread
+    /// (`engine::Engine::finish_program`): the compiled program taken in and
+    /// its id. A program of the same hash registered meanwhile answers that
+    /// one's id.
+    pub fn finish_register(&mut self, registered: Registered) -> Result<ProgramId> {
+        if let Some(&existing) = self.by_hash.get(&registered.hash) {
+            return Ok(existing);
+        }
+        let (plan, compiled) = match registered.step {
+            Done::Registered(id) => return Ok(id),
+            Done::Held(plan, compiled) => (plan, compiled),
+            Done::Built(plan, built) => (plan, self.cache.finish(built)?),
+        };
         let id = ProgramId(self.next_program);
         self.next_program += 1;
         self.programs.insert(
             id,
             Program {
                 id,
-                hash: registration.program_hash,
+                hash: registered.hash,
                 plan,
                 compiled,
             },
         );
-        self.by_hash.insert(registration.program_hash, id);
+        self.by_hash.insert(registered.hash, id);
         Ok(id)
     }
 
