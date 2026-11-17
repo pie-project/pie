@@ -1912,20 +1912,16 @@ fn pick(
     let fastest = timings
         .iter()
         .fold(f32::INFINITY, |best, &(_, ms, _)| best.min(ms));
-    // One pass leaves a plateau of near-equal tactics ordered by noise: the
-    // fastest few within reach of the fastest are timed again in turns (a
-    // drift in the device's speed falling on each alike), and of those whose
-    // medians tie the earliest (cuBLAS's own ranking) is kept.
-    // The finalists are the fastest few within reach, not the first few:
-    // a plateau of cuBLASLt heuristics would otherwise crowd out the
-    // candidates timed after them. They keep the candidates' order, so a tie
-    // still keeps the earliest.
-    let mut reach: Vec<usize> = (0..timings.len())
+    // One pass leaves a plateau of near-equal tactics ordered by noise: every
+    // one within reach of the fastest is timed again in turns (a drift in the
+    // device's speed falling on each alike), and of those whose medians agree
+    // with the best (`AGREEMENT`) the earliest (cuBLAS's own ranking, the
+    // lowest tactic id) is kept, so two tunes write the same pick. The
+    // finalists keep the candidates' order; none is cut for a noisy first
+    // pass, which would leave the earliest out of one tune's final.
+    let reach: Vec<usize> = (0..timings.len())
         .filter(|&i| timings[i].1 <= fastest * FINAL_REACH)
         .collect();
-    reach.sort_by(|&a, &b| timings[a].1.total_cmp(&timings[b].1));
-    reach.truncate(FINALISTS);
-    reach.sort_unstable();
     let mut finals: Vec<(Tactic, f32, Vec<f32>)> = reach
         .into_iter()
         .map(|i| {
@@ -1956,13 +1952,18 @@ fn pick(
         .map_or(candidates[0], |&(candidate, _)| candidate)
 }
 
-/// A tactic within this factor of the fastest's first timing is a finalist,
-/// the first this many such, each timed this many times more; finalists'
-/// medians within the last factor of the best tie.
-const FINAL_REACH: f32 = 1.05;
-const FINALISTS: usize = 8;
+/// Two timings within this fraction of each other agree: the tolerance a
+/// profile's search shares.
+// TODO: `profile::AGREEMENT` (sc/xla-search-ties) once this base has it.
+const AGREEMENT: f32 = 0.05;
+/// Finalists' medians within the agreement of the best tie, and the earliest
+/// of them (the lowest tactic id: the candidates' order) is kept.
+const FINAL_TIE: f32 = 1.0 + AGREEMENT;
+/// A tactic within twice the agreement of the fastest's first timing is a
+/// finalist, each timed this many times more: one pass's noise does not
+/// keep a tie out of the final.
+const FINAL_REACH: f32 = 1.0 + 2.0 * AGREEMENT;
 const FINAL_ROUNDS: usize = 4;
-const FINAL_TIE: f32 = 1.02;
 
 fn inner_shape(algo: &lt::cublasLtMatmulAlgo_t) -> u16 {
     let mut shape: u16 = 0;
