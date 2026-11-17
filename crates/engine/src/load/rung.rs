@@ -869,9 +869,16 @@ mod tests {
                     [(m, 64, 64, r), (m, 256, 256, 2.0 * r)]
                 })
                 .collect(),
-            // At width 8: 0.25 a ns at one key, 1 at 16 and past; at width
+            // At width 8: 0.25 a ns at one key, 0.5 at 4, 1 at 16; at width
             // 32 twice that.
-            attn_grid: vec![(1, 8, 0.25), (16, 8, 1.0), (1, 32, 0.5), (16, 32, 2.0)],
+            attn_grid: vec![
+                (1, 8, 0.25),
+                (4, 8, 0.5),
+                (16, 8, 1.0),
+                (1, 32, 0.5),
+                (4, 32, 1.0),
+                (16, 32, 2.0),
+            ],
             attn_head_dim: 8,
             scan_by_tokens: vec![(1, 2.0), (16, 4.0)],
             bytes_per_ns: 4.0,
@@ -1051,9 +1058,13 @@ mod tests {
         let prompt = RungFacts { tokens: 8, ..r };
         let t = e.terms(&prompt);
         assert_eq!(t.attention, 64.0);
-        // 4 keys, halfway from 1 to 16 in log keys: 0.625 a ns.
+        // 4 keys read where they were timed, 0.5 a ns: never between keys.
         let short = RungFacts { keys: 4, ..prompt };
-        assert!((e.terms(&short).attention - 8.0 * 4.0 * 0.5 / 0.625).abs() < 1e-9);
+        assert!((e.terms(&short).attention - 8.0 * 4.0 * 0.5 / 0.5).abs() < 1e-9);
+        // 8 keys the grid does not state: no rate (`choose` refuses such a
+        // rung by name before the estimate weighs it).
+        let between = RungFacts { keys: 8, ..prompt };
+        assert_eq!(e.terms(&between).attention, 0.0);
         // A model of 32-wide heads reads the grid at its width: 2 a ns at 16
         // keys, half the time; one of 16, halfway in log width, 1.5.
         let wide = FireEstimate {
