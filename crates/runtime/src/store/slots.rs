@@ -1530,6 +1530,32 @@ impl SlotPool {
         u32::try_from(self.chunk_runs_for(run, true).len()).unwrap_or(u32::MAX)
     }
 
+    /// Runs of `run` adjacent chunks the segments still to commit hold
+    /// below the activation: uncommitted segments under the top rung's
+    /// span that the engine binds ([`Self::backs`]), the room
+    /// [`super::shared::SharedPool::grow_step`] commits into, counted no
+    /// further than what the pool may grow to ([`Self::growable_chunks`]).
+    /// What a guest bind short of a free run waits on a commit for; none
+    /// where no segment is left to commit within the budget.
+    #[must_use]
+    pub fn committable_runs(&self, run: u32) -> u32 {
+        let run = run.max(1);
+        if run > self.segments.segment_chunks() {
+            return 0;
+        }
+        let limit = self.live_limit().min(self.state_limit()).min(self.ceiling);
+        let runs: u32 = self
+            .segments
+            .uncommitted()
+            .filter(|&segment| segment < self.top_segment && self.backs(segment))
+            .map(|segment| {
+                let range = self.segments.range(segment);
+                range.end.min(limit).saturating_sub(range.start) / run
+            })
+            .sum();
+        runs.min(self.growable_chunks() / run)
+    }
+
     /// `pieces` runs of `run` adjacent free chunks for `holder`, each run
     /// inside one segment, the lowest first, each chunk opened for `shape`
     /// and all its slots taken: refs in order, a run's chunks in physical

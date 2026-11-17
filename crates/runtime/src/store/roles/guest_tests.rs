@@ -79,14 +79,25 @@ fn facts(total: u32) -> ChunkFacts {
 /// [`facts`] in segments of `segment` chunks, all committed.
 fn facts_in(total: u32, segment: u32) -> ChunkFacts {
     let segments = total.div_ceil(segment);
+    facts_committed(total, segment, segments)
+}
+
+/// [`facts_in`] with the lowest `committed` segments committed at load
+/// (and the top rung's span), the rest the pool's to commit as it grows.
+fn facts_committed(total: u32, segment: u32, committed: u32) -> ChunkFacts {
+    let segments = total.div_ceil(segment);
     let facts = ChunkFacts {
         chunk_bytes: CHUNK,
         total_chunks: total,
         segment_chunks: segment,
         segments: SegmentFacts {
-            committed: segments,
+            committed,
             max: segments,
-            growth: Growth::Fixed,
+            growth: if committed == segments {
+                Growth::Fixed
+            } else {
+                Growth::Bottom
+            },
         },
         reserved: vec![ReservedRun {
             what: Reserved::Null,
@@ -718,12 +729,15 @@ fn a_run_is_refused_by_name_where_only_scattered_chunks_are_free() {
                 pieces: 1,
                 free_runs: 0,
                 free_chunks: free,
+                committable: 0,
             },
         }),
         "{named}"
     );
     assert!(
-        named.contains("1 runs of 3 adjacent chunks") && named.contains("0 such runs were free"),
+        named.contains("1 runs of 3 adjacent chunks")
+            && named.contains("0 such runs were free")
+            && named.contains("no segment is left to commit within the budget"),
         "{named}"
     );
     assert_eq!(held(&device), before, "the refused bind took nothing");
@@ -804,6 +818,7 @@ fn mixed_runs_bound_and_closed_then_a_long_run_lands_or_is_refused_by_name() {
                     pieces: 1,
                     free_runs: 0,
                     free_chunks: free,
+                    committable: 0,
                 }),
                 "{named}"
             );
@@ -824,5 +839,109 @@ fn mixed_runs_bound_and_closed_then_a_long_run_lands_or_is_refused_by_name() {
         } else {
             ""
         },
+    );
+}
+
+/// A pool with one segment committed (and the top rung's span), filled,
+/// and five segments left to commit: a guest bind needing a run of 3 finds
+/// no free run and waits on a segment commit (`RolesError::GuestGrow`),
+/// counted short in the pool so the walk's next step commits segment 1;
+/// once it is committed the wait ends, the bind lands in it, and the count
+/// is cleared. With no segment left to commit, the wait is refused by name.
+#[tokio::test(flavor = "current_thread")]
+async fn a_guest_bind_short_of_a_run_commits_the_next_segment_and_binds() {
+    use crate::governor::PoolTarget;
+    const ENGINE: usize = 61;
+    let Pools { device, roles } = pools_of(facts_committed(64, 8, 1));
+    assert_eq!(device.lock().unwrap().pool().prefix_segments(), 1);
+    // Every committed chunk live state may take, a chunk an instance:
+    // segment 0's beside the null chunk, and the top span's segment's
+    // below the span.
+    let (singles, mut single) = runs_of(9, 1, 1, 1000);
+    for by in 0.. {
+        if bind_as(&roles, &mut single, singles, 500 + by).is_err() {
+            break;
+        }
+    }
+    assert_eq!(device.lock().unwrap().pool().free_chunk_runs(1), 0, "full");
+    let live = device.lock().unwrap().pool().demand().live;
+    let (program, mut engine) = runs_of(8, 3, 1, 0);
+    let error = bind_as(&roles, &mut engine, program, 1).expect_err("no free run");
+    let Some(RolesError::GuestGrow {
+        room, prefix, run, ..
+    }) = error.downcast_ref::<RolesError>()
+    else {
+        panic!("waits on a commit: {error}");
+    };
+    assert_eq!((*prefix, *run), (1, 3));
+    assert!(
+        matches!(room, super::GuestRoom::Runs { run: 3, pieces: 1, free_runs: 0, committable, .. } if *committable > 0),
+        "{room:?}"
+    );
+    assert!(engine.bindings.is_empty(), "the engine was not asked");
+    {
+        let pool = device.lock().unwrap();
+        let demand = pool.pool().demand();
+        assert_eq!(demand.live, live, "nothing taken");
+        assert_eq!(demand.wanted - demand.live, 3 * CHUNK, "counted short");
+    }
+    // The walk, the governor's target above what is mapped, commits the
+    // next segment for it: the step a kv admission short of room waits on.
+    let mut grow = crate::store::shared::SharedGrow::new(0, ENGINE, device.clone());
+    let _ = grow.retarget(u64::from(u32::MAX));
+    assert_eq!(
+        grow.live_step_for_test(),
+        Some(crate::store::shared::GrowStep::Commit { prefix: 2 })
+    );
+    let wait = super::grow_for_guest(&device, ENGINE, *prefix, *run);
+    tokio::pin!(wait);
+    assert!(
+        futures::poll!(wait.as_mut()).is_pending(),
+        "it waits on the commit"
+    );
+    // What the walk does once the engine backed it.
+    device.lock().unwrap().committed(2);
+    crate::store::shared::rung_changed(ENGINE);
+    assert_eq!(wait.await, Ok(()));
+    bind_as(&roles, &mut engine, program, 1).expect("it binds in the new segment");
+    let piece = &pieces_of(&device, &engine.bindings[0].scratch)[0];
+    assert_eq!(piece, &[(8, 1), (9, 1), (10, 1)], "segment 1's first run");
+    let demand = device.lock().unwrap().pool().demand();
+    assert_eq!(demand.wanted, demand.live, "no longer counted short");
+
+    // Every segment committed and full: no segment is left to commit, and
+    // the bind is refused by name.
+    let Pools { device, roles } = pools_of(facts_in(64, 8));
+    let (singles, mut single) = runs_of(9, 1, 1, 1000);
+    for by in 0.. {
+        if bind_as(&roles, &mut single, singles, 500 + by).is_err() {
+            break;
+        }
+    }
+    let (program, mut engine) = runs_of(8, 3, 1, 0);
+    let error = bind_as(&roles, &mut engine, program, 1).expect_err("no room left");
+    let named = error.to_string();
+    assert!(
+        matches!(
+            error.downcast_ref::<RolesError>(),
+            Some(RolesError::GuestShort {
+                room: super::GuestRoom::Runs { committable: 0, .. },
+                ..
+            })
+        ),
+        "{named}"
+    );
+    assert!(
+        named.contains("no segment is left to commit within the budget"),
+        "{named}"
+    );
+    let prefix = device.lock().unwrap().pool().prefix_segments();
+    assert_eq!(
+        super::grow_for_guest(&device, ENGINE, prefix, 3).await,
+        Err(
+            "no free run of 3 adjacent chunks, and no segment is left to commit within the \
+             budget"
+                .into()
+        )
     );
 }

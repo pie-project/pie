@@ -136,6 +136,22 @@ pub enum RolesError {
         bytes: u64,
         room: GuestRoom,
     },
+    /// No free run holds the guest state, and a segment still to commit
+    /// within the budget would: the bind waits on the walk to commit one
+    /// ([`grow_for_guest`]), as a kv admission short of room does, and is
+    /// sent again once the committed prefix passes `prefix`. The pool
+    /// counts what it is short ([`GUEST_WAITER`]) toward the walk's goal.
+    #[error(
+        "{what}, {bytes} bytes of Instance slots, waits on a segment commit: {room}; the \
+         committed prefix is {prefix} segments"
+    )]
+    GuestGrow {
+        what: String,
+        bytes: u64,
+        room: GuestRoom,
+        run: u32,
+        prefix: u32,
+    },
     #[error(
         "no chunk has {slots} adjacent free {role:?} slots for an item that must lie in one run"
     )]
@@ -153,12 +169,20 @@ pub enum RolesError {
     },
 }
 
+/// The pool's waiter id for what guest binds are short
+/// ([`super::slots::SlotPool::wait`]): counted toward the walk's goal while
+/// a bind waits on a segment commit ([`RolesError::GuestGrow`]).
+pub const GUEST_WAITER: u64 = u64::MAX - 1;
+
 /// What a guest state asked of the pool, and what was free, where a bind
-/// is refused for want of it ([`RolesError::GuestShort`]).
+/// is refused or waits for want of it ([`RolesError::GuestShort`],
+/// [`RolesError::GuestGrow`]); `committable`, the runs of that length (a
+/// chunk, for a run of slots) the segments still to commit within the
+/// budget hold ([`super::slots::SlotPool::committable_runs`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuestRoom {
     /// One run of `slots` adjacent `Instance` slots in a chunk.
-    Slots { slots: u32 },
+    Slots { slots: u32, committable: u32 },
     /// `pieces` runs of `run` adjacent whole chunks, each inside one
     /// segment, and the free runs of that length and free chunks there
     /// were.
@@ -167,22 +191,61 @@ pub enum GuestRoom {
         pieces: u32,
         free_runs: u32,
         free_chunks: u32,
+        committable: u32,
     },
 }
 
-impl std::fmt::Display for GuestRoom {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl GuestRoom {
+    fn committable(self) -> u32 {
         match self {
-            Self::Slots { slots } => write!(f, "no chunk has a run of {slots} free slots"),
+            Self::Slots { committable, .. } | Self::Runs { committable, .. } => committable,
+        }
+    }
+
+    fn with_committable(self, runs: u32) -> Self {
+        match self {
+            Self::Slots { slots, .. } => Self::Slots {
+                slots,
+                committable: runs,
+            },
             Self::Runs {
                 run,
                 pieces,
                 free_runs,
                 free_chunks,
+                ..
+            } => Self::Runs {
+                run,
+                pieces,
+                free_runs,
+                free_chunks,
+                committable: runs,
+            },
+        }
+    }
+}
+
+impl std::fmt::Display for GuestRoom {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Slots { slots, .. } => write!(f, "no chunk has a run of {slots} free slots")?,
+            Self::Runs {
+                run,
+                pieces,
+                free_runs,
+                free_chunks,
+                ..
             } => write!(
                 f,
                 "{pieces} runs of {run} adjacent chunks inside one segment asked, and \
                  {free_runs} such runs were free ({free_chunks} free chunks)"
+            )?,
+        }
+        match self.committable() {
+            0 => write!(f, ", and no segment is left to commit within the budget"),
+            runs => write!(
+                f,
+                ", and the segments left to commit within the budget hold {runs} more"
             ),
         }
     }
@@ -228,9 +291,23 @@ impl Part {
                 pieces: self.pieces,
                 free_runs: 0,
                 free_chunks: 0,
+                committable: 0,
             }
         } else {
-            GuestRoom::Slots { slots: self.run }
+            GuestRoom::Slots {
+                slots: self.run,
+                committable: 0,
+            }
+        }
+    }
+
+    /// The run of chunks a piece takes and the pieces: a run of slots
+    /// takes one chunk.
+    fn chunk_runs(&self) -> (u32, u32) {
+        if self.pieces > 0 {
+            (self.chunks, self.pieces)
+        } else {
+            (1, 1)
         }
     }
 }
@@ -526,8 +603,11 @@ impl Roles {
     }
 
     /// Room on the device for `bytes` of guest scratch (`what`) in pieces
-    /// of `run` chunks ([`Self::scratch_part`]); all or none, refused by
-    /// name with what it asked and what was free.
+    /// of `run` chunks ([`Self::scratch_part`]); all or none. Where no
+    /// free run holds it and the segments still to commit within the
+    /// budget would, the pool counts it short ([`GUEST_WAITER`]) and the
+    /// bind waits on a commit ([`RolesError::GuestGrow`]); else it is
+    /// refused by name, with what it asked and what was free.
     fn take_scratch(
         &self,
         bytes: u64,
@@ -535,10 +615,39 @@ impl Roles {
         what: impl Fn() -> String,
     ) -> Result<Part, RolesError> {
         let part = self.scratch_part(bytes, run)?;
-        self.retake(&part).map_err(|room| RolesError::GuestShort {
+        let shape = self.shape(SlotRole::Instance)?;
+        let room = match self.retake(&part) {
+            Ok(part) => {
+                self.device.lock().unwrap().pool_mut().unwait(GUEST_WAITER);
+                return Ok(part);
+            }
+            Err(room) => room,
+        };
+        let (chunks, pieces) = part.chunk_runs();
+        let mut device = self.device.lock().unwrap();
+        let pool = device.pool_mut();
+        let free = match room {
+            GuestRoom::Runs { free_runs, .. } => free_runs,
+            GuestRoom::Slots { .. } => 0,
+        };
+        let committable = pool.committable_runs(chunks);
+        let room = room.with_committable(committable);
+        if free.saturating_add(committable) < pieces {
+            pool.unwait(GUEST_WAITER);
+            return Err(RolesError::GuestShort {
+                what: what(),
+                bytes,
+                room,
+            });
+        }
+        let slots = u64::from(chunks) * u64::from(pieces) * u64::from(self.chunk_slots);
+        pool.wait(GUEST_WAITER, shape.pool, slots);
+        Err(RolesError::GuestGrow {
             what: what(),
             bytes,
             room,
+            run: chunks,
+            prefix: pool.prefix_segments(),
         })
     }
 
@@ -568,6 +677,7 @@ impl Roles {
                 pieces,
                 free_runs,
                 free_chunks,
+                committable: 0,
             }),
             Err(_) => Err(like.room()),
         }
@@ -616,10 +726,14 @@ impl Roles {
         for part in like {
             let took = match (part.dead(), device) {
                 (false, _) => self.take(on, part.role, part.refs.len() as u32, part.contiguous),
-                (true, true) => self.retake(part).map_err(|room| RolesError::GuestShort {
-                    what: "a parked guest state coming back".into(),
-                    bytes: self.dead_bytes(part),
-                    room,
+                (true, true) => self.retake(part).map_err(|room| {
+                    let (run, _) = part.chunk_runs();
+                    let committable = self.device.lock().unwrap().pool().committable_runs(run);
+                    RolesError::GuestShort {
+                        what: "a parked guest state coming back".into(),
+                        bytes: self.dead_bytes(part),
+                        room: room.with_committable(committable),
+                    }
                 }),
                 (true, false) => Ok(Part {
                     refs: Vec::new(),
@@ -1375,25 +1489,43 @@ pub fn bind_instance(
 /// resident, so each bind again follows a restore. A wait that ends
 /// otherwise (the process failed or ended) is the bind's refusal.
 ///
+/// Short of a free run for its guest state where a segment still to
+/// commit within the budget holds one ([`RolesError::GuestGrow`]), it
+/// waits by `grown(prefix, run)` ([`grow_for_guest`]: the walk commits a
+/// segment past the committed prefix `prefix`, as it does for a kv
+/// admission short of room) and binds again; a wait that ends with no
+/// segment left to commit is the bind's refusal.
+///
 /// This is not a retry: nothing is attempted again on the chance it now
 /// fits, and nothing is degraded or made smaller. The bind is sent again
-/// only after the planner has restored `pid`, the event the refusal named,
-/// exactly as a fire held back by a suspension is sent after its restore.
-pub async fn bind_when_resident<T, E, B, W>(
+/// only after the planner has restored `pid`, or the walk has committed a
+/// segment, the event the refusal named, exactly as a fire held back by a
+/// suspension is sent after its restore.
+pub async fn bind_when_resident<T, E, B, W, G>(
     pid: Holder,
     mut bind: impl FnMut() -> B,
     resident: impl Fn() -> W,
+    grown: impl Fn(u32, u32) -> G,
 ) -> anyhow::Result<T>
 where
     E: std::fmt::Display,
     B: std::future::Future<Output = anyhow::Result<T>>,
     W: std::future::Future<Output = Result<(), E>>,
+    G: std::future::Future<Output = Result<(), String>>,
 {
     loop {
         let error = match bind().await {
             Ok(bound) => return Ok(bound),
             Err(error) => error,
         };
+        if let Some(&RolesError::GuestGrow { prefix, run, .. }) = error.downcast_ref::<RolesError>()
+        {
+            tracing::debug!(%pid, %error, "a bind waits on a segment commit");
+            if let Err(why) = grown(prefix, run).await {
+                return Err(error.context(format!("refused: {why}")));
+            }
+            continue;
+        }
         let parked_with_it = matches!(
             error.downcast_ref::<RolesError>(),
             Some(RolesError::Parked { holder: Some(holder), .. }) if *holder == pid
@@ -1407,6 +1539,44 @@ where
                 "its process was suspended and is not resident again: {why}"
             )));
         }
+    }
+}
+
+/// Waits until the walk of `engine`'s pool `shared` commits a segment past
+/// the committed prefix `prefix`, for a guest bind short of a free run of
+/// `run` chunks ([`RolesError::GuestGrow`]): the walk is asked to look
+/// ([`crate::store::shared::ask_walk`]) and the wait is on the event a
+/// commit tells ([`crate::store::shared::rung_watch`]), never a clock; the
+/// walk's goal counts what the bind is short ([`GUEST_WAITER`]), within the
+/// governor's target and yield, as it counts a kv admission's. Refused
+/// (`Err`) once no segment is left to commit within the budget, the
+/// pool's count of it cleared.
+pub async fn grow_for_guest(
+    shared: &Shared,
+    engine: usize,
+    prefix: u32,
+    run: u32,
+) -> Result<(), String> {
+    loop {
+        // Armed before the look: a commit between the two is not lost.
+        let watch = crate::store::shared::rung_watch(engine);
+        tokio::pin!(watch);
+        watch.as_mut().enable();
+        {
+            let mut pool = shared.lock().unwrap();
+            if pool.pool().prefix_segments() > prefix {
+                return Ok(());
+            }
+            if pool.pool().committable_runs(run) == 0 {
+                pool.pool_mut().unwait(GUEST_WAITER);
+                return Err(format!(
+                    "no free run of {run} adjacent chunks, and no segment is left to commit \
+                     within the budget"
+                ));
+            }
+        }
+        crate::store::shared::ask_walk(engine);
+        watch.await;
     }
 }
 

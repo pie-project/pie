@@ -603,6 +603,9 @@ impl SharedGrow {
                     }
                     if let Some(prefix) = commit {
                         self.shared.lock().unwrap().committed(prefix);
+                        // A guest bind short of a run waits on this
+                        // (`roles::grow_for_guest`).
+                        super::rung_changed(self.engine);
                         if let Some(planner) = crate::planner::planner_for(self.model, self.engine)
                         {
                             planner.pages_freed();

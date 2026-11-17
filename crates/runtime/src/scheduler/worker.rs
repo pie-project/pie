@@ -1156,8 +1156,23 @@ impl SchedulerHandle {
                 None => Err(crate::planner::PlannerError::Cancelled),
             }
         };
+        // Short of a free run for its guest state, it waits on the walk to
+        // commit a segment, as a kv admission does, never refused while a
+        // segment is left to commit within the budget.
+        let engine = bind.engine_id;
+        let grown = |prefix: u32, run: u32| async move {
+            let shared = crate::store::registry::try_get(0, engine)
+                .and_then(|stores| stores.shared)
+                .ok_or_else(|| format!("engine {engine} has no shared pool to grow"))?;
+            crate::inferlet::process::said(
+                "bind: a segment for its guest state",
+                pid,
+                crate::store::roles::grow_for_guest(&shared, engine, prefix, run),
+            )
+            .await
+        };
         let (registered, _, bound) =
-            crate::store::roles::bind_when_resident(pid, lane_bind, resident).await?;
+            crate::store::roles::bind_when_resident(pid, lane_bind, resident, grown).await?;
         Ok((registered, bound))
     }
 
