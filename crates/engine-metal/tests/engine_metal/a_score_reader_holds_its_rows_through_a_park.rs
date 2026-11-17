@@ -93,14 +93,20 @@ pub(super) fn reader(context: u32) -> ProgramRegistration {
 
 /// A score reader of the load's context bound for a lane of `rows` rows
 /// (a prompt, or a decode of one), its tables in `Instance` chunk `chunk`
-/// and its ring in `Channel` chunk `chunk + 2`: the instance and the
-/// slots it holds.
+/// and its ring in `Channel` chunk `chunk + 2`, its guest state after its
+/// tables (`crate::guest_places`): the instance, the slots it holds and
+/// where its scratch and its pair's tables lie.
 pub(super) fn bind_reader(
     shell: &mut Shell,
     program: engine::ProgramId,
     rows: u32,
     chunk: u32,
-) -> (engine::InstanceId, Vec<u32>, Vec<engine::RingSlots>) {
+) -> (
+    engine::InstanceId,
+    Vec<u32>,
+    Vec<engine::RingSlots>,
+    (engine::ScratchPlace, engine::ScratchPlace),
+) {
     let facts = shell.program_facts(program).expect("the reader's facts");
     let layout = shell.pool_layout();
     let instance = layout.instance.expect("an instance shape");
@@ -120,25 +126,29 @@ pub(super) fn bind_reader(
             }
         })
         .collect();
+    let extents = eta_exec::Extents {
+        row_count: rows,
+        token_count: rows,
+        sampled_rows: 1,
+        query_len: rows,
+        ..eta_exec::Extents::default()
+    };
+    let (scratch, pair) = crate::guest_places(shell, program, &extents, slots[slots.len() - 1] + 1);
     let id = shell
         .bind_program(
             program,
             &[],
-            eta_exec::Extents {
-                row_count: rows,
-                token_count: rows,
-                sampled_rows: 1,
-                query_len: rows,
-                ..eta_exec::Extents::default()
-            },
+            extents,
             GeometryClass::Host,
             PortMask::NONE,
             &[engine::ChannelId(0x5c0f_0000 + u64::from(chunk))],
             &slots,
             &rings,
+            &scratch,
+            &pair,
         )
         .expect("the reader binds");
-    (id, slots, rings)
+    (id, slots, rings, (scratch, pair))
 }
 
 /// The reader `id` attached at lane `lane`.
@@ -192,7 +202,7 @@ fn session(fixture: &Fixture, park: bool) -> Decodes {
         "the reader's instance holds its score rows: {} bytes, the rows {row_bytes}",
         facts.instance.bytes
     );
-    let (id, slots, rings) = bind_reader(&mut shell, program, 1, 1);
+    let (id, slots, rings, (scratch, pair)) = bind_reader(&mut shell, program, 1, 1);
     let attached = [at_lane(0, id)];
 
     let scored = trace
@@ -201,10 +211,11 @@ fn session(fixture: &Fixture, park: bool) -> Decodes {
     let mut decodes = Decodes::new();
     for step in 0..DECODES {
         if park && step == PARK_AT {
-            // Parked and unparked: its slots copied to fresh refs past
-            // them, the old ones blanked from a slot nothing wrote (the
-            // chunk's last), the instance rebound there.
-            let fresh: Vec<u32> = slots.iter().map(|&s| s + slots.len() as u32).collect();
+            // Parked and unparked: its slots copied to fresh refs in the
+            // chunk's second half (its scratch and its pair's tables lie
+            // right after the old ones), the old ones blanked from a slot
+            // nothing wrote (the chunk's last), the instance rebound there.
+            let fresh: Vec<u32> = slots.iter().map(|&s| s + instance.per_chunk / 2).collect();
             let blank = 2 * instance.per_chunk - 1;
             assert!(
                 fresh.last() < Some(&blank),
@@ -231,6 +242,8 @@ fn session(fixture: &Fixture, park: bool) -> Decodes {
                     instance: fresh,
                     rings: rings.clone(),
                     adapter: Vec::new(),
+                    scratch: scratch.clone(),
+                    pair: pair.clone(),
                 })
                 .expect("the reader rebinds");
         }
