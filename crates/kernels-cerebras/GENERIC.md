@@ -1933,6 +1933,13 @@ milestone's tail.
     words): link 874 s (816 MB), load 133 s, the static arrays 37 s; a step **2,651.2M cycles,
     3.53 s at 750 MHz** (3.76 s wall, the launch's rows back the rest), the same re-launched,
     finite; priced 1,081.4M (2.45x). No golden at this size.
+    Again on the system (1514, 1497's program, link 879 s, load 132 s): 2,651.1M cycles a step
+    (3.535 s), 3.76 s wall, the same to the cycle; again 2.45x. **Open, for the chip-calibrated
+    cost model:** `cost::stream` is 2.45x optimistic for a big-row denoise (klein's 64 + 64: 2x),
+    and compile on load takes the regime by price, so the stream regime's price there must be
+    calibrated before that choice is trusted. (Of the 3.76 s wall, about 0.10 s is the entries in
+    and about 0.13 s the velocity and the bench's stamps back: the 3.6 s a step's copies show
+    is their wait on the program.)
 
 - **M2f** (the GEMM regime: a whole-sequence reading over an array of PEs, layer by layer, every
   PE of the array on the current op; flux2-mini's denoise step on the simulator, klein-4B's 1024²
