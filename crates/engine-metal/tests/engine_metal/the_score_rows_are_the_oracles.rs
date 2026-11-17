@@ -45,7 +45,6 @@ fn the_score_rows_are_the_oracles() {
         profiles: None,
         top: engine_metal::Top::EveryRung,
     })
-    .and_then(|mut shell| shell.raise_whole().map(|()| shell))
     .unwrap_or_else(|why| panic!("the shell loads: {why}"));
     let prompt: Vec<u32> = (0..6u32).map(|at| (11 + at * 37) % 256).collect();
     let one: Vec<Vec<u32>> = (1..LANES).map(|lane| vec![(lane * 7) % 256]).collect();

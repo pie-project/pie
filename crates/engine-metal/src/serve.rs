@@ -2654,6 +2654,24 @@ impl Shell {
         self.programs.register(&self.device, registration)
     }
 
+    /// See `Engine::prepare_program`: the registration's plan, on this
+    /// thread; [`crate::program::Registering::compile`] builds its libraries
+    /// and pipelines on any thread, while this shell fires on.
+    pub fn prepare_program(
+        &mut self,
+        registration: &engine::program::ProgramRegistration,
+    ) -> Result<crate::program::Registering> {
+        self.programs.prepare_register(&self.device, registration)
+    }
+
+    /// See `Engine::finish_program`: the compiled registration taken in.
+    pub fn finish_program(
+        &mut self,
+        registered: crate::program::Registered,
+    ) -> Result<engine::ProgramId> {
+        self.programs.finish_register(registered)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn bind_program(
         &mut self,
