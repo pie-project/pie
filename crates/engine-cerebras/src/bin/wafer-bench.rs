@@ -332,7 +332,9 @@ fn decode(get: &HashMap<String, String>) -> Result<bool, String> {
             .unwrap_or_default()
     };
     let (prompt, seq) = (ids("prompt"), ids("tokens"));
-    let ckpt = std::path::PathBuf::from(need("checkpoint")?);
+    // (absolute: the import contract's files are the checkpoint's, joined to it again on load)
+    let ckpt =
+        std::fs::canonicalize(need("checkpoint")?).map_err(|e| format!("--checkpoint: {e}"))?;
     let t0 = std::time::Instant::now();
     let d = poem_compiler::catalog::repository()
         .parse(&reading.model)
