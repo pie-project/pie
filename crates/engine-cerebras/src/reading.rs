@@ -34,6 +34,7 @@ use std::rc::Rc;
 
 use engine_cpu::Forward;
 use engine_cpu::forward::{Captured, StreamLane, StreamStep, Values};
+use kernels_cerebras::emit::state::{Pe, StateRoot};
 use kernels_cerebras::stream::host::{Span, Word, apply, apply_spans};
 use poem_ir::{Def, InputAxis, Operands, RuntimeInput, Trace, ValueId};
 use serde_json::Value;
@@ -369,11 +370,9 @@ pub struct Paging {
     pub lanes: u32,
 }
 
-/// `host.json`'s PEs under `key` (`{x, y}` each), a column's consecutive PEs one rectangle.
-fn pes(host: &Value, key: &str) -> Vec<Rect> {
-    let mut cs: Vec<(i32, i32)> = (host[key].as_array().into_iter().flatten())
-        .filter_map(|c| Some((c["x"].as_i64()? as i32, c["y"].as_i64()? as i32)))
-        .collect();
+/// PEs as rectangles: a column's consecutive PEs one.
+fn rects(pes: &[Pe]) -> Vec<Rect> {
+    let mut cs: Vec<(i32, i32)> = pes.iter().map(|p| (p.x as i32, p.y as i32)).collect();
     cs.sort_unstable();
     let mut out: Vec<Rect> = Vec::new();
     for (x, y) in cs {
@@ -409,6 +408,24 @@ impl Reading {
             &std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?,
         )
         .map_err(|e| format!("{}: {e}", path.display()))?;
+        // the program's state (`state`: its regions, their slots, pages and PEs), the one
+        // description of it the engine reads
+        // (a program compiled before the state root states its K / V PEs as top-level keys: it
+        // is refused, not read)
+        if let Some(k) = ["pos", "paging", "rowp", "ptab"]
+            .iter()
+            .find(|k| host.get(**k).is_some())
+        {
+            return Err(format!(
+                "{}: `{k}`: compiled before the state root (host.json `state`); compile it anew",
+                path.display()
+            ));
+        }
+        let state: StateRoot = match host.get("state") {
+            Some(v) => serde_json::from_value(v.clone())
+                .map_err(|e| format!("{}: `state`: {e}", path.display()))?,
+            None => StateRoot::default(),
+        };
         let list = |k: &str| {
             host[k]
                 .as_array()
@@ -547,14 +564,14 @@ impl Reading {
             }),
             groups: host["groups"].as_u64().unwrap_or(0) as usize,
             batch: host["batch"].as_u64().unwrap_or(1).max(1) as usize,
-            pos: pes(&host, "pos"),
-            paging: host["paging"].as_object().map(|g| Paging {
-                size: g.get("size").and_then(Value::as_u64).unwrap_or(0) as u32,
-                pages: g.get("pages").and_then(Value::as_u64).unwrap_or(0) as u32,
-                lanes: g.get("lanes").and_then(Value::as_u64).unwrap_or(1) as u32,
+            pos: rects(&state.pes(|r| &r.pos)),
+            paging: state.paging().map(|(g, lanes)| Paging {
+                size: g.size,
+                pages: g.pages,
+                lanes,
             }),
-            rowp: pes(&host, "rowp"),
-            ptab: pes(&host, "ptab"),
+            rowp: rects(&state.pes(|r| &r.rows)),
+            ptab: rects(&state.pes(|r| &r.tables)),
         })
     }
 

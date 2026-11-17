@@ -2554,6 +2554,43 @@ milestone's tail.
     **+52** lines (+225, then -173). The IR paid back most of its own cost by removing the
     text parser, but not all of it.
 
+## Consolidation, item 4: one state root
+
+- **Before.** A program's state was described in several places at once:
+  - the trace's cache rows (`CacheRow::Kv` / `State`, in the engine's `facts.rs`);
+  - a template program's plan contract, its KV replayed from tokens (`backend/kv.rs`);
+  - a unit program's host.json: top-level `pos`, `paging`, `rowp` and `ptab` keys, written
+    by a patch after `host::write`;
+  - its recurrent columns' state slots, which were nowhere: the convention was "a lane slot
+    each".
+
+  The engine pieced these together. One consequence: a program whose only state is a
+  recurrence (no pages) had no `rowp` key, so its state PEs were never told a step's rows.
+  Their `rowp` stayed zero, and sst / cy_sst clear a slot whose row is at position 0.
+- **Now** (`emit::state::StateRoot`, host.json `state`). One block per program: its lane slots
+  a launch, and a region per K / V or recurrent column. Each region has:
+  - its kind (`kv`, `gdn`, `mamba2`), its layer block and head;
+  - its slots;
+  - its paging, where it pages its positions;
+  - its PEs the host tells a step's first position (`pos`), its rows (`rows`) and its lanes'
+    pages (`tables`).
+
+  `emit::stream::state_root` builds it from the columns and the arrays they place, and
+  `compile_decode` writes it in place of the four keys. The engine (`Reading::open`) reads it
+  and nothing else about state: the addressed PEs are the regions' union, and the paging is the
+  paged regions'. It never matches on a region's kind, so a new kind (KDA, a conv state) is a
+  region the compiler states. A host.json with the old keys is refused, not read.
+- **Bytes.** Only host.json changes; every CSL, rcfg and weight file is identical.
+  - Qwen3-0.6B's units and its `-l2` program at 4 lanes: the old keys' PE sets and paging
+    equal the root's.
+  - Qwen3.5-0.8B `-l1` (a recurrence alone) is the one where they differ, as below.
+- **One behaviour change, a fix.** A recurrence-only program's state columns now take a step's
+  rows, so its state persists across steps instead of being cleared each one. Paged and mixed
+  programs are unchanged: their `rowp` already covered the state columns.
+- **Templates and GEMM / grid / tiled.** A template's state is still its plan's (the artifact
+  header is unchanged). The other regimes keep no state across launches; the GEMM regime's
+  batch rows are a step's row layout, not state.
+
 ## G1: the poem survey
 
 **Goal.** Every `.poem` in `models/` runs: it compiles with no per-model code (placement searched
@@ -2773,7 +2810,8 @@ The sim checks run B = 4 with different prompts and positions a lane once B = 1 
   idle row stores into; `ptab` (B x pages) and `rowp` (three words a row: lane slot, state slot,
   position) on every decode PE. satt's PAGED mode stores a row at its lane's page and offset,
   holds its q a row (not an entry each), and unmasks its lane's pages up to its position (and
-  from its window's first). host.json states the paging.
+  from its window's first). host.json states the paging (since consolidation item 4, as
+  regions of its state root: `state`).
 - A recurrence's column holds a state a lane slot (sst / cy_sst SLOTS; its PEs as many again as
   lanes), each row stepping its lane's slot, cleared at the row's position 0 (qwen35-d0.8b -l1 at
   2 lanes links, 422 x 162).

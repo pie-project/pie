@@ -12,5 +12,6 @@ pub mod placed;
 pub mod rcfg;
 pub mod region;
 pub mod stamps;
+pub mod state;
 pub mod stream;
 pub mod tiled;

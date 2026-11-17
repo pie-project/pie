@@ -434,25 +434,15 @@ pub fn compile_decode(
     )
     .map_err(|e| e.to_string())?;
     host::write(&p, &e.arrays, None, out)?;
-    // the K / V PEs the host tells a step's first position (`pos`, a word each)
+    // the program's state (its K / V and recurrent columns, their slots and pages, the PEs a
+    // step's position, rows and page tables go to): the one description the engine reads
     let at = out.join("host.json");
     let mut h: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(&at).map_err(|e| format!("{}: {e}", at.display()))?,
     )
     .map_err(|e| e.to_string())?;
-    let pes = |sym: &str| -> Vec<serde_json::Value> {
-        (e.arrays.iter())
-            .filter(|a| a.sym == sym)
-            .map(|a| serde_json::json!({"x": a.at.x, "y": a.at.y}))
-            .collect()
-    };
-    h["pos"] = serde_json::json!(pes("pos"));
-    // the attention columns' pages (GENERIC.md G1.8): a step's rows' (lane slot, position) and
-    // each lane slot's pages, at every K / V PE
-    if let Some(g) = crate::emit::stream::paging(&p) {
-        h["paging"] = serde_json::json!({"size": g.size, "pages": g.pages, "lanes": g.lanes});
-        h["rowp"] = serde_json::json!(pes("rowp"));
-        h["ptab"] = serde_json::json!(pes("ptab"));
+    if let Some(root) = crate::emit::stream::state_root(&p, &e.arrays) {
+        h["state"] = serde_json::to_value(root).map_err(|e| e.to_string())?;
     }
     std::fs::write(
         &at,

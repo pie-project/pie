@@ -2496,6 +2496,56 @@ pub struct Paging {
     pub lanes: u32,
 }
 
+/// A decode program's state root ([`super::state`]): each K / V column a region (a paged cache,
+/// or a recurrence's state a lane slot), its PEs the host addresses as `arrays` place them;
+/// none in a stream reading's.
+#[must_use]
+pub fn state_root(p: &Program, arrays: &[HostArray]) -> Option<super::state::StateRoot> {
+    use super::state::{Pages, Pe, Region, StateRoot};
+    let lanes = rows_of(p)?;
+    let s = &p.stream;
+    let g = paging(p);
+    let mut regions = Vec::new();
+    for kc in &s.kv {
+        let ks = &p.kv[kc.block as usize];
+        let state = kv_joint(p, ks).state;
+        let mut at: Vec<Coord> = vec![kc.root(s)];
+        at.extend((0..kc.pya).map(|i| kc.pe(s, i)));
+        let of = |sym: &str| -> Vec<Pe> {
+            let mut v: Vec<Pe> = (arrays.iter())
+                .filter(|a| a.sym == sym && at.contains(&a.at))
+                .map(|a| Pe {
+                    x: a.at.x,
+                    y: a.at.y,
+                })
+                .collect();
+            v.sort_unstable();
+            v
+        };
+        regions.push(Region {
+            kind: match state {
+                Some(st) if st.mamba.is_some() => "mamba2".into(),
+                Some(_) => "gdn".into(),
+                None => "kv".into(),
+            },
+            block: kc.block,
+            head: kc.head,
+            slots: lanes,
+            paging: match (state, g) {
+                (None, Some(g)) => Some(Pages {
+                    size: g.size,
+                    pages: g.pages,
+                }),
+                _ => None,
+            },
+            pos: of("pos"),
+            rows: of("rowp"),
+            tables: of("ptab"),
+        });
+    }
+    Some(StateRoot { lanes, regions })
+}
+
 /// The fewest positions a page holds.
 pub const PAGE_MIN: u32 = 64;
 
