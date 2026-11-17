@@ -1544,6 +1544,47 @@ mod tests {
         }
     }
 
+    /// How long a guest program's registration takes (`Plane::register`):
+    /// what decides whether Metal registers off the engine thread. Cold:
+    /// every kernel source carries a nonce, so neither this process's cache
+    /// nor the system's shader cache holds it. Warm: the same registration
+    /// into a fresh plane (the system cache holds it), then into the same
+    /// plane (its own cache does). Printed, not asserted: a measurement.
+    #[test]
+    #[ignore = "a measurement: run with --ignored --nocapture"]
+    fn a_registration_takes_what_it_takes() {
+        let context = Context::bind().expect("a Metal 4 device");
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let programs: Vec<(&str, ProgramRegistration)> = vec![
+            ("top-p cut, 151936", select_registration(151_936, Cut::P(0.95), true).0),
+            ("beam step (log-softmax, top-k), 151936", select_registration(151_936, Cut::Score, true).0),
+            ("argmax sampler, 1024", registration_of(false).0),
+        ];
+        for (name, registration) in programs {
+            let mut cold = registration.clone();
+            for kernel in &mut cold.emitted_kernels {
+                kernel.source.push_str(&format!("\n// registration nonce {nonce}\n"));
+            }
+            let timed = |plane: &mut Plane, registration: &ProgramRegistration| {
+                let began = std::time::Instant::now();
+                plane.register(&context, registration).expect("registers");
+                began.elapsed().as_secs_f64() * 1e3
+            };
+            let cold_ms = timed(&mut Plane::new(), &cold);
+            let warm_ms = timed(&mut Plane::new(), &cold);
+            let mut plane = Plane::new();
+            let _ = timed(&mut plane, &cold);
+            let same_ms = timed(&mut plane, &cold);
+            eprintln!(
+                "{name}: {} kernel(s); cold {cold_ms:.1} ms, warm (system cache) {warm_ms:.1} ms, \
+                 same plane {same_ms:.2} ms",
+                cold.emitted_kernels.len()
+            );
+        }
+    }
+
     /// A value wider than the pool's chunk lies in a piece of adjacent
     /// chunks: a 151,936-token cut in 256 KiB chunks (a vocabulary-wide f32
     /// value is 607,744 bytes) is laid in runs of more than one chunk, its
@@ -2159,6 +2200,8 @@ mod tests {
                         pools: &pools,
                         instance: &instance,
                         rings: &rings,
+                        scratch: &scratch_of(&plane, program, &one_row(), &pools, 0, 0),
+                        pair: &pair_of(&plane, program, &one_row(), &pools),
                     },
                 )
                 .expect("the lane binds");
@@ -2168,7 +2211,7 @@ mod tests {
                 .bind_output(id, "logits", 0, &logits_plane, 0, eta_ir::Dtype::Bf16, VOCAB, VOCAB)
                 .expect("the logits bind");
             let fired = plane
-                .fire(&context, id, Attach::Epilogue, &guests(&context))
+                .fire(&context, id, Attach::Epilogue, &pools)
                 .expect("the stage fires");
             assert!(matches!(fired, Fired::Committed), "{form:?} fires: {fired:?}");
             let cell = plane
