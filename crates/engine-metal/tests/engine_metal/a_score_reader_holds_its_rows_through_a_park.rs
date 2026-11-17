@@ -8,9 +8,8 @@
 //! more: each decode's rows and logits are a never-parked session's, the
 //! rows lie in the instance's slots wherever they moved, and no fire
 //! builds a pipeline after ready (the reader's own are built at its
-//! registration). A capturing lane no program is attached at (an earlier
-//! cut of a pass) writes no row; an instance attached at more than one
-//! lane is refused by name.
+//! registration). A capturing lane no program is attached at, and an
+//! instance attached at more than one lane, are refused by name.
 
 use eta_compiler::codegen::program::{Backend, emit_program};
 use eta_compiler::plan::compile_bound;
@@ -270,10 +269,11 @@ fn session(fixture: &Fixture, park: bool) -> Decodes {
         "a scored fire after ready built a pipeline (built after ready)"
     );
 
-    // A capturing lane no program is attached at (an earlier cut of a
-    // pass) is served and writes no row; an instance attached at more lanes
-    // than its one lane's rows is refused by name.
-    shell
+    // A capturing lane no program is attached at is refused by name (the
+    // runtime stamps the capture only on the fire that runs the program,
+    // and Step::validate_captures refuses the rest at submit), and so is
+    // an instance attached at more lanes than its one lane's rows.
+    let refused = shell
         .fire_seated(&[Seated {
             held: Some(PROMPT + DECODES),
             ..Seated::of(Lane {
@@ -282,15 +282,15 @@ fn session(fixture: &Fixture, park: bool) -> Decodes {
                 tokens: &[7],
             })
         }])
-        .expect("a capturing lane with no program attached is served");
+        .expect_err("a capturing lane with no reader is refused");
     assert!(
-        shell.score_rows().expect("the rows read back").is_empty(),
-        "a capturing lane with no reader wrote a row"
+        refused.to_string().contains("no reader is attached"),
+        "refused by name: {refused}"
     );
     let refused = shell
         .fire_attached(
             &[Seated {
-                held: Some(PROMPT + DECODES + 1),
+                held: Some(PROMPT + DECODES),
                 ..Seated::of(Lane {
                     slot: 0,
                     word: scored,

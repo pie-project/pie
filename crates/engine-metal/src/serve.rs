@@ -4995,9 +4995,11 @@ impl Shell {
     /// its lane, reading `attn.scores` or `attn.scores.pages`), and the
     /// arm's tables of every lane's row starts written for the fire's score
     /// kernels: staged each fire, so a lane's rows are read wherever its
-    /// reader's slots lie now. A lane no program is attached at (an earlier
-    /// cut of a pass: only the last runs its program) names no row, and
-    /// nor does the load's pipeline walk, which launches nothing.
+    /// reader's slots lie now. The load's pipeline walk names no row: it
+    /// launches nothing. Every capturing lane a fire carries has its reader
+    /// attached: only the fire that runs a pass's program captures, and
+    /// `engine::fire::Step::validate_captures` refuses at submit a lane that
+    /// captures with none.
     fn lay_capture(
         &mut self,
         composition: &Composition,
@@ -5022,16 +5024,20 @@ impl Shell {
                 continue;
             }
             let source = row.source;
-            // Only the fire ending a pass runs its program: an earlier cut
-            // of a capturing pass has no reader attached, and its capture
-            // serves none (the last cut's covers every key), so it writes
-            // no row.
-            let Some(attached) = attachments.iter().find(|attached| {
-                !attached.adapter_only
-                    && (attached.lane..attached.lane + attached.lanes.max(1)).contains(&source)
-            }) else {
-                continue;
-            };
+            let attached = attachments
+                .iter()
+                .find(|attached| {
+                    !attached.adapter_only
+                        && (attached.lane..attached.lane + attached.lanes.max(1)).contains(&source)
+                })
+                .ok_or_else(|| Fault::Program {
+                    at: "serve::lay_capture",
+                    why: format!(
+                        "lane {source} captures its attention scores and no reader is attached \
+                         at it: only the fire that runs a pass's program captures \
+                         (engine::fire::Step::validate_captures refuses this at submit)"
+                    ),
+                })?;
             if attached.lanes > 1 {
                 return Err(Fault::Program {
                     at: "serve::lay_capture",
