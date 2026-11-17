@@ -2863,3 +2863,251 @@ The sim checks run B = 4 with different prompts and positions a lane once B = 1 
 - **Scope.** §0's long tail (DSA, pooled attention, hyper-connections) is research-grade CSL. The
   plan front-loads the north star (flux) and the cheap wins (P4: about 12 LLM families' root ops),
   and leaves M7 open-ended.
+
+## Free placement (P1)
+
+**Goal.** A global placer (simulated annealing) picks every block's position and shape on the
+wafer, and a negotiated-congestion router routes the links between them. This replaces the
+structured families: the snake, the U, the two-column snake, `Arrangement::derive`, the East,
+Band and Groups heads, the stream's bands and wrap, and co-residency side by side. The output is
+the existing `Placed` IR (`Placed::csl`), coloured by `Palette::allocate` and held to `check`.
+This section is the inventory and the design (milestone a). Nothing is built yet.
+
+### P1.a What prices a position today: nothing
+
+No regime's price reads where a block sits. It reads shapes only.
+
+| regime | price | position terms |
+|---|---|---|
+| decode (`cost::time`) | matvec, KV, chains, spans, head, loop reduce | none. A unit's chains and spans are its shape's. The handoffs, the head input and the embedding's return are unpriced (each layer's fitted cost absorbs them). |
+| stream (`cost::stream::time`) | units' paces, the barrier, fill | none. Forwarding costs `FORWARD_WORD` a word a unit at any distance. The gap between units is the `MEASURED = 1.41` factor (`cost/stream.rs:246`). |
+| GEMM (`cost::gemm::time`) | array, lines, all-reduce | the all-reduce chain's `members x HOP` (its own shape). A line's turn is the constant `TURN`. Tapes are unpriced. |
+| tiled (`cost::tiled::time`) | image array, hub, tapes | the hub path as `gx + gy + 2` hops, assumed rather than read from a route |
+| grid (`cost::grid::time`) | passes | none |
+
+What follows:
+
+- **Acceptance 2 ("≤ the current search's price") holds trivially for any placement** of the
+  same shapes, because positions price at zero. A free placer can only lower today's price in
+  two ways. It can make shapes feasible that the families cannot lay; the measurement below
+  bounds that for decode. Or the cost can learn what wires cost. That term is new, so it needs
+  calibrating.
+- **The P1 cost therefore adds a link term**, kept separate and reported beside the existing
+  price (P1.c below). Its coefficients start from the simulator's per-hop cycles
+  (`CHAIN_WIRE` 3, `LOOP_WIRE` 0.5) and need a chip fit before any choice relies on them. Until
+  then, the gate compares the existing price, which acceptance 2 names, and the link term
+  breaks ties.
+
+**Decode, measured.** Each of the 9 models' cold candidates (`cold::candidates`, 4,096
+positions) was sorted three ways: refused by the constructor, refused at build (`Program::build`:
+the floor, the wiring, colours, fit), or built. Columns: (a) the cheapest that builds; (b) the
+cheapest refused only at build. Where (b) < (a), a placer that made it build would gain at most
+(a) - (b).
+
+Each line is cold candidates at 4,096 positions with the kinds' layer cost, before the walk.
+"Refused for geometry" means one of: the fabric, the wafer, the band, a route clash, the even
+unit count.
+
+| model | candidates / plan | (a) builds | (b) geometry-refused | cheaper than (a) | why |
+|---|---|---|---|---|---|
+| gpt-oss-20b | 6,690 / 2,592 | 0.4168 | **0.3835 (-8.0%)** | 105 | two band columns 1,090 wide (over 750; 290-580 rows high, so the area fits); an odd unit count (the last unit must sit on the band) |
+| Gemma 4 E4B | 1,872 / 1,872 | 0.8241 | 0.8234 (-0.08%) | 5 | 771 wide, 21 columns over |
+| Qwen3.5 9B | 3,206 / 904 | 0.4862 | 0.4862 | 1 (a tie) | a route clash |
+| Qwen3-8B | 8,278 / 2,604 | 0.4995 | 0.4995 | 1 (a tie) | a route clash |
+| Qwen3.5 0.8B, 4B, Llama 3.1 8B, Gemma 4 E2B | | | | 0 | |
+| Gemma 4 12B | PENDING_12B | | | | |
+
+Two things the table does not price:
+- **The snake constructor's own refusal** ("N units on X x Y slots"). This is 1,850-3,256
+  candidates for each `Own` model. They are refused before a plan exists, so they cannot be
+  priced, and a free placer would admit them.
+- **The walk** from the extra seeds a placer admits.
+
+So among the decode models, only gpt-oss has a placement-sized gain (up to 8% by today's
+price). The rest gain at most 0.1% unless a link term is added.
+
+### P1.b Where adjacency is assumed (inventory)
+
+The tier says where the assumption lives:
+- **R**: Rust geometry. The route is a point list; a router replaces it.
+- **W**: an rcfg word or note (Rust writes it; a kernel reads it).
+- **C**: CSL dataflow (a relay, a turn, a runtime route switch).
+
+The good news is infrastructure: `wiring::Path` and `Broadcast` already take any 4-connected
+point list, `Fabric::lay` writes rx / tx at every point, every decode kernel loads its routes
+from rcfg at start (`ops/fabric.csl:33`), and the stream / grid / tiled PE code reads colours and
+logical roles only. No decode or stream CSL names a fabric direction.
+
+Decode (`block/`, `kernels/`, `programs/wafer`):
+
+| what | where | tier | generalize |
+|---|---|---|---|
+| handoff between consecutive units: same rect x (out, vertical, in) or same rect y (across); `HANDOFF_VERT[a % 2]` parity | `block/units.rs:166-224` | R | router path per weight row (a bus of PY wires), class per handoff |
+| the handoff's turn relays on weight PEs at pass start / end (`RELAY_PRE/POST`) | `ops/wpe.csl:143`, `weight.csl:334,358` | C | not needed when the routed wire keeps one colour end to end; else the turn must sit on a weight PE of the two units |
+| head input: CX row r east to head column r/2, odd rows relay one PE north (relay A / B) | `block/head.rs:106-147`, `head_pe.csl:9-48` | R+C | **high**: a new head input protocol; P1 keeps the head a rigid macro abutting the last unit |
+| token loop: the embedding up the head column, `TURN_TOP/EVEN/ODD`, `te` / `to` split, west into unit 0 (`te` / `to` within the head's rows) | `block/token_loop.rs:117-149`, `kernels/common.rs:327` | R+W+C | **high**: as above; unit 0 constrained to the head's rows |
+| head groups: x chain north on the last unit, CX forwarding chain `k % 2` | `block/head_groups.rs:115-176`, `cx.csl:272` | R+C | med |
+| band: x east to MoE column, down to the band; return bus; last unit and unit 0 on the band | `block/band.rs:117-250`, `kernels/split.rs:383` | R+C | med-high: rigid macro + abutment |
+| bus switches: a winner PE switches its route's input to its ramp (head VA bus; PLE bus with `DLY=1500`) | `head_pe.csl:186-234`, `ple_gemma.csl:88-95` | C | med: route each bus as one linear path through its senders; `DLY` depends on its length |
+| KV line north from the source unit; sharers above it | `block/shared_kv.rs:58-93` | R | low: a `Broadcast` tree |
+| PLE storage above each unit column, token line west, bus down each weight column | `block/ple.rs:219-318` | R+C | med |
+| head row / vocabulary offset from absolute `pe.at.y` (`x` for the band) | `kernels/head.rs:72,85,116,122`, `split.rs:503` | W | low: the head's local index |
+| intra-unit chains, segments, trees: adjacent members | `wiring.rs`, `fabric.rs:398` | R | kept: a unit is a rigid block |
+| **an idle PE a path crosses runs `FILLER`, which loads no routes**. `Program::build` does not refuse it; only the check sees the send that is not received. | `fabric.rs:1042`, `emit/rcfg.rs:24`, `ple.rs:128` (`settle`, west of the head only) | R | **needed first**: a generic settle (a route-only kernel on every crossed idle PE) and a build-time refusal |
+
+Stream / grid units (`floorplan/stream.rs`, `stream/build.rs`, `emit/stream.rs`). Every item is
+R; no CSL assumption was found:
+
+| what | where |
+|---|---|
+| units left to right, `x += cols + 1`; bands of one height; a block never split; `py` columns of room at a wrap | `floorplan/stream.rs:301-379` |
+| the row stream between consecutive units a straight row (empty if the next unit is west) | `:535-543` |
+| the band wrap's staircase (non-crossing, so the `py` wires share one class); `SP{k%2}` alternation | `:461-473`, `:544` |
+| the K / V column under its block's first unit's head column (the head pitch `col()` exists for it); the K / V snake; `KvColumn::link`'s L route | `:67-91`, `:218-263` |
+| the lane bus: north to row 0, east, down (receivers east of the root; `x - root.x` underflows otherwise); the lane unit 0 | `:588-661`, `emit/stream.rs:566` |
+| helpers dropped where later K / V links pass under the first unit | `build.rs:1010-1025` |
+| `py` candidates bounded by one band's height | `build.rs:369` |
+| a chain leaf by `su.col` order ("east"), not the chain's point order | `emit/stream.rs:924-1015` |
+| at most 4 units a block (`kv_in` / `kv_out` slot names) | `:684-704` |
+
+GEMM / tiled / co-residency:
+
+| what | where | tier |
+|---|---|---|
+| GEMM lines rewrite their routes at runtime with raw E/W/N/S switch words (0x81/0x31, 0x82/0x12, 0x88/0x58, 0x84/0x74) | `emit/gemm_pe.csl:44-63` | C: the array stays rigid and is translate-only (no mirror) |
+| GEMM tapes straight below the array, one tape stream a column; the weight tree enters from SOUTH | `stream/gemm.rs:821`, `emit/gemm.rs:676-717` | R: tapes could be placed apart (a routed path per column) |
+| tiled: spine at x = 0, image at +1, hub at the corner, tape snake below; the hub path `gx + gy + 2` in the cost | `emit/tiled.rs:486-530`, `cost/tiled.rs:78` | R (satellites movable) |
+| tiled all-reduce / attention order and stride relays | `tiled_pe.csl:45-357` | C, logical (the array stays rigid; mirror by relabelling routes in Rust) |
+| co-resident readings side by side in x at y = 0, by rewriting `layout.csl` text | `stream/coresident.rs:50-199` | R: move it onto `Placed` with (x, y) |
+
+Host I/O is memcpy to any PE. No block has a host-edge pin; the only rule is the memcpy halo
+(`Bounds::system`).
+
+### P1.c The problem IR
+
+`place::Problem`, a new module `src/place/`. It is extracted from a built program, so every
+current program is a point of it by construction.
+
+- **Block**: a rigid rectangle of PEs with relative coordinates for its tiles, its internal
+  routes and its pins. Kinds:
+  - a decode unit;
+  - the head macro (East / Groups / Band, with its token loop);
+  - a store column;
+  - a gap relay;
+  - a stream unit;
+  - a K / V column;
+  - the lane unit;
+  - a GEMM array (+ its tapes, a separate block where routed);
+  - the tiled image array, its spine, hub and tape;
+  - a co-resident reading.
+
+  Each block has:
+  - **shape alternatives**: the (w, h, per-PE work, per-PE bytes) its builder can make, e.g. a
+    stream unit's `py` / tile / pitch, a K / V column's `sub`, the decode head's HR / VR. The
+    decode units' PX / PY stay the search's keys. One `UnitShape` holds for every unit,
+    because the kernels' params are comptime a kind.
+  - **orientations** its code allows: identity, or mirror x / y where the PE code is
+    role-driven (stream / grid units, the tiled array); identity only for GEMM, the head macro
+    and the band.
+  - **pins**: its link ends, block-relative (a CX row's ramp, a head root, a K / V root).
+- **Net**: a link between pins of different blocks. Each has:
+  - its **kind**: handoff bus (PY wires), row stream bus (`py` wires), K / V link, lane bus,
+    KV line, token / PLE bus, tape;
+  - **words a step** (or a row, in the stream regime);
+  - **whether it is on the step's critical path**, and how often a step it is crossed;
+  - its **class** (it takes a colour from `Palette::allocate`);
+  - its **bus width**: the wires are routed as one bundle, so they stay parallel and do not
+    cross, and so may share one class (what the band wrap's staircase does by hand).
+- **Constraints**:
+  - abutment, for the rigid protocols left in place: the head macro's input face against the
+    last unit's CX rows; unit 0's `te` / `to` rows within the head's rows; Band under its
+    first and last unit;
+  - the fabric (750 x 1,153 less the halo);
+  - no overlap.
+- **Solution**: an origin, an orientation and a shape index per block, and a path per net.
+  Each regime builder takes a solution and lays its blocks there:
+  - decode through `UnitLayout::Explicit` plus a head origin;
+  - stream through explicit unit / K / V origins in place of `Stream::of`'s bands.
+
+  The router's paths replace the hand point lists in `Wiring`, then the existing colour, lay
+  and check run unchanged.
+
+**Byte identity (b)** comes from extraction. The pinned solution is the program's own origins
+and its own nets' point lists, the router's incumbent routes. Replayed, it gives the same
+`Wiring`, so the same `Placed` and the same files. The gate is the decode ident (6 configs),
+gen1's flux gate and the Qwen3-0.6B units.
+
+### P1.d Cost and its increments
+
+`cost::place`, in cycles a step:
+
+- **Compute**: the regime's existing per-block terms. They are position-free, so they are
+  cached by shape index; a shape move recomputes one block's. Stream compute is the pipeline:
+  the slowest unit's pace x rows, plus the fill (the critical chain's sum).
+- **Links**: each net's hops (its routed length, or its HPWL / L-length estimate during the
+  anneal) x the per-hop rate, plus words / bandwidth. The rate is weighted by how often the
+  net is on the critical path (the decode handoffs once a unit a step; the stream row bus in
+  the fill once, and as a bandwidth limit every row).
+- **Congestion**: a fabric edge carries one wavelet a cycle across all colours. Over each
+  directed edge, the words a row of the nets crossing it are held to the pace, and the excess
+  is penalised. The estimate is RUDY-style during the anneal; the routed occupancy comes after.
+  A PE where more classes meet than colours remain is penalised too (the router reports it
+  exactly).
+- **Penalties**: overlap area, out-of-fabric area, memory past `check::pe_bytes` /
+  `overflows()` (per shape, cached), and violated abutments.
+
+Increments: a move touches one or two blocks. Its delta is those blocks' compute (cached by
+shape), the nets incident to them (O(degree)), and congestion and overlap in the moved
+bounding boxes (an occupancy grid at a coarse pitch, 8 x 8 PEs, updated by subtraction and
+addition). No move re-routes. Routing runs on the annealer's best few, and its failures and
+overflow feed back as penalties for a short re-anneal (P1.3 in the brief).
+
+### P1.e Router
+
+PathFinder over the PE grid (865k nodes), the four directions, history plus present
+congestion costs.
+
+- **Buses** are routed as one bundle: a spine path, each wire offset across it. They turn as
+  staircases and never cross, which is what the wrap does today.
+- **Capacity of a node**: its kernel's `route_slots`, and the colours left after the classes
+  that meet there.
+- Each net, a class, then `Palette::allocate` and `check`. A refused colouring or a check
+  error is a placer penalty on the nets involved.
+
+Budget: about 1k-3k wires for decode (6-24 handoffs x PY, plus the head) and up to about 50k
+for a large stream program. A* with a bounding-box window keeps each iteration under a second
+on 8 threads. The 60 s target is the anneal plus at most about 10 router passes.
+
+### P1.f Plan, and where it deviates from the brief
+
+1. **(b) first, as extraction and replay**: `place::Problem::of(program)`, `Solution::pinned`,
+   and the two regime builders taking a solution. Identity on the decode ident, the flux gate
+   and the 0.6B units. A new module; the builders gain one entry point each.
+2. **Before the router: the idle-PE route hole.** Add a generic settle and a build-time
+   refusal for a route at a PE that loads none. Today's programs never hit it, so they are
+   unchanged, but a free route would.
+3. **(c) Router + generalized wiring, in the order of what kernels already allow**:
+   - stream / grid inter-unit links: the row bus, K / V links, the lane bus (all R);
+   - the decode handoff (R, the weight-PE relay kept where a turn falls on a weight PE);
+   - the KV line;
+   - co-residency on `Placed`.
+
+   The head protocols, the band and the PLE bus stay rigid macros under abutment constraints.
+   Their CSL changes (high) want a chip session each, so they come after (d), and only if
+   (d) shows the head's position matters.
+4. **(d) Anneal.** Seeds are the current search's best (pinned) and random. The 9 decode
+   models' gains are bounded by the measurement above. The stream and units programs are
+   where the space is large, because bands waste their height. Klein's text and denoise are
+   GEMM (one rigid array, one shape search already exhaustive) and its VAE tiled, so the
+   placer gains there only by moving tapes and the hub, which today's prices do not see.
+
+**Deviation.** The brief's acceptance 2 is met by the existing price, which is position-blind.
+The link and congestion terms are reported beside it, uncalibrated, until a chip fit.
+
+**Overlaps.**
+- Every regime now emits a `Placed` (57bf47b34: decode through `Placed::decode`). The placer's
+  output is that IR's tiles and routes; no emitter changes for the output side.
+- With G1: `floorplan/stream.rs` and `stream/build.rs` gain a solution-driven entry beside
+  `Stream::of`; the bands stay as the seed. Stream units are G1's.
+- With M2f: none past reading `Placed`.
+- Decode `block/units.rs::handoff` gains a routed variant.
