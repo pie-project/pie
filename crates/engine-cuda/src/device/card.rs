@@ -15,7 +15,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::error::{Fault, Result};
+use crate::error::Result;
 
 /// The terms an integrated device's capacity is measured from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,7 +63,7 @@ pub fn memory() -> Result<(u64, u64)> {
     }
     #[cfg(not(feature = "device"))]
     {
-        Err(Fault::Runtimeless)
+        Err(crate::error::Fault::Runtimeless)
     }
 }
 
@@ -130,7 +130,7 @@ fn commit_available() -> Result<u64> {
     };
     // SAFETY: a live struct whose length field is set, as the call requires.
     if unsafe { GlobalMemoryStatusEx(&raw mut status) } == 0 {
-        return Err(Fault::Card(format!(
+        return Err(crate::error::Fault::Card(format!(
             "an integrated device's capacity cannot be measured: Windows did not report its \
              available commit ({})",
             std::io::Error::last_os_error()
