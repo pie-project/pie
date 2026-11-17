@@ -149,29 +149,30 @@ pub struct Wafer {
     pub positions: usize,
     pub vocab: usize,
     pub hidden: usize,
-    /// The program's posted-loop length (its plan's; the config's `posted_loop` overrides it).
+    /// The program's posted-loop length (its plan's).
     pub posted_loop: usize,
     /// A unit program's paging: (lane slots a launch, pages a lane may hold, positions a page).
     pub paging: Option<(usize, u32, u32)>,
     /// A unit program's lane slots a launch (its rows: Pie's lanes run together).
     pub lanes: Option<usize>,
+    /// Whether the program runs the token loop (a template's WL build; a unit program's rows).
+    pub token_loop: bool,
 }
 
 impl Wafer {
     /// Loads the compiled `program` (its [`artifact`]) on `platform` through the SDK in
-    /// `sdk_lib`, places `weights` and returns once the model answers; `vocab`: the trace's;
-    /// `force_prompt`: the prompt through the token loop.
+    /// `sdk_lib`, places `weights` and returns once the model answers; `vocab`: the trace's.
     pub fn open(
         program: PathBuf,
         platform: Platform,
         vocab: usize,
         weights: artifact::Weights,
         sdk_lib: PathBuf,
-        force_prompt: bool,
     ) -> R<Wafer> {
         let art = artifact::read(&program)?;
         let posted_loop = art.host.loop_len as usize;
-        Wafer::spawn(posted_loop, move || {
+        let token_loop = art.host.token_loop;
+        Wafer::spawn(posted_loop, token_loop, move || {
             let sdk = Sdk::open_at(&sdk_lib).map_err(|e| e.to_string())?;
             let mut rt =
                 Runtime::new(sdk, &program, platform, "WARNING").map_err(|e| e.to_string())?;
@@ -179,8 +180,7 @@ impl Wafer {
             rt.load();
             rt.run();
             tracing::info!(s = t0.elapsed().as_secs_f64(), "artifact: program loaded");
-            let mut m = ArtifactModel::open(Box::new(rt), &weights, &art, vocab)?;
-            m.force = force_prompt;
+            let m = ArtifactModel::open(Box::new(rt), &weights, &art, vocab)?;
             Ok(Model::Artifact(Box::new(m)))
         })
     }
@@ -199,7 +199,7 @@ impl Wafer {
         checkpoint: PathBuf,
         positions: usize,
     ) -> R<Wafer> {
-        Wafer::spawn(0, move || {
+        Wafer::spawn(0, true, move || {
             let reading = crate::reading::Reading::open(&program)?;
             let landed = crate::prepare::land(&trace, &contract, &checkpoint)?;
             let sdk = Sdk::open_at(&sdk_lib).map_err(|e| e.to_string())?;
@@ -216,7 +216,11 @@ impl Wafer {
     }
 
     /// The model `open` makes, on a thread of its own taking jobs.
-    fn spawn(posted_loop: usize, open: impl FnOnce() -> R<Model> + Send + 'static) -> R<Wafer> {
+    fn spawn(
+        posted_loop: usize,
+        token_loop: bool,
+        open: impl FnOnce() -> R<Model> + Send + 'static,
+    ) -> R<Wafer> {
         let (job_tx, job_rx) = mpsc::channel::<Job>();
         let (ans_tx, ans_rx) = mpsc::channel::<Answer>();
         let (post_tx, post_rx) = mpsc::channel::<Answer>();
@@ -307,6 +311,7 @@ impl Wafer {
             posted_loop,
             paging,
             lanes,
+            token_loop,
         })
     }
 

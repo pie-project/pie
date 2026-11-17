@@ -17,6 +17,9 @@ use crate::wafer;
 /// Steps a sequence's first token loop runs past its row.
 const FIRST_LOOP: usize = 8;
 
+/// The token loop's most steps past a greedy lane's row when the config states none.
+pub(super) const DEFAULT_LOOKAHEAD: usize = 32;
+
 /// A logits row of `width` standing in for an argmax: 1 at `token`, 0
 /// elsewhere (all 0 without one).
 fn one_hot(width: usize, token: Option<u32>) -> Vec<f32> {
@@ -144,20 +147,12 @@ impl CerebrasEngine {
                     .max(ahead.map_or(0, |fires| (fires as usize).min(lookahead)));
                 c.next_loop
             };
-            // A loop runs no further than the lane's pages (debug `loop_room = false`: the
-            // lookahead alone): the rows past a sequence's end are waste.
+            // A loop runs no further than the lane's pages: the rows past a sequence's end
+            // are waste.
             let room = (pages.len() as u32 * self.kv.page_size)
                 .saturating_sub(start + tokens.len() as u32) as usize;
-            let bounded = !posting && self.debug.loop_room.unwrap_or(true) && !pages.is_empty();
+            let bounded = !posting && !pages.is_empty();
             let steps = if bounded { steps.min(room) } else { steps };
-            // With the prompt forced through the loop (debug `force_prompt`), the
-            // waited-for launch is the prompt alone: its first token right after the
-            // prefill, every later loop posted.
-            let steps = if posting && self.debug.force_prompt {
-                0
-            } else {
-                steps
-            };
             tracing::info!(
                 rows = tokens.len(),
                 steps,
@@ -207,10 +202,9 @@ impl CerebrasEngine {
         self.model.as_ref().is_some_and(|w| w.lanes.is_some())
     }
 
-    /// Whether greedy loops are posted back to back (debug `posted = false`: one
-    /// loop at a time).
+    /// Whether greedy loops are posted back to back.
     fn loop_posting(&self) -> bool {
-        self.model.is_some() && self.lookahead() > 0 && self.debug.posted.unwrap_or(true)
+        self.model.is_some() && self.lookahead() > 0
     }
 
     /// The posted loop's rows into the cache (waiting for it, or only if it
@@ -225,14 +219,16 @@ impl CerebrasEngine {
         self.loop_posted = None;
         let argmax = answer.map_err(Error::Device)?;
         let c = &mut self.kv.cached;
+        // The model's cache ran the loop's rows: dropping them would leave the wafer past what
+        // the engine holds (nothing moves the cache while a loop is out: a loop that finds it
+        // moved, or answers nothing, is a fault, not a cue to drop it).
         if c.tokens.len() != start || argmax.is_empty() {
-            // The cache moved on (it never does while a loop is out).
-            tracing::warn!(
-                start,
-                held = c.tokens.len(),
-                "spatial: a posted token loop dropped"
-            );
-            return Ok(());
+            return Err(Error::Device(format!(
+                "a posted token loop from position {start} landed on a cache holding {} \
+                 tokens ({} argmax): its rows would be lost",
+                c.tokens.len(),
+                argmax.len()
+            )));
         }
         c.tokens.push(token);
         c.tokens.extend_from_slice(&argmax[..argmax.len() - 1]);
@@ -257,11 +253,9 @@ impl CerebrasEngine {
         }
         let start = c.tokens.len();
         // A loop's rows come back when it ends: the request's last rows wait
-        // for its whole loop, so posted loops stay short (the config's
-        // `posted_loop`, else the program plan's loop).
-        let plan_loop = self.model()?.posted_loop;
+        // for its whole loop, so posted loops stay short (the program plan's loop).
+        let most = self.model()?.posted_loop;
         let c = &mut self.kv.cached;
-        let most = self.cfg.posted_loop.unwrap_or(plan_loop);
         c.next_loop = (c.next_loop.max(FIRST_LOOP) * 2)
             .min(lookahead)
             .min(most.max(1));
@@ -278,9 +272,13 @@ impl CerebrasEngine {
     }
 
     /// The most steps a greedy lane's token loop runs past its row (0: none):
-    /// the config's `lookahead`, else 32 once a model is loaded.
+    /// the config's `lookahead`, else [`DEFAULT_LOOKAHEAD`] once a model is loaded.
     pub(super) fn lookahead(&self) -> usize {
-        let default = if self.model.is_some() { 32 } else { 0 };
+        let default = if self.model.is_some() {
+            DEFAULT_LOOKAHEAD
+        } else {
+            0
+        };
         self.cfg.lookahead.unwrap_or(default)
     }
 

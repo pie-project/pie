@@ -223,7 +223,7 @@ fn run_loop(
     let cache = tempfile::tempdir().expect("a cache directory");
     let mut cfg = engine_cerebras::Config {
         cache_dir: Some(cache.path().to_path_buf()),
-        num_threads: 8,
+        num_threads: Some(8),
         ..engine_cerebras::Config::default()
     };
     cfg.debug = Some(engine_cerebras::config::Debug {

@@ -589,7 +589,7 @@ pub fn plan(trace: &Trace, ask: &Ask) -> R<Planned> {
 pub const FALLBACKS: usize = 3;
 
 /// Every plan of `trace` that builds, in the order [`plan`] prefers them (its choice first): a
-/// load links the next where one's program does not fit its PEs' memory.
+/// load takes the first (each held within its PEs' memory by the memory model already).
 pub fn plans(trace: &Trace, ask: &Ask) -> R<Vec<Planned>> {
     let wafer = ask.target(shape(trace)?)?;
     if ask.preset.is_none() {

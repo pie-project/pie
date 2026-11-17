@@ -788,7 +788,9 @@ pub(crate) fn create_engine_backend(
             // PIE home, as wasmtime's do.
             let mut cerebras = toml::Table::new();
             cerebras.insert("target".into(), opts.target.clone().into());
-            cerebras.insert("num_threads".into(), i64::from(opts.num_threads).into());
+            if let Some(n) = opts.num_threads {
+                cerebras.insert("num_threads".into(), i64::from(n).into());
+            }
             cerebras.insert(
                 "cache_dir".into(),
                 crate::disk::engine_cache_dir(home)
@@ -800,13 +802,8 @@ pub(crate) fn create_engine_backend(
             if let Some(cmaddr) = &opts.cmaddr {
                 cerebras.insert("cmaddr".into(), cmaddr.clone().into());
             }
-            for (key, value) in [
-                ("lookahead", opts.lookahead),
-                ("posted_loop", opts.posted_loop),
-            ] {
-                if let Some(v) = value {
-                    cerebras.insert(key.into(), i64::from(v).into());
-                }
+            if let Some(v) = opts.lookahead {
+                cerebras.insert("lookahead".into(), i64::from(v).into());
             }
             if let Some(asynchronous) = opts.asynchronous {
                 cerebras.insert("async".into(), asynchronous.into());

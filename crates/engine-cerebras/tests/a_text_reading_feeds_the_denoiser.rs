@@ -70,7 +70,7 @@ fn rel_cos(a: &[f32], b: &[f32]) -> (f64, f64) {
 fn engine_at(cache: &Path, fabric: Option<&str>) -> engine_cerebras::CerebrasEngine {
     let mut cfg = engine_cerebras::Config {
         cache_dir: Some(cache.to_path_buf()),
-        num_threads: 8,
+        num_threads: Some(8),
         // a system's programs are linked against its whole wafer (`prepare::stream_programs`)
         cmaddr: std::env::var("READING_CMADDR").ok(),
         ..engine_cerebras::Config::default()

@@ -679,8 +679,7 @@ impl CerebrasEngine {
         budgets: &engine::load::Budgets,
         programs: &[(std::path::PathBuf, std::path::PathBuf)],
     ) -> EngineResult<engine::load::Loaded> {
-        use engine::caps::{Capabilities, DeviceFacts, FireLimits, KvCopyDomains, PoolFacts};
-        use engine::transfer::MemoryDomain;
+        use engine::caps::{Capabilities, FireLimits, KvCopyDomains, PoolFacts};
         use eta_ir::registry::{GeometryClass, PortMask};
         let load = |e: String| Error::Load(e);
         let t0 = std::time::Instant::now();
@@ -760,7 +759,7 @@ impl CerebrasEngine {
             let cmd: Vec<String> = cmd.split_whitespace().map(str::to_string).collect();
             Remote::open(move || Ok(Box::new(crate::reading::Children::new(cmd)) as _))
         } else {
-            let (sdk_lib, platform) = (self.cfg.toolchain.sdk_lib(), self.platform());
+            let (sdk_lib, platform) = (self.cfg.toolchain.sdk_lib(), self.platform()?);
             Remote::open(move || {
                 Ok(Box::new(crate::reading::Programs {
                     sdk_lib,
@@ -787,21 +786,12 @@ impl CerebrasEngine {
         let max_tokens = budgets
             .max_tokens
             .max(u32::try_from(held(&Reading::request_rows)).unwrap_or(u32::MAX));
-        let slots = poem_compiler::state_slots(budgets.slots, &trace, super::DEFAULT_STATE_SLOTS);
+        let slots =
+            poem_compiler::state_slots(budgets.slots, &trace, super::default_state_slots(budgets));
         let facts = crate::facts::Facts::of(trace.clone(), budgets, slots).map_err(load)?;
         let paging = facts.paging();
         let caps = Capabilities {
-            device: DeviceFacts {
-                backend: "cerebras".to_string(),
-                domain: MemoryDomain::CerebrasDevice(0),
-                sms: 1,
-                unified_memory: false,
-                fp8_native: false,
-                native_mxfp4_moe: false,
-                storage_alignment: 256,
-                storage_max_tile_bytes: u64::MAX,
-                codegen_backend: None,
-            },
+            device: super::device_facts(),
             pools: PoolFacts {
                 kv_pages: u32::try_from(paging.pages()).unwrap_or(u32::MAX),
                 kv_page_size: paging.page_size,

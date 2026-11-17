@@ -91,19 +91,25 @@ impl CerebrasEngine {
     }
 
     /// The system the program runs on: the configured CS system, else the simulator.
-    fn platform(&self) -> crate::sdk::Platform {
-        match &self.cfg.cmaddr {
+    fn platform(&self) -> EngineResult<crate::sdk::Platform> {
+        Ok(match &self.cfg.cmaddr {
             Some(cmaddr) => crate::sdk::Platform::System {
                 cmaddr: cmaddr.clone(),
             },
-            None => crate::sdk::Platform::Simulator(crate::sdk::Simulator {
-                num_threads: self.cfg.num_threads,
-                ..crate::sdk::Simulator::new(match self.cfg.target {
-                    Target::Wse2 => crate::sdk::Target::Wse2,
-                    Target::Wse3 => crate::sdk::Target::Wse3,
-                })
-            }),
-        }
+            None => {
+                let threads = match self.cfg.num_threads {
+                    Some(n) => n,
+                    None => crate::sdk::host_threads().map_err(Error::Load)?,
+                };
+                crate::sdk::Platform::Simulator(crate::sdk::Simulator::new(
+                    match self.cfg.target {
+                        Target::Wse2 => crate::sdk::Target::Wse2,
+                        Target::Wse3 => crate::sdk::Target::Wse3,
+                    },
+                    threads,
+                ))
+            }
+        })
     }
 
     fn model(&mut self) -> EngineResult<&mut wafer::Wafer> {
@@ -113,8 +119,29 @@ impl CerebrasEngine {
     }
 }
 
-/// Recurrent-state seats when the budgets state none.
-const DEFAULT_STATE_SLOTS: u32 = 4;
+/// What Pie's scheduler is told of the device (every load alike). One program runs on the
+/// wafer: one compute unit (`sms`). The pools are the host's (pages hold tokens, recurrent state
+/// replays from them): no device alignment binds them (`storage_alignment` 256 is a convention,
+/// not a wafer fact) and no tile bound.
+fn device_facts() -> DeviceFacts {
+    DeviceFacts {
+        backend: "cerebras".to_string(),
+        domain: MemoryDomain::CerebrasDevice(0),
+        sms: 1,
+        unified_memory: false,
+        fp8_native: false,
+        native_mxfp4_moe: false,
+        storage_alignment: 256,
+        storage_max_tile_bytes: u64::MAX,
+        codegen_backend: None,
+    }
+}
+
+/// Recurrent-state seats when the budgets state none: one a lane the budgets run together (the
+/// seats are the host's, each a lane's tokens to replay).
+fn default_state_slots(budgets: &engine::load::Budgets) -> u32 {
+    budgets.max_lanes.max(1)
+}
 
 impl Engine for CerebrasEngine {
     fn kind(&self) -> &'static str {
@@ -157,8 +184,9 @@ impl Engine for CerebrasEngine {
         }
         // the program serves the context the config states (else as many positions as it holds)
         let positions = budgets.context_declared.then_some(budgets.max_context);
-        let slots = poem_compiler::state_slots(budgets.slots, &trace, DEFAULT_STATE_SLOTS);
-        let platform = self.platform();
+        let slots =
+            poem_compiler::state_slots(budgets.slots, &trace, default_state_slots(&budgets));
+        let platform = self.platform()?;
         let w = match prepare::prepare(&self.cfg, &trace, &contract, &path, positions) {
             Ok(prepared) => {
                 let facts = Facts::of(trace.clone(), &budgets, slots).map_err(Error::Load)?;
@@ -172,9 +200,17 @@ impl Engine for CerebrasEngine {
                     vocab,
                     prepared.weights.clone(),
                     self.cfg.toolchain.sdk_lib(),
-                    self.debug.force_prompt,
                 )
                 .map_err(|e| Error::Load(format!("the wafer model: {e}")))?;
+                // a program without the token loop serves only with the lookahead off: refused
+                // here, not at a greedy lane's first row
+                if !w.token_loop && self.cfg.lookahead.unwrap_or(fire::DEFAULT_LOOKAHEAD) > 0 {
+                    return Err(Error::Load(format!(
+                        "{}: built without the token loop (a WL build), and the lookahead is on \
+                         ([cerebras] lookahead = 0 serves it without one)",
+                        prepared.program.display()
+                    )));
+                }
                 tracing::info!(
                     program = %prepared.program.display(),
                     vocab = w.vocab,
@@ -252,17 +288,7 @@ impl Engine for CerebrasEngine {
         self.kv.page_size = paging.page_size;
         let state_rows = facts.has_state();
         let caps = Capabilities {
-            device: DeviceFacts {
-                backend: "cerebras".to_string(),
-                domain: MemoryDomain::CerebrasDevice(0),
-                sms: 1,
-                unified_memory: false,
-                fp8_native: false,
-                native_mxfp4_moe: false,
-                storage_alignment: 256,
-                storage_max_tile_bytes: u64::MAX,
-                codegen_backend: None,
-            },
+            device: device_facts(),
             pools: PoolFacts {
                 // The pages hold tokens here (the program's cache is replayed from them).
                 kv_pages: wafer_pages.map_or(

@@ -102,7 +102,7 @@ and Qwen3-8B.
 Notes on the table:
 
 - The 9B, 4B and 0.8B builds share kernel sources; only the params differ.
-- Pie runs 32-step loops (`posted_loop = 32`). Longer loops lower the per-step cost but
+- Pie runs 32-step loops (the plan's `LOOP`). Longer loops lower the per-step cost but
   lose wall time at the tail.
 - Pie's own cost is about 0.45 ms per posted launch, so Pie reaches 97% of bare.
 - Qwen3-8B: 36 dense attention layers in 9 K4 units on a 2 x 5 grid. The slot (1, 1) stays out of the snake so
@@ -129,7 +129,7 @@ cmaddr = "10.x.y.z:9000"   # omit for the fabric simulator
 max_model_len = 4096       # the positions the program is built for; omit for as many as the plan holds
 lookahead = 254
 async = true
-# posted_loop = 32         # default: the plan's LOOP
+# num_threads = 8          # simulator threads (default: the host's available parallelism; refused where the host cannot tell)
 
 [engine.wafer]             # all optional
 # preset = "9b"            # a named plan, a debug override (else the search's)
@@ -143,9 +143,6 @@ async = true
 # weights = "<dir>[:<prefix>]"       # place these staged tiles instead of cutting the checkpoint
 # set = "G2=12"                      # overrides of the plan's keys
 # levers = "DIAG:1,TSTAMP:1"         # kernel levers past the plan's
-# force_prompt = true                # the prompt through the token loop
-# posted = false                     # one loop at a time
-# loop_room = false                  # loops not bounded by the lane's pages
 ```
 
 A load plans the model's trace (the kernel set its layers take, the search's partition, the positions), builds and links the
@@ -209,7 +206,7 @@ default is the shipped build. Each kernel's header describes its own params and 
 | `DIAG` | weight, CX, CY | 0 | bisection bits: 1 no layers, 2 one layer, 4 no MLP, 8 column reduction only, 16 row reduction only |
 | `HOSTX` | CX | 0 | simulator tests: x is the host's, no handoff |
 | `WFORCE`, `WFN` | head_ctl | 0 | diagnostics: a forced winner sequence `(s WFORCE + 7) % (VR WFN)` that exercises every row's return path |
-| `force` / `nforce` | head_ctl (symbols) | - | the host forces the first `nforce` steps' tokens: a whole prompt through the loop in one launch (`[engine.debug] force_prompt`), and teacher-forced checks |
+| `force` / `nforce` | head_ctl (symbols) | - | the host forces the first `nforce` steps' tokens: a whole prompt through the loop in one launch (no host writes them since the engine's debug `force_prompt` went; the programs keep the symbols) |
 | `HACC16` | head_pe | 0 | measurement: f16 head accumulation, about -1.7k cycles. It halves the 9B golden's tightest margin and, stacked with other levers, flipped it. |
 | `FIFOW` | all | 32 | the reductions' FIFO depth |
 | `SLW` | CY | 0 | the f16 SiLU without its subnormal flush (the tail to 2^-24). Qwen3-8B needs it: the flush costs 2 golden tokens in emulation. |
@@ -231,10 +228,8 @@ These variants were removed after they failed:
 ## 5. Serving settings and metrics
 
 The `[engine]` settings above are the whole configuration: the engine reads no environment variable. The
-posted loop's length is the plan's `LOOP` (Dense 32, Gemma and gpt-oss 64) unless `posted_loop` sets it; loops
-double from 8 up to it. `[engine.debug]`'s `posted = false` runs one loop at a time (bounded by the lane's
-pages; `loop_room = false` drops the bound) and `force_prompt` forces the prompt through the token loop (one
-launch: prefill and the first token; the program needs `force` / `nforce`).
+posted loop's length is the plan's `LOOP` (Dense 32, Gemma and gpt-oss 64); loops double from 8 up to it. A
+program built without the token loop loads only with `lookahead = 0`.
 
 **Posted loops.** Greedy decoding runs as token loops posted back to back. The next loop goes onto
 the wafer while the previous loop's rows are answered. The wafer idles about 0.02 ms between loops.

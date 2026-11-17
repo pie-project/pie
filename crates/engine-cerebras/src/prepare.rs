@@ -239,36 +239,23 @@ pub fn prepare(
         positions: max_model_len,
     };
     let cache = Cache::open(cfg)?;
-    // The plans in the order they are preferred; the next is tried where a program does not fit
-    // its PEs' memory (only its link tells).
-    let tries = target::plans(trace, &ask)?;
-    let mut tried = Vec::new();
-    let (plan, program) = 'chosen: {
-        for planned in tries {
-            let plan = planned.plan;
-            tracing::info!(
-                kernels = kernels_cerebras::kernels::KernelSet::of_shape(&plan.shape).name(),
-                preset = %planned.preset.name,
-                positions = plan.contract.positions,
-                "cerebras: the wafer program's plan"
-            );
-            let Some(p) = &knobs.program else {
-                match compile(cfg, &cache, trace, &plan, &knobs.levers) {
-                    Ok(dir) => break 'chosen (plan, dir),
-                    Err(e) if build::out_of_pe_memory(&e) => {
-                        tracing::warn!(preset = %planned.preset.name, "cerebras: {e}");
-                        tried.push(format!("preset {}: {e}", planned.preset.name));
-                        continue;
-                    }
-                    Err(e) => return Err(e),
-                }
-            };
-            break 'chosen (plan, p.clone());
-        }
-        return Err(format!(
-            "no preset's program fits the PEs' memory: {}",
-            tried.join("; ")
-        ));
+    // One plan: the first the search (or the preset) gives, each of which the plans' memory
+    // model already holds within its PEs (`cost::memory::room`, the static check's model for
+    // a decode program); a link past it is an error, not a cue to try the next.
+    let planned = target::plans(trace, &ask)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("{}: no plan", trace.name))?;
+    let plan = planned.plan;
+    tracing::info!(
+        kernels = kernels_cerebras::kernels::KernelSet::of_shape(&plan.shape).name(),
+        preset = %planned.preset.name,
+        positions = plan.contract.positions,
+        "cerebras: the wafer program's plan"
+    );
+    let program = match &knobs.program {
+        Some(p) => p.clone(),
+        None => compile(cfg, &cache, trace, &plan, &knobs.levers)?,
     };
 
     let (weights, scratch) = match &knobs.weights {
@@ -711,11 +698,14 @@ fn checkpoint_stamp(checkpoint: &Path) -> R<String> {
     };
     for p in entries {
         let m = std::fs::metadata(&p).map_err(io(&p))?;
+        // (a file whose time cannot be read is refused: a stamp of 0 would match a changed
+        // checkpoint to its old cut)
         let mtime = m
             .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map_or(0, |d| d.as_secs());
+            .map_err(|e| format!("{}: its modification time: {e}", p.display()))?
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| format!("{}: its modification time: {e}", p.display()))?
+            .as_secs();
         files.push((
             p.file_name()
                 .map(|n| n.to_string_lossy().to_string())

@@ -28,45 +28,11 @@ impl Moving {
         let p = &plan.partition;
         let ceil = |a: u32, b: u32| f64::from(a.div_ceil(b.max(1)));
         let k = p.layers_per_unit as usize;
-        // a weight PE's x dims: the widest row run's
-        let hc = p
-            .row_dims
-            .iter()
-            .map(|r| f64::from(r.dims))
-            .fold(0.0, f64::max);
         let (att_cols, mlp_cols) = match p.attn_cols {
             Some(a) => (a, p.cols - a),
             None => (p.cols, p.cols),
         };
-        // the busiest unit: its K layers' tiles (f16; routed experts E5M2) and its caches, the
-        // attention half's and the MLP half's on their own PEs where they split (gpt-oss)
         let split = p.attn_cols.is_some();
-        let mut weight: f64 = 0.0;
-        for (u, unit) in s.layers.chunks(k.max(1)).enumerate() {
-            let (mut att, mut mlp) = (0.0, 0.0);
-            for (i, kind) in unit.iter().enumerate() {
-                let l = u * k + i;
-                let (outs, q) = projections(plan, *kind);
-                att += 2.0 * hc * (ceil(outs, att_cols) + ceil(q, att_cols));
-                mlp += match s.moe {
-                    Some(m) => {
-                        f64::from(m.experts)
-                            * 3.0
-                            * f64::from(s.hidden)
-                            * f64::from(m.expert_intermediate)
-                            / (f64::from(p.rows.max(1)) * f64::from(mlp_cols.max(1)))
-                    }
-                    None => 2.0 * hc * 3.0 * ceil(s.mlp.width(l as u32), mlp_cols),
-                };
-                if let Some(entries) = cache_entries(plan, *kind) {
-                    let (heads, dim) = kv(plan, *kind);
-                    let dc = ceil(heads * dim, att_cols);
-                    // keys and values (f16), the keys' inverse norms (f32)
-                    att += entries * (4.0 * dc + 4.0);
-                }
-            }
-            weight = weight.max(if split { att.max(mlp) } else { att + mlp });
-        }
         // the scores' buffers (f32 partials and scores, their f16 copy): each KV head's q heads
         // times the entries a row keeps
         let entries = [
@@ -78,8 +44,43 @@ impl Moving {
         .max()
         .unwrap_or(0);
         let qh = s.attn.q_heads / s.attn.kv_heads.max(1);
-        if !split {
-            weight += 10.0 * f64::from(qh * entries);
+        // each run of rows on its own (its x dims; the cache and the scores only where its rows
+        // attend): a plain row's wider dims and an attention row's cache are not one PE's
+        let mut weight: f64 = 0.0;
+        for run in &p.row_dims {
+            let hc = f64::from(run.dims);
+            // the busiest unit: its K layers' tiles (f16; routed experts E5M2) and its caches,
+            // the attention half's and the MLP half's on their own PEs where they split
+            // (gpt-oss)
+            for (u, unit) in s.layers.chunks(k.max(1)).enumerate() {
+                let (mut att, mut mlp) = (0.0, 0.0);
+                for (i, kind) in unit.iter().enumerate() {
+                    let l = u * k + i;
+                    let (outs, q) = projections(plan, *kind);
+                    att += 2.0 * hc * (ceil(outs, att_cols) + ceil(q, att_cols));
+                    mlp += match s.moe {
+                        Some(m) => {
+                            f64::from(m.experts)
+                                * 3.0
+                                * f64::from(s.hidden)
+                                * f64::from(m.expert_intermediate)
+                                / (f64::from(p.rows.max(1)) * f64::from(mlp_cols.max(1)))
+                        }
+                        None => 2.0 * hc * 3.0 * ceil(s.mlp.width(l as u32), mlp_cols),
+                    };
+                    if let (true, Some(entries)) = (run.attention, cache_entries(plan, *kind)) {
+                        let (heads, dim) = kv(plan, *kind);
+                        let dc = ceil(heads * dim, att_cols);
+                        // keys and values (f16), the keys' inverse norms (f32)
+                        att += entries * (4.0 * dc + 4.0);
+                    }
+                }
+                let mut w = if split { att.max(mlp) } else { att + mlp };
+                if !split && run.attention {
+                    w += 10.0 * f64::from(qh * entries);
+                }
+                weight = weight.max(w);
+            }
         }
         let hdc = ceil(s.hidden, p.head.cols);
         let head = 4.0 * f64::from(p.head.vocab_rows) * hdc;

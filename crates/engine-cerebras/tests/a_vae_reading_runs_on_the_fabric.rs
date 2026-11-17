@@ -363,10 +363,10 @@ fn flux_2_minis_vae_on_the_fabric() {
     let entries = reading.entries(&mut host, &st).expect("the entries");
     let platform = match std::env::var("READING_CMADDR") {
         Ok(cmaddr) => engine_cerebras::sdk::Platform::System { cmaddr },
-        Err(_) => engine_cerebras::sdk::Platform::Simulator(engine_cerebras::sdk::Simulator {
-            num_threads: 8,
-            ..engine_cerebras::sdk::Simulator::new(engine_cerebras::sdk::Target::Wse3)
-        }),
+        Err(_) => engine_cerebras::sdk::Platform::Simulator(engine_cerebras::sdk::Simulator::new(
+            engine_cerebras::sdk::Target::Wse3,
+            8,
+        )),
     };
     let mut fab = Programs {
         sdk_lib: cfg.toolchain.sdk_lib(),

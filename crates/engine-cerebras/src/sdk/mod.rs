@@ -95,6 +95,8 @@ pub enum Error {
     },
     /// A path is not valid UTF-8.
     Path(PathBuf),
+    /// A directory `PATH` cannot take (it holds the separator).
+    PathJoin(PathBuf),
     /// Every runtime of a process must be created on the thread that created
     /// its first one: the SDK's message system asserts on that and would abort.
     MainThread,
@@ -119,6 +121,11 @@ impl fmt::Display for Error {
                 )
             }
             Error::Path(p) => write!(f, "path is not UTF-8: {}", p.display()),
+            Error::PathJoin(p) => write!(
+                f,
+                "{} cannot join PATH (it holds the separator)",
+                p.display()
+            ),
             Error::MainThread => write!(
                 f,
                 "the SDK runtime must be created on the process's main thread"
@@ -169,7 +176,7 @@ impl Sdk {
         let artifacts = load("libsdk_compile_artifacts.so")?;
         let runtime = load("libsdkruntime.so")?;
         let api = sys::Api::resolve(&artifacts, &platform, &runtime)?;
-        prepend_path(&lib_dir.join("../bin"));
+        prepend_path(&lib_dir.join("../bin"))?;
         Ok(Arc::new(Sdk {
             api,
             lib_dir: lib_dir.to_path_buf(),
@@ -193,14 +200,25 @@ fn owning_thread() -> bool {
     *OWNER.get_or_init(|| std::thread::current().id()) == std::thread::current().id()
 }
 
-fn prepend_path(dir: &Path) {
+/// `dir` first on `PATH` (the SDK's helpers run from there); a `PATH` it cannot join (a
+/// directory holding the separator) is refused, not left without it.
+fn prepend_path(dir: &Path) -> Result<()> {
     let current = std::env::var_os("PATH").unwrap_or_default();
     let mut parts = vec![dir.to_path_buf()];
     parts.extend(std::env::split_paths(&current));
-    if let Ok(joined) = std::env::join_paths(parts) {
-        // SAFETY: called once at open time, before the SDK spawns any helper.
-        unsafe { std::env::set_var("PATH", joined) };
-    }
+    let joined = std::env::join_paths(parts).map_err(|_| Error::PathJoin(dir.to_path_buf()))?;
+    // SAFETY: called once at open time, before the SDK spawns any helper.
+    unsafe { std::env::set_var("PATH", joined) };
+    Ok(())
+}
+
+/// The simulator's threads by default: the host's available parallelism; a host that cannot
+/// tell is refused (state `num_threads`), not given a guess.
+pub fn host_threads() -> std::result::Result<u32, String> {
+    let n = std::thread::available_parallelism().map_err(|e| {
+        format!("the host's available parallelism: {e} (state [engine] num_threads)")
+    })?;
+    Ok(u32::try_from(n.get()).unwrap_or(u32::MAX))
 }
 
 /// Which wafer generation the program was compiled for.
@@ -220,10 +238,10 @@ pub struct Simulator {
 }
 
 impl Simulator {
-    pub fn new(target: Target) -> Self {
+    pub fn new(target: Target, num_threads: u32) -> Self {
         Simulator {
             target,
-            num_threads: 16,
+            num_threads,
             suppress_trace: true,
             dump_core: false,
         }

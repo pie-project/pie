@@ -103,12 +103,12 @@ fn main() {
     let sdk_lib = PathBuf::from(arg(&args, "--sdk-lib").unwrap_or_else(|| "/cbcore/lib".into()));
     let platform = match arg(&args, "--cmaddr") {
         Some(cmaddr) => engine_cerebras::sdk::Platform::System { cmaddr },
-        None => engine_cerebras::sdk::Platform::Simulator(engine_cerebras::sdk::Simulator {
-            num_threads: arg(&args, "--threads")
+        None => engine_cerebras::sdk::Platform::Simulator(engine_cerebras::sdk::Simulator::new(
+            engine_cerebras::sdk::Target::Wse3,
+            arg(&args, "--threads")
                 .and_then(|t| t.parse().ok())
                 .unwrap_or(8),
-            ..engine_cerebras::sdk::Simulator::new(engine_cerebras::sdk::Target::Wse3)
-        }),
+        )),
     };
     let mut fab = Programs {
         sdk_lib,

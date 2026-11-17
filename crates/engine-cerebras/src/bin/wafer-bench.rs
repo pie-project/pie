@@ -423,10 +423,7 @@ fn decode(get: &HashMap<String, String>) -> Result<bool, String> {
     }
     let platform = match get.get("cmaddr") {
         Some(c) => Platform::System { cmaddr: c.clone() },
-        None => Platform::Simulator(Simulator {
-            num_threads: 8,
-            ..Simulator::new(Target::Wse3)
-        }),
+        None => Platform::Simulator(Simulator::new(Target::Wse3, 8)),
     };
     let sdk = Sdk::open().map_err(|e| e.to_string())?;
     let mut rt =
@@ -644,10 +641,7 @@ fn reading(get: &HashMap<String, String>) -> Result<bool, String> {
     let d = Denoise::of(&reading.model, steps, Some(image_rows))?;
     let platform = match get.get("cmaddr") {
         Some(c) => Platform::System { cmaddr: c.clone() },
-        None => Platform::Simulator(Simulator {
-            num_threads: 8,
-            ..Simulator::new(Target::Wse3)
-        }),
+        None => Platform::Simulator(Simulator::new(Target::Wse3, 8)),
     };
     let sdk = Sdk::open().map_err(|e| e.to_string())?;
     let golden = get.get("golden").map(std::path::PathBuf::from);
@@ -894,10 +888,7 @@ fn run() -> Result<bool, String> {
     let art = read(Path::new(&program))?;
     let platform = match get.get("cmaddr") {
         Some(c) => Platform::System { cmaddr: c.clone() },
-        None => Platform::Simulator(Simulator {
-            num_threads: 8,
-            ..Simulator::new(Target::Wse3)
-        }),
+        None => Platform::Simulator(Simulator::new(Target::Wse3, 8)),
     };
     let sdk = Sdk::open().map_err(|e| e.to_string())?;
     let mut rt =
