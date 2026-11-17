@@ -324,6 +324,14 @@ pub struct Weighed {
     pub live: u64,
 }
 
+/// The tokens a load's budget is cut to once its top rung is `pick`: the
+/// pick, where it lies under the `asked` tokens the budget lays its span and
+/// fires for, so no fire runs past the rung the load chose; `None` where the
+/// budget already stops there.
+fn fire_bound(pick: Option<u32>, asked: u32) -> Option<u32> {
+    pick.filter(|&widest| widest < asked)
+}
+
 /// How a load chooses the top rung of its fires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Top {
@@ -1129,12 +1137,17 @@ impl<B: Serve> Shell<B> {
                     crate::arena::bound_top(&spans, binding)
                 }
             };
-            match pick {
-                Some(widest) if widest < top => {
+            // The fire bound is the chosen rung, one source: the budget the
+            // span and every fire are laid for is cut to it wherever it lies
+            // under the tokens the budget still asks (the candidates stop at
+            // the saturation point, so a pick at the candidates' top can lie
+            // under the ask).
+            match fire_bound(pick, budgets.tokens.max_tokens) {
+                Some(widest) => {
                     budgets.tokens = crate::arena::bounded_budget(&budgets.tokens, widest);
                     boot.budget = budgets.tokens.clone();
                 }
-                _ => break (compiled, span),
+                None => break (compiled, span),
             }
         };
         match chosen.flatten() {
@@ -5602,5 +5615,23 @@ mod tests {
                 },
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod fire_bound_tests {
+    use super::fire_bound;
+
+    #[test]
+    fn a_load_never_fires_above_the_top_it_chose() {
+        // Asked 10240, the grid saturating at 4096: the candidates stop at
+        // 4096, and a pick there (the candidates' own top) still cuts the
+        // budget, so no fire runs at 10240 over a span laid for 4096.
+        assert_eq!(fire_bound(Some(4096), 10240), Some(4096));
+        // A pick under the candidates' top cuts it too.
+        assert_eq!(fire_bound(Some(1024), 10240), Some(1024));
+        // The budget already at the pick, or no pick: nothing to cut.
+        assert_eq!(fire_bound(Some(4096), 4096), None);
+        assert_eq!(fire_bound(None, 10240), None);
     }
 }
