@@ -670,29 +670,22 @@ impl Pinned {
     /// no fire reads in place, the device copying out of it alone, whose
     /// address it takes as any host address (`device` is the host address).
     /// Nothing is pinned, so a span of gigabytes costs no page-locking.
-    #[cfg(unix)]
     pub fn pageable(bytes: usize) -> Result<Pinned> {
         if bytes == 0 {
             return Ok(Pinned::empty());
         }
-        // SAFETY: a fresh private anonymous mapping of a stated length; no
-        // fd, no offset, owned by this structure and unmapped once in `Drop`.
-        let at = unsafe {
-            libc::mmap(
-                core::ptr::null_mut(),
-                bytes,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
-                -1,
-                0,
-            )
-        };
-        if at == libc::MAP_FAILED {
-            return Err(Fault::Residency(format!(
+        // Owned by this structure and unmapped once in `Drop`.
+        let refused = || {
+            Fault::Residency(format!(
                 "this machine would not map {bytes} bytes of host memory for the weights' copy"
-            )));
+            ))
+        };
+        let at = reserve_anon(bytes).ok_or_else(refused)?;
+        if !commit_anon(at, bytes) {
+            unmap_anon(at, bytes);
+            return Err(refused());
         }
-        prefault(at.cast(), bytes);
+        prefault(at, bytes);
         pageable_spans().push((at as usize, bytes));
         Ok(Pinned {
             host: at.cast(),
@@ -876,8 +869,72 @@ impl Drop for Pinned {
     }
 }
 
+/// `bytes` of private anonymous address space, readable and writable once
+/// committed ([`commit_anon`]); released with [`unmap_anon`].
 #[cfg(unix)]
-fn unmap_anon(at: *mut u8, bytes: usize) {
+pub(crate) fn reserve_anon(bytes: usize) -> Option<*mut u8> {
+    // SAFETY: a fresh private anonymous mapping of a stated length; no fd,
+    // no offset, owned by the caller.
+    let at = unsafe {
+        libc::mmap(
+            core::ptr::null_mut(),
+            bytes.max(1),
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+            -1,
+            0,
+        )
+    };
+    (at != libc::MAP_FAILED).then_some(at.cast())
+}
+
+#[cfg(windows)]
+pub(crate) fn reserve_anon(bytes: usize) -> Option<*mut u8> {
+    use windows_sys::Win32::System::Memory::{MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+    // SAFETY: a fresh reservation of a stated length, owned by the caller.
+    let at = unsafe {
+        VirtualAlloc(
+            core::ptr::null_mut(),
+            bytes.max(1),
+            MEM_RESERVE,
+            PAGE_READWRITE,
+        )
+    };
+    (!at.is_null()).then_some(at.cast())
+}
+
+/// Commits `bytes` at `at`, inside a [`reserve_anon`] span: false when the
+/// OS will not back them. Unix commits a page as it is first written.
+#[cfg(unix)]
+pub(crate) fn commit_anon(_at: *mut u8, _bytes: usize) -> bool {
+    true
+}
+
+#[cfg(windows)]
+pub(crate) fn commit_anon(at: *mut u8, bytes: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, PAGE_READWRITE, VirtualAlloc};
+    // SAFETY: committing pages of the caller's own reservation; committed
+    // pages read zero until written.
+    !unsafe { VirtualAlloc(at.cast(), bytes, MEM_COMMIT, PAGE_READWRITE) }.is_null()
+}
+
+/// Drops the resident pages of `bytes` at `at`, whole pages of a read-only
+/// file mapping whose contents were copied elsewhere: a later read faults
+/// them back in from the file. The advice is unix's; elsewhere the OS trims
+/// a mapping's pages on its own.
+pub(crate) fn drop_file_pages(at: usize, bytes: usize) {
+    #[cfg(unix)]
+    // SAFETY: whole pages inside a live read-only file mapping (the
+    // caller's contract); the advice changes no contents.
+    unsafe {
+        libc::madvise(at as *mut core::ffi::c_void, bytes, libc::MADV_DONTNEED);
+    }
+    #[cfg(not(unix))]
+    let _ = (at, bytes);
+}
+
+#[cfg(unix)]
+pub(crate) fn unmap_anon(at: *mut u8, bytes: usize) {
     // SAFETY: unmapping a mapping `map_anon` made, exactly once.
     unsafe {
         libc::munmap(at.cast(), bytes.max(1));
@@ -885,7 +942,7 @@ fn unmap_anon(at: *mut u8, bytes: usize) {
 }
 
 #[cfg(windows)]
-fn unmap_anon(at: *mut u8, _bytes: usize) {
+pub(crate) fn unmap_anon(at: *mut u8, _bytes: usize) {
     use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
     // SAFETY: releasing a reservation `map_anon` made, exactly once.
     unsafe {
@@ -1454,7 +1511,6 @@ pub fn free_bytes() -> Option<u64> {
 /// kernel alone it takes 10 s, and huge pages asked for instead stall on
 /// compaction where the page cache has fragmented memory, a boot slower
 /// each run.
-#[cfg(unix)]
 fn prefault(at: *mut u8, bytes: usize) {
     const PAGE: usize = 4096;
     let pages = bytes.div_ceil(PAGE);

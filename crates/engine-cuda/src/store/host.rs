@@ -14,10 +14,12 @@
 //! the ring as it starts, beside the rest of the boot, and the first move
 //! waits for it.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::device::Pinned;
+use crate::device::alloc;
 use crate::device::graph::Event;
 use crate::error::{Fault, Result};
 
@@ -95,6 +97,8 @@ pub struct HostTier {
     next: u64,
     /// The last batch writing into each chunk: one a move reads waits for.
     writing: Vec<u64>,
+    /// Whether each chunk's pages are committed ([`alloc::commit_anon`]).
+    committed: Vec<AtomicBool>,
     shared: Arc<Shared>,
     send: Option<Sender<Job>>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -116,36 +120,26 @@ impl std::fmt::Debug for HostTier {
 unsafe impl Send for HostTier {}
 
 impl HostTier {
-    /// A tier of `chunks` chunks of `chunk_bytes`, mapped, not committed,
-    /// behind a staging ring of `ring` bytes ([`staging_ring`]).
+    /// A tier of `chunks` chunks of `chunk_bytes`, reserved, each committed
+    /// when a span first names it, behind a staging ring of `ring` bytes
+    /// ([`staging_ring`]).
     pub fn new(chunk_bytes: u64, chunks: u32, ring: u64) -> Result<HostTier> {
         let len =
             usize::try_from(chunk_bytes.saturating_mul(u64::from(chunks))).unwrap_or(usize::MAX);
-        // SAFETY: an anonymous private mapping no other code knows of; the
-        // kernel commits its pages as they are first written.
-        let base = unsafe {
-            libc::mmap(
-                core::ptr::null_mut(),
-                len.max(1),
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
-                -1,
-                0,
-            )
-        };
-        if base == libc::MAP_FAILED {
+        let Some(base) = alloc::reserve_anon(len) else {
             return Err(Fault::Ceiling {
                 what: "bytes of address space for the host tier",
                 need: len as u64,
                 have: 0,
             });
-        }
+        };
         // Committed a huge page at a time where the kernel has them: a move
         // landing in fresh memory faults a page in per 2 MiB, not per 4 KiB.
         // SAFETY: advice on this tier's own mapping; a kernel without
         // transparent huge pages ignores it.
+        #[cfg(target_os = "linux")]
         unsafe {
-            libc::madvise(base, len.max(1), libc::MADV_HUGEPAGE);
+            libc::madvise(base.cast(), len.max(1), libc::MADV_HUGEPAGE);
         }
         let ring_bytes = usize::try_from(ring.max(2 * chunk_bytes)).unwrap_or(usize::MAX);
         let shared = Arc::new(Shared {
@@ -175,6 +169,7 @@ impl HostTier {
             freed: 0,
             next: 0,
             writing: vec![0; chunks as usize],
+            committed: (0..chunks).map(|_| AtomicBool::new(false)).collect(),
             shared,
             send: Some(send),
             thread: Some(thread),
@@ -279,6 +274,24 @@ impl HostTier {
                 need: end,
                 have: self.len as u64,
             });
+        }
+        let chunk_bytes = self.chunk_bytes.max(1);
+        for chunk in offset / chunk_bytes..end.div_ceil(chunk_bytes) {
+            let committed = &self.committed[chunk as usize];
+            if committed.load(Ordering::Relaxed) {
+                continue;
+            }
+            let at = chunk * chunk_bytes;
+            let bytes = chunk_bytes.min(self.len as u64 - at);
+            // SAFETY: the chunk lies inside this tier's own reservation.
+            if !alloc::commit_anon(unsafe { self.base.add(at as usize) }, bytes as usize) {
+                return Err(Fault::Ceiling {
+                    what: "bytes of host memory the OS would commit for a host-tier chunk",
+                    need: bytes,
+                    have: 0,
+                });
+            }
+            committed.store(true, Ordering::Relaxed);
         }
         Ok(offset as usize)
     }
@@ -427,10 +440,8 @@ impl Drop for HostTier {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
-        // SAFETY: this tier's own mapping, no longer read or written.
-        unsafe {
-            libc::munmap(self.base.cast(), self.len.max(1));
-        }
+        // This tier's own mapping, no longer read or written.
+        alloc::unmap_anon(self.base, self.len);
     }
 }
 
@@ -483,6 +494,7 @@ fn land(jobs: &Receiver<Job>, shared: &Shared, ordinal: i32, ring_bytes: usize, 
 }
 
 /// The threads that fault the ring's pages in before it is locked.
+#[cfg(target_os = "linux")]
 const RING_FAULTERS: usize = 8;
 
 /// The staging ring, page-locked: faulted in first, in huge pages where the

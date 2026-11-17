@@ -3262,16 +3262,9 @@ impl Pools {
             let first = at.next_multiple_of(PAGE);
             let end = (at + bytes as u64) / PAGE * PAGE;
             if end > first {
-                // SAFETY: whole pages inside a read-only file mapping the
-                // weight store holds for the load's life; the advice drops
-                // their resident copies, which a later read faults back in.
-                unsafe {
-                    libc::madvise(
-                        first as *mut core::ffi::c_void,
-                        (end - first) as usize,
-                        libc::MADV_DONTNEED,
-                    );
-                }
+                // Whole pages inside a read-only file mapping the weight
+                // store holds for the load's life.
+                crate::device::alloc::drop_file_pages(first as usize, (end - first) as usize);
             }
         }
     }
