@@ -1181,6 +1181,12 @@ impl SchedulerHandle {
                 .and_then(|stores| stores.roles)
                 .map(|roles| roles.lock().unwrap().room_watch())
         };
+        // Whether `pieces` runs of `run` chunks stand free for its state.
+        let fits = |run: u32, pieces: u32| {
+            crate::store::registry::try_get(0, engine)
+                .and_then(|stores| stores.roles)
+                .is_some_and(|roles| roles.lock().unwrap().free_runs(run) >= pieces)
+        };
         // Holding guest state of its own, it is suspended instead: waiting,
         // it would hold room its own bind lacks.
         let suspend = || {
@@ -1206,7 +1212,7 @@ impl SchedulerHandle {
             .map_err(|why| why.to_string())
         };
         let (registered, _, bound) = crate::store::roles::bind_when_resident(
-            pid, lane_bind, resident, grown, room, suspend, planned,
+            pid, lane_bind, resident, grown, room, fits, suspend, planned,
         )
         .await?;
         Ok((registered, bound))
@@ -2879,8 +2885,14 @@ impl BatchScheduler {
     ) {
         match commit {
             LaneCommit::None => {}
-            LaneCommit::BindFinished { pipeline_id } => {
+            LaneCommit::BindFinished { pipeline_id, waits } => {
                 frame_policy.on_bind_completed(pipeline_id);
+                // Waiting for room, its process submits nothing until the
+                // bind lands: its lanes go out of the frame, as a
+                // suspension's do, and come back with its next submit.
+                if waits && let Some(pid) = pipeline_id {
+                    frame_policy.on_bind_waits(pid);
+                }
             }
             LaneCommit::BindInstance {
                 pipeline_id,

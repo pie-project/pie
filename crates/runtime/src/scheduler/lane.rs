@@ -94,6 +94,10 @@ pub(super) enum LaneCommit {
     },
     BindFinished {
         pipeline_id: Option<ProcessId>,
+        /// The bind found no room for its guest state and registered
+        /// nothing: its process waits for room
+        /// ([`crate::store::roles::bind_when_resident`]), off the frame.
+        waits: bool,
     },
     CloseInstance {
         id: ::engine::InstanceId,
@@ -549,6 +553,7 @@ impl Lane {
             QueuedItem::Launch(_) => unreachable!(),
             QueuedItem::RegisterChannelsBind { pipeline_id, .. } => LaneCommit::BindFinished {
                 pipeline_id: *pipeline_id,
+                waits: false,
             },
             QueuedItem::PreLaunchCopy { .. } | QueuedItem::CopyTracked { .. } => {
                 LaneCommit::AsyncControl {
@@ -785,7 +790,10 @@ impl Lane {
                         program_id = bind.program_id().0,
                         "scheduler RPC cancelled before resource creation"
                     );
-                    return LaneCommit::BindFinished { pipeline_id };
+                    return LaneCommit::BindFinished {
+                            pipeline_id,
+                            waits: false,
+                        };
                 }
                 let engine = match backend(engine) {
                     Ok(engine) => engine,
@@ -793,10 +801,35 @@ impl Lane {
                         if response.send(Err(error)).is_err() {
                             Self::release_wait_slots([bind.pacing_wait_id]);
                         }
-                        return LaneCommit::BindFinished { pipeline_id };
+                        return LaneCommit::BindFinished {
+                            pipeline_id,
+                            waits: false,
+                        };
                     }
                 };
                 let roles = roles_of(engine_idx);
+                // Its guest state first: a bind short of room is answered
+                // so before it registers anything, and waits for room
+                // (`bind_when_resident`) with nothing rolled back.
+                let guest = match crate::store::roles::take_guest(
+                    roles.as_ref(),
+                    &mut **engine,
+                    &bind.binding,
+                ) {
+                    Ok(guest) => guest,
+                    Err(error) => {
+                        let waits = crate::store::roles::waits_for_room(&error);
+                        if response.send(Err(error)).is_err() {
+                            Self::release_wait_slots([bind.pacing_wait_id]);
+                        }
+                        return LaneCommit::BindFinished { pipeline_id, waits };
+                    }
+                };
+                let untake = |guest: Option<crate::store::roles::GuestTaken>| {
+                    if let (Some(guest), Some(roles)) = (guest, roles.as_ref()) {
+                        roles.lock().unwrap().untake_guest(guest);
+                    }
+                };
                 let registered = match Self::register_channel_set(
                     engine,
                     engine_idx,
@@ -806,13 +839,18 @@ impl Lane {
                 ) {
                     Ok(registered) => registered,
                     Err(error) => {
+                        untake(guest);
                         if response.send(Err(error)).is_err() {
                             Self::release_wait_slots([bind.pacing_wait_id]);
                         }
-                        return LaneCommit::BindFinished { pipeline_id };
+                        return LaneCommit::BindFinished {
+                            pipeline_id,
+                            waits: false,
+                        };
                     }
                 };
                 if response.is_closed() {
+                    untake(guest);
                     Self::rollback_channel_set(
                         engine,
                         channels,
@@ -822,9 +860,19 @@ impl Lane {
                     );
                     Lane::release_registered_channel_wait_slots(&registered);
                     Self::release_wait_slots([bind.pacing_wait_id]);
-                    return LaneCommit::BindFinished { pipeline_id };
+                    return LaneCommit::BindFinished {
+                            pipeline_id,
+                            waits: false,
+                        };
                 }
-                match Self::bind(engine, channels, &bind, roles.as_ref(), pipeline_id) {
+                match Self::bind(
+                    engine,
+                    channels,
+                    &bind,
+                    roles.as_ref(),
+                    pipeline_id,
+                    guest,
+                ) {
                     Ok((bound, standing)) => {
                         // The engine's standing guest bytes are its total.
                         if let Some(shared) =
@@ -854,7 +902,10 @@ impl Lane {
                             Self::release_registered_channel_wait_slots(&registered);
                             Self::release_wait_slots([bind.pacing_wait_id]);
                         }
-                        LaneCommit::BindFinished { pipeline_id }
+                        LaneCommit::BindFinished {
+                            pipeline_id,
+                            waits: false,
+                        }
                     }
                 }
             }
@@ -997,13 +1048,15 @@ impl Lane {
         plan: &crate::engine::InstanceBindingPlan,
         roles: Option<&crate::store::roles::RolesHandle>,
         holder: Option<ProcessId>,
+        guest: Option<crate::store::roles::GuestTaken>,
     ) -> Result<(BoundInstance, u64)> {
-        let bound = crate::store::roles::bind_instance(
+        let bound = crate::store::roles::bind_taken(
             roles,
             &mut **engine,
             &plan.binding,
             holder,
             |id| channels.engine_registered(id),
+            guest,
         )?;
         let standing = bound.standing_guest_bytes;
         let bound = BoundInstance::new(&bound, plan.pacing_wait_id);

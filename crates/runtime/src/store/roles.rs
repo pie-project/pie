@@ -182,6 +182,17 @@ pub enum RolesError {
     },
 }
 
+/// Whether `error` is a bind waiting for room for its guest state
+/// ([`RolesError::BindShort`], [`RolesError::GuestGrow`]): nothing was
+/// registered for it, and it binds again once room is there.
+#[must_use]
+pub fn waits_for_room(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<RolesError>(),
+        Some(RolesError::BindShort(_) | RolesError::GuestGrow { .. })
+    )
+}
+
 impl RolesError {
     /// The device pool lacks room for it now: what a park, a completion or
     /// a commit may make, not a wrong ask.
@@ -417,6 +428,16 @@ pub struct Taken {
     /// The slots of an `Instance` chunk: a whole part's chunks are its
     /// refs over it.
     chunk_slots: u32,
+}
+
+/// A bind's guest state taken before it registered anything
+/// ([`Roles::take_guest`]): its scratch, and its pair's state with whether
+/// it was taken for this bind. [`Roles::take_instance`] takes it into the
+/// bind's [`Taken`]; [`Roles::untake_guest`] gives it back.
+#[derive(Debug, Default)]
+pub struct GuestTaken {
+    scratch: Option<Part>,
+    pair: Option<(FireKey, Part, bool)>,
 }
 
 impl Taken {
@@ -904,29 +925,30 @@ impl Roles {
     /// registered channel covers (`registered`), its slots of the `Channel`
     /// shape, and for the adapter it lands (`adapter`, its key) the slots
     /// of the `Adapter` shape another instance already holds for that key,
-    /// else fresh ones. A guest program's state ([`GuestState`], of the
-    /// pair `pair`): the instance's scratch, whole `Instance` chunks, and
-    /// the pair's chunks its other instances hold already, else fresh ones.
+    /// else fresh ones; with them the guest state `guest`, taken before
+    /// anything was registered for the bind ([`Self::take_guest`]), which
+    /// goes back with the rest where the take fails.
     pub fn take_instance(
         &mut self,
         program: ProgramId,
         channels: &[ChannelId],
         registered: impl Fn(ChannelId) -> bool,
         adapter: Option<u128>,
-        (pair, state): (FireKey, GuestState),
+        guest: GuestTaken,
     ) -> Result<Taken, RolesError> {
-        let facts = self
-            .programs
-            .get(&program)
-            .cloned()
-            .ok_or(RolesError::Program(program))?;
+        let Some(facts) = self.programs.get(&program).cloned() else {
+            self.untake_guest(guest);
+            return Err(RolesError::Program(program));
+        };
         let mut shared = Vec::new();
         for &id in channels {
             if let Some(item) = self.items.get(&Owner::Channel(id)) {
                 if item.tier != Tier::Device {
+                    let holder = item.holder;
+                    self.untake_guest(guest);
                     return Err(RolesError::Parked {
                         channel: id,
-                        holder: item.holder,
+                        holder,
                     });
                 }
                 shared.push(id);
@@ -939,12 +961,18 @@ impl Roles {
             ..Taken::default()
         };
         let footprint = facts.instance;
-        taken.parts.push(self.take(
+        match self.take(
             &device,
             SlotRole::Instance,
             footprint.slots,
             footprint.contiguous,
-        )?);
+        ) {
+            Ok(part) => taken.parts.push(part),
+            Err(error) => {
+                self.untake_guest(guest);
+                return Err(error);
+            }
+        }
         for ring in &facts.rings {
             let covered = channels
                 .get(ring.channel as usize)
@@ -965,6 +993,7 @@ impl Roles {
                 }
                 Err(error) => {
                     self.give(&device, &taken.parts);
+                    self.untake_guest(guest);
                     return Err(error);
                 }
             }
@@ -977,6 +1006,7 @@ impl Roles {
                 }
                 Some(_) => {
                     self.give(&device, &taken.parts);
+                    self.untake_guest(guest);
                     return Err(RolesError::AdapterParked);
                 }
                 None => match self.take(
@@ -988,12 +1018,41 @@ impl Roles {
                     Ok(part) => Some((key, part, true)),
                     Err(error) => {
                         self.give(&device, &taken.parts);
+                        self.untake_guest(guest);
                         return Err(error);
                     }
                 },
             };
         }
-        let run = state.chunks_a_piece();
+        taken.parts.extend(guest.scratch);
+        taken.pair = guest.pair;
+        Ok(taken)
+    }
+
+    /// A guest program's state for a bind of an instance on `channels`
+    /// ([`GuestState`], of the pair `pair`): the instance's scratch, whole
+    /// `Instance` chunks, and the pair's chunks its other instances hold
+    /// already, else fresh ones. Taken first, before the bind registers
+    /// anything: a bind short of it ([`RolesError::BindShort`],
+    /// [`RolesError::GuestGrow`]) waits for room with nothing to undo. A
+    /// channel it binds parked with its process refuses it first, as
+    /// [`Self::take_instance`] would.
+    pub fn take_guest(
+        &mut self,
+        channels: &[ChannelId],
+        (pair, state): (FireKey, GuestState),
+    ) -> Result<GuestTaken, RolesError> {
+        for &id in channels {
+            if let Some(item) = self.items.get(&Owner::Channel(id))
+                && item.tier != Tier::Device
+            {
+                return Err(RolesError::Parked {
+                    channel: id,
+                    holder: item.holder,
+                });
+            }
+        }
+        let mut taken = GuestTaken::default();        let run = state.chunks_a_piece();
         if (state.per_instance > 0 || state.per_pair > 0) && self.stated.insert(pair) {
             self.state_room(pair, state);
         }
@@ -1001,9 +1060,9 @@ impl Roles {
             match self.take_scratch(state.per_instance, run, || {
                 format!("an instance of {pair}'s scratch")
             }) {
-                Ok(part) => taken.parts.push(part),
+                Ok(part) => taken.scratch = Some(part),
                 Err(error) => {
-                    self.untake(taken);
+                    self.untake_guest(taken);
                     return Err(error);
                 }
             }
@@ -1033,7 +1092,7 @@ impl Roles {
                                 room,
                             };
                             let fits = self.fits_budget(&[Owner::Pair(pair)]);
-                            self.untake(taken);
+                            self.untake_guest(taken);
                             return Err(if fits {
                                 RolesError::BindShort(Box::new(short))
                             } else {
@@ -1043,14 +1102,14 @@ impl Roles {
                     }
                 }
                 Some(_) => {
-                    self.untake(taken);
+                    self.untake_guest(taken);
                     return Err(RolesError::PairParked(pair));
                 }
                 None => {
                     match self.take_scratch(state.per_pair, run, || format!("{pair}'s state")) {
                         Ok(part) => Some((pair, part, true)),
                         Err(error) => {
-                            self.untake(taken);
+                            self.untake_guest(taken);
                             return Err(error);
                         }
                     }
@@ -1087,6 +1146,17 @@ impl Roles {
             self.give(&self.device, &[part]);
         }
         if let Some((_, part, true)) = taken.pair {
+            self.give(&self.device, &[part]);
+        }
+    }
+
+    /// A guest state taken for a bind that registered nothing, or failed
+    /// before its instance's take: its chunks go back.
+    pub fn untake_guest(&mut self, guest: GuestTaken) {
+        if let Some(part) = &guest.scratch {
+            self.give(&self.device, std::slice::from_ref(part));
+        }
+        if let Some((_, part, true)) = guest.pair {
             self.give(&self.device, &[part]);
         }
     }
@@ -1656,22 +1726,63 @@ pub fn bind_instance(
     holder: Option<Holder>,
     registered: impl Fn(ChannelId) -> bool,
 ) -> anyhow::Result<BoundInstance> {
+    let guest = take_guest(roles, engine, binding)?;
+    bind_taken(roles, engine, binding, holder, registered, guest)
+}
+
+/// The guest state a bind of `binding` takes, before the bind registers
+/// anything ([`Roles::take_guest`]): short of room, the bind waits for it
+/// with nothing to roll back. `None` where no roles are kept.
+pub fn take_guest(
+    roles: Option<&RolesHandle>,
+    engine: &mut dyn Engine,
+    binding: &InstanceBinding,
+) -> anyhow::Result<Option<GuestTaken>> {
     let Some(roles) = roles else {
-        return Ok(engine.bind_instance(binding)?);
+        return Ok(None);
     };
     learn_program(roles, engine, binding.program)?;
-    let adapter = engine.adapter_key(binding)?;
     let state = engine.guest_state(binding.program, &binding.extents)?;
     let pair = FireKey {
         program: binding.program,
         extents: binding.extents,
+    };
+    Ok(Some(
+        roles
+            .lock()
+            .unwrap()
+            .take_guest(&binding.channels, (pair, state))?,
+    ))
+}
+
+/// Binds `binding` with the guest state taken for it (`guest`,
+/// [`take_guest`]): the rest of its slots taken, then the engine's bind;
+/// a failure gives everything back, `guest` with it.
+pub fn bind_taken(
+    roles: Option<&RolesHandle>,
+    engine: &mut dyn Engine,
+    binding: &InstanceBinding,
+    holder: Option<Holder>,
+    registered: impl Fn(ChannelId) -> bool,
+    guest: Option<GuestTaken>,
+) -> anyhow::Result<BoundInstance> {
+    let Some(roles) = roles else {
+        return Ok(engine.bind_instance(binding)?);
+    };
+    let guest = guest.unwrap_or_default();
+    let adapter = match engine.adapter_key(binding) {
+        Ok(adapter) => adapter,
+        Err(error) => {
+            roles.lock().unwrap().untake_guest(guest);
+            return Err(error.into());
+        }
     };
     let taken = roles.lock().unwrap().take_instance(
         binding.program,
         &binding.channels,
         registered,
         adapter,
-        (pair, state),
+        guest,
     )?;
     let binding = InstanceBinding {
         instance_slots: taken.instance_slots(),
@@ -1721,6 +1832,7 @@ pub async fn bind_when_resident<T, E, B, W, G, P>(
     resident: impl Fn() -> W,
     grown: impl Fn(u32, u32) -> G,
     room: impl Fn() -> Option<RoomWatch>,
+    fits: impl Fn(u32, u32) -> bool,
     suspend: impl Fn() -> bool,
     planned: impl Fn(u32, u32) -> P,
 ) -> anyhow::Result<T>
@@ -1745,10 +1857,10 @@ where
             watch.clone().freed().await;
             continue;
         }
-        if matches!(
-            error.downcast_ref::<RolesError>(),
-            Some(RolesError::BindShort(_))
-        ) {
+        if let Some(RolesError::BindShort(short)) = error.downcast_ref::<RolesError>()
+            && let RolesError::GuestShort { room: need, .. } = short.as_ref()
+        {
+            let (run, pieces) = need.chunk_runs();
             // Holding guest state of its own, it would wait on itself: it is
             // suspended, its state given back, and binds once restored.
             if suspend() {
@@ -1765,27 +1877,35 @@ where
             // restore short of room for its roles (`planned`: idle cache
             // dropped first, then a resident parked by the planner's
             // victim choice).
-            if let Some(RolesError::BindShort(short)) = error.downcast_ref::<RolesError>()
-                && let RolesError::GuestShort { room, .. } = short.as_ref()
-            {
-                let (run, pieces) = room.chunk_runs();
-                tracing::debug!(%pid, %error, "a bind waits in the planner for room");
-                let freed = async {
-                    match watch {
-                        Some(watch) => watch.freed().await,
-                        None => std::future::pending().await,
-                    }
+            // Room given back wakes it only where its runs (`fits`) now
+            // stand free: it is sent again on the room it waits for, never
+            // on any give.
+            tracing::debug!(%pid, %error, "a bind waits in the planner for room");
+            let freed = async {
+                let Some(mut watch) = watch else {
+                    return std::future::pending().await;
                 };
-                tokio::select! {
-                    () = freed => {}
-                    made = planned(run, pieces) => {
-                        if let Err(why) = made {
-                            return Err(error.context(format!("its wait for room ended: {why}")));
-                        }
+                loop {
+                    let next = room();
+                    watch.freed().await;
+                    if fits(run, pieces) {
+                        return;
+                    }
+                    match next {
+                        Some(next) => watch = next,
+                        None => return std::future::pending().await,
                     }
                 }
-                continue;
+            };
+            tokio::select! {
+                () = freed => {}
+                made = planned(run, pieces) => {
+                    if let Err(why) = made {
+                        return Err(error.context(format!("its wait for room ended: {why}")));
+                    }
+                }
             }
+            continue;
         }
         if let Some(&RolesError::GuestGrow { prefix, run, .. }) = error.downcast_ref::<RolesError>()
         {

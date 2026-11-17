@@ -2197,6 +2197,7 @@ async fn a_bind_by_a_suspended_process_waits_for_its_restore() {
         || planner.wait_resident(pid),
         |_, _| std::future::ready(Err::<(), String>("no guest state here".into())),
         || None,
+        |_, _| false,
         || false,
         |_, _| std::future::ready(Err::<(), String>("no guest state here".into())),
     );

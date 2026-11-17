@@ -19,7 +19,9 @@ use ::engine::{
     InstanceId, LoadRequest, Loaded, ProgramFacts, ProgramId, Rebind, ScratchPlace,
 };
 
-use super::{Owner, Roles, RolesError, RolesHandle, bind_instance, learn_program};
+use super::{
+    Owner, Roles, RolesError, RolesHandle, bind_instance, bind_taken, learn_program, take_guest,
+};
 use crate::store::shared::{Shared, SharedPool};
 
 const MIB: u64 = 1 << 20;
@@ -1138,6 +1140,12 @@ async fn a_bind_past_the_room_waits_for_room_given_back() {
 /// parked process comes back once room is there, else waits. Every process
 /// finishes, none is refused, and at the end the pool holds what it held
 /// before: nothing a park, a restore or a close took stays held.
+///
+/// Each bind goes as the lane's register+bind does: its guest state taken
+/// first, then its channels registered, then the instance bound. A bind
+/// short of room is answered before it registers anything: no
+/// registration is ever rolled back, however many binds park and come
+/// back.
 #[test]
 fn processes_cycling_through_park_restore_and_finish_all_finish_and_give_back_all() {
     #[derive(Clone, Copy, PartialEq, Debug)]
@@ -1154,18 +1162,26 @@ fn processes_cycling_through_park_restore_and_finish_all_finish_and_give_back_al
     second.next = 10_000;
     learn_program(&roles, &mut first, ProgramId(1)).unwrap();
     learn_program(&roles, &mut second, ProgramId(2)).unwrap();
+    // Registrations made, and those rolled back because the bind after
+    // them failed.
+    let (registrations, rollbacks) = (std::cell::Cell::new(0), std::cell::Cell::new(0));
     let bind_of = |roles: &RolesHandle, engine: &mut GuestEngine, program: u64, by: u128| {
-        bind_instance(
+        let binding = InstanceBinding {
+            program: ProgramId(program),
+            ..InstanceBinding::default()
+        };
+        let guest = take_guest(Some(roles), engine, &binding)?;
+        registrations.set(registrations.get() + 1);
+        bind_taken(
             Some(roles),
             engine,
-            &InstanceBinding {
-                program: ProgramId(program),
-                ..InstanceBinding::default()
-            },
+            &binding,
             Some(holder(by)),
             |_| false,
+            guest,
         )
         .map(|bound| bound.id)
+        .inspect_err(|_| rollbacks.set(rollbacks.get() + 1))
     };
     let n = 12;
     let mut stage = vec![Stage::First; n];
@@ -1245,6 +1261,8 @@ fn processes_cycling_through_park_restore_and_finish_all_finish_and_give_back_al
         parks > 0 && waits > 0,
         "the budget fit few: {parks} parks, {waits} waits"
     );
+    assert_eq!(registrations.get(), 2 * n, "one registration a bind");
+    assert_eq!(rollbacks.get(), 0, "no short bind registered anything");
     assert_eq!(held(&device), before, "all given back");
     assert_eq!(roles.lock().unwrap().device_bytes(), 0);
 }
