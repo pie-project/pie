@@ -12,7 +12,9 @@ use engine::fire::{FireTicket, Step};
 use engine::transfer::MemoryDomain;
 use eta_ir::registry::{PortMask, Stage};
 
-use engine_gpu::api::{Envelope, Host, PendingStep, fault, program_attachments, refusal};
+use engine_gpu::api::{
+    Envelope, Host, PendingStep, attachment_lanes, each_pass, fault, program_attachments, refusal,
+};
 
 use crate::device::Api;
 use engine_gpu::serve::Landed;
@@ -69,9 +71,11 @@ impl Host for Api {
     ) -> EngineResult<(FireTicket, PendingStep)> {
         let defers = defers(gpu, step);
         let guests = program_attachments(step).next().is_some();
-        // The host runs the step's guest passes behind its forward: the
-        // step lands once both are in, with the lanes they faulted.
-        let meet = (guests && !defers).then(Meet::new);
+        // The host runs the step's guest passes behind its forward: off the
+        // submit, the step lands once both are in, with the lanes they
+        // faulted; inside it, the frame's settle tells them.
+        let settles_off = gpu.sink.is_some() && <Api as Host>::settles_asynchronously(gpu);
+        let meet = (guests && !defers && settles_off).then(Meet::new);
         let (ticket, mut step_pending) = gpu.fire_step(step, at, defers, meet.clone())?;
         let landed = step_pending.landed;
         if defers && reads_on_device(gpu, step, &landed) {
@@ -79,7 +83,8 @@ impl Host for Api {
             // the next frame's forward reads its token on the
             // device, so nothing here waits.
             let wrote = std::mem::take(&mut step_pending.wrote);
-            defer_attachment(gpu, step, at, &landed, wrote)?;
+            let faulted = std::mem::take(&mut step_pending.faulted);
+            defer_attachment(gpu, step, at, &landed, wrote, faulted)?;
             let shell = gpu.loaded_mut()?;
             shell.leave_unread(&landed);
             shell.forget_seat(&landed);
@@ -108,8 +113,18 @@ impl Host for Api {
             meet.guests_ran(faulted);
         } else if defers && let Some(sink) = gpu.sink.as_ref() {
             // The forward's own report was held for the sampler.
-            let wrote = std::mem::take(&mut step_pending.wrote);
-            (sink)(at, merged(engine::StepOutcome::wrote(wrote), faulted));
+            let held = engine::StepOutcome {
+                wrote: std::mem::take(&mut step_pending.wrote),
+                faulted: std::mem::take(&mut step_pending.faulted),
+            };
+            (sink)(at, merged(held, faulted));
+        } else {
+            // Told with the frame's settle, inside the submit.
+            let held = engine::StepOutcome {
+                wrote: Vec::new(),
+                faulted: std::mem::take(&mut step_pending.faulted),
+            };
+            step_pending.faulted = merged(held, faulted).faulted;
         }
         Ok((ticket, step_pending))
     }
@@ -123,27 +138,39 @@ impl Host for Api {
         let _ = gpu;
     }
 
-    /// Before the step resolves its inputs: the forward reads the cells a prologue put.
-    fn run_prologues(gpu: &mut Vulkan, step: &Step) -> EngineResult<()> {
-        for attachment in program_attachments(step) {
-            if !gpu.programs.prologue_runs(attachment.instance) {
-                continue;
-            }
-            gpu.programs
-                .fire(
-                    attachment.instance,
-                    Stage::Prologue,
-                    #[cfg(feature = "vulkan")]
-                    gpu.shell.as_ref().map(Shell::device),
-                    #[cfg(feature = "vulkan")]
-                    Vec::new(),
-                )
-                .map_err(refusal)?;
-        }
+    /// Before the step resolves its inputs: the forward reads the cells a
+    /// prologue put. A prologue that refuses (its instance poisoned in an
+    /// earlier step, a guard) faults its own lanes; the others run.
+    fn run_prologues(
+        gpu: &mut Vulkan,
+        step: &Step,
+        faulted: &mut engine::StepOutcome,
+    ) -> EngineResult<()> {
+        let Vulkan {
+            shell, programs, ..
+        } = gpu;
+        let prologues: Vec<&engine::fire::Attachment> = program_attachments(step)
+            .filter(|attachment| programs.prologue_runs(attachment.instance))
+            .collect();
+        each_pass(prologues, "prologue", faulted, |attachment| {
+            programs.fire(
+                attachment.instance,
+                Stage::Prologue,
+                #[cfg(feature = "vulkan")]
+                shell.as_ref().map(Shell::device),
+                #[cfg(feature = "vulkan")]
+                Vec::new(),
+            )
+        });
         Ok(())
     }
 
-    fn envelope(gpu: &mut Vulkan, step: &Step, envelope: &mut Envelope<Api>) -> EngineResult<()> {
+    fn envelope(
+        gpu: &mut Vulkan,
+        step: &Step,
+        envelope: &mut Envelope<Api>,
+        faulted: &mut engine::StepOutcome,
+    ) -> EngineResult<()> {
         for attachment in &step.attachments {
             let Some(lane) = step.lanes.get(attachment.lane as usize) else {
                 return Err(Error::Invalid(format!(
@@ -160,10 +187,15 @@ impl Host for Api {
                 envelope.feeds[attachment.lane as usize] = Some(cell);
                 continue;
             }
-            envelope.tokens[attachment.lane as usize] = gpu
+            match gpu
                 .programs
                 .envelope_tokens(attachment.instance, lane.tokens.len())
-                .map_err(refusal)?;
+            {
+                Ok(tokens) => envelope.tokens[attachment.lane as usize] = tokens,
+                Err(refused) => {
+                    envelope.refused(step, attachment, &refused.to_string(), faulted);
+                }
+            }
         }
         Ok(())
     }
@@ -192,37 +224,25 @@ fn run_attachments(gpu: &mut Vulkan, step: &Step, landed: &Landed) -> Vec<engine
         shell, programs, ..
     } = gpu;
     let mut faulted = engine::StepOutcome::committed();
-    for attachment in program_attachments(step) {
+    each_pass(program_attachments(step), "epilogue", &mut faulted, |attachment| {
         #[cfg(feature = "vulkan")]
         let (device, seats) = match shell.as_ref() {
             Some(shell) => (Some(shell.device()), lane_seats(shell, landed, attachment)),
             None => (None, Vec::new()),
         };
-        if let Err(refused) = programs.fire(
+        programs.fire(
             attachment.instance,
             Stage::Epilogue,
             #[cfg(feature = "vulkan")]
             device,
             #[cfg(feature = "vulkan")]
             seats,
-        ) {
-            tracing::warn!(instance = attachment.instance.0, %refused, "a guest epilogue faulted its lanes");
-            faulted.fault_lanes(
-                attachment_lanes(attachment),
-                Some(attachment.instance),
-                &refused.to_string(),
-            );
-        }
-    }
+        )
+    });
     if let Some(shell) = shell.as_mut() {
         shell.forget_seat(landed);
     }
     faulted.faulted
-}
-
-/// The lanes `attachment`'s pass is of.
-fn attachment_lanes(attachment: &engine::fire::Attachment) -> std::ops::Range<u32> {
-    attachment.lane..attachment.lane + attachment.lanes.max(1)
 }
 
 /// Whether `step`'s one attachment can run behind its forward without
@@ -249,6 +269,7 @@ fn defer_attachment(
     at: engine::StepDone,
     landed: &Landed,
     wrote: Vec<engine::KvWrites>,
+    faulted: Vec<engine::LaneFault>,
 ) -> EngineResult<()> {
     #[cfg(feature = "vulkan")]
     {
@@ -268,6 +289,7 @@ fn defer_attachment(
             sink,
             wrote,
             lanes: u32::try_from(step.lanes.len()).unwrap_or(u32::MAX),
+            faulted,
             meet: None,
         });
         programs
@@ -282,7 +304,7 @@ fn defer_attachment(
     }
     #[cfg(not(feature = "vulkan"))]
     {
-        let _ = (gpu, step, at, landed, wrote);
+        let _ = (gpu, step, at, landed, wrote, faulted);
         Err(Error::unsupported("vulkan", "a deferred guest pass"))
     }
 }

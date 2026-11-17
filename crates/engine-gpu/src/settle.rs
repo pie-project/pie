@@ -62,6 +62,10 @@ pub struct Done {
     /// The step's lanes: every one faulted where the step is lost whole.
     pub lanes: u32,
 
+    /// The lanes whose guest passes faulted ahead of the forward (a
+    /// prologue, an envelope): told with the step however it lands.
+    pub faulted: Vec<engine::LaneFault>,
+
     /// Where the step's guest passes run on the host behind its forward:
     /// the step is told once its forward landed and they ran, with the
     /// lanes they faulted.
@@ -69,11 +73,14 @@ pub struct Done {
 }
 
 impl Done {
-    /// The outcome of a step that settled whole: what its lanes report,
-    /// or plainly committed where none does.
+    /// The outcome of a step whose forward landed: what its lanes report,
+    /// and the lanes its guests faulted ahead of it.
     #[must_use]
     pub fn settled(&self) -> engine::StepOutcome {
-        engine::StepOutcome::wrote(self.wrote.clone())
+        engine::StepOutcome {
+            wrote: self.wrote.clone(),
+            faulted: self.faulted.clone(),
+        }
     }
 
     /// Tells the sink the step's forward landed: whole, or lost for
@@ -234,6 +241,7 @@ mod tests {
                 ..Default::default()
             }],
             lanes: 4,
+            faulted: Vec::new(),
             meet: Some(meet.clone()),
         }
     }
