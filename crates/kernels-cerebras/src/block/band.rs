@@ -6,8 +6,8 @@
 //! and the winner's embedding returns west along each dims-row (the band bus, [`BUS_COLOUR`]),
 //! up unit 0's MoE column i ([`BAND_V1`]) and west into its CX row i ([`BAND_W2`]).
 //!
-//! Wants the units in two unit columns visited so that the first and the last unit sit on the
-//! band, and the band's rows = the units' rows <= their MoE columns.
+//! Wants unit 0 on the band and the last unit on it or above it (its x routed down past the
+//! units between), and the band's rows = the units' rows <= their MoE columns.
 
 use crate::floor::{Coord, CtlLine, Floor, FloorBuilder, HeadBlock, Rect, skip};
 use crate::plan::Plan;
@@ -120,10 +120,13 @@ impl Block for Band {
     fn wire(&self, plan: &Plan, floor: &Floor, w: &mut Wiring) -> R<()> {
         let at = At::of(floor);
         let ul = floor.units.last().ok_or("band: no units")?;
-        if ul.rect.y + ul.rect.h != at.y0 || self.rows != ul.rows() || self.rows > ul.cols() - ul.cx
+        // (the last unit on the band, or above it: the x's way down past the units between is
+        // the router's, [`crate::place::route`])
+        if ul.rect.y + ul.rect.h > at.y0 || self.rows != ul.rows() || self.rows > ul.cols() - ul.cx
         {
             return Err("band: the last unit sits on the band, its rows <= its MoE columns".into());
         }
+        let on = ul.rect.y + ul.rect.h == at.y0;
         for r in 0..self.rows {
             let y = ul.row_y(r);
             let xr = ul.cx_x() + 1 + r;
@@ -138,7 +141,11 @@ impl Block for Band {
             });
             let yb = at.row(r);
             w.path(Path {
-                pts: (y..=yb).map(|yy| Coord::new(xr, yy)).collect(),
+                pts: if on {
+                    (y..=yb).map(|yy| Coord::new(xr, yy)).collect()
+                } else {
+                    vec![Coord::new(xr, y), Coord::new(xr, yb)]
+                },
                 class: BAND_VERT,
                 send: BAND_OUT,
                 recv: HEAD_IN,

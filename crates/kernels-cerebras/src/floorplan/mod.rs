@@ -311,6 +311,12 @@ impl Floorplan {
     /// slot); else two unit columns visited down, then up (unit 0 and the last side by side on
     /// row 0).
     pub fn of(plan: &Plan, requests: &Requests) -> R<Floorplan> {
+        Floorplan::of_at(plan, requests, None)
+    }
+
+    /// [`Floorplan::of`] with the units' path given (`at`: a placer's origins, in visit order),
+    /// in place of the one the plan's choices make.
+    pub fn of_at(plan: &Plan, requests: &Requests, at: Option<UnitLayout>) -> R<Floorplan> {
         let p = &plan.partition;
         let col_runs = match p.attn_cols {
             Some(ax) => {
@@ -361,31 +367,36 @@ impl Floorplan {
             .as_ref()
             .map(|_| Arrangement::of(plan))
             .transpose()?;
-        let path = match (arrangement, head.at, p.unit_grid) {
-            (Some(arr), _, _) => UnitLayout::Explicit {
-                origins: arr.origins(p.cols + 1, p.rows + 1)?,
-            },
-            (None, HeadAt::Band, _) => {
-                if !p.units.is_multiple_of(2) {
-                    return Err("split: an even unit count (the last unit next to the band)".into());
+        let path = match (at, arrangement, head.at, p.unit_grid) {
+            (Some(at), ..) => at,
+            (None, a, h, g) => match (a, h, g) {
+                (Some(arr), _, _) => UnitLayout::Explicit {
+                    origins: arr.origins(p.cols + 1, p.rows + 1)?,
+                },
+                (None, HeadAt::Band, _) => {
+                    if !p.units.is_multiple_of(2) {
+                        return Err(
+                            "split: an even unit count (the last unit next to the band)".into()
+                        );
+                    }
+                    two_columns(p.units, true)
                 }
-                two_columns(p.units, true)
-            }
-            (None, _, Some(ug)) => UnitLayout::Snake {
-                unx: ug.0,
-                uny: ug.1,
-                up_first: false,
-                gaps: snake_gap(p.units, ug)?.into_iter().collect(),
-            },
-            (None, _, None) => {
-                let n = p.units;
-                if n == 0 || !n.is_multiple_of(2) {
-                    return Err(format!(
-                        "runs: {n} units (two unit columns, unit 0 and the last on row 0)"
-                    ));
+                (None, _, Some(ug)) => UnitLayout::Snake {
+                    unx: ug.0,
+                    uny: ug.1,
+                    up_first: false,
+                    gaps: snake_gap(p.units, ug)?.into_iter().collect(),
+                },
+                (None, _, None) => {
+                    let n = p.units;
+                    if n == 0 || !n.is_multiple_of(2) {
+                        return Err(format!(
+                            "runs: {n} units (two unit columns, unit 0 and the last on row 0)"
+                        ));
+                    }
+                    two_columns(n, false)
                 }
-                two_columns(n, false)
-            }
+            },
         };
         let mut segments = Vec::new();
         if requests.scores {

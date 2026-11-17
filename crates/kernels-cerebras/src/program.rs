@@ -119,6 +119,22 @@ impl Program {
         Program::finish(blocks, floorplan, plan, floor, wiring)
     }
 
+    /// [`Program::build`] with its units at `origins` (in visit order: a placer's), the head
+    /// and every other block placed against them as their blocks place them, the links between
+    /// blocks that do not meet routed ([`crate::place::route`]).
+    pub fn build_at(plan: Plan, origins: Vec<(u32, u32)>) -> Result<Program, String> {
+        plan.validate()?;
+        compose::refuse(&plan.shape)?;
+        let needs = Needs::of(&layers::of(&plan.shape));
+        let floorplan = Floorplan::of_at(
+            &plan,
+            &Requests::of(&needs),
+            Some(crate::floor::UnitLayout::Explicit { origins }),
+        )?;
+        let blocks = compose::blocks(&plan, KernelSet::of(&needs), &floorplan)?;
+        Program::build_with(blocks, floorplan, plan)
+    }
+
     /// A program's build past its links: the blocks settle, the palette, the fabric, the
     /// kernels and their route tables, the overrides.
     fn finish(
@@ -126,8 +142,10 @@ impl Program {
         floorplan: Floorplan,
         plan: Plan,
         mut floor: Floor,
-        wiring: Wiring,
+        mut wiring: Wiring,
     ) -> Result<Program, String> {
+        // the links blocks state by their waypoints, routed ([`crate::place::route`])
+        crate::place::route::fill(&mut floor, &mut wiring)?;
         for b in &blocks {
             b.settle(&plan, &wiring, &mut floor)?;
         }

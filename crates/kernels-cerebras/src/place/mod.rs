@@ -12,6 +12,7 @@
 
 pub mod decode;
 pub mod pack;
+pub mod route;
 pub mod stream;
 
 use serde::Serialize;

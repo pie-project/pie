@@ -193,6 +193,57 @@ impl Palette {
         })
     }
 
+    /// The classes `w`'s links route at each PE of `floor` (each class laid on a colour of its
+    /// own, as [`Palette::allocate`] reads footprints): what a router must leave each PE.
+    pub fn footprint(floor: &Floor, w: &Wiring) -> Result<Grid<Vec<Class>>, String> {
+        let mut out: Grid<Vec<Class>> = Grid::filled(floor.w, floor.h, Vec::new());
+        let mut cur = Wiring::default();
+        let mut members: Vec<Class> = Vec::new();
+        let mut flush = |cur: &mut Wiring, members: &mut Vec<Class>| -> Result<(), String> {
+            if members.is_empty() {
+                return Ok(());
+            }
+            let own = Palette {
+                map: members
+                    .iter()
+                    .enumerate()
+                    .map(|(k, &c)| (c, Colour(k as u8)))
+                    .collect(),
+            };
+            let routes = Lay::routes(floor, cur, &own, u8::MAX)?;
+            for (p, rs) in routes.iter() {
+                for r in rs {
+                    let c = members[usize::from(r.colour.0)];
+                    let v = out.get_mut(p);
+                    if !v.contains(&c) {
+                        v.push(c);
+                    }
+                }
+            }
+            *cur = Wiring::default();
+            members.clear();
+            Ok(())
+        };
+        for l in &w.links {
+            let add: Vec<Class> = l
+                .classes()
+                .into_iter()
+                .filter(|c| !members.contains(c))
+                .collect();
+            if members.len() + add.len() > usize::from(u8::MAX) {
+                flush(&mut cur, &mut members)?;
+            }
+            for c in l.classes() {
+                if !members.contains(&c) {
+                    members.push(c);
+                }
+            }
+            cur.links.push(l.clone());
+        }
+        flush(&mut cur, &mut members)?;
+        Ok(out)
+    }
+
     pub fn get(&self, c: Class) -> Result<Colour, String> {
         self.map
             .get(&c)
