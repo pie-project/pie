@@ -364,6 +364,31 @@ impl Engine for Spatial {
         self.programs.register(registration).map_err(refusal)
     }
 
+    /// The program adopted in the returned compile, off the engine's
+    /// thread.
+    fn prepare_program(
+        &mut self,
+        registration: &ProgramRegistration,
+    ) -> EngineResult<engine::ProgramCompile> {
+        let registration = registration.clone();
+        Ok(Box::new(move || {
+            engine::Prepared(Box::new(crate::program::Plane::adopt(&registration)))
+        }))
+    }
+
+    /// The adopted program's id; a compile that refused refuses here.
+    fn finish_program(&mut self, prepared: engine::Prepared) -> EngineResult<ProgramId> {
+        let Ok(adopted) = prepared
+            .0
+            .downcast::<Result<eta_exec::ExecPlan, crate::program::Refusal>>()
+        else {
+            return Err(engine::Error::Program(
+                "a prepared program Cerebras did not prepare".to_string(),
+            ));
+        };
+        self.programs.finish(*adopted).map_err(refusal)
+    }
+
     fn register_channel(
         &mut self,
         registration: &ChannelRegistration,

@@ -2949,6 +2949,20 @@ mod tests {
             "panicking"
         }
 
+        fn prepare_program(
+            &mut self,
+            _registration: &::engine::program::ProgramRegistration,
+        ) -> ::engine::Result<::engine::ProgramCompile> {
+            Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
+        }
+
+        fn finish_program(
+            &mut self,
+            _prepared: ::engine::Prepared,
+        ) -> ::engine::Result<::engine::ProgramId> {
+            Err(::engine::Error::unsupported(self.kind(), "finish_program"))
+        }
+
         fn load(&mut self, _request: engine::LoadRequest) -> engine::Result<engine::Loaded> {
             Err(engine::Error::Load("no model".into()))
         }
@@ -3225,6 +3239,20 @@ mod tests {
             "exhausted"
         }
 
+        fn prepare_program(
+            &mut self,
+            _registration: &::engine::program::ProgramRegistration,
+        ) -> ::engine::Result<::engine::ProgramCompile> {
+            Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
+        }
+
+        fn finish_program(
+            &mut self,
+            _prepared: ::engine::Prepared,
+        ) -> ::engine::Result<::engine::ProgramId> {
+            Err(::engine::Error::unsupported(self.kind(), "finish_program"))
+        }
+
         fn load(&mut self, _request: engine::LoadRequest) -> engine::Result<engine::Loaded> {
             Err(engine::Error::Load("no model".into()))
         }
@@ -3302,6 +3330,20 @@ mod tests {
     impl engine::Engine for InlineEngine {
         fn kind(&self) -> &'static str {
             "inline"
+        }
+
+        fn prepare_program(
+            &mut self,
+            _registration: &::engine::program::ProgramRegistration,
+        ) -> ::engine::Result<::engine::ProgramCompile> {
+            Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
+        }
+
+        fn finish_program(
+            &mut self,
+            _prepared: ::engine::Prepared,
+        ) -> ::engine::Result<::engine::ProgramId> {
+            Err(::engine::Error::unsupported(self.kind(), "finish_program"))
         }
 
         fn load(&mut self, _request: engine::LoadRequest) -> engine::Result<engine::Loaded> {
@@ -3401,6 +3443,20 @@ mod tests {
     impl engine::Engine for HoldingEngine {
         fn kind(&self) -> &'static str {
             "holding"
+        }
+
+        fn prepare_program(
+            &mut self,
+            _registration: &::engine::program::ProgramRegistration,
+        ) -> ::engine::Result<::engine::ProgramCompile> {
+            Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
+        }
+
+        fn finish_program(
+            &mut self,
+            _prepared: ::engine::Prepared,
+        ) -> ::engine::Result<::engine::ProgramId> {
+            Err(::engine::Error::unsupported(self.kind(), "finish_program"))
         }
 
         fn load(&mut self, _request: engine::LoadRequest) -> engine::Result<engine::Loaded> {
