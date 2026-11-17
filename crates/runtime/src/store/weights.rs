@@ -89,6 +89,13 @@ pub fn set_streaming(engine: usize, on: bool) {
         .insert(engine, on);
 }
 
+pub(crate) fn reset() {
+    STREAMING
+        .write()
+        .expect("the weight streaming modes are poisoned")
+        .clear();
+}
+
 /// Whether engine `engine` streams its weights; off when never told.
 #[must_use]
 pub fn streaming(engine: usize) -> bool {

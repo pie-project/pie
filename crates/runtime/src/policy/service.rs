@@ -4,8 +4,8 @@
 use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
-use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use client_api::Props;
@@ -25,7 +25,7 @@ use crate::store::registry as store_registry;
 /// The worker as its own engine program sees it.
 const WORKER: &str = "self";
 
-static EVENTS: OnceLock<Sender<Event>> = OnceLock::new();
+static EVENTS: crate::slot::Slot<Sender<Event>> = crate::slot::Slot::new();
 
 /// A worker has at most one.
 pub fn start(name: &str, component: &[u8]) -> Result<(), LoadError> {
@@ -80,6 +80,13 @@ pub fn reload(next: Option<(&str, &[u8])>) -> Result<(), String> {
     answered
         .recv()
         .map_err(|_| "the worker policy's thread has ended".to_string())?
+}
+
+/// Drops the policy thread's channel, so the thread ends, and withdraws what
+/// it set, for [`crate::bootstrap::reset`].
+pub(crate) fn reset() {
+    EVENTS.clear();
+    withdraw();
 }
 
 /// A stopped policy's tables revert to the configuration's, and what it

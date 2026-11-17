@@ -185,3 +185,11 @@ pub fn kv_pressure_bucket() -> u8 {
     }
     (f64::from(used) / f64::from(total) * 255.0).round() as u8
 }
+
+/// Forgets the boot's stores and what their engines were set to, for
+/// [`crate::bootstrap::reset`].
+pub(crate) fn reset() {
+    registry::reset();
+    shared::reset();
+    weights::reset();
+}

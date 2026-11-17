@@ -10,7 +10,6 @@
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -41,7 +40,7 @@ const STATE: &str = "state.bin";
 const KV: &str = "kv";
 const SHARED: &str = "pages";
 
-static STORE: OnceLock<(PathBuf, u64)> = OnceLock::new();
+static STORE: crate::slot::Slot<(PathBuf, u64)> = crate::slot::Slot::new();
 /// One save, load or delete at a time: a page's link count is what says
 /// whether it is still read.
 static BUSY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -51,6 +50,11 @@ pub(crate) fn configure(dir: PathBuf, budget: u64) {
         tracing::warn!(%error, "snapshots: leftovers of a crash stay on disk");
     }
     let _ = STORE.set((dir, budget));
+}
+
+/// The next boot states its own store, or none.
+pub(crate) fn reset() {
+    STORE.clear();
 }
 
 /// What a crash left: saves that never landed, deletes that never finished,
@@ -131,7 +135,7 @@ mod links {
     }
 }
 
-fn store() -> Result<&'static (PathBuf, u64), HandleError> {
+fn store() -> Result<(PathBuf, u64), HandleError> {
     STORE
         .get()
         .ok_or_else(|| HandleError::invalid("this server keeps no snapshots"))
@@ -588,7 +592,7 @@ fn token_hashes(mut bytes: &[u8], pages: usize) -> Option<Vec<Vec<Option<Hash256
 /// Keeps `held` under `name`. It stays as it was.
 pub(super) async fn save(held: &Held, tenant: &str, name: &str) -> Result<Value, HandleError> {
     let dir = dir_of(tenant, name)?;
-    let (root, budget) = store()?.clone();
+    let (root, budget) = store()?;
     let tenant_root = tenant_dir(tenant)?;
     let _busy = BUSY.lock().await;
     if dir.exists() {

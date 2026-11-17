@@ -75,6 +75,10 @@ pub(crate) fn install(schedule: Option<Table>) {
 
 static ALIASES: RwLock<Option<HashMap<ProcessId, ProcessId>>> = RwLock::new(None);
 
+pub(crate) fn reset() {
+    *ALIASES.write() = None;
+}
+
 pub fn plex_id(pid: ProcessId) -> ProcessId {
     ALIASES
         .read()

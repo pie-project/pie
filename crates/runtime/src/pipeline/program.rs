@@ -263,6 +263,11 @@ fn global() -> MutexGuard<'static, Registry> {
     GLOBAL.lock().expect("global lock poisoned")
 }
 
+/// Forgets the programs registered against the boot's model.
+pub(crate) fn reset() {
+    *global() = Registry::new(NonZeroUsize::new(DEFAULT_CAPACITY).expect("nonzero capacity"));
+}
+
 pub fn register(
     bytes: Vec<u8>,
     lanes: Vec<Vec<OutputDecl>>,

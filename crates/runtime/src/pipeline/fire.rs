@@ -1661,6 +1661,10 @@ static KV_WRITES: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<u64, ::engine::KvWrites>>,
 > = std::sync::LazyLock::new(Default::default);
 
+pub(crate) fn reset() {
+    KV_WRITES.lock().unwrap().clear();
+}
+
 pub(crate) fn record_kv_writes(writes: Vec<::engine::KvWrites>) {
     let mut held = KV_WRITES.lock().unwrap();
     for written in writes {
@@ -1918,7 +1922,8 @@ impl Switched {
 
     /// Whether the pass's rows may be cut, keyed and logged by their tokens.
     pub(crate) fn plain(&self) -> bool {
-        let facts = crate::model::model().facts();
+        let model = crate::model::model();
+        let facts = model.facts();
         !self.rows_read
             && self.lanes.iter().flatten().all(|(name, value)| {
                 facts

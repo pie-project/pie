@@ -10,7 +10,7 @@ pub mod worker;
 pub use frame::FrameStamp;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
@@ -241,10 +241,11 @@ pub(crate) async fn pool(engine_id: usize, op: worker::PoolOp) -> Result<()> {
     scheduler_handle(engine_id)?.pool(op).await
 }
 
+static LAYOUTS: std::sync::Mutex<Vec<Option<Option<state::PageLayout>>>> =
+    std::sync::Mutex::new(Vec::new());
+
 /// The engine's host-tier layout, once asked.
 pub(crate) async fn host_kv_layout(engine_id: usize) -> Option<state::PageLayout> {
-    static LAYOUTS: std::sync::Mutex<Vec<Option<Option<state::PageLayout>>>> =
-        std::sync::Mutex::new(Vec::new());
     if let Some(Some(known)) = LAYOUTS.lock().unwrap().get(engine_id) {
         return known.clone();
     }
@@ -262,11 +263,12 @@ pub(crate) async fn host_kv_layout(engine_id: usize) -> Option<state::PageLayout
     layout
 }
 
+type Known = Option<Option<::engine::TapGroups>>;
+static GROUPS: std::sync::Mutex<Vec<Known>> = std::sync::Mutex::new(Vec::new());
+
 /// The groups the engine reads a tapped page's planes out in, as spans of a
 /// host slot; `None` where it taps nothing. Once asked, known.
 pub(crate) async fn tap_groups(engine_id: usize) -> Option<::engine::TapGroups> {
-    type Known = Option<Option<::engine::TapGroups>>;
-    static GROUPS: std::sync::Mutex<Vec<Known>> = std::sync::Mutex::new(Vec::new());
     if let Some(Some(known)) = GROUPS.lock().unwrap().get(engine_id) {
         return known.clone();
     }
@@ -285,24 +287,34 @@ pub(crate) async fn tap_groups(engine_id: usize) -> Option<::engine::TapGroups> 
 }
 
 pub fn configured_submit_deadline() -> Duration {
-    *SUBMIT_DEADLINE.get_or_init(|| Duration::from_micros(100_000))
+    SUBMIT_DEADLINE.get_or_init(|| Duration::from_micros(100_000))
 }
 
 pub fn set_submit_deadline(deadline: Duration) {
     let _ = SUBMIT_DEADLINE.set(deadline);
 }
 
-static SUBMIT_DEADLINE: OnceLock<Duration> = OnceLock::new();
+static SUBMIT_DEADLINE: crate::slot::Slot<Duration> = crate::slot::Slot::new();
 
 pub fn configured_silence_timeout() -> Duration {
-    *SILENCE_TIMEOUT.get_or_init(|| Duration::from_secs(600))
+    SILENCE_TIMEOUT.get_or_init(|| Duration::from_secs(600))
 }
 
 pub fn set_silence_timeout(timeout: Duration) {
     let _ = SILENCE_TIMEOUT.set(timeout);
 }
 
-static SILENCE_TIMEOUT: OnceLock<Duration> = OnceLock::new();
+static SILENCE_TIMEOUT: crate::slot::Slot<Duration> = crate::slot::Slot::new();
+
+/// Forgets the boot's schedulers, what their engines answered and the
+/// timings it set, for [`crate::bootstrap::reset`].
+pub(crate) fn reset() {
+    handle_registry().write().unwrap().clear();
+    LAYOUTS.lock().unwrap().clear();
+    GROUPS.lock().unwrap().clear();
+    SUBMIT_DEADLINE.clear();
+    SILENCE_TIMEOUT.clear();
+}
 
 pub fn configured_frame_size() -> usize {
     match FRAME_SIZE.load(Ordering::Relaxed) {

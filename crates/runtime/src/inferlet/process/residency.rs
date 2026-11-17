@@ -64,6 +64,10 @@ pub(crate) fn unregister_residency(pid: uuid::Uuid) {
     RESIDENCIES.write().unwrap().remove(&pid);
 }
 
+pub(crate) fn reset() {
+    RESIDENCIES.write().unwrap().clear();
+}
+
 fn with_residency<R: Default>(pid: uuid::Uuid, f: impl FnOnce(&mut ProcessResidency) -> R) -> R {
     let residency = {
         let residencies = RESIDENCIES.read().unwrap();

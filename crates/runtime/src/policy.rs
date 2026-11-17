@@ -25,6 +25,14 @@ pub use program::{Commit, Fault, LoadError, Offloads, Plane, Program, Retention,
 #[cfg(not(target_arch = "wasm32"))]
 pub use service::{reload, start, start_default};
 
+/// Ends the policy thread and forgets what the boot's policy set, for
+/// [`crate::bootstrap::reset`].
+pub(crate) fn reset() {
+    service::reset();
+    pressure::reset();
+    schedule::reset();
+}
+
 use client_api::Props;
 
 use crate::inferlet::process::ProcessId;

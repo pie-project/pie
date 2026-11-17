@@ -64,6 +64,27 @@ impl RuntimeShutdown {
     }
 }
 
+/// Clears what a boot set process-wide, and frees bootstrap for the next
+/// boot in this process, which may serve another model. Call it once the
+/// boot's [`BootstrapHandle::shutdown`] returned and the tokio runtime it
+/// ran on is dropped, so no task of the boot is left to see the state go.
+pub fn reset() {
+    server::reset();
+    process::reset();
+    linker::stop();
+    program::stop();
+    crate::policy::reset();
+    crate::pipeline::reset();
+    crate::offload::reset();
+    crate::handle::snapshot::reset();
+    crate::scheduler::reset();
+    crate::planner::reset();
+    crate::store::reset();
+    model::reset();
+    engine::backend::reset();
+    RUNTIME_ACTIVE.store(false, Ordering::Release);
+}
+
 pub struct Config {
     pub host: String,
     pub port: u16,

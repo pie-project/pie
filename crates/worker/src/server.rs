@@ -33,8 +33,8 @@ enum Serving {
 
 impl Server {
     /// Boots `config` on `engine`, with the built-in inferlets and its files
-    /// under `home`; with `listen` the gateway serves it there too. One per
-    /// process.
+    /// under `home`; with `listen` the gateway serves it there too. One at a
+    /// time per process: the next starts once this one is shut down.
     pub fn start(
         config: Config,
         home: &Path,
@@ -202,6 +202,10 @@ impl Server {
                 Serving::Standalone(handle) => handle.shutdown().await,
             }
         });
+        // The boot's tasks end with its runtime; then what it set goes, and
+        // the next boot in this process may start.
+        drop(runtime);
+        runtime::bootstrap::reset();
     }
 
     fn with<T>(&self, f: impl FnOnce(&Live) -> Result<T>) -> Result<T> {

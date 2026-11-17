@@ -656,7 +656,7 @@ impl ProcessCtx {
         let Some((id, input)) = model.input(&name, &switches) else {
             return Ok(Err(format!(
                 "this model reads no input `{name}`; {}",
-                input_names(model)
+                input_names(&model)
             )));
         };
         let (rows, clip) = match validate_input_channel(input, &shape, dtype) {
