@@ -5649,6 +5649,14 @@ impl engine::frame::Shell for Shell {
             crate::encode::reset_kernel_profile();
         }
         let mut frame = walked.frame;
+        let probing = std::env::var_os("PIE_PROBE_REGION").is_some();
+        if probing && matches!(frame.probe_flush_wait(), Ok(true)) {
+            self.programs.probe_scan(&format!(
+                "in fire: after the forward ({} rows, {} lanes)",
+                prepared.descriptor.rows,
+                prepared.lanes.len()
+            ));
+        }
 
         let mut readbacks = vec![None; prepared.lanes.len()];
         if self.host_rows || self.rows_wanted {
@@ -5669,6 +5677,9 @@ impl engine::frame::Shell for Shell {
             }
         }
 
+        if probing && matches!(frame.probe_flush_wait(), Ok(true)) {
+            self.programs.probe_scan("in fire: after the readback copies");
+        }
         let attached: Vec<(engine::InstanceId, std::ops::Range<u32>)> = self
             .encode_epilogues(&mut frame, &prepared)?
             .into_iter()
@@ -5682,6 +5693,9 @@ impl engine::frame::Shell for Shell {
             })
             .collect();
         fire_trace(|| "epilogues-encoded".to_string());
+        if probing && matches!(frame.probe_flush_wait(), Ok(true)) {
+            self.programs.probe_scan("in fire: after the epilogues");
+        }
 
         self.advance(&prepared);
 
