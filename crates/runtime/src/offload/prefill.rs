@@ -253,26 +253,18 @@ pub(crate) async fn before_pass(
     }
 }
 
-/// The fewest uncached tokens worth a peer's prefill, and the executors the
-/// worker policy names: its rule, else the configuration's; unstated, 2048.
-/// `None`: this process's passes stay home.
-fn rule(pid: crate::inferlet::process::ProcessId) -> Option<(u64, Vec<String>)> {
-    use crate::policy::offload::Mode;
-    match crate::policy::offload::rule(pid) {
-        Some(None) => None,
-        Some(Some(rule)) => match rule.mode {
-            Mode::Never => None,
-            Mode::Always => Some((u64::from(rule.min_tokens).max(1), rule.executors)),
-            Mode::Cost => Some((u64::from(rule.min_tokens), rule.executors)),
+/// The fewest uncached tokens worth a peer's prefill, and the executors to
+/// try: the worker's configuration (PLEX 1.1 leaves the cutoff to the host;
+/// which helpers a process may use is the cluster's `placement/helpers`);
+/// unstated, 2048. `None`: this process's passes stay home.
+fn rule(_pid: crate::inferlet::process::ProcessId) -> Option<(u64, Vec<String>)> {
+    Some((
+        match super::prefill_min_suffix_tokens() {
+            0 => 2048,
+            n => n as u64,
         },
-        None => Some((
-            match super::prefill_min_suffix_tokens() {
-                0 => 2048,
-                n => n as u64,
-            },
-            Vec::new(),
-        )),
-    }
+        Vec::new(),
+    ))
 }
 
 fn plan(

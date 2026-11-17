@@ -1731,9 +1731,6 @@ impl KvStore {
         self.kept += 1;
         self.list(self.kept, path.terminal);
         tracing::debug!(target: "pie::kv", pages, decoded, "kept");
-        if let Some(owner) = owner {
-            crate::policy::report(Event::Kept(owner, pages * u64::from(self.page_size)));
-        }
         self.cache.insert(
             self.kept,
             KeptEntry {
