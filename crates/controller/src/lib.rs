@@ -1,12 +1,9 @@
 mod actor;
-mod actuator;
 pub mod cluster;
 pub mod directory;
 mod service;
 mod state;
 mod topology;
-
-pub use actuator::Slot;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -19,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 use controller_api::{
     Ack, DirectoryView, GatewayDecisions, GatewayInfo, Key, Neighbors, ProcessEvent, RoutingTable,
-    ScaleStatus, StateReport, WorkerInfo, WorkerStatus,
+    StateReport, WorkerInfo, WorkerStatus,
 };
 use ids::{GatewayId, NodeId, WorkerId};
 
@@ -42,9 +39,6 @@ pub struct Config {
     pub listen: String,
     pub heartbeat_timeout: Duration,
     pub tick_interval: Duration,
-    /// The workers the actuator may launch to meet a scale table; none,
-    /// and the controller does not scale (`cluster.scale` is absent).
-    pub slots: Vec<Slot>,
     /// The cluster policies: each a built-in policy's name or a `.wasm`
     /// path, no two granted the same write. None: every gateway goes by its
     /// defaults.
@@ -57,31 +51,20 @@ impl Default for Config {
             listen: "0.0.0.0:7000".to_string(),
             heartbeat_timeout: Duration::from_secs(8),
             tick_interval: Duration::from_secs(2),
-            slots: Vec::new(),
             cluster_policies: Vec::new(),
         }
     }
 }
 
 /// The controller's file: `listen`, `heartbeat_timeout` and `tick_interval`
-/// (written with their unit, `"8s"`), `cluster_policies`, and
-/// `[[scale.slot]]`.
+/// (written with their unit, `"8s"`), and `cluster_policies`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct ConfigToml {
     listen: String,
     heartbeat_timeout: units::Duration,
     tick_interval: units::Duration,
-    scale: ScaleToml,
     cluster_policies: Vec<String>,
-}
-
-/// `[scale]`: `[[scale.slot]]` entries, each a worker the actuator may
-/// launch (`model`, `engine`, `command`).
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct ScaleToml {
-    slot: Vec<Slot>,
 }
 
 impl Default for ConfigToml {
@@ -91,7 +74,6 @@ impl Default for ConfigToml {
             listen: d.listen,
             heartbeat_timeout: units::Duration::from_secs(d.heartbeat_timeout.as_secs()),
             tick_interval: units::Duration::from_secs(d.tick_interval.as_secs()),
-            scale: ScaleToml::default(),
             cluster_policies: d.cluster_policies,
         }
     }
@@ -103,7 +85,6 @@ impl From<ConfigToml> for Config {
             listen: t.listen,
             heartbeat_timeout: t.heartbeat_timeout.into(),
             tick_interval: t.tick_interval.into(),
-            slots: t.scale.slot,
             cluster_policies: t.cluster_policies,
         }
     }
@@ -130,16 +111,6 @@ impl Config {
             !self.tick_interval.is_zero(),
             "controller config: `tick_interval` must be > 0"
         );
-        for (at, slot) in self.slots.iter().enumerate() {
-            ensure!(
-                !slot.command.is_empty(),
-                "controller config: `[[scale.slot]]` {at} has an empty `command`"
-            );
-            ensure!(
-                !slot.engine.trim().is_empty(),
-                "controller config: `[[scale.slot]]` {at} names no `engine`"
-            );
-        }
         Ok(())
     }
 }
@@ -189,14 +160,6 @@ impl ControllerHandle {
 
     pub async fn report_worker(&self, id: WorkerId, status: WorkerStatus) {
         let _ = self.cmd.send(Command::ReportWorker { id, status }).await;
-    }
-
-    /// Each shape the scale table names, desired against current; none
-    /// once the controller's actor has stopped.
-    pub async fn scale_status(&self) -> Vec<ScaleStatus> {
-        let (reply, rx) = oneshot::channel();
-        let _ = self.cmd.send(Command::ScaleStatus { reply }).await;
-        rx.await.unwrap_or_default()
     }
 
     pub fn worker_watch(&self, id: WorkerId) -> watch::Receiver<Neighbors> {
@@ -383,7 +346,6 @@ pub fn embed(config: Config) -> ControllerHandle {
         ActorConfig {
             heartbeat_timeout: config.heartbeat_timeout,
         },
-        actuator::Actuator::new(config.slots.clone(), config.heartbeat_timeout),
     );
     let actor_token = shutdown.clone();
     let actor_task = tokio::spawn(async move {
@@ -426,9 +388,9 @@ pub fn embed(config: Config) -> ControllerHandle {
     let cluster = if config.cluster_policies.is_empty() {
         None
     } else {
-        match policy_components(&config.cluster_policies).and_then(|programs| {
-            start_cluster(programs, gateway_rx.clone(), directory_rx.clone())
-        }) {
+        match policy_components(&config.cluster_policies)
+            .and_then(|programs| start_cluster(programs, gateway_rx.clone(), directory_rx.clone()))
+        {
             Ok(host) => Some(host),
             Err(error) => {
                 tracing::error!(error = %format!("{error:#}"), "cluster policies not started");
@@ -528,27 +490,6 @@ mod tests {
     fn lib_every_case() {
         parse_empty_is_default();
         parse_overrides_fields();
-        parse_scale_slots();
-    }
-
-    fn parse_scale_slots() {
-        let cfg = Config::parse(
-            r#"
-            [[scale.slot]]
-            model = "Qwen/Qwen3-14B"
-            engine = "cuda"
-            command = ["pie-worker", "-c", "wa.toml"]
-
-            [[scale.slot]]
-            engine = "cuda"
-            command = ["pie-pool"]
-            "#,
-        )
-        .expect("scale slots parse");
-        assert_eq!(cfg.slots.len(), 2);
-        assert_eq!(cfg.slots[0].model.as_deref(), Some("Qwen/Qwen3-14B"));
-        assert_eq!(cfg.slots[1].model, None);
-        assert!(Config::parse("[[scale.slot]]\nengine = \"cuda\"\ncommand = []\n").is_err());
     }
 
     fn parse_empty_is_default() {

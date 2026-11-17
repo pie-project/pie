@@ -124,6 +124,9 @@ pub trait TurnRouter: Send + Sync + 'static {
 
     /// A running turn moved to `worker`, or (`None`) could not.
     fn moved(&self, _req: &Request, _worker: Option<WorkerId>, _why: &str) {}
+
+    /// The turn's first output arrived.
+    fn started(&self, _req: &Request) {}
 }
 
 struct TurnState {
@@ -442,6 +445,9 @@ impl Sessions {
                 if let ServerMessage::ProcessEvent { process_id, .. }
                 | ServerMessage::File { process_id, .. } = message
                 {
+                    if !turn.emitted {
+                        self.inner.router.started(&turn.request);
+                    }
                     turn.emitted = true;
                     // What the client calls it, if it never had the answer.
                     if turn.process.is_none() {

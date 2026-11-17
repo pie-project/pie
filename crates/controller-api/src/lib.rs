@@ -2,10 +2,6 @@ use serde::{Deserialize, Serialize};
 
 pub use ids::{GatewayId, NodeId, WorkerId};
 
-/// The environment variable a worker the controller launched finds its
-/// launch token in ([`WorkerInfo::launch`]).
-pub const LAUNCH_ENV: &str = "PIE_LAUNCH";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
@@ -58,10 +54,6 @@ pub struct WorkerInfo {
     #[serde(default)]
     pub engine: String,
     pub addr: String,
-    /// The token the controller's actuator launched it with
-    /// (`PIE_LAUNCH`), so the controller knows which of its launches it is.
-    #[serde(default)]
-    pub launch: Option<String>,
     /// Its process id, so a controller that did not spawn it, restarted
     /// after the one that did, can still signal a launch it adopts.
     #[serde(default)]
@@ -135,43 +127,11 @@ pub struct RoutableWorker {
 pub struct RoutingTable {
     pub epoch: u64,
     pub workers: Vec<RoutableWorker>,
-    /// The controller launches and stops workers to meet a scale table: it
-    /// has slots to launch into (`cluster.scale`).
-    #[serde(default)]
-    pub scales: bool,
-    /// The gateway that authors the cluster-wide tables (scale,
-    /// replication, retention): the live one with the lowest id. Every
-    /// gateway runs its cluster policies; only this one enacts those
-    /// tables, and the controller takes a scale table only from it.
+    /// The gateway that authors the cluster-wide tables (replication): the
+    /// live one with the lowest id. Every gateway runs its cluster policies;
+    /// only this one enacts those tables.
     #[serde(default)]
     pub author: Option<GatewayId>,
-}
-
-/// A shape of worker, and how many of it the cluster should run.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ScaleEntry {
-    /// The model as workers serve it (`[model] name`); None: workers that
-    /// load no model.
-    pub model: Option<String>,
-    pub engine: String,
-    pub workers: u32,
-}
-
-/// Where a shape a scale table names stands, for whoever converges on it:
-/// the controller's own actuator, or an operator in its place.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ScaleStatus {
-    pub model: Option<String>,
-    pub engine: String,
-    pub desired: u32,
-    /// Registered and taking turns.
-    pub serving: u32,
-    /// Launched by the actuator and not registered yet.
-    pub launching: u32,
-    /// Stopped by the actuator and still draining.
-    pub stopping: u32,
-    /// Slots of the shape the actuator has free to launch into.
-    pub free: u32,
 }
 
 /// What a worker holds, as it tells the controller's directory: the sealed
@@ -272,6 +232,11 @@ pub enum ProcessEvent {
         req: u64,
         worker: WorkerId,
     },
+    /// Its first output reached the gateway: the nearest a gateway sees to
+    /// its start on the worker.
+    Started {
+        req: u64,
+    },
     /// A running process moved to `worker`, or (none) could not.
     Moved {
         req: u64,
@@ -358,9 +323,6 @@ pub trait Control {
 
     async fn watch_gateway(since: u64) -> RoutingTable;
 
-    /// Each shape the scale table names, desired against current.
-    async fn scale_status() -> Vec<ScaleStatus>;
-
     /// What `worker` holds, gained and lost since its last report: the
     /// directory's one input. A pool's comes through the gateway it links to.
     async fn report_state(worker: WorkerId, report: StateReport);
@@ -418,7 +380,6 @@ mod tests {
     fn routing_table_serde_round_trip() {
         let table = RoutingTable {
             epoch: 7,
-            scales: false,
             author: Some(GatewayId(2)),
             workers: vec![RoutableWorker {
                 id: WorkerId(3),

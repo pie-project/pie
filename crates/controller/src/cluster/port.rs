@@ -183,14 +183,20 @@ impl Host {
                 move || run(host, config, loaded, rx, shared)
             })
             .map_err(|e| LoadError(format!("spawning the cluster port: {e}")))?;
+        // The workers as the policies first run, again whenever the routing
+        // table changes (a row naming a worker the host does not know is
+        // ignored), and the directory every tick.
         let ticks = events.clone();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(STATE_TICK).await;
                 let view = Arc::new(directory.borrow_and_update().clone());
                 let table = Arc::new(routing.borrow_and_update().clone());
                 if ticks.send(Event::State(view, table)).is_err() {
                     return;
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(STATE_TICK) => {}
+                    changed = routing.changed() => if changed.is_err() { return },
                 }
             }
         });
@@ -384,6 +390,9 @@ fn run(
         if port.host.due() {
             port.host.tick(Vec::new());
         }
+        // What the host has heard is read before its rows: every row a round
+        // committed is in force before a gate that round opens.
+        let heard = port.host.heard();
         let version = port.host.version();
         if version != port.version {
             port.version = version;
@@ -391,7 +400,7 @@ fn run(
             port.enact(delta);
             changed = true;
         }
-        changed |= port.hear();
+        changed |= port.hear(heard);
         if changed {
             publish(&port.shared);
         }
@@ -416,7 +425,9 @@ impl Port {
             }
         }
         tracing::info!(policies = ?policies.iter().map(|(n, _)| n).collect::<Vec<_>>(), "cluster policies reloaded (PLEX 1.1)");
-        self.shared.dead.store(policies.is_empty(), Ordering::Release);
+        self.shared
+            .dead
+            .store(policies.is_empty(), Ordering::Release);
         self.shared
             .gate_ms
             .store(gate_ms(&self.config, policies.len()), Ordering::Release);
@@ -474,13 +485,22 @@ impl Port {
                 host.dispatched(&pid(gateway, req), &worker.0.to_string());
                 false
             }
+            ProcessEvent::Started { req } => {
+                host.started(&pid(gateway, req));
+                false
+            }
             ProcessEvent::Moved { req, worker, why } => {
                 let id = pid(gateway, req);
                 match worker {
                     Some(worker) => host.dispatched(&id, &worker.0.to_string()),
                     None => {
                         tracing::info!(process = %id, %why, "a placement that moves a running process is refused");
-                        host.refuse(tables::PLACEMENT_WORKERS, &id, None, Some(Refusal::NotSupported));
+                        host.refuse(
+                            tables::PLACEMENT_WORKERS,
+                            &id,
+                            None,
+                            Some(Refusal::NotSupported),
+                        );
                     }
                 }
                 false
@@ -535,14 +555,8 @@ impl Port {
                 vec![(Tier::Device, capacity, load.used_tokens)]
             };
             let id = worker.id.0.to_string();
-            self.host.put_worker(
-                &id,
-                load.draining,
-                tiers,
-                load.running,
-                load.waiting,
-                None,
-            );
+            self.host
+                .put_worker(&id, load.draining, tiers, load.running, load.waiting, None);
             let role = match worker.role {
                 Role::Prefill => "prefill",
                 Role::Decode => "decode",
@@ -595,7 +609,10 @@ impl Port {
                     .iter()
                     .map(|w| (w.0.to_string(), Tier::Disk, tokens)),
             );
-            let held = copies.first().map(|(w, _, _)| w.clone()).unwrap_or_default();
+            let held = copies
+                .first()
+                .map(|(w, _, _)| w.clone())
+                .unwrap_or_default();
             self.host
                 .put_working_set(&id, None, None, None, tokens, 0, copies);
             sets.insert(id, held);
@@ -653,11 +670,10 @@ impl Port {
 
     /// Moves each gateway's `heard` up to its highest arrival the host has
     /// heard. Whether one moved.
-    fn hear(&mut self) -> bool {
+    fn hear(&mut self, heard: u64) -> bool {
         if self.unheard.is_empty() {
             return false;
         }
-        let heard = self.host.heard();
         let mut moved = false;
         let mut gateways = self.shared.heard.lock().unwrap();
         self.unheard.retain(|&(at, gateway, seq)| {

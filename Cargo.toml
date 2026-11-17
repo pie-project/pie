@@ -37,7 +37,6 @@ members = [
 
     "crates/inferlet",
     "crates/inferlet-macros",
-    "crates/policy",
     "crates/plex-host",
     "crates/wasmtime-web",
 
@@ -122,6 +121,7 @@ exclude = [
     "examples",
     "crates/builtins/inferlets",
     "crates/builtins/policies",
+    "crates/plex-sdk",
     ".claude",
 ]
 
