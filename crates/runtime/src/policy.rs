@@ -18,6 +18,23 @@ pub use port::{LoadError, reload, start, start_default};
 
 use client_api::Props;
 
+/// The worker columns a port enacts, as `/metrics` names them.
+pub const COLUMNS: [&str; 4] = [
+    "schedule/priority",
+    "schedule/hold",
+    "retention/priority",
+    "retention/tiers",
+];
+
+/// Per column of [`COLUMNS`]: the rows enacted (set or cleared) since start.
+pub static ROWS_ENACTED: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Per column of [`COLUMNS`]: the rows passed over, their key naming no
+/// process this worker could hold.
+pub static ROWS_PASSED_OVER: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
 use crate::inferlet::process::ProcessId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
