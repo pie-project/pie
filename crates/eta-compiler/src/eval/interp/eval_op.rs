@@ -1,5 +1,6 @@
 use alloc::vec;
 use alloc::vec::Vec;
+use core::cmp::Ordering;
 
 use eta_ir::op::Op;
 use eta_ir::rng;
@@ -8,7 +9,11 @@ use eta_ir::types::{Dtype, Literal, Predicate, RngKind, Shape, ValueId, ValueTyp
 use super::numeric::*;
 use super::{ChanEffect, Evaled, PassInputs, StepError, Value, value_matches};
 
-pub(crate) fn eval_op(
+/// One op over `vals` (indexed by the op's value ids), `ty_of` its
+/// operands' types: its result(s), or the effect it asks of the caller (a
+/// channel, a kernel, a sink). The one evaluator of an op on the host: the
+/// tier-0 interpreter here and eta-exec's both run it.
+pub fn eval_op(
     op: &Op,
     vals: &[Value],
     ty_of: &dyn Fn(ValueId) -> ValueType,
@@ -377,6 +382,15 @@ pub(crate) fn eval_op(
             let rows = rows_of(t.shape);
             let x = lanes_f32(v(input));
             let len = x.len().checked_div(rows).unwrap_or(0);
+            let payload = match predicate {
+                Predicate::RankLe(id) | Predicate::CummassLe(id) | Predicate::ProbGe(id) => id,
+            };
+            if v(payload).is_empty() {
+                return Err(fault(format!(
+                    "pivot_threshold reads value {payload} as its predicate payload and that \
+                     value has no lanes"
+                )));
+            }
             let mut keep = vec![false; x.len()];
             for r in 0..rows {
                 let row = &x[r * len..(r + 1) * len];
@@ -390,11 +404,13 @@ pub(crate) fn eval_op(
                     Predicate::CummassLe(pid) => {
                         let pv = lanes_f32(v(pid));
                         let p = pv[pick(pv.len(), r)];
-                        let order = sort_desc_order(row);
-                        let mut excl = 0.0f32;
-                        for &i in &order {
-                            k[i as usize] = excl < p;
-                            excl += row[i as usize];
+                        if !nucleus_prefix(row, p, k) {
+                            let order = sort_desc_order(row);
+                            let mut excl = 0.0f32;
+                            for &i in &order {
+                                k[i as usize] = excl < p;
+                                excl += row[i as usize];
+                            }
                         }
                     }
                     Predicate::ProbGe(tid) => {
@@ -581,29 +597,16 @@ pub(crate) fn eval_op(
             stream,
             shape,
             kind,
-        } => One(Value::F32(rng_ambient(
-            0,
-            stream,
-            kind,
+        } => One(Value::F32(rng_lanes(
+            rng::seed_eff_stream(0, stream),
             shape.numel() as usize,
+            kind,
         ))),
         Op::RngKeyed { state, shape, kind } => {
             let st = lanes_i64(v(state));
             let (key, ctr) = (st[0] as u64 & 0xFFFF_FFFF, st[1] as u64 & 0xFFFF_FFFF);
             let seed64 = rng::keyed_seed(key as u32, ctr as u32);
-            let n = shape.numel() as usize;
-            One(Value::F32(
-                (0..n as u32)
-                    .map(|j| {
-                        let u = rng::hash_uniform(seed64, j);
-                        match kind {
-                            RngKind::Uniform => u,
-                            RngKind::Gumbel => -((-(u.ln())).ln()),
-                            RngKind::Normal => rng::hash_normal(seed64, j),
-                        }
-                    })
-                    .collect(),
-            ))
+            One(Value::F32(rng_lanes(seed64, shape.numel() as usize, kind)))
         }
 
         Op::ChanTake(c) => Evaled::Chan(ChanEffect::Take(c)),
@@ -689,15 +692,19 @@ pub(super) fn broadcast_value(value: &Value, src_shape: Shape, target: Shape) ->
     for i in (0..r.saturating_sub(1)).rev() {
         sstride[i] = sstride[i + 1] * sdim(i + 1) as u64;
     }
+    let mut tstride = vec![1u64; r.max(1)];
+    for i in (0..r.saturating_sub(1)).rev() {
+        tstride[i] = tstride[i + 1] * td[i + 1] as u64;
+    }
     let n = target.numel() as usize;
     let src_idx: Vec<usize> = (0..n as u64)
         .map(|lin| {
             let mut rem = lin;
             let mut sidx = 0u64;
             for i in 0..r {
-                let stride: u64 = td[i + 1..].iter().map(|&d| d as u64).product();
-                let coord = rem / stride.max(1);
-                rem %= stride.max(1);
+                let stride = tstride[i].max(1);
+                let coord = rem / stride;
+                rem %= stride;
                 if sdim(i) != 1 {
                     sidx += coord * sstride[i];
                 }
@@ -708,16 +715,157 @@ pub(super) fn broadcast_value(value: &Value, src_shape: Shape, target: Shape) ->
     gather_flat(value, &src_idx)
 }
 
-pub(super) fn rng_ambient(seed: u32, stream: u32, kind: RngKind, len: usize) -> Vec<f32> {
-    let seed_eff = rng::seed_eff_stream(seed, stream);
-    (0..len as u32)
-        .map(|j| {
-            let u = rng::hash_uniform(seed_eff, j);
-            match kind {
-                RngKind::Uniform => u,
-                RngKind::Gumbel => -((-(u.ln())).ln()),
-                RngKind::Normal => rng::hash_normal(seed_eff, j),
+/// `n` draws of `kind` from the stream `seed_eff`, lane `j` the stream's
+/// `j`th: the same lanes however they are split, a long run's chunks on
+/// threads of their own.
+pub(super) fn rng_lanes(seed_eff: u64, n: usize, kind: RngKind) -> Vec<f32> {
+    const SPLIT_ABOVE: usize = 1 << 15;
+    let lane = |j: usize| {
+        let j = j as u32;
+        match kind {
+            RngKind::Uniform => rng::hash_uniform(seed_eff, j),
+            RngKind::Gumbel => -((-(rng::hash_uniform(seed_eff, j).ln())).ln()),
+            RngKind::Normal => rng::hash_normal(seed_eff, j),
+        }
+    };
+    let threads = std::thread::available_parallelism()
+        .map_or(1, core::num::NonZeroUsize::get)
+        .clamp(1, 8);
+    if n <= SPLIT_ABOVE || threads == 1 {
+        return (0..n).map(lane).collect();
+    }
+    let mut out = vec![0.0f32; n];
+    let chunk = n.div_ceil(threads);
+    std::thread::scope(|scope| {
+        for (c, slice) in out.chunks_mut(chunk).enumerate() {
+            let lane = &lane;
+            scope.spawn(move || {
+                let base = c * chunk;
+                for (k, slot) in slice.iter_mut().enumerate() {
+                    *slot = lane(base + k);
+                }
+            });
+        }
+    });
+    out
+}
+
+/// The nucleus cut of a row whose mass `p` lies within its 64 largest
+/// values: those values kept in `keep` as the full sort's walk keeps them
+/// (the same order, NaN last, ties by index; the same running sum), and
+/// `true`. `false`, `keep` untouched, where the row is no wider than that,
+/// holds a NaN or a negative value (its running sum then not rising), `p`
+/// is NaN, the 64 hold less than `p`, or finding them took too many
+/// inserts: the caller sorts the whole row.
+fn nucleus_prefix(row: &[f32], p: f32, keep: &mut [bool]) -> bool {
+    const WIDE: usize = 64;
+    const GIVE_UP: usize = 32 * WIDE;
+    if p.is_nan() || WIDE >= row.len() {
+        return false;
+    }
+    let mut best: Vec<u32> = Vec::with_capacity(WIDE + 1);
+    let mut inserts = 0usize;
+    for (i, &value) in row.iter().enumerate() {
+        if value.is_nan() || value < 0.0 {
+            return false;
+        }
+        let i = i as u32;
+        if best.len() == WIDE && desc_by_value(row, i, best[WIDE - 1]) != Ordering::Less {
+            continue;
+        }
+        let at = best.partition_point(|&b| desc_by_value(row, b, i) == Ordering::Less);
+        best.insert(at, i);
+        best.truncate(WIDE);
+        inserts += 1;
+        if inserts > GIVE_UP {
+            return false;
+        }
+    }
+    let mut excl = 0.0f32;
+    for &i in &best {
+        if excl >= p {
+            return true;
+        }
+        keep[i as usize] = true;
+        excl += row[i as usize];
+    }
+    if excl >= p {
+        return true;
+    }
+    for &i in &best {
+        keep[i as usize] = false;
+    }
+    false
+}
+
+/// [`sort_desc_order`]'s order of two of `row`'s indices.
+fn desc_by_value(row: &[f32], a: u32, b: u32) -> Ordering {
+    let (x, y) = (row[a as usize], row[b as usize]);
+    match (x.is_nan(), y.is_nan()) {
+        (true, true) => a.cmp(&b),
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => y.partial_cmp(&x).unwrap_or(Ordering::Equal).then(a.cmp(&b)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    use super::{nucleus_prefix, sort_desc_order};
+
+    /// The full sort's nucleus walk, the fast prefix's reference.
+    fn walk(row: &[f32], p: f32) -> Vec<bool> {
+        let mut keep = vec![false; row.len()];
+        let mut excl = 0.0f32;
+        for i in sort_desc_order(row) {
+            keep[i as usize] = excl < p;
+            excl += row[i as usize];
+        }
+        keep
+    }
+
+    /// Where the 64-wide prefix answers, it answers what the full sort's
+    /// walk does: softmax-like rows with ties, peaked and flat, at masses
+    /// from none to all of the row; where it does not, it leaves `keep`
+    /// untouched.
+    #[test]
+    fn the_nucleus_prefix_keeps_what_the_full_walk_keeps() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut answered = 0;
+        for width in [65usize, 128, 1000, 4096] {
+            for peak in [1.0f32, 8.0, 64.0] {
+                let mut row: Vec<f32> = (0..width)
+                    .map(|_| ((next() % 1000) as f32 / 1000.0 * peak).exp())
+                    .collect();
+                row[(next() as usize) % width] = row[0];
+                let total: f32 = row.iter().sum();
+                for value in &mut row {
+                    *value /= total;
+                }
+                for p in [-1.0f32, 0.0, 0.001, 0.1, 0.5, 0.9, 0.999, 1.5, f32::NAN] {
+                    let mut keep = vec![false; width];
+                    if nucleus_prefix(&row, p, &mut keep) {
+                        answered += 1;
+                        assert_eq!(keep, walk(&row, p), "width {width}, peak {peak}, p {p}");
+                    } else {
+                        assert!(keep.iter().all(|&k| !k), "a refused prefix keeps nothing");
+                    }
+                }
             }
-        })
-        .collect()
+        }
+        assert!(answered > 0, "the prefix answers some rows");
+        let mut negative = vec![0.01f32; 100];
+        negative[3] = -0.5;
+        let mut keep = vec![false; 100];
+        assert!(!nucleus_prefix(&negative, 0.0, &mut keep));
+    }
 }

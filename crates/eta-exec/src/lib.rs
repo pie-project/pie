@@ -15,7 +15,6 @@ mod error;
 mod extent;
 mod identity;
 mod lane;
-mod op;
 mod params;
 mod plan;
 mod readiness;
@@ -44,7 +43,6 @@ pub use lane::{
     HEADER_BYTES as LANE_HEADER_BYTES, Header as LaneHeader, RECORD_BYTES as LANE_RECORD_BYTES,
     Record as LaneRecord, SLOT_BYTES as LANE_SLOT_BYTES, Shape as LaneShape,
 };
-pub use op::eval_op;
 pub use params::OpParams;
 pub use plan::{Boundaries, ExecPlan, StagePlan, adopt_launch_package, adopt_launch_package_with};
 pub use readiness::{NO_TICKET, Readiness, Ticket, Words, check};
