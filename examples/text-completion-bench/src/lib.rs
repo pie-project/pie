@@ -346,7 +346,7 @@ async fn run_one(
     let embed_indptr_p = Channel::from([0u32, n]);
     // Decode fires: the prefill sample already spends one of the
     // `max_tokens` sampler activations.
-    let budget = input.max_tokens - 1;
+    let budget = decode_budget(input.max_tokens)?;
     // A host-visible channel cannot attach to two passes, so this one is device-only.
     let tok_in = (!input.host_first_token).then(|| Channel::new([1], dtype::i32));
     let g0_ch = Channel::new([1], dtype::i32);
@@ -618,9 +618,18 @@ async fn run_one(
     })
 }
 
+/// The decode fires after the prefill's sample, which is the first token:
+/// a request for no tokens has nothing to sample and is refused.
+fn decode_budget(max_tokens: usize) -> Result<usize> {
+    max_tokens
+        .checked_sub(1)
+        .ok_or_else(|| "max_tokens must be at least 1: the prefill samples the first token".into())
+}
+
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
     let main_start = std::time::Instant::now();
+    decode_budget(input.max_tokens)?;
 
     // This program is pure: it reads its input, generates, and returns the
     // token counts in one envelope. Nothing is streamed and nothing outside
@@ -811,4 +820,18 @@ async fn main(input: Input) -> Result<Output> {
         token_monotonic_ns: result.token_monotonic_ns,
         prologue_us: result.prologue_us,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `max_tokens: 0` is refused by name, not wrapped to a run past `usize::MAX`.
+    #[test]
+    fn no_tokens_is_refused() {
+        let err = decode_budget(0).unwrap_err();
+        assert!(err.contains("max_tokens must be at least 1"), "{err}");
+        assert_eq!(decode_budget(1), Ok(0));
+        assert_eq!(decode_budget(256), Ok(255));
+    }
 }
