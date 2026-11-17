@@ -6,6 +6,10 @@
 // each reading the pool up to its own slot under a mask that admits its own
 // ancestry. The prompt is folded, so it is committed and no mask speaks of
 // it: a mask's column `c` is pool slot `n + c`.
+//
+// `verify` rescores each final hypothesis alone, as `beam-search` does. The
+// rollback modes `beam-search` takes (`ckpt_sync`, `rollback_mode`) are not
+// run here: anything but `flush_free` is refused by name.
 
 import { chat, eta, model } from '@pie-project/inferlet';
 
@@ -25,6 +29,44 @@ function countGreedyMismatches(picked, greedy, beams) {
   return n;
 }
 
+// The one rollback this front-end runs is `flush_free`; any other is refused.
+export function checkRollback(input) {
+  const mode = input.rollback_mode ?? null;
+  if (mode !== null && mode !== 'flush_free') {
+    throw new Error(`rollback_mode \`${mode}\` is not supported by beam-search-js: it runs flush_free only`);
+  }
+  if (input.ckpt_sync && mode === null) {
+    throw new Error('ckpt_sync is not supported by beam-search-js: it runs flush_free only');
+  }
+}
+
+// The summed log-probability of `hypothesis` after `prompt`, teacher-forced
+// one token a fire on a working set of its own: what a beam that read only
+// its own ancestry scores.
+function rescore(prompt, hypothesis, v) {
+  const ws = new WorkingSet();
+  const pipeline = new Pipeline();
+  let total = 0;
+  for (let at = 0; at < hypothesis.length; at++) {
+    const fed = at === 0 ? prompt : [hypothesis[at - 1]];
+    const toks = Channel.from(fed, dtype.i32);
+    const indptr = Channel.from([0, fed.length], dtype.u32);
+    const wanted = Channel.from([hypothesis[at]], dtype.u32);
+    const out = new Channel([1], dtype.f32);
+    const fwd = new ForwardPass();
+    fwd.embed(toks, indptr);
+    fwd.state([ws], { fold: 'all' });
+    fwd.epilogue(() => {
+      const logits = reshape(intrinsics.output(0, 'logits'), [v]);
+      out.put(gather(logSoftmax(logits), wanted.take()));
+    });
+    pipeline.submit(fwd);
+    total += out.takeHost()[0];
+  }
+  pipeline.close();
+  return total;
+}
+
 function advanceHypotheses(hypotheses, picked, parents, beams) {
   return range(0, beams).map((lane) => [...hypotheses[parents[lane]], picked[lane]]);
 }
@@ -32,6 +74,7 @@ function advanceHypotheses(hypotheses, picked, parents, beams) {
 export function main(input) {
   const maxSteps = Number(input.max_tokens ?? 16);
   const B = Number(input.beams ?? 2);
+  checkRollback(input);
   if (B === 0) throw new Error('beams must be at least 1');
   if (maxSteps === 0) return '';
 
@@ -167,5 +210,20 @@ export function main(input) {
     throw new Error(`beam identity violated: width-1 beam search disagreed with greedy argmax on ${greedyMismatches} of ${maxSteps} steps`);
   }
   const text = model.decode(hypotheses[bestLane]);
-  return `${text}\n[beam] width=${B} steps=${maxSteps} best_score=${finalScores[bestLane].toFixed(4)} greedy_mismatches=${greedyMismatches}`;
+  let verified = '';
+  if (input.verify) {
+    let worst = 0;
+    for (let lane = 0; lane < hypotheses.length; lane++) {
+      const alone = rescore(prompt, hypotheses[lane], v);
+      const apart = Math.abs(alone - finalScores[lane]);
+      // bf16 logits: a step's log-probability rounds to about 1e-2.
+      const room = 0.02 * hypotheses[lane].length + 0.05;
+      if (apart > room) {
+        throw new Error(`beam ${lane} scored ${finalScores[lane].toFixed(4)}, and its hypothesis alone scores ${alone.toFixed(4)}: ${apart.toFixed(4)} apart, past ${room.toFixed(3)}; its recurrence or attention read another beam's cells`);
+      }
+      worst = Math.max(worst, apart);
+    }
+    verified = ` verified=${hypotheses.length} worst_apart=${worst.toFixed(4)}`;
+  }
+  return `${text}\n[beam] width=${B} steps=${maxSteps} best_score=${finalScores[bestLane].toFixed(4)} greedy_mismatches=${greedyMismatches}${verified}`;
 }
