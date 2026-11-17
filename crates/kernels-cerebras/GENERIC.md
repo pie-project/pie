@@ -3456,3 +3456,131 @@ The run order is kv0, kv300, kv600, kv0 again, 3 steps each against the golden, 
   Klein's 1024² denoise (384 x 576 + 502 tape rows, request 1520) linked, loaded and landed its
   1.99G words of static arrays, then its first launch never returned (killed at 3,000 s).
   flux2-mini's GEMM programs have run only on the simulator.
+
+## G3: the decode rotation's cost, Nemotron's deviation, gemma's exit
+
+### G3.1 The rotation a step
+
+DIRECT (G2) computes every angle's cos / sin at the root each step: 42 DSD operations over a
+table set's pairs, four calls a step on qwen3-sim (each layer's q and k regions, the second q
+head finding its position held), 117.4k simulator cycles a step against the tables' 103.5k.
+
+- **A step's advance** (`srope.csl` STEP). Each pair's `(cos f, sin f)` is the host's, rot's
+  second and third NROT (f64, rounded once). A call one position past its last multiplies its
+  cos / sin by them (`c' = c cos f - s sin f`, `s' = s cos f + c sin f`: six DSD operations); a
+  position at a multiple of the anchor period, or one that moved otherwise (a sequence's first,
+  a rewind, another lane's row), is DIRECT.
+- **The period from the error budget** (`emit::region::ROPE_ANCHOR`, derived in its doc and
+  computed by a const fn): the factor off `e^{if}` by `sqrt 2 u`, each product's roundings
+  `sqrt 2 (sqrt 2 + 1) u`, so `4.83 u` a step (`u = 2^-24`), DIRECT's own `1e-6` at the anchor;
+  the budget a sixteenth of the half ulp the region's 16-bit rounding leaves (fp16's, the finer:
+  `2^-15`): 102 steps, the period 64 (a power of two, the test a mask). The test emulates it in
+  f32 over 64k positions of three bases' 64 pairs against f64: worst `4.0e-6` against the
+  bound's `2.95e-5`.
+- **The slot gather as runs.** Every rotated row read its cos / sin through `b[e] =
+  rc[slot[e]]`, a scalar loop over the chunk's columns, a call (a NeoX head's halves are no
+  interleaved pairs, so only interleaved rotations had DSD moves). `slot_runs` prints the gather
+  as a DSD move a run of consecutive columns from consecutive slots (two a NeoX head; at most 8
+  runs, the same for every chunk, else the loop), and the slot table goes. This was the larger
+  term: the tables' 103.5k paid it too.
+- **Measured** (qwen3-sim, 16 teacher-forced steps against its golden, `--stamps 1`): every step
+  token-exact, logits bf16-identical to G2's run; a step 78.7k cycles (an anchor step, step 0,
+  91.0k). The two apart: the gather's runs alone (STEP 0, DIRECT every step) 91.0k a step, logits
+  the same, so the runs took 26.4k and the step 12.3k. qwen3-sim4 (16 steps): 57.4k a step (63.5k
+  at the anchor), logits bf16-identical to G2's run; it holds 15 of 16, as G2's did: step 7 is a
+  tie in HF bf16 (51 and 424 both 4.1562; f32's margin 0.042), the wafer taking 51 as HF bf16 does.
+  The anchor and the advance alternating: qwen3-sim built at STEP 4 (the period's one change),
+  anchors at positions 0, 4, 8 .. (91.0-91.1k), advances between (78.7k), 16 of 16, logits the
+  same.
+- **Priced**: `ROT_STEP_OPS` six operations a step, DIRECT's 42 at one step in the period
+  (`RegionFeatures::rope_step`): qwen3-sim 0.039M to 0.031M a token. The scalar gather was never
+  priced (its line has no DSD operation); its removal is not in the price.
+- **Lanes**: a launch of B lanes' rows alternates positions, so each row is DIRECT; a lane's
+  cos / sin a slot (2 NROT words a lane) would give them the step too. Not built.
+
+### G3.2 Nemotron -l1: the golden's dt floor, not the wafer
+
+1519's nemotron -l1 missed steps 4 and 8 (the bf16 HF reference keeps the golden there). An
+emulation of the unit lowering's op sequence (`tools/wafer/stream/mamba_emu.py`: the RMS norm and
+its bf16 rounding, in_proj in f32 rounded at the head root, the state root's conv, SiLU, softplus,
+decay and `o = decay Sᵀ C + (B·C) dt x + D x` by ops/math.csl's functions step for step in f32, the
+state column's update, the gate, the group norm by sums and spreads, out_proj, the residual) and
+the same sequence exact in f64, both a token a step from the checkpoint, against HF per op
+(`hf_mamba_ops.py`'s values):
+
+| | inproj | scan (raw) | gated norm (y) | layer out | logits |
+|---|---|---|---|---|---|
+| exact lowering vs HF f32 (rel L2, max over positions) | 2.1e-7 | 2.0e-5 | **0.32** | **0.21** | 0.25 |
+| the same, dt floored at 0.001 | 2.1e-7 | 2.3e-7 | 3.6e-7 | 3.4e-7 | 4.2e-7 |
+| the program's f32 / bf16 / math.csl vs exact | 2.1e-3 | 1.3e-3 | 3.8e-3 | 3.4e-3 | max |Δ| 0.056 |
+
+- **The cause**: transformers 5.23's native `NemotronHMamba2Mixer` sets `time_step_limit =
+  (time_step_min, inf)` and clamps `dt` at 0.001 in its chunked scan (its single-token path does
+  not). The release's own modeling code (`modeling_nemotron_h.py`, `mamba_dt_limit` defaulting to
+  `(0, inf)`, the checkpoint's config not stating it) does not clamp; neither does the poem. The
+  small-dt heads' raw output barely moves (2e-5) but the gated group norm rescales each group to
+  unit RMS, which turns it into 21% of the layer's output.
+- **The wafer is right**: HF with the release's limit (`tools/wafer/stream/hf_nemotron.py`, each
+  mixer's `time_step_limit = (0, inf)`) picks, on 1519's teacher-forced tokens, 15 of the wafer's
+  16 argmaxes; the 16th (step 15) is a 0.006 tie its second token takes. The program's own rounding
+  is at HF bf16's floor (layer rel L2 2.5-3.4e-3).
+- **Goldens**: `scratch/cleanup/g3/nem/golden_nem1_rel.json` (the release's dt: greedy, the old
+  tokens' teacher-forced top-5 and every position's layer-0 output on both); 1540's headless
+  per-layer run should be read against its `teacher_forced.hidden`, not `golden.hidden`. Every
+  nemotron golden made with transformers' native class (gen1's -l1, -l2, -l6) carries the floor.
+  The emulation of the program against this golden: 16 of 16 steps its argmax.
+
+### G3.3 gemma4-e2b -l2
+
+srope DIRECT already took the q / k tables out; the 98.8 KB root is the **exit**: the logit
+softcap's region over 262,144 logits at 128 column roots, 2,048 a root, in eight chunk-wide f32
+arrays (its row in, result, scratch rows, exp scratch) beside the root's receive buffer, its
+16-bit rounding and the logits out. The layout's column-root count (`place::layout_fewest`)
+counted the held rows alone (6,144 words, 2,048 of them), so the search took 128 and the
+emitted program's check refused it.
+
+- **Built**: the fewest-roots search also holds each column root's words as emitted
+  (`place::root_words`: the held rows, every value at the root received and rounded, each column
+  region's printed chunk-wide arrays, its chunk's each) with the search's code reserve to the
+  static check's bound; a layout past it takes more roots, and one past it at every count is
+  refused by name (the roots' rows and region arrays) where the emitted check refused it. Every
+  program it could change would have been refused by the emitted check, so programs that built are
+  unchanged (byte-identical: the decode units of qwen3-sim, qwen3-sim4, Qwen3-0.6B -l2,
+  Qwen3.5-0.8B -l1 and nemotron -l1; flux2-mini's and klein's text and denoise). gemma's exit now
+  takes 512 roots.
+- **What stops it next**: layer 0's head roots (`s0l0`, a head of 256 a root): its four head
+  regions (q norm, k norm and rotation, v norm, ...) each print their own chunk-wide arrays, 62
+  halves a column, 7,936 words of the root's 11,008. The regions at a root run one after
+  another, so their scratch rows could be one pool (the largest region's, ~23 halves a column):
+  a root's arrays the largest region's, not their sum. That needs the regions' scratch passed in
+  (a pointer parameter, or one module a root); a var DSD costs ~10 cycles an operation more
+  (csl-gotchas), so the pool should be a const DSD over the cy's own array. Not built. Also past
+  the budget at most row-root counts: the head roots' q tiles (18,432 words at py 384) and the
+  entry's per-layer-embedding projection at py <= 96.
+- **Shared K / V across layers** (layers 15+; not in -l2): the consumer layer is a query-only
+  unit in its producer's K / V block: the producer's columns stay its own, the consumer's q heads
+  land at the same column's roots (the block's attentions already differ per unit, G1.2), and the
+  consumer stores nothing (no `kv_append` in its trace node set). Designed, not built.
+
+- **Open, found on the way** (not this change: identical before it, qwen3-30b-a3b-mini at
+  dd330db3c too): qwen3-30b-a3b-mini -l1 and minimax-m25-mini, both units PASS in G1.1, no longer
+  build: a head root's code (`cy_0_4`, ~25.7 KB estimated) or data (`cy_0_0`, 69.5 KB) past a PE
+  under the static check G2 made the search's last word.
+
+### G3.4 gpt-oss's experts (design)
+
+`moe::group` refuses gpt-oss's at its first select (`selects no plain bank`): its banks are
+mxfp4 (`quantized`), each select adds a per-expert bias, and its activation is `SwigluAlpha` with
+a `limit`. Each lowers into the steps the routed layer already has:
+
+- **mxfp4 banks**: dequantized on the host when the weight PEs' tiles are written (an expert's
+  codes times its block scales to the build's 16 bits), the matvec unchanged; the bank's view the
+  same as a plain bank's.
+- **gate / up bias** (`[E, I]`, the gates' and ups' column order): resident parameters of the
+  activation region, added before it.
+- **The clamped SwiGLU**: `g = min(gate, limit)`, `u = clamp(up, -limit, limit)`, `(u + 1) g
+  sigmoid(alpha g)`, region ops the activation already prints (max, negation, exp, recip).
+- **down bias** (`[E, H]`): `Σ_e w_e b_e` is the gate (E, on the rows) times the bias as a
+  matvec bank, added to the down projection's sum.
+
+Not built.
