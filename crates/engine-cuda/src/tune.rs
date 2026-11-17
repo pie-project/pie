@@ -43,7 +43,7 @@ pub fn rates(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Rated
     let cache = profiles
         .and_then(Path::parent)
         .map(|home| home.join("cache"));
-    let r = crate::rates::measure(0, &base, cache.as_deref())?;
+    let (r, top) = crate::rates::measure(0, &base, cache.as_deref())?;
     let grid = r.bf16_flops_per_ns_by_rows_n_k.clone().unwrap_or_default();
     let attn = r
         .attn_flops_per_ns_by_keys_and_dim
@@ -90,12 +90,18 @@ pub fn rates(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Rated
     let tuned = engine::rates::tuned(&r);
     let how = format!(
         "{name}; the matmul through {} under serving's GEMM tactics, each rate a 20 ms burst on \
-         the stream timed by events, the median of 5 (the launch of 15); operands: engine::rates' pattern; at {}",
+         the stream timed by events, the median of 5 (the launch of 15); operands: engine::rates' pattern; rows to the saturation point {} (past it no (n, k) shape's cost a row fell more than {:.0}% below its least through {}; at it the most {:.1}%, at {} x {}); at {}",
         if cfg!(feature = "rocm") {
             "hipBLASLt"
         } else {
             "cuBLASLt"
         },
+        top.rows,
+        100.0 * profile::AGREEMENT,
+        top.through,
+        100.0 * top.best_gain,
+        top.best_shape.0,
+        top.best_shape.1,
         sitting()
     );
     let provenance = engine::rates::provenance("cuda", &how);
@@ -325,7 +331,7 @@ fn serve(
 pub const CHECK_BOUND: f64 = engine::rates::AGREEMENT;
 
 /// The lanes a served CUDA load is asked (`pie serve`'s); its tokens are
-/// left to the engine (`engine.forward_tokens`, fitted to the card).
+/// left to the engine (its fire bound, fitted to the card).
 const SERVED_LANES: u32 = 512;
 
 /// The fires timed a rung, after two warm ones.

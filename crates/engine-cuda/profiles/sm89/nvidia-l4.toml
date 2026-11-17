@@ -45,7 +45,6 @@ seated_first = true
 # a fire's working set may take 65% of the 24 GB card past the weights, as on the RTX 4090
 working_set_percent = 65
 recording = { use = "bodies", mem_mb = 1024 }
-forward_tokens = 2304
 prefill_lattice_steps = 8
 
 [rates]
@@ -90,7 +89,6 @@ measured = [
   "kernel.sdpa.prefill.ctas_per_sm",
   "kernel.sdpa.selected_mma",
   "engine.copies",
-  "engine.forward_tokens",
   "engine.prefill_lattice_steps",
   "engine.graphs",
   "engine.lattice_steps",

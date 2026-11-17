@@ -133,11 +133,11 @@ __global__ void binary(
     const T* __restrict__ x,
     const T* __restrict__ y,
     T* __restrict__ o,
-    i32 n,
+    i64 n,
     i32 width,
     const u32* __restrict__ win)
 {
-    const i32 idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const i64 idx = static_cast<i64>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= n) return;
 
     if (win != nullptr &&
@@ -164,11 +164,11 @@ template <class T, int ACT>
 __global__ void activation(
     const T* __restrict__ x,
     T* __restrict__ o,
-    i32 n,
+    i64 n,
     i32 width,
     const u32* __restrict__ win)
 {
-    const i32 idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const i64 idx = static_cast<i64>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= n) return;
     if (win != nullptr &&
         static_cast<long long>(idx) >= static_cast<long long>(win[0]) * width) return;
