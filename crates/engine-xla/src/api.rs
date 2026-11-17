@@ -1243,7 +1243,11 @@ impl Xla {
     }
 
     /// Runs each attached prologue first: the forward reads the cells a prologue put.
-    fn run_prologues(&mut self, submission: &engine::fire::Step) -> EngineResult<()> {
+    fn run_prologues(
+        &mut self,
+        submission: &engine::fire::Step,
+        latch: &std::sync::Arc<crate::program::Latch>,
+    ) -> EngineResult<()> {
         let prologues: Vec<(InstanceId, u32)> = submission
             .attachments
             .iter()
@@ -1260,9 +1264,13 @@ impl Xla {
             .as_mut()
             .ok_or_else(|| Error::Load("the xla engine has no model loaded".into()))?
             .device_and_pool();
-        self.programs
-            .fire_guests(device, &prologues, None, pool, Stage::Prologue)
+        let (_, faults) = self
+            .programs
+            .fire_guests_with(device, &prologues, None, pool, None, Stage::Prologue)
             .map_err(refusal)?;
+        for (instance, why) in faults {
+            latch.fault_instances(&[instance], &why);
+        }
         Ok(())
     }
 
@@ -1387,7 +1395,13 @@ impl Xla {
         latch: &std::sync::Arc<crate::program::Latch>,
     ) -> EngineResult<(FireTicket, StepSettle)> {
         capture(submission);
-        self.run_prologues(submission)?;
+        // Each attached instance's lanes: where its pass's fault lands.
+        latch.seat_spans(
+            (submission.attachments.iter())
+                .map(|a| (a.instance, a.lane..a.lane + a.lanes.max(1)))
+                .collect(),
+        );
+        self.run_prologues(submission, latch)?;
         let fed = self.lane_feeds(submission)?;
         let input_cells: Vec<Vec<crate::serve::InputCell<'_>>> = fed
             .cells
@@ -1763,7 +1777,7 @@ impl Xla {
                 .as_mut()
                 .ok_or_else(|| Error::Load("the xla engine has no model loaded".into()))?
                 .device_and_pool();
-            let ran = self
+            let (ran, faults) = self
                 .programs
                 .fire_guests_with(
                     device,
@@ -1774,6 +1788,9 @@ impl Xla {
                     Stage::Epilogue,
                 )
                 .map_err(refusal)?;
+            for (instance, why) in faults {
+                latch.fault_instances(&[instance], &why);
+            }
             for (attachment, ran) in submission
                 .attachments
                 .iter()
