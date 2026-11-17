@@ -55,9 +55,9 @@ struct Input {
     /// pass binds at most twelve channels, and this is the twelfth.
     #[serde(default)]
     trace: bool,
-    /// DIAGNOSTIC: record row 0's top-1/top-2 logit margin every round
-    /// (`margin_trace`). Opt-in because it is a `top_k` over the whole
-    /// vocabulary in the epilogue.
+    /// DIAGNOSTIC: record each token's top-1/top-2 logit margin, that of the
+    /// row which chose it (`margin_trace`, `top_trace`). Opt-in because it is
+    /// a `top_k` over the whole vocabulary in the epilogue.
     #[serde(default)]
     margin: bool,
     #[serde(default)]
@@ -81,6 +81,16 @@ fn bench_mode(input: &Input, k: u32) -> bool {
 /// The window drafts what the caller asked for, up to the model's draft width.
 fn working_k(asked: u32, depth: u32) -> u32 {
     asked.min(depth)
+}
+
+/// Row `j`'s report from a fire's `[rows, 2]` top-two logits: its top-1
+/// and its margin over the top-2. Row `j` chose the fire's `j`th committed
+/// token, so this is that token's.
+fn row_report(tops: &[f32], j: usize) -> Option<(f32, f32)> {
+    match tops.get(2 * j..2 * j + 2)? {
+        &[top, second] => Some((top, top - second)),
+        _ => None,
+    }
 }
 
 fn default_prompt() -> String {
@@ -119,12 +129,15 @@ struct Output {
     /// (`model::draft_depth`), not the width of `mtp.drafts`.
     depth: u32,
     prompt_tokens: u32,
-    /// Per round, row 0's top-1 minus top-2 logit — whether a divergence
-    /// between two widths is a near-tie (the bf16 floor: a one-row and a
-    /// many-row fire take different kernel paths and differ in the last
-    /// bits) or a real gap (a mechanism fault).
+    /// Per token, `tokens[i]`'s: the top-1 minus top-2 logit of the row that
+    /// chose it (the prompt's last row for the first token, a window's row
+    /// `j` for its `j`th committed token) — whether a divergence between two
+    /// widths is a near-tie (the bf16 floor: a one-row and a many-row fire
+    /// take different kernel paths and differ in the last bits) or a real
+    /// gap (a mechanism fault). Indexed as `tokens` is: a parting at token
+    /// `d` reads `margin_trace[d]` in either run.
     margin_trace: Vec<f32>,
-    /// Per round, row 0's top-1 logit beside its margin: what sets the bf16
+    /// Per token, the top-1 logit beside its margin: what sets the bf16
     /// step (`2^(exponent - 7)`) the margin is read against.
     top_trace: Vec<f32>,
     /// Per round, how many tokens were committed (the accepted run plus the
@@ -204,6 +217,7 @@ async fn main(input: Input) -> Result<Output> {
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     let spans = [(0, n)];
     let mut seed: Vec<i32> = Vec::new();
+    let mut seed_top: Vec<f32> = Vec::new();
     for &(base, end) in &spans {
         let len = end - base;
         let toks_p = Channel::from(&prompt_i32[base as usize..end as usize]);
@@ -213,6 +227,7 @@ async fn main(input: Input) -> Result<Output> {
         let rows = len - read;
         let readout_p = Channel::from_iter(read..len);
         let seed_p = Channel::new([w], dtype::i32);
+        let top_p = input.margin.then(|| Channel::new([2], dtype::f32));
 
         let fwd_p = ForwardPass::new();
         fwd_p.embed(&toks_p, &indptr_p)?;
@@ -221,7 +236,10 @@ async fn main(input: Input) -> Result<Output> {
         fwd_p.epilogue(move || {
             // The span's last readout row seeds the first window.
             let last = broadcast(Tensor::constant(rows - 1), [1]);
-            let t = gather(&reshape(reduce_argmax(intrinsics::output(0, "logits")), [rows]), &last);
+            let t = gather(
+                &reshape(reduce_argmax(intrinsics::output(0, "logits")), [rows]),
+                &last,
+            );
             let i = iota(w);
             let first = eq(&i, Tensor::constant(0u32));
             let window = if drafting {
@@ -239,6 +257,12 @@ async fn main(input: Input) -> Result<Output> {
                 broadcast(&t, [w])
             };
             seed_p.put(&window);
+            if let Some(top_p) = &top_p {
+                // The last row's top two: the first token's report.
+                let read = reshape(intrinsics::output(0, "logits"), [rows, intrinsics::vocab()]);
+                let (top, _) = top_k(gather(&read, &last), 2);
+                top_p.put(reshape(top, [2]));
+            }
         });
         fwd_p
             .submit(&pipe)
@@ -247,6 +271,9 @@ async fn main(input: Input) -> Result<Output> {
             .take_host::<Vec<i32>>()
             .await
             .with_context(|| format!("@{base}"))?;
+        if let Some(top_p) = top_p {
+            seed_top = top_p.take_host::<Vec<f32>>().await?;
+        }
     }
 
     let mut generated: Vec<u32> = Vec::with_capacity(input.max_tokens);
@@ -260,6 +287,10 @@ async fn main(input: Input) -> Result<Output> {
     let mut truth_trace: Vec<Vec<u32>> = Vec::new();
     let tracing = input.trace;
     let margin = input.margin;
+    if let Some((top, margin)) = row_report(&seed_top, 0) {
+        top_trace.push(top);
+        margin_trace.push(margin);
+    }
     let bench_accept = bench_mode(&input, k);
     let mut stopped =
         (!bench_accept && stop_tokens.contains(&x)) || generated.len() >= input.max_tokens;
@@ -280,7 +311,7 @@ async fn main(input: Input) -> Result<Output> {
         // One diagnostic channel, the margin or the trace: a declared channel
         // takes a reader cell whether or not a stage touches it, and the pass
         // has room for twelve. f32 for both — a token id is exact in f32.
-        let aux = Channel::new([if tracing { 2 * w } else if margin { 2 } else { 1 }], dtype::f32)
+        let aux = Channel::new([if tracing || margin { 2 * w } else { 1 }], dtype::f32)
             .capacity(channel_capacity() as u32);
 
         let fwd = ForwardPass::new();
@@ -310,14 +341,10 @@ async fn main(input: Input) -> Result<Output> {
                     dtype::f32,
                 ));
             } else if margin {
-                let vocab = intrinsics::vocab();
-                let row0 = reshape(gather(reshape(&logits, [w, vocab]), iota(1)), [vocab]);
-                let (top, _) = top_k(&row0, 2);
-                // [top-1 - top-2, top-1]
-                let first = gather(&top, broadcast(Tensor::constant(0u32), [2]));
-                let second = gather(&top, broadcast(Tensor::constant(1u32), [2]));
-                let lead = eq(iota(2), Tensor::constant(0u32));
-                aux.put(select(&lead, &first - &second, &first));
+                // Every row's top two, `[w, 2]`: row `j` chose the window's
+                // `j`th committed token.
+                let (top, _) = top_k(reshape(&logits, [w, intrinsics::vocab()]), 2);
+                aux.put(reshape(top, [2 * w]));
             } else {
                 // A declared channel takes a reader cell every fire.
                 aux.put(broadcast(Tensor::constant(0f32), [1]));
@@ -400,6 +427,7 @@ async fn main(input: Input) -> Result<Output> {
             for _ in 0..budget {
                 fwd.submit(&pipe)?;
                 let committed = out.take_host::<Vec<i32>>().await?;
+                let mut tops: Vec<f32> = Vec::new();
                 if tracing {
                     let traced = aux.take_host::<Vec<f32>>().await?;
                     if proposed_trace.len() < 12 {
@@ -409,9 +437,7 @@ async fn main(input: Input) -> Result<Output> {
                     }
                 } else {
                     if margin {
-                        let value = aux.take_host::<Vec<f32>>().await?;
-                        margin_trace.push(value[0]);
-                        top_trace.push(value[1]);
+                        tops = aux.take_host::<Vec<f32>>().await?;
                     } else {
                         let _ = aux.take_host::<f32>().await?;
                     }
@@ -460,8 +486,12 @@ async fn main(input: Input) -> Result<Output> {
                         }
                     }
                 }
-                for t in live {
+                for (j, t) in live.into_iter().enumerate() {
                     generated.push(t);
+                    if let Some((top, margin)) = row_report(&tops, j) {
+                        top_trace.push(top);
+                        margin_trace.push(margin);
+                    }
                     if (!bench_accept && stop_tokens.contains(&t))
                         || generated.len() >= input.max_tokens
                     {
@@ -529,6 +559,7 @@ async fn main(input: Input) -> Result<Output> {
         } else {
             run_ahead(&pipe, &fwd, budget, async || {
                 let committed = out.take_host::<Vec<i32>>().await?;
+                let mut tops: Vec<f32> = Vec::new();
                 if tracing {
                     let traced = aux.take_host::<Vec<f32>>().await?;
                     if proposed_trace.len() < 12 {
@@ -538,9 +569,7 @@ async fn main(input: Input) -> Result<Output> {
                     }
                 } else {
                     if margin {
-                        let value = aux.take_host::<Vec<f32>>().await?;
-                        margin_trace.push(value[0]);
-                        top_trace.push(value[1]);
+                        tops = aux.take_host::<Vec<f32>>().await?;
                     } else {
                         let _ = aux.take_host::<f32>().await?;
                     }
@@ -555,8 +584,12 @@ async fn main(input: Input) -> Result<Output> {
                 // Everything before the correction was a draft the trunk kept.
                 accepted += live.len().saturating_sub(1);
                 commits_trace.push(live.len() as u32);
-                for t in live {
+                for (j, t) in live.into_iter().enumerate() {
                     generated.push(t);
+                    if let Some((top, margin)) = row_report(&tops, j) {
+                        top_trace.push(top);
+                        margin_trace.push(margin);
+                    }
                     if (!bench_accept && stop_tokens.contains(&t))
                         || generated.len() >= input.max_tokens
                     {
@@ -583,6 +616,8 @@ async fn main(input: Input) -> Result<Output> {
         }
     }
     generated.truncate(input.max_tokens);
+    margin_trace.truncate(generated.len());
+    top_trace.truncate(generated.len());
     let acceptance_rate = if drafted == 0 {
         0.0
     } else {
@@ -632,6 +667,17 @@ mod tests {
         assert!(bench_mode(&input, working_k(input.k, 4)));
         let input = request(r#"{"max_tokens": 16, "k": 0, "bench_accept": true}"#);
         assert!(!bench_mode(&input, working_k(input.k, 4)));
+    }
+
+    /// A committed token's report is the row that chose it: row `j` for the
+    /// window's `j`th, not row 0's for every token of the round.
+    #[test]
+    fn each_tokens_margin_is_its_own_rows() {
+        let tops = [16.375, 15.25, 20.0, 19.875, 9.0, 1.0];
+        assert_eq!(row_report(&tops, 0), Some((16.375, 1.125)));
+        assert_eq!(row_report(&tops, 1), Some((20.0, 0.125)));
+        assert_eq!(row_report(&tops, 2), Some((9.0, 8.0)));
+        assert_eq!(row_report(&tops, 3), None);
     }
 
     /// `k = 4` on a head that chains four is a window of four drafts, and
