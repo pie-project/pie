@@ -5837,7 +5837,9 @@ fn activation_rungs(
 ) -> Result<Vec<(u32, poem_compiler::ArenaMap)>> {
     let max = budgets.tokens.max_tokens;
     let mut rungs = Vec::new();
-    for tokens in engine::memory::rungs(1, max) {
+    // The lattice's points below the load's top, then the top: the rows a
+    // Metal load fires (`crate::rates::lattice_rows`).
+    for tokens in crate::rates::lattice_rows() {
         if tokens >= max {
             break;
         }

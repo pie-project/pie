@@ -546,7 +546,8 @@ impl Engine for Metal {
                     top: crate::Top::Ruled,
                 })
                 .map_err(fault)?;
-                let narrower = (budgets.max_tokens / 2).max(MIN_FITTED_FORWARD_TOKENS);
+                let narrower =
+                    crate::rates::narrower(budgets.max_tokens, MIN_FITTED_FORWARD_TOKENS);
                 if narrower >= budgets.max_tokens
                     || accounting(weights, prepared.arena_bytes()).admit().is_ok()
                     || accounting(weights, 0).admit().is_err()
@@ -571,7 +572,8 @@ impl Engine for Metal {
             match prepared.load() {
                 Ok(shell) => break shell,
                 Err(Fault::FitShort(short)) => {
-                    let narrower = (budgets.max_tokens / 2).max(MIN_FITTED_FORWARD_TOKENS);
+                    let narrower =
+                    crate::rates::narrower(budgets.max_tokens, MIN_FITTED_FORWARD_TOKENS);
                     if narrower >= budgets.max_tokens {
                         return Err(fault(Fault::FitShort(short)));
                     }
