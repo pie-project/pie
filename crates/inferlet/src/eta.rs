@@ -20,11 +20,11 @@ pub use eta_dsl::Dtype;
 pub use eta_dsl::{
     abs, add, and, broadcast, cast, causal_mask, cos, cummass_le, cumprod, cumsum, div, dtype,
     entropy, entropy_from_logprobs, eq, exp, gather, gather_row, ge, gt, gumbel, gumbel_max,
-    indptr, iota, l2norm, le, log, log_softmax, lt, mask_apply, masked_argmax, matmul, max_elem,
-    min_elem, mul, ne, neg, normal, not, nucleus_sample, or, pivot_threshold, prob_ge, rank_le,
-    recip, reduce_argmax, reduce_max, reduce_min, reduce_sum, rem, reshape, rng, row_membership,
-    rsqrt, scalar_gather, scatter_add, scatter_set, select, sign, sin, sink_window_mask,
-    sliding_window_mask, softmax, sort_desc, sqrt, sub, top_k, transpose,
+    indptr, iota, l2norm, le, log, log_softmax, lt, mask_apply, mask_apply_packed, masked_argmax,
+    matmul, max_elem, min_elem, mul, ne, neg, normal, not, nucleus_sample, or, pivot_threshold,
+    prob_ge, rank_le, recip, reduce_argmax, reduce_max, reduce_min, reduce_sum, rem, reshape, rng,
+    row_membership, rsqrt, scalar_gather, scatter_add, scatter_set, select, sign, sin,
+    sink_window_mask, sliding_window_mask, softmax, sort_desc, sqrt, sub, top_k, transpose,
 };
 
 thread_local! {
@@ -1170,11 +1170,11 @@ pub mod shared_prelude {
     pub use eta_dsl::value::{
         Tensor, abs, and, broadcast, cast, causal_mask, cos, cummass_le, cumprod, cumsum, entropy,
         entropy_from_logprobs, eq, exp, gather, gather_row, ge, gt, gumbel, gumbel_max, indptr,
-        iota, l2norm, le, log, log_softmax, lt, mask_apply, masked_argmax, matmul, max_elem,
-        min_elem, ne, normal, not, nucleus_sample, or, pivot_threshold, prob_ge, rank_le, recip,
-        reduce_argmax, reduce_max, reduce_min, reduce_sum, reshape, rng, row_membership, rsqrt,
-        scalar_gather, scatter_add, scatter_set, select, sign, sin, sink_window_mask,
-        sliding_window_mask, softmax, sort_desc, sqrt, top_k, transpose,
+        iota, l2norm, le, log, log_softmax, lt, mask_apply, mask_apply_packed, masked_argmax,
+        matmul, max_elem, min_elem, ne, normal, not, nucleus_sample, or, pivot_threshold, prob_ge,
+        rank_le, recip, reduce_argmax, reduce_max, reduce_min, reduce_sum, reshape, rng,
+        row_membership, rsqrt, scalar_gather, scatter_add, scatter_set, select, sign, sin,
+        sink_window_mask, sliding_window_mask, softmax, sort_desc, sqrt, top_k, transpose,
     };
     pub use std::ops::ControlFlow;
 }
