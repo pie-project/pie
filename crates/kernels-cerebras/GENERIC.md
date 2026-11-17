@@ -2292,6 +2292,58 @@ milestone's tail.
         program beside the batch one for a lone request is not built: the same cycles on the
         device, a second program's PEs, link and statics for none.
 
+## Consolidation, part A (정리)
+
+- **A static check of every emitted program** (`check`): the files cslc takes, every regime
+  alike (a decode program's routes from its `rcfg.txt`). Routes: one route a colour a PE (two
+  words for one colour a clash), colours under 24, and every send received (a transmission
+  toward a neighbour needs the neighbour's route of the colour to take it from this PE; off the
+  rectangle is an error). Queues: ids under 8; an input queue on a colour its PE routes but never
+  to its ramp an error, on a colour it does not route a warning (a queue bound and never read is
+  legal; a decode program's queues are bound from its rcfg at its start, which `Fabric::validate`
+  holds to its routes). Memory: each PE's data (its files' arrays, their sizes evaluated from the
+  tile's parameters and the files' integer consts, `if` / `@as` / shifts / comparisons included)
+  and code (3,000 B + 24 B a statement, fitted to cslc's ELFs: the GEMM regime's compute PE and
+  tape PE, 1.2 KB and 3.0 KB over), the fullest PE's margin under 48 KB reported; a decode
+  program's memory is its plan's memory model's (`cost::memory::room`: its sizes are comptime
+  functions past the check's arithmetic). `wafer-compile build` and `stream` run it on what they
+  wrote and fail on an error; `wafer-compile check --dir <program>` prints it.
+  - It finds K1's band bug: the stream program the compiler built before the fix (945557fd3^,
+    flux2-mini over three bands at a 45-wide fabric) has 616 errors (a later band's weight PEs'
+    input queues on the first band's colours, routed past their ramps); the fixed compiler's
+    program has none.
+  - Every program passes: the six decode configs (planned by the search: the least room the
+    memory model leaves 19.7 KB (0.8B), 1.5 KB (9B), 3.3 KB (Llama 8B), 1.3 KB (gpt-oss), 5.1 KB
+    (E2B), 21.2 KB (tiny t08)), flux2-mini's text and denoise (GEMM, compile on load), its
+    stream-regime denoise and its VAE (tiled), and klein's 1024² GEMM program (its compute PE
+    17.3 KB data + ~31.4 KB code: an estimated margin of 434 B; the linked ELF's is 1,762 B).
+    The tests run it (`check::tests`, 84 s).
+- **No pins.** A plan with no name asked is the search's: the shipping models' plans
+  (`plans/{0.8b,4b,9b,q3-8b,l3-8b,e2b,e4b,g12,full}.json`) are no longer picked by shape. They
+  are the chip's measured programs, data of the cost model (`cost/measured/*.json`: the
+  partition, levers and arrangement, the bare step the chip measured, where): a measured
+  partition on its own model is priced at its measurement, every other at the model's prediction
+  plus its held-out error (`search::UNMEASURED`, 6.6 µs RMS on the chip's moves: what replaces
+  the old 0.3% preference for the made-for plan), and the search starts from them (any model's,
+  its own first). A named plan (`--preset`, `[engine.wafer] preset`, `--set`) stays, as a debug
+  override; `plans/` keeps the simulator's `tiny*` and `e4b-meta`. A load's fallbacks are the
+  search's next two.
+  - **Search alone gives each shipping model its measured program**, `plan.json` byte for byte
+    (Qwen3.5 0.8B, 4B, 9B, Qwen3-8B, Llama 3.1 8B with its G2=11, Gemma 4 E2B, E4B, 12B,
+    gpt-oss-20b); the decode identity holds. Where the model predicts another partition faster,
+    its gain is inside the error: E2B 3.2 µs (an E4B-seeded G2=11, G2W=27), E4B 4.4 µs, 12B 3.9 µs
+    (G2=15, GA=4, PY=282: the chip measured that move at 0.9505 against 0.9495, no gain), gpt-oss
+    3.2 µs (G2=14, G2W=21); none was run on the chip.
+  - **Where it does not, plainly**: with the model's own measured program left out of the
+    starting points (its measurement still priced; `wafer-compile search --unpinned 1`, at the
+    measured program's positions), the walk from the other models' programs reaches it for
+    Llama alone (G2=11 and all, from the 9B's). For the rest it stops at a slower partition: the
+    0.8B at 0.313 ms (measured 0.292), the 4B 0.484 (0.480), the 9B 0.517 (0.510), Qwen3-8B 0.557
+    (0.5505), E2B 0.686 (0.683), E4B 0.879 (0.8765); the 12B and gpt-oss (their kernel sets'
+    only full-size programs) find nothing that builds. The ladders of single and paired key moves
+    do not cross between these partitions: a model the chip has not run is planned from its
+    kernel set's measured programs and may land short of what a hand search would find.
+
 ## G1: the poem survey
 
 **Goal.** Every `.poem` in `models/` runs: it compiles with no per-model code (placement searched
