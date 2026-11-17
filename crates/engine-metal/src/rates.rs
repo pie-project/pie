@@ -2,8 +2,9 @@
 //! them, at the shapes every backend times ([`engine::rates`]), each through
 //! the kernel serving dispatches under the device's own tuning:
 //!
-//! * the matmul curve: `linear::gemm::matmul`, `m x GEMM_WIDTH x
-//!   GEMM_WIDTH` at each of [`engine::rates::GEMM_ROWS`], each repeat over
+//! * the matmul curves: `linear::gemm::matmul`, `m x w x w` at each of
+//!   [`engine::rates::GEMM_ROWS`] for each width `w` of
+//!   [`engine::rates::GEMM_WIDTHS`], each repeat over
 //!   the next of engine::rates::weights_at's distinct weights so every one
 //!   streams from memory, as a fire's do;
 //! * the attention curve: `attn::arbiter::prefill` at
@@ -627,30 +628,32 @@ pub fn measure(
             warmed.rate / 1e3
         ));
     }
-    // The matmul curve, m x GEMM_WIDTH x GEMM_WIDTH at each of
-    // engine::rates::GEMM_ROWS, over its planes (engine::rates::weights_at:
-    // 768 MiB, at least 12, so each repeat streams its weight as a layer's
-    // matmul does).
-    let w = engine::rates::GEMM_WIDTH;
-    bench.handles = Handles::new();
-    let plane = operand(&bench.pattern, (w * w) as usize * 2);
-    let weights = (0..engine::rates::weights_at(w, w))
-        .map(|_| {
-            let b = bench.buffer(&plane)?;
-            Ok((bench.tensor(&b, w, w, Dtype::Bf16)?, b))
-        })
-        .collect::<Result<Vec<(Tensor, Buffer)>, String>>()?;
-    let tensors: Vec<Tensor> = weights.iter().map(|(t, _)| *t).collect();
+    // The matmul curves: at each width w of engine::rates::GEMM_WIDTHS,
+    // m x w x w at each of engine::rates::GEMM_ROWS, over its planes
+    // (engine::rates::weights_at: 768 MiB, at least 12, so each repeat
+    // streams its weight as a layer's matmul does).
     let mut gemm = Vec::new();
-    for m in engine::rates::GEMM_ROWS {
-        let rate = bench.matmul_flops(m, w, w, &tensors, gap)?;
-        say(&format!(
-            "  bf16 matmul {m} x {w} x {w}: {:.4} TFLOP/s",
-            rate / 1e3
-        ));
-        gemm.push((m, rate / 1e3));
+    for w in engine::rates::GEMM_WIDTHS {
+        bench.handles = Handles::new();
+        let plane = operand(&bench.pattern, (w * w) as usize * 2);
+        let weights = (0..engine::rates::weights_at(w, w))
+            .map(|_| {
+                let b = bench.buffer(&plane)?;
+                Ok((bench.tensor(&b, w, w, Dtype::Bf16)?, b))
+            })
+            .collect::<Result<Vec<(Tensor, Buffer)>, String>>()?;
+        let tensors: Vec<Tensor> = weights.iter().map(|(t, _)| *t).collect();
+        let mut curve = Vec::new();
+        for m in engine::rates::GEMM_ROWS {
+            let rate = bench.matmul_flops(m, w, w, &tensors, gap)?;
+            say(&format!(
+                "  bf16 matmul {m} x {w} x {w}: {:.4} TFLOP/s",
+                rate / 1e3
+            ));
+            curve.push((m, rate / 1e3));
+        }
+        gemm.push((w, curve));
     }
-    drop(weights);
     // The attention curve at d 128; the other widths at the longest keys.
     let mut attn = Vec::new();
     for keys in engine::rates::ATTN_KEYS {
@@ -683,9 +686,7 @@ pub fn measure(
     say(&format!("  256 MiB blit: {bytes:.1} GB/s read and write"));
     Ok(Rates {
         launch_ns: Some(launch),
-        // One width, `engine::rates::GEMM_WIDTH`: a plane of another is
-        // read at it (this backend times no narrower curve yet).
-        gemm_tflops_by_rows: Some(vec![(engine::rates::GEMM_WIDTH, gemm)]),
+        gemm_tflops_by_rows: Some(gemm),
         attn_tflops_by_keys: Some(attn),
         hbm_gbps: Some(bytes),
         elementwise_gbps: Some(elementwise),
