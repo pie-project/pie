@@ -606,8 +606,20 @@ impl Engine for Cuda {
             width_free(&trace.name),
         )?;
         let (contract, plan) = self.settle(&trace, &path, &residency)?;
+        let kv_budget = match (residency.device_kv_budget, residency.device_kv_tokens) {
+            (Some(_), Some(_)) => {
+                return Err(Error::Load(
+                    "the load states the device pool both in bytes (`device_kv_budget`) and \
+                     in kv tokens (`[engine.memory] kv_device_tokens`); state one"
+                        .into(),
+                ));
+            }
+            (Some(bytes), None) => Some(crate::store::KvSize::Bytes(bytes)),
+            (None, Some(tokens)) => Some(crate::store::KvSize::Tokens(tokens)),
+            (None, None) => None,
+        };
         let mut budgets = budgets;
-        if budgets.context_declared && residency.device_kv_budget.is_none() {
+        if budgets.context_declared && kv_budget.is_none() {
             let fits = crate::store::declared_context_that_fits(
                 &trace,
                 budgets.page_size,
@@ -649,9 +661,9 @@ impl Engine for Cuda {
             voxels,
             page_size: budgets.page_size,
             context: budgets.max_context,
-            context_declared: budgets.context_declared && residency.device_kv_budget.is_none(),
+            context_declared: budgets.context_declared && kv_budget.is_none(),
             slots: budgets.slots,
-            kv_budget: residency.device_kv_budget,
+            kv_budget,
             allowance: residency.device,
             ordinal: if ordinal >= 0 {
                 ordinal

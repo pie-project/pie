@@ -164,7 +164,7 @@ fn load(fixture: &Fixture, overrides: &str, tokens: u32) -> Shell {
         page_size: PAGE,
         context: 2 * tokens,
         slots: 1,
-        kv_budget: Some(crate::POOL),
+        kv_budget: Some(engine_cuda::store::KvSize::Bytes(crate::POOL)),
         allowance: engine::Allowance::WHOLE,
         context_declared: false,
         ordinal: 0,

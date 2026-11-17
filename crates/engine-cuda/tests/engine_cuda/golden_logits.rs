@@ -449,7 +449,8 @@ fn load_under(
                 .and_then(|mib| mib.parse::<u64>().ok())
                 .map(|mib| mib << 20),
             mib => Some(mib << 20),
-        },
+        }
+        .map(engine_cuda::store::KvSize::Bytes),
         allowance,
         context_declared: false,
         ordinal: 0,
@@ -2353,7 +2354,7 @@ fn load_lanes(
         page_size: PAGE,
         context: CONTEXT,
         slots: lanes,
-        kv_budget,
+        kv_budget: kv_budget.map(engine_cuda::store::KvSize::Bytes),
         allowance: engine::Allowance::WHOLE,
         context_declared: false,
         ordinal: 0,

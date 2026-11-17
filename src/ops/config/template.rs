@@ -79,6 +79,7 @@ const MEMORY: &str = r#"
 # uses all of it, and the split between weights, kv and fires follows demand.
 # Each key is a cap for sharing the machine.
 # budget_device         = "20GiB"   # per device; omit for the whole device
+# kv_device_tokens      = 51968     # cuda: the device holds exactly this kv; omit to fill it
 # budget_host           = "32GiB"   # suspended kv goes to the host, then the disk
 # budget_disk           = "200GiB"  # the tier is always on
 # disk_path             = "/nvme/pie"  # omit for $PIE_HOME/cache/kv/<digest>
