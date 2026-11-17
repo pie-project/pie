@@ -60,6 +60,7 @@ impl ResidencyPlanner {
         self.with_counts(|inner| {
             if let Some(proc) = inner.procs.get_mut(&pid) {
                 proc.fires = proc.fires.saturating_sub(1);
+                proc.landed = proc.landed.saturating_add(1);
                 proc.fired_at = crate::rt::Instant::now();
                 proc.fire_lapsed = false;
             }

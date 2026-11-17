@@ -2723,3 +2723,58 @@ async fn a_bind_room_head_with_no_fresh_victim_gets_a_last_resort_pick() {
         wait.abort();
     }
 }
+
+/// The victim choice a bind short of room funds is the planner's one
+/// order ([`super::rank::VictimOrder`]): the policy's key first, then the
+/// process made resident last before those running longer. The bind's
+/// run, as pages, is the head's deficit.
+#[tokio::test(flavor = "current_thread")]
+async fn a_bind_short_of_room_picks_victims_by_victim_order() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let pids: Vec<ProcessId> = (0..4).map(|_| ProcessId::new_v4()).collect();
+    for pid in &pids {
+        planner.register(*pid);
+        planner.note_admitted(*pid);
+    }
+    let (binder, held) = (pids[0], &pids[1..]);
+    for pid in held {
+        planner.with_inner(|inner| inner.procs.get_mut(pid).unwrap().idle = true);
+    }
+    let p = planner.clone();
+    let _waited = crate::rt::spawn(async move { p.wait_bind_room(binder, 3, 1).await });
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if planner.diagnostics().queue.len() == 1 {
+            break;
+        }
+    }
+    let order = |planner: &Arc<ResidencyPlanner>| {
+        let set = planner.victim_set().expect("the bind is short");
+        assert_eq!(set.head_pid, binder);
+        assert_eq!(set.deficit.pages, 3, "its run of 3 chunks, as pages");
+        let mut by = set.preferred();
+        by.sort_by_key(|&(_, order)| order);
+        by.into_iter().map(|(pid, _)| pid).collect::<Vec<_>>()
+    };
+    assert_eq!(
+        order(&planner),
+        vec![held[2], held[1], held[0]],
+        "admitted last, first"
+    );
+    // The oldest is parked and comes back: now the youngest resident.
+    planner.with_inner(|inner| inner.came_back(held[0]));
+    assert_eq!(
+        order(&planner),
+        vec![held[0], held[2], held[1]],
+        "restored last, first"
+    );
+    // A policy key leads whatever the recency.
+    planner.with_inner(|inner| inner.procs.get_mut(&held[1]).unwrap().key = -1);
+    assert_eq!(
+        order(&planner),
+        vec![held[1], held[0], held[2]],
+        "the policy's key leads"
+    );
+}
