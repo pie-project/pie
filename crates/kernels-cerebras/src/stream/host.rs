@@ -385,26 +385,59 @@ pub fn span_words(s: &[Span]) -> u32 {
 
 /// `s`'s words (each an f32's bits, or a 16-bit word) from the values `get` holds, by value id.
 pub fn apply_spans(s: &[Span], get: &dyn Fn(u32) -> R<Rows>) -> R<Vec<u32>> {
+    let mut all = Vec::new();
+    apply_spans_into(s, get, usize::MAX, &mut |w| {
+        all = w;
+        Ok(())
+    })?;
+    Ok(all)
+}
+
+/// [`apply_spans`] a run of `chunk` words at a time, each handed to `emit` as it fills (the last
+/// shorter), and each value let go after the last span that reads it: an array's words made
+/// in bounded memory (a GEMM program's tapes, gigabytes of them).
+pub fn apply_spans_into(
+    s: &[Span],
+    get: &dyn Fn(u32) -> R<Rows>,
+    chunk: usize,
+    emit: &mut dyn FnMut(Vec<u32>) -> R<()>,
+) -> R<()> {
+    let mut last: BTreeMap<u32, usize> = BTreeMap::new();
+    for (i, sp) in s.iter().enumerate() {
+        last.insert(sp[0], i);
+    }
     let mut held: BTreeMap<u32, Rows> = BTreeMap::new();
-    let mut out = Vec::new();
+    let mut out: Vec<u32> = Vec::new();
+    let mut emitted = false;
+    // (a run full: handed on)
+    let mut push = |out: &mut Vec<u32>, w: u32, emit: &mut dyn FnMut(Vec<u32>) -> R<()>| -> R<()> {
+        out.push(w);
+        if out.len() == chunk {
+            emitted = true;
+            emit(std::mem::take(out))?;
+        }
+        Ok(())
+    };
     // a packed element waiting for its word's high half
     let mut half: Option<u32> = None;
-    for &[v, row, col, len, stride, flags, count, step] in s {
+    for (si, &[v, row, col, len, stride, flags, count, step]) in s.iter().enumerate() {
         if flags & PACK == 0
             && let Some(lo) = half.take()
         {
-            out.push(lo);
+            push(&mut out, lo, emit)?;
         }
         if v == NONE {
-            out.extend(std::iter::repeat_n(0, len as usize * count as usize));
+            for _ in 0..len as usize * count as usize {
+                push(&mut out, 0, emit)?;
+            }
             continue;
         }
         if v == LIT {
             for _ in 0..len as usize * count as usize {
                 if flags & PACK == 0 {
-                    out.push(row);
+                    push(&mut out, row, emit)?;
                 } else if let Some(lo) = half.take() {
-                    out.push(lo | ((row & 0xffff) << 16));
+                    push(&mut out, lo | ((row & 0xffff) << 16), emit)?;
                 } else {
                     half = Some(row & 0xffff);
                 }
@@ -419,22 +452,24 @@ pub fn apply_spans(s: &[Span], get: &dyn Fn(u32) -> R<Rows>) -> R<Vec<u32>> {
             } else {
                 1f32.to_bits()
             };
-            out.extend(std::iter::repeat_n(one, len as usize * count as usize));
+            for _ in 0..len as usize * count as usize {
+                push(&mut out, one, emit)?;
+            }
             continue;
         }
-        let (rows, width, d) = match held.entry(v) {
-            std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
-            std::collections::btree_map::Entry::Vacant(e) => e.insert(get(v)?),
-        };
+        if let std::collections::btree_map::Entry::Vacant(e) = held.entry(v) {
+            e.insert(get(v)?);
+        }
+        let (rows, width, d) = held.get(&v).ok_or("a value held")?.clone();
         let base = if flags & FLAT != 0 {
             col as usize
         } else {
-            let r = if flags & ONE != 0 && *rows == 1 {
+            let r = if flags & ONE != 0 && rows == 1 {
                 0
             } else {
                 row as usize
             };
-            r * *width + col as usize
+            r * width + col as usize
         };
         for i in (0..count as usize).flat_map(|j| (0..len as usize).map(move |i| (j, i))) {
             let mut at = base + i.0 * step as usize + i.1 * stride as usize;
@@ -455,18 +490,24 @@ pub fn apply_spans(s: &[Span], get: &dyn Fn(u32) -> R<Rows>) -> R<Vec<u32>> {
                 x.to_bits()
             };
             if flags & PACK == 0 {
-                out.push(w);
+                push(&mut out, w, emit)?;
             } else if let Some(lo) = half.take() {
-                out.push(lo | (w << 16));
+                push(&mut out, lo | (w << 16), emit)?;
             } else {
                 half = Some(w);
             }
+        }
+        if last.get(&v) == Some(&si) {
+            held.remove(&v);
         }
     }
     if let Some(lo) = half {
         out.push(lo);
     }
-    Ok(out)
+    if !out.is_empty() || !emitted {
+        emit(out)?;
+    }
+    Ok(())
 }
 
 /// `g` as spans: each run of words of one value, row and flags at consecutive columns one.

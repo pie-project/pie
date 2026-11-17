@@ -97,6 +97,10 @@ impl Drop for Remote {
     }
 }
 
+/// The words a static array's run written at once holds at most (1 GiB): the host's memory
+/// for the arrays as they are made.
+const STATIC_RUN: usize = 1 << 28;
+
 /// A loaded stream reading: its program's host side and link.
 pub(crate) struct Stream {
     pub(crate) reading: Arc<Reading>,
@@ -105,8 +109,9 @@ pub(crate) struct Stream {
     host: Forward,
     /// cslc's output for the SDK runtime.
     link: std::path::PathBuf,
-    /// The static arrays' words, made from the checkpoint at load and written each time its
-    /// program is opened.
+    /// A grid program in weight groups: its static arrays' words, made at load (its groups'
+    /// arrays are written a launch each). Every other program's are made as they are written
+    /// ([`Streams::write`]), from the load's weights.
     statics: Arc<Vec<Option<Vec<u32>>>>,
     /// Its static arrays are on the program open.
     written: bool,
@@ -124,6 +129,9 @@ pub(crate) struct Streams {
     host_fabric: bool,
     /// The program open (the SDK's link), every reading's static arrays on it written.
     open: Option<std::path::PathBuf>,
+    /// The checkpoint's weights, which the static arrays are made from each time a program
+    /// opens.
+    weights: Forward,
 }
 
 impl Streams {
@@ -183,12 +191,22 @@ impl Streams {
         Ok(())
     }
 
-    /// Writes reading `ri`'s static arrays on the fabric.
+    /// Writes reading `ri`'s static arrays on the fabric: a weight-grouped program's as made at
+    /// load, any other's made a run of rows at a time as it goes ([`Reading::statics_streamed`]:
+    /// the host holds a run of words and the values it reads, not every array at once).
     fn write(&mut self, ri: usize) -> R<()> {
-        let words = Arc::clone(&self.readings[ri].statics);
         let reading = Arc::clone(&self.readings[ri].reading);
-        self.fabric
-            .call(move |f| reading.write_statics(f, &words))?;
+        if reading.groups > 0 {
+            let words = Arc::clone(&self.readings[ri].statics);
+            self.fabric
+                .call(move |f| reading.write_statics(f, &words))?;
+        } else {
+            let step = reading.step(&self.trace, None, &[]);
+            let fabric = &self.fabric;
+            reading.statics_streamed(&mut self.weights, &step, STATIC_RUN, &mut |a, w| {
+                fabric.call(move |f| f.write(&a, &w))
+            })?;
+        }
         self.readings[ri].written = true;
         Ok(())
     }
@@ -703,16 +721,22 @@ impl CerebrasEngine {
             }
             let host =
                 Forward::host_for(trace.clone(), &of, &reading.entry_values()).map_err(load)?;
-            // the static arrays are the weights' alone: made from a step of no inputs
-            let s0 = std::time::Instant::now();
-            let statics = reading
-                .statics(&mut weights, &reading.step(&trace, None, &[]))
-                .map_err(load)?;
-            tracing::info!(
-                s = s0.elapsed().as_secs_f64(),
-                reading = %reading.reading,
-                "spatial: a stream program's static arrays made from the checkpoint"
-            );
+            // the static arrays are the weights' alone: made from a step of no inputs (a
+            // grid program in weight groups' here; any other's as its program opens)
+            let statics = if reading.groups > 0 {
+                let s0 = std::time::Instant::now();
+                let st = reading
+                    .statics(&mut weights, &reading.step(&trace, None, &[]))
+                    .map_err(load)?;
+                tracing::info!(
+                    s = s0.elapsed().as_secs_f64(),
+                    reading = %reading.reading,
+                    "spatial: a stream program's static arrays made from the checkpoint"
+                );
+                st
+            } else {
+                Vec::new()
+            };
             readings.push(Stream {
                 reading: Arc::new(reading),
                 host,
@@ -722,7 +746,6 @@ impl CerebrasEngine {
                 steps: 0,
             });
         }
-        drop(weights);
         let host_fabric = self.debug.stream_fabric.as_deref() == Some("host");
         // On the host fabric, a reading no program runs (the stream compiler refuses it: a
         // VAE's convolutions) is served whole by the host's forward: a debug fallback, never
@@ -841,6 +864,7 @@ impl CerebrasEngine {
             fabric,
             host_fabric,
             open: None,
+            weights,
         };
         // a wafer's program opened now, its readings' arrays written as it loads: a reading's
         // first step neither loads it nor waits on its arrays

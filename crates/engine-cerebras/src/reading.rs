@@ -963,6 +963,127 @@ impl Reading {
             .collect()
     }
 
+    /// The static arrays' words ([`Reading::statics`]) handed to `write` a run of rows of PEs at a
+    /// time, each run at most `chunk` words (at least a row), each value made from `weights`
+    /// only while a span reads it: the arrays made in bounded memory, not all at once (klein's
+    /// GEMM tapes are 8 GB of words over 16 GB of their values in f32). Arrays of a weight group
+    /// (written a launch each) are not written here.
+    pub fn statics_streamed(
+        &self,
+        weights: &mut Forward,
+        step: &StreamStep<'_>,
+        chunk: usize,
+        write: &mut dyn FnMut(Array, Vec<u32>) -> R<()>,
+    ) -> R<()> {
+        let weights = std::cell::RefCell::new(weights);
+        // values made a batch at a time (each batch one pass of the weights' forward: the next
+        // values the spans read, in order, up to PREFETCH of them), each handed out once
+        const PREFETCH: usize = 8;
+        let made = |vs: &[u32]| -> R<Vec<(u32, kernels_cerebras::stream::host::Rows)>> {
+            let want: Vec<ValueId> = vs.iter().map(|&v| ValueId(v)).collect();
+            Ok(weights
+                .borrow_mut()
+                .stream_values(step, &[], &want)?
+                .into_iter()
+                .map(|c| {
+                    let vals = match c.values {
+                        Values::F32(v) => v,
+                        Values::I32(v) => v.into_iter().map(|x| x as f32).collect(),
+                    };
+                    (c.value.0, (c.rows, c.width, Rc::new(vals)))
+                })
+                .collect())
+        };
+        for a in &self.h2d {
+            if a.entry.is_some() || a.group.is_some() {
+                continue;
+            }
+            let row = a.len * a.rect.w as usize;
+            let Some(spans) = &a.statics else {
+                let words = npy_words(a.file()?)?.1;
+                write(a.clone(), words)?;
+                continue;
+            };
+            let rows = (chunk / row.max(1)).max(1);
+            let mut y = 0i32;
+            let mut words = 0usize;
+            // the values the spans read, in the order they are first read
+            let mut order: Vec<u32> = Vec::new();
+            let mut seen = std::collections::BTreeSet::new();
+            for sp in spans {
+                let v = sp[0];
+                let constant = v == kernels_cerebras::stream::host::NONE
+                    || v == kernels_cerebras::stream::host::UNIT
+                    || v == kernels_cerebras::stream::host::LIT;
+                if !constant && seen.insert(v) {
+                    order.push(v);
+                }
+            }
+            let ahead = std::cell::RefCell::new((
+                0usize,
+                BTreeMap::<u32, kernels_cerebras::stream::host::Rows>::new(),
+            ));
+            let get = |v: u32| -> R<kernels_cerebras::stream::host::Rows> {
+                let mut a = ahead.borrow_mut();
+                if let Some(r) = a.1.remove(&v) {
+                    return Ok(r);
+                }
+                let at = order.iter().position(|&x| x == v).unwrap_or(a.0).max(a.0);
+                let batch: Vec<u32> = std::iter::once(v)
+                    .chain(
+                        order[at..]
+                            .iter()
+                            .copied()
+                            .filter(|&x| x != v)
+                            .take(PREFETCH - 1),
+                    )
+                    .collect();
+                a.0 = (at + PREFETCH).min(order.len());
+                let mut got = None;
+                for (k, r) in made(&batch)? {
+                    if k == v {
+                        got = Some(r);
+                    } else {
+                        a.1.insert(k, r);
+                    }
+                }
+                got.ok_or_else(|| format!("value %{v}: not made"))
+            };
+            kernels_cerebras::stream::host::apply_spans_into(spans, &get, rows * row, &mut |w| {
+                if w.is_empty() {
+                    return Ok(());
+                }
+                if w.len() % row != 0 {
+                    return Err(format!(
+                        "`{}` at ({}, {}): a run of {} words is no whole row of {row}",
+                        a.sym,
+                        a.rect.x,
+                        a.rect.y,
+                        w.len()
+                    ));
+                }
+                let h = (w.len() / row) as i32;
+                let mut part = a.clone();
+                part.rect.y = a.rect.y + y;
+                part.rect.h = h;
+                y += h;
+                words += w.len();
+                write(part, w)
+            })?;
+            if words != row * a.rect.h as usize {
+                return Err(format!(
+                    "`{}` at ({}, {}): {words} words for {} PEs of {}",
+                    a.sym,
+                    a.rect.x,
+                    a.rect.y,
+                    a.rect.w * a.rect.h,
+                    a.len
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// The static arrays' words ([`Reading::statics`]) written, once a load.
     pub fn write_statics(&self, rt: &mut dyn Fabric, words: &[Option<Vec<u32>>]) -> R<()> {
         for (a, w) in self.h2d.iter().zip(words) {
