@@ -36,6 +36,12 @@ pub const CODE_PER: i64 = 24;
 /// PE's ELF holds 1,430 bytes of data past what its files declare, its tape PE 326.
 pub const DATA_BASE: i64 = 1_500;
 
+/// The code room a search holds back on every PE beside its data, until the code estimate
+/// bounds cslc's: the most `.text` a stream PE of over 10 KB data links to (Qwen3.5-0.8B -l4's
+/// attention head root, 7,348 bytes; its data and the estimate's within 1.2 KB, the code
+/// estimate 2 to 9 KB over and, on a lone router root, 10 KB under).
+pub const CODE_RESERVE: i64 = 7_680;
+
 /// Every PE's routes, `(x, y, colour)` -> route word (rx `0x00` W, `0x20` E, `0x40` S, `0x60` N,
 /// `0x80` the ramp; tx `1` W, `2` E, `4` S, `8` N, `0x10` the ramp).
 #[derive(Clone, Debug, Default)]
@@ -721,6 +727,17 @@ impl Report {
         self.fullest
             .as_ref()
             .map_or(PE_BYTES, |(_, d, c)| PE_BYTES - d - c)
+    }
+
+    /// The room the fullest PE's data leaves beside [`CODE_RESERVE`] (bytes; negative past
+    /// it): a search's memory feasibility, the data the check's own.
+    #[must_use]
+    pub fn data_room(&self) -> (i64, String) {
+        self.codes
+            .iter()
+            .map(|(f, d, _)| (PE_BYTES - CODE_RESERVE - d, f.clone()))
+            .min()
+            .unwrap_or((PE_BYTES - CODE_RESERVE, String::new()))
     }
 
     /// One line: its PEs, routes, margin and findings.

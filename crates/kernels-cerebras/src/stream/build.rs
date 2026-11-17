@@ -71,6 +71,22 @@ impl Default for KvSplit {
 /// The most replicas of a K / V head the search tries ([`program_at`]'s `rep`).
 pub const MAX_KV_REP: u32 = 16;
 
+/// `p`'s PEs' memory: each PE's data (the static check's, of `p` as emitted) beside
+/// [`crate::check::CODE_RESERVE`] within a PE.
+fn fits(p: &Program) -> R<()> {
+    let e = crate::emit::stream::emit(p)?;
+    let (room, file) = crate::check::files(&e.files).data_room();
+    if room < 0 {
+        return Err(format!(
+            "{}: `{file}`'s data {} B past the {} B a PE holds beside its code",
+            p.trace.name,
+            -room,
+            crate::check::PE_BYTES - crate::check::CODE_RESERVE
+        ));
+    }
+    Ok(())
+}
+
 /// The cheapest candidates a replica count builds that the next count prices again.
 const KV_REP_TRIES: usize = 4;
 
@@ -409,6 +425,8 @@ pub fn program_py(
     }
     // built a few at a time (a whole-wafer program is large), the cheapest kept
     let mut best: Option<(f64, Program)> = None;
+    // every candidate built, priced: (cycles, candidate, replica count)
+    let mut priced: Vec<(f64, (u32, u32, KvSplit), u32)> = Vec::new();
     let mut errs: Vec<(u32, u32, String)> = Vec::new();
     // each K / V head over 1, 2, 4 .. replicas (a head root's q heads and tiles fewer, more
     // K / V PEs at once), each count priced like any other choice: every candidate at one
@@ -449,6 +467,7 @@ pub fn program_py(
                         applied = true;
                         let c = crate::cost::stream::time(&prog).cycles;
                         built.push((c, cand));
+                        priced.push((c, cand, rep));
                         if best.as_ref().is_none_or(|(b, _)| c < *b) {
                             best = Some((c, prog));
                         }
@@ -472,6 +491,40 @@ pub fn program_py(
             built.iter().take(KV_REP_TRIES).map(|&(_, c)| c).collect()
         };
         rep *= 2;
+    }
+    // the cheapest held to the PEs' memory (the static check's data of it as emitted), else
+    // the next cheapest, rebuilt
+    if let Some((c0, p0)) = best.take() {
+        priced.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut first = Some(p0);
+        for &(c, (p, tile, kv), rep) in &priced {
+            let prog = match first.take().filter(|_| c == c0) {
+                Some(prog) => prog,
+                None => match program_at(
+                    trace,
+                    shape.clone(),
+                    round16,
+                    upto,
+                    taps,
+                    p,
+                    tile,
+                    kv,
+                    spill,
+                    bounds,
+                    rep,
+                ) {
+                    Ok(prog) => prog,
+                    Err(_) => continue,
+                },
+            };
+            match fits(&prog) {
+                Ok(()) => {
+                    best = Some((c, prog));
+                    break;
+                }
+                Err(e) => errs.push((p, tile, e)),
+            }
+        }
     }
     best.map(|(_, p)| p).ok_or_else(|| {
         // the farthest a candidate got: the most row roots at the whole tile budget
