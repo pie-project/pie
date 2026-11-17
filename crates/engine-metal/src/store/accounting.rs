@@ -4,15 +4,21 @@ use crate::error::{Fault, Result};
 /// floor under the measured capacity (the user's decision, every backend).
 pub const DRIVER_FLOOR: u64 = 64 << 20;
 
-/// What a load may place on the device: the working set Metal recommends
-/// for this process, less what the device already held for it when the
-/// load began (the context, queues and libraries: `outside`) and the
-/// driver's floor, capped by `[engine.memory] budget_device` where the
-/// operator states one. Measured, not a share of the device.
+/// What a load may place on the device: the lesser of the working set
+/// Metal recommends for this process less what the device already held for
+/// it when the load began (the context, queues and libraries: `outside`),
+/// and what the OS can wire for it now (`wirable`: its available memory at
+/// load plus what this process already holds there), less the driver's
+/// floor; capped by `[engine.memory] budget_device` where the operator
+/// states one. Measured, not a share of the device: on unified memory the
+/// GPU wires the pages everything else on the machine uses, and Metal's
+/// recommendation does not subtract them (the user's ruling). Memory other
+/// processes take later is the governor's yield's business.
 #[must_use]
-pub fn capacity(working_set: u64, outside: u64, budget: Option<u64>) -> u64 {
-    let measured = working_set
-        .saturating_sub(outside)
+pub fn capacity(working_set: u64, outside: u64, wirable: Option<u64>, budget: Option<u64>) -> u64 {
+    let recommended = working_set.saturating_sub(outside);
+    let measured = wirable
+        .map_or(recommended, |wirable| recommended.min(wirable))
         .saturating_sub(DRIVER_FLOOR);
     budget.map_or(measured, |budget| measured.min(budget))
 }
@@ -24,6 +30,10 @@ pub struct Accounting {
     /// What the device held for this process before the load placed
     /// anything.
     pub outside: u64,
+    /// What the OS could wire for this process at load: its available
+    /// memory then plus what this process held (`None` where it would not
+    /// say).
+    pub wirable: Option<u64>,
     /// `[engine.memory] budget_device`, where stated.
     pub budget: Option<u64>,
     pub capacity: u64,
@@ -45,15 +55,17 @@ impl Accounting {
     pub fn of(
         working_set: u64,
         outside: u64,
+        wirable: Option<u64>,
         budget: Option<u64>,
         weights: u64,
         fire: u64,
         minimum: u64,
     ) -> Accounting {
-        let capacity = capacity(working_set, outside, budget);
+        let capacity = capacity(working_set, outside, wirable, budget);
         Accounting {
             working_set,
             outside,
+            wirable,
             budget,
             capacity,
             weights,
@@ -125,13 +137,14 @@ mod tests {
         a_load_under_the_capacity_is_admitted_and_one_over_it_refuses();
         what_the_device_held_before_the_load_comes_off_the_capacity();
         a_budget_caps_the_capacity();
+        what_the_os_can_wire_caps_the_capacity();
     }
 
     fn the_fire_counts_against_the_capacity() {
         let ws = 21_800 * (GIB / 1000);
-        let without = Accounting::of(ws, 0, None, 11 * GIB, 0, 4 * GIB);
+        let without = Accounting::of(ws, 0, None, None, 11 * GIB, 0, 4 * GIB);
         assert!(without.admit().is_ok());
-        let with = Accounting::of(ws, 0, None, 11 * GIB, 7 * GIB, 4 * GIB);
+        let with = Accounting::of(ws, 0, None, None, 11 * GIB, 7 * GIB, 4 * GIB);
         let why = with.admit().expect_err("11 + 7 + 4 GiB is over ~21.3");
         let said = format!("{why}");
         assert!(
@@ -143,9 +156,9 @@ mod tests {
 
     fn a_load_under_the_capacity_is_admitted_and_one_over_it_refuses() {
         let ws = 21_800 * (GIB / 1000);
-        let ok = Accounting::of(ws, 0, None, 11 * GIB, 0, 4 * GIB);
+        let ok = Accounting::of(ws, 0, None, None, 11 * GIB, 0, 4 * GIB);
         assert!(ok.admit().is_ok(), "11 + 4 GiB fits under ~21.3");
-        let over = Accounting::of(ws, 0, None, 18 * GIB, 0, 4 * GIB);
+        let over = Accounting::of(ws, 0, None, None, 18 * GIB, 0, 4 * GIB);
         let why = over.admit().expect_err("18 + 4 GiB over the capacity");
         let said = format!("{why}");
         for needle in [
@@ -170,8 +183,8 @@ mod tests {
     }
 
     fn what_the_device_held_before_the_load_comes_off_the_capacity() {
-        let alone = Accounting::of(40 * GIB, 0, None, 16 * GIB, 0, GIB);
-        let held = Accounting::of(40 * GIB, GIB, None, 16 * GIB, 0, GIB);
+        let alone = Accounting::of(40 * GIB, 0, None, None, 16 * GIB, 0, GIB);
+        let held = Accounting::of(40 * GIB, GIB, None, None, 16 * GIB, 0, GIB);
         assert_eq!(held.capacity, alone.capacity - GIB);
         assert_eq!(
             alone.capacity,
@@ -182,22 +195,22 @@ mod tests {
     }
 
     fn a_budget_caps_the_capacity() {
-        let whole = Accounting::of(40 * GIB, GIB, None, 16 * GIB, 0, GIB);
+        let whole = Accounting::of(40 * GIB, GIB, None, None, 16 * GIB, 0, GIB);
         assert_eq!(
             whole.capacity,
             39 * GIB - DRIVER_FLOOR,
             "no share of the device is taken, only the floor"
         );
-        let capped = Accounting::of(40 * GIB, GIB, Some(20 * GIB), 16 * GIB, 0, GIB);
+        let capped = Accounting::of(40 * GIB, GIB, None, Some(20 * GIB), 16 * GIB, 0, GIB);
         assert_eq!(capped.capacity, 20 * GIB);
         assert_eq!(capped.pool, 4 * GIB);
-        let roomy = Accounting::of(40 * GIB, GIB, Some(100 * GIB), 16 * GIB, 0, GIB);
+        let roomy = Accounting::of(40 * GIB, GIB, None, Some(100 * GIB), 16 * GIB, 0, GIB);
         assert_eq!(
             roomy.capacity,
             39 * GIB - DRIVER_FLOOR,
             "a budget past the device caps nothing"
         );
-        let over = Accounting::of(40 * GIB, 0, Some(17 * GIB), 16 * GIB, 0, 2 * GIB);
+        let over = Accounting::of(40 * GIB, 0, None, Some(17 * GIB), 16 * GIB, 0, 2 * GIB);
         let said = format!(
             "{}",
             over.admit().expect_err("16 + 2 GiB over a 17 GiB budget")
@@ -206,5 +219,20 @@ mod tests {
             said.contains("caps it at"),
             "the refusal names the budget: {said}"
         );
+    }
+
+    /// On unified memory the GPU wires the pages the rest of the machine
+    /// uses: where the OS can wire less than Metal recommends, the capacity
+    /// is what it can wire, less the floor; where it can wire more, the
+    /// recommendation stands.
+    fn what_the_os_can_wire_caps_the_capacity() {
+        let recommended = Accounting::of(40 * GIB, GIB, None, None, 16 * GIB, 0, GIB);
+        let short = Accounting::of(40 * GIB, GIB, Some(30 * GIB), None, 16 * GIB, 0, GIB);
+        assert_eq!(short.capacity, 30 * GIB - DRIVER_FLOOR);
+        assert_eq!(short.pool, 14 * GIB - DRIVER_FLOOR);
+        let roomy = Accounting::of(40 * GIB, GIB, Some(60 * GIB), None, 16 * GIB, 0, GIB);
+        assert_eq!(roomy.capacity, recommended.capacity);
+        let capped = Accounting::of(40 * GIB, GIB, Some(30 * GIB), Some(20 * GIB), 16 * GIB, 0, GIB);
+        assert_eq!(capped.capacity, 20 * GIB, "a budget under both still caps");
     }
 }

@@ -1181,10 +1181,15 @@ impl PreparedLoad<'_> {
             + scratch.bytes()
             + arms as u64 * io.last().copied().map_or(0, crate::arena::io_room)
             + ane_fire;
+        // What the OS can wire for this process now: its available memory
+        // plus what the process already holds on the device.
+        let wirable = crate::device::wirable::os_available()
+            .map(|available| available.saturating_add(device.allocated()));
         let accounting = |pool: u64| {
             crate::store::accounting::Accounting::of(
                 device.working_set(),
                 outside,
+                wirable,
                 boot.allowance.budget,
                 model_bytes,
                 fire_bytes,
@@ -1425,6 +1430,14 @@ impl PreparedLoad<'_> {
                     acct.outside
                 );
             }
+            tracing::info!(
+                capacity = acct.capacity,
+                recommended = acct.working_set.saturating_sub(acct.outside),
+                wirable = ?acct.wirable,
+                floor = crate::store::accounting::DRIVER_FLOOR,
+                "metal: the device capacity is the lesser of the working set Metal recommends \
+                 less what this process held, and what the OS can wire for it now, less the floor"
+            );
         }
         let rs_at = rows.rs.clone();
         let mut pools = Pools::reserve(&device, rows, layout, paging)?;

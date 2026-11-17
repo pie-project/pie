@@ -8,6 +8,7 @@ pub mod library;
 mod models;
 #[cfg(target_vendor = "apple")]
 pub mod sparse;
+pub mod wirable;
 
 pub use alloc::Buffer;
 pub use ctx::{Context, CoresFrom, Pending, present, reservations};
