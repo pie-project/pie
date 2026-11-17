@@ -4,6 +4,7 @@ mod a_bank_past_2_gib_reads_its_last_rows;
 mod a_buffered_fold_is_the_fold_it_replaces;
 mod a_column_cut_of_a_bank_multiplies_as_its_copy;
 mod a_copied_window_is_one_encode_over_the_same_rows;
+mod a_dense_model_reads_no_routed_or_quantized_decision;
 mod a_device_fold_lane_states_its_own_fold;
 mod a_fire_wider_than_its_rung_is_refused_by_name;
 mod a_kv_only_lane_reports_its_device_fold;
