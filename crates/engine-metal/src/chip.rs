@@ -139,6 +139,7 @@ seeded!(
     "apple7.toml",
     "apple8.toml",
     "apple9.toml",
+    "apple7/apple-m1-max.toml",
     "apple9/apple-m4-pro.toml",
     "apple10.toml",
 );
