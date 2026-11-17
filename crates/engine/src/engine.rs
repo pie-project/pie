@@ -13,6 +13,14 @@ use crate::program::{
 };
 use crate::transfer::{KvCopy, KvHandle, StateCopy};
 
+/// What a program's compile made, off the engine's thread, for the engine
+/// that prepared it ([`Engine::finish_program`]).
+pub struct Prepared(pub Box<dyn std::any::Any + Send>);
+
+/// A program's compile ([`Engine::prepare_program`]): run once, on any
+/// thread.
+pub type ProgramCompile = Box<dyn FnOnce() -> Prepared + Send>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct StepDone {
     pub frame: FrameId,
@@ -186,6 +194,30 @@ pub trait Engine: Send {
     fn prewarm_programs(&mut self, registrations: &[ProgramRegistration]) -> Result<()> {
         let _ = registrations;
         Ok(())
+    }
+
+    /// A registration in three steps, so the thread that fires does not
+    /// wait out a program's compile: this, on the engine's thread, checks
+    /// the program and hands back its compile, which the runtime runs on a
+    /// worker thread while the engine fires on; [`Engine::finish_program`],
+    /// on the engine's thread again, takes what the compile made and
+    /// answers the program's id. The program binds no instance until
+    /// then. The default compiles nothing apart: its finish registers the
+    /// program whole ([`Engine::register_program`]).
+    fn prepare_program(&mut self, registration: &ProgramRegistration) -> Result<ProgramCompile> {
+        let registration = registration.clone();
+        Ok(Box::new(move || Prepared(Box::new(registration))))
+    }
+
+    /// The second half of [`Engine::prepare_program`]: the program's id,
+    /// from what its compile made.
+    fn finish_program(&mut self, prepared: Prepared) -> Result<ProgramId> {
+        match prepared.0.downcast::<ProgramRegistration>() {
+            Ok(registration) => self.register_program(&registration),
+            Err(_) => Err(Error::Program(
+                "a prepared program this engine did not prepare".to_string(),
+            )),
+        }
     }
 
     /// What an instance of a registered program holds in the pool's
