@@ -3890,7 +3890,7 @@ mod tests {
     }
 
     async fn panics_registering() -> Result<::engine::ProgramId> {
-        crate::rt::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
         panic!("the compile panics")
     }
 
@@ -3913,7 +3913,7 @@ mod tests {
                 handle.program_id_with(ProcessId::default(), registration(0xd0d0), |_, _| {
                     async move {
                         registered.fetch_add(1, Ordering::SeqCst);
-                        crate::rt::time::sleep(Duration::from_millis(50)).await;
+                        tokio::time::sleep(Duration::from_millis(50)).await;
                         Ok(::engine::ProgramId(7))
                     }
                 })
@@ -3953,7 +3953,7 @@ mod tests {
         crate::rt::block_on(async {
             let bind = handle.program_id_with(ProcessId::default(), registration(0xc0c0), |_, _| {
                 async move {
-                    crate::rt::time::sleep(Duration::from_millis(100)).await;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                     done.store(true, Ordering::SeqCst);
                     Ok(::engine::ProgramId(9))
                 }
@@ -3964,7 +3964,7 @@ mod tests {
                     .is_err(),
                 "the bind is dropped mid-compile"
             );
-            crate::rt::time::sleep(Duration::from_millis(300)).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
         });
         assert!(finished.load(Ordering::SeqCst), "the registration finished");
         let found = crate::rt::block_on(handle.program_id_with(

@@ -664,6 +664,8 @@ impl Plane {
         Ok(())
     }
 
+    #[must_use]
+    pub fn package(
         &self,
         program: ProgramId,
     ) -> Option<&eta_compiler::codegen::launch::LaunchPackage> {

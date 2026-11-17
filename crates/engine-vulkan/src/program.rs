@@ -5,7 +5,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
 use engine::program::{
     BoundInstance, Footprint, InstanceBinding, InstanceId, ProgramFacts, ProgramId,
-    ProgramRegistration, Rebind, RingFacts,
+    Rebind, RingFacts,
 };
 use engine_gpu::program::Place;
 use engine_gpu::store::Pools;
@@ -1572,6 +1572,7 @@ mod registration_tests {
             },
             ..engine::program::ProgramRegistration::default()
         };
+        use engine_gpu::program::Programs as _;
         let mut plane = Plane::default();
         let refused = plane.register(&registration);
         let Err(Refusal::Program(why)) = &refused else {

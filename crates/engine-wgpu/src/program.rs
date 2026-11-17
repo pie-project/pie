@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use engine::channel::{ChannelId, ChannelRegistration, HostMirror, RegisteredChannel};
 use engine::program::{
-    BoundInstance, InstanceBinding, InstanceId, ProgramFacts, ProgramId, ProgramRegistration,
-    Rebind, RingFacts,
+    BoundInstance, InstanceBinding, InstanceId, ProgramFacts, ProgramId, Rebind,
+    RingFacts,
 };
 use engine_gpu::program::Place;
 use engine_gpu::store::Pools;
@@ -352,7 +352,12 @@ impl Plane {
     /// Releases `id`, which no instance binds (`Engine::close_program`):
     /// its id answers nothing after.
     pub fn close_program(&mut self, id: ProgramId) -> Result<(), Refusal> {
-        if self.instances.values().any(|instance| instance.program == id) {
+        let bound = self.programs.get(&id).is_some_and(|plan| {
+            self.instances
+                .values()
+                .any(|instance| Arc::ptr_eq(&instance.plan, plan))
+        });
+        if bound {
             return Err(Refusal::Program(format!(
                 "program {id} still has an instance bound"
             )));
@@ -1293,6 +1298,7 @@ mod registration_tests {
             },
             ..engine::program::ProgramRegistration::default()
         };
+        use engine_gpu::program::Programs as _;
         let mut plane = Plane::default();
         let refused = plane.register(&registration);
         let Err(Refusal::Program(why)) = &refused else {
