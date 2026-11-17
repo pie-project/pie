@@ -1,9 +1,10 @@
 //! The search: a model's partitions ranked by what they cost ([`crate::cost`]). From each of its
-//! kernel set's pinned plans ([`crate::pins`]: the one made for the model first), it moves the keys one or
-//! two at a time over a ladder of values, keeps the moves that plan, serve the positions asked for
-//! and leave every image its stack room, and walks to the fastest predicted step. A candidate
-//! ranks ahead of the made-for preset only where it beats it by the time model's resolution
-//! ([`RESOLUTION`]). The best few are built ([`Program::build`]: the fabric and its colours) before one is returned.
+//! kernel set's named partitions ([`crate::pins`]: the chip's measured programs, the model's own
+//! first), it moves the keys one or two at a time over a ladder of values, keeps the moves that
+//! plan, serve the positions asked for and leave every image its stack room, and walks to the
+//! fastest predicted step. On a model the chip measured, its measured partition is priced at
+//! its measurement and every other one past the time model's error ([`UNMEASURED`]). The best
+//! few are built ([`Program::build`]: the fabric and its colours) before one is returned.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -23,10 +24,12 @@ pub const MARGIN: f64 = 512.0;
 /// The refusals the repair follows a step.
 const BEAM: usize = 96;
 
-/// The least gain (a fraction of the made-for plan's step) a candidate must predict to rank
-/// ahead of that plan: the moves under it are within the time model's error (gpt-oss G2=8, 0.4%
-/// on the chip, is the one it gets the wrong way: 0.8% of its step).
-pub const RESOLUTION: f64 = 0.003;
+/// What an unmeasured partition's predicted step is held to past the model's on a model the chip
+/// measured (ms): the time model's error held out on the chip's moves (6.6 µs RMS, 21 µs at
+/// most: `ARCHITECTURE.md`, "Cost"). A measured partition's price is its measurement; one the
+/// chip has not run must beat it by more than the model can tell (gpt-oss's G2=8, a 0.4% gain on
+/// the chip the model prices a loss, is inside it).
+pub const UNMEASURED: f64 = 0.0066;
 
 /// Keys that are not the partition's (the contract's levels and loop, the head's scale).
 const FIXED: &[&str] = &["CTX", "LOOP", "NLV", "HSCALE", "RLV", "RBITS", "CAP", "WL"];
@@ -45,6 +48,9 @@ pub struct Scored {
 pub struct Asked {
     pub positions: Option<u32>,
     pub set: String,
+    /// The model's own measured partition not a starting point (its measurement still the cost
+    /// model's): what the search reaches from the other models' partitions alone.
+    pub unpinned: bool,
 }
 
 /// The candidates `shape` searched to, fastest first (at most `keep`), each built.
@@ -52,16 +58,22 @@ pub fn search(shape: &Shape, ask: &Asked, keep: usize) -> R<Vec<Scored>> {
     let set = crate::kernels::KernelSet::of_shape(shape);
     crate::compose::refuse(shape)?;
     let sig = shape.signature();
+    // the starting points: the kernel set's named partitions (the measured programs first, the
+    // model's own first of them); `unpinned`: the model's own left out
     let mut seeds = crate::pins::of(set);
-    seeds.sort_by_key(|p| p.made_for != Some(sig));
+    if ask.unpinned {
+        seeds.retain(|p| p.measured_on != Some(sig));
+    }
+    seeds.sort_by_key(|p| p.measured_on != Some(sig));
     let seeds: Vec<Preset> = seeds
         .into_iter()
         .filter_map(|p| p.set(&ask.set).ok())
         .collect();
-    // the made-for preset's plan: the positions it serves and the measured layer cost
-    let reference = seeds
-        .first()
-        .filter(|p| p.made_for == Some(sig))
+    // the model's measured program (its partition priced at its measurement): the positions it
+    // serves and the measured layer cost
+    let measured = crate::cost::measured::on(sig).and_then(|m| m.preset.set(&ask.set).ok());
+    let reference = measured
+        .as_ref()
         .and_then(|p| floorplan::plan(shape, p).ok());
     let positions = ask
         .positions
@@ -79,28 +91,23 @@ pub fn search(shape: &Shape, ask: &Asked, keep: usize) -> R<Vec<Scored>> {
         positions,
         layer,
         anchor: memory::anchor(shape),
+        measured,
     };
-    // the made-for preset as it plans: what a candidate must beat by the resolution
-    let made = seeds
-        .first()
-        .filter(|p| p.made_for == Some(sig))
-        .and_then(|p| s.score(p))
-        .filter(|c| builds(&c.planned.plan));
     let mut found: BTreeMap<String, Scored> = BTreeMap::new();
     for seed in seeds {
         if let Some(best) = s.walk(seed) {
-            found.insert(key(&best.planned.preset), best);
+            found
+                .entry(key(&best.planned.preset))
+                .and_modify(|c| {
+                    if best.ms < c.ms {
+                        *c = best.clone();
+                    }
+                })
+                .or_insert(best);
         }
     }
     let mut all: Vec<Scored> = found.into_values().collect();
     all.sort_by(|a, b| a.ms.total_cmp(&b.ms));
-    if let Some(mut m) = made {
-        all.retain(|c| key(&c.planned.preset) != key(&m.planned.preset));
-        let bar = m.ms * (1.0 - RESOLUTION);
-        let at = all.iter().position(|c| c.ms > bar).unwrap_or(all.len());
-        m.planned.preset.name = format!("search({})", m.planned.preset.name);
-        all.insert(at, m);
-    }
     let mut out = Vec::new();
     let mut why = Vec::new();
     for c in all {
@@ -136,6 +143,9 @@ struct Search<'a> {
     positions: u32,
     layer: f64,
     anchor: &'static Anchor,
+    /// The model's measured program, if the chip ran one: every other partition's price past the
+    /// model's error ([`UNMEASURED`]).
+    measured: Option<Preset>,
 }
 
 impl Search<'_> {
@@ -155,8 +165,11 @@ impl Search<'_> {
         if room < f64::from(STACK_ROOM) + MARGIN {
             return None;
         }
+        let unmeasured = self.measured.as_ref().is_some_and(|m| {
+            m.keys != p.keys || m.levers != p.levers || m.arrangement != p.arrangement
+        });
         Some(Scored {
-            ms: time::step(&plan, self.layer),
+            ms: time::step(&plan, self.layer) + if unmeasured { UNMEASURED } else { 0.0 },
             room,
             planned: Planned {
                 plan,

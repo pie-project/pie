@@ -9,8 +9,8 @@
 //! did to the bare step (requests 1151-1306); the KV elements' and the rows' span are the earlier
 //! fits' (requests 1151-1195), which these moves cannot tell apart from the chains' rate
 //! (`ARCHITECTURE.md`, "Cost"). A layer's own cost is what the
-//! chip measured of the model's shipping program past those terms (`MEASURED`); a model the chip
-//! has not run takes the median.
+//! chip measured of the model's program past those terms ([`super::measured`]: the bare step
+//! where the chip ran it, else Pie decode); a model the chip has not run takes the median.
 
 use super::Features;
 use crate::plan::{Plan, Shape};
@@ -37,21 +37,6 @@ pub const HEAD: f64 = 0.537 * CYCLE;
 /// ms a cycle of the token loop's max-reduce ([`Features::loop_reduce`]): the chip's cycle.
 pub const LOOP_REDUCE: f64 = CYCLE;
 
-/// The chip's decode ms a step of each shipping model (its shape's signature) under the program
-/// its pinned plan builds: the bare step (wafer-bench, runs 1151-1279) where the chip ran it, else
-/// Pie decode (runs 1101-1131). A layer's own cost is read off these.
-pub const MEASURED: &[([u32; 3], f64)] = &[
-    ([4096, 32, 12288], 0.5100), // Qwen3.5 9B
-    ([2560, 32, 9216], 0.4800),  // Qwen3.5 4B
-    ([1024, 24, 3584], 0.2920),  // Qwen3.5 0.8B
-    ([4096, 36, 12288], 0.5505), // Qwen3-8B
-    ([4096, 32, 14336], 0.4700), // Llama 3.1 8B
-    ([1536, 35, 6144], 0.6830),  // Gemma 4 E2B
-    ([2560, 42, 10240], 0.8765), // Gemma 4 E4B
-    ([3840, 48, 15360], 0.9495), // Gemma 4 12B
-    ([2880, 24, 2880], 0.6525),  // gpt-oss-20b
-];
-
 /// The partition's part of a step, in ms.
 #[must_use]
 pub fn partition(f: &Features) -> f64 {
@@ -69,8 +54,8 @@ pub fn partition(f: &Features) -> f64 {
 #[must_use]
 pub fn layer(shape: &Shape, reference: Option<&Plan>) -> f64 {
     let sig = shape.signature();
-    match (MEASURED.iter().find(|(s, _)| *s == sig), reference) {
-        (Some((_, ms)), Some(r)) => {
+    match (super::measured::on(sig).map(|m| m.ms), reference) {
+        (Some(ms), Some(r)) => {
             let f = Features::of(r);
             (ms - partition(&f)) / f.layers
         }

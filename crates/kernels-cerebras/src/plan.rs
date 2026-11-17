@@ -495,10 +495,11 @@ pub struct Preset {
     /// The kernel levers the preset's program ships with (`K:V,...`, see
     /// [`super::emit::params::Levers`]): the plan carries them to the build.
     pub levers: String,
-    /// The shape signature of the model this preset's program was measured on (a shipping
-    /// preset's; [`Shape::signature`]): a plan with no preset named prefers it for that shape.
+    /// The shape signature of the model this partition's program was measured on (a measured
+    /// program's, [`crate::cost::measured`]; [`Shape::signature`]): there its price is its
+    /// measurement. It picks nothing: a plan with no preset named is the search's.
     #[serde(default)]
-    pub made_for: Option<[u32; 3]>,
+    pub measured_on: Option<[u32; 3]>,
     /// The stacked unit columns' placement the preset's program was measured with (its unit
     /// shape's; [`Partition::arrangement`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -511,7 +512,7 @@ impl Preset {
             name: name.to_string(),
             keys: keys.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
             levers: String::new(),
-            made_for: None,
+            measured_on: None,
             arrangement: None,
         }
     }

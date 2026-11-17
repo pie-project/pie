@@ -429,18 +429,13 @@ pub struct Wafer {
 }
 
 impl Wafer {
-    /// The partitions to try: the pinned plan named (it must be of the shape's kernel set), else the
-    /// one made for this shape ([`crate::pins`]); none for a model with no pinned plan (the
-    /// search plans it).
+    /// The partitions to try: the named plan asked for (a debug override: it must be of the
+    /// shape's kernel set, [`crate::pins`]); none where none is named (the search plans it).
     pub fn candidates(&self) -> Vec<Candidate> {
         let kernels = KernelSet::of_shape(&self.shape);
-        let sig = self.shape.signature();
         crate::pins::of(kernels)
             .into_iter()
-            .filter(|p| match &self.preset {
-                Some(n) => *n == p.name,
-                None => p.made_for == Some(sig),
-            })
+            .filter(|p| self.preset.as_ref().is_some_and(|n| *n == p.name))
             .enumerate()
             .filter_map(|(order, p)| {
                 let mut preset = p.set(&self.set).ok()?;
@@ -510,8 +505,8 @@ impl Wafer {
             .map_err(|e| format!("preset {}: {e}", c.preset.name))
     }
 
-    /// The pinned plan that builds; with no preset named and none that builds (or none made for
-    /// the shape), the search's fastest partition ([`crate::search`]).
+    /// The named plan asked for, if it builds; with none named, the search's fastest partition
+    /// ([`crate::search`]).
     pub fn choose(&self) -> R<Planned> {
         let mut why = Vec::new();
         for c in self.candidates() {
@@ -530,6 +525,7 @@ impl Wafer {
             let ask = crate::search::Asked {
                 positions: self.positions,
                 set: self.set.clone(),
+                unpinned: false,
             };
             match crate::search::search(&self.shape, &ask, 1) {
                 Ok(mut found) => return Ok(found.remove(0).planned),
@@ -589,10 +585,24 @@ pub fn plan(trace: &Trace, ask: &Ask) -> R<Planned> {
     }
 }
 
+/// The plans a load may fall back on past the search's choice.
+pub const FALLBACKS: usize = 3;
+
 /// Every plan of `trace` that builds, in the order [`plan`] prefers them (its choice first): a
 /// load links the next where one's program does not fit its PEs' memory.
 pub fn plans(trace: &Trace, ask: &Ask) -> R<Vec<Planned>> {
     let wafer = ask.target(shape(trace)?)?;
+    if ask.preset.is_none() {
+        // the search's few fastest, its choice first
+        let asked = crate::search::Asked {
+            positions: ask.positions,
+            set: ask.set.clone(),
+            unpinned: false,
+        };
+        return crate::search::search(&wafer.shape, &asked, FALLBACKS)
+            .map(|v| v.into_iter().map(|s| s.planned).collect())
+            .map_err(|e| format!("{}: {e}", trace.name));
+    }
     let mut why = Vec::new();
     let mut fit = Vec::new();
     for c in wafer.candidates() {
@@ -612,8 +622,8 @@ pub fn plan_shape(shape: Shape, ask: &Ask) -> R<Planned> {
     ask.target(shape)?.choose()
 }
 
-/// What a plan is asked for beyond the model: a pinned plan by name (else the one made for the
-/// shape, else the search's), overrides of its keys (`K=V,...`), and the positions it must serve.
+/// What a plan is asked for beyond the model: a named plan (a debug override; else the search's),
+/// overrides of its keys (`K=V,...`), and the positions it must serve.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Ask {
     pub preset: Option<String>,
@@ -732,10 +742,15 @@ mod tests {
                 (KernelSet::Own, 8, 4, 256, 256, 16, 112),
             ),
         ] {
-            // with no preset named, each picks its shipping one
+            // with no preset named, the search gives each its measured program
             let chosen = plan(&trace(name), &Ask::default()).unwrap();
-            assert_eq!(chosen.preset.name, preset, "{name}");
+            assert_eq!(chosen.preset.name, format!("search({preset})"), "{name}");
             let p = plan(&trace(name), &Ask::preset(preset)).unwrap().plan;
+            assert_eq!(
+                serde_json::to_value(&chosen.plan).unwrap(),
+                serde_json::to_value(&p).unwrap(),
+                "{name}"
+            );
             let q = &p.partition;
             let got = (
                 KernelSet::of_shape(&p.shape),
@@ -833,12 +848,12 @@ mod tests {
     }
 
     /// The plans a load may fall back on start with the one `plan` chooses: a shipping model's
-    /// pinned plan.
+    /// measured program.
     #[test]
     fn the_fallback_plans_start_with_the_choice() {
         let t = trace("llama31-8b-bf16-kv-bf16");
         let all = plans(&t, &Ask::default()).unwrap();
-        assert_eq!(all[0].preset.name, "l3-8b");
+        assert_eq!(all[0].preset.name, "search(l3-8b)");
         assert_eq!(all[0].plan, plan(&t, &Ask::default()).unwrap().plan);
     }
 

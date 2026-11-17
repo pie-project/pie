@@ -1,7 +1,9 @@
 {
   "name": "0.8b",
   "kernels": "own",
-  "made_for": [1024, 24, 3584],
+  "ms": 0.292,
+  "source": "Qwen3.5 0.8B: the bare step (wafer-bench, runs 1151-1279) where the chip ran it, else Pie decode (runs 1101-1131)",
+  "measured_on": [1024, 24, 3584],
   "keys": {"G2": 12, "G2Y": 8, "HR": 1153, "K": 4, "NE": 128, "PX": 256, "PY": 128, "UNX": 2, "UNY": 3, "VR": 216, "WL": 1},
   "levers": "NPX:1,DIAG:0,TSTAMP:0,XKEEP:0,HACC16:0,ATTL:2"
 }

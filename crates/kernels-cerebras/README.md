@@ -132,7 +132,7 @@ async = true
 # posted_loop = 32         # default: the plan's LOOP
 
 [engine.wafer]             # all optional
-# preset = "9b"            # a pinned plan (plans/); else the one made for the model's shape, else the search
+# preset = "9b"            # a named plan, a debug override (else the search's)
 # build = "never"          # refuse a program the cache does not hold (a chip session)
 # tiles = "memory"         # cut the checkpoint for each load instead of caching the cut
 
@@ -148,7 +148,7 @@ async = true
 # loop_room = false                  # loops not bounded by the lane's pages
 ```
 
-A load plans the model's trace (the kernel set its layers take, the pinned plan or the search's, the positions), builds and links the
+A load plans the model's trace (the kernel set its layers take, the search's partition, the positions), builds and links the
 program, and cuts the checkpoint for it (`engine-cerebras` `prepare`). Both are kept in the engine cache
 (`<PIE_HOME>/.../cerebras/wafer`, `p-<model>-<key>` and `t-<model>-<key>`), keyed by everything they follow from,
 so a second load compiles and cuts nothing; a whole-wafer compile takes minutes. Pie config: `frame_size 4`,
@@ -158,10 +158,11 @@ cut, one tiler makes it); `[engine.debug] weights` serves tiles staged elsewhere
 **Build by hand** (no SDK needed until the link):
 
 1. **Plan**: `wafer-compile plan --model <deployment> [--preset <name>] [--set K=V,..] [--positions N] --out
-   <plan dir>` (`ARCHITECTURE.md`): the model's shape from its trace, the kernel set it takes, the pinned plan's
-   partition (else the search's). Pinned plans (`plans/`): `9b`, `4b`, `0.8b`, `q3-8b`, `l3-8b`; `e2b`, `e4b`,
-   `e4b-meta`; `g12`; `full` (gpt-oss); and `tiny*` for the simulator. A pinned plan carries the keys, kernel
-   levers and arrangement its program shipped with. A checkpoint with no catalog deployment takes
+   <plan dir>` (`ARCHITECTURE.md`): the model's shape from its trace, the kernel set it takes, the search's
+   partition. A named plan (`--preset`, a debug override): the chip's measured programs (`cost/measured/`: `9b`,
+   `4b`, `0.8b`, `q3-8b`, `l3-8b`; `e2b`, `e4b`; `g12`; `full`, gpt-oss), `e4b-meta`, and `tiny*` for the
+   simulator. A measured program carries the keys, kernel levers and arrangement its program shipped with and
+   the step the chip measured: the search prices it at that and starts from it. A checkpoint with no catalog deployment takes
    `--shape <shape.json>`.
 2. **Sources**: `wafer-compile build --plan <plan.json> --out <build dir> [--levers K:V,..]` writes `layout/`
    (`layout.csl`, every PE's kernel and params resolved, and one source a PE kind, from the embedded kernels or

@@ -11,6 +11,7 @@ pub const CLOCK_HZ: f64 = 750e6;
 
 pub mod gemm;
 pub mod grid;
+pub mod measured;
 pub mod memory;
 pub mod stream;
 pub mod tiled;

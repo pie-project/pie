@@ -2,7 +2,7 @@
 
 A wafer program is a list of **blocks** over a logical **plan**. poem's spatial pass reads the
 model's **shape** off its trace; the **kernel set** its layers' mixers take keys the **preset** (a
-pinned plan's keys, or the search's) that a floorplan constructor turns into the plan; the plan's
+search's keys, or a named plan's) that a floorplan constructor turns into the plan; the plan's
 **floorplan** states each element the layer program's features ask for, and the composer maps
 elements to blocks; the core runs every build step over the blocks in order and knows no model,
 no constructor and no block's vocabulary. The build lives here (`kernels-cerebras`); the
@@ -34,8 +34,8 @@ Modules are under `src/`.
 
 | Layer | Module | Holds | Knows |
 |---|---|---|---|
-| Plan | `plan.rs` | `Shape` (the model's facts), `Partition` (counts, split factors, the stacked arrangement), `Contract` (positions, CAP, LOOP, WL, the logits' prescale); `Preset` (a partition's named keys, levers and arrangement: a pinned plan's or the search's); serde, so a plan is a file | nothing physical: the seam to poem's spatial pass (below) |
-| Target | `target.rs` | the wafer as poem's `SpatialTarget`: `shape` (a trace's `Shape`), `Wafer` (candidates: the pinned plan named or made for the shape; fit: the plan builds; else the search), `plan` / `plan_shape` | the trace's ops, the kernel sets |
+| Plan | `plan.rs` | `Shape` (the model's facts), `Partition` (counts, split factors, the stacked arrangement), `Contract` (positions, CAP, LOOP, WL, the logits' prescale); `Preset` (a partition's named keys, levers and arrangement: a measured program's or the search's); serde, so a plan is a file | nothing physical: the seam to poem's spatial pass (below) |
+| Target | `target.rs` | the wafer as poem's `SpatialTarget`: `shape` (a trace's `Shape`), `Wafer` (the search's plan; a named plan, a debug override, where one is asked), `plan` / `plan_shape` | the trace's ops, the kernel sets |
 | Roles | `role.rs` | `PeRole { kind: Kind, place: Place }`. `Kind` is open (name + build stem; the architecture's kinds are consts, a block declares more). `Place` is the wafer program architecture's positions: weight / CX / CY of a unit, head / head control, a storage column's PE, none | coordinates |
 | Floor | `floor.rs` | `FloorBuilder` (blocks place onto it in order), units, gap / relay slots, the head block, store blocks, a `PeRole` a PE in a dense `Grid` | coordinates |
 | Wiring | `wiring.rs` | `Chain`, `Multicast`, `Path`, `Turn`, `Note`; open `Class { name, index }`, `Slot { name, kind: SlotKind }`, `NoteKey`; the core's only own vocabulary is `LOOPBACK` and `PASS` | coordinates, logical colours |
@@ -46,7 +46,7 @@ Modules are under `src/`.
 | Kernels | `kernels/` | `KernelSet` (the role kernels a layer program's mixers take: `Own`, `Shared`, `Windows`, `Experts`), `of` (the units' kernels by set, the head's by the head element, the store kernel by the storage, the relay by gap slots), `symbols` (by set); `Pe` (one PE as an rcfg writer sees it); `common` (the word layouts every set's weight / CX / CY / head / head control kernel shares, its codes named, the relay); `head` (`head_pe.csl`, `head_ctl.csl`: east, east by row groups); one module a set's units: `snake` (Own), `stacked` (Shared, and the store), `runs` (Windows), `split` (Experts, and the band) | the CSL kernels' ABI |
 | Layers | `layers.rs` | the plan's layer program (`poem_compiler::spatial::layer::LayerProgram`), stated from its shape; pinned to the trace's lowering | the shape |
 | Composer | `compose/` | `Needs` (read off the layer program) and `Schedule` (the layer program's phases on its floorplan), `blocks` (the blocks a floorplan's elements take), `KernelCopies` (what the role kernels read off each block, by kernel set: `copies`), `refuse` (what the set's kernels do not run, by name) | the blocks |
-| Pins | `pins.rs`, `plans/` | the pinned plans: each shipping program's kernel set, keys, levers, made-for shape and arrangement | the shipping programs |
+| Named plans | `pins.rs`, `plans/`, `cost/measured/` | the plans a build may name (a debug override): the chip's measured programs and the simulator's tiny ones | the shipping programs |
 | Emit | `emit/` | rcfg, kernel params (levers, overrides) and `layout.csl`, `HostLayout` (everything the host driver reads and writes on the wafer) | kernel builds |
 | Weights | `weights.rs` | `Binding`s (symbol, rect, source, transforms), `Copies`, the placer | the device |
 | Program | `program.rs` | `Program { plan, blocks, floor, wiring, palette, fabric, kernels, overrides, floorplan, roles, schedule }`, `build`, `bindings` | all of the above |
@@ -134,7 +134,7 @@ The floorplan (`floorplan/`) is the IR between the plan and the floor. Each feat
 
 The units are one `UnitShape` (column runs by role, row runs by dims and role, the control lines, K layers) visited along a path (`floor::UnitLayout`: a snake of slots with gap slots, or explicit origins); the head is east of the units (`HeadEast` + `TokenLoop`), east fed by row groups (`HeadGroups`), or a band below them (`Band` + `BandLoop`). `Floorplan::of` reads each element's choice off the plan: the path is the stacked arrangement's origins where the plan has one, two unit columns from the band where the head is a band, the plan's unit slots, else two unit columns down then up. The composer (`compose::blocks`) maps the elements to blocks in one order (units, segments, aux, head, token loop) and never names a constructor.
 
-The four constructors (`floorplan::{snake, stacked, runs, split}`, chosen by the kernel set the pinned plans and the search's moves are keyed for) are the points the old hand layouts were:
+The four constructors (`floorplan::{snake, stacked, runs, split}`, chosen by the kernel set the measured programs and the search's moves are keyed for) are the points the old hand layouts were:
 
 | constructor | units | path | head | beside the units |
 |---|---|---|---|---|
@@ -184,7 +184,7 @@ An rcfg writer reads one PE through `Pe`: `pe.member(slot)` / `root` / `halves` 
 `CxIo`'s flags / finals / tail, `cy`'s segment, `HeadIo`) and appends its tail.
 
 Params resolve per PE in `emit::params::tile`: the kind's `KernelBuild::params`, then the PE's
-`Overrides` (each must be a param the kind takes). Levers (the pinned plan's, carried by the plan, and `wafer-compile build --levers`'s; the last
+`Overrides` (each must be a param the kind takes). Levers (the partition's, carried by the plan, and `wafer-compile build --levers`'s; the last
 argument) override a param in every kind that takes it; `<kind>.<NAME>` (`w.FIFOW:16`, E4B's
 weight FIFO) in that kind only; a lever no kernel takes is an error.
 
@@ -239,10 +239,10 @@ a set's own is in the head and PLE kernels: the token loop's winner merge and th
    (`LAYER_OPS`, `OUTER_OPS`); teach `target.rs` the op and give the plan's `Shape` the field the
    blocks need.
 2. **Kernel set and floorplan.** `KernelSet::of` picks the role kernels from what the layer
-   program's mixers need. A model of an existing set plans by the search from its set's pinned
-   plans; once its program is validated on the chip, its plan is pinned (`plans/<name>.json`:
-   the set, keys, levers and, for stacked columns, the arrangement; one `include_str!` in
-   `pins.rs`). A new feature asks for its element (`floorplan::Requests`, `Floorplan::of`) and the
+   program's mixers need. A model of an existing set plans by the search from its set's measured
+   programs; once its program is measured on the chip, the measurement joins the cost model
+   (`cost/measured/<name>.json`: the set, keys, levers and, for stacked columns, the arrangement,
+   with the step the chip measured; one `include_str!` in `cost/measured.rs`). A new feature asks for its element (`floorplan::Requests`, `Floorplan::of`) and the
    composer maps it to its block (`compose::blocks`); a new set is a rule in `KernelSet::of`, its
    constructor (`floorplan/<point>.rs`), copies (`compose::copies`), refusals
    (`compose::refuse`), kernels (`kernels/<set>.rs`) and cut (`tiles/<set>.rs`).
@@ -273,14 +273,13 @@ a set's own is in the head and PLE kernels: the token loop's winner merge and th
 `Program::build(plan)` is the whole physical compiler; its only input is a `Plan`. The plan
 comes from poem's spatial pass (`poem_compiler::spatial::plan` over `target::Wafer`): the trace
 gives the `Shape` (layer kinds, attention / MLP / MoE / GDN / PLE specs, head, RoPE, norms), the
-shape picks the kernel set, and the pinned plan made for the shape (`pins`: `plans/*.json`, the keys,
-levers and arrangement of each shipping model's chip-validated program) is the partition tried (a
-named one, `--preset <name>`, tries only itself; `--set` overrides its keys). A checkpoint with no
-catalog deployment states its shape in a file (`target::plan_shape`; the tiny test checkpoints'
-are `tools/wafer/baseline/shapes/`, their pinned plans the `tiny*` ones).
-
-A model with no pinned plan made for its shape (or whose pinned plan does not build, and none is
-named) plans by the search (`search`, below): there is no table of presets to try.
+shape picks the kernel set, and the search (`search`, below) picks the partition: nothing is pinned.
+The chip's measured programs (`cost/measured/*.json`: each shipping model's keys, levers and
+arrangement as the chip ran them, and its measured step) are the cost model's data and the
+search's starting points, not choices. A named plan (`--preset <name>`: a measured one, or
+`plans/*.json`'s `tiny*` and `e4b-meta`) is a debug override and tries only itself; `--set`
+overrides its keys. A checkpoint with no catalog deployment states its shape in a file
+(`target::plan_shape`; the tiny test checkpoints' are `tools/wafer/baseline/shapes/`).
 `poem-compiler/SPATIAL.md` has the target-neutral half.
 
 ## Cost and search (`cost`, `search`)
@@ -331,7 +330,7 @@ gains (the chain at 2.2 cycles, 3.9 µs RMS held out) but costs 15 cycles an ele
 gpt-oss's layer less than nothing: only the 4B's PY / NE move moves both, so the moves cannot tell
 the chains' rate from the KV's. The columns cost nothing the chip resolves (`SPAN_COL` 0): halving
 the 0.8B's cost what its doubled matvec and KV elements do. Each layer's own cost is read off the
-measured step of the model's pinned plan (`time::MEASURED`: the bare step where the chip ran it,
+measured step of the model's measured program (`cost::measured`: the bare step where the chip ran it,
 else Pie decode; a model the chip has not run takes the median). Llama's G2=11 (request 1456: 0.470
 ms from 0.485, not in the fit) is its pin since; the model gives it 5 µs of the 15.
 
@@ -344,14 +343,18 @@ model is within 380 B (Qwen3.5 4B from 0.8B); across kernel flags it is off by u
 is why a model anchors on its own link. `anchors.rs` is regenerated from links when the kernels
 change.
 
-`search::search` walks from each of the kernel set's pinned plans (the made-for one first), moving one key
+`search::search` walks from each of the kernel set's measured programs and named plans (the model's
+own measured one first), moving one key
 or two (a move another must follow: the positions, the units' grid) over a ladder of values; a
 seed that does not plan is repaired a key at a time, following each move that gets it past the
-check it failed. A candidate plans, serves the positions asked for (the made-for plan's, else
-4096), keeps its head over the vocabulary, leaves every image `STACK_ROOM` plus a 512 B margin
-and builds (`Program::build`); it ranks ahead of the made-for plan only where it predicts a step
-0.3% faster (`search::RESOLUTION`: the moves under it are within the time model's error). `wafer-compile search --model <m>` prints the ranking with the keys
-each candidate moved from the made-for plan.
+check it failed. A candidate plans, serves the positions asked for (the measured program's,
+else 4096), keeps its head over the vocabulary, leaves every image `STACK_ROOM` plus a 512 B
+margin and builds (`Program::build`). On a model the chip measured, its measured partition is
+priced at its measurement and every other at the model's prediction plus its held-out error
+(`search::UNMEASURED`, 6.6 µs): a partition the chip has not run must beat the measured one by
+more than the model can tell. `wafer-compile search --model <m>` prints the ranking with the
+keys each candidate moved from the measured program; `--unpinned 1` leaves the model's own
+measured program out of the starting points (what the search reaches from the others').
 
 ## Weights
 
@@ -401,7 +404,7 @@ shape, partition and contract and the checkpoint; each model keeps one of each.
 ## Tools
 
 - `wafer-compile plan (--model <deployment> | --shape <shape.json>) [--preset <name>] [--set
-  K=V,..] [--positions N] --out <dir>` writes `plan.json` and names the pinned plan it took (or the
+  K=V,..] [--positions N] --out <dir>` writes `plan.json` and names the partition it took (the
   search's). `wafer-compile build --plan <plan.json> --out <dir> [--emit ..]
   [--levers ..] [--kernels <dir>]` writes `floor.json`, `rcfg.npy` / `rcfg_n.npy` / `rcfg.txt`,
   `kernels.json`, `layout/`, `host.json`, `plan.json`, `bindings.json` and `program.json`. `wafer-compile

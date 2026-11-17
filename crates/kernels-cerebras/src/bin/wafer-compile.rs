@@ -241,7 +241,10 @@ fn cost(args: &[String]) -> Result<(), String> {
 /// `search`: a deployment's partitions ranked by their predicted step, with the preset made for
 /// it (if any) for comparison.
 fn search(args: &[String]) -> Result<(), String> {
-    let f = flags(args, &["--model", "--positions", "--set", "--keep"])?;
+    let f = flags(
+        args,
+        &["--model", "--positions", "--set", "--keep", "--unpinned"],
+    )?;
     let name = get(&f, "--model").ok_or(USAGE)?;
     let catalog = poem_compiler::catalog::repository();
     let d = catalog
@@ -256,13 +259,14 @@ fn search(args: &[String]) -> Result<(), String> {
             .map(|n| n.parse().map_err(|e| format!("--positions {n}: {e}")))
             .transpose()?,
         set: get(&f, "--set").unwrap_or("").to_string(),
+        unpinned: get(&f, "--unpinned").is_some_and(|v| v == "1"),
     };
     let keep = get(&f, "--keep")
         .map_or(Ok(5), str::parse)
         .map_err(|e| format!("--keep: {e}"))?;
     let made = kernels_cerebras::pins::of(kernels_cerebras::kernels::KernelSet::of_shape(&shape))
         .into_iter()
-        .find(|p| p.made_for == Some(shape.signature()));
+        .find(|p| p.measured_on == Some(shape.signature()));
     for (i, c) in kernels_cerebras::search::search(&shape, &ask, keep)?
         .iter()
         .enumerate()

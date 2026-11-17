@@ -1,7 +1,9 @@
 {
   "name": "e2b",
   "kernels": "shared",
-  "made_for": [1536, 35, 6144],
+  "ms": 0.683,
+  "source": "Gemma 4 E2B: the bare step (wafer-bench, runs 1151-1279) where the chip ran it, else Pie decode (runs 1101-1131)",
+  "measured_on": [1536, 35, 6144],
   "keys": {"G2": 8, "G2W": 24, "HR": 1130, "LOOP": 64, "NEG": 32, "NU": 7, "PX": 256, "PY": 128},
   "levers": "WSPEC:2",
   "arrangement": {
