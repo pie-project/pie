@@ -418,9 +418,9 @@ pub(crate) const DEFAULT_FORWARD_TOKENS: u32 = 8192;
 
 /// The rung lattice under `engine` up to `top`: [`default_lattice`]'s
 /// points below it and `top` itself. With `top` the card's fire top (the
-/// widest row of its profile's measured grid, [`fire_top_of`], derived at
-/// `pie tune cuda --rates` by `crate::fire_top`), the candidates a load with
-/// no stated buckets weighs and the rows `--rates` times its grid at.
+/// widest row of its profile's measured grid, [`fire_top_of`]: the grid's
+/// saturation point, `crate::rates::Saturation`), the candidates a load
+/// with no stated buckets weighs and the rows `--rates` times its grid at.
 #[must_use]
 pub(crate) fn rung_lattice(engine: &crate::chip::Engine, top: u32) -> Vec<u32> {
     default_lattice(
@@ -448,7 +448,7 @@ pub(crate) fn on_lattice(engine: &crate::chip::Engine, top: u32, tokens: u32) ->
 
 /// The card's fire top: the widest row its profile's matmul grid states
 /// (`[rates] bf16_flops_per_ns_by_rows_n_k`, timed to the top
-/// `crate::fire_top` derived for the card). A profile with no grid has no
+/// the grid saturated at, `crate::rates::Saturation`). A profile with no grid has no
 /// top, and a load on it is refused for its missing rates, by name.
 pub(crate) fn fire_top_of(chip: &profile::Profile, device: &str) -> crate::error::Result<u32> {
     let rates = chip.rates();

@@ -44,15 +44,27 @@
 use engine::rates::{ATTN_DIMS, ATTN_KEYS, ATTN_SHAPE, DEPTHS, SCAN_SHAPE, weights_at};
 use profile::fire::Rates;
 
-/// The rows the matmul grid is timed at under `chip` on a card whose fire
-/// top is `top` ([`crate::fire_top`]): the candidates a load weighs its top
-/// rung among (`serve::load`'s `budget_at(asked).buckets`), the chip's rung
-/// lattice ([`crate::api::rung_lattice`] at its `engine.lattice_steps`,
-/// `prefill_lattice_from` and `_steps`) up to `top`. A load asked other
-/// tokens narrows them to a rung of it ([`crate::api::on_lattice`]).
+/// The rows the matmul grid walks under `chip`: the chip's rung lattice
+/// ([`crate::api::rung_lattice`] at its `engine.lattice_steps`,
+/// `prefill_lattice_from` and `_steps`) as far as a `u32` of rows reaches,
+/// ascending; the grid ends at the card's saturation point on it
+/// ([`Saturation`]), the top a load's candidates run to.
 #[must_use]
-pub fn lattice_rows(chip: &profile::Profile, top: u32) -> Vec<u32> {
-    crate::api::rung_lattice(&crate::chip::Engine::of(chip), top)
+pub fn lattice_rows(chip: &profile::Profile) -> Vec<u32> {
+    let mut lattice = crate::api::rung_lattice(&crate::chip::Engine::of(chip), u32::MAX);
+    lattice.pop();
+    lattice
+}
+
+/// Where the matmul grid saturates: at `rows` no `(n, k)` shape's cost a row
+/// fell by more than `profile::AGREEMENT` from `below`; `best_gain` the most
+/// any did, at `best_shape`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Saturation {
+    pub rows: u32,
+    pub below: u32,
+    pub best_gain: f64,
+    pub best_shape: (u32, u32),
 }
 
 /// The kv cache's page, as a served load pages it.
@@ -80,7 +92,7 @@ pub fn measure(
     ordinal: i32,
     chip: &profile::Profile,
     cache: Option<&std::path::Path>,
-) -> Result<(Rates, crate::fire_top::FireTop), String> {
+) -> Result<(Rates, Saturation), String> {
     kernels_cuda::disk::install(cache);
     #[cfg(feature = "device")]
     {
@@ -316,21 +328,9 @@ mod on_device {
     pub(super) fn measure(
         ordinal: i32,
         chip: &profile::Profile,
-    ) -> Result<(Rates, crate::fire_top::FireTop), String> {
+    ) -> Result<(Rates, Saturation), String> {
         let mut device = Context::bind(ordinal, None).map_err(say("the device"))?;
         device.set_tuning(kernels_cuda::tuning::Tuning::of(chip));
-        // The card's fire top, the grid's widest row (crate::fire_top).
-        let (_, memory) = crate::store::device_memory().map_err(say("the device's memory"))?;
-        let top = crate::fire_top::derive(chip, device.device().num_sm, memory)?;
-        eprintln!(
-            "[rates]: fire top {} rows: {}'s arena beside its {} MiB of weights and one \
-             sequence ({} MiB) on {} MiB",
-            top.tokens,
-            top.model,
-            top.weights >> 20,
-            top.sequence >> 20,
-            top.memory >> 20
-        );
         let stream = device.stream();
         let clock = Clock::new(stream)?;
         let mut held = Vec::new();
@@ -346,8 +346,24 @@ mod on_device {
             engine::rates::WARM_SHAPE.0,
             warmed.rate / 1e3
         );
-        let rows = lattice_rows(chip, top.tokens);
-        let grid = gemm(device.ctx(), &clock, &random, &mut held, &rows, gap)?;
+        let (grid, top) = gemm(
+            device.ctx(),
+            &clock,
+            &random,
+            &mut held,
+            &lattice_rows(chip),
+            gap,
+        )?;
+        eprintln!(
+            "[rates]: the grid saturates at {} rows: no (n, k) shape's cost a row fell by more \
+             than {:.0}% from {} (the most {:.1}%, at {} x {})",
+            top.rows,
+            100.0 * profile::AGREEMENT,
+            top.below,
+            100.0 * top.best_gain,
+            top.best_shape.0,
+            top.best_shape.1
+        );
         let mut attn = Vec::with_capacity(ATTN_KEYS.len() * ATTN_DIMS.len());
         for d in ATTN_DIMS {
             for keys in ATTN_KEYS {
@@ -390,27 +406,120 @@ mod on_device {
         Ok((rates, top))
     }
 
+    /// The matmul grid and its top: every `(n, k)` of [`DEPTHS`] squared,
+    /// at each row of `lattice` ascending up to the first where no shape's
+    /// cost a row (its launch and its work over its rows) falls by more than
+    /// `profile::AGREEMENT` from the row before ([`Saturation`]). A top rung
+    /// is the argmax of efficiency times live capacity, and live capacity
+    /// only falls as rows grow, so no rung past that point can be chosen.
+    /// Each shape walks its own rows first (one rotation laid), then every
+    /// shape is filled to the widest row any stopped at, and the grid ends at
+    /// the first row where none improves.
     fn gemm(
         ctx: &Ctx,
         clock: &Clock,
         random: &Random,
         held: &mut Vec<Buffer>,
-        rows: &[u32],
+        lattice: &[u32],
         gap: f64,
-    ) -> Result<Vec<(u32, u32, u32, f64)>, String> {
+    ) -> Result<(Vec<(u32, u32, u32, f64)>, Saturation), String> {
         // The shapes in engine::rates' spread order, so a drift left after
         // the warm-up spreads over the grid.
         let shapes: Vec<(u32, u32)> = DEPTHS
             .iter()
             .flat_map(|&k| DEPTHS.iter().map(move |&n| (n, k)))
             .collect();
-        let mut grid = Vec::with_capacity(rows.len() * shapes.len());
-        for at in engine::rates::spread_order(shapes.len()) {
-            let (n, k) = shapes[at];
-            grid.extend(gemm_at(ctx, clock, random, held, rows, n, k, gap)?);
+        let order = engine::rates::spread_order(shapes.len());
+        // A shape's cost a row at `m` from its rate (work with the launch
+        // taken off, `rate_from`): its launch and its work over its rows.
+        let cost = |(n, k): (u32, u32), m: u32, rate: f64| {
+            let work = if rate.is_finite() && rate > 0.0 {
+                engine::rates::gemm_flops(m, n, k) / rate
+            } else {
+                0.0
+            };
+            (gap + work) / f64::from(m)
+        };
+        let gain = |shape: (u32, u32), lo: (u32, f64), hi: (u32, f64)| {
+            cost(shape, lo.0, lo.1) / cost(shape, hi.0, hi.1) - 1.0
+        };
+        let mut rates: Vec<Vec<f64>> = vec![Vec::new(); shapes.len()];
+        // Each shape alone, ascending, to its first row that does not
+        // improve on the one before.
+        for &at in &order {
+            let mut shape = Planes::lay(random, shapes[at])?;
+            loop {
+                let i = rates[at].len();
+                let Some(&m) = lattice.get(i) else { break };
+                rates[at].push(shape.at(ctx, clock, random, held, m, gap)?);
+                if i > 0
+                    && gain(
+                        shapes[at],
+                        (lattice[i - 1], rates[at][i - 1]),
+                        (m, rates[at][i]),
+                    ) <= profile::AGREEMENT
+                {
+                    break;
+                }
+            }
+        }
+        // Every shape to the widest row any stopped at, then the first row
+        // where none improves; past every row measured, one more each.
+        let mut reach = rates.iter().map(Vec::len).max().unwrap_or(0);
+        let top = loop {
+            for &at in &order {
+                if rates[at].len() >= reach {
+                    continue;
+                }
+                let mut shape = Planes::lay(random, shapes[at])?;
+                while rates[at].len() < reach {
+                    let m = lattice[rates[at].len()];
+                    rates[at].push(shape.at(ctx, clock, random, held, m, gap)?);
+                }
+            }
+            let stop = (1..reach).find(|&i| {
+                (0..shapes.len()).all(|at| {
+                    gain(
+                        shapes[at],
+                        (lattice[i - 1], rates[at][i - 1]),
+                        (lattice[i], rates[at][i]),
+                    ) <= profile::AGREEMENT
+                })
+            });
+            match stop {
+                Some(i) => break i,
+                None if reach < lattice.len() => reach += 1,
+                None => break reach - 1,
+            }
+        };
+        let (best, at) = (0..shapes.len())
+            .map(|at| {
+                let i = top.max(1);
+                (
+                    gain(
+                        shapes[at],
+                        (lattice[i - 1], rates[at][i - 1]),
+                        (lattice[i], rates[at][i]),
+                    ),
+                    at,
+                )
+            })
+            .max_by(|a, b| a.0.total_cmp(&b.0))
+            .expect("shapes");
+        let mut grid = Vec::with_capacity((top + 1) * shapes.len());
+        for (at, &(n, k)) in shapes.iter().enumerate() {
+            for (i, &m) in lattice.iter().enumerate().take(top + 1) {
+                grid.push((m, n, k, rates[at][i]));
+            }
         }
         grid.sort_by_key(|&(m, n, k, _)| (k, n, m));
-        Ok(grid)
+        let saturation = Saturation {
+            rows: lattice[top],
+            below: lattice[top.saturating_sub(1)],
+            best_gain: best,
+            best_shape: shapes[at],
+        };
+        Ok((grid, saturation))
     }
 
     /// The device warmed (engine::rates::warm_up): bursts of the widest
@@ -444,27 +553,58 @@ mod on_device {
         })
     }
 
-    /// The matmul `m x n x k` at every row count of the lattice.
-    fn gemm_at(
-        ctx: &Ctx,
-        clock: &Clock,
-        random: &Random,
-        held: &mut Vec<Buffer>,
-        rows: &[u32],
+    /// One `(n, k)` shape's weight rotation laid (`engine::rates::weights_at`
+    /// planes of `WEIGHT_BYTES`), its activations and product laid as wide as
+    /// the widest row asked of it so far.
+    struct Planes {
         n: u32,
         k: u32,
-        gap: f64,
-    ) -> Result<Vec<(u32, u32, u32, f64)>, String> {
-        let most = rows.iter().copied().max().expect("rows") as usize;
-        let act = random.operand(most * k as usize * 2)?;
-        let y = zeroed(most * n as usize * 2)?;
-        let planes = weights_at(n, k);
-        let weights = (0..planes)
-            .map(|_| random.operand(n as usize * k as usize * 2))
-            .collect::<Result<Vec<Buffer>, String>>()?;
-        let mut curve = Vec::with_capacity(rows.len());
-        for row in engine::rates::spread_order(rows.len()) {
-            let m = rows[row];
+        weights: Vec<Buffer>,
+        act: Option<Buffer>,
+        y: Option<Buffer>,
+        rows: u32,
+    }
+
+    impl Planes {
+        fn lay(random: &Random, (n, k): (u32, u32)) -> Result<Planes, String> {
+            let weights = (0..weights_at(n, k))
+                .map(|_| random.operand(n as usize * k as usize * 2))
+                .collect::<Result<Vec<Buffer>, String>>()?;
+            Ok(Planes {
+                n,
+                k,
+                weights,
+                act: None,
+                y: None,
+                rows: 0,
+            })
+        }
+
+        /// The matmul `m x n x k`'s rate, its launches rotating through the
+        /// planes.
+        fn at(
+            &mut self,
+            ctx: &Ctx,
+            clock: &Clock,
+            random: &Random,
+            held: &mut Vec<Buffer>,
+            m: u32,
+            gap: f64,
+        ) -> Result<f64, String> {
+            let (n, k) = (self.n, self.k);
+            if m > self.rows {
+                self.act = None;
+                self.y = None;
+                self.act = Some(random.operand(m as usize * k as usize * 2)?);
+                self.y = Some(zeroed(m as usize * n as usize * 2)?);
+                self.rows = m;
+            }
+            let (act, y) = (
+                self.act.as_ref().expect("laid"),
+                self.y.as_ref().expect("laid"),
+            );
+            let planes = self.weights.len();
+            let weights = &self.weights;
             let fire = |w: usize| {
                 kernels_cuda::linear::gemm::matmul(
                     ctx,
@@ -475,20 +615,14 @@ mod on_device {
             };
             lay(held, || fire(0))?;
             let ns = clock.burst(ROUNDS, &mut |i| fire(i).map_err(say("the matmul")))?;
-            curve.push((
-                m,
-                n,
-                k,
-                engine::rates::rate_from(
-                    &format!("matmul {m}x{n}x{k}"),
-                    ns,
-                    engine::rates::GEMM_DISPATCHES,
-                    gap,
-                    engine::rates::gemm_flops(m, n, k),
-                )?,
-            ));
+            engine::rates::rate_from(
+                &format!("matmul {m}x{n}x{k}"),
+                ns,
+                engine::rates::GEMM_DISPATCHES,
+                gap,
+                engine::rates::gemm_flops(m, n, k),
+            )
         }
-        Ok(curve)
     }
 
     fn attention(
@@ -822,7 +956,10 @@ mod lattice_tests {
             engine.prefill_lattice_from,
             engine.prefill_lattice_steps,
         );
-        assert_eq!(super::lattice_rows(&chip, 9742), weighed);
+        assert_eq!(
+            super::lattice_rows(&chip)[..weighed.len() - 1],
+            weighed[..weighed.len() - 1]
+        );
         assert_eq!(weighed.first(), Some(&1), "a readout's one row");
     }
 }

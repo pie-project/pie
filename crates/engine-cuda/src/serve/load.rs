@@ -69,7 +69,8 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     device.set_tuning(kernels_cuda::tuning::Tuning::of(&chip));
     let engine = crate::chip::Engine::of(&chip);
     // The card's fire top: the widest row its profile's grid was timed at,
-    // derived for this card at `pie tune cuda --rates` (`crate::fire_top`).
+    // its saturation point (`crate::rates::Saturation`): past it no rung's
+    // efficiency improves, so none past it can be chosen.
     // A load asked nothing fires up to it, and the estimate picks below.
     let fire_top = crate::api::fire_top_of(&chip, device.name())?;
     if boot.budget.max_tokens == 0 {
@@ -323,9 +324,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // The top rung, the ruling's (`crate::top`): of the buckets of the asked
     // lattice, each spanning its fire's working set and needing one
     // sequence and the bodies' floor beside it, over the room the card has
-    // after the weight tier. Weighed in ascending order up to the first
-    // whose span leaves no room: a span grows with its rows, so every wider
-    // bucket leaves none either, and is neither compiled nor offered.
+    // after the weight tier: every bucket up to the card's fire top.
     let weighed;
     let tokens = {
         let paging = Paging::of(boot.page_size, boot.context, boot.slots, 1)?;
@@ -341,9 +340,6 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
                 launches,
                 beside,
             });
-            if span != u64::MAX && span.saturating_add(beside) > after_weights {
-                break;
-            }
         }
         // The rows the dense product computes at each width: its tile's.
         #[cfg(not(feature = "rocm"))]
