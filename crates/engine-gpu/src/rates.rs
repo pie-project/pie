@@ -4,10 +4,11 @@
 //! browser's load (its adapter is masked, so no profile states its rates)
 //! and `pie tune --rates` natively.
 //!
-//! Each kind of work is timed inside a frame: [`REPEATS`] of it back to back
-//! against one, the median of [`ROUNDS`] after a warm frame (which builds
-//! its pipelines), so the frame's one submit and wait cancel and what is
-//! left is the work's own time beside a dispatch's:
+//! Each kind of work is timed inside a frame: as many of it back to back as
+//! the device's submission limit holds ([`repeats_under`], at most
+//! [`REPEATS`]) against one, the median of [`ROUNDS`] after a warm frame
+//! (which builds its pipelines), so the frame's one submit and wait cancel
+//! and what is left is the work's own time beside a dispatch's:
 //! - the backend's own bf16 matmul at each row count of
 //!   the backend's rung lattice (`Serve::rung_lattice`, the rows its loads
 //!   lay fires at) and each column count and depth of
@@ -55,8 +56,68 @@ pub const COPY_BYTES: u64 = 256 << 20;
 /// The matmul a launch is timed with: its work is nothing beside a launch.
 pub const LAUNCH: u32 = 16;
 
-/// The fires a timed frame carries back to back, against a frame of one.
+/// The most fires a timed frame carries back to back, against a frame of
+/// one: fewer where the device's submission limit holds fewer.
 pub const REPEATS: u32 = 16;
+
+/// The fires a timed frame carries where one takes `one_ns`: as many as
+/// stay under the device's submission limit `limit_ns` (at least one), at
+/// most [`REPEATS`].
+#[must_use]
+pub fn repeats_under(one_ns: u64, limit_ns: Option<u64>) -> u32 {
+    match limit_ns {
+        None => REPEATS,
+        Some(limit) => {
+            u32::try_from(limit / one_ns.max(1)).map_or(REPEATS, |fit| fit.clamp(1, REPEATS))
+        }
+    }
+}
+
+/// The spread of repeated timings of one thing: their range over their
+/// median. What an estimate made from them is held under a limit with, in
+/// place of a picked margin.
+#[must_use]
+pub fn spread(times: &[u64]) -> f64 {
+    let (Some(&least), Some(&most)) = (times.iter().min(), times.iter().max()) else {
+        return 0.0;
+    };
+    let mut sorted = times.to_vec();
+    sorted.sort_unstable();
+    let median = sorted[sorted.len() / 2].max(1);
+    (most - least) as f64 / median as f64
+}
+
+/// `ns` grown by the `spread` its timings showed: the time an estimate is
+/// held under a limit at.
+#[must_use]
+pub fn with_spread(ns: u64, spread: f64) -> u64 {
+    (ns as f64 * (1.0 + spread.max(0.0))).ceil() as u64
+}
+
+/// A dispatch's time at `rows` rows, from its time `ns` at fewer rows
+/// `from_rows`: the work grows with the rows, and the time no slower than
+/// it (a narrow dispatch leaves the device idle, which a wider one fills).
+#[must_use]
+pub fn extrapolate(from_rows: u32, ns: u64, rows: u32) -> u64 {
+    let scaled = u128::from(ns) * u128::from(rows) / u128::from(from_rows.max(1));
+    u64::try_from(scaled).unwrap_or(u64::MAX)
+}
+
+/// The refusal of `what` at an estimated `estimate_ns`, past the device's
+/// submission limit `limit_ns`: it is not run, as a submission that long
+/// loses the device.
+#[must_use]
+pub fn past_submit_limit(what: &str, estimate_ns: u64, limit_ns: Option<u64>) -> Option<String> {
+    let limit = limit_ns?;
+    (estimate_ns > limit).then(|| {
+        format!(
+            "{what} would take ~{:.1} s, past this device's {:.1} s submission limit \
+             (`engine.submit.max_ms`), so it is not run",
+            estimate_ns as f64 / 1e9,
+            limit as f64 / 1e9
+        )
+    })
+}
 
 /// Timed frames of each kind; the median is kept.
 pub const ROUNDS: usize = 5;
@@ -89,16 +150,19 @@ struct Rig<'a, B: Serve> {
     held: Vec<B::Buffer>,
     /// `engine::rates::operand_pattern`, made once.
     pattern: Option<Vec<u8>>,
+    /// The longest one submission may run ([`Tactics::max_submit_ns`]).
+    limit: Option<u64>,
 }
 
 impl<'a, B: Serve> Rig<'a, B> {
-    fn new(device: &'a B::Context) -> Self {
+    fn new(device: &'a B::Context, limit: Option<u64>) -> Self {
         Rig {
             device,
             handles: Handles::<B>::new(),
             pipelines: B::Pipelines::default(),
             held: Vec::new(),
             pattern: None,
+            limit,
         }
     }
 
@@ -171,24 +235,66 @@ impl<'a, B: Serve> Rig<'a, B> {
         timer(f)
     }
 
-    /// One `fire`'s time inside a frame: [`REPEATS`] of it against one, the
-    /// host's clock around each frame's one submit.
+    /// One `fire`'s time inside a frame: as many of it as the submission
+    /// limit holds ([`repeats_under`]) against one, the host's clock around
+    /// each frame's one submit.
     fn each(
         &self,
         timer: Timer<'_, B>,
         fire: &dyn Fn(&kernels_slang::Ctx<'_>) -> Result<()>,
     ) -> Result<u64> {
+        self.each_guarded(timer, fire, None)
+    }
+
+    /// [`Rig::each`], refused unrun where `guess` (what it is named, and its
+    /// estimated time from a smaller one) is past the submission limit.
+    fn each_guarded(
+        &self,
+        timer: Timer<'_, B>,
+        fire: &dyn Fn(&kernels_slang::Ctx<'_>) -> Result<()>,
+        guess: Option<(&str, u64)>,
+    ) -> Result<u64> {
+        self.each_spread(timer, fire, guess).map(|(ns, _)| ns)
+    }
+
+    /// [`Rig::each_guarded`], with the spread of its single-fire frames.
+    fn each_spread(
+        &self,
+        timer: Timer<'_, B>,
+        fire: &dyn Fn(&kernels_slang::Ctx<'_>) -> Result<()>,
+        guess: Option<(&str, u64)>,
+    ) -> Result<(u64, f64)> {
+        let refuse = |why: String| Fault::Device { call: "rates", why };
+        if let Some((what, estimate)) = guess
+            && let Some(why) = past_submit_limit(what, estimate, self.limit)
+        {
+            return Err(refuse(why));
+        }
         let nothing = |_: &mut B::Frame| Ok(());
-        let wall = |count: u32| -> Result<u64> {
+        let wall = |count: u32| -> Result<(u64, f64)> {
             let walls = (0..ROUNDS)
                 .map(|_| self.frame(timer, count, fire, &nothing).map(|(_, w)| w))
                 .collect::<Result<Vec<u64>>>()?;
-            Ok(median(walls))
+            let spread = spread(&walls);
+            Ok((median(walls), spread))
         };
-        self.frame(timer, 1, fire, &nothing)?;
-        self.frame(timer, REPEATS, fire, &nothing)?;
-        let (one, many) = (wall(1)?, wall(REPEATS)?);
-        Ok((many.saturating_sub(one) / u64::from(REPEATS - 1)).max(1))
+        // The warm frame of one builds the pipelines; one is then timed,
+        // and the frame of many sized from it, grown by its spread.
+        let (_, first) = self.frame(timer, 1, fire, &nothing)?;
+        if let Some(why) = past_submit_limit("one dispatch of it", first, self.limit) {
+            return Err(refuse(why));
+        }
+        let (one, spread) = wall(1)?;
+        let repeats = repeats_under(with_spread(one, spread), self.limit);
+        if repeats < 2 {
+            return Ok((one, spread));
+        }
+        self.frame(timer, repeats, fire, &nothing)?;
+        let (many, _) = wall(repeats)?;
+        Ok((
+            (many.saturating_sub(one) / u64::from(repeats - 1)).max(1),
+            spread,
+        ))
     }
 }
 
@@ -216,7 +322,7 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     timer: Timer<'_, B>,
     say: &mut dyn FnMut(&str),
 ) -> Result<Rates> {
-    let mut rig = Rig::<B>::new(device);
+    let mut rig = Rig::<B>::new(device, tactics.max_submit_ns());
     // The launch first: every rate below takes its dispatches' launches off.
     let (bytes_per_ns, launch_ns) = copy_and_launch(&mut rig, tactics.gemm(tier), timer, say)?;
     rig.release();
@@ -284,8 +390,19 @@ fn warm<B: Serve>(
         next.set(next.get() + 1);
         kernels_slang::linear::gemm::matmul(sink, tactic, act, w, y).map_err(fault("rates: matmul"))
     };
-    let planes = u32::try_from(weights.len()).unwrap_or(u32::MAX);
     let nothing = |_: &mut B::Frame| Ok(());
+    // A rotation is one frame: no more of the planes than the submission
+    // limit holds, from one fire's time.
+    let (_, one) = rig.frame(timer, 1, &fire, &nothing)?;
+    if let Some(why) = past_submit_limit("one warm-up matmul", one, rig.limit) {
+        return Err(Fault::Device { call: "rates", why });
+    }
+    let planes = u32::try_from(weights.len()).unwrap_or(u32::MAX);
+    let planes = rig
+        .limit
+        .map_or(planes, |limit| {
+            u32::try_from(limit / one.max(1)).map_or(planes, |fit| fit.clamp(1, planes))
+        });
     let warmed = engine::rates::warm_up(|| {
         let (_, wall) = rig.frame(timer, planes, &fire, &nothing)?;
         Ok::<f64, Fault>(gemm_flops(m, n, k) * f64::from(planes) / wall.max(1) as f64)
@@ -316,6 +433,9 @@ fn grid<B: Serve>(
     // the next of, past the last-level cache.
     let mut laid: Option<(Tensor, Vec<Tensor>, Tensor)> = None;
     let next = std::cell::Cell::new(0usize);
+    // Each shape's times so far, `(rows, ns)`: a wider row count's is
+    // estimated from the widest below it before it runs.
+    let mut timed: Vec<Vec<(u32, u64, f64)>> = vec![Vec::new(); shapes.len()];
     let (rates, top) = engine::rates::saturate(lattice, shapes.len(), |at, row, fresh| {
         let (n, k) = shapes[at];
         if fresh {
@@ -331,18 +451,31 @@ fn grid<B: Serve>(
         }
         let (act, weights, y) = laid.as_ref().expect("laid");
         let m = lattice[row];
-        let ns = rig.each(timer, &|sink| {
-            let w = weights[next.get() % weights.len()];
-            next.set(next.get() + 1);
-            kernels_slang::linear::gemm::matmul(
-                sink,
-                tactic,
-                Tensor { rows: m, ..*act },
-                w,
-                Tensor { rows: m, ..*y },
-            )
-            .map_err(fault("rates: matmul"))
-        })?;
+        let what = format!("the matmul {m}x{n}x{k}");
+        let guess = timed[at]
+            .iter()
+            .filter(|&&(rows, ..)| rows < m)
+            .max_by_key(|&&(rows, ..)| rows)
+            .map(|&(rows, ns, spread)| {
+                (what.as_str(), with_spread(extrapolate(rows, ns, m), spread))
+            });
+        let (ns, spread) = rig.each_spread(
+            timer,
+            &|sink| {
+                let w = weights[next.get() % weights.len()];
+                next.set(next.get() + 1);
+                kernels_slang::linear::gemm::matmul(
+                    sink,
+                    tactic,
+                    Tensor { rows: m, ..*act },
+                    w,
+                    Tensor { rows: m, ..*y },
+                )
+                .map_err(fault("rates: matmul"))
+            },
+            guess,
+        )?;
+        timed[at].push((m, ns, spread));
         let rate = engine::rates::rate_from(
             &format!("matmul {m}x{n}x{k}"),
             ns as f64,
@@ -630,7 +763,7 @@ pub fn attention_rate<B: Serve, T: Tactics + ?Sized>(
     shape: engine::rates::AttnShape,
     launch: f64,
 ) -> Result<f64> {
-    let mut rig = Rig::<B>::new(device);
+    let mut rig = Rig::<B>::new(device, tactics.max_submit_ns());
     attention(&mut rig, tactics, tier, timer, shape, launch)
 }
 
@@ -641,8 +774,9 @@ pub fn gemm_rate<B: Serve>(
     tactic: kernels_slang::linear::gemm::Tactic,
     timer: Timer<'_, B>,
     (m, n, k): (u32, u32, u32),
+    limit: Option<u64>,
 ) -> Result<f64> {
-    let mut rig = Rig::<B>::new(device);
+    let mut rig = Rig::<B>::new(device, limit);
     let act = rig.operand(m, k, Dtype::Bf16)?;
     let w = rig.operand(n, k, Dtype::Bf16)?;
     let y = rig.zeros(m, n, Dtype::Bf16)?;
@@ -650,4 +784,47 @@ pub fn gemm_rate<B: Serve>(
         kernels_slang::linear::gemm::matmul(sink, tactic, act, w, y).map_err(fault("rates: matmul"))
     })?;
     Ok(2.0 * f64::from(m) * f64::from(n) * f64::from(k) / ns as f64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MS: u64 = 1_000_000;
+
+    /// A frame carries as many fires as the limit holds: sixteen 125 ms
+    /// matmuls would pass a 2 s limit, fifteen fit.
+    #[test]
+    fn a_frame_carries_what_the_submission_limit_holds() {
+        assert_eq!(repeats_under(125 * MS, None), REPEATS);
+        assert_eq!(repeats_under(125 * MS, Some(2000 * MS)), 16);
+        assert_eq!(repeats_under(140 * MS, Some(2000 * MS)), 14);
+        assert_eq!(repeats_under(1500 * MS, Some(2000 * MS)), 1);
+        assert_eq!(repeats_under(1, Some(2000 * MS)), REPEATS);
+    }
+
+    /// A fake timing: 550 ms at 32 rows is ~1.1 s at 64, refused unrun
+    /// under a 2 s limit only past it.
+    #[test]
+    fn an_estimate_is_held_under_the_limit_grown_by_its_spread() {
+        // The tiled qmm at m = 64 ran 1.03 to 1.20 s: ~17% spread.
+        let times = [1030 * MS, 1100 * MS, 1200 * MS];
+        let s = spread(&times);
+        assert!((s - 170.0 / 1100.0).abs() < 1e-9, "{s}");
+        assert_eq!(with_spread(1000 * MS, 0.25), 1250 * MS);
+        assert_eq!(spread(&[]), 0.0);
+    }
+
+    #[test]
+    fn a_dispatch_estimated_past_the_limit_is_refused_by_name() {
+        let at_64 = extrapolate(32, 550 * MS, 64);
+        assert_eq!(at_64, 1100 * MS);
+        assert_eq!(past_submit_limit("tiled at m = 64", at_64, Some(2000 * MS)), None);
+        let at_128 = extrapolate(32, 550 * MS, 128);
+        let why = past_submit_limit("tiled at m = 128", at_128, Some(2000 * MS))
+            .expect("past the limit");
+        assert!(why.contains("tiled at m = 128 would take ~2.2 s"), "{why}");
+        assert!(why.contains("2.0 s submission limit"), "{why}");
+        assert_eq!(past_submit_limit("tiled", at_128, None), None);
+    }
 }

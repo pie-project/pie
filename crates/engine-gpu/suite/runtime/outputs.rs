@@ -192,7 +192,7 @@ pub(super) struct Loaded {
 
 /// `None` without a device. `tag` names the scratch directory.
 pub(super) fn loaded(tag: &str, model: &impl ForwardHybrid) -> Option<Loaded> {
-    let boot = backend::DeviceBoot::default();
+    let boot = backend::device_boot();
     if backend::Context::bind(&boot, backend::ALLOWANCE).is_err() {
         eprintln!("not asked: no device");
         return None;

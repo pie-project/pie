@@ -187,6 +187,15 @@ pub(crate) struct Core {
     pub(crate) device_local: u64,
     /// The largest device-local heap, which device reservations take.
     heap: usize,
+    /// Where what is free of that heap is read from.
+    pub(crate) source: BudgetSource,
+    /// Whether the heap is the host's memory: an integrated device, or a
+    /// device-local heap the host maps.
+    pub(crate) unified: bool,
+    /// The largest buffer a load makes ([`buffer_ceiling`]), and the limit
+    /// that sets it; a test lowers it to lay a plane in pieces.
+    max_buffer: AtomicU64,
+    max_buffer_limit: Mutex<&'static str>,
     pub(crate) vendor_id: u32,
     pub(crate) discrete: bool,
     pub(crate) api_version: u32,
@@ -205,6 +214,129 @@ pub struct Enabled {
     pub memory_budget: bool,
 
     pub coopmat: bool,
+}
+
+/// Where a device's free memory is read from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BudgetSource {
+    /// `VK_EXT_memory_budget`: the heap's budget for this process less its
+    /// usage.
+    Extension,
+    /// The host's available memory (`MemAvailable` of `/proc/meminfo`): a
+    /// unified-memory device without the extension, whose heap is the
+    /// host's RAM, all of it, however much the host has handed out.
+    OsAvailable,
+    /// The device-local heap less every reservation of this process: a
+    /// discrete device without the extension, blind to other processes.
+    Heap,
+}
+
+impl std::fmt::Display for BudgetSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            BudgetSource::Extension => "the memory_budget extension",
+            BudgetSource::OsAvailable => "the OS's MemAvailable",
+            BudgetSource::Heap => {
+                "the device-local heap less this process's reservations (no memory_budget \
+                 extension)"
+            }
+        })
+    }
+}
+
+/// The host's available memory now: `MemAvailable` of `/proc/meminfo`, on
+/// Android less the reserve its low-memory killer defends ([`lmk_reserve`]).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn os_available() -> std::result::Result<u64, String> {
+    let text = std::fs::read_to_string("/proc/meminfo")
+        .map_err(|e| format!("reading /proc/meminfo: {e}"))?;
+    let available =
+        mem_available(&text).ok_or_else(|| "/proc/meminfo states no MemAvailable".to_string())?;
+    Ok(available.saturating_sub(lmk_reserve().map_or(0, |(bytes, _)| bytes)))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn os_available() -> std::result::Result<u64, String> {
+    Err("this host has no reader of its available memory (only Linux and Android's \
+         /proc/meminfo is read)"
+        .to_string())
+}
+
+/// What Android's low-memory killer keeps free before it kills a foreground
+/// app (one at `oom_score_adj` 0, as a process serving in the foreground
+/// is): the free pages of its levels whose kills reach adj 0, the most of
+/// them, and where they were read. lmkd states its levels as the property
+/// `sys.lmk.minfree_levels` (`pages:adj,...`); the kernel's own killer as
+/// `/sys/module/lowmemorykiller/parameters/{minfree,adj}`. `None` off
+/// Android, or where neither is readable.
+#[cfg(target_os = "android")]
+pub(crate) fn lmk_reserve() -> Option<(u64, &'static str)> {
+    // SAFETY: `sysconf` reads a constant of the process.
+    let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
+    if let Some(levels) = property(c"sys.lmk.minfree_levels")
+        && let Some(pages) = foreground_minfree(&levels)
+    {
+        return Some((pages * page, "sys.lmk.minfree_levels"));
+    }
+    let dir = std::path::Path::new("/sys/module/lowmemorykiller/parameters");
+    let minfree = std::fs::read_to_string(dir.join("minfree")).ok()?;
+    let adj = std::fs::read_to_string(dir.join("adj")).ok()?;
+    let levels: Vec<String> = minfree
+        .trim()
+        .split(',')
+        .zip(adj.trim().split(','))
+        .map(|(pages, adj)| format!("{pages}:{adj}"))
+        .collect();
+    foreground_minfree(&levels.join(","))
+        .map(|pages| (pages * page, "/sys/module/lowmemorykiller/parameters/minfree"))
+}
+
+#[cfg(not(target_os = "android"))]
+pub(crate) fn lmk_reserve() -> Option<(u64, &'static str)> {
+    None
+}
+
+/// An Android system property's value, where it is set.
+#[cfg(target_os = "android")]
+fn property(name: &CStr) -> Option<String> {
+    let mut value = [0 as c_char; 92];
+    // SAFETY: `name` is NUL-terminated and `value` holds PROP_VALUE_MAX (92)
+    // bytes, the most the call writes, NUL included.
+    let len = unsafe { libc::__system_property_get(name.as_ptr(), value.as_mut_ptr()) };
+    if len <= 0 {
+        return None;
+    }
+    // SAFETY: the call wrote a NUL-terminated string into `value`.
+    let text = unsafe { CStr::from_ptr(value.as_ptr()) };
+    Some(text.to_string_lossy().into_owned())
+}
+
+/// The most free pages a `pages:adj,...` level list keeps before a kill
+/// reaches `oom_score_adj` 0: its levels whose adj is 0 or below.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub(crate) fn foreground_minfree(levels: &str) -> Option<u64> {
+    levels
+        .split(',')
+        .filter_map(|level| {
+            let (pages, adj) = level.trim().split_once(':')?;
+            let adj: i32 = adj.trim().parse().ok()?;
+            (adj <= 0).then(|| pages.trim().parse::<u64>().ok()).flatten()
+        })
+        .max()
+}
+
+/// `MemAvailable`'s bytes in a `/proc/meminfo` text.
+pub(crate) fn mem_available(meminfo: &str) -> Option<u64> {
+    let line = meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemAvailable:"))?;
+    let mut words = line.split_whitespace();
+    let value: u64 = words.next()?.parse().ok()?;
+    match words.next() {
+        Some("kB") => value.checked_mul(1024),
+        None => Some(value),
+        Some(_) => None,
+    }
 }
 
 impl Core {
@@ -227,15 +359,28 @@ impl Core {
         Some((budget.heap_budget[self.heap], budget.heap_usage[self.heap]))
     }
 
-    /// The device-local bytes free to this process now: the heap's budget
-    /// less its usage where the driver reports them, else the heap less
-    /// every reservation (blind to other processes).
+    /// The device-local bytes free to this process now, read from
+    /// [`Core::source`]: the heap's budget less its usage; the host's
+    /// available memory, no more than the heap less every reservation; or
+    /// the heap less every reservation (blind to other processes).
     pub(crate) fn free(&self) -> u64 {
-        match self.budget() {
-            Some((budget, usage)) => budget.saturating_sub(usage),
-            None => self
-                .device_local
-                .saturating_sub(engine_gpu::books::process_reserved()),
+        let heap_left = || {
+            self.device_local
+                .saturating_sub(engine_gpu::books::process_reserved())
+        };
+        match self.source {
+            BudgetSource::Extension => self
+                .budget()
+                .map_or_else(heap_left, |(budget, usage)| budget.saturating_sub(usage)),
+            BudgetSource::OsAvailable => match os_available() {
+                Ok(available) => available.min(heap_left()),
+                Err(why) => {
+                    // Read at load, so this is the host taking it away.
+                    tracing::warn!(%why, "the host's available memory reads as none");
+                    0
+                }
+            },
+            BudgetSource::Heap => heap_left(),
         }
     }
 
@@ -245,6 +390,17 @@ impl Core {
         self.budget().map_or(0, |(_, usage)| {
             usage.saturating_sub(engine_gpu::books::process_reserved())
         })
+    }
+
+    /// The largest buffer a load makes, and the device limit that sets it.
+    pub(crate) fn max_buffer(&self) -> (u64, &'static str) {
+        (
+            self.max_buffer.load(Ordering::Relaxed),
+            *self
+                .max_buffer_limit
+                .lock()
+                .expect("max buffer lock poisoned"),
+        )
     }
 
     pub(crate) fn fault(&self, call: &'static str, code: vk::Result) -> Fault {
@@ -292,9 +448,11 @@ impl Core {
 
     pub(crate) fn staging<'a>(self: &Arc<Self>, transfer: &'a mut Transfer) -> Result<&'a Slab> {
         if transfer.staging.is_none() {
+            // No larger than the largest buffer the device makes.
+            let bytes = STAGING_BYTES.min(self.max_buffer().0 & !3);
             transfer.staging = Some(Raw::new(
                 self,
-                STAGING_BYTES,
+                bytes,
                 Memory::Staging,
                 engine_gpu::books::owners::STAGING,
             )?);
@@ -428,7 +586,6 @@ pub struct Context {
     pub(crate) core: Arc<Core>,
     /// The operator's cap on what the load takes, all of it together.
     budget: Option<u64>,
-    max_buffer: u64,
     pub(crate) dummy: Slab,
     pipeline_cache: Arc<PipelineCache>,
     device_index: u32,
@@ -581,14 +738,23 @@ fn has_extension(exts: &[vk::ExtensionProperties], name: &CStr) -> bool {
 /// The largest buffer a load makes: one a single storage descriptor binds
 /// whole (`maxStorageBufferRange`), that one allocation backs
 /// (`maxMemoryAllocationSize`, core 1.1) and that the device creates
-/// (`maxBufferSize`, core 1.3; absent before it). A limit reported as zero
-/// states nothing.
-pub(crate) fn buffer_ceiling(storage_range: u32, allocation: u64, buffer: Option<u64>) -> u64 {
-    [Some(allocation), buffer]
-        .into_iter()
-        .flatten()
-        .filter(|&limit| limit > 0)
-        .fold(u64::from(storage_range), u64::min)
+/// (`maxBufferSize`, core 1.3; absent before it), with the name of the
+/// limit that sets it. A limit reported as zero states nothing.
+pub(crate) fn buffer_ceiling(
+    storage_range: u32,
+    allocation: u64,
+    buffer: Option<u64>,
+) -> (u64, &'static str) {
+    [
+        ("maxMemoryAllocationSize", Some(allocation)),
+        ("maxBufferSize", buffer),
+    ]
+    .into_iter()
+    .filter_map(|(name, limit)| limit.filter(|&l| l > 0).map(|l| (l, name)))
+    .fold(
+        (u64::from(storage_range), "maxStorageBufferRange"),
+        |held, next| if next.0 < held.0 { next } else { held },
+    )
 }
 
 impl Context {
@@ -603,12 +769,25 @@ impl Context {
         // SAFETY: a global query of the loaded entry, with no handles.
         let layers = unsafe { entry.enumerate_instance_layer_properties() }.unwrap_or_default();
         let validation = c"VK_LAYER_KHRONOS_validation";
-        let validated = boot.validation
-            && layers
+        let validated = boot.validation;
+        if validated
+            && !layers
                 .iter()
-                .any(|l| l.layer_name_as_c_str().is_ok_and(|s| s == validation));
+                .any(|l| l.layer_name_as_c_str().is_ok_and(|s| s == validation))
+        {
+            return Err(Fault::NoDevice {
+                detail: "`[vulkan] validation = true` asks for VK_LAYER_KHRONOS_validation, \
+                         which the Vulkan loader does not find installed; install the \
+                         layer or set `validation = false`"
+                    .to_string(),
+            });
+        }
         let (instance, props2) = shared_instance(&entry, validated)?;
-        Self::finish(entry, instance, boot, budget, props2)
+        let context = Self::finish(entry, instance, boot, budget, props2)?;
+        if let Some(bytes) = boot.max_buffer {
+            context.limit_buffers(bytes);
+        }
+        Ok(context)
     }
 
     #[allow(
@@ -915,6 +1094,59 @@ impl Context {
             .map(|(at, h)| (at, h.size))
             .max_by_key(|&(_, size)| size)
             .unwrap_or((0, 0));
+        let mapped_heap = memory.memory_types[..memory.memory_type_count as usize]
+            .iter()
+            .any(|t| {
+                t.heap_index as usize == heap
+                    && t.property_flags.contains(
+                        vk::MemoryPropertyFlags::DEVICE_LOCAL
+                            | vk::MemoryPropertyFlags::HOST_VISIBLE,
+                    )
+            });
+        let unified = props.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU || mapped_heap;
+        let source = if memory_budget {
+            BudgetSource::Extension
+        } else if unified {
+            if let Err(why) = os_available() {
+                // SAFETY: the device has its pool, command buffer and fence
+                // as children, destroyed before it; none is used again.
+                unsafe {
+                    device.destroy_fence(transfer.fence, None);
+                    device.destroy_command_pool(pool, None);
+                    device.destroy_device(None);
+                }
+                bail!(Fault::NoDevice {
+                    detail: format!(
+                        "{name} shares the host's memory and has no VK_EXT_memory_budget, so \
+                         what it has free is the host's available memory, and {why}"
+                    ),
+                });
+            }
+            BudgetSource::OsAvailable
+        } else {
+            BudgetSource::Heap
+        };
+        let said = match (source, lmk_reserve()) {
+            (BudgetSource::OsAvailable, Some((reserve, from))) => format!(
+                "{source} less the {} MiB Android's low-memory killer keeps free ({from})",
+                reserve >> 20
+            ),
+            _ => source.to_string(),
+        };
+        match budget {
+            Some(cap) => tracing::info!(
+                device = %name,
+                unified,
+                "device memory: free memory from {said}, capped by the operator's --budget \
+                 of {} MiB",
+                cap >> 20
+            ),
+            None => tracing::info!(
+                device = %name,
+                unified,
+                "device memory: free memory from {said}"
+            ),
+        }
         let core = Arc::new(Core {
             _entry: entry,
             instance,
@@ -939,6 +1171,10 @@ impl Context {
             cores,
             device_local,
             heap,
+            source,
+            unified,
+            max_buffer: AtomicU64::new(max_buffer.0),
+            max_buffer_limit: Mutex::new(max_buffer.1),
             vendor_id: props.vendor_id,
             discrete: props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU,
             api_version: props.api_version,
@@ -955,7 +1191,6 @@ impl Context {
         Ok(Context {
             core,
             budget,
-            max_buffer,
             dummy,
             pipeline_cache,
             device_index: boot.device_index,
@@ -989,7 +1224,31 @@ impl Context {
 
     #[must_use]
     pub fn max_buffer(&self) -> u64 {
-        self.max_buffer
+        self.core.max_buffer().0
+    }
+
+    /// Lowers the largest buffer a load makes to `bytes`, as a device whose
+    /// limits are that small states it: what a load lays from now on is
+    /// laid under it, and an allocation past it refused.
+    pub fn limit_buffers(&self, bytes: u64) {
+        self.core.max_buffer.fetch_min(bytes, Ordering::Relaxed);
+        *self
+            .core
+            .max_buffer_limit
+            .lock()
+            .expect("max buffer lock poisoned") = "max_buffer as the boot states it";
+    }
+
+    /// Whether the device's memory is the host's ([`Core::unified`]).
+    #[must_use]
+    pub fn unified_memory(&self) -> bool {
+        self.core.unified
+    }
+
+    /// Where the device's free memory is read from.
+    #[must_use]
+    pub fn budget_source(&self) -> BudgetSource {
+        self.core.source
     }
 
     #[must_use]
@@ -2027,4 +2286,42 @@ impl Inner {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mem_available_reads_kilobytes_as_bytes() {
+        let text = "MemTotal:       11534336 kB\nMemFree:  1000 kB\nMemAvailable:    5242880 kB\n";
+        assert_eq!(mem_available(text), Some(5_242_880 * 1024));
+        assert_eq!(mem_available("MemTotal: 1 kB\n"), None);
+        assert_eq!(mem_available("MemAvailable: 12 MB\n"), None);
+    }
+
+    /// lmkd's levels on a phone: a foreground app is killed under 18432
+    /// free pages; the levels past adj 0 reach only background apps.
+    #[test]
+    fn the_lmk_reserve_is_the_level_that_reaches_the_foreground() {
+        let levels = "18432:0,23040:100,27648:200,32256:250,55296:900,80640:950";
+        assert_eq!(foreground_minfree(levels), Some(18432));
+        assert_eq!(foreground_minfree("4096:-1000,8192:0,9000:100"), Some(8192));
+        assert_eq!(foreground_minfree("23040:100"), None);
+        assert_eq!(foreground_minfree(""), None);
+    }
+
+    #[test]
+    fn the_buffer_ceiling_names_the_limit_that_sets_it() {
+        // An Adreno 840: 1 GiB allocations under a 2 GiB - 1 storage range.
+        assert_eq!(
+            buffer_ceiling(u32::MAX >> 1, 1 << 30, Some(1 << 32)),
+            (1 << 30, "maxMemoryAllocationSize")
+        );
+        assert_eq!(
+            buffer_ceiling(1 << 27, 1 << 30, None),
+            (1 << 27, "maxStorageBufferRange")
+        );
+        assert_eq!(
+            buffer_ceiling(u32::MAX, 0, Some(1 << 31)),
+            (1 << 31, "maxBufferSize")
+        );
+    }
+}

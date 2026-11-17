@@ -164,19 +164,24 @@ fn fire(
     let b = bounds(op, act, w, y)?;
     let target = ctx.target();
     if let Some(names) = ctx.naming() {
-        return names.either(&kernels(target, op, ladder, &b, capacity_rows)?);
+        return names.either(&kernels(ctx, target, op, ladder, &b, capacity_rows)?);
     }
     if b.m == 0 {
         return Ok(());
     }
+    // A rung whose kernel declares more workgroup memory than the device
+    // gives is passed over for the next.
     for rung in ladder {
-        if let Some(kernel) = kernel(target, op, *rung, &b, capacity_rows)? {
+        if let Some(kernel) = kernel(target, op, *rung, &b, capacity_rows)?
+            && crate::workgroup::fits(ctx, &kernel)
+        {
             return ctx.fire(kernel, &args(op, &b)?);
         }
     }
     Err(refuse(
         op,
-        "no `kernel.qmm` rung fits: a ladder ends on the vector kernel, which fits every shape",
+        "no `kernel.qmm` rung fits: a ladder ends on the vector kernel, which fits every shape \
+         whose workgroup memory the device holds",
     ))
 }
 
@@ -209,6 +214,7 @@ fn kernel(
 /// Every kernel a rung of `ladder` runs some batch the capacity holds with,
 /// whatever its rows: `ladder` is every rung some row count reaches.
 fn kernels(
+    ctx: &Ctx<'_>,
     target: Target,
     op: &'static str,
     ladder: &[Qmm],
@@ -218,7 +224,9 @@ fn kernels(
     let mut all = Vec::new();
     for rung in ladder {
         for m in breaks(*rung, capacity_rows) {
-            if let Some(kernel) = kernel(target, op, *rung, &Bounds { m, ..*b }, capacity_rows)? {
+            if let Some(kernel) = kernel(target, op, *rung, &Bounds { m, ..*b }, capacity_rows)?
+                && crate::workgroup::fits(ctx, &kernel)
+            {
                 distinct(&mut all, kernel);
             }
         }
@@ -440,11 +448,30 @@ mod tests {
                 vec![Qmm::Tiled { crossover_tg: 24 }, Qmm::Qmv { vecs: 2 }],
             ),
         ];
+        /// A device that states no workgroup memory limit.
+        struct Unlimited(Target);
+        impl crate::encode::Encode for Unlimited {
+            fn fire(
+                &self,
+                _fire: Fire,
+                _args: &[crate::encode::ArgValue],
+            ) -> Result<(), Error> {
+                Ok(())
+            }
+            fn absent(&self) -> Result<crate::encode::ArgValue, Error> {
+                Ok(crate::encode::ArgValue::U32(0))
+            }
+            fn target(&self) -> Target {
+                self.0
+            }
+        }
         for (target, ladder) in &ladders {
             for n in [16, 48, 64, 1024, 1030] {
                 let b = batch(n, 128, 64, 4);
                 for capacity in (1..=70).chain([95, 96, 97, 127, 128, 129, 191, 192, 193, 300]) {
-                    let named = kernels(*target, "linear.matmul", ladder, &b, capacity).unwrap();
+                    let named =
+                        kernels(&Unlimited(*target), *target, "linear.matmul", ladder, &b, capacity)
+                            .unwrap();
                     assert_eq!(
                         names(named),
                         names(asked(*target, ladder, &b, capacity)),

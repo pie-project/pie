@@ -15,10 +15,28 @@ use profile::{Facts, Profile, Registry, Report, Shelf};
 #[decision(id = "engine.submit.split_rows", constant(range(0..=1_048_576)), default = 32, tune = engine)]
 pub struct SubmitSplitRows(pub u32);
 
+/// The longest one submission may run before the driver takes the device
+/// for hung (KGSL's long-IB detection on Adreno, about 2 s), in
+/// milliseconds; 0 where no limit is known. Vulkan reports none, so a
+/// device family's profile states it. Every timed frame of `pie tune` and
+/// every serving submission is planned under it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, profile::Decision)]
+#[decision(id = "engine.submit.max_ms", constant(range(0..=3_600_000)), default = 0, tune = engine)]
+pub struct MaxSubmitMs(pub u32);
+
+impl MaxSubmitMs {
+    /// The limit in nanoseconds; `None` where none is known.
+    #[must_use]
+    pub fn ns(self) -> Option<u64> {
+        (self.0 > 0).then(|| u64::from(self.0) * 1_000_000)
+    }
+}
+
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     let mut r = Registry::new("vulkan", FACTS, AXES);
     crate::tuning::register(&mut r);
     r.add::<SubmitSplitRows>();
+    r.add::<MaxSubmitMs>();
     poem_compiler::fuse::flags::register(&mut r, &crate::FUSIONS);
     // One queue serves every region.
     poem_compiler::costs::register(&mut r, 0);
@@ -75,7 +93,8 @@ impl Device {
             .word("vendor", self.vendor)
             .int("subgroup", i64::from(self.subgroup))
             .flag("coopmat", self.coopmat)
-            .flag("discrete", self.discrete);
+            .flag("discrete", self.discrete)
+            .word("bf16", crate::tuning::BF16_EMULATED);
         match self.cores {
             Some(cores) => facts.int("cores", i64::from(cores)),
             None => facts,
@@ -117,6 +136,18 @@ mod tests {
 
     use super::*;
     use engine_gpu::backend::Tactics as _;
+
+    #[test]
+    fn the_chip_states_bf16_as_emulated_in_f32() {
+        let facts = device("qualcomm", 64, None, false).facts();
+        assert!(
+            facts
+                .describe()
+                .contains(&"bf16 = emulated (f32 math)".to_string()),
+            "{:?}",
+            facts.describe()
+        );
+    }
 
     #[test]
     fn the_registry_holds_together() {

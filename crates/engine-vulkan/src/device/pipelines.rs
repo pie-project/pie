@@ -91,6 +91,7 @@ impl Pipelines {
                   `kernels-slang/spirv`, or the instantiation is limited to WGSL)"
                 .to_string(),
         })?;
+        fits_workgroup(device, key)?;
         let cache = device.pipeline_cache();
         let pipeline = Arc::new(build(device.core(), cache.handle(), file, key, code)?);
         cache.built();
@@ -127,7 +128,28 @@ impl Pipelines {
                 limit,
             });
         }
-        Ok(())
+        fits_workgroup(device, key)
+    }
+}
+
+/// Kernel `key` held to the workgroup memory the device gives a workgroup
+/// (`maxComputeSharedMemorySize`): refused by name past it, as no pipeline
+/// of it would run. A tactic choosing among kernels passes such a one over
+/// first ([`kernels_slang::workgroup::fits`]); this refuses the one left.
+fn fits_workgroup(device: &Context, key: &'static str) -> Result<()> {
+    let limit = device.limits().shared_bytes;
+    match kernels_slang::workgroup::of_key(key) {
+        Some(bytes) if bytes > limit => Err(Fault::WorkgroupMemory {
+            kernel: key.to_string(),
+            bytes,
+            limit,
+        }),
+        Some(_) => Ok(()),
+        None => Err(Fault::Shader {
+            file: "kernels-slang",
+            entrypoint: key,
+            why: "its SPIR-V states no static workgroup memory size".to_string(),
+        }),
     }
 }
 

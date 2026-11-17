@@ -6,7 +6,7 @@ use checkpoint::plan::{LoadPlan, StorageInstr};
 use engine::load::Tiers;
 use poem_ir::{Def, Operation, Trace, ValueId};
 
-use crate::backend::{Backend, Buffer as _, Frame as _};
+use crate::backend::{Backend, Buffer as _, Context as _, Frame as _};
 use crate::error::{Fault, Result};
 use crate::handles::Handles;
 use kernels_slang::Tensor;
@@ -434,47 +434,66 @@ pub struct Seats<B: Backend> {
     routes: B::Buffer,
     routes_handle: u32,
 
-    staging: Vec<B::Buffer>,
-    kind_off: [u64; 3],
+    /// Each ring slot's staging, a buffer a kind: one no larger than the
+    /// kind's seat slab, which is no larger than the device's largest.
+    staging: Vec<[Option<B::Buffer>; 3]>,
     ring: Cell<usize>,
     pending: Cell<usize>,
 }
 
 impl<B: Backend> Seats<B> {
+    /// Seats for `capacity` distinct rows of the tables, no more than the
+    /// `rows` the largest table holds (no gather seats more distinct rows
+    /// than a table has); each kind's slab a buffer, refused by name past
+    /// the device's largest.
     pub fn reserve(
         device: &B::Context,
         handles: &Handles<B>,
         widest: [u64; 3],
         capacity: u32,
+        rows: u32,
     ) -> Result<Option<Seats<B>>> {
+        let capacity = capacity.min(rows);
         if widest.iter().all(|&b| b == 0) || capacity == 0 {
             return Ok(None);
         }
         let mut slabs = Vec::new();
         let mut seat = [None; 3];
-        let mut kind_off = [0u64; 3];
-        let mut slot_bytes = 0u64;
+        let mut caps = [0u64; 3];
         for kind in Kind::ALL {
             let per = widest[kind.at()];
             if per == 0 {
                 continue;
             }
             let cap = per * u64::from(capacity);
+            if cap > device.max_buffer() {
+                return Err(Fault::Residency(format!(
+                    "the gathered tables' {kind:?} seats take {capacity} rows of {per} bytes, \
+                     {cap} bytes in one buffer, past this device's largest of {}: a fire's \
+                     tokens are its rows, so serve with fewer `max_tokens`",
+                    device.max_buffer()
+                )));
+            }
             let buffer = B::Buffer::zeroed(device, cap, crate::books::owners::EXPERT_SEATS)?;
             let handle = handles.bind(&buffer, 0, cap)?;
             slabs.push((kind, buffer));
             seat[kind.at()] = Some((handle, per));
-            kind_off[kind.at()] = slot_bytes;
-            slot_bytes += cap;
+            caps[kind.at()] = cap;
         }
         let mut staging = Vec::with_capacity(RING);
         for _ in 0..RING {
-            staging.push(B::Buffer::with(
-                device,
-                slot_bytes,
-                crate::backend::Memory::Staging,
-                crate::books::owners::EXPERT_SEATS,
-            )?);
+            let mut slot: [Option<B::Buffer>; 3] = [None, None, None];
+            for kind in Kind::ALL {
+                if caps[kind.at()] > 0 {
+                    slot[kind.at()] = Some(B::Buffer::with(
+                        device,
+                        caps[kind.at()].next_multiple_of(B::COPY_GRAIN),
+                        crate::backend::Memory::Staging,
+                        crate::books::owners::EXPERT_SEATS,
+                    )?);
+                }
+            }
+            staging.push(slot);
         }
         let routes = B::Buffer::zeroed(device, MAX_ROUTES * 4, crate::books::owners::EXPERT_SEATS)?;
         let routes_handle = handles.bind(&routes, 0, MAX_ROUTES * 4)?;
@@ -485,7 +504,6 @@ impl<B: Backend> Seats<B> {
             routes,
             routes_handle,
             staging,
-            kind_off,
             ring: Cell::new(0),
             pending: Cell::new(0),
         }))
@@ -562,7 +580,11 @@ impl<B: Backend> Seats<B> {
                 });
             }
             let len = plane.per * unique.len() as u64;
-            let at = self.kind_off[kind.at()];
+            let at = 0;
+            let staging = staging[kind.at()].as_ref().ok_or(Fault::Device {
+                call: "gather",
+                why: format!("no staging was reserved for {kind:?} planes"),
+            })?;
 
             B::stage_rows(staging, at, len.next_multiple_of(B::COPY_GRAIN), |base| {
                 copy_rows(map, plane, unique, base)
@@ -824,9 +846,10 @@ impl<B: Backend> Gathered<B> {
         handles: &Handles<B>,
         widest: [u64; 3],
         capacity: u32,
+        rows: u32,
     ) -> Result<Option<Gathered<B>>> {
         Ok(
-            Seats::reserve(device, handles, widest, capacity)?.map(|seats| Gathered {
+            Seats::reserve(device, handles, widest, capacity, rows)?.map(|seats| Gathered {
                 seats,
                 key: Cell::new(None),
                 unique: RefCell::new(Vec::new()),

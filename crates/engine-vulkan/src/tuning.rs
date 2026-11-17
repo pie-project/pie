@@ -13,7 +13,15 @@ pub const FACTS: &[Var] = &[
     Var::fixed("coopmat", Domain::Bool),
     // A discrete GPU (`VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU`).
     Var::fixed("discrete", Domain::Bool),
+    // How bf16 runs: every kernel loads and stores it and computes in f32,
+    // on every device (no device's own bf16 arithmetic is used).
+    Var::fixed("bf16", Domain::Enum(BF16)),
 ];
+
+/// The one way bf16 runs on this engine ([`FACTS`]' `bf16`).
+pub const BF16_EMULATED: &str = "emulated (f32 math)";
+
+const BF16: &[&str] = &[BF16_EMULATED];
 
 pub const AXES: &[&str] = &["rows"];
 
@@ -312,6 +320,10 @@ impl Tuning {
 impl engine_gpu::backend::Tactics for Tuning {
     fn profile(&self) -> &profile::Profile {
         Tuning::profile(self)
+    }
+
+    fn max_submit_ns(&self) -> Option<u64> {
+        self.profile.get::<crate::chip::MaxSubmitMs>().ns()
     }
 
     fn qmm_ladder(

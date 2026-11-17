@@ -37,6 +37,42 @@ void main(uint3 gid : SV_DispatchThreadID) {
 #endif
 }
 
+#elif defined(PIE_PIECE)
+
+// One piece of a table laid in pieces along its rows: rows `first` to
+// `first + rows` of the whole. A landed row whose id (an out-of-range one
+// reading row 0, as the whole table's does) lies in the piece is written
+// from it; the other pieces write the rest.
+[[vk::binding(0)]] StructuredBuffer<int> ids;
+[[vk::binding(1)]] StructuredBuffer<uint> table;
+[[vk::binding(2)]] RWStructuredBuffer<uint> y;
+
+struct Params {
+    int hidden;
+    int vocab;
+    int first;
+    int rows;
+};
+PIE_PARAMS(3, Params, params);
+
+[shader("compute")]
+[numthreads(PIE_GROUP_X, 1, 1)]
+void main(uint3 gid : SV_DispatchThreadID) {
+    uint words = uint(max(params.hidden, 0)) / 2u;
+    uint c = gid.x;
+    uint n = gid.y;
+    if (c >= words) {
+        return;
+    }
+    int raw = ids[n];
+    bool inside = raw >= 0 && raw < params.vocab;
+    int row = (inside ? raw : 0) - params.first;
+    if (row < 0 || row >= params.rows) {
+        return;
+    }
+    y[n * words + c] = table[uint(row) * words + c];
+}
+
 #elif defined(PIE_AFFINE)
 
 #include "prim/affine.slang"
@@ -179,6 +215,7 @@ void main(uint3 gid : SV_DispatchThreadID) {
 
 // pie:instantiate gather_embed_bf16 PIE_EMBED=1 PIE_GROUP_X=256
 // pie:instantiate gather_embed_concat_bf16 PIE_CONCAT=1 PIE_GROUP_X=256
+// pie:instantiate gather_embed_piece_bf16 PIE_PIECE=1 PIE_GROUP_X=256
 // pie:instantiate gather_embed_tabled_bf16 PIE_TABLED=1 PIE_GROUP_X=256
 // pie:instantiate gather_embed_weighted_bf16 PIE_WEIGHTED=1 PIE_GROUP_X=256
 // pie:instantiate gather_embed_affine_bf16_gs_32_b_2 PIE_AFFINE=1 PIE_GROUP=32 PIE_BITS=2 PIE_GROUP_X=256

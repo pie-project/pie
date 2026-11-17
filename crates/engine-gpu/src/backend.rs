@@ -108,6 +108,11 @@ pub trait Context<B: Backend> {
 
     fn cores(&self) -> u32;
 
+    /// Whether the device's memory is the host's (an integrated GPU, or a
+    /// device-local heap the host maps): what it holds is RAM the host and
+    /// every other process draw on too.
+    fn unified_memory(&self) -> bool;
+
     /// What the device has for this load, measured now: what it holds for
     /// the load (every reservation and what the driver holds beside them)
     /// and what it has free, capped by the operator's `budget_device`.
@@ -189,6 +194,12 @@ pub trait Frame<B: Backend>: 'static {
 pub trait Tactics: std::fmt::Debug {
     /// The profile the device resolved to.
     fn profile(&self) -> &profile::Profile;
+
+    /// The longest one submission may run on this device, in nanoseconds,
+    /// as its profile states it; `None` where no limit is known.
+    fn max_submit_ns(&self) -> Option<u64> {
+        None
+    }
 
     /// The `kernel.qmm` ladder at this shape.
     fn qmm_ladder(

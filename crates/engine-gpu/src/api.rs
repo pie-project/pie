@@ -320,7 +320,10 @@ pub fn fault(fault: Fault) -> Error {
         Fault::Residency(_)
         | Fault::Workgroups { .. }
         | Fault::StorageBuffers { .. }
-        | Fault::StageBuffers { .. } => Error::Impossible(fault.to_string()),
+        | Fault::StageBuffers { .. }
+        | Fault::Allocation { .. }
+        | Fault::WorkgroupMemory { .. }
+        | Fault::Pieces { .. } => Error::Impossible(fault.to_string()),
     }
 }
 
@@ -558,7 +561,7 @@ where
                 backend: B::KIND.to_string(),
                 domain: B::domain(&self.boot),
                 sms: shell.cores(),
-                unified_memory: false,
+                unified_memory: shell.unified_memory(),
 
                 fp8_native: false,
                 native_mxfp4_moe: false,

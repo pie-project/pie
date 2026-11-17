@@ -172,6 +172,23 @@ impl<B: Backend> Run<'_, B> {
                 scales: None,
                 concat: false,
                 ..
+            } if let Some(pieces) = self.pieces(*table) => {
+                // A table in pieces along its rows: each piece lands the
+                // rows whose ids it holds.
+                let (ids, y) = (self.tensor(*ids), self.tensor(*y));
+                pieces.iter().try_for_each(|&(first, piece)| {
+                    kernels_slang::gather::embed::embed_piece(self.ctx, ids, piece, first, *vocab, y)
+                })
+            }
+            Gather::Embed {
+                ids,
+                table,
+                vocab,
+                y,
+                weights: None,
+                scales: None,
+                concat: false,
+                ..
             } => match self.banked(*table) {
                 Some(bank) => kernels_slang::gather::embed::embed_banked(
                     self.ctx,

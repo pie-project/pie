@@ -3,6 +3,17 @@ api = 1
 [target]
 assumes = { vendor = "qualcomm", coopmat = false }
 
+# The longest one submission may run: Qualcomm KGSL
+# (github.com/qualcomm-linux/kgsl, gfx-kernel.le.0.0) states
+# adreno_drawobj_timeout = 2000 ms for its legacy dispatcher
+# (adreno_dispatch.c:51); gen8 (Adreno 8xx) runs hwsched with the firmware's
+# HFI_FEATURE_BAIL_OUT_TIMER at its default, and KGSL_PROP_IB_TIMEOUT is no
+# longer in the uapi, so no process can query it. Measured on an Adreno 840:
+# submissions of 2.00 s and 2.32 s completed and the next submit returned
+# VK_ERROR_DEVICE_LOST (the bail-out poisons the context after the overrun).
+[engine]
+submit.max_ms = 2000
+
 [kernel]
 qmm = [
   { when = "rows > 32", use = "register_tiled", bm = 64, k16 = true },

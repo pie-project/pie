@@ -10,6 +10,12 @@ submit.split_rows = [
   { when = "discrete or vendor in (nvidia, amd, intel)", value = 0 },
   { value = 32 },
 ]
+# An Adreno with coopmat lands here too: KGSL takes a submission past 2 s
+# for a hang (qualcomm.toml states the source); no limit is known elsewhere.
+submit.max_ms = [
+  { when = "vendor in (qualcomm)", value = 2000 },
+  { value = 0 },
+]
 
 [kernel]
 gemm.path = [{ when = "coopmat", use = "coopmat" }, { use = "tiled" }]

@@ -10,7 +10,7 @@ pub mod spirv;
 #[cfg(feature = "vulkan")]
 pub use alloc::{Buffer, FileWriter, Memory};
 #[cfg(feature = "vulkan")]
-pub use ctx::{Context, Enabled, Frame, Kept, Pending, present, reservations};
+pub use ctx::{BudgetSource, Context, Enabled, Frame, Kept, Pending, present, reservations};
 #[cfg(feature = "vulkan")]
 pub use pipelines::{Pipeline, Pipelines};
 

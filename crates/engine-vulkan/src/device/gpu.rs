@@ -72,6 +72,10 @@ impl engine_gpu::backend::Context<Api> for Context {
         Context::cores(self)
     }
 
+    fn unified_memory(&self) -> bool {
+        Context::unified_memory(self)
+    }
+
     fn capacity(&self) -> u64 {
         Context::capacity(self)
     }

@@ -14,6 +14,7 @@ pub fn open(config_bytes: &[u8], contract_for: ContractFor) -> Result<Vulkan, St
             pipeline_cache: pipeline_cache(&doc),
             profiles,
             chunk_bytes: None,
+            max_buffer: None,
         },
         contract_for,
     ))

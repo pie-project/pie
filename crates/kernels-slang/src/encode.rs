@@ -122,6 +122,13 @@ pub trait Encode {
     fn naming(&self) -> Option<&dyn Naming> {
         None
     }
+
+    /// The workgroup memory the device gives one workgroup
+    /// (`maxComputeSharedMemorySize`), where the engine reads it: a tactic
+    /// whose kernel declares more is passed over ([`crate::workgroup::fits`]).
+    fn workgroup_limit(&self) -> Option<u32> {
+        None
+    }
 }
 
 /// A sink that takes the kernels a load can fire, before any fire states

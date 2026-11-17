@@ -139,17 +139,63 @@ pub fn act_x_wt(
     w: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
-    dtype_dispatch!(op, act.dtype, { Bf16 => () });
     let (m, n, k) = extent(op, act, w, y)?;
+    fire_columns(ctx, tactic, op, act, w, y, (m, n, k), 0)
+}
+
+/// `y[:, y0 .. y0 + w.rows] = act * w^T` on bf16: one piece of a weight
+/// laid in pieces along its rows (the result's columns) landing its own
+/// columns of the whole result, so no piece sums into another's. The kernel
+/// is the one the whole weight's matmul takes at these rows (picked by the
+/// whole result's width), so a piece's columns are the whole's bits.
+pub fn matmul_slice(
+    ctx: &Ctx<'_>,
+    tactic: Tactic,
+    act: Tensor,
+    w: Tensor,
+    y: Tensor,
+    y0: u32,
+) -> Result<(), Error> {
+    const OP: &str = "linear.matmul";
+    let extent = extent_slice(OP, act, w, y, y0)?;
+    if ctx.target() == Target::Wgsl && !(y0.is_multiple_of(2) && y.width.is_multiple_of(2)) {
+        return Err(refuse(
+            OP,
+            format!(
+                "a piece lands from column {y0} of a {}-wide result: on WGSL every output \
+                 pair is one bf16 word",
+                y.width
+            ),
+        ));
+    }
+    fire_columns(ctx, tactic, OP, act, w, y, extent, y0)
+}
+
+/// Fires `act * w^T` into `n` columns of `y` from `y0`, by the kernel the
+/// whole result's width picks.
+#[allow(clippy::too_many_arguments)]
+fn fire_columns(
+    ctx: &Ctx<'_>,
+    tactic: Tactic,
+    op: &'static str,
+    act: Tensor,
+    w: Tensor,
+    y: Tensor,
+    (m, n, k): (u32, u32, u32),
+    y0: u32,
+) -> Result<(), Error> {
+    dtype_dispatch!(op, act.dtype, { Bf16 => () });
     let target = ctx.target();
+    let width = y.width;
+    let tactic = fitting(ctx, target, tactic, op, width, k)?;
     if let Some(names) = ctx.naming() {
-        return names.either(&kernels(target, tactic, op, n, k)?);
+        return names.either(&kernels(target, tactic, op, width, k)?);
     }
     if m == 0 {
         return Ok(());
     }
     ctx.fire(
-        kernel(target, tactic, op, m, n, k)?,
+        picked(target, tactic, op, m, n, k, width)?,
         &[
             act.arg(),
             w.arg(),
@@ -157,8 +203,34 @@ pub fn act_x_wt(
             stated(op, m)?.arg(),
             stated(op, n)?.arg(),
             stated(op, k)?.arg(),
+            stated(op, width)?.arg(),
+            stated(op, y0)?.arg(),
         ],
     )
+}
+
+/// `tactic`, or the baseline tier where a kernel the projection takes at
+/// its tier declares more workgroup memory than `ctx`'s device gives one
+/// workgroup: the cooperative-matrix tile is passed over for the tiles
+/// below it.
+fn fitting(
+    ctx: &Ctx<'_>,
+    target: Target,
+    tactic: Tactic,
+    op: &'static str,
+    n: u32,
+    k: u32,
+) -> Result<Tactic, Error> {
+    if tactic.tier == Tier::Baseline
+        || kernels(target, tactic, op, n, k)?
+            .iter()
+            .all(|fire| crate::workgroup::fits(ctx, fire))
+    {
+        return Ok(tactic);
+    }
+    Ok(Tactic {
+        tier: Tier::Baseline,
+    })
 }
 
 /// The rows at which the kernel a projection takes changes: [`tile_for`]'s
@@ -188,7 +260,21 @@ fn kernel(
     n: u32,
     k: u32,
 ) -> Result<Fire, Error> {
-    if target == Target::Wgsl && !n.is_multiple_of(2) {
+    picked(target, tactic, op, m, n, k, n)
+}
+
+/// [`kernel`] picked at a result `width` wide, its grid over the `n`
+/// columns it lands (`n` = `width` but for a piece of a weight).
+fn picked(
+    target: Target,
+    tactic: Tactic,
+    op: &'static str,
+    m: u32,
+    n: u32,
+    k: u32,
+    width: u32,
+) -> Result<Fire, Error> {
+    if target == Target::Wgsl && !(n.is_multiple_of(2) && width.is_multiple_of(2)) {
         return Err(refuse(
             op,
             format!(
@@ -197,7 +283,7 @@ fn kernel(
             ),
         ));
     }
-    Ok(match tile_for(target, tactic, m, n, k) {
+    Ok(match tile_for(target, tactic, m, width, k) {
         Kernel::GemvV => Fire::at(GEMM, "linear_gemm_gemv_v_bf16")
             .groups([n.div_ceil(8), 1, 1])
             .group([32, 8, 1]),
@@ -254,7 +340,33 @@ pub fn lane(
     w: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
-    let (m, n, k) = extent(op, act, w, y)?;
+    let extent = extent(op, act, w, y)?;
+    lane_columns(ctx, op, act, w, y, extent, 0)
+}
+
+/// [`lane`] for one piece of a weight laid in pieces along its rows: its
+/// columns of the whole result, from `y0` ([`matmul_slice`]).
+pub fn lane_slice(
+    ctx: &Ctx<'_>,
+    op: &'static str,
+    act: Tensor,
+    w: Tensor,
+    y: Tensor,
+    y0: u32,
+) -> Result<(), Error> {
+    let extent = extent_slice(op, act, w, y, y0)?;
+    lane_columns(ctx, op, act, w, y, extent, y0)
+}
+
+fn lane_columns(
+    ctx: &Ctx<'_>,
+    op: &'static str,
+    act: Tensor,
+    w: Tensor,
+    y: Tensor,
+    (m, n, k): (u32, u32, u32),
+    y0: u32,
+) -> Result<(), Error> {
     if m == 0 {
         return Ok(());
     }
@@ -283,8 +395,35 @@ pub fn lane(
             stated(op, m)?.arg(),
             stated(op, n)?.arg(),
             stated(op, k)?.arg(),
+            stated(op, y.width)?.arg(),
+            stated(op, y0)?.arg(),
         ],
     )
+}
+
+/// Rows, a piece's output columns and contraction: the piece's rows land
+/// columns `y0..` of the result, within it.
+pub(crate) fn extent_slice(
+    op: &'static str,
+    act: Tensor,
+    w: Tensor,
+    y: Tensor,
+    y0: u32,
+) -> Result<(u32, u32, u32), Error> {
+    if act.width == 0 || w.rows == 0 {
+        return Err(refuse(op, "a piece of this projection is empty"));
+    }
+    if w.width != act.width || y0.checked_add(w.rows).is_none_or(|end| end > y.width) {
+        return Err(refuse(
+            op,
+            format!(
+                "a {} x {} piece landing from column {y0} does not lie in a projection {} in, \
+                 {} out",
+                w.rows, w.width, act.width, y.width
+            ),
+        ));
+    }
+    Ok((y.rows, w.rows, act.width))
 }
 
 /// Rows, output columns and contraction, the weight checked against them.

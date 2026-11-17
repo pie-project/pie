@@ -94,6 +94,37 @@ pub enum Fault {
         limit: u32,
     },
 
+    /// One allocation past the largest a device makes.
+    Allocation {
+        bytes: u64,
+
+        /// The device limit that sets the largest, by its Vulkan name.
+        limit: &'static str,
+
+        max: u64,
+    },
+
+    /// A kernel's static workgroup memory past what the device gives one.
+    WorkgroupMemory {
+        kernel: String,
+
+        bytes: u32,
+
+        limit: u32,
+    },
+
+    /// A plane past the largest buffer, which the op reading it cannot read
+    /// in pieces.
+    Pieces {
+        name: String,
+
+        bytes: u64,
+
+        max: u64,
+
+        why: String,
+    },
+
     PatchPayload {
         lane: u32,
 
@@ -303,6 +334,29 @@ impl fmt::Display for Fault {
                 f,
                 "`{kernel}`'s layout declares {binds} storage buffers and this device binds a \
                  shader stage {limit} (`maxPerStageDescriptorStorageBuffers`)"
+            ),
+            Self::Allocation { bytes, limit, max } => write!(
+                f,
+                "an allocation of {bytes} bytes exceeds this device's {limit} of {max} bytes"
+            ),
+            Self::WorkgroupMemory {
+                kernel,
+                bytes,
+                limit,
+            } => write!(
+                f,
+                "`{kernel}` declares {bytes} bytes of workgroup memory and this device gives a \
+                 workgroup {limit} (`maxComputeSharedMemorySize`)"
+            ),
+            Self::Pieces {
+                name,
+                bytes,
+                max,
+                why,
+            } => write!(
+                f,
+                "`{name}` is {bytes} bytes, past this device's largest buffer of {max} bytes, \
+                 and {why}"
             ),
             Self::PatchPayload {
                 lane,

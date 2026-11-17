@@ -616,17 +616,32 @@ impl<B: Backend> Pools<B> {
             u64::from(list.per_chunk) * u64::from(layout.total_chunks)
         });
         let host = if B::MAPS_HOST {
-            HostChunks::Mapped(
-                (host_chunks > 0)
-                    .then(|| {
-                        B::Buffer::host(
-                            device,
-                            u64::from(host_chunks) * layout.chunk_bytes,
-                            crate::books::owners::HOST_POOL,
-                        )
-                    })
-                    .transpose()?,
-            )
+            // As many chunks a buffer as the largest buffer holds, as the
+            // device's segments are laid.
+            let per = layout.chunk_bytes.max(1);
+            let per = u32::try_from(device.max_buffer() / per).unwrap_or(u32::MAX);
+            if host_chunks > 0 && per == 0 {
+                return Err(Fault::Allocation {
+                    bytes: layout.chunk_bytes,
+                    limit: "largest buffer",
+                    max: device.max_buffer(),
+                });
+            }
+            let mut buffers = Vec::new();
+            let mut left = host_chunks;
+            while left > 0 {
+                let chunks = left.min(per);
+                buffers.push(B::Buffer::host(
+                    device,
+                    u64::from(chunks) * layout.chunk_bytes,
+                    crate::books::owners::HOST_POOL,
+                )?);
+                left -= chunks;
+            }
+            HostChunks::Mapped {
+                buffers,
+                per: per.max(1),
+            }
         } else {
             HostChunks::Heap(vec![
                 0u8;
@@ -1327,12 +1342,8 @@ impl<B: Backend> Pools<B> {
             }
             (src, MemoryDomain::HostPinned) if here(src) => {
                 let bytes = self.shape(copy.shape)?.slot_bytes;
-                let host = match &self.host {
-                    HostChunks::Mapped(host) => host.as_ref().ok_or(Fault::Ceiling {
-                        what: "host chunks of the state pool",
-                        need: 1,
-                        have: 0,
-                    })?,
+                match &self.host {
+                    HostChunks::Mapped { .. } => (),
                     HostChunks::Heap(_) => {
                         let bytes = usize::try_from(bytes).unwrap_or(0);
                         for &(slot, at) in &copy.slots {
@@ -1347,27 +1358,18 @@ impl<B: Backend> Pools<B> {
                         }
                         return Ok(());
                     }
-                };
+                }
                 for &(slot, at) in &copy.slots {
                     let (buffer, local) = self.pool.locate(self.slot_offset(copy.shape, slot)?)?;
-                    frame.copy(
-                        buffer,
-                        local,
-                        host,
-                        self.host_offset(copy.shape, at)?,
-                        bytes,
-                    )?;
+                    let (host, host_at) = self.host.locate(self.host_offset(copy.shape, at)?, self.layout.chunk_bytes)?;
+                    frame.copy(buffer, local, host, host_at, bytes)?;
                 }
                 Ok(())
             }
             (MemoryDomain::HostPinned, dst) if here(dst) => {
                 let bytes = self.shape(copy.shape)?.slot_bytes;
-                let host = match &self.host {
-                    HostChunks::Mapped(host) => host.as_ref().ok_or(Fault::Ceiling {
-                        what: "host chunks of the state pool",
-                        need: 1,
-                        have: 0,
-                    })?,
+                match &self.host {
+                    HostChunks::Mapped { .. } => (),
                     HostChunks::Heap(_) => {
                         let bytes = usize::try_from(bytes).unwrap_or(0);
                         for &(at, slot) in &copy.slots {
@@ -1381,16 +1383,11 @@ impl<B: Backend> Pools<B> {
                         }
                         return Ok(());
                     }
-                };
+                }
                 for &(at, slot) in &copy.slots {
                     let (buffer, local) = self.pool.locate(self.slot_offset(copy.shape, slot)?)?;
-                    frame.copy(
-                        host,
-                        self.host_offset(copy.shape, at)?,
-                        buffer,
-                        local,
-                        bytes,
-                    )?;
+                    let (host, host_at) = self.host.locate(self.host_offset(copy.shape, at)?, self.layout.chunk_bytes)?;
+                    frame.copy(host, host_at, buffer, local, bytes)?;
                 }
                 Ok(())
             }
@@ -1429,12 +1426,8 @@ impl<B: Backend> Pools<B> {
     /// caller has drained every frame.
     pub fn read_tier_slots(&self, slots: &[(ShapeId, Vec<u32>)]) -> Result<Vec<u8>> {
         let spans = self.tier_spans(slots)?;
-        let host = match &self.host {
-            HostChunks::Mapped(host) => host.as_ref().ok_or(Fault::Ceiling {
-                what: "host chunks of the state pool",
-                need: 1,
-                have: 0,
-            })?,
+        match &self.host {
+            HostChunks::Mapped { .. } => (),
             HostChunks::Heap(host) => {
                 let mut out = Vec::new();
                 for (offset, len) in spans {
@@ -1451,13 +1444,14 @@ impl<B: Backend> Pools<B> {
                 }
                 return Ok(out);
             }
-        };
+        }
         let total: u64 = spans.iter().map(|&(_, len)| len).sum();
         let mut out = vec![0u8; usize::try_from(total).unwrap_or(usize::MAX)];
         let mut at = 0usize;
         for (offset, len) in spans {
             let len = usize::try_from(len).unwrap_or(usize::MAX);
-            host.read(offset, &mut out[at..at + len])?;
+            let (host, local) = self.host.locate(offset, self.layout.chunk_bytes)?;
+            host.read(local, &mut out[at..at + len])?;
             at += len;
         }
         Ok(out)
@@ -1484,12 +1478,9 @@ impl<B: Backend> Pools<B> {
                 self.frozen.written(frozen::Tier::Host, refs);
             }
         }
-        let host = match &mut self.host {
-            HostChunks::Mapped(host) => host.as_mut().ok_or(Fault::Ceiling {
-                what: "host chunks of the state pool",
-                need: 1,
-                have: 0,
-            })?,
+        let chunk_bytes = self.layout.chunk_bytes;
+        match &mut self.host {
+            HostChunks::Mapped { .. } => (),
             HostChunks::Heap(host) => {
                 let have = host.len() as u64;
                 if let Some(&(offset, len)) =
@@ -1510,11 +1501,12 @@ impl<B: Backend> Pools<B> {
                 }
                 return Ok(());
             }
-        };
+        }
         let mut at = 0usize;
         for (offset, len) in spans {
             let len = usize::try_from(len).unwrap_or(usize::MAX);
-            host.write(offset, &bytes[at..at + len])?;
+            let (host, local) = self.host.locate_mut(offset, chunk_bytes)?;
+            host.write(local, &bytes[at..at + len])?;
             at += len;
         }
         Ok(())
@@ -1649,8 +1641,42 @@ impl<B: Backend> Pools<B> {
 /// and written through the queue.
 #[derive(Debug)]
 enum HostChunks<B: Backend> {
-    Mapped(Option<B::Buffer>),
+    /// `per` chunks a buffer, each buffer no larger than the device's
+    /// largest.
+    Mapped { buffers: Vec<B::Buffer>, per: u32 },
     Heap(Vec<u8>),
+}
+
+impl<B: Backend> HostChunks<B> {
+    /// The mapped buffer host byte `offset` lies in, and where in it.
+    fn locate(&self, offset: u64, chunk_bytes: u64) -> Result<(&B::Buffer, u64)> {
+        let HostChunks::Mapped { buffers, per } = self else {
+            unreachable!("only mapped host chunks are located in a buffer")
+        };
+        let span = u64::from(*per) * chunk_bytes;
+        let at = usize::try_from(offset / span.max(1)).unwrap_or(usize::MAX);
+        let buffer = buffers.get(at).ok_or(Fault::Ceiling {
+            what: "host chunks of the state pool",
+            need: offset / chunk_bytes.max(1) + 1,
+            have: buffers.len() as u64 * u64::from(*per),
+        })?;
+        Ok((buffer, offset % span.max(1)))
+    }
+
+    fn locate_mut(&mut self, offset: u64, chunk_bytes: u64) -> Result<(&mut B::Buffer, u64)> {
+        let HostChunks::Mapped { buffers, per } = self else {
+            unreachable!("only mapped host chunks are located in a buffer")
+        };
+        let span = u64::from(*per) * chunk_bytes;
+        let at = usize::try_from(offset / span.max(1)).unwrap_or(usize::MAX);
+        let have = buffers.len() as u64 * u64::from(*per);
+        let buffer = buffers.get_mut(at).ok_or(Fault::Ceiling {
+            what: "host chunks of the state pool",
+            need: offset / chunk_bytes.max(1) + 1,
+            have,
+        })?;
+        Ok((buffer, offset % span.max(1)))
+    }
 }
 
 /// The bytes a batched spill stages at once.

@@ -6,10 +6,15 @@ PIE_SLOTS_RO(1, w);
 #endif
 PIE_SLOTS_RW(2, out_);
 
+// `ldy` is the result's row pitch and `y0` the column it lands from: a
+// weight laid in pieces along its rows lands each piece's columns of the
+// whole result (`ldy` = `n`, `y0` = 0 where the weight is whole).
 struct Params {
     int m;
     int n;
     int k;
+    int ldy;
+    int y0;
 };
 PIE_PARAMS(3, Params, params);
 
@@ -27,7 +32,7 @@ void write_out(uint row, uint col, float acc) {
     if (row >= uint(params.m) || col >= uint(params.n)) {
         return;
     }
-    slot_put(out_, row * uint(params.n) + col, acc);
+    slot_put(out_, row * uint(params.ldy) + uint(params.y0) + col, acc);
 }
 
 #if defined(PIE_GEMV)
@@ -151,7 +156,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     }
     if (klane == 0u && col < n) {
         [ForceUnroll] for (uint r = 0u; r < PIE_VROWS; r++) {
-            if (r < m) slot_put(out_, r * n + col, partial[(clane * PIE_VROWS + r) * PIE_KLANES]);
+            if (r < m) slot_put(out_, r * uint(params.ldy) + uint(params.y0) + col, partial[(clane * PIE_VROWS + r) * PIE_KLANES]);
         }
     }
 }

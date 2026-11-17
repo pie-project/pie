@@ -105,6 +105,13 @@ pub trait Serve: Backend {
     /// binding's offset.
     fn table_align(device: &Self::Context) -> u64;
 
+    /// The workgroup memory the device gives one workgroup, where the API
+    /// reports it: what a naming load holds tactics to, as the device's own
+    /// sink does ([`kernels_slang::Encode::workgroup_limit`]).
+    fn workgroup_limit(_device: &Self::Context) -> Option<u32> {
+        None
+    }
+
     /// Opens the device (adopting `handed` where the host handed one) and
     /// its tuning.
     /// Opens the device (adopting `handed` where the host handed one), of
@@ -713,6 +720,10 @@ pub struct Shell<B: Serve> {
     /// The rungs the load weighed its top by, and the estimate, where the
     /// profile states rates.
     weighed: Option<Weighed>,
+    /// The widest fire, in tokens, whose estimated time stays under the
+    /// device's submission limit whole; a wider one is submitted a layer at
+    /// a time ([`crate::top::submit_limit`]). `None` where no limit is known.
+    pub submit_whole: Option<u32>,
     pools: Pools<B>,
     /// The weight cache's row tables (PLE), streamed through pool slots.
     pub row_caches: crate::store::rows::RowCaches<B>,
@@ -1065,6 +1076,16 @@ impl<B: Serve> Shell<B> {
         };
         let mut chosen: Option<Option<engine::load::TopRung>> = None;
         let mut weighed: Option<Weighed> = None;
+        // The layers a fire is cut into where it passes the submission limit
+        // whole, and the widest rung whose fire stays under it whole.
+        let layers = boot
+            .trace
+            .nodes
+            .iter()
+            .filter_map(|node| node.layer)
+            .max()
+            .map_or(1, |last| last + 1);
+        let mut submit_whole: Option<u32> = None;
         let (compiled, mut span) = loop {
             let compiled = compile_axes(&boot.trace, &budgets, &profile)?;
             // The rungs the rung lattice offers up to this load's top and the
@@ -1100,13 +1121,26 @@ impl<B: Serve> Shell<B> {
                 .collect();
             // The kernels a fire issues: the compiled plan's launches.
             let launches = u32::try_from(compiled.template().len()).unwrap_or(u32::MAX);
-            let rungs = crate::top::rung_facts(
+            let mut rungs = crate::top::rung_facts(
                 &spans,
                 budgets.tokens.max_lanes,
                 binding,
                 launches,
                 &padded,
             );
+            // No submission may run past the device's limit: a rung whose
+            // fire passes it even a layer a submission is no rung, and a
+            // fire past it whole is cut a layer a submission.
+            if let Some(limit) = tuning.max_submit_ns()
+                && let Ok(estimate) = crate::top::estimate(&counts, &device_profile.rates())
+            {
+                submit_whole = crate::top::submit_limit(
+                    &mut rungs,
+                    |rung| estimate.ns(rung),
+                    layers,
+                    Some(limit),
+                );
+            }
             if weighed.is_none() {
                 weighed = crate::top::estimate(&counts, &device_profile.rates())
                     .ok()
@@ -1638,6 +1672,7 @@ impl<B: Serve> Shell<B> {
             weights,
             span,
             weighed,
+            submit_whole,
             pools,
             row_caches,
             expert_caches,
@@ -2132,6 +2167,11 @@ impl<B: Serve> Shell<B> {
     #[must_use]
     pub fn max_buffer(&self) -> u64 {
         self.device.max_buffer()
+    }
+
+    #[must_use]
+    pub fn unified_memory(&self) -> bool {
+        self.device.unified_memory()
     }
 
     /// What the device has for this load, measured now.
@@ -4661,6 +4701,10 @@ impl<S: kernels_slang::Encode> kernels_slang::Encode for Encoded<S> {
 
     fn absent(&self) -> std::result::Result<kernels_slang::ArgValue, kernels_slang::Error> {
         self.0.absent()
+    }
+
+    fn workgroup_limit(&self) -> Option<u32> {
+        self.0.workgroup_limit()
     }
 
     fn target(&self) -> kernels_slang::Target {

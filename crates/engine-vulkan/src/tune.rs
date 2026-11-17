@@ -767,6 +767,7 @@ fn bench_qmm(
         .wrong
         .iter()
         .map(|(body, n, first)| format!("{body}: wrong at {n} points; first at {first}"))
+        .chain(measured.refused.iter().cloned())
         .collect();
     Ok((fitted, lines, wrong))
 }

@@ -18,10 +18,17 @@ pub enum WeightRow {
     Dense(Tensor),
 
     Planes(Bank),
+
+    /// A dense plane past the device's largest buffer, laid in pieces along
+    /// its rows: `count` pieces from `at` of the table's pieces, in row
+    /// order ([`Run::pieces`]).
+    Pieces { at: u32, count: u32 },
 }
 
+/// The weights by param, and the pieces of every plane laid in pieces, each
+/// its first row and its rows as a tensor.
 #[derive(Clone, Debug, Default)]
-pub struct WeightTable(pub Vec<Option<WeightRow>>);
+pub struct WeightTable(pub Vec<Option<WeightRow>>, pub Vec<(u32, Tensor)>);
 
 /// A fire's carve: each value's rectangle, and the lanes its capture
 /// planes hold a row for.
@@ -757,6 +764,10 @@ impl<'c, B: Backend> Run<'c, B> {
                         "value {at} is weight {row}, a split-plane bank; it resolves \
                          through `Run::planes`, never as one dense handle"
                     ),
+                    Some(WeightRow::Pieces { .. }) => panic!(
+                        "value {at} is weight {row}, laid in pieces past the device's largest \
+                         buffer; it resolves through `Run::pieces`, never as one handle"
+                    ),
                     None => panic!("value {at} is weight {row}, which the shell has not bound"),
                 }
             }
@@ -852,6 +863,20 @@ impl<'c, B: Backend> Run<'c, B> {
         ))
     }
 
+    /// Weight value `id`'s pieces where the load laid it in pieces past the
+    /// device's largest buffer: each piece's first row and its rows.
+    pub fn pieces(&self, id: ValueId) -> Option<&'c [(u32, Tensor)]> {
+        let Def::Weight(w) = &self.values[id.0 as usize].def else {
+            return None;
+        };
+        match self.weights.0.get(*w as usize).copied().flatten() {
+            Some(WeightRow::Pieces { at, count }) => {
+                self.weights.1.get(at as usize..(at + count) as usize)
+            }
+            _ => None,
+        }
+    }
+
     pub fn banked(&self, id: ValueId) -> Option<Bank> {
         let at = id.0 as usize;
         let Def::Weight(w) = &self.values[at].def else {
@@ -860,7 +885,7 @@ impl<'c, B: Backend> Run<'c, B> {
         let row = *w as usize;
         match self.weights.0.get(row).copied().flatten() {
             Some(WeightRow::Planes(bank)) => Some(Bank { ..bank }),
-            Some(WeightRow::Dense(_)) => None,
+            Some(WeightRow::Dense(_) | WeightRow::Pieces { .. }) => None,
             None => panic!("value {at} is weight {row}, which the shell has not bound"),
         }
     }

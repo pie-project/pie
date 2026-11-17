@@ -12,7 +12,54 @@ impl<B: Backend> DispatchLinear for Run<'_, B> {
 }
 
 impl<B: Backend> Run<'_, B> {
+    /// `act * w^T` where weight `w` lies in pieces along its rows: one
+    /// dispatch a piece, each landing its own columns of `y` (split along
+    /// the outputs, so nothing sums across pieces). `None` where `w` is no
+    /// plane in pieces.
+    fn in_pieces(
+        &self,
+        act: poem_ir::ValueId,
+        w: poem_ir::ValueId,
+        y: poem_ir::ValueId,
+    ) -> Option<Result<(), kernels_slang::Error>> {
+        let pieces = self.pieces(w)?;
+        let (act, y) = (self.tensor(act), self.tensor(y));
+        let lane = act.dtype == poem_ir::Dtype::F32;
+        Some(pieces.iter().try_for_each(|&(first, piece)| {
+            if lane {
+                kernels_slang::linear::gemm::lane_slice(
+                    self.ctx,
+                    "linear.matmul",
+                    act,
+                    piece,
+                    y,
+                    first,
+                )
+            } else {
+                kernels_slang::linear::gemm::matmul_slice(
+                    self.ctx,
+                    self.gemm_tactic(),
+                    act,
+                    piece,
+                    y,
+                    first,
+                )
+            }
+        }))
+    }
+
     fn linear(&mut self, op: &Linear) -> Result<(), kernels_slang::Error> {
+        if let Linear::Matmul {
+            act,
+            w,
+            y,
+            quant: None,
+            ..
+        } = op
+            && let Some(fired) = self.in_pieces(*act, *w, *y)
+        {
+            return fired;
+        }
         match op {
             Linear::Relu2 { .. } => Err(kernels_slang::Error::Unsupported { op: op.name() }),
             Linear::Matmul {

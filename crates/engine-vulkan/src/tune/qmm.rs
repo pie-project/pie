@@ -232,6 +232,29 @@ pub struct Measured {
     pub points: Vec<Point>,
     /// Each candidate that answered wrongly: how many points, and the first.
     pub wrong: Vec<(String, usize, String)>,
+    /// Each point a candidate was not run at, as its time extrapolated from
+    /// a smaller row count passes the device's submission limit, and why.
+    pub refused: Vec<String>,
+}
+
+/// Whether candidate `name` is refused unrun at `rows` rows: its seconds a
+/// launch at the widest row count it ran below (`ran`: rows, seconds, and
+/// the spread of its timings there) scaled to `rows` and grown by that
+/// spread pass the device's submission limit (`limit_ns`). The first row count a
+/// candidate meets has nothing to scale from and always runs.
+#[must_use]
+pub fn refused_at(
+    name: &str,
+    ran: Option<(u32, f64, f64)>,
+    rows: u32,
+    limit_ns: Option<u64>,
+) -> Option<String> {
+    let (from, seconds, spread) = ran?;
+    let ns = engine_gpu::rates::with_spread(
+        engine_gpu::rates::extrapolate(from, (seconds * 1e9) as u64, rows),
+        spread,
+    );
+    engine_gpu::rates::past_submit_limit(&format!("{name} at m = {rows}"), ns, limit_ns)
 }
 
 impl Measured {
@@ -402,6 +425,10 @@ mod device {
         fn target(&self) -> Target {
             self.inner.target()
         }
+
+        fn workgroup_limit(&self) -> Option<u32> {
+            self.inner.workgroup_limit()
+        }
     }
 
     fn noise(at: u64) -> u8 {
@@ -553,6 +580,7 @@ mod device {
             }
         }
         let today = Tuning::new(base.clone(), limits);
+        let limit = base.get::<crate::chip::MaxSubmitMs>().ns();
 
         let handles = Handles::<Api>::new();
         let pipelines = Pipelines::new();
@@ -592,6 +620,10 @@ mod device {
                     done += grid.rows.len();
                     continue;
                 }
+                // Each candidate's seconds a launch at the widest row count
+                // it ran so far at this shape, or that it was refused.
+                let mut ran: Vec<Option<(u32, f64, f64)>> = vec![None; kept.len()];
+                let mut stopped = vec![false; kept.len()];
                 let w = match weights(device, &handles, n, k, *bank) {
                     Ok(w) => w,
                     Err(why) => {
@@ -629,7 +661,14 @@ mod device {
                     let mut live: Vec<usize> = Vec::new();
                     for (c, q) in kept.iter().enumerate() {
                         let t = &forced[c];
-                        if !q.fits(&t.qmm_at(m, n, k, bank.bits, bank.group)) {
+                        if stopped[c] || !q.fits(&t.qmm_at(m, n, k, bank.bits, bank.group)) {
+                            continue;
+                        }
+                        if let Some(why) = super::refused_at(kernel(q), ran[c], m, limit) {
+                            let why = format!("{n} x {k}, {}-bit g{}: {why}", bank.bits, bank.group);
+                            say(&format!("  {why}"));
+                            out.refused.push(why);
+                            stopped[c] = true;
                             continue;
                         }
                         let frame = device.frame().map_err(|e| e.to_string())?;
@@ -664,12 +703,13 @@ mod device {
                         }
                         live.push(c);
                     }
-                    let times = time(device, &pipelines, &handles, &live, |sink, c, copy| {
+                    let times = time(device, &pipelines, &handles, &live, limit, |sink, c, copy| {
                         launch(sink, &forced[c], copy)
                     })?;
                     let mut row = vec![None; kept.len()];
-                    for (c, t) in live.iter().zip(times) {
+                    for (c, (t, spread)) in live.iter().zip(times) {
                         row[*c] = Some(t);
+                        ran[*c] = Some((m, t, spread));
                     }
                     let at = today.qmm_at(m, n, k, bank.bits, bank.group);
                     let baseline = today
@@ -735,14 +775,16 @@ mod device {
     }
 
     /// Seconds per launch for each of `live`, timed round-robin so drift
-    /// lands on every candidate alike.
+    /// lands on every candidate alike, and the spread of its timings (range
+    /// over median).
     fn time(
         device: &Context,
         pipelines: &Pipelines,
         handles: &Handles<Api>,
         live: &[usize],
+        limit: Option<u64>,
         launch: impl Fn(&dyn Encode, usize, usize) -> Result<(), Error>,
-    ) -> Result<Vec<f64>, String> {
+    ) -> Result<Vec<(f64, f64)>, String> {
         const ROUNDS: usize = 7;
         const FRAME_S: f64 = 0.002;
         /// A candidate this much slower than the fastest is timed once.
@@ -762,10 +804,20 @@ mod device {
             once.push(frame(c, 1)?);
         }
         let fastest = once.iter().copied().fold(f64::INFINITY, f64::min);
-        let timed: Vec<bool> = once.iter().map(|&t| t <= fastest * SLOWER).collect();
+        // One past the submission limit ran once and runs no more.
+        let timed: Vec<bool> = once
+            .iter()
+            .map(|&t| t <= fastest * SLOWER && limit.is_none_or(|ns| t * 1e9 <= ns as f64))
+            .collect();
+        // A frame is no longer than the submission limit holds either.
         let batch: Vec<usize> = once
             .iter()
-            .map(|&one| ((FRAME_S / one.max(1e-7)) as usize).clamp(1, 256))
+            .map(|&one| {
+                let most = limit.map_or(256, |ns| {
+                    usize::try_from(ns / ((one * 1e9) as u64).max(1)).unwrap_or(256)
+                });
+                ((FRAME_S / one.max(1e-7)) as usize).clamp(1, most.clamp(1, 256))
+            })
             .collect();
         let mut seen: Vec<Vec<f64>> = once.iter().map(|&t| vec![t]).collect();
         for _ in 0..ROUNDS {
@@ -784,7 +836,9 @@ mod device {
             .into_iter()
             .map(|mut s| {
                 s.sort_by(f64::total_cmp);
-                s[s.len() / 2]
+                let median = s[s.len() / 2];
+                let spread = (s[s.len() - 1] - s[0]) / median.max(1e-12);
+                (median, spread)
             })
             .collect())
     }
@@ -793,6 +847,24 @@ mod device {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fake timing: tiled ran 0.55 s a launch at 32 rows; at 64 it is
+    /// estimated ~1.1 s and runs under a 2 s limit, at 128 ~2.2 s and is
+    /// refused unrun. A first row count always runs.
+    #[test]
+    fn a_candidate_extrapolated_past_the_submit_limit_is_refused_unrun() {
+        let limit = Some(2_000_000_000);
+        assert_eq!(refused_at("tiled", None, 512, limit), None);
+        assert_eq!(refused_at("tiled", Some((32, 0.55, 0.0)), 64, limit), None);
+        let why = refused_at("tiled", Some((32, 0.55, 0.0)), 128, limit).expect("refused");
+        assert!(why.starts_with("tiled at m = 128 would take ~2.2 s"), "{why}");
+        assert_eq!(refused_at("tiled", Some((32, 0.55, 0.0)), 128, None), None);
+        // At 0.9 s a launch, 64 rows is ~1.8 s, past the limit only once
+        // the 17% spread its timings showed is held against it.
+        assert_eq!(refused_at("tiled", Some((32, 0.9, 0.0)), 64, limit), None);
+        let why = refused_at("tiled", Some((32, 0.9, 0.17)), 64, limit).expect("refused");
+        assert!(why.starts_with("tiled at m = 64 would take ~2.1 s"), "{why}");
+    }
 
     #[test]
     fn every_candidate_forces_a_ladder_the_registry_reads() {
@@ -848,6 +920,7 @@ mod tests {
                 point(512, vec![Some(1.0), Some(9.0), Some(9.0)]),
             ],
             wrong: Vec::new(),
+            refused: Vec::new(),
         };
         let back = Measured::from_text(&measured.to_text("Test GPU"), &candidates).unwrap();
         assert_eq!(back.points.len(), 3);

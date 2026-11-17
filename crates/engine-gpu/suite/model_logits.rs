@@ -300,7 +300,7 @@ fn load_alone(
 ) -> Option<Shell> {
     let device = DeviceBoot {
         chunk_bytes: chunk,
-        ..DeviceBoot::default()
+        ..backend::device_boot()
     };
     let residency = allowed(&device, residency)?;
     Some(
@@ -456,6 +456,85 @@ fn seats(model: &str, layers: Option<u32>) {
     dump(&format!("seats-{model}"), &rows);
 }
 
+/// The planes a fire reads whole at the model's edges: the embedding's
+/// table and the logits head's weight.
+fn edge_planes(trace: &Trace) -> Vec<usize> {
+    use poem_ir::{Def, Gather, Linear, Operation};
+    let weight = |v: poem_ir::ValueId| match trace.values.get(v.0 as usize).map(|v| &v.def) {
+        Some(Def::Weight(w)) => Some(*w as usize),
+        _ => None,
+    };
+    let mut out: Vec<usize> = trace
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.op {
+            Operation::Gather(Gather::Embed {
+                table,
+                concat: false,
+                ..
+            }) => weight(*table),
+            Operation::Linear(Linear::Matmul {
+                w, logits: true, ..
+            }) => weight(*w),
+            _ => None,
+        })
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// A miniature whose embedding table and logits head lie past the device's
+/// largest buffer (lowered through the boot's `max_buffer`, the same field a
+/// smaller device's limit sets) lays them in pieces along their rows, and
+/// serves the logits it serves whole, bit for bit.
+#[test]
+fn a_table_and_head_in_pieces_serve_the_logits_whole_ones_do() {
+    const STEPS: usize = 6;
+    // A vocabulary wide enough (248k) that its table outweighs every other
+    // plane.
+    let fixture = fixture("qwen35-tiny", None);
+    let bytes = engine_gpu::weights::plane_bytes(&fixture.trace).expect("plane bytes");
+    let edges = edge_planes(&fixture.trace);
+    assert!(!edges.is_empty(), "the miniature reads an embedding table");
+    let smallest_edge = edges.iter().map(|&at| bytes[at]).min().expect("an edge");
+    let widest_edge = edges.iter().map(|&at| bytes[at]).max().expect("an edge");
+    let widest_other = (0..bytes.len())
+        .filter(|at| !edges.contains(at))
+        .map(|at| bytes[at].next_multiple_of(256))
+        .max()
+        .unwrap_or(0);
+    // Every other plane whole, each edge plane in pieces.
+    let cap = widest_other.max((widest_edge / 2).next_multiple_of(4096));
+    assert!(
+        cap < smallest_edge,
+        "the miniature's edge planes ({smallest_edge} bytes) are no wider than its others \
+         ({widest_other}): nothing to lay in pieces"
+    );
+
+    let whole = {
+        let Some(mut shell) = load(&fixture, CONTEXT) else {
+            return;
+        };
+        serve_seats(&mut shell, &fixture.trace, STEPS)
+    };
+    let pieces = {
+        let _alone = loading();
+        let device = DeviceBoot {
+            max_buffer: Some(cap),
+            ..backend::device_boot()
+        };
+        let Some(residency) = allowed(&device, engine::load::Residency::default()) else {
+            return;
+        };
+        let mut shell = Shell::load(boot(&fixture, PAGE, CONTEXT, &device, residency))
+            .unwrap_or_else(|why| panic!("the shell loads under a {cap}-byte buffer: {why}"));
+        assert_eq!(shell.max_buffer(), cap, "the boot's buffer limit is the device's");
+        serve_seats(&mut shell, &fixture.trace, STEPS)
+    };
+    same("planes in pieces", &pieces, &whole);
+}
+
 #[test]
 fn a_dense_miniature_serves_two_lanes() {
     seats("qwen3-micro-text", None);
@@ -544,7 +623,7 @@ fn every_rung_fires_what_the_load_built(model: &str) {
 /// kernels, the same bound and the same classes the kernels refuse.
 fn every_rung_names_what_the_largest_names(model: &str) {
     let fixture = fixture(model, None);
-    let device = DeviceBoot::default();
+    let device = backend::device_boot();
     let _alone = loading();
     let Some(residency) = allowed(&device, engine::load::Residency::default()) else {
         return;
@@ -800,7 +879,7 @@ fn state_lent_in_the_span_outlives_a_narrow_rungs_fires() {
     ) else {
         return;
     };
-    let device = <backend::Api as engine_gpu::api::Host>::domain(&DeviceBoot::default());
+    let device = <backend::Api as engine_gpu::api::Host>::domain(&backend::device_boot());
     // The prefills take the top rung; the decodes after them two lanes.
     let mut fed: [Vec<u32>; 2] = prompts();
     let mut held = [0u32; 2];

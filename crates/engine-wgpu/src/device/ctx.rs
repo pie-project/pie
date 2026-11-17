@@ -525,7 +525,7 @@ impl Context {
             engine_gpu::books::owners::DUMMY,
         )?;
         let context = Context {
-            max_buffer,
+            max_buffer: boot.max_buffer.map_or(max_buffer, |cap| cap.min(max_buffer)),
             core,
             dummy,
             device_index: boot.adapter_index,
@@ -575,6 +575,16 @@ impl Context {
     #[must_use]
     pub fn cores(&self) -> u32 {
         crate::chip::UNREPORTED_CORES
+    }
+
+    /// Whether the adapter's memory is the host's: an integrated GPU, or
+    /// the CPU itself, by the type the adapter reports.
+    #[must_use]
+    pub fn unified_memory(&self) -> bool {
+        matches!(
+            self.core.info.device_type,
+            wgpu::DeviceType::IntegratedGpu | wgpu::DeviceType::Cpu
+        )
     }
 
     /// The alignment a guest table takes in its pool slot: 16 at least, and

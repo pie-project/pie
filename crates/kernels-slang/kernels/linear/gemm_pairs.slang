@@ -16,10 +16,15 @@
 [[vk::binding(1)]] StructuredBuffer<uint> w;
 [[vk::binding(2)]] RWStructuredBuffer<uint> out_;
 
+// `ldy` is the result's row pitch and `y0` the column it lands from: a
+// weight laid in pieces along its rows lands each piece's columns of the
+// whole result (`ldy` = `n`, `y0` = 0 where the weight is whole).
 struct Params {
     int m;
     int n;
     int k;
+    int ldy;
+    int y0;
 };
 PIE_PARAMS(3, Params, params);
 
@@ -35,7 +40,7 @@ void write_pair(uint row, uint col, float lo, float hi) {
     if (row >= uint(params.m) || col >= uint(params.n)) {
         return;
     }
-    out_[(row * uint(params.n) + col) >> 1] = pack_bf16(lo, hi);
+    out_[(row * uint(params.ldy) + uint(params.y0) + col) >> 1] = pack_bf16(lo, hi);
 }
 
 #if defined(PIE_GEMV)

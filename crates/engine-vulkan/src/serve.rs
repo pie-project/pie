@@ -73,6 +73,10 @@ impl Serve for Api {
         device.table_align()
     }
 
+    fn workgroup_limit(device: &Context) -> Option<u32> {
+        Some(device.limits().shared_bytes)
+    }
+
     fn open(
         boot: &crate::api::DeviceBoot,
         allowance: engine::Allowance,
@@ -255,8 +259,11 @@ impl Serve for Api {
             .get::<crate::chip::SubmitSplitRows>()
             .0;
         // Whole, a 512x512 VAE decode outlasts one Adreno submission and loses the device.
-        let split = (split_rows > 0
-            && prepared.seats.iter().map(|seat| seat.rows).sum::<u32>() >= split_rows)
+        // A fire whose estimate passes the device's submission limit whole
+        // is cut a layer a submission too.
+        let rows = prepared.seats.iter().map(|seat| seat.rows).sum::<u32>();
+        let split = (split_rows > 0 && rows >= split_rows)
+            || shell.submit_whole.is_some_and(|whole| rows > whole)
             || prepared.bindings.voxels.is_some();
         let keep = key.filter(|_| !split && shell.shelf.recorder.has_room());
         Ok(Plan::Walk { keep, split })
