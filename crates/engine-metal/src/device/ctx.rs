@@ -608,7 +608,6 @@ impl Frame {
     }
 
     #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
-    #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
     #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
     pub(crate) fn fill(&mut self, slab: &super::alloc::Slab, at: u64, len: u64) -> Result<()> {
         #[cfg(target_vendor = "apple")]
