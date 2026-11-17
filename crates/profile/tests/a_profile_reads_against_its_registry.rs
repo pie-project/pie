@@ -957,11 +957,21 @@ fn a_device_file_states_its_rates_and_a_layer_above_replaces_them() {
     let dir = std::env::temp_dir().join(format!("pie-shelf-rates-{}", std::process::id()));
     let path = shelf.user_path(&dir, "Apple M9");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(&path, "api = 1\n[rates]\nlaunch_ns = 9000\n").unwrap();
+    // The user's layer (a load's measurement saved there) fills the key
+    // the checked-in file lacks, and a checked-in value wins over its own.
+    std::fs::write(
+        &path,
+        "api = 1\n[rates]\nlaunch_ns = 9000\nhbm_gbps = 999.0\n",
+    )
+    .unwrap();
     let (p, _) = shelf.resolve(&r, "Apple M9", &facts(11, true), Some(&dir));
     std::fs::remove_dir_all(&dir).unwrap();
-    assert_eq!(p.rates().hbm_gbps, Some(400.0), "kept key by key");
-    assert_eq!(p.rates().launch_ns, Some(9000));
+    assert_eq!(p.rates().hbm_gbps, Some(400.0), "the checked-in value wins");
+    assert_eq!(
+        p.rates().launch_ns,
+        Some(9000),
+        "the saved value fills the gap"
+    );
 
     // A dump carries them, and reads back.
     let text = profile::render::dump(&p);
