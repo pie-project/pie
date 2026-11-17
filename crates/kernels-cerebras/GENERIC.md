@@ -2656,6 +2656,31 @@ milestone's tail.
       linked program and wafer-bench, the same sif) and it passes, as does G1's split (b); every
       run that dies here holds a program compiled and linked today. The crash follows today's
       programs; its cause is under bisection (G1).
+    - **Resolved (G2): two causes, neither the simulator's environment.**
+      - The simulator faults on its own once the fabric idles about 1M cycles with the host
+        connected: flux2-mini's text program, loaded with nothing written and never launched,
+        then a 400 s wait, dies the same way (`Stopping due to fatal error`, signal 11); the
+        same program loaded, launched and read back at once stops clean. Every "control" above
+        idled; their deaths say nothing of the programs. A stalled program idles, so the fault
+        is how a stall shows on the simulator.
+      - The stall (read off a core dump: `SimfabConfig(dump_core=True)`, each PE's image matched
+        by its code bytes to its ELF, `tsc` and buffers read at the ELF's addresses; g2/
+        core_sym.py): qwen3-sim's layer-0 K / V columns end, every other PE starts and does not
+        end; the CX root waits on the row the attention's output should bring (`pin` 0), the
+        weight columns on the MLP's row. Qwen 3's (and every poem's with an adapter) attention
+        output passes `linear.lora_correct`, which no unit lowered: its output was a row from
+        the stream that nothing sends, and the barrier, not seeing it the attention's, ran the
+        MLP before the attention. The units now take the correction as its product's columns
+        (the wafer serves no adapter; the engine refuses one by name). Nemotron's poem has no
+        adapter node, which is why its slices ran on the CS-3 (1519) while Qwen 3.5 -l1 timed
+        out.
+      - Also on qwen3-sim's K / V PEs, the simulator's "src dest operand overlap": a paged
+        column (no `init()`, its cache carried over) never set its exp's view of the
+        probabilities' low halves, so `vexp`'s add ran over `kk` offset by one; `satt.bind()`
+        now runs each launch. The static check (`check::hazard`) finds the class: a DSD
+        operation over its own source at overlapping elements, a data task or a startup
+        activation, and a DSD length / offset from a word the host writes a step with no
+        bound (`fab.below`).
 - **Open, for G1 / P1** (the search's capacity): Kimi-K3's real layer 0 does not place,
   `no column roots up to 512 fit its tiles (12288 words)`. It holds 1.2B weights (hidden 7168,
   a 33792-wide dense MLP, 12288-wide KDA projections).
