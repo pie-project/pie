@@ -459,15 +459,12 @@ pub(crate) fn anchored(
         (Some(tactic), plan, lt)
     });
     let (chosen, plan, (lt_handle, want)) = chosen;
-    // Untimed (a capture, a shape past the tuning arena), a region cuBLASLt's
-    // epilogue lands runs on it at cuBLASLt's own first heuristic: one pass
-    // over the product, where the unfused leg is two.
-    let chosen = match chosen {
-        None if epi.lt().is_some() && outs.len() == 1 && plan.is_some() => {
-            Some(Tactic::LtEpilogue(0))
-        }
-        chosen => chosen,
-    };
+    let chosen = chosen.or_else(|| {
+        untimed(
+            &skeletons,
+            epi.lt().is_some() && outs.len() == 1 && plan.is_some(),
+        )
+    });
     match chosen {
         Some(Tactic::LtEpilogue(index)) => {
             let (Some(plan), Some(epilogue), Some(heuristic)) = (
@@ -533,6 +530,24 @@ pub(crate) fn anchored(
             Ok(true)
         }
         _ => unfused(ctx, op, epi, act, w, ins, outs, paging, m, n, k),
+    }
+}
+
+/// An anchored region no table or timing picked for (a capture, a product
+/// the profile's tables lack, a shape past the tuning arena): one pass over
+/// the product where a fused one lands it, the unfused leg's two (`None`)
+/// where none does. One row the gemv skeleton covers runs on it: the gemv
+/// the plain product runs a row on, its epilogue in the hook, so a launch
+/// and the product's round trip through memory fewer than the unfused leg.
+/// Else a region cuBLASLt's epilogue lands (`lt`) runs there, at cuBLASLt's
+/// own first heuristic.
+fn untimed(skeletons: &[Skeleton], lt: bool) -> Option<Tactic> {
+    if skeletons.contains(&Skeleton::Gemv) {
+        Some(Tactic::Skeleton(Skeleton::Gemv))
+    } else if lt {
+        Some(Tactic::LtEpilogue(0))
+    } else {
+        None
     }
 }
 
@@ -2765,5 +2780,27 @@ mod tactic_tables {
         };
         assert_eq!(c.read(text), text.lines().count() - 1);
         assert!(c.found.stale.is_none());
+    }
+}
+
+#[cfg(test)]
+mod untimed_regions {
+    use super::{Skeleton, Tactic, untimed};
+
+    #[test]
+    fn an_untimed_single_row_region_runs_fused_on_the_gemv() {
+        // A decode row's SwiGLU or residual epilogue: every skeleton covers it.
+        let all = [Skeleton::Gemv, Skeleton::Rows, Skeleton::Skinny];
+        assert_eq!(untimed(&all, false), Some(Tactic::Skeleton(Skeleton::Gemv)));
+        assert_eq!(untimed(&all, true), Some(Tactic::Skeleton(Skeleton::Gemv)));
+    }
+
+    #[test]
+    fn an_untimed_region_the_gemv_does_not_cover_keeps_lt_or_the_unfused_leg() {
+        // More rows, or a head's span (a q/k norm): no gemv.
+        let rest = [Skeleton::Rows, Skeleton::Skinny];
+        assert_eq!(untimed(&rest, true), Some(Tactic::LtEpilogue(0)));
+        assert_eq!(untimed(&rest, false), None);
+        assert_eq!(untimed(&[], false), None);
     }
 }
