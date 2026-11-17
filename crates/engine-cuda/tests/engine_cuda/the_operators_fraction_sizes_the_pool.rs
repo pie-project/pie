@@ -263,7 +263,7 @@ fn the_reservations_scale_to_a_twenty_four_gigabyte_card() {
     const WORKING_A_TOKEN: u64 = 669_440;
     const PROGRAMS: u64 = 64 * 4 * (262_144 * 4);
 
-    let floor = safety_floor_bytes(CARD);
+    let floor = safety_floor_bytes();
     let after_weights = budget_bytes(CARD, CARD, nine_tenths(CARD, 0)) - WEIGHTS;
     assert_eq!(after_weights, (CARD as f64 * 0.90) as u64 - floor - WEIGHTS);
     assert!(after_weights > 8 << 30 && after_weights < 9 << 30);
@@ -360,14 +360,18 @@ fn the_reservations_scale_to_a_twenty_four_gigabyte_card() {
 }
 
 fn a_flat_range_takes_what_the_card_has_left() {
-    assert_eq!(safety_floor_bytes(CARD), 0, "a flat range holds nothing back");
+    assert_eq!(safety_floor_bytes(), 0, "a flat range holds nothing back");
     let free = CARD - WEIGHTS;
     assert_eq!(
         budget_bytes(free, CARD, Allowance::WHOLE),
         free,
         "all the card has left, no share of it"
     );
-    assert_eq!(ceiling_of(CARD, WEIGHTS, Allowance::WHOLE), CARD, "the card itself");
+    assert_eq!(
+        ceiling_of(CARD, WEIGHTS, Allowance::WHOLE),
+        CARD,
+        "the card itself"
+    );
     let budget = Allowance {
         budget: Some(8 << 30),
     };
@@ -382,16 +386,12 @@ fn a_flat_range_takes_what_the_card_has_left() {
 }
 
 fn the_load_takes_the_card_and_charges_what_is_already_on_it() {
-    let floor = safety_floor_bytes(CARD);
-    assert_eq!(
-        floor,
-        128 * 1024 * 1024,
-        "min(128 MiB, card/10) on this card"
-    );
+    let floor = safety_floor_bytes();
+    assert_eq!(floor, 64 << 20, "the driver's 64 MiB, on every card");
 
     let free = CARD - WEIGHTS;
     let asked = budget_bytes(free, CARD, Allowance::WHOLE);
-    assert_eq!(asked, 34_410_299_648);
+    assert_eq!(asked, 34_477_408_512);
     assert_eq!(
         asked + WEIGHTS + floor,
         CARD,
@@ -406,7 +406,7 @@ fn the_load_takes_the_card_and_charges_what_is_already_on_it() {
 }
 
 fn a_stated_budget_caps_what_the_load_takes() {
-    let floor = safety_floor_bytes(CARD);
+    let floor = safety_floor_bytes();
     let free = CARD - WEIGHTS;
     let budget = |bytes: u64| Allowance {
         budget: Some(bytes),
@@ -426,7 +426,7 @@ fn a_stated_budget_caps_what_the_load_takes() {
 fn a_stated_budget_counts_the_weights_the_load_took() {
     const BEFORE: u64 = 3 << 30;
     const BUDGET: u64 = 20 << 30;
-    let floor = safety_floor_bytes(CARD);
+    let floor = safety_floor_bytes();
     let stated = Allowance {
         budget: Some(BUDGET),
     };
@@ -493,13 +493,13 @@ fn a_stated_budget_counts_the_weights_the_load_took() {
 }
 
 fn the_card_does_not_hold_a_deployment_whose_weights_leave_no_context() {
-    let floor = safety_floor_bytes(CARD);
+    let floor = safety_floor_bytes();
 
     let roomy = Accounting::of(CARD, Allowance::WHOLE, WEIGHTS, 2 << 30);
     assert_eq!(roomy.card, CARD);
     assert_eq!(roomy.weights, WEIGHTS);
     assert_eq!(roomy.floor, floor);
-    assert_eq!(roomy.pool, 34_410_299_648);
+    assert_eq!(roomy.pool, 34_477_408_512);
     assert_eq!(roomy.ceiling, CARD, "no budget stated: the card");
     assert_eq!(
         roomy.pool + roomy.weights + roomy.floor,
