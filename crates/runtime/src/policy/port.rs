@@ -279,6 +279,12 @@ struct Proc {
     session: Option<String>,
     /// What its fires mapped in from the cache, once one has looked.
     cached_tokens: Option<u64>,
+    /// The rows its fires wrote before the first readout; known once it
+    /// read one out.
+    prompt_rows: u64,
+    prompt_tokens: Option<u64>,
+    /// The rows its fires read out.
+    generated_tokens: u64,
     restarts: u64,
 }
 
@@ -426,6 +432,9 @@ impl Port {
                         state: State::Waiting,
                         session,
                         cached_tokens: None,
+                        prompt_rows: 0,
+                        prompt_tokens: None,
+                        generated_tokens: 0,
                         restarts: 0,
                     },
                 );
@@ -435,6 +444,18 @@ impl Port {
                 for name in names {
                     let value = props.get(&name).and_then(hint_value);
                     host.hint(Subject::Process(id.clone()), &name, value);
+                }
+            }
+            Event::Fired(pid, rows, readouts) => {
+                let id = schedule::plex_id(pid);
+                if let Some(proc) = self.procs.get_mut(&id) {
+                    if proc.prompt_tokens.is_none() {
+                        proc.prompt_rows += rows;
+                        if readouts > 0 {
+                            proc.prompt_tokens = Some(proc.prompt_rows);
+                        }
+                    }
+                    proc.generated_tokens += readouts;
                 }
             }
             Event::Cached(pid, tokens) => {
@@ -470,8 +491,14 @@ impl Port {
                     Outcome::Failed => "failed",
                     Outcome::Cancelled => "cancelled",
                 };
-                let cached = proc.cached_tokens.and_then(|n| u32::try_from(n).ok());
-                host.exited(&id.to_string(), outcome, None, cached, 0);
+                let count = |n: u64| u32::try_from(n).ok();
+                host.exited(
+                    &id.to_string(),
+                    outcome,
+                    proc.prompt_tokens.and_then(count),
+                    proc.cached_tokens.and_then(count),
+                    count(proc.generated_tokens).unwrap_or(u32::MAX),
+                );
                 self.offloaded.remove(&id);
                 if (self.cache.owns)(id) {
                     // What it left in the cache outlives it.
@@ -699,8 +726,13 @@ impl Port {
         self.procs
             .iter()
             .map(|(id, proc)| {
-                let cached = proc.cached_tokens.and_then(|n| u32::try_from(n).ok());
-                (id.to_string(), None, cached, None)
+                let count = |n: u64| u32::try_from(n).ok();
+                (
+                    id.to_string(),
+                    proc.prompt_tokens.and_then(count),
+                    proc.cached_tokens.and_then(count),
+                    count(proc.generated_tokens),
+                )
             })
             .collect()
     }

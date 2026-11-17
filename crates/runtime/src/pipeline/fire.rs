@@ -4062,6 +4062,21 @@ pub async fn submit_pass_stamped<C: FireContext>(
             cursor.reserved = cursor.reserved.max(end);
         }
         drop(promoted);
+        // What the fire writes and reads out, for the policies' prompt and
+        // generated counts: rows mapped in from the cache are rows of the
+        // prompt too.
+        crate::policy::report(crate::policy::Event::Fired(
+            pid,
+            full.lanes.iter().map(|lane| lane.tokens.len() as u64).sum(),
+            full.lanes
+                .iter()
+                .map(|lane| match &lane.readout {
+                    ::engine::Readout::None => 0,
+                    ::engine::Readout::Last => 1,
+                    ::engine::Readout::Rows(rows) => rows.len() as u64,
+                })
+                .sum(),
+        ));
         if pass_slots.is_some() {
             // It looked, so what it found is measured, nothing included.
             ctx.note_cached(u64::from(supplied));
