@@ -71,6 +71,9 @@ pub(crate) enum Event {
     CacheEmptied(ProcessId, By),
     Started(ProcessId),
     Paused(ProcessId),
+    /// It waits on its client (`true`), or no longer does: paused by the
+    /// client, then running again.
+    Idle(ProcessId, bool),
     Resumed(ProcessId),
     Exited(ProcessId, Outcome),
     /// A pass of the process ran on another worker: `tokens` of it.
