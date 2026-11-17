@@ -2923,8 +2923,11 @@ fn least_budget(
 }
 
 /// `shell` fired over [`STAGED_SCRIPT`] from a fresh slot: each step's logits.
+/// A prefill longer than the rows one fire carries under the load's budget
+/// goes in fires of at most that many, the last one's logits the step's.
 fn staged_steps(shell: &mut Shell, trace: &Trace) -> Vec<Vec<f32>> {
     shell.open(0).expect("slot 0 opens");
+    let most = usize::try_from(shell.budget().max_tokens.max(1)).expect("a count");
     let mut fed = 0u32;
     let mut last = None;
     let mut steps = Vec::with_capacity(STAGED_SCRIPT.len());
@@ -2934,7 +2937,11 @@ fn staged_steps(shell: &mut Shell, trace: &Trace) -> Vec<Vec<f32>> {
             Step::Decode => vec![last.expect("a decode follows a step")],
         };
         fed += u32::try_from(tokens.len()).expect("a count");
-        let logits = fire(shell, trace, &tokens);
+        let logits = tokens
+            .chunks(most)
+            .map(|chunk| fire(shell, trace, chunk))
+            .last()
+            .expect("a step fires some rows");
         last = Some(argmax(&logits));
         steps.push(logits);
     }
