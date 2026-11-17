@@ -71,6 +71,9 @@ impl Default for KvSplit {
 /// The most replicas of a K / V head the search tries ([`program_at`]'s `rep`).
 pub const MAX_KV_REP: u32 = 16;
 
+/// The cheapest candidates a replica count builds that the next count prices again.
+const KV_REP_TRIES: usize = 4;
+
 /// The cuts the search tries: the fewest rest roots, a quarter and a half more of them; helpers
 /// below the rest roots; K / V columns over `sub` columns a head at `1 / sub` of the entries a
 /// PE (as many rows of the band, `sub` times the PEs: a query's work over them), the head
@@ -407,12 +410,17 @@ pub fn program_py(
     // built a few at a time (a whole-wafer program is large), the cheapest kept
     let mut best: Option<(f64, Program)> = None;
     let mut errs: Vec<(u32, u32, String)> = Vec::new();
-    // each K / V head over 1, then 2, 4 .. replicas (a head root's q heads and tiles fewer) while
-    // none builds
+    // each K / V head over 1, 2, 4 .. replicas (a head root's q heads and tiles fewer, more
+    // K / V PEs at once), each count priced like any other choice: every candidate at one
+    // replica, the next count over the cheapest few that built (every candidate while none has),
+    // up to the count no attention takes
     let mut rep = 1;
-    while best.is_none() && rep <= MAX_KV_REP {
-        for group in cands.chunks(8) {
-            let tried: Vec<(u32, u32, R<Program>)> = std::thread::scope(|sc| {
+    let mut tries = cands.clone();
+    while rep <= MAX_KV_REP && !tries.is_empty() {
+        let mut built: Vec<(f64, (u32, u32, KvSplit))> = Vec::new();
+        let mut applied = false;
+        for group in tries.chunks(8) {
+            let tried: Vec<((u32, u32, KvSplit), R<Program>)> = std::thread::scope(|sc| {
                 let hs: Vec<_> = group
                     .iter()
                     .map(|&(p, tile, kv)| {
@@ -421,28 +429,44 @@ pub fn program_py(
                             let r = program_at(
                                 trace, shape, round16, upto, taps, p, tile, kv, spill, bounds, rep,
                             );
-                            (p, tile, r)
+                            ((p, tile, kv), r)
                         })
                     })
                     .collect();
-                hs.into_iter()
-                    .map(|h| h.join().unwrap_or_else(|_| (0, 0, Err("panicked".into()))))
+                group
+                    .iter()
+                    .zip(hs)
+                    .map(|(&c, h)| h.join().unwrap_or_else(|_| (c, Err("panicked".into()))))
                     .collect()
             });
-            for (p, tile, r) in tried {
+            for (cand, r) in tried {
                 match r {
                     Ok(prog) => {
+                        applied = true;
                         let c = crate::cost::stream::time(&prog).cycles;
+                        built.push((c, cand));
                         if best.as_ref().is_none_or(|(b, _)| c < *b) {
                             best = Some((c, prog));
                         }
                     }
                     // (a replica count no attention takes says nothing of the candidate)
                     Err(e) if rep > 1 && e.contains("no attention's q heads split") => {}
-                    Err(e) => errs.push((p, tile, e)),
+                    Err(e) => {
+                        applied = true;
+                        errs.push((cand.0, cand.1, e));
+                    }
                 }
             }
         }
+        if !applied {
+            break;
+        }
+        tries = if built.is_empty() {
+            cands.clone()
+        } else {
+            built.sort_by(|a, b| a.0.total_cmp(&b.0));
+            built.iter().take(KV_REP_TRIES).map(|&(_, c)| c).collect()
+        };
         rep *= 2;
     }
     best.map(|(_, p)| p).ok_or_else(|| {
