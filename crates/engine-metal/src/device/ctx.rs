@@ -525,6 +525,18 @@ impl Frame {
         Ok(true)
     }
 
+    /// PROBE: flushes what is encoded so far and waits for it to land.
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn probe_flush_wait(&self) -> Result<bool> {
+        if !self.flush()? {
+            return Ok(false);
+        }
+        if let Some(head) = self.flushed.borrow().last() {
+            head.waitUntilCompleted();
+        }
+        Ok(true)
+    }
+
     #[cfg(target_vendor = "apple")]
     fn commit_buffer(&mut self) -> Retained<ProtocolObject<dyn MTLCommandBuffer>> {
         self.end_pass();

@@ -2475,7 +2475,41 @@ impl Batch {
             words.vocab = vocab;
             buffer.write(0, &record_bytes(words))?;
         }
+        #[cfg(target_vendor = "apple")]
+        let probe = |when: &str, members: &[&mut Prepared]| {
+            if !matches!(frame.probe_flush_wait(), Ok(true)) {
+                eprintln!("PROBE-REGION: {when}: could not flush (a blit pass open)");
+                return;
+            }
+            let bad: Vec<(usize, u32, Option<u32>)> = members
+                .iter()
+                .enumerate()
+                .filter_map(|(lane, member)| {
+                    let mut bytes = [0u8; 4];
+                    member.status.read(0, &mut bytes).ok()?;
+                    let state = u32::from_le_bytes(bytes);
+                    (state > 3).then(|| (lane, state, member.status.slot()))
+                })
+                .collect();
+            if !bad.is_empty() {
+                eprintln!(
+                    "PROBE-REGION: {when}: {} of {count} members' status bad (lane, state, slot) {:?}",
+                    bad.len(),
+                    &bad[..bad.len().min(6)]
+                );
+            }
+        };
+        #[cfg(target_vendor = "apple")]
+        probe(&format!("batch of {count} lanes x{} before its regions", self.lanes), members);
         for region in regions {
+            #[cfg(target_vendor = "apple")]
+            let after = format!(
+                "batch of {count} after region {} {:?} ({} steps, {} launches)",
+                region.region_index,
+                region.form,
+                region.steps.len(),
+                region.launches.len()
+            );
             match region.form {
                 Form::Fused => {
                     for (index, member) in members.iter().enumerate() {
@@ -2494,6 +2528,8 @@ impl Batch {
                     self.encode_streamed(frame, region, members, count)?;
                 }
             }
+            #[cfg(target_vendor = "apple")]
+            probe(&after, members);
         }
         Ok(())
     }
