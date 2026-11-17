@@ -87,6 +87,7 @@ fn full_pool(trace: &poem_ir::Trace, page_size: u32, context: u32, slots: u32) -
 /// of the chunk `first` lies in), and what does not as whole runs of
 /// `state.run` adjacent chunks from the second segment's first chunk,
 /// committed first as the runtime commits a segment it binds in.
+#[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 fn guest_places(
     shell: &mut engine_metal::Shell,
     program: engine::ProgramId,

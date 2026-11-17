@@ -1117,6 +1117,9 @@ mod tests {
     enum Cut {
         P(f32),
         K(i32),
+        /// Not a cut: the top token's log-softmax score, in 1e-4 units
+        /// (beam search's step), one word out.
+        Score,
     }
 
     /// A program whose epilogue cuts the logits row by `cut` and puts the
@@ -1130,7 +1133,11 @@ mod tests {
         // The mask, or (`counted`) only how many tokens it takes: a ring
         // cell of one word, where the mask's would pass a small chunk.
         let mask: &'static Channel = Box::leak(Box::new(
-            Channel::new([if counted { 1 } else { vocab }], dtype::i32).capacity(1),
+            Channel::new(
+                [if counted || matches!(cut, Cut::Score) { 1 } else { vocab }],
+                dtype::i32,
+            )
+            .capacity(1),
         ));
         let mut b = Builder::new(vocab, 16);
         let logits = OutputDecl {
@@ -1148,6 +1155,17 @@ mod tests {
             let keep = match cut {
                 Cut::P(p) => pivot_threshold(&x, cummass_le(Tensor::constant(p))),
                 Cut::K(k) => pivot_threshold(&x, rank_le(Tensor::constant(k))),
+                Cut::Score => {
+                    // As beam search reads it: a [beams, vocab] row's
+                    // log-softmax, flattened, its top taken.
+                    let rows = reshape(x, [1, vocab]);
+                    let scored = broadcast(reshape(Tensor::constant(0.0f32), [1, 1]), [1, vocab])
+                        + log_softmax(&rows);
+                    let (top, _) = top_k(reshape(scored, [vocab]), 1);
+                    let scaled = top * Tensor::constant(1.0e4f32);
+                    mask.put(reshape(cast(scaled, dtype::i32), [1]));
+                    return;
+                }
             };
             if counted {
                 mask.put(reshape(reduce_sum(cast(keep, dtype::i32)), [1]));
@@ -1210,6 +1228,7 @@ mod tests {
         let fixed = |p: f32| if p > 0.0 { (f64::from(p) * 4_294_967_296.0) as u64 } else { 0 };
         let mut mask = vec![false; values.len()];
         match cut {
+            Cut::Score => unreachable!("a score is no cut"),
             Cut::K(k) => {
                 for &i in taken_order(values).iter().take(k.max(0) as usize) {
                     mask[i] = true;
@@ -1261,24 +1280,35 @@ mod tests {
 
     /// Where the runtime holds `bytes` of guest state laid in runs of `run`
     /// chunks (`engine::ScratchPlace`): one run of `Instance` slots from
-    /// chunk `first` where they fit a chunk's slots, else whole runs of
-    /// chunks from it, one after another inside its segment.
-    fn held_at(bytes: u64, run: u32, pools: &crate::store::Pools, first: u32) -> engine::ScratchPlace {
+    /// segment `segment`'s first chunk where they fit a chunk's slots, else
+    /// whole runs of chunks, each from the first chunk of a segment of its
+    /// own from `segment` on (a run never crosses a segment); and the
+    /// segment after the last it takes.
+    fn held_at(
+        bytes: u64,
+        run: u32,
+        pools: &crate::store::Pools,
+        segment: u32,
+    ) -> (engine::ScratchPlace, u32) {
         use crate::store::layout::INSTANCE;
         let per_chunk = pools.slots_per_chunk(INSTANCE).expect("an instance shape");
         let slot = pools.slot_bytes(INSTANCE).expect("an instance slot");
+        let chunks = pools.layout().segment_chunks;
+        assert!(run <= chunks, "a run of {run} chunks lies in a segment of {chunks}");
         if bytes <= u64::from(per_chunk) * slot {
-            return engine::ScratchPlace::Run {
-                first: first * per_chunk,
+            let place = engine::ScratchPlace::Run {
+                first: segment * chunks * per_chunk,
                 slots: u32::try_from(bytes.max(1).div_ceil(slot)).expect("slots"),
             };
+            return (place, segment + 1);
         }
         let piece = u64::from(run) * pools.layout().chunk_bytes;
         let pieces = u32::try_from(bytes.div_ceil(piece)).expect("pieces");
-        engine::ScratchPlace::Chunks {
+        let place = engine::ScratchPlace::Chunks {
             run,
-            pieces: (0..pieces).map(|nth| first + nth * run).collect(),
-        }
+            pieces: (0..pieces).map(|nth| (segment + nth) * chunks).collect(),
+        };
+        (place, segment + pieces)
     }
 
     /// [`fire_cut`] in a pool of `room`'s (chunk bytes, chunks, segment
@@ -1310,10 +1340,10 @@ mod tests {
         let (instance, rings) = slots_for(&pools, &facts, 0);
         let state = plane.guest_state(program, &one_row(), &pools).expect("the guest's state");
         let (scratch, pair) = match room {
-            Some((_, _, segment)) => (
-                held_at(state.per_instance, state.run, &pools, segment),
-                held_at(state.per_pair, state.run, &pools, 2 * segment),
-            ),
+            Some(_) => {
+                let (scratch, next) = held_at(state.per_instance, state.run, &pools, 1);
+                (scratch, held_at(state.per_pair, state.run, &pools, next).0)
+            }
             None => (
                 scratch_of(&plane, program, &one_row(), &pools, 0, 0),
                 pair_of(&plane, program, &one_row(), &pools),
@@ -1373,6 +1403,147 @@ mod tests {
         (mask, took, state.run)
     }
 
+    /// Beam search's step, the top token's log-softmax score over a
+    /// 151,936-token vocabulary, is the host's whether the scratch lies in
+    /// one chunk's piece (64 MiB chunks) or in runs of adjacent 256 KiB
+    /// chunks, in every form.
+    #[test]
+    fn a_log_softmax_score_in_a_run_of_chunks_is_the_hosts() {
+        use eta_compiler::codegen::program::KernelKind;
+        let vocab = 151_936usize;
+        let values: Vec<f32> = distribution(vocab, 1.0e-4, 11)
+            .iter()
+            .map(|p| (p * 1.0e5).ln_1p() * 8.0)
+            .map(|v| f32_of(bf16_of(v)))
+            .collect();
+        let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let lse = f64::from(max)
+            + values.iter().map(|&v| f64::from(v - max).exp()).sum::<f64>().ln();
+        let want = ((f64::from(max) - lse) * 1.0e4) as i32;
+        for room in [None, Some((256u64 << 10, 128u32, 16u32))] {
+            for (form, dropped) in [
+                ("streamed", &[][..]),
+                ("grouped", &[KernelKind::Streamed][..]),
+                ("fused", &[KernelKind::Streamed, KernelKind::Grouped][..]),
+            ] {
+                let (got, _, run) = fire_cut_in(&values, Cut::Score, dropped, room);
+                assert!(
+                    (got[0] - want).abs() <= 20,
+                    "{form} in runs of {run}: score {} (1e-4), the host's {want}",
+                    got[0]
+                );
+            }
+        }
+    }
+
+    /// Beam search's step as serving fires it: two lanes of one program
+    /// launched together (`Plane::stage_batched`), each instance's scratch
+    /// in whole runs of adjacent 256 KiB chunks and the pair's batch tables
+    /// in runs of their own, each lane's top log-softmax score the host's.
+    #[test]
+    fn a_batch_in_runs_of_chunks_scores_as_the_host() {
+        for (chunk, segment) in [(64u64 << 20, 1u32), (256 << 10, 16)] {
+            batch_scores_in(chunk, segment);
+        }
+    }
+
+    fn batch_scores_in(chunk: u64, segment: u32) {
+        use crate::store::Pools;
+        let vocab = 151_936usize;
+        let lanes = 2u32;
+        let values: Vec<Vec<f32>> = (0..lanes)
+            .map(|lane| {
+                distribution(vocab, 1.0e-4, 21 + u64::from(lane))
+                    .iter()
+                    .map(|p| (p * 1.0e5).ln_1p() * 8.0)
+                    .map(|v| f32_of(bf16_of(v)))
+                    .collect()
+            })
+            .collect();
+        let want: Vec<i32> = values
+            .iter()
+            .map(|values| {
+                let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let lse = f64::from(max)
+                    + values.iter().map(|&v| f64::from(v - max).exp()).sum::<f64>().ln();
+                ((f64::from(max) - lse) * 1.0e4) as i32
+            })
+            .collect();
+        let context = Context::bind().expect("a Metal 4 device");
+        let pools = Pools::guests_over(&context, chunk, 12 * segment, segment).expect("a pool");
+        let mut plane = Plane::new();
+        let vocab32 = u32::try_from(vocab).expect("a vocabulary");
+        let (registration, count, seeds, mask) = select_registration(vocab32, Cut::Score, true);
+        let program = plane.register(&context, &registration).expect("registers");
+        let facts = plane.facts(program, &pools).expect("the program's facts");
+        let state = plane.guest_state(program, &one_row(), &pools).expect("the guest's state");
+        let (pair, mut next) = held_at(state.per_pair, state.run, &pools, 1);
+        let mut planes = Vec::new();
+        let ids: Vec<InstanceId> = (0..lanes)
+            .map(|lane| {
+                let channels: Vec<ChannelId> = (1..=count as u64)
+                    .map(|c| ChannelId(c + 1000 * u64::from(lane)))
+                    .collect();
+                let (instance, rings) = slots_for(&pools, &facts, lane);
+                let (scratch, after) = held_at(state.per_instance, state.run, &pools, next);
+                next = after;
+                let id = plane
+                    .bind(
+                        &context,
+                        program,
+                        &seeds,
+                        one_row(),
+                        GeometryClass::Host,
+                        PortMask::NONE,
+                        &channels,
+                        session::Pooled {
+                            pools: &pools,
+                            instance: &instance,
+                            rings: &rings,
+                            scratch: &scratch,
+                            pair: &pair,
+                        },
+                    )
+                    .expect("the lane binds");
+                let mut logits = crate::device::Buffer::zeroed(&context, vocab as u64 * 2)
+                    .expect("a logits plane");
+                let bytes: Vec<u8> = values[lane as usize]
+                    .iter()
+                    .flat_map(|&v| bf16_of(v).to_le_bytes())
+                    .collect();
+                logits.write(0, &bytes).expect("the logits write");
+                plane
+                    .bind_output(id, "logits", 0, &logits, 0, eta_ir::Dtype::Bf16, vocab32, vocab32)
+                    .expect("the logits bind");
+                planes.push(logits);
+                id
+            })
+            .collect();
+        let mut frame = context.frame().expect("a frame");
+        let launched = plane.stage_batched(&mut frame, &ids, &pools, 0).expect("the lanes stage");
+        assert!(
+            launched.iter().all(|(_, launched)| matches!(launched, Launched::Airborne)),
+            "every lane launches: {launched:?}"
+        );
+        frame.commit().expect("the frame lands");
+        for (lane, &id) in ids.iter().enumerate() {
+            plane.settle_launched(id).expect("the lane settles");
+            let cell = plane
+                .instance_mut(id)
+                .expect("bound")
+                .take(mask)
+                .expect("the take")
+                .expect("a score");
+            let got = i32::from_le_bytes(cell[..4].try_into().expect("a word"));
+            assert!(
+                (got - want[lane]).abs() <= 20,
+                "lane {lane} launched together in runs of {}: score {got}, the host's {}",
+                state.run,
+                want[lane]
+            );
+        }
+    }
+
     /// A value wider than the pool's chunk lies in a piece of adjacent
     /// chunks: a 151,936-token cut in 256 KiB chunks (a vocabulary-wide f32
     /// value is 607,744 bytes) is laid in runs of more than one chunk, its
@@ -1385,7 +1556,7 @@ mod tests {
     fn a_value_past_a_chunk_lies_in_a_run_of_chunks() {
         use eta_compiler::codegen::program::KernelKind;
         let vocab = 151_936usize;
-        let room = Some((256u64 << 10, 64u32, 16u32));
+        let room = Some((256u64 << 10, 128u32, 16u32));
         for (seed, spread, cut) in [
             (5u64, 1.0e-4f64, Cut::P(0.9)),
             (6, 1.0e-3, Cut::K(100)),
