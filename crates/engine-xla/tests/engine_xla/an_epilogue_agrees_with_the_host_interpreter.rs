@@ -974,13 +974,15 @@ fn corner_seeds() -> Vec<(u32, Value)> {
         9,
         16,
         -3,
-        1,
-        1,
+        -1,
+        i32::MIN,
         4,
         i32::MAX,
         15,
     ];
-    let b = vec![2, 2, -1, 0, 3, 3, 0, -2, 4, 1, 1, 17, 1, -5, -1, 15];
+    // Division corners, beside the others: MIN / -1 wraps, x / 0 is 0,
+    // MIN / MIN, -1 / MAX.
+    let b = vec![2, 2, -1, 0, 3, 3, 0, -2, 4, 1, 1, i32::MAX, i32::MIN, -5, -1, 15];
     let ua = vec![
         7,
         u32::MAX,
@@ -993,13 +995,14 @@ fn corner_seeds() -> Vec<(u32, Value)> {
         9,
         16,
         3,
-        1,
-        1,
+        u32::MAX,
+        u32::MAX,
         40,
         12,
         15,
     ];
-    let ub = vec![2, 2, 0, 0, 3, 7, 0xFFFF_FFF0, 2, 4, 1, 1, 17, 1, 5, 3, 15];
+    // u32::MAX / 1, u32::MAX / u32::MAX.
+    let ub = vec![2, 2, 0, 0, 3, 7, 0xFFFF_FFF0, 2, 4, 1, 1, 1, u32::MAX, 5, 3, 15];
     vec![
         (0, Value::F32(x)),
         (1, Value::F32(y)),
