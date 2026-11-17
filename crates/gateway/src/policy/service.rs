@@ -3,7 +3,6 @@
 //! The gate, the order launches leave in, and where each goes stay here, on
 //! the request path; what decides them runs once, in the controller.
 
-use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -35,7 +34,6 @@ const REPLICATE_RETRY: Duration = Duration::from_secs(30);
 #[derive(Default)]
 struct Decided {
     active: bool,
-    schedule: Option<(HashMap<u64, i64>, Option<i64>)>,
     placements: HashMap<u64, PlacementView>,
 }
 
@@ -348,25 +346,30 @@ impl Cluster {
         }
     }
 
-    /// The highest key the schedule does not hold, the earliest among equals.
+    /// Whether `seq` leaves the gate next: the earliest waiting launch that
+    /// its placement does not hold (`placement/workers = []`). PLEX 1.1 gives
+    /// a cluster policy no order of release: it releases what it names.
     fn next(&self, seq: u64) -> bool {
         let decided = self.shared.decided.read().unwrap();
-        let schedule = decided.schedule.as_ref();
-        let key = |id: u64| schedule.map_or(0, |(keys, _)| keys.get(&id).copied().unwrap_or(0));
-        let held = |id: u64| schedule.is_some_and(|(_, floor)| floor.is_some_and(|f| key(id) < f));
+        let held = |id: u64| {
+            decided
+                .placements
+                .get(&id)
+                .is_some_and(|p| p.workers.as_ref().is_some_and(Vec::is_empty))
+        };
         self.shared
             .waiting
             .lock()
             .unwrap()
             .iter()
-            .filter(|(_, id)| !held(**id))
-            .max_by_key(|(s, id)| (key(**id), Reverse(**s)))
+            .find(|(_, id)| !held(**id))
             .is_some_and(|(s, _)| *s == seq)
     }
 
-    /// Where the placement puts `req`: its worker, its props, and the
-    /// workers its passes may run on, best first.
-    pub fn placement(&self, req: &Request) -> (Option<WorkerId>, Props, Vec<WorkerId>) {
+    /// Where the placement puts `req`: the workers it may run on, best
+    /// first (`None`: the router's choice), its props, and the workers its
+    /// passes may run on, best first.
+    pub fn placement(&self, req: &Request) -> (Option<Vec<WorkerId>>, Props, Vec<WorkerId>) {
         let decided = self.shared.decided.read().unwrap();
         let Some(placement) = decided.placements.get(&req.req_id.0) else {
             return (None, Props::new(), Vec::new());
@@ -376,7 +379,7 @@ impl Cluster {
             .iter()
             .filter_map(|(name, json)| Some((name.clone(), serde_json::from_str(json).ok()?)))
             .collect();
-        (placement.worker, props, placement.executors.clone())
+        (placement.workers.clone(), props, placement.executors.clone())
     }
 
     pub fn dispatched(&self, req: &Request, worker: WorkerId) {
@@ -454,9 +457,6 @@ fn apply(shared: &Shared, view: GatewayDecisions, fleet: &crate::worker::WorkerR
     {
         let mut decided = shared.decided.write().unwrap();
         decided.active = view.active;
-        decided.schedule = view
-            .schedule
-            .map(|schedule| (schedule.keys.into_iter().collect(), schedule.floor));
         decided.placements = view.placements.into_iter().collect();
     }
     let mut acted = shared.acted.lock().unwrap();
@@ -477,8 +477,9 @@ fn apply(shared: &Shared, view: GatewayDecisions, fleet: &crate::worker::WorkerR
     shared.changed.notify_waiters();
 }
 
-/// Moves each running process its placement names another worker for,
-/// once per target: whenever the placement or where it runs changes.
+/// Moves each running process whose placement leaves out the worker it runs
+/// on, to the first one the list names, once per target: whenever the
+/// placement or where it runs changes. Reordering a list never moves one.
 fn move_misplaced(shared: &Shared) {
     let decided = shared.decided.read().unwrap();
     let mut acted = shared.acted.lock().unwrap();
@@ -486,8 +487,9 @@ fn move_misplaced(shared: &Shared) {
         .running
         .iter()
         .filter_map(|(id, at)| {
-            let target = decided.placements.get(id)?.worker?;
-            (target != *at).then_some((*id, target))
+            let workers = decided.placements.get(id)?.workers.as_ref()?;
+            let target = *workers.first()?;
+            (!workers.contains(at)).then_some((*id, target))
         })
         .collect();
     for (id, target) in moves {
