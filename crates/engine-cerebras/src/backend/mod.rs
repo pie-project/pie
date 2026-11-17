@@ -487,7 +487,15 @@ impl Engine for CerebrasEngine {
         Ok(())
     }
 
+    fn register_adapter(
+        &mut self,
+        registration: &engine::adapter::AdapterRegistration,
+    ) -> EngineResult<()> {
+        Err(no_adapter(registration.id))
+    }
+
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
+        refuse_adapters(frame)?;
         frame.validate_for(
             self.caps
                 .as_ref()
@@ -551,5 +559,51 @@ impl Engine for CerebrasEngine {
             }
         }
         Ok(())
+    }
+}
+
+/// The refusal of adapter `id`: the wafer's programs serve none (a unit program's adapter
+/// correction is its product unchanged, kernels-cerebras `stream::unit`), so a lane asking
+/// for one is refused by name, never run without it.
+fn no_adapter(id: u32) -> Error {
+    Error::invalid(format!("cerebras serves no adapter: adapter {id}"))
+}
+
+/// A frame whose lane names an adapter, refused.
+fn refuse_adapters(frame: &FrameSubmission) -> EngineResult<()> {
+    for step in &frame.steps {
+        if let Some(id) = step.lanes.iter().find_map(|l| l.adapter) {
+            return Err(no_adapter(id));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod adapter_tests {
+    use super::*;
+    use engine::fire::{Lane, Step};
+
+    #[test]
+    fn a_lane_naming_an_adapter_is_refused_by_name() {
+        let lane = |adapter| Lane {
+            tokens: vec![1],
+            positions: vec![0],
+            adapter,
+            ..Lane::default()
+        };
+        let frame = |adapter| {
+            FrameSubmission::of(Step {
+                lanes: vec![lane(None), lane(adapter)],
+                ..Step::default()
+            })
+        };
+        assert!(refuse_adapters(&frame(None)).is_ok());
+        let e = refuse_adapters(&frame(Some(7))).expect_err("refused");
+        assert!(
+            e.to_string()
+                .contains("cerebras serves no adapter: adapter 7"),
+            "{e}"
+        );
     }
 }
