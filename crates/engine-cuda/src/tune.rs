@@ -379,6 +379,27 @@ fn prompt(width: u32) -> engine::load::CheckFire {
     }
 }
 
+/// `fire` timed as a rung's fires are: two warm, then the median of
+/// [`TIMED_FIRES`] back to back; and whether every timed fire replayed.
+fn timed(
+    shell: &mut crate::Shell,
+    trace: &poem_ir::Trace,
+    fire: engine::load::CheckFire,
+) -> Result<(f64, bool), String> {
+    for _ in 0..2 {
+        fire_once(shell, trace, fire)?;
+    }
+    let mut times = Vec::new();
+    let mut replayed = true;
+    for _ in 0..TIMED_FIRES {
+        let (ns, hit) = fire_once(shell, trace, fire)?;
+        replayed &= hit;
+        times.push(ns);
+    }
+    times.sort_by(f64::total_cmp);
+    Ok((times[times.len() / 2], replayed))
+}
+
 /// The kind of work an op is, for the dissection's rollup.
 fn kind_of(op: &str) -> &'static str {
     let moe = op.contains("moe") || op.contains("expert");
@@ -395,10 +416,12 @@ fn kind_of(op: &str) -> &'static str {
     }
 }
 
-/// A rung dissected: its tokens, its replayed and estimated times (ns),
-/// and the launches the estimate counts at it.
+/// A rung dissected: its tokens, its time in the rung loop, its replayed
+/// time on a fresh load and its estimated time (ns), and the launches the
+/// estimate counts at it.
 struct Dissected {
     tokens: u32,
+    timed: f64,
     replayed: f64,
     estimated: f64,
     launches: u32,
@@ -407,7 +430,8 @@ struct Dissected {
 /// A walked fire of each of `rungs` dissected by node, under `walked` (the
 /// check's profile, eager): its ops' device time (each node drained before
 /// and after: [`crate::dissect`]) rolled up by kind, beside the walked wall
-/// and the replayed time served fires take.
+/// (timed as [`timed`] times, on a fresh load) and the replayed time served
+/// fires take (timed so on its own fresh load).
 fn dissect(
     artifact: &Path,
     deployment: &str,
@@ -430,8 +454,7 @@ fn dissect(
         .map_or(0.0, |&(_, ns, n)| ns as f64 / f64::from(n));
     for rung in rungs {
         let width = rung.tokens;
-        fire_once(&mut shell, &trace, prompt(width))?;
-        let (walk, _) = fire_once(&mut shell, &trace, prompt(width))?;
+        let (walk, _) = timed(&mut shell, &trace, prompt(width))?;
         crate::dissect::start();
         let (wall, _) = fire_once(&mut shell, &trace, prompt(width))?;
         let mut ops = crate::dissect::take();
@@ -452,10 +475,12 @@ fn dissect(
         }
         kinds.sort_by(|a, b| b.1.total_cmp(&a.1));
         let mut out = format!(
-            "dissected: a fire of {width} tokens: replayed {:.2} ms, estimated {:.2} ms; walked \
-             {:.2} ms ({:.2} ms dissected), {nodes} nodes, {:.2} ms in them past the drains \
-             ({:.1} us a drained pair); the estimate's {} launches x {launch_ns} ns = {:.2} ms\n",
+            "dissected: a fire of {width} tokens: replayed {:.2} ms ({:.2} ms in the rung loop), \
+             estimated {:.2} ms; walked {:.2} ms ({:.2} ms dissected), {nodes} nodes, {:.2} ms \
+             in them past the drains ({:.1} us a drained pair); the estimate's {} launches x \
+             {launch_ns} ns = {:.2} ms\n",
             rung.replayed / 1e6,
+            rung.timed / 1e6,
             rung.estimated / 1e6,
             walk / 1e6,
             wall / 1e6,
@@ -516,7 +541,7 @@ fn check_estimate_of(
     let (_, _, rungs) = checked(&shell)?;
     drop(shell);
     let size = sized(rungs.iter().map(engine::load::RungFacts::check_fire));
-    let (mut shell, trace) = load_every_rung(artifact, deployment, chip, size)?;
+    let (mut shell, trace) = load_every_rung(artifact, deployment, chip.clone(), size)?;
     let (weighed, laid, rungs) = checked(&shell)?;
     let model = engine::load::model_class(&trace).to_owned();
     say(&format!(
@@ -528,23 +553,15 @@ fn check_estimate_of(
     ));
     let mut meas = Vec::new();
     for r in &rungs {
-        for _ in 0..2 {
-            fire_once(&mut shell, &trace, r.check_fire())?;
+        let (ns, replayed) = timed(&mut shell, &trace, r.check_fire())?;
+        if !replayed {
+            return Err(format!(
+                "a fire of {} tokens of {model} was walked, not replayed: its time is not what \
+                 serving runs, so it is no measurement",
+                r.tokens
+            ));
         }
-        let mut times = Vec::new();
-        for _ in 0..TIMED_FIRES {
-            let (ns, replayed) = fire_once(&mut shell, &trace, r.check_fire())?;
-            if !replayed {
-                return Err(format!(
-                    "a fire of {} tokens of {model} was walked, not replayed: its time is not \
-                     what serving runs, so it is no measurement",
-                    r.tokens
-                ));
-            }
-            times.push(ns);
-        }
-        times.sort_by(f64::total_cmp);
-        meas.push(times[times.len() / 2]);
+        meas.push(ns);
     }
     drop(shell);
     let e = &weighed.estimate;
@@ -605,18 +622,41 @@ fn check_estimate_of(
     widths.extend(also.iter().copied());
     widths.sort_unstable();
     widths.dedup();
-    let dissected: Vec<Dissected> = widths
+    let mut dissected: Vec<Dissected> = widths
         .iter()
         .filter_map(|&t| {
             let k = rungs.iter().position(|r| r.tokens == t)?;
             Some(Dissected {
                 tokens: t,
-                replayed: meas[k],
+                timed: meas[k],
+                replayed: 0.0,
                 estimated: est[k],
                 launches: rungs[k].launches,
             })
         })
         .collect();
+    // The rung loop's fires ran back to back across every rung, and the
+    // card's clocks fall as it heats: a walk timed after a fresh load would
+    // meet a cooler card. Each dissected fire is replayed again on a fresh
+    // load, as its walk is, by the same count of fires.
+    let (mut shell, trace) = load_every_rung(
+        artifact,
+        deployment,
+        chip,
+        sized(dissected.iter().map(|d| prompt(d.tokens))),
+    )?;
+    for d in &mut dissected {
+        let (ns, replayed) = timed(&mut shell, &trace, prompt(d.tokens))?;
+        if !replayed {
+            return Err(format!(
+                "a fire of {} tokens of {model} was walked, not replayed, on the dissection's \
+                 replay load",
+                d.tokens
+            ));
+        }
+        d.replayed = ns;
+    }
+    drop(shell);
     dissect(artifact, deployment, walked, &dissected, say)?;
     if short > CHECK_BOUND {
         return Err(format!(
