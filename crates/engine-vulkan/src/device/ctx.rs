@@ -199,6 +199,9 @@ pub(crate) struct Core {
     /// to its segment: a kept frame notes each descriptor binding one, to
     /// rebind it when the segment is backed or given back.
     pub(crate) segments: Mutex<std::collections::HashMap<u64, u32>>,
+    /// What each pool segment's descriptors in the kept frames bind now:
+    /// a rebind writes only the segments whose buffer changed.
+    bound: Mutex<Vec<vk::Buffer>>,
 }
 
 /// The descriptor sets of the device's frames, from pools it holds for its
@@ -1030,6 +1033,7 @@ impl Context {
             made: engine_gpu::made::Made::default(),
             sets: Mutex::new(Sets::default()),
             segments: Mutex::new(std::collections::HashMap::new()),
+            bound: Mutex::new(Vec::new()),
         });
 
         let dummy = Raw::new(
@@ -1067,8 +1071,10 @@ impl Context {
 
     /// States the pool's segments: for each, the buffer backing it (or
     /// `None`) and its stand-in. Each kept frame's descriptor of a segment
-    /// is written to its buffer, or its stand-in where it is not backed;
-    /// every frame that reads them has landed (the pool drains first).
+    /// whose buffer changed since the last statement is written to its
+    /// buffer, or its stand-in where it is not backed; a segment that stands
+    /// as it did is written nowhere. Every frame that reads them has landed
+    /// (the pool drains first).
     pub fn rebind_segments(
         &self,
         segments: &[(Option<&Buffer>, &Buffer)],
@@ -1089,6 +1095,16 @@ impl Context {
                 }
             }
         }
+        // The segments whose buffer changed: all of them at the first
+        // statement, which the load makes before it records anything.
+        let changed: Vec<bool> = {
+            let mut was = self.core.bound.lock().expect("bound lock poisoned");
+            let changed = (0..bound.len())
+                .map(|at| was.get(at) != Some(&bound[at]))
+                .collect();
+            *was = bound.clone();
+            changed
+        };
         let infos: Vec<vk::DescriptorBufferInfo> = bound
             .iter()
             .map(|&buffer| {
@@ -1104,6 +1120,9 @@ impl Context {
             .map(|kept| kept.inner.rebinds.lock().expect("rebinds lock poisoned").clone())
             .collect();
         for (set, binding, segment) in rebinds.iter().flatten() {
+            if !changed.get(*segment as usize).copied().unwrap_or(true) {
+                continue;
+            }
             let info = infos.get(*segment as usize).ok_or_else(|| Fault::Unbound {
                 what: format!("pool segment {segment}, past the {} stated", infos.len()),
             })?;
@@ -1118,11 +1137,18 @@ impl Context {
         if writes.is_empty() {
             return Ok(());
         }
+        let started = std::time::Instant::now();
         // SAFETY: every set was allocated with an update-after-bind layout
         // from an update-after-bind pool (the device has the feature, or
         // the load was refused), and no
         // submission that binds it is pending: the pool drained first.
         unsafe { self.core.device.update_descriptor_sets(&writes, &[]) };
+        tracing::info!(
+            segments = ?changed,
+            writes = writes.len(),
+            us = started.elapsed().as_micros() as u64,
+            "the recordings' descriptors of the segments that changed are rebound"
+        );
         Ok(())
     }
 
