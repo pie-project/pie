@@ -1,0 +1,355 @@
+package plex:core@1.1.0;
+
+/// Types every PLEX package shares.
+@since(version = 1.1.0)
+interface types {
+    /// A request, from arrival to exit.
+    @since(version = 1.1.0)
+    type process-id = string;
+
+    /// Related processes: the turns of a conversation, the branches of a
+    /// search.
+    @since(version = 1.1.0)
+    type session-id = string;
+
+    /// An engine instance, or a KV pool node: a worker with no `device`
+    /// tier.
+    @since(version = 1.1.0)
+    type worker-id = string;
+
+    /// KV state: a sequence of tokens from the start of a prompt. Working
+    /// sets form a tree: a working set's parent is the longest other working
+    /// set that is a prefix of it. A process's own working set has the
+    /// process's id; the host makes the shared ones where prompts branch.
+    @since(version = 1.1.0)
+    type working-set-id = string;
+
+    /// A point on the host's monotonic clock, in nanoseconds. Only
+    /// comparable to other marks from the same host.
+    ///
+    /// This is `wasi:clocks/monotonic-clock.mark`, restated here so that a
+    /// policy does not import the clock itself: a policy is told the time,
+    /// it does not read it.
+    @since(version = 1.1.0)
+    type mark = u64;
+
+    /// A length of time, in nanoseconds.
+    @since(version = 1.1.0)
+    type duration = u64;
+
+    /// Where on a worker KV can sit, highest first.
+    @since(version = 1.1.0)
+    enum tier {
+        /// Accelerator memory: ready to run.
+        device,
+        /// Host memory.
+        host,
+        /// Local storage.
+        disk,
+    }
+
+    /// The first `tokens` tokens of a working set, counted from the start
+    /// of the prompt (its ancestors' tokens included). None is all of it.
+    ///
+    /// A prefix is a cover, not a thing: rows that name overlapping
+    /// prefixes do not conflict, and a token follows every row that covers
+    /// it (`plex:retention`, `plex:replication`).
+    @since(version = 1.1.0)
+    record prefix {
+        working-set: working-set-id,
+        tokens: option<u32>,
+    }
+
+    @since(version = 1.1.0)
+    variant subject {
+        /// The host as a whole: what is said to everyone.
+        global,
+        process(process-id),
+        session(session-id),
+        worker(worker-id),
+        working-set(working-set-id),
+    }
+
+    /// A list or an object travels as `text`, in JSON.
+    @since(version = 1.1.0)
+    variant value {
+        boolean(bool),
+        int(s64),
+        float(f64),
+        text(string),
+    }
+
+    /// Why a write was not taken, or a row not enacted. A write that names
+    /// something that has since exited is not an error: it is ignored.
+    @since(version = 1.1.0)
+    variant error-code {
+        /// This host has no mechanism for it.
+        not-supported,
+        /// The value is out of range, or names something that never existed.
+        invalid-argument,
+        /// The table is full.
+        limit-exceeded,
+        other(option<string>),
+    }
+
+    @since(version = 1.1.0)
+    enum process-state {
+        /// Arrived; not yet sent to a worker.
+        pending,
+        /// At its worker, not yet started.
+        waiting,
+        running,
+        paused,
+        /// Gone. Seen only in the call that delivers its `exited`.
+        exited,
+    }
+
+    @since(version = 1.1.0)
+    enum outcome { completed, failed, cancelled }
+
+    /// Who caused a transition.
+    @since(version = 1.1.0)
+    enum by {
+        /// A row a policy wrote: a hold, an empty tier list.
+        policy,
+        /// The host's own pressure: memory, a drain.
+        host,
+        /// The client or the process itself: a tool call, a wait for input.
+        client,
+    }
+
+    @since(version = 1.1.0)
+    record exit {
+        process: process-id,
+        outcome: outcome,
+    }
+
+    @since(version = 1.1.0)
+    record dispatch {
+        process: process-id,
+        worker: worker-id,
+    }
+
+    @since(version = 1.1.0)
+    record pause {
+        process: process-id,
+        by: by,
+    }
+
+    @since(version = 1.1.0)
+    record retention {
+        working-set: working-set-id,
+        worker: worker-id,
+    }
+
+    @since(version = 1.1.0)
+    record eviction {
+        working-set: working-set-id,
+        worker: worker-id,
+        by: by,
+    }
+
+    @since(version = 1.1.0)
+    record change {
+        subject: subject,
+        name: string,
+    }
+
+    /// A transition since the last call. The snapshot is the truth; an
+    /// event says what changed, and carries what the snapshot cannot (an
+    /// outcome, a cause). A policy that plans from the snapshot alone is
+    /// correct.
+    @since(version = 1.1.0)
+    variant event {
+        arrived(process-id),
+        /// Sent to a worker; again when it moves to another.
+        dispatched(dispatch),
+        /// Started, or resumed.
+        started(process-id),
+        paused(pause),
+        exited(exit),
+        /// A session's client said it is done.
+        closed(session-id),
+        /// A process exited and its working set stays on `worker`, cached.
+        retained(retention),
+        /// The last of a working set left every tier of `worker`.
+        evicted(eviction),
+        /// A worker joined, began to drain, or left: see the snapshot.
+        worker-changed(worker-id),
+        hint-changed(change),
+        note-changed(change),
+        /// The host cannot enact a row this policy wrote: see the
+        /// column's `get-refused`.
+        refused,
+        alarm,
+    }
+}
+
+/// What the host knows, as of the start of this call. Trusted: the host
+/// measured or authenticated every field.
+///
+/// A worker policy sees its own worker, the processes on it and the
+/// working sets it holds. A cluster policy sees every worker and process,
+/// and one tree of working sets with each one's copies.
+@since(version = 1.1.0)
+interface snapshot {
+    use types.{process-id, session-id, worker-id, working-set-id, mark, duration, tier, process-state, subject, value};
+
+    @since(version = 1.1.0)
+    record process {
+        id: process-id,
+        session: option<session-id>,
+        tenant: option<string>,
+        state: process-state,
+        worker: option<worker-id>,
+        arrival: mark,
+        first-token: option<mark>,
+        /// Time spent running, and time spent pending, waiting or paused.
+        /// The host counts them: a policy that counted from events would
+        /// lose a process that started and exited between two calls.
+        service: duration,
+        waited: duration,
+        /// None while the host has not counted the prompt.
+        prompt-tokens: option<u32>,
+        /// Prompt tokens its worker would not compute again if it started
+        /// now. None before dispatch: a cluster policy reads the working
+        /// set's copies.
+        cached-tokens: option<u32>,
+        generated-tokens: u32,
+        max-tokens: option<u32>,
+    }
+
+    /// One tier of a worker.
+    @since(version = 1.1.0)
+    record room {
+        tier: tier,
+        /// None if unbounded or unknown.
+        capacity-tokens: option<u64>,
+        used-tokens: u64,
+    }
+
+    @since(version = 1.1.0)
+    record worker {
+        id: worker-id,
+        draining: bool,
+        /// The tiers it has, highest first. A pool node has no `device`.
+        tiers: list<room>,
+        running: u32,
+        waiting: u32,
+        /// Its recent time per engine step. None if it does not step.
+        step: option<duration>,
+        /// When the host last heard from it.
+        as-of: mark,
+    }
+
+    /// The first `tokens` tokens of a working set are on `worker`, in
+    /// `tier` or a higher one.
+    @since(version = 1.1.0)
+    record replica {
+        worker: worker-id,
+        tier: tier,
+        tokens: u32,
+    }
+
+    @since(version = 1.1.0)
+    record working-set {
+        id: working-set-id,
+        parent: option<working-set-id>,
+        /// None once its process exited, and for a shared working set.
+        owner: option<process-id>,
+        session: option<session-id>,
+        /// Its length from the start of the prompt, ancestors included.
+        /// Its own tokens are this less its parent's.
+        tokens: u32,
+        last-use: mark,
+        copies: list<replica>,
+    }
+
+    @since(version = 1.1.0)
+    get-processes: func() -> list<process>;
+
+    @since(version = 1.1.0)
+    get-workers: func() -> list<worker>;
+
+    @since(version = 1.1.0)
+    get-working-sets: func() -> list<working-set>;
+
+    @since(version = 1.1.0)
+    get-process: func(id: process-id) -> option<process>;
+
+    @since(version = 1.1.0)
+    get-worker: func(id: worker-id) -> option<worker>;
+
+    @since(version = 1.1.0)
+    get-working-set: func(id: working-set-id) -> option<working-set>;
+
+    /// A measured value this host reports beyond the records, named under
+    /// the host's prefix (`vllm/`, `sglang/`, `pie/`). A policy that reads
+    /// one is not portable.
+    @since(version = 1.1.0)
+    get-attr: func(subject: subject, name: string) -> option<value>;
+}
+
+/// What a client said about its own requests and sessions. Untrusted.
+@since(version = 1.1.0)
+interface hints {
+    use types.{subject, value};
+
+    @since(version = 1.1.0)
+    get: func(subject: subject, name: string) -> option<value>;
+}
+
+/// What policies say to each other, and what a policy keeps for itself
+/// across a restart. A note stays until its writer deletes it or the
+/// subject is gone.
+@since(version = 1.1.0)
+interface notes {
+    use types.{subject, value, error-code};
+
+    /// The note `name` that the policy named `writer` wrote. A policy
+    /// reads its own notes under its own name.
+    @since(version = 1.1.0)
+    get: func(subject: subject, writer: string, name: string) -> option<value>;
+
+    /// Writes this policy's own note.
+    @since(version = 1.1.0)
+    set: func(subject: subject, name: string, value: value) -> result<_, error-code>;
+
+    @since(version = 1.1.0)
+    delete: func(subject: subject, name: string);
+}
+
+@since(version = 1.1.0)
+interface alarm {
+    use types.{mark};
+
+    /// Call this policy again at `when`, with the `alarm` event. One alarm
+    /// at a time: a later `set` replaces an earlier one.
+    @since(version = 1.1.0)
+    set: func(when: mark);
+}
+
+/// The authority to end a process. The one write that cannot be undone.
+@since(version = 1.1.0)
+interface terminate {
+    use types.{process-id, error-code};
+
+    @since(version = 1.1.0)
+    terminate: func(process: process-id, reason: string) -> result<_, error-code>;
+}
+
+@since(version = 1.1.0)
+world imports {
+    @since(version = 1.1.0)
+    import types;
+    @since(version = 1.1.0)
+    import snapshot;
+    @since(version = 1.1.0)
+    import hints;
+    @since(version = 1.1.0)
+    import notes;
+    @since(version = 1.1.0)
+    import alarm;
+    @since(version = 1.1.0)
+    import terminate;
+}
