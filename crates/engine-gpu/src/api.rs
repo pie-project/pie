@@ -487,8 +487,6 @@ pub fn fault(fault: Fault) -> Error {
     }
 }
 
-const DEFAULT_STATE_SLOTS: u32 = 256;
-
 /// The load's budgets: its logit readouts sized to what `trace` reads, not a
 /// general figure, so a vocab-wide head carves only the rows a fire can read.
 fn bake_budgets(budgets: &LoadBudgets, trace: &Trace) -> Budget {
@@ -666,7 +664,14 @@ where
             budgets.max_clips,
             budgets.max_lanes,
         );
-        let slots = poem_compiler::state_slots(budgets.slots, &trace, DEFAULT_STATE_SLOTS);
+        // A served lane names its slots by ref: the only seat-addressed
+        // fires of a served load are its own naming walk's, the widest a
+        // cut's lanes, and those are the seats it is asked to lay.
+        let slots = poem_compiler::state_slots(
+            budgets.slots,
+            &trace,
+            crate::serve::naming_lanes(),
+        );
         let (disk_kv_budget, disk_kv_dir, seats) = (
             residency.disk_kv_budget,
             residency.disk_kv_dir.clone(),

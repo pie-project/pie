@@ -1430,53 +1430,40 @@ impl<B: Serve> Shell<B> {
         act_chunks.dedup_by_key(|&mut (_, chunks)| chunks);
         act_chunks.reverse();
         span.widen(&act_chunks, chunk);
-        // The load lays every seat a run of each shape for its
-        // seat-addressed fires (its own naming walk among them): as many
-        // seats as `boot.slots` asks whose runs fit the pool it laid, below
-        // the activation span, so no such fire names a chunk past the pool.
-        let lay = |seats: u32| -> Result<crate::store::layout::Layout> {
-            let layout = crate::store::layout::Layout::new(
-                chunk,
-                total,
-                segment_chunks,
-                page_size,
-                [rows.list_bytes, rows.fixed_bytes],
-                rows.pieces,
-                seats,
-                asked.pages_per_slot,
-            )?
-            .with_rs(rs_bytes, rs_tokens, asked.pages_per_slot)?
-            .with_guests(B::CHANNEL_CELLS)?;
-            rows.windows
-                .iter()
-                .enumerate()
-                .try_fold(layout, |layout, (k, w)| {
-                    layout.with_window(
-                        k,
-                        w.bytes,
-                        w.window,
-                        w.tokens,
-                        asked.context().div_ceil(w.tokens.max(1)),
-                    )
-                })
-        };
-        let state_chunks = total.saturating_sub(act_chunks.last().map_or(0, |&(_, c)| c));
-        let slots = crate::store::layout::seats_within(boot.slots, state_chunks, |seats| {
-            lay(seats).map(|layout| layout.seat_chunks())
-        })?;
-        let layout = lay(slots)?;
-        if slots < boot.slots {
-            tracing::info!(
-                asked = boot.slots,
-                seats = slots,
-                seat_chunks = layout.seat_chunks(),
-                state_chunks,
-                "the seats are fitted to the pool the load laid: each takes a run of every \
-                 shape below the activation span"
-            );
-        }
+        // The load lays each seat it is asked for a run of every shape: the
+        // chunks its seat-addressed fires name (its own naming walk's lanes,
+        // a direct caller's). Every seat's runs lie below the activation
+        // span, so the widest such fire names no chunk past the state the
+        // pool holds; a pool that cannot hold them refuses the load by name.
+        let layout = crate::store::layout::Layout::new(
+            chunk,
+            total,
+            segment_chunks,
+            page_size,
+            [rows.list_bytes, rows.fixed_bytes],
+            rows.pieces,
+            boot.slots,
+            asked.pages_per_slot,
+        )?
+        .with_rs(rs_bytes, rs_tokens, asked.pages_per_slot)?
+        .with_guests(B::CHANNEL_CELLS)?;
+        let layout = rows
+            .windows
+            .iter()
+            .enumerate()
+            .try_fold(layout, |layout, (k, w)| {
+                layout.with_window(
+                    k,
+                    w.bytes,
+                    w.window,
+                    w.tokens,
+                    asked.context().div_ceil(w.tokens.max(1)),
+                )
+            })?;
+        layout.seats_within(total.saturating_sub(act_chunks.last().map_or(0, |&(_, c)| c)))?;
         let pages =
             u64::from(layout.list.map_or(0, |list| list.per_chunk)) * u64::from(total - unindexed);
+        let slots = boot.slots;
         tracing::info!(
             chunk,
             total,
@@ -5065,6 +5052,18 @@ impl poem_exec::fire::Sink for Counting<'_> {
     }
 }
 
+/// A naming fire that cuts a mask into runs ([`Shell::cuts`]): three lanes
+/// in the class order's turn, a class each, the middle one outside the mask.
+type Cut = [usize; 3];
+
+/// The lanes of the widest seat-addressed fire a load's naming walk makes, a
+/// [`Cut`]'s: the seats a load whose lanes name their slots by ref is asked
+/// to lay.
+#[must_use]
+pub fn naming_lanes() -> u32 {
+    u32::try_from(std::mem::size_of::<Cut>() / std::mem::size_of::<usize>()).unwrap_or(u32::MAX)
+}
+
 /// One lane of a naming fire: what its class has a lane carry, all zeros.
 struct NamingLane<B: Serve> {
     word: u64,
@@ -5237,7 +5236,7 @@ impl<B: Serve> Shell<Named<B>> {
     ///
     /// A mask's three are classes whose fires the kernels admit where there
     /// are such: a class in `refused` only where no other three cut it.
-    fn cuts(&self, refused: &[bool]) -> Vec<[usize; 3]> {
+    fn cuts(&self, refused: &[bool]) -> Vec<Cut> {
         let axis = poem_ir::RowAxis::Tokens;
         let Some(order) = self.compiled.order_for(axis) else {
             return Vec::new();
@@ -5245,7 +5244,7 @@ impl<B: Serve> Shell<Named<B>> {
         let classes = self.compiled.classes.classes.len();
         let order = order.class_order(&poem_ir::ClassSet::of(0..classes));
         let mut seen: Vec<&poem_ir::ClassSet> = Vec::new();
-        let mut cuts: Vec<[usize; 3]> = Vec::new();
+        let mut cuts: Vec<Cut> = Vec::new();
         for (at, region) in self.compiled.template().iter().enumerate() {
             // A region the compiler promised whole comes in one run under
             // every fire it admits; a fire that cut it is refused.
@@ -5420,12 +5419,12 @@ impl<B: Serve> Shell<Named<B>> {
     fn asks(mut self, rung: Option<u32>) -> Result<Asks> {
         let regions = self.compiled.template().len();
         let span: Vec<u32> = self.span.rungs().iter().map(|rung| rung.tokens).collect();
-        let mixes = self.held.len() >= 3;
+        let mixes = self.held.len() >= naming_lanes() as usize;
         let rungs: Vec<u32> = rung
             .or_else(|| {
                 span.iter()
                     .copied()
-                    .filter(|&tokens| !mixes || tokens >= 3)
+                    .filter(|&tokens| !mixes || tokens >= naming_lanes())
                     .min()
             })
             .or_else(|| span.iter().copied().max())
@@ -5436,7 +5435,7 @@ impl<B: Serve> Shell<Named<B>> {
             .bound_rows(span.iter().copied().max().unwrap_or(1));
         let classes = self.compiled.classes.classes.len();
         let mut unservable: Vec<crate::naming::Unservable> = Vec::new();
-        let mut mixes: Vec<([usize; 3], poem_exec::KernelError)> = Vec::new();
+        let mut mixes: Vec<(Cut, poem_exec::KernelError)> = Vec::new();
         // The launches the walk makes of a region at most: its mask's runs
         // in the class order, or one where it launches a cut region once.
         let runs: Vec<u32> = self
@@ -5480,9 +5479,9 @@ impl<B: Serve> Shell<Named<B>> {
                 }
             }
             // Three lanes of a row or more each.
-            if tokens >= 3 && self.held.len() >= 3 {
+            if tokens >= naming_lanes() && self.held.len() >= naming_lanes() as usize {
                 mixed = true;
-                let third = u64::from(tokens / 3);
+                let third = u64::from(tokens / naming_lanes());
                 let rows = self.seat_rows().map_or(third, |seat| third.min(seat)) as u32;
                 let refused: Vec<bool> = (0..classes)
                     .map(|class| unservable.iter().any(|held| held.class == class))
