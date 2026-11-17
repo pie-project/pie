@@ -769,6 +769,10 @@ pub struct Shell<B: Serve> {
     /// ([`Shell::arm`]).
     decoding: poem_ir::ClassSet,
 
+    /// The decode attentions the trace walks, each shape once: a fire's
+    /// split class is their splits ([`Shell::split_class`]).
+    decode_shapes: Vec<crate::scratch::DecodeShape>,
+
     adapter_fact: Option<u32>,
 
     adapters: crate::adapter::Slots,
@@ -1569,6 +1573,7 @@ impl<B: Serve> Shell<B> {
 
         let weights_stream = weights.streams() || weights.gathered().is_some();
         let shelf = B::shelf(&device, &readout, weights_stream)?;
+        let decode_shapes = crate::scratch::decode_shapes(&boot.trace);
 
         let mut shell = Shell {
             preseated: Vec::new(),
@@ -1612,6 +1617,7 @@ impl<B: Serve> Shell<B> {
             masked,
             corrected,
             decoding,
+            decode_shapes,
             adapter_fact,
             adapters: adapter_slots,
 
@@ -3535,6 +3541,8 @@ impl<B: Serve> Shell<B> {
         let pages = geometries
             .first()
             .map_or(0, |geometry| geometry.indices.len() as u32);
+        // The keys the kv list's table holds: its pages, whole.
+        let held_keys = pages.saturating_mul(paging.page_size);
 
         let bucket = self
             .budgets
@@ -4022,6 +4030,7 @@ impl<B: Serve> Shell<B> {
             rung,
             caches,
             bindings,
+            held_keys,
             demand,
             guests,
         })
@@ -4082,9 +4091,79 @@ impl<B: Serve> Shell<B> {
         decode.then_some(LatticePoint { class, lanes })
     }
 
+    /// `p`'s split class: each decode shape's splits
+    /// ([`kernels_slang::attn::sdpa::decode_splits`]) at the fire's rows,
+    /// its rung's partial planes and the keys its table holds. The walk's
+    /// attention splits by the same function, whether the fire's body is
+    /// recorded or encoded, so a backend keeping recordings keys them by it.
+    pub fn split_class(&self, p: &Prepared<'_, B>) -> Result<Vec<u32>> {
+        self.split_class_at(p, p.held_keys)
+    }
+
+    fn split_class_at(&self, p: &Prepared<'_, B>, keys: u32) -> Result<Vec<u32>> {
+        let rows = p.rows.iter().map(|row| row.rows).sum::<u32>();
+        let scratch = self.span.scratch(p.rung)?;
+        Ok(self
+            .decode_shapes
+            .iter()
+            .map(|shape| {
+                let tactic = self.tuning.sdpa(self.tier, shape.head_dim);
+                let ceiling = if self.tuning.binds_split(shape.head_dim, shape.lse) {
+                    scratch.split_ceiling(shape.q_heads, rows, shape.head_dim)
+                } else {
+                    0
+                };
+                kernels_slang::attn::sdpa::decode_splits(
+                    &tactic,
+                    shape.q_heads,
+                    rows,
+                    ceiling,
+                    shape.window,
+                    keys,
+                )
+            })
+            .collect())
+    }
+
+    /// The keys a lattice fire of `p`'s lanes and rung is armed at: for each
+    /// split class a fire of them can reach, the fewest keys reaching it. A
+    /// shape's splits step up only past a multiple of its fewest keys a
+    /// split, so each class is met at one of those multiples, up to the
+    /// class the most keys reach.
+    fn split_reach(&self, p: &Prepared<'_, B>) -> Result<Vec<u32>> {
+        let most = self.split_class_at(p, u32::MAX)?;
+        let mut keys: Vec<u32> = self
+            .decode_shapes
+            .iter()
+            .zip(&most)
+            .flat_map(|(shape, &most)| {
+                let step = self
+                    .tuning
+                    .sdpa(self.tier, shape.head_dim)
+                    .split_min_keys
+                    .max(1);
+                (1..=most).map(move |k| k.saturating_mul(step))
+            })
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        let mut reach: Vec<(Vec<u32>, u32)> = Vec::new();
+        for at in keys {
+            let class = self.split_class_at(p, at)?;
+            if reach.last().is_none_or(|(held, _)| *held != class) {
+                reach.push((class, at));
+            }
+        }
+        if reach.is_empty() {
+            return Ok(vec![p.held_keys]);
+        }
+        Ok(reach.into_iter().map(|(_, at)| at).collect())
+    }
+
     /// Arms the decode lattice before the load returns: on each arm, for
-    /// each lattice class, a fire of every lane count to the ceiling, one
-    /// row a lane on seats the load sets aside for it (the fire is staged
+    /// each lattice class, a fire of every lane count to the ceiling at each
+    /// split class it reaches ([`Shell::split_class`]), one row a lane on
+    /// seats the load sets aside for it (the fire is staged
     /// and walked, never submitted, so no seat is written), which the
     /// backend records ([`Serve::arm`]). A backend that keeps no recording
     /// arms nothing. Nothing arms once the load serves.
@@ -4164,46 +4243,68 @@ impl<B: Serve> Shell<B> {
                         })
                     })
                     .collect();
-                for arm in 0..depth {
-                    // The fire takes `arm`: every other is held for it.
-                    for other in (0..depth).filter(|&other| other != arm) {
-                        self.arms.take(other);
-                    }
-                    let at = std::time::Instant::now();
-                    let staged = self.stage(StepView {
-                        lanes: &seated,
-                        attachments: &[],
-                        media: &[],
-                        clips: &[],
-                        folds: &[],
-                        done: None,
-                        guests: None,
-                    });
-                    spent.stage += at.elapsed();
-                    for other in (0..depth).filter(|&other| other != arm) {
-                        self.arms.give(other);
-                    }
-                    let mut prepared = staged?;
-                    let point = self.lattice_point(&prepared);
-                    if point != Some(LatticePoint { class, lanes }) || prepared.arm != arm {
+                // The lane count is armed at each split class it reaches,
+                // its fire holding the fewest keys of that class
+                // ([`Shell::split_reach`], known once its first fire stages
+                // its rung).
+                let mut reach: Vec<u32> = Vec::new();
+                let mut at = 0;
+                loop {
+                    for arm in 0..depth {
+                        // The fire takes `arm`: every other is held for it.
+                        for other in (0..depth).filter(|&other| other != arm) {
+                            self.arms.take(other);
+                        }
+                        let started = std::time::Instant::now();
+                        let staged = self.stage(StepView {
+                            lanes: &seated,
+                            attachments: &[],
+                            media: &[],
+                            clips: &[],
+                            folds: &[],
+                            done: None,
+                            guests: None,
+                        });
+                        spent.stage += started.elapsed();
+                        for other in (0..depth).filter(|&other| other != arm) {
+                            self.arms.give(other);
+                        }
+                        let mut prepared = staged?;
+                        let point = self.lattice_point(&prepared);
+                        if point != Some(LatticePoint { class, lanes }) || prepared.arm != arm {
+                            self.handles.rewind();
+                            return Err(program(
+                                "serve::arm",
+                                format!(
+                                    "the load's decode fire of {lanes} lane(s) of class {class} \
+                                     at arm {arm} staged at {point:?}, arm {}",
+                                    prepared.arm
+                                ),
+                            ));
+                        }
+                        if reach.is_empty() {
+                            reach = match self.split_reach(&prepared) {
+                                Ok(reach) => reach,
+                                Err(fault) => {
+                                    self.handles.rewind();
+                                    return Err(fault);
+                                }
+                            };
+                        }
+                        prepared.held_keys = reach[at];
+                        let started = std::time::Instant::now();
+                        let kept = B::arm(self, &mut prepared);
+                        spent.record += started.elapsed();
                         self.handles.rewind();
-                        return Err(program(
-                            "serve::arm",
-                            format!(
-                                "the load's decode fire of {lanes} lane(s) of class {class} at \
-                                 arm {arm} staged at {point:?}, arm {}",
-                                prepared.arm
-                            ),
-                        ));
+                        if !kept? {
+                            return Ok(None);
+                        }
+                        armed += 1;
                     }
-                    let at = std::time::Instant::now();
-                    let kept = B::arm(self, &mut prepared);
-                    spent.record += at.elapsed();
-                    self.handles.rewind();
-                    if !kept? {
-                        return Ok(None);
+                    at += 1;
+                    if at >= reach.len() {
+                        break;
                     }
-                    armed += 1;
                 }
             }
         }
@@ -4330,7 +4431,8 @@ impl<B: Serve> Shell<B> {
                     self.row_caches.streams(at) || self.expert_caches.streams(at)
                 }),
                 self.pools.segments(&self.handles)?,
-            );
+            )
+            .with_keys(p.held_keys);
             if split {
                 run.flush_between_layers();
             }
@@ -4443,6 +4545,11 @@ pub struct Prepared<'a, B: Serve> {
     pub rung: usize,
     pub caches: CacheTable,
     pub bindings: FireBindings,
+    /// The keys the fire's kv page table holds: its pages times the page
+    /// size, what attention splits and budgets its rows by. Not a binding:
+    /// a recording binds its tables at their capacity, and a fire's split
+    /// class keys it ([`Shell::split_class`]).
+    pub held_keys: u32,
     demand: Demand,
 
     pub guests: Option<B::Guests>,

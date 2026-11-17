@@ -309,7 +309,9 @@ fn decode_entry(
 /// Each query row (one a token) attends its request's cached keys, causal,
 /// one workgroup a (head, row); with `lse`, the row's base-2 LSE lands too.
 /// With `split`, rows too few to fill the device split their keys into
-/// ranges, each landing a partial the fold then weighs by its LSE.
+/// ranges, each landing a partial the fold then weighs by its LSE; `keys`
+/// are the keys the fire's page tables hold (their pages times the page
+/// size), which no row's split walks past ([`decode_splits`]).
 pub fn decode(
     ctx: &Ctx<'_>,
     tactic: Tactic,
@@ -317,6 +319,7 @@ pub fn decode(
     tables: &Tables,
     pool: &KvPool,
     window: Option<u32>,
+    keys: u32,
     head_dim: u32,
     sm_scale: f32,
     o: Tensor,
@@ -346,15 +349,8 @@ pub fn decode(
         return names.either(&[fold_kernel(lse.is_some())]);
     }
     if let Some(planes) = split {
-        let ceiling = split_ceiling(&planes, &shape, head_dim);
-        // Every page the fire's tables name: the walker splits no row past
-        // the keys it holds.
-        let keys = pool
-            .page_indices
-            .rows
-            .saturating_mul(pool.page_indices.width)
-            .saturating_mul(u32::try_from(pool.page_size).unwrap_or(0));
-        let slices = splits_for(&tactic, &shape, ceiling, window, keys);
+        let ceiling = split_ceiling(&planes, shape.q_heads, shape.rows, head_dim);
+        let slices = decode_splits(&tactic, shape.q_heads, shape.rows, ceiling, window, keys);
         if slices > 1 {
             return decode_split(
                 ctx, tactic, q, tables, pool, &shape, head_dim, sm_scale, o, lse, planes, slices,
@@ -376,11 +372,35 @@ pub fn decode(
     ctx.fire(fire.groups([shape.q_heads, shape.rows, 1]), &args)
 }
 
+/// The splits a decode of `q_heads` heads over `rows` rows takes, its
+/// partial planes holding `ceiling` splits ([`split_ceiling`]; 0 where it
+/// binds none) and its page tables `keys` keys: what [`decode`] fires,
+/// whether its body is encoded or recorded, so an engine keeping recordings
+/// keys them by it.
+#[must_use]
+pub fn decode_splits(
+    tactic: &Tactic,
+    q_heads: u32,
+    rows: u32,
+    ceiling: u32,
+    window: Option<u32>,
+    keys: u32,
+) -> u32 {
+    splits_for(tactic, q_heads, rows, ceiling, window, keys)
+}
+
 /// The splits a decode of this shape takes: enough (heads x rows x splits)
 /// workgroups to reach the device's want, no split under its fewest keys,
 /// and no more than the partial planes hold.
-fn splits_for(tactic: &Tactic, shape: &Shape, ceiling: u32, window: Option<u32>, keys: u32) -> u32 {
-    let groups = shape.q_heads.saturating_mul(shape.rows).max(1);
+fn splits_for(
+    tactic: &Tactic,
+    q_heads: u32,
+    rows: u32,
+    ceiling: u32,
+    window: Option<u32>,
+    keys: u32,
+) -> u32 {
+    let groups = q_heads.saturating_mul(rows).max(1);
     if ceiling <= 1 || groups >= tactic.split_groups {
         return 1;
     }
@@ -393,11 +413,13 @@ fn splits_for(tactic: &Tactic, shape: &Shape, ceiling: u32, window: Option<u32>,
         .clamp(1, ceiling.max(1))
 }
 
-/// The splits the partial planes hold for this shape.
-fn split_ceiling(split: &Split, shape: &Shape, head_dim: u32) -> u32 {
+/// The splits the partial planes hold for a decode of `q_heads` heads of
+/// `head_dim` over `rows` rows.
+#[must_use]
+pub fn split_ceiling(split: &Split, q_heads: u32, rows: u32, head_dim: u32) -> u32 {
     let out_room = u64::from(split.part_out.rows) * u64::from(split.part_out.width);
     let lse_room = u64::from(split.part_lse.rows) * u64::from(split.part_lse.width);
-    let lse_slice = u64::from(shape.rows) * u64::from(shape.q_heads);
+    let lse_slice = u64::from(rows) * u64::from(q_heads);
     let out_slice = lse_slice * u64::from(head_dim);
     if out_slice == 0 {
         return 0;
@@ -517,6 +539,8 @@ pub fn selected(
 
 /// Query rows tiled `tactic.tile_rows` a workgroup of one head, each attending
 /// its request's cached keys, causal; with `lse`, each row's base-2 LSE.
+/// `keys` are the keys the fire's page tables hold, which its work budget
+/// counts ([`prefill_step`]).
 pub fn prefill(
     ctx: &Ctx<'_>,
     tactic: Tactic,
@@ -524,6 +548,7 @@ pub fn prefill(
     tables: &Tables,
     pool: &KvPool,
     window: Option<u32>,
+    keys: u32,
     head_dim: u32,
     sm_scale: f32,
     o: Tensor,
@@ -567,10 +592,8 @@ pub fn prefill(
     };
     let mut args = args(OP, q, pool, tables, &shape, sm_scale, o, &extra)?;
     args.push(stated(OP, shape.rows)?.arg());
-    let keys = u64::from(pool.page_indices.rows) * pool.page_size.max(1) as u64;
-    let keys = window
-        .map_or(keys, |window| keys.min(u64::from(window)))
-        .max(1);
+    let keys = window.map_or(keys, |window| keys.min(window)).max(1);
+    let keys = u64::from(keys);
     // A naming sink is told the longest way: at the most rows and keys a
     // fire of the load may bring.
     let (rows, keys) = match ctx.naming() {
@@ -669,6 +692,105 @@ mod tests {
         }
     }
 
+    /// A fire's splits and prefill dispatches follow the keys its tables
+    /// hold, not the capacity they are bound at: at each rung of keys a
+    /// decode too narrow to fill the device splits no more than its keys
+    /// reach (one split under the fewest keys), the most only at the most
+    /// keys, and never past the planes or the device's want; a wide one
+    /// never splits. A budgeted prefill takes more dispatches only as its
+    /// keys grow.
+    #[test]
+    fn splits_and_prefill_dispatches_follow_the_keys_a_fire_holds() {
+        let tactic = Tactic {
+            tier: Tier::Subgroup,
+            narrow: false,
+            decode_threads: 256,
+            tile_rows: 16,
+            tile_lanes: 16,
+            split_groups: 96,
+            split_min_keys: 256,
+            prefill_work: 1 << 20,
+        };
+        let (q_heads, ceiling) = (16, 8);
+        let capacity = 40_960;
+        for rows in 1..=8 {
+            let want = tactic.split_groups.div_ceil(q_heads * rows);
+            let most = decode_splits(&tactic, q_heads, rows, ceiling, None, capacity);
+            if q_heads * rows >= tactic.split_groups {
+                assert_eq!(most, 1, "{rows} rows fill the device");
+            } else {
+                assert_eq!(most, want.min(ceiling), "{rows} rows at capacity");
+            }
+            let mut before = 1;
+            for keys in [1, 16, 256, 257, 512, 1024, 4096, capacity] {
+                let splits = decode_splits(&tactic, q_heads, rows, ceiling, None, keys);
+                assert!(
+                    splits >= before && splits <= most,
+                    "{rows} rows at {keys} keys: {splits} after {before}, most {most}"
+                );
+                assert!(
+                    splits <= keys.div_ceil(tactic.split_min_keys).max(1),
+                    "{rows} rows at {keys} keys split {splits} ways"
+                );
+                before = splits;
+            }
+            assert_eq!(decode_splits(&tactic, q_heads, rows, ceiling, None, 256), 1);
+            assert_eq!(
+                decode_splits(&tactic, q_heads, rows, ceiling, Some(256), capacity),
+                1,
+                "a 256-key window holds one split's keys"
+            );
+            assert_eq!(decode_splits(&tactic, q_heads, rows, 0, None, capacity), 1);
+            // Each split class k is reached at k times the fewest keys.
+            for k in 1..=most {
+                assert_eq!(
+                    decode_splits(
+                        &tactic,
+                        q_heads,
+                        rows,
+                        ceiling,
+                        None,
+                        k * tactic.split_min_keys
+                    ),
+                    k
+                );
+            }
+        }
+        let tile = 16;
+        let mut before = 0;
+        for keys in [1u64, 512, 4096, 40_960] {
+            let made = dispatches(
+                4096,
+                tile,
+                prefill_step(tactic.prefill_work, 4096, tile, Keys::Held(keys)),
+            );
+            assert!(
+                made >= before,
+                "4096 rows at {keys} keys: {made} after {before}"
+            );
+            before = made;
+        }
+        assert_eq!(
+            dispatches(
+                4096,
+                tile,
+                prefill_step(tactic.prefill_work, 4096, tile, Keys::Held(1))
+            ),
+            1
+        );
+        assert!(
+            dispatches(
+                4096,
+                tile,
+                prefill_step(tactic.prefill_work, 4096, tile, Keys::Held(512))
+            ) < dispatches(
+                4096,
+                tile,
+                prefill_step(tactic.prefill_work, 4096, tile, Keys::Held(40_960))
+            )
+        );
+    }
+
     /// A naming sink of the most rows a fire may bring, counting what is
     /// fired into it.
     struct Counted {
@@ -763,6 +885,7 @@ mod tests {
                 &tables,
                 &pool,
                 None,
+                64,
                 head_dim,
                 1.0,
                 o,

@@ -266,6 +266,10 @@ pub struct Run<'c, B: Backend> {
     /// The highest kernels-slang tier the adapter runs, where the backend's
     /// tactics read it.
     tier: kernels_slang::Tier,
+
+    /// The keys the fire's page tables hold ([`Run::with_keys`]), which
+    /// attention splits and budgets its rows by.
+    keys: u32,
 }
 
 impl<'c, B: Backend> Run<'c, B> {
@@ -320,7 +324,21 @@ impl<'c, B: Backend> Run<'c, B> {
             tuning,
             split: None,
             tier,
+            keys: 0,
         }
+    }
+
+    /// This run with the keys the fire's page tables hold: their pages
+    /// times the page size, as the fire staged them.
+    #[must_use]
+    pub fn with_keys(mut self, keys: u32) -> Self {
+        self.keys = keys;
+        self
+    }
+
+    /// The keys the fire's page tables hold.
+    pub fn keys(&self) -> u32 {
+        self.keys
     }
 
     pub fn tier(&self) -> kernels_slang::Tier {

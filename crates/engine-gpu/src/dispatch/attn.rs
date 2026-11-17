@@ -77,15 +77,15 @@ impl<B: Backend> Run<'_, B> {
         }
         let tactic = self.tuning().sdpa(self.tier(), head_dim);
         let tables = self.prefill_tables(plan, mask);
-        let (q, pool, o) = (q, *pool, o);
+        let (q, pool, o, keys) = (q, *pool, o, self.keys());
         let tiled = || {
             sdpa::prefill(
-                self.ctx, tactic, q, &tables, &pool, window, head_dim, sm_scale, o, lse,
+                self.ctx, tactic, q, &tables, &pool, window, keys, head_dim, sm_scale, o, lse,
             )
         };
         let walked = || {
             sdpa::decode(
-                self.ctx, tactic, q, &tables, &pool, window, head_dim, sm_scale, o, lse, None,
+                self.ctx, tactic, q, &tables, &pool, window, keys, head_dim, sm_scale, o, lse, None,
             )
         };
         // Which of the two a fire takes is its rows a request; a naming
@@ -125,6 +125,7 @@ impl<B: Backend> Run<'_, B> {
             self.decode_plan(plan),
             self.pool(cache),
             window,
+            self.keys(),
             head_dim,
             sm_scale,
             self.tensor(o),

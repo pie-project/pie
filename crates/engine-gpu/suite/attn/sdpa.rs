@@ -202,6 +202,8 @@ fn paged_attention_answers_the_reference() {
             (KVH * hd) as u64,
             hd as u64,
         );
+        // The keys the page table holds: its pages, whole.
+        let held = (PAGES.len() * PAGE) as u32;
         let spool = kernels_slang::KvPool::planes(
             pool.keys,
             pool.values,
@@ -341,6 +343,7 @@ fn paged_attention_answers_the_reference() {
                                     &tables,
                                     &spool,
                                     win,
+                                    held,
                                     hd as u32,
                                     scale as f32,
                                     ot,
@@ -365,6 +368,7 @@ fn paged_attention_answers_the_reference() {
                                     &tables,
                                     &spool,
                                     win,
+                                    held,
                                     hd as u32,
                                     scale as f32,
                                     ot,

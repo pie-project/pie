@@ -236,7 +236,7 @@ impl Serve for Api {
         let Some(point) = point else {
             return Ok(Plan::Walk { keep: None, split });
         };
-        let key = composition_key(prepared);
+        let key = composition_key(shell, prepared)?;
         let binds = binding_key(shell, prepared);
         let launches = match shell.shelf.recorder.get(key) {
             Some(recording) if recording.binds == binds => recording.launches,
@@ -358,7 +358,7 @@ impl Serve for Api {
                 ),
             });
         }
-        let key = composition_key(prepared);
+        let key = composition_key(shell, prepared)?;
         let binds = binding_key(shell, prepared);
         let (frame, launches, cuts) = shell.walk_kept(prepared)?;
         let kept = frame.into_kept()?;
@@ -496,11 +496,14 @@ impl Serve for Api {
     }
 }
 
-/// A decode fire's composition and arm: what its recording is kept under.
-/// A recording binds its tables at their capacity (the kv pages' indices,
-/// the bindings and windows over them), and copies its reads behind it, so
-/// the fire's lanes' pages and reads are no part of it.
-fn composition_key(p: &Prepared<'_, Api>) -> crate::record::Key {
+/// A decode fire's composition, split class and arm: what its recording is
+/// kept under. A recording binds its tables at their capacity (the kv
+/// pages' indices, the bindings and windows over them), and copies its
+/// reads behind it, so the fire's lanes' pages and reads are no part of it;
+/// the keys its tables hold are, as the splits its attention takes
+/// ([`Shell::split_class`]).
+fn composition_key(shell: &Shell<Api>, p: &Prepared<'_, Api>) -> Result<crate::record::Key> {
+    let split = shell.split_class(p)?;
     let mut key = crate::record::KeyBuilder::new();
     key.bytes(&p.descriptor.pack());
     // The tables run to a slot per traced value; hashing them field by
@@ -511,7 +514,8 @@ fn composition_key(p: &Prepared<'_, Api>) -> crate::record::Key {
     // another rung binds other bytes under the same handles.
     key.shown(&p.rung);
     key.shown(&p.arm);
-    key.finish()
+    key.hashed(&split);
+    Ok(key.finish())
 }
 
 /// What a fire binds beside its composition: the cache table, the

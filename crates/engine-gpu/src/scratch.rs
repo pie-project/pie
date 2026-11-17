@@ -420,6 +420,27 @@ impl<'a, B: Backend> FireScratch<'a, B> {
         Some(self.bind(handles, self.rooms.index?))
     }
 
+    /// The splits this fire's partial planes hold for a decode of `q_heads`
+    /// heads of `head_dim` over `rows` rows
+    /// ([`kernels_slang::attn::sdpa::split_ceiling`]); 0 where it lays none.
+    #[must_use]
+    pub fn split_ceiling(&self, q_heads: u32, rows: u32, head_dim: u32) -> u32 {
+        let Some(rooms) = self.rooms.split else {
+            return 0;
+        };
+        let plane =
+            |room: Room| Tensor::new(kernels_slang::ABSENT, room.rows, room.width, room.dtype);
+        kernels_slang::attn::sdpa::split_ceiling(
+            &kernels_slang::attn::sdpa::Split {
+                part_out: plane(rooms.part_out),
+                part_lse: plane(rooms.part_lse),
+            },
+            q_heads,
+            rows,
+            head_dim,
+        )
+    }
+
     pub fn split(&self, handles: &Handles<B>) -> Option<Result<kernels_slang::attn::sdpa::Split>> {
         let rooms = self.rooms.split?;
         Some((|| {
@@ -517,6 +538,59 @@ pub fn decodes(trace: &Trace) -> Vec<(u32, bool)> {
             continue;
         };
         let decode = (*head_dim, lse.is_some());
+        if !out.contains(&decode) {
+            out.push(decode);
+        }
+    }
+    out
+}
+
+/// A decode `trace` walks over a row's keys, whole or split: what its
+/// splits are a function of beside the fire's rows and keys
+/// ([`kernels_slang::attn::sdpa::decode_splits`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecodeShape {
+    pub q_heads: u32,
+    pub head_dim: u32,
+    pub window: Option<u32>,
+    pub lse: bool,
+}
+
+/// The decodes [`decodes`] names, each shape once: its query heads from its
+/// query row's width.
+#[must_use]
+pub fn decode_shapes(trace: &Trace) -> Vec<DecodeShape> {
+    let mut out: Vec<DecodeShape> = Vec::new();
+    for node in &trace.nodes {
+        let Operation::Attn(Attn::Decode {
+            q,
+            head_dim,
+            window,
+            lse,
+            selection: None,
+            bias: None,
+            selected: None,
+            rel: None,
+            ..
+        }) = &node.op
+        else {
+            continue;
+        };
+        let Some(Ty::Tensor { shape, .. }) = trace.values.get(q.0 as usize).map(|v| &v.ty) else {
+            continue;
+        };
+        let Some(&Dim::Const(width)) = shape.last() else {
+            continue;
+        };
+        if *head_dim == 0 || width % u64::from(*head_dim) != 0 {
+            continue;
+        }
+        let decode = DecodeShape {
+            q_heads: u32::try_from(width / u64::from(*head_dim)).unwrap_or(u32::MAX),
+            head_dim: *head_dim,
+            window: *window,
+            lse: lse.is_some(),
+        };
         if !out.contains(&decode) {
             out.push(decode);
         }
