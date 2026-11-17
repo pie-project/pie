@@ -2334,8 +2334,8 @@ milestone's tail.
     its gain is inside the error: E2B 3.2 µs (an E4B-seeded G2=11, G2W=27), E4B 4.4 µs, 12B 3.9 µs
     (G2=15, GA=4, PY=282: the chip measured that move at 0.9505 against 0.9495, no gain), gpt-oss
     3.2 µs (G2=14, G2W=21); none was run on the chip.
-  - **Where it does not, plainly**: with the model's own measured program left out of the
-    starting points (its measurement still priced; `wafer-compile search --unpinned 1`, at the
+  - **Where it does not, plainly** (superseded by part B's cold search): with the model's own
+    measured program left out of the starting points (its measurement still priced, at the
     measured program's positions), the walk from the other models' programs reaches it for
     Llama alone (G2=11 and all, from the 9B's). For the rest it stops at a slower partition: the
     0.8B at 0.313 ms (measured 0.292), the 4B 0.484 (0.480), the 9B 0.517 (0.510), Qwen3-8B 0.557
@@ -2343,6 +2343,65 @@ milestone's tail.
     only full-size programs) find nothing that builds. The ladders of single and paired key moves
     do not cross between these partitions: a model the chip has not run is planned from its
     kernel set's measured programs and may land short of what a hand search would find.
+
+## Consolidation, part B: cold search
+
+- **Why the 12B and gpt-oss found nothing cold.** Started from the other models' programs, the
+  search's only seeds of their kernel sets were the simulator's tiny plans (`tiny-g12`,
+  `tiny-gptoss`: PX 8, PY 4..8). Their repair moves a key at a time a few steps along a ladder
+  of ratios, following refusals; from units of 8 columns to the hundreds the constructors need
+  (the attention columns a KV head's segment, the experts' columns their router's, the hidden
+  over the rows, every unit one layer pattern) it never reaches a partition that plans: a hole in
+  the space between the seeds and the model, not an infeasibility. No move was missing; the
+  starting point was.
+- **The fix, generic: start from the layer graph** (`cold`). Each kernel set's constructor reads
+  a few structural keys; their values are drawn from what the shape divides (the layers into
+  units of one repeated pattern, the KV / key / value heads over the columns, the MLP or the
+  experts' dims over them, the hidden over the rows, the window over the KV rows) and from the
+  fabric's size (750 x 1,153), the rest at the kernels' defaults (a set's levers and reduction
+  groups). Every combination the constructor plans and that serves the positions asked for is
+  priced; the fastest few that build (at most two of a unit count, eight in all) are the walk's
+  starting points. No named plan or measured program is a seed any more: a measured program is a
+  candidate priced at its measurement (the walks may or may not reach it), and its step
+  calibrates the layer terms.
+- **Cold, against the measured partitions priced alike** (`cold::tests`; the time model's
+  partition terms, the layer cost by its kinds; the measured program's positions; search time on
+  the shared host, the nine in parallel):
+
+  | model | measured partition | cold search's | gap | time |
+  |---|---|---|---|---|
+  | Qwen3.5 0.8B | 0.2964 | 0.2938 | -0.9% | 10 s |
+  | Qwen3.5 4B | 0.4701 | 0.4677 | -0.5% | 9 s |
+  | Qwen3.5 9B | 0.5141 | 0.5140 | -0.0% (its own partition) | 9 s |
+  | Llama 3.1 8B | 0.4830 | 0.4830 | 0.0% (its partition, G2=11 included) | 29 s |
+  | Qwen3-8B | 0.4988 | 0.4975 | -0.3% | 27 s |
+  | Gemma 4 E2B | 0.7105 | 0.7017 | -1.2% | 20 s |
+  | Gemma 4 E4B | 0.8326 | 0.8293 | -0.4% | 22 s |
+  | Gemma 4 12B | 0.8900 | 0.8582 | -3.6% | 105 s |
+  | gpt-oss-20b | 0.7132 | 0.7100 | -0.4% | 11 s |
+
+  Every model builds cold and lands at or under its measured partition's price. That is the
+  model's verdict, not the chip's: the cold partitions are unmeasured, and the moves the chip did
+  measure the model followed to 6.6 µs RMS, 21 µs at most. (The earlier 0.3-7% gaps were the walk
+  from other models' programs not reaching these: the 0.8B's from the 4B's, at 16,384 positions.)
+- **A model the chip measured** plans its measured partition unless an unmeasured one predicts
+  more than the model's largest held-out error faster (`search::UNMEASURED`, 21 µs): eight of
+  the nine plan their measured programs byte for byte (the 9B and Llama the walk's own, the rest
+  the measured candidate). **The 12B now plans a cold partition** (RA 256 attention rows of 15
+  dims, one plain row of 14, PY 257, PX 345, G2 15, head groups of 4: 31.8 µs, 3.6% under its
+  measured one's price; it builds and passes the check, its least room 2.5 KB by the memory
+  model). The chip has not run it: it wants a session, and a load whose link fails falls back
+  to the search's next.
+- **The layer terms fitted to the nine** (`time::KIND_LAYER`: a layer's own cost by its mixer's
+  kind, gated delta 8.0 µs, full attention 5.7, sliding 10.7, shared-KV 19.7; least squares over
+  the nine measured steps past their partitions' terms). Held out a model at a time, a step:
+  0.8B +2.3%, 4B -3.1%, 9B +1.2%, Llama +5.3%, Qwen3-8B -17.8%, E2B +11.6%, E4B -8.1%, 12B -22.9%,
+  gpt-oss +13.3%; 11.8% RMS (the median layer it replaces: up to 37% off, the Gemmas). What the
+  kinds leave out (a q / k norm, a kernel set's own phases) is a model's, so a measured model's
+  own layer cost stands; no partition's choice reads it (every partition of a model has its
+  layers), only a step's absolute time does.
+- A load's fallbacks are the search's next two; `wafer-compile search --cold 1` prices nothing by
+  a measurement.
 
 ## G1: the poem survey
 
