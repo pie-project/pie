@@ -974,6 +974,37 @@ impl TileProgram {
 /// The program at a top tile of `th0 x tw0` pixels (the image array the top grid over it):
 /// its slots, buffers and tape, or why it does not fit.
 pub fn place(p: &mut TileProgram, th0: u32, tw0: u32, bounds: Option<(u32, u32)>) -> R<()> {
+    place_with(p, th0, tw0, bounds, Chunks::default())
+}
+
+/// A convolution's staged channels and weight block at most: a point's choice (smaller, a PE
+/// holds less staging and block for more passes and blocks).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Chunks {
+    /// A convolution's staged channels at most.
+    pub kc: u32,
+    /// A weight block's words at most (two 16-bit weights a word).
+    pub wb: u32,
+}
+
+impl Default for Chunks {
+    fn default() -> Self {
+        Chunks {
+            kc: KC,
+            wb: WB_WORDS,
+        }
+    }
+}
+
+/// [`place`] with `chunks` for the staged channels and the weight block.
+pub fn place_with(
+    p: &mut TileProgram,
+    th0: u32,
+    tw0: u32,
+    bounds: Option<(u32, u32)>,
+    chunks: Chunks,
+) -> R<()> {
+    let (kc_most, wb_most) = (chunks.kc, chunks.wb);
     let (h, w) = p.top();
     if !h.is_multiple_of(th0) || !w.is_multiple_of(tw0) {
         return Err(format!("a {th0} x {tw0} tile over {h} x {w}"));
@@ -986,19 +1017,19 @@ pub fn place(p: &mut TileProgram, th0: u32, tw0: u32, bounds: Option<(u32, u32)>
     for i in 0..p.ops.len() {
         if let TOp::Conv { cin, cout, .. } = p.ops[i] {
             let k3 = matches!(p.ops[i], TOp::Conv { k: 3, .. });
-            let mut kc = cin.min(KC);
+            let mut kc = cin.min(kc_most);
             while kc > 1 && (!cin.is_multiple_of(kc) || (k3 && kc % 2 != 0)) {
                 kc -= 1;
             }
             let mut kb = kc;
             while kb > 1
-                && (kb * cout > 2 * WB_WORDS || !kc.is_multiple_of(kb) || (kb * cout) % 2 != 0)
+                && (kb * cout > 2 * wb_most || !kc.is_multiple_of(kb) || (kb * cout) % 2 != 0)
             {
                 kb -= 1;
             }
-            if (kb * cout) % 2 != 0 || kb * cout > 2 * WB_WORDS {
+            if (kb * cout) % 2 != 0 || kb * cout > 2 * wb_most {
                 return Err(format!(
-                    "op {i}: a convolution to {cout} channels: no block of rows fits {WB_WORDS} words"
+                    "op {i}: a convolution to {cout} channels: no block of rows fits {wb_most} words"
                 ));
             }
             p.kb[i] = kb;
@@ -1184,6 +1215,21 @@ pub fn program(
     bounds: Option<(u32, u32)>,
 ) -> R<TileProgram> {
     program_upto(trace, reading, clip, round16, pin, bounds, None)
+}
+
+/// The program at top tile `tile` with `chunks` (a point [`points`] lists).
+pub fn program_with(
+    trace: &Trace,
+    reading: &str,
+    clip: [u32; 3],
+    round16: bool,
+    tile: (u32, u32),
+    chunks: Chunks,
+    bounds: Option<(u32, u32)>,
+) -> R<TileProgram> {
+    let mut p = lower(trace, reading, clip, round16)?;
+    place_with(&mut p, tile.0, tile.1, bounds, chunks)?;
+    Ok(p)
 }
 
 /// [`program`] over its first `upto` ops alone (a part of a reading on the simulator), the value

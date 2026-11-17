@@ -374,14 +374,32 @@ fn stream(args: &[String]) -> Result<(), String> {
         };
         if get("--regime").as_deref() == Some("tiled") {
             let bounds = kernels_cerebras::floorplan::stream::Bounds::system();
-            let p = kernels_cerebras::stream::tiled::program(
-                &trace,
-                &reading,
-                clip,
-                !ieee,
-                tile,
-                Some((bounds.w, bounds.h)),
-            )?;
+            // `--chunks KC,WB`: the staged channels and weight block at most (with `--tile`)
+            let p = match (get("--chunks"), tile) {
+                (Some(c), Some(t)) => {
+                    let v: Vec<u32> = c.split(',').filter_map(|x| x.parse().ok()).collect();
+                    let [kc, wb] = v[..] else {
+                        return Err(format!("--chunks {c}: kc,wb"));
+                    };
+                    kernels_cerebras::stream::tiled::program_with(
+                        &trace,
+                        &reading,
+                        clip,
+                        !ieee,
+                        t,
+                        kernels_cerebras::stream::tiled::Chunks { kc, wb },
+                        Some((bounds.w, bounds.h)),
+                    )?
+                }
+                _ => kernels_cerebras::stream::tiled::program(
+                    &trace,
+                    &reading,
+                    clip,
+                    !ieee,
+                    tile,
+                    Some((bounds.w, bounds.h)),
+                )?,
+            };
             let c = kernels_cerebras::cost::tiled::time(&p);
             let (fw, fh) = p.fabric();
             println!(
@@ -505,6 +523,7 @@ fn stream(args: &[String]) -> Result<(), String> {
         "--batch-most",
         "--py",
         "--tile",
+        "--chunks",
         "--cut",
         "--spill",
         "--fabric-width",
