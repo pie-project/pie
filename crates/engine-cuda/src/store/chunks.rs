@@ -1097,3 +1097,149 @@ impl Chunks {
         }
     }
 }
+
+#[cfg(all(test, feature = "device"))]
+mod skip_tests {
+    use super::*;
+    use crate::store::layout::{CHANNEL, CHANNEL_SLOT, INSTANCE, INSTANCE_SLOT};
+
+    const CHUNK: u64 = 2 << 20;
+    const SEGMENT: u32 = 4;
+
+    fn guest(id: engine::chunk::ShapeId, slot_bytes: u64) -> SlotShape {
+        SlotShape {
+            id,
+            tokens: 0,
+            slot_bytes,
+            per_chunk: u32::try_from(CHUNK / slot_bytes).expect("slots a chunk"),
+            grain: 1,
+            window: None,
+            rows: Vec::new(),
+            pools: Vec::new(),
+        }
+    }
+
+    /// A range of 16 state chunks in segments of 4, 4 of activation above,
+    /// nothing backed.
+    fn range(pool: &PhysicalPool) -> Chunks {
+        let layout = Layout {
+            chunk_bytes: CHUNK,
+            segment_chunks: SEGMENT,
+            list: None,
+            windows: Vec::new(),
+            fixed: None,
+            rs: None,
+            instance: guest(INSTANCE, INSTANCE_SLOT),
+            channel: guest(CHANNEL, CHANNEL_SLOT),
+            rows: Vec::new(),
+            experts: Vec::new(),
+        };
+        Chunks::reserve(pool, layout, 16, 4 * CHUNK).expect("the range reserves")
+    }
+
+    /// Where the runtime's physical chunk `id` lies.
+    fn address(chunks: &Chunks, id: u32) -> u64 {
+        chunks.base() + u64::from(chunks.at(id)) * CHUNK
+    }
+
+    /// The runtime's live limit as the facts state it: no run is placed at
+    /// or past it (`SlotPool::live_limit`, its total less its widest rung's
+    /// activation).
+    fn live_limit(chunks: &Chunks) -> u32 {
+        let facts = chunks.facts(1024, false, &[]);
+        let act = facts
+            .act_chunks
+            .iter()
+            .map(|&(_, act)| act)
+            .max()
+            .unwrap_or(0);
+        facts.total_chunks - act
+    }
+
+    /// Every run of `run` ids the runtime could take inside one of its
+    /// segments under its live limit lies at adjacent addresses: each
+    /// member's chunk exactly a chunk past the one before.
+    fn every_run_adjacent(chunks: &Chunks, run: u32) {
+        let limit = live_limit(chunks);
+        for segment in 0..limit.div_ceil(SEGMENT) {
+            let (from, to) = (segment * SEGMENT, ((segment + 1) * SEGMENT).min(limit));
+            for first in from..to.saturating_sub(run - 1) {
+                for id in first..first + run - 1 {
+                    assert_eq!(
+                        address(chunks, id + 1) - address(chunks, id),
+                        CHUNK,
+                        "run {first}..{} of segment {segment}: ids {id} and {} not adjacent",
+                        first + run,
+                        id + 1
+                    );
+                }
+            }
+        }
+    }
+
+    /// A fitted range whose skip lies mid-segment (a pool stated in one run
+    /// from its base, fitted to 10 of 16 chunks): a run bound up to the
+    /// skip's edge lies below it at adjacent addresses, and no run is
+    /// placed across it: the runtime's live limit is the skip, and nothing
+    /// is lent above it (the state does not meet the activation).
+    ///
+    /// A skip with state ids above it lies at a segment's edge: the range
+    /// parts only there (`Range::part`). The runtime's ids are compacted
+    /// across the skip (id `skip.0` is the range's chunk `skip.0 +
+    /// skip.1`), so a run is adjacent only because its segment lies whole
+    /// on one side of the skip.
+    #[test]
+    fn a_run_up_to_a_mid_segment_skip_lies_below_it_and_none_crosses_it() {
+        let _context = crate::device::Context::bind(0, None).expect("a device context");
+        let pool = PhysicalPool::open(0, 1 << 30).expect("the pool opens");
+
+        let mut chunks = range(&pool);
+        chunks
+            .state_fitted(10, true)
+            .expect("the pool fits 10 chunks");
+        assert_eq!(chunks.skip, (10, 6));
+        assert!(
+            !chunks.skip.0.is_multiple_of(SEGMENT),
+            "the skip mid-segment"
+        );
+        assert_eq!(
+            live_limit(&chunks),
+            10,
+            "no run is placed at the skip or past it"
+        );
+        assert!(
+            !chunks.state_meets_activation(),
+            "nothing is lent above the skip"
+        );
+        // A run of two up to the skip's edge: ids 8 and 9, the skip's
+        // segment's first chunks.
+        assert_eq!(address(&chunks, 9) - address(&chunks, 8), CHUNK);
+        assert!(address(&chunks, 9) + CHUNK <= chunks.base() + 10 * CHUNK);
+        // Across it the next id lies past the skipped chunks: it is the
+        // activation's first chunk, never a state run's.
+        assert_eq!(address(&chunks, 10), chunks.activation_base());
+        assert_ne!(address(&chunks, 10) - address(&chunks, 9), CHUNK);
+        for run in 1..=SEGMENT {
+            every_run_adjacent(&chunks, run);
+        }
+
+        // Parted: the pool's first segment from the base, the rest in one
+        // run under the activation, the skip at a segment's edge.
+        let mut chunks = range(&pool);
+        chunks
+            .state_fitted(10, false)
+            .expect("the pool fits 10 chunks");
+        assert_eq!(chunks.skip, (4, 6));
+        assert!(chunks.skip.0.is_multiple_of(SEGMENT));
+        assert_eq!(live_limit(&chunks), 10);
+        assert!(chunks.state_meets_activation());
+        assert_eq!(
+            address(&chunks, 4),
+            chunks.base() + 10 * CHUNK,
+            "the ids are compacted across the skip"
+        );
+        for run in 1..=SEGMENT {
+            every_run_adjacent(&chunks, run);
+        }
+    }
+}
