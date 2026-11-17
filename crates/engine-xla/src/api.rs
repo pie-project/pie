@@ -373,7 +373,11 @@ impl Xla {
                 frame: id,
                 step: index as u32,
             };
-            let latch = crate::program::Latch::new(at, self.sink.clone());
+            let latch = crate::program::Latch::new(
+                at,
+                u32::try_from(step.lanes.len()).unwrap_or(u32::MAX),
+                self.sink.clone(),
+            );
             // A step refused before it fires leaves no device fold's
             // position behind: what it noted of where its folds would leave
             // their states goes with it (its latched report is never told).

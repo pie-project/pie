@@ -376,7 +376,7 @@ impl Model {
         let bits = self.settled(&mut ticket);
         assert_eq!(
             self.outcome(&ticket),
-            self.asynchronous.then_some(StepOutcome::Committed),
+            self.asynchronous.then(StepOutcome::committed),
             "a fire whose fold lengths the host states reports no fold"
         );
         bits
@@ -419,7 +419,10 @@ impl Model {
     /// reported them under `tag`.
     fn reported(&mut self, ticket: &FrameTicket, tag: u64) -> Option<u32> {
         match self.outcome(ticket) {
-            Some(StepOutcome::Wrote(writes)) => {
+            Some(StepOutcome {
+                wrote: writes,
+                faulted,
+            }) if !writes.is_empty() && faulted.is_empty() => {
                 assert_eq!(writes.len(), 1, "one lane reports: {writes:?}");
                 let report = &writes[0];
                 assert_eq!(report.tag, tag, "the report carries the lane's tag");

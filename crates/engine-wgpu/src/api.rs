@@ -67,21 +67,33 @@ impl Host for Api {
         step: &Step,
         at: engine::StepDone,
     ) -> EngineResult<(FireTicket, PendingStep)> {
-        gpu.fire_step(step, at, false)
+        gpu.fire_step(step, at, false, None)
     }
 
     fn submitted(_gpu: &Wgpu) {}
 
-    fn run_prologues(gpu: &mut Wgpu, step: &Step) -> EngineResult<()> {
-        run_prologues(gpu, step)
+    fn run_prologues(
+        gpu: &mut Wgpu,
+        step: &Step,
+        faulted: &mut engine::StepOutcome,
+    ) -> EngineResult<()> {
+        run_prologues(gpu, step, faulted)
     }
 
-    fn envelope(gpu: &mut Wgpu, step: &Step, envelope: &mut Envelope<Api>) -> EngineResult<()> {
-        for attachment in &step.attachments {
-            let lane_count = gpu
-                .programs
-                .lane_count(attachment.instance)
-                .map_err(refusal)?;
+    fn envelope(
+        gpu: &mut Wgpu,
+        step: &Step,
+        envelope: &mut Envelope<Api>,
+        faulted: &mut engine::StepOutcome,
+    ) -> EngineResult<()> {
+        'attachments: for attachment in &step.attachments {
+            let lane_count = match gpu.programs.lane_count(attachment.instance) {
+                Ok(count) => count,
+                Err(refused) => {
+                    envelope.refused(step, attachment, &refused.to_string(), faulted);
+                    continue;
+                }
+            };
             for lane_at in 0..lane_count {
                 let lane_index = attachment.lane as usize + lane_at;
                 let Some(lane) = step.lanes.get(lane_index) else {
@@ -91,15 +103,31 @@ impl Host for Api {
                         step.lanes.len()
                     )));
                 };
-                envelope.tokens[lane_index] = gpu
+                let resolved = gpu
                     .programs
                     .envelope_tokens(attachment.instance, lane.tokens.len(), lane_at)
-                    .map_err(refusal)?;
-                if lane.mask.is_none() {
-                    envelope.masks[lane_index] = gpu
-                        .programs
-                        .envelope_mask(attachment.instance, lane.tokens.len(), lane_at)
-                        .map_err(refusal)?;
+                    .and_then(|tokens| {
+                        let mask = match lane.mask {
+                            Some(_) => None,
+                            None => gpu.programs.envelope_mask(
+                                attachment.instance,
+                                lane.tokens.len(),
+                                lane_at,
+                            )?,
+                        };
+                        Ok((tokens, mask))
+                    });
+                match resolved {
+                    Ok((tokens, mask)) => {
+                        envelope.tokens[lane_index] = tokens;
+                        if lane.mask.is_none() {
+                            envelope.masks[lane_index] = mask;
+                        }
+                    }
+                    Err(refused) => {
+                        envelope.refused(step, attachment, &refused.to_string(), faulted);
+                        continue 'attachments;
+                    }
                 }
             }
         }
@@ -111,8 +139,14 @@ impl Host for Api {
     }
 }
 
+/// Runs `submission`'s prologues, each on its own: one that refuses (its
+/// instance poisoned in an earlier step, a guard) faults its own lanes.
 #[cfg(feature = "wgpu")]
-fn run_prologues(gpu: &mut Wgpu, submission: &Step) -> EngineResult<()> {
+fn run_prologues(
+    gpu: &mut Wgpu,
+    submission: &Step,
+    faulted: &mut engine::StepOutcome,
+) -> EngineResult<()> {
     let mut prologues = program_attachments(submission)
         .filter(|attachment| gpu.programs.prologue_runs(attachment.instance))
         .peekable();
@@ -120,16 +154,19 @@ fn run_prologues(gpu: &mut Wgpu, submission: &Step) -> EngineResult<()> {
         return Ok(());
     }
     let device = gpu.loaded()?.device().clone();
-    for attachment in prologues {
-        gpu.programs
-            .fire_prologue(&device, attachment.instance)
-            .map_err(refusal)?;
-    }
+    let programs = &gpu.programs;
+    engine_gpu::api::each_pass(prologues, "prologue", faulted, |attachment| {
+        programs.fire_prologue(&device, attachment.instance)
+    });
     Ok(())
 }
 
 #[cfg(not(feature = "wgpu"))]
-fn run_prologues(gpu: &mut Wgpu, submission: &Step) -> EngineResult<()> {
+fn run_prologues(
+    gpu: &mut Wgpu,
+    submission: &Step,
+    _faulted: &mut engine::StepOutcome,
+) -> EngineResult<()> {
     if program_attachments(submission)
         .any(|attachment| gpu.programs.prologue_runs(attachment.instance))
     {

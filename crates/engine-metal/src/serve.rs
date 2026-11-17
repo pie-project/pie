@@ -5343,18 +5343,21 @@ impl engine::frame::Shell for Shell {
         let done = prepared.done.take();
         let ends = std::mem::take(&mut prepared.ends);
         let verdict = self.ane.as_ref().and_then(crate::ane::Ane::verdict);
+        let lanes = u32::try_from(prepared.lanes.len()).unwrap_or(u32::MAX);
         // What the fire tells its completion sink once its buffer completed:
         // its folds and ends, or why it failed.
         let tell: Told = Box::new(move |refused: Option<String>| {
             let refused = refused.or_else(|| verdict.as_ref().and_then(|verdict| verdict()));
             if let Some(done) = done.as_ref() {
                 let outcome = match &refused {
-                    None if ends.is_empty() => engine::StepOutcome::Committed,
-                    None => engine::StepOutcome::Wrote(ends.clone()),
-                    Some(why) => engine::StepOutcome::Faulted(format!(
-                        "metal command buffer for frame {} step {}: {why}",
-                        done.at.frame, done.at.step
-                    )),
+                    None => engine::StepOutcome::wrote(ends.clone()),
+                    Some(why) => engine::StepOutcome::lost(
+                        lanes,
+                        format!(
+                            "metal command buffer for frame {} step {}: {why}",
+                            done.at.frame, done.at.step
+                        ),
+                    ),
                 };
                 (done.sink)(done.at, outcome);
             }
