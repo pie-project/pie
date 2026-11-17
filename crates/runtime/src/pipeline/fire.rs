@@ -1121,7 +1121,8 @@ fn host_cuts_from(
     tail: u32,
     start: u32,
 ) -> Vec<(u32, u32)> {
-    let rows = |lane: &::engine::Lane| u32::try_from(lane.tokens.len()).unwrap_or(u32::MAX);
+    let rows =
+        |lane: &crate::engine::FireLane| u32::try_from(lane.tokens.len()).unwrap_or(u32::MAX);
     let [lane] = req.lanes.as_slice() else {
         return vec![(0, req.lanes.first().map_or(0, rows))];
     };
@@ -1231,7 +1232,7 @@ fn rows_of_lanes(
             }
             lane.kv.held += from;
             let len = lane.kv.held + (to - from);
-            lane.kv.pages.truncate(len.div_ceil(page.max(1)) as usize);
+            lane.pages.truncate(len.div_ceil(page.max(1)) as usize);
             if last {
                 if let ::engine::Readout::Rows(read) = &mut lane.readout {
                     for row in read.iter_mut() {
@@ -2733,7 +2734,7 @@ pub(crate) fn map_lane_pages(
         if lanes.iter().all(|&lane| {
             req.lanes
                 .get(lane)
-                .is_none_or(|lane| lane.kv.pages.is_empty())
+                .is_none_or(|lane| lane.pages.is_empty())
         }) {
             continue;
         }
@@ -2742,7 +2743,7 @@ pub(crate) fn map_lane_pages(
             let Some(lane) = req.lanes.get_mut(lane) else {
                 continue;
             };
-            map_pages(&mut lane.kv.pages, &table)?;
+            map_pages(&mut lane.pages, &table)?;
         }
     }
     Ok(())
@@ -2782,7 +2783,7 @@ fn stamp_lane_translation(
         let table = working_set_flat_table(stores, *ws)?;
         for &lane in lanes {
             if let Some(lane) = req.lanes.get_mut(lane) {
-                lane.kv.translation.clone_from(&table);
+                lane.translation.clone_from(&table);
             }
         }
     }
@@ -5346,9 +5347,12 @@ async fn fire_device_geometry<C: FireContext>(
         boundary_program: true,
         lanes: resolved_qo_indptr
             .windows(2)
-            .map(|span| ::engine::Lane {
-                tokens: vec![0; (span[1] - span[0]) as usize],
-                ..::engine::Lane::default()
+            .map(|span| {
+                ::engine::Lane {
+                    tokens: vec![0; (span[1] - span[0]) as usize],
+                    ..::engine::Lane::default()
+                }
+                .into()
             })
             .collect(),
         carried: counted.carried,
@@ -6449,10 +6453,10 @@ mod cut_tests {
     }
 
     fn prefill_lane(held: u32, rows: u32, page: u32) -> crate::engine::FireRequest {
-        let mut lane = ::engine::Lane::decode(0, 0, 1, 0);
+        let mut lane: crate::engine::FireLane = ::engine::Lane::decode(0, 0, 1, 0).into();
         lane.tokens = (0..rows).map(|t| t + 100).collect();
         lane.kv.held = held;
-        lane.kv.pages = (0..(held + rows).div_ceil(page)).collect();
+        lane.pages = (0..(held + rows).div_ceil(page)).collect();
         lane.readout = ::engine::Readout::Last;
         let mut req = crate::engine::FireRequest::one(lane);
         req.boundary_program = true;
@@ -6499,7 +6503,7 @@ mod cut_tests {
         let first = rows_of_lanes(&req, &[Some((0, 27))], false, 16);
         let lane = &first.lanes[0];
         assert_eq!(
-            (lane.kv.held, lane.tokens.len(), lane.kv.pages.len()),
+            (lane.kv.held, lane.tokens.len(), lane.pages.len()),
             (5, 27, 2)
         );
         assert_eq!(lane.tokens[0], 100);
@@ -6511,7 +6515,7 @@ mod cut_tests {
         let tail = rows_of_lanes(&req, &[Some((91, 100))], true, 16);
         let lane = &tail.lanes[0];
         assert_eq!(
-            (lane.kv.held, lane.tokens.len(), lane.kv.pages.len()),
+            (lane.kv.held, lane.tokens.len(), lane.pages.len()),
             (96, 9, 7)
         );
         assert_eq!(lane.tokens[0], 191);
@@ -6731,21 +6735,21 @@ pub(crate) mod fold_tests {
 
     fn request(lanes: usize) -> crate::engine::FireRequest {
         crate::engine::FireRequest {
-            lanes: (0..lanes).map(|_| ::engine::Lane::default()).collect(),
+            lanes: (0..lanes).map(|_| crate::engine::FireLane::default()).collect(),
             ..crate::engine::FireRequest::default()
         }
     }
 
     fn rows(held: u32, tokens: &[u32]) -> crate::engine::FireRequest {
         crate::engine::FireRequest {
-            lanes: vec![::engine::Lane {
-                tokens: tokens.to_vec(),
-                kv: ::engine::KvDelta {
-                    held,
-                    ..Default::default()
-                },
-                ..::engine::Lane::default()
-            }],
+            lanes: vec![
+                ::engine::Lane {
+                    tokens: tokens.to_vec(),
+                    kv: ::engine::KvDelta { held },
+                    ..::engine::Lane::default()
+                }
+                .into(),
+            ],
             ..crate::engine::FireRequest::default()
         }
     }
@@ -7094,7 +7098,7 @@ pub(crate) mod fold_tests {
         let pass = lanes_on(&stores, ws, &[&cell, &cell]);
         // Three rows and four, from slot 4.
         let mut req = crate::engine::FireRequest {
-            lanes: [3, 4].into_iter().map(|rows| rows_of(4, rows)).collect(),
+            lanes: [3, 4].into_iter().map(|rows| rows_of(4, rows).into()).collect(),
             ..crate::engine::FireRequest::default()
         };
         let landings = [landing(4, 3), landing(4, 4)];
@@ -7127,10 +7131,7 @@ pub(crate) mod fold_tests {
     fn rows_of(held: u32, rows: usize) -> ::engine::Lane {
         ::engine::Lane {
             tokens: vec![0; rows],
-            kv: ::engine::KvDelta {
-                held,
-                ..Default::default()
-            },
+            kv: ::engine::KvDelta { held },
             ..::engine::Lane::default()
         }
     }
@@ -7298,10 +7299,9 @@ pub(crate) mod fold_tests {
         let found = stores.kv.lock().folded(ws).unwrap();
         let state = rs.map(|rs| stores.rs.lock().unwrap().frozen(rs).unwrap());
         let mut req = crate::engine::FireRequest {
-            lanes: vec![rows_of(
-                slots.start as u32,
-                (slots.end - slots.start) as usize,
-            )],
+            lanes: vec![
+                rows_of(slots.start as u32, (slots.end - slots.start) as usize).into(),
+            ],
             ..crate::engine::FireRequest::default()
         };
         if let Some(rs) = rs {
@@ -9230,14 +9230,14 @@ mod unfolded_tests {
 
     fn lane(held: u32, rows: u32) -> crate::engine::FireRequest {
         crate::engine::FireRequest {
-            lanes: vec![::engine::Lane {
-                tokens: vec![0; rows as usize],
-                kv: ::engine::KvDelta {
-                    held,
-                    ..Default::default()
-                },
-                ..::engine::Lane::default()
-            }],
+            lanes: vec![
+                ::engine::Lane {
+                    tokens: vec![0; rows as usize],
+                    kv: ::engine::KvDelta { held },
+                    ..::engine::Lane::default()
+                }
+                .into(),
+            ],
             ..crate::engine::FireRequest::default()
         }
     }

@@ -23,7 +23,7 @@ pub use completion::{
 };
 pub use instance::{BoundInstance, BoundWaitSlots, InstanceBindingPlan, InstanceId, ProgramId};
 
-pub use fire::{FireRequest, FrameFire, MaskWords, StepFire, bitmask_words};
+pub use fire::{FireLane, FireRequest, FrameFire, MaskWords, StepFire, bitmask_words};
 
 pub mod rs_flag {
     pub const RESET: u8 = 1 << 0;

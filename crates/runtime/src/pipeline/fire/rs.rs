@@ -217,16 +217,12 @@ impl PreparedRs {
             if let Some(verb) = self.verbs.get(row) {
                 lane.rs = verb.clone();
             }
-            lane.rs_slot = self.slot_ids.get(row).copied();
             if let Some(&flags) = self.slot_flags.get(row) {
                 lane.rs_reset = if flags & crate::engine::RS_FLAG_RESET != 0 {
                     engine::fire::RsReset::Fresh
                 } else {
                     engine::fire::RsReset::Held
                 };
-            }
-            if let Some(window) = self.window.get(row).and_then(|lists| lists.first()) {
-                lane.kv.window.clone_from(window);
             }
         }
         if let [lane] = request.lanes.as_mut_slice() {
@@ -281,15 +277,15 @@ pub fn apply_shared(
     };
     let pool = shared.lock().unwrap();
     for (row, lane) in req.lanes.iter_mut().enumerate() {
-        lane.list = if lane.kv.translation.is_empty() {
+        lane.lane.list = if lane.translation.is_empty() {
             ::engine::ListKind::Pages
         } else {
             ::engine::ListKind::Translation
         };
-        let list = if lane.kv.translation.is_empty() {
-            &lane.kv.pages
+        let list = if lane.translation.is_empty() {
+            &lane.pages
         } else {
-            &lane.kv.translation
+            &lane.translation
         };
         let windows = rs
             .and_then(|rs| rs.window.get(row))
@@ -372,15 +368,15 @@ pub fn apply_pinned(
         return;
     };
     for lane in &mut req.lanes {
-        lane.list = if lane.kv.translation.is_empty() {
+        lane.lane.list = if lane.translation.is_empty() {
             ::engine::ListKind::Pages
         } else {
             ::engine::ListKind::Translation
         };
-        let list = if lane.kv.translation.is_empty() {
-            &lane.kv.pages
+        let list = if lane.translation.is_empty() {
+            &lane.pages
         } else {
-            &lane.kv.translation
+            &lane.translation
         };
         if list.is_empty() {
             continue;
@@ -693,7 +689,7 @@ mod tests {
         prepared.apply_to(&mut req);
         req.lanes
             .into_iter()
-            .map(|lane| (lane.rs, lane.rs_reset))
+            .map(|lane| (lane.lane.rs, lane.lane.rs_reset))
             .collect()
     }
 
@@ -885,7 +881,7 @@ mod tests {
         let mut req = request(1);
         req.lanes[0].slot = 9;
         write.apply_to(&mut req);
-        assert_eq!(req.lanes[0].rs_slot, Some(copy), "not the kv seat");
+        assert_eq!(write.slot_ids[0], copy, "not the kv seat");
         settle(&mut store, write.txn);
     }
 }

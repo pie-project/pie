@@ -406,9 +406,6 @@ impl Seq {
             word,
             tokens,
             readout: Readout::Last,
-            // What the runtime states beside the record (the engine's own
-            // check of a snapshotting lane reads it); XLA reads the record.
-            rs_slot: Some(self.slot),
             ..Lane::default()
         };
         lane.kv.held = self.held;

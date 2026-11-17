@@ -215,7 +215,7 @@ pub(crate) fn tap(pid: ProcessId, stores: &Stores, req: &mut crate::engine::Fire
     if filled.is_empty() {
         return;
     }
-    let Some(pages) = lane.kv.pages.get(filled.clone()).map(<[u32]>::to_vec) else {
+    let Some(pages) = lane.pages.get(filled.clone()).map(<[u32]>::to_vec) else {
         fail(
             &mut streams,
             run,

@@ -2951,10 +2951,13 @@ mod tests {
     fn fire_of(seats: std::ops::Range<u32>, rows: usize) -> crate::engine::FireRequest {
         crate::engine::FireRequest {
             lanes: seats
-                .map(|slot| ::engine::Lane {
-                    slot,
-                    tokens: vec![7; rows],
-                    ..Default::default()
+                .map(|slot| {
+                    ::engine::Lane {
+                        slot,
+                        tokens: vec![7; rows],
+                        ..Default::default()
+                    }
+                    .into()
                 })
                 .collect(),
             ..Default::default()

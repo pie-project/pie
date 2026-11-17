@@ -404,7 +404,7 @@ impl ReqGeometry {
         &self,
         places: &[Place],
         page: u32,
-    ) -> Result<(Vec<::engine::Lane>, Vec<Landing>), String> {
+    ) -> Result<(Vec<crate::engine::FireLane>, Vec<Landing>), String> {
         let cut_by = |values: &[u32], indptr: &[u32], lane: usize| -> Vec<u32> {
             let (Some(&start), Some(&end)) = (indptr.get(lane), indptr.get(lane + 1)) else {
                 return Vec::new();
@@ -500,14 +500,12 @@ impl ReqGeometry {
                 positions
             };
             let readout = cut_by(&self.sampling_indices, &self.sampling_indptr, lane);
-            lanes.push(::engine::Lane {
+            lanes.push(crate::engine::FireLane {
+                pages: (0..kv_len.div_ceil(page)).collect(),
+                ..crate::engine::FireLane::from(::engine::Lane {
                 tokens,
                 positions,
-                kv: ::engine::KvDelta {
-                    held: start,
-                    pages: (0..kv_len.div_ceil(page)).collect(),
-                    ..Default::default()
-                },
+                kv: ::engine::KvDelta { held: start },
                 rs: ::engine::RsVerb::Fold,
                 rs_reset: ::engine::RsReset::Inferred,
                 readout: match readout.as_slice() {
@@ -516,6 +514,7 @@ impl ReqGeometry {
                     rows => ::engine::Readout::Rows(rows.to_vec()),
                 },
                 ..::engine::Lane::default()
+                })
             });
             landings.push(Landing { start, rows });
         }
@@ -1195,7 +1194,7 @@ mod tests {
         assert_eq!(landings, vec![Landing { start: 40, rows: 3 }]);
         assert_eq!(lanes[0].kv.held, 40);
         assert_eq!(
-            lanes[0].kv.pages,
+            lanes[0].pages,
             vec![0, 1, 2],
             "slots 0..43 span three pages"
         );

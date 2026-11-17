@@ -169,14 +169,6 @@ pub fn buffered_reads(
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KvDelta {
     pub held: u32,
-    pub pages: Vec<u32>,
-    #[serde(default)]
-    pub translation: Vec<u32>,
-    /// The ids of the lane's pages in the window list, aligned with
-    /// `translation` when it is stated and with `pages` otherwise; 0 is the
-    /// null page a page wholly behind the window reads.
-    #[serde(default)]
-    pub window: Vec<u32>,
 }
 
 /// A lane's recurrent-state record, as the runtime states it.
@@ -243,10 +235,6 @@ pub struct Lane {
     pub rs: RsVerb,
     #[serde(default)]
     pub rs_reset: RsReset,
-    /// The recurrent-state row the runtime's rs store assigned this lane, when
-    /// it binds one; otherwise the state rides the seat.
-    #[serde(default)]
-    pub rs_slot: Option<u32>,
     /// Rows, ascending inside the lane, whose recurrent state the fire lands
     /// in slots of their own as it runs.
     #[serde(default)]
@@ -262,7 +250,7 @@ pub struct Lane {
     pub fires_after: Option<u32>,
     #[serde(default)]
     pub inputs: Vec<InputFeed>,
-    /// The lane takes no seat; the state it carries, if any, is the row `rs_slot` names.
+    /// The lane takes no seat; the state it carries, if any, is the record its fixed table names.
     #[serde(default)]
     pub kv_less: bool,
     /// An engine that cannot report says nothing, and the step is plainly
@@ -393,11 +381,10 @@ impl Lane {
                 .iter()
                 .try_fold(0, |at, snap| (at < snap.row).then_some(snap.row))
                 .is_some_and(|last| last < self.rows());
-            if !ascending || !matches!(self.rs, RsVerb::Fold) || self.rs_slot.is_none() {
+            if !ascending || !matches!(self.rs, RsVerb::Fold) {
                 return Err(Error::Invalid(format!(
                     "lane in slot {} snapshots its recurrent state at rows {:?} of its {}: a \
-                     snapshot is an interior row, ascending, of a lane that folds every row \
-                     into a state slot of its own",
+                     snapshot is an interior row, ascending, of a lane that folds every row",
                     self.slot,
                     self.rs_snapshots
                         .iter()
@@ -1147,14 +1134,13 @@ mod tests {
     #[test]
     fn kv_less_lanes_take_no_seat() {
         // A CFG step: four unseated float lanes beside a decode in seat 0.
-        let float = |rs_slot| Lane {
+        let float = || Lane {
             tokens: vec![0; 4],
             kv_less: true,
-            rs_slot,
             ..Lane::default()
         };
         let mut step = Step {
-            lanes: vec![float(None), float(None), float(None), float(Some(2))],
+            lanes: vec![float(), float(), float(), float()],
             ..Step::default()
         };
         step.lanes.push(Lane::decode(0, 0, 7, 3));

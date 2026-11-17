@@ -187,6 +187,7 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
                     kv_less: true,
                     ..::engine::Lane::default()
                 }
+                .into()
             })
             .collect(),
         voxels: float

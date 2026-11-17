@@ -435,8 +435,6 @@ pub struct Seated<'a, B: Serve> {
     /// (CONTRACT-BC 15).
     pub record_run: Option<&'a [u32]>,
 
-    pub translation: &'a [u32],
-
     /// A device cell holding the lane's one token, written by a pass still
     /// on the queue; the fire copies it in behind that pass.
     pub feed: Option<&'a DeviceCell<B>>,
@@ -459,7 +457,6 @@ impl<'a, B: Serve> Seated<'a, B> {
             positions: &[],
             readout: None,
             reads: &[],
-            translation: &[],
             rs: &FOLD,
             rs_reset: engine::fire::RsReset::Inferred,
             rs_snapshots: &[],

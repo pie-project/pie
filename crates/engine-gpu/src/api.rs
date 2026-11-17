@@ -1275,7 +1275,6 @@ impl<B: Host> Gpu<B> {
                 },
                 reads: &reads[at],
 
-                translation: &lane.kv.translation,
 
                 rs: &lane.rs,
                 rs_reset: lane.rs_reset,

@@ -333,7 +333,7 @@ fn shared_lanes(
     };
     out.apply_to(&mut req);
     crate::pipeline::fire::rs::apply_shared(&mut req, Some(shared), Some(out));
-    req.lanes
+    req.lanes.into_iter().map(|lane| lane.lane).collect()
 }
 
 fn buffer_of(lane: &Lane) -> (Vec<u32>, u32, u32) {
@@ -1329,8 +1329,8 @@ fn a_lane_s_list_kind_is_stated_beside_its_table() {
     let facts = fixed_facts();
     let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
     let mut placed = crate::engine::fire::lane_of(0, vec![1], 0, Vec::new());
-    placed.kv.pages = vec![5];
-    placed.kv.translation = vec![7, 8];
+    placed.pages = vec![5];
+    placed.translation = vec![7, 8];
     let mut req = crate::engine::FireRequest {
         lanes: vec![
             placed,
