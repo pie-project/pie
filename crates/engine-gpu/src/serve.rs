@@ -1018,7 +1018,9 @@ impl<B: Serve> Shell<B> {
         // the profile states them all, the top rung is the estimate's pick
         // (`engine::load::choose_tiled`, each plane's rows padded to the row
         // tile of the kernel this backend picks at its shape), among the
-        // rungs to the roofline's fire top; a fire never runs past the pick.
+        // rungs to the estimate's fire top (its argmax over the lattice to
+        // the context, `FireEstimate::fire_top`); a fire never runs past the
+        // pick.
         let device_profile = tuning.profile().clone();
         let rated = device_profile.rates().complete();
         let counts = if rated {
@@ -1054,6 +1056,29 @@ impl<B: Serve> Shell<B> {
                     .expect("one row count at least")
             }
         };
+        let row_tile: engine::roofline::RowTile = {
+            let tactic_at = gemm_at.clone();
+            std::sync::Arc::new(move |m, n, k| {
+                kernels_slang::linear::gemm::tile_for(B::TARGET, tactic_at(m), m, n, k).row_tile()
+            })
+        };
+        let fire_estimate = match counts.as_ref() {
+            Some(counts) => {
+                let mut estimate = engine::load::estimate(counts, &device_profile.rates())
+                    .map_err(|key| {
+                        Fault::Residency(
+                            engine::load::Refused::NoRates {
+                                device: device.name().to_owned(),
+                                key,
+                            }
+                            .to_string(),
+                        )
+                    })?;
+                estimate.rates = estimate.rates.with_row_tile(row_tile.clone());
+                Some(estimate)
+            }
+            None => None,
+        };
         let mut chosen: Option<engine::load::TopRung> = None;
         let mut weighed: Option<engine::load::check::Weighed> = None;
         let (compiled, mut span) = loop {
@@ -1063,12 +1088,11 @@ impl<B: Serve> Shell<B> {
             if rung_tokens.last() != Some(&top) {
                 rung_tokens.push(top);
             }
-            // No rung past the roofline's fire top can be chosen; a check's
+            // No rung past the estimate's fire top can be chosen; a check's
             // load lays them on to `laid_top` of it.
             let mut fire_top = None;
-            if rated && let Ok(constants) = engine::roofline::Constants::of(&device_profile.rates())
-            {
-                let top = engine::roofline::fire_top(&rung_tokens, &constants);
+            if let Some(estimate) = fire_estimate.as_ref() {
+                let top = estimate.fire_top(&rung_tokens, boot.context);
                 let laid = match boot.check {
                     None => top,
                     Some(CheckRungs::PastTop) => engine::load::check::laid_top(&rung_tokens, top),
@@ -1114,11 +1138,6 @@ impl<B: Serve> Shell<B> {
                     launches,
                     &padded,
                 );
-                let tactic_at = gemm_at.clone();
-                let row_tile: engine::roofline::RowTile = std::sync::Arc::new(move |m, n, k| {
-                    kernels_slang::linear::gemm::tile_for(B::TARGET, tactic_at(m), m, n, k)
-                        .row_tile()
-                });
                 let fire_top = fire_top.unwrap_or(top);
                 let offered: Vec<engine::load::RungFacts> = rungs
                     .iter()
@@ -1129,7 +1148,7 @@ impl<B: Serve> Shell<B> {
                     &offered,
                     live,
                     &device_profile,
-                    row_tile,
+                    row_tile.clone(),
                     device.name(),
                     counts,
                     binding,
