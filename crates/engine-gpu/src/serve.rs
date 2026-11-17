@@ -287,6 +287,23 @@ pub struct Boot<'a, B: Serve> {
     pub residency: engine::load::Residency,
 
     pub handed: Option<B::Handed>,
+
+    /// A load for the check of the estimate (`engine::load::check`): its
+    /// rungs laid as [`CheckRungs`] says, the widest one binding holds the
+    /// fire bound, and what the estimate weighed them by kept
+    /// ([`Shell::weighed`]).
+    pub check: Option<CheckRungs>,
+}
+
+/// How far a check's load lays its rungs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckRungs {
+    /// Past the fire top, to `engine::load::check::laid_top` of it: the
+    /// served-shape load whose rungs and estimate the check weighs.
+    PastTop,
+    /// To the lattice's rung at these rows: a load sized for one kind of
+    /// the check's fires.
+    To(u32),
 }
 
 /// A load fitted to its device: the device, its tuning and tier, and the
@@ -645,6 +662,13 @@ pub struct Shell<B: Serve> {
     /// ([`Shell::walked_serving`]).
     walked: (u64, u32),
 
+    /// Every fire walked eagerly, none recorded or replayed: a check's
+    /// walked load ([`Shell::walk_every_fire`]).
+    walk_only: bool,
+    /// The rungs the load laid and the estimate it weighed them by, where
+    /// the profile states every `[rates]` key.
+    weighed: Option<engine::load::check::Weighed>,
+
     pub handles: Handles<B>,
     trace: Trace,
     compiled: CompiledModel,
@@ -860,6 +884,7 @@ impl<B: Serve> Shell<B> {
                 device: boot.device,
                 residency: boot.residency.clone(),
                 handed: None,
+                check: boot.check,
             },
             Fitted {
                 device: crate::named::Facts::of::<B>(device),
@@ -986,14 +1011,71 @@ impl<B: Serve> Shell<B> {
         // the model compiled again at it (its own carve is laid again, as
         // it may differ from the rung's laid under the wider top).
         let binding = device.max_buffer();
-        // The top asked and its rungs' `(tokens, span bytes)`, once bounded.
+        // The top asked and its rungs' `(tokens, span bytes)`, once bounded
+        // by the binding.
         let mut unbounded: Option<(u32, Vec<(u32, u64)>)> = None;
+        // The roofline the device's rates state (`engine::roofline`): where
+        // the profile states them all, the top rung is the estimate's pick
+        // (`engine::load::choose_tiled`, each plane's rows padded to the row
+        // tile of the kernel this backend picks at its shape), among the
+        // rungs to the estimate's fire top (its argmax over the lattice to
+        // the context, `FireEstimate::fire_top`); a fire never runs past the
+        // pick.
+        let device_profile = tuning.profile().clone();
+        let rated = device_profile.rates().complete();
+        let counts = if rated {
+            Some(crate::top::counts(&boot.trace)?)
+        } else {
+            None
+        };
+        let live = counts.as_ref().map_or(0, |counts| {
+            let room = device.left().saturating_sub(counts.weight_bytes);
+            kv_budget
+                .map_or(room, |budget| budget.min(room))
+                .min(binding.saturating_mul(kernels_slang::SEGMENTS as u64))
+        });
+        // The dense tactic at each power of two of rows to the asked top:
+        // a matmul of `m` rows runs the tactic of the widest such row count
+        // at or below it.
+        let gemm_by_rows: std::sync::Arc<Vec<(u32, kernels_slang::linear::gemm::Tactic)>> =
+            std::sync::Arc::new(
+                engine::memory::rungs(1, budgets.tokens.max_tokens.max(1))
+                    .into_iter()
+                    .map(|rows| (rows, tuning.gemm(tier, rows)))
+                    .collect(),
+            );
+        let gemm_at = {
+            let table = std::sync::Arc::clone(&gemm_by_rows);
+            move |rows: u32| {
+                table
+                    .iter()
+                    .rev()
+                    .find(|&&(at, _)| at <= rows)
+                    .or(table.first())
+                    .map(|&(_, tactic)| tactic)
+                    .expect("one row count at least")
+            }
+        };
+        let row_tile: engine::roofline::RowTile = {
+            let tactic_at = gemm_at.clone();
+            std::sync::Arc::new(move |m, n, k| {
+                kernels_slang::linear::gemm::tile_for(B::TARGET, tactic_at(m), m, n, k).row_tile()
+            })
+        };
+        let mut chosen: Option<engine::load::TopRung> = None;
+        // The widest rung the load lays once the pick is made: the pick's,
+        // or a check's past it.
+        let mut laid: Option<u32> = None;
+        let mut weighed: Option<engine::load::check::Weighed> = None;
         let (compiled, mut span) = loop {
             let compiled = compile_axes(&boot.trace, &budgets, &profile)?;
             let top = budgets.tokens.max_tokens;
             let mut rung_tokens = engine::memory::rungs(1, top);
             if rung_tokens.last() != Some(&top) {
                 rung_tokens.push(top);
+            }
+            if let Some(laid) = laid {
+                rung_tokens.retain(|&tokens| tokens <= laid);
             }
             let span = Span::plan(
                 &boot.trace,
@@ -1008,9 +1090,88 @@ impl<B: Serve> Shell<B> {
                 .iter()
                 .map(|rung| (rung.tokens, rung.bytes()))
                 .collect();
-            match crate::arena::bound_top(&spans, binding) {
+            // The pick, once: the fire top (`engine::load::fire_top`), the
+            // ruling over every rung of the lattice a prompt of the context
+            // holds, each weighed as its check fire, each infeasible past one
+            // binding. No fire runs past it; a check's load lays on past it.
+            if let (Some(counts), None) = (counts.as_ref(), chosen.as_ref()) {
+                let launches = u32::try_from(compiled.template().len()).unwrap_or(u32::MAX);
+                let padded = |rows: u32| {
+                    kernels_slang::linear::gemm::padded_rows(
+                        B::TARGET,
+                        gemm_at(rows),
+                        rows,
+                        counts.width,
+                    )
+                };
+                let rungs = crate::top::rung_facts(
+                    &spans,
+                    budgets.tokens.max_lanes,
+                    binding,
+                    launches,
+                    &padded,
+                );
+                let (pick, estimate) = crate::top::choose(
+                    &rungs,
+                    live,
+                    boot.context,
+                    &device_profile,
+                    row_tile.clone(),
+                    device.name(),
+                    counts,
+                    binding,
+                )?;
+                tracing::info!(
+                    "{}",
+                    crate::top::line_of(
+                        &pick,
+                        pick.tokens,
+                        pick.span_bytes,
+                        live,
+                        device_profile.tuned()
+                    )
+                );
+                let lays = match boot.check {
+                    None => pick.tokens,
+                    Some(CheckRungs::PastTop) => {
+                        engine::load::check::laid_top(&rung_tokens, pick.tokens)
+                    }
+                    Some(CheckRungs::To(rows)) => rung_tokens
+                        .iter()
+                        .copied()
+                        .find(|&tokens| tokens >= rows)
+                        .or(rung_tokens.last().copied())
+                        .unwrap_or(rows),
+                };
+                chosen = Some(pick);
+                laid = Some(lays);
+                if boot.check.is_some() {
+                    weighed = Some(engine::load::check::Weighed {
+                        model: engine::load::model_class(&boot.trace).to_owned(),
+                        rungs,
+                        estimate,
+                        live,
+                        fire_top: pick.tokens,
+                        laid: lays,
+                    });
+                }
+            }
+            // The fire bound is the widest rung laid that one binding holds
+            // (the pick's, a check's past it), else the widest one binding
+            // holds.
+            let held: Vec<(u32, u64)> = spans
+                .iter()
+                .copied()
+                .filter(|&(tokens, _)| laid.is_none_or(|laid| tokens <= laid))
+                .collect();
+            let widest = crate::arena::bound_top(&held, binding);
+            // Whether the binding cut it, which the load then says.
+            let binds = held.iter().any(|&(_, bytes)| bytes > binding);
+            match widest {
                 Some(widest) if widest < top => {
-                    unbounded.get_or_insert((top, spans));
+                    if binds {
+                        unbounded.get_or_insert((top, spans));
+                    }
                     budgets.tokens = crate::arena::bounded_budget(&budgets.tokens, widest);
                     boot.budget = budgets.tokens.clone();
                 }
@@ -1019,6 +1180,10 @@ impl<B: Serve> Shell<B> {
                 _ => break (compiled, span),
             }
         };
+        // The widest rung a check's load laid: its top once bounded.
+        if let Some(weighed) = weighed.as_mut() {
+            weighed.laid = budgets.tokens.max_tokens;
+        }
         if let Some((asked, spans)) = unbounded {
             tracing::info!(
                 asked,
@@ -1525,6 +1690,8 @@ impl<B: Serve> Shell<B> {
             recorded: 0,
             unkept: 0,
             walked: (0, 0),
+            walk_only: false,
+            weighed,
             pipelines,
             asks,
             handles,
@@ -2069,6 +2236,20 @@ impl<B: Serve> Shell<B> {
     /// which the first holds within.
     pub fn walked_serving(&mut self) -> (u64, u32) {
         std::mem::take(&mut self.walked)
+    }
+
+    /// Walks every later fire eagerly, recording none and replaying none:
+    /// what a check's dissection times node by node.
+    pub fn walk_every_fire(&mut self) {
+        self.walk_only = true;
+    }
+
+    /// The rungs a check's load laid and the estimate it weighed them by
+    /// ([`Boot::check`]); `None` where the profile leaves a `[rates]` key
+    /// unstated.
+    #[must_use]
+    pub fn weighed(&self) -> Option<&engine::load::check::Weighed> {
+        self.weighed.as_ref()
     }
 
     #[must_use]
@@ -4546,7 +4727,15 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
                 B::Buffer::host(&self.device, need, crate::books::owners::READOUT)?;
             B::grown(self, prepared.arm, need)?;
         }
-        let (keep, split) = match B::plan(self, &mut prepared)? {
+        let plan = if self.walk_only {
+            Plan::Walk {
+                keep: None,
+                split: false,
+            }
+        } else {
+            B::plan(self, &mut prepared)?
+        };
+        let (keep, split) = match plan {
             Plan::Replayed {
                 pending,
                 seq,

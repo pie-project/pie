@@ -276,6 +276,36 @@ tune_grid!(tune_vulkan, engine_vulkan, "vulkan");
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 tune_grid!(tune_metal, engine_metal, "metal");
 
+#[cfg(feature = "vulkan")]
+fn bench_vulkan<'a>(
+    req: &'a TuneRequest<'a>,
+    artifact: &'a Path,
+    deployment: &'a str,
+) -> Result<Box<dyn engine::load::check::Bench + 'a>, String> {
+    let bench = engine_vulkan::check::bench(
+        req.profiles,
+        artifact,
+        deployment,
+        crate::engine::load::contract_for,
+    )?;
+    Ok(Box::new(bench))
+}
+
+#[cfg(feature = "wgpu")]
+fn bench_wgpu<'a>(
+    req: &'a TuneRequest<'a>,
+    artifact: &'a Path,
+    deployment: &'a str,
+) -> Result<Box<dyn engine::load::check::Bench + 'a>, String> {
+    let bench = engine_wgpu::check::bench(
+        req.profiles,
+        artifact,
+        deployment,
+        crate::engine::load::contract_for,
+    )?;
+    Ok(Box::new(bench))
+}
+
 #[cfg(feature = "engine-cuda")]
 fn tune_cuda(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String> {
     let models = pick_models("cuda", req)?;
@@ -322,8 +352,19 @@ pub fn backends() -> Vec<Backend> {
         probe: engine_vulkan::chip::probe,
         resolve: engine_vulkan::chip::resolve_facts,
         tune: Some(tune_vulkan),
-        rates: None,
-        bench: None,
+        rates: Some(|req, say| engine_vulkan::check::rated(req.profiles, say)),
+        bench: Some(bench_vulkan),
+    });
+    #[cfg(feature = "wgpu")]
+    out.push(Backend {
+        name: "wgpu",
+        registry: engine_wgpu::chip::registry,
+        shelf: &engine_wgpu::chip::SHELF,
+        probe: engine_wgpu::chip::probe,
+        resolve: engine_wgpu::chip::resolve_facts,
+        tune: None,
+        rates: Some(|req, say| engine_wgpu::check::rated(req.profiles, say)),
+        bench: Some(bench_wgpu),
     });
     #[cfg(feature = "xla")]
     out.push(Backend {

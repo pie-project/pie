@@ -23,7 +23,7 @@ const SEARCH_SKIPS: &[&str] = &[
 ];
 
 /// The facts a tuned file assumes: what a kernel's requirement reads.
-const ASSUME: &[&str] = &["vendor", "subgroup", "coopmat", "cores"];
+pub(crate) const ASSUME: &[&str] = &["vendor", "subgroup", "coopmat", "cores"];
 
 /// What a tuned overlay on `base` may assume: its target, and the facts
 /// [`ASSUME`] names as this device reports them.
@@ -103,6 +103,7 @@ fn serve(artifact: &Path, deployment: &str, device: &str, file: &str) -> Result<
         device: &boot,
         residency: engine::load::Residency::default(),
         handed: None,
+        check: None,
     })
     .map_err(|e| e.to_string())?;
     let token = |i: u32| 100 + (i * 7919) % 5000;
