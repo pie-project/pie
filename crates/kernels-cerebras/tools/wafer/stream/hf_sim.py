@@ -5,7 +5,8 @@ golden: greedy decode in f32 from the saved bf16 weights, from random prompt ids
 
 qwen3-sim (models/qwen3_dense.poem): hf_sim.py <Qwen3-0.6B> <ckpt> <golden.json> hidden_size=256
   num_attention_heads=2 num_key_value_heads=1 head_dim=128 intermediate_size=256
-  num_hidden_layers=2 vocab_size=512"""
+  num_hidden_layers=2 vocab_size=512
+qwen3-sim4: the same with num_attention_heads=4"""
 import json, sys, torch
 from transformers import AutoConfig, AutoModelForCausalLM
 torch.set_num_threads(8)

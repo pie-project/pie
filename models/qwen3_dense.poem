@@ -27,6 +27,9 @@ MODELS = [
     # A random-weight architecture slice for the simulator gate (its weights and golden:
     # crates/kernels-cerebras/tools/wafer/stream/hf_sim.py).
     qwen3("qwen3-sim", layers = 2, vocab = 512),
+    # The same at four q heads a K / V head: the search replicates each K / V head over
+    # columns (a head root's tiles past its budget), the simulator gate of the replicas.
+    qwen3("qwen3-sim4", layers = 2, vocab = 512),
 ]
 
 F8 = dtype.e4m3tile128a8
@@ -34,6 +37,7 @@ F8 = dtype.e4m3tile128a8
 DEPLOYMENTS = [
     deployment("qwen3-0.6b", weights = dtype.bf16, kv = dtype.bf16),
     deployment("qwen3-sim", weights = dtype.bf16, kv = dtype.bf16),
+    deployment("qwen3-sim4", weights = dtype.bf16, kv = dtype.bf16),
     deployment("qwen3-8b", weights = dtype.bf16, kv = dtype.bf16, drafter = "mtp"),
     deployment("qwen3-8b", weights = dtype.bf16, kv = dtype.bf16),
     deployment("qwen3-8b", weights = dtype.u4g64, kv = dtype.bf16),
@@ -88,6 +92,7 @@ DIMS = {
     "qwen3-14b": dims(hidden = 5120, layers = 40, q_heads = 40, kv_heads = 8, inter = 17408, tied = False),
     "qwen3-32b": dims(hidden = 5120, layers = 64, q_heads = 64, kv_heads = 8, inter = 25600, tied = False),
     "qwen3-sim": dims(hidden = 256, layers = 2, q_heads = 2, kv_heads = 1, inter = 256, tied = True, vocab = 512),
+    "qwen3-sim4": dims(hidden = 256, layers = 2, q_heads = 4, kv_heads = 1, inter = 256, tied = True, vocab = 512),
 }
 
 # A release whose projections a deployment keeps as released (Qwen's block
