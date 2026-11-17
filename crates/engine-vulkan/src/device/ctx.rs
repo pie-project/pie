@@ -1235,6 +1235,8 @@ impl Context {
                 submitted: std::sync::atomic::AtomicBool::new(false),
                 timing: Mutex::new(timing),
                 spare: Mutex::new(std::collections::HashMap::new()),
+                waiters: std::sync::atomic::AtomicU32::new(0),
+                most_waiters: std::sync::atomic::AtomicU32::new(0),
             }),
             open: true,
             kept: !one_time,
@@ -1280,6 +1282,10 @@ pub(crate) struct Inner {
     pub(crate) timing: Mutex<Option<Timing>>,
 
     spare: Mutex<std::collections::HashMap<u64, Vec<vk::DescriptorSet>>>,
+
+    /// Threads blocked on `fence` now, and the most at once.
+    waiters: std::sync::atomic::AtomicU32,
+    most_waiters: std::sync::atomic::AtomicU32,
 }
 
 impl Inner {
@@ -1769,6 +1775,7 @@ impl Frame {
         self.submit()?;
         Pending {
             inner: Arc::clone(&self.inner),
+            landing: None,
         }
         .wait()
     }
@@ -1778,6 +1785,7 @@ impl Frame {
         self.submit()?;
         Pending {
             inner: Arc::clone(&self.inner),
+            landing: None,
         }
         .wait()?;
         Ok(started.elapsed().as_secs_f64())
@@ -1796,18 +1804,7 @@ impl Frame {
         if let Some(at) = at {
             crate::encode::credit_submit(at.elapsed().as_nanos() as u64);
         }
-        let pending = Pending {
-            inner: Arc::clone(&self.inner),
-        };
-        if let Some(on_done) = on_done {
-            let watched = Pending {
-                inner: Arc::clone(&self.inner),
-            };
-            std::thread::spawn(move || {
-                on_done(watched.wait().err().map(|fault| fault.to_string()));
-            });
-        }
-        Ok(pending)
+        Ok(Pending::watched(&self.inner, on_done))
     }
 }
 
@@ -1920,23 +1917,45 @@ impl Kept {
         if let Some(at) = at {
             crate::encode::credit_submit(at.elapsed().as_nanos() as u64);
         }
-        let pending = Pending {
-            inner: Arc::clone(&self.inner),
-        };
-        if let Some(on_done) = on_done {
-            let watched = Pending {
-                inner: Arc::clone(&self.inner),
-            };
-            std::thread::spawn(move || {
-                on_done(watched.wait().err().map(|fault| fault.to_string()));
-            });
+        Ok(Pending::watched(
+            &self.inner,
+            on_done.map(|f| -> engine_gpu::backend::OnDone { Box::new(move |refused| f(refused)) }),
+        ))
+    }
+}
+
+/// What a frame's one fence waiter tells every other: the fence's wait
+/// returned (and with what), after the frame's `on_done` ran. A fence has
+/// one thread blocked on it at most: a second `vkWaitForFences` on the same
+/// fence wakes on a coarse timer rather than the signal (about 5.7 ms late
+/// on an RTX PRO 4500, a ~10 ms step per short fire).
+#[derive(Default)]
+struct Landing {
+    result: Mutex<Option<std::result::Result<(), vk::Result>>>,
+    landed: std::sync::Condvar,
+}
+
+impl Landing {
+    fn land(&self, result: std::result::Result<(), vk::Result>) {
+        *self.result.lock().expect("landing lock poisoned") = Some(result);
+        self.landed.notify_all();
+    }
+
+    fn wait(&self) -> std::result::Result<(), vk::Result> {
+        let mut result = self.result.lock().expect("landing lock poisoned");
+        loop {
+            if let Some(result) = *result {
+                return result;
+            }
+            result = self.landed.wait(result).expect("landing lock poisoned");
         }
-        Ok(pending)
     }
 }
 
 pub struct Pending {
     inner: Arc<Inner>,
+    /// Set where a watcher thread is the fence's one waiter.
+    landing: Option<Arc<Landing>>,
 }
 
 impl std::fmt::Debug for Pending {
@@ -1953,14 +1972,39 @@ impl Pending {
         unsafe { self.inner.core.device.get_fence_status(self.inner.fence) }.unwrap_or(true)
     }
 
+    /// A pending submission; where `on_done` is given, a watcher thread
+    /// blocks on the fence, runs it, then releases every [`Pending::wait`],
+    /// so the fence has the one waiter.
+    fn watched(inner: &Arc<Inner>, on_done: Option<engine_gpu::backend::OnDone>) -> Pending {
+        let Some(on_done) = on_done else {
+            return Pending {
+                inner: Arc::clone(inner),
+                landing: None,
+            };
+        };
+        let landing = Arc::new(Landing::default());
+        let (watched, told) = (Arc::clone(inner), Arc::clone(&landing));
+        std::thread::spawn(move || {
+            let result = watched.block_on_fence();
+            on_done(
+                result
+                    .err()
+                    .map(|e| watched.core.fault("vkWaitForFences", e).to_string()),
+            );
+            told.land(result);
+        });
+        Pending {
+            inner: Arc::clone(inner),
+            landing: Some(landing),
+        }
+    }
+
     pub fn wait(&self) -> Result<()> {
         let core = &self.inner.core;
         let at = crate::encode::profiling().then(std::time::Instant::now);
-        // SAFETY: the fence lives as long as `inner`, which `self` holds;
-        // waiting needs no external sync, so concurrent waiters are fine.
-        unsafe {
-            core.device
-                .wait_for_fences(&[self.inner.fence], true, FENCE_TIMEOUT_NS)
+        match &self.landing {
+            Some(landing) => landing.wait(),
+            None => self.inner.block_on_fence(),
         }
         .map_err(|e| core.fault("vkWaitForFences", e))?;
         if let Some(at) = at {
@@ -1972,6 +2016,22 @@ impl Pending {
 }
 
 impl Inner {
+    /// Blocks on this frame's fence. Only a frame's one waiter calls this:
+    /// a watcher thread where the frame has one, else [`Pending::wait`].
+    fn block_on_fence(&self) -> std::result::Result<(), vk::Result> {
+        let waiting = self.waiters.fetch_add(1, Ordering::AcqRel) + 1;
+        self.most_waiters.fetch_max(waiting, Ordering::AcqRel);
+        // SAFETY: the fence lives as long as `self`; waiting needs no
+        // external sync.
+        let result = unsafe {
+            self.core
+                .device
+                .wait_for_fences(&[self.fence], true, FENCE_TIMEOUT_NS)
+        };
+        self.waiters.fetch_sub(1, Ordering::AcqRel);
+        result
+    }
+
     fn harvest_timing(&self) {
         let mut slot = self.timing.lock().expect("timing lock poisoned");
         let Some(timing) = slot.as_mut() else {
@@ -2013,4 +2073,45 @@ impl Inner {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+
+    use super::{Context, Ordering};
+
+    /// A replayed frame's fence has one waiter, the watcher that runs its
+    /// `on_done`; the caller's wait returns when that watcher releases it,
+    /// not on a second `vkWaitForFences` (which wakes on a coarse timer).
+    #[test]
+    fn a_replay_blocks_one_thread_on_its_fence_and_releases_the_caller() {
+        let bound = Context::bind(&crate::api::DeviceBoot::default(), engine::Allowance::WHOLE);
+        let Ok(context) = bound else {
+            eprintln!("not asked: {:?}", bound.err());
+            return;
+        };
+        let kept = context.frame_kept().unwrap().into_kept().unwrap();
+        let mut lags = Vec::new();
+        for _ in 0..32 {
+            let ran: Arc<Mutex<Option<Instant>>> = Arc::default();
+            let told = Arc::clone(&ran);
+            let pending = kept
+                .replay(Some(Box::new(move |refused| {
+                    assert_eq!(refused, None);
+                    *told.lock().unwrap() = Some(Instant::now());
+                })))
+                .unwrap();
+            pending.wait().unwrap();
+            let woke = Instant::now();
+            let ran = ran
+                .lock()
+                .unwrap()
+                .expect("on_done ran before the wait returned");
+            lags.push(woke.duration_since(ran));
+        }
+        assert_eq!(kept.inner.most_waiters.load(Ordering::Acquire), 1);
+        lags.sort();
+        let median = lags[lags.len() / 2];
+        let worst = *lags.last().unwrap();
+        eprintln!("caller woke {median:?} (median), {worst:?} (worst) after the watcher's landing");
+    }
+}

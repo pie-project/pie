@@ -1416,6 +1416,12 @@ impl KvStore {
     /// None on a shared pool: its host slots are slot refs of the host
     /// tier, which the engine's byte reads and writes (`read_host_kv`) do
     /// not name.
+    /// The shared pool's list shape the pages are slots of; `None` for a
+    /// pinned pool.
+    pub fn shared_list(&self) -> Option<::engine::chunk::ShapeId> {
+        self.shape
+    }
+
     pub fn alloc_host_slots(&mut self, n: usize) -> Option<Vec<HostKvSlotId>> {
         if self.shape.is_some() {
             return None;

@@ -593,8 +593,8 @@ async fn land(
         _ => None,
     };
     let t0 = std::time::Instant::now();
-    let host = with_kv_lock(&stores.kv, "offload-land", |kv| kv.alloc_host_slots(n))
-        .ok_or_else(|| anyhow!("no room in the host tier for {n} pages"))?;
+    let (list, host) = staging(stores, n);
+    let host = host.ok_or_else(|| anyhow!("no room in the host tier for {n} pages"))?;
     let ids: Vec<u32> = host.iter().map(|slot| slot.0).collect();
     let written = async {
         let mut at = 0usize;
@@ -610,7 +610,13 @@ async fn land(
                 }
                 None => chunk,
             };
-            crate::scheduler::write_host_kv(engine, ids[at..at + k].to_vec(), data).await?;
+            let ids = ids[at..at + k].to_vec();
+            match list {
+                Some(list) => {
+                    crate::scheduler::write_tier_slots(engine, vec![(list, ids)], data).await?
+                }
+                None => crate::scheduler::write_host_kv(engine, ids, data).await?,
+            }
             at += k;
         }
         if at != n {
@@ -899,7 +905,8 @@ async fn export(
         with_kv_lock(&stores.kv, "offload-export", |kv| kv.release_reader(pin))
     };
     let n = device.len();
-    let staging = match with_kv_lock(&stores.kv, "offload-export", |kv| kv.alloc_host_slots(n)) {
+    let (list, staging) = staging(stores, n);
+    let staging = match staging {
         Some(staging) => staging,
         None => {
             release(stores, pin);
@@ -911,7 +918,7 @@ async fn export(
     // One read: a round trip through the engine's lane per chunk costs more
     // than the chunks save. The link and the asker's landing go by chunks.
     let t0 = std::time::Instant::now();
-    let read = read_chunk(engine, &device, &slots).await;
+    let read = read_chunk(engine, list, &device, &slots).await;
     with_kv_lock(&stores.kv, "offload-export", |kv| {
         kv.free_host_slots(staging)
     });
@@ -941,30 +948,58 @@ async fn export(
     })
 }
 
-/// Device pages `device`, copied to host `slots` and read.
+/// Host slots for `n` pages to pass through, and the list shape they are
+/// slots of on a shared pool (whose host tier is read and written by slot
+/// refs, CONTRACT-BC 22); `None` slots when the host tier has no room.
+fn staging(
+    stores: &Stores,
+    n: usize,
+) -> (
+    Option<::engine::chunk::ShapeId>,
+    Option<Vec<crate::store::kv::page_table::HostKvSlotId>>,
+) {
+    with_kv_lock(&stores.kv, "offload-stage", |kv| match kv.shared_list() {
+        Some(list) => (Some(list), kv.alloc_tier_slots(n)),
+        None => (None, kv.alloc_host_slots(n)),
+    })
+}
+
+/// Device pages `device`, copied to host `slots` and read: on a shared pool
+/// (`list`) by the engine's tier copy and the slots' refs.
 async fn read_chunk(
     engine: usize,
+    list: Option<::engine::chunk::ShapeId>,
     device: &[crate::store::kv::page_table::PhysicalKvPageId],
     slots: &[u32],
 ) -> Result<Vec<u8>> {
     let t0 = std::time::Instant::now();
-    let bytes = crate::scheduler::read_device_kv(
-        engine,
-        device.iter().map(|id| id.0).collect(),
-        slots[..device.len()].to_vec(),
-    )
-    .await?;
+    let slots = slots[..device.len()].to_vec();
+    let device: Vec<u32> = device.iter().map(|id| id.0).collect();
+    let n = device.len();
+    let bytes = match list {
+        Some(list) => {
+            let copy = crate::scheduler::TierMove {
+                kind: crate::scheduler::TierKind::KvSlots(list),
+                tier: ::engine::MemoryDomain::HostPinned,
+                out: true,
+                device,
+                slots: slots.clone(),
+                source: None,
+            };
+            crate::scheduler::copy_tier_tracked(engine, &copy)?
+                .wait()
+                .await?;
+            crate::scheduler::read_tier_slots(engine, vec![(list, slots)]).await?
+        }
+        None => crate::scheduler::read_device_kv(engine, device, slots).await?,
+    };
     tracing::debug!(
         target: "pie::offload",
         ms = t0.elapsed().as_millis() as u64,
         "read a chunk"
     );
-    if bytes.is_empty() || bytes.len() % device.len() != 0 {
-        bail!(
-            "{} bytes do not split into {} pages",
-            bytes.len(),
-            device.len()
-        );
+    if bytes.is_empty() || bytes.len() % n != 0 {
+        bail!("{} bytes do not split into {n} pages", bytes.len());
     }
     Ok(bytes)
 }
