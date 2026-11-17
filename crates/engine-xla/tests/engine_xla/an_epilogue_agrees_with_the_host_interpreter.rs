@@ -889,6 +889,13 @@ fn corners() -> (TraceContainer, Vec<u32>) {
     put(&mut p, Shape::matrix(5, 3), Dtype::F32, cs);
     let cp = p.op(Op::CumProd(table));
     put(&mut p, Shape::matrix(5, 3), Dtype::F32, cp);
+    // Integer scans wrap, as the interpreter's do.
+    for (value, dtype) in [(a, Dtype::I32), (ua, Dtype::U32)] {
+        for op in [Op::CumSum(value), Op::CumProd(value)] {
+            let c = p.op(op);
+            put(&mut p, v, dtype, c);
+        }
+    }
     let pos_y = p.op(Op::Abs(y));
     for op in [
         Op::Exp(y),

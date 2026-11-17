@@ -123,6 +123,43 @@ impl Layout {
     }
 }
 
+/// The pool's rows `ids` (an i32 vector) as a gather and a scatter keep
+/// them: two indices at least. A single row XLA turns into a `[1, 128]`
+/// `dynamic-slice` (or `dynamic-update-slice`) of the pool, which it may lay
+/// out column-major, and those take the pool in their result's layout: the
+/// whole pool copied, and copied again where XLA rematerializes it, to touch
+/// one lane's row, past the HBM a large pool leaves (gumbel_watermark's
+/// stage asked 48 GB of a 31 GB chip). A gather's or a scatter's operand
+/// keeps its own layout. One row is read, or written, twice.
+fn pool_ids(f: &mut Func, ids: Val) -> Lowering<(Val, bool)> {
+    if f.dims(ids)[0] != 1 {
+        return Ok((ids, false));
+    }
+    Ok((f.concat(&[ids, ids], 0)?, true))
+}
+
+/// The pool's rows `ids` (an i32 vector), `[n, 128]` (`pool_ids`).
+fn pool_rows_read(f: &mut Func, pool: Val, ids: Val) -> Lowering<Val> {
+    let (ids, twice) = pool_ids(f, ids)?;
+    let rows = f.take_rows(pool, ids)?;
+    if !twice {
+        return Ok(rows);
+    }
+    Ok(f.slice(rows, &[0, 0], &[1, 128], &[1, 1])?)
+}
+
+/// The pool with `rows` (`[n, 128]`) over its rows `ids` (`pool_ids`); an
+/// id off the pool writes nothing.
+fn pool_rows_write(f: &mut Func, pool: Val, ids: Val, rows: Val) -> Lowering<Val> {
+    let (ids, twice) = pool_ids(f, ids)?;
+    let rows = if twice {
+        f.concat(&[rows, rows], 0)?
+    } else {
+        rows
+    };
+    Ok(f.put_rows(pool, ids, rows, kernels_xla::hlo::Combine::Set)?)
+}
+
 /// Pool rows (u32 `[_, 128]`) a carried cell of `words` takes.
 #[must_use]
 pub fn cell_rows(words: usize) -> usize {
@@ -372,10 +409,15 @@ pub fn lower(
     let planes: Vec<Val> = (layout.reads.iter())
         .map(|read| {
             let rows = i64::from(read.rows) * i64::from(read.layers.max(1));
-            Ok(l.f.param(
+            // Row-major, as a fire lands its planes: the layout XLA picks
+            // for a narrow plane (`[128, 4]`, column-major) refuses the
+            // fire's buffer at the stage's run.
+            let p = l.f.param(
                 Ty::new(elem(read.dtype)?, &[rows, i64::from(read.width)]),
                 None,
-            ))
+            );
+            l.f.pin_row_major(p);
+            Ok(p)
         })
         .collect::<Lowering<_>>()?;
     // The pool, last: aliased to the last result.
@@ -408,7 +450,7 @@ pub fn lower(
         };
         let nr = cell_rows(slot.words) as i64;
         let pool = pool.expect("carried cells ride the pool");
-        let cells = l.f.take_rows(pool, cell_at[c])?;
+        let cells = pool_rows_read(&mut l.f, pool, cell_at[c])?;
         let cells = l.f.reshape(cells, &[l.b, nr * 128])?;
         let v = l.unpack(cells, 0, dtype, n)?;
         let v = l.reshaped(v, &package.values[slot.value as usize].shape)?;
@@ -483,7 +525,7 @@ pub fn lower(
                 cell
             };
             let cell = l.f.reshape(cell, &[l.b * nr, 128])?;
-            pool = l.f.put_rows(pool, cell_at[c], cell, kernels_xla::hlo::Combine::Set)?;
+            pool = pool_rows_write(&mut l.f, pool, cell_at[c], cell)?;
         }
         results.push(pool);
     }
@@ -790,9 +832,11 @@ impl Lower<'_> {
         let r = dims.len();
         let n = dims[r - 1];
         let e = self.f.elem(x);
-        let identity = match fold {
-            Fold::Prod => self.f.const_f(e, 1.0, &[]),
-            _ => self.f.const_f(e, 0.0, &[]),
+        let one = i64::from(fold == Fold::Prod);
+        let identity = if e == Elem::F32 {
+            self.f.const_f(e, one as f64, &[])
+        } else {
+            self.f.const_i(e, one, &[])
         };
         let mut y = x;
         let mut d = 1i64;
@@ -1239,10 +1283,12 @@ impl Lower<'_> {
                 self.set(result, y)
             }
             tags::CUMSUM | tags::CUMPROD => {
-                if dt(self, 0) != Dtype::F32 {
-                    // The interpreter scans in f32 and hands back f32 lanes
-                    // whatever the declared dtype: nothing to agree with.
-                    return refuse("a scan over integers");
+                // Integers scan in wrapping arithmetic, as the interpreter
+                // does (`i32::wrapping_add`, `u32::wrapping_mul`): XLA's
+                // integer add and multiply wrap, and both stay associative
+                // wrapped, so the doubling scan lands the walk's answer.
+                if dt(self, 0) == Dtype::Bool {
+                    return refuse("a scan over bools");
                 }
                 let (_, x) = self.raw_arg(op, 0)?;
                 let (x, _, _) = self.rows_of(x)?;

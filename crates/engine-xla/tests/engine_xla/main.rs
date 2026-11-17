@@ -21,6 +21,7 @@ mod a_registered_channel_carries_one_cell_across_its_instances;
 mod a_tier_read_lands_every_slot_whole;
 mod a_prompt_length_reuses_its_programs;
 mod an_adapter_lies_in_its_slots;
+mod a_carried_history_copies_none_of_the_pool;
 mod a_guest_reading_no_plane_is_refused_at_registration;
 mod an_epilogue_agrees_with_the_host_interpreter;
 mod host_bank;

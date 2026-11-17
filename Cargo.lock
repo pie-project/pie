@@ -1918,6 +1918,7 @@ dependencies = [
  "libc",
  "libloading 0.9.0",
  "pie-dtype",
+ "pie-eta-dsl",
  "pie-eta-ir",
  "pie-poem",
  "pie-poem-compiler",
