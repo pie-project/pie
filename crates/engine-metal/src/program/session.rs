@@ -87,8 +87,10 @@ pub struct Pooled<'a> {
 }
 
 /// The pieces `place` holds in the pool's `Instance` room: a run's first
-/// slot ref and bytes, or each whole chunk's first slot ref and the bytes
-/// of its slots.
+/// slot ref and bytes, or each piece's first chunk's first slot ref and the
+/// bytes of its run of chunks' slots. A run's chunks after its first lie at
+/// the next physical chunks of one segment (the runtime takes them so, an
+/// evacuation moves a run whole), one range from the first's address.
 pub fn pieces_of(place: &engine::ScratchPlace, pools: &Pools) -> Result<Vec<(u32, u64)>> {
     let slot_bytes = pools.slot_bytes(INSTANCE)?;
     let per_chunk = pools.slots_per_chunk(INSTANCE)?;
@@ -97,7 +99,7 @@ pub fn pieces_of(place: &engine::ScratchPlace, pools: &Pools) -> Result<Vec<(u32
         engine::ScratchPlace::Run { first, slots } => {
             Ok(vec![(*first, u64::from(*slots) * slot_bytes)])
         }
-        engine::ScratchPlace::Chunks(chunks) => chunks
+        engine::ScratchPlace::Chunks { run, pieces } => pieces
             .iter()
             .map(|&chunk| {
                 let first = chunk.checked_mul(per_chunk).ok_or_else(|| {
@@ -106,7 +108,10 @@ pub fn pieces_of(place: &engine::ScratchPlace, pools: &Pools) -> Result<Vec<(u32
                         format!("chunk {chunk} of a guest's room lies past a u32 slot ref"),
                     )
                 })?;
-                Ok((first, u64::from(per_chunk) * slot_bytes))
+                Ok((
+                    first,
+                    u64::from(per_chunk) * slot_bytes * u64::from((*run).max(1)),
+                ))
             })
             .collect(),
     }
@@ -136,30 +141,58 @@ pub struct Session {
 impl Session {
     /// The bind-time tables an instance of `compiled` takes, every
     /// launching stage's in order.
+    /// The room an instance of `compiled` bound at `extents` lays its
+    /// scratch in: `room` at the program's run, the widest any launching
+    /// stage's item asks ([`eta_exec::ChunkLayout::run`]), so one piece size
+    /// addresses every stage. A value past a segment is refused by name.
+    pub fn room_for(
+        compiled: &Compiled,
+        extents: &Extents,
+        room: super::launch::Room,
+    ) -> Result<super::launch::Room> {
+        let mut run = 1;
+        for (index, plan) in compiled.plans.iter().enumerate() {
+            if launches(compiled, index) {
+                let laid = Prepared::scratch_layout(
+                    plan,
+                    &compiled.stages[index].regions,
+                    extents,
+                    room.at_run(1)?.pieces(),
+                )?;
+                run = run.max(laid.run);
+            }
+        }
+        room.at_run(run)
+    }
+
     /// The scratch an instance of `compiled` bound at `extents` holds for
-    /// its lanes (`engine::GuestState::per_instance`): the widest launching
-    /// stage's, each laid in pieces of at most `unit` bytes
-    /// ([`super::launch::scratch_unit`]) and held as one run where it takes
-    /// one piece, else a whole chunk of `chunk_bytes` a piece
-    /// ([`super::launch::scratch_held`]). Stages fire one after another in
+    /// its lanes (`engine::GuestState::per_instance`), and the room it lies
+    /// in ([`Session::room_for`]): the widest launching stage's, each laid
+    /// in pieces of the program's run and held as one run of slots where it
+    /// fits a chunk's, else a whole run of chunks a piece
+    /// ([`super::launch::Room::held`]). Stages fire one after another in
     /// one serial pass order and none reads another's scratch (values cross
     /// stages through channels), so every stage's pieces lie from the
-    /// instance's first. A value past a piece is refused by name.
+    /// instance's first.
     pub fn scratch_for(
         compiled: &Compiled,
         extents: &Extents,
-        unit: u64,
-        chunk_bytes: u64,
-    ) -> Result<u64> {
+        room: super::launch::Room,
+    ) -> Result<(u64, super::launch::Room)> {
+        let room = Session::room_for(compiled, extents, room)?;
         let mut widest = 0;
         for (index, plan) in compiled.plans.iter().enumerate() {
             if launches(compiled, index) {
-                let ends =
-                    Prepared::scratch_ends(plan, &compiled.stages[index].regions, extents, unit)?;
-                widest = widest.max(super::launch::scratch_held(&ends, chunk_bytes));
+                let laid = Prepared::scratch_layout(
+                    plan,
+                    &compiled.stages[index].regions,
+                    extents,
+                    room.pieces(),
+                )?;
+                widest = widest.max(room.held(&laid.ends));
             }
         }
-        Ok(widest)
+        Ok((widest, room))
     }
 
     /// Where each piece of this instance's scratch lies now: its run's
@@ -243,7 +276,21 @@ impl Session {
         let tables_run = TableLayout::of(&sizes, pooled.pools.slot_bytes(INSTANCE)?).run;
         let mut tables = Tables::pooled(pooled.pools, INSTANCE, pooled.instance, &sizes)?;
         let cursors = vec![Cursor { head: 0, tail: 0 }; shapes.len()];
-        let unit = super::launch::scratch_unit(pooled.pools)?;
+        // Every stage lays its scratch in the program's run, the one the
+        // runtime took the instance's pieces at.
+        let room = Session::room_for(compiled, &extents, super::launch::Room::of(pooled.pools)?)?;
+        if let engine::ScratchPlace::Chunks { run, .. } = pooled.scratch
+            && *run != room.run
+        {
+            return Err(Fault::program(
+                "program::session",
+                format!(
+                    "the instance's scratch lies in runs of {run} chunk(s), and its program lays \
+                     its pieces in runs of {}",
+                    room.run
+                ),
+            ));
+        }
 
         let mut prepared = Vec::with_capacity(compiled.plans.len());
         for (index, stage_plan) in compiled.plans.iter().enumerate() {
@@ -254,7 +301,7 @@ impl Session {
                     &shapes,
                     extents,
                     rows,
-                    unit,
+                    room.pieces(),
                     &mut tables,
                 )?)
             } else {

@@ -117,11 +117,11 @@ impl Plane {
     /// bound (`engine::GuestState::per_pair`): the batch tables its lanes
     /// launch together with, a set a launching stage and a frame in flight
     /// at the most lanes a fire flies, packed one after another in pieces
-    /// of a chunk's `Instance` room, none crossing one; held as one run
-    /// where they take one piece, else a whole chunk a piece. A table past
-    /// a piece is refused by name. The tables are sized from counts alone,
-    /// so the pair's extents do not move them.
-    pub fn pair_bytes(&self, program_id: ProgramId, pools: &Pools) -> Result<u64> {
+    /// of `room` (the program's run), none crossing one; held as one run of
+    /// slots where they fit a chunk's, else a whole run of chunks a piece.
+    /// A table past a piece is refused by name. The tables are sized from
+    /// counts alone; the pair's extents set only the run.
+    pub fn pair_bytes(&self, program_id: ProgramId, room: launch::Room) -> Result<u64> {
         let program = self
             .programs
             .get(&program_id)
@@ -135,8 +135,8 @@ impl Plane {
         let laid = tables
             .iter()
             .flat_map(|stage| (0..self.arms).flat_map(move |_| stage.iter().copied()));
-        let ends = launch::pack_tables(laid, launch::scratch_unit(pools)?)?;
-        Ok(launch::scratch_held(&ends, pools.layout().chunk_bytes))
+        let ends = launch::pack_tables(laid, room.piece())?;
+        Ok(room.held(&ends))
     }
 
     #[must_use]
@@ -290,6 +290,10 @@ impl Plane {
             return Ok(());
         };
         let pieces = session::pieces_of(&held.place, pools)?;
+        let run = match &held.place {
+            engine::ScratchPlace::Chunks { run, .. } => *run,
+            _ => 1,
+        };
         let (mut piece, mut at) = (0usize, 0u64);
         let mut place = |bytes: u64| -> Result<launch::TablePlace> {
             let room = crate::arena::room(bytes);
@@ -305,7 +309,8 @@ impl Plane {
                     ));
                 };
                 if at + room <= holds {
-                    let laid = pools.run_bytes(crate::store::layout::INSTANCE, first, at, bytes)?;
+                    let laid =
+                        pools.run_bytes(crate::store::layout::INSTANCE, first, run, at, bytes)?;
                     at += room;
                     return Ok(laid);
                 }
@@ -725,22 +730,29 @@ impl Plane {
         )
     }
 
-    /// What an instance of `program` bound at `extents` holds for its
-    /// lanes' scratch in the pool's `Instance` room
-    /// (`engine::GuestState::per_instance`, [`Session::scratch_for`]): no
-    /// fire takes anything of the span for it. A value past a piece of
-    /// the room is refused by name.
-    pub fn lane_scratch(&self, program: ProgramId, extents: &Extents, pools: &Pools) -> Result<u64> {
+    /// What `program` bound at `extents` holds as state in the pool's
+    /// `Instance` room (`engine::GuestState`): each instance its lanes'
+    /// scratch ([`Session::scratch_for`]), the pair its batch tables
+    /// ([`Plane::pair_bytes`]), both in pieces of the program's run of
+    /// chunks. No fire takes anything of the span for either. A value past
+    /// a segment, or a table past a piece, is refused by name.
+    pub fn guest_state(
+        &self,
+        program_id: ProgramId,
+        extents: &Extents,
+        pools: &Pools,
+    ) -> Result<engine::GuestState> {
         let program = self
             .programs
-            .get(&program)
-            .ok_or_else(|| Fault::program("program::plane", format!("no program {program}")))?;
-        Session::scratch_for(
-            &program.compiled,
-            extents,
-            launch::scratch_unit(pools)?,
-            pools.layout().chunk_bytes,
-        )
+            .get(&program_id)
+            .ok_or_else(|| Fault::program("program::plane", format!("no program {program_id}")))?;
+        let (per_instance, room) =
+            Session::scratch_for(&program.compiled, extents, launch::Room::of(pools)?)?;
+        Ok(engine::GuestState {
+            per_instance,
+            per_pair: self.pair_bytes(program_id, room)?,
+            run: room.run,
+        })
     }
 
     pub fn stage_batched(
@@ -1055,10 +1067,14 @@ mod tests {
     fn select_registration(
         vocab: u32,
         cut: Cut,
+        counted: bool,
     ) -> (ProgramRegistration, usize, Vec<(u32, Vec<u8>)>, u32) {
         let indptr: &'static Channel = Box::leak(Box::new(Channel::from(vec![0u32, 1])));
-        let mask: &'static Channel =
-            Box::leak(Box::new(Channel::new([vocab], dtype::i32).capacity(1)));
+        // The mask, or (`counted`) only how many tokens it takes: a ring
+        // cell of one word, where the mask's would pass a small chunk.
+        let mask: &'static Channel = Box::leak(Box::new(
+            Channel::new([if counted { 1 } else { vocab }], dtype::i32).capacity(1),
+        ));
         let mut b = Builder::new(vocab, 16);
         let logits = OutputDecl {
             name: "logits".into(),
@@ -1076,7 +1092,11 @@ mod tests {
                 Cut::P(p) => pivot_threshold(&x, cummass_le(Tensor::constant(p))),
                 Cut::K(k) => pivot_threshold(&x, rank_le(Tensor::constant(k))),
             };
-            mask.put(cast(keep, dtype::i32));
+            if counted {
+                mask.put(reshape(reduce_sum(cast(keep, dtype::i32)), [1]));
+            } else {
+                mask.put(cast(keep, dtype::i32));
+            }
         });
         mask.note_host_take();
         let traced = b.build().expect("the program traces");
@@ -1178,17 +1198,70 @@ mod tests {
         cut: Cut,
         dropped: &[eta_compiler::codegen::program::KernelKind],
     ) -> (Vec<bool>, std::time::Duration) {
+        let (words, took, _) = fire_cut_in(values, cut, dropped, None);
+        (words.iter().map(|&word| word != 0).collect(), took)
+    }
+
+    /// Where the runtime holds `bytes` of guest state laid in runs of `run`
+    /// chunks (`engine::ScratchPlace`): one run of `Instance` slots from
+    /// chunk `first` where they fit a chunk's slots, else whole runs of
+    /// chunks from it, one after another inside its segment.
+    fn held_at(bytes: u64, run: u32, pools: &crate::store::Pools, first: u32) -> engine::ScratchPlace {
+        use crate::store::layout::INSTANCE;
+        let per_chunk = pools.slots_per_chunk(INSTANCE).expect("an instance shape");
+        let slot = pools.slot_bytes(INSTANCE).expect("an instance slot");
+        if bytes <= u64::from(per_chunk) * slot {
+            return engine::ScratchPlace::Run {
+                first: first * per_chunk,
+                slots: u32::try_from(bytes.max(1).div_ceil(slot)).expect("slots"),
+            };
+        }
+        let piece = u64::from(run) * pools.layout().chunk_bytes;
+        let pieces = u32::try_from(bytes.div_ceil(piece)).expect("pieces");
+        engine::ScratchPlace::Chunks {
+            run,
+            pieces: (0..pieces).map(|nth| first + nth * run).collect(),
+        }
+    }
+
+    /// [`fire_cut`] in a pool of `room`'s (chunk bytes, chunks, segment
+    /// chunks) where stated, the instance's scratch and its pair's tables
+    /// held as the runtime takes them at the program's run (from the
+    /// second and third segments), its mask's words (in such a pool, only
+    /// how many tokens it takes); and that run.
+    fn fire_cut_in(
+        values: &[f32],
+        cut: Cut,
+        dropped: &[eta_compiler::codegen::program::KernelKind],
+        room: Option<(u64, u32, u32)>,
+    ) -> (Vec<i32>, std::time::Duration, u32) {
         use crate::store::Pools;
         let vocab = u32::try_from(values.len()).expect("a vocabulary");
         let context = Context::bind().expect("a Metal 4 device");
-        let pools = Pools::guests_only(&context, 64 << 20, 4).expect("a pool");
+        let pools = match room {
+            Some((chunk, chunks, segment)) => {
+                Pools::guests_over(&context, chunk, chunks, segment).expect("a pool")
+            }
+            None => Pools::guests_only(&context, 64 << 20, 4).expect("a pool"),
+        };
         let mut plane = Plane::new();
-        let (mut registration, count, seeds, mask) = select_registration(vocab, cut);
+        let (mut registration, count, seeds, mask) = select_registration(vocab, cut, room.is_some());
         registration.emitted_kernels.retain(|kernel| !dropped.contains(&kernel.kind));
         let program = plane.register(&context, &registration).expect("registers");
         let facts = plane.facts(program, &pools).expect("the program's facts");
         let ids: Vec<ChannelId> = (1..=count as u64).map(ChannelId).collect();
         let (instance, rings) = slots_for(&pools, &facts, 0);
+        let state = plane.guest_state(program, &one_row(), &pools).expect("the guest's state");
+        let (scratch, pair) = match room {
+            Some((_, _, segment)) => (
+                held_at(state.per_instance, state.run, &pools, segment),
+                held_at(state.per_pair, state.run, &pools, 2 * segment),
+            ),
+            None => (
+                scratch_of(&plane, program, &one_row(), &pools, 0, 0),
+                pair_of(&plane, program, &one_row(), &pools),
+            ),
+        };
         let id = plane
             .bind(
                 &context,
@@ -1207,8 +1280,8 @@ mod tests {
                     pools: &pools,
                     instance: &instance,
                     rings: &rings,
-                    scratch: &scratch_of(&plane, program, &one_row(), &pools, 0, 0),
-                    pair: &pair_of(&plane, program, &one_row(), &pools),
+                    scratch: &scratch,
+                    pair: &pair,
                 },
             )
             .expect("the instance binds");
@@ -1238,9 +1311,46 @@ mod tests {
             .as_chunks::<4>()
             .0
             .iter()
-            .map(|word| i32::from_le_bytes(*word) != 0)
+            .map(|word| i32::from_le_bytes(*word))
             .collect();
-        (mask, took)
+        (mask, took, state.run)
+    }
+
+    /// A value wider than the pool's chunk lies in a piece of adjacent
+    /// chunks: a 151,936-token cut in 256 KiB chunks (a vocabulary-wide f32
+    /// value is 607,744 bytes) is laid in runs of more than one chunk, its
+    /// instance's scratch and its pair's tables held as whole runs inside a
+    /// segment, and every form (streamed, grouped, fused) takes as many
+    /// tokens as its rule names (the count goes out: a vocabulary-wide mask
+    /// cell would pass the chunk a ring lies in). Before runs, the bind was
+    /// refused (a value past a chunk).
+    #[test]
+    fn a_value_past_a_chunk_lies_in_a_run_of_chunks() {
+        use eta_compiler::codegen::program::KernelKind;
+        let vocab = 151_936usize;
+        let room = Some((256u64 << 10, 64u32, 16u32));
+        for (seed, spread, cut) in [
+            (5u64, 1.0e-4f64, Cut::P(0.9)),
+            (6, 1.0e-3, Cut::K(100)),
+            (7, 1.0e-5, Cut::P(0.5)),
+        ] {
+            let values = distribution(vocab, spread, seed);
+            let want_count =
+                i32::try_from(reference(&values, cut).iter().filter(|&&t| t).count()).expect("a count");
+            for (form, dropped) in [
+                ("streamed", &[][..]),
+                ("grouped", &[KernelKind::Streamed][..]),
+                ("fused", &[KernelKind::Streamed, KernelKind::Grouped][..]),
+            ] {
+                let (got, _, run) = fire_cut_in(&values, cut, dropped, room);
+                assert!(run > 1, "{form} {cut:?}: a piece of {run} chunk(s)");
+                assert_eq!(
+                    got,
+                    [want_count],
+                    "{form} {cut:?}: the tokens taken in runs of {run} chunks"
+                );
+            }
+        }
     }
 
     /// Probabilities from a seeded generator, `spread` deciding how flat:
@@ -1364,10 +1474,10 @@ mod tests {
         pools: &crate::store::Pools,
     ) -> engine::ScratchPlace {
         use crate::store::layout::INSTANCE;
-        let _ = extents;
         let bytes = plane
-            .pair_bytes(program, pools)
-            .expect("the pair's tables lay");
+            .guest_state(program, extents, pools)
+            .expect("the pair's tables lay")
+            .per_pair;
         let per_chunk = pools.slots_per_chunk(INSTANCE).expect("an instance shape");
         let slot = pools.slot_bytes(INSTANCE).expect("an instance slot");
         let slots = u32::try_from(bytes.max(1).div_ceil(slot)).expect("slots");
@@ -1395,8 +1505,9 @@ mod tests {
     ) -> engine::ScratchPlace {
         use crate::store::layout::INSTANCE;
         let bytes = plane
-            .lane_scratch(program, extents, pools)
-            .expect("the scratch lays in pieces");
+            .guest_state(program, extents, pools)
+            .expect("the scratch lays in pieces")
+            .per_instance;
         let slot = pools.slot_bytes(INSTANCE).expect("an instance slot");
         let (first, room) = scratch_first(pools);
         let slots = u32::try_from(bytes.max(1).div_ceil(slot)).expect("slots");

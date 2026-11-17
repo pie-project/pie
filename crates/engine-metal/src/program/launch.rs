@@ -57,43 +57,107 @@ fn launches<'a>(
     }
 }
 
-/// A stage's scratch as Metal lays it ([`launches`]) in pieces of at most
-/// `chunk` bytes ([`eta_exec::lay_out_chunked`]): what the kernels'
-/// offsets and pieces, the instance's scratch (`engine::GuestState`) and
-/// the lane's piece bases all read, the same at every call. A value past
-/// a piece is refused by name ([`TooLarge::PastChunk`]).
+/// A stage's scratch as Metal lays it ([`launches`]) in `pieces`
+/// ([`eta_exec::lay_out_chunked`]): what the kernels' offsets and pieces,
+/// the instance's scratch (`engine::GuestState`) and the lane's piece
+/// bases all read, the same at every call. A value past a segment is
+/// refused by name ([`TooLarge::PastSegment`]).
 fn layout_of(
     plan: &LaunchStagePlan,
     regions: &[Region],
     descriptors: &[ValueDesc],
-    chunk: u64,
+    pieces: eta_exec::Pieces,
 ) -> Result<ChunkLayout> {
-    eta_exec::lay_out_chunked(plan, descriptors, &launches(plan, regions, descriptors), chunk)
+    eta_exec::lay_out_chunked(plan, descriptors, &launches(plan, regions, descriptors), pieces)
         .map_err(|why: TooLarge| {
             Fault::program(
                 "program::launch",
-                format!("a lane's scratch does not lie in pieces of {chunk} bytes: {why}"),
+                format!(
+                    "a lane's scratch does not lie in pieces of {} chunk(s) of {} bytes: {why}",
+                    pieces.run, pieces.chunk
+                ),
             )
         })
 }
 
-/// The bytes a piece of a guest's scratch holds at most: a chunk's
-/// `Instance` slots, one run of them (`engine::ScratchPlace::Run`) or the
-/// room of a whole chunk (`Chunks`).
-pub fn scratch_unit(pools: &Pools) -> Result<u64> {
-    Ok(u64::from(pools.slots_per_chunk(INSTANCE)?) * pools.slot_bytes(INSTANCE)?)
+/// The `Instance` room guest state lies in: a chunk's slots (`unit` bytes)
+/// lie at adjacent addresses, and so do the chunks of a run inside one
+/// segment of `segment` chunks (a pool part holds whole segments, one
+/// buffer). A piece is a run of `run` chunks from its first; a state that
+/// fits a chunk's slots holds one run of slots, a state of more holds that
+/// many whole runs of chunks of `chunk` bytes (`engine::ScratchPlace`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Room {
+    /// The bytes of one chunk's `Instance` slots.
+    pub unit: u64,
+    /// A chunk's bytes.
+    pub chunk: u64,
+    /// The chunks a segment holds.
+    pub segment: u32,
+    /// The chunks a piece takes (`engine::GuestState::run`).
+    pub run: u32,
 }
 
-/// The bytes an instance holds for a stage laid as `ends` says
-/// ([`ChunkLayout::ends`]): its one piece's where it takes one (a run in a
-/// chunk), else a whole chunk of `chunk_bytes` a piece, so the runtime
-/// takes one chunk for each.
-#[must_use]
-pub fn scratch_held(ends: &[u64], chunk_bytes: u64) -> u64 {
-    match ends {
-        [] => 0,
-        [only] => (*only).max(SCRATCH_ALIGN).next_multiple_of(SCRATCH_ALIGN),
-        _ => u64::try_from(ends.len()).unwrap_or(u64::MAX).saturating_mul(chunk_bytes),
+impl Room {
+    /// The pool's room, a piece one chunk.
+    pub fn of(pools: &Pools) -> Result<Room> {
+        Ok(Room {
+            unit: u64::from(pools.slots_per_chunk(INSTANCE)?) * pools.slot_bytes(INSTANCE)?,
+            chunk: pools.layout().chunk_bytes,
+            segment: pools.layout().segment_chunks,
+            run: 1,
+        })
+    }
+
+    /// The same room, a piece `run` chunks. A run past one chunk reads
+    /// across chunks as one range, so a chunk's slots must fill it whole:
+    /// a gap past a chunk's last slot is refused by name.
+    pub fn at_run(self, run: u32) -> Result<Room> {
+        if run > 1 && self.unit != self.chunk {
+            return Err(Fault::program(
+                "program::launch",
+                format!(
+                    "a guest's piece of {run} chunks: a chunk's Instance slots hold {} of its {} \
+                     bytes, so the chunks of a run do not lie one after another",
+                    self.unit, self.chunk
+                ),
+            ));
+        }
+        Ok(Room {
+            run: run.max(1),
+            ..self
+        })
+    }
+
+    /// A piece's bytes: its run's chunks' slots.
+    #[must_use]
+    pub fn piece(self) -> u64 {
+        self.unit.saturating_mul(u64::from(self.run.max(1)))
+    }
+
+    /// What a stage's scratch is laid in: chunks of a chunk's slots, a
+    /// segment's of them, a piece at least this room's run.
+    #[must_use]
+    pub fn pieces(self) -> eta_exec::Pieces {
+        eta_exec::Pieces::new(self.unit, self.segment).at_least(self.run.max(1))
+    }
+
+    /// The bytes an instance holds for a stage laid as `ends` says
+    /// ([`ChunkLayout::ends`]): its one piece's where it fits a chunk's
+    /// slots (a run of slots in a chunk), else a whole run of chunks a
+    /// piece, so the runtime takes a run for each.
+    #[must_use]
+    pub fn held(self, ends: &[u64]) -> u64 {
+        match ends {
+            [] => 0,
+            [only] if *only <= self.unit => {
+                (*only).max(SCRATCH_ALIGN).next_multiple_of(SCRATCH_ALIGN)
+            }
+            _ => u64::try_from(ends.len())
+                .unwrap_or(u64::MAX)
+                .saturating_mul(u64::from(self.run.max(1)))
+                .saturating_mul(self.chunk),
+        }
     }
 }
 
@@ -1089,15 +1153,15 @@ impl Prepared {
         }
     }
 
-    /// The pieces one lane of a stage of `plan` takes at `extents`, each
-    /// piece's bytes in use, laid in pieces of at most `chunk` bytes as
-    /// [`Prepared::build`] lays them.
-    pub fn scratch_ends(
+    /// One lane's scratch of a stage of `plan` at `extents`, laid in
+    /// `pieces` as [`Prepared::build`] lays it: its run and each piece's
+    /// bytes in use.
+    pub fn scratch_layout(
         plan: &LaunchStagePlan,
         regions: &[Region],
         extents: &Extents,
-        chunk: u64,
-    ) -> Result<Vec<u64>> {
+        pieces: eta_exec::Pieces,
+    ) -> Result<ChunkLayout> {
         let descriptors: Vec<ValueDesc> = plan
             .value_types
             .iter()
@@ -1110,7 +1174,7 @@ impl Prepared {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(layout_of(plan, regions, &descriptors, chunk)?.ends)
+        layout_of(plan, regions, &descriptors, pieces)
     }
 
     /// The bind-time tables a stage of `plan` takes, in the order `build`
@@ -1148,8 +1212,8 @@ impl Prepared {
         sizes
     }
 
-    /// The stage at `extents`, its scratch laid in pieces of at most
-    /// `chunk` bytes ([`scratch_unit`]).
+    /// The stage at `extents`, its scratch laid in `pieces` (the
+    /// program's run, [`Room::pieces`]).
     #[allow(clippy::too_many_arguments)]
     pub fn build(
         plan: &LaunchStagePlan,
@@ -1157,7 +1221,7 @@ impl Prepared {
         shapes: &[ChannelShape],
         extents: Extents,
         rows: u32,
-        chunk: u64,
+        pieces: eta_exec::Pieces,
         tables: &mut Tables<'_>,
     ) -> Result<Prepared> {
         let channel_count = u32::try_from(plan.channel_bindings.len())
@@ -1177,7 +1241,7 @@ impl Prepared {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let scratch_layout = layout_of(plan, regions, &descriptors, chunk)?;
+        let scratch_layout = layout_of(plan, regions, &descriptors, pieces)?;
         let temporary_offset = lane_word(LANE_TEMPORARY, scratch_layout.temporary.offset)?;
         let temporary_bytes = lane_word(LANE_TEMPORARY_BYTES, scratch_layout.temporary_bytes)?;
 

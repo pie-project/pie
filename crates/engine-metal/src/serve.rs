@@ -2643,14 +2643,15 @@ impl Shell {
             pooled,
         )?;
         if crate::diag::on().tier_trace {
+            let state = self
+                .programs
+                .guest_state(program_id, &extents, &self.pools)
+                .unwrap_or_default();
             eprintln!(
                 "residency: program {} bound at {extents:?}: each instance holds {} bytes of \
-                 scratch, its pair {} bytes of batch tables, in the Instance room",
-                program_id.0,
-                self.programs
-                    .lane_scratch(program_id, &extents, &self.pools)
-                    .unwrap_or(0),
-                self.programs.pair_bytes(program_id, &self.pools).unwrap_or(0),
+                 scratch, its pair {} bytes of batch tables, in the Instance room, in runs of \
+                 {} chunk(s)",
+                program_id.0, state.per_instance, state.per_pair, state.run,
             );
         }
         Ok(id)
@@ -2678,12 +2679,7 @@ impl Shell {
         program_id: engine::ProgramId,
         extents: &eta_exec::Extents,
     ) -> Result<engine::GuestState> {
-        Ok(engine::GuestState {
-            per_instance: self
-                .programs
-                .lane_scratch(program_id, extents, &self.pools)?,
-            per_pair: self.programs.pair_bytes(program_id, &self.pools)?,
-        })
+        self.programs.guest_state(program_id, extents, &self.pools)
     }
 
     /// What an instance of `program_id` holds in pool slots
