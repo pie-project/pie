@@ -1482,7 +1482,13 @@ impl Inputs {
 
         let rs = match (rs, rs_at) {
             (Some((pages, toks)), Some(at)) => {
-                copy(at.lanes, table_lanes.max(lanes) as usize * 16)?;
+                // A lane's whole `RsLane`, its extended-run place with it:
+                // a shorter copy leaves the last lanes' tails as an earlier
+                // fire staged them.
+                copy(
+                    at.lanes,
+                    table_lanes.max(lanes) as usize * RS_LANE_BYTES as usize,
+                )?;
                 copy(at.pages, *pages as usize * 8)?;
                 copy(at.replay_tok, *toks as usize * 4)?;
                 Some(RsHandles {
