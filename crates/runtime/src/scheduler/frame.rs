@@ -227,10 +227,6 @@ struct SealSkips {
 pub(crate) struct FramePolicy {
     k: usize,
     max_wave_tokens: usize,
-    /// The tokens a wave takes where the worker policy stated them
-    /// (`install-batch`), in place of the engine's one fire's: prompts past
-    /// one fire then share a frame, and the worker cuts the wave into fires.
-    batch_tokens: Option<usize>,
     max_wave_rows: usize,
     /// The rows a wave may read out, the engine's `max_readouts`; 0 bounds
     /// nothing.
@@ -332,10 +328,6 @@ impl FramePolicy {
 
     /// The worker policy's bound on a batch of passes, as it stands now;
     /// none leaves a wave the engine's one fire's tokens.
-    pub fn bound_batch(&mut self, tokens: Option<usize>) {
-        self.batch_tokens = tokens;
-    }
-
     /// Fires are cut to `rows` of the activation rung now: a lane whose
     /// next frame holds a wider fire (cut under a cap since lowered) is
     /// left out of the frames sealed from here, its frame kept whole until
@@ -428,7 +420,6 @@ impl FramePolicy {
         Self {
             k,
             max_wave_tokens,
-            batch_tokens: None,
             max_wave_rows,
             max_wave_readouts: 0,
             lanes: BTreeMap::new(),
@@ -1059,7 +1050,7 @@ impl FramePolicy {
 
         let k = self.k;
         let max_wave_rows = self.max_wave_rows;
-        let max_wave_tokens = self.batch_tokens.unwrap_or(self.max_wave_tokens);
+        let max_wave_tokens = self.max_wave_tokens;
         let max_wave_readouts = self.max_wave_readouts;
         // One frame of prompts on the card at a time: prompts arriving behind
         // it bind together into the next, while decodes keep running ahead.

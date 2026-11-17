@@ -1,51 +1,24 @@
-//! The worker plane of PLEX (`plex:policy@1.0.0`): when a worker's passes run,
-//! and where its state sits within it.
+//! The worker plane of PLEX 1.1 (`plex:policy@1.1.0`, the `plex-host`
+//! crate): when a worker's passes run, and where its state sits within it.
 //!
 //! A process's PLEX id is the id its client knows: one restarted after a KV
 //! reclaim keeps it. The browser build runs no policy: the runtime still
 //! reports here, and nothing listens.
 #![cfg_attr(target_arch = "wasm32", allow(dead_code))]
 
-pub mod batch;
-pub mod offload;
 pub mod pressure;
 pub mod retention;
 pub mod schedule;
 
 #[cfg(not(target_arch = "wasm32"))]
-mod manifest;
-#[cfg(not(target_arch = "wasm32"))]
-mod program;
-#[cfg(not(target_arch = "wasm32"))]
-mod service;
+mod port;
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use manifest::{Manifest, ManifestError};
-#[cfg(not(target_arch = "wasm32"))]
-pub use program::{Commit, Fault, LoadError, Offloads, Plane, Program, Retention, Table};
-#[cfg(not(target_arch = "wasm32"))]
-pub use service::{reload, start, start_default};
+pub use port::{LoadError, reload, start, start_default};
 
 use client_api::Props;
 
 use crate::inferlet::process::ProcessId;
-
-#[cfg(not(target_arch = "wasm32"))]
-pub mod wit {
-    pub use super::program::bindings::plex::policy::types::*;
-}
-
-pub const CAPABILITIES: &[&str] = &[
-    "schedule.admit",
-    "schedule.preempt",
-    "schedule.preempt-for-admit",
-    "schedule.resume",
-    "schedule.floor",
-    "retention.order",
-    "retention.tier",
-    "offload.remote",
-    "publish",
-];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum By {
@@ -91,7 +64,6 @@ pub(crate) enum Event {
     /// While it waits for admission: the tokens of its prompt's prefix the
     /// stores hold now ([`crate::store::waiting`]), in place of the last.
     Waiting(ProcessId, u64),
-    Kept(ProcessId, u64),
     CacheEmptied(ProcessId, By),
     Started(ProcessId),
     Paused(ProcessId),
@@ -167,7 +139,7 @@ pub fn session_closed(session: String) {
 
 pub(crate) fn report(event: Event) {
     #[cfg(not(target_arch = "wasm32"))]
-    service::report(event);
+    port::report(event);
     #[cfg(target_arch = "wasm32")]
     let _ = event;
 }
