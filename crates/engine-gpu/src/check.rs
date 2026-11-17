@@ -8,22 +8,27 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use engine::load::CheckFire;
-use engine::load::check::{Dissection, Fired, Run, Weighed};
+use engine::load::check::{Dissection, Fired, Run, Shell as CheckShell, Weighed};
 use poem_ir::{Platform, Request, Trace};
 
 use crate::api::ContractFor;
-use crate::serve::{Boot, Lane, Serve, Shell};
+use crate::serve::{Boot, CheckRungs, Lane, Serve, Shell};
 
 /// The widest fire a check's load is asked: [`engine::load::check::PAST_TOP`]
 /// times the widest row count the rates step measures, past any fire top a
 /// device's rates can set (the binding bounds it below where it must).
-pub const ASKED_TOP: u32 = engine::load::check::PAST_TOP * engine::rates::GEMM_ROWS[engine::rates::GEMM_ROWS.len() - 1];
+pub const ASKED_TOP: u32 =
+    engine::load::check::PAST_TOP * engine::rates::GEMM_ROWS[engine::rates::GEMM_ROWS.len() - 1];
 
 /// The lanes a served load is asked where a check names no shell: the
 /// compiler's default budget's.
 fn served_lanes() -> u32 {
     poem_compiler::Budget::default().max_lanes
 }
+
+/// The context a served-shape load is asked: one long prompt's, so the
+/// fire top it weighs is the model's, not a short context's.
+const SERVED_CONTEXT: u32 = 32_768;
 
 /// The page every check load pages its kv by.
 const PAGE: u32 = 16;
@@ -76,9 +81,12 @@ impl<B: Serve> engine::load::check::Bench for Bench<B> {
     fn load(
         &mut self,
         run: Run,
-        shell: Option<(u32, u32)>,
+        shell: Option<CheckShell>,
     ) -> Result<Box<dyn engine::load::check::Loaded + '_>, String> {
-        let (slots, context) = shell.unwrap_or((served_lanes(), ASKED_TOP));
+        let (slots, context, rungs) = match shell {
+            None => (served_lanes(), SERVED_CONTEXT, CheckRungs::PastTop),
+            Some(shell) => (shell.slots, shell.context, CheckRungs::To(shell.rows)),
+        };
         let mut loaded = Shell::<B>::load(Boot {
             trace: self.trace.clone(),
             contract: &self.contract,
@@ -94,7 +102,7 @@ impl<B: Serve> engine::load::check::Bench for Bench<B> {
             device: &self.device,
             residency: engine::load::Residency::default(),
             handed: None,
-            check: true,
+            check: Some(rungs),
         })
         .map_err(|e| e.to_string())?;
         if run == Run::Walked {

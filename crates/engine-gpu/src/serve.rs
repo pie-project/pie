@@ -289,10 +289,21 @@ pub struct Boot<'a, B: Serve> {
     pub handed: Option<B::Handed>,
 
     /// A load for the check of the estimate (`engine::load::check`): its
-    /// rungs laid past the fire top to `engine::load::check::laid_top`, the
-    /// widest one binding holds the fire bound, and what the estimate
-    /// weighed them by kept ([`Shell::weighed`]).
-    pub check: bool,
+    /// rungs laid as [`CheckRungs`] says, the widest one binding holds the
+    /// fire bound, and what the estimate weighed them by kept
+    /// ([`Shell::weighed`]).
+    pub check: Option<CheckRungs>,
+}
+
+/// How far a check's load lays its rungs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckRungs {
+    /// Past the fire top, to `engine::load::check::laid_top` of it: the
+    /// served-shape load whose rungs and estimate the check weighs.
+    PastTop,
+    /// To the lattice's rung at these rows: a load sized for one kind of
+    /// the check's fires.
+    To(u32),
 }
 
 /// A load fitted to its device: the device, its tuning and tier, and the
@@ -1058,10 +1069,15 @@ impl<B: Serve> Shell<B> {
             if rated && let Ok(constants) = engine::roofline::Constants::of(&device_profile.rates())
             {
                 let top = engine::roofline::fire_top(&rung_tokens, &constants);
-                let laid = if boot.check {
-                    engine::load::check::laid_top(&rung_tokens, top)
-                } else {
-                    top
+                let laid = match boot.check {
+                    None => top,
+                    Some(CheckRungs::PastTop) => engine::load::check::laid_top(&rung_tokens, top),
+                    Some(CheckRungs::To(rows)) => rung_tokens
+                        .iter()
+                        .copied()
+                        .find(|&tokens| tokens >= rows)
+                        .or(rung_tokens.last().copied())
+                        .unwrap_or(rows),
                 };
                 rung_tokens.retain(|&tokens| tokens <= laid);
                 fire_top = Some(top);
@@ -1129,7 +1145,7 @@ impl<B: Serve> Shell<B> {
                     )
                 );
                 chosen = Some(pick);
-                if boot.check {
+                if boot.check.is_some() {
                     weighed = Some(engine::load::check::Weighed {
                         model: engine::load::model_class(&boot.trace).to_owned(),
                         rungs,
@@ -1144,7 +1160,7 @@ impl<B: Serve> Shell<B> {
             // never runs past it; a check's load fires every rung it laid),
             // else the widest rung one binding holds.
             let widest = match chosen {
-                Some(pick) if !boot.check => Some(pick.tokens),
+                Some(pick) if boot.check.is_none() => Some(pick.tokens),
                 _ => crate::arena::bound_top(&spans, binding),
             };
             // Whether the binding cut it, which the load then says.
@@ -2104,13 +2120,14 @@ impl<B: Serve> Shell<B> {
 
     #[must_use]
     pub fn classes(&self) -> poem_ir::LaneClasses {
-        let outputs = poem_exec::feeds::class_outputs(
-            &self.trace,
-            &self.compiled,
-            self.paging().context(),
-            self.paging().page_size,
-        )
-        .unwrap_or_default();
+        let outputs =
+            poem_exec::feeds::class_outputs(
+                &self.trace,
+                &self.compiled,
+                self.paging().context(),
+                self.paging().page_size,
+            )
+                .unwrap_or_default();
         poem_exec::feeds::lane_classes(&self.trace, &self.compiled, &outputs)
     }
 
@@ -2380,10 +2397,7 @@ impl<B: Serve> Shell<B> {
     /// Fires `lanes` and reads back every output their programs read, the
     /// host's rows and those a reader on the device takes alike: each read's
     /// lane, output name and values (widened to f32), in the step's order.
-    pub fn fire_outputs(
-        &mut self,
-        lanes: &[Seated<'_, B>],
-    ) -> Result<Vec<(u32, String, Vec<f32>)>> {
+    pub fn fire_outputs(&mut self, lanes: &[Seated<'_, B>]) -> Result<Vec<(u32, String, Vec<f32>)>> {
         use engine::frame::Shell as FrameShell;
         if lanes.iter().any(|lane| !lane.refs) {
             let seats = self.pools.seat_segments();
@@ -2409,11 +2423,7 @@ impl<B: Serve> Shell<B> {
         let _ = self.landed.remove(&landed.seq);
         // Nothing fired since: the arm's seat holds this step's reads.
         let read: Vec<&ReadSpan> = layout.iter().filter(|span| span.rows > 0).collect();
-        let end = read
-            .iter()
-            .map(|span| span.at + span.bytes())
-            .max()
-            .unwrap_or(0);
+        let end = read.iter().map(|span| span.at + span.bytes()).max().unwrap_or(0);
         let mut raw = vec![0u8; usize::try_from(end).unwrap_or(usize::MAX)];
         self.readout[arm].read(0, &mut raw)?;
         Ok(read
@@ -2491,11 +2501,7 @@ impl<B: Serve> Shell<B> {
 
     /// Where `slots` lays each capturing lane's rows: its source lane, and
     /// the bytes of the span's buffer its key row and page row start at.
-    fn capture_rows(
-        &self,
-        composition: &Composition,
-        slots: &SlotTable,
-    ) -> Vec<(u32, u64, Option<u64>)> {
+    fn capture_rows(&self, composition: &Composition, slots: &SlotTable) -> Vec<(u32, u64, Option<u64>)> {
         let Some(rows) = self.span.capture().filter(|_| slots.1.rows() > 0) else {
             return Vec::new();
         };
@@ -4013,9 +4019,10 @@ impl<B: Serve> Shell<B> {
         }));
         // Each capturing lane's rows by their bases in the guest region's
         // key and page rows ([`crate::arena::Span::slots`] binds them).
-        let capture_table = self.span.capture().map_or_else(Vec::new, |rows| {
-            scored.table(&indptr_host, rows.keys, rows.pages)
-        });
+        let capture_table = self
+            .span
+            .capture()
+            .map_or_else(Vec::new, |rows| scored.table(&indptr_host, rows.keys, rows.pages));
         let (readout_rows, readout_layout) =
             readout_table(&composition, lanes, &self.readouts, &scored, |class| {
                 self.readout_for(class)

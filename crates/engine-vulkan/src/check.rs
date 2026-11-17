@@ -34,10 +34,7 @@ pub fn bench(
 
 /// `pie tune vulkan --rates`: device 0's `[rates]` measured, every one, and
 /// its user file under `profiles` with them in place of its own.
-pub fn rated(
-    profiles: &Path,
-    say: &mut dyn FnMut(&str),
-) -> Result<engine::rates::Rated, String> {
+pub fn rated(profiles: &Path, say: &mut dyn FnMut(&str)) -> Result<engine::rates::Rated, String> {
     let began = Instant::now();
     let device = Context::bind(&crate::api::DeviceBoot::default(), engine::Allowance::WHOLE)
         .map_err(|e| e.to_string())?;
@@ -45,7 +42,8 @@ pub fn rated(
     let (profile, _) = crate::chip::resolve(&chip, Some(profiles));
     let tuning = crate::tuning::Tuning::new(profile, device.limits());
     say(&format!("measuring the [rates] of {}", chip.name));
-    let measured = crate::rates::measure_saying(&device, &tuning, say).map_err(|e| e.to_string())?;
+    let measured =
+        crate::rates::measure_saying(&device, &tuning, say).map_err(|e| e.to_string())?;
     if measured.unsettled {
         say("a rate's frames stopped at the device's bound on one submission before it settled");
     }

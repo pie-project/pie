@@ -34,10 +34,7 @@ pub fn bench(
 
 /// `pie tune wgpu --rates`: adapter 0's `[rates]` measured, every one, and
 /// its user file under `profiles` with them in place of its own.
-pub fn rated(
-    profiles: &Path,
-    say: &mut dyn FnMut(&str),
-) -> Result<engine::rates::Rated, String> {
+pub fn rated(profiles: &Path, say: &mut dyn FnMut(&str)) -> Result<engine::rates::Rated, String> {
     let began = Instant::now();
     let device = Context::bind(&crate::api::DeviceBoot::default(), engine::Allowance::WHOLE)
         .map_err(|e| e.to_string())?;
