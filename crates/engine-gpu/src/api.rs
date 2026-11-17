@@ -606,6 +606,8 @@ where
             classes: shell.classes(),
         };
 
+        // The load is through: every fire from here on is served.
+        shell.serve_from_now();
         self.shell = Some(shell);
         self.caps = Some(caps.clone());
         Ok(Loaded {

@@ -749,6 +749,11 @@ pub struct Shell<B: Serve> {
     /// each one's source lane and the bytes its key row, and its page row
     /// where it has one, start at in the span's buffer.
     last_capture: Vec<(u32, crate::guest::session::ScoreRows)>,
+    /// Whether the load is through and fires are served
+    /// ([`Shell::serve_from_now`]): a served lane that captures scores has a
+    /// reader attached, which holds its rows; before, the load's own warm
+    /// and arming fires have none, and a capturing class's lanes lay none.
+    serving: bool,
 
     rs_buffers: Option<crate::rs::Buffers>,
 
@@ -1651,6 +1656,7 @@ impl<B: Serve> Shell<B> {
             rs_layout,
             snaps: None,
             last_capture: Vec::new(),
+            serving: false,
             rs_buffers,
             rs_scratch: None,
             out,
@@ -2448,6 +2454,14 @@ impl<B: Serve> Shell<B> {
     #[must_use]
     pub fn kv_page_bytes(&self) -> u64 {
         self.pools.page_bytes()
+    }
+
+    /// The load is through: every fire from now on is served, and a lane
+    /// that captures scores with no reader holding its rows is refused by
+    /// name (the runtime stamps the switch only on a fire carrying its
+    /// reader).
+    pub fn serve_from_now(&mut self) {
+        self.serving = true;
     }
 
     /// The last fire's capturing lanes' rows, read back at their readers'
@@ -3889,9 +3903,25 @@ impl<B: Serve> Shell<B> {
 
         // The lanes whose class captures, compacted in lane order: a key row
         // each, and a page row each of those whose program reads pages.
-        // A lane captures where its class writes score rows and a reader
-        // holds its rows: a fire with no reader bound (the load's warm and
-        // arming fires among them) lays none, and its captures skip.
+        // A lane captures where its class writes score rows. A served one
+        // has a reader holding its rows, or is refused by name; the load's
+        // own warm and arming fires have no reader, lay none, and their
+        // captures skip.
+        if self.serving
+            && let Some(row) = composition.lanes().iter().find(|row| {
+                self.captures(row.class as usize) && lanes[row.source as usize].scores.is_none()
+            })
+        {
+            return Err(program(
+                "serve::prepare",
+                format!(
+                    "lane {} captures scores, and no instance reading them is attached to \
+                     hold its rows: the scores switch is stamped only on a fire carrying \
+                     its reader",
+                    row.source
+                ),
+            ));
+        }
         let scored = Scored::of(composition.lanes().iter().map(|row| {
             let captures = self.captures(row.class as usize)
                 && lanes[row.source as usize].scores.is_some();
@@ -4506,9 +4536,18 @@ fn readout_table<B: Serve>(
                 Kind::Readout => (host.first, host.rows, false),
                 Kind::Lane => {
                     let lane = u32::try_from(lane_row).unwrap_or(u32::MAX);
-                    // A score row is the lane's among the capturing ones.
+                    // A score row is the lane's among the capturing ones;
+                    // a lane no reader holds rows for (a load's warm and
+                    // arming fires) lays none and reads none.
                     let first = match plane.captured {
                         None => lane,
+                        Some(_)
+                            if lanes
+                                .get(source)
+                                .is_some_and(|seated| seated.scores.is_none()) =>
+                        {
+                            continue;
+                        }
                         Some(grain) => {
                             let row = match grain {
                                 crate::arena::Grain::Keys => scored.row(lane),

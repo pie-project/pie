@@ -1157,6 +1157,9 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
                 Refusal::Program(format!("the guest staging ring was not laid: {why}"))
             })?,
         );
+        place.device.lay_staging().map_err(|why| {
+            Refusal::Program(format!("the device's transfer staging was not laid: {why}"))
+        })?;
         self.forms.load(engine_gpu::guest::Bounds {
             chunk: place.pools.chunk_bytes(),
             io: place.io,

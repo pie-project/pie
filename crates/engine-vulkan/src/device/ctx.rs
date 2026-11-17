@@ -1141,6 +1141,15 @@ impl Context {
         &self.core.books
     }
 
+    /// Lays the transfer staging every host write to device memory and read
+    /// from it goes through, if no write has yet: what a load does before
+    /// it is ready, so a bind's tables and a guest's roots past its ring
+    /// rooms allocate nothing.
+    pub fn lay_staging(&self) -> Result<()> {
+        let mut transfer = self.core.transfer.lock().expect("transfer lock poisoned");
+        self.core.staging(&mut transfer).map(|_| ())
+    }
+
     pub fn bind_thread(&self) -> Result<()> {
         Ok(())
     }

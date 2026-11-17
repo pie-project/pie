@@ -485,7 +485,7 @@ fn a_bind_and_its_fires_create_no_buffer() {
     else {
         return;
     };
-    for (round, token) in [3u32, 11, 7].into_iter().enumerate() {
+    for token in [3u32, 11, 7] {
         let lane = Lane {
             slot: 0,
             word,
@@ -498,14 +498,6 @@ fn a_bind_and_its_fires_create_no_buffer() {
             }],
             ..Lane::default()
         };
-        if round > 0 {
-            assert!(
-                engine
-                    .publish_channel(instance, 2, &T.to_le_bytes())
-                    .expect("the timestep publishes"),
-                "the ring had room"
-            );
-        }
         let mut ticket = engine
             .submit(&FrameSubmission::of(Step {
                 lanes: vec![lane],

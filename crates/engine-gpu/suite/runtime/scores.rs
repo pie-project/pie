@@ -416,3 +416,39 @@ fn the_score_rows_are_the_oracles() {
     assert_eq!(&again[0].2, pages, "the page row at the new place");
     assert_eq!(read(&shell, place.expect("placed")), before, "the old place untouched");
 }
+
+/// A served fire whose lane captures scores with no reader attached to hold
+/// its rows is refused by name (the runtime stamps the switch only on a fire
+/// carrying its reader); before the load is through, the same fire (a warm
+/// or arming fire, which has no reader) lays no row and serves.
+#[test]
+fn a_served_capturing_lane_without_a_reader_is_refused_by_name() {
+    let fixture = fixture(MODEL, None);
+    let trace = &fixture.trace;
+    let Some(mut shell) = load(&fixture, 256) else {
+        return;
+    };
+    let reads = vec![KEYS.to_string()];
+    let prompt: Vec<u32> = (0..6u32).map(|at| (11 + at * 37) % 256).collect();
+    let fire = |shell: &mut crate::backend::Shell| {
+        let seated = [Seated {
+            held: Some(0),
+            reads: &reads,
+            ..Seated::of(Lane {
+                slot: 0,
+                word: word(trace, prompt.len() as u32, true),
+                tokens: &prompt,
+            })
+        }];
+        shell.fire_seated(&seated)
+    };
+    fire(&mut shell).expect("a load's own fire with no reader lays no row");
+    assert!(shell.score_rows().expect("read back").is_empty());
+    shell.serve_from_now();
+    let refused = fire(&mut shell).expect_err("a served capturing lane with no reader");
+    let why = refused.to_string();
+    assert!(
+        why.contains("lane 0 captures scores, and no instance reading them is attached"),
+        "{why}"
+    );
+}

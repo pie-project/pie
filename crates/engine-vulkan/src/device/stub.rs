@@ -60,6 +60,10 @@ impl Context {
     }
 
     #[must_use]
+    pub fn lay_staging(&self) -> Result<()> {
+        match self.never {}
+    }
+
     pub fn books(&self) -> &engine_gpu::Books {
         match self.never {}
     }
