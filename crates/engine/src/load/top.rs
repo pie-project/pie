@@ -455,7 +455,7 @@ impl fmt::Display for Refused {
             Refused::NoRates { device, key } => write!(
                 f,
                 "device {device} has no rates in its profile for this model: `[rates] {key}` is \
-                 unstated, so nothing weighs its top rung; `pie tune <backend> --rates` measures \
+                 unstated (or stated at nothing), so nothing weighs its top rung; `pie tune <backend> --rates` measures \
                  it"
             ),
             Refused::NoRung(no) => no.fmt(f),
@@ -756,8 +756,19 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "device Card X has no rates in its profile for this model: `[rates] \
-             attn_tflops_by_keys` is unstated, so nothing weighs its top rung; `pie tune <backend> \
-             --rates` measures it"
+             attn_tflops_by_keys` is unstated (or stated at nothing), so nothing weighs its top \
+             rung; `pie tune <backend> --rates` measures it"
+        );
+        // A rate that settled at nothing is refused by the same name, never
+        // divided by.
+        let zero = profile::fire::Rates {
+            attn_tflops_by_keys: Some(vec![(512, 0.0), (8192, 4.0)]),
+            ..self::rates()
+        };
+        let err = choose(&rungs, 1 << 33, u32::MAX, &zero, "Card X", &counts()).unwrap_err();
+        assert!(
+            err.to_string().contains("`[rates] attn_tflops_by_keys`"),
+            "{err}"
         );
     }
 
