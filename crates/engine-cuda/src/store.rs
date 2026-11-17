@@ -54,7 +54,7 @@ impl Accounting {
     #[must_use]
     pub fn of(card: u64, allowance: engine::Allowance, weights: u64, minimum: u64) -> Accounting {
         let ceiling = allowance.ceiling(card);
-        let floor = elastic::safety_floor_bytes(card);
+        let floor = elastic::safety_floor_bytes();
         Accounting {
             card,
             ceiling,
@@ -428,6 +428,21 @@ pub fn weight_tier_bytes(trace: &Trace, stated: u64, extra_resident: u64) -> Res
 /// loads hold lies outside it. `latch` says a load is resolving its one
 /// ceiling, not a reading ahead of it.
 pub fn load_ceiling(allowance: engine::Allowance, latch: bool) -> Result<u64> {
+    crate::device::card::stated(allowance.budget);
+    if latch
+        && allowance.budget.is_none()
+        && let Some(terms) = crate::device::card::integrated()?
+    {
+        let mib = |bytes: u64| bytes >> 20;
+        eprintln!(
+            "engine-cuda: integrated device: capacity {} MiB = min(dedicated {} MiB - held {} MiB, Windows commit available {} MiB), less the driver's {} MiB floor; the system memory the driver lends it is not counted (state [engine.memory] budget_device to size by it)",
+            mib(terms.free()),
+            mib(terms.dedicated),
+            mib(terms.held),
+            mib(terms.commit_available),
+            mib(elastic::safety_floor_bytes()),
+        );
+    }
     let (free, total) = device_memory()?;
     let held = (total - free).saturating_sub(crate::device::own::before_loads(latch));
     Ok(elastic::ceiling_of(total, held, allowance))
@@ -435,20 +450,7 @@ pub fn load_ceiling(allowance: engine::Allowance, latch: bool) -> Result<u64> {
 
 /// The device's free and total bytes, as the driver reports them now.
 pub fn device_memory() -> Result<(u64, u64)> {
-    #[cfg(feature = "device")]
-    {
-        use crate::device::rt;
-
-        let (mut free, mut total) = (0usize, 0usize);
-        // SAFETY: two live locals; the call only writes them.
-        let asked = unsafe { rt::cudaMemGetInfo(&raw mut free, &raw mut total) };
-        crate::device::ctx::check("cudaMemGetInfo", asked)?;
-        Ok((free as u64, total as u64))
-    }
-    #[cfg(not(feature = "device"))]
-    {
-        Err(Fault::Runtimeless)
-    }
+    crate::device::card::memory()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3202,16 +3204,9 @@ impl Pools {
             let first = at.next_multiple_of(PAGE);
             let end = (at + bytes as u64) / PAGE * PAGE;
             if end > first {
-                // SAFETY: whole pages inside a read-only file mapping the
-                // weight store holds for the load's life; the advice drops
-                // their resident copies, which a later read faults back in.
-                unsafe {
-                    libc::madvise(
-                        first as *mut core::ffi::c_void,
-                        (end - first) as usize,
-                        libc::MADV_DONTNEED,
-                    );
-                }
+                // Whole pages inside a read-only file mapping the weight
+                // store holds for the load's life.
+                crate::device::alloc::drop_file_pages(first as usize, (end - first) as usize);
             }
         }
     }
