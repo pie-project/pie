@@ -1088,7 +1088,9 @@ impl Pools {
                 have: u64::from(self.layout.total_chunks),
             });
         }
-        Ok((self.pool.physical(chunk)?, index))
+        let physical = self.pool.physical(chunk)?;
+        self.pool.clear_of_carve(chunk, physical)?;
+        Ok((physical, index))
     }
 
     /// The physical slot kernels address for slot ref `slot` of `shape`.

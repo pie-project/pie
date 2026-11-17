@@ -183,7 +183,9 @@ fn fault(fault: Fault) -> Error {
             Error::Program(fault.to_string())
         }
         Fault::Fire(_) => Error::Invalid(fault.to_string()),
-        Fault::Residency(_) | Fault::FitShort(_) => Error::Impossible(fault.to_string()),
+        Fault::Residency(_) | Fault::FitShort(_) | Fault::UnderCarve { .. } => {
+            Error::Impossible(fault.to_string())
+        }
     }
 }
 
