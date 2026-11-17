@@ -1173,14 +1173,6 @@ impl Shell {
                 })
                 .collect(),
         );
-        // Committed whole: a fire reading out past one row a lane (a verify
-        // reads every row) would otherwise grow it outside the fit.
-        let unscored = compiled.arena.scores_from(&boot.trace).max(
-            compiled
-                .arena_forked
-                .as_ref()
-                .map_or(0, |forked| forked.scores_from(&boot.trace)),
-        );
         // The activation rungs a pool may drop to (SPEC decision 6), each a
         // bucket's carve laid at the reservation's end.
         let rungs = activation_rungs(&boot.trace, &budgets, &compiled)?;
@@ -1191,30 +1183,33 @@ impl Shell {
                 .map(|(tokens, map)| (*tokens, map.bytes))
                 .collect::<Vec<_>>(),
         );
-        // What each carve laid at the end reads before its scores.
-        let prefixes: Vec<(u64, u64)> = std::iter::once(&compiled.arena)
-            .chain(compiled.arena_forked.as_ref())
-            .chain(rungs.iter().map(|(_, map)| map))
-            .map(|map| (map.bytes, map.scores_from(&boot.trace)))
-            .collect();
-        let mut arena = Arena::reserve(arena_bytes).with_rungs(rungs, prefixes);
-        // The arena is backed here, at load, out of the elastic pool the
-        // allowance leaves past the weights: one it does not hold refuses
-        // the load by name.
-        arena
-            .ensure(&mut pools, unscored)
-            .map_err(|why| match why {
-                Fault::Ceiling { need, have, .. } | Fault::OutOfMemory { need, have } => {
-                    Fault::Residency(format!(
-                        "the card does not hold this deployment's activation arena: it backs \
-                         {need} bytes at load, and under the load's allowance (`[engine.memory] \
-                         budget_device`, or the whole card) the elastic pool past the weights \
-                         holds {have}. Raise `[engine.memory] budget_device`, or serve fewer \
-                         `max_forward_tokens`."
-                    ))
-                }
-                other => other,
-            })?;
+        let mut arena = Arena::reserve(arena_bytes).with_rungs(rungs);
+        // The arena is backed here, at load, whole, out of the elastic pool
+        // the allowance leaves past the weights: a fire reading out past one
+        // row a lane (a verify reads every row) and the `attn.scores` planes
+        // a capturing fire writes are in it, so neither a fire nor a bind
+        // grows it. One the pool does not hold refuses the load by name.
+        let scores = arena_bytes.saturating_sub(
+            compiled.arena.scores_from(&boot.trace).max(
+                compiled
+                    .arena_forked
+                    .as_ref()
+                    .map_or(0, |forked| forked.scores_from(&boot.trace)),
+            ),
+        );
+        arena.back(&mut pools).map_err(|why| match why {
+            Fault::Ceiling { need, have, .. } | Fault::OutOfMemory { need, have } => {
+                Fault::Residency(format!(
+                    "the card does not hold this deployment's activation arena: it backs \
+                     {need} bytes at load ({scores} of them the attention score planes a \
+                     capturing fire writes), and under the load's allowance (`[engine.memory] \
+                     budget_device`, or the whole card) the elastic pool past the weights \
+                     holds {have}. Raise `[engine.memory] budget_device`, or serve fewer \
+                     `max_forward_tokens`."
+                ))
+            }
+            other => other,
+        })?;
         if arena.has_rungs() {
             pools.fit_range_whole();
         }
@@ -1659,9 +1654,6 @@ impl Shell {
                 shell.pools.fresh()
             );
         }
-        // The carves laid at the activation's end, backed where the range
-        // now lies (the fit may have reserved it anew).
-        shell.arena.ensure_rungs(&mut shell.pools)?;
         shell.lay_workspace()?;
         let afforded = fitted.bodies;
         if shell.measuring {
@@ -1874,9 +1866,6 @@ impl Staged {
                 false,
                 &resident,
             )?;
-            // The fit may have reserved the range anew: the carves laid at
-            // the activation's end are backed where it now lies.
-            shell.arena.ensure_rungs(&mut shell.pools)?;
             shell.pools.state_whole();
             fitted
         } else {
@@ -2017,7 +2006,6 @@ impl Shell {
         let fitted = self
             .pools
             .fit_the_card(hold, self.held_for_fires, false, &resident)?;
-        self.arena.ensure_rungs(&mut self.pools)?;
         self.lay_workspace()?;
         self.bodies_mem = usize::try_from(hold).unwrap_or(usize::MAX);
         self.rearming = true;
