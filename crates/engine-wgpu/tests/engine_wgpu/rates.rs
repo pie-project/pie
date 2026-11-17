@@ -13,11 +13,19 @@ fn the_micro_fires_state_rates_and_the_ruling_picks_by_them() {
     };
     let (chip, _) = engine_wgpu::chip::resolve(&device.chip(), None);
     let tuning = engine_wgpu::tuning::Tuning::new(chip.clone(), device.cores());
-    let rates = engine_wgpu::rates::measure(&device, &tuning).unwrap();
+    let rates = engine_wgpu::rates::measure(&device, &tuning, None)
+        .unwrap()
+        .rates;
     assert!(rates.complete(), "{rates:?}");
     let widest = |c: &Option<Vec<(u32, f64)>>| c.as_ref().and_then(|c| c.last()).unwrap().1 * 1e3;
     let (flops, bytes, launch) = (
-        widest(&rates.gemm_tflops_by_rows),
+        widest(
+            &rates
+                .gemm_tflops_by_rows
+                .as_ref()
+                .and_then(|w| w.last())
+                .map(|(_, c)| c.clone()),
+        ),
         rates.hbm_gbps.unwrap(),
         rates.launch_ns.unwrap(),
     );
@@ -68,7 +76,16 @@ fn the_micro_fires_state_rates_and_the_ruling_picks_by_them() {
         scan_dispatches: 0,
         width: 4096,
     };
-    let (top, _) = choose(&rungs, 8 << 30, &profile, "adapter", &counts, 1 << 30).unwrap();
+    let (top, _) = choose(
+        &rungs,
+        8 << 30,
+        &profile,
+        std::sync::Arc::new(|_, _, _| 1),
+        "adapter",
+        &counts,
+        1 << 30,
+    )
+    .unwrap();
     let line = line_of(&top, top.tokens, top.span_bytes, 8 << 30, profile.tuned());
     assert!(line.contains("by the estimate"), "{line}");
     assert!(line.contains("rates measured this load"), "{line}");
