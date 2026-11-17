@@ -19,7 +19,7 @@
 //!   of them, several times what any last-level cache holds, so each reads
 //!   its weight from device memory as a layer's does.
 //! - `attn_flops_per_ns_by_keys_and_dim`: the paged prefill attention at
-//!   [`ATTN_SHAPE`]'s heads over each of [`ATTN_KEYS`] (a sequence of as many
+//!   [`ATTN_SHAPE`]'s heads over each row of the matmul grid's lattice to its saturation point (a sequence of as many
 //!   rows attending itself) and each head width of `ATTN_DIMS`, causal, in
 //!   pages of [`PAGE`]; its launches rotate through
 //!   `engine::rates::attn_sets_at` sets of q rows and kv pages, so each reads
@@ -41,7 +41,7 @@
 //! Index and page tables, gates, outputs and workspace stay as laid.
 
 #[cfg_attr(not(feature = "device"), allow(unused_imports))]
-use engine::rates::{ATTN_DIMS, ATTN_KEYS, ATTN_SHAPE, DEPTHS, SCAN_SHAPE, weights_at};
+use engine::rates::{ATTN_DIMS, ATTN_SHAPE, DEPTHS, SCAN_SHAPE, weights_at};
 use profile::fire::Rates;
 
 /// The rows the matmul grid walks under `chip`: the chip's rung lattice
@@ -364,9 +364,17 @@ mod on_device {
             top.best_shape.0,
             top.best_shape.1
         );
-        let mut attn = Vec::with_capacity(ATTN_KEYS.len() * ATTN_DIMS.len());
+        // The attention at the grid's rows: a rung's prompt attends as many
+        // keys as its rows, so its rate is read where it was timed, not
+        // between powers of two (a kernel's wave quantization moves it
+        // between them).
+        let keys_at: Vec<u32> = lattice_rows(chip)
+            .into_iter()
+            .take_while(|&rows| rows <= top.rows)
+            .collect();
+        let mut attn = Vec::with_capacity(keys_at.len() * ATTN_DIMS.len());
         for d in ATTN_DIMS {
-            for keys in ATTN_KEYS {
+            for &keys in &keys_at {
                 attn.push((
                     keys,
                     d,
@@ -585,12 +593,17 @@ mod on_device {
         let (q_heads, kv_heads) = (at.q_heads, at.kv_heads);
         let pages = rows.div_ceil(PAGE);
         let kv_width = kv_heads * d;
-        // `attn_sets_at` sets of q rows and kv pages, each fire the next
-        // set's, so each reads its q and kv from device memory as a served
-        // layer's do; the sets' pages share one pool.
-        let sets = engine::rates::attn_sets_at(at);
-        let cells = sets * (pages * PAGE) as usize;
+        // Sets of q rows and kv pages past every last-level cache
+        // (`engine::rates::ATTN_SET_BYTES`, as `attn_sets_at` counts them but
+        // of the pages as laid, whole), each fire the next set's, so each
+        // reads its q and kv from device memory as a served layer's do; the
+        // sets' pages share one pool and their page tables one column.
         let q_bytes = (rows * q_heads * d) as usize * 2;
+        let set_cells = (pages * PAGE) as usize;
+        let sets = engine::rates::ATTN_SET_BYTES
+            .div_ceil(q_bytes + 2 * set_cells * kv_width as usize * 2)
+            .max(2);
+        let cells = sets * set_cells;
         let keys = random.operand(cells * kv_width as usize * 2)?;
         let values = random.operand(cells * kv_width as usize * 2)?;
         let q = random.operand(sets * q_bytes)?;
@@ -598,17 +611,10 @@ mod on_device {
         // Each set's pages scattered over its span of the pool as a served
         // sequence's are.
         let order = engine::rates::attn_page_order(pages);
-        let indices = (0..sets)
-            .map(|set| {
-                let first = set as u32 * pages;
-                column(
-                    &order
-                        .iter()
-                        .map(|&p| (first + p) as i32)
-                        .collect::<Vec<i32>>(),
-                )
-            })
-            .collect::<Result<Vec<Buffer>, String>>()?;
+        let table: Vec<i32> = (0..sets as u32)
+            .flat_map(|set| order.iter().map(move |&p| (set * pages + p) as i32))
+            .collect();
+        let indices = column(&table)?;
         let kv_indptr = [0, pages as i32];
         let indptr = column(&kv_indptr)?;
         let last = column(&[(rows - (pages - 1) * PAGE) as i32])?;
@@ -627,7 +633,12 @@ mod on_device {
                 bf16_values: absent,
                 key_scales: Tensor::ABSENT,
                 value_scales: Tensor::ABSENT,
-                page_indices: i32s(&indices[set], pages),
+                page_indices: Tensor::new(
+                    indices.ptr() + (set * pages as usize * 4) as u64,
+                    pages,
+                    1,
+                    Dtype::I32,
+                ),
                 page_indptr: i32s(&indptr, 2),
                 last_page_lens: i32s(&last, 1),
                 row_valid: Tensor::ABSENT,
