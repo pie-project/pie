@@ -1,5 +1,6 @@
 #![allow(unsafe_code)]
 use engine::fire::Readout;
+use kernels_cuda::runtime::channel::WordRun;
 
 use crate::error::{Fault, Result};
 use crate::program::Fired;
@@ -254,7 +255,9 @@ impl Shell {
             return Ok(None);
         }
         let rows = tap_rows(reports);
-        let bytes = (rows + cells.len()) * 4;
+        // The cells' gather table follows the words, in the tap itself.
+        let table_at = ((rows + cells.len()) * 4).next_multiple_of(16);
+        let bytes = table_at + cells.len() * size_of::<WordRun>();
         let at = at as usize;
         if self.taps.len() <= at {
             self.taps.resize_with(at + 1, || None);
@@ -272,12 +275,36 @@ impl Shell {
                 rows * 4,
             )?;
         }
-        for (index, &cell) in cells.iter().enumerate() {
-            crate::device::copy_d2d(
-                self.device.stream(),
-                tap.device() + ((rows + index) * 4) as u64,
-                cell,
-                4,
+        // One gather launch for every cell. A cell may be host memory (a
+        // guest pass's commit word is a mapped pinned slot): a copy call
+        // between two host spans runs on the host once the stream drains,
+        // so it would hold the host a whole step behind the device.
+        if !cells.is_empty() {
+            let table: Vec<WordRun> = cells
+                .iter()
+                .enumerate()
+                .map(|(index, &src)| WordRun {
+                    src,
+                    dst_word: u32::try_from(rows + index).unwrap_or(u32::MAX),
+                    words: 1,
+                })
+                .collect();
+            // SAFETY: the tap at `at` is this step's alone until its host
+            // function gives it back, and it spans `bytes`; `WordRun` is
+            // plain `repr(C)` data, written as its bytes before the launch
+            // that reads it.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    table.as_ptr().cast::<u8>(),
+                    tap.host().add(table_at),
+                    table.len() * size_of::<WordRun>(),
+                );
+            }
+            kernels_cuda::runtime::channel::gather_words(
+                self.device.ctx(),
+                tap.device() + table_at as u64,
+                tap.device(),
+                u32::try_from(table.len()).unwrap_or(u32::MAX),
             )?;
         }
         Ok(Some(Tap(tap.host().cast::<u32>().cast_const())))
