@@ -704,6 +704,8 @@ impl Rig {
                 instance_slots: Vec::new(),
                 ring_slots: Vec::new(),
                 adapter_slots: Vec::new(),
+                scratch: engine::ScratchPlace::None,
+                pair: engine::ScratchPlace::None,
                 extents: engine::program::BindExtents {
                     row_count: rows,
                     token_count: rows,

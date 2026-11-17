@@ -94,6 +94,10 @@ pub(super) enum LaneCommit {
     },
     BindFinished {
         pipeline_id: Option<ProcessId>,
+        /// The bind found no room for its guest state and registered
+        /// nothing: its process waits for room
+        /// ([`crate::store::roles::bind_when_resident`]), off the frame.
+        waits: bool,
     },
     CloseInstance {
         id: ::engine::InstanceId,
@@ -564,6 +568,7 @@ impl Lane {
             QueuedItem::Launch(_) => unreachable!(),
             QueuedItem::RegisterChannelsBind { pipeline_id, .. } => LaneCommit::BindFinished {
                 pipeline_id: *pipeline_id,
+                waits: false,
             },
             QueuedItem::PreLaunchCopy { .. } | QueuedItem::CopyTracked { .. } => {
                 LaneCommit::AsyncControl {
@@ -836,7 +841,10 @@ impl Lane {
                         program_id = bind.program_id().0,
                         "scheduler RPC cancelled before resource creation"
                     );
-                    return LaneCommit::BindFinished { pipeline_id };
+                    return LaneCommit::BindFinished {
+                            pipeline_id,
+                            waits: false,
+                        };
                 }
                 let engine = match backend(engine) {
                     Ok(engine) => engine,
@@ -844,26 +852,71 @@ impl Lane {
                         if response.send(Err(error)).is_err() {
                             Self::release_wait_slots([bind.pacing_wait_id]);
                         }
-                        return LaneCommit::BindFinished { pipeline_id };
+                        return LaneCommit::BindFinished {
+                            pipeline_id,
+                            waits: false,
+                        };
                     }
                 };
                 let roles = roles_of(engine_idx);
+                // Everything it takes of the pool first, its rings, its
+                // guest state, its tables: a bind short of room is answered
+                // so before it registers anything, and waits for room
+                // (`bind_when_resident`) with nothing rolled back.
+                let taken = crate::store::roles::take_bind(
+                    roles.as_ref(),
+                    &mut **engine,
+                    &bind.binding,
+                    |id| channels.engine_registered(id) || plans.iter().any(|plan| plan.id == id),
+                )
+                .and_then(|taken| {
+                    match crate::store::roles::take_rings(roles.as_ref(), &mut **engine, &plans) {
+                        Ok(rings) => Ok((taken, rings)),
+                        Err(error) => {
+                            if let (Some(taken), Some(roles)) = (taken, roles.as_ref()) {
+                                roles.lock().unwrap().untake(taken);
+                            }
+                            Err(error)
+                        }
+                    }
+                });
+                let (taken, rings) = match taken {
+                    Ok(taken) => taken,
+                    Err(error) => {
+                        let waits = crate::store::roles::waits_for_room(&error);
+                        if response.send(Err(error)).is_err() {
+                            Self::release_wait_slots([bind.pacing_wait_id]);
+                        }
+                        return LaneCommit::BindFinished { pipeline_id, waits };
+                    }
+                };
+                let untake = |taken: Option<crate::store::roles::Taken>| {
+                    if let (Some(taken), Some(roles)) = (taken, roles.as_ref()) {
+                        roles.lock().unwrap().untake(taken);
+                    }
+                };
                 let registered = match Self::register_channel_set(
                     engine,
                     engine_idx,
                     channels,
                     &plans,
+                    rings,
                     pipeline_id,
                 ) {
                     Ok(registered) => registered,
                     Err(error) => {
+                        untake(taken);
                         if response.send(Err(error)).is_err() {
                             Self::release_wait_slots([bind.pacing_wait_id]);
                         }
-                        return LaneCommit::BindFinished { pipeline_id };
+                        return LaneCommit::BindFinished {
+                            pipeline_id,
+                            waits: false,
+                        };
                     }
                 };
                 if response.is_closed() {
+                    untake(taken);
                     Self::rollback_channel_set(
                         engine,
                         channels,
@@ -873,9 +926,19 @@ impl Lane {
                     );
                     Lane::release_registered_channel_wait_slots(&registered);
                     Self::release_wait_slots([bind.pacing_wait_id]);
-                    return LaneCommit::BindFinished { pipeline_id };
+                    return LaneCommit::BindFinished {
+                            pipeline_id,
+                            waits: false,
+                        };
                 }
-                match Self::bind(engine, channels, &bind, roles.as_ref(), pipeline_id) {
+                match Self::bind(
+                    engine,
+                    channels,
+                    &bind,
+                    roles.as_ref(),
+                    pipeline_id,
+                    taken,
+                ) {
                     Ok((bound, standing)) => {
                         // Its program can be in a fire until it closes, and
                         // the engine's standing guest bytes are its total.
@@ -914,7 +977,10 @@ impl Lane {
                             Self::release_registered_channel_wait_slots(&registered);
                             Self::release_wait_slots([bind.pacing_wait_id]);
                         }
-                        LaneCommit::BindFinished { pipeline_id }
+                        LaneCommit::BindFinished {
+                            pipeline_id,
+                            waits: false,
+                        }
                     }
                 }
             }
@@ -1055,14 +1121,10 @@ impl Lane {
         plan: &crate::engine::InstanceBindingPlan,
         roles: Option<&crate::store::roles::RolesHandle>,
         holder: Option<ProcessId>,
+        taken: Option<crate::store::roles::Taken>,
     ) -> Result<(BoundInstance, u64)> {
-        let bound = crate::store::roles::bind_instance(
-            roles,
-            &mut **engine,
-            &plan.binding,
-            holder,
-            |id| channels.engine_registered(id),
-        )?;
+        let bound =
+            crate::store::roles::bind_taken(roles, &mut **engine, &plan.binding, holder, taken)?;
         let standing = bound.standing_guest_bytes;
         let bound = BoundInstance::new(&bound, plan.pacing_wait_id);
         channels.bind(bound.instance_id, plan.binding.channels.clone());
@@ -1081,9 +1143,12 @@ impl Lane {
         engine_idx: usize,
         channels: &mut ChannelJoin,
         plans: &[ChannelRegistration],
+        rings: Vec<Option<crate::store::roles::TakenRing>>,
         holder: Option<ProcessId>,
     ) -> Result<Vec<RegisteredChannel>> {
         let roles = roles_of(engine_idx);
+        // Each plan's ring, taken before anything was registered.
+        let mut rings = rings.into_iter();
         let mut registered = Vec::with_capacity(plans.len());
         let mut registered_ids = Vec::with_capacity(plans.len());
         let undo =
@@ -1097,15 +1162,21 @@ impl Lane {
                 }
             };
         for plan in plans {
+            let ring = rings.next().flatten();
             if channels.contains(plan.id) {
                 undo(engine, channels, &registered_ids);
+                crate::store::roles::untake_rings(
+                    roles.as_ref(),
+                    std::iter::once(ring).chain(rings).collect(),
+                );
                 return Err(anyhow!("channel {} is already registered", plan.id));
             }
-            match crate::store::roles::register_channel(
+            match crate::store::roles::register_taken(
                 roles.as_ref(),
                 &mut **engine,
                 plan,
                 holder,
+                ring,
                 |engine, plan| crate::engine::verbs::register_channel(engine, engine_idx, plan),
             ) {
                 Ok(channel) => {
@@ -1115,6 +1186,7 @@ impl Lane {
                 }
                 Err(cause) => {
                     undo(engine, channels, &registered_ids);
+                    crate::store::roles::untake_rings(roles.as_ref(), rings.collect());
                     return Err(cause);
                 }
             }

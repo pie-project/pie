@@ -619,6 +619,21 @@ impl FramePolicy {
 
     pub fn on_process_suspend(&mut self, owner: ProcessId) {
         self.suspended.insert(owner);
+        self.pending_binds.remove(&owner);
+        self.park_owner(owner);
+    }
+
+    /// `owner`'s bind waits for room for its guest state: until it lands
+    /// the process submits nothing, so a frame does not wait on its lanes.
+    /// They are parked as a suspension's are, and come back with its next
+    /// submit ([`Self::record_arrival`]).
+    pub fn on_bind_waits(&mut self, owner: ProcessId) {
+        self.park_owner(owner);
+    }
+
+    /// Parks `owner`'s lanes: none is awaited, what arrived of an
+    /// incomplete frame goes as it stands.
+    fn park_owner(&mut self, owner: ProcessId) {
         let owned: Vec<ProcessId> = self
             .lanes
             .iter()
@@ -639,7 +654,7 @@ impl FramePolicy {
                 self.lanes.remove(&lane_id);
             }
         }
-        self.pending_binds.remove(&owner);
+        // Not joining while it waits: it holds no frame back as one.
         self.forget_staged(owner);
         self.maybe_reset_episode();
     }
@@ -1360,6 +1375,50 @@ mod tests {
         a_burst_of_cut_prefills_seals_its_pieces_step_by_step();
         a_wave_reads_out_no_more_than_the_engine_carves();
         a_policys_bound_packs_prompts_into_a_frame_up_to_it_and_no_further();
+        a_frame_goes_without_a_lane_whose_process_waits_to_bind();
+    }
+
+    /// A process whose bind found no room for its guest state submits
+    /// nothing until the bind lands: the frame its lane was awaited in
+    /// goes without it (the soak's 56-lane frame held 6 minutes on one
+    /// process stuck at bind, its bind re-asked so often the leash never
+    /// ran out). Its next submit brings the lane back.
+    fn a_frame_goes_without_a_lane_whose_process_waits_to_bind() {
+        let mut policy =
+            FramePolicy::new(1, 64, 4096, None).with_submit_deadline(Duration::from_secs(86_400));
+        let (runner, binder) = (pid(), pid());
+        policy.on_fire_enqueued(stamp(runner, 0, 0, 1), Some(runner), 1, 1, 1);
+        policy.on_fire_enqueued(stamp(binder, 0, 0, 1), Some(binder), 2, 1, 1);
+        let queued: QueuedFireIds = [1, 2].into_iter().collect();
+        assert_eq!(fires(&plan(&mut policy, &queued, Instant::now())).len(), 2);
+        policy.on_frame_retired([runner, binder]);
+
+        // The binder's process binds another instance; the runner submits.
+        policy.on_fire_enqueued(stamp(runner, 1, 0, 1), Some(runner), 3, 1, 1);
+        let queued: QueuedFireIds = [3].into_iter().collect();
+        policy.on_bind_enqueued(Some(binder));
+        policy.on_bind_completed(Some(binder));
+        let t0 = Instant::now();
+        assert!(
+            matches!(plan(&mut policy, &queued, t0), FramePlan::Hold(_)),
+            "control: the binder's lane is awaited"
+        );
+        // The bind is short of guest-state room and waits for it.
+        policy.on_bind_waits(binder);
+        assert_eq!(
+            fires(&plan(&mut policy, &queued, t0)),
+            vec![3],
+            "the frame goes without the waiting binder"
+        );
+        policy.on_frame_retired([runner]);
+
+        // Bound at last, it submits: its lane is awaited again.
+        policy.on_fire_enqueued(stamp(binder, 1, 0, 1), Some(binder), 4, 1, 1);
+        policy.on_fire_enqueued(stamp(runner, 2, 0, 1), Some(runner), 5, 1, 1);
+        let queued: QueuedFireIds = [4, 5].into_iter().collect();
+        let mut both = fires(&plan(&mut policy, &queued, Instant::now()));
+        both.sort_unstable();
+        assert_eq!(both, vec![4, 5], "it rides the next frame");
     }
 
     /// Prompts past half a fire's tokens take a frame each, the lane's

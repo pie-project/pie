@@ -8,7 +8,7 @@ use crate::error::{Error, Result};
 use crate::fire::{FrameId, FrameSubmission, FrameTicket, MediaEncode, Step};
 use crate::load::{LoadRequest, Loaded};
 use crate::program::{
-    BindExtents, BoundInstance, FireFacts, InstanceBinding, InstanceId, ProgramFacts, ProgramId,
+    BindExtents, BoundInstance, FireFacts, GuestState, InstanceBinding, InstanceId, ProgramFacts, ProgramId,
     ProgramRegistration, ReadoutFacts, Rebind, RingFacts,
 };
 use crate::transfer::{KvCopy, KvHandle, StateCopy};
@@ -216,6 +216,19 @@ pub trait Engine: Send {
     fn fire_facts(&self, program: ProgramId, extents: &BindExtents) -> Result<FireFacts> {
         let _ = (program, extents);
         Ok(FireFacts::default())
+    }
+
+    /// What `program` bound at `extents` holds as state ([`GuestState`]):
+    /// each instance's scratch and the pair's, taken in the `Instance` role
+    /// at the bind ([`crate::ScratchPlace`]), held while bound, and told to
+    /// the engine in the binding ([`InstanceBinding::scratch`],
+    /// [`InstanceBinding::pair`]) and in every [`Rebind::Instance`]. Asked
+    /// at every bind, on the lane, before it is sent. The default states
+    /// none: an engine that lays its guests' scratch in the fire's span
+    /// ([`Self::fire_facts`]) states it there until it moves it here.
+    fn guest_state(&self, program: ProgramId, extents: &BindExtents) -> Result<GuestState> {
+        let _ = (program, extents);
+        Ok(GuestState::default())
     }
 
     /// What the rows a fire reads out take ([`ReadoutFacts`]): the bytes a

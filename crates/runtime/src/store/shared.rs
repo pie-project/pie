@@ -1039,6 +1039,16 @@ impl SharedPool {
         self.roles
     }
 
+    /// The kv list slots that, moved out whole, free `chunks` chunks: what
+    /// a guest bind short of room is short, in pages
+    /// (`planner::PoolPort::chunks_as_pages`).
+    #[must_use]
+    pub fn list_slots_for_chunks(&self, chunks: u32) -> u64 {
+        self.list.map_or(0, |list| {
+            u64::from(chunks) * u64::from(list.slots_per_chunk)
+        })
+    }
+
     /// The kv list slots whose chunks, let go whole, hold `rs` of the state
     /// shapes: the rs list's slots (`pages`), each window list's
     /// (`windows`, a store of windows) and whole records (`slots`). Any
@@ -1250,6 +1260,14 @@ impl SharedPool {
         }
     }
 
+    /// The slots a chunk of pool shape `shape` holds (1 where it is none).
+    #[must_use]
+    pub fn chunk_slots(&self, shape: ShapeId) -> u32 {
+        self.pool
+            .shape(shape)
+            .map_or(1, |s| s.slots_per_chunk.max(1))
+    }
+
     /// `n` fresh slots of `shape` for the store, as slot refs; none when
     /// they do not all fit.
     pub fn take_refs(&mut self, shape: ShapeId, n: u64) -> Option<Vec<u32>> {
@@ -1261,6 +1279,19 @@ impl SharedPool {
     /// refs in order ([`SlotPool::acquire_run`]).
     pub fn take_run(&mut self, shape: ShapeId, n: u64) -> Result<Vec<u32>, SlotError> {
         let slots = self.pool.acquire_run(STORE, shape, n)?;
+        Ok(slots.iter().map(|&slot| self.pool.slot_ref(slot)).collect())
+    }
+
+    /// `pieces` runs of `run` adjacent whole chunks of `shape` for the
+    /// store, each inside one segment, as slot refs in order
+    /// ([`SlotPool::acquire_chunk_runs`]).
+    pub fn take_chunk_runs(
+        &mut self,
+        shape: ShapeId,
+        run: u32,
+        pieces: u32,
+    ) -> Result<Vec<u32>, SlotError> {
+        let slots = self.pool.acquire_chunk_runs(STORE, shape, run, pieces)?;
         Ok(slots.iter().map(|&slot| self.pool.slot_ref(slot)).collect())
     }
 

@@ -230,6 +230,8 @@ fn session(fixture: &Fixture, park: bool) -> Decodes {
                     instance: fresh,
                     rings: rings.clone(),
                     adapter: Vec::new(),
+                    scratch: engine::ScratchPlace::None,
+                    pair: engine::ScratchPlace::None,
                 })
                 .expect("the reader rebinds");
         }

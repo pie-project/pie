@@ -447,6 +447,8 @@ fn a_park_and_unpark_moves_through_the_host_and_rebinds_the_new_refs() {
             slots: now[3..].to_vec(),
         }],
         adapter: Vec::new(),
+        scratch: ::engine::ScratchPlace::None,
+        pair: ::engine::ScratchPlace::None,
     }));
     assert!(engine.rebinds.contains(&Rebind::Channel {
         id: channel,
@@ -1006,4 +1008,64 @@ fn a_shared_adapter_parks_only_once_every_holder_has() {
     }
     assert_eq!(held(&device), before);
     assert_eq!(held(&host), 0);
+}
+
+/// TPU's handles e2e (XLA, a 237-page pool): a restored process's
+/// register+bind found no run for a ring that must lie in one ("no chunk
+/// has 1 adjacent free Channel slots") and failed. A registration short
+/// of a run the budget holds waits for room ([`RolesError::BindShort`],
+/// one free chunk its room), with nothing registered and nothing taken;
+/// once a chunk is let go it registers into a run.
+#[test]
+fn a_ring_short_of_a_run_waits_for_a_chunk_and_registers_nothing() {
+    let Pools { device, roles, .. } = pools();
+    let mut engine = FakeEngine {
+        ring: Some(run_ring(2)),
+        ..FakeEngine::default()
+    };
+    let (shape, list) = {
+        let pool = device.lock().unwrap();
+        (
+            pool.roles().channel.unwrap().pool,
+            pool.list().unwrap().pool,
+        )
+    };
+    // One chunk of the shape with no two free slots side by side, every
+    // other chunk taken by kv.
+    let mut kv = Vec::new();
+    {
+        let mut pool = device.lock().unwrap();
+        let whole = pool.take_refs(shape, u64::from(PER_CHUNK)).unwrap();
+        let freed: Vec<u32> = whole.iter().copied().step_by(2).collect();
+        pool.give_refs(shape, &freed);
+        while let Some(refs) = pool.take_refs(list, 1) {
+            kv.extend(refs);
+        }
+    }
+    let before = held(&device);
+    let plan = ChannelRegistration {
+        id: ChannelId(1),
+        ..ChannelRegistration::default()
+    };
+    let error = register_channel(Some(&roles), &mut engine, &plan, None, |engine, plan| {
+        Ok(engine.register_channel(plan)?)
+    })
+    .unwrap_err();
+    let short = error.downcast_ref::<RolesError>().expect("named");
+    assert!(
+        matches!(short, RolesError::BindShort(inner) if matches!(**inner, RolesError::NoRun { .. })),
+        "{error}"
+    );
+    assert_eq!(short.room_runs(), Some((1, 1)), "it waits for a chunk");
+    assert!(super::waits_for_room(&error));
+    assert!(engine.registrations.is_empty(), "nothing registered");
+    assert_eq!(held(&device), before, "nothing taken");
+    // A kv chunk let go: the ring registers into a run.
+    let freed: Vec<u32> = kv.drain(..16).collect();
+    device.lock().unwrap().give_refs(list, &freed);
+    register_channel(Some(&roles), &mut engine, &plan, None, |engine, plan| {
+        Ok(engine.register_channel(plan)?)
+    })
+    .expect("it registers once a chunk is free");
+    assert!(adjacent(&engine.registrations[0].slots, PER_CHUNK));
 }

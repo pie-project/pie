@@ -1107,8 +1107,63 @@ impl SchedulerHandle {
                 None => Err(crate::planner::PlannerError::Cancelled),
             }
         };
-        let (registered, _, bound) =
-            crate::store::roles::bind_when_resident(pid, lane_bind, resident).await?;
+        // Short of a free run for its guest state, it waits on the walk to
+        // commit a segment, as a kv admission does, never refused while a
+        // segment is left to commit within the budget.
+        let engine = bind.engine_id;
+        let grown = |prefix: u32, run: u32| async move {
+            let shared = crate::store::registry::try_get(0, engine)
+                .and_then(|stores| stores.shared)
+                .ok_or_else(|| format!("engine {engine} has no shared pool to grow"))?;
+            crate::inferlet::process::said(
+                "bind: a segment for its guest state",
+                pid,
+                crate::store::roles::grow_for_guest(&shared, engine, prefix, run),
+            )
+            .await
+        };
+        // Short of room the budget holds, with no segment left to commit,
+        // it waits for room given back (a process completing, or parked),
+        // as an admission waits on pages, never refused for it.
+        let room = || {
+            crate::store::registry::try_get(0, engine)
+                .and_then(|stores| stores.roles)
+                .map(|roles| roles.lock().unwrap().room_watch())
+        };
+        // Whether `pieces` runs of `run` chunks stand free for its state.
+        let fits = |run: u32, pieces: u32| {
+            crate::store::registry::try_get(0, engine)
+                .and_then(|stores| stores.roles)
+                .is_some_and(|roles| roles.lock().unwrap().free_runs(run) >= pieces)
+        };
+        // Holding guest state of its own, it is suspended instead: waiting,
+        // it would hold room its own bind lacks.
+        let suspend = |run: u32, pieces: u32| {
+            let holds = crate::store::registry::try_get(0, engine)
+                .and_then(|stores| stores.roles)
+                .is_some_and(|roles| roles.lock().unwrap().holds_guest_state(pid));
+            holds
+                && crate::planner::planner_of(pid)
+                    .is_some_and(|planner| planner.suspend_for_room(pid, run, pieces))
+        };
+        // Waiting, it is a waiter in the planner's queue: idle cache goes
+        // first, then a resident is parked for it, as for a restore short
+        // of room for its roles.
+        let planned = |run: u32, pieces: u32| async move {
+            let planner = crate::planner::planner_of(pid)
+                .ok_or_else(|| "its process has no planner".to_string())?;
+            crate::inferlet::process::said(
+                "bind: room for its guest state",
+                pid,
+                planner.wait_bind_room(pid, run, pieces),
+            )
+            .await
+            .map_err(|why| why.to_string())
+        };
+        let (registered, _, bound) = crate::store::roles::bind_when_resident(
+            pid, lane_bind, resident, grown, room, fits, suspend, planned,
+        )
+        .await?;
         Ok((registered, bound))
     }
 
@@ -2746,8 +2801,14 @@ impl BatchScheduler {
     ) {
         match commit {
             LaneCommit::None => {}
-            LaneCommit::BindFinished { pipeline_id } => {
+            LaneCommit::BindFinished { pipeline_id, waits } => {
                 frame_policy.on_bind_completed(pipeline_id);
+                // Waiting for room, its process submits nothing until the
+                // bind lands: its lanes go out of the frame, as a
+                // suspension's do, and come back with its next submit.
+                if waits && let Some(pid) = pipeline_id {
+                    frame_policy.on_bind_waits(pid);
+                }
             }
             LaneCommit::BindInstance {
                 pipeline_id,

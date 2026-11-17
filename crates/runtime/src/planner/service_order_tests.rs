@@ -6,7 +6,7 @@ use tokio::sync::Notify;
 
 use crate::store::rs::RsUnits;
 
-use super::inner::Inner;
+use super::inner::{Inner, RestoreGate};
 use super::proc::{Proc, Residency};
 use super::wait::{EntryKey, WaitKind, Waiter};
 
@@ -60,6 +60,44 @@ fn planner_every_case() {
     a_restore_holds_the_head_when_no_allocation_is_unmet();
     a_younger_restore_still_queues_behind_an_older_allocation();
     returning_host_room_resumes_the_yield();
+    a_restore_short_of_room_for_its_roles_waits_then_evicts_once_stalled();
+}
+
+/// A restore whose role slots found no room is queued again, a waiter: it
+/// is not served on spare pages alone (the room it lacks is not pages),
+/// goes again on a completion's credit, and, the fleet stalled with
+/// nothing completing, has a resident evicted for it. Without the flag the
+/// same spare pages serve it.
+fn a_restore_short_of_room_for_its_roles_waits_then_evicts_once_stalled() {
+    let (mut inner, pids) = fleet(&[
+        (1, Residency::Evicted, true),
+        (2, Residency::Resident, true),
+    ]);
+    park_restore(&mut inner, pids[0], 4);
+    assert_eq!(
+        inner.restore_gate(pids[0], 64),
+        RestoreGate::Serve,
+        "control"
+    );
+    inner.procs.get_mut(&pids[0]).unwrap().roles_short = true;
+    assert!(!inner.fleet_stalled());
+    assert_eq!(
+        inner.restore_gate(pids[0], 64),
+        RestoreGate::Wait,
+        "spare pages are no room"
+    );
+    inner.completion_credit = 1;
+    assert_eq!(
+        inner.restore_gate(pids[0], 64),
+        RestoreGate::Serve,
+        "a completion's credit"
+    );
+    assert_eq!(inner.completion_credit, 0);
+    // The resident waits on an allocation too: nothing will complete, so
+    // it is evicted for the restore.
+    park_allocation(&mut inner, pids[1], 1);
+    assert!(inner.fleet_stalled());
+    assert_eq!(inner.restore_gate(pids[0], 0), RestoreGate::Evict);
 }
 
 fn a_restore_yields_the_head_to_a_younger_allocation() {
