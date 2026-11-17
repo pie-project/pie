@@ -228,7 +228,8 @@ impl fmt::Display for Fault {
                 "lane {lane} carries an explicit attention mask and this load's \
                  artifact bakes no masked class: `masked` is a fact the MODEL declares \
                  and this plan has no `attention.masked` arm for the bits \
-                 to reach"
+                 to reach, nor a ragged attention whose text states a lane's mask \
+                 (`stated_group_mask()`)"
             ),
             Self::MaskWord {
                 lane,
