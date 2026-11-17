@@ -183,6 +183,7 @@ pub(crate) async fn before_pass(
     slots: &[Hash256],
 ) {
     let Some(mut pass) = plan(stores, ws, held, rows, slots) else {
+        tracing::debug!(target: "pie::offload", %pid, held, rows = rows.len(), "a pass with nothing to send away");
         return;
     };
     // A run's keys name it from token 0: a pass that starts there can be
@@ -217,7 +218,15 @@ pub(crate) async fn before_pass(
     // Best first; one that cannot take the pass gives way to the next, and
     // when none can, it runs here.
     let mut last = None;
-    for (executor, peer) in super::executors::candidates(pid, &named).await {
+    let candidates = super::executors::candidates(pid, &named).await;
+    tracing::debug!(
+        target: "pie::offload",
+        %pid,
+        pages = pass.limit - pass.have,
+        executors = ?candidates.iter().map(|(w, _)| w).collect::<Vec<_>>(),
+        "a pass that may go to a peer"
+    );
+    for (executor, peer) in candidates {
         let started = std::time::Instant::now();
         match take(pid, stores, engine, peer, &pass).await {
             Ok(pages) => {

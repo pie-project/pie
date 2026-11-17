@@ -38,6 +38,10 @@ pub trait WorkerControl {
 
     async fn cancel(req_id: ReqId);
 
+    /// The workers the request's process may prefill on, best first, from
+    /// now on (empty: the worker's own configuration decides).
+    async fn set_executors(req_id: ReqId, executors: Vec<WorkerId>);
+
     async fn set_priority(req_id: ReqId, p: Priority);
 
     // The session's client is gone: tear it down so its processes are
