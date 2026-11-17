@@ -357,6 +357,9 @@ pub struct Reading {
     pub paging: Option<Paging>,
     pub rowp: Vec<Rect>,
     pub ptab: Vec<Rect>,
+    /// The state slots every recurrence's column holds (the least; `None`: no recurrence): a
+    /// row's state slot is below it.
+    pub slots: Option<u32>,
     /// Requests a launch (the GEMM regime's batch): the step's rows each request's rows in
     /// turn, its lane values a request's lanes in turn.
     pub batch: usize,
@@ -572,6 +575,12 @@ impl Reading {
             }),
             rowp: rects(&state.pes(|r| &r.rows)),
             ptab: rects(&state.pes(|r| &r.tables)),
+            slots: state
+                .regions
+                .iter()
+                .filter(|r| r.kind != "kv")
+                .map(|r| r.slots)
+                .min(),
         })
     }
 
@@ -614,6 +623,7 @@ impl Reading {
             paging: None,
             rowp: Vec::new(),
             ptab: Vec::new(),
+            slots: None,
             batch: 1,
         }
     }
@@ -1138,12 +1148,78 @@ impl Reading {
 
     /// The K / V PEs told a decode step's first position ([`Reading::pos`]).
     pub fn write_pos(&self, rt: &mut dyn Fabric, at: u32) -> R<()> {
+        self.position_held(at)?;
         write_all(rt, &self.pos, "pos", &[at])
+    }
+
+    /// A position the program's pages hold (a lane's `pages` pages of `size`), refused past
+    /// them: the wafer holds a word it is told below what it indexes (`fab.below`), a memory
+    /// safety net, never a host's range check.
+    fn position_held(&self, at: u32) -> R<()> {
+        match self.paging {
+            Some(g) if u64::from(at) >= u64::from(g.pages) * u64::from(g.size) => Err(format!(
+                "position {at} past the {} the program's {} pages of {} hold",
+                g.pages * g.size,
+                g.pages,
+                g.size
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// A step's rows, each (lane slot, state slot, position) in the program's range, refused
+    /// by name past it.
+    pub fn rows_held(&self, rows: &[(u32, u32, u32)]) -> R<()> {
+        for &(lane, state, at) in rows {
+            if let Some(g) = self.paging
+                && lane >= g.lanes
+            {
+                return Err(format!(
+                    "lane slot {lane} past the program's {} lane slots",
+                    g.lanes
+                ));
+            }
+            if let Some(n) = self.slots
+                && state >= n
+            {
+                return Err(format!(
+                    "state slot {state} past the {n} its recurrences' columns hold"
+                ));
+            }
+            self.position_held(at)?;
+        }
+        Ok(())
+    }
+
+    /// Page tables in the program's range (a lane slot's `pages` entries each, every page id
+    /// below `pages`), refused by name past it.
+    pub fn pages_held(&self, table: &[u32]) -> R<()> {
+        let Some(g) = self.paging else {
+            return Err("page tables for a program that pages nothing".into());
+        };
+        if table.len() != (g.lanes * g.pages) as usize {
+            return Err(format!(
+                "a page table of {} entries for {} lane slots of {} pages",
+                table.len(),
+                g.lanes,
+                g.pages
+            ));
+        }
+        if let Some((i, p)) = table.iter().enumerate().find(|(_, p)| **p >= g.pages) {
+            return Err(format!(
+                "page {p} (lane slot {}, entry {}) past the program's {} pages",
+                i as u32 / g.pages,
+                i as u32 % g.pages,
+                g.pages
+            ));
+        }
+        Ok(())
     }
 
     /// The attention and state PEs told a step's rows' (lane slot, state slot, position)
     /// ([`Reading::rowp`]; `n` rows a step, those past `rows` slot 0 at position 0).
     pub fn write_rows(&self, rt: &mut dyn Fabric, n: usize, rows: &[(u32, u32, u32)]) -> R<()> {
+        self.rows_held(&rows[..rows.len().min(n)])?;
         let mut words = vec![0u32; 3 * n];
         for (t, &(lane, state, at)) in rows.iter().enumerate().take(n) {
             words[3 * t] = lane;
@@ -1170,6 +1246,7 @@ impl Reading {
     /// The attention PEs told each lane slot's pages (`table`: lane slot by lane slot, `pages` a
     /// slot; [`Reading::ptab`]).
     pub fn write_pages(&self, rt: &mut dyn Fabric, table: &[u32]) -> R<()> {
+        self.pages_held(table)?;
         write_all(rt, &self.ptab, "ptab", table)
     }
 
@@ -1667,5 +1744,36 @@ impl Denoise {
             vs.push(v);
         }
         Ok((inputs[li].1.clone(), vs))
+    }
+}
+
+#[cfg(test)]
+mod held_tests {
+    use super::*;
+
+    /// A paged program of 2 lane slots, 3 pages of 64 a column, its recurrences 2 slots.
+    fn paged() -> Reading {
+        let mut r = Reading::host_only("m", "decode", &[]);
+        r.paging = Some(Paging {
+            size: 64,
+            pages: 3,
+            lanes: 2,
+        });
+        r.slots = Some(2);
+        r
+    }
+
+    #[test]
+    fn a_step_s_host_words_past_the_program_s_range_are_refused_by_name() {
+        let r = paged();
+        assert!(r.rows_held(&[(0, 0, 0), (1, 1, 191)]).is_ok());
+        let e = |x: R<()>| x.expect_err("refused");
+        assert!(e(r.rows_held(&[(2, 0, 0)])).contains("lane slot 2 past the program's 2"));
+        assert!(e(r.rows_held(&[(0, 2, 0)])).contains("state slot 2 past the 2"));
+        assert!(e(r.rows_held(&[(0, 0, 192)])).contains("position 192 past the 192"));
+        assert!(r.pages_held(&[0, 1, 2, 2, 2, 2]).is_ok());
+        assert!(e(r.pages_held(&[0, 1, 2])).contains("3 entries for 2 lane slots of 3 pages"));
+        assert!(e(r.pages_held(&[0, 1, 2, 2, 3, 2])).contains("page 3 (lane slot 1, entry 1)"));
+        assert!(e(r.position_held(500)).contains("position 500"));
     }
 }
