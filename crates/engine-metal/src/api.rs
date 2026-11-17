@@ -926,8 +926,26 @@ impl Engine for Metal {
     }
 
     fn register_program(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
+        let shell = self.loaded_mut()?;
+        let before = shell.program_compilations();
+        let id = shell.register_program(registration).map_err(fault)?;
+        // A registration after ready that compiled guest code is one the
+        // load's prewarm did not prepare.
+        let built = shell.program_compilations() - before;
+        if built > 0 {
+            self.live.tally(engine::live::Tally::BuiltAfterReady, built);
+            tracing::warn!(
+                program = registration.program_hash,
+                regions = built,
+                "metal: a registration after ready compiled guest code the prewarm did not"
+            );
+        }
+        Ok(id)
+    }
+
+    fn prewarm_programs(&mut self, registrations: &[ProgramRegistration]) -> EngineResult<()> {
         self.loaded_mut()?
-            .register_program(registration)
+            .prewarm_programs(registrations)
             .map_err(fault)
     }
 

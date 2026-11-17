@@ -404,12 +404,16 @@ fn direct_wide(
             let _ = writeln!(compute, "{v} = ({c}) ? ({x}) : ({y});");
         }
         tags::CONST => {
-            let bits = op.lit_bits;
+            // The value is read from the op's params, never written into
+            // the text: a request's knob (a temperature, a top-p) is a
+            // constant of its trace, and a region whose text held it would
+            // be one module per value (CUDA's regions read `p.lit_bits` too).
+            let bits = format!("lane_params[{node}].lit_bits");
             let literal = match op.lit_dtype {
-                0 => format!("as_type<float>({bits}u)"),
-                1 => format!("int({bits}u)"),
-                2 => format!("{bits}u"),
-                _ => (if bits != 0 { "true" } else { "false" }).to_string(),
+                0 => format!("as_type<float>({bits})"),
+                1 => format!("int({bits})"),
+                2 => bits,
+                _ => format!("({bits} != 0u)"),
             };
             let _ = writeln!(
                 compute,
