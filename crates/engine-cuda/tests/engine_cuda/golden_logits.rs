@@ -1601,6 +1601,137 @@ fn golden_pair_buffered() {
     }
 }
 
+/// A lane replaying rows it buffered, in a fire beside a folding lane of
+/// another seat (a decode or a prompt piece), answers as it does in a fire of
+/// its own; the folding lane answers as alone too. A beam's lanes replay
+/// their lineage beside other sequences' decodes so. The engine-gpu suite's
+/// `a_replaying_lane_beside_a_folding_lane_answers_as_alone`, on this shell.
+#[test]
+fn a_replaying_lane_beside_a_folding_lane_answers_as_alone() {
+    use engine::fire::{FoldLen, RsVerb};
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    const FLOOR: f32 = 0.05;
+    let cache = cache_dir();
+    let model = buffered_model();
+    let fixture = fixture(&model, &cache);
+    let mut shell = Shell::load(Boot {
+        trace: fixture.trace.clone(),
+        contract: &fixture.contract,
+        checkpoint: &fixture.container,
+        budget: Budget::new(2, TOKENS),
+        patches: None,
+        voxels: None,
+        page_size: PAGE,
+        context: CONTEXT,
+        slots: 4,
+        kv_budget: None,
+        allowance: engine::Allowance::WHOLE,
+        context_declared: false,
+        ordinal: 0,
+        knobs: buffering(engine_cuda::Knobs::default()),
+        cache_dir: Some(&cache),
+        runahead: engine::runahead::Runahead::F1,
+        residency: engine_cuda::experts::Plan::default(),
+        world: engine_cuda::World::default(),
+        expert: engine_cuda::World::default(),
+        comm: core::ptr::null_mut(),
+    })
+    .unwrap_or_else(|why| panic!("{model} loads: {why}"));
+    let page = rs_page(&mut shell);
+    let window = |seed: u32| -> Vec<u32> { (0..6u32).map(|at| (seed + at * 37) % 256).collect() };
+    let (tokens, next, third) = (window(11), window(101), window(203));
+    let k = tokens.len() as u32;
+    // Slot `slot`'s rs buffer pages reaching `rows` rows, apart from every
+    // other slot's.
+    let buffer = |slot: u32, rows: u32, fold: u32| RsVerb::Buffer {
+        pages: (0..rows.div_ceil(page)).map(|at| slot * 16 + at).collect(),
+        base: 0,
+        folded: 0,
+        fold: FoldLen::Host(fold),
+        lineage: engine::fire::Lineage::Set,
+    };
+    let seat = |slot: u32, tokens: &'_ [u32], rs: RsVerb| -> (u32, Vec<u32>, RsVerb) {
+        (slot, tokens.to_vec(), rs)
+    };
+    let fire = |shell: &mut Shell, lanes: &[(u32, Vec<u32>, RsVerb)]| -> Vec<Vec<f32>> {
+        let seated: Vec<engine_cuda::Seated<'_>> = lanes
+            .iter()
+            .map(|(slot, tokens, rs)| engine_cuda::Seated {
+                rs: rs.clone(),
+                ..engine_cuda::Seated::of(Lane {
+                    slot: *slot,
+                    word: fixture.trace.facts.word(&Request::new(
+                        u32::try_from(tokens.len()).expect("a count"),
+                        false,
+                    )),
+                    tokens,
+                })
+            })
+            .collect();
+        shell.fire_media(&seated, &[], &[]).expect("the fire runs")
+    };
+    // The replaying lane's three steps: `tokens` buffered past an empty
+    // state, a row replaying them and landing its own (folding nothing),
+    // a row replaying all and folding them; with `beside`, the last two
+    // each in a fire with that seat's prefill folding as it lands.
+    let run =
+        |shell: &mut Shell, slot: u32, beside: Option<u32>| -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+            shell.open(slot).expect("the slot opens");
+            fire(shell, &[seat(slot, &tokens, buffer(slot, k, 0))]);
+            let (mut own, mut peer) = (Vec::new(), Vec::new());
+            for (row, rows, fold) in [(0usize, k + 1, 0), (1, k + 2, k + 1)] {
+                let lane = seat(slot, &next[row..=row], buffer(slot, rows, fold));
+                match beside {
+                    None => own.push(fire(shell, &[lane]).swap_remove(0)),
+                    Some(other) => {
+                        shell.open(other).expect("the peer opens");
+                        let mut out = fire(shell, &[seat(other, &third, RsVerb::Fold), lane]);
+                        own.push(out.swap_remove(1));
+                        peer.push(out.swap_remove(0));
+                    }
+                }
+            }
+            (own, peer)
+        };
+    let (alone, _) = run(&mut shell, 0, None);
+    let (beside, peers) = run(&mut shell, 1, Some(2));
+    shell.open(3).expect("slot 3 opens");
+    let peer_alone = fire(&mut shell, &[seat(3, &third, RsVerb::Fold)]).swap_remove(0);
+    let spread = |a: &[f32], b: &[f32]| {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max)
+    };
+    let mut apart = Vec::new();
+    for (row, (a, b)) in alone.iter().zip(&beside).enumerate() {
+        let d = spread(a, b);
+        eprintln!(
+            "{model}: replaying row {row} beside a folding lane vs alone: logit spread {d:.4} \
+             (argmax {} vs {})",
+            argmax(b),
+            argmax(a)
+        );
+        if d > FLOOR {
+            apart.push(format!("replaying row {row}: {d}"));
+        }
+    }
+    for (row, got) in peers.iter().enumerate() {
+        let d = spread(&peer_alone, got);
+        eprintln!("{model}: the folding lane beside replaying row {row} vs alone: {d:.4}");
+        if d > FLOOR {
+            apart.push(format!("the folding lane beside row {row}: {d}"));
+        }
+    }
+    assert!(
+        apart.is_empty(),
+        "{model}: lanes answer apart in a mixed fire: {apart:?}"
+    );
+}
+
 fn contract_of(trace: &Trace, path: &Path) -> std::result::Result<ModelContract, String> {
     let source = ztensor::Source::open(path).map_err(|why| why.to_string())?;
     poem::import::own_contract(&source, &trace.params, 1, Platform::Cuda)

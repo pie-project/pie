@@ -289,6 +289,99 @@ fn a_gdn_buffered_fold_is_the_fold_it_replaces() {
     }
 }
 
+/// A lane replaying rows it buffered, in a fire beside a folding lane (a
+/// decode or a prompt piece of another sequence), answers as it does in a
+/// fire of its own: its logits, and the state its replay folds; the folding
+/// lane answers as alone too. A beam's lanes replay their lineage beside
+/// other sequences' decodes so.
+#[test]
+fn a_replaying_lane_beside_a_folding_lane_answers_as_alone() {
+    if let Some(model) = Model::load("qwen35-tiny") {
+        replays_beside_a_fold(model, "qwen35-tiny");
+    }
+}
+
+fn replays_beside_a_fold(mut m: Model, name: &str) {
+    let fold = RsVerb::Fold;
+    let tokens = window(11);
+    let next = window(101);
+    let third = window(203);
+    let k = WINDOW as u32;
+    let (fresh, held) = (RsReset::Fresh, RsReset::Held);
+    // The replaying lane: `tokens` buffered past an empty state, then one row
+    // that replays them and lands its own, folding nothing, then one that
+    // replays all and folds them.
+    let buffered = m.buffer(0, 0);
+    let replay = m.buffer_over(k + 1, 0, 0);
+    let replay_fold = m.buffer_over(k + 2, 0, k + 1);
+    let run = |m: &mut Model, slot: u32, beside: Option<u32>| {
+        m.open(slot);
+        m.one(slot, &tokens, &buffered, fresh, 0);
+        let mut answers = Vec::new();
+        for (rows, verb, at) in [(&next[..1], &replay, k), (&next[1..2], &replay_fold, k + 1)] {
+            let out = match beside {
+                None => m.one(slot, rows, verb, held, at),
+                Some(peer) => {
+                    m.open(peer);
+                    let mut out = m.fire(&[
+                        (peer, &third, &fold, fresh, 0),
+                        (slot, rows, verb, held, at),
+                    ]);
+                    out.swap_remove(1)
+                }
+            };
+            answers.push(out);
+        }
+        (answers, m.state(slot))
+    };
+    let (alone, alone_state) = run(&mut m, 0, None);
+    let (beside, beside_state) = run(&mut m, 1, Some(2));
+    m.open(3);
+    let peer_alone = m.one(3, &third, &fold, fresh, 0);
+    m.open(2);
+    let peer_beside = {
+        m.open(1);
+        m.one(1, &tokens, &buffered, fresh, 0);
+        m.fire(&[
+            (2, &third, &fold, fresh, 0),
+            (1, &next[..1], &replay, held, k),
+        ])
+        .swap_remove(0)
+    };
+    // The scale a state is measured against: two different folds' distance.
+    m.open(3);
+    m.one(3, &tokens[..3], &fold, fresh, 0);
+    let short = m.state(3);
+    let scale = m
+        .distance(&short, &alone_state, false)
+        .expect("integer planes are not counted");
+    for (at, (a, b)) in alone.iter().zip(&beside).enumerate() {
+        let d = spread(a, b);
+        eprintln!(
+            "{name}: replaying row {at} beside a folding lane vs alone, logit spread {d:.4} \
+             (argmax {} vs {})",
+            argmax(b),
+            argmax(a)
+        );
+        assert!(
+            d <= LOGIT_FLOOR,
+            "{name}: replaying row {at} answers {d} apart beside a folding lane"
+        );
+    }
+    m.assert_same_state(
+        &beside_state,
+        &alone_state,
+        &format!("{name}: the state a replay folds beside a folding lane"),
+        scale,
+    );
+    let d = spread(&peer_alone, &peer_beside);
+    eprintln!("{name}: the folding lane beside a replay vs alone, logit spread {d:.4}");
+    assert!(
+        d <= LOGIT_FLOOR,
+        "{name}: the folding lane answers {d} apart beside a replay"
+    );
+}
+
 /// A buffering fire leaves the state as it was; a fold replaying it is the
 /// fold it deferred, at any length; a folding lane beside a buffering one
 /// answers as alone; and rounds of a two-row window with a rejected row
