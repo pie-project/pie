@@ -7,7 +7,9 @@ pub const MAP_UNIT_BYTES: u64 = 32 * 1024 * 1024;
 
 const HANDLES_PER_ARENA: u64 = 256;
 
-const SAFETY_FLOOR_BYTES: u64 = 128 * 1024 * 1024;
+/// The driver's safety floor under the measured capacity: one size on
+/// every backend.
+const SAFETY_FLOOR_BYTES: u64 = 64 << 20;
 
 /// The handle a flat arena's units carry: they are backed by the arena's
 /// one allocation, and own nothing to release.
@@ -32,15 +34,11 @@ pub const fn mapped_on_demand() -> bool {
 /// out of the range by name; once arming ends nothing allocates on the
 /// device.
 #[must_use]
-pub const fn safety_floor_bytes(total: u64) -> u64 {
-    if !mapped_on_demand() {
-        return 0;
-    }
-    let tenth = total / 10;
-    if SAFETY_FLOOR_BYTES < tenth {
+pub const fn safety_floor_bytes() -> u64 {
+    if mapped_on_demand() {
         SAFETY_FLOOR_BYTES
     } else {
-        tenth
+        0
     }
 }
 
@@ -50,7 +48,7 @@ pub const fn safety_floor_bytes(total: u64) -> u64 {
 pub fn budget_bytes(free: u64, total: u64, allowance: engine::Allowance) -> u64 {
     allowance
         .room(total, total.saturating_sub(free))
-        .saturating_sub(safety_floor_bytes(total))
+        .saturating_sub(safety_floor_bytes())
 }
 
 /// What a card of `total` bytes may hold in all while a load under
@@ -75,7 +73,7 @@ pub fn room_under(ceiling: u64, free: u64, total: u64) -> u64 {
     ceiling
         .min(total)
         .saturating_sub(total.saturating_sub(free))
-        .saturating_sub(safety_floor_bytes(total))
+        .saturating_sub(safety_floor_bytes())
 }
 
 #[must_use]

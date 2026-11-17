@@ -54,7 +54,7 @@ impl Accounting {
     #[must_use]
     pub fn of(card: u64, allowance: engine::Allowance, weights: u64, minimum: u64) -> Accounting {
         let ceiling = allowance.ceiling(card);
-        let floor = elastic::safety_floor_bytes(card);
+        let floor = elastic::safety_floor_bytes();
         Accounting {
             card,
             ceiling,
