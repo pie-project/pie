@@ -5649,7 +5649,8 @@ impl engine::frame::Shell for Shell {
             crate::encode::reset_kernel_profile();
         }
         let mut frame = walked.frame;
-        let probing = std::env::var_os("PIE_PROBE_REGION").is_some();
+        let probing = cfg!(target_vendor = "apple") && std::env::var_os("PIE_PROBE_REGION").is_some();
+        #[cfg(target_vendor = "apple")]
         if probing && matches!(frame.probe_flush_wait(), Ok(true)) {
             self.programs.probe_scan(&format!(
                 "in fire: after the forward ({} rows, {} lanes)",
@@ -5677,6 +5678,7 @@ impl engine::frame::Shell for Shell {
             }
         }
 
+        #[cfg(target_vendor = "apple")]
         if probing && matches!(frame.probe_flush_wait(), Ok(true)) {
             self.programs.probe_scan("in fire: after the readback copies");
         }
@@ -5693,6 +5695,7 @@ impl engine::frame::Shell for Shell {
             })
             .collect();
         fire_trace(|| "epilogues-encoded".to_string());
+        #[cfg(target_vendor = "apple")]
         if probing && matches!(frame.probe_flush_wait(), Ok(true)) {
             self.programs.probe_scan("in fire: after the epilogues");
         }
