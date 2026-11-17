@@ -1620,6 +1620,7 @@ fn prefill_fresh_case(maps: (PageMap, PageMap), shift: i32) {
     let mut b = Bench::new();
     let kv = pool.bind(&mut b);
     let twin = pool.bind(&mut b);
+    let stray_kv = pool.bind(&mut b);
     let plan = fire.prefill(&mut b);
     let qt = b.bf16(rows as u32, (qh * d) as u32, &q);
     let qr = ragged(&mut b, &runs, qt);
@@ -1657,8 +1658,17 @@ fn prefill_fresh_case(maps: (PageMap, PageMap), shift: i32) {
     let lse = b.zeros(Dtype::F32, rows as u32, qh as u32);
     let o_old = b.zeros(Dtype::Bf16, rows as u32, wq);
     let o_old_win = b.zeros(Dtype::Bf16, rows as u32, wq);
+    let o_stray = b.zeros(Dtype::Bf16, rows as u32, wq);
     if !b
         .run(|ctx| {
+            // The unshifted fire with lane 1's rows landing `shift` slots
+            // on (a guest's stated write slots): lane 1 reads its keys
+            // through its table, as the walk does, not the rows it handed.
+            let read = low::kv_append(ctx, kt, vt, &stray_kv, pt_old, ot_old)?;
+            let call = arbiter::prefill(
+                qr, &plan, &stray_kv, None, d as u32, kvh as u32, scale, o_stray, 1000,
+            )?;
+            low::attend_fresh(ctx, call, stray_kv, read)?;
             low::kv_append(ctx, kt, vt, &kv, pt, ot)?;
             let read = low::kv_append(ctx, kt2, vt2, &twin, pt, ot)?;
             let call = arbiter::prefill_lse(
@@ -1711,6 +1721,36 @@ fn prefill_fresh_case(maps: (PageMap, PageMap), shift: i32) {
         lanes: pool.lanes.clone(),
         ..pool
     };
+    // The stray fire's pool: its rows where they landed, read through the
+    // tables at the fire's own positions.
+    let mut strayed = Pool {
+        keys: pool.keys.clone(),
+        values: pool.values.clone(),
+        lanes: pool.lanes.clone(),
+        ..pool
+    };
+    for (i, &p) in page_old.iter().enumerate() {
+        if p != sink {
+            let slot = p as usize * ps + off_old[i] as usize;
+            strayed.keys[slot * w..(slot + 1) * w].copy_from_slice(&k[i * w..(i + 1) * w]);
+            strayed.values[slot * w..(slot + 1) * w].copy_from_slice(&v[i * w..(i + 1) * w]);
+        }
+    }
+    let (want_stray, _) = sdpa(
+        &q,
+        rows,
+        qh,
+        kvh,
+        d,
+        d,
+        &strayed.keys,
+        &strayed.values,
+        f64::from(scale),
+        &|r| fire.admitted(&strayed, r, 0, true),
+        &no_bias,
+        &unit,
+    );
+    check_rows(&b.read_f32(o_stray), &want_stray, qh * d, live, 2e-3);
     // The rows read: the first append's, then the shifted fire's as read
     // fresh.
     for (rows_k, rows_v, pg, of) in [(&k, &v, &page, &off), (&k, &v, &page_old, &off_old)] {

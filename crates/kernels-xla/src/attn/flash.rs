@@ -12,9 +12,11 @@
 //! length) are read too, walked before the fresh blocks: each lane's pages
 //! laid one after another as a virtual rectangle, its blocks copied page by
 //! page out of the planes (pooled planes as the pool lays them, unpacked in
-//! VMEM). The kernel stands in for the paged walk only when no row carries
-//! a custom mask, every row filed in its lane's slot: the fire decides at
-//! run time (`stablehlo.case`), the walk being the other branch.
+//! VMEM). A lane whose rows the fire did not append in its own slots (a
+//! guest's stated write slots) reads all its keys that way, as the walk
+//! reads them through its table: a choice made per lane, as data. A fire
+//! with a row under a custom mask walks: the fire decides at run time
+//! (`stablehlo.case`), the walk being the other branch.
 //!
 //! Grid: one step per row block, its key blocks walked by a loop with the
 //! next block's `k`/`v` copying in (two buffers) while the current one is
@@ -37,6 +39,9 @@ use crate::tensor::{Operand, PageMap};
 
 use super::paged::{Flashed, Geom, Heads, cmp_i, read_rows_i32, round_up, with_i};
 
+/// The paged walk a fire falls back to.
+pub(crate) type Walk<'a> = Box<dyn FnOnce(&mut Func) -> Built<Flashed> + 'a>;
+
 /// Keys per block.
 const BK: i64 = 256;
 /// Query rows per block.
@@ -50,9 +55,6 @@ fn bad<T>(detail: impl Into<String>) -> Built<T> {
         detail: detail.into(),
     })
 }
-
-/// The paged walk a fire falls back to.
-pub(crate) type Walk<'a> = Box<dyn FnOnce(&mut Func) -> Built<Flashed> + 'a>;
 
 /// What the fire appended: `k`, `v` (`[r, kvh · d]` bf16) and each row's
 /// write page and offset (`[r]` i32).
@@ -752,10 +754,12 @@ fn segments(f: &mut Func, lane: Val, qpos: Val) -> Built<(Val, Val)> {
 
 /// The attention of `q4` (`[r, kvh, g, d]` bf16) rows over the fire's
 /// appended keys and their lanes' older keys, read page by page out of the
-/// planes, where every row is filed in its lane's slot and carries no
-/// custom mask, else `walk`: `lo`/`hi` bound each row's admitted positions,
-/// `lane` its lane (clamped), `cap` the lane's capacity, `enabled` its
-/// custom-mask flag, `slots` the pool plane's rows. `o` is bf16.
+/// planes: `lo`/`hi` bound each row's admitted positions, `lane` its lane
+/// (clamped), `cap` the lane's capacity, `enabled` its custom-mask flag
+/// (a fire with a live row under a mask takes `walk`), `slots` the pool
+/// plane's rows. A lane whose rows did not all land in its own slots
+/// (`through_pages`) reads every key through its pages, as the walk would.
+/// `o` is bf16.
 pub(crate) fn attend(
     f: &mut Func,
     ap: &Appended,
@@ -786,52 +790,26 @@ pub(crate) fn attend(
     };
     let (start, p0) = segments(f, lane, qpos)?;
     let live = cmp_i(f, Cmp::Ge, qpos, 0)?;
-    let old = older(f, geom, slots, lane, lo, p0, live, maps)?;
-    // Filed in its lane's slot (not the sink, the plane's last page).
-    let pix = with_i(f, qpos, ps, Func::div)?;
-    let at = with_i(f, lane, geom.pages, Func::mul)?;
-    let at = f.add(at, pix)?;
-    let page = super::paged::take(f, geom.pt, at)?;
-    let want = with_i(f, page, ps, Func::mul)?;
-    let off = with_i(f, qpos, ps, Func::rem)?;
-    let want = f.add(want, off)?;
-    let got = with_i(f, ap.page, ps, Func::mul)?;
-    let got = f.add(got, ap.off)?;
-    let filed = f.compare(Cmp::Eq, got, want)?;
-    let inside = cmp_i(f, Cmp::Ge, ap.page, 0)?;
-    // the sink is the keys plane's last page, in its own pages
-    let plane_page = maps[0].apply(f, ap.page)?;
-    let below = cmp_i(f, Cmp::Lt, plane_page, slots / ps - 1)?;
-    let filed = f.and(filed, inside)?;
-    let filed = f.and(filed, below)?;
-    let upto = with_i(f, qpos, 1, Func::add)?;
-    let held = f.compare(Cmp::Le, upto, cap)?;
-    let mut ok = f.and(filed, held)?;
-    if let Some(en) = enabled {
-        let off = cmp_i(f, Cmp::Eq, en, 0)?;
-        ok = f.and(ok, off)?;
-    }
+    let paged = through_pages(f, geom, slots, ap, lane, qpos, cap, live, maps[0])?;
+    // A paged lane's rows read `[lo, hi)` all as older keys.
+    let reach = f.select(paged, hi, p0)?;
+    let old = older(f, geom, slots, lane, lo, reach, live, maps)?;
+    let fresh = f.not(paged);
+    let fresh = f.and(fresh, live)?;
+    let (klo, khi) = fresh_rows(f, lo, hi, p0, start, fresh)?;
+    let Some(en) = enabled else {
+        let (o, m, l) = run(f, &s, ap, q4, klo, khi, vmem_cap, &old, planes)?;
+        return Ok(Flashed { o, m, l });
+    };
+    // 0: the walk, where a live row carries a custom mask; 1: the kernel.
+    // This run-time case is a second path every program carries (the walk's
+    // code beside the kernel's in each layer), kept only until the kernel
+    // takes a row's mask bits itself.
+    let off = cmp_i(f, Cmp::Eq, en, 0)?;
     let dead = f.not(live);
-    let ok = f.or(ok, dead)?;
+    let ok = f.or(off, dead)?;
     let all = f.reduce(ok, &[0], Fold::And)?;
-    // 0: the walk; 1: the kernel. This runtime case is a second path every
-    // program carries (the walk's code beside the kernel's in each layer),
-    // kept only until the kernel takes a row's custom mask (and a row out of
-    // its slot is refused before the fire): that change deletes the walk
-    // branch here.
     let which = f.convert(all, Elem::I32);
-
-    // Each row's key rows `[klo, khi)` of the rectangle: its segment's,
-    // from its window's start (the older keys are the other rectangle's).
-    let klo = f.max(lo, p0)?;
-    let klo = f.sub(klo, p0)?;
-    let klo = f.add(klo, start)?;
-    let khi = f.sub(hi, p0)?;
-    let khi = f.add(khi, start)?;
-    let dead_lo = f.like_i(klo, 0);
-    let klo = f.select(live, klo, dead_lo)?;
-    let khi = f.select(live, khi, dead_lo)?;
-
     let outs = vec![
         Ty::new(Elem::Bf16, &[r, h.kvh, h.g, h.dv]),
         Ty::new(Elem::F32, &[r, h.kvh, h.g]),
@@ -854,6 +832,79 @@ pub(crate) fn attend(
     })
 }
 
+/// Each row's key rows `[klo, khi)` of the fire's own rectangle: its
+/// segment's, from its window's start (the older keys are the virtual
+/// rectangle's); none where `fresh` is false.
+fn fresh_rows(
+    f: &mut Func,
+    lo: Val,
+    hi: Val,
+    p0: Val,
+    start: Val,
+    fresh: Val,
+) -> Built<(Val, Val)> {
+    let klo = f.max(lo, p0)?;
+    let klo = f.sub(klo, p0)?;
+    let klo = f.add(klo, start)?;
+    let khi = f.sub(hi, p0)?;
+    let khi = f.add(khi, start)?;
+    let none = f.like_i(klo, 0);
+    Ok((f.select(fresh, klo, none)?, f.select(fresh, khi, none)?))
+}
+
+/// Whether each row's lane reads all its keys through its pages: a lane
+/// with a live row the fire did not append at its table slot (a guest's
+/// stated write slots may differ from `have + i`), nor within its capacity.
+/// The walk reads such a lane's keys through its table after the append;
+/// so does the kernel, through the fire's page list. Every other lane reads
+/// its fresh keys from the rectangle the fire appended.
+fn through_pages(
+    f: &mut Func,
+    geom: &Geom,
+    slots: i64,
+    ap: &Appended,
+    lane: Val,
+    qpos: Val,
+    cap: Val,
+    live: Val,
+    keys_map: PageMap,
+) -> Built<Val> {
+    let ps = geom.ps;
+    let r = f.dims(lane)[0];
+    let pix = with_i(f, qpos, ps, Func::div)?;
+    let at = with_i(f, lane, geom.pages, Func::mul)?;
+    let at = f.add(at, pix)?;
+    let page = super::paged::take(f, geom.pt, at)?;
+    let want = with_i(f, page, ps, Func::mul)?;
+    let off = with_i(f, qpos, ps, Func::rem)?;
+    let want = f.add(want, off)?;
+    let got = with_i(f, ap.page, ps, Func::mul)?;
+    let got = f.add(got, ap.off)?;
+    let filed = f.compare(Cmp::Eq, got, want)?;
+    let inside = cmp_i(f, Cmp::Ge, ap.page, 0)?;
+    // the sink is the keys plane's last page, in its own pages
+    let plane_page = keys_map.apply(f, ap.page)?;
+    let below = cmp_i(f, Cmp::Lt, plane_page, slots / ps - 1)?;
+    let filed = f.and(filed, inside)?;
+    let filed = f.and(filed, below)?;
+    let upto = with_i(f, qpos, 1, Func::add)?;
+    let held = f.compare(Cmp::Le, upto, cap)?;
+    let ok = f.and(filed, held)?;
+    let stray = f.not(ok);
+    let stray = f.and(stray, live)?;
+    // any stray row of a lane pages the whole lane
+    let grid = [geom.lanes, r];
+    let li = f.iota(Elem::I32, &grid, 0);
+    let lb = f.broadcast(lane, &grid, &[1])?;
+    let mine = f.compare(Cmp::Eq, lb, li)?;
+    let sb = f.broadcast(stray, &grid, &[1])?;
+    let hit = f.and(mine, sb)?;
+    let hit = f.convert(hit, Elem::I32);
+    let any = f.reduce(hit, &[1], Fold::Max)?;
+    let paged = super::paged::take(f, any, lane)?;
+    cmp_i(f, Cmp::Ne, paged, 0)
+}
+
 /// A fire's readout rows `q4` (`[R, kvh, g, d]` bf16, at fire rows `at`)
 /// over their lanes' keys: the rows the fire appended (`ap`, one a fire row,
 /// `lane` and `qpos` the fire's tables), a blocked walk over that rectangle,
@@ -867,6 +918,7 @@ pub(crate) fn readouts(
     ap: &Appended,
     h: &Heads,
     geom: &Geom,
+    slots: i64,
     planes: (Val, Val),
     q4: Val,
     at: Val,
@@ -888,19 +940,20 @@ pub(crate) fn readouts(
     } else {
         f.like_i(qpos, 0)
     };
+    let cap = geom.capacity(f, lane)?;
     let hi = with_i(f, qpos, 1, Func::add)?;
-    // Each row's fresh key rows, as `attend` reads them.
-    let klo = f.max(lo, p0)?;
-    let klo = f.sub(klo, p0)?;
-    let klo = f.add(klo, start)?;
-    let khi = f.sub(hi, p0)?;
-    let khi = f.add(khi, start)?;
+    let hi = f.min(hi, cap)?;
+    // A lane whose rows did not all land in its slots reads every key
+    // through its pages, as `attend`'s do.
+    let paged = through_pages(f, geom, slots, ap, lane, qpos, cap, live, maps[0])?;
+    let fresh = f.not(paged);
+    let fresh = f.and(fresh, live)?;
+    let (klo, khi) = fresh_rows(f, lo, hi, p0, start, fresh)?;
+    // Its older keys: positions `[lo, p0)` of its lane (`[lo, hi)` paged;
+    // none for a padded row).
     let dead = f.like_i(klo, 0);
-    let klo = f.select(live, klo, dead)?;
-    let khi = f.select(live, khi, dead)?;
-    // Its older keys: positions `[lo, p0)` of its lane (none for a padded
-    // row).
-    let ohi = f.select(live, p0, dead)?;
+    let reach = f.select(paged, hi, p0)?;
+    let ohi = f.select(live, reach, dead)?;
     let olo = f.select(live, lo, dead)?;
     let pick = |f: &mut Func, v: Val| super::paged::take(f, v, at);
     let (klo, khi) = (pick(f, klo)?, pick(f, khi)?);

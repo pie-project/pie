@@ -2419,6 +2419,7 @@ pub fn attend_readouts(
         &ap,
         &heads,
         &geom,
+        i64::from(pool.keys.rows),
         (pool.keys.val, pool.values.val),
         q4,
         at,
