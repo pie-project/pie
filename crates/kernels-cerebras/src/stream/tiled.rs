@@ -170,6 +170,8 @@ pub struct TileProgram {
     pub stream_words: u32,
     pub tape: u32,
     pub round16: bool,
+    /// The PE's buffers packed tightly ([`Chunks::tight`]).
+    pub tight: bool,
     /// Each op's words in the stream ahead of its records (their 16-bit words, an even count),
     /// none where the op table is a PE's constant.
     pub op_words: Vec<u32>,
@@ -677,6 +679,7 @@ pub fn lower(trace: &Trace, reading: &str, clip: [u32; 3], round16: bool) -> R<T
         tape: 0,
         round16,
         op_words: Vec::new(),
+        tight: false,
     };
     print_regions(&mut p)?;
     Ok(p)
@@ -992,6 +995,10 @@ pub struct Chunks {
     /// The op table streams in with the weights, an op's words ahead of its records (a PE holds
     /// one op's), not held whole on every PE.
     pub stream_ops: bool,
+    /// The PE's buffers as tight as the compiler packs them: a rounding staged a chunk at a
+    /// time (the staging no longer holds a whole value), the arena the least of several orders
+    /// of first fit.
+    pub tight: bool,
 }
 
 impl Default for Chunks {
@@ -1000,6 +1007,7 @@ impl Default for Chunks {
             kc: KC,
             wb: WB_WORDS,
             stream_ops: false,
+            tight: false,
         }
     }
 }
@@ -1013,6 +1021,7 @@ pub fn place_with(
     chunks: Chunks,
 ) -> R<()> {
     let (kc_most, wb_most) = (chunks.kc, chunks.wb);
+    p.tight = chunks.tight;
     let (h, w) = p.top();
     if !h.is_multiple_of(th0) || !w.is_multiple_of(tw0) {
         return Err(format!("a {th0} x {tw0} tile over {h} x {w}"));
@@ -1073,13 +1082,16 @@ pub fn place_with(
                     l.px() * kc
                 };
                 let _ = cin;
-                hx = hx.max(n).max(p.words(*y));
+                hx = hx.max(n);
+                if !chunks.tight {
+                    hx = hx.max(p.words(*y));
+                }
             }
             TOp::Attend { q, o, .. } => hx = hx.max(2 * p.vals[q].width).max(p.words(*o)),
             op => {
                 let (_, outs) = p.io(i);
                 for v in outs {
-                    if p.vals[&v].round {
+                    if p.vals[&v].round && !chunks.tight {
                         hx = hx.max(p.words(v));
                     }
                 }
@@ -1107,30 +1119,52 @@ pub fn place_with(
             life.insert(Key::Temp(i), (i, i, tw));
         }
     }
-    let mut placed: Vec<(u32, u32, usize, usize)> = Vec::new();
-    let mut items: Vec<(Key, (usize, usize, u32))> = life.into_iter().collect();
-    items.sort_by_key(|(k, (s, _, w))| (*s, std::cmp::Reverse(*w), *k));
-    p.slots.clear();
-    let mut arena = 0u32;
-    for (k, (s, e, w)) in items {
-        // the lowest offset free over [s, e] (4-word aligned)
-        let mut busy: Vec<(u32, u32)> = placed
-            .iter()
-            .filter(|(_, _, ps, pe)| *ps <= e && s <= *pe)
-            .map(|(o, w, _, _)| (*o, o + w))
-            .collect();
-        busy.sort_unstable();
-        let mut off = 0u32;
-        for (a, b) in busy {
-            if off + w <= a {
-                break;
+    let items: Vec<(Key, (usize, usize, u32))> = life.into_iter().collect();
+    // first fit in an order: by start, the wider first (the tight choice: the least of that and
+    // the widest first, the longest-lived first)
+    let fit = |order: &Order| {
+        let mut items = items.clone();
+        items.sort_by_key(|it| (order(it), it.0));
+        let mut placed: Vec<(u32, u32, usize, usize)> = Vec::new();
+        let mut slots = BTreeMap::new();
+        let mut arena = 0u32;
+        for (k, (s, e, w)) in items {
+            // the lowest offset free over [s, e] (4-word aligned)
+            let mut busy: Vec<(u32, u32)> = placed
+                .iter()
+                .filter(|(_, _, ps, pe)| *ps <= e && s <= *pe)
+                .map(|(o, w, _, _)| (*o, o + w))
+                .collect();
+            busy.sort_unstable();
+            let mut off = 0u32;
+            for (a, b) in busy {
+                if off + w <= a {
+                    break;
+                }
+                off = off.max(b.next_multiple_of(4));
             }
-            off = off.max(b.next_multiple_of(4));
+            placed.push((off, w, s, e));
+            slots.insert(k, off);
+            arena = arena.max(off + w);
         }
-        placed.push((off, w, s, e));
-        p.slots.insert(k, off);
-        arena = arena.max(off + w);
+        (arena, slots)
+    };
+    let by_start = |(_, (s, _, w)): &(Key, (usize, usize, u32))| (*s as i64, -i64::from(*w), 0i64);
+    let (mut arena, mut slots) = fit(&by_start);
+    if chunks.tight {
+        let widest =
+            |(_, (s, _, w)): &(Key, (usize, usize, u32))| (-i64::from(*w), *s as i64, 0i64);
+        let longest = |(_, (s, e, w)): &(Key, (usize, usize, u32))| {
+            (-((e - s) as i64), -i64::from(*w), *s as i64)
+        };
+        for order in [&widest as &Order, &longest] {
+            let (a, sl) = fit(order);
+            if a < arena {
+                (arena, slots) = (a, sl);
+            }
+        }
     }
+    p.slots = slots;
     p.arena = arena.next_multiple_of(4).max(4);
     let data = p.arena + p.hx / 2 + p.wb;
     if data > DATA_WORDS {
@@ -1317,6 +1351,10 @@ pub fn program_upto(
         )
     })
 }
+
+/// An order of the arena's first fit: a lifetime's (key, (first op, last op, words)) to its sort
+/// key.
+type Order = dyn Fn(&(Key, (usize, usize, u32))) -> (i64, i64, i64);
 
 /// A value's rows as [`emulate`] reads them.
 pub type Rows = crate::stream::host::Rows;

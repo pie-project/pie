@@ -386,10 +386,15 @@ fn stream(args: &[String]) -> Result<(), String> {
             let p = match (get("--chunks"), tile) {
                 (Some(c), Some(t)) => {
                     let v: Vec<u32> = c.split(',').filter_map(|x| x.parse().ok()).collect();
-                    let (kc, wb, stream_ops) = match v[..] {
-                        [kc, wb] => (kc, wb, false),
-                        [kc, wb, s] => (kc, wb, s != 0),
-                        _ => return Err(format!("--chunks {c}: kc,wb[,stream ops 0|1]")),
+                    let (kc, wb, stream_ops, tight) = match v[..] {
+                        [kc, wb] => (kc, wb, false, false),
+                        [kc, wb, s] => (kc, wb, s != 0, false),
+                        [kc, wb, s, g] => (kc, wb, s != 0, g != 0),
+                        _ => {
+                            return Err(format!(
+                                "--chunks {c}: kc,wb[,stream ops 0|1[,tight 0|1]]"
+                            ));
+                        }
                     };
                     kernels_cerebras::stream::tiled::program_with(
                         &trace,
@@ -397,7 +402,12 @@ fn stream(args: &[String]) -> Result<(), String> {
                         clip,
                         !ieee,
                         t,
-                        kernels_cerebras::stream::tiled::Chunks { kc, wb, stream_ops },
+                        kernels_cerebras::stream::tiled::Chunks {
+                            kc,
+                            wb,
+                            stream_ops,
+                            tight,
+                        },
                         Some((bounds.w, bounds.h)),
                     )?
                 }

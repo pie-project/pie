@@ -167,9 +167,11 @@ fn flux_2_minis_vae_program_is_the_reference() {
 }
 
 /// The tiled program whose op table streams in with its weights (an op's words ahead of its
-/// records, a PE holding one op's) decodes bit for bit as the one holding its table.
+/// records, a PE holding one op's) and whose buffers are packed tightly (its rounding staged a
+/// chunk at a time, its arena the least of several orders) decodes bit for bit as the one
+/// holding its table.
 #[test]
-fn a_tiled_program_streaming_its_op_table_decodes_alike() {
+fn a_tiled_program_streaming_its_op_table_and_packed_tightly_decodes_alike() {
     let trace = common::trace();
     let tmp = tempfile::tempdir().expect("a scratch directory");
     let f = forward(&trace, &tmp.path().join("ckpt"));
@@ -184,6 +186,7 @@ fn a_tiled_program_streaming_its_op_table_decodes_alike() {
         (2, 2),
         tiled::Chunks {
             stream_ops: true,
+            tight: true,
             ..tiled::Chunks::default()
         },
         None,
@@ -192,6 +195,7 @@ fn a_tiled_program_streaming_its_op_table_decodes_alike() {
     assert!(held.op_words.is_empty());
     assert_eq!(streamed.op_words.len(), streamed.ops.len());
     assert!(streamed.stream_words > held.stream_words);
+    assert!(streamed.arena <= held.arena && streamed.hx <= held.hx);
     let lat = f32s(PIPE_LATENT);
     let st = step(held.word, clip, &lat);
     let f = std::cell::RefCell::new(f);

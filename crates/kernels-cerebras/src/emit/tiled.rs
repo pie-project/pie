@@ -392,18 +392,26 @@ fn pe_file(p: &TileProgram, tb: &Table) -> String {
          var hout: [{hout}]f32 align(16) = @zeros([{hout}]f32);\nvar hout_p: [*]f32 = &hout;\nconst D_hout = @get_dsd(mem1d_dsd, .{{ .tensor_access = |i|{{{hout}}} -> hout[i] }});\n\
          var pcfg = @zeros([2]u32);\nvar pcfg_p: [*]u32 = &pcfg;"
     );
+    // (a tight program's rounding staged a chunk at a time: its staging holds no whole value)
+    let ops = if p.tight {
+        TPE_OPS.replace(
+            "fn rnd(o: u16, n: u16) void { if (n == 0) { return; } @fs2h(hd(0, n), md(o, n)); @fh2s(md(o, n), hd(0, n)); }",
+            "fn rnd(o: u16, n: u16) void {\n  var d: u16 = 0;\n  while (d < n) {\n    const m = if (n - d > HXN) HXN else n - d;\n    @fs2h(hd(0, m), md(o + d, m)); @fh2s(md(o + d, m), hd(0, m));\n    d += m;\n  }\n}",
+        )
+    } else {
+        TPE_OPS.to_string()
+    };
+    let ops = ops.as_str();
     if streamed {
         // (each op's words off the stream into `prog`, its first word its code and length)
         // (tiled_pe.csl's `run_all`, the table's walk, in place: the template holds it once)
-        let all = TPE_OPS.find("fn run_all() void {").unwrap_or(TPE_OPS.len());
-        let end = TPE_OPS[all..]
-            .find("\n}\n")
-            .map_or(TPE_OPS.len(), |e| all + e + 3);
-        t.push_str(&TPE_OPS[..all]);
+        let all = ops.find("fn run_all() void {").unwrap_or(ops.len());
+        let end = ops[all..].find("\n}\n").map_or(ops.len(), |e| all + e + 3);
+        t.push_str(&ops[..all]);
         t.push_str(RUN_STREAMED);
-        t.push_str(&TPE_OPS[end..]);
+        t.push_str(&ops[end..]);
     } else {
-        t.push_str(TPE_OPS);
+        t.push_str(ops);
     }
     t.push_str(&reg_fn(p));
     let mut init = String::new();
