@@ -601,7 +601,10 @@ export class ForwardPass {
     wit('group', () => this.wit.group(lane, id));
   }
 
-  /** Per row, the kv slots it attends, or its attention group's rows without kv. */
+  /**
+   * Per row, what it attends past the frozen part (column c is slot folded() + c:
+   * the buffer, then the pass's rows), or its attention group's rows without kv.
+   */
   mask(rows: Channel): void {
     this.ensurePortsAvailable([Port.ATTN_MASK]);
     wit('mask', () => this.wit.mask(rows.wit()));

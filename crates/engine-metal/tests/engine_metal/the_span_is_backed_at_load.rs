@@ -63,9 +63,9 @@ fn the_span_is_backed_at_load() {
             }])
             .expect("the fire lands")
     };
-    // The shell stands at the smallest rung, as a load leaves it.
+    // The shell stands at the largest rung, as a load leaves it.
     shell.open(0).expect("slot 0 opens");
-    shell.set_rung(0, 1).expect("the smallest rung");
+    shell.set_rung(u32::MAX, 1).expect("the rung lowers to the smallest");
     fire(&mut shell, 0, &tokens[..1], 0);
     shell.set_rung(1, u32::MAX).expect("the rung raises to the top");
     fire(&mut shell, 0, &tokens[1..], 1);

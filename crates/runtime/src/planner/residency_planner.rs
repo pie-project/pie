@@ -980,6 +980,16 @@ impl ResidencyPlanner {
         self.port.suspend_capable()
     }
 
+    /// Suspends `pid` to give back the room its parked items hold on the
+    /// device: a bind of its short of room it holds part of itself would
+    /// wait on itself ([`crate::store::roles::bind_when_resident`]).
+    /// Whether a suspension began.
+    pub fn suspend_for_room(self: &Arc<Self>, pid: ProcessId) -> bool {
+        let before = self.stats.evictions_started.load(Ordering::Relaxed);
+        self.pause(vec![pid], |_| true);
+        self.stats.evictions_started.load(Ordering::Relaxed) > before
+    }
+
     /// A worker with no host or disk tier leaves it running.
     pub(super) fn pause_held(self: &Arc<Self>) {
         let held: Vec<ProcessId> = self.with_inner(|inner| {

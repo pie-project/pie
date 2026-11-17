@@ -56,6 +56,10 @@ pub(super) struct Proc {
     /// Its fires stood unsettled past `FIRE_PROGRESS`, and the planner was
     /// told.
     pub(super) fire_lapsed: bool,
+    /// Its last restore found no device room for its parked role slots
+    /// (instance tables, rings, guest state): it waits, queued, for a
+    /// completion or an eviction to free some, never failed for it.
+    pub(super) roles_short: bool,
 }
 
 impl Proc {
@@ -102,6 +106,7 @@ impl Proc {
             fires: 0,
             fired_at: crate::rt::Instant::now(),
             fire_lapsed: false,
+            roles_short: false,
         }
     }
 }

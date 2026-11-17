@@ -32,6 +32,9 @@ impl Serve for Api {
 
     type Flight = ();
 
+    /// The tokens wgpu's served loads are asked ([`crate::FIRE`]).
+    const ROWS_TOP: u32 = crate::FIRE.1;
+
     type Keep = std::convert::Infallible;
 
     const FUSIONS: &'static [poem_compiler::fuse::Rule] = &crate::FUSIONS;
@@ -68,9 +71,9 @@ impl Serve for Api {
         let tuning = {
             let chip = tuning.profile().clone();
             let rates = chip.rates();
-            if rates.bf16_flops_per_ns_by_rows_and_depth.is_some()
+            if rates.bf16_flops_per_ns_by_rows_n_k.is_some()
                 && rates.attn_flops_per_ns_by_keys_and_dim.is_some()
-                && rates.scan_elements_per_ns.is_some()
+                && rates.scan_elements_per_ns_by_tokens.is_some()
                 && rates.bytes_per_ns.is_some()
             {
                 tuning

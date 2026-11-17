@@ -212,7 +212,12 @@ pub enum StructSlot {
 pub struct FireBindings {
     pub tokens: Tensor,
 
+    /// Each row's cache row: attention's causal bound.
     pub positions: Tensor,
+
+    /// Each row's stated position: the rotation `RuntimeInput::Positions`
+    /// reads.
+    pub rotations: Tensor,
 
     pub readout_rows: Tensor,
 
@@ -427,6 +432,9 @@ impl<'c, B: Backend> Run<'c, B> {
         if let Some(gathered) = &self.window().gathered {
             if handle.buf == self.fire.positions.buf {
                 return gathered.positions;
+            }
+            if handle.buf == self.fire.rotations.buf {
+                return gathered.rotations;
             }
             if handle.buf == self.fire.tables.request_of_token.buf {
                 return gathered.request_of_token;
@@ -680,7 +688,7 @@ impl<'c, B: Backend> Run<'c, B> {
         match &self.values[at].def {
             Def::Input(RuntimeInput::Tokens) => self.fire.tokens,
             Def::Input(RuntimeInput::ReadoutRows) => self.fire.readout_rows,
-            Def::Input(RuntimeInput::Positions) => self.fire.positions,
+            Def::Input(RuntimeInput::Positions) => self.fire.rotations,
 
             Def::Input(RuntimeInput::Mask) => self.fire.tables.mask,
 

@@ -11,6 +11,10 @@ pub mod serve;
 pub mod tune;
 pub mod tuning;
 
+/// The fire a served wgpu load is asked, `(lanes, tokens)`: the ladder's
+/// upper bound, whose rungs the rates step times.
+pub const FIRE: (u32, u32) = (512, 10240);
+
 pub use boot::open;
 #[cfg(feature = "wgpu")]
 pub use boot::{open_with_device, request_device};

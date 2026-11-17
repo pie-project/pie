@@ -57,6 +57,7 @@ pub struct Candidate {
 pub fn rung_facts(
     candidates: &[Candidate],
     max_lanes: u32,
+    fire_lanes: u32,
     live: u64,
     computed: impl Fn(u32) -> u32,
 ) -> Vec<RungFacts> {
@@ -76,6 +77,7 @@ pub fn rung_facts(
             } else {
                 None
             },
+            fire_lanes,
         })
         .collect()
 }
@@ -149,7 +151,12 @@ mod tests {
     /// The L40S device file's rates.
     fn l40s() -> profile::fire::Rates {
         profile::fire::Rates {
-            bf16_flops_per_ns_by_rows_and_depth: Some(vec![(4096, 4096, 249_000.0)]),
+            bf16_flops_per_ns_by_rows_n_k: Some(
+                (0..=14)
+                    .map(|i| 1u32 << i)
+                    .map(|m| (m, 4096, 4096, 249_000.0))
+                    .collect(),
+            ),
             attn_flops_per_ns_by_keys_and_dim: Some(vec![(2048, 128, 100_000.0)]),
             bytes_per_ns: Some(654.0),
             launch_ns: Some(1620),
@@ -170,6 +177,7 @@ mod tests {
     fn a_load_without_rates_is_refused_by_name() {
         let rungs = rung_facts(
             &[candidate(1024, 100), candidate(2048, 200)],
+            256,
             256,
             8 << 30,
             |rows| rows,
@@ -207,7 +215,7 @@ mod tests {
             },
         ];
         let live = 3 << 30;
-        let rungs = rung_facts(&candidates, 256, live, |rows| rows);
+        let rungs = rung_facts(&candidates, 256, 256, live, |rows| rows);
         assert_eq!(rungs[0].lanes, 256);
         assert_eq!(rungs[3].infeasible, Some(NO_ROOM));
         assert_eq!(rungs[4].infeasible, Some(NO_PLAN));

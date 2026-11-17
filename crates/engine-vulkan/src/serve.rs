@@ -54,6 +54,9 @@ impl Serve for Api {
 
     type Flight = Flight;
 
+    /// The tokens Vulkan's served loads are asked ([`crate::FIRE`]).
+    const ROWS_TOP: u32 = crate::FIRE.1;
+
     type Keep = crate::record::Key;
 
     const FUSIONS: &'static [poem_compiler::fuse::Rule] = &crate::FUSIONS;
@@ -324,6 +327,15 @@ impl Serve for Api {
             Api::harvest_one(shell)?;
         }
         Ok(())
+    }
+
+    fn wait_flown(shell: &Shell<Api>) -> Result<bool> {
+        // Each step's fence: the landing copy is inside its submission, so
+        // the device is done with the step when it signals.
+        for flight in &shell.inflight {
+            flight.api.pending.wait()?;
+        }
+        Ok(true)
     }
 
     fn harvest_one(shell: &mut Shell<Api>) -> Result<()> {

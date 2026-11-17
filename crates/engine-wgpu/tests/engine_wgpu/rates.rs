@@ -30,16 +30,18 @@ fn the_micro_fires_state_rates_and_the_ruling_picks_by_them() {
     assert!(launch > 0);
     // The grid at every row and depth of the lattice, the attention and
     // scan rates.
-    let grid = rates.bf16_flops_per_ns_by_rows_and_depth.clone().unwrap();
+    let grid = rates.bf16_flops_per_ns_by_rows_n_k.clone().unwrap();
     assert_eq!(
         grid.len(),
-        engine::rates::LATTICE_ROWS.len() * engine::rates::DEPTHS.len()
+        <engine_wgpu::device::Api as engine_gpu::serve::Serve>::rung_lattice().len()
+            * engine::rates::DEPTHS.len()
+            * engine::rates::DEPTHS.len()
     );
-    assert_eq!(profile::fire::grid(grid.clone()), Some(grid.clone()));
+    assert_eq!(profile::fire::gemm_grid(grid.clone()), Some(grid.clone()));
     eprintln!("grid {grid:?}");
     for rate in [
         rates.attn_at(2048, 128).unwrap(),
-        rates.scan_elements_per_ns.unwrap(),
+        rates.scan_at(2048).unwrap(),
     ] {
         assert!((1.0..1e6).contains(&rate), "{rate}");
     }

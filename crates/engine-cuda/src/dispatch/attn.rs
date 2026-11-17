@@ -169,7 +169,7 @@ impl Run<'_> {
                     debug_assert_eq!(seat.live.rows, self.total_tokens());
                     match self.declared(*plan) {
                         StructKind::AttnPrefillPlan => {
-                            let built = plan::plan_prefill(
+                            let mut built = plan::plan_prefill(
                                 self.qo_indptr_host(),
                                 seat.kv_indptr,
                                 seat.kv_len,
@@ -184,6 +184,7 @@ impl Run<'_> {
                                 fire.toggles,
                                 seat.workspace,
                             )?;
+                            built.mask_origin = self.mask_origin();
                             if let Some(wanted) = crate::serve::diag::on().plan_trace.as_deref()
                                 && (wanted == "all" || wanted == seat.rows.to_string())
                             {

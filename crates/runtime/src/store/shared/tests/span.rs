@@ -29,12 +29,16 @@ impl Mover for Lane {
     }
 }
 
-/// A pool whose engine is told rungs, as it loads: at the smallest rung,
-/// its span backed.
+/// A pool whose engine is told rungs, its span backed, lowered from the
+/// top rung it loads at to the smallest (as yield's walk leaves it), the
+/// engine told.
 fn loaded_told() -> (SharedPool, FakeEngine) {
     let mut facts = facts();
     facts.tells_rungs = true;
-    (SharedPool::new(&facts, 256).unwrap(), FakeEngine::new())
+    let mut pool = SharedPool::new(&facts, 256).unwrap();
+    assert_eq!(pool.rung(), 2048, "it loads at the top rung");
+    assert_eq!(pool.lower_rung(16).unwrap(), Some((2048, 16)));
+    (pool, FakeEngine::new())
 }
 
 /// [`loaded_told`] raised to the largest rung, as a first wide pass takes
@@ -110,7 +114,9 @@ fn the_span_is_backed_at_load_on_every_engine() {
         assert_eq!(pool.pool().span_segments(), 2);
         assert_eq!(pool.pool().span_to_regrow(), None);
         assert_eq!(pool.mapped_segments(), 4, "the loaded prefix and the span");
-        assert_eq!(pool.rung(), if tells { 16 } else { 2048 });
+        assert_eq!(pool.rung(), 2048, "the top rung, told rungs or not");
+        assert_eq!(pool.told(), 2048);
+        assert_eq!(pool.start_cap(), u32::MAX);
         pool.pool().check();
     }
 }
@@ -371,12 +377,12 @@ fn a_lower_notice_comes_after_the_retire_fence() {
     assert_eq!(pool.lower_rung(256).unwrap(), Some((2048, 256)));
 }
 
-/// A pool whose engine is told rungs starts at the smallest rung, the one
-/// the engine lays its fires by at load, fires cut to it. A first wider pass does not widen fires in
-/// place: the raise reaches the engine (`set_rung`) first, and only then is
-/// the cap lifted for the pass's fire.
+/// A pool whose engine is told rungs, lowered to the smallest rung, fires
+/// cut to it. A wider pass does not widen fires in place: the raise reaches
+/// the engine (`set_rung`) first, and only then is the cap lifted for the
+/// pass's fire.
 #[tokio::test(flavor = "current_thread")]
-async fn an_engine_told_rungs_starts_at_the_smallest_rung_and_raises_through_the_engine() {
+async fn an_engine_told_rungs_raises_through_the_engine() {
     const ENGINE: usize = 56;
     let (pool, mut engine) = loaded_told();
     assert_eq!(pool.rung(), 16, "the floor rung");
@@ -432,7 +438,10 @@ fn fine_told() -> (SharedPool, FakeEngine) {
     let mut facts = facts();
     facts.tells_rungs = true;
     facts.act_chunks = (0..12).map(|k| (1u32 << k, 1 + k)).collect();
-    (SharedPool::new(&facts, 256).unwrap(), FakeEngine::new())
+    let mut pool = SharedPool::new(&facts, 256).unwrap();
+    // Lowered from the top rung it loads at, as yield's walk leaves it.
+    assert_eq!(pool.lower_rung(1).unwrap(), Some((2048, 1)));
+    (pool, FakeEngine::new())
 }
 
 /// Mac's footprint at rest: on an on-demand pool with one live lane, a
@@ -683,9 +692,11 @@ async fn an_engine_told_rungs_on_a_span_backed_at_load_hears_each_rung_and_nothi
     facts.tells_rungs = true;
     let mut pool = SharedPool::new(&facts, 256).unwrap();
     assert!(pool.tells_rungs(), "its own fact, the span backed at load");
-    assert_eq!(pool.rung(), 16, "it starts at the smallest rung");
-    assert_eq!(pool.told(), 16);
-    assert_eq!(pool.start_cap(), 16, "fires start cut to it");
+    assert_eq!(pool.rung(), 2048, "it starts at the top rung");
+    assert_eq!(pool.told(), 2048);
+    assert_eq!(pool.start_cap(), u32::MAX, "fires start uncut");
+    // Lowered to the smallest, as yield's walk leaves it: the engine told.
+    assert_eq!(pool.lower_rung(16).unwrap(), Some((2048, 16)));
     let mut engine = FakeEngine::new();
     assert_eq!(
         walk_segments(&mut pool, 8, 0, &mut engine),

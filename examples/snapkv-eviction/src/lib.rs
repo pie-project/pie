@@ -155,20 +155,17 @@ async fn main(input: Input) -> Result<Output> {
     // Freezes the haystack but buffers the question's rows: the answer below writes them again.
     let toks_p = Channel::from(&prompt_i32[..]);
     let embed_indptr_p = Channel::from([0u32, n]);
-    let fold_p = Channel::from([ask_at]);
     let tok_out_p = Channel::new([1], dtype::i32);
     let page_mass_out = Channel::new([p_max], dtype::f32);
     let total_out = Channel::new([1], dtype::f32);
 
     let fwd_p = ForwardPass::new();
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
-    fwd_p.state(
-        &[&ws],
-        StateGeometry {
-            fold: Fold::Count(&fold_p),
-            ..StateGeometry::default()
-        },
-    )?;
+    // The haystack stays unfolded: the question's mask hides the rows it does
+    // not keep, and a mask speaks only of the rows past the set's committed
+    // boundary (column `c` is slot `folded + c`). Unfolded, the boundary
+    // stays 0 and the columns are slots.
+    fwd_p.state(&[&ws], StateGeometry::default())?;
     fwd_p.epilogue(move || {
         let logits = intrinsics::output(0, "logits");
         tok_out_p.put(reduce_argmax(logits));

@@ -46,6 +46,13 @@ pub struct TuneRequest<'a> {
     pub check_estimate: bool,
     /// Run the `[rates]` step alone: the device's rates measured on it.
     pub rates: bool,
+    /// Time only the dense GEMM tactics the checked models' served loads
+    /// arm, with no profile search (CUDA).
+    pub gemm_only: bool,
+    /// The engine boot and load request `pie serve` makes for an artifact,
+    /// which the tune loads to time the GEMM products serving runs.
+    #[cfg(feature = "engine-cuda")]
+    pub served_cuda: engine_cuda::tune::Served<'a>,
 }
 
 /// What a tune produced.
@@ -83,6 +90,14 @@ fn pick_models(
     }
     let found = artifacts(req.artifacts, backend);
     if req.check.is_empty() {
+        if found.is_empty() && req.check_estimate {
+            return Err(format!(
+                "a check of the estimate needs a model stamped for {backend}, and none under {} \
+                 is; make one with the import `pie serve` runs, `pie model import <its source, \
+                 e.g. Qwen/Qwen3-0.6B>`",
+                req.artifacts.display()
+            ));
+        }
         return Ok(found.into_iter().take(1).collect());
     }
     let mut picked = Vec::new();
@@ -90,14 +105,18 @@ fn pick_models(
         let hit = found
             .iter()
             .find(|(path, d)| {
-                d == name || d.contains(name.as_str()) || path.to_string_lossy().contains(name.as_str())
+                d == name
+                    || d.contains(name.as_str())
+                    || path.to_string_lossy().contains(name.as_str())
             })
             .ok_or_else(|| {
                 let have: Vec<&str> = found.iter().map(|(_, d)| d.as_str()).collect();
                 format!(
-                    "no stamped artifact for this backend matches `{name}` (servable here: {have:?}); \
-                     `pie model list` marks the rest unstamped, which an import from this \
-                     pie restamps: `pie model import <source>`"
+                    "the check of `{name}` needs its artifact stamped for {backend}, and none \
+                     under {} is (stamped for {backend} here: {have:?}); make it with the import \
+                     `pie serve` runs, `pie model import <its source, e.g. Qwen/Qwen3-0.6B>`, \
+                     which also restamps one another pie imported",
+                    req.artifacts.display()
                 )
             })?;
         picked.push(hit.clone());
@@ -165,11 +184,28 @@ macro_rules! tuned {
     };
 }
 
+/// `--gemm-only` times CUDA's dense GEMM tactics: refused by name on a
+/// backend that has none.
+#[cfg(any(
+    feature = "vulkan",
+    feature = "wgpu",
+    all(feature = "metal", target_vendor = "apple")
+))]
+fn no_gemm_only(req: &TuneRequest<'_>, backend: &str) -> Result<(), String> {
+    if req.gemm_only {
+        return Err(format!(
+            "--gemm-only times CUDA's dense GEMM tactics; {backend} has none to time"
+        ));
+    }
+    Ok(())
+}
+
 /// `pie tune` on Vulkan: the kernel grid and the search, then the
 /// `[fire_ns]` step (or that step alone).
 #[cfg(feature = "vulkan")]
 fn tune_vulkan(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String> {
     use engine_vulkan::tune::{Depth, Steps, run};
+    no_gemm_only(req, "vulkan")?;
     let depth = if req.full { Depth::Full } else { Depth::Quick };
     let models = pick_models("vulkan", req)?;
     let out = run(
@@ -192,6 +228,7 @@ fn tune_vulkan(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 fn tune_metal(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String> {
     use engine_metal::tune::{Depth, check_estimate, rates, run};
+    no_gemm_only(req, "metal")?;
     if req.rates && !req.check_estimate {
         let out = rates(Some(req.profiles), say)?;
         return Ok(tuned!(out, wrong: out.wrong));
@@ -202,13 +239,21 @@ fn tune_metal(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned,
         return Ok(tuned!(out, wrong: out.wrong));
     }
     let depth = if req.full { Depth::Full } else { Depth::Quick };
-    let out = run(depth, Some(req.profiles), req.cache, req.refit, &models, say)?;
+    let out = run(
+        depth,
+        Some(req.profiles),
+        req.cache,
+        req.refit,
+        &models,
+        say,
+    )?;
     Ok(tuned!(out, wrong: out.wrong))
 }
 
 /// `pie tune wgpu`: the `[rates]` step alone.
 #[cfg(feature = "wgpu")]
 fn tune_wgpu(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String> {
+    no_gemm_only(req, "wgpu")?;
     if !req.rates || req.check_estimate {
         return Err("`pie tune wgpu` measures the device's rates alone: pass --rates".to_string());
     }
@@ -241,7 +286,24 @@ fn tune_cuda(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, 
         });
     }
     let models = pick_models("cuda", req)?;
-    let out = engine_cuda::tune::run(Some(req.profiles), &models, req.check_estimate, say)?;
+    let out = if req.gemm_only {
+        engine_cuda::tune::gemm_only(
+            Some(req.profiles),
+            &models,
+            req.served_cuda,
+            crate::engine::load::contract_for,
+            say,
+        )?
+    } else {
+        engine_cuda::tune::run(
+            Some(req.profiles),
+            &models,
+            req.check_estimate,
+            req.served_cuda,
+            crate::engine::load::contract_for,
+            say,
+        )?
+    };
     Ok(tuned!(out, wrong: Vec::new()))
 }
 

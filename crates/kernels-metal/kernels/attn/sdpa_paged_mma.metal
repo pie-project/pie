@@ -39,7 +39,7 @@ inline void sdpa_paged_mma_body(
     const float scale,
     const device uchar* attention_mask,
     const uint attention_mask_stride,
-    const device uchar* attention_mask_enabled,
+    const device uint* attention_mask_enabled,
     const int window,
     const int n_rows,
     device float* lse,
@@ -97,7 +97,7 @@ inline void sdpa_paged_mma_body(
   const int q_pos    = live ? position_ids[my_row] : 0;
   const int my_start = (window > 0 && q_pos >= window) ? (q_pos - window + 1) : 0;
 
-  const int mask_word = live ? int(attention_mask_enabled[my_row]) : 0;
+  const int mask_word = live ? int((attention_mask_enabled[my_row] & 3u)) : 0;
   const bool masked  = mask_word != 0;
   const bool wide    = mask_word == 2;
 
@@ -120,7 +120,7 @@ inline void sdpa_paged_mma_body(
       const int p = position_ids[row_lo + i];
       kp_hi = max(kp_hi, p);
       kp_lo = min(kp_lo, (window > 0 && p >= window) ? (p - window + 1) : 0);
-      wide_here = wide_here || attention_mask_enabled[row_lo + i] == 2;
+      wide_here = wide_here || (attention_mask_enabled[row_lo + i] & 3u) == 2;
     }
     const int page_base = int(kv_page_indptr[r]);
 
@@ -176,8 +176,9 @@ inline void sdpa_paged_mma_body(
             const int kp = base + kk;
             keep = (wide || kp <= q_pos) && kp >= my_start;
             if (keep && masked) {
-              keep = !(uint(kp) >= attention_mask_stride ||
-                       attention_mask[size_t(my_row) * attention_mask_stride + uint(kp)] == 0);
+              keep = pie_mask_admits(attention_mask, attention_mask_stride,
+                                     attention_mask_enabled[my_row] >> 2, uint(my_row),
+                                     uint(kp));
             }
           }
           const float s = keep ? float(e[j]) : NEG_INF;
@@ -261,7 +262,7 @@ template <typename T, int D, int KT>
     const constant float& scale                [[buffer(11)]],
     const device uchar* attention_mask         [[buffer(12)]],
     const device uint& attention_mask_stride   [[buffer(13)]],
-    const device uchar* attention_mask_enabled [[buffer(14)]],
+    const device uint* attention_mask_enabled [[buffer(14)]],
     const constant int& window                 [[buffer(15)]],
     const device T* sinks                      [[buffer(16)]],
     const constant int& n_rows                 [[buffer(17)]],
@@ -301,7 +302,7 @@ template <typename T, int D, int KT>
     const constant float& scale                [[buffer(11)]],
     const device uchar* attention_mask         [[buffer(12)]],
     const device uint& attention_mask_stride   [[buffer(13)]],
-    const device uchar* attention_mask_enabled [[buffer(14)]],
+    const device uint* attention_mask_enabled [[buffer(14)]],
     const constant int& window                 [[buffer(15)]],
     const device T* sinks                      [[buffer(16)]],
     const constant int& n_rows                 [[buffer(17)]],
@@ -333,7 +334,7 @@ template <typename T, int D, int KT>
       device itype*, const constant int&, const device int*,                 \
       const device int*, const device uint*, const device uint*,             \
       const constant int&, const constant int&, const constant float&,       \
-      const device uchar*, const device uint&, const device uchar*,          \
+      const device uchar*, const device uint&, const device uint*,          \
       const constant int&, const device itype*, const constant int&,         \
       PIE_KV_LAYOUT_TYPES uint3, uint3, uint, uint);
 
@@ -346,7 +347,7 @@ instantiate_sdpa_paged_mma(bfloat16, bfloat, 64, 16)
       device itype*, const constant int&, const device int*,                 \
       const device int*, const device uint*, const device uint*,             \
       const constant int&, const constant int&, const constant float&,       \
-      const device uchar*, const device uint&, const device uchar*,          \
+      const device uchar*, const device uint&, const device uint*,          \
       const constant int&, const device itype*, const constant int&,         \
       device float*, PIE_KV_LAYOUT_TYPES uint3, uint3, uint, uint);
 
@@ -432,7 +433,7 @@ inline void sdpa_paged_mma_wide_body(
     const float scale,
     const device uchar* attention_mask,
     const uint attention_mask_stride,
-    const device uchar* attention_mask_enabled,
+    const device uint* attention_mask_enabled,
     const int window,
     const int n_rows,
     device float* lse,
@@ -503,7 +504,7 @@ inline void sdpa_paged_mma_wide_body(
   const int q_pos    = live ? position_ids[my_row] : 0;
   const int my_start = (window > 0 && q_pos >= window) ? (q_pos - window + 1) : 0;
 
-  const int mask_word = live ? int(attention_mask_enabled[my_row]) : 0;
+  const int mask_word = live ? int((attention_mask_enabled[my_row] & 3u)) : 0;
   const bool masked  = mask_word != 0;
   const bool wide    = mask_word == 2;
 
@@ -529,7 +530,7 @@ inline void sdpa_paged_mma_wide_body(
       const int p = position_ids[row_lo + i];
       kp_hi = max(kp_hi, p);
       kp_lo = min(kp_lo, (window > 0 && p >= window) ? (p - window + 1) : 0);
-      wide_here = wide_here || attention_mask_enabled[row_lo + i] == 2;
+      wide_here = wide_here || (attention_mask_enabled[row_lo + i] & 3u) == 2;
     }
     const int page_base = int(kv_page_indptr[r]);
     if (wide_here) {
@@ -621,8 +622,9 @@ inline void sdpa_paged_mma_wide_body(
             const int kp = base + kk;
             keep = (wide || kp <= q_pos) && kp >= my_start;
             if (keep && masked) {
-              keep = !(uint(kp) >= attention_mask_stride ||
-                       attention_mask[size_t(my_row) * attention_mask_stride + uint(kp)] == 0);
+              keep = pie_mask_admits(attention_mask, attention_mask_stride,
+                                     attention_mask_enabled[my_row] >> 2, uint(my_row),
+                                     uint(kp));
             }
           }
           if (!keep) sv[c * 2 + j] = NEG_INF;
@@ -717,7 +719,7 @@ inline void sdpa_paged_mma_wide_body(
     const constant float& scale                [[buffer(11)]],               \
     const device uchar* attention_mask         [[buffer(12)]],               \
     const device uint& attention_mask_stride   [[buffer(13)]],               \
-    const device uchar* attention_mask_enabled [[buffer(14)]],               \
+    const device uint* attention_mask_enabled [[buffer(14)]],               \
     const constant int& window                 [[buffer(15)]],               \
     const device itype* sinks                  [[buffer(16)]],               \
     const constant int& n_rows                 [[buffer(17)]]
@@ -768,7 +770,7 @@ template <typename T, int D>
       device itype*, const constant int&, const device int*,                 \
       const device int*, const device uint*, const device uint*,             \
       const constant int&, const constant int&, const constant float&,       \
-      const device uchar*, const device uint&, const device uchar*,          \
+      const device uchar*, const device uint&, const device uint*,          \
       const constant int&, const device itype*, const constant int&
 
 #define instantiate_sdpa_paged_mma_wide(name, itype, d)                       \

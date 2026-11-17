@@ -1180,10 +1180,13 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
         &mut self,
         place: &engine_gpu::program::Place<'_, crate::device::Api>,
     ) -> Result<(), Refusal> {
-        let widen = crate::guest::widen::Widen::new(place.device).map_err(|why| {
-            Refusal::Program(format!("the readout widen did not build: {why}"))
-        })?;
-        self.widen = Some(Arc::new(widen));
+        #[cfg(feature = "wgpu")]
+        {
+            let widen = crate::guest::widen::Widen::new(place.device).map_err(|why| {
+                Refusal::Program(format!("the readout widen did not build: {why}"))
+            })?;
+            self.widen = Some(Arc::new(widen));
+        }
         self.ring = Some(
             crate::guest::session::Ring::lay(place.device, place.io).map_err(|why| {
                 Refusal::Program(format!("the guest staging ring was not laid: {why}"))

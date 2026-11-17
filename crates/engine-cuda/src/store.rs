@@ -3723,10 +3723,11 @@ impl Pools {
         // Where the fit keeps chunks back, only the segments wholly under
         // them: the last the fitted chunks reach into would back some of
         // what is kept.
+        let fitted_end = u64::from(self.chunks.ids_for(fitted));
         let segments = if stated > fitted {
-            self.chunks.segments_under(u64::from(fitted))
+            self.chunks.segments_under(fitted_end)
         } else {
-            self.chunks.segments_for(u64::from(fitted))
+            self.chunks.segments_for(fitted_end)
         };
         // The fit that sized these chunks ran in this same step of the
         // load, so the card holds them: a refusal here is a fit that

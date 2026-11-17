@@ -1118,7 +1118,9 @@ impl SchedulerHandle {
                 )
                 .await
                 .map_err(|why| {
-                    anyhow!("pipeline: a program's standing bytes need a wider activation span: {why}")
+                    anyhow!(
+                        "pipeline: a program's standing bytes need a wider activation span: {why}"
+                    )
                 })?;
                 Some(open)
             }
@@ -1171,8 +1173,42 @@ impl SchedulerHandle {
             )
             .await
         };
-        let (registered, _, bound) =
-            crate::store::roles::bind_when_resident(pid, lane_bind, resident, grown).await?;
+        // Short of room the budget holds, with no segment left to commit,
+        // it waits for room given back (a process completing, or parked),
+        // as an admission waits on pages, never refused for it.
+        let room = || {
+            crate::store::registry::try_get(0, engine)
+                .and_then(|stores| stores.roles)
+                .map(|roles| roles.lock().unwrap().room_watch())
+        };
+        // Holding guest state of its own, it is suspended instead: waiting,
+        // it would hold room its own bind lacks.
+        let suspend = || {
+            let holds = crate::store::registry::try_get(0, engine)
+                .and_then(|stores| stores.roles)
+                .is_some_and(|roles| roles.lock().unwrap().holds_guest_state(pid));
+            holds
+                && crate::planner::planner_of(pid)
+                    .is_some_and(|planner| planner.suspend_for_room(pid))
+        };
+        // Waiting, it is a waiter in the planner's queue: idle cache goes
+        // first, then a resident is parked for it, as for a restore short
+        // of room for its roles.
+        let planned = |run: u32, pieces: u32| async move {
+            let planner = crate::planner::planner_of(pid)
+                .ok_or_else(|| "its process has no planner".to_string())?;
+            crate::inferlet::process::said(
+                "bind: room for its guest state",
+                pid,
+                planner.wait_bind_room(pid, run, pieces),
+            )
+            .await
+            .map_err(|why| why.to_string())
+        };
+        let (registered, _, bound) = crate::store::roles::bind_when_resident(
+            pid, lane_bind, resident, grown, room, suspend, planned,
+        )
+        .await?;
         Ok((registered, bound))
     }
 

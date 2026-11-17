@@ -12,7 +12,7 @@ device = "NVIDIA RTX PRO 4500 Blackwell"
 # Coopmat, 26.2 TFLOPS; the 256 MiB copy 813 GB/s; the launch a dispatch's
 # own cost inside a recorded frame (1024 of the narrowest matmul against
 # one, in-graph), 3.57 us.
-bf16_flops_per_ns_by_rows_and_depth = [[4096, 4096, 26200.0]]
+bf16_flops_per_ns_by_rows_n_k = [[4096, 4096, 4096, 26200.0]]
 bytes_per_ns = 813.0
 launch_ns = 3573
 # Vendor peaks, bounds and not rates: dense bf16 about 202 TFLOPS (NVIDIA

@@ -202,7 +202,7 @@ fn tiled_launch(
             ),
         ));
     }
-    let cus = ctx.multiprocessors().unwrap_or(304).max(1);
+    let cus = ctx.multiprocessors(op)?;
     let blocks = y.rows.div_ceil(m) * n.div_ceil(tile_n);
     let split = GemmSplit::plan(ctx, op, y.rows, n, k, blocks, cus)?;
     ctx.fire(
@@ -258,10 +258,8 @@ pub const GEMV_ROWS: u32 = 16;
 
 /// Split-K depth for `rows` x `n`: aims for `kernel.qmm.split_warps_per_sm`
 /// warps on every SM, capped by the thin (8 rows or fewer) or wide maximum.
-fn carve_for(n: u32, rows: u32, ctx: &Ctx) -> Carve {
+fn carve_for(n: u32, rows: u32, ctx: &Ctx, sms: u32) -> Carve {
     let tuning = ctx.tuning();
-    // A context that cannot say its SM count aims as an L40S would.
-    let sms = ctx.multiprocessors().unwrap_or(142);
     // The knob counts 32-lane warps; a 64-lane wavefront is two.
     let warps = (sms.saturating_mul(tuning.qmm_split_warps_per_sm) / 2).max(1);
     let bands = n.div_ceil(BAND);
@@ -305,7 +303,7 @@ pub fn matmul_gemv(
         scales,
         biases,
         y,
-        carve_for(y.width, y.rows, ctx),
+        carve_for(y.width, y.rows, ctx, ctx.multiprocessors("linear.matmul")?),
     )
 }
 
@@ -325,7 +323,7 @@ pub fn lm_head_gemv(
         scales,
         biases,
         y,
-        carve_for(y.width, y.rows, ctx),
+        carve_for(y.width, y.rows, ctx, ctx.multiprocessors("linear.matmul")?),
     )
 }
 

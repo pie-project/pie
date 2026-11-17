@@ -16,21 +16,22 @@ pub struct Outcome {
 /// Measure the first adapter's rates and lay them over the profile it runs.
 pub fn rates(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Outcome, String> {
     let began = Instant::now();
-    let device =
-        crate::device::Context::bind(&crate::api::DeviceBoot::default(), engine::Allowance::WHOLE)
-            .map_err(|e| e.to_string())?;
+    // The step's device takes what its own fires lay, no load's budget.
+    let device = crate::device::Context::bind(
+        &crate::api::DeviceBoot::default(),
+        engine::Allowance {
+            budget: Some(engine::rates::step_bytes(crate::FIRE.1)),
+        },
+    )
+    .map_err(|e| e.to_string())?;
     let chip = device.chip();
     let (base, report) = crate::chip::resolve(&chip, profiles);
     say(&format!("{}: starting from {}", chip.name, report.used));
     let tuning = crate::tuning::Tuning::new(base.clone(), device.cores());
-    let r = crate::rates::measure(&device, &tuning).map_err(|e| e.to_string())?;
-    for &(m, k, rate) in r
-        .bf16_flops_per_ns_by_rows_and_depth
-        .as_deref()
-        .unwrap_or(&[])
-    {
+    let r = crate::rates::measure_saying(&device, &tuning, say).map_err(|e| e.to_string())?;
+    for &(m, n, k, rate) in r.bf16_flops_per_ns_by_rows_n_k.as_deref().unwrap_or(&[]) {
         say(&format!(
-            "[rates]: matmul m {m:>5} k {k:>5}: {:6.1} TFLOP/s",
+            "[rates]: matmul m {m:>5} n {n:>5} k {k:>5}: {:.4} TFLOP/s",
             rate / 1e3
         ));
     }
@@ -38,7 +39,7 @@ pub fn rates(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Outco
         "[rates]: attention {:.1} TFLOP/s, scan {:.2} G state elements/s, {:.0} GB/s, launch \
          {:.2} us",
         r.attn_at(16384, 128).unwrap_or(0.0) / 1e3,
-        r.scan_elements_per_ns.unwrap_or(0.0),
+        r.scan_at(2048).unwrap_or(0.0),
         r.bytes_per_ns.unwrap_or(0.0),
         r.launch_ns.unwrap_or(0) as f64 / 1e3
     ));

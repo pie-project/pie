@@ -117,6 +117,11 @@ pub struct Shell {
     adapters: crate::blob::Adapters,
     held: Vec<u32>,
     readout_rows: crate::device::Buffer,
+    /// The run a fire stages a host-resident bank's experts in, bounded at
+    /// load and laid with the staged inputs (`experts::staging`).
+    expert_staging: crate::experts::staging::Staging,
+    /// Where it lies once laid; `None` where the load stages none.
+    expert_staged: Option<crate::experts::staging::Staged>,
     exports: Exports,
     graphs: Graphs,
     copies: bool,
@@ -1090,6 +1095,33 @@ impl Shell {
         let mut settled = FrameShell::settle(self, enqueued)?;
         Shell::read_out(self, &mut settled)?;
         Ok(std::mem::take(&mut settled.pixels))
+    }
+
+    /// [`Shell::fire`] of text lanes timed to its landing: the time from
+    /// its preparation to the device's last work done, its logits read back
+    /// after (`pie tune --check-estimate`'s fire).
+    pub fn fire_landed(
+        &mut self,
+        lanes: &[Lane<'_>],
+    ) -> Result<(std::time::Duration, Vec<Vec<f32>>)> {
+        let seated: Vec<Seated<'_>> = lanes.iter().copied().map(Seated::of).collect();
+        let began = std::time::Instant::now();
+        let prepared = FrameShell::prepare(
+            self,
+            StepView {
+                lanes: &seated,
+                attachments: &[],
+                media: &[],
+                voxels: &[],
+            },
+            None,
+        )?;
+        let enqueued = FrameShell::enqueue(self, prepared)?;
+        let mut settled = FrameShell::settle(self, enqueued)?;
+        self.device.synchronize()?;
+        let landed = began.elapsed();
+        Shell::read_out(self, &mut settled)?;
+        Ok((landed, std::mem::take(&mut settled.logits)))
     }
 
     pub fn fire_media(

@@ -151,6 +151,10 @@ pub struct PrefillPlan {
     pub graph_capturable: bool,
     pub graph_refusal: Option<String>,
     pub mask_indptr: Option<Tensor>,
+    /// Per request its mask word (`kernels_cuda`'s `PrefillPlan::mask_origin`):
+    /// the engine binds it beside `mask_indptr`; ROCm's paged prefill takes
+    /// no mask, so nothing here reads it.
+    pub mask_origin: Option<Tensor>,
     pub device: Device,
 }
 
@@ -433,6 +437,7 @@ pub fn plan_prefill(
         graph_capturable: capturable,
         graph_refusal,
         mask_indptr,
+        mask_origin: None,
         device: *device,
     })
 }

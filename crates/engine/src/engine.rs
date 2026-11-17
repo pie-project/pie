@@ -266,7 +266,7 @@ pub trait Engine: Send {
     }
 
     /// The activation rung moves from `from`, the rung the engine was last
-    /// told (the smallest, from the load), to `to` tokens; only where
+    /// told (the largest, from the load), to `to` tokens; only where
     /// [`crate::chunk::ChunkFacts::tells_rungs`], through the lane, never
     /// on a fire's path, and only where the two differ. A raise
     /// (`to > from`) comes before any fire of the wider rung: the engine

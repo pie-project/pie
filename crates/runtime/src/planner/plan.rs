@@ -5,6 +5,7 @@ use tokio::sync::Notify;
 
 use super::grant::{AllocationGrant, Demand, DevicePageReservation, RsSlotReservation};
 use super::holdings::{swapped_page_count, swapped_rs_units};
+use super::inner::RestoreGate;
 use super::proc::Residency;
 use super::wait::{EntryKey, WaitKind, Waiter};
 use super::{ProcessId, ResidencyPlanner, exec};
@@ -38,6 +39,15 @@ enum Step {
     ServeRestore {
         key: EntryKey,
         pid: ProcessId,
+    },
+    /// The head is a restore whose role slots found no room, and nothing
+    /// else will free any: a resident process is evicted for it.
+    EvictForRoles,
+    /// The head is a bind short of device room for its guest state.
+    BindRoom {
+        key: EntryKey,
+        run: u32,
+        pieces: u32,
     },
     Release(DevicePageReservation),
     Done,
@@ -112,11 +122,14 @@ impl ResidencyPlanner {
                     }
                     return Step::Done;
                 };
+                if let WaitKind::BindRoom { run, pieces, .. } = waiter.kind {
+                    return Step::BindRoom { key, run, pieces };
+                }
                 let is_restore = matches!(waiter.kind, WaitKind::Restore { .. });
                 let pid = waiter.pid;
                 let demand = match &waiter.kind {
                     WaitKind::Allocation { demand, .. } => Some(*demand),
-                    WaitKind::Restore { .. } => None,
+                    WaitKind::Restore { .. } | WaitKind::BindRoom { .. } => None,
                 };
                 let missing = waiter.kv_need().saturating_sub(inner.accum.len() as u32);
                 if missing > 0 {
@@ -142,24 +155,43 @@ impl ResidencyPlanner {
                     Some(_) => Step::ServeAllocationBurst {
                         extra: inner.burst_shortfall(),
                     },
-                    None => {
-                        // A restore goes back once a resident process has
-                        // finished (its credit), or the fleet can do nothing
-                        // else, or the device has room for it and still a
-                        // page for each resident lane's next one: suspended
-                        // processes come back as soon as room appears, every
-                        // one it holds at once, not one a completion.
-                        if inner.completion_credit > 0 {
-                            inner.completion_credit -= 1;
-                        } else if spare < inner.growth_reserve() && !inner.fleet_stalled() {
-                            return Step::Done;
-                        }
-                        Step::ServeRestore { key, pid }
-                    }
+                    None => match inner.restore_gate(pid, spare) {
+                        RestoreGate::Serve => Step::ServeRestore { key, pid },
+                        RestoreGate::Wait => Step::Done,
+                        RestoreGate::Evict => Step::EvictForRoles,
+                    },
                 }
             });
             let fund_by_eviction = match step {
                 Step::Done => return false,
+                Step::BindRoom { key, run, pieces } => {
+                    // Its runs stand free: the bind takes them.
+                    if self.port.guest_room_free(run, pieces) {
+                        self.serve_bind_room(key);
+                        continue;
+                    }
+                    // As a restore short of room for its roles: idle cache
+                    // first, one set or a sweep, and it looks again in what
+                    // that left; then, the fleet stalled, a resident is
+                    // parked for it by the planner's victim choice.
+                    if self.reclaim_idle_once() || self.sweep_stranded(u32::MAX, false) {
+                        continue;
+                    }
+                    if !self.with_inner(|inner| inner.fleet_stalled()) {
+                        return false;
+                    }
+                    true
+                }
+                Step::EvictForRoles => {
+                    // Idle cache holds chunks too: one set goes, and the
+                    // restore tries again in what it left, before any
+                    // resident moves for it.
+                    if self.reclaim_idle_once() || self.sweep_stranded(u32::MAX, false) {
+                        self.with_inner(|inner| inner.roles_retry_head());
+                        continue;
+                    }
+                    true
+                }
                 Step::Release(stranded) => {
                     drop(stranded);
                     return false;

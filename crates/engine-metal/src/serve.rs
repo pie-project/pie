@@ -170,6 +170,9 @@ pub struct Seated<'a> {
     pub inputs: &'a [engine::fire::InputFeed],
     pub pages: &'a [u32],
     pub held: Option<u32>,
+    /// The set's committed boundary (`KvDelta::folded`): the lane's mask
+    /// speaks of the keys from it on.
+    pub folded: u32,
     pub mask: Option<&'a Masking>,
     /// A lane with no KV of its own: its mask is over its attention group.
     pub kv_less: bool,
@@ -214,6 +217,7 @@ impl<'a> Seated<'a> {
             inputs: &[],
             pages: &[],
             held: None,
+            folded: 0,
             mask: None,
             kv_less: false,
             adapter: None,
@@ -1454,11 +1458,11 @@ impl PreparedLoad<'_> {
         }
         // The span is mapped untouched; the kernel scratch plane is the one
         // part a kernel reads before it writes.
-        // The smallest rung's fire is backed from the load, so a raise the
-        // system refuses always has a rung in hand to cut back to.
-        pools.cover(arena.floor_reach())?;
-        // Every rung's staged regions laid in the span; the floor's hosted,
-        // where frames stage until the runtime raises.
+        // The largest rung's fire is backed from the load: the shell stands
+        // at it from ready, as the runtime's pool starts.
+        pools.cover(arena.top_reach())?;
+        // Every rung's staged regions laid in the span; the largest's
+        // hosted, where frames stage until the runtime lowers.
         for (index, (inputs, readout)) in inputs.iter_mut().zip(&mut readout).enumerate() {
             for (arm, (inputs, readout)) in inputs.iter_mut().zip(readout.iter_mut()).enumerate() {
                 let ((inputs_at, _), (readout_at, _)) = arena.regions(index, arm as u64);
@@ -1550,10 +1554,10 @@ impl PreparedLoad<'_> {
             budgets,
             ane,
             weights,
-            rung: arena.floor_tokens(),
+            rung: arena.top_tokens(),
             warming: false,
             frozen_ahead: std::collections::HashMap::new(),
-            batch_bottom: arena.rung_guest_top(arena.floor_tokens()),
+            batch_bottom: arena.rung_guest_top(arena.top_tokens()),
             arena,
             pools,
             rs_layout,
@@ -1604,7 +1608,7 @@ impl PreparedLoad<'_> {
                 "metal: the widest rung's recurrent scratch"
             );
         }
-        // The span is backed whole, yet the shell stands at the smallest rung
+        // The span is backed whole, and the shell stands at the largest rung
         // as the runtime's pool starts it: the runtime still tells every rung
         // change (`tells_rungs`), so a guest fire runs at the
         // widest rung whose carve and term fit the span. A change then moves
@@ -1941,13 +1945,6 @@ impl Shell {
         self.pools.span_heaps_made()
     }
 
-    /// Raises the rung to the widest, backing its carve: what a caller that
-    /// fires this shell itself, with no runtime raising the rung, asks
-    /// first (tuning, the tests).
-    pub fn raise_whole(&mut self) -> Result<()> {
-        self.set_rung(0, u32::MAX)
-    }
-
     /// See `Engine::release_span`: every frame drains first.
     #[allow(unsafe_code)]
     pub fn release_span(&mut self, segments: u32) -> Result<()> {
@@ -2225,6 +2222,7 @@ impl Shell {
                         base: 0,
                         folded: 0,
                         fold: engine::fire::FoldLen::Host(0),
+                        lineage: engine::fire::Lineage::Set,
                     },
                     0,
                 ),
@@ -2234,6 +2232,7 @@ impl Shell {
                         base: 0,
                         folded: 0,
                         fold: engine::fire::FoldLen::Host(held),
+                        lineage: engine::fire::Lineage::Set,
                     },
                     held,
                 ),
@@ -3106,6 +3105,13 @@ impl Shell {
     }
 
     /// Seat `slot`'s state rows, one after another.
+    /// The planes [`Shell::state_bytes`] lays end to end: each state row's
+    /// trace cache index, bytes and dtype.
+    #[must_use]
+    pub fn state_planes(&self) -> Vec<(u32, u64, Dtype)> {
+        self.pools.state_planes()
+    }
+
     pub fn state_bytes(&mut self, slot: u32) -> Result<Vec<u8>> {
         self.drain()?;
         let record = self.pools.record(None, slot)?;
@@ -3969,6 +3975,9 @@ impl Shell {
         let mut tokens: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut positions: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut rotations: Vec<i32> = Vec::with_capacity(rows as usize);
+        // Each row's stated position, the mrope table's fill where a row
+        // carries no stream of its own.
+        let mut stated_rows: Vec<i32> = Vec::with_capacity(rows as usize);
         // Each band's lane and row tables of record piece ids, filled lane
         // by lane and joined band after band below.
         let widths = self.pools.bands();
@@ -4112,6 +4121,7 @@ impl Shell {
             masks.push(crate::mask::LaneMask {
                 mask: masking,
                 have,
+                folded: seated.folded.min(have),
                 rows: row.rows,
                 wide: self.wide.contains(row.class as usize),
             });
@@ -4237,6 +4247,7 @@ impl Shell {
                     base,
                     folded,
                     fold,
+                    lineage,
                 } => {
                     let ahead = held_key.and_then(|key| self.frozen_ahead.get(&key).copied());
                     let folded = match ahead {
@@ -4255,6 +4266,7 @@ impl Shell {
                         base: *base,
                         folded,
                         fold: *fold,
+                        lineage: *lineage,
                     }
                 }
                 verb => verb.clone(),
@@ -4372,8 +4384,11 @@ impl Shell {
                             .collect(),
                         None => rows.clone(),
                     };
-                    positions.extend(if self.states_mrope { &rows } else { &stated });
-                    rotations.extend(stated);
+                    // The causal bound is the row order, the cache row; a
+                    // stated position rotates the row and bounds nothing.
+                    positions.extend(&rows);
+                    rotations.extend(if self.states_mrope { &rows } else { &stated });
+                    stated_rows.extend(&stated);
                     match &device_writes[source] {
                         Some((slots, offsets)) => {
                             for (&page, &off) in slots.iter().zip(offsets) {
@@ -4396,10 +4411,12 @@ impl Shell {
                             .positions
                             .get(at)
                             .map_or(row, |&p| narrow(u64::from(p)));
-                        // With mrope the rotation rides its own table, and the
-                        // plain one is the causal bound: a KV row.
-                        positions.push(if self.states_mrope { row } else { stated });
-                        rotations.push(stated);
+                        // The causal bound is the row order, the cache row; a
+                        // stated position rotates the row and bounds nothing.
+                        // With mrope the rotation rides its own table.
+                        positions.push(row);
+                        rotations.push(if self.states_mrope { row } else { stated });
+                        stated_rows.push(stated);
                         request_of_token.push(at_lane);
                     }
                     writes.extend(std::iter::repeat_n(None, rows_here));
@@ -4555,6 +4572,7 @@ impl Shell {
                 enabled: self.copies && masks.iter().all(|lane| lane.mask.is_none()),
                 page_tables: &geometries,
                 positions: &positions,
+                rotations: &rotations,
                 request_of_token: &request_of_token,
             },
         )?;
@@ -4633,7 +4651,7 @@ impl Shell {
                     }
                     None => {
                         for i in 0..row.rows as usize {
-                            let p = rotations[row.row_offset as usize + i];
+                            let p = stated_rows[row.row_offset as usize + i];
                             mrope_positions[at + 3 * i] = p;
                             mrope_positions[at + 3 * i + 1] = p;
                             mrope_positions[at + 3 * i + 2] = p;
@@ -4939,6 +4957,7 @@ impl Shell {
                 tokens: &tokens,
                 readout_rows: &readout_rows,
                 positions: &positions,
+                rotations: &rotations,
                 windows: &boundaries,
                 slot_ids: &slot_ids,
                 slot_of_row: &slot_of_row,
@@ -5004,6 +5023,7 @@ impl Shell {
         let bindings = FireBindings {
             tokens: bound.tokens,
             positions: bound.positions,
+            rotations: bound.rotations,
             adapter_routes: bound.adapter_routes,
             readout_rows: bound.readout_rows,
             readout_indptr,
@@ -5844,7 +5864,9 @@ fn activation_rungs(
 ) -> Result<Vec<(u32, poem_compiler::ArenaMap)>> {
     let max = budgets.tokens.max_tokens;
     let mut rungs = Vec::new();
-    for tokens in engine::memory::rungs(1, max) {
+    // The lattice's points below the load's top, then the top: the rows a
+    // Metal load fires (`crate::rates::lattice_rows`).
+    for tokens in crate::rates::lattice_rows() {
         if tokens >= max {
             break;
         }

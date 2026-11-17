@@ -39,7 +39,6 @@ fn load(fixture: &Fixture) -> Shell {
         profiles: None,
         top: engine_metal::Top::EveryRung,
     })
-    .and_then(|mut shell| shell.raise_whole().map(|()| shell))
     .unwrap_or_else(|why| panic!("the shell loads: {why}"))
 }
 
@@ -141,6 +140,7 @@ fn every_form_a_recurrent_load_serves_is_built_by_its_walk() {
         base: 0,
         folded: 0,
         fold: FoldLen::Host(fold),
+        lineage: engine::fire::Lineage::Set,
     };
     let (hold, replay) = (buffer(0), buffer(1));
     let lane = |slot: u32, tokens: &'static [u32], word: u64, rs: &'static RsVerb, held: u32| Seated {

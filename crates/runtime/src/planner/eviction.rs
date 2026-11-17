@@ -272,8 +272,13 @@ impl ResidencyPlanner {
             // In-flight moves past what the head's own kv takes free chunks
             // for its state too.
             let spare = expected.pages.saturating_sub(missing);
+            // A bind short of room is short the pages that, moved out
+            // whole, free its chunks: free pages are no runs of chunks.
+            let room = waiter.room_pages().saturating_sub(expected.pages);
             let deficit = Reclaim {
-                pages: missing.saturating_sub(expected.pages.saturating_add(free)),
+                pages: missing
+                    .saturating_sub(expected.pages.saturating_add(free))
+                    .saturating_add(room),
                 rs: waiter
                     .rs_need()
                     .add(inner.seating_reserve(waiter.pid, rs_growth, waiter.rs_need(), rs_total))
@@ -401,7 +406,7 @@ impl ResidencyPlanner {
                 .unmet_head()
                 .and_then(|(key, waiter)| match waiter.kind {
                     WaitKind::Allocation { .. } => Some((key, waiter.pid)),
-                    WaitKind::Restore { .. } => None,
+                    WaitKind::Restore { .. } | WaitKind::BindRoom { .. } => None,
                 })
         }) else {
             return false;

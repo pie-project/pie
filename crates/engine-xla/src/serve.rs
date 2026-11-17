@@ -152,6 +152,12 @@ pub struct Seated<'a> {
 
     pub held: Option<u32>,
 
+    /// The lane's set's committed boundary (`KvDelta::folded`, numbered as
+    /// `held`): column `c` of its mask is slot `folded + c`, and the slots
+    /// below it are read under the causal bound and no mask bit. 0 where
+    /// nothing is committed.
+    pub folded: u32,
+
     pub mask: Option<&'a Masking>,
 
     pub adapter: Option<u32>,
@@ -210,6 +216,7 @@ impl<'a> Seated<'a> {
             lane,
             pages: &[],
             held: None,
+            folded: 0,
             mask: None,
             adapter: None,
             positions: &[],
@@ -276,6 +283,9 @@ pub struct Shell {
     /// The warm ladder's second pass: every fire traced as one that stages
     /// expert misses (`crate::store::streamed::Fire::stages`).
     pub(crate) stage_all: bool,
+    /// A fire on scratch slots every lane shares (the warm ladder's): what it
+    /// writes is never read back, so its rows may lay a page in two runs.
+    pub(crate) scratch_fire: bool,
     /// The stage-only pass (`size`): a fire stops once its inputs are
     /// staged, before anything is traced, leaving their rows here.
     sizing: Option<u32>,
@@ -486,6 +496,7 @@ impl Shell {
             crate::chip::resolve(device.kind(), boot.device.profiles.as_deref());
         if !device.kind().is_empty() {
             crate::chip::SHELF.tell_untuned(device.kind(), &chip_report);
+            crate::chip::tell_unmeasured(device.kind(), &chip, &chip_report);
         }
         let tpu = crate::chip::Tpu::of(device.kind());
         let headroom = boot.device.headroom.unwrap_or_else(|| tpu.headroom());
@@ -495,13 +506,7 @@ impl Shell {
                 device.kind()
             );
         }
-        let mut tuning = kernels_xla::tuning::Tuning::on(&chip, tpu.vmem_bytes());
-        // `PIE_XLA_MOE_GMM=0`: routed MLPs take no grouped-matmul (Mosaic)
-        // kernel, as the other Mosaic switches turn theirs off (a GPU
-        // plugin runs none).
-        if std::env::var("PIE_XLA_MOE_GMM").is_ok_and(|v| v == "0") {
-            tuning.moe_path = kernels_xla::tuning::MoePath::Auto { gmm: false };
-        }
+        let tuning = kernels_xla::tuning::Tuning::on(&chip, tpu.vmem_bytes());
         let engine = crate::chip::Engine::of(&chip);
         let pad = engine.pad;
         let mut boot = Boot {
@@ -621,11 +626,7 @@ impl Shell {
 
         // Windowed kv rows live in their own pool, a window per sequence
         // (engine-cuda `serve/load.rs`).
-        let window = if boot.device.window_pool {
-            crate::store::window_of(&boot.trace)?
-        } else {
-            None
-        };
+        let window = crate::store::window_of(&boot.trace)?;
         let paging_at = |pages: u64, slots: u32| -> Result<Paging> {
             Ok(Paging::of(boot.page_size, boot.context, slots, pages)?
                 .windowed(window, boot.budget.max_tokens)
@@ -1034,6 +1035,7 @@ impl Shell {
             streamed,
             fire_streamed: None,
             stage_all: false,
+            scratch_fire: false,
             sizing: None,
             staging_facts: staging_facts.clone(),
             host: crate::store::tier::Host::default(),
@@ -1958,6 +1960,7 @@ impl Shell {
                     base,
                     folded,
                     fold,
+                    lineage,
                 } => {
                     let id = rs_shape.ok_or_else(|| Fault::Program {
                         at: "serve::rs",
@@ -1968,14 +1971,17 @@ impl Shell {
                         base: *base,
                         folded: *folded,
                         fold: *fold,
+                        lineage: *lineage,
                     }
                 }
                 engine::fire::RsVerb::Fold => engine::fire::RsVerb::Fold,
             });
-            if let engine::fire::RsVerb::Buffer { folded, .. } = seated.rs {
-                let rows = seated.lane.tokens.len() as u32;
+            if let engine::fire::RsVerb::Buffer {
+                folded, lineage, ..
+            } = seated.rs
+            {
                 let first = seated.first.unwrap_or(have);
-                let reads = engine::fire::buffered_reads(seated.mask, *folded, first, rows)
+                let reads = engine::fire::buffered_reads(seated.mask, *folded, first, *lineage)
                     .map_err(|e| Fault::Program {
                         at: "serve::rs",
                         why: format!("lane {at}: {e}"),
@@ -2051,6 +2057,7 @@ impl Shell {
                 masks.push(crate::mask::LaneMask {
                     mask: None,
                     have: 0,
+                    folded: 0,
                     rows: row.rows,
                     wide: false,
                 });
@@ -2124,6 +2131,7 @@ impl Shell {
             masks.push(crate::mask::LaneMask {
                 mask: kv_mask,
                 have,
+                folded: seated.folded.min(have),
                 rows: row.rows,
                 wide: self.wide.contains(row.class as usize),
             });
@@ -2498,6 +2506,16 @@ impl Shell {
         let mut table_seats = Vec::with_capacity(table_windowed.len());
         let mut geometry = Vec::with_capacity(table_windowed.len());
         for (g, &in_window) in geometries.iter().zip(&table_windowed) {
+            let sink = if in_window { window_sink } else { sink_page };
+            append_runs(
+                &g.write_page,
+                &g.write_offset,
+                narrow(u64::from(sink)),
+                paging.page_size,
+                g.indptr.len().saturating_sub(1),
+                self.tuning.chunks.append_page_rows,
+                self.scratch_fire || self.sizing.is_some(),
+            )?;
             let mut indices = g.indices.clone();
             let padded = (lane_count as usize) * (max_pages as usize);
             let sink = if in_window { window_sink } else { sink_page };
@@ -3823,4 +3841,133 @@ fn timing_epoch() -> &'static std::time::Instant {
 pub(crate) fn timing() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("PIE_XLA_TIMING").is_some_and(|v| v != "0"))
+}
+
+/// Refuses a fire whose kv rows the append does not take, before it is
+/// dispatched: a tall fire's rows land by page runs (`kernels_xla`'s
+/// `append_run_capacity`), and the device lays at most the capacity's runs,
+/// each a page's consecutive offsets, no page in two. Runs are found as the
+/// device finds them: a row bound for the sink (padding) is no run's, and a
+/// run opens wherever a live row's page differs from the row before it. A
+/// kernel handed more runs than its scratch holds halts the chip, so this is
+/// never left to the device. A `scratch` fire (lanes sharing scratch slots,
+/// nothing read back) is held to the capacity alone: its lanes lay the same
+/// pages, which only the data it never reads depends on.
+fn append_runs(
+    page: &[i32],
+    offset: &[i32],
+    sink: i32,
+    page_size: u32,
+    lanes: usize,
+    page_rows: i64,
+    scratch: bool,
+) -> Result<()> {
+    let n = page.len();
+    let ps = i64::from(page_size);
+    let Some(m) =
+        kernels_xla::attn::paged::append_run_capacity(n as i64, ps, lanes as i64, page_rows)
+    else {
+        return Ok(());
+    };
+    let refuse = |why: String| Fault::Program {
+        at: "serve::append_runs",
+        why,
+    };
+    let mut runs = 0i64;
+    let mut pages = std::collections::HashSet::new();
+    let mut prev = -1i32;
+    let mut open = (0usize, 0i32);
+    for (i, (&p, &o)) in page.iter().zip(offset).enumerate() {
+        let live = p != sink && p >= 0 && o >= 0 && i64::from(o) < ps;
+        let key = if live { p } else { -1 };
+        if live && key != prev {
+            runs += 1;
+            if !pages.insert(p) && !scratch {
+                return Err(refuse(format!(
+                    "this fire's kv rows lay page {p} in two runs (row {i}): the append \
+                     lands a page's rows as one run"
+                )));
+            }
+            open = (i, o);
+        }
+        if live && !scratch && i64::from(o) != i64::from(open.1) + (i - open.0) as i64 {
+            return Err(refuse(format!(
+                "this fire's kv row {i} lands at offset {o} of page {p}, not the next offset \
+                 of its run: the append lands a run's rows consecutively"
+            )));
+        }
+        prev = key;
+    }
+    if runs > m {
+        return Err(refuse(format!(
+            "this fire's runs exceed the append's capacity m: its {n} kv rows over {lanes} \
+             lanes lay {runs} page runs, and the append lays at most {m}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod append_runs_tests {
+    use super::append_runs;
+
+    const SINK: i32 = 999;
+
+    /// One prompt's rows from offset `start` of page `first` on.
+    fn prompt(rows: usize, first: i32, start: i32) -> (Vec<i32>, Vec<i32>) {
+        (0..rows as i32)
+            .map(|r| (first + (start + r) / 16, (start + r) % 16))
+            .unzip()
+    }
+
+    #[test]
+    fn a_fire_within_the_run_capacity_is_taken() {
+        let (page, off) = prompt(256, 3, 5);
+        append_runs(&page, &off, SINK, 16, 1, 128, false).expect("one prompt's runs fit");
+        // Padding rows bound for the sink are no run's.
+        let (mut page, mut off) = prompt(240, 0, 0);
+        page.extend([SINK; 16]);
+        off.extend([0; 16]);
+        append_runs(&page, &off, SINK, 16, 2, 128, false).expect("padding lays no run");
+        // A short fire lands row by row, whatever its layout.
+        append_runs(&[7; 64], &[0; 64], SINK, 16, 64, 128, false)
+            .expect("a short fire is not run-checked");
+    }
+
+    #[test]
+    fn a_fire_past_the_run_capacity_is_refused_on_the_host() {
+        // 256 rows, each on its own page, stated as one lane: 256 runs
+        // against a capacity of 256 / 16 + 2.
+        let page: Vec<i32> = (0..256).collect();
+        let off = vec![7; 256];
+        let why = append_runs(&page, &off, SINK, 16, 1, 128, false)
+            .expect_err("more runs than the capacity is refused")
+            .to_string();
+        assert!(why.contains("exceed the append's capacity m"), "{why}");
+        assert!(
+            why.contains("256 page runs") && why.contains("at most 18"),
+            "{why}"
+        );
+        // The same rows as 256 lanes of one row each fit.
+        append_runs(&page, &off, SINK, 16, 256, 128, false).expect("a decode-wide fire's runs fit");
+    }
+
+    #[test]
+    fn a_page_in_two_runs_or_a_skipped_offset_is_refused() {
+        let (mut page, mut off) = prompt(128, 0, 0);
+        page[100] = 0;
+        let why = append_runs(&page, &off, SINK, 16, 4, 128, false)
+            .expect_err("page 0 twice")
+            .to_string();
+        assert!(why.contains("in two runs"), "{why}");
+        // A scratch fire's lanes share pages: held to the capacity alone.
+        append_runs(&page, &off, SINK, 16, 4, 128, true).expect("a scratch fire may share pages");
+        let (page, _) = prompt(128, 0, 0);
+        off = (0..128).map(|r| r % 16).collect();
+        off[20] = 9;
+        let why = append_runs(&page, &off, SINK, 16, 4, 128, false)
+            .expect_err("a skipped offset")
+            .to_string();
+        assert!(why.contains("not the next offset"), "{why}");
+    }
 }

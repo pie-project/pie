@@ -62,12 +62,9 @@ gemm.turn_min_n = 2048
 # request keeps it: 64 vs 82 us).
 ssm.gdn_wide_from = 512
 
-# A fire of 10240 rows: 8192 left the
-# first prompts' decodes waiting out a second prefill fire, 12K and up made
-# queued prompts wait. Past 2048 rows, eight buckets a doubling: a prefill's
+# Past 2048 rows, eight buckets a doubling: a prefill's
 # GEMMs run its bucket's rows (Gemma4 31B, 32 prompts: 4416 rows took 4871,
 # 10% of the frame, at four).
 [engine]
-forward_tokens = 10240
 prefill_lattice_from = 2048
 prefill_lattice_steps = 8

@@ -24,6 +24,11 @@ use kernels_metal::attn::{self, DecodePlan};
 use kernels_metal::{KvPool, Tensor};
 use poem_ir::Dtype;
 
+/// A row's mask words, one u32 a row (its enable flag, its boundary 0).
+fn mask_words(v: &[u32]) -> Vec<u8> {
+    v.iter().flat_map(|w| w.to_le_bytes()).collect()
+}
+
 const KV_HEADS: usize = 2;
 const Q_HEADS: usize = 4; // gqa = 2
 const N_KV: usize = 20; // cached key/value tokens (positions 0..N_KV)
@@ -394,13 +399,13 @@ fn run_case(
     let rows = positions.len();
     let hpos = rig.i32s(&positions);
     let hreq = rig.i32s(&vec![0i32; rows]);
-    let hmen = rig.u8s(&vec![0u8; rows]); // mask disabled → full causal to position
-    let hmask = rig.u8s(&vec![0u8; rows]); // never read while mask disabled
+    let hmen = rig.u8s(&mask_words(&vec![0u32; rows])); // mask disabled → full causal to position
+    let hmask = rig.u8s(&mask_words(&vec![0u32; rows])); // never read while mask disabled
     let plan = DecodePlan {
         positions: Tensor::new(hpos, rows as u32, 1, Dtype::I32),
         request_of_token: Tensor::new(hreq, rows as u32, 1, Dtype::I32),
         mask: Tensor::new(hmask, rows as u32, 1, Dtype::U8),
-        mask_enabled: Tensor::new(hmen, rows as u32, 1, Dtype::U8),
+        mask_enabled: Tensor::new(hmen, rows as u32, 1, Dtype::U32),
         mask_stride: 1,
     };
 

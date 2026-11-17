@@ -615,6 +615,15 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 interval.tick().await;
                 let d = planner.diagnostics();
                 let (lk_n, lk_wait, lk_hold, lk_wmax, lk_hmax) = planner.lock_census();
+                // Who holds the device pool's slots, whatever the queue.
+                if let Some(shared) = crate::store::registry::try_get(arena_model_idx, 0)
+                    .and_then(|stores| stores.shared)
+                {
+                    println!(
+                        "[pool-held] {}",
+                        shared.lock().unwrap().pool().held_census()
+                    );
+                }
                 if d.queue.is_empty() && d.proc_states[1..].iter().all(|&n| n == 0) {
                     continue;
                 }
@@ -622,7 +631,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     "[planner-trace] queue={} unmet={} head_pages={} head_kind={} bypass={}/{} accum={} \
                      free={}/{} host_free={}/{} head_rs={} rs_free={}/{} \
                      parks={} serves={} evictions={} deferrals={} \
-                     evict_rollbacks={} evict_faults={} restore_faults={} restores={} restore_failures={} gate_parks={} \
+                     evict_rollbacks={} evict_faults={} restore_faults={} restores={} restore_failures={} restore_roles_short={} gate_parks={} \
                      hogs={} starved={} restarted={} salvaged={} swapfull={}/{} e6_relax={} rshort={} \
                      grow_waits={} grow_parked={} no_grows={} \
                      lock_n={} lock_wait_ms={} lock_hold_ms={} lock_wmax_us={} lock_hmax_us={} \
@@ -653,6 +662,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     d.restore_faults_total,
                     d.restores_total,
                     d.restore_failures_total,
+                    d.restore_roles_short_total,
                     d.gate_parks_total,
                     d.hog_failures_total,
                     d.starvations_total,

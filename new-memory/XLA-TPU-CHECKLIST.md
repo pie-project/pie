@@ -44,12 +44,12 @@ Expect `... readouts bit-identical` for qwen3-micro-text (dense), qwen35-tiny (g
 gemma4-e4b-mini-l1 (window list, trimmed past the window), and `a_parked_working_set_decodes_on_as_it_would_have`
 (host tier + slot file park/restore, same build) to pass.
 
-On TPU the Mosaic kernels are ON (on CUDA they were off via `PIE_XLA_FLASH_PREFILL=0 PIE_XLA_KV_KERNEL=0
-PIE_XLA_ROPE_KERNEL=0 PIE_GDN_CHUNK_KERNEL=0 PIE_GDN_STEP_KERNEL=0`). Differences to expect and how to read them:
+On TPU the Mosaic kernels are on, each gated only by its own fit check (there are no switches to turn them off).
+Differences to expect and how to read them:
 - The Mosaic kv append runs only on identity-mapped planes, so on the branch every pool plane appends through the HLO
   scatter. Values written are the same bytes; a mismatch here is a bug.
-- If a gate differs, rerun both builds with the Mosaic switches above set to 0: equal then = a Mosaic path under a
-  non-identity map (section 2); different then = the pool addressing itself.
+- If a gate differs, the kernel tests of section 2 (mapped pools) separate a Mosaic path under a non-identity map from
+  the pool addressing itself.
 
 ## 2. TPU-only kernel tests (mapped pools; skip off a TPU)
 

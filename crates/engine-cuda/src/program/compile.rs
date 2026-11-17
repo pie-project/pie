@@ -141,9 +141,15 @@ const NVRTC_OPTIONS: [&std::ffi::CStr; 5] = [
 /// a build with no runtime compiler, which compiles nothing.
 fn compile_options() -> Vec<&'static [u8]> {
     #[cfg(feature = "rocm")]
-    return HIPRTC_OPTIONS.iter().map(|option| option.as_bytes()).collect();
+    return HIPRTC_OPTIONS
+        .iter()
+        .map(|option| option.as_bytes())
+        .collect();
     #[cfg(feature = "cuda")]
-    return NVRTC_OPTIONS.iter().map(|option| option.to_bytes()).collect();
+    return NVRTC_OPTIONS
+        .iter()
+        .map(|option| option.to_bytes())
+        .collect();
     #[cfg(not(any(feature = "rocm", feature = "cuda")))]
     Vec::new()
 }
@@ -913,11 +919,10 @@ impl Cache {
         late_memory(&cubin).map_err(|why| Failure::Deterministic {
             reason: format!("region {region_index} (`{entry}`): {why}"),
         })?;
-        let module = Module::load(&cubin, REGION_SYMBOL, dynamic).map_err(|error| {
-            Failure::Retryable {
+        let module =
+            Module::load(&cubin, REGION_SYMBOL, dynamic).map_err(|error| Failure::Retryable {
                 reason: format!("loading `{entry}`: {error}"),
-            }
-        })?;
+            })?;
         self.disk.store(&key, REGION_SYMBOL, &cubin);
         self.built.insert(key, cubin.into());
         Ok(named(module))
@@ -993,17 +998,34 @@ mod tests {
         let directory = scratch("shared");
         let target = device_target();
         // Two stages' regions: other names, other region indices.
-        let (a, b) = ("ptir_fused_00000000000000aa_r0", "ptir_fused_00000000000000bb_r3");
+        let (a, b) = (
+            "ptir_fused_00000000000000aa_r0",
+            "ptir_fused_00000000000000bb_r3",
+        );
         let mut cache = Cache::new(Disk::at(&directory));
-        let first = cache.region_module(&target, 0, a, &region(a)).expect("builds");
-        let second = cache.region_module(&target, 3, b, &region(b)).expect("builds");
-        assert_eq!(cache.stats().compilations, 1, "the second stage's region is the first's code");
-        assert_eq!((first.entry_name(), second.entry_name()), (a, b), "each keeps its name");
+        let first = cache
+            .region_module(&target, 0, a, &region(a))
+            .expect("builds");
+        let second = cache
+            .region_module(&target, 3, b, &region(b))
+            .expect("builds");
+        assert_eq!(
+            cache.stats().compilations,
+            1,
+            "the second stage's region is the first's code"
+        );
+        assert_eq!(
+            (first.entry_name(), second.entry_name()),
+            (a, b),
+            "each keeps its name"
+        );
 
         // A later boot finds it on disk under a third name and index.
         let c = "ptir_fused_00000000000000cc_r5";
         let mut later = Cache::new(Disk::at(&directory));
-        let third = later.region_module(&target, 5, c, &region(c)).expect("loads");
+        let third = later
+            .region_module(&target, 5, c, &region(c))
+            .expect("loads");
         assert_eq!(
             (later.stats().compilations, later.stats().persistent_hits),
             (0, 1),
@@ -1051,19 +1073,28 @@ mod tests {
             "a template edit bumps no version, so the source itself has to be \
              in the key — otherwise yesterday's cubin answers today's launch"
         );
-        let other_device = Target { device: 1, ..target };
+        let other_device = Target {
+            device: 1,
+            ..target
+        };
         assert_eq!(
             before,
             region_key(&other_device, "__global__ void k() { a(); }"),
             "a second card of the same architecture shares the build"
         );
-        let newer = Target { rtc: (12, 5), ..target };
+        let newer = Target {
+            rtc: (12, 5),
+            ..target
+        };
         assert_ne!(
             before,
             region_key(&newer, "__global__ void k() { a(); }"),
             "another runtime compiler builds it again"
         );
-        assert!(before.contains(&target.architecture()), "the target stays readable");
+        assert!(
+            before.contains(&target.architecture()),
+            "the target stays readable"
+        );
     }
 
     fn scratch(name: &str) -> PathBuf {

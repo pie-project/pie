@@ -1050,6 +1050,7 @@ def eagle_draft(m, inputs, x, logits, root):
     draft = ops.attn.logit_softcap(ops.linear.lm_head(ops.elemwise.rmsnorm(dy, m.final_norm, m.final_norm_eps), m.embed), m.softcap)
     output("mtp.logits", draft)
     output("mtp.drafts", ops.sampling.argmax([draft]))
+    draft_depth(1)
 
 def assistant_draft(m, inputs, positions, x, logits, root):
     """The MTP assistant (`m.assistant`) proposes one token from the trunk's
@@ -1082,6 +1083,7 @@ def assistant_draft(m, inputs, positions, x, logits, root):
     draft = ops.linear.lm_head(ops.elemwise.rmsnorm(y, a.norm, a.norm_eps), a.embed)
     output("mtp.logits", draft)
     output("mtp.drafts", ops.sampling.argmax([draft]))
+    draft_depth(1)
 
 def clipped(x, c):
     if c.clip == None:

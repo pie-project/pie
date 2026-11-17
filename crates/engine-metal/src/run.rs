@@ -98,7 +98,13 @@ pub type PoolSlabs = kernels_metal::attn::pool::PoolState;
 pub struct FireBindings {
     pub tokens: Tensor,
 
+    /// Each row's cache row: the causal bound its attention reads, by row
+    /// order whatever position the lane states.
     pub positions: Tensor,
+
+    /// Each row's stated position: what its rotation reads
+    /// (`RuntimeInput::Positions`).
+    pub rotations: Tensor,
 
     pub adapter_routes: Option<Tensor>,
 
@@ -1219,6 +1225,9 @@ impl<'c> Run<'c> {
             if handle.buf == self.fire.positions.buf {
                 return gathered.positions;
             }
+            if handle.buf == self.fire.rotations.buf {
+                return gathered.rotations;
+            }
             if handle.buf == self.fire.tables.request_of_token.buf {
                 return gathered.request_of_token;
             }
@@ -1549,7 +1558,7 @@ impl<'c> Run<'c> {
         match &self.values[at].def {
             Def::Input(RuntimeInput::Tokens) => self.fire.tokens,
             Def::Input(RuntimeInput::ReadoutRows) => self.fire.readout_rows,
-            Def::Input(RuntimeInput::Positions) => self.fire.positions,
+            Def::Input(RuntimeInput::Positions) => self.fire.rotations,
             Def::Input(RuntimeInput::Mask) => self.fire.tables.mask,
             Def::Input(RuntimeInput::AdapterRoutes) => {
                 self.fire.adapter_routes.unwrap_or_else(|| {

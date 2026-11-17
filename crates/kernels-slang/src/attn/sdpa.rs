@@ -66,7 +66,10 @@ pub struct Tables {
     pub request_of_token: Tensor,
     /// The packed byte mask, `mask_stride` bytes a row.
     pub mask: Tensor,
-    /// One byte a row: whether the row reads its mask.
+    /// One u32 a row: its enable flag in bits 0-1 (nonzero: the row reads
+    /// its mask) and its lane's committed boundary in bits 2-31, the key its
+    /// plane's column 0 is. Every key below the boundary is read under the
+    /// model's own bounds and no mask bit.
     pub mask_enabled: Tensor,
     pub mask_stride: u32,
 }
@@ -79,7 +82,7 @@ impl Tables {
             ("position table", tables.positions, Dtype::I32),
             ("owning-request table", tables.request_of_token, Dtype::I32),
             ("mask planes", tables.mask, Dtype::U8),
-            ("mask-enabled flags", tables.mask_enabled, Dtype::U8),
+            ("mask words", tables.mask_enabled, Dtype::U32),
         ];
         for (what, t, want) in stated {
             if t.dtype != want {
@@ -723,7 +726,7 @@ mod tests {
             positions: tensor(3, staged, 1, Dtype::I32),
             request_of_token: tensor(4, staged, 1, Dtype::I32),
             mask: tensor(5, 1, 1, Dtype::U8),
-            mask_enabled: tensor(6, staged, 1, Dtype::U8),
+            mask_enabled: tensor(6, staged, 1, Dtype::U32),
             mask_stride: 1,
         };
         let plane = tensor(7, 64, heads * head_dim, Dtype::Bf16);

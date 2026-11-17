@@ -154,16 +154,6 @@ impl Beside {
                      process's queues are not readable ({why})"
                 ))
             })?;
-            if areas.counted == kernels_cuda::hip::kfd::Counted::Driver
-                && areas.queues != areas.rule
-            {
-                eprintln!(
-                    "engine-cuda: KFD lists {} queues for this process where HIP's rule \
-                     counts {}: a load in another PID namespace, which counts by the rule, would \
-                     hold the wrong figure",
-                    areas.queues, areas.rule
-                );
-            }
             Ok(Beside {
                 said: format!("the driver holds {areas}"),
             })
@@ -970,14 +960,15 @@ pub struct Range {
     deferred: bool,
 }
 
-/// The spans the first `bottom` bytes of a range's segments lie in, parted
-/// at `parted.0` by `parted.1` bytes.
+/// The spans the first `bottom` bytes of a range's segments back: all but
+/// the `parted.1` bytes from `parted.0`, which nothing backs.
 fn laid(bottom: u64, parted: (u64, u64)) -> [(u64, u64); 2] {
     let (from, by) = parted;
     if bottom <= from {
         return [(0, bottom), (0, 0)];
     }
-    [(0, from), (from + by, bottom - from)]
+    let above = from.saturating_add(by);
+    [(0, from), (above, bottom.saturating_sub(above))]
 }
 
 impl Range {
@@ -1159,21 +1150,12 @@ impl Range {
         self.parted
     }
 
-    /// Parts the segments at `from` bytes, a whole number of segments none
-    /// past which is committed: those from there on lie `by` bytes further
-    /// up the range, and the `by` bytes between are never backed. A range
-    /// reserved for more than it comes to hold keeps both its ends where
-    /// they lie this way: its first segments at its base, its last ones
-    /// under what lies above them.
+    /// Parts the range at `from` bytes, anywhere in it: the `by` bytes from
+    /// there are never backed, whatever segments are committed, and every
+    /// byte keeps its place. A range reserved for more than it comes to
+    /// hold keeps both its ends where they lie this way: its first chunks
+    /// at its base, its last ones under what lies above them.
     pub fn part(&mut self, from: u64, by: u64) -> Result<()> {
-        if !from.is_multiple_of(self.segment_bytes)
-            || u64::from(self.committed) * self.segment_bytes > from
-        {
-            return Err(Fault::program(
-                "device::elastic",
-                "a range parted inside a segment, or under committed ones",
-            ));
-        }
         self.parted = (from, by);
         Ok(())
     }
@@ -1499,7 +1481,7 @@ mod tests {
         const ABOVE: u64 = 30;
         let units = |from: u64, bytes: u64| from / UNIT..(from + bytes).div_ceil(UNIT);
         for fitted in [8, 9, 16, 37, 64, 99] {
-            for parting in [8, 16] {
+            for parting in [8, 13, 16] {
                 // A pool that fits under where it would part is not parted.
                 if parting >= fitted {
                     continue;
@@ -1507,7 +1489,7 @@ mod tests {
                 let mut range = reserved((RESERVED + ABOVE) * CHUNK, SEGMENT * CHUNK, UNIT);
                 let skipped = RESERVED - fitted;
                 range.part(parting * CHUNK, skipped * CHUNK).unwrap();
-                range.limit(fitted * CHUNK);
+                range.limit(RESERVED * CHUNK);
                 let want = range.wanted(range.segments(), &[]);
                 let backed = range.arena.target_units(&want).unwrap();
                 let stated: Vec<usize> = units(0, parting * CHUNK)
@@ -1530,7 +1512,7 @@ mod tests {
                 // What a commit of them all would ask is those chunks.
                 assert_eq!(
                     range
-                        .growth_of(range.segments(), fitted * CHUNK, range.parted())
+                        .growth_of(range.segments(), RESERVED * CHUNK, range.parted())
                         .unwrap(),
                     pages_for_bytes(fitted * CHUNK)
                 );
@@ -1548,13 +1530,17 @@ mod tests {
         ];
         assert_eq!(range.held_past(above), 6 * CHUNK);
         assert_eq!(range.held(above), 4 * CHUNK);
-        // Parted under a committed segment, or inside one, it is refused:
-        // what is backed never moves.
+        // Parted inside a segment, or under committed ones, every byte
+        // keeps its place: only the parted bytes go unbacked.
         let mut range = reserved((RESERVED + ABOVE) * CHUNK, SEGMENT * CHUNK, UNIT);
-        assert!(range.part(3 * CHUNK, CHUNK).is_err());
         range.committed = 2;
-        assert!(range.part(SEGMENT * CHUNK, CHUNK).is_err());
-        assert!(range.part(2 * SEGMENT * CHUNK, CHUNK).is_ok());
+        range.part(3 * CHUNK, CHUNK).unwrap();
+        let backed = range.arena.target_units(&range.wanted(2, &[])).unwrap();
+        let stated: Vec<usize> = units(0, 3 * CHUNK)
+            .chain(units(4 * CHUNK, (2 * SEGMENT - 4) * CHUNK))
+            .map(|unit| unit as usize)
+            .collect();
+        assert_eq!(backed, stated);
     }
 
     fn a_partial_page_is_a_whole_page() {

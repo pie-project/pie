@@ -38,11 +38,6 @@ use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
 const BLOCK: u32 = 256;
 
-#[must_use]
-pub(crate) const fn elementwise(n: u32) -> Launch {
-    Launch::flat(n, BLOCK)
-}
-
 /// A per-head elementwise pass over `rows` rows of `heads` heads: the
 /// elements a thread (eight where the head width allows) and its launch,
 /// a row's threads over grid y.

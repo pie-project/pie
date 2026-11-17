@@ -679,7 +679,7 @@ fn grouped_lt(
 }
 
 /// `groups` strided bf16 matmuls in one hipBLASLt launch; `Ok(false)` where
-/// hipBLASLt is absent or offers no algorithm.
+/// hipBLASLt offers no algorithm for the shape.
 #[cfg(feature = "rocm")]
 #[allow(clippy::too_many_arguments)]
 fn grouped_lt(
@@ -1429,21 +1429,29 @@ fn lt_wanted(ctx: &Ctx, per: u32, from: u32, fits: bool) -> bool {
 
 /// The library and the solution the profile names for a contraction of `k`
 /// (`kernel.moe.lt_tile_deep` from `kernel.moe.lt_deep_k`, else
-/// `kernel.moe.lt_tile_shallow`); `None` where either is missing.
+/// `kernel.moe.lt_tile_shallow`): a library that did not open, or a tile it
+/// does not hold, is refused by name.
 #[cfg(feature = "rocm")]
 fn lt_solution(
     ctx: &Ctx,
+    op: &'static str,
     dtype: Dtype,
     k: u32,
-) -> Option<(&'static crate::hip::lt_grouped::Library, usize)> {
-    let lib = crate::hip::lt_grouped::library(dtype).ok()?;
+) -> Result<(&'static crate::hip::lt_grouped::Library, usize), Error> {
+    let lib = crate::hip::lt_grouped::library(dtype).map_err(|why| refuse(op, why))?;
     let t = ctx.tuning();
     let tile = if k >= t.moe_lt_deep_k {
         t.moe_lt_tile_deep
     } else {
         t.moe_lt_tile_shallow
     };
-    Some((lib, lib.pick(tile)?))
+    let at = lib.pick(tile).ok_or_else(|| {
+        refuse(
+            op,
+            format!("the profile's tile {tile} is not in hipBLASLt's grouped library"),
+        )
+    })?;
+    Ok((lib, at))
 }
 
 /// The hipBLASLt leg's planes: routes in expert order, the staged result
@@ -1613,11 +1621,8 @@ fn mlp_lt(ctx: &Ctx, op: &'static str, p: &RoutedMlp, y: &mut Tensor) -> Result<
     {
         return Ok(false);
     }
-    let (Some((lib, up_at)), Some((_, down_at))) =
-        (lt_solution(ctx, dtype, k), lt_solution(ctx, dtype, i))
-    else {
-        return Ok(false);
-    };
+    let (lib, up_at) = lt_solution(ctx, op, dtype, k)?;
+    let (_, down_at) = lt_solution(ctx, op, dtype, i)?;
     let ty = dtype_dispatch!(op, dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let fan = Selected {
         route_count: rows,

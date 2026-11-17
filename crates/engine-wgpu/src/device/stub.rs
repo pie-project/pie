@@ -385,6 +385,13 @@ impl Pipelines {
         self.compiles.get()
     }
 
+    /// The kernels built after `from`: none, since a device-less build
+    /// builds no pipeline.
+    #[must_use]
+    pub fn built_since(&self, _from: u64) -> Vec<&'static str> {
+        Vec::new()
+    }
+
     pub fn get(
         &self,
         _device: &Context,

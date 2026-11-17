@@ -550,7 +550,10 @@ impl Shell {
                 seated
             })
             .collect();
-        self.fire_full(&seated).map(|_| ())
+        self.scratch_fire = true;
+        let fired = self.fire_full(&seated).map(|_| ());
+        self.scratch_fire = false;
+        fired
     }
 }
 

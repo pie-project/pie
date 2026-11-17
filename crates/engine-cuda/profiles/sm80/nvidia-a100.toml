@@ -79,7 +79,7 @@ branches = true
 [rates]
 # 312 TFLOPS dense bf16 (NVIDIA A100 Tensor Core GPU datasheet; 624 with
 # sparsity).
-bf16_flops_per_ns_by_rows_and_depth = [[4096, 4096, 312000.0]]
+bf16_flops_per_ns_by_rows_n_k = [[4096, 4096, 4096, 312000.0]]
 # 1555 GB/s, the 40 GB part's HBM2 (A100 datasheet); the 80 GB parts reach
 # 1935-2039, and this file matches every A100 by name, so the lowest is
 # stated.

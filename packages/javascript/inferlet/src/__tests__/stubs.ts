@@ -20,6 +20,7 @@ export const modelStub = {
   submitDeadlineUs: () => 50_000n,
   runAheadWindow: () => 4,
   draftBlock: () => undefined,
+  draftDepth: () => 0,
   switches: () => [{ name: 'mode', values: ['encode', 'denoise'] }],
   lane: (switches: Array<[string, string]>) => ({
     inputs: switches.some(([k, v]) => k === 'mode' && v === 'denoise')

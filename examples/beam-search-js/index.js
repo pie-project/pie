@@ -4,7 +4,8 @@
 // The chat-templated prompt (or `prompt_tokens`) is prefilled once; that fire
 // picks the first `beams` tokens, and the beams then share one working set,
 // each reading the pool up to its own slot under a mask that admits its own
-// ancestry.
+// ancestry. The prompt is folded, so it is committed and no mask speaks of
+// it: a mask's column `c` is pool slot `n + c`.
 
 import { chat, eta, model } from '@pie-project/inferlet';
 
@@ -115,8 +116,9 @@ export function main(input) {
 
     // The first decode writes beam i's token at slot n + i; it sees the prompt and its own cell.
     const initMask = [];
-    for (let lane = 0; lane < B; lane++) for (let p = 0; p < poolLen; p++) initMask.push(p < n || p === n + lane);
-    const mask = Channel.fromShaped([B, poolLen], initMask);
+    const cells = poolLen - n;
+    for (let lane = 0; lane < B; lane++) for (let c = 0; c < cells; c++) initMask.push(c === lane);
+    const mask = Channel.fromShaped([B, cells], initMask);
     const slots = Channel.from(range(n, n + B), dtype.u32);
     // A beam's RoPE position is its depth in the sequence, not its pool slot.
     const pos = Channel.from(new Array(B).fill(n), dtype.u32);
@@ -132,8 +134,9 @@ export function main(input) {
       const wpos = baseB.add(iota(B));
 
       const inherited = gather(mask.take(), parent);
-      const col = broadcast(reshape(iota(poolLen), [1, poolLen]), [B, poolLen]);
-      const wposB = broadcast(reshape(wpos, [B, 1]), [B, poolLen]);
+      // Column `c` is slot `n + c`.
+      const col = broadcast(reshape(iota(cells).add(n), [1, cells]), [B, cells]);
+      const wposB = broadcast(reshape(wpos, [B, 1]), [B, cells]);
       const newpos = eq(col, wposB);
       mask.put(or(inherited, newpos));
 
