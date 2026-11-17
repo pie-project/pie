@@ -2213,6 +2213,9 @@ impl<B: Serve> Shell<B> {
         engine::GuestState {
             per_instance: lanes.len() as u64 * a_lane,
             per_pair: aligned,
+            // A capture row is no value of a guest's scratch: chunks
+            // one a piece where the rows outgrow a chunk's slots.
+            run: 1,
         }
     }
 

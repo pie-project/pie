@@ -41,12 +41,16 @@ fn slots(bytes: u64) -> u64 {
     bytes.div_ceil(SLOT)
 }
 
-/// The logical chunks `place` lies in.
+/// The logical chunks `place` lies in (no evacuation here: a run's
+/// chunks are its first's next logical ids too).
 fn chunks(place: &ScratchPlace) -> Vec<u32> {
     match place {
         ScratchPlace::None => Vec::new(),
         ScratchPlace::Run { first, .. } => vec![first / SPC],
-        ScratchPlace::Chunks(chunks) => chunks.clone(),
+        ScratchPlace::Chunks { run, pieces } => pieces
+            .iter()
+            .flat_map(|&first| first..first + run)
+            .collect(),
     }
 }
 /// The rungs: (16 tokens, 1 chunk), (256, 4), (2048, 12); the top rung's
@@ -69,13 +73,19 @@ fn shape(id: EngineShape, kind: SlotKind, slot_bytes: u64, role: SlotRole) -> Sl
 /// `total` chunks of 16 MiB in one segment, a kv list and a 4 KiB
 /// `Instance` shape, the rungs [`RUNGS`]; 8 host chunks.
 fn facts(total: u32) -> ChunkFacts {
+    facts_in(total, total)
+}
+
+/// [`facts`] in segments of `segment` chunks, all committed.
+fn facts_in(total: u32, segment: u32) -> ChunkFacts {
+    let segments = total.div_ceil(segment);
     let facts = ChunkFacts {
         chunk_bytes: CHUNK,
         total_chunks: total,
-        segment_chunks: total,
+        segment_chunks: segment,
         segments: SegmentFacts {
-            committed: 1,
-            max: 1,
+            committed: segments,
+            max: segments,
             growth: Growth::Fixed,
         },
         reserved: vec![ReservedRun {
@@ -115,7 +125,10 @@ struct Pools {
 }
 
 fn pools(total: u32) -> Pools {
-    let facts = facts(total);
+    pools_of(facts(total))
+}
+
+fn pools_of(facts: ChunkFacts) -> Pools {
     let device = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
     let host = Arc::new(Mutex::new(
         SharedPool::tier(&facts, facts.host_chunks)
@@ -149,6 +162,7 @@ impl GuestEngine {
             state: GuestState {
                 per_instance,
                 per_pair,
+                run: 1,
             },
             next: 0,
             bindings: Vec::new(),
@@ -305,7 +319,7 @@ fn the_pair_s_chunks_are_taken_once_and_given_back_at_the_last_close() {
         .collect();
     let pair = engine.bindings[0].pair.clone();
     assert!(
-        matches!(&pair, ScratchPlace::Chunks(chunks) if chunks.len() == 2),
+        matches!(&pair, ScratchPlace::Chunks { run: 1, pieces } if pieces.len() == 2),
         "two whole chunks: {pair:?}"
     );
     assert!(engine.bindings.iter().all(|binding| binding.pair == pair));
@@ -387,7 +401,7 @@ fn a_park_gives_the_scratch_back_whole_and_an_unpark_takes_fresh_chunks() {
     };
     assert_eq!(*rebound, id);
     let fresh = chunks(scratch);
-    assert!(matches!(scratch, ScratchPlace::Chunks(_)) && fresh.len() == 2, "{scratch:?}");
+    assert!(matches!(scratch, ScratchPlace::Chunks { .. }) && fresh.len() == 2, "{scratch:?}");
     assert!(
         matches!(pair_place, ScratchPlace::Run { slots: 1536, .. }),
         "a fresh run: {pair_place:?}"
@@ -409,7 +423,7 @@ fn refs_of(place: &ScratchPlace) -> Vec<u32> {
     match place {
         ScratchPlace::None => Vec::new(),
         ScratchPlace::Run { first, slots } => (*first..first + slots).collect(),
-        ScratchPlace::Chunks(chunks) => chunks
+        ScratchPlace::Chunks { .. } => chunks(place)
             .iter()
             .flat_map(|&chunk| chunk * SPC..(chunk + 1) * SPC)
             .collect(),
@@ -472,8 +486,8 @@ fn two_programs_scratch_and_pairs_lie_apart_and_stay_apart_after_a_park() {
     assert!(sampler.bindings.iter().all(|binding| binding.pair == pairs[0]));
     assert!(beam.bindings.iter().all(|binding| binding.pair == pairs[1]));
     assert!(matches!(scratch[0], ScratchPlace::Run { .. }));
-    assert!(matches!(scratch[3], ScratchPlace::Chunks(_)));
-    assert!(matches!(pairs[0], ScratchPlace::Chunks(_)));
+    assert!(matches!(scratch[3], ScratchPlace::Chunks { .. }));
+    assert!(matches!(pairs[0], ScratchPlace::Chunks { .. }));
     assert!(matches!(pairs[1], ScratchPlace::Run { .. }));
     let limit = device.lock().unwrap().pool().live_limit();
     let check = |scratch: &[ScratchPlace]| {
@@ -534,4 +548,281 @@ fn two_instances_told_one_run_are_caught() {
     assert!(disjoint(&[&run, &run]).is_err());
     assert!(disjoint(&[&run, &overlapping]).is_err());
     assert!(disjoint(&[&run, &adjacent]).is_ok());
+}
+
+/// A guest engine stating pieces of `run` chunks, `pieces` of them an
+/// instance and no pair, for program `program`, its instance ids from
+/// `next`.
+fn runs_of(program: u32, run: u32, pieces: u32, next: u64) -> (ProgramId, GuestEngine) {
+    let mut engine = GuestEngine::new(u64::from(run * pieces) * CHUNK, 0);
+    engine.state.run = run;
+    engine.next = next;
+    (ProgramId(u64::from(program)), engine)
+}
+
+/// Binds an instance of `program` on `engine` for `by`.
+fn bind_as(
+    roles: &RolesHandle,
+    engine: &mut GuestEngine,
+    program: ProgramId,
+    by: u128,
+) -> anyhow::Result<InstanceId> {
+    learn_program(roles, engine, program)?;
+    let binding = InstanceBinding {
+        program,
+        ..InstanceBinding::default()
+    };
+    Ok(bind_instance(Some(roles), engine, &binding, Some(holder(by)), |_| false)?.id)
+}
+
+/// Each piece of `place`: its chunks' physical ids, and the segment each
+/// lies in.
+fn pieces_of(device: &Shared, place: &ScratchPlace) -> Vec<Vec<(u32, u32)>> {
+    let ScratchPlace::Chunks { run, pieces } = place else {
+        panic!("runs of whole chunks: {place:?}");
+    };
+    let pool = device.lock().unwrap();
+    pieces
+        .iter()
+        .map(|&first| {
+            let at = pool.pool().physical(first).expect("held");
+            (at..at + run)
+                .map(|physical| (physical, pool.pool().segments().of(physical)))
+                .collect()
+        })
+        .collect()
+}
+
+/// A guest whose widest value takes 2.5 chunks lays its pieces in runs
+/// of 3 (`GuestState::run`): each piece the bind takes is 3 adjacent
+/// chunks inside one segment, the engine told each run's first. Two
+/// instances' runs share no chunk.
+#[test]
+fn a_bind_needing_a_run_of_three_takes_three_adjacent_chunks_in_one_segment() {
+    // Segments of 8 chunks: the null chunk at 0, the span at 52..64.
+    let Pools { device, roles } = pools_of(facts_in(64, 8));
+    let (program, mut engine) = runs_of(8, 3, 2, 0);
+    let before = held(&device);
+    let a = bind_as(&roles, &mut engine, program, 1).unwrap();
+    let b = bind_as(&roles, &mut engine, program, 2).unwrap();
+    assert_eq!(
+        held(&device) - before,
+        2 * 2 * 3 * CHUNK,
+        "two runs of 3 an instance"
+    );
+    let mut seen = std::collections::BTreeSet::new();
+    for binding in &engine.bindings {
+        assert!(
+            matches!(&binding.scratch, ScratchPlace::Chunks { run: 3, pieces } if pieces.len() == 2),
+            "{:?}",
+            binding.scratch
+        );
+        for piece in pieces_of(&device, &binding.scratch) {
+            let (first, segment) = piece[0];
+            assert_eq!(
+                piece,
+                (first..first + 3)
+                    .map(|at| (at, segment))
+                    .collect::<Vec<_>>(),
+                "3 adjacent chunks inside segment {segment}"
+            );
+            for (at, _) in piece {
+                assert!(seen.insert(at), "chunk {at} lies in two runs");
+            }
+        }
+    }
+    // Segment 0 holds the null chunk: runs 1..4 and 4..7, then 8..11 and
+    // 11..14, never 7..10 across the segments' end.
+    assert_eq!(
+        seen.into_iter().collect::<Vec<_>>(),
+        [1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13]
+    );
+    roles.lock().unwrap().close_instance(a);
+    roles.lock().unwrap().close_instance(b);
+    assert_eq!(held(&device), before);
+}
+
+/// Closing an instance gives its runs back whole: the next bind of the
+/// same runs takes the same chunks.
+#[test]
+fn release_then_rebind_reuses_the_run() {
+    let Pools { device, roles } = pools_of(facts_in(64, 8));
+    let (program, mut engine) = runs_of(8, 3, 1, 0);
+    let before = held(&device);
+    let id = bind_as(&roles, &mut engine, program, 1).unwrap();
+    let first = engine.bindings[0].scratch.clone();
+    roles.lock().unwrap().close_instance(id);
+    assert_eq!(held(&device), before, "the whole run back");
+    bind_as(&roles, &mut engine, program, 2).unwrap();
+    assert_eq!(engine.bindings[1].scratch, first, "the same run again");
+}
+
+/// Fills `roles`' room with single-chunk instances and closes every other
+/// one: the free chunks lie scattered, none beside another. The ids still
+/// bound.
+fn scatter(roles: &RolesHandle, device: &Shared) -> Vec<InstanceId> {
+    let (program, mut singles) = runs_of(9, 1, 1, 1000);
+    let mut ids = Vec::new();
+    for by in 0.. {
+        match bind_as(roles, &mut singles, program, 500 + by) {
+            Ok(id) => ids.push(id),
+            Err(_) => break,
+        }
+    }
+    assert!(ids.len() > 8, "{} singles", ids.len());
+    let mut kept = Vec::new();
+    for (k, id) in ids.into_iter().enumerate() {
+        if k % 2 == 0 {
+            roles.lock().unwrap().close_instance(id);
+        } else {
+            kept.push(id);
+        }
+    }
+    assert_eq!(
+        device.lock().unwrap().pool().free_chunk_runs(2),
+        0,
+        "none adjacent"
+    );
+    kept
+}
+
+/// Where only scattered single chunks are free, a bind needing a run of 3
+/// is refused by name, stating the run and what was free: no such run,
+/// and the free chunks there were. Nothing is taken.
+#[test]
+fn a_run_is_refused_by_name_where_only_scattered_chunks_are_free() {
+    let Pools { device, roles } = pools_of(facts_in(64, 8));
+    scatter(&roles, &device);
+    let free = device.lock().unwrap().pool().free_chunks();
+    assert!(
+        free >= 3,
+        "{free} free chunks: room enough, but not adjacent"
+    );
+    let before = held(&device);
+    let (program, mut engine) = runs_of(8, 3, 1, 0);
+    let error = bind_as(&roles, &mut engine, program, 1).expect_err("no run of 3 is free");
+    let named = error.to_string();
+    assert_eq!(
+        error.downcast_ref::<RolesError>(),
+        Some(&RolesError::GuestShort {
+            what: format!(
+                "an instance of {}'s scratch",
+                super::FireKey {
+                    program,
+                    extents: BindExtents::default(),
+                }
+            ),
+            bytes: 3 * CHUNK,
+            room: super::GuestRoom::Runs {
+                run: 3,
+                pieces: 1,
+                free_runs: 0,
+                free_chunks: free,
+            },
+        }),
+        "{named}"
+    );
+    assert!(
+        named.contains("1 runs of 3 adjacent chunks") && named.contains("0 such runs were free"),
+        "{named}"
+    );
+    assert_eq!(held(&device), before, "the refused bind took nothing");
+    assert!(engine.bindings.is_empty(), "the engine was not asked");
+}
+
+/// Many instances of runs 1, 2 and 3, bound and closed in a seeded random
+/// order, then one bind of a run of 6. It lands, or is refused by name
+/// with the free-run accounting, never a panic: where it is refused with
+/// free chunks enough, the pool is fragmented, and only a compaction of
+/// the bound runs would place it. The outcome is stated.
+#[test]
+fn mixed_runs_bound_and_closed_then_a_long_run_lands_or_is_refused_by_name() {
+    let Pools { device, roles } = pools_of(facts_in(128, 8));
+    let mut engines: Vec<(ProgramId, GuestEngine)> = (1..=3)
+        .map(|run| runs_of(20 + run, run, 1, u64::from(run) * 100_000))
+        .collect();
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut next = |bound: u64| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state % bound
+    };
+    let mut bound: Vec<(InstanceId, u32)> = Vec::new();
+    let (mut binds, mut refused) = (0u32, 0u32);
+    for step in 0..2000u128 {
+        if bound.is_empty() || next(3) != 0 {
+            let which = next(3) as usize;
+            let (program, engine) = &mut engines[which];
+            match bind_as(&roles, engine, *program, step) {
+                Ok(id) => {
+                    bound.push((id, which as u32 + 1));
+                    binds += 1;
+                }
+                Err(error) => {
+                    // Refused by name: a run of chunks, or (run 1, a
+                    // chunk's slots) a run of slots, short.
+                    assert!(
+                        matches!(
+                            error.downcast_ref::<RolesError>(),
+                            Some(RolesError::GuestShort { .. })
+                        ),
+                        "{error}"
+                    );
+                    refused += 1;
+                }
+            }
+        } else {
+            let at = next(bound.len() as u64) as usize;
+            let (id, _) = bound.swap_remove(at);
+            roles.lock().unwrap().close_instance(id);
+        }
+    }
+    // Half of what is bound closes, at random.
+    for _ in 0..bound.len() / 2 {
+        let at = next(bound.len() as u64) as usize;
+        let (id, _) = bound.swap_remove(at);
+        roles.lock().unwrap().close_instance(id);
+    }
+    let (free, runs) = {
+        let pool = device.lock().unwrap();
+        (pool.pool().free_chunks(), pool.pool().free_chunk_runs(6))
+    };
+    let (program, mut long) = runs_of(30, 6, 1, 900_000);
+    let outcome = bind_as(&roles, &mut long, program, 9_999);
+    match &outcome {
+        Ok(_) => assert!(runs >= 1, "it landed in a free run of 6"),
+        Err(error) => {
+            let named = error.to_string();
+            assert_eq!(
+                error.downcast_ref::<RolesError>().map(|error| match error {
+                    RolesError::GuestShort { room, .. } => *room,
+                    other => panic!("{other}"),
+                }),
+                Some(super::GuestRoom::Runs {
+                    run: 6,
+                    pieces: 1,
+                    free_runs: 0,
+                    free_chunks: free,
+                }),
+                "{named}"
+            );
+            assert_eq!(runs, 0);
+        }
+    }
+    eprintln!(
+        "{binds} binds, {refused} refused by name, {} bound; then a run of 6: {} \
+         ({free} free chunks, {runs} free runs of 6){}",
+        bound.len(),
+        if outcome.is_ok() {
+            "landed"
+        } else {
+            "refused by name"
+        },
+        if outcome.is_err() && free >= 6 {
+            ": fragmented, only a compaction would place it"
+        } else {
+            ""
+        },
+    );
 }

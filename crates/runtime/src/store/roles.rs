@@ -34,10 +34,14 @@
 //! back at its last close ([`InstanceBinding::pair`]), held as an adapter
 //! is. Either lies in the `Instance` role ([`::engine::ScratchPlace`]): one
 //! run of adjacent slots in a chunk where it fits a chunk's slots, else
-//! whole chunks. Their contents are dead between fires: a park gives them
-//! back and copies nothing, an unpark takes a fresh run or fresh chunks,
-//! and the engine is told where ([`Rebind::Instance`]) before the next
-//! fire.
+//! pieces of [`::engine::GuestState::run`] adjacent whole chunks, each
+//! inside one segment, so a value wider than a chunk lies whole in its
+//! piece. The room is placed at the bind, never at a fire; a bind no free
+//! run holds is refused by name ([`RolesError::GuestShort`], naming the run
+//! and what was free). Their contents are dead between fires: a park gives
+//! them back and copies nothing, an unpark takes a fresh run or fresh
+//! runs of chunks, and the engine is told where ([`Rebind::Instance`])
+//! before the next fire.
 //!
 //! An engine that states neither shape has no [`Roles`]: it keeps its
 //! tables and rings itself, as before.
@@ -126,8 +130,12 @@ pub enum RolesError {
     AdapterParked,
     #[error("{0}'s state is parked with the instances that hold it")]
     PairParked(FireKey),
-    #[error("the device pool has no room for {what}, {bytes} bytes of Instance slots")]
-    GuestShort { what: String, bytes: u64 },
+    #[error("the device pool has no room for {what}, {bytes} bytes of Instance slots: {room}")]
+    GuestShort {
+        what: String,
+        bytes: u64,
+        room: GuestRoom,
+    },
     #[error(
         "no chunk has {slots} adjacent free {role:?} slots for an item that must lie in one run"
     )]
@@ -145,6 +153,41 @@ pub enum RolesError {
     },
 }
 
+/// What a guest state asked of the pool, and what was free, where a bind
+/// is refused for want of it ([`RolesError::GuestShort`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestRoom {
+    /// One run of `slots` adjacent `Instance` slots in a chunk.
+    Slots { slots: u32 },
+    /// `pieces` runs of `run` adjacent whole chunks, each inside one
+    /// segment, and the free runs of that length and free chunks there
+    /// were.
+    Runs {
+        run: u32,
+        pieces: u32,
+        free_runs: u32,
+        free_chunks: u32,
+    },
+}
+
+impl std::fmt::Display for GuestRoom {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Slots { slots } => write!(f, "no chunk has a run of {slots} free slots"),
+            Self::Runs {
+                run,
+                pieces,
+                free_runs,
+                free_chunks,
+            } => write!(
+                f,
+                "{pieces} runs of {run} adjacent chunks inside one segment asked, and \
+                 {free_runs} such runs were free ({free_chunks} free chunks)"
+            ),
+        }
+    }
+}
+
 /// Where an item's slots lie.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tier {
@@ -159,20 +202,36 @@ enum Tier {
 /// and taken so again on every tier it moves to. Guest scratch, whose
 /// contents are dead between fires, is never copied and holds nothing off
 /// the device (`refs` empty there), fresh room taken when it comes back:
-/// `whole` chunks of slots, or (`run`) one run of that many slots.
+/// `pieces` runs of `chunks` adjacent whole chunks, or (`run`) one run of
+/// that many slots.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Part {
     role: SlotRole,
     refs: Vec<u32>,
     contiguous: bool,
-    whole: u32,
+    pieces: u32,
+    chunks: u32,
     run: u32,
 }
 
 impl Part {
     /// Guest scratch, dead between fires.
     fn dead(&self) -> bool {
-        self.whole > 0 || self.run > 0
+        self.pieces > 0 || self.run > 0
+    }
+
+    /// What it asks of the pool, as a refusal names it.
+    fn room(&self) -> GuestRoom {
+        if self.pieces > 0 {
+            GuestRoom::Runs {
+                run: self.chunks,
+                pieces: self.pieces,
+                free_runs: 0,
+                free_chunks: 0,
+            }
+        } else {
+            GuestRoom::Slots { slots: self.run }
+        }
     }
 }
 
@@ -288,26 +347,28 @@ fn scratch(parts: &[Part]) -> Option<&Part> {
     parts.iter().find(|part| part.dead())
 }
 
-/// Where a dead part lies: its run's first slot ref and slots, or the
-/// chunks its whole chunks' refs lie in, a chunk each `chunk_slots`.
+/// Where a dead part lies: its run's first slot ref and slots, or each of
+/// its runs of whole chunks by its first chunk, `chunk_slots` refs a chunk.
 fn place(part: &Part, chunk_slots: u32) -> ScratchPlace {
     let Some(&first) = part.refs.first() else {
         return ScratchPlace::None;
     };
-    if part.whole == 0 {
+    if part.pieces == 0 {
         return ScratchPlace::Run {
             first,
             slots: u32::try_from(part.refs.len()).unwrap_or(u32::MAX),
         };
     }
     let spc = chunk_slots.max(1);
-    ScratchPlace::Chunks(
-        part.refs
+    ScratchPlace::Chunks {
+        run: part.chunks,
+        pieces: part
+            .refs
             .iter()
-            .step_by(spc as usize)
+            .step_by((spc * part.chunks.max(1)) as usize)
             .map(|&r| r / spc)
             .collect(),
-    )
+    }
 }
 
 /// The slots taken for a channel about to register:
@@ -363,6 +424,9 @@ pub struct Roles {
     held: Vec<(InstanceId, Pump)>,
     /// The slots of an `Instance` chunk (1 where the pool states none).
     chunk_slots: u32,
+    /// The guest (program, extents) pairs whose room has been stated
+    /// ([`Self::take_instance`]): each states it once, at its first bind.
+    stated: std::collections::HashSet<FireKey>,
 }
 
 impl Roles {
@@ -389,6 +453,7 @@ impl Roles {
             items: HashMap::new(),
             held: Vec::new(),
             chunk_slots,
+            stated: std::collections::HashSet::new(),
         })
     }
 
@@ -409,7 +474,8 @@ impl Roles {
             role,
             refs,
             contiguous,
-            whole: 0,
+            pieces: 0,
+            chunks: 0,
             run: 0,
         };
         if slots == 0 {
@@ -435,60 +501,98 @@ impl Roles {
         }
     }
 
-    /// Room on the device for `bytes` of guest scratch (`what`): one run of
-    /// `Instance` slots in a chunk where they fit a chunk's slots, else
-    /// whole chunks; all or none, refused by name.
-    fn take_scratch(&self, bytes: u64, what: impl Fn() -> String) -> Result<Part, RolesError> {
+    /// The dead part `bytes` of guest scratch take, pieces of `run`
+    /// chunks each: one run of `Instance` slots in a chunk where they fit a
+    /// chunk's slots, else whole runs of `run` adjacent chunks.
+    fn scratch_part(&self, bytes: u64, run: u32) -> Result<Part, RolesError> {
         let shape = self.shape(SlotRole::Instance)?;
         let slot = shape.slot_bytes.max(1);
-        let (whole, run) = if bytes <= u64::from(self.chunk_slots) * slot {
+        let run = run.max(1);
+        let (pieces, slots) = if bytes <= u64::from(self.chunk_slots) * slot {
             (0, u32::try_from(bytes.div_ceil(slot)).unwrap_or(u32::MAX))
         } else {
             let chunk = self.device.lock().unwrap().pool().chunk_bytes().max(1);
-            (u32::try_from(bytes.div_ceil(chunk)).unwrap_or(u32::MAX), 0)
+            let piece = chunk.saturating_mul(u64::from(run));
+            (u32::try_from(bytes.div_ceil(piece)).unwrap_or(u32::MAX), 0)
         };
-        let part = Part {
+        Ok(Part {
             role: SlotRole::Instance,
             refs: Vec::new(),
             contiguous: true,
-            whole,
-            run,
-        };
-        self.retake(&part).map_err(|_| RolesError::GuestShort {
-            what: what(),
-            bytes,
+            pieces,
+            chunks: if pieces > 0 { run } else { 0 },
+            run: slots,
         })
     }
 
-    /// Fresh device room for dead part `like`: its run, or its whole
-    /// chunks, all or none.
-    fn retake(&self, like: &Part) -> Result<Part, RolesError> {
-        let shape = self.shape(SlotRole::Instance)?;
-        let mut pool = self.device.lock().unwrap();
-        let mut refs = Vec::new();
-        let runs = if like.whole > 0 {
-            vec![self.chunk_slots; like.whole as usize]
-        } else {
-            vec![like.run]
-        };
-        for slots in runs {
-            match pool.take_run(shape.pool, u64::from(slots)) {
-                Ok(taken) => refs.extend(taken),
-                Err(_) => {
-                    if !refs.is_empty() {
-                        pool.give_refs(shape.pool, &refs);
-                    }
-                    return Err(RolesError::NoRun {
-                        role: SlotRole::Instance,
-                        slots,
-                    });
-                }
-            }
-        }
-        Ok(Part {
-            refs,
-            ..like.clone()
+    /// Room on the device for `bytes` of guest scratch (`what`) in pieces
+    /// of `run` chunks ([`Self::scratch_part`]); all or none, refused by
+    /// name with what it asked and what was free.
+    fn take_scratch(
+        &self,
+        bytes: u64,
+        run: u32,
+        what: impl Fn() -> String,
+    ) -> Result<Part, RolesError> {
+        let part = self.scratch_part(bytes, run)?;
+        self.retake(&part).map_err(|room| RolesError::GuestShort {
+            what: what(),
+            bytes,
+            room,
         })
+    }
+
+    /// Fresh device room for dead part `like`: its run of slots, or its
+    /// runs of whole chunks, each inside one segment; all or none, else
+    /// what it asked and what was free.
+    fn retake(&self, like: &Part) -> Result<Part, GuestRoom> {
+        let shape = self.shape(SlotRole::Instance).map_err(|_| like.room())?;
+        let mut pool = self.device.lock().unwrap();
+        let taken = if like.pieces > 0 {
+            pool.take_chunk_runs(shape.pool, like.chunks, like.pieces)
+        } else {
+            pool.take_run(shape.pool, u64::from(like.run))
+        };
+        match taken {
+            Ok(refs) => Ok(Part {
+                refs,
+                ..like.clone()
+            }),
+            Err(SlotError::NoChunkRun {
+                run,
+                pieces,
+                free_runs,
+                free_chunks,
+            }) => Err(GuestRoom::Runs {
+                run,
+                pieces,
+                free_runs,
+                free_chunks,
+            }),
+            Err(_) => Err(like.room()),
+        }
+    }
+
+    /// The bytes dead part `part` holds on the device.
+    fn dead_bytes(&self, part: &Part) -> u64 {
+        if part.pieces > 0 {
+            let chunk = self.device.lock().unwrap().pool().chunk_bytes();
+            u64::from(part.pieces) * u64::from(part.chunks) * chunk
+        } else {
+            let slot = self
+                .shapes
+                .of(part.role)
+                .map_or(0, |shape| shape.slot_bytes);
+            u64::from(part.run) * slot
+        }
+    }
+
+    /// The free runs of `run` adjacent `Instance` chunks inside one
+    /// segment the device pool holds now: how many more pieces of a guest
+    /// state that lies in runs of that length it could place.
+    #[must_use]
+    pub fn free_runs(&self, run: u32) -> u32 {
+        self.device.lock().unwrap().pool().free_chunk_runs(run)
     }
 
     fn give(&self, on: &Shared, parts: &[Part]) {
@@ -512,7 +616,11 @@ impl Roles {
         for part in like {
             let took = match (part.dead(), device) {
                 (false, _) => self.take(on, part.role, part.refs.len() as u32, part.contiguous),
-                (true, true) => self.retake(part),
+                (true, true) => self.retake(part).map_err(|room| RolesError::GuestShort {
+                    what: "a parked guest state coming back".into(),
+                    bytes: self.dead_bytes(part),
+                    room,
+                }),
                 (true, false) => Ok(Part {
                     refs: Vec::new(),
                     ..part.clone()
@@ -637,8 +745,12 @@ impl Roles {
                 },
             };
         }
+        let run = state.chunks_a_piece();
+        if (state.per_instance > 0 || state.per_pair > 0) && self.stated.insert(pair) {
+            self.state_room(pair, state);
+        }
         if state.per_instance > 0 {
-            match self.take_scratch(state.per_instance, || {
+            match self.take_scratch(state.per_instance, run, || {
                 format!("an instance of {pair}'s scratch")
             }) {
                 Ok(part) => taken.parts.push(part),
@@ -658,7 +770,7 @@ impl Roles {
                     return Err(RolesError::PairParked(pair));
                 }
                 None => {
-                    match self.take_scratch(state.per_pair, || format!("{pair}'s state")) {
+                    match self.take_scratch(state.per_pair, run, || format!("{pair}'s state")) {
                         Ok(part) => Some((pair, part, true)),
                         Err(error) => {
                             self.untake(taken);
@@ -669,6 +781,26 @@ impl Roles {
             };
         }
         Ok(taken)
+    }
+
+    /// States, once a pair, what its guest state asks of the pool and how
+    /// many of it the pool holds free as it stands: the run of adjacent
+    /// chunks a piece takes, the pieces an instance and the pair take, and
+    /// the free runs of that length, so a refusal for want of a run is
+    /// visible before it happens.
+    fn state_room(&self, pair: FireKey, state: GuestState) {
+        let run = state.chunks_a_piece();
+        let pieces = |bytes: u64| self.scratch_part(bytes, run).map_or(0, |part| part.pieces);
+        tracing::info!(
+            %pair,
+            per_instance = state.per_instance,
+            per_pair = state.per_pair,
+            run,
+            instance_pieces = pieces(state.per_instance),
+            pair_pieces = pieces(state.per_pair),
+            free_runs = self.free_runs(run),
+            "a guest program's room: pieces of `run` adjacent chunks, and the free runs of that length"
+        );
     }
 
     /// The bind of `taken` failed: its slots go back.
