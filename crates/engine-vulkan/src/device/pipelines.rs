@@ -184,20 +184,18 @@ fn set_layout(
                 .stage_flags(vk::ShaderStageFlags::COMPUTE)
         })
         .collect();
-    // On a device that rebinds a recording's pool segments, each binding
-    // may be written after a recording binds the set.
+    // Each binding may be written after a recording binds the set: a
+    // recording's pool segments are rebound as they come and go.
     let flags = vec![vk::DescriptorBindingFlags::UPDATE_AFTER_BIND; entries.len()];
     let mut binding_flags =
         vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&flags);
-    let mut info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&entries);
-    if core.features.rebinds {
-        info = info
-            .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL)
-            .push_next(&mut binding_flags);
-    }
+    let info = vk::DescriptorSetLayoutCreateInfo::default()
+        .bindings(&entries)
+        .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL)
+        .push_next(&mut binding_flags);
     // SAFETY: `core.device` is live and the create info, `entries` and
-    // `flags` outlive the call; the update-after-bind flags are chained
-    // only where the device enabled the feature.
+    // `flags` outlive the call; the device enabled update-after-bind (a
+    // load is refused without it).
     let layout = unsafe { core.device.create_descriptor_set_layout(&info, None) }
     .map_err(|e| core.fault("vkCreateDescriptorSetLayout", e))?;
     let held = Arc::new(SetLayout {

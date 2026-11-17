@@ -1548,15 +1548,22 @@ impl<B: Serve> Shell<B> {
 
         let adapter_fact = adapter_fact(&compiled.classes, &corrected);
         let adapter_slots = crate::adapter::Slots::new(weights.adapter_seats());
-        // The classes a decode fire is of: those every request landing in
-        // them reads one row of, a plain request among them.
+        // The classes the decode lattice arms: of those the shared rule arms
+        // (`engine::load::armed`: a plain request's, a drafter's verify's),
+        // the ones every request landing in them reads one row of. A scored
+        // class is armed at the lattice's octaves alone, apart.
         let landing = poem_exec::feeds::landing_requests(&boot.trace.facts, &compiled.classes);
-        let outputs =
-            poem_exec::feeds::class_outputs(&boot.trace, &compiled).map_err(|why| program("serve::raise", why))?;
-        let plain = poem_exec::feeds::plain_of(&landing, &outputs);
+        let outputs = poem_exec::feeds::class_outputs(&boot.trace, &compiled)
+            .map_err(|why| program("serve::raise", why))?;
+        let armed = engine::load::armed::lattice_classes(&landing, |class| {
+            poem_exec::feeds::drafter(&landing, &outputs, class)
+        });
+        let scored = engine::load::armed::scored_classes(&landing);
         let decoding = poem_ir::ClassSet::of(
             poem_exec::feeds::decoding_of(&landing).iter().filter(|&class| {
-                plain.contains(class) && !asks.unservable.iter().any(|held| held.class == class)
+                armed.contains(class)
+                    && !scored.contains(class)
+                    && !asks.unservable.iter().any(|held| held.class == class)
             }),
         );
 

@@ -243,11 +243,8 @@ impl Sets {
                 .ty(vk::DescriptorType::UNIFORM_BUFFER)
                 .descriptor_count(SETS_PER_POOL),
         ];
-        let flags = if core.features.rebinds {
-            vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND
-        } else {
-            vk::DescriptorPoolCreateFlags::empty()
-        };
+        // A recording's pool segments are rebound after it binds them.
+        let flags = vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND;
         // SAFETY: `d` is live and the create info is complete.
         let pool = unsafe {
             d.create_descriptor_pool(
@@ -283,13 +280,22 @@ pub struct Enabled {
     pub memory_budget: bool,
 
     pub coopmat: bool,
+}
 
-    /// A descriptor of a set a recording binds may be written after it is
-    /// recorded (`descriptorBindingStorageBufferUpdateAfterBind`): a
-    /// recording's pool segments are rebound when they are backed or given
-    /// back ([`Context::rebind_segments`]), so it stands for the load's
-    /// life. Without it the device keeps no recording.
-    pub rebinds: bool,
+/// Refuses a device that cannot write a descriptor of a set a recording
+/// binds after it is recorded (`descriptorBindingStorageBufferUpdateAfterBind`):
+/// a recording's pool segments are rebound when they are backed or given
+/// back ([`Context::rebind_segments`]), and every decode body serving fires
+/// is a recording. Such a device is served by the wgpu engine.
+fn recorded_bodies(name: &str, update_after_bind: bool) -> std::result::Result<(), String> {
+    if update_after_bind {
+        return Ok(());
+    }
+    Err(format!(
+        "Vulkan device {name} lacks descriptor update-after-bind \
+         (descriptorBindingStorageBufferUpdateAfterBind), which recorded bodies need; serve it \
+         with the wgpu engine"
+    ))
 }
 
 impl Core {
@@ -856,8 +862,13 @@ impl Context {
                 && f12.shader_float16 == vk::TRUE
                 && f12.vulkan_memory_model == vk::TRUE
                 && (pinned == Some(32) || subgroup.subgroup_size == 32),
-            rebinds: f12.descriptor_binding_storage_buffer_update_after_bind == vk::TRUE,
         };
+        if let Err(detail) = recorded_bodies(
+            &name,
+            f12.descriptor_binding_storage_buffer_update_after_bind == vk::TRUE,
+        ) {
+            bail!(Fault::NoDevice { detail });
+        }
         if !enabled.shader_int16 || !enabled.storage_16bit {
             bail!(Fault::NoDevice {
                 detail: format!(
@@ -879,7 +890,7 @@ impl Context {
             )
             .vulkan_memory_model(f12.vulkan_memory_model == vk::TRUE)
             .vulkan_memory_model_device_scope(f12.vulkan_memory_model_device_scope == vk::TRUE)
-            .descriptor_binding_storage_buffer_update_after_bind(enabled.rebinds);
+            .descriptor_binding_storage_buffer_update_after_bind(true);
         let mut e13 = vk::PhysicalDeviceVulkan13Features::default()
             .subgroup_size_control(enabled.subgroup_size_control)
             .synchronization2(f13.synchronization2 == vk::TRUE);
@@ -1054,13 +1065,6 @@ impl Context {
         self.pipeline_cache().persist()
     }
 
-    /// Whether a recording's descriptors can be rebound after it is
-    /// recorded ([`Enabled::rebinds`]).
-    #[must_use]
-    pub fn rebinds(&self) -> bool {
-        self.core.features.rebinds
-    }
-
     /// States the pool's segments: for each, the buffer backing it (or
     /// `None`) and its stand-in. Each kept frame's descriptor of a segment
     /// is written to its buffer, or its stand-in where it is not backed;
@@ -1114,15 +1118,9 @@ impl Context {
         if writes.is_empty() {
             return Ok(());
         }
-        if !self.core.features.rebinds {
-            return Err(Fault::Unbound {
-                what: "a recording's pool segments rebound on a device that writes no \
-                       descriptor after it is bound"
-                    .to_string(),
-            });
-        }
         // SAFETY: every set was allocated with an update-after-bind layout
-        // from an update-after-bind pool (the device rebinds), and no
+        // from an update-after-bind pool (the device has the feature, or
+        // the load was refused), and no
         // submission that binds it is pending: the pool drained first.
         unsafe { self.core.device.update_descriptor_sets(&writes, &[]) };
         Ok(())
@@ -2398,4 +2396,18 @@ impl Inner {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::recorded_bodies;
+
+    /// A device without descriptor update-after-bind is refused by name,
+    /// with the feature it lacks and the engine that serves it; one with it
+    /// is not.
+    #[test]
+    fn a_device_without_update_after_bind_is_refused_by_name() {
+        assert_eq!(recorded_bodies("Mali-G52", true), Ok(()));
+        let why = recorded_bodies("Mali-G52", false).expect_err("refused");
+        assert!(why.contains("Vulkan device Mali-G52"), "{why}");
+        assert!(why.contains("descriptorBindingStorageBufferUpdateAfterBind"), "{why}");
+        assert!(why.contains("serve it with the wgpu engine"), "{why}");
+    }
+}

@@ -9,11 +9,6 @@ use poem_ir::Dtype;
 use crate::device::{Api, Buffer, Context, Frame, Pending, Pipelines};
 use engine_gpu::error::{Fault, Result};
 
-/// The debug switch that has a load keep no recording and encode every
-/// fire, as a device without `descriptorBindingStorageBufferUpdateAfterBind`
-/// does: so that path is tested where every device has the feature.
-const ENCODE_EVERY_FIRE: &str = "PIE_VULKAN_ENCODE_EVERY_FIRE";
-
 /// What the shell keeps of Vulkan's own: the frames kept to replay, and
 /// what each harvested step read out, for readers behind it on the queue.
 pub struct Shelf {
@@ -160,20 +155,6 @@ impl Serve for Api {
         Ok(Shelf {
             recorder: if weights_stream {
                 crate::record::Recorder::refusing("the weights plane streams")
-            } else if std::env::var_os(ENCODE_EVERY_FIRE).is_some() {
-                // The debug switch: the path a device without the feature
-                // below takes, on any device, to test it.
-                crate::record::Recorder::refusing(
-                    "PIE_VULKAN_ENCODE_EVERY_FIRE is set (the debug switch that takes the path \
-                     of a device without descriptorBindingStorageBufferUpdateAfterBind)",
-                )
-            } else if !device.rebinds() {
-                // A recording binds the pool's segments, which come and go
-                // while the load serves.
-                crate::record::Recorder::refusing(
-                    "the device writes no descriptor a recording binds \
-                     (descriptorBindingStorageBufferUpdateAfterBind)",
-                )
             } else {
                 crate::record::Recorder::new()
             },

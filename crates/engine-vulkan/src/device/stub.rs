@@ -143,10 +143,6 @@ impl Context {
         match self.never {}
     }
 
-    pub fn rebinds(&self) -> bool {
-        match self.never {}
-    }
-
     pub fn persist_pipelines(&self) -> Result<()> {
         match self.never {}
     }

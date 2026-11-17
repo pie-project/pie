@@ -608,6 +608,21 @@ pub fn plain_of(
     }))
 }
 
+/// Whether `class` writes an output no class a plain request lands in
+/// writes: a drafter's (MTP's `mtp.drafts`), which a drafter's verify reads.
+#[must_use]
+pub fn drafter(landing: &[Vec<poem_ir::Request>], outputs: &[ClassOutput], class: usize) -> bool {
+    let plain = |class: usize| landing[class].iter().any(poem_ir::Request::plain);
+    let plain_names: std::collections::HashSet<&str> = outputs
+        .iter()
+        .filter(|out| (0..landing.len()).any(|c| plain(c) && out.classes.contains(c)))
+        .map(|out| out.decl.name.as_str())
+        .collect();
+    outputs
+        .iter()
+        .any(|out| out.classes.contains(class) && !plain_names.contains(out.decl.name.as_str()))
+}
+
 /// Whether only its query length and its reading the pass's drafts set
 /// this request apart.
 #[must_use]
