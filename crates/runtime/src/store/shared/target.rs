@@ -63,8 +63,8 @@ impl SharedGrow {
             let pool = shared.lock().unwrap();
             (pool.mapped_segments(), pool.start_cap())
         };
-        // Fires start cut to the rung the pool starts at: on a span backed
-        // on demand, the smallest, until a raise reaches the engine.
+        // Fires start cut to the rung the pool starts at: the largest, no
+        // cap.
         super::set_fire_cap(engine, start_cap);
         Self {
             model,
@@ -156,6 +156,14 @@ impl SharedGrow {
     /// (`pipeline::fire::prefill_want`), and a batch's ask raises at once
     /// where nothing moves. Not the engine's whole lane count: a pool with
     /// one live lane rests at a small rung.
+    /// Whether a raise waits on the governor's grow of the span yield gave
+    /// back ([`Self::span_shed`]): the rung is held down, and the passes
+    /// asking past it are told so ([`super::hold_rung`]).
+    fn set_span_shed(&self, shed: bool) {
+        self.span_shed.store(shed, Ordering::Release);
+        super::hold_rung(self.engine, shed);
+    }
+
     fn walk_rows(&self) -> u32 {
         super::wanted_rows(self.engine).max((self.live_lanes)())
     }
@@ -248,7 +256,7 @@ impl SharedGrow {
                     // Its activation lies in span segments yield gave back:
                     // the governor's grow backs them again, never a fire's
                     // retirement.
-                    self.span_shed.store(true, Ordering::Release);
+                    self.set_span_shed(true);
                     tracing::debug!(engine = self.engine, %error, goal, "the activation rung waits for the governor's grow");
                     return;
                 }
@@ -585,7 +593,7 @@ impl SharedGrow {
                         self.shared.lock().unwrap().span_committed(n);
                         // The span is whole again: a raise waiting on it is
                         // tried now.
-                        self.span_shed.store(false, Ordering::Release);
+                        self.set_span_shed(false);
                         super::rung_changed(self.engine);
                         super::ask_walk(self.engine);
                         if let Some(planner) = crate::planner::planner_for(self.model, self.engine)
@@ -671,7 +679,7 @@ impl PoolTarget for SharedGrow {
         // raise into the span yield gave back may be tried now, the walk
         // backing the span again first (`SharedPool::grow_step`).
         if segments > was {
-            self.span_shed.store(false, Ordering::Release);
+            self.set_span_shed(false);
         }
         self.wake.notify_one();
         let mapped = self.shared.lock().unwrap().mapped_segments();
@@ -859,6 +867,10 @@ mod tests {
             "refused: the rung in hand"
         );
         assert!(grow.span_shed_for_test(), "it waits on the governor's grow");
+        assert!(
+            super::super::rung_held(ENGINE),
+            "the rung is held down: a pass asking past it is cut to it"
+        );
         // A fire retiring brings no span back: nothing is tried again.
         grow.room_freed();
         grow.walk_rung().await;
@@ -873,6 +885,10 @@ mod tests {
         // applied, no fire retiring.
         let _ = grow.retarget(mapped);
         assert!(!grow.span_shed_for_test(), "the grow re-arms it");
+        assert!(
+            !super::super::rung_held(ENGINE),
+            "held no longer: a pass waits for the raise in flight"
+        );
         let regrow = shared.lock().unwrap().pool().span_to_regrow();
         assert_eq!(regrow, Some(2));
         shared.lock().unwrap().span_committed(2);

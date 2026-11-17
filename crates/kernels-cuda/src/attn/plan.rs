@@ -157,6 +157,10 @@ pub struct PrefillPlan {
     pub graph_capturable: bool,
     pub graph_refusal: Option<String>,
     pub mask_indptr: Option<Tensor>,
+    /// Per request, the committed boundary its mask speaks of the keys past
+    /// and its wide bit (`PrefillPagedParams::maybe_mask_origin`); the engine
+    /// binds it beside `mask_indptr`.
+    pub mask_origin: Option<Tensor>,
     pub device: Device,
 }
 
@@ -494,6 +498,7 @@ pub fn plan_prefill(
         graph_capturable: capturable,
         graph_refusal,
         mask_indptr,
+        mask_origin: None,
         device: *device,
     })
 }

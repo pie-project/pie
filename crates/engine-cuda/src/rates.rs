@@ -11,21 +11,28 @@
 //!
 //! Every shape is `engine::rates`' lattice, and its counts turn the times
 //! into rates, so the CUDA and ROCm rates mean what every backend's do:
-//! - `bf16_flops_per_ns_by_rows_and_depth`: the matmul `m x k x k` at each
-//!   row count of [`LATTICE_ROWS`] and depth of [`DEPTHS`] through `linear::gemm` (cuBLAS(Lt) on CUDA,
+//! - `bf16_flops_per_ns_by_rows_n_k`: the matmul `m x n x k` at each row
+//!   count of the load's candidate rungs ([`lattice_rows`]) and each column count and depth of [`DEPTHS`]
+//!   through `linear::gemm` (cuBLAS(Lt) on CUDA,
 //!   hipBLASLt/rocBLAS on ROCm) under the GEMM tactics serving runs; its
-//!   launches rotate through `engine::rates::weights_at` weight planes, `engine::rates::WEIGHT_BYTES`
+//!   launches rotate through `engine::rates::weights_at(n, k)` weight planes, `engine::rates::WEIGHT_BYTES`
 //!   of them, several times what any last-level cache holds, so each reads
 //!   its weight from device memory as a layer's does.
-//! - `attn_flops_per_ns_by_keys`: the paged prefill attention at
+//! - `attn_flops_per_ns_by_keys_and_dim`: the paged prefill attention at
 //!   [`ATTN_SHAPE`]'s heads over each of [`ATTN_KEYS`] (a sequence of as many
-//!   rows attending itself), causal, in pages of [`PAGE`].
-//! - `scan_elements_per_ns`: the causal conv and the chunked gated delta
+//!   rows attending itself) and each head width of `ATTN_DIMS`, causal, in
+//!   pages of [`PAGE`]; its launches rotate through
+//!   `engine::rates::attn_sets_at` sets of q rows and kv pages, so each reads
+//!   them from device memory as a served layer's does.
+//! - `scan_elements_per_ns_by_tokens`: at each of `engine::rates::SCAN_TOKENS`,
+//!   the causal conv and the chunked gated delta
 //!   scan at [`SCAN_SHAPE`].
 //! - `bytes_per_ns`: a [`COPY_BYTES`] device-to-device copy, read plus write.
-//! - `launch_ns`: [`LAUNCHES`] near-empty kernels captured in one graph, the
-//!   graph's time over [`LAUNCHES`]: a dispatch's cost inside a recorded
-//!   body, as serving replays them.
+//! - `launch_ns`: a chain of dependent near-empty kernels captured in one
+//!   graph against one kernel of the chain's whole work, at each length of
+//!   `engine::rates::LAUNCH_CHAINS` (`engine::rates::launch_from`): what a
+//!   dispatch adds to its work inside a recorded body, as serving replays
+//!   them.
 //!
 //! Every float operand the matmul, attention and scan read (activations,
 //! weight planes, the kv pages, the scan's input, conv weight and states) is
@@ -34,19 +41,38 @@
 //! Index and page tables, gates, outputs and workspace stay as laid.
 
 #[cfg_attr(not(feature = "device"), allow(unused_imports))]
-use engine::rates::{
-    ATTN_DIMS, ATTN_KEYS, ATTN_SHAPE, DEPTHS, LATTICE_ROWS, SCAN_SHAPE, weights_at,
-};
+use engine::rates::{ATTN_DIMS, ATTN_KEYS, ATTN_SHAPE, DEPTHS, SCAN_SHAPE, weights_at};
 use profile::fire::Rates;
+
+/// The rows the matmul grid walks under `chip`: the chip's rung lattice
+/// ([`crate::api::rung_lattice`] at its `engine.lattice_steps`,
+/// `prefill_lattice_from` and `_steps`) as far as a `u32` of rows reaches,
+/// ascending; the grid ends at the card's saturation point on it
+/// ([`Saturation`]), the top a load's candidates run to.
+#[must_use]
+pub fn lattice_rows(chip: &profile::Profile) -> Vec<u32> {
+    let mut lattice = crate::api::rung_lattice(&crate::chip::Engine::of(chip), u32::MAX);
+    lattice.pop();
+    lattice
+}
+
+/// Where the matmul grid saturates: `rows` the last where an `(n, k)`
+/// shape's cost a row fell more than `profile::AGREEMENT` below the least
+/// before it (`best_gain` the most, at `best_shape`), none doing so from
+/// there through `through`, a doubling or more past it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Saturation {
+    pub rows: u32,
+    pub through: u32,
+    pub best_gain: f64,
+    pub best_shape: (u32, u32),
+}
 
 /// The kv cache's page, as a served load pages it.
 pub const PAGE: u32 = 16;
 
 /// The copy's bytes: past every last-level cache, so it moves device memory.
 pub const COPY_BYTES: usize = 256 << 20;
-
-/// The kernels the launch's graph captures.
-pub const LAUNCHES: u32 = 1000;
 
 /// A burst's length.
 pub const BURST_NS: f64 = 20e6;
@@ -59,15 +85,14 @@ pub const ROUNDS: usize = 5;
 pub const LAUNCH_ROUNDS: usize = 15;
 
 /// The rates of device `ordinal` under `chip`'s tuning, its matmuls under
-/// the GEMM tactics serving picks from `cache` (the engine's cache root,
-/// `$PIE_HOME/cache`, whose `gemm-algos` table a served load reads): a
-/// shape it holds runs its pick, and one it does not is timed once and kept
-/// there, so every later measurement and every load runs that same pick.
+/// the GEMM tactic tables the caller installed
+/// (`kernels_cuda::linear::gemm::install_tactics`, as a served load does),
+/// the kernels' disk cache under `cache` (`$PIE_HOME/cache`).
 pub fn measure(
     ordinal: i32,
     chip: &profile::Profile,
     cache: Option<&std::path::Path>,
-) -> Result<Rates, String> {
+) -> Result<(Rates, Saturation), String> {
     kernels_cuda::disk::install(cache);
     #[cfg(feature = "device")]
     {
@@ -84,13 +109,50 @@ pub fn measure(
 #[allow(unsafe_code)]
 mod on_device {
     use core::ffi::c_void;
+    use core::sync::atomic::{AtomicUsize, Ordering};
 
     use kernels_cuda::attn::plan::{Live, Shape, Workspace};
     use kernels_cuda::{Ctx, KvPool, RaggedTensor, RecurrentPool, Slabs, Tensor};
     use poem_ir::Dtype;
 
     use super::*;
-    use crate::device::{Buffer, Context, Graph, rt};
+    use crate::device::{Context, Graph, rt};
+
+    /// The device bytes the step's buffers hold now, and the most they held.
+    static LIVE: AtomicUsize = AtomicUsize::new(0);
+    static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+    /// A device buffer the step holds, counted in [`LIVE`] and [`PEAK`]
+    /// while it lives.
+    struct Buffer(crate::device::Buffer);
+
+    impl Buffer {
+        fn zeroed(bytes: usize) -> crate::error::Result<Buffer> {
+            let b = crate::device::Buffer::zeroed(bytes)?;
+            let live = LIVE.fetch_add(b.bytes(), Ordering::Relaxed) + b.bytes();
+            PEAK.fetch_max(live, Ordering::Relaxed);
+            Ok(Buffer(b))
+        }
+    }
+
+    impl core::ops::Deref for Buffer {
+        type Target = crate::device::Buffer;
+        fn deref(&self) -> &crate::device::Buffer {
+            &self.0
+        }
+    }
+
+    impl core::ops::DerefMut for Buffer {
+        fn deref_mut(&mut self) -> &mut crate::device::Buffer {
+            &mut self.0
+        }
+    }
+
+    impl Drop for Buffer {
+        fn drop(&mut self) {
+            LIVE.fetch_sub(self.0.bytes(), Ordering::Relaxed);
+        }
+    }
 
     type Kernel = kernels_cuda::Error;
 
@@ -188,7 +250,11 @@ mod on_device {
     }
 
     /// Lays the scratch slabs `launch` takes on its context (a size-only
-    /// walk of it, as a load lays its fires'), in memory `held` keeps.
+    /// walk of it, as a load lays its fires'), in the one buffer `held`
+    /// keeps: zeroed again where it is wide enough, else replaced by a wider
+    /// one. Every fire before has landed (each timing waits on its stop
+    /// event) and the launch's graph is gone, so nothing still reads the
+    /// slabs laid before; one buffer a point would hold the grid's 1425.
     fn lay(
         held: &mut Vec<Buffer>,
         launch: impl FnOnce() -> Result<(), Kernel>,
@@ -199,11 +265,20 @@ mod on_device {
         if placed.is_empty() {
             return Ok(());
         }
-        let buffer = Buffer::zeroed(Slabs::placed_bytes(&placed)).map_err(say("the slabs"))?;
-        // SAFETY: `buffer` is zeroed device memory of the bytes these slabs
-        // take, kept in `held` past every launch that takes them.
+        let bytes = Slabs::placed_bytes(&placed);
+        match held.last_mut() {
+            Some(buffer) if buffer.bytes() >= bytes => {
+                buffer.zero_span(0, bytes).map_err(say("the slabs"))?;
+            }
+            _ => {
+                held.clear();
+                held.push(Buffer::zeroed(bytes).map_err(say("the slabs"))?);
+            }
+        }
+        let buffer = held.last().expect("laid just above");
+        // SAFETY: `buffer` is zeroed device memory of at least the bytes
+        // these slabs take, kept in `held` past every launch that takes them.
         unsafe { Slabs::place(buffer.ptr() as *mut c_void, &placed) };
-        held.push(buffer);
         Ok(())
     }
 
@@ -250,69 +325,290 @@ mod on_device {
         Ok(b)
     }
 
-    pub(super) fn measure(ordinal: i32, chip: &profile::Profile) -> Result<Rates, String> {
+    pub(super) fn measure(
+        ordinal: i32,
+        chip: &profile::Profile,
+    ) -> Result<(Rates, Saturation), String> {
         let mut device = Context::bind(ordinal, None).map_err(say("the device"))?;
         device.set_tuning(kernels_cuda::tuning::Tuning::of(chip));
         let stream = device.stream();
         let clock = Clock::new(stream)?;
         let mut held = Vec::new();
         let random = Random::new(stream)?;
-        let grid = gemm(device.ctx(), &clock, &random, &mut held)?;
+        // The launch first: every rate below takes its dispatches' launches
+        // off (engine::rates::rate_from).
+        let launch = launch(device.ctx(), stream, &clock, &mut held)?;
+        let gap = launch as f64;
+        let warmed = warm(device.ctx(), &clock, &random, &mut held)?;
+        eprintln!(
+            "[rates]: warm-up: {} rotations of the {}^3 matmul, settled at {:.1} TFLOP/s",
+            warmed.rotations,
+            engine::rates::WARM_SHAPE.0,
+            warmed.rate / 1e3
+        );
+        let (grid, top) = gemm(
+            device.ctx(),
+            &clock,
+            &random,
+            &mut held,
+            &lattice_rows(chip),
+            gap,
+        )?;
+        eprintln!(
+            "[rates]: the grid saturates at {} rows: past it no (n, k) shape's cost a row fell \
+             more than {:.0}% below its least through {} (at it the most {:.1}%, at {} x {})",
+            top.rows,
+            100.0 * profile::AGREEMENT,
+            top.through,
+            100.0 * top.best_gain,
+            top.best_shape.0,
+            top.best_shape.1
+        );
         let mut attn = Vec::with_capacity(ATTN_KEYS.len() * ATTN_DIMS.len());
         for d in ATTN_DIMS {
             for keys in ATTN_KEYS {
                 attn.push((
                     keys,
                     d,
-                    attention(&device, &clock, &random, &mut held, keys, d)?,
+                    attention(&device, &clock, &random, &mut held, keys, d, gap)?,
                 ));
             }
         }
-        let scan = scan(device.ctx(), &clock, &random, &mut held)?;
-        let bytes = copy(stream, &clock)?;
-        let launch = launch(device.ctx(), stream, &clock, &mut held)?;
+        let mut scan_curve = Vec::with_capacity(engine::rates::SCAN_TOKENS.len());
+        for tokens in engine::rates::SCAN_TOKENS {
+            scan_curve.push((
+                tokens,
+                scan(
+                    device.ctx(),
+                    &clock,
+                    &random,
+                    &mut held,
+                    SCAN_SHAPE.at(tokens),
+                    gap,
+                )?,
+            ));
+        }
+        let bytes = copy(stream, &clock, gap)?;
         device.synchronize().map_err(say("the device"))?;
-        Ok(Rates {
-            bf16_flops_per_ns_by_rows_and_depth: Some(grid),
+        eprintln!(
+            "[rates]: the step held at most {} MiB of device buffers ({} MiB of slabs at its end)",
+            PEAK.load(Ordering::Relaxed) >> 20,
+            held.iter().map(|b| b.bytes()).sum::<usize>() >> 20
+        );
+        let rates = Rates {
+            bf16_flops_per_ns_by_rows_n_k: Some(grid),
             attn_flops_per_ns_by_keys_and_dim: Some(attn),
-            scan_elements_per_ns: Some(scan),
+            scan_elements_per_ns_by_tokens: Some(scan_curve),
             bytes_per_ns: Some(bytes),
             launch_ns: Some(launch),
             ..Rates::default()
-        })
+        };
+        Ok((rates, top))
     }
 
+    /// The matmul grid and its top: every `(n, k)` of [`DEPTHS`] squared,
+    /// at each row of `lattice` ascending up to the card's saturation point
+    /// ([`Saturation`]): the last row where some shape's cost a row (its
+    /// launch and its work over its rows) falls more than
+    /// `profile::AGREEMENT` below the least it took at any row before, with
+    /// none doing so through a doubling of its rows past it (the lattice's
+    /// period: a tile's padding repeats each doubling, so a cost a row
+    /// zigzags within one and a step-to-step gain is not an improvement). A
+    /// top rung is the argmax of efficiency times live capacity, and live
+    /// capacity only falls as rows grow, so no rung past it can be chosen.
+    /// Each shape walks its own rows first (one rotation laid), then every
+    /// shape is filled to the widest row any reached.
     fn gemm(
         ctx: &Ctx,
         clock: &Clock,
         random: &Random,
         held: &mut Vec<Buffer>,
-    ) -> Result<Vec<(u32, u32, f64)>, String> {
-        let mut grid = Vec::with_capacity(LATTICE_ROWS.len() * DEPTHS.len());
-        for &k in &DEPTHS {
-            grid.extend(gemm_at(ctx, clock, random, held, k)?);
+        lattice: &[u32],
+        gap: f64,
+    ) -> Result<(Vec<(u32, u32, u32, f64)>, Saturation), String> {
+        // The shapes in engine::rates' spread order, so a drift left after
+        // the warm-up spreads over the grid.
+        let shapes: Vec<(u32, u32)> = DEPTHS
+            .iter()
+            .flat_map(|&k| DEPTHS.iter().map(move |&n| (n, k)))
+            .collect();
+        let order = engine::rates::spread_order(shapes.len());
+        // A shape's cost a row at `m` from its rate (work with the launch
+        // taken off, `rate_from`): its launch and its work over its rows.
+        let cost = |(n, k): (u32, u32), m: u32, rate: f64| {
+            let work = if rate.is_finite() && rate > 0.0 {
+                engine::rates::gemm_flops(m, n, k) / rate
+            } else {
+                0.0
+            };
+            (gap + work) / f64::from(m)
+        };
+        // Each row's gain on the least cost a row before it, of one shape.
+        let gains = |at: usize, rates: &[f64]| -> Vec<f64> {
+            let mut least = f64::INFINITY;
+            rates
+                .iter()
+                .enumerate()
+                .map(|(i, &rate)| {
+                    let c = cost(shapes[at], lattice[i], rate);
+                    let gain = least / c - 1.0;
+                    least = least.min(c);
+                    gain
+                })
+                .collect()
+        };
+        // The last row that improved, and the first row a doubling past it.
+        let last = |g: &[f64]| {
+            (1..g.len())
+                .rev()
+                .find(|&i| g[i] > profile::AGREEMENT)
+                .unwrap_or(0)
+        };
+        let past = |i: usize| {
+            lattice
+                .iter()
+                .position(|&m| u64::from(m) >= 2 * u64::from(lattice[i]))
+                .unwrap_or(lattice.len() - 1)
+        };
+        let mut rates: Vec<Vec<f64>> = vec![Vec::new(); shapes.len()];
+        let mut reach = 0;
+        // Each shape alone, ascending, to a doubling past its last gain.
+        for &at in &order {
+            let mut planes = Planes::lay(random, shapes[at])?;
+            while rates[at].len() < lattice.len() {
+                let m = lattice[rates[at].len()];
+                rates[at].push(planes.at(ctx, clock, random, held, m, gap)?);
+                if rates[at].len() > past(last(&gains(at, &rates[at]))) {
+                    break;
+                }
+            }
+            reach = reach.max(rates[at].len());
         }
-        Ok(grid)
+        // Every shape to the widest row any reached, until the last gain of
+        // any has a doubling measured past it.
+        let top = loop {
+            for &at in &order {
+                if rates[at].len() >= reach {
+                    continue;
+                }
+                let mut planes = Planes::lay(random, shapes[at])?;
+                while rates[at].len() < reach {
+                    let m = lattice[rates[at].len()];
+                    rates[at].push(planes.at(ctx, clock, random, held, m, gap)?);
+                }
+            }
+            let top = (0..shapes.len())
+                .map(|at| last(&gains(at, &rates[at])))
+                .max()
+                .unwrap_or(0);
+            if past(top) < reach || reach == lattice.len() {
+                break top;
+            }
+            reach = past(top) + 1;
+        };
+        let (best, at) = (0..shapes.len())
+            .map(|at| (gains(at, &rates[at])[top], at))
+            .max_by(|a, b| a.0.total_cmp(&b.0))
+            .expect("shapes");
+        let mut grid = Vec::with_capacity((top + 1) * shapes.len());
+        for (at, &(n, k)) in shapes.iter().enumerate() {
+            for (i, &m) in lattice.iter().enumerate().take(top + 1) {
+                grid.push((m, n, k, rates[at][i]));
+            }
+        }
+        grid.sort_by_key(|&(m, n, k, _)| (k, n, m));
+        let saturation = Saturation {
+            rows: lattice[top],
+            through: lattice[reach - 1],
+            best_gain: best,
+            best_shape: shapes[at],
+        };
+        Ok((grid, saturation))
     }
 
-    /// The matmul `m x k x k` at every row count of the lattice.
-    fn gemm_at(
+    /// The device warmed (engine::rates::warm_up): bursts of the widest
+    /// matmul over its planes until its rate stops falling.
+    fn warm(
         ctx: &Ctx,
         clock: &Clock,
         random: &Random,
         held: &mut Vec<Buffer>,
-        k: u32,
-    ) -> Result<Vec<(u32, u32, f64)>, String> {
-        let n = k;
-        let most = *LATTICE_ROWS.last().expect("rows") as usize;
-        let act = random.operand(most * k as usize * 2)?;
-        let y = zeroed(most * n as usize * 2)?;
-        let planes = weights_at(k);
+    ) -> Result<engine::rates::Warmed, String> {
+        let (m, n, k) = engine::rates::WARM_SHAPE;
+        let act = random.operand(m as usize * k as usize * 2)?;
+        let y = zeroed(m as usize * n as usize * 2)?;
+        let planes = weights_at(n, k);
         let weights = (0..planes)
             .map(|_| random.operand(n as usize * k as usize * 2))
             .collect::<Result<Vec<Buffer>, String>>()?;
-        let mut curve = Vec::with_capacity(LATTICE_ROWS.len());
-        for &m in &LATTICE_ROWS {
+        let fire = |w: usize| {
+            kernels_cuda::linear::gemm::matmul(
+                ctx,
+                Tensor::new(act.ptr(), m, k, Dtype::Bf16),
+                Tensor::new(weights[w % planes].ptr(), n, k, Dtype::Bf16),
+                &mut Tensor::new(y.ptr(), m, n, Dtype::Bf16),
+            )
+        };
+        lay(held, || fire(0))?;
+        engine::rates::warm_up(|| {
+            let ns = clock
+                .time(&mut || (0..planes).try_for_each(|w| fire(w).map_err(say("the matmul"))))?;
+            Ok(engine::rates::gemm_flops(m, n, k) * planes as f64 / ns.max(1.0))
+        })
+    }
+
+    /// One `(n, k)` shape's weight rotation laid (`engine::rates::weights_at`
+    /// planes of `WEIGHT_BYTES`), its activations and product laid as wide as
+    /// the widest row asked of it so far.
+    struct Planes {
+        n: u32,
+        k: u32,
+        weights: Vec<Buffer>,
+        act: Option<Buffer>,
+        y: Option<Buffer>,
+        rows: u32,
+    }
+
+    impl Planes {
+        fn lay(random: &Random, (n, k): (u32, u32)) -> Result<Planes, String> {
+            let weights = (0..weights_at(n, k))
+                .map(|_| random.operand(n as usize * k as usize * 2))
+                .collect::<Result<Vec<Buffer>, String>>()?;
+            Ok(Planes {
+                n,
+                k,
+                weights,
+                act: None,
+                y: None,
+                rows: 0,
+            })
+        }
+
+        /// The matmul `m x n x k`'s rate, its launches rotating through the
+        /// planes.
+        fn at(
+            &mut self,
+            ctx: &Ctx,
+            clock: &Clock,
+            random: &Random,
+            held: &mut Vec<Buffer>,
+            m: u32,
+            gap: f64,
+        ) -> Result<f64, String> {
+            let (n, k) = (self.n, self.k);
+            if m > self.rows {
+                self.act = None;
+                self.y = None;
+                self.act = Some(random.operand(m as usize * k as usize * 2)?);
+                self.y = Some(zeroed(m as usize * n as usize * 2)?);
+                self.rows = m;
+            }
+            let (act, y) = (
+                self.act.as_ref().expect("laid"),
+                self.y.as_ref().expect("laid"),
+            );
+            let planes = self.weights.len();
+            let weights = &self.weights;
             let fire = |w: usize| {
                 kernels_cuda::linear::gemm::matmul(
                     ctx,
@@ -323,9 +619,14 @@ mod on_device {
             };
             lay(held, || fire(0))?;
             let ns = clock.burst(ROUNDS, &mut |i| fire(i).map_err(say("the matmul")))?;
-            curve.push((m, k, engine::rates::gemm_flops(m, k) / ns));
+            engine::rates::rate_from(
+                &format!("matmul {m}x{n}x{k}"),
+                ns,
+                engine::rates::GEMM_DISPATCHES,
+                gap,
+                engine::rates::gemm_flops(m, n, k),
+            )
         }
-        Ok(curve)
     }
 
     fn attention(
@@ -335,6 +636,7 @@ mod on_device {
         held: &mut Vec<Buffer>,
         keys_n: u32,
         head_dim: u32,
+        gap: f64,
     ) -> Result<f64, String> {
         let ctx = device.ctx();
         let at = ATTN_SHAPE.at(keys_n).with_dim(head_dim);
@@ -343,17 +645,30 @@ mod on_device {
         let (q_heads, kv_heads) = (at.q_heads, at.kv_heads);
         let pages = rows.div_ceil(PAGE);
         let kv_width = kv_heads * d;
-        let cells = (pages * PAGE) as usize;
+        // `attn_sets_at` sets of q rows and kv pages, each fire the next
+        // set's, so each reads its q and kv from device memory as a served
+        // layer's do; the sets' pages share one pool.
+        let sets = engine::rates::attn_sets_at(at);
+        let cells = sets * (pages * PAGE) as usize;
+        let q_bytes = (rows * q_heads * d) as usize * 2;
         let keys = random.operand(cells * kv_width as usize * 2)?;
         let values = random.operand(cells * kv_width as usize * 2)?;
-        let q = random.operand((rows * q_heads * d) as usize * 2)?;
-        let o = zeroed((rows * q_heads * d) as usize * 2)?;
-        // The sequence's pages scattered over the pool as a served one's are.
-        let page_ids: Vec<i32> = engine::rates::attn_page_order(pages)
-            .into_iter()
-            .map(|p| p as i32)
-            .collect();
-        let indices = column(&page_ids)?;
+        let q = random.operand(sets * q_bytes)?;
+        let o = zeroed(q_bytes)?;
+        // Each set's pages scattered over its span of the pool as a served
+        // sequence's are.
+        let order = engine::rates::attn_page_order(pages);
+        let indices = (0..sets)
+            .map(|set| {
+                let first = set as u32 * pages;
+                column(
+                    &order
+                        .iter()
+                        .map(|&p| (first + p) as i32)
+                        .collect::<Vec<i32>>(),
+                )
+            })
+            .collect::<Result<Vec<Buffer>, String>>()?;
         let kv_indptr = [0, pages as i32];
         let indptr = column(&kv_indptr)?;
         let last = column(&[(rows - (pages - 1) * PAGE) as i32])?;
@@ -364,32 +679,34 @@ mod on_device {
         let i32s = |b: &Buffer, n: u32| Tensor::new(b.ptr(), n, 1, Dtype::I32);
         let plane = |b: &Buffer| Tensor::new(b.ptr(), cells as u32, kv_width, Dtype::Bf16);
         let absent = Tensor::new(0, 0, 0, Dtype::Bf16);
-        let pool = KvPool {
-            keys: plane(&keys),
-            values: plane(&values),
-            bf16_keys: absent,
-            bf16_values: absent,
-            key_scales: Tensor::ABSENT,
-            value_scales: Tensor::ABSENT,
-            page_indices: i32s(&indices, pages),
-            page_indptr: i32s(&indptr, 2),
-            last_page_lens: i32s(&last, 1),
-            row_valid: Tensor::ABSENT,
-            env_min: absent,
-            env_max: absent,
-            has_envelopes: false,
-            page_size: PAGE as i32,
-            seq_stride: i64::from(kv_width),
-            head_stride: i64::from(d),
-            layout: 0,
-            scheme_byte: 0,
-            block_size: 0,
-            max_pages_per_request: pages as i32,
-            pages_in_batch: pages as i32,
-            live: [0, 0],
-            page_stride: [0, 0],
-        }
-        .with_packed_stride();
+        let pool = |set: usize| {
+            KvPool {
+                keys: plane(&keys),
+                values: plane(&values),
+                bf16_keys: absent,
+                bf16_values: absent,
+                key_scales: Tensor::ABSENT,
+                value_scales: Tensor::ABSENT,
+                page_indices: i32s(&indices[set], pages),
+                page_indptr: i32s(&indptr, 2),
+                last_page_lens: i32s(&last, 1),
+                row_valid: Tensor::ABSENT,
+                env_min: absent,
+                env_max: absent,
+                has_envelopes: false,
+                page_size: PAGE as i32,
+                seq_stride: i64::from(kv_width),
+                head_stride: i64::from(d),
+                layout: 0,
+                scheme_byte: 0,
+                block_size: 0,
+                max_pages_per_request: pages as i32,
+                pages_in_batch: pages as i32,
+                live: [0, 0],
+                page_stride: [0, 0],
+            }
+            .with_packed_stride()
+        };
         let shape = Shape {
             num_requests: 1,
             lane_offset: 0,
@@ -428,15 +745,22 @@ mod on_device {
         )
         .map_err(say("the attention's plan"))?;
         plan.stage(ctx).map_err(say("the attention's plan"))?;
-        let fire = || {
+        let pools: Vec<KvPool> = (0..sets).map(pool).collect();
+        let fire = |i: usize| {
+            let set = i % sets;
             kernels_cuda::attn::prefill(
                 ctx,
                 RaggedTensor {
-                    data: Tensor::new(q.ptr(), rows, q_heads * d, Dtype::Bf16),
+                    data: Tensor::new(
+                        q.ptr() + (set * q_bytes) as u64,
+                        rows,
+                        q_heads * d,
+                        Dtype::Bf16,
+                    ),
                     indptr: i32s(&qo_at, 2),
                 },
                 &plan,
-                &pool,
+                &pools[set],
                 None,
                 d,
                 kv_heads,
@@ -444,9 +768,15 @@ mod on_device {
                 &mut Tensor::new(o.ptr(), rows, q_heads * d, Dtype::Bf16),
             )
         };
-        lay(held, fire)?;
-        let ns = clock.burst(ROUNDS, &mut |_| fire().map_err(say("the attention")))?;
-        Ok(engine::rates::attn_flops(at) / ns)
+        lay(held, || fire(0))?;
+        let ns = clock.burst(ROUNDS, &mut |i| fire(i).map_err(say("the attention")))?;
+        engine::rates::rate_from(
+            &format!("attention {}x{} d {}", at.rows, at.keys, at.head_dim),
+            ns,
+            engine::rates::ATTN_DISPATCHES,
+            gap,
+            engine::rates::attn_flops(at),
+        )
     }
 
     fn scan(
@@ -454,30 +784,39 @@ mod on_device {
         clock: &Clock,
         random: &Random,
         held: &mut Vec<Buffer>,
+        shape: engine::rates::ScanShape,
+        gap: f64,
     ) -> Result<f64, String> {
-        let shape = SCAN_SHAPE;
         let (tokens, conv_width) = (shape.tokens, shape.conv_width);
         let channels = shape.channels();
         let conv_stride = conv_width * channels;
         let state_stride = shape.v_heads * shape.k_dim * shape.v_dim;
-        let x = random.operand((tokens * channels) as usize * 2)?;
-        let conv_y = zeroed((tokens * channels) as usize * 2)?;
+        // `scan_sets_at` sets of input rows and conv and scan state, each
+        // fire the next set's (its rows at their offset, its state the slot
+        // of its index), so each reads them from device memory as a served
+        // layer's do.
+        let sets = engine::rates::scan_sets_at(shape);
+        let x_bytes = (tokens * channels) as usize * 2;
+        let x = random.operand(sets * x_bytes)?;
+        let conv_y = zeroed(x_bytes)?;
         let weight = random.operand((channels * conv_width) as usize * 2)?;
-        let conv_state = random.operand(conv_stride as usize * 2)?;
-        let state = random.operand(state_stride as usize * 2)?;
+        let conv_state = random.operand(sets * conv_stride as usize * 2)?;
+        let state = random.operand(sets * state_stride as usize * 2)?;
         let gates = zeroed((tokens * 2 * shape.v_heads) as usize * 4)?;
         let y = zeroed((tokens * shape.v_heads * shape.v_dim) as usize * 4)?;
-        let slot = column(&[0])?;
+        let slots = (0..sets)
+            .map(|set| column(&[set as i32]))
+            .collect::<Result<Vec<Buffer>, String>>()?;
         let indptr = column(&[0, tokens as i32])?;
-        let ragged = |data: &Buffer| RaggedTensor {
-            data: Tensor::new(data.ptr(), tokens, channels, Dtype::Bf16),
+        let ragged = |at: u64| RaggedTensor {
+            data: Tensor::new(at, tokens, channels, Dtype::Bf16),
             indptr: Tensor::new(indptr.ptr(), 2, 1, Dtype::I32),
         };
-        let pool = RecurrentPool {
-            slab: Tensor::new(state.ptr(), 1, state_stride, Dtype::Bf16),
-            slot_ids: Tensor::new(slot.ptr(), 1, 1, Dtype::I32),
+        let pool = |set: usize| RecurrentPool {
+            slab: Tensor::new(state.ptr(), sets as u32, state_stride, Dtype::Bf16),
+            slot_ids: Tensor::new(slots[set].ptr(), 1, 1, Dtype::I32),
             slot_stride_elems: i64::from(state_stride),
-            conv_slab: Tensor::new(conv_state.ptr(), 1, conv_stride, Dtype::Bf16),
+            conv_slab: Tensor::new(conv_state.ptr(), sets as u32, conv_stride, Dtype::Bf16),
             conv_stride: i64::from(conv_stride),
             write_state: true,
             write_state_mask: Tensor::ABSENT,
@@ -497,23 +836,25 @@ mod on_device {
         };
         #[cfg(feature = "rocm")]
         let out = Dtype::F32;
-        let fire = || {
+        let pools: Vec<RecurrentPool> = (0..sets).map(pool).collect();
+        let fire = |i: usize| {
+            let set = i % sets;
             kernels_cuda::ssm::causal_conv1d_chunked(
                 ctx,
-                ragged(&x),
+                ragged(x.ptr() + (set * x_bytes) as u64),
                 Tensor::new(weight.ptr(), channels, conv_width, Dtype::Bf16),
                 None,
-                &pool,
+                &pools[set],
                 conv_width,
                 1,
                 &mut Tensor::new(conv_y.ptr(), tokens, channels, Dtype::Bf16),
             )?;
             kernels_cuda::ssm::gated_delta_chunked(
                 ctx,
-                ragged(&conv_y),
+                ragged(conv_y.ptr()),
                 Tensor::ABSENT,
                 Tensor::new(gates.ptr(), tokens, 2 * shape.v_heads, Dtype::F32),
-                &pool,
+                &pools[set],
                 shape.k_heads,
                 shape.v_heads,
                 shape.k_dim,
@@ -521,12 +862,18 @@ mod on_device {
                 &mut Tensor::new(y.ptr(), tokens, shape.v_heads * shape.v_dim, out),
             )
         };
-        lay(held, fire)?;
-        let ns = clock.burst(ROUNDS, &mut |_| fire().map_err(say("the scan")))?;
-        Ok(engine::rates::scan_elements(shape) / ns)
+        lay(held, || fire(0))?;
+        let ns = clock.burst(ROUNDS, &mut |i| fire(i).map_err(say("the scan")))?;
+        engine::rates::rate_from(
+            &format!("scan of {} tokens", shape.tokens),
+            ns,
+            engine::rates::SCAN_DISPATCHES,
+            gap,
+            engine::rates::scan_elements(shape),
+        )
     }
 
-    fn copy(stream: *mut c_void, clock: &Clock) -> Result<f64, String> {
+    fn copy(stream: *mut c_void, clock: &Clock, gap: f64) -> Result<f64, String> {
         let from = zeroed(COPY_BYTES)?;
         let into = zeroed(COPY_BYTES)?;
         let ns = clock.burst(ROUNDS, &mut |_| {
@@ -534,7 +881,13 @@ mod on_device {
                 .map_err(say("the copy"))
         })?;
         // Every byte copied is read and written.
-        Ok(2.0 * COPY_BYTES as f64 / ns)
+        engine::rates::rate_from(
+            "copy",
+            ns,
+            engine::rates::COPY_DISPATCHES,
+            gap,
+            2.0 * COPY_BYTES as f64,
+        )
     }
 
     fn launch(
@@ -543,30 +896,74 @@ mod on_device {
         clock: &Clock,
         held: &mut Vec<Buffer>,
     ) -> Result<u64, String> {
-        let x = zeroed(256)?;
-        let y = zeroed(256)?;
-        let fire = || {
+        // A chain of `n` dependent residual adds captured in one graph
+        // (each adds into the buffer the one before wrote, the two
+        // alternating), against one add over the chain's whole length, at
+        // each length of engine::rates::LAUNCH_CHAINS.
+        let most = *engine::rates::LAUNCH_CHAINS.last().expect("chains") as usize;
+        let (x, y) = (zeroed(256)?, zeroed(256)?);
+        let (wide_x, wide_y) = (zeroed(16 * most)?, zeroed(16 * most)?);
+        let add = |from: &Buffer, into: &Buffer, width: u32| {
             kernels_cuda::elemwise::pointwise::residual_add(
                 ctx,
-                Tensor::new(x.ptr(), 1, 8, Dtype::Bf16),
-                &mut Tensor::new(y.ptr(), 1, 8, Dtype::Bf16),
+                Tensor::new(from.ptr(), 1, width, Dtype::Bf16),
+                &mut Tensor::new(into.ptr(), 1, width, Dtype::Bf16),
             )
         };
-        lay(held, fire)?;
-        fire().map_err(say("the launch"))?;
-        let graph = Graph::capture(stream, || {
-            for _ in 0..LAUNCHES {
-                fire().map_err(|e| crate::error::Fault::Unsupported(e.to_string()))?;
-            }
-            Ok(())
-        })
-        .map_err(say("the launch's graph"))?;
-        let exec = graph
-            .instantiate(stream)
-            .map_err(say("the launch's graph"))?;
-        let ns = clock.burst(LAUNCH_ROUNDS, &mut |_| {
-            exec.launch(stream).map_err(say("the launch's graph"))
-        })?;
-        Ok((ns / f64::from(LAUNCHES)).round() as u64)
+        lay(held, || add(&x, &y, 8))?;
+        add(&x, &y, 8).map_err(say("the launch"))?;
+        let timed = |work: &dyn Fn() -> Result<(), crate::error::Fault>| {
+            let graph = Graph::capture(stream, work).map_err(say("the launch's graph"))?;
+            let exec = graph
+                .instantiate(stream)
+                .map_err(say("the launch's graph"))?;
+            clock.burst(LAUNCH_ROUNDS, &mut |_| {
+                exec.launch(stream).map_err(say("the launch's graph"))
+            })
+        };
+        let unsupported = |e: kernels_cuda::Error| crate::error::Fault::Unsupported(e.to_string());
+        let mut gaps = Vec::new();
+        for n in engine::rates::LAUNCH_CHAINS {
+            let chain = timed(&|| {
+                for i in 0..n {
+                    let (from, into) = if i % 2 == 0 { (&x, &y) } else { (&y, &x) };
+                    add(from, into, 8).map_err(unsupported)?;
+                }
+                Ok(())
+            })?;
+            let one = timed(&|| add(&wide_x, &wide_y, 8 * n).map_err(unsupported))?;
+            gaps.push((n, engine::rates::launch_from(chain, one, n)));
+        }
+        eprintln!(
+            "[rates]: launch: {}",
+            gaps.iter()
+                .map(|(n, ns)| format!("{ns:.0} ns a dispatch over a chain of {n}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        Ok(gaps.last().map_or(0.0, |&(_, ns)| ns).round() as u64)
+    }
+}
+
+#[cfg(test)]
+mod lattice_tests {
+    #[test]
+    fn the_grid_is_timed_at_the_candidates_a_load_weighs() {
+        // The rows a load with nothing stated weighs (serve::load's
+        // budget_at(asked).buckets): the chip's lattice to its asked tokens.
+        let chip = crate::chip::profile("");
+        let engine = crate::chip::Engine::of(&chip);
+        let weighed = crate::api::lattice(
+            Vec::new(),
+            9742,
+            engine.lattice_steps,
+            engine.prefill_lattice_from,
+            engine.prefill_lattice_steps,
+        );
+        assert_eq!(
+            super::lattice_rows(&chip)[..weighed.len() - 1],
+            weighed[..weighed.len() - 1]
+        );
+        assert_eq!(weighed.first(), Some(&1), "a readout's one row");
     }
 }

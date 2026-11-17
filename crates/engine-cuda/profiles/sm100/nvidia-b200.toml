@@ -17,7 +17,7 @@ sdpa.selected_mma = true
 sdpa.selected_cluster = 8
 moe.mxfp4_f16 = true
 
-# Host-mapped `host` planes, 16384-row fires, a decoding
+# Host-mapped `host` planes, a decoding
 # lane's pages before a waiting prompt, a lattice bucket between powers of
 # two (four from 4096 rows), and a gated delta fire at most 4096 rows.
 [engine]
@@ -25,13 +25,12 @@ lattice_steps = 2
 prefill_lattice_from = 4096
 host_planes = true
 seated_first = true
-forward_tokens = 16384
 walk_fire_rows = 4096
 
 [rates]
 # 2.25 PFLOPS dense bf16 (NVIDIA B200: 4.5 PFLOPS with sparsity, the HGX
 # B200 summary's 36 PFLOPS over 8 GPUs, halved for dense).
-bf16_flops_per_ns_by_rows_and_depth = [[4096, 4096, 2250000.0]]
+bf16_flops_per_ns_by_rows_n_k = [[4096, 4096, 4096, 2250000.0]]
 # 8 TB/s of HBM3e (NVIDIA B200 specifications).
 bytes_per_ns = 8000.0
 
@@ -59,7 +58,6 @@ measured = [
   "kernel.sdpa.prefill.ctas_per_sm",
   "kernel.sdpa.selected_mma",
   "engine.copies",
-  "engine.forward_tokens",
   "engine.host_planes",
   "engine.lattice_steps",
   "engine.seated_first",

@@ -26,11 +26,12 @@ pub struct Counts {
     /// `k` merged (their count, flops and bytes), dense and routed apart, the
     /// output head's aside. Ordered by `(n, k)`.
     pub gemm_shapes: Vec<GemmShape>,
-    /// The output head's bytes on the device, read every fire.
+    /// The output head's bytes on the device, read every fire by the
+    /// readout alone (not in `weight_bytes`).
     pub head_bytes: u64,
     /// The output head's flops a sampled row: two a head element. A fire
     /// reads out once a sampled row, not once a row; the head's bytes are
-    /// in `weight_bytes`.
+    /// `head_bytes`.
     pub readout_flops: u64,
     /// The output head's depth (the model's hidden width).
     pub readout_depth: u32,
@@ -92,7 +93,6 @@ impl Counts {
                 // much as its own plane), multiplied once a lane.
                 let (rows, cols) = rectangle(&param.shape);
                 let bytes = kept.plane_bytes.get(at).copied().unwrap_or(0);
-                weight_bytes = weight_bytes.saturating_add(bytes);
                 head_bytes = head_bytes.saturating_add(bytes);
                 readout = readout.saturating_add(rows.saturating_mul(cols));
                 readout_depth = readout_depth.max(cols);
@@ -405,17 +405,12 @@ pub fn estimate(
     counts: &Counts,
     rates: &profile::fire::Rates,
 ) -> Result<FireEstimate, &'static str> {
-    let needed = |rate: Option<f64>, needed: bool, key: &'static str| match rate {
-        Some(rate) => Ok(rate),
-        None if !needed => Ok(0.0),
-        None => Err(key),
-    };
     Ok(FireEstimate {
         flops_grid: rates
-            .bf16_flops_per_ns_by_rows_and_depth
+            .bf16_flops_per_ns_by_rows_n_k
             .clone()
             .filter(|grid| !grid.is_empty())
-            .ok_or("bf16_flops_per_ns_by_rows_and_depth")?,
+            .ok_or("bf16_flops_per_ns_by_rows_n_k")?,
         bytes_per_ns: rates.bytes_per_ns.ok_or("bytes_per_ns")?,
         attn_grid: match &rates.attn_flops_per_ns_by_keys_and_dim {
             Some(grid) if !grid.is_empty() => grid.clone(),
@@ -423,11 +418,11 @@ pub fn estimate(
             _ => return Err("attn_flops_per_ns_by_keys_and_dim"),
         },
         attn_head_dim: counts.attn_head_dim,
-        scan_elements_per_ns: needed(
-            rates.scan_elements_per_ns,
-            counts.state_elements_per_row > 0,
-            "scan_elements_per_ns",
-        )?,
+        scan_by_tokens: match &rates.scan_elements_per_ns_by_tokens {
+            Some(curve) if !curve.is_empty() => curve.clone(),
+            _ if counts.state_elements_per_row == 0 => Vec::new(),
+            _ => return Err("scan_elements_per_ns_by_tokens"),
+        },
         launch_ns: rates.launch_ns.unwrap_or(0) as f64,
         dense_bytes: counts.weight_bytes,
         expert_bytes: counts.expert_bytes,
@@ -453,6 +448,14 @@ pub enum Refused {
     NoRates { device: String, key: &'static str },
     /// No rung offered is feasible.
     NoRung(NoRung),
+    /// The device's matmul grid states no rate at rows a rung fires (its
+    /// rows are the rung lattice it was timed at): measured on another
+    /// lattice, or a load laying a rung off it.
+    OffGrid {
+        device: String,
+        rows: Vec<u32>,
+        grid: Vec<u32>,
+    },
 }
 
 impl fmt::Display for Refused {
@@ -465,6 +468,13 @@ impl fmt::Display for Refused {
                  it"
             ),
             Refused::NoRung(no) => no.fmt(f),
+            Refused::OffGrid { device, rows, grid } => write!(
+                f,
+                "device {device}'s matmul grid (`[rates] bf16_flops_per_ns_by_rows_n_k`) states \
+                 no rows {rows:?} a rung of this load fires (it states {grid:?}, the rung \
+                 lattice it was timed at); `pie tune <backend> --rates` measures the lattice \
+                 this backend lays"
+            ),
         }
     }
 }
@@ -486,6 +496,23 @@ pub fn choose(
         device: device.to_owned(),
         key,
     })?;
+    // Every row a feasible rung fires, and its readout's, on the grid.
+    let grid = profile::fire::gemm_rows(&estimate.flops_grid);
+    let mut off: Vec<u32> = rungs
+        .iter()
+        .filter(|r| r.infeasible.is_none())
+        .flat_map(|r| [r.tokens, r.check_fire().sampled])
+        .filter(|rows| grid.binary_search(rows).is_err())
+        .collect();
+    off.sort_unstable();
+    off.dedup();
+    if !off.is_empty() {
+        return Err(Refused::OffGrid {
+            device: device.to_owned(),
+            rows: off,
+            grid,
+        });
+    }
     let top = super::rung::top_rung(rungs, live, &estimate).map_err(Refused::NoRung)?;
     Ok((top, estimate))
 }
@@ -541,6 +568,7 @@ mod tests {
             padded_rows: tokens,
             span_bytes: span,
             infeasible,
+            fire_lanes: 256,
         }
     }
 
@@ -564,6 +592,58 @@ mod tests {
         }
     }
 
+    /// A grid at every power of two of rows to 16384, at 4096 x 4096.
+    fn lattice(rate: f64) -> Vec<(u32, u32, u32, f64)> {
+        (0..=14).map(|i| (1u32 << i, 4096, 4096, rate)).collect()
+    }
+
+    #[test]
+    fn a_lattice_off_the_powers_of_two_is_read_where_its_engine_timed_it() {
+        // An engine whose candidates are its own buckets (2234, 2436), its
+        // grid timed at exactly those rows and at a readout's one: every
+        // rung reads its own rows, and nothing is off the grid.
+        let rows = [1, 2234, 2436];
+        let rates = profile::fire::Rates {
+            bf16_flops_per_ns_by_rows_n_k: Some(
+                rows.iter().map(|&m| (m, 4096, 4096, 1.0)).collect(),
+            ),
+            attn_flops_per_ns_by_keys_and_dim: Some(vec![(2048, 128, 1.0)]),
+            bytes_per_ns: Some(1.0),
+            ..profile::fire::Rates::default()
+        };
+        let rungs = [rung(2234, 100 * MIB, None), rung(2436, 110 * MIB, None)];
+        let (top, estimate) = choose(&rungs, 1 << 33, &rates, "Card X", &counts()).unwrap();
+        assert!(rungs.iter().any(|r| r.tokens == top.tokens));
+        assert_eq!(profile::fire::gemm_rows(&estimate.flops_grid), rows);
+        // The same rungs against a powers-of-two grid: refused by name.
+        let pow2 = profile::fire::Rates {
+            bf16_flops_per_ns_by_rows_n_k: Some(lattice(1.0)),
+            ..rates
+        };
+        let err = choose(&rungs, 1 << 33, &pow2, "Card X", &counts()).unwrap_err();
+        assert!(
+            matches!(err, Refused::OffGrid { ref rows, .. } if rows == &vec![2234, 2436]),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_rung_off_the_grid_is_refused_by_name() {
+        let rungs = [rung(1024, 100 * MIB, None), rung(3000, 150 * MIB, None)];
+        let rates = profile::fire::Rates {
+            bf16_flops_per_ns_by_rows_n_k: Some(lattice(1.0)),
+            attn_flops_per_ns_by_keys_and_dim: Some(vec![(2048, 128, 1.0)]),
+            bytes_per_ns: Some(1.0),
+            ..profile::fire::Rates::default()
+        };
+        let err = choose(&rungs, 1 << 33, &rates, "Card X", &counts()).unwrap_err();
+        assert!(
+            matches!(err, Refused::OffGrid { ref rows, .. } if rows == &vec![3000]),
+            "{err}"
+        );
+        assert!(err.to_string().contains("states no rows [3000]"), "{err}");
+    }
+
     #[test]
     fn without_rates_the_load_is_refused_by_name() {
         let rungs = [rung(1024, 100 * MIB, None), rung(2048, 150 * MIB, None)];
@@ -582,7 +662,7 @@ mod tests {
         // No feasible rung at all: the ruling's refusal.
         let none = [rung(1024, 300 * MIB, Some("past one binding"))];
         let rated = profile::fire::Rates {
-            bf16_flops_per_ns_by_rows_and_depth: Some(vec![(4096, 4096, 1.0)]),
+            bf16_flops_per_ns_by_rows_n_k: Some(lattice(1.0)),
             attn_flops_per_ns_by_keys_and_dim: Some(vec![(2048, 128, 1.0)]),
             bytes_per_ns: Some(1.0),
             ..profile::fire::Rates::default()
@@ -599,21 +679,27 @@ mod tests {
     #[test]
     fn the_estimate_reads_the_rates_and_the_counts() {
         let rates = profile::fire::Rates {
-            bf16_flops_per_ns_by_rows_and_depth: Some(vec![(16, 4096, 1.0), (4096, 4096, 10.0)]),
+            bf16_flops_per_ns_by_rows_n_k: Some(vec![
+                (16, 4096, 4096, 1.0),
+                (4096, 4096, 4096, 10.0),
+            ]),
             attn_flops_per_ns_by_keys_and_dim: Some(vec![(2048, 128, 7.0)]),
             bytes_per_ns: Some(100.0),
             launch_ns: Some(5),
             ..profile::fire::Rates::default()
         };
         let e = estimate(&counts(), &rates).unwrap();
-        assert_eq!(e.flops_grid, vec![(16, 4096, 1.0), (4096, 4096, 10.0)]);
+        assert_eq!(
+            e.flops_grid,
+            vec![(16, 4096, 4096, 1.0), (4096, 4096, 4096, 10.0)]
+        );
         assert_eq!(e.gemm_shapes, counts().gemm_shapes);
         assert_eq!(
             (e.attn_grid.clone(), e.bytes_per_ns, e.launch_ns),
             (vec![(2048, 128, 7.0)], 100.0, 5.0)
         );
         // No recurrent state: no scan rate read.
-        assert_eq!(e.scan_elements_per_ns, 0.0);
+        assert!(e.scan_by_tokens.is_empty());
         assert_eq!(e.dense_bytes, 1 << 30);
         // Each rate the model's work needs, unstated, is named.
         for (key, unstated) in [
@@ -625,9 +711,9 @@ mod tests {
                 },
             ),
             (
-                "bf16_flops_per_ns_by_rows_and_depth",
+                "bf16_flops_per_ns_by_rows_n_k",
                 profile::fire::Rates {
-                    bf16_flops_per_ns_by_rows_and_depth: None,
+                    bf16_flops_per_ns_by_rows_n_k: None,
                     ..rates.clone()
                 },
             ),
@@ -645,14 +731,17 @@ mod tests {
             state_elements_per_row: 1 << 20,
             ..counts()
         };
-        assert_eq!(estimate(&recurrent, &rates), Err("scan_elements_per_ns"));
+        assert_eq!(
+            estimate(&recurrent, &rates),
+            Err("scan_elements_per_ns_by_tokens")
+        );
         let scanned = profile::fire::Rates {
-            scan_elements_per_ns: Some(3.0),
+            scan_elements_per_ns_by_tokens: Some(vec![(2048, 3.0)]),
             ..rates.clone()
         };
         assert_eq!(
-            estimate(&recurrent, &scanned).unwrap().scan_elements_per_ns,
-            3.0
+            estimate(&recurrent, &scanned).unwrap().scan_by_tokens,
+            vec![(2048, 3.0)]
         );
         // A model attending nothing reads no attention rate.
         let attending_nothing = Counts {
@@ -670,7 +759,7 @@ mod tests {
     fn the_refusal_names_the_key_unstated() {
         let rungs = [rung(1024, 100 * MIB, None)];
         let rates = profile::fire::Rates {
-            bf16_flops_per_ns_by_rows_and_depth: Some(vec![(4096, 4096, 1.0)]),
+            bf16_flops_per_ns_by_rows_n_k: Some(lattice(1.0)),
             bytes_per_ns: Some(1.0),
             ..profile::fire::Rates::default()
         };
@@ -836,7 +925,7 @@ mod tests {
         };
         let tuned = profile::fire::Tuned {
             rates: profile::fire::Rates {
-                bf16_flops_per_ns_by_rows_and_depth: Some(vec![(4096, 4096, 249_000.0)]),
+                bf16_flops_per_ns_by_rows_n_k: Some(lattice(249_000.0)),
                 bytes_per_ns: Some(654.0),
                 launch_ns: Some(1620),
                 ..profile::fire::Rates::default()

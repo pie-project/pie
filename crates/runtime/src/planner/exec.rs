@@ -756,6 +756,13 @@ async fn restore(
                     roles: None,
                 },
             );
+            // Room the budget holds but nothing has freed yet: the restore
+            // waits, queued, as an admission does.
+            if matches!(error, crate::store::roles::RolesError::UnparkShort(_)) {
+                tracing::debug!(%pid, %error, "planner: a restore waits for room for its roles");
+                planner.requeue_restore_roles(pid);
+                return;
+            }
             planner.restore_faulted(pid, &format!("roles unpark: {error}"));
             return;
         }

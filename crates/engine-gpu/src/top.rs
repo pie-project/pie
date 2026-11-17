@@ -54,6 +54,8 @@ pub fn rung_facts(
             padded_rows: padded(tokens),
             span_bytes,
             infeasible: (span_bytes > binding).then_some(PAST_ONE_BINDING),
+            // One fire carries every lane the budget seats.
+            fire_lanes: max_lanes,
         })
         .collect()
 }
@@ -74,7 +76,7 @@ pub fn choose(
             Refused::NoRung(no) => {
                 format!("{no}; this device binds no more than {} MiB", binding >> 20)
             }
-            refused @ Refused::NoRates { .. } => refused.to_string(),
+            refused @ (Refused::NoRates { .. } | Refused::OffGrid { .. }) => refused.to_string(),
         })
     })
 }
@@ -135,7 +137,7 @@ mod tests {
         // No feasible rung at all: the ruling's refusal, with the binding.
         let none = facts(&[(1024, 300 * MIB)], 200 * MIB);
         let rated = profile(
-            "api = 1\n[rates]\nbf16_flops_per_ns_by_rows_and_depth = [[4096, 4096, 1.0]]\nattn_flops_per_ns_by_keys_and_dim = [[2048, 128, 1.0]]\nbytes_per_ns = 1.0\n",
+            "api = 1\n[rates]\nbf16_flops_per_ns_by_rows_n_k = [[4096, 4096, 4096, 1.0]]\nattn_flops_per_ns_by_keys_and_dim = [[2048, 128, 1.0]]\nbytes_per_ns = 1.0\n",
         );
         let err = choose(&none, 1 << 33, &rated, "Card X", &counts(), 200 * MIB).unwrap_err();
         assert!(

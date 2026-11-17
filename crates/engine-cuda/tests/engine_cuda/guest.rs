@@ -287,10 +287,18 @@ pub fn alone_span(_: SlotRole, _: &[u32], bytes: u64) -> engine_cuda::Result<u64
 }
 
 /// A plane with no pool: its programs' tables and scratch lie in buffers of
-/// their own ([`alone_span`]), its fires of up to 256 lanes.
+/// their own ([`alone_span`]), its fires of up to 256 lanes, its samplers'
+/// lane arenas a buffer of their own sized for every block a 256-lane
+/// launch may run (the load lays them in the activation's span).
 pub fn alone_plane() -> engine_cuda::ProgramPlane {
+    use engine_cuda::program::launch::{Arenas, LANE_SAMPLER_BLOCKS};
     let mut plane = engine_cuda::ProgramPlane::new(engine_cuda::program::compile::Disk::disabled());
     plane.set_flight(256);
     plane.set_fire_lanes(256);
+    let bytes = Arenas::bytes_for(256, 256 * LANE_SAMPLER_BLOCKS);
+    if let Ok(buffer) = engine_cuda::device::Buffer::zeroed(bytes as usize) {
+        let at = Box::leak(Box::new(buffer)).ptr();
+        plane.set_arenas(Arenas { at, bytes });
+    }
     plane
 }

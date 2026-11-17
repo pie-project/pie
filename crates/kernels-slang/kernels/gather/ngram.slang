@@ -10,6 +10,11 @@
 // end-of-sequence id. The hash plane is `mults | primes | offsets`, u64s as
 // (lo, hi) words. `PIE_UPDATE`: one decoded token a lane; `PIE_CHUNKED`: a
 // request's run of tokens a lane (an i32 CSR). Both roll the state forward.
+// `PIE_COMMITTED`: a request's rows of a speculative window, a lane: its rows
+// are the CSR's plus `replay[lane0 + r]` buffered ones before them (`ids` is
+// the extended rows), its own rows hashed into the CSR's rows of
+// `ngram_ids`, and the window kept as of row `commit[lane0 + r]` (left as it
+// was when that is zero; no slot when `slots[lane0 + r] < 0`).
 
 #define MAX_NGRAM 4
 #define MAX_HEADS 32
@@ -21,6 +26,14 @@
 [[vk::binding(2)]] StructuredBuffer<uint> hash;
 [[vk::binding(3)]] RWStructuredBuffer<int> ngram_ids;
 #define NGRAM_SEGMENTS_AT 4
+#elif defined(PIE_COMMITTED)
+[[vk::binding(1)]] StructuredBuffer<int> indptr;
+[[vk::binding(2)]] StructuredBuffer<int> replay;
+[[vk::binding(3)]] StructuredBuffer<int> commit;
+[[vk::binding(4)]] StructuredBuffer<int> slots;
+[[vk::binding(5)]] StructuredBuffer<uint> hash;
+[[vk::binding(6)]] RWStructuredBuffer<int> ngram_ids;
+#define NGRAM_SEGMENTS_AT 7
 #elif defined(PIE_CHUNKED)
 [[vk::binding(1)]] StructuredBuffer<int> indptr;
 [[vk::binding(2)]] StructuredBuffer<uint> slots;
@@ -41,6 +54,9 @@ struct Params {
     uint pieces;
     uint piece_first;
     uint piece_atoms;
+#if defined(PIE_COMMITTED)
+    int lane0;
+#endif
     int ngram;
     int heads;
     int heads_per_ngram;
@@ -113,6 +129,39 @@ void main(uint3 gid : SV_DispatchThreadID) {
         state[slab + uint(p)] = state[slab + uint(p + 1)];
     }
     state[slab + uint(span - 1)] = fresh + 1;
+#elif defined(PIE_COMMITTED)
+    uint lane = uint(params.lane0) + r;
+    int begin = indptr[r];
+    for (uint j = 0; j < r; j++) {
+        begin += replay[uint(params.lane0) + j];
+    }
+    int replayed = replay[lane];
+    int rows = (indptr[r + 1u] - indptr[r]) + replayed;
+    if (rows <= 0 || pie_state_none(lane)) {
+        return;
+    }
+    uint slab = pie_piece_unit(lane, 0u) * params.slot_stride;
+    for (int t = replayed; t < rows; t++) {
+        int window[MAX_NGRAM] = { 0, 0, 0, 0 };
+        window[0] = ids[uint(begin + t)];
+        for (int p = 1; p <= span; p++) {
+            window[p] = t >= p ? ids[uint(begin + t - p)] : cell(state[slab + uint(span - (p - t))]);
+        }
+        mask_window(window);
+        hash_row(window, uint(indptr[r] + (t - replayed)));
+    }
+    int keep = min(commit[lane], rows);
+    if (keep <= 0) {
+        return;
+    }
+    int next[MAX_NGRAM] = { 0, 0, 0, 0 };
+    for (int p = 0; p < span; p++) {
+        int src = keep - span + p;
+        next[p] = src >= 0 ? ids[uint(begin + src)] + 1 : state[slab + uint(p + keep)];
+    }
+    for (int p = 0; p < span; p++) {
+        state[slab + uint(p)] = next[p];
+    }
 #else
     int begin = indptr[r];
     int rows = indptr[r + 1u] - begin;
@@ -142,3 +191,4 @@ void main(uint3 gid : SV_DispatchThreadID) {
 
 // pie:instantiate gather_ngram_update PIE_UPDATE=1 PIE_GROUP_X=64
 // pie:instantiate gather_ngram_chunked PIE_CHUNKED=1 PIE_GROUP_X=64
+// pie:instantiate gather_ngram_committed PIE_COMMITTED=1 PIE_GROUP_X=64

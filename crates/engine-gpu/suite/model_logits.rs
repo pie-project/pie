@@ -900,6 +900,148 @@ fn state_lent_in_the_span_outlives_a_narrow_rungs_fires() {
     );
 }
 
+/// A masked fire after a partial fold: a lane's mask speaks of the keys from
+/// its committed boundary on (`KvDelta::folded`). Past a boundary at 100 of
+/// a 150-key prompt, a mask over the buffer and the fire's own rows lands
+/// the same logits, bit for bit, as the same bits over the whole context
+/// from a boundary at 0, its committed columns set; the mask is read (it
+/// lands other logits than all set), and one short of its buffer and rows
+/// is refused for that extent.
+#[test]
+fn a_masked_fire_after_a_partial_fold_admits_the_committed_keys() {
+    let fixture = fixture("qwen3-micro-text", None);
+    let Some(mut shell) = load(&fixture, CONTEXT) else {
+        return;
+    };
+    let [prompt, _] = prompts();
+    let have = prompt.len() as u32;
+    shell
+        .fire_seated(&[Seated {
+            held: Some(0),
+            ..Seated::of(Lane {
+                slot: 0,
+                word: word(&fixture.trace, have),
+                tokens: &prompt,
+            })
+        }])
+        .expect("the prefill lands");
+
+    const ROWS: u32 = 4;
+    const FOLDED: u32 = 100;
+    let tokens: Vec<u32> = (0..ROWS).map(|at| (at * 29 + 3) % 256).collect();
+    let masked = fixture.trace.facts.word(&Request::new(ROWS, true));
+    let buffer = u64::from(have - FOLDED);
+    // Hides every third buffered key; admits the fire's own rows.
+    let hidden = |column: u64| column < buffer && column % 3 == 1;
+    let bits = |committed: u64, hide: &dyn Fn(u64) -> bool| {
+        let total = committed + buffer + u64::from(ROWS);
+        let mut runs = vec![0u32];
+        let mut admitted = false;
+        for column in 0..total {
+            let keep = column < committed || !hide(column - committed);
+            if keep != admitted {
+                runs.push(0);
+                admitted = keep;
+            }
+            *runs.last_mut().unwrap() += 1;
+        }
+        engine::fire::Masking::Extent(engine::fire::Mask::new(runs, total))
+    };
+    let mut fire = |folded: u32, mask: &engine::fire::Masking| {
+        shell.fire_seated(&[Seated {
+            held: Some(have),
+            folded,
+            mask: Some(mask),
+            ..Seated::of(Lane {
+                slot: 0,
+                word: masked,
+                tokens: &tokens,
+            })
+        }])
+    };
+    let past = fire(FOLDED, &bits(0, &hidden)).expect("the masked fire lands");
+    let whole = fire(0, &bits(u64::from(FOLDED), &hidden)).expect("the whole mask lands");
+    same("a mask past the boundary against the whole", &past, &whole);
+    let all = fire(FOLDED, &bits(0, &|_| false)).expect("an all-set mask lands");
+    assert!(
+        past[0]
+            .iter()
+            .zip(&all[0])
+            .any(|(a, b)| a.to_bits() != b.to_bits()),
+        "the mask hid nothing"
+    );
+    let short = {
+        let engine::fire::Masking::Extent(mask) = bits(0, &hidden) else {
+            unreachable!()
+        };
+        let total = mask.total - 1;
+        engine::fire::Masking::Extent(engine::fire::Mask::new(mask.runs, total))
+    };
+    let refused = fire(FOLDED, &short).expect_err("a mask short of its extent");
+    assert!(
+        refused
+            .to_string()
+            .contains(&format!("will read {}", buffer + u64::from(ROWS))),
+        "{refused}"
+    );
+}
+
+/// A row's causal bound is its row order, the cache row; a stated position
+/// rotates the row and bounds nothing. A lane's four rows land at slots
+/// 0..4 and all state position 0: the last row still reads the three before
+/// it, so two lanes whose middle tokens differ answer differently (bounded
+/// by the stated position, the last row read slot 0 alone and the two
+/// answered the same). The rotation follows the stated position: stating
+/// 0 everywhere answers otherwise than stating nothing, and stating the
+/// slots answers the same, bit for bit.
+#[test]
+fn a_stated_position_rotates_and_bounds_no_key() {
+    let fixture = fixture("qwen3-micro-text", None);
+    let Some(mut shell) = load(&fixture, CONTEXT) else {
+        return;
+    };
+    let mut last = |slot: u32, tokens: &[u32], positions: &[u32]| {
+        let seated = Seated {
+            held: Some(0),
+            positions,
+            ..Seated::of(Lane {
+                slot,
+                word: word(&fixture.trace, tokens.len() as u32),
+                tokens,
+            })
+        };
+        shell
+            .fire_seated(&[seated])
+            .expect("the fire lands")
+            .remove(0)
+    };
+    let zeros = [0u32; 4];
+    let one = last(0, &[11, 48, 85, 122], &zeros);
+    let two = last(1, &[11, 200, 7, 122], &zeros);
+    let apart = |a: &[f32], b: &[f32]| {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max)
+    };
+    assert!(
+        apart(&one, &two) > 1e-3,
+        "the last row's logits are the same whatever the rows before it say: its \
+         attention was bounded by its stated position, not its cache row"
+    );
+    let unstated = last(0, &[11, 48, 85, 122], &[]);
+    let slots = last(0, &[11, 48, 85, 122], &[0, 1, 2, 3]);
+    same(
+        "positions stated as the slots",
+        &[slots],
+        &[unstated.clone()],
+    );
+    assert!(
+        apart(&one, &unstated) > 1e-3,
+        "stating position 0 everywhere rotated the rows as their slots"
+    );
+}
+
 /// Panics at the first row whose logits differ in a bit.
 pub fn same(what: &str, got: &[Vec<f32>], want: &[Vec<f32>]) {
     assert_eq!(got.len(), want.len(), "{what}: rows");

@@ -3,7 +3,7 @@
 //! same registry against AMD's chips, keyed by their gfx version.
 #![allow(unsafe_code)]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use profile::{Anywhere, Decision, Domain, Facts, Profile, Registry, Report, Shelf, Var};
@@ -108,16 +108,9 @@ pub struct SeatSpread;
 #[decision(id = "engine.window_spare", flag, default = false, tune = engine)]
 pub struct WindowSpare;
 
-/// The rows one fire takes when `[engine] max_forward_tokens` is not
-/// stated; 0 keeps the fixed 8192. Wider fires batch more prompts' chunks
-/// into one pass of the weights, and their activation arena grows with them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "engine.forward_tokens", constant(range(0..=65536)), default = 0, tune = engine)]
-pub struct ForwardTokens(pub u32);
-
 /// Prompt rows a lane brings to a fire over chunked gated delta layers of `H`
 /// value heads when `max_forward_tokens` is unset: a fire takes at most
-/// `floor(SMs / H)` such lanes, so the walk runs in one wave. 0: `forward_tokens`.
+/// `floor(SMs / H)` such lanes, so the walk runs in one wave. 0: the fire bound.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "engine.walk_fire_rows", constant(range(0..=65536)), default = 0, tune = engine)]
 pub struct WalkFireRows(pub u32);
@@ -180,7 +173,6 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<SeatToEnd>()
         .add::<SeatSpread>()
         .add::<WindowSpare>()
-        .add::<ForwardTokens>()
         .add::<WalkFireRows>()
         .add::<FireRows>()
         .add::<PrefillLanes>()
@@ -196,7 +188,8 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     // HIP graphs have no conditional node: one is priced past any launch it
     // could skip, so the compiler lowers every region to `AlwaysLaunch`. The
     // residual norms run as generated row kernels there too; the products'
-    // epilogues keep their hand rules until ROCm holds contraction skeletons.
+    // epilogues run on their hand rules (`FUSIONS`), ROCm holding no
+    // contraction skeletons.
     #[cfg(feature = "rocm")]
     poem_compiler::costs::register_regions_for(
         &mut r,
@@ -257,6 +250,38 @@ shelved!(
     rocm: ["gfx94.toml", "gfx94/amd-instinct-mi300x.toml"],
 );
 
+/// The checked-in dense GEMM tactic tables, beside the device profiles they
+/// belong to (`sm89/nvidia-l40s.toml` has `sm89/nvidia-l40s.gemm`): what
+/// `pie tune` and loads on that device timed, read before the user's own.
+#[cfg(not(feature = "rocm"))]
+pub const GEMM_TABLES: &[(&str, &str)] = &[
+    (
+        "sm89/nvidia-l40s.gemm",
+        include_str!("../profiles/sm89/nvidia-l40s.gemm"),
+    ),
+    (
+        "sm120/nvidia-rtx-pro-4500-blackwell.gemm",
+        include_str!("../profiles/sm120/nvidia-rtx-pro-4500-blackwell.gemm"),
+    ),
+];
+
+/// The checked-in tactic table of `device`'s profile, if it has one.
+#[cfg(not(feature = "rocm"))]
+#[must_use]
+pub fn gemm_table(device: &str) -> Option<&'static str> {
+    let file = format!("/{}.gemm", profile::id_of(device));
+    GEMM_TABLES
+        .iter()
+        .find(|(path, _)| path.ends_with(&file))
+        .map(|(_, text)| *text)
+}
+
+/// Where the user's tactic table for `device` lives, beside their profile.
+#[must_use]
+pub fn user_gemm_table(profiles: &Path, device: &str) -> PathBuf {
+    SHELF.user_path(profiles, device).with_extension("gemm")
+}
+
 pub static SHELF: Shelf = Shelf {
     backend: "cuda",
     seeded: SEEDED,
@@ -283,7 +308,6 @@ pub struct Engine {
     pub seat_to_end: bool,
     pub seat_spread: bool,
     pub window_spare: bool,
-    pub forward_tokens: u32,
     pub walk_fire_rows: u32,
     pub fire_rows: u32,
     pub prefill_lanes: u32,
@@ -317,7 +341,6 @@ impl Engine {
             seat_to_end: profile.on::<SeatToEnd>(&Anywhere),
             seat_spread: profile.on::<SeatSpread>(&Anywhere),
             window_spare: profile.on::<WindowSpare>(&Anywhere),
-            forward_tokens: profile.get::<ForwardTokens>().0,
             walk_fire_rows: profile.get::<WalkFireRows>().0,
             fire_rows: profile.get::<FireRows>().0,
             prefill_lanes: profile.get::<PrefillLanes>().0,
@@ -798,7 +821,6 @@ mod tests {
                 seat_to_end: false,
                 seat_spread: false,
                 window_spare: false,
-                forward_tokens: 0,
                 walk_fire_rows: 0,
                 fire_rows: 0,
                 prefill_lanes: 0,
@@ -865,7 +887,6 @@ mod tests {
             "a B200 walks a selection on the tensor cores"
         );
         assert!(Engine::of(&b200).seated_first);
-        assert_eq!(Engine::of(&b200).forward_tokens, 16384);
         assert_eq!(Engine::of(&b200).walk_fire_rows, 4096);
         assert!(Engine::of(&b200).host_planes);
         assert_eq!(Engine::of(&b200).lattice_steps, 2);
@@ -878,7 +899,6 @@ mod tests {
                 seat_to_end: false,
                 seat_spread: false,
                 window_spare: false,
-                forward_tokens: 0,
                 walk_fire_rows: 0,
                 fire_rows: 0,
                 prefill_lanes: 0,
@@ -1095,7 +1115,6 @@ mod tests {
                 Engine {
                     prefill_lattice_from: 256,
                     prefill_lattice_steps: 8,
-                    forward_tokens: if std::ptr::eq(p, &l40s) { 2304 } else { 0 },
                     seated_first: std::ptr::eq(p, &l40s),
                     recording: if std::ptr::eq(p, &l40s) {
                         Recording::Bodies {
@@ -1151,7 +1170,6 @@ mod tests {
                     || (spec.id == "kernel.sdpa.selected_mma" && std::ptr::eq(p, &l40s))
                     || spec.id.starts_with("kernel.moe.mxfp4_mma_")
                     || spec.id.starts_with("engine.prefill_lattice_")
-                    || (spec.id == "engine.forward_tokens" && std::ptr::eq(p, &l40s))
                     || (spec.id == "kernel.sdpa.decode.grouped_prefill_from"
                         && std::ptr::eq(p, &l40s))
                     || (spec.id == "kernel.sdpa.index_mma" && std::ptr::eq(p, &l40s))
@@ -1210,14 +1228,15 @@ mod hip {
             let (profile, report) = resolve(gpu, &facts(9, 4, 304), None);
             let mut layers = vec![profile::Source::Seeded("gfx94.toml".into())];
             if device {
-                layers.push(profile::Source::Seeded("gfx94/amd-instinct-mi300x.toml".into()));
+                layers.push(profile::Source::Seeded(
+                    "gfx94/amd-instinct-mi300x.toml".into(),
+                ));
             }
             assert_eq!(report.layers, layers, "{gpu}");
             assert!(report.untuned(), "{gpu}");
             assert_eq!(
                 Engine::of(&profile),
                 Engine {
-                    forward_tokens: 10240,
                     prefill_lattice_from: 2048,
                     prefill_lattice_steps: 8,
                     ..Engine::of(&registry().defaults())

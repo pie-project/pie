@@ -45,9 +45,10 @@ pub struct Chunks {
     /// The chunks the runtime named weight slots in: no page is seated in
     /// one ([`Chunks::keep_clear`]).
     weights: std::collections::BTreeSet<u32>,
-    /// The chunks of the range the runtime never names, what it was
+    /// The chunk ids of the range the card never backs, what it was
     /// reserved for past what the card came to back ([`Chunks::state_fitted`]):
-    /// from `skip.0`, `skip.1` of them.
+    /// from `skip.0`, `skip.1` of them. The runtime is told them skipped
+    /// (`Reserved::Skipped`): it names none, and every id keeps its place.
     skip: (u32, u32),
 }
 
@@ -194,14 +195,29 @@ impl Chunks {
             .min(self.activation_bytes())
     }
 
-    /// The range's chunks under the state's end, and how many of the
-    /// state's last chunks lie in one run under it.
-    fn under_state(&self) -> (u32, u32) {
-        let stated = self.stated();
-        if self.skip.0 < stated {
-            (self.total, stated - self.skip.0)
+    /// The chunk ids the card never backs ([`Chunks::state_fitted`]).
+    fn skipped(&self) -> std::ops::Range<u32> {
+        self.skip.0..self.skip.0 + self.skip.1
+    }
+
+    /// The chunk id the first `chunks` backed chunks end at: past the
+    /// skipped ids where they reach them.
+    #[must_use]
+    pub fn ids_for(&self, chunks: u32) -> u32 {
+        if self.skip.1 > 0 && chunks > self.skip.0 {
+            chunks.saturating_add(self.skip.1).min(self.total)
         } else {
-            (stated, stated)
+            chunks
+        }
+    }
+
+    /// The chunk id the state's chunks end at: the range's state end, or
+    /// where the skipped ids start when they run up to it.
+    fn under_state(&self) -> u32 {
+        if self.skip.1 > 0 && self.skipped().end >= self.total {
+            self.skip.0
+        } else {
+            self.total
         }
     }
 
@@ -209,7 +225,7 @@ impl Chunks {
     /// last of them, in order.
     #[must_use]
     pub fn state_end(&self) -> u64 {
-        self.range.base() + u64::from(self.under_state().0) * self.layout.chunk_bytes
+        self.range.base() + u64::from(self.under_state()) * self.layout.chunk_bytes
     }
 
     /// Where a fire's activation starts: the range's end less its chunks.
@@ -271,20 +287,29 @@ impl Chunks {
             return Ok(Commit::Committed);
         }
         let chunk = self.layout.chunk_bytes;
-        let start = self.stated();
+        let start = self.total;
         let segment = self.layout.segment_chunks.max(1);
         let first = start / segment * segment;
         if first >= start {
             return Ok(Commit::Committed);
         }
-        // The boundary's chunks lie in one run: the pool parts at a whole
-        // segment at or under them, or past them all.
-        let outcome = self.range.hold(
-            pool,
-            u64::from(self.at(first)) * chunk,
-            u64::from(start - first) * chunk,
-            false,
-        )?;
+        // The boundary's chunks but the skipped ids: below them, above
+        // them, or both.
+        let skipped = self.skipped();
+        let mut outcome = Commit::Committed;
+        for (from, to) in [
+            (first, start.min(skipped.start.max(first))),
+            (first.max(skipped.end), start),
+        ] {
+            if from < to && outcome == Commit::Committed {
+                outcome = self.range.hold(
+                    pool,
+                    u64::from(from) * chunk,
+                    u64::from(to - from) * chunk,
+                    false,
+                )?;
+            }
+        }
         if outcome == Commit::Committed && first == 0 && !self.null_zeroed {
             crate::device::zero_span(
                 self.range.span(0, chunk)?,
@@ -299,7 +324,7 @@ impl Chunks {
     /// the fit left the cache rows of a range reserved for more.
     pub fn limit(&mut self, chunks: u32) {
         self.range
-            .limit(u64::from(chunks) * self.layout.chunk_bytes);
+            .limit(u64::from(self.ids_for(chunks)) * self.layout.chunk_bytes);
     }
 
     /// The chunk a pool of `fitted` chunks parts at ([`Chunks::state_fitted`]):
@@ -356,14 +381,14 @@ impl Chunks {
         }
         let parting = self.parting(fitted, contiguous);
         let chunk = self.layout.chunk_bytes;
-        if parting < fitted {
+        if fitted < self.total {
             self.range.part(
                 u64::from(parting) * chunk,
                 u64::from(self.total - fitted) * chunk,
             )?;
         }
         self.skip = (parting, self.total - fitted);
-        self.range.limit(u64::from(fitted) * chunk);
+        self.range.limit(u64::from(self.total) * chunk);
         Ok(())
     }
 
@@ -371,33 +396,21 @@ impl Chunks {
     /// skipped under any of them.
     #[must_use]
     pub fn in_one_run(&self) -> bool {
-        self.skip.0 >= self.stated()
+        self.skip.1 == 0 || self.skipped().end >= self.total
     }
 
     /// Whether the state's chunks end where the activation starts: only
     /// then is what a smaller rung lends one span with them.
     #[must_use]
     pub fn state_meets_activation(&self) -> bool {
-        self.under_state().0 == self.total
+        self.under_state() == self.total
     }
 
-    /// The state chunks the runtime counts: the range's but those skipped
+    /// The state chunks the card backs: the range's but those skipped
     /// ([`Chunks::state_fitted`]).
     #[must_use]
     pub fn stated(&self) -> u32 {
         self.total - self.skip.1
-    }
-
-    /// Where the runtime's physical chunk `physical` lies in the range: the
-    /// same chunk under where the pool parts, past the skipped chunks from
-    /// there.
-    #[must_use]
-    fn at(&self, physical: u32) -> u32 {
-        if physical >= self.skip.0 {
-            physical.saturating_add(self.skip.1)
-        } else {
-            physical
-        }
     }
 
     /// Whether the range's chunk `chunk` is backed: in a committed segment,
@@ -583,24 +596,27 @@ impl Chunks {
     /// that many would be placed ([`Chunks::state_fitted`]).
     pub fn growth_for(&self, chunks: u32, placed: Option<bool>) -> Result<u64> {
         let chunk = self.layout.chunk_bytes;
-        let parted = match placed {
+        let (end, parted) = match placed {
             Some(contiguous) => {
                 let chunks = chunks.min(self.total);
                 let parting = self.parting(chunks, contiguous);
                 if parting < chunks {
                     (
-                        u64::from(parting) * chunk,
-                        u64::from(self.total - chunks) * chunk,
+                        self.total,
+                        (
+                            u64::from(parting) * chunk,
+                            u64::from(self.total - chunks) * chunk,
+                        ),
                     )
                 } else {
-                    (u64::MAX, 0)
+                    (chunks, (u64::MAX, 0))
                 }
             }
-            None => self.range.parted(),
+            None => (self.ids_for(chunks), self.range.parted()),
         };
         self.range.growth_of(
-            self.segments_for(u64::from(chunks)),
-            u64::from(chunks) * chunk,
+            self.segments_for(u64::from(end)),
+            u64::from(end) * chunk,
             parted,
         )
     }
@@ -712,7 +728,7 @@ impl Chunks {
             // A slot ref: its chunk is one the runtime opened, in a segment
             // it had backed ahead of this fire.
             let chunk = id / per_chunk;
-            let named = self.stated().saturating_add(self.act);
+            let named = self.total.saturating_add(self.act);
             if chunk == 0 || chunk >= named {
                 return Err(Fault::Ceiling {
                     what: "chunks of the state pool a slot ref may name",
@@ -720,15 +736,16 @@ impl Chunks {
                     have: u64::from(named),
                 });
             }
-            return Ok(self.at(self.table.physical(chunk).unwrap_or(chunk)));
+            return Ok(self.table.physical(chunk).unwrap_or(chunk));
         }
-        let stated = self.stated();
+        let stated = self.total;
+        let skipped = self.skipped();
         let seating = &mut self.seated[kind.index()];
         if let Some(&slot) = seating.refs.get(id as usize)
             && slot != UNSEATED
         {
             let chunk = slot / per_chunk;
-            return Ok(self.at(self.table.physical(chunk).unwrap_or(chunk)));
+            return Ok(self.table.physical(chunk).unwrap_or(chunk));
         }
         let (chunk, index) = match seating.open {
             Some((chunk, index)) if index < per_chunk => (chunk, index),
@@ -741,8 +758,8 @@ impl Chunks {
                     });
                 }
                 // A chunk the runtime laid weights in is not this pool's
-                // to open.
-                while self.weights.contains(&self.next) {
+                // to open, nor a skipped one.
+                while self.weights.contains(&self.next) || skipped.contains(&self.next) {
                     self.next += 1;
                 }
                 if self.next >= stated {
@@ -770,7 +787,7 @@ impl Chunks {
                 need: u64::from(chunk) * u64::from(per_chunk) + u64::from(index) + 1,
                 have: u64::from(u32::MAX),
             })?;
-        Ok(self.at(self.table.physical(chunk).unwrap_or(chunk)))
+        Ok(self.table.physical(chunk).unwrap_or(chunk))
     }
 
     /// The slot ref page `id` is seated on.
@@ -801,7 +818,7 @@ impl Chunks {
             need: u64::from(logical) + 1,
             have: u64::from(self.total),
         })?;
-        Ok((self.at(physical), slot % shape.per_chunk))
+        Ok((physical, slot % shape.per_chunk))
     }
 
     /// Bytes from the pool's base to page `id`'s slot.
@@ -833,7 +850,7 @@ impl Chunks {
             have: u64::from(self.total),
         })?;
         self.range.span(
-            u64::from(self.at(physical)) * self.layout.chunk_bytes
+            u64::from(physical) * self.layout.chunk_bytes
                 + u64::from(slot % per_chunk) * slot_bytes,
             slot_bytes,
         )
@@ -914,8 +931,8 @@ impl Chunks {
                 continue;
             }
             spans.push((
-                self.range.span(u64::from(self.at(to)) * chunk, chunk)?,
-                self.range.span(u64::from(self.at(from)) * chunk, chunk)?,
+                self.range.span(u64::from(to) * chunk, chunk)?,
+                self.range.span(u64::from(from) * chunk, chunk)?,
                 usize::try_from(chunk).unwrap_or(0),
             ));
         }
@@ -1021,7 +1038,7 @@ impl Chunks {
                 });
             }
         }
-        let total = self.stated().saturating_add(self.act);
+        let total = self.total.saturating_add(self.act);
         let max = u32::try_from(u64::from(total).div_ceil(u64::from(layout.segment_chunks.max(1))))
             .unwrap_or(u32::MAX);
         ChunkFacts {
@@ -1039,11 +1056,17 @@ impl Chunks {
                     Growth::TwoEnded
                 },
             },
-            reserved: vec![ReservedRun {
+            reserved: std::iter::once(ReservedRun {
                 what: Reserved::Null,
                 first: 0,
                 chunks: 1,
-            }],
+            })
+            .chain((self.skip.1 > 0).then_some(ReservedRun {
+                what: Reserved::Skipped,
+                first: self.skip.0,
+                chunks: self.skip.1,
+            }))
+            .collect(),
             shapes,
             act_chunks: rungs
                 .iter()
@@ -1095,5 +1118,151 @@ impl Chunks {
                 )
                 .collect(),
         }
+    }
+}
+
+#[cfg(all(test, feature = "device"))]
+mod skip_tests {
+    use super::*;
+    use crate::store::layout::{CHANNEL, CHANNEL_SLOT, INSTANCE, INSTANCE_SLOT};
+    use engine::chunk::{Reserved, ReservedRun};
+
+    const CHUNK: u64 = 32 << 20;
+    const SEGMENT: u32 = 4;
+
+    fn guest(id: engine::chunk::ShapeId, slot_bytes: u64) -> SlotShape {
+        SlotShape {
+            id,
+            tokens: 0,
+            slot_bytes,
+            per_chunk: u32::try_from(CHUNK / slot_bytes).expect("slots a chunk"),
+            grain: 1,
+            window: None,
+            rows: Vec::new(),
+            pools: Vec::new(),
+        }
+    }
+
+    /// A range of 16 state chunks in segments of 4, 4 of activation above,
+    /// nothing backed.
+    fn range(pool: &PhysicalPool) -> Chunks {
+        let layout = Layout {
+            chunk_bytes: CHUNK,
+            segment_chunks: SEGMENT,
+            list: None,
+            windows: Vec::new(),
+            fixed: None,
+            rs: None,
+            instance: guest(INSTANCE, INSTANCE_SLOT),
+            channel: guest(CHANNEL, CHANNEL_SLOT),
+            rows: Vec::new(),
+            experts: Vec::new(),
+        };
+        Chunks::reserve(pool, layout, 16, 4 * CHUNK).expect("the range reserves")
+    }
+
+    /// Where the runtime's chunk `id` lies, where the card backs it: the
+    /// address the engine reads a slot of it at.
+    fn address(chunks: &Chunks, id: u32) -> Option<u64> {
+        let per_chunk = u32::try_from(CHUNK / INSTANCE_SLOT).expect("slots a chunk");
+        chunks
+            .weight_slot(per_chunk, INSTANCE_SLOT, id * per_chunk)
+            .ok()
+    }
+
+    /// Fits a fresh range to `fitted` of its 16 chunks and backs every
+    /// segment the runtime may commit: the skipped ids back nothing.
+    fn fitted(pool: &mut PhysicalPool, fitted: u32, contiguous: bool) -> Chunks {
+        let mut chunks = range(pool);
+        chunks
+            .state_fitted(fitted, contiguous)
+            .expect("the pool fits");
+        let segments = chunks.segments_for(u64::from(chunks.total()));
+        assert_eq!(
+            chunks
+                .commit_segments(pool, segments)
+                .expect("the segments commit"),
+            Commit::Committed
+        );
+        chunks
+    }
+
+    /// The runtime is told the skipped ids as a reserved run, beside the
+    /// null chunk, among every id of the range: none is renumbered.
+    fn skipped_run(chunks: &Chunks) -> Option<ReservedRun> {
+        let facts = chunks.facts(1024, false, &[]);
+        assert_eq!(facts.total_chunks, 16 + 4, "every id of the range is named");
+        facts
+            .reserved
+            .iter()
+            .copied()
+            .find(|run| run.what == Reserved::Skipped)
+    }
+
+    /// Every id the runtime may hand out lies at its own place: chunk `id`
+    /// at `id` chunks from the base, so each member of a run of adjacent
+    /// ids lies a chunk past the one before; a skipped id is backed by
+    /// nothing, and no id lies in its place.
+    fn ids_keep_their_place(chunks: &Chunks, skip: std::ops::Range<u32>) {
+        for id in 1..16 {
+            match address(chunks, id) {
+                Some(at) => {
+                    assert!(!skip.contains(&id), "skipped id {id} is backed");
+                    assert_eq!(at, chunks.base() + u64::from(id) * CHUNK, "id {id}");
+                }
+                None => assert!(skip.contains(&id), "id {id} is not backed"),
+            }
+        }
+        for id in 1..15 {
+            if let (Some(a), Some(b)) = (address(chunks, id), address(chunks, id + 1)) {
+                assert_eq!(b - a, CHUNK, "ids {id} and {} adjacent", id + 1);
+            }
+        }
+    }
+
+    /// A fitted range whose skip lies mid-segment: a pool of 10 chunks of
+    /// 16 stated in one run from its base skips ids 10..16, from the middle
+    /// of a segment up to the activation. The runtime is told every id of
+    /// the range, ids 10..16 skipped, so a run bound up to the skip's edge
+    /// lies below it at adjacent addresses, no id lies in the skip's place,
+    /// and the activation's ids above it keep their meaning (id 16 its
+    /// first chunk). Parted at a whole segment, the same holds of ids
+    /// 4..10. Before, the runtime's ids were renumbered across the skip:
+    /// it was told 10 + 4 chunks, and its id 10 was the activation's.
+    #[test]
+    fn a_run_up_to_a_mid_segment_skip_lies_below_it_and_none_crosses_it() {
+        let _context = crate::device::Context::bind(0, None).expect("a device context");
+        let mut pool = PhysicalPool::open(0, u64::MAX).expect("the pool opens");
+        // Stated in one run from the base (another worker reads it in
+        // place): the skip runs mid-segment up to the activation.
+        let chunks = fitted(&mut pool, 10, true);
+        assert_eq!(chunks.skip, (10, 6));
+        assert!(
+            !chunks.skip.0.is_multiple_of(SEGMENT),
+            "the skip mid-segment"
+        );
+        assert_eq!(
+            skipped_run(&chunks),
+            Some(ReservedRun {
+                what: Reserved::Skipped,
+                first: 10,
+                chunks: 6,
+            })
+        );
+        assert!(chunks.in_one_run());
+        assert!(
+            !chunks.state_meets_activation(),
+            "nothing is lent above the skip"
+        );
+        ids_keep_their_place(&chunks, 10..16);
+        drop(chunks);
+
+        // Parted at the first whole segment: ids 4..10 skipped, the state's
+        // last chunks (10..16) right under the activation.
+        let chunks = fitted(&mut pool, 10, false);
+        assert_eq!(chunks.skip, (4, 6));
+        assert!(chunks.state_meets_activation());
+        assert_eq!(chunks.ids_for(10), 16);
+        ids_keep_their_place(&chunks, 4..10);
     }
 }

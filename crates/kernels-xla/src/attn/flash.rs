@@ -172,8 +172,7 @@ fn shape(r: i64, h: &Heads, scale: f64, vmem_cap: i64, narrow_rows: i64) -> Opti
         .find(|s| s.vmem() <= vmem_cap)
 }
 
-/// Whether the kernel takes this fire: the static side of the decision
-/// (`PIE_XLA_FLASH_PREFILL=0` turns it off).
+/// Whether the kernel takes this fire: the static side of the decision.
 pub(crate) fn fits(
     f: &Func,
     ap: &Appended,
@@ -182,9 +181,6 @@ pub(crate) fn fits(
     vmem_cap: i64,
     narrow_rows: i64,
 ) -> bool {
-    if std::env::var("PIE_XLA_FLASH_PREFILL").is_ok_and(|v| v == "0") {
-        return false;
-    }
     let kd = f.dims(ap.k);
     let vd = f.dims(ap.v);
     kd.len() == 2
@@ -627,7 +623,13 @@ pub(crate) fn attend(
     let ok = f.or(ok, dead)?;
     let all = f.reduce(ok, &[0], Fold::And)?;
     // 0: the walk; 1: the kernel, the older keys a rectangle holds (none
-    // where every row's keys are fresh).
+    // where every row's keys are fresh). This runtime case is a second path
+    // every program carries (the walk's code beside the kernel's in each
+    // layer), kept only until the kernel walks any number of older pages
+    // itself, a paged copy loop in place of the `OLD_PAGES` rectangle: that
+    // change deletes the walk branch here. Choosing the walk statically for
+    // any program whose tables could pass the rectangle is not the fix: it
+    // would walk every long-context prefill.
     let fits_old = cmp_i(f, Cmp::Le, old.total, OLD_PAGES)?;
     let all = f.and(all, fits_old)?;
     let which = f.convert(all, Elem::I32);
@@ -794,53 +796,13 @@ struct Older {
     khi: Val,
     planes: (Val, Val),
     ps: i64,
-    /// The pages unmapped (`blocks::SINK` where the sink is read), and each
-    /// plane's map and sink: on a pool the DMA gather maps them itself.
-    raw: Val,
-    maps: [PageMap; 2],
-    sink: i64,
 }
 
 impl Older {
     /// The rectangle's keys and values, `[OLD_PAGES · ps, w]` each.
     fn gather(&self, f: &mut Func) -> Built<(Val, Val)> {
         let n = OLD_PAGES;
-        // Both planes of the chunk pool by DMA, each plane's map applied in
-        // the kernel (the unmapped ids one computation a fire), only with
-        // `PIE_XLA_OLDER_DMA=1`: the kernel call falls between the queries'
-        // projection and the flash, and XLA evicts the queries from fast
-        // memory around it (v6e qwen3-0.6b, 2048-token prefill: a 5.6 us
-        // copy and a flash 7 us slower a layer, against the XLA gather's
-        // 7 us). The XLA gather reads the pool's pages as blocks.
-        if let (Some((pool, Elem::Bf16)), Some((pool_v, Elem::Bf16))) =
-            (f.view_parts(self.planes.0), f.view_parts(self.planes.1))
-            && pool == pool_v
-            && f.view_order(self.planes.0).is_none()
-            && crate::blocks::on()
-            && std::env::var("PIE_XLA_OLDER_DMA").is_ok_and(|v| v == "1")
-        {
-            let mut planes = Vec::with_capacity(2);
-            for (plane, map) in [(self.planes.0, self.maps[0]), (self.planes.1, self.maps[1])] {
-                let (slots, w) = (f.dims(plane)[0], f.dims(plane)[1]);
-                let bytes = self.ps * w * 2;
-                if bytes % 512 == 0 && (bytes / 256) % 16 == 0 {
-                    planes.push((bytes / 512, map, self.sink, slots / self.ps - 1));
-                }
-            }
-            let mut out = Vec::with_capacity(2);
-            if planes.len() == 2 {
-                // both planes in one kernel call
-                let got =
-                    crate::blocks::gather_paged_planes(f, pool, self.raw, Elem::Bf16, &planes)?;
-                for (g, plane) in got.into_iter().zip([self.planes.0, self.planes.1]) {
-                    let w = f.dims(plane)[1];
-                    out.push(f.reshape(g, &[n * self.ps, w])?);
-                }
-            }
-            if out.len() == 2 {
-                return Ok((out[0], out[1]));
-            }
-        }
+        // The XLA gather reads the pool's pages as blocks.
         let at = f.reshape(self.pages, &[n, 1])?;
         let dims = crate::hlo::GatherDims {
             offset_dims: vec![1, 2],
@@ -959,8 +921,6 @@ fn older(
     } else {
         plane_pages(f, maps[1])?
     };
-    let sentinel = f.like_i(raw, i64::from(crate::blocks::SINK));
-    let raw = f.select(used, raw, sentinel)?;
     Ok(Older {
         pages: page,
         values_pages,
@@ -969,9 +929,6 @@ fn older(
         khi,
         planes,
         ps,
-        raw,
-        maps,
-        sink: slots / ps - 1,
     })
 }
 

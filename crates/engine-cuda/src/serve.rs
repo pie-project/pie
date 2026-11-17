@@ -101,6 +101,9 @@ pub struct Shell {
     /// The class words of a drafter's classes (`Shell::drafts_only`); none
     /// on a model without a drafter.
     drafting_words: std::collections::HashSet<u64>,
+    /// The scored classes the lattice arms (`engine::load::armed`): at its
+    /// octaves alone, a fire holding a lane of one padded up to the next.
+    scored: poem_ir::ClassSet,
     landing: Vec<Vec<poem_ir::Request>>,
     armed: Option<Armed>,
     media: poem_ir::ClassSet,
@@ -114,6 +117,11 @@ pub struct Shell {
     adapters: crate::blob::Adapters,
     held: Vec<u32>,
     readout_rows: crate::device::Buffer,
+    /// The run a fire stages a host-resident bank's experts in, bounded at
+    /// load and laid with the staged inputs (`experts::staging`).
+    expert_staging: crate::experts::staging::Staging,
+    /// Where it lies once laid; `None` where the load stages none.
+    expert_staged: Option<crate::experts::staging::Staged>,
     exports: Exports,
     graphs: Graphs,
     copies: bool,
@@ -159,6 +167,13 @@ pub struct Shell {
     inputs_at: u64,
     decoded_tiles: Vec<u64>,
     arming: bool,
+    /// Each lane's score rows while the lattice arms a scored class, since
+    /// no reader is bound: lent from the run the load holds for them in the
+    /// activation's span ([`Shell::arming_capture`]).
+    arming_rows: Vec<u64>,
+    /// The bytes of that run (`engine::load::armed::arming_capture_room`),
+    /// and where it lies once laid.
+    arming_capture: (u64, u64),
     golden_arm: Golden,
     armed_body: Option<record::BodyKey>,
     /// The target arming fires is past its kind's widest bucket
@@ -973,6 +988,16 @@ impl Shell {
                 .contains(&(word & self.compiled.classes.mask))
     }
 
+    /// Whether a lane of `word` lands in a scored class the lattice arms.
+    fn scored_word(&self, word: u64) -> bool {
+        !self.scored.is_empty()
+            && self
+                .compiled
+                .classes
+                .class_of(word & self.compiled.classes.mask)
+                .is_some_and(|class| self.scored.contains(class))
+    }
+
     fn rs_rungs(&self) -> Vec<u32> {
         let ceiling = self.lane_ceiling();
         let top = self.budget.buckets.last().copied();
@@ -1070,6 +1095,33 @@ impl Shell {
         let mut settled = FrameShell::settle(self, enqueued)?;
         Shell::read_out(self, &mut settled)?;
         Ok(std::mem::take(&mut settled.pixels))
+    }
+
+    /// [`Shell::fire`] of text lanes timed to its landing: the time from
+    /// its preparation to the device's last work done, its logits read back
+    /// after (`pie tune --check-estimate`'s fire).
+    pub fn fire_landed(
+        &mut self,
+        lanes: &[Lane<'_>],
+    ) -> Result<(std::time::Duration, Vec<Vec<f32>>)> {
+        let seated: Vec<Seated<'_>> = lanes.iter().copied().map(Seated::of).collect();
+        let began = std::time::Instant::now();
+        let prepared = FrameShell::prepare(
+            self,
+            StepView {
+                lanes: &seated,
+                attachments: &[],
+                media: &[],
+                voxels: &[],
+            },
+            None,
+        )?;
+        let enqueued = FrameShell::enqueue(self, prepared)?;
+        let mut settled = FrameShell::settle(self, enqueued)?;
+        self.device.synchronize()?;
+        let landed = began.elapsed();
+        Shell::read_out(self, &mut settled)?;
+        Ok((landed, std::mem::take(&mut settled.logits)))
     }
 
     pub fn fire_media(

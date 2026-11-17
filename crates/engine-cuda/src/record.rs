@@ -652,11 +652,25 @@ impl AxisCarve<'_> {
         self.prefix(span, u32::MAX)
     }
 
+    /// The lanes a window's carve reaches: from the least lane it can start
+    /// at under this key (one lane for each class before it), its classes'
+    /// lane rungs. Where a fire's own classes before it put its lanes is no
+    /// part of it, so every fire of the key carves the lanes its body was
+    /// armed at.
     #[must_use]
     pub fn lanes(&self, span: MaskSpan) -> Option<(u32, u32)> {
         let cap = self.lane_ceiling?;
         let (_, own) = self.prefix(span, cap)?;
-        Some((span.lane_offset, own.min(cap)))
+        let before = self
+            .ladder
+            .rungs()
+            .iter()
+            .filter(|(class, _)| {
+                let window = self.classes.class(*class as usize);
+                window.row_offset + window.rows <= span.row_offset
+            })
+            .count();
+        Some((u32::try_from(before).ok()?, own.min(cap)))
     }
 
     fn prefix(&self, span: MaskSpan, cap: u32) -> Option<(u32, u32)> {
@@ -1049,10 +1063,10 @@ impl Bodies {
         if !run.capturable() {
             if warmed == WARM_FIRES {
                 eprintln!(
-                    "engine-cuda: body {key} declines to capture — a schedule it \
-                     built refused its graph form ({}), so `graph_capturable` \
-                     is false and this composition walks eagerly for good. The \
-                     prefill float grant is sized at the lattice's top rung in \
+                    "engine-cuda: body {key} declines to capture ({}), so this \
+                     composition walks eagerly for good, each serving fire counted \
+                     unrecorded. A prefill schedule that refused its graph form: \
+                     the prefill float grant is sized at the lattice's top rung in \
                      `inputs::reserve` (`prefill_float_bytes`); a bucket that \
                      outgrows it is this line.",
                     run.uncapturable_why().join("; ")

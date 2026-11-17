@@ -985,18 +985,19 @@ impl<'a> Walk<'a> {
         };
         for (k, v) in t.iter() {
             match k.get_ref().as_ref() {
-                "bf16_flops_per_ns_by_rows_and_depth" => {
-                    rates.bf16_flops_per_ns_by_rows_and_depth =
-                        self.grid(v, "bf16_flops_per_ns_by_rows_and_depth", "rows, depth");
+                "bf16_flops_per_ns_by_rows_n_k" => {
+                    rates.bf16_flops_per_ns_by_rows_n_k = self.gemm_grid(v);
                 }
                 "attn_flops_per_ns_by_keys_and_dim" => {
                     rates.attn_flops_per_ns_by_keys_and_dim =
                         self.grid(v, "attn_flops_per_ns_by_keys_and_dim", "keys, head width");
                 }
-                key @ ("scan_elements_per_ns" | "bytes_per_ns") => {
+                "scan_elements_per_ns_by_tokens" => {
+                    rates.scan_elements_per_ns_by_tokens = self.tokens_curve(v);
+                }
+                key @ "bytes_per_ns" => {
                     match positive(v.get_ref()) {
-                        Some(f) if key == "bytes_per_ns" => rates.bytes_per_ns = Some(f),
-                        Some(f) => rates.scan_elements_per_ns = Some(f),
+                        Some(f) => rates.bytes_per_ns = Some(f),
                         None => self.err(
                             v.span().start,
                             format!(
@@ -1019,13 +1020,128 @@ impl<'a> Walk<'a> {
                 other => self.err(
                     k.span().start,
                     format!(
-                        "`rates` holds `bf16_flops_per_ns_by_rows_and_depth`, `attn_flops_per_ns_by_keys_and_dim`, \
-                         `scan_elements_per_ns`, `bytes_per_ns` and `launch_ns`, not `{other}`"
+                        "`rates` holds `bf16_flops_per_ns_by_rows_n_k`, `attn_flops_per_ns_by_keys_and_dim`, \
+                         `scan_elements_per_ns_by_tokens`, `bytes_per_ns` and `launch_ns`, not `{other}`"
                     ),
                 ),
             }
         }
         rates
+    }
+
+    /// `rates.scan_elements_per_ns_by_tokens`: `[tokens, elements a ns]`
+    /// pairs, whole tokens and a positive rate each, non-empty and strictly
+    /// ascending in tokens.
+    fn tokens_curve(&mut self, value: &Spanned<DeValue<'_>>) -> Option<Vec<(u32, f64)>> {
+        const WHAT: &str = "`rates.scan_elements_per_ns_by_tokens` is a non-empty list of \
+                            [tokens, elements a ns] pairs, ascending in tokens";
+        let DeValue::Array(points) = value.get_ref() else {
+            self.err(
+                value.span().start,
+                format!("{WHAT}, not {}", found(value.get_ref())),
+            );
+            return None;
+        };
+        let mut curve: Vec<(u32, f64)> = Vec::with_capacity(points.len());
+        for point in points.iter() {
+            let pair = match point.get_ref() {
+                DeValue::Array(pair) if pair.len() == 2 => {
+                    let tokens = int(pair[0].get_ref())
+                        .and_then(|i| u32::try_from(i).ok())
+                        .filter(|&m| m > 0);
+                    let rate = match pair[1].get_ref() {
+                        DeValue::Float(f) => f.as_str().replace('_', "").parse::<f64>().ok(),
+                        DeValue::Integer(_) => int(pair[1].get_ref()).map(|i| i as f64),
+                        _ => None,
+                    }
+                    .filter(|f| *f > 0.0);
+                    tokens.zip(rate)
+                }
+                _ => None,
+            };
+            match pair {
+                Some((m, r)) if curve.last().is_none_or(|&(last, _)| m > last) => {
+                    curve.push((m, r));
+                }
+                _ => {
+                    self.err(
+                        point.span().start,
+                        format!("{WHAT}, not {}", found(point.get_ref())),
+                    );
+                    return None;
+                }
+            }
+        }
+        if curve.is_empty() {
+            self.err(value.span().start, format!("{WHAT}, not an empty list"));
+            return None;
+        }
+        Some(curve)
+    }
+
+    /// `rates.bf16_flops_per_ns_by_rows_n_k`: `[rows, n, k, flops a ns]`,
+    /// whole rows, columns and depths and a positive rate each, every stated
+    /// `(n, k)` at every stated row ([`crate::fire::gemm_grid`]).
+    fn gemm_grid(&mut self, value: &Spanned<DeValue<'_>>) -> Option<Vec<(u32, u32, u32, f64)>> {
+        const WHAT: &str = "`rates.bf16_flops_per_ns_by_rows_n_k` is a grid of [rows, n, k, \
+                            flops a ns], every stated (n, k) at every stated row, each rate \
+                            positive";
+        let DeValue::Array(points) = value.get_ref() else {
+            self.err(
+                value.span().start,
+                format!("{WHAT}, not {}", found(value.get_ref())),
+            );
+            return None;
+        };
+        let whole = |v: &DeValue<'_>| {
+            int(v)
+                .and_then(|i| u32::try_from(i).ok())
+                .filter(|&m| m > 0)
+        };
+        let mut quads: Vec<(u32, u32, u32, f64)> = Vec::with_capacity(points.len());
+        for point in points.iter() {
+            let quad = match point.get_ref() {
+                DeValue::Array(t) if t.len() == 4 => {
+                    let rate = match t[3].get_ref() {
+                        DeValue::Float(f) => f.as_str().replace('_', "").parse::<f64>().ok(),
+                        DeValue::Integer(_) => int(t[3].get_ref()).map(|i| i as f64),
+                        _ => None,
+                    }
+                    .filter(|f| *f > 0.0);
+                    match (
+                        whole(t[0].get_ref()),
+                        whole(t[1].get_ref()),
+                        whole(t[2].get_ref()),
+                        rate,
+                    ) {
+                        (Some(m), Some(n), Some(k), Some(r)) => Some((m, n, k, r)),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            let Some(quad) = quad else {
+                self.err(
+                    point.span().start,
+                    format!("{WHAT}, not {}", found(point.get_ref())),
+                );
+                return None;
+            };
+            quads.push(quad);
+        }
+        if quads.is_empty() {
+            self.err(value.span().start, format!("{WHAT}, not an empty list"));
+            return None;
+        }
+        let count = quads.len();
+        let grid = crate::fire::gemm_grid(quads);
+        if grid.is_none() {
+            self.err(
+                value.span().start,
+                format!("{WHAT}, not {count} points that leave a hole or state a point twice"),
+            );
+        }
+        grid
     }
 
     /// `rates.<key>`: `[a, b, flops a ns]` triples (`axes` names `a` and
@@ -1038,12 +1154,9 @@ impl<'a> Walk<'a> {
         key: &str,
         axes: &str,
     ) -> Option<Vec<(u32, u32, f64)>> {
-        let every = match key {
-            "attn_flops_per_ns_by_keys_and_dim" => "every head width at every key count",
-            _ => "every depth at every row",
-        };
         let what = format!(
-            "`rates.{key}` is a full grid of [{axes}, flops a ns], {every}, each rate positive"
+            "`rates.{key}` is a full grid of [{axes}, flops a ns], every head width at every key \
+             count, each rate positive"
         );
         let what = what.as_str();
         let DeValue::Array(points) = value.get_ref() else {
@@ -1067,7 +1180,7 @@ impl<'a> Walk<'a> {
                         DeValue::Integer(_) => int(t[2].get_ref()).map(|i| i as f64),
                         _ => None,
                     }
-                    .filter(|f| f.is_finite() && *f > 0.0);
+                    .filter(|f| *f > 0.0);
                     match (whole(t[0].get_ref()), whole(t[1].get_ref()), rate) {
                         (Some(m), Some(k), Some(r)) => Some((m, k, r)),
                         _ => None,

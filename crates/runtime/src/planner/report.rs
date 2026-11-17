@@ -146,6 +146,7 @@ impl ResidencyPlanner {
             debug_assert_eq!(proc.state, Residency::Restoring);
             proc.state = Residency::Resident;
             proc.progressed = false;
+            proc.roles_short = false;
             Some(proc.signal.clone())
         });
         crate::scheduler::worker::notify_process_resume(pid);
@@ -183,6 +184,22 @@ impl ResidencyPlanner {
         } else {
             self.poke();
         }
+    }
+
+    /// `pid`'s restore found no device room for its parked role slots, which
+    /// a budget holds: it is queued again, a waiter like any admission, and
+    /// served once a completion frees room or an eviction makes it
+    /// ([`super::proc::Proc::roles_short`]). No failure.
+    pub(super) fn requeue_restore_roles(self: &Arc<Self>, pid: ProcessId) {
+        self.stats
+            .restore_roles_short
+            .fetch_add(1, Ordering::Relaxed);
+        self.with_inner(|inner| {
+            if let Some(proc) = inner.procs.get_mut(&pid) {
+                proc.roles_short = true;
+            }
+        });
+        self.requeue_restore(pid);
     }
 
     /// More of `pid`'s pages were swapped out since its restore was quoted:

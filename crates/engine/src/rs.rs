@@ -33,6 +33,7 @@ impl LanePlan {
             base,
             folded,
             fold,
+            lineage,
         } = verb
         else {
             return Ok(LanePlan {
@@ -47,7 +48,7 @@ impl LanePlan {
                  into its buffer"
             )));
         }
-        let reads = buffered_reads(mask, *folded, first, rows)?;
+        let reads = buffered_reads(mask, *folded, first, *lineage)?;
         let replay: u32 = reads
             .iter()
             .map(|r| u32::try_from(r.len()).unwrap_or(0))

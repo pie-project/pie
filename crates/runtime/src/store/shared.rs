@@ -90,6 +90,11 @@ struct RungGate {
     /// the cap once no step past it is (the scheduler holds back a launch
     /// past the cap), so the walker may lower the pool's rung behind it.
     grant: std::sync::atomic::AtomicU32,
+    /// The walker holds the rung down: a raise waits on the governor's grow
+    /// of the span yield gave back under pressure, no fire's retirement.
+    /// What a pass waits on before it is cut otherwise lands; under this, a
+    /// pass is cut to the rung standing ([`rung_held`]).
+    held: std::sync::atomic::AtomicBool,
     /// The event every wait on the activation rung waits on: the fire cap
     /// moved, a raise was applied, copied or refused, the rung was lowered,
     /// segments were committed, or room was freed (a fire retired).
@@ -119,6 +124,7 @@ fn rung_gate(engine: usize) -> &'static RungGate {
             Box::leak(Box::new(RungGate {
                 cap: std::sync::atomic::AtomicU32::new(u32::MAX),
                 grant: std::sync::atomic::AtomicU32::new(u32::MAX),
+                held: std::sync::atomic::AtomicBool::new(false),
                 event: tokio::sync::Notify::new(),
                 walk: tokio::sync::Notify::new(),
             }))
@@ -212,6 +218,27 @@ fn set_fire_cap(engine: usize, tokens: u32) {
         .cap
         .store(tokens, std::sync::atomic::Ordering::Release);
     rung_changed(engine);
+}
+
+/// Whether `engine`'s walker holds the rung down: a raise past it waits on
+/// the governor's grow of the span yield gave back (pressure), so a pass
+/// asking past it is cut to the rung standing rather than wait.
+#[must_use]
+pub fn rung_held(engine: usize) -> bool {
+    rung_gate(engine)
+        .held
+        .load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// The walker of `engine` holds the rung down, or no longer does; every wait
+/// on the rung looks again.
+pub(crate) fn hold_rung(engine: usize, held: bool) {
+    let was = rung_gate(engine)
+        .held
+        .swap(held, std::sync::atomic::Ordering::AcqRel);
+    if was != held {
+        rung_changed(engine);
+    }
 }
 
 /// The scheduler of `engine` has no step wider than `cap` in flight, and
@@ -829,10 +856,11 @@ impl SharedPool {
     }
 
     /// The pool `facts` state, and `max_context` tokens the longest a
-    /// working set holds. The rung starts at the largest: state never takes
-    /// the top span until a rung is lowered. Where the span is backed on
-    /// demand, at the smallest, the rung the engine backs at load
-    /// ([`Self::start_cap`]).
+    /// working set holds. The rung starts at the largest, the top rung the
+    /// load chose, on every engine: the span is backed at load and live
+    /// state never takes it, so fires are uncut from ready on
+    /// ([`Self::start_cap`]). Only yield's pressure or a forced fit lowers
+    /// it.
     pub fn new(facts: &ChunkFacts, max_context: u32) -> Result<Self, SharedError> {
         facts
             .validate()
@@ -840,14 +868,30 @@ impl SharedPool {
         if let Some(shape) = facts.shapes.iter().find(|shape| shape.pinned.is_some()) {
             return Err(SharedError::Pinned(shape.id.0));
         }
+        // The reserved runs lie from chunk 0 on; skipped ids anywhere above
+        // them, apart.
         let mut reserved = 0u32;
+        let mut skips = Vec::new();
         for run in &facts.reserved {
-            if run.first != reserved {
+            if run.what == ::engine::chunk::Reserved::Skipped {
+                skips.push((run.first, run.chunks));
+                continue;
+            }
+            if run.first != reserved || !skips.is_empty() {
                 return Err(SharedError::Reserved);
             }
             reserved += run.chunks;
         }
-        Self::build(facts, reserved, max_context)
+        let mut skips_sorted = skips.clone();
+        skips_sorted.sort_unstable();
+        let mut end = reserved;
+        for &(first, chunks) in &skips_sorted {
+            if first < end || first.saturating_add(chunks) > facts.total_chunks {
+                return Err(SharedError::Reserved);
+            }
+            end = first + chunks;
+        }
+        Self::build(facts, reserved, &skips, max_context)
     }
 
     /// A tier below the device (CONTRACT-BC 22): `chunks` chunks of the
@@ -899,10 +943,15 @@ impl SharedPool {
             weights: Vec::new(),
             ..facts.clone()
         };
-        Self::build(&tier, 0, 0).map(Some)
+        Self::build(&tier, 0, &[], 0).map(Some)
     }
 
-    fn build(facts: &ChunkFacts, reserved: u32, max_context: u32) -> Result<Self, SharedError> {
+    fn build(
+        facts: &ChunkFacts,
+        reserved: u32,
+        skips: &[(u32, u32)],
+        max_context: u32,
+    ) -> Result<Self, SharedError> {
         let mut shapes = Vec::with_capacity(facts.shapes.len() + facts.weights.len());
         let (mut lists, mut rs_lists, mut windows, mut fixed) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -989,11 +1038,14 @@ impl SharedPool {
             act_chunks: facts.act_chunks.clone(),
             act_span: facts.act_span_chunks,
         });
-        // An engine told rungs starts at the smallest, the rung it lays its
-        // fires by at load; passes raise it through `Engine::set_rung` as
-        // fires need. One that is not: at the largest.
+        for &(first, chunks) in skips {
+            pool.skip(first, chunks);
+        }
+        // Every engine starts at the largest rung, the one it lays its fires
+        // by at load (an engine told rungs as well: it hears each change
+        // from there).
         let tells_rungs = facts.tells_rungs;
-        if !tells_rungs && let Some(&(rung, _)) = facts.act_chunks.last() {
+        if let Some(&(rung, _)) = facts.act_chunks.last() {
             pool.set_rung(rung)
                 .expect("an empty pool takes its largest rung");
         }
@@ -1135,7 +1187,11 @@ impl SharedPool {
     #[must_use]
     pub fn tier_bytes(&self) -> (u64, u64, u64) {
         let chunk = self.pool.chunk_bytes();
-        let total = u64::from(self.pool.total_chunks() - self.pool.reserved_chunks()) * chunk;
+        let total = u64::from(
+            self.pool.total_chunks()
+                - self.pool.reserved_chunks()
+                - self.pool.skipped_below(self.pool.total_chunks()),
+        ) * chunk;
         let opened = u64::from(self.pool.state_chunks()) * chunk;
         (total, opened, self.pool.demand().live)
     }
@@ -1178,6 +1234,7 @@ impl SharedPool {
         let state_chunks = self
             .backable_below_span()
             .saturating_sub(pool.reserved_chunks())
+            .saturating_sub(pool.skipped_below(self.backable_below_span()))
             .saturating_sub(act_chunks - pool.act_max())
             .saturating_sub(weight_chunks);
         PoolRoom {
@@ -1350,10 +1407,10 @@ impl SharedPool {
     /// (standing bytes).
     #[must_use]
     pub fn state_chunks_now(&self) -> u32 {
-        self.pool
-            .live_limit()
-            .min(self.pool.state_limit())
+        let limit = self.pool.live_limit().min(self.pool.state_limit());
+        limit
             .saturating_sub(self.pool.reserved_chunks())
+            .saturating_sub(self.pool.skipped_below(limit))
     }
 
     /// Slots of pool shape `shape` the state chunks hold, were every one
@@ -1683,8 +1740,7 @@ impl SharedPool {
     }
 
     /// The cap fires start at: the rung the pool starts at, lifted. The
-    /// largest's (no cap) unless the engine is told rungs, where fires
-    /// start cut to the smallest rung until a raise reaches the engine.
+    /// largest's on every engine: no cap.
     #[must_use]
     pub fn start_cap(&self) -> u32 {
         self.lifted(self.rung())
@@ -2110,7 +2166,8 @@ impl SharedPool {
 
     #[must_use]
     pub fn hard_limit(&self) -> u64 {
-        u64::from(self.pool.total_chunks()) * self.pool.chunk_bytes()
+        u64::from(self.pool.total_chunks() - self.pool.skipped_below(self.pool.total_chunks()))
+            * self.pool.chunk_bytes()
     }
 
     /// Bytes under the mapped segments, the top span's included.

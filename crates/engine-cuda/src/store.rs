@@ -1137,17 +1137,6 @@ impl Pools {
         self.pool.map_unit_bytes()
     }
 
-    /// The map units the pool may still take beside the bodies while they
-    /// arm: none once the load backed it whole.
-    #[must_use]
-    pub fn arming_margin_bytes(&self) -> u64 {
-        if self.whole {
-            0
-        } else {
-            self.pool.map_unit_bytes().saturating_mul(16)
-        }
-    }
-
     /// What the cache rows may still take of the device: the bytes the fit
     /// declared them, or the most their segments ever backed, past what
     /// they back now. The activation's held spans are no part of it: they
@@ -3734,10 +3723,11 @@ impl Pools {
         // Where the fit keeps chunks back, only the segments wholly under
         // them: the last the fitted chunks reach into would back some of
         // what is kept.
+        let fitted_end = u64::from(self.chunks.ids_for(fitted));
         let segments = if stated > fitted {
-            self.chunks.segments_under(u64::from(fitted))
+            self.chunks.segments_under(fitted_end)
         } else {
-            self.chunks.segments_for(u64::from(fitted))
+            self.chunks.segments_for(fitted_end)
         };
         // The fit that sized these chunks ran in this same step of the
         // load, so the card holds them: a refusal here is a fit that

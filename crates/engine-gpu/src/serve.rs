@@ -64,6 +64,23 @@ pub trait Serve: Backend {
     /// What a step in flight keeps until it is harvested.
     type Flight;
 
+    /// The widest fire this backend lays: the tokens its served loads are
+    /// asked, the top of its rung lattice ([`Serve::rung_lattice`]).
+    const ROWS_TOP: u32;
+
+    /// The rows this backend lays fires at, its one rung lattice: every
+    /// power of two of tokens from 1 to [`Serve::ROWS_TOP`], and that top.
+    /// A load offers no other rung, and the rates step times exactly these.
+    #[must_use]
+    fn rung_lattice() -> Vec<u32> {
+        let top = Self::ROWS_TOP.max(1);
+        let mut rows = engine::memory::rungs(1, top);
+        if rows.last() != Some(&top) {
+            rows.push(top);
+        }
+        rows
+    }
+
     /// The key a walked step is kept under to replay.
     type Keep;
 
@@ -188,6 +205,14 @@ pub trait Serve: Backend {
 
     /// Harvests the oldest step in flight, waiting for it.
     fn harvest_one(shell: &mut Shell<Self>) -> Result<()>;
+
+    /// Waits for every step in flight to finish on the device, harvesting
+    /// none: a check of the estimate stops its timer here and reads the
+    /// rows back after. `false` where the backend cannot wait apart from
+    /// its harvest.
+    fn wait_flown(_shell: &Shell<Self>) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 /// How a step goes to the device ([`Serve::plan`]).
@@ -425,6 +450,9 @@ pub struct Seated<'a, B: Serve> {
     pub pages: &'a [u32],
 
     pub held: Option<u32>,
+    /// The set's committed boundary (`KvDelta::folded`): the lane's mask
+    /// speaks of the keys from it on.
+    pub folded: u32,
     pub kv_less: bool,
 
     pub mask: Option<&'a Masking>,
@@ -485,6 +513,7 @@ impl<'a, B: Serve> Seated<'a, B> {
             lane,
             pages: &[],
             held: None,
+            folded: 0,
             kv_less: false,
             mask: None,
             adapter: None,
@@ -1030,10 +1059,16 @@ impl<B: Serve> Shell<B> {
         let mut weighed: Option<Weighed> = None;
         let (compiled, mut span) = loop {
             let compiled = compile_axes(&boot.trace, &budgets, &profile)?;
+            // The rungs the rung lattice offers up to this load's top: the
+            // rows the rates grid was timed at, so the estimate never weighs
+            // a rung it did not measure.
             let top = budgets.tokens.max_tokens;
-            let mut rung_tokens = engine::memory::rungs(1, top);
-            if rung_tokens.last() != Some(&top) {
-                rung_tokens.push(top);
+            let mut rung_tokens: Vec<u32> = B::rung_lattice()
+                .into_iter()
+                .filter(|&t| t <= top)
+                .collect();
+            if rung_tokens.is_empty() {
+                rung_tokens.push(1);
             }
             let span = Span::plan(
                 &boot.trace,
@@ -2258,6 +2293,23 @@ impl<B: Serve> Shell<B> {
     }
 
     pub fn fire_seated(&mut self, lanes: &[Seated<'_, B>]) -> Result<Vec<Vec<f32>>> {
+        let landed = self.fire_seated_landed(lanes)?;
+        self.rows_of(&landed)
+    }
+
+    /// [`Shell::fire`] for a check of the estimate: the fire submitted and
+    /// waited for on the device ([`Serve::wait_flown`]), its rows not yet
+    /// read back ([`Shell::rows_of`] reads them, outside a timer); `false`
+    /// where the backend cannot wait apart from its harvest, so nothing
+    /// was waited for and the fire is no timing.
+    pub fn fire_waited(&mut self, lanes: &[Lane<'_>]) -> Result<(Landed, bool)> {
+        let seated: Vec<Seated<'_, B>> = lanes.iter().copied().map(Seated::of).collect();
+        let landed = self.fire_seated_landed(&seated)?;
+        let waited = B::wait_flown(self)?;
+        Ok((landed, waited))
+    }
+
+    fn fire_seated_landed(&mut self, lanes: &[Seated<'_, B>]) -> Result<Landed> {
         use engine::frame::Shell as FrameShell;
         // A direct fire's seat-addressed lanes read the seats' runs: back
         // their segments first, off the fire's path.
@@ -2280,8 +2332,7 @@ impl<B: Serve> Shell<B> {
             None,
         )?;
         let enqueued = FrameShell::enqueue(self, prepared)?;
-        let landed = FrameShell::settle(self, enqueued)?;
-        self.rows_of(&landed)
+        FrameShell::settle(self, enqueued)
     }
 
     /// Fires `lanes` over their VAE `clips` and reads back the pixel plane
@@ -3056,6 +3107,9 @@ impl<B: Serve> Shell<B> {
         let mut tokens: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut positions: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut rotations: Vec<i32> = Vec::with_capacity(rows as usize);
+        // Each row's stated position, the mrope table's fill where a row
+        // carries no stream of its own.
+        let mut stated_rows: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut slot_ids: Vec<i32> = Vec::with_capacity(lanes.len());
 
         let mut request_of_token: Vec<i32> = Vec::with_capacity(rows as usize);
@@ -3152,6 +3206,7 @@ impl<B: Serve> Shell<B> {
                     base,
                     folded,
                     fold,
+                    lineage,
                 } if self.pools.rs_rows().is_some() => engine::fire::RsVerb::Buffer {
                     pages: self
                         .pools
@@ -3159,6 +3214,7 @@ impl<B: Serve> Shell<B> {
                     base: *base,
                     folded: *folded,
                     fold: *fold,
+                    lineage: *lineage,
                 },
                 other => other.clone(),
             };
@@ -3271,6 +3327,7 @@ impl<B: Serve> Shell<B> {
             masks.push(crate::mask::LaneMask {
                 mask: masking,
                 have,
+                folded: seated.folded.min(have),
                 rows: row.rows,
             });
 
@@ -3393,10 +3450,12 @@ impl<B: Serve> Shell<B> {
                             .positions
                             .get(at)
                             .map_or(row, |&p| narrow(u64::from(p)));
-                        // With mrope the rotation rides its own table, and the
-                        // plain one is the causal bound: a KV row.
-                        positions.push(if self.states_mrope { row } else { stated });
-                        rotations.push(stated);
+                        // The causal bound is the row order, the cache row; a
+                        // stated position rotates the row and bounds nothing.
+                        // With mrope the rotation rides its own table.
+                        positions.push(row);
+                        rotations.push(if self.states_mrope { row } else { stated });
+                        stated_rows.push(stated);
                         request_of_token.push(at_lane);
                         slot_of_row.extend_from_slice(&state);
                     }
@@ -3545,6 +3604,7 @@ impl<B: Serve> Shell<B> {
                 enabled: self.copies && masks.iter().all(|lane| lane.mask.is_none()),
                 page_tables: &geometries,
                 positions: &positions,
+                rotations: &rotations,
                 request_of_token: &request_of_token,
             },
             &[],
@@ -3627,7 +3687,7 @@ impl<B: Serve> Shell<B> {
                     }
                     None => {
                         for i in 0..row.rows as usize {
-                            let p = rotations[row.row_offset as usize + i];
+                            let p = stated_rows[row.row_offset as usize + i];
                             mrope_positions[at + 3 * i] = p;
                             mrope_positions[at + 3 * i + 1] = p;
                             mrope_positions[at + 3 * i + 2] = p;
@@ -3755,6 +3815,7 @@ impl<B: Serve> Shell<B> {
             &crate::inputs::Fire {
                 tokens: &tokens,
                 positions: &positions,
+                rotations: &rotations,
                 readout_rows: &readout_rows,
                 windows: &boundaries,
                 slot_ids: &slot_ids,
@@ -3909,6 +3970,7 @@ impl<B: Serve> Shell<B> {
             group_masks,
             tokens: bound.tokens,
             positions: bound.positions,
+            rotations: bound.rotations,
             readout_rows: bound.readout_rows,
 
             adapter_routes: bound.adapter_routes,

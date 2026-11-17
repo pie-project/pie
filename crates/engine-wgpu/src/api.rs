@@ -45,7 +45,6 @@ pub type Wgpu = engine_gpu::api::Gpu<Api>;
 impl Host for Api {
     const KIND: &'static str = "wgpu";
 
-
     type Programs = crate::program::Plane;
 
     fn domain(boot: &DeviceBoot) -> MemoryDomain {

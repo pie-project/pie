@@ -198,9 +198,9 @@ pub fn emit_sampler_region(
   M1Lane g;
   g.slice = lane_row;
   g.slices = lane_blocks;
-  g.arena = reinterpret_cast<m1_u8*>(scratch_bases[temporary_piece]) + temporary_offset;
+  g.arena = lane_arenas + (m1_u64)dispatch_lane * lane_blocks * M1_LANE_ARENA_STRIDE;
   g.words = reinterpret_cast<m1_u32*>(lane_line);
-  g.stride = temporary_stride;
+  g.stride = M1_LANE_ARENA_STRIDE;
   g.parity = 0u;
   g.arrivals = 0u;
   g.counted = false;

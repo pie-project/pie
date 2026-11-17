@@ -372,9 +372,62 @@ pub fn resolve(kind: &str, profiles: Option<&Path>) -> (Profile, Report) {
     SHELF.resolve(registry(), kind, &Tpu::of(kind).facts(), profiles)
 }
 
+/// The decisions `pie tune xla` measures that this device runs unmeasured:
+/// stated at a carried or seeded value, or left at the registry's default,
+/// but no layer measured them on it (`[provenance] measured`). In id order.
+#[must_use]
+pub fn unmeasured(profile: &Profile, report: &Report) -> Vec<&'static str> {
+    profile
+        .entries()
+        .filter(|(spec, ..)| spec.tune != profile::Tune::Never)
+        .map(|(spec, ..)| spec.id)
+        .filter(|id| !report.measured.contains(id))
+        .collect()
+}
+
+/// Says once per device kind, by name, which decisions it runs unmeasured
+/// and how to measure them: none runs a default silently.
+pub fn tell_unmeasured(kind: &str, profile: &Profile, report: &Report) {
+    use std::collections::BTreeSet;
+    use std::sync::Mutex;
+    static TOLD: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+    let ids = unmeasured(profile, report);
+    if ids.is_empty() || report.untuned() {
+        // An untuned device was told as a whole (`Shelf::tell_untuned`).
+        return;
+    }
+    let mut told = TOLD.lock().expect("told lock poisoned");
+    if told.insert(kind.to_string()) {
+        eprintln!(
+            "{kind}: {} decision(s) run a value not measured on this device: {}.\n\
+             To measure them:\n    pie tune xla",
+            ids.len(),
+            ids.join(", ")
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_v6e_names_the_decisions_it_runs_unmeasured() {
+        let (profile, report) = resolve("TPU v6 lite", None);
+        let ids = unmeasured(&profile, &report);
+        for id in [
+            "kernel.attn.append_rows_in_place",
+            "kernel.attn.append_page_rows",
+            "kernel.attn.decode_chunk_keys",
+        ] {
+            assert!(
+                ids.contains(&id),
+                "{id} runs unmeasured and is named: {ids:?}"
+            );
+        }
+        // A decision the file measured is not named.
+        assert!(!ids.contains(&"kernel.attn.decode_pages"), "{ids:?}");
+    }
 
     #[test]
     fn the_registry_holds_together() {

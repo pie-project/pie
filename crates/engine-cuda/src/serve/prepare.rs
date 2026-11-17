@@ -231,6 +231,11 @@ impl Shell {
                         ),
                     });
                 }
+                // A size-only walk launches nothing: no row is written.
+                None if crate::sizing::active() => Some(0),
+                // Arming: no reader is bound, and the lane captures into
+                // rows lent for it.
+                None if self.arming => self.arming_rows.get(at).copied(),
                 None => None,
             };
             rows[at] = row.ok_or_else(|| Fault::Unbound {
@@ -673,8 +678,16 @@ impl Shell {
         let buffering = lanes.iter().any(|seated| {
             matches!(seated.rs, RsVerb::Buffer { .. }) || self.drafts_only(seated.lane.word)
         });
+        // One holding a scored lane pads to the lattice's next octave, where
+        // its body is armed (`engine::load::armed::scored_bucket`).
+        let scored = lanes
+            .iter()
+            .any(|seated| self.scored_word(seated.lane.word));
         let at = self.forced_bucket.take().or_else(|| {
             let rows: u32 = lane_rows.iter().sum();
+            if scored {
+                return engine::load::armed::scored_bucket(&self.budget.buckets, rows);
+            }
             buffering
                 .then(|| self.rs_rungs().into_iter().find(|&bucket| bucket >= rows))
                 .flatten()
@@ -1173,7 +1186,12 @@ impl Shell {
                         ),
                     ));
                 }
-                pending_mask_injects.push((masks.len(), src, have.saturating_add(row.rows)));
+                // The guest's cell holds the lane's buffer, then its row:
+                // columns from its committed boundary on.
+                let extent = have
+                    .saturating_sub(seated.folded.min(have))
+                    .saturating_add(row.rows);
+                pending_mask_injects.push((masks.len(), src, extent));
             }
             let runs_masked_arm = self.masked.contains(row.class as usize);
             let reads_group_mask = self.group_masked.contains(row.class as usize);
@@ -1195,6 +1213,7 @@ impl Shell {
                 // masks (`group_masks`), not over the lane's keys.
                 mask: masking.filter(|_| runs_masked_arm),
                 have,
+                folded: seated.folded.min(have),
                 rows: row.rows,
                 wide: self.wide.contains(row.class as usize),
             });
@@ -1232,6 +1251,7 @@ impl Shell {
                     base,
                     folded,
                     fold,
+                    lineage,
                 } => {
                     rs_pages.extend_from_slice(pages);
                     // A device-counted fold not yet settled left the state
@@ -1261,7 +1281,7 @@ impl Shell {
                             ),
                         ));
                     }
-                    let reads = engine::fire::buffered_reads(masking, *folded, first, row.rows)
+                    let reads = engine::fire::buffered_reads(masking, *folded, first, *lineage)
                         .map_err(|error| {
                             Fault::program("serve::rs", format!("lane {}: {error}", row.source))
                         })?;

@@ -89,7 +89,6 @@ pub(super) struct Arming {
     belted: bool,
     starved: Option<u64>,
     peer_stopped: bool,
-    unit_margin: u64,
     /// The bodies' allowance is a record's measurement
     /// ([`super::measured`]): the lattice arms as recorded, unpriced, and
     /// no headroom estimate stops it.
@@ -649,6 +648,7 @@ impl Shell {
                 positions: &[],
                 pages: &lane.pages,
                 held: lane.held,
+                folded: 0,
                 kv_less: false,
                 translation: &[],
                 window: &lane.window,
@@ -999,19 +999,21 @@ impl Shell {
     /// instead. A coarser default lattice's buckets are the finer one's
     /// every other past the fine rows, so nothing compiled changes. Returns
     /// the buckets dropped; says so, and loudly where even the coarsest
-    /// lattice does not fit.
+    /// lattice does not fit. A load that arms scored classes keeps the
+    /// plain lattice whole: where its plain and scored bodies together do
+    /// not fit, it is refused by name.
     fn fit_lattice(
         &mut self,
         rest: &[(u32, Kind)],
         kept: usize,
         weighed: &[(usize, usize); Kind::COUNT],
-    ) -> std::collections::BTreeSet<u32> {
+    ) -> Result<std::collections::BTreeSet<u32>> {
         let Some((steps, from, mut fine)) = self.lattice else {
-            return std::collections::BTreeSet::new();
+            return Ok(std::collections::BTreeSet::new());
         };
         let spent = self.cache.body_stats().census;
         if spent.bodies == 0 {
-            return std::collections::BTreeSet::new();
+            return Ok(std::collections::BTreeSet::new());
         }
         let average = spent.bytes / spent.bodies;
         let price = |kind: Kind| match weighed[kind.at()] {
@@ -1027,16 +1029,19 @@ impl Shell {
                 .sum::<usize>()
                 + kept * average
         };
-        // What the allowance has left, or the card where it has less: the
-        // ceiling's spare stops arming as the allowance does.
-        let allowance = self.bodies_mem.saturating_sub(spent.bytes);
-        let spare = self
-            .pools
-            .spare_bytes_for_bodies(allowance as u64)
-            .map_or(allowance, |spare| {
-                usize::try_from(spare).unwrap_or(usize::MAX)
+        // What the bodies may still take (`Shell::bodies_room`), priced at
+        // what the armed ones took as they were instantiated: the bytes
+        // `arm_target` stops on.
+        let room = usize::try_from(self.bodies_room()).unwrap_or(usize::MAX);
+        if !self.scored.is_empty() && need(&buckets) > room {
+            return Err(Fault::Ceiling {
+                what: "bytes of the bodies of the plain lattice and its scored classes' \
+                       octaves, which a load arming scored classes holds whole \
+                       ([engine] bodies_mem, or the card)",
+                need: (need(&buckets) + spent.bytes) as u64,
+                have: (room + spent.bytes) as u64,
             });
-        let room = allowance.min(spare);
+        }
         while need(&buckets) > room {
             if fine <= steps.max(1) {
                 eprintln!(
@@ -1076,8 +1081,25 @@ impl Shell {
             .filter(|b| !buckets.contains(b))
             .copied()
             .collect();
+        // The fires compose at the buckets left (`Shell::budgets`), as the
+        // lattice arms them: a bucket dropped here is one no fire pads to.
+        self.budgets.tokens.buckets.clone_from(&buckets);
         self.budget.buckets = buckets;
-        dropped
+        Ok(dropped)
+    }
+
+    /// What the bodies may still take: the allowance past the bytes the
+    /// armed ones took of the device as each was instantiated and uploaded
+    /// (`record::Body::bytes`, measured), or the card's spare past the cache
+    /// rows' reserve where it has less. Arming stops when it is spent
+    /// (`arm_target`), and the lattice's fit prices the bodies still to arm
+    /// in it (`fit_lattice`).
+    fn bodies_room(&self) -> u64 {
+        let allowance =
+            (self.bodies_mem as u64).saturating_sub(self.cache.body_stats().census.bytes as u64);
+        self.pools
+            .spare_bytes_for_bodies(allowance)
+            .map_or(allowance, |spare| allowance.min(spare))
     }
 
     /// Forgets the recorded bodies and arms the lattice again within the
@@ -1131,6 +1153,15 @@ impl Shell {
     /// Every composition the lattice arms, in arming's order (the top
     /// bucket's first, then by kind and bucket), each with its recurrent
     /// rows' treatment; `None` where there is nothing to arm.
+    /// Whether a composition holds a lane of a scored class.
+    fn holds_scored(&self, target: &BodySynth) -> bool {
+        target
+            .lanes()
+            .0
+            .iter()
+            .any(|&(class, _)| self.scored.contains(class))
+    }
+
     fn lattice_targets(&self) -> Option<LatticeTargets> {
         let ceiling = self.lane_ceiling();
         if ceiling == 0 {
@@ -1181,40 +1212,44 @@ impl Shell {
             (true, Some(ladder)) => ladder.buckets.clone(),
             _ => Vec::new(),
         };
-        let deployment = Deployment {
+        // The plain lattice is keyed over the plain classes alone, whole;
+        // the scored classes' compositions beside it, at its octaves alone
+        // (`engine::load::armed::scored_buckets`): a fire holding a scored
+        // lane pads up to the next (`Shell::scored_word`).
+        let plain = poem_ir::ClassSet::of(
+            self.tiers
+                .plain
+                .iter()
+                .filter(|class| !self.scored.contains(*class)),
+        );
+        let deployment_of = |armed: &poem_ir::ClassSet, points: Vec<LatticePoint>| Deployment {
             points,
             buckets: self.budget.buckets.clone(),
-            patch_points,
+            patch_points: patch_points.clone(),
             decoders: self
                 .decoding
                 .iter()
-                .filter(|class| textual(*class) && self.tiers.plain.contains(*class))
+                .filter(|class| textual(*class) && armed.contains(*class))
                 .collect(),
             prefilling: (0..classes)
                 .filter(|class| {
-                    !self.decoding.contains(*class)
-                        && textual(*class)
-                        && self.tiers.plain.contains(*class)
+                    !self.decoding.contains(*class) && textual(*class) && armed.contains(*class)
                 })
                 .collect(),
             media: self
                 .media
                 .iter()
-                .filter(|class| self.tiers.plain.contains(*class))
+                .filter(|class| armed.contains(*class))
                 .collect(),
             wide: self
                 .decoding
                 .iter()
                 .chain((0..classes).filter(|class| !self.decoding.contains(*class)))
                 .filter(|class| {
-                    textual(*class)
-                        && !self.landing[*class].is_empty()
-                        && self.tiers.plain.contains(*class)
+                    textual(*class) && !self.landing[*class].is_empty() && armed.contains(*class)
                 })
                 .collect(),
-            drafting: (0..classes)
-                .filter(|class| !self.landing[*class].iter().any(poem_ir::Request::plain))
-                .collect(),
+            drafting: crate::exports::drafting_of(&self.landing, armed),
             rs_rungs: self.rs_rungs(),
             decoding: self.decoding.clone(),
             seats,
@@ -1226,12 +1261,35 @@ impl Shell {
         };
         let mut found = Targets::default();
         for enumerate in ARMS {
-            enumerate(&deployment, &mut found);
+            enumerate(&deployment_of(&plain, points.clone()), &mut found);
         }
+        let octaves = engine::load::armed::scored_buckets(&self.budget.buckets);
+        let mut scored_found = Targets::default();
+        if !self.scored.is_empty() {
+            for enumerate in ARMS {
+                enumerate(
+                    &deployment_of(&self.tiers.plain, points.clone()),
+                    &mut scored_found,
+                );
+            }
+        }
+        let scored = scored_found
+            .targets
+            .into_iter()
+            .filter(|(bucket, target)| self.holds_scored(target) && octaves.contains(bucket))
+            .collect::<Vec<_>>();
+        eprintln!(
+            "engine-cuda: lattice keys {} plain and {} scored (the scored at the \
+             lattice's {} octaves)",
+            found.targets.len(),
+            scored.len(),
+            octaves.len(),
+        );
         let Targets {
             mut targets,
             unfireable,
         } = found;
+        targets.extend(scored);
         let top = targets.iter().map(|(bucket, _)| *bucket).max();
         let rank = |kind: Kind| match kind {
             Kind::Decode => 0u8,
@@ -1460,7 +1518,6 @@ impl Shell {
             belted: false,
             starved: None,
             peer_stopped: false,
-            unit_margin: self.pools.arming_margin_bytes(),
             from_record: self.bodies_from_record || self.rearming,
             capped: !(self.bodies_from_record && self.arming_at_load),
             took: Some(0),
@@ -1470,6 +1527,21 @@ impl Shell {
     }
 
     fn arm_lattice_fenced(&mut self, verify: bool) -> Result<()> {
+        // A scored class's fires capture into rows no reader holds yet:
+        // each lane's lent from the run the load holds for them.
+        let (room, at) = self.arming_capture;
+        let row = self.programs.capture().bytes();
+        self.arming_rows = if room == 0 {
+            Vec::new()
+        } else {
+            (0..room / row).map(|lane| at + lane * row).collect()
+        };
+        let armed = self.arm_lattice_rows(verify);
+        self.arming_rows = Vec::new();
+        armed
+    }
+
+    fn arm_lattice_rows(&mut self, verify: bool) -> Result<()> {
         let Some(mut st) = self.arm_begin(verify) else {
             return Ok(());
         };
@@ -1501,7 +1573,7 @@ impl Shell {
                 )
                 .collect();
             let kept = st.targets.len() + 1 - rest.len();
-            let dropped = self.fit_lattice(&rest, kept, &st.weighed);
+            let dropped = self.fit_lattice(&rest, kept, &st.weighed)?;
             st.dropped.extend(dropped);
         }
         let weighed_before = self.cache.body_stats().census;
@@ -1513,20 +1585,15 @@ impl Shell {
         // bucket's fires made what its warm fire would.
         self.arm_cold = st.narrower(bucket, &target) && !st.verify;
         let spent = self.cache.body_stats();
-        let room = (self.bodies_mem as u64).saturating_sub(spent.census.bytes as u64);
-        let spare = self.pools.spare_bytes_for_bodies(room).unwrap_or(u64::MAX);
-        let price = (2 * spent.census.bytes / spent.census.bodies.max(1)) as u64;
-        // A map unit's margin never past a quarter of the allowance: an
-        // allowance the fit held under the margin would otherwise stop
-        // arming before its first body.
-        let margin = price.max(st.unit_margin.min(self.bodies_mem as u64 / 4));
-        // Estimated where nothing is known; a record's allowance is a
-        // measurement, and the headroom estimate is not consulted.
-        let headroom = !st.from_record && spare < margin;
+        // Stopped on the count: the bytes the armed bodies took, measured as
+        // each was made, against the allowance and the card's spare. A
+        // record's allowance is a measurement and the card is not consulted.
+        let room = self.bodies_room();
+        let spent_out = room == 0 && (spent.census.bytes as u64) < self.bodies_mem as u64;
         let mine = !st.verify
             && (spent.census.bodies >= record::MAX_BODIES
                 || (st.capped && spent.census.bytes >= self.bodies_mem)
-                || headroom);
+                || (!st.from_record && spent_out));
         let stop = match self.ep.as_ref() {
             // The group's ranks fire one sequence of steps: the allowance
             // one rank runs out of stops every rank's captures.
@@ -1537,8 +1604,8 @@ impl Shell {
             if st.never == 0 {
                 st.never_from = bucket;
                 st.belted = spent.census.bodies >= record::MAX_BODIES;
-                if headroom && !st.belted && spent.census.bytes < self.bodies_mem {
-                    st.starved = Some(spare);
+                if !st.from_record && spent_out && !st.belted {
+                    st.starved = Some(spent.census.bytes as u64);
                 }
                 st.peer_stopped = !mine;
             }
@@ -1843,14 +1910,18 @@ impl Shell {
             }
         }
         // A load that records bodies serves every composition it fires from
-        // one: one that armed none, or stopped arming for want of room, would
-        // serve eagerly, which is never what a deployment asked for.
+        // one: one that armed none, or stopped arming with compositions left,
+        // would serve eagerly, which is never what a deployment asked for. A
+        // load that stages host-resident experts reads each fire's routes
+        // back, so it records none by design (`Run::capturable`; stated at
+        // load).
         let attempted = st.wanted + st.never;
         if st.records
+            && self.expert_staged.is_none()
             && !st.verify
             && !st.group
             && attempted > 0
-            && (st.armed == 0 || st.starved.is_some())
+            && (st.armed == 0 || st.never > 0)
         {
             return Err(Fault::Residency(format!(
                 "the card does not hold this deployment's graph bodies: {} of {attempted} \
@@ -1862,9 +1933,22 @@ impl Shell {
                  ({report})",
                 st.armed,
                 match st.starved {
-                    Some(spare) => format!(
-                        ", arming stopped with {} MiB spare under the ceiling",
-                        spare >> 20
+                    Some(took) => format!(
+                        ", arming stopped when the {} armed bodies had taken {} MiB and the card's \
+                         spare under the ceiling, past the cache rows' reserve, was spent",
+                        st.armed,
+                        took >> 20
+                    ),
+                    None if st.belted => {
+                        format!(
+                            ", arming stopped at {} bodies (record::MAX_BODIES)",
+                            record::MAX_BODIES
+                        )
+                    }
+                    None if st.never > 0 => format!(
+                        ", arming stopped when the bodies had taken their allowance, \
+                         `[engine] bodies_mem` {} MiB",
+                        self.bodies_mem >> 20
                     ),
                     None => String::new(),
                 },
@@ -2095,9 +2179,9 @@ impl core::fmt::Display for Armed {
                 match self.starved {
                     _ if self.peer_stopped =>
                         "a peer rank's bound (the stop is agreed across the group)".to_string(),
-                    Some(spare) => format!(
-                        "the ceiling's spare ran out ({} MiB left beyond the elastic pool's growth)",
-                        spare >> 20
+                    Some(took) => format!(
+                        "the ceiling's spare ran out (the bodies had taken {} MiB)",
+                        took >> 20
                     ),
                     None if self.belted => "record::MAX_BODIES".to_string(),
                     None => "[engine] bodies_mem".to_string(),

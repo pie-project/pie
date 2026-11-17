@@ -33,21 +33,33 @@ pub struct Rated {
 
 /// `pie tune cuda --rates`: GPU 0's rates measured at `engine::rates`'
 /// lattice ([`crate::rates::measure`]), its GEMMs under the tactics serving
-/// keeps in the engine cache beside `profiles` (`$PIE_HOME/cache`), laid
-/// over the profile it runs.
+/// reads (the device's checked-in table, then the user's beside
+/// `profiles`), a product they lack timed here and added to the user's, as
+/// every `pie tune` step times them; laid over the profile it runs.
 pub fn rates(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Rated, String> {
     let began = Instant::now();
     let (name, facts) = crate::chip::probe(0).ok_or("no CUDA device answers")?;
     let (base, report) = crate::chip::resolve(&name, &facts, profiles);
     say(&format!("{name}: starting from {}", report.used));
+    #[cfg(feature = "cuda")]
+    let _untime = {
+        let tactics = kernels_cuda::linear::gemm::install_tactics(
+            crate::chip::gemm_table(&name),
+            profiles.map(|profiles| crate::chip::user_gemm_table(profiles, &name)),
+        );
+        say(&format!(
+            "[rates]: dense GEMM tactics from the profile's tables: {} checked in, {} the \
+             user's; a product they lack is timed and added to the user's",
+            tactics.from_profile, tactics.from_user,
+        ));
+        kernels_cuda::linear::gemm::time_tactics(true);
+        Untime
+    };
     let cache = profiles
         .and_then(Path::parent)
         .map(|home| home.join("cache"));
-    let r = crate::rates::measure(0, &base, cache.as_deref())?;
-    let grid = r
-        .bf16_flops_per_ns_by_rows_and_depth
-        .clone()
-        .unwrap_or_default();
+    let (r, top) = crate::rates::measure(0, &base, cache.as_deref())?;
+    let grid = r.bf16_flops_per_ns_by_rows_n_k.clone().unwrap_or_default();
     let attn = r
         .attn_flops_per_ns_by_keys_and_dim
         .clone()
@@ -55,8 +67,8 @@ pub fn rates(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Rated
     for &k in &engine::rates::DEPTHS {
         let at = |rows: u32| {
             grid.iter()
-                .find(|p| p.0 == rows && p.1 == k)
-                .map_or(0.0, |p| p.2)
+                .find(|p| p.0 == rows && p.1 == k && p.2 == k)
+                .map_or(0.0, |p| p.3)
         };
         say(&format!(
             "[rates]: bf16 at depth {k}: {:.1} TFLOP/s at 16 rows to {:.1} at 8192",
@@ -69,31 +81,42 @@ pub fn rates(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Rated
          elements/s, {:.0} GB/s, launch {} ns",
         r.attn_at(512, 128).unwrap_or(0.0) / 1e3,
         r.attn_at(16384, 128).unwrap_or(0.0) / 1e3,
-        r.scan_elements_per_ns.unwrap_or(0.0),
+        r.scan_at(2048).unwrap_or(0.0),
         r.bytes_per_ns.unwrap_or(0.0),
         r.launch_ns.unwrap_or(0),
     ));
     let tenth = |v: f64| (v * 10.0).round() / 10.0;
     let r = profile::fire::Rates {
-        bf16_flops_per_ns_by_rows_and_depth: Some(
-            grid.iter().map(|&(m, k, v)| (m, k, tenth(v))).collect(),
+        bf16_flops_per_ns_by_rows_n_k: Some(
+            grid.iter()
+                .map(|&(m, n, k, v)| (m, n, k, tenth(v)))
+                .collect(),
         ),
         attn_flops_per_ns_by_keys_and_dim: Some(
             attn.iter().map(|&(k, d, v)| (k, d, tenth(v))).collect(),
         ),
-        scan_elements_per_ns: r.scan_elements_per_ns.map(tenth),
+        scan_elements_per_ns_by_tokens: r
+            .scan_elements_per_ns_by_tokens
+            .as_ref()
+            .map(|c| c.iter().map(|&(t, v)| (t, tenth(v))).collect()),
         bytes_per_ns: r.bytes_per_ns.map(tenth),
         ..r
     };
     let tuned = engine::rates::tuned(&r);
     let how = format!(
         "{name}; the matmul through {} under serving's GEMM tactics, each rate a 20 ms burst on \
-         the stream timed by events, the median of 5 (the launch of 15); operands: engine::rates' pattern; at {}",
+         the stream timed by events, the median of 5 (the launch of 15); operands: engine::rates' pattern; rows to the saturation point {} (past it no (n, k) shape's cost a row fell more than {:.0}% below its least through {}; at it the most {:.1}%, at {} x {}); at {}",
         if cfg!(feature = "rocm") {
             "hipBLASLt"
         } else {
             "cuBLASLt"
         },
+        top.rows,
+        100.0 * profile::AGREEMENT,
+        top.through,
+        100.0 * top.best_gain,
+        top.best_shape.0,
+        top.best_shape.1,
         sitting()
     );
     let provenance = engine::rates::provenance("cuda", &how);
@@ -141,10 +164,27 @@ fn sitting() -> String {
         .map_or_else(|| "commit unknown".to_string(), |s| format!("commit {s}"))
 }
 
-/// Serve `artifact` under `chip`: a prompt, then steps at each lane count.
-fn serve(artifact: &Path, deployment: &str, chip: Profile) -> Result<Serving, String> {
-    use poem::{Platform, Request};
-    let slots = *LANES.iter().max().expect("lanes") as u32;
+/// How a load is shaped: its slots and compiled budget, its patch ladder,
+/// its pages and context.
+struct Shape {
+    slots: u32,
+    budget: poem_compiler::Budget,
+    patches: Option<poem_compiler::PatchLadder>,
+    page_size: u32,
+    context: u32,
+}
+
+/// Load `artifact` under `chip` shaped by `shape` (from the trace): the
+/// products its arming times land in the user's tactic table under
+/// `profiles`.
+fn load(
+    artifact: &Path,
+    deployment: &str,
+    chip: &Profile,
+    profiles: Option<&Path>,
+    shape: impl FnOnce(&poem_ir::Trace) -> Shape,
+) -> Result<(crate::Shell, poem_ir::Trace), String> {
+    use poem::Platform;
     let row = poem_compiler::catalog::deployment(deployment)
         .ok_or_else(|| format!("no catalog row `{deployment}`"))?;
     let trace = row.trace(Platform::Cuda);
@@ -158,15 +198,22 @@ fn serve(artifact: &Path, deployment: &str, chip: Profile) -> Result<Serving, St
     let prospect =
         crate::weights::prospect(&trace, &contract, artifact, target).map_err(|e| e.to_string())?;
     let residency = crate::experts::Plan::cut(&prospect.ranking);
-    let mut shell = crate::Shell::load(crate::Boot {
+    let Shape {
+        slots,
+        budget,
+        patches,
+        page_size,
+        context,
+    } = shape(&trace);
+    let shell = crate::Shell::load(crate::Boot {
         voxels: None,
         trace: trace.clone(),
         contract: &contract,
         checkpoint: artifact,
-        budget: poem_compiler::Budget::new(slots, CONTEXT),
-        patches: patches(&trace, slots),
-        page_size: 16,
-        context: CONTEXT,
+        budget,
+        patches,
+        page_size,
+        context,
         slots,
         kv_budget: None,
         allowance: engine::Allowance::WHOLE,
@@ -174,6 +221,7 @@ fn serve(artifact: &Path, deployment: &str, chip: Profile) -> Result<Serving, St
         ordinal: 0,
         knobs: crate::Knobs {
             chip: Some(chip.clone()),
+            profiles: profiles.map(Path::to_path_buf),
             ..crate::Knobs::default()
         },
         cache_dir: None,
@@ -184,6 +232,51 @@ fn serve(artifact: &Path, deployment: &str, chip: Profile) -> Result<Serving, St
         comm: core::ptr::null_mut(),
     })
     .map_err(|e| e.to_string())?;
+    Ok((shell, trace))
+}
+
+/// The engine boot and load request `pie serve` makes for an artifact when
+/// its config states nothing past the model (the worker builds both).
+pub type Served<'a> =
+    &'a dyn Fn(&Path) -> Result<(crate::DeviceBoot, engine::load::LoadRequest), String>;
+
+/// Load `artifact` under `chip` as `pie serve` does, through the engine's
+/// own load: its arming walks every composition of the lattice a served
+/// load records, so the products it times are the ones serving runs, rung
+/// by rung; the tune's own servings ([`serve`]) cover only their prompt and
+/// lane counts.
+#[cfg(feature = "cuda")]
+fn arm_served(
+    artifact: &Path,
+    chip: &Profile,
+    served: Served<'_>,
+    contract_for: crate::ContractFor,
+) -> Result<(), String> {
+    use engine::Engine;
+    let (mut boot, request) = served(artifact)?;
+    boot.knobs.chip = Some(chip.clone());
+    let mut cuda = crate::open(boot, contract_for)?;
+    cuda.load(request).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Serve `artifact` under `chip`: a prompt, then steps at each lane count.
+/// The products it times land in the user's tactic table under `profiles`.
+fn serve(
+    artifact: &Path,
+    deployment: &str,
+    chip: Profile,
+    profiles: Option<&Path>,
+) -> Result<Serving, String> {
+    use poem::Request;
+    let slots = *LANES.iter().max().expect("lanes") as u32;
+    let (mut shell, trace) = load(artifact, deployment, &chip, profiles, |trace| Shape {
+        slots,
+        budget: poem_compiler::Budget::new(slots, CONTEXT),
+        patches: patches(trace, slots),
+        page_size: 16,
+        context: CONTEXT,
+    })?;
     let token = |i: u32| 100 + (i * 7919) % 5000;
     let prompt: Vec<u32> = (0..PROMPT).map(token).collect();
     let fire =
@@ -250,21 +343,40 @@ fn serve(artifact: &Path, deployment: &str, chip: Profile) -> Result<Serving, St
 
 /// How far the estimate's pick may fall short of the measured-best rung:
 /// its score, under the measured times, within this share of the best's.
-pub const CHECK_BOUND: f64 = 0.05;
+pub const CHECK_BOUND: f64 = engine::rates::AGREEMENT;
 
 /// The lanes a served CUDA load is asked (`pie serve`'s); its tokens are
-/// left to the engine (`engine.forward_tokens`, fitted to the card).
+/// left to the engine (its fire bound, fitted to the card).
 const SERVED_LANES: u32 = 512;
 
 /// The fires timed a rung, after two warm ones.
 const TIMED_FIRES: usize = 5;
 
+/// The shell a check fires on before its fires are known: as many slots as
+/// a served load's lanes, each [`ROOMY_CONTEXT`] long.
+const ROOMY: (u32, u32) = (SERVED_LANES, ROOMY_CONTEXT);
+const ROOMY_CONTEXT: u32 = 32_768;
+
+/// The `(slots, context)` a shell must hold to fire each of `fires`
+/// (engine::load::CheckFire): its slots the most lanes one fires, its
+/// context a lane's keys and new tokens, in whole pages.
+fn sized(fires: impl IntoIterator<Item = engine::load::CheckFire>) -> (u32, u32) {
+    let (slots, context) = fires.into_iter().fold((1u32, 1u32), |(slots, context), f| {
+        (
+            slots.max(f.lanes),
+            context.max(f.keys_per_lane + f.tokens_per_lane),
+        )
+    });
+    (slots, context.next_multiple_of(16))
+}
+
 /// A served-shape load of `artifact` under `chip`, every rung the card
-/// holds laid (`Knobs::every_rung`), one slot long enough for the widest.
+/// holds laid (`Knobs::every_rung`), on `slots` slots of `context` each.
 fn load_every_rung(
     artifact: &Path,
     deployment: &str,
     chip: Profile,
+    (slots, context): (u32, u32),
 ) -> Result<(crate::Shell, poem_ir::Trace), String> {
     use poem::Platform;
     let row = poem_compiler::catalog::deployment(deployment)
@@ -290,8 +402,9 @@ fn load_every_rung(
         budget,
         patches: patches(&trace, SERVED_LANES),
         page_size: 16,
-        context: 32_768,
-        slots: 1,
+        context,
+        // A slot a lane: a decode-shaped rung's check fires a lane a slot.
+        slots,
         kv_budget: None,
         allowance: engine::Allowance::WHOLE,
         context_declared: false,
@@ -312,28 +425,53 @@ fn load_every_rung(
     Ok((shell, trace))
 }
 
-/// One fire of `width` prompt tokens on a fresh slot 0: its wall time (ns)
-/// and whether it replayed a recorded body.
+/// One fire as the estimate weighs a rung (engine::load::CheckFire): its
+/// lanes each on a fresh slot of its own, each its tokens; its wall time
+/// (ns) and whether it replayed a recorded body.
 fn fire_once(
     shell: &mut crate::Shell,
     trace: &poem_ir::Trace,
-    width: u32,
+    fire: engine::load::CheckFire,
 ) -> Result<(f64, bool), String> {
     let token = |i: u32| 100 + (i * 7919) % 5000;
-    let prompt: Vec<u32> = (0..width).map(token).collect();
-    shell.open(0).map_err(|e| e.to_string())?;
-    let lane = crate::Lane {
-        slot: 0,
-        word: trace.facts.word(&poem::Request::new(width, false)),
-        tokens: &prompt,
-    };
+    let prompts: Vec<Vec<u32>> = (0..fire.lanes)
+        .map(|lane| {
+            (0..fire.tokens_per_lane)
+                .map(|i| token(lane * fire.tokens_per_lane + i))
+                .collect()
+        })
+        .collect();
+    for slot in 0..fire.lanes {
+        shell.open(slot).map_err(|e| e.to_string())?;
+    }
+    let word = trace
+        .facts
+        .word(&poem::Request::new(fire.tokens_per_lane, false));
+    let lanes: Vec<crate::Lane> = prompts
+        .iter()
+        .enumerate()
+        .map(|(slot, tokens)| crate::Lane {
+            slot: slot as u32,
+            word,
+            tokens,
+        })
+        .collect();
     let hits = shell.body_stats().tally.hits;
-    let began = Instant::now();
-    shell
-        .fire(std::slice::from_ref(&lane))
-        .map_err(|e| e.to_string())?;
-    let ns = began.elapsed().as_secs_f64() * 1e9;
+    // Timed to its landing; its rows are read back after.
+    let (landed, _) = shell.fire_landed(&lanes).map_err(|e| e.to_string())?;
+    let ns = landed.as_secs_f64() * 1e9;
     Ok((ns, shell.body_stats().tally.hits > hits))
+}
+
+/// One prompt of `width` tokens on a fresh slot: the dissection's fire.
+fn prompt(width: u32) -> engine::load::CheckFire {
+    engine::load::CheckFire {
+        rows: width,
+        lanes: 1,
+        tokens_per_lane: width,
+        keys_per_lane: width,
+        sampled: 1,
+    }
 }
 
 /// The kind of work an op is, for the dissection's rollup.
@@ -373,7 +511,8 @@ fn dissect(
     say: &mut dyn FnMut(&str),
 ) -> Result<(), String> {
     let launch_ns = walked.rates().launch_ns.unwrap_or(0) as f64;
-    let (mut shell, trace) = load_every_rung(artifact, deployment, walked)?;
+    let fires = rungs.iter().map(|r| prompt(r.tokens));
+    let (mut shell, trace) = load_every_rung(artifact, deployment, walked, sized(fires))?;
     // A drained pair around nothing: what each node's drains cost beside
     // its work, taken off every node.
     crate::dissect::start();
@@ -386,10 +525,10 @@ fn dissect(
         .map_or(0.0, |&(_, ns, n)| ns as f64 / f64::from(n));
     for rung in rungs {
         let width = rung.tokens;
-        fire_once(&mut shell, &trace, width)?;
-        let (walk, _) = fire_once(&mut shell, &trace, width)?;
+        fire_once(&mut shell, &trace, prompt(width))?;
+        let (walk, _) = fire_once(&mut shell, &trace, prompt(width))?;
         crate::dissect::start();
-        let (wall, _) = fire_once(&mut shell, &trace, width)?;
+        let (wall, _) = fire_once(&mut shell, &trace, prompt(width))?;
         let mut ops = crate::dissect::take();
         ops.sort_by_key(|row| std::cmp::Reverse(row.1));
         let nodes: u32 = ops.iter().map(|row| row.2).sum();
@@ -451,30 +590,44 @@ fn check_estimate_of(
     walked: Profile,
     say: &mut dyn FnMut(&str),
 ) -> Result<String, String> {
-    let (mut shell, trace) = load_every_rung(artifact, deployment, chip)?;
+    // The rungs come of a load; the shell each check fire runs on is then
+    // sized from the fires (engine::load::CheckFire).
+    let checked = |shell: &crate::Shell| -> Result<_, String> {
+        let weighed = shell.weighed().cloned().ok_or_else(|| {
+            "this device has no rates in its profile to estimate by: run `pie tune --rates`"
+                .to_string()
+        })?;
+        let laid = shell.budget().max_tokens;
+        let rungs: Vec<engine::load::RungFacts> = weighed
+            .rungs
+            .iter()
+            .filter(|r| r.infeasible.is_none() && r.tokens <= laid)
+            .copied()
+            .collect();
+        Ok((weighed, laid, rungs))
+    };
+    let (shell, _) = load_every_rung(artifact, deployment, chip.clone(), ROOMY)?;
+    let (_, _, rungs) = checked(&shell)?;
+    drop(shell);
+    let size = sized(rungs.iter().map(engine::load::RungFacts::check_fire));
+    let (mut shell, trace) = load_every_rung(artifact, deployment, chip, size)?;
+    let (weighed, laid, rungs) = checked(&shell)?;
     let model = engine::load::model_class(&trace).to_owned();
-    let weighed = shell.weighed().cloned().ok_or_else(|| {
-        "this device has no rates in its profile to estimate by: run `pie tune --rates`".to_string()
-    })?;
-    let laid = shell.budget().max_tokens;
-    let rungs: Vec<engine::load::RungFacts> = weighed
-        .rungs
-        .iter()
-        .filter(|r| r.infeasible.is_none() && r.tokens <= laid)
-        .copied()
-        .collect();
     say(&format!(
-        "timing a fire at each of {} rung widths of {model} (laid to {laid})",
-        rungs.len()
+        "timing a fire at each of {} rung widths of {model} (laid to {laid}) on {} slots of {} \
+         tokens",
+        rungs.len(),
+        size.0,
+        size.1
     ));
     let mut meas = Vec::new();
     for r in &rungs {
         for _ in 0..2 {
-            fire_once(&mut shell, &trace, r.tokens)?;
+            fire_once(&mut shell, &trace, r.check_fire())?;
         }
         let mut times = Vec::new();
         for _ in 0..TIMED_FIRES {
-            let (ns, replayed) = fire_once(&mut shell, &trace, r.tokens)?;
+            let (ns, replayed) = fire_once(&mut shell, &trace, r.check_fire())?;
             if !replayed {
                 return Err(format!(
                     "a fire of {} tokens of {model} was walked, not replayed: its time is not \
@@ -627,12 +780,24 @@ fn patches(trace: &poem_ir::Trace, slots: u32) -> Option<poem_compiler::PatchLad
     )
 }
 
+/// Stops timing tactics when the tune ends, however it ends.
+#[cfg(feature = "cuda")]
+struct Untime;
+
+#[cfg(feature = "cuda")]
+impl Drop for Untime {
+    fn drop(&mut self) {
+        kernels_cuda::linear::gemm::time_tactics(false);
+    }
+}
+
 struct Cuda<'a> {
     models: &'a [(PathBuf, String)],
     device: &'a str,
     base: &'a Profile,
     facts: &'a Facts,
     sms: u32,
+    profiles: Option<&'a Path>,
 }
 
 impl Cuda<'_> {
@@ -662,7 +827,7 @@ impl Bench for Cuda<'_> {
 
     fn serve(&mut self, model: usize, file: &str) -> Result<Serving, String> {
         let (artifact, deployment) = &self.models[model];
-        serve(artifact, deployment, Self::profile_of(file)?)
+        serve(artifact, deployment, Self::profile_of(file)?, self.profiles)
     }
 
     fn plan(&self, model: usize, file: &str) -> Option<u64> {
@@ -676,14 +841,74 @@ impl Bench for Cuda<'_> {
 
 /// Run the tune on GPU 0: search, check, and assemble the file. `say` hears
 /// progress.
-pub fn run(
+/// `pie tune cuda --gemm-only`: under today's profile, each model's served
+/// load arms its lattice with timing on, adding what the tactic tables lack
+/// to the user's table; no profile search, and the profile is not changed.
+pub fn gemm_only(
     profiles: Option<&Path>,
     models: &[(PathBuf, String)],
-    check_estimate: bool,
+    served: Served<'_>,
+    contract_for: crate::ContractFor,
     say: &mut dyn FnMut(&str),
 ) -> Result<Outcome, String> {
     let began = Instant::now();
     let (name, facts) = crate::chip::probe(0).ok_or("no CUDA device answers")?;
+    let (base, report) = crate::chip::resolve(&name, &facts, profiles);
+    say(&format!(
+        "{name}: timing dense GEMM tactics under {}",
+        report.used
+    ));
+    if models.is_empty() {
+        return Err("--gemm-only needs a model to load (import one, or pass --check)".to_string());
+    }
+    #[cfg(feature = "cuda")]
+    {
+        kernels_cuda::linear::gemm::time_tactics(true);
+        let _untime = Untime;
+        let before = kernels_cuda::linear::gemm::timed();
+        for (artifact, deployment) in models {
+            say(&format!(
+                "timing the dense GEMM tactics {deployment}'s served lattice arms"
+            ));
+            arm_served(artifact, &base, served, contract_for)?;
+        }
+        say(&format!(
+            "{} product(s) timed",
+            kernels_cuda::linear::gemm::timed() - before
+        ));
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (base, name, began, served, contract_for);
+        Err("--gemm-only times cuBLAS tactics, and this build has no CUDA runtime".to_string())
+    }
+    #[cfg(feature = "cuda")]
+    Ok(Outcome {
+        device: name,
+        file: String::new(),
+        lines: Vec::new(),
+        checks: Vec::new(),
+        changed: false,
+        seconds: began.elapsed().as_secs_f64(),
+    })
+}
+
+pub fn run(
+    profiles: Option<&Path>,
+    models: &[(PathBuf, String)],
+    check_estimate: bool,
+    served: Served<'_>,
+    contract_for: crate::ContractFor,
+    say: &mut dyn FnMut(&str),
+) -> Result<Outcome, String> {
+    let began = Instant::now();
+    let (name, facts) = crate::chip::probe(0).ok_or("no CUDA device answers")?;
+    // The one place dense GEMM tactics are timed: each serving below adds
+    // the products it meets to the user's table beside their profile.
+    #[cfg(feature = "cuda")]
+    kernels_cuda::linear::gemm::time_tactics(true);
+    #[cfg(feature = "cuda")]
+    let _untime = Untime;
     let sms = facts
         .get("sms")
         .and_then(|v| u32::try_from(v).ok())
@@ -697,6 +922,7 @@ pub fn run(
         base: &base,
         facts: &facts,
         sms,
+        profiles,
     };
     // The check of the estimate alone: under today's profile, every model
     // checked before the run fails on any.
@@ -755,6 +981,17 @@ pub fn run(
     let tuned = search::render_overrides(&chosen);
     let today = bench.file(&[])?;
     let draft = bench.file(&chosen)?;
+    // The dense GEMM tactics of the lattice a served load arms, under the
+    // tuned profile: a product the tables lack is timed here or nowhere.
+    #[cfg(feature = "cuda")]
+    for (artifact, deployment) in models {
+        say(&format!(
+            "timing the dense GEMM tactics {deployment}'s served lattice arms"
+        ));
+        arm_served(artifact, &Cuda::profile_of(&draft)?, served, contract_for)?;
+    }
+    #[cfg(not(feature = "cuda"))]
+    let _ = (served, contract_for);
     let mut checks = Vec::new();
     // A file that changes nothing serves as today's does.
     let unchanged = draft == today;

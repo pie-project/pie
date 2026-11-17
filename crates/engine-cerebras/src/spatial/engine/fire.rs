@@ -53,6 +53,50 @@ fn one_reader(step: &engine::fire::Step, at: usize) -> bool {
 /// Whether `mask` (alternating runs: excluded, admitted, ...) lets a row at
 /// `position` see every position up to its own: the causal mask the model
 /// runs. Anything else this engine cannot run.
+/// The first of a lane's `rows` (at positions `start..`) whose mask is not
+/// causal over the lane's own history, if any. A mask speaks of the slots
+/// from the lane's committed boundary `folded` on: column `c` is slot
+/// `folded + c`, and every slot below it is read. So row `r` is causal when
+/// it admits columns `0..=start + r - folded` and, where the mask is dense,
+/// none after.
+fn first_non_causal(
+    masking: Option<&engine::fire::Masking>,
+    dense: Option<(&[bool], usize)>,
+    folded: u32,
+    start: u32,
+    rows: usize,
+) -> Option<usize> {
+    let folded = folded.min(start);
+    let own = |row: usize| u64::from(start - folded) + row as u64;
+    if let Some(masking) = masking {
+        for row in 0..rows {
+            let mask = match masking {
+                engine::fire::Masking::Extent(mask) => mask,
+                engine::fire::Masking::Rows(masks) => match masks.get(row) {
+                    Some(mask) => mask,
+                    None => continue,
+                },
+            };
+            if !causal(mask, own(row)) {
+                return Some(row);
+            }
+        }
+    }
+    if let Some((cells, stride)) = dense {
+        for row in 0..rows {
+            let line = &cells[row * stride..(row + 1) * stride];
+            let seen = own(row) as usize + 1;
+            if line.len() < seen
+                || line.iter().take(seen).any(|&admit| !admit)
+                || line.iter().skip(seen).any(|&admit| admit)
+            {
+                return Some(row);
+            }
+        }
+    }
+    None
+}
+
 fn causal(mask: &engine::fire::Mask, position: u64) -> bool {
     let want = position + 1;
     let admitted: u64 = mask.admitted(0..want).map(|r| r.end - r.start).sum();
@@ -296,34 +340,16 @@ impl Spatial {
                 start as usize + row
             )))
         };
-        if let Some(masking) = &lane.mask {
-            for row in 0..rows {
-                let mask = match masking {
-                    engine::fire::Masking::Extent(mask) => mask,
-                    engine::fire::Masking::Rows(masks) => match masks.get(row) {
-                        Some(mask) => mask,
-                        None => continue,
-                    },
-                };
-                if !causal(mask, u64::from(start) + row as u64) {
-                    return refuse(row);
-                }
-            }
+        match first_non_causal(
+            lane.mask.as_ref(),
+            dense.map(|(cells, stride)| (cells.as_slice(), *stride)),
+            lane.kv.folded,
+            start,
+            rows,
+        ) {
+            Some(row) => refuse(row),
+            None => Ok(()),
         }
-        if let Some((cells, stride)) = dense {
-            for row in 0..rows {
-                let position = start as usize + row;
-                let line = &cells[row * stride..(row + 1) * stride];
-                let seen = position + 1;
-                if line.len() < seen
-                    || line.iter().take(seen).any(|&admit| !admit)
-                    || line.iter().skip(seen).any(|&admit| admit)
-                {
-                    return refuse(row);
-                }
-            }
-        }
-        Ok(())
     }
 
     /// One step: prologues, the lanes' tokens and positions (a device
@@ -577,6 +603,29 @@ mod tests {
         assert_eq!(logits_wanted(&[3], 4), wafer::Logits::Last);
         assert_eq!(logits_wanted(&[1], 4), wafer::Logits::All);
         assert_eq!(logits_wanted(&[2, 3], 4), wafer::Logits::All);
+    }
+
+    /// A mask speaks of the slots from the lane's committed boundary on: a
+    /// causal mask past ten committed slots, two buffered and two rows, is
+    /// four columns wide and is taken; one that hides a buffered slot, or
+    /// admits a later row, is not. The same mask read from slot 0 (a
+    /// boundary of 0) is short of the lane's history and says nothing of it.
+    #[test]
+    fn a_causal_mask_is_counted_from_the_lanes_boundary() {
+        use engine::fire::{Mask, Masking};
+        // Lane writes rows at slots 12 and 13; slots 0..10 are committed.
+        let causal = Masking::Rows(vec![Mask::new(vec![0, 3], 4), Mask::new(vec![0, 4], 4)]);
+        assert_eq!(first_non_causal(Some(&causal), None, 10, 12, 2), None);
+        let hides = Masking::Rows(vec![Mask::new(vec![1, 2], 4), Mask::new(vec![0, 4], 4)]);
+        assert_eq!(first_non_causal(Some(&hides), None, 10, 12, 2), Some(0));
+        // A dense mask in the same columns, and one admitting the next row.
+        let dense = [true, true, true, false, true, true, true, true];
+        assert_eq!(first_non_causal(None, Some((&dense, 4)), 10, 12, 2), None);
+        let ahead = [true, true, true, true, true, true, true, true];
+        assert_eq!(first_non_causal(None, Some((&ahead, 4)), 10, 12, 2), Some(0));
+        // With no boundary the columns are slots, as before.
+        let whole = Masking::Extent(Mask::new(vec![0, 14], 14));
+        assert_eq!(first_non_causal(Some(&whole), None, 0, 12, 2), None);
     }
 
     #[test]

@@ -37,59 +37,104 @@ pub struct RungFacts {
     pub padded_rows: u32,
     pub span_bytes: u64,
     pub infeasible: Option<&'static str>,
+    /// The most lanes one fire carries: the engine's own cap (a wider wave
+    /// the runtime fires as fires of this many), stated by each engine.
+    pub fire_lanes: u32,
+}
+
+/// The fire a rung is weighed as, and the one a check of the estimate fires
+/// for it: `lanes` lanes of `tokens_per_lane` new tokens each (`rows` in
+/// all), each row attending `keys_per_lane` keys, `sampled` rows read out.
+/// Decode-shaped (a rung no wider than its lanes, nor than the lanes one
+/// fire carries, `RungFacts::fire_lanes`): a lane a token, each on a fresh
+/// slot, attending its one key, every row read out. A wider decode wave is
+/// fires of the narrower rungs, so a rung past either is prefill-shaped.
+/// Prefill-shaped: one prompt of the rung's tokens on a fresh slot,
+/// attending the rung's keys, its last row read out. The estimate's terms
+/// are computed from it and every backend's check builds its fire from it,
+/// so the two cannot weigh different fires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckFire {
+    pub rows: u32,
+    pub lanes: u32,
+    pub tokens_per_lane: u32,
+    pub keys_per_lane: u32,
+    pub sampled: u32,
 }
 
 impl RungFacts {
+    /// The fire this rung is weighed and checked as ([`CheckFire`]).
+    #[must_use]
+    pub fn check_fire(&self) -> CheckFire {
+        if self.decode_shaped() {
+            CheckFire {
+                rows: self.tokens,
+                lanes: self.tokens,
+                tokens_per_lane: 1,
+                keys_per_lane: 1,
+                sampled: self.tokens,
+            }
+        } else {
+            CheckFire {
+                rows: self.tokens,
+                lanes: 1,
+                tokens_per_lane: self.tokens,
+                keys_per_lane: self.keys,
+                sampled: 1,
+            }
+        }
+    }
+
     /// The rows a fire at this rung samples, as the estimate weighs it: a
     /// rung no wider than its lanes is decode-shaped (a lane a token, each
     /// sampled), a wider one prefill-shaped (one prompt, one row sampled).
     #[must_use]
     pub fn sampled(&self) -> u32 {
-        if self.decode_shaped() { self.tokens } else { 1 }
+        self.check_fire().sampled
     }
 
     /// Whether the estimate weighs this rung decode-shaped: no wider than
-    /// its lanes.
+    /// its lanes, nor than the lanes one fire carries.
     #[must_use]
     pub fn decode_shaped(&self) -> bool {
-        self.tokens <= self.lanes
+        self.tokens <= self.lanes.min(self.fire_lanes)
     }
 }
 
 /// What a fire costs, as work over the device's rates (the one shared
 /// formula every engine weighs its top rung by):
 ///
-/// `t(r) = Σ_dispatches max(launch_ns, work_d(r))`: each of the fire's
-/// dispatches takes its own work or a launch, whichever is longer, and a
-/// dispatch of the compiled plan the model's counts name no work for takes
-/// a launch. A dispatch's work is its op's term over the dispatches the op
-/// takes (a matmul plane's read or compute, whichever is longer; an
-/// attention layer's flops and kv read; a scan layer's state steps; an
-/// elementwise op's bytes), so a fire of many short kernels pays a launch
-/// for each of them, and one whose kernels are long pays only their work.
-/// The terms, summed over the fire (the work, unfloored):
+/// `t(r) = Σ_dispatches (launch_ns + work_d(r))`: each of the fire's
+/// dispatches takes its own work and a launch, and a dispatch of the
+/// compiled plan the model's counts name no work for takes a launch. A
+/// dispatch's work is its op's term over the dispatches the op takes (a
+/// matmul plane's read or compute, whichever is longer; an attention
+/// layer's flops and kv read; a scan layer's state steps; an elementwise
+/// op's bytes). `launch_ns` is what a dependent dispatch adds to its work
+/// as the backend submits a fire (`crate::rates::launch_from`): where the
+/// backend overlaps its launches it is small and the sum is the work; where
+/// it serializes them, each adds it. The terms, summed over the fire (the
+/// work, without the launches):
 ///
 /// `work(r) = max(weights(r) / bytes_per_ns,
-///             Σ_(n, k) padded_rows(r) · flops_per_row(n, k) / flops(padded_rows(r), k))
-///       + sampled(r) · readout_flops / flops(sampled(r), hidden)
+///             Σ_(n, k) tokens(r) · flops_per_row(n, k) / flops(tokens(r), n, k))
+///       + sampled(r) · readout_flops / flops(sampled(r), vocab, hidden)
 ///       + tokens(r) · keys(r) · attn_flops_per_row_key / attn(keys(r), d)
 ///       + keys(r) · kv_bytes_per_key / bytes_per_ns
-///       + tokens(r) · state_elements_per_row / scan_elements_per_ns
+///       + tokens(r) · state_elements_per_row / scan(tokens_per_lane(r))
 ///       + tokens(r) · elementwise_bytes_per_row / bytes_per_ns`
 ///
-/// The rates are timed as back-to-back dispatches in a frame, so each
-/// already holds its dispatch's launch wherever they serialize: a launch
-/// decides a dispatch's time only when the dispatch is too short for its
-/// work to hide it. Where `weights(r) = dense_bytes + expert_bytes · (1 −
-/// (1 − k/E)^tokens)`:
-/// a fire reads every dense weight once (the output head's among them), and
+/// Where `weights(r) = dense_bytes + expert_bytes · (1 − (1 − k/E)^tokens)`:
+/// a fire reads every dense weight once (the output head's at its readout), and
 /// of a routed bank the experts its rows touch (each row picks `k` of `E`).
-/// `flops(m, k)` is the device's matmul rate at `m` rows and depth `k`, its
-/// measured grid interpolated in `log m` and `log k`
-/// ([`profile::fire::flops_at`]), and each of the model's dense shapes
-/// (`n` columns at depth `k`, [`super::Counts::gemm_shapes`]) is read at its
-/// own depth: a narrow model's matmuls run below a wide one's at the same
-/// rows. `attn(keys, d)` is the device's attention rate at a row's keys and
+/// `flops(m, n, k)` is the device's matmul rate at `m` rows, `n` columns
+/// and depth `k`: its measured grid read at `m` exactly (the grid's rows
+/// are the rung lattice, each timed through the kernel serving runs, its
+/// padding and tile in the rate) and interpolated in `log n` and `log k`
+/// ([`profile::fire::gemm_at`]), and each of the model's dense
+/// shapes ([`super::Counts::gemm_shapes`]) is read at its own columns and
+/// depth: a narrow model's matmuls run below a wide one's at the same rows,
+/// and a wide shallow leg apart from a narrow deep one. `attn(keys, d)` is the device's attention rate at a row's keys and
 /// the model's head width `d`, its measured grid interpolated in `log keys`
 /// and `log d` and clamped (a paged prefill streams long keys faster a flop
 /// than short, and a wide head's tiles run at their own rate). The output head
@@ -113,9 +158,9 @@ impl RungFacts {
 /// rung's rows.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FireEstimate {
-    /// Dense bf16 matmul flops a nanosecond by rows and depth: `(m, k,
-    /// rate)`, a full grid ([`profile::fire::grid`]).
-    pub flops_grid: Vec<(u32, u32, f64)>,
+    /// Dense bf16 matmul flops a nanosecond by rows, columns and depth:
+    /// `(m, n, k, rate)` ([`profile::fire::gemm_grid`]).
+    pub flops_grid: Vec<(u32, u32, u32, f64)>,
     /// Attention flops a nanosecond by the keys a row attends and the head
     /// width: `(keys, d, rate)`, a full grid; read only where the model
     /// attends.
@@ -124,7 +169,7 @@ pub struct FireEstimate {
     pub attn_head_dim: u32,
     /// Recurrent state elements a nanosecond; read only where the model
     /// carries recurrent state.
-    pub scan_elements_per_ns: f64,
+    pub scan_by_tokens: Vec<(u32, f64)>,
     /// Device memory bytes a nanosecond.
     pub bytes_per_ns: f64,
     /// What one launch costs beside its work.
@@ -172,24 +217,26 @@ impl FireEstimate {
         self.dense_bytes as f64 + self.expert_bytes as f64 * touched
     }
 
-    /// The matmul rate at `rows` and `depth`.
+    /// The matmul rate at `rows`, `n` columns and depth `k`.
     #[must_use]
-    pub fn flops_per_ns(&self, rows: u32, depth: u32) -> f64 {
-        profile::fire::flops_at(&self.flops_grid, rows, depth).unwrap_or(f64::INFINITY)
+    pub fn flops_per_ns(&self, rows: u32, n: u32, k: u32) -> f64 {
+        profile::fire::gemm_at(&self.flops_grid, rows, n, k).unwrap_or(f64::INFINITY)
     }
 
     /// Each dense shape's matmul time at `rung`, in ns: `(n, k, ns)`, the
-    /// padded rows' flops at that shape over the rate at its depth. Their
+    /// rung's tokens' flops at that shape over the rate there. Their
     /// sum is [`Terms::flops`].
     #[must_use]
     pub fn matmuls(&self, rung: &RungFacts) -> Vec<(u32, u32, f64)> {
-        let rows = rung.padded_rows;
+        // The rung's tokens: the grid was timed at them through the kernel
+        // serving runs, its padding and tile in the rate.
+        let rows = rung.tokens;
         self.gemm_shapes
             .iter()
             .map(|s| {
                 let work = f64::from(rows) * s.flops_per_row as f64;
                 let ns = if work > 0.0 {
-                    work / self.flops_per_ns(rows, s.k)
+                    work / self.flops_per_ns(rows, s.n, s.k)
                 } else {
                     0.0
                 };
@@ -201,21 +248,20 @@ impl FireEstimate {
     /// The estimate's terms at `rung`, in ns: the one place its form lives.
     #[must_use]
     pub fn terms(&self, rung: &RungFacts) -> Terms {
-        let tokens = f64::from(rung.tokens);
-        // A row's keys, and the keys the fire reads: decode-shaped, a lane
-        // attends one key (its fresh slot's own); prefill-shaped, the rung's.
-        let (keys, keys_read) = if rung.decode_shaped() {
-            (1.0, tokens)
+        // The fire the rung is weighed as: its rows, the keys a row
+        // attends, and the keys the fire reads (each lane its own).
+        let fire = rung.check_fire();
+        let tokens = f64::from(fire.rows);
+        let keys = f64::from(fire.keys_per_lane);
+        let keys_read = if fire.lanes > 1 {
+            f64::from(fire.lanes) * keys
         } else {
-            (f64::from(rung.keys), f64::from(rung.keys))
+            keys
         };
         // Work over a rate, nothing where there is no work.
         let over = |work: f64, rate: f64| if work > 0.0 { work / rate } else { 0.0 };
-        // `count` dispatches sharing `work`, each its share or a launch.
-        let floored = |work: f64, count: u32| {
-            let count = f64::from(count.max(1));
-            count * (work / count).max(self.launch_ns)
-        };
+        // `count` dispatches sharing `work`, each its share and a launch.
+        let floored = |work: f64, count: u32| work + f64::from(count.max(1)) * self.launch_ns;
         let (mut dispatched, mut dispatches) = (0.0, 0u64);
         // The matmuls: each plane a dispatch, its read or its compute.
         let touched = self.touched(rung.tokens);
@@ -229,11 +275,11 @@ impl FireEstimate {
             dispatches += u64::from(s.planes.max(1));
         }
         // The readout: one dispatch, the head's read or its compute.
+        // The head's bytes are the readout's alone, not the trunk's read.
         let head_read = over(self.head_bytes as f64, self.bytes_per_ns);
-        weights += head_read;
         let readout = over(
-            f64::from(rung.sampled()) * self.readout_flops,
-            self.flops_per_ns(rung.sampled(), self.readout_depth),
+            f64::from(fire.sampled) * self.readout_flops,
+            self.flops_per_ns(fire.sampled, self.readout_columns(), self.readout_depth),
         );
         if self.readout_flops > 0.0 {
             dispatched += floored(readout.max(head_read), 1);
@@ -253,7 +299,10 @@ impl FireEstimate {
         }
         let recurrent = over(
             tokens * self.state_elements_per_row,
-            self.scan_elements_per_ns,
+            // The rate at a lane's prompt (a decode lane's one token at
+            // the curve's narrowest point).
+            profile::fire::interpolate(&self.scan_by_tokens, fire.tokens_per_lane)
+                .unwrap_or(f64::INFINITY),
         );
         if self.state_elements_per_row > 0.0 {
             dispatched += floored(recurrent, self.scan_dispatches);
@@ -277,8 +326,18 @@ impl FireEstimate {
             kv,
             recurrent,
             elementwise,
+            head_read,
             dispatched,
         }
+    }
+
+    /// The output head's columns (the vocabulary): its flops a row over two
+    /// a depth.
+    fn readout_columns(&self) -> u32 {
+        let depth = f64::from(self.readout_depth.max(1));
+        (self.readout_flops / (2.0 * depth))
+            .round()
+            .clamp(1.0, f64::from(u32::MAX)) as u32
     }
 
     /// The share of the experts a fire of `tokens` touches.
@@ -372,7 +431,8 @@ impl GemmShape {
 pub struct Terms {
     /// `launches · launch_ns`.
     pub launch: f64,
-    /// The weight bytes the fire reads, over the bandwidth.
+    /// The trunk's weight bytes the fire reads (the head's aside), over the
+    /// bandwidth.
     pub weights: f64,
     /// The padded rows' matmul flops, each shape over the rate at those
     /// rows and its depth.
@@ -387,7 +447,9 @@ pub struct Terms {
     pub recurrent: f64,
     /// The norms' and elementwise ops' activation bytes, over the bandwidth.
     pub elementwise: f64,
-    /// The fire's time: each dispatch its work or a launch, summed.
+    /// The output head's bytes, over the bandwidth: the readout's read.
+    pub head_read: f64,
+    /// The fire's time: each dispatch its work and a launch, summed.
     pub dispatched: f64,
 }
 
@@ -397,21 +459,20 @@ impl Terms {
     #[must_use]
     pub fn work(&self) -> f64 {
         self.weights.max(self.flops)
-            + self.readout
+            + self.readout.max(self.head_read)
             + self.attention
             + self.kv
             + self.recurrent
             + self.elementwise
     }
 
-    /// The fire's time: each dispatch its work or a launch, summed.
+    /// The fire's time: each dispatch its work and a launch, summed.
     #[must_use]
     pub fn total(&self) -> f64 {
         self.dispatched
     }
 
-    /// What the launch floors add to the fire's work: its dispatches too
-    /// short to hide their launches.
+    /// What the launches add to the fire's work: one a dispatch.
     #[must_use]
     pub fn floor(&self) -> f64 {
         (self.dispatched - self.work()).max(0.0)
@@ -606,6 +667,7 @@ mod tests {
             padded_rows: tokens,
             span_bytes: span_mib * MIB,
             infeasible: None,
+            fire_lanes: 4096,
         }
     }
 
@@ -613,10 +675,15 @@ mod tests {
     /// a byte a ns, one flop a ns.
     fn estimate(fixed_ns: u64, per_token_ns: f64) -> FireEstimate {
         FireEstimate {
-            flops_grid: vec![(1, 1, 1.0)],
+            // Every power of two to 16384 rows and 10240: every rung below.
+            flops_grid: (0..=14)
+                .map(|i| 1u32 << i)
+                .chain([10240])
+                .map(|m| (m, 1, 1, 1.0))
+                .collect(),
             attn_grid: Vec::new(),
             attn_head_dim: 0,
-            scan_elements_per_ns: 0.0,
+            scan_by_tokens: Vec::new(),
             bytes_per_ns: 1.0,
             launch_ns: 0.0,
             dense_bytes: fixed_ns,
@@ -678,18 +745,18 @@ mod tests {
     }
 
     #[test]
-    fn a_narrow_fire_pays_for_the_tile_it_under_fills() {
-        // Compute-bound past a read of 100 ns: one flop a row a ns. Unpadded,
-        // 16 tokens beat 64 (equal throughput, less span); padded to a
-        // 64-row tile, 16 tokens cost what 64 do.
-        let e = estimate(100, 10.0);
-        let unpadded = [rung(16, 1), rung(64, 4)];
-        let times: Vec<f64> = unpadded.iter().map(|r| e.ns(r)).collect();
-        assert_eq!(times, [160.0, 640.0]);
-        let mut padded = unpadded;
-        padded[0].padded_rows = 64;
-        assert_eq!(e.ns(&padded[0]), 640.0);
-        let top = top_rung(&padded, 1024 * MIB, &e).unwrap();
+    fn a_narrow_fire_pays_for_the_tile_it_under_fills_in_its_measured_rate() {
+        // The grid is timed at each rung's own rows, so a 16-row fire that
+        // computes a 64-row tile reads a quarter of 64's rate there: 16
+        // tokens cost what 64 do, and the narrow rung does not win.
+        let mut e = estimate(100, 10.0);
+        for point in e.flops_grid.iter_mut().filter(|p| p.0 == 16) {
+            point.3 = 0.25;
+        }
+        let rungs = [rung(16, 1), rung(64, 4)];
+        let times: Vec<f64> = rungs.iter().map(|r| e.ns(r)).collect();
+        assert_eq!(times, [640.0, 640.0]);
+        let top = top_rung(&rungs, 1024 * MIB, &e).unwrap();
         assert_eq!(top.tokens, 64);
     }
 
@@ -793,14 +860,20 @@ mod tests {
     /// attending 16 keys, the matmuls padded to 32 rows.
     fn documented() -> (FireEstimate, RungFacts) {
         let e = FireEstimate {
-            // At depth 64: 1 a ns at 4 rows, 5 at 64: 3 at 16, 4 at 32 (log
-            // rows). At depth 256: twice that.
-            flops_grid: vec![(4, 64, 1.0), (64, 64, 5.0), (4, 256, 2.0), (64, 256, 10.0)],
+            // At depth 64: 1 a ns to 4 rows, then one more each doubling to 5
+            // at 64 and past. At depth 256: twice that.
+            flops_grid: (0..=13)
+                .map(|i| 1u32 << i)
+                .flat_map(|m| {
+                    let r = (f64::from(m).log2() - 1.0).clamp(1.0, 5.0);
+                    [(m, 64, 64, r), (m, 256, 256, 2.0 * r)]
+                })
+                .collect(),
             // At width 8: 0.25 a ns at one key, 1 at 16 and past; at width
             // 32 twice that.
             attn_grid: vec![(1, 8, 0.25), (16, 8, 1.0), (1, 32, 0.5), (16, 32, 2.0)],
             attn_head_dim: 8,
-            scan_elements_per_ns: 2.0,
+            scan_by_tokens: vec![(1, 2.0), (16, 4.0)],
             bytes_per_ns: 4.0,
             launch_ns: 3.0,
             dense_bytes: 200,
@@ -825,22 +898,91 @@ mod tests {
             padded_rows: 32,
             span_bytes: 0,
             infeasible: None,
+            fire_lanes: 4096,
         };
         (e, r)
     }
 
     #[test]
-    fn the_matmul_rate_is_the_curve_at_the_padded_rows() {
+    fn a_rung_is_weighed_and_checked_as_one_fire() {
+        let (_, r) = documented();
+        // Decode-shaped: four lanes of a token each, a key each, all read out.
+        assert_eq!(
+            r.check_fire(),
+            CheckFire {
+                rows: 4,
+                lanes: 4,
+                tokens_per_lane: 1,
+                keys_per_lane: 1,
+                sampled: 4
+            }
+        );
+        // Prefill-shaped: one prompt over the rung's keys, its last row.
+        let prompt = RungFacts { tokens: 8, ..r };
+        assert_eq!(
+            prompt.check_fire(),
+            CheckFire {
+                rows: 8,
+                lanes: 1,
+                tokens_per_lane: 8,
+                keys_per_lane: 16,
+                sampled: 1
+            }
+        );
+    }
+
+    #[test]
+    fn a_rung_past_the_lanes_one_fire_carries_is_a_prompt() {
+        let (_, r) = documented();
+        // 512 rows, but one fire carries 256 lanes: a 512-lane decode is two
+        // fires of the 256 rung, so this rung is one prompt of 512.
+        let wide = RungFacts {
+            tokens: 512,
+            lanes: 512,
+            keys: 512,
+            fire_lanes: 256,
+            ..r
+        };
+        assert_eq!(
+            wide.check_fire(),
+            CheckFire {
+                rows: 512,
+                lanes: 1,
+                tokens_per_lane: 512,
+                keys_per_lane: 512,
+                sampled: 1
+            }
+        );
+        // 256 rows: 256 lanes of a token each.
+        let at = RungFacts {
+            tokens: 256,
+            lanes: 256,
+            ..wide
+        };
+        assert_eq!(
+            at.check_fire(),
+            CheckFire {
+                rows: 256,
+                lanes: 256,
+                tokens_per_lane: 1,
+                keys_per_lane: 1,
+                sampled: 256
+            }
+        );
+    }
+
+    #[test]
+    fn the_matmul_rate_is_the_grid_at_the_rung_tokens() {
         let (e, r) = documented();
-        assert!((e.flops_per_ns(32, 64) - 4.0).abs() < 1e-12);
-        assert!((e.flops_per_ns(16, 64) - 3.0).abs() < 1e-12);
-        assert_eq!(e.flops_per_ns(1, 64), 1.0, "clamped below");
-        assert_eq!(e.flops_per_ns(4096, 64), 5.0, "clamped above");
-        // Halfway from 64 to 256 in log depth: halfway from 4 to 8 a ns.
-        assert!((e.flops_per_ns(32, 128) - 6.0).abs() < 1e-12);
-        // 32 · 10 flops at 4 a ns: compute bound past the 200 / 4 read.
+        assert_eq!(e.flops_per_ns(4, 64, 64), 1.0);
+        assert_eq!(e.flops_per_ns(16, 64, 64), 3.0);
+        assert_eq!(e.flops_per_ns(4096, 64, 64), 5.0);
+        // Halfway from 64 to 256 in log depth: halfway from 3 to 6 a ns.
+        assert!((e.flops_per_ns(16, 128, 128) - 4.5).abs() < 1e-12);
+        // Read at the rung's 4 tokens (not its 32 padded rows): 4 · 10 at 1
+        // a ns, under the 200 / 4 read.
         let t = e.terms(&r);
-        assert!((t.flops - 80.0).abs() < 1e-9);
+        assert!((t.flops - 40.0).abs() < 1e-9);
         assert_eq!(t.weights, 50.0);
     }
 
@@ -854,15 +996,12 @@ mod tests {
             ],
             ..e
         };
-        // 32 · 10 at 4 a ns (depth 64), and 32 · 10 at 8 a ns (depth 256).
+        // 4 · 10 at 1 a ns (depth 64), and 4 · 10 at 2 a ns (depth 256).
         let shapes = two.matmuls(&r);
         assert_eq!(shapes.len(), 2);
-        assert!((shapes[0].2 - 80.0).abs() < 1e-9);
-        assert!((shapes[1].2 - 40.0).abs() < 1e-9);
-        assert!(
-            (two.terms(&r).flops - 120.0).abs() < 1e-9,
-            "the shapes' sum"
-        );
+        assert!((shapes[0].2 - 40.0).abs() < 1e-9);
+        assert!((shapes[1].2 - 20.0).abs() < 1e-9);
+        assert!((two.terms(&r).flops - 60.0).abs() < 1e-9, "the shapes' sum");
         // The check's table: each shape's matmul and its half of the 200 / 4
         // read, then read + matmul and max beside the measured.
         let table = shape_table(&two, &[r], &[200e6]);
@@ -938,7 +1077,7 @@ mod tests {
         // A model with no state reads no scan rate.
         let none = FireEstimate {
             state_elements_per_row: 0.0,
-            scan_elements_per_ns: 0.0,
+            scan_by_tokens: Vec::new(),
             ..e
         };
         assert_eq!(none.terms(&r).recurrent, 0.0);
@@ -952,28 +1091,52 @@ mod tests {
     }
 
     #[test]
-    fn each_dispatch_takes_its_work_or_a_launch() {
+    fn the_heads_bytes_are_the_readouts_alone() {
         let (e, r) = documented();
-        // The documented fire's five dispatches: the matmul's 80 (its read
-        // 50), the readout's 24, the attention's 8 + 8, the scan's 6, and
-        // the one elementwise op's 2, floored at a 3 ns launch.
+        let headed = FireEstimate {
+            head_bytes: 400,
+            ..e.clone()
+        };
+        // Decode-shaped: the head's 400 bytes read once, at the readout
+        // (100 ns past its 24 of compute), not again in the trunk's 50.
+        let t = headed.terms(&r);
+        assert_eq!((t.weights, t.head_read), (50.0, 100.0));
+        assert!((t.total() - (50.0 + 100.0 + 16.0 + 6.0 + 2.0 + 5.0 * 3.0)).abs() < 1e-9);
+        assert!((t.work() - (50.0 + 100.0 + 16.0 + 6.0 + 2.0)).abs() < 1e-9);
+        // Prefill-shaped (one row sampled), the trunk's compute past its
+        // read: the head moves only the readout's dispatch.
+        let prompt = RungFacts { tokens: 8, ..r };
+        let (with, without) = (headed.terms(&prompt), e.terms(&prompt));
+        assert_eq!(with.weights, without.weights);
+        assert!(
+            (with.total() - without.total() - (100.0 - without.readout)).abs() < 1e-9,
+            "{with:?} {without:?}"
+        );
+    }
+
+    #[test]
+    fn each_dispatch_adds_a_launch_to_its_work() {
+        let (e, r) = documented();
+        // The documented fire's five dispatches: the matmul's read 50 (past
+        // its 40 of compute), the readout's 24, the attention's 8 + 8, the
+        // scan's 6 and the one elementwise op's 2, each and a 3 ns launch.
         let t = e.terms(&r);
-        assert!((t.work() - 128.0).abs() < 1e-9);
-        assert!((t.total() - 129.0).abs() < 1e-9);
-        assert!((t.floor() - 1.0).abs() < 1e-9);
+        assert!((t.work() - 98.0).abs() < 1e-9);
+        assert!((t.total() - (98.0 + 5.0 * 3.0)).abs() < 1e-9);
+        assert!((t.floor() - 15.0).abs() < 1e-9);
         // The plan's dispatches the counts name no work for: a launch each.
         let more = RungFacts {
             launches: 1000,
             ..r
         };
-        assert!((e.terms(&more).total() - (129.0 + 995.0 * 3.0)).abs() < 1e-9);
+        assert!((e.terms(&more).total() - (98.0 + 1000.0 * 3.0)).abs() < 1e-9);
     }
 
     #[test]
-    fn a_model_of_many_tiny_ops_pays_a_launch_for_each() {
+    fn a_chain_of_short_dispatches_adds_its_gaps() {
         let (e, r) = documented();
         // A hundred per-row ops of one byte a row: 1 ns of work each at 4
-        // tokens, 3 ns of launch each.
+        // tokens, and each a 3 ns gap: the gaps add, they do not hide.
         let tiny = FireEstimate {
             elementwise_ops: vec![1; 100],
             ..e
@@ -981,31 +1144,24 @@ mod tests {
         let wide = RungFacts { launches: 104, ..r };
         let t = tiny.terms(&wide);
         assert!((t.elementwise - 100.0).abs() < 1e-9);
-        assert!((t.total() - (80.0 + 24.0 + 16.0 + 6.0 + 300.0)).abs() < 1e-9);
-        assert!((t.floor() - 200.0).abs() < 1e-9);
+        assert!((t.total() - (t.work() + 104.0 * 3.0)).abs() < 1e-9);
     }
 
     #[test]
-    fn a_long_matmul_buries_its_launch() {
+    fn a_backend_with_no_gap_is_its_work() {
         let (e, r) = documented();
-        // A wide fire: the one matmul plane's compute far past a launch,
-        // its time the work's, unchanged by the floor.
-        let wide = RungFacts {
-            tokens: 4096,
-            lanes: 4096,
-            padded_rows: 4096,
-            ..r
+        let overlapped = FireEstimate {
+            launch_ns: 0.0,
+            ..e
         };
-        let t = e.terms(&wide);
-        assert!(t.flops > 100.0 * e.launch_ns);
-        let matmul = t.flops.max(t.weights);
-        let floored = matmul + t.readout + (t.attention + t.kv) + t.recurrent + t.elementwise;
-        assert!((t.total() - floored).abs() < 1e-9, "{t:?}");
+        let t = overlapped.terms(&r);
+        assert!((t.total() - t.work()).abs() < 1e-9);
+        assert_eq!(t.floor(), 0.0);
     }
 
     #[test]
-    fn a_one_token_fire_is_its_launches() {
-        // The M5's rung 1: one row, every dispatch shorter than a launch.
+    fn a_one_token_fire_is_its_launches_and_its_little_work() {
+        // The M5's rung 1: one row, every dispatch's work far under a launch.
         let (e, r) = documented();
         let quick = FireEstimate {
             launch_ns: 1000.0,
@@ -1019,16 +1175,16 @@ mod tests {
             ..r
         };
         let t = quick.terms(&one);
-        assert!(t.work() < 1000.0, "{t:?}");
-        assert_eq!(t.total(), 40.0 * 1000.0);
+        assert!(t.work() < 100.0, "{t:?}");
+        assert!((t.total() - (40.0 * 1000.0 + t.work())).abs() < 1e-9);
     }
 
     #[test]
     fn the_estimate_is_its_documented_form() {
         let (e, r) = documented();
-        // Each of its five dispatches its work or a 3 ns launch: max(200/4,
-        // 32·10/4), 4·6/1, 4·1·0.5/0.25 + 4·8/4, 4·3/2, and 4·2/4 floored.
-        let want = 80.0 + 24.0 + (8.0 + 8.0) + 6.0 + 3.0;
+        // Each of its five dispatches its work and a 3 ns launch: max(200/4,
+        // 4·10/1), 4·6/1, 4·1·0.5/0.25 + 4·8/4, 4·3/2 and 4·2/4.
+        let want = 50.0 + 24.0 + (8.0 + 8.0) + 6.0 + 2.0 + 5.0 * 3.0;
         assert!((e.ns(&r) - want).abs() < 1e-9, "{}", e.ns(&r));
         assert_eq!(e.ns(&r), e.terms(&r).total());
     }

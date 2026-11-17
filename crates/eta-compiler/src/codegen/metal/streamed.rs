@@ -423,17 +423,22 @@ fn direct_wide(
         tags::BROADCAST => {
             let d0 = d0?;
             let src = arg(0)?;
+            // The shape it broadcasts from is its operand's as written: an
+            // elided view reshape (`[1, n]` of an `[n]`) reads the bytes of the
+            // value it views, but broadcasts by its own dims; the viewed
+            // value's would align its axis with the output's first.
+            let shaped = *op.args.first()?;
             if let Some(bits) = regs.get(&src) {
                 let _ = writeln!(compute, "{v} = {};", typed_from_bits(dout, bits, d0));
             } else {
                 let mode = format!("bc_{node}");
                 let _ = writeln!(
                     pre,
-                    "    const uint {mode} = descriptors[{src}].len == 1u ? 0u : 2u;"
+                    "    const uint {mode} = descriptors[{shaped}].len == 1u ? 0u : 2u;"
                 );
                 let _ = writeln!(
                     pre,
-                    "    const M1ValueDesc bd0_{node} = descriptors[{src}];"
+                    "    const M1ValueDesc bd0_{node} = descriptors[{shaped}];"
                 );
                 let _ = writeln!(
                     pre,

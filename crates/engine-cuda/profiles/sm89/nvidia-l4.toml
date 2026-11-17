@@ -45,12 +45,11 @@ seated_first = true
 # a fire's working set may take 65% of the 24 GB card past the weights, as on the RTX 4090
 working_set_percent = 65
 recording = { use = "bodies", mem_mb = 1024 }
-forward_tokens = 2304
 prefill_lattice_steps = 8
 
 [rates]
 # 121 TFLOPS dense bf16 (NVIDIA L4 datasheet; 242 with sparsity).
-bf16_flops_per_ns_by_rows_and_depth = [[4096, 4096, 121000.0]]
+bf16_flops_per_ns_by_rows_n_k = [[4096, 4096, 4096, 121000.0]]
 # 300 GB/s of GDDR6 (L4 datasheet).
 bytes_per_ns = 300.0
 
@@ -90,7 +89,6 @@ measured = [
   "kernel.sdpa.prefill.ctas_per_sm",
   "kernel.sdpa.selected_mma",
   "engine.copies",
-  "engine.forward_tokens",
   "engine.prefill_lattice_steps",
   "engine.graphs",
   "engine.lattice_steps",

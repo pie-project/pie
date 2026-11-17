@@ -265,6 +265,7 @@ impl Set {
                 base: PROMPT,
                 folded,
                 fold,
+                lineage: engine::fire::Lineage::Set,
             },
             rs_reset: RsReset::Held,
             slot_copies: std::mem::take(&mut self.copies),
@@ -655,5 +656,49 @@ fn replays_what_a_host_fold_replays(frames: u8) {
             "by the time each submit returned"
         },
         want.len()
+    );
+}
+
+/// A lane sharing its set replays the buffered slots its mask admits
+/// (`Lineage::Admitted`), every run of them in slot order. Two sets hold the
+/// same prompt and the same eight buffered rows; a masked lane after them
+/// admits every slot, on one set as one run and on the other as two runs
+/// side by side (a zero-width hidden run between). Its recurrence replays
+/// the same rows either way, so the two land the same logits, bit for bit;
+/// replaying only the first run, the second set's lane ran its recurrence
+/// over rows the replay never wrote.
+#[test]
+fn a_two_run_lineage_replays_both_runs() {
+    let Some((mut model, _)) = load(1) else {
+        return;
+    };
+    let trace = model.trace.clone();
+    let masked = trace.facts.word(&poem::Request::new(ROWS, true));
+    let mut last = |slot: u32, runs: Vec<u32>| {
+        let mut set = Set::new(&mut model, slot);
+        let buffer = set.lane(&trace, 11, PROMPT, FoldLen::Host(0), 0);
+        model.fire(buffer);
+        let mut lane = set.lane(&trace, 12, PROMPT, FoldLen::Host(0), 0);
+        let RsVerb::Buffer { lineage, .. } = &mut lane.rs else {
+            unreachable!("a buffering lane")
+        };
+        *lineage = engine::fire::Lineage::Admitted;
+        lane.word = masked;
+        lane.kv.folded = PROMPT;
+        let total = u64::from(ROWS + ROWS);
+        lane.mask = Some(engine::fire::Masking::Extent(engine::fire::Mask::new(
+            runs, total,
+        )));
+        model.fire(lane)
+    };
+    let one = last(0, vec![0, 2 * ROWS]);
+    let two = last(1, vec![0, 3, 0, 2 * ROWS - 3]);
+    assert!(
+        !one.is_empty() && one.iter().all(|&bits| f32::from_bits(bits).is_finite()),
+        "the one-run lane reads finite logits"
+    );
+    assert!(
+        one == two,
+        "a lineage of two runs side by side replays what one run over the same slots replays"
     );
 }

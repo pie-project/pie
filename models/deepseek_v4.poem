@@ -1414,6 +1414,7 @@ def draft(m, rows, streams, logits):
     proposal = ops.linear.lm_head(ops.gather.gather_rows(y, drafted.readout_rows()), m.head)
     output("mtp.logits", proposal)
     output("mtp.drafts", ops.sampling.argmax([proposal]))
+    draft_depth(1)
 
 def rope(x, pos, rope_dim, head_dim, theta, scaling, inverse = False):
     if scaling != None:

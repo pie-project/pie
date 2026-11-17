@@ -78,6 +78,9 @@ pub struct Segments {
     total_chunks: u32,
     state: Vec<SegmentState>,
     used: Vec<u32>,
+    /// Chunks of each segment the backend never backs
+    /// ([`Self::skip`]): no budget counts them.
+    skipped: Vec<u32>,
     /// Chunks of `Committed` segments: what the budget may spend.
     committed_chunks: u32,
 }
@@ -97,6 +100,7 @@ impl Segments {
             total_chunks,
             state: vec![SegmentState::Uncommitted; count as usize],
             used: vec![0; count as usize],
+            skipped: vec![0; count as usize],
             committed_chunks: 0,
         };
         for segment in 0..committed {
@@ -119,9 +123,10 @@ impl Segments {
         start..(start + self.segment_chunks).min(self.total_chunks)
     }
 
+    /// The chunks `segment` backs: its range's but those skipped.
     pub fn len(&self, segment: u32) -> u32 {
         let range = self.range(segment);
-        range.end - range.start
+        range.end - range.start - self.skipped[segment as usize]
     }
 
     pub fn is_empty(&self) -> bool {
@@ -173,6 +178,17 @@ impl Segments {
     /// The lowest uncommitted segments, in order.
     pub fn uncommitted(&self) -> impl Iterator<Item = u32> + '_ {
         (0..self.count()).filter(|&segment| self.state(segment) == SegmentState::Uncommitted)
+    }
+
+    /// Physical chunk `chunk` is one the backend never backs: held for
+    /// good, and counted in no segment's chunks.
+    pub(super) fn skip(&mut self, chunk: u32) {
+        let segment = self.of(chunk);
+        if self.state(segment) == SegmentState::Committed {
+            self.committed_chunks -= 1;
+        }
+        self.skipped[segment as usize] += 1;
+        self.used[segment as usize] += 1;
     }
 
     pub(super) fn hold(&mut self, chunk: u32) {

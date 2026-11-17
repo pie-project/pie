@@ -514,6 +514,11 @@ pub struct SlotPool {
     /// A permutation of `0..total`, as the engine's chunk table.
     logical_to_physical: Vec<u32>,
     physical_to_logical: Vec<u32>,
+    /// Physical chunks never handed out: the reserved ones from 0 and the
+    /// skipped ids ([`Self::skip`]). Each stays where it lies.
+    fixed: Bits,
+    /// The skipped runs of chunk ids, `first..end` ([`Self::skip`]).
+    skips: Vec<(u32, u32)>,
     /// Free physical chunks.
     free: Bits,
     /// Free physical chunks of committed segments below the activation:
@@ -573,8 +578,10 @@ impl SlotPool {
             }
         }
         let mut free = Bits::new(total, true);
+        let mut fixed = Bits::new(total, false);
         for chunk in 0..facts.reserved_chunks {
             free.clear(chunk);
+            fixed.set(chunk);
             segments.hold(chunk);
         }
         let mut pool = Self {
@@ -593,6 +600,8 @@ impl SlotPool {
             chunks: vec![FREE_CHUNK; total as usize],
             logical_to_physical: (0..total).collect(),
             physical_to_logical: (0..total).collect(),
+            fixed,
+            skips: Vec::new(),
             free,
             open: Bits::new(total, false),
             ceiling: total,
@@ -614,6 +623,32 @@ impl SlotPool {
             pool.reopen(chunk);
         }
         pool
+    }
+
+    /// The chunk ids `first..first + chunks` are skipped: the backend
+    /// never backs them, so none is handed out, counted in a segment's
+    /// chunks or moved, and no run of adjacent chunks crosses them; the
+    /// ids above keep their place.
+    pub fn skip(&mut self, first: u32, chunks: u32) {
+        let end = first.saturating_add(chunks).min(self.total);
+        if first < end {
+            self.skips.push((first, end));
+        }
+        for chunk in first..end {
+            if self.fixed.get(chunk) {
+                continue;
+            }
+            self.free.clear(chunk);
+            self.fixed.set(chunk);
+            self.segments.skip(chunk);
+            self.reopen(chunk);
+        }
+    }
+
+    /// Whether physical chunk `chunk` is never handed out: reserved or
+    /// skipped. Its logical id is its physical one.
+    fn is_fixed(&self, chunk: u32) -> bool {
+        self.fixed.get(chunk)
     }
 
     /// Whether physical chunk `chunk` may be opened: free, in a committed
@@ -704,9 +739,7 @@ impl SlotPool {
     /// the rows such a fire reads out where they land beside the activation
     /// ([`Self::readout_bytes`]).
     fn fire_chunks(&self, tokens: u32) -> u32 {
-        let bytes = self
-            .standing
-            .saturating_add(self.readout_bytes(tokens));
+        let bytes = self.standing.saturating_add(self.readout_bytes(tokens));
         u32::try_from(bytes.div_ceil(self.chunk_bytes.max(1))).unwrap_or(u32::MAX)
     }
 
@@ -846,7 +879,7 @@ impl SlotPool {
     /// State chunks at physical ids `from..to`.
     fn held_in(&self, from: u32, to: u32) -> Vec<u32> {
         (from..to)
-            .filter(|&chunk| !self.free.get(chunk) && chunk >= self.reserved)
+            .filter(|&chunk| !self.free.get(chunk) && !self.is_fixed(chunk))
             .collect()
     }
 
@@ -1044,7 +1077,8 @@ impl SlotPool {
                 let range = self.segments.range(segment);
                 range.end.min(limit).saturating_sub(range.start)
             })
-            .sum();
+            .sum::<u32>()
+            - self.skipped_in_committed(limit);
         let held_below = self.held - self.held_count(limit, self.total);
         self.headroom_any()
             .min(below.saturating_sub(self.reserved + held_below))
@@ -1065,14 +1099,15 @@ impl SlotPool {
                 let range = self.segments.range(segment);
                 range.end.min(self.ceiling).saturating_sub(range.start)
             })
-            .sum();
+            .sum::<u32>()
+            - self.skipped_in_committed(self.ceiling);
         all.min(below.saturating_sub(self.reserved + self.held))
     }
 
     /// State chunks at physical ids `from..to`, counted.
     fn held_count(&self, from: u32, to: u32) -> u32 {
         (from..to)
-            .filter(|&chunk| !self.free.get(chunk) && chunk >= self.reserved)
+            .filter(|&chunk| !self.free.get(chunk) && !self.is_fixed(chunk))
             .count() as u32
     }
 
@@ -1088,7 +1123,7 @@ impl SlotPool {
 
     /// Where logical chunk `chunk` lies now, when it is reserved or open.
     pub fn physical(&self, chunk: u32) -> Option<u32> {
-        (chunk < self.reserved || self.chunks[chunk as usize].shape != NO_SHAPE)
+        (self.is_fixed(chunk) || self.chunks[chunk as usize].shape != NO_SHAPE)
             .then(|| self.logical_to_physical[chunk as usize])
     }
 
@@ -1213,10 +1248,36 @@ impl SlotPool {
             .count() as u32;
         let held_below = self.held - self.held_count(limit, self.total);
         free.min(
-            self.total
+            (self.total - self.skipped_below(self.total))
                 .saturating_sub(self.reserved + self.held + self.act),
         )
-        .min(limit.saturating_sub(self.reserved + held_below))
+        .min((limit - self.skipped_below(limit)).saturating_sub(self.reserved + held_below))
+    }
+
+    /// Skipped chunk ids below physical id `limit` ([`Self::skip`]).
+    pub fn skipped_below(&self, limit: u32) -> u32 {
+        self.skips
+            .iter()
+            .map(|&(first, end)| end.min(limit).saturating_sub(first))
+            .sum()
+    }
+
+    /// Skipped chunk ids below `limit` in committed segments.
+    fn skipped_in_committed(&self, limit: u32) -> u32 {
+        let mut skipped = 0;
+        for &(first, end) in &self.skips {
+            let end = end.min(limit);
+            if first >= end {
+                continue;
+            }
+            for segment in self.segments.of(first)..=self.segments.of(end - 1) {
+                if self.segments.state(segment) == SegmentState::Committed {
+                    let range = self.segments.range(segment);
+                    skipped += range.end.min(end).saturating_sub(range.start.max(first));
+                }
+            }
+        }
+        skipped
     }
 
     /// [`Self::fits`] against what the pool can grow to
@@ -1292,6 +1353,34 @@ impl SlotPool {
                 wanted: demand.wanted + (state.live + state.cached + state.waiting) * bytes,
             }
         })
+    }
+
+    /// Who holds the pool's slots, by kind of holder (the store's own, as
+    /// guest state and role slots are taken, apart), and the chunks free
+    /// and opened: what a stall is read by.
+    #[must_use]
+    pub fn held_census(&self) -> String {
+        let (mut sets, mut cache, mut snapshots, mut weights, mut store) = (0, 0, 0, 0, 0);
+        for (holder, &slots) in &self.holders {
+            match holder {
+                h if *h == super::chunks::STORE => store += slots,
+                Holder::WorkingSet(_) => sets += slots,
+                Holder::CacheEntry(_) => cache += slots,
+                Holder::Snapshot(_) => snapshots += slots,
+                Holder::Weights { .. } => weights += slots,
+            }
+        }
+        format!(
+            "slots: working_sets={sets} cache={cache} snapshots={snapshots} weights={weights} \
+             store={store} ({} holders); chunks: opened={} free={} committed={} total={} \
+             pending={}",
+            self.holders.len(),
+            self.held,
+            self.free_chunks(),
+            self.committed_chunks(),
+            self.total,
+            self.pending.values().map(Vec::len).sum::<usize>(),
+        )
     }
 
     /// Records that `waiter` is parked short `slots` of `shape`, replacing
@@ -1656,7 +1745,7 @@ impl SlotPool {
         if chunk >= self.total {
             return Some("past the pool");
         }
-        if chunk < self.reserved {
+        if self.is_fixed(chunk) {
             return Some("reserved");
         }
         if self.chunks[chunk as usize].shape != NO_SHAPE {
@@ -2069,7 +2158,7 @@ impl SlotPool {
             return None;
         }
         let range = self.segments.range(segment);
-        if range.start < self.reserved {
+        if range.clone().any(|chunk| self.is_fixed(chunk)) {
             return None;
         }
         let needed = self.reserved + self.held + self.act;
@@ -2292,14 +2381,14 @@ impl SlotPool {
             let physical = self.logical_to_physical[logical as usize];
             let meta = self.chunks[logical as usize];
             assert_eq!(self.physical_to_logical[physical as usize], logical);
-            if meta.shape == NO_SHAPE && logical >= self.reserved {
+            if meta.shape == NO_SHAPE && !self.is_fixed(logical) {
                 assert!(self.free.get(physical), "a free logical id on a held chunk");
                 continue;
             }
             assert!(!self.free.get(physical));
             assert!(!self.open.get(physical));
             seg_used[self.segments.of(physical) as usize] += 1;
-            if logical < self.reserved {
+            if self.is_fixed(logical) {
                 assert_eq!(physical, logical);
                 continue;
             }
@@ -2332,7 +2421,7 @@ impl SlotPool {
             assert_eq!(seg_used[segment as usize], self.segments.used(segment));
             for chunk in self.segments.range(segment) {
                 assert_eq!(self.open.get(chunk), self.openable(chunk), "chunk {chunk}");
-                if !self.free.get(chunk) && chunk >= self.reserved {
+                if !self.free.get(chunk) && !self.is_fixed(chunk) {
                     assert!(chunk < self.state_limit(), "state in the activation span");
                     assert!(
                         chunk < self.live_limit() || !self.holds_live(chunk),
@@ -2935,5 +3024,54 @@ mod tests {
             pool.plan_evacuation(2).is_none(),
             "2..4 and 6..8 free, four chunks, and no run of 3 in a lower segment"
         );
+    }
+
+    /// Skipped ids mid-segment, with ids above them: ids 6..10 of 20 in
+    /// segments of 4 (from the middle of segment 1 to the middle of segment
+    /// 2), the top segment under the activation. No skipped id is handed
+    /// out, counted in the budget or moved; a run of adjacent chunks lies
+    /// up to the skip's edge or past it, never across it; and every id
+    /// above the skip is handed out as itself.
+    #[test]
+    fn skipped_ids_mid_segment_stay_gaps_no_run_crosses() {
+        let fixed = [(ShapeKind::Fixed, 4)];
+        let mut pool = SlotPool::new(facts_with(20, 4, 5, &fixed, &[(16, 4)]));
+        let committed = pool.committed_chunks();
+        pool.skip(6, 4);
+        assert_eq!(pool.committed_chunks(), committed - 4, "nothing backs them");
+        pool.check();
+        let holder = Holder::WorkingSet(1);
+        let physical = |pool: &SlotPool, slots: &[Slot]| -> Vec<u32> {
+            let mut chunks: Vec<u32> = slots
+                .iter()
+                .map(|slot| pool.physical(slot.chunk).unwrap())
+                .collect();
+            chunks.dedup();
+            chunks
+        };
+        // Runs of 2: 1..3 (segment 0 holds the null chunk), 4..6 up to the
+        // skip's edge, then 10..12, 12..14 and 14..16 past it; 5|10 is no
+        // run.
+        assert_eq!(pool.free_chunk_runs(2), 5);
+        let runs = pool.acquire_chunk_runs(holder, 0, 2, 4).unwrap();
+        assert_eq!(physical(&pool, &runs), [1, 2, 4, 5, 10, 11, 12, 13]);
+        for slot in &runs {
+            assert_eq!(
+                pool.physical(slot.chunk),
+                Some(slot.chunk),
+                "ids keep their place"
+            );
+        }
+        assert_eq!(pool.free_chunk_runs(2), 1, "14..16");
+        pool.check();
+        // Singles take every free chunk but the skipped ones.
+        let singles = pool.acquire_chunk_runs(holder, 0, 1, 3).unwrap();
+        assert_eq!(physical(&pool, &singles), [3, 14, 15]);
+        assert!(pool.acquire_chunk_runs(holder, 0, 1, 1).is_err());
+        // A segment that holds skipped ids is never evacuated.
+        pool.release(holder, &singles, 0);
+        assert!(pool.plan_evacuation(1).is_none());
+        assert!(pool.plan_evacuation(2).is_none());
+        pool.check();
     }
 }

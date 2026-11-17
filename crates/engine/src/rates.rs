@@ -6,27 +6,83 @@
 //! the counts here turn its times into rates, and [`tuned`] and
 //! [`provenance`] write them.
 //!
-//! - `bf16_flops_per_ns_by_rows_and_depth`: a bf16 matmul `m x k x k` (`m`
-//!   rows, `k` columns, depth `k`) at each `m` of [`LATTICE_ROWS`] and each
-//!   `k` of [`DEPTHS`], [`gemm_flops`] a matmul over its time.
+//! - `bf16_flops_per_ns_by_rows_n_k`: a bf16 matmul of `m` rows, `n`
+//!   columns and depth `k` at each `m` of the engine's own rung lattice
+//!   (the rows its loads lay fires at, which its rates step times exactly;
+//!   no lattice is engine::rates') and each `n` and
+//!   each `k` of [`DEPTHS`] (a serving projection is seldom square: a gate
+//!   and up leg runs wide and shallow, a down leg narrow and deep),
+//!   [`gemm_flops`] a matmul over its time.
 //! - `attn_flops_per_ns_by_keys_and_dim`: the backend's prefill attention
 //!   at [`ATTN_SHAPE`]'s heads, one sequence of `keys` rows attending itself
 //!   at each `keys` of [`ATTN_KEYS`] and head width `d` of [`ATTN_DIMS`]
 //!   ([`AttnShape::at`], [`AttnShape::with_dim`]), its pages laid in the pool
 //!   in [`attn_page_order`], through the attention kernel serving selects at
 //!   that shape, [`attn_flops`] over its time.
-//! - `scan_elements_per_ns`: the backend's prefill gated-delta scan and the
+//! - `scan_elements_per_ns_by_tokens`: at each `tokens` of [`SCAN_TOKENS`]
+//!   ([`ScanShape::at`]), over [`scan_sets_at`] cold sets, the backend's
+//!   prefill gated-delta scan and the
 //!   causal conv before it at [`SCAN_SHAPE`], [`scan_elements`] over the two
 //!   together's time.
-//! - `bytes_per_ns` (a copy of device memory, every byte read and written)
-//!   and `launch_ns` (a dispatch's own cost inside a recorded frame) as
-//!   before.
+//! - `bytes_per_ns`: a copy of device memory, every byte read and written.
+//! - `launch_ns`: what a dispatch adds to its work in a chain of dependent
+//!   ones submitted as serving submits them (a captured graph, one command
+//!   buffer, one encoder): a chain of `n` tiny kernels, each reading the one
+//!   before's output, against one kernel doing the chain's whole work, at
+//!   each `n` of [`LAUNCH_CHAINS`] ([`launch_from`]). Where a backend
+//!   overlaps its launches the gap comes out small; where it serializes
+//!   them, it is what each adds.
 
-/// The rows the matmul curve is measured at: powers of two from 16 (a
-/// decode fire's few lanes, one register or coopmat tile) to 8192 (past the
-/// widest rung a load lays on any device today, where every device's
-/// matmul is compute bound).
-pub const LATTICE_ROWS: [u32; 10] = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192];
+/// The bytes the rates step lays on the device at once, at most, for a
+/// largest fire of `top` rows: the largest of the warm-up's planes and
+/// operands, one grid shape's rotation and operands, one attention point's
+/// cold sets, one scan point's cold sets, and the copy's two buffers. What
+/// the step's device binds, so it needs no load budget.
+#[must_use]
+pub fn step_bytes(top: u32) -> u64 {
+    let bf16 = |elements: u64| elements * 2;
+    let (wm, wn, wk) = WARM_SHAPE;
+    let warm = bf16(u64::from(wm) * u64::from(wk))
+        + weights_at(wn, wk) as u64 * bf16(u64::from(wn) * u64::from(wk))
+        + bf16(u64::from(wm) * u64::from(wn));
+    let rows = u64::from(top.max(1));
+    let grid = DEPTHS
+        .iter()
+        .flat_map(|&k| DEPTHS.iter().map(move |&n| (n, k)))
+        .map(|(n, k)| {
+            bf16(rows * u64::from(k))
+                + weights_at(n, k) as u64 * bf16(u64::from(n) * u64::from(k))
+                + bf16(rows * u64::from(n))
+        })
+        .max()
+        .unwrap_or(0);
+    let attn = ATTN_DIMS
+        .iter()
+        .flat_map(|&d| {
+            ATTN_KEYS
+                .iter()
+                .map(move |&keys| ATTN_SHAPE.at(keys).with_dim(d))
+        })
+        .map(|s| {
+            let q = u64::from(s.rows) * u64::from(s.q_heads * s.head_dim);
+            let kv = 2 * u64::from(s.keys) * u64::from(s.kv_heads * s.head_dim);
+            attn_sets_at(s) as u64 * bf16(q + kv) + bf16(q)
+        })
+        .max()
+        .unwrap_or(0);
+    let scan = SCAN_TOKENS
+        .iter()
+        .map(|&t| {
+            let s = SCAN_SHAPE.at(t);
+            let rows = u64::from(s.tokens) * u64::from(s.channels());
+            let state = u64::from(s.conv_width * s.channels() + s.v_heads * s.k_dim * s.v_dim);
+            scan_sets_at(s) as u64 * (bf16(rows) + 4 * state) + bf16(rows) * 2
+        })
+        .max()
+        .unwrap_or(0);
+    let copy = 2 * (256u64 << 20);
+    warm.max(grid).max(attn).max(scan).max(copy)
+}
 
 /// The depths the matmul grid is measured at (its columns the same): the
 /// contractions of the dense layers served, from a small model's 1024
@@ -37,11 +93,11 @@ pub const LATTICE_ROWS: [u32; 10] = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096
 /// contraction feeds fewer tiles).
 pub const DEPTHS: [u32; 5] = [1024, 2048, 4096, 8192, 16384];
 
-/// The flops of one matmul of `rows` at `depth` (its columns the same):
-/// two a multiply-add.
+/// The flops of one matmul of `rows`, `n` columns and depth `k`: two a
+/// multiply-add.
 #[must_use]
-pub fn gemm_flops(rows: u32, depth: u32) -> f64 {
-    2.0 * f64::from(rows) * f64::from(depth) * f64::from(depth)
+pub fn gemm_flops(rows: u32, n: u32, k: u32) -> f64 {
+    2.0 * f64::from(rows) * f64::from(n) * f64::from(k)
 }
 
 /// The bytes of weight planes a matmul's timed fires rotate through at
@@ -51,12 +107,12 @@ pub fn gemm_flops(rows: u32, depth: u32) -> f64 {
 /// its rates there moved 4% run to run.
 pub const WEIGHT_BYTES: usize = 768 << 20;
 
-/// The weight planes the timed matmuls at depth `k` rotate through:
-/// [`WEIGHT_BYTES`] of `k x k` bf16 planes, and never fewer than 12, so each
-/// reads its weight from device memory as a layer's does.
+/// The weight planes the timed matmuls of `n` columns at depth `k` rotate
+/// through: [`WEIGHT_BYTES`] of `n x k` bf16 planes, and never fewer than
+/// 12, so each reads its weight from device memory as a layer's does.
 #[must_use]
-pub fn weights_at(k: u32) -> usize {
-    let plane = k as usize * k as usize * 2;
+pub fn weights_at(n: u32, k: u32) -> usize {
+    let plane = n as usize * k as usize * 2;
     WEIGHT_BYTES.div_ceil(plane.max(1)).max(12)
 }
 
@@ -89,6 +145,123 @@ pub fn operand_pattern() -> Vec<u8> {
         bytes.extend_from_slice(&((v.to_bits() >> 16) as u16).to_le_bytes());
     }
     bytes
+}
+
+/// The dispatches one timed fire of each micro-fire issues: what
+/// [`rate_from`] takes their launches off for. A matmul, an attention and a
+/// copy are one each; a scan is its conv and its scan.
+pub const GEMM_DISPATCHES: u32 = 1;
+pub const ATTN_DISPATCHES: u32 = 1;
+pub const SCAN_DISPATCHES: u32 = 2;
+pub const COPY_DISPATCHES: u32 = 1;
+
+/// The tolerance two runs of a rates step agree within, and a check's
+/// estimate within the measured best: what [`rate_from`] allows a burst to
+/// fall below its launches before it calls the two a measurement fault.
+/// Defined once, in the profile crate, whose search breaks ties by it.
+pub use profile::AGREEMENT;
+
+/// The rate a timed fire comes to once its dispatches' launches are off:
+/// `work / (burst_ns − dispatches · launch_ns)`, `burst_ns` one fire's time
+/// (its `dispatches` back to back), `work` its flops, bytes or elements.
+/// The estimate adds a launch a dispatch to the work at this rate
+/// (`crate::load::FireEstimate`), so a rate holding its launches would count
+/// them twice. A fire no longer than its launches is gap-bound: its work
+/// unmeasurable at that size, stated as an infinite rate (no work, the
+/// dispatch priced at its launch alone). One shorter than its launches by
+/// more than [`AGREEMENT`] means the launch probe and the burst disagree,
+/// and `what` is refused by name.
+pub fn rate_from(
+    what: &str,
+    burst_ns: f64,
+    dispatches: u32,
+    launch_ns: f64,
+    work: f64,
+) -> Result<f64, String> {
+    let launches = f64::from(dispatches) * launch_ns;
+    let left = burst_ns - launches;
+    if left > 0.0 {
+        return Ok(work / left);
+    }
+    if burst_ns < launches * (1.0 - AGREEMENT) {
+        return Err(format!(
+            "{what}: a fire of {dispatches} dispatches took {burst_ns:.0} ns, below their \
+             launches ({launch_ns:.0} ns each) by more than {:.0}%: the launch probe and the \
+             burst disagree, so neither is a measurement",
+            AGREEMENT * 100.0
+        ));
+    }
+    Ok(f64::INFINITY)
+}
+
+/// The chain lengths the launch probe runs: a few dozen dispatches (a
+/// layer's) and a thousand (a fire's), whose gaps should agree.
+pub const LAUNCH_CHAINS: [u32; 2] = [64, 1024];
+
+/// A dispatch's launch from a chain of `n` dependent kernels taking
+/// `chain_ns` against one kernel doing the chain's whole work in `one_ns`:
+/// what each dispatch adds, `(chain − one) / n`, never below nothing.
+#[must_use]
+pub fn launch_from(chain_ns: f64, one_ns: f64, n: u32) -> f64 {
+    ((chain_ns - one_ns) / f64::from(n.max(1))).max(0.0)
+}
+
+/// The matmul every backend's rates step warms the device with before it
+/// times anything ([`warm_up`]): the widest the grid times, `m x n x k`.
+pub const WARM_SHAPE: (u32, u32, u32) = (8192, 8192, 8192);
+
+/// How a warm-up ended: the rotations of [`WARM_SHAPE`] over its
+/// [`weights_at`] planes it ran, and the rate (flops a ns) of the last.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Warmed {
+    pub rotations: u32,
+    pub rate: f64,
+}
+
+/// Warm the device until its clock stops falling: run `rotation` (one
+/// rotation of [`WARM_SHAPE`] back to back over its [`weights_at`] planes,
+/// returning its rate) while each rotation's rate is below the one before
+/// it (the clock still sinking under its power cap), and stop at the first
+/// rotation that is not slower than its predecessor (the descent over).
+/// Every backend's rates step calls it first, so its timings start on a
+/// settled clock rather than a cold one.
+pub fn warm_up<E>(mut rotation: impl FnMut() -> Result<f64, E>) -> Result<Warmed, E> {
+    let mut last = rotation()?;
+    let mut rotations = 1;
+    loop {
+        let rate = rotation()?;
+        rotations += 1;
+        if rate >= last {
+            return Ok(Warmed { rotations, rate });
+        }
+        last = rate;
+    }
+}
+
+/// The order a rates step times `len` points in: a fixed stride through
+/// them ([`attn_page_order`]'s), not ascending, so a drift left after the
+/// warm-up spreads over the grid rather than biasing its widest rows.
+#[must_use]
+pub fn spread_order(len: usize) -> Vec<usize> {
+    attn_page_order(u32::try_from(len).unwrap_or(u32::MAX))
+        .into_iter()
+        .map(|i| i as usize)
+        .collect()
+}
+
+/// The bytes of q, k and v sets an attention's timed fires rotate through
+/// at least: [`WEIGHT_BYTES`]' bound, past every last-level cache, since a
+/// served fire reads each layer's kv (and its q) cold.
+pub const ATTN_SET_BYTES: usize = WEIGHT_BYTES;
+
+/// The q / k / v sets the timed attentions of `shape` rotate through:
+/// [`ATTN_SET_BYTES`] of the shape's q rows and k and v keys (bf16), and
+/// never fewer than 2.
+#[must_use]
+pub fn attn_sets_at(shape: AttnShape) -> usize {
+    let q = shape.rows as usize * (shape.q_heads * shape.head_dim) as usize;
+    let kv = 2 * shape.keys as usize * (shape.kv_heads * shape.head_dim) as usize;
+    ATTN_SET_BYTES.div_ceil(((q + kv) * 2).max(1)).max(2)
 }
 
 /// A prefill attention the attention rate is timed at.
@@ -205,7 +378,30 @@ pub struct ScanShape {
     pub conv_width: u32,
 }
 
+/// The prompt lengths the scan curve is measured at: the attention's keys
+/// (a scan's rate a token grows with the chunk it walks, as a paged
+/// attention's with its keys).
+pub const SCAN_TOKENS: [u32; 6] = ATTN_KEYS;
+
+/// The scan sets the timed scans of `shape` rotate through: [`ATTN_SET_BYTES`]
+/// of the shape's input rows (bf16) and its conv and scan state (f32), and
+/// never fewer than 2, so each reads its state cold as a served layer's.
+#[must_use]
+pub fn scan_sets_at(shape: ScanShape) -> usize {
+    let rows = shape.tokens as usize * shape.channels() as usize * 2;
+    let state = 4
+        * (shape.conv_width as usize * shape.channels() as usize
+            + (shape.v_heads * shape.k_dim * shape.v_dim) as usize);
+    ATTN_SET_BYTES.div_ceil((rows + state).max(1)).max(2)
+}
+
 impl ScanShape {
+    /// This shape's heads over a prompt of `tokens`.
+    #[must_use]
+    pub fn at(self, tokens: u32) -> ScanShape {
+        ScanShape { tokens, ..self }
+    }
+
     /// The conv's channels: the scan's `qkv` row, its keys and queries and
     /// its values.
     #[must_use]
@@ -254,7 +450,7 @@ pub fn tuned(rates: &profile::fire::Rates) -> String {
 pub fn provenance(backend: &str, how: &str) -> (&'static str, String) {
     let text = format!(
         "pie tune {backend} --rates on {} (pie {}): {how}; at engine::rates' lattice (matmul \
-         m x k x k, m 16..8192, k 1024..16384; attention keys x keys, keys 512..16384, {}/{} \
+         m x n x k, m the rung lattice, n and k 1024..16384; attention keys x keys, keys 512..16384, {}/{} \
          heads of 64..256; scan {} tokens, {}/{} heads of {}x{}, conv {})",
         today(),
         env!("CARGO_PKG_VERSION"),
@@ -300,18 +496,22 @@ mod tests {
 
     #[test]
     fn the_lattice_ascends_and_the_counts_are_the_estimates() {
-        assert!(LATTICE_ROWS.windows(2).all(|w| w[0] < w[1]));
+        assert!(step_bytes(10240) >= 6 << 30, "a 16384^2 rotation");
         assert!(DEPTHS.windows(2).all(|w| w[0] < w[1]));
-        assert_eq!(weights_at(1024), 384);
-        assert_eq!(weights_at(8192), 12);
-        assert_eq!(weights_at(16384), 12);
+        assert_eq!(weights_at(1024, 1024), 384);
+        assert_eq!(weights_at(16384, 1024), 24);
+        assert_eq!(weights_at(8192, 8192), 12);
+        assert_eq!(weights_at(16384, 16384), 12);
         assert_eq!(DEPTHS.last(), Some(&16384));
-        assert_eq!(gemm_flops(16, 1024), 2.0 * 16.0 * 1024.0 * 1024.0);
+        assert_eq!(gemm_flops(16, 2048, 1024), 2.0 * 16.0 * 2048.0 * 1024.0);
         // 4 · 2048 · 2048 · 16 · 128.
         assert_eq!(attn_flops(ATTN_SHAPE), 4.0 * 2048.0 * 2048.0 * 2048.0);
         // 2048 tokens · 16 heads · 128 · 128.
         assert_eq!(scan_elements(SCAN_SHAPE), 2048.0 * 16.0 * 16384.0);
         assert_eq!(SCAN_SHAPE.channels(), 6144);
+        assert_eq!(SCAN_SHAPE.at(512).tokens, 512);
+        assert!(scan_sets_at(SCAN_SHAPE.at(512)) >= 2);
+        assert!(scan_sets_at(SCAN_SHAPE.at(512)) > scan_sets_at(SCAN_SHAPE.at(16384)));
         assert!(ATTN_KEYS.windows(2).all(|w| w[0] < w[1]));
         for pages in [1, 2, 7, 32, 1024, 7919, 15838] {
             let mut order = attn_page_order(pages);
@@ -327,6 +527,10 @@ mod tests {
         assert_eq!(&attn_page_order(32)[..4], &[0, 15, 30, 13]);
         assert_eq!(ATTN_SHAPE.at(512).rows, 512);
         assert!(ATTN_DIMS.windows(2).all(|w| w[0] < w[1]));
+        // 512 keys at d 64: 1 MiB of q, 1 MiB of k and v; 16384 at 256: 256
+        // MiB, three sets past 768 MiB.
+        assert_eq!(attn_sets_at(ATTN_SHAPE.at(512).with_dim(64)), 384);
+        assert_eq!(attn_sets_at(ATTN_SHAPE.at(16384).with_dim(256)), 3);
         assert_eq!(ATTN_SHAPE.at(512).with_dim(256).head_dim, 256);
         assert_eq!(
             attn_flops(ATTN_SHAPE.at(512).with_dim(256)),
@@ -351,6 +555,64 @@ mod tests {
     }
 
     #[test]
+    fn a_rate_holds_no_launches() {
+        // A large fire: 1 ms over a 2 us launch, its rate barely moved.
+        let rate = rate_from("big", 1_000_000.0, 1, 2000.0, 1e9).unwrap();
+        assert!((rate - 1e9 / 998_000.0).abs() < 1e-9);
+        // A small one the gap dominates: 3 us of a 2 us launch is 1 us of
+        // work, not 3.
+        assert_eq!(rate_from("small", 3000.0, 1, 2000.0, 1000.0).unwrap(), 1.0);
+        // A scan's two dispatches both come off.
+        assert_eq!(rate_from("scan", 5000.0, 2, 2000.0, 1000.0).unwrap(), 1.0);
+        // No longer than its launch (within the agreement): gap-bound.
+        assert_eq!(
+            rate_from("tiny", 1950.0, 1, 2000.0, 10.0).unwrap(),
+            f64::INFINITY
+        );
+        // Far below it: the two disagree, refused by name.
+        let err = rate_from("matmul 16x1024x1024", 1000.0, 1, 2000.0, 10.0).unwrap_err();
+        assert!(
+            err.starts_with("matmul 16x1024x1024: a fire of 1 dispatches"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_launch_is_what_each_dependent_dispatch_adds() {
+        // 64 dispatches over 1 ms of work in 1.112 ms: 1.75 us each.
+        assert!((launch_from(1_112_000.0, 1_000_000.0, 64) - 1750.0).abs() < 1e-6);
+        // A chain no slower than its one kernel: no gap.
+        assert_eq!(launch_from(990.0, 1000.0, 64), 0.0);
+        assert!(LAUNCH_CHAINS.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn the_warm_up_runs_until_its_rate_stops_falling() {
+        // A clock sinking 100, 96, 93, 92 then holding: four rotations to
+        // the first not slower than the one before.
+        let mut rates = [100.0, 96.0, 93.0, 92.0, 92.5, 80.0].into_iter();
+        let warmed = warm_up(|| Ok::<f64, ()>(rates.next().unwrap())).unwrap();
+        assert_eq!((warmed.rotations, warmed.rate), (5, 92.5));
+        // A warm device: two rotations.
+        let mut rates = [100.0, 100.0].into_iter();
+        assert_eq!(
+            warm_up(|| Ok::<f64, ()>(rates.next().unwrap()))
+                .unwrap()
+                .rotations,
+            2
+        );
+    }
+
+    #[test]
+    fn the_points_are_timed_in_a_spread_order() {
+        let order = spread_order(250);
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..250).collect::<Vec<usize>>());
+        assert!(!order.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
     fn the_date_is_the_civil_one() {
         assert_eq!(civil(0), (1970, 1, 1));
         assert_eq!(civil(20_408), (2025, 11, 16));
@@ -360,17 +622,20 @@ mod tests {
     #[test]
     fn the_writer_writes_what_the_profile_reads() {
         let rates = profile::fire::Rates {
-            bf16_flops_per_ns_by_rows_and_depth: Some(vec![(16, 1024, 100.0), (8192, 1024, 900.5)]),
+            bf16_flops_per_ns_by_rows_n_k: Some(vec![
+                (16, 2048, 1024, 100.0),
+                (8192, 2048, 1024, 900.5),
+            ]),
             attn_flops_per_ns_by_keys_and_dim: Some(vec![(512, 128, 40.0), (16384, 128, 50.0)]),
-            scan_elements_per_ns: Some(7.0),
+            scan_elements_per_ns_by_tokens: Some(vec![(2048, 7.0)]),
             bytes_per_ns: Some(800.0),
             launch_ns: Some(3500),
         };
         assert_eq!(
             tuned(&rates),
-            "[rates]\nbf16_flops_per_ns_by_rows_and_depth = [\n  [16, 1024, 100.0],\n  [8192, 1024, \
-             900.5],\n]\n\
-             attn_flops_per_ns_by_keys_and_dim = [\n  [512, 128, 40.0],\n  [16384, 128, 50.0],\n]\nscan_elements_per_ns = 7.0\nbytes_per_ns = 800.0\n\
+            "[rates]\nbf16_flops_per_ns_by_rows_n_k = [\n  [16, 2048, 1024, 100.0],\n  [8192, 2048, \
+             1024, 900.5],\n]\n\
+             attn_flops_per_ns_by_keys_and_dim = [\n  [512, 128, 40.0],\n  [16384, 128, 50.0],\n]\nscan_elements_per_ns_by_tokens = [[2048, 7.0]]\nbytes_per_ns = 800.0\n\
              launch_ns = 3500\n"
         );
         let (key, text) = provenance("vulkan", "the matmul through Coopmat");

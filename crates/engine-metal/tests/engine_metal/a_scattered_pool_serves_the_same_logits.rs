@@ -80,7 +80,7 @@ pub(super) fn seeded_bf16(name: &str, count: usize) -> Vec<f32> {
 }
 
 /// `trace`'s checkpoint planes seeded by name, by name.
-fn seeded(trace: &Trace) -> Vec<(String, Vec<u64>, ztensor::Leaf, Vec<u8>)> {
+pub(super) fn seeded(trace: &Trace) -> Vec<(String, Vec<u64>, ztensor::Leaf, Vec<u8>)> {
     let mut out = Vec::new();
     let mut planes: Vec<_> = trace
         .params
@@ -345,7 +345,6 @@ pub(super) fn load_near(fixture: &Fixture, context: u32, chunk: Option<u64>) -> 
         profiles: None,
         top: engine_metal::Top::EveryRung,
     })
-    .and_then(|mut shell| shell.raise_whole().map(|()| shell))
     .unwrap_or_else(|why| panic!("the shell loads: {why}"))
 }
 

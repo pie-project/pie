@@ -75,6 +75,8 @@ pub fn rung_facts(
             padded_rows: c.padded_rows,
             span_bytes: u64::from(c.chunks) * chunk_bytes,
             infeasible: (c.chunks > per_buffer).then_some(PAST_ONE_BUFFER),
+            // One fire carries every lane the budget seats.
+            fire_lanes: max_lanes,
         })
         .collect()
 }
@@ -175,7 +177,12 @@ mod tests {
             "{err}"
         );
         let rated = profile::fire::Rates {
-            bf16_flops_per_ns_by_rows_and_depth: Some(vec![(4096, 4096, 5000.0)]),
+            bf16_flops_per_ns_by_rows_n_k: Some(
+                (0..=14)
+                    .map(|i| 1u32 << i)
+                    .map(|m| (m, 4096, 4096, 5000.0))
+                    .collect(),
+            ),
             attn_flops_per_ns_by_keys_and_dim: Some(vec![(2048, 128, 2000.0)]),
             bytes_per_ns: Some(400.0),
             launch_ns: Some(5000),

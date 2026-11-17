@@ -486,7 +486,10 @@ pub fn rates(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Outco
     let name = device.name().to_string();
     let facts = crate::chip::measured(&device, crate::chip::perf_cores());
     let (base, report) = crate::chip::resolve(&name, &facts, profiles);
-    say(&format!("{name}: measuring the rates, starting from {}", report.used));
+    say(&format!(
+        "{name}: measuring the rates, starting from {}",
+        report.used
+    ));
     let rates = crate::rates::measure(&device, base.clone(), say)?;
     let tuned = engine::rates::tuned(&rates);
     let seconds = began.elapsed().as_secs_f64();
@@ -498,7 +501,9 @@ pub fn rates(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Outco
         engine::rates::provenance(
             "metal",
             "each kernel through the dispatch serving runs, back to back in 20 ms frames \
-             timed by the GPU, the matmul over engine::rates::weights_at planes",
+             timed by the GPU, the matmul over engine::rates::weights_at planes, attention \
+             over engine::rates::attn_sets_at sets; operands: \
+             engine::rates' pattern",
         ),
         ("from", format!("\"{}\"", report.used)),
         ("pie", format!("\"{}\"", env!("CARGO_PKG_VERSION"))),
@@ -567,8 +572,6 @@ fn serve(artifact: &Path, deployment: &str, device: &str, file: &str) -> Result<
         top: crate::Top::EveryRung,
     })
     .map_err(|e| e.to_string())?;
-    // No runtime raises the rung here: the widest carve is backed.
-    shell.raise_whole().map_err(|e| e.to_string())?;
     // Time the load as it serves, not the GPU-alone stretch before the
     // Neural Engine's programs compile.
     let mut refused = None;
@@ -655,7 +658,7 @@ fn serve(artifact: &Path, deployment: &str, device: &str, file: &str) -> Result<
 
 /// How far the estimate's pick may fall short of the measured-best rung:
 /// its score, under the measured times, within this share of the best's.
-pub const CHECK_BOUND: f64 = 0.05;
+pub const CHECK_BOUND: f64 = engine::rates::AGREEMENT;
 
 /// The fire size `--check-estimate` lays its rungs up to: what a served
 /// Metal load asks (`max_lanes`, `max_tokens`).
@@ -663,7 +666,13 @@ const CHECK_FIRE: (u32, u32) = (256, 2048);
 
 /// The kinds of work a fire's time is told in: what each kernel does by
 /// its entrypoint.
-const KINDS: [&str; 5] = ["gemm", "attention", "recurrent", "norm+elementwise", "other"];
+const KINDS: [&str; 5] = [
+    "gemm",
+    "attention",
+    "recurrent",
+    "norm+elementwise",
+    "other",
+];
 
 fn kind_of(entrypoint: &str) -> usize {
     let e = entrypoint.to_ascii_lowercase();
@@ -671,16 +680,24 @@ fn kind_of(entrypoint: &str) -> usize {
     // (`sdpa_mpp_*`), and its visits read the kv pages (`sdpa_visit_*`).
     if e.starts_with("attn") || e.starts_with("sdpa") || e.contains("flash") {
         1
-    } else if ["gemm", "gemv", "qmm", "mpp", "matmul", "moe_"].iter().any(|k| e.contains(k)) {
-        0
-    } else if ["gdn", "conv", "scan", "delta", "rs_", "recur", "ssm", "chunk_"]
+    } else if ["gemm", "gemv", "qmm", "mpp", "matmul", "moe_"]
         .iter()
         .any(|k| e.contains(k))
     {
+        0
+    } else if [
+        "gdn", "conv", "scan", "delta", "rs_", "recur", "ssm", "chunk_",
+    ]
+    .iter()
+    .any(|k| e.contains(k))
+    {
         2
-    } else if ["norm", "rope", "silu", "gelu", "swiglu", "add", "mul", "act", "residual", "copy", "cast", "softmax", "sigmoid", "gate"]
-        .iter()
-        .any(|k| e.contains(k))
+    } else if [
+        "norm", "rope", "silu", "gelu", "swiglu", "add", "mul", "act", "residual", "copy", "cast",
+        "softmax", "sigmoid", "gate",
+    ]
+    .iter()
+    .any(|k| e.contains(k))
     {
         3
     } else {
@@ -770,7 +787,6 @@ fn check_one(
             top: crate::Top::EveryRung,
         })
         .map_err(|e| e.to_string())?;
-        shell.raise_whole().map_err(|e| e.to_string())?;
         // No runtime commits the pool here: a bounded pool's every whole
         // segment under the activation span is committed, as a runtime does
         // once the state its lanes hold reaches it (a slot a lane's records,
@@ -803,10 +819,11 @@ fn check_one(
     // on a fresh slot; up to them, a lane a token, each on a fresh slot of
     // its own (a second shell, of a slot a lane).
     let max_lanes = rungs.iter().map(|r| r.lanes).max().unwrap_or(1);
-    let (decode, prompts): (Vec<u32>, Vec<u32>) = rungs
-        .iter()
-        .map(|r| r.tokens)
-        .partition(|&w| rungs.iter().any(|r| r.tokens == w && r.decode_shaped()));
+    let (decode, prompts): (Vec<u32>, Vec<u32>) = rungs.iter().map(|r| r.tokens).partition(|&w| {
+        rungs
+            .iter()
+            .any(|r| r.tokens == w && r.check_fire().lanes > 1)
+    });
     say(&format!(
         "{model}: timing a fire at each rung, prompt-shaped {prompts:?}, decode-shaped {decode:?} \
          (a lane a token, each on a fresh slot, up to {max_lanes})"
@@ -864,7 +881,8 @@ fn check_one(
         }
         Ok((width, by_kind, dispatches, rows))
     };
-    let mut measured = search::time_fires(&prompts, |width, _| prompt_fire(&mut shell, width), say)?;
+    let mut measured =
+        search::time_fires(&prompts, |width, _| prompt_fire(&mut shell, width), say)?;
     let mut dissected = Vec::new();
     for &width in &prompts {
         dissected.push(dissect(&mut shell, width, &prompt_fire)?);
@@ -909,7 +927,7 @@ fn check_one(
          {:.2} GB\n  rung  measured  estimated | est (ms): launch work weights flops \
          readout attn kv recur elem | device by kind (ms, dispatches timed alone): {}  dispatches  sum  \
          wall-sum\n",
-        e.flops_per_ns(8192, 4096),
+        e.flops_per_ns(8192, 4096, 4096),
         e.bytes_per_ns,
         e.launch_ns,
         e.dense_bytes as f64 / 1e9,

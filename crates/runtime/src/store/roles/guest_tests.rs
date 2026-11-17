@@ -15,9 +15,8 @@ use ::engine::chunk::{
     SlotRole, SlotShape,
 };
 use ::engine::{
-    BindExtents, BoundInstance, Engine, FrameSubmission, FrameTicket, GuestState,
-    InstanceBinding, InstanceId, LoadRequest, Loaded, ProgramFacts, ProgramId, Rebind,
-    ScratchPlace,
+    BindExtents, BoundInstance, Engine, FrameSubmission, FrameTicket, GuestState, InstanceBinding,
+    InstanceId, LoadRequest, Loaded, ProgramFacts, ProgramId, Rebind, ScratchPlace,
 };
 
 use super::{Owner, Roles, RolesError, RolesHandle, bind_instance, learn_program};
@@ -153,6 +152,15 @@ fn pools_of(facts: ChunkFacts) -> Pools {
     }
 }
 
+/// The refusal `error` names: the room a bind found short, whether it
+/// waits for room given back (`RolesError::BindShort`) or is refused.
+fn short_of(error: &anyhow::Error) -> Option<&RolesError> {
+    match error.downcast_ref::<RolesError>() {
+        Some(RolesError::BindShort(short)) => Some(short),
+        other => other,
+    }
+}
+
 /// Bytes the pool's slots hold for live state.
 fn held(pool: &Shared) -> u64 {
     pool.lock().unwrap().pool().demand().live
@@ -199,7 +207,11 @@ impl Engine for GuestEngine {
         Ok(ProgramFacts::default())
     }
 
-    fn guest_state(&self, _program: ProgramId, _extents: &BindExtents) -> ::engine::Result<GuestState> {
+    fn guest_state(
+        &self,
+        _program: ProgramId,
+        _extents: &BindExtents,
+    ) -> ::engine::Result<GuestState> {
         Ok(self.state)
     }
 
@@ -261,7 +273,10 @@ fn a_one_lane_prefill_reaches_the_top_rung_with_a_program_bound() {
         let pool = device.lock().unwrap();
         let limit = pool.pool().live_limit();
         assert_eq!(limit, 64 - 12, "the top rung's span lies above it");
-        for chunk in chunks(&binding.scratch).into_iter().chain(chunks(&binding.pair)) {
+        for chunk in chunks(&binding.scratch)
+            .into_iter()
+            .chain(chunks(&binding.pair))
+        {
             assert!(
                 pool.pool().physical(chunk).unwrap() < limit,
                 "the program's state lies below the span"
@@ -284,8 +299,9 @@ fn a_one_lane_prefill_reaches_the_top_rung_with_a_program_bound() {
 }
 
 /// 256 bound instances of a program holding 11.2 MB each are counted at
-/// their binds, a run of 2735 slots each (one a chunk: two do not fit one)
-/// beside the pair's, and take state's room as any state does; the 257th
+/// their binds, a whole chunk each (past half a chunk's slots: a run of
+/// them would need a chunk nearly empty) beside the pair's run, and take
+/// state's room as any state does; the 257th
 /// finds no chunk with the run free and is refused by name, nothing taken.
 #[test]
 fn two_hundred_fifty_six_instances_are_counted_at_bind_and_the_257th_is_refused() {
@@ -297,14 +313,22 @@ fn two_hundred_fifty_six_instances_are_counted_at_bind_and_the_257th_is_refused(
     for by in 1..=256 {
         bind(&roles, &mut engine, by).unwrap_or_else(|error| panic!("bind {by}: {error}"));
     }
-    let state = (256 * slots(11_200_000) + slots(PAIR)) * SLOT;
-    assert_eq!(held(&device) - before, state, "256 scratch runs and the pair's");
-    assert_eq!(roles.lock().unwrap().device_bytes(), state, "state, counted");
+    let state = 256 * CHUNK + slots(PAIR) * SLOT;
+    assert_eq!(
+        held(&device) - before,
+        state,
+        "256 scratch runs and the pair's"
+    );
+    assert_eq!(
+        roles.lock().unwrap().device_bytes(),
+        state,
+        "state, counted"
+    );
     let error = bind(&roles, &mut engine, 257).expect_err("the pool holds no more");
     let named = error.to_string();
     assert!(
         matches!(
-            error.downcast_ref::<RolesError>(),
+            short_of(&error),
             Some(RolesError::GuestShort {
                 bytes: 11_200_000,
                 ..
@@ -312,8 +336,15 @@ fn two_hundred_fifty_six_instances_are_counted_at_bind_and_the_257th_is_refused(
         ),
         "{named}"
     );
-    assert!(named.contains("scratch") && named.contains("program 7"), "{named}");
-    assert_eq!(held(&device) - before, state, "the refused bind took nothing");
+    assert!(
+        named.contains("scratch") && named.contains("program 7"),
+        "{named}"
+    );
+    assert_eq!(
+        held(&device) - before,
+        state,
+        "the refused bind took nothing"
+    );
     assert_eq!(engine.bindings.len(), 256, "the engine was not asked");
 }
 
@@ -338,12 +369,21 @@ fn the_pair_s_chunks_are_taken_once_and_given_back_at_the_last_close() {
     assert_eq!(held(&device) - before, 2 * CHUNK + 3 * run);
     roles.lock().unwrap().close_instance(ids[0]);
     roles.lock().unwrap().close_instance(ids[1]);
-    assert_eq!(held(&device) - before, 2 * CHUNK + run, "the pair stays with its last");
-    assert!(!roles.lock().unwrap().slots(Owner::Pair(super::FireKey {
-        program: PROGRAM,
-        extents: BindExtents::default(),
-    }))
-    .is_empty());
+    assert_eq!(
+        held(&device) - before,
+        2 * CHUNK + run,
+        "the pair stays with its last"
+    );
+    assert!(
+        !roles
+            .lock()
+            .unwrap()
+            .slots(Owner::Pair(super::FireKey {
+                program: PROGRAM,
+                extents: BindExtents::default(),
+            }))
+            .is_empty()
+    );
     roles.lock().unwrap().close_instance(ids[2]);
     assert_eq!(held(&device), before, "the last close gives the pair back");
 }
@@ -368,7 +408,11 @@ fn a_park_gives_the_scratch_back_whole_and_an_unpark_takes_fresh_chunks() {
         .unwrap()
         .prepare_park(holder(1))
         .expect("the instance and its pair park");
-    assert!(park.copies().is_empty(), "nothing copied: {:?}", park.copies());
+    assert!(
+        park.copies().is_empty(),
+        "nothing copied: {:?}",
+        park.copies()
+    );
     roles.lock().unwrap().commit(park);
     assert_eq!(held(&device), before, "parked: its chunks given back whole");
 
@@ -412,7 +456,10 @@ fn a_park_gives_the_scratch_back_whole_and_an_unpark_takes_fresh_chunks() {
     };
     assert_eq!(*rebound, id);
     let fresh = chunks(scratch);
-    assert!(matches!(scratch, ScratchPlace::Chunks { .. }) && fresh.len() == 2, "{scratch:?}");
+    assert!(
+        matches!(scratch, ScratchPlace::Chunks { .. }) && fresh.len() == 2,
+        "{scratch:?}"
+    );
     assert!(
         matches!(pair_place, ScratchPlace::Run { slots: 1536, .. }),
         "a fresh run: {pair_place:?}"
@@ -494,7 +541,12 @@ fn two_programs_scratch_and_pairs_lie_apart_and_stay_apart_after_a_park() {
         sampler.bindings[0].pair.clone(),
         beam.bindings[0].pair.clone(),
     ];
-    assert!(sampler.bindings.iter().all(|binding| binding.pair == pairs[0]));
+    assert!(
+        sampler
+            .bindings
+            .iter()
+            .all(|binding| binding.pair == pairs[0])
+    );
     assert!(beam.bindings.iter().all(|binding| binding.pair == pairs[1]));
     assert!(matches!(scratch[0], ScratchPlace::Run { .. }));
     assert!(matches!(scratch[3], ScratchPlace::Chunks { .. }));
@@ -714,7 +766,7 @@ fn a_run_is_refused_by_name_where_only_scattered_chunks_are_free() {
     let error = bind_as(&roles, &mut engine, program, 1).expect_err("no run of 3 is free");
     let named = error.to_string();
     assert_eq!(
-        error.downcast_ref::<RolesError>(),
+        short_of(&error),
         Some(&RolesError::GuestShort {
             what: format!(
                 "an instance of {}'s scratch",
@@ -777,10 +829,7 @@ fn mixed_runs_bound_and_closed_then_a_long_run_lands_or_is_refused_by_name() {
                     // Refused by name: a run of chunks, or (run 1, a
                     // chunk's slots) a run of slots, short.
                     assert!(
-                        matches!(
-                            error.downcast_ref::<RolesError>(),
-                            Some(RolesError::GuestShort { .. })
-                        ),
+                        matches!(short_of(&error), Some(RolesError::GuestShort { .. })),
                         "{error}"
                     );
                     refused += 1;
@@ -809,7 +858,7 @@ fn mixed_runs_bound_and_closed_then_a_long_run_lands_or_is_refused_by_name() {
         Err(error) => {
             let named = error.to_string();
             assert_eq!(
-                error.downcast_ref::<RolesError>().map(|error| match error {
+                short_of(&error).map(|error| match error {
                     RolesError::GuestShort { room, .. } => *room,
                     other => panic!("{other}"),
                 }),
@@ -923,7 +972,7 @@ async fn a_guest_bind_short_of_a_run_commits_the_next_segment_and_binds() {
     let named = error.to_string();
     assert!(
         matches!(
-            error.downcast_ref::<RolesError>(),
+            short_of(&error),
             Some(RolesError::GuestShort {
                 room: super::GuestRoom::Runs { committable: 0, .. },
                 ..
@@ -944,4 +993,262 @@ async fn a_guest_bind_short_of_a_run_commits_the_next_segment_and_binds() {
                 .into()
         )
     );
+}
+
+/// More parked guest states come back than the device has room for: four
+/// instances of 11.2 MB (past half a chunk's slots: a whole chunk each)
+/// park, four of another program take their chunks, and every restore then
+/// finds no room. Each unpark short of room the budget holds is a wait
+/// (`RolesError::UnparkShort`), never a failure; as each
+/// of the others completes, one waiting restore comes back, until all four
+/// have.
+#[test]
+fn restores_past_the_free_room_wait_and_all_come_back() {
+    let Pools { roles, .. } = pools(1 + 4 + 1 + 12);
+    let mut engine = GuestEngine::new(11_200_000, PAIR);
+    let mut ids = Vec::new();
+    for by in 1..=4 {
+        ids.push(bind(&roles, &mut engine, by).unwrap());
+    }
+    assert!(
+        engine
+            .bindings
+            .iter()
+            .all(|b| matches!(b.scratch, ScratchPlace::Chunks { run: 1, ref pieces } if pieces.len() == 1)),
+        "a whole chunk each"
+    );
+    for by in 1..=4 {
+        let park = roles
+            .lock()
+            .unwrap()
+            .prepare_park(holder(by))
+            .expect("it parks");
+        roles.lock().unwrap().commit(park);
+    }
+
+    // Another program's four instances take the chunks meanwhile.
+    let mut other = GuestEngine::new(11_200_000, 0);
+    other.next = 100;
+    learn_program(&roles, &mut other, ProgramId(8)).unwrap();
+    let mut others = Vec::new();
+    for by in 5..=8 {
+        let bound = bind_instance(
+            Some(&roles),
+            &mut other,
+            &InstanceBinding {
+                program: ProgramId(8),
+                ..InstanceBinding::default()
+            },
+            Some(holder(by)),
+            |_| false,
+        )
+        .unwrap();
+        others.push(bound.id);
+    }
+    let mut back = 0;
+    for (n, by) in (1..=4).enumerate() {
+        let short = roles
+            .lock()
+            .unwrap()
+            .prepare_unpark(holder(by))
+            .expect_err("no room: it waits");
+        assert!(
+            matches!(short, RolesError::UnparkShort(_)),
+            "a wait, not a failure: {short}"
+        );
+        // One of the others completes: its chunk frees, and the waiting
+        // restore comes back into it.
+        roles.lock().unwrap().close_instance(others[n]);
+        let unpark = roles
+            .lock()
+            .unwrap()
+            .prepare_unpark(holder(by))
+            .expect("room now")
+            .expect("its items unpark");
+        roles.lock().unwrap().commit(unpark);
+        let stale = roles.lock().unwrap().stale(holder(by));
+        for rebind in stale {
+            roles.lock().unwrap().rebound(Owner::of(&rebind));
+        }
+        back += 1;
+    }
+    assert_eq!(back, 4, "every restore came back");
+}
+
+/// More binds than the device has room for, the pool whole: the bind past
+/// the room is a wait (`RolesError::BindShort`), not a refusal, and a watch
+/// taken before it ends once another instance closes; the bind then lands
+/// in the room given back. A state no budget holds is still refused.
+#[tokio::test(flavor = "current_thread")]
+async fn a_bind_past_the_room_waits_for_room_given_back() {
+    let Pools { roles, .. } = pools(1 + 4 + 12);
+    let mut engine = GuestEngine::new(11_200_000, 0);
+    let mut ids = Vec::new();
+    for by in 1..=4 {
+        ids.push(bind(&roles, &mut engine, by).unwrap());
+    }
+    let watch = roles.lock().unwrap().room_watch();
+    let short = bind(&roles, &mut engine, 5).expect_err("no room");
+    assert!(
+        matches!(
+            short.downcast_ref::<RolesError>(),
+            Some(RolesError::BindShort(_))
+        ),
+        "a wait, not a refusal: {short}"
+    );
+    let freed = watch.clone().freed();
+    tokio::pin!(freed);
+    assert!(
+        futures::poll!(freed.as_mut()).is_pending(),
+        "nothing given back yet"
+    );
+    roles.lock().unwrap().close_instance(ids[0]);
+    freed.await;
+    bind(&roles, &mut engine, 5).expect("room given back: it binds");
+
+    // Twenty chunks of state: no budget of this pool holds it.
+    let mut huge = GuestEngine::new(20 * CHUNK, 0);
+    huge.next = 200;
+    learn_program(&roles, &mut huge, ProgramId(9)).unwrap();
+    let refused = bind_instance(
+        Some(&roles),
+        &mut huge,
+        &InstanceBinding {
+            program: ProgramId(9),
+            ..InstanceBinding::default()
+        },
+        Some(holder(9)),
+        |_| false,
+    )
+    .expect_err("refused");
+    assert!(
+        matches!(
+            refused.downcast_ref::<RolesError>(),
+            Some(RolesError::GuestShort { .. })
+        ),
+        "{refused}"
+    );
+}
+
+/// Twelve processes, each binding two programs' instances in turn (the
+/// first held while the second binds, as a prefill's sampler and a
+/// decode's), under a pool whose room fits five instances. A bind short of
+/// room its process holds part of suspends the process (its guest state
+/// parked, given back); one holding none waits for room given back; a
+/// parked process comes back once room is there, else waits. Every process
+/// finishes, none is refused, and at the end the pool holds what it held
+/// before: nothing a park, a restore or a close took stays held.
+#[test]
+fn processes_cycling_through_park_restore_and_finish_all_finish_and_give_back_all() {
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Stage {
+        First,
+        Second,
+        Parked,
+        Done,
+    }
+    let Pools { device, roles } = pools(1 + 5 + 12);
+    let before = held(&device);
+    let mut first = GuestEngine::new(11_200_000, 0);
+    let mut second = GuestEngine::new(11_200_000, 0);
+    second.next = 10_000;
+    learn_program(&roles, &mut first, ProgramId(1)).unwrap();
+    learn_program(&roles, &mut second, ProgramId(2)).unwrap();
+    let bind_of = |roles: &RolesHandle, engine: &mut GuestEngine, program: u64, by: u128| {
+        bind_instance(
+            Some(roles),
+            engine,
+            &InstanceBinding {
+                program: ProgramId(program),
+                ..InstanceBinding::default()
+            },
+            Some(holder(by)),
+            |_| false,
+        )
+        .map(|bound| bound.id)
+    };
+    let n = 12;
+    let mut stage = vec![Stage::First; n];
+    let mut ids: Vec<Vec<InstanceId>> = vec![Vec::new(); n];
+    let (mut parks, mut waits) = (0, 0);
+    for _round in 0..10_000 {
+        if stage.iter().all(|s| *s == Stage::Done) {
+            break;
+        }
+        for p in 0..n {
+            let by = p as u128 + 1;
+            match stage[p] {
+                Stage::Done => {}
+                Stage::Parked => match {
+                    let unparked = roles.lock().unwrap().prepare_unpark(holder(by));
+                    unparked
+                } {
+                    Ok(Some(txn)) => {
+                        roles.lock().unwrap().commit(txn);
+                        let stale = roles.lock().unwrap().stale(holder(by));
+                        for rebind in stale {
+                            roles.lock().unwrap().rebound(Owner::of(&rebind));
+                        }
+                        stage[p] = Stage::Second;
+                    }
+                    Ok(None) => stage[p] = Stage::Second,
+                    Err(RolesError::UnparkShort(_)) => waits += 1,
+                    Err(other) => panic!("process {p}'s restore failed: {other}"),
+                },
+                Stage::First | Stage::Second => {
+                    let (engine, program) = if stage[p] == Stage::First {
+                        (&mut first, 1)
+                    } else {
+                        (&mut second, 2)
+                    };
+                    match bind_of(&roles, engine, program, by) {
+                        Ok(id) => {
+                            ids[p].push(id);
+                            if stage[p] == Stage::First {
+                                stage[p] = Stage::Second;
+                            } else {
+                                // Both bound: it runs to its end, closing both.
+                                for id in ids[p].drain(..) {
+                                    roles.lock().unwrap().close_instance(id);
+                                }
+                                stage[p] = Stage::Done;
+                            }
+                        }
+                        Err(error) => {
+                            assert!(
+                                matches!(short_of_wait(&error), Some(RolesError::BindShort(_))),
+                                "process {p} refused: {error}"
+                            );
+                            if roles.lock().unwrap().holds_guest_state(holder(by)) {
+                                let park = roles
+                                    .lock()
+                                    .unwrap()
+                                    .prepare_park(holder(by))
+                                    .expect("its state parks");
+                                roles.lock().unwrap().commit(park);
+                                stage[p] = Stage::Parked;
+                                parks += 1;
+                            } else {
+                                waits += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        stage.iter().all(|s| *s == Stage::Done),
+        "every process finishes: {stage:?}"
+    );
+    assert!(
+        parks > 0 && waits > 0,
+        "the budget fit few: {parks} parks, {waits} waits"
+    );
+    assert_eq!(held(&device), before, "all given back");
+    assert_eq!(roles.lock().unwrap().device_bytes(), 0);
+}
+
+fn short_of_wait(error: &anyhow::Error) -> Option<&RolesError> {
+    error.downcast_ref::<RolesError>()
 }

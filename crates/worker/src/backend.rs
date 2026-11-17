@@ -78,8 +78,8 @@ impl Fire {
 
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 const METAL_FIRE: Fire = Fire {
-    lanes: 512,
-    tokens: 10240,
+    lanes: runtime::engine::backend::open::METAL_FIRE.0,
+    tokens: runtime::engine::backend::open::METAL_FIRE.1,
 };
 /// The Metal shell has no planner to derive a page from.
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
@@ -91,8 +91,8 @@ const VULKAN_FIRE: Fire = Fire {
 };
 #[cfg(feature = "wgpu")]
 const WGPU_FIRE: Fire = Fire {
-    lanes: 512,
-    tokens: 10240,
+    lanes: runtime::engine::backend::open::WGPU_FIRE.0,
+    tokens: runtime::engine::backend::open::WGPU_FIRE.1,
 };
 #[cfg(feature = "xla")]
 const XLA_FIRE: Fire = Fire {
@@ -155,8 +155,8 @@ fn cuda_budgets(
         .max(page_size);
     engine::Budgets {
         max_lanes: CUDA_FIRE_LANES,
-        // 0: the engine takes its chip's `engine.forward_tokens`, 8192 where
-        // the profile says nothing, and fits the rungs to the card.
+        // 0: the engine takes its fire bound (8192) and fits the rungs to
+        // the card.
         max_tokens: 0,
         buckets: Vec::new(),
         max_adapters: adapter_seats,
@@ -226,9 +226,8 @@ fn dump_device_boot(home: &Path, boot: &DeviceBoot, group_id: usize, rank: Optio
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn land(
-    backend: &mut runtime::engine::EngineBox,
+/// The request a boot loads the model at `snapshot_dir` with.
+fn load_request(
     snapshot_dir: &Path,
     cache_dir: &Path,
     budgets: engine::Budgets,
@@ -236,7 +235,7 @@ fn land(
     platform: poem_ir::Platform,
     frames_in_flight: u8,
     overrides: &runtime::engine::load::Overrides,
-) -> Result<(engine::Loaded, String, Option<PathBuf>)> {
+) -> Result<engine::LoadRequest> {
     let mut request = runtime::engine::load::request(
         overrides,
         snapshot_dir,
@@ -254,6 +253,55 @@ fn land(
             None => dir,
         });
     }
+    Ok(request)
+}
+
+/// The engine boot and load request `pie serve` makes for the model at
+/// `snapshot_dir` on one CUDA device under `home` when its config states
+/// nothing past the model: what `pie tune` loads to time the dense GEMM
+/// products serving runs.
+#[cfg(feature = "engine-cuda")]
+pub fn served_cuda(snapshot_dir: &Path, home: &Path) -> Result<(DeviceBoot, engine::LoadRequest)> {
+    validate_snapshot_dir(snapshot_dir)?;
+    let cache_dir = &crate::disk::engine_cache_dir(home);
+    let boot = device_boot(&CudaEngineOptions::default(), home, cache_dir, None)?;
+    let overrides = runtime::engine::load::Overrides::default();
+    let request = load_request(
+        snapshot_dir,
+        cache_dir,
+        cuda_budgets(
+            config::AdapterConfig::default().seats(),
+            None,
+            declared_context(snapshot_dir, &overrides),
+        ),
+        config::MemoryConfig::default().residency(),
+        poem_ir::Platform::Cuda,
+        u8::try_from(config::RuntimeConfig::default().frame_dispatch_depth).unwrap_or(u8::MAX),
+        &overrides,
+    )?;
+    Ok((boot, request))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn land(
+    backend: &mut runtime::engine::EngineBox,
+    snapshot_dir: &Path,
+    cache_dir: &Path,
+    budgets: engine::Budgets,
+    residency: engine::Residency,
+    platform: poem_ir::Platform,
+    frames_in_flight: u8,
+    overrides: &runtime::engine::load::Overrides,
+) -> Result<(engine::Loaded, String, Option<PathBuf>)> {
+    let request = load_request(
+        snapshot_dir,
+        cache_dir,
+        budgets,
+        residency,
+        platform,
+        frames_in_flight,
+        overrides,
+    )?;
     let deployment = request.trace.name.clone();
     let disk_kv_dir = request.residency.disk_kv_dir.clone();
     let wide = request.trace.nodes.iter().any(|node| {

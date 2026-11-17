@@ -14,14 +14,14 @@ __global__ void swiglu_clamp_routed_e4m3(
     const bf16* __restrict__ packed,
     const float* __restrict__ weights,
     bf16* __restrict__ y,
-    i32 lanes,
+    i64 lanes,
     i32 width,
     float limit,
     i32 fan,
     const u32* __restrict__ win)
 {
     using Block = E4m3Block<128>;
-    const i32 idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const i64 idx = static_cast<i64>(blockIdx.x) * blockDim.x + threadIdx.x;
     const int lane = static_cast<int>(threadIdx.x % 32);
     const long long per_row = width / 8;
     long long live_lanes = lanes;
@@ -73,12 +73,12 @@ __global__ void geglu_tanh(
     const T* __restrict__ gate,
     const T* __restrict__ up,
     T* __restrict__ y,
-    i32 n,
+    i64 n,
     i32 width,
     i32 fan,
     const u32* __restrict__ win)
 {
-    const i32 idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const i64 idx = static_cast<i64>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= n) return;
 
     if (win != nullptr &&
@@ -100,12 +100,12 @@ template <class T, bool RELU2>
 __global__ void act(
     const T* __restrict__ x,
     T* __restrict__ y,
-    i32 n,
+    i64 n,
     i32 width,
     i32 fan,
     const u32* __restrict__ win)
 {
-    const i32 idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const i64 idx = static_cast<i64>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= n) return;
 
     if (win != nullptr &&
@@ -343,13 +343,13 @@ __global__ void swiglu_clamp_lanes(
     const T* __restrict__ up,
     const float* __restrict__ weights,
     T* __restrict__ y,
-    i32 n,
+    i64 n,
     i32 width,
     float limit,
     i32 fan,
     const u32* __restrict__ win)
 {
-    const i32 idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const i64 idx = static_cast<i64>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= n) return;
 
     if (win != nullptr &&

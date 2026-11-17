@@ -390,6 +390,12 @@ impl<B: Serve> Serve for Named<B> {
 
     type Flight = ();
 
+    const ROWS_TOP: u32 = B::ROWS_TOP;
+
+    fn rung_lattice() -> Vec<u32> {
+        B::rung_lattice()
+    }
+
     type Keep = std::convert::Infallible;
 
     const FUSIONS: &'static [poem_compiler::fuse::Rule] = B::FUSIONS;
