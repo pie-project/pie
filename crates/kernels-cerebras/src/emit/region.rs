@@ -63,6 +63,62 @@ pub struct Place {
     pub columns: Option<Vec<u32>>,
 }
 
+/// A decode rotation's anchor period (`srope.csl`'s STEP): positions between two DIRECT
+/// computations advance by one rotation a position in f32. The bound, with `u = 2^-24` (f32's
+/// unit roundoff) and cos / sin of unit size:
+/// - a step's factor `(cos f, sin f)` is the host's, each rounded once: off `e^{if}` by at most
+///   `sqrt 2 u` (in angle and length together);
+/// - its product, two roundings a term and one for the sum, each component off by at most
+///   `(|c| + |s| + 1) u <= (sqrt 2 + 1) u`, the pair by `sqrt 2 (sqrt 2 + 1) u`;
+/// - a step adds at most [`ROPE_STEP_ERR`] `= (sqrt 2 + 2 + sqrt 2) u` ~ 4.83 u, the error
+///   before it carried at length `1 + sqrt 2 u`; the anchor's own (DIRECT's series, its
+///   reduction) is at most [`ROPE_DIRECT_ERR`] (1e-6).
+///
+/// The budget: a sixteenth of the half ulp the region's 16-bit rounding of the rotated row
+/// leaves (fp16, the finer of the two: `2^-11 / 16`), so the drift never moves a rounded
+/// value by more than a sixteenth of its rounding. `E0 + (N - 1) 4.83 u <= 2^-15` holds to
+/// `N - 1 = 102`: the anchor every 64 positions (a power of two: the test a mask).
+/// `rope_anchor_drift_in_budget` emulates it in f32 against f64.
+pub const ROPE_ANCHOR: u32 = rope_anchor();
+pub const ROPE_STEP_ERR: f64 = (2.0 * std::f64::consts::SQRT_2 + 2.0) / 16_777_216.0;
+pub const ROPE_DIRECT_ERR: f64 = 1e-6;
+pub const ROPE_BUDGET: f64 = 1.0 / 32_768.0;
+
+/// The largest power of two `N` with `ROPE_DIRECT_ERR + (N - 1) ROPE_STEP_ERR <= ROPE_BUDGET`.
+const fn rope_anchor() -> u32 {
+    let mut n = 1u32;
+    while ROPE_DIRECT_ERR + (2 * n - 1) as f64 * ROPE_STEP_ERR <= ROPE_BUDGET {
+        n *= 2;
+    }
+    n
+}
+
+/// Most DSD moves a rotation's cos / sin gather is printed as (else a scalar loop over the
+/// slot table).
+const SLOT_RUNS: usize = 8;
+
+/// A rotation's slot gather (`b[e] = rc[slot[e]]` a column) as runs `(e, j, n)`: columns
+/// `e .. e + n` from slots `j .. j + n`, the same runs for every chunk (the chunks share one
+/// code), at most [`SLOT_RUNS`] of them: a NeoX head's halves, two runs a head.
+fn slot_runs(slot_of: &[Vec<f32>]) -> Option<Vec<(usize, usize, usize)>> {
+    let first = slot_of.first()?;
+    if slot_of.iter().any(|m| m != first) {
+        return None;
+    }
+    let mut runs: Vec<(usize, usize, usize)> = Vec::new();
+    for (e, &j) in first.iter().enumerate() {
+        let j = j as usize;
+        match runs.last_mut() {
+            Some((e0, j0, n)) if *e0 + *n == e && *j0 + *n == j => *n += 1,
+            _ => runs.push((e, j, 1)),
+        }
+        if runs.len() > SLOT_RUNS {
+            return None;
+        }
+    }
+    Some(runs)
+}
+
 /// The mates `region`'s static gathers name, each a row over the region's columns (a rotation's
 /// pair mate, a NeoX head's other half).
 #[must_use]
@@ -1102,13 +1158,20 @@ impl Printer<'_> {
         let (lv, bits) = (self.place.rope_lv, self.place.rope_bits);
         let rb = 1usize << bits;
         // rot[base + ((lv rb + d) 2) ns + j]: cos, then sin at + ns (ops/rope.csl)
-        // (BITS 0: the angles computed at the root, the table its frequencies alone: a decode
-        // step's position is any below its cache's, past what tables of digits hold)
+        // (BITS 0: the angles computed at the root, the table its frequencies, then each one's
+        // cos and sin (a position's step, srope's STEP), NS apiece: a decode step's position is
+        // any below its cache's, past what tables of digits hold)
         let rot: Vec<Vec<f32>> = freqs
             .iter()
             .map(|fs| {
                 if bits == 0 {
-                    return fs.clone();
+                    let mut t = vec![0f32; 3 * ns];
+                    for (j, &f) in fs.iter().enumerate() {
+                        t[j] = f;
+                        t[ns + j] = f64::from(f).cos() as f32;
+                        t[2 * ns + j] = f64::from(f).sin() as f32;
+                    }
+                    return t;
                 }
                 let mut t = vec![0f32; lv as usize * rb * 2 * ns];
                 for l in 0..lv as usize {
@@ -1128,6 +1191,7 @@ impl Printer<'_> {
         let pairs = slot_of
             .iter()
             .all(|m| m.iter().enumerate().all(|(e, &j)| j as usize == e / 2));
+        let runs = if pairs { None } else { slot_runs(&slot_of) };
         self.tables.push(Table {
             name: "rot".into(),
             u16: false,
@@ -1138,7 +1202,7 @@ impl Printer<'_> {
             u16: false,
             of_chunk: ranges,
         });
-        if !pairs {
+        if !pairs && runs.is_none() {
             self.tables.push(Table {
                 name: "slot".into(),
                 u16: true,
@@ -1163,6 +1227,15 @@ impl Printer<'_> {
                     let _ = writeln!(
                         code,
                         "  @fmovs(@increment_dsd_offset(@set_dsd_stride(@set_dsd_length(B{buf}, {h}), 2), {o}, f32), @set_dsd_length({src}, {h}));"
+                    );
+                }
+            }
+        } else if let Some(runs) = &runs {
+            for (buf, src) in [(cb, "RC"), (sb, "RS")] {
+                for &(e, j, n) in runs {
+                    let _ = writeln!(
+                        code,
+                        "  @fmovs(@increment_dsd_offset(@set_dsd_length(B{buf}, {n}), {e}, f32), @increment_dsd_offset(@set_dsd_length({src}, {n}), {j}, f32));"
                     );
                 }
             }
@@ -1252,9 +1325,9 @@ impl Printer<'_> {
                 self.place.rope_bits,
                 r.sources,
                 if self.place.rope_bits == 0 {
-                    ", .DIRECT = true"
+                    format!(", .DIRECT = true, .STEP = {ROPE_ANCHOR}")
                 } else {
-                    ""
+                    String::new()
                 }
             );
             if !self.tables.iter().any(|t| t.name == "slot") {
@@ -1437,6 +1510,57 @@ mod tests {
     use super::{ParamAt, Place, print};
     use kernels_ir::Shape;
     use poem_ir::{Operands, Platform};
+
+    /// srope's STEP in f32 as the PE runs it (a DIRECT anchor at each multiple of the period, one
+    /// rotation a position between) stays within the budget less the anchor's own error, against
+    /// f64 at the f32 frequencies (HF's), over 64k positions of three bases' 64 pairs.
+    #[test]
+    fn rope_anchor_drift_in_budget() {
+        let n = super::ROPE_ANCHOR;
+        assert!(n.is_power_of_two() && n >= 2, "{n}");
+        assert_eq!(n, 64);
+        let mut worst = 0f64;
+        for theta in [1e4f32, 5e5, 1e6] {
+            for j in 0..64 {
+                let f = 1.0 / theta.powf(2.0 * j as f32 / 128.0);
+                let (c1, s1) = (f64::from(f).cos() as f32, f64::from(f).sin() as f32);
+                let (mut c, mut s) = (1f32, 0f32);
+                for p in 0u32..65_536 {
+                    let a = f64::from(p) * f64::from(f);
+                    if p % n == 0 {
+                        (c, s) = (a.cos() as f32, a.sin() as f32);
+                    } else {
+                        // srope's advance: a = s s1, b = c s1, c = c c1 - a, s = s c1 + b
+                        let (x, y) = (s * s1, c * s1);
+                        (c, s) = (c * c1 - x, s * c1 + y);
+                    }
+                    let e = (f64::from(c) - a.cos()).hypot(f64::from(s) - a.sin());
+                    worst = worst.max(e);
+                }
+            }
+        }
+        eprintln!("rope drift: worst {worst:.3e} at an anchor every {n}");
+        assert!(
+            worst <= super::ROPE_BUDGET - super::ROPE_DIRECT_ERR,
+            "{worst:e}"
+        );
+    }
+
+    /// A NeoX head's gather is two runs a head; interleaved slots (pairs) or chunks that differ
+    /// are not runs.
+    #[test]
+    fn slot_runs_of_a_neox_head() {
+        let neox: Vec<f32> = (0..256).map(|e| (e % 64) as f32).collect();
+        assert_eq!(
+            super::slot_runs(&[neox.clone(), neox.clone()]),
+            Some(vec![(0, 0, 64), (64, 0, 64), (128, 0, 64), (192, 0, 64)])
+        );
+        let mut other = neox.clone();
+        other.swap(0, 1);
+        assert_eq!(super::slot_runs(&[neox, other]), None);
+        let pairs: Vec<f32> = (0..128).map(|e| (e / 2) as f32).collect();
+        assert_eq!(super::slot_runs(&[pairs]), None);
+    }
 
     /// Every root op of flux2-mini's denoise layers (norms, modulations, residuals, the rotation,
     /// the gated MLP) lowers to a region alone and prints for roots holding a head's chunk; the

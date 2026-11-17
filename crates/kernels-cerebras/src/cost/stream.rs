@@ -62,6 +62,10 @@ pub const ROT_LEVEL: f64 = 152.0;
 /// an element.
 pub const ROT_DIRECT_OPS: f64 = 42.0;
 pub const ROT_DIRECT_OP: f64 = 30.0;
+/// DIRECT's step (`srope.csl`'s STEP): a position one past the last advanced by
+/// [`ROT_STEP_OPS`] DSD operations over the pairs, DIRECT at each multiple of the period (the
+/// rows of one sequence: a step's position the last one's plus one).
+pub const ROT_STEP_OPS: f64 = 6.0;
 /// The row store: a held word cast out or summed back, a hop of the row chain.
 pub const STORE_WORD: f64 = 1.0;
 pub const CHAIN_HOP: f64 = 2.0;
@@ -86,6 +90,8 @@ pub struct RegionFeatures {
     pub rope_bits: f64,
     /// A rotation computed at the root (`srope.csl`'s DIRECT): its pairs (`NROT`); 0 with tables.
     pub rope_direct: f64,
+    /// DIRECT's anchor period (`srope.csl`'s STEP; 0: every position DIRECT).
+    pub rope_step: f64,
 }
 
 impl RegionFeatures {
@@ -108,6 +114,12 @@ impl RegionFeatures {
             if csl[i..].contains(".DIRECT = true") {
                 f.rope_direct = csl[i..]
                     .split(".NROT = ")
+                    .nth(1)
+                    .and_then(|t| t.split(|ch: char| !ch.is_ascii_digit()).next())
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0.0);
+                f.rope_step = csl[i..]
+                    .split(".STEP = ")
                     .nth(1)
                     .and_then(|t| t.split(|ch: char| !ch.is_ascii_digit()).next())
                     .and_then(|n| n.parse().ok())
@@ -167,7 +179,12 @@ impl RegionFeatures {
             return 0.0;
         }
         if self.rope_direct > 0.0 {
-            return ROT_DIRECT_OPS * (ROT_DIRECT_OP + self.rope_direct * DSD_ELEM);
+            let op = ROT_DIRECT_OP + self.rope_direct * DSD_ELEM;
+            if self.rope_step > 1.0 {
+                let n = self.rope_step;
+                return op * (ROT_DIRECT_OPS + (n - 1.0) * ROT_STEP_OPS) / n;
+            }
+            return ROT_DIRECT_OPS * op;
         }
         let d = self.rope_bits.max(1.0).exp2();
         ROT_CHANGE + ROT_LEVEL * d / (d - 1.0)
@@ -676,6 +693,27 @@ mod tests {
             RegionFeatures::of("fn row() void {\n}\n", 128).rotation_advance(),
             0.0
         );
+    }
+
+    /// A decode rotation computed at its root: DIRECT every position, or advanced a position
+    /// and re-anchored every STEP.
+    #[test]
+    fn a_direct_rotation_is_priced_by_its_anchor_period() {
+        let at = |opts: &str| {
+            format!(
+                "const rp = @import_module(\"ops/srope.csl\", .{{ .rot = &T_rot_a, .rc = &rc, \
+                 .rs = &rs, .NROT = 64, .LV = 1, .BITS = 0, .DIRECT = true{opts} }});\n\
+                 fn row() void {{\n  rp.tables(@as(u32, sc2), b, b, n);\n}}\n"
+            )
+        };
+        let op = ROT_DIRECT_OP + 64.0 * DSD_ELEM;
+        let direct = RegionFeatures::of(&at(""), 128);
+        assert_eq!((direct.rope_direct, direct.rope_step), (64.0, 0.0));
+        assert!((direct.rotation_advance() - ROT_DIRECT_OPS * op).abs() < 1e-9);
+        let step = RegionFeatures::of(&at(", .STEP = 64"), 128);
+        assert_eq!(step.rope_step, 64.0);
+        let want = op * (ROT_DIRECT_OPS + 63.0 * ROT_STEP_OPS) / 64.0;
+        assert!((step.rotation_advance() - want).abs() < 1e-9);
     }
 
     /// P7 v1's columns: flux at 1024² (4,608 rows, a q head of 128 a kv head) takes about a
