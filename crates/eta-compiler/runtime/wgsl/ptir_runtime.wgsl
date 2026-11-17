@@ -22,15 +22,16 @@ struct Cfg {
   pad : u32,
 }
 
-// Every binding read_write: an instance's tables and config lie in the
-// pool's slots, in the segment buffers the scratch binds read_write, and a
-// usage scope (WebGPU's) takes one buffer read_write or read-only, not both.
+// The tables are read-only and the config a uniform here; where the API
+// takes one buffer read_write or read-only in a scope, not both (WebGPU),
+// and they lie in the pool segments the scratch binds read_write, the
+// backend binds them read_write (engine-gpu's `READ_ONLY_BINDINGS`).
 @group(0) @binding(0) var<storage, read_write> status  : array<u32>;
-@group(0) @binding(1) var<storage, read_write> descs   : array<u32>;
-@group(0) @binding(2) var<storage, read_write> params  : array<u32>;
-@group(0) @binding(3) var<storage, read_write> offs    : array<u32>;
+@group(0) @binding(1) var<storage, read>       descs   : array<u32>;
+@group(0) @binding(2) var<storage, read>       params  : array<u32>;
+@group(0) @binding(3) var<storage, read>       offs    : array<u32>;
 @group(0) @binding(4) var<storage, read_write> seg0    : array<u32>;
-@group(0) @binding(5) var<storage, read_write> cfg     : Cfg;
+@group(0) @binding(5) var<uniform>             cfg     : Cfg;
 @group(0) @binding(6) var<storage, read_write> seg1    : array<u32>;
 @group(0) @binding(7) var<storage, read_write> seg2    : array<u32>;
 @group(0) @binding(8) var<storage, read_write> seg3    : array<u32>;

@@ -21,11 +21,20 @@ pub enum Slot {
 }
 
 /// The layout every guest stage's pipelines bind (group 0): storage
-/// buffers, the config among them (it lies in the pool's slots).
+/// buffers, the config a uniform.
 #[must_use]
 pub fn stage_layout() -> Vec<(u32, Slot)> {
-    use engine_gpu::guest::session::BINDINGS;
-    (0..BINDINGS).map(|at| (at, Slot::Storage)).collect()
+    use engine_gpu::guest::session::{BINDINGS, CFG_BINDING};
+    (0..BINDINGS)
+        .map(|at| {
+            let slot = if at == CFG_BINDING {
+                Slot::Uniform
+            } else {
+                Slot::Storage
+            };
+            (at, slot)
+        })
+        .collect()
 }
 
 /// The descriptor type a layout binds `slot` as.

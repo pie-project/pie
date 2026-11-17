@@ -12,7 +12,7 @@ use engine_gpu::store::layout::INSTANCE;
 
 use engine_gpu::guest::held::{self, consecutive};
 use engine_gpu::guest::session::{
-    BINDINGS, CFG_BINDING, InstanceLay, PiecePlace, ScoreRows, ScoreSpec, SEGMENT_BINDINGS, StageTables,
+    BINDINGS, CFG_BINDING, READ_ONLY_BINDINGS, InstanceLay, PiecePlace, ScoreRows, ScoreSpec, SEGMENT_BINDINGS, StageTables,
     groups_for, lay_program, piece_places, place_table, score_rows,
 };
 
@@ -609,6 +609,16 @@ fn bind_layout(core: &Core) -> wgpu::BindGroupLayout {
         })
 }
 
+/// `code` with the bindings the runtime only reads declared read_write
+/// (`READ_ONLY_BINDINGS`): a WebGPU scope takes the pool's segments, where
+/// the tables and config lie, read_write for the scratch, and one buffer
+/// one way only.
+fn read_write(code: &str) -> String {
+    READ_ONLY_BINDINGS
+        .iter()
+        .fold(code.to_string(), |code, (read, written)| code.replace(read, written))
+}
+
 fn build_pipelines(
     core: &Arc<Core>,
     pipeline_layout: &wgpu::PipelineLayout,
@@ -623,7 +633,7 @@ fn build_pipelines(
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("pie guest"),
-                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&lowered.code)),
+                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Owned(read_write(&lowered.code))),
             });
         lowered
             .entries

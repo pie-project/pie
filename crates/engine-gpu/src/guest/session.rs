@@ -15,6 +15,30 @@ pub const BINDINGS: u32 = 9;
 
 pub const CFG_BINDING: u32 = 5;
 
+/// The runtime's declarations of the bindings it only reads, the tables
+/// read-only storage and the config a uniform (`ptir_runtime.wgsl`), and
+/// each as a read_write storage binding: what a backend whose scopes take a
+/// buffer one way only binds them as, since they lie in the pool segments
+/// the scratch binds read_write (WebGPU).
+pub const READ_ONLY_BINDINGS: [(&str, &str); 4] = [
+    (
+        "@group(0) @binding(1) var<storage, read>       descs",
+        "@group(0) @binding(1) var<storage, read_write> descs",
+    ),
+    (
+        "@group(0) @binding(2) var<storage, read>       params",
+        "@group(0) @binding(2) var<storage, read_write> params",
+    ),
+    (
+        "@group(0) @binding(3) var<storage, read>       offs",
+        "@group(0) @binding(3) var<storage, read_write> offs",
+    ),
+    (
+        "@group(0) @binding(5) var<uniform>             cfg",
+        "@group(0) @binding(5) var<storage, read_write> cfg",
+    ),
+];
+
 /// Where the pool's segments bind, one each: the instance's scratch lies in
 /// pool chunks, and a chunk in one segment.
 pub const SEGMENT_BINDINGS: [u32; kernels_slang::SEGMENTS] = [4, 6, 7, 8];
