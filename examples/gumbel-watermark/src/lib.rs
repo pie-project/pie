@@ -74,6 +74,13 @@
 //! peaked model that keeps repeating its contexts, is reported as too few
 //! contexts to judge, neither a pass nor a failure. The default length
 //! (256 tokens) leaves enough contexts on the shipped models.
+//!
+//! The keyed sampler picks each token from its context's noise, so on a
+//! peaked model the same context draws the same token and the text can
+//! loop: past some step it makes no new contexts however long it runs
+//! (Qwen3.5 stops at 86 at 256, 512 and 1024 tokens). The check detects
+//! that from the token stream (the contexts settle into a repeating period)
+//! and says so: try a different prompt or secret.
 
 mod verdict;
 
@@ -436,8 +443,10 @@ async fn main(input: Input) -> Result<Output> {
     let mut kept_score = 0.0f32;
     let mut kept_null = 0.0f32;
     let mut kept = 0usize;
+    let mut contexts: Vec<u32> = Vec::with_capacity(scores.len());
     for (t, (&s, &z)) in scores.iter().zip(nulls.iter()).enumerate() {
         let counter = host_counter(&history_view, n as usize + t, cfg.context_width);
+        contexts.push(counter);
         if seen.insert(counter) {
             kept_score += s;
             kept_null += z;
@@ -471,6 +480,6 @@ async fn main(input: Input) -> Result<Output> {
         mean_null_score: mean_null,
         z_score,
         unique_contexts: kept,
-        verdict: verdict.describe(kept, z_score),
+        verdict: verdict::describe(verdict, kept, z_score, verdict::cycle(&contexts)),
     })
 }
