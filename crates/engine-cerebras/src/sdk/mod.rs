@@ -408,6 +408,9 @@ pub struct Runtime {
     pending: Vec<(Task, Vec<u32>)>,
     /// Blocking copies and launches so far: calls, time, words.
     pub io: IoStats,
+    /// The simulator's host-to-device writes issued since its last landed one (see
+    /// `reading`'s write: it bounds them).
+    pub unlanded: usize,
 }
 
 /// A runtime's blocking calls by kind: how many, how long they took, how
@@ -512,6 +515,7 @@ impl Runtime {
             _platform: platform,
             running: false,
             pending: Vec::new(),
+            unlanded: 0,
             io: IoStats::default(),
         })
     }

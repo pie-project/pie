@@ -1308,6 +1308,10 @@ impl Runtime {
     }
 }
 
+/// Writes the simulator holds in flight before one is landed (its command fan halts on a
+/// fourth command queued: two writes and the read that lands them).
+const SIM_IN_FLIGHT: usize = 2;
+
 impl Fabric for Runtime {
     fn launch(&mut self, reading: &Reading) -> R<Option<u64>> {
         let args: Vec<u32> = reading.rd.into_iter().collect();
@@ -1357,14 +1361,18 @@ impl Fabric for Runtime {
             self.memcpy_h2d(&a.sym, part, rect, a.len, Order::RowMajor, dt)
                 .map_err(|x| x.to_string())?;
             // the simulator's memcpy halo takes a write's command before the fabric has taken
-            // the one before; commands queued that way past its depth halt it (an `hcf` in the
-            // command fan, GENERIC.md G1.6): each write landed (a word read back from its first
-            // PE) before the next
+            // the one before; a fourth command queued that way halts it (an `hcf` in the command
+            // fan, GENERIC.md G1.6): at most two writes in flight, then a read (a word of the
+            // last's first PE) lands them, the read the third
             if self.simulated() && self.rpc().symbols().contains_key("tsc") {
-                let one = Rect { w: 1, h: 1, ..rect };
-                let mut ts = [0u32; 3];
-                self.memcpy_d2h("tsc", &mut ts, one, 3, Order::RowMajor, DataType::Bits32)
-                    .map_err(|x| x.to_string())?;
+                self.unlanded += 1;
+                if self.unlanded >= SIM_IN_FLIGHT {
+                    let one = Rect { w: 1, h: 1, ..rect };
+                    let mut ts = [0u32; 3];
+                    self.memcpy_d2h("tsc", &mut ts, one, 3, Order::RowMajor, DataType::Bits32)
+                        .map_err(|x| x.to_string())?;
+                    self.unlanded = 0;
+                }
             }
             y += n;
         }

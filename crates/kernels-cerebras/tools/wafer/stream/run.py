@@ -39,10 +39,11 @@ for i, a in enumerate(host["h2d"]):
         data = d.reshape(-1).astype(np.float32)
     r.memcpy_h2d(r.get_id(a["sym"]), data, a["x"], a["y"], a["w"], a["h"], a["len"],
                  data_type=U16 if a["u16"] else F32, **kw)
-    # every write landed (a word read back from its first PE) before the next: the simulator's
-    # memcpy halo takes commands before the fabric has taken the ones before, and halts (an hcf
-    # in its command fan) when they queue past its depth (GENERIC.md G1.6)
-    r.memcpy_d2h(np.zeros(3, np.uint32), r.get_id("tsc"), a["x"], a["y"], 1, 1, 3, data_type=F32, **kw)
+    # at most two writes in flight, then a read (a word of the last's first PE) lands them: the
+    # simulator's memcpy halo takes commands before the fabric has taken the ones before, and
+    # halts (an hcf in its command fan) on a fourth queued (GENERIC.md G1.6)
+    if i % 2 == 1 or i == len(host["h2d"]) - 1:
+        r.memcpy_d2h(np.zeros(3, np.uint32), r.get_id("tsc"), a["x"], a["y"], 1, 1, 3, data_type=F32, **kw)
     if os.environ.get("VERBOSE"):
         print(f"  {i} {a['sym']} landed at {time.time() - t0:.0f} s", flush=True)
 t1 = time.time()
