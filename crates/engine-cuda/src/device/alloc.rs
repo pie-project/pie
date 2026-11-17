@@ -1491,12 +1491,7 @@ pub fn copy_d2h_on(stream: *mut core::ffi::c_void, at: u64, into: &mut [u8]) -> 
 pub fn free_bytes() -> Option<u64> {
     #[cfg(feature = "device")]
     {
-        use crate::device::rt;
-
-        let (mut free, mut total) = (0usize, 0usize);
-        // SAFETY: two live locals; the call only writes them.
-        let asked = unsafe { rt::cudaMemGetInfo(&raw mut free, &raw mut total) };
-        (asked == rt::cudaError::cudaSuccess).then_some(free as u64)
+        crate::device::card::memory().ok().map(|(free, _)| free)
     }
     #[cfg(not(feature = "device"))]
     {
