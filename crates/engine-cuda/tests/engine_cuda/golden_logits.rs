@@ -3147,3 +3147,36 @@ fn golden_staged_experts() {
         );
     }
 }
+
+/// Probe (by hand): position N+1's logits from two one-row decodes against
+/// one two-row fire of the same tokens, after the same prefill, bit for bit.
+#[test]
+#[ignore = "a probe run by hand"]
+fn rows_probe() {
+    let cache = cache_dir();
+    for model in ["qwen3-micro-text", "qwen35-tiny"] {
+        let fixture = fixture(model, &cache);
+        for n in [37u32, 250] {
+            let prefill: Vec<u32> = (0..n).map(|t| (t * 7 + 11) % 1000).collect();
+            let run = |split: bool| {
+                let mut shell = load(&fixture, &cache);
+                shell.open(0).expect("slot 0 opens");
+                let first = fire(&mut shell, &fixture.trace, &prefill);
+                let a = argmax(&first);
+                let b = (a + 13) % 1000;
+                if split {
+                    let _ = fire(&mut shell, &fixture.trace, &[a]);
+                    fire(&mut shell, &fixture.trace, &[b])
+                } else {
+                    fire(&mut shell, &fixture.trace, &[a, b])
+                }
+            };
+            let _ = run(true);
+            let one = run(true);
+            let two = run(false);
+            let diff = one.iter().zip(&two).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+            let most = one.iter().zip(&two).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+            println!("rows {model} n {n}: {diff} of {} logits differ, max |d| {most:e}, argmax {} vs {}", one.len(), argmax(&one), argmax(&two));
+        }
+    }
+}

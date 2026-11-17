@@ -993,3 +993,64 @@ fn attn_paged_relative_bias() {
         }
     }
 }
+
+/// Probe (by hand): a decode row against the same row as row 0 of a
+/// two-row causal prefill over the same cache, bit for bit.
+#[test]
+#[ignore = "a probe run by hand"]
+fn attn_rows_probe() {
+    let Some(gpu) = Gpu::open() else { return };
+    let ctx = gpu.ctx();
+    let device = plan::Device::probe(&ctx).unwrap();
+    for (c, l) in [
+        (Case::new(16, 8, 128, 16, false), 37u32),
+        (Case::new(16, 8, 128, 16, false), 250),
+        (Case::new(8, 2, 256, 16, false), 37),
+        (Case::new(8, 2, 256, 16, false), 250),
+        (Case::new(8, 2, 256, 16, true), 250),
+    ] {
+        let cache = cache(&gpu, &c, &[l + 2], 7);
+        let row = (c.q_heads * c.head_dim) as usize;
+        let qv: Vec<f32> = values(2 * row, 3, 1.0).into_iter().map(round_bf16).collect();
+        let shape = plan::Shape {
+            num_requests: 1,
+            lane_offset: 0,
+            num_q_heads: c.q_heads,
+            num_kv_heads: c.kv_heads,
+            head_dim: c.head_dim,
+            page_size: c.page_size,
+            hnd_layout: c.hnd,
+        };
+        // decode of row a over l + 1 keys
+        let mut outs = Vec::new();
+        for grid in [kernels_rocm::attn::paged::decode_max_grid_size(c.kv_heads, device.num_sm), 1] {
+            let q = RaggedTensor { data: gpu.tensor(&qv[row..], 1, row as u32, Dtype::Bf16), indptr: gpu.column(&[0, 1]) };
+            let live = plan::Live { requests: 1, lane_offset: 0, row_offset: 0, rows: 1 };
+            let built = plan::plan_decode(&cache.page_indptr, &[(l + 2) as i32], shape, live, None, false, grid, plan::Toggles::default(), &device, workspace(&gpu)).unwrap();
+            built.stage(&ctx).unwrap();
+            let mut o = gpu.zeros(1, row as u32, Dtype::Bf16);
+            let mut lse = gpu.zeros(1, c.q_heads, Dtype::F32);
+            attn::decode_lse(&ctx, q, &built, &cache.pool, None, c.head_dim, 0.0, &mut o, &mut lse).unwrap();
+            outs.push((format!("decode grid {grid} split={}", built.info.split_kv), gpu.read(&o)));
+        }
+        // the two-row prefill: rows a, b over l + 2 keys, causal
+        for qo in [1u32, 2] {
+            let q = RaggedTensor { data: gpu.tensor(&qv[(2 - qo as usize) * row..], qo, row as u32, Dtype::Bf16), indptr: gpu.column(&[0, qo as i32]) };
+            let live = plan::Live { requests: 1, lane_offset: 0, row_offset: 0, rows: qo };
+            let kv = (l + 2) as i32;
+            let built = plan::plan_prefill(&[0, qo as i32], &cache.page_indptr, &[kv], qo, shape, live, None, true, false, None, &device, plan::Toggles::default(), workspace(&gpu)).unwrap();
+            built.stage(&ctx).unwrap();
+            let mut o = gpu.zeros(qo, row as u32, Dtype::Bf16);
+            attn::prefill(&ctx, q, &built, &cache.pool, None, c.head_dim, c.kv_heads, 0.0, &mut o).unwrap();
+            outs.push((format!("prefill qo {qo} split={} tile={}", built.info.split_kv, built.info.cta_tile_q), gpu.read(&o)[(qo as usize - 1) * row..].to_vec()));
+        }
+        let (want, _) = reference_row(&c, &qv[row..], &cache.keys[0], &cache.vals[0], (l + 2) as usize, 1, 0, None);
+        let err = |v: &[f32]| v.iter().zip(&want).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+        let (want2, _) = reference_row(&c, &qv[row..], &cache.keys[0], &cache.vals[0], (l + 2) as usize, 1, 0, None);
+        eprintln!("[attn-ref2] l {l}: {}", outs.iter().map(|(n, v)| format!("{n} vs host(l+2 keys) {:.2e}", v.iter().zip(&want2).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max))).collect::<Vec<_>>().join(" | "));
+        eprintln!("[attn-ref] l {l}: {}", outs.iter().map(|(n, v)| format!("{n} vs host {:.2e}", err(v))).collect::<Vec<_>>().join(" | "));
+        let base = &outs[0].1;
+        let line: Vec<String> = outs.iter().map(|(n, v)| format!("{n}: {} max {:.2e}", v.iter().zip(base).filter(|(x, y)| x.to_bits() != y.to_bits()).count(), v.iter().zip(base).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max))).collect();
+        eprintln!("[attn-rows] h{}/{} d{} hnd={} l {l}: {}", c.q_heads, c.kv_heads, c.head_dim, c.hnd, line.join(" | "));
+    }
+}
