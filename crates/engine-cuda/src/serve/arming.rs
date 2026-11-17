@@ -1273,7 +1273,7 @@ impl Shell {
         // maskless one.
         let buffering = self.buffers.is_some();
         let rungs = self.rs_rungs();
-        let group_masked = if self.feeds.ragged.is_empty() {
+        let group_masked = if self.stated_feeds.is_empty() {
             poem_ir::ClassSet::default()
         } else {
             self.group_masked.clone()

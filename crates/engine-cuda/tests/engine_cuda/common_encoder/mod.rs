@@ -81,7 +81,7 @@ impl ForwardHybrid for EncoderLayer {
             &indptr,
             HEAD_DIM,
             SM_SCALE,
-            table.map_or(RaggedMask::GroupBlockDiagonal, |table| {
+            table.map_or(RaggedMask::Stated, |table| {
                 ops::attn::relative_bias(&table, MAX_LEN)
             }),
         );

@@ -38,7 +38,7 @@ impl ForwardHybrid for Grouped {
         let table = Weight::sym("embed", [u64::from(VOCAB), WIDTH], Dtype::Bf16);
         let x = ops::gather::embed(&inputs.tokens(), &table, VOCAB);
         let groups = inputs.group_indptr();
-        let o = ops::attn::ragged(&x, &x, &x, &groups, &groups, HEAD_DIM, SCALE, RaggedMask::None);
+        let o = ops::attn::ragged(&x, &x, &x, &groups, &groups, HEAD_DIM, SCALE, RaggedMask::Stated);
         let read = ops::gather::gather_rows(&o, &inputs.readout_rows());
         poem::output("logits", &read, None);
     }
