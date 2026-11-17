@@ -229,11 +229,12 @@ pub enum SlotError {
     /// adjacent addresses only inside one segment.
     #[error("a run of {run} adjacent chunks is past a segment's {segment}")]
     RunPastSegment { run: u32, segment: u32 },
-    /// Fewer free runs of `run` adjacent chunks inside one segment than
-    /// `pieces`: what was free, as runs of that length and as chunks.
+    /// Fewer free runs of `run` adjacent chunks in any one segment than
+    /// `pieces`: the most one segment had free, as runs of that length, and
+    /// the free chunks.
     #[error(
-        "{pieces} runs of {run} adjacent chunks inside one segment asked, and {free_runs} \
-         such runs are free ({free_chunks} free chunks)"
+        "{pieces} runs of {run} adjacent chunks in one segment asked, and one segment has \
+         {free_runs} such runs free at most ({free_chunks} free chunks)"
     )]
     NoChunkRun {
         run: u32,
@@ -543,6 +544,11 @@ pub struct SlotPool {
     /// The chunks after the first lie at the next physical chunks, and an
     /// evacuation moves the run whole.
     runs: HashMap<u32, u32>,
+    /// The pieces of one take of more than one run
+    /// ([`Self::acquire_chunk_runs`]), which lie in one segment: each
+    /// piece's first logical chunk and the take's first. An evacuation
+    /// moves a take's pieces into one segment together.
+    takes: HashMap<u32, u32>,
 }
 
 impl SlotPool {
@@ -613,6 +619,7 @@ impl SlotPool {
             holders: HashMap::new(),
             waiters: HashMap::new(),
             runs: HashMap::new(),
+            takes: HashMap::new(),
         };
         pool.act = pool.act_chunks(0);
         assert!(
@@ -1519,7 +1526,7 @@ impl SlotPool {
     /// ([`Self::fill_limit`]): each run's first physical chunk, lowest
     /// first, no two sharing a chunk, and no more than the budget's room
     /// holds ([`Self::headroom`]).
-    fn chunk_runs_for(&self, run: u32, live: bool) -> Vec<u32> {
+    fn chunk_runs_for(&self, run: u32, live: bool) -> Vec<Vec<u32>> {
         let run = run.max(1);
         if run > self.segments.segment_chunks() {
             return Vec::new();
@@ -1531,9 +1538,10 @@ impl SlotPool {
             self.headroom_any()
         };
         let most = (room / run) as usize;
-        let mut firsts = Vec::new();
+        let mut segments = Vec::new();
         for segment in 0..self.segments.count() {
             let range = self.segments.range(segment);
+            let mut firsts = Vec::new();
             let mut stretch = 0u32;
             for chunk in range.start..range.end.min(limit) {
                 if !self.open.get(chunk) {
@@ -1546,25 +1554,30 @@ impl SlotPool {
                     stretch = 0;
                 }
             }
+            firsts.truncate(most);
+            segments.push(firsts);
         }
-        firsts.truncate(most);
-        firsts
+        segments
     }
 
-    /// Free runs of `run` adjacent chunks inside one segment live state may
-    /// take now ([`Self::acquire_chunk_runs`]), counted disjoint.
+    /// The most free runs of `run` adjacent chunks one segment holds that
+    /// live state may take now ([`Self::acquire_chunk_runs`]), counted
+    /// disjoint: the pieces a guest state, which lies in one segment, could
+    /// place.
     #[must_use]
     pub fn free_chunk_runs(&self, run: u32) -> u32 {
-        u32::try_from(self.chunk_runs_for(run, true).len()).unwrap_or(u32::MAX)
+        let most = self.chunk_runs_for(run, true).iter().map(Vec::len).max();
+        u32::try_from(most.unwrap_or(0)).unwrap_or(u32::MAX)
     }
 
-    /// Runs of `run` adjacent chunks the segments still to commit hold
-    /// below the activation: uncommitted segments under the top rung's
-    /// span that the engine binds ([`Self::backs`]), the room
+    /// The most runs of `run` adjacent chunks one segment still to commit
+    /// holds below the activation: uncommitted segments under the top
+    /// rung's span that the engine binds ([`Self::backs`]), the room
     /// [`super::shared::SharedPool::grow_step`] commits into, counted no
     /// further than what the pool may grow to ([`Self::growable_chunks`]).
-    /// What a guest bind short of a free run waits on a commit for; none
-    /// where no segment is left to commit within the budget.
+    /// What a guest bind short of a free run waits on a commit for (its
+    /// pieces lie in one segment); none where no segment is left to commit
+    /// within the budget.
     #[must_use]
     pub fn committable_runs(&self, run: u32) -> u32 {
         let run = run.max(1);
@@ -1580,15 +1593,18 @@ impl SlotPool {
                 let range = self.segments.range(segment);
                 range.end.min(limit).saturating_sub(range.start) / run
             })
-            .sum();
+            .max()
+            .unwrap_or(0);
         runs.min(self.growable_chunks() / run)
     }
 
-    /// `pieces` runs of `run` adjacent free chunks for `holder`, each run
-    /// inside one segment, the lowest first, each chunk opened for `shape`
-    /// and all its slots taken: refs in order, a run's chunks in physical
-    /// order. A run longer than one is kept so (an evacuation moves it
-    /// whole) until its first chunk is free again. All or nothing.
+    /// `pieces` runs of `run` adjacent free chunks for `holder`, all inside
+    /// one segment (the lowest that holds them), the lowest first, each
+    /// chunk opened for `shape` and all its slots taken: refs in order, a
+    /// run's chunks in physical order. A guest stage binds the one segment
+    /// its state lies in. A run longer than one is kept so, and the pieces
+    /// of one take together (an evacuation moves them whole into one
+    /// segment), until a piece's first chunk is free again. All or nothing.
     ///
     /// # Errors
     ///
@@ -1613,17 +1629,20 @@ impl SlotPool {
             return Err(SlotError::RunPastSegment { run, segment });
         }
         let live = holder.is_live();
-        let firsts = self.chunk_runs_for(run, live);
-        if firsts.len() < pieces as usize {
+        let segments = self.chunk_runs_for(run, live);
+        let Some(firsts) = segments.iter().find(|firsts| firsts.len() >= pieces as usize) else {
+            let most = segments.iter().map(Vec::len).max().unwrap_or(0);
             return Err(SlotError::NoChunkRun {
                 run,
                 pieces,
-                free_runs: u32::try_from(firsts.len()).unwrap_or(u32::MAX),
+                free_runs: u32::try_from(most).unwrap_or(u32::MAX),
                 free_chunks: self.free_chunks_for(live),
             });
-        }
+        };
+        let firsts = firsts[..pieces as usize].to_vec();
         let mut taken = Vec::with_capacity((pieces * run * spc) as usize);
-        for &first in &firsts[..pieces as usize] {
+        let leader = firsts.first().map(|&first| self.physical_to_logical[first as usize]);
+        for &first in &firsts {
             let head = self.physical_to_logical[first as usize];
             for physical in first..first + run {
                 let chunk = self.open_at(physical, shape);
@@ -1631,6 +1650,11 @@ impl SlotPool {
             }
             if run > 1 {
                 self.runs.insert(head, run);
+            }
+            if pieces > 1
+                && let Some(leader) = leader
+            {
+                self.takes.insert(head, leader);
             }
         }
         if !taken.is_empty() {
@@ -2044,6 +2068,7 @@ impl SlotPool {
 
     fn close_chunk(&mut self, logical: u32, physical: u32) {
         self.runs.remove(&logical);
+        self.takes.remove(&logical);
         self.chunks[logical as usize] = FREE_CHUNK;
         self.free.set(physical);
         self.segments.let_go(physical);
@@ -2171,8 +2196,39 @@ impl SlotPool {
         let mut targets: BTreeSet<u32> = self.open.iter_in(0, range.start).collect();
         let mut moves = Vec::with_capacity(sources.len());
         let mut in_run = BTreeSet::new();
+        // The pieces of one take lie in one segment, so they all lie here:
+        // they move together into one segment's free runs.
+        let mut takes: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
         for &from in &sources {
             let logical = self.physical_to_logical[from as usize];
+            if let Some(&leader) = self.takes.get(&logical) {
+                takes.entry(leader).or_default().push(from);
+            }
+        }
+        for heads in takes.values() {
+            let run = self
+                .runs
+                .get(&self.physical_to_logical[heads[0] as usize])
+                .copied()
+                .unwrap_or(1);
+            let tos = self.free_runs_in_one(&targets, run, heads.len())?;
+            for (&from, &to) in heads.iter().zip(&tos) {
+                for k in 0..run {
+                    targets.remove(&(to + k));
+                    in_run.insert(from + k);
+                    moves.push(ChunkMove {
+                        logical: self.physical_to_logical[(from + k) as usize],
+                        from: from + k,
+                        to: to + k,
+                    });
+                }
+            }
+        }
+        for &from in &sources {
+            let logical = self.physical_to_logical[from as usize];
+            if in_run.contains(&from) {
+                continue;
+            }
             let Some(&run) = self.runs.get(&logical) else {
                 continue;
             };
@@ -2196,6 +2252,30 @@ impl SlotPool {
             });
         }
         Some(Evacuation { segment, moves })
+    }
+
+    /// `pieces` disjoint runs of `run` adjacent chunks of `free`, all in one
+    /// segment (the lowest that holds them), each run's first chunk.
+    fn free_runs_in_one(&self, free: &BTreeSet<u32>, run: u32, pieces: usize) -> Option<Vec<u32>> {
+        let mut by_segment: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+        let mut stretch = 0u32;
+        let mut last: Option<u32> = None;
+        for &chunk in free {
+            let adjacent = last.is_some_and(|last: u32| {
+                last + 1 == chunk && self.segments.of(last) == self.segments.of(chunk)
+            });
+            stretch = if adjacent { stretch + 1 } else { 1 };
+            last = Some(chunk);
+            if stretch == run {
+                let firsts = by_segment.entry(self.segments.of(chunk)).or_default();
+                firsts.push(chunk + 1 - run);
+                if firsts.len() == pieces {
+                    return Some(firsts.clone());
+                }
+                stretch = 0;
+            }
+        }
+        None
     }
 
     /// The lowest of `free` chunks that opens `run` of them at adjacent
@@ -2973,8 +3053,9 @@ mod tests {
             chunks.dedup();
             chunks
         };
-        // Segment 0 holds the null chunk: its run of 3 is 1..4.
-        assert_eq!(pool.free_chunk_runs(3), 3);
+        // Segment 0 holds the null chunk: its run of 3 is 1..4. One segment
+        // holds one run of 3 at most.
+        assert_eq!(pool.free_chunk_runs(3), 1);
         let first = pool.acquire_chunk_runs(holder, 0, 3, 1).unwrap();
         assert_eq!(physical(&pool, &first), [1, 2, 3]);
         assert_eq!(first.len(), 12, "every slot of each chunk");
@@ -3051,9 +3132,11 @@ mod tests {
         };
         // Runs of 2: 1..3 (segment 0 holds the null chunk), 4..6 up to the
         // skip's edge, then 10..12, 12..14 and 14..16 past it; 5|10 is no
-        // run.
-        assert_eq!(pool.free_chunk_runs(2), 5);
-        let runs = pool.acquire_chunk_runs(holder, 0, 2, 4).unwrap();
+        // run. Segment 3 holds two of them, the most one segment does.
+        assert_eq!(pool.free_chunk_runs(2), 2);
+        let runs: Vec<Slot> = (0..4)
+            .flat_map(|_| pool.acquire_chunk_runs(holder, 0, 2, 1).unwrap())
+            .collect();
         assert_eq!(physical(&pool, &runs), [1, 2, 4, 5, 10, 11, 12, 13]);
         for slot in &runs {
             assert_eq!(
@@ -3064,8 +3147,11 @@ mod tests {
         }
         assert_eq!(pool.free_chunk_runs(2), 1, "14..16");
         pool.check();
-        // Singles take every free chunk but the skipped ones.
-        let singles = pool.acquire_chunk_runs(holder, 0, 1, 3).unwrap();
+        // Singles take every free chunk but the skipped ones, a take's
+        // pieces in one segment: 3 alone in segment 0, 14 and 15 in 3.
+        assert!(pool.acquire_chunk_runs(holder, 0, 1, 3).is_err(), "no segment holds 3");
+        let mut singles = pool.acquire_chunk_runs(holder, 0, 1, 1).unwrap();
+        singles.extend(pool.acquire_chunk_runs(holder, 0, 1, 2).unwrap());
         assert_eq!(physical(&pool, &singles), [3, 14, 15]);
         assert!(pool.acquire_chunk_runs(holder, 0, 1, 1).is_err());
         // A segment that holds skipped ids is never evacuated.

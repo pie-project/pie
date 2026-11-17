@@ -169,6 +169,20 @@ pub enum RolesError {
         "no chunk has {slots} adjacent free {role:?} slots for an item that must lie in one run"
     )]
     NoRun { role: SlotRole, slots: u32 },
+    /// A guest state's pieces lie in one segment (a stage binds that
+    /// segment alone), and these are more chunks than a segment holds: no
+    /// segment could ever place it.
+    #[error(
+        "{what}, {bytes} bytes of Instance slots, lies in {pieces} runs of {run} adjacent \
+         chunks in one segment, and a segment holds {segment} chunks: no segment holds it"
+    )]
+    GuestPastSegment {
+        what: String,
+        bytes: u64,
+        run: u32,
+        pieces: u32,
+        segment: u32,
+    },
     #[error(
         "a {role:?} item must lie in one run of {slots} adjacent slots of {slot_bytes} bytes, \
          and a chunk holds {per_chunk} of them: its cell is larger than a chunk, which the \
@@ -204,16 +218,17 @@ pub const GUEST_WAITER: u64 = u64::MAX - 1;
 
 /// What a guest state asked of the pool, and what was free, where a bind
 /// is refused or waits for want of it ([`RolesError::GuestShort`],
-/// [`RolesError::GuestGrow`]); `committable`, the runs of that length (a
-/// chunk, for a run of slots) the segments still to commit within the
-/// budget hold ([`super::slots::SlotPool::committable_runs`]).
+/// [`RolesError::GuestGrow`]); `committable`, the most runs of that length
+/// (a chunk, for a run of slots) one segment still to commit within the
+/// budget holds ([`super::slots::SlotPool::committable_runs`]): a guest
+/// state's pieces lie in one segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuestRoom {
     /// One run of `slots` adjacent `Instance` slots in a chunk.
     Slots { slots: u32, committable: u32 },
-    /// `pieces` runs of `run` adjacent whole chunks, each inside one
-    /// segment, and the free runs of that length and free chunks there
-    /// were.
+    /// `pieces` runs of `run` adjacent whole chunks, all inside one
+    /// segment, the most free runs of that length one segment had, and
+    /// the free chunks.
     Runs {
         run: u32,
         pieces: u32,
@@ -275,15 +290,15 @@ impl std::fmt::Display for GuestRoom {
                 ..
             } => write!(
                 f,
-                "{pieces} runs of {run} adjacent chunks inside one segment asked, and \
-                 {free_runs} such runs were free ({free_chunks} free chunks)"
+                "{pieces} runs of {run} adjacent chunks in one segment asked, and one \
+                 segment had {free_runs} such runs free at most ({free_chunks} free chunks)"
             )?,
         }
         match self.committable() {
             0 => write!(f, ", and no segment is left to commit within the budget"),
             runs => write!(
                 f,
-                ", and the segments left to commit within the budget hold {runs} more"
+                ", and a segment left to commit within the budget holds {runs}"
             ),
         }
     }
@@ -724,6 +739,17 @@ impl Roles {
     ) -> Result<Part, RolesError> {
         let part = self.scratch_part(bytes, run)?;
         let shape = self.shape(SlotRole::Instance)?;
+        let (chunks, pieces) = part.chunk_runs();
+        let segment = self.device.lock().unwrap().pool().segments().segment_chunks();
+        if u64::from(chunks) * u64::from(pieces) > u64::from(segment) {
+            return Err(RolesError::GuestPastSegment {
+                what: what(),
+                bytes,
+                run: chunks,
+                pieces,
+                segment,
+            });
+        }
         let room = match self.retake(&part) {
             Ok(part) => {
                 self.device.lock().unwrap().pool_mut().unwait(GUEST_WAITER);
@@ -731,7 +757,6 @@ impl Roles {
             }
             Err(room) => room,
         };
-        let (chunks, pieces) = part.chunk_runs();
         let mut device = self.device.lock().unwrap();
         let pool = device.pool_mut();
         let free = match room {
@@ -740,7 +765,9 @@ impl Roles {
         };
         let committable = pool.committable_runs(chunks);
         let room = room.with_committable(committable);
-        if free.saturating_add(committable) < pieces {
+        // Its pieces lie in one segment: a free one or one to commit holds
+        // them all, never the two together.
+        if free.max(committable) < pieces {
             pool.unwait(GUEST_WAITER);
             let short = RolesError::GuestShort {
                 what: what(),

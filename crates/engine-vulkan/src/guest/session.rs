@@ -14,7 +14,7 @@ use engine_gpu::store::layout::{CHANNEL, INSTANCE};
 
 use engine_gpu::guest::held::{self, consecutive};
 use engine_gpu::guest::session::{
-    BINDINGS, InstanceLay, PiecePlace, ScoreRows, ScoreSpec, SEGMENT_BINDINGS, StageTables, groups_for,
+    BINDINGS, InstanceLay, PiecePlace, ScoreRows, ScoreSpec, SCRATCH_BINDING, StageTables, groups_for,
     lay_program, piece_places, place_table, score_rows,
 };
 
@@ -425,11 +425,10 @@ impl Session {
         self.write_sets()
     }
 
-    /// The buffer each segment binding takes: the segment where a piece
-    /// lies in it, else the first piece's (never read), else the fault
-    /// word's slot (a scratch of no pieces reads no segment).
-    fn segment_buffers(&self) -> [(vk::Buffer, u64); 4] {
-        let fallback = self.pieces.first().map_or_else(
+    /// The buffer the scratch binding takes: the segment its pieces lie
+    /// in, else the fault word's (a scratch of no pieces reads none).
+    fn scratch_buffer(&self) -> (vk::Buffer, u64) {
+        self.pieces.first().map_or_else(
             || {
                 (
                     self.status.buffer().slab().buffer,
@@ -437,23 +436,16 @@ impl Session {
                 )
             },
             |piece| (piece.buffer.slab().buffer, piece.buffer.bytes()),
-        );
-        let mut out = [fallback; 4];
-        for piece in &self.pieces {
-            if let Some(slot) = out.get_mut(piece.place.segment as usize) {
-                *slot = (piece.buffer.slab().buffer, piece.buffer.bytes());
-            }
-        }
-        out
+        )
     }
 
     /// Points each stage's set at its buffers: the fault word, its tables
-    /// where their slots lie now, and the segments its pieces lie in.
+    /// where their slots lie now, and the segment its pieces lie in.
     /// Nothing on the queue uses the sets: at construction none has run,
     /// and a rebind settles first.
     fn write_sets(&self) -> Result<()> {
         let d = &self.core.device;
-        let segments = self.segment_buffers();
+        let (scratch, scratch_bytes) = self.scratch_buffer();
         for stage in &self.stages {
             let [descs, params, offs, cfg] = &stage.tables;
             let held = |held: &Held| (held.buffer().slab().buffer, held.offset(), held.bytes());
@@ -464,13 +456,11 @@ impl Session {
                 (3, held(offs), vk::DescriptorType::STORAGE_BUFFER),
                 (5, held(cfg), vk::DescriptorType::UNIFORM_BUFFER),
             ];
-            for (&binding, &(buffer, range)) in SEGMENT_BINDINGS.iter().zip(&segments) {
-                buffers.push((
-                    binding,
-                    (buffer, 0, range),
-                    vk::DescriptorType::STORAGE_BUFFER,
-                ));
-            }
+            buffers.push((
+                SCRATCH_BINDING,
+                (scratch, 0, scratch_bytes),
+                vk::DescriptorType::STORAGE_BUFFER,
+            ));
             let infos: Vec<[vk::DescriptorBufferInfo; 1]> = buffers
                 .iter()
                 .map(|&(_, (buffer, offset, range), _)| {

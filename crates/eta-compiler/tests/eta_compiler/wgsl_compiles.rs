@@ -86,11 +86,8 @@ fn the_shader_declares_the_bindings_a_shell_binds() {
         "@group(0) @binding(1) var<storage, read>       descs",
         "@group(0) @binding(2) var<storage, read>       params",
         "@group(0) @binding(3) var<storage, read>       offs",
-        "@group(0) @binding(4) var<storage, read_write> seg0",
+        "@group(0) @binding(4) var<storage, read_write> heap",
         "@group(0) @binding(5) var<uniform>             cfg",
-        "@group(0) @binding(6) var<storage, read_write> seg1",
-        "@group(0) @binding(7) var<storage, read_write> seg2",
-        "@group(0) @binding(8) var<storage, read_write> seg3",
     ] {
         assert!(
             RUNTIME.contains(declaration),

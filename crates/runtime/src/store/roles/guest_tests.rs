@@ -788,7 +788,7 @@ fn a_run_is_refused_by_name_where_only_scattered_chunks_are_free() {
     );
     assert!(
         named.contains("1 runs of 3 adjacent chunks")
-            && named.contains("0 such runs were free")
+            && named.contains("0 such runs free at most")
             && named.contains("no segment is left to commit within the budget"),
         "{named}"
     );
@@ -1106,7 +1106,7 @@ async fn a_bind_past_the_room_waits_for_room_given_back() {
     freed.await;
     bind(&roles, &mut engine, 5).expect("room given back: it binds");
 
-    // Twenty chunks of state: no budget of this pool holds it.
+    // Twenty chunks of state: no segment of this pool holds it.
     let mut huge = GuestEngine::new(20 * CHUNK, 0);
     huge.next = 200;
     learn_program(&roles, &mut huge, ProgramId(9)).unwrap();
@@ -1124,7 +1124,7 @@ async fn a_bind_past_the_room_waits_for_room_given_back() {
     assert!(
         matches!(
             refused.downcast_ref::<RolesError>(),
-            Some(RolesError::GuestShort { .. })
+            Some(RolesError::GuestPastSegment { .. })
         ),
         "{refused}"
     );
@@ -1381,4 +1381,69 @@ fn a_restore_rebinds_an_instance_with_its_pair_s_place() {
         pair,
         "rebound to where it landed"
     );
+}
+
+/// A guest state's pieces lie in one segment, the one its stages bind:
+/// with four chunks free, two in each of two segments, an instance of three
+/// single-chunk pieces finds no segment holding them and waits for room
+/// (`RolesError::BindShort`), never split; a third chunk freed in one
+/// segment lets it bind there, every piece in that segment.
+#[test]
+fn a_guest_state_s_pieces_lie_in_one_segment_and_a_bind_waits_until_one_holds_them() {
+    // Segments of 8 chunks: the null chunk at 0, the span at the top.
+    let Pools { device, roles } = pools_of(facts_in(64, 8));
+    let (singles, mut single) = runs_of(9, 1, 1, 1000);
+    let mut held_by = Vec::new();
+    for by in 0.. {
+        let Ok(id) = bind_as(&roles, &mut single, singles, 500 + by) else {
+            break;
+        };
+        let place = &single.bindings.last().expect("bound").scratch;
+        held_by.push((id, pieces_of(&device, place)[0][0].1));
+    }
+    assert_eq!(device.lock().unwrap().pool().free_chunk_runs(1), 0, "full");
+    let segment_of = |segment: u32| {
+        held_by
+            .iter()
+            .filter(|&&(_, at)| at == segment)
+            .map(|&(id, _)| id)
+            .collect::<Vec<_>>()
+    };
+    let (zero, one) = (segment_of(0), segment_of(1));
+    for &id in zero.iter().take(2).chain(one.iter().take(2)) {
+        roles.lock().unwrap().close_instance(id);
+    }
+    assert_eq!(device.lock().unwrap().pool().free_chunk_runs(1), 2, "two a segment");
+    let (program, mut engine) = runs_of(8, 1, 3, 0);
+    let error = bind_as(&roles, &mut engine, program, 1).expect_err("no segment holds three");
+    assert!(
+        matches!(error.downcast_ref::<RolesError>(), Some(RolesError::BindShort(_))),
+        "a wait, not a refusal: {error}"
+    );
+    assert!(engine.bindings.is_empty(), "the engine was not asked");
+    roles.lock().unwrap().close_instance(one[2]);
+    bind_as(&roles, &mut engine, program, 1).expect("segment 1 holds three now");
+    let segments: Vec<u32> = pieces_of(&device, &engine.bindings[0].scratch)
+        .iter()
+        .map(|piece| piece[0].1)
+        .collect();
+    assert_eq!(segments, [1, 1, 1], "every piece in segment 1");
+}
+
+/// A guest state of more chunks than a segment holds could never lie in
+/// one segment: refused by name at the bind, whatever is free.
+#[test]
+fn a_guest_state_past_a_segment_is_refused_by_name() {
+    let Pools { roles, .. } = pools_of(facts_in(64, 8));
+    let (program, mut engine) = runs_of(8, 3, 3, 0);
+    let error = bind_as(&roles, &mut engine, program, 1).expect_err("nine chunks, segments of 8");
+    let named = error.to_string();
+    assert!(
+        matches!(
+            short_of(&error),
+            Some(RolesError::GuestPastSegment { run: 3, pieces: 3, segment: 8, .. })
+        ),
+        "{named}"
+    );
+    assert!(named.contains("no segment holds it"), "{named}");
 }

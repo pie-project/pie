@@ -744,3 +744,95 @@ fn a_sampler_in_runs_of_chunks_draws_what_one_chunk_draws() {
         "the lanes draw apart, so a lane reading another's state would show"
     );
 }
+
+/// A top-p sampler over `n` candidates (a Gumbel draw of logits, then
+/// `nucleus_sample` at p = 0.95): the shape of the standard top-p guest.
+fn nucleus_draw(n: u32) -> TraceContainer {
+    use eta_dsl::prelude::*;
+    let leak = |channel: Channel| -> &'static Channel { Box::leak(Box::new(channel)) };
+    let rng = leak(Channel::from([0x51deu32, 0]));
+    let top_p = leak(Channel::from([0.95f32]));
+    let out = leak(Channel::new([1], dtype::i32).capacity(8));
+    let mut b = Builder::new(VOCAB, 16);
+    b.stage(Stage::Epilogue, move || {
+        let r = rng.take();
+        let p = top_p.take();
+        let logits = gumbel(&r, [n]);
+        let token = reshape(nucleus_sample(&logits, reshape(&p, []), &r), [1]);
+        rng.put(&r + iota(2));
+        top_p.put(&p);
+        out.put(&token);
+    });
+    out.note_host_take();
+    b.build().expect("the sampler traces").container().clone()
+}
+
+/// The device whose cold compile of [`nucleus_draw`]'s stages the bound
+/// below was measured on, and that compile at the sitting (863185d4e, the
+/// private heap's single scratch binding) on each backend, in ms; the bound
+/// is a quarter past it. Run with the driver's shader cache off
+/// (`__GL_SHADER_DISK_CACHE=0`) so the compile is cold: measured so on
+/// 2026-11-17, this test's registration and first bind at 863185d4e.
+const COLD_DEVICE: &str = "NVIDIA RTX PRO 4500 Blackwell";
+const COLD_AT_BASE_MS: &[(&str, u128)] = &[("vulkan", 20_979), ("wgpu", 4_547)];
+
+/// A top-p sampler's stages compile, at its registration and first bind,
+/// within a quarter past what the sitting's compile of the same program
+/// took: the guest's addressing adds no code a driver spends its compile
+/// on (a stage binds the one segment its state lies in, and an access is
+/// an index of it).
+#[test]
+fn a_top_p_sampler_compiles_cold_within_a_quarter_past_the_sitting() {
+    let Some(Loaded {
+        mut engine,
+        caps,
+        dir,
+        ..
+    }) = loaded("cold-compile", &Rows)
+    else {
+        return;
+    };
+    let device = backend::Context::bind(&backend::DeviceBoot::default(), backend::ALLOWANCE)
+        .map(|context| context.chip().name)
+        .unwrap_or_default();
+    let started = std::time::Instant::now();
+    let bound = eta_ir::validate::bind(nucleus_draw(151_936), vec![Vec::new()], EngineCaps::default())
+        .expect("the sampler binds");
+    let stages = eta_compiler::plan::compile_bound(&bound);
+    let program = engine
+        .register_program(&ProgramRegistration {
+            program_hash: 0x70_9b,
+            launch: eta_compiler::codegen::launch::build(&bound, &stages),
+            ..Default::default()
+        })
+        .expect("the sampler registers");
+    let chunks = &caps.caps.chunks;
+    let top = chunks.segment_chunks;
+    let mut slots = super::slots::Slots::of(chunks, top - 40, top - 1);
+    slots.chunks = (top - 26..top - 2).collect();
+    let binding = slots.binding(
+        &engine,
+        InstanceBinding {
+            program,
+            channels: vec![ChannelId(300), ChannelId(301), ChannelId(302)],
+            geometry: GeometryClass::Host,
+            ..Default::default()
+        },
+        &[],
+    );
+    engine.bind_instance(&binding).expect("the sampler binds its instance");
+    let took = started.elapsed().as_millis();
+    drop(engine);
+    let _ = std::fs::remove_dir_all(&dir);
+    eprintln!("COLD_COMPILE {} {device}: {took} ms", backend::NAME);
+    let base = COLD_AT_BASE_MS
+        .iter()
+        .find(|(name, _)| *name == backend::NAME)
+        .map_or(0, |&(_, ms)| ms);
+    if device == COLD_DEVICE && base > 0 {
+        assert!(
+            took * 4 <= base * 5,
+            "the cold compile took {took} ms, past a quarter over the sitting's {base} ms"
+        );
+    }
+}

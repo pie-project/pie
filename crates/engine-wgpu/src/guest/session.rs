@@ -12,7 +12,7 @@ use engine_gpu::store::layout::INSTANCE;
 
 use engine_gpu::guest::held::{self, consecutive};
 use engine_gpu::guest::session::{
-    BINDINGS, CFG_BINDING, READ_ONLY_BINDINGS, InstanceLay, PiecePlace, ScoreRows, ScoreSpec, SEGMENT_BINDINGS, StageTables,
+    BINDINGS, CFG_BINDING, READ_ONLY_BINDINGS, InstanceLay, PiecePlace, ScoreRows, ScoreSpec, SCRATCH_BINDING, StageTables,
     groups_for, lay_program, piece_places, place_table, score_rows,
 };
 
@@ -207,7 +207,7 @@ impl Session {
             stage_tables.push([(); 4].map(|()| placed.next().expect("four tables a stage")));
         }
         let status = placed.next().expect("the fault word after the tables");
-        let segments = segment_buffers(&pieces, &status);
+        let heap = scratch_buffer(&pieces, &status);
         let mut stages = Vec::with_capacity(plans.len());
         for ((at, resolved), tables) in resolved.into_iter().enumerate().zip(stage_tables) {
             let StageTables {
@@ -217,7 +217,7 @@ impl Session {
                 ..
             } = resolved;
             stages.push(Stage {
-                group: group(&core, &code.binds, &status, &tables, &segments)?,
+                group: group(&core, &code.binds, &status, &tables, &heap)?,
                 groups: if code.strides[at] {
                     groups_for(&descriptors, device.cores())
                 } else {
@@ -322,14 +322,14 @@ impl Session {
     }
 
     fn regroup(&mut self) -> Result<()> {
-        let segments = segment_buffers(&self.pieces, &self.status);
+        let scratch = scratch_buffer(&self.pieces, &self.status);
         for stage in &mut self.stages {
             stage.group = group(
                 &self.core,
                 &self.code.binds,
                 &self.status,
                 &stage.tables,
-                &segments,
+                &scratch,
             )?;
         }
         Ok(())
@@ -563,20 +563,12 @@ fn addresses(pieces: &[Piece]) -> Vec<u32> {
     pieces.iter().map(|piece| piece.place.address()).collect()
 }
 
-/// The buffer each segment binding takes: the segment where a piece lies in
-/// it, else the first piece's (never read), else the fault word's (a
-/// scratch of no pieces reads no segment).
-fn segment_buffers(pieces: &[Piece], status: &Held) -> [Buffer; 4] {
-    let fallback = pieces
+/// The buffer the scratch binding takes: the segment the pieces lie in,
+/// else the fault word's (a scratch of no pieces reads none).
+fn scratch_buffer(pieces: &[Piece], status: &Held) -> Buffer {
+    pieces
         .first()
-        .map_or_else(|| status.buffer().clone(), |piece| piece.buffer.clone());
-    let mut out = [(); 4].map(|()| fallback.clone());
-    for piece in pieces {
-        if let Some(slot) = out.get_mut(piece.place.segment as usize) {
-            *slot = piece.buffer.clone();
-        }
-    }
-    out
+        .map_or_else(|| status.buffer().clone(), |piece| piece.buffer.clone())
 }
 
 fn whole(buffer: &Buffer) -> wgpu::BindingResource<'_> {
@@ -677,13 +669,13 @@ fn span(held: &Held) -> wgpu::BindingResource<'_> {
 
 /// A stage's bind group: the fault word and its tables where their slots
 /// lie now (each at an offset the table layout aligned to the device's
-/// binding alignment), and the pool's segments its scratch lies in.
+/// binding alignment), and the segment its scratch lies in.
 fn group(
     core: &Arc<Core>,
     binds: &wgpu::BindGroupLayout,
     status: &Held,
     tables: &[Held; 4],
-    segments: &[Buffer; 4],
+    scratch: &Buffer,
 ) -> Result<wgpu::BindGroup> {
     let [descs, params, offs, cfg] = tables;
     let mut entries = vec![
@@ -708,12 +700,10 @@ fn group(
             resource: span(cfg),
         },
     ];
-    for (&binding, segment) in SEGMENT_BINDINGS.iter().zip(segments) {
-        entries.push(wgpu::BindGroupEntry {
-            binding,
-            resource: whole(segment),
-        });
-    }
+    entries.push(wgpu::BindGroupEntry {
+        binding: SCRATCH_BINDING,
+        resource: whole(scratch),
+    });
     let group = core.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("pie guest"),
         layout: binds,

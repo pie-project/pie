@@ -30,11 +30,8 @@ struct Cfg {
 @group(0) @binding(1) var<storage, read>       descs   : array<u32>;
 @group(0) @binding(2) var<storage, read>       params  : array<u32>;
 @group(0) @binding(3) var<storage, read>       offs    : array<u32>;
-@group(0) @binding(4) var<storage, read_write> seg0    : array<u32>;
+@group(0) @binding(4) var<storage, read_write> heap    : array<u32>;
 @group(0) @binding(5) var<uniform>             cfg     : Cfg;
-@group(0) @binding(6) var<storage, read_write> seg1    : array<u32>;
-@group(0) @binding(7) var<storage, read_write> seg2    : array<u32>;
-@group(0) @binding(8) var<storage, read_write> seg3    : array<u32>;
 
 var<private> tid : u32;
 
@@ -52,32 +49,13 @@ fn d_rank(v : u32) -> u32 { return descs[v * DESC_WORDS + 3u]; }
 fn d_dtype(v : u32) -> u32 { return descs[v * DESC_WORDS + 4u]; }
 fn d_dim(v : u32, k : u32) -> u32 { return descs[v * DESC_WORDS + 5u + k]; }
 
-// The instance's scratch lies in pool chunks (the pool's segments, bound
-// four), each value whole in one piece. An address is a word of a segment,
-// the segment in its top two bits: `offs` holds the temporary area's
-// address, then each value's, which a bind and a rebind write.
-const SEG_SHIFT : u32 = 30u;
-const SEG_WORDS : u32 = 0x3FFFFFFFu;
+// The instance's scratch lies in pool chunks of one segment, the one bound
+// at `heap`, each value whole in one piece. An address is a word of that
+// segment: `offs` holds the temporary area's address, then each value's,
+// which a bind and a rebind write.
+fn hl(a : u32) -> u32 { return heap[a]; }
 
-fn hl(a : u32) -> u32 {
-  let w = a & SEG_WORDS;
-  switch (a >> SEG_SHIFT) {
-    case 0u: { return seg0[w]; }
-    case 1u: { return seg1[w]; }
-    case 2u: { return seg2[w]; }
-    default: { return seg3[w]; }
-  }
-}
-
-fn hs(a : u32, x : u32) {
-  let w = a & SEG_WORDS;
-  switch (a >> SEG_SHIFT) {
-    case 0u: { seg0[w] = x; }
-    case 1u: { seg1[w] = x; }
-    case 2u: { seg2[w] = x; }
-    default: { seg3[w] = x; }
-  }
-}
+fn hs(a : u32, x : u32) { heap[a] = x; }
 
 fn base(v : u32) -> u32 { return offs[v + 1u]; }
 

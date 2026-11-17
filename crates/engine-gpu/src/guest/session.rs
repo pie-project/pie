@@ -11,7 +11,7 @@ use eta_ir::op::tags;
 
 pub const DESC_WORDS: usize = 9;
 
-pub const BINDINGS: u32 = 9;
+pub const BINDINGS: u32 = 6;
 
 pub const CFG_BINDING: u32 = 5;
 
@@ -39,13 +39,10 @@ pub const READ_ONLY_BINDINGS: [(&str, &str); 4] = [
     ),
 ];
 
-/// Where the pool's segments bind, one each: the instance's scratch lies in
-/// pool chunks, and a chunk in one segment.
-pub const SEGMENT_BINDINGS: [u32; kernels_slang::SEGMENTS] = [4, 6, 7, 8];
-
-/// The top bits of a guest address name its segment
-/// (`ptir_runtime.wgsl`'s `SEG_SHIFT`): a segment's words are fewer.
-pub const SEGMENT_SHIFT: u32 = 30;
+/// Where the segment an instance's scratch lies in binds: its pieces lie in
+/// pool chunks of one segment (the runtime places them so), and a guest
+/// address is a word of it.
+pub const SCRATCH_BINDING: u32 = 4;
 
 /// Where a pass's spans start in the host staging ring: the scratch's own
 /// alignment, which a copy's offsets meet on every API.
@@ -533,19 +530,20 @@ impl PiecePlace {
         }
     }
 
-    /// The guest address of its first word: the segment in the top bits.
+    /// The guest address of its first word: its word in its segment.
     #[must_use]
     pub fn address(self) -> u32 {
-        (self.segment << SEGMENT_SHIFT) | u32::try_from(self.at / 4).unwrap_or(u32::MAX)
+        u32::try_from(self.at / 4).unwrap_or(u32::MAX)
     }
 }
 
 /// Where the pieces of an instance's state laid as `lay` lie in the pool,
 /// at `place` ([`engine::ScratchPlace`]): a run of slots' one piece from its
-/// first slot, else each run of chunks' first byte, piece by piece. Refused
-/// by name where the place holds fewer pieces, or runs of another length,
-/// than the state takes, a run passes its segment, or a segment's words
-/// reach past the address bits.
+/// first slot, else each run of chunks' first byte, piece by piece, all in
+/// one segment. Refused by name where the place holds fewer pieces, or runs
+/// of another length, than the state takes, its pieces lie in more than one
+/// segment, a run passes its segment, or a segment's words pass a guest
+/// address.
 pub fn piece_places<B: crate::backend::Backend>(
     pools: &crate::store::Pools<B>,
     place: &engine::ScratchPlace,
@@ -598,19 +596,26 @@ pub fn piece_places<B: crate::backend::Backend>(
         engine::ScratchPlace::Chunks { .. } => lay.piece_bytes(),
         _ => held,
     };
-    firsts
+    let places = firsts
         .into_iter()
         .map(|slot| {
             let (segment, buffer, at) = pools.slot_segment(INSTANCE, slot)?;
             let end = at + span;
-            if at % 4 != 0 || end > crate::backend::Buffer::bytes(buffer) || end / 4 > 1 << SEGMENT_SHIFT
-            {
+            if at % 4 != 0 || end > crate::backend::Buffer::bytes(buffer) || end / 4 > 1 << 32 {
                 return Err(refused(format!(
                     "a guest piece of {span} bytes at byte {at} of segment {segment}, past the \
-                     segment or the {SEGMENT_SHIFT} word bits a guest address reaches"
+                     segment or the words a guest address reaches"
                 )));
             }
             Ok(PiecePlace { segment, at })
         })
-        .collect()
+        .collect::<crate::error::Result<Vec<_>>>()?;
+    if places.windows(2).any(|pair| pair[0].segment != pair[1].segment) {
+        return Err(refused(format!(
+            "a guest's state lies in one segment, which its stages bind, and its place puts \
+             its pieces in segments {:?}",
+            places.iter().map(|place| place.segment).collect::<Vec<_>>()
+        )));
+    }
+    Ok(places)
 }
