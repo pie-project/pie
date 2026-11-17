@@ -216,6 +216,8 @@ async fn a_fork_the_pool_can_never_copy_is_refused_by_name() {
 /// with no set of its own held.
 struct GrowingPool {
     slots: AtomicU32,
+    /// Tiers sweeps that reached the store.
+    sweeps: AtomicU32,
 }
 
 impl PoolPort for GrowingPool {
@@ -281,11 +283,43 @@ impl PoolPort for GrowingPool {
         None
     }
     fn drop_disallowed(&self) -> usize {
+        self.sweeps.fetch_add(1, Ordering::SeqCst);
         0
     }
     fn prepare_demote(&self, _room: usize) -> Option<crate::store::kv::KvResidencyTxn> {
         None
     }
+}
+
+/// A tiers sweep asked off the runtime (a table installed on the policy
+/// port's thread) is not lost: the next plan, on the runtime, runs it.
+#[test]
+fn a_tiers_sweep_asked_off_the_runtime_runs_at_the_next_plan() {
+    use std::collections::HashMap;
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_write();
+    let pool = Arc::new(GrowingPool {
+        slots: AtomicU32::new(1),
+        sweeps: AtomicU32::new(0),
+    });
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let owner = ProcessId::new_v4();
+    crate::policy::retention::install(Some(
+        crate::policy::retention::Table::new(HashMap::new(), None)
+            .with_tiers(HashMap::from([(owner, vec![(None, 0b010)])]), None),
+    ));
+    planner.sweep_tiers();
+    assert_eq!(
+        pool.sweeps.load(Ordering::SeqCst),
+        0,
+        "no runtime: nothing moved yet"
+    );
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async { planner.plan() });
+    assert_eq!(pool.sweeps.load(Ordering::SeqCst), 1, "the plan ran it");
+    crate::policy::retention::install(None);
 }
 
 /// A process parked at admission is seated once the pool backs more slots,
@@ -295,6 +329,7 @@ fn a_process_waiting_for_a_seat_is_seated_when_the_pool_grows() {
     let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
     let pool = Arc::new(GrowingPool {
         slots: AtomicU32::new(1),
+        sweeps: AtomicU32::new(0),
     });
     let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
     let (first, second) = (ProcessId::new_v4(), ProcessId::new_v4());
