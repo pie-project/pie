@@ -329,7 +329,9 @@ pub struct Shell {
     /// Token-declared values on a readout-rowed path (`crate::rows`), and
     /// a readout-rowed value that tells their rows.
     readout_rowed: (std::sync::Arc<Vec<bool>>, Option<ValueId>),
-    device: Device,
+    /// Shared: a guest program's registration compiles its stages off the
+    /// engine thread (`Engine::prepare_program`) while fires go on.
+    device: std::sync::Arc<Device>,
 }
 
 impl std::fmt::Debug for Shell {
@@ -1036,7 +1038,7 @@ impl Shell {
             pad,
             seats: engine.seats,
             tpu,
-            device,
+            device: std::sync::Arc::new(device),
             handles,
             trace: boot.trace,
             compiled,
@@ -1128,6 +1130,13 @@ impl Shell {
     #[must_use]
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    /// The device, shared: what a registration's compile, off the engine
+    /// thread, holds.
+    #[must_use]
+    pub fn device_shared(&self) -> std::sync::Arc<Device> {
+        std::sync::Arc::clone(&self.device)
     }
 
     /// The device and the pool buffer at once: a guest pass's programs take

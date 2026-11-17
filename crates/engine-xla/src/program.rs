@@ -509,6 +509,21 @@ impl Plane {
         registration: &ProgramRegistration,
         device: Option<&crate::device::Device>,
     ) -> Result<ProgramId, Refusal> {
+        let pending = self.prepare(registration)?;
+        let staged = match device {
+            Some(device) => pending.compile(device),
+            None => Ok(Vec::new()),
+        };
+        self.finish(pending, staged)
+    }
+
+    /// A registration's first step, on the engine's thread: the program
+    /// interprets and every stage lowers (else refused by name), and the
+    /// stage shapes its passes take are named; nothing compiles yet. Its
+    /// compile ([`Pending::compile`]) runs on any thread, and
+    /// [`Plane::finish`] makes it the program. Until then no instance of
+    /// it binds.
+    pub fn prepare(&mut self, registration: &ProgramRegistration) -> Result<Pending, Refusal> {
         let plan = eta_exec::adopt_launch_package(registration.launch.clone())
             .map_err(|error| Refusal::Program(error.to_string()))?;
         if !plan.executable {
@@ -532,19 +547,58 @@ impl Plane {
                 registration.program_hash
             )));
         }
-        if let (Some(device), Some(form)) = (device, self.forms.get(id).cloned())
-            && let Err(why) =
-                self.stages
-                    .compile_all(device, &plan.package, form.key, &form.pooled())
+        let form = self.forms.get(id).cloned();
+        let wanted = match &form {
+            Some(form) => self.stages.wanted(&plan.package, form.key, &form.pooled()),
+            None => Ok(Vec::new()),
+        };
+        let wanted = match wanted {
+            Ok(wanted) => wanted,
+            Err(why) => {
+                self.forms.forget(id);
+                return Err(Refusal::Program(format!(
+                    "a stage of program 0x{:016x} does not compile: {why}",
+                    registration.program_hash
+                )));
+            }
+        };
+        Ok(Pending {
+            id,
+            hash: registration.program_hash,
+            key: form.map(|form| form.key),
+            plan: Arc::new(plan),
+            wanted,
+            pool_rows: self.stages.pool_rows(),
+        })
+    }
+
+    /// A registration's last step, on the engine's thread: the stages its
+    /// compile made held, and the program registered; a compile that
+    /// refused refuses it.
+    pub fn finish(
+        &mut self,
+        pending: Pending,
+        staged: Result<Vec<Arc<crate::guest::run::Staged>>, String>,
+    ) -> Result<ProgramId, Refusal> {
+        let Pending {
+            id, hash, key, plan, wanted, ..
+        } = pending;
+        let staged = match staged {
+            Ok(staged) => staged,
+            Err(why) => {
+                self.forms.forget(id);
+                return Err(Refusal::Program(format!(
+                    "a stage of program 0x{hash:016x} does not compile: {why}"
+                )));
+            }
+        };
+        if let Some(key) = key
+            && !staged.is_empty()
         {
-            self.forms.forget(id);
-            return Err(Refusal::Program(format!(
-                "a stage of program 0x{:016x} does not compile: {why}",
-                registration.program_hash
-            )));
+            self.stages.install(key, wanted, staged);
         }
         tracing::debug!(program = id.0, "guest program registered");
-        self.programs.insert(id, Arc::new(plan));
+        self.programs.insert(id, plan);
         Ok(id)
     }
 
@@ -1816,5 +1870,30 @@ mod latch_tests {
         );
         drop(heard);
         event.join().expect("the event thread");
+    }
+}
+
+/// A program a registration prepared ([`Plane::prepare`]): what its
+/// compile, on any thread, compiles, and what [`Plane::finish`] holds.
+pub struct Pending {
+    id: ProgramId,
+    hash: u64,
+    key: Option<[u8; 32]>,
+    plan: Arc<ExecPlan>,
+    wanted: Vec<crate::guest::run::Want>,
+    pool_rows: i64,
+}
+
+impl Pending {
+    /// Every stage shape the program's passes take, compiled on `device`
+    /// (on whatever thread calls this).
+    pub fn compile(
+        &self,
+        device: &crate::device::Device,
+    ) -> Result<Vec<Arc<crate::guest::run::Staged>>, String> {
+        if self.wanted.is_empty() {
+            return Ok(Vec::new());
+        }
+        crate::guest::run::compile_wanted(device, &self.plan.package, &self.wanted, self.pool_rows)
     }
 }
