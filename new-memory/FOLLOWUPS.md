@@ -90,3 +90,33 @@ on the pool kind (`None` on a shared pool), and handle/snapshot stage by that sp
 shared pool's tier slots (sc/plex11-offload-staging). Once Cerebras states a single-shape shared pool, `with_pages`,
 `with_pool`'s pinned use, `host_pool`, `alloc_host_slots` and the split in handle/snapshot all delete, and every engine
 takes `shared_stores`.
+
+## F14 — Metal: a serving process's GPU driver memory that currentAllocatedSize does not count
+On an M1 Max (recommended working set 26.80 GB) a serving Metal process's command buffer is refused
+(`kIOGPUCommandBufferCallbackErrorOutOfMemory`) at 26.18-26.41 GB held (`currentAllocatedSize`), 0.4-0.6 GB under the
+limit. A process holding only its own buffers, filling them all each step, is refused at the limit exactly (26.84 GB
+held; ok at 26.58). The shipped load rule (sc/mac-bind-evicts b3bb497e4: capacity from the recommended working set
+less this process's outside bytes and what others held wired, less the 64 MiB floor) held the uncapped hour, but with
+only ~0.06 GB to spare, partly by coincidence: the "others wired" it subtracts is not what the driver counts.
+
+- Ruled out, each by a run: the machine's total wired (28.4 GB wired passes the plain probe); another process's GPU
+  memory (an 8 GB idle hog changes nothing); placement sparse buffers and their heaps, the residency set, no-copy
+  file-backed weights (all counted, and each probe variant refuses at the limit); lanes per fire (6, 8, 43, 47 refuse at
+  the same held); the guest program set (top-p alone vs five programs: one segment apart); time or accumulation (30k
+  command buffers first, or the pool pinned full a minute in: same); frames in flight and pending maps (the refused frame
+  was alone, the mapping queue idle); thread-private arrays (none above 128 B a thread); a per-fire transient
+  (`currentAllocatedSize` sampled every 1 ms is flat once the pool stops growing). The load's own warm walk at a filler
+  passes to 44 MB of the limit, so calibrating from the load's fires measures nothing.
+- What names it: the IOAccelerator node's "Alloc system memory" (`ioreg -r -c IOAccelerator -l`, machine-wide,
+  0.29 GB idle). For plain buffers it is their bytes plus 0.02 GB. For a serving process it runs ~0.9-1.0 GB past
+  `currentAllocatedSize` from the load on (3.17 GB at 1.89 GB held right after load; 27.19 GB at 26.41 GB held at the
+  refusal). It is a per-process driver cost present at load, not per fire. Per-client ioreg entries show no memory
+  (GPU time and queue counts only; pie opens three command queues).
+- Repro (local branch sc/mac-residency-exp 7399520bb, not for merge): `PIE_PROBE_LIFT=1` (capacity = recommended less
+  outside, less the floor; no wired check), `PIE_SHARED_SEGMENTS_FILE` written to 600 ~45 s in, 8 concurrent top-p
+  (scratchpad kit soak_topp.py SOAK_CAP=8); the refusal comes ~1 min in, logged as "metal: refused-frame".
+- Next: a Metal System Trace (Mac Pro's M5 has Xcode: `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun
+  xctrace`) of the repro would name the driver objects. A measured term is available without it: a load's own
+  accelerator Alloc delta (after the load less before, less `currentAllocatedSize`). It's machine-wide, so it holds only
+  where nothing else allocates on the GPU during the load. With it, the bound becomes held + grow <= recommended - that
+  term - 64 MiB, and the wired-by-others term goes.
