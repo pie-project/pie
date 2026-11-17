@@ -5,8 +5,8 @@ use engine_cuda::device::elastic::{
 };
 use engine_cuda::store::kv::Paging;
 use engine_cuda::store::{
-    Accounting, BODIES_FLOOR_BYTES, bodies_allowance, decoded_weight_reserve, holds_within,
-    one_slot_bytes, tokens_within, window_fire_bytes, window_of,
+    Accounting, BODIES_FLOOR_BYTES, MEASURING, decoded_weight_reserve, holds, one_slot_bytes,
+    tokens_within, window_fire_bytes, window_of,
 };
 
 const CARD: u64 = 48_305_799_168;
@@ -38,7 +38,7 @@ fn the_operators_fraction_sizes_the_pool_every_case() {
         a_flat_range_takes_what_the_card_has_left();
     }
     the_decoded_weight_tiles_are_held_out_of_the_pool();
-    the_bodies_keep_their_floor_and_the_tile_is_taken_before_any_capture();
+    the_bodies_are_held_ahead_of_the_rows_and_the_tile_before_any_capture();
     a_sliding_row_holds_its_window_and_not_the_context();
 }
 
@@ -142,47 +142,29 @@ fn a_sliding_row_holds_its_window_and_not_the_context() {
     );
 }
 
-fn the_bodies_keep_their_floor_and_the_tile_is_taken_before_any_capture() {
+fn the_bodies_are_held_ahead_of_the_rows_and_the_tile_before_any_capture() {
     // pie-evals nightly 36021487786 on an L40S: gemma-4-31b 4-bit at a 6144
     // envelope. Past one 5280 MiB sequence the card had 6581 MiB; holding
     // the programs (1024 MiB at 256 lanes) and a reserve for the decoded
-    // tiles ate it all, bodies_mem was held to 0, nothing armed, and the
+    // tiles ate it all, the bodies were held 0, nothing armed, and the
     // first fire — a capture — found the `decoded_weight` scratch at 0 bytes
     // and needed 176160768.
+    const SEQUENCE: u64 = 5280 << 20;
     const SPARE: u64 = 6581 << 20;
     const PROGRAMS: u64 = 1024 << 20;
-    const CONFIGURED: u64 = 4 << 30;
     const MLP_PLANE: u64 = 21_504 * 5376 * 2;
     const FIRST_CAPTURE: u64 = 176_160_768;
+    let live = SEQUENCE + SPARE;
 
-    let (bodies, programs) = holds_within(CONFIGURED, PROGRAMS, SPARE);
-    assert!(bodies >= BODIES_FLOOR_BYTES, "the floor holds: {bodies}");
-    assert_eq!(programs, PROGRAMS, "and the programs still fit beside it");
-    assert!(
-        bodies + programs < SPARE,
-        "a second sequence's worth is left: {}",
-        SPARE - bodies - programs
-    );
-
-    let (bodies, programs) = holds_within(CONFIGURED, PROGRAMS, 700 << 20);
     assert_eq!(
-        bodies, BODIES_FLOOR_BYTES,
-        "on a short card the floor comes first"
+        holds(SEQUENCE, live, MEASURING, PROGRAMS),
+        Ok((SPARE - PROGRAMS, PROGRAMS)),
+        "bodies still to arm are held everything past the sequence and the programs"
     );
     assert_eq!(
-        programs,
-        (700 << 20) - BODIES_FLOOR_BYTES,
-        "and the programs take what is left"
-    );
-    assert_eq!(
-        holds_within(CONFIGURED, PROGRAMS, 0),
-        (0, 0),
-        "but never past one sequence"
-    );
-    assert_eq!(
-        holds_within(256 << 20, PROGRAMS, SPARE).0,
-        256 << 20,
-        "a configured allowance under the floor is the floor"
+        holds(SEQUENCE, live, MEASURING, SPARE + 1),
+        Ok((0, SPARE)),
+        "and programs past the card leave them nothing: arming refuses the load by name"
     );
 
     // The tile a stream is warmed with at load covers the widest plane its
@@ -320,54 +302,44 @@ fn the_reservations_scale_to_a_twenty_four_gigabyte_card() {
         "4 GiB of bodies_mem leaves under one coarse slot: {fixed}"
     );
 
-    // The bodies' allowance bounds arming at what one sequence leaves: the
-    // cache rows take what the bodies leave of it once they are captured.
-    let bodies = bodies_allowance(4 << 30, room - fine(8192));
-    assert!(
-        (BODIES_FLOOR_BYTES..4 << 30).contains(&bodies),
-        "held to what one sequence leaves: {bodies}"
-    );
-    assert_eq!(bodies, room - fine(8192));
+    // The bodies are held ahead of the cache rows: still to arm, all one
+    // sequence leaves; measured, what they took, and the rows fill the rest.
+    let claim = fine(8192);
+    let (bodies, _) = holds(claim, room, MEASURING, 0).expect("one sequence fits");
     assert_eq!(
-        bodies_allowance(4 << 30, 40 << 30),
-        4 << 30,
-        "a roomy card keeps the config"
+        bodies,
+        room - claim,
+        "the claim before arming is that one sequence"
     );
     assert_eq!(
-        bodies_allowance(4 << 30, 1 << 30),
-        1 << 30,
-        "a short card gives them what it has: no part of it is kept for rows' sake"
+        holds(claim, room, 1 << 30, 0),
+        Ok((1 << 30, 0)),
+        "a measured figure is held as it is"
     );
     assert_eq!(
-        bodies_allowance(4 << 30, 300 << 20),
-        300 << 20,
-        "and yields to the sequence"
-    );
-    assert_eq!(
-        bodies_allowance(256 << 20, 40 << 30),
-        256 << 20,
-        "a small config is kept"
-    );
-
-    let seats = |slot: u64| (room - bodies) / slot;
-    assert!(seats(fine(8192)) >= 1, "the 8k envelope seats a sequence");
-    assert_eq!(
-        room - bodies,
-        fine(8192),
-        "the claim before arming is that one sequence; the rows' others come of what the bodies \
-         leave"
+        holds(claim, room, room, 0),
+        Err(room - claim),
+        "and one past what the sequence leaves is refused"
     );
 }
 
 fn a_flat_range_takes_what_the_card_has_left() {
-    assert_eq!(safety_floor_bytes(CARD), 0, "a flat range holds nothing back");
+    assert_eq!(
+        safety_floor_bytes(CARD),
+        0,
+        "a flat range holds nothing back"
+    );
     let free = CARD - WEIGHTS;
     assert_eq!(
         budget_bytes(free, CARD, Allowance::WHOLE),
         free,
         "all the card has left, no share of it"
     );
-    assert_eq!(ceiling_of(CARD, WEIGHTS, Allowance::WHOLE), CARD, "the card itself");
+    assert_eq!(
+        ceiling_of(CARD, WEIGHTS, Allowance::WHOLE),
+        CARD,
+        "the card itself"
+    );
     let budget = Allowance {
         budget: Some(8 << 30),
     };

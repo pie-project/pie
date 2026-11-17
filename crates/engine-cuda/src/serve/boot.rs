@@ -30,14 +30,12 @@ impl Graphs {
 pub enum Recording {
     Off,
     Shaped,
-    Bodies { mem_megabytes: u32 },
+    Bodies,
 }
 
 impl Default for Recording {
     fn default() -> Recording {
-        Recording::Bodies {
-            mem_megabytes: DEFAULT_BODIES_MEGABYTES,
-        }
+        Recording::Bodies
     }
 }
 
@@ -49,15 +47,7 @@ impl Recording {
 
     #[must_use]
     pub fn bodies(self) -> bool {
-        matches!(self, Recording::Bodies { .. })
-    }
-
-    #[must_use]
-    pub fn bodies_mem(self) -> u32 {
-        match self {
-            Recording::Bodies { mem_megabytes, .. } => mem_megabytes,
-            Recording::Off | Recording::Shaped => 0,
-        }
+        matches!(self, Recording::Bodies)
     }
 }
 
@@ -101,8 +91,6 @@ pub enum Golden {
     Eager,
     Body,
 }
-
-pub const DEFAULT_BODIES_MEGABYTES: u32 = 4096;
 
 pub struct Boot<'a> {
     pub trace: Trace,

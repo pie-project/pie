@@ -1507,7 +1507,7 @@ impl Shell {
             pad: engine.recording.pad(),
             golden_arm: Golden::Off,
             bodies: engine.recording.bodies(),
-            bodies_mem: (engine.recording.bodies_mem() as usize).saturating_mul(1 << 20),
+            bodies_mem: 0,
             bodies_record: None,
             bodies_from_record: false,
             arming_at_load: false,
@@ -1607,9 +1607,10 @@ impl Shell {
         }
         let footprint = |shell: &Shell| footprint(shell, device_total, free_before);
         // The bodies are held what they took when this deployment last
-        // armed whole, where it is recorded; the configured `bodies_mem` is
-        // the ceiling and what a first boot holds. One number: arming's
-        // allowance is the hold.
+        // armed whole, where it is recorded; with no record, everything the
+        // card has past one working set, and the cache rows fill what they
+        // leave once they are captured. One number: arming's allowance is
+        // the hold, a load fact like the span, and no figure is chosen.
         let mut recorded = false;
         if shell.records_bodies()
             && let Some(dir) = boot.cache_dir
@@ -1628,16 +1629,15 @@ impl Shell {
                 if boot.knobs.diagnostics.arm_trace {
                     eprintln!(
                         "[arm-trace] bodies held {} MiB: {} bodies took {} MiB, their captures {} \
-                         MiB, when this deployment last armed whole (bodies_mem {} MiB)",
-                        held.min(shell.bodies_mem) >> 20,
+                         MiB, when this deployment last armed whole",
+                        held >> 20,
                         measured.bodies,
                         measured.bytes >> 20,
                         measured.captured >> 20,
-                        shell.bodies_mem >> 20,
                     );
                 }
-                shell.bodies_from_record = held < shell.bodies_mem;
-                shell.bodies_mem = shell.bodies_mem.min(held);
+                shell.bodies_from_record = true;
+                shell.bodies_mem = held;
             }
             shell.bodies_record = Some(record);
         }
@@ -1646,13 +1646,7 @@ impl Shell {
         // in for the figure.
         shell.measuring =
             shell.records_bodies() && !crate::device::elastic::mapped_on_demand() && !recorded;
-        let bodies = if shell.measuring {
-            crate::store::MEASURING
-        } else if shell.records_bodies() {
-            shell.bodies_mem as u64
-        } else {
-            0
-        };
+        let bodies = shell.bodies_hold();
         let resident = footprint(&shell);
         // What the kernels' scratch slabs take, walked size-only through
         // the compositions the lattice fires before the range is first
@@ -1737,23 +1731,9 @@ impl Shell {
             shell.staged_runs().iter().sum::<u64>(),
             ledger.held,
         );
-        let afforded = fitted.bodies;
-        if shell.measuring {
-            // Arming is allowed all the card has past the least range.
-            shell.bodies_mem = usize::try_from(afforded).unwrap_or(usize::MAX);
-        } else if afforded < bodies {
-            eprintln!(
-                "engine-cuda: [engine] bodies_mem {} MiB is held down to {} MiB on this card: \
-                 with the weights, activations and inputs resident, one sequence at the declared \
-                 context and the guests' programs seated, {} MiB is left for the graph bodies \
-                 and the cache rows together; the rows take what the bodies leave of it once \
-                 they are captured.",
-                bodies >> 20,
-                afforded >> 20,
-                fitted.spare >> 20,
-            );
-            shell.bodies_mem = usize::try_from(afforded).unwrap_or(usize::MAX);
-        }
+        // Arming is allowed what the fit held the bodies: a record's figure,
+        // or all the card has past the least range.
+        shell.bodies_mem = usize::try_from(fitted.bodies).unwrap_or(usize::MAX);
         Ok(Staged {
             shell,
             rank: boot.world.rank,
@@ -1943,7 +1923,7 @@ impl Staged {
             // state's chunks then end where the activation starts, so what
             // a rung lends and what lies under it are one span.
             let fitted = shell.pools.fit_the_card(
-                shell.bodies_mem as u64,
+                shell.bodies_hold(),
                 shell.held_for_fires,
                 false,
                 &resident,
@@ -1958,7 +1938,7 @@ impl Staged {
             // load that records no bodies has fired none, and keeps the
             // whole span for its fires; one that arms later and lends no
             // rung keeps the bodies' allowance out as well.
-            let bodies = if deferred { shell.bodies_mem as u64 } else { 0 };
+            let bodies = if deferred { shell.bodies_hold() } else { 0 };
             let settled = shell.records_bodies() && !deferred;
             shell
                 .pools
@@ -2041,6 +2021,20 @@ impl Shell {
     #[must_use]
     pub fn expert_staging(&self) -> &crate::experts::staging::Staging {
         &self.expert_staging
+    }
+
+    /// What the fit holds the bodies ahead of the cache rows' fill: none on
+    /// a load that records none; what they took when this deployment last
+    /// armed whole, where that is recorded; else everything past one working
+    /// set ([`crate::store::MEASURING`]).
+    fn bodies_hold(&self) -> u64 {
+        if !self.records_bodies() {
+            0
+        } else if self.bodies_from_record {
+            self.bodies_mem as u64
+        } else {
+            crate::store::MEASURING
+        }
     }
 
     /// The device's memory as this load holds it now ([`ledger`]).
