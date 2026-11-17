@@ -425,6 +425,7 @@ pub(crate) fn build_frame_submission(
             },
             terminal_cells: build.terminal_cells,
             completions: build.completions,
+            member_lanes: build.member_lane_indptr,
             instances,
         });
         flattened.extend(group);

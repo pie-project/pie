@@ -20,6 +20,7 @@ use engine_gpu::serve::Landed;
 use engine_gpu::serve::Shell;
 
 use crate::serve::Seats;
+use engine_gpu::settle::{Meet, merged};
 #[cfg(feature = "vulkan")]
 use engine_gpu::settle::Done;
 
@@ -67,7 +68,11 @@ impl Host for Api {
         at: engine::StepDone,
     ) -> EngineResult<(FireTicket, PendingStep)> {
         let defers = defers(gpu, step);
-        let (ticket, mut step_pending) = gpu.fire_step(step, at, defers)?;
+        let guests = program_attachments(step).next().is_some();
+        // The host runs the step's guest passes behind its forward: the
+        // step lands once both are in, with the lanes they faulted.
+        let meet = (guests && !defers).then(Meet::new);
+        let (ticket, mut step_pending) = gpu.fire_step(step, at, defers, meet.clone())?;
         let landed = step_pending.landed;
         if defers && reads_on_device(gpu, step, &landed) {
             // The sampler lands on its own and reports the step;
@@ -81,34 +86,30 @@ impl Host for Api {
             step_pending.rows = Some(Vec::new());
             return Ok((ticket, step_pending));
         }
-        if program_attachments(step).next().is_some()
-            && reads_on_device(gpu, step, &step_pending.landed)
-        {
+        let mut faulted = Vec::new();
+        if guests && reads_on_device(gpu, step, &step_pending.landed) {
             // Every attachment reads its logits on the device:
             // it queues behind the forward without waiting for
             // it, so the GPU runs on into the sampler and the
             // step waits once.
             let landed = step_pending.landed;
-            run_attachments(gpu, step, &landed)?;
+            faulted = run_attachments(gpu, step, &landed);
             let shell = gpu.loaded_mut()?;
             step_pending.rows = Some(shell.rows_of(&landed).map_err(fault)?);
             shell.forget_seat(&landed);
-        } else if program_attachments(step).next().is_some() {
+        } else if guests {
             let shell = gpu.loaded_mut()?;
             let rows = shell.rows_of(&step_pending.landed).map_err(fault)?;
             step_pending.rows = Some(rows);
             let landed = step_pending.landed;
-            run_attachments(gpu, step, &landed)?;
+            faulted = run_attachments(gpu, step, &landed);
         }
-        if defers && let Some(sink) = gpu.sink.as_ref() {
+        if let Some(meet) = meet {
+            meet.guests_ran(faulted);
+        } else if defers && let Some(sink) = gpu.sink.as_ref() {
             // The forward's own report was held for the sampler.
             let wrote = std::mem::take(&mut step_pending.wrote);
-            let outcome = if wrote.is_empty() {
-                engine::StepOutcome::Committed
-            } else {
-                engine::StepOutcome::Wrote(wrote)
-            };
-            (sink)(at, outcome);
+            (sink)(at, merged(engine::StepOutcome::wrote(wrote), faulted));
         }
         Ok((ticket, step_pending))
     }
@@ -183,31 +184,45 @@ fn reads_on_device(gpu: &Vulkan, step: &Step, landed: &Landed) -> bool {
             .all(|attachment| shell.readout_seats(landed, attachment.lane).is_some())
 }
 
-fn run_attachments(gpu: &mut Vulkan, step: &Step, landed: &Landed) -> EngineResult<()> {
+/// Runs `step`'s guest epilogues on the host behind its forward, each
+/// attachment's on its own: a pass that faults (its instance poisoned, a
+/// guard, a stage's fault) faults its own lanes and no other.
+fn run_attachments(gpu: &mut Vulkan, step: &Step, landed: &Landed) -> Vec<engine::LaneFault> {
     let Vulkan {
         shell, programs, ..
     } = gpu;
+    let mut faulted = engine::StepOutcome::committed();
     for attachment in program_attachments(step) {
         #[cfg(feature = "vulkan")]
         let (device, seats) = match shell.as_ref() {
             Some(shell) => (Some(shell.device()), lane_seats(shell, landed, attachment)),
             None => (None, Vec::new()),
         };
-        programs
-            .fire(
-                attachment.instance,
-                Stage::Epilogue,
-                #[cfg(feature = "vulkan")]
-                device,
-                #[cfg(feature = "vulkan")]
-                seats,
-            )
-            .map_err(refusal)?;
+        if let Err(refused) = programs.fire(
+            attachment.instance,
+            Stage::Epilogue,
+            #[cfg(feature = "vulkan")]
+            device,
+            #[cfg(feature = "vulkan")]
+            seats,
+        ) {
+            tracing::warn!(instance = attachment.instance.0, %refused, "a guest epilogue faulted its lanes");
+            faulted.fault_lanes(
+                attachment_lanes(attachment),
+                Some(attachment.instance),
+                &refused.to_string(),
+            );
+        }
     }
     if let Some(shell) = shell.as_mut() {
         shell.forget_seat(landed);
     }
-    Ok(())
+    faulted.faulted
+}
+
+/// The lanes `attachment`'s pass is of.
+fn attachment_lanes(attachment: &engine::fire::Attachment) -> std::ops::Range<u32> {
+    attachment.lane..attachment.lane + attachment.lanes.max(1)
 }
 
 /// Whether `step`'s one attachment can run behind its forward without
@@ -248,9 +263,21 @@ fn defer_attachment(
             .ok_or_else(|| Error::Load("the vulkan engine has no model loaded".into()))?;
         let attachment = &step.attachments[0];
         let seats = lane_seats(shell, landed, attachment);
-        let done = sink.clone().map(|sink| Done { at, sink, wrote });
+        let done = sink.clone().map(|sink| Done {
+            at,
+            sink,
+            wrote,
+            lanes: u32::try_from(step.lanes.len()).unwrap_or(u32::MAX),
+            meet: None,
+        });
         programs
-            .fire_deferred(attachment.instance, shell.device(), seats, done)
+            .fire_deferred(
+                attachment.instance,
+                attachment_lanes(attachment),
+                shell.device(),
+                seats,
+                done,
+            )
             .map_err(refusal)
     }
     #[cfg(not(feature = "vulkan"))]

@@ -58,6 +58,14 @@ pub struct Done {
     /// What the step's lanes report when it settles: the slots each fold
     /// froze, on a fire whose fold length is the device's.
     pub wrote: Vec<engine::KvWrites>,
+
+    /// The step's lanes: every one faulted where the step is lost whole.
+    pub lanes: u32,
+
+    /// Where the step's guest passes run on the host behind its forward:
+    /// the step is told once its forward landed and they ran, with the
+    /// lanes they faulted.
+    pub meet: Option<Meet>,
 }
 
 impl Done {
@@ -65,10 +73,26 @@ impl Done {
     /// or plainly committed where none does.
     #[must_use]
     pub fn settled(&self) -> engine::StepOutcome {
-        if self.wrote.is_empty() {
-            engine::StepOutcome::Committed
-        } else {
-            engine::StepOutcome::Wrote(self.wrote.clone())
+        engine::StepOutcome::wrote(self.wrote.clone())
+    }
+
+    /// Tells the sink the step's forward landed: whole, or lost for
+    /// `refused`, `what` naming what was refused. Where its guest passes
+    /// run behind it on the host, the step is told once they ran too.
+    pub fn tell(&self, refused: Option<String>, what: &str) {
+        let outcome = match refused {
+            None => self.settled(),
+            Some(why) => engine::StepOutcome::lost(
+                self.lanes,
+                format!(
+                    "{what} for frame {} step {}: {why}",
+                    self.at.frame, self.at.step
+                ),
+            ),
+        };
+        match &self.meet {
+            None => (self.sink)(self.at, outcome),
+            Some(meet) => meet.forward_landed(self, outcome),
         }
     }
 }
@@ -77,6 +101,75 @@ impl std::fmt::Debug for Done {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Done").field("at", &self.at).finish()
     }
+}
+
+/// Where a step's forward landing and its host guest passes meet: whichever
+/// comes second tells the sink the step, its lanes the guests faulted
+/// beside what the forward says.
+#[derive(Clone, Default)]
+pub struct Meet {
+    inner: Arc<std::sync::Mutex<Met>>,
+}
+
+#[derive(Default)]
+struct Met {
+    forward: Option<(engine::StepDone, engine::CompletionSink, engine::StepOutcome)>,
+    guests: Option<Vec<engine::LaneFault>>,
+}
+
+impl Meet {
+    #[must_use]
+    pub fn new() -> Meet {
+        Meet::default()
+    }
+
+    /// The step's guest passes ran on the host, faulting `faulted`.
+    pub fn guests_ran(&self, faulted: Vec<engine::LaneFault>) {
+        let told = {
+            let mut met = self.inner.lock().expect("meet lock poisoned");
+            match met.forward.take() {
+                Some(forward) => Some((forward, faulted)),
+                None => {
+                    met.guests = Some(faulted);
+                    None
+                }
+            }
+        };
+        if let Some(((at, sink, outcome), faulted)) = told {
+            sink(at, merged(outcome, faulted));
+        }
+    }
+
+    fn forward_landed(&self, done: &Done, outcome: engine::StepOutcome) {
+        let told = {
+            let mut met = self.inner.lock().expect("meet lock poisoned");
+            match met.guests.take() {
+                Some(faulted) => Some(merged(outcome, faulted)),
+                None => {
+                    met.forward = Some((done.at, done.sink.clone(), outcome));
+                    None
+                }
+            }
+        };
+        if let Some(outcome) = told {
+            (done.sink)(done.at, outcome);
+        }
+    }
+}
+
+/// `outcome` with the lanes `faulted` faulted beside its own; a lane it
+/// faulted already keeps its own reason.
+#[must_use]
+pub fn merged(
+    mut outcome: engine::StepOutcome,
+    faulted: Vec<engine::LaneFault>,
+) -> engine::StepOutcome {
+    for fault in faulted {
+        if outcome.faulted.iter().all(|had| had.lane != fault.lane) {
+            outcome.faulted.push(fault);
+        }
+    }
+    outcome
 }
 
 #[derive(Debug, Clone)]
@@ -117,5 +210,86 @@ impl Arms {
     #[must_use]
     pub fn held(&self) -> usize {
         self.taken.iter().filter(|held| **held).count()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::{Done, Meet};
+
+    type Heard = Arc<Mutex<Vec<engine::StepOutcome>>>;
+
+    fn done(meet: &Meet, heard: &Heard) -> Done {
+        let into = Arc::clone(heard);
+        Done {
+            at: engine::StepDone {
+                frame: engine::FrameId(1),
+                step: 0,
+            },
+            sink: Arc::new(move |_, outcome| into.lock().unwrap().push(outcome)),
+            wrote: vec![engine::KvWrites {
+                tag: 7,
+                ..Default::default()
+            }],
+            lanes: 4,
+            meet: Some(meet.clone()),
+        }
+    }
+
+    fn guest_fault(lane: u32) -> Vec<engine::LaneFault> {
+        let mut outcome = engine::StepOutcome::committed();
+        outcome.fault_lanes(
+            lane..lane + 1,
+            Some(engine::InstanceId(9)),
+            "instance 9 (program 1) faulted: guard",
+        );
+        outcome.faulted
+    }
+
+    /// A step whose guest pass faulted one lane of four on the host is
+    /// told once, after both its forward landed and its guests ran,
+    /// whichever comes first: that lane faulted, the rest committed with
+    /// what they wrote.
+    #[test]
+    fn a_guest_fault_faults_its_own_lane_whichever_lands_first() {
+        for guests_first in [false, true] {
+            let heard = Heard::default();
+            let meet = Meet::new();
+            let done = done(&meet, &heard);
+            if guests_first {
+                meet.guests_ran(guest_fault(2));
+                assert!(heard.lock().unwrap().is_empty(), "the forward is still out");
+                done.tell(None, "test buffer");
+            } else {
+                done.tell(None, "test buffer");
+                assert!(heard.lock().unwrap().is_empty(), "the guests have not run");
+                meet.guests_ran(guest_fault(2));
+            }
+            let heard = heard.lock().unwrap();
+            assert_eq!(heard.len(), 1, "told once");
+            let outcome = &heard[0];
+            assert_eq!(outcome.wrote.len(), 1, "the committed lanes' reports stand");
+            assert_eq!(outcome.faulted.len(), 1, "one lane faulted: {outcome:?}");
+            assert_eq!(outcome.faulted[0].lane, 2);
+            assert_eq!(outcome.faulted[0].instance, Some(engine::InstanceId(9)));
+            assert!(outcome.faulted[0].reason.contains("guard"));
+        }
+    }
+
+    /// A forward the queue refused loses the whole step: every lane
+    /// faulted, a guest's own fault on a lane not counted twice.
+    #[test]
+    fn a_refused_forward_faults_every_lane_once() {
+        let heard = Heard::default();
+        let meet = Meet::new();
+        let done = done(&meet, &heard);
+        done.tell(Some("device lost".into()), "test buffer");
+        meet.guests_ran(guest_fault(1));
+        let heard = heard.lock().unwrap();
+        let lanes: Vec<u32> = heard[0].faulted.iter().map(|fault| fault.lane).collect();
+        assert_eq!(lanes, [0, 1, 2, 3]);
+        assert!(heard[0].faulted[1].reason.contains("device lost"));
     }
 }

@@ -34,10 +34,13 @@ impl Spatial {
     pub(super) fn pump(&mut self) {
         while let Some(Posted { at, step }) = self.posted.pop_front() {
             let outcome = match self.fire_step(&step) {
-                Ok(_) => StepOutcome::Committed,
+                Ok(_) => StepOutcome::committed(),
                 Err(error) => {
                     tracing::error!(frame = at.frame.0, step = at.step, %error, "spatial: a posted step failed");
-                    StepOutcome::Faulted(error.to_string())
+                    StepOutcome::unattributed_guest_fault(
+                        u32::try_from(step.lanes.len()).unwrap_or(u32::MAX),
+                        error.to_string(),
+                    )
                 }
             };
             if let Some(sink) = &self.sink {

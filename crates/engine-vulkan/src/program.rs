@@ -889,6 +889,7 @@ impl Plane {
     pub fn fire_deferred(
         &mut self,
         instance: InstanceId,
+        lanes: std::ops::Range<u32>,
         device: &crate::device::Context,
         seats: Vec<Vec<crate::guest::run::Readout<'_>>>,
         done: Option<engine_gpu::settle::Done>,
@@ -921,18 +922,25 @@ impl Plane {
         let deferral = runner.take_deferral().unwrap_or_default();
         widen.disarm();
         let program = seat.program;
-        match outcome {
-            StepOutcome::Committed => {}
-            StepOutcome::Blocked(channel) => {
-                return Err(Refusal::Program(format!(
-                    "instance {instance} (program {program}) blocked on channel {channel}"
-                )));
+        let refused = match outcome {
+            StepOutcome::Committed => None,
+            StepOutcome::Blocked(channel) => Some(format!(
+                "instance {instance} (program {program}) blocked on channel {channel}"
+            )),
+            StepOutcome::Faulted(why) => Some(format!(
+                "instance {instance} (program {program}) faulted: {why}"
+            )),
+        };
+        if let Some(why) = refused {
+            // The pass faulted on the host: its own lanes fault, and the
+            // step's other lanes commit.
+            tracing::warn!(instance = instance.0, %why, "a deferred guest epilogue faulted its lanes");
+            if let Some(done) = done {
+                let mut outcome = done.settled();
+                outcome.fault_lanes(lanes, Some(instance), &why);
+                (done.sink)(done.at, outcome);
             }
-            StepOutcome::Faulted(why) => {
-                return Err(Refusal::Program(format!(
-                    "instance {instance} (program {program}) faulted: {why}"
-                )));
-            }
+            return Ok(());
         }
         *tally += 1;
 
@@ -974,6 +982,10 @@ impl Plane {
         let owing = Arc::clone(&seat.landing);
         let faulted = Arc::clone(&seat.faulted);
         let on_done = move |refused: Option<String>| {
+            // The queue refusing the buffer the step's forward and this
+            // pass rode is the step lost whole; what the pass's own status
+            // and landing say is its lanes'.
+            let lost = refused.clone();
             let mut fault = refused;
             if fault.is_none() {
                 let mut word = [0u8; 4];
@@ -1008,10 +1020,14 @@ impl Plane {
                 spare.lock().expect("spare lock poisoned").push(lent);
             }
             if let Some(done) = done.as_ref() {
-                let outcome = match fault {
-                    None => done.settled(),
-                    Some(why) => engine::StepOutcome::Faulted(why),
-                };
+                if lost.is_some() {
+                    done.tell(lost, "vulkan guest pass");
+                    return;
+                }
+                let mut outcome = done.settled();
+                if let Some(why) = fault {
+                    outcome.fault_lanes(lanes.clone(), Some(instance), &why);
+                }
                 (done.sink)(done.at, outcome);
             }
         };
