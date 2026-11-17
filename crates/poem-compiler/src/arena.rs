@@ -1139,9 +1139,8 @@ fn hold_out_scores(trace: &Trace, placements: &mut [Placement]) -> Vec<(usize, P
     held
 }
 
-/// Each layer's `attn.scores` plane on top of every other slot, from
-/// [`ArenaMap::scores_from`] on: a backend seating the planes for a fire's
-/// capturing lanes alone finds every other slot under them.
+/// Each layer's `attn.scores` plane on top of every other slot, so a load no
+/// program reads scores from backs the arena only up to [`ArenaMap::scores_from`].
 fn lift_scores(trace: &Trace, placements: &mut [Placement], bytes: u64) -> u64 {
     let mut lifted: Vec<usize> = Vec::new();
     for output in trace.outputs.iter().filter(|output| output.name == SCORES) {
