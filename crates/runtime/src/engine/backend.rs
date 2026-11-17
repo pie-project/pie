@@ -102,6 +102,10 @@ pub mod open {
             .map_err(::anyhow::Error::msg)
     }
 
+    /// The fire a served Metal load is asked ([`engine_metal::FIRE`]).
+    #[cfg(all(feature = "metal", target_vendor = "apple"))]
+    pub const METAL_FIRE: (u32, u32) = engine_metal::FIRE;
+
     #[cfg(all(feature = "metal", target_vendor = "apple"))]
     pub fn metal(config_bytes: &[u8]) -> Result<EngineBox> {
         engine_metal::open(config_bytes, crate::engine::load::contract_for)
