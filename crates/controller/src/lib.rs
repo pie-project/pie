@@ -183,6 +183,13 @@ impl ControllerHandle {
 
     /// What `worker` holds, gained and lost since its last report.
     pub fn report_state(&self, worker: WorkerId, report: StateReport) {
+        tracing::debug!(
+            %worker,
+            added = report.added.len(),
+            runs_added = report.runs_added.len(),
+            pool = report.pool,
+            "a worker's state report"
+        );
         let quiet = !report.full
             && report.added.is_empty()
             && report.removed.is_empty()

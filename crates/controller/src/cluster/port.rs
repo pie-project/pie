@@ -19,7 +19,8 @@ use std::time::Duration;
 
 use client_api::props::{PROMPT_BLOCK_BYTES, TOKENS_PER_BYTE};
 use controller_api::{
-    DirectoryView, GatewayDecisions, Health, PlacementView, ProcessEvent, Role, RoutingTable,
+    DirectoryView, GatewayDecisions, Health, PlacementView, ProcessEvent, ReplicateOrder, Role,
+    RoutingTable,
 };
 use ids::{GatewayId, WorkerId};
 use plex_host::host::{Config, Delta, Host as PlexHost};
@@ -29,7 +30,11 @@ use tokio::sync::watch;
 
 /// The columns a cluster of pie gateways enacts. Every worker that links to
 /// a controller can reach its peers, so helpers are always enactable.
-const SUPPORTED: &[&str] = &[tables::PLACEMENT_WORKERS, tables::PLACEMENT_HELPERS];
+const SUPPORTED: &[&str] = &[
+    tables::PLACEMENT_WORKERS,
+    tables::PLACEMENT_HELPERS,
+    tables::REPLICATION_WORKERS,
+];
 
 /// How often the policies hear what the directory and the routing table
 /// hold.
@@ -103,6 +108,10 @@ struct Tables {
     /// on, best first.
     helpers: HashMap<String, Vec<WorkerId>>,
     helpers_default: Option<Vec<WorkerId>>,
+    /// `replication/workers` rows: by prefix (a working set, and its first
+    /// tokens or all of it), the workers to hold a copy of it.
+    replicas: HashMap<(String, Option<u32>), Vec<WorkerId>>,
+    replicas_default: Option<Vec<WorkerId>>,
     /// Notes on a process, passed on with it: the worker plane reads them
     /// as `cluster/note/<writer>/<name>`.
     notes: HashMap<String, BTreeMap<String, String>>,
@@ -120,6 +129,9 @@ struct Shared {
     /// Each gateway's live processes: a default row reaches them.
     live: Mutex<HashMap<GatewayId, HashSet<u64>>>,
     views: Mutex<HashMap<GatewayId, watch::Sender<GatewayDecisions>>>,
+    /// The directory as last heard: the copies replication asks for are
+    /// the ones it does not show.
+    directory: RwLock<Arc<DirectoryView>>,
 }
 
 /// The cluster policies, running.
@@ -175,6 +187,7 @@ impl Host {
             terminated: Mutex::default(),
             live: Mutex::default(),
             views: Mutex::default(),
+            directory: RwLock::default(),
         });
         let (events, rx) = channel();
         std::thread::Builder::new()
@@ -222,7 +235,8 @@ impl Host {
         if let Some(view) = views.get(&gateway) {
             return view.subscribe();
         }
-        let mut view = decisions_of(&self.shared, gateway);
+        let courier = views.keys().all(|other| other.0 > gateway.0);
+        let mut view = decisions_of(&self.shared, gateway, courier);
         view.epoch = 1;
         let (tx, rx) = watch::channel(view);
         views.insert(gateway, tx);
@@ -258,7 +272,8 @@ impl Host {
 }
 
 /// `gateway`'s view as the rows leave it now, epoch 0.
-fn decisions_of(shared: &Shared, gateway: GatewayId) -> GatewayDecisions {
+/// `courier`: this gateway carries the copies replication asks for.
+fn decisions_of(shared: &Shared, gateway: GatewayId, courier: bool) -> GatewayDecisions {
     let mine = |id: &str| {
         at_gateway(id)
             .filter(|(g, _)| *g == gateway)
@@ -335,15 +350,100 @@ fn decisions_of(shared: &Shared, gateway: GatewayId) -> GatewayDecisions {
         heard,
         placements: placements.into_iter().collect(),
         terminated,
-        replicate: Vec::new(),
+        replicate: if courier { orders(shared) } else { Vec::new() },
     }
 }
 
 /// Each gateway's view, sent where it changed.
+/// For each working set `replication/workers` names, a copy for each named
+/// worker the directory does not show holding it, from a worker that does.
+/// A copy is kept at retention 0: the worker's own retention decides how
+/// long, not a key the cluster sets. A pool keeps it in host memory.
+fn orders(shared: &Shared) -> Vec<ReplicateOrder> {
+    let tables = shared.tables.read().unwrap();
+    if tables.replicas.is_empty() && tables.replicas_default.is_none() {
+        return Vec::new();
+    }
+    let directory = shared.directory.read().unwrap().clone();
+    let peer = |worker: WorkerId| {
+        directory
+            .peers
+            .iter()
+            .find(|(w, _)| *w == worker)
+            .map(|(_, peer)| peer.clone())
+    };
+    let page = |group: &controller_api::GroupView| {
+        group
+            .sites
+            .iter()
+            .find_map(|w| {
+                directory
+                    .disk_tiers
+                    .iter()
+                    .find(|(d, _)| d == w)
+                    .map(|(_, (page, _))| u64::from(*page).max(1))
+            })
+            .unwrap_or(1)
+    };
+    // By (group, worker): the most pages any row covering it wants there.
+    let mut wanted: BTreeMap<(String, WorkerId), usize> = BTreeMap::new();
+    for (key, group) in &directory.groups {
+        let id = hex(key);
+        let mut covers: Vec<(Option<u32>, &Vec<WorkerId>)> = tables
+            .replicas
+            .iter()
+            .filter(|((set, _), _)| *set == id)
+            .map(|((_, tokens), workers)| (*tokens, workers))
+            .collect();
+        if covers.is_empty()
+            && let Some(default) = &tables.replicas_default
+        {
+            covers.push((None, default));
+        }
+        for (tokens, workers) in covers {
+            // A page is covered when its first token is.
+            let pages = tokens.map_or(group.keys.len(), |tokens| {
+                (u64::from(tokens).div_ceil(page(group)) as usize).min(group.keys.len())
+            });
+            for &worker in workers {
+                if pages == 0 || group.sites.contains(&worker) {
+                    continue;
+                }
+                let at = wanted.entry((id.clone(), worker)).or_default();
+                *at = (*at).max(pages);
+            }
+        }
+    }
+    let groups: HashMap<String, &controller_api::GroupView> = directory
+        .groups
+        .iter()
+        .map(|(key, group)| (hex(key), group))
+        .collect();
+    wanted
+        .into_iter()
+        .filter_map(|((id, worker), pages)| {
+            let group = groups.get(&id)?;
+            let from = group.sites.iter().find_map(|holder| peer(*holder))?;
+            Some(ReplicateOrder {
+                group: id,
+                worker,
+                keys: group.keys[..pages].to_vec(),
+                from,
+                retention: 0,
+                disk: false,
+                table: tables::REPLICATION_WORKERS.to_string(),
+            })
+        })
+        .collect()
+}
+
 fn publish(shared: &Shared) {
     let gateways: Vec<GatewayId> = shared.views.lock().unwrap().keys().copied().collect();
+    // Workers dial gateways; the lowest-numbered linked one carries each
+    // copy, so it is asked once.
+    let courier = gateways.iter().map(|g| g.0).min();
     for gateway in gateways {
-        let view = decisions_of(shared, gateway);
+        let view = decisions_of(shared, gateway, courier == Some(gateway.0));
         if let Some(tx) = shared.views.lock().unwrap().get(&gateway) {
             tx.send_if_modified(|current| {
                 let epoch = current.epoch;
@@ -557,7 +657,8 @@ impl Port {
 
     /// The workers and the working sets, as the routing table and the
     /// directory have them now.
-    fn state(&mut self, view: &DirectoryView, table: &RoutingTable) {
+    fn state(&mut self, view: &Arc<DirectoryView>, table: &RoutingTable) {
+        *self.shared.directory.write().unwrap() = view.clone();
         let pools: HashSet<WorkerId> = view.pools.iter().copied().collect();
         let page: HashMap<WorkerId, u64> = view
             .disk_tiers
@@ -595,6 +696,22 @@ impl Port {
                 Some(Value::Text(worker.model.clone())),
             );
             now.insert(worker.id);
+        }
+        // A pool is a worker without a device tier: it keeps what it is sent
+        // in host memory, and serves nothing.
+        for pool in &pools {
+            if now.contains(pool) {
+                continue;
+            }
+            let id = pool.0.to_string();
+            self.host
+                .put_worker(&id, false, vec![(Tier::Host, None, 0)], 0, 0, None);
+            self.host.attr(
+                Subject::Worker(id),
+                "pie/role",
+                Some(Value::Text("pool".into())),
+            );
+            now.insert(*pool);
         }
         for gone in self.workers.difference(&now) {
             self.host.remove_worker(&gone.0.to_string());
@@ -645,6 +762,8 @@ impl Port {
             }
         }
         self.sets = sets;
+        // What replication asks for is what the directory does not show.
+        publish(&self.shared);
     }
 
     /// The rows a round committed.
@@ -680,6 +799,19 @@ impl Port {
         }
         if let Some(default) = delta.placement_helpers.default {
             tables.helpers_default = default.map(parse);
+        }
+        for (id, row) in delta.replication_workers.rows {
+            match row {
+                Some(list) => {
+                    tables.replicas.insert(id, parse(list));
+                }
+                None => {
+                    tables.replicas.remove(&id);
+                }
+            }
+        }
+        if let Some(default) = delta.replication_workers.default {
+            tables.replicas_default = default.map(parse);
         }
         for (writer, subject, name, value) in delta.notes {
             tracing::debug!(%writer, subject = %format!("{}/{}", subject.kind(), subject.id()), %name, ?value, "cluster policy note");
@@ -724,5 +856,58 @@ impl Port {
             false
         });
         moved
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use controller_api::GroupView;
+
+    fn shared(tables: Tables, directory: DirectoryView) -> Shared {
+        Shared {
+            tables: RwLock::new(tables),
+            heard: Mutex::default(),
+            dead: AtomicBool::new(false),
+            gate_ms: AtomicU64::new(0),
+            terminated: Mutex::default(),
+            live: Mutex::default(),
+            views: Mutex::default(),
+            directory: RwLock::new(Arc::new(directory)),
+        }
+    }
+
+    #[test]
+    fn replication_asks_each_named_worker_without_a_copy_for_the_pages_its_rows_cover() {
+        let group = GroupView {
+            keys: vec![[1; 32], [2; 32], [3; 32]],
+            sites: vec![WorkerId(0)],
+            disk_sites: Vec::new(),
+            persist_tokens: None,
+        };
+        let id = hex(&[3; 32]);
+        let directory = DirectoryView {
+            groups: vec![([3; 32], group)],
+            peers: vec![(WorkerId(0), "w0".into())],
+            disk_tiers: vec![(WorkerId(0), (16, false))],
+            ..Default::default()
+        };
+        let mut tables = Tables::default();
+        // 17 tokens cover two 16-token pages; all of it covers three; the
+        // worker that holds it is asked nothing.
+        tables.replicas.insert(
+            (id.clone(), Some(17)),
+            vec![WorkerId(0), WorkerId(1), WorkerId(9)],
+        );
+        tables
+            .replicas
+            .insert((id.clone(), None), vec![WorkerId(9)]);
+        let mut orders = orders(&shared(tables, directory));
+        orders.sort_by_key(|o| o.worker.0);
+        let asked: Vec<(u64, usize, &str, i64)> = orders
+            .iter()
+            .map(|o| (o.worker.0, o.keys.len(), o.from.as_str(), o.retention))
+            .collect();
+        assert_eq!(asked, [(1, 2, "w0", 0), (9, 3, "w0", 0)]);
     }
 }
