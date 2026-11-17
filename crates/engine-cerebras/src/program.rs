@@ -93,15 +93,29 @@ pub struct Plane {
 
 impl Plane {
     pub fn register(&mut self, registration: &ProgramRegistration) -> Result<ProgramId, Refusal> {
-        let plan = eta_exec::adopt_launch_package(registration.launch.clone())
-            .map_err(|error| Refusal::Program(error.to_string()))?;
+        self.finish(Plane::adopt(registration))
+    }
+
+    /// A registration's compile, on any thread: the program adopted, or
+    /// why it is refused, by its hash.
+    pub fn adopt(registration: &ProgramRegistration) -> Result<ExecPlan, Refusal> {
+        let hash = registration.program_hash;
+        let plan = eta_exec::adopt_launch_package(registration.launch.clone()).map_err(|error| {
+            Refusal::Program(format!("program 0x{hash:016x} does not adopt: {error}"))
+        })?;
         if !plan.executable {
             return Err(Refusal::Program(format!(
-                "program 0x{:016x} calls a semantic boundary this backend does not implement: {}",
-                registration.program_hash,
+                "program 0x{hash:016x} calls a semantic boundary this backend does not implement: {}",
                 plan.reject_reason.as_deref().unwrap_or("no reason given")
             )));
         }
+        Ok(plan)
+    }
+
+    /// A registration's last step, on the engine's thread: the adopted
+    /// program's id, or its compile's refusal.
+    pub fn finish(&mut self, adopted: Result<ExecPlan, Refusal>) -> Result<ProgramId, Refusal> {
+        let plan = adopted?;
         self.next_program += 1;
         let id = ProgramId(self.next_program);
         tracing::debug!(program = id.0, "guest program registered");
