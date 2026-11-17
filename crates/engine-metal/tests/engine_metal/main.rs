@@ -22,6 +22,7 @@ mod a_scattered_pool_serves_the_same_logits;
 mod a_settled_fires_fold_is_told_before_it_returns;
 mod a_stated_position_bounds_no_key;
 mod a_stale_frozen_length_replays_from_where_the_record_stands;
+mod a_stated_group_mask_reads_only_the_rows_it_admits;
 mod a_ternary_decode_in_dot_answers_the_host_decoder;
 mod a_tower_region_reads_the_patch_window;
 mod a_verify_walk_is_the_committed_walk;
