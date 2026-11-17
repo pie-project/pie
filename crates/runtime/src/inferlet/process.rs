@@ -456,15 +456,26 @@ pub fn get_runtime_stats() -> RuntimeProcessStats {
 
 pub fn init_admission(max_concurrent: Option<usize>) {
     let limit = max_concurrent.filter(|&n| n > 0);
-    // Only the first gate, prewarm, holds below the floor.
-    let sem = limit.map(|n| OrderedSemaphore::new("execution", n, false));
+    // Passed in this order: none passes a gate ahead of a higher key
+    // waiting at an earlier one.
     let prewarm = Some(OrderedSemaphore::new(
         "prewarm",
         limit.unwrap_or(UNCAPPED_PREWARM_PROCESSES),
         true,
     ));
     const STAGED_COHORTS: usize = 1;
-    let bind_ahead = limit.map(|n| OrderedSemaphore::new("bind", n, false));
+    let earlier = |gates: &[&Option<Arc<OrderedSemaphore>>]| -> Vec<Arc<OrderedSemaphore>> {
+        gates
+            .iter()
+            .filter_map(|gate| gate.as_ref().map(Arc::clone))
+            .collect()
+    };
+    let bind_ahead = limit.map(|n| OrderedSemaphore::after("bind", n, false, earlier(&[&prewarm])));
+    let sem = limit.map(|n| {
+        // A held process is not started: it waits here, bound, until its
+        // row lets it, and the others pass it.
+        OrderedSemaphore::after("execution", n, true, earlier(&[&prewarm, &bind_ahead]))
+    });
     BIND_STAGED_RESERVE.store(
         limit.map_or(0, |n| n.saturating_mul(STAGED_COHORTS)),
         Relaxed,
