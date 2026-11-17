@@ -3218,3 +3218,44 @@ The link and congestion terms are reported beside it, uncalibrated, until a chip
   A uniform shift of every block builds, with the floor, links and palette translated.
   GEMM and tiled programs (klein text, denoise, VAE) are one rigid array each and are not
   placed yet; their identity is untouched.
+
+### P1.c (first): co-resident readings packed in 2D
+
+**The failure.** Klein's compile on load (`prepare::stream_programs`, 64 rows) failed to link
+on the CS system. `coresident::combine` laid the readings side by side:
+
+| reading | size (w x h) | x | y |
+|---|---|---|---|
+| text | 256 x 877 | 0 | 0 |
+| denoise | 384 x 1,014 | 256 | 0 |
+| vae.decode | 130 x 148 | 640 | 0 |
+
+That is 770 x 1,014 in all, against the 755 x 1,170 the system leaves past the memcpy halo.
+cslc refused the rectangle ("width '770' does not fit in fabric with width '762' at horizontal
+offset '4'"). The `vae.encode` reading is refused by the stream compiler, as before.
+
+**The fix.** `combine` now places the readings through `place::Problem`, one block a reading
+with no nets between them (`place::pack`):
+- **Where side by side fits the bounds**, it is kept: no price reads where a reading sits, so
+  the program's own placement wins a tie.
+- **Otherwise the readings are packed in 2D**: bottom-left over every order of the readings,
+  taking the smallest bounding box, then the least height.
+- **Each reading's lines are rewritten by its (x, y)**: its tiles, routes and loops (x and y
+  ranges), and its host arrays (`h2d`, `d2h`, `argmax`, `origin`). The engine already reads
+  `origin` as (x, y).
+- **A state root** (a decode program's) off row 0 is refused by name; that move is not
+  written yet.
+
+**Klein packed: 640 x 1,025.**
+
+| reading | x | y |
+|---|---|---|
+| text | 0 | 0 |
+| denoise | 256 | 0 |
+| vae.decode | 0 | 877 (under the text) |
+
+It links for the system fabric: cslc 2.10.1 in the SDK image, `--fabric-dims=762,1172
+--fabric-offsets=4,1`, rc 0 in 241 s, 316 ELFs.
+
+**flux2-mini** fits side by side (178 x 523). Its combined program is byte-identical to
+origin's, all 201 files.
