@@ -227,3 +227,46 @@ mod nvml {
         Ok((memory.total, memory.used))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Integrated;
+
+    const MIB: u64 = 1 << 20;
+
+    #[test]
+    fn an_integrated_device_takes_its_carve_out_less_what_is_held() {
+        // An RTX Spark at load: 64000 MiB carved out, 953 held, 90304 MiB
+        // of commit left.
+        let terms = Integrated {
+            dedicated: 64000 * MIB,
+            held: 953 * MIB,
+            commit_available: 90304 * MIB,
+        };
+        assert_eq!(terms.free(), 63047 * MIB);
+    }
+
+    #[test]
+    fn windows_commit_bounds_an_integrated_device() {
+        let terms = Integrated {
+            dedicated: 64000 * MIB,
+            held: 953 * MIB,
+            commit_available: 20000 * MIB,
+        };
+        assert_eq!(
+            terms.free(),
+            20000 * MIB,
+            "every device byte is charged to commit"
+        );
+    }
+
+    #[test]
+    fn a_device_held_past_its_carve_out_has_nothing_free() {
+        let terms = Integrated {
+            dedicated: 64000 * MIB,
+            held: 70000 * MIB,
+            commit_available: 90304 * MIB,
+        };
+        assert_eq!(terms.free(), 0);
+    }
+}
