@@ -85,10 +85,9 @@ pub const ROUNDS: usize = 5;
 pub const LAUNCH_ROUNDS: usize = 15;
 
 /// The rates of device `ordinal` under `chip`'s tuning, its matmuls under
-/// the GEMM tactics serving picks from `cache` (the engine's cache root,
-/// `$PIE_HOME/cache`, whose `gemm-algos` table a served load reads): a
-/// shape it holds runs its pick, and one it does not is timed once and kept
-/// there, so every later measurement and every load runs that same pick.
+/// the GEMM tactic tables the caller installed
+/// (`kernels_cuda::linear::gemm::install_tactics`, as a served load does),
+/// the kernels' disk cache under `cache` (`$PIE_HOME/cache`).
 pub fn measure(
     ordinal: i32,
     chip: &profile::Profile,
