@@ -388,6 +388,35 @@ pub enum Drift<'a> {
     Depth { top: f32, steps: f32 },
 }
 
+/// The top-p sampler a parting's decision was drawn under: a token is kept
+/// while the probability mass (at `temperature`) of the tokens ranked above
+/// it is below `top_p`, as `CummassLe` keeps it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Nucleus {
+    pub temperature: f32,
+    pub top_p: f32,
+}
+
+/// Which clause of the rule admitted a parting ([`near_tie`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Clause {
+    /// The decision's gap is within twice the drift.
+    Gap,
+    /// A contested token's nucleus membership flipped on the drift's move of
+    /// the mass above it.
+    NucleusEdge,
+}
+
+impl Clause {
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Clause::Gap => "gap",
+            Clause::NucleusEdge => "nucleus-edge",
+        }
+    }
+}
+
 /// A parting of two runs read under contract A: what was measured and the
 /// verdict.
 #[derive(Clone, Debug, PartialEq)]
@@ -410,6 +439,11 @@ pub struct Parting {
     /// Whether the drift is diffuse: no contested token moved more than
     /// every other entry of the row. `None` where no row was measured.
     pub diffuse: Option<bool>,
+    /// Each contested token's exclusive mass (the mass ranked above it) in
+    /// each path, where a [`Nucleus`] was given and rows were measured.
+    pub excl: Vec<(f64, f64)>,
+    /// The clause that admitted the parting; `None` where none did.
+    pub clause: Option<Clause>,
     /// The verdict: a near-tie contract A admits.
     pub tie: bool,
 }
@@ -417,28 +451,41 @@ pub struct Parting {
 /// Whether two runs that part at one step part on a near-tie contract A
 /// admits ("equal up to stated bf16 near-ties"), the decision there going
 /// to a different one of `contested` (each path's pick) by `gap` (the
-/// decision's top-1 less its top-2, in logit units).
+/// decision's top-1 less its top-2, in logit units), drawn under `nucleus`
+/// where a top-p sampler drew it.
 ///
-/// The rule, as stated for the contract:
-/// 1. The gap is within twice the largest per-logit drift between the two
-///    paths at that step, measured over the full row: each of the two
-///    contested logits may round its own way by up to that drift, so the
-///    pair's difference can move by twice it.
-/// 2. The drift is diffuse: a contested token's |drift| is an outlier when
-///    it exceeds the |drift| of every entry of the row other than the
-///    contested pair, i.e. the move that decided the parting is larger than
-///    any move rounding made anywhere else in the row. A concentrated move
-///    on the contested tokens is a bug even within the gap bound: rounding
-///    has no reason to favour the two tokens the decision weighed.
+/// The rule, as stated for the contract. The drift must be diffuse, and one
+/// of the two clauses must hold:
+/// - Diffuse: a contested token's |drift| is an outlier when it exceeds the
+///   |drift| of every entry of the row other than the contested pair, i.e.
+///   the move that decided the parting is larger than any move rounding
+///   made anywhere else in the row. A concentrated move on the contested
+///   tokens is a bug even within the bounds below: rounding has no reason
+///   to favour the tokens the decision weighed.
+/// - Gap ([`Clause::Gap`]): the gap is within twice the largest per-logit
+///   drift between the two paths at that step, measured over the full row:
+///   each of the two contested logits may round its own way by up to that
+///   drift, so the pair's difference can move by twice it.
+/// - Nucleus edge ([`Clause::NucleusEdge`]): a contested token is kept by
+///   one path's nucleus and not the other's (`top_p` lies between its two
+///   exclusive masses), and the masses differ by no more than the largest
+///   drift `D` can move them: `excl x (e^(2 D / T) - 1)`, every probability
+///   above the token scaled by at most `e^(2 D / T)` against the sum.
 ///
-/// Without a row ([`Drift::Depth`]) only rule 1 is read, against twice the
-/// stated drift (2 x bf16 step x the propagated depth bound), and
-/// `diffuse` is `None`.
+/// Without a row ([`Drift::Depth`]) only the gap clause is read, against
+/// twice the stated drift (2 x bf16 step x the propagated depth bound),
+/// and `diffuse` is `None`.
 #[must_use]
-pub fn near_tie(gap: f32, contested: &[usize], drift: Drift<'_>) -> Parting {
+pub fn near_tie(
+    gap: f32,
+    contested: &[usize],
+    drift: Drift<'_>,
+    nucleus: Option<Nucleus>,
+) -> Parting {
     match drift {
         Drift::Depth { top, steps } => {
             let drift = bf16_step(top) * steps;
+            let tie = gap <= 2.0 * drift;
             Parting {
                 gap,
                 drift_max: drift,
@@ -446,7 +493,9 @@ pub fn near_tie(gap: f32, contested: &[usize], drift: Drift<'_>) -> Parting {
                 ranks: Vec::new(),
                 bound: 2.0 * drift,
                 diffuse: None,
-                tie: gap <= 2.0 * drift,
+                excl: Vec::new(),
+                clause: tie.then_some(Clause::Gap),
+                tie,
             }
         }
         Drift::Rows { a, b } => {
@@ -471,6 +520,30 @@ pub fn near_tie(gap: f32, contested: &[usize], drift: Drift<'_>) -> Parting {
                 .fold(0.0f32, f32::max);
             let diffuse = contested.iter().all(|&token| at(token) <= elsewhere);
             let bound = 2.0 * drift_max;
+            let excl: Vec<(f64, f64)> = nucleus.map_or_else(Vec::new, |n| {
+                contested
+                    .iter()
+                    .map(|&token| {
+                        (
+                            exclusive_mass(a, n.temperature, token),
+                            exclusive_mass(b, n.temperature, token),
+                        )
+                    })
+                    .collect()
+            });
+            let edge = nucleus.is_some_and(|n| {
+                excl.iter()
+                    .any(|&(x, y)| nucleus_edge(x, y, n, drift_max))
+            });
+            let clause = if !diffuse {
+                None
+            } else if gap <= bound {
+                Some(Clause::Gap)
+            } else if edge {
+                Some(Clause::NucleusEdge)
+            } else {
+                None
+            };
             Parting {
                 gap,
                 drift_max,
@@ -478,10 +551,44 @@ pub fn near_tie(gap: f32, contested: &[usize], drift: Drift<'_>) -> Parting {
                 ranks,
                 bound,
                 diffuse: Some(diffuse),
-                tie: gap <= bound && diffuse,
+                excl,
+                clause,
+                tie: clause.is_some(),
             }
         }
     }
+}
+
+/// The probability mass `row`'s softmax at `temperature` ranks above
+/// `token`: every token of greater probability, and of equal probability at
+/// a lower index, as a descending sort orders them.
+#[must_use]
+pub fn exclusive_mass(row: &[f32], temperature: f32, token: usize) -> f64 {
+    let t = f64::from(temperature);
+    let top = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let weight = |x: f32| ((f64::from(x) - f64::from(top)) / t).exp();
+    let total: f64 = row.iter().map(|x| weight(*x)).sum();
+    let Some(&own) = row.get(token) else {
+        return f64::NAN;
+    };
+    row.iter()
+        .enumerate()
+        .filter(|&(at, x)| *x > own || (*x == own && at < token))
+        .map(|(_, x)| weight(*x))
+        .sum::<f64>()
+        / total
+}
+
+/// The nucleus-edge clause of [`near_tie`] for one contested token whose
+/// exclusive mass is `a` in one path and `b` in the other: the nucleus
+/// keeps it in one path alone, and the masses differ by no more than a
+/// drift of `drift_max` moves them.
+#[must_use]
+pub fn nucleus_edge(a: f64, b: f64, nucleus: Nucleus, drift_max: f32) -> bool {
+    let p = f64::from(nucleus.top_p);
+    let flipped = (a < p) != (b < p);
+    let reach = a.max(b) * ((2.0 * f64::from(drift_max) / f64::from(nucleus.temperature)).exp() - 1.0);
+    flipped && (a - b).abs() <= reach
 }
 
 #[cfg(test)]
@@ -561,24 +668,53 @@ mod tests {
         // The contested pair: 943 and 729's moves, -1 and +2 steps.
         b[5] = a[5] - step;
         b[7] = a[7] + 2.0 * step;
-        let parting = near_tie(0.092, &[5, 7], Drift::Rows { a: &a, b: &b });
+        let parting = near_tie(0.092, &[5, 7], Drift::Rows { a: &a, b: &b }, None);
         assert!(parting.tie, "{parting:?}");
         assert_eq!(parting.drift_max, 3.0 * step);
         assert_eq!(parting.diffuse, Some(true));
         assert!(parting.ranks.iter().all(|rank| *rank > 0), "{:?}", parting.ranks);
-        assert!(!near_tie(0.40, &[5, 7], Drift::Rows { a: &a, b: &b }).tie, "past twice the drift");
+        assert!(!near_tie(0.40, &[5, 7], Drift::Rows { a: &a, b: &b }, None).tie, "past twice the drift");
 
         // The decision's pair alone moving past every other entry: structured.
         let mut c = a.clone();
         c[3] = a[3] + step;
         c[5] = a[5] - 2.0 * step;
         c[7] = a[7] + 2.0 * step;
-        let concentrated = near_tie(0.092, &[5, 7], Drift::Rows { a: &a, b: &c });
+        let concentrated = near_tie(0.092, &[5, 7], Drift::Rows { a: &a, b: &c }, None);
         assert_eq!(concentrated.diffuse, Some(false));
         assert!(!concentrated.tie, "{concentrated:?}");
         assert_eq!(concentrated.ranks, vec![0, 0]);
 
-        let stated = near_tie(0.092, &[5, 7], Drift::Depth { top: 14.0625, steps: 1.0 });
+        let stated = near_tie(0.092, &[5, 7], Drift::Depth { top: 14.0625, steps: 1.0 }, None);
         assert_eq!((stated.bound, stated.diffuse, stated.tie), (0.125, None, true));
+    }
+
+    /// Seed 12's parting (Qwen3-0.6B on Vulkan, top-p T 0.6 p 0.95, token
+    /// 16): a 1.45 gap past twice its 0.219 drift, but token 990's
+    /// exclusive mass is 0.9522 in one path (dropped) and 0.9477 in the
+    /// other (kept): the nucleus edge moved across p on rounding. A row
+    /// built the same way is admitted by that clause, by name; the same
+    /// flip on a mass move the drift cannot reach is not.
+    #[test]
+    fn a_nucleus_edge_crossed_on_rounding_is_a_tie_by_its_own_clause() {
+        let seed12 = Nucleus { temperature: 0.6, top_p: 0.95 };
+        assert!(nucleus_edge(0.952_162, 0.947_712, seed12, 0.218_75));
+        assert!(!nucleus_edge(0.952_162, 0.951_000, seed12, 0.218_75), "kept by neither");
+        assert!(!nucleus_edge(0.99, 0.90, seed12, 0.001), "past what the drift moves");
+
+        // Three tokens at T 1: token 2's mass above it is 0.952 in one path
+        // (dropped at p 0.95) and 0.9475 in the other (kept); token 1 moves
+        // more than either contested token, so the drift is diffuse.
+        let nucleus = Nucleus { temperature: 1.0, top_p: 0.95 };
+        let logits = |probs: [f64; 3]| probs.map(|p| p.ln() as f32).to_vec();
+        let a = logits([0.900, 0.052, 0.048]);
+        let b = logits([0.890, 0.0575, 0.0525]);
+        let parting = near_tie(1.0, &[0, 2], Drift::Rows { a: &a, b: &b }, Some(nucleus));
+        assert_eq!(parting.clause, Some(Clause::NucleusEdge), "{parting:?}");
+        assert!(parting.tie);
+        assert_eq!(Clause::NucleusEdge.name(), "nucleus-edge");
+        assert!((parting.excl[1].0 - 0.952).abs() < 1e-6 && (parting.excl[1].1 - 0.9475).abs() < 1e-6);
+        assert_eq!(near_tie(1.0, &[0, 2], Drift::Rows { a: &a, b: &b }, None).clause, None);
+        assert_eq!(near_tie(0.01, &[0, 2], Drift::Rows { a: &a, b: &b }, Some(nucleus)).clause, Some(Clause::Gap));
     }
 }
