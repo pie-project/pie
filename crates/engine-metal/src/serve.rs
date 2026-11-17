@@ -1758,13 +1758,16 @@ impl Shell {
                 span_host(pools, at, bytes)
             })?;
         // The runtime backed the tables below the carve before the bind
-        // (`engine::Engine::standing_after`), and the span covers them.
-        debug_assert!(
-            bottom >= self.arena.end() - self.pools.covered(),
-            "the guests' batch tables take {} bytes under the carve, past the {} the span backs",
-            top - bottom,
-            top.saturating_sub(self.arena.end() - self.pools.covered()),
-        );
+        // (`engine::Engine::standing_after`), and the span covers them:
+        // laid past it they would lie on chunks the runtime lends to state.
+        let backed = self.arena.end() - self.pools.covered();
+        if bottom < backed {
+            return Err(Fault::Ceiling {
+                what: "bytes of the backed span under the carve for the guests' batch tables",
+                need: top - bottom,
+                have: top.saturating_sub(backed),
+            });
+        }
         self.batch_bottom = bottom;
         Ok(())
     }
@@ -3015,10 +3018,28 @@ impl Shell {
             return Ok(());
         };
         let waited = flight.pending.wait();
-        // Settling inside submit: the sink hears the fire here, the buffer
-        // complete, before the harvest (and so the submit) returns.
+        // Each attached instance's epilogue, settled once the buffer
+        // completed: one that did not commit faults its own lanes alone,
+        // and the rest of the step commits.
+        let mut faulted = Vec::new();
+        if waited.is_ok() {
+            for (instance, lanes) in &flight.attached {
+                let outcome = self
+                    .programs
+                    .settle_launched(*instance)
+                    .and_then(|fired| match fired {
+                        crate::Fired::Committed => Ok(()),
+                        other => Err(refused(&other, *instance)),
+                    });
+                if let Err(fault) = outcome {
+                    faulted.push((lanes.clone(), *instance, fault.to_string()));
+                }
+            }
+        }
+        // The sink hears the fire here, the buffer complete and its
+        // epilogues settled, before the harvest returns.
         if let Some(told) = flight.told.as_ref() {
-            told(waited.as_ref().err().map(ToString::to_string));
+            told(waited.as_ref().err().map(ToString::to_string), &faulted);
         }
         if let Some(keepalive) = &self.keepalive {
             keepalive.end();
@@ -3041,19 +3062,6 @@ impl Shell {
                 },
                 other => other,
             });
-        }
-        let mut refusal: Option<Fault> = None;
-        for instance in &flight.attached {
-            let outcome = self
-                .programs
-                .settle_launched(*instance)
-                .and_then(|fired| match fired {
-                    crate::Fired::Committed => Ok(()),
-                    other => Err(refused(&other, *instance)),
-                });
-            if let Err(fault) = outcome {
-                refusal.get_or_insert(fault);
-            }
         }
 
         if let Some(plane) = self.nan_flags.as_ref() {
@@ -3111,10 +3119,7 @@ impl Shell {
         if !self.forgotten.remove(&flight.seq) {
             self.landed.insert(flight.seq, rows);
         }
-        match refusal {
-            Some(fault) => Err(fault),
-            None => Ok(()),
-        }
+        Ok(())
     }
 
     /// Where lane `lane`'s voxels of grid output `out` start: the plane's
@@ -3454,7 +3459,7 @@ impl Shell {
                 flight
                     .attached
                     .iter()
-                    .any(|held| instances.contains(held) || cohort.contains(held))
+                    .any(|(held, _)| instances.contains(held) || cohort.contains(held))
             })
             .map(|flight| flight.seq)
         {
@@ -5504,7 +5509,8 @@ pub struct Enqueued<'a> {
     arm: usize,
     lanes: usize,
     launches: u32,
-    attached: Vec<engine::InstanceId>,
+    /// Each attached instance and the step's lanes it is attached at.
+    attached: Vec<(engine::InstanceId, std::ops::Range<u32>)>,
     /// Each lane's read-back row: its output's name, width and element bytes.
     readbacks: Vec<Option<(String, u32, u64)>>,
     /// What the harvest tells the completion sink, where the engine settles
@@ -5550,13 +5556,20 @@ struct Flight {
     arm: usize,
     lanes: usize,
     pending: Pending,
-    attached: Vec<engine::InstanceId>,
+    /// Each attached instance and the step's lanes it is attached at.
+    attached: Vec<(engine::InstanceId, std::ops::Range<u32>)>,
     readbacks: Vec<Option<(String, u32, u64)>>,
     told: Option<Told>,
 }
 
-/// A fire's word to its completion sink, given why its buffer failed.
-type Told = Box<dyn Fn(Option<String>) + Send>;
+/// A fire's word to its completion sink, given why its buffer failed, or
+/// the attached instances whose epilogues faulted: their lanes, the
+/// instance and why.
+type Told = Box<dyn Fn(Option<String>, &[Faulted]) + Send>;
+
+/// An attached instance whose epilogue did not commit: the step's lanes it
+/// is attached at, the instance, and why.
+type Faulted = (std::ops::Range<u32>, engine::InstanceId, String);
 
 impl engine::frame::Shell for Shell {
     type Step<'a> = StepView<'a>;
@@ -5640,7 +5653,18 @@ impl engine::frame::Shell for Shell {
             }
         }
 
-        let attached = self.encode_epilogues(&mut frame, &prepared)?;
+        let attached: Vec<(engine::InstanceId, std::ops::Range<u32>)> = self
+            .encode_epilogues(&mut frame, &prepared)?
+            .into_iter()
+            .map(|instance| {
+                let lanes = prepared
+                    .attachments
+                    .iter()
+                    .find(|a| a.instance == instance && !a.adapter_only)
+                    .map_or(0..0, |a| a.lane..a.lane + a.lanes.max(1));
+                (instance, lanes)
+            })
+            .collect();
         fire_trace(|| "epilogues-encoded".to_string());
 
         self.advance(&prepared);
@@ -5653,11 +5677,17 @@ impl engine::frame::Shell for Shell {
         let lanes = u32::try_from(prepared.lanes.len()).unwrap_or(u32::MAX);
         // What the fire tells its completion sink once its buffer completed:
         // its folds and ends, or why it failed.
-        let tell: Told = Box::new(move |refused: Option<String>| {
+        let tell: Told = Box::new(move |refused: Option<String>, faulted: &[Faulted]| {
             let refused = refused.or_else(|| verdict.as_ref().and_then(|verdict| verdict()));
             if let Some(done) = done.as_ref() {
                 let outcome = match &refused {
-                    None => engine::StepOutcome::wrote(ends.clone()),
+                    None => {
+                        let mut outcome = engine::StepOutcome::wrote(ends.clone());
+                        for (lanes, instance, why) in faulted {
+                            outcome.fault_lanes(lanes.clone(), Some(*instance), why);
+                        }
+                        outcome
+                    }
                     Some(why) => engine::StepOutcome::lost(
                         lanes,
                         format!(
@@ -5672,8 +5702,10 @@ impl engine::frame::Shell for Shell {
         // One frame in flight: the engine settles inside submit, and the sink
         // has each step's reports before submit returns, told from the
         // harvest on this thread once the buffer completed. More: the
-        // completion handler tells it.
-        let (in_handler, at_harvest) = if self.arms.depth() == 1 {
+        // completion handler tells it, unless a program is attached: its
+        // epilogue's verdict is read and committed on this thread, at the
+        // harvest, and the sink hears which lanes faulted from there.
+        let (in_handler, at_harvest) = if self.arms.depth() == 1 || !attached.is_empty() {
             (None, Some(tell))
         } else {
             (Some(tell), None)
@@ -5681,7 +5713,7 @@ impl engine::frame::Shell for Shell {
         let pending = frame.commit_async(Some(Box::new(move |refused: Option<String>| {
             counts.leave();
             if let Some(tell) = in_handler.as_ref() {
-                tell(refused);
+                tell(refused, &[]);
             }
         })));
         let pending = match pending {

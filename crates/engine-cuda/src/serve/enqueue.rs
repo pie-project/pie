@@ -184,6 +184,7 @@ impl Shell {
             rs_scratch,
             predicate: &mut self.predicate,
             readout_rows: &mut self.readout_rows,
+            capture: self.capture.as_mut(),
             budget: &self.budget,
             fire_lanes,
             owed: &mut self.owed,
@@ -253,6 +254,8 @@ struct FireCtx<'a> {
     rs_scratch: Option<(u64, u64)>,
     predicate: &'a mut Predicate,
     readout_rows: &'a mut Buffer,
+    /// Where the fire's capturing lanes write their readers' rows.
+    capture: Option<&'a mut crate::scores::CaptureLayout>,
     budget: &'a Budget,
     /// The most lanes a fire carries, as the runtime is told.
     fire_lanes: u32,
@@ -351,6 +354,65 @@ impl Shell {
 }
 
 impl FireCtx<'_> {
+    /// Stages the capture rows' tables (`crate::scores`): for each of the
+    /// fire's lanes, in the fire's order, the key row of the reader attached
+    /// at it where its class captures, and 0 for any other. Staged each
+    /// fire, so a row is found wherever its reader's slots lie now. Every
+    /// capturing lane a fire carries has its reader attached
+    /// (`engine::fire::Step::validate_captures`); arming's fires bind no
+    /// reader and name no row.
+    fn lay_capture(&mut self, p: &Prepared<'_>) -> Result<()> {
+        let Some(layout) = self.capture.as_deref_mut() else {
+            return Ok(());
+        };
+        let lanes = p.composition.lanes();
+        let mut keys_at = vec![0u64; lanes.len()];
+        for (at, row) in lanes.iter().enumerate() {
+            if self.arming || !layout.captures(row.class as usize) {
+                continue;
+            }
+            let source = row.source;
+            let attached = p
+                .attachments
+                .iter()
+                .find(|attached| {
+                    !attached.adapter_only
+                        && (attached.lane..attached.lane + attached.lanes.max(1)).contains(&source)
+                })
+                .ok_or_else(|| {
+                    Fault::program(
+                        "serve::lay_capture",
+                        format!(
+                            "lane {source} captures its attention scores and no reader is \
+                             attached at it: only the fire that runs a pass's program captures \
+                             (engine::fire::Step::validate_captures refuses this at submit)"
+                        ),
+                    )
+                })?;
+            if attached.lanes > 1 {
+                return Err(Fault::program(
+                    "serve::lay_capture",
+                    format!(
+                        "lane {source} captures its attention scores, and instance {} is \
+                         attached at {} lanes: an instance holds one lane's score rows",
+                        attached.instance, attached.lanes
+                    ),
+                ));
+            }
+            keys_at[at] = self.programs.score_rows(attached.instance).ok_or_else(|| {
+                Fault::program(
+                    "serve::lay_capture",
+                    format!(
+                        "lane {source} captures its attention scores, and instance {} attached \
+                         at it reads none of them, so it holds no score rows",
+                        attached.instance
+                    ),
+                )
+            })?;
+        }
+        layout.stage(self.device.stream(), &keys_at)
+    }
+
     fn gate(&mut self, p: &Prepared<'_>) -> Result<()> {
         let lane_count = p.composition.lane_count();
         if p.rs.predicated || p.rs.truncates {
@@ -601,6 +663,7 @@ impl FireCtx<'_> {
             carve_lanes,
         )?;
         self.programs.set_span(span);
+        self.lay_capture(p)?;
         if let Some(ep) = self.ep {
             ep.seats(forked)
                 .seat(ep.wire(), p.composition.bucket(), &mut slots);
@@ -774,6 +837,10 @@ impl FireCtx<'_> {
             device: self.device.device(),
             toggles: self.device.toggles(),
             capture: self.graphs.shaped(),
+            score_rows: self
+                .capture
+                .as_deref()
+                .map(crate::scores::CaptureLayout::seat),
         };
         let place = At::new();
         let stream = Cell::new(0u32);
@@ -1240,6 +1307,36 @@ impl FireCtx<'_> {
         first_voxel: u32,
     ) -> Result<()> {
         let name = &out.decl.name;
+        // A capturing lane's rows are its reader's state, not the arena's:
+        // its key row, then its page row.
+        if crate::scores::captured(name) {
+            let (Some(keys_at), Some(layout)) =
+                (self.programs.score_rows(instance), self.capture.as_deref())
+            else {
+                return Err(Fault::Unbound {
+                    what: format!(
+                        "output `{name}` of lane {k}, which instance {instance} holds no score \
+                         rows for"
+                    ),
+                });
+            };
+            let (keys, pages) = layout.widths();
+            let (at, width) = if name == crate::scores::SCORES {
+                (keys_at, keys)
+            } else {
+                (keys_at + layout.key_bytes(), pages)
+            };
+            return self.programs.bind_output(
+                instance,
+                name,
+                k,
+                at,
+                crate::program::launch::INTRINSIC_STORAGE_F32,
+                width,
+                width,
+                0,
+            );
+        }
         let plane = plane_of(out.values[0], name)?;
         let storage = storage_of(plane.dtype)?;
         let width = plane.width;

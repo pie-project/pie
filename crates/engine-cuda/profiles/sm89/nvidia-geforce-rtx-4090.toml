@@ -12,7 +12,6 @@ gemm.heuristics = 4  # 1.5% faster end to end
 # which never reads it here (bf16 expert banks; its experts are MXFP4): the win was noise.
 qmm.split_thin_max = 16  # 1.0% faster end to end
 qmm.split_warps_per_sm = 36  # 1.0% faster end to end
-sdpa.decode.static_max_requests = 320  # 2.5% faster end to end
 sdpa.merge_warp = true  # 1.4% faster end to end
 # ssm.kda_step_fused = true reset to its default: the tune timed it 1.0% faster on gpt-oss-20b,
 # which never reads it here (a recurrent (SSM) path; it has none): the win was noise.
@@ -122,9 +121,6 @@ measured = [
   "kernel.sdpa.decode.gqa_deep_64",
   "kernel.sdpa.decode.grouped_prefill_lse",
   "kernel.sdpa.decode.grouped_prefill_window",
-  "kernel.sdpa.decode.split_small",
-  "kernel.sdpa.decode.split_window",
-  "kernel.sdpa.decode.static_max_requests",
   "kernel.sdpa.fa2_live",
   "kernel.sdpa.merge_warp",
   "kernel.sdpa.prefill.ctas_per_sm",

@@ -33,6 +33,7 @@ pub mod rates;
 pub mod record;
 pub mod replay;
 pub mod run;
+pub mod scores;
 pub mod serve;
 pub mod settle;
 pub mod sizing;

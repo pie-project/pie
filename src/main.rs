@@ -167,7 +167,7 @@ async fn serve(global: pie::args::GlobalArgs, diag: Option<&str>) -> anyhow::Res
         global,
     )?;
     let (controller, gateway, mut worker) =
-        worker::standalone::derive_standalone(ctx.config_str())?;
+        worker::standalone::derive_standalone(ctx.config_str(), Some(ctx.config_path()))?;
     if let Some(words) = diag {
         worker.state_diagnostics(words)?;
     }
@@ -183,10 +183,12 @@ async fn serve(global: pie::args::GlobalArgs, diag: Option<&str>) -> anyhow::Res
     // SIGHUP swaps both planes' policies for the file's; nothing else in it
     // is read again.
     let reload = handle.policy_reload();
+    let path = ctx.config_path().to_path_buf();
     ctx.on_hangup(move |config| {
         let reload = reload.clone();
+        let path = path.clone();
         async move {
-            let config = match worker::standalone::derive_standalone(&config) {
+            let config = match worker::standalone::derive_standalone(&config, Some(&path)) {
                 Ok((_, _, worker)) => worker,
                 Err(e) => {
                     tracing::error!(

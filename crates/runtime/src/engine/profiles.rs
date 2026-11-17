@@ -69,6 +69,29 @@ pub struct TuneRequest<'a> {
     pub rates: bool,
 }
 
+impl<'a> TuneRequest<'a> {
+    /// A quick tune over these directories, every choice off: what a caller
+    /// fills the rest of a request from (`..TuneRequest::at(..)`), so a
+    /// field this build carries under a feature the caller's crate does not
+    /// see (the workspace's feature unification turns `engine-cuda` on here
+    /// for one member and not another) still has its value.
+    #[must_use]
+    pub fn at(profiles: &'a Path, artifacts: &'a Path, cache: &'a Path) -> TuneRequest<'a> {
+        TuneRequest {
+            full: false,
+            profiles,
+            artifacts,
+            check: &[],
+            no_check: false,
+            cache,
+            refit: false,
+            check_estimate: false,
+            dissect: &[],
+            rates: false,
+        }
+    }
+}
+
 /// What a tune produced.
 pub struct Tuned {
     pub device: String,

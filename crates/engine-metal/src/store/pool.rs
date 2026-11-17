@@ -603,6 +603,24 @@ impl Pool {
         backed
     }
 
+    /// Refuses logical chunk `logical`, on physical chunk `physical`,
+    /// where any byte of it lies inside the backed carve: state the runtime
+    /// placed where the engine lays a fire's activation and its guests'
+    /// tables and scratch. The two must never meet; met, a fire is refused
+    /// by name rather than corrupting either.
+    pub fn clear_of_carve(&self, logical: u32, physical: u32) -> Result<()> {
+        let end = (u64::from(physical) + 1) * self.chunk_bytes;
+        if end > self.bytes().saturating_sub(self.carve) {
+            return Err(Fault::UnderCarve {
+                logical,
+                physical,
+                carve: self.carve,
+                range: self.bytes(),
+            });
+        }
+        Ok(())
+    }
+
     /// The bytes from the range's end the rung's carve backs.
     #[must_use]
     pub fn covered(&self) -> u64 {
@@ -1105,6 +1123,42 @@ mod tests {
     use crate::device::Context;
 
     const CHUNK: u64 = 16 << 20;
+
+    /// State and the carve never meet: with the span's segment lent to
+    /// state, a chunk the carve backs (where a fire lays its activation and
+    /// its guests' tables and scratch) is refused by name for state, every
+    /// chunk under the carve's bottom is not, and a narrowed carve gives its
+    /// chunks back to state.
+    #[test]
+    fn a_state_chunk_inside_the_carve_is_refused_by_name() {
+        let device = Context::bind().expect("a device");
+        let mut pool = Pool::reserve(&device, CHUNK, 12, 4, 3, u64::MAX).expect("a pool");
+        pool.commit_span(1).expect("the span's segment, lent to state");
+        for chunk in 0..12 {
+            pool.clear_of_carve(chunk, chunk).expect("no carve backed");
+        }
+        // A carve a byte past one chunk takes the top two.
+        pool.cover(CHUNK + 1).expect("a carve");
+        for chunk in 0..10 {
+            pool.clear_of_carve(chunk, chunk).expect("under the carve's bottom");
+        }
+        for chunk in [10, 11] {
+            let refused = pool
+                .clear_of_carve(chunk, chunk)
+                .expect_err("inside the carve");
+            assert!(
+                matches!(refused, crate::error::Fault::UnderCarve { physical, .. } if physical == chunk),
+                "named: {refused}"
+            );
+        }
+        // A logical chunk is judged where it lies.
+        assert!(pool.clear_of_carve(3, 11).is_err());
+        pool.clear_of_carve(11, 3).expect("placed under the carve");
+        // SAFETY: nothing ran on this pool.
+        unsafe { pool.narrow(1) }.expect("the rung lowers");
+        pool.clear_of_carve(10, 10).expect("the narrowed carve gave it back");
+        assert!(pool.clear_of_carve(11, 11).is_err());
+    }
 
     #[test]
     fn the_span_is_backed_on_demand_from_the_top_and_the_bottom_grows_under_it() {

@@ -93,15 +93,13 @@ pub fn run(args: TuneArgs) -> Result<Answer> {
     check.extend(args.check_estimate.iter().flatten().cloned());
     let req = runtime::engine::profiles::TuneRequest {
         full: args.full,
-        profiles: &dir,
-        artifacts: &artifacts,
         check: &check,
         no_check: args.no_check,
-        cache: &cache,
         refit: args.refit,
         check_estimate: args.check_estimate.is_some(),
         dissect: &args.dissect,
         rates: args.rates,
+        ..runtime::engine::profiles::TuneRequest::at(&dir, &artifacts, &cache)
     };
     // A check of the estimate is a test: it writes nothing.
     if req.check_estimate {

@@ -27,6 +27,10 @@ const WARP: u32 = 32;
 #[cfg_attr(not(feature = "device"), allow(dead_code))]
 const MAX_BLOCK_THREADS: u32 = 1024;
 
+/// The narrowest block a region is emitted for on ROCm: one wavefront.
+#[cfg(feature = "rocm")]
+const ROCM_WAVE: u32 = 64;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Target {
     pub major: i32,
@@ -151,22 +155,41 @@ fn compile_options() -> Vec<&'static [u8]> {
 pub fn compile(source: &str, architecture: &str) -> std::result::Result<Vec<u8>, Failure> {
     #[cfg(feature = "rocm")]
     {
-        use kernels_cuda::hip::{self, CompileError};
-        match hip::compile(
-            "ptir_fused_region",
-            source,
-            architecture,
-            &HIPRTC_OPTIONS,
-            &[],
-        ) {
-            Ok(built) if built.code.is_empty() => Err(Failure::Retryable {
-                reason: "hiprtc produced an empty code object".into(),
-            }),
-            Ok(built) => Ok(built.code),
-            Err(CompileError::Rejected(log)) => Err(Failure::Deterministic {
-                reason: format!("hiprtc refused the emitted region: {log}"),
-            }),
-            Err(CompileError::Failed(reason)) => Err(Failure::Retryable { reason }),
+        use kernels_cuda::hip::{self, CompileError, code_object};
+        // A region states no launch bounds, so hiprtc emits it for the
+        // widest block and holds it to that block's registers; one that
+        // needs more spills, and its scratch is a buffer the runtime would
+        // allocate at its first launch (refused at load). As CUDA's driver
+        // narrows such a kernel's block, the region is emitted again for
+        // half the block till it needs none: the launch reads the width it
+        // was emitted for (`launch_width`). The narrowest is one wavefront.
+        let mut bound: Option<u32> = None;
+        loop {
+            let flag = bound.map(|threads| format!("--gpu-max-threads-per-block={threads}"));
+            let options: Vec<&str> = HIPRTC_OPTIONS
+                .iter()
+                .copied()
+                .chain(flag.as_deref())
+                .collect();
+            let code = match hip::compile("ptir_fused_region", source, architecture, &options, &[]) {
+                Ok(built) if built.code.is_empty() => {
+                    return Err(Failure::Retryable {
+                        reason: "hiprtc produced an empty code object".into(),
+                    });
+                }
+                Ok(built) => built.code,
+                Err(CompileError::Rejected(log)) => {
+                    return Err(Failure::Deterministic {
+                        reason: format!("hiprtc refused the emitted region: {log}"),
+                    });
+                }
+                Err(CompileError::Failed(reason)) => return Err(Failure::Retryable { reason }),
+            };
+            let narrower = bound.unwrap_or(MAX_BLOCK_THREADS) / 2;
+            if code_object::refuse_late_buffers(&code).is_ok() || narrower < ROCM_WAVE {
+                return Ok(code);
+            }
+            bound = Some(narrower);
         }
     }
     #[cfg(feature = "cuda")]

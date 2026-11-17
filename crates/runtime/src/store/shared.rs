@@ -32,9 +32,10 @@
 //! window list refs in token order) and [`::engine::fire::Lane::fixed`] (one `[run, cow]`
 //! a piece). `cow == run` writes the record in place; a lane whose record is
 //! shared (a fork, or a snapshot restored, in that fire) writes a fresh
-//! record the engine copies `run` onto first. The copy-on-write records come
-//! out of a reserve of one set per lane a fire runs, which the planner keeps
-//! back from admission (`ResidencyPlanner::cow_lanes`).
+//! record the engine copies `run` onto first. The copy-on-write record is
+//! part of that fire's demand, granted before it runs as any slot is: none
+//! is kept back up front, and one held counts against the planner's state
+//! seats (`ResidencyPlanner::state_seats`).
 //!
 //! Position (CONTRACT-BC item 2): state lies below `total - act_chunks(rung)`;
 //! raising the rung first moves state out of the new activation span
@@ -318,8 +319,8 @@ pub fn raise_now(shared: &Shared, engine: usize, rows: u32) {
         rung_changed(engine);
     }
     // The rung holds `goal` now: fires may take its width, once a raise's
-    // copy is the engine's.
-    if pool.copying().is_some() {
+    // copy is the engine's and no lower's narrow is under way.
+    if pool.copying().is_some() || pool.lowering() {
         return;
     }
     let cap = lifted(goal);
@@ -720,6 +721,11 @@ pub struct SharedPool {
     /// [`Self::told`] before the raise whose copy is the engine's to take:
     /// what a refused raise goes back to.
     told_from: Option<u32>,
+    /// The rung a lower has told the engine and the engine has not yet
+    /// come down to ([`Self::lower_notice`]): until its narrow lands the
+    /// engine holds [`Self::told`], so that rung's activation stays set
+    /// aside, no raise is taken past it and no cap is lifted.
+    lowering: Option<u32>,
     /// The engine refused the last `commit_span`: no span segment is asked
     /// again until room is freed ([`Self::block_span_commit`]).
     span_commit_blocked: bool,
@@ -968,6 +974,7 @@ impl SharedPool {
             raise_from: None,
             told: 0,
             told_from: None,
+            lowering: None,
             span_commit_blocked: false,
             programs: programs::ProgramFires::default(),
         };
@@ -1616,6 +1623,12 @@ impl SharedPool {
         if self.told_unfit() {
             return None;
         }
+        // A lower's narrow under way: the engine holds the rung it was told
+        // before, and a raise past it would tell it a rung while it comes
+        // down; it waits for the narrow to land.
+        if self.lowering.is_some() && self.pool.rung_of(rung) > self.told {
+            return None;
+        }
         Some(if self.told > self.pool.rung_of(rung) {
             self.told
         } else {
@@ -1852,6 +1865,51 @@ impl SharedPool {
     /// engine holding a wider rung is brought down to it (a guest term
     /// grew past the rung it holds, [`Self::told_unfit`]): what is set
     /// aside stays, and a raise at `rung` follows.
+    /// The first half of a lower that brings the engine down: the notice it
+    /// is sent (`Engine::set_rung(from, to)`), with nothing given back yet.
+    /// The engine holds [`Self::told`] until that notice lands, laying its
+    /// guests' tables and covering a bind's term at that rung, so what is
+    /// set aside for it stays until [`Self::lower_landed`] (a bind funded
+    /// meanwhile is funded at the rung the engine holds). A lower that
+    /// tells the engine nothing is taken at once ([`Self::lower_rung`]).
+    pub fn lower_notice(&mut self, rung: u32) -> Result<Option<(u32, u32)>, RungError> {
+        let to = self.pool.rung_of(rung);
+        let tells = self.tells_rungs() && self.told != to;
+        if !tells {
+            return self.lower_rung(rung);
+        }
+        if self.pool.act_chunks(rung) > self.pool.act_reserved() && self.told <= to {
+            return Err(RungError::Pool(SlotError::Occupied { rung, chunks: 0 }));
+        }
+        self.lowering = Some(to);
+        Ok(Some((self.told, to)))
+    }
+
+    /// The engine took a lower's notice ([`Self::lower_notice`]) and holds
+    /// `rung`'s from here: what it set aside above is given back. Where
+    /// the pool cannot lower now, what is set aside stays; the engine's
+    /// rung is still the one it holds.
+    pub fn lower_landed(&mut self, rung: u32) -> Result<(), RungError> {
+        self.lowering = None;
+        let lowered = self.lower_rung(rung).map(|_| ());
+        if lowered.is_err() {
+            let _ = self.tell(rung);
+        }
+        lowered
+    }
+
+    /// The engine refused a lower's notice: it holds the rung it held, and
+    /// nothing was given back.
+    pub fn lower_refused(&mut self) {
+        self.lowering = None;
+    }
+
+    /// Whether a lower's notice is under way ([`Self::lower_notice`]).
+    #[must_use]
+    pub fn lowering(&self) -> bool {
+        self.lowering.is_some()
+    }
+
     pub fn lower_rung(&mut self, rung: u32) -> Result<Option<(u32, u32)>, RungError> {
         if self.pool.act_chunks(rung) > self.pool.act_reserved() {
             if !self.tells_rungs() || self.told <= self.pool.rung_of(rung) {

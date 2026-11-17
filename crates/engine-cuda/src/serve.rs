@@ -114,6 +114,9 @@ pub struct Shell {
     adapters: crate::blob::Adapters,
     held: Vec<u32>,
     readout_rows: crate::device::Buffer,
+    /// Where a fire's capturing lanes write their readers' rows: `None`
+    /// where the trace captures none (`crate::scores`).
+    capture: Option<crate::scores::CaptureLayout>,
     /// The run a fire stages a host-resident bank's experts in, bounded at
     /// load and laid with the staged inputs (`experts::staging`).
     expert_staging: crate::experts::staging::Staging,
@@ -548,8 +551,10 @@ impl Shell {
     /// ([`Self::seat_host_kv`]).
     pub const HOST_POOLS: u64 = 4;
 
-    /// Seats this rank's host tier (CONTRACT-BC 22), pinned as it is first
-    /// used, from `stated` bytes shared by `ranks`, within the host memory
+    /// Seats this rank's host tier (CONTRACT-BC 22), committed as it is
+    /// first used, behind the staging `ring` the load pinned before it
+    /// measured the device ([`crate::store::staging_ring_for`]; `None` seats
+    /// no tier), from `stated` bytes shared by `ranks`, within the host memory
     /// the load left: whole chunks of the state pool's size, every shape's
     /// slots parking in them, and as many host kv slots for byte reads
     /// ([`Self::read_host_kv`], a tap's read-out). Unstated, it holds `seats`
@@ -561,6 +566,7 @@ impl Shell {
         seats: u32,
         context: u32,
         ranks: u32,
+        ring: Option<crate::store::Ring>,
     ) -> Result<u32> {
         let ranks = u64::from(ranks.max(1));
         let row = self.state_row_bytes();
@@ -600,7 +606,7 @@ impl Shell {
         // shelf a load does not move through costs nothing.
         self.pools
             .seat_host(u32::try_from(budget.checked_div(page).unwrap_or(0)).unwrap_or(u32::MAX));
-        self.pools.seat_tier(budget, whole)?;
+        self.pools.seat_tier(budget, ring)?;
         Ok(self.pools.host_pages())
     }
     /// Opens this rank's share of `budget` disk kv bytes under `dir`.
@@ -825,16 +831,6 @@ impl Shell {
         ids: &[engine::ChannelId],
         slots: crate::program::Slots,
     ) -> Result<engine::InstanceId> {
-        let reads_scores = self.programs.program(program_id).is_some_and(|program| {
-            program
-                .plan
-                .outputs()
-                .iter()
-                .any(|(name, _)| *name == "attn.scores")
-        });
-        if reads_scores {
-            self.arena.ensure_whole(&mut self.pools)?;
-        }
         let stream = self.device.stream();
         let buffers_rs = self.buffers.is_some();
         let pools = &self.pools;
@@ -941,6 +937,14 @@ impl Shell {
                 .collect(),
             adapter: engine::program::Footprint::default(),
         })
+    }
+
+    /// Where instance `instance`'s capturing lane's rows lie now: its key
+    /// row of the load's context, then its page row (`crate::scores`).
+    /// `None` for an instance whose program reads none.
+    #[must_use]
+    pub fn score_rows(&self, instance: engine::InstanceId) -> Option<u64> {
+        self.programs.score_rows(instance)
     }
 
     /// The address of a guest item of `bytes` in `refs`, where they lie now.

@@ -175,9 +175,11 @@ pub struct Boot<'a> {
     /// (`Pools::declare_context`).
     pub context_declared: bool,
     pub slots: u32,
-    /// The bytes the cache rows take, as a test or bench states them
-    /// (`Residency::device_kv_budget`); `None` fills what `allowance` leaves.
-    pub kv_budget: Option<u64>,
+    /// The device pool as the load states it: a test's bytes
+    /// (`Residency::device_kv_budget`) or the operator's kv tokens
+    /// (`Residency::device_kv_tokens`); `None` fills what `allowance`
+    /// leaves.
+    pub kv_budget: Option<crate::store::KvSize>,
     /// What this load may take of the card (`[engine.memory] budget_device`).
     pub allowance: engine::Allowance,
     pub ordinal: i32,

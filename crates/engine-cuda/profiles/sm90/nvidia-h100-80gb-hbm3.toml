@@ -11,8 +11,6 @@ gemm.rows_m = 4  # 1.7% faster end to end
 # mla.expanded_from = 49152 reset to its default: the tune timed it 1.5% faster on gpt-oss-20b,
 # which never reads it here (MLA attention; it has none): the win was noise.
 qmm.split_warps_per_sm = 29  # 3.4% faster end to end
-sdpa.decode.split_small = true  # 1.7% faster end to end
-sdpa.decode.static_max_requests = 256  # 1.8% faster end to end
 # sdpa.index_split_until = 512 reset to its default: the tune timed it 4.3% faster on gpt-oss-20b,
 # which never reads it here (indexed (DSA) attention; it has none): the win was noise.
 # ssm.gdn_scan_until = 56 reset to its default: the tune timed it 4.3% faster on gpt-oss-20b,
@@ -124,9 +122,6 @@ measured = [
   "kernel.sdpa.decode.gqa_deep_64",
   "kernel.sdpa.decode.grouped_prefill_lse",
   "kernel.sdpa.decode.grouped_prefill_window",
-  "kernel.sdpa.decode.split_small",
-  "kernel.sdpa.decode.split_window",
-  "kernel.sdpa.decode.static_max_requests",
   "kernel.sdpa.fa2_live",
   "kernel.sdpa.merge_warp",
   "kernel.sdpa.prefill.ctas_per_sm",

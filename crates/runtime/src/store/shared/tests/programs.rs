@@ -2054,3 +2054,65 @@ fn readout_rows_beside_the_activation_are_counted_at_every_rung() {
     );
     assert_eq!(chunks(&pool), [2, 2, 20, 20, 140, 140]);
 }
+
+/// A lower the walk takes tells the engine first and gives back what was
+/// set aside only once the engine's narrow lands: until then the engine
+/// holds the wider rung, laying its guests' tables and covering a bind's
+/// term there. A bind funded in between is funded at the rung the engine
+/// holds, so what it covers stays out of state's reach. (Given back at
+/// once, a bind there was funded at the narrower rung while the engine
+/// covered the wider one, over chunks state was lent: Metal's c64
+/// epilogue faults.)
+#[tokio::test(flavor = "current_thread")]
+async fn a_bind_before_the_engine_narrows_is_funded_at_the_rung_it_holds() {
+    let (mut pool, engine) = on_demand_at(2048);
+    pool.fire_facts_learned(key(PROGRAM), &lane_facts());
+    let held = pool.pool().act_reserved();
+    let limit = pool.pool().state_limit();
+    assert_eq!(
+        pool.lower_notice(256).unwrap(),
+        Some((2048, 256)),
+        "the engine is told first"
+    );
+    assert_eq!(pool.told(), 2048, "it holds the wider rung until it lands");
+    assert_eq!(pool.pool().act_reserved(), held, "nothing given back yet");
+    assert_eq!(pool.pool().state_limit(), limit, "no state lent above");
+    assert_eq!(
+        pool.raise_at(256),
+        Some(2048),
+        "a term is set aside at the rung the engine holds"
+    );
+
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    let engine = Arc::new(Mutex::new(engine));
+    let open = ProgramOpen::new(&shared, key(PROGRAM), 0).unwrap();
+    fund_span(&shared, || 256, &Grants, &Lane(engine.clone()))
+        .await
+        .unwrap();
+    {
+        let pool = shared.lock().unwrap();
+        // The engine covers the bind's term at 2048, wider than 256's.
+        assert!(pool.pool().act_chunks(2048) > pool.pool().act_chunks(256));
+        assert!(
+            pool.pool().act_reserved() >= pool.pool().act_chunks(2048),
+            "the funded room covers the held rung's term: {} of {}",
+            pool.pool().act_reserved(),
+            pool.pool().act_chunks(2048)
+        );
+        assert!(
+            pool.pool().state_limit() <= TOTAL - pool.pool().act_chunks(2048),
+            "no state where the engine covers the term"
+        );
+    }
+    let mut pool = shared.lock().unwrap();
+    pool.instance_bound(InstanceId(1), key(PROGRAM));
+    pool.lower_landed(256).unwrap();
+    assert_eq!(pool.told(), 256, "the narrow landed");
+    assert_eq!(
+        pool.pool().act_reserved(),
+        pool.pool().act_chunks(256),
+        "what the wider rung held is given back once it landed"
+    );
+    drop(pool);
+    drop(open);
+}

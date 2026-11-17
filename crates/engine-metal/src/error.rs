@@ -162,6 +162,17 @@ pub enum Fault {
     },
 
     Recipe(String),
+
+    /// A fire names a state slot whose chunk lies inside the activation
+    /// span's backed carve: the activation, the guests' tables and their
+    /// scratch lie there, so reading or writing the slot would read or
+    /// overwrite them ([`crate::store::pool::Pool::clear_of_carve`]).
+    UnderCarve {
+        logical: u32,
+        physical: u32,
+        carve: u64,
+        range: u64,
+    },
 }
 
 impl Fault {
@@ -314,6 +325,17 @@ impl fmt::Display for Fault {
                  `{step}`: {why}"
             ),
             Self::Recipe(refusal) => f.write_str(refusal),
+            Self::UnderCarve {
+                logical,
+                physical,
+                carve,
+                range,
+            } => write!(
+                f,
+                "state chunk {logical} (physical {physical}) lies inside the activation \
+                 span's backed carve, the top {carve} bytes of the {range}-byte pool, where a \
+                 fire lays its activation and its guests' tables: refused, not read or written"
+            ),
             Self::Adapter { bank, why } => write!(f, "adapter bank `{bank}`: {why}"),
             Self::Blob { path, why } => write!(f, "the shared adapter `{path}` {why}"),
             Self::AdapterSlots { seats } => write!(
