@@ -6,7 +6,9 @@
 //! The policy hears it as [`Event::Waiting`](crate::policy::Event::Waiting).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Once};
+use std::time::Instant;
 
 use client_api::props::{self, Props};
 
@@ -26,6 +28,50 @@ struct Watch {
 
 static WAITING: LazyLock<Mutex<HashMap<ProcessId, Watch>>> = LazyLock::new(Default::default);
 static REFRESH: Once = Once::new();
+
+/// Refreshes run (one for each wake of the stores' `changed`).
+static REFRESHES: AtomicU64 = AtomicU64::new(0);
+/// Prompts looked up, at arrival or in a refresh.
+static LOOKUPS: AtomicU64 = AtomicU64::new(0);
+/// Counts reported to the policy (each a change).
+static REPORTS: AtomicU64 = AtomicU64::new(0);
+/// Time spent looking up, in all.
+static LOOKUP_NS: AtomicU64 = AtomicU64::new(0);
+/// Time a store's lock was held for lookups: in all, and the longest once.
+static LOCK_NS: AtomicU64 = AtomicU64::new(0);
+static LOCK_NS_MAX: AtomicU64 = AtomicU64::new(0);
+
+/// The counters above, as `/metrics` lines.
+pub fn metrics() -> String {
+    let load = |c: &AtomicU64| c.load(Ordering::Relaxed);
+    let secs = |c: &AtomicU64| load(c) as f64 / 1e9;
+    format!(
+        "# HELP pie_waiting_refreshes_total Lookups of every waiting prompt, one each time a store's cache changed.\n\
+         # TYPE pie_waiting_refreshes_total counter\n\
+         pie_waiting_refreshes_total {}\n\
+         # HELP pie_waiting_lookups_total Waiting prompts looked up in the kv stores.\n\
+         # TYPE pie_waiting_lookups_total counter\n\
+         pie_waiting_lookups_total {}\n\
+         # HELP pie_waiting_reports_total Changed cached-token counts of waiting processes told to the policy.\n\
+         # TYPE pie_waiting_reports_total counter\n\
+         pie_waiting_reports_total {}\n\
+         # HELP pie_waiting_lookup_seconds_total Time spent looking waiting prompts up.\n\
+         # TYPE pie_waiting_lookup_seconds_total counter\n\
+         pie_waiting_lookup_seconds_total {}\n\
+         # HELP pie_waiting_lock_seconds_total Time a kv store's lock was held for those lookups.\n\
+         # TYPE pie_waiting_lock_seconds_total counter\n\
+         pie_waiting_lock_seconds_total {}\n\
+         # HELP pie_waiting_lock_seconds_max The longest one lookup held a kv store's lock.\n\
+         # TYPE pie_waiting_lock_seconds_max gauge\n\
+         pie_waiting_lock_seconds_max {}\n",
+        load(&REFRESHES),
+        load(&LOOKUPS),
+        load(&REPORTS),
+        secs(&LOOKUP_NS),
+        secs(&LOCK_NS),
+        secs(&LOCK_NS_MAX),
+    )
+}
 
 fn waiting() -> std::sync::MutexGuard<'static, HashMap<ProcessId, Watch>> {
     WAITING.lock().expect("waiting prefixes lock poisoned")
@@ -65,7 +111,12 @@ fn cached(stores: &[Stores], keys: &[Vec<hash::Hash256>]) -> u64 {
         .zip(keys)
         .map(|(stores, keys)| {
             let pages = registry::with_kv_lock(&stores.kv, "waiting-prefix", |kv| {
-                kv.cached_run_any_tier(keys).len()
+                let held = Instant::now();
+                let pages = kv.cached_run_any_tier(keys).len();
+                let ns = held.elapsed().as_nanos() as u64;
+                LOCK_NS.fetch_add(ns, Ordering::Relaxed);
+                LOCK_NS_MAX.fetch_max(ns, Ordering::Relaxed);
+                pages
             });
             pages as u64 * u64::from(stores.kv_page_size)
         })
@@ -139,13 +190,17 @@ fn update(stores: &[Stores], pids: &[ProcessId]) {
             .collect()
     };
     for (pid, keys) in keys {
+        let looked = Instant::now();
         let tokens = cached(stores, &keys);
+        LOOKUPS.fetch_add(1, Ordering::Relaxed);
+        LOOKUP_NS.fetch_add(looked.elapsed().as_nanos() as u64, Ordering::Relaxed);
         let changed = waiting().get_mut(&pid).is_some_and(|watch| {
             let changed = watch.cached != Some(tokens);
             watch.cached = Some(tokens);
             changed
         });
         if changed {
+            REPORTS.fetch_add(1, Ordering::Relaxed);
             crate::policy::report(crate::policy::Event::Waiting(pid, tokens));
         }
     }
@@ -169,6 +224,7 @@ async fn refresh() {
         }
         let pids: Vec<ProcessId> = waiting().keys().copied().collect();
         if !pids.is_empty() {
+            REFRESHES.fetch_add(1, Ordering::Relaxed);
             crate::rt::spawn_blocking(move || update(&stores, &pids))
                 .await
                 .ok();

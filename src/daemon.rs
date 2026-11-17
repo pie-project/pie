@@ -253,7 +253,8 @@ fn render(start: Instant, component: &str, version: &str) -> String {
          pie_build_info{{component=\"{component}\",version=\"{version}\"}} 1\n\
          # HELP pie_uptime_seconds Seconds since process start.\n\
          # TYPE pie_uptime_seconds gauge\n\
-         pie_uptime_seconds {uptime}\n"
+         pie_uptime_seconds {uptime}\n{waiting}",
+        waiting = runtime::store::waiting::metrics(),
     )
 }
 
