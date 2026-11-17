@@ -166,6 +166,48 @@ fn flux_2_minis_vae_program_is_the_reference() {
     assert!(psnr(px, &gold) >= 40.0);
 }
 
+/// The tiled program whose op table streams in with its weights (an op's words ahead of its
+/// records, a PE holding one op's) decodes bit for bit as the one holding its table.
+#[test]
+fn a_tiled_program_streaming_its_op_table_decodes_alike() {
+    let trace = common::trace();
+    let tmp = tempfile::tempdir().expect("a scratch directory");
+    let f = forward(&trace, &tmp.path().join("ckpt"));
+    let clip = [1, 8, 8];
+    let held = tiled::program(&trace, "vae.decode", clip, true, Some((2, 2)), None)
+        .unwrap_or_else(|e| panic!("{e}"));
+    let streamed = tiled::program_with(
+        &trace,
+        "vae.decode",
+        clip,
+        true,
+        (2, 2),
+        tiled::Chunks {
+            stream_ops: true,
+            ..tiled::Chunks::default()
+        },
+        None,
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert!(held.op_words.is_empty());
+    assert_eq!(streamed.op_words.len(), streamed.ops.len());
+    assert!(streamed.stream_words > held.stream_words);
+    let lat = f32s(PIPE_LATENT);
+    let st = step(held.word, clip, &lat);
+    let f = std::cell::RefCell::new(f);
+    let get = |v: u32| -> Result<grid::Rows, String> {
+        let c = f
+            .borrow_mut()
+            .stream_values(&st, &[], &[ValueId(v)])?
+            .remove(0);
+        Ok((c.rows, c.width, Rc::new(floats(&c))))
+    };
+    let a = tiled::emulate(&held, &get).unwrap_or_else(|e| panic!("{e}"));
+    let b = tiled::emulate(&streamed, &get).unwrap_or_else(|e| panic!("{e}"));
+    let o = held.outs[0].0;
+    assert_eq!(a[&o], b[&o], "the streamed table's decode differs");
+}
+
 /// The tiled program's decode on the host (`tiled::emulate`: its ops over the whole image, each
 /// convolution's weights read off its own stream) against engine-cpu's and diffusers'.
 #[test]

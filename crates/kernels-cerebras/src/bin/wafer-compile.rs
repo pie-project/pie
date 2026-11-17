@@ -374,12 +374,15 @@ fn stream(args: &[String]) -> Result<(), String> {
         };
         if get("--regime").as_deref() == Some("tiled") {
             let bounds = kernels_cerebras::floorplan::stream::Bounds::system();
-            // `--chunks KC,WB`: the staged channels and weight block at most (with `--tile`)
+            // `--chunks KC,WB[,S]`: the staged channels and weight block at most, the op table streamed
+            // (S 1) (with `--tile`)
             let p = match (get("--chunks"), tile) {
                 (Some(c), Some(t)) => {
                     let v: Vec<u32> = c.split(',').filter_map(|x| x.parse().ok()).collect();
-                    let [kc, wb] = v[..] else {
-                        return Err(format!("--chunks {c}: kc,wb"));
+                    let (kc, wb, stream_ops) = match v[..] {
+                        [kc, wb] => (kc, wb, false),
+                        [kc, wb, s] => (kc, wb, s != 0),
+                        _ => return Err(format!("--chunks {c}: kc,wb[,stream ops 0|1]")),
                     };
                     kernels_cerebras::stream::tiled::program_with(
                         &trace,
@@ -387,7 +390,7 @@ fn stream(args: &[String]) -> Result<(), String> {
                         clip,
                         !ieee,
                         t,
-                        kernels_cerebras::stream::tiled::Chunks { kc, wb },
+                        kernels_cerebras::stream::tiled::Chunks { kc, wb, stream_ops },
                         Some((bounds.w, bounds.h)),
                     )?
                 }

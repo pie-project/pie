@@ -124,6 +124,19 @@ fn temp(p: &TileProgram, i: usize) -> u32 {
     p.slots.get(&Key::Temp(i)).copied().unwrap_or(0)
 }
 
+/// Each op's words (its code, its length, its arguments), the op table cut at its ops.
+pub fn op_words(p: &TileProgram) -> R<Vec<Vec<u32>>> {
+    let words = table(p)?.words;
+    let mut out = Vec::with_capacity(p.ops.len());
+    let mut a = 0usize;
+    while a + 1 < words.len() {
+        let n = words[a + 1] as usize;
+        out.push(words[a..a + n].to_vec());
+        a += n;
+    }
+    Ok(out)
+}
+
 #[allow(clippy::too_many_lines)]
 fn table(p: &TileProgram) -> R<Table> {
     let mut words = Vec::new();
@@ -309,6 +322,10 @@ fn reg_fn(p: &TileProgram) -> String {
 /// The image PE's ops (its interpreter's).
 const TPE_OPS: &str = include_str!("tiled_pe.csl");
 
+/// `run_all` where the op table streams in: each op's words off the stream into `prog` (its
+/// first word its code and length), then the op at 0.
+const RUN_STREAMED: &str = "fn run_all() void {\n  var i: u16 = 0;\n  while (i < NOPS) : (i += 1) {\n    @mov32(@set_dsd_length(D_progw, 1), fab.fin(q_t, 1));\n    const n = (prog[1] + 1) >> 1;\n    if (n > 1) { @mov32(@set_dsd_length(@increment_dsd_offset(D_progw, 1, u32), n - 1), fab.fin(q_t, n - 1)); }\n    const op = prog[0];\n    if (op == 1) { opin(0); }\n    else if (op == 2) { opout(0); }\n    else if (op == 3) { conv(0); }\n    else if (op == 4) { norm(0); }\n    else if (op == 5) { region_op(0); }\n    else if (op == 6) { up(0); }\n    else if (op == 8) { attend(0); }\n  }\n}\n";
+
 fn pe_file(p: &TileProgram, tb: &Table) -> String {
     let mut t = format!(
         "// {}: an image PE of the tiled regime (kernels-cerebras emit::tiled, GENERIC.md M2d): the\n// program's ops over its pixels, in step with the array.\n",
@@ -329,14 +346,27 @@ fn pe_file(p: &TileProgram, tb: &Table) -> String {
             "const rm{mi} = @import_module(\"{name}\", .{{ .math = math, .seg = math }});"
         );
     }
+    // the op table: held whole, or (streamed) an op's words at a time off the stream
+    let streamed = !p.op_words.is_empty();
+    let table_decl = if streamed {
+        let opn = p.op_words.iter().copied().max().unwrap_or(2).max(2);
+        format!(
+            "const NOPS: u16 = {};\nconst OPN: u16 = {opn};\nvar prog = @zeros([OPN]u16);\nconst D_prog = @get_dsd(mem1d_dsd, .{{ .tensor_access = |i|{{OPN}} -> prog[i] }});\nvar D_progw = D_prog;",
+            p.op_words.len()
+        )
+    } else {
+        format!(
+            "const NPROG: u16 = {};\nconst prog = [{}]u16 {{ {} }};",
+            tb.words.len(),
+            tb.words.len().max(1),
+            list(&tb.words)
+        )
+    };
     let _ = writeln!(
         t,
-        "const GX: u16 = {};\nconst GY: u16 = {};\nconst NPROG: u16 = {};\nconst prog = [{}]u16 {{ {} }};\nconst lays = [{}]u16 {{ {} }};\nconst fk = [{}]f32 {{ {} }};",
+        "const GX: u16 = {};\nconst GY: u16 = {};\n{table_decl}\nconst lays = [{}]u16 {{ {} }};\nconst fk = [{}]f32 {{ {} }};",
         p.gx,
         p.gy,
-        tb.words.len(),
-        tb.words.len().max(1),
-        list(&tb.words),
         tb.lays.len(),
         list(&tb.lays),
         tb.consts.len().max(1),
@@ -362,15 +392,32 @@ fn pe_file(p: &TileProgram, tb: &Table) -> String {
          var hout: [{hout}]f32 align(16) = @zeros([{hout}]f32);\nvar hout_p: [*]f32 = &hout;\nconst D_hout = @get_dsd(mem1d_dsd, .{{ .tensor_access = |i|{{{hout}}} -> hout[i] }});\n\
          var pcfg = @zeros([2]u32);\nvar pcfg_p: [*]u32 = &pcfg;"
     );
-    t.push_str(TPE_OPS);
+    if streamed {
+        // (each op's words off the stream into `prog`, its first word its code and length)
+        // (tiled_pe.csl's `run_all`, the table's walk, in place: the template holds it once)
+        let all = TPE_OPS.find("fn run_all() void {").unwrap_or(TPE_OPS.len());
+        let end = TPE_OPS[all..]
+            .find("\n}\n")
+            .map_or(TPE_OPS.len(), |e| all + e + 3);
+        t.push_str(&TPE_OPS[..all]);
+        t.push_str(RUN_STREAMED);
+        t.push_str(&TPE_OPS[end..]);
+    } else {
+        t.push_str(TPE_OPS);
+    }
     t.push_str(&reg_fn(p));
     let mut init = String::new();
     for mi in 0..p.modules.len() {
         let _ = writeln!(init, "  rm{mi}.init();");
     }
+    let progw = if streamed {
+        "  D_progw = @set_dsd_base_addr(D_wb, @ptrcast([*]u32, &prog[0]));\n"
+    } else {
+        ""
+    };
     let _ = write!(
         t,
-        "task go() void {{\n  stamp(0);\n  X = @as(u16, pcfg[0]);\n  Y = @as(u16, pcfg[1]);\n  D_wa = @set_dsd_base_addr(D_wa0, @ptrcast([*]@fp16(), &wb[0]));\n  D_hx32 = @set_dsd_base_addr(D_wb, @ptrcast([*]u32, &hx[0]));\n{init}  run_all();\n  stamp(1);\n  sys_mod.unblock_cmd_stream();\n}}\n"
+        "task go() void {{\n  stamp(0);\n  X = @as(u16, pcfg[0]);\n  Y = @as(u16, pcfg[1]);\n  D_wa = @set_dsd_base_addr(D_wa0, @ptrcast([*]@fp16(), &wb[0]));\n  D_hx32 = @set_dsd_base_addr(D_wb, @ptrcast([*]u32, &hx[0]));\n{progw}{init}  run_all();\n  stamp(1);\n  sys_mod.unblock_cmd_stream();\n}}\n"
     );
     t.push_str("comptime {\n  @bind_local_task(go, T_GO);\n  @export_symbol(run);\n  @export_symbol(tsc_p, \"tsc\");\n  @export_symbol(pcfg_p, \"pcfg\");\n  @export_symbol(hin_p, \"hin\");\n  @export_symbol(hout_p, \"hout\");\n");
     for (q, c) in [

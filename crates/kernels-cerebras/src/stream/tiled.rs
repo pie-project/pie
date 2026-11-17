@@ -31,7 +31,7 @@ use serde::Serialize;
 
 use crate::emit::region::{self, ParamAt, Place, Printed};
 use crate::stream::grid::{self, Prelude, RegIn, Res};
-use crate::stream::host::{BF16, FLAT, HALF, NONE, PACK, Span};
+use crate::stream::host::{BF16, FLAT, HALF, LIT, NONE, PACK, Span};
 
 type R<T> = Result<T, String>;
 
@@ -170,6 +170,9 @@ pub struct TileProgram {
     pub stream_words: u32,
     pub tape: u32,
     pub round16: bool,
+    /// Each op's words in the stream ahead of its records (their 16-bit words, an even count),
+    /// none where the op table is a PE's constant.
+    pub op_words: Vec<u32>,
 }
 
 /// A weight block's words at most (two 16-bit weights a word).
@@ -673,6 +676,7 @@ pub fn lower(trace: &Trace, reading: &str, clip: [u32; 3], round16: bool) -> R<T
         stream_words: 0,
         tape: 0,
         round16,
+        op_words: Vec::new(),
     };
     print_regions(&mut p)?;
     Ok(p)
@@ -985,6 +989,9 @@ pub struct Chunks {
     pub kc: u32,
     /// A weight block's words at most (two 16-bit weights a word).
     pub wb: u32,
+    /// The op table streams in with the weights, an op's words ahead of its records (a PE holds
+    /// one op's), not held whole on every PE.
+    pub stream_ops: bool,
 }
 
 impl Default for Chunks {
@@ -992,6 +999,7 @@ impl Default for Chunks {
         Chunks {
             kc: KC,
             wb: WB_WORDS,
+            stream_ops: false,
         }
     }
 }
@@ -1136,9 +1144,23 @@ pub fn place_with(
     if p.arena > 32_000 || p.hx > 32_000 {
         return Err("an arena past a DSD offset".into());
     }
-    // the stream
+    // the stream (each op's words ahead of its records where the op table streams)
     p.stream.clear();
+    p.op_words = Vec::new();
+    let table = if chunks.stream_ops {
+        crate::emit::tiled::op_words(p)?
+    } else {
+        Vec::new()
+    };
     for i in 0..n {
+        if let Some(w) = table.get(i) {
+            let even = w.len().next_multiple_of(2);
+            p.op_words.push(even as u32);
+            for k in 0..even {
+                let x = w.get(k).copied().unwrap_or(0);
+                p.stream.push([LIT, x, 0, 1, 0, PACK, 1, 0]);
+            }
+        }
         let r = p.records(i);
         p.stream.extend(r);
     }
@@ -1327,6 +1349,8 @@ pub fn emulate(p: &TileProgram, get: &dyn Fn(u32) -> R<Rows>) -> R<BTreeMap<u32,
     let mut scales: BTreeMap<usize, (Vec<f32>, Vec<f32>)> = BTreeMap::new();
     let wd = |v: ValueId| p.vals[&v].width as usize;
     for (i, op) in p.ops.iter().enumerate() {
+        // (an op's words ahead of its records, where the op table streams)
+        cur += p.op_words.get(i).map_or(0, |&n| n as usize / 2);
         match op {
             TOp::In(v) => {
                 vals.insert(v.0, get(v.0)?.2.to_vec());
