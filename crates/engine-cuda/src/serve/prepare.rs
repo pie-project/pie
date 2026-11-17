@@ -1763,8 +1763,13 @@ impl Shell {
         // A tapped fire is walked, so the walk can mark where each layer
         // ends on the stream.
         let snapshots_fit = snapshots.rows.len() <= crate::store::rs::SNAPSHOTS as usize;
+        // A body's ragged attention was captured with no group mask (arming
+        // states none): a fire whose lanes state one walks, so its kernel
+        // reads the mask staged for it.
+        let group_masked = !group_masks.is_empty();
         let bodied = records_bodies
             && !tapped
+            && !group_masked
             && snapshots_fit
             && Self::keyable_units(&self.compiled)
             && world
@@ -1810,6 +1815,8 @@ impl Shell {
             (records_bodies && !arming && !(bodied && readouts_fit && lanes_fit)).then(|| {
                 let why = if tapped {
                     "it is tapped"
+                } else if group_masked {
+                    "its lanes state a group mask, which no body's ragged attention reads"
                 } else if !snapshots_fit {
                     "it takes more snapshots than a body holds"
                 } else if !Self::keyable_units(&self.compiled) {
