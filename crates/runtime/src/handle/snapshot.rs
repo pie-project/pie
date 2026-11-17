@@ -133,6 +133,7 @@ fn store() -> Result<&'static (PathBuf, u64), HandleError> {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Manifest {
     version: u32,
     name: String,
@@ -160,20 +161,19 @@ struct Spent {
 }
 
 /// Where the rows end. What is folded is the manifest's `folded`, the one
-/// length there is; a manifest written before that carries it here as well,
-/// and it is not read.
+/// length there is.
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SavedCursor {
     tail: Option<u32>,
     reserved: u32,
-    /// One past the highest slot written ([`Cursor::written`]); a manifest
-    /// that states none wrote inside what it reserved.
-    #[serde(default)]
-    written: Option<u32>,
+    /// One past the highest slot written ([`Cursor::written`]).
+    written: u32,
     spans: Vec<(u32, u32, u32)>,
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SavedState {
     state_size: u64,
     buffer_page_tokens: u32,
@@ -184,9 +184,7 @@ struct SavedState {
     bytes: u64,
     /// The windows' position, for a model whose state is one window list:
     /// `buffer` is then its table, and `window_tokens` the window.
-    #[serde(default)]
     window: Option<WindowState>,
-    #[serde(default)]
     window_tokens: u32,
 }
 
@@ -853,7 +851,7 @@ async fn finish(
         cursor: SavedCursor {
             tail: cursor.tail,
             reserved: cursor.reserved,
-            written: Some(cursor.written_end()),
+            written: cursor.written_end(),
             spans: cursor.spans.clone(),
         },
         page_len: set.page_len,
@@ -1028,7 +1026,7 @@ pub(super) async fn load(holder: ProcessId, tenant: &str, name: &str) -> Result<
     let cursor = Cursor {
         tail: cursor.tail,
         reserved: cursor.reserved,
-        written: cursor.written.unwrap_or(cursor.reserved),
+        written: cursor.written,
         staged: Vec::new(),
         spans: cursor.spans,
     };

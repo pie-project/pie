@@ -99,18 +99,6 @@ fn entries_in(dir: &Path) -> Result<Vec<Entry>> {
         found.extend(in_dir);
     }
 
-    let taken: BTreeSet<String> = found.iter().map(|entry| entry.name.clone()).collect();
-    let flat: Vec<PathBuf> = children
-        .iter()
-        .filter(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "zt"))
-        .cloned()
-        .collect();
-    found.extend(
-        entries_from(flat)
-            .into_iter()
-            .filter(|entry| !taken.contains(&entry.name)),
-    );
-
     found.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(found)
 }
@@ -298,7 +286,6 @@ mod tests {
     fn store_every_case() {
         shards_are_not_entries_of_their_own();
         a_model_directory_is_one_entry_with_its_builds_beneath_it();
-        a_leftover_flat_file_does_not_shadow_the_archive_that_replaced_it();
         an_artifact_named_for_its_specialization_is_listed();
         a_directory_of_three_backends_is_three_entries();
         a_lone_artifact_is_still_addressed_by_its_model_name();
@@ -389,39 +376,6 @@ mod tests {
         assert_eq!(entry.runtimes[1].files.len(), 4, "root plus three shards");
 
         assert!(entry.total_bytes() > 3 * entry.bytes);
-    }
-
-    fn a_leftover_flat_file_does_not_shadow_the_archive_that_replaced_it() {
-        let root = tempfile::tempdir().unwrap();
-        let payload = vec![7u8; 32_000];
-
-        let flat = root.path().join("qwen.zt");
-        let mut writer = Writer::create(&flat, &Default::default()).unwrap();
-        writer.add_tensor(&decl("w"), &payload).unwrap();
-        writer.finish().unwrap();
-
-        let archive = root.path().join("qwen").join(ARCHIVE_FILE);
-        let mut writer = Writer::create(&archive, &Default::default()).unwrap();
-        writer.add_tensor(&decl("a"), &payload).unwrap();
-        writer.add_tensor(&decl("b"), &payload).unwrap();
-        writer.finish().unwrap();
-
-        let found = entries_in(root.path()).unwrap();
-        assert_eq!(found.len(), 1, "one model, not two");
-        assert_eq!(found[0].name, "qwen");
-        assert_eq!(found[0].tensors, 2, "the archive, not the flat leftover");
-        assert_eq!(found[0].root, archive);
-
-        let other = root.path().join("legacy.zt");
-        let mut writer = Writer::create(&other, &Default::default()).unwrap();
-        writer.add_tensor(&decl("w"), &payload).unwrap();
-        writer.finish().unwrap();
-        let names: Vec<String> = entries_in(root.path())
-            .unwrap()
-            .into_iter()
-            .map(|e| e.name)
-            .collect();
-        assert_eq!(names, ["legacy", "qwen"]);
     }
 
     fn an_artifact_named_for_its_specialization_is_listed() {

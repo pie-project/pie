@@ -522,12 +522,7 @@ mod tests {
         let registry = crate::chip::registry();
         let knobs = search::knobs(&base, SEARCH_SKIPS, "");
         let ids: Vec<&str> = knobs.iter().map(|k| k.id).collect();
-        for want in [
-            "kernel.moe.grouped",
-            "engine.graphs",
-            "engine.recording",
-            fused,
-        ] {
+        for want in ["kernel.moe.grouped", fused] {
             assert!(ids.contains(&want), "{want} not searched: {ids:?}");
         }
         for k in &knobs {

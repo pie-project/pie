@@ -96,8 +96,9 @@ fn seated<'a>(
         tokens,
     });
     let pages = after.div_ceil(PAGE) as usize;
-    seated.pages = &lane.kv.pages[..pages.min(lane.kv.pages.len())];
-    seated.fixed = &lane.fixed;
+    let table = lane.tables.first().map_or(&[][..], |(_, table)| table.as_slice());
+    seated.pages = &table[..pages.min(table.len())];
+    seated.fixed = lane.record.pieces();
     seated
 }
 

@@ -23,7 +23,6 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::caps::PoolFacts;
 use crate::error::{Error, Result};
 use crate::transfer::MemoryDomain;
 
@@ -135,6 +134,11 @@ pub struct ChunkFacts {
     /// And what they held when the last run left is there still.
     #[serde(default)]
     pub disk_kept: bool,
+    /// One recurrent-state record's bytes as the model's state rows take
+    /// them (not the slots or chunks a pool lays it in); 0 where the model
+    /// holds no recurrent state.
+    #[serde(default)]
+    pub record_bytes: u64,
     /// The streamable weights' slot shapes ([`WeightShape`]), ids apart
     /// from [`ChunkFacts::shapes`]'. Empty where nothing streams.
     #[serde(default)]
@@ -384,6 +388,60 @@ impl ChunkFacts {
         self.shapes.iter().find(|shape| shape.id == id)
     }
 
+    /// The kv list: the list shape of full (unwindowed) kv pages.
+    #[must_use]
+    pub fn kv_list(&self) -> Option<&SlotShape> {
+        self.shapes.iter().find(|shape| {
+            shape.role == SlotRole::State
+                && matches!(shape.kind, SlotKind::List { window: None, .. })
+        })
+    }
+
+    /// The tokens a kv page holds: the kv list's slot, else a window list's,
+    /// else the rs buffer's; 0 where the load states no list.
+    #[must_use]
+    pub fn page_tokens(&self) -> u32 {
+        let list = |shape: &SlotShape| match shape.kind {
+            SlotKind::List { tokens, .. } => Some(tokens),
+            SlotKind::Fixed { .. } => None,
+        };
+        self.kv_list()
+            .and_then(list)
+            .or_else(|| {
+                self.shapes
+                    .iter()
+                    .filter(|shape| shape.role == SlotRole::State)
+                    .find_map(list)
+            })
+            .or_else(|| self.shapes.iter().find_map(list))
+            .unwrap_or(0)
+    }
+
+    /// The kv pages the device holds: the kv list's slots on its pinned run,
+    /// or every state chunk as kv slots in a shared pool.
+    #[must_use]
+    pub fn kv_device_pages(&self) -> u64 {
+        self.kv_list().map_or(0, |shape| shape.device_slots(self))
+    }
+
+    /// The kv pages the host tier holds.
+    #[must_use]
+    pub fn kv_host_pages(&self) -> u64 {
+        self.kv_list().map_or(0, |shape| match shape.pinned {
+            Some(pinned) => u64::from(pinned.host.chunks) * u64::from(shape.slots_per_chunk),
+            None => u64::from(self.host_chunks) * u64::from(shape.slots_per_chunk),
+        })
+    }
+
+    /// The kv pages the disk tier holds.
+    #[must_use]
+    pub fn kv_disk_pages(&self) -> u64 {
+        self.kv_list().map_or(0, |shape| match shape.pinned {
+            Some(pinned) => u64::from(pinned.disk.chunks) * u64::from(shape.slots_per_chunk),
+            None => u64::from(self.disk_chunks) * u64::from(shape.slots_per_chunk),
+        })
+    }
+
     #[must_use]
     pub fn weight(&self, id: ShapeId) -> Option<&WeightShape> {
         self.weights.iter().find(|shape| shape.id == id)
@@ -420,13 +478,13 @@ impl ChunkFacts {
             .saturating_sub(self.act_chunks_max())
     }
 
-    /// States today's pools as chunks, one slot a chunk, each pool a pinned
-    /// run whose slots keep today's ids: chunk 0 null, then the kv pages
+    /// States pinned pools as chunks, one slot a chunk, each pool a pinned
+    /// run whose slots keep the engine's ids: chunk 0 null, then the kv pages
     /// (a list shape, with its host and disk tiers pinned alike, ids from
     /// 0), the state slots and the rs buffer pages (fixed shapes, device
     /// only). One segment, whole from the load; activation lives apart.
     #[must_use]
-    pub fn degenerate(pools: &PoolFacts, bytes: &DegenerateBytes) -> ChunkFacts {
+    pub fn degenerate(pools: &DegeneratePools) -> ChunkFacts {
         let mut device = 1u32;
         let mut host = 0u32;
         let mut shapes = Vec::new();
@@ -478,7 +536,7 @@ impl ChunkFacts {
                 rate: 1,
                 window: None,
             },
-            bytes.kv_page,
+            pools.kv_page_bytes,
             pools.kv_pages,
             pools.host_kv_pages,
             disk,
@@ -496,7 +554,7 @@ impl ChunkFacts {
         push(
             DEGENERATE_BUFFER,
             SlotKind::Fixed { pieces: 1 },
-            bytes.buffer_page,
+            pools.buffer_page_bytes,
             pools.buffer_pages,
             0,
             ChunkRun::default(),
@@ -526,9 +584,14 @@ impl ChunkFacts {
             act_span_chunks: None,
             host_chunks: host,
             disk_chunks,
-            disk_persistent: pools.disk_kv_persistent,
-            disk_kept: pools.disk_kv_kept,
+            disk_persistent: pools.disk_persistent,
+            disk_kept: pools.disk_kept,
             weights: Vec::new(),
+            record_bytes: if pools.state_slots > 0 {
+                pools.state_slot_bytes
+            } else {
+                0
+            },
         }
     }
 
@@ -712,12 +775,25 @@ pub const DEGENERATE_KV: ShapeId = ShapeId(0);
 pub const DEGENERATE_STATE: ShapeId = ShapeId(2);
 pub const DEGENERATE_BUFFER: ShapeId = ShapeId(3);
 
-/// What [`ChunkFacts::degenerate`] needs beside the pool facts: the bytes
-/// of a kv page and an rs buffer page, which `PoolFacts` does not state.
+/// The pinned pools [`ChunkFacts::degenerate`] states as chunks.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct DegenerateBytes {
-    pub kv_page: u64,
-    pub buffer_page: u64,
+pub struct DegeneratePools {
+    pub kv_pages: u32,
+    /// Tokens a kv page holds.
+    pub kv_page_size: u32,
+    pub kv_page_bytes: u64,
+    pub state_slots: u32,
+    pub state_slot_bytes: u64,
+    /// Buffer pages of `kv_page_size` unfolded rows, beside the state slots.
+    pub buffer_pages: u32,
+    pub buffer_page_bytes: u64,
+    /// Host pages kv can be suspended into, and slot-file pages below them.
+    pub host_kv_pages: u32,
+    pub disk_kv_pages: u32,
+    /// The slot files are kept across runs.
+    pub disk_persistent: bool,
+    /// And what they held when the last run left is there still.
+    pub disk_kept: bool,
 }
 
 /// Where the engine keeps each logical chunk: the runtime names logical
@@ -905,20 +981,15 @@ mod role_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChunkFacts, DegenerateBytes};
-    use crate::caps::PoolFacts;
+    use super::{ChunkFacts, DegeneratePools};
 
     fn facts() -> ChunkFacts {
-        let pools = PoolFacts {
+        let mut facts = ChunkFacts::degenerate(&DegeneratePools {
             kv_pages: 8,
             kv_page_size: 16,
-            ..PoolFacts::default()
-        };
-        let bytes = DegenerateBytes {
-            kv_page: 4096,
-            buffer_page: 0,
-        };
-        let mut facts = ChunkFacts::degenerate(&pools, &bytes);
+            kv_page_bytes: 4096,
+            ..DegeneratePools::default()
+        });
         facts.total_chunks += 2;
         facts.segment_chunks += 2;
         facts.act_chunks = vec![(64, 1), (256, 2)];

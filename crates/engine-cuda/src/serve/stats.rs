@@ -319,6 +319,13 @@ impl Shell {
         self.pools.take_refs();
     }
 
+    /// The record a lane bound to none reads and writes, where lanes name
+    /// refs and the load holds state: the null record, ref 0.
+    #[must_use]
+    pub fn null_record(&self) -> Option<u32> {
+        (self.pools.by_refs() && self.pools.has_state()).then_some(0)
+    }
+
     /// Copies a working set's recurrent record from slot `src` onto `dst`,
     /// on the stream ahead of the fire that writes `dst`.
     pub fn fork_state(&mut self, src: u32, dst: u32) -> crate::Result<()> {

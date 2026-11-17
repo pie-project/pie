@@ -8,7 +8,6 @@ use anyhow::{Result, anyhow};
 use serde::Deserialize;
 
 pub use crate::boot::{Embedded, Engine, Loaded, Summary};
-use crate::config::retired;
 use crate::config::{ByteSize, Config, EngineKind, Runahead};
 
 /// The knobs an app sets (`PieServer.Configuration` in Swift and Kotlin, the
@@ -65,10 +64,7 @@ impl Settings {
         } else {
             toml::from_str(text).map_err(|e: toml::de::Error| e.message().to_string())
         };
-        parsed.map_err(|e| {
-            let why = retired::explain_settings(&e).unwrap_or(e);
-            anyhow!("parse the settings: {why}")
-        })
+        parsed.map_err(|e| anyhow!("parse the settings: {e}"))
     }
 
     /// The worker config that serves `artifact` from `home`: this build's
@@ -180,24 +176,12 @@ mod tests {
         assert_eq!(config.runtime.frame_size, u32::from(Runahead::STEPS_MAX));
     }
 
-    /// An app's settings that still state a retired key are refused with
-    /// what became of it, as JSON and as TOML; the current keys load.
+    /// An app's settings refuse a key they do not declare, as JSON and as
+    /// TOML; the current keys load.
     #[test]
-    fn a_retired_setting_is_refused_by_name() {
-        let err = Settings::parse(r#"{"max_model_len": 8192}"#)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("`max_model_len` was renamed to `max_context`"),
-            "{err}"
-        );
-        let err = Settings::parse("max_forward_requests = 8\n")
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("`max_forward_requests` is no longer a setting: "),
-            "{err}"
-        );
+    fn an_unknown_setting_is_refused() {
+        let err = Settings::parse("max_contxt = 8\n").unwrap_err().to_string();
+        assert!(err.contains("unknown field `max_contxt`"), "{err}");
         let err = Settings::parse(r#"{"max_contxt": 8192}"#)
             .unwrap_err()
             .to_string();

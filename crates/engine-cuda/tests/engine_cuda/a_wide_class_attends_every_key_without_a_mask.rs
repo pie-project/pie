@@ -117,7 +117,7 @@ fn shell(trace: Trace, path: &Path, graphs: Graphs) -> Shell {
         context_declared: false,
         ordinal: 0,
         knobs: engine_cuda::Knobs {
-            chip: Some(engine_cuda::chip::pinned(graphs, None)),
+            pin: Some((graphs, None)),
             ..engine_cuda::Knobs::default()
         },
         cache_dir: None,

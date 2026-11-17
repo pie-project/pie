@@ -201,7 +201,7 @@ impl Cuda {
         // the routed banks it takes an expert at a time: the plan seats none
         // itself.
         let diagnostics = &self.boot.knobs.diagnostics;
-        let cached = if diagnostics.dense_weights || diagnostics.dense_experts {
+        let cached = if self.boot.knobs.dense_weights() || diagnostics.dense_experts {
             Vec::new()
         } else {
             crate::store::layout::streamed_experts(trace)
@@ -685,7 +685,7 @@ impl Engine for Cuda {
         let mut shell = staged.finish().map_err(fault)?;
 
         shell.mount_adapters(self.boot.adapter_dir.clone());
-        let host_kv_pages = shell
+        shell
             .seat_host_kv(
                 residency.host_kv_budget,
                 residency.kv_seats.unwrap_or(budgets.max_lanes),
@@ -700,7 +700,7 @@ impl Engine for Cuda {
         } else {
             None
         };
-        let disk_kv_pages = shell
+        shell
             .seat_disk_kv(
                 residency.disk_kv_budget,
                 residency.disk_kv_dir.as_deref(),
@@ -715,6 +715,7 @@ impl Engine for Cuda {
             shell.drop_rungs();
         }
         let mut chunk_facts = shell.chunk_facts().map_err(fault)?;
+        chunk_facts.record_bytes = shell.state_slot_bytes();
         chunk_facts.disk_persistent = residency.disk_kv_persistent && chunk_facts.disk_chunks > 0;
         let trace_name = shell.trace().name.clone();
         let (weight_bytes, arena_bytes, pool_bytes, input_bytes) = shell.footprint();
@@ -743,11 +744,6 @@ impl Engine for Cuda {
                 codegen_backend: Some(CODEGEN.to_string()),
             },
             pools: PoolFacts {
-                kv_pages: u32::try_from(paging.pages()).unwrap_or(u32::MAX),
-                kv_page_size: paging.page_size,
-                state_slots: if state_rows { paging.slots } else { 0 },
-                state_slot_bytes: shell.state_slot_bytes(),
-                buffer_pages: shell.buffer_pages(),
                 adapter_banks: shell
                     .banks()
                     .iter()
@@ -755,10 +751,6 @@ impl Engine for Cuda {
                     .min()
                     .unwrap_or(0),
                 window_tokens: paging.window.map_or(0, |window| window.tokens),
-                host_kv_pages,
-                disk_kv_pages,
-                disk_kv_persistent: residency.disk_kv_persistent && disk_kv_pages > 0,
-                disk_kv_kept: shell.disk_kv_kept(),
                 seated_first: shell.seated_first(),
                 seat_to_end: shell.seat_to_end(),
                 seat_spread: shell.seat_spread(),
@@ -1436,7 +1428,9 @@ impl Cuda {
         // differ.
         use crate::store::layout::{FIXED, LIST, WINDOW};
         let by_refs = submission.lanes.iter().any(|lane| {
-            !lane.tables.is_empty() || !lane.fixed.is_empty() || !lane.slot_copies.is_empty()
+            !lane.tables.is_empty()
+                || !matches!(lane.record, engine::fire::LaneRecord::Unstated)
+                || !lane.slot_copies.is_empty()
         });
         if by_refs {
             shell.take_refs();
@@ -1450,9 +1444,25 @@ impl Cuda {
         }
         // Each lane's record: the one it reads and the one its fire writes.
         let mut records: Vec<Option<(u32, u32)>> = Vec::with_capacity(submission.lanes.len());
+        // The lanes stated to carry no state: they read and write the null
+        // record.
+        let mut nulls: Vec<bool> = Vec::with_capacity(submission.lanes.len());
         let mut forked: Vec<(u32, u32)> = Vec::new();
         for lane in &submission.lanes {
-            let record = match lane.fixed.as_slice() {
+            let pieces = match &lane.record {
+                engine::fire::LaneRecord::Pieces(pieces) => pieces.as_slice(),
+                engine::fire::LaneRecord::Null => &[],
+                engine::fire::LaneRecord::Unstated if shell.null_record().is_some() => {
+                    return Err(Error::Invalid(format!(
+                        "lane in slot {} states no record, and this load holds recurrent \
+                         state: the runtime states every lane's record, or that it has none",
+                        lane.slot
+                    )));
+                }
+                engine::fire::LaneRecord::Unstated => &[],
+            };
+            nulls.push(matches!(lane.record, engine::fire::LaneRecord::Null));
+            let record = match pieces {
                 [] => None,
                 [(shape, pieces)] if *shape == FIXED => {
                     let runs: Vec<u32> = pieces.iter().map(|[run, _]| *run).collect();
@@ -1489,8 +1499,7 @@ impl Cuda {
             }
             records.push(record);
         }
-        // The lane's list refs are its table of pages, or, where a program
-        // places its rows, the table that translates the program's pages.
+        // The lane's refs of `shape`: the kv list's, or a window list's.
         fn table(lane: &engine::fire::Lane, shape: engine::chunk::ShapeId) -> Option<&[u32]> {
             lane.tables
                 .iter()
@@ -1507,6 +1516,14 @@ impl Cuda {
                     .collect()
             })
             .collect();
+        // A lane's list kind says what its list table holds: its pages, or
+        // the working set's mapped pages its program's page indexes address
+        // (a device-geometry instance's lane).
+        let placed: Vec<bool> = submission
+            .lanes
+            .iter()
+            .map(|lane| lane.list == engine::fire::ListKind::Translation)
+            .collect();
         let seated: Vec<Seated<'_>> = submission
             .lanes
             .iter()
@@ -1519,27 +1536,30 @@ impl Cuda {
                         tokens: &lane.tokens,
                     },
                     positions: &lane.positions,
-                    pages: match table(lane, LIST) {
-                        Some(refs) if by_refs && lane.kv.translation.is_empty() => refs,
-                        _ => &lane.kv.pages,
+                    pages: if placed[at] {
+                        &[]
+                    } else {
+                        table(lane, LIST).unwrap_or(&[])
                     },
-                    held: (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
+                    held: table(lane, LIST)
+                        .filter(|_| !placed[at])
+                        .map(|_| lane.kv.held),
                     folded: lane.kv.folded,
                     kv_less: lane.kv_less,
-                    translation: match table(lane, LIST) {
-                        Some(refs) if by_refs && !lane.kv.translation.is_empty() => refs,
-                        _ => &lane.kv.translation,
+                    translation: if placed[at] {
+                        table(lane, LIST).unwrap_or(&[])
+                    } else {
+                        &[]
                     },
-                    window: match table(lane, WINDOW) {
-                        Some(refs) if by_refs => refs,
-                        _ => &lane.kv.window,
-                    },
-                    more_windows: if by_refs { &more_windows[at] } else { &[] },
+                    window: table(lane, WINDOW).unwrap_or(&[]),
+                    more_windows: &more_windows[at],
                     mask: lane.mask.as_ref(),
                     adapter: lane_adapters[at].or(lane.adapter),
                     rs: lane.rs.clone(),
                     rs_reset: lane.rs_reset,
-                    rs_slot: records[at].map(|(_, written)| written).or(lane.rs_slot),
+                    rs_slot: records[at]
+                        .map(|(_, written)| written)
+                        .or(nulls[at].then_some(0)),
                     rs_read: records[at].map(|(run, _)| run),
                     rs_snapshots: &lane.rs_snapshots,
                     readout: match &lane.readout {

@@ -565,7 +565,7 @@ where
         let (max_lanes, max_tokens) = (shell.budget().max_lanes, shell.budget().max_tokens);
         let max_readouts = u32::try_from(poem_compiler::arena::readouts_ceiling(shell.budget()))
             .unwrap_or(u32::MAX);
-        let disk_kv_pages = shell
+        shell
             .seat_disk_kv(
                 disk_kv_budget,
                 disk_kv_dir.as_deref(),
@@ -580,7 +580,7 @@ where
 
         let paging = shell.paging();
 
-        let pools = shell.pool_facts(disk_kv_pages).map_err(fault)?;
+        let pools = shell.pool_facts().map_err(fault)?;
         let chunks = shell.chunk_facts().map_err(fault)?;
 
         let caps = Capabilities {
@@ -1235,9 +1235,9 @@ impl<B: Host> Gpu<B> {
                 ))
             })?;
         }
-        // A lane stating its slot tables names its kv pages and its record
-        // there (CONTRACT-BC 4); until the runtime states them, the legacy
-        // fields carry the same slot refs.
+        // A lane names its kv pages and its record in its slot tables
+        // (CONTRACT-BC 4): this engine states one shared pool, so the
+        // runtime states them.
         let mut pages_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
         let mut record_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
         let mut run_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
@@ -1249,17 +1249,33 @@ impl<B: Host> Gpu<B> {
                     .find(|(shape, _)| *shape == crate::store::layout::LIST)
                     .map(|(_, refs)| refs.clone()),
             );
-            let fixed = lane
-                .fixed
-                .iter()
-                .find(|(shape, _)| *shape == crate::store::layout::FIXED);
-            run_of.push(fixed.and_then(|(_, pieces)| {
+            // A load that holds state is told every lane's record: its
+            // pieces, or none (the null record, ref 0 a piece).
+            let fixed = match &lane.record {
+                engine::fire::LaneRecord::Pieces(pieces) => pieces
+                    .iter()
+                    .find(|(shape, _)| *shape == crate::store::layout::FIXED)
+                    .map(|(_, pieces)| pieces.clone()),
+                engine::fire::LaneRecord::Null => {
+                    Some(vec![[0, 0]; shell.pools().pieces() as usize])
+                }
+                engine::fire::LaneRecord::Unstated if shell.pools().has_state() => {
+                    return Err(Error::Invalid(format!(
+                        "lane in slot {} states no record, and this load holds recurrent \
+                         state: the runtime states every lane's record, or that it has none",
+                        lane.slot
+                    )));
+                }
+                engine::fire::LaneRecord::Unstated => None,
+            };
+            let fixed = fixed.as_ref();
+            run_of.push(fixed.and_then(|pieces| {
                 pieces
                     .iter()
                     .any(|&[run, cow]| run != cow)
                     .then(|| pieces.iter().map(|&[run, _]| run).collect())
             }));
-            record_of.push(fixed.map(|(_, pieces)| {
+            record_of.push(fixed.map(|pieces| {
                 // `cow != run`: the record is copied before the fire, once
                 // for every lane of a group naming the same pair.
                 for &[run, cow] in pieces {
@@ -1290,8 +1306,8 @@ impl<B: Host> Gpu<B> {
                     word: words[at],
                     tokens: resolved[at].as_deref().unwrap_or(&lane.tokens),
                 },
-                pages: pages_of[at].as_deref().unwrap_or(&lane.kv.pages),
-                held: (!lane.kv.pages.is_empty() || pages_of[at].is_some()).then_some(lane.kv.held),
+                pages: pages_of[at].as_deref().unwrap_or(&[]),
+                held: pages_of[at].is_some().then_some(lane.kv.held),
                 folded: lane.kv.folded,
                 kv_less: lane.kv_less,
 
@@ -1306,11 +1322,9 @@ impl<B: Host> Gpu<B> {
                 },
                 reads: &reads[at],
 
-                translation: &lane.kv.translation,
 
                 rs: &lane.rs,
                 rs_reset: lane.rs_reset,
-                rs_slot: lane.rs_slot,
                 rs_snapshots: &lane.rs_snapshots,
                 refs: true,
                 windows: &lane.tables,

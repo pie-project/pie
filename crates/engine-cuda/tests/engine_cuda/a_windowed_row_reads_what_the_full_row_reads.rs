@@ -31,7 +31,7 @@ fn logits(trace: Trace, path: &Path, prompt: &[u32], decodes: u32) -> Vec<Vec<f3
         context_declared: false,
         ordinal: 0,
         knobs: engine_cuda::Knobs {
-            chip: Some(engine_cuda::chip::pinned(engine_cuda::Graphs::Off, None)),
+            pin: Some((engine_cuda::Graphs::Off, None)),
             ..engine_cuda::Knobs::default()
         },
         cache_dir: None,

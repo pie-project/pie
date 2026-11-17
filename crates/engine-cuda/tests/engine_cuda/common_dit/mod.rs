@@ -454,10 +454,7 @@ impl Rig {
         let dir = tempfile::tempdir().expect("a scratch directory");
         let path = weights.write(dir.path());
         let mut boot = engine_cuda::DeviceBoot::default();
-        boot.knobs.chip = Some(engine_cuda::chip::pinned(
-            engine_cuda::Graphs::On,
-            Some(recording),
-        ));
+        boot.knobs.pin = Some((engine_cuda::Graphs::On, Some(recording)));
         let mut engine = engine_cuda::open(boot, contract_for).expect("the engine opens");
         let facts = plan.facts.clone();
         let inputs = plan.inputs.iter().map(|input| input.name.clone()).collect();

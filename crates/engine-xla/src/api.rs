@@ -127,8 +127,9 @@ pub struct Xla {
     /// device with one unsettled is the runtime's to wait out.
     rs_ahead: BTreeMap<u64, u32>,
     /// What the engine counts while it serves, read by the runtime: a
-    /// program a fire waited on (Compiled), a guest pass the host
-    /// interprets (Fallback), a frame or registration refused (Refused).
+    /// program a fire waited on (Compiled), a frame or registration
+    /// refused (Refused). Never Fallback: a guest runs on the device or is
+    /// refused at its registration.
     /// Never Unrecorded: every serving fire runs a program, built if need
     /// be.
     live: engine::live::Live,
@@ -182,11 +183,18 @@ impl Xla {
         self.shell.as_mut()
     }
 
-    /// Guest passes so far: those run on the device, those the host
-    /// interpreted.
+    /// Guest passes run on the device so far: every pass a guest takes.
     #[must_use]
-    pub fn guest_passes(&self) -> (u64, u64) {
+    pub fn guest_passes(&self) -> u64 {
         self.programs.tally()
+    }
+
+    /// Guest stages compiled inside a fire, past their program's
+    /// registration: zero where every registration compiled every shape a
+    /// fire takes.
+    #[must_use]
+    pub fn guest_fire_compiles(&self) -> u64 {
+        self.programs.fire_compiles()
     }
 
     #[must_use]
@@ -556,7 +564,7 @@ impl Engine for Xla {
         self.programs.seat_readouts(shell.readouts());
         let (rows, sink_row) = shell.pool_geometry();
         self.programs.seat_pool(rows, sink_row);
-        self.programs.seat_reads(shell.plane_reads());
+        self.programs.seat_planes(shell.guest_planes());
         // From here a program a fire waits on, a pass the host interprets,
         // is served worse than the load prepared: counted.
         shell.device().report_to(self.live.clone());
@@ -1086,6 +1094,7 @@ impl Xla {
             .shell
             .as_ref()
             .and_then(|shell| shell.pools().window_shape());
+        let kv_shape = self.shell.as_ref().and_then(|shell| shell.pools().kv_shape());
         for attached in &submission.attachments {
             if self.programs.geometry_of(attached.instance) != Some(GeometryClass::DeviceGeometry) {
                 continue;
@@ -1123,7 +1132,12 @@ impl Xla {
                 }
                 let lane = &lanes[source];
                 let ports = envelope.lane(at, source).map_err(port_error)?;
-                let table = &lane.kv.translation;
+                let table: &[u32] = match lane.list {
+                    engine::fire::ListKind::Translation => {
+                        kv_shape.and_then(|id| table_of(lane, id)).unwrap_or(&[])
+                    }
+                    engine::fire::ListKind::Pages => &[],
+                };
                 let translate = |page: u32, port: &str| -> EngineResult<u32> {
                     table.get(page as usize).copied().ok_or_else(|| {
                         program(format!(
@@ -1203,7 +1217,7 @@ impl Xla {
                         }
                         Some(after - rows as u32)
                     }
-                    () => (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
+                    () => holds_kv(lane, kv_shape).then_some(lane.kv.held),
                 };
                 if let Some(have) = have {
                     ports
@@ -1629,6 +1643,20 @@ impl Xla {
             (shell.pools().kv_shape(), shell.pools().window_shape())
         });
         let shell = self.loaded_mut()?;
+        // A load that holds state is told every lane's record: its pieces,
+        // or none (`LaneRecord::Null`, which names no piece).
+        if shell.state_slot_bytes() > 0
+            && let Some(lane) = submission
+                .lanes
+                .iter()
+                .find(|lane| matches!(lane.record, engine::fire::LaneRecord::Unstated))
+        {
+            return Err(Error::Invalid(format!(
+                "lane in slot {} states no record, and this load holds recurrent state: the \
+                 runtime states every lane's record, or that it has none",
+                lane.slot
+            )));
+        }
         let mut words: Vec<u64> = submission.lanes.iter().map(|lane| lane.word).collect();
         for (at, slot) in lane_adapters.iter().enumerate() {
             if slot.is_none() {
@@ -1659,15 +1687,13 @@ impl Xla {
                     Some(DeviceLane {
                         pages: Some(pages), ..
                     }) => pages,
-                    _ => kv_shape
-                        .and_then(|id| table_of(lane, id))
-                        .unwrap_or(&lane.kv.pages),
+                    _ => kv_shape.and_then(|id| table_of(lane, id)).unwrap_or(&[]),
                 },
                 held: match &device[at] {
                     Some(DeviceLane {
                         have: Some(have), ..
                     }) => Some(*have),
-                    _ => (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
+                    _ => holds_kv(lane, kv_shape).then_some(lane.kv.held),
                 },
                 folded: lane.kv.folded,
                 mask: device[at]
@@ -1689,7 +1715,6 @@ impl Xla {
                 },
                 quiet: matches!(lane.readout, Readout::None),
                 rs_reset: lane.rs_reset,
-                rs_slot: lane.rs_slot,
                 rs: &verbs[at],
                 media: media_of[at],
                 inputs: &input_cells[at],
@@ -1710,7 +1735,7 @@ impl Xla {
                         .and_then(|id| table_of(lane, id))
                         .unwrap_or(&[]),
                 },
-                fixed: &lane.fixed,
+                fixed: lane.record.pieces(),
                 copies: &lane.slot_copies,
             })
             .collect();
@@ -1882,13 +1907,17 @@ fn tier_key(tier: crate::serve::Tier, shape: engine::chunk::ShapeId, slot: u32) 
 }
 
 /// The state record a lane reads and the one it writes: its first fixed
-/// shape's first piece, `[run, cow]` (a fork's `cow` differs), else the
-/// recurrent-state row the runtime assigned it.
+/// shape's first piece, `[run, cow]` (a fork's `cow` differs); none where
+/// it holds no record.
 fn record_key(lane: &engine::fire::Lane) -> Option<(u64, u64)> {
-    match lane.fixed.first().and_then(|(id, pieces)| Some((*id, pieces.first()?))) {
-        Some((id, &[run, cow])) => Some((ref_key(id, run), ref_key(id, cow))),
-        None => lane.rs_slot.map(|slot| (u64::from(slot), u64::from(slot))),
-    }
+    let (id, &[run, cow]) =
+        lane.record.pieces().first().and_then(|(id, pieces)| Some((*id, pieces.first()?)))?;
+    Some((ref_key(id, run), ref_key(id, cow)))
+}
+
+/// Whether the lane holds kv pages: its kv list's table names any.
+fn holds_kv(lane: &engine::fire::Lane, kv: Option<engine::chunk::ShapeId>) -> bool {
+    kv.and_then(|id| table_of(lane, id)).is_some_and(|table| !table.is_empty())
 }
 
 #[cfg(test)]

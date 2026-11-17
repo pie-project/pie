@@ -86,9 +86,13 @@ pub struct Stages {
     /// go.
     pub pool_rows: i64,
     pub sink_row: u32,
-    /// Every plane a fire returns, as a stage reads it (`Shell::plane_reads`):
-    /// output, rows, width, layers, readout flag, dtype.
-    pub plane_reads: Vec<(String, u32, u32, u32, bool, Dtype)>,
+    /// Every plane a fire of the load can return, as a stage reads it
+    /// (`Shell::guest_planes`): output, rows, width, layers, readout flag,
+    /// dtype. A registration's outputs are checked against these, and each
+    /// stage compiled for them.
+    pub planes: Vec<(String, u32, u32, u32, bool, Dtype)>,
+    /// Stages a fire compiled (`Stages::get` past `compile_all`): a defect.
+    pub fire_compiles: u64,
 }
 
 /// A rung's stage as a compile thread leaves it.
@@ -136,8 +140,8 @@ fn stage(
 impl Stages {
     /// Stage `at` of `package` for `batch`, as registration compiled it
     /// (`Stages::compile_all`). A shape registration did not reach
-    /// compiles here, which a load warm-up sealed reports as a program
-    /// outside the ladder (WARM_STRICT refuses it).
+    /// compiles here, inside the fire, counted (`fire_compiles`) and, where
+    /// the load sealed its ladder, a miss (WARM_STRICT refuses it).
     pub fn get(
         &mut self,
         device: &Device,
@@ -151,6 +155,15 @@ impl Stages {
         if let Some(hit) = self.map.get(&slot) {
             return Ok(Arc::clone(hit));
         }
+        // Registration compiled every shape a fire of the load takes: one
+        // compiled here waits a fire on it.
+        self.fire_compiles += 1;
+        tracing::warn!(
+            stage = at,
+            lanes = batch.lanes,
+            compiles = self.fire_compiles,
+            "a guest stage compiled inside a fire, past its program's registration"
+        );
         let staged = stage(device, package, at, batch, carried, self.pool_rows, None)?;
         self.map.insert(slot, Arc::clone(&staged));
         Ok(staged)
@@ -158,8 +171,8 @@ impl Stages {
 
     /// Compiles every stage of `package` for every shape a pass can take:
     /// each lane rung up to the widest fire (`top`), each combination of
-    /// the planes its outputs can be read off (the fires the warm ladder
-    /// traced, `plane_reads`), with the `carried` channels in the pool;
+    /// the planes its outputs can be read off (the load's, `planes`), with
+    /// the `carried` channels in the pool;
     /// and one lane with none carried (an instance that steps alone).
     /// Side by side; the first refusal refuses the program.
     pub fn compile_all(
@@ -177,7 +190,27 @@ impl Stages {
         for at in 0..package.stages.len() {
             let mut combos: Vec<Vec<Read>> = vec![Vec::new()];
             for (name, lane) in lower::outputs(package, at) {
-                let options: Vec<Read> = (self.plane_reads.iter())
+                // Every output a stage reads is a plane a fire of this load
+                // returns on the device, of the dtype it reads: else the
+                // program is refused here, at its registration, and a pass
+                // never finds an output unbound.
+                let wants: Vec<Dtype> = (package.values.iter())
+                    .filter(|v| {
+                        v.source == ValueOrigin::Output && v.output.as_deref() == Some(&name)
+                    })
+                    .map(|v| v.dtype)
+                    .collect();
+                if !self
+                    .planes
+                    .iter()
+                    .any(|p| p.0 == name && wants.iter().all(|&d| d == p.5))
+                {
+                    return Err(format!(
+                        "stage {at} reads output `{name}` ({wants:?}), which no fire of this load \
+                         returns on the device as that"
+                    ));
+                }
+                let options: Vec<Read> = (self.planes.iter())
                     .filter(|p| p.0 == name)
                     .map(|p| Read {
                         name: name.clone(),
@@ -189,9 +222,6 @@ impl Stages {
                         dtype: p.5,
                     })
                     .collect();
-                if options.is_empty() {
-                    continue;
-                }
                 combos = combos
                     .into_iter()
                     .flat_map(|c| {

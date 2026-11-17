@@ -129,16 +129,13 @@ pub struct ModelConfig {
 }
 
 pub struct EngineConfig {
-    pub total_pages: usize,
     /// The pools as chunks: what the engine states
     /// ([`::engine::Capabilities::chunks`]).
     pub chunks: ::engine::chunk::ChunkFacts,
+    /// The model's window (`PoolFacts::window_tokens`).
     pub window_tokens: u32,
-    pub cpu_pages: usize,
-    pub disk_pages: u32,
     /// The disk tier is kept for the next run (`disk_kv_persistent`).
     pub disk_kept: Option<KeptDisk>,
-    pub rs_cache_slots: usize,
     /// The engine asks the planner to serve a decoding lane's pages before a
     /// prompt waiting to be seated (`PoolFacts::seated_first`).
     pub seated_first: bool,
@@ -148,7 +145,6 @@ pub struct EngineConfig {
     /// The engine asks the planner to spread the starts the pools do not hold
     /// to the end at once over a life (`PoolFacts::seat_spread`).
     pub seat_spread: bool,
-    pub rs_cache_slot_bytes: u64,
     pub draft_block: u32,
     pub draft_mask_token: u32,
     pub draft_proposals_from: u32,
@@ -166,6 +162,16 @@ pub struct EngineConfig {
     pub inputs: Vec<poem_ir::InputDecl>,
     pub classes: poem_ir::LaneClasses,
     pub engine_backend: crate::engine::EngineBox,
+}
+
+/// The admission cap: `cap`, held to the `seats` a seated-first kv pool
+/// seats where the model holds no recurrent state (whose processes its
+/// planner admits against the state pool instead).
+fn seat_cap(cap: usize, has_state: bool, seats: Option<usize>) -> usize {
+    match seats {
+        Some(seats) if !has_state && cap > seats.max(1) => seats.max(1),
+        _ => cap,
+    }
 }
 
 /// A disk tier kept across runs: where its journal is, and whether the
@@ -280,7 +286,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     // charges each process the fixed set its working set holds against the
     // state pool, beside a copy-on-write set per lane a fire runs
     // (`ResidencyPlanner::admit`): no cap here.
-    let has_state = engine_configs.iter().any(|d| d.rs_cache_slots > 0);
+    let has_state = engine_configs.iter().any(|d| d.chunks.record_bytes > 0);
     let admission_cap = config
         .max_concurrent_processes
         .or_else(|| {
@@ -300,27 +306,29 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             let seats = engine_configs
                 .iter()
                 .filter(|d| d.seated_first && !d.seat_spread && d.limits.max_context > 0)
-                .map(|d| 5 * d.total_pages * kv_page_size / d.limits.max_context)
+                .map(|d| {
+                    5 * usize::try_from(d.chunks.kv_device_pages()).unwrap_or(usize::MAX)
+                        * kv_page_size
+                        / d.limits.max_context
+                })
                 .min();
-            match seats {
-                Some(seats) if !has_state && cap > seats.max(1) => {
-                    tracing::info!(
-                        requested = cap,
-                        seated = seats,
-                        "admission: capped at five sequences a sequence at the declared context \
-                         holds in the kv pool"
-                    );
-                    seats.max(1)
-                }
-                _ => cap,
+            let capped = seat_cap(cap, has_state, seats);
+            if capped < cap {
+                tracing::info!(
+                    requested = cap,
+                    seated = capped,
+                    "admission: capped at five sequences a sequence at the declared context \
+                     holds in the kv pool"
+                );
             }
+            capped
         });
     process::init_admission(admission_cap);
 
     let rs_caps = {
         let d0 = engine_configs.first();
         let mut caps = model::RsCaps {
-            state_size: d0.map(|d| d.rs_cache_slot_bytes).unwrap_or(0),
+            state_size: d0.map_or(0, |d| d.chunks.record_bytes),
             buffer_page_size: 0,
             window_tokens: d0.map_or(0, |d| d.window_tokens),
         };
@@ -419,7 +427,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             crate::store::shared::SharedPool::scale_of(&d.chunks).unwrap_or(
                 crate::policy::pressure::Scale {
                     kv_page_bytes: 0,
-                    state_slot_bytes: d.rs_cache_slot_bytes,
+                    state_slot_bytes: d.chunks.record_bytes,
                 },
             )
         })
@@ -499,7 +507,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         if crate::store::shared::SharedPool::states_shared(&d.chunks) {
             d.chunks.host_chunks > 0 || d.chunks.disk_chunks > 0
         } else {
-            d.cpu_pages > 0 || d.disk_pages > 0
+            d.chunks.kv_host_pages() > 0 || d.chunks.kv_disk_pages() > 0
         }
     });
     // The lanes one fire runs on each engine: the copy-on-write sets its
@@ -516,7 +524,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             // A shared pool states its tiers in chunks, not in the page
             // fields its engine leaves at 0.
             tracing::info!(
-                device_pages = d.total_pages,
+                device_pages = d.chunks.kv_device_pages(),
                 host_chunks = d.chunks.host_chunks,
                 disk_chunks = d.chunks.disk_chunks,
                 chunk_bytes = d.chunks.chunk_bytes,
@@ -524,14 +532,14 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             );
         } else if kv_swap_capable {
             tracing::info!(
-                device_pages = d.total_pages,
-                host_pages = d.cpu_pages,
-                disk_pages = d.disk_pages,
+                device_pages = d.chunks.kv_device_pages(),
+                host_pages = d.chunks.kv_host_pages(),
+                disk_pages = d.chunks.kv_disk_pages(),
                 "kv tiers: suspended kv goes to the host, then the disk"
             );
         } else {
             tracing::warn!(
-                device_pages = d.total_pages,
+                device_pages = d.chunks.kv_device_pages(),
                 "no host or disk kv tier: pie cannot compute kv again, so kv \
                  pressure restarts processes"
             );
@@ -820,11 +828,6 @@ fn verify_config(config: &Config) -> Result<()> {
     );
     for (i, dev) in model.engines.iter().enumerate() {
         ensure!(
-            dev.total_pages > 0,
-            "Model {:?} engine {i}: total_pages must be > 0",
-            model.name
-        );
-        ensure!(
             dev.limits.max_forward_tokens > 0,
             "Model {:?} engine {i}: max_forward_tokens must be > 0",
             model.name
@@ -986,4 +989,54 @@ fn init_tracing(
         .init();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::seat_cap;
+    use crate::model::RsCaps;
+
+    /// What bootstrap reads of a load's chunk facts for the model's
+    /// recurrent state: whether it holds any, and its RsCaps.
+    fn read(facts: &::engine::chunk::ChunkFacts) -> (bool, RsCaps) {
+        (
+            facts.record_bytes > 0,
+            RsCaps {
+                state_size: facts.record_bytes,
+                buffer_page_size: 0,
+                window_tokens: 0,
+            },
+        )
+    }
+
+    /// A pool that lays a state shape for a dense model (records of some
+    /// size beside its kv) still says the model holds no state: its RsCaps
+    /// state nothing (no rs working set, no rs count a fire is held to) and
+    /// it keeps the seat cap. A hybrid's record bytes are its RsCaps' state
+    /// size, a record's and not a slot's, and it skips the cap.
+    #[test]
+    fn the_model_s_record_bytes_say_whether_it_holds_state() {
+        let mut facts = ::engine::chunk::ChunkFacts::degenerate(&::engine::chunk::DegeneratePools {
+            kv_pages: 8,
+            kv_page_size: 16,
+            kv_page_bytes: 4096,
+            state_slots: 4,
+            state_slot_bytes: 1 << 20,
+            ..::engine::chunk::DegeneratePools::default()
+        });
+        facts.record_bytes = 0;
+        let (dense, caps) = read(&facts);
+        assert!(!dense && !caps.has_state(), "dense: no rs work");
+        assert_eq!(seat_cap(512, dense, Some(45)), 45, "dense: the seat cap");
+
+        facts.record_bytes = 3000;
+        let (hybrid, caps) = read(&facts);
+        assert!(hybrid && caps.has_state());
+        assert_eq!(caps.state_size, 3000, "a record's bytes, not the slot's");
+        assert_eq!(seat_cap(512, hybrid, Some(45)), 512, "hybrid: admitted by its planner");
+
+        assert_eq!(seat_cap(512, false, None), 512, "no seated-first pool, no cap");
+        assert_eq!(seat_cap(16, false, Some(45)), 16, "a cap under the seats stands");
+        assert_eq!(seat_cap(512, false, Some(0)), 1, "one sequence at least");
+    }
 }
