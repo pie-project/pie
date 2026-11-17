@@ -469,13 +469,13 @@ impl Engine for Metal {
                 .map_err(fault)?
                 .bytes(u64::from(paging.pages_per_slot)),
         };
-        let wirable = crate::device::wirable::os_available()
-            .map(|available| available.saturating_add(outside));
+        let wiring = crate::device::wirable::os_memory()
+            .map(|os| crate::store::accounting::Wiring::of(os, outside));
         let accounting = |weights: u64, scratch: u64| {
             crate::store::accounting::Accounting::of(
                 working_set,
                 outside,
-                wirable,
+                wiring,
                 residency.device.budget,
                 weights,
                 scratch,

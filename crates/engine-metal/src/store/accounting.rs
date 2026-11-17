@@ -4,21 +4,48 @@ use crate::error::{Fault, Result};
 /// floor under the measured capacity (the user's decision, every backend).
 pub const DRIVER_FLOOR: u64 = 64 << 20;
 
+/// What the OS could wire for this process at load, measured then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Wiring {
+    /// Its available memory plus what this process held on the device.
+    pub wirable: u64,
+    /// What every other process (and the kernel) held wired: the GPU's
+    /// wired limit is the machine's, so this counts against the working
+    /// set Metal recommends.
+    pub others: u64,
+}
+
+impl Wiring {
+    /// From the OS's memory and what this process held on the device.
+    #[must_use]
+    pub fn of(os: crate::device::wirable::OsMemory, held: u64) -> Wiring {
+        Wiring {
+            wirable: os.available.saturating_add(held),
+            others: os.wired.saturating_sub(held),
+        }
+    }
+}
+
 /// What a load may place on the device: the lesser of the working set
-/// Metal recommends for this process less what the device already held for
-/// it when the load began (the context, queues and libraries: `outside`),
-/// and what the OS can wire for it now (`wirable`: its available memory at
-/// load plus what this process already holds there), less the driver's
-/// floor; capped by `[engine.memory] budget_device` where the operator
-/// states one. Measured, not a share of the device: on unified memory the
-/// GPU wires the pages everything else on the machine uses, and Metal's
-/// recommendation does not subtract them (the user's ruling). Memory other
-/// processes take later is the governor's yield's business.
+/// Metal recommends less what the device already held for this process when
+/// the load began (the context, queues and libraries: `outside`) and less
+/// what other processes held wired then, and what the OS can wire for it
+/// (its available memory at load plus what this process held there), less
+/// the driver's floor; capped by `[engine.memory] budget_device` where the
+/// operator states one. Measured, not a share of the device (the user's
+/// ruling): on unified memory the GPU wires the pages everything else on
+/// the machine uses, its wired limit is the machine's, and Metal's
+/// recommendation subtracts neither. An M1 Max (32 GiB) recommends 26.8 GB;
+/// its device refused residency at 26.2 GB held with 1.8 GB wired
+/// elsewhere. Memory other processes take later is the governor's yield's
+/// business.
 #[must_use]
-pub fn capacity(working_set: u64, outside: u64, wirable: Option<u64>, budget: Option<u64>) -> u64 {
+pub fn capacity(working_set: u64, outside: u64, wiring: Option<Wiring>, budget: Option<u64>) -> u64 {
     let recommended = working_set.saturating_sub(outside);
-    let measured = wirable
-        .map_or(recommended, |wirable| recommended.min(wirable))
+    let measured = wiring
+        .map_or(recommended, |wiring| {
+            recommended.saturating_sub(wiring.others).min(wiring.wirable)
+        })
         .saturating_sub(DRIVER_FLOOR);
     budget.map_or(measured, |budget| measured.min(budget))
 }
@@ -30,10 +57,9 @@ pub struct Accounting {
     /// What the device held for this process before the load placed
     /// anything.
     pub outside: u64,
-    /// What the OS could wire for this process at load: its available
-    /// memory then plus what this process held (`None` where it would not
-    /// say).
-    pub wirable: Option<u64>,
+    /// What the OS could wire for this process at load (`None` where it
+    /// would not say).
+    pub wiring: Option<Wiring>,
     /// `[engine.memory] budget_device`, where stated.
     pub budget: Option<u64>,
     pub capacity: u64,
@@ -55,17 +81,17 @@ impl Accounting {
     pub fn of(
         working_set: u64,
         outside: u64,
-        wirable: Option<u64>,
+        wiring: Option<Wiring>,
         budget: Option<u64>,
         weights: u64,
         fire: u64,
         minimum: u64,
     ) -> Accounting {
-        let capacity = capacity(working_set, outside, wirable, budget);
+        let capacity = capacity(working_set, outside, wiring, budget);
         Accounting {
             working_set,
             outside,
-            wirable,
+            wiring,
             budget,
             capacity,
             weights,
@@ -127,7 +153,7 @@ impl Accounting {
 
 #[cfg(test)]
 mod tests {
-    use super::{Accounting, DRIVER_FLOOR};
+    use super::{Accounting, DRIVER_FLOOR, Wiring};
 
     const GIB: u64 = 1 << 30;
 
@@ -226,13 +252,34 @@ mod tests {
     /// is what it can wire, less the floor; where it can wire more, the
     /// recommendation stands.
     fn what_the_os_can_wire_caps_the_capacity() {
+        let wiring = |wirable, others| Some(Wiring { wirable, others });
         let recommended = Accounting::of(40 * GIB, GIB, None, None, 16 * GIB, 0, GIB);
-        let short = Accounting::of(40 * GIB, GIB, Some(30 * GIB), None, 16 * GIB, 0, GIB);
+        let short = Accounting::of(40 * GIB, GIB, wiring(30 * GIB, 0), None, 16 * GIB, 0, GIB);
         assert_eq!(short.capacity, 30 * GIB - DRIVER_FLOOR);
         assert_eq!(short.pool, 14 * GIB - DRIVER_FLOOR);
-        let roomy = Accounting::of(40 * GIB, GIB, Some(60 * GIB), None, 16 * GIB, 0, GIB);
+        let roomy = Accounting::of(40 * GIB, GIB, wiring(60 * GIB, 0), None, 16 * GIB, 0, GIB);
         assert_eq!(roomy.capacity, recommended.capacity);
-        let capped = Accounting::of(40 * GIB, GIB, Some(30 * GIB), Some(20 * GIB), 16 * GIB, 0, GIB);
+        let capped = Accounting::of(40 * GIB, GIB, wiring(30 * GIB, 0), Some(20 * GIB), 16 * GIB, 0, GIB);
         assert_eq!(capped.capacity, 20 * GIB, "a budget under both still caps");
+    }
+
+    /// The GPU's wired limit is the machine's: what other processes held
+    /// wired at load comes off the recommended working set, though the OS
+    /// could wire more for this one. The M1 Max's soak: Metal recommended
+    /// 26.8 GB, the OS could wire 27.7, 1.8 was wired elsewhere, and the
+    /// device refused residency at 26.2 held.
+    #[test]
+    fn what_others_hold_wired_comes_off_the_recommendation() {
+        let mb = 1_000_000;
+        let os = crate::device::wirable::OsMemory {
+            available: 27_700 * mb,
+            wired: 1_800 * mb,
+        };
+        let soak = Accounting::of(26_800 * mb, 0, Some(Wiring::of(os, 0)), None, 1_200 * mb, 700 * mb, GIB);
+        assert_eq!(soak.capacity, 25_000 * mb - DRIVER_FLOOR);
+        assert!(soak.capacity < 26_200 * mb, "under where residency was refused");
+        // What this process held is its own, not others'.
+        let held = Wiring::of(os, 500 * mb);
+        assert_eq!((held.wirable, held.others), (28_200 * mb, 1_300 * mb));
     }
 }

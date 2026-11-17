@@ -1,14 +1,24 @@
-//! What the OS can wire for this process now: the memory it reports
-//! available (free, inactive, purgeable and speculative pages) at the
-//! moment a load asks. On unified memory the GPU's working set is wired
-//! from the same pages everything else on the machine uses, so a load's
-//! device capacity is the lesser of what Metal recommends and this.
+//! What the OS reports of its memory at the moment a load asks: what is
+//! available (free, inactive, purgeable and speculative pages) and what is
+//! wired. On unified memory the GPU's working set is wired from the same
+//! pages everything else on the machine uses, and the GPU's wired limit is
+//! the machine's, not a process's: what other processes hold wired counts
+//! against the same limit Metal's recommended working set states.
 #![allow(unsafe_code)]
 
-/// The bytes the OS reports available now, `None` where it would not say.
+/// The OS's memory now, in bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OsMemory {
+    /// Free, inactive, purgeable and speculative pages.
+    pub available: u64,
+    /// Wired pages, every process's and the kernel's.
+    pub wired: u64,
+}
+
+/// The OS's memory now, `None` where it would not say.
 #[cfg(target_vendor = "apple")]
 #[must_use]
-pub fn os_available() -> Option<u64> {
+pub fn os_memory() -> Option<OsMemory> {
     use std::mem::{MaybeUninit, size_of};
     // SAFETY: no arguments; answers this task's host port.
     #[allow(deprecated, reason = "the mach crate is not a dependency for one call")]
@@ -28,15 +38,18 @@ pub fn os_available() -> Option<u64> {
     let stats = unsafe { stats.assume_init() };
     // SAFETY: no arguments.
     let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
-    let pages = u64::from(stats.free_count)
+    let available = u64::from(stats.free_count)
         + u64::from(stats.inactive_count)
         + u64::from(stats.purgeable_count)
         + u64::from(stats.speculative_count);
-    Some(pages.saturating_mul(page))
+    Some(OsMemory {
+        available: available.saturating_mul(page),
+        wired: u64::from(stats.wire_count).saturating_mul(page),
+    })
 }
 
 #[cfg(not(target_vendor = "apple"))]
 #[must_use]
-pub fn os_available() -> Option<u64> {
+pub fn os_memory() -> Option<OsMemory> {
     None
 }
