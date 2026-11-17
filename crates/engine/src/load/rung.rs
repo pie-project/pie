@@ -289,7 +289,7 @@ impl FireEstimate {
             tokens * keys * self.attn_flops_per_row_key,
             // The rate at the keys a row attends: one at a decode lane, the
             // grid's narrowest point.
-            profile::fire::flops_at(&self.attn_grid, keys as u32, self.attn_head_dim)
+            profile::fire::attn_flops_at(&self.attn_grid, keys as u32, self.attn_head_dim)
                 .unwrap_or(f64::INFINITY),
         );
         let kv = over(keys_read * self.kv_bytes_per_key, self.bytes_per_ns);

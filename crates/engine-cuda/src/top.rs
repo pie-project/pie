@@ -157,7 +157,9 @@ mod tests {
                     .map(|m| (m, 4096, 4096, 249_000.0))
                     .collect(),
             ),
-            attn_flops_per_ns_by_keys_and_dim: Some(vec![(2048, 128, 100_000.0)]),
+            attn_flops_per_ns_by_keys_and_dim: Some(
+                (0..=14).map(|i| (1u32 << i, 128, 100_000.0)).collect(),
+            ),
             bytes_per_ns: Some(654.0),
             launch_ns: Some(1620),
             ..profile::fire::Rates::default()

@@ -36,9 +36,16 @@ pub fn rates(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Outco
         ));
     }
     say(&format!(
-        "[rates]: attention {:.1} TFLOP/s, scan {:.2} G state elements/s, {:.0} GB/s, launch \
-         {:.2} us",
-        r.attn_at(16384, 128).unwrap_or(0.0) / 1e3,
+        "[rates]: attention {:.1} TFLOP/s at its widest keys, scan {:.2} G state elements/s, \
+         {:.0} GB/s, launch {:.2} us",
+        r.attn_flops_per_ns_by_keys_and_dim
+            .as_deref()
+            .and_then(|grid| {
+                let widest = *profile::fire::attn_keys(grid).last()?;
+                profile::fire::attn_flops_at(grid, widest, 128)
+            })
+            .unwrap_or(0.0)
+            / 1e3,
         r.scan_at(2048).unwrap_or(0.0),
         r.bytes_per_ns.unwrap_or(0.0),
         r.launch_ns.unwrap_or(0) as f64 / 1e3

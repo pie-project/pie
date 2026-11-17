@@ -15,7 +15,8 @@
 //!   [`gemm_flops`] a matmul over its time.
 //! - `attn_flops_per_ns_by_keys_and_dim`: the backend's prefill attention
 //!   at [`ATTN_SHAPE`]'s heads, one sequence of `keys` rows attending itself
-//!   at each `keys` of [`ATTN_KEYS`] and head width `d` of [`ATTN_DIMS`]
+//!   at each `keys` of the engine's lattice to its saturation top
+//!   ([`attn_keys`]) and head width `d` of [`ATTN_DIMS`]
 //!   ([`AttnShape::at`], [`AttnShape::with_dim`]), its pages laid in the pool
 //!   in [`attn_page_order`], through the attention kernel serving selects at
 //!   that shape, [`attn_flops`] over its time.
@@ -56,17 +57,15 @@ pub fn step_bytes(top: u32) -> u64 {
         })
         .max()
         .unwrap_or(0);
+    // The attention's keys run to `top`: its sets hold about
+    // ATTN_SET_BYTES at every point, the widest's one set past it.
     let attn = ATTN_DIMS
         .iter()
-        .flat_map(|&d| {
-            ATTN_KEYS
-                .iter()
-                .map(move |&keys| ATTN_SHAPE.at(keys).with_dim(d))
-        })
+        .map(|&d| ATTN_SHAPE.at(top.max(1)).with_dim(d))
         .map(|s| {
             let q = u64::from(s.rows) * u64::from(s.q_heads * s.head_dim);
-            let kv = 2 * u64::from(s.keys) * u64::from(s.kv_heads * s.head_dim);
-            attn_sets_at(s) as u64 * bf16(q + kv) + bf16(q)
+            let kv = 2 * u64::from(s.keys.div_ceil(16) * 16) * u64::from(s.kv_heads * s.head_dim);
+            ATTN_SET_BYTES as u64 + bf16(q + kv) + bf16(q)
         })
         .max()
         .unwrap_or(0);
@@ -403,14 +402,51 @@ pub fn saturation_of(lattice: &[u32], costs: &[Vec<f64>]) -> Saturation {
 /// served fire reads each layer's kv (and its q) cold.
 pub const ATTN_SET_BYTES: usize = WEIGHT_BYTES;
 
-/// The q / k / v sets the timed attentions of `shape` rotate through:
-/// [`ATTN_SET_BYTES`] of the shape's q rows and k and v keys (bf16), and
-/// never fewer than 2.
+/// The q / k / v sets the timed attentions of `shape` rotate through, its
+/// kv laid in pages of `page` keys: [`ATTN_SET_BYTES`] of the shape's q rows
+/// and of k and v over the pages as laid, whole (bf16), and never fewer
+/// than 2. (engine-cuda's sizing, 63876a684: a few-key point's page is
+/// laid whole, so its sets are counted by it.)
 #[must_use]
-pub fn attn_sets_at(shape: AttnShape) -> usize {
-    let q = shape.rows as usize * (shape.q_heads * shape.head_dim) as usize;
-    let kv = 2 * shape.keys as usize * (shape.kv_heads * shape.head_dim) as usize;
-    ATTN_SET_BYTES.div_ceil(((q + kv) * 2).max(1)).max(2)
+pub fn attn_sets_at(shape: AttnShape, page: u32) -> usize {
+    let q_bytes = shape.rows as usize * (shape.q_heads * shape.head_dim) as usize * 2;
+    let cells = (shape.keys.div_ceil(page.max(1)) * page.max(1)) as usize;
+    let kv_bytes = 2 * cells * (shape.kv_heads * shape.head_dim) as usize * 2;
+    ATTN_SET_BYTES.div_ceil((q_bytes + kv_bytes).max(1)).max(2)
+}
+
+/// The keys the attention is timed at, each a sequence of as many rows
+/// attending itself: the engine's own rung lattice to its saturation `top`
+/// (a rung's prompt attends as many keys as its rows, so its rate is read
+/// where it was timed, not between rows, where a kernel's wave quantization
+/// moves it).
+#[must_use]
+pub fn attn_keys(lattice: &[u32], top: u32) -> Vec<u32> {
+    lattice
+        .iter()
+        .copied()
+        .take_while(|&rows| rows <= top)
+        .collect()
+}
+
+/// The rates step's attention, one rule for every engine: at each head
+/// width of [`ATTN_DIMS`] and each of [`attn_keys`] (`lattice` to `top`),
+/// [`ATTN_SHAPE`] at those keys and that width, timed by `measure` (its
+/// rate in flops a ns, the launch taken off). Returns `(keys, d, rate)`
+/// grouped by width, as `attn_flops_per_ns_by_keys_and_dim` states them.
+pub fn attention_at_rows<E>(
+    lattice: &[u32],
+    top: u32,
+    mut measure: impl FnMut(AttnShape) -> Result<f64, E>,
+) -> Result<Vec<(u32, u32, f64)>, E> {
+    let keys = attn_keys(lattice, top);
+    let mut out = Vec::with_capacity(keys.len() * ATTN_DIMS.len());
+    for d in ATTN_DIMS {
+        for &k in &keys {
+            out.push((k, d, measure(ATTN_SHAPE.at(k).with_dim(d))?));
+        }
+    }
+    Ok(out)
 }
 
 /// A prefill attention the attention rate is timed at.
@@ -437,12 +473,6 @@ pub const ATTN_SHAPE: AttnShape = AttnShape {
     kv_heads: 8,
     head_dim: 128,
 };
-
-/// The keys the attention curve is measured at (each a sequence of as many
-/// rows attending itself): powers of two from 512 (a short prompt's piece)
-/// to 16384 (past the widest rung a load lays), since a paged prefill's
-/// rate a flop grows with the keys its tiles stream.
-pub const ATTN_KEYS: [u32; 6] = [512, 1024, 2048, 4096, 8192, 16384];
 
 /// The step the attention's page table walks its pool by: page `i` of the
 /// sequence is pool page `i · ATTN_PAGE_STRIDE mod pages`
@@ -530,7 +560,7 @@ pub struct ScanShape {
 /// The prompt lengths the scan curve is measured at: the attention's keys
 /// (a scan's rate a token grows with the chunk it walks, as a paged
 /// attention's with its keys).
-pub const SCAN_TOKENS: [u32; 6] = ATTN_KEYS;
+pub const SCAN_TOKENS: [u32; 6] = [512, 1024, 2048, 4096, 8192, 16384];
 
 /// The scan sets the timed scans of `shape` rotate through: [`ATTN_SET_BYTES`]
 /// of the shape's input rows (bf16) and its conv and scan state (f32), and
@@ -599,8 +629,8 @@ pub fn tuned(rates: &profile::fire::Rates) -> String {
 pub fn provenance(backend: &str, how: &str) -> (&'static str, String) {
     let text = format!(
         "pie tune {backend} --rates on {} (pie {}): {how}; at engine::rates' lattice (matmul \
-         m x n x k, m the rung lattice, n and k 1024..16384; attention keys x keys, keys 512..16384, {}/{} \
-         heads of 64..256; scan {} tokens, {}/{} heads of {}x{}, conv {})",
+         m x n x k, m the rung lattice to its saturation point, n and k 1024..16384; attention keys \
+         x keys, keys the same rows, {}/{} heads of 64..256; scan {} tokens, {}/{} heads of {}x{}, conv {})",
         today(),
         env!("CARGO_PKG_VERSION"),
         ATTN_SHAPE.q_heads,
@@ -768,6 +798,24 @@ mod tests {
     }
 
     #[test]
+    fn the_attention_is_timed_at_the_lattice_rows_to_the_top() {
+        // CUDA's (63876a684): every grid row to the saturation point, each
+        // head width.
+        let lattice = [1, 2, 4, 280, 305, 4096, 4467, 4871];
+        assert_eq!(attn_keys(&lattice, 4467), [1, 2, 4, 280, 305, 4096, 4467]);
+        let mut timed = Vec::new();
+        let points = attention_at_rows(&lattice, 305, |s| {
+            timed.push((s.keys, s.rows, s.head_dim));
+            Ok::<_, ()>(f64::from(s.keys))
+        })
+        .unwrap();
+        assert_eq!(points.len(), 5 * ATTN_DIMS.len());
+        assert!(timed.iter().all(|&(k, r, _)| k == r));
+        assert_eq!(points[0], (1, ATTN_DIMS[0], 1.0));
+        assert_eq!(points[4], (305, ATTN_DIMS[0], 305.0));
+    }
+
+    #[test]
     fn the_walk_stops_a_shape_a_doubling_past_its_last_gain() {
         // One shape flat from 64: the walk times it to 128 (a doubling past
         // its last gain) and no further.
@@ -801,7 +849,7 @@ mod tests {
         assert_eq!(SCAN_SHAPE.at(512).tokens, 512);
         assert!(scan_sets_at(SCAN_SHAPE.at(512)) >= 2);
         assert!(scan_sets_at(SCAN_SHAPE.at(512)) > scan_sets_at(SCAN_SHAPE.at(16384)));
-        assert!(ATTN_KEYS.windows(2).all(|w| w[0] < w[1]));
+        assert!(SCAN_TOKENS.windows(2).all(|w| w[0] < w[1]));
         for pages in [1, 2, 7, 32, 1024, 7919, 15838] {
             let mut order = attn_page_order(pages);
             let in_order = order.windows(2).all(|w| w[0] < w[1]);
@@ -818,8 +866,15 @@ mod tests {
         assert!(ATTN_DIMS.windows(2).all(|w| w[0] < w[1]));
         // 512 keys at d 64: 1 MiB of q, 1 MiB of k and v; 16384 at 256: 256
         // MiB, three sets past 768 MiB.
-        assert_eq!(attn_sets_at(ATTN_SHAPE.at(512).with_dim(64)), 384);
-        assert_eq!(attn_sets_at(ATTN_SHAPE.at(16384).with_dim(256)), 3);
+        // engine-cuda's sizing (63876a684), the pages laid whole: 512 keys
+        // at d 64, q 1 MiB and kv 1 MiB, 384 sets of 768 MiB; at 16384 and
+        // d 256 three; one key lays its whole page of 16.
+        assert_eq!(attn_sets_at(ATTN_SHAPE.at(512).with_dim(64), 16), 384);
+        assert_eq!(attn_sets_at(ATTN_SHAPE.at(16384).with_dim(256), 16), 3);
+        assert_eq!(
+            attn_sets_at(ATTN_SHAPE.at(1).with_dim(128), 16),
+            ATTN_SET_BYTES.div_ceil(16 * 128 * 2 + 2 * 16 * 8 * 128 * 2)
+        );
         assert_eq!(ATTN_SHAPE.at(512).with_dim(256).head_dim, 256);
         assert_eq!(
             attn_flops(ATTN_SHAPE.at(512).with_dim(256)),

@@ -19,7 +19,8 @@
 //!   of them, several times what any last-level cache holds, so each reads
 //!   its weight from device memory as a layer's does.
 //! - `attn_flops_per_ns_by_keys_and_dim`: the paged prefill attention at
-//!   [`ATTN_SHAPE`]'s heads over each row of the matmul grid's lattice to its saturation point (a sequence of as many
+//!   [`ATTN_SHAPE`]'s heads over each row of the matmul grid's lattice to
+//!   its saturation point (`engine::rates::attention_at_rows`; a sequence of as many
 //!   rows attending itself) and each head width of `ATTN_DIMS`, causal, in
 //!   pages of [`PAGE`]; its launches rotate through
 //!   `engine::rates::attn_sets_at` sets of q rows and kv pages, so each reads
@@ -41,7 +42,7 @@
 //! Index and page tables, gates, outputs and workspace stay as laid.
 
 #[cfg_attr(not(feature = "device"), allow(unused_imports))]
-use engine::rates::{ATTN_DIMS, ATTN_SHAPE, DEPTHS, SCAN_SHAPE, weights_at};
+use engine::rates::{ATTN_SHAPE, DEPTHS, SCAN_SHAPE, weights_at};
 use profile::fire::Rates;
 
 /// The rows the matmul grid walks under `chip`: the chip's rung lattice
@@ -364,24 +365,22 @@ mod on_device {
             top.best_shape.0,
             top.best_shape.1
         );
-        // The attention at the grid's rows: a rung's prompt attends as many
-        // keys as its rows, so its rate is read where it was timed, not
-        // between powers of two (a kernel's wave quantization moves it
-        // between them).
-        let keys_at: Vec<u32> = lattice_rows(chip)
-            .into_iter()
-            .take_while(|&rows| rows <= top.rows)
-            .collect();
-        let mut attn = Vec::with_capacity(keys_at.len() * ATTN_DIMS.len());
-        for d in ATTN_DIMS {
-            for &keys in &keys_at {
-                attn.push((
-                    keys,
-                    d,
-                    attention(&device, &clock, &random, &mut held, keys, d, gap)?,
-                ));
-            }
-        }
+        // The attention at the grid's rows to its saturation point
+        // (engine::rates::attention_at_rows, every engine's rule): a rung's
+        // prompt attends as many keys as its rows, so its rate is read where
+        // it was timed, not between rows (a kernel's wave quantization moves
+        // it between them).
+        let attn = engine::rates::attention_at_rows(&lattice_rows(chip), top.rows, |at| {
+            attention(
+                &device,
+                &clock,
+                &random,
+                &mut held,
+                at.keys,
+                at.head_dim,
+                gap,
+            )
+        })?;
         let mut scan_curve = Vec::with_capacity(engine::rates::SCAN_TOKENS.len());
         for tokens in engine::rates::SCAN_TOKENS {
             scan_curve.push((
@@ -600,9 +599,7 @@ mod on_device {
         // sets' pages share one pool and their page tables one column.
         let q_bytes = (rows * q_heads * d) as usize * 2;
         let set_cells = (pages * PAGE) as usize;
-        let sets = engine::rates::ATTN_SET_BYTES
-            .div_ceil(q_bytes + 2 * set_cells * kv_width as usize * 2)
-            .max(2);
+        let sets = engine::rates::attn_sets_at(at, PAGE);
         let cells = sets * set_cells;
         let keys = random.operand(cells * kv_width as usize * 2)?;
         let values = random.operand(cells * kv_width as usize * 2)?;
@@ -916,5 +913,37 @@ mod lattice_tests {
             weighed[..weighed.len() - 1]
         );
         assert_eq!(weighed.first(), Some(&1), "a readout's one row");
+    }
+}
+
+#[cfg(test)]
+mod attention_tests {
+    use super::PAGE;
+
+    #[test]
+    fn the_attention_sets_and_keys_are_the_shared_rule_at_cudas_page() {
+        // CUDA path unchanged: 63876a684 sized its sets in place, the q rows
+        // and the kv pages as laid whole against ATTN_SET_BYTES, at least 2,
+        // and took the lattice's rows to the saturation point; the shared
+        // functions at its PAGE give the same.
+        for (keys, d) in [(1, 64), (17, 128), (2234, 128), (4467, 256)] {
+            let at = engine::rates::ATTN_SHAPE.at(keys).with_dim(d);
+            let pages = at.rows.div_ceil(PAGE);
+            let q_bytes = (at.rows * at.q_heads * at.head_dim) as usize * 2;
+            let set_cells = (pages * PAGE) as usize;
+            let kv_width = (at.kv_heads * at.head_dim) as usize;
+            let inline = engine::rates::ATTN_SET_BYTES
+                .div_ceil(q_bytes + 2 * set_cells * kv_width * 2)
+                .max(2);
+            assert_eq!(
+                engine::rates::attn_sets_at(at, PAGE),
+                inline,
+                "{keys} keys, d {d}"
+            );
+        }
+        let lattice = super::lattice_rows(&crate::chip::profile(""));
+        let top = lattice[lattice.len() / 2];
+        let inline: Vec<u32> = lattice.iter().copied().take_while(|&r| r <= top).collect();
+        assert_eq!(engine::rates::attn_keys(&lattice, top), inline);
     }
 }

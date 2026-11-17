@@ -15,7 +15,7 @@
 //!   `engine::rates::weights_at(n, k)`
 //!   weight planes (past the last-level cache), for the matmul grid;
 //! - its prefill attention at `engine::rates::ATTN_SHAPE`'s heads over each
-//!   `engine::rates::ATTN_KEYS` and head width of `engine::rates::ATTN_DIMS`,
+//!   the lattice's rows to its saturation top (`engine::rates::attention_at_rows`) and head width of `engine::rates::ATTN_DIMS`,
 //!   through the kernel a served fire selects at that shape, for the
 //!   attention grid;
 //! - its chunked gated-delta scan, the causal conv before it, at
@@ -36,10 +36,7 @@
 //! way: one submit each, so neither the clock nor the adapter's span start
 //! biases it.
 
-use engine::rates::{
-    ATTN_DIMS, ATTN_KEYS, ATTN_SHAPE, DEPTHS, SCAN_SHAPE, attn_flops, gemm_flops, scan_elements,
-    weights_at,
-};
+use engine::rates::{DEPTHS, SCAN_SHAPE, attn_flops, gemm_flops, scan_elements, weights_at};
 use kernels_slang::{KvPool, RaggedTensor, Tensor};
 use poem_ir::Dtype;
 use profile::fire::Rates;
@@ -66,6 +63,11 @@ pub const ROUNDS: usize = 5;
 
 /// The kv page the attention's pool is laid in.
 const PAGE: u32 = 16;
+
+/// The most q / kv sets one attention point lays: each set binds its own q
+/// and k and v buffers, and the step's bindings are a device's to bound
+/// (a few-key point would lay thousands, its reads warm at any count).
+const ATTN_SETS_MOST: usize = 256;
 
 /// How a backend times a committed frame: `(adapter ns where it has
 /// timestamps, host ns around the submit and the wait)`.
@@ -237,18 +239,13 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         top.through,
         100.0 * top.best_gain,
     ));
-    let mut attn = Vec::with_capacity(ATTN_KEYS.len() * ATTN_DIMS.len());
-    for d in ATTN_DIMS {
-        for keys in ATTN_KEYS {
-            let shape = ATTN_SHAPE.at(keys).with_dim(d);
-            attn.push((
-                keys,
-                d,
-                attention(&mut rig, tactics, tier, timer, shape, launch)?,
-            ));
-            rig.release();
-        }
-    }
+    // The attention at the grid's rows to its saturation point
+    // (engine::rates::attention_at_rows, every engine's rule).
+    let attn = engine::rates::attention_at_rows(&rows, top.rows, |shape| {
+        let rate = attention(&mut rig, tactics, tier, timer, shape, launch);
+        rig.release();
+        rate
+    })?;
     let mut scan_curve = Vec::with_capacity(engine::rates::SCAN_TOKENS.len());
     for tokens in engine::rates::SCAN_TOKENS {
         let shape = SCAN_SHAPE.at(tokens);
@@ -394,7 +391,7 @@ fn attention<B: Serve, T: Tactics + ?Sized>(
     let page_indptr = rig.words(&[0, pages], 2, 1, Dtype::U32)?;
     // Each fire reads the next of these q / k / v sets, past the last-level
     // cache, as a served fire reads each layer's kv cold.
-    let sets = (0..engine::rates::attn_sets_at(s))
+    let sets = (0..engine::rates::attn_sets_at(s, PAGE).min(ATTN_SETS_MOST))
         .map(|_| {
             let q = rig.operand(s.rows, s.q_heads * s.head_dim, Dtype::Bf16)?;
             let keys = rig.operand(s.keys, kv_width, Dtype::Bf16)?;

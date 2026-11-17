@@ -28,7 +28,7 @@
 //! serving runs, and every backend times the same bytes. Index and page
 //! tables, gates, outputs and the launch probe stay as laid.
 
-use engine::rates::{ATTN_DIMS, ATTN_KEYS, ATTN_SHAPE, AttnShape, DEPTHS, SCAN_SHAPE};
+use engine::rates::{AttnShape, DEPTHS, SCAN_SHAPE};
 use kernels_metal::linear::gemm;
 use kernels_metal::tensor::{RaggedTensor, RecurrentPool};
 use kernels_metal::{KvPool, PrefillPlan, StateMap, Tensor, Tuning, attn, ssm};
@@ -224,7 +224,11 @@ impl Bench<'_> {
         // one set repeated would sit in the system cache. Every set's pages
         // lie in one pool plane, scattered over it as a served pool lays a
         // sequence's (engine::rates::attn_page_order), each set its own q.
-        let sets = u32::try_from(engine::rates::attn_sets_at(shape)).map_err(|e| e.to_string())?;
+        // Each set binds its own q and page-table buffers: at most
+        // ATTN_SETS_MOST of them (a few-key point would lay thousands).
+        const ATTN_SETS_MOST: usize = 256;
+        let sets = u32::try_from(engine::rates::attn_sets_at(shape, PAGE).min(ATTN_SETS_MOST))
+            .map_err(|e| e.to_string())?;
         let all = pages * sets;
         let slots = all * PAGE;
         let kv = u64::from(slots) * u64::from(kv_heads * d) * 2;
@@ -545,19 +549,19 @@ pub fn measure(
         }
     }
     grid.sort_by_key(|&(m, n, k, _)| (k, n, m));
-    let mut keys_curve = Vec::with_capacity(ATTN_KEYS.len() * ATTN_DIMS.len());
-    for (d, keys) in ATTN_DIMS
-        .iter()
-        .flat_map(|&d| ATTN_KEYS.iter().map(move |&keys| (d, keys)))
-    {
+    // The attention at the grid's rows to its saturation point
+    // (engine::rates::attention_at_rows, every engine's rule).
+    let keys_curve = engine::rates::attention_at_rows(&lattice, top.rows, |shape| {
         bench.handles = Handles::new();
-        let rate = bench.attention_flops(ATTN_SHAPE.at(keys).with_dim(d), gap)?;
+        let rate = bench.attention_flops(shape, gap)?;
         say(&format!(
-            "  prefill attention, {keys} rows over {keys} keys, d {d}: {:.2} TFLOP/s",
+            "  prefill attention, {0} rows over {0} keys, d {1}: {2:.4} TFLOP/s",
+            shape.keys,
+            shape.head_dim,
             rate / 1e3
         ));
-        keys_curve.push((keys, d, rate));
-    }
+        Ok::<_, String>(rate)
+    })?;
     bench.handles = Handles::new();
     let mut scan_curve = Vec::with_capacity(engine::rates::SCAN_TOKENS.len());
     for tokens in engine::rates::SCAN_TOKENS {

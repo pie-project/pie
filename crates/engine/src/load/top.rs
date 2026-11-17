@@ -453,6 +453,9 @@ pub enum Refused {
     /// lattice, or a load laying a rung off it.
     OffGrid {
         device: String,
+        /// The grid: `bf16_flops_per_ns_by_rows_n_k` (its rows) or
+        /// `attn_flops_per_ns_by_keys_and_dim` (its keys).
+        what: &'static str,
         rows: Vec<u32>,
         grid: Vec<u32>,
     },
@@ -468,12 +471,16 @@ impl fmt::Display for Refused {
                  it"
             ),
             Refused::NoRung(no) => no.fmt(f),
-            Refused::OffGrid { device, rows, grid } => write!(
+            Refused::OffGrid {
+                device,
+                what,
+                rows,
+                grid,
+            } => write!(
                 f,
-                "device {device}'s matmul grid (`[rates] bf16_flops_per_ns_by_rows_n_k`) states \
-                 no rows {rows:?} a rung of this load fires (it states {grid:?}, the rung \
-                 lattice it was timed at); `pie tune <backend> --rates` measures the lattice \
-                 this backend lays"
+                "device {device}'s `[rates] {what}` states no rows {rows:?} a rung of this load \
+                 fires (it states {grid:?}, the rung lattice it was timed at); `pie tune \
+                 <backend> --rates` measures the lattice this backend lays"
             ),
         }
     }
@@ -509,9 +516,31 @@ pub fn choose(
     if !off.is_empty() {
         return Err(Refused::OffGrid {
             device: device.to_owned(),
+            what: "bf16_flops_per_ns_by_rows_n_k",
             rows: off,
             grid,
         });
+    }
+    // Every key count a feasible rung's rows attend, on the attention grid:
+    // read there exactly, never between rows.
+    if estimate.attn_flops_per_row_key > 0.0 {
+        let keys = profile::fire::attn_keys(&estimate.attn_grid);
+        let mut off: Vec<u32> = rungs
+            .iter()
+            .filter(|r| r.infeasible.is_none())
+            .map(|r| r.check_fire().keys_per_lane)
+            .filter(|k| keys.binary_search(k).is_err())
+            .collect();
+        off.sort_unstable();
+        off.dedup();
+        if !off.is_empty() {
+            return Err(Refused::OffGrid {
+                device: device.to_owned(),
+                what: "attn_flops_per_ns_by_keys_and_dim",
+                rows: off,
+                grid: keys,
+            });
+        }
     }
     let top = super::rung::top_rung(rungs, live, &estimate).map_err(Refused::NoRung)?;
     Ok((top, estimate))
@@ -597,6 +626,11 @@ mod tests {
         (0..=14).map(|i| (1u32 << i, 4096, 4096, rate)).collect()
     }
 
+    /// An attention grid at every power of two of keys to 16384, d 128.
+    fn attn_lattice(rate: f64) -> Vec<(u32, u32, f64)> {
+        (0..=14).map(|i| (1u32 << i, 128, rate)).collect()
+    }
+
     #[test]
     fn a_lattice_off_the_powers_of_two_is_read_where_its_engine_timed_it() {
         // An engine whose candidates are its own buckets (2234, 2436), its
@@ -607,7 +641,7 @@ mod tests {
             bf16_flops_per_ns_by_rows_n_k: Some(
                 rows.iter().map(|&m| (m, 4096, 4096, 1.0)).collect(),
             ),
-            attn_flops_per_ns_by_keys_and_dim: Some(vec![(2048, 128, 1.0)]),
+            attn_flops_per_ns_by_keys_and_dim: Some(rows.iter().map(|&k| (k, 128, 1.0)).collect()),
             bytes_per_ns: Some(1.0),
             ..profile::fire::Rates::default()
         };
@@ -632,7 +666,7 @@ mod tests {
         let rungs = [rung(1024, 100 * MIB, None), rung(3000, 150 * MIB, None)];
         let rates = profile::fire::Rates {
             bf16_flops_per_ns_by_rows_n_k: Some(lattice(1.0)),
-            attn_flops_per_ns_by_keys_and_dim: Some(vec![(2048, 128, 1.0)]),
+            attn_flops_per_ns_by_keys_and_dim: Some(attn_lattice(1.0)),
             bytes_per_ns: Some(1.0),
             ..profile::fire::Rates::default()
         };
@@ -642,6 +676,34 @@ mod tests {
             "{err}"
         );
         assert!(err.to_string().contains("states no rows [3000]"), "{err}");
+    }
+
+    #[test]
+    fn a_rung_whose_keys_the_attention_grid_lacks_is_refused_by_name() {
+        // The matmul grid at the rung's rows, the attention at powers of two
+        // only (a profile timed before the attention ran at the lattice).
+        let rows = [1, 2234];
+        let rates = profile::fire::Rates {
+            bf16_flops_per_ns_by_rows_n_k: Some(
+                rows.iter().map(|&m| (m, 4096, 4096, 1.0)).collect(),
+            ),
+            attn_flops_per_ns_by_keys_and_dim: Some(vec![(2048, 128, 1.0), (4096, 128, 1.0)]),
+            bytes_per_ns: Some(1.0),
+            ..profile::fire::Rates::default()
+        };
+        let err = choose(
+            &[rung(2234, 100 * MIB, None)],
+            1 << 33,
+            &rates,
+            "Card X",
+            &counts(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Refused::OffGrid { what, ref rows, .. }
+                if what == "attn_flops_per_ns_by_keys_and_dim" && rows == &vec![2234]),
+            "{err}"
+        );
     }
 
     #[test]
@@ -663,7 +725,7 @@ mod tests {
         let none = [rung(1024, 300 * MIB, Some("past one binding"))];
         let rated = profile::fire::Rates {
             bf16_flops_per_ns_by_rows_n_k: Some(lattice(1.0)),
-            attn_flops_per_ns_by_keys_and_dim: Some(vec![(2048, 128, 1.0)]),
+            attn_flops_per_ns_by_keys_and_dim: Some(attn_lattice(1.0)),
             bytes_per_ns: Some(1.0),
             ..profile::fire::Rates::default()
         };

@@ -50,7 +50,7 @@ fn the_micro_fires_state_rates_and_the_ruling_picks_by_them() {
     assert_eq!(profile::fire::gemm_grid(grid.clone()), Some(grid.clone()));
     eprintln!("grid {grid:?}");
     for rate in [
-        rates.attn_at(2048, 128).unwrap(),
+        rates.attn_at(top, 128).unwrap(),
         rates.scan_at(2048).unwrap(),
     ] {
         assert!((1.0..1e6).contains(&rate), "{rate}");

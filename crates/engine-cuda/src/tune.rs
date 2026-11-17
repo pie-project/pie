@@ -76,11 +76,16 @@ pub fn rates(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Rated
             at(8192) / 1e3
         ));
     }
+    let keys = profile::fire::attn_keys(&attn);
+    let (narrowest, widest) = (
+        keys.first().copied().unwrap_or(0),
+        keys.last().copied().unwrap_or(0),
+    );
     say(&format!(
-        "[rates]: attention {:.1} TFLOP/s at 512 keys to {:.1} at 16384, scan {:.0} G \
-         elements/s, {:.0} GB/s, launch {} ns",
-        r.attn_at(512, 128).unwrap_or(0.0) / 1e3,
-        r.attn_at(16384, 128).unwrap_or(0.0) / 1e3,
+        "[rates]: attention {:.1} TFLOP/s at {narrowest} keys to {:.1} at {widest}, scan {:.0} \
+         G elements/s, {:.0} GB/s, launch {} ns",
+        r.attn_at(narrowest, 128).unwrap_or(0.0) / 1e3,
+        r.attn_at(widest, 128).unwrap_or(0.0) / 1e3,
         r.scan_at(2048).unwrap_or(0.0),
         r.bytes_per_ns.unwrap_or(0.0),
         r.launch_ns.unwrap_or(0),

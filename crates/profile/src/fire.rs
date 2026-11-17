@@ -75,11 +75,12 @@ impl Rates {
         gemm_at(self.bf16_flops_per_ns_by_rows_n_k.as_deref()?, rows, n, k)
     }
 
-    /// The attention rate at `keys` and head width `d` ([`flops_at`]: in
-    /// `log keys` and `log d`, clamped). `None` where no grid is stated.
+    /// The attention rate at `keys` and head width `d` ([`attn_flops_at`]:
+    /// at `keys` exactly, in `log d` between widths). `None` where no grid
+    /// is stated, or it states no `keys`.
     #[must_use]
     pub fn attn_at(&self, keys: u32, d: u32) -> Option<f64> {
-        flops_at(self.attn_flops_per_ns_by_keys_and_dim.as_deref()?, keys, d)
+        attn_flops_at(self.attn_flops_per_ns_by_keys_and_dim.as_deref()?, keys, d)
     }
 
     /// The scan rate at a prompt of `tokens` ([`interpolate`]). `None` where
@@ -188,6 +189,43 @@ pub fn flops_at(grid: &[(u32, u32, f64)], rows: u32, depth: u32) -> Option<f64> 
     let at = depths.partition_point(|&k| k <= depth);
     let (lo, hi) = (depths[at - 1], depths[at]);
     Some(lerp_log((lo, along(lo)?), (hi, along(hi)?), depth))
+}
+
+/// The attention rate of `grid` (`(keys, d, rate)`, grouped by `d`
+/// ascending) at `keys` and head width `d`: each width's point at `keys`
+/// exactly (the keys are the rung lattice the step timed, a kernel's wave
+/// quantization moving the rate between them, so none is read between),
+/// then linear in `log d` between widths and clamped past them. `None`
+/// where a width states no `keys`.
+#[must_use]
+pub fn attn_flops_at(grid: &[(u32, u32, f64)], keys: u32, d: u32) -> Option<f64> {
+    let mut widths: Vec<u32> = grid.iter().map(|&(_, w, _)| w).collect();
+    widths.sort_unstable();
+    widths.dedup();
+    let along = |w: u32| -> Option<f64> {
+        grid.iter()
+            .find(|&&(k, ww, _)| k == keys && ww == w)
+            .map(|&(_, _, r)| r)
+    };
+    let (&w0, &w1) = (widths.first()?, widths.last()?);
+    if d <= w0 {
+        return along(w0);
+    }
+    if d >= w1 {
+        return along(w1);
+    }
+    let at = widths.partition_point(|&w| w <= d);
+    let (lo, hi) = (widths[at - 1], widths[at]);
+    Some(lerp_log((lo, along(lo)?), (hi, along(hi)?), d))
+}
+
+/// The keys an attention grid states, ascending.
+#[must_use]
+pub fn attn_keys(grid: &[(u32, u32, f64)]) -> Vec<u32> {
+    let mut keys: Vec<u32> = grid.iter().map(|&(k, ..)| k).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    keys
 }
 
 /// `points` (`(m, n, k, rate)`) checked and ordered by `(k, n, m)`: `None`
@@ -425,6 +463,24 @@ mod tests {
         assert_eq!(rates.flops_at(256, 24576, 4096), Some(800.0));
         assert_eq!(rates.peak_flops(), Some(800.0));
         assert_eq!(Rates::default().flops_at(16, 1024, 1024), None);
+    }
+
+    #[test]
+    fn the_attention_reads_its_keys_exactly_and_interpolates_the_width() {
+        // Keys 2234 and 2436 (a lattice's rows) at widths 64 and 256.
+        let grid = vec![
+            (2234, 64, 100.0),
+            (2436, 64, 120.0),
+            (2234, 256, 400.0),
+            (2436, 256, 480.0),
+        ];
+        assert_eq!(attn_flops_at(&grid, 2234, 64), Some(100.0));
+        assert_eq!(attn_flops_at(&grid, 2436, 512), Some(480.0), "width clamped");
+        // Width 128 halfway from 64 to 256 in log width.
+        assert!((attn_flops_at(&grid, 2234, 128).unwrap() - 250.0).abs() < 1e-9);
+        // Keys between the rows: no rate, never read between them.
+        assert_eq!(attn_flops_at(&grid, 2300, 64), None);
+        assert_eq!(attn_keys(&grid), vec![2234, 2436]);
     }
 
     #[test]
