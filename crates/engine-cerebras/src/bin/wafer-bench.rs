@@ -61,7 +61,8 @@ const USAGE: &str = "usage: wafer-bench --program <dir> --weights <dir>[:<prefix
                      --inputs <dir> [--grid T,H,W] [--steps N] [--golden <dir>] [--save <dir>] [--reload 1] [--cmaddr <addr>] [--statics <dir>] [--stamps <dir>] \
                      [--rows 1 [--save-rows <dir>]]\n       wafer-bench --decode <golden.json> --checkpoint <dir> \
                      (--reading <dir> --program <dir> | --model <deployment> --cache <dir> [--positions N] \
-                     [--lanes B]) [--steps N] [--stagger S] [--cmaddr <addr>] [--export <dir>] [--dry 1]";
+                     [--lanes B]) [--steps N] [--stagger S] [--cmaddr <addr>] [--export <dir>] [--dry 1] \
+                     [--stamps 1]";
 
 fn main() {
     match run() {
@@ -314,7 +315,10 @@ fn decode(get: &HashMap<String, String>) -> Result<bool, String> {
             (d.display().to_string(), l.display().to_string())
         }
     };
-    let reading = Reading::open(Path::new(&dir))?;
+    let mut reading = Reading::open(Path::new(&dir))?;
+    // (a step's wall time as Pie serves it: every PE's stamps, 3 words a PE, read back only
+    // where asked, the cycles then reported)
+    reading.stamped = get.contains_key("stamps");
     let trace = reading.trace()?;
     let golden: Value = serde_json::from_str(
         &std::fs::read_to_string(need("decode")?).map_err(|e| format!("--decode: {e}"))?,
