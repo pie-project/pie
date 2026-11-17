@@ -231,11 +231,14 @@ fn inputs(gpu: &mut Gpu, lcg: &mut Lcg, case: Case, m: usize, n: usize) -> (Vec<
 fn each_skeleton_lands_each_epilogue_as_the_interpreter() {
     // (skeleton, rows, n, k): the gemv split over K and not (past
     // `kernel.gemv.splitk_max_n` columns), the few rows at one, a ragged
-    // few and sixteen, the skinny at a ragged few and a full tile.
+    // few and sixteen, and eight over a ragged grid wide enough to fill a
+    // device's wave at four weight rows a warp; the skinny at a ragged few
+    // and a full tile.
     #[rustfmt::skip]
     let shapes = [
         (Skeleton::Gemv, 1, 256, 512), (Skeleton::Gemv, 1, 4224, 256),
         (Skeleton::Rows, 1, 192, 512), (Skeleton::Rows, 5, 320, 1024), (Skeleton::Rows, 16, 128, 256),
+        (Skeleton::Rows, 8, 4100, 1024),
         (Skeleton::Skinny, 3, 128, 256), (Skeleton::Skinny, 64, 256, 512),
     ];
     let tuning = Tuning::DEFAULT;
