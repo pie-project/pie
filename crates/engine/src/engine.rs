@@ -69,18 +69,6 @@ impl StepOutcome {
         }
     }
 
-    /// SCAFFOLDING, deleted in the sitting every engine attributes its
-    /// guest faults to their lanes: a guest fault this engine cannot yet
-    /// place on the lanes whose pass it was, told as every one of the
-    /// step's `lanes` faulted, as the whole step failed before lanes did.
-    #[must_use]
-    pub fn unattributed_guest_fault(lanes: u32, reason: impl Into<String>) -> StepOutcome {
-        StepOutcome {
-            wrote: Vec::new(),
-            faulted: every_lane(lanes, reason.into()),
-        }
-    }
-
     /// Lanes `lanes` of `instance`'s pass faulted for `reason`; a lane
     /// already faulted keeps its first reason.
     pub fn fault_lanes(
