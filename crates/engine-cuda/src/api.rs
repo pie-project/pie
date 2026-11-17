@@ -1030,6 +1030,36 @@ impl Engine for Cuda {
             .and_then(|shell| shell.prewarm_programs(registrations).map_err(fault))
     }
 
+    /// The program adopted and its build planned here; its regions compile
+    /// (NVRTC, or the kernel cache's files) in the returned compile, off
+    /// the engine's thread, while fires go on. Their modules load into the
+    /// context at [`Engine::finish_program`].
+    fn prepare_program(
+        &mut self,
+        registration: &ProgramRegistration,
+    ) -> EngineResult<engine::ProgramCompile> {
+        let prepared = self
+            .loaded_mut()
+            .and_then(|shell| shell.prepare_program(registration).map_err(fault));
+        let mut pending = self.refused(prepared)?;
+        Ok(Box::new(move || {
+            pending.build();
+            engine::Prepared(Box::new(pending))
+        }))
+    }
+
+    fn finish_program(&mut self, prepared: engine::Prepared) -> EngineResult<ProgramId> {
+        let Ok(pending) = prepared.0.downcast::<crate::program::Pending>() else {
+            return Err(Error::Program(
+                "a prepared program CUDA did not prepare".to_string(),
+            ));
+        };
+        let registered = self
+            .loaded_mut()
+            .and_then(|shell| shell.finish_program(*pending).map_err(fault));
+        self.refused(registered)
+    }
+
     fn settles_asynchronously(&self) -> bool {
         true
     }

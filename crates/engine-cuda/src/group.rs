@@ -406,6 +406,36 @@ impl Engine for Group {
         self.lead(move |rank| rank.register_program(&registration))
     }
 
+    /// Each rank plans its own build, and the compile builds every rank's
+    /// in turn; each rank loads its own modules at the finish.
+    fn prepare_program(
+        &mut self,
+        registration: &ProgramRegistration,
+    ) -> EngineResult<engine::ProgramCompile> {
+        let mut compiles = Vec::with_capacity(self.ranks.len());
+        for rank in 0..self.ranks.len() {
+            compiles.push(self.on(rank, |cuda| cuda.prepare_program(registration))?);
+        }
+        Ok(Box::new(move || {
+            let built: Vec<engine::Prepared> =
+                compiles.into_iter().map(|compile| compile()).collect();
+            engine::Prepared(Box::new(built))
+        }))
+    }
+
+    fn finish_program(&mut self, prepared: engine::Prepared) -> EngineResult<ProgramId> {
+        let Ok(built) = prepared.0.downcast::<Vec<engine::Prepared>>() else {
+            return Err(Error::Program(
+                "a prepared program this group did not prepare".to_string(),
+            ));
+        };
+        let mut ids = Vec::with_capacity(built.len());
+        for (rank, prepared) in built.into_iter().enumerate() {
+            ids.push(self.on(rank, |cuda| cuda.finish_program(prepared))?);
+        }
+        Ok(ids.swap_remove(0))
+    }
+
     fn program_facts(&self, program: ProgramId) -> EngineResult<engine::program::ProgramFacts> {
         match self.ranks.first().and_then(|rank| rank.try_lock().ok()) {
             Some(rank) => rank.program_facts(program),
