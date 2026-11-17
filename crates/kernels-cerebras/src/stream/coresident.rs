@@ -26,6 +26,8 @@ const GATED: &str = "fn run(rd: u16) void { if (rd == RD) { timestamp.enable_tsc
 pub struct Placed {
     pub name: String,
     pub x: u32,
+    /// Its first row (0 where the readings fit side by side).
+    pub y: u32,
     pub w: u32,
     pub h: u32,
 }
@@ -73,12 +75,14 @@ pub fn combine(root: &Path, names: &[String]) -> R<Vec<Placed>> {
         placed.push(Placed {
             name: n.clone(),
             x,
+            y: 0,
             w,
             h,
         });
         x += w;
     }
-    let (w, h) = (x, placed.iter().map(|p| p.h).max().unwrap_or(1));
+    // side by side where they fit the system's fabric, else packed in 2D ([`crate::place::pack`])
+    let (w, h) = place(&mut placed)?;
     let mut names_out: std::collections::BTreeMap<String, String> = Default::default();
     let mut body = String::new();
     let mut covered = std::collections::BTreeSet::new();
@@ -120,7 +124,7 @@ pub fn combine(root: &Path, names: &[String]) -> R<Vec<Placed>> {
                     while x < x1 {
                         let mut y = y0;
                         while y < y1 {
-                            covered.insert((x + p.x, y));
+                            covered.insert((x + p.x, y + p.y));
                             y += sy;
                         }
                         x += sx;
@@ -138,6 +142,7 @@ pub fn combine(root: &Path, names: &[String]) -> R<Vec<Placed>> {
                         );
                     rest = format!("{}{fixed}", &rest[..at]);
                 }
+                let rest = shift_y(&rest, p.y)?;
                 let _ = writeln!(
                     body,
                     "  for (@range(u16, {}, {}, {sx}{rest}",
@@ -158,16 +163,18 @@ pub fn combine(root: &Path, names: &[String]) -> R<Vec<Placed>> {
                     &format!("memcpy.get_params({}), .RD = {rd}", px + p.x),
                     1,
                 );
-                covered.insert((px + p.x, py));
+                covered.insert((px + p.x, py + p.y));
                 let _ = writeln!(
                     body,
-                    "  @set_tile_code({}, {py}, \"{}/{file}\"{params}",
+                    "  @set_tile_code({}, {}, \"{}/{file}\"{params}",
                     px + p.x,
+                    py + p.y,
                     p.name
                 );
             } else if let Some(rest) = l.strip_prefix("@set_color_config(") {
                 let (px, rest) = num_after(rest, "").ok_or("a route's x")?;
-                let _ = writeln!(body, "  @set_color_config({}{rest}", px + p.x);
+                let (py, rest) = num_after(rest, ", ").ok_or("a route's y")?;
+                let _ = writeln!(body, "  @set_color_config({}, {}{rest}", px + p.x, py + p.y);
             } else if let Some(rest) = l.strip_prefix("@export_name(\"") {
                 let (name, ty) = rest.split_once('"').ok_or("an export")?;
                 if name == "run" {
@@ -188,15 +195,25 @@ pub fn combine(root: &Path, names: &[String]) -> R<Vec<Placed>> {
         let mut host: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&hp).map_err(io(&hp))?)
                 .map_err(|e| format!("{}: {e}", hp.display()))?;
-        for list in ["h2d", "d2h"] {
-            if let Some(items) = host[list].as_array_mut() {
+        for list in ["h2d", "d2h", "argmax"] {
+            if let Some(items) = host.get_mut(list).and_then(serde_json::Value::as_array_mut) {
                 for it in items {
                     let x0 = it["x"].as_u64().unwrap_or(0);
                     it["x"] = serde_json::json!(x0 + u64::from(p.x));
+                    if p.y > 0 {
+                        let y0 = it["y"].as_u64().unwrap_or(0);
+                        it["y"] = serde_json::json!(y0 + u64::from(p.y));
+                    }
                 }
             }
         }
-        host["origin"] = serde_json::json!([p.x, 0]);
+        if p.y > 0 && host.get("state").is_some_and(|s| !s.is_null()) {
+            return Err(format!(
+                "{}: a state root's PEs are not moved off row 0 yet",
+                p.name
+            ));
+        }
+        host["origin"] = serde_json::json!([p.x, p.y]);
         host["rd"] = serde_json::json!(rd);
         std::fs::write(
             &hp,
@@ -239,6 +256,48 @@ pub fn combine(root: &Path, names: &[String]) -> R<Vec<Placed>> {
     )
     .map_err(io(root))?;
     Ok(placed)
+}
+
+/// The readings' places within the system's fabric: as they are (side by side) where they fit,
+/// else packed in 2D. Returns the program's size.
+fn place(placed: &mut [Placed]) -> R<(u32, u32)> {
+    use crate::place::{BlockKind, NetKind, Problem, pack};
+    let b = crate::floorplan::stream::Bounds::system();
+    let rects = placed
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            (
+                BlockKind::Reading(i),
+                crate::floor::Rect::new(p.x, p.y, p.w, p.h),
+            )
+        })
+        .collect();
+    let (w0, h0) = (
+        placed.iter().map(|p| p.x + p.w).max().unwrap_or(0),
+        placed.iter().map(|p| p.y + p.h).max().unwrap_or(1),
+    );
+    let pr = Problem::of(w0, h0, rects, &crate::wiring::Wiring::default(), &|_| {
+        NetKind::Other
+    })?;
+    let s = pack::pack(&pr, b.w, b.h)?;
+    for (p, at) in placed.iter_mut().zip(&s.at) {
+        p.x = at.x;
+        p.y = at.y;
+    }
+    Ok((s.w.max(1), s.h.max(1)))
+}
+
+/// A loop's rest past its x range, its y range (`@range(u16, y0, y1, ..`) moved by `dy`.
+fn shift_y(rest: &str, dy: u32) -> R<String> {
+    if dy == 0 {
+        return Ok(rest.to_string());
+    }
+    let pre = "@range(u16, ";
+    let at = rest.find(pre).ok_or("a loop's y")? + pre.len();
+    let (y0, r) = num_after(&rest[at..], "").ok_or("a loop's y")?;
+    let (y1, r) = num_after(r, ", ").ok_or("a loop's y")?;
+    Ok(format!("{}{}, {}{r}", &rest[..at], y0 + dy, y1 + dy))
 }
 
 /// The op modules (`ops/`) in `root` and in each reading's directory `root/<name>`.

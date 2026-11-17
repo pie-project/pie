@@ -11,6 +11,7 @@
 //! reproduced byte for byte by the placer pinned to it.
 
 pub mod decode;
+pub mod pack;
 pub mod stream;
 
 use serde::Serialize;
@@ -35,6 +36,8 @@ pub enum BlockKind {
     StreamUnit(usize),
     /// A stream's K / V column (its index in the stream).
     KvColumn(usize),
+    /// A co-resident reading (a whole program; its index in the load).
+    Reading(usize),
 }
 
 /// A rigid rectangle of PEs and the links inside it.
