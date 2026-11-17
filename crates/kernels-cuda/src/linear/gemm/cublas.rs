@@ -536,14 +536,18 @@ pub(crate) fn anchored(
 /// An anchored region no table or timing picked for (a capture, a product
 /// the profile's tables lack, a shape past the tuning arena): one pass over
 /// the product where a fused one lands it, the unfused leg's two (`None`)
-/// where none does. One row the gemv skeleton covers runs on it: the gemv
-/// the plain product runs a row on, its epilogue in the hook, so a launch
-/// and the product's round trip through memory fewer than the unfused leg.
-/// Else a region cuBLASLt's epilogue lands (`lt`) runs there, at cuBLASLt's
-/// own first heuristic.
+/// where none does. A few rows a streaming skeleton covers (the gemv one
+/// row, the rows skeleton up to 16 rows of one part) run on it: the kernel
+/// the plain product streams few rows on, its epilogue in the hook, so a
+/// launch and the product's round trip through memory fewer than the
+/// unfused leg. Else a region cuBLASLt's epilogue lands (`lt`) runs there,
+/// at cuBLASLt's own first heuristic.
 fn untimed(skeletons: &[Skeleton], lt: bool) -> Option<Tactic> {
-    if skeletons.contains(&Skeleton::Gemv) {
-        Some(Tactic::Skeleton(Skeleton::Gemv))
+    if let Some(streaming) = [Skeleton::Gemv, Skeleton::Rows]
+        .into_iter()
+        .find(|s| skeletons.contains(s))
+    {
+        Some(Tactic::Skeleton(streaming))
     } else if lt {
         Some(Tactic::LtEpilogue(0))
     } else {
@@ -2796,11 +2800,21 @@ mod untimed_regions {
     }
 
     #[test]
-    fn an_untimed_region_the_gemv_does_not_cover_keeps_lt_or_the_unfused_leg() {
-        // More rows, or a head's span (a q/k norm): no gemv.
-        let rest = [Skeleton::Rows, Skeleton::Skinny];
-        assert_eq!(untimed(&rest, true), Some(Tactic::LtEpilogue(0)));
-        assert_eq!(untimed(&rest, false), None);
+    fn untimed_few_rows_of_one_part_run_fused_on_the_rows_skeleton() {
+        // Eight decode rows' residual epilogue (a down projection).
+        let few = [Skeleton::Rows, Skeleton::Skinny];
+        assert_eq!(untimed(&few, false), Some(Tactic::Skeleton(Skeleton::Rows)));
+        assert_eq!(untimed(&few, true), Some(Tactic::Skeleton(Skeleton::Rows)));
+    }
+
+    #[test]
+    fn an_untimed_region_no_streaming_skeleton_covers_keeps_lt_or_the_unfused_leg() {
+        // Two parts (a packed gate | up), a head's span, or past 16 rows.
+        assert_eq!(
+            untimed(&[Skeleton::Skinny], true),
+            Some(Tactic::LtEpilogue(0))
+        );
+        assert_eq!(untimed(&[Skeleton::Skinny], false), None);
         assert_eq!(untimed(&[], false), None);
     }
 }
