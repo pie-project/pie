@@ -249,6 +249,7 @@ Hardware: steps 1-5 for CUDA and Vulkan/wgpu can be done on the L40S; ROCm, Meta
 3. Settled: no valuation in the engine; PLEX weighs the facts the ledger publishes (2.8).
 4. Settled by the user: `max_patches` / `max_images` / `max_voxels` / `max_clips` go; derived rungs, only abnormal requests refused.
 5. Settled by the user: weight cache rules 1 and 3 now, rule 2 later (2.7a); governor is two keys (section 3).
+6. Open: the runtime's host shadow re-evaluates the guest's prologue / epilogue pure ops (`pareval::fold_stage` via `HostShadow::advance`, and `eval_descriptor_ports`) to decide fire geometry (tokens, indptr, positions, slots, fold, attention mask). A design change is pending: geometry ports come only from the device or from host-written channels, so the host never recomputes guest ops. It needs every engine to carry device geometry first (engine-gpu's after (v)). Measured cost today (Vulkan, RTX PRO 4500, Qwen3-0.6B, scratch instrumentation around both calls, 2026-11-17): beam_search `--beams 4`, 64 steps (with sc/gpu-vk-beam, decode envelope class): host eval 18.9 µs median / 50.9 µs p99 per fire (shadow advance 15.1 / 40.6, port eval 4.2 / 10.4) against a 15.9 ms mean fire, 0.12%; naive-masked `doc-isolation`, 128 tokens: 18.8 / 56.1 µs per fire (shadow 14.5 / 38.4, ports + mask 4.2 / 22.7) against a 5.5 ms mean fire, 0.34%.
 
 ## 6. Decisions during implementation (2026-11-13)
 
