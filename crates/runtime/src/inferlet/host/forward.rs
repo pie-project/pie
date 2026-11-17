@@ -1180,105 +1180,64 @@ impl ProcessCtx {
                 Some(&rep) => super::working_set::kv_of(self, rep)?.engine,
                 None => crate::planner::engine_of(self.id()),
             };
-            let (devgeo, decode_envelope, geometry_class) = if float.is_none() {
-                let device_port_mask = crate::engine::get_spec(engine)?.device_geometry_port_mask;
-                let needs_mask_port = prog.bound.container.ports.iter().any(|binding| {
-                    matches!(binding.port, eta_ir::registry::Port::AttnMask)
-                        && matches!(binding.source, eta_ir::container::PortSource::Channel(_))
-                });
-                let devgeo_capable = device_port_mask.covers(PortMask::DEVICE_GEOMETRY)
-                    && (!needs_mask_port
-                        || device_port_mask.covers(PortMask::of(&[Port::AttnMask])));
+            // The class is chosen once, here; a pass whose geometry the host
+            // resolves while it is not host-derivable says why, by name
+            // (`pipeline::fire::host_geometry`), and its fires are counted.
+            let (devgeo, decode_envelope, geometry_class, host_geometry) = if float.is_none() {
+                use crate::pipeline::fire::{geometry as fire_geometry, host_geometry};
+                let spec = crate::engine::get_spec(engine)?;
                 let taint = prog.geometry_taint();
-                let devgeo = if !taint.host_derivable() {
-                    match crate::pipeline::fire::geometry::detect_pooled_device_geometry(
-                        &prog.bound.container,
-                    ) {
-                        Some(_) if !devgeo_capable => {
-                            tracing::info!(
-                                "device-geometry program on an engine without device geometry \
-                                 ports (mask {device_port_mask:?}): falling back to \
-                                 host-evaluated serialized execution"
-                            );
-                            None
-                        }
-                        // A program the decode envelope covers runs ahead: its
-                        // pages and write slots are the host's, so the next fire
-                        // is staged while this one runs. Device geometry reads
-                        // every descriptor port back from the device before it
-                        // stages, so it is only the pass for programs the
-                        // envelope declines.
-                        Some(_)
-                            if envelope_runs_ahead(
-                                &prog.bound.container,
-                                taint,
-                                device_port_mask,
-                            ) =>
-                        {
-                            None
-                        }
-                        Some(qo_indptr) => {
-                            tracing::info!(
-                                "device-carried decode ({} lane(s), {} row(s)) re-publishes \
-                                 where its rows land: executes as a device-geometry pass",
-                                qo_indptr.len().saturating_sub(1),
-                                qo_indptr.last().copied().unwrap_or(0)
-                            );
-                            Some(qo_indptr)
-                        }
-                        None => None,
-                    }
-                } else {
-                    None
+                let host_derivable = taint.host_derivable();
+                let mut why = String::new();
+                let program = host_geometry::ProgramGeometry {
+                    host_derivable,
+                    pooled: if host_derivable {
+                        None
+                    } else {
+                        fire_geometry::detect_pooled_device_geometry(&prog.bound.container)
+                    },
+                    envelope: if host_derivable {
+                        Ok(None)
+                    } else {
+                        fire_geometry::classify_decode_envelope_why(
+                            &prog.bound.container,
+                            taint,
+                            &mut why,
+                        )
+                    },
+                    why,
+                    needs_mask_port: prog.bound.container.ports.iter().any(|binding| {
+                        matches!(binding.port, eta_ir::registry::Port::AttnMask)
+                            && matches!(
+                                binding.source,
+                                eta_ir::container::PortSource::Channel(_)
+                            )
+                    }),
                 };
-                let decode_envelope = if devgeo.is_some() || taint.host_derivable() {
-                    None
-                } else {
-                    let mut why = String::new();
-                    match crate::pipeline::fire::geometry::classify_decode_envelope_why(
-                        &prog.bound.container,
-                        taint,
-                        &mut why,
-                    ) {
-                        Ok(Some(required)) => {
-                            if device_port_mask.covers(required) {
-                                Some(required)
-                            } else {
-                                tracing::info!(
-                                    "decode envelope on an engine without device geometry ports \
-                                     (mask {device_port_mask:?}, needs {required:?}): falling \
-                                     back to host-evaluated serialized execution"
-                                );
-                                None
-                            }
-                        }
-                        Ok(None) => {
-                            tracing::info!(
-                                "not a decode envelope: {why}; falling back to host-evaluated \
-                                 execution"
-                            );
-                            None
-                        }
-                        Err(reason) => {
-                            tracing::warn!(
-                                "device-dependent geometry is not a decode envelope \
-                                 ({reason}); falling back to host-evaluated execution — fires \
-                                 block loudly on values the host cannot derive"
-                            );
-                            None
-                        }
-                    }
-                };
-                let geometry_class = if devgeo.is_some() {
-                    GeometryClass::DeviceGeometry
-                } else if decode_envelope.is_some() {
-                    GeometryClass::DecodeEnvelope
-                } else {
-                    GeometryClass::Host
-                };
-                (devgeo, decode_envelope, geometry_class)
+                let bound = host_geometry::classify(
+                    program,
+                    spec.device_geometry_port_mask,
+                    spec.kind,
+                );
+                if let Some(qo_indptr) = &bound.devgeo {
+                    tracing::info!(
+                        "device-carried decode ({} lane(s), {} row(s)) re-publishes \
+                         where its rows land: executes as a device-geometry pass",
+                        qo_indptr.len().saturating_sub(1),
+                        qo_indptr.last().copied().unwrap_or(0)
+                    );
+                }
+                if let Some(host) = &bound.host {
+                    tracing::info!("{}", host.bind_message(prog.hash));
+                }
+                (
+                    bound.devgeo,
+                    bound.decode_envelope,
+                    bound.class,
+                    bound.host.is_some(),
+                )
             } else {
-                (None, None, GeometryClass::Host)
+                (None, None, GeometryClass::Host, false)
             };
 
             let instance_id = crate::pipeline::instance::next_instance_id();
@@ -1451,6 +1410,7 @@ impl ProcessCtx {
                 failed: None,
                 devgeo,
                 decode_envelope,
+                host_geometry,
                 host_shadow,
                 facts,
                 float,
@@ -1618,21 +1578,6 @@ pub(crate) fn eta_output(output: &poem_ir::OutputDecl) -> eta_ir::registry::Outp
         },
         layers: output.layers,
         readout: output.readout,
-    }
-}
-
-/// Whether the decode envelope classifies `container` and the engine reads
-/// every port that envelope requires from the device.
-fn envelope_runs_ahead(
-    container: &eta_ir::container::TraceContainer,
-    taint: &eta_compiler::eval::pareval::GeometryTaint,
-    device_port_mask: PortMask,
-) -> bool {
-    let mut why = String::new();
-    match crate::pipeline::fire::geometry::classify_decode_envelope_why(container, taint, &mut why)
-    {
-        Ok(Some(required)) => device_port_mask.covers(required),
-        Ok(None) | Err(_) => false,
     }
 }
 

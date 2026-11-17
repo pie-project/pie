@@ -1,5 +1,9 @@
 //! The eta program plane: guest programs run in the host interpreter over the
 //! rows a fire read out.
+//!
+//! The interpreter ([`eta_exec::Interpreted`]) is this engine's one
+//! execution path for a guest stage: it lowers no stage to a device form, so
+//! an interpreted pass is how every guest pass runs here, not a fallback.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -96,7 +100,7 @@ impl Plane {
             .map_err(|error| Refusal::Program(error.to_string()))?;
         if !plan.executable {
             return Err(Refusal::Program(format!(
-                "program 0x{:016x} does not interpret: {}",
+                "program 0x{:016x} calls a semantic boundary this backend does not implement: {}",
                 registration.program_hash,
                 plan.reject_reason.as_deref().unwrap_or("no reason given")
             )));

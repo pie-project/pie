@@ -546,6 +546,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     device_domain: ::engine::MemoryDomain::HostPinned,
                     limits: d.limits,
                     device_geometry_port_mask: d.device_geometry_port_mask,
+                    kind: "",
                 },
                 d.engine_backend,
                 d.chunks.eager_rungs,

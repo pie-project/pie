@@ -161,7 +161,7 @@ impl Plane {
             .map_err(|error| Refusal::Program(error.to_string()))?;
         if !plan.executable {
             return Err(Refusal::Program(format!(
-                "program 0x{:016x} does not interpret: {}",
+                "program 0x{:016x} calls a semantic boundary this backend does not implement: {}",
                 registration.program_hash,
                 plan.reject_reason.as_deref().unwrap_or("no reason given")
             )));
@@ -169,13 +169,21 @@ impl Plane {
         self.next_program += 1;
         let id = ProgramId(self.next_program);
 
-        let admitted = self.forms.admit(id, &plan.package);
-        tracing::debug!(
-            program = id.0,
-            device_form = admitted,
-            why = self.forms.refusal(id).map(ToString::to_string),
-            "guest program registered"
-        );
+        // A guest pass runs on the device whole or not at all, and this
+        // engine runs no other: a program whose stages do not lower has no
+        // form here, refused at registration by name.
+        if !self.forms.admit(id, &plan.package) {
+            let why = self
+                .forms
+                .refusal(id)
+                .map_or_else(|| "no reason given".to_owned(), ToString::to_string);
+            self.forms.forget(id);
+            return Err(Refusal::Program(format!(
+                "program 0x{:016x} has no device form: {why}",
+                registration.program_hash
+            )));
+        }
+        tracing::debug!(program = id.0, "guest program registered");
         self.programs.insert(id, Arc::new(plan));
         Ok(id)
     }
@@ -407,7 +415,7 @@ impl Plane {
             id: program.0,
         })?;
         if self.forms.get(program).is_none() {
-            // No device half: the bind refuses it.
+            // Registration refuses a program with no device form.
             return Ok(ProgramFacts::default());
         }
         let sizes = engine_gpu::guest::session::program_table_sizes(&plan.package.plans);
@@ -1511,5 +1519,48 @@ mod tests {
             "{refused:?}"
         );
         faults.join().unwrap();
+    }
+}
+
+/// A program whose stages do not lower is refused at registration, by
+/// name: this engine runs no guest pass but on the device.
+#[cfg(test)]
+mod registration_tests {
+    use super::{Plane, Refusal};
+    use eta_compiler::codegen::launch::{LaunchOp, LaunchPackage, LaunchStage, LaunchStagePlan};
+
+    #[test]
+    fn a_program_whose_stages_do_not_lower_is_refused_at_register() {
+        // An op no backend emits WGSL for, and no boundary.
+        const UNEMITTED: u8 = 0xFE;
+        assert!(!eta_compiler::codegen::wgsl::emits(UNEMITTED));
+        assert!(!eta_compiler::codegen::wgsl::is_boundary(UNEMITTED));
+        let registration = engine::program::ProgramRegistration {
+            program_hash: 0xabc,
+            launch: LaunchPackage {
+                stages: vec![LaunchStage::default()],
+                plans: vec![LaunchStagePlan {
+                    ops: vec![LaunchOp {
+                        tag: UNEMITTED,
+                        ..LaunchOp::default()
+                    }],
+                    ..LaunchStagePlan::default()
+                }],
+                ..LaunchPackage::default()
+            },
+            ..engine::program::ProgramRegistration::default()
+        };
+        let mut plane = Plane::default();
+        let refused = plane.register(&registration);
+        let Err(Refusal::Program(why)) = &refused else {
+            panic!("registered with no device form: {refused:?}");
+        };
+        assert!(
+            why.starts_with("program 0x0000000000000abc has no device form: stage 0 runs"),
+            "{why}"
+        );
+        assert!(why.contains("emits no WGSL for"), "{why}");
+        assert_eq!(plane.forms.tally(), (0, 0), "the refusal is not kept");
+        assert!(plane.programs.is_empty());
     }
 }

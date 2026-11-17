@@ -191,6 +191,9 @@ pub struct BoundForwardPass {
     pub failed: Option<String>,
     pub devgeo: Option<Vec<u32>>,
     pub decode_envelope: Option<eta_ir::registry::PortMask>,
+    /// Bound with a [`crate::pipeline::fire::host_geometry::HostGeometry`]:
+    /// each fire resolves its geometry on the host, and is counted.
+    pub host_geometry: bool,
     pub host_shadow: crate::pipeline::fire::shadow::HostShadow,
     pub facts: Vec<LaneFacts>,
     pub float: Option<FloatPass>,
