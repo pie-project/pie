@@ -246,6 +246,54 @@ fn median(mut v: Vec<u64>) -> u64 {
     v[v.len() / 2].max(1)
 }
 
+/// What `pie tune <backend> --rates` writes for `device`
+/// (`engine::rates::Rated`): its user file `existing` (none where there is
+/// none yet) with its `[rates]` replaced by `measured` and `provenance` set,
+/// as a load saves what it measured (`engine::rates::saved_text`), and the
+/// block alone.
+#[must_use]
+pub fn rated(
+    device: &str,
+    existing: Option<&str>,
+    measured: &Rates,
+    provenance: &(&'static str, String),
+    seconds: f64,
+) -> engine::rates::Rated {
+    let file =
+        engine::rates::saved_text(existing.map(without_rates).as_deref(), measured, provenance);
+    let block = format!(
+        "{}\n[provenance]\n{} = {}\n",
+        engine::rates::tuned(measured).trim_end(),
+        provenance.0,
+        provenance.1
+    );
+    engine::rates::Rated {
+        device: device.to_owned(),
+        file,
+        block,
+        seconds,
+    }
+}
+
+/// `text` with its `[rates]` table taken out: the header and every line to
+/// the next table's header (one at the line's start; a rate's array rows
+/// are indented).
+fn without_rates(text: &str) -> String {
+    let header = |line: &str| line.starts_with('[') && line.trim_end().ends_with(']');
+    let mut out = String::new();
+    let mut in_rates = false;
+    for line in text.lines() {
+        if header(line) {
+            in_rates = line.trim_end() == "[rates]";
+        }
+        if !in_rates {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// The rates of `device`, its kernels under the tactics `tactics` picks at
 /// `tier`, no timed frame past `max_submit` where the device states one
 /// (`engine::rates::timed_frames`).

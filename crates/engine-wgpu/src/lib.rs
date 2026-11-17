@@ -1,5 +1,6 @@
 pub mod api;
 pub mod boot;
+pub mod check;
 pub mod chip;
 pub mod device;
 pub mod encode;

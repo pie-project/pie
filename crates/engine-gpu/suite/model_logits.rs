@@ -361,6 +361,7 @@ fn boot<'a>(
         device,
         residency,
         handed: None,
+        check: false,
     }
 }
 
