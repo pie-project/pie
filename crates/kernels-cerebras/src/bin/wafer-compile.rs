@@ -243,7 +243,7 @@ fn cost(args: &[String]) -> Result<(), String> {
 fn search(args: &[String]) -> Result<(), String> {
     let f = flags(
         args,
-        &["--model", "--positions", "--set", "--keep", "--unpinned"],
+        &["--model", "--positions", "--set", "--keep", "--cold"],
     )?;
     let name = get(&f, "--model").ok_or(USAGE)?;
     let catalog = poem_compiler::catalog::repository();
@@ -259,7 +259,7 @@ fn search(args: &[String]) -> Result<(), String> {
             .map(|n| n.parse().map_err(|e| format!("--positions {n}: {e}")))
             .transpose()?,
         set: get(&f, "--set").unwrap_or("").to_string(),
-        unpinned: get(&f, "--unpinned").is_some_and(|v| v == "1"),
+        cold: get(&f, "--cold").is_some_and(|v| v == "1"),
     };
     let keep = get(&f, "--keep")
         .map_or(Ok(5), str::parse)
@@ -267,6 +267,24 @@ fn search(args: &[String]) -> Result<(), String> {
     let made = kernels_cerebras::pins::of(kernels_cerebras::kernels::KernelSet::of_shape(&shape))
         .into_iter()
         .find(|p| p.measured_on == Some(shape.signature()));
+    // cold: the measured program priced as the cold search prices (the median layer), its gap
+    if ask.cold
+        && let Some(m) = kernels_cerebras::cost::measured::on(shape.signature())
+        && let Ok(mut plan) = kernels_cerebras::floorplan::plan(&shape, &m.preset)
+    {
+        if let Some(n) = ask.positions {
+            plan.contract.positions = n;
+        }
+        let ms = kernels_cerebras::cost::time::step(
+            &plan,
+            kernels_cerebras::cost::time::kinds_layer(&shape),
+        );
+        println!(
+            "measured {} {ms:.4} ms priced cold (the chip's {:.4})",
+            m.preset.name, m.ms
+        );
+    }
+    let t0 = std::time::Instant::now();
     for (i, c) in kernels_cerebras::search::search(&shape, &ask, keep)?
         .iter()
         .enumerate()
@@ -280,6 +298,7 @@ fn search(args: &[String]) -> Result<(), String> {
             c.planned.preset.name, c.ms, c.room, moved
         );
     }
+    println!("search {:.1} s", t0.elapsed().as_secs_f64());
     Ok(())
 }
 

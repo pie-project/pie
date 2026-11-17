@@ -1,7 +1,7 @@
 //! The named partitions a build may ask for by name (`wafer-compile plan --preset`, a debug
 //! override of the search): the chip's measured programs ([`crate::cost::measured`]) and the
 //! simulator's tiny ones and a variant (`plans/*.json`). None is picked for a model by itself: a
-//! plan with no preset named is the search's ([`crate::search`]), which starts from these.
+//! plan with no preset named is the search's ([`crate::search`]), from the layer graph alone.
 
 use serde::Deserialize;
 

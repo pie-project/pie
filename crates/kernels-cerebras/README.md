@@ -162,7 +162,7 @@ cut, one tiler makes it); `[engine.debug] weights` serves tiles staged elsewhere
    partition. A named plan (`--preset`, a debug override): the chip's measured programs (`cost/measured/`: `9b`,
    `4b`, `0.8b`, `q3-8b`, `l3-8b`; `e2b`, `e4b`; `g12`; `full`, gpt-oss), `e4b-meta`, and `tiny*` for the
    simulator. A measured program carries the keys, kernel levers and arrangement its program shipped with and
-   the step the chip measured: the search prices it at that and starts from it. A checkpoint with no catalog deployment takes
+   the step the chip measured: the search prices it at that (a candidate beside its own). A checkpoint with no catalog deployment takes
    `--shape <shape.json>`.
 2. **Sources**: `wafer-compile build --plan <plan.json> --out <build dir> [--levers K:V,..]` writes `layout/`
    (`layout.csl`, every PE's kernel and params resolved, and one source a PE kind, from the embedded kernels or

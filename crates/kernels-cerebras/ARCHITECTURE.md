@@ -275,8 +275,9 @@ comes from poem's spatial pass (`poem_compiler::spatial::plan` over `target::Waf
 gives the `Shape` (layer kinds, attention / MLP / MoE / GDN / PLE specs, head, RoPE, norms), the
 shape picks the kernel set, and the search (`search`, below) picks the partition: nothing is pinned.
 The chip's measured programs (`cost/measured/*.json`: each shipping model's keys, levers and
-arrangement as the chip ran them, and its measured step) are the cost model's data and the
-search's starting points, not choices. A named plan (`--preset <name>`: a measured one, or
+arrangement as the chip ran them, and its measured step) are the cost model's data: a measured
+partition is a candidate priced at its measurement, the layer terms are fitted to them; none is a
+starting point. A named plan (`--preset <name>`: a measured one, or
 `plans/*.json`'s `tiny*` and `e4b-meta`) is a debug override and tries only itself; `--set`
 overrides its keys. A checkpoint with no catalog deployment states its shape in a file
 (`target::plan_shape`; the tiny test checkpoints' are `tools/wafer/baseline/shapes/`).
@@ -331,8 +332,9 @@ gpt-oss's layer less than nothing: only the 4B's PY / NE move moves both, so the
 the chains' rate from the KV's. The columns cost nothing the chip resolves (`SPAN_COL` 0): halving
 the 0.8B's cost what its doubled matvec and KV elements do. Each layer's own cost is read off the
 measured step of the model's measured program (`cost::measured`: the bare step where the chip ran it,
-else Pie decode; a model the chip has not run takes the median). Llama's G2=11 (request 1456: 0.470
-ms from 0.485, not in the fit) is its pin since; the model gives it 5 µs of the 15.
+else Pie decode; a model the chip has not run takes its layers' kinds' costs, `time::KIND_LAYER`,
+least squares over the nine: 11.8% RMS on a step held out). Llama's G2=11 (request 1456: 0.470
+ms from 0.485, not in the fit) is its measured program; the model gives it 5 µs of the 15.
 
 `cost::memory` is the PE image model. The bytes a partition moves are the weight PE's (its K
 layers' tiles, its KV cache, its scores' buffers) and the head PE's (its vocabulary rows' tiles and
@@ -343,18 +345,20 @@ model is within 380 B (Qwen3.5 4B from 0.8B); across kernel flags it is off by u
 is why a model anchors on its own link. `anchors.rs` is regenerated from links when the kernels
 change.
 
-`search::search` walks from each of the kernel set's measured programs and named plans (the model's
-own measured one first), moving one key
-or two (a move another must follow: the positions, the units' grid) over a ladder of values; a
-seed that does not plan is repaired a key at a time, following each move that gets it past the
-check it failed. A candidate plans, serves the positions asked for (the measured program's,
-else 4096), keeps its head over the vocabulary, leaves every image `STACK_ROOM` plus a 512 B
-margin and builds (`Program::build`). On a model the chip measured, its measured partition is
-priced at its measurement and every other at the model's prediction plus its held-out error
-(`search::UNMEASURED`, 6.6 µs): a partition the chip has not run must beat the measured one by
-more than the model can tell. `wafer-compile search --model <m>` prints the ranking with the
-keys each candidate moved from the measured program; `--unpinned 1` leaves the model's own
-measured program out of the starting points (what the search reaches from the others').
+`search::search` starts from the layer graph alone (`cold`: each kernel set's structural keys
+over what the shape divides and the fabric holds, every combination its constructor plans and
+serving the positions asked for, the fastest few that build, at most two of a unit count), and
+walks from each, moving one key or two (a move another must follow: the positions, the units'
+grid) over a ladder of values; a seed that does not plan is repaired a key at a time, following
+each move that gets it past the check it failed. A candidate plans, serves the positions asked for
+(the measured program's, else 4096), keeps its head over the vocabulary, leaves every image
+`STACK_ROOM` plus a 512 B margin and builds (`Program::build`). On a model the chip measured, its
+measured partition is a candidate priced at its measurement and every other at the model's
+prediction plus its largest held-out error (`search::UNMEASURED`, 21 µs): a partition the chip has
+not run replaces a measured one only where it predicts more than the model has been off by.
+`wafer-compile search --model <m>` prints the ranking with the keys each candidate moved from
+the measured program and the search's time; `--cold 1` prices nothing by a measurement (what a
+model the chip has not run gets) and prints the measured partition priced alike.
 
 ## Weights
 

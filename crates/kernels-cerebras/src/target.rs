@@ -525,7 +525,7 @@ impl Wafer {
             let ask = crate::search::Asked {
                 positions: self.positions,
                 set: self.set.clone(),
-                unpinned: false,
+                cold: false,
             };
             match crate::search::search(&self.shape, &ask, 1) {
                 Ok(mut found) => return Ok(found.remove(0).planned),
@@ -597,7 +597,7 @@ pub fn plans(trace: &Trace, ask: &Ask) -> R<Vec<Planned>> {
         let asked = crate::search::Asked {
             positions: ask.positions,
             set: ask.set.clone(),
-            unpinned: false,
+            cold: false,
         };
         return crate::search::search(&wafer.shape, &asked, FALLBACKS)
             .map(|v| v.into_iter().map(|s| s.planned).collect())
@@ -742,15 +742,18 @@ mod tests {
                 (KernelSet::Own, 8, 4, 256, 256, 16, 112),
             ),
         ] {
-            // with no preset named, the search gives each its measured program
-            let chosen = plan(&trace(name), &Ask::default()).unwrap();
-            assert_eq!(chosen.preset.name, format!("search({preset})"), "{name}");
+            // with no preset named, the search gives each its measured program (the 12B a
+            // partition it predicts faster by more than the model's largest error: GENERIC.md,
+            // consolidation part B)
             let p = plan(&trace(name), &Ask::preset(preset)).unwrap().plan;
-            assert_eq!(
-                serde_json::to_value(&chosen.plan).unwrap(),
-                serde_json::to_value(&p).unwrap(),
-                "{name}"
-            );
+            if preset != "g12" {
+                let chosen = plan(&trace(name), &Ask::default()).unwrap();
+                assert_eq!(
+                    serde_json::to_value(&chosen.plan).unwrap(),
+                    serde_json::to_value(&p).unwrap(),
+                    "{name}"
+                );
+            }
             let q = &p.partition;
             let got = (
                 KernelSet::of_shape(&p.shape),
@@ -853,7 +856,7 @@ mod tests {
     fn the_fallback_plans_start_with_the_choice() {
         let t = trace("llama31-8b-bf16-kv-bf16");
         let all = plans(&t, &Ask::default()).unwrap();
-        assert_eq!(all[0].preset.name, "search(l3-8b)");
+        assert_eq!(all[0].plan, plan(&t, &Ask::preset("l3-8b")).unwrap().plan);
         assert_eq!(all[0].plan, plan(&t, &Ask::default()).unwrap().plan);
     }
 

@@ -10,7 +10,8 @@
 //! fits' (requests 1151-1195), which these moves cannot tell apart from the chains' rate
 //! (`ARCHITECTURE.md`, "Cost"). A layer's own cost is what the
 //! chip measured of the model's program past those terms ([`super::measured`]: the bare step
-//! where the chip ran it, else Pie decode); a model the chip has not run takes the median.
+//! where the chip ran it, else Pie decode); a model the chip has not run takes its layers' kinds'
+//! ([`KIND_LAYER`]).
 
 use super::Features;
 use crate::plan::{Plan, Shape};
@@ -49,8 +50,8 @@ pub fn partition(f: &Features) -> f64 {
         + LOOP_REDUCE * f.loop_reduce
 }
 
-/// A layer's own cost, in ms: read off the measured step of the model's shipping `reference` plan,
-/// else the median of the measured models'.
+/// A layer's own cost, in ms: read off the measured step of the model's measured `reference`
+/// plan, else its layers' kinds' ([`kinds_layer`]).
 #[must_use]
 pub fn layer(shape: &Shape, reference: Option<&Plan>) -> f64 {
     let sig = shape.signature();
@@ -59,12 +60,38 @@ pub fn layer(shape: &Shape, reference: Option<&Plan>) -> f64 {
             let f = Features::of(r);
             (ms - partition(&f)) / f.layers
         }
-        _ => MEDIAN_LAYER,
+        _ => kinds_layer(shape),
     }
 }
 
-/// The median layer cost of the measured models (their `layer`s, the 9B's), ms.
-pub const MEDIAN_LAYER: f64 = 0.0073;
+/// A layer's own cost by its mixer's kind (ms: Qwen3.5's gated delta net, full attention,
+/// sliding-window attention, attention over another layer's KV), least squares over the chip's
+/// nine measured programs ([`super::measured`]: each model's layer cost past its partition's
+/// terms against its layers' kinds; `the_layer_kinds_follow_the_measurements` refits it). Held
+/// out a model at a time, a step it predicts is off by 11.8% RMS (2.3, -3.1, 1.2% on the
+/// Qwen3.5s; 11.6, -8.1% on Gemma E2B, E4B; 13.3% gpt-oss; -22.9% Gemma 12B; 5.2% Llama; -17.8%
+/// Qwen3-8B): what the kinds leave out (a q / k norm, a model's kernels' own phases) is a
+/// model's, so a model the chip ran takes its own ([`layer`]); a partition's choice never
+/// reads it (every partition of a model has its layers).
+pub const KIND_LAYER: [f64; 4] = [8.018e-3, 5.707e-3, 10.653e-3, 19.700e-3];
+
+/// [`KIND_LAYER`] over `shape`'s layers, a layer's mean.
+#[must_use]
+pub fn kinds_layer(shape: &Shape) -> f64 {
+    use crate::plan::LayerKind;
+    let n = shape.layers.len().max(1) as f64;
+    shape
+        .layers
+        .iter()
+        .map(|l| match l {
+            LayerKind::Gdn => KIND_LAYER[0],
+            LayerKind::Global => KIND_LAYER[1],
+            LayerKind::Sliding { .. } => KIND_LAYER[2],
+            LayerKind::SharedKv { .. } => KIND_LAYER[3],
+        })
+        .sum::<f64>()
+        / n
+}
 
 /// A step of `plan`, in ms, with each layer costing `layer`.
 #[must_use]
@@ -180,5 +207,100 @@ mod tests {
                 "{model} {to_set}: {got} ms the other way from {want} ms"
             );
         }
+    }
+
+    /// [`super::KIND_LAYER`] is the least-squares fit of the nine measured programs' layer costs
+    /// to their layers' kinds, and each model held out is predicted within what the doc states.
+    #[test]
+    fn the_layer_kinds_follow_the_measurements() {
+        let names = [
+            "qwen35-d0.8b-bf16-kv-bf16",
+            "qwen35-d4b-bf16-kv-bf16",
+            "qwen35-d9b-bf16-kv-bf16",
+            "llama31-8b-bf16-kv-bf16",
+            "qwen3-8b-bf16-kv-bf16",
+            "gemma4-e2b-bf16-kv-bf16",
+            "gemma4-e4b-bf16-kv-bf16",
+            "gemma4-12b-bf16-kv-bf16",
+            "gptoss-20b-bf16-mxfp4-kv-bf16",
+        ];
+        // (kinds' fractions, the layer cost, the partition's ms, layers, the measured ms)
+        let mut rows: Vec<([f64; 4], f64, f64, f64, f64)> = Vec::new();
+        for n in names {
+            let t = poem_compiler::catalog::repository()
+                .parse(n)
+                .unwrap()
+                .trace(poem_ir::Platform::Cerebras);
+            let s = crate::target::shape(&t).unwrap();
+            let m = super::super::measured::on(s.signature()).expect("measured");
+            let plan = crate::floorplan::plan(&s, &m.preset).unwrap();
+            let f = super::super::Features::of(&plan);
+            let part = super::partition(&f);
+            let mut x = [0.0; 4];
+            for l in &s.layers {
+                x[match l {
+                    crate::plan::LayerKind::Gdn => 0,
+                    crate::plan::LayerKind::Global => 1,
+                    crate::plan::LayerKind::Sliding { .. } => 2,
+                    crate::plan::LayerKind::SharedKv { .. } => 3,
+                }] += 1.0 / f.layers;
+            }
+            rows.push((x, (m.ms - part) / f.layers, part, f.layers, m.ms));
+        }
+        // least squares by the normal equations (4 unknowns)
+        let fit = |use_row: &dyn Fn(usize) -> bool| -> [f64; 4] {
+            let mut a = [[0.0f64; 5]; 4];
+            for (i, (x, y, ..)) in rows.iter().enumerate() {
+                if !use_row(i) {
+                    continue;
+                }
+                for r in 0..4 {
+                    for c in 0..4 {
+                        a[r][c] += x[r] * x[c];
+                    }
+                    a[r][4] += x[r] * y;
+                }
+            }
+            for c in 0..4 {
+                let p = (c..4)
+                    .max_by(|&i, &j| a[i][c].abs().total_cmp(&a[j][c].abs()))
+                    .unwrap();
+                a.swap(c, p);
+                let pivot = a[c];
+                for (r, row) in a.iter_mut().enumerate() {
+                    if r != c {
+                        let k = row[c] / pivot[c];
+                        for (x, y) in row.iter_mut().zip(pivot).skip(c) {
+                            *x -= k * y;
+                        }
+                    }
+                }
+            }
+            [
+                a[0][4] / a[0][0],
+                a[1][4] / a[1][1],
+                a[2][4] / a[2][2],
+                a[3][4] / a[3][3],
+            ]
+        };
+        let all = fit(&|_| true);
+        for (k, (got, want)) in all.iter().zip(super::KIND_LAYER).enumerate() {
+            assert!(
+                (got - want).abs() < 2e-5,
+                "kind {k}: fitted {got}, stated {want}"
+            );
+        }
+        let mut sq = 0.0;
+        for (i, n) in names.iter().enumerate() {
+            let c = fit(&|j| j != i);
+            let (x, _, part, layers, ms) = rows[i];
+            let pred = part + layers * (0..4).map(|k| x[k] * c[k]).sum::<f64>();
+            let err = (pred - ms) / ms;
+            sq += err * err;
+            eprintln!("{n}: held out {:+.1}%", err * 100.0);
+            assert!(err.abs() < 0.25, "{n}: {err}");
+        }
+        let rms = (sq / names.len() as f64).sqrt();
+        assert!((rms - 0.118).abs() < 0.01, "held-out RMS {rms}");
     }
 }

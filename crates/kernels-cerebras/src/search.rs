@@ -1,10 +1,11 @@
-//! The search: a model's partitions ranked by what they cost ([`crate::cost`]). From each of its
-//! kernel set's named partitions ([`crate::pins`]: the chip's measured programs, the model's own
-//! first), it moves the keys one or two at a time over a ladder of values, keeps the moves that
+//! The search: a model's partitions ranked by what they cost ([`crate::cost`]). From the layer
+//! graph's fastest candidates ([`crate::cold`]: no named plan or measured program a starting
+//! point), it moves the keys one or two at a time over a ladder of values, keeps the moves that
 //! plan, serve the positions asked for and leave every image its stack room, and walks to the
-//! fastest predicted step. On a model the chip measured, its measured partition is priced at
-//! its measurement and every other one past the time model's error ([`UNMEASURED`]). The best
-//! few are built ([`Program::build`]: the fabric and its colours) before one is returned.
+//! fastest predicted step. On a model the chip measured, its measured partition is a candidate
+//! priced at its measurement and every other one past the time model's error ([`UNMEASURED`]).
+//! The best few are built ([`Program::build`]: the fabric and its colours) before one is
+//! returned.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -25,11 +26,14 @@ pub const MARGIN: f64 = 512.0;
 const BEAM: usize = 96;
 
 /// What an unmeasured partition's predicted step is held to past the model's on a model the chip
-/// measured (ms): the time model's error held out on the chip's moves (6.6 µs RMS, 21 µs at
-/// most: `ARCHITECTURE.md`, "Cost"). A measured partition's price is its measurement; one the
-/// chip has not run must beat it by more than the model can tell (gpt-oss's G2=8, a 0.4% gain on
-/// the chip the model prices a loss, is inside it).
-pub const UNMEASURED: f64 = 0.0066;
+/// measured (ms): the time model's largest error held out on the chip's moves (21 µs; 6.6 µs
+/// RMS: `ARCHITECTURE.md`, "Cost"). A measured partition's price is its measurement; one the
+/// chip has not run replaces it only where it predicts more than the model has been off by.
+pub const UNMEASURED: f64 = 0.021;
+
+/// A cold search's starting points, and at most this many of one unit count.
+const COLD_SEEDS: usize = 8;
+const COLD_EACH: usize = 2;
 
 /// Keys that are not the partition's (the contract's levels and loop, the head's scale).
 const FIXED: &[&str] = &["CTX", "LOOP", "NLV", "HSCALE", "RLV", "RBITS", "CAP", "WL"];
@@ -48,30 +52,22 @@ pub struct Scored {
 pub struct Asked {
     pub positions: Option<u32>,
     pub set: String,
-    /// The model's own measured partition not a starting point (its measurement still the cost
-    /// model's): what the search reaches from the other models' partitions alone.
-    pub unpinned: bool,
+    /// No measurement a price or a candidate: the layer graph and the model's terms alone (what a
+    /// model the chip has not run gets).
+    pub cold: bool,
 }
 
 /// The candidates `shape` searched to, fastest first (at most `keep`), each built.
 pub fn search(shape: &Shape, ask: &Asked, keep: usize) -> R<Vec<Scored>> {
-    let set = crate::kernels::KernelSet::of_shape(shape);
     crate::compose::refuse(shape)?;
     let sig = shape.signature();
-    // the starting points: the kernel set's named partitions (the measured programs first, the
-    // model's own first of them); `unpinned`: the model's own left out
-    let mut seeds = crate::pins::of(set);
-    if ask.unpinned {
-        seeds.retain(|p| p.measured_on != Some(sig));
-    }
-    seeds.sort_by_key(|p| p.measured_on != Some(sig));
-    let seeds: Vec<Preset> = seeds
-        .into_iter()
-        .filter_map(|p| p.set(&ask.set).ok())
-        .collect();
-    // the model's measured program (its partition priced at its measurement): the positions it
-    // serves and the measured layer cost
-    let measured = crate::cost::measured::on(sig).and_then(|m| m.preset.set(&ask.set).ok());
+    // the model's measured program, if the chip ran one (not with `cold`): the cost model's
+    // data, its partition priced at its measurement, the positions it serves and the layer
+    // cost read off it; no starting point
+    let measured = (!ask.cold)
+        .then(|| crate::cost::measured::on(sig))
+        .flatten()
+        .and_then(|m| m.preset.set(&ask.set).ok());
     let reference = measured
         .as_ref()
         .and_then(|p| floorplan::plan(shape, p).ok());
@@ -91,20 +87,54 @@ pub fn search(shape: &Shape, ask: &Asked, keep: usize) -> R<Vec<Scored>> {
         positions,
         layer,
         anchor: memory::anchor(shape),
-        measured,
+        measured: measured.clone(),
     };
+    // the starting points: the layer graph's candidates that plan and fit ([`crate::cold`]),
+    // the fastest few (at most [`COLD_EACH`] of a unit count)
+    let mut c: Vec<Scored> = crate::cold::candidates(shape, positions)
+        .into_iter()
+        .filter_map(|p| p.set(&ask.set).ok())
+        .filter_map(|p| s.score(&p))
+        .collect();
+    c.sort_by(|a, b| a.ms.total_cmp(&b.ms));
+    let mut seeds: Vec<Preset> = Vec::new();
+    let mut units: BTreeMap<u32, usize> = BTreeMap::new();
+    for x in c {
+        let n = units.entry(x.planned.plan.partition.units).or_default();
+        if *n < COLD_EACH && builds(&x.planned.plan) {
+            *n += 1;
+            seeds.push(x.planned.preset);
+        }
+        if seeds.len() >= COLD_SEEDS {
+            break;
+        }
+    }
     let mut found: BTreeMap<String, Scored> = BTreeMap::new();
+    let mut keep_best = |best: Scored| {
+        found
+            .entry(format!(
+                "{}|{}",
+                key(&best.planned.preset),
+                best.planned.preset.levers
+            ))
+            .and_modify(|c| {
+                if best.ms < c.ms {
+                    *c = best.clone();
+                }
+            })
+            .or_insert(best);
+    };
     for seed in seeds {
         if let Some(best) = s.walk(seed) {
-            found
-                .entry(key(&best.planned.preset))
-                .and_modify(|c| {
-                    if best.ms < c.ms {
-                        *c = best.clone();
-                    }
-                })
-                .or_insert(best);
+            keep_best(best);
         }
+    }
+    // the measured partition, a candidate as priced (the walks may not reach it)
+    if let Some(m) = &measured
+        && let Some(mut sc) = s.score(m).filter(|c| builds(&c.planned.plan))
+    {
+        sc.planned.preset.name = format!("measured({})", m.name);
+        keep_best(sc);
     }
     let mut all: Vec<Scored> = found.into_values().collect();
     all.sort_by(|a, b| a.ms.total_cmp(&b.ms));

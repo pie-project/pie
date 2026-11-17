@@ -862,7 +862,9 @@ pub fn program(files: &BTreeMap<String, String>, routes: Option<Routes>) -> Repo
     rep.codes.dedup();
     rep.unknown.sort();
     rep.unknown.dedup();
-    if rep.margin() < 0 {
+    // (a decode program's memory is its plan's memory model's, fitted to its links: the
+    // estimate here misses its comptime-sized arrays and its code's measure; reported only)
+    if rep.margin() < 0 && !runtime_queues {
         let (f, d, c) = rep.fullest.clone().unwrap_or_default();
         rep.errors.push(format!(
             "`{f}`: {d} B data + ~{c} B code past a PE's {PE_BYTES} B"

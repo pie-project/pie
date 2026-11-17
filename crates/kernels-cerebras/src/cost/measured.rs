@@ -1,9 +1,10 @@
 //! The chip's measured decode programs: each shipping model's partition and kernel levers as the
-//! chip ran them, and the bare step it measured (`measured/*.json`). They are data of the cost
-//! model, not choices: a plan whose partition and levers are one of these, on the model it was
-//! measured on, is priced at its measurement; a layer's own cost is read off them
-//! ([`super::time::layer`]); and the search starts from them ([`crate::search`]), any model's
-//! from its kernel set's. Which plan a model gets is the search's.
+//! chip ran them, and the bare step it measured (`measured/*.json`). They are the cost model's
+//! data, not choices or starting points: a plan whose partition and levers are one of these, on
+//! the model it was measured on, is priced at its measurement (a candidate the search weighs
+//! against its own); a layer's own cost is read off them ([`super::time::layer`]) and its kinds'
+//! fitted to them all ([`super::time::KIND_LAYER`]). Which plan a model gets is the search's,
+//! from its layer graph ([`crate::cold`]).
 
 use serde::Deserialize;
 
