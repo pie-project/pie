@@ -44,6 +44,10 @@ pub mod tune;
 pub mod weights;
 pub mod window;
 
+/// The fire a served Metal load is asked, `(lanes, tokens)`: the top of its
+/// rung lattice ([`rates::lattice_rows`]), the rows its load fires up to.
+pub const FIRE: (u32, u32) = (512, 10240);
+
 pub use adapter::{Role as AdapterRole, Site};
 pub use api::{ContractFor, DeviceBoot, Metal};
 pub use arena::Arena;

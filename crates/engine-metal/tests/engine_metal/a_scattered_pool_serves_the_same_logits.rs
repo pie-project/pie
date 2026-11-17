@@ -65,7 +65,7 @@ pub(super) fn write_serving(path: &Path, trace: &Trace) {
 }
 
 /// `trace`'s checkpoint planes seeded by name, by name.
-fn seeded(trace: &Trace) -> Vec<(String, Vec<u64>, ztensor::Leaf, Vec<u8>)> {
+pub(super) fn seeded(trace: &Trace) -> Vec<(String, Vec<u64>, ztensor::Leaf, Vec<u8>)> {
     let mut out = Vec::new();
     let mut planes: Vec<_> = trace
         .params

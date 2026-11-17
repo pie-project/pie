@@ -78,8 +78,8 @@ impl Fire {
 
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 const METAL_FIRE: Fire = Fire {
-    lanes: 512,
-    tokens: 10240,
+    lanes: runtime::engine::backend::open::METAL_FIRE.0,
+    tokens: runtime::engine::backend::open::METAL_FIRE.1,
 };
 /// The Metal shell has no planner to derive a page from.
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
