@@ -919,6 +919,33 @@ impl Step {
     }
 }
 
+impl Step {
+    /// Refuses a lane whose word `captures` its attention scores where no
+    /// program runs at it on this fire (none attached, or one attached for
+    /// its adapter alone): the scores it would capture have no reader, which
+    /// only a runtime stamping the switch on the wrong fire asks for.
+    pub fn validate_captures(&self, captures: impl Fn(u64) -> bool) -> Result<()> {
+        for (at, lane) in self.lanes.iter().enumerate() {
+            if !captures(lane.word) {
+                continue;
+            }
+            let at = u32::try_from(at).unwrap_or(u32::MAX);
+            let read = self.attachments.iter().any(|attachment| {
+                !attachment.adapter_only
+                    && (attachment.lane..attachment.lane + attachment.lanes.max(1)).contains(&at)
+            });
+            if !read {
+                return Err(Error::Invalid(format!(
+                    "lane {at} captures its attention scores, and no instance whose program \
+                     reads them is attached at it on this fire: only the fire that runs a \
+                     pass's program captures them"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct FrameSubmission {
     pub steps: Vec<Step>,
@@ -1133,6 +1160,30 @@ mod tests {
             *runs.last_mut().unwrap() += 1;
         }
         Mask::new(runs, kept.len() as u64)
+    }
+
+    #[test]
+    fn a_capturing_lane_needs_a_reader_attached() {
+        const SCORES: u64 = 16;
+        let mut step = Step {
+            lanes: vec![Lane::decode(0, 0, 1, 0), Lane::decode(1, SCORES, 2, 0)],
+            ..Step::default()
+        };
+        let captures = |word: u64| word & SCORES != 0;
+        let refused = step.validate_captures(captures).unwrap_err().to_string();
+        assert!(refused.contains("lane 1 captures"), "{refused}");
+        step.attachments.push(Attachment {
+            lane: 1,
+            lanes: 1,
+            instance: InstanceId(7),
+            adapter_only: true,
+        });
+        assert!(
+            step.validate_captures(captures).is_err(),
+            "an adapter alone reads no scores"
+        );
+        step.attachments[0].adapter_only = false;
+        step.validate_captures(captures).unwrap();
     }
 
     #[test]
