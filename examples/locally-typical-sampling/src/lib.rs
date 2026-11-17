@@ -102,7 +102,7 @@ fn default_seed() -> u32 {
 /// Returns `(keep_mask, kept_count, kept_mass)`. The mask is never empty: the
 /// most typical token has exclusive prefix mass `0 < mass`, so it always
 /// survives the `lt` test.
-fn typical_keep(logits: &Tensor, vocab: u32, k_max: u32, mass: f32) -> (Tensor, Tensor, Tensor) {
+fn typical_keep(logits: &Tensor, vocab: u32, k_max: u32, mass: &Tensor) -> (Tensor, Tensor, Tensor) {
     let logprobs = log_softmax(logits);
     let probs = exp(&logprobs);
     // H = -sum(p log p), a scalar.
@@ -127,23 +127,22 @@ fn typical_keep(logits: &Tensor, vocab: u32, k_max: u32, mass: f32) -> (Tensor, 
     (keep, kept, kept_mass)
 }
 
-/// One sampling step: temperature, typical mask, Gumbel-max draw.
+/// One sampling step: temperature, typical mask, Gumbel-max draw. The
+/// temperature and `mass` ride in `[1]` channels, so every request of one
+/// `k_max` runs one program.
 fn typical_step(
     logits: Tensor,
     vocab: u32,
     k_max: u32,
-    temperature: f32,
-    mass: f32,
+    temperature: &Channel,
+    mass: &Channel,
     rng_state: &Tensor,
 ) -> (Tensor, Tensor, Tensor) {
     // Temperature first, matching the reference implementations: typicality is
     // measured on the distribution actually being sampled from.
-    let scaled = if temperature == 1.0 {
-        logits
-    } else {
-        &logits / temperature
-    };
-    let (keep, kept, kept_mass) = typical_keep(&scaled, vocab, k_max, mass);
+    let scaled = &logits / reshape(temperature.read(), []);
+    let mass = reshape(mass.read(), []);
+    let (keep, kept, kept_mass) = typical_keep(&scaled, vocab, k_max, &mass);
     let neg_inf = broadcast(f32::NEG_INFINITY, [vocab]);
     let masked = select(&keep, &scaled, &neg_inf);
     let token = gumbel_max(masked, rng_state);
@@ -165,7 +164,8 @@ async fn main(input: Input) -> Result<Output> {
 
     let k_max = input.k_max;
     let mass = input.mass;
-    let temperature = input.temperature;
+    let mass_c = Channel::from([mass]);
+    let temperature_c = Channel::from([input.temperature]);
     let max_tokens = input.max_tokens;
     let vocab = model::output_vocab_size();
     let ws = WorkingSet::new();
@@ -211,7 +211,7 @@ async fn main(input: Input) -> Result<Output> {
     fwd_p.epilogue(move || {
         let r = rng_p.take();
         let logits = intrinsics::output(0, "logits");
-        let (token, kept, kmass) = typical_step(logits, vocab, k_max, temperature, mass, &r);
+        let (token, kept, kmass) = typical_step(logits, vocab, k_max, &temperature_c, &mass_c, &r);
         let r_next = &r + iota(2);
         tok_out_p.put(&token);
         kept_out_p.put(&kept);
@@ -245,7 +245,7 @@ async fn main(input: Input) -> Result<Output> {
             // Takes and compute first, puts last (value-id discipline).
             let r = rng.take();
             let logits = intrinsics::output(0, "logits");
-            let (token, kept, kmass) = typical_step(logits, vocab, k_max, temperature, mass, &r);
+            let (token, kept, kmass) = typical_step(logits, vocab, k_max, &temperature_c, &mass_c, &r);
 
             let r_next = &r + iota(2);
 

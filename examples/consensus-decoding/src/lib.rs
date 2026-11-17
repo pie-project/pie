@@ -63,8 +63,10 @@ fn decode_text(tokens: &[u32]) -> Result<String> {
 async fn main(input: Input) -> Result<String> {
     let question = input.question;
     let num_candidates = input.num_candidates;
-    let temperature = input.temperature.max(1e-4);
-    let top_p = input.top_p.clamp(0.0, 1.0);
+    // The temperature and `top_p` ride in `[1]` channels, read in the
+    // stages: every request of one candidate count runs one program.
+    let temperature_c = Channel::from([input.temperature.max(1e-4)]);
+    let top_p_c = Channel::from([input.top_p.clamp(0.0, 1.0)]);
     let max_tokens = input.max_tokens;
     if num_candidates == 0 {
         return Err("num_candidates must be at least 1".into());
@@ -120,9 +122,9 @@ async fn main(input: Input) -> Result<String> {
             // that elided 4-byte slot, corrupting the sampler's scratch — the
             // failure is silent and yields plausible-looking junk tokens.
             let logits = intrinsics::output(0, "logits"); // [1, vocab] (single read-out row)
-            let scaled = &reshape(&logits, [1, vocab]) / temperature;
+            let scaled = &reshape(&logits, [1, vocab]) / reshape(temperature_c.read(), []);
             let probs = softmax(&scaled);
-            let keep = pivot_threshold(&probs, cummass_le(top_p));
+            let keep = pivot_threshold(&probs, cummass_le(reshape(top_p_c.read(), [])));
             let masked = mask_apply(&scaled, &keep); // [1, vocab]
             let g = gumbel(&r, [1, vocab]);
             let toks0 = reduce_argmax(&masked + &g); // [1] i32
@@ -175,9 +177,9 @@ async fn main(input: Input) -> Result<String> {
             } else {
                 intrinsics::output(0, "logits")
             }; // [B, vocab]
-            let scaled = &logits / temperature;
+            let scaled = &logits / reshape(temperature_c.read(), []);
             let probs = softmax(&scaled);
-            let keep = pivot_threshold(&probs, cummass_le(top_p));
+            let keep = pivot_threshold(&probs, cummass_le(reshape(top_p_c.read(), [])));
             let masked = mask_apply(&scaled, &keep);
             let g = gumbel(&r, [b, vocab]);
             let toks = reduce_argmax(&masked + &g); // [B] i32

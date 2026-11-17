@@ -68,12 +68,9 @@ struct Output {
 }
 
 /// One sampling step: temperature, then a Gumbel-max draw over the full vocab.
-fn step(logits: Tensor, temperature: f32, rng_state: &Tensor) -> Tensor {
-    let scaled = if temperature == 1.0 {
-        logits
-    } else {
-        &logits / temperature
-    };
+/// The temperature rides in a `[1]` channel: every request runs one program.
+fn step(logits: Tensor, temperature: &Channel, rng_state: &Tensor) -> Tensor {
+    let scaled = &logits / reshape(temperature.read(), []);
     gumbel_max(scaled, rng_state)
 }
 
@@ -83,7 +80,7 @@ async fn main(input: Input) -> Result<Output> {
         return Err("temperature must be finite and greater than 0".into());
     }
     let max_tokens = input.max_tokens;
-    let temperature = input.temperature;
+    let temperature = Channel::from([input.temperature]);
     let want_stats = input.stats;
     let ws = WorkingSet::new();
 
@@ -129,7 +126,7 @@ async fn main(input: Input) -> Result<Output> {
     fwd_p.epilogue(move || {
         let r = rng_p.take();
         let logits = intrinsics::output(0, "logits");
-        let token = step(logits, temperature, &r);
+        let token = step(logits, &temperature, &r);
         let r_next = &r + iota(2);
         tok_out_p.put(&token);
         if want_stats {
@@ -176,7 +173,7 @@ async fn main(input: Input) -> Result<Output> {
         fwd.epilogue(move || {
             let r = rng.take();
             let logits = intrinsics::output(0, "logits");
-            let token = step(logits, temperature, &r);
+            let token = step(logits, &temperature, &r);
 
             let r_next = &r + iota(2);
 

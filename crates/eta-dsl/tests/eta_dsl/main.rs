@@ -7,5 +7,6 @@ mod inferlet_goldens;
 mod lowering;
 mod op_reachability;
 mod outputs;
+mod program_identity;
 mod result_parity;
 mod the_name_table_is_sorted;

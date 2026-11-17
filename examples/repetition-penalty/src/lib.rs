@@ -37,8 +37,8 @@
 //!
 //! Two `[vocab]` f32 channels, so ~594 KiB each at this model's 151936-token
 //! vocabulary. Only `counts` is a feedback channel; `prompt_present` is written
-//! once and cycled unchanged, which keeps the graph shape identical between the
-//! prefill and decode passes.
+//! once by the host and read unchanged. Both are shaped by the vocabulary, not
+//! by the prompt or `max_tokens`, so every request runs the same programs.
 //!
 //! ## Source
 //!
@@ -113,12 +113,19 @@ fn default_seed() -> u32 {
     0x7ce1
 }
 
+/// The penalties and the temperature, in `[1]` channels: every request runs
+/// one program.
 #[derive(Clone, Copy)]
 struct Cfg {
-    frequency_penalty: f32,
-    presence_penalty: f32,
-    repetition_penalty: f32,
-    temperature: f32,
+    frequency_penalty: Channel,
+    presence_penalty: Channel,
+    repetition_penalty: Channel,
+    temperature: Channel,
+}
+
+/// A knob's value as the stage reads it.
+fn knob(channel: Channel) -> Tensor {
+    reshape(channel.read(), [])
 }
 
 /// Applies all three penalties to a logit row.
@@ -141,15 +148,15 @@ fn apply_penalties(
     // CTRL-style repetition penalty. Dividing a positive logit and multiplying
     // a negative one both move it toward -inf, which is the point: a single
     // multiplicative rule would *reward* already-negative logits.
-    let r = broadcast(cfg.repetition_penalty, [vocab]);
+    let r = broadcast(knob(cfg.repetition_penalty), [vocab]);
     let positive = gt(logits, &zero);
     let repenalized = select(&positive, logits / &r, logits * &r);
     let l = select(&seen, &repenalized, logits);
 
     // Frequency scales with how often the token was emitted; presence is a flat
     // charge for having been emitted at all.
-    let freq = broadcast(cfg.frequency_penalty, [vocab]) * counts;
-    let pres = broadcast(cfg.presence_penalty, [vocab]) * cast(&out_seen, dtype::f32);
+    let freq = broadcast(knob(cfg.frequency_penalty), [vocab]) * counts;
+    let pres = broadcast(knob(cfg.presence_penalty), [vocab]) * cast(&out_seen, dtype::f32);
 
     let penalized = reshape(reduce_sum(cast(&seen, dtype::f32)), [1]);
     let peak = reshape(reduce_max(counts), [1]);
@@ -169,11 +176,7 @@ fn step(
         apply_penalties(&logits, vocab, cfg, counts, prompt_present);
     // Temperature last, matching vLLM's ordering: the penalties are defined on
     // raw logits, and scaling first would make their strength depend on it.
-    let scaled = if cfg.temperature == 1.0 {
-        penalized
-    } else {
-        &penalized / cfg.temperature
-    };
+    let scaled = &penalized / knob(cfg.temperature);
     let token = gumbel_max(scaled, rng_state);
     (token, n_penalized, peak)
 }
@@ -207,10 +210,10 @@ async fn main(input: Input) -> Result<Output> {
     let max_tokens = input.max_tokens;
     let vocab = model::output_vocab_size();
     let cfg = Cfg {
-        frequency_penalty: input.frequency_penalty,
-        presence_penalty: input.presence_penalty,
-        repetition_penalty: input.repetition_penalty,
-        temperature: input.temperature,
+        frequency_penalty: Channel::from([input.frequency_penalty]),
+        presence_penalty: Channel::from([input.presence_penalty]),
+        repetition_penalty: Channel::from([input.repetition_penalty]),
+        temperature: Channel::from([input.temperature]),
     };
     let ws = WorkingSet::new();
 
@@ -219,9 +222,9 @@ async fn main(input: Input) -> Result<Output> {
             sampler: "repetition-penalty",
             text: String::new(),
             count: 0,
-            frequency_penalty: cfg.frequency_penalty,
-            presence_penalty: cfg.presence_penalty,
-            repetition_penalty: cfg.repetition_penalty,
+            frequency_penalty: input.frequency_penalty,
+            presence_penalty: input.presence_penalty,
+            repetition_penalty: input.repetition_penalty,
             mean_penalized: 0.0,
             peak_repeat: 0.0,
             unique_ratio: 0.0,
@@ -243,8 +246,16 @@ async fn main(input: Input) -> Result<Output> {
 
     // ── PREFILL FIRE (N-wide): first sampled token comes off the prompt. ──
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-    let toks_p = Channel::from(prompt_i32.clone());
-    let prompt_p = Channel::from(prompt_i32.clone());
+    // The prompt as a `[vocab]` 0/1 row, built on the host: its shape is the
+    // vocabulary's, whatever the prompt's length.
+    let mut present = vec![0.0f32; vocab as usize];
+    for &t in &prompt {
+        if let Some(cell) = present.get_mut(t as usize) {
+            *cell = 1.0;
+        }
+    }
+    let toks_p = Channel::from(prompt_i32);
+    let present_p = Channel::from(present.clone());
     let embed_indptr_p = Channel::from([0u32, n]);
     let rng_p = Channel::from([input.seed, 0]);
     let tok_out_p = Channel::new([1], dtype::i32);
@@ -256,9 +267,8 @@ async fn main(input: Input) -> Result<Output> {
     fwd_p.state(&[&ws], StateGeometry::folding())?;
     fwd_p.epilogue(move || {
         let r = rng_p.take();
-        let p_toks = prompt_p.read();
+        let present = present_p.read();
         let counts = broadcast(0.0f32, [vocab]);
-        let present = scatter_set(broadcast(0.0f32, [vocab]), &p_toks, 1.0f32);
         let logits = intrinsics::output(0, "logits");
         let (token, n_pen, peak) = step(logits, vocab, cfg, &counts, &present, &r);
         let r_next = &r + iota(2);
@@ -280,14 +290,17 @@ async fn main(input: Input) -> Result<Output> {
 
     // ── DECODE LOOP (1-wide, run-ahead). ──
     if generated.len() < max_tokens {
-        let mut hist0 = vec![-1i32; max_tokens];
-        hist0[0] = g0;
+        // The output histogram, a `[vocab]` count row the device advances:
+        // its shape is the vocabulary's, whatever `max_tokens` is.
+        let mut counts0 = vec![0.0f32; vocab as usize];
+        if let Some(cell) = counts0.get_mut(g0 as usize) {
+            *cell = 1.0;
+        }
 
         let tok_in = Channel::from([g0]);
         let rng = Channel::from([input.seed ^ 0x5bd1, 0]);
-        let hist_c = Channel::from(hist0);
-        let hlen_c = Channel::from([1u32]);
-        let prompt_c = Channel::from(prompt_i32);
+        let counts_c = Channel::from(counts0);
+        let present_c = Channel::from(present);
         let out = Channel::new([3], dtype::f32).capacity(channel_capacity() as u32);
         let lane1 = Channel::from([0u32, 1u32]);
 
@@ -297,14 +310,11 @@ async fn main(input: Input) -> Result<Output> {
         fwd.epilogue(move || {
             // Takes and compute first, puts last (value-id discipline).
             let r = rng.take();
-            let hist = hist_c.take();
-            let hlen = hlen_c.take();
-            let p_toks = prompt_c.read();
+            let counts = counts_c.take();
+            let present = present_c.read();
             let logits = intrinsics::output(0, "logits");
-            let counts = scatter_add(broadcast(0.0f32, [vocab]), &hist, 1.0f32);
-            let present = scatter_set(broadcast(0.0f32, [vocab]), &p_toks, 1.0f32);
             let (token, n_pen, peak) = step(logits, vocab, cfg, &counts, &present, &r);
-            let hist_next = scatter_set(&hist, &hlen, &token);
+            let counts_next = scatter_add(&counts, &token, 1.0f32);
 
             let r_next = &r + iota(2);
 
@@ -314,8 +324,7 @@ async fn main(input: Input) -> Result<Output> {
                 &n_pen,
                 &peak,
             ));
-            hist_c.put(&hist_next);
-            hlen_c.put(&hlen + 1u32);
+            counts_c.put(&counts_next);
             rng.put(&r_next);
         });
 
@@ -349,9 +358,9 @@ async fn main(input: Input) -> Result<Output> {
         sampler: "repetition-penalty",
         text: model::decode(&generated)?,
         count: generated.len(),
-        frequency_penalty: cfg.frequency_penalty,
-        presence_penalty: cfg.presence_penalty,
-        repetition_penalty: cfg.repetition_penalty,
+        frequency_penalty: input.frequency_penalty,
+        presence_penalty: input.presence_penalty,
+        repetition_penalty: input.repetition_penalty,
         mean_penalized: penalized.iter().sum::<f32>() / penalized.len() as f32,
         peak_repeat: peaks.iter().fold(0.0f32, |a, &b| a.max(b)),
         unique_ratio: unique.len() as f32 / generated.len() as f32,

@@ -46,13 +46,16 @@ fn default_top_p() -> f32 {
 /// `r` is the taken `[2]` u32 rng state (`[key, ctr]`) driving the Gumbel noise.
 /// Returns the sampled token `[1]` i32. Zero temperature is exact greedy
 /// decoding; positive temperatures use nucleus sampling.
-fn sample_token(r: &Tensor, temperature: f32, top_p: f32) -> Tensor {
+///
+/// Greedy and sampled are two programs; a sampled one reads its temperature
+/// and `top_p` off `[1]` channels, so every sampled request runs one program.
+fn sample_token(r: &Tensor, knobs: Option<(Channel, Channel)>) -> Tensor {
     let logits = intrinsics::output(0, "logits"); // [1, vocab] f32 (read-out row)
-    if temperature == 0.0 {
+    let Some((temperature, top_p)) = knobs else {
         return reduce_argmax(&logits);
-    }
-    let scaled = &logits / temperature.max(1e-4);
-    nucleus_sample(&scaled, top_p, r)
+    };
+    let scaled = &logits / reshape(temperature.read(), []);
+    nucleus_sample(&scaled, reshape(top_p.read(), []), r)
 }
 
 #[inferlet::main]
@@ -64,8 +67,12 @@ async fn main(input: Input) -> Result<String> {
         return Err("temperature must be finite".into());
     }
 
-    let temperature = input.temperature;
-    let top_p = input.top_p;
+    let knobs = (input.temperature != 0.0).then(|| {
+        (
+            Channel::from([input.temperature.max(1e-4)]),
+            Channel::from([input.top_p]),
+        )
+    });
     let max_tokens = input.max_tokens;
     if max_tokens == 0 {
         return Ok(String::new());
@@ -105,7 +112,7 @@ async fn main(input: Input) -> Result<String> {
         fwd_p.state(&[&ws], StateGeometry::folding())?;
         fwd_p.epilogue(move || {
             let r = rng_p.take();
-            let tok = sample_token(&r, temperature, top_p);
+            let tok = sample_token(&r, knobs);
             let r_next = &r + iota(2); // advance ctr: [key, ctr+1]
             g0_ch.put(&tok);
             rng_p.put(&r_next);
@@ -146,7 +153,7 @@ async fn main(input: Input) -> Result<String> {
         // TAKES + compute first, PUTS last (value-id discipline).
         let r = rng.take();
 
-        let tok = sample_token(&r, temperature, top_p); // [1] i32
+        let tok = sample_token(&r, knobs); // [1] i32
         let r_next = &r + iota(2);
 
         tok_in.put(&tok);

@@ -45,43 +45,110 @@ impl Shape {
     };
 }
 
-/// The shapes the SDK's requests take most: greedy, a temperature draw
-/// (Gumbel-max), top-p, top-k with top-p, and greedy landing its top
-/// logprobs. The knobs' values here are any request's.
-pub const STANDARD: [(&str, Shape); 5] = [
+/// The shapes the built-in inferlets' requests take most ([`Values`]):
+/// greedy, sampled, and greedy landing logprobs. The knobs' values here are
+/// any request's.
+pub const STANDARD: [(&str, Shape); 3] = [
     ("greedy", Shape::GREEDY),
     (
-        "gumbel-max",
-        Shape {
-            temperature: Some(1.0),
-            ..Shape::GREEDY
-        },
-    ),
-    (
-        "top-p",
-        Shape {
-            temperature: Some(1.0),
-            top_p: true,
-            ..Shape::GREEDY
-        },
-    ),
-    (
-        "top-k + top-p",
+        "sampled",
         Shape {
             temperature: Some(1.0),
             top_p: true,
             top_k: true,
+            min_p: true,
             ..Shape::GREEDY
         },
     ),
     (
         "top logprobs",
         Shape {
-            logprobs: Some(5),
+            logprobs: Some(MAX_TOP_LOGPROBS),
             ..Shape::GREEDY
         },
     ),
 ];
+
+/// The most alternatives a step lands, as OpenAI caps `top_logprobs`: a
+/// program landing logprobs always lands this many, and the host keeps the
+/// ones a request asked for, so every logprobs request shares one program.
+pub const MAX_TOP_LOGPROBS: u32 = 20;
+
+/// A request's sampling as the built-in inferlets take it: temperature zero
+/// is greedy, a top-k of zero is off.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Request {
+    pub temperature: f32,
+    pub top_p: f32,
+    pub top_k: u32,
+    pub min_p: f32,
+    pub repetition: f32,
+    pub frequency: f32,
+    pub presence: f32,
+    /// Alternatives a step reports, where asked.
+    pub logprobs: Option<u32>,
+}
+
+/// A request's values for every knob its kind carries: the program's shape
+/// is which are present, and a request's unused knobs ride at their neutral
+/// values (top-p 1, min-p 0, top-k the vocabulary; penalties 1 and 0), so
+/// one program serves every request of its kind: greedy or sampled (at a
+/// temperature, a program constant), penalized or not, landing logprobs or
+/// not. Each present knob rides in a `[1]` channel the host seeds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Values {
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub top_k: Option<u32>,
+    pub min_p: Option<f32>,
+    pub repetition: Option<f32>,
+    pub frequency: Option<f32>,
+    pub presence: Option<f32>,
+    /// Always [`MAX_TOP_LOGPROBS`] where a request asks for any.
+    pub logprobs: Option<u32>,
+}
+
+impl Request {
+    pub fn penalized(&self) -> bool {
+        self.repetition != 1.0 || self.frequency != 0.0 || self.presence != 0.0
+    }
+
+    /// The knobs this request's kind carries, at its values.
+    pub fn values(&self, vocab: u32) -> Values {
+        let sampled = self.temperature > 0.0;
+        let penalized = self.penalized();
+        let top_k = match self.top_k {
+            0 => vocab,
+            k => k.min(vocab),
+        };
+        Values {
+            temperature: sampled.then(|| self.temperature.max(1e-4)),
+            top_p: sampled.then_some(self.top_p),
+            top_k: sampled.then_some(top_k),
+            min_p: sampled.then_some(self.min_p),
+            repetition: penalized.then_some(self.repetition),
+            frequency: penalized.then_some(self.frequency),
+            presence: penalized.then_some(self.presence),
+            logprobs: self.logprobs.map(|_| MAX_TOP_LOGPROBS),
+        }
+    }
+}
+
+impl Values {
+    /// Which knobs are present: the program's shape.
+    pub fn shape(&self) -> Shape {
+        Shape {
+            temperature: self.temperature,
+            top_p: self.top_p.is_some(),
+            top_k: self.top_k.is_some(),
+            min_p: self.min_p.is_some(),
+            repetition: self.repetition.is_some(),
+            frequency: self.frequency.is_some(),
+            presence: self.presence.is_some(),
+            logprobs: self.logprobs,
+        }
+    }
+}
 
 /// The sampler's knob values as scalars.
 pub struct Knobs {

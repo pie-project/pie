@@ -18,15 +18,16 @@
 //! prefix among them, in a choice's `prompt_logprobs` in vLLM's shape.
 //! Either costs a prefill read out row by row, apart from the prefix cache.
 //!
-//! Refused with 400: more than one prompt, token-array prompts and
-//! `suffix`. Anything a thinking model emits as a thinking block is returned
-//! as text: this API has no other place for it.
+//! Refused with 400: more than one prompt, token-array prompts, `suffix`
+//! and a `logit_bias` that biases any token (the sampler applies none).
+//! Anything a thinking model emits as a thinking block is returned as text:
+//! this API has no other place for it.
 
 use compat::{ApiError, Envelope, Event, Finish, Request, emit};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{alternatives, choices, invalid, run_choices, stop_sequences, token_text, usage_of};
+use crate::{refuse_logit_bias, alternatives, choices, invalid, run_choices, stop_sequences, token_text, usage_of};
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -52,6 +53,7 @@ struct Body {
     presence_penalty: Option<f32>,
     frequency_penalty: Option<f32>,
     repetition_penalty: Option<f32>,
+    logit_bias: Option<Value>,
 }
 
 #[derive(Deserialize, Default)]
@@ -82,6 +84,7 @@ impl Parsed {
 fn parse(body: Value) -> Result<Parsed, ApiError> {
     let body: Body =
         serde_json::from_value(body).map_err(|e| invalid(format!("request body: {e}"), None))?;
+    refuse_logit_bias(body.logit_bias.as_ref())?;
     let prompt = match body.prompt {
         None | Some(Value::Null) => String::new(),
         Some(Value::String(s)) => s,

@@ -13,6 +13,7 @@ use inferlet::eta::prelude::*;
 use inferlet::speculative::{SplitMix64, point_rows, verify_point_rows};
 use std::ops::ControlFlow;
 
+#[derive(Clone, Copy)]
 enum Round<'a> {
     Prompt(&'a [u32]),
     Draft,
@@ -38,108 +39,214 @@ struct Landed {
     chances: Vec<f32>,
 }
 
-async fn pass(
-    pipe: &Pipeline,
-    ws: &WorkingSet,
-    tokens: &[i32],
-    base: u32,
-    round: Round<'_>,
-    pick: Option<&Pick>,
-) -> Result<Landed> {
-    let count = tokens.len() as u32;
-    let end = base + count;
-    let drafting = matches!(round, Round::Draft);
-    let toks = Channel::from(tokens);
-    let indptr = Channel::from([0u32, count]);
-    let slots = Channel::from_iter(base..end);
-    let readouts = match round {
-        Round::Prompt(_) => vec![count - 1],
-        Round::Draft | Round::Verify(_) | Round::Plain => (0..count).collect(),
-    };
-    let shown = readouts.len() as u32;
-    let readout = Channel::from(readouts);
+/// A round's pass: built once for its kind and width, then fired again with
+/// each round's tokens, slots, fold and proposals, so every round of a kind
+/// runs one program.
+struct Pass {
+    fwd: ForwardPass,
+    /// Put afresh each fire: the embed and slot ports take them.
+    toks: Channel,
+    slots: Channel,
+    /// Seeded with the first fire's values and set before each later one:
+    /// the survivors a draft or verify folds, and a verify's proposals.
+    fold: Option<Channel>,
+    proposals: Option<Channel>,
+    out: Channel,
+    chances: Option<Channel>,
+    /// The rows it reads out.
+    shown: u32,
+    fired: bool,
+}
+
+/// What a round reads beside its tokens: the survivors it folds (none
+/// folds every row) and, under a `Pick`, the proposal each row claims.
+fn round_values(round: Round<'_>, tokens: &[i32], shown: u32) -> (Option<u32>, Vec<u32>) {
     let fold = match round {
         Round::Prompt(_) | Round::Plain => None,
         Round::Draft => Some(0),
         Round::Verify(survivors) => Some(survivors),
     };
-    let fold = fold.map(|n| Channel::from([n]));
-    let fold = match &fold {
-        Some(count) => Fold::Count(count),
-        None => Fold::All,
-    };
-    let out = Channel::new([shown], dtype::i32);
     // Row `j` of a verify reads the token proposal `j` claims, the input
     // one past it; the last row (and a prompt's or plain fire's one) has
     // none.
-    let sampled = pick.filter(|_| !drafting).map(|pick| {
-        let mut proposals: Vec<u32> = match round {
-            Round::Verify(_) => tokens[1..].iter().map(|&t| t as u32).collect(),
-            _ => Vec::new(),
-        };
-        proposals.resize(shown as usize, 0);
-        (
-            *pick,
-            Channel::from(proposals),
-            Channel::new([shown], dtype::f32),
-        )
-    });
-    let chances = sampled.as_ref().map(|(_, _, chances)| *chances);
-    let fwd = ForwardPass::new();
-    if drafting {
-        fwd.switch(0, "block_draft", "on").context("draft block")?;
-    }
-    fwd.embed(&toks, &indptr)?;
-    fwd.readout(&readout)?;
-    fwd.state(
-        &[ws],
-        StateGeometry {
-            slots: Some(&slots),
-            fold,
-            ..StateGeometry::default()
-        },
-    )?;
-    if let Round::Prompt(ends) = round {
-        fwd.checkpoints(ends)?;
-    }
-    fwd.epilogue(move || {
-        if drafting {
-            out.put(reshape(intrinsics::output(0, "mtp.drafts"), [shown]));
-            return;
-        }
-        let Some((pick, proposals, chances)) = &sampled else {
-            out.put(reshape(
-                reduce_argmax(intrinsics::output(0, "logits")),
-                [shown],
-            ));
-            return;
-        };
-        let logits = reshape(intrinsics::output(0, "logits"), [shown, pick.vocab]);
-        let r = pick.noise.take();
-        let (chance, draws) = point_rows(
-            &(&logits / pick.temperature),
-            &proposals.read(),
-            shown,
-            pick.vocab,
-            &r,
-        );
-        out.put(reshape(draws, [shown]));
-        chances.put(reshape(chance, [shown]));
-        pick.noise.put(&r + iota(2));
-    });
-    fwd.submit(pipe).context("speculative submit")?;
-    let tokens = out
-        .take_host::<Vec<i32>>()
-        .await
-        .context("speculative readback")?;
-    let chances = match chances {
-        Some(chances) => chances
-            .take_host::<Vec<f32>>()
-            .await
-            .context("speculative chances")?,
-        None => Vec::new(),
+    let mut proposals: Vec<u32> = match round {
+        Round::Verify(_) => tokens[1..].iter().map(|&t| t as u32).collect(),
+        _ => Vec::new(),
     };
-    Ok(Landed { tokens, chances })
+    proposals.resize(shown as usize, 0);
+    (fold, proposals)
+}
+
+impl Pass {
+    /// The pass a round of `count` tokens runs, seeded with its first
+    /// fire's values.
+    fn new(
+        ws: &WorkingSet,
+        tokens: &[i32],
+        round: Round<'_>,
+        pick: Option<&Pick>,
+    ) -> Result<Pass> {
+        let count = tokens.len() as u32;
+        let drafting = matches!(round, Round::Draft);
+        let toks = Channel::new([count], dtype::i32);
+        let indptr = Channel::from([0u32, count]);
+        let slots = Channel::new([count], dtype::u32);
+        let readouts = match round {
+            Round::Prompt(_) => vec![count - 1],
+            Round::Draft | Round::Verify(_) | Round::Plain => (0..count).collect(),
+        };
+        let shown = readouts.len() as u32;
+        let readout = Channel::from(readouts);
+        let (fold, proposals) = round_values(round, tokens, shown);
+        let fold = fold.map(|n| Channel::from([n]));
+        let out = Channel::new([shown], dtype::i32);
+        let sampled = pick.filter(|_| !drafting).map(|pick| {
+            (
+                *pick,
+                Channel::from(proposals),
+                Channel::new([shown], dtype::f32),
+            )
+        });
+        let proposals = sampled.as_ref().map(|(_, proposals, _)| *proposals);
+        let chances = sampled.as_ref().map(|(_, _, chances)| *chances);
+        let fwd = ForwardPass::new();
+        if drafting {
+            fwd.switch(0, "block_draft", "on").context("draft block")?;
+        }
+        fwd.embed(&toks, &indptr)?;
+        fwd.readout(&readout)?;
+        fwd.state(
+            &[ws],
+            StateGeometry {
+                slots: Some(&slots),
+                fold: match &fold {
+                    Some(count) => Fold::Count(count),
+                    None => Fold::All,
+                },
+                ..StateGeometry::default()
+            },
+        )?;
+        if let Round::Prompt(ends) = round {
+            fwd.checkpoints(ends)?;
+        }
+        fwd.epilogue(move || {
+            if drafting {
+                out.put(reshape(intrinsics::output(0, "mtp.drafts"), [shown]));
+                return;
+            }
+            let Some((pick, proposals, chances)) = &sampled else {
+                out.put(reshape(
+                    reduce_argmax(intrinsics::output(0, "logits")),
+                    [shown],
+                ));
+                return;
+            };
+            let logits = reshape(intrinsics::output(0, "logits"), [shown, pick.vocab]);
+            let r = pick.noise.take();
+            let (chance, draws) = point_rows(
+                &(&logits / pick.temperature),
+                &proposals.read(),
+                shown,
+                pick.vocab,
+                &r,
+            );
+            out.put(reshape(draws, [shown]));
+            chances.put(reshape(chance, [shown]));
+            pick.noise.put(&r + iota(2));
+        });
+        Ok(Pass {
+            fwd,
+            toks,
+            slots,
+            fold,
+            proposals,
+            out,
+            chances,
+            shown,
+            fired: false,
+        })
+    }
+
+    /// Fires the pass over `tokens` at slots `base..` and reads what it landed.
+    async fn fire(
+        &mut self,
+        pipe: &Pipeline,
+        tokens: &[i32],
+        base: u32,
+        round: Round<'_>,
+    ) -> Result<Landed> {
+        let count = tokens.len() as u32;
+        if self.fired {
+            let (fold, proposals) = round_values(round, tokens, self.shown);
+            if let (Some(channel), Some(n)) = (&self.fold, fold) {
+                channel.set([n]).context("speculative fold")?;
+            }
+            if let Some(channel) = &self.proposals {
+                channel.set(proposals).context("speculative proposals")?;
+            }
+        }
+        self.fired = true;
+        self.toks.put(tokens.to_vec());
+        self.slots.put((base..base + count).collect::<Vec<u32>>());
+        self.fwd.submit(pipe).context("speculative submit")?;
+        let tokens = self
+            .out
+            .take_host::<Vec<i32>>()
+            .await
+            .context("speculative readback")?;
+        let chances = match &self.chances {
+            Some(chances) => chances
+                .take_host::<Vec<f32>>()
+                .await
+                .context("speculative chances")?,
+            None => Vec::new(),
+        };
+        Ok(Landed { tokens, chances })
+    }
+}
+
+/// The passes a generation fires, each built at its first round: the
+/// draft, the plain fire, and a verify a width.
+struct Passes<'a> {
+    ws: &'a WorkingSet,
+    pick: Option<&'a Pick>,
+    draft: Option<Pass>,
+    plain: Option<Pass>,
+    verify: Vec<Option<Pass>>,
+}
+
+impl Passes<'_> {
+    /// Fires `round` over `tokens` at slots `base..`, on the pass its kind
+    /// and width built.
+    async fn fire(
+        &mut self,
+        pipe: &Pipeline,
+        tokens: &[i32],
+        base: u32,
+        round: Round<'_>,
+    ) -> Result<Landed> {
+        let slot = match round {
+            Round::Prompt(_) => {
+                return Pass::new(self.ws, tokens, round, self.pick)?
+                    .fire(pipe, tokens, base, round)
+                    .await;
+            }
+            Round::Draft => &mut self.draft,
+            Round::Plain => &mut self.plain,
+            Round::Verify(_) => {
+                let width = tokens.len();
+                if self.verify.len() <= width {
+                    self.verify.resize_with(width + 1, || None);
+                }
+                &mut self.verify[width]
+            }
+        };
+        let pass = match slot {
+            Some(pass) => pass,
+            None => slot.insert(Pass::new(self.ws, tokens, round, self.pick)?),
+        };
+        pass.fire(pipe, tokens, base, round).await
+    }
 }
 
 /// Fire prices, the median of the last few of each shape, so the loop drafts
@@ -265,7 +372,15 @@ pub async fn generate(
     // The acceptance draws, a stream apart from the device's noise.
     let mut uniform = SplitMix64::new(u64::from(sampled.map_or(0, |(_, seed)| seed)) ^ 0x5bec);
     let pick = pick.as_ref();
-    let mut anchor = pass(&pipe, &ws, &prompt, 0, Round::Prompt(ends), pick)
+    let mut passes = Passes {
+        ws: &ws,
+        pick,
+        draft: None,
+        plain: None,
+        verify: Vec::new(),
+    };
+    let mut anchor = passes
+        .fire(&pipe, &prompt, 0, Round::Prompt(ends))
         .await?
         .tokens[0];
     let mut generated = 1;
@@ -323,7 +438,8 @@ pub async fn generate(
         let Some(width) = width else {
             // A plain fire folds whatever the last round buffered.
             let fired = inferlet::monotonic_now_ns();
-            let truth = pass(&pipe, &ws, &[anchor], held, Round::Plain, pick)
+            let truth = passes
+                .fire(&pipe, &[anchor], held, Round::Plain)
                 .await?
                 .tokens;
             if survivors == 0 {
@@ -344,7 +460,8 @@ pub async fn generate(
         let mut input = vec![draft.mask_token as i32; block as usize];
         input[0] = anchor;
         let fired = inferlet::monotonic_now_ns();
-        let picks = pass(&pipe, &ws, &input, held, Round::Draft, None)
+        let picks = passes
+            .fire(&pipe, &input, held, Round::Draft)
             .await?
             .tokens;
         Prices::keep(&mut prices.draft, inferlet::monotonic_now_ns() - fired);
@@ -352,7 +469,9 @@ pub async fn generate(
         let mut verify = vec![anchor];
         verify.extend_from_slice(proposals);
         let fired = inferlet::monotonic_now_ns();
-        let landed = pass(&pipe, &ws, &verify, held, Round::Verify(survivors), pick).await?;
+        let landed = passes
+            .fire(&pipe, &verify, held, Round::Verify(survivors))
+            .await?;
         Prices::keep(
             &mut prices.verify[width as usize],
             inferlet::monotonic_now_ns() - fired,

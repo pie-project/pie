@@ -200,7 +200,12 @@ async fn main(input: Input) -> Result<Output> {
     if input.max_tokens == 0 {
         return Ok(Output::empty(input.k, k, depth));
     }
-    let w = k + 1 + input.pad;
+    // The window is the model's widest whatever `k` asks (`pad` rows past it
+    // are a diagnostic), and `k` rides in a channel: every drafting request
+    // runs one program. Rows past `k` carry the correction and are never
+    // accepted.
+    let w = if k > 0 { depth + 1 } else { 1 } + input.pad;
+    let k_c = Channel::from([k]);
 
     let mut prompt = chat::system_user("You are a helpful assistant.", &input.prompt);
     prompt.extend(chat::cue_without_thinking());
@@ -247,6 +252,7 @@ async fn main(input: Input) -> Result<Output> {
             let t = gather(&reshape(reduce_argmax(intrinsics::output(0, "logits")), [rows]), &last);
             let i = iota(w);
             let first = eq(&i, Tensor::constant(0u32));
+            let k = broadcast(reshape(k_c.read(), []), [w]);
             let window = if drafting {
                 // The head's chain at that row, `[width]`; the window takes
                 // its first `k`, and any pad row carries `t` again.
@@ -256,7 +262,7 @@ async fn main(input: Input) -> Result<Output> {
                     Tensor::constant(depth - 1),
                 );
                 let at = broadcast(Tensor::constant((rows - 1) * width), [w]) + &j;
-                let drafted = and(not(&first), le(&i, Tensor::constant(k)));
+                let drafted = and(not(&first), le(&i, &k));
                 select(&drafted, gather(&chains, &at), broadcast(&t, [w]))
             } else {
                 broadcast(&t, [w])
@@ -350,13 +356,17 @@ async fn main(input: Input) -> Result<Output> {
             let none = broadcast(Tensor::constant(NONE), [w]);
 
             // ── verify: the longest prefix of drafts the trunk agreed with
+            let asked = reshape(k_c.read(), []);
             let m = if k > 0 {
-                let proposed = gather(&window, iota(k) + &one); // window[1..=k]
-                let said = gather(&truth, iota(k)); // truth[0..k]
-                let hit = cast(eq(&proposed, &said), dtype::u32);
+                // window[1..=depth] against truth[0..depth], a hit only
+                // within the `k` asked.
+                let proposed = gather(&window, iota(depth) + &one);
+                let said = gather(&truth, iota(depth));
+                let within = lt(iota(depth), broadcast(&asked, [depth]));
+                let hit = cast(and(eq(&proposed, &said), &within), dtype::u32);
                 let exact = reshape(reduce_sum(cumprod(&hit)), [1]);
                 if bench_accept {
-                    broadcast(Tensor::constant(k.saturating_sub(1)), [1])
+                    reshape(&asked - &one, [1])
                 } else {
                     exact
                 }
@@ -381,7 +391,7 @@ async fn main(input: Input) -> Result<Output> {
                 let chains = reshape(intrinsics::output(0, "mtp.drafts"), [w * width]);
                 let j = min_elem(max_elem(&i, &one) - &one, Tensor::constant(depth - 1));
                 let at = &mb * Tensor::constant(width) + &j;
-                let drafted = and(not(&first), le(&i, Tensor::constant(k)));
+                let drafted = and(not(&first), le(&i, broadcast(&asked, [w])));
                 select(&drafted, gather(&chains, &at), &correction)
             } else {
                 correction

@@ -1209,27 +1209,35 @@ pub mod diffusion {
     }
 
     use super::{
-        Tensor, and, cast, cumsum, dtype, eq, iota, le, lt, reduce_sum, scatter_set, sort_desc,
+        Tensor, and, broadcast, cast, cumsum, dtype, eq, iota, le, lt, reduce_sum, scatter_set,
+        sort_desc,
     };
+    use eta_dsl::AsTensor;
 
     pub fn linear_temperature(remaining: u32, max_steps: u32, t_max: f32, t_min: f32) -> f32 {
         t_min + (t_max - t_min) * (remaining as f32 / max_steps.max(1) as f32)
     }
 
-    pub fn entropy_bound_accept(entropy: &Tensor, bound: f32) -> Tensor {
+    /// The positions to accept, least uncertain first, while the entropy
+    /// accepted before each stays within `bound`: a rank-0 value (a channel's
+    /// read, so a request's bound is no program constant).
+    pub fn entropy_bound_accept(entropy: &Tensor, bound: impl AsTensor) -> Tensor {
         let n = entropy.shape().dims()[0];
         let (neg_sorted, order) = sort_desc(-entropy);
         let sorted = -&neg_sorted;
-        let below = le(&(&cumsum(&sorted) - &sorted), bound);
+        let below = le(&(&cumsum(&sorted) - &sorted), broadcast(bound, [n]));
         let none = lt(iota(n), 0u32);
         scatter_set(&none, &order, &below)
     }
 
+    /// Whether the canvas stopped changing and its mean entropy is under
+    /// `threshold`: a rank-0 value (a channel's read, so a request's
+    /// threshold is no program constant).
     pub fn stable_and_confident(
         argmax: &Tensor,
         previous: &Tensor,
         entropy: &Tensor,
-        threshold: f32,
+        threshold: impl AsTensor,
     ) -> Tensor {
         let n = argmax.shape().dims()[0];
         let unchanged = reduce_sum(cast(eq(argmax, previous), dtype::i32));

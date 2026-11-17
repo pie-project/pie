@@ -120,12 +120,19 @@ struct Output {
     min_entropy: f32,
 }
 
+/// The host's view of the knobs it reports, and the `[4]` channel the stages
+/// read them off (`[t0, theta, ln n, min_temperature]`): every request runs
+/// one program.
 #[derive(Clone, Copy)]
 struct Cfg {
     t0: f32,
     theta: f32,
-    ln_n: f32,
-    min_temperature: f32,
+    knobs: Channel,
+}
+
+/// Knob `at` of the `[4]` knob channel, as a scalar.
+fn knob(cfg: Cfg, at: u32) -> Tensor {
+    reshape(gather(cfg.knobs.read(), broadcast(Tensor::constant(at), [1])), [])
 }
 
 /// `T = T0 · N^(θ/H)`, evaluated as `T0 · exp((θ/H) · ln N)` because the op set
@@ -139,9 +146,9 @@ fn edt_temperature(logits: &Tensor, cfg: Cfg) -> (Tensor, Tensor) {
 
     // A one-hot row has H = 0; floor it so the reciprocal stays finite.
     let h_safe = max_elem(&h, 1e-6f32);
-    let exponent = cfg.theta / &h_safe;
-    let t = cfg.t0 * exp(&exponent * cfg.ln_n);
-    (max_elem(&t, cfg.min_temperature), h)
+    let exponent = knob(cfg, 1) / &h_safe;
+    let t = knob(cfg, 0) * exp(&exponent * knob(cfg, 2));
+    (max_elem(&t, knob(cfg, 3)), h)
 }
 
 /// One sampling step: derive the temperature from this row's entropy, then draw.
@@ -173,11 +180,11 @@ async fn main(input: Input) -> Result<Output> {
     }
     let max_tokens = input.max_tokens;
     let vocab = model::output_vocab_size();
+    let ln_n = input.n.ln();
     let cfg = Cfg {
         t0: input.t0,
         theta: input.theta,
-        ln_n: input.n.ln(),
-        min_temperature: input.min_temperature,
+        knobs: Channel::from([input.t0, input.theta, ln_n, input.min_temperature]),
     };
     let ws = WorkingSet::new();
 

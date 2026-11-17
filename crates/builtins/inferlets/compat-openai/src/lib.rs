@@ -24,6 +24,16 @@ fn invalid(message: impl Into<String>, param: Option<&str>) -> ApiError {
     )
 }
 
+/// A request that biases tokens is refused by name: the sampler applies no
+/// per-token bias, and ignoring one would answer a different question.
+fn refuse_logit_bias(bias: Option<&Value>) -> Result<(), ApiError> {
+    match bias {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::Object(map)) if map.is_empty() => Ok(()),
+        Some(_) => Err(invalid("logit_bias is not supported", Some("logit_bias"))),
+    }
+}
+
 /// The usage of every choice together: the prompt once, every choice's
 /// completion.
 fn usage_of<'a>(outcomes: impl IntoIterator<Item = &'a compat::Outcome>) -> Value {

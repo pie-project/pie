@@ -103,12 +103,19 @@ pub const DEFAULT_CAPACITY: usize = 256;
 
 pub struct Registry {
     inner: LruCache<u64, Arc<RegisteredProgram>>,
+    /// Registrations found by their hash, and those registered anew: a miss
+    /// is a program identity of its own, so requests of one kind add none
+    /// after the first.
+    hits: u64,
+    misses: u64,
 }
 
 impl Registry {
     pub fn new(capacity: NonZeroUsize) -> Self {
         Self {
             inner: LruCache::new(capacity),
+            hits: 0,
+            misses: 0,
         }
     }
 
@@ -131,9 +138,20 @@ impl Registry {
                 return Err(RegisterError::HashCollision(hash));
             }
             check_outputs(&hit.bound.container, &lanes).map_err(RegisterError::Bind)?;
+            self.hits += 1;
             return Ok(hit.clone());
         }
         let decoded = container::decode(&bytes).map_err(RegisterError::Decode)?;
+        tracing::debug!(
+            hash = format_args!("0x{hash:016x}"),
+            channels = ?decoded
+                .channels
+                .iter()
+                .map(|channel| channel.shape.dims().to_vec())
+                .collect::<Vec<_>>(),
+            ops = decoded.stages.iter().map(|stage| stage.ops.len()).sum::<usize>(),
+            "program registered anew"
+        );
         let pricing = price(&decoded);
         let channel_accesses = Self::channel_accesses(&decoded);
         let reads = Self::reads(&decoded);
@@ -154,7 +172,14 @@ impl Registry {
             emitted: Mutex::new(HashMap::new()),
         });
         self.inner.put(hash, entry.clone());
+        self.misses += 1;
         Ok(entry)
+    }
+
+    /// Registrations found by their hash and registered anew, so far.
+    #[must_use]
+    pub fn hits_and_misses(&self) -> (u64, u64) {
+        (self.hits, self.misses)
     }
 
     fn reads(container: &TraceContainer) -> Vec<(String, u32)> {
@@ -277,6 +302,13 @@ pub fn register(
 
 pub fn lookup(hash: u64) -> Option<Arc<RegisteredProgram>> {
     global().lookup(hash)
+}
+
+/// The served model's registrations found by their hash and registered
+/// anew: the model status's `programs.hits` and `programs.misses`.
+#[must_use]
+pub fn hits_and_misses() -> (u64, u64) {
+    global().hits_and_misses()
 }
 
 #[must_use]

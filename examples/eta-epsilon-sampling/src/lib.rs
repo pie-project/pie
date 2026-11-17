@@ -94,17 +94,17 @@ fn truncation_keep(
     logits: &Tensor,
     vocab: u32,
     mode: Mode,
-    epsilon: f32,
+    epsilon: &Tensor,
 ) -> (Tensor, Tensor, Tensor) {
     let logprobs = log_softmax(logits);
     let probs = exp(&logprobs);
 
     let threshold = match mode {
-        Mode::Epsilon => Tensor::constant(epsilon),
+        Mode::Epsilon => epsilon.clone(),
         Mode::Eta => {
             // min(eps, sqrt(eps) * exp(-H)): the floor relaxes with entropy.
             let h = entropy_from_logprobs(&probs, &logprobs);
-            let adaptive = epsilon.sqrt() * exp(-&h);
+            let adaptive = sqrt(epsilon) * exp(-&h);
             min_elem(epsilon, adaptive)
         }
     };
@@ -120,21 +120,20 @@ fn truncation_keep(
     (keep, kept, kept_mass)
 }
 
-/// One sampling step: temperature, truncation mask, Gumbel-max draw.
+/// One sampling step: temperature, truncation mask, Gumbel-max draw. The
+/// temperature and epsilon ride in `[1]` channels, so every request of one
+/// mode runs one program.
 fn truncation_step(
     logits: Tensor,
     vocab: u32,
     mode: Mode,
-    temperature: f32,
-    epsilon: f32,
+    temperature: &Channel,
+    epsilon: &Channel,
     rng_state: &Tensor,
 ) -> (Tensor, Tensor, Tensor) {
-    let scaled = if temperature == 1.0 {
-        logits
-    } else {
-        &logits / temperature
-    };
-    let (keep, kept, kept_mass) = truncation_keep(&scaled, vocab, mode, epsilon);
+    let scaled = &logits / reshape(temperature.read(), []);
+    let epsilon = reshape(epsilon.read(), []);
+    let (keep, kept, kept_mass) = truncation_keep(&scaled, vocab, mode, &epsilon);
     let neg_inf = broadcast(f32::NEG_INFINITY, [vocab]);
     let masked = select(&keep, &scaled, &neg_inf);
     let token = gumbel_max(masked, rng_state);
@@ -155,7 +154,8 @@ async fn main(input: Input) -> Result<Output> {
         other => return Err(format!("unknown mode: {other} (expected eta or epsilon)")),
     };
     let epsilon = input.epsilon;
-    let temperature = input.temperature;
+    let epsilon_c = Channel::from([epsilon]);
+    let temperature_c = Channel::from([input.temperature]);
     let max_tokens = input.max_tokens;
     let vocab = model::output_vocab_size();
     let ws = WorkingSet::new();
@@ -201,7 +201,7 @@ async fn main(input: Input) -> Result<Output> {
     fwd_p.epilogue(move || {
         let r = rng_p.take();
         let logits = intrinsics::output(0, "logits");
-        let (token, kept, kmass) = truncation_step(logits, vocab, mode, temperature, epsilon, &r);
+        let (token, kept, kmass) = truncation_step(logits, vocab, mode, &temperature_c, &epsilon_c, &r);
         let r_next = &r + iota(2);
         tok_out_p.put(&token);
         kept_out_p.put(&kept);
@@ -236,7 +236,7 @@ async fn main(input: Input) -> Result<Output> {
             let r = rng.take();
             let logits = intrinsics::output(0, "logits");
             let (token, kept, kmass) =
-                truncation_step(logits, vocab, mode, temperature, epsilon, &r);
+                truncation_step(logits, vocab, mode, &temperature_c, &epsilon_c, &r);
 
             let r_next = &r + iota(2);
 

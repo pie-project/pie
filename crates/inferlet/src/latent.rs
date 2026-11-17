@@ -1,9 +1,9 @@
 use crate::eta::{
-    Channel, ForwardPass, Pipeline, broadcast, gather, max_elem, min_elem, normal, reduce_sum,
-    reshape, sqrt,
+    Channel, ForwardPass, Pipeline, broadcast, div, gather, max_elem, min_elem, mul, normal,
+    reduce_sum, reshape, sqrt, sub,
 };
 use crate::model::{ScheduleFact, ScheduleKind};
-use eta_dsl::Tensor;
+use eta_dsl::{AsTensor, Tensor};
 
 pub mod prelude {
     pub use super::{
@@ -149,25 +149,32 @@ pub fn cfg_combine(cond: &Tensor, uncond: &Tensor, s: &Tensor) -> Tensor {
     uncond + &(&(cond - uncond) * &broadcast(s, shape))
 }
 
-pub fn apg(cond: &Tensor, uncond: &Tensor, s: f32, eta: f32, norm_threshold: f32) -> Tensor {
+/// Adaptive projected guidance: the guidance `s`, the parallel component's
+/// weight `eta` and, where given, the per-row norm the difference is clipped
+/// to. The knobs are values (a channel's read, or constants), so a request's
+/// own need be no program constant.
+pub fn apg(
+    cond: &Tensor,
+    uncond: &Tensor,
+    s: impl AsTensor,
+    eta: impl AsTensor,
+    norm_threshold: Option<&Tensor>,
+) -> Tensor {
     let shape = cond.shape();
     let rows = shape.dims()[0];
     let per_row = |x: &Tensor| broadcast(reshape(x, [rows, 1]), shape);
     let mut diff = cond - uncond;
-    if norm_threshold > 0.0 {
+    if let Some(norm_threshold) = norm_threshold {
         let norm = sqrt(reduce_sum(&(&diff * &diff)));
-        let scale = min_elem(
-            &(&Tensor::constant(norm_threshold) / &max_elem(&norm, 1e-12f32)),
-            1.0f32,
-        );
+        let scale = min_elem(&div(norm_threshold, max_elem(&norm, 1e-12f32)), 1.0f32);
         diff = &diff * &per_row(&scale);
     }
     let dot = reduce_sum(&(&diff * cond));
     let cond_sq = max_elem(reduce_sum(&(cond * cond)), 1e-12f32);
     let parallel = cond * &per_row(&(&dot / &cond_sq));
     let orthogonal = &diff - &parallel;
-    let guidance = &orthogonal + &(&parallel * eta);
-    cond + &(&guidance * (s - 1.0))
+    let guidance = &orthogonal + &mul(&parallel, eta);
+    cond + &mul(&guidance, sub(s, 1.0f32))
 }
 
 #[must_use]

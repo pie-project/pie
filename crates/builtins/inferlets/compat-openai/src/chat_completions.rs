@@ -24,7 +24,8 @@
 //! an assistant message's `reasoning_content` replayed where the template
 //! replays reasoning.
 //!
-//! Refused with 400: content parts other than text and images. Every other
+//! Refused with 400: content parts other than text and images, and a
+//! `logit_bias` that biases any token (the sampler applies none). Every other
 //! unknown field is ignored, as OpenAI does.
 
 use compat::{
@@ -34,7 +35,7 @@ use compat::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{chat_logprob, choices, invalid, run_choices, stop_sequences, usage_of};
+use crate::{refuse_logit_bias, chat_logprob, choices, invalid, run_choices, stop_sequences, usage_of};
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -65,6 +66,7 @@ struct Body {
     repetition_penalty: Option<f32>,
     reasoning_effort: Option<String>,
     chat_template_kwargs: Option<Value>,
+    logit_bias: Option<Value>,
 }
 
 #[derive(Deserialize, Default)]
@@ -145,6 +147,7 @@ fn content_parts(content: Option<Value>, param: &str) -> Result<(String, Vec<Vec
 fn parse(body: Value) -> Result<(Request, bool, u32), ApiError> {
     let body: Body =
         serde_json::from_value(body).map_err(|e| invalid(format!("request body: {e}"), None))?;
+    refuse_logit_bias(body.logit_bias.as_ref())?;
     if body.messages.is_empty() {
         return Err(invalid("`messages` must not be empty", Some("messages")));
     }

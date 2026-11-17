@@ -150,8 +150,14 @@ async fn main(input: Input) -> Result<Output> {
     let mut steps_taken: Vec<u32> = Vec::new();
     let mut final_entropy: Vec<f32> = Vec::new();
     let mut entropy_trace: Vec<Vec<f32>> = Vec::new();
-    let bound = input.entropy_bound;
-    let confidence = input.confidence;
+    // The schedule and the stopping knobs ride in `[1]` channels, read in the
+    // epilogue: every request runs the same denoise program.
+    let max_steps = input.max_steps.max(1);
+    let bound = Channel::from([input.entropy_bound]);
+    let confidence = Channel::from([input.confidence]);
+    let t_max = Channel::from([input.t_max]);
+    let t_min = Channel::from([input.t_min]);
+    let steps_c = Channel::from([max_steps]);
 
     for block in 0..canvases {
         let base = n + block * length;
@@ -169,8 +175,6 @@ async fn main(input: Input) -> Result<Output> {
         // computed from it in the epilogue (the same `linear_temperature`
         // arithmetic the host would do), so a step needs no host `set`.
         let step_index = Channel::from([0u32]);
-        let max_steps = input.max_steps.max(1);
-        let (t_max, t_min) = (input.t_max, input.t_min);
         let rng_state = Channel::from([input.seed ^ block, 0]);
         // The previous step's argmax canvas, device-carried; -1 means none.
         let history = Channel::from(vec![-1i32; length as usize]);
@@ -214,9 +218,11 @@ async fn main(input: Input) -> Result<Output> {
             // `remaining = max_steps - step`, spelled in the host's own f32
             // order so the schedule is the same numbers it would have set.
             let i = step_index.take();
-            let remaining = cast(&(max_steps - &i), dtype::f32);
+            let steps = reshape(steps_c.read(), [1]);
+            let (t_max, t_min) = (reshape(t_max.read(), [1]), reshape(t_min.read(), [1]));
+            let remaining = cast(&(&steps - &i), dtype::f32);
             let t = reshape(
-                &(&(&remaining / (max_steps as f32)) * (t_max - t_min)) + t_min,
+                &(&(&remaining / &cast(&steps, dtype::f32)) * &(&t_max - &t_min)) + &t_min,
                 [],
             );
             step_index.put(&(&i + 1u32));
@@ -238,14 +244,14 @@ async fn main(input: Input) -> Result<Output> {
             let sampled = gumbel_max(&scaled, &r);
             let argmax = reduce_argmax(&scaled);
 
-            let accept = entropy_bound_accept(&h, bound);
+            let accept = entropy_bound_accept(&h, &reshape(bound.read(), []));
             let r_noise = &r + iota(2);
             let noise = cast(&rng(&r_noise, [length]) * (vocab as f32), dtype::i32);
             let next = select(&accept, &sampled, &noise);
 
             let previous = history.take();
             history.put(&argmax);
-            let done = stable_and_confident(&argmax, &previous, &h, confidence);
+            let done = stable_and_confident(&argmax, &previous, &h, &reshape(confidence.read(), []));
 
             // The taps: the top ids of the scaled row (the same ids as of
             // its softmax) and their probabilities `exp(v - m) / z`. Read

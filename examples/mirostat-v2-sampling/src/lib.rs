@@ -68,10 +68,12 @@ fn default_floor() -> String {
     "argmax".into()
 }
 
+/// The floor the keep-mask never drops below; a rank floor's `k_min` rides
+/// in a `[1]` channel, so every request of one floor runs one program.
 #[derive(Clone, Copy)]
 enum Floor {
     Argmax,
-    Rank(u32),
+    Rank(Channel),
     Plain,
 }
 
@@ -98,11 +100,11 @@ fn mirostat_step(
             let argmax_ind = ge(&probs, broadcast(reduce_max(&probs), [vocab]));
             or(base_mask, argmax_ind)
         }
-        Floor::Rank(k_min) if k_min > 0 => {
-            let rank_mask = pivot_threshold(&logits, rank_le(k_min));
+        Floor::Rank(k_min) => {
+            let rank_mask = pivot_threshold(&logits, rank_le(reshape(k_min.read(), [])));
             or(base_mask, rank_mask)
         }
-        _ => base_mask,
+        Floor::Plain => base_mask,
     };
     let neg_inf = broadcast(f32::NEG_INFINITY, [vocab]);
     let masked = select(&mask, &logits, &neg_inf);
@@ -126,7 +128,7 @@ async fn main(input: Input) -> Result<Output> {
 
     let floor = match input.floor.as_str() {
         "argmax" => Floor::Argmax,
-        "rank" if input.k_min > 0 => Floor::Rank(input.k_min),
+        "rank" if input.k_min > 0 => Floor::Rank(Channel::from([input.k_min])),
         "plain" => Floor::Plain,
         "rank" => return Err("rank floor requires k_min > 0".into()),
         other => return Err(format!("unknown floor mode: {other}")),
@@ -204,6 +206,9 @@ async fn main(input: Input) -> Result<Output> {
         let tok_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
         let s_out = Channel::new([1], dtype::f32).capacity(channel_capacity() as u32);
         let lane1 = Channel::from([0u32, 1u32]);
+        // The controller's target and rate: knobs, not program constants.
+        let tau_c = Channel::from([tau]);
+        let lr_c = Channel::from([lr]);
 
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &lane1)?;
@@ -216,7 +221,9 @@ async fn main(input: Input) -> Result<Output> {
             let (token, surprise) = mirostat_step(floor, logits, vocab, &mu_v, &r);
 
             let r_next = &r + iota(2);
-            let mu_next = &mu_v - (&surprise - tau) * lr;
+            let tau = reshape(tau_c.read(), []);
+            let lr = reshape(lr_c.read(), []);
+            let mu_next = &mu_v - &(&(&surprise - &tau) * &lr);
 
             tok_in.put(&token);
             tok_out.put(&token);

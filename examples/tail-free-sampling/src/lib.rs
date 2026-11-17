@@ -94,11 +94,13 @@ struct Output {
     mean_mass: f32,
 }
 
+/// The sampler's knobs: `k_max` is a shape, `z` and the temperature ride in
+/// channels, so every request of one `k_max` runs one program.
 #[derive(Clone, Copy)]
 struct Cfg {
-    z: f32,
+    z: Channel,
     k_max: u32,
-    temperature: f32,
+    temperature: Channel,
 }
 
 /// `x[i + 1]`, with the final element repeated so the difference vanishes at
@@ -113,7 +115,7 @@ fn shift1(x: &Tensor, k: u32) -> Tensor {
 /// Returns `(keep_mask, kept_count, kept_mass)`. The mask is never empty: the
 /// most likely token has exclusive prefix curvature `0 < z`, so it always
 /// survives the `lt` test.
-fn tail_free_keep(logits: &Tensor, vocab: u32, k_max: u32, z: f32) -> (Tensor, Tensor, Tensor) {
+fn tail_free_keep(logits: &Tensor, vocab: u32, k_max: u32, z: &Tensor) -> (Tensor, Tensor, Tensor) {
     let probs = softmax(logits);
     // Probability is monotone in logits, so ranking by logit gives the
     // descending probability curve directly.
@@ -146,12 +148,9 @@ fn tail_free_keep(logits: &Tensor, vocab: u32, k_max: u32, z: f32) -> (Tensor, T
 fn step(logits: Tensor, vocab: u32, cfg: Cfg, rng_state: &Tensor) -> (Tensor, Tensor, Tensor) {
     // Temperature first: the curve whose curvature we measure has to be the
     // curve we actually sample from.
-    let scaled = if cfg.temperature == 1.0 {
-        logits
-    } else {
-        &logits / cfg.temperature
-    };
-    let (keep, kept, kept_mass) = tail_free_keep(&scaled, vocab, cfg.k_max, cfg.z);
+    let scaled = &logits / reshape(cfg.temperature.read(), []);
+    let z = reshape(cfg.z.read(), []);
+    let (keep, kept, kept_mass) = tail_free_keep(&scaled, vocab, cfg.k_max, &z);
     let neg_inf = broadcast(f32::NEG_INFINITY, [vocab]);
     let masked = select(&keep, &scaled, &neg_inf);
     (gumbel_max(masked, rng_state), kept, kept_mass)
@@ -173,9 +172,9 @@ async fn main(input: Input) -> Result<Output> {
     let max_tokens = input.max_tokens;
     let vocab = model::output_vocab_size();
     let cfg = Cfg {
-        z: input.z,
+        z: Channel::from([input.z]),
         k_max: input.k_max,
-        temperature: input.temperature,
+        temperature: Channel::from([input.temperature]),
     };
     let ws = WorkingSet::new();
 
@@ -184,7 +183,7 @@ async fn main(input: Input) -> Result<Output> {
             sampler: "tail-free",
             text: String::new(),
             count: 0,
-            z: cfg.z,
+            z: input.z,
             k_max: cfg.k_max,
             mean_kept: 0.0,
             min_kept: 0,
@@ -293,7 +292,7 @@ async fn main(input: Input) -> Result<Output> {
         sampler: "tail-free",
         text: model::decode(&generated)?,
         count: generated.len(),
-        z: cfg.z,
+        z: input.z,
         k_max: cfg.k_max,
         mean_kept: mean_s1,
         min_kept: min_s1 as u32,

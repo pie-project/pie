@@ -47,7 +47,7 @@ const GREEN_SALT: u32 = 0x67ee_7157;
 
 /// The greenlist keyed on the previous token (a `[1]` u32): entry `t` is
 /// green when its keyed uniform falls below `gamma`.
-fn green_mask(previous: &Tensor, gamma: f32, vocab: u32) -> Tensor {
+fn green_mask(previous: &Tensor, gamma: &Tensor, vocab: u32) -> Tensor {
     let is_counter = eq(iota(2), broadcast(1u32, [2]));
     let state = select(
         &is_counter,
@@ -61,7 +61,7 @@ fn watermarked_sample(
     logits: &Tensor,
     green: &Tensor,
     rng_state: &Tensor,
-    delta: f32,
+    delta: &Tensor,
     vocab: u32,
 ) -> Tensor {
     let bias = select(green, broadcast(delta, [vocab]), broadcast(0.0f32, [vocab]));
@@ -90,9 +90,11 @@ async fn main(input: Input) -> Result<String> {
     }
     let n = prompt.len() as u32;
     let stop_tokens = chat::stop_tokens();
-    let delta = input.delta;
-    let gamma = input.gamma;
-    let last_prompt = *prompt.last().unwrap_or(&0);
+    // The knobs and the prompt's last token ride in `[1]` channels: every
+    // request runs the same programs.
+    let delta = Channel::from([input.delta]);
+    let gamma = Channel::from([input.gamma]);
+    let last_prompt = Channel::from([*prompt.last().unwrap_or(&0)]);
 
     let prompt_tokens = Channel::from_iter(prompt.iter().map(|&token| token as i32));
     let prefill_indptr = Channel::from([0u32, n]);
@@ -103,10 +105,11 @@ async fn main(input: Input) -> Result<String> {
     prefill.embed(&prompt_tokens, &prefill_indptr)?;
     prefill.state(&[&ws], StateGeometry::folding())?;
     prefill.epilogue(move || {
-        let green = green_mask(&broadcast(last_prompt, [1]), gamma, vocab);
+        let green = green_mask(&last_prompt.read(), &reshape(gamma.read(), []), vocab);
         let rng = prefill_rng.take();
+        let delta = reshape(delta.read(), []);
         let token =
-            watermarked_sample(&intrinsics::output(0, "logits"), &green, &rng, delta, vocab);
+            watermarked_sample(&intrinsics::output(0, "logits"), &green, &rng, &delta, vocab);
         first_out.put(&token);
         prefill_rng.put(&rng + iota(2));
     });
@@ -132,13 +135,13 @@ async fn main(input: Input) -> Result<String> {
         decode.epilogue(move || {
             // The token this step embedded is the previous output: the key.
             let previous = cast(token_in.take(), dtype::u32);
-            let green = green_mask(&previous, gamma, vocab);
+            let green = green_mask(&previous, &reshape(gamma.read(), []), vocab);
             let rng_value = rng.take();
             let token = watermarked_sample(
                 &intrinsics::output(0, "logits"),
                 &green,
                 &rng_value,
-                delta,
+                &reshape(delta.read(), []),
                 vocab,
             );
 

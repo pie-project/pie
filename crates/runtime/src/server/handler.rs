@@ -83,6 +83,19 @@ impl Session {
                         ),
                     );
 
+                    // Program registrations found by their hash and registered
+                    // anew: a miss is a program identity of its own, so
+                    // requests of one kind add none after the first.
+                    let (hits, misses) = crate::pipeline::program::hits_and_misses();
+                    stats.insert(
+                        format!("{}.programs.hits", model_name),
+                        serde_json::Value::from(hits),
+                    );
+                    stats.insert(
+                        format!("{}.programs.misses", model_name),
+                        serde_json::Value::from(misses),
+                    );
+
                     let inf = crate::scheduler::get_stats().await;
                     stats.insert(
                         format!("{}.total_batches", model_name),

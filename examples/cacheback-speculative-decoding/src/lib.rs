@@ -139,69 +139,101 @@ fn draft_from_cache(tokens: &[u32], draft_length: usize, max_ngram: usize) -> Ve
     Vec::new()
 }
 
-async fn fire(
-    ws: &WorkingSet,
-    pipeline: &Pipeline,
-    tokens: &[u32],
-    base: u32,
-    fold: Option<u32>,
-    last_only: bool,
-    margin: bool,
-) -> Result<(Vec<u32>, Vec<[f32; 2]>)> {
-    let rows = tokens.len() as u32;
-    let total = base + rows;
+/// A verify-and-extend pass of one shape — its rows, whether it reads out
+/// only the last, whether it folds a count — built once and fired again
+/// with each round's tokens, slots and fold, so every round of a shape runs
+/// one program.
+struct Pass {
+    fwd: ForwardPass,
+    ids: Channel,
+    slots: Channel,
+    /// Seeded with the first fire's count, set before each later one.
+    fold: Option<Channel>,
+    truth_out: Channel,
+    top_out: Option<Channel>,
+    fired: bool,
+}
 
-    let ids = Channel::from_iter(tokens.iter().map(|&t| t as i32));
-    let embed_indptr = Channel::from([0u32, rows]);
-    let slots = Channel::from_iter(base..total);
-    let read = if last_only { rows - 1 } else { 0 };
-    let readout = Channel::from_iter(read..rows);
-    let truth_out = Channel::new([rows - read], dtype::i32);
-    let read_rows = rows - read;
-    let top_out = margin.then(|| Channel::new([read_rows * 2], dtype::f32));
-    let fold_len = fold.map(|n| Channel::from([n]));
-    let fold = match &fold_len {
-        Some(count) => Fold::Count(count),
-        None => Fold::All,
-    };
+impl Pass {
+    fn new(ws: &WorkingSet, rows: u32, fold: Option<u32>, last_only: bool, margin: bool) -> Result<Pass> {
+        let ids = Channel::new([rows], dtype::i32);
+        let embed_indptr = Channel::from([0u32, rows]);
+        let slots = Channel::new([rows], dtype::u32);
+        let read = if last_only { rows - 1 } else { 0 };
+        let readout = Channel::from_iter(read..rows);
+        let truth_out = Channel::new([rows - read], dtype::i32);
+        let read_rows = rows - read;
+        let top_out = margin.then(|| Channel::new([read_rows * 2], dtype::f32));
+        let fold = fold.map(|n| Channel::from([n]));
 
-    let fwd = ForwardPass::new();
-    fwd.embed(&ids, &embed_indptr)?;
-    fwd.readout(&readout)?;
-    fwd.state(
-        &[ws],
-        StateGeometry {
-            slots: Some(&slots),
+        let fwd = ForwardPass::new();
+        fwd.embed(&ids, &embed_indptr)?;
+        fwd.readout(&readout)?;
+        fwd.state(
+            &[ws],
+            StateGeometry {
+                slots: Some(&slots),
+                fold: match &fold {
+                    Some(count) => Fold::Count(count),
+                    None => Fold::All,
+                },
+                ..StateGeometry::default()
+            },
+        )?;
+        fwd.epilogue(move || {
+            let logits = intrinsics::output(0, "logits");
+            truth_out.put(reduce_argmax(&logits));
+            if let Some(top_out) = &top_out {
+                let (top, _) = top_k(&logits, 2);
+                top_out.put(reshape(top, [read_rows * 2]));
+            }
+        });
+        Ok(Pass {
+            fwd,
+            ids,
+            slots,
             fold,
-            ..StateGeometry::default()
-        },
-    )?;
-    fwd.epilogue(move || {
-        let logits = intrinsics::output(0, "logits");
-        truth_out.put(reduce_argmax(&logits));
-        if let Some(top_out) = &top_out {
-            let (top, _) = top_k(&logits, 2);
-            top_out.put(reshape(top, [read_rows * 2]));
-        }
-    });
-    fwd.submit(pipeline).context("verify-and-extend")?;
+            truth_out,
+            top_out,
+            fired: false,
+        })
+    }
 
-    let truth = truth_out
-        .take_host::<Vec<i32>>()
-        .await?
-        .into_iter()
-        .map(|t| t as u32)
-        .collect();
-    let tops = match top_out {
-        Some(top_out) => top_out
-            .take_host::<Vec<f32>>()
+    async fn fire(
+        &mut self,
+        pipeline: &Pipeline,
+        tokens: &[u32],
+        base: u32,
+        fold: Option<u32>,
+    ) -> Result<(Vec<u32>, Vec<[f32; 2]>)> {
+        let rows = tokens.len() as u32;
+        if self.fired
+            && let (Some(channel), Some(n)) = (&self.fold, fold)
+        {
+            channel.set([n]).context("verify fold")?;
+        }
+        self.fired = true;
+        self.ids.put(tokens.iter().map(|&t| t as i32).collect::<Vec<i32>>());
+        self.slots.put((base..base + rows).collect::<Vec<u32>>());
+        self.fwd.submit(pipeline).context("verify-and-extend")?;
+        let truth = self
+            .truth_out
+            .take_host::<Vec<i32>>()
             .await?
-            .chunks_exact(2)
-            .map(|pair| [pair[0], pair[1]])
-            .collect(),
-        None => Vec::new(),
-    };
-    Ok((truth, tops))
+            .into_iter()
+            .map(|t| t as u32)
+            .collect();
+        let tops = match &self.top_out {
+            Some(top_out) => top_out
+                .take_host::<Vec<f32>>()
+                .await?
+                .chunks_exact(2)
+                .map(|pair| [pair[0], pair[1]])
+                .collect(),
+            None => Vec::new(),
+        };
+        Ok((truth, tops))
+    }
 }
 
 /// What the decode loop needs from the target model: one greedy verify fire,
@@ -232,6 +264,8 @@ struct Live {
     ckpt: Option<WorkingSet>,
     margin: bool,
     tops: Vec<[f32; 2]>,
+    /// The passes fired on `ws`, by rows, last-only read and folded count.
+    passes: Vec<((u32, bool, bool), Pass)>,
 }
 
 impl Target for Live {
@@ -242,16 +276,19 @@ impl Target for Live {
         fold: Option<u32>,
         last_only: bool,
     ) -> Result<Vec<u32>> {
-        let (truth, tops) = fire(
-            &self.ws,
-            &self.pipeline,
-            tokens,
-            base,
-            fold,
-            last_only,
-            self.margin,
-        )
-        .await?;
+        let key = (tokens.len() as u32, last_only, fold.is_some());
+        let at = match self.passes.iter().position(|(shape, _)| *shape == key) {
+            Some(at) => at,
+            None => {
+                let pass = Pass::new(&self.ws, key.0, fold, last_only, self.margin)?;
+                self.passes.push((key, pass));
+                self.passes.len() - 1
+            }
+        };
+        let (truth, tops) = self.passes[at]
+            .1
+            .fire(&self.pipeline, tokens, base, fold)
+            .await?;
         self.tops = tops;
         Ok(truth)
     }
@@ -272,6 +309,8 @@ impl Target for Live {
     fn restore(&mut self) -> bool {
         match self.ckpt.take() {
             Some(restored) => {
+                // The passes are bound to the set the checkpoint replaces.
+                self.passes.clear();
                 self.ws = restored;
                 true
             }
@@ -354,6 +393,11 @@ async fn decode<T: Target>(
 
         let proposed = window.len() - 1;
         drafted += proposed;
+        // The verify fires at the widest window whatever was drafted, so every
+        // round runs one program: rows past the drafts repeat `x` and are
+        // never read, and the next fire overwrites their slots.
+        let mut fired = window.clone();
+        fired.resize(w_max, x);
 
         // Each window row's top-1/top-2, row `i` the one choosing window[i + 1].
         let mut row_tops: Vec<[f32; 2]> = Vec::new();
@@ -388,7 +432,7 @@ async fn decode<T: Target>(
                 target.checkpoint()?;
             }
             let fold = if is_ckpt_sync { None } else { Some(survivors) };
-            let truth = target.fire(&window, base, fold, false).await?;
+            let truth = target.fire(&fired, base, fold, false).await?;
             verification_steps += 1;
             row_tops = target.tops();
 
@@ -504,6 +548,7 @@ async fn main(input: Input) -> Result<Output> {
         ckpt: None,
         margin: input.margin,
         tops: Vec::new(),
+        passes: Vec::new(),
     };
     let Decoded {
         generated,

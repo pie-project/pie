@@ -117,12 +117,15 @@ struct Output {
 
 /// In-graph sample from `logits`: argmax at `temperature <= 0`, otherwise
 /// temperature-scaled TopP Gumbel-max (`keep = pivot_threshold(softmax(l/T),
-/// cummass_le(p)); argmax(select(keep, l/T, -inf) + gumbel(r))`).
+/// cummass_le(p)); argmax(select(keep, l/T, -inf) + gumbel(r))`). `p` rides
+/// in a `[1]` channel, so every top-p of a temperature runs one program; the
+/// temperature is a program constant, as compat's is (a channel-fed divisor
+/// costs the fused sampler ~20% of a decode step).
 fn sample(
     logits: Tensor,
     vocab: u32,
     temperature: f32,
-    top_p: f32,
+    top_p: Channel,
     rng: Option<Channel>,
 ) -> Tensor {
     match rng {
@@ -130,7 +133,7 @@ fn sample(
         Some(rng) => {
             let scaled = logits / temperature;
             let probs = softmax(&scaled);
-            let keep = pivot_threshold(probs, cummass_le(top_p));
+            let keep = pivot_threshold(probs, cummass_le(reshape(top_p.read(), [])));
             let neg_inf = broadcast(f32::NEG_INFINITY, [vocab]);
             let masked = select(&keep, &scaled, &neg_inf);
             let r = rng.take();
@@ -300,7 +303,7 @@ async fn run_one(
     let prefill_rng =
         (input.temperature > 0.0).then(|| Channel::from([rng_seed ^ 0x9e37_79b9, 0u32]));
     let temperature = input.temperature;
-    let top_p = input.top_p;
+    let top_p = Channel::from([input.top_p]);
 
     let ws = WorkingSet::new();
     let n = prompt_vec.len() as u32;

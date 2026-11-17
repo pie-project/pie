@@ -82,22 +82,23 @@ struct Output {
     mean_mass: f32,
 }
 
+/// The sampler's knobs, in `[1]` channels: every request runs one program.
 #[derive(Clone, Copy)]
 struct Cfg {
-    a: f32,
-    temperature: f32,
+    a: Channel,
+    temperature: Channel,
 }
 
 /// The top-a keep-mask. Exact — no candidate bound, no sort.
 ///
 /// Returns `(keep_mask, kept_count, kept_mass)`.
-fn top_a_keep(logits: &Tensor, vocab: u32, a: f32) -> (Tensor, Tensor, Tensor) {
+fn top_a_keep(logits: &Tensor, vocab: u32, a: &Tensor) -> (Tensor, Tensor, Tensor) {
     let max_l = reduce_max(logits);
     let exps = exp(logits - broadcast(&max_l, [vocab]));
     let sum_e = reduce_sum(&exps);
     let probs = &exps / broadcast(&sum_e, [vocab]);
     let p_max = recip(&sum_e);
-    let threshold = a * (&p_max * &p_max);
+    let threshold = a * &(&p_max * &p_max);
     let keep = ge(&probs, broadcast(&threshold, [vocab]));
 
     let zeros = broadcast(0.0f32, [vocab]);
@@ -110,12 +111,8 @@ fn top_a_keep(logits: &Tensor, vocab: u32, a: f32) -> (Tensor, Tensor, Tensor) {
 fn step(logits: Tensor, vocab: u32, cfg: Cfg, rng_state: &Tensor) -> (Tensor, Tensor, Tensor) {
     // Temperature first: `p_max` has to be measured on the distribution being
     // sampled from, or the floor tracks the wrong peak.
-    let scaled = if cfg.temperature == 1.0 {
-        logits
-    } else {
-        &logits / cfg.temperature
-    };
-    let (keep, kept, kept_mass) = top_a_keep(&scaled, vocab, cfg.a);
+    let scaled = &logits / reshape(cfg.temperature.read(), []);
+    let (keep, kept, kept_mass) = top_a_keep(&scaled, vocab, &reshape(cfg.a.read(), []));
     let neg_inf = broadcast(f32::NEG_INFINITY, [vocab]);
     let masked = select(&keep, &scaled, &neg_inf);
     (gumbel_max(masked, rng_state), kept, kept_mass)
@@ -132,8 +129,8 @@ async fn main(input: Input) -> Result<Output> {
     let max_tokens = input.max_tokens;
     let vocab = model::output_vocab_size();
     let cfg = Cfg {
-        a: input.a,
-        temperature: input.temperature,
+        a: Channel::from([input.a]),
+        temperature: Channel::from([input.temperature]),
     };
     let ws = WorkingSet::new();
 
@@ -142,7 +139,7 @@ async fn main(input: Input) -> Result<Output> {
             sampler: "top-a",
             text: String::new(),
             count: 0,
-            a: cfg.a,
+            a: input.a,
             mean_kept: 0.0,
             min_kept: 0,
             mean_mass: 0.0,
@@ -250,7 +247,7 @@ async fn main(input: Input) -> Result<Output> {
         sampler: "top-a",
         text: model::decode(&generated)?,
         count: generated.len(),
-        a: cfg.a,
+        a: input.a,
         mean_kept: mean_s1,
         min_kept: min_s1 as u32,
         mean_mass: mean_s2,

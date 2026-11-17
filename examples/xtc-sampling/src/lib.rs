@@ -119,12 +119,18 @@ struct Output {
 /// works; this is the 32-bit golden-ratio conjugate.
 const GATE_OFFSET: u32 = 0x9e37_79b9;
 
+/// The sampler's knobs, in `[1]` channels: every request runs one program.
 #[derive(Clone, Copy)]
 struct Cfg {
-    threshold: f32,
-    min_p: f32,
-    probability: f32,
-    temperature: f32,
+    threshold: Channel,
+    min_p: Channel,
+    probability: Channel,
+    temperature: Channel,
+}
+
+/// A knob's value as the stage reads it.
+fn knob(channel: Channel) -> Tensor {
+    reshape(channel.read(), [])
 }
 
 /// The XTC keep-mask.
@@ -140,11 +146,11 @@ fn xtc_mask(logits: &Tensor, vocab: u32, cfg: Cfg, rng_state: &Tensor) -> (Tenso
 
     // Stage 1 — min-p floor. Inert when min_p == 0, since every probability is
     // >= 0.
-    let floor = cfg.min_p * &p_max;
+    let floor = knob(cfg.min_p) * &p_max;
     let kept_floor = ge(&probs, broadcast(&floor, [vocab]));
 
     // Stage 2 — XTC, over the tokens that survived the floor.
-    let above = and(&kept_floor, ge(&probs, broadcast(cfg.threshold, [vocab])));
+    let above = and(&kept_floor, ge(&probs, broadcast(knob(cfg.threshold), [vocab])));
 
     // Least likely token that still clears the threshold. Tokens below it are
     // sent to +inf so the reduction ignores them.
@@ -155,7 +161,7 @@ fn xtc_mask(logits: &Tensor, vocab: u32, cfg: Cfg, rng_state: &Tensor) -> (Tenso
     // one-element draw to a scalar.
     let gate_state = rng_state + broadcast(GATE_OFFSET, [2]);
     let u = reduce_min(rng(&gate_state, [1]));
-    let fired = lt(&u, cfg.probability);
+    let fired = lt(&u, knob(cfg.probability));
 
     let drop = and(
         broadcast(&fired, [vocab]),
@@ -168,11 +174,7 @@ fn xtc_mask(logits: &Tensor, vocab: u32, cfg: Cfg, rng_state: &Tensor) -> (Tenso
 
 /// One sampling step: temperature, head removal, Gumbel-max draw.
 fn step(logits: Tensor, vocab: u32, cfg: Cfg, rng_state: &Tensor) -> (Tensor, Tensor, Tensor) {
-    let scaled = if cfg.temperature == 1.0 {
-        logits
-    } else {
-        &logits / cfg.temperature
-    };
+    let scaled = &logits / knob(cfg.temperature);
     let (keep, dropped, fired) = xtc_mask(&scaled, vocab, cfg, rng_state);
     let neg_inf = broadcast(f32::NEG_INFINITY, [vocab]);
     let masked = select(&keep, &scaled, &neg_inf);
@@ -196,10 +198,10 @@ async fn main(input: Input) -> Result<Output> {
     let max_tokens = input.max_tokens;
     let vocab = model::output_vocab_size();
     let cfg = Cfg {
-        threshold: input.threshold,
-        min_p: input.min_p,
-        probability: input.probability,
-        temperature: input.temperature,
+        threshold: Channel::from([input.threshold]),
+        min_p: Channel::from([input.min_p]),
+        probability: Channel::from([input.probability]),
+        temperature: Channel::from([input.temperature]),
     };
     let ws = WorkingSet::new();
 
@@ -208,9 +210,9 @@ async fn main(input: Input) -> Result<Output> {
             sampler: "xtc",
             text: String::new(),
             count: 0,
-            threshold: cfg.threshold,
-            min_p: cfg.min_p,
-            probability: cfg.probability,
+            threshold: input.threshold,
+            min_p: input.min_p,
+            probability: input.probability,
             mean_dropped: 0.0,
             min_dropped: 0,
             fire_rate: 0.0,
@@ -327,9 +329,9 @@ async fn main(input: Input) -> Result<Output> {
         sampler: "xtc",
         text: model::decode(&generated)?,
         count: generated.len(),
-        threshold: cfg.threshold,
-        min_p: cfg.min_p,
-        probability: cfg.probability,
+        threshold: input.threshold,
+        min_p: input.min_p,
+        probability: input.probability,
         mean_dropped: mean_s1,
         min_dropped: min_s1 as u32,
         fire_rate: mean_s2,

@@ -69,7 +69,7 @@ pub struct Sampling {
 }
 
 /// The most alternatives a step reports, as OpenAI caps `top_logprobs`.
-pub const MAX_TOP_LOGPROBS: u32 = 20;
+pub use inferlet::sampler::MAX_TOP_LOGPROBS;
 
 /// A sampled token's log-probability under the model's raw logits, and the
 /// likeliest tokens' with theirs, most likely first.
@@ -147,9 +147,21 @@ impl Sampling {
     }
 
     fn penalized(&self) -> bool {
-        self.presence_penalty != 0.0
-            || self.frequency_penalty != 0.0
-            || self.repetition_penalty != 1.0
+        self.request().penalized()
+    }
+
+    /// The sampler's view of this request.
+    fn request(&self) -> sampler::Request {
+        sampler::Request {
+            temperature: self.temperature,
+            top_p: self.top_p,
+            top_k: self.top_k,
+            min_p: self.min_p,
+            repetition: self.repetition_penalty,
+            frequency: self.frequency_penalty,
+            presence: self.presence_penalty,
+            logprobs: self.logprobs,
+        }
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -180,7 +192,9 @@ impl Sampling {
     }
 }
 
-/// The channels a pass's knobs are seeded in.
+/// The channels a pass's knobs are seeded in: every knob of the request's
+/// kind, so one program serves every request of the kind
+/// ([`sampler::Values`]).
 struct KnobChannels {
     temperature: Option<f32>,
     top_p: Option<Channel>,
@@ -193,22 +207,20 @@ struct KnobChannels {
 }
 
 impl KnobChannels {
+    /// The knobs `s`'s kind carries ([`sampler::Request::values`]), each
+    /// seeded in a `[1]` channel.
     fn new(s: &Sampling) -> Self {
-        let f = |on: bool, v: f32| on.then(|| Channel::from([v]));
-        let sampled = s.temperature > 0.0;
-        let penalized = s.penalized();
+        let values = s.request().values(model::output_vocab_size());
+        let f = |v: Option<f32>| v.map(|v| Channel::from([v]));
         Self {
-            temperature: sampled.then(|| s.temperature.max(1e-4)),
-            top_p: f(sampled && s.top_p < 1.0, s.top_p),
-            top_k: (sampled && s.top_k > 0).then(|| Channel::from([s.top_k])),
-            min_p: f(sampled && s.min_p > 0.0, s.min_p),
-            repetition: f(
-                penalized && s.repetition_penalty != 1.0,
-                s.repetition_penalty,
-            ),
-            frequency: f(penalized && s.frequency_penalty != 0.0, s.frequency_penalty),
-            presence: f(penalized && s.presence_penalty != 0.0, s.presence_penalty),
-            logprobs: s.logprobs,
+            temperature: values.temperature,
+            top_p: f(values.top_p),
+            top_k: values.top_k.map(|k| Channel::from([k])),
+            min_p: f(values.min_p),
+            repetition: f(values.repetition),
+            frequency: f(values.frequency),
+            presence: f(values.presence),
+            logprobs: values.logprobs,
         }
     }
 
@@ -243,31 +255,39 @@ fn slots(
     }
 }
 
-/// The host's read of a step's landed logprobs.
-fn logprob_of(values: &[f32], ids: &[i32]) -> Logprob {
+/// The host's read of a step's landed logprobs: the sampled token's, and
+/// the `top` likeliest of the alternatives landed.
+fn logprob_of(values: &[f32], ids: &[i32], top: u32) -> Logprob {
     Logprob {
         logprob: values.first().copied().unwrap_or(f32::NEG_INFINITY),
         top: ids
             .iter()
             .zip(values.iter().skip(1))
+            .take(top as usize)
             .map(|(&id, &lp)| (id as u32, lp))
             .collect(),
         rank: None,
     }
 }
 
-/// The channels a pass lands its logprobs in, where asked.
+/// The channels a pass lands its logprobs in, where asked: always the most
+/// alternatives a request may ask for, so every logprobs request shares
+/// one program; the host keeps the ones asked ([`take_logprob`]).
 fn logprob_channels(logprobs: Option<u32>, capacity: u32) -> Option<(Channel, Option<Channel>)> {
-    logprobs.map(|top| {
+    logprobs.map(|_| {
         (
-            Channel::new([1 + top], dtype::f32).capacity(capacity),
-            (top > 0).then(|| Channel::new([top], dtype::i32).capacity(capacity)),
+            Channel::new([1 + MAX_TOP_LOGPROBS], dtype::f32).capacity(capacity),
+            Some(Channel::new([MAX_TOP_LOGPROBS], dtype::i32).capacity(capacity)),
         )
     })
 }
 
-/// A step's logprobs off the host side of its channels.
-async fn take_logprob(channels: Option<&(Channel, Option<Channel>)>) -> Result<Option<Logprob>> {
+/// A step's logprobs off the host side of its channels, with the `top`
+/// alternatives asked.
+async fn take_logprob(
+    channels: Option<&(Channel, Option<Channel>)>,
+    top: u32,
+) -> Result<Option<Logprob>> {
     let Some((values, ids)) = channels else {
         return Ok(None);
     };
@@ -276,7 +296,7 @@ async fn take_logprob(channels: Option<&(Channel, Option<Channel>)>) -> Result<O
         Some(ids) => ids.take_host::<Vec<i32>>().await?,
         None => Vec::new(),
     };
-    Ok(Some(logprob_of(&values, &ids)))
+    Ok(Some(logprob_of(&values, &ids, top)))
 }
 
 /// The prompt's own logprobs: rows `0..prompt.len() - 1` prefilled and read
@@ -311,12 +331,11 @@ async fn score_prompt(
         let targets = Channel::from(&prompt[base + 1..end + 1]);
         let chosen_out = Channel::new([len], dtype::f32);
         let rank_out = Channel::new([len], dtype::f32);
-        let top_out = (top > 0).then(|| {
-            (
-                Channel::new([len, top], dtype::f32),
-                Channel::new([len, top], dtype::i32),
-            )
-        });
+        // Every scoring pass lands the most alternatives a request may ask
+        // for, so all share one program; the host keeps the `top` asked.
+        let landed = MAX_TOP_LOGPROBS;
+        let top_values = Channel::new([len, landed], dtype::f32);
+        let top_ids = Channel::new([len, landed], dtype::i32);
 
         let fwd = ForwardPass::new();
         fwd.embed(&toks, &embed_indptr)?;
@@ -329,36 +348,38 @@ async fn score_prompt(
             let likelier = gt(&lp, broadcast(reshape(&chosen, [len, 1]), [len, vocab]));
             rank_out.put(reduce_sum(cast(&likelier, dtype::f32)) + 1.0f32);
             chosen_out.put(&chosen);
-            if let Some((values, ids)) = top_out {
-                let (top_values, top_ids) = top_k(&lp, top);
-                values.put(&top_values);
-                ids.put(cast(&top_ids, dtype::i32));
-            }
+            let (values, ids) = top_k(&lp, landed);
+            top_values.put(&values);
+            top_ids.put(cast(&ids, dtype::i32));
         });
         fwd.checkpoints(ends)?;
         fwd.submit(pipe)
             .with_context(|| format!("prompt scoring submit @{base}"))?;
         let chosen = chosen_out.take_host::<Vec<f32>>().await?;
         let ranks = rank_out.take_host::<Vec<f32>>().await?;
-        let (values, ids) = match top_out {
-            Some((values, ids)) => (
-                values.take_host::<Vec<f32>>().await?,
-                ids.take_host::<Vec<i32>>().await?,
-            ),
-            None => (Vec::new(), Vec::new()),
-        };
-        scored.extend(prompt_rows(&chosen, &ranks, &values, &ids, top as usize));
+        let values = top_values.take_host::<Vec<f32>>().await?;
+        let ids = top_ids.take_host::<Vec<i32>>().await?;
+        scored.extend(prompt_rows(
+            &chosen,
+            &ranks,
+            &values,
+            &ids,
+            landed as usize,
+            top as usize,
+        ));
     }
     Ok(scored)
 }
 
 /// The host's read of a scoring pass: each row's chosen logprob and rank,
-/// and its `top` alternatives off the flat `[rows, top]` values and ids.
+/// and the likeliest `top` of its alternatives off the flat `[rows, landed]`
+/// values and ids.
 fn prompt_rows(
     chosen: &[f32],
     ranks: &[f32],
     values: &[f32],
     ids: &[i32],
+    landed: usize,
     top: usize,
 ) -> Vec<Logprob> {
     chosen
@@ -366,7 +387,7 @@ fn prompt_rows(
         .zip(ranks)
         .enumerate()
         .map(|(row, (&logprob, &rank))| {
-            let span = row * top..(row + 1) * top;
+            let span = row * landed..row * landed + top.min(landed);
             Logprob {
                 logprob,
                 top: ids
@@ -399,6 +420,9 @@ pub async fn generate(
     on_token: &mut dyn FnMut(u32, Option<Logprob>) -> ControlFlow<()>,
 ) -> Result<Generated> {
     sampling.validate()?;
+    // The alternatives a step's logprobs report: every pass lands the most
+    // a request may ask for, and the host keeps these.
+    let asked = sampling.logprobs.unwrap_or(0);
     let images = &prompt.images;
     let ends = &prompt.ends;
     let prompt = &prompt.tokens[..];
@@ -537,7 +561,7 @@ pub async fn generate(
         None => (
             g0_ch.take_host::<i32>().await.context("prefill drain")?,
             None,
-            take_logprob(lp_ch.as_ref()).await?,
+            take_logprob(lp_ch.as_ref(), asked).await?,
         ),
     };
     let mut sampled = 0usize;
@@ -603,7 +627,7 @@ pub async fn generate(
                 fired += 1;
                 let t = out.take_host::<Vec<i32>>().await?;
                 let token = *t.first().unwrap_or(&0) as u32;
-                let lp = take_logprob(lp_ch.as_ref()).await?;
+                let lp = take_logprob(lp_ch.as_ref(), asked).await?;
                 sampled += 1;
                 guide.accept(token).context("advance grammar")?;
                 if on_token(token, lp).is_break() || guide.is_terminated() {
@@ -621,7 +645,7 @@ pub async fn generate(
                    -> std::result::Result<ControlFlow<()>, String> {
                 let t = ch.take_host::<Vec<i32>>().await?;
                 let token = *t.first().unwrap_or(&0) as u32;
-                let lp = take_logprob(lp).await?;
+                let lp = take_logprob(lp, asked).await?;
                 sampled += 1;
                 Ok(on_token(token, lp))
             };
@@ -662,6 +686,7 @@ mod tests {
             &[-0.5, -1.0, -0.1, -0.3],
             &[4, 9, 2, 3],
             2,
+            2,
         );
         assert_eq!(
             rows,
@@ -682,9 +707,31 @@ mod tests {
 
     #[test]
     fn a_row_scored_with_no_alternatives_has_none() {
-        let rows = prompt_rows(&[-1.0], &[3.0], &[], &[], 0);
+        let rows = prompt_rows(&[-1.0], &[3.0], &[-0.2, -0.4], &[5, 6], 2, 0);
         assert_eq!(rows[0].top, Vec::new());
         assert_eq!(rows[0].rank, Some(3));
+    }
+
+    #[test]
+    fn a_row_keeps_the_likeliest_alternatives_asked_of_those_landed() {
+        let rows = prompt_rows(
+            &[-0.5, -2.0],
+            &[1.0, 7.0],
+            &[-0.5, -1.0, -1.5, -0.1, -0.3, -0.9],
+            &[4, 9, 8, 2, 3, 1],
+            3,
+            1,
+        );
+        assert_eq!(rows[0].top, vec![(4, -0.5)]);
+        assert_eq!(rows[1].top, vec![(2, -0.1)]);
+    }
+
+    #[test]
+    fn a_step_keeps_the_likeliest_alternatives_asked_of_those_landed() {
+        let lp = logprob_of(&[-0.7, -0.5, -1.0, -2.0], &[4, 9, 1], 2);
+        assert_eq!(lp.logprob, -0.7);
+        assert_eq!(lp.top, vec![(4, -0.5), (9, -1.0)]);
+        assert!(logprob_of(&[-0.7, -0.5], &[4], 0).top.is_empty());
     }
 
     #[test]
