@@ -98,6 +98,12 @@ pub enum Error {
     /// Every runtime of a process must be created on the thread that created
     /// its first one: the SDK's message system asserts on that and would abort.
     MainThread,
+    /// The SDK's `bin` directory cannot join `PATH` (a path holding the
+    /// separator): its helpers would not be found.
+    PathJoin(PathBuf, String),
+    /// The threads this process may run are not known (the simulator runs
+    /// on them).
+    Threads(String),
 }
 
 impl fmt::Display for Error {
@@ -122,6 +128,12 @@ impl fmt::Display for Error {
             Error::MainThread => write!(
                 f,
                 "the SDK runtime must be created on the process's main thread"
+            ),
+            Error::Threads(e) => write!(f, "the threads this process may run: {e}"),
+            Error::PathJoin(dir, e) => write!(
+                f,
+                "the SDK's helpers in {} cannot join PATH: {e}",
+                dir.display()
             ),
         }
     }
@@ -168,7 +180,7 @@ impl Sdk {
         let artifacts = load("libsdk_compile_artifacts.so")?;
         let runtime = load("libsdkruntime.so")?;
         let api = sys::Api::resolve(&artifacts, &platform, &runtime)?;
-        prepend_path(&lib_dir.join("../bin"));
+        prepend_path(&lib_dir.join("../bin"))?;
         Ok(Arc::new(Sdk {
             api,
             _runtime: runtime,
@@ -187,14 +199,20 @@ fn owning_thread() -> bool {
     *OWNER.get_or_init(|| std::thread::current().id()) == std::thread::current().id()
 }
 
-fn prepend_path(dir: &Path) {
+fn prepend_path(dir: &Path) -> Result<()> {
     let current = std::env::var_os("PATH").unwrap_or_default();
+    let joined = prepended(dir, &current)?;
+    // SAFETY: called once at open time, before the SDK spawns any helper.
+    unsafe { std::env::set_var("PATH", joined) };
+    Ok(())
+}
+
+/// `dir` ahead of the search path `current`, refused by name where it cannot
+/// join one.
+fn prepended(dir: &Path, current: &std::ffi::OsStr) -> Result<std::ffi::OsString> {
     let mut parts = vec![dir.to_path_buf()];
-    parts.extend(std::env::split_paths(&current));
-    if let Ok(joined) = std::env::join_paths(parts) {
-        // SAFETY: called once at open time, before the SDK spawns any helper.
-        unsafe { std::env::set_var("PATH", joined) };
-    }
+    parts.extend(std::env::split_paths(current));
+    std::env::join_paths(parts).map_err(|e| Error::PathJoin(dir.to_path_buf(), e.to_string()))
 }
 
 /// Which wafer generation the program was compiled for.
@@ -214,13 +232,16 @@ pub struct Simulator {
 }
 
 impl Simulator {
-    pub fn new(target: Target) -> Self {
-        Simulator {
+    /// The simulator for `target` on every thread this process may run.
+    pub fn new(target: Target) -> Result<Self> {
+        let threads =
+            std::thread::available_parallelism().map_err(|e| Error::Threads(e.to_string()))?;
+        Ok(Simulator {
             target,
-            num_threads: 16,
+            num_threads: u32::try_from(threads.get()).unwrap_or(u32::MAX),
             suppress_trace: true,
             dump_core: false,
-        }
+        })
     }
 }
 
@@ -812,4 +833,30 @@ pub fn f32_words(v: &[f32]) -> Vec<u32> {
 /// Reinterprets copied-back words as `f32`.
 pub fn words_f32(v: &[u32]) -> Vec<f32> {
     v.iter().map(|x| f32::from_bits(*x)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::{Error, Simulator, Target, prepended};
+
+    /// The SDK's `bin` goes ahead of the search path; a directory holding
+    /// the separator cannot join it and is refused by name, not skipped.
+    #[test]
+    fn a_bin_that_cannot_join_path_is_refused() {
+        let joined = prepended(Path::new("/sdk/bin"), "/usr/bin:/bin".as_ref())
+            .expect("a plain directory joins");
+        assert_eq!(joined, "/sdk/bin:/usr/bin:/bin");
+        let refused = prepended(Path::new("/sdk:x/bin"), "/usr/bin".as_ref());
+        assert!(matches!(refused, Err(Error::PathJoin(..))), "{refused:?}");
+    }
+
+    /// The simulator runs on every thread the process may run.
+    #[test]
+    fn the_simulator_runs_on_the_available_threads() {
+        let sim = Simulator::new(Target::Wse3).expect("the threads are known here");
+        let threads = std::thread::available_parallelism().expect("known");
+        assert_eq!(sim.num_threads as usize, threads.get());
+    }
 }

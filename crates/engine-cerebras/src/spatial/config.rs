@@ -23,8 +23,6 @@ pub struct Config {
     pub target: Target,
     /// The CS system's `host:port`; none runs the fabric simulator.
     pub cmaddr: Option<String>,
-    /// Simulator threads.
-    pub num_threads: u32,
     /// Where compiled programs and cut tiles are kept (the worker's engine cache).
     pub cache_dir: Option<PathBuf>,
     /// The most steps a greedy lane's token loop runs past its row (0: off; loops start at 8
@@ -34,8 +32,6 @@ pub struct Config {
     /// epilogue ran. None / false: each frame runs whole inside its submit.
     #[serde(rename = "async")]
     pub asynchronous: Option<bool>,
-    /// The most steps a posted token loop runs past its row (default: the program's plan's).
-    pub posted_loop: Option<usize>,
     pub wafer: Wafer,
     pub toolchain: Toolchain,
     /// Bench and experiment settings; a load with any logs them.
@@ -47,11 +43,9 @@ impl Default for Config {
         Config {
             target: Target::Wse3,
             cmaddr: None,
-            num_threads: 16,
             cache_dir: None,
             lookahead: None,
             asynchronous: None,
-            posted_loop: None,
             wafer: Wafer::default(),
             toolchain: Toolchain::default(),
             debug: None,
@@ -104,12 +98,6 @@ pub struct Debug {
     pub set: String,
     /// Kernel levers past the preset's (`K:V,...`).
     pub levers: String,
-    /// Feed the prompt through the token loop (the program must be built for it).
-    pub force_prompt: bool,
-    /// `false`: one greedy loop at a time instead of posted back to back.
-    pub posted: Option<bool>,
-    /// `false`: a loop runs the lookahead alone, not bounded by the lane's pages.
-    pub loop_room: Option<bool>,
 }
 
 impl Config {
@@ -204,6 +192,18 @@ mod tests {
         assert!(of("[cerebras]\nprogram = \"p\"\n").is_err());
         assert!(of("[cerebras.wafer]\nbuild = \"sometimes\"\n").is_err());
         assert!(of("[cerebras.debug]\nposted_loop = 4\n").is_err());
+        // No serving switch: a token loop is posted, bounded by the lane's
+        // pages and as long as the program's plan states; the simulator
+        // runs on every thread.
+        for gone in [
+            "[cerebras]\nposted_loop = 4\n",
+            "[cerebras]\nnum_threads = 16\n",
+            "[cerebras.debug]\nforce_prompt = true\n",
+            "[cerebras.debug]\nposted = false\n",
+            "[cerebras.debug]\nloop_room = false\n",
+        ] {
+            assert!(of(gone).is_err(), "{gone}");
+        }
         assert!(of("[cerebras]\nlookahead = \"8\"\n").is_err());
     }
 }
