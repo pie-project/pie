@@ -298,52 +298,6 @@ impl FireEstimate {
         }
     }
 
-    /// The fire top: of the rungs of `lattice` a prompt can hold (no wider
-    /// than `context`; `context` itself where none is), the one whose prompt
-    /// runs the most tokens a ns by this estimate (the narrowest of a tie).
-    /// The estimate's argmax over the whole lattice, bounded by the context
-    /// alone: no rule over the matmul curve stops it short, so a knee past a
-    /// flat stretch is reached. A top rung is the argmax of efficiency times
-    /// live capacity; past this rung efficiency only falls and live capacity
-    /// only falls as rows grow, so none past it can win, and a load offers
-    /// the rungs to it.
-    #[must_use]
-    pub fn fire_top(&self, lattice: &[u32], context: u32) -> u32 {
-        let held: Vec<u32> = lattice.iter().copied().filter(|&m| m <= context).collect();
-        if held.is_empty() {
-            return context.max(1);
-        }
-        self.top(&held)
-    }
-
-    /// The rung of `lattice` whose prompt runs the most tokens a ns (the
-    /// narrowest of a tie): [`FireEstimate::fire_top`] over a lattice the
-    /// caller has bounded.
-    #[must_use]
-    pub fn top(&self, lattice: &[u32]) -> u32 {
-        let rate = |tokens: u32| {
-            let prompt = RungFacts {
-                tokens,
-                lanes: 1,
-                keys: tokens,
-                launches: 0,
-                padded_rows: tokens,
-                span_bytes: 0,
-                infeasible: None,
-                fire_lanes: 1,
-            };
-            f64::from(tokens) / self.ns(&prompt).max(f64::MIN_POSITIVE)
-        };
-        let mut best: Option<(u32, f64)> = None;
-        for &tokens in lattice {
-            let r = rate(tokens);
-            if best.is_none_or(|(_, b)| r > b) {
-                best = Some((tokens, r));
-            }
-        }
-        best.map_or(1, |(tokens, _)| tokens)
-    }
-
     /// The estimated time of a fire at `rung`.
     #[must_use]
     pub fn ns(&self, rung: &RungFacts) -> f64 {
@@ -527,6 +481,29 @@ pub fn top_rung(
 ) -> Result<TopRung, NoRung> {
     let times: Vec<f64> = rungs.iter().map(|r| estimate.ns(r)).collect();
     pick(rungs, &times, live_capacity_bytes)
+}
+
+/// The fire top: the ruling's top rung ([`top_rung`]) over the rungs a
+/// prompt can hold (no wider than `context`) of every rung the engine's
+/// lattice offers, each weighed as its check fire shapes it
+/// ([`RungFacts::check_fire`]: decode-shaped no wider than its lanes,
+/// prefill-shaped past them), by efficiency times live capacity. One
+/// function with the check of the estimate's pick (`super::check`), so a
+/// load's bound and the check cannot disagree: a load offers its rungs to
+/// it, and none past it can win. The context and memory (a rung
+/// infeasible) are its only bounds.
+pub fn fire_top(
+    rungs: &[RungFacts],
+    live_capacity_bytes: u64,
+    estimate: &FireEstimate,
+    context: u32,
+) -> Result<TopRung, NoRung> {
+    let held: Vec<RungFacts> = rungs
+        .iter()
+        .filter(|r| r.tokens <= context)
+        .copied()
+        .collect();
+    top_rung(&held, live_capacity_bytes, estimate)
 }
 
 /// The ruling's argmax over `rungs` whose fires take `times` (ns, one a
@@ -774,40 +751,14 @@ mod tests {
         assert_eq!(top.tokens, 64);
     }
 
-    #[test]
-    fn the_top_is_the_rung_whose_prompt_runs_fastest() {
-        // 1000 ns fixed, 1 ns a token, and attention growing with the
-        // square of the prompt: tokens a ns rise, then fall.
-        let (e, _) = summed(1000, 1.0);
-        let e = FireEstimate {
-            attn_flops_per_row_key: 1e-4,
-            attn_dispatches: 1,
-            attn_head_dim: 1,
-            ..e
-        };
-        let lattice: Vec<u32> = (0..=15).map(|i| 1u32 << i).chain([3000, 6000]).collect();
-        let mut lattice = lattice;
-        lattice.sort_unstable();
-        let rate = |t: u32| {
-            let f = f64::from(t);
-            f / (1000.0 + f + f * f * 1e-4 / 0.5)
-        };
-        let want = *lattice
-            .iter()
-            .max_by(|&&a, &&b| rate(a).total_cmp(&rate(b)))
-            .unwrap();
-        assert_eq!(e.top(&lattice), want);
-        assert!(want > 1024 && want < 32768, "{want}");
-    }
-
     /// The M1's 1024-wide matmul curve: nearly flat from 256 to 512 rows,
     /// then a knee at 1024 (2.3 / 2.35 / 5.0 TFLOP/s). A rule that stops
     /// where a doubling stops paying stops at 256; the fire top is the
-    /// estimate's argmax over the lattice, so it lies past the knee, bounded
+    /// ruling's argmax over the lattice, so it lies past the knee, bounded
     /// by what a prompt holds alone.
     #[test]
     fn the_fire_top_reaches_past_a_knee_after_a_flat_stretch() {
-        let (e, _) = summed(0, 1.0);
+        let (e, at) = summed(0, 1.0);
         let e = FireEstimate {
             rates: crate::roofline::Constants {
                 gemm_by_rows: vec![(
@@ -820,12 +771,47 @@ mod tests {
             gemm_shapes: vec![GemmShape::dense(1024, 1024, 2 * 1024 * 1024, 1 << 21)],
             ..e
         };
-        let lattice = [256, 512, 1024, 2048];
-        assert_eq!(e.fire_top(&lattice, 4096), 2048);
+        let rungs = [at(256, 0), at(512, 0), at(1024, 0), at(2048, 0)];
+        let top = |context| fire_top(&rungs, 1 << 30, &e, context).unwrap().tokens;
+        assert_eq!(top(4096), 2048);
         // A context of 1024 holds no prompt of 2048: the knee itself.
-        assert_eq!(e.fire_top(&lattice, 1024), 1024);
-        // A context short of every rung: the context.
-        assert_eq!(e.fire_top(&lattice, 100), 100);
+        assert_eq!(top(1024), 1024);
+    }
+
+    /// A rung no wider than its lanes is weighed decode-shaped (a lane a
+    /// token, each attending one key), as the check fires it. Weighed as one
+    /// prompt each, attention growing with its square, 512 would run more
+    /// tokens a ns than 1024; decode-shaped, 1024 does. The fire top is the
+    /// check's pick by the estimate, so it is 1024.
+    #[test]
+    fn the_fire_top_is_the_checks_pick_as_its_fires_are_shaped() {
+        // The weights read in 1000 ns, a token's matmul 1 ns, no readout.
+        let e = estimate(1000, 1.0);
+        let e = FireEstimate {
+            attn_flops_per_row_key: 1e-3,
+            attn_dispatches: 1,
+            attn_head_dim: 1,
+            ..e
+        };
+        let decode = |tokens| RungFacts {
+            lanes: 1024,
+            fire_lanes: 1024,
+            ..rung(tokens, 0)
+        };
+        let prompt = |tokens| RungFacts {
+            lanes: 1,
+            ..rung(tokens, 0)
+        };
+        let live = 1 << 30;
+        // As prompts the two rank the other way.
+        let prompts = [prompt(512), prompt(1024)];
+        assert_eq!(top_rung(&prompts, live, &e).unwrap().tokens, 512);
+        let rungs = [decode(512), decode(1024)];
+        assert!(rungs.iter().all(RungFacts::decode_shaped));
+        let times: Vec<f64> = rungs.iter().map(|r| e.ns(r)).collect();
+        let pick = pick(&rungs, &times, live).unwrap();
+        let top = fire_top(&rungs, live, &e, 4096).unwrap();
+        assert_eq!((top.tokens, pick.tokens), (1024, 1024));
     }
 
     #[test]

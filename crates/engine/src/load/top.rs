@@ -465,19 +465,21 @@ impl fmt::Display for Refused {
 
 impl std::error::Error for Refused {}
 
-/// The top rung of `rungs` for `device`, whose profile states `rates`, over
-/// a live range of `live` bytes, by the estimate from the rates alone (its
-/// matmuls padding nothing: [`choose_tiled`] states the backend's tile). A
-/// device whose profile states no rates has nothing to weigh the rungs by,
-/// and the load is refused, naming it.
+/// The fire top ([`super::fire_top`]) of `rungs` (every rung the engine's
+/// lattice offers) a prompt of `context` holds, for `device`, whose profile
+/// states `rates`, over a live range of `live` bytes, by the estimate from
+/// the rates alone (its matmuls padding nothing: [`choose_tiled`] states the
+/// backend's tile). A device whose profile states no rates has nothing to
+/// weigh the rungs by, and the load is refused, naming it.
 pub fn choose(
     rungs: &[RungFacts],
     live: u64,
+    context: u32,
     rates: &profile::fire::Rates,
     device: &str,
     counts: &Counts,
 ) -> Result<(TopRung, FireEstimate), Refused> {
-    choose_tiled(rungs, live, rates, None, device, counts)
+    choose_tiled(rungs, live, context, rates, None, device, counts)
 }
 
 /// [`choose`] with the backend's matmul tile rows (`row_tile`), each
@@ -485,6 +487,7 @@ pub fn choose(
 pub fn choose_tiled(
     rungs: &[RungFacts],
     live: u64,
+    context: u32,
     rates: &profile::fire::Rates,
     row_tile: Option<crate::roofline::RowTile>,
     device: &str,
@@ -497,7 +500,7 @@ pub fn choose_tiled(
     if let Some(tile) = row_tile {
         estimate.rates = estimate.rates.with_row_tile(tile);
     }
-    let top = super::rung::top_rung(rungs, live, &estimate).map_err(Refused::NoRung)?;
+    let top = super::rung::fire_top(rungs, live, &estimate, context).map_err(Refused::NoRung)?;
     Ok((top, estimate))
 }
 
@@ -633,7 +636,7 @@ mod tests {
     fn without_rates_the_load_is_refused_by_name() {
         let rungs = [rung(1024, 100 * MIB, None), rung(2048, 150 * MIB, None)];
         let bare = profile::fire::Rates::default();
-        let err = choose(&rungs, 1 << 33, &bare, "Card X", &counts()).unwrap_err();
+        let err = choose(&rungs, 1 << 33, u32::MAX, &bare, "Card X", &counts()).unwrap_err();
         assert!(
             err.to_string()
                 .contains("device Card X has no rates in its profile"),
@@ -646,7 +649,7 @@ mod tests {
         );
         // No feasible rung at all: the ruling's refusal.
         let none = [rung(1024, 300 * MIB, Some("past one binding"))];
-        let err = choose(&none, 1 << 33, &rates(), "Card X", &counts()).unwrap_err();
+        let err = choose(&none, 1 << 33, u32::MAX, &rates(), "Card X", &counts()).unwrap_err();
         assert!(matches!(err, Refused::NoRung(_)), "{err}");
         assert!(
             err.to_string()
@@ -749,7 +752,7 @@ mod tests {
             attn_tflops_by_keys: None,
             ..rates()
         };
-        let err = choose(&rungs, 1 << 33, &rates, "Card X", &counts()).unwrap_err();
+        let err = choose(&rungs, 1 << 33, u32::MAX, &rates, "Card X", &counts()).unwrap_err();
         assert_eq!(
             err.to_string(),
             "device Card X has no rates in its profile for this model: `[rates] \

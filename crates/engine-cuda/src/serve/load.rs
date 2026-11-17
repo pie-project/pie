@@ -84,24 +84,16 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     .map_err(Fault::Card)?;
     device.set_tuning(kernels_cuda::tuning::Tuning::of(&chip));
     let engine = crate::chip::Engine::of(&chip);
-    // The model's fire top on this card (`crate::api::fire_top_of`): past it
-    // no rung's efficiency improves, so none past it can be chosen. A load
-    // asked nothing fires up to it, and the estimate picks below.
-    let fire_top = crate::api::fire_top_of(&chip, &boot.trace, boot.context, device.name())?;
-    // A load that keeps every rung (a check of the estimate) lays them past
-    // the top (`engine::load::check::laid_top`), so a top set too low shows
-    // in the check, or to the rows its fires take.
-    let laid_top = match boot.knobs.every_rung {
-        None => fire_top,
-        Some(super::EveryRung::PastTop) => {
-            let mut lattice = crate::api::rung_lattice(&engine, u32::MAX);
-            lattice.pop();
-            engine::load::check::laid_top(&lattice, fire_top)
-        }
+    // Every rung of the lattice a prompt of the load's context holds is a
+    // candidate: the fire top (`engine::load::fire_top`) is chosen among
+    // them below, the context and memory its only bounds. A check's load
+    // sized for one kind of its fires lays the rungs to their rows.
+    let lattice_top = match boot.knobs.every_rung {
         Some(super::EveryRung::To(rows)) => rows,
+        _ => boot.context.max(1),
     };
     if boot.budget.max_tokens == 0 {
-        boot.budget.max_tokens = laid_top;
+        boot.budget.max_tokens = lattice_top;
         // only where it at least halves the fire: a trunk of few value heads seats enough lanes that the
         // wide fire feeds its experts better (Qwen3.6-35B-A3B pf64 lost 4% at 5120 rows of 8192)
         if let Some(fit) = walk_fire_fit(&boot.trace, engine.walk_fire_rows, device.device().num_sm)
@@ -157,7 +149,8 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // at: asked other tokens (the walk fit, `engine.fire_rows`, a stated
     // `max_forward_tokens`), its top is the rung at or below them.
     if stated_buckets.is_empty() {
-        boot.budget.max_tokens = crate::api::on_lattice(&engine, laid_top, boot.budget.max_tokens);
+        boot.budget.max_tokens =
+            crate::api::on_lattice(&engine, lattice_top, boot.budget.max_tokens);
     }
     boot.budget.buckets = crate::api::lattice(
         stated_buckets.clone(),
@@ -357,10 +350,10 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     let working = |tokens: u32, voxels: &Option<poem_compiler::VoxelLadder>| -> u64 {
         laid(tokens, voxels).map_or(u64::MAX, |(bytes, _)| bytes)
     };
-    // The top rung, the ruling's (`crate::top`): of the buckets of the asked
-    // lattice, each spanning its fire's working set and needing one
-    // sequence and the bodies' floor beside it, over the room the card has
-    // after the weight tier: every bucket up to the card's fire top.
+    // The fire top, the ruling's (`crate::top`, `engine::load::fire_top`):
+    // of every bucket of the asked lattice (to the context), each spanning
+    // its fire's working set and needing one sequence and the bodies' floor
+    // beside it, over the room the card has after the weight tier.
     let weighed;
     let tokens = {
         let paging = Paging::of(boot.page_size, boot.context, boot.slots, 1)?;
@@ -394,6 +387,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         let top = crate::top::choose(
             &rungs,
             after_weights,
+            boot.context,
             &chip.rates(),
             None,
             device.name(),
@@ -415,12 +409,18 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
                 rungs: rungs.clone(),
                 estimate,
                 live: after_weights,
-                fire_top,
+                fire_top: top.tokens,
             });
-        if boot.knobs.every_rung.is_some() {
-            crate::top::widest(&rungs).unwrap_or(top.tokens)
-        } else {
-            top.tokens
+        let widest = crate::top::widest(&rungs).unwrap_or(top.tokens);
+        match boot.knobs.every_rung {
+            None => top.tokens,
+            // Past the top (`engine::load::check::laid_top`), so a top set
+            // too low shows in the check.
+            Some(super::EveryRung::PastTop) => {
+                let lattice: Vec<u32> = rungs.iter().map(|r| r.tokens).collect();
+                engine::load::check::laid_top(&lattice, top.tokens).min(widest)
+            }
+            Some(super::EveryRung::To(_)) => widest,
         }
     };
     // The derived voxel rung's room is still the configured share of the

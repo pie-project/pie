@@ -418,8 +418,8 @@ pub(crate) fn lattice(
 pub(crate) const DEFAULT_FORWARD_TOKENS: u32 = 8192;
 
 /// The rung lattice under `engine` up to `top`: [`default_lattice`]'s
-/// points below it and `top` itself. With `top` the card's fire top
-/// ([`fire_top_of`]), the candidates a load with no stated buckets weighs.
+/// points below it and `top` itself. With `top` the load's context, the
+/// candidates a load with no stated buckets weighs its fire top among.
 #[must_use]
 pub(crate) fn rung_lattice(engine: &crate::chip::Engine, top: u32) -> Vec<u32> {
     default_lattice(
@@ -443,34 +443,6 @@ pub(crate) fn on_lattice(engine: &crate::chip::Engine, top: u32, tokens: u32) ->
         .copied()
         .find(|&rung| rung <= tokens)
         .unwrap_or(lattice[0])
-}
-
-/// The fire top of `trace` on this card
-/// (`engine::load::FireEstimate::fire_top`): the estimate's argmax over its
-/// rung lattice to `context`, the most tokens one prompt holds, by the
-/// profile's measured rates. No rung is priced at rows no fire can carry
-/// (asked of cuBLASLt's heuristic at 2^30 rows, it divides by zero). A
-/// profile without the rates the model needs has no top, and a load on it
-/// is refused for them, by name.
-pub(crate) fn fire_top_of(
-    chip: &profile::Profile,
-    trace: &Trace,
-    context: u32,
-    device: &str,
-) -> crate::error::Result<u32> {
-    let counts = crate::top::counts(trace)?;
-    let estimate = engine::load::estimate(&counts, &chip.rates()).map_err(|key| {
-        Fault::Card(
-            engine::load::Refused::NoRates {
-                device: device.to_owned(),
-                key,
-            }
-            .to_string(),
-        )
-    })?;
-    let context = context.max(1);
-    let lattice = rung_lattice(&crate::chip::Engine::of(chip), context);
-    Ok(estimate.fire_top(&lattice, context))
 }
 
 /// The load's budgets for `trace`: its logit readouts sized to what the

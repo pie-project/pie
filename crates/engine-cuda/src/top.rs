@@ -115,18 +115,20 @@ pub fn widest(rungs: &[RungFacts]) -> Option<u32> {
         .max()
 }
 
-/// The top rung of `rungs` on `device`, whose profile states `rates`, over
-/// a live range of `live` bytes, each matmul padded to `row_tile`
-/// ([`engine::load::choose_tiled`]).
+/// The fire top of `rungs` (every rung of the lattice a load offers) a
+/// prompt of `context` holds, on `device`, whose profile states `rates`,
+/// over a live range of `live` bytes, each matmul padded to `row_tile`
+/// ([`engine::load::choose_tiled`], [`engine::load::fire_top`]).
 pub fn choose(
     rungs: &[RungFacts],
     live: u64,
+    context: u32,
     rates: &profile::fire::Rates,
     row_tile: Option<engine::roofline::RowTile>,
     device: &str,
     counts: &Counts,
 ) -> Result<TopRung> {
-    engine::load::choose_tiled(rungs, live, rates, row_tile, device, counts)
+    engine::load::choose_tiled(rungs, live, context, rates, row_tile, device, counts)
         .map(|(top, _)| top)
         .map_err(|refused| Fault::Card(refused.to_string()))
 }
@@ -194,6 +196,7 @@ mod tests {
         let err = choose(
             &rungs,
             8 << 30,
+            u32::MAX,
             &profile::fire::Rates::default(),
             None,
             "NVIDIA L40S",
@@ -233,7 +236,16 @@ mod tests {
             Some("its plan does not compile at this budget: the arena does not fit")
         );
         assert_eq!(rungs[4].span_bytes, 0);
-        let top = choose(&rungs, live, &l40s(), None, "NVIDIA L40S", &counts()).unwrap();
+        let top = choose(
+            &rungs,
+            live,
+            u32::MAX,
+            &l40s(),
+            None,
+            "NVIDIA L40S",
+            &counts(),
+        )
+        .unwrap();
         let estimate = engine::load::estimate(&counts(), &l40s()).unwrap();
         assert_eq!(
             top,
@@ -247,7 +259,16 @@ mod tests {
                 .0
         );
         // Every rung refused: the ruling's refusal, each rung named.
-        let err = choose(&rungs[3..], live, &l40s(), None, "NVIDIA L40S", &counts()).unwrap_err();
+        let err = choose(
+            &rungs[3..],
+            live,
+            u32::MAX,
+            &l40s(),
+            None,
+            "NVIDIA L40S",
+            &counts(),
+        )
+        .unwrap_err();
         assert!(
             err.to_string()
                 .contains(&format!("8192 tokens (span 2400 MiB): {NO_ROOM}")),

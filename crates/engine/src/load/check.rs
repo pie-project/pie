@@ -1,10 +1,10 @@
 //! The check of the estimate (`pie tune --check-estimate`), one for every
 //! engine: a fire of each rung width a load lays is timed as serving runs it
 //! (its recorded body replayed), beside the estimate the load weighs its top
-//! by ([`super::FireEstimate`]); the estimate's pick among the rungs a load
-//! lays (to its fire top) is held within [`CHECK_BOUND`] of the measured
-//! best among every rung timed (to [`PAST_TOP`] times the fire top, so a top
-//! set too low shows). The narrowest and widest rungs, both picks and any
+//! by ([`super::FireEstimate`]); the estimate's pick (the load's fire top,
+//! [`super::fire_top`]) is held within [`CHECK_BOUND`] of the measured best
+//! among every rung timed (to [`PAST_TOP`] times the fire top, so a top set
+//! too low shows). The narrowest and widest rungs, both picks and any
 //! width asked are dissected: replayed and walked node by node on fresh
 //! loads, each node's device time rolled up by the kind of work it is.
 //!
@@ -62,7 +62,8 @@ pub struct Weighed {
     pub estimate: FireEstimate,
     /// The live range kv and activation share at load.
     pub live: u64,
-    /// The model's fire top: the widest rung a load that is no check lays.
+    /// The model's fire top ([`super::fire_top`]): the widest rung a load
+    /// that is no check lays, the estimate's pick over its lattice.
     pub fire_top: u32,
     /// The widest rung the load laid.
     pub laid: u32,
@@ -300,9 +301,9 @@ pub fn check(
     let est: Vec<f64> = rungs.iter().map(|r| e.ns(r)).collect();
     // Both picks are the ruling's over every rung timed: the estimate's
     // argmax (efficiency times live capacity) against the measured times'.
-    // No cap stands between them: the load's fire top is the estimate's own
-    // argmax over the lattice to its context, so it offers the estimate's
-    // pick, and a top set too low shows as a measured best past it.
+    // No cap stands between them: the load's fire top is this pick, one
+    // function (`super::fire_top`), and a top set too low shows as a
+    // measured best past it.
     let by_est = super::pick(&rungs, &est, weighed.live).map_err(|e| e.to_string())?;
     let by_meas = super::pick(&rungs, &meas, weighed.live).map_err(|e| e.to_string())?;
     let scores = super::scored(&rungs, &meas, weighed.live);
