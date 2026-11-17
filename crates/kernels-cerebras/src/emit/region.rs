@@ -1102,9 +1102,14 @@ impl Printer<'_> {
         let (lv, bits) = (self.place.rope_lv, self.place.rope_bits);
         let rb = 1usize << bits;
         // rot[base + ((lv rb + d) 2) ns + j]: cos, then sin at + ns (ops/rope.csl)
+        // (BITS 0: the angles computed at the root, the table its frequencies alone: a decode
+        // step's position is any below its cache's, past what tables of digits hold)
         let rot: Vec<Vec<f32>> = freqs
             .iter()
             .map(|fs| {
+                if bits == 0 {
+                    return fs.clone();
+                }
                 let mut t = vec![0f32; lv as usize * rb * 2 * ns];
                 for l in 0..lv as usize {
                     for d in 0..rb {
@@ -1240,9 +1245,17 @@ impl Printer<'_> {
                 "var rc = @zeros([{0}]f32);\nvar rs = @zeros([{0}]f32);\n\
                  const RC = @get_dsd(mem1d_dsd, .{{ .tensor_access = |i|{{{0}}} -> rc[i] }});\n\
                  const RS = @get_dsd(mem1d_dsd, .{{ .tensor_access = |i|{{{0}}} -> rs[i] }});\n\
-                 const rp = @import_module(\"ops/srope.csl\", .{{ .rot = &T_rot_a, .rc = &rc, .rs = &rs, .NROT = {0}, .LV = {1}, .BITS = {2} }});\n\
+                 const rp = @import_module(\"ops/srope.csl\", .{{ .rot = &T_rot_a, .rc = &rc, .rs = &rs, .NROT = {0}, .LV = {1}, .BITS = {2}{4} }});\n\
                  // (sources: {3:?})",
-                r.slots, self.place.rope_lv, self.place.rope_bits, r.sources
+                r.slots,
+                self.place.rope_lv,
+                self.place.rope_bits,
+                r.sources,
+                if self.place.rope_bits == 0 {
+                    ", .DIRECT = true"
+                } else {
+                    ""
+                }
             );
             if !self.tables.iter().any(|t| t.name == "slot") {
                 let _ = writeln!(s, "var T_slot_a = @zeros([1]u16);");

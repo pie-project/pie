@@ -779,9 +779,8 @@ pub fn program_at(
                     }
                 })
                 .collect();
-            // positions below a class's rows: digits of 3 bits
-            let top = class_rows.iter().map(|c| c.0).max().unwrap_or(1).max(2) - 1;
-            let lv = (32 - top.leading_zeros()).div_ceil(3);
+            // positions below a class's rows (a decode step's: below its cache's positions)
+            let (lv, bits) = rope_digits(&class_rows, shape.cache);
             let printed = region::print(
                 &chain.region,
                 &Place {
@@ -795,7 +794,7 @@ pub fn program_at(
                     params: params.clone(),
                     round16,
                     rope_lv: lv.max(1),
-                    rope_bits: 3,
+                    rope_bits: bits,
                     straddle: false,
                     columns: None,
                 },
@@ -842,8 +841,7 @@ pub fn program_at(
                 if d > 1
                     && let Step::Region { chain, .. } = &u.steps[i]
                 {
-                    let top = class_rows.iter().map(|c| c.0).max().unwrap_or(1).max(2) - 1;
-                    let lv = (32 - top.leading_zeros()).div_ceil(3);
+                    let (lv, bits) = rope_digits(&class_rows, shape.cache);
                     let pr = region::print(
                         &chain.region,
                         &Place {
@@ -852,7 +850,7 @@ pub fn program_at(
                             params: ps,
                             round16,
                             rope_lv: lv.max(1),
-                            rope_bits: 3,
+                            rope_bits: bits,
                             straddle: false,
                             columns: None,
                         },
@@ -1067,6 +1065,18 @@ pub fn program_at(
         lane_at,
         round16,
     })
+}
+
+/// A rotation table's digits (levels, bits a level) for the positions it serves: a class's
+/// rows in digits of 3 bits; a decode step's (a row at any position below its cache's) none,
+/// its angles computed at the root from the frequencies alone (`srope`'s DIRECT, BITS 0).
+fn rope_digits(class_rows: &[(u32, u32)], cache: Option<u32>) -> (u32, u32) {
+    if cache.is_some() {
+        return (1, 0);
+    }
+    let rows = class_rows.iter().map(|c| c.0).max().unwrap_or(1);
+    let top = rows.max(2) - 1;
+    ((32 - top.leading_zeros()).div_ceil(3).max(1), 3)
 }
 
 #[cfg(test)]

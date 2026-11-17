@@ -9,14 +9,20 @@
 // result is bit for bit the whole computation's). Rows whose positions advance by one a row
 // (a raster, a token index) recompute about one level a call; a position that holds, none.
 //
+// DIRECT (a decode step's: its position any below its cache's, past what digits' tables hold in
+// a root's memory): rot is each table set's frequencies alone, and a call computes each angle
+// p f in f32 (as HF's rotary embedding does), reduced by 2 pi in two parts (Cody-Waite) and its
+// cos / sin by their series to degree 16 / 15 (|error| below 1e-6 over [-pi, pi]).
+//
 // Params: rot, rc, rs (the region's tables and its cos / sin of the current position), NROT (a
-// table row's pairs), LV, BITS.
+// table row's pairs), LV, BITS, DIRECT.
 param rot: [*]f32;
 param rc: [*]f32;
 param rs: [*]f32;
 param NROT: u16;
 param LV: u16;
 param BITS: u16;
+param DIRECT: bool = false;
 
 const RB: u16 = 1 << BITS;
 // the kept products of levels 0 .. LV - 2, [cos | sin][NROT] a level
@@ -34,11 +40,58 @@ fn digit(p: u32, lv: u16) u16 {
   return @as(u16, (p >> @as(u16, BITS * (LV - 1 - lv))) & @as(u32, RB - 1));
 }
 
+// 2 pi in two parts (6.28125 exact in a few bits: k C1 exact for the k a position makes) and 1 / 2 pi
+const C1: f32 = 6.28125;
+const C2: f32 = 0.0019353071795864769;
+const INV2PI: f32 = 0.15915494309189535;
+
+// a - 2 pi k, k the nearest whole turn (a >= 0: a position times a frequency)
+fn turn(a: f32) f32 {
+  const k = @as(f32, @as(u32, a * INV2PI + 0.5));
+  return (a - k * C1) - k * C2;
+}
+
+fn sin_r(r: f32) f32 {
+  const x2 = r * r;
+  var s: f32 = -7.6471637318198164759e-13;
+  s = s * x2 + 1.6059043836821614599e-10;
+  s = s * x2 - 2.5052108385441718775e-8;
+  s = s * x2 + 2.7557319223985890653e-6;
+  s = s * x2 - 1.9841269841269841270e-4;
+  s = s * x2 + 8.3333333333333333333e-3;
+  s = s * x2 - 1.6666666666666666667e-1;
+  return r + r * x2 * s;
+}
+
+fn cos_r(r: f32) f32 {
+  const x2 = r * r;
+  var c: f32 = 4.7794773323873852974e-14;
+  c = c * x2 - 1.1470745597729724714e-11;
+  c = c * x2 + 2.0876756987868098979e-9;
+  c = c * x2 - 2.7557319223985890653e-7;
+  c = c * x2 + 2.4801587301587301587e-5;
+  c = c * x2 - 1.3888888888888888889e-3;
+  c = c * x2 + 4.1666666666666666667e-2;
+  c = c * x2 - 0.5;
+  return 1.0 + x2 * c;
+}
+
 // cos / sin of position p for pairs j < n of the table set at base, into rc / rs from out:
 // c' = c c2 - s s2, s' = s c2 + c s2 a level, the first level's (c2, s2) taken as they are.
 fn tables(p: u32, base: u16, out: u16, n: u16) void {
   const q = last[out];
   if (p == q) { return; }
+  if (DIRECT) {
+    last[out] = p;
+    const pf = @as(f32, p);
+    var j: u16 = 0;
+    while (j < n) : (j += 1) {
+      const r = turn(pf * rot[base + j]);
+      rc[out + j] = cos_r(r);
+      rs[out + j] = sin_r(r);
+    }
+    return;
+  }
   var from: u16 = 0;
   if (q != NONE) {
     from = LV;
