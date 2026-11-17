@@ -601,17 +601,23 @@ impl Roles {
     }
 
     /// The dead part `bytes` of guest scratch take, pieces of `run`
-    /// chunks each: one run of `Instance` slots in a chunk where they take
-    /// no more than half a chunk's slots, else whole runs of `run` adjacent
-    /// chunks. A run of slots wider than that needs a chunk nearly empty,
-    /// which a pool under pressure seldom has though whole chunks free up
-    /// as processes leave; a whole chunk is what it comes back to.
+    /// chunks each: one run of `Instance` slots in a chunk where a second
+    /// state of its size fits the same chunk beside it, else whole runs of
+    /// `run` adjacent chunks. A state two of which do not fit one chunk
+    /// gains nothing from a run of slots, its chunk holding no other state
+    /// of its program, and only fragments: what it leaves of its chunk
+    /// takes some smaller item, which keeps the chunk from coming free, and
+    /// a run of that many slots needs a chunk all but empty, which a pool
+    /// under pressure seldom has though whole chunks free up as processes
+    /// leave. In whole chunks it comes back to any free chunk.
     fn scratch_part(&self, bytes: u64, run: u32) -> Result<Part, RolesError> {
         let shape = self.shape(SlotRole::Instance)?;
         let slot = shape.slot_bytes.max(1);
         let run = run.max(1);
-        let (pieces, slots) = if bytes.saturating_mul(2) <= u64::from(self.chunk_slots) * slot {
-            (0, u32::try_from(bytes.div_ceil(slot)).unwrap_or(u32::MAX))
+        let slots = bytes.div_ceil(slot);
+        let two_share_a_chunk = slots.saturating_mul(2) <= u64::from(self.chunk_slots);
+        let (pieces, slots) = if two_share_a_chunk {
+            (0, u32::try_from(slots).unwrap_or(u32::MAX))
         } else {
             let chunk = self.device.lock().unwrap().pool().chunk_bytes().max(1);
             let piece = chunk.saturating_mul(u64::from(run));
