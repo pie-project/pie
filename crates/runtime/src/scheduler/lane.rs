@@ -138,7 +138,8 @@ fn unassigned_ref(engine_idx: usize, frame: &crate::engine::FrameFire) -> Option
             .enumerate()
             .find_map(|(at, lane)| {
                 let fixed: Vec<(::engine::chunk::ShapeId, Vec<u32>)> = lane
-                    .fixed
+                    .record
+                    .pieces()
                     .iter()
                     .map(|(shape, pairs)| (*shape, pairs.iter().flatten().copied().collect()))
                     .collect();

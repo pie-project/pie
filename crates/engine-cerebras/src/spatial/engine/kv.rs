@@ -20,6 +20,9 @@ use crate::spatial::wafer;
 #[derive(Default)]
 pub(super) struct Kv {
     pub(super) page_size: u32,
+    /// The slot ref of page 0 in the kv run the load pinned: a lane's list
+    /// table names page `p` as ref `p + ref_from`.
+    pub(super) ref_from: u32,
     /// Pool page -> the token at each offset (`None`: never written).
     pub(super) pages: std::collections::HashMap<u32, Vec<Option<u32>>>,
     /// The slot's tokens.
@@ -32,6 +35,16 @@ pub(super) struct Kv {
 }
 
 impl Kv {
+    /// The pages a lane's list table names, as this engine's page ids.
+    pub(super) fn lane_pages(&self, lane: &engine::fire::Lane) -> Vec<u32> {
+        lane.tables
+            .iter()
+            .find(|(shape, _)| *shape == engine::chunk::DEGENERATE_KV)
+            .map_or_else(Vec::new, |(_, refs)| {
+                refs.iter().map(|&r| r - self.ref_from).collect()
+            })
+    }
+
     /// The lane's first `n` positions' tokens.
     pub(super) fn history(&self, slot: u32, pages: &[u32], n: u32) -> EngineResult<Vec<u32>> {
         let size = self.page_size.max(1);

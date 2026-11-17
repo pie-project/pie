@@ -889,6 +889,13 @@ fn corners() -> (TraceContainer, Vec<u32>) {
     put(&mut p, Shape::matrix(5, 3), Dtype::F32, cs);
     let cp = p.op(Op::CumProd(table));
     put(&mut p, Shape::matrix(5, 3), Dtype::F32, cp);
+    // Integer scans wrap, as the interpreter's do.
+    for (value, dtype) in [(a, Dtype::I32), (ua, Dtype::U32)] {
+        for op in [Op::CumSum(value), Op::CumProd(value)] {
+            let c = p.op(op);
+            put(&mut p, v, dtype, c);
+        }
+    }
     let pos_y = p.op(Op::Abs(y));
     for op in [
         Op::Exp(y),
@@ -1064,7 +1071,7 @@ fn registration_compiles_every_pass(device: &Device) {
     stages.top = lanes;
     stages.pool_rows = i64::from(pool_rows);
     stages.sink_row = pool_rows - 8;
-    stages.plane_reads = vec![(
+    stages.planes = vec![(
         read.name.clone(),
         read.rows,
         read.width,
@@ -1806,7 +1813,7 @@ fn a_sampler_registers_on_a_served_model() {
     let mut model = Model::load_with("qwen3-30b-a3b-mini", None, 512, 7, None);
     let device = model.engine.shell().expect("loaded").device();
     let (misses, held) = (device.misses(), device.compiled());
-    let reads = model.engine.shell().expect("loaded").plane_reads();
+    let reads = model.engine.shell().expect("loaded").guest_planes();
     let (container, _) = carrying(model.vocab);
     let plan = plan_of(container, model.vocab);
     let t = std::time::Instant::now();

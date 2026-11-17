@@ -1,11 +1,13 @@
 use engine::fire::{KvDelta, Lane, Step};
+
+pub use self::lane::FireLane;
 use eta_ir::registry::GeometryClass;
 
 use crate::engine::completion::CellPtr;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct FireRequest {
-    pub lanes: Vec<Lane>,
+    pub lanes: Vec<FireLane>,
     pub geometry: GeometryClass,
     pub single_token_mode: bool,
     pub has_user_mask: bool,
@@ -32,9 +34,9 @@ pub struct RingMove {
 
 impl FireRequest {
     #[must_use]
-    pub fn one(lane: Lane) -> FireRequest {
+    pub fn one(lane: impl Into<FireLane>) -> FireRequest {
         FireRequest {
-            lanes: vec![lane],
+            lanes: vec![lane.into()],
             ..FireRequest::default()
         }
     }
@@ -93,11 +95,11 @@ impl FireRequest {
     pub fn pages(&self) -> impl Iterator<Item = u32> + '_ {
         self.lanes
             .iter()
-            .flat_map(|lane| lane.kv.pages.iter().copied())
+            .flat_map(|lane| lane.pages.iter().copied())
     }
 
     #[must_use]
-    pub fn lane(&self) -> Option<&Lane> {
+    pub fn lane(&self) -> Option<&FireLane> {
         self.lanes.first()
     }
 
@@ -181,15 +183,58 @@ pub fn bitmask_words(lanes: &[Lane]) -> MaskWords {
 }
 
 #[must_use]
-pub fn lane_of(slot: u32, tokens: Vec<u32>, held: u32, pages: Vec<u32>) -> Lane {
-    Lane {
-        slot,
-        tokens,
-        kv: KvDelta {
-            held,
-            pages,
-            ..Default::default()
+pub fn lane_of(slot: u32, tokens: Vec<u32>, held: u32, pages: Vec<u32>) -> FireLane {
+    FireLane {
+        lane: Lane {
+            slot,
+            tokens,
+            kv: KvDelta {
+                held,
+                ..Default::default()
+            },
+            ..Lane::default()
         },
-        ..Lane::default()
+        pages,
+        ..FireLane::default()
+    }
+}
+
+mod lane {
+    use engine::fire::Lane;
+
+    /// A lane of a fire the runtime builds: the engine's lane, and the ids
+    /// the runtime's stores place its state by, which the fire names to the
+    /// engine in the lane's slot tables (`pipeline::fire::rs::apply_shared`,
+    /// `apply_pinned`) and never otherwise.
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct FireLane {
+        pub lane: Lane,
+        /// The kv store's page ids, in token order.
+        pub pages: Vec<u32>,
+        /// Where stated, the slot each of `pages` stands in (a shared
+        /// prefix's), in its place.
+        pub translation: Vec<u32>,
+    }
+
+    impl From<Lane> for FireLane {
+        fn from(lane: Lane) -> Self {
+            FireLane {
+                lane,
+                ..FireLane::default()
+            }
+        }
+    }
+
+    impl std::ops::Deref for FireLane {
+        type Target = Lane;
+        fn deref(&self) -> &Lane {
+            &self.lane
+        }
+    }
+
+    impl std::ops::DerefMut for FireLane {
+        fn deref_mut(&mut self) -> &mut Lane {
+            &mut self.lane
+        }
     }
 }

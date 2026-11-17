@@ -1027,6 +1027,12 @@ impl SharedPool {
         &self.fixed
     }
 
+    /// Whether the pool lays recurrent-state records: the model holds state.
+    #[must_use]
+    pub fn holds_records(&self) -> bool {
+        !self.fixed.is_empty()
+    }
+
     /// The fixed shapes taken on demand: an instance's tables, a ring.
     #[must_use]
     pub fn roles(&self) -> RoleShapes {

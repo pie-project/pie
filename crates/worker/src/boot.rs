@@ -290,8 +290,8 @@ fn load(
         deployment: group.deployment.clone(),
         trace: group.facts.trace_name.clone(),
         weight_bytes: group.facts.weight_bytes,
-        kv_pages: caps.pools.kv_pages,
-        kv_page_size: caps.pools.kv_page_size,
+        kv_pages: u32::try_from(caps.chunks.kv_device_pages()).unwrap_or(u32::MAX),
+        kv_page_size: caps.chunks.page_tokens(),
         max_lanes: caps.limits.max_lanes,
         max_tokens: caps.limits.max_tokens,
     };

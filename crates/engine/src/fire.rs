@@ -195,14 +195,49 @@ pub struct KvDelta {
     /// the same `folded` there.
     #[serde(default)]
     pub folded: u32,
-    pub pages: Vec<u32>,
-    #[serde(default)]
-    pub translation: Vec<u32>,
-    /// The ids of the lane's pages in the window list, aligned with
-    /// `translation` when it is stated and with `pages` otherwise; 0 is the
-    /// null page a page wholly behind the window reads.
-    #[serde(default)]
-    pub window: Vec<u32>,
+}
+
+/// A lane's recurrent-state record, as the runtime states it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LaneRecord {
+    /// Not stated: the load holds no recurrent state. An engine whose load
+    /// holds state refuses a lane that states none.
+    #[default]
+    Unstated,
+    /// The lane carries no state: it reads and writes the null record (ref
+    /// 0 a piece).
+    Null,
+    /// The lane's slot refs of each fixed shape, one `[run, cow]` a piece,
+    /// in piece order. `cow == run` writes the record in place (the normal
+    /// case); `cow != run` has the engine copy `run` onto `cow` on the
+    /// stream before the fire, which then reads and writes `cow` (a fork, or
+    /// a snapshot restored, within the fire).
+    Pieces(Vec<(ShapeId, Vec<[u32; 2]>)>),
+}
+
+impl LaneRecord {
+    /// The pieces a record names; none for [`LaneRecord::Null`] and
+    /// [`LaneRecord::Unstated`].
+    #[must_use]
+    pub fn pieces(&self) -> &[(ShapeId, Vec<[u32; 2]>)] {
+        match self {
+            LaneRecord::Pieces(pieces) => pieces,
+            LaneRecord::Null | LaneRecord::Unstated => &[],
+        }
+    }
+}
+
+/// What a lane's kv list table holds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ListKind {
+    /// The lane's kv pages in token order: entry `i` holds its rows
+    /// `[i * T, (i + 1) * T)`.
+    #[default]
+    Pages,
+    /// The working set's pages its program addresses by page index (a
+    /// device-geometry instance's lane): entry `i` is the page index `i`
+    /// names, the rows' order the program's.
+    Translation,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -251,10 +286,6 @@ pub struct Lane {
     pub rs: RsVerb,
     #[serde(default)]
     pub rs_reset: RsReset,
-    /// The recurrent-state row the runtime's rs store assigned this lane, when
-    /// it binds one; otherwise the state rides the seat.
-    #[serde(default)]
-    pub rs_slot: Option<u32>,
     /// Rows, ascending inside the lane, whose recurrent state the fire lands
     /// in slots of their own as it runs.
     #[serde(default)]
@@ -270,7 +301,7 @@ pub struct Lane {
     pub fires_after: Option<u32>,
     #[serde(default)]
     pub inputs: Vec<InputFeed>,
-    /// The lane takes no seat; the state it carries, if any, is the row `rs_slot` names.
+    /// The lane takes no seat; the state it carries, if any, is the record its fixed table names.
     #[serde(default)]
     pub kv_less: bool,
     /// An engine that cannot report says nothing, and the step is plainly
@@ -282,20 +313,22 @@ pub struct Lane {
     #[serde(default)]
     pub tap: Option<Tap>,
     /// The lane's slot refs of the kv list and of each window list, in
-    /// token order (an engine that states [`crate::chunk::ChunkFacts`]);
-    /// empty during the migration, when `kv` and `rs` still say. A window
+    /// token order, by the shapes of the engine's [`crate::chunk::ChunkFacts`]
+    /// (pinned shapes' refs where it pins its pools); a list the lane holds
+    /// no slot of is left out. A window
     /// list's table is in its own token order, entry `i` its rows
     /// `[i * T_w, (i + 1) * T_w)` (`T_w` its shape's tokens), a slot trimmed
     /// behind its window ref 0 (CONTRACT-BC 19, 21).
     #[serde(default)]
     pub tables: Vec<(ShapeId, Vec<u32>)>,
-    /// The lane's slot refs of each fixed shape, one `[run, cow]` a piece,
-    /// in piece order. `cow == run` writes the record in place (the normal
-    /// case); `cow != run` has the engine copy `run` onto `cow` on the
-    /// stream before the fire, which then reads and writes `cow` (a fork, or
-    /// a snapshot restored, within the fire).
+    /// What the kv list's table in `tables` holds: the rows' pages, or a
+    /// translation its program's page indexes address.
     #[serde(default)]
-    pub fixed: Vec<(ShapeId, Vec<[u32; 2]>)>,
+    pub list: ListKind,
+    /// The lane's recurrent-state record. The runtime states one for every
+    /// lane of a load that holds recurrent state, a record or none.
+    #[serde(default)]
+    pub record: LaneRecord,
     /// Whole-slot copies `[src, dst]` (logical slot refs) of each list
     /// shape, made on the stream before the fire runs, after the fires
     /// before it: the rs list, where a lane writes buffered rows into a
@@ -399,11 +432,10 @@ impl Lane {
                 .iter()
                 .try_fold(0, |at, snap| (at < snap.row).then_some(snap.row))
                 .is_some_and(|last| last < self.rows());
-            if !ascending || !matches!(self.rs, RsVerb::Fold) || self.rs_slot.is_none() {
+            if !ascending || !matches!(self.rs, RsVerb::Fold) {
                 return Err(Error::Invalid(format!(
                     "lane in slot {} snapshots its recurrent state at rows {:?} of its {}: a \
-                     snapshot is an interior row, ascending, of a lane that folds every row \
-                     into a state slot of its own",
+                     snapshot is an interior row, ascending, of a lane that folds every row",
                     self.slot,
                     self.rs_snapshots
                         .iter()
@@ -417,7 +449,10 @@ impl Lane {
     }
 
     fn validate_chunk_refs(&self, serves: Serves) -> Result<()> {
-        if self.tables.is_empty() && self.fixed.is_empty() && self.slot_copies.is_empty() {
+        if self.tables.is_empty()
+            && matches!(self.record, LaneRecord::Unstated)
+            && self.slot_copies.is_empty()
+        {
             return Ok(());
         }
         if !serves.chunks {
@@ -427,7 +462,7 @@ impl Lane {
             .tables
             .iter()
             .map(|(shape, _)| *shape)
-            .chain(self.fixed.iter().map(|(shape, _)| *shape));
+            .chain(self.record.pieces().iter().map(|(shape, _)| *shape));
         let mut seen: Vec<ShapeId> = Vec::new();
         for shape in shapes {
             if seen.contains(&shape) {
@@ -438,7 +473,12 @@ impl Lane {
             }
             seen.push(shape);
         }
-        if let Some((shape, _)) = self.fixed.iter().find(|(_, pieces)| pieces.is_empty()) {
+        if let Some((shape, _)) = self
+            .record
+            .pieces()
+            .iter()
+            .find(|(_, pieces)| pieces.is_empty())
+        {
             return Err(Error::Invalid(format!(
                 "lane in slot {} names fixed shape {shape} with no piece",
                 self.slot
@@ -452,7 +492,7 @@ impl Lane {
     /// named, every ref inside the pool (or the shape's pinned run) and off
     /// the reserved chunks, but a window list's null ref 0 in its table.
     pub fn validate_chunks(&self, facts: &ChunkFacts) -> Result<()> {
-        for (id, pieces) in &self.fixed {
+        for (id, pieces) in self.record.pieces() {
             if let Some(SlotKind::Fixed { pieces: stated }) = facts.shape(*id).map(|s| s.kind)
                 && pieces.len() != stated as usize
             {
@@ -464,7 +504,8 @@ impl Lane {
             }
         }
         let fixed: Vec<(ShapeId, Vec<u32>)> = self
-            .fixed
+            .record
+            .pieces()
             .iter()
             .map(|(shape, pieces)| (*shape, pieces.iter().flatten().copied().collect()))
             .collect();
@@ -1142,23 +1183,38 @@ mod tests {
         let ancestry = mask(&[false, true, false, true, true]);
         let one = Masking::Rows(vec![ancestry.clone()]);
         // Alone on its set: every buffered slot, the mask unread.
-        assert_eq!(buffered_reads(Some(&one), 2, 6, Lineage::Set).unwrap(), vec![2..6]);
-        assert_eq!(buffered_reads(None, 2, 6, Lineage::Set).unwrap(), vec![2..6]);
+        assert_eq!(
+            buffered_reads(Some(&one), 2, 6, Lineage::Set).unwrap(),
+            vec![2..6]
+        );
+        assert_eq!(
+            buffered_reads(None, 2, 6, Lineage::Set).unwrap(),
+            vec![2..6]
+        );
         // Sharing a set: the ancestry its mask states, as slots.
         let reads = buffered_reads(Some(&one), 2, 6, Lineage::Admitted);
         assert_eq!(reads.unwrap(), vec![3..4, 5..6]);
-        assert_eq!(buffered_reads(None, 2, 6, Lineage::Admitted).unwrap(), vec![2..6]);
+        assert_eq!(
+            buffered_reads(None, 2, 6, Lineage::Admitted).unwrap(),
+            vec![2..6]
+        );
 
         // A row hiding its own lane's earlier row reads it in its recurrence:
         // the own rows run in order. Two rows admitting other buffered slots
         // than each other cannot share one run.
         let blind = mask(&[false, true, false, false, true]);
         let rows = Masking::Rows(vec![ancestry.clone(), blind]);
-        assert_eq!(buffered_reads(Some(&rows), 2, 5, Lineage::Admitted).unwrap(), vec![3..4]);
+        assert_eq!(
+            buffered_reads(Some(&rows), 2, 5, Lineage::Admitted).unwrap(),
+            vec![3..4]
+        );
         let other = mask(&[true, false, false, true, true]);
         let rows = Masking::Rows(vec![ancestry, other]);
         assert!(buffered_reads(Some(&rows), 2, 5, Lineage::Admitted).is_err());
-        assert_eq!(buffered_reads(Some(&rows), 2, 5, Lineage::Set).unwrap(), vec![2..5]);
+        assert_eq!(
+            buffered_reads(Some(&rows), 2, 5, Lineage::Set).unwrap(),
+            vec![2..5]
+        );
     }
 
     #[test]
@@ -1181,14 +1237,13 @@ mod tests {
     #[test]
     fn kv_less_lanes_take_no_seat() {
         // A CFG step: four unseated float lanes beside a decode in seat 0.
-        let float = |rs_slot| Lane {
+        let float = || Lane {
             tokens: vec![0; 4],
             kv_less: true,
-            rs_slot,
             ..Lane::default()
         };
         let mut step = Step {
-            lanes: vec![float(None), float(None), float(None), float(Some(2))],
+            lanes: vec![float(), float(), float(), float()],
             ..Step::default()
         };
         step.lanes.push(Lane::decode(0, 0, 7, 3));

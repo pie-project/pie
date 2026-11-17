@@ -1,7 +1,7 @@
 //! Device forms of eta guest programs: every stage of a program lowered to
 //! StableHLO (`lower`), compiled per batch shape and run on the device
-//! (`run`). A program any of whose stages does not lower is refused a device
-//! form and runs in the host interpreter.
+//! (`run`). A program any of whose stages does not lower is refused at its
+//! registration, by name: there is no other path for its passes.
 
 pub mod lower;
 pub mod run;

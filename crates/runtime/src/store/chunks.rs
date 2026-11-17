@@ -646,6 +646,9 @@ pub struct ShapeRun {
     /// Device ids, from [`Pinned::ids_from`].
     pub device: u32,
     pub ids_from: u32,
+    /// The slot ref of the device run's first slot: id `i` is ref
+    /// `i - ids_from + ref_from`.
+    pub ref_from: u32,
     pub host: u32,
     pub disk: u32,
 }
@@ -656,6 +659,7 @@ impl ShapeRun {
             slot_bytes,
             device: pinned.device.chunks * slots_per_chunk,
             ids_from: pinned.ids_from,
+            ref_from: pinned.device.first * slots_per_chunk,
             host: pinned.host.chunks * slots_per_chunk,
             disk: pinned.disk.chunks * slots_per_chunk,
         }

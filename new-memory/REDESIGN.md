@@ -197,7 +197,7 @@ Memory sizing reads **no key by default**. Everything below is optional; an empt
 
 Seven keys, none required. `governor_patience` (F2) goes (user decision, 2026-11-13): in `Governor::tick` it is the count of congested ticks before the backoff acts, a debounce of the pressure signal rather than an intent, so it becomes one fixed value ( today's profiles tie it to the backoff: 0.9 → 4 ticks, 0.8 → 2, 0.7 → 1). Limits that are product decisions rather than memory (`max_context`, and F2's `max_batch_tokens` / `max_batch_sequences`) stay outside `[engine.memory]` as optional caps; when absent the context is the model's and the batch is the largest rung.
 
-Removed, each refused with a message naming what replaced it:
+Removed (user ruling, 2026-11-16: no rename table or per-key message; a file that still states one fails as serde's unknown field):
 
 | Key | Replaced by |
 |---|---|
@@ -230,7 +230,7 @@ Each step is mergeable alone. Steps 1-5 are verified bit-for-bit with the golden
    b. `FrameMap`; inputs and readout into the carve.
    c. ROCm (20 names), then Metal and Vulkan/wgpu (`scratch.rs` → exported workspaces, arena into the span, `act_chunks` stated).
 4. **State stragglers** into the pool (channels, instance tables, adapters, side planes).
-5. **Derived rungs and measured total**; delete the load-time fit, `engine/src/fit.rs`, and the config keys, each refused with a message.
+5. **Derived rungs and measured total**; delete the load-time fit, `engine/src/fit.rs`, and the config keys.
 6. **Model cache under PLEX** (F1 extended) and the config surface (F2, section 3).
 7. **XLA**: measured `fire(r)`.
 

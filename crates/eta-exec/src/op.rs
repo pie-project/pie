@@ -729,9 +729,33 @@ pub fn eval_op(op: &LaunchOp, package: &LaunchPackage, vals: &mut [Value]) -> Re
         }
         tags::CUMSUM | tags::CUMPROD => {
             let rows = canonical_rows(ty_shape(package, a0));
+            let is_sum = code == tags::CUMSUM;
+            // Integers scan in their own dtype, wrapping (as eta-compiler's
+            // interpreter and the devices do); floats and bools in f32.
+            fn scan<T: Copy>(x: &[T], rows: usize, id: T, f: fn(T, T) -> T) -> Vec<T> {
+                let len = x.len().checked_div(rows).unwrap_or(0);
+                let mut o = Vec::with_capacity(x.len());
+                for r in 0..rows {
+                    let mut acc = id;
+                    for &v in &x[r * len..r * len + len] {
+                        acc = f(acc, v);
+                        o.push(acc);
+                    }
+                }
+                o
+            }
+            let ints = match &vals[a0] {
+                Value::I32(x) if is_sum => Some(Value::I32(scan(x, rows, 0, i32::wrapping_add))),
+                Value::I32(x) => Some(Value::I32(scan(x, rows, 1, i32::wrapping_mul))),
+                Value::U32(x) if is_sum => Some(Value::U32(scan(x, rows, 0, u32::wrapping_add))),
+                Value::U32(x) => Some(Value::U32(scan(x, rows, 1, u32::wrapping_mul))),
+                _ => None,
+            };
+            if let Some(y) = ints {
+                out!(y);
+            }
             let x = vals[a0].lanes_f32();
             let len = x.len().checked_div(rows).unwrap_or(0);
-            let is_sum = code == tags::CUMSUM;
             let mut o = Vec::with_capacity(x.len());
             for r in 0..rows {
                 let mut acc = if is_sum { 0.0 } else { 1.0 };

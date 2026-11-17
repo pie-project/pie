@@ -313,6 +313,33 @@ impl Shell {
         self.pools.take_refs();
     }
 
+    /// Each of `step`'s lanes: whether it is attached to an instance whose
+    /// program places its rows (device geometry).
+    #[must_use]
+    pub fn placed_lanes(&self, step: &engine::fire::Step) -> Vec<bool> {
+        let mut placed = vec![false; step.lanes.len()];
+        for attached in &step.attachments {
+            if self.programs.geometry_of(attached.instance)
+                == Some(eta_ir::registry::GeometryClass::DeviceGeometry)
+            {
+                let lanes = attached.lane as usize..(attached.lane + attached.lanes) as usize;
+                for at in lanes {
+                    if let Some(lane) = placed.get_mut(at) {
+                        *lane = true;
+                    }
+                }
+            }
+        }
+        placed
+    }
+
+    /// The record a lane bound to none reads and writes, where lanes name
+    /// refs and the load holds state: the null record, ref 0.
+    #[must_use]
+    pub fn null_record(&self) -> Option<u32> {
+        (self.pools.by_refs() && self.pools.has_state()).then_some(0)
+    }
+
     /// Copies a working set's recurrent record from slot `src` onto `dst`,
     /// on the stream ahead of the fire that writes `dst`.
     pub fn fork_state(&mut self, src: u32, dst: u32) -> crate::Result<()> {

@@ -172,8 +172,6 @@ pub struct Seated<'a> {
 
     pub rs_reset: engine::fire::RsReset,
 
-    pub rs_slot: Option<u32>,
-
     pub rs: &'a engine::fire::RsVerb,
 
     pub media: Option<Media<'a>>,
@@ -223,7 +221,6 @@ impl<'a> Seated<'a> {
             readout: None,
             quiet: false,
             rs_reset: engine::fire::RsReset::Inferred,
-            rs_slot: None,
             rs: &FOLD,
             media: None,
             inputs: &[],
@@ -330,11 +327,6 @@ pub struct Shell {
     /// The readout rows of every fire shape traced, the rows a guest stage's
     /// readout plane comes in (`Shell::readouts`).
     readouts: std::collections::BTreeSet<u32>,
-    /// Every plane a traced fire returned, as a guest stage reads it: its
-    /// output, rows, width, layers, readout flag and dtype. The warm ladder
-    /// traces every fire shape, so these are every plane a stage can read
-    /// (`Plane::register` compiles each stage for them).
-    plane_reads: Vec<(String, u32, u32, u32, bool, Dtype)>,
     /// The programs that gather a readout plane's host-read rows apart, by
     /// the plane's rows and width, and every such plane the ladder traced.
     gathers: std::collections::HashMap<(u32, u32), std::sync::Arc<crate::device::Program>>,
@@ -402,10 +394,30 @@ impl Shell {
         self.readouts.iter().copied().collect()
     }
 
-    /// Every plane a traced fire returned, as a guest stage reads it.
+    /// Every plane a fire of this load can return, as a guest stage reads
+    /// it: output, rows, width, layers, readout flag and dtype. Every
+    /// fire's plane of an output has one shape, its ring's (`Shell::planes`:
+    /// the ring's rows, the output's width, an I32 output as I32 and any
+    /// other as F32), so the load states them all before any fire, and a
+    /// program's registration compiles each stage for them
+    /// (`Stages::compile_all`). An output no ring holds lands no plane.
     #[must_use]
-    pub fn plane_reads(&self) -> Vec<(String, u32, u32, u32, bool, Dtype)> {
-        self.plane_reads.clone()
+    pub fn guest_planes(&self) -> Vec<(String, u32, u32, u32, bool, Dtype)> {
+        (self.readout_specs.iter())
+            .flat_map(|spec| {
+                spec.exports.iter().map(|&export| {
+                    let decl = &self.exports[export].decl;
+                    (
+                        decl.name.clone(),
+                        spec.cap,
+                        spec.width,
+                        decl.layers,
+                        decl.readout,
+                        spec.dtype,
+                    )
+                })
+            })
+            .collect()
     }
 
     /// `engine.seated_first`, `engine.seat_to_end`, `engine.seat_spread`.
@@ -1058,7 +1070,6 @@ impl Shell {
             shaped: std::collections::HashMap::new(),
             deferred: None,
             readouts: std::collections::BTreeSet::new(),
-            plane_reads: Vec::new(),
             gathers: std::collections::HashMap::new(),
             gather_shapes: std::collections::BTreeSet::new(),
             readout_specs: readout_specs.clone(),
@@ -1314,6 +1325,7 @@ impl Shell {
     #[must_use]
     pub fn tiered_facts(&self) -> engine::chunk::ChunkFacts {
         let mut facts = self.pools.facts();
+        facts.record_bytes = self.pools.state_slot_bytes();
         facts.weights = self.streamed.facts();
         facts.host_chunks = self.host.chunks();
         if let (Some(disk), Some(kv)) = (&self.disk, self.pools.layout().kv()) {
@@ -2602,20 +2614,6 @@ impl Shell {
         };
         let slots = self.slots(fire_rows);
         let planes = self.planes(&composition, &slots, readout_rows.len() as u32)?;
-        for plane in &planes {
-            let out = &self.exports[plane.export];
-            let read = (
-                out.decl.name.clone(),
-                plane.rows,
-                plane.width,
-                out.decl.layers,
-                out.decl.readout,
-                plane.dtype,
-            );
-            if !self.plane_reads.contains(&read) {
-                self.plane_reads.push(read);
-            }
-        }
         // The host readers' readout rows, gathered apart after the fire.
         let host = self.host_table(&composition, &planes, &readout_layout, lanes, real);
         if let Some(table) = &host {

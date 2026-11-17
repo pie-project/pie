@@ -249,7 +249,7 @@ impl Set {
             },
             readout: Readout::Last,
             tables: vec![(LIST, self.kv[..upto.div_ceil(PAGE) as usize].to_vec())],
-            fixed: vec![(FIXED, self.record.clone())],
+            record: engine::fire::LaneRecord::Pieces(vec![(FIXED, self.record.clone())]),
             tokens,
             ..Lane::default()
         }
@@ -489,6 +489,14 @@ fn load(frames: u8) -> Option<(Model, InstanceId)> {
         Some(SlotKind::Fixed { pieces }) => pieces,
         other => panic!("{MODEL}'s record shape is {other:?}"),
     };
+    // The record's bytes the load states are the model's state rows, which
+    // its pool lays in `pieces` fixed slots: a record's, not its slots'.
+    let laid = facts.shape(FIXED).map_or(0, |shape| shape.slot_bytes) * u64::from(pieces);
+    assert!(
+        facts.record_bytes > 0 && facts.record_bytes <= laid,
+        "{MODEL} states a record of {} bytes in {laid} bytes of slots",
+        facts.record_bytes
+    );
     let rs_tokens = match facts.shape(RS).map(|shape| shape.kind) {
         Some(SlotKind::List { tokens, .. }) => tokens,
         other => panic!("{MODEL}'s rs list is {other:?}"),

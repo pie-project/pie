@@ -1702,12 +1702,11 @@ fn submitted_buffered(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
             tokens,
             kv: KvDelta {
                 held: fed,
-                pages: pages.clone(),
                 ..KvDelta::default()
             },
             rs,
             tables: vec![(ids[0], pages.clone())],
-            fixed: vec![(ids[2], record.clone())],
+            record: engine::fire::LaneRecord::Pieces(vec![(ids[2], record.clone())]),
             slot_copies: if copies.is_empty() {
                 Vec::new()
             } else {

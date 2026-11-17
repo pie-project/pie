@@ -13,7 +13,7 @@ mod posted;
 use engine::Engine;
 use engine::caps::{Capabilities, DeviceFacts, FireLimits, PoolFacts};
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
-use engine::chunk::{ChunkFacts, DegenerateBytes};
+use engine::chunk::{ChunkFacts, DegeneratePools};
 use engine::error::{Error, Result as EngineResult};
 use engine::fire::{FireId, FireTicket, FrameId, FrameSubmission, FrameTicket, LaneReadout};
 use engine::load::{Checkpoint, LoadFacts, LoadRequest, Loaded};
@@ -205,27 +205,24 @@ impl Engine for Spatial {
         let paging = facts.paging();
         self.kv.page_size = paging.page_size;
         let state_rows = facts.has_state();
-        let pools = PoolFacts {
+        // Pinned pools as chunks, one slot a chunk, device tier only: a kv
+        // page is its tokens on the host (a 32-bit token a position), never
+        // a device span the runtime could place, evict or stream.
+        let chunks = ChunkFacts::degenerate(&DegeneratePools {
             // The pages hold tokens here (the program's cache is replayed from them).
             kv_pages: u32::try_from(paging.pages()).unwrap_or(u32::MAX),
             kv_page_size: paging.page_size,
+            kv_page_bytes: u64::from(paging.page_size) * 4,
             state_slots: if state_rows { paging.slots } else { 0 },
-            // recurrent state replays from tokens: no buffered verbs
-            buffer_pages: 0,
             state_slot_bytes: facts.state_slot_bytes(),
-            adapter_banks: 0,
-            ..PoolFacts::default()
-        };
-        // Today's pools as pinned chunks, one slot a chunk, device tier only:
-        // a kv page is its tokens on the host (a 32-bit token a position),
-        // never a device span the runtime could place, evict or stream.
-        let chunks = ChunkFacts::degenerate(
-            &pools,
-            &DegenerateBytes {
-                kv_page: u64::from(paging.page_size) * 4,
-                buffer_page: 0,
-            },
-        );
+            // recurrent state replays from tokens: no buffered verbs
+            ..DegeneratePools::default()
+        });
+        self.kv.ref_from = chunks
+            .shape(engine::chunk::DEGENERATE_KV)
+            .and_then(|shape| Some((shape.pinned?, shape.slots_per_chunk)))
+            .map_or(0, |(pinned, per)| pinned.device.first * per - pinned.ids_from);
+        let pools = PoolFacts::default();
         let caps = Capabilities {
             device: DeviceFacts {
                 backend: "cerebras".to_string(),

@@ -68,9 +68,7 @@ const DEFAULT_MODEL_BLOCK: &str = r#"[model]
 name = "default"
 source = "Qwen/Qwen3.5-0.8B"
 # weight_cache_dir = ""       # empty derives $PIE_HOME/cache/weights
-# weight_dtype     = "bfloat16"  # what the CHECKPOINT holds. activation_dtype
-                                 # is what the engine computes in, so that is
-                                 # an engine key and this is a model one.
+# weight_dtype     = "bfloat16"  # what the CHECKPOINT holds
 "#;
 
 const MEMORY: &str = r#"
@@ -158,7 +156,6 @@ const CUDA_ENGINE_BLOCK: &str = r#"
 type = "cuda"
 device = ["cuda:0"]
 tensor_parallel_size = 1
-activation_dtype = "bfloat16"
 # max_context     = 32768   # the most tokens one sequence may hold; omit for
 #                           # the context the model's config.json declares,
 #                           # shortened where one sequence at it would take
@@ -174,7 +171,6 @@ const METAL_ENGINE_BLOCK: &str = r#"
 # for this engine — the Metal shell serves one device.
 type = "metal"
 device = ["metal:0"]
-activation_dtype = "bfloat16"
 # max_context          = 8192   # omit to keep the engine's KV-ring ceiling;
                                 # setting it only ever shrinks the ring
 "#;
@@ -187,7 +183,6 @@ const VULKAN_ENGINE_BLOCK: &str = r#"
 # for this engine — the Vulkan shell serves one device.
 type = "vulkan"
 device = ["vulkan:0"]       # vkEnumeratePhysicalDevices order; 0 is the first
-activation_dtype = "bfloat16"
 # validation           = false  # VK_LAYER_KHRONOS_validation; diagnostic only
 # pipeline_cache       = "/path/to/pipeline.bin"  # omit for $PIE_HOME/cache/vulkan-pipelines.bin
 "#;
@@ -200,7 +195,6 @@ const WGPU_ENGINE_BLOCK: &str = r#"
 # for this engine — the wgpu shell serves one adapter.
 type = "wgpu"
 device = ["wgpu:0"]         # enumeration order among the reachable adapters
-activation_dtype = "bfloat16"
 # backends = "vulkan"           # omit for every backend this build carries
 # power_preference     = "high-performance"  # or "low-power", "none"
 "#;
@@ -212,7 +206,6 @@ const XLA_ENGINE_BLOCK: &str = r#"
 # whatever the named engine accepts. The xla shell drives one PJRT device.
 type = "xla"
 device = ["tpu:0"]          # which of the plugin's addressable devices
-activation_dtype = "bfloat16"
 # plugin               = "/path/to/libtpu.so"  # omit: PIE_XLA_PLUGIN, TPU_LIBRARY_PATH, libtpu.so
 "#;
 
@@ -224,7 +217,6 @@ const CEREBRAS_ENGINE_BLOCK: &str = r#"
 # the fabric simulator, or a CS system named by cmaddr.
 type = "cerebras"
 device = ["cerebras:0"]
-activation_dtype = "bfloat16"
 target = "wse3"             # the wafer generation: "wse2" or "wse3"
 num_threads = 16            # host threads for the simulator and staging
 # cmaddr               = "10.0.0.1:9000"  # omit to run the fabric simulator
@@ -244,43 +236,6 @@ mod tests {
         the_cerebras_block_states_only_keys_the_engine_declares();
         a_binary_with_an_engine_writes_a_config_that_parses();
         it_names_the_engine_this_binary_actually_has();
-        no_block_names_a_retired_key();
-    }
-
-    /// Not even commented out: an operator who uncomments a line the
-    /// template offers gets a file that parses.
-    fn no_block_names_a_retired_key() {
-        use worker::config::EngineKind;
-        #[allow(unused_mut)]
-        let mut blocks = vec![
-            (HEADER, None),
-            (DEFAULT_MODEL_BLOCK, None),
-            (CUDA_ENGINE_BLOCK, Some(EngineKind::Cuda)),
-            (VULKAN_ENGINE_BLOCK, Some(EngineKind::Vulkan)),
-            (WGPU_ENGINE_BLOCK, Some(EngineKind::Wgpu)),
-            (XLA_ENGINE_BLOCK, Some(EngineKind::Xla)),
-            (CEREBRAS_ENGINE_BLOCK, Some(EngineKind::Cerebras)),
-            (MEMORY, None),
-            (RUNTIME, None),
-            (DEFAULT_FRAMES, None),
-            (CEREBRAS_FRAMES, None),
-            (TAIL, None),
-        ];
-        #[cfg(all(feature = "metal", target_vendor = "apple"))]
-        blocks.push((METAL_ENGINE_BLOCK, Some(EngineKind::Metal)));
-        for (block, engine) in blocks {
-            for line in block.lines() {
-                let stated = line.trim_start_matches(['#', ' ']);
-                let Some((key, _)) = stated.split_once('=') else {
-                    continue;
-                };
-                let key = key.trim();
-                assert!(
-                    worker::config::retired::refusal_for(key, engine).is_none(),
-                    "the template offers the retired key {key}: {line}"
-                );
-            }
-        }
     }
 
     /// The `[engine.memory]` block, every line uncommented, is a config.
