@@ -49,7 +49,7 @@ fn clear(s: u16) void {
 
 // Row t of a step: its slot's state, cleared at its position 0, stepped.
 fn row(t: u16) void {
-  const s = @as(u16, rowp[3 * t + 1]);
+  const s = @as(u16, fab.below(rowp[3 * t + 1], SLOTS));
   if (rowp[3 * t + 2] == 0) { clear(s); }
   step_at(s * NR * DV);
 }

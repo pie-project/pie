@@ -11,6 +11,10 @@ const tile_config = @import_module("<tile_config>");
 const color_config = tile_config.color_config;
 const tgt = tile_config.target;
 
+// A word the host writes, held below `n` (a step's rows, page tables: one unwritten or wrong
+// makes no DSD past its array; the static check's bound, check::hazard).
+fn below(v: u32, n: u32) u32 { return if (v < n) v else n - 1; }
+
 fn fout(comptime q: output_queue, n: u16) fabout_dsd {
   return @set_dsd_length(@get_dsd(fabout_dsd, .{ .extent = 1, .output_queue = q }), n);
 }

@@ -2639,7 +2639,7 @@ fn kv_pe_file(p: &Program, k: usize, ks: &place::KvSched) -> R<(String, String)>
         // a decode step's rows each at its lane's slot (`rowp`: lane slot, position; `ptab`:
         // each lane slot's pages, the host's)
         t.push_str("var rowp_p: [*]u32 = &att.rowp;\nvar ptab_p: [*]u32 = &att.ptab;\n");
-        body.push_str("  att.myrow = @as(u16, pcfg[0]);\n  red.role = @as(u16, pcfg[1]);\n");
+        body.push_str("  att.bind(@as(u16, pcfg[0]));\n  red.role = @as(u16, pcfg[1]);\n");
         let _ = writeln!(
             body,
             "  {{ var t: u16 = 0; while (t < {total}) : (t += 1) {{ att.store_t(t); }} }}\n  {{ var t: u16 = 0; while (t < {total}) : (t += 1) {{ att.query_t(t); }} }}"

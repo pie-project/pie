@@ -97,9 +97,16 @@ const sxk_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Dc} -> sx[i] });
 const k_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Qh * NE} -> kk[i] });
 var pl_d = k_d;
 
-fn init(row: u16) void {
+// The PE's row in the column, and the exp's view of its probabilities' low halves (pl_d: vexp's
+// add into their high halves; unset, it is kk's own and the add overlaps its source). A launch's
+// first call where the cache carries over (PAGED: init() clears it).
+fn bind(row: u16) void {
   myrow = row;
   pl_d = @set_dsd_stride(@set_dsd_base_addr(k_d, @ptrcast([*]u16, &pp)), 2);
+}
+
+fn init(row: u16) void {
+  bind(row);
   var e: u16 = 0;
   while (e < VCW) : (e += 1) { vc[e] = 0; }
   e = 0;
@@ -148,15 +155,20 @@ fn query_q(p: u16) void {
   query();
 }
 
+// A page's positions, and the pages a PE's entries hold (a page id the host writes is held below
+// it, a lane below LANES, a page index below MAXP: fab.below).
+const PG: u16 = EP * PYA;
+const NPG: u32 = NE / EP;
+
 // Row t's slot (PAGED): its PE row `srow` and entry `sent`.
 var srow: u16 = 0;
 var sent: u16 = 0;
 fn slot(t: u16) void {
   const P: u32 = @as(u32, EP) * @as(u32, PYA);
-  const lane = rowp[3 * t];
+  const lane = fab.below(rowp[3 * t], LANES);
   const q = rowp[3 * t + 2];
-  const page = ptab[lane * @as(u32, MAXP) + q / P];
-  const off = q % P;
+  const page = fab.below(ptab[lane * @as(u32, MAXP) + fab.below(q / P, MAXP)], NPG);
+  const off = q % @as(u32, PG);
   srow = @as(u16, off % @as(u32, PYA));
   sent = @as(u16, page * @as(u32, EP) + off / @as(u32, PYA));
 }
@@ -197,7 +209,7 @@ fn unmask(page: u32, a: u32, b: u32) void {
 fn lane_mask(t: u16) void {
   const P: u32 = @as(u32, EP) * @as(u32, PYA);
   const Y: u32 = @as(u32, PYA);
-  const lane = rowp[3 * t];
+  const lane = fab.below(rowp[3 * t], LANES);
   const q = rowp[3 * t + 2];
   @fmovs(mk_d, @as(f32, 0.0));
   // the first position attended
@@ -205,13 +217,13 @@ fn lane_mask(t: u16) void {
   if (WIN > 0 and q + 1 > @as(u32, WIN)) { lo = q + 1 - @as(u32, WIN); }
   const row = @as(u32, myrow);
   var j: u32 = lo / P;
-  while (j <= q / P) : (j += 1) {
-    const page = ptab[lane * @as(u32, MAXP) + j];
+  while (j <= q / P and j < @as(u32, MAXP)) : (j += 1) {
+    const page = fab.below(ptab[lane * @as(u32, MAXP) + j], NPG);
     // offsets o = e x PYA + row in [from, to]
     var from: u32 = 0;
     var to: u32 = P - 1;
-    if (j == lo / P) { from = lo % P; }
-    if (j == q / P) { to = q % P; }
+    if (j == lo / P) { from = lo % @as(u32, PG); }
+    if (j == q / P) { to = q % @as(u32, PG); }
     var a: u32 = 0;
     if (from > row) { a = (from - row + Y - 1) / Y; }
     var b: u32 = 0;

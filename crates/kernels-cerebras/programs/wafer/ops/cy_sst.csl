@@ -73,7 +73,7 @@ fn clear(s: u16) void {
 
 // Row t of a step: its slot's history (cleared at its position 0), the step.
 fn row(t: u16, x: [*]f32, o: [*]f32) void {
-  const s = @as(u16, rowp[3 * t + 1]);
+  const s = @as(u16, fab.below(rowp[3 * t + 1], SLOTS));
   if (rowp[3 * t + 2] == 0) { clear(s); }
   hb = s * HW;
   step(x, o);

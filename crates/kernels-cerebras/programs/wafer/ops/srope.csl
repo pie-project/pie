@@ -55,7 +55,8 @@ fn tables(p: u32, base: u16, out: u16, n: u16) void {
   const kept = @ptrcast([*]f32, &pre);
   var lv: u16 = from;
   while (lv < LV) : (lv += 1) {
-    const d = digit(p, lv);
+    // (below RB as digit() makes it: a position the host writes, bounded for the check)
+    const d = digit(p, lv) % RB;
     const o = base + ((lv * RB + d) * 2) * NROT;
     const c2 = @increment_dsd_offset(tab, @as(i16, o), f32);
     const s2 = @increment_dsd_offset(tab, @as(i16, o + NROT), f32);
