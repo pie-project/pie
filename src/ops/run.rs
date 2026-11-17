@@ -300,7 +300,8 @@ pub async fn run(
 
     let target = target(args.inferlet.as_deref(), args.path.as_deref())?;
 
-    let (controller, gateway, mut worker) = worker::standalone::derive_standalone(&content)?;
+    let (controller, gateway, mut worker) =
+        worker::standalone::derive_standalone(&content, Some(&cfg_path))?;
     if let Some(words) = diag {
         worker.state_diagnostics(words)?;
     }

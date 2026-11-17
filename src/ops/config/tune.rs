@@ -345,7 +345,8 @@ pub async fn run(global: &crate::args::GlobalArgs, args: TuneArgs) -> Result<cra
 
     let objective = resolve_objective(args.objective)?;
 
-    let (controller, gateway, worker) = worker::standalone::derive_standalone(&content)?;
+    let (controller, gateway, worker) =
+        worker::standalone::derive_standalone(&content, Some(&cfg_path))?;
     let baseline = Knobs {
         frame_size: worker.runtime.frame_size as usize,
         dispatch_depth: worker.runtime.frame_dispatch_depth as usize,
