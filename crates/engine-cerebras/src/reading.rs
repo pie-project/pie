@@ -1306,6 +1306,18 @@ impl Runtime {
         });
         Ok((hi >= lo).then(|| hi - lo))
     }
+
+    /// The simulator's writes still in flight landed (a word read back from the last's first
+    /// PE), before a program runs over them.
+    fn land(&mut self) -> R<()> {
+        if let Some(one) = self.landing.filter(|_| self.unlanded > 0) {
+            let mut ts = [0u32; 3];
+            self.memcpy_d2h("tsc", &mut ts, one, 3, Order::RowMajor, DataType::Bits32)
+                .map_err(|x| x.to_string())?;
+            self.unlanded = 0;
+        }
+        Ok(())
+    }
 }
 
 /// Writes the simulator holds in flight before one is landed (its command fan halts on a
@@ -1314,13 +1326,7 @@ const SIM_IN_FLIGHT: usize = 2;
 
 impl Fabric for Runtime {
     fn launch(&mut self, reading: &Reading) -> R<Option<u64>> {
-        // (the simulator's writes still in flight landed before the program runs over them)
-        if let Some(one) = self.landing.filter(|_| self.unlanded > 0) {
-            let mut ts = [0u32; 3];
-            self.memcpy_d2h("tsc", &mut ts, one, 3, Order::RowMajor, DataType::Bits32)
-                .map_err(|x| x.to_string())?;
-            self.unlanded = 0;
-        }
+        self.land()?;
         let args: Vec<u32> = reading.rd.into_iter().collect();
         self.launch("run", &args).map_err(|x| x.to_string())?;
         self.stamps(reading)
@@ -1393,6 +1399,7 @@ impl Fabric for Runtime {
         _step: &StreamStep<'_>,
     ) -> R<(Vec<Vec<f32>>, Option<u64>)> {
         let e = |x: crate::sdk::Error| x.to_string();
+        self.land()?;
         let args: Vec<u32> = reading.rd.into_iter().collect();
         self.launch("run", &args).map_err(e)?;
         let mut got = Vec::new();
