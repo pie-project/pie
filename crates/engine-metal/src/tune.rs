@@ -482,6 +482,49 @@ fn assemble(
     )
 }
 
+/// `pie tune metal --rates`: this device's `[rates]` measured through
+/// Metal's own kernels ([`crate::rates::measure`]) at the shapes every
+/// backend times, laid over the profile a load on it runs and written whole,
+/// with the `[provenance]` entry naming how.
+pub fn rates(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Outcome, String> {
+    let began = Instant::now();
+    let device = Context::bind().map_err(|e| e.to_string())?;
+    let name = device.name().to_string();
+    let facts = crate::chip::measured(&device, crate::chip::perf_cores());
+    let (base, report) = crate::chip::resolve(&name, &facts, profiles);
+    say(&format!(
+        "{name}: measuring the rates, starting from {}",
+        report.used
+    ));
+    let rates = crate::rates::measure(&device, base.clone(), say)?;
+    let tuned = engine::rates::tuned(&rates);
+    let seconds = began.elapsed().as_secs_f64();
+    let provenance = [
+        (
+            "source",
+            "\"pie tune metal --rates on this machine\"".to_string(),
+        ),
+        crate::rates::provenance(&name),
+        ("from", format!("\"{}\"", report.used)),
+        ("pie", format!("\"{}\"", env!("CARGO_PKG_VERSION"))),
+        ("seconds", format!("{seconds:.0}")),
+    ];
+    let file = assemble(&base, &name, &facts, &tuned, &provenance)?;
+    Ok(Outcome {
+        device: name,
+        file,
+        lines: vec![Line {
+            id: "rates",
+            text: tuned.trim_end().replace('\n', "; "),
+            measured: true,
+        }],
+        wrong: Vec::new(),
+        checks: Vec::new(),
+        changed: true,
+        seconds,
+    })
+}
+
 pub struct Outcome {
     pub device: String,
     pub file: String,
