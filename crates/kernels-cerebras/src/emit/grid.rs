@@ -14,7 +14,7 @@ use std::fmt::Write as _;
 
 use poem_ir::ValueId;
 
-use crate::emit::stream::{COMMON, Tiles, buf, cfg_decl, dedup, routes};
+use crate::emit::stream::{COMMON, Tiles, buf, cfg_decl, dedup, placed_of};
 use crate::fabric::Endpoint;
 use crate::floor::Coord;
 use crate::floorplan::stream::{self as fs, COL_CHAIN, KV_CHAIN, KV_RECV, KV_SEND, ROW_CHAIN};
@@ -1653,34 +1653,6 @@ pub fn emit(g: &GridProgram) -> R<Emitted> {
 /// `layout.csl`: every PE's code, params and routes, every exported name.
 fn layout_file(g: &GridProgram, tiles: &Tiles, arrays: &[GridArray]) -> String {
     let s = &g.stream;
-    let mut t = String::new();
-    let _ = writeln!(
-        t,
-        "// A grid reading's wafer program (kernels-cerebras emit::grid): {} x {} PEs.\nconst memcpy = @import_module(\"<memcpy/get_params>\", .{{ .width = {}, .height = {} }});\nlayout {{\n  @set_rectangle({}, {});",
-        s.w, s.h, s.w, s.h, s.w, s.h
-    );
-    for y in 0..s.h {
-        for x in 0..s.w {
-            let c = Coord::new(x, y);
-            let (file, params) = tiles
-                .get(&c)
-                .cloned()
-                .unwrap_or_else(|| ("filler.csl".into(), Vec::new()));
-            let mut ps = format!(".memcpy_params = memcpy.get_params({x})");
-            for (k, v) in &params {
-                let _ = write!(ps, ", .{k} = {v}");
-            }
-            let _ = writeln!(t, "  @set_tile_code({x}, {y}, \"{file}\", .{{ {ps} }});");
-            for rt in g.fabric.routes(c) {
-                let _ = writeln!(
-                    t,
-                    "  @set_color_config({x}, {y}, @get_color({}), {});",
-                    rt.colour.0,
-                    routes(rt.word)
-                );
-            }
-        }
-    }
     let mut names: BTreeMap<String, &str> = BTreeMap::new();
     for (n, ty) in [
         ("tsc", "u32"),
@@ -1702,9 +1674,9 @@ fn layout_file(g: &GridProgram, tiles: &Tiles, arrays: &[GridArray]) -> String {
         };
         names.insert(a.sym.clone(), ty);
     }
-    for (n, ty) in &names {
-        let _ = writeln!(t, "  @export_name(\"{n}\", [*]{ty}, true);");
-    }
-    t.push_str("  @export_name(\"run\", fn() void);\n}\n");
-    t
+    let header = format!(
+        "// A grid reading's wafer program (kernels-cerebras emit::grid): {} x {} PEs.",
+        s.w, s.h
+    );
+    placed_of(header, (s.w, s.h), tiles, &g.fabric, &names).csl()
 }

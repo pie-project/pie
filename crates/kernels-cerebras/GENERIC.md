@@ -2516,6 +2516,25 @@ milestone's tail.
     regimes do not pay for the IR. What would: the grid and stream emitters' layouts (their
     per-PE route and tile writers, about 150 lines each) and the check's CSL parser (about 300)
     once every regime states a `Placed`; the decode programs (routes from rcfg) stay outside it.
+  - **Grid and stream** (`emit::stream::placed_of`). The two regimes' layout writers were the
+    same code: each PE's tile (a filler where it has none), then its fabric routes, row by
+    row, then the host's symbols in name order. Both now state one `Placed`, built by a single
+    constructor, with every entry a single PE and printed a PE at a time (`Placed::by_pe`, which
+    keeps the same print order).
+    - Byte-identical against the origin tip's own output:
+      - gen1's flux gate (flux2-mini and klein text, denoise and tiled VAE), all 7,663
+        files, matching `flux-base5.sha`;
+      - every `fluxid` program (stream, grid `mini-vae-rows`, tiled, GEMM);
+      - the stream-unit program of Qwen3-0.6B (157,824 PEs, about 1M routes);
+      - the decode identity's 6 configs.
+    - Lines: grid.rs +6 / -34, stream.rs +56 / -47, placed.rs +73 / -34 (the PE-at-a-time
+      printing and the line printers split out). Net **+20**.
+  - **The tally.** All four regimes now state a `Placed`, and the check reads one directly
+    (GEMM, klein). Net **+225** over part C. The IR did not shrink the code; the one real
+    dedupe was grid and stream sharing a writer. The check's CSL parser (about 300 lines)
+    stays, because the decode programs' layouts (`emit::layout`, routes from rcfg) and
+    `check --dir` over a program on disk are still text. It could go only if decode moved
+    onto the IR too.
 
 ## G1: the poem survey
 

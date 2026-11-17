@@ -4,7 +4,11 @@
 //! reads and writes. One printer writes it as `layout.csl` ([`Placed::csl`]); the static check
 //! reads it as it is ([`crate::check::layout_ir`]).
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
+
+/// A PE's code and routes (printed a PE at a time).
+type PeEntries<'a> = (Vec<&'a Tile>, Vec<&'a Route>);
 
 /// `[lo, hi)` by `step`.
 pub type Span = (u32, u32, u32);
@@ -44,6 +48,9 @@ pub struct Placed {
     pub routes: Vec<Route>,
     /// The host's symbols: (name, element type), `run` the launch after them.
     pub exports: Vec<(String, String)>,
+    /// Printed a PE at a time (rows, then columns: each PE's code, then its routes), every
+    /// entry one PE's; else the tiles, then the routes, as listed.
+    pub by_pe: bool,
 }
 
 impl Placed {
@@ -99,40 +106,33 @@ impl Placed {
             "{}\nconst memcpy = @import_module(\"<memcpy/get_params>\", .{{ .width = {w}, .height = {h} }});\nlayout {{\n  @set_rectangle({w}, {h});\n",
             self.header
         );
-        for tl in &self.tiles {
-            let params: String = tl
-                .params
-                .iter()
-                .map(|(k, v)| format!(", .{k} = {v}"))
-                .collect();
-            let _ = match tl.at {
-                At::Region(xs, ys) => writeln!(
-                    t,
-                    "  for (@range(u16, {}, {}, {})) |x| {{ const mp = memcpy.get_params(x); for (@range(u16, {}, {}, {})) |y| {{ @set_tile_code(x, y, \"{}\", .{{ .memcpy_params = mp{params} }}); }} }}",
-                    xs.0, xs.1, xs.2, ys.0, ys.1, ys.2, tl.file
-                ),
-                At::Pe(x, y) => writeln!(
-                    t,
-                    "  @set_tile_code({x}, {y}, \"{}\", .{{ .memcpy_params = memcpy.get_params({x}){params} }});",
-                    tl.file
-                ),
-            };
-        }
-        for r in &self.routes {
-            let cfg = format!(
-                "@get_color({}), .{{ .routes = .{{ .rx = .{{ {} }}, .tx = .{{ {} }} }} }}",
-                r.colour,
-                r.rx,
-                r.tx.join(", ")
-            );
-            let _ = match r.at {
-                At::Region(xs, ys) => writeln!(
-                    t,
-                    "  for (@range(u16, {}, {}, {})) |x| {{ for (@range(u16, {}, {}, {})) |y| {{ @set_color_config(x, y, {cfg}); }} }}",
-                    xs.0, xs.1, xs.2, ys.0, ys.1, ys.2
-                ),
-                At::Pe(x, y) => writeln!(t, "  @set_color_config({x}, {y}, {cfg});"),
-            };
+        if self.by_pe {
+            let mut at: BTreeMap<(u32, u32), PeEntries> = BTreeMap::new();
+            for tl in &self.tiles {
+                if let At::Pe(x, y) = tl.at {
+                    at.entry((y, x)).or_default().0.push(tl);
+                }
+            }
+            for r in &self.routes {
+                if let At::Pe(x, y) = r.at {
+                    at.entry((y, x)).or_default().1.push(r);
+                }
+            }
+            for (tls, rs) in at.values() {
+                for tl in tls {
+                    tile_line(&mut t, tl);
+                }
+                for r in rs {
+                    route_line(&mut t, r);
+                }
+            }
+        } else {
+            for tl in &self.tiles {
+                tile_line(&mut t, tl);
+            }
+            for r in &self.routes {
+                route_line(&mut t, r);
+            }
         }
         for (n, ty) in &self.exports {
             let _ = writeln!(t, "  @export_name(\"{n}\", [*]{ty}, true);");
@@ -155,4 +155,43 @@ impl Placed {
                     .map(move |y| (x, y))
             })
     }
+}
+
+/// A tile's `@set_tile_code` line.
+fn tile_line(t: &mut String, tl: &Tile) {
+    let params: String = tl
+        .params
+        .iter()
+        .map(|(k, v)| format!(", .{k} = {v}"))
+        .collect();
+    let _ = match tl.at {
+        At::Region(xs, ys) => writeln!(
+            t,
+            "  for (@range(u16, {}, {}, {})) |x| {{ const mp = memcpy.get_params(x); for (@range(u16, {}, {}, {})) |y| {{ @set_tile_code(x, y, \"{}\", .{{ .memcpy_params = mp{params} }}); }} }}",
+            xs.0, xs.1, xs.2, ys.0, ys.1, ys.2, tl.file
+        ),
+        At::Pe(x, y) => writeln!(
+            t,
+            "  @set_tile_code({x}, {y}, \"{}\", .{{ .memcpy_params = memcpy.get_params({x}){params} }});",
+            tl.file
+        ),
+    };
+}
+
+/// A route's `@set_color_config` line.
+fn route_line(t: &mut String, r: &Route) {
+    let cfg = format!(
+        "@get_color({}), .{{ .routes = .{{ .rx = .{{ {} }}, .tx = .{{ {} }} }} }}",
+        r.colour,
+        r.rx,
+        r.tx.join(", ")
+    );
+    let _ = match r.at {
+        At::Region(xs, ys) => writeln!(
+            t,
+            "  for (@range(u16, {}, {}, {})) |x| {{ for (@range(u16, {}, {}, {})) |y| {{ @set_color_config(x, y, {cfg}); }} }}",
+            xs.0, xs.1, xs.2, ys.0, ys.1, ys.2
+        ),
+        At::Pe(x, y) => writeln!(t, "  @set_color_config({x}, {y}, {cfg});"),
+    };
 }

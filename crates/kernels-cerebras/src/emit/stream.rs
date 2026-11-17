@@ -17,8 +17,9 @@ use std::fmt::Write as _;
 use poem_ir::ValueId;
 use serde::Serialize;
 
+use crate::emit::placed::{At, Placed, Route, Tile as PlacedTile};
 use crate::emit::region::ParamAt;
-use crate::fabric::{Colour, Endpoint, RouteWord};
+use crate::fabric::{Endpoint, RouteWord};
 use crate::floor::{Coord, Dir};
 use crate::floorplan::stream::{
     self as fs, COL_CHAIN, HELP_CHAIN, KV_CHAIN, KV_RECV, KV_SEND, LANE_BUS, LANE_GATHER, PATH_IN,
@@ -27,7 +28,7 @@ use crate::floorplan::stream::{
 use crate::stream::build::{Built, Program};
 use crate::stream::place::{self, Seg};
 use crate::stream::unit::{Cols, Reader, Side, Step};
-use crate::wiring::{Class, Slot};
+use crate::wiring::Slot;
 
 type R<T> = Result<T, String>;
 
@@ -119,18 +120,17 @@ fn dirname(d: Dir) -> &'static str {
     }
 }
 
-/// A route word as CSL's `.rx` / `.tx` sets.
-pub(crate) fn routes(w: RouteWord) -> String {
+/// A route word's receive and sends, as CSL names them.
+fn route_sets(w: RouteWord) -> (&'static str, Vec<&'static str>) {
     let rx = if w.from_ramp() {
-        "RAMP".to_string()
+        "RAMP"
     } else {
-        let d = match w.0 & 0x60 {
+        dirname(match w.0 & 0x60 {
             0x00 => Dir::W,
             0x20 => Dir::E,
             0x40 => Dir::S,
             _ => Dir::N,
-        };
-        dirname(d).to_string()
+        })
     };
     let mut tx = Vec::new();
     for (bit, d) in [
@@ -146,10 +146,49 @@ pub(crate) fn routes(w: RouteWord) -> String {
     if w.to_ramp() {
         tx.push("RAMP");
     }
-    format!(
-        ".{{ .routes = .{{ .rx = .{{ {rx} }}, .tx = .{{ {} }} }} }}",
-        tx.join(", ")
-    )
+    (rx, tx)
+}
+
+/// The placement of a program laid out a PE at a time (the stream and grid regimes): each
+/// PE's code (a filler's where it has none) and its routes on `fabric`, the host's symbols
+/// `names` (in name order).
+pub(crate) fn placed_of(
+    header: String,
+    (w, h): (u32, u32),
+    tiles: &Tiles,
+    fabric: &crate::fabric::Fabric,
+    names: &BTreeMap<String, &str>,
+) -> Placed {
+    let mut pl = Placed::new(header, w, h);
+    pl.by_pe = true;
+    let filler = (String::from("filler.csl"), Vec::new());
+    for y in 0..h {
+        for x in 0..w {
+            let c = Coord::new(x, y);
+            let (file, params) = tiles.get(&c).unwrap_or(&filler);
+            pl.tiles.push(PlacedTile {
+                at: At::Pe(x, y),
+                file: file.clone(),
+                params: params
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.to_string()))
+                    .collect(),
+            });
+            for rt in fabric.routes(c) {
+                let (rx, tx) = route_sets(rt.word);
+                pl.routes.push(Route {
+                    at: At::Pe(x, y),
+                    colour: u32::from(rt.colour.0),
+                    rx,
+                    tx,
+                });
+            }
+        }
+    }
+    for (n, ty) in names {
+        pl.export(n, ty);
+    }
+    pl
 }
 
 /// A buffer declaration and its DSD.
@@ -2724,34 +2763,6 @@ fn filler_file() -> String {
 /// `layout.csl`: every PE's code and params, every route, every exported name.
 fn layout_file(p: &Program, tiles: &Tiles, arrays: &[HostArray]) -> String {
     let s = &p.stream;
-    let mut t = String::new();
-    let _ = writeln!(
-        t,
-        "// A stream reading's wafer program (kernels-cerebras emit::stream): {} x {} PEs.\nconst memcpy = @import_module(\"<memcpy/get_params>\", .{{ .width = {}, .height = {} }});\nlayout {{\n  @set_rectangle({}, {});",
-        s.w, s.h, s.w, s.h, s.w, s.h
-    );
-    for y in 0..s.h {
-        for x in 0..s.w {
-            let c = Coord::new(x, y);
-            let (file, params) = tiles
-                .get(&c)
-                .cloned()
-                .unwrap_or_else(|| ("filler.csl".into(), Vec::new()));
-            let mut ps = format!(".memcpy_params = memcpy.get_params({x})");
-            for (k, v) in &params {
-                let _ = write!(ps, ", .{k} = {v}");
-            }
-            let _ = writeln!(t, "  @set_tile_code({x}, {y}, \"{file}\", .{{ {ps} }});");
-            for rt in p.fabric.routes(c) {
-                let _ = writeln!(
-                    t,
-                    "  @set_color_config({x}, {y}, @get_color({}), {});",
-                    rt.colour.0,
-                    routes(rt.word)
-                );
-            }
-        }
-    }
     // an array's element type: words (config, positions, stamps, an argmax's) u32
     let mut names: BTreeMap<String, &str> = BTreeMap::new();
     for a in arrays {
@@ -2762,11 +2773,9 @@ fn layout_file(p: &Program, tiles: &Tiles, arrays: &[HostArray]) -> String {
         };
         names.insert(a.sym.clone(), ty);
     }
-    for (n, ty) in &names {
-        let _ = writeln!(t, "  @export_name(\"{n}\", [*]{ty}, true);");
-    }
-    t.push_str("  @export_name(\"run\", fn() void);\n}\n");
-    let _ = Colour(0);
-    let _ = Class::new("");
-    t
+    let header = format!(
+        "// A stream reading's wafer program (kernels-cerebras emit::stream): {} x {} PEs.",
+        s.w, s.h
+    );
+    placed_of(header, (s.w, s.h), tiles, &p.fabric, &names).csl()
 }
