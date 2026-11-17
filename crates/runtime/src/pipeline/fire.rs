@@ -1817,6 +1817,7 @@ async fn promote<C: FireContext>(
         crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| kv.commit_promote(txn))
             .map_err(|error| error.to_string())?;
     Ok(Some(Promoted {
+        pages: below as u64,
         stores: stores.clone(),
         pin: Some(pin),
         _lease: lease,
@@ -1878,6 +1879,8 @@ impl Drop for PromoteGuard {
 }
 
 struct Promoted {
+    /// Pages of the run that came up from below the device.
+    pages: u64,
     stores: crate::store::registry::Stores,
     pin: Option<crate::store::kv::ReaderPin>,
     _lease: crate::store::kv::working_set::KvFireLease,
@@ -4063,6 +4066,12 @@ pub async fn submit_pass_stamped<C: FireContext>(
             let end = full.lanes[0].kv.held.saturating_add(supplied);
             cursor.tail = Some(end);
             cursor.reserved = cursor.reserved.max(end);
+        }
+        // Of the rows mapped in, those on pages that came up from below.
+        if let Some(promoted) = &promoted {
+            let below = (promoted.pages * u64::from(page_size)).min(u64::from(supplied));
+            crate::store::CACHED_FROM_BELOW_TOKENS
+                .fetch_add(below, std::sync::atomic::Ordering::Relaxed);
         }
         drop(promoted);
         // What the fire writes and reads out, for the policies' prompt and

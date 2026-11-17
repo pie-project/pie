@@ -236,3 +236,9 @@ pub fn kv_pressure_bucket() -> u8 {
     }
     (f64::from(used) / f64::from(total) * 255.0).round() as u8
 }
+
+/// Prompt tokens served from cached KV that a fire brought back up from
+/// below the device (the host or disk tier), since the process started:
+/// `/metrics`' `pie_kv_cached_from_below_tokens_total`.
+pub static CACHED_FROM_BELOW_TOKENS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);

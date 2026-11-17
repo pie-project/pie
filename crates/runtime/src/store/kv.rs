@@ -1108,6 +1108,11 @@ impl KvStore {
             })
             .collect();
         order.sort_unstable_by_key(|(order, _)| *order);
+        tracing::debug!(
+            target: "pie::retention",
+            order = ?order.iter().map(|((key, _, _), (_, ids))| (*key, ids.len())).collect::<Vec<_>>(),
+            "idle cache, lowest key first"
+        );
         order.into_iter().map(|(_, group)| group).collect()
     }
 

@@ -252,7 +252,11 @@ fn render(start: Instant, component: &str, version: &str) -> String {
          pie_build_info{{component=\"{component}\",version=\"{version}\"}} 1\n\
          # HELP pie_uptime_seconds Seconds since process start.\n\
          # TYPE pie_uptime_seconds gauge\n\
-         pie_uptime_seconds {uptime}\n{waiting}",
+         pie_uptime_seconds {uptime}\n\
+         # HELP pie_kv_cached_from_below_tokens_total Prompt tokens served from cached KV brought back up from the host or disk tier.\n\
+         # TYPE pie_kv_cached_from_below_tokens_total counter\n\
+         pie_kv_cached_from_below_tokens_total {below}\n{waiting}",
+        below = runtime::store::CACHED_FROM_BELOW_TOKENS.load(std::sync::atomic::Ordering::Relaxed),
         waiting = runtime::store::waiting::metrics(),
     )
 }
