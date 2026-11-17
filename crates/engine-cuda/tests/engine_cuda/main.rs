@@ -50,6 +50,7 @@ mod a_double_block_fires_two_streams_through_the_engine;
 #[cfg(feature = "cuda")]
 mod a_fired_router_and_mega_moe_answer_what_their_legs_answer;
 mod a_four_rank_group_fires_a_sharded_plan;
+mod a_faulted_epilogue_faults_its_own_lanes;
 mod a_fragmented_window_gets_a_view_per_run;
 mod a_fused_geglu_reads_its_affine_bank_as_planes;
 #[cfg(feature = "cuda")]

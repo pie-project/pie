@@ -54,7 +54,7 @@ use crate::store::kv::{self, Seat};
 use crate::store::rs::Buffers;
 use crate::weights::{AdapterPlane, Weights};
 use crate::window::Windows;
-use enqueue::{GuestBatch, Owed, Reap, reap_guest_fires};
+use enqueue::{GuestBatch, GuestFault, Owed, Reap, reap_guest_fires};
 use segments::Segmented;
 
 pub struct Shell {
@@ -208,6 +208,8 @@ pub struct Shell {
     tap_sink: Option<engine::TapSink>,
     airborne: crate::settle::Airborne,
     owed: Owed,
+    /// The guest passes of the step under way that faulted their lanes.
+    guest_faults: Vec<GuestFault>,
     /// Landed events of reaped batches, for the next to record.
     spare_events: Vec<crate::device::graph::Event>,
     /// Where a device-counted fold left each recurrent slot, ahead of the

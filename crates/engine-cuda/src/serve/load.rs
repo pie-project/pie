@@ -1480,6 +1480,7 @@ impl Shell {
             tap_sink: None,
             airborne,
             owed: super::Owed::new(),
+            guest_faults: Vec::new(),
             spare_events: Vec::new(),
             rs_ahead: std::collections::HashMap::new(),
             _released: Released,
