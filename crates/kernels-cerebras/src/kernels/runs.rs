@@ -209,11 +209,8 @@ impl Dims {
         if (1..p.units).any(|u| kinds(u) != kinds(0)) {
             return Err("runs: the units' layer kinds differ".into());
         }
-        let km = kinds(0)
-            .iter()
-            .enumerate()
-            .filter(|(_, g)| **g)
-            .fold(0u32, |m, (l, _)| m | (1 << l));
+        let first = kinds(0);
+        let km = super::layer_mask(k, |l| first[l as usize])?;
         let window = s
             .layers
             .iter()

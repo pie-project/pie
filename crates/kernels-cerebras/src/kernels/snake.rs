@@ -143,12 +143,9 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
     let plan = &prog.plan;
     let (s, p) = (&plan.shape, &plan.partition);
     let k = p.layers_per_unit;
-    let km: u32 = s.layers[..k as usize]
-        .iter()
-        .enumerate()
-        .filter(|(_, l)| !matches!(l, LayerKind::Gdn))
-        .map(|(i, _)| 1 << i)
-        .sum();
+    let km = super::layer_mask(k, |l| {
+        !matches!(s.layers.get(l as usize), Some(LayerKind::Gdn) | None)
+    })?;
     let hcc = p.row_dims.first().ok_or("snake: no row dims")?.dims;
     let gate = u32::from(s.attn.output_gate);
     let (hd, kvh) = (s.attn.head_dim, s.attn.kv_heads);
@@ -177,7 +174,7 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
                 KM: km,
                 NQA: nqa,
                 NQG: nqg,
-                GDN: u32::from(km != (1 << k) - 1),
+                GDN: u32::from(km != (1u32 << k) - 1),
                 ATT: u32::from(km != 0),
                 DV: dv,
                 DK: dk,

@@ -135,6 +135,20 @@ pub fn symbols(set: KernelSet) -> &'static [(&'static str, &'static str)] {
     }
 }
 
+/// The bits of a unit's layer mask (`KM`: a `u16` in `cy.csl` and `weight.csl`).
+pub const KM_BITS: u32 = 16;
+
+/// A unit's layer mask over its `k` layers (bit `l` where `of(l)`), or why a unit of `k` layers
+/// has none.
+pub fn layer_mask(k: u32, of: impl Fn(u32) -> bool) -> R<u32> {
+    if k > KM_BITS {
+        return Err(format!(
+            "{k} layers a unit past the layer mask's {KM_BITS} bits"
+        ));
+    }
+    Ok((0..k).filter(|&l| of(l)).fold(0, |m, l| m | (1 << l)))
+}
+
 /// A colour as an rcfg word.
 pub fn word(c: Colour) -> u32 {
     u32::from(c.0)

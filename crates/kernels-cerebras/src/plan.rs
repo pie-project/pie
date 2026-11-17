@@ -385,13 +385,6 @@ impl Plan {
         if sh.hidden == 0 || sh.vocab == 0 || sh.layers.is_empty() {
             return bad("an empty model".into());
         }
-        if pa.hidden_placed() < sh.hidden {
-            return bad(format!(
-                "placed hidden {} < hidden {}",
-                pa.hidden_placed(),
-                sh.hidden
-            ));
-        }
         if pa.units == 0 || pa.layers_per_unit == 0 || pa.rows == 0 || pa.cols == 0 {
             return bad("no units, layers, rows or columns".into());
         }
@@ -416,6 +409,14 @@ impl Plan {
         }
         if next != pa.rows {
             return bad(format!("row runs end at {next}, not {}", pa.rows));
+        }
+        // (the runs in order first: a run's rows are its end less its start)
+        if pa.hidden_placed() < sh.hidden {
+            return bad(format!(
+                "placed hidden {} < hidden {}",
+                pa.hidden_placed(),
+                sh.hidden
+            ));
         }
         // A segment lives in one half of a unit row and must not span its control column.
         let halves: Vec<(&str, u32, u32)> = match pa.attn_cols {

@@ -249,10 +249,7 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
     let plan = &prog.plan;
     let (s, p) = (&plan.shape, &plan.partition);
     let k = p.layers_per_unit;
-    let km: u32 = (0..k)
-        .filter(|&l| matches!(s.layers[l as usize], LayerKind::Global))
-        .map(|l| 1 << l)
-        .sum();
+    let km = super::layer_mask(k, |l| matches!(s.layers[l as usize], LayerKind::Global))?;
     let hcc = p.row_dims[0].dims;
     let qh = s.attn.q_heads / 2;
     let hds = s.attn.head_dim;

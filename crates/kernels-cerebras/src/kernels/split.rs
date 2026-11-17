@@ -179,9 +179,9 @@ impl Dims {
         let qh = s.attn.q_heads / s.attn.kv_heads;
         let dc = s.attn.head_dim / p.segments.scores;
         let ic = moe.expert_intermediate / (p.cols - ax);
-        let km = (0..k)
-            .filter(|&l| matches!(s.layers.get(l as usize), Some(LayerKind::Global)))
-            .fold(0, |m, l| m | (1 << l));
+        let km = super::layer_mask(k, |l| {
+            matches!(s.layers.get(l as usize), Some(LayerKind::Global))
+        })?;
         let win = s
             .layers
             .iter()
