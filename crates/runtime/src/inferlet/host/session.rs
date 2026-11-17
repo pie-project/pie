@@ -14,6 +14,7 @@ use wasmtime_wasi::WasiView;
 /// is the one whose KV the planner may move off the device first.
 async fn idle_while<T>(pid: crate::inferlet::ProcessId, wait: impl Future<Output = T>) -> T {
     let planner = crate::planner::planner_of(pid);
+    crate::policy::report(crate::policy::Event::Idle(pid, true));
     if let Some(planner) = &planner {
         planner.set_idle(pid, true);
     }
@@ -21,6 +22,7 @@ async fn idle_while<T>(pid: crate::inferlet::ProcessId, wait: impl Future<Output
     if let Some(planner) = planner {
         planner.set_idle(pid, false);
     }
+    crate::policy::report(crate::policy::Event::Idle(pid, false));
     out
 }
 

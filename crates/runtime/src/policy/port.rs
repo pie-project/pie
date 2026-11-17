@@ -278,6 +278,9 @@ struct Proc {
     /// The runtime's process (a restart's is new).
     pid: ProcessId,
     state: State,
+    /// Waiting on its client: paused by the client, whatever else moves
+    /// its KV meanwhile.
+    idle: bool,
     session: Option<String>,
     /// What its fires mapped in from the cache, once one has looked.
     cached_tokens: Option<u64>,
@@ -287,6 +290,8 @@ struct Proc {
     prompt_tokens: Option<u64>,
     /// The rows its fires read out.
     generated_tokens: u64,
+    /// The rows its fires wrote: its working set's length.
+    rows: u64,
     restarts: u64,
 }
 
@@ -478,10 +483,12 @@ impl Port {
                         state: State::Waiting,
                         session,
                         pid,
+                        idle: false,
                         cached_tokens: None,
                         prompt_rows: 0,
                         prompt_tokens: None,
                         generated_tokens: 0,
+                        rows: 0,
                         restarts: 0,
                     },
                 );
@@ -496,6 +503,7 @@ impl Port {
             Event::Fired(pid, rows, readouts) => {
                 let id = schedule::plex_id(pid);
                 if let Some(proc) = self.procs.get_mut(&id) {
+                    proc.rows += rows;
                     if proc.prompt_tokens.is_none() {
                         proc.prompt_rows += rows;
                         if readouts > 0 {
@@ -518,9 +526,24 @@ impl Port {
                     host.started(&id.to_string());
                 }
             }
-            Event::Paused(pid) => {
+            Event::Idle(pid, idle) => {
                 let id = schedule::plex_id(pid);
                 if let Some(proc) = self.procs.get_mut(&id) {
+                    proc.idle = idle;
+                    if idle {
+                        proc.state = State::Paused;
+                        host.paused(&id.to_string(), "client");
+                    } else {
+                        proc.state = State::Running;
+                        host.started(&id.to_string());
+                    }
+                }
+            }
+            Event::Paused(pid) => {
+                let id = schedule::plex_id(pid);
+                if let Some(proc) = self.procs.get_mut(&id)
+                    && !proc.idle
+                {
                     proc.state = State::Paused;
                     // A held process was paused for its row; any other, for
                     // the host's own room.
@@ -740,6 +763,28 @@ impl Port {
             );
             now.insert(id);
         }
+        // A live process's own working set, before any of it is cached: a
+        // policy's rows on it (its retention while it waits) need it known.
+        for (id, proc) in &self.procs {
+            if now.contains(id) || proc.rows == 0 {
+                continue;
+            }
+            let tokens = u32::try_from(proc.rows).unwrap_or(u32::MAX);
+            let tier = match (self.cache.resident)(proc.pid) {
+                Some(false) => WitTier::Host,
+                _ => WitTier::Device,
+            };
+            self.host.put_working_set(
+                &id.to_string(),
+                None,
+                Some(id.to_string()),
+                proc.session.clone(),
+                tokens,
+                0,
+                vec![(WORKER.to_string(), tier, tokens)],
+            );
+            now.insert(*id);
+        }
         for (id, rest) in &self.handles {
             let tokens = u32::try_from(rest.resting.tokens).unwrap_or(u32::MAX);
             let tier = match (self.cache.resident)(*id) {
@@ -834,6 +879,11 @@ impl Port {
             prefix,
         );
         if kept {
+            tracing::debug!(
+                priority = c.retention.len(),
+                tiers = c.tiers.len(),
+                "retention rows installed"
+            );
             let mut steps: HashMap<ProcessId, Vec<(Option<u64>, i64)>> = HashMap::new();
             for (&(owner, tokens), &key) in &c.retention {
                 steps

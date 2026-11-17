@@ -37,6 +37,9 @@ pub struct ResidencyPlanner {
     pub(super) waiters: AtomicUsize,
     pub(super) nonresident: AtomicUsize,
     drain: OnceLock<Arc<Notify>>,
+    /// The runtime the planner was made on: where a tiers sweep asked from
+    /// off it (the policy port's thread) runs.
+    runtime: Option<tokio::runtime::Handle>,
     idle_reclaim_exhausted: std::sync::atomic::AtomicBool,
     pub(super) sweeping: AtomicBool,
     sweep_exhausted: AtomicBool,
@@ -97,6 +100,7 @@ impl ResidencyPlanner {
             waiters: AtomicUsize::new(0),
             nonresident: AtomicUsize::new(0),
             drain: OnceLock::new(),
+            runtime: tokio::runtime::Handle::try_current().ok(),
             idle_reclaim_exhausted: std::sync::atomic::AtomicBool::new(false),
             sweeping: AtomicBool::new(false),
             sweep_exhausted: AtomicBool::new(false),
@@ -411,13 +415,35 @@ impl ResidencyPlanner {
     /// nowhere it is goes now, and what they keep off the device moves
     /// down now, with no waiter's want.
     pub(super) fn sweep_tiers(self: &Arc<Self>) {
-        // A move runs on the runtime: called off it, the sweep waits for
-        // the next plan that runs there.
+        // A move runs on the runtime: called off it, the sweep goes there,
+        // or (a planner made off any runtime) waits for the next plan that
+        // runs on one.
         if !crate::rt::has_runtime() {
-            crate::policy::retention::idle_cache_appeared();
+            match &self.runtime {
+                Some(runtime) => {
+                    let planner = self.clone();
+                    runtime.spawn(async move { planner.sweep_tiers() });
+                }
+                None => crate::policy::retention::idle_cache_appeared(),
+            }
             return;
         }
         tracing::debug!(target: "pie::retention", busy = self.demoting.load(Ordering::Acquire), "tiers sweep");
+        // A process waiting on its client whose row keeps its KV off the
+        // device is paused, its KV moved down for the wait.
+        let off: Vec<ProcessId> = self.with_inner(|inner| {
+            inner
+                .procs
+                .iter()
+                .filter(|(pid, proc)| proc.idle && Self::kept_off_device(**pid))
+                .map(|(pid, _)| *pid)
+                .collect()
+        });
+        let idle = self.with_inner(|inner| inner.procs.values().filter(|proc| proc.idle).count());
+        tracing::debug!(target: "pie::retention", idle, off = off.len(), "tiers sweep: idle processes");
+        if !off.is_empty() {
+            self.pause(off, |proc| proc.idle);
+        }
         if self.port.drop_disallowed() > 0 {
             self.re_arm_idle_reclaim();
             self.poke();
@@ -431,6 +457,12 @@ impl ResidencyPlanner {
             Some(txn) => exec::spawn_move_out(self.clone(), txn, "demote", Self::tiers_done),
             None => self.demoting.store(false, Ordering::Release),
         }
+    }
+
+    /// Whether `pid`'s own working set may not sit on the device.
+    fn kept_off_device(pid: ProcessId) -> bool {
+        use crate::policy::retention::{DEVICE, Installed, Keys};
+        Installed.tiers_at(Some(pid), 0) & DEVICE == 0
     }
 
     /// A move a tiers row asked for landed: the next group goes, until none
@@ -941,6 +973,11 @@ impl ResidencyPlanner {
                 return;
             };
             proc.idle = idle;
+            if idle {
+                // A tiers row may keep its working set off the device while
+                // it waits.
+                crate::policy::retention::idle_cache_appeared();
+            }
             if self.seat_to_end {
                 self.to_end_notify.notify_waiters();
             }
