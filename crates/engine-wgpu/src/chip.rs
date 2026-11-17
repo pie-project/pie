@@ -69,6 +69,22 @@ pub fn resolve(device: &Device, profiles: Option<&Path>) -> (Profile, Report) {
     SHELF.resolve(registry(), &device.name, &device.facts(), profiles)
 }
 
+/// The adapter this machine would serve, by name, with its facts.
+#[must_use]
+pub fn probe() -> Option<(String, Facts)> {
+    let context =
+        crate::device::Context::bind(&crate::api::DeviceBoot::default(), engine::Allowance::WHOLE)
+            .ok()?;
+    let device = context.chip();
+    Some((device.name.clone(), device.facts()))
+}
+
+/// [`resolve`] by the adapter's name and facts.
+#[must_use]
+pub fn resolve_facts(name: &str, facts: &Facts, profiles: Option<&Path>) -> (Profile, Report) {
+    SHELF.resolve(registry(), name, facts, profiles)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
