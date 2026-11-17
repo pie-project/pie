@@ -298,17 +298,12 @@ pub fn check(
     }
     let e = &weighed.estimate;
     let est: Vec<f64> = rungs.iter().map(|r| e.ns(r)).collect();
-    // The estimate picks among the rungs a load lays (to its fire top); the
-    // measured best is of every rung timed, past it.
-    let offered: Vec<usize> = (0..rungs.len())
-        .filter(|&k| rungs[k].tokens <= weighed.fire_top)
-        .collect();
-    let by_est = super::pick(
-        &offered.iter().map(|&k| rungs[k]).collect::<Vec<_>>(),
-        &offered.iter().map(|&k| est[k]).collect::<Vec<_>>(),
-        weighed.live,
-    )
-    .map_err(|e| e.to_string())?;
+    // Both picks are the ruling's over every rung timed: the estimate's
+    // argmax (efficiency times live capacity) against the measured times'.
+    // No cap stands between them: the load's fire top is the estimate's own
+    // argmax over the lattice to its context, so it offers the estimate's
+    // pick, and a top set too low shows as a measured best past it.
+    let by_est = super::pick(&rungs, &est, weighed.live).map_err(|e| e.to_string())?;
     let by_meas = super::pick(&rungs, &meas, weighed.live).map_err(|e| e.to_string())?;
     let scores = super::scored(&rungs, &meas, weighed.live);
     let score = |tokens: u32| {

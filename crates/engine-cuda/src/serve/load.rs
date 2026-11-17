@@ -2600,7 +2600,7 @@ fn activation_rungs(
 mod tests {
     use super::widened;
 
-    /// The MI300X's lattice to its saturation point, 13778.
+    /// A lattice to 13778, as the MI300X laid it.
     const LATTICE: [u32; 21] = [
         512, 1024, 2048, 2234, 2436, 2656, 2897, 3159, 3445, 3757, 4096, 4467, 4871, 5312, 5793,
         6317, 6889, 7513, 8192, 9742, 13778,

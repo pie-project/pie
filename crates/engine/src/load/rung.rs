@@ -298,12 +298,27 @@ impl FireEstimate {
         }
     }
 
-    /// The rows past which no rung of `lattice` can be chosen, by this
-    /// estimate of the model's own fire: the rung of `lattice` whose prompt
-    /// runs the most tokens a ns (the narrowest of a tie). A top rung is the
-    /// argmax of efficiency times live capacity; past this rung efficiency
-    /// only falls and live capacity only falls as rows grow, so none past it
-    /// can win.
+    /// The fire top: of the rungs of `lattice` a prompt can hold (no wider
+    /// than `context`; `context` itself where none is), the one whose prompt
+    /// runs the most tokens a ns by this estimate (the narrowest of a tie).
+    /// The estimate's argmax over the whole lattice, bounded by the context
+    /// alone: no rule over the matmul curve stops it short, so a knee past a
+    /// flat stretch is reached. A top rung is the argmax of efficiency times
+    /// live capacity; past this rung efficiency only falls and live capacity
+    /// only falls as rows grow, so none past it can win, and a load offers
+    /// the rungs to it.
+    #[must_use]
+    pub fn fire_top(&self, lattice: &[u32], context: u32) -> u32 {
+        let held: Vec<u32> = lattice.iter().copied().filter(|&m| m <= context).collect();
+        if held.is_empty() {
+            return context.max(1);
+        }
+        self.top(&held)
+    }
+
+    /// The rung of `lattice` whose prompt runs the most tokens a ns (the
+    /// narrowest of a tie): [`FireEstimate::fire_top`] over a lattice the
+    /// caller has bounded.
     #[must_use]
     pub fn top(&self, lattice: &[u32]) -> u32 {
         let rate = |tokens: u32| {
@@ -783,6 +798,34 @@ mod tests {
             .unwrap();
         assert_eq!(e.top(&lattice), want);
         assert!(want > 1024 && want < 32768, "{want}");
+    }
+
+    /// The M1's 1024-wide matmul curve: nearly flat from 256 to 512 rows,
+    /// then a knee at 1024 (2.3 / 2.35 / 5.0 TFLOP/s). A rule that stops
+    /// where a doubling stops paying stops at 256; the fire top is the
+    /// estimate's argmax over the lattice, so it lies past the knee, bounded
+    /// by what a prompt holds alone.
+    #[test]
+    fn the_fire_top_reaches_past_a_knee_after_a_flat_stretch() {
+        let (e, _) = summed(0, 1.0);
+        let e = FireEstimate {
+            rates: crate::roofline::Constants {
+                gemm_by_rows: vec![(
+                    1024,
+                    vec![(256, 2300.0), (512, 2350.0), (1024, 5000.0), (2048, 5100.0)],
+                )],
+                ..e.rates
+            },
+            dense_bytes: 1 << 20,
+            gemm_shapes: vec![GemmShape::dense(1024, 1024, 2 * 1024 * 1024, 1 << 21)],
+            ..e
+        };
+        let lattice = [256, 512, 1024, 2048];
+        assert_eq!(e.fire_top(&lattice, 4096), 2048);
+        // A context of 1024 holds no prompt of 2048: the knee itself.
+        assert_eq!(e.fire_top(&lattice, 1024), 1024);
+        // A context short of every rung: the context.
+        assert_eq!(e.fire_top(&lattice, 100), 100);
     }
 
     #[test]

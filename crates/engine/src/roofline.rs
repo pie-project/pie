@@ -17,8 +17,6 @@
 
 use std::sync::Arc;
 
-use crate::rates::{AGREEMENT, GEMM_WIDTH};
-
 /// The rows of the tile a backend's matmul kernel pads `m` rows to at
 /// `(m, n, k)` (1 where it pads nothing).
 pub type RowTile = Arc<dyn Fn(u32, u32, u32) -> u32 + Send + Sync>;
@@ -181,38 +179,6 @@ impl Constants {
     }
 }
 
-/// The rows past which no rung can be chosen, by the roofline alone: of the
-/// widest matmul curve's rows, ascending, the first `p` past which a doubling to
-/// `2p` rows of a [`GEMM_WIDTH`]-square plane (its launch, and its bf16
-/// read or its compute, [`Constants::gemm_ns`]) costs a row no more than
-/// [`AGREEMENT`] less; the curve's widest row where every doubling still
-/// gains. A top rung is the argmax of efficiency times live capacity, and
-/// live capacity only falls as rows grow, so no rung past it can win. On
-/// `lattice` (ascending), its first row at or past it.
-#[must_use]
-pub fn fire_top(lattice: &[u32], constants: &Constants) -> u32 {
-    let w = GEMM_WIDTH;
-    let plane = 2.0 * f64::from(w) * f64::from(w);
-    let per_row = |m: u32| constants.gemm_ns(m, w, w, plane) / f64::from(m.max(1));
-    let rows: Vec<u32> = constants
-        .gemm_by_rows
-        .last()
-        .map(|(_, c)| c.iter().map(|&(m, _)| m).collect())
-        .unwrap_or_default();
-    let top = rows
-        .iter()
-        .copied()
-        .find(|&p| per_row(p.saturating_mul(2)) > (1.0 - AGREEMENT) * per_row(p))
-        .or(rows.last().copied())
-        .unwrap_or(1);
-    lattice
-        .iter()
-        .copied()
-        .find(|&m| m >= top)
-        .or(lattice.last().copied())
-        .unwrap_or(top)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,25 +256,5 @@ mod tests {
             900.0 + flops / 202_000.0
         );
         assert_eq!(c.dispatch_ns(0.0, 1.0, 0.0), 900.0);
-    }
-
-    #[test]
-    fn the_fire_top_is_where_a_doubling_stops_paying() {
-        let mut lattice: Vec<u32> = (0..=14).map(|i| 1u32 << i).chain([2234, 2436]).collect();
-        lattice.sort_unstable();
-        // 2048 to 4096 gains 4% (192 to 200): not more than AGREEMENT, so
-        // 2048 is the top.
-        assert_eq!(fire_top(&lattice, &constants()), 2048);
-        // A curve still rising 10% each doubling to its end: its widest row.
-        let rising = Constants {
-            gemm_by_rows: vec![(
-                4096,
-                (8..=13)
-                    .map(|i| (1u32 << i, 1000.0 * 1.1f64.powi(i)))
-                    .collect(),
-            )],
-            ..constants()
-        };
-        assert_eq!(fire_top(&lattice, &rising), 8192);
     }
 }

@@ -445,12 +445,13 @@ pub(crate) fn on_lattice(engine: &crate::chip::Engine, top: u32, tokens: u32) ->
         .unwrap_or(lattice[0])
 }
 
-/// The fire top of `trace` on this card (`engine::load::FireEstimate::top`):
-/// the rung of its lattice to `context` ([`probed_rows`]) whose prompt runs
-/// the most tokens a ns by the profile's measured rates. Past it no rung's
-/// efficiency improves, so none past it can be chosen. A profile without
-/// the rates the model needs has no top, and a load on it is refused for
-/// them, by name.
+/// The fire top of `trace` on this card
+/// (`engine::load::FireEstimate::fire_top`): the estimate's argmax over its
+/// rung lattice to `context`, the most tokens one prompt holds, by the
+/// profile's measured rates. No rung is priced at rows no fire can carry
+/// (asked of cuBLASLt's heuristic at 2^30 rows, it divides by zero). A
+/// profile without the rates the model needs has no top, and a load on it
+/// is refused for them, by name.
 pub(crate) fn fire_top_of(
     chip: &profile::Profile,
     trace: &Trace,
@@ -467,15 +468,9 @@ pub(crate) fn fire_top_of(
             .to_string(),
         )
     })?;
-    Ok(estimate.top(&probed_rows(&crate::chip::Engine::of(chip), context)))
-}
-
-/// The rows the fire top weighs: the rung lattice to `context`, the most
-/// tokens one prompt holds, so no rung is priced at rows no fire can carry
-/// (asked of cuBLASLt's heuristic at 2^30 rows, it divides by zero).
-#[must_use]
-pub(crate) fn probed_rows(engine: &crate::chip::Engine, context: u32) -> Vec<u32> {
-    rung_lattice(engine, context.max(1))
+    let context = context.max(1);
+    let lattice = rung_lattice(&crate::chip::Engine::of(chip), context);
+    Ok(estimate.fire_top(&lattice, context))
 }
 
 /// The load's budgets for `trace`: its logit readouts sized to what the
@@ -2007,19 +2002,5 @@ pub(crate) fn readout_facts() -> engine::ReadoutFacts {
     engine::ReadoutFacts {
         landing: engine::ReadoutLanding::InSpan,
         store_rows: None,
-    }
-}
-
-#[cfg(test)]
-mod probed_rows_tests {
-    #[test]
-    fn the_fire_top_weighs_no_rows_past_a_prompt() {
-        let engine = crate::chip::Engine::of(&crate::chip::profile(""));
-        for context in [1, 4096, 131_072] {
-            let rows = super::probed_rows(&engine, context);
-            assert_eq!(rows.last(), Some(&context), "{rows:?}");
-            assert!(rows.iter().all(|&m| m <= context));
-            assert!(rows.windows(2).all(|w| w[0] < w[1]));
-        }
     }
 }
