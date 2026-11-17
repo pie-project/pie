@@ -12,6 +12,7 @@
 
 pub mod cost;
 pub mod decode;
+pub mod flow;
 pub mod pack;
 pub mod route;
 pub mod stream;
