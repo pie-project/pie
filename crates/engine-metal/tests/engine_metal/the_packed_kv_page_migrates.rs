@@ -230,7 +230,6 @@ fn migrate_case(rig: &mut Rig, head_dim: usize) {
         atoms: Default::default(),
         shards: Default::default(),
         short_runs: Vec::new(),
-        cow_sets: 1,
         waste: Default::default(),
         profile: ChunkProfile::ON_DEVICE_METAL,
         weights: Vec::new(),

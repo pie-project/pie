@@ -60,23 +60,6 @@ pub const TOKEN_GRAIN: u32 = 16;
 /// fires read.
 pub const FIXED_SETS_PER_WS: u32 = 1;
 
-/// The copy-on-write fixed records a lane that runs in a fire takes beside its
-/// working set's (a fork, or a snapshot restored, within the fire). The pool
-/// keeps one reserve of these for its most lanes, not one a working set.
-pub const COW_SETS_PER_LANE: u32 = 1;
-
-/// The copy-on-write fixed records a pool reserves under `budgets`:
-/// [`COW_SETS_PER_LANE`] for each of the most lanes a fire runs. Derived, not
-/// configured.
-#[must_use]
-pub fn cow_sets(budgets: &Budgets) -> u32 {
-    budgets
-        .tokens
-        .max_lanes
-        .max(1)
-        .saturating_mul(COW_SETS_PER_LANE)
-}
-
 /// The least bytes a fixed slot takes: a record of a few bytes shares a chunk
 /// with a thousand-odd others.
 pub const FIXED_SLOT_FLOOR: u64 = 1 << 10;
@@ -316,9 +299,6 @@ pub struct ChunkRecipe {
     /// Layers of a token slot whose run is under [`MIN_RUN`] because a slot
     /// long enough would not fit a chunk.
     pub short_runs: Vec<RowId>,
-    /// The copy-on-write fixed records the pool reserves once, beside every
-    /// working set's own: [`cow_sets`] of the budgets planned for.
-    pub cow_sets: u32,
     pub waste: Waste,
     pub profile: ChunkProfile,
     /// The weight slot shapes: routed experts and gathered table rows the
@@ -384,32 +364,6 @@ impl RsLayout {
 }
 
 impl ChunkRecipe {
-    /// The copy-on-write fixed records the pool reserves once.
-    #[must_use]
-    pub fn cow_sets(&self) -> u32 {
-        self.cow_sets
-    }
-
-    /// The fixed slots the copy-on-write reserve takes in the pool.
-    #[must_use]
-    pub fn cow_slots(&self) -> u64 {
-        match self.fixed() {
-            Some(SlotLayout::Fixed { pieces_per_ws, .. }) => {
-                u64::from(self.cow_sets) * u64::from(*pieces_per_ws)
-            }
-            _ => 0,
-        }
-    }
-
-    /// The chunks the copy-on-write reserve takes in the pool, counted once.
-    #[must_use]
-    #[allow(clippy::cast_precision_loss)]
-    pub fn cow_chunks(&self) -> f64 {
-        self.fixed().map_or(0.0, |fixed| {
-            self.cow_slots() as f64 / fixed.per_chunk(self.chunk_bytes).max(1) as f64
-        })
-    }
-
     /// The kv list shape.
     #[must_use]
     pub fn list(&self) -> Option<&SlotLayout> {
@@ -456,8 +410,8 @@ impl ChunkRecipe {
     }
 
     /// The chunks a working set takes at the profile's context, its share of
-    /// chunks it shares with others counted in part; the copy-on-write
-    /// reserve is the pool's ([`ChunkRecipe::cow_chunks`]), not counted here.
+    /// chunks it shares with others counted in part. A fork's copy-on-write
+    /// record is taken from the pool when the fork writes, as a seat's is.
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
     pub fn chunks_per_ws(&self) -> f64 {
@@ -646,7 +600,6 @@ pub fn plan(
     let align = device.align();
     let (lo, hi) = device.range();
     let census = census::census(trace, device.state_f32, device.rs_mamba2)?;
-    let cow = cow_sets(budgets);
     let weight_groups = weights::census(trace, budgets.tokens.max_tokens, device.tma_rows);
     // Where experts are not cut, no chunk is smaller than one.
     let expert = weight_groups
@@ -935,7 +888,6 @@ pub fn plan(
             rs.as_ref(),
             pick.as_ref(),
             record,
-            cow,
             chunk,
             &device,
         );
@@ -1012,7 +964,6 @@ pub fn plan(
         atoms,
         shards,
         short_runs,
-        cow_sets: cow,
         waste,
         profile: device,
         weights,
@@ -1341,14 +1292,12 @@ fn pick_fixed(rows: &[FixedRow], record: u64, chunk: u64, align: u64) -> Option<
 
 /// What a working set takes at the profile's context with chunks of `chunk`
 /// bytes, and what of that holds nothing: its kv and window lists, its rs list
-/// at [`EXPECTED_UNFOLDED`] tokens, its own fixed record, and its share of
-/// the pool's `cow` copy-on-write records over the profile's concurrency.
+/// at [`EXPECTED_UNFOLDED`] tokens, and its own fixed record.
 fn weigh(
     tokens: &[SlotLayout],
     rs: Option<&RsShape>,
     fixed: Option<&FixedPick>,
     record: u64,
-    cow: u32,
     chunk: u64,
     device: &ChunkProfile,
 ) -> Waste {
@@ -1383,9 +1332,9 @@ fn weigh(
     }
     if let Some(pick) = fixed {
         shapes += 1;
-        // The pool's fixed records: a set a working set, and the reserve once.
+        // The pool's fixed records: a set a working set.
         let working = u64::from(device.concurrency.max(1));
-        let sets = working * u64::from(FIXED_SETS_PER_WS) + u64::from(cow);
+        let sets = working * u64::from(FIXED_SETS_PER_WS);
         let held = u64::from(pick.pieces) * pick.slot;
         waste.state += sets * record / working;
         waste.fixed_pad += sets * held.saturating_sub(record) / working;
