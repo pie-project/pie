@@ -210,11 +210,13 @@ impl Session {
     /// first slot, or each of its whole chunks' first, through the pool's
     /// view, each with the bytes it holds. The pool may have moved them
     /// since the last fire (an evacuation, an unpark), so a fire asks anew.
+    /// Only the device reads scratch, through the view, so a piece may cross
+    /// a placement heap's end (a chunk may): no one host address is asked.
     pub fn scratch_at(&self, pools: &Pools) -> Result<Vec<ScratchAt>> {
         pieces_of(&self.scratch, pools)?
             .into_iter()
             .map(|(first, bytes)| {
-                let (buffer, offset, _, _) = pools.slot_place(INSTANCE, first)?;
+                let (buffer, offset, _, _) = pools.slot_runs(INSTANCE, first)?;
                 Ok(ScratchAt {
                     buffer,
                     offset,
