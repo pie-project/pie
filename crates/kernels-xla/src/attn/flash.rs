@@ -14,9 +14,10 @@
 //! page out of the planes (pooled planes as the pool lays them, unpacked in
 //! VMEM). A lane whose rows the fire did not append in its own slots (a
 //! guest's stated write slots) reads all its keys that way, as the walk
-//! reads them through its table: a choice made per lane, as data. A fire
-//! with a row under a custom mask walks: the fire decides at run time
-//! (`stablehlo.case`), the walk being the other branch.
+//! reads them through its table: a choice made per lane, as data; so does a
+//! lane with a row under a custom mask, whose mask columns gate its keys in
+//! the kernel (copied by position, only in row blocks that hold such a row).
+//! The kernel carries no run-time branch.
 //!
 //! Grid: one step per row block, its key blocks walked by a loop with the
 //! next block's `k`/`v` copying in (two buffers) while the current one is
@@ -33,14 +34,11 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::error::Error;
-use crate::hlo::{Branch, Built, Cmp, Elem, Fold, Func, Malformed, Ty, Val};
+use crate::hlo::{Built, Cmp, Elem, Fold, Func, Malformed, Val};
 use crate::mosaic::{Body, Compiled, Grid, ICmp, Kernel, MTy, Sem, Space, V, Window};
 use crate::tensor::{Operand, PageMap};
 
 use super::paged::{Flashed, Geom, Heads, cmp_i, read_rows_i32, round_up, with_i};
-
-/// The paged walk a fire falls back to.
-pub(crate) type Walk<'a> = Box<dyn FnOnce(&mut Func) -> Built<Flashed> + 'a>;
 
 /// Keys per block.
 const BK: i64 = 256;
@@ -157,6 +155,11 @@ struct OldPages {
     np: i64,
     ps: i64,
     split: bool,
+    /// The custom mask's column plane, where the fire carries one: `i32
+    /// [r, w]`, position `k` at column `k + BK`; prefetched each row's flag,
+    /// its lane's shift (`Older::shift`) and each row block's flag (any
+    /// flagged row).
+    mask: Option<i64>,
 }
 
 impl Shape {
@@ -329,6 +332,10 @@ fn kernel(s: &Shape, vmem_cap: i64, old: &OldPages) -> Built<Compiled> {
     if old.split {
         prefetch.push(vec![old.np]);
     }
+    let mask_at = prefetch.len();
+    if old.mask.is_some() {
+        prefetch.extend([vec![r], vec![r], vec![nb]]);
+    }
     let planes = match src {
         Src::Plain { slots } => vec![any(vec![slots, wk]), any(vec![slots, wv])],
         Src::Pooled { rows } => vec![any_of(vec![rows, 128], Elem::U32)],
@@ -348,6 +355,13 @@ fn kernel(s: &Shape, vmem_cap: i64, old: &OldPages) -> Built<Compiled> {
         scratch.push(MTy::Ref(vec![2, per_blk, hk, 128], Elem::U32, Space::Vmem));
         scratch.push(MTy::Ref(vec![2, per_blk, hv, 128], Elem::U32, Space::Vmem));
     }
+    let mscratch_at = scratch.len();
+    if old.mask.is_some() {
+        // a flagged row block's mask columns for an older block, a row's a
+        // tile of its own (copied row by row), and their copies' semaphore
+        scratch.push(MTy::Ref(vec![bq, 1, bk], Elem::I32, Space::Vmem));
+        scratch.push(MTy::Sem(vec![1]));
+    }
     let mut ins = vec![
         blocked(
             vec![r, qh * d],
@@ -363,6 +377,10 @@ fn kernel(s: &Shape, vmem_cap: i64, old: &OldPages) -> Built<Compiled> {
         blocked(vec![1, r], Elem::I32, vec![1, bq], Box::new(cols)),
     ];
     ins.extend(planes);
+    let plane_at = ins.len();
+    if let Some(w) = old.mask {
+        ins.push(any_of(vec![r, w], Elem::I32));
+    }
     let k = Kernel {
         name: "flash_prefill".into(),
         grid: vec![nb],
@@ -398,6 +416,17 @@ fn kernel(s: &Shape, vmem_cap: i64, old: &OldPages) -> Built<Compiled> {
             Src::Pooled { .. } => Some((blk.scratch[7], blk.scratch[8])),
             Src::Plain { .. } => None,
         };
+        let masked = old.mask.map(|_| {
+            let pre = &blk.grid.prefetch;
+            (
+                pre[mask_at],
+                pre[mask_at + 1],
+                pre[mask_at + 2],
+                blk.ins[plane_at],
+                blk.scratch[mscratch_at],
+                blk.scratch[mscratch_at + 1],
+            )
+        });
         let (o_ref, mo_ref, lo_ref) = (blk.outs[0], blk.outs[1], blk.outs[2]);
         let (kbuf, vbuf, sems, bias_ref, m_s, l_s, acc_s) = (
             blk.scratch[0],
@@ -606,6 +635,61 @@ fn kernel(s: &Shape, vmem_cap: i64, old: &OldPages) -> Built<Compiled> {
             let ninf = b.splat_f(&sq, Elem::F32, f64::NEG_INFINITY)?;
             let bias = b.select(ok, zs, ninf)?;
             b.vstore_all(bias, bias_ref)?;
+            // A flagged row block's older block: each flagged row's mask
+            // columns (its lane's positions are the block's rows less its
+            // shift, a whole 128) gate its keys, as the walk's mask does.
+            if let Some((en_ref, shift_ref, flag_ref, plane, mt, msem)) = masked {
+                let flag = b.load(flag_ref, &[i])?;
+                let z = b.i32(0);
+                let any = b.cmpi(ICmp::Ne, flag, z)?;
+                let go = b.andi(any, is_old)?;
+                b.when(go, |b| {
+                    let ones = b.splat_i(&[bq, 1, bk], 1)?;
+                    let i0 = b.index(0);
+                    b.vstore(ones, mt, &[i0, i0, i0])?;
+                    let z = b.i32(0);
+                    let bqv = b.i32(bq);
+                    let row0 = b.muli(i, bqv)?;
+                    let bkv = b.i32(bk);
+                    let v0 = b.muli(j, bkv)?;
+                    let one = b.i32(1);
+                    let sem = b.ref_slice(msem, &[z], &[1])?;
+                    let sem = b.ref_squeeze(sem)?;
+                    for wait in [false, true] {
+                        b.for_range(z, bqv, one, |b, x| {
+                            let row = b.addi(row0, x)?;
+                            let en = b.load(en_ref, &[row])?;
+                            let z = b.i32(0);
+                            let on = b.cmpi(ICmp::Ne, en, z)?;
+                            b.when(on, |b| {
+                                let sh = b.load(shift_ref, &[row])?;
+                                let at = b.subi(v0, sh)?;
+                                let edge = b.i32(BK);
+                                let at = b.addi(at, edge)?;
+                                let at = b.assume_multiple(at, 128)?;
+                                let z = b.i32(0);
+                                let src = b.ref_slice(plane, &[row, at], &[1, bk])?;
+                                let dst = b.ref_slice(mt, &[x, z, z], &[1, 1, bk])?;
+                                let dst = b.ref_squeeze(dst)?;
+                                if wait {
+                                    b.dma_wait(sem, src, dst)
+                                } else {
+                                    b.dma_start(src, dst, sem)
+                                }
+                            })
+                        })?;
+                    }
+                    let cols = b.vload(mt, &[i0, i0, i0], &[bq, 1, bk])?;
+                    let cols = b.shape_cast(cols, &[bq, bk])?;
+                    let cols = b.transpose(cols)?;
+                    let zc = b.splat_i(&[bk, bq], 0)?;
+                    let keep = b.cmpi(ICmp::Ne, cols, zc)?;
+                    let bias = b.vload_all(bias_ref)?;
+                    let ninf = b.splat_f(&[bk, bq], Elem::F32, f64::NEG_INFINITY)?;
+                    let bias = b.select(keep, bias, ninf)?;
+                    b.vstore_all(bias, bias_ref)
+                })?;
+            }
 
             let z = b.i32(0);
             let kslab = b.ref_slice(kbuf, &[slot, z, z], &[1, bk, wk])?;
@@ -755,11 +839,12 @@ fn segments(f: &mut Func, lane: Val, qpos: Val) -> Built<(Val, Val)> {
 /// The attention of `q4` (`[r, kvh, g, d]` bf16) rows over the fire's
 /// appended keys and their lanes' older keys, read page by page out of the
 /// planes: `lo`/`hi` bound each row's admitted positions, `lane` its lane
-/// (clamped), `cap` the lane's capacity, `enabled` its custom-mask flag
-/// (a fire with a live row under a mask takes `walk`), `slots` the pool
-/// plane's rows. A lane whose rows did not all land in its own slots
-/// (`through_pages`) reads every key through its pages, as the walk would.
-/// `o` is bf16.
+/// (clamped), `cap` the lane's capacity, `slots` the pool plane's rows.
+/// `mask`: each row's custom-mask flag, the mask plane (`[r, pitch]` u8,
+/// a row's byte at key position `k`) and its bound. A lane whose rows did
+/// not all land in its own slots, or with a flagged row (`through_pages`),
+/// reads every key through its pages, as the walk would; a flagged row's
+/// keys are gated by its mask in the kernel. `o` is bf16.
 pub(crate) fn attend(
     f: &mut Func,
     ap: &Appended,
@@ -773,11 +858,10 @@ pub(crate) fn attend(
     lo: Val,
     hi: Val,
     cap: Val,
-    enabled: Option<Val>,
+    mask: Option<(Val, Val, i64)>,
     scale: f64,
     vmem_cap: i64,
     narrow_rows: i64,
-    walk: Walk<'_>,
     maps: [PageMap; 2],
 ) -> Built<Flashed> {
     let r = f.dims(q4)[0];
@@ -790,46 +874,36 @@ pub(crate) fn attend(
     };
     let (start, p0) = segments(f, lane, qpos)?;
     let live = cmp_i(f, Cmp::Ge, qpos, 0)?;
-    let paged = through_pages(f, geom, slots, ap, lane, qpos, cap, live, maps[0])?;
+    // each live row's flag (none on a padded row)
+    let flags = match mask {
+        Some((en, _, _)) => {
+            let z = f.like_i(en, 0);
+            Some(f.select(live, en, z)?)
+        }
+        None => None,
+    };
+    let paged = through_pages(f, geom, slots, ap, lane, qpos, cap, live, flags, maps[0])?;
     // A paged lane's rows read `[lo, hi)` all as older keys.
     let reach = f.select(paged, hi, p0)?;
     let old = older(f, geom, slots, lane, lo, reach, live, maps)?;
     let fresh = f.not(paged);
     let fresh = f.and(fresh, live)?;
     let (klo, khi) = fresh_rows(f, lo, hi, p0, start, fresh)?;
-    let Some(en) = enabled else {
-        let (o, m, l) = run(f, &s, ap, q4, klo, khi, vmem_cap, &old, planes)?;
-        return Ok(Flashed { o, m, l });
+    let cols = match (mask, flags) {
+        (Some((_, plane, bound)), Some(en)) => {
+            // position `k` at column `k + BK`: a block's columns from a
+            // block before a lane's first key to a block past its span
+            let w = BK + geom.span + BK;
+            let x = super::pages::mask_columns(f, plane, bound, r, geom.span + BK)?;
+            let zero = f.const_i(Elem::I32, 0, &[]);
+            let x = f.pad(x, zero, &[0, BK], &[0, 0], &[0, 0])?;
+            debug_assert_eq!(f.dims(x)[1], w);
+            Some((en, x))
+        }
+        _ => None,
     };
-    // 0: the walk, where a live row carries a custom mask; 1: the kernel.
-    // This run-time case is a second path every program carries (the walk's
-    // code beside the kernel's in each layer), kept only until the kernel
-    // takes a row's mask bits itself.
-    let off = cmp_i(f, Cmp::Eq, en, 0)?;
-    let dead = f.not(live);
-    let ok = f.or(off, dead)?;
-    let all = f.reduce(ok, &[0], Fold::And)?;
-    let which = f.convert(all, Elem::I32);
-    let outs = vec![
-        Ty::new(Elem::Bf16, &[r, h.kvh, h.g, h.dv]),
-        Ty::new(Elem::F32, &[r, h.kvh, h.g]),
-        Ty::new(Elem::F32, &[r, h.kvh, h.g]),
-    ];
-    let walked: Branch<'_> = Box::new(move |f: &mut Func| {
-        let fl = walk(f)?;
-        let o = f.convert(fl.o, Elem::Bf16);
-        Ok(vec![o, fl.m, fl.l])
-    });
-    let flashed: Branch<'_> = Box::new(move |f: &mut Func| {
-        let (o, m, l) = run(f, &s, ap, q4, klo, khi, vmem_cap, &old, planes)?;
-        Ok(vec![o, m, l])
-    });
-    let out = f.case(which, &outs, vec![walked, flashed])?;
-    Ok(Flashed {
-        o: out[0],
-        m: out[1],
-        l: out[2],
-    })
+    let (o, m, l) = run(f, &s, ap, q4, klo, khi, vmem_cap, &old, planes, cols)?;
+    Ok(Flashed { o, m, l })
 }
 
 /// Each row's key rows `[klo, khi)` of the fire's own rectangle: its
@@ -854,7 +928,8 @@ fn fresh_rows(
 
 /// Whether each row's lane reads all its keys through its pages: a lane
 /// with a live row the fire did not append at its table slot (a guest's
-/// stated write slots may differ from `have + i`), nor within its capacity.
+/// stated write slots may differ from `have + i`), nor within its capacity,
+/// or under a custom mask (`flags`: its columns are read by position).
 /// The walk reads such a lane's keys through its table after the append;
 /// so does the kernel, through the fire's page list. Every other lane reads
 /// its fresh keys from the rectangle the fire appended.
@@ -867,6 +942,7 @@ fn through_pages(
     qpos: Val,
     cap: Val,
     live: Val,
+    flags: Option<Val>,
     keys_map: PageMap,
 ) -> Built<Val> {
     let ps = geom.ps;
@@ -889,7 +965,11 @@ fn through_pages(
     let filed = f.and(filed, below)?;
     let upto = with_i(f, qpos, 1, Func::add)?;
     let held = f.compare(Cmp::Le, upto, cap)?;
-    let ok = f.and(filed, held)?;
+    let mut ok = f.and(filed, held)?;
+    if let Some(en) = flags {
+        let off = cmp_i(f, Cmp::Eq, en, 0)?;
+        ok = f.and(ok, off)?;
+    }
     let stray = f.not(ok);
     let stray = f.and(stray, live)?;
     // any stray row of a lane pages the whole lane
@@ -929,6 +1009,7 @@ pub(crate) fn readouts(
     ch: crate::tuning::Chunks,
     vmem_cap: i64,
     maps: [PageMap; 2],
+    mask: Option<(Val, Val, i64)>,
 ) -> Built<Val> {
     let n = f.dims(lane)[0];
     let (start, p0) = segments(f, lane, qpos)?;
@@ -945,7 +1026,7 @@ pub(crate) fn readouts(
     let hi = f.min(hi, cap)?;
     // A lane whose rows did not all land in its slots reads every key
     // through its pages, as `attend`'s do.
-    let paged = through_pages(f, geom, slots, ap, lane, qpos, cap, live, maps[0])?;
+    let paged = through_pages(f, geom, slots, ap, lane, qpos, cap, live, None, maps[0])?;
     let fresh = f.not(paged);
     let fresh = f.and(fresh, live)?;
     let (klo, khi) = fresh_rows(f, lo, hi, p0, start, fresh)?;
@@ -958,13 +1039,35 @@ pub(crate) fn readouts(
     let pick = |f: &mut Func, v: Val| super::paged::take(f, v, at);
     let (klo, khi) = (pick(f, klo)?, pick(f, khi)?);
     let (olo, ohi, ol) = (pick(f, olo)?, pick(f, ohi)?, pick(f, lane)?);
+    // A readout row under a custom mask (`mask`'s flag, a readout row's)
+    // reads every key through its pages, its mask gating them: a causal
+    // one to itself, a wide one (flag 2) to its lane's capacity.
+    let (klo, khi, olo, ohi, mask) = match mask {
+        Some((en, plane, bound)) => {
+            let (live_r, cap_r) = (pick(f, live)?, pick(f, cap)?);
+            let (lo_r, hi_r) = (pick(f, lo)?, pick(f, hi)?);
+            let on = cmp_i(f, Cmp::Ne, en, 0)?;
+            let on = f.and(on, live_r)?;
+            let wide = cmp_i(f, Cmp::Eq, en, 2)?;
+            let reach = f.select(wide, cap_r, hi_r)?;
+            let none = f.like_i(klo, 0);
+            (
+                f.select(on, none, klo)?,
+                f.select(on, none, khi)?,
+                f.select(on, lo_r, olo)?,
+                f.select(on, reach, ohi)?,
+                Some((en, plane, bound)),
+            )
+        }
+        None => (klo, khi, olo, ohi, None),
+    };
     use super::paged::{KeyList, Planes, Rows, Rule, blocked, per_row};
     let a = if super::pages::fits(geom.span, h, vmem_cap)
         && Src::of(f, planes.0, planes.1, geom.ps).is_some()
     {
         super::pages::attend(
             f, q4, planes.0, planes.1, geom.pt, ol, olo, ohi, geom.pages, geom.ps, h, scale,
-            vmem_cap, maps,
+            vmem_cap, maps, mask,
         )?
     } else {
         let paged = Planes::Paged {
@@ -977,16 +1080,13 @@ pub(crate) fn readouts(
         };
         let mut rows = Rows::new(q4, olo, ohi);
         rows.lane = Some(ol);
-        per_row(
-            f,
-            &paged,
-            h,
-            &Rule::default(),
-            &rows,
-            KeyList::Range,
-            scale,
-            ch,
-        )?
+        let mut rule = Rule::default();
+        if let Some((en, plane, bound)) = mask {
+            rows.enabled = Some(en);
+            rows.mask = Some(plane);
+            rule.bound = bound;
+        }
+        per_row(f, &paged, h, &rule, &rows, KeyList::Range, scale, ch)?
     };
     let b = blocked(
         f,
@@ -1033,6 +1133,8 @@ pub(crate) fn readouts(
 /// last, laid lane after lane (in the order the lanes' first rows come) as
 /// a virtual rectangle of `np` pages, every lane's whole table room, so a
 /// prefix of any length is read; and each row's range `[klo, khi)` in it.
+/// A lane's virtual rows lie a whole 128 rows from its positions (`shift`),
+/// so a block's mask columns come in one aligned copy.
 #[derive(Clone, Copy)]
 struct Older {
     /// Each virtual page's keys plane page, `[np]` (the sink past the ones
@@ -1042,6 +1144,9 @@ struct Older {
     values: Option<Val>,
     klo: Val,
     khi: Val,
+    /// Each row's lane's virtual row less its position (`[r]`, a multiple
+    /// of 128).
+    shift: Val,
     np: i64,
     ps: i64,
 }
@@ -1098,10 +1203,18 @@ fn older(
     let kj = f.broadcast(key, &ll, &[1])?;
     let ki = f.broadcast(key, &ll, &[0])?;
     let before = f.compare(Cmp::Lt, kj, ki)?;
-    let nb = f.broadcast(np_l, &ll, &[1])?;
+    // a lane's room: its pages, whole 128-row blocks, and a block more, so
+    // its first page lies at its position's offset in a block
+    let a = 128 / ps;
+    let room = with_i(f, np_l, 2 * a - 1, Func::add)?;
+    let room = with_i(f, room, a, Func::div)?;
+    let room = with_i(f, room, a, Func::mul)?;
+    let nb = f.broadcast(room, &ll, &[1])?;
     let z = f.like_i(nb, 0);
     let ahead = f.select(before, nb, z)?;
     let base = f.reduce(ahead, &[1], Fold::Sum)?;
+    let lead = with_i(f, first, a, Func::rem)?;
+    let base = f.add(base, lead)?;
     // Each row's range in the rectangle.
     let base_r = super::paged::take(f, base, lane)?;
     let first_r = super::paged::take(f, first, lane)?;
@@ -1114,7 +1227,10 @@ fn older(
     let khi = f.select(reads, khi, none)?;
     // Each virtual page's plane page: lane `l`'s `j`-th from its first at
     // `base[l] + j`, every other one the sink.
-    let np = round_up(lanes * pages, BK / ps);
+    let np = round_up(
+        lanes * (round_up(pages, 128 / ps) + 2 * (128 / ps)),
+        BK / ps,
+    );
     let lp = [lanes, pages];
     let j = f.iota(Elem::I32, &lp, 1);
     let l = f.iota(Elem::I32, &lp, 0);
@@ -1166,6 +1282,7 @@ fn older(
         values,
         klo,
         khi,
+        shift,
         np,
         ps,
     })
@@ -1183,6 +1300,7 @@ fn run(
     vmem_cap: i64,
     old: &Older,
     planes: (Val, Val),
+    mask: Option<(Val, Val)>,
 ) -> Built<(Val, Val, Val)> {
     let Shape {
         r, rp, bq, bk, h, ..
@@ -1244,10 +1362,20 @@ fn run(
         np: old.np,
         ps: old.ps,
         split: old.values.is_some(),
+        mask: mask.map(|(_, cols)| f.dims(cols)[1]),
     };
     let kern = kernel(s, vmem_cap, &pages)?;
     let mut operands = vec![lo_blk, hi_blk, olo, ohi, old.keys];
     operands.extend(old.values);
+    if let Some((en, _)) = mask {
+        // each row block's flag: any flagged row
+        let on = cmp_i(f, Cmp::Ne, en, 0)?;
+        let on = f.convert(on, Elem::I32);
+        let on = pad_rows(f, on, 0)?;
+        let on = f.reshape(on, &[nb, bq])?;
+        let blk = f.reduce(on, &[1], Fold::Max)?;
+        operands.extend([en, old.shift, blk]);
+    }
     operands.extend([q2, ap.k, ap.v, klo, khi, okl, okh]);
     match s.src {
         // both planes out of the pool itself
@@ -1257,6 +1385,7 @@ fn run(
         },
         Src::Plain { .. } => operands.extend([planes.0, planes.1]),
     }
+    operands.extend(mask.map(|(_, cols)| cols));
     let out = kern.call(f, &operands)?;
     let o = f.reshape(out[0], &[r, h.kvh, h.g, h.dv])?;
     // The max and sum come a row per head.
@@ -1288,6 +1417,7 @@ mod tests {
             np: 256,
             ps: 16,
             split: false,
+            mask: None,
         };
         let c = kernel(&s, 110 << 20, &old).unwrap();
         assert!(c.module.contains("iteration_bounds = array<i64: 7>"));
@@ -1343,6 +1473,7 @@ mod tests {
             np: 64 * 256,
             ps: 16,
             split: true,
+            mask: None,
         };
         let c = kernel(&s, 110 << 20, &old).unwrap();
         assert!(c.module.contains("scratch_operands = 9 : i64"));
