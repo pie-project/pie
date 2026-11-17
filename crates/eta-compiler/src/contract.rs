@@ -364,6 +364,126 @@ impl Case {
     }
 }
 
+/// One bf16 step at `x`'s magnitude: the spacing of bf16 values in `x`'s
+/// binade, `2^(exponent - 7)`.
+#[must_use]
+pub fn bf16_step(x: f32) -> f32 {
+    let x = x.abs();
+    if x == 0.0 || !x.is_finite() {
+        return 0.0;
+    }
+    (2f32).powi(x.log2().floor() as i32 - 7)
+}
+
+/// How far two paths' logit rows at one step moved apart: the drift a
+/// parting is read against ([`near_tie`]).
+#[derive(Clone, Copy, Debug)]
+pub enum Drift<'a> {
+    /// Both paths' full logit rows at the parting's step, the same history
+    /// before it.
+    Rows { a: &'a [f32], b: &'a [f32] },
+    /// No row to measure: the per-logit drift is stated, `steps` bf16 steps
+    /// at the top logit `top`, the depth the logits passed through
+    /// propagating each layer's rounding up to them.
+    Depth { top: f32, steps: f32 },
+}
+
+/// A parting of two runs read under contract A: what was measured and the
+/// verdict.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Parting {
+    /// The decision's gap at the parting: its top-1 less its top-2, in
+    /// logit units.
+    pub gap: f32,
+    /// The largest per-logit drift between the two paths' rows (or the
+    /// stated one, [`Drift::Depth`]).
+    pub drift_max: f32,
+    /// The drift's root mean square over the row (the stated drift where no
+    /// row was measured).
+    pub drift_rms: f32,
+    /// Each contested token's rank by its |drift| among the row's: how many
+    /// entries moved strictly more (0 is the row's largest move). Empty
+    /// where no row was measured.
+    pub ranks: Vec<usize>,
+    /// The gap's bound: twice the drift.
+    pub bound: f32,
+    /// Whether the drift is diffuse: no contested token moved more than
+    /// every other entry of the row. `None` where no row was measured.
+    pub diffuse: Option<bool>,
+    /// The verdict: a near-tie contract A admits.
+    pub tie: bool,
+}
+
+/// Whether two runs that part at one step part on a near-tie contract A
+/// admits ("equal up to stated bf16 near-ties"), the decision there going
+/// to a different one of `contested` (each path's pick) by `gap` (the
+/// decision's top-1 less its top-2, in logit units).
+///
+/// The rule, as stated for the contract:
+/// 1. The gap is within twice the largest per-logit drift between the two
+///    paths at that step, measured over the full row: each of the two
+///    contested logits may round its own way by up to that drift, so the
+///    pair's difference can move by twice it.
+/// 2. The drift is diffuse: a contested token's |drift| is an outlier when
+///    it exceeds the |drift| of every entry of the row other than the
+///    contested pair, i.e. the move that decided the parting is larger than
+///    any move rounding made anywhere else in the row. A concentrated move
+///    on the contested tokens is a bug even within the gap bound: rounding
+///    has no reason to favour the two tokens the decision weighed.
+///
+/// Without a row ([`Drift::Depth`]) only rule 1 is read, against twice the
+/// stated drift (2 x bf16 step x the propagated depth bound), and
+/// `diffuse` is `None`.
+#[must_use]
+pub fn near_tie(gap: f32, contested: &[usize], drift: Drift<'_>) -> Parting {
+    match drift {
+        Drift::Depth { top, steps } => {
+            let drift = bf16_step(top) * steps;
+            Parting {
+                gap,
+                drift_max: drift,
+                drift_rms: drift,
+                ranks: Vec::new(),
+                bound: 2.0 * drift,
+                diffuse: None,
+                tie: gap <= 2.0 * drift,
+            }
+        }
+        Drift::Rows { a, b } => {
+            let moved: Vec<f32> = a.iter().zip(b).map(|(x, y)| (y - x).abs()).collect();
+            let drift_max = moved.iter().copied().fold(0.0f32, f32::max);
+            let drift_rms = if moved.is_empty() {
+                0.0
+            } else {
+                let squares: f64 = moved.iter().map(|d| f64::from(*d) * f64::from(*d)).sum();
+                (squares / moved.len() as f64).sqrt() as f32
+            };
+            let at = |token: usize| moved.get(token).copied().unwrap_or(f32::INFINITY);
+            let ranks = contested
+                .iter()
+                .map(|&token| moved.iter().filter(|d| **d > at(token)).count())
+                .collect();
+            let elsewhere = moved
+                .iter()
+                .enumerate()
+                .filter(|(token, _)| !contested.contains(token))
+                .map(|(_, d)| *d)
+                .fold(0.0f32, f32::max);
+            let diffuse = contested.iter().all(|&token| at(token) <= elsewhere);
+            let bound = 2.0 * drift_max;
+            Parting {
+                gap,
+                drift_max,
+                drift_rms,
+                ranks,
+                bound,
+                diffuse: Some(diffuse),
+                tie: gap <= bound && diffuse,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,5 +538,47 @@ mod tests {
         assert_eq!(words(&rows[0]), [51_616, 212_655], "tokens");
         assert_eq!(words(&rows[1]), [0, 0], "parents");
         assert_eq!(words(&rows[2]), [0xC11A_7922, 0xC11A_795E], "scores");
+    }
+
+    /// The 48_6 parting (Qwen3-0.6B on Vulkan, a 48-row tiled prefill
+    /// against a 16-row tail over cached pages): a 0.092 gap, the row
+    /// moving up to 3 steps everywhere and the contested pair 1 and 2: a
+    /// near-tie. The same gap with the pair alone moving is a bug, and a gap
+    /// past twice the drift is no tie.
+    #[test]
+    fn a_parting_is_a_tie_on_diffuse_drift_within_twice_its_largest_move() {
+        let step = bf16_step(14.0625);
+        assert_eq!(step, 0.0625);
+        let mut a = vec![0.0f32; 64];
+        let mut b = a.clone();
+        for (at, x) in a.iter_mut().enumerate() {
+            *x = 10.0 + at as f32 / 8.0;
+        }
+        for (at, (x, y)) in a.iter().zip(b.iter_mut()).enumerate() {
+            *y = x + step * [0.0, 1.0, -1.0, 2.0][at % 4];
+        }
+        b[40] = a[40] + 3.0 * step;
+        // The contested pair: 943 and 729's moves, -1 and +2 steps.
+        b[5] = a[5] - step;
+        b[7] = a[7] + 2.0 * step;
+        let parting = near_tie(0.092, &[5, 7], Drift::Rows { a: &a, b: &b });
+        assert!(parting.tie, "{parting:?}");
+        assert_eq!(parting.drift_max, 3.0 * step);
+        assert_eq!(parting.diffuse, Some(true));
+        assert!(parting.ranks.iter().all(|rank| *rank > 0), "{:?}", parting.ranks);
+        assert!(!near_tie(0.40, &[5, 7], Drift::Rows { a: &a, b: &b }).tie, "past twice the drift");
+
+        // The decision's pair alone moving past every other entry: structured.
+        let mut c = a.clone();
+        c[3] = a[3] + step;
+        c[5] = a[5] - 2.0 * step;
+        c[7] = a[7] + 2.0 * step;
+        let concentrated = near_tie(0.092, &[5, 7], Drift::Rows { a: &a, b: &c });
+        assert_eq!(concentrated.diffuse, Some(false));
+        assert!(!concentrated.tie, "{concentrated:?}");
+        assert_eq!(concentrated.ranks, vec![0, 0]);
+
+        let stated = near_tie(0.092, &[5, 7], Drift::Depth { top: 14.0625, steps: 1.0 });
+        assert_eq!((stated.bound, stated.diffuse, stated.tie), (0.125, None, true));
     }
 }
