@@ -404,20 +404,60 @@ impl Plane {
     /// wave of binds builds it a few times a pair. What a build costs is
     /// measured in `crate::guest_term::GuestTerm` (30 pairs of 256 lanes: 39 - 53 us).
     fn fit_term(&mut self) {
-        let pairs: Vec<crate::guest_term::FirePair> = self
-            .pairs
+        let pairs = self.fire_pairs();
+        let most = self.most_lanes();
+        self.term.fit(&pairs, most);
+    }
+
+    /// The pairs bound now, as the term reads them.
+    fn fire_pairs(&self) -> Vec<crate::guest_term::FirePair> {
+        self.pairs
             .iter()
             .map(|(_, _, bytes, bound)| crate::guest_term::FirePair {
                 facts: bytes.facts(),
                 live: *bound,
             })
-            .collect();
-        let most = if self.fire_lanes == 0 {
+            .collect()
+    }
+
+    /// The most lanes the term is built for: the fire's, every lane count
+    /// where none is set.
+    fn most_lanes(&self) -> u32 {
+        if self.fire_lanes == 0 {
             u32::MAX
         } else {
             self.fire_lanes
-        };
-        self.term.fit(&pairs, most);
+        }
+    }
+
+    /// The engine's standing guest bytes (`engine::Engine::standing_after`):
+    /// what the widest fire lays for the pairs bound now, under its carve.
+    /// The runtime sets that much of the span aside below every rung's
+    /// carve, so a fire is cut to the widest rung whose carve leaves it
+    /// that much.
+    #[must_use]
+    pub fn standing(&self) -> u64 {
+        self.term.bytes(u32::MAX)
+    }
+
+    /// [`Self::standing`] once an instance of `program_id` at `extents` is
+    /// bound too, nothing changed.
+    pub fn standing_after(&self, program_id: ProgramId, extents: Extents) -> Result<u64> {
+        let mut pairs = self.fire_pairs();
+        match self
+            .pairs
+            .iter()
+            .position(|(program, at, _, _)| *program == program_id && *at == extents)
+        {
+            Some(at) => pairs[at].live += 1,
+            None => pairs.push(crate::guest_term::FirePair {
+                facts: self.fire_bytes(program_id, extents)?.facts(),
+                live: 1,
+            }),
+        }
+        let mut term = crate::guest_term::GuestTerm::default();
+        term.fit(&pairs, self.most_lanes());
+        Ok(term.bytes(u32::MAX))
     }
 
     /// An instance of `program_id` is bound at `extents`.
