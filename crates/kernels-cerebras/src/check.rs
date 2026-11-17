@@ -104,6 +104,17 @@ pub fn pe_bytes(
     }
 }
 
+/// The words a tape PE's array may take: the room its image leaves past its own bytes (`own`,
+/// as a link measured them), the stack's [`crate::build::STACK_ROOM`] and the search's
+/// [`crate::search::MARGIN`].
+#[must_use]
+pub fn tape_words(own: i64) -> u32 {
+    #[allow(clippy::cast_possible_truncation)]
+    let margin = crate::search::MARGIN as i64;
+    let room = PE_BYTES - own - i64::from(crate::build::STACK_ROOM) - margin;
+    u32::try_from(room.max(0) / 4).unwrap_or(0)
+}
+
 /// The code room a search holds back on every PE beside its data, until the code estimate
 /// bounds cslc's: the most `.text` a stream PE of over 10 KB data links to (Qwen3.5-0.8B -l4's
 /// attention head root, 7,348 bytes; its data and the estimate's within 1.2 KB, the code

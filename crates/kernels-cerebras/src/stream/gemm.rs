@@ -252,7 +252,7 @@ pub struct GemmProgram {
     pub wwords: u32,
     /// Each column's stream words (an uneven output's columns differ).
     pub wcol: Vec<u32>,
-    /// The tapes' rows below the array: a column's stream over its tape PEs, [`TAPE_WORDS`] a
+    /// The tapes' rows below the array: a column's stream over its tape PEs, [`crate::emit::gemm::tape_words`] a
     /// PE, each sending its words then forwarding those of the PEs past it, up the column.
     pub tape: u32,
     /// Key-block members of the attention (`kbm x tb` keys a block).
@@ -829,9 +829,6 @@ impl GemmProgram {
     }
 }
 
-/// Words a tape PE holds.
-pub const TAPE_WORDS: u32 = 10_000;
-
 /// The 16-bit flags of a weight in this build.
 fn w16(round16: bool) -> u32 {
     if round16 { BF16 } else { HALF }
@@ -1248,7 +1245,7 @@ pub fn placed(l: &Lowering, c: u32, r: u32, kbm: u32) -> R<GemmProgram> {
     }
     p.wwords = wwords as u32;
     p.wcol = wcol.iter().map(|&w| w as u32).collect();
-    p.tape = (wwords.div_ceil(u64::from(TAPE_WORDS)) as u32).max(1);
+    p.tape = (wwords.div_ceil(u64::from(crate::emit::gemm::tape_words())) as u32).max(1);
     p.wbn = p
         .wbn
         .max(words.iter().map(Vec::len).max().unwrap_or(2).div_ceil(2) as u32);
@@ -1459,10 +1456,10 @@ fn starts(ws: &[Span]) -> Vec<u64> {
 const OPMARK: u32 = u32::MAX - 3;
 
 /// The words tape PE `ri` of column `ci` holds: its run of the column's stream, padded to
-/// [`TAPE_WORDS`].
+/// [`crate::emit::gemm::tape_words`].
 #[must_use]
 pub fn tape_spans(p: &GemmProgram, ci: u32, ri: u32) -> Vec<Span> {
-    let per = TAPE_WORDS;
+    let per = crate::emit::gemm::tape_words();
     let lo = 2 * u64::from(ri) * u64::from(per);
     let hi = (lo + 2 * u64::from(per)).min(2 * u64::from(p.wcol[ci as usize]));
     let mut out: Vec<Span> = Vec::new();

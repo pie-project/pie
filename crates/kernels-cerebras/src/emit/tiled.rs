@@ -24,7 +24,7 @@ use crate::emit::stream::COMMON;
 use crate::floor::Coord;
 use crate::stream::grid::{RegIn, Res};
 use crate::stream::host::{NONE, Word};
-use crate::stream::tiled::{Key, Lay, TAPE_WORDS, TOp, TileProgram, tape_spans};
+use crate::stream::tiled::{Key, Lay, TOp, TileProgram, tape_spans};
 
 type R<T> = Result<T, String>;
 
@@ -394,14 +394,26 @@ fn pe_file(p: &TileProgram, tb: &Table) -> String {
     t
 }
 
-fn tape_file() -> String {
+/// A tape PE's image past its tape's words, as a link measures it (klein's 1024² tiled VAE at tile 2,2 linked for the system at 10,977 tape words: every `ttape.csl` image 48,464 B used): the check's
+/// estimate of it misses by ~500 B, past the stack's room. A change to `ttape.csl`'s code
+/// re-measures it.
+pub const TAPE_IMAGE_BYTES: i64 = 4556;
+
+/// Words a tape PE holds: the room `ttape.csl`'s image leaves past its own bytes, the stack and the
+/// margin.
+#[must_use]
+pub fn tape_words() -> u32 {
+    crate::check::tape_words(TAPE_IMAGE_BYTES)
+}
+
+fn tape_file(tw: u32) -> String {
     let mut t = String::from(
         "// The tiled regime's weight tape (kernels-cerebras emit::tiled): a PE's words of the\n// reading's stream, then the words of the PEs past it forwarded.\nparam memcpy_params;\nparam C_O: u16;\nparam C_I: u16;\n",
     );
     t.push_str(COMMON);
     let _ = writeln!(
         t,
-        "const q_i = @get_input_queue(2);\nconst q_o = @get_output_queue(2);\nconst TW: u16 = {TAPE_WORDS};\nvar tape = @zeros([TW]u32);\nvar tape_p: [*]u32 = &tape;\nconst D_tape = @get_dsd(mem1d_dsd, .{{ .tensor_access = |i|{{TW}} -> tape[i] }});\nvar pcfg = @zeros([2]u32);\nvar pcfg_p: [*]u32 = &pcfg;"
+        "const q_i = @get_input_queue(2);\nconst q_o = @get_output_queue(2);\nconst TW: u16 = {tw};\nvar tape = @zeros([TW]u32);\nvar tape_p: [*]u32 = &tape;\nconst D_tape = @get_dsd(mem1d_dsd, .{{ .tensor_access = |i|{{TW}} -> tape[i] }});\nvar pcfg = @zeros([2]u32);\nvar pcfg_p: [*]u32 = &pcfg;"
     );
     t.push_str(
         "task go() void {\n  stamp(0);\n  const own = @as(u16, pcfg[0]);\n  if (own > 0) { @mov32(fab.fout(q_o, own), @set_dsd_length(D_tape, own)); }\n  var left: u32 = pcfg[1];\n  while (left > 0) {\n    const n: u16 = if (left > 16384) 16384 else @as(u16, left);\n    @mov32(fab.fout(q_o, n), fab.fin(q_i, n));\n    left -= @as(u32, n);\n  }\n  stamp(1);\n  sys_mod.unblock_cmd_stream();\n}\n",
@@ -615,7 +627,7 @@ pub fn emit(p: &TileProgram) -> R<Emitted> {
     let tb = table(p)?;
     let mut files: Vec<(String, String)> = p.modules.clone();
     files.push(("tpe.csl".into(), pe_file(p, &tb)));
-    files.push(("ttape.csl".into(), tape_file()));
+    files.push(("ttape.csl".into(), tape_file(tape_words())));
     files.push(("thub.csl".into(), hub_file(p)));
     files.push(("filler.csl".into(), filler_file()));
     let pl = placed(p);
@@ -716,13 +728,13 @@ pub fn emit(p: &TileProgram) -> R<Emitted> {
     let mut sent = 0u32;
     for k in 0..p.tape {
         let (x, y) = p.tape_at(k);
-        let own = TAPE_WORDS.min(total - sent);
+        let own = tape_words().min(total - sent);
         sent += own;
         arrays.push(GridArray {
             at: Coord::new(x, y),
             sym: "tape".into(),
             u16: false,
-            len: TAPE_WORDS,
+            len: tape_words(),
             fill: GridFill::Spans(tape_spans(p, k)),
             group: None,
         });

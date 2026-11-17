@@ -20,7 +20,7 @@ use poem_ir::ValueId;
 use crate::emit::grid::{GridArray, GridFill};
 use crate::emit::stream::COMMON;
 use crate::floor::Coord;
-use crate::stream::gemm::{GOp, GVal, GemmProgram, RArg, TAPE_WORDS, local, piece, tape_spans};
+use crate::stream::gemm::{GOp, GVal, GemmProgram, RArg, local, piece, tape_spans};
 use crate::stream::host::{CLAMP, NONE, ONE, Word};
 
 type R<T> = Result<T, String>;
@@ -622,14 +622,26 @@ fn pe_file(p: &GemmProgram, tb: &Table) -> String {
 
 /// `gtape.csl`: a tape PE's words of its column's weight stream, then the words of the PEs
 /// past it forwarded (16,384 at a time: a fabric transfer of 32,768 stalls).
-fn tape_file() -> String {
+/// A tape PE's image past its tape's words, as a link measures it (the system links of 9064b2e41's GEMM programs at 10,000 tape words: every `gtape.csl` image 44,544 B used): the check's
+/// estimate of it misses by ~500 B, past the stack's room. A change to `gtape.csl`'s code
+/// re-measures it.
+pub const TAPE_IMAGE_BYTES: i64 = 4544;
+
+/// Words a tape PE holds: the room `gtape.csl`'s image leaves past its own bytes, the stack and the
+/// margin.
+#[must_use]
+pub fn tape_words() -> u32 {
+    crate::check::tape_words(TAPE_IMAGE_BYTES)
+}
+
+fn tape_file(tw: u32) -> String {
     let mut t = String::from(
         "// The GEMM regime's weight tape (kernels-cerebras emit::gemm): a PE's words of its column's\n// stream, then the words of the PEs past it forwarded.\nparam memcpy_params;\nparam C_O: u16;\nparam C_I: u16;\n",
     );
     t.push_str(COMMON);
     let _ = writeln!(
         t,
-        "const q_i = @get_input_queue(2);\nconst q_o = @get_output_queue(2);\nconst TW: u16 = {TAPE_WORDS};\nvar tape = @zeros([TW]u32);\nvar tape_p: [*]u32 = &tape;\nconst D_tape = @get_dsd(mem1d_dsd, .{{ .tensor_access = |i|{{TW}} -> tape[i] }});\nvar pcfg = @zeros([2]u32);\nvar pcfg_p: [*]u32 = &pcfg;"
+        "const q_i = @get_input_queue(2);\nconst q_o = @get_output_queue(2);\nconst TW: u16 = {tw};\nvar tape = @zeros([TW]u32);\nvar tape_p: [*]u32 = &tape;\nconst D_tape = @get_dsd(mem1d_dsd, .{{ .tensor_access = |i|{{TW}} -> tape[i] }});\nvar pcfg = @zeros([2]u32);\nvar pcfg_p: [*]u32 = &pcfg;"
     );
     t.push_str(
         "task go() void {\n  stamp(0);\n  const own = @as(u16, pcfg[0]);\n  if (own > 0) { @mov32(fab.fout(q_o, own), @set_dsd_length(D_tape, own)); }\n  var left: u32 = pcfg[1];\n  while (left > 0) {\n    const n: u16 = if (left > 16384) 16384 else @as(u16, left);\n    @mov32(fab.fout(q_o, n), fab.fin(q_i, n));\n    left -= @as(u32, n);\n  }\n  stamp(1);\n  sys_mod.unblock_cmd_stream();\n}\n",
@@ -754,7 +766,7 @@ pub fn emit(p: &GemmProgram) -> R<Emitted> {
     let mut files: Vec<(String, String)> = p.modules.clone();
     files.push(("gseg.csl".into(), gseg_file()));
     files.push(("gpe.csl".into(), pe_file(p, &tb)));
-    files.push(("gtape.csl".into(), tape_file()));
+    files.push(("gtape.csl".into(), tape_file(tape_words())));
     let pl = placed(p);
     files.push(("layout.csl".into(), pl.csl()));
     let mut arrays = Vec::new();
@@ -763,14 +775,14 @@ pub fn emit(p: &GemmProgram) -> R<Emitted> {
         let total = p.wcol[x as usize];
         let mut sent = 0u32;
         for k in 0..p.tape {
-            let own = TAPE_WORDS.min(total - sent);
+            let own = tape_words().min(total - sent);
             sent += own;
             let at = Coord::new(x, p.r + k);
             arrays.push(GridArray {
                 at,
                 sym: "tape".into(),
                 u16: false,
-                len: TAPE_WORDS,
+                len: tape_words(),
                 fill: GridFill::Spans(tape_spans(p, x, k)),
                 group: None,
             });

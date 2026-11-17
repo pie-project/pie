@@ -172,8 +172,6 @@ pub struct TileProgram {
     pub round16: bool,
 }
 
-/// Words a tape PE holds.
-pub const TAPE_WORDS: u32 = 10_000;
 /// A weight block's words at most (two 16-bit weights a word).
 pub const WB_WORDS: u32 = 512;
 /// A convolution's staged channels at most.
@@ -1114,7 +1112,10 @@ pub fn place(p: &mut TileProgram, th0: u32, tw0: u32, bounds: Option<(u32, u32)>
         p.stream.extend(r);
     }
     p.stream_words = crate::stream::host::span_words(&p.stream);
-    p.tape = p.stream_words.div_ceil(TAPE_WORDS).max(1);
+    p.tape = p
+        .stream_words
+        .div_ceil(crate::emit::tiled::tape_words())
+        .max(1);
     if let Some((bw, bh)) = bounds {
         let (fw, fh) = p.fabric();
         if fw > bw || fh > bh {
@@ -1129,8 +1130,8 @@ pub fn place(p: &mut TileProgram, th0: u32, tw0: u32, bounds: Option<(u32, u32)>
 
 /// Tape PE `k`'s spans: its words of the stream (zeros past the stream's end).
 pub fn tape_spans(p: &TileProgram, k: u32) -> Vec<Span> {
-    let lo = 2 * u64::from(k) * u64::from(TAPE_WORDS);
-    let hi = lo + 2 * u64::from(TAPE_WORDS);
+    let lo = 2 * u64::from(k) * u64::from(crate::emit::tiled::tape_words());
+    let hi = lo + 2 * u64::from(crate::emit::tiled::tape_words());
     let mut out: Vec<Span> = Vec::new();
     let mut at = 0u64; // in halves
     for s in &p.stream {
@@ -1157,8 +1158,17 @@ pub fn tape_spans(p: &TileProgram, k: u32) -> Vec<Span> {
         ]);
     }
     let used = crate::stream::host::span_words(&out);
-    if used < TAPE_WORDS {
-        out.push([NONE, 0, 0, TAPE_WORDS - used, 0, 0, 1, 0]);
+    if used < crate::emit::tiled::tape_words() {
+        out.push([
+            NONE,
+            0,
+            0,
+            crate::emit::tiled::tape_words() - used,
+            0,
+            0,
+            1,
+            0,
+        ]);
     }
     out
 }
@@ -1629,10 +1639,13 @@ mod tests {
         );
         for k in 0..p.tape {
             let s = tape_spans(&p, k);
-            assert_eq!(crate::stream::host::span_words(&s), TAPE_WORDS);
+            assert_eq!(
+                crate::stream::host::span_words(&s),
+                crate::emit::tiled::tape_words()
+            );
         }
-        assert!(p.stream_words <= p.tape * TAPE_WORDS);
-        assert!(p.stream_words > (p.tape - 1) * TAPE_WORDS);
+        assert!(p.stream_words <= p.tape * crate::emit::tiled::tape_words());
+        assert!(p.stream_words > (p.tape - 1) * crate::emit::tiled::tape_words());
         // every value's slot inside the arena
         for (k, off) in &p.slots {
             let w = match k {
