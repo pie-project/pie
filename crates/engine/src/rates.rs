@@ -676,11 +676,12 @@ pub fn saved_text(
         .collect();
     let header =
         |lines: &[String], name: &str| lines.iter().position(|l| l.trim() == format!("[{name}]"));
-    // The table's lines after `at`, to the next table.
+    // The table's lines after `at`, to the next table: a header starts its
+    // line, where a rate's array rows (`  [1024, [...]]`) are indented.
     let table_end = |lines: &[String], at: usize| {
         let mut end = lines[at + 1..]
             .iter()
-            .position(|l| l.trim_start().starts_with('['))
+            .position(|l| l.starts_with('['))
             .map_or(lines.len(), |i| at + 1 + i);
         while end > at + 1 && lines[end - 1].trim().is_empty() {
             end -= 1;
@@ -987,6 +988,13 @@ mod tests {
         assert_eq!(
             saved_text(Some(existing), &measured, &how),
             "api = 1\n[engine]\ngraphs = \"on\"\n\n[rates]\nlaunch_ns = 900\nhbm_gbps = 700.0\n\n[provenance]\nsource = \"me\"\nrates = \"measured at load\"\n"
+        );
+        // A rate stated as array rows: the key lands after its last row.
+        let rows =
+            "api = 1\n\n[rates]\nattn_tflops_by_keys = [\n  [512, 4.0],\n  [1024, 5.0],\n]\n";
+        assert_eq!(
+            saved_text(Some(rows), &measured, &how),
+            "api = 1\n\n[rates]\nattn_tflops_by_keys = [\n  [512, 4.0],\n  [1024, 5.0],\n]\nhbm_gbps = 700.0\n\n[provenance]\nrates = \"measured at load\"\n"
         );
     }
 
