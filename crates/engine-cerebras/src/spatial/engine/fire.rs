@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 
+use engine::StepOutcome;
 use engine::error::{Error, Result as EngineResult};
 use engine::fire::{LaneReadout, Readout};
 use engine::program::InstanceId;
@@ -354,19 +355,25 @@ impl Spatial {
 
     /// One step: prologues, the lanes' tokens and positions (a device
     /// geometry instance states them on its ports), the forward, the guest
-    /// passes over its logits, and the lanes' readouts.
+    /// passes over its logits, and the lanes' readouts. A pass that refuses
+    /// or faults (a prologue, an envelope, an epilogue, a lane its rows
+    /// cannot run) faults its own lanes in the outcome; the other lanes run
+    /// on and commit. An `Err` is the step lost whole.
     #[allow(clippy::too_many_lines)]
     pub(super) fn fire_step(
         &mut self,
         step: &engine::fire::Step,
-    ) -> EngineResult<Vec<LaneReadout>> {
+    ) -> EngineResult<(Vec<LaneReadout>, StepOutcome)> {
         let fire_t0 = std::time::Instant::now();
         self.next_fire = self.next_fire.wrapping_add(1);
-        for attachment in &step.attachments {
-            if !attachment.adapter_only && self.programs.prologue_runs(attachment.instance) {
-                self.programs
-                    .fire_interpreted(attachment.instance, &[], Stage::Prologue)
-                    .map_err(refusal)?;
+        let mut outcome = StepOutcome::committed();
+        for attachment in passes(step) {
+            if self.programs.prologue_runs(attachment.instance)
+                && let Err(refused) =
+                    self.programs
+                        .fire_interpreted(attachment.instance, &[], Stage::Prologue)
+            {
+                fault_pass(&mut outcome, attachment, "prologue", &refused.to_string());
             }
         }
         let lanes = &step.lanes;
@@ -388,72 +395,24 @@ impl Spatial {
             }
         }
         // Each lane's tokens and positions: the fire's, or an instance's ports.
-        let mut tokens: Vec<Vec<u32>> = lanes.iter().map(|l| l.tokens.clone()).collect();
-        // Masks a device geometry instance states on its port, by lane.
-        let mut dense_masks: BTreeMap<usize, (Vec<bool>, usize)> = BTreeMap::new();
-        let mut positions: Vec<Vec<u32>> = lanes.iter().map(|l| l.positions.clone()).collect();
-        for attachment in &step.attachments {
-            if attachment.adapter_only {
+        let mut resolved = Resolved {
+            tokens: lanes.iter().map(|l| l.tokens.clone()).collect(),
+            dense_masks: BTreeMap::new(),
+            positions: lanes.iter().map(|l| l.positions.clone()).collect(),
+        };
+        for attachment in passes(step) {
+            if faulted(&outcome, attachment) {
                 continue;
             }
-            let instance = attachment.instance;
-            let first = attachment.lane as usize;
-            if self.programs.geometry_of(instance) == Some(GeometryClass::DeviceGeometry) {
-                let Some(mut envelope) =
-                    self.programs.device_envelope(instance).map_err(refusal)?
-                else {
-                    continue;
-                };
-                envelope.host_rows = lanes
-                    .iter()
-                    .skip(first)
-                    .take(attachment.lanes.max(1) as usize)
-                    .map(|lane| lane.tokens.len() as u32)
-                    .collect();
-                for at in 0..envelope.lanes() {
-                    let source = first + at;
-                    let Some(lane) = lanes.get(source) else { break };
-                    let ports = envelope.lane(at, source).map_err(port_error)?;
-                    let rows = if ports.owns_slots() {
-                        ports.rows() as usize
-                    } else {
-                        lane.tokens.len()
-                    };
-                    let have = if ports.owns_slots() {
-                        ports
-                            .reach(rows)
-                            .map_err(port_error)?
-                            .map(|after| after.saturating_sub(rows as u32))
-                    } else {
-                        (!lane.kv.pages.is_empty()).then_some(lane.kv.held)
-                    };
-                    tokens[source] = ports.tokens_for(rows).map_err(port_error)?.to_vec();
-                    if let Some((cells, stride)) = ports.mask(rows).map_err(port_error)? {
-                        dense_masks.insert(source, (cells.to_vec(), stride));
-                    }
-                    if let Some(have) = have {
-                        if let Some(p) = ports.positions_for(have, rows).map_err(port_error)? {
-                            positions[source] = p.to_vec();
-                        } else if positions[source].len() != rows {
-                            positions[source] = (have..have + rows as u32).collect();
-                        }
-                    }
-                }
-            } else {
-                let count = self.programs.lane_count(instance).map_err(refusal)?;
-                for at in 0..count {
-                    let source = first + at;
-                    let Some(lane) = lanes.get(source) else { break };
-                    if let Some(crate::program::Tokens::Host(ids)) = self
-                        .programs
-                        .envelope_tokens(instance, lane.tokens.len(), at)
-                        .map_err(refusal)?
-                    {
-                        tokens[source] = ids;
-                    }
-                }
+            if let Err(refused) = self.envelope(step, attachment, &mut resolved) {
+                fault_pass(&mut outcome, attachment, "envelope", &refused.to_string());
             }
         }
+        let Resolved {
+            tokens,
+            dense_masks,
+            positions,
+        } = resolved;
         // The forward, lane by lane, keeping the logits of the rows something reads.
         let attached: BTreeMap<usize, InstanceId> = step
             .attachments
@@ -478,7 +437,7 @@ impl Spatial {
                 Readout::None if attached.contains_key(&at) && n > 0 => vec![n - 1],
                 _ => Vec::new(),
             };
-            let (out, ran_ahead) = if tokens[at].is_empty() {
+            let (out, ran_ahead) = if tokens[at].is_empty() || lane_faulted(&outcome, at) {
                 (Vec::new(), false)
             } else {
                 // The rows' positions: stated (consecutive), else after what
@@ -488,79 +447,71 @@ impl Spatial {
                     None if !lane.kv.pages.is_empty() => lane.kv.held,
                     None => self.kv.slots.get(&lane.slot).map_or(0, |h| h.len() as u32),
                 };
-                if positions[at]
+                let runs = if positions[at]
                     .iter()
                     .enumerate()
                     .any(|(i, &p)| p != start + i as u32)
                 {
-                    return Err(Error::Invalid(format!(
+                    Err(Error::Invalid(format!(
                         "the spatial engine runs a lane's rows at consecutive positions; lane \
                          {at} has {:?}",
                         positions[at]
-                    )));
+                    )))
+                } else {
+                    // The model runs causal attention over the lane's own history only.
+                    self.check_masks(lane, at, start, tokens[at].len(), dense_masks.get(&at))
+                };
+                if let Err(refused) = runs {
+                    fault_lane(&mut outcome, step, at, &refused.to_string());
+                    (Vec::new(), false)
+                } else {
+                    // Greedy: the lane's one reader takes only the argmax of
+                    // the logits.
+                    let greedy = attached
+                        .get(&at)
+                        .is_some_and(|&instance| self.programs.greedy_reads(instance, &name))
+                        && one_reader(step, at);
+                    self.forward(
+                        lane.slot,
+                        &lane.kv.pages,
+                        &tokens[at],
+                        start,
+                        &rows,
+                        greedy,
+                        lane.fires_after,
+                    )?
                 }
-                // The model runs causal attention over the lane's own history only.
-                self.check_masks(lane, at, start, tokens[at].len(), dense_masks.get(&at))?;
-                // Greedy: the lane's one reader takes only the argmax of the
-                // logits.
-                let greedy = attached
-                    .get(&at)
-                    .is_some_and(|&instance| self.programs.greedy_reads(instance, &name))
-                    && one_reader(step, at);
-                self.forward(
-                    lane.slot,
-                    &lane.kv.pages,
-                    &tokens[at],
-                    start,
-                    &rows,
-                    greedy,
-                    lane.fires_after,
-                )?
             };
             logits.push(out);
             fast.push(ran_ahead);
             read_rows.push(rows);
         }
-        // Guest passes in the interpreter, each output it reads from this fire.
-        for attachment in &step.attachments {
-            if attachment.adapter_only {
+        // Guest passes in the interpreter, each output it reads from this
+        // fire; a pass one of whose lanes faulted runs none.
+        for attachment in passes(step) {
+            if let Some(why) = outcome
+                .faulted
+                .iter()
+                .find(|fault| pass_lanes(attachment).contains(&fault.lane))
+                .map(|fault| fault.reason.clone())
+            {
+                fault_pass(&mut outcome, attachment, "epilogue", &why);
                 continue;
             }
-            let mut outputs: Vec<(String, u32, Value)> = Vec::new();
-            for (out_name, k) in self.programs.outputs_of(attachment.instance) {
-                let lane = attachment.lane as usize + k as usize;
-                if out_name != name && out_name.starts_with("attn.") {
-                    return Err(Error::Invalid(format!(
-                        "the program reads model output `{out_name}`; the spatial engine's \
-                         model answers `{name}` (the logits) alone — attention scores are not \
-                         served yet"
-                    )));
+            match self.epilogue_outputs(attachment, &name, &mut logits, &fast) {
+                Ok(outputs) => {
+                    if let Err(refused) = self.programs.fire_interpreted(
+                        attachment.instance,
+                        &outputs,
+                        Stage::Epilogue,
+                    ) {
+                        fault_pass(&mut outcome, attachment, "epilogue", &refused.to_string());
+                    }
                 }
-                if out_name != name {
-                    continue;
-                }
-                // A pass over several lanes reads its rows as one output: the
-                // lane's, then the pass's later lanes'.
-                let end = attachment.lane as usize + attachment.lanes.max(1) as usize;
-                if logits.get(lane).is_some() {
-                    let flat: Vec<f32> = if fast.get(lane) == Some(&true)
-                        && end <= lane + 1
-                        && logits[lane].len() == 1
-                    {
-                        // Its one row, handed over: nothing else reads it.
-                        std::mem::take(&mut logits[lane][0])
-                    } else {
-                        (lane..end.max(lane + 1))
-                            .filter_map(|l| logits.get(l))
-                            .flat_map(|rows| rows.iter().flatten().copied())
-                            .collect()
-                    };
-                    outputs.push((out_name.clone(), k, Value::F32(flat)));
+                Err(refused) => {
+                    fault_pass(&mut outcome, attachment, "epilogue", &refused.to_string());
                 }
             }
-            self.programs
-                .fire_interpreted(attachment.instance, &outputs, Stage::Epilogue)
-                .map_err(refusal)?;
         }
         self.fires += 1;
         tracing::info!(
@@ -571,13 +522,17 @@ impl Spatial {
             model_ms = MODEL_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
             "spatial: model time"
         );
-        Ok(lanes
+        let readouts = lanes
             .iter()
             .enumerate()
             .map(|(at, lane)| {
                 // A token loop's row is a stand-in for its argmax: the lane's
                 // answer is in its program's channels, as a device guest's.
-                if matches!(lane.readout, Readout::None) || logits[at].is_empty() || fast[at] {
+                if matches!(lane.readout, Readout::None)
+                    || logits[at].is_empty()
+                    || fast[at]
+                    || lane_faulted(&outcome, at)
+                {
                     return LaneReadout::default();
                 }
                 let values: Vec<f32> = logits[at].iter().flatten().copied().collect();
@@ -589,7 +544,190 @@ impl Spatial {
                     ..LaneReadout::default()
                 }
             })
-            .collect())
+            .collect();
+        Ok((readouts, outcome))
+    }
+
+    /// The tokens, positions and masks `attachment`'s instance states for
+    /// its lanes in `resolved`: a device geometry instance's ports, else
+    /// its envelope's tokens.
+    fn envelope(
+        &mut self,
+        step: &engine::fire::Step,
+        attachment: &engine::fire::Attachment,
+        resolved: &mut Resolved,
+    ) -> EngineResult<()> {
+        let lanes = &step.lanes;
+        let instance = attachment.instance;
+        let first = attachment.lane as usize;
+        if self.programs.geometry_of(instance) != Some(GeometryClass::DeviceGeometry) {
+            let count = self.programs.lane_count(instance).map_err(refusal)?;
+            for at in 0..count {
+                let source = first + at;
+                let Some(lane) = lanes.get(source) else { break };
+                if let Some(crate::program::Tokens::Host(ids)) = self
+                    .programs
+                    .envelope_tokens(instance, lane.tokens.len(), at)
+                    .map_err(refusal)?
+                {
+                    resolved.tokens[source] = ids;
+                }
+            }
+            return Ok(());
+        }
+        let Some(mut envelope) = self.programs.device_envelope(instance).map_err(refusal)? else {
+            return Ok(());
+        };
+        envelope.host_rows = lanes
+            .iter()
+            .skip(first)
+            .take(attachment.lanes.max(1) as usize)
+            .map(|lane| lane.tokens.len() as u32)
+            .collect();
+        for at in 0..envelope.lanes() {
+            let source = first + at;
+            let Some(lane) = lanes.get(source) else { break };
+            let ports = envelope.lane(at, source).map_err(port_error)?;
+            let rows = if ports.owns_slots() {
+                ports.rows() as usize
+            } else {
+                lane.tokens.len()
+            };
+            let have = if ports.owns_slots() {
+                ports
+                    .reach(rows)
+                    .map_err(port_error)?
+                    .map(|after| after.saturating_sub(rows as u32))
+            } else {
+                (!lane.kv.pages.is_empty()).then_some(lane.kv.held)
+            };
+            resolved.tokens[source] = ports.tokens_for(rows).map_err(port_error)?.to_vec();
+            if let Some((cells, stride)) = ports.mask(rows).map_err(port_error)? {
+                resolved
+                    .dense_masks
+                    .insert(source, (cells.to_vec(), stride));
+            }
+            if let Some(have) = have {
+                if let Some(p) = ports.positions_for(have, rows).map_err(port_error)? {
+                    resolved.positions[source] = p.to_vec();
+                } else if resolved.positions[source].len() != rows {
+                    resolved.positions[source] = (have..have + rows as u32).collect();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The outputs `attachment`'s epilogue reads from this fire: the model's
+    /// `name` (its logits) over the pass's lanes. A program reading another
+    /// model output this engine does not serve is refused.
+    fn epilogue_outputs(
+        &self,
+        attachment: &engine::fire::Attachment,
+        name: &str,
+        logits: &mut [Vec<Vec<f32>>],
+        fast: &[bool],
+    ) -> EngineResult<Vec<(String, u32, Value)>> {
+        let mut outputs: Vec<(String, u32, Value)> = Vec::new();
+        for (out_name, k) in self.programs.outputs_of(attachment.instance) {
+            let lane = attachment.lane as usize + k as usize;
+            if out_name != name && out_name.starts_with("attn.") {
+                return Err(Error::Invalid(format!(
+                    "the program reads model output `{out_name}`; the spatial engine's \
+                     model answers `{name}` (the logits) alone — attention scores are not \
+                     served yet"
+                )));
+            }
+            if out_name != name {
+                continue;
+            }
+            // A pass over several lanes reads its rows as one output: the
+            // lane's, then the pass's later lanes'.
+            let end = attachment.lane as usize + attachment.lanes.max(1) as usize;
+            if logits.get(lane).is_some() {
+                let flat: Vec<f32> = if fast.get(lane) == Some(&true)
+                    && end <= lane + 1
+                    && logits[lane].len() == 1
+                {
+                    // Its one row, handed over: nothing else reads it.
+                    std::mem::take(&mut logits[lane][0])
+                } else {
+                    (lane..end.max(lane + 1))
+                        .filter_map(|l| logits.get(l))
+                        .flat_map(|rows| rows.iter().flatten().copied())
+                        .collect()
+                };
+                outputs.push((out_name.clone(), k, Value::F32(flat)));
+            }
+        }
+        Ok(outputs)
+    }
+}
+
+/// The tokens, positions and masks of a step's lanes, as their instances
+/// resolve them.
+struct Resolved {
+    tokens: Vec<Vec<u32>>,
+    positions: Vec<Vec<u32>>,
+    /// Masks a device geometry instance states on its port, by lane.
+    dense_masks: BTreeMap<usize, (Vec<bool>, usize)>,
+}
+
+/// The step's attachments that run stages.
+fn passes(step: &engine::fire::Step) -> impl Iterator<Item = &engine::fire::Attachment> {
+    step.attachments.iter().filter(|a| !a.adapter_only)
+}
+
+/// The lanes `attachment`'s pass is of.
+fn pass_lanes(attachment: &engine::fire::Attachment) -> std::ops::Range<u32> {
+    attachment.lane..attachment.lane + attachment.lanes.max(1)
+}
+
+/// Whether one of `attachment`'s lanes faulted.
+fn faulted(outcome: &StepOutcome, attachment: &engine::fire::Attachment) -> bool {
+    outcome
+        .faulted
+        .iter()
+        .any(|fault| pass_lanes(attachment).contains(&fault.lane))
+}
+
+/// Whether lane `at` faulted.
+fn lane_faulted(outcome: &StepOutcome, at: usize) -> bool {
+    outcome
+        .faulted
+        .iter()
+        .any(|fault| fault.lane as usize == at)
+}
+
+/// `attachment`'s pass refused or faulted at `stage` for `why`: its lanes
+/// fault, by its instance.
+fn fault_pass(
+    outcome: &mut StepOutcome,
+    attachment: &engine::fire::Attachment,
+    stage: &str,
+    why: &str,
+) {
+    tracing::warn!(
+        instance = attachment.instance.0,
+        stage,
+        %why,
+        "spatial: a guest pass faulted; its lanes fault"
+    );
+    outcome.fault_lanes(pass_lanes(attachment), Some(attachment.instance), why);
+}
+
+/// Lane `at`'s rows cannot run, for `why`: the lanes of every pass it is
+/// of fault, or it alone where it is of none.
+fn fault_lane(outcome: &mut StepOutcome, step: &engine::fire::Step, at: usize, why: &str) {
+    let lane = u32::try_from(at).unwrap_or(u32::MAX);
+    let mut of = passes(step)
+        .filter(|attachment| pass_lanes(attachment).contains(&lane))
+        .peekable();
+    if of.peek().is_none() {
+        outcome.fault_lanes(lane..lane + 1, None, why);
+    }
+    for attachment in of {
+        fault_pass(outcome, attachment, "forward", why);
     }
 }
 
@@ -622,10 +760,188 @@ mod tests {
         let dense = [true, true, true, false, true, true, true, true];
         assert_eq!(first_non_causal(None, Some((&dense, 4)), 10, 12, 2), None);
         let ahead = [true, true, true, true, true, true, true, true];
-        assert_eq!(first_non_causal(None, Some((&ahead, 4)), 10, 12, 2), Some(0));
+        assert_eq!(
+            first_non_causal(None, Some((&ahead, 4)), 10, 12, 2),
+            Some(0)
+        );
         // With no boundary the columns are slots, as before.
         let whole = Masking::Extent(Mask::new(vec![0, 14], 14));
         assert_eq!(first_non_causal(Some(&whole), None, 0, 12, 2), None);
+    }
+
+    /// An epilogue whose put is `word`'s cell, or, `reads_logits`, the
+    /// model's logits over its lane: a pass with no rows holds none, so its
+    /// epilogue faults.
+    fn guest(spatial: &mut Spatial, reads_logits: bool) -> engine::program::ProgramId {
+        use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
+        use eta_ir::op::Op;
+        use eta_ir::registry::{Axis, EngineCaps, OutputDecl};
+        use eta_ir::types::{Dtype, Literal, Shape};
+        let ops = if reads_logits {
+            vec![
+                Op::Output {
+                    index: 0,
+                    lane: 0,
+                    shape: Shape::matrix(1, 4),
+                    dtype: Dtype::F32,
+                },
+                Op::ChanPut { chan: 0, value: 0 },
+            ]
+        } else {
+            vec![
+                Op::Const(Literal::F32(7.0)),
+                Op::Broadcast {
+                    value: 0,
+                    shape: Shape::matrix(1, 4),
+                },
+                Op::ChanPut { chan: 0, value: 1 },
+            ]
+        };
+        let program = TraceContainer {
+            names: vec!["logits".to_string()],
+            channels: vec![ChannelDecl {
+                shape: Shape::matrix(1, 4),
+                dtype: ChanDType::Concrete(Dtype::F32),
+                capacity: 2,
+                host_role: HostRole::Reader,
+                seeded: false,
+            }],
+            ports: Vec::new(),
+            stages: vec![StageProgram {
+                stage: Stage::Epilogue,
+                ops,
+            }],
+            externs: Vec::new(),
+            inputs: Vec::new(),
+        };
+        let decls = vec![OutputDecl {
+            name: "logits".to_string(),
+            axis: Axis::Lane,
+            width: 4,
+            dtype: Dtype::F32,
+            layers: 0,
+            readout: true,
+        }];
+        let bound = eta_ir::validate::bind(program, vec![decls], EngineCaps::default())
+            .expect("the guest binds");
+        let stages = eta_compiler::plan::compile_bound(&bound);
+        spatial
+            .programs
+            .register(&engine::program::ProgramRegistration {
+                program_hash: u64::from(reads_logits),
+                launch: eta_compiler::codegen::launch::build(&bound, &stages),
+                ..Default::default()
+            })
+            .expect("the guest registers")
+    }
+
+    /// Three instances' passes in one step, the middle one's epilogue
+    /// faulting: its lane faults, by its instance, and the step does not
+    /// err; the other two's epilogues run and their puts commit.
+    #[test]
+    fn one_instances_fault_leaves_the_others_outputs_committed() {
+        use engine::channel::{ChannelId, ChannelRegistration};
+        use engine::fire::{Attachment, Lane, Step};
+        use engine::program::{BindExtents, InstanceBinding};
+        use eta_ir::container::{ChanDType, HostRole};
+        use eta_ir::types::Dtype;
+
+        fn no_model(
+            _: &poem_ir::Trace,
+            _: &std::path::Path,
+        ) -> std::result::Result<checkpoint::contract::ModelContract, String> {
+            Err("no model in this test".into())
+        }
+        let mut spatial = Spatial::new(crate::spatial::Config::default(), no_model);
+        spatial.readout = Some(("logits".to_string(), 4));
+        let puts = guest(&mut spatial, false);
+        let reads = guest(&mut spatial, true);
+        let instances: Vec<InstanceId> = [puts, reads, puts]
+            .into_iter()
+            .enumerate()
+            .map(|(at, program)| {
+                let channel = ChannelId(at as u64 + 1);
+                spatial
+                    .programs
+                    .register_channel(&ChannelRegistration {
+                        id: channel,
+                        shape: vec![1, 4],
+                        dtype: ChanDType::Concrete(Dtype::F32),
+                        host_role: HostRole::Reader,
+                        seeded: false,
+                        extern_dir: None,
+                        capacity: 2,
+                        extern_name: Vec::new(),
+                        slots: Vec::new(),
+                    })
+                    .expect("the channel registers");
+                spatial
+                    .programs
+                    .bind(&InstanceBinding {
+                        program,
+                        channels: vec![channel],
+                        seeds: Vec::new(),
+                        geometry: GeometryClass::Host,
+                        extents: BindExtents::default(),
+                        device_resolved: Default::default(),
+                        instance_slots: Vec::new(),
+                        ring_slots: Vec::new(),
+                        adapter_slots: Vec::new(),
+                    })
+                    .expect("the instance binds")
+                    .id
+            })
+            .collect();
+        // Lanes with no rows: no forward runs, and the wafer is not asked.
+        let step = Step {
+            lanes: vec![Lane::default(); 3],
+            attachments: instances
+                .iter()
+                .enumerate()
+                .map(|(at, &instance)| Attachment {
+                    lane: at as u32,
+                    lanes: 1,
+                    instance,
+                    adapter_only: false,
+                })
+                .collect(),
+            media: Vec::new(),
+            voxels: Vec::new(),
+        };
+        let (_, outcome) = spatial
+            .fire_step(&step)
+            .expect("a guest's fault does not fail the step");
+        let lanes: Vec<(u32, Option<InstanceId>)> = outcome
+            .faulted
+            .iter()
+            .map(|fault| (fault.lane, fault.instance))
+            .collect();
+        assert_eq!(
+            lanes,
+            [(1, Some(instances[1]))],
+            "the faulting pass's lane alone"
+        );
+        assert!(
+            outcome.faulted[0].reason.contains("logits"),
+            "faulted by its own reason: {}",
+            outcome.faulted[0].reason
+        );
+        let seven: Vec<u8> = [7.0f32; 4].iter().flat_map(|v| v.to_le_bytes()).collect();
+        for at in [0, 2] {
+            let cell = spatial
+                .programs
+                .take(instances[at], 0)
+                .expect("the channel reads");
+            assert_eq!(
+                cell.as_deref(),
+                Some(&seven[..]),
+                "instance {at}'s put committed"
+            );
+        }
+        assert!(
+            spatial.programs.take(instances[1], 0).is_err(),
+            "the faulted instance is poisoned"
+        );
     }
 
     #[test]
