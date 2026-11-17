@@ -417,3 +417,80 @@ impl ResidencyPlanner {
         Some(error)
     }
 }
+
+impl ResidencyPlanner {
+    /// Waits, queued in the planner beside admissions and restores, until
+    /// the device pool holds `pieces` free runs of `run` adjacent chunks
+    /// for a bind of `pid`'s short of room for its guest state
+    /// (`store::roles::RolesError::BindShort`). The planner funds it as it
+    /// funds a restore short of room for its roles: idle cache dropped
+    /// first, then, the fleet stalled, a resident parked by its victim
+    /// choice; the bind is sent again once served. `Err` where `pid` is
+    /// gone. Woken by its own serve, never a clock.
+    pub async fn wait_bind_room(
+        self: &Arc<Self>,
+        pid: ProcessId,
+        run: u32,
+        pieces: u32,
+    ) -> Result<(), PlannerError> {
+        let pages = self.port.chunks_as_pages(run.max(1).saturating_mul(pieces));
+        let notify = Arc::new(Notify::new());
+        let key = self
+            .with_inner(|inner| {
+                inner.procs.contains_key(&pid).then(|| {
+                    inner.enqueue(
+                        pid,
+                        WaitKind::BindRoom {
+                            run,
+                            pieces,
+                            pages,
+                            notify: notify.clone(),
+                            served: false,
+                        },
+                    )
+                })
+            })
+            .ok_or(PlannerError::Cancelled)?;
+        // Off the queue however the wait ends.
+        let _registration = WaitRegistration {
+            planner: self,
+            key,
+            active: true,
+        };
+        self.poke();
+        loop {
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let served = self.with_inner(|inner| {
+                let key = inner.locate(key)?;
+                match inner.queue.get(&key)?.kind {
+                    WaitKind::BindRoom { served, .. } => Some(served),
+                    _ => None,
+                }
+            });
+            match served {
+                None => return Err(PlannerError::Cancelled),
+                Some(true) => return Ok(()),
+                Some(false) => notified.await,
+            }
+        }
+    }
+
+    /// The head bind's runs stand free: it is told, to take them.
+    pub(super) fn serve_bind_room(self: &Arc<Self>, key: EntryKey) {
+        let notify = self.with_inner(|inner| {
+            let key = inner.locate(key)?;
+            match &mut inner.queue.get_mut(&key)?.kind {
+                WaitKind::BindRoom { served, notify, .. } => {
+                    *served = true;
+                    Some(notify.clone())
+                }
+                _ => None,
+            }
+        });
+        if let Some(notify) = notify {
+            notify.notify_waiters();
+        }
+    }
+}

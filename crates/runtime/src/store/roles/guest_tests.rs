@@ -1252,3 +1252,133 @@ fn processes_cycling_through_park_restore_and_finish_all_finish_and_give_back_al
 fn short_of_wait(error: &anyhow::Error) -> Option<&RolesError> {
     error.downcast_ref::<RolesError>()
 }
+
+/// The pair's place an instance's rebind names, from a restore's stale
+/// list: the one rebind of `id`.
+fn rebound_pair(roles: &RolesHandle, by: u128, id: InstanceId) -> ScratchPlace {
+    let stale = roles.lock().unwrap().stale(holder(by));
+    let found: Vec<ScratchPlace> = stale
+        .iter()
+        .filter_map(|rebind| match rebind {
+            Rebind::Instance { id: at, pair, .. } if *at == id => Some(pair.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(found.len(), 1, "one rebind of {id:?}: {stale:?}");
+    found[0].clone()
+}
+
+/// Parks and unparks `by`'s items, nothing copied.
+fn park(roles: &RolesHandle, by: u128) {
+    let park = roles
+        .lock()
+        .unwrap()
+        .prepare_park(holder(by))
+        .expect("it parks");
+    roles.lock().unwrap().commit(park);
+}
+
+/// A pair parked with the instances that held it comes back for a new
+/// bind of the same pair: its state is dead between fires, so it takes
+/// fresh room on the device and the bind lands, never refused for it. The
+/// parked instance, restored, is rebound to the pair where it lies now.
+#[test]
+fn a_new_bind_of_a_parked_pair_brings_the_pair_back_and_lands() {
+    let Pools { device, roles } = pools(64);
+    let mut engine = GuestEngine::new(TOP_P, 2 * CHUNK);
+    let first = bind(&roles, &mut engine, 1).unwrap();
+    park(&roles, 1);
+    // Another process binds the same pair while it is parked.
+    bind(&roles, &mut engine, 2).expect("the pair comes back for it, no refusal");
+    let pair = engine.bindings[1].pair.clone();
+    assert!(matches!(pair, ScratchPlace::Chunks { .. }), "{pair:?}");
+    assert!(held(&device) > 0);
+    // The parked instance comes back, rebound to the pair where it lies.
+    let unpark = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(1))
+        .unwrap()
+        .expect("it unparks");
+    roles.lock().unwrap().commit(unpark);
+    assert_eq!(rebound_pair(&roles, 1, first), pair);
+}
+
+/// A restore's rebind of an instance names its pair's place: where the
+/// pair stayed resident (another process's instance held it), and where it
+/// was parked too and came back with it. Two processes restoring a pair
+/// parked with both: the second waits for the first's move to land, then
+/// is rebound to it, never told the pair lies nowhere.
+#[test]
+fn a_restore_rebinds_an_instance_with_its_pair_s_place() {
+    // The pair resident: process 2's instance holds it on the device.
+    let Pools { roles, .. } = pools(64);
+    let mut engine = GuestEngine::new(TOP_P, 2 * CHUNK);
+    let first = bind(&roles, &mut engine, 1).unwrap();
+    bind(&roles, &mut engine, 2).unwrap();
+    let resident = engine.bindings[0].pair.clone();
+    park(&roles, 1);
+    let unpark = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(1))
+        .unwrap()
+        .unwrap();
+    roles.lock().unwrap().commit(unpark);
+    assert_eq!(
+        rebound_pair(&roles, 1, first),
+        resident,
+        "the resident pair"
+    );
+
+    // The pair parked with its only process, and back with it.
+    let Pools { roles, .. } = pools(64);
+    let mut engine = GuestEngine::new(TOP_P, 2 * CHUNK);
+    let only = bind(&roles, &mut engine, 1).unwrap();
+    park(&roles, 1);
+    let unpark = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(1))
+        .unwrap()
+        .unwrap();
+    roles.lock().unwrap().commit(unpark);
+    let back = rebound_pair(&roles, 1, only);
+    assert!(matches!(back, ScratchPlace::Chunks { .. }), "{back:?}");
+
+    // Parked with two processes: one restore moves it; the other waits.
+    let Pools { roles, .. } = pools(64);
+    let mut engine = GuestEngine::new(TOP_P, 2 * CHUNK);
+    let a = bind(&roles, &mut engine, 1).unwrap();
+    let b = bind(&roles, &mut engine, 2).unwrap();
+    park(&roles, 2);
+    park(&roles, 1);
+    let first_back = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(1))
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(
+            roles.lock().unwrap().prepare_unpark(holder(2)),
+            Err(RolesError::PairParked(_))
+        ),
+        "its pair is moving with the other restore"
+    );
+    roles.lock().unwrap().commit(first_back);
+    let pair = rebound_pair(&roles, 1, a);
+    assert!(matches!(pair, ScratchPlace::Chunks { .. }), "{pair:?}");
+    let second = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(2))
+        .unwrap()
+        .unwrap();
+    roles.lock().unwrap().commit(second);
+    assert_eq!(
+        rebound_pair(&roles, 2, b),
+        pair,
+        "rebound to where it landed"
+    );
+}

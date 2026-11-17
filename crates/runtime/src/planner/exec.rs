@@ -763,6 +763,13 @@ async fn restore(
                 planner.requeue_restore_roles(pid);
                 return;
             }
+            // Its pair is on its way back with another process's restore:
+            // it goes again once that lands, its instances rebound to it.
+            if matches!(error, crate::store::roles::RolesError::PairParked(_)) {
+                tracing::debug!(%pid, %error, "planner: a restore waits for its pair's move");
+                planner.requeue_restore(pid);
+                return;
+            }
             planner.restore_faulted(pid, &format!("roles unpark: {error}"));
             return;
         }

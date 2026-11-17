@@ -128,7 +128,10 @@ pub enum RolesError {
     },
     #[error("the adapter this binding lands is parked with the instances that hold it")]
     AdapterParked,
-    #[error("{0}'s state is parked with the instances that hold it")]
+    /// The pair's state is on its way to or from the host with the
+    /// instances that hold it: a bind of it waits for the move to land
+    /// ([`Roles::room_watch`]), and an unpark is queued again.
+    #[error("{0}'s state is moving with the instances that hold it")]
     PairParked(FireKey),
     /// A bind found no device room for its items now, though the budget's
     /// state chunks hold them: it waits for room given back (a process
@@ -221,6 +224,16 @@ pub enum GuestRoom {
 }
 
 impl GuestRoom {
+    /// The runs of chunks it asks, `(run, pieces)`: a run of slots takes
+    /// one chunk.
+    #[must_use]
+    pub fn chunk_runs(self) -> (u32, u32) {
+        match self {
+            Self::Slots { .. } => (1, 1),
+            Self::Runs { run, pieces, .. } => (run, pieces),
+        }
+    }
+
     fn committable(self) -> u32 {
         match self {
             Self::Slots { committable, .. } | Self::Runs { committable, .. } => committable,
@@ -1000,6 +1013,35 @@ impl Roles {
                 Some(item) if item.tier == Tier::Device => {
                     Some((pair, item.parts[0].clone(), false))
                 }
+                // Parked with its instances: its contents are dead between
+                // fires, so it comes back on its own, fresh room on the
+                // device for this bind; its parked instances are rebound to
+                // it as they unpark.
+                Some(item) if item.tier == Tier::Host => {
+                    let like = item.parts[0].clone();
+                    match self.retake(&like) {
+                        Ok(part) => {
+                            let item = self.items.get_mut(&Owner::Pair(pair)).expect("present");
+                            item.parts = vec![part.clone()];
+                            item.tier = Tier::Device;
+                            Some((pair, part, false))
+                        }
+                        Err(room) => {
+                            let short = RolesError::GuestShort {
+                                what: format!("{pair}'s state coming back"),
+                                bytes: self.dead_bytes(&like),
+                                room,
+                            };
+                            let fits = self.fits_budget(&[Owner::Pair(pair)]);
+                            self.untake(taken);
+                            return Err(if fits {
+                                RolesError::BindShort(Box::new(short))
+                            } else {
+                                short
+                            });
+                        }
+                    }
+                }
                 Some(_) => {
                     self.untake(taken);
                     return Err(RolesError::PairParked(pair));
@@ -1249,6 +1291,15 @@ impl Roles {
             })
             .map(|(owner, _)| *owner)
             .collect();
+        // An instance whose pair is on its way back with another process's
+        // unpark is rebound once that lands: until then its restore is
+        // queued again, never told no room for its pair.
+        if let Some(pair) = owners.iter().find_map(|owner| {
+            let key = self.items[owner].pair?;
+            (self.items.get(&Owner::Pair(key))?.tier == Tier::Moving).then_some(key)
+        }) {
+            return Err(RolesError::PairParked(pair));
+        }
         let device = Arc::clone(&self.device);
         let mut items: Vec<(Owner, Vec<Part>)> = Vec::new();
         for owner in &owners {
@@ -1350,6 +1401,11 @@ impl Roles {
             }
             self.free_if_done(owner);
         }
+        // A bind waiting on a pair's move looks again.
+        self.freed
+            .gives
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.freed.notify.notify_waiters();
     }
 
     /// The move failed: each item stays where it was, and the slots taken
@@ -1417,6 +1473,16 @@ impl Roles {
             })
             .chain(instances.into_iter().filter_map(|id| {
                 let item = self.items.get(&Owner::Instance(id))?;
+                // Its pair not on the device yet: rebound once it lands,
+                // never told the pair lies nowhere.
+                if let Some(key) = item.pair
+                    && self
+                        .items
+                        .get(&Owner::Pair(key))
+                        .is_none_or(|pair| pair.tier != Tier::Device)
+                {
+                    return None;
+                }
                 Some(Rebind::Instance {
                     id,
                     instance: item.parts.first().map_or_else(Vec::new, |p| p.refs.clone()),
@@ -1648,19 +1714,22 @@ pub fn bind_instance(
 /// only after the planner has restored `pid`, or the walk has committed a
 /// segment, the event the refusal named, exactly as a fire held back by a
 /// suspension is sent after its restore.
-pub async fn bind_when_resident<T, E, B, W, G>(
+#[allow(clippy::too_many_arguments)]
+pub async fn bind_when_resident<T, E, B, W, G, P>(
     pid: Holder,
     mut bind: impl FnMut() -> B,
     resident: impl Fn() -> W,
     grown: impl Fn(u32, u32) -> G,
     room: impl Fn() -> Option<RoomWatch>,
     suspend: impl Fn() -> bool,
+    planned: impl Fn(u32, u32) -> P,
 ) -> anyhow::Result<T>
 where
     E: std::fmt::Display,
     B: std::future::Future<Output = anyhow::Result<T>>,
     W: std::future::Future<Output = Result<(), E>>,
     G: std::future::Future<Output = Result<(), String>>,
+    P: std::future::Future<Output = Result<(), String>>,
 {
     loop {
         // Taken before the bind: room given back meanwhile is not lost.
@@ -1669,6 +1738,13 @@ where
             Ok(bound) => return Ok(bound),
             Err(error) => error,
         };
+        if let Some(RolesError::PairParked(key)) = error.downcast_ref::<RolesError>()
+            && let Some(watch) = &watch
+        {
+            tracing::debug!(%pid, %key, "a bind waits for its pair's move to land");
+            watch.clone().freed().await;
+            continue;
+        }
         if matches!(
             error.downcast_ref::<RolesError>(),
             Some(RolesError::BindShort(_))
@@ -1684,9 +1760,30 @@ where
                 }
                 continue;
             }
-            if let Some(watch) = watch {
-                tracing::debug!(%pid, %error, "a bind waits for room given back");
-                watch.freed().await;
+            // Else it waits, queued in the planner, for room: given back
+            // (a close or a park, `watch`), or made for it as for a
+            // restore short of room for its roles (`planned`: idle cache
+            // dropped first, then a resident parked by the planner's
+            // victim choice).
+            if let Some(RolesError::BindShort(short)) = error.downcast_ref::<RolesError>()
+                && let RolesError::GuestShort { room, .. } = short.as_ref()
+            {
+                let (run, pieces) = room.chunk_runs();
+                tracing::debug!(%pid, %error, "a bind waits in the planner for room");
+                let freed = async {
+                    match watch {
+                        Some(watch) => watch.freed().await,
+                        None => std::future::pending().await,
+                    }
+                };
+                tokio::select! {
+                    () = freed => {}
+                    made = planned(run, pieces) => {
+                        if let Err(why) = made {
+                            return Err(error.context(format!("its wait for room ended: {why}")));
+                        }
+                    }
+                }
                 continue;
             }
         }

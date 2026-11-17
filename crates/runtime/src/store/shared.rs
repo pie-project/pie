@@ -1133,6 +1133,16 @@ impl SharedPool {
         self.roles
     }
 
+    /// The kv list slots that, moved out whole, free `chunks` chunks: what
+    /// a guest bind short of room is short, in pages
+    /// (`planner::PoolPort::chunks_as_pages`).
+    #[must_use]
+    pub fn list_slots_for_chunks(&self, chunks: u32) -> u64 {
+        self.list.map_or(0, |list| {
+            u64::from(chunks) * u64::from(list.slots_per_chunk)
+        })
+    }
+
     /// The kv list slots whose chunks, let go whole, hold `rs` of the state
     /// shapes: the rs list's slots (`pages`), each window list's
     /// (`windows`, a store of windows) and whole records (`slots`). Any

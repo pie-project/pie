@@ -43,6 +43,12 @@ enum Step {
     /// The head is a restore whose role slots found no room, and nothing
     /// else will free any: a resident process is evicted for it.
     EvictForRoles,
+    /// The head is a bind short of device room for its guest state.
+    BindRoom {
+        key: EntryKey,
+        run: u32,
+        pieces: u32,
+    },
     Release(DevicePageReservation),
     Done,
 }
@@ -116,11 +122,14 @@ impl ResidencyPlanner {
                     }
                     return Step::Done;
                 };
+                if let WaitKind::BindRoom { run, pieces, .. } = waiter.kind {
+                    return Step::BindRoom { key, run, pieces };
+                }
                 let is_restore = matches!(waiter.kind, WaitKind::Restore { .. });
                 let pid = waiter.pid;
                 let demand = match &waiter.kind {
                     WaitKind::Allocation { demand, .. } => Some(*demand),
-                    WaitKind::Restore { .. } => None,
+                    WaitKind::Restore { .. } | WaitKind::BindRoom { .. } => None,
                 };
                 let missing = waiter.kv_need().saturating_sub(inner.accum.len() as u32);
                 if missing > 0 {
@@ -155,6 +164,24 @@ impl ResidencyPlanner {
             });
             let fund_by_eviction = match step {
                 Step::Done => return false,
+                Step::BindRoom { key, run, pieces } => {
+                    // Its runs stand free: the bind takes them.
+                    if self.port.guest_room_free(run, pieces) {
+                        self.serve_bind_room(key);
+                        continue;
+                    }
+                    // As a restore short of room for its roles: idle cache
+                    // first, one set or a sweep, and it looks again in what
+                    // that left; then, the fleet stalled, a resident is
+                    // parked for it by the planner's victim choice.
+                    if self.reclaim_idle_once() || self.sweep_stranded(u32::MAX, false) {
+                        continue;
+                    }
+                    if !self.with_inner(|inner| inner.fleet_stalled()) {
+                        return false;
+                    }
+                    true
+                }
                 Step::EvictForRoles => {
                     // Idle cache holds chunks too: one set goes, and the
                     // restore tries again in what it left, before any
