@@ -28,10 +28,13 @@ use crate::linear::skeleton::{Epilogue, In, MAX_INS, MAX_OUTS, Paging, RowLeg, S
 
 /// The streaming skeleton that serves `m x n x k` with `epi`, where the
 /// product is bound by its weight's read (fewer rows than the device's
-/// ridge, `Tuning::gemm_ridge_rows`): the one of fewest rows that covers it
-/// (the gemv's one row, the few-rows skeleton's sixteen, the skinny's), each
-/// streaming the weight once with the epilogue fused. `None` where the
-/// product is compute-bound or none covers it: cuBLASLt serves it.
+/// ridge, `Tuning::gemm_ridge_rows`): the gemv (one row) or the few-rows
+/// skeleton (sixteen), the first that covers it, each a warp streaming a
+/// weight row through every activation row, the epilogue fused. The skinny
+/// skeleton tiles its rows on mma.sync as a GEMM does, so it is no streaming
+/// kernel and cuBLASLt serves what it would (on the L40S it ran 64-lane decode
+/// 9% under cuBLASLt). `None` where the product is compute-bound or neither
+/// covers it.
 fn streamed(
     epi: &Epilogue,
     m: i32,
@@ -42,7 +45,7 @@ fn streamed(
     if m >= i32::try_from(tuning.gemm_ridge_rows).unwrap_or(i32::MAX) {
         return None;
     }
-    Skeleton::ALL
+    [Skeleton::Gemv, Skeleton::Rows]
         .into_iter()
         .find(|s| s.covers(epi, m, n, k, tuning))
 }
