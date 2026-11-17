@@ -93,8 +93,21 @@ fn noise_canvas(seed: u32, length: u32, vocab: u32) -> Vec<i32> {
         .collect()
 }
 
+/// The denoising schedule a request may ask for: at least one step, and
+/// temperatures `0 < t_min <= t_max`.
+fn check_schedule(input: &Input) -> Result<()> {
+    if input.max_steps == 0 {
+        return Err("max_steps must be at least 1: a canvas denoised zero times is noise".into());
+    }
+    if !(input.t_min > 0.0 && input.t_max >= input.t_min) {
+        return Err("temperatures must satisfy 0 < t_min <= t_max".into());
+    }
+    Ok(())
+}
+
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
+    check_schedule(&input)?;
     if !model::switch("mode").is_some_and(|mode| mode.values.iter().any(|v| v == "denoise")) {
         return Err(
             "this program drives a block-diffusion model; the bound model is not one".into(),
@@ -112,9 +125,6 @@ async fn main(input: Input) -> Result<Output> {
         return Err(format!(
             "the engine reads out at most {readable} rows a fire and a canvas is {length}"
         ));
-    }
-    if !(input.t_min > 0.0 && input.t_max >= input.t_min) {
-        return Err("temperatures must satisfy 0 < t_min <= t_max".into());
     }
     let vocab = model::output_vocab_size();
     let stop_tokens = inferlet::chat::stop_tokens();
@@ -169,7 +179,7 @@ async fn main(input: Input) -> Result<Output> {
         // computed from it in the epilogue (the same `linear_temperature`
         // arithmetic the host would do), so a step needs no host `set`.
         let step_index = Channel::from([0u32]);
-        let max_steps = input.max_steps.max(1);
+        let max_steps = input.max_steps;
         let (t_max, t_min) = (input.t_max, input.t_min);
         let rng_state = Channel::from([input.seed ^ block, 0]);
         // The previous step's argmax canvas, device-carried; -1 means none.
@@ -378,4 +388,23 @@ async fn encode(ws: &WorkingSet, pipe: &Pipeline, tokens: &[i32], base: u32) -> 
     fwd.submit(pipe)?;
     last.take_host::<i32>().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(json: &str) -> Input {
+        serde_json::from_str(json).unwrap()
+    }
+
+    /// `max_steps: 0` is refused by name, not committed as an empty canvas.
+    #[test]
+    fn zero_steps_is_refused() {
+        let err = check_schedule(&request(r#"{"max_steps": 0}"#)).unwrap_err();
+        assert!(err.contains("max_steps must be at least 1"), "{err}");
+        assert!(check_schedule(&request(r#"{"max_steps": 1}"#)).is_ok());
+        assert!(check_schedule(&request("{}")).is_ok());
+        assert!(check_schedule(&request(r#"{"t_min": 0.9, "t_max": 0.4}"#)).is_err());
+    }
 }
