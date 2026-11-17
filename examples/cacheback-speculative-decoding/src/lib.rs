@@ -41,8 +41,13 @@ struct Input {
     stream: bool,
     #[serde(default)]
     ignore_eos: bool,
+    /// `rollback_mode: "ckpt_sync"` when `rollback_mode` is left out.
     #[serde(default)]
     ckpt_sync: bool,
+    /// `flush_free` (the next fire overwrites the rejected slots),
+    /// `ckpt_sync` (checkpoint before each verify, restore and replay the
+    /// accepted rows after) or `stop_wait` (verify one row a fire). Any other
+    /// name is refused.
     #[serde(default)]
     rollback_mode: Option<String>,
     /// DIAGNOSTIC: report, for every generated token, the top-1 and top-2
@@ -199,6 +204,27 @@ async fn fire(
     Ok((truth, tops))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rollback {
+    FlushFree,
+    CkptSync,
+    StopWait,
+}
+
+/// The rollback the request names; a name this program does not run is
+/// refused, never taken for the default.
+fn rollback(input: &Input) -> Result<Rollback> {
+    match input.rollback_mode.as_deref() {
+        None if input.ckpt_sync => Ok(Rollback::CkptSync),
+        None | Some("flush_free") => Ok(Rollback::FlushFree),
+        Some("ckpt_sync") => Ok(Rollback::CkptSync),
+        Some("stop_wait") => Ok(Rollback::StopWait),
+        Some(other) => Err(format!(
+            "unknown rollback_mode `{other}`: this program runs flush_free, ckpt_sync or stop_wait"
+        )),
+    }
+}
+
 /// What the decode loop needs from the target model: one greedy verify fire,
 /// and the checkpoint `ckpt_sync` takes before it and restores after.
 trait Target {
@@ -297,6 +323,9 @@ async fn decode<T: Target>(
 ) -> Result<Decoded> {
     let w_max = input.draft_length + 1;
     let n = prompt.len() as u32;
+    let mode = rollback(input)?;
+    let is_ckpt_sync = mode == Rollback::CkptSync;
+    let is_stop_wait = mode == Rollback::StopWait;
 
     let truth = target.fire(prompt, 0, None, true).await?;
     let first = *truth.last().expect("a prefill answers its last row");
@@ -320,16 +349,6 @@ async fn decode<T: Target>(
     let mut base = n;
     let mut survivors: u32 = 0;
 
-    let mode = input
-        .rollback_mode
-        .as_deref()
-        .unwrap_or(if input.ckpt_sync {
-            "ckpt_sync"
-        } else {
-            "flush_free"
-        });
-    let is_ckpt_sync = mode == "ckpt_sync";
-    let is_stop_wait = mode == "stop_wait";
 
     while !stopped && generated.len() < input.max_tokens {
         let prev_len = generated.len();
@@ -458,6 +477,7 @@ async fn main(input: Input) -> Result<Output> {
         top_trace: Vec::new(),
         margin_trace: Vec::new(),
     };
+    rollback(&input)?;
     if input.max_tokens == 0 {
         return Ok(empty());
     }
@@ -671,5 +691,20 @@ mod tests {
                 assert_eq!(chose, out.generated, "{mode} at draft {draft_length}");
             }
         }
+    }
+
+    /// A rollback the program does not run is refused by name, not flushed.
+    #[test]
+    fn an_unknown_rollback_mode_is_refused() {
+        let mut toy = Toy {
+            slots: Vec::new(),
+            saved: None,
+            tops: Vec::new(),
+        };
+        let err = ready(decode(&mut toy, &request(8, 4, "ckpt"), &[100], &[], |_| {}))
+            .err()
+            .expect("an unknown rollback_mode is refused");
+        assert!(err.contains("unknown rollback_mode `ckpt`"), "{err}");
+        assert!(toy.slots.is_empty(), "nothing was fired");
     }
 }
