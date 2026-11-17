@@ -1513,6 +1513,7 @@ pub fn compile_program(p: &TileProgram, out: &std::path::Path) -> R<()> {
     for (name, text) in &e.files {
         std::fs::write(out.join(name), text).map_err(|e| format!("{name}: {e}"))?;
     }
+    crate::check::written(&e.placed, &e.files, None);
     std::fs::write(
         out.join("fabric.txt"),
         format!("{} {} {}\n", e.w, e.h, u8::from(p.round16)),

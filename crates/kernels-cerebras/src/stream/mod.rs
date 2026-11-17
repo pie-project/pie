@@ -370,6 +370,7 @@ fn write_stream(
     for (name, text) in &e.files {
         std::fs::write(out.join(name), text).map_err(|e| format!("{name}: {e}"))?;
     }
+    crate::check::written(&e.placed, &e.files, None);
     std::fs::write(
         out.join("fabric.txt"),
         format!("{} {} {}\n", e.w, e.h, u8::from(o.round16)),
@@ -426,6 +427,7 @@ pub fn compile_decode(
     for (name, text) in &e.files {
         std::fs::write(out.join(name), text).map_err(|e| format!("{name}: {e}"))?;
     }
+    crate::check::written(&e.placed, &e.files, None);
     std::fs::write(
         out.join("fabric.txt"),
         format!("{} {} {}\n", e.w, e.h, u8::from(round16)),

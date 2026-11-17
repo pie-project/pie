@@ -51,6 +51,9 @@ pub struct Placed {
     /// Printed a PE at a time (rows, then columns: each PE's code, then its routes), every
     /// entry one PE's; else the tiles, then the routes, as listed.
     pub by_pe: bool,
+    /// The decode templates' frame (the size as `W` / `HH` consts, a region's loops a line
+    /// each, `init` / `compute` the launches); else the stream regimes' (`run`).
+    pub decode: bool,
 }
 
 impl Placed {
@@ -102,10 +105,17 @@ impl Placed {
     #[must_use]
     pub fn csl(&self) -> String {
         let (w, h) = (self.w, self.h);
-        let mut t = format!(
-            "{}\nconst memcpy = @import_module(\"<memcpy/get_params>\", .{{ .width = {w}, .height = {h} }});\nlayout {{\n  @set_rectangle({w}, {h});\n",
-            self.header
-        );
+        let mut t = if self.decode {
+            format!(
+                "{}\nconst W: u16 = {w};\nconst HH: u16 = {h};\nconst memcpy = @import_module(\"<memcpy/get_params>\", .{{ .width = W, .height = HH }});\nlayout {{\n  @set_rectangle(W, HH);\n",
+                self.header
+            )
+        } else {
+            format!(
+                "{}\nconst memcpy = @import_module(\"<memcpy/get_params>\", .{{ .width = {w}, .height = {h} }});\nlayout {{\n  @set_rectangle({w}, {h});\n",
+                self.header
+            )
+        };
         if self.by_pe {
             let mut at: BTreeMap<(u32, u32), PeEntries> = BTreeMap::new();
             for tl in &self.tiles {
@@ -128,7 +138,11 @@ impl Placed {
             }
         } else {
             for tl in &self.tiles {
-                tile_line(&mut t, tl);
+                if self.decode {
+                    tile_lines(&mut t, tl);
+                } else {
+                    tile_line(&mut t, tl);
+                }
             }
             for r in &self.routes {
                 route_line(&mut t, r);
@@ -137,7 +151,11 @@ impl Placed {
         for (n, ty) in &self.exports {
             let _ = writeln!(t, "  @export_name(\"{n}\", [*]{ty}, true);");
         }
-        t.push_str("  @export_name(\"run\", fn() void);\n}\n");
+        t.push_str(if self.decode {
+            "  @export_name(\"init\", fn()void);\n  @export_name(\"compute\", fn(u32, u32)void);\n}\n"
+        } else {
+            "  @export_name(\"run\", fn() void);\n}\n"
+        });
         t
     }
 
@@ -176,6 +194,24 @@ fn tile_line(t: &mut String, tl: &Tile) {
             tl.file
         ),
     };
+}
+
+/// A region's tile as the decode templates' frame writes it (its loops a line each).
+fn tile_lines(t: &mut String, tl: &Tile) {
+    let At::Region(xs, ys) = tl.at else {
+        tile_line(t, tl);
+        return;
+    };
+    let params: String = tl
+        .params
+        .iter()
+        .map(|(k, v)| format!(", .{k} = {v}"))
+        .collect();
+    let _ = writeln!(
+        t,
+        "  for (@range(u16, {}, {}, {})) |x| {{\n    const mp = memcpy.get_params(x);\n    for (@range(u16, {}, {}, {})) |y| {{\n      @set_tile_code(x, y, \"{}\", .{{ .memcpy_params = mp{params} }});\n    }}\n  }}",
+        xs.0, xs.1, xs.2, ys.0, ys.1, ys.2, tl.file
+    );
 }
 
 /// A route's `@set_color_config` line.

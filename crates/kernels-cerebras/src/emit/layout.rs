@@ -10,7 +10,6 @@
 //! so the link takes no params.
 
 use std::collections::HashMap;
-use std::fmt::Write as _;
 use std::path::Path;
 
 use crate::abi::{Kernels, Params};
@@ -18,6 +17,8 @@ use crate::floor::{Coord, Rect};
 use crate::program::Program;
 use crate::role::Kind;
 use crate::sources;
+
+use super::placed::{At, Placed, Tile};
 
 use super::params::{Levers, kernels, tile};
 
@@ -129,45 +130,38 @@ pub fn tiles(
     Ok((distinct, grid))
 }
 
-/// The `layout.csl` text of a program.
-pub fn layout_text(prog: &Program, kinds: &Kernels) -> Result<String, String> {
+/// The placement of a program: its kinds' rectangles, every param a literal, no routes (a
+/// decode program's are its rcfg's, set at its start).
+pub fn placed(prog: &Program, kinds: &Kernels) -> Result<Placed, String> {
     let (w, h) = (prog.floor.w, prog.floor.h);
     let (distinct, grid) = tiles(prog, kinds)?;
-    let rs = rects(w, h, |c| grid[(c.y * w + c.x) as usize]);
-    let mut s = String::new();
-    s.push_str("param kernel_rows: u16 = 0;\nparam kernel_cols: u16 = 0;\nparam iters: u16 = 0;\n");
-    let _ = writeln!(s, "const W: u16 = {w};\nconst HH: u16 = {h};");
-    s.push_str(
-        "const memcpy = @import_module(\"<memcpy/get_params>\", .{ .width = W, .height = HH });\n",
+    let mut pl = Placed::new(
+        "param kernel_rows: u16 = 0;\nparam kernel_cols: u16 = 0;\nparam iters: u16 = 0;".into(),
+        w,
+        h,
     );
-    s.push_str("layout {\n  @set_rectangle(W, HH);\n");
-    for (i, r) in rs {
-        let (file, args) = match &distinct[i] {
-            None => ("filler".to_string(), String::new()),
+    pl.decode = true;
+    for (i, r) in rects(w, h, |c| grid[(c.y * w + c.x) as usize]) {
+        let (file, params) = match &distinct[i] {
+            None => ("filler".to_string(), Vec::new()),
             Some((k, p)) => (
                 k.stem.to_string(),
                 p.items
                     .iter()
-                    .map(|(n, v)| format!(", .{n} = {}", v.render()))
-                    .collect::<String>(),
+                    .map(|(n, v)| (n.to_string(), v.render()))
+                    .collect(),
             ),
         };
-        let _ = writeln!(
-            s,
-            "  for (@range(u16, {}, {}, 1)) |x| {{\n    const mp = memcpy.get_params(x);\n    for (@range(u16, {}, {}, 1)) |y| {{\n      @set_tile_code(x, y, \"{file}.csl\", .{{ .memcpy_params = mp{args} }});\n    }}\n  }}",
-            r.x,
-            r.x + r.w,
-            r.y,
-            r.y + r.h,
-        );
+        pl.tiles.push(Tile {
+            at: At::Region((r.x, r.x + r.w, 1), (r.y, r.y + r.h, 1)),
+            file: format!("{file}.csl"),
+            params,
+        });
     }
     for (n, t) in crate::kernels::symbols(prog.roles) {
-        let _ = writeln!(s, "  @export_name(\"{n}\", [*]{t}, true);");
+        pl.export(n, t);
     }
-    s.push_str(
-        "  @export_name(\"init\", fn()void);\n  @export_name(\"compute\", fn(u32, u32)void);\n}\n",
-    );
-    Ok(s)
+    Ok(pl)
 }
 
 /// Writes `<out>/layout.csl`, one `<kind>.csl` a role kind (the kernel source, embedded or from
@@ -182,8 +176,10 @@ pub fn write(
     let kinds = kernels(prog, levers)?;
     std::fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
     let syms = crate::kernels::symbols(prog.roles);
+    let own = std::cell::RefCell::new(Vec::new());
     let wr = |name: &str, text: &str| {
         let p = out.join(name);
+        own.borrow_mut().push((name.to_string(), text.to_string()));
         std::fs::write(&p, text).map_err(|e| format!("{}: {e}", p.display()))
     };
     for (k, kb) in &kinds {
@@ -224,6 +220,11 @@ pub fn write(
         };
         wr(&format!("ops/{name}"), &text)?;
     }
-    wr("layout.csl", &layout_text(prog, &kinds)?)?;
+    let pl = placed(prog, &kinds)?;
+    wr("layout.csl", &pl.csl())?;
+    if crate::check::keeping() {
+        let routes = crate::check::Routes::of_rcfg(&super::rcfg::dump(prog)?, 0, 0)?;
+        crate::check::written(&pl, &own.borrow(), Some(routes));
+    }
     Ok(())
 }

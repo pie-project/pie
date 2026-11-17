@@ -45,6 +45,8 @@ const OP_ATTN: u32 = 8;
 #[derive(Clone, Debug)]
 pub struct Emitted {
     pub files: Vec<(String, String)>,
+    /// Its placement (`layout.csl`'s): what the static check reads.
+    pub placed: super::placed::Placed,
     pub arrays: Vec<GridArray>,
     pub w: u32,
     pub h: u32,
@@ -655,12 +657,6 @@ fn table_syms(p: &GemmProgram) -> Vec<(String, bool)> {
     out
 }
 
-/// `layout.csl`: the array's code and every colour's routes by loops.
-#[allow(clippy::too_many_lines)]
-fn layout_file(p: &GemmProgram) -> String {
-    placed(p).csl()
-}
-
 /// The program's placement: the array's PEs and the tapes' below them, every line's and tree's
 /// routes, the host's symbols.
 #[must_use]
@@ -759,7 +755,8 @@ pub fn emit(p: &GemmProgram) -> R<Emitted> {
     files.push(("gseg.csl".into(), gseg_file()));
     files.push(("gpe.csl".into(), pe_file(p, &tb)));
     files.push(("gtape.csl".into(), tape_file()));
-    files.push(("layout.csl".into(), layout_file(p)));
+    let pl = placed(p);
+    files.push(("layout.csl".into(), pl.csl()));
     let mut arrays = Vec::new();
     let ieee = !p.l.round16;
     for x in 0..p.c {
@@ -929,6 +926,7 @@ pub fn emit(p: &GemmProgram) -> R<Emitted> {
     let (w, h) = p.fabric();
     Ok(Emitted {
         files,
+        placed: pl,
         arrays,
         w,
         h,

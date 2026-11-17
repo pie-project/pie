@@ -148,6 +148,7 @@ fn build(args: &[String]) -> Result<(), String> {
         kernels_cerebras::cost::memory::anchor(&plan.shape),
     );
     let prog = Program::of(plan)?;
+    kernels_cerebras::check::keep();
     build::emit(
         &prog,
         &levers,
@@ -156,8 +157,7 @@ fn build(args: &[String]) -> Result<(), String> {
         &emit,
     )?;
     // the static check of what was emitted (routes, queues, a PE's memory)
-    if out.join("layout/layout.csl").is_file() {
-        let mut rep = kernels_cerebras::check::dir(&out.join("layout"))?;
+    if let Some(mut rep) = kernels_cerebras::check::last() {
         rep.model_room = Some(room as i64);
         println!("{}", rep.line());
         rep.ok()?;
@@ -165,31 +165,14 @@ fn build(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// The static check of what `stream` wrote in `--out` (where it wrote a program).
+/// The static check of the program `stream` wrote (where it wrote one); `--check-all 1`, its
+/// findings and every kind of PE's line (file, data bytes, its code's measures: a refit's
+/// input).
 fn checked(args: &[String]) -> Result<(), String> {
-    let Some(out) = args
-        .iter()
-        .position(|a| a == "--out")
-        .and_then(|i| args.get(i + 1))
-    else {
+    let Some(rep) = kernels_cerebras::check::last() else {
         return Ok(());
     };
-    let dir = Path::new(out);
-    if !dir.join("layout.csl").is_file() || args.iter().any(|a| a == "--price") {
-        return Ok(());
-    }
-    let rep = kernels_cerebras::check::dir(dir)?;
-    println!("{}", rep.line());
-    rep.ok()
-}
-
-/// `check --dir <program dir> [--all 1]`: the static check of an emitted program (a stream
-/// program's directory, or a decode build's `layout/`); `--all`, every kind of PE's line.
-fn check(args: &[String]) -> Result<(), String> {
-    let f = flags(args, &["--dir", "--all"])?;
-    let rep = kernels_cerebras::check::dir(Path::new(get(&f, "--dir").ok_or(USAGE)?))?;
-    if get(&f, "--all").is_some() {
-        // every kind of PE: file, data bytes, its code's measures (a refit's input), parameters
+    if args.iter().any(|a| a == "--check-all") {
         for (file, p, d, r) in &rep.kinds {
             let m = r.measure;
             println!(
@@ -197,24 +180,24 @@ fn check(args: &[String]) -> Result<(), String> {
                 m.statements, r.functions, m.dsd, m.loops, m.ifs
             );
         }
+        for e in rep.errors.iter().take(20) {
+            println!("  error: {e}");
+        }
+        for w in rep.warnings.iter().take(5) {
+            println!("  warning: {w}");
+        }
+        for (f, d, c) in rep.codes.iter().take(8) {
+            println!("  {f}: {d} B data + ~{c} B code");
+        }
+        if !rep.unknown.is_empty() {
+            println!(
+                "  {} array sizes not evaluated, e.g. {}",
+                rep.unknown.len(),
+                rep.unknown[0]
+            );
+        }
     }
     println!("{}", rep.line());
-    for e in rep.errors.iter().take(20) {
-        println!("  error: {e}");
-    }
-    for w in rep.warnings.iter().take(5) {
-        println!("  warning: {w}");
-    }
-    for (f, d, c) in rep.codes.iter().take(8) {
-        println!("  {f}: {d} B data + ~{c} B code");
-    }
-    if !rep.unknown.is_empty() {
-        println!(
-            "  {} array sizes not evaluated, e.g. {}",
-            rep.unknown.len(),
-            rep.unknown[0]
-        );
-    }
     rep.ok()
 }
 
@@ -725,8 +708,10 @@ fn run() -> Result<(), String> {
         Some("link") => link(&args[1..]),
         Some("cost") => cost(&args[1..]),
         Some("search") => search(&args[1..]),
-        Some("stream") => stream(&args[1..]).and_then(|()| checked(&args[1..])),
-        Some("check") => check(&args[1..]),
+        Some("stream") => {
+            kernels_cerebras::check::keep();
+            stream(&args[1..]).and_then(|()| checked(&args[1..]))
+        }
         _ => Err(USAGE.to_string()),
     }
 }

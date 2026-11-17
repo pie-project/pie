@@ -14,6 +14,7 @@ use std::fmt::Write as _;
 
 use poem_ir::ValueId;
 
+use crate::emit::placed::Placed;
 use crate::emit::stream::{COMMON, Tiles, buf, cfg_decl, dedup, placed_of};
 use crate::fabric::Endpoint;
 use crate::floor::Coord;
@@ -58,6 +59,8 @@ pub struct GridArray {
 #[derive(Clone, Debug)]
 pub struct Emitted {
     pub files: Vec<(String, String)>,
+    /// Its placement (`layout.csl`'s): what the static check reads.
+    pub placed: super::placed::Placed,
     pub arrays: Vec<GridArray>,
     pub w: u32,
     pub h: u32,
@@ -1641,17 +1644,19 @@ pub fn emit(g: &GridProgram) -> R<Emitted> {
     }
     files.push(("filler.csl".into(), filler_file()));
     dedup(&mut files, &mut tiles);
-    files.push(("layout.csl".into(), layout_file(g, &tiles, &arrays)));
+    let pl = layout_placed(g, &tiles, &arrays);
+    files.push(("layout.csl".into(), pl.csl()));
     Ok(Emitted {
         files,
+        placed: pl,
         arrays,
         w: s.w,
         h: s.h,
     })
 }
 
-/// `layout.csl`: every PE's code, params and routes, every exported name.
-fn layout_file(g: &GridProgram, tiles: &Tiles, arrays: &[GridArray]) -> String {
+/// The placement: every PE's code, params and routes, every exported name.
+fn layout_placed(g: &GridProgram, tiles: &Tiles, arrays: &[GridArray]) -> Placed {
     let s = &g.stream;
     let mut names: BTreeMap<String, &str> = BTreeMap::new();
     for (n, ty) in [
@@ -1678,5 +1683,5 @@ fn layout_file(g: &GridProgram, tiles: &Tiles, arrays: &[GridArray]) -> String {
         "// A grid reading's wafer program (kernels-cerebras emit::grid): {} x {} PEs.",
         s.w, s.h
     );
-    placed_of(header, (s.w, s.h), tiles, &g.fabric, &names).csl()
+    placed_of(header, (s.w, s.h), tiles, &g.fabric, &names)
 }

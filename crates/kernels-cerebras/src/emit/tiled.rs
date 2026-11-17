@@ -40,6 +40,8 @@ const A: [u32; 2] = [10, 11];
 #[derive(Clone, Debug)]
 pub struct Emitted {
     pub files: Vec<(String, String)>,
+    /// Its placement (`layout.csl`'s): what the static check reads.
+    pub placed: super::placed::Placed,
     pub arrays: Vec<GridArray>,
     pub w: u32,
     pub h: u32,
@@ -441,12 +443,6 @@ fn filler_file() -> String {
     t
 }
 
-/// `layout.csl`: loops over the array's parity classes, the colours' route rules.
-#[allow(clippy::too_many_lines)]
-fn layout_file(p: &TileProgram) -> String {
-    placed(p).csl()
-}
-
 /// The program's placement: the image array's PEs (each its shifts' parities), the hub, the
 /// tape, the fillers; the shifts', the weight tree's, the broadcast's and the tape's routes.
 #[must_use]
@@ -622,7 +618,8 @@ pub fn emit(p: &TileProgram) -> R<Emitted> {
     files.push(("ttape.csl".into(), tape_file()));
     files.push(("thub.csl".into(), hub_file(p)));
     files.push(("filler.csl".into(), filler_file()));
-    files.push(("layout.csl".into(), layout_file(p)));
+    let pl = placed(p);
+    files.push(("layout.csl".into(), pl.csl()));
     let mut arrays = Vec::new();
     let (gx, gy) = (p.gx, p.gy);
     for y in 0..gy {
@@ -741,6 +738,7 @@ pub fn emit(p: &TileProgram) -> R<Emitted> {
     let (w, h) = p.fabric();
     Ok(Emitted {
         files,
+        placed: pl,
         arrays,
         w,
         h,

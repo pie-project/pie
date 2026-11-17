@@ -2307,7 +2307,8 @@ milestone's tail.
   fullest PE's margin under 48 KB reported; a decode
   program's memory is its plan's memory model's (`cost::memory::room`: its sizes are comptime
   functions past the check's arithmetic). `wafer-compile build` and `stream` run it on what they
-  wrote and fail on an error; `wafer-compile check --dir <program>` prints it.
+  wrote and fail on an error (since part C, the check reads the placement the writer states,
+  not the files on disk; `check --dir` is gone).
   - It finds K1's band bug: the stream program the compiler built before the fix (945557fd3^,
     flux2-mini over three bands at a 45-wide fabric) has 616 errors (a later band's weight PEs'
     input queues on the first band's colours, routed past their ramps); the fixed compiler's
@@ -2457,8 +2458,8 @@ milestone's tail.
   - `check::pe_bytes(files, file, params)` is the same model for a search's candidate, one
     kind of PE at a time. `PeBytes::fits()` means it fits whatever the miss;
     `PeBytes::overflows()` means it cannot.
-  - `wafer-compile check --dir <program> --all 1` prints every kind of PE's measures, which is
-    a refit's input.
+  - `wafer-compile stream ... --check-all 1` prints every kind of PE's measures, which is a
+    refit's input. Before part C this was `check --dir <program> --all 1`.
 
 ## The GEMM search's time
 
@@ -2529,12 +2530,29 @@ milestone's tail.
       - the decode identity's 6 configs.
     - Lines: grid.rs +6 / -34, stream.rs +56 / -47, placed.rs +73 / -34 (the PE-at-a-time
       printing and the line printers split out). Net **+20**.
-  - **The tally.** All four regimes now state a `Placed`, and the check reads one directly
-    (GEMM, klein). Net **+225** over part C. The IR did not shrink the code; the one real
-    dedupe was grid and stream sharing a writer. The check's CSL parser (about 300 lines)
-    stays, because the decode programs' layouts (`emit::layout`, routes from rcfg) and
-    `check --dir` over a program on disk are still text. It could go only if decode moved
-    onto the IR too.
+  - **Decode** (`emit::layout::placed`): the KernelSet templates' kind rectangles, a region
+    each, with no routes (a decode program's routes are its rcfg's, set at its start). It
+    prints in the templates' own frame (`Placed::decode`: the size as `W` / `HH`, each region's
+    loops on lines of their own, `init` / `compute` as the launches).
+  - **The check reads only placements.**
+    - Every regime's `Emitted` carries its `Placed`. Each writer hands it to `check::written`,
+      and the check runs on it when `check::keep` asked: `wafer-compile stream` and `build`
+      do, a load does not.
+    - A decode build passes its rcfg's routes alongside its placement.
+    - The stream search's memory feasibility (`stream::build::fits`) reads the candidate's
+      placement, so it no longer parses `layout.csl` per candidate.
+    - The CSL layout parser is gone (180 lines, plus `program`, `dir` and `files`), and so
+      is `wafer-compile check --dir`. Nothing needed it past the writers; a refit re-emits
+      with `--check-all`.
+    - The check's reports are unchanged: the same counts on flux2-mini text and Qwen3-0.6B's
+      units.
+  - Byte-identical against the origin tip's output: the flux gate (7,663 files), every
+    `fluxid` program, Qwen3-0.6B's units, and the decode identity's 6 configs.
+  - Lines: check.rs +65 / -270, wafer-compile.rs +27 / -42, emit/layout.rs +30 / -29,
+    placed.rs +42 / -6, the four emitters and their writers +33 / -23. Net **-173**.
+  - **The tally.** Every regime states a `Placed`, and the check reads only that. Part C nets
+    **+52** lines (+225, then -173). The IR paid back most of its own cost by removing the
+    text parser, but not all of it.
 
 ## G1: the poem survey
 

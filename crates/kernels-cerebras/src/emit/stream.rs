@@ -106,6 +106,8 @@ pub struct HostArray {
 #[derive(Clone, Debug)]
 pub struct Emitted {
     pub files: Vec<(String, String)>,
+    /// Its placement (`layout.csl`'s): what the static check reads.
+    pub placed: super::placed::Placed,
     pub arrays: Vec<HostArray>,
     pub w: u32,
     pub h: u32,
@@ -636,9 +638,11 @@ pub fn emit(p: &Program) -> R<Emitted> {
         }
     }
     dedup(&mut files, &mut tiles);
-    files.push(("layout.csl".into(), layout_file(p, &tiles, &arrays)));
+    let pl = layout_placed(p, &tiles, &arrays);
+    files.push(("layout.csl".into(), pl.csl()));
     Ok(Emitted {
         files,
+        placed: pl,
         arrays,
         w: s.w,
         h: s.h,
@@ -2760,8 +2764,8 @@ fn filler_file() -> String {
     t
 }
 
-/// `layout.csl`: every PE's code and params, every route, every exported name.
-fn layout_file(p: &Program, tiles: &Tiles, arrays: &[HostArray]) -> String {
+/// The placement: every PE's code and params, every route, every exported name.
+fn layout_placed(p: &Program, tiles: &Tiles, arrays: &[HostArray]) -> Placed {
     let s = &p.stream;
     // an array's element type: words (config, positions, stamps, an argmax's) u32
     let mut names: BTreeMap<String, &str> = BTreeMap::new();
@@ -2777,5 +2781,5 @@ fn layout_file(p: &Program, tiles: &Tiles, arrays: &[HostArray]) -> String {
         "// A stream reading's wafer program (kernels-cerebras emit::stream): {} x {} PEs.",
         s.w, s.h
     );
-    placed_of(header, (s.w, s.h), tiles, &p.fabric, &names).csl()
+    placed_of(header, (s.w, s.h), tiles, &p.fabric, &names)
 }

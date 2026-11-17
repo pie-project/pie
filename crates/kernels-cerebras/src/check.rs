@@ -1,5 +1,6 @@
-//! A static check of an emitted wafer program, every regime alike: what `layout.csl` (and a
-//! decode program's `rcfg.txt`) route and each PE's code holds, read off the files cslc takes.
+//! A static check of an emitted wafer program, every regime alike: what its placement
+//! ([`Placed`], `layout.csl`'s, and a decode program's rcfg) routes and each PE's code holds (its
+//! files, as cslc takes them).
 //!
 //! - **Routes**: one route a colour at a PE (a colour set twice to different words is a clash),
 //!   colours in range, and every send received: a route transmitting toward a neighbour needs
@@ -18,9 +19,11 @@
 
 pub mod code;
 
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::path::Path;
+
+use crate::emit::placed::Placed;
 
 type R<T> = Result<T, String>;
 
@@ -439,186 +442,6 @@ fn dirs_word(list: &str, rx: bool) -> u32 {
     w
 }
 
-/// `.rx = .{ ... }` / `.tx = .{ ... }`'s list.
-fn route_list<'a>(cfg: &'a str, key: &str) -> &'a str {
-    let Some(at) = cfg.find(key) else { return "" };
-    let rest = &cfg[at + key.len()..];
-    let Some(open) = rest.find('{') else {
-        return "";
-    };
-    let Some(close) = rest[open..].find('}') else {
-        return "";
-    };
-    &rest[open + 1..open + close]
-}
-
-/// A layout's statements run: the rectangle, each PE's tile and every route it sets.
-pub fn layout(text: &str) -> R<(Routes, Tiles)> {
-    let src = uncomment(text);
-    let cs: Vec<char> = src.chars().collect();
-    let mut st = Layout::default();
-    let mut env = BTreeMap::new();
-    st.block(&cs, &mut 0, &mut env, false)?;
-    Ok((st.routes, st.tiles))
-}
-
-#[derive(Default)]
-struct Layout {
-    routes: Routes,
-    tiles: BTreeMap<(i64, i64), Tile>,
-}
-
-impl Layout {
-    /// Statements up to the block's closing brace (or the end at the top).
-    fn block(
-        &mut self,
-        cs: &[char],
-        p: &mut usize,
-        env: &mut BTreeMap<String, i64>,
-        inner: bool,
-    ) -> R<()> {
-        loop {
-            while *p < cs.len() && cs[*p].is_whitespace() {
-                *p += 1;
-            }
-            if *p >= cs.len() {
-                return Ok(());
-            }
-            if cs[*p] == '}' {
-                *p += 1;
-                if inner {
-                    return Ok(());
-                }
-                continue;
-            }
-            // a statement: up to `;` or a block's `{` at depth 0
-            let start = *p;
-            let mut depth = 0i32;
-            while *p < cs.len() {
-                match cs[*p] {
-                    '(' | '[' => depth += 1,
-                    ')' | ']' => depth -= 1,
-                    '{' if depth == 0 => break,
-                    '{' | '}' if depth > 0 => {}
-                    ';' if depth == 0 => break,
-                    _ => {}
-                }
-                *p += 1;
-            }
-            let head: String = cs[start..(*p).min(cs.len())].iter().collect();
-            let head = head.trim().to_string();
-            if *p < cs.len() && cs[*p] == '{' {
-                *p += 1;
-                if let Some(rest) = head.strip_prefix("for") {
-                    let args = call_args(rest.trim_start().trim_start_matches('(').trim_start())
-                        .unwrap_or_default();
-                    let var = head
-                        .rsplit('|')
-                        .nth(1)
-                        .map(str::trim)
-                        .unwrap_or("")
-                        .to_string();
-                    let (a, b, s) = match args.as_slice() {
-                        [_, a, b, s] => (eval(a, env), eval(b, env), eval(s, env)),
-                        _ => (None, None, None),
-                    };
-                    let (Some(a), Some(b), Some(s)) = (a, b, s) else {
-                        return Err(format!("layout: a loop it cannot run: `{head}`"));
-                    };
-                    let body = *p;
-                    let mut i = a;
-                    let mut end = body;
-                    if a >= b {
-                        // (an empty loop: its body skipped)
-                        let mut e = body;
-                        self.skip(cs, &mut e);
-                        end = e;
-                    }
-                    while i < b {
-                        let mut q = body;
-                        let mut inner_env = env.clone();
-                        inner_env.insert(var.clone(), i);
-                        self.block(cs, &mut q, &mut inner_env, true)?;
-                        end = q;
-                        i += s.max(1);
-                    }
-                    *p = end;
-                } else {
-                    let mut inner_env = env.clone();
-                    self.block(cs, p, &mut inner_env, true)?;
-                }
-                continue;
-            }
-            *p += 1;
-            self.statement(&head, env);
-        }
-    }
-
-    fn skip(&self, cs: &[char], p: &mut usize) {
-        let mut depth = 1;
-        while *p < cs.len() && depth > 0 {
-            match cs[*p] {
-                '{' => depth += 1,
-                '}' => depth -= 1,
-                _ => {}
-            }
-            *p += 1;
-        }
-    }
-
-    fn statement(&mut self, s: &str, env: &mut BTreeMap<String, i64>) {
-        if let Some(rest) = s
-            .strip_prefix("const ")
-            .or_else(|| s.strip_prefix("param "))
-        {
-            if let Some((name, v)) = rest.split_once('=') {
-                let name = name.split(':').next().unwrap_or("").trim().to_string();
-                if let Some(v) = eval(v, env) {
-                    env.insert(name, v);
-                }
-            }
-        } else if s.starts_with("@set_rectangle") {
-            if let Some(a) = call_args(s)
-                && a.len() == 2
-            {
-                self.routes.w = eval(&a[0], env).unwrap_or(0);
-                self.routes.h = eval(&a[1], env).unwrap_or(0);
-            }
-        } else if s.starts_with("@set_tile_code") {
-            if let Some(a) = call_args(s)
-                && a.len() >= 3
-                && let (Some(x), Some(y)) = (eval(&a[0], env), eval(&a[1], env))
-            {
-                let params = a
-                    .get(3)
-                    .map(|f| fields(f))
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter_map(|(k, v)| eval(&v, env).map(|v| (k, v)))
-                    .collect();
-                self.tiles.insert(
-                    (x, y),
-                    Tile {
-                        file: a[2].trim_matches('"').to_string(),
-                        params,
-                    },
-                );
-            }
-        } else if s.starts_with("@set_color_config")
-            && let Some(a) = call_args(s)
-            && a.len() == 4
-            && let (Some(x), Some(y)) = (eval(&a[0], env), eval(&a[1], env))
-        {
-            let c = call_args(&a[2])
-                .and_then(|g| g.first().and_then(|e| eval(e, env)))
-                .unwrap_or(-1);
-            let word = dirs_word(route_list(&a[3], ".rx"), true)
-                | dirs_word(route_list(&a[3], ".tx"), false);
-            self.routes.set(x, y, c, word);
-        }
-    }
-}
-
 /// What a PE's files hold: data bytes, queue bindings (`input`, id, colour).
 #[derive(Clone, Debug, Default)]
 struct Held {
@@ -942,29 +765,9 @@ impl Report {
     }
 }
 
-/// The checks over a program's files (`layout.csl`, its PE files and the ops they import),
-/// its routes `routes` where the layout does not set them (a decode program's `rcfg.txt`).
-#[must_use]
-pub fn program(files: &BTreeMap<String, String>, routes: Option<Routes>) -> Report {
-    let Some(text) = files.get("layout.csl") else {
-        let mut rep = Report::default();
-        rep.errors.push("no layout.csl".into());
-        return rep;
-    };
-    match layout(text) {
-        Ok((r, tiles)) => placed_with(files, r, &tiles, routes),
-        Err(e) => {
-            let mut rep = Report::default();
-            rep.errors.push(e);
-            rep
-        }
-    }
-}
-
 /// A placement's routes and tiles as the check reads them (no `layout.csl` to parse).
 #[must_use]
-pub fn layout_ir(p: &crate::emit::placed::Placed) -> (Routes, Tiles) {
-    use crate::emit::placed::Placed;
+pub fn layout_ir(p: &Placed) -> (Routes, Tiles) {
     let mut r = Routes {
         w: i64::from(p.w),
         h: i64::from(p.h),
@@ -981,7 +784,7 @@ pub fn layout_ir(p: &crate::emit::placed::Placed) -> (Routes, Tiles) {
         let params: BTreeMap<String, i64> = t
             .params
             .iter()
-            .filter_map(|(k, v)| v.parse().ok().map(|v| (k.clone(), v)))
+            .filter_map(|(k, v)| eval(v, &BTreeMap::new()).map(|v| (k.clone(), v)))
             .collect();
         for (x, y) in Placed::pes(t.at) {
             tiles.insert(
@@ -996,9 +799,10 @@ pub fn layout_ir(p: &crate::emit::placed::Placed) -> (Routes, Tiles) {
     (r, tiles)
 }
 
-/// [`program`] over a placement (its PE files in `own`, the crate's ops beside them).
+/// The checks over a placement: its PE files in `own` (the crate's ops beside them), `routes`
+/// a decode program's (its rcfg's: its placement sets none).
 #[must_use]
-pub fn placed(p: &crate::emit::placed::Placed, own: &[(String, String)]) -> Report {
+pub fn placed(p: &Placed, own: &[(String, String)], routes: Option<Routes>) -> Report {
     let mut files: BTreeMap<String, String> = BTreeMap::new();
     for (n, s) in crate::sources::OPS.iter().chain(crate::sources::STREAM_OPS) {
         files.insert(format!("ops/{n}"), (*s).to_string());
@@ -1007,7 +811,36 @@ pub fn placed(p: &crate::emit::placed::Placed, own: &[(String, String)]) -> Repo
         files.insert(n.clone(), s.clone());
     }
     let (r, tiles) = layout_ir(p);
-    placed_with(&files, r, &tiles, None)
+    placed_with(&files, r, &tiles, routes)
+}
+
+thread_local! {
+    /// Whether a written program's check is kept for [`last`] (this thread's), and the last.
+    static KEEP: Cell<bool> = const { Cell::new(false) };
+    static LAST: RefCell<Option<Report>> = const { RefCell::new(None) };
+}
+
+/// From now on, every program this thread writes is checked, its report kept for [`last`].
+pub fn keep() {
+    KEEP.with(|k| k.set(true));
+}
+
+/// Whether [`keep`] asked.
+pub(crate) fn keeping() -> bool {
+    KEEP.with(Cell::get)
+}
+
+/// A program's writer: its placement and files checked where [`keep`] asks.
+pub(crate) fn written(p: &Placed, own: &[(String, String)], routes: Option<Routes>) {
+    if keeping() {
+        let rep = placed(p, own, routes);
+        LAST.with(|l| *l.borrow_mut() = Some(rep));
+    }
+}
+
+/// The check of the program written last (since [`keep`]), once.
+pub fn last() -> Option<Report> {
+    LAST.with(|l| l.borrow_mut().take())
 }
 
 /// The checks over routes `r` and tiles `tiles`, the PEs' files in `files`, `routes` a decode
@@ -1107,56 +940,6 @@ fn placed_with(
     rep
 }
 
-/// [`program`] over the files in `dir` (and `ops/` beside them, else the crate's ops), its
-/// `rcfg.txt` where it has one.
-pub fn dir(dir: &Path) -> R<Report> {
-    let mut files: BTreeMap<String, String> = BTreeMap::new();
-    for (n, s) in crate::sources::OPS.iter().chain(crate::sources::STREAM_OPS) {
-        files.insert(format!("ops/{n}"), (*s).to_string());
-    }
-    for sub in ["", "ops"] {
-        let d = dir.join(sub);
-        let Ok(rd) = std::fs::read_dir(&d) else {
-            continue;
-        };
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.extension().is_some_and(|x| x == "csl") {
-                let name = if sub.is_empty() {
-                    e.file_name().to_string_lossy().to_string()
-                } else {
-                    format!("{sub}/{}", e.file_name().to_string_lossy())
-                };
-                files.insert(
-                    name,
-                    std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?,
-                );
-            }
-        }
-    }
-    let rcfg = dir.join("../rcfg.txt");
-    let routes = if rcfg.is_file() {
-        let t = std::fs::read_to_string(&rcfg).map_err(|e| e.to_string())?;
-        Some(Routes::of_rcfg(&t, 0, 0)?)
-    } else {
-        None
-    };
-    Ok(program(&files, routes))
-}
-
-/// [`program`] over files in memory (an emitter's), the crate's ops beside them.
-#[must_use]
-pub fn files(own: &[(String, String)]) -> Report {
-    let mut files: BTreeMap<String, String> = BTreeMap::new();
-    for (n, s) in crate::sources::OPS.iter().chain(crate::sources::STREAM_OPS) {
-        files.insert(format!("ops/{n}"), (*s).to_string());
-    }
-    for (n, s) in own {
-        files.insert(n.clone(), s.clone());
-    }
-    program(&files, None)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1173,8 +956,16 @@ mod tests {
 
     #[test]
     fn a_send_into_a_pe_that_does_not_take_it_is_found() {
-        let lay = "layout {\n  @set_rectangle(3, 1);\n  for (@range(u16, 0, 2, 1)) |x| { @set_color_config(x, 0, @get_color(4), .{ .routes = .{ .rx = .{ WEST }, .tx = .{ EAST, RAMP } } }); }\n  @set_color_config(2, 0, @get_color(4), .{ .routes = .{ .rx = .{ NORTH }, .tx = .{ RAMP } } });\n}\n";
-        let (r, _) = layout(lay).expect("it parses");
+        use crate::emit::placed::At;
+        let mut pl = Placed::new(String::new(), 3, 1);
+        pl.route(
+            4,
+            At::Region((0, 2, 1), (0, 1, 1)),
+            "WEST",
+            &["EAST", "RAMP"],
+        );
+        pl.route(4, At::Pe(2, 0), "NORTH", &["RAMP"]);
+        let (r, _) = layout_ir(&pl);
         assert_eq!(r.at.len(), 3);
         let e = flow(&r);
         assert_eq!(e.len(), 1, "{e:?}");
@@ -1184,11 +975,13 @@ mod tests {
     #[test]
     fn a_queue_on_a_colour_never_delivered_is_found_and_memory_is_counted() {
         let pe = "param C: u16;\nconst N: u16 = 100;\nvar buf = @zeros([N * 2]f32);\nconst q = @get_input_queue(3);\ncomptime { @initialize_queue(q, .{ .color = @get_color(C) }); }\n";
-        let lay = "layout {\n  @set_rectangle(2, 1);\n  @set_tile_code(0, 0, \"pe.csl\", .{ .C = 5 });\n  @set_tile_code(1, 0, \"pe.csl\", .{ .C = 6 });\n  @set_color_config(0, 0, @get_color(5), .{ .routes = .{ .rx = .{ RAMP }, .tx = .{ EAST } } });\n  @set_color_config(1, 0, @get_color(5), .{ .routes = .{ .rx = .{ WEST }, .tx = .{ RAMP } } });\n}\n";
-        let rep = files(&[
-            ("layout.csl".into(), lay.into()),
-            ("pe.csl".into(), pe.into()),
-        ]);
+        use crate::emit::placed::At;
+        let mut pl = Placed::new(String::new(), 2, 1);
+        pl.tile(At::Pe(0, 0), "pe.csl", &[("C", "5".into())]);
+        pl.tile(At::Pe(1, 0), "pe.csl", &[("C", "6".into())]);
+        pl.route(5, At::Pe(0, 0), "RAMP", &["EAST"]);
+        pl.route(5, At::Pe(1, 0), "WEST", &["RAMP"]);
+        let rep = placed(&pl, &[("pe.csl".into(), pe.into())], None);
         assert_eq!(rep.errors.len(), 1, "{:?}", rep.errors);
         assert!(rep.errors[0].contains("(0, 0)"));
         assert_eq!(rep.warnings.len(), 1, "{:?}", rep.warnings);
@@ -1225,6 +1018,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{m}: {e}"));
             plans.push((m.to_string(), p.plan));
         }
+        keep();
         for (m, plan) in plans {
             let out = scratch(&m.replace(['/', '.'], "_"));
             let room = crate::cost::memory::room(&plan, crate::cost::memory::anchor(&plan.shape));
@@ -1232,7 +1026,7 @@ mod tests {
             let prog = crate::program::Program::of(plan).unwrap_or_else(|e| panic!("{m}: {e}"));
             crate::build::emit(&prog, &levers, None, &out, &crate::build::EMITS)
                 .unwrap_or_else(|e| panic!("{m}: {e}"));
-            let mut rep = dir(&out.join("layout")).expect("the check reads it");
+            let mut rep = last().expect("the build's check");
             rep.model_room = Some(room as i64);
             eprintln!("{m}: {}", rep.line());
             assert!(
@@ -1263,12 +1057,13 @@ mod tests {
                 .trace(poem_ir::Platform::Cerebras)
         };
         let mini = trace("flux2-mini-bf16-kv-bf16");
+        keep();
         // compile on load's text and denoise, the stream regime's denoise, the VAE's grid and
         // tiled programs
         for reading in ["text", "denoise"] {
             let out = scratch(&format!("mini-{reading}"));
             stream::compile_whole(&mini, &o(reading), &[], &out).expect("it compiles");
-            let rep = dir(&out).expect("the check reads it");
+            let rep = last().expect("the program's check");
             eprintln!("flux2-mini {reading}: {}", rep.line());
             assert!(
                 rep.errors.is_empty(),
@@ -1279,7 +1074,7 @@ mod tests {
         }
         let out = scratch("mini-stream");
         stream::compile(&mini, &o("denoise"), &out, None).expect("the stream regime's");
-        let rep = dir(&out).expect("the check reads it");
+        let rep = last().expect("the program's check");
         eprintln!("flux2-mini denoise (stream): {}", rep.line());
         assert!(
             rep.errors.is_empty(),
@@ -1289,7 +1084,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&out);
         let out = scratch("mini-vae");
         stream::compile_reading(&mini, &o("vae.decode"), &out).expect("the VAE");
-        let rep = dir(&out).expect("the check reads it");
+        let rep = last().expect("the program's check");
         eprintln!("flux2-mini vae.decode: {}", rep.line());
         assert!(
             rep.errors.is_empty(),
@@ -1307,7 +1102,7 @@ mod tests {
             stream::gemm::program(&klein, &ko, &rows, None, (b.w, b.h), 1).expect("klein places");
         let e = crate::emit::gemm::emit(&p).expect("it emits");
         // (the check reads the placement as the emitter states it)
-        let rep = placed(&crate::emit::gemm::placed(&p), &e.files);
+        let rep = placed(&e.placed, &e.files, None);
         eprintln!("klein 1024² denoise: {}", rep.line());
         assert!(
             rep.errors.is_empty(),

@@ -75,7 +75,7 @@ pub const MAX_KV_REP: u32 = 16;
 /// [`crate::check::CODE_RESERVE`] within a PE.
 fn fits(p: &Program) -> R<()> {
     let e = crate::emit::stream::emit(p)?;
-    let (room, file) = crate::check::files(&e.files).data_room();
+    let (room, file) = crate::check::placed(&e.placed, &e.files, None).data_room();
     if room < 0 {
         return Err(format!(
             "{}: `{file}`'s data {} B past the {} B a PE holds beside its code",
