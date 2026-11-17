@@ -64,7 +64,7 @@ impl Program {
         for b in &blocks {
             b.floor(&plan, &mut fb)?;
         }
-        let mut floor = fb.build()?;
+        let floor = fb.build()?;
         // The program and its memcpy halo on a system's wafer (the largest fabric there is).
         let ((fw, fh), _) = memcpy_fabric(floor.w, floor.h);
         let (sw, sh) = Arch::Wse3.system_fabric();
@@ -78,6 +78,56 @@ impl Program {
         for b in &blocks {
             b.wire(&plan, &floor, &mut wiring)?;
         }
+        Program::finish(blocks, floorplan, plan, floor, wiring)
+    }
+
+    /// [`Program::build`] with its blocks where `place` puts them: the program's floor and
+    /// links as a placement problem ([`crate::place::decode::problem`]), `place`'s solution
+    /// applied (every block moved with its links, the nets between them with their blocks),
+    /// then settled, coloured and laid as `build` does. The problem's own placement
+    /// ([`crate::place::Solution::pinned`]) gives `build`'s program.
+    pub fn build_placed(
+        plan: Plan,
+        place: &dyn Fn(&crate::place::Problem) -> Result<crate::place::Solution, String>,
+    ) -> Result<Program, String> {
+        plan.validate()?;
+        compose::refuse(&plan.shape)?;
+        let needs = Needs::of(&layers::of(&plan.shape));
+        let floorplan = Floorplan::of(&plan, &Requests::of(&needs))?;
+        let blocks = compose::blocks(&plan, KernelSet::of(&needs), &floorplan)?;
+        let mut fb = FloorBuilder::default();
+        for b in &blocks {
+            b.floor(&plan, &mut fb)?;
+        }
+        let floor = fb.build()?;
+        let mut wiring = Wiring::default();
+        for b in &blocks {
+            b.wire(&plan, &floor, &mut wiring)?;
+        }
+        let problem = crate::place::decode::problem(&floor, &wiring)?;
+        let solution = place(&problem)?;
+        let floor = crate::place::decode::floor(&problem, &floor, &solution)?;
+        let ((fw, fh), _) = memcpy_fabric(floor.w, floor.h);
+        let (sw, sh) = Arch::Wse3.system_fabric();
+        if fw > sw || fh > sh {
+            return Err(format!(
+                "{} x {} PEs (with the memcpy halo {fw} x {fh}): over the wafer's {sw} x {sh}",
+                floor.w, floor.h
+            ));
+        }
+        let wiring = problem.apply(&wiring, &solution)?;
+        Program::finish(blocks, floorplan, plan, floor, wiring)
+    }
+
+    /// A program's build past its links: the blocks settle, the palette, the fabric, the
+    /// kernels and their route tables, the overrides.
+    fn finish(
+        blocks: Vec<Box<dyn Block>>,
+        floorplan: Floorplan,
+        plan: Plan,
+        mut floor: Floor,
+        wiring: Wiring,
+    ) -> Result<Program, String> {
         for b in &blocks {
             b.settle(&plan, &wiring, &mut floor)?;
         }
