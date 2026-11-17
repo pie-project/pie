@@ -1,6 +1,7 @@
 #![allow(unsafe_code)]
 pub mod chunks;
 mod host;
+pub use host::Ring;
 pub mod kv;
 pub mod layout;
 pub mod rs;
@@ -189,14 +190,15 @@ impl StatedKv {
     /// the fit got that far.
     fn short(&self, room: u64, fits: Option<u64>) -> Fault {
         let mib = |bytes: u64| bytes >> 20;
-        let held = fits.map_or(String::new(), |fits| format!(", where it backs {fits} pages"));
+        let held = fits.map_or(String::new(), |fits| {
+            format!(", where it backs {fits} pages")
+        });
         Fault::Residency(format!(
             "`[engine.memory] kv_device_tokens = {}` asks {} kv pages of {} tokens: {} chunks \
              of {} MiB for them and the shapes every sequence binds beside them, and {} for \
-             the weights held whole, {} MiB in all; the device has {} MiB for the pool under \
-             `[engine.memory] budget_device` (or the whole device) once the weight tier, the \
-             fires and the graph bodies are down{held}. State fewer tokens or a larger \
-             `budget_device`.",
+             the weights held whole, {} MiB in all; the device has {} MiB for the pool {} once \
+             the weight tier, the fires and the graph bodies are down{held}. State fewer \
+             tokens or a larger `budget_device`.",
             self.tokens,
             self.pages,
             self.page_tokens,
@@ -205,6 +207,7 @@ impl StatedKv {
             self.weight_chunks,
             mib(self.bytes()),
             mib(room),
+            crate::device::card::bound(),
         ))
     }
 }
@@ -404,6 +407,42 @@ pub fn declared_context_that_fits(
         }
     }
     Ok(fits.saturating_mul(page_size))
+}
+
+/// The staging ring's bytes for a host tier of this rank, sized from the
+/// trace before the load measures the device: two sequences at `context`
+/// beside their state rows, the most one step moves, within what the tier
+/// may take (the operator's `host` bytes shared by `ranks`, else half of
+/// what the host has free, as [`crate::Shell::seat_host_kv`] bounds its
+/// default), never under two of a one-page sequence's slots
+/// ([`host::staging_ring`]). `None` where no tier is stated.
+pub fn staging_ring_for(
+    trace: &Trace,
+    page_size: u32,
+    context: u32,
+    max_tokens: u32,
+    host: Option<u64>,
+    ranks: u32,
+) -> Result<Option<u64>> {
+    let ranks = u64::from(ranks.max(1));
+    let free = crate::weights::available_memory() / ranks;
+    let budget = match host {
+        Some(0) => return Ok(None),
+        Some(bytes) => (bytes / ranks).min(free),
+        None => free / 2,
+    };
+    let page_size = page_size.max(1);
+    let window = window_of(trace)?;
+    let one = |tokens: u32| -> Result<u64> {
+        let paging =
+            Paging::of(page_size, tokens.max(page_size), 1, 1)?.windowed(window, max_tokens);
+        one_slot_bytes(trace, paging)
+    };
+    Ok(Some(host::staging_ring(
+        one(context)?,
+        one(page_size)?,
+        budget,
+    )))
 }
 
 pub fn one_slot_bytes(trace: &Trace, paging: Paging) -> Result<u64> {
@@ -1467,7 +1506,8 @@ impl Pools {
         self.chunks
             .clear_past_parting(&mut self.pool, self.contiguous)?;
         let fitted = self.fit(bodies, programs, settled, true, resident)?;
-        self.chunks.state_fitted(self.fitted_chunks(), self.contiguous)?;
+        self.chunks
+            .state_fitted(self.fitted_chunks(), self.contiguous)?;
         Ok(fitted)
     }
 
@@ -3917,9 +3957,10 @@ impl Pools {
 
     /// Seats the host tier of `budget` bytes: as many whole chunks of the
     /// state pool's size, in pageable memory the tier commits as moves
-    /// first write it, behind a page-locked staging ring double-buffering
-    /// the largest move, one `sequence` of bytes ([`host::staging_ring`]).
-    pub fn seat_tier(&mut self, budget: u64, sequence: u64) -> Result<()> {
+    /// first write it, behind the staging `ring` the load pinned before it
+    /// measured the device ([`staging_ring_for`]); a tier of no chunks lets
+    /// it go.
+    pub fn seat_tier(&mut self, budget: u64, ring: Option<Ring>) -> Result<()> {
         // No more than the machine has free, known now: a tier stated larger
         // would fail mid-serve, at the first move past what the host holds.
         let free = crate::weights::available_memory();
@@ -3937,13 +3978,9 @@ impl Pools {
         };
         let chunk = self.chunks.layout().chunk_bytes;
         let chunks = u32::try_from(budget.checked_div(chunk).unwrap_or(0)).unwrap_or(u32::MAX);
-        self.tier = match chunks {
-            0 => None,
-            chunks => Some(host::HostTier::new(
-                chunk,
-                chunks,
-                host::staging_ring(sequence, budget),
-            )?),
+        self.tier = match (chunks, ring) {
+            (0, _) | (_, None) => None,
+            (chunks, Some(ring)) => Some(host::HostTier::new(chunk, chunks, ring)?),
         };
         Ok(())
     }

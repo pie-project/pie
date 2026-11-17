@@ -618,17 +618,37 @@ impl Engine for Cuda {
             (None, Some(tokens)) => Some(crate::store::KvSize::Tokens(tokens)),
             (None, None) => None,
         };
+        // Every rank on the host seats its own tier: a tensor-parallel
+        // group's and each expert-parallel rank's.
+        let ranks = self.boot.world.size * self.expert.size;
+        let max_tokens = if budgets.max_tokens == 0 {
+            16_384
+        } else {
+            budgets.max_tokens
+        };
+        // The host tier's staging ring is page-locked here, before anything
+        // measures the device: on an integrated device the ring and the
+        // device draw on the same memory, and what the ring holds is then
+        // gone from the driver's free bytes and Windows' commit alike. A
+        // ring that cannot be pinned refuses the load, here and not after
+        // ready.
+        let ring = crate::store::staging_ring_for(
+            &trace,
+            budgets.page_size,
+            budgets.max_context,
+            max_tokens,
+            residency.host_kv_budget,
+            ranks,
+        )
+        .and_then(|bytes| bytes.map(crate::store::Ring::pin).transpose())
+        .map_err(fault)?;
         let mut budgets = budgets;
         if budgets.context_declared && kv_budget.is_none() {
             let fits = crate::store::declared_context_that_fits(
                 &trace,
                 budgets.page_size,
                 budgets.max_context,
-                if budgets.max_tokens == 0 {
-                    16_384
-                } else {
-                    budgets.max_tokens
-                },
+                max_tokens,
                 residency.device,
                 plan.device_demand(),
             )
@@ -702,9 +722,8 @@ impl Engine for Cuda {
                 residency.host_kv_budget,
                 residency.kv_seats.unwrap_or(budgets.max_lanes),
                 budgets.max_context,
-                // Every rank on the host seats its own: a tensor-parallel
-                // group's and each expert-parallel rank's.
-                self.boot.world.size * self.expert.size,
+                ranks,
+                ring,
             )
             .map_err(fault)?;
         let kv_handle = if residency.kv_export {

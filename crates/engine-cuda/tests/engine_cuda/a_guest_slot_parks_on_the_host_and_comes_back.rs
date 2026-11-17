@@ -204,8 +204,12 @@ fn a_guest_slot_parks_on_the_host_and_comes_back() {
         "{refused}"
     );
 
+    let ring =
+        engine_cuda::store::staging_ring_for(shell.trace(), PAGE, 256, 256, Some(crate::POOL), 1)
+            .and_then(|bytes| bytes.map(engine_cuda::store::Ring::pin).transpose())
+            .expect("the staging ring pins");
     shell
-        .seat_host_kv(Some(crate::POOL), 1, 256, 1)
+        .seat_host_kv(Some(crate::POOL), 1, 256, 1, ring)
         .expect("the host tier seats");
     let facts = shell.chunk_facts().expect("the pool states its chunks");
     assert!(facts.host_chunks >= 2, "a host chunk a guest shape");

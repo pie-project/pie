@@ -545,8 +545,10 @@ impl Shell {
     /// ([`Self::seat_host_kv`]).
     pub const HOST_POOLS: u64 = 4;
 
-    /// Seats this rank's host tier (CONTRACT-BC 22), pinned as it is first
-    /// used, from `stated` bytes shared by `ranks`, within the host memory
+    /// Seats this rank's host tier (CONTRACT-BC 22), committed as it is
+    /// first used, behind the staging `ring` the load pinned before it
+    /// measured the device ([`crate::store::staging_ring_for`]; `None` seats
+    /// no tier), from `stated` bytes shared by `ranks`, within the host memory
     /// the load left: whole chunks of the state pool's size, every shape's
     /// slots parking in them, and as many host kv slots for byte reads
     /// ([`Self::read_host_kv`], a tap's read-out). Unstated, it holds `seats`
@@ -558,6 +560,7 @@ impl Shell {
         seats: u32,
         context: u32,
         ranks: u32,
+        ring: Option<crate::store::Ring>,
     ) -> Result<u32> {
         let ranks = u64::from(ranks.max(1));
         let row = self.state_row_bytes();
@@ -576,9 +579,6 @@ impl Shell {
         };
         let whole = u64::from(rows) * row + pages * page + window_pages * window_page;
         let page_tokens = u64::from(self.pools.paging().page_size.max(1));
-        // One sequence at full context beside its state row: the most one
-        // move carries.
-        let sequence = row + u64::from(context).div_ceil(page_tokens) * page;
         let seated = u64::from(rows) * row
             + u64::from(seats) * u64::from(context).div_ceil(page_tokens) * page;
         // Unstated, the default takes at most half of what the host leaves
@@ -600,7 +600,7 @@ impl Shell {
         // shelf a load does not move through costs nothing.
         self.pools
             .seat_host(u32::try_from(budget.checked_div(page).unwrap_or(0)).unwrap_or(u32::MAX));
-        self.pools.seat_tier(budget, sequence)?;
+        self.pools.seat_tier(budget, ring)?;
         Ok(self.pools.host_pages())
     }
     /// Opens this rank's share of `budget` disk kv bytes under `dir`.
