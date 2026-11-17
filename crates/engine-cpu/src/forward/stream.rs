@@ -221,7 +221,10 @@ impl Forward {
                 f.weights[v.0 as usize] = Some(Held::Floats {
                     rows,
                     width: each,
-                    v: super::laid(param.layout, w.into_iter().map(super::bf16).collect()),
+                    v: std::sync::Arc::new(super::laid(
+                        param.layout,
+                        w.into_iter().map(super::bf16).collect(),
+                    )),
                 });
             }
         }
@@ -379,7 +382,7 @@ impl Forward {
                     Some(Held::Floats {
                         rows: want,
                         width: width as usize,
-                        v: v.clone(),
+                        v: std::sync::Arc::new(v.clone()),
                     })
                 }
                 RuntimeInput::Mask { .. } | RuntimeInput::Geometry { .. } => Some(Held::Opaque),
@@ -391,7 +394,7 @@ impl Forward {
                 Values::F32(v) => Held::Floats {
                     rows: g.rows,
                     width: g.width,
-                    v: v.clone(),
+                    v: std::sync::Arc::new(v.clone()),
                 },
                 Values::I32(v) => Held::Ints {
                     rows: g.rows,
@@ -480,7 +483,7 @@ impl Forward {
             }
             run.materialize(output.value)?;
             let (rows, width, values) = match run.held(output.value)? {
-                Held::Floats { rows, width, v } => (*rows, *width, Values::F32(v.clone())),
+                Held::Floats { rows, width, v } => (*rows, *width, Values::F32(v.as_ref().clone())),
                 Held::Ints { rows, width, v } => (*rows, *width, Values::I32(v.clone())),
                 Held::Opaque => return Err(format!("output `{}` holds no rows", output.name)),
             };
@@ -500,7 +503,7 @@ impl Run<'_> {
     /// `v` as it is held now, node `at`'s input or output.
     fn captured(&self, at: usize, input: bool, v: ValueId) -> Option<Captured> {
         let (rows, width, values) = match self.held(v).ok()? {
-            Held::Floats { rows, width, v } => (*rows, *width, Values::F32(v.clone())),
+            Held::Floats { rows, width, v } => (*rows, *width, Values::F32(v.as_ref().clone())),
             Held::Ints { rows, width, v } => (*rows, *width, Values::I32(v.clone())),
             Held::Opaque => return None,
         };
@@ -556,7 +559,7 @@ impl Run<'_> {
                 Held::Floats {
                     rows: n,
                     width,
-                    v: out,
+                    v: std::sync::Arc::new(out),
                 }
             }
             Held::Ints { rows: n, width, .. } => {
@@ -595,6 +598,7 @@ impl Run<'_> {
         let dead = |r: usize| rows.lane(ty, r).is_some_and(|l| !live[l]);
         match held {
             Held::Floats { rows: n, width, v } => {
+                let v = std::sync::Arc::make_mut(v);
                 for r in (0..*n).filter(|&r| dead(r)) {
                     let row = &mut v[r * *width..(r + 1) * *width];
                     match &found {

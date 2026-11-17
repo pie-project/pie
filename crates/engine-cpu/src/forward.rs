@@ -50,7 +50,9 @@ enum Held {
     Floats {
         rows: usize,
         width: usize,
-        v: Vec<f32>,
+        /// Shared: a run's values start as the weights' (a clone of the weights each run, of a
+        /// whole model's, is a pointer each, not a copy).
+        v: std::sync::Arc<Vec<f32>>,
     },
     Ints {
         rows: usize,
@@ -294,7 +296,7 @@ impl Forward {
             weights[id] = Some(Held::Floats {
                 rows,
                 width: each,
-                v: laid(param.layout, v.into_iter().map(bf16).collect()),
+                v: std::sync::Arc::new(laid(param.layout, v.into_iter().map(bf16).collect())),
             });
         }
         let lanes = (0..trace.caches.len()).map(|_| Lane::default()).collect();
@@ -413,7 +415,7 @@ impl Forward {
                 continue;
             }
             let (rows, width, values) = match run.held(output.value)? {
-                Held::Floats { rows, width, v } => (*rows, *width, Values::F32(v.clone())),
+                Held::Floats { rows, width, v } => (*rows, *width, Values::F32(v.as_ref().clone())),
                 Held::Ints { rows, width, v } => (*rows, *width, Values::I32(v.clone())),
                 Held::Opaque => return Err(format!("output `{}` holds no rows", output.name)),
             };
@@ -515,7 +517,7 @@ impl Run<'_> {
             Held::Floats { rows, width, v } => Ok(Rows {
                 rows: *rows,
                 width: *width,
-                v,
+                v: v.as_slice(),
             }),
             _ => Err(format!("value {} is not floats", id.0)),
         }
@@ -554,7 +556,11 @@ impl Run<'_> {
             } => v.into_iter().map(bf16).collect(),
             _ => v,
         };
-        self.vals[id.0 as usize] = Some(Held::Floats { rows, width, v });
+        self.vals[id.0 as usize] = Some(Held::Floats {
+            rows,
+            width,
+            v: std::sync::Arc::new(v),
+        });
         Ok(())
     }
 
