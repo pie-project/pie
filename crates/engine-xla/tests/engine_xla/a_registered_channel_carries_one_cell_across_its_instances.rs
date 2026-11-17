@@ -270,7 +270,7 @@ fn a_guest_fault_fails_its_own_lanes_alone() {
     let kv = refs.shapes(|s| s.role == engine::chunk::SlotRole::State)[0].id;
     let (page_a, page_b) = (refs.take(kv), refs.take(kv));
     let program = rig.register(incrementer());
-    let mut bound = |rig: &mut Rig, seeded: bool| -> InstanceId {
+    let bound = |rig: &mut Rig, seeded: bool| -> InstanceId {
         let input = rig.channel_of(vec![2], Dtype::U32, HostRole::Writer);
         let out = rig.channel_of(vec![2], Dtype::U32, HostRole::Reader);
         rig.engine
