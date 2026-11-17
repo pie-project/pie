@@ -2049,9 +2049,11 @@ impl Prepared {
             let chunk = self.status.diag_chunk;
             let named = chunk.and_then(|(_, p)| crate::store::diag_last_named(p));
             let moved = chunk.and_then(|(l, _)| crate::store::diag_moved(l));
+            let history = chunk.map(|(_, p)| crate::store::diag_history(p)).unwrap_or_default();
             eprintln!(
-                "PROBE-STATUS: state {state:#x} words {:02x?} slot {:?} offset {} chunk (logical, physical) {chunk:?} last named by (shape, logical) {named:?} logical last moved to {moved:?}",
-                &bytes[..16.min(bytes.len())], self.status.slot(), self.status.offset()
+                "PROBE-STATUS: state {state:#x} words {:02x?} slot {:?} offset {} chunk (logical, physical) {chunk:?} last named by (shape, logical) {named:?} logical last moved to {moved:?} history (shape, logical, lookups) {:?}",
+                &bytes[..16.min(bytes.len())], self.status.slot(), self.status.offset(),
+                &history[history.len().saturating_sub(12)..]
             );
         }
         Status::read(&bytes).ok_or_else(|| {
