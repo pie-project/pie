@@ -24,13 +24,71 @@ pub fn fits(p: &Problem, s: &Solution, w: u32, h: u32) -> bool {
         })
 }
 
-/// `p`'s blocks within `w` x `h`: its own placement where it fits, else the packing with the
-/// smallest bounding box (then the least height). The solution's fabric is the bounding box.
-pub fn pack(p: &Problem, w: u32, h: u32) -> R<Solution> {
-    let pinned = Solution::pinned(p);
-    if fits(p, &pinned, w, h) {
-        return Ok(pinned);
+/// How far blocks that pack into no `w` x `h` fabric miss it: the nearest packing's overrun, in
+/// columns with the height held (`dx`) or in rows with the width held (`dy`); the smaller is
+/// the one stated, the other 0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Miss {
+    pub dx: u32,
+    pub dy: u32,
+}
+
+impl std::fmt::Display for Miss {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.dy > 0 {
+            write!(f, "short {} rows", self.dy)
+        } else {
+            write!(f, "short {} columns", self.dx)
+        }
     }
+}
+
+/// [`pack`], or how near it came ([`Miss`]): a cheap fit test a search asks of many candidates.
+pub fn pack_within(p: &Problem, w: u32, h: u32) -> Result<Solution, Miss> {
+    if let Ok(s) = pack(p, w, h) {
+        return Ok(s);
+    }
+    // the nearest miss: the least overrun of the bounds' one side with the other held
+    let orders = orders(p);
+    let over = |bw: u32, bh: u32, horiz: bool| -> Option<u32> {
+        orders
+            .iter()
+            .filter_map(|o| bottom_left(p, o, bw, bh))
+            .map(|s| {
+                if horiz {
+                    s.w.saturating_sub(w)
+                } else {
+                    s.h.saturating_sub(h)
+                }
+            })
+            .min()
+    };
+    let dy = over(w, u32::MAX / 2, false);
+    let dx = over(u32::MAX / 2, h, true);
+    Err(match (dx, dy) {
+        (Some(dx), Some(dy)) if dy <= dx => Miss { dx: 0, dy },
+        (Some(dx), _) => Miss { dx, dy: 0 },
+        (None, Some(dy)) => Miss { dx: 0, dy },
+        // (a block wider and taller than the bounds alike)
+        (None, None) => Miss {
+            dx: p
+                .blocks
+                .iter()
+                .map(|b| b.rect.w.saturating_sub(w))
+                .max()
+                .unwrap_or(0),
+            dy: p
+                .blocks
+                .iter()
+                .map(|b| b.rect.h.saturating_sub(h))
+                .max()
+                .unwrap_or(0),
+        },
+    })
+}
+
+/// The orders the packing tries: every order up to 7 blocks; past that, by height and by width.
+fn orders(p: &Problem) -> Vec<Vec<usize>> {
     let n = p.blocks.len();
     let mut orders: Vec<Vec<usize>> = Vec::new();
     if n <= 7 {
@@ -44,6 +102,17 @@ pub fn pack(p: &Problem, w: u32, h: u32) -> R<Solution> {
         orders.extend([by_h, by_w]);
     }
     orders.truncate(ORDERS);
+    orders
+}
+
+/// `p`'s blocks within `w` x `h`: its own placement where it fits, else the packing with the
+/// smallest bounding box (then the least height). The solution's fabric is the bounding box.
+pub fn pack(p: &Problem, w: u32, h: u32) -> R<Solution> {
+    let pinned = Solution::pinned(p);
+    if fits(p, &pinned, w, h) {
+        return Ok(pinned);
+    }
+    let orders = orders(p);
     let mut best: Option<(u64, u32, Solution)> = None;
     for o in &orders {
         let Some(s) = bottom_left(p, o, w, h) else {
@@ -163,5 +232,23 @@ mod tests {
         let p = problem(&[(700, 600), (700, 600)]);
         let s = super::pack(&p, 754, 1170);
         assert!(s.is_err());
+        // the nearest miss: stacked, 30 rows over (side by side would be 646 columns over)
+        assert_eq!(
+            super::pack_within(&p, 754, 1170).unwrap_err(),
+            super::Miss { dx: 0, dy: 30 }
+        );
+        assert_eq!(
+            super::pack_within(&p, 754, 1170).unwrap_err().to_string(),
+            "short 30 rows"
+        );
+        // klein's readings side by side at 770 columns pack within the system's
+        let p = problem(&[(256, 877), (384, 1014), (130, 148)]);
+        let s = super::pack_within(&p, 755, 1170).unwrap();
+        assert_eq!((s.w, s.h), (640, 1025));
+        let p = problem(&[(256, 1100), (384, 1100), (130, 148)]);
+        assert_eq!(
+            super::pack_within(&p, 755, 1170).unwrap_err(),
+            super::Miss { dx: 15, dy: 0 }
+        );
     }
 }
