@@ -507,7 +507,7 @@ impl Plane {
             .map_err(|error| Refusal::Program(error.to_string()))?;
         if !plan.executable {
             return Err(Refusal::Program(format!(
-                "program 0x{:016x} does not interpret: {}",
+                "program 0x{:016x} calls a semantic boundary this backend does not implement: {}",
                 registration.program_hash,
                 plan.reject_reason.as_deref().unwrap_or("no reason given")
             )));

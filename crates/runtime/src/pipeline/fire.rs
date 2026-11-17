@@ -34,6 +34,7 @@ fn container_has_lora_sink(container: &eta_ir::container::TraceContainer) -> boo
 pub mod context;
 pub mod float;
 pub mod geometry;
+pub mod host_geometry;
 pub mod kv;
 pub mod rs;
 pub mod shadow;
@@ -3513,6 +3514,9 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 }
             };
             crate::probe_fire_record!(submit_probe.geometry_us, geometry_clock.elapsed());
+            if p.host_geometry {
+                host_geometry::count_fire();
+            }
             let accesses = p.instance.program.channel_accesses.clone();
             (
                 geometry,
