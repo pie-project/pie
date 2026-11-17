@@ -169,6 +169,10 @@ pub struct StateReport {
     /// across runs; sent with a full report.
     #[serde(default)]
     pub disk_tier: Option<(u32, bool)>,
+    /// The held pages that are off the device, by key, and the tier they
+    /// are on; all of it, whenever any changes.
+    #[serde(default)]
+    pub off_device: Option<Vec<([u8; 32], OffDevice)>>,
 }
 
 /// A sealed page's key.
@@ -181,8 +185,19 @@ pub type Key = [u8; 32];
 pub struct GroupView {
     pub keys: Vec<Key>,
     pub sites: Vec<WorkerId>,
+    /// The sites whose copy is not wholly on the device: the lowest tier
+    /// any of its pages is on. A site not named here holds it on the device.
+    #[serde(default)]
+    pub site_tiers: Vec<(WorkerId, OffDevice)>,
     pub disk_sites: Vec<WorkerId>,
     pub persist_tokens: Option<u64>,
+}
+
+/// Where a held page is, off the device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum OffDevice {
+    Host,
+    Disk,
 }
 
 /// The controller's directory as the gateways read it: what each worker

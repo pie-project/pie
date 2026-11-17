@@ -574,6 +574,7 @@ pub async fn report_state<C: crate::ControlLink>(control: C, worker: WorkerId) {
     let mut said_published = Vec::new();
     let mut said_disk: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
     let mut said_hints = Vec::new();
+    let mut said_off: std::collections::HashMap<[u8; 32], bool> = Default::default();
     loop {
         // A controller dialed again has heard none of it.
         if control.generation() != generation {
@@ -583,6 +584,7 @@ pub async fn report_state<C: crate::ControlLink>(control: C, worker: WorkerId) {
         let walk = std::time::Instant::now();
         let now = runtime::offload::directory::sealed_keys();
         let disk = runtime::offload::directory::persisted_keys();
+        let off = runtime::offload::directory::off_device_keys();
         let hints = runtime::offload::directory::persist_hints();
         let published: Vec<(String, String)> = runtime::policy::published()
             .into_iter()
@@ -636,6 +638,18 @@ pub async fn report_state<C: crate::ControlLink>(control: C, worker: WorkerId) {
             },
             persist_hints: (full || hints != said_hints).then(|| hints.clone()),
             disk_tier: full.then(runtime::offload::directory::disk_tier).flatten(),
+            off_device: (full || off != said_off).then(|| {
+                off.iter()
+                    .map(|(key, on_disk)| {
+                        let tier = if *on_disk {
+                            controller_api::OffDevice::Disk
+                        } else {
+                            controller_api::OffDevice::Host
+                        };
+                        (*key, tier)
+                    })
+                    .collect()
+            }),
         };
         match control.report_state(worker, report).await {
             Ok(()) => {
@@ -644,6 +658,7 @@ pub async fn report_state<C: crate::ControlLink>(control: C, worker: WorkerId) {
                 said_published = published;
                 said_disk = disk;
                 said_hints = hints;
+                said_off = off;
                 full = false;
             }
             Err(error) => {

@@ -73,6 +73,21 @@ pub fn sealed_keys() -> HashSet<Hash256> {
     keys
 }
 
+/// The sealed pages this worker holds off the device, by key: `false` on
+/// the host, `true` on disk. A page on two tiers is where it can be read.
+pub fn off_device_keys() -> std::collections::HashMap<Hash256, bool> {
+    let mut keys = std::collections::HashMap::new();
+    for stores in crate::store::registry::all_for_model(0) {
+        let nodes = with_kv_lock(&stores.kv, "offload-report", |kv| kv.node_ids());
+        for slice in nodes.chunks(REPORT_SLICE) {
+            keys.extend(with_kv_lock(&stores.kv, "offload-report", |kv| {
+                kv.off_device_key_list(slice)
+            }));
+        }
+    }
+    keys
+}
+
 /// Every cache entry this worker holds, as its pages' keys from token 0.
 pub fn cached_runs() -> Vec<Vec<Hash256>> {
     let mut runs = Vec::new();

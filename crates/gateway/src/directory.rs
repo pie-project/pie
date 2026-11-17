@@ -125,6 +125,7 @@ mod tests {
                 GroupView {
                     keys: vec![[1; 32], [2; 32]],
                     sites: vec![WorkerId(1)],
+                    site_tiers: Vec::new(),
                     disk_sites: vec![WorkerId(1)],
                     persist_tokens: Some(40),
                 },
