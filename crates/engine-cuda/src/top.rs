@@ -12,7 +12,7 @@ use poem_ir::Trace;
 use crate::error::{Fault, Result};
 
 /// Why a rung is no rung of this load: its plan does not compile at it.
-pub const NO_PLAN: &str = "its plan does not compile";
+pub const NO_PLAN: &str = "its plan does not compile at this budget";
 
 /// Why a rung is no rung of this load: its span leaves no room for one
 /// sequence and the bodies' floor beside it.
@@ -36,15 +36,23 @@ pub fn counts(trace: &Trace) -> Result<Counts> {
     ))
 }
 
-/// One rung offered: a fire of `tokens`, its span (`u64::MAX` where its
-/// plan does not compile), the launches its compiled plan issues, and what
-/// must lie beside it (one sequence's cache rows and the bodies' floor).
+/// One rung offered: a fire of `tokens`, its compiled plan's span and
+/// launches (or why it does not compile: [`NO_PLAN`] and the compile's
+/// error), and what must lie beside it (one sequence's cache rows and the
+/// bodies' floor).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Candidate {
     pub tokens: u32,
-    pub span: u64,
-    pub launches: u32,
+    pub plan: std::result::Result<(u64, u32), &'static str>,
     pub beside: u64,
+}
+
+/// Why a rung's plan does not compile, as a refusal names it: [`NO_PLAN`]
+/// and the compile's own error. Held for the life of the process (a load's
+/// handful of rungs at most).
+#[must_use]
+pub fn no_plan(why: &str) -> &'static str {
+    Box::leak(format!("{NO_PLAN}: {why}").into_boxed_str())
 }
 
 /// The rungs `candidates` offer as the ruling weighs them over `live`
@@ -63,21 +71,22 @@ pub fn rung_facts(
 ) -> Vec<RungFacts> {
     candidates
         .iter()
-        .map(|c| RungFacts {
-            tokens: c.tokens,
-            lanes: c.tokens.min(max_lanes),
-            keys: c.tokens,
-            launches: c.launches,
-            padded_rows: computed(c.tokens),
-            span_bytes: c.span,
-            infeasible: if c.span == u64::MAX {
-                Some(NO_PLAN)
-            } else if c.span.saturating_add(c.beside) > live {
-                Some(NO_ROOM)
-            } else {
-                None
-            },
-            fire_lanes,
+        .map(|c| {
+            let (span, launches) = c.plan.unwrap_or((0, 0));
+            RungFacts {
+                tokens: c.tokens,
+                lanes: c.tokens.min(max_lanes),
+                keys: c.tokens,
+                launches,
+                padded_rows: computed(c.tokens),
+                span_bytes: span,
+                infeasible: match c.plan {
+                    Err(why) => Some(why),
+                    Ok(_) if span.saturating_add(c.beside) > live => Some(NO_ROOM),
+                    Ok(_) => None,
+                },
+                fire_lanes,
+            }
         })
         .collect()
 }
@@ -184,8 +193,7 @@ mod tests {
     fn candidate(tokens: u32, span_mib: u64) -> Candidate {
         Candidate {
             tokens,
-            span: span_mib * MIB,
-            launches: 400,
+            plan: Ok((span_mib * MIB, 400)),
             beside: 800 * MIB,
         }
     }
@@ -228,7 +236,7 @@ mod tests {
             candidate(4096, 1200),
             candidate(8192, 2400),
             Candidate {
-                span: u64::MAX,
+                plan: Err(no_plan("the arena does not fit")),
                 ..candidate(16384, 0)
             },
         ];
@@ -236,7 +244,11 @@ mod tests {
         let rungs = rung_facts(&candidates, 256, 256, live, |rows| rows);
         assert_eq!(rungs[0].lanes, 256);
         assert_eq!(rungs[3].infeasible, Some(NO_ROOM));
-        assert_eq!(rungs[4].infeasible, Some(NO_PLAN));
+        assert_eq!(
+            rungs[4].infeasible,
+            Some("its plan does not compile at this budget: the arena does not fit")
+        );
+        assert_eq!(rungs[4].span_bytes, 0);
         let top = choose(&rungs, live, &l40s(), None, "NVIDIA L40S", &counts()).unwrap();
         let estimate = engine::load::estimate(&counts(), &l40s()).unwrap();
         assert_eq!(
@@ -245,7 +257,10 @@ mod tests {
         );
         assert_eq!(
             top.span_bytes,
-            candidates[top.tokens.trailing_zeros() as usize - 10].span
+            candidates[top.tokens.trailing_zeros() as usize - 10]
+                .plan
+                .unwrap()
+                .0
         );
         // Every rung refused: the ruling's refusal, each rung named.
         let err = choose(&rungs[3..], live, &l40s(), None, "NVIDIA L40S", &counts()).unwrap_err();

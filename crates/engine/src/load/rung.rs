@@ -501,7 +501,12 @@ impl fmt::Display for NoRung {
         write!(f, "no rung of fires is feasible:")?;
         for (k, (tokens, span, why)) in self.refused.iter().enumerate() {
             let sep = if k == 0 { " " } else { "; " };
-            write!(f, "{sep}{tokens} tokens (span {} MiB): {why}", span >> 20)?;
+            // A rung whose plan never compiled has no span to state.
+            if *span == 0 {
+                write!(f, "{sep}{tokens} tokens: {why}")?;
+            } else {
+                write!(f, "{sep}{tokens} tokens (span {} MiB): {why}", span >> 20)?;
+            }
         }
         Ok(())
     }

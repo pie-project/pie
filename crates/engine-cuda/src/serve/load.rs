@@ -309,8 +309,10 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     let window = crate::store::window_of(&boot.trace)?;
     // A fire of `tokens`' working set (the activation arena, the attention
     // workspaces and one fire's windowed kv rows) and the launches its
-    // compiled plan issues; `None` where the plan does not compile.
-    let laid = |tokens: u32, voxels: &Option<poem_compiler::VoxelLadder>| -> Option<(u64, u32)> {
+    // compiled plan issues; the compile's error where it does not compile.
+    let laid = |tokens: u32,
+                voxels: &Option<poem_compiler::VoxelLadder>|
+     -> std::result::Result<(u64, u32), String> {
         let windowed = Paging::of(boot.page_size, boot.context, boot.slots, 1)
             .ok()
             .and_then(|paging| {
@@ -320,7 +322,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         let budget = budget_at(tokens);
         let compiled =
             poem_compiler::compile_axes(&boot.trace, &budgets_at(&budget, voxels), &profile)
-                .ok()?;
+                .map_err(|e| e.to_string())?;
         // The span the rung weighs is the carve the load backs: the larger
         // of the in-order and forked arenas, without their `attn.scores`
         // planes (a reader's program term, never a load's).
@@ -340,7 +342,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             ))
             .saturating_add(windowed);
         let launches = u32::try_from(compiled.template().len()).unwrap_or(u32::MAX);
-        Some((bytes, launches))
+        Ok((bytes, launches))
     };
     let working = |tokens: u32, voxels: &Option<poem_compiler::VoxelLadder>| -> u64 {
         laid(tokens, voxels).map_or(u64::MAX, |(bytes, _)| bytes)
@@ -354,14 +356,13 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         let paging = Paging::of(boot.page_size, boot.context, boot.slots, 1)?;
         let mut candidates = Vec::new();
         for rung in budget_at(asked_tokens).buckets {
-            let (span, launches) = laid(rung, &voxels).unwrap_or((u64::MAX, 0));
+            let plan = laid(rung, &voxels).map_err(|why| crate::top::no_plan(&why));
             let sequence =
                 crate::store::least_sequence_bytes(&boot.trace, paging.windowed(window, rung))?;
             let beside = sequence.saturating_add(crate::store::BODIES_FLOOR_BYTES);
             candidates.push(crate::top::Candidate {
                 tokens: rung,
-                span,
-                launches,
+                plan,
                 beside,
             });
         }
