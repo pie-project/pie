@@ -12,7 +12,7 @@ use super::holdings::{held_page_count, held_rs_units};
 use super::inner::Inner;
 use super::pool::PoolPort;
 use super::proc::{PendingBind, Proc, Residency};
-use super::rank::Rank;
+use super::rank::VictimOrder;
 use super::reclaim::Reclaim;
 use super::short::{Shortfall, Sink, WeightShed};
 use super::stats::PlannerStats;
@@ -438,7 +438,7 @@ impl ResidencyPlanner {
                     .procs
                     .iter()
                     .filter(|(_, proc)| proc.holder)
-                    .map(|(pid, proc)| (std::cmp::Reverse(proc.rank()), *pid))
+                    .map(|(pid, proc)| (proc.victim_order(), *pid))
                     .collect();
                 holders.sort_unstable();
                 holders
@@ -670,6 +670,8 @@ impl ResidencyPlanner {
                 .iter()
                 .any(|killed| inner.procs.get(killed).is_some_and(|p| p.seq == seq));
             inner.procs.insert(pid, proc);
+            // A respawn is resident anew, whatever seq it keeps.
+            inner.came_back(pid);
         });
     }
 
@@ -1063,7 +1065,7 @@ impl ResidencyPlanner {
             ptrace!("pause: cannot suspend");
             return;
         }
-        let pausable: Vec<(ProcessId, Rank)> = self.with_inner(|inner| {
+        let pausable: Vec<(ProcessId, VictimOrder)> = self.with_inner(|inner| {
             pids.iter()
                 .filter_map(|pid| {
                     let proc = inner.procs.get(pid)?;
@@ -1071,7 +1073,7 @@ impl ResidencyPlanner {
                         && proc.state == Residency::Resident
                         && !inner.host_swap_blocked.contains(pid)
                         && !inner.prepare_blocked.contains(pid))
-                    .then(|| (*pid, proc.rank()))
+                    .then(|| (*pid, proc.victim_order()))
                 })
                 .collect()
         });
@@ -1112,6 +1114,13 @@ impl ResidencyPlanner {
             }
             (wake, spawned)
         });
+        for pid in &spawned {
+            ptrace!(
+                "pause-evict pid={} landed={}",
+                pid,
+                self.with_inner(|inner| inner.procs.get(pid).map_or(0, |p| p.landed))
+            );
+        }
         self.start_evictions(wake, spawned);
     }
 
