@@ -160,19 +160,27 @@ pub fn groups_for(descriptors: &[ValueDesc], cores: u32) -> u32 {
 pub const TABLE_BINDINGS: [u32; 4] = [1, 2, 3, CFG_BINDING];
 
 /// The words of a stage's place table (binding 3) for `values` values:
-/// each value's word in its piece, each value's piece, the temporary
-/// area's piece and word, then the base of each piece, at most one a value
-/// and one for the temporary area ([`bases_at`]).
+/// the temporary area's guest address, then each value's
+/// ([`place_table`]), what a bind and a rebind write whole.
 #[must_use]
 pub fn place_words(values: usize) -> usize {
-    3 * values + 3
+    values + 1
 }
 
-/// The byte of a stage's place table its piece bases start at: what a bind
-/// and a rebind write.
+/// A stage's place table where its pieces lie at `pieces` (each piece's
+/// guest address, [`PiecePlace::address`]): the temporary area's address,
+/// then each value's, its piece's base and its word there summed at the
+/// bind, so a guest access reads one word for its value's place.
 #[must_use]
-pub fn bases_at(values: usize) -> u64 {
-    (2 * values as u64 + 2) * 4
+pub fn place_table(places: &[Placed], temporary: Placed, pieces: &[u32]) -> Vec<u8> {
+    let address = |placed: &Placed| {
+        let base = pieces.get(placed.piece as usize).copied().unwrap_or(0);
+        base + u32::try_from(placed.offset / 4).unwrap_or(u32::MAX)
+    };
+    std::iter::once(&temporary)
+        .chain(places)
+        .flat_map(|placed| address(placed).to_le_bytes())
+        .collect()
 }
 
 /// The bytes of a stage's tables ([`TABLE_BINDINGS`] order): what its
@@ -200,8 +208,8 @@ pub fn program_table_sizes(plans: &[LaunchStagePlan]) -> Vec<u64> {
 
 /// What a stage resolves at a bind: its values' descriptors and places,
 /// its scratch in pieces of a chunk, and its tables' bytes ([`table_sizes`]
-/// each, [`TABLE_BINDINGS`] order; the place table's bases left for the
-/// bind to write, [`bases_at`]).
+/// each, [`TABLE_BINDINGS`] order; the place table left for the bind to
+/// write where the pieces lie, [`place_table`]).
 pub struct StageTables {
     pub descriptors: Vec<ValueDesc>,
     pub places: Vec<Placed>,
@@ -251,13 +259,6 @@ pub fn stage_tables(
         params.extend_from_slice(&OpParams::of(op, result_base, plan.output_slots).to_le_bytes());
         result_base += u32::from(op.result_count);
     }
-    let word = |at: u64| u32::try_from(at / 4).unwrap_or(u32::MAX);
-    let place_table: Vec<u32> = places
-        .iter()
-        .map(|placed| word(placed.offset))
-        .chain(places.iter().map(|placed| placed.piece))
-        .chain([scratch.temporary.piece, word(scratch.temporary.offset)])
-        .collect();
     let config = Cfg {
         value_count: u32::try_from(plan.value_types.len()).unwrap_or(u32::MAX),
         op_count: u32::try_from(plan.ops.len()).unwrap_or(u32::MAX),
@@ -269,7 +270,7 @@ pub fn stage_tables(
         tables: [
             sized(descs, 0),
             sized(params, 1),
-            sized(words_le(&place_table), 2),
+            sized(Vec::new(), 2),
             sized(config.to_le_bytes(), 3),
         ],
         places,

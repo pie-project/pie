@@ -156,6 +156,12 @@ pub(crate) struct Core {
 
     pub(crate) spent: Mutex<Vec<wgpu::Buffer>>,
 
+    /// A submit holds it shared; a host map of a buffer that every submit
+    /// may reference (the guest ring, which passes of every frame in flight
+    /// land in) holds it alone: WebGPU refuses a submit that uses a buffer
+    /// while any range of it is mapped.
+    pub(crate) maps: std::sync::RwLock<()>,
+
     poller: host::Poller,
 
     pub(crate) uniforms: Mutex<Vec<Held>>,
@@ -195,6 +201,15 @@ impl Core {
         self.poller.kick();
     }
 
+    /// Submits `buffers` where no host map excludes it ([`Core::maps`]).
+    pub(crate) fn submit(
+        &self,
+        buffers: impl IntoIterator<Item = wgpu::CommandBuffer>,
+    ) -> wgpu::SubmissionIndex {
+        let _shared = self.maps.read().expect("maps lock poisoned");
+        self.queue.submit(buffers)
+    }
+
     pub(crate) fn wait_for(&self, _index: &wgpu::SubmissionIndex) -> Result<()> {
         let done = Signal::new();
         let landed = done.clone();
@@ -216,7 +231,7 @@ impl Core {
     }
 
     pub(crate) fn submit_once(&self, encoder: wgpu::CommandEncoder) -> Result<()> {
-        let index = self.queue.submit(std::iter::once(encoder.finish()));
+        let index = self.submit(std::iter::once(encoder.finish()));
         self.wait_for(&index)
     }
 
@@ -511,6 +526,7 @@ impl Context {
             limits,
             enabled,
             spent: Mutex::new(Vec::new()),
+            maps: std::sync::RwLock::new(()),
             poller,
             uniforms: Mutex::new(Vec::new()),
             scratch: Mutex::new(Vec::new()),
@@ -957,7 +973,7 @@ impl Frame {
         let started = Mark::now();
         let finished = encoder.finish();
         crate::encode::record_read_phase(0, started.ns());
-        let index = core.queue.submit(std::iter::once(finished));
+        let index = core.submit(std::iter::once(finished));
         crate::encode::record_submit(started.ns(), 0);
         let inner = Arc::clone(&self.inner);
         core.queue.on_submitted_work_done(move || {

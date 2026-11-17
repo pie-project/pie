@@ -14,8 +14,8 @@ use engine_gpu::store::layout::{CHANNEL, INSTANCE};
 
 use engine_gpu::guest::held::{self, consecutive};
 use engine_gpu::guest::session::{
-    BINDINGS, InstanceLay, PiecePlace, ScoreRows, ScoreSpec, SEGMENT_BINDINGS, StageTables, bases_at, groups_for,
-    lay_program, piece_places, score_rows, stage_tables,
+    BINDINGS, InstanceLay, PiecePlace, ScoreRows, ScoreSpec, SEGMENT_BINDINGS, StageTables, groups_for,
+    lay_program, piece_places, place_table, score_rows,
 };
 
 /// The host staging ring the plane laid at load.
@@ -71,6 +71,8 @@ struct Stage {
 
     /// Each value's piece and offset there.
     places: Vec<Placed>,
+    /// The temporary area's piece and offset there.
+    temporary: Placed,
 
     descriptors: Vec<ValueDesc>,
     /// The stage's bind-time tables in the instance's `Instance` slots,
@@ -305,9 +307,10 @@ impl Session {
         // slots, written at once; each stage's place table names its pieces'
         // bases.
         let mut bytes: Vec<Vec<u8>> = Vec::with_capacity(4 * resolved.len() + 1);
-        for (plan, stage) in plans.iter().zip(&resolved) {
+        let addresses = addresses(&pieces);
+        for stage in &resolved {
             let mut stage_bytes = stage.tables.clone();
-            write_bases(&mut stage_bytes[2], plan.value_types.len(), &pieces);
+            stage_bytes[2] = place_table(&stage.places, stage.scratch.temporary, &addresses);
             bytes.extend(stage_bytes);
         }
         bytes.push(vec![0u8; eta_exec::STATUS_BYTES]);
@@ -328,6 +331,7 @@ impl Session {
             let StageTables {
                 descriptors,
                 places,
+                scratch,
                 ..
             } = resolved;
             stages.push(Stage {
@@ -339,6 +343,7 @@ impl Session {
                 },
                 set: vk::DescriptorSet::null(),
                 places,
+                temporary: scratch.temporary,
                 descriptors,
                 tables: stage_tables,
                 staged: Vec::new(),
@@ -492,15 +497,14 @@ impl Session {
         Ok(())
     }
 
-    /// Writes each stage's piece bases into its place table, where the
-    /// pieces lie now.
+    /// Writes each stage's place table where its pieces lie now.
     fn write_bases(&self) -> Result<()> {
+        let addresses = addresses(&self.pieces);
         for stage in &self.stages {
-            let values = stage.descriptors.len();
-            let mut words = Vec::new();
-            write_bases(&mut words, values, &self.pieces);
-            let at = bases_at(values);
-            stage.tables[2].write(at, &words[usize::try_from(at).unwrap_or(0)..])?;
+            stage.tables[2].write(
+                0,
+                &place_table(&stage.places, stage.temporary, &addresses),
+            )?;
         }
         Ok(())
     }
@@ -1012,18 +1016,9 @@ fn pieces_of(
         .collect()
 }
 
-/// Writes `pieces`' bases into a place table of `values` values (its bytes
-/// grown to hold them where shorter).
-fn write_bases(table: &mut Vec<u8>, values: usize, pieces: &[Piece]) {
-    let at = usize::try_from(bases_at(values)).unwrap_or(usize::MAX);
-    let end = at + 4 * pieces.len();
-    if table.len() < end {
-        table.resize(end, 0);
-    }
-    for (index, piece) in pieces.iter().enumerate() {
-        table[at + 4 * index..at + 4 * index + 4]
-            .copy_from_slice(&piece.place.address().to_le_bytes());
-    }
+/// Each piece's guest address, piece by piece.
+fn addresses(pieces: &[Piece]) -> Vec<u32> {
+    pieces.iter().map(|piece| piece.place.address()).collect()
 }
 
 fn build_pipelines(

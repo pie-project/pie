@@ -45,18 +45,13 @@ impl Raw {
             });
         }
         let mappable = kind == Memory::Readback;
-        let mut usage = if mappable {
+        let usage = if mappable {
             wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST
         } else {
             wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST
         };
-        // The pool's segments hold guest configs a stage binds as a uniform
-        // (`guest::session`), beside everything bound as storage.
-        if owner == engine_gpu::books::owners::POOL && kind == Memory::Device {
-            usage |= wgpu::BufferUsages::UNIFORM;
-        }
         core.books.created();
         let buffer = core.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
@@ -85,7 +80,7 @@ impl Raw {
                 label: Some("pie clear"),
             });
         encoder.clear_buffer(&buffer, 0, None);
-        core.queue.submit(std::iter::once(encoder.finish()));
+        core.submit(std::iter::once(encoder.finish()));
         core.take_error("clear_buffer")?;
         Ok(Arc::new(Raw {
             core: Arc::clone(core),
@@ -141,6 +136,13 @@ impl Raw {
         }
         let back = Signal::new();
         let deliver = back.clone();
+        // A host-mapped buffer's map excludes every submit until it is
+        // unmapped (`Core::maps`): a submit referencing it in between is
+        // refused. The mirror of one arm, read through `read_async` after
+        // its frame lands, is referenced by that arm alone and needs none.
+        let _alone = self
+            .mappable
+            .then(|| self.core.maps.write().expect("maps lock poisoned"));
         self.read_async(offset, into.len() as u64, move |raw| deliver.notify(raw));
         let raw = back.park("Buffer::read")??;
         into.copy_from_slice(&raw[..into.len()]);
@@ -206,7 +208,7 @@ impl Raw {
                 label: Some("pie read"),
             });
         encoder.copy_buffer_to_buffer(&self.buffer, start, &staging, 0, Some(span));
-        core.queue.submit(std::iter::once(encoder.finish()));
+        core.submit(std::iter::once(encoder.finish()));
         let mapped = staging.clone();
         let core = Arc::clone(core);
         staging
@@ -242,7 +244,7 @@ impl Raw {
                 label: Some("pie zero"),
             });
         encoder.clear_buffer(&self.buffer, start, Some(end - start));
-        core.queue.submit(std::iter::once(encoder.finish()));
+        core.submit(std::iter::once(encoder.finish()));
         core.take_error("clear_buffer")
     }
 }

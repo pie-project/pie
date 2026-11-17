@@ -53,9 +53,8 @@ fn d_dim(v : u32, k : u32) -> u32 { return descs[v * DESC_WORDS + 5u + k]; }
 
 // The instance's scratch lies in pool chunks (the pool's segments, bound
 // four), each value whole in one piece. An address is a word of a segment,
-// the segment in its top two bits: `offs` holds each value's word in its
-// piece, then each value's piece, then the temporary area's piece and word,
-// then each piece's first word, which a rebind rewrites.
+// the segment in its top two bits: `offs` holds the temporary area's
+// address, then each value's, which a bind and a rebind write.
 const SEG_SHIFT : u32 = 30u;
 const SEG_WORDS : u32 = 0x3FFFFFFFu;
 
@@ -79,14 +78,9 @@ fn hs(a : u32, x : u32) {
   }
 }
 
-fn piece_base(piece : u32) -> u32 { return offs[2u * cfg.value_count + 2u + piece]; }
+fn base(v : u32) -> u32 { return offs[v + 1u]; }
 
-fn base(v : u32) -> u32 { return piece_base(offs[cfg.value_count + v]) + offs[v]; }
-
-fn tmp() -> u32 {
-  let at = 2u * cfg.value_count;
-  return piece_base(offs[at]) + offs[at + 1u];
-}
+fn tmp() -> u32 { return offs[0]; }
 
 fn rows_of(v : u32) -> u32 {
   let rank = d_rank(v);
