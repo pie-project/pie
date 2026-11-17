@@ -14,9 +14,9 @@ use crate::exports::{
 use crate::inputs::Inputs;
 use crate::program::Plane as ProgramPlane;
 use crate::record::Bodies as GraphCache;
-use crate::store::{KvSize, Pools, StatedKv};
 use crate::store::kv::{self, Paging};
 use crate::store::rs::Buffers;
+use crate::store::{KvSize, Pools, StatedKv};
 use crate::weights::Weights;
 
 use super::{Boot, Golden, Released, Shell};
@@ -864,12 +864,12 @@ impl Shell {
             )?,
         };
         let paging = Paging::of(boot.page_size, boot.context, boot.slots, pages)?
-        .windowed(
-            crate::store::window_of(&boot.trace)?,
-            boot.budget.max_tokens,
-        )
-        .seated(boot.budget.max_lanes)
-        .spare(engine.window_spare);
+            .windowed(
+                crate::store::window_of(&boot.trace)?,
+                boot.budget.max_tokens,
+            )
+            .seated(boot.budget.max_lanes)
+            .spare(engine.window_spare);
         // A class attending both ways decodes its planes over all its rows once, at load.
         let decoding = poem_exec::feeds::classes_reading(&boot.trace, &compiled, |def| {
             matches!(def, poem_ir::Def::Weight(w)
@@ -1059,7 +1059,10 @@ impl Shell {
         facts.mark_rows_a_lane(&read_only_by_decoders(&boot.trace, &compiled, &decoding));
         let feeds = Feeds::of(&boot.trace, &compiled);
         let tiers = crate::record::Tiers {
-            plain: plain_of(&landing, &Exports::of(&boot.trace, &compiled, boot.context, boot.page_size)?.outputs),
+            plain: plain_of(
+                &landing,
+                &Exports::of(&boot.trace, &compiled, boot.context, boot.page_size)?.outputs,
+            ),
         };
         let drafting_words: std::collections::HashSet<u64> = compiled
             .classes
