@@ -588,6 +588,7 @@ fn check_estimate_of(
     deployment: &str,
     chip: Profile,
     walked: Profile,
+    also: &[u32],
     say: &mut dyn FnMut(&str),
 ) -> Result<String, String> {
     // The rungs come of a load; the shell each check fire runs on is then
@@ -696,6 +697,7 @@ fn check_estimate_of(
     let mut widths: Vec<u32> = vec![by_est.tokens, by_meas.tokens];
     widths.extend(rungs.first().map(|r| r.tokens));
     widths.extend(rungs.last().map(|r| r.tokens));
+    widths.extend(also.iter().copied());
     widths.sort_unstable();
     widths.dedup();
     let dissected: Vec<Dissected> = widths
@@ -897,6 +899,7 @@ pub fn run(
     profiles: Option<&Path>,
     models: &[(PathBuf, String)],
     check_estimate: bool,
+    dissect: &[u32],
     served: Served<'_>,
     contract_for: crate::ContractFor,
     say: &mut dyn FnMut(&str),
@@ -941,6 +944,7 @@ pub fn run(
                 deployment,
                 Cuda::profile_of(&today)?,
                 Cuda::profile_of(&walked)?,
+                dissect,
                 say,
             ) {
                 failed.push(why);

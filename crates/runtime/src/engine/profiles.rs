@@ -44,6 +44,8 @@ pub struct TuneRequest<'a> {
     /// Check the estimate alone: time the check models' fires at each rung
     /// width and hold the estimate's pick to the measured best.
     pub check_estimate: bool,
+    /// With `check_estimate`: rung widths dissected beside the picks.
+    pub dissect: &'a [u32],
     /// Run the `[rates]` step alone: the device's rates measured on it.
     pub rates: bool,
     /// Time only the dense GEMM tactics the checked models' served loads
@@ -299,6 +301,7 @@ fn tune_cuda(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, 
             Some(req.profiles),
             &models,
             req.check_estimate,
+            req.dissect,
             req.served_cuda,
             crate::engine::load::contract_for,
             say,
