@@ -103,7 +103,13 @@ pub(crate) struct Latch {
     lanes: u32,
     sink: Option<engine::CompletionSink>,
     holds: std::sync::atomic::AtomicUsize,
+    /// A fault of the whole step (its fire, a device event): every lane.
     fault: std::sync::Mutex<Option<String>>,
+    /// Each attached instance's lanes of the step, where its pass's fault
+    /// lands (`Latch::fault_instances`).
+    spans: std::sync::Mutex<Vec<(InstanceId, std::ops::Range<u32>)>>,
+    /// The lanes whose instance's pass faulted; the rest commit.
+    lane_faults: std::sync::Mutex<engine::StepOutcome>,
     /// What the step's reported lanes wrote, told when it lands.
     writes: std::sync::Mutex<Vec<engine::KvWrites>>,
     /// The step's outcome once every hold is released: `Some(fault)`.
@@ -124,6 +130,8 @@ impl Latch {
             sink,
             holds: std::sync::atomic::AtomicUsize::new(1),
             fault: std::sync::Mutex::new(None),
+            spans: std::sync::Mutex::new(Vec::new()),
+            lane_faults: std::sync::Mutex::new(engine::StepOutcome::committed()),
             writes: std::sync::Mutex::new(Vec::new()),
             landed: std::sync::Mutex::new(None),
             done: std::sync::Condvar::new(),
@@ -141,6 +149,32 @@ impl Latch {
 
     pub(crate) fn hold(&self) {
         self.holds.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// The step's attached instances and the lanes each one's pass is for.
+    pub(crate) fn seat_spans(&self, spans: Vec<(InstanceId, std::ops::Range<u32>)>) {
+        *self.spans.lock().expect("spans lock poisoned") = spans;
+    }
+
+    /// `instances`' passes faulted for `why`: their lanes fault, every
+    /// other lane of the step commits. An instance the step does not seat
+    /// faults the whole step.
+    pub(crate) fn fault_instances(&self, instances: &[InstanceId], why: &str) {
+        let spans = self.spans.lock().expect("spans lock poisoned");
+        let mut faults = self.lane_faults.lock().expect("lane faults lock poisoned");
+        for instance in instances {
+            match spans.iter().find(|(id, _)| id == instance) {
+                Some((_, lanes)) => faults.fault_lanes(lanes.clone(), Some(*instance), why),
+                None => {
+                    self.fault
+                        .lock()
+                        .expect("fault lock poisoned")
+                        .get_or_insert_with(|| {
+                            format!("instance {instance}, which the step does not seat: {why}")
+                        });
+                }
+            }
+        }
     }
 
     /// The step's reported lanes wrote `writes`: told with its landing.
@@ -174,10 +208,20 @@ impl Latch {
             sink(
                 self.at,
                 match fault.clone() {
-                    None => engine::StepOutcome::wrote(std::mem::take(
-                        &mut *self.writes.lock().expect("writes lock poisoned"),
-                    )),
-                    Some(why) => engine::StepOutcome::unattributed_guest_fault(self.lanes, why),
+                    None => {
+                        let mut outcome = engine::StepOutcome::wrote(std::mem::take(
+                            &mut *self.writes.lock().expect("writes lock poisoned"),
+                        ));
+                        outcome.faulted = std::mem::take(
+                            &mut self
+                                .lane_faults
+                                .lock()
+                                .expect("lane faults lock poisoned")
+                                .faulted,
+                        );
+                        outcome
+                    }
+                    Some(why) => engine::StepOutcome::lost(self.lanes, why),
                 },
             );
         }
@@ -193,6 +237,15 @@ struct Flight {
     out_words: usize,
     puts: Vec<crate::guest::run::DeferredPut>,
     poison: Vec<Arc<AtomicBool>>,
+}
+
+/// A landed flight's outcome on its step: a fault lands on the lanes of
+/// the instances it committed for.
+fn landed(latch: &Latch, instances: &[InstanceId], outcome: Result<(), String>) {
+    if let Err(why) = outcome {
+        latch.fault_instances(instances, &why);
+    }
+    latch.release(Ok(()));
 }
 
 /// Guest passes in flight. A flight lands on the plugin's thread when its
@@ -239,6 +292,7 @@ impl Flights {
         self: &Arc<Self>,
         deferred: crate::guest::run::Deferred,
         poison: Vec<Arc<AtomicBool>>,
+        instances: Vec<InstanceId>,
         latch: Option<&Arc<Latch>>,
     ) {
         let crate::guest::run::Deferred {
@@ -280,13 +334,14 @@ impl Flights {
                 drop(unsafe { Box::from_raw(dst) });
                 let outcome = self.land(id, Err(why.to_string()), None);
                 if let Some(latch) = latch {
-                    latch.release(outcome);
+                    landed(latch, &instances, outcome);
                 }
                 return;
             }
         };
         let flights = Arc::clone(self);
         let hold = latch.cloned();
+        let theirs = instances.clone();
         let landing = Landing(dst);
         let keep = Arc::clone(&out);
         let registered = event.on_ready(move |done| {
@@ -299,7 +354,7 @@ impl Flights {
                 Some(keep),
             );
             if let Some(latch) = hold {
-                latch.release(outcome);
+                landed(&latch, &theirs, outcome);
             }
         });
         if let Err(why) = registered {
@@ -307,7 +362,7 @@ impl Flights {
             // freed under a copy that may still be writing them.
             let outcome = self.land(id, Err(why.to_string()), None);
             if let Some(latch) = latch {
-                latch.release(outcome);
+                landed(latch, &instances, outcome);
             }
         }
     }
@@ -1224,14 +1279,21 @@ impl Plane {
         pool: &mut Option<crate::pjrt::Buffer>,
         at: Stage,
     ) -> Result<Vec<bool>, Refusal> {
-        self.fire_guests_with(device, attachments, kept, pool, None, at)
+        let (ran, faults) = self.fire_guests_with(device, attachments, kept, pool, None, at)?;
+        match faults.into_iter().next() {
+            Some((_, why)) => Err(Refusal::Program(why)),
+            None => Ok(ran),
+        }
     }
 
     /// `fire_guests`, with each device group's last stage left in flight
     /// when `latch` is given: its puts land when their download does (and
     /// release a hold on `latch` then), and the next fire's `embed_tokens`
     /// can read them where they are. Every pass still in flight lands
-    /// before this one binds its roots.
+    /// before this one binds its roots. Answers which attachments ran on
+    /// the device and each instance whose pass faulted, with why: its
+    /// lanes fault, the others' passes stand. A pass that lands later
+    /// places its fault on `latch`.
     #[allow(clippy::too_many_lines)]
     pub(crate) fn fire_guests_with(
         &mut self,
@@ -1241,7 +1303,7 @@ impl Plane {
         pool: &mut Option<crate::pjrt::Buffer>,
         latch: Option<&Arc<Latch>>,
         point: Stage,
-    ) -> Result<Vec<bool>, Refusal> {
+    ) -> Result<(Vec<bool>, Vec<(InstanceId, String)>), Refusal> {
         use crate::guest::run::{Member, OnDevice, bound, step_group, step_group_deferred};
         self.flights.wait_all();
         let members: Vec<InstanceId> = attachments.iter().map(|&(id, _)| id).collect();
@@ -1280,7 +1342,7 @@ impl Plane {
                 }
             }
         }
-        let mut first_error: Option<Refusal> = None;
+        let mut faults: Vec<(InstanceId, String)> = Vec::new();
         let mut note = |outcome: StepOutcome, instance: InstanceId, program: ProgramId| {
             let why = match outcome {
                 StepOutcome::Committed => return,
@@ -1291,7 +1353,7 @@ impl Plane {
                     format!("instance {instance} (program {program}) faulted: {why}")
                 }
             };
-            first_error.get_or_insert(Refusal::Program(why));
+            faults.push((instance, why));
         };
         let mut ran = vec![false; attachments.len()];
         if shared {
@@ -1415,14 +1477,17 @@ impl Plane {
                     (outcomes, None)
                 };
                 if let Some(deferred) = deferred {
-                    let poison: Vec<Arc<AtomicBool>> = deferred
+                    let instances: Vec<InstanceId> = deferred
                         .members
                         .iter()
                         .filter_map(|&m| order.get(m))
-                        .filter_map(|(_, id, _)| self.instances.get(id))
+                        .map(|(_, id, _)| *id)
+                        .collect();
+                    let poison: Vec<Arc<AtomicBool>> = (instances.iter())
+                        .filter_map(|id| self.instances.get(id))
                         .map(|seat| Arc::clone(&seat.poisoned))
                         .collect();
-                    self.flights.launch(deferred, poison, latch);
+                    self.flights.launch(deferred, poison, instances, latch);
                 }
                 for ((at, id, program), outcome) in order.into_iter().zip(outcomes) {
                     ran[at] = true;
@@ -1440,16 +1505,16 @@ impl Plane {
         // is a fault, not a pass for another path.
         for (at, &(instance, lane)) in attachments.iter().enumerate() {
             if !ran[at] {
-                first_error.get_or_insert(Refusal::Program(format!(
-                    "instance {instance} at lane {lane}: its outputs are not on the device in \
-                     this fire, which its registration checked they would be"
-                )));
+                faults.push((
+                    instance,
+                    format!(
+                        "instance {instance} at lane {lane}: its outputs are not on the device in \
+                         this fire, which its registration checked they would be"
+                    ),
+                ));
             }
         }
-        match first_error {
-            Some(why) => Err(why),
-            None => Ok(ran),
-        }
+        Ok((ran, faults))
     }
 
     #[must_use]
