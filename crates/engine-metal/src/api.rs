@@ -763,10 +763,7 @@ impl Engine for Metal {
     }
 
     fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<engine::CopyCompletion> {
-        self.loaded_mut()?
-            .copy_slots(copy)
-            .map_err(fault)
-            .map(|()| engine::completion::copy_landed_placeholder())
+        self.loaded_mut()?.copy_slots(copy).map_err(fault)
     }
 
     fn read_tier_slots(
@@ -1123,10 +1120,7 @@ impl Engine for Metal {
         }
         let page_size = self.loaded_mut()?.paging().page_size;
         let moves = copy.runs(page_size)?;
-        self.loaded_mut()?
-            .copy_kv(&moves)
-            .map_err(fault)
-            .map(|()| engine::completion::copy_landed_placeholder())
+        self.loaded_mut()?.copy_kv(&moves).map_err(fault)
     }
 }
 
