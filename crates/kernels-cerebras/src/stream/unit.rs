@@ -457,6 +457,8 @@ impl Reader<'_> {
             ) => up(*x, 0),
             // (a sink's output is its attention's, the sink folded into the Attend)
             Operation::Attn(Attn::Sink { o, .. }) => up(*o, 0),
+            // (an adapter's correction: its product, no adapter on the wafer)
+            Operation::Linear(Linear::LoraCorrect { y, .. }) => up(*y, 0),
             _ => Cols {
                 base: v,
                 from: 0,
@@ -499,7 +501,8 @@ fn rooted(op: &Operation) -> bool {
     )
 }
 
-/// No step: the value it makes is columns of another.
+/// No step: the value it makes is columns of another (an adapter's correction is its product
+/// unchanged: the wafer serves no adapter).
 fn alias(op: &Operation) -> bool {
     matches!(
         op,
@@ -509,7 +512,7 @@ fn alias(op: &Operation) -> bool {
                 | Gather::PackRows { .. }
                 | Gather::UnpackRows { .. }
                 | Gather::Rows { .. }
-        )
+        ) | Operation::Linear(Linear::LoraCorrect { .. })
     )
 }
 
