@@ -1322,6 +1322,13 @@ impl Shell {
             &schedule_streams(&boot.trace, &compiled),
             pools.ids_a_lane(),
             buffers.as_ref().map(crate::store::rs::Buffers::page_tokens),
+            // A stretch a ragged attention, where some class reads a lane's
+            // group mask.
+            if group_masked.is_empty() {
+                0
+            } else {
+                feeds.ragged.len()
+            },
         )?;
 
         let exports = Exports::of(&boot.trace, &compiled)?;
@@ -1456,6 +1463,7 @@ impl Shell {
             armed_body: None,
             arm_cold: false,
             arm_rs: crate::record::RsBody::Folds,
+            arm_group_mask: false,
             arm_deferred: false,
             card: (0, 0),
             held_for_fires: 0,

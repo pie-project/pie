@@ -78,9 +78,14 @@ pub(crate) fn masked_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir
 /// mask as its group's (the custom arm). There a mask is the lane's to
 /// state or not (stating none, a row attends every row of its group), so a
 /// plan whose only attention is kv-less takes one too.
+///
+/// Only a kv-less lane states a group mask, so a class that writes or reads
+/// a cache (a language model's prefill beside its vision tower's ragged
+/// attention) takes none: arming records a masked twin of each body over
+/// these classes, and the rest arm once.
 #[must_use]
 pub(crate) fn group_masked_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir::ClassSet {
-    classes_running(trace, compiled, |op| {
+    let ragged = classes_running(trace, compiled, |op| {
         matches!(
             op,
             poem_ir::Operation::Attn(poem_ir::Attn::Ragged {
@@ -88,7 +93,21 @@ pub(crate) fn group_masked_classes(trace: &Trace, compiled: &CompiledModel) -> p
                 ..
             })
         )
-    })
+    });
+    let cached = classes_running(trace, compiled, |op| {
+        matches!(
+            op,
+            poem_ir::Operation::Attn(
+                poem_ir::Attn::Decode { .. }
+                    | poem_ir::Attn::Prefill { .. }
+                    | poem_ir::Attn::KvAppend { .. }
+                    | poem_ir::Attn::MlaKvAppend { .. }
+                    | poem_ir::Attn::MlaDecode { .. }
+                    | poem_ir::Attn::MlaPrefill { .. }
+            )
+        )
+    });
+    poem_ir::ClassSet::of(ragged.iter().filter(|&class| !cached.contains(class)))
 }
 
 #[must_use]
