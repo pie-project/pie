@@ -23,7 +23,7 @@
 //! server, and every compat request runs as tenant `default` unless an
 //! `x-plex-tenant` header names another.
 //!
-//! Props come from `x-plex-prop-<name>` headers (JSON if it parses) over a
+//! Hints (props, to the runtime) come from `x-plex-hint-<name>` headers (JSON if it parses) over a
 //! `plex` body object; `x-plex-session` names the session; `prompt` defaults to
 //! the request's text.
 
@@ -95,7 +95,7 @@ fn identity(headers: &HeaderMap) -> Identity {
     }
 }
 
-const PROP_HEADER_PREFIX: &str = "x-plex-prop-";
+const PROP_HEADER_PREFIX: &str = "x-plex-hint-";
 const TENANT_HEADER: &str = "x-plex-tenant";
 const SESSION_HEADER: &str = "x-plex-session";
 
@@ -739,9 +739,9 @@ mod tests {
     #[test]
     fn props_come_from_the_body_and_the_headers() {
         let mut headers = HeaderMap::new();
-        headers.insert("x-plex-prop-priority", "3".parse().unwrap());
-        headers.insert("x-plex-prop-tier", "gold".parse().unwrap());
-        headers.insert("x-plex-prop-tags", r#"["a","b"]"#.parse().unwrap());
+        headers.insert("x-plex-hint-priority", "3".parse().unwrap());
+        headers.insert("x-plex-hint-tier", "gold".parse().unwrap());
+        headers.insert("x-plex-hint-tags", r#"["a","b"]"#.parse().unwrap());
         headers.insert("x-request-id", "r".parse().unwrap());
         let body = json!({"model": "m", "plex": {"priority": 1, "deadline-ms": 500}});
         let expected: Props = serde_json::from_value(json!({
@@ -796,7 +796,7 @@ mod tests {
         );
         assert_eq!(text(&json!({"prompt": "once upon"})), "once upon\n");
         let mut headers = HeaderMap::new();
-        headers.insert("x-plex-prop-prompt", "the client's".parse().unwrap());
+        headers.insert("x-plex-hint-prompt", "the client's".parse().unwrap());
         assert_eq!(props(&headers, &first)["prompt"], json!("the client's"));
         assert!(!props(&HeaderMap::new(), &json!({"model": "m"})).contains_key("prompt"));
     }

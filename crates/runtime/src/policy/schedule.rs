@@ -8,36 +8,53 @@ use parking_lot::RwLock;
 
 use crate::inferlet::process::ProcessId;
 
+/// The 1.1 schedule columns as they stand: `priority` (highest first) and
+/// `hold`, each by process with the column's default for the rest.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Table {
     keys: HashMap<ProcessId, i64>,
-    floor: Option<i64>,
+    key_default: Option<i64>,
+    holds: HashMap<ProcessId, bool>,
+    hold_default: Option<bool>,
 }
 
 impl Table {
-    pub fn new(keys: HashMap<ProcessId, i64>, floor: Option<i64>) -> Self {
-        Self { keys, floor }
-    }
-
-    pub fn get(&self, id: ProcessId) -> Option<i64> {
-        self.keys.get(&id).copied()
-    }
-
-    pub fn floor(&self) -> Option<i64> {
-        self.floor
+    pub fn new(
+        keys: HashMap<ProcessId, i64>,
+        key_default: Option<i64>,
+        holds: HashMap<ProcessId, bool>,
+        hold_default: Option<bool>,
+    ) -> Self {
+        Self {
+            keys,
+            key_default,
+            holds,
+            hold_default,
+        }
     }
 
     pub fn key(&self, pid: ProcessId) -> i64 {
-        self.get(plex_id(pid)).unwrap_or(0)
+        let id = plex_id(pid);
+        self.keys
+            .get(&id)
+            .copied()
+            .or(self.key_default)
+            .unwrap_or(0)
     }
 
+    /// Its row, or the default, says so.
     pub fn names(&self, pid: ProcessId) -> bool {
-        self.get(plex_id(pid)).is_some()
+        self.keys.contains_key(&plex_id(pid)) || self.key_default.is_some()
     }
 
-    /// Below the floor: not to be started, and to be paused if running.
+    /// Not to be started, and to be paused if running.
     pub fn held(&self, pid: ProcessId) -> bool {
-        self.floor.is_some_and(|floor| self.key(pid) < floor)
+        let id = plex_id(pid);
+        self.holds
+            .get(&id)
+            .copied()
+            .or(self.hold_default)
+            .unwrap_or(false)
     }
 }
 

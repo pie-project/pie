@@ -25,20 +25,26 @@ pub const fn above_floor(key: i64) -> bool {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Table {
     steps: HashMap<ProcessId, Vec<(Option<u64>, i64)>>,
+    /// The column's default: the key of KV no row covers.
+    default: Option<i64>,
 }
 
 impl Table {
-    pub fn new(steps: HashMap<ProcessId, Vec<(Option<u64>, i64)>>) -> Self {
-        Self { steps }
+    pub fn new(steps: HashMap<ProcessId, Vec<(Option<u64>, i64)>>, default: Option<i64>) -> Self {
+        Self { steps, default }
     }
 
     fn key_at(&self, owner: ProcessId, at: u64) -> Option<i64> {
         self.steps
-            .get(&owner)?
-            .iter()
-            .filter(|(upto, _)| upto.is_none_or(|upto| at < upto))
-            .map(|&(_, key)| key)
-            .max()
+            .get(&crate::policy::schedule::plex_id(owner))
+            .and_then(|steps| {
+                steps
+                    .iter()
+                    .filter(|(upto, _)| upto.is_none_or(|upto| at < upto))
+                    .map(|&(_, key)| key)
+                    .max()
+            })
+            .or(self.default)
     }
 }
 
@@ -64,8 +70,13 @@ pub struct Installed;
 
 impl Keys for Installed {
     fn key_at(&self, owner: Option<ProcessId>, at: u64) -> i64 {
+        let current = CURRENT.read();
+        let Some(table) = current.as_ref() else {
+            return FLOOR;
+        };
         owner
-            .and_then(|owner| CURRENT.read().as_ref()?.key_at(owner, at))
+            .and_then(|owner| table.key_at(owner, at))
+            .or(table.default)
             .unwrap_or(FLOOR)
     }
 
@@ -73,7 +84,7 @@ impl Keys for Installed {
         CURRENT
             .read()
             .as_ref()
-            .and_then(|table| table.steps.get(&owner))
+            .and_then(|table| table.steps.get(&crate::policy::schedule::plex_id(owner)))
             .map(|steps| steps.iter().filter_map(|&(upto, _)| upto).collect())
             .unwrap_or_default()
     }
@@ -92,18 +103,18 @@ mod tests {
     #[test]
     fn a_position_takes_the_highest_key_covering_it_and_none_is_0() {
         let (owner, other) = (ProcessId::from_u128(0xf3), ProcessId::from_u128(0xf4));
-        install(Some(Table::new(HashMap::from([(
-            owner,
-            vec![(None, -1), (Some(100), 5)],
-        )]))));
+        install(Some(Table::new(
+            HashMap::from([(owner, vec![(None, -1), (Some(100), 5)])]),
+            None,
+        )));
         assert_eq!(Installed.key_at(Some(owner), 99), 5);
         assert_eq!(Installed.key_at(Some(owner), 100), -1);
         assert_eq!(Installed.steps(owner), [100]);
         assert_eq!(Installed.key_at(Some(other), 0), FLOOR, "unnamed");
-        install(Some(Table::new(HashMap::from([(
-            owner,
-            vec![(Some(10), 3)],
-        )]))));
+        install(Some(Table::new(
+            HashMap::from([(owner, vec![(Some(10), 3)])]),
+            None,
+        )));
         assert_eq!(Installed.key_at(Some(owner), 10), 0, "past every entry");
         install(None);
     }
