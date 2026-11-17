@@ -19,7 +19,9 @@ mod mamba2;
 
 pub use conv1d::{causal_conv1d, causal_conv1d_chunked, short_conv, short_conv_chunked};
 pub use dyn_conv::dyn_conv;
-pub use gdn_chunk::{gated_delta_chunked, gated_delta_chunked_serial, gdn_lands_snapshots};
+pub use gdn_chunk::{
+    gated_delta_chunked, gated_delta_chunked_serial, gated_delta_scans, gdn_lands_snapshots,
+};
 pub use gdn_prep::gdn_gates;
 pub use gdn_recurrent::gated_delta;
 pub use kda::{kda, kda_chunked};

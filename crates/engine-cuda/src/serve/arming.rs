@@ -1015,6 +1015,7 @@ impl Shell {
         rest: &[(u32, Kind)],
         kept: usize,
         weighed: &[(usize, usize); Kind::COUNT],
+        margin: u64,
     ) -> std::collections::BTreeSet<u32> {
         let Some((steps, from, mut fine)) = self.lattice else {
             return std::collections::BTreeSet::new();
@@ -1046,7 +1047,12 @@ impl Shell {
             .map_or(allowance, |spare| {
                 usize::try_from(spare).unwrap_or(usize::MAX)
             });
-        let room = allowance.min(spare);
+        // Arming stops a body short of the margin it keeps (`arm_target`):
+        // the lattice kept is one it arms whole within that.
+        let margin = usize::try_from(margin)
+            .unwrap_or(usize::MAX)
+            .max(2 * average);
+        let room = allowance.min(spare).saturating_sub(margin);
         while need(&buckets) > room {
             if fine <= steps.max(1) {
                 eprintln!(
@@ -1539,7 +1545,8 @@ impl Shell {
                 )
                 .collect();
             let kept = st.targets.len() + 1 - rest.len();
-            let dropped = self.fit_lattice(&rest, kept, &st.weighed);
+            let margin = st.unit_margin.min(self.bodies_mem as u64 / 4);
+            let dropped = self.fit_lattice(&rest, kept, &st.weighed, margin);
             st.dropped.extend(dropped);
         }
         let weighed_before = self.cache.body_stats().census;

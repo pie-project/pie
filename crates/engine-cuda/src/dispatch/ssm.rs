@@ -459,6 +459,20 @@ impl Run<'_> {
     }
 }
 
+/// A gated-delta recurrence's launch, one arm of it.
+type Scan = fn(
+    &kernels_cuda::Ctx,
+    RaggedTensor,
+    kernels_cuda::Tensor,
+    kernels_cuda::Tensor,
+    &kernels_cuda::RecurrentPool,
+    u32,
+    u32,
+    u32,
+    u32,
+    &mut kernels_cuda::Tensor,
+) -> Result<(), kernels_cuda::Error>;
+
 impl Run<'_> {
     #[allow(clippy::too_many_arguments)]
     fn conv1d_extended(
@@ -537,9 +551,33 @@ impl Run<'_> {
         let gates_ext = self.rs_ext_of(op, gates)?;
         let z_ext = self.rs_extend(op, z, false)?;
         let csr = self.rs_ext_csr(op)?;
-        let mut y_ext = self.rs_out(op, y)?;
+        let y_ext = self.rs_out(op, y)?;
         let tail = self.recurrent_tail_absolute(state);
-        kernels_cuda::ssm::gated_delta_chunked(
+        // The arm this window's rows take unextended, whatever rows the
+        // extended run holds: a lane folding beside a replaying one answers
+        // as it does in a fire of its own, the arm picked by the window's
+        // rows, not the run's. The short scan walks only the rows the window
+        // reaches, and stages that many.
+        let own = self.tensor(y).rows;
+        let (scan, qkv_ext, z_ext, gates_ext, mut y_ext): (Scan, _, _, _, _) =
+            if kernels_cuda::ssm::gated_delta_scans(self.ctx(), own) {
+                (
+                    kernels_cuda::ssm::gated_delta_chunked_serial,
+                    self.rs_reach(op, qkv_ext, own)?,
+                    self.rs_reach(op, z_ext, own)?,
+                    self.rs_reach(op, gates_ext, own)?,
+                    self.rs_reach(op, y_ext, own)?,
+                )
+            } else {
+                (
+                    kernels_cuda::ssm::gated_delta_chunked,
+                    qkv_ext,
+                    z_ext,
+                    gates_ext,
+                    y_ext,
+                )
+            };
+        scan(
             self.rs_ext_ctx(op)?,
             RaggedTensor {
                 data: qkv_ext,
@@ -555,7 +593,7 @@ impl Run<'_> {
             &mut y_ext,
         )?;
         if let Some(tail) = tail {
-            kernels_cuda::ssm::gated_delta_chunked(
+            scan(
                 self.rs_ext_ctx(op)?,
                 RaggedTensor {
                     data: qkv_ext,

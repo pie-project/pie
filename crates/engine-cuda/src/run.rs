@@ -177,18 +177,21 @@ pub(crate) fn replayed(reads: &[std::ops::Range<u32>]) -> u32 {
 /// every row of the run, and a lane's rows lie in every plane where the
 /// staged tables say (`channel::RsLane::ext`), so the windows of a fire,
 /// which may run on side streams of one another, share the planes and no
-/// row of them. A window takes a layer's planes in the order its ops ask;
-/// the next layer takes them anew.
+/// row of them. A window takes a layer's planes in the order its ops ask,
+/// each at its operand's width, and the next layer takes them anew: where
+/// two windows' widths part at one place (a prompt piece's recurrence
+/// beside a step's), each width is a plane of its own.
 #[derive(Debug)]
 pub struct RsScratch {
     ptr: u64,
     bytes: u64,
     rows: u32,
     next: Cell<u64>,
-    /// Each plane's place and the bytes of a row of it, by the kind of layer
-    /// that takes it (a lone conv's, or a recurrence's) and the order its
-    /// windows take them: the two kinds lay planes of their own.
-    planes: std::cell::RefCell<std::collections::HashMap<(bool, usize), (u64, u64)>>,
+    /// Each plane's place, by the kind of layer that takes it (a lone
+    /// conv's, or a recurrence's), the order its windows take them and the
+    /// bytes of a row of it: the two kinds lay planes of their own, and so
+    /// do two widths at one place (`store::rs::ext_row_bytes` counts each).
+    planes: std::cell::RefCell<std::collections::HashMap<(bool, usize, u64), u64>>,
     /// Each window's layout words (by its first lane and the op of its
     /// layer that lays them): their place and bytes.
     words: std::cell::RefCell<std::collections::HashMap<(u32, u32), (u64, u64)>>,
@@ -234,6 +237,13 @@ impl RsScratch {
         }
     }
 
+    /// The extended rows a window of `own` rows reaches from its place in
+    /// the run: its own and every row the fire replays, at most.
+    fn window_reach(&self, own: u32) -> u32 {
+        own.saturating_add(crate::store::rs::Buffers::replayed_reach(self.rows))
+            .min(self.rows)
+    }
+
     /// The bytes the extended runs of a fire reaching `rows_ext` rows take:
     /// a layer's planes of them and its windows' layout words.
     #[must_use]
@@ -256,33 +266,26 @@ impl RsScratch {
     }
 
     /// The next plane window `lane0` takes of its layer, a row of it
-    /// `row_bytes`: the one every window takes there.
+    /// `row_bytes`: the one every window takes there at that width. Windows
+    /// of other shapes (a prompt piece's chunked recurrence beside a step's,
+    /// whose rows may be wider) take planes of their own where their widths
+    /// part, never another shape's plane at another stride.
     fn plane(&self, lane0: u32, row_bytes: u64) -> crate::error::Result<u64> {
-        let (at, lone) = {
+        let key = {
             let mut taken = self.taken.borrow_mut();
             let (planes, _, lone) = taken.entry(lane0).or_default();
             *planes += 1;
-            (*planes - 1, *lone)
+            (*lone, *planes - 1, row_bytes)
         };
-        let held = self.planes.borrow().get(&(lone, at)).copied();
-        let (base, held) = match held {
-            Some(plane) => plane,
+        let held = self.planes.borrow().get(&key).copied();
+        let base = match held {
+            Some(base) => base,
             None => {
                 let base = self.lay(u64::from(self.rows) * row_bytes)?;
-                self.planes
-                    .borrow_mut()
-                    .insert((lone, at), (base, row_bytes));
-                (base, row_bytes)
+                self.planes.borrow_mut().insert(key, base);
+                base
             }
         };
-        if held != row_bytes {
-            return Err(crate::error::Fault::program(
-                "run::rs",
-                format!(
-                    "the window from lane {lane0} takes plane {at} of its recurrent layer                      at {row_bytes} bytes a row, and the plane was laid at {held}; the                      windows of a fire share a layer's planes, operand for operand"
-                ),
-            ));
-        }
         Ok(self.ptr + base)
     }
 
@@ -1251,6 +1254,24 @@ impl<'c> Run<'c> {
     }
 
     /// Each lane's own rows of the extended `ext` back onto value `id`.
+    /// The extended rows of this window's recurrence a scan walks: the
+    /// rows it reaches ([`RsScratch::window_reach`]), not the whole run, so
+    /// what the scan stages per row is laid for that reach.
+    pub(crate) fn rs_reach(
+        &self,
+        op: &'static str,
+        ext: Tensor,
+        own: u32,
+    ) -> Result<Tensor, kernels_cuda::Error> {
+        let (_, scratch) = self.rs_seat_and_scratch(op)?;
+        Ok(Tensor::new(
+            ext.ptr,
+            scratch.window_reach(own),
+            ext.width,
+            ext.dtype,
+        ))
+    }
+
     pub(crate) fn rs_land(
         &self,
         op: &'static str,
@@ -2891,9 +2912,14 @@ mod tests {
         scratch.layer_done(0);
         assert_eq!(scratch.plane(0, 64).unwrap(), first[0]);
         assert_eq!(scratch.layout(0, 36).unwrap(), words[0]);
-        // A plane is one operand's for every window.
+        // A window whose operand at a place is another width (a prompt
+        // piece's recurrence beside a step's) takes a plane of its own
+        // there, at its own stride, apart from every plane laid before.
         scratch.layer_done(3);
-        assert!(scratch.plane(3, 32).is_err());
+        let own = scratch.plane(3, 32).unwrap();
+        assert!(own >= words[1] + 256, "{own:#x} {first:x?} {words:x?}");
+        scratch.layer_done(3);
+        assert_eq!(scratch.plane(3, 32).unwrap(), own);
     }
 
     /// A lone conv's layer (Qwen4's PLE conv) takes planes of its own: its

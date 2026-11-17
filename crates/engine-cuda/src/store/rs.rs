@@ -158,18 +158,33 @@ fn ext_row_bytes(trace: &Trace) -> Result<u64> {
         .filter(|conv| conv.feeds == poem_compiler::rs::Feeds::Alone)
         .map(|conv| conv.node)
         .collect();
-    // A recurrence's operands and a lone conv's are laid side by side in the
-    // extended run (`run::RsScratch` keeps the two kinds apart): the widest
-    // of each.
-    let mut widest = 0u64;
-    let mut widest_lone = 0u64;
+    // The conv (its input and its rows) or the gates (`[b | a]` and the
+    // gates) node `id` comes of, with the planes it lays: what a window
+    // lays of the layer ahead of its recurrence, in node order.
+    let feeding = |id: ValueId| -> Result<Option<(usize, [u64; 2])>> {
+        let Some(&node) = defined.get(&id.0) else {
+            return Ok(None);
+        };
+        Ok(match &trace.nodes[node].op {
+            Operation::Ssm(
+                Ssm::CausalConv1dChunked { x, y, .. } | Ssm::CausalConv1d { x, y, .. },
+            ) => Some((node, [row_bytes(*x)?, row_bytes(*y)?])),
+            Operation::Ssm(Ssm::GdnGates { ba, gates, .. }) => {
+                Some((node, [row_bytes(*ba)?, row_bytes(*gates)?]))
+            }
+            _ => None,
+        })
+    };
+    // Each recurrent layer's planes as a window lays them, one after the
+    // next (`run::RsScratch::plane`): its conv's, its gates', then the
+    // recurrence's own. A lone conv's are a layer of their own kind.
+    let mut layers: Vec<(bool, Vec<u64>)> = Vec::new();
     for (at, node) in trace.nodes.iter().enumerate() {
-        let total = match &node.op {
-            // A lone conv runs extended over its own rows when a lane replays.
+        let (fed, own): (Vec<ValueId>, Vec<ValueId>) = match &node.op {
             Operation::Ssm(
                 Ssm::CausalConv1dChunked { x, y, .. } | Ssm::CausalConv1d { x, y, .. },
             ) if lone.contains(&at) => {
-                widest_lone = widest_lone.max(row_bytes(*x)? + row_bytes(*y)?);
+                layers.push((true, vec![row_bytes(*x)?, row_bytes(*y)?]));
                 continue;
             }
             // A one-token class's recurrences run extended too, when a lane
@@ -181,53 +196,44 @@ fn ext_row_bytes(trace: &Trace) -> Result<u64> {
                 | Ssm::GatedDelta {
                     qkv, z, gates, y, ..
                 },
-            ) => {
-                let mut total =
-                    row_bytes(*qkv)? + row_bytes(*z)? + row_bytes(*gates)? + row_bytes(*y)?;
-                if let Some(Operation::Ssm(
-                    Ssm::CausalConv1dChunked { x, .. } | Ssm::CausalConv1d { x, .. },
-                )) = defined.get(&qkv.0).map(|n| &trace.nodes[*n].op)
-                {
-                    total += row_bytes(*x)?;
-                }
-                if let Some(Operation::Ssm(Ssm::GdnGates { ba, .. })) =
-                    defined.get(&gates.0).map(|n| &trace.nodes[*n].op)
-                {
-                    total += row_bytes(*ba)?;
-                }
-                total
-            }
+            ) => (vec![*qkv, *gates], vec![*z, *y]),
             Operation::Ssm(
                 Ssm::KdaChunked { mixed, f, b, y, .. } | Ssm::Kda { mixed, f, b, y, .. },
-            ) => {
-                let mut total =
-                    row_bytes(*mixed)? + row_bytes(*f)? + row_bytes(*b)? + row_bytes(*y)?;
-                if let Some(Operation::Ssm(
-                    Ssm::CausalConv1dChunked { x, .. } | Ssm::CausalConv1d { x, .. },
-                )) = defined.get(&mixed.0).map(|n| &trace.nodes[*n].op)
-                {
-                    total += row_bytes(*x)?;
-                }
-                total
-            }
+            ) => (vec![*mixed], vec![*f, *b, *y]),
             Operation::Ssm(
                 Ssm::Mamba2Chunked { xbc, dt, z, y, .. } | Ssm::Mamba2 { xbc, dt, z, y, .. },
-            ) => {
-                let mut total =
-                    row_bytes(*xbc)? + row_bytes(*dt)? + row_bytes(*z)? + row_bytes(*y)?;
-                if let Some(Operation::Ssm(
-                    Ssm::CausalConv1dChunked { x, .. } | Ssm::CausalConv1d { x, .. },
-                )) = defined.get(&xbc.0).map(|n| &trace.nodes[*n].op)
-                {
-                    total += row_bytes(*x)?;
-                }
-                total
-            }
+            ) => (vec![*xbc], vec![*dt, *z, *y]),
             _ => continue,
         };
-        widest = widest.max(total);
+        let mut ahead = Vec::new();
+        for id in fed {
+            ahead.extend(feeding(id)?);
+        }
+        ahead.sort_by_key(|(node, _)| *node);
+        let mut planes: Vec<u64> = ahead.into_iter().flat_map(|(_, planes)| planes).collect();
+        for id in own {
+            planes.push(row_bytes(id)?);
+        }
+        layers.push((false, planes));
     }
-    Ok(widest + widest_lone)
+    Ok(laid_row_bytes(&layers))
+}
+
+/// The bytes a row of the extended run's planes takes, over every layer
+/// shape a fire's windows lay: a plane is shared by the windows (and the
+/// layers) that take it at one place in their layer and one row width, so
+/// each distinct such (kind, place, width) is one plane. The prompt and
+/// step forms of a layer may lay a plane at one place at two widths (a
+/// step's recurrence writing f32 rows where the prompt's writes bf16):
+/// those are two planes.
+fn laid_row_bytes(layers: &[(bool, Vec<u64>)]) -> u64 {
+    let mut planes: std::collections::BTreeSet<(bool, usize, u64)> = Default::default();
+    for (lone, row_bytes) in layers {
+        for (at, &bytes) in row_bytes.iter().enumerate() {
+            planes.insert((*lone, at, bytes));
+        }
+    }
+    planes.iter().map(|&(_, _, bytes)| bytes).sum()
 }
 
 /// The planes a recurrence reads besides the conv's rows: the gated-delta
@@ -490,6 +496,13 @@ impl Buffers {
         max_rows.saturating_mul(2)
     }
 
+    /// The most buffered rows a fire whose extended run holds `rows_ext`
+    /// rows replays ([`Buffers::rows_ext`]): the widest bucket's tokens.
+    #[must_use]
+    pub fn replayed_reach(rows_ext: u32) -> u32 {
+        rows_ext / 2
+    }
+
     /// Backs the scratch for an extended run of `rows_ext` rows, in place.
     pub fn ensure_scratch(&mut self, pools: &mut Pools, rows_ext: u32) -> Result<()> {
         let bytes = RsScratch::need(rows_ext, self.ext_row_bytes);
@@ -540,7 +553,8 @@ impl Buffers {
         (pools.activation_base() + self.scratch.at, self.scratch.held)
     }
 
-    /// A row of every extended operand of one recurrent layer, in bytes.
+    /// A row of every plane a fire's extended run lays, in bytes: each
+    /// recurrent layer shape's operands, once a place and width.
     #[must_use]
     pub fn ext_row_bytes(&self) -> u64 {
         self.ext_row_bytes
@@ -1069,5 +1083,17 @@ mod tests {
                 .expect("an empty plan reads clean")
                 .is_none()
         );
+    }
+
+    /// A layer's prompt and step forms lay one plane where their widths
+    /// agree and two where they part; a lone conv's are of its own kind.
+    #[test]
+    fn the_planes_a_fire_lays_are_each_place_and_width_once() {
+        let prompt = (false, vec![4096, 4096, 32, 64, 2048, 2048]);
+        let step = (false, vec![4096, 4096, 32, 64, 2048, 4096]);
+        assert_eq!(laid_row_bytes(&[prompt.clone()]), 12_384);
+        assert_eq!(laid_row_bytes(&[prompt.clone(), prompt.clone()]), 12_384);
+        assert_eq!(laid_row_bytes(&[prompt.clone(), step]), 12_384 + 4096);
+        assert_eq!(laid_row_bytes(&[prompt, (true, vec![20, 20])]), 12_384 + 40);
     }
 }

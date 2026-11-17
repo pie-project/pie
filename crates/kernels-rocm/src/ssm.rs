@@ -862,6 +862,14 @@ impl Delta {
     }
 }
 
+/// Whether a gated-delta recurrence over a window of `rows` rows takes the
+/// short scan ([`gated_delta_chunked_serial`]'s arm): never by its rows
+/// here, where the chunked walk is the head widths' choice alone.
+#[must_use]
+pub fn gated_delta_scans(_ctx: &Ctx, _rows: u32) -> bool {
+    false
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn gated_delta_chunked_serial(
     ctx: &Ctx,

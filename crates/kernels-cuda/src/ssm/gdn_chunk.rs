@@ -470,6 +470,14 @@ pub fn gated_delta_chunked_serial(
     out
 }
 
+/// Whether a gated-delta recurrence over a window of `rows` rows takes the
+/// short scan ([`gated_delta_chunked_serial`]'s arm) rather than the wide
+/// chunked walk: a short fire (a verify, a fold) scans its rows in order.
+#[must_use]
+pub fn gated_delta_scans(ctx: &Ctx, rows: u32) -> bool {
+    rows <= ctx.tuning().ssm_gdn_scan_until
+}
+
 thread_local! {
     static SERIAL_SCAN: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 }
@@ -501,7 +509,7 @@ pub fn gated_delta_chunked(
     dtype_dispatch!(OP, qkv.data.dtype, { Bf16 => () });
     debug_assert_eq!(gates.dtype, Dtype::F32, "`{OP}` reads an f32 decay row");
     // A short fire (a verify, a fold) scans its rows in order instead.
-    let scan = y.rows <= ctx.tuning().ssm_gdn_scan_until;
+    let scan = gated_delta_scans(ctx, y.rows);
     if y.dtype == Dtype::Bf16 {
         // Narrowed for its gated norm: the tcgen05 walk lands bf16 itself;
         // any other walk lands f32 in a plane, cast after.
