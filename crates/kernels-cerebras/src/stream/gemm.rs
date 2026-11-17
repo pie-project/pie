@@ -263,6 +263,8 @@ pub struct GemmProgram {
     /// Buffer sizes (words): a weight block, an input piece (16-bit halves), the residents.
     pub wbn: u32,
     pub xbn: u32,
+    /// Some weight block holds an odd count of 16-bit weights (each padded to whole words).
+    pub odd: bool,
 }
 
 fn refuse(t: &Trace, what: impl std::fmt::Display) -> String {
@@ -1177,16 +1179,14 @@ pub fn placed(l: &Lowering, c: u32, r: u32, kbm: u32) -> R<GemmProgram> {
             }
         }
         let rows = if *lane { 1 } else { tb };
-        // the input's pieces over the columns: the widest, the first odd one
-        let (mut kmax, mut kodd) = (0u32, None);
-        for cp in 0..c {
-            let (k0, k1) = piece(cp, c, *k);
-            let kc = k1 - k0;
-            kmax = kmax.max(kc);
-            if kc % 2 == 1 && kodd.is_none() {
-                kodd = Some(kc);
-            }
-        }
+        // the input's pieces over the columns: the widest
+        let pieces: Vec<u32> = (0..c)
+            .map(|cp| {
+                let (k0, k1) = piece(cp, c, *k);
+                k1 - k0
+            })
+            .collect();
+        let kmax = pieces.iter().copied().max().unwrap_or(0);
         if kmax == 0 {
             continue;
         }
@@ -1195,17 +1195,12 @@ pub fn placed(l: &Lowering, c: u32, r: u32, kbm: u32) -> R<GemmProgram> {
             for (ci, wc) in wcol.iter_mut().enumerate() {
                 let (lo, hi) = piece(ci as u32, c, sw);
                 let p = hi - lo;
-                if let Some(kc) = kodd
-                    && p % 2 == 1
-                {
-                    return Err(refuse(
-                        t,
-                        format!("a weight block of {kc} x {p}: an odd count of 16-bit weights"),
-                    ));
-                }
-                wbn = wbn.max(kmax * p / 2);
-                // (every block even: its words the column's whole input times its piece, halved)
-                *wc += u64::from(*k) * u64::from(p) / 2;
+                // (a block of an odd count of 16-bit weights is padded to whole words)
+                wbn = wbn.max((kmax * p).div_ceil(2));
+                *wc += pieces
+                    .iter()
+                    .map(|&kc| u64::from((kc * p).div_ceil(2)))
+                    .sum::<u64>();
             }
         }
     }
@@ -1230,6 +1225,7 @@ pub fn placed(l: &Lowering, c: u32, r: u32, kbm: u32) -> R<GemmProgram> {
         qchunk,
         wbn,
         xbn,
+        odd: false,
     };
     // the program streams in with its weights: each op's words (16-bit, an even count) where
     // its mark is
@@ -1274,6 +1270,7 @@ pub fn streams(p: &mut GemmProgram) -> R<()> {
     let mut wstream: Vec<Vec<Span>> = vec![Vec::new(); c as usize];
     let mut wcol = vec![0u64; c as usize];
     let (mut wbn, mut xbn) = (2u32, 2u32);
+    let mut any_odd = false;
     for (oi, op) in l2.ops.iter().enumerate() {
         // the op's own words first (a mark, its words once the program is placed)
         for ws in &mut wstream {
@@ -1356,14 +1353,11 @@ pub fn streams(p: &mut GemmProgram) -> R<()> {
                 for (ci, ws) in wstream.iter_mut().enumerate() {
                     let (lo, hi) = piece(ci as u32, c, sw);
                     let p = hi - lo;
-                    if (kc * p) % 2 != 0 {
-                        return Err(refuse(
-                            t,
-                            format!("a weight block of {kc} x {p}: an odd count of 16-bit weights"),
-                        ));
-                    }
-                    wbn = wbn.max(kc * p / 2);
-                    wcol[ci] += u64::from(kc * p / 2);
+                    // (a block of an odd count of 16-bit weights is padded to whole words)
+                    let odd = (kc * p) % 2 != 0;
+                    any_odd |= odd && p > 0;
+                    wbn = wbn.max((kc * p).div_ceil(2));
+                    wcol[ci] += u64::from((kc * p).div_ceil(2));
                     match yv.maps.get(&sf) {
                         _ if p == 0 => {}
                         None => ws.push([w.0, sf + lo, k0, p, *k, f16, kc, 1]),
@@ -1377,6 +1371,9 @@ pub fn streams(p: &mut GemmProgram) -> R<()> {
                                 }
                             }
                         }
+                    }
+                    if odd && p > 0 {
+                        ws.push([NONE, 0, 0, 1, 0, f16, 1, 0]);
                     }
                 }
             }
@@ -1430,6 +1427,7 @@ pub fn streams(p: &mut GemmProgram) -> R<()> {
             "the weight streams' words are not the ones counted",
         ));
     }
+    p.odd = any_odd;
     p.wat = wstream.iter().map(|ws| starts(ws)).collect();
     p.wstream = wstream;
     Ok(())

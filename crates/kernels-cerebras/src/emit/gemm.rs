@@ -582,7 +582,19 @@ fn pe_file(p: &GemmProgram, tb: &Table) -> String {
         kvn = (2 * p.tb * nc).max(2),
         phn = kb.max(2),
     );
-    t.push_str(GPE_OPS);
+    // (a weight block of an odd count of 16-bit weights takes whole words, the last half a pad)
+    if p.odd {
+        t.push_str(
+            &GPE_OPS
+                .replace(
+                    "tot += @as(u32, kc) * @as(u32, if (uy) ylw else prog[b + 10 + 2 * s]) / 2;",
+                    "tot += (@as(u32, kc) * @as(u32, if (uy) ylw else prog[b + 10 + 2 * s]) + 1) / 2;",
+                )
+                .replace("wget(0, kc * p / 2);", "wget(0, (kc * p + 1) / 2);"),
+        );
+    } else {
+        t.push_str(GPE_OPS);
+    }
     t.push_str(&reg_fn(p));
     // the regions' tables, the host's to write
     let mut exports = Vec::new();
