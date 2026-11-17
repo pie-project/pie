@@ -949,8 +949,8 @@ impl<'c, B: Backend> Run<'c, B> {
         }
         if !rows.is_empty() || !experts.is_empty() {
             self.cached_planes = planes;
-            self.cache_pool = Some(pool);
         }
+        self.cache_pool = Some(pool);
         self
     }
 

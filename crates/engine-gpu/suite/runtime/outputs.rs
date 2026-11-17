@@ -646,10 +646,13 @@ fn wide_draws(tag: &str, chunk: Option<u64>, n: u32) -> Option<(Vec<Vec<i32>>, u
         })
         .expect("the draw registers");
     let chunks = &caps.caps.chunks;
-    let mut slots =
-        super::slots::Slots::of(chunks, chunks.segment_chunks - 1, chunks.segment_chunks - 2);
-    // Whole chunks below the guests' slots, adjacent, for runs past a chunk.
-    slots.chunks = (chunks.segment_chunks - 26..chunks.segment_chunks - 2).collect();
+    // The instances' tables and runs of slots from chunk `top - 40` up (a
+    // chunk each where they fill one), their own cells in the top chunk,
+    // and whole chunks below that, adjacent, for runs past a chunk.
+    let top = chunks.segment_chunks;
+    assert!(top > 41, "segment 0 holds the test's chunks: {top}");
+    let mut slots = super::slots::Slots::of(chunks, top - 40, top - 1);
+    slots.chunks = (top - 26..top - 2).collect();
     let extents = engine::program::BindExtents::default();
     let run = engine
         .guest_state(program, &extents)

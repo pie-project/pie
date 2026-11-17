@@ -27,8 +27,13 @@ impl Shape {
         })
     }
 
-    /// The slots `footprint` takes: the next ones, adjacent.
+    /// The slots `footprint` takes: the next ones, adjacent, from the next
+    /// chunk where the rest of this one is short of them.
     pub fn take(&mut self, footprint: &Footprint) -> Vec<u32> {
+        let left = self.per_chunk - self.next % self.per_chunk;
+        if footprint.slots > left && footprint.slots <= self.per_chunk {
+            self.next += left;
+        }
         let first = self.next;
         self.next += footprint.slots;
         assert_eq!(
