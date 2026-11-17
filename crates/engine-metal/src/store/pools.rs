@@ -2478,6 +2478,10 @@ impl Pools {
 /// in a fire's slot lookups, and each logical chunk's latest move.
 static NAMED: std::sync::Mutex<Option<std::collections::HashMap<u32, (u32, u32)>>> =
     std::sync::Mutex::new(None);
+/// PROBE: every distinct (shape, logical) that ever named each physical
+/// chunk, in first-seen order, with the count of lookups since the last change.
+static HISTORY: std::sync::Mutex<Option<std::collections::HashMap<u32, Vec<(u32, u32, u64)>>>> =
+    std::sync::Mutex::new(None);
 pub static MOVED: std::sync::Mutex<Option<std::collections::HashMap<u32, u32>>> =
     std::sync::Mutex::new(None);
 
@@ -2489,6 +2493,22 @@ fn diag_named(physical: u32, shape: u32, logical: u32) {
     if let Ok(mut map) = NAMED.lock() {
         map.get_or_insert_with(Default::default).insert(physical, (shape, logical));
     }
+    if let Ok(mut map) = HISTORY.lock() {
+        let runs = map.get_or_insert_with(Default::default).entry(physical).or_default();
+        match runs.last_mut() {
+            Some(last) if last.0 == shape && last.1 == logical => last.2 += 1,
+            _ => runs.push((shape, logical, 1)),
+        }
+    }
+}
+
+/// PROBE: every run of (shape, logical, lookups) that named `physical`.
+pub fn diag_history(physical: u32) -> Vec<(u32, u32, u64)> {
+    HISTORY
+        .lock()
+        .ok()
+        .and_then(|map| map.as_ref().and_then(|map| map.get(&physical).cloned()))
+        .unwrap_or_default()
 }
 
 /// PROBE: who last named physical chunk `physical`: (shape, logical).
