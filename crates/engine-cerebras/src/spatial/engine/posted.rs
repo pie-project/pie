@@ -1,7 +1,9 @@
 //! The asynchronous engine (`[cerebras.spatial] async`): a frame's steps
 //! are posted, not run, and each lands on the completion sink once its
-//! epilogue ran. Steps run in order on the lane's thread; the wafer runs
-//! the posted token loop on meanwhile ([`Spatial::forward`]).
+//! epilogue ran, the lanes whose passes faulted told with it. Steps run in
+//! order on the lane's thread; the wafer runs the posted token loop on
+//! meanwhile ([`Spatial::forward`]). A step that errs whole (the wafer
+//! refused its forward) is lost: every lane of it faults.
 
 use std::collections::VecDeque;
 
@@ -34,10 +36,10 @@ impl Spatial {
     pub(super) fn pump(&mut self) {
         while let Some(Posted { at, step }) = self.posted.pop_front() {
             let outcome = match self.fire_step(&step) {
-                Ok(_) => StepOutcome::committed(),
+                Ok((_, outcome)) => outcome,
                 Err(error) => {
-                    tracing::error!(frame = at.frame.0, step = at.step, %error, "spatial: a posted step failed");
-                    StepOutcome::unattributed_guest_fault(
+                    tracing::error!(frame = at.frame.0, step = at.step, %error, "spatial: a posted step was lost");
+                    StepOutcome::lost(
                         u32::try_from(step.lanes.len()).unwrap_or(u32::MAX),
                         error.to_string(),
                     )
