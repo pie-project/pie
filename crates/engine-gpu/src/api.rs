@@ -46,6 +46,10 @@ pub struct PendingStep {
     /// prologue, an envelope), where the forward's own completion does not
     /// carry them, as `wrote`.
     pub faulted: Vec<engine::LaneFault>,
+
+    /// The check of the step's device-fed token ids, where the forward's
+    /// own completion does not carry it: told with the step once it landed.
+    pub fed: Option<crate::settle::FedCheck>,
 }
 
 /// What a backend crate supplies beside its [`Serve`] to stand behind the
@@ -343,10 +347,14 @@ impl<B: Host> Gpu<B> {
             return;
         };
         for (step, pending) in steps.iter_mut().enumerate() {
-            let outcome = engine::StepOutcome {
+            let mut outcome = engine::StepOutcome {
                 wrote: std::mem::take(&mut pending.wrote),
                 faulted: std::mem::take(&mut pending.faulted),
             };
+            // The frame settled: every step's forward landed.
+            if let Some(fed) = pending.fed.take() {
+                outcome = crate::settle::merged(outcome, fed.faults());
+            }
             if !outcome.wrote.is_empty() || !outcome.faulted.is_empty() {
                 let at = engine::StepDone {
                     frame: *frame,
@@ -1258,14 +1266,13 @@ impl<B: Host> Gpu<B> {
             if lane.inputs.is_empty() {
                 continue;
             }
-            let instance = submission
+            // A lane feeding inputs with no attachment is a submission that
+            // names no instance to read them through: the fire as stated is
+            // malformed, not one lane's fault, and it is refused whole.
+            let attachment = submission
                 .attachments
                 .iter()
-                .find(|attachment| {
-                    (attachment.lane..attachment.lane + attachment.lanes.max(1))
-                        .contains(&(at as u32))
-                })
-                .map(|attachment| attachment.instance)
+                .find(|attachment| attachment_lanes(attachment).contains(&(at as u32)))
                 .ok_or_else(|| {
                     Error::Invalid(format!(
                         "lane {at} feeds guest inputs and has no attachment; an input is read \
@@ -1273,10 +1280,19 @@ impl<B: Host> Gpu<B> {
                     ))
                 })?;
             for feed in &lane.inputs {
-                let cell = self
-                    .programs
-                    .input_cell(instance, feed.channel)
-                    .map_err(refusal)?;
+                // A cell its instance refuses is that attachment's fault: its
+                // lanes fault, and the seat takes zeros nothing reads.
+                let cell = match self.programs.input_cell(attachment.instance, feed.channel) {
+                    Ok(cell) => cell,
+                    Err(refused) => {
+                        faulted.fault_lanes(
+                            attachment_lanes(attachment),
+                            Some(attachment.instance),
+                            &refused.to_string(),
+                        );
+                        crate::serve::InputCell::Refused
+                    }
+                };
                 input_cells[at].push((*feed, cell));
             }
         }
@@ -1310,6 +1326,7 @@ impl<B: Host> Gpu<B> {
                 }
             }
         }
+        let vocab = self.vocab;
         let shell = self.loaded_mut()?;
 
         let mut words: Vec<u64> = submission.lanes.iter().map(|lane| lane.word).collect();
@@ -1418,6 +1435,7 @@ impl<B: Host> Gpu<B> {
 
         let wrote;
         let mut faulted = faulted.faulted;
+        let mut fed = None;
         let landed = {
             use engine::frame::Shell as FrameShell;
             let done = sink.filter(|_| !defers).map(|sink| Done {
@@ -1427,6 +1445,7 @@ impl<B: Host> Gpu<B> {
                 lanes: u32::try_from(submission.lanes.len()).unwrap_or(u32::MAX),
                 faulted: std::mem::take(&mut faulted),
                 meet,
+                fed: None,
             });
             let mut prepared = FrameShell::prepare(
                 shell,
@@ -1443,6 +1462,37 @@ impl<B: Host> Gpu<B> {
             )
             .map_err(fault)?;
             wrote = std::mem::take(&mut prepared.wrote);
+            // A lane fed its token on the device is checked once the
+            // forward landed, from what the forward embedded.
+            if let Some(vocab) = vocab
+                && !prepared.fed_lanes.is_empty()
+            {
+                let lanes = prepared
+                    .fed_lanes
+                    .iter()
+                    .map(|&(source, row)| {
+                        let attached = submission
+                            .attachments
+                            .iter()
+                            .find(|attachment| attachment_lanes(attachment).contains(&source));
+                        crate::settle::FedLane {
+                            row,
+                            lanes: attached.map_or(source..source + 1, attachment_lanes),
+                            instance: attached.map(|attachment| attachment.instance),
+                        }
+                    })
+                    .collect();
+                let check = crate::settle::FedCheck::new(
+                    shell.token_row_reader(prepared.arm),
+                    lanes,
+                    vocab,
+                );
+                prepared.fed_check = Some(check.clone());
+                match prepared.done.as_mut() {
+                    Some(done) => done.fed = Some(check),
+                    None => fed = Some(check),
+                }
+            }
             let enqueued = FrameShell::enqueue(shell, prepared).map_err(fault)?;
             FrameShell::settle(shell, enqueued).map_err(fault)?
         };
@@ -1462,6 +1512,7 @@ impl<B: Host> Gpu<B> {
                 rows: None,
                 wrote,
                 faulted,
+                fed,
             },
         ))
     }

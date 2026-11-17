@@ -176,6 +176,7 @@ impl Serve for Api {
             pixels,
             counts,
             done,
+            fed_check,
             ..
         } = launch;
         let arm = prepared.arm;
@@ -205,6 +206,7 @@ impl Serve for Api {
             std::sync::Arc::clone(&shell.shelf.mailbox),
             counts,
             done,
+            fed_check,
             shell.shelf.worker.clone(),
         );
         let pending = frame.commit_async(None)?;

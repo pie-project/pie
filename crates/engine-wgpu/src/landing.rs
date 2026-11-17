@@ -68,6 +68,7 @@ struct Landing {
     mailbox: Mailbox,
     counts: Airborne,
     done: Option<Done>,
+    fed: Option<engine_gpu::settle::FedCheck>,
 }
 
 impl Landing {
@@ -110,9 +111,15 @@ impl Landing {
             mailbox,
             counts,
             done,
+            fed,
             ..
         } = self;
         tracing::debug!(seq, arm, ok = read.is_ok(), "landing: rows back");
+        // What the fire embedded is read back before the step is posted:
+        // its arm may be taken again then.
+        if let Some(fed) = &fed {
+            fed.landed(read.is_ok());
+        }
         let (rows, refused, failed) = match read {
             Ok(rows) => (rows, None, false),
             Err(why) => (Vec::new(), Some(why), true),
@@ -259,6 +266,7 @@ pub(crate) fn on_done(
     mailbox: Mailbox,
     counts: Airborne,
     done: Option<Done>,
+    fed: Option<engine_gpu::settle::FedCheck>,
     worker: Worker,
 ) -> OnDone {
     let Seat {
@@ -284,6 +292,7 @@ pub(crate) fn on_done(
             mailbox,
             counts,
             done,
+            fed,
         });
     };
     Box::new(move |refused: Option<String>| {

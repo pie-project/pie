@@ -70,6 +70,9 @@ pub struct Done {
     /// the step is told once its forward landed and they ran, with the
     /// lanes they faulted.
     pub meet: Option<Meet>,
+
+    /// The step's device-fed token ids, checked once its forward landed.
+    pub fed: Option<FedCheck>,
 }
 
 impl Done {
@@ -77,9 +80,13 @@ impl Done {
     /// and the lanes its guests faulted ahead of it.
     #[must_use]
     pub fn settled(&self) -> engine::StepOutcome {
-        engine::StepOutcome {
+        let outcome = engine::StepOutcome {
             wrote: self.wrote.clone(),
             faulted: self.faulted.clone(),
+        };
+        match &self.fed {
+            Some(fed) => merged(outcome, fed.faults()),
+            None => outcome,
         }
     }
 
@@ -164,6 +171,106 @@ impl Meet {
     }
 }
 
+/// A step's lanes fed their one token on the device (a cell a guest pass
+/// still on the queue wrote): the ids the forward embedded are read back
+/// from the arm's token seat once the forward landed, before the arm is
+/// given back, and a lane whose id is past the vocabulary faults by name,
+/// as one the host resolved does ahead of the forward.
+#[derive(Clone)]
+pub struct FedCheck {
+    inner: Arc<Fed>,
+}
+
+/// A device-fed lane: its row in the fire's token seat, and the lanes and
+/// instance of the attachment it is of.
+#[derive(Debug, Clone)]
+pub struct FedLane {
+    pub row: u32,
+    pub lanes: std::ops::Range<u32>,
+    pub instance: Option<engine::InstanceId>,
+}
+
+/// Reads the id at token seat row `row`.
+pub type ReadRow = Box<dyn Fn(u32) -> Option<u32> + Send + Sync>;
+
+struct Fed {
+    read: ReadRow,
+    lanes: Vec<FedLane>,
+    vocab: u32,
+    faults: std::sync::Mutex<Option<Vec<engine::LaneFault>>>,
+    ready: std::sync::Condvar,
+}
+
+impl FedCheck {
+    #[must_use]
+    pub fn new(read: ReadRow, lanes: Vec<FedLane>, vocab: u32) -> FedCheck {
+        FedCheck {
+            inner: Arc::new(Fed {
+                read,
+                lanes,
+                vocab,
+                faults: std::sync::Mutex::new(None),
+                ready: std::sync::Condvar::new(),
+            }),
+        }
+    }
+
+    /// The forward landed (`whole`), or was lost: reads the fed ids back,
+    /// once. A lost step faults every lane by its own loss, not here.
+    pub fn landed(&self, whole: bool) {
+        let fed = &*self.inner;
+        let mut faults = fed.faults.lock().expect("fed lock poisoned");
+        if faults.is_some() {
+            return;
+        }
+        let mut outcome = engine::StepOutcome::committed();
+        for lane in fed.lanes.iter().filter(|_| whole) {
+            let Some(id) = (fed.read)(lane.row) else {
+                continue;
+            };
+            if id >= fed.vocab {
+                let why = match lane.instance {
+                    Some(instance) => format!(
+                        "instance {instance}: token {id} is out of range for a vocabulary of {}",
+                        fed.vocab
+                    ),
+                    None => format!(
+                        "token {id} is out of range for a vocabulary of {}",
+                        fed.vocab
+                    ),
+                };
+                tracing::warn!(row = lane.row, %why, "a device-fed token is out of range; its lanes fault");
+                outcome.fault_lanes(lane.lanes.clone(), lane.instance, &why);
+            }
+        }
+        *faults = Some(outcome.faulted);
+        fed.ready.notify_all();
+    }
+
+    /// The lanes the fed ids faulted, once the forward landed.
+    #[must_use]
+    pub fn faults(&self) -> Vec<engine::LaneFault> {
+        let fed = &*self.inner;
+        let mut faults = fed.faults.lock().expect("fed lock poisoned");
+        while faults.is_none() {
+            faults = fed.ready.wait(faults).expect("fed lock poisoned");
+        }
+        faults.clone().unwrap_or_default()
+    }
+
+    /// Waits until the forward's landing read the fed ids back: the arm's
+    /// token seat may be written again only then.
+    pub fn wait(&self) {
+        let _ = self.faults();
+    }
+}
+
+impl std::fmt::Debug for FedCheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FedCheck").field("lanes", &self.inner.lanes).finish()
+    }
+}
+
 /// `outcome` with the lanes `faulted` faulted beside its own; a lane it
 /// faulted already keeps its own reason.
 #[must_use]
@@ -243,6 +350,7 @@ mod tests {
             lanes: 4,
             faulted: Vec::new(),
             meet: Some(meet.clone()),
+            fed: None,
         }
     }
 
@@ -284,6 +392,47 @@ mod tests {
             assert_eq!(outcome.faulted[0].instance, Some(engine::InstanceId(9)));
             assert!(outcome.faulted[0].reason.contains("guard"));
         }
+    }
+
+    /// A device-fed lane whose embedded id is past the vocabulary faults its
+    /// own attachment's lanes by name once the forward landed; the other
+    /// fed lanes, in range, fault nothing.
+    #[test]
+    fn a_device_fed_id_past_the_vocabulary_faults_its_lanes_alone() {
+        use super::{FedCheck, FedLane};
+        let seat = [5u32, 7, 151_954, 9];
+        let lanes = (0..4u32)
+            .map(|row| FedLane {
+                row,
+                lanes: row..row + 1,
+                instance: Some(engine::InstanceId(100 + u64::from(row))),
+            })
+            .collect();
+        let fed = FedCheck::new(
+            Box::new(move |row| seat.get(row as usize).copied()),
+            lanes,
+            151_936,
+        );
+        let heard = Heard::default();
+        let meet = Meet::new();
+        let mut done = done(&meet, &heard);
+        done.meet = None;
+        done.fed = Some(fed.clone());
+        let landing = std::thread::spawn(move || fed.landed(true));
+        landing.join().expect("the landing");
+        done.tell(None, "test buffer");
+        let heard = heard.lock().unwrap();
+        let faulted: Vec<(u32, Option<engine::InstanceId>)> = heard[0]
+            .faulted
+            .iter()
+            .map(|fault| (fault.lane, fault.instance))
+            .collect();
+        assert_eq!(faulted, [(2, Some(engine::InstanceId(102)))]);
+        assert_eq!(
+            heard[0].faulted[0].reason,
+            "instance 102: token 151954 is out of range for a vocabulary of 151936"
+        );
+        assert_eq!(heard[0].wrote.len(), 1, "the other lanes' reports stand");
     }
 
     /// A forward the queue refused loses the whole step: every lane

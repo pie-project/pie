@@ -12,9 +12,9 @@ use engine::fire::{FireTicket, Step};
 use engine::transfer::MemoryDomain;
 use eta_ir::registry::{PortMask, Stage};
 
-use engine_gpu::api::{
-    Envelope, Host, PendingStep, attachment_lanes, each_pass, fault, program_attachments, refusal,
-};
+use engine_gpu::api::{Envelope, Host, PendingStep, each_pass, fault, program_attachments};
+#[cfg(feature = "vulkan")]
+use engine_gpu::api::{attachment_lanes, refusal};
 
 use crate::device::Api;
 use engine_gpu::serve::Landed;
@@ -84,7 +84,8 @@ impl Host for Api {
             // device, so nothing here waits.
             let wrote = std::mem::take(&mut step_pending.wrote);
             let faulted = std::mem::take(&mut step_pending.faulted);
-            defer_attachment(gpu, step, at, &landed, wrote, faulted)?;
+            let fed = step_pending.fed.take();
+            defer_attachment(gpu, step, at, &landed, wrote, faulted, fed)?;
             let shell = gpu.loaded_mut()?;
             shell.leave_unread(&landed);
             shell.forget_seat(&landed);
@@ -113,10 +114,14 @@ impl Host for Api {
             meet.guests_ran(faulted);
         } else if defers && let Some(sink) = gpu.sink.as_ref() {
             // The forward's own report was held for the sampler.
-            let held = engine::StepOutcome {
+            let mut held = engine::StepOutcome {
                 wrote: std::mem::take(&mut step_pending.wrote),
                 faulted: std::mem::take(&mut step_pending.faulted),
             };
+            // Its rows are read: the forward landed.
+            if let Some(fed) = step_pending.fed.take() {
+                held = merged(held, fed.faults());
+            }
             (sink)(at, merged(held, faulted));
         } else {
             // Told with the frame's settle, inside the submit.
@@ -147,7 +152,10 @@ impl Host for Api {
         faulted: &mut engine::StepOutcome,
     ) -> EngineResult<()> {
         let Vulkan {
-            shell, programs, ..
+            #[cfg(feature = "vulkan")]
+            shell,
+            programs,
+            ..
         } = gpu;
         let prologues: Vec<&engine::fire::Attachment> = program_attachments(step)
             .filter(|attachment| programs.prologue_runs(attachment.instance))
@@ -270,6 +278,7 @@ fn defer_attachment(
     landed: &Landed,
     wrote: Vec<engine::KvWrites>,
     faulted: Vec<engine::LaneFault>,
+    fed: Option<engine_gpu::settle::FedCheck>,
 ) -> EngineResult<()> {
     #[cfg(feature = "vulkan")]
     {
@@ -291,6 +300,7 @@ fn defer_attachment(
             lanes: u32::try_from(step.lanes.len()).unwrap_or(u32::MAX),
             faulted,
             meet: None,
+            fed,
         });
         programs
             .fire_deferred(
@@ -304,7 +314,7 @@ fn defer_attachment(
     }
     #[cfg(not(feature = "vulkan"))]
     {
-        let _ = (gpu, step, at, landed, wrote, faulted);
+        let _ = (gpu, step, at, landed, wrote, faulted, fed);
         Err(Error::unsupported("vulkan", "a deferred guest pass"))
     }
 }

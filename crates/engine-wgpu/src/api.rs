@@ -8,7 +8,9 @@ use engine::fire::{FireTicket, Step};
 use engine::transfer::MemoryDomain;
 use eta_ir::registry::PortMask;
 
-use engine_gpu::api::{Envelope, Host, PendingStep, program_attachments, refusal};
+use engine_gpu::api::{Envelope, Host, PendingStep, program_attachments};
+#[cfg(feature = "wgpu")]
+use engine_gpu::api::refusal;
 
 use crate::device::Api;
 
