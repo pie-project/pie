@@ -384,12 +384,13 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             |rows| rows,
         );
         let counts = crate::top::counts(&boot.trace)?;
+        let row_tile = crate::top::row_tile(&chip);
         let top = crate::top::choose(
             &rungs,
             after_weights,
             boot.context,
             &chip.rates(),
-            None,
+            Some(row_tile.clone()),
             device.name(),
             &counts,
         )?;
@@ -405,6 +406,10 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         );
         weighed = engine::load::estimate(&counts, &chip.rates())
             .ok()
+            .map(|mut estimate| {
+                estimate.rates = estimate.rates.with_row_tile(row_tile);
+                estimate
+            })
             .map(|estimate| crate::top::Weighed {
                 rungs: rungs.clone(),
                 estimate,

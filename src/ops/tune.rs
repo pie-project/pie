@@ -40,7 +40,6 @@ pub struct TuneArgs {
     #[arg(long)]
     pub refit: bool,
 
-
     /// Check the estimate the load weighs its top rung by: time a fire at
     /// each rung width of these models (by name or substring; the smallest
     /// imported artifact without one), to four times the fire top, through

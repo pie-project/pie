@@ -115,6 +115,32 @@ pub fn widest(rungs: &[RungFacts]) -> Option<u32> {
         .max()
 }
 
+/// The rows of the tile each dense bf16 product of `m x n x k` computes
+/// under `chip`, as `kernels_cuda::linear::gemm` selects its kernel: few
+/// rows a streaming skeleton covers (up to the rows skeleton's 16) stream
+/// the weight once a row and pad nothing; past them the tile of cuBLASLt's
+/// first heuristic algorithm at the shape (on ROCm, and where cuBLASLt names
+/// none, a row's own: nothing padded).
+#[must_use]
+pub fn row_tile(chip: &profile::Profile) -> engine::roofline::RowTile {
+    #[cfg(feature = "cuda")]
+    {
+        let tuning = kernels_cuda::tuning::Tuning::of(chip);
+        std::sync::Arc::new(move |m, n, k| {
+            if m <= kernels_cuda::linear::skeleton::ROWS_M {
+                1
+            } else {
+                kernels_cuda::linear::gemm::tile_rows(&tuning, m, n, k).unwrap_or(1)
+            }
+        })
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = chip;
+        std::sync::Arc::new(|_, _, _| 1)
+    }
+}
+
 /// The fire top of `rungs` (every rung of the lattice a load offers) a
 /// prompt of `context` holds, on `device`, whose profile states `rates`,
 /// over a live range of `live` bytes, each matmul padded to `row_tile`

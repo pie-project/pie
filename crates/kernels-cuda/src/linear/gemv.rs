@@ -5,19 +5,6 @@ use crate::linear::skeleton::{Epilogue, In, Paging};
 
 const GEMV: &str = "linear/gemv.cu";
 
-/// `out[n] = act . weight[n]` for one row: the gemv skeleton with the plain
-/// store filled in. The GEMM tuner's `Gemv` tactic.
-pub(crate) fn gemv_bf16(
-    ctx: &Ctx,
-    weight: u64,
-    act: u64,
-    out: u64,
-    n: i32,
-    k: i32,
-) -> Result<(), Error> {
-    gemv(ctx, Epilogue::store(), weight, act, &[], &[out], None, n, k)
-}
-
 /// The gemv skeleton's kernel for `epi` over `n` columns, and whether it splits
 /// each column's K over a block (`kernel.gemv.splitk_max_n` columns at
 /// most) and its warps a block. `kernel.gemv.bf16`: Blackwell profiles pick
