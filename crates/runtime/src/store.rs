@@ -8,6 +8,7 @@ pub(crate) mod rs;
 pub mod segments;
 pub mod shared;
 pub mod slots;
+pub(crate) mod waiting;
 pub mod weights;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

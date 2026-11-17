@@ -792,9 +792,24 @@ impl Registry {
                 }
                 None
             }
-            Event::Started(pid) => self
-                .set(pid, State::Running)
-                .map(|id| Edge::Started(id.to_string())),
+            Event::Waiting(pid, tokens) => {
+                let id = schedule::plex_id(pid);
+                if let Some(proc) = self.procs.get_mut(&id)
+                    && proc.state == State::Pending
+                {
+                    proc.cached_tokens = Some(tokens);
+                }
+                None
+            }
+            Event::Started(pid) => {
+                // Its fires count what they map in from here.
+                let id = schedule::plex_id(pid);
+                if let Some(proc) = self.procs.get_mut(&id) {
+                    proc.cached_tokens = None;
+                }
+                self.set(pid, State::Running)
+                    .map(|id| Edge::Started(id.to_string()))
+            }
             Event::Paused(pid) => self
                 .set(pid, State::Paused)
                 .map(|id| Edge::Paused(id.to_string())),

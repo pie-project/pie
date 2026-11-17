@@ -186,6 +186,9 @@ pub struct KvStore {
     /// Told when pages may have joined the cache: a fire's pages settle, or
     /// a working set is released and keeps its sealed prefix.
     cached: Arc<tokio::sync::Notify>,
+    /// Told when an entry joins or leaves the cache: what a lookup of a
+    /// waiting prompt's prefix finds may have changed.
+    changed: Arc<tokio::sync::Notify>,
     /// A persistent disk tier's journal, and the slots it names.
     persisted: Option<Persisted>,
     /// How many leading tokens each owner's props ask to keep on disk
@@ -424,6 +427,7 @@ impl KvStore {
             outstanding: BTreeSet::new(),
             moved: Arc::new(tokio::sync::Notify::new()),
             cached: Arc::new(tokio::sync::Notify::new()),
+            changed: Arc::new(tokio::sync::Notify::new()),
             persisted: None,
             hints: HashMap::new(),
             reclaimable: std::cell::Cell::new(None),
@@ -729,6 +733,7 @@ impl KvStore {
         let mut freed = 0;
         for key in keys {
             if let Some(entry) = self.cache.remove(&key) {
+                self.changed.notify_waiters();
                 self.unlist(key, entry.path.terminal);
                 self.splits.retain(|&(split, _)| split != key);
                 self.disown(&entry, by);
@@ -923,6 +928,7 @@ impl KvStore {
             self.kept += 1;
             self.list(self.kept, path.terminal);
             self.cache.insert(self.kept, KeptEntry { path, ..entry });
+            self.changed.notify_waiters();
         }
     }
 
@@ -1528,6 +1534,7 @@ impl KvStore {
                 decoded: false,
             },
         );
+        self.changed.notify_waiters();
         true
     }
 
@@ -1604,6 +1611,11 @@ impl KvStore {
     /// working set is released): arm it before looking.
     pub fn cached(&self) -> Arc<tokio::sync::Notify> {
         Arc::clone(&self.cached)
+    }
+
+    /// Told when an entry joins or leaves the cache: arm it before looking.
+    pub fn changed(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.changed)
     }
 
     /// Pages may have joined the cache.
@@ -1749,6 +1761,7 @@ impl KvStore {
                 decoded,
             },
         );
+        self.changed.notify_waiters();
     }
 
     pub fn owner_of(&self, ws: WorkingSetId) -> Option<ProcessId> {

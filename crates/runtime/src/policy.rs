@@ -88,6 +88,9 @@ pub(crate) enum Event {
     PropsChanged(ProcessId, Props, Vec<String>),
     /// One of its fires found this many tokens cached and mapped them in.
     Cached(ProcessId, u64),
+    /// While it waits for admission: the tokens of its prompt's prefix the
+    /// stores hold now ([`crate::store::waiting`]), in place of the last.
+    Waiting(ProcessId, u64),
     Kept(ProcessId, u64),
     CacheEmptied(ProcessId, By),
     Started(ProcessId),

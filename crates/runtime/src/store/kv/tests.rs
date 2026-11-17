@@ -1725,3 +1725,43 @@ fn idle_cache_last_read_long_ago_comes_back_past_the_fires_in_flight() {
     store.retire_idle();
     assert_eq!(store.available_pages(), 8, "and back once it retires");
 }
+
+/// A process waiting for admission whose prompt's prefix the store holds is
+/// told so before it runs; once that prefix is evicted, it is told it is
+/// gone, the store having said its cache changed.
+#[test]
+fn a_waiting_prompt_finds_its_cached_prefix_and_loses_it_when_evicted() {
+    use crate::policy::retention::FLOOR;
+    use crate::store::registry;
+    use crate::store::waiting::tests::{found, waits};
+    use futures::FutureExt;
+
+    let model = registry::register_model(16, &[16], &[1]);
+    let stores = registry::all_for_model(model);
+    let tokens: Vec<u32> = (0..64).map(|t| 700 + t).collect();
+    registry::with_kv_lock(&stores[0].kv, "test", |kv| {
+        sealed_and_gone(kv, &tokens, ProcessId::from_u128(70))
+    });
+
+    let waiter = ProcessId::from_u128(71);
+    waits(&stores, waiter, &tokens);
+    assert_eq!(
+        found(&stores, waiter),
+        Some(64),
+        "its four pages, before it runs"
+    );
+
+    let changed = registry::with_kv_lock(&stores[0].kv, "test", |kv| kv.changed());
+    let mut told = Box::pin(changed.notified());
+    told.as_mut().enable();
+    let dropped = registry::with_kv_lock(&stores[0].kv, "test", |kv| {
+        kv.reclaim_droppable(kv.current_epoch(), |_| FLOOR)
+    });
+    assert!(dropped > 0, "the prefix is evicted");
+    assert!(
+        told.now_or_never().is_some(),
+        "the store says its cache changed"
+    );
+    assert_eq!(found(&stores, waiter), Some(0), "and the waiter finds none");
+    crate::store::waiting::left(waiter);
+}

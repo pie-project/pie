@@ -31,6 +31,17 @@ pub const MAX_SESSION_BYTES: usize = 128;
 /// inferlet tokenizes.
 pub const PROMPT: &str = "prompt";
 
+/// A completion's prompt text exactly as the client sent it (the compat
+/// gateway sets it for `/v1/completions`): the runtime tokenizes it at
+/// arrival, as the compat inferlet will, to look its prefix up in the cache
+/// before the process is admitted.
+pub const RAW_PROMPT: &str = "raw-prompt";
+
+/// The prompt's token ids (an array of integers), as a program that has them
+/// states them at launch: the runtime looks their prefix up in the cache
+/// before the process is admitted.
+pub const PROMPT_TOKENS: &str = "prompt-tokens";
+
 /// The request's output limit, so the router has it before the inferlet runs.
 pub const MAX_TOKENS: &str = "max-tokens";
 
@@ -112,14 +123,31 @@ pub fn from_client(props: &mut Props) -> Result<(), String> {
                 "prop name '{name}' must be 1 to {MAX_NAME_BYTES} bytes"
             ));
         }
-        if let (PROMPT, Some(text)) = (name.as_str(), value.as_str()) {
+        if let (PROMPT | RAW_PROMPT, Some(text)) = (name.as_str(), value.as_str()) {
             if text.len() > MAX_PROMPT_BYTES {
                 return Err(format!(
-                    "prop '{PROMPT}' is {} bytes, limit {MAX_PROMPT_BYTES}",
+                    "prop '{name}' is {} bytes, limit {MAX_PROMPT_BYTES}",
                     text.len()
                 ));
             }
             continue;
+        }
+        if name == PROMPT_TOKENS {
+            match prompt_tokens(props) {
+                Some(tokens) if tokens.len() * 4 <= MAX_PROMPT_BYTES => continue,
+                Some(tokens) => {
+                    return Err(format!(
+                        "prop '{PROMPT_TOKENS}' is {} tokens, limit {}",
+                        tokens.len(),
+                        MAX_PROMPT_BYTES / 4
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "prop '{PROMPT_TOKENS}' must be an array of token ids"
+                    ));
+                }
+            }
         }
         bytes += name.len() + value.to_string().len();
     }
@@ -127,6 +155,18 @@ pub fn from_client(props: &mut Props) -> Result<(), String> {
         return Err(format!("props are {bytes} bytes, limit {MAX_PROPS_BYTES}"));
     }
     Ok(())
+}
+
+/// The token ids `prompt-tokens` states, if it is an array of them.
+#[must_use]
+pub fn prompt_tokens(props: &Props) -> Option<Vec<u32>> {
+    props
+        .0
+        .get(PROMPT_TOKENS)?
+        .as_array()?
+        .iter()
+        .map(|id| id.as_u64().and_then(|id| u32::try_from(id).ok()))
+        .collect()
 }
 
 /// English runs about four bytes a token.
