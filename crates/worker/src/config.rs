@@ -51,8 +51,34 @@ impl Config {
     ///
     /// Pure: no file IO, no env, no clap.
     pub fn parse(s: &str) -> Result<Self> {
-        let cfg: Config = toml::from_str(s).map_err(|e| anyhow::anyhow!("parse config: {e}"))?;
-        cfg.validate()?;
+        Self::parse_file(s, None)
+    }
+
+    /// [`Config::parse`] of the file at `path`: a key no section declares
+    /// is refused by the file, line and dotted key, to be deleted.
+    pub fn parse_file(s: &str, path: Option<&Path>) -> Result<Self> {
+        let at = |line: Option<usize>| {
+            let file = path.map_or_else(|| "config".to_string(), |p| p.display().to_string());
+            line.map_or(file.clone(), |line| format!("{file}:{line}"))
+        };
+        let cfg: Config = toml::from_str(s).map_err(|e| match unknown_field(e.message()) {
+            Some(field) => {
+                let start = e.span().map(|span| span.start);
+                let table = start.map(|start| table_at(s, start)).unwrap_or_default();
+                let line = start.map(|start| s[..start].matches('\n').count() + 1);
+                anyhow::anyhow!("{}: {}", at(line), unknown_key(&table, field))
+            }
+            None => anyhow::anyhow!("{}: {e}", at(None)),
+        })?;
+        cfg.validate()
+            .map_err(|e| match e.downcast_ref::<UnknownKey>() {
+                Some(UnknownKey { table, field }) => anyhow::anyhow!(
+                    "{}: {}",
+                    at(line_of(s, table, field)),
+                    unknown_key(table, field)
+                ),
+                None => e,
+            })?;
         Ok(cfg)
     }
 
@@ -400,6 +426,81 @@ fn default_scratch_dir() -> PathBuf {
 }
 fn default_network_allowed_hosts() -> Vec<String> {
     vec!["*".to_string()]
+}
+
+/// A key no section of the config declares: in `table` (dotted, empty at
+/// the top), named `field`.
+#[derive(Debug)]
+struct UnknownKey {
+    table: String,
+    field: String,
+}
+
+impl std::fmt::Display for UnknownKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&unknown_key(&self.table, &self.field))
+    }
+}
+
+impl std::error::Error for UnknownKey {}
+
+/// The refusal of an unknown key, whatever key it is.
+fn unknown_key(table: &str, field: &str) -> String {
+    let key = if table.is_empty() {
+        field.to_string()
+    } else {
+        format!("{table}.{field}")
+    };
+    format!("unknown key `{key}`; delete it (it isn't a setting)")
+}
+
+/// The field a deserializer's "unknown field" error names.
+fn unknown_field(message: &str) -> Option<&str> {
+    message.strip_prefix("unknown field `")?.split('`').next()
+}
+
+/// The table (dotted) a TOML document's byte `at` lies in: the last header
+/// before it.
+fn table_at(text: &str, at: usize) -> String {
+    let mut table = String::new();
+    for line in text[..at.min(text.len())].lines() {
+        if let Some(header) = header(line) {
+            table = header;
+        }
+    }
+    table
+}
+
+/// The table a header line opens, `[a.b]` or `[[a.b]]`.
+fn header(line: &str) -> Option<String> {
+    let line = line.trim();
+    let inner = line
+        .strip_prefix("[[")
+        .and_then(|l| l.strip_suffix("]]"))
+        .or_else(|| line.strip_prefix('[').and_then(|l| l.strip_suffix(']')))?;
+    Some(
+        inner
+            .split('.')
+            .map(str::trim)
+            .collect::<Vec<_>>()
+            .join("."),
+    )
+}
+
+/// The line (from 1) where `field` is stated in `table`.
+fn line_of(text: &str, table: &str, field: &str) -> Option<usize> {
+    let mut current = String::new();
+    for (at, line) in text.lines().enumerate() {
+        if let Some(header) = header(line) {
+            current = header;
+            continue;
+        }
+        let stated = line.split('=').next().map(str::trim);
+        if current == table && stated == Some(field) {
+            return Some(at + 1);
+        }
+    }
+    None
 }
 
 /// `[model] rope_scaling`: the YaRN a deployment stretches its model's
@@ -952,11 +1053,15 @@ impl EngineConfig {
     pub fn options_as<T: serde::de::DeserializeOwned>(&self) -> Result<T> {
         toml::Value::Table(self.options.clone())
             .try_into()
-            .map_err(|e: toml::de::Error| {
-                anyhow::anyhow!(
+            .map_err(|e: toml::de::Error| match unknown_field(e.message()) {
+                Some(field) => anyhow::Error::new(UnknownKey {
+                    table: "engine".to_string(),
+                    field: field.to_string(),
+                }),
+                None => anyhow::anyhow!(
                     "invalid [engine] options for engine type {:?}: {e}",
                     self.kind,
-                )
+                ),
             })
     }
 
@@ -1167,13 +1272,48 @@ device = ["metal:0"]
     /// Nothing reads a compute dtype from the config: a file that states
     /// one is refused as it would be for any key no struct declares.
     fn activation_dtype_is_an_unknown_key() {
+        let file = std::path::Path::new("/etc/pie/config.toml");
+        // An engine's own key, read through its options struct: lines 6-9
+        // are `[engine]`, `type`, `device`, the dropped key.
+        let err = Config::parse_file(
+            &MINIMAL_METAL.replace(
+                "device = [\"metal:0\"]",
+                "device = [\"metal:0\"]\nactivation_dtype = \"bfloat16\"",
+            ),
+            Some(file),
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            err,
+            "/etc/pie/config.toml:9: unknown key `engine.activation_dtype`; delete it (it \
+             isn't a setting)"
+        );
+        // Any other section's: the deserializer's own span.
+        let err = Config::parse_file(
+            &MINIMAL_METAL.replace(
+                "source = \"Qwen/Qwen3-0.6B\"",
+                "source = \"Qwen/Qwen3-0.6B\"\nmax_contxt = 8",
+            ),
+            Some(file),
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            err,
+            "/etc/pie/config.toml:5: unknown key `model.max_contxt`; delete it (it isn't a \
+             setting)"
+        );
         let err = Config::parse(&MINIMAL_METAL.replace(
-            "device = [\"metal:0\"]",
-            "device = [\"metal:0\"]\nactivation_dtype = \"bfloat16\"",
+            "[engine]",
+            "[engine.memory]\nbudget_dev = \"1GiB\"\n[engine]",
         ))
         .unwrap_err()
         .to_string();
-        assert!(err.contains("unknown field `activation_dtype`"), "{err}");
+        assert!(
+            err.starts_with("config:7: unknown key `engine.memory.budget_dev`"),
+            "{err}"
+        );
         Config::parse(MINIMAL_METAL).expect("without it, the file loads");
     }
 

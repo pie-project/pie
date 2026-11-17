@@ -44,7 +44,7 @@ async fn main() -> anyhow::Result<ExitCode> {
         cli.global,
     )?;
 
-    let mut cfg = worker::Config::parse(ctx.config_str())?;
+    let mut cfg = worker::Config::parse_file(ctx.config_str(), Some(ctx.config_path()))?;
     if let Some(listen) = cli.listen {
         cfg.server.listen = listen;
     }
@@ -59,15 +59,21 @@ async fn main() -> anyhow::Result<ExitCode> {
     let handle = worker::run(cfg, &pie::paths::pie_home()).await?;
     // SIGHUP swaps the worker policy for the file's `[runtime] worker_policy`;
     // nothing else in it is read again, and the worker serves on.
-    ctx.on_hangup(|config| async move {
-        match worker::Config::parse(&config) {
-            Ok(config) => {
-                if let Err(e) = worker::reload_policy(&config).await {
-                    tracing::error!("SIGHUP: {e:#}");
+    let path = ctx.config_path().to_path_buf();
+    ctx.on_hangup(move |config| {
+        let path = path.clone();
+        async move {
+            match worker::Config::parse_file(&config, Some(&path)) {
+                Ok(config) => {
+                    if let Err(e) = worker::reload_policy(&config).await {
+                        tracing::error!("SIGHUP: {e:#}");
+                    }
                 }
-            }
-            Err(e) => {
-                tracing::error!("SIGHUP: the config does not parse, so the policy stands: {e:#}")
+                Err(e) => {
+                    tracing::error!(
+                        "SIGHUP: the config does not parse, so the policy stands: {e:#}"
+                    )
+                }
             }
         }
     });
