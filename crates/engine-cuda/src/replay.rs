@@ -4,7 +4,7 @@
 //! (unannounced; the replay floor op stamps where decoder windows start), then
 //! the step with each prompt cut to its last window.
 
-use engine::fire::{Readout, RsReset, RsVerb, Step};
+use engine::fire::{ListKind, Readout, RsReset, RsVerb, Step};
 use poem_ir::{Attn, Builtin, Fact, Fused, Operation};
 
 use crate::serve::Shell;
@@ -62,20 +62,15 @@ impl Replay {
 
     /// `step` as the encoder-only step to fire first and the step to fire
     /// after it, where a lane of it is a prompt longer than the window;
-    /// `None` where none is. `plain` says whether a word is a plain lane's, attending one way;
-    /// `placed`, whether each lane's program places its rows (device geometry), which no cut
-    /// moves.
+    /// `None` where none is. `plain` says whether a word is a plain lane's, attending one way.
+    /// A lane whose list table is a translation (its program places its rows, device
+    /// geometry) is never cut.
     #[must_use]
-    pub fn split(
-        self,
-        step: &Step,
-        plain: impl Fn(u64) -> bool,
-        placed: &[bool],
-    ) -> Option<(Step, Step)> {
+    pub fn split(self, step: &Step, plain: impl Fn(u64) -> bool) -> Option<(Step, Step)> {
         let window = self.window as usize;
         let cuts: Vec<Option<usize>> = (0..step.lanes.len())
             .map(|at| {
-                (!placed.get(at).copied().unwrap_or(false) && self.cuts(step, at, &plain))
+                self.cuts(step, at, &plain)
                     .then(|| step.lanes[at].tokens.len() - window)
             })
             .collect();
@@ -126,6 +121,7 @@ impl Replay {
             && matches!(lane.rs, RsVerb::Fold)
             && lane.inputs.is_empty()
             && !lane.kv_less
+            && lane.list == ListKind::Pages
             && lane
                 .tables
                 .iter()
@@ -143,7 +139,7 @@ impl Replay {
 #[cfg(test)]
 mod tests {
     use super::{LIST, Replay};
-    use engine::fire::{KvDelta, Lane, Readout, RsReset, Step};
+    use engine::fire::{KvDelta, Lane, ListKind, Readout, RsReset, Step};
 
     fn prompt(slot: u32, rows: u32, held: u32) -> Lane {
         Lane {
@@ -178,7 +174,7 @@ mod tests {
             ..Step::default()
         };
         let (head, tail) = replay
-            .split(&step, |word| word & replay.bit == 0, &[])
+            .split(&step, |word| word & replay.bit == 0)
             .expect("two prompts are longer than the window");
         assert_eq!(head.lanes.len(), 2);
         assert!(head.attachments.is_empty());
@@ -219,10 +215,21 @@ mod tests {
             lanes: vec![read],
             ..Step::default()
         };
-        assert!(
-            replay
-                .split(&step, |word| word & replay.bit == 0, &[])
-                .is_none()
-        );
+        assert!(replay.split(&step, |word| word & replay.bit == 0).is_none());
+    }
+
+    #[test]
+    fn a_lane_whose_list_is_a_translation_is_left_whole() {
+        let replay = Replay {
+            bit: 0b100,
+            window: 128,
+        };
+        let mut placed = prompt(3, 300, 0);
+        placed.list = ListKind::Translation;
+        let step = Step {
+            lanes: vec![placed],
+            ..Step::default()
+        };
+        assert!(replay.split(&step, |word| word & replay.bit == 0).is_none());
     }
 }

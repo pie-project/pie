@@ -238,11 +238,9 @@ impl Cuda {
         if let Some((replay, shell)) = self.replay.zip(self.shell.as_ref())
             && frame.steps.iter().any(|step| {
                 replay
-                    .split(
-                        step,
-                        |word| shell.trace().facts.plain(word) && !shell.wide(word),
-                        &shell.placed_lanes(step),
-                    )
+                    .split(step, |word| {
+                        shell.trace().facts.plain(word) && !shell.wide(word)
+                    })
                     .is_some()
             })
         {
@@ -1331,11 +1329,9 @@ impl Cuda {
                 .replay
                 .zip(self.shell.as_ref())
                 .and_then(|(replay, shell)| {
-                    replay.split(
-                        step,
-                        |word| shell.trace().facts.plain(word) && !shell.wide(word),
-                        &shell.placed_lanes(step),
-                    )
+                    replay.split(step, |word| {
+                        shell.trace().facts.plain(word) && !shell.wide(word)
+                    })
                 });
             if let Some((head, _)) = &split
                 && let Err(error) = self.fire_step(head, at, false)
