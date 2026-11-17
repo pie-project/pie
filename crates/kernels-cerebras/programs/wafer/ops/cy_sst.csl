@@ -17,6 +17,12 @@
 // norm; decay = exp(-exp(A) softplus(dt + dt_bias)), the step dt' = softplus(dt + dt_bias);
 // delta = dt' x; o = decay Sᵀ C + (B . C) delta + D x (D, the head's skip, cw's after A, dt).
 //
+// KDA (Kimi's delta attention, the same column): the row [q | k | v | b | f] (f the head's forget
+// logits, DK: a decay a key channel), cw's dt_bias DK wide; the conv, norms and beta as the delta
+// rule's (the norms' eps L2EPS); decay_i = exp(g_i), g_i = -exp(A) softplus(f_i + dt_i), or with
+// FLOOR (non-zero) g_i = FLOOR sigmoid(exp(A) (f_i + dt_i)); [decay k | decay q | k] down and
+// [delta | decay] for the update, each a key's decay (ops/sst.csl's one form).
+//
 // SLOTS: a conv history a lane slot (row t of a step steps slot rowp[3 t + 1], cleared first at
 // its position 0).
 //
@@ -32,11 +38,15 @@ param CONV: u16 = 4;
 param SLOTS: u16 = 1;
 param ROWS: u16 = 1;
 param MAMBA: bool = false;
+param KDA: bool = false;
+param FLOOR: f32 = 0.0;
+param L2EPS: f32 = 1.0e-6;
 
 const NCH: u16 = 2 * DK + DV;
-const L2EPS: f32 = 1.0e-6;
-// the taps, A, dt_bias (and MAMBA's D and a bias a channel)
-const CW: u16 = NCH * CONV + 2 + (if (MAMBA) 1 + NCH else 0);
+// the decay's logits a row (a head's, or a key's under KDA)
+const AW: u16 = if (KDA) DK else 1;
+// the taps, A, dt_bias (a key's under KDA; and MAMBA's D and a bias a channel)
+const CW: u16 = NCH * CONV + 1 + AW + (if (MAMBA) 1 + NCH else 0);
 var cw = @zeros([CW]f32);
 const HW: u16 = (CONV - 1) * NCH;
 var hist = @zeros([SLOTS * HW]f32);
@@ -46,10 +56,12 @@ var y = @zeros([NCH]f32);
 var sk: [2 * DV]f32 align(16) = @zeros([2 * DV]f32);
 var dd: [DV + DK]f32 align(16) = @zeros([DV + DK]f32);
 var kt: [2 * DK]f32 align(16) = @zeros([2 * DK]f32);
+var dk: [DK]f32 align(16) = @zeros([DK]f32);
 const y_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NCH} -> y[i] });
 const sk_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2 * DV} -> sk[i] });
 const dd_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DV + DK} -> dd[i] });
 const kt_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2 * DK} -> kt[i] });
+const dk_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DK} -> dk[i] });
 
 // A sequence's first step: the conv's history cleared.
 fn init() void { clear(0); }
@@ -68,7 +80,7 @@ fn row(t: u16, x: [*]f32, o: [*]f32) void {
   hb = 0;
 }
 
-// One step: x [q | k | v | b | a] (NCH + 2 f32) in, o (DV f32) out.
+// One step: x [q | k | v | b | a] (NCH + 1 + AW f32) in, o (DV f32) out.
 fn step(x: [*]f32, o: [*]f32) void {
   // the conv over the history (oldest first) and this row, its SiLU; the history shifted
   var c: u16 = 0;
@@ -97,12 +109,30 @@ fn step(x: [*]f32, o: [*]f32) void {
   var kq: f32 = 0.0;
   while (i < DK) : (i += 1) { kq += y[i] * y[DK + i]; }
   const beta = math.sigm(x[NCH]);
-  const step = math.softplus(x[NCH + 1] + cw[NCH * CONV + 1]);
-  const decay = math.exp1(-math.exp1(cw[NCH * CONV]) * step);
-  // [decay k | decay q | k] down, [Σ decay k_i S_i | Σ decay q_i S_i] up
+  var step: f32 = 0.0;
+  var decay: f32 = 0.0;
   const kk_d = @increment_dsd_offset(@set_dsd_length(y_d, DK), @as(i16, DK), f32);
-  @fmuls(@set_dsd_length(kt_d, DK), kk_d, decay);
-  @fmuls(@increment_dsd_offset(@set_dsd_length(kt_d, DK), @as(i16, DK), f32), @set_dsd_length(y_d, DK), decay);
+  if (KDA) {
+    // a decay a key channel
+    const alpha = math.exp1(cw[NCH * CONV]);
+    i = 0;
+    while (i < DK) : (i += 1) {
+      const z = x[NCH + 1 + i] + cw[NCH * CONV + 1 + i];
+      if (FLOOR != 0.0) {
+        dk[i] = math.exp1(FLOOR * math.sigm(alpha * z));
+      } else {
+        dk[i] = math.exp1(-alpha * math.softplus(z));
+      }
+    }
+    @fmuls(@set_dsd_length(kt_d, DK), kk_d, dk_d);
+    @fmuls(@increment_dsd_offset(@set_dsd_length(kt_d, DK), @as(i16, DK), f32), @set_dsd_length(y_d, DK), dk_d);
+  } else {
+    step = math.softplus(x[NCH + 1] + cw[NCH * CONV + 1]);
+    decay = math.exp1(-math.exp1(cw[NCH * CONV]) * step);
+    @fmuls(@set_dsd_length(kt_d, DK), kk_d, decay);
+    @fmuls(@increment_dsd_offset(@set_dsd_length(kt_d, DK), @as(i16, DK), f32), @set_dsd_length(y_d, DK), decay);
+  }
+  // [decay k | decay q | k] down, [Σ decay k_i S_i | Σ decay q_i S_i] up
   @fmovs(fab.fout(YO, 2 * DK), kt_d);
   @fmovs(fab.fout(YO, DK), kk_d);
   @fmovs(sk_d, fab.fin(IN, 2 * DV));
@@ -118,7 +148,11 @@ fn step(x: [*]f32, o: [*]f32) void {
       o[i] = sk[DV + i] + kq * d;
     }
   }
-  i = 0;
-  while (i < DK) : (i += 1) { dd[DV + i] = decay; }
+  if (KDA) {
+    @fmovs(@increment_dsd_offset(@set_dsd_length(dd_d, DK), @as(i16, DV), f32), dk_d);
+  } else {
+    i = 0;
+    while (i < DK) : (i += 1) { dd[DV + i] = decay; }
+  }
   @fmovs(fab.fout(YO, DV + DK), dd_d);
 }

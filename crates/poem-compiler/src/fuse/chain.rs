@@ -704,10 +704,13 @@ fn lowers_explicitly(op: &Operation) -> bool {
             up: None,
             weights: None,
             limit: None,
-            act: GluAct::Swiglu | GluAct::GegluTanh,
+            act: GluAct::Swiglu | GluAct::GegluTanh | GluAct::Situ { .. },
             ..
-        }) | Operation::Elemwise(Elemwise::Standardize { .. } | Elemwise::RmsnormGated { .. })
-            | Operation::Linear(Linear::MoeSigmoidGateAdd { .. } | Linear::Relu2 { .. })
+        }) | Operation::Elemwise(
+            Elemwise::Standardize { .. }
+                | Elemwise::RmsnormGated { .. }
+                | Elemwise::RmsnormGatedBy { .. }
+        ) | Operation::Linear(Linear::MoeSigmoidGateAdd { .. } | Linear::Relu2 { .. })
     )
 }
 
@@ -1062,10 +1065,19 @@ fn lower_with(trace: &Trace, run: &[u32], escapes: &Escapes, explicit: bool) -> 
                     return None;
                 }
             }
+            // (a table of one row read whole, no ids picking it: the row every row reads,
+            // AttnRes's projection)
+            let one_row = matches!(form, Form::Table { .. })
+                && read.by.is_none()
+                && !read.half
+                && matches!(
+                    &trace.values[v.0 as usize].ty,
+                    Ty::Tensor { shape, .. } if matches!(shape.first(), Some(Dim::Const(1)))
+                );
             ins.push(In {
                 value: v,
                 dtype: dtype_of(trace, v),
-                shared: matches!(form, Form::Shared { .. }),
+                shared: matches!(form, Form::Shared { .. }) || one_row,
                 one: matches!(form, Form::One),
                 each: (matches!(form, Form::Each) && !read.half) || read.elem,
                 by: read.by,
@@ -1164,6 +1176,10 @@ fn part(trace: &Trace, run: &[u32], width: u32) -> Option<u32> {
             })
             | Operation::Elemwise(Elemwise::Rope { head_dim: head, .. })
             | Operation::Elemwise(Elemwise::RmsnormGated { head_dim: head, .. }) => Some(*head),
+            // (its heads by count: the row's width over them)
+            Operation::Elemwise(Elemwise::RmsnormGatedBy { heads, .. }) => {
+                (*heads > 0 && width.is_multiple_of(*heads)).then(|| width / heads)
+            }
             Operation::Elemwise(
                 Elemwise::ResidualAdd { gate: None, .. }
                 | Elemwise::Binary { .. }
@@ -1373,7 +1389,28 @@ impl Builder {
                         self.push(Op::Binary(Binary::Mul, gate, s))
                     }
                     GluAct::GegluTanh => self.gelu_tanh(gate),
+                    // Kimi's SiTU: `beta tanh(gate / beta) sigmoid(gate)`, the up capped as
+                    // `cap tanh(up / cap)` where stated
+                    GluAct::Situ { beta, .. } if beta > 0.0 => {
+                        let (b, ib) = (self.konst(beta), self.konst(1.0 / beta));
+                        let gb = self.push(Op::Binary(Binary::Mul, gate, ib));
+                        let t = self.tanh(gb);
+                        let bt = self.push(Op::Binary(Binary::Mul, b, t));
+                        let s = self.sigmoid(gate);
+                        self.push(Op::Binary(Binary::Mul, bt, s))
+                    }
                     _ => return None,
+                };
+                let up = match act {
+                    GluAct::Situ {
+                        up_cap: Some(cap), ..
+                    } if cap > 0.0 => {
+                        let (c, ic) = (self.konst(cap), self.konst(1.0 / cap));
+                        let uc = self.push(Op::Binary(Binary::Mul, up, ic));
+                        let t = self.tanh(uc);
+                        self.push(Op::Binary(Binary::Mul, c, t))
+                    }
+                    _ => up,
                 };
                 let out = self.push(Op::Binary(Binary::Mul, gated, up));
                 self.set(y, out);
@@ -1501,6 +1538,41 @@ impl Builder {
                     poem_ir::GateActivation::Silu => self.push(Op::Binary(Binary::Mul, g, s)),
                 };
                 let out = self.push(Op::Binary(Binary::Mul, n, a));
+                self.set(*y, out);
+            }
+            // A gated norm by its head count (Kimi's KDA output): each head normed, times its
+            // weight, times the gate's sigmoid.
+            Elemwise::RmsnormGatedBy {
+                x,
+                gate,
+                weight,
+                heads,
+                eps,
+                y,
+            } => {
+                // (a head of the row `x` is: the region a head where the run is cut so)
+                let row = match form(trace, *x) {
+                    Some(Form::Rows { width, .. }) => u32::try_from(width).ok()?,
+                    _ => return None,
+                };
+                if *heads == 0 || !row.is_multiple_of(*heads) {
+                    return None;
+                }
+                let (width, head) = (self.width, row / heads);
+                if !width.is_multiple_of(head) {
+                    return None;
+                }
+                let x = self.get(*x)?;
+                let mut n = if head == width {
+                    self.rms_normed(x, *eps)
+                } else {
+                    self.b.rms_normed_heads(x, head, *eps)
+                };
+                let w = self.get(*weight)?;
+                n = self.push(Op::Binary(Binary::Mul, n, w));
+                let g = self.get(*gate)?;
+                let s = self.sigmoid(g);
+                let out = self.push(Op::Binary(Binary::Mul, n, s));
                 self.set(*y, out);
             }
             // A head as wide as the row is the row's norm.

@@ -185,6 +185,28 @@ pub struct State {
     /// skip, `bias` the conv's a channel.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mamba: Option<Mamba>,
+    /// Kimi's delta attention in place of Gated DeltaNet's (ops/cy_sst.csl's KDA): a decay a key
+    /// channel (`a` its forget logits, `head_dim` a head; `dt` the same).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kda: Option<Kda>,
+}
+
+/// Kimi's delta attention's own parameters of a state column ([`State::kda`]).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct Kda {
+    pub head_dim: u32,
+    /// The norms' eps (q's and k's l2 norms).
+    pub eps: f32,
+    /// The decay's floor (`g = floor sigmoid(..)`), 0 where unbounded.
+    pub floor: f32,
+}
+
+impl State {
+    /// The decay logits a head root takes: one (a head's), or a key's each under KDA.
+    #[must_use]
+    pub fn a_width(&self) -> u32 {
+        self.kda.map_or(1, |k| k.head_dim)
+    }
 }
 
 /// Mamba-2's own parameters of a state column ([`State::mamba`]).
@@ -1150,6 +1172,7 @@ pub fn lower_through(
                         q_from: inner + g * n,
                         v_dim: p,
                         mamba: Some(super::unit::Mamba { d: *d, bias: *cb }),
+                        kda: None,
                     }),
                     sink: None,
                     kv_rep: 1,
@@ -1230,6 +1253,111 @@ pub fn lower_through(
                         .copied()
                         .find(|&n| n > at && pick(&trace.nodes[n as usize].op))
                 };
+                // Kimi's delta attention: a gated delta rule of a decay a key channel
+                if let Some(kn) = find(
+                    &|op| matches!(op, Operation::Ssm(Ssm::Kda { mixed, .. }) if mixed == conv_y),
+                ) {
+                    let Operation::Ssm(Ssm::Kda {
+                        f,
+                        b,
+                        dt_bias,
+                        a_log,
+                        heads,
+                        head_dim,
+                        norm_eps,
+                        gate_floor,
+                        y,
+                        ..
+                    }) = &trace.nodes[kn as usize].op
+                    else {
+                        unreachable!()
+                    };
+                    skip.insert(kn);
+                    let (h, d) = (*heads, *head_dim);
+                    let xc = r.cols(*x);
+                    let bc = r.cols(*b);
+                    for c in [xc, bc] {
+                        if side_of(&sides, c) != Some(Side::Col) {
+                            return Err(refuse_at("reads a value not at the column roots"));
+                        }
+                    }
+                    // the forget logits (a low-rank projection's, at the row roots) to the
+                    // column roots: a constant matvec (one where its output is its input)
+                    let mut fc = r.cols(*f);
+                    match side_of(&sides, fc) {
+                        Some(Side::Col) => {}
+                        Some(Side::Row) => {
+                            let moved = super::mamba::synth(kn, super::mamba::Kind::Moved);
+                            steps.push(Step::Matvec {
+                                node: kn,
+                                from: Side::Row,
+                                input: fc,
+                                weight: ValueId(super::host::UNIT),
+                                view: View::Spread { rep: 1 },
+                                output: moved,
+                                k: h * d,
+                                n: h * d,
+                                x32: true,
+                                round: false,
+                            });
+                            sides.insert(moved, Side::Col);
+                            fc = Cols {
+                                base: moved,
+                                from: 0,
+                                width: h * d,
+                            };
+                        }
+                        None => return Err(refuse_at("reads forget logits on no roots")),
+                    }
+                    let q = Cols { width: h * d, ..xc };
+                    let k = Cols {
+                        from: xc.from + h * d,
+                        width: h * d,
+                        ..xc
+                    };
+                    let v = Cols {
+                        from: xc.from + 2 * h * d,
+                        width: h * d,
+                        ..xc
+                    };
+                    joint = Some(Joint {
+                        q_heads: h,
+                        kv_heads: h,
+                        head_dim: d,
+                        scale: 1.0,
+                        causal: true,
+                        window: None,
+                        state: Some(State {
+                            b: Cols { width: h, ..bc },
+                            a: fc,
+                            conv: *weight,
+                            taps: *conv_width,
+                            a_log: *a_log,
+                            dt: *dt_bias,
+                            k_from: h * d,
+                            v_from: 2 * h * d,
+                            ratio: 1,
+                            q_from: 0,
+                            v_dim: 0,
+                            mamba: None,
+                            kda: Some(Kda {
+                                head_dim: d,
+                                eps: *norm_eps,
+                                floor: *gate_floor,
+                            }),
+                        }),
+                        sink: None,
+                        kv_rep: 1,
+                    });
+                    steps.push(Step::Store { q, k, v });
+                    sides.insert(*y, Side::Col);
+                    steps.push(Step::Attend {
+                        out: *y,
+                        round: r.round(*y),
+                    });
+                    i += 1;
+                    continue;
+                }
                 let gd = find(&|op| {
                     matches!(op, Operation::Ssm(Ssm::GatedDelta { qkv, .. }) if qkv == conv_y)
                 })
@@ -1317,6 +1445,7 @@ pub fn lower_through(
                         q_from: 0,
                         v_dim: 0,
                         mamba: None,
+                        kda: None,
                     }),
                     sink: None,
                     kv_rep: 1,

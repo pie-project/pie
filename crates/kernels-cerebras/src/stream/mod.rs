@@ -211,7 +211,11 @@ pub fn shape(trace: &Trace, reading: &str, classes: &[RowClass]) -> R<StreamShap
             Operation::Linear(Linear::Glu {
                 intermediate, act, ..
             }) if glu.is_none() => {
-                glu = Some((*intermediate, crate::target::act(act).map_err(refuse)?));
+                // (an activation the templates run none of, Kimi's SiTU, the regions print
+                // alone: the shape states no MLP)
+                if !matches!(act, poem_ir::GluAct::Situ { .. }) {
+                    glu = Some((*intermediate, crate::target::act(act).map_err(refuse)?));
+                }
             }
             Operation::Linear(Linear::Matmul {
                 input_scales,
@@ -627,5 +631,36 @@ mod tests {
     #[test]
     fn a_reading_the_poem_does_not_run_is_refused() {
         assert!(shape_of(&trace("flux2-mini-bf16-kv-bf16"), "vae.decode", 64).is_err());
+    }
+
+    /// Kimi-K3's KDA layer (the simulator's model) lowers to a stream unit's state column a
+    /// head: cy_sst's KDA (a decay a key channel, the release's gate floor), the forget logits
+    /// moved to the column roots, its state root a `kda` region a lane slot.
+    #[test]
+    fn a_kda_layer_is_a_state_column_a_head() {
+        let dir = std::env::temp_dir().join(format!("pie-kda-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let t = trace("kimik3-tiny-bf16-mxfp4-kv-bf16");
+        let p = compile_decode(&t, 64, 1, true, &dir).unwrap_or_else(|e| panic!("{e}"));
+        let j =
+            p.kv.first()
+                .and_then(|ks| ks.units.first())
+                .and_then(|&u| p.units[u].unit.joint);
+        let st = j.and_then(|j| j.state).expect("a state column");
+        let k = st.kda.expect("KDA's");
+        assert_eq!((k.head_dim, k.floor, st.a_width()), (128, -5.0, 128));
+        let root = std::fs::read_to_string(dir.join("sr_0.csl")).expect("the state root");
+        assert!(
+            root.contains(".KDA = true, .FLOOR = -5.0, .L2EPS = 1e-5"),
+            "{root}"
+        );
+        let host: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("host.json")).expect("host"))
+                .expect("json");
+        let kinds: Vec<&str> = (host["state"]["regions"].as_array().into_iter().flatten())
+            .filter_map(|r| r["kind"].as_str())
+            .collect();
+        assert_eq!(kinds, ["kda", "kda"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

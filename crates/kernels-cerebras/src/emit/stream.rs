@@ -552,7 +552,7 @@ pub fn emit(p: &Program) -> R<Emitted> {
                 (st.conv.0, kc_ * t, d * t),
                 (st.conv.0, vc * t, dv * t),
                 (st.a_log.0, h, 1),
-                (st.dt.0, h, 1),
+                (st.dt.0, h * st.a_width(), st.a_width()),
             ];
             // Mamba-2's: its head's skip, its channels' conv bias
             if let Some(m) = st.mamba {
@@ -1786,8 +1786,9 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
                 ];
                 // a recurrence's head: its beta and decay logits after them
                 if let Some(st) = j.state {
+                    let aw = st.a_width();
                     parts.push((st.b, st.b.from + idx, 1));
-                    parts.push((st.a, st.a.from + idx, 1));
+                    parts.push((st.a, st.a.from + idx * aw, aw));
                 }
                 for (c, f, len) in parts {
                     for (_, src, m) in g.pieces(c.base, f, len)? {
@@ -2525,6 +2526,7 @@ pub fn state_root(p: &Program, arrays: &[HostArray]) -> Option<super::state::Sta
         regions.push(Region {
             kind: match state {
                 Some(st) if st.mamba.is_some() => "mamba2".into(),
+                Some(st) if st.kda.is_some() => "kda".into(),
                 Some(_) => "gdn".into(),
                 None => "kv".into(),
             },
@@ -2702,13 +2704,16 @@ fn st_root_file(p: &Program, k: usize, ks: &place::KvSched) -> R<(String, String
         t,
         "const cy = @import_module(\"ops/cy_sst.csl\", .{{ .fab = fab, .math = math, .YO = q_am, .IN = q_ar, .DK = {d}, .DV = {dv}, .CONV = {}, .SLOTS = {n_rows}, .ROWS = {n_rows}{} }});",
         st.taps,
-        if st.mamba.is_some() {
-            ", .MAMBA = true"
-        } else {
-            ""
+        match (st.mamba, st.kda) {
+            (Some(_), _) => ", .MAMBA = true".to_string(),
+            (None, Some(k)) => format!(
+                ", .KDA = true, .FLOOR = {:?}, .L2EPS = {:?}",
+                k.floor, k.eps
+            ),
+            (None, None) => String::new(),
         }
     );
-    let sw = 2 * d + dv + 2;
+    let sw = 2 * d + dv + 1 + st.a_width();
     t.push_str(&buf("sx", sw));
     t.push_str(&buf("ob", dv));
     // a decode step's rows each a lane's (its state slot's history; `rowp`, the host's)

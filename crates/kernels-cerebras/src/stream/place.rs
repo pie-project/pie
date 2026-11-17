@@ -351,10 +351,11 @@ fn layout_with(r: &Reader, u: &Unit, py: u32, rest: u32) -> Option<Layout> {
                                 h as usize,
                                 Slice::of(st.b.base, st.b.from + h, 1),
                             );
+                            let aw = st.a_width();
                             push(
                                 &mut cols,
                                 h as usize,
-                                Slice::of(st.a.base, st.a.from + h, 1),
+                                Slice::of(st.a.base, st.a.from + h * aw, aw),
                             );
                         }
                     }

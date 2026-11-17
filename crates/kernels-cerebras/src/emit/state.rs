@@ -25,8 +25,8 @@ pub struct Pages {
 /// One region of state.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Region {
-    /// What it holds (`kv`: a K / V cache of positions; `gdn`, `mamba2`: a recurrence's state a
-    /// slot), as the compiler names it.
+    /// What it holds (`kv`: a K / V cache of positions; `gdn`, `kda`, `mamba2`: a recurrence's
+    /// state a slot), as the compiler names it.
     pub kind: String,
     /// The layer block and the head it serves.
     pub block: u32,

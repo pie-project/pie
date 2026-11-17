@@ -31,6 +31,8 @@ pub enum Kind {
     Sums = 3,
     /// The sums over each group's columns (f32, inner).
     Spread = 4,
+    /// A row vector moved to the column roots (Kimi's delta attention's forget logits, f32).
+    Moved = 5,
 }
 
 /// The synthetic value of `kind` of the Mamba-2 at `node`.

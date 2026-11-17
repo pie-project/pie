@@ -2591,6 +2591,49 @@ milestone's tail.
   header is unchanged). The other regimes keep no state across launches; the GEMM regime's
   batch rows are a step's row layout, not state.
 
+## KDA: the first new state kind on the state root
+
+- **Op.** Kimi's delta attention (`ssm.kda`, Kimi-K3's linear layers). It is Gated
+  DeltaNet's delta rule with a decay per key channel, not per head:
+  - `g_i = -exp(A) softplus(f_i + dt_i)`, or with the release's floor `-5`,
+    `g_i = floor sigmoid(exp(A) (f_i + dt_i))`;
+  - `S = diag(exp g) S`, then the delta update, `o = Sᵀ q`;
+  - q and k l2-normed, q scaled by `1/sqrt(d)`, `beta = sigmoid(b)`.
+- **What lowers generically:**
+  - The mixer is a state column per head, exactly as GDN's (`spatial::layer` maps `Kda` to
+    `Mixer::Gdn`). Its state has GDN's shape (`DK x DV` a lane slot), so no new region shape:
+    the state root states it as a `kda` region, which the engine reads like any other.
+  - The state PEs (`ops/sst.csl`) already took a decay per key (they were written for it).
+  - The forget logits come from a low-rank pair (`f_a`, `f_b`), so they land at the row
+    roots. A constant identity matvec (`View::Spread { rep: 1 }`, as Mamba-2's spreads) moves
+    them to the column roots, and each head root sends its `d` of them after q, k, v and b.
+  - Three region ops K3 also needs lower through the chain builder:
+    - the output's `rmsnorm_gated_by` (a head's norm, its weight, the gate's sigmoid);
+    - SiTU (`beta tanh(g/beta) sigmoid(g)` times the up, capped as `cap tanh(up/cap)`);
+    - AttnRes's one-row projection, a `[1, W]` table read whole, now a row every row reads.
+- **New CSL:** `ops/cy_sst.csl`'s `KDA` branch, about 25 lines. The state root takes the
+  row `[q | k | v | b | f]`, keeps `dt_bias` per key, and computes the decay vector, with
+  `FLOOR` and `L2EPS` as parameters. Programs are byte for byte the same (the flux gate,
+  Qwen3-0.6B's units, Qwen3.5-0.8B `-l1`'s GDN columns, the decode identity), and the GDN
+  roots link with the new file. Mamba-2's `cw` indexes are unchanged (one decay logit a row);
+  no Mamba-2 program was linked.
+- **Kimi-K3 slices.** The poem made a slice's last layer MLA (the release's rule). A cut of
+  `num_hidden_layers` keeps each layer's kind by its index (`full_attn_layers`), so the
+  slice's last layer is MLA only at the release's own index 92.
+- **The real slice** (`moonshotai/Kimi-K3`, layer 0 with its embedding and head, 7.0 GB
+  range-fetched, text-only names):
+  - The HF golden runs: the release's `modeling_kimi_linear.py` on transformers 5.23 in f32,
+    with fla-core's kernels as a CPU stand-in's serial walk.
+  - The program lowers; placement refuses it: `no column roots up to 512 fit its tiles
+    (12288 words)`. Layer 0 is 1.2B weights (7168 wide, a 33792 MLP, 12288-wide KDA). The
+    search's capacity, not the lowering.
+- **The simulator's model** (`kimik3-tiny`: one KDA layer, hidden 256, two heads of 128, MLP
+  256, vocab 512, the release's floor, AttnRes and SiTU; random weights; HF golden alike):
+  - compiles to 6 x 76 PEs; `--dry` lands 793,767 static words;
+  - on the simulator the first launch's logits never come back (`could be a kernel stall`).
+    G1's attention-only `qwen3-sim` stalls the same way on the same day, so the decode unit
+    path's stall is not KDA's.
+
 ## G1: the poem survey
 
 **Goal.** Every `.poem` in `models/` runs: it compiles with no per-model code (placement searched

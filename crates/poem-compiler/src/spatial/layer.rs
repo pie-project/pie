@@ -465,6 +465,8 @@ impl Body<'_, '_> {
         for &v in acts {
             match self.at(v) {
                 At::Root(Axis::Col) => self.cast(v, Axis::Col, open),
+                // (a stream unit moves a row vector to its column roots: a constant matvec)
+                At::Root(Axis::Row) if self.r.stream => {}
                 At::Root(Axis::Row) => {
                     return Err(format!("{} reads a row vector on the tiles", op.op));
                 }
@@ -643,6 +645,19 @@ impl Body<'_, '_> {
                 };
                 self.mixer(op, Some(kind), &acts, &outs)
             }
+            // Kimi's delta attention: a gated delta rule whose decay is a key channel's (a stream
+            // unit's state column a head, as Gated DeltaNet's)
+            Operation::Ssm(Ssm::Kda {
+                heads, head_dim, ..
+            }) if self.r.stream => {
+                let kind = Mixer::Gdn {
+                    k_heads: *heads,
+                    v_heads: *heads,
+                    k_dim: *head_dim,
+                    v_dim: *head_dim,
+                };
+                self.mixer(op, Some(kind), &acts, &outs)
+            }
             Operation::Ssm(Ssm::GatedDelta {
                 k_heads,
                 v_heads,
@@ -681,6 +696,7 @@ impl Body<'_, '_> {
                         | "elemwise.residual_add"
                         | "elemwise.rmsnorm"
                         | "elemwise.rmsnorm_gated"
+                        | "elemwise.rmsnorm_gated_by"
                         | "elemwise.rope"
                 ) =>
             {
