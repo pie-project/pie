@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use engine::channel::{ChannelId, ChannelRegistration, HostMirror, RegisteredChannel};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
@@ -54,11 +54,6 @@ impl Instance {
     }
 }
 
-#[derive(Default)]
-pub(crate) struct Tally {
-    interpreted: AtomicU64,
-}
-
 /// A lane's tokens off its `embed_tokens` channel, on the host.
 pub enum Tokens {
     Host(Vec<u32>),
@@ -87,7 +82,9 @@ pub struct Plane {
     next_program: u64,
     next_instance: u64,
 
-    tally: Arc<Tally>,
+    /// What the engine counts while it serves: each guest pass the host
+    /// interprets is a [`engine::live::Tally::Fallback`].
+    live: engine::live::Live,
 }
 
 impl Plane {
@@ -650,7 +647,7 @@ impl Plane {
         let inputs = PassInputs { outputs };
         let outcome =
             eta_exec::step_with(&mut seat.inst, &seat.plan, &inputs, &mut Interpreted, at);
-        self.tally.interpreted.fetch_add(1, Ordering::AcqRel);
+        self.live.tally(engine::live::Tally::Fallback, 1);
         let program = seat.program;
         match outcome {
             StepOutcome::Committed => Ok(()),
@@ -674,10 +671,11 @@ impl Plane {
         false
     }
 
-    /// Guest passes run in the interpreter.
+    /// What the plane counts while it serves (the engine's
+    /// [`engine::Engine::live`]).
     #[must_use]
-    pub fn tally(&self) -> u64 {
-        self.tally.interpreted.load(Ordering::Acquire)
+    pub fn live(&self) -> engine::live::Live {
+        self.live.clone()
     }
 
     fn instance_mut(&mut self, id: InstanceId) -> Result<&mut Instance, Refusal> {
@@ -880,5 +878,114 @@ impl Plane {
             )));
         }
         Ok(ring.front())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use engine::channel::{ChannelId, ChannelRegistration};
+    use engine::live::Tally;
+    use engine::program::{BindExtents, InstanceBinding, ProgramRegistration};
+    use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
+    use eta_ir::op::Op;
+    use eta_ir::registry::{Axis, EngineCaps, GeometryClass, OutputDecl, Stage};
+    use eta_ir::types::{Dtype, Shape};
+
+    use super::{Plane, Value};
+
+    /// A greedy template on the host: an epilogue that puts the argmax of
+    /// its lane's logits. The pass runs in the interpreter, puts the
+    /// argmax, and is counted a fallback, once.
+    #[test]
+    fn an_interpreted_pass_is_counted_a_fallback() {
+        let width = 8u32;
+        let container = TraceContainer {
+            names: vec!["logits".to_string()],
+            channels: vec![ChannelDecl {
+                shape: Shape::vector(1),
+                dtype: ChanDType::Concrete(Dtype::I32),
+                capacity: 2,
+                host_role: HostRole::Reader,
+                seeded: false,
+            }],
+            ports: Vec::new(),
+            stages: vec![StageProgram {
+                stage: Stage::Epilogue,
+                ops: vec![
+                    Op::Output {
+                        index: 0,
+                        lane: 0,
+                        shape: Shape::matrix(1, width),
+                        dtype: Dtype::F32,
+                    },
+                    Op::ReduceArgmax(0),
+                    Op::ChanPut { chan: 0, value: 1 },
+                ],
+            }],
+            externs: Vec::new(),
+            inputs: Vec::new(),
+        };
+        let decls = vec![OutputDecl {
+            name: "logits".to_string(),
+            axis: Axis::Lane,
+            width,
+            dtype: Dtype::F32,
+            layers: 0,
+            readout: true,
+        }];
+        let bound = eta_ir::validate::bind(container, vec![decls], EngineCaps::default())
+            .expect("the template binds");
+        let stages = eta_compiler::plan::compile_bound(&bound);
+        let mut plane = Plane::default();
+        let program = plane
+            .register(&ProgramRegistration {
+                program_hash: 1,
+                launch: eta_compiler::codegen::launch::build(&bound, &stages),
+                ..Default::default()
+            })
+            .expect("the template registers");
+        plane
+            .register_channel(&ChannelRegistration {
+                id: ChannelId(1),
+                shape: vec![1],
+                dtype: ChanDType::Concrete(Dtype::I32),
+                host_role: HostRole::Reader,
+                seeded: false,
+                extern_dir: None,
+                capacity: 2,
+                extern_name: Vec::new(),
+                slots: Vec::new(),
+            })
+            .expect("the channel registers");
+        let instance = plane
+            .bind(&InstanceBinding {
+                program,
+                channels: vec![ChannelId(1)],
+                seeds: Vec::new(),
+                geometry: GeometryClass::Host,
+                extents: BindExtents::default(),
+                device_resolved: Default::default(),
+                instance_slots: Vec::new(),
+                ring_slots: Vec::new(),
+                adapter_slots: Vec::new(),
+            })
+            .expect("the instance binds")
+            .id;
+        let live = plane.live();
+        let logits = vec![0.5, -1.0, 3.0, 2.0, 3.0, 0.0, 1.0, -2.0];
+        plane
+            .fire_interpreted(
+                instance,
+                &[("logits".to_string(), 0, Value::F32(logits))],
+                Stage::Epilogue,
+            )
+            .expect("the pass runs");
+        assert_eq!(
+            plane.take(instance, 0).expect("the channel reads"),
+            Some(2i32.to_le_bytes().to_vec()),
+            "the first of the largest"
+        );
+        assert_eq!(live.tallied(Tally::Fallback), 1, "one interpreted pass");
+        assert_eq!(live.tallied(Tally::BuiltAfterReady), 0);
     }
 }

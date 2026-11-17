@@ -12,8 +12,8 @@ mod posted;
 
 use engine::Engine;
 use engine::caps::{Capabilities, DeviceFacts, FireLimits, PoolFacts};
-use engine::chunk::{ChunkFacts, DegenerateBytes};
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
+use engine::chunk::{ChunkFacts, DegenerateBytes};
 use engine::error::{Error, Result as EngineResult};
 use engine::fire::{FireId, FireTicket, FrameId, FrameSubmission, FrameTicket, LaneReadout};
 use engine::load::{Checkpoint, LoadFacts, LoadRequest, Loaded};
@@ -101,6 +101,10 @@ impl Engine for Spatial {
         "cerebras-spatial"
     }
 
+    fn live(&self) -> engine::live::Live {
+        self.programs.live()
+    }
+
     fn device_facts(&self) -> Option<&DeviceFacts> {
         self.caps.as_ref().map(|caps| &caps.device)
     }
@@ -134,9 +138,7 @@ impl Engine for Spatial {
             ));
         }
         if residency.host_kv_budget.is_some_and(|bytes| bytes > 0) {
-            tracing::warn!(
-                "the spatial engine states no host kv tier: host_kv_budget is not used"
-            );
+            tracing::warn!("the spatial engine states no host kv tier: host_kv_budget is not used");
         }
         let Checkpoint::Path(path) = checkpoint else {
             return Err(Error::Load(
@@ -433,7 +435,31 @@ impl Engine for Spatial {
         Ok(())
     }
 
+    /// A frame's submit, its refusal counted ([`engine::live::Tally::Refused`]).
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
+        let submitted = self.submit_frame(frame);
+        if submitted.is_err() {
+            self.programs.live().tally(engine::live::Tally::Refused, 1);
+        }
+        submitted
+    }
+
+    fn settle_frame(&mut self, ticket: &mut FrameTicket) -> EngineResult<()> {
+        if let Some((id, readouts)) = &self.pending
+            && *id == ticket.id
+        {
+            for (receipt, read) in ticket.steps.iter_mut().zip(readouts) {
+                receipt.readouts = read.clone();
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Spatial {
+    /// The frame `submit` runs: posted on an asynchronous engine, else run
+    /// whole here.
+    fn submit_frame(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
         frame.validate_for(
             self.caps
                 .as_ref()
@@ -487,15 +513,39 @@ impl Engine for Spatial {
         self.pending = Some((id, readouts));
         Ok(FrameTicket { id, steps })
     }
+}
 
-    fn settle_frame(&mut self, ticket: &mut FrameTicket) -> EngineResult<()> {
-        if let Some((id, readouts)) = &self.pending
-            && *id == ticket.id
-        {
-            for (receipt, read) in ticket.steps.iter_mut().zip(readouts) {
-                receipt.readouts = read.clone();
-            }
-        }
-        Ok(())
+#[cfg(test)]
+mod tests {
+    use engine::Engine;
+    use engine::fire::{FrameSubmission, Lane, Step};
+    use engine::live::Tally;
+
+    use super::Spatial;
+
+    fn no_model(
+        _: &poem_ir::Trace,
+        _: &std::path::Path,
+    ) -> std::result::Result<checkpoint::contract::ModelContract, String> {
+        Err("no model in this test".into())
+    }
+
+    /// A frame the engine refuses (here: a lane before any load) is counted
+    /// on the engine's live record, which the runtime reads.
+    #[test]
+    fn a_refused_frame_is_counted() {
+        let mut spatial = Spatial::new(crate::spatial::Config::default(), no_model);
+        let live = spatial.live();
+        let refused = spatial.submit(&FrameSubmission::of(Step {
+            lanes: vec![Lane {
+                tokens: vec![1],
+                ..Lane::default()
+            }],
+            attachments: Vec::new(),
+            media: Vec::new(),
+            voxels: Vec::new(),
+        }));
+        assert!(refused.is_err());
+        assert_eq!(live.tallied(Tally::Refused), 1);
     }
 }
