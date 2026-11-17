@@ -272,10 +272,18 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
     };
     let o_indptr = narrow_all(op, "batch_prefill_o_indptr", &o_indptr)?;
 
-    let padded_batch_size = if req.enable_cuda_graph {
+    // A captured grid holds every work item a replay of the rung could lay:
+    // its tiles, and where its layout splits, the split's grid. An unsplit
+    // layout's replays lay no more than its tiles, so its grid is them: padding
+    // it to the split's capacity only parks empty blocks on the CUs, which on
+    // CUDA changed how a 2048-row replay's blocks paired on the SMs (4.16 ms
+    // against 3.49 walked).
+    let padded_batch_size = if !req.enable_cuda_graph {
+        new_batch_size
+    } else if split_kv {
         u64::from(max_batch_size_if_split).max(total_num_tiles_q)
     } else {
-        new_batch_size
+        total_num_tiles_q
     };
     if new_batch_size > padded_batch_size {
         return Err(refuse(
@@ -534,6 +542,21 @@ mod tests {
         // A 512-row rung's 16 tiles leave room for two chunks a tile: split.
         let half = captured(&[0, 512], &[0, 32], 512, 256);
         assert!(schedule("test", &half, &Device::L40S).unwrap().split_kv);
+    }
+
+    #[test]
+    fn an_unsplit_captured_grid_is_its_tiles() {
+        // A one-lane 1024-row rung on an L40S (35 items a kv head): unsplit,
+        // its 32 query tiles are its grid, not the split's 35.
+        let wide = captured(&[0, 1024], &[0, 64], 1024, 1);
+        let sched = schedule("test", &wide, &Device::L40S).unwrap();
+        assert!(!sched.split_kv);
+        assert_eq!(sched.padded_batch_size, 32);
+        // A split layout still holds the split's capacity.
+        let half = captured(&[0, 512], &[0, 32], 512, 1);
+        let sched = schedule("test", &half, &Device::L40S).unwrap();
+        assert!(sched.split_kv);
+        assert!(sched.padded_batch_size >= 35);
     }
 
     #[test]
