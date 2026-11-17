@@ -155,10 +155,8 @@ fn plan_of(deployment: &str, chip: &Profile, sms: u32) -> Option<u64> {
         )
     };
     #[cfg(not(feature = "rocm"))]
-    let trace = poem_compiler::fuse::fuse(
-        trace,
-        crate::residual_norms(chip, profile.synth_regions),
-    );
+    let trace =
+        poem_compiler::fuse::fuse(trace, crate::residual_norms(chip, profile.synth_regions));
     let slots = *LANES.iter().max().expect("lanes") as u32;
     let mut budget = poem_compiler::Budget::new(slots, CONTEXT);
     budget.buckets = crate::api::lattice(
