@@ -886,6 +886,69 @@ mod tests {
         assert!(super::pick_tied(Vec::new()).is_none());
     }
 
+    /// A bench reading `kernel.fast` (faster when on), `kernel.flat` (no
+    /// effect) and `kernel.broken` (its candidate does not serve), and not
+    /// `kernel.unread`.
+    struct Four;
+
+    impl Bench for Four {
+        fn models(&self) -> Vec<String> {
+            vec!["four".into()]
+        }
+        fn file(&self, entries: &[(String, String)]) -> Result<String, String> {
+            Ok(render_overrides(entries))
+        }
+        fn serve(&mut self, _: usize, file: &str) -> Result<Serving, String> {
+            if value(file, "broken").is_some_and(|v| v == "2") {
+                return Err("does not build".into());
+            }
+            let t = if value(file, "fast").is_some_and(|v| v == "true") {
+                50.0
+            } else {
+                100.0
+            };
+            Ok(Serving {
+                prompt: vec![t],
+                steps: vec![vec![t]; 3],
+                readout: vec![1.0, 0.0],
+                read: vec!["kernel.fast", "kernel.flat", "kernel.broken"],
+                refused: None,
+            })
+        }
+        fn plan(&self, _: usize, _: &str) -> Option<u64> {
+            None
+        }
+    }
+
+    #[test]
+    fn only_what_a_model_reads_and_the_run_compared_is_written_as_measured() {
+        let knob = |id: &'static str, current: &str, value: &str| Knob {
+            id,
+            current: current.into(),
+            candidates: vec![(value.to_string(), String::new())],
+            halfway: false,
+            plan_only: false,
+        };
+        let knobs = vec![
+            knob("kernel.fast", "false", "true"),
+            knob("kernel.flat", "1", "2"),
+            knob("kernel.unread", "1", "2"),
+            knob("kernel.broken", "1", "2"),
+        ];
+        let (chosen, lines) = search(&mut Four, Vec::new(), &knobs, "", &mut |_| {}).unwrap();
+        assert_eq!(chosen, vec![("kernel.fast".into(), "true".into())], "{lines:?}");
+        // Read and changed; read and kept under a noiseless bar (1%, within
+        // AGREEMENT); never read; read, but its one candidate never served.
+        assert!(lines[1].text.starts_with("kept"), "{lines:?}");
+        assert!(lines[2].text.contains("no check model reads it"), "{lines:?}");
+        assert!(lines[3].text.contains("no other candidate served"), "{lines:?}");
+        let flags: Vec<bool> = lines.iter().map(|l| l.measured).collect();
+        assert_eq!(flags, [true, true, false, false], "{lines:?}");
+        // What a writer lists under `[provenance] measured`.
+        let written: Vec<&str> = lines.iter().filter(|l| l.measured).map(|l| l.id).collect();
+        assert_eq!(written, ["kernel.fast", "kernel.flat"]);
+    }
+
     use super::*;
 
     #[test]

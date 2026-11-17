@@ -63,6 +63,8 @@ macro_rules! spirv_only {
     };
 }
 
+mod a_dense_model_reads_no_routed_or_quantized_decision;
+
 #[path = "../../../engine-gpu/suite/attn/mod.rs"]
 mod attn;
 #[path = "../../../engine-gpu/suite/collective/mod.rs"]
