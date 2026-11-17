@@ -15,8 +15,8 @@ use crate::error::{Fault, Result};
 pub const NO_PLAN: &str = "its plan does not compile";
 
 /// Why a rung is no rung of this load: its span leaves no room for one
-/// sequence and the bodies' floor beside it.
-pub const NO_ROOM: &str = "no room is left beside it for one sequence and the bodies' floor";
+/// sequence beside it.
+pub const NO_ROOM: &str = "no room is left beside it for one sequence";
 
 /// The counts of `trace` over the planes this engine keeps: its token
 /// tables and routed banks streamed apart from the dense weights.
@@ -38,7 +38,7 @@ pub fn counts(trace: &Trace) -> Result<Counts> {
 
 /// One rung offered: a fire of `tokens`, its span (`u64::MAX` where its
 /// plan does not compile), the launches its compiled plan issues, and what
-/// must lie beside it (one sequence's cache rows and the bodies' floor).
+/// must lie beside it (one sequence's cache rows).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Candidate {
     pub tokens: u32,

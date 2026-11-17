@@ -360,8 +360,10 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     };
     // The top rung, the ruling's (`crate::top`): of the buckets of the asked
     // lattice, each spanning its fire's working set and needing one
-    // sequence and the bodies' floor beside it, over the room the card has
-    // after the weight tier: every bucket up to the card's fire top.
+    // sequence beside it, over the room the card has after the weight tier:
+    // every bucket up to the card's fire top. The bodies are priced when
+    // they arm, ahead of the cache rows' fill (`store::holds`), and a card
+    // that holds none of them past the rung is refused there by name.
     let weighed;
     let tokens = {
         let paging = Paging::of(boot.page_size, boot.context, boot.slots, 1)?;
@@ -370,12 +372,11 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             let (span, launches) = laid(rung, &voxels).unwrap_or((u64::MAX, 0));
             let sequence =
                 crate::store::least_sequence_bytes(&boot.trace, paging.windowed(window, rung))?;
-            let beside = sequence.saturating_add(crate::store::BODIES_FLOOR_BYTES);
             candidates.push(crate::top::Candidate {
                 tokens: rung,
                 span,
                 launches,
-                beside,
+                beside: sequence,
             });
         }
         // The rows the dense product computes at each width: its tile's.
@@ -454,7 +455,6 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         after_weights
             .saturating_sub(working(tokens, &voxels))
             .saturating_sub(seat)
-            .saturating_sub(crate::store::BODIES_FLOOR_BYTES)
     });
     if tokens != asked_tokens {
         boot.budget = budget_at(tokens);
@@ -565,7 +565,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
 /// guests' programs, the capturing lanes' score planes and the readout
 /// indices) is held to half of the card past the weights, the half `bake`
 /// sizes the token budget against before the weights are down, and to what
-/// leaves one sequence and the bodies' floor beside it. The tile yields
+/// leaves one sequence beside it. The tile yields
 /// first, held to the widest plane fired at token rows (a plane past it is
 /// served by the fused-dequant arm), then the token budget halves toward its
 /// floor, then the lanes halve toward one, and what their cut frees grows the
@@ -764,14 +764,12 @@ fn refit(
                     .saturating_mul(8),
             )
     };
-    // What one sequence and the bodies' floor leave a fire, and within it the
+    // What one sequence leaves a fire, and within it the
     // half the cache rows are owed when the floors can still reach it.
     let room_at = |tokens: u32, owed: bool| -> Result<u64> {
         let sequence =
             crate::store::least_sequence_bytes(&boot.trace, paging.windowed(window, tokens))?;
-        let room = live
-            .saturating_sub(sequence)
-            .saturating_sub(crate::store::BODIES_FLOOR_BYTES);
+        let room = live.saturating_sub(sequence);
         Ok(if owed {
             room.min(live / 100 * u64::from(engine.working_set_percent))
         } else {
@@ -842,8 +840,7 @@ fn refit(
          and {lanes}: at the asked budgets a fire's working set (activation arena, attention \
          workspaces, decoded-weight tiles) takes {} MiB of the {} MiB this \
          card has after the weight tier under the load's allowance, past the half the cache \
-         rows are owed and what one sequence at the declared context and the bodies' floor \
-         need.",
+         rows are owed and what one sequence at the declared context needs.",
         asked.max_tokens,
         working_at(asked_lanes, asked_tokens, scoped) >> 20,
         live >> 20,

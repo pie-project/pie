@@ -140,11 +140,6 @@ struct WorkingSet {
 /// leave, once they are captured ([`Pools::fit_and_state`]).
 pub const MEASURING: u64 = u64::MAX;
 
-/// What of the bodies' room the context a model declares (and the operator
-/// did not state) is shortened to keep: enough for the decode bodies, which
-/// are what a serve replays every step and cost tens of megabytes each.
-pub const BODIES_FLOOR_BYTES: u64 = 512 << 20;
-
 /// What the fit holds beside its claim, ahead of the kv pool's fill: the
 /// bodies first (what they take where it is measured, every byte past the
 /// claim where they are still to arm, [`MEASURING`]), then the guests'
@@ -1430,16 +1425,15 @@ impl Pools {
         // its kv pages, its windowed pages and its recurrent record.
         let mut one_slot = u64::from(self.paging.pages_per_slot).min(self.ceiling);
         // A declared context is the model's, not the operator's: where this
-        // fit does not seat one working set at it beside the programs and
-        // the bodies' floor, it is served at the longest the fit does.
+        // fit does not seat one working set at it beside the programs (and a
+        // recorded figure for the bodies), it is served at the longest the
+        // fit does.
         if self.declared && !settled {
-            let floor = bodies.min(BODIES_FLOOR_BYTES);
             let seats = |pages: u64| {
                 let Ok(set) = self.working_set(pages, bodies, programs, live) else {
                     return false;
                 };
-                set.bodies >= floor
-                    && set.programs >= programs
+                set.programs >= programs
                     && engine::chunk::fit(set.limit, chunk, 0, set.least).is_ok()
             };
             // Never down to a window the rows are read through.
@@ -1463,7 +1457,7 @@ impl Pools {
                     "engine-cuda: the model declares a {declared}-token context and, with \
                      everything else this load puts on the device resident, the card does not \
                      seat one sequence at it beside the guests' programs and the graph bodies' \
-                     floor; serving {} tokens. State `[engine] max_context` to choose.",
+                     record; serving {} tokens. State `[engine] max_context` to choose.",
                     self.paging.context()
                 );
             }

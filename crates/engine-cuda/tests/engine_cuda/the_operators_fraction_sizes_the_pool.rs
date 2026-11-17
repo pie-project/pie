@@ -5,8 +5,8 @@ use engine_cuda::device::elastic::{
 };
 use engine_cuda::store::kv::Paging;
 use engine_cuda::store::{
-    Accounting, BODIES_FLOOR_BYTES, MEASURING, decoded_weight_reserve, holds, one_slot_bytes,
-    tokens_within, window_fire_bytes, window_of,
+    Accounting, MEASURING, decoded_weight_reserve, holds, one_slot_bytes, tokens_within,
+    window_fire_bytes, window_of,
 };
 
 const CARD: u64 = 48_305_799_168;
@@ -93,7 +93,7 @@ fn a_twenty_seven_b_serves_on_a_twenty_four_gigabyte_card_at_the_asked_lanes() {
         live.saturating_sub(working(LANES, lm_head))
     );
 
-    let room = live - SEQUENCE - BODIES_FLOOR_BYTES;
+    let room = live - SEQUENCE;
     assert!(
         tokens_within(LANES, 1, room, |lanes| working(lanes, lm_head)) < LANES,
         "with the tile kept, the lanes would halve to seat one sequence"
