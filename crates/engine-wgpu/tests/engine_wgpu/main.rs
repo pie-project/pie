@@ -66,6 +66,14 @@ macro_rules! spirv_only {
     };
 }
 
+/// A test whose wgpu run is held back for a stated reason.
+macro_rules! wgpu_held {
+    ($reason:literal, $test:item) => {
+        #[ignore = $reason]
+        $test
+    };
+}
+
 #[path = "../../../engine-gpu/suite/attn/mod.rs"]
 mod attn;
 #[path = "../../../engine-gpu/suite/collective/mod.rs"]

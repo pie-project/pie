@@ -338,6 +338,36 @@ fn load_alone(
     )
 }
 
+/// [`load`] on a device whose largest buffer is `max_buffer` bytes, as a
+/// device that binds less does, its pool `kv_budget` bytes in chunks of
+/// `chunk` (the kernels bind at most four segments of it, none past that
+/// buffer).
+pub fn load_capped(
+    fixture: &Fixture,
+    context: u32,
+    max_buffer: u64,
+    kv_budget: u64,
+    chunk: u64,
+) -> Option<Shell> {
+    let _alone = loading();
+    let device = DeviceBoot {
+        max_buffer: Some(max_buffer),
+        chunk_bytes: Some(chunk),
+        ..DeviceBoot::default()
+    };
+    let residency = allowed(
+        &device,
+        engine::load::Residency {
+            device_kv_budget: Some(kv_budget),
+            ..engine::load::Residency::default()
+        },
+    )?;
+    Some(
+        Shell::load(boot(fixture, PAGE, context, &device, residency))
+            .unwrap_or_else(|why| panic!("the shell loads: {why}")),
+    )
+}
+
 /// The boot of a suite load of `fixture` on `device`.
 fn boot<'a>(
     fixture: &'a Fixture,
