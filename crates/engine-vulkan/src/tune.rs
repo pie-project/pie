@@ -20,7 +20,7 @@ const SEARCH_SKIPS: &[&str] = &[
 ];
 
 /// The facts a tuned file assumes: what a kernel's requirement reads.
-const ASSUME: &[&str] = &["vendor", "subgroup", "coopmat", "cores"];
+pub(crate) const ASSUME: &[&str] = &["vendor", "subgroup", "coopmat", "cores"];
 
 /// What a tuned overlay on `base` may assume: its target, and the facts
 /// [`ASSUME`] names as this device reports them.
@@ -1001,14 +1001,7 @@ pub fn run(
         ("checked", format!("\"{}\"", checked.replace('"', "'"))),
     ];
     if steps.rates {
-        provenance.push(engine::rates::provenance(
-            "vulkan",
-            &format!(
-                "the matmul through the profile's path, the host's clock around each frame; \
-                 operands: engine::rates' pattern; at {}",
-                engine::rates::build_commit()
-            ),
-        ));
+        provenance.push(crate::rates::provenance(&name));
     }
     let file = search::assemble(
         crate::chip::registry(),

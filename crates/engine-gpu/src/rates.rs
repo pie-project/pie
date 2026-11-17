@@ -86,16 +86,19 @@ struct Rig<'a, B: Serve> {
     held: Vec<B::Buffer>,
     /// `engine::rates::operand_pattern`, made once.
     pattern: Option<Vec<u8>>,
+    /// The longest one timed frame may run (`engine::rates::frame_budget`).
+    budget: std::time::Duration,
 }
 
 impl<'a, B: Serve> Rig<'a, B> {
-    fn new(device: &'a B::Context) -> Self {
+    fn new(device: &'a B::Context, budget: std::time::Duration) -> Self {
         Rig {
             device,
             handles: Handles::<B>::new(),
             pipelines: B::Pipelines::default(),
             held: Vec::new(),
             pattern: None,
+            budget,
         }
     }
 
@@ -168,8 +171,10 @@ impl<'a, B: Serve> Rig<'a, B> {
         timer(f)
     }
 
-    /// One `fire`'s time inside a frame: [`REPEATS`] of it against one, the
-    /// host's clock around each frame's one submit.
+    /// One `fire`'s time inside a frame: as many of it as the frame budget
+    /// holds (at most [`REPEATS`], `engine::rates::fires_in`) against one,
+    /// the host's clock around each frame's one submit; a fire past half the
+    /// budget is its frame of one alone, no frame running two.
     fn each(
         &self,
         timer: Timer<'_, B>,
@@ -183,9 +188,14 @@ impl<'a, B: Serve> Rig<'a, B> {
             Ok(median(walls))
         };
         self.frame(timer, 1, fire, &nothing)?;
-        self.frame(timer, REPEATS, fire, &nothing)?;
-        let (one, many) = (wall(1)?, wall(REPEATS)?);
-        Ok((many.saturating_sub(one) / u64::from(REPEATS - 1)).max(1))
+        let one = wall(1)?;
+        let count = engine::rates::fires_in(self.budget, one as f64, REPEATS);
+        if count < 2 {
+            return Ok(one);
+        }
+        self.frame(timer, count, fire, &nothing)?;
+        let many = wall(count)?;
+        Ok((many.saturating_sub(one) / u64::from(count - 1)).max(1))
     }
 }
 
@@ -204,14 +214,15 @@ pub fn machine() -> engine::roofline::Machine {
 }
 
 /// The rates of `device`, its kernels under the tactics `tactics` picks at
-/// `tier`.
+/// `tier`, no timed frame past `budget` (`engine::rates::frame_budget`).
 pub fn measure<B: Serve, T: Tactics + ?Sized>(
     device: &B::Context,
     tactics: &T,
     tier: kernels_slang::Tier,
     timer: Timer<'_, B>,
+    budget: std::time::Duration,
 ) -> Result<Rates> {
-    measure_saying::<B, T>(device, tactics, tier, timer, &mut |_| {})
+    measure_saying::<B, T>(device, tactics, tier, timer, budget, &mut |_| {})
 }
 
 /// [`measure`], saying how the warm-up ended and what each shape reached.
@@ -220,10 +231,11 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     tactics: &T,
     tier: kernels_slang::Tier,
     timer: Timer<'_, B>,
+    budget: std::time::Duration,
     say: &mut dyn FnMut(&str),
 ) -> Result<Rates> {
     let machine = machine();
-    let mut rig = Rig::<B>::new(device);
+    let mut rig = Rig::<B>::new(device, budget);
     // The launch first: every rate below takes its dispatches' launches off.
     let (bytes_per_ns, launch_ns) = copy_and_launch(&mut rig, tactics.gemm(tier), timer, say)?;
     rig.release();
@@ -301,8 +313,18 @@ fn warm<B: Serve>(
     };
     let planes = u32::try_from(weights.len()).unwrap_or(u32::MAX);
     let nothing = |_: &mut B::Frame| Ok(());
+    // A rotation over every plane, in frames of as many fires as the frame
+    // budget holds.
+    let (_, one) = rig.frame(timer, 1, &fire, &nothing)?;
+    let per = engine::rates::fires_in(rig.budget, one as f64, planes);
     let warmed = engine::rates::warm_up(|| {
-        let (_, wall) = rig.frame(timer, planes, &fire, &nothing)?;
+        let mut wall = 0u64;
+        let mut left = planes;
+        while left > 0 {
+            let count = per.min(left);
+            wall += rig.frame(timer, count, &fire, &nothing)?.1;
+            left -= count;
+        }
         Ok::<f64, Fault>(gemm_flops(m, n, k) * f64::from(planes) / wall.max(1) as f64)
     })?;
     rig.release();
@@ -605,7 +627,7 @@ pub fn attention_rate<B: Serve, T: Tactics + ?Sized>(
     shape: engine::rates::AttnShape,
     launch: f64,
 ) -> Result<f64> {
-    let mut rig = Rig::<B>::new(device);
+    let mut rig = Rig::<B>::new(device, engine::rates::BURST);
     attention(&mut rig, tactics, tier, timer, &machine(), shape, launch)
 }
 
@@ -617,7 +639,7 @@ pub fn gemm_rate<B: Serve>(
     timer: Timer<'_, B>,
     (m, n, k): (u32, u32, u32),
 ) -> Result<f64> {
-    let mut rig = Rig::<B>::new(device);
+    let mut rig = Rig::<B>::new(device, engine::rates::BURST);
     let act = rig.operand(m, k, Dtype::Bf16)?;
     let w = rig.operand(n, k, Dtype::Bf16)?;
     let y = rig.zeros(m, n, Dtype::Bf16)?;

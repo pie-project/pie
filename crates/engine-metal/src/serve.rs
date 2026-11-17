@@ -591,6 +591,13 @@ impl Shell {
         let (chip, chip_report) =
             crate::chip::resolve(device.name(), &measured, boot.profiles.as_deref());
         crate::chip::tell_untuned(device.name(), &chip_report);
+        // A device whose profile lacks the roofline's constants measures
+        // them here, before ready, and keeps them in the user's profile.
+        let chip = crate::rates::at_load(&device, chip, &measured, boot.profiles.as_deref(), None)
+            .map_err(|why| Fault::Device {
+                call: "rates at load",
+                why,
+            })?;
         if chip
             .ladder::<kernels_metal::tuning::Qmm>()
             .values()

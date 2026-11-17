@@ -55,6 +55,28 @@ impl Rates {
         *self == Rates::default()
     }
 
+    /// The keys of `[rates]` the roofline weighs a fire by that this states
+    /// none of: what a load measures before it is ready
+    /// (`engine::rates::rates_at_load`). The one list of them.
+    #[must_use]
+    pub fn missing(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.launch_ns.is_none() {
+            out.push("launch_ns");
+        }
+        for (key, v) in [
+            ("gemm_tflops", self.gemm_tflops),
+            ("attn_tflops", self.attn_tflops),
+            ("hbm_gbps", self.hbm_gbps),
+            ("scan_gelems", self.scan_gelems),
+        ] {
+            if v.is_none() {
+                out.push(key);
+            }
+        }
+        out
+    }
+
     /// The matmul rate in flops a nanosecond.
     #[must_use]
     pub fn gemm_flops_per_ns(&self) -> Option<f64> {
@@ -101,10 +123,13 @@ pub type FireTable = Vec<(u32, u64)>;
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Tuned {
     pub rates: Rates,
-    /// The rates were measured on the device by this load (a browser's,
-    /// whose masked adapter no profile names), not read from a layer: they
-    /// are this load's alone and are never written.
+    /// The rates were measured on the device by this load, not read from
+    /// a layer (`engine::rates::rates_at_load`): no layer stated them all.
     pub measured_this_load: bool,
+    /// Where this load saved what it measured (the user's profile of the
+    /// device), for later loads to read; `None` where it kept them for
+    /// itself alone (no profiles directory: a browser's masked adapter).
+    pub saved_to: Option<String>,
 }
 
 impl Tuned {
@@ -112,6 +137,7 @@ impl Tuned {
     pub fn lay(&mut self, upper: &Tuned) {
         self.rates = upper.rates.clone().over(std::mem::take(&mut self.rates));
         self.measured_this_load |= upper.measured_this_load;
+        self.saved_to = upper.saved_to.clone().or(self.saved_to.take());
     }
 
     /// `[rates]` as profile TOML, nothing where nothing is stated or the
@@ -138,6 +164,7 @@ mod tests {
                 ..Rates::default()
             },
             measured_this_load: false,
+            saved_to: None,
         };
         let up = Tuned {
             rates: Rates {
@@ -146,6 +173,7 @@ mod tests {
                 ..Rates::default()
             },
             measured_this_load: false,
+            saved_to: None,
         };
         low.lay(&up);
         assert_eq!(

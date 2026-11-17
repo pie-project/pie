@@ -527,15 +527,41 @@ pub fn line_of(
         TopWhy::OnlyFeasible => "as the one feasible rung".to_string(),
     };
     let gib = live as f64 / f64::from(1u32 << 30);
-    let from = if tuned.measured_this_load {
-        "rates measured this load"
-    } else {
-        "the profile's rates"
-    };
-    format!(
-        "top rung {top} {by}; span {} MiB of {gib:.1} GiB live; {from}: {rates}",
-        span >> 20
-    )
+    match measured_line(tuned) {
+        Some(measured) => format!(
+            "top rung {top} {by}; span {} MiB of {gib:.1} GiB live; {measured}",
+            span >> 20
+        ),
+        None => format!(
+            "top rung {top} {by}; span {} MiB of {gib:.1} GiB live; the profile's rates: {rates}",
+            span >> 20
+        ),
+    }
+}
+
+/// What a load's line says of rates it measured itself
+/// (`engine::rates::rates_at_load`): `measured the roofline at load: <the
+/// constants>; saved to <path>` (or kept for this load alone); `None` where
+/// its profile stated them.
+#[must_use]
+pub fn measured_line(tuned: &profile::fire::Tuned) -> Option<String> {
+    if !tuned.measured_this_load {
+        return None;
+    }
+    let r = &tuned.rates;
+    let constants = format!(
+        "launch {} ns, {:.1} TFLOP/s matmul, {:.1} TFLOP/s attention, {:.0} GB/s, {:.0} G scan \
+         elements/s",
+        r.launch_ns.unwrap_or(0),
+        r.gemm_tflops.unwrap_or(0.0),
+        r.attn_tflops.unwrap_or(0.0),
+        r.hbm_gbps.unwrap_or(0.0),
+        r.scan_gelems.unwrap_or(0.0),
+    );
+    Some(match &tuned.saved_to {
+        Some(path) => format!("measured the roofline at load: {constants}; saved to {path}"),
+        None => format!("measured the roofline at load: {constants}; kept for this load alone"),
+    })
 }
 
 #[cfg(test)]
@@ -867,11 +893,27 @@ mod tests {
                 ..profile::fire::Rates::default()
             },
             measured_this_load: false,
+            saved_to: None,
         };
         assert_eq!(
             line_of(&top, 2048, 512 * MIB, 2 << 30, &tuned),
             "top rung 2048 by the estimate: eff 0.900 at a live share of 0.250; span 512 MiB \
              of 2.0 GiB live; the profile's rates: 249.0 TFLOP/s bf16, 654 GB/s, launch 1620 ns"
+        );
+        // Measured by this load and saved: the line says so, and where.
+        let measured = profile::fire::Tuned {
+            measured_this_load: true,
+            saved_to: Some("/home/u/.pie/profiles/cuda/user/nvidia-l40s.toml".into()),
+            ..tuned
+        };
+        let line = line_of(&top, 2048, 512 * MIB, 2 << 30, &measured);
+        assert!(
+            line.ends_with(
+                "measured the roofline at load: launch 1620 ns, 249.0 TFLOP/s matmul, 0.0 \
+                 TFLOP/s attention, 654 GB/s, 0 G scan elements/s; saved to \
+                 /home/u/.pie/profiles/cuda/user/nvidia-l40s.toml"
+            ),
+            "{line}"
         );
     }
 }

@@ -581,6 +581,82 @@ pub fn provenance(backend: &str, how: &str) -> (&'static str, String) {
     ("rates", format!("\"{}\"", text.replace('"', "'")))
 }
 
+/// The longest a rates step's timed submission runs by default: long enough
+/// that its launch and its clock are small beside its work.
+pub const BURST: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// The longest one timed submission of a rates step may run: [`BURST`], or
+/// less where the device's profile states a shorter `max_submit_ms` (a
+/// browser's or a watchdog's bound on one submission).
+#[must_use]
+pub fn frame_budget(max_submit: Option<std::time::Duration>) -> std::time::Duration {
+    max_submit.map_or(BURST, |most| most.min(BURST))
+}
+
+/// How many fires of `one_ns` each a timed submission under `budget`
+/// carries: as many as fit, at least one, at most `most`.
+#[must_use]
+pub fn fires_in(budget: std::time::Duration, one_ns: f64, most: u32) -> u32 {
+    let fit = (budget.as_nanos() as f64 / one_ns.max(1.0)).floor();
+    (fit.min(f64::from(most.max(1))) as u32).max(1)
+}
+
+/// Where a load saves the rates it measured, and how its file reads: the
+/// user's profile of the device (`profile::Shelf::user_path`), its text the
+/// resolved profile with the rates and their provenance laid in (the
+/// backend's `profile::search::assemble`).
+pub struct SaveTo<'a> {
+    pub path: std::path::PathBuf,
+    pub file: &'a dyn Fn(&profile::fire::Rates) -> Result<String, String>,
+}
+
+/// The roofline a load weighs its fires by, one rule for every engine: the
+/// rates `chip`'s layers state where they state every one (a checked-in
+/// profile's over a saved one, `profile::Registry::resolve`); else, before
+/// the load is ready, the device's own, measured by `measure` (the backend's
+/// `pie tune --rates` step, seconds long, its every timed submission under
+/// `budget` ([`frame_budget`] of the device's `max_submit_ms`)), each rate a
+/// layer states kept over the measured one, the whole saved to `save` (with
+/// its provenance) so later loads read them and measure nothing. The
+/// returned profile's rates are marked measured this load and where they
+/// were saved, and the load line says so (`engine::load::line_of`).
+pub fn rates_at_load(
+    chip: profile::Profile,
+    save: Option<SaveTo<'_>>,
+    budget: std::time::Duration,
+    measure: impl FnOnce(std::time::Duration) -> Result<profile::fire::Rates, String>,
+) -> Result<profile::Profile, String> {
+    let stated = chip.rates();
+    if stated.missing().is_empty() {
+        return Ok(chip);
+    }
+    let measured = measure(budget)?;
+    let rates = stated.over(measured);
+    if !rates.missing().is_empty() {
+        return Err(format!(
+            "the device's rates step measured no {:?}: nothing weighs a fire by them",
+            rates.missing()
+        ));
+    }
+    let saved_to = match save {
+        Some(save) => {
+            let text = (save.file)(&rates)?;
+            if let Some(dir) = save.path.parent() {
+                std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+            }
+            std::fs::write(&save.path, text)
+                .map_err(|e| format!("{}: {e}", save.path.display()))?;
+            Some(save.path.display().to_string())
+        }
+        None => None,
+    };
+    let mut tuned = chip.tuned().clone();
+    tuned.rates = rates;
+    tuned.measured_this_load = true;
+    tuned.saved_to = saved_to;
+    Ok(chip.with_tuned(tuned))
+}
+
 /// The commit this pie was built from, as the build stated it in
 /// `PIE_COMMIT`, else `commit unknown`: never the source tree's `HEAD` at
 /// tune time, which may have moved on since the build. A rates step's
@@ -618,6 +694,145 @@ fn civil(days: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A profile of the toy registry stating `rates`.
+    fn chip(rates: profile::fire::Rates) -> profile::Profile {
+        let p = profile::Registry::new("toy", &[], &[]).defaults();
+        let mut tuned = p.tuned().clone();
+        tuned.rates = rates;
+        p.with_tuned(tuned)
+    }
+
+    fn all() -> profile::fire::Rates {
+        profile::fire::Rates {
+            launch_ns: Some(900),
+            gemm_tflops: Some(200.0),
+            attn_tflops: Some(150.0),
+            hbm_gbps: Some(700.0),
+            scan_gelems: Some(2000.0),
+        }
+    }
+
+    #[test]
+    fn a_load_without_the_constants_measures_saves_and_says_so() {
+        let dir = std::env::temp_dir().join(format!("pie-rates-at-load-{}", std::process::id()));
+        let path = dir.join("vulkan/user/card-x.toml");
+        let file = |r: &profile::fire::Rates| Ok(format!("api = 1\n{}", tuned(r)));
+        // A checked-in launch, nothing else: the rest measured, the launch
+        // kept, each submission under the budget asked.
+        let stated = profile::fire::Rates {
+            launch_ns: Some(1234),
+            ..profile::fire::Rates::default()
+        };
+        let mut asked = None;
+        let p = rates_at_load(
+            chip(stated),
+            Some(SaveTo {
+                path: path.clone(),
+                file: &file,
+            }),
+            frame_budget(Some(std::time::Duration::from_millis(5))),
+            |budget| {
+                asked = Some(budget);
+                Ok(all())
+            },
+        )
+        .unwrap();
+        assert_eq!(asked, Some(std::time::Duration::from_millis(5)));
+        assert_eq!(p.rates().launch_ns, Some(1234), "the stated value kept");
+        assert_eq!(p.rates().gemm_tflops, Some(200.0));
+        assert!(p.tuned().measured_this_load);
+        assert_eq!(p.tuned().saved_to.as_deref(), Some(path.to_str().unwrap()));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("gemm_tflops = 200.0") && text.contains("launch_ns = 1234"),
+            "{text}"
+        );
+        // The line says it was measured here and where it went.
+        let line = crate::load::measured_line(p.tuned()).unwrap();
+        assert!(
+            line.starts_with("measured the roofline at load: "),
+            "{line}"
+        );
+        assert!(
+            line.ends_with(&format!("saved to {}", path.display())),
+            "{line}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_next_load_reads_what_the_first_saved_and_measures_nothing() {
+        static SHELF: profile::Shelf = profile::Shelf {
+            backend: "toy",
+            seeded: &[],
+            derived: None,
+        };
+        let registry = profile::Registry::new("toy", &[], &[]);
+        let facts = profile::Facts::of(&registry);
+        let dir = std::env::temp_dir().join(format!("pie-rates-next-{}", std::process::id()));
+        let (first, _) = SHELF.resolve(&registry, "Card X", &facts, Some(&dir));
+        assert!(!first.rates().missing().is_empty());
+        let base = first.clone();
+        let file = |r: &profile::fire::Rates| {
+            profile::search::assemble(
+                &registry,
+                &base,
+                "Card X",
+                &facts,
+                &tuned(r),
+                std::slice::from_ref(&provenance("toy", "a test")),
+                &[],
+            )
+        };
+        let measured = rates_at_load(
+            first,
+            Some(SaveTo {
+                path: SHELF.user_path(&dir, "Card X"),
+                file: &file,
+            }),
+            BURST,
+            |_| Ok(all()),
+        )
+        .unwrap();
+        assert!(measured.tuned().measured_this_load);
+        // The next load resolves the saved file: every constant stated, so
+        // it measures nothing and its line names no measurement.
+        let (second, _) = SHELF.resolve(&registry, "Card X", &facts, Some(&dir));
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(second.rates(), all());
+        let second = rates_at_load(second, None, BURST, |_| -> Result<_, String> {
+            panic!("measured what the first load saved")
+        })
+        .unwrap();
+        assert!(!second.tuned().measured_this_load);
+    }
+
+    #[test]
+    fn a_load_whose_layers_state_every_constant_measures_nothing() {
+        let p = rates_at_load(chip(all()), None, BURST, |_| -> Result<_, String> {
+            panic!("measured a profile stating every constant")
+        })
+        .unwrap();
+        assert_eq!(p.rates(), all());
+        assert!(!p.tuned().measured_this_load);
+        assert_eq!(crate::load::measured_line(p.tuned()), None);
+    }
+
+    #[test]
+    fn a_frame_carries_what_its_budget_holds() {
+        assert_eq!(frame_budget(None), BURST);
+        assert_eq!(frame_budget(Some(std::time::Duration::from_secs(2))), BURST);
+        let five = std::time::Duration::from_millis(5);
+        assert_eq!(frame_budget(Some(five)), five);
+        assert_eq!(fires_in(five, 1e6, 16), 5);
+        assert_eq!(fires_in(five, 1e3, 16), 16, "at most `most`");
+        assert_eq!(
+            fires_in(five, 50e6, 16),
+            1,
+            "one fire past the budget still runs alone"
+        );
+    }
 
     /// Every shape's cost a row as `f(rows)` over `lattice`.
     fn costs(lattice: &[u32], shapes: usize, f: impl Fn(usize, u32) -> f64) -> Vec<Vec<f64>> {

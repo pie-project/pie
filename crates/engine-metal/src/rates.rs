@@ -456,6 +456,58 @@ impl Bench<'_> {
     }
 }
 
+/// The `[provenance]` entry a measurement of `device`'s rates writes beside
+/// them (`engine::rates::provenance`): how Metal measured them.
+#[must_use]
+pub fn provenance(device: &str) -> (&'static str, String) {
+    engine::rates::provenance(
+        "metal",
+        &format!(
+            "{device}; each kernel through the dispatch serving runs, back to back in 20 ms \
+             frames timed by the GPU, the matmul over engine::rates::weights_at planes, attention \
+             over engine::rates::attn_sets_at sets; operands: engine::rates' pattern; at {}",
+            engine::rates::build_commit()
+        ),
+    )
+}
+
+/// `chip` with every roofline constant stated
+/// (`engine::rates::rates_at_load`, every engine's rule): as its layers
+/// state them where they state them all; else `device`'s own, measured
+/// before the load is ready, saved to the user's profile under `profiles`.
+/// Metal's frames are its 20 ms ones (`engine::rates::BURST`); the budget
+/// a device's `max_submit_ms` sets is not threaded into them yet.
+pub fn at_load(
+    device: &Context,
+    chip: profile::Profile,
+    facts: &profile::Facts,
+    profiles: Option<&std::path::Path>,
+    max_submit: Option<std::time::Duration>,
+) -> Result<profile::Profile, String> {
+    let base = chip.clone();
+    let name = device.name().to_string();
+    let file = |rates: &Rates| {
+        crate::tune::assemble(
+            &base,
+            &name,
+            facts,
+            &engine::rates::tuned(rates),
+            std::slice::from_ref(&provenance(&name)),
+        )
+    };
+    let save = profiles.map(|profiles| engine::rates::SaveTo {
+        path: crate::chip::SHELF.user_path(profiles, &name),
+        file: &file,
+    });
+    let measure_chip = chip.clone();
+    engine::rates::rates_at_load(
+        chip,
+        save,
+        engine::rates::frame_budget(max_submit),
+        |_budget| measure(device, measure_chip, &mut |_| {}),
+    )
+}
+
 /// `device`'s rates under the kernel tuning of `profile` (the profile a
 /// load on it runs), saying each as it lands.
 pub fn measure(

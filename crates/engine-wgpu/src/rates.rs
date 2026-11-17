@@ -9,15 +9,79 @@ use profile::fire::Rates;
 
 use crate::device::{Api, Context, Frame};
 
+/// The `[provenance]` entry a measurement of `device`'s rates writes beside
+/// them (`engine::rates::provenance`): how wgpu measured them.
+#[must_use]
+pub fn provenance(device: &str) -> (&'static str, String) {
+    engine::rates::provenance(
+        "wgpu",
+        &format!(
+            "{device}; the matmul through the profile's path, the adapter's timestamps where it \
+             has them; operands: engine::rates' pattern; at {}",
+            engine::rates::build_commit()
+        ),
+    )
+}
+
+/// `tuning` with every roofline constant stated
+/// (`engine::rates::rates_at_load`, every engine's rule): as its layers
+/// state them where they state them all; else `device`'s own, measured
+/// before the load is ready, each timed frame under `max_submit` where the
+/// device states one, saved to the user's profile under `profiles` (a
+/// browser, its adapter masked and no profiles directory, keeps them for
+/// its load alone).
+pub fn at_load(
+    device: &Context,
+    tuning: crate::tuning::Tuning,
+    profiles: Option<&std::path::Path>,
+    max_submit: Option<std::time::Duration>,
+) -> Result<crate::tuning::Tuning> {
+    let chip = tuning.profile().clone();
+    let measured = device.chip();
+    let facts = measured.facts();
+    let base = chip.clone();
+    let file = |rates: &Rates| {
+        profile::search::assemble(
+            crate::chip::registry(),
+            &base,
+            &measured.name,
+            &facts,
+            &engine::rates::tuned(rates),
+            std::slice::from_ref(&provenance(&measured.name)),
+            &[],
+        )
+    };
+    let save = profiles.map(|profiles| engine::rates::SaveTo {
+        path: crate::chip::SHELF.user_path(profiles, &measured.name),
+        file: &file,
+    });
+    let chip = engine::rates::rates_at_load(
+        chip,
+        save,
+        engine::rates::frame_budget(max_submit),
+        |budget| measure(device, &tuning, budget).map_err(|e| e.to_string()),
+    )
+    .map_err(|why| engine_gpu::error::Fault::Device {
+        call: "rates at load",
+        why,
+    })?;
+    Ok(crate::tuning::Tuning::new(chip, device.cores()))
+}
+
 /// The rates of `device`, under the tactics `tuning` picks.
-pub fn measure(device: &Context, tuning: &crate::tuning::Tuning) -> Result<Rates> {
-    measure_saying(device, tuning, &mut |_| {})
+pub fn measure(
+    device: &Context,
+    tuning: &crate::tuning::Tuning,
+    budget: std::time::Duration,
+) -> Result<Rates> {
+    measure_saying(device, tuning, budget, &mut |_| {})
 }
 
 /// [`measure`], saying how the warm-up ended.
 pub fn measure_saying(
     device: &Context,
     tuning: &crate::tuning::Tuning,
+    budget: std::time::Duration,
     say: &mut dyn FnMut(&str),
 ) -> Result<Rates> {
     let tier = <Api as engine_gpu::serve::Serve>::tier(device);
@@ -31,5 +95,5 @@ pub fn measure_saying(
             .filter(|&ns| ns > 0);
         Ok((span, (host * 1e9) as u64))
     };
-    engine_gpu::rates::measure_saying::<Api, _>(device, tuning, tier, &timer, say)
+    engine_gpu::rates::measure_saying::<Api, _>(device, tuning, tier, &timer, budget, say)
 }
