@@ -1835,6 +1835,9 @@ impl Shell {
             at: base + inputs + readouts + voxels + predicates + experts,
             bytes: arenas,
         });
+        // The kernels a guest's wave fires are the engine's, not the
+        // program's: loaded here, before ready, so no first fire builds them.
+        kernels_cuda::runtime::channel::load_wave_kernels()?;
         eprintln!(
             "engine-cuda: guests' samplers meet in {} KiB of lane arenas laid at load ({} \
              lanes a flight on {} units), no lane's",
