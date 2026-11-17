@@ -623,7 +623,13 @@ pub(crate) fn attend(
     let ok = f.or(ok, dead)?;
     let all = f.reduce(ok, &[0], Fold::And)?;
     // 0: the walk; 1: the kernel, the older keys a rectangle holds (none
-    // where every row's keys are fresh).
+    // where every row's keys are fresh). This runtime case is a second path
+    // every program carries (the walk's code beside the kernel's in each
+    // layer), kept only until the kernel walks any number of older pages
+    // itself, a paged copy loop in place of the `OLD_PAGES` rectangle: that
+    // change deletes the walk branch here. Choosing the walk statically for
+    // any program whose tables could pass the rectangle is not the fix: it
+    // would walk every long-context prefill.
     let fits_old = cmp_i(f, Cmp::Le, old.total, OLD_PAGES)?;
     let all = f.and(all, fits_old)?;
     let which = f.convert(all, Elem::I32);
