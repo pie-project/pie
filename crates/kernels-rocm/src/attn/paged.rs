@@ -321,7 +321,56 @@ pub fn prefill(
         o,
         lse,
         None,
+        None,
         rel,
+    )
+}
+
+/// `pie::attn::PrefillMask`, field for field: a masked prefill's two
+/// segments, a request each (its committed run read whole, its buffer read
+/// by the bits of its plane past `origin`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PrefillMask {
+    /// The packed bits, a request's plane from byte `indptr[req]`.
+    pub bits: u64,
+    /// i64 byte offsets, a request each.
+    pub indptr: u64,
+    /// u32 words, a request each: its origin, the wide bit at 31; 0 for none
+    /// (origin 0, wide).
+    pub origin: u64,
+}
+
+const _: () = assert!(core::mem::size_of::<PrefillMask>() == 24);
+
+/// The prefill over `plan` whose rows read their committed runs whole and
+/// their buffers by `mask` (`paged_prefill_masked`).
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_masked(
+    ctx: &Ctx,
+    op: &'static str,
+    q: RaggedTensor,
+    plan: &PrefillPlan,
+    pool: &KvPool,
+    window_left: i32,
+    sm_scale: f32,
+    o: &Tensor,
+    lse: u64,
+    mask: PrefillMask,
+) -> Result<(), Error> {
+    prefill_walk(
+        ctx,
+        op,
+        q,
+        plan,
+        pool,
+        window_left,
+        sm_scale,
+        o,
+        lse,
+        None,
+        Some(mask),
+        None,
     )
 }
 
@@ -359,7 +408,7 @@ pub fn prefill_selected(
     o: &Tensor,
     sel: PrefillSel,
 ) -> Result<(), Error> {
-    prefill_walk(ctx, op, q, plan, pool, -1, sm_scale, o, 0, Some(sel), None)
+    prefill_walk(ctx, op, q, plan, pool, -1, sm_scale, o, 0, Some(sel), None, None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -374,6 +423,7 @@ fn prefill_walk(
     o: &Tensor,
     lse: u64,
     sel: Option<PrefillSel>,
+    mask: Option<PrefillMask>,
     rel: Option<Rel>,
 ) -> Result<(), Error> {
     let shape = &plan.shape;
@@ -441,7 +491,26 @@ fn prefill_walk(
         [512, 1, 1],
     );
     let fp8 = kv::native_e4m3(pool);
-    if let Some(sel) = sel {
+    if let Some(mask) = mask {
+        if fp8 || rel.is_some() {
+            return Err(refuse(
+                op,
+                "the masked prefill walks bf16 pages, with no relative bias",
+            ));
+        }
+        // The same two families the unmasked prefill picks between.
+        let family = if matches!(shape.head_dim, 128 | 256) {
+            "paged_prefill_masked"
+        } else {
+            "paged_prefill_wide_masked"
+        };
+        let entry = format!("::pie::attn::{family}<{}, {hnd}>", shape.head_dim);
+        ctx.fire(
+            op,
+            Fire::at(kernel(FILE, &entry)).apply(launch),
+            &[ArgValue::of(&args), ArgValue::of(&mask)],
+        )?;
+    } else if let Some(sel) = sel {
         if !matches!(shape.head_dim, 128 | 256) || !plan.causal || fp8 {
             return Err(refuse(
                 op,
