@@ -1054,3 +1054,40 @@ fn attn_rows_probe() {
         eprintln!("[attn-rows] h{}/{} d{} hnd={} l {l}: {}", c.q_heads, c.kv_heads, c.head_dim, c.hnd, line.join(" | "));
     }
 }
+
+/// Probe (by hand): a decode batch through the decode kernel against the
+/// same rows through the prefill kernel (each request one row), timed.
+#[test]
+#[ignore = "a probe run by hand"]
+fn attn_decode_via_prefill_probe() {
+    let Some(gpu) = Gpu::open() else { return };
+    let ctx = gpu.ctx();
+    let device = plan::Device::probe(&ctx).unwrap();
+    for c in [Case::new(16, 8, 128, 16, false), Case::new(8, 2, 256, 16, false), Case::new(32, 8, 128, 16, false)] {
+        for (n, l) in [(1u32, 256u32), (1, 2048), (1, 8192), (8, 2048), (64, 512), (64, 2048), (256, 1024)] {
+            let lens = vec![l; n as usize];
+            let cache = cache(&gpu, &c, &lens, 7);
+            let row = c.q_heads * c.head_dim;
+            let qv: Vec<f32> = values((n * row) as usize, 3, 1.0).into_iter().map(round_bf16).collect();
+            let q = RaggedTensor { data: gpu.tensor(&qv, n, row, Dtype::Bf16), indptr: gpu.column(&(0..=n as i32).collect::<Vec<_>>()) };
+            let shape = plan::Shape { num_requests: n, lane_offset: 0, num_q_heads: c.q_heads, num_kv_heads: c.kv_heads, head_dim: c.head_dim, page_size: c.page_size, hnd_layout: c.hnd };
+            let live = plan::Live { requests: n, lane_offset: 0, row_offset: 0, rows: n };
+            let kv: Vec<i32> = lens.iter().map(|&x| x as i32).collect();
+            let grid = kernels_rocm::attn::paged::decode_max_grid_size(c.kv_heads, device.num_sm);
+            let d = plan::plan_decode(&cache.page_indptr, &kv, shape, live, None, false, grid, plan::Toggles::default(), &device, workspace(&gpu)).unwrap();
+            d.stage(&ctx).unwrap();
+            let mut o = gpu.zeros(n, row, Dtype::Bf16);
+            let mut lse = gpu.zeros(n, c.q_heads, Dtype::F32);
+            let td = gpu.time(200, || attn::decode_lse(&ctx, q, &d, &cache.pool, None, c.head_dim, 0.0, &mut o, &mut lse).unwrap());
+            let od = gpu.read(&o);
+            let qo: Vec<i32> = (0..=n as i32).collect();
+            let p = plan::plan_prefill(&qo, &cache.page_indptr, &kv, n, shape, live, None, true, false, None, &device, plan::Toggles::default(), workspace(&gpu)).unwrap();
+            p.stage(&ctx).unwrap();
+            let mut o2 = gpu.zeros(n, row, Dtype::Bf16);
+            let tp = gpu.time(200, || attn::prefill(&ctx, q, &p, &cache.pool, None, c.head_dim, c.kv_heads, 0.0, &mut o2).unwrap());
+            let op = gpu.read(&o2);
+            let diff = od.iter().zip(&op).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+            eprintln!("[via-prefill] h{}/{} d{} n {n:>3} l {l:>5}: decode {td:7.2} us (split {})  prefill {tp:7.2} us (split {}, tile {})  x{:.2}  bits differ {diff}/{}", c.q_heads, c.kv_heads, c.head_dim, d.info.split_kv, p.info.split_kv, p.info.cta_tile_q, tp / td, od.len());
+        }
+    }
+}
