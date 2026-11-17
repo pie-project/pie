@@ -17,6 +17,7 @@
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::OnceLock;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -344,6 +345,7 @@ struct Columns {
 /// A column's rows and default into `rows` and `default`; keys that name
 /// no process this worker could hold are passed over.
 fn apply<K, V, R: std::hash::Hash + Eq>(
+    column: usize,
     delta: plex_host::host::ColumnDelta<K, V>,
     rows: &mut HashMap<R, V>,
     default: &mut Option<V>,
@@ -351,7 +353,11 @@ fn apply<K, V, R: std::hash::Hash + Eq>(
 ) -> bool {
     let changed = !delta.rows.is_empty() || delta.default.is_some();
     for (k, row) in delta.rows {
-        let Some(k) = key(k) else { continue };
+        let Some(k) = key(k) else {
+            super::ROWS_PASSED_OVER[column].fetch_add(1, Ordering::Relaxed);
+            continue;
+        };
+        super::ROWS_ENACTED[column].fetch_add(1, Ordering::Relaxed);
         match row {
             Some(v) => {
                 rows.insert(k, v);
@@ -847,11 +853,18 @@ impl Port {
         let pid = |id: String| ProcessId::from_str(&id).ok();
         let c = &mut self.columns;
         let scheduled = apply(
+            0,
             delta.schedule_priority,
             &mut c.priority,
             &mut c.priority_default,
             pid,
-        ) | apply(delta.schedule_hold, &mut c.hold, &mut c.hold_default, pid);
+        ) | apply(
+            1,
+            delta.schedule_hold,
+            &mut c.hold,
+            &mut c.hold_default,
+            pid,
+        );
         if scheduled {
             tracing::debug!(
                 priority = c.priority.len(),
@@ -868,11 +881,13 @@ impl Port {
         }
         let prefix = |(id, tokens): (String, Option<u32>)| Some((pid(id)?, tokens));
         let kept = apply(
+            2,
             delta.retention_priority,
             &mut c.retention,
             &mut c.retention_default,
             prefix,
         ) | apply(
+            3,
             delta.retention_tiers,
             &mut c.tiers,
             &mut c.tiers_default,
