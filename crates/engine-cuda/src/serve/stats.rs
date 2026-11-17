@@ -348,14 +348,15 @@ impl Shell {
     }
 
     /// Copies whole slots of `shape` between tiers (CONTRACT-BC 22), on
-    /// the stream behind the fires enqueued and ahead of the next.
+    /// the stream behind the fires enqueued and ahead of the next. What it
+    /// answers resolves once the copy has landed (CONTRACT-BC 23).
     pub fn copy_tier_slots(
         &mut self,
         shape: engine::chunk::ShapeId,
         from: crate::store::Tier,
         to: crate::store::Tier,
         pairs: &[(u32, u32)],
-    ) -> crate::Result<()> {
+    ) -> crate::Result<engine::CopyCompletion> {
         // A record that leaves the device, or arrives on it, moves when the
         // runtime's count of its folds has caught up (it moves no set with
         // a device-counted fold unsettled): what a fold left ahead of that
@@ -372,8 +373,15 @@ impl Shell {
             }
         }
         let swap = (!super::diag::on().tier_inline).then(|| self.device.swap_stream());
-        self.pools
-            .copy_tier_slots(self.device.stream(), swap, shape, from, to, pairs)
+        let stream = self.device.stream();
+        let (copy, landed) = engine::completion::copy_in_flight();
+        if let Some(copy) = self
+            .pools
+            .copy_tier_slots(stream, swap, shape, from, to, pairs, copy)?
+        {
+            self.land_after(stream, copy)?;
+        }
+        Ok(landed)
     }
 
     /// Copies whole slots and token runs of a kv shape (`windowed`: the windowed
