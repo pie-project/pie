@@ -66,7 +66,11 @@ device = []
 test-slot-fill = []
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_Memory"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+] }
 
 [dev-dependencies]
 eta-dsl = { package = "pie-eta-dsl", path = "../eta-dsl" }

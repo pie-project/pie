@@ -2670,30 +2670,52 @@ fn stamp_lane_words(
     device_rows: Option<&[u32]>,
 ) {
     let model = crate::model::model();
-    let media: Vec<u32> = req.media.iter().map(|media| media.lane).collect();
-    for (at, lane) in req.lanes.iter_mut().enumerate() {
-        let rows = device_rows
-            .and_then(|rows| rows.get(at).copied())
-            .unwrap_or_else(|| u32::try_from(lane.tokens.len()).unwrap_or(u32::MAX));
-        let on = of
-            .get(at)
-            .and_then(|&pass_lane| switched.on.get(pass_lane))
-            .map_or(&[][..], Vec::as_slice);
-        let request = poem::Request::new(rows, lane.mask.is_some() || fire_wide_mask)
-            .adapted(lane.adapter.is_some())
-            .drafting(on.contains(&poem_ir::Builtin::Drafts))
-            .capturing_scores(on.contains(&poem_ir::Builtin::Scores))
-            .with_media(media.contains(&(at as u32)))
-            .starting(starts(lane));
-        let switches = of
-            .get(at)
-            .and_then(|&pass_lane| switched.lanes.get(pass_lane))
-            .map_or(&[][..], Vec::as_slice);
-        let request = switches.iter().fold(request, |request, (name, value)| {
-            request.switched(name, value)
-        });
-        lane.word = model.word(&request);
+    let requests = lane_requests(req, switched, of, fire_wide_mask, device_rows);
+    for (lane, request) in req.lanes.iter_mut().zip(&requests) {
+        lane.word = model.word(request);
     }
+}
+
+/// What each lane of `req` asks of the model ([`stamp_lane_words`]). A lane
+/// captures its attention scores only on the fire that runs the pass's
+/// program, the one reading them: an earlier cut of a cut pass carries the
+/// adapter alone, and scores it captured would have no reader.
+fn lane_requests(
+    req: &crate::engine::FireRequest,
+    switched: &Switched,
+    of: &[usize],
+    fire_wide_mask: bool,
+    device_rows: Option<&[u32]>,
+) -> Vec<poem::Request> {
+    let media: Vec<u32> = req.media.iter().map(|media| media.lane).collect();
+    req.lanes
+        .iter()
+        .enumerate()
+        .map(|(at, lane)| {
+            let rows = device_rows
+                .and_then(|rows| rows.get(at).copied())
+                .unwrap_or_else(|| u32::try_from(lane.tokens.len()).unwrap_or(u32::MAX));
+            let on = of
+                .get(at)
+                .and_then(|&pass_lane| switched.on.get(pass_lane))
+                .map_or(&[][..], Vec::as_slice);
+            let request = poem::Request::new(rows, lane.mask.is_some() || fire_wide_mask)
+                .adapted(lane.adapter.is_some())
+                .drafting(on.contains(&poem_ir::Builtin::Drafts))
+                .capturing_scores(
+                    req.boundary_program && on.contains(&poem_ir::Builtin::Scores),
+                )
+                .with_media(media.contains(&(at as u32)))
+                .starting(starts(lane));
+            let switches = of
+                .get(at)
+                .and_then(|&pass_lane| switched.lanes.get(pass_lane))
+                .map_or(&[][..], Vec::as_slice);
+            switches.iter().fold(request, |request, (name, value)| {
+                request.switched(name, value)
+            })
+        })
+        .collect()
 }
 
 /// Whether the lane's recurrent state is empty, as the engine reads its reset.
@@ -6536,6 +6558,7 @@ mod cut_tests {
     fn cut_every_case() {
         a_long_plain_pass_is_cut_on_page_boundaries();
         only_the_last_cut_runs_the_program();
+        only_the_last_cut_captures_scores();
         a_masked_pass_is_cut_with_its_rows_masks();
         the_last_piece_holds_what_the_program_reads();
         several_lanes_are_cut_and_end_together();
@@ -6631,6 +6654,41 @@ mod cut_tests {
         assert_eq!(lane.tokens[0], 191);
         assert!(matches!(lane.readout, ::engine::Readout::Last));
         assert!(tail.boundary_program);
+    }
+
+    /// A pass whose program reads its attention scores, cut into several
+    /// fires: only the last runs the program, so only its lanes capture
+    /// them; an earlier cut's would have no reader attached.
+    fn only_the_last_cut_captures_scores() {
+        let req = prefill_lane(5, 100, 16);
+        let switched = Switched {
+            lanes: vec![Vec::new()],
+            on: vec![vec![poem_ir::Builtin::Scores]],
+            tails: vec![0],
+            rows_read: true,
+        };
+        let cuts = host_cuts(&req, true, 32, 16, &[], 0);
+        assert_eq!(cuts.len(), 4, "the pass is cut");
+        let captures: Vec<bool> = cuts
+            .iter()
+            .enumerate()
+            .map(|(at, &cut)| {
+                let last = at + 1 == cuts.len();
+                let piece = rows_of_lanes(&req, &[Some(cut)], last, 16);
+                assert_eq!(piece.boundary_program, last);
+                let requests = lane_requests(&piece, &switched, &[0], false, None);
+                assert_eq!(requests.len(), 1);
+                requests[0].captures_scores()
+            })
+            .collect();
+        assert_eq!(
+            captures,
+            [false, false, false, true],
+            "only the fire carrying the reading program captures scores"
+        );
+        // The pass uncut is its own last fire: it captures.
+        let whole = lane_requests(&req, &switched, &[0], false, None);
+        assert!(whole[0].captures_scores());
     }
 
     fn a_pass_with_media_is_cut_before_its_first_span() {

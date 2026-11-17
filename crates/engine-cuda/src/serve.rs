@@ -169,6 +169,10 @@ pub struct Shell {
     /// How the arming fire's lanes treat their recurrent rows: a buffering
     /// treatment is recorded with lanes that land and replay nothing.
     arm_rs: record::RsBody,
+    /// The arming fire's ragged attentions read a group mask: its lanes
+    /// state every row of their group admitted, and its body is the masked
+    /// twin (`record::BodyKey::group_mask`).
+    arm_group_mask: bool,
     /// The device's bytes and those in use before this load began: what
     /// the load's ledger is read against.
     card: (u64, u64),

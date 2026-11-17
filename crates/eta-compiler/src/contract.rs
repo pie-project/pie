@@ -66,6 +66,34 @@ pub struct Case {
     pub readers: Vec<u32>,
 }
 
+/// What a platform documents of the f32 functions a guest step lowers
+/// to: the most ulps each answers off the exact value. Its basic
+/// arithmetic (+, -, *, /) is correctly rounded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Accuracy {
+    pub exp_ulps: u32,
+    pub log_ulps: u32,
+}
+
+impl Accuracy {
+    /// Metal's precise math (`MTLMathMode::Safe`, precise functions, which
+    /// guest libraries compile with): Metal Shading Language Specification
+    /// 4.1, Table 8.1, `exp` <= 4 ulp, `log` <= 4 ulp, `x + y`, `x - y`,
+    /// `x * y`, `x / y` correctly rounded.
+    pub const METAL_PRECISE: Accuracy = Accuracy {
+        exp_ulps: 4,
+        log_ulps: 4,
+    };
+
+    /// The interpreter's: Rust's `f32::exp` and `f32::ln`, the platform's
+    /// libm, faithfully rounded (within 1 ulp) on the hosts the contract
+    /// runs on.
+    pub const HOST: Accuracy = Accuracy {
+        exp_ulps: 1,
+        log_ulps: 1,
+    };
+}
+
 /// The beam step at widths 2 and 4, its logits in one lane's seat and a
 /// lane a row.
 #[must_use]
@@ -224,6 +252,93 @@ impl Case {
             .collect()
     }
 
+    /// The most an f32 cell this step writes may stand off the
+    /// interpreter's, a backend whose math is `device`'s answering it:
+    /// equal up to stated rounding (the guest-lowering contract: float math
+    /// agrees within rounding, while integer, comparison, ordering, mask and
+    /// RNG-bit results are exact), derived from what each side documents,
+    /// not picked.
+    ///
+    /// The step is a log-softmax over `vocab` (a score is `x - max -
+    /// log(S)`, `S` the sum of `exp(x - max)`, then added to a carried
+    /// score). Both sides sum in the canonical order (32-lane trees, five
+    /// adds a level), so the sum's own rounding differs only through its
+    /// inputs and each add's last bit. Per side:
+    /// - each `exp` is off by its ulps, relative to the term;
+    /// - each of the tree's adds on the path rounds once (half an ulp,
+    ///   relative);
+    /// - `log(S)` is off by its ulps of `log(S)`, at most `log(vocab)`
+    ///   since `S` lies in `[1, vocab]`, plus the sum's relative error;
+    /// - the three correctly rounded adds after it round once each.
+    #[must_use]
+    pub fn f32_bound(&self, device: Accuracy, cell: f32) -> f32 {
+        let host = Accuracy::HOST;
+        let ulp = |x: f64| -> f64 { 2f64.powi(x.abs().max(f64::from(f32::MIN_POSITIVE)).log2().floor() as i32 - 23) };
+        let unit = 2f64.powi(-24);
+        let levels = f64::from(self.vocab.max(2)).log(32.0).ceil();
+        let depth = 5.0 * levels;
+        let exp = f64::from(device.exp_ulps + host.exp_ulps) * 2f64.powi(-23);
+        let sum = exp + 2.0 * depth * unit;
+        let log = f64::from(device.log_ulps + host.log_ulps) * ulp(f64::from(self.vocab).ln()) + sum;
+        (log + 6.0 * ulp(f64::from(cell))) as f32
+    }
+
+    /// Whether `got` answers `want` for channel `channel`, as a backend of
+    /// `device`'s math writes it `steps` steps in (each side carrying its own
+    /// scores, so the bound adds up a step at a time): an f32 cell within
+    /// `steps` times [`Case::f32_bound`] of the interpreter's, every other
+    /// cell (ids, parents, masks) byte for byte. The one check every
+    /// backend's contract test makes.
+    ///
+    /// # Errors
+    ///
+    /// Each cell that disagrees, by index, with both values and the bound.
+    pub fn agrees(
+        &self,
+        channel: u32,
+        got: &[u8],
+        want: &[u8],
+        device: Accuracy,
+        steps: u32,
+    ) -> Result<(), String> {
+        if got.len() != want.len() {
+            return Err(format!(
+                "{}: channel {channel}: {} bytes, the interpreter's {}",
+                self.name,
+                got.len(),
+                want.len()
+            ));
+        }
+        let floats = matches!(
+            self.bound.container.channels.get(channel as usize).map(|c| c.dtype),
+            Some(ChanDType::Concrete(Dtype::F32))
+        );
+        if !floats {
+            return if got == want {
+                Ok(())
+            } else {
+                Err(format!("{}: channel {channel}: {got:02x?} != {want:02x?}", self.name))
+            };
+        }
+        let cell = |bytes: &[u8]| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let wrong: Vec<String> = got
+            .chunks_exact(4)
+            .zip(want.chunks_exact(4))
+            .enumerate()
+            .filter_map(|(at, (g, w))| {
+                let (g, w) = (cell(g), cell(w));
+                let bound = self.f32_bound(device, w) * steps.max(1) as f32;
+                let off = (g - w).abs();
+                (!(off <= bound)).then(|| format!("cell {at}: {g} ({:#010x}) vs {w} ({:#010x}), off {off:e} past {bound:e}", g.to_bits(), w.to_bits()))
+            })
+            .collect();
+        if wrong.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("{}: channel {channel}: {}", self.name, wrong.join("; ")))
+        }
+    }
+
     /// What the host interpreter puts in each of [`Case::readers`], as the
     /// wire carries it.
     #[must_use]
@@ -252,6 +367,38 @@ impl Case {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A device's score one ulp off the interpreter's agrees, as the
+    /// documented accuracy allows (an M5 Pro's precise exp / log answered
+    /// 0xc11a7965 where the host answered 0xc11a7966); a score off past the
+    /// bound does not, nor does a token id off by one.
+    #[test]
+    fn a_score_within_the_documented_rounding_agrees_and_an_id_is_exact() {
+        let cases = beam_stage();
+        let w2 = &cases[2];
+        let scores = |words: [u32; 2]| -> Vec<u8> {
+            words.iter().flat_map(|w| f32::from_bits(*w).to_le_bytes()).collect()
+        };
+        let want = scores([0xC11A_7966, 0xC11A_7966]);
+        let float = w2
+            .bound
+            .container
+            .channels
+            .iter()
+            .position(|c| matches!(c.dtype, ChanDType::Concrete(Dtype::F32)))
+            .expect("a score channel") as u32;
+        let near = scores([0xC11A_7965, 0xC11A_7965]);
+        assert_eq!(w2.agrees(float, &near, &want, Accuracy::METAL_PRECISE, 1), Ok(()));
+        let bound = w2.f32_bound(Accuracy::METAL_PRECISE, f32::from_bits(0xC11A_7966));
+        assert!(bound < 1e-4, "the bound is rounding, not slack: {bound:e}");
+        let far = scores([0xC11A_7966, (f32::from_bits(0xC11A_7966) + 4.0 * bound).to_bits()]);
+        assert!(w2.agrees(float, &far, &want, Accuracy::METAL_PRECISE, 1).is_err());
+        let ids = w2.readers[0];
+        let id = 51_616u32.to_le_bytes().to_vec();
+        let off = 51_617u32.to_le_bytes().to_vec();
+        assert!(w2.agrees(ids, &off, &id, Accuracy::METAL_PRECISE, 1).is_err());
+        assert_eq!(w2.agrees(ids, &id, &id, Accuracy::METAL_PRECISE, 1), Ok(()));
+    }
 
     /// The interpreter's answer to the width-2 step, pinned: the top two
     /// scores, their tokens and parents.

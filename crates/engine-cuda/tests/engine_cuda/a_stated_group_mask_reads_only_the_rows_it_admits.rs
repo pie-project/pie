@@ -77,6 +77,18 @@ fn fire_and_compare(graphs: Graphs) {
     rig.engine
         .settle_frame(&mut ticket)
         .expect("the frame settles");
+    // Armed, the fire replays a body that reads its mask: one captured
+    // without a mask would land every row of its group.
+    if matches!(graphs, Graphs::On) {
+        let shell = rig.engine.shell().expect("the load holds a shell");
+        let key = shell
+            .replayed_body()
+            .expect("an armed load replays a body for the masked fire");
+        assert!(
+            key.group_mask,
+            "the masked fire replayed {key}, a body captured with no group mask"
+        );
+    }
     let readouts = &ticket.steps[0].readouts;
     assert_eq!(readouts.len(), 3);
     for (at, readout) in readouts.iter().enumerate() {

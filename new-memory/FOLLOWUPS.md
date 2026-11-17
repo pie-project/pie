@@ -81,3 +81,12 @@ one pipeline, whose fires a step seats one at a time and in order. Not built: a 
 would hold forever: sealed frames dispatch front-first and the front holds while a member lane is blocked
 (scheduler/frame.rs plan_dispatch), so a waiting take at the front keeps its put sealed behind it; the take would
 have to leave its sealed frame, which a frame dispatching whole forbids.
+
+## F13 — Cerebras states a shared pool; the pinned kv store goes
+`runtime::store::registry::register_model_with_chunks` still builds `KvStore::with_pages` (a pinned run of device
+pages with its own `host_pool`) for an engine whose chunk facts state no shared pool. Only engine-cerebras does today
+(degenerate facts, out of scope for the memory-redesign PR). Because of it, `KvStore::alloc_host_slots` keeps a split
+on the pool kind (`None` on a shared pool), and handle/snapshot stage by that split while offload stages through the
+shared pool's tier slots (sc/plex11-offload-staging). Once Cerebras states a single-shape shared pool, `with_pages`,
+`with_pool`'s pinned use, `host_pool`, `alloc_host_slots` and the split in handle/snapshot all delete, and every engine
+takes `shared_stores`.
