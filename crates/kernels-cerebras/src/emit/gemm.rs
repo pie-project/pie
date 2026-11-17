@@ -13,6 +13,8 @@
 
 use std::fmt::Write as _;
 
+use super::placed::{At, Placed, Span};
+
 use poem_ir::ValueId;
 
 use crate::emit::grid::{GridArray, GridFill};
@@ -656,40 +658,39 @@ fn table_syms(p: &GemmProgram) -> Vec<(String, bool)> {
 /// `layout.csl`: the array's code and every colour's routes by loops.
 #[allow(clippy::too_many_lines)]
 fn layout_file(p: &GemmProgram) -> String {
+    placed(p).csl()
+}
+
+/// The program's placement: the array's PEs and the tapes' below them, every line's and tree's
+/// routes, the host's symbols.
+#[must_use]
+pub fn placed(p: &GemmProgram) -> Placed {
     let (w, h) = (p.c, p.r);
     let fh = h + p.tape;
-    let mut t = format!(
-        "// A GEMM-regime reading's wafer program (kernels-cerebras emit::gemm): an array of {w} x {h} PEs, {} rows of tapes below it.\nconst memcpy = @import_module(\"<memcpy/get_params>\", .{{ .width = {w}, .height = {fh} }});\nlayout {{\n  @set_rectangle({w}, {fh});\n  for (@range(u16, 0, {w}, 1)) |x| {{ const mp = memcpy.get_params(x); for (@range(u16, 0, {h}, 1)) |y| {{ @set_tile_code(x, y, \"gpe.csl\", .{{ .memcpy_params = mp }}); }} }}\n",
-        p.tape
+    let mut l = Placed::new(
+        format!(
+            "// A GEMM-regime reading's wafer program (kernels-cerebras emit::gemm): an array of {w} x {h} PEs, {} rows of tapes below it.",
+            p.tape
+        ),
+        w,
+        fh,
     );
+    let ax = (0, w, 1);
+    let ay = (0, h, 1);
+    let at = |xs: Span, ys: Span| At::Region(xs, ys);
+    l.tile(at(ax, ay), "gpe.csl", &[]);
     for k in 0..p.tape {
         let co = if k == 0 { C_WT } else { C_TA[(k % 2) as usize] };
         let ci = C_TA[((k + 1) % 2) as usize];
-        let _ = writeln!(
-            t,
-            "  for (@range(u16, 0, {w}, 1)) |x| {{ const mp = memcpy.get_params(x); for (@range(u16, {0}, {1}, 1)) |y| {{ @set_tile_code(x, y, \"gtape.csl\", .{{ .memcpy_params = mp, .C_O = {co}, .C_I = {ci} }}); }} }}",
-            h + k,
-            h + k + 1
+        l.tile(
+            at(ax, (h + k, h + k + 1, 1)),
+            "gtape.csl",
+            &[("C_O", co.to_string()), ("C_I", ci.to_string())],
         );
     }
-    let mut rule = |c: u32, xs: (u32, u32, u32), ys: (u32, u32, u32), rx: &str, tx: &[&str]| {
-        if xs.0 >= xs.1 || ys.0 >= ys.1 || tx.is_empty() {
-            return;
-        }
-        let _ = writeln!(
-            t,
-            "  for (@range(u16, {}, {}, {})) |x| {{ for (@range(u16, {}, {}, {})) |y| {{ @set_color_config(x, y, @get_color({c}), .{{ .routes = .{{ .rx = .{{ {rx} }}, .tx = .{{ {} }} }} }}); }} }}",
-            xs.0,
-            xs.1,
-            xs.2,
-            ys.0,
-            ys.1,
-            ys.2,
-            tx.join(", ")
-        );
+    let mut rule = |c: u32, xs: Span, ys: Span, rx: &'static str, tx: &[&'static str]| {
+        l.route(c, at(xs, ys), rx, tx);
     };
-    let ay = (0, h, 1);
-    let ax = (0, w, 1);
     // the row line: east (pass on to the ramp; the last to the ramp), west
     rule(C_XF, (0, w - 1, 1), ay, "WEST", &["EAST", "RAMP"]);
     rule(C_XF, (w - 1, w, 1), ay, "WEST", &["RAMP"]);
@@ -742,17 +743,12 @@ fn layout_file(p: &GemmProgram) -> String {
         ("hsc", "f32"),
         ("hout", "f32"),
     ] {
-        let _ = writeln!(t, "  @export_name(\"{n}\", [*]{ty}, true);");
+        l.export(n, ty);
     }
     for (s, u16) in table_syms(p) {
-        let _ = writeln!(
-            t,
-            "  @export_name(\"{s}\", [*]{}, true);",
-            if u16 { "u16" } else { "f32" }
-        );
+        l.export(&s, if u16 { "u16" } else { "f32" });
     }
-    t.push_str("  @export_name(\"run\", fn() void);\n}\n");
-    t
+    l
 }
 
 /// The emitted program.

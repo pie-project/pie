@@ -784,18 +784,79 @@ impl Report {
 /// its routes `routes` where the layout does not set them (a decode program's `rcfg.txt`).
 #[must_use]
 pub fn program(files: &BTreeMap<String, String>, routes: Option<Routes>) -> Report {
-    let mut rep = Report::default();
     let Some(text) = files.get("layout.csl") else {
+        let mut rep = Report::default();
         rep.errors.push("no layout.csl".into());
         return rep;
     };
-    let (mut r, tiles) = match layout(text) {
-        Ok(x) => x,
+    match layout(text) {
+        Ok((r, tiles)) => placed_with(files, r, &tiles, routes),
         Err(e) => {
+            let mut rep = Report::default();
             rep.errors.push(e);
-            return rep;
+            rep
         }
+    }
+}
+
+/// A placement's routes and tiles as the check reads them (no `layout.csl` to parse).
+#[must_use]
+pub fn layout_ir(p: &crate::emit::placed::Placed) -> (Routes, Tiles) {
+    use crate::emit::placed::Placed;
+    let mut r = Routes {
+        w: i64::from(p.w),
+        h: i64::from(p.h),
+        ..Routes::default()
     };
+    for rt in &p.routes {
+        let word = dirs_word(rt.rx, true) | dirs_word(&rt.tx.join(", "), false);
+        for (x, y) in Placed::pes(rt.at) {
+            r.set(i64::from(x), i64::from(y), i64::from(rt.colour), word);
+        }
+    }
+    let mut tiles = Tiles::new();
+    for t in &p.tiles {
+        let params: BTreeMap<String, i64> = t
+            .params
+            .iter()
+            .filter_map(|(k, v)| v.parse().ok().map(|v| (k.clone(), v)))
+            .collect();
+        for (x, y) in Placed::pes(t.at) {
+            tiles.insert(
+                (i64::from(x), i64::from(y)),
+                Tile {
+                    file: t.file.clone(),
+                    params: params.clone(),
+                },
+            );
+        }
+    }
+    (r, tiles)
+}
+
+/// [`program`] over a placement (its PE files in `own`, the crate's ops beside them).
+#[must_use]
+pub fn placed(p: &crate::emit::placed::Placed, own: &[(String, String)]) -> Report {
+    let mut files: BTreeMap<String, String> = BTreeMap::new();
+    for (n, s) in crate::sources::OPS.iter().chain(crate::sources::STREAM_OPS) {
+        files.insert(format!("ops/{n}"), (*s).to_string());
+    }
+    for (n, s) in own {
+        files.insert(n.clone(), s.clone());
+    }
+    let (r, tiles) = layout_ir(p);
+    placed_with(&files, r, &tiles, None)
+}
+
+/// The checks over routes `r` and tiles `tiles`, the PEs' files in `files`, `routes` a decode
+/// program's from its rcfg.
+fn placed_with(
+    files: &BTreeMap<String, String>,
+    mut r: Routes,
+    tiles: &Tiles,
+    routes: Option<Routes>,
+) -> Report {
+    let mut rep = Report::default();
     // (a decode program's queues are bound at its start from its rcfg words, which the
     // fabric's own check holds to its routes: the files' bindings are placeholders)
     let runtime_queues = routes.is_some();
@@ -811,7 +872,7 @@ pub fn program(files: &BTreeMap<String, String>, routes: Option<Routes>) -> Repo
     rep.errors.extend(flow(&r));
     // each distinct (file, parameters) once
     let mut seen: BTreeMap<(String, Vec<(String, i64)>), Held> = BTreeMap::new();
-    for (&(x, y), t) in &tiles {
+    for (&(x, y), t) in tiles {
         let key = (
             t.file.clone(),
             t.params.iter().map(|(k, v)| (k.clone(), *v)).collect(),
@@ -1072,7 +1133,8 @@ mod tests {
         let p =
             stream::gemm::program(&klein, &ko, &rows, None, (b.w, b.h), 1).expect("klein places");
         let e = crate::emit::gemm::emit(&p).expect("it emits");
-        let rep = files(&e.files);
+        // (the check reads the placement as the emitter states it)
+        let rep = placed(&crate::emit::gemm::placed(&p), &e.files);
         eprintln!("klein 1024² denoise: {}", rep.line());
         assert!(
             rep.errors.is_empty(),

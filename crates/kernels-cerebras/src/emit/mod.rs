@@ -8,6 +8,7 @@ pub mod grid;
 pub mod host;
 pub mod layout;
 pub mod params;
+pub mod placed;
 pub mod rcfg;
 pub mod region;
 pub mod stamps;
