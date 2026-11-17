@@ -5,7 +5,9 @@
 //! streaming skeleton covers run on it, the epilogue fused (the gemv one
 //! row; the rows skeleton up to its tile of 16 rows of one part, a
 //! structural bound), the kernel streaming the weight once through every
-//! row; every other runs cuBLASLt's first heuristic algorithm for its shape
+//! row; as few rows of a region of more parts run fused on the skinny
+//! skeleton where it covers them; every other
+//! runs cuBLASLt's first heuristic algorithm for its shape
 //! (its own ranking, deterministic for the shape, the workspace and the
 //! library), an anchored region with an epilogue cuBLASLt lands on that
 //! algorithm with it, else the product then its epilogue on the row
@@ -198,8 +200,24 @@ pub(crate) fn anchored(
     if m <= 0 || n <= 0 || k <= 0 || epi.plain() || ins.len() > MAX_INS || outs.len() > MAX_OUTS {
         return Ok(false);
     }
-    if let Some(skeleton) = streamed(epi, m, n, k, &ctx.tuning()) {
+    let tuning = ctx.tuning();
+    if let Some(skeleton) = streamed(epi, m, n, k, &tuning) {
         skeleton.fire(ctx, epi, w, act, ins, outs, paging, m, n, k)?;
+        return Ok(true);
+    }
+    // Few rows of a region the rows skeleton does not take for its parts (a
+    // packed gate | up) run fused on the skinny skeleton where it covers
+    // them at its own tile (no head's span): one pass over the product where
+    // the unfused leg is two launches and the product's round trip through
+    // memory. A head's span tiles the skinny skeleton by whole heads, a
+    // grid of `n / head width` blocks, a few SMs' worth: such a region keeps
+    // the unfused leg, its product streamed on the rows skeleton's grid.
+    if m <= crate::linear::skeleton::ROWS_M as i32
+        && epi.parts() > 1
+        && epi.span() == 1
+        && Skeleton::Skinny.covers(epi, m, n, k, &tuning)
+    {
+        Skeleton::Skinny.fire(ctx, epi, w, act, ins, outs, paging, m, n, k)?;
         return Ok(true);
     }
     if let [out] = outs

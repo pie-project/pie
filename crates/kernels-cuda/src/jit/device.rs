@@ -194,6 +194,17 @@ pub(crate) fn multiprocessors() -> Option<u32> {
 }
 
 #[must_use]
+pub(crate) fn max_threads_per_sm() -> Option<u32> {
+    static COUNT: OnceLock<Mutex<HashMap<i32, Option<u32>>>> = OnceLock::new();
+    per_device(&COUNT, |o| {
+        attribute(
+            rt::cudaDeviceAttr::cudaDevAttrMaxThreadsPerMultiProcessor,
+            o,
+        )
+    })
+}
+
+#[must_use]
 pub(crate) fn compute_capability_major() -> Option<u32> {
     static MAJOR: OnceLock<Mutex<HashMap<i32, Option<u32>>>> = OnceLock::new();
     per_device(&MAJOR, |ordinal| {
