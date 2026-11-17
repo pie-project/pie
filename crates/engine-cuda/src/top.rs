@@ -103,42 +103,16 @@ pub fn widest(rungs: &[RungFacts]) -> Option<u32> {
         .max()
 }
 
-/// The device the roofline weighs a fire on (`engine::roofline::Machine`):
-/// its `sms`, the tile cuBLASLt's first heuristic algorithm takes at each
-/// dense bf16 shape under `chip`'s workspace (on ROCm, and where cuBLASLt
-/// names none, its 128 x 128), and the paged prefill's query tile (its 128
-/// packed rows) at `kernel.sdpa.prefill.ctas_per_sm` a SM.
-#[must_use]
-pub fn machine(chip: &profile::Profile, sms: u32) -> engine::roofline::Machine {
-    use engine::roofline::Tile;
-    let tuning = kernels_cuda::tuning::Tuning::of(chip);
-    let fallback = Tile::of(128, 128);
-    #[cfg(feature = "cuda")]
-    let gemm_tile: engine::roofline::TileOf = std::sync::Arc::new(move |m, n, k| {
-        kernels_cuda::linear::gemm::tile(&tuning, m, n, k)
-            .map_or(fallback, |(rows, cols, splits)| Tile { rows, cols, splits })
-    });
-    #[cfg(not(feature = "cuda"))]
-    let gemm_tile: engine::roofline::TileOf = std::sync::Arc::new(move |_, _, _| fallback);
-    engine::roofline::Machine {
-        sms,
-        gemm_tile,
-        attn_rows: 128,
-        attn_ctas_per_sm: tuning.prefill_ctas_per_sm.max(1),
-    }
-}
-
-/// The top rung of `rungs` on `device` (`machine`), whose profile states
-/// `rates`, over a live range of `live` bytes ([`engine::load::choose`]).
+/// The top rung of `rungs` on `device`, whose profile states `rates`, over
+/// a live range of `live` bytes ([`engine::load::choose`]).
 pub fn choose(
     rungs: &[RungFacts],
     live: u64,
     rates: &profile::fire::Rates,
-    machine: &engine::roofline::Machine,
     device: &str,
     counts: &Counts,
 ) -> Result<TopRung> {
-    engine::load::choose(rungs, live, rates, machine, device, counts)
+    engine::load::choose(rungs, live, rates, device, counts)
         .map(|(top, _)| top)
         .map_err(|refused| Fault::Card(refused.to_string()))
 }
@@ -177,16 +151,13 @@ mod tests {
     /// The L40S device file's rates.
     fn l40s() -> profile::fire::Rates {
         profile::fire::Rates {
-            gemm_tflops: Some(249.0),
-            attn_tflops: Some(100.0),
+            gemm_tflops_by_rows: Some(vec![(256, 100.0), (8192, 249.0)]),
+            attn_tflops_by_keys: Some(vec![(512, 50.0), (8192, 100.0)]),
             hbm_gbps: Some(654.0),
+            elementwise_gbps: Some(400.0),
             launch_ns: Some(1620),
             ..profile::fire::Rates::default()
         }
-    }
-
-    fn card() -> engine::roofline::Machine {
-        engine::roofline::Machine::fixed(142, engine::roofline::Tile::of(128, 128), 128)
     }
 
     fn candidate(tokens: u32, span_mib: u64) -> Candidate {
@@ -211,7 +182,6 @@ mod tests {
             &rungs,
             8 << 30,
             &profile::fire::Rates::default(),
-            &card(),
             "NVIDIA L40S",
             &counts(),
         )
@@ -245,8 +215,8 @@ mod tests {
         assert_eq!(rungs[0].lanes, 256);
         assert_eq!(rungs[3].infeasible, Some(NO_ROOM));
         assert_eq!(rungs[4].infeasible, Some(NO_PLAN));
-        let top = choose(&rungs, live, &l40s(), &card(), "NVIDIA L40S", &counts()).unwrap();
-        let estimate = engine::load::estimate(&counts(), &l40s(), &card()).unwrap();
+        let top = choose(&rungs, live, &l40s(), "NVIDIA L40S", &counts()).unwrap();
+        let estimate = engine::load::estimate(&counts(), &l40s()).unwrap();
         assert_eq!(
             top,
             engine::load::top_rung(&rungs, live, &estimate).unwrap()
@@ -256,15 +226,7 @@ mod tests {
             candidates[top.tokens.trailing_zeros() as usize - 10].span
         );
         // Every rung refused: the ruling's refusal, each rung named.
-        let err = choose(
-            &rungs[3..],
-            live,
-            &l40s(),
-            &card(),
-            "NVIDIA L40S",
-            &counts(),
-        )
-        .unwrap_err();
+        let err = choose(&rungs[3..], live, &l40s(), "NVIDIA L40S", &counts()).unwrap_err();
         assert!(
             err.to_string()
                 .contains(&format!("8192 tokens (span 2400 MiB): {NO_ROOM}")),

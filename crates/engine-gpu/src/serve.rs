@@ -1071,16 +1071,10 @@ impl<B: Serve> Shell<B> {
             // device's fire top (`engine::roofline::fire_top` over its rates):
             // no rung past it can be chosen. A device without the rates has
             // none, and the ruling refuses it by name.
-            let saturated = engine::load::gemm_constants(&device_profile.rates()).map_or(
-                u32::MAX,
-                |constants| {
-                    engine::roofline::fire_top(
-                        &B::rung_lattice(),
-                        &constants,
-                        &crate::rates::machine(),
-                    )
-                },
-            );
+            let saturated = engine::roofline::Constants::of(&device_profile.rates())
+                .map_or(u32::MAX, |constants| {
+                    engine::roofline::fire_top(&B::rung_lattice(), &constants)
+                });
             let top = budgets.tokens.max_tokens.min(saturated);
             let mut rung_tokens: Vec<u32> = B::rung_lattice()
                 .into_iter()
@@ -1112,17 +1106,13 @@ impl<B: Serve> Shell<B> {
                 &padded,
             );
             if weighed.is_none() {
-                weighed = crate::top::estimate(
-                    &counts,
-                    &device_profile.rates(),
-                    &crate::rates::machine(),
-                )
-                .ok()
-                .map(|estimate| Weighed {
-                    rungs: rungs.clone(),
-                    estimate,
-                    live,
-                });
+                weighed = crate::top::estimate(&counts, &device_profile.rates())
+                    .ok()
+                    .map(|estimate| Weighed {
+                        rungs: rungs.clone(),
+                        estimate,
+                        live,
+                    });
             }
             let pick = match (&chosen, boot.top) {
                 (None, Top::Ruled) => {

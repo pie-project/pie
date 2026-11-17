@@ -2,14 +2,19 @@
 //! them, at the shapes every backend times ([`engine::rates`]), each through
 //! the kernel serving dispatches under the device's own tuning:
 //!
-//! * the matmul: `linear::gemm::matmul` at each of
-//!   [`engine::rates::GEMM_SHAPES`], each repeat over the next of
-//!   engine::rates::weights_at's distinct weights so every one streams from memory, as a fire's do;
-//! * attention: `attn::arbiter::prefill` at [`engine::rates::ATTN_SHAPE`]
-//!   over [`engine::rates::ATTN_KEYS`] keys,
+//! * the matmul curve: `linear::gemm::matmul`, `m x GEMM_WIDTH x
+//!   GEMM_WIDTH` at each of [`engine::rates::GEMM_ROWS`], each repeat over
+//!   the next of engine::rates::weights_at's distinct weights so every one
+//!   streams from memory, as a fire's do;
+//! * the attention curve: `attn::arbiter::prefill` at
+//!   [`engine::rates::ATTN_SHAPE`] over each of [`engine::rates::ATTN_KEYS`]
+//!   keys at d 128 (64 and 256 at the longest keys, said beside it),
 //!   causal, over a bf16 pool of the 16-token pages serving builds, laid
 //!   in engine::rates::attn_page_order's scattered order, each repeat the
 //!   next of engine::rates::attn_sets_at's q / kv sets so each reads cold;
+//! * the per-row ops: `elemwise::norm::rmsnorm` then `linear::mlp::swiglu`
+//!   at [`engine::rates::ELEMENTWISE_SHAPE`], each repeat the next of
+//!   engine::rates::elementwise_sets' sets;
 //! * the scan: `ssm::causal_conv1d_chunked` then `ssm::gated_delta_chunked`
 //!   at [`engine::rates::SCAN_SHAPE`];
 //! * a 256 MiB blit between two buffers (read and write counted), and a
@@ -35,15 +40,6 @@ use kernels_metal::tensor::{RaggedTensor, RecurrentPool};
 use kernels_metal::{KvPool, PrefillPlan, StateMap, Tensor, Tuning, attn, ssm};
 use poem_ir::Dtype;
 use profile::fire::Rates;
-
-/// The device the roofline weighs a Metal fire on: the matmul and the
-/// attention kernels' work-groups over the GPU's cores are not modelled, so
-/// it is one unit taking a one-element tile, and no wave is quantized (a
-/// matmul's work is its own `2 m n k`; the rates step's counts are the same).
-#[must_use]
-pub fn machine() -> engine::roofline::Machine {
-    engine::roofline::Machine::fixed(1, engine::roofline::Tile::of(1, 1), 1)
-}
 
 /// The widest fire this backend's lattice reaches: the tokens a served
 /// Metal load is asked ([`crate::FIRE`]).
@@ -215,6 +211,46 @@ impl Bench<'_> {
             engine::rates::GEMM_DISPATCHES,
             gap,
             engine::rates::gemm_flops(m, n, k),
+        )
+    }
+
+    /// The per-row ops' bandwidth: the rmsnorm then the swiglu at
+    /// `engine::rates::ELEMENTWISE_SHAPE`, each repeat the next of
+    /// `engine::rates::elementwise_sets` sets, their bytes over their time.
+    fn elementwise_bytes(&self, gap: f64) -> Result<f64, String> {
+        let (rows, width) = engine::rates::ELEMENTWISE_SHAPE;
+        let row = u64::from(rows) * u64::from(width) * 2;
+        let weight = self.operand(u64::from(width) * 2)?;
+        let wt = self.tensor(&weight, 1, width, Dtype::Bf16)?;
+        let mut held = Vec::new();
+        let mut sets = Vec::new();
+        for _ in 0..engine::rates::elementwise_sets() {
+            let (x, normed, packed, y) = (
+                self.operand(row)?,
+                self.zeroed(row)?,
+                self.operand(2 * row)?,
+                self.zeroed(row)?,
+            );
+            sets.push((
+                self.tensor(&x, rows, width, Dtype::Bf16)?,
+                self.tensor(&normed, rows, width, Dtype::Bf16)?,
+                self.tensor(&packed, rows, 2 * width, Dtype::Bf16)?,
+                self.tensor(&y, rows, width, Dtype::Bf16)?,
+            ));
+            held.extend([x, normed, packed, y]);
+        }
+        let seconds = self.timed(&|sink, at| {
+            let (x, normed, packed, y) = sets[at as usize % sets.len()];
+            kernels_metal::elemwise::norm::rmsnorm(sink, x, wt, 1e-6, normed)?;
+            kernels_metal::linear::mlp::swiglu(sink, packed, width, y)
+        })?;
+        drop(held);
+        engine::rates::rate_from(
+            "per-row ops",
+            seconds * 1e9,
+            2,
+            gap,
+            engine::rates::elementwise_bytes(),
         )
     }
 
@@ -501,46 +537,53 @@ pub fn measure(
             warmed.rate / 1e3
         ));
     }
-    // The matmul at each of engine::rates::GEMM_SHAPES, each over its own
-    // planes (engine::rates::weights_at: 768 MiB, at least 12, so each
-    // repeat streams its weight as a layer's matmul does); the fastest.
-    let mut gemm = 0.0f64;
-    for (m, n, k) in engine::rates::GEMM_SHAPES {
-        bench.handles = Handles::new();
-        let plane = operand(&bench.pattern, (n * k) as usize * 2);
-        let weights = (0..engine::rates::weights_at(n, k))
-            .map(|_| {
-                let w = bench.buffer(&plane)?;
-                Ok((bench.tensor(&w, n, k, Dtype::Bf16)?, w))
-            })
-            .collect::<Result<Vec<(Tensor, Buffer)>, String>>()?;
-        let tensors: Vec<Tensor> = weights.iter().map(|(t, _)| *t).collect();
-        let rate = bench.matmul_flops(m, n, k, &tensors, gap)?;
+    // The matmul curve, m x GEMM_WIDTH x GEMM_WIDTH at each of
+    // engine::rates::GEMM_ROWS, over its planes (engine::rates::weights_at:
+    // 768 MiB, at least 12, so each repeat streams its weight as a layer's
+    // matmul does).
+    let w = engine::rates::GEMM_WIDTH;
+    bench.handles = Handles::new();
+    let plane = operand(&bench.pattern, (w * w) as usize * 2);
+    let weights = (0..engine::rates::weights_at(w, w))
+        .map(|_| {
+            let b = bench.buffer(&plane)?;
+            Ok((bench.tensor(&b, w, w, Dtype::Bf16)?, b))
+        })
+        .collect::<Result<Vec<(Tensor, Buffer)>, String>>()?;
+    let tensors: Vec<Tensor> = weights.iter().map(|(t, _)| *t).collect();
+    let mut gemm = Vec::new();
+    for m in engine::rates::GEMM_ROWS {
+        let rate = bench.matmul_flops(m, w, w, &tensors, gap)?;
         say(&format!(
-            "  bf16 matmul {m} x {n} x {k}: {:.4} TFLOP/s",
+            "  bf16 matmul {m} x {w} x {w}: {:.4} TFLOP/s",
             rate / 1e3
         ));
-        gemm = gemm.max(rate);
+        gemm.push((m, rate / 1e3));
     }
-    // The attention over engine::rates::ATTN_KEYS keys at each width, 128's
-    // the rate.
-    let mut attn = 0.0;
-    for d in engine::rates::ATTN_DIMS {
+    drop(weights);
+    // The attention curve at d 128; the other widths at the longest keys.
+    let mut attn = Vec::new();
+    for keys in engine::rates::ATTN_KEYS {
         bench.handles = Handles::new();
-        let shape = engine::rates::ATTN_SHAPE
-            .at(engine::rates::ATTN_KEYS)
-            .with_dim(d);
-        let rate = bench.attention_flops(shape, gap)?;
+        let rate = bench.attention_flops(engine::rates::ATTN_SHAPE.at(keys), gap)?;
         say(&format!(
-            "  prefill attention, {0} rows over {0} keys, d {1}: {2:.4} TFLOP/s",
-            shape.keys,
-            shape.head_dim,
+            "  prefill attention, {keys} rows over {keys} keys, d 128: {:.4} TFLOP/s",
             rate / 1e3
         ));
-        if d == 128 {
-            attn = rate;
-        }
+        attn.push((keys, rate / 1e3));
     }
+    let longest = engine::rates::ATTN_KEYS[engine::rates::ATTN_KEYS.len() - 1];
+    for d in engine::rates::ATTN_DIMS.into_iter().filter(|&d| d != 128) {
+        bench.handles = Handles::new();
+        let rate = bench.attention_flops(engine::rates::ATTN_SHAPE.at(longest).with_dim(d), gap)?;
+        say(&format!(
+            "  prefill attention, {longest} rows over {longest} keys, d {d}: {:.4} TFLOP/s",
+            rate / 1e3
+        ));
+    }
+    bench.handles = Handles::new();
+    let elementwise = bench.elementwise_bytes(gap)?;
+    say(&format!("  rmsnorm and swiglu: {elementwise:.1} GB/s"));
     bench.handles = Handles::new();
     let scan = bench.scan_elements(SCAN_SHAPE.tokens, gap)?;
     say(&format!(
@@ -550,9 +593,10 @@ pub fn measure(
     say(&format!("  256 MiB blit: {bytes:.1} GB/s read and write"));
     Ok(Rates {
         launch_ns: Some(launch),
-        gemm_tflops: Some(gemm / 1e3),
-        attn_tflops: Some(attn / 1e3),
+        gemm_tflops_by_rows: Some(gemm),
+        attn_tflops_by_keys: Some(attn),
         hbm_gbps: Some(bytes),
+        elementwise_gbps: Some(elementwise),
         scan_gelems: Some(scan),
     })
 }

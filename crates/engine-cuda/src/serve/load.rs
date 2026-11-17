@@ -79,12 +79,10 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     .map_err(crate::error::Fault::Card)?;
     device.set_tuning(kernels_cuda::tuning::Tuning::of(&chip));
     let engine = crate::chip::Engine::of(&chip);
-    // The device the roofline weighs a fire on, and its fire top
-    // (`crate::api::fire_top_of`): past it no rung's efficiency improves, so
-    // none past it can be chosen. A load asked nothing fires up to it, and
-    // the estimate picks below.
-    let machine = crate::top::machine(&chip, device.device().num_sm);
-    let fire_top = crate::api::fire_top_of(&chip, &machine, device.name())?;
+    // The card's fire top (`crate::api::fire_top_of`): past it no rung's
+    // efficiency improves, so none past it can be chosen. A load asked
+    // nothing fires up to it, and the estimate picks below.
+    let fire_top = crate::api::fire_top_of(&chip, device.name())?;
     if boot.budget.max_tokens == 0 {
         boot.budget.max_tokens = fire_top;
         // only where it at least halves the fire: a trunk of few value heads seats enough lanes that the
@@ -390,14 +388,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             computed,
         );
         let counts = crate::top::counts(&boot.trace)?;
-        let top = crate::top::choose(
-            &rungs,
-            after_weights,
-            &chip.rates(),
-            &machine,
-            device.name(),
-            &counts,
-        )?;
+        let top = crate::top::choose(&rungs, after_weights, &chip.rates(), device.name(), &counts)?;
         eprintln!(
             "engine-cuda: {}",
             engine::load::line_of(
@@ -408,7 +399,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
                 chip.tuned()
             )
         );
-        weighed = engine::load::estimate(&counts, &chip.rates(), &machine)
+        weighed = engine::load::estimate(&counts, &chip.rates())
             .ok()
             .map(|estimate| crate::top::Weighed {
                 rungs: rungs.clone(),

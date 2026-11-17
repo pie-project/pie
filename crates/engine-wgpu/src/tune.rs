@@ -30,10 +30,18 @@ pub fn rates(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Outco
     let tuning = crate::tuning::Tuning::new(base.clone(), device.cores());
     let r = crate::rates::measure_saying(&device, &tuning, say).map_err(|e| e.to_string())?;
     say(&format!(
-        "[rates]: matmul {:.1} TFLOP/s, attention {:.1} TFLOP/s, scan {:.2} G state elements/s, \
-         {:.0} GB/s, launch {:.2} us",
-        r.gemm_tflops.unwrap_or(0.0),
-        r.attn_tflops.unwrap_or(0.0),
+        "[rates]: matmul {:.1} TFLOP/s at its widest rows, attention {:.1} TFLOP/s at its \
+         longest keys, per-row ops {:.0} GB/s, scan {:.2} G state elements/s, {:.0} GB/s, \
+         launch {:.2} us",
+        r.gemm_tflops_by_rows
+            .as_ref()
+            .and_then(|c| c.last())
+            .map_or(0.0, |&(_, t)| t),
+        r.attn_tflops_by_keys
+            .as_ref()
+            .and_then(|c| c.last())
+            .map_or(0.0, |&(_, t)| t),
+        r.elementwise_gbps.unwrap_or(0.0),
         r.scan_gelems.unwrap_or(0.0),
         r.hbm_gbps.unwrap_or(0.0),
         r.launch_ns.unwrap_or(0) as f64 / 1e3

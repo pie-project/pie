@@ -925,11 +925,11 @@ fn check_one(
     let (at_est, best) = (score(by_est.tokens), score(by_meas.tokens));
     let e = &weighed.estimate;
     let mut out = format!(
-        "{model} on {device}: {:.0} flop/ns matmul, {:.0} B/ns, launch {:.0} ns; dense \
+        "{model} on {device}: {:.0} flop/ns matmul at its widest rows, {:.0} B/ns, launch {:.0} ns; dense \
          {:.2} GB\n  rung  measured  estimated | est (ms): launch work weights flops \
          readout attn kv recur elem | device by kind (ms, dispatches timed alone): {}  dispatches  sum  \
          wall-sum\n",
-        e.rates.gemm_flops_per_ns,
+        e.rates.gemm_by_rows.last().map_or(0.0, |&(_, r)| r),
         e.rates.bytes_per_ns,
         e.rates.launch_ns,
         e.dense_bytes as f64 / 1e9,

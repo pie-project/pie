@@ -985,8 +985,16 @@ impl<'a> Walk<'a> {
         };
         for (k, v) in t.iter() {
             let slot = match k.get_ref().as_ref() {
-                "gemm_tflops" => &mut rates.gemm_tflops,
-                "attn_tflops" => &mut rates.attn_tflops,
+                key @ ("gemm_tflops_by_rows" | "attn_tflops_by_keys") => {
+                    let curve = self.curve(v, key);
+                    if key == "gemm_tflops_by_rows" {
+                        rates.gemm_tflops_by_rows = curve;
+                    } else {
+                        rates.attn_tflops_by_keys = curve;
+                    }
+                    continue;
+                }
+                "elementwise_gbps" => &mut rates.elementwise_gbps,
                 "hbm_gbps" => &mut rates.hbm_gbps,
                 "scan_gelems" => &mut rates.scan_gelems,
                 "launch_ns" => {
@@ -1006,8 +1014,9 @@ impl<'a> Walk<'a> {
                     self.err(
                         k.span().start,
                         format!(
-                            "`rates` holds `launch_ns`, `gemm_tflops`, `attn_tflops`, `hbm_gbps` \
-                             and `scan_gelems`, not `{other}`"
+                            "`rates` holds `launch_ns`, `gemm_tflops_by_rows`, \
+                             `attn_tflops_by_keys`, `hbm_gbps`, `elementwise_gbps` and \
+                             `scan_gelems`, not `{other}`"
                         ),
                     );
                     continue;
@@ -1026,6 +1035,57 @@ impl<'a> Walk<'a> {
             }
         }
         rates
+    }
+
+    /// `rates.<key>`: `[x, rate]` pairs, a whole positive `x` and a positive
+    /// rate each, non-empty and strictly ascending in `x`.
+    fn curve(&mut self, value: &Spanned<DeValue<'_>>, key: &str) -> Option<Vec<(u32, f64)>> {
+        let what = format!(
+            "`rates.{key}` is a non-empty list of [x, rate] pairs, ascending in x, each rate \
+             positive"
+        );
+        let DeValue::Array(points) = value.get_ref() else {
+            self.err(
+                value.span().start,
+                format!("{what}, not {}", found(value.get_ref())),
+            );
+            return None;
+        };
+        let mut curve: Vec<(u32, f64)> = Vec::with_capacity(points.len());
+        for point in points.iter() {
+            let pair = match point.get_ref() {
+                DeValue::Array(pair) if pair.len() == 2 => {
+                    let x = int(pair[0].get_ref())
+                        .and_then(|i| u32::try_from(i).ok())
+                        .filter(|&m| m > 0);
+                    let rate = match pair[1].get_ref() {
+                        DeValue::Float(f) => f.as_str().replace('_', "").parse::<f64>().ok(),
+                        DeValue::Integer(_) => int(pair[1].get_ref()).map(|i| i as f64),
+                        _ => None,
+                    }
+                    .filter(|f| f.is_finite() && *f > 0.0);
+                    x.zip(rate)
+                }
+                _ => None,
+            };
+            match pair {
+                Some((x, r)) if curve.last().is_none_or(|&(last, _)| x > last) => {
+                    curve.push((x, r))
+                }
+                _ => {
+                    self.err(
+                        point.span().start,
+                        format!("{what}, not {}", found(point.get_ref())),
+                    );
+                    return None;
+                }
+            }
+        }
+        if curve.is_empty() {
+            self.err(value.span().start, format!("{what}, not an empty list"));
+            return None;
+        }
+        Some(curve)
     }
 
     fn target(&mut self, value: &Spanned<DeValue<'_>>) -> Target {

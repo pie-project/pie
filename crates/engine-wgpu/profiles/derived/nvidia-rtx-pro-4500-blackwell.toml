@@ -13,7 +13,10 @@ device = "NVIDIA RTX PRO 4500 Blackwell"
 # WGSL's tiled kernel, timed by the adapter's timestamps, 14.1 TFLOPS; the
 # 256 MiB copy 756 GB/s; the launch a dispatch's own cost inside one frame
 # (1024 of the narrowest matmul against one, in-graph), 4.12 us.
-gemm_tflops = 14.1
+# One point of the matmul curve, the 4096^3 product measured: its rate is
+# read at every row (no curve was timed), and the attention curve and the
+# per-row ops' bandwidth are unstated.
+gemm_tflops_by_rows = [[4096, 14.1]]
 hbm_gbps = 756.0
 launch_ns = 4120
 # Vendor peaks, bounds and not rates: dense bf16 about 202 TFLOPS (NVIDIA

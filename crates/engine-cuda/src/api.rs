@@ -445,18 +445,14 @@ pub(crate) fn on_lattice(engine: &crate::chip::Engine, top: u32, tokens: u32) ->
 }
 
 /// The card's fire top (`engine::roofline::fire_top`): on its rung lattice
-/// as far as a `u32` of rows reaches, the last row where a dense matmul's
-/// cost a row, by the roofline over its profile's rates on `machine`, still
-/// falls more than `profile::AGREEMENT` below its least before. Past it no
+/// as far as a `u32` of rows reaches, where a doubling of a dense matmul's
+/// rows stops cutting its cost a row by more than `profile::AGREEMENT`, by
+/// its profile's measured matmul curve. Past it no
 /// rung's efficiency improves, so none past it can be chosen. A profile
 /// without the matmul rate or the bandwidth has no top, and a load on it is
 /// refused for its missing rates, by name.
-pub(crate) fn fire_top_of(
-    chip: &profile::Profile,
-    machine: &engine::roofline::Machine,
-    device: &str,
-) -> crate::error::Result<u32> {
-    let constants = engine::load::gemm_constants(&chip.rates()).map_err(|key| {
+pub(crate) fn fire_top_of(chip: &profile::Profile, device: &str) -> crate::error::Result<u32> {
+    let constants = engine::roofline::Constants::of(&chip.rates()).map_err(|key| {
         Fault::Card(
             engine::load::Refused::NoRates {
                 device: device.to_owned(),
@@ -467,7 +463,7 @@ pub(crate) fn fire_top_of(
     })?;
     let mut lattice = rung_lattice(&crate::chip::Engine::of(chip), u32::MAX);
     lattice.pop();
-    Ok(engine::roofline::fire_top(&lattice, &constants, machine))
+    Ok(engine::roofline::fire_top(&lattice, &constants))
 }
 
 /// The load's budgets for `trace`: its logit readouts sized to what the

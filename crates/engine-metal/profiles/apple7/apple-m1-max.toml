@@ -14,13 +14,14 @@ assumes = { cores = 24 }
 # sets 2.52 TFLOPS at 512 keys of 64 to 6.31 at 16384 of 128; the blit
 # against 400 GB/s of LPDDR5. Every float operand engine::rates' pattern.
 [rates]
-# Reduced to the roofline's constants from the grid measured above on
-# 2026-11-17: gemm_tflops its 8192 x 4096 x 4096 point (the grid ran no
-# 8192^3), attn_tflops
-# its longest keys (16384) at d 128, scan_gelems its 2048-token point.
+# Reduced from the grid `pie tune metal --rates` measured on 2026-11-16 (its
+# provenance below) on 2026-11-17: the matmul curve its n = k = 4096 points
+# at the rows engine::rates times, the attention curve its d 128 points at
+# those keys. The grid timed no per-row ops, so elementwise_gbps is unstated
+# (a load here measures it, or `pie tune metal --rates` does).
 launch_ns = 4449
-gemm_tflops = 5.3
-attn_tflops = 6.3
+gemm_tflops_by_rows = [[256, 5.07], [512, 5.17], [1024, 5.24], [2048, 5.26], [4096, 5.29], [8192, 5.29]]
+attn_tflops_by_keys = [[512, 4.36], [1024, 5.39], [2048, 5.97], [4096, 6.23], [8192, 6.3]]
 hbm_gbps = 376.9
 scan_gelems = 89.9
 

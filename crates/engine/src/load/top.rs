@@ -80,6 +80,7 @@ impl Counts {
         let (mut weight_bytes, mut expert_bytes) = (0u64, 0u64);
         let (mut largest, mut width) = (0u64, 0u64);
         let heads = heads(trace);
+        let classes = poem_ir::residency::residency(trace);
         let (mut readout, mut readout_depth) = (0u64, 0u64);
         let experts = routing(trace);
         // `(n, k, routed)` to the shape's planes, elements a row and bytes.
@@ -98,7 +99,14 @@ impl Counts {
                 readout_depth = readout_depth.max(cols);
                 continue;
             }
-            if kept.tables.contains(&at) {
+            // A token table a gather reads a row of a token: no plane a
+            // fire multiplies by, whatever tier it lies in.
+            if kept.tables.contains(&at)
+                || matches!(
+                    classes.get(at),
+                    Some(poem_ir::residency::Residency::Rows(_))
+                )
+            {
                 continue;
             }
             let bytes = kept.plane_bytes.get(at).copied().unwrap_or(0);
@@ -397,33 +405,23 @@ fn routing(trace: &Trace) -> Option<(u32, u32)> {
     })
 }
 
-/// The estimate of a fire's time on `machine`, a device of `rates`, or the
-/// first rate the model's work needs that the device's profile leaves
-/// unstated: the matmul rate and the bandwidth always, the attention rate
-/// where the model attends, the scan rate where it carries recurrent state.
+/// The estimate of a fire's time on a device of `rates`, or the first rate
+/// the model's work needs that the device's profile leaves unstated: the
+/// matmul curve and the bandwidths always, the attention curve where the
+/// model attends, the scan rate where it carries recurrent state.
 pub fn estimate(
     counts: &Counts,
     rates: &profile::fire::Rates,
-    machine: &crate::roofline::Machine,
 ) -> Result<FireEstimate, &'static str> {
-    let constants = crate::roofline::Constants {
-        launch_ns: rates.launch_ns.unwrap_or(0) as f64,
-        gemm_flops_per_ns: rates.gemm_flops_per_ns().ok_or("gemm_tflops")?,
-        bytes_per_ns: rates.bytes_per_ns().ok_or("hbm_gbps")?,
-        attn_flops_per_ns: match rates.attn_flops_per_ns() {
-            Some(rate) => rate,
-            None if counts.attn_flops_per_row_key == 0 => f64::INFINITY,
-            None => return Err("attn_tflops"),
-        },
-        scan_elements_per_ns: match rates.scan_gelems {
-            Some(rate) => rate,
-            None if counts.state_elements_per_row == 0 => f64::INFINITY,
-            None => return Err("scan_gelems"),
-        },
-    };
+    let constants = crate::roofline::Constants::of(rates)?;
+    if counts.attn_flops_per_row_key > 0 && rates.attn_tflops_by_keys.is_none() {
+        return Err("attn_tflops_by_keys");
+    }
+    if counts.state_elements_per_row > 0 && rates.scan_gelems.is_none() {
+        return Err("scan_gelems");
+    }
     Ok(FireEstimate {
         rates: constants,
-        machine: machine.clone(),
         attn_head_dim: counts.attn_head_dim,
         dense_bytes: counts.weight_bytes,
         expert_bytes: counts.expert_bytes,
@@ -438,21 +436,6 @@ pub fn estimate(
         elementwise_ops: counts.elementwise_ops.clone(),
         attn_dispatches: counts.attn_dispatches,
         scan_dispatches: counts.scan_dispatches,
-    })
-}
-
-/// The constants of `rates` a fire top is derived from
-/// (`crate::roofline::fire_top`): the matmul rate and the bandwidth, else
-/// the key unstated.
-pub fn gemm_constants(
-    rates: &profile::fire::Rates,
-) -> Result<crate::roofline::Constants, &'static str> {
-    Ok(crate::roofline::Constants {
-        launch_ns: rates.launch_ns.unwrap_or(0) as f64,
-        gemm_flops_per_ns: rates.gemm_flops_per_ns().ok_or("gemm_tflops")?,
-        bytes_per_ns: rates.bytes_per_ns().ok_or("hbm_gbps")?,
-        attn_flops_per_ns: rates.attn_flops_per_ns().unwrap_or(f64::INFINITY),
-        scan_elements_per_ns: rates.scan_gelems.unwrap_or(f64::INFINITY),
     })
 }
 
@@ -482,7 +465,7 @@ impl fmt::Display for Refused {
 
 impl std::error::Error for Refused {}
 
-/// The top rung of `rungs` for `device` (`machine`), whose profile states
+/// The top rung of `rungs` for `device`, whose profile states
 /// `rates`, over a live range of `live` bytes, by the estimate from the
 /// rates alone. A device whose profile states no rates has nothing to weigh
 /// the rungs by, and the load is refused, naming it.
@@ -490,11 +473,10 @@ pub fn choose(
     rungs: &[RungFacts],
     live: u64,
     rates: &profile::fire::Rates,
-    machine: &crate::roofline::Machine,
     device: &str,
     counts: &Counts,
 ) -> Result<(TopRung, FireEstimate), Refused> {
-    let estimate = estimate(counts, rates, machine).map_err(|key| Refused::NoRates {
+    let estimate = estimate(counts, rates).map_err(|key| Refused::NoRates {
         device: device.to_owned(),
         key,
     })?;
@@ -516,7 +498,10 @@ pub fn line_of(
     let r = &tuned.rates;
     let rates = format!(
         "{:.1} TFLOP/s bf16, {:.0} GB/s, launch {} ns",
-        r.gemm_tflops.unwrap_or(0.0),
+        r.gemm_tflops_by_rows
+            .as_ref()
+            .and_then(|c| c.last())
+            .map_or(0.0, |&(_, t)| t),
         r.hbm_gbps.unwrap_or(0.0),
         r.launch_ns.unwrap_or(0)
     );
@@ -577,16 +562,13 @@ mod tests {
         }
     }
 
-    fn machine() -> crate::roofline::Machine {
-        crate::roofline::Machine::fixed(142, crate::roofline::Tile::of(128, 128), 128)
-    }
-
     fn rates() -> profile::fire::Rates {
         profile::fire::Rates {
             launch_ns: Some(5),
-            gemm_tflops: Some(10.0),
-            attn_tflops: Some(7.0),
+            gemm_tflops_by_rows: Some(vec![(256, 5.0), (4096, 10.0)]),
+            attn_tflops_by_keys: Some(vec![(2048, 7.0)]),
             hbm_gbps: Some(100.0),
+            elementwise_gbps: Some(50.0),
             scan_gelems: None,
         }
     }
@@ -595,7 +577,7 @@ mod tests {
     fn without_rates_the_load_is_refused_by_name() {
         let rungs = [rung(1024, 100 * MIB, None), rung(2048, 150 * MIB, None)];
         let bare = profile::fire::Rates::default();
-        let err = choose(&rungs, 1 << 33, &bare, &machine(), "Card X", &counts()).unwrap_err();
+        let err = choose(&rungs, 1 << 33, &bare, "Card X", &counts()).unwrap_err();
         assert!(
             err.to_string()
                 .contains("device Card X has no rates in its profile"),
@@ -608,7 +590,7 @@ mod tests {
         );
         // No feasible rung at all: the ruling's refusal.
         let none = [rung(1024, 300 * MIB, Some("past one binding"))];
-        let err = choose(&none, 1 << 33, &rates(), &machine(), "Card X", &counts()).unwrap_err();
+        let err = choose(&none, 1 << 33, &rates(), "Card X", &counts()).unwrap_err();
         assert!(matches!(err, Refused::NoRung(_)), "{err}");
         assert!(
             err.to_string()
@@ -619,16 +601,23 @@ mod tests {
 
     #[test]
     fn the_estimate_reads_the_rates_and_the_counts() {
-        let e = estimate(&counts(), &rates(), &machine()).unwrap();
+        let e = estimate(&counts(), &rates()).unwrap();
         assert_eq!(e.gemm_shapes, counts().gemm_shapes);
         assert_eq!(
             (
-                e.rates.gemm_flops_per_ns,
-                e.rates.attn_flops_per_ns,
+                e.rates.gemm_by_rows.clone(),
+                e.rates.attn_by_keys.clone(),
                 e.rates.bytes_per_ns,
+                e.rates.elementwise_bytes_per_ns,
                 e.rates.launch_ns
             ),
-            (10_000.0, 7_000.0, 100.0, 5.0)
+            (
+                vec![(256, 5_000.0), (4096, 10_000.0)],
+                vec![(2048, 7_000.0)],
+                100.0,
+                50.0,
+                5.0
+            )
         );
         // No recurrent state: no scan rate read.
         assert_eq!(e.rates.scan_elements_per_ns, f64::INFINITY);
@@ -643,31 +632,35 @@ mod tests {
                 },
             ),
             (
-                "gemm_tflops",
+                "gemm_tflops_by_rows",
                 profile::fire::Rates {
-                    gemm_tflops: None,
+                    gemm_tflops_by_rows: None,
                     ..rates()
                 },
             ),
             (
-                "attn_tflops",
+                "elementwise_gbps",
                 profile::fire::Rates {
-                    attn_tflops: None,
+                    elementwise_gbps: None,
+                    ..rates()
+                },
+            ),
+            (
+                "attn_tflops_by_keys",
+                profile::fire::Rates {
+                    attn_tflops_by_keys: None,
                     ..rates()
                 },
             ),
         ] {
-            assert_eq!(
-                estimate(&counts(), &unstated, &machine()).map(|_| ()),
-                Err(key)
-            );
+            assert_eq!(estimate(&counts(), &unstated).map(|_| ()), Err(key));
         }
         let recurrent = Counts {
             state_elements_per_row: 1 << 20,
             ..counts()
         };
         assert_eq!(
-            estimate(&recurrent, &rates(), &machine()).map(|_| ()),
+            estimate(&recurrent, &rates()).map(|_| ()),
             Err("scan_gelems")
         );
         let scanned = profile::fire::Rates {
@@ -675,7 +668,7 @@ mod tests {
             ..rates()
         };
         assert_eq!(
-            estimate(&recurrent, &scanned, &machine())
+            estimate(&recurrent, &scanned)
                 .unwrap()
                 .rates
                 .scan_elements_per_ns,
@@ -687,24 +680,25 @@ mod tests {
             ..counts()
         };
         let no_attn = profile::fire::Rates {
-            attn_tflops: None,
+            attn_tflops_by_keys: None,
             ..rates()
         };
-        assert!(estimate(&attending_nothing, &no_attn, &machine()).is_ok());
+        assert!(estimate(&attending_nothing, &no_attn).is_ok());
     }
 
     #[test]
     fn the_refusal_names_the_key_unstated() {
         let rungs = [rung(1024, 100 * MIB, None)];
         let rates = profile::fire::Rates {
-            attn_tflops: None,
+            attn_tflops_by_keys: None,
             ..rates()
         };
-        let err = choose(&rungs, 1 << 33, &rates, &machine(), "Card X", &counts()).unwrap_err();
+        let err = choose(&rungs, 1 << 33, &rates, "Card X", &counts()).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "device Card X has no rates in its profile for this model: `[rates] attn_tflops` is \
-             unstated, so nothing weighs its top rung; `pie tune <backend> --rates` measures it"
+            "device Card X has no rates in its profile for this model: `[rates] \
+             attn_tflops_by_keys` is unstated, so nothing weighs its top rung; `pie tune <backend> \
+             --rates` measures it"
         );
     }
 
@@ -861,7 +855,7 @@ mod tests {
         };
         let tuned = profile::fire::Tuned {
             rates: profile::fire::Rates {
-                gemm_tflops: Some(249.0),
+                gemm_tflops_by_rows: Some(vec![(256, 100.0), (8192, 249.0)]),
                 hbm_gbps: Some(654.0),
                 launch_ns: Some(1620),
                 ..profile::fire::Rates::default()

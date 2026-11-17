@@ -50,17 +50,17 @@ dag_streams = true
 dag_streams_until = 256
 
 [rates]
-# `pie tune cuda --rates` on this L40S: the roofline's constants, each a 20 ms
-# burst of its kernel back to back, the median of 5, its launches taken off and
-# its work counted as its waves over the 142 SMs run it. The matmul is the
-# faster of 4096^3 (236.8) and 8192^3 (210.1); the attention at 8192 keys is
-# d 128's (d 64 377.2, d 256 355.2: within 13%, so one rate). Two runs agree
-# within 1.5% on every constant.
+# `pie tune cuda --rates` on this L40S: each a 20 ms burst of its kernel back
+# to back, the median of 5, its launches taken off. The matmul at 4096 x 4096
+# by rows; the attention, one sequence attending itself, d 128, by keys (at
+# 8192 keys d 64 334.3, d 256 313.8); the per-row ops an rmsnorm and a swiglu
+# at 2048 x 4096.
 launch_ns = 904
-gemm_tflops = 236.8
-attn_tflops = 409.3
-hbm_gbps = 656.2
-scan_gelems = 2736.2
+gemm_tflops_by_rows = [[256, 139.1], [512, 181.7], [1024, 206.6], [2048, 217.8], [4096, 214.3], [8192, 190.5]]
+attn_tflops_by_keys = [[512, 98.9], [1024, 166.5], [2048, 237.7], [4096, 299.3], [8192, 361.5]]
+hbm_gbps = 652.1
+elementwise_gbps = 648.8
+scan_gelems = 2725.6
 
 [provenance]
 measured = [
@@ -118,4 +118,4 @@ measured = [
   "compiler.launch_us",
   "compiler.side_streams",
 ]
-rates = "pie tune cuda --rates on 2026-11-17 (pie 0.6.0): NVIDIA L40S; the matmul through cuBLASLt's first heuristic algorithm, each rate a 20 ms burst on the stream timed by events, the median of 5 (the launch of 15), its work its waves over the device's SMs; operands: engine::rates' pattern; at commit 6e685c96c; at engine::rates' shapes (matmul 4096x4096x4096, 8192x8192x8192; attention 8192 keys x keys, 16/8 heads of 128; scan 2048 tokens, 16/16 heads of 128x128, conv 4)"
+rates = "pie tune cuda --rates on 2026-11-17 (pie 0.6.0): NVIDIA L40S; the matmul through cuBLASLt's first heuristic algorithm, each rate a 20 ms burst on the stream timed by events, the median of 5 (the launch of 15); operands: engine::rates' pattern; at commit f6b5b3ca0-wip; at engine::rates' shapes (matmul m x 4096 x 4096, m [256, 512, 1024, 2048, 4096, 8192]; attention keys x keys, keys [512, 1024, 2048, 4096, 8192], 16/8 heads of 128; per-row ops 2048 x 4096; scan 2048 tokens, 16/16 heads of 128x128, conv 4)"

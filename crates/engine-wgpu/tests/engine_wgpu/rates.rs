@@ -14,9 +14,11 @@ fn the_micro_fires_state_rates_and_the_ruling_picks_by_them() {
     let (chip, _) = engine_wgpu::chip::resolve(&device.chip(), None);
     let tuning = engine_wgpu::tuning::Tuning::new(chip.clone(), device.cores());
     let rates = engine_wgpu::rates::measure(&device, &tuning).unwrap();
+    assert!(rates.complete(), "{rates:?}");
+    let widest = |c: &Option<Vec<(u32, f64)>>| c.as_ref().and_then(|c| c.last()).unwrap().1 * 1e3;
     let (flops, bytes, launch) = (
-        rates.gemm_flops_per_ns().unwrap(),
-        rates.bytes_per_ns().unwrap(),
+        widest(&rates.gemm_tflops_by_rows),
+        rates.hbm_gbps.unwrap(),
         rates.launch_ns.unwrap(),
     );
     eprintln!(
@@ -30,8 +32,9 @@ fn the_micro_fires_state_rates_and_the_ruling_picks_by_them() {
     assert!(launch > 0);
     // The attention and scan rates.
     for rate in [
-        rates.attn_flops_per_ns().unwrap(),
+        widest(&rates.attn_tflops_by_keys),
         rates.scan_gelems.unwrap(),
+        rates.elementwise_gbps.unwrap(),
     ] {
         assert!((1.0..1e6).contains(&rate), "{rate}");
     }

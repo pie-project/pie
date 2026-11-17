@@ -108,42 +108,37 @@ impl RungFacts {
 /// dispatches takes its own work and a launch, and a dispatch of the
 /// compiled plan the model's counts name no work for takes a launch. A
 /// dispatch's work is the longer of its compute and its memory traffic: a
-/// matmul plane's compute (its tiles over its waves on the device's SMs,
-/// `crate::roofline::Machine::gemm_flops`, over `gemm_flops_per_ns`) or its
-/// read; an attention layer's flops (its work-groups' waves) over
-/// `attn_flops_per_ns`, and its kv read; a scan layer's state steps; an
-/// elementwise op's bytes over the bandwidth. `launch_ns` is what a
+/// matmul plane's flops over the measured matmul rate at its rows
+/// (`crate::roofline::Constants::gemm_rate`)
+/// or its read; an attention layer's flops over the measured attention rate
+/// at its keys, or its kv read; a scan layer's state steps; a per-row op's
+/// bytes over the per-row ops' measured bandwidth. `launch_ns` is what a
 /// dependent dispatch adds to its work as the backend submits a fire
 /// (`crate::rates::launch_from`). The terms, summed over the fire (the
 /// work, without the launches):
 ///
-/// `work(r) = Σ_planes max(read, waves(tokens(r), n, k) / gemm_rate)
-///       + max(head_read, waves(sampled(r), vocab, hidden) / gemm_rate)
-///       + tokens(r) · keys(r) · attn_flops_per_row_key · wave_factor / attn_rate
-///       + keys(r) · kv_bytes_per_key / bytes_per_ns
+/// `work(r) = Σ_planes max(read, 2 tokens(r) n k / gemm(tokens(r)))
+///       + max(head_read, 2 sampled(r) vocab hidden / gemm(sampled(r)))
+///       + max(tokens(r) · keys(r) · attn_flops_per_row_key / attn(keys(r)),
+///             keys(r) · kv_bytes_per_key / bytes_per_ns)
 ///       + tokens(r) · state_elements_per_row / scan_rate
-///       + tokens(r) · elementwise_bytes_per_row / bytes_per_ns`
+///       + tokens(r) · elementwise_bytes_per_row / elementwise_bytes_per_ns`
 ///
 /// A routed bank's planes read the experts a fire's rows touch
-/// (`dense + expert_bytes · (1 − (1 − k/E)^tokens)`), and their compute is
-/// their rows' flops unquantized (a grouped kernel's tiles are the routes',
-/// not the rung's). The output head runs once a sampled row
+/// (`dense + expert_bytes · (1 − (1 − k/E)^tokens)`). The output head runs once a sampled row
 /// ([`RungFacts::sampled`]): a rung no wider than its lanes is weighed
 /// decode-shaped (a lane a token, every row sampled), a wider rung
 /// prefill-shaped (one prompt, its last row sampled). A decode-shaped
 /// rung's lanes attend one key each (a fresh slot's own): its score is for
 /// picking the top, not a prediction of a long-context decode's time.
 /// Sources: the constants are the profile's `[rates]` (measured by `pie tune
-/// --rates` at `crate::rates`' shapes); the machine is the device's (its
-/// SMs) and its kernels' tiles; the byte, flop, attention, state and
+/// --rates` at `crate::rates`' shapes); the byte, flop, attention, state and
 /// elementwise counts are the trace's ([`super::Counts`]); `launches` are
 /// the backend's, from its compiled plan.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FireEstimate {
-    /// The device's constants.
+    /// The device's rates.
     pub rates: crate::roofline::Constants,
-    /// The device and its kernels' work-groups.
-    pub machine: crate::roofline::Machine,
     /// The model's widest head.
     pub attn_head_dim: u32,
     /// The weight bytes every fire reads.
@@ -183,35 +178,23 @@ impl FireEstimate {
         self.dense_bytes as f64 + self.expert_bytes as f64 * self.touched(tokens)
     }
 
-    /// Each dense shape's matmul compute at `rung`, in ns: `(n, k, ns)`,
-    /// the rung's rows' tiles over their waves at that shape (each plane
-    /// one) over the matmul rate; a routed shape's rows' flops over it. Their
-    /// sum is [`Terms::flops`].
+    /// Each shape's matmul compute at `rung`, in ns: `(n, k, ns)`, the
+    /// rung's rows' flops at that shape over the matmul rate at those rows. Their sum is [`Terms::flops`].
     #[must_use]
     pub fn matmuls(&self, rung: &RungFacts) -> Vec<(u32, u32, f64)> {
         let rows = rung.tokens;
-        let rate = self.rates.gemm_flops_per_ns;
         self.gemm_shapes
             .iter()
             .map(|s| {
-                let flops = if s.flops_per_row == 0 {
-                    0.0
-                } else if s.routed {
-                    f64::from(rows) * s.flops_per_row as f64
+                let flops = f64::from(rows) * s.flops_per_row as f64;
+                let ns = if flops > 0.0 {
+                    flops / self.rates.gemm_rate(rows)
                 } else {
-                    f64::from(s.planes) * self.machine.gemm_flops(rows, s.n, s.k)
+                    0.0
                 };
-                (s.n, s.k, if flops > 0.0 { flops / rate } else { 0.0 })
+                (s.n, s.k, ns)
             })
             .collect()
-    }
-
-    /// The query heads an attention layer reads: its flops a row a key over
-    /// four a head element, a layer each dispatch.
-    fn attn_heads(&self) -> u32 {
-        let per_layer =
-            4.0 * f64::from(self.attn_head_dim.max(1)) * f64::from(self.attn_dispatches.max(1));
-        (self.attn_flops_per_row_key / per_layer).round().max(1.0) as u32
     }
 
     /// The estimate's terms at `rung`, in ns: the one place its form lives.
@@ -248,21 +231,17 @@ impl FireEstimate {
         // The head's bytes are the readout's alone, not the trunk's read.
         let head_read = over(self.head_bytes as f64, c.bytes_per_ns);
         let readout = over(
-            self.machine
-                .gemm_flops(fire.sampled, self.readout_columns(), self.readout_depth),
-            c.gemm_flops_per_ns,
+            f64::from(fire.sampled) * self.readout_flops,
+            c.gemm_rate(fire.sampled),
         );
         if self.readout_flops > 0.0 {
             dispatched += floored(readout.max(head_read), 1);
             dispatches += 1;
         }
-        // The attention: its flops as its work-groups' waves run them.
-        let waves =
-            self.machine
-                .attn_wave_factor(fire.lanes, fire.tokens_per_lane, self.attn_heads());
+        // The attention at the rate its kernel reaches at a row's keys.
         let attention = over(
-            tokens * keys * self.attn_flops_per_row_key * waves,
-            c.attn_flops_per_ns,
+            tokens * keys * self.attn_flops_per_row_key,
+            c.attn_rate(fire.keys_per_lane),
         );
         let kv = over(keys_read * self.kv_bytes_per_key, c.bytes_per_ns);
         if self.attn_flops_per_row_key > 0.0 {
@@ -276,7 +255,7 @@ impl FireEstimate {
         }
         let mut elementwise = 0.0;
         for &bytes in &self.elementwise_ops {
-            let work = over(tokens * bytes as f64, c.bytes_per_ns);
+            let work = over(tokens * bytes as f64, c.elementwise_bytes_per_ns);
             elementwise += work;
             dispatched += floored(work, 1);
             dispatches += 1;
@@ -295,15 +274,6 @@ impl FireEstimate {
             head_read,
             dispatched,
         }
-    }
-
-    /// The output head's columns (the vocabulary): its flops a row over two
-    /// a depth.
-    fn readout_columns(&self) -> u32 {
-        let depth = f64::from(self.readout_depth.max(1));
-        (self.readout_flops / (2.0 * depth))
-            .round()
-            .clamp(1.0, f64::from(u32::MAX)) as u32
     }
 
     /// The share of the experts a fire of `tokens` touches.
@@ -636,35 +606,34 @@ mod tests {
         }
     }
 
-    /// A device of one SM whose matmul tile is one element and whose
-    /// attention takes a row a work-group: no waves to quantize, so a
-    /// matmul's flops are its own `2 m n k`.
-    fn unit() -> crate::roofline::Machine {
-        crate::roofline::Machine::fixed(1, crate::roofline::Tile::of(1, 1), 1)
-    }
-
     fn constants(launch_ns: f64, bytes_per_ns: f64) -> crate::roofline::Constants {
+        // Flat curves: two flops a ns at every row, half a flop a ns at
+        // every key; the per-row ops at the bandwidth.
         crate::roofline::Constants {
             launch_ns,
-            gemm_flops_per_ns: 2.0,
-            attn_flops_per_ns: 0.5,
+            gemm_by_rows: vec![(1, 2.0)],
+            attn_by_keys: vec![(1, 0.5)],
             bytes_per_ns,
+            elementwise_bytes_per_ns: bytes_per_ns,
             scan_elements_per_ns: 2.0,
         }
     }
 
     /// A fire of `fixed_ns` beside `per_token_ns` a token: weights read at
-    /// a byte a ns, a plane of `per_token_ns` columns at depth 1 a token (two
-    /// flops a column at two a ns).
+    /// a byte a ns, `2 · per_token_ns` flops a token at two a ns.
     fn estimate(fixed_ns: u64, per_token_ns: f64) -> FireEstimate {
         FireEstimate {
             rates: constants(0.0, 1.0),
-            machine: unit(),
             attn_head_dim: 0,
             dense_bytes: fixed_ns,
             expert_bytes: 0,
             experts: None,
-            gemm_shapes: vec![GemmShape::dense(per_token_ns as u32, 1, 1, fixed_ns)],
+            gemm_shapes: vec![GemmShape::dense(
+                1,
+                1,
+                (2.0 * per_token_ns) as u64,
+                fixed_ns,
+            )],
             head_bytes: 0,
             readout_flops: 0.0,
             readout_depth: 1,
@@ -682,7 +651,7 @@ mod tests {
     /// fixed part.
     fn summed(fixed_ns: u64, per_token_ns: f64) -> (FireEstimate, impl Fn(u32, u64) -> RungFacts) {
         // The fixed part a prefill-shaped fire's one readout: one lane, so
-        // every rung samples one row, `fixed_ns` columns at depth 1.
+        // every rung samples one row, `2 · fixed_ns` flops at two a ns.
         let e = FireEstimate {
             readout_flops: 2.0 * fixed_ns as f64,
             dense_bytes: 0,
@@ -720,33 +689,25 @@ mod tests {
     }
 
     #[test]
-    fn a_narrow_fire_pays_for_the_tile_it_under_fills() {
-        // A 64-row tile on one SM: 16 rows compute what 64 do, so the
-        // narrow rung costs as much and does not win.
+    fn a_narrow_fire_reads_the_curve_where_it_runs_slower() {
+        // The matmul at a fifth of its rate at 16 rows, whole from 64: 16
+        // tokens cost what 64 do, and the narrow rung does not win.
         let e = FireEstimate {
-            machine: crate::roofline::Machine::fixed(1, crate::roofline::Tile::of(64, 1), 1),
+            rates: crate::roofline::Constants {
+                gemm_by_rows: vec![(16, 0.5), (64, 2.0)],
+                ..constants(0.0, 1.0)
+            },
             ..estimate(100, 10.0)
+        };
+        let e = FireEstimate {
+            gemm_shapes: vec![GemmShape::dense(1, 1, 20, 100)],
+            ..e
         };
         let rungs = [rung(16, 1), rung(64, 4)];
         let times: Vec<f64> = rungs.iter().map(|r| e.ns(r)).collect();
         assert_eq!(times, [640.0, 640.0]);
         let top = top_rung(&rungs, 1024 * MIB, &e).unwrap();
         assert_eq!(top.tokens, 64);
-    }
-
-    #[test]
-    fn a_rung_that_fills_its_last_wave_costs_no_more_than_one_short_of_it() {
-        // 142 SMs, 128 x 128 tiles, a 1024-column plane (8 tile columns):
-        // 2176 rows are 17 x 8 = 136 tiles, one wave; 2304 are 144, two.
-        // The wider rung's tokens cost twice the narrower's time.
-        let e = FireEstimate {
-            machine: crate::roofline::Machine::fixed(142, crate::roofline::Tile::of(128, 128), 128),
-            gemm_shapes: vec![GemmShape::dense(1024, 1024, 1, 0)],
-            ..estimate(0, 0.0)
-        };
-        let (one, two) = (e.ns(&rung(2176, 1)), e.ns(&rung(2304, 1)));
-        assert_eq!(two, 2.0 * one);
-        assert_eq!(one, 142.0 * 2.0 * 128.0 * 128.0 * 1024.0 / 2.0);
     }
 
     #[test]
@@ -850,7 +811,6 @@ mod tests {
     fn documented() -> (FireEstimate, RungFacts) {
         let e = FireEstimate {
             rates: constants(3.0, 4.0),
-            machine: unit(),
             attn_head_dim: 8,
             dense_bytes: 200,
             expert_bytes: 0,
@@ -948,7 +908,7 @@ mod tests {
     }
 
     #[test]
-    fn the_matmul_is_its_waves_over_the_rate_or_its_read() {
+    fn the_matmul_is_its_flops_over_the_curve_or_its_read() {
         let (e, r) = documented();
         // 4 rows of a 5 x 1 plane: 2 · 4 · 5 flops at 2 a ns, under the
         // 200 / 4 read.
@@ -995,7 +955,7 @@ mod tests {
     }
 
     #[test]
-    fn attention_is_its_waves_over_its_rate_or_its_kv_read() {
+    fn attention_is_its_flops_over_the_curve_or_its_kv_read() {
         let (e, r) = documented();
         let t = e.terms(&r);
         // Decode-shaped: 4 lanes of one key each, 4 · 1 · 0.5 at 0.5 a ns,
@@ -1009,22 +969,15 @@ mod tests {
         let t = e.terms(&prompt);
         assert_eq!(t.attention, 128.0);
         assert_eq!(t.kv, 32.0);
-        // On 4 SMs, a row a work-group of one head: 8 rows fill two waves,
-        // 9 take three (12 work-groups' time for 9; 9 groups over 4 slots
-        // split nothing).
-        let four = FireEstimate {
-            machine: crate::roofline::Machine::fixed(4, crate::roofline::Tile::of(1, 1), 1),
+        // A curve rising with the keys: 16 keys at 2 a ns, a quarter the time.
+        let rising = FireEstimate {
+            rates: crate::roofline::Constants {
+                attn_by_keys: vec![(1, 0.5), (16, 2.0)],
+                ..constants(3.0, 4.0)
+            },
             ..e
         };
-        assert_eq!(four.terms(&prompt).attention, 128.0);
-        let nine = RungFacts {
-            tokens: 9,
-            ..prompt
-        };
-        assert_eq!(
-            four.terms(&nine).attention,
-            9.0 * 16.0 * 0.5 / 0.5 * 12.0 / 9.0
-        );
+        assert_eq!(rising.terms(&prompt).attention, 32.0);
     }
 
     #[test]

@@ -70,11 +70,7 @@ impl Serve for Api {
         let tuning = {
             let chip = tuning.profile().clone();
             let rates = chip.rates();
-            if rates.gemm_tflops.is_some()
-                && rates.attn_tflops.is_some()
-                && rates.scan_gelems.is_some()
-                && rates.hbm_gbps.is_some()
-            {
+            if rates.complete() {
                 tuning
             } else {
                 let mut tuned = chip.tuned().clone();

@@ -1,79 +1,110 @@
-//! What every backend's `pie tune <backend> --rates` times, and how it
-//! counts the work: a few large shapes, model-independent, whose times give
-//! the device's roofline constants (`profile::fire::Rates`), so a profile's
-//! `[rates]` mean the same on every backend and the estimate
-//! (`crate::load::FireEstimate`, over `crate::roofline`) reads them the
-//! same way. Each backend times these shapes through its own kernels and its
-//! own clock; the counts here (each the work as the device runs it, its
-//! waves over the device's SMs: `crate::roofline::Machine`) turn its times
-//! into rates, and [`tuned`] and [`provenance`] write them.
+//! What every backend's `pie tune <backend> --rates` (or a load on a
+//! device whose profile lacks them) times, and how it counts the work: a few
+//! shapes, model-independent, whose times give the device's rates
+//! (`profile::fire::Rates`), so a profile's `[rates]` mean the same on every
+//! backend and the estimate (`crate::load::FireEstimate`, over
+//! `crate::roofline`) reads them the same way. Each backend times these
+//! shapes through its own kernels and its own clock; the counts here turn
+//! its times into rates, and [`tuned`] and [`provenance`] write them. Every
+//! timed submission is a burst of one kernel sized off a first single
+//! dispatch's time, so none runs long.
 //!
 //! - `launch_ns`: what a dispatch adds to its work in a chain of dependent
-//!   ones submitted as serving submits them (a captured graph, one command
-//!   buffer, one encoder): a chain of `n` tiny kernels, each reading the one
-//!   before's output, against one kernel doing the chain's whole work, at
-//!   each `n` of [`LAUNCH_CHAINS`] ([`launch_from`]).
-//! - `gemm_tflops`: a bf16 matmul at each of [`GEMM_SHAPES`] (large and
-//!   square-ish, after [`warm_up`]), its waves' flops
-//!   (`crate::roofline::Machine::gemm_flops`) over its time; the fastest.
-//! - `attn_tflops`: the backend's prefill attention at [`ATTN_SHAPE`] over
-//!   [`ATTN_KEYS`] keys (one sequence attending itself, its pages laid in
-//!   [`attn_page_order`]), [`attn_flops`] times its wave factor over its
-//!   time, at head width 128 ([`ATTN_DIMS`]' others stated beside it).
+//!   ones submitted as serving submits them, at each `n` of
+//!   [`LAUNCH_CHAINS`] ([`launch_from`]).
+//! - `gemm_tflops_by_rows`: a bf16 matmul of [`GEMM_WIDTH`] columns and
+//!   depth at each of [`GEMM_ROWS`], [`gemm_flops`] over its time.
+//! - `attn_tflops_by_keys`: the backend's prefill attention at
+//!   [`ATTN_SHAPE`]'s heads over each of [`ATTN_KEYS`] keys (one sequence
+//!   attending itself, its pages laid in [`attn_page_order`]),
+//!   [`attn_flops`] over its time.
 //! - `hbm_gbps`: a copy of device memory, every byte read and written.
+//! - `elementwise_gbps`: the per-row ops a fire runs between its matmuls, a
+//!   norm and the gated activation at [`ELEMENTWISE_SHAPE`], their bytes
+//!   ([`elementwise_bytes`]) over their time together.
 //! - `scan_gelems`: the prefill gated-delta scan and the causal conv before
 //!   it at [`SCAN_SHAPE`], [`scan_elements`] over the two together's time.
 
 /// The bytes the rates step lays on the device at once, at most: the
-/// largest of a matmul shape's rotation and operands, the attention's cold
-/// sets, the scan's cold sets and the copy's two buffers. What the step's
-/// device binds, so it needs no load budget.
+/// largest of a matmul's rotation and operands, the attention's cold sets,
+/// the per-row ops' sets, the scan's cold sets and the copy's two buffers.
+/// What the step's device binds, so it needs no load budget.
 #[must_use]
 pub fn step_bytes() -> u64 {
     let bf16 = |elements: u64| elements * 2;
-    let gemm = GEMM_SHAPES
-        .iter()
-        .chain(std::iter::once(&WARM_SHAPE))
-        .map(|&(m, n, k)| {
-            bf16(u64::from(m) * u64::from(k))
-                + weights_at(n, k) as u64 * bf16(u64::from(n) * u64::from(k))
-                + bf16(u64::from(m) * u64::from(n))
-        })
-        .max()
-        .unwrap_or(0);
-    let attn = ATTN_DIMS
-        .iter()
-        .map(|&d| ATTN_SHAPE.at(ATTN_KEYS).with_dim(d))
-        .map(|s| {
-            let q = u64::from(s.rows) * u64::from(s.q_heads * s.head_dim);
-            let kv = 2 * u64::from(s.keys.div_ceil(16) * 16) * u64::from(s.kv_heads * s.head_dim);
-            ATTN_SET_BYTES as u64 + bf16(q + kv) + bf16(q)
-        })
-        .max()
-        .unwrap_or(0);
+    let (wm, wn, wk) = WARM_SHAPE;
+    let warm = bf16(u64::from(wm) * u64::from(wk))
+        + weights_at(wn, wk) as u64 * bf16(u64::from(wn) * u64::from(wk))
+        + bf16(u64::from(wm) * u64::from(wn));
+    let w = u64::from(GEMM_WIDTH);
+    let widest = u64::from(GEMM_ROWS[GEMM_ROWS.len() - 1]);
+    let gemm = bf16(widest * w)
+        + weights_at(GEMM_WIDTH, GEMM_WIDTH) as u64 * bf16(w * w)
+        + bf16(widest * w);
+    let attn = {
+        let s = ATTN_SHAPE.at(ATTN_KEYS[ATTN_KEYS.len() - 1]);
+        let q = u64::from(s.rows) * u64::from(s.q_heads * s.head_dim);
+        let kv = 2 * u64::from(s.keys.div_ceil(16) * 16) * u64::from(s.kv_heads * s.head_dim);
+        ATTN_SET_BYTES as u64 + bf16(q + kv) + bf16(q)
+    };
     let scan = {
         let s = SCAN_SHAPE;
         let rows = u64::from(s.tokens) * u64::from(s.channels());
         let state = u64::from(s.conv_width * s.channels() + s.v_heads * s.k_dim * s.v_dim);
         scan_sets_at(s) as u64 * (bf16(rows) + 4 * state) + bf16(rows) * 2
     };
+    let elementwise = (elementwise_sets() * elementwise_set_bytes()) as u64;
     let copy = 2 * (256u64 << 20);
-    gemm.max(attn).max(scan).max(copy)
+    warm.max(gemm)
+        .max(attn)
+        .max(scan)
+        .max(elementwise)
+        .max(copy)
 }
 
-/// The matmuls `gemm_tflops` is the fastest of, `m x n x k`: large and
-/// square-ish, every tile filled over many waves on any device served.
-pub const GEMM_SHAPES: [(u32, u32, u32); 2] = [(4096, 4096, 4096), (8192, 8192, 8192)];
+/// The columns and depth of the matmul curve: the catalog's median hidden
+/// width (an 8B-class model's 4096).
+pub const GEMM_WIDTH: u32 = 4096;
 
-/// The keys (and rows) the attention rate is timed at: long, so its
-/// work-groups fill many waves.
-pub const ATTN_KEYS: u32 = 8192;
+/// The rows the matmul curve is timed at: the lattice's octaves a fire's
+/// prompt reaches, 256 to 8192.
+pub const GEMM_ROWS: [u32; 6] = [256, 512, 1024, 2048, 4096, 8192];
 
-/// The depths (and columns) of the matmul shapes the fire top is derived
-/// over (`crate::roofline::fire_top`): the contractions of the dense layers
-/// served, from a small model's 1024 (Qwen3-0.6B's hidden) through 4096
-/// (Qwen3-8B's) and 8192 (a 30B-class hidden) to 16384, past the down
-/// projections of the 8B and Llama-class MLPs (12288 and 14336 deep).
+/// The keys (and rows) the attention curve is timed at.
+pub const ATTN_KEYS: [u32; 5] = [512, 1024, 2048, 4096, 8192];
+
+/// The per-row ops' shape: `(rows, width)`, a 2048-token fire of a
+/// 4096-wide model; the norm reads and writes rows of `width`, the gated
+/// activation reads `2 · width` and writes `width`.
+pub const ELEMENTWISE_SHAPE: (u32, u32) = (2048, 4096);
+
+/// The bytes the per-row ops move at [`ELEMENTWISE_SHAPE`]: the norm's row in
+/// and out, then the gated activation's two halves in and its row out.
+#[must_use]
+pub fn elementwise_bytes() -> f64 {
+    let (rows, width) = ELEMENTWISE_SHAPE;
+    let row = 2.0 * f64::from(rows) * f64::from(width);
+    2.0 * row + 3.0 * row
+}
+
+/// One set of the per-row ops' operands (bf16): the norm's in and out, the
+/// activation's packed halves and its out.
+#[must_use]
+pub fn elementwise_set_bytes() -> usize {
+    let (rows, width) = ELEMENTWISE_SHAPE;
+    rows as usize * width as usize * 2 * 5
+}
+
+/// The per-row ops' sets a timed burst rotates through: [`ATTN_SET_BYTES`]
+/// of them, at least 2, so each reads its rows from device memory.
+#[must_use]
+pub fn elementwise_sets() -> usize {
+    ATTN_SET_BYTES.div_ceil(elementwise_set_bytes()).max(2)
+}
+
+/// The depths of the dense layers served, from a small model's 1024
+/// (Qwen3-0.6B's hidden) through 4096 (Qwen3-8B's) and 8192 (a 30B-class
+/// hidden) to 16384.
 pub const DEPTHS: [u32; 5] = [1024, 2048, 4096, 8192, 16384];
 
 /// The flops of one matmul of `rows`, `n` columns and depth `k`: two a
@@ -443,10 +474,10 @@ pub fn attn_page_order(pages: u32) -> Vec<u32> {
         .collect()
 }
 
-/// The head widths the attention is timed at: the widths of the models
-/// served (64 for the small and older ones, 128 for most, 256 for Qwen3.5's
-/// and Gemma's global layers). `attn_tflops` is 128's; the others are
-/// stated beside it, so a width whose rate departs from it shows.
+/// The head widths of the models served (64 for the small and older ones,
+/// 128 for most, 256 for Qwen3.5's and Gemma's global layers). The curve is
+/// 128's; the step times the others at its longest keys and says them
+/// beside it, so a width whose rate departs from it shows.
 pub const ATTN_DIMS: [u32; 3] = [64, 128, 256];
 
 impl AttnShape {
@@ -558,17 +589,15 @@ pub fn tuned(rates: &profile::fire::Rates) -> String {
 /// matmul kernel, its clock).
 #[must_use]
 pub fn provenance(backend: &str, how: &str) -> (&'static str, String) {
-    let shapes: Vec<String> = GEMM_SHAPES
-        .iter()
-        .map(|(m, n, k)| format!("{m}x{n}x{k}"))
-        .collect();
+    let (rows, width) = ELEMENTWISE_SHAPE;
     let text = format!(
-        "pie tune {backend} --rates on {} (pie {}): {how}; at engine::rates' shapes (matmul {}; \
-         attention {ATTN_KEYS} keys x keys, {}/{} heads of 128; scan {} tokens, {}/{} heads of \
-         {}x{}, conv {})",
+        "pie tune {backend} --rates on {} (pie {}): {how}; at engine::rates' shapes (matmul m x \
+         {GEMM_WIDTH} x {GEMM_WIDTH}, m {:?}; attention keys x keys, keys {:?}, {}/{} heads of \
+         128; per-row ops {rows} x {width}; scan {} tokens, {}/{} heads of {}x{}, conv {})",
         today(),
         env!("CARGO_PKG_VERSION"),
-        shapes.join(", "),
+        GEMM_ROWS,
+        ATTN_KEYS,
         ATTN_SHAPE.q_heads,
         ATTN_SHAPE.kv_heads,
         SCAN_SHAPE.tokens,
@@ -752,6 +781,9 @@ mod tests {
     #[test]
     fn the_lattice_ascends_and_the_counts_are_the_estimates() {
         assert!(step_bytes() >= 1 << 30, "an 8192^2 rotation");
+        assert!(GEMM_ROWS.windows(2).all(|w| w[0] < w[1]));
+        assert!(ATTN_KEYS.windows(2).all(|w| w[0] < w[1]));
+        assert!(elementwise_sets() >= 2);
         assert!(DEPTHS.windows(2).all(|w| w[0] < w[1]));
         assert_eq!(weights_at(1024, 1024), 384);
         assert_eq!(weights_at(16384, 1024), 24);
@@ -884,16 +916,13 @@ mod tests {
     fn the_writer_writes_what_the_profile_reads() {
         let rates = profile::fire::Rates {
             launch_ns: Some(3500),
-            gemm_tflops: Some(181.5),
-            attn_tflops: Some(120.0),
+            gemm_tflops_by_rows: Some(vec![(256, 90.0), (8192, 181.5)]),
+            attn_tflops_by_keys: Some(vec![(512, 60.0), (8192, 120.0)]),
             hbm_gbps: Some(800.0),
+            elementwise_gbps: Some(500.0),
             scan_gelems: Some(7.0),
         };
-        assert_eq!(
-            tuned(&rates),
-            "[rates]\nlaunch_ns = 3500\ngemm_tflops = 181.5\nattn_tflops = 120.0\nhbm_gbps = \
-             800.0\nscan_gelems = 7.0\n"
-        );
+        assert_eq!(tuned(&rates), rates.toml());
         let (key, text) = provenance("vulkan", "the matmul through Coopmat");
         assert_eq!(key, "rates");
         assert!(text.starts_with("\"pie tune vulkan --rates on "), "{text}");

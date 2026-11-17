@@ -90,7 +90,7 @@ pub fn choose(
     device: &str,
     counts: &Counts,
 ) -> Result<TopRung> {
-    engine::load::choose(rungs, live, rates, &crate::rates::machine(), device, counts)
+    engine::load::choose(rungs, live, rates, device, counts)
         .map(|(top, _)| top)
         .map_err(|refused| Fault::Residency(refused.to_string()))
 }
@@ -177,9 +177,10 @@ mod tests {
             "{err}"
         );
         let rated = profile::fire::Rates {
-            gemm_tflops: Some(5.0),
-            attn_tflops: Some(2.0),
+            gemm_tflops_by_rows: Some(vec![(256, 2.0), (4096, 5.0)]),
+            attn_tflops_by_keys: Some(vec![(2048, 2.0)]),
             hbm_gbps: Some(400.0),
+            elementwise_gbps: Some(200.0),
             launch_ns: Some(5000),
             ..profile::fire::Rates::default()
         };

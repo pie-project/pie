@@ -14,13 +14,14 @@ assumes = { cores = 20 }
 # cold, scattered q / kv sets 7.33 TFLOPS at 512 keys of 64 to 21.3 at 8192
 # of 128. Every float operand engine::rates' pattern.
 [rates]
-# Reduced to the roofline's constants from the grid measured above on
-# 2026-11-17: gemm_tflops its 8192 x 4096 x 4096 point (the grid ran no
-# 8192^3), attn_tflops
-# its longest keys (16384) at d 128, scan_gelems its 2048-token point.
+# Reduced from the grid `pie tune metal --rates` measured on 2026-11-16 (its
+# provenance below) on 2026-11-17: the matmul curve its n = k = 4096 points
+# at the rows engine::rates times, the attention curve its d 128 points at
+# those keys. The grid timed no per-row ops, so elementwise_gbps is unstated
+# (a load here measures it, or `pie tune metal --rates` does).
 launch_ns = 1840
-gemm_tflops = 28.4
-attn_tflops = 20.8
+gemm_tflops_by_rows = [[256, 24.96], [512, 28.84], [1024, 29.89], [2048, 30.15], [4096, 28.56], [8192, 28.44]]
+attn_tflops_by_keys = [[512, 10.62], [1024, 15.21], [2048, 18.4], [4096, 20.32], [8192, 21.26]]
 hbm_gbps = 275.7
 scan_gelems = 302.5
 

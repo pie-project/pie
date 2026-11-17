@@ -11,24 +11,25 @@
 //! divided by `k`.
 //!
 //! Every shape is `engine::rates`', and its counts turn the times into
-//! rates, each work as the device runs it (`engine::roofline::Machine`:
-//! its waves over the SMs), so the constants read back through the
-//! roofline give the times measured:
+//! rates, so the CUDA and ROCm rates mean what every backend's do:
 //! - `launch_ns`: a chain of dependent near-empty kernels captured in one
 //!   graph against one kernel of the chain's whole work, at each length of
 //!   `engine::rates::LAUNCH_CHAINS` (`engine::rates::launch_from`): what a
 //!   dispatch adds to its work inside a recorded body.
-//! - `gemm_tflops`: the matmul at each of `engine::rates::GEMM_SHAPES`
-//!   through `linear::gemm` (cuBLASLt's first heuristic algorithm on CUDA,
-//!   hipBLASLt's on ROCm), after the warm-up; its launches rotate through
-//!   `engine::rates::weights_at(n, k)` weight planes, past every last-level
-//!   cache. The fastest.
-//! - `attn_tflops`: the paged prefill attention at [`ATTN_SHAPE`]'s heads
-//!   over `engine::rates::ATTN_KEYS` keys, causal, in pages of [`PAGE`], at
-//!   head width 128 (64 and 256 timed and said beside it); its launches
-//!   rotate through `engine::rates::attn_sets_at` sets of q rows and kv
-//!   pages.
+//! - `gemm_tflops_by_rows`: the matmul `m x GEMM_WIDTH x GEMM_WIDTH` at each
+//!   of `engine::rates::GEMM_ROWS` through `linear::gemm` (cuBLASLt's first
+//!   heuristic algorithm on CUDA, hipBLASLt's on ROCm), after the warm-up;
+//!   its launches rotate through `engine::rates::weights_at` weight planes,
+//!   past every last-level cache.
+//! - `attn_tflops_by_keys`: the paged prefill attention at [`ATTN_SHAPE`]'s
+//!   heads over each of `engine::rates::ATTN_KEYS` keys, causal, in pages of
+//!   [`PAGE`], head width 128 (64 and 256 timed at the longest keys and said
+//!   beside it); its launches rotate through `engine::rates::attn_sets_at`
+//!   sets of q rows and kv pages.
 //! - `hbm_gbps`: a [`COPY_BYTES`] device-to-device copy, read plus write.
+//! - `elementwise_gbps`: the rmsnorm and the swiglu as a fire runs them at
+//!   `engine::rates::ELEMENTWISE_SHAPE`, rotating through
+//!   `engine::rates::elementwise_sets` sets.
 //! - `scan_gelems`: the causal conv and the chunked gated delta scan at
 //!   [`SCAN_SHAPE`].
 //!
@@ -47,8 +48,8 @@ use profile::fire::Rates;
 pub fn provenance(device: &str) -> (&'static str, String) {
     let how = format!(
         "{device}; the matmul through {}'s first heuristic algorithm, each rate a 20 ms burst on \
-         the stream timed by events, the median of 5 (the launch of 15), its work its waves over \
-         the device's SMs; operands: engine::rates' pattern; at {}",
+         the stream timed by events, the median of 5 (the launch of 15); operands: engine::rates' \
+         pattern; at {}",
         if cfg!(feature = "rocm") {
             "hipBLASLt"
         } else {
@@ -75,12 +76,7 @@ pub fn ensure(
     cache: Option<&std::path::Path>,
 ) -> Result<profile::Profile, String> {
     let stated = chip.rates();
-    if stated.launch_ns.is_some()
-        && stated.gemm_tflops.is_some()
-        && stated.attn_tflops.is_some()
-        && stated.hbm_gbps.is_some()
-        && stated.scan_gelems.is_some()
-    {
+    if stated.complete() {
         return Ok(chip);
     }
     let began = std::time::Instant::now();
@@ -129,12 +125,12 @@ pub const ROUNDS: usize = 5;
 /// burst than a kernel's work (an MI300X VF's 1610 to 1719 ns over 5).
 pub const LAUNCH_ROUNDS: usize = 15;
 
-/// What a rates step measured: the constants, and the attention's rate at
-/// each head width of `engine::rates::ATTN_DIMS` (TFLOP/s), said beside them.
+/// What a rates step measured: the rates, and the attention's rate at the
+/// longest keys at each head width of `engine::rates::ATTN_DIMS` (TFLOP/s),
+/// said beside them.
 pub struct Measured {
     pub rates: Rates,
     pub attn_by_dim: Vec<(u32, f64)>,
-    pub gemm_by_shape: Vec<((u32, u32, u32), f64)>,
 }
 
 /// The rates of device `ordinal` under `chip`'s tuning, the kernels' disk
@@ -379,7 +375,6 @@ mod on_device {
     pub(super) fn measure(ordinal: i32, chip: &profile::Profile) -> Result<Measured, String> {
         let mut device = Context::bind(ordinal, None).map_err(say("the device"))?;
         device.set_tuning(kernels_cuda::tuning::Tuning::of(chip));
-        let machine = crate::top::machine(chip, device.device().num_sm);
         let stream = device.stream();
         let clock = Clock::new(stream)?;
         let mut held = Vec::new();
@@ -395,34 +390,29 @@ mod on_device {
             engine::rates::WARM_SHAPE.0,
             warmed.rate / 1e3
         );
-        let mut gemm_by_shape = Vec::new();
-        for (m, n, k) in engine::rates::GEMM_SHAPES {
-            let mut planes = Planes::lay(&random, (n, k))?;
-            let rate = planes.at(device.ctx(), &clock, &random, &mut held, &machine, m, gap)?;
-            gemm_by_shape.push(((m, n, k), rate));
+        let w = engine::rates::GEMM_WIDTH;
+        let mut planes = Planes::lay(&random, (w, w))?;
+        let mut gemm = Vec::new();
+        for m in engine::rates::GEMM_ROWS {
+            let rate = planes.at(device.ctx(), &clock, &random, &mut held, m, gap)?;
+            gemm.push((m, rate));
         }
-        let gemm = gemm_by_shape
-            .iter()
-            .map(|&(_, rate)| rate)
-            .fold(0.0, f64::max);
+        drop(planes);
+        let mut attn = Vec::new();
+        for keys in engine::rates::ATTN_KEYS {
+            let rate = attention(&device, &clock, &random, &mut held, keys, 128, gap)?;
+            attn.push((keys, rate));
+        }
+        let longest = engine::rates::ATTN_KEYS[engine::rates::ATTN_KEYS.len() - 1];
         let mut attn_by_dim = Vec::new();
         for d in engine::rates::ATTN_DIMS {
-            let rate = attention(
-                &device,
-                &clock,
-                &random,
-                &mut held,
-                &machine,
-                engine::rates::ATTN_KEYS,
-                d,
-                gap,
-            )?;
-            attn_by_dim.push((d, rate));
+            let rate = match attn.last() {
+                Some(&(_, rate)) if d == 128 => rate,
+                _ => attention(&device, &clock, &random, &mut held, longest, d, gap)?,
+            };
+            attn_by_dim.push((d, rate / 1e3));
         }
-        let attn = attn_by_dim
-            .iter()
-            .find(|&&(d, _)| d == 128)
-            .map_or(0.0, |&(_, rate)| rate);
+        let elementwise = elementwise(device.ctx(), &clock, &random, &mut held, gap)?;
         let scan = scan(device.ctx(), &clock, &random, &mut held, SCAN_SHAPE, gap)?;
         let bytes = copy(stream, &clock, gap)?;
         device.synchronize().map_err(say("the device"))?;
@@ -431,19 +421,71 @@ mod on_device {
             PEAK.load(Ordering::Relaxed) >> 20,
             held.iter().map(|b| b.bytes()).sum::<usize>() >> 20
         );
-        // Three significant decimals of the TFLOP/s, a tenth of the rest.
+        // A tenth of a TFLOP/s, a GB/s, a G element a second.
         let tenth = |v: f64| (v * 10.0).round() / 10.0;
+        let tflops = |curve: Vec<(u32, f64)>| {
+            curve
+                .into_iter()
+                .map(|(x, r)| (x, tenth(r / 1e3)))
+                .collect()
+        };
         Ok(Measured {
             rates: Rates {
                 launch_ns: Some(launch),
-                gemm_tflops: Some(tenth(gemm / 1e3)),
-                attn_tflops: Some(tenth(attn / 1e3)),
+                gemm_tflops_by_rows: Some(tflops(gemm)),
+                attn_tflops_by_keys: Some(tflops(attn)),
                 hbm_gbps: Some(tenth(bytes)),
+                elementwise_gbps: Some(tenth(elementwise)),
                 scan_gelems: Some(tenth(scan)),
             },
-            attn_by_dim: attn_by_dim.iter().map(|&(d, r)| (d, r / 1e3)).collect(),
-            gemm_by_shape: gemm_by_shape.iter().map(|&(s, r)| (s, r / 1e3)).collect(),
+            attn_by_dim,
         })
+    }
+
+    /// The per-row ops' bandwidth: the rmsnorm, then the swiglu, at
+    /// `engine::rates::ELEMENTWISE_SHAPE`, each fire the next of
+    /// `engine::rates::elementwise_sets` sets, their bytes over their time.
+    fn elementwise(
+        ctx: &Ctx,
+        clock: &Clock,
+        random: &Random,
+        held: &mut Vec<Buffer>,
+        gap: f64,
+    ) -> Result<f64, String> {
+        let (rows, width) = engine::rates::ELEMENTWISE_SHAPE;
+        let sets = engine::rates::elementwise_sets();
+        let row = rows as usize * width as usize * 2;
+        let x = random.operand(sets * row)?;
+        let normed = zeroed(sets * row)?;
+        let packed = random.operand(sets * 2 * row)?;
+        let y = zeroed(sets * row)?;
+        let weight = random.operand(width as usize * 2)?;
+        let fire = |i: usize| {
+            let at = |b: &Buffer, bytes: usize| b.ptr() + ((i % sets) * bytes) as u64;
+            kernels_cuda::elemwise::norm::rmsnorm(
+                ctx,
+                Tensor::new(at(&x, row), rows, width, Dtype::Bf16),
+                Tensor::new(weight.ptr(), 1, width, Dtype::Bf16),
+                1e-6,
+                &mut Tensor::new(at(&normed, row), rows, width, Dtype::Bf16),
+            )?;
+            kernels_cuda::linear::glu::swiglu(
+                ctx,
+                Tensor::new(at(&packed, 2 * row), rows, 2 * width, Dtype::Bf16),
+                width,
+                1,
+                &mut Tensor::new(at(&y, row), rows, width, Dtype::Bf16),
+            )
+        };
+        lay(held, || fire(0))?;
+        let ns = clock.burst(ROUNDS, &mut |i| fire(i).map_err(say("the per-row ops")))?;
+        engine::rates::rate_from(
+            "per-row ops",
+            ns,
+            2,
+            gap,
+            engine::rates::elementwise_bytes(),
+        )
     }
 
     /// The device warmed (engine::rates::warm_up): bursts of the widest
@@ -505,14 +547,13 @@ mod on_device {
         }
 
         /// The matmul `m x n x k`'s rate, its launches rotating through the
-        /// planes: its waves' flops on `machine` over its time.
+        /// planes.
         fn at(
             &mut self,
             ctx: &Ctx,
             clock: &Clock,
             random: &Random,
             held: &mut Vec<Buffer>,
-            machine: &engine::roofline::Machine,
             m: u32,
             gap: f64,
         ) -> Result<f64, String> {
@@ -545,19 +586,17 @@ mod on_device {
                 ns,
                 engine::rates::GEMM_DISPATCHES,
                 gap,
-                machine.gemm_flops(m, n, k),
+                engine::rates::gemm_flops(m, n, k),
             )
         }
     }
 
-    /// The attention's rate at `keys_n` keys and width `head_dim`: its
-    /// flops, times its work-groups' wave factor on `machine`, over its time.
+    /// The attention's rate at `keys_n` keys and width `head_dim`.
     fn attention(
         device: &Context,
         clock: &Clock,
         random: &Random,
         held: &mut Vec<Buffer>,
-        machine: &engine::roofline::Machine,
         keys_n: u32,
         head_dim: u32,
         gap: f64,
@@ -700,7 +739,7 @@ mod on_device {
             ns,
             engine::rates::ATTN_DISPATCHES,
             gap,
-            engine::rates::attn_flops(at) * machine.attn_wave_factor(1, at.rows, at.q_heads),
+            engine::rates::attn_flops(at),
         )
     }
 

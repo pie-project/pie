@@ -824,7 +824,8 @@ fn rates(base: &Profile, say: &mut dyn FnMut(&str)) -> Result<profile::fire::Rat
     // step measures through.
     let tier = <crate::device::Api as engine_gpu::serve::Serve>::tier(&device);
     let gemm = engine_gpu::backend::Tactics::gemm(&tuning, tier);
-    for (m, n, k) in engine::rates::GEMM_SHAPES {
+    let w = engine::rates::GEMM_WIDTH;
+    for (m, n, k) in engine::rates::GEMM_ROWS.map(|m| (m, w, w)) {
         let path =
             kernels_slang::linear::gemm::tile_for(kernels_slang::Target::Spirv, gemm, m, n, k);
         say(&format!(
@@ -832,10 +833,20 @@ fn rates(base: &Profile, say: &mut dyn FnMut(&str)) -> Result<profile::fire::Rat
         ));
     }
     say(&format!(
-        "[rates]: matmul {:.1} TFLOP/s, attention {:.1} TFLOP/s, scan {:.2} G state elements/s, \
-         {:.0} GB/s, launch {:.2} us",
-        rates.gemm_tflops.unwrap_or(0.0),
-        rates.attn_tflops.unwrap_or(0.0),
+        "[rates]: matmul {:.1} TFLOP/s at its widest rows, attention {:.1} TFLOP/s at its \
+         longest keys, per-row ops {:.0} GB/s, scan {:.2} G state elements/s, {:.0} GB/s, \
+         launch {:.2} us",
+        rates
+            .gemm_tflops_by_rows
+            .as_ref()
+            .and_then(|c| c.last())
+            .map_or(0.0, |&(_, t)| t),
+        rates
+            .attn_tflops_by_keys
+            .as_ref()
+            .and_then(|c| c.last())
+            .map_or(0.0, |&(_, t)| t),
+        rates.elementwise_gbps.unwrap_or(0.0),
         rates.scan_gelems.unwrap_or(0.0),
         rates.hbm_gbps.unwrap_or(0.0),
         rates.launch_ns.unwrap_or(0) as f64 / 1e3

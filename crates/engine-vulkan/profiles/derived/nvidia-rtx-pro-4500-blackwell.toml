@@ -12,7 +12,10 @@ device = "NVIDIA RTX PRO 4500 Blackwell"
 # Coopmat, 26.2 TFLOPS; the 256 MiB copy 813 GB/s; the launch a dispatch's
 # own cost inside a recorded frame (1024 of the narrowest matmul against
 # one, in-graph), 3.57 us.
-gemm_tflops = 26.2
+# One point of the matmul curve, the 4096^3 product measured: its rate is
+# read at every row (no curve was timed), and the attention curve and the
+# per-row ops' bandwidth are unstated.
+gemm_tflops_by_rows = [[4096, 26.2]]
 hbm_gbps = 813.0
 launch_ns = 3573
 # Vendor peaks, bounds and not rates: dense bf16 about 202 TFLOPS (NVIDIA

@@ -1235,13 +1235,9 @@ impl PreparedLoad<'_> {
                 // (`engine::roofline::fire_top` over its rates): no rung past
                 // it can be chosen. A device without the rates has none, and
                 // the ruling refuses it by name.
-                let saturated = engine::load::gemm_constants(&chip.tuned().rates)
+                let saturated = engine::roofline::Constants::of(&chip.tuned().rates)
                     .map_or(u32::MAX, |constants| {
-                        engine::roofline::fire_top(
-                            &crate::rates::lattice_rows(),
-                            &constants,
-                            &crate::rates::machine(),
-                        )
+                        engine::roofline::fire_top(&crate::rates::lattice_rows(), &constants)
                     })
                     .max(act.first().map_or(1, |&(tokens, _)| tokens));
                 let candidates: Vec<crate::top::Candidate> = act
@@ -1542,7 +1538,7 @@ impl PreparedLoad<'_> {
             false => None,
         };
         let weighed = weighed.and_then(|(counts, rungs, live)| {
-            engine::load::estimate(&counts, &chip.tuned().rates, &crate::rates::machine())
+            engine::load::estimate(&counts, &chip.tuned().rates)
                 .ok()
                 .map(|estimate| crate::top::Weighed {
                     rungs,

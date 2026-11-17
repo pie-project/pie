@@ -915,8 +915,8 @@ api = 1
 [target]
 device = "Apple M9"
 [rates]
-gemm_tflops = 50            # 50 TFLOP/s
-attn_tflops = 20.0
+gemm_tflops_by_rows = [[256, 20.0], [4096, 50]]   # 50 TFLOP/s wide
+attn_tflops_by_keys = [[2048, 20.0]]
 scan_gelems = 3000.0
 hbm_gbps = 400              # 400 GB/s
 "#;
@@ -945,10 +945,11 @@ fn a_device_file_states_its_rates_and_a_layer_above_replaces_them() {
     assert_eq!(
         p.rates(),
         profile::fire::Rates {
-            gemm_tflops: Some(50.0),
-            attn_tflops: Some(20.0),
+            gemm_tflops_by_rows: Some(vec![(256, 20.0), (4096, 50.0)]),
+            attn_tflops_by_keys: Some(vec![(2048, 20.0)]),
             scan_gelems: Some(3000.0),
             hbm_gbps: Some(400.0),
+            elementwise_gbps: None,
             launch_ns: None,
         }
     );
@@ -988,13 +989,18 @@ fn rates_are_refused_where_they_do_not_read_and_fire_times_are_no_profiles() {
             "`rates.hbm_gbps` is a positive number",
         ),
         (
-            "[rates]\ngemm_tflops = nan\n",
-            "`rates.gemm_tflops` is a positive number",
+            "[rates]\nelementwise_gbps = nan\n",
+            "`rates.elementwise_gbps` is a positive number",
         ),
         (
+            "[rates]\ngemm_tflops_by_rows = [[512, 2.0], [256, 1.0]]\n",
+            "`rates.gemm_tflops_by_rows` is a non-empty list of [x, rate] pairs, ascending in x",
+        ),
+        ("[rates]\nattn_tflops_by_keys = []\n", "not an empty list"),
+        ("[rates]\ngemm_tflops = 1.0\n", "not `gemm_tflops`"),
+        (
             "[rates]\nflops = 1.0\n",
-            "`rates` holds `launch_ns`, `gemm_tflops`, `attn_tflops`, `hbm_gbps` and \
-             `scan_gelems`, not `flops`",
+            "`elementwise_gbps` and `scan_gelems`, not `flops`",
         ),
         // The measured grids are gone: an unknown key like any other.
         (
@@ -1022,7 +1028,7 @@ fn the_notice_names_rates_measured_on_the_device_and_what_is_untuned() {
     let r = registry();
     let rated = |provenance: &str| {
         format!(
-            "api = 1\n[target]\ndevice = \"Apple M9\"\n[rates]\ngemm_tflops = 5.0\n\
+            "api = 1\n[target]\ndevice = \"Apple M9\"\n[rates]\ngemm_tflops_by_rows = [[4096, 5.0]]\n\
              hbm_gbps = 300.0\n{provenance}"
         )
     };

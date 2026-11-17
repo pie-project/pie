@@ -44,25 +44,26 @@ pub fn rates(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Rated
         .map(|home| home.join("cache"));
     let measured = crate::rates::measure(0, &base, cache.as_deref())?;
     let r = measured.rates;
-    let each = |items: Vec<String>| items.join(", ");
+    let curve = |c: &Option<Vec<(u32, f64)>>| {
+        c.iter()
+            .flatten()
+            .map(|(x, t)| format!("{x} {t:.1}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     say(&format!(
-        "[rates]: matmul {} TFLOP/s; attention at {} keys {} TFLOP/s; scan {:.0} G elements/s, \
-         {:.0} GB/s, launch {} ns",
-        each(
-            measured
-                .gemm_by_shape
-                .iter()
-                .map(|((m, n, k), t)| format!("{m}x{n}x{k} {t:.1}"))
-                .collect()
-        ),
-        engine::rates::ATTN_KEYS,
-        each(
-            measured
-                .attn_by_dim
-                .iter()
-                .map(|(d, t)| format!("d {d} {t:.1}"))
-                .collect()
-        ),
+        "[rates]: matmul TFLOP/s by rows {}; attention by keys {} (at {} keys: {}); per-row ops \
+         {:.0} GB/s, scan {:.0} G elements/s, {:.0} GB/s, launch {} ns",
+        curve(&r.gemm_tflops_by_rows),
+        curve(&r.attn_tflops_by_keys),
+        engine::rates::ATTN_KEYS[engine::rates::ATTN_KEYS.len() - 1],
+        measured
+            .attn_by_dim
+            .iter()
+            .map(|(d, t)| format!("d {d} {t:.1}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        r.elementwise_gbps.unwrap_or(0.0),
         r.scan_gelems.unwrap_or(0.0),
         r.hbm_gbps.unwrap_or(0.0),
         r.launch_ns.unwrap_or(0),

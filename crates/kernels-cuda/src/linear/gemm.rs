@@ -13,8 +13,6 @@ use dtype::Dtype;
 #[cfg(feature = "cuda")]
 pub(crate) mod cublas;
 #[cfg(feature = "cuda")]
-pub use cublas::tile;
-#[cfg(feature = "cuda")]
 pub mod cublas_lt_fp8;
 
 /// The rows cuBLAS's tile M: the 128 of the 128x128 and 256x128 tiles its
