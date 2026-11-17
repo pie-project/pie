@@ -99,6 +99,12 @@ impl Shell {
         self.cache.body_stats()
     }
 
+    /// The key of the body the last fire replayed (`None` till one has).
+    #[must_use]
+    pub fn replayed_body(&self) -> Option<&record::BodyKey> {
+        self.cache.replayed()
+    }
+
     #[must_use]
     pub fn streams(&self) -> (u32, u32, usize, usize) {
         (
