@@ -164,18 +164,20 @@ impl TurnRouter for RouteBackend {
                 }
                 taken.ok_or(DispatchFail)?
             }
-            Some(Placed::Located(at)) => self
-                .routing
-                .dispatch_with_retry(&self.workers, req, affinity, Some(at), pinned)
-                .await
-                .map_err(|_| DispatchFail)?
-                .worker_id,
-            None => self
-                .routing
-                .dispatch_with_retry(&self.workers, req, affinity, None, pinned)
-                .await
-                .map_err(|_| DispatchFail)?
-                .worker_id,
+            Some(Placed::Located(at)) => {
+                self.routing
+                    .dispatch_with_retry(&self.workers, req, affinity, Some(at), pinned)
+                    .await
+                    .map_err(|_| DispatchFail)?
+                    .worker_id
+            }
+            None => {
+                self.routing
+                    .dispatch_with_retry(&self.workers, req, affinity, None, pinned)
+                    .await
+                    .map_err(|_| DispatchFail)?
+                    .worker_id
+            }
         };
         if let Some(router) = router {
             router.dispatched(req, worker);
@@ -210,6 +212,12 @@ impl TurnRouter for RouteBackend {
     fn moved(&self, req: &Request, worker: Option<WorkerId>, why: &str) {
         if let Some(router) = self.router_for(req) {
             router.moved(req, worker, why);
+        }
+    }
+
+    fn started(&self, req: &Request) {
+        if let Some(router) = self.router_for(req) {
+            router.started(req);
         }
     }
 

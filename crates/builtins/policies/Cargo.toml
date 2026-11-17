@@ -1,35 +1,18 @@
-# The PLEX policies built into the pie binary, one cargo workspace targeting
-# wasm32-wasip3. `test-*` policies misbehave on purpose; they are embedded
-# only with the `test-policies` feature, for the hosts' own tests.
+# The PLEX 1.1 policies built into the pie binary, one cargo workspace
+# targeting wasm32-unknown-unknown, each a component (crates/plex-sdk).
+# `test-*` policies misbehave on purpose; they are embedded only with the
+# `test-policies` feature, for the hosts' own tests. Real policies are the
+# PLEX corpus (plex `policies-1.1`), loaded by `.wasm` path.
 [workspace]
 resolver = "2"
 members = [
     "noop",
-    "priority",
-    "fair",
-    "deadline",
-    "keep-handles",
-    "keep-session",
-    "offload",
-    "session-affinity",
-    "cache-aware",
-    "cluster-priority",
-    "pin",
-    "rebalance",
-    "drain-migrate",
-    "relocate",
-    "pool-replicate",
-    "persist-prefix",
-    "retain-all",
-    "replicate",
-    "disaggregate",
-    "scale-by-prop",
-    "test-spin",
-    "test-trap",
     "test-route",
-    "test-share",
-    "test-pressure",
+    "test-trap",
 ]
 
 [profile.release]
+opt-level = "s"
 lto = true
+panic = "abort"
+strip = true

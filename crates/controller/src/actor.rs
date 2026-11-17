@@ -2,10 +2,9 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot, watch};
 
-use controller_api::{Ack, RoutingTable, ScaleEntry, ScaleStatus, WorkerInfo, WorkerStatus};
+use controller_api::{Ack, RoutingTable, WorkerInfo, WorkerStatus};
 use ids::{GatewayId, NodeId, WorkerId};
 
-use crate::actuator::Actuator;
 use crate::state::Cluster;
 use crate::topology::{Topology, reassign, routing_only};
 
@@ -26,15 +25,6 @@ pub enum Command {
     ReportWorker {
         id: WorkerId,
         status: WorkerStatus,
-    },
-    /// A scale table, whole. PLEX 1.1 has no scale column, so no cluster
-    /// policy sends one: the actuator keeps what it was given.
-    #[cfg_attr(not(test), allow(dead_code))]
-    DesireScale {
-        entries: Vec<ScaleEntry>,
-    },
-    ScaleStatus {
-        reply: oneshot::Sender<Vec<ScaleStatus>>,
     },
     Tick,
 }
@@ -58,7 +48,6 @@ pub struct Actor {
     gateway_tx: watch::Sender<RoutingTable>,
     cmd_rx: mpsc::Receiver<Command>,
     config: ActorConfig,
-    actuator: Actuator,
 }
 
 impl Actor {
@@ -67,17 +56,14 @@ impl Actor {
         worker_tx: watch::Sender<Topology>,
         gateway_tx: watch::Sender<RoutingTable>,
         config: ActorConfig,
-        actuator: Actuator,
     ) -> Self {
-        let mut cluster = Cluster::new();
-        cluster.scales = actuator.scales();
+        let cluster = Cluster::new();
         Self {
             cluster,
             worker_tx,
             gateway_tx,
             cmd_rx,
             config,
-            actuator,
         }
     }
 
@@ -99,10 +85,6 @@ impl Actor {
                     let _ = reply.send(ack);
                 }
                 Command::ReportWorker { id, status } => self.report_worker(id, status),
-                Command::DesireScale { entries } => self.desire_scale(entries),
-                Command::ScaleStatus { reply } => {
-                    let _ = reply.send(self.actuator.status(&self.cluster.workers));
-                }
                 Command::Tick => self.tick(),
             }
         }
@@ -118,9 +100,7 @@ impl Actor {
         );
         if let Some(worker) = self.cluster.workers.get_mut(&id) {
             worker.engine = info.engine;
-            worker.launch = info.launch;
             worker.pid = info.pid;
-            self.actuator.registered(worker);
         }
         self.cluster.worker_epoch += 1;
         self.cluster.gateway_epoch += 1;
@@ -138,12 +118,6 @@ impl Actor {
         id
     }
 
-    /// The cluster policies' scale table, from the host that runs them.
-    fn desire_scale(&mut self, entries: Vec<ScaleEntry>) {
-        self.actuator.desire(entries);
-        self.actuator.converge(&self.cluster.workers);
-    }
-
     fn report_worker(&mut self, id: WorkerId, status: WorkerStatus) {
         if let Some(true) = self.cluster.report(id, status, Instant::now()) {
             self.cluster.gateway_epoch += 1;
@@ -152,7 +126,6 @@ impl Actor {
     }
 
     fn tick(&mut self) {
-        self.actuator.converge(&self.cluster.workers);
         let (workers_removed, gateways_removed) = self
             .cluster
             .evict_expired(Instant::now(), self.config.heartbeat_timeout);
@@ -184,31 +157,8 @@ mod tests {
         let (_cmd, cmd_rx) = mpsc::channel(1);
         let (worker_tx, _) = watch::channel(Topology::default());
         let (gateway_tx, gateway_rx) = watch::channel(crate::topology::empty_routing());
-        let actor = Actor::new(
-            cmd_rx,
-            worker_tx,
-            gateway_tx,
-            ActorConfig::default(),
-            Actuator::new(Vec::new(), Duration::ZERO),
-        );
+        let actor = Actor::new(cmd_rx, worker_tx, gateway_tx, ActorConfig::default());
         (actor, gateway_rx)
-    }
-
-    fn table(workers: u32) -> Vec<ScaleEntry> {
-        vec![ScaleEntry {
-            model: Some("m".into()),
-            engine: "cuda".into(),
-            workers,
-        }]
-    }
-
-    fn desired(actor: &Actor) -> Vec<u32> {
-        actor
-            .actuator
-            .status(&actor.cluster.workers)
-            .iter()
-            .map(|s| s.desired)
-            .collect()
     }
 
     #[test]
@@ -231,14 +181,5 @@ mod tests {
         assert_eq!(routing.borrow().author, Some(b));
         assert!(routing.borrow().epoch > epoch, "gateways hear it");
         assert!(actor.cluster.gateways.contains_key(&c));
-    }
-
-    #[test]
-    fn the_last_scale_table_is_the_one_converged_on() {
-        let (mut actor, _routing) = actor();
-        actor.desire_scale(table(2));
-        assert_eq!(desired(&actor), [2]);
-        actor.desire_scale(table(5));
-        assert_eq!(desired(&actor), [5]);
     }
 }

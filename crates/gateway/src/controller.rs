@@ -89,7 +89,6 @@ fn no_routing() -> RoutingTable {
     RoutingTable {
         epoch: 0,
         workers: Vec::new(),
-        scales: false,
         author: None,
     }
 }
