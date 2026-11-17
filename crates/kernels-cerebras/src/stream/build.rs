@@ -901,15 +901,23 @@ pub fn program_at(
     let path: Vec<usize> = (0..built.len())
         .filter(|&i| !built[i].unit.classes.is_empty())
         .collect();
+    // (a unit takes its rows from the host where it reads the host's values and no unit before
+    // it on the path runs its classes; a later one's host values join the rows the stream
+    // brings it: a per-layer embedding's lookup)
     let path_units: Vec<(Vec<usize>, bool, bool, bool)> = path
         .iter()
-        .map(|&i| {
+        .enumerate()
+        .map(|(pi, &i)| {
             let u = &built[i].unit;
+            let first = !path[..pi]
+                .iter()
+                .any(|&j| built[j].unit.classes.iter().any(|c| u.classes.contains(c)));
             (
                 u.classes.clone(),
-                u.steps
-                    .iter()
-                    .any(|s| matches!(s, Step::In { host: true, .. })),
+                first
+                    && u.steps
+                        .iter()
+                        .any(|s| matches!(s, Step::In { host: true, .. })),
                 u.joint.is_some(),
                 u.steps
                     .iter()
