@@ -5642,6 +5642,7 @@ impl engine::frame::Shell for Shell {
         let _ = prev;
         self.programs.probe_scan("prepare start");
         let _ = crate::store::diag_fire_begin();
+        self.pools.diag_publish_parts();
         self.admit_attachments(step.lanes, step.attachments)?;
         self.fire_prologues(step.attachments)?;
         self.programs.probe_scan("after prologues");
@@ -5698,11 +5699,18 @@ impl engine::frame::Shell for Shell {
                 else {
                     continue;
                 };
+                let to = seat.at(u64::from(row.source) * self.readout_row_bytes);
+                let start = crate::device::alloc::slab_address(seat.view().slab()) + to;
+                crate::store::diag_fire_addresses(
+                    row.source,
+                    "readout row copy",
+                    &[start, start + u64::from(width) * element - 1],
+                );
                 frame.copy(
                     self.arena.store().slab(),
                     offset,
                     seat.view().slab(),
-                    seat.at(u64::from(row.source) * self.readout_row_bytes),
+                    to,
                     u64::from(width) * element,
                 )?;
                 readbacks[row.source as usize] = Some((name, width, element));

@@ -6,7 +6,7 @@ pub mod pool;
 mod pools;
 pub mod streamed;
 
-pub use pools::{Pools, Rows, RsRows, TablePaging, WindowRows, diag_fire_begin, diag_fire_now, diag_fire_pages, diag_history, diag_last_named, diag_moved, diag_who_named, MOVED};
+pub use pools::{Pools, Rows, RsRows, TablePaging, WindowRows, diag_chunk_of_address, diag_fire_addresses, diag_set_parts, diag_fire_begin, diag_fire_now, diag_fire_pages, diag_history, diag_last_named, diag_moved, diag_who_named, MOVED};
 
 use kernels_metal::{StateMap, Tensor};
 use poem_ir::{Attn, Def, Dtype, Operation, Trace};

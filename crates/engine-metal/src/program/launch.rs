@@ -1396,6 +1396,27 @@ impl Prepared {
                 pending,
             });
         }
+        {
+            let mut addresses = Vec::new();
+            for cell in &self.bound {
+                addresses.extend(cell.slab.address_at(cell.committed));
+                addresses.extend(cell.slab.address_at(cell.pending));
+            }
+            // A float read's seat names its own row table (the instance's
+            // slots), read, not written: left out.
+            addresses.extend(
+                self.seats
+                    .iter()
+                    .filter(|seat| seat.storage != STORAGE_BF16_ROWS && seat.storage != STORAGE_F32_ROWS)
+                    .map(|seat| seat.at)
+                    .filter(|&at| at != 0),
+            );
+            crate::store::diag_fire_addresses(
+                self.status.slot().unwrap_or(u32::MAX),
+                "a stage's ring cells and output seats (lane = its status slot)",
+                &addresses,
+            );
+        }
         let ready = Status {
             state: 1,
             fault: 0,

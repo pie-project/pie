@@ -1094,6 +1094,11 @@ impl Pools {
         Ok((physical, index))
     }
 
+    /// PROBE: publishes the pool's GPU address ranges.
+    pub fn diag_publish_parts(&self) {
+        self.pool.diag_publish_parts();
+    }
+
     /// PROBE: the physical chunk a kernel reaches through kv page id `id`.
     pub fn diag_page_chunk(&self, id: u32) -> Option<u32> {
         let list = *self.shape(LIST).ok()?;
@@ -2568,4 +2573,33 @@ pub fn diag_who_named(chunk: u32) -> Vec<(u64, u32, &'static str)> {
 /// PROBE: the current fire's sequence number.
 pub fn diag_fire_now() -> u64 {
     FIRE_SEQ.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+
+/// PROBE: each pool buffer's (GPU base, bytes, first chunk), and the chunk size.
+static PARTS: std::sync::Mutex<(Vec<(u64, u64, u32)>, u64)> = std::sync::Mutex::new((Vec::new(), 0));
+
+pub fn diag_set_parts(parts: Vec<(u64, u64, u32)>, chunk_bytes: u64) {
+    if let Ok(mut held) = PARTS.lock() {
+        *held = (parts, chunk_bytes);
+    }
+}
+
+/// PROBE: the pool chunk GPU address `address` lies in, if any.
+pub fn diag_chunk_of_address(address: u64) -> Option<u32> {
+    let held = PARTS.lock().ok()?;
+    let (parts, chunk) = &*held;
+    parts.iter().find_map(|&(base, bytes, first)| {
+        (address >= base && address < base + bytes)
+            .then(|| first + u32::try_from((address - base) / (*chunk).max(1)).unwrap_or(u32::MAX))
+    })
+}
+
+/// PROBE: lane (or instance) `lane` of the current fire wrote through these
+/// GPU addresses by `path`.
+pub fn diag_fire_addresses(lane: u32, path: &'static str, addresses: &[u64]) {
+    let chunks: Vec<u32> = addresses.iter().filter_map(|&a| diag_chunk_of_address(a)).collect();
+    if !chunks.is_empty() {
+        diag_fire_pages(lane, path, chunks);
+    }
 }

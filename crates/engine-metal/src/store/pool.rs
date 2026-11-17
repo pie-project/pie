@@ -338,6 +338,19 @@ impl Pool {
         self.parts.len()
     }
 
+    /// PROBE: publishes each buffer's GPU address range and first chunk.
+    pub fn diag_publish_parts(&self) {
+        let parts: Vec<(u64, u64, u32)> = self
+            .parts
+            .iter()
+            .map(|part| {
+                let base = crate::device::alloc::slab_address(part.view.slab());
+                (base, u64::from(part.chunks) * self.chunk_bytes, part.first)
+            })
+            .collect();
+        crate::store::diag_set_parts(parts, self.chunk_bytes);
+    }
+
     /// The chunks each buffer but the last holds.
     #[must_use]
     pub fn part_chunks(&self) -> u32 {
