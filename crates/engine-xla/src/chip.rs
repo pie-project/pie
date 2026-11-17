@@ -451,6 +451,7 @@ mod tests {
         let mut want = kernels_xla::tuning::Tuning::DEFAULT;
         want.chunks.block_rows = 256;
         want.chunks.decode_pages = 64;
+        want.ssm.row_blocks = 16;
         want.rope_flat_rows = 1024;
         want.glu_land_from = 1024;
         want.glu_gemm_from = 1024;
