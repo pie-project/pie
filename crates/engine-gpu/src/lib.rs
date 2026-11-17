@@ -3,6 +3,7 @@
 //! in each backend crate, which instantiates these types with its own.
 
 pub mod adapter;
+pub mod android;
 pub mod api;
 pub mod arena;
 pub mod backend;

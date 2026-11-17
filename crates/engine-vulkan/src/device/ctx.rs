@@ -185,6 +185,9 @@ pub(crate) struct Core {
     pub(crate) pinned: Option<u32>,
     pub(crate) cores: Option<u32>,
     pub(crate) device_local: u64,
+    /// On Android, the most the load may hold in all, read when the
+    /// device bound (`engine_gpu::android`): a phone's heap is its RAM.
+    ceiling: Option<u64>,
     /// The largest device-local heap, which device reservations take.
     heap: usize,
     pub(crate) vendor_id: u32,
@@ -229,14 +232,16 @@ impl Core {
 
     /// The device-local bytes free to this process now: the heap's budget
     /// less its usage where the driver reports them, else the heap less
-    /// every reservation (blind to other processes).
+    /// every reservation (blind to other processes); on Android, no more
+    /// than the ceiling read at bind less every reservation.
     pub(crate) fn free(&self) -> u64 {
-        match self.budget() {
+        let reserved = engine_gpu::books::process_reserved();
+        let free = match self.budget() {
             Some((budget, usage)) => budget.saturating_sub(usage),
-            None => self
-                .device_local
-                .saturating_sub(engine_gpu::books::process_reserved()),
-        }
+            None => self.device_local.saturating_sub(reserved),
+        };
+        self.ceiling
+            .map_or(free, |ceiling| free.min(ceiling.saturating_sub(reserved)))
     }
 
     /// What the driver holds for this process in the heap beside every
@@ -591,6 +596,31 @@ pub(crate) fn buffer_ceiling(storage_range: u32, allocation: u64, buffer: Option
         .fold(u64::from(storage_range), u64::min)
 }
 
+/// The most a load may hold in all, where the system bounds it beside the
+/// device: on Android, what memory has available less lmkd's reserve and
+/// the floor ([`engine_gpu::android`]), plus what this process already
+/// holds, which that reading counts as taken.
+#[cfg(target_os = "android")]
+fn system_ceiling() -> Result<Option<u64>> {
+    let room = engine_gpu::android::room()?;
+    let held = engine_gpu::books::process_reserved();
+    tracing::info!(
+        available = room.available,
+        defended = room.defended,
+        floor = engine_gpu::android::SAFETY_FLOOR_BYTES,
+        room = room.room,
+        held,
+        "the load takes what memory has available less what lmkd keeps free and the floor"
+    );
+    Ok(Some(room.room.saturating_add(held)))
+}
+
+#[cfg(not(target_os = "android"))]
+#[allow(clippy::unnecessary_wraps)]
+fn system_ceiling() -> Result<Option<u64>> {
+    Ok(None)
+}
+
 impl Context {
     /// Binds the device `boot` names for a load that takes what it has,
     /// no more than `allowance.budget` where the operator states one.
@@ -628,6 +658,8 @@ impl Context {
                 return Err($fault)
             };
         }
+        // Read before any handle is made, so a refusal leaves nothing to free.
+        let ceiling = system_ceiling()?;
         // In this function every query takes a `physical` enumerated from
         // `instance`, which lives until the end of it, and every chained
         // output struct is a local that outlives its call.
@@ -938,6 +970,7 @@ impl Context {
             pinned,
             cores,
             device_local,
+            ceiling,
             heap,
             vendor_id: props.vendor_id,
             discrete: props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU,
