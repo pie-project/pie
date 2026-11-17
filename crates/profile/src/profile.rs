@@ -664,7 +664,12 @@ impl Registry {
     fn resolve_with(&self, layers: &[Candidate], facts: Option<&Facts>) -> (Profile, Report) {
         let mut entries: BTreeMap<&'static str, Vec<Rung>> = BTreeMap::new();
         let mut tuned = crate::fire::Tuned::default();
+        // The user's layer's rates (a load's measurement saved, or a `pie
+        // tune --rates`) lie under the checked-in layers': a checked-in
+        // profile's rate wins where it states one.
+        let mut user_tuned = crate::fire::Tuned::default();
         let mut rates_measured: Option<String> = None;
+        let mut user_rates_measured: Option<String> = None;
         let mut measured: BTreeMap<&'static str, bool> = BTreeMap::new();
         let mut target = crate::registry::Target::default();
         // What the checked-in layers below assume, which a checked-in
@@ -718,18 +723,32 @@ impl Registry {
             if !file.target.name_contains.is_empty() {
                 target.name_contains = file.target.name_contains;
             }
-            tuned.lay(&file.tuned);
             // A layer stating rates says how they were measured, or leaves
             // the ones below standing as they were.
-            if file.tuned.rates != crate::fire::Rates::default() {
-                rates_measured = file
-                    .provenance
+            let how = (file.tuned.rates != crate::fire::Rates::default()).then(|| {
+                file.provenance
                     .iter()
                     .find(|(k, _)| k == "rates")
-                    .map(|(_, v)| v.trim_matches('"').to_string());
+                    .map(|(_, v)| v.trim_matches('"').to_string())
+            });
+            if seeded {
+                tuned.lay(&file.tuned);
+                if let Some(how) = how {
+                    rates_measured = how;
+                }
+            } else {
+                user_tuned.lay(&file.tuned);
+                if let Some(how) = how {
+                    user_rates_measured = how;
+                }
             }
             used.push(layer.source.clone());
         }
+        // The checked-in rates over the user's: theirs stand only where no
+        // checked-in layer states one.
+        rates_measured = rates_measured.or(user_rates_measured);
+        user_tuned.lay(&tuned);
+        let tuned = user_tuned;
         let top = used.last().cloned().unwrap_or(Source::Defaults);
         let report = Report {
             used: top.clone(),
