@@ -225,24 +225,22 @@ impl Plane {
             }
         };
         // Its (program, extents) pair: the first bind opens it in the room
-        // the runtime took for it; every later one names the same room.
+        // the runtime took for it; a later one names that room, or a fresh
+        // one where the runtime gave the pair's back (its instances parked)
+        // and took another: the tables are laid there, nothing copied, as
+        // at an unpark's rebind.
+        let moved = self
+            .pairs
+            .iter()
+            .find(|(_, pair)| pair.program == program_id && pair.extents == extents)
+            .filter(|(_, held)| held.place != pair_place)
+            .map(|(&pair, _)| pair);
         let pair = match self
             .pairs
             .iter()
             .find(|(_, pair)| pair.program == program_id && pair.extents == extents)
         {
-            Some((&pair, held)) if held.place == pair_place => pair,
-            Some((_, held)) => {
-                release_seats(&adopted);
-                return Err(Fault::program(
-                    "program::plane",
-                    format!(
-                        "a bind of program {program_id} names its pair's room at \
-                         {pair_place:?}, and the pair's live instances hold it at {:?}",
-                        held.place
-                    ),
-                ));
-            }
+            Some((&pair, _)) => pair,
             None => {
                 let pair = self.next_pair;
                 self.next_pair += 1;
@@ -251,7 +249,7 @@ impl Plane {
                     Pair {
                         program: program_id,
                         extents,
-                        place: pair_place,
+                        place: pair_place.clone(),
                         batches: BTreeMap::new(),
                         live: 0,
                     },
@@ -261,6 +259,18 @@ impl Plane {
         };
         if let Some(held) = self.pairs.get_mut(&pair) {
             held.live += 1;
+        }
+        if let Some(pair) = moved {
+            if let Some(held) = self.pairs.get_mut(&pair) {
+                held.place = pair_place;
+            }
+            if let Err(why) = self.lay_pair(pools, pair) {
+                release_seats(&adopted);
+                if let Some(held) = self.pairs.get_mut(&pair) {
+                    held.live -= 1;
+                }
+                return Err(why);
+            }
         }
         let id = InstanceId(self.next_instance);
         self.next_instance += 1;
