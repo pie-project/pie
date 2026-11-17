@@ -3,7 +3,7 @@ mod numeric;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use eval_op::eval_op;
+pub use eval_op::eval_op;
 
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::format;
@@ -43,6 +43,18 @@ impl Value {
             Value::I32(_) => Dtype::I32,
             Value::U32(_) => Dtype::U32,
             Value::Bool(_) => Dtype::Bool,
+        }
+    }
+
+    /// `numel` (at least one) zeros of `dtype`.
+    pub fn zeros(dtype: Dtype, numel: usize) -> Value {
+        let n = numel.max(1);
+        match dtype {
+            Dtype::F32 => Value::F32(vec![0.0; n]),
+            Dtype::I32 => Value::I32(vec![0; n]),
+            Dtype::U32 => Value::U32(vec![0; n]),
+            Dtype::Bool => Value::Bool(vec![false; n]),
+            _ => no_interpreter_lane(dtype),
         }
     }
 
@@ -234,14 +246,7 @@ pub(crate) fn no_interpreter_lane(dtype: Dtype) -> ! {
 }
 
 fn zeros(ty: ValueType) -> Value {
-    let n = ty.shape.numel().max(1) as usize;
-    match ty.dtype {
-        Dtype::F32 => Value::F32(vec![0.0; n]),
-        Dtype::I32 => Value::I32(vec![0; n]),
-        Dtype::U32 => Value::U32(vec![0; n]),
-        Dtype::Bool => Value::Bool(vec![false; n]),
-        _ => no_interpreter_lane(ty.dtype),
-    }
+    Value::zeros(ty.dtype, ty.shape.numel() as usize)
 }
 
 pub(super) fn value_matches(v: &Value, ty: ValueType) -> bool {
@@ -622,13 +627,16 @@ fn exec_body(
     Ok(())
 }
 
-pub(crate) enum ChanEffect {
+/// A channel op's effect, which the caller's channels carry out.
+pub enum ChanEffect {
     Take(u32),
     Read(u32),
     Put(u32, ValueId),
 }
 
-pub(crate) enum Evaled {
+/// What [`eval_op`] answers: the op's result(s), or the effect its caller
+/// carries out (a channel's, a kernel's, a sink's).
+pub enum Evaled {
     One(Value),
     Two(Value, Value),
     Chan(ChanEffect),

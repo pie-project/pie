@@ -163,9 +163,11 @@ pub fn decode(
             .map(|c| [c[0], c[1], c[2], c[3]])
     };
     Some(match dtype {
-        Dtype::Bool => {
-            eta_exec::Value::Bool((0..numel).map(|j| (bytes[j / 8] >> (j % 8)) & 1).collect())
-        }
+        Dtype::Bool => eta_exec::Value::Bool(
+            (0..numel)
+                .map(|j| (bytes[j / 8] >> (j % 8)) & 1 != 0)
+                .collect(),
+        ),
         Dtype::I32 => eta_exec::Value::I32(words().map(i32::from_le_bytes).collect()),
         Dtype::U32 => eta_exec::Value::U32(words().map(u32::from_le_bytes).collect()),
         Dtype::F32 => eta_exec::Value::F32(words().map(f32::from_le_bytes).collect()),

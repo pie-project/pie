@@ -1124,16 +1124,15 @@ impl Plane {
     }
 }
 
-fn runs_of(row: &[u8]) -> Vec<u32> {
+fn runs_of(row: &[bool]) -> Vec<u32> {
     let mut runs = Vec::new();
     let mut current = false;
     let mut count = 0u32;
-    if row.first().is_some_and(|&cell| cell != 0) {
+    if row.first().is_some_and(|&cell| cell) {
         runs.push(0);
         current = true;
     }
-    for &cell in row {
-        let value = cell != 0;
+    for &value in row {
         if value == current {
             count += 1;
         } else {
