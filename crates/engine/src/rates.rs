@@ -710,33 +710,51 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn the_l40s_walk_saturates_at_4467() {
-        // Leader's L40S walk (tests/fixtures/l40s-saturation.toml): every
-        // (n, k) shape's cost a row over the L40S's lattice to 19484. The
-        // rule CUDA's rates step takes (engine::rates::saturate) gives 4467,
-        // with no gain through 8934: CUDA's path unchanged.
-        let text = include_str!("../tests/fixtures/l40s-saturation.toml");
+    /// A stored walk's lattice, its stated top and every shape's cost a row
+    /// (tests/fixtures: `rows = [..]`, `top = ..`, a `cost = [..]` a shape).
+    fn walk(text: &str) -> (Vec<u32>, u32, Vec<Vec<f64>>) {
         let mut rows = Vec::new();
-        let mut top = 0.0;
+        let mut top = 0;
         let mut costs: Vec<Vec<f64>> = Vec::new();
         for line in text.lines().map(str::trim) {
             if line.starts_with("rows =") {
                 rows = numbers(line).into_iter().map(|r| r as u32).collect();
             } else if line.starts_with("top =") {
-                top = numbers(line)[0];
+                top = numbers(line)[0] as u32;
             } else if line.starts_with("agreement =") {
                 assert_eq!(numbers(line)[0], AGREEMENT);
             } else if line.starts_with("cost =") {
                 costs.push(numbers(line));
             }
         }
-        assert_eq!((rows.len(), costs.len()), (59, 25));
+        assert_eq!(costs.len(), 25, "every (n, k) of DEPTHS squared");
         assert!(costs.iter().all(|c| c.len() == rows.len()));
+        (rows, top, costs)
+    }
+
+    #[test]
+    fn the_l40s_walk_saturates_at_4467() {
+        // Leader's L40S walk (tests/fixtures/l40s-saturation.toml): every
+        // (n, k) shape's cost a row over the L40S's lattice to 19484. The
+        // rule CUDA's rates step takes (engine::rates::saturate) gives 4467,
+        // with no gain through 8934: CUDA's path unchanged.
+        let (rows, top, costs) = walk(include_str!("../tests/fixtures/l40s-saturation.toml"));
+        assert_eq!(rows.len(), 59);
         let s = saturation_of(&rows, &costs);
-        assert_eq!(f64::from(s.rows), top);
-        assert_eq!(s.rows, 4467);
+        assert_eq!((s.rows, top), (4467, 4467));
         assert!(s.through >= 8934, "{s:?}");
+    }
+
+    #[test]
+    fn the_l40s_live_run_saturates_at_4096() {
+        // The second live `--rates` on the L40S (l40s-saturation-run.toml):
+        // its grid as written, to its top. The last gain is at 4096 (the
+        // 1024 x 1024 shape, 7.9% under its least before), so the rule keeps
+        // 4096; the rows it measured past it are not in the grid.
+        let (rows, top, costs) = walk(include_str!("../tests/fixtures/l40s-saturation-run.toml"));
+        let s = saturation_of(&rows, &costs);
+        assert_eq!((s.rows, top), (4096, 4096));
+        assert!(s.best_gain > AGREEMENT && s.best_gain < 0.085, "{s:?}");
     }
 
     #[test]
