@@ -203,7 +203,7 @@ fn fire(fixture: &Fixture, knobs: Knobs) -> engine_cuda::Result<Vec<f32>> {
         ordinal: 0,
         // Eager: the fold is read off the walk, not a recorded body.
         knobs: Knobs {
-            chip: Some(engine_cuda::chip::pinned(Graphs::Off, None)),
+            pin: Some((Graphs::Off, None)),
             ..knobs
         },
         cache_dir: None,

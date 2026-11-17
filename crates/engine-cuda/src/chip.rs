@@ -8,8 +8,6 @@ use std::sync::LazyLock;
 
 use profile::{Anywhere, Decision, Domain, Facts, Profile, Registry, Report, Shelf, Var};
 
-use crate::{Graphs, Recording};
-
 /// The fact a family file assumes: CUDA's compute capability as major * 10
 /// + minor (89 is sm_89), or AMD's gfx version the same way (94 is gfx94x).
 #[cfg(not(feature = "rocm"))]
@@ -25,34 +23,11 @@ pub const FACTS: &[Var] = &[
 
 pub const AXES: &[&str] = &["rows"];
 
-/// Whether fires are captured as CUDA graphs.
+/// The device memory recorded bodies may take, in megabytes. Every fire is
+/// captured and replayed as a recorded body; no profile serves otherwise.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "engine.graphs", default = "on", tune = engine)]
-pub enum GraphMode {
-    /// Every fire launches eagerly: for diagnostics, not serving.
-    Off,
-    /// Fires are shaped for capture but launch eagerly.
-    Shaped,
-    /// Fires are captured and replayed.
-    On,
-}
-
-/// How captured fires are kept.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(
-    id = "engine.recording",
-    default = r#"{ use = "bodies", mem_mb = 4096 }"#,
-    tune = engine
-)]
-pub enum RecordingMode {
-    Off,
-    Shaped,
-    /// Recorded bodies are kept, up to `mem_mb` of device memory.
-    Bodies {
-        #[constant(range(0..=1_048_576), default = 4096)]
-        mem_mb: u32,
-    },
-}
+#[decision(id = "engine.bodies_mb", constant(range(0..=1_048_576)), default = 4096, tune = engine)]
+pub struct BodiesMb(pub u32);
 
 /// Whether a window that cannot be viewed in place is copied rather than
 /// split.
@@ -170,8 +145,7 @@ pub struct PrefillLatticeSteps(pub u32);
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     let mut r = Registry::new("cuda", FACTS, AXES);
     kernels_cuda::tuning::register(&mut r);
-    r.add::<GraphMode>()
-        .add::<RecordingMode>()
+    r.add::<BodiesMb>()
         .add::<Copies>()
         .add::<Grouped>()
         .add::<WorkingSetPercent>()
@@ -306,8 +280,8 @@ pub fn facts(major: u32, minor: u32, sms: u32) -> Facts {
 /// The settings one load on this GPU runs under, read from its profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Engine {
-    pub graphs: Graphs,
-    pub recording: Recording,
+    /// What recorded bodies may take (`engine.bodies_mb`).
+    pub bodies_megabytes: u32,
     pub copies: bool,
     pub grouped: bool,
     pub working_set_percent: u32,
@@ -330,18 +304,7 @@ impl Engine {
     #[must_use]
     pub fn of(profile: &Profile) -> Engine {
         Engine {
-            graphs: match profile.get::<GraphMode>() {
-                GraphMode::Off => Graphs::Off,
-                GraphMode::Shaped => Graphs::Shaped,
-                GraphMode::On => Graphs::On,
-            },
-            recording: match *profile.get::<RecordingMode>() {
-                RecordingMode::Off => Recording::Off,
-                RecordingMode::Shaped => Recording::Shaped,
-                RecordingMode::Bodies { mem_mb } => Recording::Bodies {
-                    mem_megabytes: mem_mb,
-                },
-            },
+            bodies_megabytes: profile.get::<BodiesMb>().0,
             copies: profile.on::<Copies>(&Anywhere),
             grouped: profile.on::<Grouped>(&Anywhere),
             working_set_percent: profile.get::<WorkingSetPercent>().0,
@@ -433,29 +396,6 @@ pub fn profile(overrides: &str) -> Profile {
     registry().with_overrides(overrides)
 }
 
-/// The registry defaults with the graph mode, and the recording mode where
-/// given, pinned: for a test or a diagnostic that runs eagerly.
-#[must_use]
-pub fn pinned(graphs: Graphs, recording: Option<Recording>) -> Profile {
-    let mut text = format!(
-        "[engine]\ngraphs = \"{}\"\n",
-        match graphs {
-            Graphs::Off => "off",
-            Graphs::Shaped => "shaped",
-            Graphs::On => "on",
-        }
-    );
-    match recording {
-        None => {}
-        Some(Recording::Off) => text.push_str("recording = \"off\"\n"),
-        Some(Recording::Shaped) => text.push_str("recording = \"shaped\"\n"),
-        Some(Recording::Bodies { mem_megabytes }) => text.push_str(&format!(
-            "recording = {{ use = \"bodies\", mem_mb = {mem_megabytes} }}\n"
-        )),
-    }
-    profile(&text)
-}
-
 /// Resolve the profile one load runs under: its compute capability's
 /// family file, the file for this GPU, then the user's.
 #[must_use]
@@ -470,6 +410,28 @@ mod tests {
     #[test]
     fn the_registry_holds_together() {
         assert_eq!(registry().check(), Vec::<String>::new());
+    }
+
+    /// Every fire is captured: no profile turns capture or bodies off.
+    #[test]
+    fn a_profile_stating_graphs_or_recording_is_refused() {
+        for (text, id) in [
+            ("api = 1\n[engine]\ngraphs = \"off\"\n", "engine.graphs"),
+            (
+                "api = 1\n[engine]\nrecording = \"off\"\n",
+                "engine.recording",
+            ),
+        ] {
+            let why = registry()
+                .load_user(text, "user.toml")
+                .expect_err("not a decision")
+                .to_string();
+            assert!(why.contains(&format!("`{id}` is not a decision")), "{why}");
+        }
+        let bodies = registry()
+            .load_user("api = 1\n[engine]\nbodies_mb = 512\n", "user.toml")
+            .expect("the bodies' memory is a decision");
+        assert_eq!(Engine::of(&bodies).bodies_megabytes, 512);
     }
 
     #[test]
@@ -819,10 +781,7 @@ mod tests {
         assert_eq!(
             engine,
             Engine {
-                graphs: Graphs::default(),
-                recording: Recording::Bodies {
-                    mem_megabytes: DEFAULT_BODIES_MEGABYTES
-                },
+                bodies_megabytes: DEFAULT_BODIES_MEGABYTES,
                 copies: true,
                 grouped: true,
                 working_set_percent: 50,
@@ -1130,12 +1089,10 @@ mod tests {
                     prefill_lattice_steps: 8,
                     forward_tokens: if std::ptr::eq(p, &l40s) { 2304 } else { 0 },
                     seated_first: std::ptr::eq(p, &l40s),
-                    recording: if std::ptr::eq(p, &l40s) {
-                        Recording::Bodies {
-                            mem_megabytes: 1024,
-                        }
+                    bodies_megabytes: if std::ptr::eq(p, &l40s) {
+                        1024
                     } else {
-                        Engine::of(&registry().defaults()).recording
+                        DEFAULT_BODIES_MEGABYTES
                     },
                     ..Engine::of(&registry().defaults())
                 }
@@ -1200,7 +1157,7 @@ mod tests {
                     || (spec.id == "kernel.moe.mxfp4_fp8_from" && std::ptr::eq(p, &l40s))
                     || spec.id == "kernel.ssm.kda_chunked"
                     || (spec.id == "engine.seated_first" && std::ptr::eq(p, &l40s))
-                    || (spec.id == "engine.recording" && std::ptr::eq(p, &l40s))
+                    || (spec.id == "engine.bodies_mb" && std::ptr::eq(p, &l40s))
                     || (spec.id == "kernel.sdpa.decode.grouped_prefill_lse"
                         && std::ptr::eq(p, &l40s))
                     || (spec.id == "kernel.sdpa.decode.grouped_prefill_window"

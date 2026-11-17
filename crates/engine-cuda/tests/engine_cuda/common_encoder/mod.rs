@@ -354,7 +354,7 @@ impl Rig {
         let path = weights.write(dir.path());
         let boot = engine_cuda::DeviceBoot {
             knobs: engine_cuda::Knobs {
-                chip: Some(engine_cuda::chip::pinned(graphs, None)),
+                pin: Some((graphs, None)),
                 ..engine_cuda::Knobs::default()
             },
             ..engine_cuda::DeviceBoot::default()

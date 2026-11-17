@@ -476,10 +476,7 @@ fn knobs() -> engine_cuda::Knobs {
     // `PIE_GOLDEN_EAGER`: no graph captured and no body recorded; every
     // fire walks its plan. The logits are a recorded body's.
     if std::env::var_os("PIE_GOLDEN_EAGER").is_some() {
-        knobs.chip = Some(engine_cuda::chip::pinned(
-            engine_cuda::Graphs::Off,
-            Some(engine_cuda::Recording::Off),
-        ));
+        knobs.pin = Some((engine_cuda::Graphs::Off, Some(engine_cuda::Recording::Off)));
     }
     // `PIE_GOLDEN_ONE_WINDOW`: every windowed row in one window list.
     knobs.diagnostics.one_window = std::env::var_os("PIE_GOLDEN_ONE_WINDOW").is_some();
@@ -489,7 +486,7 @@ fn knobs() -> engine_cuda::Knobs {
     // No weight shape stated: the tables and routed banks dense on the
     // device, as the base engine seats them. The weight cache's own probes
     // load with its shapes ([`load_cached`]).
-    knobs.diagnostics.dense_weights = true;
+    knobs.dense_weights = true;
     knobs
 }
 
@@ -500,10 +497,7 @@ fn knobs() -> engine_cuda::Knobs {
 /// match bit for bit.
 fn buffering(mut knobs: engine_cuda::Knobs) -> engine_cuda::Knobs {
     if std::env::var_os("PIE_GOLDEN_RS_EAGER").is_some() {
-        knobs.chip = Some(engine_cuda::chip::pinned(
-            engine_cuda::Graphs::Off,
-            Some(engine_cuda::Recording::Off),
-        ));
+        knobs.pin = Some((engine_cuda::Graphs::Off, Some(engine_cuda::Recording::Off)));
     }
     knobs
 }
@@ -1874,7 +1868,7 @@ fn served_rows(fixture: &Fixture, cache: &Path, rows: Rows) -> (Vec<(u64, u32)>,
     // The table's rows alone: the model's routed experts dense, as the
     // base engine seats them.
     let mut knobs = knobs();
-    knobs.diagnostics.dense_weights = false;
+    knobs.dense_weights = false;
     knobs.diagnostics.dense_experts = true;
     let mut shell = load_with(fixture, cache, knobs);
     let facts = shell.chunk_facts().expect("the pool states its chunks");
@@ -2022,7 +2016,7 @@ fn served_experts_as(fixture: &Fixture, cache: &Path, rows: Rows, told: bool) ->
     let began = std::time::Instant::now();
     use engine::chunk::{ResidentWeight, WeightAtom, WeightKind, WeightResidency};
     let mut knobs = knobs();
-    knobs.diagnostics.dense_weights = false;
+    knobs.dense_weights = false;
     knobs.weights_held = told;
     let mut shell = load_with(fixture, cache, knobs);
     let loaded = began.elapsed();
@@ -2476,12 +2470,9 @@ fn served_two_sets(
     use engine::chunk::SlotKind;
     use engine::fire::RsReset;
     let mut knobs = knobs();
-    knobs.chip = match serving {
-        Serving::Recorded => knobs.chip,
-        Serving::Eager => Some(engine_cuda::chip::pinned(
-            engine_cuda::Graphs::Off,
-            Some(engine_cuda::Recording::Off),
-        )),
+    knobs.pin = match serving {
+        Serving::Recorded => knobs.pin,
+        Serving::Eager => Some((engine_cuda::Graphs::Off, Some(engine_cuda::Recording::Off))),
     };
     let mut shell = load_with(fixture, cache, knobs);
     // As a worker boots it: the fitted pool backed whole, its facts stated.
@@ -2853,7 +2844,7 @@ fn golden_budget_probe() {
         for &budget in &budgets {
             let mut knobs = knobs();
             if std::env::var_os("PIE_GOLDEN_UNTABLED").is_some() {
-                knobs.diagnostics.dense_weights = false;
+                knobs.dense_weights = false;
                 knobs.diagnostics.untabled_experts = true;
             }
             let allowance = engine::Allowance {
@@ -2890,7 +2881,7 @@ fn least_budget(
     let knobs = || {
         let mut knobs = knobs();
         if untabled {
-            knobs.diagnostics.dense_weights = false;
+            knobs.dense_weights = false;
             knobs.diagnostics.untabled_experts = true;
         }
         knobs
@@ -2977,7 +2968,7 @@ fn golden_staged_experts() {
 
         let staged = || {
             let mut knobs = knobs();
-            knobs.diagnostics.dense_weights = false;
+            knobs.dense_weights = false;
             knobs.diagnostics.untabled_experts = true;
             knobs
         };

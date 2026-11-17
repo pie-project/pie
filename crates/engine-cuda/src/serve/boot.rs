@@ -6,10 +6,18 @@ use poem_ir::Trace;
 
 use super::diag::Diagnostics;
 
+/// Whether a load captures its fires. Serving captures every one (`On`);
+/// the eager modes exist only in a test build (feature `test-pins`), pinned
+/// by [`Knobs::pin`], never by a profile or a config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Graphs {
+    /// Every fire launches eagerly.
+    #[cfg(feature = "test-pins")]
     Off,
+    /// Fires are shaped for capture but launch eagerly.
+    #[cfg(feature = "test-pins")]
     Shaped,
+    /// Fires are captured and replayed.
     #[default]
     On,
 }
@@ -17,7 +25,11 @@ pub enum Graphs {
 impl Graphs {
     #[must_use]
     pub fn shaped(self) -> bool {
-        !matches!(self, Graphs::Off)
+        match self {
+            #[cfg(feature = "test-pins")]
+            Graphs::Off => false,
+            _ => true,
+        }
     }
 
     #[must_use]
@@ -26,11 +38,17 @@ impl Graphs {
     }
 }
 
+/// How captured fires are kept. Serving keeps recorded bodies; the others
+/// exist only in a test build (feature `test-pins`), as [`Graphs`]' do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Recording {
+    #[cfg(feature = "test-pins")]
     Off,
+    #[cfg(feature = "test-pins")]
     Shaped,
-    Bodies { mem_megabytes: u32 },
+    Bodies {
+        mem_megabytes: u32,
+    },
 }
 
 impl Default for Recording {
@@ -44,7 +62,11 @@ impl Default for Recording {
 impl Recording {
     #[must_use]
     pub fn pad(self) -> bool {
-        !matches!(self, Recording::Off)
+        match self {
+            #[cfg(feature = "test-pins")]
+            Recording::Off => false,
+            _ => true,
+        }
     }
 
     #[must_use]
@@ -56,6 +78,7 @@ impl Recording {
     pub fn bodies_mem(self) -> u32 {
         match self {
             Recording::Bodies { mem_megabytes, .. } => mem_megabytes,
+            #[cfg(feature = "test-pins")]
             Recording::Off | Recording::Shaped => 0,
         }
     }
@@ -88,6 +111,42 @@ pub struct Knobs {
     /// none, CUDA's default): an expert-parallel group whose ranks share a
     /// device wires only when its ranks' streams fit them.
     pub work_queues: Option<u32>,
+    /// A test's graph mode, and recording mode where given (none: the
+    /// profile's bodies), in place of serving's captured bodies.
+    #[cfg(feature = "test-pins")]
+    pub pin: Option<(Graphs, Option<Recording>)>,
+    /// A test's load that states no weight shape: every table and routed
+    /// bank the weight cache would stream stays dense on the device, as a
+    /// load that predates the cache seats it.
+    #[cfg(feature = "test-pins")]
+    pub dense_weights: bool,
+}
+
+impl Knobs {
+    /// The graph and recording modes a load runs under: every fire
+    /// captured, its bodies kept up to `bodies_megabytes`; only a test
+    /// build's [`Knobs::pin`] runs otherwise.
+    #[must_use]
+    pub fn modes(&self, bodies_megabytes: u32) -> (Graphs, Recording) {
+        let bodies = Recording::Bodies {
+            mem_megabytes: bodies_megabytes,
+        };
+        #[cfg(feature = "test-pins")]
+        if let Some((graphs, recording)) = self.pin {
+            return (graphs, recording.unwrap_or(bodies));
+        }
+        (Graphs::On, bodies)
+    }
+
+    /// Whether the load states no weight shape ([`Knobs::dense_weights`]);
+    /// never outside a test build.
+    #[must_use]
+    pub fn dense_weights(&self) -> bool {
+        #[cfg(feature = "test-pins")]
+        return self.dense_weights;
+        #[cfg(not(feature = "test-pins"))]
+        false
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

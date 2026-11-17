@@ -12,7 +12,6 @@
 //! engine's fire reproduces.)
 
 use engine::Engine;
-use engine_cuda::{Graphs, Recording};
 use poem::{Dtype, Platform, Request};
 
 use crate::micro::{
@@ -44,7 +43,7 @@ fn check(mem_megabytes: u32) {
     let word = |len: usize| whole.facts.word(&Request::new(len as u32, false));
     let prompts: Vec<Vec<u32>> = (0..size).map(|r| prompt(37 + 15 * r, r + 1)).collect();
     let profile =
-        || engine_cuda::chip::pinned(Graphs::On, Some(Recording::Bodies { mem_megabytes }));
+        || engine_cuda::chip::profile(&format!("[engine]\nbodies_mb = {mem_megabytes}\n"));
 
     let boots = (ordinals.iter())
         .map(|&ordinal| {
