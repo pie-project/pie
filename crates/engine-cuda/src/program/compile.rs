@@ -1029,7 +1029,7 @@ impl Cache {
     }
 
     /// One region's module, built whole on this thread.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "rocm"))]
     fn region_module(
         &mut self,
         target: &Target,

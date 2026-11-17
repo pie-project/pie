@@ -84,10 +84,12 @@ fn heavier_epilogue(rounds: u32) -> eta_ir::container::TraceContainer {
     use eta_ir::op::Op;
     let mut program = super::outputs::epilogue();
     let ops = &mut program.stages[0].ops;
-    // Values: 0 the ids output, 1 the stack output; each op below adds one.
-    let put = ops.pop().expect("the stack's put");
-    assert!(matches!(put, Op::ChanPut { chan: 1, value: 1 }), "{put:?}");
-    let mut last = 1u32;
+    // The stack's put is the last op; each op below adds one value after
+    // the value it puts, the epilogue's last.
+    let Some(Op::ChanPut { chan: 1, value }) = ops.pop() else {
+        panic!("the epilogue ends putting the stack");
+    };
+    let mut last = value;
     for round in 0..rounds * 4 {
         ops.push(match round % 4 {
             0 => Op::Sin(last),
