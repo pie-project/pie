@@ -97,7 +97,7 @@ pub fn code_bytes(r: &code::Reached) -> i64 {
 /// A kind of PE the fit misses alike, refitted on its own linked images ([`CODE_KINDS`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CodeKind {
-    /// Its file.
+    /// Its file (a `*` in it any run of characters).
     pub file: &'static str,
     /// Text its file holds (`None`: any), telling a variant of the file apart.
     pub holding: Option<&'static str>,
@@ -118,6 +118,12 @@ pub struct CodeKind {
 /// | `tpe.csl` op table streamed | klein 1024² VAE tile 1,4 at (64, 256) 43,968 and gated 43,984; tile 2,2 at (128, 512) 44,712; tile 2,4 at (32, 256) tight 48,128, gated 48,144, in the combined 1024² program 48,224 | 73 B |
 /// | `tpe.csl` op table held | klein tile 1,4 at (64, 256) 47,424; tile 2,2 at (128, 512) 48,172; flux2-mini's VAE tile 1,1 31,656 | 12 B |
 /// | `ttape.csl` | klein tile 2,4 47,872, gated 47,888, in the combined 1024² program 47,920 | 15 B |
+///
+/// A stream unit's weight PE (`w_*.csl` over ops/smv.csl's matvecs) holds 269 to 1,116 B past
+/// the estimate (mean 476 B) on 34 images linked alone with their program's exports (qwen3-sim,
+/// qwen3-sim4, Qwen3-0.6B -l2, Qwen3.5-0.8B -l1, nemotron -l1, qwen3-30b-a3b-mini -l1,
+/// minimax-sim, minimax-m25-mini -l1, klein's text: 12,976 to 35,840 B; GENERIC.md, "G4: a weight
+/// PE's memory, refitted"), 640 B after.
 pub const CODE_KINDS: &[CodeKind] = &[
     CodeKind {
         file: "tpe.csl",
@@ -137,16 +143,30 @@ pub const CODE_KINDS: &[CodeKind] = &[
         bytes: 512,
         miss: 15,
     },
+    CodeKind {
+        file: "w_*.csl",
+        holding: Some("ops/smv.csl"),
+        bytes: 476,
+        miss: 640,
+    },
 ];
 
 /// `file`'s kind ([`CODE_KINDS`]), its text `text` where known.
 fn kind_of(file: &str, text: Option<&str>) -> Option<&'static CodeKind> {
     let base = file.rsplit('/').next().unwrap_or(file);
     CODE_KINDS.iter().find(|k| {
-        k.file == base
+        named(k.file, base)
             && k.holding
                 .is_none_or(|h| text.is_some_and(|t| t.contains(h)))
     })
+}
+
+/// Whether `file` is `pattern`'s (a `*` in it any run of characters).
+fn named(pattern: &str, file: &str) -> bool {
+    match pattern.split_once('*') {
+        Some((a, b)) => file.len() >= a.len() + b.len() && file.starts_with(a) && file.ends_with(b),
+        None => pattern == file,
+    }
 }
 
 /// The code a kind of PE holds past the fit's ([`CODE_KINDS`]; none for a kind not refitted).

@@ -806,27 +806,37 @@ fn root_words(
     w
 }
 
-/// The code bytes a weight PE's matvecs take at the least (ops/smv.csl's: 3,981 B estimated for
-/// a head's weight PE), and its arrays beside its matvecs' (stamps, its chains' words: 516 B).
-pub const WEIGHT_CODE: i64 = 3_900;
+/// A weight PE's bytes past its matvecs' arrays, refitted on 34 linked weight PEs (each linked
+/// alone with its program's exports, cslc for the simulator's fabric: qwen3-sim, qwen3-sim4,
+/// Qwen3-0.6B -l2, Qwen3.5-0.8B -l1, nemotron -l1, qwen3-30b-a3b-mini -l1, minimax-sim,
+/// minimax-m25-mini -l1, klein's text; GENERIC.md, "G4: a weight PE's memory, refitted"): its
+/// fixed arrays (stamps, its chains' words) [`WEIGHT_FIXED`], its code [`WEIGHT_CODE`] with one
+/// matvec and [`WEIGHT_MV`] each matvec more (least squares), the fit's worst miss below an image
+/// [`WEIGHT_MISS`].
 pub const WEIGHT_FIXED: i64 = 400;
+pub const WEIGHT_CODE: i64 = 4_481;
+pub const WEIGHT_MV: i64 = 598;
+pub const WEIGHT_MISS: i64 = 597;
 
-/// A weight PE's bytes as emitted, past a PE by more than the static check's miss
-/// ([`crate::check::PeBytes::overflows`]): each matvec's tile (16-bit, a word unused), its two
-/// 16-bit x buffers and two f32 partial buffers (ops/smv.csl), and [`WEIGHT_CODE`]. A tile of few
-/// rows and many outputs is its partial buffers' as much as its weights' (a head's 4 x 3,039).
+/// A weight PE's bytes as emitted past a PE less the stack's room and the fit's miss
+/// ([`crate::build::STACK_ROOM`], [`WEIGHT_MISS`]): each matvec's tile (16-bit, a word unused),
+/// its two 16-bit x buffers and two f32 partial buffers (ops/smv.csl), [`WEIGHT_FIXED`] and its
+/// code. A tile of few rows and many outputs is its partial buffers' as much as its weights' (a
+/// head's 4 x 3,039).
 fn weight_over(u: &Unit, l: &Layout, col: u32) -> bool {
-    let data: u32 = u
+    let tiles: Vec<(u32, u32)> = u
         .steps
         .iter()
         .filter_map(|s| tile_dims(s, l, col))
-        .map(|(a, b)| 2 * (a * b + 1) + 4 * a + 8 * b)
+        .collect();
+    let data: i64 = tiles
+        .iter()
+        .map(|&(a, b)| i64::from(2 * (a * b + 1) + 4 * a + 8 * b))
         .sum();
-    crate::check::PeBytes {
-        data: i64::from(data) + WEIGHT_FIXED,
-        code: WEIGHT_CODE,
-    }
-    .overflows()
+    let mvs = tiles.iter().filter(|&&(a, b)| a > 0 && b > 0).count() as i64;
+    let code = WEIGHT_CODE + WEIGHT_MV * (mvs - 1).max(0);
+    data + WEIGHT_FIXED + code + WEIGHT_MISS + i64::from(crate::build::STACK_ROOM)
+        > crate::check::PE_BYTES
 }
 
 /// [`root_words`] and the code room the search holds back ([`crate::check::CODE_RESERVE`]) past a

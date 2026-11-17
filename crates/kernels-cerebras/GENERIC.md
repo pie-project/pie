@@ -3681,3 +3681,30 @@ an undeclared `seg`.
 - **Identity**: against 9205f3f72's binary, only minimax-sim and minimax-m25-mini change; qwen3-sim,
   qwen3-sim4, Qwen3-0.6B -l2, Qwen3.5-0.8B -l1, nemotron -l1 and flux2-mini's / klein's text and
   denoise programs are byte-identical.
+
+### G4.2 qwen3-30b-a3b-mini -l1: a weight PE's memory, refitted
+
+8a17c07a1's plan (110 x 554) did not link: cslc ran out of PE memory (`.bss`) on the exit's
+weight PEs (`w_1_0.csl`: ops/smv.csl's 4 x 2,922 tile, its x and partial buffers). The check
+estimated 51,267 B, 2,115 B past a PE, inside its 2,361 B worst over-estimate (`OVER`), and
+`place::weight_over` held the search to the same bound. Linked alone (the PE and its program's
+exports in a 1 x 1 layout, cslc for the simulator's fabric: within a byte of the same PE in the
+full program, 17,344 B both on qwen3-sim4's `w_0_0`), it holds 51,536 B (from 2,000 to 2,700
+outputs a column it adds 16 B an output: 36,784 .. 47,984 B): the estimate was right, the
+bound let it through.
+
+- **The data**: 34 weight PE images linked alone (qwen3-sim, qwen3-sim4, Qwen3-0.6B -l2,
+  Qwen3.5-0.8B -l1, nemotron -l1, qwen3-30b-a3b-mini -l1, minimax-sim, minimax-m25-mini -l1,
+  klein's text; 12,976 to 35,840 B, one to six matvecs, some f32 rows). The check's estimate
+  is under on every one, 269 to 1,116 B (mean 476); the search's formula (`weight_over`: the
+  tiles, x and partial buffers, 400 B and 3,900 B of code) 466 B under at one matvec, about
+  600 B more each matvec past it.
+- **The refit**: `check::CODE_KINDS` gains the weight PE (`w_*.csl` over ops/smv.csl: a `*` in a
+  kind's file now matches any run), its mean miss (476 B) added to its code and its worst
+  after (640 B) its miss. `weight_over`'s code is least squares on the same images
+  (`WEIGHT_CODE` 4,481 B at one matvec, `WEIGHT_MV` 598 B each more; worst under after
+  `WEIGHT_MISS` 597 B), and the search keeps a weight PE within a PE less the stack's room and
+  that miss (as `stream::tiled::points` does a tiled kind's), not within the check's `OVER`.
+- **qwen3-30b-a3b-mini -l1** takes 115 x 554 (the exit over more columns); it links, its fullest
+  image 47,440 B (`w_1_0`, 1,712 B of stack), the check's estimate 47,647 B. The other decode
+  programs and flux's text and denoise are byte-identical (their weight PEs are far from a PE).
