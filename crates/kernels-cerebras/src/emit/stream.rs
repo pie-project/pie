@@ -702,6 +702,21 @@ pub(crate) fn dedup(files: &mut Vec<(String, String)>, tiles: &mut Tiles) {
     }
 }
 
+/// The chunk root `idx` runs of the region at `step`: its index from the region's first root,
+/// or, for a region cut across roots whose replicas run the same chunk (a replicated K / V
+/// head's full-width K norm: `per` roots a chunk, narrower than the region), the replicas'
+/// chunk. (A head region whole at each root keeps its root index: its residents are a root's.)
+fn chunk_at(b: &Built, step: usize, idx: u32) -> u32 {
+    b.regions.get(&step).map_or(idx, |(at, _, _)| {
+        let cut = matches!(&b.unit.steps[step], Step::Region { chain, .. } if at.chunk < chain.region.width);
+        if cut && at.reps == 1 {
+            at.chunk_of(idx - at.first)
+        } else {
+            idx - at.first
+        }
+    })
+}
+
 /// An array a root file declares, at root `idx` of its side.
 fn rebind(a: &HostArray, c: Coord, idx: u32, b: &Built) -> HostArray {
     let mut out = a.clone();
@@ -710,7 +725,7 @@ fn rebind(a: &HostArray, c: Coord, idx: u32, b: &Built) -> HostArray {
         unit, step, table, ..
     } = a.fill
     {
-        let first = b.regions.get(&step).map_or(0, |(at, _, _)| at.first);
+        let ri = chunk_at(b, step, idx);
         // a region whole at each root (a head region) has one chunk's tables
         let one = b
             .regions
@@ -720,19 +735,19 @@ fn rebind(a: &HostArray, c: Coord, idx: u32, b: &Built) -> HostArray {
             unit,
             step,
             table,
-            r: if one { 0 } else { idx - first },
+            r: if one { 0 } else { ri },
         };
     }
     if let Fill::Resident {
         unit, step, param, ..
     } = a.fill
     {
-        let first = b.regions.get(&step).map_or(0, |(at, _, _)| at.first);
+        let ri = chunk_at(b, step, idx);
         out.fill = Fill::Resident {
             unit,
             step,
             param,
-            r: idx - first,
+            r: ri,
         };
     }
     out

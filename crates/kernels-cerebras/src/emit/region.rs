@@ -61,6 +61,10 @@ pub struct Place {
     /// The row's columns in the order the roots hold them (`columns[p]` the region's column at
     /// position `p`; `None`: in order): a rotation's mates gathered into one root's chunk.
     pub columns: Option<Vec<u32>>,
+    /// Consecutive roots that run the same chunk (a replicated K / V head's replicas, each its
+    /// head whole): a row's all-reduce sums each column `dup` times, so a root's part is taken
+    /// `1 / dup` (a power of two: exact); 1 elsewhere.
+    pub dup: u32,
 }
 
 /// A decode rotation's anchor period (`srope.csl`'s STEP): positions between two DIRECT
@@ -587,6 +591,9 @@ impl Printer<'_> {
                 let src = self.ptr_of(a)?;
                 self.sums = true;
                 let mut e = format!("vsum({src}, 0, C)");
+                if self.place.roots > 1 && self.place.dup > 1 {
+                    e = format!("({e}) * {}", lit(1.0 / self.place.dup as f32));
+                }
                 if self.place.roots > 1 {
                     self.all_reduces += 1;
                     let _ = writeln!(self.body, "  sred[0] = {e};\n  seg.all_reduce(SRED, 1);");
@@ -972,9 +979,10 @@ impl Printer<'_> {
                             })
                     });
                 if !swap && !halves && per.is_none() {
-                    // mates each within its own chunk, the pattern differing chunk to chunk (a
-                    // replicated K / V head's half a head a root, its rotated half on one root
-                    // and its rest on the other): a scalar gather by the chunk's own index table
+                    // the general gather: each column's mate within its own chunk, by the
+                    // chunk's index table (a scalar loop); the forms above are its cases whose
+                    // pattern is one DSD move a run, the same for every chunk. A mate in another
+                    // chunk is refused (no root holds both).
                     let s = self.row_of(src)?;
                     let arr = s
                         .strip_prefix('B')
@@ -985,7 +993,9 @@ impl Printer<'_> {
                         .enumerate()
                         .all(|(e, &m)| m as usize / c == e / c);
                     let (Some(arr), true) = (arr, within) else {
-                        return refuse(format!("op {k}: a gather other than a pair's mate"));
+                        return refuse(format!(
+                            "op {k}: a gather of a mate in another chunk, or of no row"
+                        ));
                     };
                     let name = format!("g{v}");
                     self.tables.push(Table {
@@ -1695,6 +1705,7 @@ mod tests {
                 rope_bits: 3,
                 straddle: false,
                 columns: None,
+                dup: 1,
             };
             let p = print(reg, &place).unwrap_or_else(|e| panic!("node {at} ({name}): {e}"));
             if name == "elemwise.layernorm" {
@@ -1734,6 +1745,7 @@ mod tests {
             rope_bits: 3,
             straddle: false,
             columns: None,
+            dup: 1,
         };
         let p = print(&region, &place).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(p.csl.matches("while (i < C)").count(), 2, "{}", p.csl);

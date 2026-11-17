@@ -803,6 +803,7 @@ pub fn program_at(
                     rope_bits: bits,
                     straddle: false,
                     columns: None,
+                    dup: at.per.max(1),
                 },
             )
             .map_err(|e| format!("{}: step {i}: {e}", u.name))?;
@@ -859,6 +860,7 @@ pub fn program_at(
                             rope_bits: bits,
                             straddle: false,
                             columns: None,
+                            dup: 1,
                         },
                     )
                     .map_err(|e| format!("{}: step {i} (helpers): {e}", u.name))?;

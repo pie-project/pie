@@ -266,6 +266,34 @@ impl Layout {
                 per: self.heads,
             };
         }
+        // a value of several heads whose replicated heads are laid whole at each of their
+        // replicas (`per` consecutive head roots a head: a full-width K norm's K): a head's
+        // chunk at each replica, the replicas' duplicate sums taken once ([`Place::dup`])
+        if self.heads > 1 {
+            for per in (2..=self.heads).filter(|p| self.heads.is_multiple_of(*p)) {
+                let units = self.heads / per;
+                if !width.is_multiple_of(units) {
+                    continue;
+                }
+                let chunk = width / units;
+                if cands.iter().any(|c| {
+                    (0..self.heads).all(|h| {
+                        let at = c.from + h / per * chunk;
+                        self.cols[h as usize].iter().any(|s| {
+                            s.base == c.base.0 && s.from <= at && at + chunk <= s.from + s.len
+                        })
+                    })
+                }) {
+                    return RegionAt {
+                        first: 0,
+                        roots: self.heads,
+                        chunk,
+                        reps: 1,
+                        per,
+                    };
+                }
+            }
+        }
         if self.heads > 0 && width.is_multiple_of(self.heads) {
             let chunk = width / self.heads;
             if cands.iter().any(|c| {
@@ -846,6 +874,7 @@ fn region_halves(chain: &poem_compiler::fuse::chain::Chain, at: &RegionAt) -> u3
         rope_bits: 0,
         straddle: true,
         columns: None,
+        dup: at.per.max(1),
     };
     let Ok(p) = crate::emit::region::print(&chain.region, &place) else {
         return 0;

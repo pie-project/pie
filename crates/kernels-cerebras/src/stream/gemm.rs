@@ -969,6 +969,7 @@ pub fn placed(l: &Lowering, c: u32, r: u32, kbm: u32) -> R<GemmProgram> {
             rope_bits: 3,
             straddle: true,
             columns,
+            dup: 1,
         })
     };
     // the rotations' layouts first (a region's rows alike: a reader of a permuted row prints
@@ -2089,6 +2090,7 @@ mod tests {
                 rope_bits: 3,
                 straddle: false,
                 columns: None,
+                dup: 1,
             },
         );
         assert!(off.is_err());
