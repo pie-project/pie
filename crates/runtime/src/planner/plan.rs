@@ -5,6 +5,7 @@ use tokio::sync::Notify;
 
 use super::grant::{AllocationGrant, Demand, DevicePageReservation, RsSlotReservation};
 use super::holdings::{swapped_page_count, swapped_rs_units};
+use super::inner::RestoreGate;
 use super::proc::Residency;
 use super::wait::{EntryKey, WaitKind, Waiter};
 use super::{ProcessId, ResidencyPlanner, exec};
@@ -39,6 +40,9 @@ enum Step {
         key: EntryKey,
         pid: ProcessId,
     },
+    /// The head is a restore whose role slots found no room, and nothing
+    /// else will free any: a resident process is evicted for it.
+    EvictForRoles,
     Release(DevicePageReservation),
     Done,
 }
@@ -142,24 +146,16 @@ impl ResidencyPlanner {
                     Some(_) => Step::ServeAllocationBurst {
                         extra: inner.burst_shortfall(),
                     },
-                    None => {
-                        // A restore goes back once a resident process has
-                        // finished (its credit), or the fleet can do nothing
-                        // else, or the device has room for it and still a
-                        // page for each resident lane's next one: suspended
-                        // processes come back as soon as room appears, every
-                        // one it holds at once, not one a completion.
-                        if inner.completion_credit > 0 {
-                            inner.completion_credit -= 1;
-                        } else if spare < inner.growth_reserve() && !inner.fleet_stalled() {
-                            return Step::Done;
-                        }
-                        Step::ServeRestore { key, pid }
-                    }
+                    None => match inner.restore_gate(pid, spare) {
+                        RestoreGate::Serve => Step::ServeRestore { key, pid },
+                        RestoreGate::Wait => Step::Done,
+                        RestoreGate::Evict => Step::EvictForRoles,
+                    },
                 }
             });
             let fund_by_eviction = match step {
                 Step::Done => return false,
+                Step::EvictForRoles => true,
                 Step::Release(stranded) => {
                     drop(stranded);
                     return false;

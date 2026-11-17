@@ -63,8 +63,8 @@ use std::sync::{Arc, Mutex};
 
 use ::engine::chunk::{ShapeId as EngineShape, SlotRole};
 use ::engine::{
-    BoundInstance, ChannelId, ChannelRegistration, Engine, GuestState, InstanceBinding,
-    InstanceId, ProgramFacts, ProgramId, Rebind, RingFacts, RingSlots, ScratchPlace,
+    BoundInstance, ChannelId, ChannelRegistration, Engine, GuestState, InstanceBinding, InstanceId,
+    ProgramFacts, ProgramId, Rebind, RingFacts, RingSlots, ScratchPlace,
 };
 
 use super::shared::programs::FireKey;
@@ -130,6 +130,11 @@ pub enum RolesError {
     AdapterParked,
     #[error("{0}'s state is parked with the instances that hold it")]
     PairParked(FireKey),
+    /// A parked process's items found no device room now, though the
+    /// budget's state chunks hold them: the restore waits, queued, for room
+    /// a completion or an eviction frees, and is never failed for it.
+    #[error("{0}; the budget holds it, so the restore waits for room")]
+    UnparkShort(Box<RolesError>),
     #[error("the device pool has no room for {what}, {bytes} bytes of Instance slots: {room}")]
     GuestShort {
         what: String,
@@ -167,6 +172,21 @@ pub enum RolesError {
         slot_bytes: u64,
         per_chunk: u32,
     },
+}
+
+impl RolesError {
+    /// The device pool lacks room for it now: what a park, a completion or
+    /// a commit may make, not a wrong ask.
+    #[must_use]
+    pub fn is_short(&self) -> bool {
+        matches!(
+            self,
+            Self::Short { .. }
+                | Self::NoRun { .. }
+                | Self::GuestShort { .. }
+                | Self::GuestGrow { .. }
+        )
+    }
 }
 
 /// The pool's waiter id for what guest binds are short
@@ -415,7 +435,9 @@ impl Taken {
     pub fn pair(&self) -> ScratchPlace {
         self.pair
             .as_ref()
-            .map_or(ScratchPlace::None, |(_, part, _)| place(part, self.chunk_slots))
+            .map_or(ScratchPlace::None, |(_, part, _)| {
+                place(part, self.chunk_slots)
+            })
     }
 }
 
@@ -579,13 +601,16 @@ impl Roles {
     }
 
     /// The dead part `bytes` of guest scratch take, pieces of `run`
-    /// chunks each: one run of `Instance` slots in a chunk where they fit a
-    /// chunk's slots, else whole runs of `run` adjacent chunks.
+    /// chunks each: one run of `Instance` slots in a chunk where they take
+    /// no more than half a chunk's slots, else whole runs of `run` adjacent
+    /// chunks. A run of slots wider than that needs a chunk nearly empty,
+    /// which a pool under pressure seldom has though whole chunks free up
+    /// as processes leave; a whole chunk is what it comes back to.
     fn scratch_part(&self, bytes: u64, run: u32) -> Result<Part, RolesError> {
         let shape = self.shape(SlotRole::Instance)?;
         let slot = shape.slot_bytes.max(1);
         let run = run.max(1);
-        let (pieces, slots) = if bytes <= u64::from(self.chunk_slots) * slot {
+        let (pieces, slots) = if bytes.saturating_mul(2) <= u64::from(self.chunk_slots) * slot {
             (0, u32::try_from(bytes.div_ceil(slot)).unwrap_or(u32::MAX))
         } else {
             let chunk = self.device.lock().unwrap().pool().chunk_bytes().max(1);
@@ -939,15 +964,12 @@ impl Roles {
         item.rings = taken.rings;
         item.channels = taken.channels;
         if let Some((key, part, _)) = taken.adapter {
-            let shared = self
-                .items
-                .entry(Owner::Adapter(key))
-                .or_insert_with(|| {
-                    let mut adapter = Item::new(holder, vec![part]);
-                    // Held by its instances alone: freed at the last close.
-                    adapter.open = false;
-                    adapter
-                });
+            let shared = self.items.entry(Owner::Adapter(key)).or_insert_with(|| {
+                let mut adapter = Item::new(holder, vec![part]);
+                // Held by its instances alone: freed at the last close.
+                adapter.open = false;
+                adapter
+            });
             shared.attached.insert(id);
             item.adapter = Some(key);
         }
@@ -1066,13 +1088,14 @@ impl Roles {
                     })
             }
             Owner::Adapter(_) | Owner::Pair(_) => {
-                item.attached.iter().any(|id| {
-                    instance(id).is_some_and(|instance| instance.holder == Some(holder))
-                }) && item.attached.iter().all(|id| {
-                    instance(id).is_some_and(|instance| {
-                        instance.holder == Some(holder) || instance.tier != Tier::Device
+                item.attached
+                    .iter()
+                    .any(|id| instance(id).is_some_and(|instance| instance.holder == Some(holder)))
+                    && item.attached.iter().all(|id| {
+                        instance(id).is_some_and(|instance| {
+                            instance.holder == Some(holder) || instance.tier != Tier::Device
+                        })
                     })
-                })
             }
         }
     }
@@ -1132,12 +1155,16 @@ impl Roles {
             .collect();
         let device = Arc::clone(&self.device);
         let mut items: Vec<(Owner, Vec<Part>)> = Vec::new();
-        for owner in owners {
-            match self.take_parts(&device, &self.items[&owner].parts, true) {
-                Ok(to) => items.push((owner, to)),
+        for owner in &owners {
+            match self.take_parts(&device, &self.items[owner].parts, true) {
+                Ok(to) => items.push((*owner, to)),
                 Err(error) => {
                     for (_, parts) in &items {
                         self.give(&device, parts);
+                    }
+                    // Short of room the budget holds: the restore waits.
+                    if error.is_short() && self.fits_budget(&owners) {
+                        return Err(RolesError::UnparkShort(Box::new(error)));
                     }
                     return Err(error);
                 }
@@ -1147,6 +1174,30 @@ impl Roles {
             self.items.get_mut(owner).expect("present").tier = Tier::Moving;
         }
         Ok((!items.is_empty()).then(|| self.moving(false, items)))
+    }
+
+    /// Whether the items of `owners` together fit the device pool's state
+    /// chunks at all, whole chunks for each part: room a completion or an
+    /// eviction can make.
+    fn fits_budget(&self, owners: &[Owner]) -> bool {
+        let device = self.device.lock().unwrap();
+        let mut chunks = 0u64;
+        for owner in owners {
+            for part in &self.items[owner].parts {
+                chunks += if part.dead() {
+                    let (run, pieces) = part.chunk_runs();
+                    u64::from(run) * u64::from(pieces)
+                } else {
+                    let per_chunk = self
+                        .shapes
+                        .of(part.role)
+                        .and_then(|shape| device.pool().shape(shape.pool))
+                        .map_or(1, |shape| shape.slots_per_chunk.max(1));
+                    (part.refs.len() as u64).div_ceil(u64::from(per_chunk))
+                };
+            }
+        }
+        chunks <= u64::from(device.state_chunks_now())
     }
 
     /// The move of `items` (each item's slots to take), with the copies

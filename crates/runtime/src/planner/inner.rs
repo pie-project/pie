@@ -350,6 +350,35 @@ impl Inner {
             .count() as u32
     }
 
+    /// Whether the restore of `pid`, the head, goes now (`spare`: device
+    /// pages free past what the head gathered). A restore goes back once a
+    /// resident process has finished (its credit), or the fleet can do
+    /// nothing else, or the device has room for it and still a page for
+    /// each resident lane's next one: suspended processes come back as
+    /// soon as room appears, every one it holds at once, not one a
+    /// completion. One whose role slots found no room last time
+    /// ([`super::proc::Proc::roles_short`]) goes again only once a
+    /// completion frees some, or, the fleet stalled, an eviction makes it.
+    pub(super) fn restore_gate(&mut self, pid: ProcessId, spare: u32) -> RestoreGate {
+        let roles_short = self.procs.get(&pid).is_some_and(|proc| proc.roles_short);
+        if self.completion_credit > 0 {
+            self.completion_credit -= 1;
+            return RestoreGate::Serve;
+        }
+        let stalled = self.fleet_stalled();
+        if roles_short {
+            return if stalled {
+                RestoreGate::Evict
+            } else {
+                RestoreGate::Wait
+            };
+        }
+        if spare < self.growth_reserve() && !stalled {
+            return RestoreGate::Wait;
+        }
+        RestoreGate::Serve
+    }
+
     pub(super) fn fleet_stalled(&self) -> bool {
         if !self.evicting.is_empty() {
             return false;
@@ -375,4 +404,14 @@ impl Inner {
             Residency::Evicted => true,
         })
     }
+}
+
+/// What the head restore does now ([`Inner::restore_gate`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RestoreGate {
+    Serve,
+    Wait,
+    /// Its role slots wait on room nothing else will free: a resident
+    /// process is evicted for it.
+    Evict,
 }

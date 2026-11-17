@@ -15,9 +15,8 @@ use ::engine::chunk::{
     SlotRole, SlotShape,
 };
 use ::engine::{
-    BindExtents, BoundInstance, Engine, FrameSubmission, FrameTicket, GuestState,
-    InstanceBinding, InstanceId, LoadRequest, Loaded, ProgramFacts, ProgramId, Rebind,
-    ScratchPlace,
+    BindExtents, BoundInstance, Engine, FrameSubmission, FrameTicket, GuestState, InstanceBinding,
+    InstanceId, LoadRequest, Loaded, ProgramFacts, ProgramId, Rebind, ScratchPlace,
 };
 
 use super::{Owner, Roles, RolesError, RolesHandle, bind_instance, learn_program};
@@ -199,7 +198,11 @@ impl Engine for GuestEngine {
         Ok(ProgramFacts::default())
     }
 
-    fn guest_state(&self, _program: ProgramId, _extents: &BindExtents) -> ::engine::Result<GuestState> {
+    fn guest_state(
+        &self,
+        _program: ProgramId,
+        _extents: &BindExtents,
+    ) -> ::engine::Result<GuestState> {
         Ok(self.state)
     }
 
@@ -261,7 +264,10 @@ fn a_one_lane_prefill_reaches_the_top_rung_with_a_program_bound() {
         let pool = device.lock().unwrap();
         let limit = pool.pool().live_limit();
         assert_eq!(limit, 64 - 12, "the top rung's span lies above it");
-        for chunk in chunks(&binding.scratch).into_iter().chain(chunks(&binding.pair)) {
+        for chunk in chunks(&binding.scratch)
+            .into_iter()
+            .chain(chunks(&binding.pair))
+        {
             assert!(
                 pool.pool().physical(chunk).unwrap() < limit,
                 "the program's state lies below the span"
@@ -284,8 +290,9 @@ fn a_one_lane_prefill_reaches_the_top_rung_with_a_program_bound() {
 }
 
 /// 256 bound instances of a program holding 11.2 MB each are counted at
-/// their binds, a run of 2735 slots each (one a chunk: two do not fit one)
-/// beside the pair's, and take state's room as any state does; the 257th
+/// their binds, a whole chunk each (past half a chunk's slots: a run of
+/// them would need a chunk nearly empty) beside the pair's run, and take
+/// state's room as any state does; the 257th
 /// finds no chunk with the run free and is refused by name, nothing taken.
 #[test]
 fn two_hundred_fifty_six_instances_are_counted_at_bind_and_the_257th_is_refused() {
@@ -297,9 +304,17 @@ fn two_hundred_fifty_six_instances_are_counted_at_bind_and_the_257th_is_refused(
     for by in 1..=256 {
         bind(&roles, &mut engine, by).unwrap_or_else(|error| panic!("bind {by}: {error}"));
     }
-    let state = (256 * slots(11_200_000) + slots(PAIR)) * SLOT;
-    assert_eq!(held(&device) - before, state, "256 scratch runs and the pair's");
-    assert_eq!(roles.lock().unwrap().device_bytes(), state, "state, counted");
+    let state = 256 * CHUNK + slots(PAIR) * SLOT;
+    assert_eq!(
+        held(&device) - before,
+        state,
+        "256 scratch runs and the pair's"
+    );
+    assert_eq!(
+        roles.lock().unwrap().device_bytes(),
+        state,
+        "state, counted"
+    );
     let error = bind(&roles, &mut engine, 257).expect_err("the pool holds no more");
     let named = error.to_string();
     assert!(
@@ -312,8 +327,15 @@ fn two_hundred_fifty_six_instances_are_counted_at_bind_and_the_257th_is_refused(
         ),
         "{named}"
     );
-    assert!(named.contains("scratch") && named.contains("program 7"), "{named}");
-    assert_eq!(held(&device) - before, state, "the refused bind took nothing");
+    assert!(
+        named.contains("scratch") && named.contains("program 7"),
+        "{named}"
+    );
+    assert_eq!(
+        held(&device) - before,
+        state,
+        "the refused bind took nothing"
+    );
     assert_eq!(engine.bindings.len(), 256, "the engine was not asked");
 }
 
@@ -338,12 +360,21 @@ fn the_pair_s_chunks_are_taken_once_and_given_back_at_the_last_close() {
     assert_eq!(held(&device) - before, 2 * CHUNK + 3 * run);
     roles.lock().unwrap().close_instance(ids[0]);
     roles.lock().unwrap().close_instance(ids[1]);
-    assert_eq!(held(&device) - before, 2 * CHUNK + run, "the pair stays with its last");
-    assert!(!roles.lock().unwrap().slots(Owner::Pair(super::FireKey {
-        program: PROGRAM,
-        extents: BindExtents::default(),
-    }))
-    .is_empty());
+    assert_eq!(
+        held(&device) - before,
+        2 * CHUNK + run,
+        "the pair stays with its last"
+    );
+    assert!(
+        !roles
+            .lock()
+            .unwrap()
+            .slots(Owner::Pair(super::FireKey {
+                program: PROGRAM,
+                extents: BindExtents::default(),
+            }))
+            .is_empty()
+    );
     roles.lock().unwrap().close_instance(ids[2]);
     assert_eq!(held(&device), before, "the last close gives the pair back");
 }
@@ -368,7 +399,11 @@ fn a_park_gives_the_scratch_back_whole_and_an_unpark_takes_fresh_chunks() {
         .unwrap()
         .prepare_park(holder(1))
         .expect("the instance and its pair park");
-    assert!(park.copies().is_empty(), "nothing copied: {:?}", park.copies());
+    assert!(
+        park.copies().is_empty(),
+        "nothing copied: {:?}",
+        park.copies()
+    );
     roles.lock().unwrap().commit(park);
     assert_eq!(held(&device), before, "parked: its chunks given back whole");
 
@@ -412,7 +447,10 @@ fn a_park_gives_the_scratch_back_whole_and_an_unpark_takes_fresh_chunks() {
     };
     assert_eq!(*rebound, id);
     let fresh = chunks(scratch);
-    assert!(matches!(scratch, ScratchPlace::Chunks { .. }) && fresh.len() == 2, "{scratch:?}");
+    assert!(
+        matches!(scratch, ScratchPlace::Chunks { .. }) && fresh.len() == 2,
+        "{scratch:?}"
+    );
     assert!(
         matches!(pair_place, ScratchPlace::Run { slots: 1536, .. }),
         "a fresh run: {pair_place:?}"
@@ -494,7 +532,12 @@ fn two_programs_scratch_and_pairs_lie_apart_and_stay_apart_after_a_park() {
         sampler.bindings[0].pair.clone(),
         beam.bindings[0].pair.clone(),
     ];
-    assert!(sampler.bindings.iter().all(|binding| binding.pair == pairs[0]));
+    assert!(
+        sampler
+            .bindings
+            .iter()
+            .all(|binding| binding.pair == pairs[0])
+    );
     assert!(beam.bindings.iter().all(|binding| binding.pair == pairs[1]));
     assert!(matches!(scratch[0], ScratchPlace::Run { .. }));
     assert!(matches!(scratch[3], ScratchPlace::Chunks { .. }));
@@ -944,4 +987,84 @@ async fn a_guest_bind_short_of_a_run_commits_the_next_segment_and_binds() {
                 .into()
         )
     );
+}
+
+/// More parked guest states come back than the device has room for: four
+/// instances of 11.2 MB (past half a chunk's slots: a whole chunk each)
+/// park, four of another program take their chunks, and every restore then
+/// finds no room. Each unpark short of room the budget holds is a wait
+/// (`RolesError::UnparkShort`), never a failure; as each
+/// of the others completes, one waiting restore comes back, until all four
+/// have.
+#[test]
+fn restores_past_the_free_room_wait_and_all_come_back() {
+    let Pools { roles, .. } = pools(1 + 4 + 1 + 12);
+    let mut engine = GuestEngine::new(11_200_000, PAIR);
+    let mut ids = Vec::new();
+    for by in 1..=4 {
+        ids.push(bind(&roles, &mut engine, by).unwrap());
+    }
+    assert!(
+        engine
+            .bindings
+            .iter()
+            .all(|b| matches!(b.scratch, ScratchPlace::Chunks { run: 1, ref pieces } if pieces.len() == 1)),
+        "a whole chunk each"
+    );
+    for by in 1..=4 {
+        let park = roles
+            .lock()
+            .unwrap()
+            .prepare_park(holder(by))
+            .expect("it parks");
+        roles.lock().unwrap().commit(park);
+    }
+
+    // Another program's four instances take the chunks meanwhile.
+    let mut other = GuestEngine::new(11_200_000, 0);
+    other.next = 100;
+    learn_program(&roles, &mut other, ProgramId(8)).unwrap();
+    let mut others = Vec::new();
+    for by in 5..=8 {
+        let bound = bind_instance(
+            Some(&roles),
+            &mut other,
+            &InstanceBinding {
+                program: ProgramId(8),
+                ..InstanceBinding::default()
+            },
+            Some(holder(by)),
+            |_| false,
+        )
+        .unwrap();
+        others.push(bound.id);
+    }
+    let mut back = 0;
+    for (n, by) in (1..=4).enumerate() {
+        let short = roles
+            .lock()
+            .unwrap()
+            .prepare_unpark(holder(by))
+            .expect_err("no room: it waits");
+        assert!(
+            matches!(short, RolesError::UnparkShort(_)),
+            "a wait, not a failure: {short}"
+        );
+        // One of the others completes: its chunk frees, and the waiting
+        // restore comes back into it.
+        roles.lock().unwrap().close_instance(others[n]);
+        let unpark = roles
+            .lock()
+            .unwrap()
+            .prepare_unpark(holder(by))
+            .expect("room now")
+            .expect("its items unpark");
+        roles.lock().unwrap().commit(unpark);
+        let stale = roles.lock().unwrap().stale(holder(by));
+        for rebind in stale {
+            roles.lock().unwrap().rebound(Owner::of(&rebind));
+        }
+        back += 1;
+    }
+    assert_eq!(back, 4, "every restore came back");
 }

@@ -622,7 +622,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     "[planner-trace] queue={} unmet={} head_pages={} head_kind={} bypass={}/{} accum={} \
                      free={}/{} host_free={}/{} head_rs={} rs_free={}/{} \
                      parks={} serves={} evictions={} deferrals={} \
-                     evict_rollbacks={} evict_faults={} restore_faults={} restores={} restore_failures={} gate_parks={} \
+                     evict_rollbacks={} evict_faults={} restore_faults={} restores={} restore_failures={} restore_roles_short={} gate_parks={} \
                      hogs={} starved={} restarted={} salvaged={} swapfull={}/{} e6_relax={} rshort={} \
                      grow_waits={} grow_parked={} no_grows={} \
                      lock_n={} lock_wait_ms={} lock_hold_ms={} lock_wmax_us={} lock_hmax_us={} \
@@ -653,6 +653,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     d.restore_faults_total,
                     d.restores_total,
                     d.restore_failures_total,
+                    d.restore_roles_short_total,
                     d.gate_parks_total,
                     d.hog_failures_total,
                     d.starvations_total,
