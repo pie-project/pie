@@ -20,7 +20,7 @@ use ::engine::{
 };
 
 use super::{
-    Owner, Roles, RolesError, RolesHandle, bind_instance, bind_taken, learn_program, take_guest,
+    Owner, Roles, RolesError, RolesHandle, bind_instance, bind_taken, learn_program, take_bind,
 };
 use crate::store::shared::{Shared, SharedPool};
 
@@ -1170,16 +1170,9 @@ fn processes_cycling_through_park_restore_and_finish_all_finish_and_give_back_al
             program: ProgramId(program),
             ..InstanceBinding::default()
         };
-        let guest = take_guest(Some(roles), engine, &binding)?;
+        let taken = take_bind(Some(roles), engine, &binding, |_| false)?;
         registrations.set(registrations.get() + 1);
-        bind_taken(
-            Some(roles),
-            engine,
-            &binding,
-            Some(holder(by)),
-            |_| false,
-            guest,
-        )
+        bind_taken(Some(roles), engine, &binding, Some(holder(by)), taken)
         .map(|bound| bound.id)
         .inspect_err(|_| rollbacks.set(rollbacks.get() + 1))
     };

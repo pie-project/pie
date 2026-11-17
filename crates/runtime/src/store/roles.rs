@@ -194,6 +194,21 @@ pub fn waits_for_room(error: &anyhow::Error) -> bool {
 }
 
 impl RolesError {
+    /// The room a bind short of it waits for (`BindShort`), as `(run,
+    /// pieces)`: `pieces` free runs of `run` adjacent chunks. One free
+    /// chunk holds a slot item, whatever its run of slots.
+    #[must_use]
+    pub fn room_runs(&self) -> Option<(u32, u32)> {
+        let Self::BindShort(short) = self else {
+            return None;
+        };
+        match short.as_ref() {
+            Self::GuestShort { room, .. } => Some(room.chunk_runs()),
+            Self::Short { .. } | Self::NoRun { .. } => Some((1, 1)),
+            _ => None,
+        }
+    }
+
     /// The device pool lacks room for it now: what a park, a completion or
     /// a commit may make, not a wrong ask.
     #[must_use]
@@ -1150,6 +1165,21 @@ impl Roles {
         }
     }
 
+    /// A bind's or a registration's take short of slots (`Short`, `NoRun`):
+    /// a free chunk of the budget holds any one item (a run past a chunk is
+    /// `PastChunk`), so it waits for room as a guest state does
+    /// ([`RolesError::BindShort`]). Anything else stands as it is.
+    fn bind_short(&self, error: RolesError) -> RolesError {
+        match error {
+            RolesError::Short { .. } | RolesError::NoRun { .. }
+                if self.device.lock().unwrap().state_chunks_now() > 0 =>
+            {
+                RolesError::BindShort(Box::new(error))
+            }
+            error => error,
+        }
+    }
+
     /// A guest state taken for a bind that registered nothing, or failed
     /// before its instance's take: its chunks go back.
     pub fn untake_guest(&mut self, guest: GuestTaken) {
@@ -1685,13 +1715,74 @@ pub fn register_channel<T>(
     holder: Option<Holder>,
     register: impl FnOnce(&mut dyn Engine, &ChannelRegistration) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
+    let taken = take_ring(roles, engine, plan)?;
+    register_taken(roles, engine, plan, holder, taken, register)
+}
+
+/// The slots a registration of `plan` takes for its ring, before anything
+/// is registered: short of room a budget holds, [`RolesError::BindShort`].
+/// `None` where no roles are kept or the engine keeps the ring itself.
+pub fn take_ring(
+    roles: Option<&RolesHandle>,
+    engine: &mut dyn Engine,
+    plan: &ChannelRegistration,
+) -> anyhow::Result<Option<TakenRing>> {
     let Some(roles) = roles else {
-        return register(engine, plan);
+        return Ok(None);
     };
     let Some(facts) = engine.ring_facts(plan)? else {
+        return Ok(None);
+    };
+    let mut roles = roles.lock().unwrap();
+    Ok(Some(
+        roles
+            .take_channel(&facts)
+            .map_err(|error| roles.bind_short(error))?,
+    ))
+}
+
+/// The rings of every registration of `plans` ([`take_ring`]), all or
+/// none.
+pub fn take_rings(
+    roles: Option<&RolesHandle>,
+    engine: &mut dyn Engine,
+    plans: &[ChannelRegistration],
+) -> anyhow::Result<Vec<Option<TakenRing>>> {
+    let mut rings = Vec::with_capacity(plans.len());
+    for plan in plans {
+        match take_ring(roles, engine, plan) {
+            Ok(ring) => rings.push(ring),
+            Err(error) => {
+                untake_rings(roles, rings);
+                return Err(error);
+            }
+        }
+    }
+    Ok(rings)
+}
+
+/// Gives back rings taken for registrations that will not happen.
+pub fn untake_rings(roles: Option<&RolesHandle>, rings: Vec<Option<TakenRing>>) {
+    if let Some(roles) = roles {
+        let mut roles = roles.lock().unwrap();
+        for ring in rings.into_iter().flatten() {
+            roles.untake_channel(ring);
+        }
+    }
+}
+
+/// Registers `plan` over the ring [`take_ring`] took for it (`taken`).
+pub fn register_taken<T>(
+    roles: Option<&RolesHandle>,
+    engine: &mut dyn Engine,
+    plan: &ChannelRegistration,
+    holder: Option<Holder>,
+    taken: Option<TakenRing>,
+    register: impl FnOnce(&mut dyn Engine, &ChannelRegistration) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let (Some(roles), Some(taken)) = (roles, taken) else {
         return register(engine, plan);
     };
-    let taken = roles.lock().unwrap().take_channel(&facts)?;
     let plan = ChannelRegistration {
         slots: taken.slots(),
         ..plan.clone()
@@ -1726,64 +1817,60 @@ pub fn bind_instance(
     holder: Option<Holder>,
     registered: impl Fn(ChannelId) -> bool,
 ) -> anyhow::Result<BoundInstance> {
-    let guest = take_guest(roles, engine, binding)?;
-    bind_taken(roles, engine, binding, holder, registered, guest)
+    let taken = take_bind(roles, engine, binding, registered)?;
+    bind_taken(roles, engine, binding, holder, taken)
 }
 
-/// The guest state a bind of `binding` takes, before the bind registers
-/// anything ([`Roles::take_guest`]): short of room, the bind waits for it
-/// with nothing to roll back. `None` where no roles are kept.
-pub fn take_guest(
+/// Everything a bind of `binding` takes of the pool, before the bind
+/// registers anything: its guest state ([`Roles::take_guest`]), then its
+/// tables, its own rings and its adapter ([`Roles::take_instance`]); a
+/// ring of a channel `registered` names (registered, or to be by this
+/// bind) is the channel's. Short of room a budget holds, the bind is
+/// answered [`RolesError::BindShort`] and waits for it with nothing to
+/// roll back. `None` where no roles are kept.
+pub fn take_bind(
     roles: Option<&RolesHandle>,
     engine: &mut dyn Engine,
     binding: &InstanceBinding,
-) -> anyhow::Result<Option<GuestTaken>> {
+    registered: impl Fn(ChannelId) -> bool,
+) -> anyhow::Result<Option<Taken>> {
     let Some(roles) = roles else {
         return Ok(None);
     };
     learn_program(roles, engine, binding.program)?;
     let state = engine.guest_state(binding.program, &binding.extents)?;
+    let adapter = engine.adapter_key(binding)?;
     let pair = FireKey {
         program: binding.program,
         extents: binding.extents,
     };
-    Ok(Some(
-        roles
-            .lock()
-            .unwrap()
-            .take_guest(&binding.channels, (pair, state))?,
-    ))
+    let mut roles = roles.lock().unwrap();
+    let guest = roles.take_guest(&binding.channels, (pair, state))?;
+    let taken = roles
+        .take_instance(
+            binding.program,
+            &binding.channels,
+            registered,
+            adapter,
+            guest,
+        )
+        .map_err(|error| roles.bind_short(error))?;
+    Ok(Some(taken))
 }
 
-/// Binds `binding` with the guest state taken for it (`guest`,
-/// [`take_guest`]): the rest of its slots taken, then the engine's bind;
-/// a failure gives everything back, `guest` with it.
+/// Binds `binding` over what [`take_bind`] took for it (`taken`): the
+/// engine's bind, and what it took kept for `holder`, or given back where
+/// the engine refuses it.
 pub fn bind_taken(
     roles: Option<&RolesHandle>,
     engine: &mut dyn Engine,
     binding: &InstanceBinding,
     holder: Option<Holder>,
-    registered: impl Fn(ChannelId) -> bool,
-    guest: Option<GuestTaken>,
+    taken: Option<Taken>,
 ) -> anyhow::Result<BoundInstance> {
-    let Some(roles) = roles else {
+    let (Some(roles), Some(taken)) = (roles, taken) else {
         return Ok(engine.bind_instance(binding)?);
     };
-    let guest = guest.unwrap_or_default();
-    let adapter = match engine.adapter_key(binding) {
-        Ok(adapter) => adapter,
-        Err(error) => {
-            roles.lock().unwrap().untake_guest(guest);
-            return Err(error.into());
-        }
-    };
-    let taken = roles.lock().unwrap().take_instance(
-        binding.program,
-        &binding.channels,
-        registered,
-        adapter,
-        guest,
-    )?;
     let binding = InstanceBinding {
         instance_slots: taken.instance_slots(),
         ring_slots: taken.ring_slots(),
@@ -1857,10 +1944,10 @@ where
             watch.clone().freed().await;
             continue;
         }
-        if let Some(RolesError::BindShort(short)) = error.downcast_ref::<RolesError>()
-            && let RolesError::GuestShort { room: need, .. } = short.as_ref()
+        if let Some((run, pieces)) = error
+            .downcast_ref::<RolesError>()
+            .and_then(RolesError::room_runs)
         {
-            let (run, pieces) = need.chunk_runs();
             // Holding guest state of its own, it would wait on itself: it is
             // suspended, its state given back, and binds once restored with
             // room for this bind (`run`, `pieces`) beside its own.

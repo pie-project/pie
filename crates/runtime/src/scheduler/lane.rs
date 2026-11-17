@@ -808,15 +808,29 @@ impl Lane {
                     }
                 };
                 let roles = roles_of(engine_idx);
-                // Its guest state first: a bind short of room is answered
+                // Everything it takes of the pool first, its rings, its
+                // guest state, its tables: a bind short of room is answered
                 // so before it registers anything, and waits for room
                 // (`bind_when_resident`) with nothing rolled back.
-                let guest = match crate::store::roles::take_guest(
+                let taken = crate::store::roles::take_bind(
                     roles.as_ref(),
                     &mut **engine,
                     &bind.binding,
-                ) {
-                    Ok(guest) => guest,
+                    |id| channels.engine_registered(id) || plans.iter().any(|plan| plan.id == id),
+                )
+                .and_then(|taken| {
+                    match crate::store::roles::take_rings(roles.as_ref(), &mut **engine, &plans) {
+                        Ok(rings) => Ok((taken, rings)),
+                        Err(error) => {
+                            if let (Some(taken), Some(roles)) = (taken, roles.as_ref()) {
+                                roles.lock().unwrap().untake(taken);
+                            }
+                            Err(error)
+                        }
+                    }
+                });
+                let (taken, rings) = match taken {
+                    Ok(taken) => taken,
                     Err(error) => {
                         let waits = crate::store::roles::waits_for_room(&error);
                         if response.send(Err(error)).is_err() {
@@ -825,9 +839,9 @@ impl Lane {
                         return LaneCommit::BindFinished { pipeline_id, waits };
                     }
                 };
-                let untake = |guest: Option<crate::store::roles::GuestTaken>| {
-                    if let (Some(guest), Some(roles)) = (guest, roles.as_ref()) {
-                        roles.lock().unwrap().untake_guest(guest);
+                let untake = |taken: Option<crate::store::roles::Taken>| {
+                    if let (Some(taken), Some(roles)) = (taken, roles.as_ref()) {
+                        roles.lock().unwrap().untake(taken);
                     }
                 };
                 let registered = match Self::register_channel_set(
@@ -835,11 +849,12 @@ impl Lane {
                     engine_idx,
                     channels,
                     &plans,
+                    rings,
                     pipeline_id,
                 ) {
                     Ok(registered) => registered,
                     Err(error) => {
-                        untake(guest);
+                        untake(taken);
                         if response.send(Err(error)).is_err() {
                             Self::release_wait_slots([bind.pacing_wait_id]);
                         }
@@ -850,7 +865,7 @@ impl Lane {
                     }
                 };
                 if response.is_closed() {
-                    untake(guest);
+                    untake(taken);
                     Self::rollback_channel_set(
                         engine,
                         channels,
@@ -871,7 +886,7 @@ impl Lane {
                     &bind,
                     roles.as_ref(),
                     pipeline_id,
-                    guest,
+                    taken,
                 ) {
                     Ok((bound, standing)) => {
                         // The engine's standing guest bytes are its total.
@@ -1048,16 +1063,10 @@ impl Lane {
         plan: &crate::engine::InstanceBindingPlan,
         roles: Option<&crate::store::roles::RolesHandle>,
         holder: Option<ProcessId>,
-        guest: Option<crate::store::roles::GuestTaken>,
+        taken: Option<crate::store::roles::Taken>,
     ) -> Result<(BoundInstance, u64)> {
-        let bound = crate::store::roles::bind_taken(
-            roles,
-            &mut **engine,
-            &plan.binding,
-            holder,
-            |id| channels.engine_registered(id),
-            guest,
-        )?;
+        let bound =
+            crate::store::roles::bind_taken(roles, &mut **engine, &plan.binding, holder, taken)?;
         let standing = bound.standing_guest_bytes;
         let bound = BoundInstance::new(&bound, plan.pacing_wait_id);
         channels.bind(bound.instance_id, plan.binding.channels.clone());
@@ -1076,9 +1085,12 @@ impl Lane {
         engine_idx: usize,
         channels: &mut ChannelJoin,
         plans: &[ChannelRegistration],
+        rings: Vec<Option<crate::store::roles::TakenRing>>,
         holder: Option<ProcessId>,
     ) -> Result<Vec<RegisteredChannel>> {
         let roles = roles_of(engine_idx);
+        // Each plan's ring, taken before anything was registered.
+        let mut rings = rings.into_iter();
         let mut registered = Vec::with_capacity(plans.len());
         let mut registered_ids = Vec::with_capacity(plans.len());
         let undo =
@@ -1092,15 +1104,21 @@ impl Lane {
                 }
             };
         for plan in plans {
+            let ring = rings.next().flatten();
             if channels.contains(plan.id) {
                 undo(engine, channels, &registered_ids);
+                crate::store::roles::untake_rings(
+                    roles.as_ref(),
+                    std::iter::once(ring).chain(rings).collect(),
+                );
                 return Err(anyhow!("channel {} is already registered", plan.id));
             }
-            match crate::store::roles::register_channel(
+            match crate::store::roles::register_taken(
                 roles.as_ref(),
                 &mut **engine,
                 plan,
                 holder,
+                ring,
                 |engine, plan| crate::engine::verbs::register_channel(engine, engine_idx, plan),
             ) {
                 Ok(channel) => {
@@ -1110,6 +1128,7 @@ impl Lane {
                 }
                 Err(cause) => {
                     undo(engine, channels, &registered_ids);
+                    crate::store::roles::untake_rings(roles.as_ref(), rings.collect());
                     return Err(cause);
                 }
             }
