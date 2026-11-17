@@ -80,15 +80,6 @@ pub fn narrower(tokens: u32) -> u32 {
 use crate::device::{Buffer, Context, Handles, Pipelines};
 use crate::encode::Sink;
 
-/// How long a timed frame runs: long enough that the device reaches and
-/// holds its serving clock through it. A narrow kernel's frame of 5 ms read
-/// the m = 16 matmul 26% apart run to run on an M1 Max (45% on an M5 Pro);
-/// 20 ms reads it within 0.25%.
-const FRAME_SECONDS: f64 = 0.020;
-
-/// The most of one measurement a timed frame repeats.
-const MAX_REPEATS: u32 = 512;
-
 fn median(mut times: Vec<f64>) -> f64 {
     times.sort_by(f64::total_cmp);
     times[times.len() / 2]
@@ -141,36 +132,76 @@ impl Bench<'_> {
         Ok(Tensor::new(handle, rows, width, dtype))
     }
 
-    /// GPU seconds of one frame holding `k` of what `encode` fills.
+    /// GPU seconds of one frame holding `k` of what `encode` fills, each
+    /// told its place in the measurement (`turn`, one counter across every
+    /// frame of it: a frame reads the next operand sets, never the first
+    /// ones again).
     fn frame_of(
         &self,
+        turn: &engine::rates::Rotation,
         encode: &dyn Fn(&Sink<'_>, u32) -> Result<(), kernels_metal::Error>,
         k: u32,
     ) -> Result<f64, String> {
         let frame = self.device.frame().map_err(|e| e.to_string())?;
         let sink = Sink::new(self.device, &frame, &self.pipelines, &self.handles);
-        for at in 0..k {
+        for _ in 0..k {
+            let at = turn.next(u32::MAX as usize) as u32;
             encode(&sink, at).map_err(|e| e.to_string())?;
         }
         frame.commit_timed().map_err(|e| e.to_string())
     }
 
     /// The GPU seconds one of what `encode` fills takes as serving runs it,
-    /// back to back with others: each frame holds `k` of them, `k` enough
-    /// for a frame of [`FRAME_SECONDS`], and the median of five such frames
-    /// after a warm one, over `k`. A frame of one short dispatch times the
-    /// clock state the device idled into between frames, not the kernel
-    /// (bimodal on an M5 Pro at m = 64..2048 of the matmul ladder).
+    /// back to back with others: each frame holds `k` of them, `k` doubled
+    /// until a fire's time settles (`engine::rates::timed_frames`, every
+    /// engine's rule), and the median of five such frames after a warm one,
+    /// over `k`. A frame of one short dispatch times the clock state the
+    /// device idled into between frames, not the kernel (bimodal on an M5
+    /// Pro at m = 64..2048 of the matmul ladder; 5 ms frames read the m = 16
+    /// matmul 26% apart run to run on an M1 Max, 20 ms within 0.25%).
     fn timed(
         &self,
         encode: &dyn Fn(&Sink<'_>, u32) -> Result<(), kernels_metal::Error>,
     ) -> Result<f64, String> {
-        let once = self.frame_of(encode, 1)?.max(1e-7);
-        let k = ((FRAME_SECONDS / once).ceil() as u32).clamp(1, MAX_REPEATS);
-        self.frame_of(encode, k)?;
+        self.timed_of(false, encode)
+    }
+
+    /// [`Bench::timed`] for a memory-bound op: before it is timed, its own
+    /// frames warm the GPU until their rate stops moving
+    /// (`engine::rates::warm_up`'s rule): the DVFS level sustained serving
+    /// sees (an M1's per-row ops read 146, 175, 217 or 262 GB/s by the level
+    /// it had reached), not the one an idle device starts at.
+    fn timed_warmed(
+        &self,
+        encode: &dyn Fn(&Sink<'_>, u32) -> Result<(), kernels_metal::Error>,
+    ) -> Result<f64, String> {
+        self.timed_of(true, encode)
+    }
+
+    fn timed_of(
+        &self,
+        warm: bool,
+        encode: &dyn Fn(&Sink<'_>, u32) -> Result<(), kernels_metal::Error>,
+    ) -> Result<f64, String> {
+        let turn = engine::rates::Rotation::default();
+        self.frame_of(&turn, encode, 1)?;
+        let k = engine::rates::timed_frames(
+            None,
+            None,
+            |k| self.frame_of(&turn, encode, k).map(|s| s * 1e9),
+            |why| why,
+        )?
+        .fires;
+        if warm {
+            engine::rates::warm_up(|| {
+                self.frame_of(&turn, encode, k)
+                    .map(|s| f64::from(k) / s.max(1e-12))
+            })?;
+        }
+        self.frame_of(&turn, encode, k)?;
         let mut times = Vec::with_capacity(5);
         for _ in 0..5 {
-            times.push(self.frame_of(encode, k)? / f64::from(k));
+            times.push(self.frame_of(&turn, encode, k)? / f64::from(k));
         }
         Ok(median(times))
     }
@@ -239,7 +270,7 @@ impl Bench<'_> {
             ));
             held.extend([x, normed, packed, y]);
         }
-        let seconds = self.timed(&|sink, at| {
+        let seconds = self.timed_warmed(&|sink, at| {
             let (x, normed, packed, y) = sets[at as usize % sets.len()];
             kernels_metal::elemwise::norm::rmsnorm(sink, x, wt, 1e-6, normed)?;
             kernels_metal::linear::mlp::swiglu(sink, packed, width, y)
@@ -398,7 +429,7 @@ impl Bench<'_> {
         let weight = self.tensor(&weight, channels, CONV, Dtype::Bf16)?;
         let gates = self.tensor(&gates, TOKENS, 2 * HEADS, Dtype::F32)?;
         let y = self.tensor(&y, TOKENS, HEADS * DV, Dtype::F32)?;
-        let seconds = self.timed(&|sink, _| {
+        let seconds = self.timed_warmed(&|sink, _| {
             ssm::causal_conv1d_chunked(sink, x, weight, &pool, CONV, 1, convolved)?;
             ssm::gated_delta_chunked(
                 sink,
@@ -429,6 +460,16 @@ impl Bench<'_> {
     fn bytes_per_ns(&self, gap: f64) -> Result<f64, String> {
         let bytes = 256u64 << 20;
         let (from, into) = (self.zeroed(bytes)?, self.zeroed(bytes)?);
+        let blit = || -> Result<f64, String> {
+            let mut frame = self.device.frame().map_err(|e| e.to_string())?;
+            frame
+                .copy_span(&from, 0, &into, 0, bytes)
+                .map_err(|e| e.to_string())?;
+            frame.commit_timed().map_err(|e| e.to_string())
+        };
+        // A memory-bound op: its own blits warm the GPU until their rate
+        // stops moving (`engine::rates::warm_up`'s rule) before it is timed.
+        engine::rates::warm_up(|| blit().map(|s| 1.0 / s.max(1e-12)))?;
         let mut times = Vec::with_capacity(5);
         for at in 0..6 {
             let mut frame = self.device.frame().map_err(|e| e.to_string())?;
@@ -490,6 +531,55 @@ impl Bench<'_> {
         let launch = gaps.last().map_or(0.0, |&(_, ns)| ns).round() as u64;
         Ok((launch, gaps))
     }
+}
+
+/// The `[provenance]` entry a measurement of `device`'s rates writes beside
+/// them (`engine::rates::provenance`): how Metal measured them.
+#[must_use]
+pub fn provenance(device: &str) -> (&'static str, String) {
+    engine::rates::provenance(
+        "metal",
+        &format!(
+            "{device}; each kernel through the dispatch serving runs, back to back in frames \
+             doubled until a fire's time settles, timed by the GPU, the matmul over engine::rates::weights_at planes, attention \
+             over engine::rates::attn_sets_at sets; operands: engine::rates' pattern; at {}",
+            engine::rates::build_commit()
+        ),
+    )
+}
+
+/// `chip` with every roofline constant stated
+/// (`engine::rates::rates_at_load`, every engine's rule): as its layers
+/// state them where they state them all; else `device`'s own, measured
+/// before the load is ready, saved to the user's profile under `profiles`.
+/// Metal states no bound on one submission yet, so its frames settle
+/// uncapped (`engine::rates::timed_frames`).
+pub fn at_load(
+    device: &Context,
+    chip: profile::Profile,
+    _facts: &profile::Facts,
+    profiles: Option<&std::path::Path>,
+    max_submit: Option<std::time::Duration>,
+) -> Result<profile::Profile, String> {
+    let name = device.name().to_string();
+    let check = |text: &str| {
+        crate::chip::registry()
+            .parse(text, "the measured rates", profile::Strict::User)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    };
+    let save = profiles.map(|profiles| engine::rates::SaveTo {
+        path: crate::chip::SHELF.user_path(profiles, &name),
+        provenance: provenance(&name),
+        check: &check,
+    });
+    let measure_chip = chip.clone();
+    engine::rates::rates_at_load(chip, save, None, max_submit, |_max_submit| {
+        Ok(engine::rates::Measured {
+            rates: measure(device, measure_chip, &mut |_| {})?,
+            unsettled: false,
+        })
+    })
 }
 
 /// `device`'s rates under the kernel tuning of `profile` (the profile a
