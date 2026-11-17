@@ -87,7 +87,11 @@ pub(super) struct Arming {
     records: bool,
     priced: bool,
     dropped: std::collections::BTreeSet<u32>,
-    weighed: [(usize, usize); Kind::COUNT],
+    /// Bytes and bodies armed a kind, and apart for the bodies whose
+    /// recurrences run over the extended rows (`RsBody::Replays`): they
+    /// launch the extended run's layout, gathers and scan staging beside
+    /// every node a folding body of the kind holds.
+    weighed: [[(usize, usize); 2]; Kind::COUNT],
     armed: usize,
     wanted: usize,
     tally: [(usize, usize); Kind::COUNT],
@@ -999,8 +1003,9 @@ impl Shell {
     /// The lattice's buckets a doubling past `engine.prefill_lattice_from`,
     /// halved until the bodies of `rest` (the narrower prefill, mixed and
     /// wide targets' buckets, still to arm) fit what the allowance has left
-    /// each at what the bodies of its kind armed so far weigh (`weighed`,
-    /// bytes and bodies a kind; the top bucket arms one of each first, and a
+    /// each at what the bodies of its kind and treatment armed so far weigh
+    /// (`weighed`, bytes and bodies a kind, the extended apart; the top
+    /// bucket arms one of each first, and a
     /// kind's bodies hold about as many nodes at any bucket, where kinds
     /// differ: Qwen3.6-35B-A3B's mixed bodies 8.9 MiB, its lattice's 5.5 MiB
     /// on average): a load whose
@@ -1012,9 +1017,9 @@ impl Shell {
     /// lattice does not fit.
     fn fit_lattice(
         &mut self,
-        rest: &[(u32, Kind)],
+        rest: &[(u32, Kind, bool)],
         kept: usize,
-        weighed: &[(usize, usize); Kind::COUNT],
+        weighed: &[[(usize, usize); 2]; Kind::COUNT],
         margin: u64,
     ) -> std::collections::BTreeSet<u32> {
         let Some((steps, from, mut fine)) = self.lattice else {
@@ -1025,16 +1030,30 @@ impl Shell {
             return std::collections::BTreeSet::new();
         }
         let average = spent.bytes / spent.bodies;
-        let price = |kind: Kind| match weighed[kind.at()] {
-            (bytes, bodies) if bodies > 0 => bytes / bodies,
-            _ => average,
+        // An extended body unmeasured at its kind is priced at the folding
+        // body's weight times what the extended bodies measured so far weigh
+        // over the folding ones of their kinds.
+        let mean = |(bytes, bodies): (usize, usize)| (bodies > 0).then(|| bytes / bodies);
+        let (ext, fold) = weighed
+            .iter()
+            .filter(|w| w[0].1 > 0 && w[1].1 > 0)
+            .fold((0usize, 0usize), |(e, f), w| {
+                (e + mean(w[1]).unwrap_or(0), f + mean(w[0]).unwrap_or(0))
+            });
+        let price = |kind: Kind, extended: bool| {
+            let folding = mean(weighed[kind.at()][0]).unwrap_or(average);
+            match mean(weighed[kind.at()][usize::from(extended)]) {
+                Some(price) => price,
+                None if extended && fold > 0 => folding * ext / fold,
+                None => folding,
+            }
         };
         let was = self.budget.buckets.clone();
         let mut buckets = was.clone();
         let need = |buckets: &[u32]| {
             rest.iter()
-                .filter(|(b, _)| buckets.contains(b))
-                .map(|&(_, kind)| price(kind))
+                .filter(|(b, _, _)| buckets.contains(b))
+                .map(|&(_, kind, extended)| price(kind, extended))
                 .sum::<usize>()
                 + kept * average
         };
@@ -1061,7 +1080,7 @@ impl Shell {
                      narrower bodies still to arm weigh some {} MiB of the {} MiB left. Raise \
                      bodies_mem or free the card.",
                     self.bodies_mem >> 20,
-                    rest.iter().filter(|(b, _)| buckets.contains(b)).count(),
+                    rest.iter().filter(|(b, _, _)| buckets.contains(b)).count(),
                     need(&buckets) >> 20,
                     room >> 20,
                 );
@@ -1083,7 +1102,7 @@ impl Shell {
                 was.len(),
                 spent.bodies,
                 average >> 10,
-                rest.iter().filter(|(b, _)| was.contains(b)).count(),
+                rest.iter().filter(|(b, _, _)| was.contains(b)).count(),
                 room >> 20,
             );
         }
@@ -1493,7 +1512,7 @@ impl Shell {
             records,
             priced: verify || group || self.lattice.is_none(),
             dropped: std::collections::BTreeSet::new(),
-            weighed: [(0usize, 0usize); Kind::COUNT],
+            weighed: [[(0usize, 0usize); 2]; Kind::COUNT],
             armed: 0,
             wanted: 0,
             tally: [(0usize, 0usize); Kind::COUNT],
@@ -1536,14 +1555,18 @@ impl Shell {
             // What is still to arm: the narrower targets a coarser lattice
             // may drop, and the rest (the top bucket's, the decodes'), which
             // arm whatever the lattice.
-            let rest: Vec<(u32, Kind)> = std::iter::once((bucket, target.kind()))
-                .chain(
-                    st.targets
-                        .iter()
-                        .filter(|(bucket, target, _)| st.narrower(*bucket, target))
-                        .map(|(bucket, target, _)| (*bucket, target.kind())),
-                )
-                .collect();
+            let extended = |treatment: &Treatment| treatment.rs == record::RsBody::Replays;
+            let rest: Vec<(u32, Kind, bool)> =
+                std::iter::once((bucket, target.kind(), extended(&treatment)))
+                    .chain(
+                        st.targets
+                            .iter()
+                            .filter(|(bucket, target, _)| st.narrower(*bucket, target))
+                            .map(|(bucket, target, treatment)| {
+                                (*bucket, target.kind(), extended(treatment))
+                            }),
+                    )
+                    .collect();
             let kept = st.targets.len() + 1 - rest.len();
             let margin = st.unit_margin.min(self.bodies_mem as u64 / 4);
             let dropped = self.fit_lattice(&rest, kept, &st.weighed, margin);
@@ -1664,8 +1687,10 @@ impl Shell {
             st.tally[at].0 += 1;
             let now = self.cache.body_stats().census;
             if now.bodies > weighed_before.bodies {
-                st.weighed[at].0 += now.bytes.saturating_sub(weighed_before.bytes);
-                st.weighed[at].1 += now.bodies - weighed_before.bodies;
+                let weighed =
+                    &mut st.weighed[at][usize::from(treatment.rs == record::RsBody::Replays)];
+                weighed.0 += now.bytes.saturating_sub(weighed_before.bytes);
+                weighed.1 += now.bodies - weighed_before.bodies;
             }
             if let Some(wanted) = super::diag::on().arm_bench.as_deref()
                 && let Some(key) = key.as_ref()
