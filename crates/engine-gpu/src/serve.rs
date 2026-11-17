@@ -1059,10 +1059,17 @@ impl<B: Serve> Shell<B> {
         let mut weighed: Option<Weighed> = None;
         let (compiled, mut span) = loop {
             let compiled = compile_axes(&boot.trace, &budgets, &profile)?;
-            // The rungs the rung lattice offers up to this load's top: the
-            // rows the rates grid was timed at, so the estimate never weighs
-            // a rung it did not measure.
-            let top = budgets.tokens.max_tokens;
+            // The rungs the rung lattice offers up to this load's top and the
+            // device's saturation point (the rows its rates grid ends at,
+            // `engine::rates::saturate`): no rung past it can be chosen, and
+            // the estimate never weighs a rung the grid does not state.
+            let saturated = device_profile
+                .rates()
+                .bf16_flops_per_ns_by_rows_n_k
+                .as_deref()
+                .and_then(|grid| profile::fire::gemm_rows(grid).last().copied())
+                .unwrap_or(u32::MAX);
+            let top = budgets.tokens.max_tokens.min(saturated);
             let mut rung_tokens: Vec<u32> = B::rung_lattice()
                 .into_iter()
                 .filter(|&t| t <= top)

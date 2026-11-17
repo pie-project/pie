@@ -830,17 +830,19 @@ impl PreparedLoad<'_> {
                     &boot.trace,
                     *chip.get::<crate::chip::WeightsLayout>(),
                 )?;
-                let ane = crate::ane::load(&device, &handles, &boot.trace, &weights, &chip).unwrap_or_else(
-                    |why| {
+                let ane = crate::ane::load(&device, &handles, &boot.trace, &weights, &chip)
+                    .unwrap_or_else(|why| {
                         eprintln!("the Neural Engine stays out of this load: {why}");
                         None
-                    },
-                );
+                    });
                 // The compiler's on-device Metal recipe is the one layout source: the
                 // chunk, the list slot (its tokens are the kv page size), where
                 // every fixed row's pieces lie in a record, and the weight slots.
-                let recipe =
-                    crate::chunks::recipe_near(&boot.trace, &budgets, boot.residency.chunk_bytes())?;
+                let recipe = crate::chunks::recipe_near(
+                    &boot.trace,
+                    &budgets,
+                    boot.residency.chunk_bytes(),
+                )?;
                 let weight_caches = if boot.residency.whole_weights() {
                     Vec::new()
                 } else {
@@ -886,8 +888,12 @@ impl PreparedLoad<'_> {
         // pages can never take it says so once, with the form that runs: a
         // silent fall-through had the M5's prompts read as tensor-op ones.
         if tuning.sdpa_mpp() {
-            let widths: std::collections::BTreeSet<u32> =
-                facts.rows.iter().flatten().map(|row| row.head_dim).collect();
+            let widths: std::collections::BTreeSet<u32> = facts
+                .rows
+                .iter()
+                .flatten()
+                .map(|row| row.head_dim)
+                .collect();
             for head_dim in widths {
                 let form = kernels_metal::attn::arbiter::prefill_form(
                     head_dim,
@@ -1225,8 +1231,20 @@ impl PreparedLoad<'_> {
                         .sum::<usize>(),
                 )
                 .unwrap_or(u32::MAX);
+                // The rungs to the device's saturation point (the rows its
+                // rates grid ends at, `engine::rates::saturate`): no rung past
+                // it can be chosen, and the estimate weighs none it lacks.
+                let saturated = chip
+                    .tuned()
+                    .rates
+                    .bf16_flops_per_ns_by_rows_n_k
+                    .as_deref()
+                    .and_then(|grid| profile::fire::gemm_rows(grid).last().copied())
+                    .unwrap_or(u32::MAX)
+                    .max(act.first().map_or(1, |&(tokens, _)| tokens));
                 let candidates: Vec<crate::top::Candidate> = act
                     .iter()
+                    .filter(|&&(tokens, _)| tokens <= saturated)
                     .map(|&(tokens, chunks)| crate::top::Candidate {
                         tokens,
                         chunks,
@@ -1252,13 +1270,8 @@ impl PreparedLoad<'_> {
         };
         if let Some((counts, rungs, live)) = weighed.as_ref().filter(|_| boot.top == Top::Ruled) {
             let (live, rungs) = (*live, rungs.clone());
-            let pick = crate::top::choose(
-                &rungs,
-                live,
-                &chip.tuned().rates,
-                device.name(),
-                &counts,
-            )?;
+            let pick =
+                crate::top::choose(&rungs, live, &chip.tuned().rates, device.name(), &counts)?;
             let asked = budgets.tokens.max_tokens;
             tracing::info!(
                 "{}: {}",
@@ -1527,14 +1540,14 @@ impl PreparedLoad<'_> {
             false => None,
         };
         let weighed = weighed.and_then(|(counts, rungs, live)| {
-            engine::load::estimate(&counts, &chip.tuned().rates).ok().map(|estimate| {
-                crate::top::Weighed {
+            engine::load::estimate(&counts, &chip.tuned().rates)
+                .ok()
+                .map(|estimate| crate::top::Weighed {
                     rungs,
                     estimate,
                     live,
                     counts,
-                }
-            })
+                })
         });
         let shell = Shell {
             weighed,
@@ -2065,7 +2078,9 @@ impl Shell {
     #[must_use]
     pub fn pipeline_cache_key(&self) -> String {
         let fnv = |bytes: &[u8]| {
-            bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
+            bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
+                (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+            })
         };
         #[cfg(target_vendor = "apple")]
         let os = objc2_foundation::NSProcessInfo::processInfo()
@@ -2115,7 +2130,10 @@ impl Shell {
 
     /// Builds `keys` (a list an earlier boot of the same load wrote): the
     /// pipelines, before ready, without walking. Returns how many it built.
-    pub fn build_pipelines(&self, keys: &[(String, String, String, Option<[u64; 2]>)]) -> Result<u64> {
+    pub fn build_pipelines(
+        &self,
+        keys: &[(String, String, String, Option<[u64; 2]>)],
+    ) -> Result<u64> {
         let before = self.pipelines.compiled();
         for (file, entry, stamp, strides) in keys {
             let leak = |text: &str| -> &'static str { Box::leak(text.to_owned().into_boxed_str()) };
@@ -2207,7 +2225,9 @@ impl Shell {
         let record = vec![first(layout.fixed); layout.pieces as usize];
         let windows: Vec<Vec<u32>> = layout
             .window_lists()
-            .map(|window| vec![window.slots.per_chunk; context.div_ceil(window.tokens.max(1)) as usize])
+            .map(|window| {
+                vec![window.slots.per_chunk; context.div_ceil(window.tokens.max(1)) as usize]
+            })
             .collect();
         let verbs: Vec<(engine::fire::RsVerb, u32)> = if self.serves_rs_verbs() {
             let per = layout.rs_tokens.max(1);
@@ -4289,9 +4309,9 @@ impl Shell {
                     engine::fire::RsVerb::Buffer { folded, fold, .. } => {
                         let fold = match fold {
                             engine::fire::FoldLen::Host(n) => Some(*n),
-                            engine::fire::FoldLen::Device => ports
-                                .as_ref()
-                                .and_then(engine::ports::LanePorts::fold),
+                            engine::fire::FoldLen::Device => {
+                                ports.as_ref().and_then(engine::ports::LanePorts::fold)
+                            }
                         };
                         fold.map(|n| folded.saturating_add(n).min(end) - folded)
                     }
@@ -4310,7 +4330,8 @@ impl Shell {
                     ..engine::KvWrites::default()
                 });
             }
-            if let (engine::fire::RsVerb::Buffer { folded, fold, .. }, Some(key)) = (&rs, held_key) {
+            if let (engine::fire::RsVerb::Buffer { folded, fold, .. }, Some(key)) = (&rs, held_key)
+            {
                 let n = match fold {
                     engine::fire::FoldLen::Host(n) => Some(*n),
                     engine::fire::FoldLen::Device => {

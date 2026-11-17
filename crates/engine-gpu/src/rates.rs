@@ -227,7 +227,16 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         warmed.rate / 1e3
     ));
     let rows = B::rung_lattice();
-    let grid = grid(&mut rig, tactics.gemm(tier), timer, launch, &rows)?;
+    let (grid, top) = grid(&mut rig, tactics.gemm(tier), timer, launch, &rows)?;
+    say(&format!(
+        "[rates]: the grid saturates at {} rows of a lattice to {}: past it no (n, k) shape's \
+         cost a row fell more than {:.0}% below its least through {} (at it the most {:.1}%)",
+        top.rows,
+        rows.last().copied().unwrap_or(0),
+        100.0 * engine::rates::AGREEMENT,
+        top.through,
+        100.0 * top.best_gain,
+    ));
     let mut attn = Vec::with_capacity(ATTN_KEYS.len() * ATTN_DIMS.len());
     for d in ATTN_DIMS {
         for keys in ATTN_KEYS {
@@ -299,55 +308,67 @@ fn grid<B: Serve>(
     timer: Timer<'_, B>,
     launch: f64,
     lattice: &[u32],
-) -> Result<Vec<(u32, u32, u32, f64)>> {
+) -> Result<(Vec<(u32, u32, u32, f64)>, engine::rates::Saturation)> {
     let widest = lattice.iter().copied().max().unwrap_or(1);
     let shapes: Vec<(u32, u32)> = DEPTHS
         .iter()
         .flat_map(|&k| DEPTHS.iter().map(move |&n| (n, k)))
         .collect();
-    let mut out = Vec::with_capacity(lattice.len() * shapes.len());
-    for at in engine::rates::spread_order(shapes.len()) {
+    // A shape's operands, laid at the start of each run of it: the widest
+    // row's activation and output, and the weight planes each fire reads
+    // the next of, past the last-level cache.
+    let mut laid: Option<(Tensor, Vec<Tensor>, Tensor)> = None;
+    let next = std::cell::Cell::new(0usize);
+    let (rates, top) = engine::rates::saturate(lattice, shapes.len(), |at, row, fresh| {
         let (n, k) = shapes[at];
-        let act = rig.operand(widest, k, Dtype::Bf16)?;
-        // Each fire reads the next of these, past the last-level cache.
-        let weights = (0..weights_at(n, k))
-            .map(|_| rig.operand(n, k, Dtype::Bf16))
-            .collect::<Result<Vec<Tensor>>>()?;
-        let y = rig.zeros(widest, n, Dtype::Bf16)?;
-        let next = std::cell::Cell::new(0usize);
-        for row in engine::rates::spread_order(lattice.len()) {
-            let m = lattice[row];
-            let ns = rig.each(timer, &|sink| {
-                let w = weights[next.get() % weights.len()];
-                next.set(next.get() + 1);
-                kernels_slang::linear::gemm::matmul(
-                    sink,
-                    tactic,
-                    Tensor { rows: m, ..act },
-                    w,
-                    Tensor { rows: m, ..y },
-                )
-                .map_err(fault("rates: matmul"))
-            })?;
-            out.push((
-                m,
-                n,
-                k,
-                engine::rates::rate_from(
-                    &format!("matmul {m}x{n}x{k}"),
-                    ns as f64,
-                    engine::rates::GEMM_DISPATCHES,
-                    launch,
-                    gemm_flops(m, n, k),
-                )
-                .map_err(|why| Fault::Device { call: "rates", why })?,
-            ));
+        if fresh {
+            // The last shape's planes go before this shape's are laid.
+            laid = None;
+            rig.release();
+            let act = rig.operand(widest, k, Dtype::Bf16)?;
+            let weights = (0..weights_at(n, k))
+                .map(|_| rig.operand(n, k, Dtype::Bf16))
+                .collect::<Result<Vec<Tensor>>>()?;
+            let y = rig.zeros(widest, n, Dtype::Bf16)?;
+            laid = Some((act, weights, y));
         }
-        // This shape's planes go before the next shape's are laid.
-        rig.release();
+        let (act, weights, y) = laid.as_ref().expect("laid");
+        let m = lattice[row];
+        let ns = rig.each(timer, &|sink| {
+            let w = weights[next.get() % weights.len()];
+            next.set(next.get() + 1);
+            kernels_slang::linear::gemm::matmul(
+                sink,
+                tactic,
+                Tensor { rows: m, ..*act },
+                w,
+                Tensor { rows: m, ..*y },
+            )
+            .map_err(fault("rates: matmul"))
+        })?;
+        let rate = engine::rates::rate_from(
+            &format!("matmul {m}x{n}x{k}"),
+            ns as f64,
+            engine::rates::GEMM_DISPATCHES,
+            launch,
+            gemm_flops(m, n, k),
+        )
+        .map_err(|why| Fault::Device { call: "rates", why })?;
+        Ok::<_, Fault>((
+            rate,
+            engine::rates::gemm_cost_per_row(m, n, k, rate, launch),
+        ))
+    })?;
+    rig.release();
+    // The grid ends at the saturation point: a load's rungs run to it.
+    let mut out = Vec::with_capacity((top.top + 1) * shapes.len());
+    for (at, &(n, k)) in shapes.iter().enumerate() {
+        for (i, &m) in lattice.iter().enumerate().take(top.top + 1) {
+            out.push((m, n, k, rates[at][i]));
+        }
     }
     out.sort_by_key(|&(m, n, k, _)| (k, n, m));
-    Ok(out)
+    Ok((out, top))
 }
 
 /// The prefill attention's rate at `s`: one sequence of `s.rows` rows

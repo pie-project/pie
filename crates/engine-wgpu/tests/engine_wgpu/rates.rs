@@ -28,14 +28,24 @@ fn the_micro_fires_state_rates_and_the_ruling_picks_by_them() {
     assert!((1.0..1e6).contains(&flops), "{flops}");
     assert!((1.0..1e4).contains(&bytes), "{bytes}");
     assert!(launch > 0);
-    // The grid at every row and depth of the lattice, the attention and
-    // scan rates.
+    // The grid at every row of the lattice up to its saturation top and
+    // every depth, the attention and scan rates.
     let grid = rates.bf16_flops_per_ns_by_rows_n_k.clone().unwrap();
+    let lattice = <engine_wgpu::device::Api as engine_gpu::serve::Serve>::rung_lattice();
+    let rows = profile::fire::gemm_rows(&grid);
+    let top = *rows.last().expect("rows");
+    assert_eq!(
+        rows,
+        lattice
+            .iter()
+            .copied()
+            .take_while(|&m| m <= top)
+            .collect::<Vec<_>>(),
+        "the lattice's rows to the saturation top"
+    );
     assert_eq!(
         grid.len(),
-        <engine_wgpu::device::Api as engine_gpu::serve::Serve>::rung_lattice().len()
-            * engine::rates::DEPTHS.len()
-            * engine::rates::DEPTHS.len()
+        rows.len() * engine::rates::DEPTHS.len() * engine::rates::DEPTHS.len()
     );
     assert_eq!(profile::fire::gemm_grid(grid.clone()), Some(grid.clone()));
     eprintln!("grid {grid:?}");

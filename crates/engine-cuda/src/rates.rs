@@ -417,7 +417,8 @@ mod on_device {
     /// top rung is the argmax of efficiency times live capacity, and live
     /// capacity only falls as rows grow, so no rung past it can be chosen.
     /// Each shape walks its own rows first (one rotation laid), then every
-    /// shape is filled to the widest row any reached.
+    /// shape is filled to the widest row any reached: the walk is
+    /// [`engine::rates::saturate`], the rule every engine's rates step takes.
     fn gemm(
         ctx: &Ctx,
         clock: &Clock,
@@ -432,96 +433,35 @@ mod on_device {
             .iter()
             .flat_map(|&k| DEPTHS.iter().map(move |&n| (n, k)))
             .collect();
-        let order = engine::rates::spread_order(shapes.len());
-        // A shape's cost a row at `m` from its rate (work with the launch
-        // taken off, `rate_from`): its launch and its work over its rows.
-        let cost = |(n, k): (u32, u32), m: u32, rate: f64| {
-            let work = if rate.is_finite() && rate > 0.0 {
-                engine::rates::gemm_flops(m, n, k) / rate
-            } else {
-                0.0
-            };
-            (gap + work) / f64::from(m)
-        };
-        // Each row's gain on the least cost a row before it, of one shape.
-        let gains = |at: usize, rates: &[f64]| -> Vec<f64> {
-            let mut least = f64::INFINITY;
-            rates
-                .iter()
-                .enumerate()
-                .map(|(i, &rate)| {
-                    let c = cost(shapes[at], lattice[i], rate);
-                    let gain = least / c - 1.0;
-                    least = least.min(c);
-                    gain
-                })
-                .collect()
-        };
-        // The last row that improved, and the first row a doubling past it.
-        let last = |g: &[f64]| {
-            (1..g.len())
-                .rev()
-                .find(|&i| g[i] > profile::AGREEMENT)
-                .unwrap_or(0)
-        };
-        let past = |i: usize| {
-            lattice
-                .iter()
-                .position(|&m| u64::from(m) >= 2 * u64::from(lattice[i]))
-                .unwrap_or(lattice.len() - 1)
-        };
-        let mut rates: Vec<Vec<f64>> = vec![Vec::new(); shapes.len()];
-        let mut reach = 0;
-        // Each shape alone, ascending, to a doubling past its last gain.
-        for &at in &order {
-            let mut planes = Planes::lay(random, shapes[at])?;
-            while rates[at].len() < lattice.len() {
-                let m = lattice[rates[at].len()];
-                rates[at].push(planes.at(ctx, clock, random, held, m, gap)?);
-                if rates[at].len() > past(last(&gains(at, &rates[at]))) {
-                    break;
-                }
+        // The walk is engine::rates::saturate's, one rule for every engine;
+        // a shape's planes are laid at the start of each run of it.
+        let mut planes: Option<Planes> = None;
+        let (rates, top) = engine::rates::saturate(lattice, shapes.len(), |at, row, fresh| {
+            if fresh {
+                planes = None;
+                planes = Some(Planes::lay(random, shapes[at])?);
             }
-            reach = reach.max(rates[at].len());
-        }
-        // Every shape to the widest row any reached, until the last gain of
-        // any has a doubling measured past it.
-        let top = loop {
-            for &at in &order {
-                if rates[at].len() >= reach {
-                    continue;
-                }
-                let mut planes = Planes::lay(random, shapes[at])?;
-                while rates[at].len() < reach {
-                    let m = lattice[rates[at].len()];
-                    rates[at].push(planes.at(ctx, clock, random, held, m, gap)?);
-                }
-            }
-            let top = (0..shapes.len())
-                .map(|at| last(&gains(at, &rates[at])))
-                .max()
-                .unwrap_or(0);
-            if past(top) < reach || reach == lattice.len() {
-                break top;
-            }
-            reach = past(top) + 1;
-        };
-        let (best, at) = (0..shapes.len())
-            .map(|at| (gains(at, &rates[at])[top], at))
-            .max_by(|a, b| a.0.total_cmp(&b.0))
-            .expect("shapes");
-        let mut grid = Vec::with_capacity((top + 1) * shapes.len());
+            let m = lattice[row];
+            let rate = planes
+                .as_mut()
+                .expect("laid")
+                .at(ctx, clock, random, held, m, gap)?;
+            let (n, k) = shapes[at];
+            Ok::<_, String>((rate, engine::rates::gemm_cost_per_row(m, n, k, rate, gap)))
+        })?;
+        drop(planes);
+        let mut grid = Vec::with_capacity((top.top + 1) * shapes.len());
         for (at, &(n, k)) in shapes.iter().enumerate() {
-            for (i, &m) in lattice.iter().enumerate().take(top + 1) {
+            for (i, &m) in lattice.iter().enumerate().take(top.top + 1) {
                 grid.push((m, n, k, rates[at][i]));
             }
         }
         grid.sort_by_key(|&(m, n, k, _)| (k, n, m));
         let saturation = Saturation {
-            rows: lattice[top],
-            through: lattice[reach - 1],
-            best_gain: best,
-            best_shape: shapes[at],
+            rows: top.rows,
+            through: top.through,
+            best_gain: top.best_gain,
+            best_shape: shapes[top.best_shape],
         };
         Ok((grid, saturation))
     }

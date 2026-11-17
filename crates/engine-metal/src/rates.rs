@@ -488,41 +488,60 @@ pub fn measure(
             warmed.rate / 1e3
         ));
     }
-    let mut grid = Vec::with_capacity(lattice_rows().len() * DEPTHS.len() * DEPTHS.len());
-    // The shapes, and each shape's rows, in engine::rates' spread order.
+    // The shapes, walked by engine::rates::saturate (the rule every
+    // engine's rates step takes) up to the device's saturation point on the
+    // lattice, at most FIRE.1: the fire a served Metal load is asked, the
+    // ceiling the worker's request sets, not a limit of the device.
+    let lattice = lattice_rows();
     let shapes: Vec<(u32, u32)> = DEPTHS
         .iter()
-        .flat_map(|&k| DEPTHS.iter().map(move |&n| (k, n)))
+        .flat_map(|&k| DEPTHS.iter().map(move |&n| (n, k)))
         .collect();
-    for (k, n) in engine::rates::spread_order(shapes.len())
-        .into_iter()
-        .map(|at| shapes[at])
-    {
-        // Each pair's tensors are its own: the handles let the last pair's
-        // planes go (a grid of every (n, k) holds no more than one pair's).
-        bench.handles = Handles::new();
-        // The planes every backend rotates through (engine::rates::weights_at:
-        // 768 MiB, at least 12), each its own memory so each repeat streams
-        // its weight as a layer's matmul does; one plane of the operand
-        // pattern fills them.
-        let plane = operand(&bench.pattern, (n * k) as usize * 2);
-        let weights = (0..engine::rates::weights_at(n, k))
-            .map(|_| {
-                let w = bench.buffer(&plane)?;
-                Ok((bench.tensor(&w, n, k, Dtype::Bf16)?, w))
-            })
-            .collect::<Result<Vec<(Tensor, Buffer)>, String>>()?;
-        let tensors: Vec<Tensor> = weights.iter().map(|(t, _)| *t).collect();
-        for m in engine::rates::spread_order(lattice_rows().len())
-            .into_iter()
-            .map(|row| lattice_rows()[row])
-        {
-            let rate = bench.matmul_flops(m, n, k, &tensors, gap)?;
-            say(&format!(
-                "  bf16 matmul {m} x {n} x {k}: {:.2} TFLOP/s",
-                rate / 1e3
-            ));
-            grid.push((m, n, k, rate));
+    // A shape's planes, laid at the start of each run of it: the planes
+    // every backend rotates through (engine::rates::weights_at: 768 MiB, at
+    // least 12), each its own memory so each repeat streams its weight as a
+    // layer's matmul does; one plane of the operand pattern fills them.
+    let mut laid: Option<(Vec<Tensor>, Vec<Buffer>)> = None;
+    let (rates, top) = engine::rates::saturate(&lattice, shapes.len(), |at, row, fresh| {
+        let (n, k) = shapes[at];
+        if fresh {
+            // The handles let the last shape's planes go (a grid of every
+            // (n, k) holds no more than one shape's).
+            laid = None;
+            bench.handles = Handles::new();
+            let plane = operand(&bench.pattern, (n * k) as usize * 2);
+            let weights = (0..engine::rates::weights_at(n, k))
+                .map(|_| {
+                    let w = bench.buffer(&plane)?;
+                    Ok((bench.tensor(&w, n, k, Dtype::Bf16)?, w))
+                })
+                .collect::<Result<Vec<(Tensor, Buffer)>, String>>()?;
+            laid = Some(weights.into_iter().unzip());
+        }
+        let (tensors, _) = laid.as_ref().expect("laid");
+        let m = lattice[row];
+        let rate = bench.matmul_flops(m, n, k, tensors, gap)?;
+        say(&format!(
+            "  bf16 matmul {m} x {n} x {k}: {:.4} TFLOP/s",
+            rate / 1e3
+        ));
+        Ok::<_, String>((rate, engine::rates::gemm_cost_per_row(m, n, k, rate, gap)))
+    })?;
+    drop(laid);
+    say(&format!(
+        "  the grid saturates at {} rows of a lattice to {}: past it no (n, k) shape's cost a \
+         row fell more than {:.0}% below its least through {} (at it the most {:.1}%)",
+        top.rows,
+        lattice.last().copied().unwrap_or(0),
+        100.0 * engine::rates::AGREEMENT,
+        top.through,
+        100.0 * top.best_gain,
+    ));
+    // The grid ends at the saturation point: a load's rungs run to it.
+    let mut grid = Vec::with_capacity((top.top + 1) * shapes.len());
+    for (at, &(n, k)) in shapes.iter().enumerate() {
+        for (i, &m) in lattice.iter().enumerate().take(top.top + 1) {
+            grid.push((m, n, k, rates[at][i]));
         }
     }
     grid.sort_by_key(|&(m, n, k, _)| (k, n, m));
@@ -576,7 +595,11 @@ mod lattice_tests {
         assert_eq!(narrower(10240), 8192);
         assert_eq!(narrower(8192), 4096);
         assert_eq!(narrower(1024), crate::FIRE.0);
-        assert_eq!(narrower(crate::FIRE.0), crate::FIRE.0, "no narrower than a token a lane");
+        assert_eq!(
+            narrower(crate::FIRE.0),
+            crate::FIRE.0,
+            "no narrower than a token a lane"
+        );
         assert!(lattice_rows().contains(&narrower(10240)));
     }
 }
