@@ -145,14 +145,24 @@ impl Engine for Spatial {
                 "the spatial engine loads a checkpoint path".into(),
             ));
         };
-        let contract = (self.contract_for)(&trace, &path).map_err(Error::Load)?;
-        // the program serves the context the config states (else as many positions as it holds)
-        let positions = budgets.context_declared.then_some(budgets.max_context);
-        let prepared = prepare::prepare(&self.cfg, &trace, &contract, &path, positions)
-            .map_err(|e| Error::Load(format!("the wafer program: {e}")))?;
+        // What the trace and budgets alone decide, before anything is
+        // compiled: the float output the readout rows read, which bounds
+        // the wafer's vocabulary. A trace without one could serve no fire.
         let slots = poem_compiler::state_slots(budgets.slots, &trace, DEFAULT_STATE_SLOTS);
         let facts = Facts::of(trace, &budgets, slots).map_err(Error::Load)?;
-        self.readout = facts.readout();
+        let (readout, width) = facts.readout().ok_or_else(|| {
+            Error::Load(
+                "the trace reads no float output at its readout rows (`logits`, else its one \
+                 float readout): the spatial engine serves none"
+                    .into(),
+            )
+        })?;
+        let contract = (self.contract_for)(facts.trace(), &path).map_err(Error::Load)?;
+        // the program serves the context the config states (else as many positions as it holds)
+        let positions = budgets.context_declared.then_some(budgets.max_context);
+        let prepared = prepare::prepare(&self.cfg, facts.trace(), &contract, &path, positions)
+            .map_err(|e| Error::Load(format!("the wafer program: {e}")))?;
+        self.readout = Some((readout, width));
         let platform = match &self.cfg.cmaddr {
             Some(cmaddr) => crate::sdk::Platform::System {
                 cmaddr: cmaddr.clone(),
@@ -165,10 +175,7 @@ impl Engine for Spatial {
                 })
             }),
         };
-        let vocab = self
-            .readout
-            .as_ref()
-            .map_or(usize::MAX, |(_, w)| *w as usize);
+        let vocab = width as usize;
         let w = wafer::Wafer::open(
             prepared.program.clone(),
             platform,
@@ -547,5 +554,72 @@ mod tests {
         }));
         assert!(refused.is_err());
         assert_eq!(live.tallied(Tally::Refused), 1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use engine::Engine;
+    use engine::load::{Budgets, Checkpoint, LoadRequest, Residency};
+    use poem::{Dtype, ForwardHybrid, Input, StateRows, Weight, ops};
+
+    use super::Spatial;
+
+    const VOCAB: u32 = 16;
+
+    /// A model whose one readout is an i32 argmax: no float output for the
+    /// readout rows.
+    struct IdsOnly;
+
+    impl ForwardHybrid for IdsOnly {
+        fn states(&self) -> StateRows {
+            StateRows::new()
+        }
+        fn forward(&self, inputs: Input) {
+            let table = Weight::sym("embed", [u64::from(VOCAB), 8], Dtype::Bf16);
+            let x = ops::gather::embed(&inputs.tokens(), &table, VOCAB);
+            let x = ops::gather::gather_rows(&x, &inputs.readout_rows());
+            poem::output("ids", &ops::sampling::argmax(&[&x]), None);
+        }
+    }
+
+    fn compiles_nothing(
+        _: &poem_ir::Trace,
+        _: &std::path::Path,
+    ) -> std::result::Result<checkpoint::contract::ModelContract, String> {
+        panic!("a load the trace alone refuses reaches no import, plan or compile")
+    }
+
+    /// A trace with no float readout is refused at load, before the import
+    /// contract, the plan or a compile, by name; it does not load with an
+    /// unbounded vocabulary to fail at every fire.
+    #[test]
+    fn a_trace_without_a_float_readout_is_refused_at_load() {
+        let trace = poem::trace_hybrid("ids-only", &IdsOnly, poem_ir::Platform::Cerebras);
+        let mut spatial = Spatial::new(crate::spatial::Config::default(), compiles_nothing);
+        let refused = spatial
+            .load(LoadRequest {
+                trace,
+                checkpoint: Checkpoint::Path("/nonexistent/ids-only.zt".into()),
+                budgets: Budgets {
+                    max_lanes: 1,
+                    max_tokens: 4,
+                    buckets: vec![4],
+                    max_adapters: 0,
+                    page_size: 16,
+                    max_context: 64,
+                    context_declared: false,
+                    slots: 1,
+                    max_patches: None,
+                    max_images: None,
+                    max_voxels: None,
+                    max_clips: None,
+                },
+                residency: Residency::default(),
+                ordinal: 0,
+                frames_in_flight: 1,
+            })
+            .expect_err("the load is refused");
+        assert!(refused.to_string().contains("no float output"), "{refused}");
     }
 }
