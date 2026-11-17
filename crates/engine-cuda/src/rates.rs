@@ -12,7 +12,7 @@
 //! Every shape is `engine::rates`' lattice, and its counts turn the times
 //! into rates, so the CUDA and ROCm rates mean what every backend's do:
 //! - `bf16_flops_per_ns_by_rows_n_k`: the matmul `m x n x k` at each row
-//!   count of the rung lattice ([`lattice_rows`]) and each column count and depth of [`DEPTHS`]
+//!   count of the load's candidate rungs ([`lattice_rows`]) and each column count and depth of [`DEPTHS`]
 //!   through `linear::gemm` (cuBLAS(Lt) on CUDA,
 //!   hipBLASLt/rocBLAS on ROCm) under the GEMM tactics serving runs; its
 //!   launches rotate through `engine::rates::weights_at(n, k)` weight planes, `engine::rates::WEIGHT_BYTES`
@@ -44,17 +44,28 @@
 use engine::rates::{ATTN_DIMS, ATTN_KEYS, ATTN_SHAPE, DEPTHS, SCAN_SHAPE, weights_at};
 use profile::fire::Rates;
 
-/// The widest fire this backend's grid is timed to, the top of its rung
-/// lattice: the rows a fire takes when nothing states them
-/// ([`crate::api::DEFAULT_FORWARD_TOKENS`]). A chip whose profile states its
-/// own fire rows needs its lattice to reach them.
-pub const ROWS_TOP: u32 = crate::api::DEFAULT_FORWARD_TOKENS;
-
-/// The rows the matmul grid is timed at: the rung lattice up to
-/// [`ROWS_TOP`] (`engine::rates::row_lattice`, the one definition).
+/// The rows the matmul grid is timed at under `chip`: the candidates a load
+/// weighs its top rung among (`serve::load`'s `budget_at(asked).buckets`),
+/// the chip's lattice ([`crate::api::lattice`] at its `engine.lattice_steps`,
+/// `prefill_lattice_from` and `_steps`) up to the tokens a load is asked
+/// when nothing states them: the chip's `engine.forward_tokens`, at least
+/// [`crate::api::DEFAULT_FORWARD_TOKENS`]. A load asked other tokens (a
+/// model the walk fit narrows, a stated `max_forward_tokens`) lays a top
+/// this grid does not state, refused by name.
 #[must_use]
-pub fn lattice_rows() -> Vec<u32> {
-    engine::rates::row_lattice(ROWS_TOP)
+pub fn lattice_rows(chip: &profile::Profile) -> Vec<u32> {
+    let engine = crate::chip::Engine::of(chip);
+    let top = match engine.forward_tokens {
+        0 => crate::api::DEFAULT_FORWARD_TOKENS,
+        tokens => tokens.max(crate::api::DEFAULT_FORWARD_TOKENS),
+    };
+    crate::api::lattice(
+        Vec::new(),
+        top,
+        engine.lattice_steps,
+        engine.prefill_lattice_from,
+        engine.prefill_lattice_steps,
+    )
 }
 
 /// The kv cache's page, as a served load pages it.
@@ -320,7 +331,8 @@ mod on_device {
             engine::rates::WARM_SHAPE.0,
             warmed.rate / 1e3
         );
-        let grid = gemm(device.ctx(), &clock, &random, &mut held, gap)?;
+        let rows = lattice_rows(chip);
+        let grid = gemm(device.ctx(), &clock, &random, &mut held, &rows, gap)?;
         let mut attn = Vec::with_capacity(ATTN_KEYS.len() * ATTN_DIMS.len());
         for d in ATTN_DIMS {
             for keys in ATTN_KEYS {
@@ -367,6 +379,7 @@ mod on_device {
         clock: &Clock,
         random: &Random,
         held: &mut Vec<Buffer>,
+        rows: &[u32],
         gap: f64,
     ) -> Result<Vec<(u32, u32, u32, f64)>, String> {
         // The shapes in engine::rates' spread order, so a drift left after
@@ -375,10 +388,10 @@ mod on_device {
             .iter()
             .flat_map(|&k| DEPTHS.iter().map(move |&n| (n, k)))
             .collect();
-        let mut grid = Vec::with_capacity(lattice_rows().len() * shapes.len());
+        let mut grid = Vec::with_capacity(rows.len() * shapes.len());
         for at in engine::rates::spread_order(shapes.len()) {
             let (n, k) = shapes[at];
-            grid.extend(gemm_at(ctx, clock, random, held, n, k, gap)?);
+            grid.extend(gemm_at(ctx, clock, random, held, rows, n, k, gap)?);
         }
         grid.sort_by_key(|&(m, n, k, _)| (k, n, m));
         Ok(grid)
@@ -421,20 +434,21 @@ mod on_device {
         clock: &Clock,
         random: &Random,
         held: &mut Vec<Buffer>,
+        rows: &[u32],
         n: u32,
         k: u32,
         gap: f64,
     ) -> Result<Vec<(u32, u32, u32, f64)>, String> {
-        let most = *lattice_rows().last().expect("rows") as usize;
+        let most = rows.iter().copied().max().expect("rows") as usize;
         let act = random.operand(most * k as usize * 2)?;
         let y = zeroed(most * n as usize * 2)?;
         let planes = weights_at(n, k);
         let weights = (0..planes)
             .map(|_| random.operand(n as usize * k as usize * 2))
             .collect::<Result<Vec<Buffer>, String>>()?;
-        let mut curve = Vec::with_capacity(lattice_rows().len());
-        for row in engine::rates::spread_order(lattice_rows().len()) {
-            let m = lattice_rows()[row];
+        let mut curve = Vec::with_capacity(rows.len());
+        for row in engine::rates::spread_order(rows.len()) {
+            let m = rows[row];
             let fire = |w: usize| {
                 kernels_cuda::linear::gemm::matmul(
                     ctx,
@@ -774,5 +788,29 @@ mod on_device {
                 .join(", ")
         );
         Ok(gaps.last().map_or(0.0, |&(_, ns)| ns).round() as u64)
+    }
+}
+
+#[cfg(test)]
+mod lattice_tests {
+    #[test]
+    fn the_grid_is_timed_at_the_candidates_a_load_weighs() {
+        // The rows a load with nothing stated weighs (serve::load's
+        // budget_at(asked).buckets): the chip's lattice to its asked tokens.
+        let chip = crate::chip::profile("");
+        let engine = crate::chip::Engine::of(&chip);
+        let asked = match engine.forward_tokens {
+            0 => crate::api::DEFAULT_FORWARD_TOKENS,
+            tokens => tokens.max(crate::api::DEFAULT_FORWARD_TOKENS),
+        };
+        let weighed = crate::api::lattice(
+            Vec::new(),
+            asked,
+            engine.lattice_steps,
+            engine.prefill_lattice_from,
+            engine.prefill_lattice_steps,
+        );
+        assert_eq!(super::lattice_rows(&chip), weighed);
+        assert_eq!(weighed.first(), Some(&1), "a readout's one row");
     }
 }

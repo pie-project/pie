@@ -81,6 +81,14 @@ pub trait Bench {
     /// A fingerprint of the plan model `model` compiles under `file`:
     /// equal fingerprints serve the same. `None` where it cannot say.
     fn plan(&self, model: usize, file: &str) -> Option<u64>;
+    /// Whether [`Bench::plan`] covers every decision, not only the
+    /// plan-only ones (a price, a fusion): its fingerprint is all the
+    /// load would run (XLA's program texts), so a candidate whose
+    /// fingerprint equals today's serves the same whatever its decision,
+    /// and a decision no check model's plan moves is not served at all.
+    fn plan_covers_all(&self) -> bool {
+        false
+    }
 }
 
 /// One decision the search tries.
@@ -620,10 +628,11 @@ pub fn search(
     let mut lines = Vec::new();
     for knob in knobs {
         let mut fresh = vec![false; names.len()];
+        let by_plan = knob.plan_only || bench.plan_covers_all();
         let movable: Vec<usize> = (0..names.len())
             .filter(|&m| {
                 incumbent[m].as_ref().is_some_and(|s| {
-                    (knob.plan_only || s.read.contains(&knob.id))
+                    (by_plan || s.read.contains(&knob.id))
                         && !(refuses(knob.id) && s.refused.is_some())
                 })
             })
@@ -645,7 +654,7 @@ pub fn search(
         }
         let plans: Vec<Option<u64>> = (0..names.len())
             .map(|m| {
-                if knob.plan_only {
+                if by_plan {
                     bench.plan(m, &incumbent_text)
                 } else {
                     None
@@ -694,9 +703,7 @@ pub fn search(
             let on: Vec<usize> = movable
                 .iter()
                 .copied()
-                .filter(|&m| {
-                    !knob.plan_only || plans[m].is_none() || bench.plan(m, &text) != plans[m]
-                })
+                .filter(|&m| !by_plan || plans[m].is_none() || bench.plan(m, &text) != plans[m])
                 .collect();
             if on.is_empty() {
                 notes.push(format!("plans the same\u{1f}{seen}"));
@@ -947,5 +954,56 @@ mod tests {
             lines[2].text.contains("no check model reads it"),
             "{lines:?}"
         );
+    }
+
+    /// A bench whose plan fingerprint covers every decision: `kernel.noop`
+    /// is read by the model but moves nothing it runs, and noise would make
+    /// one of its candidates look faster.
+    struct Planned(usize);
+
+    impl Bench for Planned {
+        fn models(&self) -> Vec<String> {
+            vec!["toy".into()]
+        }
+        fn file(&self, entries: &[(String, String)]) -> Result<String, String> {
+            Ok(render_overrides(entries))
+        }
+        fn serve(&mut self, _: usize, file: &str) -> Result<Serving, String> {
+            self.0 += 1;
+            // Every other serve is 10% faster, whatever it serves.
+            let t = if self.0 % 2 == 0 { 90.0 } else { 100.0 };
+            let _ = value(file, "noop");
+            Ok(Serving {
+                prompt: vec![t],
+                steps: vec![vec![t]; 3],
+                readout: vec![1.0, 0.0],
+                read: vec!["kernel.noop"],
+                refused: None,
+            })
+        }
+        fn plan(&self, _: usize, _: &str) -> Option<u64> {
+            Some(7)
+        }
+        fn plan_covers_all(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn a_decision_that_moves_no_plan_is_not_served() {
+        let knobs = vec![Knob {
+            id: "kernel.noop",
+            current: "1".into(),
+            candidates: vec![("2".into(), String::new()), ("3".into(), String::new())],
+            halfway: false,
+            plan_only: false,
+        }];
+        let start = vec![("kernel.noop".to_string(), "1".to_string())];
+        let mut bench = Planned(0);
+        let (chosen, lines) = search(&mut bench, start, &knobs, "", &mut |_| {}).unwrap();
+        assert_eq!(chosen[0].1, "1", "{lines:?}");
+        assert!(lines[0].text.contains("plans the same"), "{lines:?}");
+        // Only the incumbent's first serving: no candidate was served.
+        assert_eq!(bench.0, 1);
     }
 }

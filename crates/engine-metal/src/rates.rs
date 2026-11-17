@@ -42,11 +42,12 @@ use profile::fire::Rates;
 /// the lattice.
 pub const ROWS_TOP: u32 = 8192;
 
-/// The rows the matmul grid is timed at: the rung lattice up to
-/// [`ROWS_TOP`] (`engine::rates::row_lattice`, the one definition).
+/// The rows the matmul grid is timed at: every power of two of rows from 1
+/// to [`ROWS_TOP`], Metal's own list (its owner states the lattice its
+/// loads lay).
 #[must_use]
 pub fn lattice_rows() -> Vec<u32> {
-    engine::rates::row_lattice(ROWS_TOP)
+    (0..=ROWS_TOP.ilog2()).map(|i| 1 << i).collect()
 }
 
 use crate::device::{Buffer, Context, Handles, Pipelines};

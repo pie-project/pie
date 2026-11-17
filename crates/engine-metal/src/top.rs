@@ -178,8 +178,8 @@ mod tests {
         );
         let rated = profile::fire::Rates {
             bf16_flops_per_ns_by_rows_n_k: Some(
-                engine::rates::row_lattice(16384)
-                    .into_iter()
+                (0..=14)
+                    .map(|i| 1u32 << i)
                     .map(|m| (m, 4096, 4096, 5000.0))
                     .collect(),
             ),
