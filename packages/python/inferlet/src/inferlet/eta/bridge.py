@@ -25,7 +25,7 @@ from wit_world.imports import working_set as _wit_ws
 
 from ..media import Audio, Image
 from .builder import Builder, DslChannel
-from .ir import Axis, Dtype, OutputDecl, Port, Shape, Stage, numel, shape_of
+from .ir import Axis, Dtype, Observe, OutputDecl, Port, Shape, Stage, numel, shape_of
 from .trace import ChannelState, TraceError
 from .value import ConstData, Tensor, const_data, reshape, unpack_elems
 
@@ -541,6 +541,17 @@ class ForwardPass:
         self._lanes: list[WorkingSet] = []
         self._fold_all: Channel | None = None
         self._switches: list[tuple[int, str, str]] = []
+        self._observe: Observe | None = None
+
+    def observe(self, observe: Observe) -> None:
+        """State what this pass's program observes where it reads attention
+        scores (`attn.scores`, `attn.scores.pages`): its lanes' last `n` query
+        rows (`Observe.rows_(n)`) or every row a lane brings
+        (`Observe.fire_rows()`). A program that reads scores states it, or the
+        runtime refuses it at registration. Construction-only."""
+        if self._program_attached:
+            raise InferletError("the observation is construction-only")
+        self._observe = observe
 
     # -- ports ----------------------------------------------------------------
 
@@ -756,6 +767,8 @@ class ForwardPass:
         if self._program_attached:
             return
         builder = Builder(self._vocab, self._page_size)
+        if self._observe is not None:
+            builder.set_observe(self._observe)
         lanes = max(
             [1, len(self._lanes)]
             + [lane + 1 for lane, _, _ in self._switches]

@@ -796,6 +796,14 @@ impl Plane {
         })
     }
 
+    /// What `instance`'s program observes where it reads attention scores.
+    #[must_use]
+    pub fn observe(&self, instance: InstanceId) -> Option<eta_ir::container::Observe> {
+        self.instances
+            .get(&instance)
+            .and_then(|seat| seat.plan.package.observe)
+    }
+
     /// Waits for every pass airborne on `instance`'s channels before the prologue runs.
     #[cfg(feature = "wgpu")]
     pub(crate) fn fire_prologue(
@@ -1247,5 +1255,9 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
 
     fn reads(&self, instance: InstanceId) -> Vec<(String, u32)> {
         Plane::reads(self, instance)
+    }
+
+    fn observe(&self, instance: InstanceId) -> Option<eta_ir::container::Observe> {
+        Plane::observe(self, instance)
     }
 }

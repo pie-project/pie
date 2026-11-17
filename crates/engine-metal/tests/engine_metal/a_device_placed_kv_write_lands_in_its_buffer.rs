@@ -83,6 +83,7 @@ fn prompt_program(vocab: u32, tokens: &[u32]) -> ProgramRegistration {
         }],
         externs: Vec::new(),
         inputs: Vec::new(),
+        observe: None,
     };
     let bound = eta_ir::validate::bind(
         container,

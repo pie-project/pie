@@ -147,11 +147,13 @@ pub enum Attn {
         o: ValueId,
     },
     /// Each capturing lane's attention mass a key of the load's context
-    /// ([`crate::Dim::ContextTimes`]`(1)`), averaged over its last `observe`
-    /// query rows and over every query head, added to `into` (an earlier
+    /// ([`crate::Dim::ContextTimes`]`(1)`), averaged over the query rows the
+    /// lane observes and over every query head, added to `into` (an earlier
     /// layer's, the same row) or, with none, to a zeroed row: one row a
     /// capturing lane ([`crate::Dim::Capturing`]). The last layer's is the
-    /// mass summed over the layers, a key.
+    /// mass summed over the layers, a key. The rows a lane observes are no
+    /// fact of the model's: its reading program states them
+    /// (`eta_ir::container::Observe`), and an engine reads them a lane.
     ScoreCapture {
         #[input]
         q: ValueId,
@@ -165,7 +167,6 @@ pub enum Attn {
         /// averaged over, where a rank attends only its share of them.
         q_heads: u32,
         sm_scale: f32,
-        observe: u32,
         #[input(F32)]
         into: Option<ValueId>,
         #[output(F32)]

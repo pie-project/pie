@@ -191,6 +191,9 @@ pub struct Seated<'a> {
     /// The runtime's report tag for this lane (`engine::fire` lane
     /// `reports`); 0: no report asked.
     pub reports: u64,
+    /// What the lane's program observes where it reads attention scores, as
+    /// its container states it; a lane that captures states it.
+    pub observe: Option<eta_ir::container::Observe>,
 }
 
 impl<'a> Seated<'a> {
@@ -219,6 +222,7 @@ impl<'a> Seated<'a> {
             record_run: None,
             windows: &[],
             reports: 0,
+            observe: None,
         }
     }
 
@@ -2089,6 +2093,7 @@ impl Shell {
                             pages: &kv_pages,
                             record: (!record.is_empty()).then_some(&record[..]),
                             windows: &windows,
+                            observe: Some(eta_ir::container::Observe::FireRows),
                             ..Seated::of(Lane {
                                 slot: 0,
                                 word: word(prompt, form),
@@ -2103,6 +2108,8 @@ impl Shell {
                                 pages: &kv_pages,
                                 record: (!record.is_empty()).then_some(&record[..]),
                                 windows: &windows,
+                                // A walk names a capturing form at its rows.
+                                observe: Some(eta_ir::container::Observe::FireRows),
                                 ..Seated::of(Lane {
                                     slot,
                                     word: word(1, form),
@@ -4849,7 +4856,8 @@ impl Shell {
         // The capturing lanes' score rows, laid in the guest region before
         // any program stage takes its scratch there.
         let mut guest = self.guest_carve();
-        let (capture_seat, capture_rows) = self.lay_capture(&composition, &mut guest, arm)?;
+        let (capture_seat, capture_rows) =
+            self.lay_capture(&composition, lanes, attachments, &mut guest, arm)?;
         self.last_capture = capture_rows.clone();
         let bindings = FireBindings {
             tokens: bound.tokens,
@@ -4973,6 +4981,8 @@ impl Shell {
     fn lay_capture(
         &mut self,
         composition: &Composition,
+        seated: &[Seated<'_>],
+        attachments: &[Attached],
         guest: &mut crate::program::GuestCarve,
         arm: usize,
     ) -> Result<(Option<crate::run::CaptureSeat>, CaptureRows)> {
@@ -4983,11 +4993,34 @@ impl Shell {
         let (key_bytes, page_bytes) = capture_row_bytes(layout.keys, layout.pages);
         let mut keys_at = vec![u64::MAX; lanes.len().max(1)];
         let mut pages_at = vec![u64::MAX; lanes.len().max(1)];
+        let mut observe_at = vec![0u32; lanes.len().max(1)];
         let mut rows = Vec::new();
         for (at, row) in lanes.iter().enumerate() {
             if !layout.classes.contains(row.class as usize) {
                 continue;
             }
+            // What the lane's program observes: as its attachment's program
+            // states it, else as the caller seated it.
+            let source = row.source;
+            let stated = attachments
+                .iter()
+                .filter(|a| !a.adapter_only && (a.lane..a.lane + a.lanes.max(1)).contains(&source))
+                .find_map(|a| self.programs.observe(a.instance));
+            let observe = stated.or_else(|| seated.get(source as usize).and_then(|lane| lane.observe));
+            observe_at[at] = match observe {
+                Some(eta_ir::container::Observe::Rows(rows)) => rows.min(row.rows),
+                Some(eta_ir::container::Observe::FireRows) => row.rows,
+                None => {
+                    return Err(Fault::program(
+                        "serve::lay_capture",
+                        format!(
+                            "lane {} captures attention scores and its program states no \
+                             observation (`eta_ir::container::Observe`)",
+                            row.source
+                        ),
+                    ));
+                }
+            };
             let taken = guest.take(key_bytes + page_bytes)?;
             keys_at[at] = taken.offset / 4;
             pages_at[at] = (taken.offset + key_bytes) / 4;
@@ -4997,12 +5030,14 @@ impl Shell {
             return Ok((None, CaptureRows::default()));
         }
         let count = layout.tables.len();
-        let (keys_table, pages_table) = &mut layout.tables[arm % count];
+        let (keys_table, pages_table, observe_table) = &mut layout.tables[arm % count];
         let words = |offsets: &[u64]| -> Vec<u8> {
             offsets.iter().flat_map(|offset| offset.to_le_bytes()).collect()
         };
         keys_table.write(0, &words(&keys_at))?;
         pages_table.write(0, &words(&pages_at))?;
+        let observed: Vec<u8> = observe_at.iter().flat_map(|rows| rows.to_le_bytes()).collect();
+        observe_table.write(0, &observed)?;
         let table_bytes = keys_at.len() as u64 * 8;
         let lanes_u32 = u32::try_from(keys_at.len()).unwrap_or(u32::MAX);
         let store = self.arena.store();
@@ -5024,6 +5059,12 @@ impl Shell {
                 lanes_u32,
                 1,
                 Dtype::U64,
+            ),
+            observe_at: kernels_metal::Tensor::new(
+                self.handles.bind(observe_table, 0, table_bytes / 2)?,
+                lanes_u32,
+                1,
+                Dtype::U32,
             ),
             keys: layout.keys,
             pages: layout.pages,
@@ -5319,7 +5360,9 @@ pub struct CaptureLayout {
     pages: u32,
     page_size: u32,
     classes: poem_ir::ClassSet,
-    tables: Vec<(crate::device::Buffer, crate::device::Buffer)>,
+    /// Each arm's tables: every fire lane's key row start and page row
+    /// start (u64), and the rows it observes (u32).
+    tables: Vec<(crate::device::Buffer, crate::device::Buffer, crate::device::Buffer)>,
 }
 
 /// What a capturing lane's rows take of a guest region: its key row and its
@@ -5352,7 +5395,13 @@ impl CaptureLayout {
         }
         let bytes = u64::from(lanes.max(1)) * 8;
         let tables = (0..arms.max(1))
-            .map(|_| Ok((Buffer::zeroed(device, bytes)?, Buffer::zeroed(device, bytes)?)))
+            .map(|_| {
+                Ok((
+                    Buffer::zeroed(device, bytes)?,
+                    Buffer::zeroed(device, bytes)?,
+                    Buffer::zeroed(device, bytes / 2)?,
+                ))
+            })
             .collect::<Result<Vec<_>>>()?;
         Ok(Some(CaptureLayout {
             keys: context,

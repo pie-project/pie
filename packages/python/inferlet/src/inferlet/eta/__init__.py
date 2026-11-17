@@ -37,7 +37,7 @@ from .bridge import (
     submit_deadline_us,
     unpad_tokens,
 )
-from .ir import Dtype, Port, Stage, dtype
+from .ir import Dtype, Observe, Port, Stage, dtype
 from .trace import TraceError
 from .value import (
     ConstData,
@@ -133,6 +133,7 @@ __all__ = [
     "unpad_tokens",
     # ir
     "Dtype",
+    "Observe",
     "Port",
     "Stage",
     "dtype",

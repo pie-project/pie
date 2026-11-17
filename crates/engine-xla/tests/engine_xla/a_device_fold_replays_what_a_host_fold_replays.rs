@@ -67,6 +67,7 @@ fn fold_program() -> TraceContainer {
         }],
         externs: Vec::new(),
         inputs: Vec::new(),
+        observe: None,
     }
 }
 

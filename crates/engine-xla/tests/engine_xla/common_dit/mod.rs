@@ -526,6 +526,7 @@ pub fn carrier(shapes: &[Shape], fed: u32) -> TraceContainer {
         }],
         externs: Vec::new(),
         inputs: Vec::new(),
+        observe: None,
     }
 }
 

@@ -202,7 +202,6 @@ impl<B: Backend> Run<'_, B> {
                 kv_heads,
                 q_heads,
                 sm_scale,
-                observe,
                 into,
                 scores,
                 ..
@@ -236,6 +235,7 @@ impl<B: Backend> Run<'_, B> {
                         positions: self.bindings().positions,
                         table,
                         capturing,
+                        observed: self.scored().observed(),
                         stats,
                         scores,
                     },
@@ -244,7 +244,6 @@ impl<B: Backend> Run<'_, B> {
                     *kv_heads,
                     *q_heads,
                     *sm_scale,
-                    *observe,
                     into.is_some(),
                     self.tuning().workgroup_bytes(),
                 )

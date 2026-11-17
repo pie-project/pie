@@ -133,6 +133,10 @@ pub trait Programs<B: Serve>: Default {
 
     /// The outputs `instance` reads, each with the lane of its attachment.
     fn reads(&self, instance: InstanceId) -> Vec<(String, u32)>;
+
+    /// What `instance`'s program observes where it reads attention scores,
+    /// as its container states it.
+    fn observe(&self, instance: InstanceId) -> Option<eta_ir::container::Observe>;
 }
 
 /// The elements a cell of `shape` holds (a scalar holds one).

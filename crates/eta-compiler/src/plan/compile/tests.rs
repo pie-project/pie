@@ -108,6 +108,7 @@ pub(super) fn program(prefix_constant: u32, global_channel_offset: usize) -> Bou
         stages,
         externs: vec![],
         inputs: Vec::new(),
+        observe: None,
     };
     served(container, vocab)
 }

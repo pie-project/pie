@@ -2617,13 +2617,20 @@ impl Switched {
         let mut on = vec![Vec::new(); lanes.len()];
         let mut tails = vec![0; lanes.len()];
         let mut rows_read = false;
+        // A score reader's last fire holds the rows it observes, as it
+        // states them; every query row of a fire observes the fire's own.
+        let observed = match pass.instance.program.bound.container.observe {
+            Some(eta_ir::container::Observe::Rows(rows)) => rows,
+            Some(eta_ir::container::Observe::FireRows) | None => 0,
+        };
         for (name, lane) in &pass.instance.program.reads {
             let switches = model.output_switches(name);
             if let Some(decl) = model.output(name) {
                 rows_read |= decl.axis != poem_ir::InputAxis::Lane
                     && (!decl.readout || !switches.is_empty());
+                let scores = crate::pipeline::program::SCORE_OUTPUTS.contains(&name.as_str());
                 if let Some(tail) = tails.get_mut(*lane as usize) {
-                    *tail = (*tail).max(decl.tail);
+                    *tail = (*tail).max(decl.tail).max(if scores { observed } else { 0 });
                 }
             }
             if let Some(lane_on) = on.get_mut(*lane as usize) {

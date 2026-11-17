@@ -133,6 +133,7 @@ fn stating_prologue() -> TraceContainer {
         }],
         externs: Vec::new(),
         inputs: Vec::new(),
+        observe: None,
     }
 }
 

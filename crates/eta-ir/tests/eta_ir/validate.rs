@@ -134,6 +134,7 @@ fn section3() -> TraceContainer {
         }],
         externs: Vec::new(),
         inputs: Vec::new(),
+        observe: None,
     }
 }
 
@@ -188,6 +189,7 @@ fn sink_precedence_t11() {
         }],
         externs: Vec::new(),
         inputs: Vec::new(),
+        observe: None,
     };
     assert!(served(mk(Stage::Prologue), EVERY).is_ok());
     assert!(matches!(
@@ -214,6 +216,7 @@ fn sink_precedence_t11() {
         }],
         externs: Vec::new(),
         inputs: Vec::new(),
+        observe: None,
     };
     let apm = {
         let mut c = apm;
@@ -273,6 +276,7 @@ fn lora_honour_gate_and_placement() {
         }],
         externs: Vec::new(),
         inputs: Vec::new(),
+        observe: None,
     };
     assert!(served(mk(Stage::Prologue), EVERY).is_ok());
     let no_lora = EngineCaps {

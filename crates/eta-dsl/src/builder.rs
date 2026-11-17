@@ -33,6 +33,7 @@ pub struct Builder<'a> {
     vocab: u32,
     page_size: u32,
     outputs: Vec<Vec<OutputDecl>>,
+    observe: Option<eta_ir::container::Observe>,
 }
 
 impl<'a> Builder<'a> {
@@ -44,7 +45,14 @@ impl<'a> Builder<'a> {
             vocab,
             page_size,
             outputs: Vec::new(),
+            observe: None,
         }
+    }
+
+    /// States what the program observes where it reads attention scores:
+    /// the container's observe section.
+    pub fn observe(&mut self, observe: eta_ir::container::Observe) {
+        self.observe = Some(observe);
     }
 
     /// The outputs each lane of the pass reads out, in lane order.
@@ -227,6 +235,7 @@ impl<'a> Builder<'a> {
             channels: channel_decls,
             ports,
             stages,
+            observe: self.observe,
         };
 
         let mut errs: Vec<TraceError> = Vec::new();

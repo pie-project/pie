@@ -16,6 +16,7 @@
 
 use engine_cpu::forward::{Output, Values};
 use engine_cpu::Forward;
+use eta_ir::container::Observe;
 use poem::Request;
 use poem_ir::Trace;
 
@@ -56,10 +57,11 @@ fn lanes(pattern: &[Reads]) -> Vec<(Vec<u32>, bool, bool)> {
 const DECODE: [u32; 2] = [17, 101];
 
 /// The oracle's key and page rows for `prompt` and then each of `DECODE`.
-fn oracle(trace: &Trace, context: u32, prompt: &[u32]) -> Vec<[Vec<f32>; 2]> {
+fn oracle(trace: &Trace, context: u32, prompt: &[u32], observe: Observe) -> Vec<[Vec<f32>; 2]> {
     let mut me = Forward::new(trace.clone(), None, &seeded_bf16)
         .unwrap_or_else(|why| panic!("the oracle loads {MODEL}: {why}"))
-        .at_context(context, PAGE);
+        .at_context(context, PAGE)
+        .observing(observe);
     let read = |outs: Vec<Output>| -> [Vec<f32>; 2] {
         [KEYS, PAGES].map(|name| match outs.iter().find(|out| out.name == name) {
             Some(Output {
@@ -93,7 +95,7 @@ fn apart(got: &[f32], want: &[f32]) -> f32 {
     (diff / norm.max(f32::MIN_POSITIVE)).sqrt()
 }
 
-fn served(context: u32, pattern: &[Reads]) {
+fn served(context: u32, pattern: &[Reads], observe: Observe) {
     let fixture = fixture(MODEL, None);
     let trace = &fixture.trace;
     assert!(
@@ -118,7 +120,7 @@ fn served(context: u32, pattern: &[Reads]) {
         .collect();
     let want: Vec<Option<Vec<[Vec<f32>; 2]>>> = lanes
         .iter()
-        .map(|(prompt, captures, _)| captures.then(|| oracle(trace, context, prompt)))
+        .map(|(prompt, captures, _)| captures.then(|| oracle(trace, context, prompt, observe)))
         .collect();
 
     // The device's reservations by owner, but for the per-dispatch scalars
@@ -149,6 +151,7 @@ fn served(context: u32, pattern: &[Reads]) {
             .map(|lane| Seated {
                 held: Some(held[lane]),
                 reads: &reads[lane],
+                observe: lanes[lane].1.then_some(observe),
                 ..Seated::of(Lane {
                     slot: lane as u32,
                     word: word(trace, tokens[lane].len() as u32, lanes[lane].1),
@@ -214,12 +217,18 @@ fn served(context: u32, pattern: &[Reads]) {
     }
 }
 
-/// Two capturing lanes among four, one reading pages, at two contexts.
+/// Two capturing lanes among four, one reading pages, at two contexts, their
+/// program observing its last 32 rows, its last 4, and the fire's own.
 #[test]
 fn a_capturing_lane_serves_the_oracles_score_rows() {
     use Reads::{Keys, Nothing, Pages};
-    for context in [256, 512] {
-        served(context, &[Nothing, Pages, Nothing, Keys]);
+    for (context, observe) in [
+        (256, Observe::Rows(32)),
+        (512, Observe::Rows(32)),
+        (256, Observe::Rows(4)),
+        (256, Observe::FireRows),
+    ] {
+        served(context, &[Nothing, Pages, Nothing, Keys], observe);
     }
 }
 
@@ -228,8 +237,8 @@ fn a_capturing_lane_serves_the_oracles_score_rows() {
 #[test]
 fn a_fire_lays_rows_for_its_capturing_lanes_alone() {
     use Reads::{Nothing, Pages};
-    served(256, &[Nothing, Pages, Nothing]);
-    served(256, &[Nothing, Nothing, Nothing]);
+    served(256, &[Nothing, Pages, Nothing], Observe::Rows(32));
+    served(256, &[Nothing, Nothing, Nothing], Observe::Rows(32));
 }
 
 /// The span lays no byte for a capturing lane's rows: a load that captures
@@ -269,9 +278,16 @@ fn the_arena_holds_no_score_row() {
 /// planes): the attention mass a key of the load's context, summed over the
 /// layers and averaged over the query heads, and that summed a kv page of
 /// the load's own (its chunk recipe's, not the boot's). A fire of 256 lanes,
-/// one capturing, lays that lane's rows alone.
+/// one capturing, lays that lane's rows alone, at each observation its
+/// program may state.
 #[test]
 fn the_score_rows_are_the_oracles() {
+    for observe in [Observe::Rows(32), Observe::Rows(2), Observe::FireRows] {
+        contract(observe);
+    }
+}
+
+fn contract(observe: Observe) {
     const LANES: u32 = 256;
     const CONTEXT: u32 = 64;
     let fixture = fixture(MODEL, None);
@@ -290,6 +306,7 @@ fn the_score_rows_are_the_oracles() {
                 Seated {
                     held: Some(0),
                     reads: if capturing { &reads } else { &[] },
+                    observe: capturing.then_some(observe),
                     ..Seated::of(Lane {
                         slot,
                         word: word(trace, tokens.len() as u32, capturing),
@@ -321,7 +338,8 @@ fn the_score_rows_are_the_oracles() {
 
     let mut oracle = Forward::new(trace.clone(), None, &seeded_bf16)
         .expect("the oracle loads")
-        .at_context(CONTEXT, page);
+        .at_context(CONTEXT, page)
+        .observing(observe);
     let outs = oracle
         .step(&prompt, 0, word(trace, prompt.len() as u32, true))
         .expect("the oracle steps");

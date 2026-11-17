@@ -1,8 +1,8 @@
 //! Score capture (`attn.score_capture`, `attn.score_pages`) from
 //! `kernels/attn/score.slang`: each capturing lane's one f32 row, a mass a
 //! key of the load's context, its causal softmax over its paged keys summed
-//! over this layer's query heads and averaged over its last `observe` query
-//! rows and the model's query heads, added into the row or into zero; and
+//! over this layer's query heads and averaged over the query rows its program
+//! observes and the model's query heads, added into the row or into zero; and
 //! once, the final row summed a kv page.
 //!
 //! A fire's capturing lanes are compacted ([`TABLE_INTS`] a lane, in lane
@@ -10,7 +10,8 @@
 //! Every head and observed row is summed inside the dispatch, so no
 //! per-head row is laid, and in one order a key, so a run reproduces. Two
 //! dispatches a layer, wide over the keys: the normalisers of each (lane,
-//! head, observed row) into a scratch of [`stats_floats`], then the mass, a
+//! head, observed row) into a scratch of [`stats_floats`] (a fire's observed
+//! rows, not a bound a lane), then the mass, a
 //! thread a key.
 #![allow(clippy::too_many_arguments)]
 
@@ -87,18 +88,20 @@ fn mass_form(workgroup_bytes: u32, heads: u32, kv_heads: u32, head_dim: u32) -> 
 const PAGES: &str = "attn_score_pages";
 
 /// The ints a capturing lane's entry of the capture table holds: the fire
-/// lane, its first and end query row in the fire, and the f32 its key row
+/// lane, its first and end query row in the fire, the f32 its key row
 /// starts at in the key rows and its page row in the page rows (-1 where
-/// its program reads no pages). A lane's rows are addressed through those
-/// two bases alone.
-pub const TABLE_INTS: u32 = 5;
+/// its program reads no pages), the query rows it observes (its last ones,
+/// as its program states them, at most the rows it brings), and the
+/// observed row of the fire its first is (where its normalisers lie). A
+/// lane's rows are addressed through those bases alone.
+pub const TABLE_INTS: u32 = 7;
 
-/// The f32s the normalisers of `capturing` lanes take, `heads` query heads
-/// of this rank each and `observe` rows a head: a maximum and an inverse
-/// sum each.
+/// The f32s the normalisers of a fire's `observed` rows take (every
+/// capturing lane's, together), `heads` query heads of this rank each: a
+/// maximum and an inverse sum each.
 #[must_use]
-pub fn stats_floats(capturing: u32, heads: u32, observe: u32) -> u64 {
-    u64::from(capturing) * u64::from(heads) * u64::from(observe) * 2
+pub fn stats_floats(observed: u32, heads: u32) -> u64 {
+    u64::from(observed) * u64::from(heads) * 2
 }
 
 /// One layer's capture over a fire's capturing lanes.
@@ -112,6 +115,9 @@ pub struct Capture {
     pub table: Tensor,
     /// The capturing lanes: the rows of `scores`.
     pub capturing: u32,
+    /// The query rows the capturing lanes observe, together: the table's
+    /// observed rows summed.
+    pub observed: u32,
     /// The normalisers' scratch, at least [`stats_floats`] f32.
     pub stats: Tensor,
     /// The key rows, `[capturing, context]` f32: added into, or written.
@@ -164,7 +170,6 @@ pub fn capture(
     kv_heads: u32,
     q_heads: u32,
     sm_scale: f32,
-    observe: u32,
     into: bool,
     workgroup_bytes: u32,
 ) -> Result<(), Error> {
@@ -243,13 +248,6 @@ pub fn capture(
             ),
         ));
     }
-    if observe == 0 {
-        return Err(refuse(
-            OP,
-            "the observation window is zero rows wide, which is a capture that observes \
-             nothing; the caller states the width it wants, and zero is not one",
-        ));
-    }
     nonzero(OP, "the capturing lanes this capture answers", at.capturing)?;
     let page_size = u32::try_from(pool.page_size)
         .ok()
@@ -295,7 +293,6 @@ pub fn capture(
             stated(OP, kv_heads)?.arg(),
             stated(OP, head_dim)?.arg(),
             sm_scale.arg(),
-            stated(OP, observe)?.arg(),
             stated(OP, context)?.arg(),
             i32::from(into).arg(),
             stated(OP, q_heads)?.arg(),
@@ -309,7 +306,7 @@ pub fn capture(
         pool.page_indptr.arg(),
         at.positions.arg(),
     ];
-    let need = stats_floats(at.capturing, heads, observe);
+    let need = stats_floats(at.observed, heads);
     let have = u64::from(at.stats.rows) * u64::from(at.stats.width);
     if have < need {
         return Err(refuse(

@@ -194,6 +194,9 @@ async fn main(input: Input) -> Result<Output> {
         let page_mass_out = Channel::new([p_max], dtype::f32).capacity(channel_capacity() as u32);
 
         let fwd = ForwardPass::new();
+        // H2O accumulates each decode's attention into its own running sum:
+        // a fire observes its own rows.
+        fwd.observe(Observe::FireRows);
         fwd.embed(&tok_in, &lane1)?;
         fwd.state(&[&ws], StateGeometry::default())?;
 

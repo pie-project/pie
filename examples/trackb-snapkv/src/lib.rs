@@ -160,6 +160,8 @@ async fn main(input: Input) -> Result<Output> {
     let page_mass_out = Channel::new([p_max], dtype::f32);
 
     let fwd_p = ForwardPass::new();
+    // SnapKV's observation window: the prompt's last 32 rows, its paper's.
+    fwd_p.observe(Observe::Rows(32));
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
     fwd_p.state(&[&ws], StateGeometry::default())?;
 

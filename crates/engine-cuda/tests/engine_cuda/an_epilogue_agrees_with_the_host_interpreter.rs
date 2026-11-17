@@ -133,6 +133,7 @@ fn epilogue() -> TraceContainer {
         }],
         externs: Vec::new(),
         inputs: Vec::new(),
+        observe: None,
     }
 }
 
@@ -428,6 +429,7 @@ fn shared_row() -> TraceContainer {
         }],
         externs: Vec::new(),
         inputs: Vec::new(),
+        observe: None,
     }
 }
 
@@ -558,6 +560,7 @@ fn acceptance() -> TraceContainer {
         }],
         externs: Vec::new(),
         inputs: Vec::new(),
+        observe: None,
     }
 }
 
@@ -685,6 +688,7 @@ fn sampler_arithmetic() -> TraceContainer {
         }],
         externs: Vec::new(),
         inputs: Vec::new(),
+        observe: None,
     }
 }
 
@@ -808,6 +812,7 @@ fn a_frame_gathers_out_of_one_frame() {
         }],
         externs: Vec::new(),
         inputs: Vec::new(),
+        observe: None,
     };
     let bound = crate::bound::logits(container, VOCAB).expect("the frame gather binds");
     let x: Vec<f32> = (0..plane).map(|i| 1.0 + i as f32).collect();

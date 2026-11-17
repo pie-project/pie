@@ -83,6 +83,7 @@ fn lanes_with_fold(vocab: u32, tokens: &[u32], lanes: u32, fold: &[u32]) -> Prog
         }],
         externs: Vec::new(),
         inputs: Vec::new(),
+        observe: None,
     };
     let bound = eta_ir::validate::bind(
         container,

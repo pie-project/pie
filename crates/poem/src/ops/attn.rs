@@ -1122,8 +1122,8 @@ pub fn voxel_over(
 /// key blocks an indexer picked a row, `ratio` keys a block, one pick a head
 /// when `per_head`), decode and prefill lanes read only those blocks; a
 /// masked lane reads every key. With `scores`, the lanes capturing scores
-/// read theirs out as `attn.scores` ([`score_capture`]'s, over their last 32
-/// query rows and the keys of the load's context).
+/// read theirs out as `attn.scores` ([`score_capture`]'s, over the query
+/// rows their reading program observes and the keys of the load's context).
 ///
 /// The host plans are the compiler's: each kind's is built once a trace,
 /// over the lanes of that kind and outside any layer, and every layer asking
@@ -1334,7 +1334,6 @@ pub fn attend(
         Value::merge(arms)
     };
     if scores {
-        const OBSERVE: u32 = 32;
         // Each layer adds into the row the layers before it filled; the
         // recorder reads the last one out when the trace is done
         // (`attn.scores` and `attn.scores.pages`).
@@ -1348,7 +1347,6 @@ pub fn attend(
             kv_heads,
             head_dim,
             sm_scale,
-            OBSERVE,
             into.as_ref(),
         );
         rec.carry(SCORE_ROW, &captured);
@@ -1360,8 +1358,8 @@ pub fn attend(
 pub(crate) const SCORE_ROW: &str = "attn.scores row";
 
 /// The attention mass a key of each lane capturing scores (`fact::scores`)
-/// over the keys of `kv` the load's context holds, averaged over the lane's
-/// last `observe` query rows of `q` and over its query heads, added to
+/// over the keys of `kv` the load's context holds, averaged over the query
+/// rows of `q` its reading program observes and over its query heads, added to
 /// `into`'s row (an earlier layer's) or to a zeroed one: `[capturing,
 /// context]`, one row a capturing lane in lane order. No arena holds it:
 /// each row lies in the reading program's guest region.
@@ -1374,7 +1372,6 @@ pub fn score_capture(
     kv_heads: u32,
     head_dim: u32,
     sm_scale: f32,
-    observe: u32,
     into: Option<&Value>,
 ) -> Value {
     let rec = inputs.recorder();
@@ -1403,7 +1400,6 @@ pub fn score_capture(
             kv_heads,
             q_heads,
             sm_scale,
-            observe,
             into: into.map(Value::id),
             scores: scores.id(),
         },

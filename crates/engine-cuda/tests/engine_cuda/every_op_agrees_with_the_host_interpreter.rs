@@ -228,6 +228,7 @@ impl Prog {
             }],
             externs: Vec::new(),
             inputs: Vec::new(),
+            observe: None,
         };
         Case {
             name,

@@ -32,6 +32,7 @@ fn epilogue(channels: Vec<ChannelDecl>, ops: Vec<Op>) -> TraceContainer {
         }],
         externs: Vec::new(),
         inputs: Vec::new(),
+        observe: None,
     }
 }
 

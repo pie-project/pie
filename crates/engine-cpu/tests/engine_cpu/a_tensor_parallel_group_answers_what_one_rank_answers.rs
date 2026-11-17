@@ -131,7 +131,8 @@ fn read(outs: Vec<Output>) -> Read {
 fn steps(trace: &Trace, group: Option<Group>) -> [Read; 2] {
     let mut me = Forward::new(trace.clone(), group, &plane)
         .expect("the micro loads")
-        .at_context(CONTEXT, PAGE);
+        .at_context(CONTEXT, PAGE)
+        .observing(eta_ir::container::Observe::Rows(32));
     let first = me
         .step(&PROMPT, 0, word(trace, PROMPT.len()))
         .expect("the prefill runs");

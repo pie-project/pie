@@ -84,6 +84,8 @@ pub enum RegisterError {
     Decode(ContainerDecodeError),
     Bind(ValidateError),
     HashCollision(u64),
+    /// It reads attention scores and states no observation.
+    Unobserved,
 }
 
 impl fmt::Display for RegisterError {
@@ -94,6 +96,10 @@ impl fmt::Display for RegisterError {
             RegisterError::HashCollision(hash) => {
                 write!(f, "program hash collision for 0x{hash:016x}")
             }
+            RegisterError::Unobserved => f.write_str(
+                "this program reads attention scores but states no observation; build it with \
+                 an SDK that states Observe",
+            ),
         }
     }
 }
@@ -137,6 +143,7 @@ impl Registry {
         let pricing = price(&decoded);
         let channel_accesses = Self::channel_accesses(&decoded);
         let reads = Self::reads(&decoded);
+        unobserved(&reads, &decoded)?;
         let bound = bind(decoded, lanes, caps).map_err(RegisterError::Bind)?;
         let compiled_stages = eta_compiler::plan::compile_bound(&bound);
         let launch = std::sync::OnceLock::new();
@@ -202,6 +209,21 @@ impl Registry {
     pub fn lookup(&mut self, hash: u64) -> Option<Arc<RegisteredProgram>> {
         self.inner.get(&hash).cloned()
     }
+}
+
+/// The outputs a program reading which states what it observes.
+pub const SCORE_OUTPUTS: [&str; 2] = ["attn.scores", "attn.scores.pages"];
+
+/// A program reading attention scores states what it observes
+/// ([`container::Observe`]); one that states none is refused by name.
+fn unobserved(reads: &[(String, u32)], container: &TraceContainer) -> Result<(), RegisterError> {
+    let scores = reads
+        .iter()
+        .any(|(name, _)| SCORE_OUTPUTS.contains(&name.as_str()));
+    if scores && container.observe.is_none() {
+        return Err(RegisterError::Unobserved);
+    }
+    Ok(())
 }
 
 fn price(c: &TraceContainer) -> Pricing {
@@ -343,5 +365,89 @@ mod pricing_tests {
         };
         assert_eq!(price(&container).rows, 256);
         assert_eq!(price(&TraceContainer::default()).rows, 1);
+    }
+}
+
+#[cfg(test)]
+mod observe_tests {
+    use super::{Registry, unobserved};
+    use eta_ir::container::{Observe, StageProgram, TraceContainer};
+    use eta_ir::op::Op;
+    use eta_ir::registry::Stage;
+    use eta_ir::types::{Dtype, Shape};
+
+    fn reader(name: &str, observe: Option<Observe>) -> TraceContainer {
+        TraceContainer {
+            names: vec![name.to_string()],
+            stages: vec![StageProgram {
+                stage: Stage::Epilogue,
+                ops: vec![Op::Output {
+                    index: 0,
+                    lane: 0,
+                    shape: Shape::matrix(1, 64),
+                    dtype: Dtype::F32,
+                }],
+            }],
+            observe,
+            ..TraceContainer::default()
+        }
+    }
+
+    /// A program reading either score output states what it observes; one
+    /// that states nothing is refused by name, at registration, before it
+    /// binds; a program reading no scores states nothing.
+    #[test]
+    fn a_score_reader_states_what_it_observes() {
+        for name in ["attn.scores", "attn.scores.pages"] {
+            let bare = reader(name, None);
+            let reads = Registry::reads(&bare);
+            let why = unobserved(&reads, &bare).expect_err("a bare score reader is refused");
+            assert_eq!(
+                why.to_string(),
+                "this program reads attention scores but states no observation; build it with \
+                 an SDK that states Observe"
+            );
+            for observe in [Observe::Rows(32), Observe::FireRows] {
+                let stated = reader(name, Some(observe));
+                unobserved(&Registry::reads(&stated), &stated).expect("a stated reader registers");
+            }
+        }
+        let logits = reader("logits", None);
+        unobserved(&Registry::reads(&logits), &logits).expect("no scores read, nothing to state");
+    }
+
+    /// A container built before the observe section (the SDKs' golden
+    /// `text_completion_decode`, unrebuilt) still decodes, binds and
+    /// registers: it reads no scores, so it states nothing.
+    #[test]
+    fn an_old_container_still_registers() {
+        use eta_ir::registry::{Axis, EngineCaps, OutputDecl};
+        let goldens = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../packages/python/inferlet/tests/goldens/eta_containers.txt"
+        ))
+        .expect("the SDKs' golden containers");
+        let hex = goldens
+            .lines()
+            .find(|line| line.starts_with("text_completion_decode "))
+            .and_then(|line| line.split_whitespace().last())
+            .expect("the decode golden");
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).expect("hex"))
+            .collect();
+        let logits = OutputDecl {
+            name: "logits".to_string(),
+            axis: Axis::Row,
+            width: 151_936,
+            dtype: Dtype::F32,
+            layers: 0,
+            readout: true,
+        };
+        let mut registry = Registry::new(std::num::NonZeroUsize::new(4).expect("nonzero"));
+        let registered = registry
+            .register(bytes, vec![vec![logits]], EngineCaps::default())
+            .unwrap_or_else(|why| panic!("the old container registers: {why}"));
+        assert_eq!(registered.bound.container.observe, None);
     }
 }

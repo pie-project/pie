@@ -51,6 +51,7 @@ fn read(name: &str, stage: Stage, lane: u32, shape: Shape, dtype: Dtype) -> Trac
         }],
         externs: Vec::new(),
         inputs: Vec::new(),
+        observe: None,
     }
 }
 

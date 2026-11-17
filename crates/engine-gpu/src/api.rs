@@ -1144,10 +1144,17 @@ impl<B: Host> Gpu<B> {
         let guests = B::guests(self, submission)?;
 
         let mut reads: Vec<Vec<String>> = vec![Vec::new(); submission.lanes.len()];
+        let mut observes: Vec<Option<eta_ir::container::Observe>> =
+            vec![None; submission.lanes.len()];
         for attachment in program_attachments(submission) {
+            let observe = self.programs.observe(attachment.instance);
             for (name, k) in self.programs.reads(attachment.instance) {
-                if let Some(lane) = reads.get_mut((attachment.lane + k) as usize) {
+                let at = (attachment.lane + k) as usize;
+                if let Some(lane) = reads.get_mut(at) {
                     lane.push(name);
+                }
+                if let Some(lane) = observes.get_mut(at) {
+                    *lane = lane.or(observe);
                 }
             }
         }
@@ -1259,6 +1266,7 @@ impl<B: Host> Gpu<B> {
                     Readout::Last | Readout::None => None,
                 },
                 reads: &reads[at],
+                observe: observes[at],
 
                 translation: &lane.kv.translation,
 

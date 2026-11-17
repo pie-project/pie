@@ -4,7 +4,8 @@
 //! (interleaved with two that do not), so the capture table compacts them.
 //! Each capturing lane's one f32 row is a mass a key of the load's context:
 //! a layer's causal softmax over its keys summed over the layer's query
-//! heads, averaged over its last `observe` rows and the model's query heads,
+//! heads, averaged over the rows its program observes (its last `observe`,
+//! or for one lane every row it brings) and the model's query heads,
 //! written over a row of sevens (`into` none) and then added into by a
 //! second layer (`into` some); the final row summed a kv page for the two
 //! lanes that read pages. Contexts below and past a tile of keys, observe
@@ -111,6 +112,14 @@ enum Sum {
     OneHead,
 }
 
+/// The rows capturing lane `lane` observes: the second capturing lane's
+/// program observes the fire's own rows (`FireRows`), the others their last
+/// `observe` (`Rows`).
+fn observed(f: &Fixture, lane: usize, observe: usize) -> usize {
+    let rows = (f.qo[lane + 1] - f.qo[lane]) as usize;
+    if lane == 2 { rows } else { observe.min(rows) }
+}
+
 /// Each capturing lane's key row after both layers, and its page row.
 fn reference(f: &Fixture, context: usize, observe: usize, q_heads: usize, sum: Sum) -> Vec<Vec<f64>> {
     let row = KV_HEADS * HEAD_DIM;
@@ -120,7 +129,8 @@ fn reference(f: &Fixture, context: usize, observe: usize, q_heads: usize, sum: S
         let pages = &f.page_indices[f.page_indptr[lane] as usize..f.page_indptr[lane + 1] as usize];
         let capacity = pages.len() * PAGE;
         let (lo, hi) = (f.qo[lane] as usize, f.qo[lane + 1] as usize);
-        let observed = observe.min(hi - lo);
+        let observed = observed(f, lane, observe);
+        let _ = lo;
         let divisor = match sum {
             Sum::Heads | Sum::OneHead => q_heads,
             Sum::LocalDivisor => Q_HEADS,
@@ -166,10 +176,11 @@ fn agrees(got: &[f32], want: &[f64]) -> Result<f64, String> {
     Ok(worst)
 }
 
-/// The capture table the engine stages: lane, rows, and the bases of its
-/// key row and page row.
-fn table(f: &Fixture, context: usize) -> Vec<i32> {
+/// The capture table the engine stages: lane, rows, the bases of its key
+/// row and page row, its observed rows and the observed rows before it.
+fn table(f: &Fixture, context: usize, observe: usize) -> Vec<i32> {
     let mut page_row = 0;
+    let mut before = 0;
     let pages = context.div_ceil(PAGE) as i32;
     f.lanes
         .iter()
@@ -183,7 +194,9 @@ fn table(f: &Fixture, context: usize) -> Vec<i32> {
             } else {
                 -1
             };
-            [lane as i32, f.qo[lane], f.qo[lane + 1], (row * context) as i32, page]
+            let rows = observed(f, lane, observe) as i32;
+            before += rows;
+            [lane as i32, f.qo[lane], f.qo[lane + 1], (row * context) as i32, page, rows, before - rows]
         })
         .collect()
 }
@@ -205,7 +218,11 @@ fn case(gpu: &mut Gpu, context: usize, observe: usize, q_heads: usize, workgroup
     let pi = gpu.up_u32(&f.page_indices);
     let pp = gpu.up_u32(&f.page_indptr);
     let pos = gpu.up_i32(&f.positions);
-    let capture_table = table(&f, context);
+    let capture_table = table(&f, context, observe);
+    let observed_rows: u32 = capture_table
+        .chunks(TABLE_INTS as usize)
+        .map(|entry| entry[5] as u32)
+        .sum();
     let capturing = (capture_table.len() / TABLE_INTS as usize) as u32;
     let page_rows = capture_table.chunks(TABLE_INTS as usize).filter(|e| e[4] >= 0).count();
     let tb = gpu.up_i32(&capture_table);
@@ -227,7 +244,7 @@ fn case(gpu: &mut Gpu, context: usize, observe: usize, q_heads: usize, workgroup
     // One row past the capturing lanes', which no capture writes.
     let held_rows = capturing as usize + 1;
     let scores = gpu.up_f32(&vec![7.0; held_rows * context]);
-    let stats_n = stats_floats(capturing, Q_HEADS as u32, observe as u32) as usize;
+    let stats_n = stats_floats(observed_rows, Q_HEADS as u32) as usize;
     let stats = gpu.up_f32(&vec![0.0; stats_n]);
     let pages_w = context.div_ceil(PAGE);
     let pages = gpu.up_f32(&vec![7.0; (page_rows + 1) * pages_w]);
@@ -241,6 +258,7 @@ fn case(gpu: &mut Gpu, context: usize, observe: usize, q_heads: usize, workgroup
                     positions: t(pos, rows, 1, Dtype::I32),
                     table: t(tb, capturing as usize, TABLE_INTS as usize, Dtype::I32),
                     capturing,
+                    observed: observed_rows,
                     stats: t(stats, 1, stats_n, Dtype::F32),
                     scores: keys_t,
                 },
@@ -249,7 +267,6 @@ fn case(gpu: &mut Gpu, context: usize, observe: usize, q_heads: usize, workgroup
                 KV_HEADS as u32,
                 q_heads as u32,
                 SCALE as f32,
-                observe as u32,
                 layer > 0,
                 workgroup_bytes,
             )?;

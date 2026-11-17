@@ -20,7 +20,7 @@ import * as witSession from 'pie:inferlet/session@0.3.0';
 import { Audio, Image } from '../media.js';
 import { Builder, DslChannel } from './builder.js';
 import { kernel } from './intrinsics.js';
-import { Axis, Dtype, OutputDecl, Port, Shape, Stage, numel, portName, shapeOf } from './ir.js';
+import { Axis, Dtype, Observe, OutputDecl, Port, Shape, Stage, numel, portName, shapeOf } from './ir.js';
 import { ChannelState, TraceError } from './trace.js';
 import { ConstData, ConstLike, Tensor, constData, reshape, unpackElems } from './value.js';
 
@@ -501,6 +501,7 @@ export class ForwardPass {
   private lanes: WorkingSet[] = [];
   private foldAll: Channel | undefined;
   private switches: [number, string, string][] = [];
+  private observed: Observe | undefined;
 
   constructor() {
     this.wit = new witForward.ForwardPass();
@@ -681,9 +682,20 @@ export class ForwardPass {
     return out;
   }
 
+  /** State what this pass's program observes where it reads attention
+   * scores (`attn.scores`, `attn.scores.pages`): its lanes' last `rows`
+   * query rows (`{ rows }`) or every row a lane brings (`'fire-rows'`). A
+   * program that reads scores states it, or the runtime refuses it at
+   * registration. Construction-only. */
+  observe(observe: Observe): void {
+    if (this.programAttached) throw new InferletError('the observation is construction-only');
+    this.observed = observe;
+  }
+
   attachProgram(): void {
     if (this.programAttached) return;
     const builder = new Builder(this.vocab, this.pageSize);
+    if (this.observed !== undefined) builder.observe(this.observed);
     const lanes = Math.max(
       1,
       this.lanes.length,
