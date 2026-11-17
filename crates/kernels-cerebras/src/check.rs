@@ -90,6 +90,78 @@ pub fn code_bytes(r: &code::Reached) -> i64 {
     b
 }
 
+/// Kinds of PE the fit misses alike, each refitted on its own linked images: its file, the
+/// bytes its images held past [`code_bytes`]' estimate (their mean miss, added to its code),
+/// and the estimate's worst miss on them after (bytes; [`miss`]). Provenance: GENERIC.md, "A
+/// tiled PE's memory, refitted".
+/// A kind of PE the fit misses alike, refitted on its own linked images ([`CODE_KINDS`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CodeKind {
+    /// Its file.
+    pub file: &'static str,
+    /// Text its file holds (`None`: any), telling a variant of the file apart.
+    pub holding: Option<&'static str>,
+    /// The bytes its images held past the estimate (their mean miss), added to its code.
+    pub bytes: i64,
+    /// The estimate's worst miss below its images after (bytes; [`miss`]).
+    pub miss: i64,
+}
+
+/// Kinds of PE the fit misses alike, each refitted on its own linked images (cslc for the
+/// system; GENERIC.md, "A tiled PE's memory, refitted"), the first a file's matches. A tiled
+/// program's top-tile PE (`tpe.csl`) holds ~340 B of data and 570-1,000 B of code past the
+/// estimate, by whether its op table streams in (`D_progw`) or is held (and ~80 B more in a
+/// combined program than alone); its tape PE (`ttape.csl`) ~510 B in all:
+///
+/// | kind | linked images (estimate's code, its data's; the ELF's) | miss after |
+/// |---|---|---|
+/// | `tpe.csl` op table streamed | klein 1024² VAE tile 1,4 at (64, 256) 43,968 and gated 43,984; tile 2,2 at (128, 512) 44,712; tile 2,4 at (32, 256) tight 48,128, gated 48,144, in the combined 1024² program 48,224 | 73 B |
+/// | `tpe.csl` op table held | klein tile 1,4 at (64, 256) 47,424; tile 2,2 at (128, 512) 48,172; flux2-mini's VAE tile 1,1 31,656 | 12 B |
+/// | `ttape.csl` | klein tile 2,4 47,872, gated 47,888, in the combined 1024² program 47,920 | 15 B |
+pub const CODE_KINDS: &[CodeKind] = &[
+    CodeKind {
+        file: "tpe.csl",
+        holding: Some("D_progw"),
+        bytes: 952,
+        miss: 73,
+    },
+    CodeKind {
+        file: "tpe.csl",
+        holding: None,
+        bytes: 1_329,
+        miss: 12,
+    },
+    CodeKind {
+        file: "ttape.csl",
+        holding: None,
+        bytes: 512,
+        miss: 15,
+    },
+];
+
+/// `file`'s kind ([`CODE_KINDS`]), its text `text` where known.
+fn kind_of(file: &str, text: Option<&str>) -> Option<&'static CodeKind> {
+    let base = file.rsplit('/').next().unwrap_or(file);
+    CODE_KINDS.iter().find(|k| {
+        k.file == base
+            && k.holding
+                .is_none_or(|h| text.is_some_and(|t| t.contains(h)))
+    })
+}
+
+/// The code a kind of PE holds past the fit's ([`CODE_KINDS`]; none for a kind not refitted).
+#[must_use]
+pub fn kind_code(files: &BTreeMap<String, String>, file: &str) -> i64 {
+    kind_of(file, files.get(file).map(String::as_str)).map_or(0, |k| k.bytes)
+}
+
+/// The estimate's worst miss below a PE of `file`'s linked image (bytes), its text `text`:
+/// its kind's ([`CODE_KINDS`]), else the fit's over every image ([`UNDER`]).
+#[must_use]
+pub fn miss(file: &str, text: Option<&str>) -> i64 {
+    kind_of(file, text).map_or(UNDER, |k| k.miss)
+}
+
 /// A PE's memory: `file`'s at `params`, its imports read from `files` (what the check finds of
 /// each kind of PE, for a search to price a candidate's PEs alike).
 #[must_use]
@@ -100,7 +172,7 @@ pub fn pe_bytes(
 ) -> PeBytes {
     PeBytes {
         data: held(files, file, params, 0).data,
-        code: code_bytes(&code::reached(files, file, params)),
+        code: code_bytes(&code::reached(files, file, params)) + kind_code(files, file),
     }
 }
 
@@ -909,7 +981,7 @@ fn placed_with(
             rep.errors.push(h);
         }
         let reached = code::reached(files, f, &params);
-        let code = code_bytes(&reached);
+        let code = code_bytes(&reached) + kind_code(files, f);
         rep.kinds.push((f.clone(), p.clone(), h.data, reached));
         if rep
             .fullest
@@ -934,9 +1006,9 @@ fn placed_with(
                 "`{f}`: {d} B data + ~{c} B code past a PE's {PE_BYTES} B by more than the \
                  estimate's {OVER} B miss"
             ));
-        } else if !pe.fits() {
+        } else if pe.total() + miss(&f, files.get(&f).map(String::as_str)) > PE_BYTES {
             rep.warnings.push(format!(
-                "`{f}`: {d} B data + ~{c} B code within the estimate's {UNDER} B miss of a PE's \
+                "`{f}`: {d} B data + ~{c} B code within the estimate's miss of a PE's \
                  {PE_BYTES} B: it may not link"
             ));
         }

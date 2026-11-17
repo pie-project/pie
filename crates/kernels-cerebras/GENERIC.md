@@ -2468,6 +2468,33 @@ milestone's tail.
   - `wafer-compile stream ... --check-all 1` prints every kind of PE's measures, which is a
     refit's input. Before part C this was `check --dir <program> --all 1`.
 
+## A tiled PE's memory, refitted
+
+- **The miss.** The joint choice put klein's 1024² VAE at tile 2,4 with (64, 256) staged
+  channels and block, the op table streamed and the buffers packed tightly: the check's estimate
+  of its `tpe.csl` left 963 B, past the stack's 768 B, but cslc ran out of PE memory linking it
+  in the combined program. The fit's worst miss over every image (`check::UNDER`, 2,437 B) would
+  have refused it, and much that links besides.
+- **Each tiled kind under alike.** Linked for the system (cslc, the ELFs' sections): the tiled
+  top-tile PE holds 340 B of data past the estimate in every image (338 to 342), and 570 to
+  620 B of code where its op table streams in, 983 to 995 B where it is held (the estimate
+  prices the streamed reader's code above the held table's; cslc's is ~300 B below). The tape
+  PE holds ~510 B past it in all. Gating a kernel's `run` on the reading launched (the combined
+  program's) costs 16 B a PE linked (the estimate's 34 B); the combined program's tiled PEs
+  link ~80 B (`tpe.csl`) and ~32 B (`ttape.csl`) above the same gated program alone.
+
+  | kind | linked images, B (estimate, B) | mean miss | worst after |
+  |---|---|---|---|
+  | `tpe.csl`, op table streamed (`D_progw`) | klein 1024² VAE: tile 1,4 at (64, 256) 43,968 (43,028), gated 43,984 (43,062); tile 2,2 at (128, 512) 44,712 (43,796); tile 2,4 at (32, 256) tight 48,128 (47,165), gated 48,144 (47,199), in the combined 1024² program 48,224 (47,199) | 952 | 73 |
+  | `tpe.csl`, op table held | klein: tile 1,4 at (64, 256) 47,424 (46,083); tile 2,2 at (128, 512) 48,172 (46,851); flux2-mini's VAE, tile 1,1: 31,656 (30,331) | 1,329 | 12 |
+  | `ttape.csl` | klein tile 2,4: 47,872 (47,359), gated 47,888 (47,393), in the combined 1024² program 47,920 (47,393) | 512 | 15 |
+
+- **The refit** (`check::CODE_KINDS`): each kind's mean miss added to its code, and its worst
+  miss after (`check::miss`) the margin a choice keeps past the stack's room; a kind not refitted
+  keeps `UNDER`. The check warns at a kind's own miss. Klein's tile 2,4 at (64, 256) tight and
+  streamed, gated: 49,175 B estimated (it does not link); at (32, 256) 48,151 B (linked in the
+  combined 1024² program 48,224 B, 928 B of stack).
+
 ## The GEMM search's time
 
 - **What it cost.** Klein's text program took 251 s to compile on load. Most of
