@@ -690,6 +690,7 @@ where
             residency,
             device: &self.boot,
             handed: self.handed.take(),
+            check: None,
         })
         .map_err(fault)?;
         self.programs.load(&place(&shell)).map_err(refusal)?;
