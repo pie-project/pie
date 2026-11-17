@@ -108,6 +108,8 @@ pub(super) struct Arming {
     /// away.
     profiled: usize,
     ballot: Ballot,
+    /// When arming began.
+    began: std::time::Instant,
 }
 
 impl Arming {
@@ -1465,6 +1467,7 @@ impl Shell {
             from_record: self.bodies_from_record || self.rearming,
             capped: !(self.bodies_from_record && self.arming_at_load),
             took: Some(0),
+            began: std::time::Instant::now(),
             profiled: self.budget.buckets.len(),
             ballot: Ballot::open(&self.device),
         })
@@ -1791,7 +1794,10 @@ impl Shell {
             refusals: stats.tally.refusals,
             seal,
         };
-        eprintln!("engine-cuda: {report}");
+        eprintln!(
+            "engine-cuda: {report}; armed in {:.1} s",
+            st.began.elapsed().as_secs_f64()
+        );
         // The lattice the bodies armed over against the profile's: fewer
         // buckets is the allowance binding, each fire padded further.
         eprintln!(
