@@ -995,6 +995,24 @@ impl Shell {
         Ok(self.programs.instance_mut(instance_id))
     }
 
+    /// The engine's standing guest bytes: what the widest fire lays for the
+    /// programs bound now, under its carve
+    /// ([`crate::program::Plane::standing`]).
+    #[must_use]
+    pub fn guest_standing(&self) -> u64 {
+        self.programs.standing()
+    }
+
+    /// [`Self::guest_standing`] once an instance of `program` at `extents`
+    /// is bound too.
+    pub fn guest_standing_after(
+        &self,
+        program: engine::ProgramId,
+        extents: eta_exec::Extents,
+    ) -> Result<u64> {
+        self.programs.standing_after(program, extents)
+    }
+
     pub fn close_program_instance(&mut self, instance_id: engine::InstanceId) -> Result<()> {
         self.reap_landed_guests()?;
         self.programs.close_instance(instance_id)

@@ -746,6 +746,16 @@ impl Engine for Rank {
         }
     }
 
+    fn standing_after(&self, binding: &InstanceBinding) -> EngineResult<u64> {
+        match self.group.ranks[self.rank].try_lock().ok() {
+            Some(rank) => rank.standing_after(binding),
+            None => Err(Error::Program(
+                "a rank is busy: a bind's standing guest bytes are asked between frames"
+                    .to_string(),
+            )),
+        }
+    }
+
     fn ring_facts(
         &self,
         registration: &ChannelRegistration,

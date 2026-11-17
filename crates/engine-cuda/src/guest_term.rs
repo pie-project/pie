@@ -3,7 +3,9 @@
 //! (program, extents) pairs bound, each laid as a flight at the power of
 //! two over its members. The engine's own placement until its guests'
 //! scratch moves into their instances' state (`engine::GuestState`); the
-//! runtime sets nothing of the span aside for it.
+//! engine states its widest fire's as its standing guest bytes, which the
+//! runtime sets aside below every rung's carve
+//! ([`crate::program::Plane::standing`]).
 
 /// The lanes a flight of `members` is laid for.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]

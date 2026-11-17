@@ -1236,6 +1236,7 @@ impl Engine for Cuda {
                 },
             )
             .map_err(fault)?;
+        let standing_guest_bytes = shell.guest_standing();
         let landed = adapter_of(shell, binding.program, id, &seeds);
         let bound = match landed {
             Ok(bound) => bound,
@@ -1251,8 +1252,17 @@ impl Engine for Cuda {
             id,
             program: binding.program,
             geometry: binding.geometry,
-            standing_guest_bytes: 0,
+            standing_guest_bytes,
         })
+    }
+
+    fn standing_after(&self, binding: &InstanceBinding) -> EngineResult<u64> {
+        match self.shell.as_ref() {
+            Some(shell) => shell
+                .guest_standing_after(binding.program, extents(&binding.extents))
+                .map_err(fault),
+            None => Ok(0),
+        }
     }
 
     fn close_instance(&mut self, id: InstanceId) -> EngineResult<u64> {
@@ -1261,10 +1271,10 @@ impl Engine for Cuda {
         if let Some(held) = held {
             shell.release_adapter(held);
         }
-        // CUDA lays its guests' tables in the fire's span: it keeps none
-        // standing.
+        // CUDA lays its guests' tables in the fire's span, under its carve:
+        // what the widest fire lays stands below every rung's.
         shell.close_program_instance(id).map_err(fault)?;
-        Ok(0)
+        Ok(shell.guest_standing())
     }
 
     fn close_channel(&mut self, id: ChannelId) -> EngineResult<()> {
