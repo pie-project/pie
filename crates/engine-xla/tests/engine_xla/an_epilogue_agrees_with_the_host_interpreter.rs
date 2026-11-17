@@ -1072,6 +1072,8 @@ fn registration_compiles_every_pass(device: &Device) {
         read.readout,
         read.dtype,
     )];
+    // The load's declared planes: the plane read, as a fire lands it.
+    stages.planes = vec![(read.name.clone(), read.dtype)];
     // A program registers on a served model, its load's ladder sealed:
     // registration compiles are no ladder misses.
     device.seal();

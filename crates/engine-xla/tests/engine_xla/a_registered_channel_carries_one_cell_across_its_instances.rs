@@ -179,7 +179,7 @@ fn a_registered_channel_carries_one_cell_across_its_instances() {
 
     let x = bind(&mut rig, first, true);
     let y = bind(&mut rig, second, false);
-    let (device0, _) = rig.engine.guest_passes();
+    let device0 = rig.engine.guest_passes();
     let mut counts = vec![pass(&mut rig, x, page), pass(&mut rig, x, page)];
     counts.push(pass(&mut rig, y, page));
 
@@ -220,7 +220,7 @@ fn a_registered_channel_carries_one_cell_across_its_instances() {
     let z = bind(&mut rig, first, true);
     counts.push(pass(&mut rig, z, page));
     counts.push(pass(&mut rig, x, page));
-    let (device1, interpreted) = rig.engine.guest_passes();
+    let device1 = rig.engine.guest_passes();
 
     let want: Vec<u32> = (1..=counts.len() as u32).map(|k| SEED[1] + k).collect();
     assert_eq!(
@@ -230,7 +230,7 @@ fn a_registered_channel_carries_one_cell_across_its_instances() {
     assert_eq!(
         device1 - device0,
         counts.len() as u64,
-        "every pass ran on the device ({interpreted} interpreted)"
+        "every pass ran on the device"
     );
     eprintln!("a registered counter carried on the device across three instances: {counts:?}");
 }

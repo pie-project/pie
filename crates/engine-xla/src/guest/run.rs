@@ -89,6 +89,9 @@ pub struct Stages {
     /// Every plane a fire returns, as a stage reads it (`Shell::plane_reads`):
     /// output, rows, width, layers, readout flag, dtype.
     pub plane_reads: Vec<(String, u32, u32, u32, bool, Dtype)>,
+    /// Every output a fire of the load can return as a plane, by name and
+    /// dtype: a registration's outputs are checked against these.
+    pub planes: Vec<(String, Dtype)>,
 }
 
 /// A rung's stage as a compile thread leaves it.
@@ -177,6 +180,26 @@ impl Stages {
         for at in 0..package.stages.len() {
             let mut combos: Vec<Vec<Read>> = vec![Vec::new()];
             for (name, lane) in lower::outputs(package, at) {
+                // Every output a stage reads is a plane a fire of this load
+                // returns on the device, of the dtype it reads: else the
+                // program is refused here, at its registration, and a pass
+                // never finds an output unbound.
+                let wants: Vec<Dtype> = (package.values.iter())
+                    .filter(|v| {
+                        v.source == ValueOrigin::Output && v.output.as_deref() == Some(&name)
+                    })
+                    .map(|v| v.dtype)
+                    .collect();
+                if !self
+                    .planes
+                    .iter()
+                    .any(|p| p.0 == name && wants.iter().all(|&d| d == p.1))
+                {
+                    return Err(format!(
+                        "stage {at} reads output `{name}` ({wants:?}), which no fire of this load \
+                         returns on the device as that"
+                    ));
+                }
                 let options: Vec<Read> = (self.plane_reads.iter())
                     .filter(|p| p.0 == name)
                     .map(|p| Read {
@@ -189,9 +212,6 @@ impl Stages {
                         dtype: p.5,
                     })
                     .collect();
-                if options.is_empty() {
-                    continue;
-                }
                 combos = combos
                     .into_iter()
                     .flat_map(|c| {

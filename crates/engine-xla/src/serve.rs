@@ -392,6 +392,28 @@ impl Shell {
         self.readouts.iter().copied().collect()
     }
 
+    /// Every output a fire of this load can return as a plane a guest stage
+    /// reads, by name and the dtype the plane lands in (`Shell::planes`: an
+    /// I32 output as I32, any other as F32); a grid's or a wider dtype's
+    /// output lands no plane.
+    #[must_use]
+    pub fn guest_planes(&self) -> Vec<(String, Dtype)> {
+        (self.exports.iter())
+            .filter(|out| {
+                out.grid.is_none()
+                    && matches!(out.decl.dtype, Dtype::Bf16 | Dtype::F32 | Dtype::I32)
+            })
+            .map(|out| {
+                let dtype = if out.decl.dtype == Dtype::I32 {
+                    Dtype::I32
+                } else {
+                    Dtype::F32
+                };
+                (out.decl.name.clone(), dtype)
+            })
+            .collect()
+    }
+
     /// Every plane a traced fire returned, as a guest stage reads it.
     #[must_use]
     pub fn plane_reads(&self) -> Vec<(String, u32, u32, u32, bool, Dtype)> {

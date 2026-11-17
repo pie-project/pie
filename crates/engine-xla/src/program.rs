@@ -1,8 +1,9 @@
 //! The eta program plane, from engine-wgpu's plane without its wgpu device half.
-//! A program whose stages lower to StableHLO (`crate::guest`) runs its
-//! passes on the device (`Plane::fire_guests`), instances of one program
-//! batched into one executable per stage; any other runs in the host
-//! interpreter.
+//! A program runs its passes on the device (`Plane::fire_guests`),
+//! instances of one program batched into one executable per stage; one with
+//! a stage that does not lower to StableHLO (`crate::guest`), or that reads
+//! an output no fire of the load returns on the device, is refused at its
+//! registration.
 #![allow(unsafe_code)]
 
 use std::collections::BTreeMap;
@@ -15,9 +16,7 @@ type Placed = (Arc<ExecPlan>, [u8; 32], Vec<crate::guest::run::Bound>);
 
 use engine::channel::{ChannelId, ChannelRegistration, HostMirror, RegisteredChannel};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
-use eta_exec::{
-    ChannelState, ExecPlan, HostOp, InterpInstance, Interpreted, PassInputs, StepOutcome, Value,
-};
+use eta_exec::{ChannelState, ExecPlan, HostOp, InterpInstance, PassInputs, StepOutcome, Value};
 use eta_ir::registry::{GeometryClass, Port, Stage};
 
 #[derive(Debug)]
@@ -93,7 +92,6 @@ impl Instance {
 #[derive(Default)]
 pub(crate) struct Tally {
     device: AtomicU64,
-    interpreted: AtomicU64,
 }
 
 /// A step's completion: `sink(at, ..)` runs once every hold on it is
@@ -494,6 +492,13 @@ impl Plane {
         self.stages.plane_reads = reads;
     }
 
+    /// Every output a fire of the load can return as a plane, by name and
+    /// dtype (`Shell::guest_planes`): what a registration checks every
+    /// output its program reads against.
+    pub fn seat_planes(&mut self, planes: Vec<(String, poem_ir::Dtype)>) {
+        self.stages.planes = planes;
+    }
+
     /// Registers a program; where every stage lowers (its device form),
     /// compiles every stage for every shape a pass can take on `device`
     /// (`Stages::compile_all`), so no pass compiles: a stage that does not
@@ -515,9 +520,18 @@ impl Plane {
         self.next_program += 1;
         let id = ProgramId(self.next_program);
 
-        let admitted = self.forms.admit(id, &plan.package);
-        if admitted
-            && let (Some(device), Some(form)) = (device, self.forms.get(id).cloned())
+        if !self.forms.admit(id, &plan.package) {
+            let why = self
+                .forms
+                .refusal(id)
+                .map_or_else(String::new, ToString::to_string);
+            self.forms.forget(id);
+            return Err(Refusal::Program(format!(
+                "a stage of program 0x{:016x} does not lower on XLA: {why}",
+                registration.program_hash
+            )));
+        }
+        if let (Some(device), Some(form)) = (device, self.forms.get(id).cloned())
             && let Err(why) =
                 self.stages
                     .compile_all(device, &plan.package, form.key, &form.pooled())
@@ -528,12 +542,7 @@ impl Plane {
                 registration.program_hash
             )));
         }
-        tracing::debug!(
-            program = id.0,
-            device_form = admitted,
-            why = self.forms.refusal(id).map(ToString::to_string),
-            "guest program registered"
-        );
+        tracing::debug!(program = id.0, "guest program registered");
         self.programs.insert(id, Arc::new(plan));
         Ok(id)
     }
@@ -1423,30 +1432,16 @@ impl Plane {
         if on_device > 0 && self.tally.device.fetch_add(on_device, Ordering::AcqRel) == 0 {
             tracing::info!(passes = on_device, "a guest pass ran on the device");
         }
-        // The rest in the interpreter, over the host copy of their rows.
+        // Registration refused every program whose outputs a fire does not
+        // return on the device (`Stages::compile_all`), and every program
+        // with a stage that does not lower: an attachment that did not run
+        // is a fault, not a pass for another path.
         for (at, &(instance, lane)) in attachments.iter().enumerate() {
-            if ran[at] {
-                continue;
-            }
-            let mut outputs: Vec<(String, u32, Value)> = Vec::new();
-            if let (Some(kept), Some(seat)) = (kept, self.instances.get(&instance)) {
-                for (name, k) in seat.plan.outputs() {
-                    let read = kept.lane_value(lane as usize + k as usize, name);
-                    if let Some(value) = read.map_err(Refusal::Program)? {
-                        outputs.push((name.to_string(), k, value));
-                    }
-                }
-            }
-            if let Some(held) = self.instances.get_mut(&instance)
-                && let Err(why) = cells_to_host(held, pool.as_ref())
-            {
-                held.inst.poisoned = true;
-                first_error.get_or_insert(Refusal::Program(why));
-                continue;
-            }
-            let outcome = self.fire_interpreted(instance, &outputs, point);
-            if let Err(why) = outcome {
-                first_error.get_or_insert(why);
+            if !ran[at] {
+                first_error.get_or_insert(Refusal::Program(format!(
+                    "instance {instance} at lane {lane}: its outputs are not on the device in \
+                     this fire, which its registration checked they would be"
+                )));
             }
         }
         match first_error {
@@ -1460,38 +1455,6 @@ impl Plane {
         self.instances
             .get(&instance)
             .is_some_and(|seat| seat.plan.prologue_runs())
-    }
-
-    /// One pass of `instance` in the interpreter, its outputs read as
-    /// `outputs` (name, the pass's lane, value).
-    #[doc(hidden)]
-    pub fn fire_interpreted(
-        &mut self,
-        instance: InstanceId,
-        outputs: &[(String, u32, Value)],
-        at: Stage,
-    ) -> Result<(), Refusal> {
-        let seat = self.instances.get_mut(&instance).ok_or(Refusal::Closed {
-            what: "instance",
-            id: instance.0,
-        })?;
-        let inputs = PassInputs { outputs };
-        let outcome =
-            eta_exec::step_with(&mut seat.inst, &seat.plan, &inputs, &mut Interpreted, at);
-        self.tally.interpreted.fetch_add(1, Ordering::AcqRel);
-        if let Some(live) = &self.live {
-            live.tally(engine::live::Tally::Fallback, 1);
-        }
-        let program = seat.program;
-        match outcome {
-            StepOutcome::Committed => Ok(()),
-            StepOutcome::Blocked(channel) => Err(Refusal::Program(format!(
-                "instance {instance} (program {program}) blocked on channel {channel}"
-            ))),
-            StepOutcome::Faulted(why) => Err(Refusal::Program(format!(
-                "instance {instance} (program {program}) faulted: {why}"
-            ))),
-        }
     }
 
     /// Waits for the in-flight cell `ring`'s next read would find, when
@@ -1514,11 +1477,8 @@ impl Plane {
     }
 
     #[must_use]
-    pub fn tally(&self) -> (u64, u64) {
-        (
-            self.tally.device.load(Ordering::Acquire),
-            self.tally.interpreted.load(Ordering::Acquire),
-        )
+    pub fn tally(&self) -> u64 {
+        self.tally.device.load(Ordering::Acquire)
     }
 
     fn instance_mut(&mut self, id: InstanceId) -> Result<&mut Instance, Refusal> {

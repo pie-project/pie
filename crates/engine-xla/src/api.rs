@@ -187,10 +187,9 @@ impl Xla {
         self.shell.as_mut()
     }
 
-    /// Guest passes so far: those run on the device, those the host
-    /// interpreted.
+    /// Guest passes run on the device so far: every pass a guest takes.
     #[must_use]
-    pub fn guest_passes(&self) -> (u64, u64) {
+    pub fn guest_passes(&self) -> u64 {
         self.programs.tally()
     }
 
@@ -562,6 +561,7 @@ impl Engine for Xla {
         let (rows, sink_row) = shell.pool_geometry();
         self.programs.seat_pool(rows, sink_row);
         self.programs.seat_reads(shell.plane_reads());
+        self.programs.seat_planes(shell.guest_planes());
         // From here a program a fire waits on, a pass the host interprets,
         // is served worse than the load prepared: counted.
         shell.device().report_to(self.live.clone());
