@@ -180,6 +180,17 @@ pub const COPY_DISPATCHES: u32 = 1;
 /// Defined once, in the profile crate, whose search breaks ties by it.
 pub use profile::AGREEMENT;
 
+/// What a backend's rates step (`pie tune --rates`) produced.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Rated {
+    pub device: String,
+    /// The complete profile, its `[rates]` the ones measured.
+    pub file: String,
+    /// The `[rates]` block and its `[provenance]` line alone.
+    pub block: String,
+    pub seconds: f64,
+}
+
 /// The rate a timed fire comes to once its dispatches' launches are off:
 /// `work / (burst_ns − dispatches · launch_ns)`, `burst_ns` one fire's time
 /// (its `dispatches` back to back), `work` its flops, bytes or elements.

@@ -45,6 +45,26 @@ pub struct TuneArgs {
     /// profile search; the profile is not written.
     #[arg(long)]
     pub gemm_only: bool,
+
+    /// Check the estimate the load weighs its top rung by: time a fire at
+    /// each rung width of these models (by name or substring; the smallest
+    /// imported artifact without one), to four times the fire top, through
+    /// the serving path; print the measured and estimated times a rung and
+    /// both picks, and fail where the estimate's pick falls more than the
+    /// stated bound short of the measured best. Writes nothing.
+    #[arg(long, num_args = 0..)]
+    pub check_estimate: Option<Vec<String>>,
+
+    /// With `--check-estimate`: also dissect these rung widths (comma
+    /// separated), each replayed and walked node by node beside the
+    /// estimate's picks.
+    #[arg(long, value_delimiter = ',', requires = "check_estimate")]
+    pub dissect: Vec<u32>,
+
+    /// Run the `[rates]` step alone: measure the device's roofline
+    /// constants (launch, matmul and attention rates, bandwidths, scan).
+    #[arg(long, conflicts_with = "check_estimate")]
+    pub rates: bool,
 }
 
 pub fn run(args: TuneArgs) -> Result<Answer> {
@@ -70,13 +90,6 @@ pub fn run(args: TuneArgs) -> Result<Answer> {
         },
     };
     let backend = all.swap_remove(at);
-    let tune = backend.tune.ok_or_else(|| {
-        anyhow!(
-            "`pie tune` cannot measure {} yet; start from `pie profile dump {}` instead",
-            backend.name,
-            backend.name
-        )
-    })?;
     let dir = crate::paths::pie_home().join("profiles");
     let palette = Palette::for_stream(ui::Stream::Stderr);
     let mut say = |line: &str| eprintln!("{}", palette.dim(line));
@@ -88,22 +101,55 @@ pub fn run(args: TuneArgs) -> Result<Answer> {
     let served_cuda = |artifact: &std::path::Path| {
         worker::backend::served_cuda(artifact, &home).map_err(|e| format!("{e:#}"))
     };
+    let mut check = args.check.clone();
+    check.extend(args.check_estimate.iter().flatten().cloned());
     let req = runtime::engine::profiles::TuneRequest {
         full: args.full,
         profiles: &dir,
         artifacts: &artifacts,
-        check: &args.check,
+        check: &check,
         no_check: args.no_check,
         cache: &cache,
         refit: args.refit,
         gemm_only: args.gemm_only,
+        check_estimate: args.check_estimate.is_some(),
+        dissect: &args.dissect,
+        rates: args.rates,
         #[cfg(feature = "engine-cuda")]
         served_cuda: &served_cuda,
     };
+    // A check of the estimate is a test: it writes nothing.
+    if req.check_estimate {
+        let checked = runtime::engine::profiles::check_estimate(&backend, &req, &mut say)
+            .map_err(|e| anyhow!(e))?;
+        let mut out = String::new();
+        for c in &checked {
+            out.push_str(&c.report);
+        }
+        out.push_str(&format!(
+            "the estimate's pick is within the bound of the measured best for {} model(s)\n",
+            checked.len()
+        ));
+        return Ok(text(out));
+    }
+    if req.rates {
+        let rated =
+            runtime::engine::profiles::rates(&backend, &req, &mut say).map_err(|e| anyhow!(e))?;
+        let head = format!(
+            "{}: rates measured in {:.0} s\n{}",
+            rated.device, rated.seconds, rated.block
+        );
+        return write_profile(&backend, &args, &dir, &rated.device, &rated.file, head).map(text);
+    }
+    let tune = backend.tune.ok_or_else(|| {
+        anyhow!(
+            "`pie tune` cannot measure {} yet; start from `pie profile dump {}` instead",
+            backend.name,
+            backend.name
+        )
+    })?;
     let tuned = tune(&req, &mut say).map_err(|e| anyhow!(e))?;
 
-    let id = profile::id_of(&tuned.device);
-    let path = backend.shelf.user_path(&dir, &tuned.device);
     let mut out = format!("{}: tuned in {:.0} s\n", tuned.device, tuned.seconds);
     for (id, text) in &tuned.lines {
         out.push_str(&format!("  {id}: {text}\n"));
@@ -136,17 +182,39 @@ pub fn run(args: TuneArgs) -> Result<Answer> {
         out.push_str("--gemm-only: the dense GEMM tactics were timed into the user's table; the profile is not written\n");
         return Ok(text(out));
     }
-    if args.dry_run {
-        out.push_str("\n--dry-run: nothing written. The profile:\n\n");
-        out.push_str(&tuned.file);
-        return Ok(text(out));
-    }
-    if failed && !args.force {
+    if failed && !args.force && !args.dry_run {
         bail!(
             "{out}the tuned profile serves slower or reads differently than today's; \
              nothing written (--force writes it anyway)"
         );
     }
+    let mut answer = write_profile(&backend, &args, &dir, &tuned.device, &tuned.file, out)?;
+    if !args.full && !args.dry_run {
+        answer.push_str(
+            "This was the quick grid; run `pie tune --full` for a profile you contribute.\n",
+        );
+    }
+    Ok(text(answer))
+}
+
+/// Write `file`, the profile of `device`, to the user's shelf (or, with
+/// `--dry-run`, print it), the previous one kept beside it; `out` is what
+/// the run says so far, the answer's head.
+fn write_profile(
+    backend: &runtime::engine::profiles::Backend,
+    args: &TuneArgs,
+    dir: &std::path::Path,
+    device: &str,
+    file: &str,
+    mut out: String,
+) -> Result<String> {
+    if args.dry_run {
+        out.push_str("\n--dry-run: nothing written. The profile:\n\n");
+        out.push_str(file);
+        return Ok(out);
+    }
+    let id = profile::id_of(device);
+    let path = backend.shelf.user_path(dir, device);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -158,7 +226,7 @@ pub fn run(args: TuneArgs) -> Result<Answer> {
             ui::short_path(&kept)
         ));
     }
-    std::fs::write(&path, &tuned.file)?;
+    std::fs::write(&path, file)?;
     out.push_str(&format!(
         "wrote {}; every load on this device now runs it.\n\
          Consider contributing it:\n    \
@@ -169,10 +237,5 @@ pub fn run(args: TuneArgs) -> Result<Answer> {
         ui::short_path(&path),
         backend.name
     ));
-    if !args.full {
-        out.push_str(
-            "This was the quick grid; run `pie tune --full` for a profile you contribute.\n",
-        );
-    }
-    Ok(text(out))
+    Ok(out)
 }

@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::caps::Capabilities;
 
 pub mod armed;
+pub mod check;
 pub mod rung;
 pub mod top;
 

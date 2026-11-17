@@ -19,7 +19,26 @@ pub struct Backend {
     /// Measure this machine's device and write its profile: `pie tune`.
     /// `None` where the backend cannot tune yet.
     pub tune: Option<Tune>,
+    /// Measure the device's `[rates]` alone: `pie tune --rates`. `None`
+    /// where the engine has no rates step.
+    pub rates: Option<Rates>,
+    /// The engine's loads of one model for the check of the estimate
+    /// (`engine::load::check`): `pie tune --check-estimate`. `None` where
+    /// the engine offers none.
+    pub bench: Option<BenchOf>,
 }
+
+/// `pie tune --rates` for one backend.
+pub type Rates =
+    fn(&TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<engine::rates::Rated, String>;
+
+/// A backend's loads of the model of `artifact` (its deployment named) for
+/// the check of the estimate.
+pub type BenchOf = for<'a> fn(
+    &'a TuneRequest<'a>,
+    artifact: &'a Path,
+    deployment: &'a str,
+) -> Result<Box<dyn engine::load::check::Bench + 'a>, String>;
 
 /// `pie tune` for one backend.
 pub type Tune = fn(&TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String>;
@@ -44,6 +63,13 @@ pub struct TuneRequest<'a> {
     /// Time only the dense GEMM tactics the checked models' served loads
     /// arm, with no profile search (CUDA).
     pub gemm_only: bool,
+    /// Check the estimate alone: time the check models' fires at each rung
+    /// width and hold the estimate's pick to the measured best.
+    pub check_estimate: bool,
+    /// With `check_estimate`: rung widths dissected beside the picks.
+    pub dissect: &'a [u32],
+    /// Run the `[rates]` step alone.
+    pub rates: bool,
     /// The engine boot and load request `pie serve` makes for an artifact,
     /// which the tune loads to time the GEMM products serving runs.
     #[cfg(feature = "engine-cuda")]
@@ -68,11 +94,6 @@ pub struct Tuned {
 
 /// The check models among the artifacts stamped for `backend`: those
 /// `req.check` names, or the smallest.
-#[cfg(any(
-    feature = "engine-cuda",
-    feature = "vulkan",
-    all(feature = "metal", target_vendor = "apple")
-))]
 fn pick_models(
     backend: &str,
     req: &TuneRequest<'_>,
@@ -82,6 +103,14 @@ fn pick_models(
     }
     let found = artifacts(req.artifacts, backend);
     if req.check.is_empty() {
+        if found.is_empty() && req.check_estimate {
+            return Err(format!(
+                "a check of the estimate needs a model stamped for {backend}, and none under {} \
+                 is; make one with the import `pie serve` runs, `pie model import <its source, \
+                 e.g. Qwen/Qwen3-0.6B>`",
+                req.artifacts.display()
+            ));
+        }
         return Ok(found.into_iter().take(1).collect());
     }
     let mut picked = Vec::new();
@@ -106,11 +135,6 @@ fn pick_models(
 
 /// The `.zt` artifacts under `store` stamped for `backend`, as (path,
 /// deployment), smallest file first.
-#[cfg(any(
-    feature = "engine-cuda",
-    feature = "vulkan",
-    all(feature = "metal", target_vendor = "apple")
-))]
 fn artifacts(store: &Path, backend: &str) -> Vec<(std::path::PathBuf, String)> {
     let mut out: Vec<(u64, std::path::PathBuf, String)> = Vec::new();
     let Ok(dirs) = std::fs::read_dir(store) else {
@@ -136,6 +160,59 @@ fn artifacts(store: &Path, backend: &str) -> Vec<(std::path::PathBuf, String)> {
     }
     out.sort_by_key(|(bytes, ..)| *bytes);
     out.into_iter().map(|(_, p, d)| (p, d)).collect()
+}
+
+/// `pie tune --rates`: the backend's rates step, refused by name where the
+/// engine has none.
+pub fn rates(
+    backend: &Backend,
+    req: &TuneRequest<'_>,
+    say: &mut dyn FnMut(&str),
+) -> Result<engine::rates::Rated, String> {
+    let step = backend.rates.ok_or_else(|| {
+        format!(
+            "`pie tune --rates` measures a device's [rates] by its engine's rates step, and \
+             engine-{} has none",
+            backend.name
+        )
+    })?;
+    step(req, say)
+}
+
+/// `pie tune --check-estimate`: the check of the estimate
+/// (`engine::load::check`) on each check model through the backend's
+/// bench, refused by name where the engine offers none. Every model is
+/// checked before any failure is returned.
+pub fn check_estimate(
+    backend: &Backend,
+    req: &TuneRequest<'_>,
+    say: &mut dyn FnMut(&str),
+) -> Result<Vec<engine::load::check::Checked>, String> {
+    let bench_of = backend.bench.ok_or_else(|| {
+        format!(
+            "`pie tune --check-estimate` times fires through its engine's check bench \
+             (engine::load::check::Bench), and engine-{} offers none",
+            backend.name
+        )
+    })?;
+    let models = pick_models(backend.name, req)?;
+    let mut checked = Vec::new();
+    let mut failed = Vec::new();
+    for (artifact, deployment) in &models {
+        say(&format!("check of the estimate: {deployment}"));
+        let outcome = bench_of(req, artifact, deployment)
+            .and_then(|mut bench| engine::load::check::check(&mut *bench, req.dissect, say));
+        match outcome {
+            Ok(c) if c.passes() => checked.push(c),
+            Ok(c) => failed.push(c.failure()),
+            Err(why) => failed.push(format!("{deployment}: {why}")),
+        }
+    }
+    if failed.is_empty() {
+        Ok(checked)
+    } else {
+        Err(failed.join("\n"))
+    }
 }
 
 /// A backend's tune output as [`Tuned`]: each backend has its own type, with
@@ -226,6 +303,8 @@ pub fn backends() -> Vec<Backend> {
         probe: || engine_cuda::chip::probe(0),
         resolve: engine_cuda::chip::resolve,
         tune: Some(tune_cuda),
+        rates: None,
+        bench: None,
     });
     #[cfg(feature = "vulkan")]
     out.push(Backend {
@@ -235,6 +314,8 @@ pub fn backends() -> Vec<Backend> {
         probe: engine_vulkan::chip::probe,
         resolve: engine_vulkan::chip::resolve_facts,
         tune: Some(tune_vulkan),
+        rates: None,
+        bench: None,
     });
     #[cfg(feature = "xla")]
     out.push(Backend {
@@ -246,6 +327,8 @@ pub fn backends() -> Vec<Backend> {
         probe: || None,
         resolve: |kind, _, profiles| engine_xla::chip::resolve(kind, profiles),
         tune: None,
+        rates: None,
+        bench: None,
     });
     #[cfg(feature = "metal")]
     out.push(Backend {
@@ -258,6 +341,8 @@ pub fn backends() -> Vec<Backend> {
         tune: Some(tune_metal),
         #[cfg(not(target_vendor = "apple"))]
         tune: None,
+        rates: None,
+        bench: None,
     });
     out
 }
