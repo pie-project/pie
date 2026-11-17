@@ -1191,9 +1191,24 @@ impl SchedulerHandle {
                 && crate::planner::planner_of(pid)
                     .is_some_and(|planner| planner.suspend_for_room(pid))
         };
-        let (registered, _, bound) =
-            crate::store::roles::bind_when_resident(pid, lane_bind, resident, grown, room, suspend)
-                .await?;
+        // Waiting, it is a waiter in the planner's queue: idle cache goes
+        // first, then a resident is parked for it, as for a restore short
+        // of room for its roles.
+        let planned = |run: u32, pieces: u32| async move {
+            let planner = crate::planner::planner_of(pid)
+                .ok_or_else(|| "its process has no planner".to_string())?;
+            crate::inferlet::process::said(
+                "bind: room for its guest state",
+                pid,
+                planner.wait_bind_room(pid, run, pieces),
+            )
+            .await
+            .map_err(|why| why.to_string())
+        };
+        let (registered, _, bound) = crate::store::roles::bind_when_resident(
+            pid, lane_bind, resident, grown, room, suspend, planned,
+        )
+        .await?;
         Ok((registered, bound))
     }
 

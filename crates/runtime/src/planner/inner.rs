@@ -224,7 +224,8 @@ impl Inner {
                 continue;
             }
             match &waiter.kind {
-                WaitKind::Allocation { .. } => {
+                // A bind short of room asks as an admission does.
+                WaitKind::Allocation { .. } | WaitKind::BindRoom { .. } => {
                     allocation = Some(key);
                     break;
                 }

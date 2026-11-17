@@ -223,6 +223,12 @@ impl ResidencyPlanner {
                         WaitKind::Restore { demand } => {
                             format!("restore kv={} rs={}", demand.kv_pages, demand.rs)
                         }
+                        WaitKind::BindRoom {
+                            run,
+                            pieces,
+                            served,
+                            ..
+                        } => format!("bind room {pieces} runs of {run} served={served}"),
                     };
                     format!("{key:?} pid={} {kind}", waiter.pid)
                 })
