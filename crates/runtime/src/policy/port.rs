@@ -275,6 +275,8 @@ enum State {
 /// What the port keeps of a live process.
 #[derive(Debug, Clone)]
 struct Proc {
+    /// The runtime's process (a restart's is new).
+    pid: ProcessId,
     state: State,
     session: Option<String>,
     /// What its fires mapped in from the cache, once one has looked.
@@ -316,6 +318,46 @@ struct Port {
     /// The policy loaded, to load again if its successor does not load.
     loaded: Option<(String, Vec<u8>)>,
     version: u64,
+    /// The schedule and retention columns as the rows left them.
+    columns: Columns,
+}
+
+/// The worker's columns: each process's row (by its client's id), and the
+/// column's default.
+#[derive(Default)]
+struct Columns {
+    priority: HashMap<ProcessId, i64>,
+    priority_default: Option<i64>,
+    hold: HashMap<ProcessId, bool>,
+    hold_default: Option<bool>,
+    retention: HashMap<(ProcessId, Option<u32>), i64>,
+    retention_default: Option<i64>,
+}
+
+/// A column's rows and default into `rows` and `default`; keys that name
+/// no process this worker could hold are passed over.
+fn apply<K, V, R: std::hash::Hash + Eq>(
+    delta: plex_host::host::ColumnDelta<K, V>,
+    rows: &mut HashMap<R, V>,
+    default: &mut Option<V>,
+    key: impl Fn(K) -> Option<R>,
+) -> bool {
+    let changed = !delta.rows.is_empty() || delta.default.is_some();
+    for (k, row) in delta.rows {
+        let Some(k) = key(k) else { continue };
+        match row {
+            Some(v) => {
+                rows.insert(k, v);
+            }
+            None => {
+                rows.remove(&k);
+            }
+        }
+    }
+    if let Some(d) = delta.default {
+        *default = d;
+    }
+    changed
 }
 
 fn run(host: Host, loaded: Option<(String, Vec<u8>)>, events: Receiver<Event>) {
@@ -332,6 +374,7 @@ fn run(host: Host, loaded: Option<(String, Vec<u8>)>, events: Receiver<Event>) {
         offloaded: HashMap::new(),
         loaded,
         version: 0,
+        columns: Columns::default(),
     };
     loop {
         let first = match events.recv_timeout(LOOK) {
@@ -398,6 +441,7 @@ impl Port {
                 if let Some(proc) = self.procs.get_mut(&id) {
                     // A restart after a reclaim: the same process, computed
                     // again, as a preemption by the host is.
+                    proc.pid = pid;
                     proc.restarts += 1;
                     proc.state = State::Paused;
                     host.paused(&id.to_string(), "host");
@@ -431,6 +475,7 @@ impl Port {
                     Proc {
                         state: State::Waiting,
                         session,
+                        pid,
                         cached_tokens: None,
                         prompt_rows: 0,
                         prompt_tokens: None,
@@ -752,16 +797,49 @@ impl Port {
             tracing::debug!(%key, ?value, "worker policy note");
             super::publish(key, value);
         }
-        let rows = delta.schedule_priority.rows.len()
-            + delta.schedule_hold.rows.len()
-            + delta.retention_priority.rows.len()
-            + delta.retention_tiers.rows.len();
-        if rows > 0 || !delta.terminate.is_empty() {
+        let pid = |id: String| ProcessId::from_str(&id).ok();
+        let c = &mut self.columns;
+        let scheduled = apply(
+            delta.schedule_priority,
+            &mut c.priority,
+            &mut c.priority_default,
+            pid,
+        ) | apply(delta.schedule_hold, &mut c.hold, &mut c.hold_default, pid);
+        if scheduled {
             tracing::debug!(
-                rows,
-                terminate = delta.terminate.len(),
-                "worker policy rows"
+                priority = c.priority.len(),
+                hold = c.hold.len(),
+                hold_default = ?c.hold_default,
+                "schedule rows installed"
             );
+            schedule::install(Some(schedule::Table::new(
+                c.priority.clone(),
+                c.priority_default,
+                c.hold.clone(),
+                c.hold_default,
+            )));
+        }
+        let kept = apply(
+            delta.retention_priority,
+            &mut c.retention,
+            &mut c.retention_default,
+            |(id, tokens): (String, Option<u32>)| Some((pid(id)?, tokens)),
+        );
+        if kept {
+            let mut steps: HashMap<ProcessId, Vec<(Option<u64>, i64)>> = HashMap::new();
+            for (&(owner, tokens), &key) in &c.retention {
+                steps
+                    .entry(owner)
+                    .or_default()
+                    .push((tokens.map(u64::from), key));
+            }
+            retention::install(Some(retention::Table::new(steps, c.retention_default)));
+        }
+        for (id, reason) in delta.terminate {
+            let Some(proc) = pid(id).and_then(|id| self.procs.get(&id)) else {
+                continue;
+            };
+            process::terminate_by(proc.pid, Err(reason), By::Policy);
         }
     }
 

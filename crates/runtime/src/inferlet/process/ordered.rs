@@ -153,6 +153,13 @@ impl State {
                 return;
             };
             let waiter = self.waiters.swap_remove(index);
+            tracing::trace!(
+                target: "pie::admission",
+                pid = %waiter.pid,
+                key = schedule.as_ref().map_or(0, |s| s.key(waiter.pid)),
+                waiting = self.waiters.len(),
+                "granted"
+            );
             if waiter.granted.send(()).is_ok() {
                 self.permits -= 1;
             }
@@ -228,16 +235,16 @@ mod tests {
         let _schedule = schedule::TEST_LOCK.write().await;
         let pids = [pid(1), pid(2), pid(3), pid(4)];
         let keys = HashMap::from([(pid(3), 10), (pid(2), 5)]);
-        schedule::install(Some(Table::new(keys, None)));
+        schedule::install(Some(Table::new(keys, None, HashMap::new(), None)));
         assert_eq!(
             grant_order(&pids).await,
             [pid(3), pid(2), pid(1), pid(4)],
             "highest key first, then arrival"
         );
 
-        // A floor of 1 holds every unnamed process until it is named.
-        let keys = HashMap::from([(pid(4), 1)]);
-        schedule::install(Some(Table::new(keys, Some(1))));
+        // A hold default holds every process its own row does not release.
+        let holds = HashMap::from([(pid(4), false)]);
+        schedule::install(Some(Table::new(HashMap::new(), None, holds, Some(true))));
         let semaphore = OrderedSemaphore::new("test", 1, true);
         let held = tokio::spawn({
             let semaphore = Arc::clone(&semaphore);
@@ -246,12 +253,13 @@ mod tests {
         let named = Arc::clone(&semaphore).acquire_owned(pid(4)).await;
         drop(named);
         tokio::time::sleep(Duration::from_millis(10)).await;
-        assert!(!held.is_finished(), "below the floor is held");
-        schedule::install(Some(Table::new(HashMap::from([(pid(1), 1)]), Some(1))));
+        assert!(!held.is_finished(), "a held process is not granted");
+        let holds = HashMap::from([(pid(1), false)]);
+        schedule::install(Some(Table::new(HashMap::new(), None, holds, Some(true))));
         semaphore.regrant();
         tokio::time::timeout(Duration::from_secs(1), held)
             .await
-            .expect("naming it releases it")
+            .expect("its row releases it")
             .unwrap();
 
         // A waiter that gives up returns its place, or its permit.
