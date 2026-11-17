@@ -50,6 +50,8 @@ ash = { version = "0.38", default-features = false, features = [
 ], optional = true }
 
 [dev-dependencies]
+# Guest programs the suite traces.
+eta-dsl = { package = "pie-eta-dsl", path = "../eta-dsl" }
 # The CPU oracle the score capture is held against.
 engine-cpu = { path = "../engine-cpu" }
 ztensor = { workspace = true }

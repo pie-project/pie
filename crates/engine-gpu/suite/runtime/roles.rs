@@ -366,7 +366,7 @@ fn an_instance_in_pool_slots_fires_through_moves() {
         .guest_state(program, &binding.extents)
         .expect("the program's guest state");
     assert!(state.per_instance > 0, "the instance holds its scratch");
-    let unparked_scratch = slots.scratch(state.per_instance);
+    let unparked_scratch = slots.scratch(&state);
     assert_ne!(unparked_scratch, binding.scratch, "a new place");
     assert_eq!(
         !binding.ring_slots.is_empty(),

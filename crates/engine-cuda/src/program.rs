@@ -56,8 +56,8 @@ impl Program {
         {
             return Ok(&mut self.batches[at]);
         }
-        let mut stages = self.stages(extents, shape.room.unit())?;
-        let laid = lay_pair(&mut stages, shape)?;
+        let (mut stages, room) = self.stages(extents, shape.room)?;
+        let laid = lay_pair(&mut stages, PairShape { room, ..shape })?;
         self.batches.push(Batch {
             extents,
             stages,
@@ -82,9 +82,12 @@ impl Program {
     }
 
     /// The program's stages prepared for binds at `extents`, their scratch
-    /// in pieces of at most `chunk` bytes: their tables and what each lays.
-    /// Nothing is put on the device.
-    fn stages(&self, extents: Extents, chunk: u64) -> Result<Vec<Option<Prepared>>> {
+    /// in pieces of `room`: their tables and what each lays, and the room
+    /// at the program's run. Every stage lays its pieces in one size, the
+    /// run of adjacent chunks its widest item asks
+    /// ([`eta_exec::ChunkLayout::run`]), so one piece size addresses all
+    /// of the instance's scratch. Nothing is put on the device.
+    fn stages(&self, extents: Extents, room: Room) -> Result<(Vec<Option<Prepared>>, Room)> {
         let shapes: Vec<ChannelShape> = self
             .plan
             .package
@@ -92,20 +95,33 @@ impl Program {
             .iter()
             .map(ChannelShape::of)
             .collect();
-        let mut stages = Vec::with_capacity(self.compiled.plans.len());
-        for (index, stage_plan) in self.compiled.plans.iter().enumerate() {
-            let launches = self
-                .compiled
+        let launching = |index: usize| {
+            self.compiled
                 .stages
                 .get(index)
-                .is_some_and(|stage| !stage.regions.is_empty());
-            stages.push(if launches {
-                Some(Prepared::build(stage_plan, &shapes, extents, chunk)?)
+                .is_some_and(|stage| !stage.regions.is_empty())
+        };
+        let mut run = 1;
+        for (index, stage_plan) in self.compiled.plans.iter().enumerate() {
+            if launching(index) {
+                run = run.max(launch::scratch_chunked(stage_plan, extents, room.pieces())?.run);
+            }
+        }
+        let room = room.at_run(run);
+        let mut stages = Vec::with_capacity(self.compiled.plans.len());
+        for (index, stage_plan) in self.compiled.plans.iter().enumerate() {
+            stages.push(if launching(index) {
+                Some(Prepared::build(
+                    stage_plan,
+                    &shapes,
+                    extents,
+                    room.pieces(),
+                )?)
             } else {
                 None
             });
         }
-        Ok(stages)
+        Ok((stages, room))
     }
 }
 
@@ -145,15 +161,23 @@ impl Capture {
     }
 }
 
-/// The `Instance` room guest state lies in: a piece is one run of a
-/// chunk's slots (`unit` bytes), the most that lies at adjacent addresses,
-/// and a state of more pieces than one holds that many whole chunks of
-/// `chunk` bytes (`engine::ScratchPlace`).
+/// The `Instance` room guest state lies in: a chunk's slots (`per_chunk`
+/// of `slot_bytes`) lie at adjacent addresses, and so do the chunks of a
+/// run inside one segment of `segment` chunks. A piece is `run` chunks'
+/// slots, from a run's first chunk ([`Room::unit`]); a state that fits a
+/// chunk's slots holds one run of slots, and a state of more holds that
+/// many whole runs of `run` chunks of `chunk` bytes
+/// (`engine::ScratchPlace`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Room {
     pub per_chunk: u32,
     pub slot_bytes: u64,
     pub chunk: u64,
+    pub segment: u32,
+    /// The chunks a piece takes (`engine::GuestState::run`): 1 as the pool
+    /// states the room, a program's own run once its stages are laid
+    /// ([`Room::at_run`]).
+    pub run: u32,
 }
 
 impl Room {
@@ -162,24 +186,50 @@ impl Room {
         per_chunk: u32::MAX,
         slot_bytes: 1,
         chunk: u64::MAX,
+        segment: 1,
+        run: 1,
     };
 
-    /// A piece's bytes.
+    /// The bytes of one chunk's slots.
     #[must_use]
-    pub fn unit(self) -> u64 {
+    pub fn slots_unit(self) -> u64 {
         u64::from(self.per_chunk).saturating_mul(self.slot_bytes)
     }
 
+    /// A piece's bytes: its run's chunks' slots.
+    #[must_use]
+    pub fn unit(self) -> u64 {
+        self.slots_unit().saturating_mul(u64::from(self.run.max(1)))
+    }
+
+    /// The same room, a piece `run` chunks.
+    #[must_use]
+    pub fn at_run(self, run: u32) -> Room {
+        Room {
+            run: run.max(1),
+            ..self
+        }
+    }
+
+    /// What a stage's scratch is laid in ([`eta_exec::layout_chunked`]):
+    /// chunks of a chunk's slots' bytes, a segment's of them, a piece at
+    /// least this room's run.
+    #[must_use]
+    pub fn pieces(self) -> eta_exec::Pieces {
+        eta_exec::Pieces::new(self.slots_unit(), self.segment).at_least(self.run.max(1))
+    }
+
     /// The bytes stated for a state laid to `end` of its pieces: the bytes
-    /// themselves where they lie in one, else as many whole chunks as it
-    /// takes pieces.
+    /// themselves where they fit a chunk's slots, else as many whole runs
+    /// of chunks as it takes pieces.
     #[must_use]
     pub fn stated(self, end: u64) -> u64 {
-        let unit = self.unit().max(1);
-        if end <= unit {
+        if end <= self.slots_unit() {
             end
         } else {
-            end.div_ceil(unit).saturating_mul(self.chunk)
+            end.div_ceil(self.unit().max(1))
+                .saturating_mul(u64::from(self.run.max(1)))
+                .saturating_mul(self.chunk)
         }
     }
 
@@ -240,6 +290,14 @@ pub struct Laid {
     pub stages: Vec<Option<[u64; SPANS]>>,
     pub wave: (u64, u64),
     pub capture: Option<u64>,
+    /// The room both lie in, at the program's run.
+    pub room: Room,
+}
+
+impl Default for Room {
+    fn default() -> Room {
+        Room::ALONE
+    }
 }
 
 /// Lays a pair's state and its instances' scratch for `stages`, each
@@ -288,11 +346,13 @@ fn lay_pair(stages: &mut [Option<Prepared>], shape: PairShape) -> Result<Laid> {
         stages: laid,
         wave,
         capture,
+        room: shape.room,
     })
 }
 
 /// Places a pair's stages where its state's pieces lie now.
-fn place_pair(batch: &mut Batch, room: Room) -> Result<()> {
+fn place_pair(batch: &mut Batch) -> Result<()> {
+    let room = batch.laid.room;
     for (prepared, at) in batch.stages.iter_mut().zip(&batch.laid.stages) {
         if let (Some(prepared), Some(at)) = (prepared, at) {
             let mut placed = [0u64; SPANS];
@@ -495,7 +555,12 @@ impl Plane {
         else {
             return Ok(None);
         };
-        self.room.at(bound.session.scratch(), offset).map(Some)
+        let room = program
+            .batches
+            .iter()
+            .find(|batch| batch.extents == extents)
+            .map_or(self.room, |batch| batch.laid.room);
+        room.at(bound.session.scratch(), offset).map(Some)
     }
 
     /// The lanes a pair's tables are laid for: a flight's most, no more
@@ -539,10 +604,12 @@ impl Plane {
             .get(&program_id)
             .ok_or_else(|| Fault::program("program::plane", format!("no program {program_id}")))?;
         let shape = self.pair_shape(program);
-        let laid = lay_pair(&mut program.stages(extents, shape.room.unit())?, shape)?;
+        let (mut stages, room) = program.stages(extents, shape.room)?;
+        let laid = lay_pair(&mut stages, PairShape { room, ..shape })?;
         Ok(engine::GuestState {
-            per_instance: self.room.stated(laid.per_instance),
-            per_pair: self.room.stated(laid.per_pair),
+            per_instance: room.stated(laid.per_instance),
+            per_pair: room.stated(laid.per_pair),
+            run: room.run,
         })
     }
 
@@ -579,10 +646,10 @@ impl Plane {
             compiled,
             batches: Vec::new(),
         };
-        // A value past a piece of the room is refused here, by name
-        // (`eta_exec::TooLarge::PastChunk`), at the extents a bind states
+        // A value past a segment of the room is refused here, by name
+        // (`eta_exec::TooLarge::PastSegment`), at the extents a bind states
         // by default; a bind's own are laid again at its bind.
-        program.stages(Extents::default(), self.room.unit())?;
+        program.stages(Extents::default(), self.room)?;
         self.next_program += 1;
         self.programs.insert(id, program);
         self.by_hash.insert(registration.program_hash, id);
@@ -609,7 +676,6 @@ impl Plane {
         span: Span<'_>,
         stream: *mut core::ffi::c_void,
     ) -> Result<InstanceId> {
-        let room = self.room;
         let shape = {
             let program = self.programs.get(&program_id).ok_or_else(|| {
                 Fault::program("program::plane", format!("no program {program_id}"))
@@ -619,10 +685,10 @@ impl Plane {
         let program = self.programs.get_mut(&program_id).expect("just found");
         let held = Held::of(&program.plan.package.channels);
         let batch = program.batch(extents, shape)?;
-        let place = slots.place(&held, &batch.laid, room, span)?;
+        let place = slots.place(&held, &batch.laid, span)?;
         if batch.bound == 0 {
-            batch.pair = slots.pair_pieces(&batch.laid, room, span)?;
-            place_pair(batch, room)?;
+            batch.pair = slots.pair_pieces(&batch.laid, span)?;
+            place_pair(batch)?;
         }
         let program = &*program;
         let endpoints = endpoints_for(&program.plan, adopted, stream)?;
@@ -677,17 +743,16 @@ impl Plane {
     /// at where their pool slots lie now: after an evacuation moved chunks,
     /// ahead of the next fire staged.
     pub fn rebase(&mut self, span: Span<'_>) -> Result<()> {
-        let room = self.room;
         for bound in self.instances.values_mut() {
             let Some(program) = self.programs.get_mut(&bound.program_id) else {
                 continue;
             };
             let held = Held::of(&program.plan.package.channels);
             let batch = program.batch_mut(bound.session.extents())?;
-            let place = bound.slots.place(&held, &batch.laid, room, span)?;
+            let place = bound.slots.place(&held, &batch.laid, span)?;
             bound.session.rebase(&place)?;
-            batch.pair = bound.slots.pair_pieces(&batch.laid, room, span)?;
-            place_pair(batch, room)?;
+            batch.pair = bound.slots.pair_pieces(&batch.laid, span)?;
+            place_pair(batch)?;
         }
         Ok(())
     }
@@ -696,7 +761,6 @@ impl Plane {
     /// runtime copied them, its scratch and its pair's state in fresh room,
     /// nothing copied (`Engine::rebind_slots`).
     pub fn rebind(&mut self, id: InstanceId, slots: Slots, span: Span<'_>) -> Result<()> {
-        let room = self.room;
         let bound = self
             .instances
             .get_mut(&id)
@@ -706,12 +770,12 @@ impl Plane {
         })?;
         let held = Held::of(&program.plan.package.channels);
         let batch = program.batch_mut(bound.session.extents())?;
-        let place = slots.place(&held, &batch.laid, room, span)?;
+        let place = slots.place(&held, &batch.laid, span)?;
         bound.session.rebase(&place)?;
         // Fresh room, whether or not it is where the pair lay before: what
         // another item wrote there meanwhile is staged over.
-        batch.pair = slots.pair_pieces(&batch.laid, room, span)?;
-        place_pair(batch, room)?;
+        batch.pair = slots.pair_pieces(&batch.laid, span)?;
+        place_pair(batch)?;
         bound.slots = slots;
         Ok(())
     }
@@ -929,7 +993,6 @@ impl Plane {
             return Ok(());
         }
         let main = context.stream();
-        let room = self.room;
         let lanes_most = self.table_lanes();
         let Plane {
             programs,
@@ -971,7 +1034,7 @@ impl Plane {
             let batch = program.batch_mut(*extents)?;
             let (offset, bytes) = batch.laid.wave;
             if wave_at.is_none_or(|(_, widest)| bytes > widest) {
-                wave_at = Some((room.at(&batch.pair, offset)?, bytes));
+                wave_at = Some((batch.laid.room.at(&batch.pair, offset)?, bytes));
             }
             meet.push(
                 at_point(&mut batch.stages, &runs)
@@ -1233,7 +1296,7 @@ pub struct Slots {
 impl Slots {
     /// Where the items of an instance that keeps `held`, of a pair laid
     /// `laid`, lie now.
-    fn place(&self, held: &Held, laid: &Laid, room: Room, span: Span<'_>) -> Result<Place> {
+    fn place(&self, held: &Held, laid: &Laid, span: Span<'_>) -> Result<Place> {
         let instance = span(
             engine::chunk::SlotRole::Instance,
             &self.instance,
@@ -1261,18 +1324,19 @@ impl Slots {
         Ok(Place {
             instance,
             rings,
-            scratch: pieces(&self.scratch, laid.per_instance, room, span)?,
+            scratch: pieces(&self.scratch, laid.per_instance, laid.room, span)?,
         })
     }
 
     /// Where the pair's state lies now, a piece each.
-    fn pair_pieces(&self, laid: &Laid, room: Room, span: Span<'_>) -> Result<Vec<u64>> {
-        pieces(&self.pair, laid.per_pair, room, span)
+    fn pair_pieces(&self, laid: &Laid, span: Span<'_>) -> Result<Vec<u64>> {
+        pieces(&self.pair, laid.per_pair, laid.room, span)
     }
 }
 
 /// Each piece's address of a state of `bytes` laid in `room` that lies at
-/// `place`: its run, or each of its whole chunks.
+/// `place`: its run of slots, or each of its runs of whole chunks, from
+/// the run's first chunk (the pool keeps a run's chunks adjacent).
 fn pieces(
     place: &engine::ScratchPlace,
     bytes: u64,
@@ -1291,24 +1355,25 @@ fn pieces(
             let refs: Vec<u32> = (*first..first + slots).collect();
             Ok(vec![span(role, &refs, bytes)?])
         }
-        ScratchPlace::Chunks(chunks) => {
+        ScratchPlace::Chunks { run, pieces } => {
             let wanted = bytes.div_ceil(room.unit().max(1));
-            if chunks.len() as u64 != wanted {
+            if pieces.len() as u64 != wanted || (*run).max(1) != room.run.max(1) {
                 return Err(Fault::program(
                     "program::plane",
                     format!(
-                        "{bytes} bytes of guest state lie in {wanted} whole chunks, and its \
-                         binding names {}",
-                        chunks.len()
+                        "{bytes} bytes of guest state lie in {wanted} runs of {} whole \
+                         chunks, and its binding names {} runs of {run}",
+                        room.run,
+                        pieces.len()
                     ),
                 ));
             }
-            chunks
+            pieces
                 .iter()
                 .map(|&chunk| {
                     let first = chunk * room.per_chunk;
                     let refs: Vec<u32> = (first..first + room.per_chunk).collect();
-                    span(role, &refs, room.unit())
+                    span(role, &refs, room.slots_unit())
                 })
                 .collect()
         }
@@ -1439,6 +1504,8 @@ mod laid_tests {
             per_chunk: 256,
             slot_bytes: 4096,
             chunk: 1 << 20,
+            segment: 8,
+            run: 1,
         };
         assert_eq!(room.stated(700 << 10), 700 << 10);
         assert_eq!(room.stated((1 << 20) + (400 << 10)), 2 << 20);
@@ -1447,6 +1514,21 @@ mod laid_tests {
             Some(0x5000_0008)
         );
         assert!(room.at(&[0x1000_0000], 1 << 20).is_err());
+        // Pieces of runs of 3 chunks: a piece's offsets reach past a chunk,
+        // and a state of more than a chunk's slots holds whole runs.
+        let three = room.at_run(3);
+        assert_eq!(three.unit(), 3 << 20);
+        assert_eq!(three.stated(700 << 10), 700 << 10, "a run of slots");
+        assert_eq!(three.stated((3 << 20) + 1), 6 << 20, "two runs of 3");
+        assert_eq!(
+            three.at(&[0x1000_0000, 0x5000_0000], (2 << 20) + 8).ok(),
+            Some(0x1020_0008),
+            "inside the first run, past its first chunk"
+        );
+        assert_eq!(
+            three.at(&[0x1000_0000, 0x5000_0000], (3 << 20) + 8).ok(),
+            Some(0x5000_0008)
+        );
     }
 
     #[test]

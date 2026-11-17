@@ -669,17 +669,17 @@ where
             return Ok(engine::GuestState::default());
         };
         let scores = shell.score_spec(crate::guest::session::reads_of(package));
-        let chunk = shell.pools().chunk_bytes();
-        let lay = crate::guest::session::instance_lay(
+        let (_, lay) = crate::guest::session::lay_program(
             &package.plans,
             &crate::guest::session::extents_of(extents),
             &scores,
-            chunk,
+            shell.pools().guest_pieces(),
         )
         .map_err(|why| Error::Program(format!("program {program}'s state: {why}")))?;
         Ok(engine::GuestState {
-            per_instance: lay.held_bytes(chunk),
+            per_instance: lay.held_bytes(),
             per_pair: 0,
+            run: lay.run,
         })
     }
 

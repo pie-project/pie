@@ -62,10 +62,12 @@ impl Slots {
         }
     }
 
-    /// Where `bytes` of guest scratch lie, as the runtime's role store lays
+    /// Where `state`'s instance bytes lie, as the runtime's role store lays
     /// them: one run of `Instance` slots where they fit a chunk's, else
-    /// whole chunks of [`Slots::chunks`].
-    pub fn scratch(&mut self, bytes: u64) -> ScratchPlace {
+    /// whole runs of [`Slots::chunks`] (adjacent ids, the last first).
+    pub fn scratch(&mut self, state: &engine::GuestState) -> ScratchPlace {
+        let bytes = state.per_instance;
+        let run = state.chunks_a_piece();
         let chunk_bytes = self.chunk_bytes;
         if bytes == 0 {
             return ScratchPlace::None;
@@ -89,7 +91,11 @@ impl Slots {
             "a test's scratch of {bytes} bytes takes {need} chunks, and {} are handed",
             self.chunks.len()
         );
-        ScratchPlace::Chunks(self.chunks.split_off(self.chunks.len() - need))
+        let taken = self.chunks.split_off(self.chunks.len() - need);
+        ScratchPlace::Chunks {
+            run,
+            pieces: taken.iter().step_by(run as usize).copied().collect(),
+        }
     }
 
     /// Registers `registration` over the channel slots its ring facts state.
@@ -144,7 +150,7 @@ impl Slots {
         let state = engine
             .guest_state(binding.program, &binding.extents)
             .expect("the program's guest state");
-        let scratch = self.scratch(state.per_instance);
+        let scratch = self.scratch(&state);
         InstanceBinding {
             instance_slots,
             ring_slots,

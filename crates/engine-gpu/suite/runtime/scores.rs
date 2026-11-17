@@ -63,14 +63,15 @@ fn rows_for(shell: &crate::backend::Shell, reads: &[String], k: u32) -> Option<S
         return None;
     }
     let pools = shell.pools();
-    let chunk = pools.chunk_bytes();
-    let lay = lay_instance(&[], &spec, chunk).expect("a score row fits a chunk");
+    let lay = lay_instance(&[], &spec, pools.guest_pieces()).expect("a score row fits a chunk");
     let at = pools.layout().total_chunks - pools.span_chunks() - 1 - k;
     let places = piece_places(
         pools,
-        &engine::ScratchPlace::Chunks(vec![at]),
-        lay.pieces(),
-        lay.held_bytes(chunk),
+        &engine::ScratchPlace::Chunks {
+            run: lay.run,
+            pieces: vec![at],
+        },
+        &lay,
     )
     .expect("the reader's chunk is committed");
     score_rows(&lay, &places).first().map(|&(_, rows)| rows)

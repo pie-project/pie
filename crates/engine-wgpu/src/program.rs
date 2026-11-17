@@ -1028,7 +1028,7 @@ impl Plane {
                 slots: &binding.instance_slots,
                 align: place.align,
                 scratch: &binding.scratch,
-                chunk: place.pools.chunk_bytes(),
+                pieces: place.pools.guest_pieces(),
                 ring: &ring,
                 lanes: engine_gpu::guest::pass_lanes(&plan.package),
                 scores: &scores,
@@ -1190,7 +1190,7 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
             })?,
         );
         self.forms.load(engine_gpu::guest::Bounds {
-            chunk: place.pools.chunk_bytes(),
+            pieces: place.pools.guest_pieces(),
             io: place.io,
         });
         Ok(())

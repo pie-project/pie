@@ -770,6 +770,13 @@ impl<B: Backend> Pools<B> {
         self.pool.segment(segment)
     }
 
+    /// The pieces a guest's state lies in: runs of adjacent chunks inside one
+    /// segment ([`eta_exec::Pieces`]).
+    #[must_use]
+    pub fn guest_pieces(&self) -> eta_exec::Pieces {
+        eta_exec::Pieces::new(self.layout.chunk_bytes, self.layout.segment_chunks)
+    }
+
     /// The bytes of a whole chunk of the pool.
     #[must_use]
     pub fn chunk_bytes(&self) -> u64 {

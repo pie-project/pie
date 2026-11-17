@@ -15,7 +15,7 @@ use engine_gpu::store::layout::{CHANNEL, INSTANCE};
 use engine_gpu::guest::held::{self, consecutive};
 use engine_gpu::guest::session::{
     BINDINGS, InstanceLay, PiecePlace, ScoreRows, ScoreSpec, SEGMENT_BINDINGS, StageTables, bases_at, groups_for,
-    lay_instance, piece_places, score_rows, stage_tables,
+    lay_program, piece_places, score_rows, stage_tables,
 };
 
 /// The host staging ring the plane laid at load.
@@ -205,7 +205,8 @@ pub struct Tables<'a> {
     pub slots: &'a [u32],
     pub align: u64,
     pub scratch: &'a engine::ScratchPlace,
-    pub chunk: u64,
+    /// The pool's pieces: its chunk, its segments.
+    pub pieces: eta_exec::Pieces,
     pub ring: &'a Arc<Ring>,
     /// The lanes one pass runs: its ring rooms.
     pub lanes: u32,
@@ -237,7 +238,6 @@ pub struct Session {
     /// any stage lays in them.
     scratch: engine::ScratchPlace,
     pieces: Vec<Piece>,
-    piece_count: u32,
     held: u64,
     /// Its scratch and score rows in pieces, and the rows where they lie.
     lay: InstanceLay,
@@ -297,19 +297,10 @@ impl Session {
         }
 
         let core = device.core().clone();
-        let resolved = plans
-            .iter()
-            .map(|plan| stage_tables(plan, extents, tables.chunk).map_err(program))
-            .collect::<Result<Vec<StageTables>>>()?;
-        let lay = lay_instance(
-            &resolved.iter().map(|stage| &stage.scratch).collect::<Vec<_>>(),
-            tables.scores,
-            tables.chunk,
-        )
-        .map_err(program)?;
-        let piece_count = lay.pieces();
-        let held = lay.held_bytes(tables.chunk);
-        let pieces = pieces_of(tables.pools, tables.scratch, piece_count, held)?;
+        let (resolved, lay) =
+            lay_program(plans, extents, tables.scores, tables.pieces).map_err(program)?;
+        let held = lay.held_bytes();
+        let pieces = pieces_of(tables.pools, tables.scratch, &lay)?;
         // Every stage's tables, then the fault word, in the instance's
         // slots, written at once; each stage's place table names its pieces'
         // bases.
@@ -394,7 +385,6 @@ impl Session {
             status,
             scratch: tables.scratch.clone(),
             pieces,
-            piece_count,
             held,
             rows,
             lay,
@@ -531,7 +521,7 @@ impl Session {
             }
         }
         self.status.rebind(pools)?;
-        self.pieces = pieces_of(pools, &self.scratch, self.piece_count, self.held)?;
+        self.pieces = pieces_of(pools, &self.scratch, &self.lay)?;
         self.rows = score_rows(
             &self.lay,
             &self.pieces.iter().map(|piece| piece.place).collect::<Vec<_>>(),
@@ -576,7 +566,7 @@ impl Session {
         self.status.retarget(pools, slots[at])?;
         self.slots = slots.to_vec();
         self.scratch = scratch.clone();
-        self.pieces = pieces_of(pools, &self.scratch, self.piece_count, self.held)?;
+        self.pieces = pieces_of(pools, &self.scratch, &self.lay)?;
         self.rows = score_rows(
             &self.lay,
             &self.pieces.iter().map(|piece| piece.place).collect::<Vec<_>>(),
@@ -1011,15 +1001,14 @@ impl Drop for Session {
     }
 }
 
-/// Where `count` pieces of `held` bytes lie at `scratch`, each with its
-/// segment's buffer.
+/// Where the pieces of `lay` lie at `scratch`, each with its segment's
+/// buffer.
 fn pieces_of(
     pools: &Pools<crate::device::Api>,
     scratch: &engine::ScratchPlace,
-    count: u32,
-    held: u64,
+    lay: &InstanceLay,
 ) -> Result<Vec<Piece>> {
-    piece_places(pools, scratch, count, held)?
+    piece_places(pools, scratch, lay)?
         .into_iter()
         .map(|place| {
             let buffer = pools.segment_buffer(place.segment)?.clone();

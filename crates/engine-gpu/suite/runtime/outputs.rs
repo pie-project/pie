@@ -204,7 +204,19 @@ pub(super) struct Loaded {
 
 /// `None` without a device. `tag` names the scratch directory.
 pub(super) fn loaded(tag: &str, model: &impl ForwardHybrid) -> Option<Loaded> {
-    let boot = backend::DeviceBoot::default();
+    loaded_in(tag, model, None)
+}
+
+/// [`loaded`] in a pool of `chunk`-byte chunks where `chunk` says.
+pub(super) fn loaded_in(
+    tag: &str,
+    model: &impl ForwardHybrid,
+    chunk: Option<u64>,
+) -> Option<Loaded> {
+    let boot = backend::DeviceBoot {
+        chunk_bytes: chunk,
+        ..backend::DeviceBoot::default()
+    };
     if backend::Context::bind(&boot, backend::ALLOWANCE).is_err() {
         eprintln!("not asked: no device");
         return None;
@@ -592,4 +604,140 @@ fn a_frame_of_many_steps_settles_every_step_one_frame_in_flight() {
     }
     drop(engine);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A sampler of `n` candidates a draw (a Gumbel draw over `n` keys): its
+/// value of `n` f32 is the widest of its scratch.
+fn wide_draw(n: u32) -> TraceContainer {
+    use eta_dsl::prelude::*;
+    let leak = |channel: Channel| -> &'static Channel { Box::leak(Box::new(channel)) };
+    let rng = leak(Channel::from([0x7ce1u32, 0]));
+    let out = leak(Channel::new([1], dtype::i32).capacity(8));
+    let mut b = Builder::new(VOCAB, 16);
+    b.stage(Stage::Epilogue, move || {
+        let r = rng.take();
+        let token = reshape(reduce_argmax(gumbel(&r, [n])), [1]);
+        rng.put(&r + iota(2));
+        out.put(&token);
+    });
+    out.note_host_take();
+    b.build().expect("the draw traces").container().clone()
+}
+
+/// Each lane's tokens over three fires of four lanes, an instance a lane,
+/// each seeded apart, in a pool of `chunk`-byte chunks where `chunk` says;
+/// and the run of chunks a piece of the sampler's state takes.
+fn wide_draws(tag: &str, chunk: Option<u64>, n: u32) -> Option<(Vec<Vec<i32>>, u32)> {
+    let Loaded {
+        mut engine,
+        caps,
+        trace,
+        dir,
+        ..
+    } = loaded_in(tag, &Rows, chunk)?;
+    let bound = eta_ir::validate::bind(wide_draw(n), vec![Vec::new()], EngineCaps::default())
+        .expect("the draw binds");
+    let stages = eta_compiler::plan::compile_bound(&bound);
+    let program = engine
+        .register_program(&ProgramRegistration {
+            program_hash: 0x51de,
+            launch: eta_compiler::codegen::launch::build(&bound, &stages),
+            ..Default::default()
+        })
+        .expect("the draw registers");
+    let chunks = &caps.caps.chunks;
+    let mut slots =
+        super::slots::Slots::of(chunks, chunks.segment_chunks - 1, chunks.segment_chunks - 2);
+    // Whole chunks below the guests' slots, adjacent, for runs past a chunk.
+    slots.chunks = (chunks.segment_chunks - 26..chunks.segment_chunks - 2).collect();
+    let extents = engine::program::BindExtents::default();
+    let run = engine
+        .guest_state(program, &extents)
+        .expect("the draw's state")
+        .chunks_a_piece();
+    let lanes = 4u32;
+    let mut instances = Vec::new();
+    for lane in 0..lanes {
+        let channels = vec![ChannelId(100 + u64::from(lane) * 2), ChannelId(101 + u64::from(lane) * 2)];
+        let binding = slots.binding(
+            &engine,
+            InstanceBinding {
+                program,
+                channels: channels.clone(),
+                seeds: vec![engine::channel::ChannelSeed {
+                    channel: 0,
+                    bytes: [0x7ce1u32 + lane, 0].iter().flat_map(|w| w.to_le_bytes()).collect(),
+                }],
+                geometry: GeometryClass::Host,
+                extents,
+                ..Default::default()
+            },
+            &[],
+        );
+        instances.push(engine.bind_instance(&binding).expect("the draw binds").id);
+    }
+    let word = trace.facts.word(&Request::new(1, false));
+    let mut tokens = vec![Vec::new(); lanes as usize];
+    for token in [3u32, 11, 7] {
+        let step = Step {
+            lanes: (0..lanes)
+                .map(|slot| Lane {
+                    slot,
+                    word,
+                    tokens: vec![token],
+                    readout: Readout::Last,
+                    kv_less: true,
+                    ..Lane::default()
+                })
+                .collect(),
+            attachments: instances
+                .iter()
+                .enumerate()
+                .map(|(lane, &instance)| Attachment {
+                    lane: lane as u32,
+                    lanes: 1,
+                    instance,
+                    adapter_only: false,
+                })
+                .collect(),
+            media: Vec::new(),
+            voxels: Vec::new(),
+        };
+        let mut ticket = engine
+            .submit(&FrameSubmission::of(step))
+            .expect("the frame fires");
+        engine.settle_frame(&mut ticket).expect("the frame settles");
+        for (lane, &instance) in instances.iter().enumerate() {
+            let cell = engine
+                .take_channel(instance, 1)
+                .expect("the token reads")
+                .expect("a token");
+            tokens[lane].push(i32::from_le_bytes(cell[..4].try_into().expect("an i32")));
+        }
+    }
+    drop(engine);
+    let _ = std::fs::remove_dir_all(&dir);
+    Some((tokens, run))
+}
+
+/// A sampler whose widest value passes the pool's chunk lies in pieces of
+/// a run of adjacent chunks (`GuestState::run` past one): every lane draws
+/// the token it draws where one chunk holds it.
+#[test]
+fn a_sampler_in_runs_of_chunks_draws_what_one_chunk_draws() {
+    // 100,000 candidates: 400 KB of f32, and the 1.6 MB of whole-value
+    // temporaries beside them, past a 1 MiB chunk.
+    let n = 100_000;
+    let Some((one, run_one)) = wide_draws("draw-wide", None, n) else {
+        return;
+    };
+    let (runs, run) = wide_draws("draw-runs", Some(1 << 20), n).expect("the device bound once");
+    eprintln!("tokens {one:?}, runs of {run} chunk(s) against {run_one}");
+    assert_eq!(run_one, 1, "the default chunk holds the draw's value");
+    assert!(run > 1, "a 1 MiB chunk holds no 1.6 MB temporary area: a run of {run}");
+    assert_eq!(runs, one, "every lane's tokens");
+    assert!(
+        one.iter().flatten().any(|&t| t != one[0][0]),
+        "the lanes draw apart, so a lane reading another's state would show"
+    );
 }

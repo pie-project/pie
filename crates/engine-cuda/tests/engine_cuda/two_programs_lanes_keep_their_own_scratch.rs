@@ -37,11 +37,12 @@ fn extents() -> Extents {
 
 /// Draws one fire carrying `EACH` lanes of a top-p and of a top-k program,
 /// guest state laid in `room` (one piece, as wide as anything, where none),
-/// each instance's scratch at `place(program, index, bytes)`, and counts the
+/// each instance's scratch at `place(program, index, bytes, run)` (`run`
+/// the chunks a piece takes, `engine::GuestState::run`), and counts the
 /// lanes that drew the interpreter's token.
 fn draw(
     room: Option<engine_cuda::program::Room>,
-    place: impl Fn(usize, u32, u64) -> ScratchPlace,
+    place: impl Fn(usize, u32, u64, u32) -> ScratchPlace,
 ) -> (usize, usize) {
     let context = Context::bind(0, None).expect("a device context");
     let backend = Backend::parse(engine_cuda::api::CODEGEN).expect("the engine's codegen backend");
@@ -126,7 +127,7 @@ fn draw(
                     &vec![None; count],
                     &ids,
                     engine_cuda::program::Slots {
-                        scratch: place(index, at, state.per_instance),
+                        scratch: place(index, at, state.per_instance, state.run),
                         pair: pair.clone(),
                         ..crate::guest::alone_slots(&plane, *program)
                     },
@@ -186,7 +187,7 @@ fn two_programs_lanes_keep_their_own_scratch() {
         eprintln!("no device: skipping");
         return;
     }
-    let (agree, total) = draw(None, |program, at, bytes| run(apart(program, at), bytes));
+    let (agree, total) = draw(None, |program, at, bytes, _| run(apart(program, at), bytes));
     assert_eq!(
         agree, total,
         "a lane drew another than the interpreter's token"
@@ -206,16 +207,73 @@ fn a_lanes_scratch_in_pieces_apart_draws_the_interpreters_token() {
         per_chunk: PER_CHUNK,
         slot_bytes: SLOT,
         chunk: u64::from(PER_CHUNK) * SLOT,
+        segment: 64,
+        run: 1,
     };
-    let (agree, total) = draw(Some(room), |program, at, bytes| {
+    let (agree, total) = draw(Some(room), |program, at, bytes, _| {
         if bytes <= room.unit() {
             return run(apart(program, at), bytes);
         }
         // Its chunks out of order and apart: the last first.
         let chunks = u32::try_from(bytes.div_ceil(room.chunk)).expect("chunks");
         let first = apart(program, at) * 2;
-        ScratchPlace::Chunks((0..chunks).rev().map(|piece| first + piece * 2).collect())
+        ScratchPlace::Chunks {
+            run: 1,
+            pieces: (0..chunks).rev().map(|piece| first + piece * 2).collect(),
+        }
     });
+    assert_eq!(
+        agree, total,
+        "a lane drew another than the interpreter's token"
+    );
+}
+
+/// The same fire with the room cut to chunks of 128 KiB, past which a
+/// logits row (and the sampler's other values) lies: the program lays its
+/// pieces in runs of adjacent chunks (`engine::GuestState::run`), each value
+/// whole in one run, and each instance's runs lie apart and out of order,
+/// each addressed from its first chunk.
+#[test]
+fn a_lanes_values_wider_than_a_chunk_lie_in_runs_and_draw_the_interpreters_token() {
+    if !engine_cuda::device::present() {
+        eprintln!("no device: skipping");
+        return;
+    }
+    const SMALL: u32 = 32;
+    let room = engine_cuda::program::Room {
+        per_chunk: SMALL,
+        slot_bytes: SLOT,
+        chunk: u64::from(SMALL) * SLOT,
+        segment: 64,
+        run: 1,
+    };
+    let seen = std::cell::Cell::new(0u32);
+    let (agree, total) = draw(Some(room), |program, at, bytes, run| {
+        seen.set(seen.get().max(run));
+        if bytes <= room.slots_unit() {
+            return ScratchPlace::Run {
+                first: apart(program, at) * 64 * SMALL,
+                slots: u32::try_from(bytes.div_ceil(SLOT)).expect("slots"),
+            };
+        }
+        // Each instance its own 64 chunks; its runs the last first, a
+        // chunk apart.
+        let pieces = u32::try_from(bytes.div_ceil(room.chunk * u64::from(run))).expect("runs");
+        let first = apart(program, at) * 64;
+        assert!(
+            (run + 1) * pieces <= 64,
+            "{pieces} runs of {run} fit an instance's chunks"
+        );
+        ScratchPlace::Chunks {
+            run,
+            pieces: (0..pieces)
+                .rev()
+                .map(|piece| first + piece * (run + 1))
+                .collect(),
+        }
+    });
+    let run = seen.get();
+    assert!(run > 1, "a value past a 128 KiB chunk asks a run, {run}");
     assert_eq!(
         agree, total,
         "a lane drew another than the interpreter's token"
@@ -230,7 +288,7 @@ fn lanes_placed_on_one_scratch_write_over_one_another() {
         eprintln!("no device: skipping");
         return;
     }
-    let (agree, total) = draw(None, |_, _, bytes| run(0, bytes));
+    let (agree, total) = draw(None, |_, _, bytes, _| run(0, bytes));
     eprintln!("overlapping scratch: {agree} of {total} lanes drew the interpreter's token");
     assert!(
         agree < total,

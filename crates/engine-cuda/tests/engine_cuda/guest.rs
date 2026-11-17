@@ -34,8 +34,9 @@ impl Shape {
 
     /// Room for `bytes` of guest scratch, as the runtime's role store
     /// takes it: one run of slots in a chunk where they fit a chunk's,
-    /// else whole chunks (`engine::ScratchPlace`), each below `end`.
-    fn scratch(&mut self, bytes: u64, chunk_bytes: u64, end: u32) -> ScratchPlace {
+    /// else whole runs of `run` adjacent chunks (`engine::ScratchPlace`),
+    /// each below `end`.
+    fn scratch(&mut self, bytes: u64, chunk_bytes: u64, run: u32, end: u32) -> ScratchPlace {
         let per_chunk = self.per_chunk;
         let place = if bytes == 0 {
             return ScratchPlace::None;
@@ -48,10 +49,15 @@ impl Shape {
             self.next += slots;
             ScratchPlace::Run { first, slots }
         } else {
-            let chunks = u32::try_from(bytes.div_ceil(chunk_bytes)).expect("whole chunks");
+            let run = run.max(1);
+            let pieces =
+                u32::try_from(bytes.div_ceil(chunk_bytes * u64::from(run))).expect("whole runs");
             let first = self.next.div_ceil(per_chunk);
-            self.next = (first + chunks) * per_chunk;
-            ScratchPlace::Chunks((first..first + chunks).collect())
+            self.next = (first + pieces * run) * per_chunk;
+            ScratchPlace::Chunks {
+                run,
+                pieces: (0..pieces).map(|piece| first + piece * run).collect(),
+            }
         };
         assert!(
             self.next.div_ceil(per_chunk) <= end,
@@ -117,7 +123,9 @@ impl Guest {
         state: GuestState,
     ) -> (ScratchPlace, ScratchPlace) {
         let (chunk, end) = (self.chunk_bytes, self.committed);
-        let scratch = self.scratch.scratch(state.per_instance, chunk, end);
+        let scratch = self
+            .scratch
+            .scratch(state.per_instance, chunk, state.run, end);
         let pair = match self
             .pairs
             .iter()
@@ -125,7 +133,7 @@ impl Guest {
         {
             Some((_, _, place)) => place.clone(),
             None => {
-                let place = self.scratch.scratch(state.per_pair, chunk, end);
+                let place = self.scratch.scratch(state.per_pair, chunk, state.run, end);
                 self.pairs.push((program, extents.clone(), place.clone()));
                 place
             }

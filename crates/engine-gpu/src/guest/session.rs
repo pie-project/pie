@@ -4,7 +4,7 @@
 use eta_compiler::codegen::launch::{LaunchPackage, LaunchStagePlan};
 use eta_compiler::codegen::{wgsl, wgsl_analysis};
 use eta_exec::{
-    ChunkLayout, Extents, Launch, Launches, OpParams, Placed, SELECT_RESERVE, ValueDesc,
+    ChunkLayout, Extents, Launch, Launches, OpParams, Pieces, Placed, SELECT_RESERVE, ValueDesc,
     describe, lay_out_chunked, whole_value_temporaries,
 };
 use eta_ir::op::tags;
@@ -209,12 +209,13 @@ pub struct StageTables {
     pub tables: [Vec<u8>; 4],
 }
 
-/// Resolves `plan` against `extents`, its scratch in chunks of `chunk`
-/// bytes: refused by name where a value is past a chunk.
+/// Resolves `plan` against `extents`, its scratch in `pieces` (runs of
+/// adjacent chunks inside a segment): refused by name where a value is past
+/// a segment.
 pub fn stage_tables(
     plan: &LaunchStagePlan,
     extents: &Extents,
-    chunk: u64,
+    pieces: Pieces,
 ) -> Result<StageTables, String> {
     let descriptors = plan
         .value_types
@@ -229,7 +230,7 @@ pub fn stage_tables(
         plan,
         &descriptors,
         &Stepping::of(plan).launches(&descriptors),
-        chunk,
+        pieces,
     )
     .map_err(|why| format!("a guest pass's scratch does not lie in chunks: {why}"))?;
     let mut places = scratch.values.clone();
@@ -309,9 +310,14 @@ pub fn reads_of(package: &LaunchPackage) -> impl Iterator<Item = (&str, u32)> {
 /// What an instance holds at its place: its stages' scratch (each stage over
 /// the same pieces, so each piece as full as the fullest stage leaves it),
 /// then its capturing lanes' score rows, each whole in a piece: a free tail
-/// of the first piece with room, else a new piece.
+/// of the first piece with room, else a new piece. A piece is a run of
+/// `run` adjacent chunks inside one segment ([`eta_exec::Pieces`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InstanceLay {
+    /// The chunks a piece takes.
+    pub run: u32,
+    /// A chunk's bytes.
+    pub chunk: u64,
     /// Each piece's bytes in use.
     pub ends: Vec<u64>,
     /// Each capturing lane's key row and, where it reads pages, page row.
@@ -324,28 +330,43 @@ impl InstanceLay {
         u32::try_from(self.ends.len()).unwrap_or(u32::MAX)
     }
 
-    /// The bytes an instance holds in chunks of `chunk` bytes: the one
-    /// piece's where it takes one (a run inside a chunk), else whole
-    /// chunks, one a piece.
+    /// A piece's bytes: its run of chunks.
     #[must_use]
-    pub fn held_bytes(&self, chunk: u64) -> u64 {
+    pub fn piece_bytes(&self) -> u64 {
+        u64::from(self.run.max(1)).saturating_mul(self.chunk)
+    }
+
+    /// The bytes an instance holds (`engine::GuestState::per_instance`):
+    /// the one piece's where it takes one inside a chunk (a run of slots),
+    /// else whole runs of chunks, one a piece.
+    #[must_use]
+    pub fn held_bytes(&self) -> u64 {
         match self.ends[..] {
             [] => 0,
-            [only] => only,
-            _ => u64::from(self.pieces()).saturating_mul(chunk),
+            [only] if only <= self.chunk => only,
+            _ => u64::from(self.pieces()).saturating_mul(self.piece_bytes()),
         }
     }
 }
 
-/// `stages` laid together with `scores`' rows in chunks of `chunk` bytes
-/// ([`InstanceLay`]); a row larger than a chunk is refused by name.
+/// `stages`, laid in pieces of one run, together with `scores`' rows
+/// ([`InstanceLay`]); a row past a piece is refused by name.
 pub fn lay_instance(
     stages: &[&ChunkLayout],
     scores: &ScoreSpec,
-    chunk: u64,
+    pieces: Pieces,
 ) -> Result<InstanceLay, String> {
+    let run = stages.iter().map(|stage| stage.run).fold(pieces.run.max(1), u32::max);
+    let piece = u64::from(run).saturating_mul(pieces.chunk);
     let mut ends: Vec<u64> = Vec::new();
     for stage in stages {
+        if stage.run != run {
+            return Err(format!(
+                "a stage laid in pieces of {} chunk(s) beside one of {run}: a program lays \
+                 every stage in one piece size",
+                stage.run
+            ));
+        }
         for (piece, &end) in stage.ends.iter().enumerate() {
             match ends.get_mut(piece) {
                 Some(have) => *have = (*have).max(end),
@@ -356,18 +377,18 @@ pub fn lay_instance(
     let align = eta_exec::SCRATCH_ALIGN;
     let mut place = |bytes: u64, what: &str| -> Result<Placed, String> {
         let span = bytes.next_multiple_of(align);
-        if span > chunk {
+        if span > piece {
             return Err(format!(
-                "{what} takes {bytes} bytes, past a {chunk}-byte chunk, and a score row lies \
-                 whole in one"
+                "{what} takes {bytes} bytes, past a {piece}-byte piece ({run} chunk(s)), and a \
+                 score row lies whole in one"
             ));
         }
-        for (piece, end) in ends.iter_mut().enumerate() {
+        for (at_piece, end) in ends.iter_mut().enumerate() {
             let at = end.next_multiple_of(align);
-            if at + span <= chunk {
+            if at + span <= piece {
                 *end = at + span;
                 return Ok(Placed {
-                    piece: u32::try_from(piece).unwrap_or(u32::MAX),
+                    piece: u32::try_from(at_piece).unwrap_or(u32::MAX),
                     offset: at,
                 });
             }
@@ -388,22 +409,50 @@ pub fn lay_instance(
         };
         rows.push((lane, key, page));
     }
-    Ok(InstanceLay { ends, rows })
+    Ok(InstanceLay {
+        run,
+        chunk: pieces.chunk,
+        ends,
+        rows,
+    })
 }
 
-/// What an instance of `plans` holds at `extents` with `scores`' rows, in
-/// chunks of `chunk` bytes ([`lay_instance`]).
-pub fn instance_lay(
+/// `plans`' stages at `extents` and an instance's state with `scores`'
+/// rows, in `pieces` ([`lay_instance`]): every stage, and every row, in
+/// pieces of one run, the least that holds the widest of them whole.
+pub fn lay_program(
     plans: &[LaunchStagePlan],
     extents: &Extents,
     scores: &ScoreSpec,
-    chunk: u64,
-) -> Result<InstanceLay, String> {
-    let stages = plans
+    pieces: Pieces,
+) -> Result<(Vec<StageTables>, InstanceLay), String> {
+    let first = plans
         .iter()
-        .map(|plan| stage_tables(plan, extents, chunk).map(|tables| tables.scratch))
+        .map(|plan| stage_tables(plan, extents, pieces))
         .collect::<Result<Vec<_>, _>>()?;
-    lay_instance(&stages.iter().collect::<Vec<_>>(), scores, chunk)
+    let widest_row = scores
+        .key_bytes
+        .max(scores.page_bytes)
+        .next_multiple_of(eta_exec::SCRATCH_ALIGN);
+    let row_run = u32::try_from(widest_row.div_ceil(pieces.chunk.max(1))).unwrap_or(u32::MAX);
+    let run = first
+        .iter()
+        .map(|stage| stage.scratch.run)
+        .fold(pieces.run.max(1).max(row_run), u32::max);
+    let stages = if first.iter().all(|stage| stage.scratch.run == run) {
+        first
+    } else {
+        plans
+            .iter()
+            .map(|plan| stage_tables(plan, extents, pieces.at_least(run)))
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let lay = lay_instance(
+        &stages.iter().map(|stage| &stage.scratch).collect::<Vec<_>>(),
+        scores,
+        pieces.at_least(run),
+    )?;
+    Ok((stages, lay))
 }
 
 /// A capturing lane's score rows at its instance's place: its key row, and
@@ -466,62 +515,74 @@ impl PiecePlace {
     }
 }
 
-/// Where the `pieces` pieces of an instance's scratch lie in the pool, laid
-/// at `place` ([`engine::ScratchPlace`]): a run's one piece from its first
-/// slot, else each whole chunk's first byte, piece by piece. Refused by
-/// name where the place holds fewer pieces than the scratch takes, or a
-/// segment's words reach past the address bits.
+/// Where the pieces of an instance's state laid as `lay` lie in the pool,
+/// at `place` ([`engine::ScratchPlace`]): a run of slots' one piece from its
+/// first slot, else each run of chunks' first byte, piece by piece. Refused
+/// by name where the place holds fewer pieces, or runs of another length,
+/// than the state takes, a run passes its segment, or a segment's words
+/// reach past the address bits.
 pub fn piece_places<B: crate::backend::Backend>(
     pools: &crate::store::Pools<B>,
     place: &engine::ScratchPlace,
-    pieces: u32,
-    held: u64,
+    lay: &InstanceLay,
 ) -> crate::error::Result<Vec<PiecePlace>> {
     use crate::store::layout::INSTANCE;
     let refused = |why: String| crate::error::Fault::Program {
         at: "guest::session",
         why,
     };
+    let (pieces, held) = (lay.pieces(), lay.held_bytes());
     let firsts: Vec<u32> = match place {
         engine::ScratchPlace::None if pieces == 0 => Vec::new(),
         engine::ScratchPlace::None => {
             return Err(refused(format!(
-                "a guest's scratch takes {pieces} piece(s) and its binding holds none"
+                "a guest's state takes {pieces} piece(s) and its binding holds none"
             )));
         }
         engine::ScratchPlace::Run { first, slots } => {
             let room = u64::from(*slots) * pools.slot_bytes(INSTANCE)?;
             if pieces != 1 || room < held {
                 return Err(refused(format!(
-                    "a guest's scratch of {pieces} piece(s), {held} bytes, given a run of                      {slots} instance slot(s), {room} bytes"
+                    "a guest's state of {pieces} piece(s), {held} bytes, given a run of \
+                     {slots} instance slot(s), {room} bytes"
                 )));
             }
             vec![*first]
         }
-        engine::ScratchPlace::Chunks(chunks) => {
-            if (chunks.len() as u64) < u64::from(pieces) {
+        engine::ScratchPlace::Chunks { run, pieces: chunks } => {
+            if (chunks.len() as u64) < u64::from(pieces) || *run != lay.run.max(1) {
                 return Err(refused(format!(
-                    "a guest's scratch of {pieces} piece(s) given {} chunk(s)",
+                    "a guest's state of {pieces} piece(s) of {} chunk(s) given {} piece(s) of \
+                     {run}",
+                    lay.run,
                     chunks.len()
                 )));
             }
             let per_chunk = pools.slots_per_chunk(INSTANCE)?;
             chunks[..pieces as usize]
                 .iter()
-                .map(|&chunk| chunk.checked_mul(per_chunk).ok_or_else(|| refused(format!(
-                    "chunk {chunk} names no instance slot"
-                ))))
+                .map(|&chunk| {
+                    chunk
+                        .checked_mul(per_chunk)
+                        .ok_or_else(|| refused(format!("chunk {chunk} names no instance slot")))
+                })
                 .collect::<crate::error::Result<_>>()?
         }
+    };
+    let span = match place {
+        engine::ScratchPlace::Chunks { .. } => lay.piece_bytes(),
+        _ => held,
     };
     firsts
         .into_iter()
         .map(|slot| {
-            let (segment, _, at) = pools.slot_segment(INSTANCE, slot)?;
-            if at % 4 != 0 || (at + pools.chunk_bytes()) / 4 > 1 << SEGMENT_SHIFT {
+            let (segment, buffer, at) = pools.slot_segment(INSTANCE, slot)?;
+            let end = at + span;
+            if at % 4 != 0 || end > crate::backend::Buffer::bytes(buffer) || end / 4 > 1 << SEGMENT_SHIFT
+            {
                 return Err(refused(format!(
-                    "a guest piece at byte {at} of segment {segment}, which a guest address \
-                     of {SEGMENT_SHIFT} word bits does not reach"
+                    "a guest piece of {span} bytes at byte {at} of segment {segment}, past the \
+                     segment or the {SEGMENT_SHIFT} word bits a guest address reaches"
                 )));
             }
             Ok(PiecePlace { segment, at })

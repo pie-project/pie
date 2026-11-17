@@ -196,7 +196,7 @@ impl<L: Lower> std::fmt::Debug for Compiled<L> {
 /// no value of its scratch may pass, and its host staging's bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Bounds {
-    pub chunk: u64,
+    pub pieces: eta_exec::Pieces,
     pub io: crate::program::GuestIo,
 }
 
@@ -261,7 +261,7 @@ pub fn within(
     extents: &eta_exec::Extents,
     bounds: Bounds,
 ) -> Result<session::StageTables, Refused> {
-    session::stage_tables(&package.plans[at], extents, bounds.chunk)
+    session::stage_tables(&package.plans[at], extents, bounds.pieces)
         .map_err(|why| Refused::Chunk { stage: at, why })
 }
 
@@ -462,6 +462,9 @@ mod tests {
         /// Qwen3-0.6B's pool chunk on the GPU (its chunk recipe's).
         pub const QWEN_CHUNK: u64 = 4 << 20;
 
+        /// Its pool's chunks a segment, as the tests take it: room for a run.
+        pub const QWEN_SEGMENT: u32 = 64;
+
         /// [`super::a_shipped_programs_stage_scratch`]'s rows.
         /// Each: the program, its scratch each value its own bytes, the
         /// pieces it lies in at [`QWEN_CHUNK`], the bytes an instance holds
@@ -654,7 +657,7 @@ mod tests {
         let chunk = shipped::QWEN_CHUNK;
         // Every lane bound passed: the rows state what each moves.
         let bounds = Bounds {
-            chunk,
+            pieces: eta_exec::Pieces::new(chunk, shipped::QWEN_SEGMENT),
             io: crate::program::GuestIo {
                 lane_bytes: u64::MAX >> 8,
                 lanes: 1,
@@ -682,7 +685,7 @@ mod tests {
                     *name,
                     own,
                     tables.scratch.pieces(),
-                    tables.scratch.held_bytes(chunk),
+                    tables.scratch.held_bytes(),
                     pass_io(&package, 0, &tables),
                 )
             })
@@ -703,13 +706,21 @@ mod tests {
             lanes: 1,
             depth: 1,
         };
+        // In chunks of 1 MiB, a vocabulary-wide value takes a run of chunks;
+        // in segments of one chunk, it is refused by name.
         let small = Bounds {
-            chunk: 1 << 20,
+            pieces: eta_exec::Pieces::new(1 << 20, shipped::QWEN_SEGMENT),
             io,
         };
-        let refused = within(&package, 0, &Extents::default(), small).err();
+        let runs = within(&package, 0, &Extents::default(), small).expect("a run of chunks");
+        assert!(runs.scratch.run > 1, "{}", runs.scratch.run);
+        let one_chunk = Bounds {
+            pieces: eta_exec::Pieces::new(1 << 20, 1),
+            io,
+        };
+        let refused = within(&package, 0, &Extents::default(), one_chunk).err();
         assert!(
-            matches!(&refused, Some(Refused::Chunk { stage: 0, why }) if why.contains("past a 1048576-byte chunk")),
+            matches!(&refused, Some(Refused::Chunk { stage: 0, why }) if why.contains("segment")),
             "{refused:?}"
         );
         // A model declaring the logits row alone bounds a lane's room at
@@ -717,7 +728,7 @@ mod tests {
         // beside them are four bytes past it, stated by name and staged
         // through the device's transfer staging, not refused.
         let bounds = Bounds {
-            chunk: shipped::QWEN_CHUNK,
+            pieces: eta_exec::Pieces::new(shipped::QWEN_CHUNK, shipped::QWEN_SEGMENT),
             io,
         };
         let tables = within(&package, 0, &Extents::default(), bounds).expect("lays out");
@@ -755,27 +766,28 @@ mod tests {
         use session::{ScoreSpec, lay_instance};
         let vocab = shipped::QWEN_VOCAB;
         let chunk = shipped::QWEN_CHUNK;
+        let pieces = eta_exec::Pieces::new(chunk, shipped::QWEN_SEGMENT);
         let greedy = shipped::package(&shipped::greedy(vocab), vocab);
-        let stage = session::stage_tables(&greedy.plans[0], &Extents::default(), chunk)
+        let stage = session::stage_tables(&greedy.plans[0], &Extents::default(), pieces)
             .expect("greedy lays out");
         let spec = |lanes: Vec<(u32, bool)>| ScoreSpec {
             lanes,
             key_bytes: 40_960 * 4,
             page_bytes: 2_560 * 4,
         };
-        let none = lay_instance(&[&stage.scratch], &spec(Vec::new()), chunk).expect("fits");
+        let none = lay_instance(&[&stage.scratch], &spec(Vec::new()), pieces).expect("fits");
         assert_eq!(none.ends, stage.scratch.ends, "no row, the scratch alone");
-        let one = lay_instance(&[&stage.scratch], &spec(vec![(0, true)]), chunk).expect("fits");
+        let one = lay_instance(&[&stage.scratch], &spec(vec![(0, true)]), pieces).expect("fits");
         assert_eq!(one.pieces(), 1, "a key and a page row fit the scratch's piece");
         let (lane, keys, pages) = one.rows[0];
         assert_eq!(lane, 0);
         assert!(keys.offset >= stage.scratch.ends[0], "past the scratch");
         assert_eq!(pages.expect("a page row").offset, keys.offset + 40_960 * 4);
-        assert_eq!(one.held_bytes(chunk), one.ends[0], "one run");
+        assert_eq!(one.held_bytes(), one.ends[0], "one run");
         let many: Vec<(u32, bool)> = (0..8).map(|lane| (lane, lane % 2 == 0)).collect();
-        let lay = lay_instance(&[&stage.scratch], &spec(many), chunk).expect("fits");
+        let lay = lay_instance(&[&stage.scratch], &spec(many), pieces).expect("fits");
         assert!(lay.pieces() > 1);
-        assert_eq!(lay.held_bytes(chunk), u64::from(lay.pieces()) * chunk);
+        assert_eq!(lay.held_bytes(), u64::from(lay.pieces()) * chunk);
         for &(_, keys, pages) in &lay.rows {
             for (row, bytes) in [(Some(keys), 40_960 * 4), (pages, 2_560 * 4)] {
                 if let Some(row) = row {
@@ -787,8 +799,13 @@ mod tests {
             key_bytes: chunk + 4,
             ..spec(vec![(0, false)])
         };
-        let refused = lay_instance(&[&stage.scratch], &wide, chunk).unwrap_err();
+        let refused = lay_instance(&[&stage.scratch], &wide, pieces).unwrap_err();
         assert!(refused.contains("a key row takes"), "{refused}");
+        // Laid with the program, a row wider than a chunk takes a run of them.
+        let (_, wide_lay) = session::lay_program(&greedy.plans, &Extents::default(), &wide, pieces)
+            .expect("a run of two chunks");
+        assert_eq!(wide_lay.run, 2);
+        assert_eq!(wide_lay.held_bytes(), u64::from(wide_lay.pieces()) * 2 * chunk);
     }
 
     /// A value the host stages or reads back that the stage's plan does not

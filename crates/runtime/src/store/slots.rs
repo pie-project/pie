@@ -225,6 +225,22 @@ pub enum SlotError {
         slots: u64,
         per_chunk: u32,
     },
+    /// A run of adjacent chunks longer than a segment holds: chunks lie at
+    /// adjacent addresses only inside one segment.
+    #[error("a run of {run} adjacent chunks is past a segment's {segment}")]
+    RunPastSegment { run: u32, segment: u32 },
+    /// Fewer free runs of `run` adjacent chunks inside one segment than
+    /// `pieces`: what was free, as runs of that length and as chunks.
+    #[error(
+        "{pieces} runs of {run} adjacent chunks inside one segment asked, and {free_runs} \
+         such runs are free ({free_chunks} free chunks)"
+    )]
+    NoChunkRun {
+        run: u32,
+        pieces: u32,
+        free_runs: u32,
+        free_chunks: u32,
+    },
 }
 
 /// A raise of the activation, as planned: nothing moves, live state never
@@ -517,6 +533,11 @@ pub struct SlotPool {
     retired: u64,
     holders: HashMap<Holder, u64>,
     waiters: HashMap<u64, (ShapeId, u64)>,
+    /// Runs of adjacent chunks taken whole ([`Self::acquire_chunk_runs`])
+    /// and longer than one: each run's first logical chunk and its length.
+    /// The chunks after the first lie at the next physical chunks, and an
+    /// evacuation moves the run whole.
+    runs: HashMap<u32, u32>,
 }
 
 impl SlotPool {
@@ -582,6 +603,7 @@ impl SlotPool {
             retired: 0,
             holders: HashMap::new(),
             waiters: HashMap::new(),
+            runs: HashMap::new(),
         };
         pool.act = pool.act_chunks(0);
         assert!(
@@ -1403,6 +1425,105 @@ impl SlotPool {
         Ok(taken)
     }
 
+    /// The free runs of `run` adjacent chunks a holder, `live` or not, may
+    /// open now, each inside one committed segment, below what it may fill
+    /// ([`Self::fill_limit`]): each run's first physical chunk, lowest
+    /// first, no two sharing a chunk, and no more than the budget's room
+    /// holds ([`Self::headroom`]).
+    fn chunk_runs_for(&self, run: u32, live: bool) -> Vec<u32> {
+        let run = run.max(1);
+        if run > self.segments.segment_chunks() {
+            return Vec::new();
+        }
+        let limit = self.fill_limit(live);
+        let room = if live {
+            self.headroom()
+        } else {
+            self.headroom_any()
+        };
+        let most = (room / run) as usize;
+        let mut firsts = Vec::new();
+        for segment in 0..self.segments.count() {
+            let range = self.segments.range(segment);
+            let mut stretch = 0u32;
+            for chunk in range.start..range.end.min(limit) {
+                if !self.open.get(chunk) {
+                    stretch = 0;
+                    continue;
+                }
+                stretch += 1;
+                if stretch == run {
+                    firsts.push(chunk + 1 - run);
+                    stretch = 0;
+                }
+            }
+        }
+        firsts.truncate(most);
+        firsts
+    }
+
+    /// Free runs of `run` adjacent chunks inside one segment live state may
+    /// take now ([`Self::acquire_chunk_runs`]), counted disjoint.
+    #[must_use]
+    pub fn free_chunk_runs(&self, run: u32) -> u32 {
+        u32::try_from(self.chunk_runs_for(run, true).len()).unwrap_or(u32::MAX)
+    }
+
+    /// `pieces` runs of `run` adjacent free chunks for `holder`, each run
+    /// inside one segment, the lowest first, each chunk opened for `shape`
+    /// and all its slots taken: refs in order, a run's chunks in physical
+    /// order. A run longer than one is kept so (an evacuation moves it
+    /// whole) until its first chunk is free again. All or nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`SlotError::RunPastSegment`] where `run` is past a segment's
+    /// chunks; [`SlotError::NoChunkRun`] where fewer than `pieces` such
+    /// runs are free, naming what was.
+    pub fn acquire_chunk_runs(
+        &mut self,
+        holder: Holder,
+        shape: ShapeId,
+        run: u32,
+        pieces: u32,
+    ) -> Result<Vec<Slot>, SlotError> {
+        let spc = self
+            .shapes
+            .get(shape as usize)
+            .ok_or(SlotError::UnknownShape(shape))?
+            .spc();
+        let run = run.max(1);
+        let segment = self.segments.segment_chunks();
+        if run > segment {
+            return Err(SlotError::RunPastSegment { run, segment });
+        }
+        let live = holder.is_live();
+        let firsts = self.chunk_runs_for(run, live);
+        if firsts.len() < pieces as usize {
+            return Err(SlotError::NoChunkRun {
+                run,
+                pieces,
+                free_runs: u32::try_from(firsts.len()).unwrap_or(u32::MAX),
+                free_chunks: self.free_chunks_for(live),
+            });
+        }
+        let mut taken = Vec::with_capacity((pieces * run * spc) as usize);
+        for &first in &firsts[..pieces as usize] {
+            let head = self.physical_to_logical[first as usize];
+            for physical in first..first + run {
+                let chunk = self.open_at(physical, shape);
+                self.fill(chunk, live, u64::from(spc), &mut taken);
+            }
+            if run > 1 {
+                self.runs.insert(head, run);
+            }
+        }
+        if !taken.is_empty() {
+            *self.holders.entry(holder).or_default() += taken.len() as u64;
+        }
+        Ok(taken)
+    }
+
     /// Exactly slot refs `first .. first + n` of `shape` for `holder`, in
     /// ref order: the chunks they lie in, `first` its chunk's slot 0, each
     /// opened for the shape where it is named rather than lowest first (a
@@ -1807,6 +1928,7 @@ impl SlotPool {
     }
 
     fn close_chunk(&mut self, logical: u32, physical: u32) {
+        self.runs.remove(&logical);
         self.chunks[logical as usize] = FREE_CHUNK;
         self.free.set(physical);
         self.segments.let_go(physical);
@@ -1911,9 +2033,11 @@ impl SlotPool {
     }
 
     /// Moves every held chunk of `segment` into free committed chunks of
-    /// lower segments, lowest first; none when they do not fit there, when
-    /// the segment holds reserved chunks, or when the budget would not
-    /// survive losing the segment.
+    /// lower segments, lowest first, a run of adjacent chunks
+    /// ([`Self::acquire_chunk_runs`]) whole into as many adjacent free
+    /// chunks of one segment; none when they do not fit there, when the
+    /// segment holds reserved chunks, or when the budget would not survive
+    /// losing the segment.
     pub fn plan_evacuation(&self, segment: u32) -> Option<Evacuation> {
         if segment >= self.top_segment || self.segments.state(segment) != SegmentState::Committed {
             return None;
@@ -1929,16 +2053,52 @@ impl SlotPool {
         let sources: Vec<u32> = (range.start..range.end)
             .filter(|&chunk| !self.free.get(chunk))
             .collect();
-        let moves: Vec<ChunkMove> = sources
-            .iter()
-            .zip(self.open.iter_in(0, range.start))
-            .map(|(&from, to)| ChunkMove {
+        let mut targets: BTreeSet<u32> = self.open.iter_in(0, range.start).collect();
+        let mut moves = Vec::with_capacity(sources.len());
+        let mut in_run = BTreeSet::new();
+        for &from in &sources {
+            let logical = self.physical_to_logical[from as usize];
+            let Some(&run) = self.runs.get(&logical) else {
+                continue;
+            };
+            let to = self.free_run_in(&targets, run)?;
+            for k in 0..run {
+                targets.remove(&(to + k));
+                in_run.insert(from + k);
+                moves.push(ChunkMove {
+                    logical: self.physical_to_logical[(from + k) as usize],
+                    from: from + k,
+                    to: to + k,
+                });
+            }
+        }
+        for &from in sources.iter().filter(|from| !in_run.contains(from)) {
+            let to = targets.pop_first()?;
+            moves.push(ChunkMove {
                 logical: self.physical_to_logical[from as usize],
                 from,
                 to,
-            })
-            .collect();
-        (moves.len() == sources.len()).then_some(Evacuation { segment, moves })
+            });
+        }
+        Some(Evacuation { segment, moves })
+    }
+
+    /// The lowest of `free` chunks that opens `run` of them at adjacent
+    /// physical ids inside one segment.
+    fn free_run_in(&self, free: &BTreeSet<u32>, run: u32) -> Option<u32> {
+        let mut stretch = 0u32;
+        let mut last = None;
+        for &chunk in free {
+            let adjacent = last.is_some_and(|last: u32| {
+                last + 1 == chunk && self.segments.of(last) == self.segments.of(chunk)
+            });
+            stretch = if adjacent { stretch + 1 } else { 1 };
+            last = Some(chunk);
+            if stretch == run {
+                return Some(chunk + 1 - run);
+            }
+        }
+        None
     }
 
     /// Carries out `evacuation`, which the fire at `epoch` copies: the
@@ -2677,5 +2837,77 @@ mod tests {
                 ],
             );
         }
+    }
+
+    /// Runs of adjacent chunks are taken inside one segment, lowest first,
+    /// never across a segment's end; a run past a segment is refused by
+    /// name, and too few free runs are refused naming what was free. An
+    /// evacuation moves a run whole onto adjacent free chunks of one lower
+    /// segment, its chunks in order.
+    #[test]
+    fn chunk_runs_lie_inside_a_segment_and_move_whole() {
+        let fixed = [(ShapeKind::Fixed, 4)];
+        // Four segments of 4 chunks, the top one under the activation.
+        let mut pool = SlotPool::new(facts_with(16, 4, 4, &fixed, &[(16, 4)]));
+        let holder = Holder::WorkingSet(1);
+        let physical = |pool: &SlotPool, slots: &[Slot]| -> Vec<u32> {
+            let mut chunks: Vec<u32> = slots
+                .iter()
+                .map(|slot| pool.physical(slot.chunk).unwrap())
+                .collect();
+            chunks.dedup();
+            chunks
+        };
+        // Segment 0 holds the null chunk: its run of 3 is 1..4.
+        assert_eq!(pool.free_chunk_runs(3), 3);
+        let first = pool.acquire_chunk_runs(holder, 0, 3, 1).unwrap();
+        assert_eq!(physical(&pool, &first), [1, 2, 3]);
+        assert_eq!(first.len(), 12, "every slot of each chunk");
+        // A run of 2 then lies in segment 1, never across 3|4.
+        let second = pool.acquire_chunk_runs(holder, 0, 2, 2).unwrap();
+        assert_eq!(physical(&pool, &second), [4, 5, 6, 7]);
+        assert_eq!(
+            pool.acquire_chunk_runs(holder, 0, 5, 1),
+            Err(SlotError::RunPastSegment { run: 5, segment: 4 })
+        );
+        assert_eq!(
+            pool.acquire_chunk_runs(holder, 0, 3, 2),
+            Err(SlotError::NoChunkRun {
+                run: 3,
+                pieces: 2,
+                free_runs: 1,
+                free_chunks: 4,
+            })
+        );
+        // Segment 0 empties but for the null chunk; segment 2's run of 3
+        // moves whole into 1..4.
+        let third = pool.acquire_chunk_runs(holder, 0, 3, 1).unwrap();
+        assert_eq!(physical(&pool, &third), [8, 9, 10]);
+        pool.release(holder, &first, 0);
+        let evacuation = pool.plan_evacuation(2).expect("the run fits segment 0");
+        let moves: Vec<(u32, u32)> = evacuation
+            .moves
+            .iter()
+            .map(|step| (step.from, step.to))
+            .collect();
+        assert_eq!(moves, [(8, 1), (9, 2), (10, 3)]);
+        pool.apply_evacuation(&evacuation, 1).unwrap();
+        assert_eq!(physical(&pool, &third), [1, 2, 3], "adjacent, in order");
+        // Where no lower segment has the run free, the segment stays.
+        let mut pool = SlotPool::new(facts_with(16, 4, 4, &fixed, &[(16, 4)]));
+        let run = pool.acquire_chunk_runs(holder, 0, 3, 1).unwrap();
+        let singles = pool.acquire_chunk_runs(holder, 0, 1, 2).unwrap();
+        assert_eq!(physical(&pool, &singles), [4, 5]);
+        let far = pool.acquire_chunk_runs(holder, 0, 3, 1).unwrap();
+        assert_eq!(physical(&pool, &far), [8, 9, 10]);
+        pool.release(holder, &run, 0);
+        // Segment 0 has 1..4 free again: segment 2's run fits there.
+        assert!(pool.plan_evacuation(2).is_some());
+        let taken = pool.acquire_chunk_runs(holder, 0, 1, 1).unwrap();
+        assert_eq!(physical(&pool, &taken), [1]);
+        assert!(
+            pool.plan_evacuation(2).is_none(),
+            "2..4 and 6..8 free, four chunks, and no run of 3 in a lower segment"
+        );
     }
 }
