@@ -90,6 +90,9 @@ pub struct Shell {
     /// The classes a stated mask reaches as a group's (a ragged attention):
     /// a lane there states one or none.
     group_masked: poem_ir::ClassSet,
+    /// The ragged packings an attention stating a mask reads, a fire's
+    /// group masks staged in their order (`exports::stated_feeds`).
+    stated_feeds: Vec<(poem_ir::Selection, poem_ir::Selection)>,
     wide: poem_ir::ClassSet,
     feeds: crate::exports::Feeds,
     corrected: poem_ir::ClassSet,

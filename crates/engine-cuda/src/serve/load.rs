@@ -1058,6 +1058,7 @@ impl Shell {
         // partials are sized for the lanes, not the widest fire's rows.
         facts.mark_rows_a_lane(&read_only_by_decoders(&boot.trace, &compiled, &decoding));
         let feeds = Feeds::of(&boot.trace, &compiled);
+        let stated_feeds = crate::exports::stated_feeds(&boot.trace, &feeds.ragged);
         let tiers = crate::record::Tiers {
             plain: plain_of(
                 &landing,
@@ -1338,13 +1339,8 @@ impl Shell {
             &schedule_streams(&boot.trace, &compiled),
             pools.ids_a_lane(),
             buffers.as_ref().map(crate::store::rs::Buffers::page_tokens),
-            // A stretch a ragged attention, where some class reads a lane's
-            // group mask.
-            if group_masked.is_empty() {
-                0
-            } else {
-                feeds.ragged.len()
-            },
+            // A stretch a packing an attention stating a mask reads.
+            stated_feeds.len(),
         )?;
 
         let exports = Exports::of(&boot.trace, &compiled, boot.context, boot.page_size)?;
@@ -1439,6 +1435,7 @@ impl Shell {
             page_tables,
             masked,
             group_masked,
+            stated_feeds,
             wide,
             feeds,
             adapter_fact,
