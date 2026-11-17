@@ -2900,31 +2900,31 @@ What follows:
 
 **Decode, measured.** Each of the 9 models' cold candidates (`cold::candidates`, 4,096
 positions) was sorted three ways: refused by the constructor, refused at build (`Program::build`:
-the floor, the wiring, colours, fit), or built. Columns: (a) the cheapest that builds; (b) the
-cheapest refused only at build. Where (b) < (a), a placer that made it build would gain at most
-(a) - (b).
+the floor, the wiring, colours, fit), or built. Where a candidate refused only for geometry is cheaper than the first
+that builds, a placer that made it build gains at most the difference.
 
-Each line is cold candidates at 4,096 positions with the kinds' layer cost, before the walk.
-"Refused for geometry" means one of: the fabric, the wafer, the band, a route clash, the even
-unit count.
+The cold candidates at 4,096 positions are priced by shape alone (`time::step`, the kinds'
+layer cost) and built cheapest first until one builds. A candidate the snake refuses before
+it plans ("N units on X x Y slots") is re-gridded: one unit column, because the price reads
+no grid. The examples `p1_price` / `p1_refusals` are uncommitted scratch.
 
-| model | candidates / plan | (a) builds | (b) geometry-refused | cheaper than (a) | why |
+| model | candidates | snake-refused, re-gridded and priced | cheapest priced (re-gridded) | first that builds | cheaper refused for geometry |
 |---|---|---|---|---|---|
-| gpt-oss-20b | 6,690 / 2,592 | 0.4168 | **0.3835 (-8.0%)** | 105 | two band columns 1,090 wide (over 750; 290-580 rows high, so the area fits); an odd unit count (the last unit must sit on the band) |
-| Gemma 4 E4B | 1,872 / 1,872 | 0.8241 | 0.8234 (-0.08%) | 5 | 771 wide, 21 columns over |
-| Qwen3.5 9B | 3,206 / 904 | 0.4862 | 0.4862 | 1 (a tie) | a route clash |
-| Qwen3-8B | 8,278 / 2,604 | 0.4995 | 0.4995 | 1 (a tie) | a route clash |
-| Qwen3.5 0.8B, 4B, Llama 3.1 8B, Gemma 4 E2B | | | | 0 | |
-| Gemma 4 12B | PENDING_12B | | | | |
+| Qwen3.5 0.8B | 4,220 | 1,651 | 0.2720 (0.2720) | 0.2720 | none |
+| Qwen3.5 4B | 3,617 | 1,184 | 0.4359 (0.4359) | 0.4359 | none |
+| Qwen3.5 9B | 3,206 | 1,184 | 0.4862 (0.4862) | 0.4862 | none |
+| Llama 3.1 8B | 4,698 | 1,619 | 0.4536 (0.4536) | 0.4536 | none |
+| Qwen3-8B | 8,278 | 1,886 | 0.4995 (0.4995) | 0.4995 | none |
+| Gemma 4 E2B | 819 | — | 0.7036 | 0.7062 | none (39 refused for RoPE positions, not geometry) |
+| Gemma 4 E4B | 1,872 | — | 0.8234 | 0.8241 | **-0.08%**: 5 over the wafer (771 wide) |
+| Gemma 4 12B | 59,904 | — | 0.8481 | 0.8515 | **-0.4%**: 42 over the wafer |
+| gpt-oss-20b | 6,690 | — | 0.3835 | 0.4168 | **-8.0%**: 31 over the wafer (two band columns 1,090 wide), 40 odd unit counts, 15 band rules |
 
-Two things the table does not price:
-- **The snake constructor's own refusal** ("N units on X x Y slots"). This is 1,850-3,256
-  candidates for each `Own` model. They are refused before a plan exists, so they cannot be
-  priced, and a free placer would admit them.
-- **The walk** from the extra seeds a placer admits.
-
-So among the decode models, only gpt-oss has a placement-sized gain (up to 8% by today's
-price). The rest gain at most 0.1% unless a link term is added.
+- **The snake's refusals hide nothing.** For each `Own` model, the cheapest re-gridded
+  candidate costs exactly the cheapest grid-valid one. The price reads no grid, and every
+  (K, PX, PY) the snake refuses on one grid is laid on another.
+- **A placer's decode payoff by today's price is gpt-oss's 8%.** Gemma 12B (0.4%) and E4B
+  (0.08%) follow; for the rest there is none unless a link term is added.
 
 ### P1.b Where adjacency is assumed (inventory)
 
@@ -3085,7 +3085,9 @@ on 8 threads. The 60 s target is the anneal plus at most about 10 router passes.
    and the 0.6B units. A new module; the builders gain one entry point each.
 2. **Before the router: the idle-PE route hole.** Add a generic settle and a build-time
    refusal for a route at a PE that loads none. Today's programs never hit it, so they are
-   unchanged, but a free route would.
+   unchanged, but a free route would. The refusal is done (`Fabric::check_route_slots`): every
+   test passes, and the cold search's nine prices are as before. The settle comes with the
+   router.
 3. **(c) Router + generalized wiring, in the order of what kernels already allow**:
    - stream / grid inter-unit links: the row bus, K / V links, the lane bus (all R);
    - the decode handoff (R, the weight-PE relay kept where a turn falls on a weight PE);
@@ -3111,3 +3113,42 @@ The link and congestion terms are reported beside it, uncalibrated, until a chip
   `Stream::of`; the bands stay as the seed. Stream units are G1's.
 - With M2f: none past reading `Placed`.
 - Decode `block/units.rs::handoff` gains a routed variant.
+
+### P1.b Built: the problem and the pinned placement
+
+`src/place/` (new) and one additive entry, `Program::build_placed`.
+
+- **`place::Problem::of(w, h, rects, wiring, kind)`** sorts a program's links onto its blocks.
+  - A link wholly inside one block is that block's own.
+  - Every other link is a `Net`, which records the blocks it touches and whether it crosses
+    free PEs.
+  - A class's turns at adjacent PEs (a bus stated a PE at a time: the PLE buses, the token
+    line) are one net, while a turn alone at a root (a loop-back) stays its block's.
+  - Notes move with their block, or with the net through their free PE.
+- **`Problem::apply(wiring, solution)`** moves each block's links by its delta, and each net
+  with its blocks when they move alike. A net between blocks moved apart is refused here; it
+  is the router's in (c).
+- **Decode** (`place::decode`):
+  - `problem(floor, wiring)` takes as blocks the units, relay slots, the head and the storage
+    blocks, and checks that every PE running a kernel lies in one.
+  - `floor(problem, floor, solution)` moves their PEs, rectangles, the head's control line
+    and root.
+  - `Program::build_placed(plan, place)` lays the floor and links, places, applies, then
+    settles, colours and lays as `build` does (its tail, `Program::finish`, is shared with
+    `build_with`).
+- **Stream / grid** (`place::stream`):
+  - the blocks are each unit's rectangle and each K / V column's;
+  - `stream(problem, stream, solution)` moves the units (a K / V column with its first unit
+    for now) and the lane receivers;
+  - `relay(program, stream)` re-lays the palette and fabric.
+  - No existing function was changed. `Stream::of` and `program_at` are untouched.
+- **Byte identity, pinned** (`place::decode::tests`, `place::stream::tests`): every file `build`
+  emits is identical for:
+  - every measured decode config (0.8B, 4B, 9B, Qwen3-8B, Llama, E2B, E4B, 12B, gpt-oss);
+  - every kernel set's tiny;
+  - flux2-mini's denoise stream at one band and at three (38 columns);
+  - Qwen3-0.6B's decode units (253 blocks, 7,840 nets).
+
+  A uniform shift of every block builds, with the floor, links and palette translated.
+  GEMM and tiled programs (klein text, denoise, VAE) are one rigid array each and are not
+  placed yet; their identity is untouched.
