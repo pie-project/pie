@@ -273,8 +273,20 @@ impl ResidencyPlanner {
             // for its state too.
             let spare = expected.pages.saturating_sub(missing);
             // A bind short of room is short the pages that, moved out
-            // whole, free its chunks: free pages are no runs of chunks.
-            let room = waiter.room_pages().saturating_sub(expected.pages);
+            // whole, free its chunks: free pages are no runs of chunks. So
+            // is the restore of a process such a bind suspended.
+            let pending = match waiter.kind {
+                WaitKind::Restore { .. } => inner
+                    .procs
+                    .get(&waiter.pid)
+                    .and_then(|proc| proc.bind_room)
+                    .map_or(0, |need| need.pages),
+                _ => 0,
+            };
+            let room = waiter
+                .room_pages()
+                .max(pending)
+                .saturating_sub(expected.pages);
             let deficit = Reclaim {
                 pages: missing
                     .saturating_sub(expected.pages.saturating_add(free))

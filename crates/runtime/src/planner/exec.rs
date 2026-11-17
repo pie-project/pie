@@ -774,6 +774,21 @@ async fn restore(
             return;
         }
     };
+    // Suspended by a bind short of guest-state room, it comes back only
+    // with room for that bind past what its own items took: else it would
+    // bind short again at once. It waits, queued, as a restore short of
+    // room for its roles.
+    if let Some(need) = planner.pending_bind(pid)
+        && stores
+            .roles
+            .as_ref()
+            .is_some_and(|roles| roles.lock().unwrap().free_runs(need.run) < need.pieces)
+    {
+        abort(model, engine, Move::Restore { kv, rs, roles });
+        tracing::debug!(%pid, "planner: a restore waits for room for its pending bind");
+        planner.requeue_restore_roles(pid);
+        return;
+    }
     let mut guard = MoveGuard::new(model, engine, Move::Restore { kv, rs, roles });
     if let Err(error) = guard.copy(&planner, pid).await {
         planner.restore_faulted(

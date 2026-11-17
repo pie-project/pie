@@ -9,8 +9,8 @@ use tokio::sync::Notify;
 
 use crate::store::rs::RsUnits;
 
-use super::inner::RESERVE_SHARE;
-use super::proc::{Proc, Residency};
+use super::inner::{RESERVE_SHARE, RestoreGate};
+use super::proc::{PendingBind, Proc, Residency};
 use super::reclaim::Reclaim;
 use super::wait::{EntryKey, WaitKind};
 
@@ -2198,7 +2198,7 @@ async fn a_bind_by_a_suspended_process_waits_for_its_restore() {
         |_, _| std::future::ready(Err::<(), String>("no guest state here".into())),
         || None,
         |_, _| false,
-        || false,
+        |_, _| false,
         |_, _| std::future::ready(Err::<(), String>("no guest state here".into())),
     );
     tokio::pin!(decode);
@@ -2602,5 +2602,119 @@ async fn short_lived_binds_over_a_cache_filled_pool_all_land() {
         planner.stats.evictions_started.load(Ordering::Relaxed),
         0,
         "cache alone was dropped for them"
+    );
+}
+
+/// A process a bind short of guest-state room suspended comes back only
+/// with its whole need: its kv pages and the room its pending bind asks.
+/// The device has free pages (kv room, a plain restore would go) but no
+/// run of 3 free chunks: its restore waits, queued, and nothing evicts for
+/// it while the fleet runs. Once a run frees, the room event alone serves
+/// it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_restore_suspended_for_a_bind_waits_for_the_bind_s_room_too() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    // Free pages, but no 3 of them adjacent.
+    pool.free.lock().extend([0, 2, 4, 6]);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (binder, runner) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [binder, runner] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    // Its bind asked one run of 3 chunks, and it was parked for it.
+    planner.with_inner(|inner| {
+        let proc = inner.procs.get_mut(&binder).unwrap();
+        proc.state = Residency::Evicted;
+        proc.bind_room = Some(PendingBind {
+            run: 3,
+            pieces: 1,
+            pages: 3,
+        });
+        inner.enqueue(
+            binder,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        );
+    });
+    let state = |planner: &Arc<ResidencyPlanner>| {
+        planner.with_inner(|inner| inner.procs.get(&binder).unwrap().state)
+    };
+    // Control: by kv pages alone it would go now.
+    let spare = pool.chunk_stats().pages.0;
+    assert_eq!(
+        planner.with_inner(|inner| inner.restore_gate(binder, spare)),
+        RestoreGate::Serve,
+        "its kv room stands"
+    );
+    planner.pages_freed();
+    assert_eq!(state(&planner), Residency::Evicted, "not restored");
+    assert_eq!(planner.diagnostics().queue.len(), 1, "it waits, queued");
+    assert_eq!(
+        planner.stats.evictions_started.load(Ordering::Relaxed),
+        0,
+        "the fleet runs: nothing parked for it"
+    );
+    // A run of 3 frees: the room event serves it.
+    pool.free.lock().extend([1, 3, 5]);
+    planner.pages_freed();
+    assert_eq!(state(&planner), Residency::Restoring, "restored now");
+    assert_eq!(planner.diagnostics().queue.len(), 0);
+}
+
+/// The victim choice a bind short of room funds is the planner's one
+/// order ([`super::rank::VictimOrder`]): the policy's key first, then the
+/// process made resident last before those running longer. The bind's
+/// run, as pages, is the head's deficit.
+#[tokio::test(flavor = "current_thread")]
+async fn a_bind_short_of_room_picks_victims_by_victim_order() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let pids: Vec<ProcessId> = (0..4).map(|_| ProcessId::new_v4()).collect();
+    for pid in &pids {
+        planner.register(*pid);
+        planner.note_admitted(*pid);
+    }
+    let (binder, held) = (pids[0], &pids[1..]);
+    for pid in held {
+        planner.with_inner(|inner| inner.procs.get_mut(pid).unwrap().idle = true);
+    }
+    let p = planner.clone();
+    let _waited = crate::rt::spawn(async move { p.wait_bind_room(binder, 3, 1).await });
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if planner.diagnostics().queue.len() == 1 {
+            break;
+        }
+    }
+    let order = |planner: &Arc<ResidencyPlanner>| {
+        let set = planner.victim_set().expect("the bind is short");
+        assert_eq!(set.head_pid, binder);
+        assert_eq!(set.deficit.pages, 3, "its run of 3 chunks, as pages");
+        let mut by = set.preferred();
+        by.sort_by_key(|&(_, order)| order);
+        by.into_iter().map(|(pid, _)| pid).collect::<Vec<_>>()
+    };
+    assert_eq!(
+        order(&planner),
+        vec![held[2], held[1], held[0]],
+        "admitted last, first"
+    );
+    // The oldest is parked and comes back: now the youngest resident.
+    planner.with_inner(|inner| inner.came_back(held[0]));
+    assert_eq!(
+        order(&planner),
+        vec![held[0], held[2], held[1]],
+        "restored last, first"
+    );
+    // A policy key leads whatever the recency.
+    planner.with_inner(|inner| inner.procs.get_mut(&held[1]).unwrap().key = -1);
+    assert_eq!(
+        order(&planner),
+        vec![held[1], held[0], held[2]],
+        "the policy's key leads"
     );
 }

@@ -11,7 +11,7 @@ use super::grant::{AllocationGrant, Demand, DevicePageReservation, RsSlotReserva
 use super::holdings::{held_page_count, held_rs_units};
 use super::inner::Inner;
 use super::pool::PoolPort;
-use super::proc::{Proc, Residency};
+use super::proc::{PendingBind, Proc, Residency};
 use super::rank::VictimOrder;
 use super::reclaim::Reclaim;
 use super::short::{Shortfall, Sink, WeightShed};
@@ -985,11 +985,38 @@ impl ResidencyPlanner {
     /// Suspends `pid` to give back the room its parked items hold on the
     /// device: a bind of its short of room it holds part of itself would
     /// wait on itself ([`crate::store::roles::bind_when_resident`]).
-    /// Whether a suspension began.
-    pub fn suspend_for_room(self: &Arc<Self>, pid: ProcessId) -> bool {
+    /// Whether a suspension began. The bind asks `pieces` runs of `run`
+    /// adjacent chunks: its restore waits for them beside its kv pages
+    /// ([`super::proc::Proc::bind_room`]), never served into the same
+    /// shortfall.
+    pub fn suspend_for_room(self: &Arc<Self>, pid: ProcessId, run: u32, pieces: u32) -> bool {
+        let need = PendingBind {
+            run: run.max(1),
+            pieces,
+            pages: self.port.chunks_as_pages(run.max(1).saturating_mul(pieces)),
+        };
         let before = self.stats.evictions_started.load(Ordering::Relaxed);
-        ptrace!("suspend-for-room pid={}", pid);
+        ptrace!(
+            "suspend-for-room pid={} run={} pieces={}",
+            pid,
+            need.run,
+            need.pieces
+        );
+        self.with_inner(|inner| {
+            if let Some(proc) = inner.procs.get_mut(&pid) {
+                proc.bind_room = Some(need);
+            }
+        });
         self.pause(vec![pid], |_| true);
+        // Not suspended, it waits as any bind short of room: no restore
+        // reads the room.
+        self.with_inner(|inner| {
+            if let Some(proc) = inner.procs.get_mut(&pid)
+                && proc.state == Residency::Resident
+            {
+                proc.bind_room = None;
+            }
+        });
         self.stats.evictions_started.load(Ordering::Relaxed) > before
     }
 

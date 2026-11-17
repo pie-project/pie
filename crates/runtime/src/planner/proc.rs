@@ -65,6 +65,23 @@ pub(super) struct Proc {
     /// (instance tables, rings, guest state): it waits, queued, for a
     /// completion or an eviction to free some, never failed for it.
     pub(super) roles_short: bool,
+    /// Suspended by a bind of its short of guest-state room
+    /// ([`super::ResidencyPlanner::suspend_for_room`]): the room that bind
+    /// asks. Its restore is served only once that room stands free beside
+    /// its kv pages, as a bind short of room is
+    /// ([`super::wait::WaitKind::BindRoom`]), so it never comes back to be
+    /// short again.
+    pub(super) bind_room: Option<PendingBind>,
+}
+
+/// The guest-state room a suspended process's pending bind asks:
+/// `pieces` free runs of `run` adjacent chunks, `pages` the kv pages that,
+/// moved out whole, free them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PendingBind {
+    pub(super) run: u32,
+    pub(super) pieces: u32,
+    pub(super) pages: u32,
 }
 
 impl Proc {
@@ -120,6 +137,7 @@ impl Proc {
             fire_lapsed: false,
             landed: 0,
             roles_short: false,
+            bind_room: None,
         }
     }
 }

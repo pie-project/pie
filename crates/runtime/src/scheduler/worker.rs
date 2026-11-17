@@ -1189,13 +1189,13 @@ impl SchedulerHandle {
         };
         // Holding guest state of its own, it is suspended instead: waiting,
         // it would hold room its own bind lacks.
-        let suspend = || {
+        let suspend = |run: u32, pieces: u32| {
             let holds = crate::store::registry::try_get(0, engine)
                 .and_then(|stores| stores.roles)
                 .is_some_and(|roles| roles.lock().unwrap().holds_guest_state(pid));
             holds
                 && crate::planner::planner_of(pid)
-                    .is_some_and(|planner| planner.suspend_for_room(pid))
+                    .is_some_and(|planner| planner.suspend_for_room(pid, run, pieces))
         };
         // Waiting, it is a waiter in the planner's queue: idle cache goes
         // first, then a resident is parked for it, as for a restore short

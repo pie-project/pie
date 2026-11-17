@@ -1833,7 +1833,7 @@ pub async fn bind_when_resident<T, E, B, W, G, P>(
     grown: impl Fn(u32, u32) -> G,
     room: impl Fn() -> Option<RoomWatch>,
     fits: impl Fn(u32, u32) -> bool,
-    suspend: impl Fn() -> bool,
+    suspend: impl Fn(u32, u32) -> bool,
     planned: impl Fn(u32, u32) -> P,
 ) -> anyhow::Result<T>
 where
@@ -1862,8 +1862,9 @@ where
         {
             let (run, pieces) = need.chunk_runs();
             // Holding guest state of its own, it would wait on itself: it is
-            // suspended, its state given back, and binds once restored.
-            if suspend() {
+            // suspended, its state given back, and binds once restored with
+            // room for this bind (`run`, `pieces`) beside its own.
+            if suspend(run, pieces) {
                 tracing::debug!(%pid, %error, "a bind short of room suspends its process");
                 if let Err(why) = resident().await {
                     return Err(error.context(format!(

@@ -6,7 +6,7 @@ use tokio::sync::Notify;
 use super::grant::{AllocationGrant, Demand, DevicePageReservation, RsSlotReservation};
 use super::holdings::{swapped_page_count, swapped_rs_units};
 use super::inner::RestoreGate;
-use super::proc::Residency;
+use super::proc::{PendingBind, Residency};
 use super::wait::{EntryKey, WaitKind, Waiter};
 use super::{ProcessId, ResidencyPlanner, exec};
 use crate::store::rs::RsUnits;
@@ -43,6 +43,13 @@ enum Step {
     /// The head is a restore whose role slots found no room, and nothing
     /// else will free any: a resident process is evicted for it.
     EvictForRoles,
+    /// The head is a restore of a process a bind short of guest-state
+    /// room suspended, its kv gathered: it waits for the room that bind
+    /// asks as the bind would ([`Self::BindRoom`]).
+    RestoreBindRoom {
+        key: EntryKey,
+        need: PendingBind,
+    },
     /// The head is a bind short of device room for its guest state.
     BindRoom {
         key: EntryKey,
@@ -108,6 +115,9 @@ impl ResidencyPlanner {
         self.reseat_released();
         // Taken once a pass: every grow step of this pass goes on past it.
         let no_grow = self.no_grow.swap(false, Ordering::AcqRel);
+        // The head restore whose pending bind's room was seen free this
+        // pass: what it asks past its kv stands.
+        let mut room_stood: Option<EntryKey> = None;
         loop {
             let (rs_free, rs_total) = self.port.rs_stats();
             let rs_growth = self.rs_growth();
@@ -155,10 +165,16 @@ impl ResidencyPlanner {
                     Some(_) => Step::ServeAllocationBurst {
                         extra: inner.burst_shortfall(),
                     },
-                    None => match inner.restore_gate(pid, spare) {
-                        RestoreGate::Serve => Step::ServeRestore { key, pid },
-                        RestoreGate::Wait => Step::Done,
-                        RestoreGate::Evict => Step::EvictForRoles,
+                    None => match inner.procs.get(&pid).and_then(|proc| proc.bind_room) {
+                        // Its whole need: the room its bind asks too.
+                        Some(need) if room_stood != Some(key) => {
+                            Step::RestoreBindRoom { key, need }
+                        }
+                        _ => match inner.restore_gate(pid, spare) {
+                            RestoreGate::Serve => Step::ServeRestore { key, pid },
+                            RestoreGate::Wait => Step::Done,
+                            RestoreGate::Evict => Step::EvictForRoles,
+                        },
                     },
                 }
             });
@@ -174,6 +190,23 @@ impl ResidencyPlanner {
                     // first, one set or a sweep, and it looks again in what
                     // that left; then, the fleet stalled, a resident is
                     // parked for it by the planner's victim choice.
+                    if self.reclaim_idle_once() || self.sweep_stranded(u32::MAX, false) {
+                        continue;
+                    }
+                    if !self.with_inner(|inner| inner.fleet_stalled()) {
+                        return false;
+                    }
+                    true
+                }
+                Step::RestoreBindRoom { key, need } => {
+                    // As the bind it suspended for waits: served once the
+                    // runs stand free past its gathered kv, else idle cache
+                    // first, then, the fleet stalled, a resident parked
+                    // for it by the planner's victim choice.
+                    if self.port.guest_room_free(need.run, need.pieces) {
+                        room_stood = Some(key);
+                        continue;
+                    }
                     if self.reclaim_idle_once() || self.sweep_stranded(u32::MAX, false) {
                         continue;
                     }
