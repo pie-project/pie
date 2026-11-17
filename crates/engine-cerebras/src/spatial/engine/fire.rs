@@ -130,7 +130,7 @@ impl Spatial {
         let last_only = rows.len() == 1 && rows[0] as usize + 1 == tokens.len();
         let lookahead = self.lookahead();
         let greedy = greedy && last_only && lookahead > 0;
-        let width = self.readout.as_ref().map_or(0, |(_, w)| *w as usize);
+        let width = self.readout()?.1 as usize;
         let fed: Vec<u32> = history.iter().chain(tokens).copied().collect();
         // The wafer program runs its token loops back to back: the next
         // is posted as one lands, so the wafer runs while rows are answered.
@@ -315,6 +315,14 @@ impl Spatial {
         Ok(())
     }
 
+    /// The loaded model's readout: the float output its readout rows read,
+    /// and its width (a load refuses a trace without one).
+    fn readout(&self) -> EngineResult<(String, u32)> {
+        self.readout
+            .clone()
+            .ok_or_else(|| Error::Load("the spatial engine has no model loaded".into()))
+    }
+
     /// The most steps a greedy lane's token loop runs past its row (0: none):
     /// the config's `lookahead`, else 32 once a model is loaded.
     pub(super) fn lookahead(&self) -> usize {
@@ -463,9 +471,7 @@ impl Spatial {
                 (0..a.lanes.max(1)).map(move |k| (a.lane as usize + k as usize, a.instance))
             })
             .collect();
-        let (name, width) = self.readout.clone().ok_or_else(|| {
-            Error::Load("the model reads no float output at its readout rows".into())
-        })?;
+        let (name, width) = self.readout()?;
         let mut logits: Vec<Vec<Vec<f32>>> = Vec::with_capacity(lanes.len());
         let mut read_rows: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
         // Lanes a token loop answered (their row a one-hot of the argmax).
@@ -622,7 +628,10 @@ mod tests {
         let dense = [true, true, true, false, true, true, true, true];
         assert_eq!(first_non_causal(None, Some((&dense, 4)), 10, 12, 2), None);
         let ahead = [true, true, true, true, true, true, true, true];
-        assert_eq!(first_non_causal(None, Some((&ahead, 4)), 10, 12, 2), Some(0));
+        assert_eq!(
+            first_non_causal(None, Some((&ahead, 4)), 10, 12, 2),
+            Some(0)
+        );
         // With no boundary the columns are slots, as before.
         let whole = Masking::Extent(Mask::new(vec![0, 14], 14));
         assert_eq!(first_non_causal(Some(&whole), None, 0, 12, 2), None);
