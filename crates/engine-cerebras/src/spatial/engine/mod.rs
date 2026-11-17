@@ -12,8 +12,8 @@ mod posted;
 
 use engine::Engine;
 use engine::caps::{Capabilities, DeviceFacts, FireLimits, PoolFacts};
-use engine::chunk::{ChunkFacts, DegenerateBytes};
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
+use engine::chunk::{ChunkFacts, DegenerateBytes};
 use engine::error::{Error, Result as EngineResult};
 use engine::fire::{FireId, FireTicket, FrameId, FrameSubmission, FrameTicket, LaneReadout};
 use engine::load::{Checkpoint, LoadFacts, LoadRequest, Loaded};
@@ -23,7 +23,7 @@ use eta_ir::registry::{GeometryClass, PortMask};
 
 use kv::Kv;
 
-use super::config::{Config, Debug, Target};
+use super::config::{Config, Target};
 use super::facts::Facts;
 use super::{prepare, wafer};
 
@@ -34,7 +34,6 @@ use crate::api::{ContractFor, refusal};
 pub struct Spatial {
     programs: crate::program::Plane,
     cfg: Config,
-    debug: Debug,
     contract_for: ContractFor,
     /// The trace's classes, inputs, readout and paging.
     facts: Option<Facts>,
@@ -52,6 +51,9 @@ pub struct Spatial {
     /// The posted token loop on the wafer: the token it was fed and its
     /// position.
     loop_posted: Option<(u32, usize)>,
+    /// The most steps a greedy lane's token loop runs past its row, as the
+    /// load decided ([`fire::lookahead_of`]).
+    lookahead: usize,
     next_fire: u64,
     next_frame: u64,
     sink: Option<engine::CompletionSink>,
@@ -65,7 +67,6 @@ impl Spatial {
     pub fn new(cfg: Config, contract_for: ContractFor) -> Spatial {
         Spatial {
             programs: crate::program::Plane::default(),
-            debug: cfg.debug(),
             cfg,
             contract_for,
             facts: None,
@@ -78,6 +79,7 @@ impl Spatial {
             ahead_hits: 0,
             ahead_runs: 0,
             loop_posted: None,
+            lookahead: 0,
             next_fire: 0,
             next_frame: 0,
             sink: None,
@@ -134,9 +136,7 @@ impl Engine for Spatial {
             ));
         }
         if residency.host_kv_budget.is_some_and(|bytes| bytes > 0) {
-            tracing::warn!(
-                "the spatial engine states no host kv tier: host_kv_budget is not used"
-            );
+            tracing::warn!("the spatial engine states no host kv tier: host_kv_budget is not used");
         }
         let Checkpoint::Path(path) = checkpoint else {
             return Err(Error::Load(
@@ -148,6 +148,10 @@ impl Engine for Spatial {
         let positions = budgets.context_declared.then_some(budgets.max_context);
         let prepared = prepare::prepare(&self.cfg, &trace, &contract, &path, positions)
             .map_err(|e| Error::Load(format!("the wafer program: {e}")))?;
+        // Whether greedy lanes run the program's token loop, and how far:
+        // decided before the wafer opens.
+        self.lookahead = fire::lookahead_of(self.cfg.lookahead, prepared.plan.contract.token_loop)
+            .map_err(Error::Load)?;
         let slots = poem_compiler::state_slots(budgets.slots, &trace, DEFAULT_STATE_SLOTS);
         let facts = Facts::of(trace, &budgets, slots).map_err(Error::Load)?;
         self.readout = facts.readout();
@@ -155,13 +159,13 @@ impl Engine for Spatial {
             Some(cmaddr) => crate::sdk::Platform::System {
                 cmaddr: cmaddr.clone(),
             },
-            None => crate::sdk::Platform::Simulator(crate::sdk::Simulator {
-                num_threads: self.cfg.num_threads,
-                ..crate::sdk::Simulator::new(match self.cfg.target {
+            None => crate::sdk::Platform::Simulator(
+                crate::sdk::Simulator::new(match self.cfg.target {
                     Target::Wse2 => crate::sdk::Target::Wse2,
                     Target::Wse3 => crate::sdk::Target::Wse3,
                 })
-            }),
+                .map_err(|e| Error::Load(format!("the fabric simulator: {e}")))?,
+            ),
         };
         let vocab = self
             .readout
@@ -173,7 +177,6 @@ impl Engine for Spatial {
             vocab,
             prepared.weights.clone(),
             self.cfg.toolchain.sdk_lib(),
-            self.debug.force_prompt,
         )
         .map_err(|e| Error::Load(format!("the spatial wafer model: {e}")))?;
         tracing::info!(
