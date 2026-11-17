@@ -166,6 +166,37 @@ pub fn started(pid: ProcessId) -> tokio::sync::oneshot::Receiver<()> {
     rx
 }
 
+/// How a fire refused because a policy stopped its process reads: this,
+/// then the reason. Compat's `STOPPED`.
+pub const STOPPED: &str = "stopped by policy: ";
+
+/// Policy stops asked of running processes: the reason, and whether a fire
+/// has refused for it yet.
+static STOPS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<ProcessId, (String, bool)>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// A policy stops running `pid`: its next fire refuses with the reason, so
+/// the program can end its reply; a fire after that ends the process.
+pub(crate) fn stop(pid: ProcessId, reason: String) {
+    STOPS.lock().unwrap().entry(pid).or_insert((reason, false));
+}
+
+/// At a fire of `pid`: `Some(refusal)` if a policy stopped it.
+pub(crate) fn stopped(pid: ProcessId) -> Option<String> {
+    let mut stops = STOPS.lock().unwrap();
+    let (reason, told) = stops.get_mut(&pid)?;
+    let refusal = format!("{STOPPED}{reason}");
+    if *told {
+        let reason = reason.clone();
+        drop(stops);
+        crate::inferlet::process::terminate_by(pid, Err(reason), By::Policy);
+    } else {
+        *told = true;
+    }
+    Some(refusal)
+}
+
 fn note_start(event: &Event) {
     match event {
         Event::Started(pid) => {
@@ -179,6 +210,8 @@ fn note_start(event: &Event) {
             let mut starts = STARTS.lock().unwrap();
             starts.started.remove(pid);
             starts.waiting.remove(pid);
+            drop(starts);
+            STOPS.lock().unwrap().remove(pid);
         }
         _ => {}
     }

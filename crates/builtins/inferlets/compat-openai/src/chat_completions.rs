@@ -343,6 +343,7 @@ fn finish_reason(finish: Finish) -> &'static str {
         Finish::Stop | Finish::StopSequence => "stop",
         Finish::Length => "length",
         Finish::ToolCalls => "tool_calls",
+        Finish::Abort => "abort",
     }
 }
 
@@ -499,7 +500,7 @@ pub async fn serve(envelope: Envelope) -> Result<String, String> {
                     .map(|(t, lp)| chat_logprob(*t, lp))
                     .collect(),
             );
-            json!({"index": index, "message": message, "finish_reason": finish_reason(outcome.finish), "logprobs": logprobs})
+            json!({"index": index, "message": message, "finish_reason": finish_reason(outcome.finish), "stop_reason": outcome.stop_reason, "logprobs": logprobs})
         })
         .collect();
     let mut body = json!({

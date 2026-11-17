@@ -3717,6 +3717,9 @@ pub async fn submit_pass_stamped<C: FireContext>(
 ) -> Anyhow<Result<(), String>> {
     let submit_probe = crate::scheduler::probe::host_submit();
     let submit_clock = crate::scheduler::probe::ProbeClock::start();
+    if let Some(refusal) = crate::policy::stopped(ctx.process_id()) {
+        return Ok(Err(refusal));
+    }
     {
         if ctx.resources().get(&fwd)?.devgeo.is_some() {
             return fire_device_geometry(ctx, this, fwd, frame).await;

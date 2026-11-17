@@ -839,7 +839,12 @@ impl Port {
             let Some(proc) = pid(id).and_then(|id| self.procs.get(&id)) else {
                 continue;
             };
-            process::terminate_by(proc.pid, Err(reason), By::Policy);
+            // A running process ends its reply at its next fire; one not
+            // started yet is refused.
+            match proc.state {
+                State::Running => super::stop(proc.pid, reason),
+                _ => process::terminate_by(proc.pid, Err(reason), By::Policy),
+            }
         }
     }
 
