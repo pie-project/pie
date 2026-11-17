@@ -569,7 +569,7 @@ pub fn unit_program(
     let dir = stage.path().join("decode");
     let compile = |at: u32, b: u32| {
         let _ = std::fs::remove_dir_all(&dir);
-        stream::compile_decode(trace, at, b, true, &dir)
+        stream::compile_decode(trace, at, b, true, None, &dir)
     };
     // the most positions that fit one lane: the most a compile takes, by bisection (or the
     // stated ones)

@@ -409,6 +409,7 @@ pub fn compile_decode(
     positions: u32,
     lanes: u32,
     round16: bool,
+    upto: Option<usize>,
     out: &std::path::Path,
 ) -> R<build::Program> {
     let classes = program::decode_classes(trace, lanes.max(1));
@@ -418,7 +419,7 @@ pub fn compile_decode(
         trace,
         s,
         round16,
-        None,
+        upto,
         &[],
         None,
         None,
@@ -641,7 +642,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pie-kda-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let t = trace("kimik3-tiny-bf16-mxfp4-kv-bf16");
-        let p = compile_decode(&t, 64, 1, true, &dir).unwrap_or_else(|e| panic!("{e}"));
+        let p = compile_decode(&t, 64, 1, true, None, &dir).unwrap_or_else(|e| panic!("{e}"));
         let j =
             p.kv.first()
                 .and_then(|ks| ks.units.first())

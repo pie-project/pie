@@ -330,11 +330,18 @@ fn stream(args: &[String]) -> Result<(), String> {
         let lanes: u32 = get("--lanes")
             .map_or(Ok(1), |r| r.parse())
             .map_err(|e| format!("--lanes: {e}"))?;
+        // (`--stages N`: its first N stages alone, the last's rows read back: a headless
+        // slice, held to a golden's hidden state on the simulator)
+        let upto = get("--stages")
+            .map(|s| s.parse::<usize>())
+            .transpose()
+            .map_err(|e| format!("--stages: {e}"))?;
         let p = kernels_cerebras::stream::compile_decode(
             &trace,
             positions,
             lanes,
             !ieee,
+            upto,
             std::path::Path::new(&out),
         )?;
         println!(

@@ -147,7 +147,9 @@ fn main() {
                 .ok()
                 .and_then(|r| r.parse().ok())
                 .unwrap_or(1);
-            match kernels_cerebras::stream::compile_decode(&trace, positions, lanes, true, &out) {
+            match kernels_cerebras::stream::compile_decode(
+                &trace, positions, lanes, true, None, &out,
+            ) {
                 Ok(p) => line(
                     name,
                     "decode.units",

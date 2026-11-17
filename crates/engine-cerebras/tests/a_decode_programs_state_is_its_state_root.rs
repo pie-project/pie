@@ -11,7 +11,7 @@ fn decode(model: &str, lanes: u32) -> (tempfile::TempDir, Reading) {
         .unwrap_or_else(|| panic!("{model} parses"))
         .trace(poem_ir::Platform::Cerebras);
     let dir = tempfile::tempdir().expect("a scratch directory");
-    kernels_cerebras::stream::compile_decode(&trace, 256, lanes, true, dir.path())
+    kernels_cerebras::stream::compile_decode(&trace, 256, lanes, true, None, dir.path())
         .unwrap_or_else(|e| panic!("{model}: {e}"));
     let reading = Reading::open(dir.path()).expect("host.json states the program");
     (dir, reading)

@@ -64,6 +64,11 @@ const USAGE: &str = "usage: wafer-bench --program <dir> --weights <dir>[:<prefix
                      [--lanes B]) [--steps N] [--stagger S] [--cmaddr <addr>] [--export <dir>] [--dry 1] \
                      [--stamps 1]";
 
+/// A headless slice's rows against the golden's: relative L2 and cosine (bf16 weights and
+/// activations against HF's f32).
+const HIDDEN_REL: f64 = 3e-2;
+const HIDDEN_COS: f64 = 0.999;
+
 fn main() {
     match run() {
         Ok(true) => println!("WAFER_BENCH ok"),
@@ -486,6 +491,48 @@ fn decode(get: &HashMap<String, String>) -> Result<bool, String> {
             return Err("logits not f32".into());
         };
         let w = logits.width;
+        // a headless slice (`wafer-compile --stages`): its rows held to the golden's value at
+        // each position (`golden.hidden`, the HF module `golden.value`'s output) by relative L2
+        // and cosine
+        if let Some(hidden) = golden["hidden"].as_array() {
+            for (t, s) in local.iter().enumerate() {
+                let Some(s) = *s else { continue };
+                let v = &all[t * w..(t + 1) * w];
+                let want: Vec<f32> = hidden
+                    .get(s)
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| format!("golden.hidden has no position {s}"))?
+                    .iter()
+                    .filter_map(Value::as_f64)
+                    .map(|x| x as f32)
+                    .collect();
+                if want.len() != w {
+                    return Err(format!(
+                        "golden.hidden is {} wide, the rows read back {w}",
+                        want.len()
+                    ));
+                }
+                let dot = |a: &[f32], b: &[f32]| -> f64 {
+                    a.iter()
+                        .zip(b)
+                        .map(|(x, y)| f64::from(*x) * f64::from(*y))
+                        .sum()
+                };
+                let diff: Vec<f32> = v.iter().zip(&want).map(|(a, b)| a - b).collect();
+                let rel = (dot(&diff, &diff) / dot(&want, &want).max(1e-30)).sqrt();
+                let cos = dot(v, &want) / (dot(v, v) * dot(&want, &want)).sqrt().max(1e-30);
+                let ok = rel <= HIDDEN_REL && cos >= HIDDEN_COS;
+                checked += 1;
+                held += usize::from(ok);
+                println!(
+                    "DECODE_STEP {}",
+                    json!({"lane": t, "step": s, "token": seq[s], "value": golden["value"],
+                        "rel_l2": rel, "cos": cos, "ok": ok, "cycles": cycles, "wall_ms": wall_ms,
+                        "finite": v.iter().all(|x| x.is_finite())})
+                );
+            }
+            continue;
+        }
         for (t, s) in local.iter().enumerate() {
             let Some(s) = *s else { continue };
             let v = &all[t * w..(t + 1) * w];
