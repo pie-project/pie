@@ -411,6 +411,8 @@ pub struct Runtime {
     /// The simulator's host-to-device writes issued since its last landed one (see
     /// `reading`'s write: it bounds them).
     pub unlanded: usize,
+    /// A PE of the last such write (where a read lands them).
+    pub landing: Option<Rect>,
 }
 
 /// A runtime's blocking calls by kind: how many, how long they took, how
@@ -516,6 +518,7 @@ impl Runtime {
             running: false,
             pending: Vec::new(),
             unlanded: 0,
+            landing: None,
             io: IoStats::default(),
         })
     }

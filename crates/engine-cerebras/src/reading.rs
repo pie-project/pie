@@ -1314,6 +1314,13 @@ const SIM_IN_FLIGHT: usize = 2;
 
 impl Fabric for Runtime {
     fn launch(&mut self, reading: &Reading) -> R<Option<u64>> {
+        // (the simulator's writes still in flight landed before the program runs over them)
+        if let Some(one) = self.landing.filter(|_| self.unlanded > 0) {
+            let mut ts = [0u32; 3];
+            self.memcpy_d2h("tsc", &mut ts, one, 3, Order::RowMajor, DataType::Bits32)
+                .map_err(|x| x.to_string())?;
+            self.unlanded = 0;
+        }
         let args: Vec<u32> = reading.rd.into_iter().collect();
         self.launch("run", &args).map_err(|x| x.to_string())?;
         self.stamps(reading)
@@ -1366,6 +1373,7 @@ impl Fabric for Runtime {
             // last's first PE) lands them, the read the third
             if self.simulated() && self.rpc().symbols().contains_key("tsc") {
                 self.unlanded += 1;
+                self.landing = Some(Rect { w: 1, h: 1, ..rect });
                 if self.unlanded >= SIM_IN_FLIGHT {
                     let one = Rect { w: 1, h: 1, ..rect };
                     let mut ts = [0u32; 3];
