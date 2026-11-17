@@ -3655,3 +3655,29 @@ Where it stops:
   any placement.
 - **The calibration:** every gain above is the link term's. 1539 measures whether a row's
   K / V round trip costs what the term says.
+## G4: column-side segments, a weight PE's memory, a root's scratch pool
+
+### G4.1 The column roots' segment all-reduce
+
+MiniMax normalises q and k across all their heads. With its K / V heads replicated over head
+roots (17ec3ca23), those norms are column regions over the head roots whose sums all-reduce
+(`seg.all_reduce`), but only the CX roots had ops/seg.csl wired: minimax-sim's `cy_0_0.csl` named
+an undeclared `seg`.
+
+- **Built**: a unit asks for a column segment (`UnitAsk::col_segment`, `(first, roots)`) where
+  its column regions sum across roots (`stream::build::col_segment`: every such region spans the
+  same roots, else refused by name). The floorplan chains those CY roots (`StreamUnit::col_segment`,
+  its own colours `YG<u>` / `YM<u>`, the `SEGMENT` slot, rooted at the last as the CX roots' is), and
+  a member root declares ops/seg.csl exactly as a CX root does (`seg_params`: the chain's colours
+  and role). seg.csl binds iq6, iq7 and oq4 itself; a root whose own queues reach them is refused
+  by name. Nothing about MiniMax is named: any column region whose sums cross roots gets it.
+- **minimax-sim** links (cslc through the SIF) and its program is token-exact on the simulator
+  against its golden on every step this run covered (12 of the golden's 16: steps 0-11 at
+  `--steps 16`, step 7's 0.027 tie included), 81.2k cycles a step. minimax-m25-mini -l1 (213 x 794)
+  links too.
+- **Reading a plain checkpoint**: minimax_m2.poem refused any deployment whose experts are not the
+  release's FP8 or NVFP4; it now refuses only where the checkpoint's expert legs are stored
+  quantized (`kind`), so the simulator slice's bf16 checkpoint reads as stored.
+- **Identity**: against 9205f3f72's binary, only minimax-sim and minimax-m25-mini change; qwen3-sim,
+  qwen3-sim4, Qwen3-0.6B -l2, Qwen3.5-0.8B -l1, nemotron -l1 and flux2-mini's / klein's text and
+  denoise programs are byte-identical.

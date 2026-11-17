@@ -7,7 +7,7 @@
 # The two releases differ in the identity their template states and the
 # context their configuration does.
 
-load("//pie/codec.poem", "kept", "mapped")
+load("//pie/codec.poem", "kept", "kind", "mapped")
 load("//lib/blocks.poem", "attention")
 
 def spoken(name):
@@ -182,8 +182,10 @@ TRANSFORMERS = [
 ]
 
 def read(m, reads):
-    for w in m.layers:
-        if not kept(w.gate):
+    for l, w in enumerate(m.layers):
+        # (a checkpoint stored plain, the simulator's slice, reads as stored)
+        stored = kind("model.layers.{}.block_sparse_moe.experts.0.w1.weight".format(l))
+        if not kept(w.gate) and stored != None:
             fail("`{}`: MiniMax-M2 is released FP8 and exported NVFP4; this deployment reads its experts as {}".format(w.gate.name, w.gate.dtype))
     mapped(reads, m, TRANSFORMERS)
 

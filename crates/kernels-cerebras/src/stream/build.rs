@@ -1040,28 +1040,31 @@ pub fn program_at(
     }
     let asks: Vec<UnitAsk> = built
         .iter()
-        .map(|b| UnitAsk {
-            name: b.unit.name.clone(),
-            heads: b.layout.heads,
-            cols: b.layout.px(),
-            segment: b
-                .regions
-                .values()
-                .any(|(at, p, _)| at.roots == py && p.all_reduces > 0 && at.first == 0)
-                && b.unit.steps.iter().any(|s| {
-                    matches!(
-                        s,
-                        Step::Region {
-                            side: Side::Row,
-                            ..
-                        }
-                    )
-                }),
-            on_path: !b.unit.classes.is_empty(),
-            lanes: b.lanes,
-            helpers: b.helper.as_ref().map_or(0, |h| h.1),
+        .map(|b| -> R<UnitAsk> {
+            Ok(UnitAsk {
+                name: b.unit.name.clone(),
+                heads: b.layout.heads,
+                cols: b.layout.px(),
+                segment: b
+                    .regions
+                    .values()
+                    .any(|(at, p, _)| at.roots == py && p.all_reduces > 0 && at.first == 0)
+                    && b.unit.steps.iter().any(|s| {
+                        matches!(
+                            s,
+                            Step::Region {
+                                side: Side::Row,
+                                ..
+                            }
+                        )
+                    }),
+                col_segment: col_segment(b)?,
+                on_path: !b.unit.classes.is_empty(),
+                lanes: b.lanes,
+                helpers: b.helper.as_ref().map_or(0, |h| h.1),
+            })
         })
-        .collect();
+        .collect::<R<_>>()?;
     let stream = Stream::of(&requests, py, &asks, &blocks, heads, pya, split.sub, bounds)?;
     let wiring = stream.wiring();
     let floor = stream.floor();
@@ -1093,6 +1096,36 @@ fn rope_digits(class_rows: &[(u32, u32)], cache: Option<u32>) -> (u32, u32) {
     let rows = class_rows.iter().map(|c| c.0).max().unwrap_or(1);
     let top = rows.max(2) - 1;
     ((32 - top.leading_zeros()).div_ceil(3).max(1), 3)
+}
+
+/// The CY roots a unit's column regions all-reduce over (`(first, roots)`: one segment
+/// collective, so every column region that sums across roots spans the same roots), none where
+/// no column region sums across roots.
+fn col_segment(b: &Built) -> R<Option<(u32, u32)>> {
+    let spans: BTreeSet<(u32, u32)> = b
+        .regions
+        .iter()
+        .filter(|(si, (at, p, _))| {
+            at.roots > 1
+                && p.all_reduces > 0
+                && matches!(
+                    b.unit.steps[**si],
+                    Step::Region {
+                        side: Side::Col,
+                        ..
+                    }
+                )
+        })
+        .map(|(_, (at, _, _))| (at.first, at.roots))
+        .collect();
+    match spans.len() {
+        0 => Ok(None),
+        1 => Ok(spans.into_iter().next()),
+        _ => Err(format!(
+            "{}: column regions all-reduce over different roots ({spans:?}): one segment a unit's column roots",
+            b.unit.name
+        )),
+    }
 }
 
 #[cfg(test)]

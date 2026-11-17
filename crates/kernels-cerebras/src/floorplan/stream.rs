@@ -47,6 +47,10 @@ pub struct StreamUnit {
     pub y: u32,
     /// Its CX roots all-reduce a row's sums (a row region's norm).
     pub segment: bool,
+    /// Its CY roots `first .. first + roots` all-reduce a row's sums (a column region's norm
+    /// across those roots: a norm over all heads at the head roots).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub col_segment: Option<(u32, u32)>,
     /// On the row stream (the lane prologue's unit is not).
     pub on_path: bool,
     /// Helper PEs below each rest root (`cy(i)` for `i >= heads`): [`StreamUnit::helper`].
@@ -209,6 +213,8 @@ pub struct UnitAsk {
     pub heads: u32,
     pub cols: u32,
     pub segment: bool,
+    /// Its CY roots `first .. first + roots` all-reduce ([`StreamUnit::col_segment`]).
+    pub col_segment: Option<(u32, u32)>,
     pub on_path: bool,
     /// It reads lane vectors on its row / column roots.
     pub lanes: (bool, bool),
@@ -354,6 +360,7 @@ impl Stream {
                 x,
                 y,
                 segment: a.segment,
+                col_segment: a.col_segment,
                 on_path: a.on_path,
                 helpers: a.helpers,
                 pitch: if first && requests.joint && a.heads > 0 {
@@ -532,6 +539,19 @@ impl Stream {
                     l1: pair(&format!("SG{u}")),
                     l2: None,
                     cast: class(&format!("SM{u}")),
+                    loopback: false,
+                    slot: SEGMENT,
+                });
+            }
+            // the column side's: its CY roots in a row, rooted at the last (one half, as the
+            // CX roots')
+            if let Some((first, roots)) = unit.col_segment {
+                w.chain(Chain {
+                    pts: (first..first + roots).map(|i| unit.cy(i)).collect(),
+                    root: roots as usize - 1,
+                    l1: pair(&format!("YG{u}")),
+                    l2: None,
+                    cast: class(&format!("YM{u}")),
                     loopback: false,
                     slot: SEGMENT,
                 });
@@ -715,6 +735,7 @@ mod tests {
             heads,
             cols,
             segment: false,
+            col_segment: None,
             on_path: true,
             lanes: (false, false),
             helpers: 0,
@@ -772,6 +793,53 @@ mod tests {
             }
         }
         assert_eq!(bus.recv.iter().filter(|&&r| r).count(), lb.to.len());
+    }
+
+    /// A unit whose column regions all-reduce across its head roots has a segment chain over
+    /// those CY roots alone, rooted at the last (as the CX roots' is), its colours its own.
+    #[test]
+    fn a_column_segment_chains_its_cy_roots() {
+        let mut asks: Vec<UnitAsk> = (0..2).map(|u| ask(&format!("u{u}"), 6, 4)).collect();
+        asks[0].col_segment = Some((0, 4));
+        asks[1].segment = true;
+        let requests = Requests {
+            stream: true,
+            joint: true,
+            ..Requests::default()
+        };
+        let s = Stream::of(
+            &requests,
+            4,
+            &asks,
+            &[vec![0, 1]],
+            4,
+            3,
+            1,
+            Bounds { w: 32, h: 60 },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let wiring = s.wiring();
+        let segs: Vec<&Chain> = wiring
+            .links
+            .iter()
+            .filter_map(|l| match l {
+                crate::wiring::Link::Chain(c) if c.slot == SEGMENT => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(segs.len(), 2);
+        let u = &s.units[0];
+        let col = segs
+            .iter()
+            .find(|c| c.pts[0] == u.cy(0))
+            .expect("the CY roots' segment");
+        assert_eq!(col.pts, (0..4).map(|i| u.cy(i)).collect::<Vec<_>>());
+        assert_eq!(col.root, 3);
+        let row = segs
+            .iter()
+            .find(|c| c.pts[0] == s.units[1].cx(0))
+            .expect("the CX roots'");
+        assert_ne!(col.cast, row.cast);
     }
 
     /// Units too wide for one row of the fabric fill bands, a block never split over two; the

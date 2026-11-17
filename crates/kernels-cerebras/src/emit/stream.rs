@@ -1146,21 +1146,15 @@ fn root_params(p: &Program, ui: usize, c: Coord, side: Side) -> Vec<(String, u32
                 _ => 0xff,
             };
             let xr = colour_of(p, &format!("XR{ui}")).map_or(0xff, u32::from);
-            let (ss, sa, role) = chain_cols(p, c, SEGMENT);
-            let sm = colour_of(p, &format!("SM{ui}")).map_or(0xff, u32::from);
-            // the root sends the cast; a member receives it
-            let (ss, sm) = if role == 6 { (sm, 0xff) } else { (ss, sm) };
-            vec![
+            let mut v = vec![
                 ("C_PI".into(), opt(ep(p, c, PATH_IN), false)),
                 ("C_PO".into(), opt(ep(p, c, PATH_OUT), true)),
                 ("C_RR".into(), rr),
                 ("C_XR".into(), xr),
                 ("C_LB".into(), lb),
-                ("C_SA".into(), sa),
-                ("C_SM".into(), sm),
-                ("C_SS".into(), ss),
-                ("S_ROLE".into(), role),
-            ]
+            ];
+            v.extend(seg_params(p, c, &format!("SM{ui}")));
+            v
         }
         Side::Col => {
             let cr = match ep(p, c, COL_CHAIN) {
@@ -1178,6 +1172,10 @@ fn root_params(p: &Program, ui: usize, c: Coord, side: Side) -> Vec<(String, u32
                 ("C_GS".into(), gs),
                 ("C_GR".into(), gr),
             ];
+            // a member of the CY roots' segment: its colours as a CX root's
+            if ep(p, c, SEGMENT).is_some() {
+                v.extend(seg_params(p, c, &format!("YM{ui}")));
+            }
             // a rest root over helpers: their chain's cast out, their sums in
             if let Some(Endpoint::Root(r)) = ep(p, c, HELP_CHAIN) {
                 let hm = colour_of(p, &format!("HM{ui}")).map_or(0xff, u32::from);
@@ -1191,6 +1189,20 @@ fn root_params(p: &Program, ui: usize, c: Coord, side: Side) -> Vec<(String, u32
         }
     };
     parked(p, c, v)
+}
+
+/// A segment member's colours and role (ops/seg.csl's): `cast` its multicast's class.
+fn seg_params(p: &Program, c: Coord, cast: &str) -> Vec<(String, u32)> {
+    let (ss, sa, role) = chain_cols(p, c, SEGMENT);
+    let sm = colour_of(p, cast).map_or(0xff, u32::from);
+    // the root sends the cast; a member receives it
+    let (ss, sm) = if role == 6 { (sm, 0xff) } else { (ss, sm) };
+    vec![
+        ("C_SA".into(), sa),
+        ("C_SM".into(), sm),
+        ("C_SS".into(), ss),
+        ("S_ROLE".into(), role),
+    ]
 }
 
 /// A unit's CX roots' file (`side` Row) or column root `idx`'s (Col), its arrays the host
@@ -1978,7 +1990,8 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
             ("C_HM", "q_hm", false),
         ],
     };
-    let pnames: Vec<&str> = match side {
+    let segment = s_segment(p, ui, side, idx);
+    let mut pnames: Vec<&str> = match side {
         Side::Row => vec![
             "C_PI", "C_PO", "C_RR", "C_XR", "C_LB", "C_SA", "C_SM", "C_SS", "S_ROLE",
         ],
@@ -1987,6 +2000,9 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
         ],
         Side::Col => vec!["C_CR", "C_XC", "C_KS", "C_KR", "C_LB", "C_GS", "C_GR"],
     };
+    if side == Side::Col && segment {
+        pnames.extend(["C_SA", "C_SM", "C_SS", "S_ROLE"]);
+    }
     for pn in &pnames {
         let _ = writeln!(t, "param {pn}: u16;");
     }
@@ -2025,7 +2041,13 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
             "  @initialize_queue({q}, .{{ .color = @get_color({cname}) }});"
         );
     }
-    if side == Side::Row && s_segment(p, ui) {
+    if segment {
+        // (ops/seg.csl binds iq6, iq7 and oq4 itself: a root's own queues stop short of them)
+        if iq > 6 || oq > 4 {
+            return Err(format!(
+                "a segment root's own queues reach ops/seg.csl's (input {iq}, output {oq})"
+            ));
+        }
         t.push_str("var rcfg = [18]u32 { 0, 0, 0, 0, @as(u32, C_SM), @as(u32, C_SA), 0, 0, 0, 0, 0, 0, 0, @as(u32, C_SA), 0, @as(u32, C_SS), @as(u32, C_SM), @as(u32, S_ROLE) };\n");
         t.push_str("const seg = @import_module(\"ops/seg.csl\", .{ .fab = fab, .rcfg = &rcfg, .RQ = 0, .XM = @get_input_queue(6), .YM = @get_input_queue(7), .AO = @get_output_queue(4), .UT = @get_ut_id(5) });\n");
         inits.push_str("  @initialize_queue(@get_input_queue(6), .{ .color = @get_color(C_SM) });\n  @initialize_queue(@get_input_queue(7), .{ .color = @get_color(C_SA) });\n  @initialize_queue(@get_output_queue(4), .{ .color = @get_color(C_SS) });\n");
@@ -2142,7 +2164,7 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
     for k in 0..slot {
         let _ = writeln!(body, "  rg{k}.init();");
     }
-    if side == Side::Row && s_segment(p, ui) {
+    if segment {
         body.push_str("  seg.role = S_ROLE;\n  seg.qmode(0);\n");
     }
     body.push_str("  lanes();\n");
@@ -2328,9 +2350,15 @@ fn helper_file(ui: usize, b: &Built, r: &Reader) -> R<(String, String)> {
     Ok((name, t))
 }
 
-/// Whether unit `ui`'s CX roots all-reduce.
-fn s_segment(p: &Program, ui: usize) -> bool {
-    p.stream.units[ui].segment
+/// Whether root `idx` of unit `ui`'s `side` all-reduces over its side's segment.
+fn s_segment(p: &Program, ui: usize, side: Side, idx: u32) -> bool {
+    let u = &p.stream.units[ui];
+    match side {
+        Side::Row => u.segment,
+        Side::Col => u
+            .col_segment
+            .is_some_and(|(first, roots)| idx >= first && idx < first + roots),
+    }
 }
 
 fn kv_root_params(p: &Program, kc: &fs::KvColumn, c: Coord) -> Vec<(String, u32)> {

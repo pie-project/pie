@@ -1942,6 +1942,7 @@ fn floorplan(p: u32, attn: Option<&Attention>, reading: &str) -> R<(Stream, Pale
         heads: u32::from(attn.is_some()),
         cols: p,
         segment: false,
+        col_segment: None,
         on_path: true,
         lanes: (false, false),
         helpers: 0,
