@@ -304,8 +304,8 @@ fn a_guest_fault_fails_its_own_lanes_alone() {
     }));
     rig.fire(
         vec![
-            host_lane(1, vec![3], vec![page_a], 0),
-            host_lane(2, vec![3], vec![page_b], 0),
+            host_lane(kv, 1, vec![3], vec![page_a], 0),
+            host_lane(kv, 2, vec![3], vec![page_b], 0),
         ],
         vec![attach(0, fed), attach(1, starved)],
         Vec::new(),
