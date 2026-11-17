@@ -792,18 +792,20 @@ fn refit(
         // 1024 rows at 1024 lanes, then the lanes to 512: one 717-token prompt a fire.
         // Back at 8192 rows: pf64-512 7.05k -> 10.35k tok/s (vLLM 9.03k at 1024
         // sequences), pf1024-512 7.92k -> 10.37k (9.00k), c1024 2.69k -> 2.71k (2.72k).
-        let mut tokens = tokens;
-        while lanes < asked_lanes && tokens < asked.max_tokens {
-            let wider = crate::api::on_lattice(
-                &engine,
-                asked.max_tokens,
-                tokens.saturating_mul(2).min(asked.max_tokens),
-            );
-            if working_at(lanes, wider, scoped) > room_at(wider, owed)? {
-                break;
-            }
-            tokens = wider;
-        }
+        // The rows grow back toward the top rung the load chose, never past it:
+        // the lattice's top above it is the card's saturation point, a rung the
+        // choice already weighed and passed over, and what the load reserved
+        // for (the activation span, the guests' carve) is the chosen top's.
+        let tokens = if lanes < asked_lanes {
+            widened(
+                tokens,
+                asked_tokens,
+                |rows| crate::api::on_lattice(&engine, asked.max_tokens, rows),
+                |wider| Ok(working_at(lanes, wider, scoped) <= room_at(wider, owed)?),
+            )?
+        } else {
+            tokens
+        };
         let room = room_at(tokens, owed)?;
         Ok((working_at(lanes, tokens, scoped) <= room).then_some((tokens, lanes)))
     };
@@ -844,7 +846,7 @@ fn refit(
          card has after the weight tier under the load's allowance, past the half the cache \
          rows are owed and what one sequence at the declared context and the bodies' floor \
          need.",
-        asked.max_tokens,
+        asked_tokens,
         working_at(asked_lanes, asked_tokens, scoped) >> 20,
         live >> 20,
     );
@@ -853,6 +855,26 @@ fn refit(
     let compiled = poem_compiler::compile_axes(&boot.trace, &budgets, profile)?;
     let planes = decoded_weight_planes(&boot.trace, &compiled, table);
     Ok((compiled, budgets, tiles_of(&planes, scoped)))
+}
+
+/// The rows a fire whose lanes were cut grows back to: doubling on the
+/// lattice (`on`, the rung at or below) while the wider fire `fits`, up to
+/// `top`, the rung the load chose and reserved for, and never past it.
+fn widened(
+    tokens: u32,
+    top: u32,
+    on: impl Fn(u32) -> u32,
+    mut fits: impl FnMut(u32) -> Result<bool>,
+) -> Result<u32> {
+    let mut tokens = tokens;
+    while tokens < top {
+        let wider = on(tokens.saturating_mul(2).min(top));
+        if wider <= tokens || !fits(wider)? {
+            break;
+        }
+        tokens = wider;
+    }
+    Ok(tokens)
 }
 
 impl Shell {
@@ -2581,4 +2603,54 @@ fn activation_rungs(
         }
     }
     Ok(rungs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::widened;
+
+    /// The MI300X's lattice to its saturation point, 13778.
+    const LATTICE: [u32; 21] = [
+        512, 1024, 2048, 2234, 2436, 2656, 2897, 3159, 3445, 3757, 4096, 4467, 4871, 5312, 5793,
+        6317, 6889, 7513, 8192, 9742, 13778,
+    ];
+
+    fn on(rows: u32) -> u32 {
+        LATTICE
+            .iter()
+            .copied()
+            .filter(|rung| *rung <= rows)
+            .max()
+            .unwrap_or(LATTICE[0])
+    }
+
+    /// A tight-budget load whose lanes were cut grows its fire back to the
+    /// top rung it chose (3445), not to the lattice's saturation top (13778)
+    /// that every wider fire would also fit: what it reserved is the chosen
+    /// top's.
+    #[test]
+    fn a_cut_fire_grows_back_to_the_chosen_top_and_no_further() {
+        let mut asked = Vec::new();
+        let rows = widened(1024, 3445, on, |wider| {
+            asked.push(wider);
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(rows, 3445);
+        assert!(asked.iter().all(|wider| *wider <= 3445), "{asked:?}");
+    }
+
+    /// It stops at the widest rung that fits below the top.
+    #[test]
+    fn a_cut_fire_stops_where_the_wider_fire_does_not_fit() {
+        let rows = widened(512, 3445, on, |wider| Ok(wider <= 2048)).unwrap();
+        assert_eq!(rows, 2048);
+    }
+
+    /// At the top already, nothing widens.
+    #[test]
+    fn a_fire_at_its_top_stays() {
+        let rows = widened(3445, 3445, on, |_| panic!("nothing past the top is asked")).unwrap();
+        assert_eq!(rows, 3445);
+    }
 }
