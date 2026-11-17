@@ -115,8 +115,17 @@ only ~0.06 GB to spare, partly by coincidence: the "others wired" it subtracts i
 - Repro (local branch sc/mac-residency-exp 7399520bb, not for merge): `PIE_PROBE_LIFT=1` (capacity = recommended less
   outside, less the floor; no wired check), `PIE_SHARED_SEGMENTS_FILE` written to 600 ~45 s in, 8 concurrent top-p
   (scratchpad kit soak_topp.py SOAK_CAP=8); the refusal comes ~1 min in, logged as "metal: refused-frame".
-- Next: a Metal System Trace (Mac Pro's M5 has Xcode: `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun
-  xctrace`) of the repro would name the driver objects. A measured term is available without it: a load's own
-  accelerator Alloc delta (after the load less before, less `currentAllocatedSize`). It's machine-wide, so it holds only
-  where nothing else allocates on the GPU during the load. With it, the bound becomes held + grow <= recommended - that
-  term - 64 MiB, and the wired-by-others term goes.
+- The M5 Pro does not show it (sc/mac-residency-exp 9011fd7e9, Qwen3-0.6B, no budget, a Metal System Trace of the
+  launch and of an attached run). There, the load's Alloc delta (+1754 / +1773 MiB over two boots) is under
+  `currentAllocatedSize` (1884 MiB at ready, flat to the end). The trace names every object pie made:
+  - one 1.12 GiB weights buffer and 24 small buffers (1150.7 MiB in all);
+  - 46 IOGPU heaps, 16 MiB each (128 MiB attributed), beside the span's placement heaps (backed whole at the load, 31
+    heaps);
+  - two residency sets: one empty, one of 48-49 allocations, 734-744 MiB committed, the heaps added one at a time.
+  The driver's extra on the M5 comes with the first fires, not the load: +205 MiB Alloc over `currentAllocatedSize`
+  after three requests, freed at exit. Its wired level peaks at 2.45 GB against ~1.85 GB allocated, ~0.6 GB with no
+  allocation row: per-command-buffer or shader-private memory (compiler activity is in the trace). Pipelines,
+  libraries and queues have no allocation rows. Exports: the M5's scratchpad/out/trx/ (launch.*, attach.*).
+- So the ~1 GB at load is the M1's (its driver, or apple7's), and the fire-time term is the M5's, at most ~0.2-0.6 GB.
+  Neither is an object pie creates or could size. The shipped rule stands (ruled: no Alloc-delta term). A term, if one is
+  ever taken, has to be measured per machine at the load's first fires, not read from the load.
