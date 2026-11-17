@@ -877,6 +877,11 @@ pub struct MemoryConfig {
     /// The most device memory this load takes (`"20GiB"`), per device, for
     /// a device shared with another process. Omit to use the whole device.
     pub budget_device: Option<ByteSize>,
+    /// The device memory the kv pool takes (`"8GiB"`), within
+    /// `budget_device`. Omit for what the load leaves it. Set to hold a
+    /// stated number of kv tokens: how much KV the device keeps is then a
+    /// measured input, as a vLLM `--num-gpu-blocks-override` makes it.
+    pub budget_kv_device: Option<ByteSize>,
     /// The most pinned host memory suspended kv pages and state slots may
     /// take (`"32GiB"`), shared by the tensor-parallel ranks. Omit for every
     /// seat at full context, within half of what the host has free (so
@@ -908,6 +913,7 @@ impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
             budget_device: None,
+            budget_kv_device: None,
             budget_host: None,
             budget_disk: None,
             disk_path: None,
@@ -929,7 +935,7 @@ impl MemoryConfig {
             device: engine::Allowance {
                 budget: self.budget_device.map(|b| b.as_bytes()),
             },
-            device_kv_budget: None,
+            device_kv_budget: self.budget_kv_device.map(|b| b.as_bytes()),
             host_kv_budget: self.budget_host.map(|b| b.as_bytes()),
             kv_seats: None,
             disk_kv_budget: self.budget_disk.map(|b| b.as_bytes()),
@@ -959,6 +965,7 @@ impl MemoryConfig {
         );
         for (key, budget) in [
             ("budget_device", self.budget_device),
+            ("budget_kv_device", self.budget_kv_device),
             ("budget_host", self.budget_host),
             ("budget_disk", self.budget_disk),
         ] {
@@ -983,8 +990,8 @@ impl EngineConfig {
         toml::Value::Table(self.options.clone())
             .try_into()
             .map_err(|e: toml::de::Error| {
-                let why = retired::explain(e.message(), Some(self.kind))
-                    .unwrap_or_else(|| e.to_string());
+                let why =
+                    retired::explain(e.message(), Some(self.kind)).unwrap_or_else(|| e.to_string());
                 anyhow::anyhow!(
                     "invalid [engine] options for engine type {:?}: {why}",
                     self.kind,
@@ -1220,7 +1227,10 @@ device = ["metal:0"]
               disk_path = \"/nvme\"\ndisk_persistent = false\n";
         let cfg = Config::parse(&current).expect("the current keys load");
         assert_eq!(cfg.engine.max_context, Some(8192));
-        assert_eq!(cfg.engine.memory.budget_host, Some(ByteSize::from_mib(8 * 1024)));
+        assert_eq!(
+            cfg.engine.memory.budget_host,
+            Some(ByteSize::from_mib(8 * 1024))
+        );
         let vulkan = "[model]\nname = \"default\"\nsource = \"Qwen/Qwen3-0.6B\"\n\
                       [engine]\ntype = \"vulkan\"\ndevice = [\"vulkan:0\"]\n\
                       pipeline_cache = \"/tmp/p.bin\"\n";
