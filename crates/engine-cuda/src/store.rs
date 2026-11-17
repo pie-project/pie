@@ -2100,13 +2100,16 @@ impl Pools {
     }
 
     /// The room guest state lies in: the `Instance` shape's slots a
-    /// chunk and their bytes, and a chunk's bytes.
+    /// chunk and their bytes, a chunk's bytes, and a segment's chunks (a
+    /// run of chunks lies inside one).
     pub fn instance_room(&self) -> Result<crate::program::Room> {
         let shape = self.chunks.shape(Kind::Instance)?;
         Ok(crate::program::Room {
             per_chunk: shape.per_chunk,
             slot_bytes: shape.slot_bytes,
             chunk: self.chunks.layout().chunk_bytes,
+            segment: self.chunks.layout().segment_chunks.max(1),
+            run: 1,
         })
     }
 

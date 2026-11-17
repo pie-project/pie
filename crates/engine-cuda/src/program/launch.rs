@@ -807,39 +807,44 @@ pub fn scratch_offsets(plan: &LaunchStagePlan, extents: Extents) -> Result<Vec<u
     lay_out(plan, &descriptors).map(|layout| layout.values)
 }
 
-/// `plan`'s scratch at `extents` in pieces of at most `chunk` bytes, the
-/// layout a guest lane's scratch takes: a value past a chunk is refused by
-/// name ([`eta_exec::TooLarge::PastChunk`]).
+/// `plan`'s scratch at `extents` in `pieces`, the layout a guest lane's
+/// scratch takes: each piece a run of adjacent chunks that holds the
+/// widest item whole; an item past a segment is refused by name
+/// ([`eta_exec::TooLarge::PastSegment`]).
 pub fn scratch_chunked(
     plan: &LaunchStagePlan,
     extents: Extents,
-    chunk: u64,
+    pieces: eta_exec::Pieces,
 ) -> Result<eta_exec::ChunkLayout> {
     let descriptors = describe_values(plan, extents)?;
-    lay_out_chunked(plan, &descriptors, chunk)
+    lay_out_chunked(plan, &descriptors, pieces)
 }
 
 fn lay_out_chunked(
     plan: &LaunchStagePlan,
     descriptors: &[ValueDesc],
-    chunk: u64,
+    pieces: eta_exec::Pieces,
 ) -> Result<eta_exec::ChunkLayout> {
-    eta_exec::lay_out_chunked(plan, descriptors, &run_of(plan, descriptors), chunk).map_err(|why| {
-        Fault::program(
-            "program::launch",
-            format!("a lane's scratch does not lie in chunks of {chunk} bytes: {why}"),
-        )
-    })
+    eta_exec::lay_out_chunked(plan, descriptors, &run_of(plan, descriptors), pieces).map_err(
+        |why| {
+            Fault::program(
+                "program::launch",
+                format!(
+                    "a lane's scratch does not lie in runs of chunks of {} bytes: {why}",
+                    pieces.chunk
+                ),
+            )
+        },
+    )
 }
 
 impl Prepared {
-    /// The stage at `extents`, its scratch laid in pieces of at most
-    /// `chunk` bytes.
+    /// The stage at `extents`, its scratch laid in `pieces`.
     pub fn build(
         plan: &LaunchStagePlan,
         shapes: &[ChannelShape],
         extents: Extents,
-        chunk: u64,
+        pieces: eta_exec::Pieces,
     ) -> Result<Prepared> {
         let channel_count = u32::try_from(plan.channel_bindings.len())
             .map_err(|_| Fault::program("program::launch", "more channels than a u32 can count"))?;
@@ -847,7 +852,7 @@ impl Prepared {
             .map_err(|_| Fault::program("program::launch", "more values than a u32 can count"))?;
 
         let descriptors = describe_values(plan, extents)?;
-        let scratch_layout = lay_out_chunked(plan, &descriptors, chunk)?;
+        let scratch_layout = lay_out_chunked(plan, &descriptors, pieces)?;
         let temporary_offset = u32::try_from(scratch_layout.temporary.offset)
             .map_err(|_| Fault::program("program::launch", "a temporary offset past a u32"))?;
         let temporary_bytes = u32::try_from(scratch_layout.temporary_bytes)
@@ -927,7 +932,7 @@ impl Prepared {
             channel_count,
             value_count,
             pieces_at: Vec::new(),
-            unit: chunk,
+            unit: scratch_layout.piece_bytes(),
             temporary_piece: scratch_layout.temporary.piece,
             ends: scratch_layout.ends,
             temporary_offset,
