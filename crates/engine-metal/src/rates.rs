@@ -110,6 +110,11 @@ struct Bench<'a> {
     max_submit: Option<std::time::Duration>,
     /// Whether a frame the bound stopped before its fire's time settled.
     capped: std::cell::Cell<bool>,
+    /// The fires laid so far, across frames: each fire takes the next of a
+    /// measurement's rotated operands (weights, attention sets, per-row
+    /// sets), so a frame never re-reads what the frame before it read and
+    /// left in the system cache.
+    fired: std::cell::Cell<u32>,
 }
 
 impl Bench<'_> {
@@ -148,9 +153,11 @@ impl Bench<'_> {
     ) -> Result<f64, String> {
         let frame = self.device.frame().map_err(|e| e.to_string())?;
         let sink = Sink::new(self.device, &frame, &self.pipelines, &self.handles);
+        let first = self.fired.get();
         for at in 0..k {
-            encode(&sink, at).map_err(|e| e.to_string())?;
+            encode(&sink, first.wrapping_add(at)).map_err(|e| e.to_string())?;
         }
+        self.fired.set(first.wrapping_add(k));
         frame.commit_timed().map_err(|e| e.to_string())
     }
 
@@ -566,6 +573,7 @@ pub fn measure(
         pattern: engine::rates::operand_pattern(),
         max_submit,
         capped: std::cell::Cell::new(false),
+        fired: std::cell::Cell::new(0),
     };
     // The launch first: every rate below takes its dispatches' launches off
     // (engine::rates::rate_from).
