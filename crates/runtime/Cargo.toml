@@ -98,6 +98,9 @@ wasmtime-wasi-http = { version = "49.0.2", default-features = false, features = 
     "default-send-request",
 ] }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 tokio = { version = "1.53", default-features = false, features = ["sync", "macros"] }
 web-std = { path = "../web-std" }
