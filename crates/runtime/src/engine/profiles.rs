@@ -289,6 +289,20 @@ fn tune_cuda(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, 
     Ok(tuned!(out, wrong: Vec::new()))
 }
 
+/// CUDA's loads of one model for the check of the estimate.
+#[cfg(feature = "engine-cuda")]
+fn bench_cuda<'a>(
+    req: &'a TuneRequest<'a>,
+    artifact: &'a Path,
+    deployment: &'a str,
+) -> Result<Box<dyn engine::load::check::Bench + 'a>, String> {
+    Ok(Box::new(engine_cuda::check::bench(
+        artifact,
+        deployment,
+        Some(req.profiles),
+    )))
+}
+
 /// Every backend this build hosts.
 #[must_use]
 #[allow(clippy::vec_init_then_push)]
@@ -304,7 +318,7 @@ pub fn backends() -> Vec<Backend> {
         resolve: engine_cuda::chip::resolve,
         tune: Some(tune_cuda),
         rates: None,
-        bench: None,
+        bench: Some(bench_cuda),
     });
     #[cfg(feature = "vulkan")]
     out.push(Backend {

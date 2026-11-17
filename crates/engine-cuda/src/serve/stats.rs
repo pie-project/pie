@@ -94,6 +94,13 @@ impl Shell {
         self.graphs
     }
 
+    /// The rungs this load weighed its top by and the estimate it weighed
+    /// them with: what a check of the estimate reads.
+    #[must_use]
+    pub fn weighed(&self) -> Option<&crate::top::Weighed> {
+        self.weighed.as_ref()
+    }
+
     #[must_use]
     pub fn body_stats(&self) -> record::BodyStats {
         self.cache.body_stats()

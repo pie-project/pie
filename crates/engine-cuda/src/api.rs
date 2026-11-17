@@ -414,9 +414,69 @@ pub(crate) fn lattice(
     }
 }
 
-/// The rows a fire takes when neither `max_forward_tokens` nor the chip's
-/// profile states them.
+/// The rows a patch ladder is derived from when a load states no tokens.
 pub(crate) const DEFAULT_FORWARD_TOKENS: u32 = 8192;
+
+/// The rung lattice under `engine` up to `top`: [`default_lattice`]'s
+/// points below it and `top` itself. With `top` the card's fire top
+/// ([`fire_top_of`]), the candidates a load with no stated buckets weighs.
+#[must_use]
+pub(crate) fn rung_lattice(engine: &crate::chip::Engine, top: u32) -> Vec<u32> {
+    default_lattice(
+        top,
+        engine.lattice_steps,
+        engine.prefill_lattice_from,
+        engine.prefill_lattice_steps,
+    )
+}
+
+/// The widest rung of [`rung_lattice`] to `top` at or below `tokens` (its
+/// first where none is): a load asked other tokens (the walk fit,
+/// `engine.fire_rows`, a stated `max_forward_tokens`, a refit) lays no last
+/// point off the grid.
+#[must_use]
+pub(crate) fn on_lattice(engine: &crate::chip::Engine, top: u32, tokens: u32) -> u32 {
+    let lattice = rung_lattice(engine, top);
+    lattice
+        .iter()
+        .rev()
+        .copied()
+        .find(|&rung| rung <= tokens)
+        .unwrap_or(lattice[0])
+}
+
+/// The fire top of `trace` on this card (`engine::load::FireEstimate::top`):
+/// the rung of its lattice to `context` ([`probed_rows`]) whose prompt runs
+/// the most tokens a ns by the profile's measured rates. Past it no rung's
+/// efficiency improves, so none past it can be chosen. A profile without
+/// the rates the model needs has no top, and a load on it is refused for
+/// them, by name.
+pub(crate) fn fire_top_of(
+    chip: &profile::Profile,
+    trace: &Trace,
+    context: u32,
+    device: &str,
+) -> crate::error::Result<u32> {
+    let counts = crate::top::counts(trace)?;
+    let estimate = engine::load::estimate(&counts, &chip.rates()).map_err(|key| {
+        Fault::Card(
+            engine::load::Refused::NoRates {
+                device: device.to_owned(),
+                key,
+            }
+            .to_string(),
+        )
+    })?;
+    Ok(estimate.top(&probed_rows(&crate::chip::Engine::of(chip), context)))
+}
+
+/// The rows the fire top weighs: the rung lattice to `context`, the most
+/// tokens one prompt holds, so no rung is priced at rows no fire can carry
+/// (asked of cuBLASLt's heuristic at 2^30 rows, it divides by zero).
+#[must_use]
+pub(crate) fn probed_rows(engine: &crate::chip::Engine, context: u32) -> Vec<u32> {
+    rung_lattice(engine, context.max(1))
+}
 
 /// The load's budgets for `trace`: its logit readouts sized to what the
 /// trace drafts, not the general 16 a lane, so a vocab-wide head carves only
@@ -1947,5 +2007,19 @@ pub(crate) fn readout_facts() -> engine::ReadoutFacts {
     engine::ReadoutFacts {
         landing: engine::ReadoutLanding::InSpan,
         store_rows: None,
+    }
+}
+
+#[cfg(test)]
+mod probed_rows_tests {
+    #[test]
+    fn the_fire_top_weighs_no_rows_past_a_prompt() {
+        let engine = crate::chip::Engine::of(&crate::chip::profile(""));
+        for context in [1, 4096, 131_072] {
+            let rows = super::probed_rows(&engine, context);
+            assert_eq!(rows.last(), Some(&context), "{rows:?}");
+            assert!(rows.iter().all(|&m| m <= context));
+            assert!(rows.windows(2).all(|w| w[0] < w[1]));
+        }
     }
 }

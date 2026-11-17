@@ -23,22 +23,21 @@ pub struct Outcome {
 
 /// How a load is shaped: its slots and compiled budget, its patch ladder,
 /// its pages and context.
-struct Shape {
-    slots: u32,
-    budget: poem_compiler::Budget,
-    patches: Option<poem_compiler::PatchLadder>,
-    page_size: u32,
-    context: u32,
+pub(crate) struct Shape {
+    pub(crate) slots: u32,
+    pub(crate) budget: poem_compiler::Budget,
+    pub(crate) patches: Option<poem_compiler::PatchLadder>,
+    pub(crate) page_size: u32,
+    pub(crate) context: u32,
 }
 
-/// Load `artifact` under `chip` shaped by `shape` (from the trace): the
-/// products its arming times land in the user's tactic table under
-/// `profiles`.
-fn load(
+/// Load `artifact` under `knobs` (its profile pinned) shaped by `shape`
+/// (from the trace): the products its arming times land in the user's
+/// tactic table under the knobs' profiles.
+pub(crate) fn load(
     artifact: &Path,
     deployment: &str,
-    chip: &Profile,
-    profiles: Option<&Path>,
+    knobs: crate::Knobs,
     shape: impl FnOnce(&poem_ir::Trace) -> Shape,
 ) -> Result<(crate::Shell, poem_ir::Trace), String> {
     use poem::Platform;
@@ -76,11 +75,7 @@ fn load(
         allowance: engine::Allowance::WHOLE,
         context_declared: false,
         ordinal: 0,
-        knobs: crate::Knobs {
-            chip: Some(chip.clone()),
-            profiles: profiles.map(Path::to_path_buf),
-            ..crate::Knobs::default()
-        },
+        knobs,
         cache_dir: None,
         runahead: engine::runahead::Runahead::F1,
         residency,
@@ -127,7 +122,12 @@ fn serve(
 ) -> Result<Serving, String> {
     use poem::Request;
     let slots = *LANES.iter().max().expect("lanes") as u32;
-    let (mut shell, trace) = load(artifact, deployment, &chip, profiles, |trace| Shape {
+    let knobs = crate::Knobs {
+        chip: Some(chip.clone()),
+        profiles: profiles.map(Path::to_path_buf),
+        ..crate::Knobs::default()
+    };
+    let (mut shell, trace) = load(artifact, deployment, knobs, |trace| Shape {
         slots,
         budget: poem_compiler::Budget::new(slots, CONTEXT),
         patches: patches(trace, slots),
@@ -243,7 +243,7 @@ fn plan_of(deployment: &str, chip: &Profile, sms: u32) -> Option<u64> {
     Some(h.finish())
 }
 
-fn patches(trace: &poem_ir::Trace, slots: u32) -> Option<poem_compiler::PatchLadder> {
+pub(crate) fn patches(trace: &poem_ir::Trace, slots: u32) -> Option<poem_compiler::PatchLadder> {
     crate::api::patch_ladder(
         trace,
         &engine::load::Budgets {
