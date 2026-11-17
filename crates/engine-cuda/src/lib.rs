@@ -29,6 +29,7 @@ pub mod lockstep;
 pub mod mask;
 pub mod narrow;
 pub mod program;
+pub mod node_dump;
 pub mod rates;
 pub mod record;
 pub mod replay;

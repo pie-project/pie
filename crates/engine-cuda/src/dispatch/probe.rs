@@ -65,6 +65,7 @@ impl poem_exec::DispatchProbe for Run<'_> {
                 show(self, &outs)
             );
         }
+        crate::node_dump::dump(self, node);
         if !crate::serve::diag::on().nan_check {
             return;
         }

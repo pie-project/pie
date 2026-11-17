@@ -532,6 +532,21 @@ fn argmax(logits: &[f32]) -> u32 {
 
 /// `tokens` fired as slot 0's next step: its logits.
 fn fire(shell: &mut Shell, trace: &Trace, tokens: &[u32]) -> Vec<f32> {
+    // `PIE_NODE_DUMP`: the process's first fire's every node output, there.
+    static FIRES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let first = FIRES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0;
+    let dump = std::env::var_os("PIE_NODE_DUMP").filter(|_| first);
+    if let Some(dir) = &dump {
+        engine_cuda::node_dump::set(Some(dir.into()));
+    }
+    let out = fire_inner(shell, trace, tokens);
+    if dump.is_some() {
+        engine_cuda::node_dump::set(None);
+    }
+    out
+}
+
+fn fire_inner(shell: &mut Shell, trace: &Trace, tokens: &[u32]) -> Vec<f32> {
     let word = trace.facts.word(&Request::new(
         u32::try_from(tokens.len()).expect("a count"),
         false,
