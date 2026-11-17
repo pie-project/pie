@@ -1,9 +1,9 @@
 #include "prim/affine.slang"
 #include "prim/params.slang"
 #include "prim/slot16.slang"
-// y = x * dequant(w)^T, register-tiled: each invocation holds a 4x4 block of
-// the output, and each k step reads one float4 of activations and one of
-// weights from workgroup memory for sixteen multiply-adds. A GPU whose
+// y = x * dequant(w)^T, register-tiled: each invocation holds an 8x4 block of
+// the output, and each k step reads two packed quads of activations and one
+// of weight codes from workgroup memory for 32 multiply-adds. A GPU whose
 // workgroup memory is slow next to its ALUs (Adreno) runs the plain tiled
 // point, which reads two scalars per multiply-add, several times slower.
 
@@ -16,7 +16,8 @@
 #define PIE_BK 32
 #endif
 #define PIE_TX (PIE_BN / 4)
-#define PIE_TY (PIE_BM / 4)
+#define PIE_TY (PIE_BM / 8)
+#define PIE_QUADS (PIE_BM / 4)
 #define PIE_THREADS (PIE_TX * PIE_TY)
 #if PIE_GROUP % PIE_BK != 0
 #error "a K block must not straddle a scale group"
@@ -35,9 +36,13 @@ struct Params {
 };
 PIE_PARAMS(5, Params, params);
 
-// Both tiles k-major, so a row of four outputs reads one float4.
-groupshared float4 xs[PIE_BK * PIE_TY];
-groupshared float4 ws[PIE_BK * PIE_TX];
+// Workgroup memory is what Adreno pays for most, so both tiles stay packed
+// there: activations as their bf16 bits (four rows of one k in a uint2),
+// weights as their code words (four neighbouring columns' word in a uint4),
+// widened and dequantized in registers. A K block never straddles a scale
+// group, so each column's scale and bias hold for the whole block.
+groupshared uint2 xs[PIE_BK * PIE_QUADS];
+groupshared uint4 ws[(PIE_BK / PIE_CODES_PER_WORD) * PIE_TX];
 
 [numthreads(PIE_TX, PIE_TY, 1)]
 void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
@@ -51,60 +56,69 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     uint wpr = k * uint(PIE_BITS) / 32u;
     uint gpr = k / uint(PIE_GROUP);
     uint words_per_block = uint(PIE_BK) / cpw;
+    uint mycol = col0 + local.x * 4u;
 
-    float4 acc[4];
-    [ForceUnroll] for (uint i = 0u; i < 4u; i++) acc[i] = float4(0.0);
+    float4 acc[8];
+    [ForceUnroll] for (uint i = 0u; i < 8u; i++) acc[i] = float4(0.0);
 
     for (uint k0 = 0u; k0 < k; k0 += uint(PIE_BK)) {
         GroupMemoryBarrierWithGroupSync();
-        // Activations: four rows of one k per invocation and pass.
-        for (uint e = flat; e < uint(PIE_BK * PIE_TY); e += uint(PIE_THREADS)) {
-            uint kk = e / uint(PIE_TY);
-            uint quad = e - kk * uint(PIE_TY);
-            float4 v;
+        // Activations: four rows of one k per invocation and pass, raw bits.
+        for (uint e = flat; e < uint(PIE_BK * PIE_QUADS); e += uint(PIE_THREADS)) {
+            uint kk = e / uint(PIE_QUADS);
+            uint quad = e - kk * uint(PIE_QUADS);
+            uint h[4];
             [ForceUnroll] for (uint r = 0u; r < 4u; r++) {
                 uint row = row0 + quad * 4u + r;
-                v[r] = row < m ? slot_at(x, row * k + k0 + kk) : 0.0;
+                h[r] = row < m ? uint(x[row * k + k0 + kk]) : 0u;
             }
-            xs[e] = v;
+            xs[e] = uint2(h[0] | (h[1] << 16), h[2] | (h[3] << 16));
         }
-        // Weights: one packed word of one column per invocation and pass.
+        // Weights: one word of four neighbouring columns per invocation.
+        for (uint e = flat; e < uint(PIE_TX) * words_per_block; e += uint(PIE_THREADS)) {
+            uint wi = e / uint(PIE_TX);
+            uint quad = e - wi * uint(PIE_TX);
+            uint4 words = uint4(0u);
+            [ForceUnroll] for (uint c = 0u; c < 4u; c++) {
+                uint col = col0 + quad * 4u + c;
+                if (col < n) words[c] = w[col * wpr + k0 / cpw + wi];
+            }
+            ws[e] = words;
+        }
         uint g = k0 / uint(PIE_GROUP);
-        for (uint e = flat; e < uint(PIE_BN) * words_per_block; e += uint(PIE_THREADS)) {
-            uint c = e / words_per_block;
-            uint wi = e - c * words_per_block;
-            uint col = col0 + c;
-            uint word = 0u;
-            float s = 0.0;
-            float b = 0.0;
-            if (col < n) {
-                word = w[col * wpr + k0 / cpw + wi];
-                s = slot_at(scales, col * gpr + g);
-                b = slot_at(biases, col * gpr + g);
-            }
-            [ForceUnroll] for (uint q = 0u; q < cpw; q++) {
-                uint kk = wi * cpw + q;
-                uint at = kk * uint(PIE_TX) + c / 4u;
-                float value = col < n ? affine_code(word, q) * s + b : 0.0;
-                ws[at][c % 4u] = value;
-            }
+        float4 s;
+        float4 b;
+        [ForceUnroll] for (uint c = 0u; c < 4u; c++) {
+            uint col = min(mycol + c, n - 1u);
+            s[c] = slot_at(scales, col * gpr + g);
+            b[c] = slot_at(biases, col * gpr + g);
         }
         GroupMemoryBarrierWithGroupSync();
-        [ForceUnroll] for (uint kk = 0u; kk < uint(PIE_BK); kk++) {
-            float4 a = xs[kk * uint(PIE_TY) + local.y];
-            float4 bw = ws[kk * uint(PIE_TX) + local.x];
-            acc[0] += a.x * bw;
-            acc[1] += a.y * bw;
-            acc[2] += a.z * bw;
-            acc[3] += a.w * bw;
+        for (uint wi = 0u; wi < words_per_block; wi++) {
+            uint4 cw = ws[wi * uint(PIE_TX) + local.x];
+            [ForceUnroll] for (uint q = 0u; q < uint(PIE_CODES_PER_WORD); q++) {
+                uint kk = wi * cpw + q;
+                float4 bw = float4(affine_code(cw.x, q), affine_code(cw.y, q),
+                                   affine_code(cw.z, q), affine_code(cw.w, q)) * s + b;
+                uint2 p0 = xs[kk * uint(PIE_QUADS) + local.y * 2u];
+                uint2 p1 = xs[kk * uint(PIE_QUADS) + local.y * 2u + 1u];
+                acc[0] += asfloat(p0.x << 16) * bw;
+                acc[1] += asfloat(p0.x & 0xffff0000u) * bw;
+                acc[2] += asfloat(p0.y << 16) * bw;
+                acc[3] += asfloat(p0.y & 0xffff0000u) * bw;
+                acc[4] += asfloat(p1.x << 16) * bw;
+                acc[5] += asfloat(p1.x & 0xffff0000u) * bw;
+                acc[6] += asfloat(p1.y << 16) * bw;
+                acc[7] += asfloat(p1.y & 0xffff0000u) * bw;
+            }
         }
     }
 
-    [ForceUnroll] for (uint r = 0u; r < 4u; r++) {
-        uint row = row0 + local.y * 4u + r;
+    [ForceUnroll] for (uint r = 0u; r < 8u; r++) {
+        uint row = row0 + local.y * 8u + r;
         if (row >= m) continue;
         [ForceUnroll] for (uint c = 0u; c < 4u; c++) {
-            uint col = col0 + local.x * 4u + c;
+            uint col = mycol + c;
             if (col < n) slot_put(y, row * n + col, acc[r][c]);
         }
     }

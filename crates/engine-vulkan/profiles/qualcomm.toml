@@ -5,7 +5,7 @@ assumes = { vendor = "qualcomm", coopmat = false }
 
 [kernel]
 qmm = [
-  { when = "rows > 32", use = "register_tiled", bm = 64, k16 = true },
+  { when = "rows > 32", use = "register_tiled", bm = 64, k16 = false },
   { when = "rows >= 12", use = "register_tiled", bm = 32, k16 = true },
   { when = "subgroup >= 32", use = "one_row", lanes = 32, rows = 1 },
   { use = "qmv", vecs = 4 },
