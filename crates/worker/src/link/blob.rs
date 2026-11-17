@@ -8,9 +8,14 @@ pub async fn fetch(blob: &BlobRef) -> Result<Vec<u8>> {
     const RETRY_BACKOFF: Duration = Duration::from_millis(100);
     let url = format!("{}/blob/{}", blob.origin.trim_end_matches('/'), blob.hash);
 
+    let client = crate::http::builder()?
+        .build()
+        .context("building HTTP client")?;
     let mut attempt = 0;
     let bytes = loop {
-        let resp = reqwest::get(url.as_str())
+        let resp = client
+            .get(url.as_str())
+            .send()
             .await
             .with_context(|| format!("GET {url}"))?;
         match resp.status().as_u16() {
