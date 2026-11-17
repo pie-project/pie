@@ -41,17 +41,15 @@ pub enum GraphMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(
     id = "engine.recording",
-    default = r#"{ use = "bodies", mem_mb = 4096 }"#,
+    default = r#""bodies""#,
     tune = engine
 )]
 pub enum RecordingMode {
     Off,
     Shaped,
-    /// Recorded bodies are kept, up to `mem_mb` of device memory.
-    Bodies {
-        #[constant(range(0..=1_048_576), default = 4096)]
-        mem_mb: u32,
-    },
+    /// Recorded bodies are kept, each composition the load arms, in what
+    /// the fit holds them ahead of the cache rows.
+    Bodies,
 }
 
 /// Whether a window that cannot be viewed in place is copied rather than
@@ -297,9 +295,7 @@ impl Engine {
             recording: match *profile.get::<RecordingMode>() {
                 RecordingMode::Off => Recording::Off,
                 RecordingMode::Shaped => Recording::Shaped,
-                RecordingMode::Bodies { mem_mb } => Recording::Bodies {
-                    mem_megabytes: mem_mb,
-                },
+                RecordingMode::Bodies => Recording::Bodies,
             },
             copies: profile.on::<Copies>(&Anywhere),
             grouped: profile.on::<Grouped>(&Anywhere),
@@ -407,9 +403,7 @@ pub fn pinned(graphs: Graphs, recording: Option<Recording>) -> Profile {
         None => {}
         Some(Recording::Off) => text.push_str("recording = \"off\"\n"),
         Some(Recording::Shaped) => text.push_str("recording = \"shaped\"\n"),
-        Some(Recording::Bodies { mem_megabytes }) => text.push_str(&format!(
-            "recording = {{ use = \"bodies\", mem_mb = {mem_megabytes} }}\n"
-        )),
+        Some(Recording::Bodies) => text.push_str("recording = \"bodies\"\n"),
     }
     profile(&text)
 }
@@ -461,8 +455,6 @@ mod tests {
     }
 
     #[cfg(not(feature = "rocm"))]
-    use crate::DEFAULT_BODIES_MEGABYTES;
-
     #[test]
     fn every_checked_in_profile_dumps_to_a_file_that_reads_back_strictly() {
         for (name, text) in SEEDED {
@@ -778,9 +770,7 @@ mod tests {
             engine,
             Engine {
                 graphs: Graphs::default(),
-                recording: Recording::Bodies {
-                    mem_megabytes: DEFAULT_BODIES_MEGABYTES
-                },
+                recording: Recording::Bodies,
                 copies: true,
                 grouped: true,
                 working_set_percent: 50,
@@ -1084,13 +1074,6 @@ mod tests {
                     prefill_lattice_from: 256,
                     prefill_lattice_steps: 8,
                     seated_first: std::ptr::eq(p, &l40s),
-                    recording: if std::ptr::eq(p, &l40s) {
-                        Recording::Bodies {
-                            mem_megabytes: 1024,
-                        }
-                    } else {
-                        Engine::of(&registry().defaults()).recording
-                    },
                     ..Engine::of(&registry().defaults())
                 }
             );

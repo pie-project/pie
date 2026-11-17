@@ -129,13 +129,7 @@ fn the_token_class_fires_alone() {
     }
     let plan = plan();
     let weights = Weights::random(&plan, 41);
-    let mut rig = Rig::load_recording(
-        plan,
-        &weights,
-        64,
-        vec![16, 64],
-        Recording::Bodies { mem_megabytes: 0 },
-    );
+    let mut rig = Rig::load_recording(plan, &weights, 64, vec![16, 64], Recording::Shaped);
 
     let program = rig.register(epilogue(TEXT_ROWS, WIDTH), 7);
     let handles = rig.lane_of(program, TEXT_ROWS, WIDTH);

@@ -1,6 +1,6 @@
 //! What a deployment's graph bodies took the last time it armed whole,
 //! kept beside the kernel cache: a load that finds it holds that for its
-//! bodies, not the `[engine] bodies_mem` ceiling, and arms its lattice as
+//! bodies, not everything past one working set, and arms its lattice as
 //! recorded, without the estimates a load that knows nothing prices by.
 //!
 //! The record is keyed on everything that shapes the bodies: the engine
@@ -104,7 +104,7 @@ pub(crate) fn write(path: &Path, measured: Measured) -> std::io::Result<()> {
 /// What a load's arming ends with for the record at `path`: armed whole,
 /// what the bodies took is written; short of whole (`armed` of `wanted`)
 /// after holding a record's figure, the record under-held, and it is
-/// dropped, so the next load holds the ceiling and records again. The
+/// dropped, so the next load measures them and records again. The
 /// line to say, where there is one.
 ///
 /// Armed whole, the record never shrinks: the key fixes the build and the
@@ -146,7 +146,7 @@ pub(crate) fn conclude(
     }
     Ok(Some(format!(
         "engine-cuda: the bodies' record under-held: {armed} of {wanted} compositions armed; \
-         the record is dropped and the next load holds bodies_mem"
+         the record is dropped and the next load measures them again"
     )))
 }
 
@@ -250,7 +250,7 @@ mod tests {
         // Short of whole on the record's figure: dropped, and said.
         let said = conclude(&at, true, false, measured, 150, 161).unwrap();
         assert!(said.is_some_and(|line| line.contains("150 of 161 compositions armed")));
-        assert_eq!(read(&at), None, "the next load holds bodies_mem");
+        assert_eq!(read(&at), None, "the next load measures them again");
         // Dropped twice is no error.
         assert!(
             conclude(&at, true, false, measured, 150, 161)

@@ -13,7 +13,7 @@ mod settle;
 mod stats;
 
 pub use arming::{Armed, Kind, Seal};
-pub use boot::{Boot, DEFAULT_BODIES_MEGABYTES, Golden, Graphs, Knobs, Recording};
+pub use boot::{Boot, Golden, Graphs, Knobs, Recording};
 pub use diag::Diagnostics;
 pub use lanes::{Attached, Clips, Lane, Media, Seated};
 pub(crate) use lanes::{MROPE_COORDS, PATCH_ROUTE_DROP};

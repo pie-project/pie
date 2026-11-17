@@ -108,6 +108,8 @@ pub(super) struct Arming {
     /// away.
     profiled: usize,
     ballot: Ballot,
+    /// When arming began.
+    began: std::time::Instant,
 }
 
 impl Arming {
@@ -1041,10 +1043,10 @@ impl Shell {
         while need(&buckets) > room {
             if fine <= steps.max(1) {
                 eprintln!(
-                    "engine-cuda: WARNING: [engine] bodies_mem {} MiB (or the card) arms no \
+                    "engine-cuda: WARNING: the bodies' hold of {} MiB arms no \
                      lattice's every key: at {fine} bucket(s) a doubling past {from} rows the {} \
-                     narrower bodies still to arm weigh some {} MiB of the {} MiB left. Raise \
-                     bodies_mem or free the card.",
+                     narrower bodies still to arm weigh some {} MiB of the {} MiB left. Free \
+                     the card.",
                     self.bodies_mem >> 20,
                     rest.iter().filter(|(b, _)| buckets.contains(b)).count(),
                     need(&buckets) >> 20,
@@ -1058,7 +1060,7 @@ impl Shell {
         }
         if buckets.len() < was.len() {
             eprintln!(
-                "engine-cuda: [engine] bodies_mem {} MiB (or the card) arms every key at {fine} \
+                "engine-cuda: the bodies' hold of {} MiB arms every key at {fine} \
                  bucket(s) a doubling past {from} rows, not the profile's {}: {} bucket(s), not \
                  {} ({} bodies armed at {} KiB on average, {} still to arm at the profile's \
                  lattice, {} MiB left).",
@@ -1465,6 +1467,7 @@ impl Shell {
             from_record: self.bodies_from_record || self.rearming,
             capped: !(self.bodies_from_record && self.arming_at_load),
             took: Some(0),
+            began: std::time::Instant::now(),
             profiled: self.budget.buckets.len(),
             ballot: Ballot::open(&self.device),
         })
@@ -1791,7 +1794,10 @@ impl Shell {
             refusals: stats.tally.refusals,
             seal,
         };
-        eprintln!("engine-cuda: {report}");
+        eprintln!(
+            "engine-cuda: {report}; armed in {:.1} s",
+            st.began.elapsed().as_secs_f64()
+        );
         // The lattice the bodies armed over against the profile's: fewer
         // buckets is the allowance binding, each fire padded further.
         eprintln!(
@@ -2104,7 +2110,7 @@ impl core::fmt::Display for Armed {
                         spare >> 20
                     ),
                     None if self.belted => "record::MAX_BODIES".to_string(),
-                    None => "[engine] bodies_mem".to_string(),
+                    None => "the bodies' hold".to_string(),
                 },
                 self.never_from,
             )?,

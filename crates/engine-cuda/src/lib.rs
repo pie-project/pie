@@ -183,8 +183,7 @@ pub use run::{
     PoolSlabs, Run, SlotTable, StructSlot, WeightRow, WeightTable,
 };
 pub use serve::{
-    Armed, Boot, DEFAULT_BODIES_MEGABYTES, Diagnostics, Golden, Graphs, Knobs, Lane, Media,
-    Recording, Seal, Seated, Shell,
+    Armed, Boot, Diagnostics, Golden, Graphs, Knobs, Lane, Media, Recording, Seal, Seated, Shell,
 };
 
 pub use blob::{
