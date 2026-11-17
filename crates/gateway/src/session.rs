@@ -41,7 +41,9 @@ pub struct TurnInput {
 /// moves once it has sent output: launched again elsewhere under the same
 /// process, it sends the client only what follows.
 #[derive(Clone)]
-pub struct Resume(pub Arc<dyn Fn(&str) -> Option<String> + Send + Sync>);
+pub struct Resume(pub Arc<ResumeFn>);
+
+pub type ResumeFn = dyn Fn(&str) -> Option<String> + Send + Sync;
 
 impl std::fmt::Debug for Resume {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1276,7 +1278,8 @@ mod tests {
         assert!(sessions.migrate(req, WorkerId(8)).await);
         assert_eq!(*router.cancels.lock().unwrap(), [(WorkerId(7), req)]);
         assert_eq!(*router.moves.lock().unwrap(), [(req, Some(WorkerId(8)))]);
-        let ClientMessage::LaunchProcess { input, .. } = &router.messages.lock().unwrap()[1] else {
+        let message = router.messages.lock().unwrap()[1].clone();
+        let ClientMessage::LaunchProcess { input, .. } = message else {
             panic!("a launch");
         };
         assert_eq!(input, "after one", "it goes on after what was sent");
