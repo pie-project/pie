@@ -2424,14 +2424,6 @@ impl<'c> Run<'c> {
         })
     }
 
-    pub(crate) fn windowed(&self, handle: Tensor) -> Tensor {
-        if !self.plane_base() {
-            return handle;
-        }
-        let window = self.window().span();
-        skip(handle, window.row_offset, window.rows)
-    }
-
     /// Each of this window's clips' lane in the fire, cut as its grids
     /// index lanes, and the lane the recurrent pools' lane tables start at
     /// in this window ([`Self::recurrent`]): clip `l` reads row
