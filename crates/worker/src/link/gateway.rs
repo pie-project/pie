@@ -610,8 +610,30 @@ async fn run_turn(
         return push_eos(gateway, req_id).await;
     }
 
+    // Once the turn names its process, the gateway hears when it starts
+    // here (its execution admitted): the cluster's policies count its
+    // waiting from that, not from its first output.
+    let mut start: Option<tokio::sync::oneshot::Receiver<()>> = None;
+    let mut armed = false;
+    let arm = |process_id: &Option<String>| {
+        process_id
+            .as_deref()
+            .and_then(|pid| pid.parse().ok())
+            .map(runtime::policy::started)
+    };
+    if let Some(rx) = arm(&process_id) {
+        start = Some(rx);
+        armed = true;
+    }
+
     loop {
         tokio::select! {
+            fired = async { start.as_mut().expect("armed").await }, if start.is_some() => {
+                start = None;
+                if fired.is_ok() {
+                    let _ = gateway.started(push_ctx(), req_id).await;
+                }
+            }
             _ = cancel.notified() => {
                 tracing::debug!(%req_id, "turn cancelled");
                 match (&process_id, corr) {
@@ -628,6 +650,10 @@ async fn run_turn(
                     return TurnEnd::Aborted;
                 };
                 let terminal = turn_terminal(&msg, corr, proc_launch, &mut process_id);
+                if !armed && let Some(rx) = arm(&process_id) {
+                    start = Some(rx);
+                    armed = true;
+                }
                 match gateway.push_tokens(push_ctx(), req_id, Tokens::Chunk(msg)).await {
                     Ok(Control::Continue) => {}
                     Ok(Control::Abort) => {

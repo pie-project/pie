@@ -137,7 +137,51 @@ pub fn session_closed(session: String) {
     report(Event::SessionClosed(session));
 }
 
+/// Who waits to hear a process start (a worker forwards it to its
+/// gateway), and which have started: a start that comes before its waiter
+/// is not lost.
+#[derive(Default)]
+struct Starts {
+    waiting: std::collections::HashMap<ProcessId, Vec<tokio::sync::oneshot::Sender<()>>>,
+    started: std::collections::HashSet<ProcessId>,
+}
+
+static STARTS: std::sync::LazyLock<std::sync::Mutex<Starts>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Resolves once `pid` has started (at once if it already has); never if
+/// it exits first.
+pub fn started(pid: ProcessId) -> tokio::sync::oneshot::Receiver<()> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let mut starts = STARTS.lock().unwrap();
+    if starts.started.contains(&pid) {
+        let _ = tx.send(());
+    } else {
+        starts.waiting.entry(pid).or_default().push(tx);
+    }
+    rx
+}
+
+fn note_start(event: &Event) {
+    match event {
+        Event::Started(pid) => {
+            let mut starts = STARTS.lock().unwrap();
+            starts.started.insert(*pid);
+            for tx in starts.waiting.remove(pid).into_iter().flatten() {
+                let _ = tx.send(());
+            }
+        }
+        Event::Exited(pid, _) => {
+            let mut starts = STARTS.lock().unwrap();
+            starts.started.remove(pid);
+            starts.waiting.remove(pid);
+        }
+        _ => {}
+    }
+}
+
 pub(crate) fn report(event: Event) {
+    note_start(&event);
     #[cfg(not(target_arch = "wasm32"))]
     port::report(event);
     #[cfg(target_arch = "wasm32")]
