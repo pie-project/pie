@@ -126,6 +126,22 @@ __device__ __forceinline__ float block_max(float v, float* smem) {
 // a launch to a bucket of rows and stages the run's true extent in four
 // words, {rows, row_offset, lanes, lane_offset}. Absent (null), the launch's
 // own extent is the true one and it starts at row 0.
+// Each index of a flat launch over `n` elements (or lanes), `f(i)` at each:
+// one a thread under a 32-bit `I` (the launch's grid then covers `n`), a
+// grid-stride loop under a 64-bit one (the grid capped at the x axis). `f`
+// returns false where its thread's rows are past the window.
+template <class I, class F>
+__device__ __forceinline__ void sweep(I n, F&& f) {
+    const I first = static_cast<I>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if constexpr (sizeof(I) == 4) {
+        if (first < n) f(first);
+    } else {
+        const I stride = static_cast<I>(gridDim.x) * blockDim.x;
+        for (I i = first; i < n; i += stride)
+            if (!f(i)) return;
+    }
+}
+
 struct Window {
     const u32* w;
 

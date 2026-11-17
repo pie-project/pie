@@ -14,12 +14,13 @@ namespace pie::attn {
 constexpr float kLn2 = 0.69314718055994530942f;
 
 // x = cap · tanh(x / cap), in place: Gemma's logit soft cap.
-template <class T>
-__global__ void logit_softcap(T* __restrict__ x, float cap, usize n) {
-    const usize i = static_cast<usize>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i >= n) return;
+template <class T, class I>
+__global__ void logit_softcap(T* __restrict__ x, float cap, I n) {
     const float inv_cap = 1.f / cap;
-    x[i] = from_f32<T>(cap * tanhf(to_f32(x[i]) * inv_cap));
+    sweep(n, [&](I i) {
+        x[i] = from_f32<T>(cap * tanhf(to_f32(x[i]) * inv_cap));
+        return true;
+    });
 }
 
 // V elements a thread (V divides the head width), a row's heads·head_dim / V

@@ -23,6 +23,31 @@ impl Launch {
         }
     }
 
+    /// The most blocks a grid's x axis holds on HIP.
+    pub const GRID_X: u32 = i32::MAX as u32;
+
+    /// A grid-stride sweep over `n` elements, one a thread: a thread an
+    /// element up to the x axis's most blocks, the kernel's loop past it.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub const fn strided(n: u64, block: u32) -> Self {
+        let blocks = if block == 0 {
+            0
+        } else {
+            n.div_ceil(block as u64)
+        };
+        let grid = if blocks > Self::GRID_X as u64 {
+            Self::GRID_X
+        } else {
+            blocks as u32
+        };
+        Self {
+            grid: [grid, 1, 1],
+            block: [block, 1, 1],
+            smem: 0,
+        }
+    }
+
     #[must_use]
     pub const fn per_row(rows: u32, block: u32) -> Self {
         Self {
