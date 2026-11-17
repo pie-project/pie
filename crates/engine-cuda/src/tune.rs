@@ -90,7 +90,7 @@ pub fn rates(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Rated
     let tuned = engine::rates::tuned(&r);
     let how = format!(
         "{name}; the matmul through {} under serving's GEMM tactics, each rate a 20 ms burst on \
-         the stream timed by events, the median of 5 (the launch of 15); operands: engine::rates' pattern; rows to the saturation point {} (no (n, k) shape's cost a row fell by more than {:.0}% from {}; the most {:.1}%, at {} x {}); at {}",
+         the stream timed by events, the median of 5 (the launch of 15); operands: engine::rates' pattern; rows to the saturation point {} (past it no (n, k) shape's cost a row fell more than {:.0}% below its least through {}; at it the most {:.1}%, at {} x {}); at {}",
         if cfg!(feature = "rocm") {
             "hipBLASLt"
         } else {
@@ -98,7 +98,7 @@ pub fn rates(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Rated
         },
         top.rows,
         100.0 * profile::AGREEMENT,
-        top.below,
+        top.through,
         100.0 * top.best_gain,
         top.best_shape.0,
         top.best_shape.1,

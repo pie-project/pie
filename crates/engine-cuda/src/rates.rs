@@ -56,13 +56,14 @@ pub fn lattice_rows(chip: &profile::Profile) -> Vec<u32> {
     lattice
 }
 
-/// Where the matmul grid saturates: at `rows` no `(n, k)` shape's cost a row
-/// fell by more than `profile::AGREEMENT` from `below`; `best_gain` the most
-/// any did, at `best_shape`.
+/// Where the matmul grid saturates: `rows` the last where an `(n, k)`
+/// shape's cost a row fell more than `profile::AGREEMENT` below the least
+/// before it (`best_gain` the most, at `best_shape`), none doing so from
+/// there through `through`, a doubling or more past it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Saturation {
     pub rows: u32,
-    pub below: u32,
+    pub through: u32,
     pub best_gain: f64,
     pub best_shape: (u32, u32),
 }
@@ -355,11 +356,11 @@ mod on_device {
             gap,
         )?;
         eprintln!(
-            "[rates]: the grid saturates at {} rows: no (n, k) shape's cost a row fell by more \
-             than {:.0}% from {} (the most {:.1}%, at {} x {})",
+            "[rates]: the grid saturates at {} rows: past it no (n, k) shape's cost a row fell \
+             more than {:.0}% below its least through {} (at it the most {:.1}%, at {} x {})",
             top.rows,
             100.0 * profile::AGREEMENT,
-            top.below,
+            top.through,
             100.0 * top.best_gain,
             top.best_shape.0,
             top.best_shape.1
@@ -407,14 +408,17 @@ mod on_device {
     }
 
     /// The matmul grid and its top: every `(n, k)` of [`DEPTHS`] squared,
-    /// at each row of `lattice` ascending up to the first where no shape's
-    /// cost a row (its launch and its work over its rows) falls by more than
-    /// `profile::AGREEMENT` from the row before ([`Saturation`]). A top rung
-    /// is the argmax of efficiency times live capacity, and live capacity
-    /// only falls as rows grow, so no rung past that point can be chosen.
+    /// at each row of `lattice` ascending up to the card's saturation point
+    /// ([`Saturation`]): the last row where some shape's cost a row (its
+    /// launch and its work over its rows) falls more than
+    /// `profile::AGREEMENT` below the least it took at any row before, with
+    /// none doing so through a doubling of its rows past it (the lattice's
+    /// period: a tile's padding repeats each doubling, so a cost a row
+    /// zigzags within one and a step-to-step gain is not an improvement). A
+    /// top rung is the argmax of efficiency times live capacity, and live
+    /// capacity only falls as rows grow, so no rung past it can be chosen.
     /// Each shape walks its own rows first (one rotation laid), then every
-    /// shape is filled to the widest row any stopped at, and the grid ends at
-    /// the first row where none improves.
+    /// shape is filled to the widest row any reached.
     fn gemm(
         ctx: &Ctx,
         clock: &Clock,
@@ -440,70 +444,71 @@ mod on_device {
             };
             (gap + work) / f64::from(m)
         };
-        let gain = |shape: (u32, u32), lo: (u32, f64), hi: (u32, f64)| {
-            cost(shape, lo.0, lo.1) / cost(shape, hi.0, hi.1) - 1.0
+        // Each row's gain on the least cost a row before it, of one shape.
+        let gains = |at: usize, rates: &[f64]| -> Vec<f64> {
+            let mut least = f64::INFINITY;
+            rates
+                .iter()
+                .enumerate()
+                .map(|(i, &rate)| {
+                    let c = cost(shapes[at], lattice[i], rate);
+                    let gain = least / c - 1.0;
+                    least = least.min(c);
+                    gain
+                })
+                .collect()
+        };
+        // The last row that improved, and the first row a doubling past it.
+        let last = |g: &[f64]| {
+            (1..g.len())
+                .rev()
+                .find(|&i| g[i] > profile::AGREEMENT)
+                .unwrap_or(0)
+        };
+        let past = |i: usize| {
+            lattice
+                .iter()
+                .position(|&m| u64::from(m) >= 2 * u64::from(lattice[i]))
+                .unwrap_or(lattice.len() - 1)
         };
         let mut rates: Vec<Vec<f64>> = vec![Vec::new(); shapes.len()];
-        // Each shape alone, ascending, to its first row that does not
-        // improve on the one before.
+        let mut reach = 0;
+        // Each shape alone, ascending, to a doubling past its last gain.
         for &at in &order {
-            let mut shape = Planes::lay(random, shapes[at])?;
-            loop {
-                let i = rates[at].len();
-                let Some(&m) = lattice.get(i) else { break };
-                rates[at].push(shape.at(ctx, clock, random, held, m, gap)?);
-                if i > 0
-                    && gain(
-                        shapes[at],
-                        (lattice[i - 1], rates[at][i - 1]),
-                        (m, rates[at][i]),
-                    ) <= profile::AGREEMENT
-                {
+            let mut planes = Planes::lay(random, shapes[at])?;
+            while rates[at].len() < lattice.len() {
+                let m = lattice[rates[at].len()];
+                rates[at].push(planes.at(ctx, clock, random, held, m, gap)?);
+                if rates[at].len() > past(last(&gains(at, &rates[at]))) {
                     break;
                 }
             }
+            reach = reach.max(rates[at].len());
         }
-        // Every shape to the widest row any stopped at, then the first row
-        // where none improves; past every row measured, one more each.
-        let mut reach = rates.iter().map(Vec::len).max().unwrap_or(0);
+        // Every shape to the widest row any reached, until the last gain of
+        // any has a doubling measured past it.
         let top = loop {
             for &at in &order {
                 if rates[at].len() >= reach {
                     continue;
                 }
-                let mut shape = Planes::lay(random, shapes[at])?;
+                let mut planes = Planes::lay(random, shapes[at])?;
                 while rates[at].len() < reach {
                     let m = lattice[rates[at].len()];
-                    rates[at].push(shape.at(ctx, clock, random, held, m, gap)?);
+                    rates[at].push(planes.at(ctx, clock, random, held, m, gap)?);
                 }
             }
-            let stop = (1..reach).find(|&i| {
-                (0..shapes.len()).all(|at| {
-                    gain(
-                        shapes[at],
-                        (lattice[i - 1], rates[at][i - 1]),
-                        (lattice[i], rates[at][i]),
-                    ) <= profile::AGREEMENT
-                })
-            });
-            match stop {
-                Some(i) => break i,
-                None if reach < lattice.len() => reach += 1,
-                None => break reach - 1,
+            let top = (0..shapes.len())
+                .map(|at| last(&gains(at, &rates[at])))
+                .max()
+                .unwrap_or(0);
+            if past(top) < reach || reach == lattice.len() {
+                break top;
             }
+            reach = past(top) + 1;
         };
         let (best, at) = (0..shapes.len())
-            .map(|at| {
-                let i = top.max(1);
-                (
-                    gain(
-                        shapes[at],
-                        (lattice[i - 1], rates[at][i - 1]),
-                        (lattice[i], rates[at][i]),
-                    ),
-                    at,
-                )
-            })
+            .map(|at| (gains(at, &rates[at])[top], at))
             .max_by(|a, b| a.0.total_cmp(&b.0))
             .expect("shapes");
         let mut grid = Vec::with_capacity((top + 1) * shapes.len());
@@ -515,7 +520,7 @@ mod on_device {
         grid.sort_by_key(|&(m, n, k, _)| (k, n, m));
         let saturation = Saturation {
             rows: lattice[top],
-            below: lattice[top.saturating_sub(1)],
+            through: lattice[reach - 1],
             best_gain: best,
             best_shape: shapes[at],
         };
