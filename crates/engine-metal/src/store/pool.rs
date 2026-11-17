@@ -982,6 +982,13 @@ impl Pool {
             at: "store::pool::evacuate",
             why: why.to_string(),
         })?;
+        if let Ok(mut map) = crate::store::MOVED.lock() {
+            let map = map.get_or_insert_with(Default::default);
+            for &(logical, physical) in &evacuation.moves {
+                map.insert(logical, physical);
+            }
+        }
+        eprintln!("PROBE-EVAC: {} moves {:?}", evacuation.moves.len(), &evacuation.moves[..evacuation.moves.len().min(8)]);
         for &(logical, physical) in &evacuation.moves {
             let from = self.physical(logical)?;
             self.admit(from)?;

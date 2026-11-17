@@ -1089,8 +1089,16 @@ impl Pools {
             });
         }
         let physical = self.pool.physical(chunk)?;
+        diag_named(physical, shape_id_of(shape), chunk);
         self.pool.clear_of_carve(chunk, physical)?;
         Ok((physical, index))
+    }
+
+    /// PROBE: the logical and physical chunk slot ref `slot` of `id` sits in.
+    pub fn diag_chunk(&self, id: ShapeId, slot: u32) -> Option<(u32, u32)> {
+        let shape = *self.shape(id).ok()?;
+        let (chunk, _) = shape.split(slot);
+        Some((chunk, self.pool.physical(chunk).ok()?))
     }
 
     /// The physical slot kernels address for slot ref `slot` of `shape`.
@@ -2463,4 +2471,32 @@ impl Pools {
                 .any(|slot| seats.contains(&(slot / cache.shape.per_chunk.max(1))))
         })
     }
+}
+
+
+/// PROBE: the shape and logical chunk that last named each physical chunk
+/// in a fire's slot lookups, and each logical chunk's latest move.
+static NAMED: std::sync::Mutex<Option<std::collections::HashMap<u32, (u32, u32)>>> =
+    std::sync::Mutex::new(None);
+pub static MOVED: std::sync::Mutex<Option<std::collections::HashMap<u32, u32>>> =
+    std::sync::Mutex::new(None);
+
+fn shape_id_of(shape: &Slots) -> u32 {
+    shape.id.0
+}
+
+fn diag_named(physical: u32, shape: u32, logical: u32) {
+    if let Ok(mut map) = NAMED.lock() {
+        map.get_or_insert_with(Default::default).insert(physical, (shape, logical));
+    }
+}
+
+/// PROBE: who last named physical chunk `physical`: (shape, logical).
+pub fn diag_last_named(physical: u32) -> Option<(u32, u32)> {
+    NAMED.lock().ok()?.as_ref()?.get(&physical).copied()
+}
+
+/// PROBE: where logical chunk `logical` last moved to, if it moved.
+pub fn diag_moved(logical: u32) -> Option<u32> {
+    MOVED.lock().ok()?.as_ref()?.get(&logical).copied()
 }

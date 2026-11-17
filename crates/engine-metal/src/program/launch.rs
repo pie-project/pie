@@ -2037,6 +2037,16 @@ impl Prepared {
     pub fn status(&self) -> Result<Status> {
         let mut bytes = [0u8; eta_exec::STATUS_BYTES];
         self.status.read(0, &mut bytes)?;
+        let state = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        if state > 3 {
+            let chunk = self.status.diag_chunk;
+            let named = chunk.and_then(|(_, p)| crate::store::diag_last_named(p));
+            let moved = chunk.and_then(|(l, _)| crate::store::diag_moved(l));
+            eprintln!(
+                "PROBE-STATUS: state {state:#x} words {:02x?} slot {:?} offset {} chunk (logical, physical) {chunk:?} last named by (shape, logical) {named:?} logical last moved to {moved:?}",
+                &bytes[..16.min(bytes.len())], self.status.slot(), self.status.offset()
+            );
+        }
         Status::read(&bytes).ok_or_else(|| {
             Fault::program(
                 "program::launch",
