@@ -1619,6 +1619,17 @@ impl Pools {
         Ok(())
     }
 
+    /// The event the pool's newest buffer fires once every program that
+    /// wrote it has run (a copy's, and every one before it: each takes the
+    /// buffer the one before returned); `None` on a dry device, which runs
+    /// none.
+    pub fn landing(&self) -> Result<Option<crate::pjrt::Event>> {
+        Ok(match self.buffer.as_ref() {
+            Some(buffer) => Some(buffer.ready()?),
+            None => None,
+        })
+    }
+
     /// Copies whole slots `(shape, src ref, dst ref)` in order (a later one
     /// may read what an earlier one wrote).
     pub fn copy(
