@@ -1008,8 +1008,11 @@ pub fn run(
     if steps.rates {
         provenance.push(engine::rates::provenance(
             "vulkan",
-            "the matmul through the profile's path, the host's clock around each frame; operands: \
-             engine::rates' pattern",
+            &format!(
+                "the matmul through the profile's path, the host's clock around each frame; \
+                 operands: engine::rates' pattern; at {}",
+                engine::rates::build_commit()
+            ),
         ));
     }
     let file = search::assemble(

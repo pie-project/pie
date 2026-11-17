@@ -615,6 +615,16 @@ pub fn provenance(backend: &str, how: &str) -> (&'static str, String) {
     ("rates", format!("\"{}\"", text.replace('"', "'")))
 }
 
+/// The commit this pie was built from, as the build stated it in
+/// `PIE_COMMIT`, else `commit unknown`: never the source tree's `HEAD` at
+/// tune time, which may have moved on since the build. A rates step's
+/// provenance names it.
+#[must_use]
+pub fn build_commit() -> String {
+    option_env!("PIE_COMMIT")
+        .map_or_else(|| "commit unknown".to_string(), |c| format!("commit {c}"))
+}
+
 /// Today's date in UTC, `YYYY-MM-DD`.
 fn today() -> String {
     let secs = std::time::SystemTime::now()

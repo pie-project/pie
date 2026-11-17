@@ -52,7 +52,11 @@ pub fn rates(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Outco
         ),
         engine::rates::provenance(
             "wgpu",
-            "the matmul through the profile's path, the adapter's timestamps where it has them; operands: engine::rates' pattern",
+            &format!(
+                "the matmul through the profile's path, the adapter's timestamps where it has \
+                 them; operands: engine::rates' pattern; at {}",
+                engine::rates::build_commit()
+            ),
         ),
         ("from", format!("\"{}\"", report.used)),
         ("pie", format!("\"{}\"", env!("CARGO_PKG_VERSION"))),
