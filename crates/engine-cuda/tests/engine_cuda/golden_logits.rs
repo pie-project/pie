@@ -449,7 +449,8 @@ fn load_under(
                 .and_then(|mib| mib.parse::<u64>().ok())
                 .map(|mib| mib << 20),
             mib => Some(mib << 20),
-        },
+        }
+        .map(engine_cuda::store::KvSize::Bytes),
         allowance,
         context_declared: false,
         ordinal: 0,
@@ -929,8 +930,12 @@ fn served_offloaded(fixture: &Fixture, cache: &Path, offload: bool) -> Vec<(u64,
     if stated.is_some() {
         resident("before it is seated");
     }
+    let host = Some(stated.map_or(1 << 30, |mib| mib << 20));
+    let ring = engine_cuda::store::staging_ring_for(shell.trace(), PAGE, CONTEXT, CONTEXT, host, 1)
+        .and_then(|bytes| bytes.map(engine_cuda::store::Ring::pin).transpose())
+        .expect("the staging ring pins");
     shell
-        .seat_host_kv(Some(stated.map_or(1 << 30, |mib| mib << 20)), 1, CONTEXT, 1)
+        .seat_host_kv(host, 1, CONTEXT, 1, ring)
         .expect("the host tier seats");
     if stated.is_some() {
         std::thread::sleep(std::time::Duration::from_secs(2));
@@ -2346,7 +2351,7 @@ fn load_lanes(
         page_size: PAGE,
         context: CONTEXT,
         slots: lanes,
-        kv_budget,
+        kv_budget: kv_budget.map(engine_cuda::store::KvSize::Bytes),
         allowance: engine::Allowance::WHOLE,
         context_declared: false,
         ordinal: 0,

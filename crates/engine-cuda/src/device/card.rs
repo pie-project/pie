@@ -49,6 +49,21 @@ pub fn stated(budget: Option<u64>) {
     STATED.store(budget.is_some(), Ordering::Relaxed);
 }
 
+/// What bounds the load's room on the bound device, as a refusal names it:
+/// the operator's budget where one is stated, else an integrated device's
+/// carve-out within Windows' commit, else the whole device.
+#[must_use]
+pub fn bound() -> &'static str {
+    if STATED.load(Ordering::Relaxed) {
+        "under `[engine.memory] budget_device`"
+    } else if matches!(integrated(), Ok(Some(_))) {
+        "within the integrated device's carve-out and Windows' commit (state \
+         `[engine.memory] budget_device` to size by the system memory the driver lends it)"
+    } else {
+        "on the whole device"
+    }
+}
+
 /// The bound device's free and total bytes now.
 pub fn memory() -> Result<(u64, u64)> {
     #[cfg(feature = "device")]
