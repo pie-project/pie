@@ -159,6 +159,12 @@ impl PoolTarget for EnginePool {
         self.target_mut().is_some_and(PoolTarget::take_refused)
     }
 
+    fn pressed(&mut self, yielding: bool) {
+        if let Some(grow) = self.target_mut() {
+            grow.pressed(yielding);
+        }
+    }
+
     fn ticked(&mut self) {
         if let Some(grow) = self.target_mut() {
             grow.ticked();
@@ -319,6 +325,10 @@ impl<P: PoolTarget> PoolTarget for Shared<P> {
 
     fn take_refused(&mut self) -> bool {
         self.0.lock().take_refused()
+    }
+
+    fn pressed(&mut self, yielding: bool) {
+        self.0.lock().pressed(yielding);
     }
 
     fn ticked(&mut self) {

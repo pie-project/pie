@@ -1041,6 +1041,10 @@ impl<P: PoolTarget + SlotAccess, W: WeightPort> PoolTarget for WeightFirst<P, W>
         self.inner.take_refused()
     }
 
+    fn pressed(&mut self, yielding: bool) {
+        self.inner.pressed(yielding);
+    }
+
     fn ticked(&mut self) {
         self.heard();
         match self.port.uses() {

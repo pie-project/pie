@@ -24,9 +24,12 @@ pub struct SharedGrow {
     refused: Arc<AtomicBool>,
     /// The last shrink found no room.
     no_room: Arc<AtomicBool>,
-    /// The walk of the activation rung toward what the passes still to run
-    /// ask of a fire (SPEC decision 6, by demand): the smallest rung while
-    /// none asks past it.
+    /// The governor yields to the system's pressure ([`PoolTarget::pressed`]):
+    /// only then is the rung walked below the top.
+    pressed: Arc<AtomicBool>,
+    /// The walk of the activation rung: at the top rung the load chose,
+    /// down toward what the passes still to run ask of a fire only under
+    /// yield's pressure ([`Self::pressed`]), and back up once it lifts.
     rung_walk: Arc<std::sync::Mutex<RungWalk>>,
     /// The lanes live now that may decode ([`Self::walk_rows`]).
     live_lanes: Arc<dyn Fn() -> u32 + Send + Sync>,
@@ -74,6 +77,7 @@ impl SharedGrow {
             wake: Arc::new(Notify::new()),
             refused: Arc::new(AtomicBool::new(false)),
             no_room: Arc::new(AtomicBool::new(false)),
+            pressed: Arc::new(AtomicBool::new(false)),
             rung_walk: Arc::new(std::sync::Mutex::new(RungWalk::default())),
             #[cfg(test)]
             epochs_for_test: None,
@@ -106,6 +110,7 @@ impl SharedGrow {
     /// for a test.
     #[cfg(test)]
     pub(crate) fn press_for_test(&self) {
+        self.pressed.store(true, Ordering::Release);
         self.target.store(0, Ordering::Release);
     }
 
@@ -185,15 +190,23 @@ impl SharedGrow {
                 if pool.awaiting_notice().is_some() {
                     return;
                 }
-                let goal = pool.rung_for(self.walk_rows());
+                // The rung stands at the top the load chose: it comes down,
+                // toward what the passes ask of a fire, only under yield,
+                // the governor yielding to the system's pressure with its
+                // target below what is mapped, whose last shed gives the
+                // span the lower leaves back. Neither an idle pool nor a
+                // small request lowers it, and a calm target below what is
+                // mapped (demand fell) is no pressure. Once yield lifts, the
+                // walk raises it to the top again.
+                let yielding = self.pressed.load(Ordering::Acquire)
+                    && self.goal_in(&pool) < pool.mapped_segments();
+                let goal = if yielding {
+                    pool.rung_for(self.walk_rows())
+                } else {
+                    pool.rungs().last().copied().unwrap_or(0)
+                };
                 let cap = super::fire_cap(self.engine);
-                // The pool stands past what is asked: it comes down only
-                // under yield, the governor's target below what is mapped
-                // (pressure), whose last shed gives the span the lower
-                // leaves back; an idle pool keeps its rung. The governor's
-                // grow backs it again.
                 let past = pool.pool().act_chunks(goal) < pool.pool().act_reserved();
-                let yielding = self.goal_in(&pool) < pool.mapped_segments();
                 // An engine holding a rung that no longer fits is brought
                 // down at once too: a bind waits on it.
                 let forced = cap > pool.fit_cap() || pool.told_unfit();
@@ -691,6 +704,14 @@ impl PoolTarget for SharedGrow {
 
     fn take_refused(&mut self) -> bool {
         self.refused.swap(false, Ordering::AcqRel)
+    }
+
+    /// The governor yields to pressure, or no longer does: the walk looks
+    /// again (yield lifted, the rung goes back to the top).
+    fn pressed(&mut self, yielding: bool) {
+        if self.pressed.swap(yielding, Ordering::AcqRel) != yielding {
+            self.wake.notify_one();
+        }
     }
 
     /// A governor tick: the walk looks again.

@@ -6436,6 +6436,68 @@ mod rung_wait_tests {
         );
     }
 
+    /// The rung stays at the top the load chose: a small request after
+    /// boot (a 1-token warm-up), on a calm system whose governor target
+    /// sits below what is mapped (demand fell), lowers nothing, and the
+    /// first 512-row prompt after it is one fire at the top rung. Only
+    /// yield's pressure walks the rung down to what is asked, and once it
+    /// lifts the walk takes it back to the top.
+    #[tokio::test(flavor = "current_thread")]
+    async fn after_a_small_request_the_first_wide_prompt_is_one_fire_at_the_top_rung() {
+        use crate::governor::PoolTarget;
+        const ENGINE: usize = 68;
+        let stores =
+            super::unfolded_tests::pool_with_rungs(vec![(1, 1), (64, 2), (512, 3)]);
+        let shared = stores.shared.clone().expect("a shared pool");
+        let mut grow = crate::store::shared::SharedGrow::new(0, ENGINE, shared.clone())
+            .with_live_lanes(|| 0)
+            .with_epochs(|| (0, 0));
+        assert_eq!(shared.lock().unwrap().rung(), 512, "the load's top rung");
+        let mapped = u64::from(shared.lock().unwrap().mapped_segments());
+        // Calm, the governor's target below what is mapped: no pressure.
+        grow.pressed(false);
+        let _ = grow.retarget(0);
+        // The scheduler has nothing wider than a row in flight.
+        crate::store::shared::grant_rung(ENGINE, 1);
+        // The warm-up: one token, asked while it runs, then gone.
+        let warm = crate::store::shared::want_rows(ENGINE, 1);
+        for _ in 0..6 {
+            grow.walk_rung().await;
+        }
+        drop(warm);
+        for _ in 0..6 {
+            grow.walk_rung().await;
+        }
+        assert_eq!(shared.lock().unwrap().rung(), 512, "no small request lowers it");
+        assert_eq!(crate::store::shared::fire_cap(ENGINE), u32::MAX, "uncut");
+
+        // The first wide prompt: no raise to wait on, one piece of its rows.
+        let ask = super::ask_rung(&stores, ENGINE, uuid::Uuid::new_v4(), 512, 512)
+            .expect("512 rows ask");
+        assert!(ask.raise.is_none(), "the rung holds them");
+        assert_eq!(cut_now(ENGINE, &prompt_of(512)), [(0, 512)], "one fire");
+        drop(ask);
+
+        // Under yield's pressure the walk takes the rung down to what is
+        // asked (a row here) ...
+        let small = crate::store::shared::want_rows(ENGINE, 1);
+        grow.pressed(true);
+        for _ in 0..6 {
+            grow.walk_rung().await;
+        }
+        assert_eq!(crate::store::shared::fire_cap(ENGINE), 1, "cut under yield");
+        assert_eq!(shared.lock().unwrap().rung(), 1, "lowered under yield");
+        drop(small);
+        // ... and once it lifts, back to the top.
+        grow.pressed(false);
+        let _ = grow.retarget(mapped);
+        for _ in 0..6 {
+            grow.walk_rung().await;
+        }
+        assert_eq!(shared.lock().unwrap().rung(), 512, "the top again");
+        assert_eq!(crate::store::shared::fire_cap(ENGINE), u32::MAX);
+    }
+
     /// The negative control: where the walker holds the rung down (yield
     /// gave the span back, the raise waits on the governor's grow), the
     /// pass waits for nothing and is cut to the rung standing.

@@ -92,6 +92,7 @@ impl Steer {
         };
         let limits = *self.governor.limits();
         let segments = within(&limits, target);
+        pool.pressed(self.governor.yielding());
         match pool.retarget(segments) {
             Retarget::Reached => {
                 if self.short.take().is_some() {

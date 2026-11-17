@@ -224,6 +224,14 @@ pub trait PoolTarget {
     /// A tick's turn is done (not a waiter's): what changes only once a
     /// tick, as which weights are resident, changes now.
     fn ticked(&mut self) {}
+    /// Whether the governor yields to the system's pressure now
+    /// ([`Governor::yielding`]): only then does the pool give back what it
+    /// holds for its own fires (the activation rung). A target below what
+    /// is mapped on a calm system (demand fell, the cache aged out) lowers
+    /// no rung.
+    fn pressed(&mut self, yielding: bool) {
+        let _ = yielding;
+    }
 }
 
 /// What the loop tells the runtime, which maps it to the policy's
