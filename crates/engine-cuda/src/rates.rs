@@ -3,9 +3,10 @@
 //! HIP's): the roofline constants the top rung's estimate is weighed by.
 //!
 //! Each rate is a burst of its kernel launched back to back on the stream,
-//! about [`BURST_NS`] (20 ms) long (`k` launches, `k` sized off one warm
-//! launch), as serving runs a fire's: a lone launch lets the device idle
-//! between timings, and its clock state, not the kernel, sets the number.
+//! `k` launches, `k` doubled until a launch's time settles
+//! (`engine::rates::timed_frames`, every engine's rule), as serving runs a
+//! fire's: a lone launch lets the device idle between timings, and its
+//! clock state, not the kernel, sets the number.
 //! The burst is timed by events on the stream, the median of [`ROUNDS`]
 //! bursts ([`LAUNCH_ROUNDS`] for the launch) after a warm one kept, and
 //! divided by `k`.
@@ -60,53 +61,40 @@ pub fn provenance(device: &str) -> (&'static str, String) {
     engine::rates::provenance("cuda", &how)
 }
 
-/// `chip` with every roofline constant stated: as it is where its layers
-/// state them all; else the device's own measured here, before the load is
-/// ready (the step `pie tune cuda --rates` runs, seconds long, each timed
-/// submission a burst of about [`BURST_NS`]), each constant a layer states
-/// kept over the measured one, the whole written to the user's profile of
-/// `device` under `profiles` (with its provenance) so later loads read it,
-/// and marked measured this load for the load's line.
+/// `chip` with every roofline constant stated
+/// ([`engine::rates::rates_at_load`], every engine's rule): as its layers
+/// state them where they state them all; else the device's own, measured
+/// here before the load is ready (the step `pie tune cuda --rates` runs,
+/// seconds long, each timed submission a burst settled by
+/// `engine::rates::timed_frames`: CUDA states no bound on one submission),
+/// saved to the user's profile of
+/// `device` under `profiles` with its provenance so later loads read them.
 pub fn ensure(
     chip: profile::Profile,
     ordinal: i32,
     device: &str,
-    facts: &profile::Facts,
+    _facts: &profile::Facts,
     profiles: Option<&std::path::Path>,
     cache: Option<&std::path::Path>,
 ) -> Result<profile::Profile, String> {
-    let stated = chip.rates();
-    if stated.complete() {
-        return Ok(chip);
-    }
-    let began = std::time::Instant::now();
-    let measured = measure(ordinal, &chip, cache)?.rates;
-    let rates = stated.over(measured);
-    eprintln!(
-        "engine-cuda: {device}'s profile states no roofline rates; measured them in {:.1} s",
-        began.elapsed().as_secs_f64()
-    );
-    if let Some(profiles) = profiles {
-        let file = profile::search::assemble(
-            crate::chip::registry(),
-            &chip,
-            device,
-            facts,
-            &engine::rates::tuned(&rates),
-            std::slice::from_ref(&provenance(device)),
-            &[crate::chip::ARCH],
-        )?;
-        let path = crate::chip::SHELF.user_path(profiles, device);
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        }
-        std::fs::write(&path, file).map_err(|e| format!("{}: {e}", path.display()))?;
-        eprintln!("engine-cuda: the rates are written to {}", path.display());
-    }
-    let mut tuned = chip.tuned().clone();
-    tuned.rates = rates;
-    tuned.measured_this_load = true;
-    Ok(chip.with_tuned(tuned))
+    let check = |text: &str| {
+        crate::chip::registry()
+            .parse(text, "the measured rates", profile::Strict::User)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    };
+    let save = profiles.map(|profiles| engine::rates::SaveTo {
+        path: crate::chip::SHELF.user_path(profiles, device),
+        provenance: provenance(device),
+        check: &check,
+    });
+    let measure_chip = chip.clone();
+    engine::rates::rates_at_load(chip, save, None, |_max_submit| {
+        Ok(engine::rates::Measured {
+            rates: measure(ordinal, &measure_chip, cache)?.rates,
+            unsettled: false,
+        })
+    })
 }
 
 /// The kv cache's page, as a served load pages it.
@@ -114,13 +102,6 @@ pub const PAGE: u32 = 16;
 
 /// The copy's bytes: past every last-level cache, so it moves device memory.
 pub const COPY_BYTES: usize = 256 << 20;
-
-/// A burst's length.
-// TODO(engine::rates' shared measurement frame, GPU's branch): every burst
-// settles by warm_up's rule (repeats doubling until the per-fire time stops
-// falling by more than AGREEMENT, max_submit the one cap) and this constant
-// goes.
-pub const BURST_NS: f64 = 20e6;
 
 /// Timed bursts of each kind; the median is kept.
 pub const ROUNDS: usize = 5;
@@ -270,16 +251,23 @@ mod on_device {
         }
 
         /// The ns one launch of `once(i)` takes, `i` the launch's place in
-        /// its burst: a burst of about [`BURST_NS`] sized off a warm launch,
-        /// the median of `rounds` after a warm burst, over its launches.
+        /// its burst: a burst of `k` launches, `k` doubled until a launch's
+        /// time settles (`engine::rates::timed_frames`; CUDA states no bound
+        /// on one submission), the median of `rounds` after a warm burst,
+        /// over its launches.
         fn burst(
             &self,
             rounds: usize,
             once: &mut dyn FnMut(usize) -> Result<(), String>,
         ) -> Result<f64, String> {
             self.time(&mut || once(0))?;
-            let one = self.time(&mut || once(0))?.max(1.0);
-            let k = ((BURST_NS / one).ceil() as usize).clamp(1, 4096);
+            let k = engine::rates::timed_frames(
+                None,
+                None,
+                |k| self.time(&mut || (0..k as usize).try_for_each(&mut *once)),
+                |why| why,
+            )?
+            .fires as usize;
             let mut run = || (0..k).try_for_each(&mut *once);
             self.time(&mut run)?;
             let mut times = (0..rounds)
