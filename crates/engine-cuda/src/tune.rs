@@ -141,27 +141,12 @@ pub fn rates(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Rated
     })
 }
 
-/// The commit of the tree this pie was built from: the build's `PIE_COMMIT`
-/// where it embedded one, else the source tree's `HEAD`, else `unknown`.
+/// The commit this pie was built from, as the build stated it in
+/// `PIE_COMMIT`, else `commit unknown`: never the source tree's `HEAD` at
+/// tune time, which may have moved on since the build.
 fn sitting() -> String {
-    if let Some(commit) = option_env!("PIE_COMMIT") {
-        return commit.to_string();
-    }
-    std::process::Command::new("git")
-        .args([
-            "-C",
-            env!("CARGO_MANIFEST_DIR"),
-            "rev-parse",
-            "--short",
-            "HEAD",
-        ])
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .and_then(|out| String::from_utf8(out.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .map_or_else(|| "commit unknown".to_string(), |s| format!("commit {s}"))
+    option_env!("PIE_COMMIT")
+        .map_or_else(|| "commit unknown".to_string(), |c| format!("commit {c}"))
 }
 
 /// How a load is shaped: its slots and compiled budget, its patch ladder,
