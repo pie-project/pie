@@ -865,6 +865,7 @@ mod tests {
                 stage: Stage::Epilogue,
                 ops: vec![Op::ChanPut { chan: 0, value: 0 }],
             }],
+            observe: None,
         };
         for (port, shape, dtype) in extra {
             let index = container.channels.len() as u32;
@@ -927,6 +928,7 @@ mod tests {
                 stage: Stage::Epilogue,
                 ops: vec![],
             }],
+            observe: None,
         };
         for (port, shape, dtype) in decls {
             let index = container.channels.len() as u32;

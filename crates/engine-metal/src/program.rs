@@ -975,6 +975,14 @@ impl Plane {
             .collect())
     }
 
+    /// What instance `id`'s program observes where it reads attention
+    /// scores, as its container states it; nothing for an instance gone.
+    #[must_use]
+    pub fn observe(&self, id: InstanceId) -> Option<eta_ir::container::Observe> {
+        let bound = self.instances.get(&id)?;
+        self.programs.get(&bound.program_id)?.plan.package.observe
+    }
+
     pub fn close_instance(&mut self, id: InstanceId) -> Result<()> {
         let bound = self
             .instances

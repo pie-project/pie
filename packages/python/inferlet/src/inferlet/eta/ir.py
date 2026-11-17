@@ -509,6 +509,27 @@ class ExternDecl:
     chan: int
 
 
+@dataclass(frozen=True)
+class Observe:
+    """What a program that reads attention scores observes: its lanes' last
+    `rows` query rows of a fire (`Observe.rows_(n)`), or every row a lane
+    brings (`Observe.fire_rows()`, `rows` None)."""
+
+    rows: int | None = None
+
+    @staticmethod
+    def rows_(n: int) -> "Observe":
+        return Observe(rows=n)
+
+    @staticmethod
+    def fire_rows() -> "Observe":
+        return Observe(rows=None)
+
+
+# The tag the optional observe section opens with, after the input table.
+OBSERVE_SECTION = 0x4F
+
+
 @dataclass
 class TraceContainer:
     names: list[str] = field(default_factory=list)
@@ -518,6 +539,9 @@ class TraceContainer:
     externs: list[ExternDecl] = field(default_factory=list)
     # The channels the forward reads as guest model inputs, sorted, unique.
     inputs: list[int] = field(default_factory=list)
+    # What the program observes where it reads attention scores: an optional
+    # section after every table, which a container without it lacks.
+    observe: Observe | None = None
 
     def encode(self) -> bytes:
         return encode(self)
@@ -627,6 +651,13 @@ def encode(c: TraceContainer) -> bytes:
         _u32(w, e.chan)
     for chan in c.inputs:
         _u32(w, chan)
+    if c.observe is not None:
+        _u8(w, OBSERVE_SECTION)
+        if c.observe.rows is None:
+            _u8(w, 1)
+        else:
+            _u8(w, 0)
+            _u32(w, c.observe.rows)
     return bytes(w)
 
 

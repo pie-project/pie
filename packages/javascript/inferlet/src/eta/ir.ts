@@ -481,6 +481,13 @@ export interface ExternDecl {
   chan: number;
 }
 
+/** What a program that reads attention scores observes: its lanes' last
+ * `rows` query rows of a fire, or every row a lane brings (`'fire-rows'`). */
+export type Observe = { rows: number } | 'fire-rows';
+
+/** The tag the optional observe section opens with, after the input table. */
+export const OBSERVE_SECTION = 0x4f;
+
 export interface TraceContainer {
   names: string[];
   channels: ChannelDecl[];
@@ -489,6 +496,9 @@ export interface TraceContainer {
   externs: ExternDecl[];
   /** The channels the forward reads as guest model inputs, sorted, unique. */
   inputs: number[];
+  /** What the program observes where it reads attention scores: an optional
+   * section after every table, which a container without it lacks. */
+  observe?: Observe;
 }
 
 class Writer {
@@ -628,6 +638,15 @@ export function encode(c: TraceContainer): Uint8Array {
     w.u32(e.chan);
   }
   for (const chan of c.inputs) w.u32(chan);
+  if (c.observe !== undefined) {
+    w.u8(OBSERVE_SECTION);
+    if (c.observe === 'fire-rows') {
+      w.u8(1);
+    } else {
+      w.u8(0);
+      w.u32(c.observe.rows);
+    }
+  }
   return w.finish();
 }
 

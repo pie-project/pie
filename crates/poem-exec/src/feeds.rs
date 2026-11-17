@@ -362,11 +362,9 @@ fn output_decl(
              product differs"
         ));
     }
-    let tail = values
-        .iter()
-        .filter_map(|value| observed(trace, *value))
-        .max()
-        .unwrap_or(0);
+    // The rows a lane's last fire must hold: a score's are what its reading
+    // program states it observes, the runtime's to read, not the model's.
+    let tail = 0;
     Ok(OutputDecl {
         name: name.to_string(),
         axis,
@@ -413,20 +411,6 @@ fn computing_classes(trace: &Trace, compiled: &CompiledModel, value: ValueId) ->
             None => ClassSet::default(),
         },
         _ => ClassSet::default(),
-    }
-}
-
-/// The rows a score capture `value` (or its gather across ranks) observes.
-fn observed(trace: &Trace, value: ValueId) -> Option<u32> {
-    let Def::Op(node) = trace.values.get(value.0 as usize)?.def else {
-        return None;
-    };
-    match trace.nodes.get(node as usize)?.op {
-        poem_ir::Operation::Attn(poem_ir::Attn::ScoreCapture { observe, .. }) => Some(observe),
-        poem_ir::Operation::Collective(poem_ir::Collective::AllGather { x, .. }) => {
-            observed(trace, x)
-        }
-        _ => None,
     }
 }
 

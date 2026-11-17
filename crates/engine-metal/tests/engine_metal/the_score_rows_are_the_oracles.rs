@@ -90,6 +90,7 @@ fn the_score_rows_are_the_oracles() {
             };
             Seated {
                 held: Some(0),
+                observe: (slot == 0).then_some(eta_ir::container::Observe::Rows(32)),
                 ..Seated::of(Lane { slot, word, tokens })
             }
         })
@@ -118,7 +119,8 @@ fn the_score_rows_are_the_oracles() {
         .word(&Request::new(prompt.len() as u32, false).capturing_scores(true));
     let mut oracle = engine_cpu::Forward::new(host_trace, None, &seeded_bf16)
         .expect("the oracle loads")
-        .at_context(CONTEXT, page);
+        .at_context(CONTEXT, page)
+        .observing(eta_ir::container::Observe::Rows(32));
     let outs = oracle.step(&prompt, 0, host_word).expect("the oracle steps");
     let floats = |name: &str| -> Vec<f32> {
         match outs.iter().find(|out| out.name == name) {

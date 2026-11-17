@@ -1351,6 +1351,8 @@ impl Metal {
                     record_run: run_of[at].as_deref(),
                     windows: &window_of[at],
                     reports: lane.reports,
+                    // The lane's program states it; the stage reads it there.
+                    observe: None,
                 })
             })
             .collect::<EngineResult<Vec<_>>>()?;

@@ -158,6 +158,10 @@ pub trait Programs<B: Serve>: Default {
         instance: InstanceId,
         seats: Vec<Vec<crate::guest::run::Readout<'_, B>>>,
     ) -> Result<(), Refusal>;
+
+    /// What `instance`'s program observes where it reads attention scores,
+    /// as its container states it.
+    fn observe(&self, instance: InstanceId) -> Option<eta_ir::container::Observe>;
 }
 
 /// The refusal of a seat no row of the program reads.

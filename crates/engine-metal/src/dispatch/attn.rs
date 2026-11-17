@@ -34,7 +34,6 @@ impl Run<'_> {
                 kv_heads,
                 q_heads,
                 sm_scale,
-                observe,
                 into,
                 ..
             } => {
@@ -47,13 +46,13 @@ impl Run<'_> {
                     *head_dim,
                     *kv_heads,
                     *sm_scale,
-                    *observe,
                     seat.keys,
                     *q_heads,
                     into.is_none(),
                     self.requests(),
                     attn::score::CaptureRows {
                         rows: seat.keys_at,
+                        observe: seat.observe_at,
                         first: self.window().span.lane_offset,
                     },
                 )

@@ -36,6 +36,7 @@ export {
 } from './bridge.js';
 export type { Fold, StateGeometry } from './bridge.js';
 export { Dtype, Port, Stage, dtype } from './ir.js';
+export type { Observe } from './ir.js';
 export type { Shape } from './ir.js';
 export { TraceError } from './trace.js';
 export {

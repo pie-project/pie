@@ -515,6 +515,7 @@ mod tests {
                     ChanPut { chan: 7, value: 35 },
                 ],
             }],
+            observe: None,
         }
     }
 

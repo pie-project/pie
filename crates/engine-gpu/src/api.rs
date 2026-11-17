@@ -1182,17 +1182,23 @@ impl<B: Host> Gpu<B> {
         let guests = B::guests(self, submission)?;
 
         let mut reads: Vec<Vec<String>> = vec![Vec::new(); submission.lanes.len()];
+        let mut observes: Vec<Option<eta_ir::container::Observe>> =
+            vec![None; submission.lanes.len()];
         for attachment in program_attachments(submission) {
             // A root read at lane `k` may span rows: row `r` is lane
             // `k + r`'s readout, so every lane of the attachment from `k`
             // on reads the output out.
             let end = attachment.lane + attachment.lanes.max(1);
+            let observe = self.programs.observe(attachment.instance);
             for (name, k) in self.programs.reads(attachment.instance) {
                 for at in attachment.lane + k..end {
                     if let Some(lane) = reads.get_mut(at as usize)
                         && !lane.contains(&name)
                     {
                         lane.push(name.clone());
+                    }
+                    if let Some(lane) = observes.get_mut(at as usize) {
+                        *lane = lane.or(observe);
                     }
                 }
             }
@@ -1305,6 +1311,7 @@ impl<B: Host> Gpu<B> {
                     Readout::Last | Readout::None => None,
                 },
                 reads: &reads[at],
+                observe: observes[at],
 
                 translation: &lane.kv.translation,
 

@@ -55,6 +55,7 @@ fn lora_program(layers: u32, rank: u32, hidden: u32) -> TraceContainer {
         }],
         externs: Vec::new(),
         inputs: Vec::new(),
+        observe: None,
     }
 }
 

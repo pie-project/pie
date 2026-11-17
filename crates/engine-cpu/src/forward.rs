@@ -150,6 +150,9 @@ pub struct Forward {
     /// ([`Forward::at_context`]): what a score capture's row is a mass a
     /// key, or a page, of.
     context: Option<(u32, u32)>,
+    /// The rows a score capture observes, as its reading program states them
+    /// ([`Forward::observing`]).
+    observe: Option<eta_ir::container::Observe>,
 }
 
 fn bf16(x: f32) -> f32 {
@@ -277,6 +280,7 @@ impl Forward {
             lanes,
             placed,
             context: None,
+            observe: None,
         })
     }
 
@@ -286,6 +290,14 @@ impl Forward {
     #[must_use]
     pub fn at_context(mut self, context: u32, page_size: u32) -> Forward {
         self.context = Some((context, page_size));
+        self
+    }
+
+    /// This forward as a program stating `observe` reads its scores: the
+    /// query rows a score capture averages over.
+    #[must_use]
+    pub fn observing(mut self, observe: eta_ir::container::Observe) -> Forward {
+        self.observe = Some(observe);
         self
     }
 
@@ -351,6 +363,7 @@ impl Forward {
             group: self.group.as_ref(),
             placed: &self.placed,
             context: self.context,
+            observe: self.observe,
         };
         let mut aliases = Vec::new();
         for (at, node) in self.trace.nodes.iter().enumerate() {
@@ -450,6 +463,7 @@ struct Run<'a> {
     group: Option<&'a Group>,
     placed: &'a std::collections::BTreeMap<u32, Placed>,
     context: Option<(u32, u32)>,
+    observe: Option<eta_ir::container::Observe>,
 }
 
 impl Run<'_> {
@@ -602,11 +616,10 @@ impl Run<'_> {
                 head_dim,
                 q_heads,
                 sm_scale,
-                observe,
                 into,
                 scores,
                 ..
-            } => self.capture(q, cache, head_dim as usize, q_heads, sm_scale, observe, into, scores),
+            } => self.capture(q, cache, head_dim as usize, q_heads, sm_scale, into, scores),
             Attn::ScorePages { keys, pages } => self.score_pages(keys, pages),
             Attn::Prefill { mask: Some(_), .. } => {
                 Err("a custom mask, which this forward does not read".into())
@@ -668,7 +681,8 @@ impl Run<'_> {
     }
 
     /// The lane's attention mass a key of its load's context, averaged over
-    /// its last `observe` rows and over the model's `q_heads` query heads
+    /// the rows its program observes ([`Forward::observing`]) and over the
+    /// model's `q_heads` query heads
     /// (this rank's heads attended, each a `1 / q_heads` share), added to
     /// `into`'s row, or to a zeroed one: one row for the lane (it captures;
     /// this forward runs one lane).
@@ -680,10 +694,13 @@ impl Run<'_> {
         hd: usize,
         q_heads: u32,
         scale: f32,
-        observe: u32,
         into: Option<ValueId>,
         scores: ValueId,
     ) -> Result<(), String> {
+        let observe = self.observe.ok_or(
+            "a score capture averages over the rows its reading program observes, and this \
+             forward was told none (`Forward::observing`)",
+        )?;
         let (context, _) = self.context.ok_or(
             "a score capture is a mass a key of the load's context, and this forward was \
              given no context (`Forward::at_context`)",
@@ -710,7 +727,10 @@ impl Run<'_> {
         let heads = q.width / hd;
         let kv_heads = (lane.k.iter().flatten().next()).map_or(1, |k| k.len() / hd);
         let group = heads / kv_heads.max(1);
-        let observed = (observe as usize).min(q.rows);
+        let observed = match observe {
+            eta_ir::container::Observe::Rows(rows) => (rows as usize).min(q.rows),
+            eta_ir::container::Observe::FireRows => q.rows,
+        };
         let share = 1.0 / (observed as f32 * q_heads as f32);
         for t in q.rows - observed..q.rows {
             let p = self.positions[t] as usize;

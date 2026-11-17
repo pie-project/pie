@@ -46,6 +46,7 @@ fn an_output_of_ids_reads_as_stored() {
         }],
         externs: Vec::new(),
         inputs: Vec::new(),
+        observe: None,
     };
     let decl = OutputDecl {
         name: "mtp.drafts".to_string(),

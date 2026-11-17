@@ -118,6 +118,7 @@ fn epilogue(rows: u32, width: u32) -> TraceContainer {
         }],
         externs: Vec::new(),
         inputs: Vec::new(),
+        observe: None,
     }
 }
 

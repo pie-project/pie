@@ -144,6 +144,7 @@ fn beam_program() -> TraceContainer {
         }],
         externs: Vec::new(),
         inputs: Vec::new(),
+        observe: None,
     }
 }
 
@@ -354,6 +355,7 @@ fn device_fed_tokens_reach_the_next_fire() {
         }],
         externs: Vec::new(),
         inputs: Vec::new(),
+        observe: None,
     });
     // The rings the instance keeps itself: one contiguous run of Channel
     // slots each, as the runtime takes them.

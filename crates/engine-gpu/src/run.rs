@@ -27,39 +27,49 @@ pub struct WeightTable(pub Vec<Option<WeightRow>>);
 #[derive(Clone, Debug, Default, Hash)]
 pub struct SlotTable(pub Vec<Option<Tensor>>, pub Scored);
 
+/// A capturing lane of a fire, as [`Scored::of`] takes it: whether its
+/// program reads pages, and the query rows it observes (its last ones).
+#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq)]
+pub struct Captures {
+    pub pages: bool,
+    pub observed: u32,
+}
+
 /// A fire's capturing lanes (`poem_ir::Dim::Capturing`), compacted: each
 /// takes a key row in lane order, and those whose program reads pages a
 /// page row too, in lane order among themselves. The fire's other lanes
 /// take none.
 #[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
 pub struct Scored {
-    /// For each capturing lane in lane order: the fire lane, and its page
-    /// row where it reads pages.
-    capturing: Vec<(u32, Option<u32>)>,
+    /// For each capturing lane in lane order: the fire lane, its page row
+    /// where it reads pages, and the rows it observes.
+    capturing: Vec<(u32, Option<u32>, u32)>,
     /// For each lane of the fire, its key row where it captures.
     rows: Vec<Option<u32>>,
     pages: u32,
 }
 
 impl Scored {
-    /// The fire's lanes in order, each as `(captures, reads pages)`.
+    /// The fire's lanes in order, each capturing or not.
     #[must_use]
-    pub fn of(lanes: impl IntoIterator<Item = (bool, bool)>) -> Scored {
+    pub fn of(lanes: impl IntoIterator<Item = Option<Captures>>) -> Scored {
         let mut scored = Scored::default();
-        for (lane, (captures, pages)) in lanes.into_iter().enumerate() {
-            if !captures {
+        for (lane, captures) in lanes.into_iter().enumerate() {
+            let Some(captures) = captures else {
                 scored.rows.push(None);
                 continue;
-            }
+            };
             let row = u32::try_from(scored.capturing.len()).unwrap_or(u32::MAX);
-            let page = pages.then(|| {
+            let page = captures.pages.then(|| {
                 scored.pages += 1;
                 scored.pages - 1
             });
             scored.rows.push(Some(row));
-            scored
-                .capturing
-                .push((u32::try_from(lane).unwrap_or(u32::MAX), page));
+            scored.capturing.push((
+                u32::try_from(lane).unwrap_or(u32::MAX),
+                page,
+                captures.observed,
+            ));
         }
         if scored.capturing.is_empty() {
             return Scored::default();
@@ -71,6 +81,13 @@ impl Scored {
     #[must_use]
     pub fn rows(&self) -> u32 {
         u32::try_from(self.capturing.len()).unwrap_or(u32::MAX)
+    }
+
+    /// The query rows the capturing lanes observe, together: what their
+    /// normalisers take.
+    #[must_use]
+    pub fn observed(&self) -> u32 {
+        self.capturing.iter().map(|&(.., observed)| observed).sum()
     }
 
     /// The page rows: the capturing lanes whose program reads pages.
@@ -95,23 +112,29 @@ impl Scored {
     /// The capture table a fire stages for its kernels
     /// (`kernels_slang::attn::score::TABLE_INTS` a capturing lane): each
     /// capturing lane's fire lane, its first and end query row by `indptr`
-    /// (the fire's), and the base of its key row and of its page row (or
-    /// -1), in f32s from the start of the rows the fire binds: `keys` and
-    /// `pages` f32s a row, its row among them.
+    /// (the fire's), the base of its key row and of its page row (or -1), in
+    /// f32s from the start of the rows the fire binds (`keys` and `pages`
+    /// f32s a row, its row among them), the rows it observes, and the
+    /// observed rows of the capturing lanes before it.
     #[must_use]
     pub fn table(&self, indptr: &[i32], keys: u32, pages: u32) -> Vec<i32> {
         let at = |lane: u32| indptr.get(lane as usize).copied().unwrap_or(0);
         let int = |n: u64| i32::try_from(n).unwrap_or(i32::MAX);
+        let mut before = 0u64;
         self.capturing
             .iter()
             .enumerate()
-            .flat_map(|(row, &(lane, page))| {
+            .flat_map(|(row, &(lane, page, observed))| {
+                let first = before;
+                before += u64::from(observed);
                 [
                     int(u64::from(lane)),
                     at(lane),
                     at(lane + 1),
                     int(row as u64 * u64::from(keys)),
                     page.map_or(-1, |page| int(u64::from(page) * u64::from(pages))),
+                    int(u64::from(observed)),
+                    int(first),
                 ]
             })
             .collect()
@@ -1209,20 +1232,16 @@ impl<'c, B: Backend> Run<'c, B> {
 
 #[cfg(test)]
 mod tests {
-    use super::Scored;
+    use super::{Captures, Scored};
 
     /// The capturing lanes compact in lane order, whatever lanes lie
     /// between: a key row each, and a page row each among those that read
-    /// pages; the table names each one's fire lane, query rows and page row.
+    /// pages; the table names each one's fire lane, query rows, row bases,
+    /// observed rows and the observed rows before it.
     #[test]
     fn the_capturing_lanes_compact_in_lane_order() {
-        let scored = Scored::of([
-            (false, false),
-            (true, true),
-            (true, false),
-            (false, false),
-            (true, true),
-        ]);
+        let at = |pages, observed| Some(Captures { pages, observed });
+        let scored = Scored::of([None, at(true, 1), at(false, 1), None, at(true, 2)]);
         assert_eq!((scored.rows(), scored.page_rows()), (3, 2));
         assert_eq!(
             [0, 1, 2, 3, 4].map(|lane| scored.row(lane)),
@@ -1233,10 +1252,11 @@ mod tests {
             [Some(0), None, Some(1)]
         );
         let indptr = [0, 5, 6, 7, 9, 11];
+        assert_eq!(scored.observed(), 4);
         assert_eq!(
             scored.table(&indptr, 100, 7),
-            [1, 5, 6, 0, 0, 2, 6, 7, 100, -1, 4, 9, 11, 200, 7],
-            "lane, its rows, its key row's base and its page row's"
+            [1, 5, 6, 0, 0, 1, 0, 2, 6, 7, 100, -1, 1, 1, 4, 9, 11, 200, 7, 2, 2],
+            "lane, its rows, its key row's base and its page row's, its observed rows and those before"
         );
     }
 
@@ -1244,7 +1264,7 @@ mod tests {
     /// table.
     #[test]
     fn a_fire_without_a_capturing_lane_holds_no_row() {
-        let scored = Scored::of([(false, false); 3]);
+        let scored = Scored::of([None; 3]);
         assert_eq!(scored, Scored::default());
         assert_eq!((scored.rows(), scored.page_rows()), (0, 0));
         assert!(scored.table(&[0, 1, 2, 3], 8, 1).is_empty());

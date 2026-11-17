@@ -115,6 +115,19 @@ pub struct StageProgram {
     pub ops: Vec<Op>,
 }
 
+/// The query rows of a lane a program that reads attention scores observes:
+/// what the mass a key is averaged over (`poem_ir::Attn::ScoreCapture`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum Observe {
+    /// The lane's last `n` query rows of the fire (all of them where it
+    /// brings fewer).
+    Rows(u32),
+    /// Every query row the lane brings to the fire: one a decode, the
+    /// prompt's at a prefill.
+    FireRows,
+}
+
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct TraceContainer {
     pub names: Vec<String>,
@@ -124,7 +137,14 @@ pub struct TraceContainer {
     pub externs: Vec<ExternDecl>,
     /// The channels the forward reads as guest model inputs, sorted, unique.
     pub inputs: Vec<ChannelIndex>,
+    /// What a program that reads attention scores observes: an optional
+    /// section after every table ([`OBSERVE_SECTION`]), which a container
+    /// built before it has not, and decodes as it always did.
+    pub observe: Option<Observe>,
 }
+
+/// The tag the observe section opens with, after the input table.
+pub const OBSERVE_SECTION: u8 = 0x4f;
 
 impl TraceContainer {
     pub fn encode(&self) -> Vec<u8> {
@@ -202,6 +222,18 @@ pub fn encode(c: &TraceContainer) -> Vec<u8> {
     }
     for &chan in &c.inputs {
         put_u32(&mut w, chan);
+    }
+    match c.observe {
+        None => {}
+        Some(Observe::Rows(rows)) => {
+            w.push(OBSERVE_SECTION);
+            w.push(0);
+            put_u32(&mut w, rows);
+        }
+        Some(Observe::FireRows) => {
+            w.push(OBSERVE_SECTION);
+            w.push(1);
+        }
     }
     w
 }
@@ -444,6 +476,28 @@ pub fn decode(bytes: &[u8]) -> Result<TraceContainer, ContainerDecodeError> {
     for _ in 0..n_inputs {
         inputs.push(r.u32()?);
     }
+    // The optional observe section: a container without it ends here.
+    let observe = if r.offset() == bytes.len() {
+        None
+    } else {
+        let tag = r.u8()?;
+        if tag != OBSERVE_SECTION {
+            return Err(ContainerDecodeError::UnknownTag {
+                what: "section",
+                tag,
+            });
+        }
+        Some(match r.u8()? {
+            0 => Observe::Rows(r.u32()?),
+            1 => Observe::FireRows,
+            kind => {
+                return Err(ContainerDecodeError::UnknownTag {
+                    what: "observe",
+                    tag: kind,
+                });
+            }
+        })
+    };
     if r.offset() != bytes.len() {
         return Err(ContainerDecodeError::TrailingBytes);
     }
@@ -454,6 +508,7 @@ pub fn decode(bytes: &[u8]) -> Result<TraceContainer, ContainerDecodeError> {
         stages,
         externs,
         inputs,
+        observe,
     };
     if container.encode() != bytes {
         return Err(ContainerDecodeError::NonCanonical);
@@ -620,6 +675,7 @@ mod tests {
             }],
             externs: Vec::new(),
             inputs: Vec::new(),
+            observe: None,
         }
     }
 
@@ -674,6 +730,7 @@ mod tests {
             }],
             externs: alloc::vec::Vec::new(),
             inputs: Vec::new(),
+            observe: None,
         };
         let bytes = encode(&c);
         assert_eq!(decode(&bytes).expect("decode"), c);

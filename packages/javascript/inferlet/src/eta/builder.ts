@@ -6,6 +6,7 @@ import {
   Dtype,
   HostRole,
   Port,
+  Observe,
   OutputDecl,
   PortBinding,
   Stage,
@@ -161,11 +162,17 @@ export class Builder {
   private inputs: DslChannel[] = [];
   private stages: [Stage, () => void][] = [];
   private outputs: OutputDecl[][] = [];
+  private observed: Observe | undefined;
 
   constructor(
     readonly vocab: number,
     readonly pageSize: number,
   ) {}
+
+  /** State what the program observes where it reads attention scores. */
+  observe(observe: Observe): void {
+    this.observed = observe;
+  }
 
   bindPort(port: Port, source: DslChannel): void {
     source.noteDescClaim(portConsumes(port));
@@ -264,6 +271,7 @@ export class Builder {
     const stages: StageProgram[] = stageResults.map((r) => ({ stage: r.stage, ops: r.ops }));
     const portBindings: PortBinding[] = ports.sort((a, b) => a[0] - b[0]).map(([port, channel]) => ({ port, channel }));
     const container: TraceContainer = { names, channels: decls, ports: portBindings, stages, externs: [], inputs };
+    if (this.observed !== undefined) container.observe = this.observed;
 
     lint(channels, sinks);
 

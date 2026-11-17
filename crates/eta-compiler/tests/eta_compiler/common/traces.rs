@@ -105,6 +105,7 @@ pub fn section3_trace() -> TraceContainer {
         }],
         externs: Vec::new(),
         inputs: Vec::new(),
+        observe: None,
     }
 }
 
@@ -389,6 +390,7 @@ pub fn beam_trace() -> TraceContainer {
         }],
         externs: Vec::new(),
         inputs: Vec::new(),
+        observe: None,
     }
 }
 

@@ -4,14 +4,16 @@
 
 // Score capture (`attn.score_capture`, `attn.score_pages`): each capturing
 // lane's one f32 row, a mass a key of the load's context, summed over this
-// layer's query heads and averaged over the lane's last `observe` query rows
-// and the model's query heads; then, once after the last layer, the row
-// summed a kv page.
+// layer's query heads and averaged over the query rows the lane's program
+// observes and the model's query heads; then, once after the last layer, the
+// row summed a kv page.
 //
-// A fire's capturing lanes are compacted: `capture` holds five ints for
+// A fire's capturing lanes are compacted: `capture` holds seven ints for
 // each, in lane order: the lane, its first and end query row in the fire,
-// and the f32 its key row starts at in `scores` and its page row in
-// `pages_row` (-1 where its program reads no pages). A lane's rows are
+// the f32 its key row starts at in `scores` and its page row in `pages_row`
+// (-1 where its program reads no pages), the rows it observes (its last
+// ones, as its program states them), and the observed row of the fire its
+// first is (where its normalisers lie in `stats`). A lane's rows are
 // addressed through those bases alone, wherever the host lays them.
 //
 // Two dispatches a layer, wide over the keys, deterministic (no atomics, one
@@ -45,8 +47,8 @@ PIE_PARAMS(3, Params, params);
 [numthreads(PIE_THREADS, 1, 1)]
 void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     uint c = group.y;
-    int keys_at = capture[c * 5u + 3u];
-    int pages_at = capture[c * 5u + 4u];
+    int keys_at = capture[c * 7u + 3u];
+    int pages_at = capture[c * 7u + 4u];
     int p = int(group.x) * PIE_THREADS + int(local.x);
     if (pages_at < 0 || p >= params.pages) {
         return;
@@ -96,7 +98,6 @@ struct Params {
     int kv_heads;
     int head_dim;
     float sm_scale;
-    int observe;
     // The keys of the load's context: a row's width.
     int context;
     // Whether the row is added into (1) or into zero (0).
@@ -117,21 +118,22 @@ groupshared int score_cap;
 groupshared int score_qohi;
 groupshared int score_rows;
 groupshared int score_keys_at;
+groupshared int score_stats_at;
 
 // The lane's capture entry, staged for the workgroup: read uniformly, as
 // WGSL lets a barrier follow only workgroup-uniform control flow.
 void stage_lane(uint c, uint tid) {
     if (tid == 0u) {
-        int lane = capture[c * 5u];
-        int qo_lo = capture[c * 5u + 1u];
-        int qo_hi = capture[c * 5u + 2u];
-        score_keys_at = capture[c * 5u + 3u];
+        int lane = capture[c * 7u];
+        int qo_hi = capture[c * 7u + 2u];
+        score_keys_at = capture[c * 7u + 3u];
+        score_rows = capture[c * 7u + 5u];
+        score_stats_at = capture[c * 7u + 6u];
         int page_first = int(kv_page_indptr[uint(lane)]);
         int pages = int(kv_page_indptr[uint(lane) + 1u]) - page_first;
         score_first = page_first;
         score_cap = pages * params.page_size;
         score_qohi = qo_hi;
-        score_rows = min(params.observe, qo_hi - qo_lo);
     }
     GroupMemoryBarrierWithGroupSync();
 }
@@ -216,9 +218,10 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     int qo_hi = workgroupUniformLoad(score_qohi);
     int rows = workgroupUniformLoad(score_rows);
     uint kv_head = uint(head / (params.q_heads / params.kv_heads));
-    uint at = (c * uint(params.q_heads) + uint(head)) * uint(params.observe);
+    int stats_at = workgroupUniformLoad(score_stats_at);
 
     for (int w = 0; w < rows; w++) {
+        uint at = (uint(stats_at + w) * uint(params.q_heads) + uint(head)) * 2u;
         int qi = qo_hi - rows + w;
         stage_q(qi, head, tid);
         int limit = min(position_ids[uint(qi)] + 1, capacity);
@@ -233,8 +236,8 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         fold_softmax(tid, m, l);
         if (tid == 0u) {
             float sum = score_l[0];
-            stats[(at + uint(w)) * 2u] = score_m[0];
-            stats[(at + uint(w)) * 2u + 1u] = sum > 0.0 ? 1.0 / sum : 0.0;
+            stats[at] = score_m[0];
+            stats[at + 1u] = sum > 0.0 ? 1.0 / sum : 0.0;
         }
         GroupMemoryBarrierWithGroupSync();
     }
@@ -270,6 +273,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     int qo_hi = workgroupUniformLoad(score_qohi);
     int rows = workgroupUniformLoad(score_rows);
     int keys_at = workgroupUniformLoad(score_keys_at);
+    int stats_at = workgroupUniformLoad(score_stats_at);
     uint head_dim = uint(params.head_dim);
     uint pairs = head_dim >> 1;
     uint heads = uint(params.q_heads);
@@ -309,7 +313,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
                     mass_q[(i / pairs) * run + i % pairs] = q[q_at + i];
                 }
                 for (uint h = tid; h < heads; h += uint(PIE_THREADS)) {
-                    uint at = ((c * heads + h) * uint(params.observe) + uint(w)) * 2u;
+                    uint at = (uint(stats_at + w) * heads + h) * 2u;
                     mass_top[h] = stats[at];
                     mass_inv[h] = stats[at + 1u];
                 }

@@ -86,6 +86,7 @@ impl Program {
             }],
             externs: Vec::new(),
             inputs: Vec::new(),
+            observe: None,
         }
     }
 }

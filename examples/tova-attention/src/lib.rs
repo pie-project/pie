@@ -155,6 +155,9 @@ async fn main(input: Input) -> Result<Output> {
         let scores_out = Channel::new([kv_max], dtype::f32).capacity(channel_capacity() as u32);
 
         let fwd = ForwardPass::new();
+        // TOVA scores the keys by the attention of the token it decodes:
+        // the fire's own row.
+        fwd.observe(Observe::FireRows);
         fwd.embed(&tok_in, &lane1)?;
         fwd.state(&[&ws], StateGeometry::folding())?;
 

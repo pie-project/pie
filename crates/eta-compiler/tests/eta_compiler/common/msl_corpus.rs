@@ -141,6 +141,7 @@ fn epilogue(channels: Vec<ChannelDecl>, ops: Vec<Op>) -> TraceContainer {
         }],
         externs: Vec::new(),
         inputs: Vec::new(),
+        observe: None,
     }
 }
 
@@ -235,6 +236,7 @@ pub fn synthetic_traces() -> Vec<(&'static str, TraceContainer, Served)> {
                 }],
                 externs: Vec::new(),
                 inputs: Vec::new(),
+                observe: None,
             },
             with_sink,
         ),
@@ -320,6 +322,7 @@ fn staged(stage: Stage, channels: Vec<ChannelDecl>, ops: Vec<Op>) -> TraceContai
         stages: vec![StageProgram { stage, ops }],
         externs: Vec::new(),
         inputs: Vec::new(),
+        observe: None,
     }
 }
 

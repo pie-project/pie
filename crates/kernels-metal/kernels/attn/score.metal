@@ -5,7 +5,8 @@ using namespace metal;
 #include "../prim/kv_page.h"
 
 // One threadgroup a request (a lane of the fire's window): a capturing
-// lane's attention mass a key, over its last `observe` query rows and over
+// lane's attention mass a key, over the query rows its program observes
+// (`observe_at[row_first + request]`, its last ones) and over
 // the query heads this launch attends (`num_q_heads` of the model's
 // `total_heads`, each a 1 / (rows x total_heads) share), added to its row,
 // the `kv_max` (the load's context) floats at the GPU address
@@ -27,7 +28,7 @@ template <typename T, int HEAD_DIM_MAX, int SIMDS>
     const constant int& num_kv_heads    [[buffer(8)]],
     const constant int& head_dim        [[buffer(9)]],
     const constant float& sm_scale      [[buffer(10)]],
-    const constant int& observe         [[buffer(11)]],
+    const device uint* observe_at       [[buffer(11)]],
     const constant int& kv_max          [[buffer(12)]],
     const constant ulong& k_page_stride [[buffer(13)]],
     const constant ulong& v_page_stride [[buffer(14)]],
@@ -72,6 +73,7 @@ template <typename T, int HEAD_DIM_MAX, int SIMDS>
       pages > 0 ? (pages - 1) * page_size + kv_last_page_lens[request] : 0;
   const int qo_hi = qo_indptr[request + 1];
   const int qo_len = qo_hi - qo_indptr[request];
+  const int observe = int(observe_at[row_first + uint(request)]);
   const int rows = observe < qo_len ? observe : qo_len;
   if (pages <= 0 || kv_len <= 0 || rows <= 0) {
     return;

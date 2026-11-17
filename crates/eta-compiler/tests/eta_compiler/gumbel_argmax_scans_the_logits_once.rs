@@ -72,6 +72,7 @@ fn subject(divide: bool, kind: RngKind) -> TraceContainer {
         }],
         externs: Vec::new(),
         inputs: Vec::new(),
+        observe: None,
     }
 }
 
@@ -162,6 +163,7 @@ fn decode_subject(divide: bool, vocab: u32) -> TraceContainer {
         }],
         externs: Vec::new(),
         inputs: Vec::new(),
+        observe: None,
     }
 }
 

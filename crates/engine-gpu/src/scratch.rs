@@ -100,8 +100,8 @@ pub struct Rooms {
     spatial: Option<Room>,
 
     /// A score capture's normalisers: a maximum and an inverse sum for each
-    /// (capturing lane, query head, observed row), a lane of the rung's
-    /// fires a row.
+    /// (observed row, query head), a row a token of the rung's fires (a
+    /// fire's capturing lanes observe its rows at most).
     score: Option<Room>,
 
     copy: Option<CopyRoom>,
@@ -273,22 +273,18 @@ impl Rooms {
             .nodes
             .iter()
             .filter_map(|node| match &node.op {
-                Operation::Attn(Attn::ScoreCapture {
-                    q,
-                    head_dim,
-                    observe,
-                    ..
-                }) => of(*q).map(|rect| (rect.width / (*head_dim).max(1), *observe)),
+                Operation::Attn(Attn::ScoreCapture { q, head_dim, .. }) => {
+                    of(*q).map(|rect| rect.width / (*head_dim).max(1))
+                }
                 _ => None,
             })
-            .map(|(heads, observe)| {
-                kernels_slang::attn::score::stats_floats(1, heads, observe)
-            })
+            .map(|heads| kernels_slang::attn::score::stats_floats(1, heads))
             .max()
             .filter(|floats| *floats > 0)
             .map(|floats| {
+                // A fire's capturing lanes observe its rows at most.
                 let mut at = 0u64;
-                Room::lay(&mut at, u64::from(narrow.max_lanes), floats, Dtype::F32)
+                Room::lay(&mut at, u64::from(narrow.max_tokens), floats, Dtype::F32)
             });
 
         let union = routed

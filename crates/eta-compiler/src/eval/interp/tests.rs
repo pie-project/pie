@@ -55,6 +55,7 @@ fn counter_trace() -> TraceContainer {
         }],
         externs: Vec::new(),
         inputs: Vec::new(),
+        observe: None,
     }
 }
 
@@ -123,6 +124,7 @@ fn register_rule_put_then_take_reads_pending() {
         }],
         externs: alloc::vec::Vec::new(),
         inputs: Vec::new(),
+        observe: None,
     };
     let b = served(c);
     let mut inst = Instance::new(&b, &[]).unwrap();
@@ -155,6 +157,7 @@ fn dummy_run_on_late_host_edge_then_recover() {
         }],
         externs: alloc::vec::Vec::new(),
         inputs: Vec::new(),
+        observe: None,
     };
     let b = served(c);
     let mut inst = Instance::new(&b, &[(1, Value::U32(vec![100]))]).unwrap();
@@ -196,6 +199,7 @@ fn rng_keyed_is_pure_function_of_state() {
         }],
         externs: alloc::vec::Vec::new(),
         inputs: Vec::new(),
+        observe: None,
     };
     let b = served(mk());
     let seeds = [(0u32, Value::U32(vec![42, 7]))];

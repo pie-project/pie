@@ -411,6 +411,10 @@ pub struct Seated<'a, B: Serve> {
     /// The outputs the lane's program reads.
     pub reads: &'a [String],
 
+    /// What the lane's program observes where it reads attention scores, as
+    /// its container states it; a lane that captures states it.
+    pub observe: Option<eta_ir::container::Observe>,
+
     pub rs: &'a engine::fire::RsVerb,
 
     pub rs_reset: engine::fire::RsReset,
@@ -465,6 +469,7 @@ impl<'a, B: Serve> Seated<'a, B> {
             positions: &[],
             readout: None,
             reads: &[],
+            observe: None,
             translation: &[],
             rs: &FOLD,
             rs_reset: engine::fire::RsReset::Inferred,
@@ -3807,16 +3812,35 @@ impl<B: Serve> Shell<B> {
             .collect();
 
         // The lanes whose class captures, compacted in lane order: a key row
-        // each, and a page row each of those whose program reads pages.
-        let scored = Scored::of(composition.lanes().iter().map(|row| {
-            let captures = self.captures(row.class as usize);
-            let pages = captures
-                && lanes[row.source as usize]
-                    .reads
-                    .iter()
-                    .any(|name| name == SCORE_PAGES);
-            (captures, pages)
-        }));
+        // each, and a page row each of those whose program reads pages; each
+        // observes the rows its program states.
+        let mut captures = Vec::with_capacity(composition.lanes().len());
+        for row in composition.lanes() {
+            if !self.captures(row.class as usize) {
+                captures.push(None);
+                continue;
+            }
+            let seated = &lanes[row.source as usize];
+            let observed = match seated.observe {
+                Some(eta_ir::container::Observe::Rows(rows)) => rows.min(row.rows),
+                Some(eta_ir::container::Observe::FireRows) => row.rows,
+                None => {
+                    return Err(Fault::Program {
+                        at: "serve::prepare",
+                        why: format!(
+                            "lane {} captures attention scores and its program states no \
+                             observation (`eta_ir::container::Observe`)",
+                            row.source
+                        ),
+                    });
+                }
+            };
+            captures.push(Some(crate::run::Captures {
+                pages: seated.reads.iter().any(|name| name == SCORE_PAGES),
+                observed,
+            }));
+        }
+        let scored = Scored::of(captures);
         // Each capturing lane's rows by their bases in the guest region's
         // key and page rows ([`crate::arena::Span::slots`] binds them).
         let capture_table = self
@@ -5261,6 +5285,8 @@ impl<B: Serve> Shell<Named<B>> {
                 adapter: lane.adapter,
                 inputs: &lane.inputs,
                 reads: &lane.reads,
+                // A capturing class is named at every row it may observe.
+                observe: Some(eta_ir::container::Observe::FireRows),
                 ..Seated::of(Lane {
                     slot: at as u32,
                     word: lane.word,

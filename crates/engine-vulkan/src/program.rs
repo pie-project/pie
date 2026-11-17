@@ -835,6 +835,14 @@ impl Plane {
         })
     }
 
+    /// What `instance`'s program observes where it reads attention scores.
+    #[must_use]
+    pub fn observe(&self, instance: InstanceId) -> Option<eta_ir::container::Observe> {
+        self.instances
+            .get(&instance)
+            .and_then(|seat| seat.plan.package.observe)
+    }
+
     #[must_use]
     pub fn prologue_runs(&self, instance: InstanceId) -> bool {
         self.instances
@@ -1376,6 +1384,10 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
                 "instance {instance}: this build carries no Vulkan device, so a guest pass has nowhere to run"
             )))
         }
+    }
+
+    fn observe(&self, instance: InstanceId) -> Option<eta_ir::container::Observe> {
+        Plane::observe(self, instance)
     }
 }
 

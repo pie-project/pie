@@ -570,7 +570,12 @@ struct ForwardInner {
     adapter_scale_sites: u32,
     inputs: Vec<(u32, String, DslChannel)>,
     switches: Vec<(u32, String, String)>,
+    observe: Option<Observe>,
 }
+
+/// What a program that reads attention scores observes: the query rows of a
+/// lane its scores average over ([`ForwardPass::observe`]).
+pub use eta_dsl::eta::container::Observe;
 
 impl ForwardPass {
     /// Whether a switch is off its model's default; such a pass posts one fire at a time.
@@ -605,8 +610,20 @@ impl ForwardPass {
                 adapter_scale_sites: 0,
                 inputs: Vec::new(),
                 switches: Vec::new(),
+                observe: None,
             }),
         }
+    }
+
+    /// States what this pass's program observes where it reads attention
+    /// scores (`attn.scores`, `attn.scores.pages`): its lanes' last `n` query
+    /// rows of a fire (`Observe::Rows(n)`), or every row a lane brings
+    /// (`Observe::FireRows`). A program that reads scores states it, or the
+    /// runtime refuses it at registration. Construction-only.
+    pub fn observe(&self, observe: Observe) {
+        let mut inner = self.inner.borrow_mut();
+        assert!(!inner.program_attached, "the observation is construction-only");
+        inner.observe = Some(observe);
     }
 
     /// Sets lane `lane`'s model switch `name` (`model::switches()`) to `value`.
@@ -896,6 +913,9 @@ impl ForwardPass {
         let inner = self.inner.borrow();
         let mut builder = Builder::new(inner.vocab, inner.page_size);
         builder.outputs(lane_outputs(&inner)?);
+        if let Some(observe) = inner.observe {
+            builder.observe(observe);
+        }
         for (port, channel) in &inner.ports {
             builder.bind_port_recorded(*port, channel.clone());
         }
@@ -1198,7 +1218,7 @@ impl ForwardPass {
 }
 
 pub mod prelude {
-    pub use super::{ForwardPass, run_ahead, submit_frame};
+    pub use super::{ForwardPass, Observe, run_ahead, submit_frame};
     pub use crate::eta::shared_prelude::*;
 }
 

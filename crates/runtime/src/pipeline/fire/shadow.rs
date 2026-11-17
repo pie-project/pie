@@ -257,6 +257,7 @@ mod tests {
                 stage: Stage::Epilogue,
                 ops: epilogue,
             }],
+            observe: None,
         };
         let logits = OutputDecl {
             name: "logits".into(),

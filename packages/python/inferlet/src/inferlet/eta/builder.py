@@ -19,6 +19,7 @@ from typing import Callable
 from .ir import (
     ChannelDecl,
     HostRole,
+    Observe,
     Port,
     PortBinding,
     OutputDecl,
@@ -191,6 +192,11 @@ class Builder:
         self.vocab = vocab
         self.page_size = page_size
         self.outputs: list[list[OutputDecl]] = []
+        self.observe: Observe | None = None
+
+    def set_observe(self, observe: Observe) -> None:
+        """State what the program observes where it reads attention scores."""
+        self.observe = observe
 
     def set_outputs(self, lanes: list[list[OutputDecl]]) -> None:
         """The outputs each lane of the pass reads out, in lane order."""
@@ -309,7 +315,9 @@ class Builder:
 
         stages = [StageProgram(r.stage, r.ops) for r in stage_results]
         port_bindings = [PortBinding(p, ci) for p, ci in sorted(ports, key=lambda x: int(x[0]))]
-        container = TraceContainer(names=names, channels=decls, ports=port_bindings, stages=stages, inputs=inputs)
+        container = TraceContainer(
+            names=names, channels=decls, ports=port_bindings, stages=stages, inputs=inputs, observe=self.observe
+        )
 
         _lint(channels, sinks)
 

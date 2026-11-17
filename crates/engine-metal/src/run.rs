@@ -163,6 +163,7 @@ pub struct FireBindings {
 pub struct CaptureSeat {
     pub keys_at: Tensor,
     pub pages_at: Tensor,
+    pub observe_at: Tensor,
     pub keys: u32,
     pub pages: u32,
     pub page_size: u32,

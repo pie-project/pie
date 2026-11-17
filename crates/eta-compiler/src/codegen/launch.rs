@@ -327,6 +327,10 @@ pub struct LaunchPackage {
     pub stages: Vec<LaunchStage>,
     pub plans: Vec<LaunchStagePlan>,
     pub fault_classes: Vec<FaultClass>,
+    /// What the program observes where it reads attention scores, as its
+    /// container states it ([`eta_ir::container::Observe`]).
+    #[serde(default)]
+    pub observe: Option<eta_ir::container::Observe>,
 }
 
 impl LaunchPackage {
@@ -356,6 +360,7 @@ pub fn build(bound: &BoundTrace, stages: &[CompiledStage]) -> LaunchPackage {
         stages: lower_stages(bound),
         plans: stages.iter().map(lower_plan).collect(),
         fault_classes: crate::codegen::fault::classes(),
+        observe: bound.container.observe,
     }
 }
 

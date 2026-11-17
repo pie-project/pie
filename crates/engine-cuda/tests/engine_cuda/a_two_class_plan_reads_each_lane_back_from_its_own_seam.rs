@@ -152,6 +152,7 @@ fn epilogue(rows: u32, output: &str, width: u32) -> TraceContainer {
         }],
         externs: Vec::new(),
         inputs: Vec::new(),
+        observe: None,
     }
 }
 
