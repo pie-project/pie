@@ -207,11 +207,17 @@ pub fn combine(root: &Path, names: &[String]) -> R<Vec<Placed>> {
                 }
             }
         }
-        if p.y > 0 && host.get("state").is_some_and(|s| !s.is_null()) {
-            return Err(format!(
-                "{}: a state root's PEs are not moved off row 0 yet",
-                p.name
-            ));
+        // a decode reading's state root: its regions' PEs the host addresses, moved alike
+        if let Some(st) = host.get_mut("state").filter(|s| !s.is_null()) {
+            let mut root: crate::emit::state::StateRoot = serde_json::from_value(st.clone())
+                .map_err(|e| format!("{}: state: {e}", p.name))?;
+            for r in &mut root.regions {
+                for pe in r.pos.iter_mut().chain(&mut r.rows).chain(&mut r.tables) {
+                    pe.x += p.x;
+                    pe.y += p.y;
+                }
+            }
+            *st = serde_json::to_value(root).map_err(|e| e.to_string())?;
         }
         host["origin"] = serde_json::json!([p.x, p.y]);
         host["rd"] = serde_json::json!(rd);
@@ -388,5 +394,61 @@ mod tests {
                 sizes[0].1.max(sizes[1].1)
             )
         );
+    }
+
+    /// A decode reading (its state root's PEs the host addresses) combined after another
+    /// reading: every region's `pos`, `rows` and `tables` PEs moved by its origin.
+    #[test]
+    fn a_decode_readings_state_moves_with_it() {
+        let dir = std::env::temp_dir().join(format!("coresident-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        struct Gone(std::path::PathBuf);
+        impl Drop for Gone {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let tmp = Gone(dir.clone());
+        let mini = poem_compiler::catalog::repository()
+            .parse("flux2-mini-bf16-kv-bf16")
+            .expect("flux2-mini parses")
+            .trace(poem_ir::Platform::Cerebras);
+        let o = crate::stream::Options {
+            reading: "text".into(),
+            rows: 16,
+            round16: true,
+            upto: None,
+            taps: Vec::new(),
+        };
+        let (w0, _) = crate::stream::compile_reading(&mini, &o, &dir.join("text")).unwrap();
+        let q = poem_compiler::catalog::repository()
+            .parse("qwen3-0.6b-bf16-kv-bf16-l1")
+            .expect("qwen3 parses")
+            .trace(poem_ir::Platform::Cerebras);
+        crate::stream::compile_decode(&q, 64, 1, true, &dir.join("decode")).unwrap();
+        let read = |p: &std::path::Path| -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
+        };
+        let before = read(&dir.join("decode/host.json"));
+        let names = vec!["text".to_string(), "decode".to_string()];
+        let placed = combine(&dir, &names).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!((placed[1].x, placed[1].y), (w0, 0));
+        let after = read(&dir.join("decode/host.json"));
+        let pes = |v: &serde_json::Value| -> Vec<(u64, u64)> {
+            (v["state"]["regions"].as_array().into_iter().flatten())
+                .flat_map(|r| ["pos", "rows", "tables"].map(|k| r[k].clone()))
+                .flat_map(|l| l.as_array().cloned().unwrap_or_default())
+                .map(|pe| (pe["x"].as_u64().unwrap(), pe["y"].as_u64().unwrap()))
+                .collect()
+        };
+        let (b, a) = (pes(&before), pes(&after));
+        assert!(!b.is_empty(), "the decode reading has state PEs");
+        assert_eq!(
+            a,
+            b.iter()
+                .map(|&(x, y)| (x + u64::from(w0), y))
+                .collect::<Vec<_>>()
+        );
+        drop(tmp);
     }
 }
