@@ -2624,15 +2624,38 @@ milestone's tail.
   range-fetched, text-only names):
   - The HF golden runs: the release's `modeling_kimi_linear.py` on transformers 5.23 in f32,
     with fla-core's kernels as a CPU stand-in's serial walk.
-  - The program lowers; placement refuses it: `no column roots up to 512 fit its tiles
-    (12288 words)`. Layer 0 is 1.2B weights (7168 wide, a 33792 MLP, 12288-wide KDA). The
-    search's capacity, not the lowering.
+  - The program lowers; placement refuses it (the open item below).
 - **The simulator's model** (`kimik3-tiny`: one KDA layer, hidden 256, two heads of 128, MLP
   256, vocab 512, the release's floor, AttnRes and SiTU; random weights; HF golden alike):
   - compiles to 6 x 76 PEs; `--dry` lands 793,767 static words;
   - on the simulator the first launch's logits never come back (`could be a kernel stall`).
     G1's attention-only `qwen3-sim` stalls the same way on the same day, so the decode unit
     path's stall is not KDA's.
+  - **The bisect** (`kda/stall.py`: the Python SDK harness, not the engine's runtime; every
+    write lands and is confirmed, `run` launched, then bounded reads):
+    - `sim.log` names no PE, op or address: `@1094207 Stopping due to fatal error`, then
+      `Caught signal 11`. The simulator process itself segfaults; there is no operand
+      overlap.
+    - Reads just after the launch from idle edge PEs (rows 0 and 75) succeed. After a 200 s
+      wait even a filler's read fails. The simulator dies on its own while the program runs,
+      at 0.93M to 1.95M cycles; no particular read triggers it.
+    - Headless (`wafer-compile ... --reading decode --stages 1`: the KDA layer's unit alone,
+      no head, 4 x 76 PEs) dies the same way, so the logits root is not the cause.
+    - Without the state's host writes (`rowp` skipped), it still dies the same way.
+    - Two controls die the same way: flux2-mini's text program (the stream regime, compiled
+      today), launched, then a 300 s wait; and the headless program with every write landed and
+      no launch at all.
+    - **Not the environment, not the runtime.** G1 re-ran yesterday's flux2f c1 (yesterday's
+      linked program and wafer-bench, the same sif) and it passes, as does G1's split (b); every
+      run that dies here holds a program compiled and linked today. The crash follows today's
+      programs; its cause is under bisection (G1).
+- **Open, for G1 / P1** (the search's capacity): Kimi-K3's real layer 0 does not place,
+  `no column roots up to 512 fit its tiles (12288 words)`. It holds 1.2B weights (hidden 7168,
+  a 33792-wide dense MLP, 12288-wide KDA projections).
+- **Open, for P1** (packing): klein-4B's readings co-resident for the system, as a load on a CS
+  system compiles them (`prepare::stream_programs`, `stream::coresident::combine`), need a
+  rectangle 770 wide; the system's fabric holds 762 at offset 4, so cslc refuses the layout.
+  flux2-mini's readings link. Not fixed here.
 
 ## G1: the poem survey
 
