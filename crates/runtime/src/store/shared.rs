@@ -868,14 +868,30 @@ impl SharedPool {
         if let Some(shape) = facts.shapes.iter().find(|shape| shape.pinned.is_some()) {
             return Err(SharedError::Pinned(shape.id.0));
         }
+        // The reserved runs lie from chunk 0 on; skipped ids anywhere above
+        // them, apart.
         let mut reserved = 0u32;
+        let mut skips = Vec::new();
         for run in &facts.reserved {
-            if run.first != reserved {
+            if run.what == ::engine::chunk::Reserved::Skipped {
+                skips.push((run.first, run.chunks));
+                continue;
+            }
+            if run.first != reserved || !skips.is_empty() {
                 return Err(SharedError::Reserved);
             }
             reserved += run.chunks;
         }
-        Self::build(facts, reserved, max_context)
+        let mut skips_sorted = skips.clone();
+        skips_sorted.sort_unstable();
+        let mut end = reserved;
+        for &(first, chunks) in &skips_sorted {
+            if first < end || first.saturating_add(chunks) > facts.total_chunks {
+                return Err(SharedError::Reserved);
+            }
+            end = first + chunks;
+        }
+        Self::build(facts, reserved, &skips, max_context)
     }
 
     /// A tier below the device (CONTRACT-BC 22): `chunks` chunks of the
@@ -927,10 +943,15 @@ impl SharedPool {
             weights: Vec::new(),
             ..facts.clone()
         };
-        Self::build(&tier, 0, 0).map(Some)
+        Self::build(&tier, 0, &[], 0).map(Some)
     }
 
-    fn build(facts: &ChunkFacts, reserved: u32, max_context: u32) -> Result<Self, SharedError> {
+    fn build(
+        facts: &ChunkFacts,
+        reserved: u32,
+        skips: &[(u32, u32)],
+        max_context: u32,
+    ) -> Result<Self, SharedError> {
         let mut shapes = Vec::with_capacity(facts.shapes.len() + facts.weights.len());
         let (mut lists, mut rs_lists, mut windows, mut fixed) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -1017,6 +1038,9 @@ impl SharedPool {
             act_chunks: facts.act_chunks.clone(),
             act_span: facts.act_span_chunks,
         });
+        for &(first, chunks) in skips {
+            pool.skip(first, chunks);
+        }
         // Every engine starts at the largest rung, the one it lays its fires
         // by at load (an engine told rungs as well: it hears each change
         // from there).
@@ -1163,7 +1187,11 @@ impl SharedPool {
     #[must_use]
     pub fn tier_bytes(&self) -> (u64, u64, u64) {
         let chunk = self.pool.chunk_bytes();
-        let total = u64::from(self.pool.total_chunks() - self.pool.reserved_chunks()) * chunk;
+        let total = u64::from(
+            self.pool.total_chunks()
+                - self.pool.reserved_chunks()
+                - self.pool.skipped_below(self.pool.total_chunks()),
+        ) * chunk;
         let opened = u64::from(self.pool.state_chunks()) * chunk;
         (total, opened, self.pool.demand().live)
     }
@@ -1206,6 +1234,7 @@ impl SharedPool {
         let state_chunks = self
             .backable_below_span()
             .saturating_sub(pool.reserved_chunks())
+            .saturating_sub(pool.skipped_below(self.backable_below_span()))
             .saturating_sub(act_chunks - pool.act_max())
             .saturating_sub(weight_chunks);
         PoolRoom {
@@ -1378,10 +1407,10 @@ impl SharedPool {
     /// (standing bytes).
     #[must_use]
     pub fn state_chunks_now(&self) -> u32 {
-        self.pool
-            .live_limit()
-            .min(self.pool.state_limit())
+        let limit = self.pool.live_limit().min(self.pool.state_limit());
+        limit
             .saturating_sub(self.pool.reserved_chunks())
+            .saturating_sub(self.pool.skipped_below(limit))
     }
 
     /// Slots of pool shape `shape` the state chunks hold, were every one
@@ -2137,7 +2166,8 @@ impl SharedPool {
 
     #[must_use]
     pub fn hard_limit(&self) -> u64 {
-        u64::from(self.pool.total_chunks()) * self.pool.chunk_bytes()
+        u64::from(self.pool.total_chunks() - self.pool.skipped_below(self.pool.total_chunks()))
+            * self.pool.chunk_bytes()
     }
 
     /// Bytes under the mapped segments, the top span's included.

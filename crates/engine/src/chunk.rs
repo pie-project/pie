@@ -176,6 +176,10 @@ pub enum Reserved {
     /// the tables an adapter's planes are read through. Model bytes, never
     /// state: no slot ref names them and nothing parks or drops them.
     Tables,
+    /// Chunk ids of the range the card never backs, anywhere in it: the
+    /// ids above keep their place, and no run of adjacent chunks the
+    /// runtime hands out crosses them.
+    Skipped,
 }
 
 /// `chunks` chunks from `first`, reserved for `what`.
