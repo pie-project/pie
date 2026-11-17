@@ -48,6 +48,16 @@ impl Inner {
         })
     }
 
+    /// `pid` is resident again: the youngest resident, the first victim
+    /// past the policy's keys ([`super::rank::VictimOrder`]).
+    pub(super) fn came_back(&mut self, pid: ProcessId) {
+        let came = self.next_seq;
+        if let Some(proc) = self.procs.get_mut(&pid) {
+            proc.came = came;
+            self.next_seq += 1;
+        }
+    }
+
     pub(super) fn settle_eviction(&mut self, pid: ProcessId) {
         self.evicting.remove(&pid);
     }

@@ -61,6 +61,49 @@ fn planner_every_case() {
     a_younger_restore_still_queues_behind_an_older_allocation();
     returning_host_room_resumes_the_yield();
     a_restore_short_of_room_for_its_roles_waits_then_evicts_once_stalled();
+    victims_go_youngest_resident_first_under_the_policys_keys();
+}
+
+/// Victims are picked in one order: the policy's key first, then the
+/// process made resident last (admitted or restored) before those running
+/// longer. A restore makes an old process the youngest resident; a lower
+/// policy key goes before any of them.
+fn victims_go_youngest_resident_first_under_the_policys_keys() {
+    let (mut inner, pids) = fleet(&[
+        (1, Residency::Resident, true),
+        (2, Residency::Resident, true),
+        (3, Residency::Resident, true),
+    ]);
+    inner.next_seq = 4;
+    let order = |inner: &Inner| {
+        let mut by: Vec<_> = pids
+            .iter()
+            .map(|pid| (inner.procs[pid].victim_order(), *pid))
+            .collect();
+        by.sort();
+        by.into_iter().map(|(_, pid)| pid).collect::<Vec<_>>()
+    };
+    assert_eq!(
+        order(&inner),
+        vec![pids[2], pids[1], pids[0]],
+        "admitted last, first"
+    );
+    // The oldest is parked and comes back: now it is the youngest resident.
+    inner.came_back(pids[0]);
+    assert_eq!(
+        order(&inner),
+        vec![pids[0], pids[2], pids[1]],
+        "restored last, first"
+    );
+    // Its rank (the queue's and eligibility's order) stays its admission's.
+    assert!(inner.procs[&pids[0]].rank() < inner.procs[&pids[1]].rank());
+    // A policy key leads whatever the recency.
+    inner.procs.get_mut(&pids[1]).unwrap().key = -1;
+    assert_eq!(
+        order(&inner),
+        vec![pids[1], pids[0], pids[2]],
+        "the policy's key leads"
+    );
 }
 
 /// A restore whose role slots found no room is queued again, a waiter: it

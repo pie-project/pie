@@ -9,7 +9,7 @@ use super::grant::AllocationGrant;
 use super::holdings::suspendable_rs_units;
 use super::plan::ServeOutcome;
 use super::proc::Residency;
-use super::rank::Rank;
+use super::rank::VictimOrder;
 use super::reclaim::Reclaim;
 use super::residency_planner::HOST_RESERVE_DIVISOR;
 use super::victim::{Victim, VictimSet};
@@ -19,22 +19,22 @@ use super::{ProcessId, ResidencyPlanner};
 impl ResidencyPlanner {
     pub(super) fn quote_and_pick(
         &self,
-        candidates: Vec<(ProcessId, Rank)>,
+        candidates: Vec<(ProcessId, VictimOrder)>,
         deficit: Reclaim,
         room: Reclaim,
         state_pages: u32,
         model: usize,
         engine: usize,
     ) -> (Vec<(ProcessId, Reclaim)>, Vec<ProcessId>) {
-        let mut ordered: Vec<(ProcessId, Rank, bool)> = candidates
+        let mut ordered: Vec<(ProcessId, VictimOrder, bool)> = candidates
             .into_iter()
-            .map(|(pid, rank)| {
+            .map(|(pid, order)| {
                 let quiescent =
                     crate::inferlet::process::residency::kv_lease_quiescent(pid, model, engine);
-                (pid, rank, quiescent)
+                (pid, order, quiescent)
             })
             .collect();
-        ordered.sort_by_key(|&(_, rank, quiescent)| (!quiescent, std::cmp::Reverse(rank)));
+        ordered.sort_by_key(|&(_, order, quiescent)| (!quiescent, order));
         let pids: Vec<ProcessId> = ordered.iter().map(|(pid, ..)| *pid).collect();
         // On a shared pool the state a victim parks frees chunks kv takes:
         // it is worth that many kv pages to a head short of kv.
@@ -312,7 +312,7 @@ impl ResidencyPlanner {
                 })
                 .map(|(pid, proc)| Victim {
                     pid: *pid,
-                    rank: proc.rank(),
+                    order: proc.victim_order(),
                     e6_fresh: proc.progressed || proc.idle || proc.held,
                 })
                 .collect();
@@ -374,7 +374,12 @@ impl ResidencyPlanner {
         });
         let any = !spawned.is_empty();
         for pid in &spawned {
-            ptrace!("evict pid={} head={:?}", pid, head_key);
+            ptrace!(
+                "evict pid={} head={:?} landed={}",
+                pid,
+                head_key,
+                self.with_inner(|inner| inner.procs.get(pid).map_or(0, |p| p.landed))
+            );
         }
         self.start_evictions(wake, spawned);
         any
@@ -488,7 +493,7 @@ impl ResidencyPlanner {
                         working_sets,
                         u32::MAX,
                     );
-                    let mut legal: Vec<(ProcessId, Rank, bool, Reclaim)> = pids
+                    let mut legal: Vec<(ProcessId, VictimOrder, bool, Reclaim)> = pids
                         .iter()
                         .zip(quotes)
                         .zip(&rs_quotes)
@@ -505,7 +510,7 @@ impl ResidencyPlanner {
                             match quote? {
                                 ReclaimQuote::Pages(pages) if pages > 0 => Some((
                                     *pid,
-                                    proc.rank(),
+                                    proc.victim_order(),
                                     proc.progressed,
                                     Reclaim { pages, rs },
                                 )),
@@ -513,7 +518,7 @@ impl ResidencyPlanner {
                             }
                         })
                         .collect();
-                    legal.sort_by_key(|&(_, rank, fresh, _)| (!fresh, std::cmp::Reverse(rank)));
+                    legal.sort_by_key(|&(_, order, fresh, _)| (!fresh, order));
                     let mut picks = Vec::new();
                     let mut covered = 0u32;
                     for (pid, _, _, frees) in legal {
