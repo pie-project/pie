@@ -343,12 +343,18 @@ async fn main(input: Input) -> Result<Output> {
     let g0 = tok_out_p.take_host::<i32>().await?;
     let s0 = score_out_p.take_host::<f32>().await?;
     let n0 = null_out_p.take_host::<f32>().await?;
-    generated.push(g0 as u32);
+    // A stop token ends the text and is not part of it, as every chat
+    // inferlet here ends its text.
+    let stop_tokens = inferlet::chat::stop_tokens();
+    let stopped = stop_tokens.contains(&(g0 as u32));
+    if !stopped {
+        generated.push(g0 as u32);
+    }
     scores.push(s0);
     nulls.push(n0);
 
     // ── DECODE LOOP (1-wide, run-ahead). ──
-    if generated.len() < max_tokens {
+    if !stopped && generated.len() < max_tokens {
         history[n as usize] = g0;
 
         let tok_in = Channel::from([g0]);
@@ -390,6 +396,9 @@ async fn main(input: Input) -> Result<Output> {
                 .with_context(|| format!("@{}", generated.len()))?;
             let s = score_out.take_host::<f32>().await?;
             let z = null_out.take_host::<f32>().await?;
+            if stop_tokens.contains(&(t as u32)) {
+                return Ok(ControlFlow::Break(()));
+            }
             generated.push(t as u32);
             scores.push(s);
             nulls.push(z);
