@@ -38,7 +38,6 @@ moe.mxfp4_mma_per_from = 4
 
 [engine]
 seated_first = true
-bodies_mb = 1024
 prefill_lattice_steps = 8
 
 # Independent chains on side streams, as the RTX 4090, H100, sm100 and the RTX PRO 6000 run them:
@@ -104,7 +103,6 @@ measured = [
   "engine.copies",
   "engine.prefill_lattice_steps",
   "engine.lattice_steps",
-  "engine.bodies_mb",
   "engine.working_set_percent",
   "fuse.qkv_fused_qknorm_rope_vnorm_write",
   "compiler.cond_fixed_us",

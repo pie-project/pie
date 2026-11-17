@@ -352,8 +352,10 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     };
     // The fire top, the ruling's (`crate::top`, `engine::load::fire_top`):
     // of every bucket of the asked lattice (to the context), each spanning
-    // its fire's working set and needing one sequence and the bodies' floor
-    // beside it, over the room the card has after the weight tier.
+    // its fire's working set and needing one sequence beside it, over the
+    // room the card has after the weight tier. The bodies are priced when
+    // they arm, ahead of the cache rows' fill (`store::holds`), and a card
+    // that holds none of them past the rung is refused there by name.
     let weighed;
     let tokens = {
         let paging = Paging::of(boot.page_size, boot.context, boot.slots, 1)?;
@@ -362,11 +364,10 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             let plan = laid(rung, &voxels).map_err(|why| crate::top::no_plan(&why));
             let sequence =
                 crate::store::least_sequence_bytes(&boot.trace, paging.windowed(window, rung))?;
-            let beside = sequence.saturating_add(crate::store::BODIES_FLOOR_BYTES);
             candidates.push(crate::top::Candidate {
                 tokens: rung,
                 plan,
-                beside,
+                beside: sequence,
             });
         }
         // The lanes one fire carries (`Shell::fire_lanes`): the runtime
@@ -457,7 +458,6 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         after_weights
             .saturating_sub(working(tokens, &voxels))
             .saturating_sub(seat)
-            .saturating_sub(crate::store::BODIES_FLOOR_BYTES)
     });
     if tokens != asked_tokens {
         boot.budget = budget_at(tokens);
@@ -568,7 +568,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
 /// guests' programs, the capturing lanes' score planes and the readout
 /// indices) is held to half of the card past the weights, the half `bake`
 /// sizes the token budget against before the weights are down, and to what
-/// leaves one sequence and the bodies' floor beside it. The tile yields
+/// leaves one sequence beside it. The tile yields
 /// first, held to the widest plane fired at token rows (a plane past it is
 /// served by the fused-dequant arm), then the token budget halves toward its
 /// floor, then the lanes halve toward one, and what their cut frees grows the
@@ -767,14 +767,12 @@ fn refit(
                     .saturating_mul(8),
             )
     };
-    // What one sequence and the bodies' floor leave a fire, and within it the
+    // What one sequence leaves a fire, and within it the
     // half the cache rows are owed when the floors can still reach it.
     let room_at = |tokens: u32, owed: bool| -> Result<u64> {
         let sequence =
             crate::store::least_sequence_bytes(&boot.trace, paging.windowed(window, tokens))?;
-        let room = live
-            .saturating_sub(sequence)
-            .saturating_sub(crate::store::BODIES_FLOOR_BYTES);
+        let room = live.saturating_sub(sequence);
         Ok(if owed {
             room.min(live / 100 * u64::from(engine.working_set_percent))
         } else {
@@ -847,8 +845,7 @@ fn refit(
          and {lanes}: at the asked budgets a fire's working set (activation arena, attention \
          workspaces, decoded-weight tiles) takes {} MiB of the {} MiB this \
          card has after the weight tier under the load's allowance, past the half the cache \
-         rows are owed and what one sequence at the declared context and the bodies' floor \
-         need.",
+         rows are owed and what one sequence at the declared context needs.",
         asked_tokens,
         working_at(asked_lanes, asked_tokens, scoped) >> 20,
         live >> 20,
@@ -1040,7 +1037,7 @@ impl Shell {
                 crate::device::free_bytes().unwrap_or(0) >> 20
             );
         }
-        let (graphs, recording) = boot.knobs.modes(engine.bodies_megabytes);
+        let (graphs, recording) = boot.knobs.modes();
         let (compiled, budgets, tiles) = refit(
             &mut boot,
             &device,
@@ -1542,7 +1539,7 @@ impl Shell {
             pad: recording.pad(),
             golden_arm: Golden::Off,
             bodies: recording.bodies(),
-            bodies_mem: (recording.bodies_mem() as usize).saturating_mul(1 << 20),
+            bodies_mem: 0,
             bodies_record: None,
             bodies_from_record: false,
             arming_at_load: false,
@@ -1636,9 +1633,10 @@ impl Shell {
         }
         let footprint = |shell: &Shell| footprint(shell, device_total, free_before);
         // The bodies are held what they took when this deployment last
-        // armed whole, where it is recorded; the configured `bodies_mem` is
-        // the ceiling and what a first boot holds. One number: arming's
-        // allowance is the hold.
+        // armed whole, where it is recorded; with no record, everything the
+        // card has past one working set, and the cache rows fill what they
+        // leave once they are captured. One number: arming's allowance is
+        // the hold, a load fact like the span, and no figure is chosen.
         let mut recorded = false;
         if shell.records_bodies()
             && let Some(dir) = boot.cache_dir
@@ -1657,16 +1655,15 @@ impl Shell {
                 if boot.knobs.diagnostics.arm_trace {
                     eprintln!(
                         "[arm-trace] bodies held {} MiB: {} bodies took {} MiB, their captures {} \
-                         MiB, when this deployment last armed whole (bodies_mem {} MiB)",
-                        held.min(shell.bodies_mem) >> 20,
+                         MiB, when this deployment last armed whole",
+                        held >> 20,
                         measured.bodies,
                         measured.bytes >> 20,
                         measured.captured >> 20,
-                        shell.bodies_mem >> 20,
                     );
                 }
-                shell.bodies_from_record = held < shell.bodies_mem;
-                shell.bodies_mem = shell.bodies_mem.min(held);
+                shell.bodies_from_record = true;
+                shell.bodies_mem = held;
             }
             shell.bodies_record = Some(record);
         }
@@ -1675,13 +1672,7 @@ impl Shell {
         // in for the figure.
         shell.measuring =
             shell.records_bodies() && !crate::device::elastic::mapped_on_demand() && !recorded;
-        let bodies = if shell.measuring {
-            crate::store::MEASURING
-        } else if shell.records_bodies() {
-            shell.bodies_mem as u64
-        } else {
-            0
-        };
+        let bodies = shell.bodies_hold();
         let resident = footprint(&shell);
         // What the kernels' scratch slabs take, walked size-only through
         // the compositions the lattice fires before the range is first
@@ -1754,23 +1745,9 @@ impl Shell {
         // now lies (the fit may have reserved it anew).
         shell.arena.ensure_rungs(&mut shell.pools)?;
         shell.lay_workspace()?;
-        let afforded = fitted.bodies;
-        if shell.measuring {
-            // Arming is allowed all the card has past the least range.
-            shell.bodies_mem = usize::try_from(afforded).unwrap_or(usize::MAX);
-        } else if afforded < bodies {
-            eprintln!(
-                "engine-cuda: [engine] bodies_mem {} MiB is held down to {} MiB on this card: \
-                 with the weights, activations and inputs resident, one sequence at the declared \
-                 context and the guests' programs seated, {} MiB is left for the graph bodies \
-                 and the cache rows together; the rows take what the bodies leave of it once \
-                 they are captured.",
-                bodies >> 20,
-                afforded >> 20,
-                fitted.spare >> 20,
-            );
-            shell.bodies_mem = usize::try_from(afforded).unwrap_or(usize::MAX);
-        }
+        // Arming is allowed what the fit held the bodies: a record's figure,
+        // or all the card has past the least range.
+        shell.bodies_mem = usize::try_from(fitted.bodies).unwrap_or(usize::MAX);
         Ok(Staged {
             shell,
             rank: boot.world.rank,
@@ -1960,7 +1937,7 @@ impl Staged {
             // state's chunks then end where the activation starts, so what
             // a rung lends and what lies under it are one span.
             let fitted = shell.pools.fit_the_card(
-                shell.bodies_mem as u64,
+                shell.bodies_hold(),
                 shell.held_for_fires,
                 false,
                 &resident,
@@ -1978,7 +1955,7 @@ impl Staged {
             // load that records no bodies has fired none, and keeps the
             // whole span for its fires; one that arms later and lends no
             // rung keeps the bodies' allowance out as well.
-            let bodies = if deferred { shell.bodies_mem as u64 } else { 0 };
+            let bodies = if deferred { shell.bodies_hold() } else { 0 };
             let settled = shell.records_bodies() && !deferred;
             shell
                 .pools
@@ -2061,6 +2038,20 @@ impl Shell {
     #[must_use]
     pub fn expert_staging(&self) -> &crate::experts::staging::Staging {
         &self.expert_staging
+    }
+
+    /// What the fit holds the bodies ahead of the cache rows' fill: none on
+    /// a load that records none; what they took when this deployment last
+    /// armed whole, where that is recorded; else everything past one working
+    /// set ([`crate::store::MEASURING`]).
+    fn bodies_hold(&self) -> u64 {
+        if !self.records_bodies() {
+            0
+        } else if self.bodies_from_record {
+            self.bodies_mem as u64
+        } else {
+            crate::store::MEASURING
+        }
     }
 
     /// The device's memory as this load holds it now ([`ledger`]).

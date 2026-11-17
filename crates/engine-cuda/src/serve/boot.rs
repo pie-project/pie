@@ -45,16 +45,12 @@ pub enum Recording {
     Off,
     #[cfg(feature = "test-pins")]
     Shaped,
-    Bodies {
-        mem_megabytes: u32,
-    },
+    Bodies,
 }
 
 impl Default for Recording {
     fn default() -> Recording {
-        Recording::Bodies {
-            mem_megabytes: DEFAULT_BODIES_MEGABYTES,
-        }
+        Recording::Bodies
     }
 }
 
@@ -69,17 +65,7 @@ impl Recording {
 
     #[must_use]
     pub fn bodies(self) -> bool {
-        matches!(self, Recording::Bodies { .. })
-    }
-
-    #[must_use]
-    pub fn bodies_mem(self) -> u32 {
-        match self {
-            Recording::Bodies { mem_megabytes, .. } => mem_megabytes,
-            Recording::Off => 0,
-            #[cfg(feature = "test-pins")]
-            Recording::Shaped => 0,
-        }
+        matches!(self, Recording::Bodies)
     }
 }
 
@@ -140,14 +126,12 @@ pub struct Knobs {
 
 impl Knobs {
     /// The graph and recording modes a load runs under: every fire
-    /// captured, its bodies kept up to `bodies_megabytes`; only a walked
+    /// captured, its bodies kept as the fit holds them; only a walked
     /// load ([`Knobs::walked`]) and a test build's [`Knobs::pin`] run
     /// otherwise.
     #[must_use]
-    pub fn modes(&self, bodies_megabytes: u32) -> (Graphs, Recording) {
-        let bodies = Recording::Bodies {
-            mem_megabytes: bodies_megabytes,
-        };
+    pub fn modes(&self) -> (Graphs, Recording) {
+        let bodies = Recording::Bodies;
         #[cfg(feature = "test-pins")]
         if let Some((graphs, recording)) = self.pin {
             return (graphs, recording.unwrap_or(bodies));
@@ -176,8 +160,6 @@ pub enum Golden {
     Eager,
     Body,
 }
-
-pub const DEFAULT_BODIES_MEGABYTES: u32 = 4096;
 
 pub struct Boot<'a> {
     pub trace: Trace,

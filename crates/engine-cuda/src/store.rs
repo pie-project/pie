@@ -133,42 +133,35 @@ struct WorkingSet {
     limit: u64,
 }
 
-/// The bodies' hold on a load that measures it: everything the card has
-/// past the least range that serves, so arming cannot come short; the
-/// range is fitted again to what the arming took ([`Pools::fit_the_card`]).
+/// The bodies' hold on a load that has not yet armed them: everything the
+/// card has past the claim (one working set and the weights the pool seats
+/// whole), so arming takes what the bodies take and cannot come short of
+/// spare memory while the card holds them; the kv pool fills what they
+/// leave, once they are captured ([`Pools::fit_and_state`]).
 pub const MEASURING: u64 = u64::MAX;
 
-/// What of `[engine] bodies_mem` comes before the guests' programs on a
-/// card with little room past one sequence: enough for the decode bodies,
-/// which are what a serve replays every step and cost tens of megabytes
-/// each.
-pub const BODIES_FLOOR_BYTES: u64 = 512 << 20;
-
-/// What the graph bodies may take while they arm: the configured allowance
-/// (or what they took when this deployment last armed whole), within `room`,
-/// what is left for them and the cache rows once one sequence and the
-/// guests' programs are seated. It bounds arming and no more: the load's
-/// last fit comes after the bodies are captured and gives the cache rows
-/// everything they left ([`Pools::fit_and_state`]), so no part of the room
-/// is kept from the bodies for rows' sake. A load arms every composition or
-/// is refused, and a lattice held under its allowance for the rows' sake
-/// was a load refused with room on the card.
-#[must_use]
-pub fn bodies_allowance(configured: u64, room: u64) -> u64 {
-    configured.min(room)
-}
-
-/// What is held for the bodies and the guests' programs together on a
-/// card with `spare` bytes past one sequence, in the order they yield: the
-/// bodies' floor first, since a load with no armed body walks every step
-/// eagerly and that is no serve, then the programs, then the bodies' share
-/// of what is left. Returns `(bodies, programs)`.
-#[must_use]
-pub fn holds_within(configured: u64, programs: u64, spare: u64) -> (u64, u64) {
-    let floor = configured.min(BODIES_FLOOR_BYTES).min(spare);
-    let programs = programs.min(spare.saturating_sub(floor));
-    let bodies = bodies_allowance(configured, spare.saturating_sub(programs)).max(floor);
-    (bodies, programs)
+/// What the fit holds beside its claim, ahead of the kv pool's fill: the
+/// bodies first (what they take where it is measured, every byte past the
+/// claim where they are still to arm, [`MEASURING`]), then the guests'
+/// programs. `live` is the card's room for the claim and the holds; the kv
+/// pool fills only what is past the holds. Returns `(bodies, programs)`.
+///
+/// # Errors
+/// What the card has past the claim, where the bodies' measured figure is
+/// more than that.
+pub fn holds(
+    claim: u64,
+    live: u64,
+    bodies: u64,
+    programs: u64,
+) -> core::result::Result<(u64, u64), u64> {
+    let spare = live.saturating_sub(claim);
+    let bodies = match bodies {
+        MEASURING => spare.saturating_sub(programs),
+        bodies if bodies > spare => return Err(spare),
+        bodies => bodies,
+    };
+    Ok((bodies, programs.min(spare - bodies)))
 }
 
 /// The largest token budget at or under `max_tokens`, halving toward
@@ -1257,7 +1250,15 @@ impl Pools {
     /// beside the null chunk (its kv pages, its windowed pages and its
     /// recurrent record), and what it holds for the bodies and the guests'
     /// programs beside it.
-    fn working_set(&self, pages: u64, bodies: u64, programs: u64, live: u64) -> WorkingSet {
+    /// Errs with what the card has past the claim where that is under the
+    /// bodies' measured figure ([`holds`]).
+    fn working_set(
+        &self,
+        pages: u64,
+        bodies: u64,
+        programs: u64,
+        live: u64,
+    ) -> core::result::Result<WorkingSet, u64> {
         let slots = u32::from(self.has_state());
         let least = chunks_at(self.chunks.layout(), &self.paging, pages, slots);
         let need = self.chunk_bytes(least);
@@ -1276,24 +1277,18 @@ impl Pools {
             } else {
                 need
             });
-        let spare = live.saturating_sub(claim);
-        let (bodies, programs) = if bodies == MEASURING {
-            let programs = programs.min(spare);
-            (spare - programs, programs)
-        } else {
-            holds_within(bodies, programs, spare)
-        };
+        let (bodies, programs) = holds(claim, live, bodies, programs)?;
         let room = live.saturating_sub(programs.saturating_add(bodies));
         // Whole map units of the room, in whole chunks, of the range's.
         let unit = self.chunks.map_unit().max(1);
-        WorkingSet {
+        Ok(WorkingSet {
             least,
             need,
             bodies,
             programs,
             room,
             limit: self.budget.unwrap_or(room) / unit * unit,
-        }
+        })
     }
 
     /// Sizes the pool to the card: every whole chunk the card has room for,
@@ -1303,9 +1298,10 @@ impl Pools {
     /// this load puts on the device is resident, and again after arming,
     /// when the bodies have taken what they take and the rest is the pool's.
     /// `programs` is held for the guests' programs throughout; `bodies` is
-    /// the allowance arming is bounded by, which `bodies_allowance` holds
-    /// within what the room affords, and both yield before that one working
-    /// set does, since a pool under it is no deployment. `resident` spells what is on
+    /// held ahead of the kv pool's fill ([`holds`]): what they took where
+    /// that is measured, refused by name where the card does not hold it
+    /// beside one working set, and everything past that working set where
+    /// they are still to arm ([`MEASURING`]). `resident` spells what is on
     /// the device already, for the refusal when not even that fits.
     /// `settled` says the activation has reached its high water: every
     /// composition fired while the bodies armed.
@@ -1401,14 +1397,15 @@ impl Pools {
         // its kv pages, its windowed pages and its recurrent record.
         let mut one_slot = u64::from(self.paging.pages_per_slot).min(self.ceiling);
         // A declared context is the model's, not the operator's: where this
-        // fit does not seat one working set at it beside the programs and
-        // the bodies' floor, it is served at the longest the fit does.
+        // fit does not seat one working set at it beside the programs (and a
+        // recorded figure for the bodies), it is served at the longest the
+        // fit does.
         if self.declared && !settled {
-            let floor = bodies.min(BODIES_FLOOR_BYTES);
             let seats = |pages: u64| {
-                let set = self.working_set(pages, bodies, programs, live);
-                set.bodies >= floor
-                    && set.programs >= programs
+                let Ok(set) = self.working_set(pages, bodies, programs, live) else {
+                    return false;
+                };
+                set.programs >= programs
                     && engine::chunk::fit(set.limit, chunk, 0, set.least).is_ok()
             };
             // Never down to a window the rows are read through.
@@ -1432,7 +1429,7 @@ impl Pools {
                     "engine-cuda: the model declares a {declared}-token context and, with \
                      everything else this load puts on the device resident, the card does not \
                      seat one sequence at it beside the guests' programs and the graph bodies' \
-                     floor; serving {} tokens. State `[engine] max_context` to choose.",
+                     record; serving {} tokens. State `[engine] max_context` to choose.",
                     self.paging.context()
                 );
             }
@@ -1444,7 +1441,17 @@ impl Pools {
             programs,
             room,
             limit,
-        } = self.working_set(one_slot, bodies, programs, live);
+        } = self
+            .working_set(one_slot, bodies, programs, live)
+            .map_err(|spare| {
+                Fault::Residency(format!(
+                    "the card does not hold this deployment's graph bodies: {resident}; past \
+                     one working set at the declared context and the weights the pool seats it \
+                     has {spare} bytes, and the bodies took {bodies} when this deployment last \
+                     armed whole. Lower `[engine] max_context`, raise `[engine.memory] \
+                     budget_device`, or free what else holds the device."
+                ))
+            })?;
         let held = programs.saturating_add(bodies);
         if let Some(budget) = self.budget.filter(|&budget| budget > room) {
             return Err(Fault::Residency(
@@ -4957,6 +4964,55 @@ fn wide(n: u64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_bodies_are_held_ahead_of_the_kv_fill_and_refused_by_name_past_the_floor() {
+        const MIB: u64 = 1 << 20;
+        // Qwen3.5-0.8B's check load on the L40S: 39602 MiB live past the
+        // weights and the span, one 32768-token sequence's 512 MiB claimed.
+        let (live, claim) = (39_602 * MIB, 512 * MIB);
+        let room = |(bodies, programs): (u64, u64)| live - bodies - programs;
+
+        // Still to arm: every byte past the claim is the bodies', and the kv
+        // pool is fitted to the claim alone until they are captured.
+        let measuring = holds(claim, live, MEASURING, 0).expect("one sequence fits");
+        assert_eq!(measuring, (live - claim, 0));
+        assert_eq!(
+            room(measuring),
+            claim,
+            "the kv fill takes nothing of their room"
+        );
+
+        // Measured: what they took is held before the kv pool fills the rest.
+        let measured = holds(claim, live, 1010 * MIB, 0).expect("they fit");
+        assert_eq!(measured, (1010 * MIB, 0));
+        assert_eq!(room(measured), live - 1010 * MIB);
+        assert_eq!(
+            holds(claim, live, live - claim, 0),
+            Ok((live - claim, 0)),
+            "a figure that exactly fits is held"
+        );
+
+        // Weights, span, bodies and the kv floor past the card: refused,
+        // with what the card has past the claim, never held down.
+        assert_eq!(holds(claim, live, live - claim + 1, 0), Err(live - claim));
+        assert_eq!(
+            holds(live + MIB, live, 1, 0),
+            Err(0),
+            "a floor past the card leaves the bodies nothing"
+        );
+        assert_eq!(
+            holds(live + MIB, live, MEASURING, 0),
+            Ok((0, 0)),
+            "and still to arm, the fit's own floor check refuses it ([`Pools::fit`])"
+        );
+
+        // The guests' programs come after the bodies.
+        assert_eq!(
+            holds(claim, live, 100 * MIB, live),
+            Ok((100 * MIB, live - claim - 100 * MIB))
+        );
+    }
 
     #[test]
     fn store_every_case() {

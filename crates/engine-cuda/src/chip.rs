@@ -23,12 +23,6 @@ pub const FACTS: &[Var] = &[
 
 pub const AXES: &[&str] = &["rows"];
 
-/// The device memory recorded bodies may take, in megabytes. Every fire is
-/// captured and replayed as a recorded body; no profile serves otherwise.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "engine.bodies_mb", constant(range(0..=1_048_576)), default = 4096, tune = engine)]
-pub struct BodiesMb(pub u32);
-
 /// Whether a window that cannot be viewed in place is copied rather than
 /// split.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -138,8 +132,7 @@ pub struct PrefillLatticeSteps(pub u32);
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     let mut r = Registry::new("cuda", FACTS, AXES);
     kernels_cuda::tuning::register(&mut r);
-    r.add::<BodiesMb>()
-        .add::<Copies>()
+    r.add::<Copies>()
         .add::<Grouped>()
         .add::<WorkingSetPercent>()
         .add::<LatticeSteps>()
@@ -240,8 +233,6 @@ pub fn facts(major: u32, minor: u32, sms: u32) -> Facts {
 /// The settings one load on this GPU runs under, read from its profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Engine {
-    /// What recorded bodies may take (`engine.bodies_mb`).
-    pub bodies_megabytes: u32,
     pub copies: bool,
     pub grouped: bool,
     pub working_set_percent: u32,
@@ -263,7 +254,6 @@ impl Engine {
     #[must_use]
     pub fn of(profile: &Profile) -> Engine {
         Engine {
-            bodies_megabytes: profile.get::<BodiesMb>().0,
             copies: profile.on::<Copies>(&Anywhere),
             grouped: profile.on::<Grouped>(&Anywhere),
             working_set_percent: profile.get::<WorkingSetPercent>().0,
@@ -370,7 +360,8 @@ mod tests {
         assert_eq!(registry().check(), Vec::<String>::new());
     }
 
-    /// Every fire is captured: no profile turns capture or bodies off.
+    /// Every fire is captured, its bodies held as the fit holds them: no
+    /// profile turns capture or bodies off or states their memory.
     #[test]
     fn a_profile_stating_graphs_or_recording_is_refused() {
         for (text, id) in [
@@ -379,6 +370,7 @@ mod tests {
                 "api = 1\n[engine]\nrecording = \"off\"\n",
                 "engine.recording",
             ),
+            ("api = 1\n[engine]\nbodies_mb = 512\n", "engine.bodies_mb"),
         ] {
             let why = registry()
                 .load_user(text, "user.toml")
@@ -386,10 +378,6 @@ mod tests {
                 .to_string();
             assert!(why.contains(&format!("`{id}` is not a decision")), "{why}");
         }
-        let bodies = registry()
-            .load_user("api = 1\n[engine]\nbodies_mb = 512\n", "user.toml")
-            .expect("the bodies' memory is a decision");
-        assert_eq!(Engine::of(&bodies).bodies_megabytes, 512);
     }
 
     #[test]
@@ -423,8 +411,6 @@ mod tests {
     }
 
     #[cfg(not(feature = "rocm"))]
-    use crate::DEFAULT_BODIES_MEGABYTES;
-
     #[test]
     fn every_checked_in_profile_dumps_to_a_file_that_reads_back_strictly() {
         for (name, text) in SEEDED {
@@ -739,7 +725,6 @@ mod tests {
         assert_eq!(
             engine,
             Engine {
-                bodies_megabytes: DEFAULT_BODIES_MEGABYTES,
                 copies: true,
                 grouped: true,
                 working_set_percent: 50,
@@ -1043,11 +1028,6 @@ mod tests {
                     prefill_lattice_from: 256,
                     prefill_lattice_steps: 8,
                     seated_first: std::ptr::eq(p, &l40s),
-                    bodies_megabytes: if std::ptr::eq(p, &l40s) {
-                        1024
-                    } else {
-                        DEFAULT_BODIES_MEGABYTES
-                    },
                     ..Engine::of(&registry().defaults())
                 }
             );
@@ -1110,7 +1090,6 @@ mod tests {
                     || (spec.id == "kernel.moe.mxfp4_fp8_from" && std::ptr::eq(p, &l40s))
                     || spec.id == "kernel.ssm.kda_chunked"
                     || (spec.id == "engine.seated_first" && std::ptr::eq(p, &l40s))
-                    || (spec.id == "engine.bodies_mb" && std::ptr::eq(p, &l40s))
                     || (spec.id == "kernel.sdpa.decode.grouped_prefill_lse"
                         && std::ptr::eq(p, &l40s))
                     || (spec.id == "kernel.sdpa.decode.grouped_prefill_window"
