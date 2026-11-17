@@ -766,7 +766,7 @@ impl Lane {
             } => {
                 let operation = plan.label();
                 let submitted = backend(engine).and_then(|engine| {
-                    crate::engine::verbs::settled(match plan {
+                    crate::engine::verbs::copied(match plan {
                         PreLaunchCopy::Kv(plan) => engine.copy_kv(&plan),
                         PreLaunchCopy::State(plan) => engine.copy_state(&plan),
                         PreLaunchCopy::Slots(plan) => engine.copy_slots(&plan),
@@ -920,7 +920,7 @@ impl Lane {
             }
             QueuedItem::CopyTracked { plan, completion } => {
                 match backend(engine).and_then(|engine| {
-                    crate::engine::verbs::settled(match plan {
+                    crate::engine::verbs::copied(match plan {
                         PreLaunchCopy::Kv(plan) => engine.copy_kv(&plan),
                         PreLaunchCopy::State(plan) => engine.copy_state(&plan),
                         PreLaunchCopy::Slots(plan) => engine.copy_slots(&plan),
@@ -966,9 +966,11 @@ impl Lane {
                         .write_host_kv(&slots, &bytes)
                         .map(|()| Vec::new())
                         .map_err(Into::into),
+                    // The read is ordered after the copy on the engine, and
+                    // waits it out (read_host_kv drains).
                     HostKvOp::CopyRead(copy, slots) => engine
                         .copy_kv(&copy)
-                        .and_then(|()| engine.read_host_kv(&slots))
+                        .and_then(|_copied| engine.read_host_kv(&slots))
                         .map_err(Into::into),
                     HostKvOp::Read(slots) => engine.read_host_kv(&slots).map_err(Into::into),
                     HostKvOp::ReadState(slots, pages) => {

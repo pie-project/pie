@@ -560,9 +560,11 @@ impl Engine for Group {
         }
     }
 
-    fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
+    /// Lands once every rank's copy has.
+    fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<engine::CopyCompletion> {
         let copy = copy.clone();
-        self.lead(move |rank| rank.copy_kv(&copy))
+        let each = self.each(move |rank| rank.copy_kv(&copy))?;
+        Ok(engine::completion::all(each))
     }
 
     /// Each rank moves its band of every slot to and from its own tiers
@@ -581,9 +583,11 @@ impl Engine for Group {
         self.lead(move |rank| rank.evacuate(&evacuation))
     }
 
-    fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
+    /// Lands once every rank's copy has.
+    fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<engine::CopyCompletion> {
         let copy = copy.clone();
-        self.lead(move |rank| rank.copy_slots(&copy))
+        let each = self.each(move |rank| rank.copy_slots(&copy))?;
+        Ok(engine::completion::all(each))
     }
 
     fn host_kv_layout(&self) -> Option<state::PageLayout> {

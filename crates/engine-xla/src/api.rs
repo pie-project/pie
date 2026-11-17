@@ -871,7 +871,7 @@ impl Engine for Xla {
         self.sink = Some(sink);
     }
 
-    fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
+    fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<engine::CopyCompletion> {
         copy.validate()?;
         let served = self
             .caps
@@ -898,7 +898,7 @@ impl Engine for Xla {
                 .collect();
             shell.copy_slots(&pairs).map_err(fault)?;
         }
-        Ok(())
+        Ok(engine::completion::copy_landed_placeholder())
     }
 
     /// The pool is fixed at load: one segment, committed whole.
@@ -963,7 +963,7 @@ impl Engine for Xla {
         Ok(self.loaded_mut()?.weight_uses())
     }
 
-    fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
+    fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<engine::CopyCompletion> {
         use crate::serve::Tier;
         let device = self.caps.as_ref().map(|caps| caps.device.domain);
         let tier = |domain| match domain {
@@ -999,7 +999,8 @@ impl Engine for Xla {
             }
             return shell
                 .copy_tier(copy.shape, from, to, &copy.slots)
-                .map_err(fault);
+                .map_err(fault)
+                .map(|()| engine::completion::copy_landed_placeholder());
         }
         let pairs: Vec<(engine::chunk::ShapeId, u32, u32)> = copy
             .slots
@@ -1008,7 +1009,7 @@ impl Engine for Xla {
             .collect();
         shell.copy_slots(&pairs).map_err(fault)?;
         if copy.runs.is_empty() {
-            return Ok(());
+            return Ok(engine::completion::copy_landed_placeholder());
         }
         if shell.pools().kv_shape() != Some(copy.shape) {
             return Err(Error::Unsupported {
@@ -1027,7 +1028,7 @@ impl Engine for Xla {
                 tokens: r.tokens,
             })
             .collect();
-        shell.copy_kv(&runs).map_err(fault)
+        shell.copy_kv(&runs).map_err(fault).map(|()| engine::completion::copy_landed_placeholder())
     }
 }
 

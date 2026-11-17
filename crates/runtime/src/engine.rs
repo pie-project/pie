@@ -56,9 +56,11 @@ pub mod verbs {
             .map_err(anyhow::Error::from)
     }
 
-    pub fn settled(result: engine::Result<()>) -> Result<SubmissionCompletion> {
+    /// A copy the engine took: settles once it has landed, not once it is
+    /// enqueued ([`::engine::Engine::copy_slots`]).
+    pub fn copied(result: engine::Result<::engine::CopyCompletion>) -> Result<SubmissionCompletion> {
         result
-            .map(|()| SubmissionCompletion::ready())
+            .map(SubmissionCompletion::copy)
             .map_err(anyhow::Error::from)
     }
 

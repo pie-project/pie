@@ -285,6 +285,9 @@ struct PendingSubmissionCompletion {
 enum SubmissionCompletionKind {
     ReadyOk,
     Pending(Arc<PendingSubmissionCompletion>),
+    /// A copy the engine took: settles once it has landed
+    /// ([`engine::Engine::copy_slots`]), not once it is enqueued.
+    Copy(engine::CopyCompletion),
 }
 
 #[derive(Clone)]
@@ -308,10 +311,17 @@ impl SubmissionCompletion {
         }
     }
 
+    /// Settles once the engine's copy has landed.
+    pub fn copy(landed: engine::CopyCompletion) -> Self {
+        Self {
+            kind: SubmissionCompletionKind::Copy(landed),
+        }
+    }
+
     pub fn wait_id(&self) -> u64 {
         match &self.kind {
             SubmissionCompletionKind::Pending(pending) => pending.state.slot,
-            SubmissionCompletionKind::ReadyOk => {
+            SubmissionCompletionKind::ReadyOk | SubmissionCompletionKind::Copy(_) => {
                 panic!("only pending submission completions expose a wait id")
             }
         }
@@ -320,7 +330,7 @@ impl SubmissionCompletion {
     pub fn target_epoch(&self) -> u64 {
         match &self.kind {
             SubmissionCompletionKind::Pending(pending) => pending.state.target_epoch,
-            SubmissionCompletionKind::ReadyOk => {
+            SubmissionCompletionKind::ReadyOk | SubmissionCompletionKind::Copy(_) => {
                 panic!("only pending submission completions expose a target epoch")
             }
         }
@@ -329,7 +339,7 @@ impl SubmissionCompletion {
     pub fn terminal_cell_ptr(&self) -> Option<CellPtr> {
         match &self.kind {
             SubmissionCompletionKind::Pending(pending) => pending.state.terminal_cell_ptr(),
-            SubmissionCompletionKind::ReadyOk => None,
+            SubmissionCompletionKind::ReadyOk | SubmissionCompletionKind::Copy(_) => None,
         }
     }
 
@@ -338,7 +348,9 @@ impl SubmissionCompletion {
             SubmissionCompletionKind::Pending(pending) => {
                 pending.state.close(pending.broker.table, message);
             }
-            SubmissionCompletionKind::ReadyOk => {}
+            // A copy enqueued lands as it lands: closing waits on nothing
+            // less.
+            SubmissionCompletionKind::ReadyOk | SubmissionCompletionKind::Copy(_) => {}
         }
     }
 
@@ -349,6 +361,9 @@ impl SubmissionCompletion {
     pub fn check(&self) -> Option<Result<()>> {
         match &self.kind {
             SubmissionCompletionKind::ReadyOk => Some(Ok(())),
+            SubmissionCompletionKind::Copy(landed) => {
+                landed.check().map(|landed| landed.map_err(anyhow::Error::from))
+            }
             SubmissionCompletionKind::Pending(pending) => {
                 if pending.state.closed.load(Ordering::Acquire) {
                     return Some(pending.state.close_error());
@@ -409,6 +424,13 @@ impl std::future::Future for SubmissionCompletion {
         let this = self.get_mut();
         match &this.kind {
             SubmissionCompletionKind::ReadyOk => Poll::Ready(Ok(())),
+            SubmissionCompletionKind::Copy(landed) => {
+                // Clones share the copy's waiters: polling one registers
+                // this task on the copy itself.
+                let mut landed = landed.clone();
+                std::future::Future::poll(std::pin::Pin::new(&mut landed), cx)
+                    .map(|landed| landed.map_err(anyhow::Error::from))
+            }
             SubmissionCompletionKind::Pending(pending) => {
                 let slot = pending.state.slot;
                 let table = pending.broker.table;

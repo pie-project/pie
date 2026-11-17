@@ -851,8 +851,11 @@ where
             .map_err(refusal)
     }
 
-    fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
-        self.loaded_mut()?.copy_slots(copy).map_err(fault)
+    fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<engine::CopyCompletion> {
+        self.loaded_mut()?
+            .copy_slots(copy)
+            .map_err(fault)
+            .map(|()| engine::completion::copy_landed_placeholder())
     }
 
     fn read_tier_slots(
@@ -1132,7 +1135,7 @@ where
         }
     }
 
-    fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
+    fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<engine::CopyCompletion> {
         copy.validate()?;
         let device = self.caps.as_ref().map(|caps| caps.device.domain);
         if device.is_none_or(|device| copy.src != device || copy.dst != device) {
@@ -1143,7 +1146,10 @@ where
         }
         let page_size = self.loaded_mut()?.paging().page_size;
         let moves = copy.runs(page_size)?;
-        self.loaded_mut()?.copy_kv(&moves).map_err(fault)
+        self.loaded_mut()?
+            .copy_kv(&moves)
+            .map_err(fault)
+            .map(|()| engine::completion::copy_landed_placeholder())
     }
 }
 

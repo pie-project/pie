@@ -286,7 +286,7 @@ impl Engine for Spatial {
 
     /// Recurrent states replay from their tokens (the program holds one
     /// sequence's): a copy is not a device move here.
-    fn copy_state(&mut self, copy: &engine::transfer::StateCopy) -> EngineResult<()> {
+    fn copy_state(&mut self, copy: &engine::transfer::StateCopy) -> EngineResult<engine::CopyCompletion> {
         let _ = copy;
         Err(Error::Unsupported {
             verb: "`copy_state` on the wafer program (its state replays from tokens)",
@@ -297,7 +297,7 @@ impl Engine for Spatial {
     /// The load states its pools pinned (`ChunkFacts::degenerate`), so the
     /// runtime moves its kv through `copy_kv`; there is no shared pool and
     /// no host or disk tier to move slots between.
-    fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
+    fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<engine::CopyCompletion> {
         let _ = copy;
         Err(Error::Unsupported {
             verb: "`copy_slots` on the wafer program (its pools are pinned, device tier only: \
@@ -329,7 +329,7 @@ impl Engine for Spatial {
         })
     }
 
-    fn copy_kv(&mut self, copy: &engine::transfer::KvCopy) -> EngineResult<()> {
+    fn copy_kv(&mut self, copy: &engine::transfer::KvCopy) -> EngineResult<engine::CopyCompletion> {
         copy.validate()?;
         let t0 = std::time::Instant::now();
         self.drain();
@@ -371,7 +371,7 @@ impl Engine for Spatial {
                 }
             }
         }
-        Ok(())
+        Ok(engine::completion::copy_landed_placeholder())
     }
 
     fn register_program(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {

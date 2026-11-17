@@ -4,6 +4,7 @@ use crate::adapter::AdapterRegistration;
 use crate::caps::DeviceFacts;
 use crate::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
 use crate::chunk::{Evacuation, SlotCopy, WeightResidency, WeightUses};
+use crate::completion::CopyCompletion;
 use crate::error::{Error, Result};
 use crate::fire::{FrameId, FrameSubmission, FrameTicket, MediaEncode, Step};
 use crate::load::{LoadRequest, Loaded};
@@ -401,9 +402,19 @@ pub trait Engine: Send {
     /// of its kv slot file. Token runs are device to device only. Each copy
     /// is ordered after every fire submitted before it and before every one
     /// after (a stream-ordered copy, or a drain), and copies in submission
-    /// order: the runtime reuses a source slot and names a destination
-    /// again as soon as the call returns.
-    fn copy_slots(&mut self, copy: &SlotCopy) -> Result<()> {
+    /// order.
+    ///
+    /// Landing (CONTRACT-BC 23): an `Ok` means the copy is enqueued, not
+    /// done. The [`CopyCompletion`] it answers resolves once the copy has
+    /// landed: its bytes in place on the destination, and nothing of it
+    /// still reading the source (CUDA / ROCm the swap stream's event past
+    /// the copy, Metal / engine-gpu the command buffer it was grafted into,
+    /// XLA its transfer future). The runtime hands neither a source nor a
+    /// destination slot to a new owner until then; it may name them in
+    /// later fires and copies of this engine before then, which the order
+    /// above serializes. Resolving it early lets a later owner's bytes be
+    /// overwritten by the copy still in flight. An `Err` enqueued nothing.
+    fn copy_slots(&mut self, copy: &SlotCopy) -> Result<CopyCompletion> {
         let _ = copy;
         Err(self.unsupported("copy_slots"))
     }
@@ -476,12 +487,18 @@ pub trait Engine: Send {
         let _ = submission;
     }
 
-    fn copy_kv(&mut self, copy: &KvCopy) -> Result<()> {
+    /// Copies kv pages between domains. Lands as [`Engine::copy_slots`]
+    /// does: the [`CopyCompletion`] resolves once the copy has landed, and
+    /// no page it names is handed to a new owner before then.
+    fn copy_kv(&mut self, copy: &KvCopy) -> Result<CopyCompletion> {
         let _ = copy;
         Err(self.unsupported("copy_kv"))
     }
 
-    fn copy_state(&mut self, copy: &StateCopy) -> Result<()> {
+    /// Copies recurrent state slots. Lands as [`Engine::copy_slots`] does:
+    /// the [`CopyCompletion`] resolves once the copy has landed, and no
+    /// slot it names is handed to a new owner before then.
+    fn copy_state(&mut self, copy: &StateCopy) -> Result<CopyCompletion> {
         let _ = copy;
         Err(self.unsupported("copy_state"))
     }
