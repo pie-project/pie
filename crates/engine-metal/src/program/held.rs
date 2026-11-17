@@ -55,6 +55,8 @@ pub struct Held {
     offset: u64,
     bytes: u64,
     place: Place,
+    /// PROBE: (logical, physical) chunk at the last (re)bind.
+    pub diag_chunk: Option<(u32, u32)>,
 }
 
 impl Held {
@@ -83,6 +85,7 @@ impl Held {
                 at,
                 host,
             },
+            diag_chunk: pools.diag_chunk(shape, slot),
         };
         region.zero()?;
         Ok(region)
@@ -130,6 +133,7 @@ impl Held {
                 at,
                 host,
             },
+            diag_chunk: pools.diag_chunk(shape, first),
         };
         region.zero()?;
         Ok(region)
@@ -144,6 +148,7 @@ impl Held {
             host,
         } = &mut self.place;
         let (buffer, offset, base, _) = pools.slot_place(*shape, *slot)?;
+        self.diag_chunk = pools.diag_chunk(*shape, *slot);
         self.buffer = buffer;
         self.offset = offset + *at;
         // SAFETY: as in `in_slot`.
