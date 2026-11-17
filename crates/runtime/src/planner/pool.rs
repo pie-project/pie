@@ -992,6 +992,15 @@ pub trait PoolPort: Send + Sync + 'static {
         wanted: usize,
     ) -> Option<crate::store::kv::KvResidencyTxn>;
     fn prepare_demote(&self, room: usize) -> Option<crate::store::kv::KvResidencyTxn>;
+    /// Idle cache a `retention/tiers` row keeps off the device, to move
+    /// down now.
+    fn prepare_demote_now(&self) -> Option<crate::store::kv::KvResidencyTxn> {
+        None
+    }
+    /// Idle cache a `retention/tiers` row allows nowhere it is, dropped now.
+    fn drop_disallowed(&self) -> usize {
+        0
+    }
     /// [`Self::prepare_sweep`] of the tails past the heads `order` names
     /// alone: those heads stay however few pages move.
     fn prepare_tail_sweep(
@@ -2005,6 +2014,27 @@ impl PoolPort for RegistryPool {
         .inspect_err(|error| tracing::warn!(%error, "planner: demote prepare failed"))
         .ok()
         .flatten()
+    }
+
+    fn prepare_demote_now(&self) -> Option<crate::store::kv::KvResidencyTxn> {
+        if !self.suspend_capable {
+            return None;
+        }
+        self.with_kv_tagged("planner-demote", |kv| {
+            kv.prepare_demote_now(crate::policy::retention::Installed)
+        })
+        .inspect_err(|error| tracing::warn!(%error, "planner: demote prepare failed"))
+        .ok()
+        .flatten()
+    }
+
+    fn drop_disallowed(&self) -> usize {
+        self.with_kv_tagged("planner-tiers", |kv| {
+            Ok::<_, crate::store::kv::KvStoreError>(
+                kv.drop_disallowed(crate::policy::retention::Installed),
+            )
+        })
+        .unwrap_or(0)
     }
 
     fn prepare_spill(&self, room: usize) -> Option<crate::store::kv::KvSpillTxn> {

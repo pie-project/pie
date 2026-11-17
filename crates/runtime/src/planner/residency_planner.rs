@@ -1128,6 +1128,35 @@ impl ResidencyPlanner {
         self.demote_done(moved);
     }
 
+    /// The retention table changed: idle cache its tiers rows allow
+    /// nowhere it is goes now, and what they keep off the device moves
+    /// down now, with no waiter's want.
+    pub fn sweep_tiers(self: &Arc<Self>) {
+        tracing::debug!(target: "pie::retention", busy = self.demoting.load(Ordering::Acquire), "tiers sweep");
+        if self.port.drop_disallowed() > 0 {
+            self.re_arm_idle_reclaim();
+            self.poke();
+        }
+        if self.demoting.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let txn = self.port.prepare_demote_now();
+        tracing::debug!(target: "pie::retention", moves = txn.is_some(), "tiers sweep: demote now");
+        match txn {
+            Some(txn) => exec::spawn_move_out(self.clone(), txn, "demote", Self::tiers_done),
+            None => self.demoting.store(false, Ordering::Release),
+        }
+    }
+
+    /// A move a tiers row asked for landed: the next group goes, until none
+    /// is left.
+    fn tiers_done(self: &Arc<Self>, moved: bool) {
+        self.demote_done(moved);
+        if moved {
+            self.sweep_tiers();
+        }
+    }
+
     fn demote_done(self: &Arc<Self>, moved: bool) {
         ptrace!("demote done moved={}", moved);
         self.with_inner(|inner| inner.settle_eviction(DEMOTE));
