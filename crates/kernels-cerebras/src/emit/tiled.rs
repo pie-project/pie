@@ -15,6 +15,8 @@
 
 use std::fmt::Write as _;
 
+use super::placed::{At, Placed, Span};
+
 use poem_ir::ValueId;
 
 use crate::emit::grid::{GridArray, GridFill};
@@ -442,29 +444,26 @@ fn filler_file() -> String {
 /// `layout.csl`: loops over the array's parity classes, the colours' route rules.
 #[allow(clippy::too_many_lines)]
 fn layout_file(p: &TileProgram) -> String {
+    placed(p).csl()
+}
+
+/// The program's placement: the image array's PEs (each its shifts' parities), the hub, the
+/// tape, the fillers; the shifts', the weight tree's, the broadcast's and the tape's routes.
+#[must_use]
+pub fn placed(p: &TileProgram) -> Placed {
     let (fw, fh) = p.fabric();
     let (gx, gy) = (p.gx, p.gy);
-    let mut t = format!(
-        "// A tiled grid reading's wafer program (kernels-cerebras emit::tiled): {fw} x {fh} PEs, an image array of {gx} x {gy}.\nconst memcpy = @import_module(\"<memcpy/get_params>\", .{{ .width = {fw}, .height = {fh} }});\nlayout {{\n  @set_rectangle({fw}, {fh});\n"
+    let mut l = Placed::new(
+        format!(
+            "// A tiled grid reading's wafer program (kernels-cerebras emit::tiled): {fw} x {fh} PEs, an image array of {gx} x {gy}."
+        ),
+        fw,
+        fh,
     );
-    // a rule: colour `c` on fabric x in [x0, x1) step sx, y in [y0, y1) step sy (the routes
-    // after every PE's code)
-    let mut rt = String::new();
-    let mut rule = |c: u32, xs: (u32, u32, u32), ys: (u32, u32, u32), rx: &str, tx: &[&str]| {
-        if xs.0 >= xs.1 || ys.0 >= ys.1 || tx.is_empty() {
-            return;
-        }
-        let _ = writeln!(
-            rt,
-            "  for (@range(u16, {}, {}, {})) |x| {{ for (@range(u16, {}, {}, {})) |y| {{ @set_color_config(x, y, @get_color({c}), .{{ .routes = .{{ .rx = .{{ {rx} }}, .tx = .{{ {} }} }} }}); }} }}",
-            xs.0,
-            xs.1,
-            xs.2,
-            ys.0,
-            ys.1,
-            ys.2,
-            tx.join(", ")
-        );
+    // a rule: colour `c` on fabric x in [x0, x1) step sx, y in [y0, y1) step sy
+    let mut routes: Vec<(u32, At, &'static str, Vec<&'static str>)> = Vec::new();
+    let mut rule = |c: u32, xs: Span, ys: Span, rx: &'static str, tx: &[&'static str]| {
+        routes.push((c, At::Region(xs, ys), rx, tx.to_vec()));
     };
     let all_y = (0, gy, 1);
     // the shifts (image X at fabric x = X + 1): a PE of parity q sends on colour q and
@@ -502,8 +501,8 @@ fn layout_file(p: &TileProgram) -> String {
     rule(T, (gx, gx + 1, 1), all_y, "WEST", &["RAMP"]);
     // the broadcast tree: the hub west into the corner, up the last column, west along the rows
     rule(B, (gx + 1, gx + 2, 1), (gy - 1, gy, 1), "RAMP", &["WEST"]);
-    let rw: &[&str] = if gx > 1 { &["RAMP", "WEST"] } else { &["RAMP"] };
-    let rwn: Vec<&str> = rw.iter().copied().chain(["NORTH"]).collect();
+    let rw: &[&'static str] = if gx > 1 { &["RAMP", "WEST"] } else { &["RAMP"] };
+    let rwn: Vec<&'static str> = rw.iter().copied().chain(["NORTH"]).collect();
     rule(
         B,
         (gx, gx + 1, 1),
@@ -534,11 +533,8 @@ fn layout_file(p: &TileProgram) -> String {
         let (a, b) = (p.tape_at(k), p.tape_at(k - 1));
         let (to, from) = dir(a, b);
         let c = A[(k % 2) as usize];
-        let _ = writeln!(
-            rt,
-            "  @set_color_config({}, {}, @get_color({c}), .{{ .routes = .{{ .rx = .{{ RAMP }}, .tx = .{{ {to} }} }} }});\n  @set_color_config({}, {}, @get_color({c}), .{{ .routes = .{{ .rx = .{{ {from} }}, .tx = .{{ RAMP }} }} }});",
-            a.0, a.1, b.0, b.1
-        );
+        routes.push((c, At::Pe(a.0, a.1), "RAMP", vec![to]));
+        routes.push((c, At::Pe(b.0, b.1), from, vec!["RAMP"]));
     }
     // the code
     for px in 0..2u32 {
@@ -547,28 +543,29 @@ fn layout_file(p: &TileProgram) -> String {
             if x0 > gx || y0 >= gy {
                 continue;
             }
-            let _ = writeln!(
-                t,
-                "  for (@range(u16, {x0}, {}, 2)) |x| {{ const mp = memcpy.get_params(x); for (@range(u16, {y0}, {gy}, 2)) |y| {{ @set_tile_code(x, y, \"tpe.csl\", .{{ .memcpy_params = mp, .C_EO = {}, .C_EI = {}, .C_WO = {}, .C_WI = {}, .C_SO = {}, .C_SI = {}, .C_NO = {}, .C_NI = {}, .C_T = {T}, .C_B = {B} }}); }} }}",
-                gx + 1,
-                E[px as usize],
-                E[1 - px as usize],
-                W[px as usize],
-                W[1 - px as usize],
-                S[py as usize],
-                S[1 - py as usize],
-                N[py as usize],
-                N[1 - py as usize],
+            let c = |v: u32| v.to_string();
+            l.tile(
+                At::Region((x0, gx + 1, 2), (y0, gy, 2)),
+                "tpe.csl",
+                &[
+                    ("C_EO", c(E[px as usize])),
+                    ("C_EI", c(E[1 - px as usize])),
+                    ("C_WO", c(W[px as usize])),
+                    ("C_WI", c(W[1 - px as usize])),
+                    ("C_SO", c(S[py as usize])),
+                    ("C_SI", c(S[1 - py as usize])),
+                    ("C_NO", c(N[py as usize])),
+                    ("C_NI", c(N[1 - py as usize])),
+                    ("C_T", c(T)),
+                    ("C_B", c(B)),
+                ],
             );
         }
     }
-    let _ = writeln!(
-        t,
-        "  @set_tile_code({}, {}, \"thub.csl\", .{{ .memcpy_params = memcpy.get_params({}), .C_I = {}, .C_B = {B} }});",
-        gx + 1,
-        gy - 1,
-        gx + 1,
-        E[cpar]
+    l.tile(
+        At::Pe(gx + 1, gy - 1),
+        "thub.csl",
+        &[("C_I", E[cpar].to_string()), ("C_B", B.to_string())],
     );
     let mut used = std::collections::BTreeSet::new();
     for k in 0..p.tape {
@@ -576,37 +573,29 @@ fn layout_file(p: &TileProgram) -> String {
         used.insert((x, y));
         let co = if k == 0 { T } else { A[(k % 2) as usize] };
         let ci = A[((k + 1) % 2) as usize];
-        let _ = writeln!(
-            t,
-            "  @set_tile_code({x}, {y}, \"ttape.csl\", .{{ .memcpy_params = memcpy.get_params({x}), .C_O = {co}, .C_I = {ci} }});"
+        l.tile(
+            At::Pe(x, y),
+            "ttape.csl",
+            &[("C_O", co.to_string()), ("C_I", ci.to_string())],
         );
     }
     // the rest: the spine, the hub's column but its row, the tape rows' remainder
     for y in 0..gy {
-        let _ = writeln!(
-            t,
-            "  @set_tile_code(0, {y}, \"filler.csl\", .{{ .memcpy_params = memcpy.get_params(0) }});"
-        );
+        l.tile(At::Pe(0, y), "filler.csl", &[]);
     }
     for y in 0..gy.saturating_sub(1) {
-        let _ = writeln!(
-            t,
-            "  @set_tile_code({}, {y}, \"filler.csl\", .{{ .memcpy_params = memcpy.get_params({}) }});",
-            gx + 1,
-            gx + 1
-        );
+        l.tile(At::Pe(gx + 1, y), "filler.csl", &[]);
     }
     for y in gy..fh {
         for x in 0..fw {
             if !used.contains(&(x, y)) {
-                let _ = writeln!(
-                    t,
-                    "  @set_tile_code({x}, {y}, \"filler.csl\", .{{ .memcpy_params = memcpy.get_params({x}) }});"
-                );
+                l.tile(At::Pe(x, y), "filler.csl", &[]);
             }
         }
     }
-    t.push_str(&rt);
+    for (c, at, rx, tx) in routes {
+        l.route(c, at, rx, &tx);
+    }
     for (n, ty) in [
         ("tsc", "u32"),
         ("pcfg", "u32"),
@@ -614,10 +603,9 @@ fn layout_file(p: &TileProgram) -> String {
         ("hout", "f32"),
         ("tape", "u32"),
     ] {
-        let _ = writeln!(t, "  @export_name(\"{n}\", [*]{ty}, true);");
+        l.export(n, ty);
     }
-    t.push_str("  @export_name(\"run\", fn() void);\n}\n");
-    t
+    l
 }
 
 /// The image PEs' place in fabric coordinates.

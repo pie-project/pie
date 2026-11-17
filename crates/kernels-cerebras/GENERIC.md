@@ -2403,6 +2403,34 @@ milestone's tail.
 - A load's fallbacks are the search's next two; `wafer-compile search --cold 1` prices nothing by
   a measurement.
 
+## Consolidation, part C: one placement IR
+
+- **Design.** Every regime's program is, to cslc and to the check, the same thing: a rectangle of
+  PEs; regions of it each running one code file with its parameters (a role: an array PE, a
+  tape PE, a line or chain member, a hub, a filler); each colour's route over a region (what it
+  takes from, what it sends to); the symbols the host writes and reads. `emit::placed::Placed`
+  states exactly that (regions as column and row spans, or one PE; a route's colour, receive
+  and sends; the exports), and one printer writes it (`Placed::csl`). Each regime is a
+  constructor of a `Placed` (its own geometry: the GEMM regime's array and tapes, the tiled
+  regime's image array, hub and tape snake, the grid and stream regimes' units), and the
+  readers take it as it is: the static check (`check::layout_ir`, no text to parse), the cost
+  models where they read placement (the lines' lengths, the tapes' rows), and the search, which
+  prices every regime's constructor and takes the cheapest (`stream::compile_whole` today, over
+  stream and GEMM). What stays a regime's own: its PE code files and its host arrays (their
+  words are what the regime computes, not where it sits).
+- **Migration, one regime at a time, each byte for byte** (`layout.csl` and every other file
+  the same):
+  - **GEMM** (`emit::gemm::placed`): its array, tapes, lines, trees and chains as regions; the
+    check over klein's 1024² program reads the IR. flux2-mini's denoise (and a batch of 2) and
+    the GQA text program identical.
+  - **Tiled** (`emit::tiled::placed`): the image array's parities, the hub, the tape's snake (its
+    PEs one at a time), the fillers. flux2-mini's and klein's VAE programs identical.
+  - Lines: `placed.rs` +158; gemm.rs +29 / -33 (its layout printer is the IR's now); tiled.rs
+    +55 / -67; the check +68 / -6 (it reads a placement as well as text). Net **+205**: two
+    regimes do not pay for the IR. What would: the grid and stream emitters' layouts (their
+    per-PE route and tile writers, about 150 lines each) and the check's CSL parser (about 300)
+    once every regime states a `Placed`; the decode programs (routes from rcfg) stay outside it.
+
 ## G1: the poem survey
 
 **Goal.** Every `.poem` in `models/` runs: it compiles with no per-model code (placement searched
