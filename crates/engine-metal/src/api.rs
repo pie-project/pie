@@ -949,6 +949,45 @@ impl Engine for Metal {
             .map_err(fault)
     }
 
+    /// The plan here; the libraries and pipelines in the compile, off this
+    /// thread (cold, a sampler's take 0.1-0.4 s on an M1 Max).
+    fn prepare_program(
+        &mut self,
+        registration: &ProgramRegistration,
+    ) -> EngineResult<engine::ProgramCompile> {
+        let registering = self
+            .loaded_mut()?
+            .prepare_program(registration)
+            .map_err(fault)?;
+        Ok(Box::new(move || {
+            engine::Prepared(Box::new(registering.compile()))
+        }))
+    }
+
+    fn finish_program(&mut self, prepared: engine::Prepared) -> EngineResult<ProgramId> {
+        let registered = prepared
+            .0
+            .downcast::<crate::program::Registered>()
+            .map_err(|_| {
+                engine::Error::Program("a prepared program this engine did not prepare".into())
+            })?;
+        let shell = self.loaded_mut()?;
+        let before = shell.program_compilations();
+        let id = shell.finish_program(*registered).map_err(fault)?;
+        // The compile's regions count at the finish: a registration after
+        // ready that compiled guest code is one the prewarm did not prepare.
+        let built = shell.program_compilations() - before;
+        if built > 0 {
+            self.live.tally(engine::live::Tally::BuiltAfterReady, built);
+            tracing::warn!(
+                program = id.0,
+                regions = built,
+                "metal: a registration after ready compiled guest code the prewarm did not"
+            );
+        }
+        Ok(id)
+    }
+
     fn adapter_key(&self, binding: &engine::InstanceBinding) -> EngineResult<Option<u128>> {
         adapter_key_of(self.loaded()?, binding.program, &binding.seeds)
     }
