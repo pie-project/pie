@@ -6,7 +6,10 @@
 //! among every rung timed (to [`PAST_TOP`] times the fire top, so a top set
 //! too low shows). The narrowest and widest rungs, both picks and any
 //! width asked are dissected: replayed and walked node by node on fresh
-//! loads, each node's device time rolled up by the kind of work it is.
+//! loads, each node's device time rolled up by the kind of work it is. A
+//! rung is dissected as its check fire shapes it ([`RungFacts::check_fire`]):
+//! a decode-shaped rung as its decode step (a lane a token), a prompt-shaped
+//! one as its prompt, each kind on a load of its own.
 //!
 //! An engine offers the check its loads through [`Bench`] and [`Loaded`];
 //! everything else (the rungs timed, the warm fires, the median, the picks,
@@ -247,8 +250,9 @@ fn timed_rungs(weighed: &Weighed) -> Vec<RungFacts> {
 
 /// The check of the estimate on `bench`'s model: every rung timed, the two
 /// picks weighed, `also` (rung widths) dissected beside the narrowest, the
-/// widest and both picks. `say` hears the report as it is made; the
-/// verdict is [`Checked::passes`].
+/// widest and both picks, each as its check fire shapes it (a decode-shaped
+/// rung as decode). `say` hears the report as it is made; the verdict is
+/// [`Checked::passes`].
 pub fn check(
     bench: &mut dyn Bench,
     also: &[u32],
@@ -367,37 +371,50 @@ pub fn check(
         .iter()
         .filter_map(|&t| Some((rungs.iter().position(|r| r.tokens == t)?, t)))
         .collect();
-    let shell = shell_for(dissected.iter().map(|&(_, t)| prompt(t)), PAGE);
-    // The rung loop's fires ran back to back across every rung, and a card's
-    // clocks fall as it heats: a walk timed after a fresh load would meet a
-    // cooler card. Each dissected fire is replayed again on a fresh load, as
-    // its walk is, by the same count of fires.
-    let mut replayed = Vec::with_capacity(dissected.len());
-    {
-        let mut load = bench.load(Run::Replayed, Some(shell))?;
-        for &(_, width) in &dissected {
-            let f = timed(&mut *load, prompt(width))?;
-            if !f.replayed {
-                return Err(format!(
-                    "a fire of {width} tokens of {model} was walked, not replayed, on the \
-                     dissection's replay load"
-                ));
-            }
-            replayed.push(f.ns);
-        }
-    }
     let launch_ns = e.rates.launch_ns;
-    let mut load = bench.load(Run::Walked, Some(shell))?;
-    for (&(k, width), replayed) in dissected.iter().zip(replayed) {
-        let walk = timed(&mut *load, prompt(width))?.ns;
-        let d = load.dissect(prompt(width))?;
-        say(&dissection(
-            width,
-            (meas[k], replayed, est[k], walk),
-            rungs[k].launches,
-            launch_ns,
-            d,
-        ));
+    // Each kind of fire (decode steps, prompts) is dissected on loads of its
+    // own, sized from its fires, as the rung loop timed it.
+    for decode in [true, false] {
+        let kind: Vec<(usize, u32)> = dissected
+            .iter()
+            .copied()
+            .filter(|&(k, _)| rungs[k].decode_shaped() == decode)
+            .collect();
+        if kind.is_empty() {
+            continue;
+        }
+        let shell = shell_for(kind.iter().map(|&(k, _)| rungs[k].check_fire()), PAGE);
+        // The rung loop's fires ran back to back across every rung, and a
+        // card's clocks fall as it heats: a walk timed after a fresh load
+        // would meet a cooler card. Each dissected fire is replayed again on
+        // a fresh load, as its walk is, by the same count of fires.
+        let mut replayed = Vec::with_capacity(kind.len());
+        {
+            let mut load = bench.load(Run::Replayed, Some(shell))?;
+            for &(k, width) in &kind {
+                let f = timed(&mut *load, rungs[k].check_fire())?;
+                if !f.replayed {
+                    return Err(format!(
+                        "a fire of {width} tokens of {model} was walked, not replayed, on the \
+                         dissection's replay load"
+                    ));
+                }
+                replayed.push(f.ns);
+            }
+        }
+        let mut load = bench.load(Run::Walked, Some(shell))?;
+        for (&(k, width), replayed) in kind.iter().zip(replayed) {
+            let fire = rungs[k].check_fire();
+            let walk = timed(&mut *load, fire)?.ns;
+            let d = load.dissect(fire)?;
+            say(&dissection(
+                width,
+                (meas[k], replayed, est[k], walk),
+                rungs[k].launches,
+                launch_ns,
+                d,
+            ));
+        }
     }
     Ok(Checked {
         model,
