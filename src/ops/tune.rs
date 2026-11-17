@@ -90,15 +90,13 @@ pub fn run(args: TuneArgs) -> Result<Answer> {
     };
     let req = runtime::engine::profiles::TuneRequest {
         full: args.full,
-        profiles: &dir,
-        artifacts: &artifacts,
         check: &args.check,
         no_check: args.no_check,
-        cache: &cache,
         refit: args.refit,
         gemm_only: args.gemm_only,
         #[cfg(feature = "engine-cuda")]
         served_cuda: &served_cuda,
+        ..runtime::engine::profiles::TuneRequest::at(&dir, &artifacts, &cache)
     };
     let tuned = tune(&req, &mut say).map_err(|e| anyhow!(e))?;
 

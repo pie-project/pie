@@ -50,6 +50,39 @@ pub struct TuneRequest<'a> {
     pub served_cuda: engine_cuda::tune::Served<'a>,
 }
 
+impl<'a> TuneRequest<'a> {
+    /// A quick tune over these directories, every choice off: what a caller
+    /// fills the rest of a request from (`..TuneRequest::at(..)`), so a
+    /// field this build carries under a feature the caller's crate does not
+    /// see (the workspace's feature unification turns `engine-cuda` on here
+    /// for one member and not another) still has its value.
+    #[must_use]
+    pub fn at(profiles: &'a Path, artifacts: &'a Path, cache: &'a Path) -> TuneRequest<'a> {
+        TuneRequest {
+            full: false,
+            profiles,
+            artifacts,
+            check: &[],
+            no_check: false,
+            cache,
+            refit: false,
+            gemm_only: false,
+            #[cfg(feature = "engine-cuda")]
+            served_cuda: &unserved_cuda,
+        }
+    }
+}
+
+/// The served load of a request whose caller states none: refused by name.
+#[cfg(feature = "engine-cuda")]
+fn unserved_cuda(_: &Path) -> Result<(engine_cuda::DeviceBoot, engine::load::LoadRequest), String> {
+    Err(
+        "the caller of this tune was built without engine-cuda, so it states no served CUDA \
+         load for the tune to time"
+            .to_owned(),
+    )
+}
+
 /// What a tune produced.
 pub struct Tuned {
     pub device: String,
