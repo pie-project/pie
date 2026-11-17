@@ -27,13 +27,22 @@ pub enum Finish {
     ToolCalls,
     /// A stop sequence appeared.
     StopSequence,
+    /// The host stopped it (a policy's terminate): the tokens so far stand,
+    /// and [`Outcome::stop_reason`] says why.
+    Abort,
 }
+
+/// How a fire refused because the host stopped the process reads: this,
+/// then the reason. The runtime's `policy::STOPPED`.
+pub const STOPPED: &str = "stopped by policy: ";
 
 #[derive(Clone, Debug)]
 pub struct Outcome {
     pub finish: Finish,
     /// The stop sequence that ended generation, when one did.
     pub stop_sequence: Option<String>,
+    /// Why the host stopped it, when it did ([`Finish::Abort`]).
+    pub stop_reason: Option<String>,
     pub prompt_tokens: usize,
     pub cached_tokens: usize,
     pub completion_tokens: usize,
@@ -203,7 +212,7 @@ pub async fn run(req: &Request, sink: impl FnMut(Event)) -> Result<Outcome, Stri
             }
         }
     };
-    let done = generate(
+    let ran = generate(
         &prompt,
         req.sampling,
         req.max_tokens.saturating_sub(continued.len()),
@@ -211,8 +220,19 @@ pub async fn run(req: &Request, sink: impl FnMut(Event)) -> Result<Outcome, Stri
         &mut on_prompt,
         &mut on_token,
     )
-    .await?;
-    let sampled = done.sampled;
+    .await;
+    // Stopped by the host, it ends here with what it sampled.
+    let mut stop_reason = None;
+    let sampled = match ran {
+        Ok(done) => done.sampled,
+        Err(e) => match e.find(STOPPED) {
+            Some(at) => {
+                stop_reason = Some(e[at + STOPPED.len()..].to_string());
+                generated as usize - continued.len()
+            }
+            None => return Err(e),
+        },
+    };
     let cached_tokens = inferlet::session::cached_tokens() as usize;
     let mut sink = sink.into_inner();
     if let Some(e) = error {
@@ -226,6 +246,7 @@ pub async fn run(req: &Request, sink: impl FnMut(Event)) -> Result<Outcome, Stri
     }
 
     let mut finish = match out.finish {
+        _ if stop_reason.is_some() => Finish::Abort,
         Some(f) => f,
         None if guide.as_ref().is_some_and(|g| g.is_terminated()) => Finish::Stop,
         None => Finish::Length,
@@ -240,6 +261,7 @@ pub async fn run(req: &Request, sink: impl FnMut(Event)) -> Result<Outcome, Stri
     Ok(Outcome {
         finish,
         stop_sequence: out.stop_hit.and_then(|i| req.stop.get(i).cloned()),
+        stop_reason,
         prompt_tokens: prompt.tokens.len() - continued,
         cached_tokens: cached_tokens.min(prompt.tokens.len() - continued),
         completion_tokens: sampled + continued,

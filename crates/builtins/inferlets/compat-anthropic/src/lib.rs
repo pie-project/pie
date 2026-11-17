@@ -307,6 +307,8 @@ fn stop_reason(finish: Finish) -> &'static str {
         Finish::Length => "max_tokens",
         Finish::ToolCalls => "tool_use",
         Finish::StopSequence => "stop_sequence",
+        // Anthropic names no host stop; the turn ended as the host said.
+        Finish::Abort => "end_turn",
     }
 }
 
