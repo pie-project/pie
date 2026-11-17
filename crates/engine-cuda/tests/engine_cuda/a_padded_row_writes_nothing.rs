@@ -74,10 +74,7 @@ fn shell(trace: poem::Trace, path: &Path) -> Shell {
         context_declared: false,
         ordinal: 0,
         knobs: engine_cuda::Knobs {
-            chip: Some(engine_cuda::chip::pinned(
-                Graphs::Off,
-                Some(Recording::Shaped),
-            )),
+            pin: Some((Graphs::Off, Some(Recording::Shaped))),
             ..engine_cuda::Knobs::default()
         },
         cache_dir: None,

@@ -80,8 +80,6 @@ fn stage(
         poem::import::own_contract(&source, &trace.params, 1, Platform::Cuda)
             .expect("a container of the plan's own planes is read by its own names");
     drop(source);
-    let graphs = if graphs { "on" } else { "off" };
-    let chip = engine_cuda::chip::profile(&format!("[engine]\ngraphs = \"{graphs}\"\n"));
     engine_cuda::device::ctx::bind_thread(ordinal).unwrap();
     let staged = Shell::stage(engine_cuda::Boot {
         trace: trace.clone(),
@@ -98,7 +96,8 @@ fn stage(
         context_declared: false,
         ordinal,
         knobs: engine_cuda::Knobs {
-            chip: Some(chip),
+            chip: Some(engine_cuda::chip::profile("")),
+            pin: (!graphs).then_some((engine_cuda::Graphs::Off, None)),
             diagnostics: crate::micro::diagnostics(),
             ..engine_cuda::Knobs::default()
         },

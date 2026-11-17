@@ -201,7 +201,7 @@ impl Cuda {
         // the routed banks it takes an expert at a time: the plan seats none
         // itself.
         let diagnostics = &self.boot.knobs.diagnostics;
-        let cached = if diagnostics.dense_weights || diagnostics.dense_experts {
+        let cached = if self.boot.knobs.dense_weights() || diagnostics.dense_experts {
             Vec::new()
         } else {
             crate::store::layout::streamed_experts(trace)

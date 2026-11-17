@@ -38,7 +38,7 @@ moe.mxfp4_mma_per_from = 4
 
 [engine]
 seated_first = true
-recording = { use = "bodies", mem_mb = 1024 }
+bodies_mb = 1024
 forward_tokens = 2304
 prefill_lattice_steps = 8
 
@@ -88,9 +88,8 @@ measured = [
   "engine.copies",
   "engine.forward_tokens",
   "engine.prefill_lattice_steps",
-  "engine.graphs",
   "engine.lattice_steps",
-  "engine.recording",
+  "engine.bodies_mb",
   "engine.working_set_percent",
   "fuse.qkv_fused_qknorm_rope_vnorm_write",
   "compiler.cond_fixed_us",

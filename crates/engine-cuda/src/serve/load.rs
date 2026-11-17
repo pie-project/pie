@@ -19,7 +19,7 @@ use crate::store::kv::{self, Paging};
 use crate::store::rs::Buffers;
 use crate::weights::Weights;
 
-use super::{Boot, Golden, Graphs, Released, Shell};
+use super::{Boot, Golden, Released, Shell};
 
 /// The least `max_forward_tokens` is served at when the card is short: one
 /// prefill chunk a frame, which serves, and under it the halving stops.
@@ -128,7 +128,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         }
     }
     // So do the routed banks it streams an expert at a time.
-    if !boot.knobs.diagnostics.dense_weights && !boot.knobs.diagnostics.dense_experts {
+    if !boot.knobs.dense_weights() && !boot.knobs.diagnostics.dense_experts {
         let banks = crate::store::layout::streamed_experts(&boot.trace);
         match host_copy(boot, &banks)? {
             HostCopy::Filed => {
@@ -231,7 +231,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // the pinned host tier: a row not cached is read from it in place. Told
     // of the trace as the load runs it: a table whose gather a rewrite
     // above folded into another op is read whole, and stays on the device.
-    if !boot.knobs.diagnostics.dense_weights {
+    if !boot.knobs.dense_weights() {
         let streamed = crate::store::layout::streamed_rows(&boot.trace);
         match host_copy(boot, &streamed)? {
             HostCopy::Filed => {
@@ -946,6 +946,7 @@ impl Shell {
                 crate::device::free_bytes().unwrap_or(0) >> 20
             );
         }
+        let (graphs, recording) = boot.knobs.modes(engine.bodies_megabytes);
         let (compiled, budgets, tiles) = refit(
             &mut boot,
             &device,
@@ -1109,7 +1110,7 @@ impl Shell {
             } else {
                 boot.residency.cached_experts()
             },
-            !boot.knobs.diagnostics.dense_weights,
+            !boot.knobs.dense_weights(),
             boot.knobs.diagnostics.one_window,
         )?;
         if boot.knobs.diagnostics.arm_trace {
@@ -1427,7 +1428,7 @@ impl Shell {
             expert_staged: expert_staging.at(crate::sizing::STAND_IN),
             expert_staging,
             exports,
-            graphs: engine.graphs,
+            graphs,
             copies: engine.copies,
             seated_first: engine.seated_first,
             seat_to_end: engine.seat_to_end,
@@ -1439,10 +1440,10 @@ impl Shell {
                 engine.prefill_lattice_from,
                 engine.prefill_lattice_steps,
             )),
-            pad: engine.recording.pad(),
+            pad: recording.pad(),
             golden_arm: Golden::Off,
-            bodies: engine.recording.bodies(),
-            bodies_mem: (engine.recording.bodies_mem() as usize).saturating_mul(1 << 20),
+            bodies: recording.bodies(),
+            bodies_mem: (recording.bodies_mem() as usize).saturating_mul(1 << 20),
             bodies_record: None,
             bodies_from_record: false,
             arming_at_load: false,
@@ -1478,23 +1479,12 @@ impl Shell {
             rs_ahead: std::collections::HashMap::new(),
             _released: Released,
         };
-        if !shell.graphs.records() {
+        if !shell.graphs.records() || !shell.bodies {
             eprintln!(
-                "engine-cuda: engine.graphs is {}, a diagnostic mode — every fire \
-                 walks eagerly (~470 kernel launches of host time per decode step) \
-                 with nothing captured; a profile serves `on` with bodies",
-                match shell.graphs {
-                    Graphs::Off => "off",
-                    Graphs::Shaped => "shaped",
-                    Graphs::On => "on",
-                }
-            );
-        } else if !shell.bodies {
-            eprintln!(
-                "engine-cuda: engine.recording keeps no bodies under engine.graphs = on, a \
-                 diagnostic arm — bodies are the only recorded path, so every fire walks \
-                 eagerly (~470 kernel launches of host time per decode step) with nothing \
-                 captured; a profile serves `bodies`"
+                "engine-cuda: a test's pinned modes ({:?}, {recording:?}): every fire \
+                 walks eagerly (~470 kernel launches of host time per decode step) with \
+                 nothing captured",
+                shell.graphs
             );
         }
         // The cache rows are declared last, from what the card has left: once

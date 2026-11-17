@@ -160,7 +160,7 @@ fn load(trace: &Trace, joins: &[Join], unjoined: &Trace, tag: &str) -> (Shell, S
         // body records it, and capturing every composition of eleven rows
         // twice was most of this test's time.
         knobs: engine_cuda::Knobs {
-            chip: Some(engine_cuda::chip::profile("[engine]\ngraphs = \"off\"\n")),
+            pin: Some((engine_cuda::Graphs::Off, None)),
             ..engine_cuda::Knobs::default()
         },
         cache_dir: None,

@@ -89,9 +89,7 @@ fn logits(trace: &Trace, container: &Path, mega: bool, prompt: &[u32]) -> Vec<f3
         poem::import::own_contract(&source, &trace.params, 1, Platform::Cuda)
             .expect("a container of the plan's own planes is read by its own names");
     drop(source);
-    let chip = engine_cuda::chip::profile(&format!(
-        "[engine]\ngraphs = \"off\"\n[fuse]\nmoe_mega = {mega}\n"
-    ));
+    let chip = engine_cuda::chip::profile(&format!("[fuse]\nmoe_mega = {mega}\n"));
     let staged = Shell::stage(engine_cuda::Boot {
         trace: trace.clone(),
         contract: &contract,
@@ -108,6 +106,7 @@ fn logits(trace: &Trace, container: &Path, mega: bool, prompt: &[u32]) -> Vec<f3
         ordinal: 0,
         knobs: engine_cuda::Knobs {
             chip: Some(chip),
+            pin: Some((engine_cuda::Graphs::Off, None)),
             ..engine_cuda::Knobs::default()
         },
         cache_dir: None,
