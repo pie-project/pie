@@ -79,28 +79,55 @@ fn full_pool(trace: &poem_ir::Trace, page_size: u32, context: u32, slots: u32) -
     None
 }
 
-/// The instance's and the pair's guest state (`Shell::guest_state`) as runs
-/// of `Instance` slots from `first`, the scratch first and the pair's tables
-/// after it, both short of the chunk `first` lies in.
+/// The instance's and the pair's guest state (`Shell::guest_state`) as the
+/// runtime holds it: what fits a chunk's slots as runs of `Instance` slots
+/// from `first` (the scratch first, the pair's tables after it, both short
+/// of the chunk `first` lies in), and what does not as whole runs of
+/// `state.run` adjacent chunks from the second segment's first chunk,
+/// committed first as the runtime commits a segment it binds in.
 fn guest_places(
-    shell: &engine_metal::Shell,
+    shell: &mut engine_metal::Shell,
     program: engine::ProgramId,
     extents: &eta_exec::Extents,
     first: u32,
 ) -> (engine::ScratchPlace, engine::ScratchPlace) {
-    let instance = shell.pool_layout().instance.expect("an instance shape");
+    let layout = shell.pool_layout();
+    let instance = layout.instance.expect("an instance shape");
     let state = shell.guest_state(program, extents).expect("the guest state");
+    let unit = u64::from(instance.per_chunk) * instance.slot_bytes;
     let slots = |bytes: u64| u32::try_from(bytes.div_ceil(instance.slot_bytes)).expect("a slot count");
-    let run = |first: u32, slots: u32| match slots {
-        0 => engine::ScratchPlace::None,
-        _ => engine::ScratchPlace::Run { first, slots },
-    };
-    let scratch = slots(state.per_instance);
-    let pair = slots(state.per_pair);
+    let mut next_chunk = layout.segment_chunks;
+    let mut next_slot = first;
     let end = (first / instance.per_chunk + 1) * instance.per_chunk;
-    assert!(
-        first + scratch + pair < end,
-        "the guest state ({scratch} + {pair} slots from {first}) fits its chunk"
-    );
-    (run(first, scratch), run(first + scratch, pair))
+    let mut place = |bytes: u64| -> engine::ScratchPlace {
+        if bytes == 0 {
+            return engine::ScratchPlace::None;
+        }
+        if bytes <= unit {
+            let taken = slots(bytes);
+            let at = next_slot;
+            next_slot += taken;
+            assert!(next_slot < end, "the guest state's slots from {first} fit their chunk");
+            return engine::ScratchPlace::Run { first: at, slots: taken };
+        }
+        let run = state.run.max(1);
+        let pieces = u32::try_from(bytes.div_ceil(u64::from(run) * layout.chunk_bytes))
+            .expect("a piece count");
+        let firsts: Vec<u32> = (0..pieces).map(|nth| next_chunk + nth * run).collect();
+        next_chunk += pieces * run;
+        assert!(
+            next_chunk <= 2 * layout.segment_chunks && next_chunk <= layout.total_chunks,
+            "the guest state's runs lie inside the second segment"
+        );
+        engine::ScratchPlace::Chunks { run, pieces: firsts }
+    };
+    let scratch = place(state.per_instance);
+    let pair = place(state.per_pair);
+    if [&scratch, &pair]
+        .iter()
+        .any(|held| matches!(held, engine::ScratchPlace::Chunks { .. }))
+    {
+        shell.commit_segments(2).expect("the second segment commits");
+    }
+    (scratch, pair)
 }

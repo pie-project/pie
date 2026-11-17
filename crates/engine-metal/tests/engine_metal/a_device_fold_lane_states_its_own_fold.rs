@@ -174,7 +174,7 @@ fn fire_with_fold(lanes: u32, fold: &[u32]) -> Option<String> {
         ..eta_exec::Extents::default()
     };
     let (scratch, pair) =
-        crate::guest_places(&shell, program, &extents, slots[slots.len() - 1] + 1);
+        crate::guest_places(&mut shell, program, &extents, slots[slots.len() - 1] + 1);
     let id = shell
         .bind_program(
             program,

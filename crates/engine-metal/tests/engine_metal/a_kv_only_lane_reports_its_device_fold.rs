@@ -138,7 +138,7 @@ fn report(shell: &mut Shell, vocab: u32, tokens: &[u32], fold: bool, slot: u32) 
         ..eta_exec::Extents::default()
     };
     let (scratch, pair) =
-        crate::guest_places(&shell, program, &extents, slots[slots.len() - 1] + 1);
+        crate::guest_places(shell, program, &extents, slots[slots.len() - 1] + 1);
     let id = shell
         .bind_program(
             program,

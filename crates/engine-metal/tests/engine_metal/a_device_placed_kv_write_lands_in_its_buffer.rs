@@ -163,7 +163,7 @@ fn serve(
             ..eta_exec::Extents::default()
         };
         let (scratch, pair) =
-            crate::guest_places(&shell, program, &extents, slots[slots.len() - 1] + 1);
+            crate::guest_places(shell, program, &extents, slots[slots.len() - 1] + 1);
         let id = shell
             .bind_program(
                 program,

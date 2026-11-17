@@ -83,9 +83,10 @@ fn layout_of(
 /// The `Instance` room guest state lies in: a chunk's slots (`unit` bytes)
 /// lie at adjacent addresses, and so do the chunks of a run inside one
 /// segment of `segment` chunks (a pool part holds whole segments, one
-/// buffer). A piece is a run of `run` chunks from its first; a state that
-/// fits a chunk's slots holds one run of slots, a state of more holds that
-/// many whole runs of chunks of `chunk` bytes (`engine::ScratchPlace`).
+/// buffer). A state that fits a chunk's slots holds one run of slots; a
+/// state of more holds whole runs of `run` chunks, each chunk all `chunk`
+/// of its bytes (its slots and the tail past its last), so a piece is
+/// `run x chunk` bytes from its run's first chunk (`engine::ScratchPlace`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Room {
     /// The bytes of one chunk's `Instance` slots.
@@ -109,37 +110,25 @@ impl Room {
         })
     }
 
-    /// The same room, a piece `run` chunks. A run past one chunk reads
-    /// across chunks as one range, so a chunk's slots must fill it whole:
-    /// a gap past a chunk's last slot is refused by name.
+    /// The same room, a piece `run` chunks.
     pub fn at_run(self, run: u32) -> Result<Room> {
-        if run > 1 && self.unit != self.chunk {
-            return Err(Fault::program(
-                "program::launch",
-                format!(
-                    "a guest's piece of {run} chunks: a chunk's Instance slots hold {} of its {} \
-                     bytes, so the chunks of a run do not lie one after another",
-                    self.unit, self.chunk
-                ),
-            ));
-        }
         Ok(Room {
             run: run.max(1),
             ..self
         })
     }
 
-    /// A piece's bytes: its run's chunks' slots.
+    /// A piece's bytes: its run's chunks, whole.
     #[must_use]
     pub fn piece(self) -> u64 {
-        self.unit.saturating_mul(u64::from(self.run.max(1)))
+        self.chunk.saturating_mul(u64::from(self.run.max(1)))
     }
 
-    /// What a stage's scratch is laid in: chunks of a chunk's slots, a
-    /// segment's of them, a piece at least this room's run.
+    /// What a stage's scratch is laid in: whole chunks, a segment's of
+    /// them, a piece at least this room's run.
     #[must_use]
     pub fn pieces(self) -> eta_exec::Pieces {
-        eta_exec::Pieces::new(self.unit, self.segment).at_least(self.run.max(1))
+        eta_exec::Pieces::new(self.chunk, self.segment).at_least(self.run.max(1))
     }
 
     /// The bytes an instance holds for a stage laid as `ends` says

@@ -88,7 +88,7 @@ pub struct Pooled<'a> {
 
 /// The pieces `place` holds in the pool's `Instance` room: a run's first
 /// slot ref and bytes, or each piece's first chunk's first slot ref and the
-/// bytes of its run of chunks' slots. A run's chunks after its first lie at
+/// bytes of its run of chunks, whole. A run's chunks after its first lie at
 /// the next physical chunks of one segment (the runtime takes them so, an
 /// evacuation moves a run whole), one range from the first's address.
 pub fn pieces_of(place: &engine::ScratchPlace, pools: &Pools) -> Result<Vec<(u32, u64)>> {
@@ -108,10 +108,7 @@ pub fn pieces_of(place: &engine::ScratchPlace, pools: &Pools) -> Result<Vec<(u32
                         format!("chunk {chunk} of a guest's room lies past a u32 slot ref"),
                     )
                 })?;
-                Ok((
-                    first,
-                    u64::from(per_chunk) * slot_bytes * u64::from((*run).max(1)),
-                ))
+                Ok((first, pools.layout().chunk_bytes * u64::from((*run).max(1))))
             })
             .collect(),
     }

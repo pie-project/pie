@@ -1156,8 +1156,13 @@ impl Pools {
         let shape = *self.shape(id)?;
         let (chunk, index) = self.place(&shape, first)?;
         let chunks = chunks.max(1);
-        let run_room = (u64::from(shape.per_chunk) * u64::from(chunks) - u64::from(index))
-            * shape.slot_bytes;
+        // A run of slots in one chunk holds its slots; a run of chunks
+        // holds them whole, each chunk all its bytes.
+        let run_room = if chunks == 1 {
+            u64::from(shape.per_chunk - index) * shape.slot_bytes
+        } else {
+            u64::from(chunks) * self.layout.chunk_bytes - u64::from(index) * shape.slot_bytes
+        };
         if at.saturating_add(len) > run_room {
             return Err(Fault::Ceiling {
                 what: "bytes of a run of slots inside its chunks",
