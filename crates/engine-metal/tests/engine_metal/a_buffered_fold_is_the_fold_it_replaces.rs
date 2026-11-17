@@ -394,6 +394,113 @@ fn a_gdn_buffered_fold_is_the_fold_it_replaces() {
     }
 }
 
+/// A lane replaying rows it buffered, in a fire beside a folding lane (a
+/// decode or a prompt piece of another sequence), answers as it does in a
+/// fire of its own: its logits, and the state its replay folds; the folding
+/// lane answers as alone too. A beam's lanes replay their lineage beside
+/// other sequences' decodes so. (engine-gpu's suite and CUDA's
+/// golden_logits state it so, sc/np-beam-beside 7a77ff0a6: CUDA shared a
+/// scratch plane by index across window shapes.)
+#[test]
+fn a_replaying_lane_beside_a_folding_lane_answers_as_alone() {
+    if let Some(shell) = ready_gdn() {
+        replays_beside_a_fold(shell);
+    }
+}
+
+fn replays_beside_a_fold(mut shell: Shell) {
+    let planes = planes_of(&shell);
+    let fold = RsVerb::Fold;
+    let tokens = window(11);
+    let next = window(101);
+    let third = window(203);
+    let k = WINDOW as u32;
+    let (fresh, held) = (RsReset::Fresh, RsReset::Held);
+    let buffered = buffer(0, 0);
+    let replay = buffer_over(k + 1, 0, 0);
+    let replay_fold = buffer_over(k + 2, 0, k + 1);
+    // One lane's fire, or a peer folding `third` fresh beside it.
+    let run = |shell: &mut Shell, slot: u32, beside: Option<u32>| {
+        shell.open(slot).expect("the slot opens");
+        shell
+            .fire_seated(&[seated(slot, &tokens, &buffered, fresh)])
+            .expect("the buffering fire runs");
+        let mut answers = Vec::new();
+        for (rows, verb, at) in [(&next[..1], &replay, k), (&next[1..2], &replay_fold, k + 1)] {
+            let out = match beside {
+                None => shell
+                    .fire_seated(&[seated_at(slot, rows, verb, held, at)])
+                    .expect("the replaying fire runs")
+                    .swap_remove(0),
+                Some(peer) => {
+                    shell.open(peer).expect("the peer opens");
+                    shell
+                        .fire_seated(&[
+                            seated(peer, &third, &fold, fresh),
+                            seated_at(slot, rows, verb, held, at),
+                        ])
+                        .expect("the mixed fire runs")
+                        .swap_remove(1)
+                }
+            };
+            answers.push(out);
+        }
+        (answers, shell.state_bytes(slot).expect("the slot reads back"))
+    };
+    let (alone, alone_state) = run(&mut shell, 0, None);
+    let (beside, beside_state) = run(&mut shell, 1, Some(2));
+    shell.open(3).expect("slot 3 opens");
+    let peer_alone = shell
+        .fire_seated(&[seated(3, &third, &fold, fresh)])
+        .expect("the peer alone")
+        .swap_remove(0);
+    shell.open(2).expect("slot 2 opens");
+    shell.open(1).expect("slot 1 opens");
+    shell
+        .fire_seated(&[seated(1, &tokens, &buffered, fresh)])
+        .expect("the buffering fire runs");
+    let peer_beside = shell
+        .fire_seated(&[
+            seated(2, &third, &fold, fresh),
+            seated_at(1, &next[..1], &replay, held, k),
+        ])
+        .expect("the mixed fire runs")
+        .swap_remove(0);
+    // The scale a state is measured against: two different folds' distance.
+    shell.open(3).expect("slot 3 opens");
+    shell
+        .fire_seated(&[seated(3, &tokens[..3], &fold, fresh)])
+        .expect("the short fold runs");
+    let short = shell.state_bytes(3).expect("slot 3");
+    let scale = distance(&short, &alone_state, &planes, false).expect("float planes only");
+    for (at, (a, b)) in alone.iter().zip(&beside).enumerate() {
+        let d = spread(a, b);
+        eprintln!(
+            "replaying row {at} beside a folding lane vs alone, logit spread {d:.4} \
+             (argmax {} vs {})",
+            argmax(b),
+            argmax(a)
+        );
+        assert!(
+            d <= LOGIT_FLOOR,
+            "replaying row {at} answers {d} apart beside a folding lane"
+        );
+    }
+    assert_same_state(
+        &beside_state,
+        &alone_state,
+        "the state a replay folds beside a folding lane",
+        &planes,
+        scale,
+    );
+    let d = spread(&peer_alone, &peer_beside);
+    eprintln!("the folding lane beside a replay vs alone, logit spread {d:.4}");
+    assert!(
+        d <= LOGIT_FLOOR,
+        "the folding lane answers {d} apart beside a replay"
+    );
+}
+
 /// A buffering fire leaves the state as it was; a fold replaying it is the
 /// fold it deferred, at any length; a folding lane beside a buffering one
 /// answers as alone; and rounds of a two-row window with a rejected row
