@@ -741,6 +741,103 @@ pub fn layout(r: &Reader, u: &Unit, py: u32, tile: u32, spill: bool, widen: u32)
     Ok(layout_fewest(r, u, py, tile, spill, want).unwrap_or(l0))
 }
 
+/// Words column root `col` holds as emitted: its held rows ([`held_words`]), the values it
+/// holds (each received into a row buffer and rounded in a 16-bit one) and, for each column
+/// region it runs, the printed module's chunk-wide arrays (its rows in, results,
+/// scratch rows and per-column tables: `[C]` arrays, a 16-bit one half a word), its chunk's
+/// each. `printed` caches a region's arrays a column by (step, chunk).
+fn root_words(
+    r: &Reader,
+    u: &Unit,
+    l: &Layout,
+    col: u32,
+    printed: &mut BTreeMap<(usize, u32, u32), u32>,
+) -> u32 {
+    // the values it holds, each received into a row buffer and rounded in a 16-bit one
+    let mut w = held_words(u, l, col)
+        + l.cols
+            .get(col as usize)
+            .map_or(0, |ss| ss.iter().map(|s| s.len * 3 / 2).sum::<u32>());
+    for (i, s) in u.steps.iter().enumerate() {
+        let Step::Region {
+            side: Side::Col,
+            chain,
+        } = s
+        else {
+            continue;
+        };
+        let at = l.region_of(Side::Col, &chain.region, &region_cols(r, chain));
+        if at.roots == 0 || col < at.first || col >= at.first + at.roots {
+            continue;
+        }
+        let halves = *printed
+            .entry((i, at.chunk, at.roots))
+            .or_insert_with(|| region_halves(chain, &at));
+        w += at.chunk * halves / 2;
+    }
+    w
+}
+
+/// [`root_words`] and the code room the search holds back ([`crate::check::CODE_RESERVE`]) past a
+/// PE's bytes by more than the static check's miss ([`crate::check::PeBytes::overflows`]).
+fn root_over(
+    r: &Reader,
+    u: &Unit,
+    l: &Layout,
+    col: u32,
+    printed: &mut BTreeMap<(usize, u32, u32), u32>,
+) -> bool {
+    crate::check::PeBytes {
+        data: 4 * i64::from(root_words(r, u, l, col, printed)),
+        code: crate::check::CODE_RESERVE,
+    }
+    .overflows()
+}
+
+/// A column region's chunk-wide arrays printed at `chunk` columns, in 16-bit halves a column
+/// (0 where it does not print alone: its program's check counts it).
+fn region_halves(chain: &poem_compiler::fuse::chain::Chain, at: &RegionAt) -> u32 {
+    let params = chain
+        .region
+        .params
+        .iter()
+        .map(|&s| {
+            if s == kernels_ir::Shape::Scalar {
+                crate::emit::region::ParamAt::Scalar
+            } else {
+                crate::emit::region::ParamAt::Row
+            }
+        })
+        .collect();
+    let place = crate::emit::region::Place {
+        chunk: at.chunk,
+        // (as the build prints it: a head region whole at each root it runs at)
+        roots: if at.reps > 1 || at.chunk == chain.region.width && at.roots > 1 {
+            1
+        } else {
+            at.roots
+        },
+        params,
+        round16: true,
+        rope_lv: 1,
+        rope_bits: 0,
+        straddle: true,
+        columns: None,
+    };
+    let Ok(p) = crate::emit::region::print(&chain.region, &place) else {
+        return 0;
+    };
+    let mut halves = 0;
+    for line in p.csl.lines().filter(|l| l.starts_with("var ")) {
+        for (pat, h) in [("[C]f32", 2), ("[C]u16", 1), ("[C]@fp16()", 1)] {
+            if line.contains(&format!("@zeros({pat})")) {
+                halves += h;
+            }
+        }
+    }
+    halves
+}
+
 /// A layout's worst tile past the budget: (rest roots, the root, its words, its matvecs' (step,
 /// words)).
 type OverTile = (u32, u32, u32, Vec<(usize, u32)>);
@@ -774,6 +871,10 @@ fn layout_fewest(r: &Reader, u: &Unit, py: u32, tile: u32, spill: bool, from: u3
     }
     let mut short: Option<(u32, u32)> = None;
     let mut unstored = false;
+    // the column regions' arrays a column, by (step, chunk); the last layout a root of which
+    // overflows: (rest roots, the root, its words)
+    let mut printed: BTreeMap<(usize, u32, u32), u32> = BTreeMap::new();
+    let mut over_root: Option<(u32, u32, u32)> = None;
     // the most rest roots' worst tile: its root, its words, its matvecs' (step: words)
     let mut over_tile: Option<OverTile> = None;
     for rest in from..=MAX_REST {
@@ -798,6 +899,12 @@ fn layout_fewest(r: &Reader, u: &Unit, py: u32, tile: u32, spill: bool, from: u3
             continue;
         }
         if (0..l.px()).all(|c| held_words(u, &l, c) <= ROOT_BUDGET) {
+            // a root's rows and its regions' arrays, a chunk's each, past a PE however its code
+            // is counted: more roots (a vocabulary's head region's chunk)
+            if let Some(c) = (0..l.px()).find(|&c| root_over(r, u, &l, c, &mut printed)) {
+                over_root = Some((rest, c, root_words(r, u, &l, c, &mut printed)));
+                continue;
+            }
             return Ok(Layout { spill, ..l });
         }
         // the tiles fit, the held rows not: what the fewest roots hold
@@ -811,6 +918,14 @@ fn layout_fewest(r: &Reader, u: &Unit, py: u32, tile: u32, spill: bool, from: u3
     }
     Err(match short {
         Some((h, o)) => held_refusal(u, "column", h, o),
+        None if over_root.is_some() => {
+            let (rest, c, w) = over_root.unwrap_or_default();
+            format!(
+                "{}: its column roots' rows and region arrays past a PE at every count up to \
+                 {MAX_REST} (at {rest} rest roots, root {c}: {w} words)",
+                u.name
+            )
+        }
         None if unstored => format!(
             "{}: its row store ({} rows of {} words) fits beside the tiles at no column roots \
              up to {MAX_REST}",
