@@ -1144,6 +1144,13 @@ impl Range {
         if crate::sizing::active() {
             return Ok(Commit::Committed);
         }
+        // A span held from `from` already covering `bytes` leaves what is
+        // held as it is, and what is held is backed: nothing to commit. A
+        // bind holds the same span again on every program it lays, and the
+        // walk below spells out every unit of the range to find that out.
+        if self.held(from) >= bytes {
+            return Ok(Commit::Committed);
+        }
         let mut held = self.held.clone();
         match held.iter_mut().find(|span| span.0 == from) {
             Some(span) => span.1 = span.1.max(bytes),
