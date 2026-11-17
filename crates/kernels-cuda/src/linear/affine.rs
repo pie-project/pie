@@ -257,7 +257,7 @@ fn dense_affine(
         && !seat.streams()
         && y.rows <= AFFINE_MMA_UNTIL
         && k.is_multiple_of(64)
-        && ctx.tuning().affine_mma
+        && ctx.tuning().affine_mma()
     {
         return affine_w4a16_mma(ctx, op, act, codes, scales, biases, y, n, k);
     }

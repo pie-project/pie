@@ -407,7 +407,7 @@ pub fn matmul(
     }
     // cuBLASLt takes the rows in whole fours; the padding rows are zero.
     let mpad = m.div_ceil(4) * 4;
-    let workspace = (ctx.tuning().gemm_workspace_mb as usize) << 20;
+    let workspace = (ctx.tuning().gemm_workspace_mb() as usize) << 20;
     let Some((handle, plan)) = plan_for(mpad, n, k, workspace, false) else {
         return Ok(false);
     };
@@ -584,7 +584,7 @@ pub fn matmul_mx(
     }
     // the rows in whole 128s, the scales' tile: the padding rows' products are dropped
     let mpad = m.div_ceil(128) * 128;
-    let workspace = (ctx.tuning().gemm_workspace_mb as usize) << 20;
+    let workspace = (ctx.tuning().gemm_workspace_mb() as usize) << 20;
     let Some((handle, plan)) = plan_for(mpad, n, k, workspace, true) else {
         return Ok(false);
     };

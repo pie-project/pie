@@ -190,7 +190,7 @@ pub(crate) fn decode<P>(
                 geometry.block(),
             )
             .smem(geometry.smem_bytes)
-            .programmatic(ctx.tuning().pdl),
+            .programmatic(ctx.tuning().pdl()),
         ),
         &[ArgValue::of(params)],
     )

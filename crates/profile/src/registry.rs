@@ -17,7 +17,7 @@ use crate::when::When;
 pub const API: i64 = 1;
 
 /// Top-level keys that are not decisions.
-const RESERVED: [&str; 3] = ["api", "target", "provenance"];
+const RESERVED: [&str; 4] = ["api", "target", "provenance", "rates"];
 
 /// A typed ladder, and the flag it raises when evaluated at a point.
 type Build = fn(
@@ -109,6 +109,8 @@ pub struct File {
     pub measured: Vec<&'static str>,
     /// Decisions the file spells, by id.
     pub entries: BTreeMap<&'static str, Vec<Rung>>,
+    /// `[rates]` ([`crate::fire`]).
+    pub tuned: crate::fire::Tuned,
 }
 
 impl Registry {
@@ -359,6 +361,7 @@ impl Registry {
                     }
                 }
                 "target" => file.target = walk.target(value),
+                "rates" => file.tuned.rates = walk.rates(value),
                 "provenance" => match value.get_ref() {
                     DeValue::Table(t) => {
                         for (k, v) in t.iter() {
@@ -964,6 +967,166 @@ impl<'a> Walk<'a> {
                 None
             }
         }
+    }
+
+    fn rates(&mut self, value: &Spanned<DeValue<'_>>) -> crate::fire::Rates {
+        let mut rates = crate::fire::Rates::default();
+        let DeValue::Table(t) = value.get_ref() else {
+            self.err(value.span().start, "`rates` is a table");
+            return rates;
+        };
+        let positive = |v: &DeValue<'_>| {
+            let f = match v {
+                DeValue::Float(f) => f.as_str().replace('_', "").parse::<f64>().ok(),
+                DeValue::Integer(_) => int(v).map(|i| i as f64),
+                _ => None,
+            };
+            f.filter(|f| f.is_finite() && *f > 0.0)
+        };
+        for (k, v) in t.iter() {
+            let slot = match k.get_ref().as_ref() {
+                "gemm_tflops_by_rows" => {
+                    rates.gemm_tflops_by_rows = self.width_curves(v);
+                    continue;
+                }
+                key @ "attn_tflops_by_keys" => {
+                    rates.attn_tflops_by_keys = self.curve(v, key);
+                    continue;
+                }
+                "elementwise_gbps" => &mut rates.elementwise_gbps,
+                "hbm_gbps" => &mut rates.hbm_gbps,
+                "scan_gelems" => &mut rates.scan_gelems,
+                "launch_ns" => {
+                    match int(v.get_ref()).and_then(|i| u64::try_from(i).ok()) {
+                        Some(ns) => rates.launch_ns = Some(ns),
+                        None => self.err(
+                            v.span().start,
+                            format!(
+                                "`rates.launch_ns` is a whole number of nanoseconds, not {}",
+                                found(v.get_ref())
+                            ),
+                        ),
+                    }
+                    continue;
+                }
+                other => {
+                    self.err(
+                        k.span().start,
+                        format!(
+                            "`rates` holds `launch_ns`, `gemm_tflops_by_rows`, \
+                             `attn_tflops_by_keys`, `hbm_gbps`, `elementwise_gbps` and \
+                             `scan_gelems`, not `{other}`"
+                        ),
+                    );
+                    continue;
+                }
+            };
+            match positive(v.get_ref()) {
+                Some(f) => *slot = Some(f),
+                None => self.err(
+                    v.span().start,
+                    format!(
+                        "`rates.{}` is a positive number, not {}",
+                        k.get_ref(),
+                        found(v.get_ref())
+                    ),
+                ),
+            }
+        }
+        rates
+    }
+
+    /// `rates.gemm_tflops_by_rows`: `[width, curve]` pairs, a whole positive
+    /// width and a curve of `[rows, TFLOP/s]` each, strictly ascending in
+    /// width.
+    fn width_curves(
+        &mut self,
+        value: &Spanned<DeValue<'_>>,
+    ) -> Option<Vec<(u32, Vec<(u32, f64)>)>> {
+        const WHAT: &str = "`rates.gemm_tflops_by_rows` is a non-empty list of [width, [[rows, \
+                            TFLOP/s], ...]] pairs, ascending in width";
+        let DeValue::Array(widths) = value.get_ref() else {
+            self.err(
+                value.span().start,
+                format!("{WHAT}, not {}", found(value.get_ref())),
+            );
+            return None;
+        };
+        let mut out: Vec<(u32, Vec<(u32, f64)>)> = Vec::with_capacity(widths.len());
+        for entry in widths.iter() {
+            let pair = match entry.get_ref() {
+                DeValue::Array(pair) if pair.len() == 2 => int(pair[0].get_ref())
+                    .and_then(|i| u32::try_from(i).ok())
+                    .filter(|&w| w > 0)
+                    .map(|w| (w, &pair[1])),
+                _ => None,
+            };
+            let Some((width, curve)) = pair.filter(|&(w, _)| out.last().is_none_or(|l| w > l.0))
+            else {
+                self.err(
+                    entry.span().start,
+                    format!("{WHAT}, not {}", found(entry.get_ref())),
+                );
+                return None;
+            };
+            out.push((width, self.curve(curve, "gemm_tflops_by_rows")?));
+        }
+        if out.is_empty() {
+            self.err(value.span().start, format!("{WHAT}, not an empty list"));
+            return None;
+        }
+        Some(out)
+    }
+
+    /// `rates.<key>`: `[x, rate]` pairs, a whole positive `x` and a positive
+    /// rate each, non-empty and strictly ascending in `x`.
+    fn curve(&mut self, value: &Spanned<DeValue<'_>>, key: &str) -> Option<Vec<(u32, f64)>> {
+        let what = format!(
+            "`rates.{key}` is a non-empty list of [x, rate] pairs, ascending in x, each rate \
+             positive"
+        );
+        let DeValue::Array(points) = value.get_ref() else {
+            self.err(
+                value.span().start,
+                format!("{what}, not {}", found(value.get_ref())),
+            );
+            return None;
+        };
+        let mut curve: Vec<(u32, f64)> = Vec::with_capacity(points.len());
+        for point in points.iter() {
+            let pair = match point.get_ref() {
+                DeValue::Array(pair) if pair.len() == 2 => {
+                    let x = int(pair[0].get_ref())
+                        .and_then(|i| u32::try_from(i).ok())
+                        .filter(|&m| m > 0);
+                    let rate = match pair[1].get_ref() {
+                        DeValue::Float(f) => f.as_str().replace('_', "").parse::<f64>().ok(),
+                        DeValue::Integer(_) => int(pair[1].get_ref()).map(|i| i as f64),
+                        _ => None,
+                    }
+                    .filter(|f| f.is_finite() && *f > 0.0);
+                    x.zip(rate)
+                }
+                _ => None,
+            };
+            match pair {
+                Some((x, r)) if curve.last().is_none_or(|&(last, _)| x > last) => {
+                    curve.push((x, r))
+                }
+                _ => {
+                    self.err(
+                        point.span().start,
+                        format!("{what}, not {}", found(point.get_ref())),
+                    );
+                    return None;
+                }
+            }
+        }
+        if curve.is_empty() {
+            self.err(value.span().start, format!("{what}, not an empty list"));
+            return None;
+        }
+        Some(curve)
     }
 
     fn target(&mut self, value: &Spanned<DeValue<'_>>) -> Target {

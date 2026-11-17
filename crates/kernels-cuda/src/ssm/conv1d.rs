@@ -140,7 +140,7 @@ fn conv1d_update(
                 [(channels / CONV_VEC).div_ceil(CONV_BLOCK), n, 1],
                 [CONV_BLOCK, 1, 1],
             )
-            .programmatic(ctx.tuning().pdl),
+            .programmatic(ctx.tuning().pdl()),
         )
     } else {
         args.push(dil.arg());
@@ -246,7 +246,7 @@ fn conv1d_chunked(
         && [x.data.ptr, y.ptr, weight.ptr, state.conv_slab.ptr]
             .iter()
             .all(|&at| aligned16(at));
-    let (entrypoint, launch) = if vec8 && ctx.tuning().ssm_conv_vec4 {
+    let (entrypoint, launch) = if vec8 && ctx.tuning().ssm_conv_vec4() {
         (
             format!("::pie::ssm::conv1d_chunked_row_tile_vec4{}", out.args()),
             Launch::grid(

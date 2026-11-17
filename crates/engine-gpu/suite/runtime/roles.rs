@@ -336,6 +336,8 @@ fn an_instance_in_pool_slots_fires_through_moves() {
             instance_slots: Vec::new(),
             ring_slots: Vec::new(),
             adapter_slots: Vec::new(),
+            scratch: engine::ScratchPlace::None,
+            pair: engine::ScratchPlace::None,
         },
         &registered,
     );

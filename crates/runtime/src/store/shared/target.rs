@@ -269,7 +269,7 @@ impl SharedGrow {
                         if super::fire_cap(self.engine) > rung {
                             continue;
                         }
-                        pool.lower_rung(rung)
+                        pool.lower_notice(rung)
                     };
                     let notice = match lowered {
                         Ok(notice) => notice,
@@ -278,17 +278,33 @@ impl SharedGrow {
                             return;
                         }
                     };
-                    tracing::info!(engine = self.engine, rung, "the activation rung is lowered");
                     // Past the retire fence: the engine may give back the
                     // carve above the new rung, where it holds another (a
                     // lower that returns a dropped term's room at the rung
-                    // it holds sends nothing). A failed notice is no fault.
-                    if let Some((from, to)) = notice
-                        && let Err(error) =
-                            crate::scheduler::pool(self.engine, PoolOp::Rung { from, to }).await
-                    {
-                        tracing::warn!(engine = self.engine, %error, from, to, "a lower's notice was refused");
+                    // it holds sends nothing, and was taken). What it held
+                    // is given back to state only once the notice landed:
+                    // until then the engine lays its guests' tables and
+                    // covers a bind's term at the rung it held.
+                    if let Some((from, to)) = notice {
+                        // No lane: no engine holds a carve to come down from.
+                        let landed = match crate::scheduler::scheduler_handle(self.engine) {
+                            Ok(lane) => lane.pool(PoolOp::Rung { from, to }).await,
+                            Err(_) => Ok(()),
+                        };
+                        let mut pool = self.shared.lock().unwrap();
+                        match landed {
+                            Ok(()) => {
+                                if let Err(error) = pool.lower_landed(rung) {
+                                    tracing::warn!(engine = self.engine, %error, "the activation rung stays");
+                                }
+                            }
+                            Err(error) => {
+                                pool.lower_refused();
+                                tracing::warn!(engine = self.engine, %error, from, to, "a lower's notice was refused");
+                            }
+                        }
                     }
+                    tracing::info!(engine = self.engine, rung, "the activation rung is lowered");
                     // A bind waiting on the engine to come down looks again.
                     super::rung_changed(self.engine);
                     if let Some(planner) = crate::planner::planner_for(self.model, self.engine) {

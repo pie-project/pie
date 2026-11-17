@@ -127,7 +127,7 @@ pub fn skinny(
                 [32 * warps, 1, 1],
             )
             .smem(smem(warps, step))
-            .programmatic(ctx.tuning().pdl),
+            .programmatic(ctx.tuning().pdl()),
         ),
         &[
             ArgValue::Ptr(weight),

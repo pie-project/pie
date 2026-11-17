@@ -136,6 +136,8 @@ fn bind_fold(engine: &mut backend::Engine, slots: &mut Slots) -> InstanceId {
             instance_slots: Vec::new(),
             ring_slots: Vec::new(),
             adapter_slots: Vec::new(),
+            scratch: engine::ScratchPlace::None,
+            pair: engine::ScratchPlace::None,
             extents: engine::program::BindExtents {
                 row_count: ROWS,
                 token_count: ROWS,

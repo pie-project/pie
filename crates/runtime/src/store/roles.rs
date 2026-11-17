@@ -1811,6 +1811,7 @@ pub fn register_taken<T>(
 /// `roles`, `binding` as it is: the engine keeps it all itself.
 ///
 /// [`Engine::guest_state`]: ::engine::Engine::guest_state
+#[cfg(test)]
 pub fn bind_instance(
     roles: Option<&RolesHandle>,
     engine: &mut dyn Engine,

@@ -100,7 +100,7 @@ fn logits(trace: &Trace, container: &Path, mega: bool, prompt: &[u32]) -> Vec<f3
         page_size: PAGE,
         context: CEILING,
         slots: 1,
-        kv_budget: Some(crate::POOL),
+        kv_budget: Some(engine_cuda::store::KvSize::Bytes(crate::POOL)),
         allowance: engine::Allowance::WHOLE,
         context_declared: false,
         ordinal: 0,
@@ -134,6 +134,15 @@ fn logits(trace: &Trace, container: &Path, mega: bool, prompt: &[u32]) -> Vec<f3
 fn a_declined_mega_moe_answers_what_its_legs_answer() {
     if !engine_cuda::device::present() {
         eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    // A backend whose fusions hold no mega-MoE (ROCm) never forms one, so
+    // it has no declined one to answer for.
+    if !engine_cuda::FUSIONS
+        .iter()
+        .any(|rule| rule.kernel() == "fused.moe_mega")
+    {
+        eprintln!("skipping: this backend forms no `fused.moe_mega`");
         return;
     }
     for name in ROWS {

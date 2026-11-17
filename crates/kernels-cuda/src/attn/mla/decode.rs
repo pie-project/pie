@@ -111,10 +111,10 @@ pub(crate) mod naive {
         // fires of `kernel.sdpa.mla_wgmma_rows` rows and more: a few rows' keys
         // split wider on the 16-head kernel.
         if shape.window == 0
-            && u32::try_from(shape.total_tokens).unwrap_or(0) >= ctx.tuning().mla_wgmma_rows
+            && u32::try_from(shape.total_tokens).unwrap_or(0) >= ctx.tuning().mla_wgmma_rows()
             && (!selected || shape.top_k > 0)
             && !shape.fp8
-            && ctx.tuning().mla_wgmma
+            && ctx.tuning().mla_wgmma()
             && hopper()
             && shape.kv_lora_rank == 512
             && shape.rope_dim == 64
@@ -185,7 +185,7 @@ pub(crate) mod naive {
                     ArgValue::Ptr(part_lse),
                     ArgValue::Ptr(ptrs.selection),
                     shape.top_k.arg(),
-                    i32::from(ctx.tuning().mla_dense_short).arg(),
+                    i32::from(ctx.tuning().mla_dense_short()).arg(),
                     shape.num_requests.arg(),
                     shape.num_heads.arg(),
                     shape.page_size.arg(),
@@ -362,7 +362,7 @@ pub(crate) mod naive {
                 ArgValue::Ptr(part_lse),
                 ArgValue::Ptr(ptrs.selection),
                 shape.top_k.arg(),
-                i32::from(ctx.tuning().mla_dense_short).arg(),
+                i32::from(ctx.tuning().mla_dense_short()).arg(),
                 shape.num_requests.arg(),
                 shape.num_heads.arg(),
                 shape.page_size.arg(),

@@ -90,3 +90,12 @@ on the pool kind (`None` on a shared pool), and handle/snapshot stage by that sp
 shared pool's tier slots (sc/plex11-offload-staging). Once Cerebras states a single-shape shared pool, `with_pages`,
 `with_pool`'s pinned use, `host_pool`, `alloc_host_slots` and the split in handle/snapshot all delete, and every engine
 takes `shared_stores`.
+
+## F14 — The fire's guest term stays while engines move their scratch into guest state
+Ruling (v) makes a guest program's scratch state of its instance (`Engine::guest_state`, taken in Instance slots at
+the bind; sc/np-guest-state). Its runtime half landed additively: `Engine::fire_facts`, `FireFacts` / `GuestTerm` and
+the pool's per-fire term arithmetic (`store::shared::programs`, the rung's carve plus the term) stay, so an engine that
+still lays its guests' scratch in the fire's span keeps working until its half ports (CUDA, engine-gpu, Metal). Each
+port moves its scratch from `fire_facts` into `guest_state`; once no engine states a fire term, `fire_facts`,
+`FireFacts`, `LaidLanes`, `FirePair`, `GuestTerm`, the `FireFacts` lane item and the term's share of every rung's
+activation go, with no dual path.

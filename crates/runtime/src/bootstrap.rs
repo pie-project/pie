@@ -510,12 +510,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             d.chunks.kv_host_pages() > 0 || d.chunks.kv_disk_pages() > 0
         }
     });
-    // The lanes one fire runs on each engine: the copy-on-write sets its
-    // state pool keeps back from admission.
-    let fire_lanes: Vec<u32> = engine_configs
-        .iter()
-        .map(|d| d.limits.max_forward_requests as u32)
-        .collect();
     let seated_first = !engine_configs.is_empty() && engine_configs.iter().all(|d| d.seated_first);
     let seat_to_end = !engine_configs.is_empty() && engine_configs.iter().all(|d| d.seat_to_end);
     let seat_spread = seat_to_end && engine_configs.iter().all(|d| d.seat_spread);
@@ -611,7 +605,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             engine,
             crate::planner::ResidencyPlanner::new(std::sync::Arc::new(pool))
                 .seated_first(seated_first)
-                .cow_lanes(fire_lanes.get(engine).copied().unwrap_or(1))
                 .seat_to_end(seat_to_end)
                 .seat_spread(seat_spread)
                 .weight_shed(steered.shed_hook()),

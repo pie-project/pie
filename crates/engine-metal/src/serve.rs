@@ -1758,13 +1758,16 @@ impl Shell {
                 span_host(pools, at, bytes)
             })?;
         // The runtime backed the tables below the carve before the bind
-        // (`engine::Engine::standing_after`), and the span covers them.
-        debug_assert!(
-            bottom >= self.arena.end() - self.pools.covered(),
-            "the guests' batch tables take {} bytes under the carve, past the {} the span backs",
-            top - bottom,
-            top.saturating_sub(self.arena.end() - self.pools.covered()),
-        );
+        // (`engine::Engine::standing_after`), and the span covers them:
+        // laid past it they would lie on chunks the runtime lends to state.
+        let backed = self.arena.end() - self.pools.covered();
+        if bottom < backed {
+            return Err(Fault::Ceiling {
+                what: "bytes of the backed span under the carve for the guests' batch tables",
+                need: top - bottom,
+                have: top.saturating_sub(backed),
+            });
+        }
         self.batch_bottom = bottom;
         Ok(())
     }

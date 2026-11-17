@@ -42,6 +42,23 @@ pub struct Pool<B: Backend> {
     table: ChunkTable,
 }
 
+/// The chunks one binding holds, at least one.
+fn binding_chunks(chunk_bytes: u64, binding: u64) -> u32 {
+    u32::try_from(binding / chunk_bytes.max(1))
+        .unwrap_or(u32::MAX)
+        .max(1)
+}
+
+/// The most segments a pool of `total_chunks` is cut into with its top
+/// `span` whole in the last ([`segment_chunks`]).
+fn spanned_segments(total_chunks: u32, span: u32) -> u32 {
+    if span == 0 {
+        SEGMENTS as u32
+    } else {
+        (total_chunks / (span + SEGMENTS as u32 - 1)).min(SEGMENTS as u32)
+    }
+}
+
 /// The chunks a segment holds for a pool of `total_chunks` whose top `span`
 /// lie in its last segment: the pool cut into as many segments as it may
 /// be (the kernels bind [`SEGMENTS`]), so commits stay fine, with each
@@ -51,14 +68,8 @@ pub struct Pool<B: Backend> {
 /// `None`: no count of segments does both (the load is refused).
 #[must_use]
 pub fn segment_chunks(chunk_bytes: u64, total_chunks: u32, binding: u64, span: u32) -> Option<u32> {
-    let fits = u32::try_from(binding / chunk_bytes.max(1))
-        .unwrap_or(u32::MAX)
-        .max(1);
-    let most = if span == 0 {
-        SEGMENTS as u32
-    } else {
-        (total_chunks / (span + SEGMENTS as u32 - 1)).min(SEGMENTS as u32)
-    };
+    let fits = binding_chunks(chunk_bytes, binding);
+    let most = spanned_segments(total_chunks, span);
     let least = total_chunks.div_ceil(fits);
     (most > 0 && least <= most).then(|| total_chunks.div_ceil(most))
 }
@@ -103,6 +114,13 @@ pub fn sized(
     // State lies within that index; the span past it is the fire's
     // alone (bound by offset, never indexed), at every rung.
     let total = total.min(binds).min(words.saturating_add(act));
+    // As many segments as hold the span whole in the last, each within one
+    // binding: chunks past what those bind are not laid. A span near a
+    // binding cuts the pool into few segments, and a pool between whole
+    // counts of them binds only the lower count's.
+    let total = total.min(
+        spanned_segments(total, act).saturating_mul(binding_chunks(chunk, binding)),
+    );
     let span_short = || {
         Fault::Residency(format!(
             "one working set takes {least_chunks} chunks of {chunk} bytes beside a fire's \
@@ -505,6 +523,25 @@ mod tests {
         // the widest last segment.
         assert_eq!(segment_chunks(chunk, 64, 64 << 20, 16), None);
         assert_eq!(segment_chunks(chunk, 64, 1 << 30, 63), None);
+    }
+
+    /// Qwen3.5-0.8B on wgpu at a 12 GiB budget: 2304000-byte chunks, a
+    /// binding of 2047 MiB (931 chunks), a top rung of 922 chunks and one
+    /// working set of 455. Every segment must hold the span, so a pool of
+    /// 3500 chunks binds three segments (2793 chunks), not four: it lays
+    /// those, where it was refused for the four its chunks would take.
+    #[test]
+    fn a_pool_lays_the_chunks_its_segments_bind() {
+        const MIB: u64 = 1 << 20;
+        let (chunk, binding, act, least) = (2_304_000u64, 2047 * MIB, 922u32, 455u32);
+        assert_eq!(super::segment_chunks(chunk, 3500, binding, act), None);
+        let pool = super::sized(3500 * chunk, None, chunk, act, least, binding)
+            .expect("the chunks three segments bind");
+        assert_eq!(pool.total, 3 * 931);
+        assert!(u64::from(pool.segment_chunks) * chunk <= binding);
+        assert!(pool.total - 2 * pool.segment_chunks >= act, "the span lies in the last");
+        // A pool short of one segment holding the span is still refused.
+        assert!(super::sized(900 * chunk, None, chunk, act, least, binding).is_err());
     }
 
     /// Qwen3-8B on a 32 GiB card binding 4095 MiB (14.5 GiB of weights):

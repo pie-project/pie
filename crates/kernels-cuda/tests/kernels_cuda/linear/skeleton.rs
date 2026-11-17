@@ -459,16 +459,17 @@ fn lt_region(n: usize, gelu: bool, relu: bool, biased: bool) -> (Region, Vec<Inp
     )
 }
 
-/// cuBLASLt's own epilogue, the fused candidate the tuner times beside the
-/// skeletons and the unfused leg, lands what the anchored region states over
+/// cuBLASLt's own epilogue, at cuBLASLt's first heuristic for the product
+/// with it (what an anchored region no streaming skeleton covers runs on),
+/// lands what the anchored region states over
 /// its products as they are summed: a bias, a ReLU and a bias then a ReLU,
 /// at a decode's rows and a prefill's, within the product's sum in another
 /// order (an ulp, two over a long cancelling K; the epilogue's one rounding
 /// is the IR's), and
 /// GLM-4.7's biased banks (q, q and k and v, k and v) so. A region no
 /// cuBLASLt epilogue lands (a soft cap, a tanh GELU, a bias then one, a bias
-/// over products rounded first) is not offered to it. Through the tuner's
-/// entry a prefill's lands the same on whichever it picks.
+/// over products rounded first) is not offered to it. Through the anchored
+/// entry a prefill's lands the same.
 #[test]
 fn cublaslts_own_epilogue_lands_the_anchored_region() {
     for gelu_biased in [false, true] {
@@ -537,7 +538,8 @@ fn cublaslts_own_epilogue_lands_the_anchored_region() {
             let want = eval(&anchored, m, &av, &wv, &[], &given).expect("runs");
             let want: Vec<f32> = want[0].iter().map(|&v| round_bf16(v)).collect();
             assert_within(&what, &gpu.down::<u16>(y, m * n), &want, ONE_MORE);
-            // And through the tuner, a prefill's rows past every skeleton.
+            // And through the anchored entry, a prefill's rows past every
+            // streaming skeleton.
             if m >= 100 {
                 let y2 = gpu.zeros(m * n * 2);
                 for _ in 0..2 {
@@ -559,7 +561,7 @@ fn cublaslts_own_epilogue_lands_the_anchored_region() {
                 }
                 gpu.sync();
                 assert_within(
-                    &format!("{what}, on the tuner's pick"),
+                    &format!("{what}, through the anchored entry"),
                     &gpu.down::<u16>(y2, m * n),
                     &want,
                     ONE_MORE,
