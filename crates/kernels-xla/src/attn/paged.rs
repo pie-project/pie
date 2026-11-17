@@ -2259,7 +2259,9 @@ pub fn attend_fresh(
             // The flash read keeps the table's pages (the fresh rows are
             // told by them) and reads each plane's older pages by its map.
             let narrow = tuning.chunks.flash_narrow_rows;
-            match fresh.filter(|a| plain && super::flash::fits(f, a, r, &heads, cap_v, narrow)) {
+            match fresh.filter(|a| {
+                plain && super::flash::fits(f, a, r, &heads, cap_v, narrow, (keys, values), geom.ps)
+            }) {
                 Some(a) => super::flash::attend(
                     f,
                     &a,
@@ -2272,7 +2274,6 @@ pub fn attend_fresh(
                     qpos,
                     lo,
                     hi,
-                    window,
                     cap,
                     enabled,
                     scale,
@@ -2358,13 +2359,12 @@ pub fn attend_fresh(
 
 /// A decode over a fire's readout rows (`call.q`'s rows, at the fire rows
 /// `rows` names), each attending as the token it reads out, its position
-/// and lane in `call.tables`. Where every readout's lane holds no keys from
-/// before the fire, its keys are the rows the fire appended (`fresh`, one a
-/// fire row: `cache_rows` and `request_of_token` are the fire's), its
-/// lane's run up to itself: one blocked walk over that rectangle reads them,
-/// not a gather of every row's pages (a prompt's 32 padded lanes read 1024
-/// pages a layer). The fire decides at run time; the paged walk is the
-/// other branch, and the only one without `fresh`.
+/// and lane in `call.tables`. Its keys from this fire are the rows the fire
+/// appended (`fresh`, one a fire row: `cache_rows` and `request_of_token`
+/// are the fire's), its lane's run up to itself, read by one blocked walk
+/// over that rectangle; its lane's older keys each row copies page by page
+/// (`flash::readouts`), not a gather of every row's pages (a prompt's 32
+/// padded lanes read 1024 pages a layer). A fire without `fresh` walks.
 #[allow(clippy::too_many_arguments)]
 pub fn attend_readouts(
     f: &mut Func,
@@ -2414,18 +2414,11 @@ pub fn attend_readouts(
     let req = read_rows_i32(f, OP, request_of_token, request_of_token.rows)?;
     let lane = geom.lane_of(f, req)?;
     let q4 = f.reshape(call.q.val, &[i64::from(r), heads.kvh, heads.g, heads.d])?;
-    let walked: crate::hlo::Branch<'_> = Box::new(move |f: &mut Func| {
-        Ok(vec![walk(f).map_err(|e| crate::hlo::Malformed {
-            op: OP,
-            detail: e.to_string(),
-        })?])
-    });
     Ok(super::flash::readouts(
         f,
         &ap,
         &heads,
         &geom,
-        i64::from(pool.keys.rows),
         (pool.keys.val, pool.values.val),
         q4,
         at,
@@ -2434,7 +2427,7 @@ pub fn attend_readouts(
         window,
         f64::from(call.sm_scale),
         tuning.chunks,
-        walked,
+        tuning.vmem_cap(),
         [pool.keys_map, pool.values_map],
     )?)
 }

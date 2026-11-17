@@ -1559,7 +1559,17 @@ fn a_tall_wide_prefill_lays_its_kv_in_parts() {
 
 #[test]
 fn a_prefill_reads_the_rows_it_appended_fresh() {
-    prefill_fresh_case(IDENTITY);
+    prefill_fresh_case(IDENTITY, 20);
+}
+
+/// A lane holding 300 positions before the fire (19 pages, past the 16 a
+/// gathered rectangle once held): the flash kernel copies every one of
+/// them page by page and answers the reference, over identity and mapped
+/// planes (the values' pages a list of their own).
+#[test]
+fn a_prefill_reads_an_older_prefix_of_any_length() {
+    prefill_fresh_case(IDENTITY, 300);
+    prefill_fresh_case(MAPPED, 300);
 }
 
 /// The fresh-row read over planes laid by their own page maps: the flash
@@ -1568,19 +1578,22 @@ fn a_prefill_reads_the_rows_it_appended_fresh() {
 /// reference as the identity pool does.
 #[test]
 fn a_prefill_reads_its_fresh_rows_over_mapped_planes() {
-    prefill_fresh_case(MAPPED);
+    prefill_fresh_case(MAPPED, 20);
 }
 
-fn prefill_fresh_case(maps: (PageMap, PageMap)) {
+/// `shift`: the positions lane 1 holds before the shifted fire.
+fn prefill_fresh_case(maps: (PageMap, PageMap), shift: i32) {
     let mut rng = Rng(31);
     let (qh, kvh, d, ps) = (4usize, 2usize, 128usize, 16usize);
+    // lane 1's pages run on past the others' (room for a 300-position
+    // prefix and its 100 rows)
     let lanes: Vec<Vec<i32>> = vec![
         (0..40).collect(),
-        (40..48).collect(),
+        (40..48).chain(60..90).collect(),
         (48..52).collect(),
         (52..56).collect(),
     ];
-    let mut pool = Pool::new(&mut rng, ps, kvh, d, 60, lanes, 40).with_maps(maps);
+    let mut pool = Pool::new(&mut rng, ps, kvh, d, 90, lanes, 40).with_maps(maps);
     let runs = [(0, 0, 600), (1, 0, 100), (2, 0, 1), (3, 0, 51)];
     let fire = Fire::plain(&prefill_rows(&runs, 16));
     let rows = fire.positions.len();
@@ -1616,11 +1629,11 @@ fn prefill_fresh_case(maps: (PageMap, PageMap)) {
     let vt2 = b.bf16(rows as u32, w as u32, &v2);
     let pt = b.i32(rows as u32, 1, &page);
     let ot = b.i32(rows as u32, 1, &off);
-    // The same fire with lane 1 holding 20 positions before it: a walk.
+    // The same fire with lane 1 holding `shift` positions before it.
     let mut shifted = fire.positions.clone();
     for (p, &l) in shifted.iter_mut().zip(&fire.req) {
         if l == 1 && *p >= 0 {
-            *p += 20;
+            *p += shift;
         }
     }
     let old = Fire {
@@ -1665,8 +1678,11 @@ fn prefill_fresh_case(maps: (PageMap, PageMap)) {
             )?;
             low::attend_fresh(ctx, call, kv, read)?;
             // The shifted fire appends its rows to the pool itself: its
-            // lane 1 reads 20 older keys there, beside its own rows.
-            let read = low::kv_append(ctx, kt2, vt2, &kv, pt_old, ot_old)?;
+            // lane 1 reads `shift` older keys there, beside its own rows,
+            // read fresh as the twin's append hands them (other keys than
+            // the pool's: a walk would read the pool's).
+            low::kv_append(ctx, kt2, vt2, &kv, pt_old, ot_old)?;
+            let read = low::kv_append(ctx, kt, vt, &twin, pt_old, ot_old)?;
             let call = arbiter::prefill(
                 qr, &plan_old, &kv, None, d as u32, kvh as u32, scale, o_old, 1000,
             )?;
@@ -1695,8 +1711,9 @@ fn prefill_fresh_case(maps: (PageMap, PageMap)) {
         lanes: pool.lanes.clone(),
         ..pool
     };
-    // The device pool holds the first append, then the shifted fire's.
-    for (rows_k, rows_v, pg, of) in [(&k, &v, &page, &off), (&k2, &v2, &page_old, &off_old)] {
+    // The rows read: the first append's, then the shifted fire's as read
+    // fresh.
+    for (rows_k, rows_v, pg, of) in [(&k, &v, &page, &off), (&k, &v, &page_old, &off_old)] {
         for (i, &p) in pg.iter().enumerate() {
             if p != sink {
                 let slot = p as usize * ps + of[i] as usize;
