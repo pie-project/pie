@@ -38,6 +38,7 @@ members = [
     "crates/inferlet",
     "crates/inferlet-macros",
     "crates/policy",
+    "crates/plex-host",
     "crates/wasmtime-web",
 
     "crates/poem-ir",
