@@ -358,6 +358,9 @@ impl<B: Backend> Run<'_, B> {
                 Ok(())
             }
             Attn::Decode {
+                // A lane stating a mask never reaches `attn.decode` here: its
+                // fire is refused (`Fault::MaskUnread`), so the masks state none.
+                mask: _,
                 q,
                 plan,
                 cache,
@@ -430,6 +433,9 @@ impl<B: Backend> Run<'_, B> {
                 Err(kernels_slang::Error::Unsupported { op: op.name() })
             }
             Attn::Decode {
+                // A lane stating a mask never reaches `attn.decode` here: its
+                // fire is refused (`Fault::MaskUnread`), so the masks state none.
+                mask: _,
                 q,
                 plan,
                 selection: Some(selection),
@@ -640,6 +646,9 @@ impl<B: Backend> Run<'_, B> {
                 Some(self.tensor(*lse)),
             ),
             Attn::Decode {
+                // A lane stating a mask never reaches `attn.decode` here: its
+                // fire is refused (`Fault::MaskUnread`), so the masks state none.
+                mask: _,
                 q,
                 plan,
                 cache,

@@ -1074,6 +1074,7 @@ impl Run<'_> {
         let sinks = self.tensor(*sink);
         match **attn {
             poem_ir::Attn::Decode {
+                mask: _,
                 q,
                 plan,
                 cache,

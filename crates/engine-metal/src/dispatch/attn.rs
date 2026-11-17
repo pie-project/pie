@@ -159,6 +159,9 @@ impl Run<'_> {
                 Ok(())
             }
             Attn::Decode {
+                // A lane stating a mask never reaches `attn.decode` here: its
+                // fire is refused (`Fault::MaskUnread`), so the masks state none.
+                mask: _,
                 q,
                 plan,
                 cache,
@@ -236,6 +239,9 @@ impl Run<'_> {
                 Err(kernels_metal::Error::Unsupported { op: op.name() })
             }
             Attn::Decode {
+                // A lane stating a mask never reaches `attn.decode` here: its
+                // fire is refused (`Fault::MaskUnread`), so the masks state none.
+                mask: _,
                 q,
                 plan,
                 selection: Some(selection),
@@ -375,6 +381,9 @@ impl Run<'_> {
                 self.tuning(),
             ),
             Attn::Decode {
+                // A lane stating a mask never reaches `attn.decode` here: its
+                // fire is refused (`Fault::MaskUnread`), so the masks state none.
+                mask: _,
                 q,
                 plan,
                 cache,

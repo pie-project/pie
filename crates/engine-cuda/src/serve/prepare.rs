@@ -979,6 +979,9 @@ impl Shell {
         let mut more_windows: Vec<&[&[u32]]> = Vec::with_capacity(lanes.len());
         let mut kv_less_seats: Vec<bool> = Vec::with_capacity(lanes.len());
         let mut masks: Vec<crate::mask::LaneMask<'_>> = Vec::with_capacity(lanes.len());
+        // Whether some lane's class reads the fire's masks: then every lane
+        // states its entry, a mask or none.
+        let mut reads_masks = false;
         let mut tokens: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut token_injects: Vec<crate::inputs::TokenInject> = Vec::new();
         let mut positions: Vec<i32> = Vec::with_capacity(rows as usize);
@@ -1145,18 +1148,19 @@ impl Shell {
                 pending_mask_injects.push((masks.len(), src, extent));
             }
             let runs_masked_arm = self.masked.contains(row.class as usize);
+            reads_masks |= runs_masked_arm;
             let reads_group_mask = self.group_masked.contains(row.class as usize);
             if masking.is_some() && self.masked.is_empty() && self.group_masked.is_empty() {
                 return Err(Fault::Maskless { lane: row.source });
             }
-            // A masked kv prefill's class is the masked word's, and only
-            // its; a group's mask is the lane's to state on any class that
-            // reads one.
-            if masking.is_some() != runs_masked_arm && !(reads_group_mask && !runs_masked_arm) {
-                return Err(Fault::MaskWord {
+            // The mask is per-lane data: a lane stating none reads every key
+            // in a masked arm too. One stated where no arm applies it is
+            // refused; a group's mask is the lane's to state on any class
+            // that reads one.
+            if masking.is_some() && !runs_masked_arm && !reads_group_mask {
+                return Err(Fault::MaskUnread {
                     lane: row.source,
                     word: lane.word,
-                    runs_masked_arm,
                 });
             }
             masks.push(crate::mask::LaneMask {
@@ -1737,7 +1741,7 @@ impl Shell {
         };
         super::btrace::mark("windows_of");
 
-        let staged = crate::mask::stage(&masks)?;
+        let staged = crate::mask::stage(&masks, reads_masks)?;
         let mask_injects: Vec<crate::inputs::MaskInject> = match &staged {
             Some(staged) => pending_mask_injects
                 .iter()

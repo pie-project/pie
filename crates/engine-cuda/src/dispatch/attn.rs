@@ -224,6 +224,7 @@ impl Run<'_> {
                 Ok(())
             }
             Attn::Decode {
+                mask: _,
                 q,
                 plan,
                 cache,
@@ -247,6 +248,7 @@ impl Run<'_> {
                 &mut self.tensor(*o),
             ),
             Attn::Decode {
+                mask: _,
                 q,
                 plan: _,
                 selection: Some(selection),
@@ -328,6 +330,7 @@ impl Run<'_> {
                 )
             }
             Attn::Decode {
+                mask: _,
                 q,
                 plan,
                 cache,
@@ -562,6 +565,7 @@ impl Run<'_> {
                 &mut self.tensor(*o),
             ),
             Attn::Decode {
+                mask: _,
                 q,
                 plan,
                 cache,
