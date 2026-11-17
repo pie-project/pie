@@ -804,6 +804,31 @@ impl Shell {
         self.programs.prewarm(&self.device, registrations)
     }
 
+    /// A program's registration, first step ([`crate::program::Plane::prepare`]):
+    /// its build runs off the engine's thread.
+    pub fn prepare_program(
+        &mut self,
+        registration: &engine::program::ProgramRegistration,
+    ) -> Result<crate::program::Pending> {
+        // The regions it plans to build that no prewarm or earlier
+        // registration built: each a module built after ready.
+        let before = self.programs.built_late();
+        let prepared = self.programs.prepare(&self.device, registration);
+        let late = self.programs.built_late() - before;
+        if late != 0 {
+            self.live.tally(engine::live::Tally::BuiltAfterReady, late);
+        }
+        prepared
+    }
+
+    /// A program's registration, last step ([`crate::program::Plane::finish`]).
+    pub fn finish_program(
+        &mut self,
+        pending: crate::program::Pending,
+    ) -> Result<engine::ProgramId> {
+        self.programs.finish(pending)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn bind_program(
         &mut self,
