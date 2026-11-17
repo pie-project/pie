@@ -391,11 +391,16 @@ pub fn lower(
         .map(|at| any[at] && out_ty(at).is_some_and(per_lane))
         .collect();
 
-    // the host's nodes: outside the layers, no weight read, every input the host's own
+    // the host's nodes: outside the layers, no weight read, every input the host's own (a token
+    // embedding's lookup in a layer too: a per-layer embedding's table, by the host's ids)
     let mut host: Vec<Option<bool>> = vec![None; nodes];
     let mut ins = Vec::new();
     for at in 0..nodes {
-        if !any[at] || lane[at] || analysis.layers[at].is_some() {
+        let looked_up = matches!(
+            trace.nodes[at].op,
+            Operation::Gather(Gather::Embed { weights: None, .. })
+        );
+        if !any[at] || lane[at] || (analysis.layers[at].is_some() && !looked_up) {
             continue;
         }
         let node = &trace.nodes[at];

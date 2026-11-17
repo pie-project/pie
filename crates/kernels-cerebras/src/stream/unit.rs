@@ -340,6 +340,15 @@ pub fn unmoved(v: ValueId) -> ValueId {
     ValueId(v.0 & !MOVED)
 }
 
+/// A copy of a row value's columns laid out as a value of its own (a layer's slice of a
+/// stacked row value, re-laid through the columns so the row roots hold it as its own width).
+pub const RELAID: u32 = 1 << 28;
+
+/// The value `v` names in the trace (a moved or re-laid copy's original).
+fn traced(v: ValueId) -> ValueId {
+    ValueId(v.0 & !(MOVED | RELAID))
+}
+
 impl Reader<'_> {
     fn def(&self, v: ValueId) -> Option<&Def> {
         self.trace.values.get(unmoved(v).0 as usize).map(|d| &d.def)
@@ -350,7 +359,7 @@ impl Reader<'_> {
         if let Some((w, _)) = super::moe::ty(self.trace, unmoved(v)) {
             return w;
         }
-        match self.trace.values.get(unmoved(v).0 as usize).map(|d| &d.ty) {
+        match self.trace.values.get(traced(v).0 as usize).map(|d| &d.ty) {
             Some(Ty::Tensor { shape, .. }) => match shape.last() {
                 Some(Dim::Const(n)) => *n as u32,
                 _ => 0,
@@ -364,7 +373,7 @@ impl Reader<'_> {
         if let Some((_, d)) = super::moe::ty(self.trace, unmoved(v)) {
             return Some(d);
         }
-        match self.trace.values.get(unmoved(v).0 as usize).map(|d| &d.ty) {
+        match self.trace.values.get(traced(v).0 as usize).map(|d| &d.ty) {
             Some(Ty::Tensor { dtype, .. }) => Some(*dtype),
             _ => None,
         }
@@ -455,6 +464,13 @@ impl Reader<'_> {
             Operation::Gather(
                 Gather::PackRows { x, .. } | Gather::UnpackRows { x, .. } | Gather::Rows { x, .. },
             ) => up(*x, 0),
+            // (a layer's columns of a stacked value: a per-layer embedding's projection)
+            Operation::Gather(Gather::Select {
+                table,
+                layer,
+                width: w,
+                ..
+            }) => up(*table, layer * w),
             // (a sink's output is its attention's, the sink folded into the Attend)
             Operation::Attn(Attn::Sink { o, .. }) => up(*o, 0),
             // (an adapter's correction: its product, no adapter on the wafer)
@@ -512,6 +528,7 @@ fn alias(op: &Operation) -> bool {
                 | Gather::PackRows { .. }
                 | Gather::UnpackRows { .. }
                 | Gather::Rows { .. }
+                | Gather::Select { .. }
         ) | Operation::Linear(Linear::LoraCorrect { .. })
     )
 }
@@ -672,6 +689,50 @@ pub fn lower_through(
         // flush the run of root ops before the next step
         if !pending.is_empty() {
             for mut c in regions(trace, &pending)? {
+                // a layer's slice of a stacked row value (a per-layer embedding's projection):
+                // the row roots hold the stacked value's columns, not the slice's as a value of
+                // its own width; re-laid through the columns (two identity matvecs) first
+                for k in 0..c.ins.len() {
+                    let v = c.ins[k].value;
+                    let sliced = matches!(r.def(v), Some(Def::Op(n))
+                        if matches!(trace.nodes[*n as usize].op, Operation::Gather(Gather::Select { .. })));
+                    if !sliced || c.region.params[k] == kernels_ir::Shape::Scalar {
+                        continue;
+                    }
+                    let cc = r.cols(v);
+                    if side_of(&sides, cc).is_none() {
+                        enter(&mut steps, &mut sides, cc, Side::Row)?;
+                    }
+                    if side_of(&sides, cc) != Some(Side::Row) {
+                        continue;
+                    }
+                    // the stacked value across whole (once), the slice back from its columns
+                    let all = ValueId(cc.base.0 | RELAID);
+                    if let std::collections::btree_map::Entry::Vacant(e) = sides.entry(all) {
+                        e.insert(Side::Col);
+                        let w = r.width(cc.base);
+                        steps.push(Step::Matvec {
+                            node: c.nodes[0],
+                            from: Side::Row,
+                            input: Cols {
+                                base: cc.base,
+                                from: 0,
+                                width: w,
+                            },
+                            weight: ValueId(super::host::UNIT),
+                            view: View::Plain,
+                            output: all,
+                            k: w,
+                            n: w,
+                            x32: r.dtype(cc.base) == Some(Dtype::F32),
+                            round: r.round(cc.base),
+                        });
+                    }
+                    let a = ValueId(v.0 | RELAID);
+                    let part = Cols { base: all, ..cc };
+                    move_across(&r, &mut steps, &mut sides, a, part, c.nodes[0]);
+                    c.ins[k].value = moved(a);
+                }
                 // the side its row inputs are on (a lane prologue's sinusoid: the rows)
                 let mut side = None;
                 let mut on: Vec<(usize, Cols, Side)> = Vec::new();

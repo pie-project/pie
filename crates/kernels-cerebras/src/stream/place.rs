@@ -198,6 +198,34 @@ impl Layout {
             let on = units > 0
                 && side == Side::Col
                 && (cands.iter().any(at_heads) || cands.iter().all(unplaced));
+            // (no head roots for it, its values not placed yet: its chunks over the rest
+            // roots, the most that divide them, each root a run of them)
+            let rest = self.px().saturating_sub(self.heads);
+            if !on && side == Side::Col && rest > 0 && span.is_multiple_of(width) {
+                let n = span / width;
+                let roots = (1..=rest.min(n))
+                    .rev()
+                    .find(|r| n.is_multiple_of(*r))
+                    .unwrap_or(1);
+                // (or placed so already: the layout it made, read again)
+                let cover = width * (n / roots);
+                let there = |c: &Cols| {
+                    (0..roots).all(|i| {
+                        self.cols[(self.heads + i) as usize]
+                            .iter()
+                            .any(|s| s.covers(c.base, c.from + i * cover))
+                    })
+                };
+                if cands.iter().all(|c| unplaced(c) || there(c)) {
+                    return RegionAt {
+                        first: self.heads,
+                        roots,
+                        chunk: width,
+                        reps: n / roots,
+                        per: 1,
+                    };
+                }
+            }
             return RegionAt {
                 first: 0,
                 roots: if on { self.heads } else { 0 },

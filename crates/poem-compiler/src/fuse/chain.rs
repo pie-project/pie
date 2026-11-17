@@ -698,15 +698,25 @@ fn lowers_explicitly(op: &Operation) -> bool {
         }) | Operation::Elemwise(Elemwise::Rope {
             turn: Turn::Full { .. } | Turn::Partial { .. } | Turn::Last { .. } | Turn::Yarn { .. },
             ..
-        }) | Operation::Linear(Linear::Glu {
-            packed: Some(_),
-            gate: None,
-            up: None,
-            weights: None,
-            limit: None,
-            act: GluAct::Swiglu | GluAct::GegluTanh | GluAct::Situ { .. },
-            ..
-        }) | Operation::Elemwise(
+        }) | Operation::Linear(
+            Linear::Glu {
+                packed: Some(_),
+                gate: None,
+                up: None,
+                weights: None,
+                limit: None,
+                act: GluAct::Swiglu | GluAct::GegluTanh | GluAct::Situ { .. },
+                ..
+            } | Linear::Glu {
+                packed: None,
+                gate: Some(_),
+                up: Some(_),
+                weights: None,
+                limit: None,
+                act: GluAct::Swiglu | GluAct::GegluTanh,
+                ..
+            }
+        ) | Operation::Elemwise(
             Elemwise::Standardize { .. }
                 | Elemwise::RmsnormGated { .. }
                 | Elemwise::RmsnormGatedBy { .. }
@@ -1411,6 +1421,30 @@ impl Builder {
                         self.push(Op::Binary(Binary::Mul, c, t))
                     }
                     _ => up,
+                };
+                let out = self.push(Op::Binary(Binary::Mul, gated, up));
+                self.set(y, out);
+            }
+            // a GLU of its gate and up apart (a per-layer embedding's gate by the layer's
+            // row): the same, each read whole
+            Linear::Glu {
+                packed: None,
+                gate: Some(gate),
+                up: Some(up),
+                weights: None,
+                act,
+                limit: None,
+                y,
+                ..
+            } => {
+                let (gate, up) = (self.get(gate)?, self.get(up)?);
+                let gated = match act {
+                    GluAct::Swiglu => {
+                        let s = self.sigmoid(gate);
+                        self.push(Op::Binary(Binary::Mul, gate, s))
+                    }
+                    GluAct::GegluTanh => self.gelu_tanh(gate),
+                    _ => return None,
                 };
                 let out = self.push(Op::Binary(Binary::Mul, gated, up));
                 self.set(y, out);
