@@ -492,17 +492,19 @@ fn prefill_walk(
     );
     let fp8 = kv::native_e4m3(pool);
     if let Some(mask) = mask {
-        if !matches!(shape.head_dim, 128 | 256) || fp8 || rel.is_some() {
+        if fp8 || rel.is_some() {
             return Err(refuse(
                 op,
-                "the masked prefill walks 128- or 256-wide heads of bf16 pages, with no \
-                 relative bias",
+                "the masked prefill walks bf16 pages, with no relative bias",
             ));
         }
-        let entry = format!(
-            "::pie::attn::paged_prefill_masked<{}, {hnd}>",
-            shape.head_dim
-        );
+        // The same two families the unmasked prefill picks between.
+        let family = if matches!(shape.head_dim, 128 | 256) {
+            "paged_prefill_masked"
+        } else {
+            "paged_prefill_wide_masked"
+        };
+        let entry = format!("::pie::attn::{family}<{}, {hnd}>", shape.head_dim);
         ctx.fire(
             op,
             Fire::at(kernel(FILE, &entry)).apply(launch),

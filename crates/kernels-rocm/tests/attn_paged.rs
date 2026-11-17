@@ -1004,7 +1004,7 @@ fn attn_paged_masked_prefill() {
     let Some(gpu) = Gpu::open() else { return };
     let ctx = gpu.ctx();
     let device = plan::Device::probe(&ctx).unwrap();
-    for c in [Case::new(8, 4, 128, 16, false), Case::new(16, 4, 256, 16, false)] {
+    for c in [Case::new(8, 4, 128, 16, false), Case::new(16, 4, 256, 16, false), Case::new(8, 2, 64, 16, false)] {
         // A causal request over a prefix whose committed run ends at 45, and
         // a wide one that reads only its buffer's bits.
         let qo_lens = [37u32, 5];
