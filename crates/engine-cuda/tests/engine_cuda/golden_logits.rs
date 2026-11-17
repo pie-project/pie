@@ -8,13 +8,12 @@
 //! that must not move a logit (a memory layout, an address) is proven by
 //! the same hashes before and after it.
 //!
-//! A dense product's cuBLAS algorithm is the one the profile's tactic tables
-//! name, or cuBLAS's own pick where they name none; nothing is timed at load,
-//! so every run sums each product in the same order. The probe reads the
-//! user's table under the cache shared across runs (`PIE_GOLDEN_CACHE/profiles`,
-//! the cache by default `pie-golden-cache` under the system's temp dir) over
-//! the device profile's checked-in one. Each model is served twice in its
-//! process, and the second serving is the one hashed.
+//! A dense product's kernel is chosen by its shape alone (a streaming
+//! skeleton for few rows, else cuBLASLt's first heuristic); nothing is timed
+//! at load, so every run sums each product in the same order. The cache is
+//! shared across runs (`PIE_GOLDEN_CACHE`, by default `pie-golden-cache`
+//! under the system's temp dir). Each model is served twice in its process,
+//! and the second serving is the one hashed.
 //!
 //! Run by hand (both are ignored in the suite): first `golden_fixtures`,
 //! which seeds each model's checkpoint into the cache's `fixtures` without a
@@ -107,8 +106,19 @@ fn fnv(name: &str) -> u64 {
     fnv_bytes(FNV, name.as_bytes())
 }
 
-/// The hash of a step's logits, bit for bit.
+/// The hash of a step's logits, bit for bit. `PIE_GOLDEN_LOGITS=<dir>`
+/// also writes each row hashed, in order, as `<n>.f32` (little-endian): two
+/// runs' rows at a step whose top parts, to weigh the parting against the
+/// row's drift.
 fn hash_logits(logits: &[f32]) -> u64 {
+    if let Some(dir) = std::env::var_os("PIE_GOLDEN_LOGITS") {
+        static AT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let at = AT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let bytes: Vec<u8> = logits.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let dir = std::path::PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).expect("the logits directory");
+        std::fs::write(dir.join(format!("{at}.f32")), bytes).expect("a logits row is written");
+    }
     logits
         .iter()
         .fold(FNV, |hash, v| fnv_bytes(hash, &v.to_bits().to_le_bytes()))
