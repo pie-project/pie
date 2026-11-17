@@ -404,13 +404,19 @@ async fn main(input: Input) -> Result<Output> {
     fwd_p.submit(&pipe).context("prefill submit")?;
 
     let g0 = tok_out_p.take_host::<i32>().await?;
-    if stream {
-        inferlet::session::send("t:1");
+    // A stop token ends the text and is not part of it, as every chat
+    // inferlet here ends its text.
+    let stop_tokens = inferlet::chat::stop_tokens();
+    let stopped = stop_tokens.contains(&(g0 as u32));
+    if !stopped {
+        if stream {
+            inferlet::session::send("t:1");
+        }
+        generated.push(g0 as u32);
     }
-    generated.push(g0 as u32);
 
     // ── DECODE LOOP (1-wide, run-ahead). ──
-    if generated.len() < max_tokens {
+    if !stopped && generated.len() < max_tokens {
         history[n as usize] = g0;
 
         let tok_in = Channel::from([g0]);
@@ -455,6 +461,9 @@ async fn main(input: Input) -> Result<Output> {
                 .take_host::<i32>()
                 .await
                 .with_context(|| format!("@{}", generated.len()))?;
+            if stop_tokens.contains(&(t as u32)) {
+                return Ok(ControlFlow::Break(()));
+            }
             if stream {
                 inferlet::session::send("t:1");
             }
