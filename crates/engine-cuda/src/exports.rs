@@ -188,16 +188,29 @@ pub(crate) fn landing_requests(
     landing
 }
 
-/// The classes the lattice keys and arms: those a plain request lands in,
-/// and, on a model with a drafter (an output only drafting classes write,
-/// MTP's `mtp.drafts`), those writing it that a request plain but for
-/// reading its pass's drafts lands in (the drafter's verify).
+/// Whether `request` lands on a class whose bodies arm as a plain class's:
+/// a plain request, or one setting only a custom attention mask beside its
+/// query length (a beam's lanes, each reading its ancestry). The mask is
+/// staged a fire at the addresses the load laid, so a body replays it.
+#[must_use]
+pub(crate) fn plain_or_masked(request: &poem_ir::Request) -> bool {
+    request.plain()
+        || (request.has_custom_mask()
+            && request.departures() == usize::from(request.query_len() != 1) + 1)
+}
+
+/// The classes the lattice keys and arms: those a plain or a masked-only
+/// request lands in ([`plain_or_masked`]), and, on a model with a drafter
+/// (an output only drafting classes write, MTP's `mtp.drafts`), those
+/// writing it that a request plain but for reading its pass's drafts lands
+/// in (the drafter's verify). A class an adapter, a score capture or a
+/// draft with a mask sets apart is none of them: its fires walk eagerly.
 #[must_use]
 pub(crate) fn plain_of(
     landing: &[Vec<poem_ir::Request>],
     outputs: &[poem_exec::feeds::ClassOutput],
 ) -> poem_ir::ClassSet {
-    let plain = |class: usize| landing[class].iter().any(poem_ir::Request::plain);
+    let plain = |class: usize| landing[class].iter().any(plain_or_masked);
     // An output's name no plain class writes: the drafter's (a name written
     // by several value sets is one output a set).
     let plain_names: std::collections::HashSet<&str> = outputs

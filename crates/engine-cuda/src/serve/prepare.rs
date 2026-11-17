@@ -1797,7 +1797,7 @@ impl Shell {
                         None if !self.exports.reads_readout_rows() => (last, every + rung),
                         _ if !self.landing[class as usize]
                             .iter()
-                            .any(poem_ir::Request::plain) =>
+                            .any(crate::exports::plain_or_masked) =>
                         {
                             let per_lane = self.budget.readouts_per_lane.max(1);
                             (

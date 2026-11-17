@@ -357,6 +357,39 @@ fn mixed_keys(deployment: &Deployment, into: &mut Targets) {
                 }
             }
         }
+        // Two decoding classes beside each other (a beam's masked steps
+        // beside other sequences' decodes), alone and with each prompt
+        // class beside them: a decoding class's rung is the lane ceiling
+        // whatever its lanes, so a lane of each keys every such fire.
+        let decoders: Vec<usize> = deployment.decoders.iter().copied().filter(alone).collect();
+        for (at, &first) in decoders.iter().enumerate() {
+            for &second in &decoders[at + 1..] {
+                if point >= 2 && deployment.seats >= 2 {
+                    into.targets.push((
+                        point,
+                        BodySynth::Wide {
+                            lanes: vec![(first, 1), (second, 1)],
+                        },
+                    ));
+                }
+                for class in deployment.prefilling.iter().copied().filter(alone) {
+                    let rows = (point >= 3 && deployment.seats >= 3)
+                        .then(|| {
+                            Shell::spread(
+                                point - 2,
+                                (deployment.seats - 2).min(deployment.max_lanes.saturating_sub(2)),
+                                deployment.context,
+                            )
+                        })
+                        .flatten();
+                    if let Some(rows) = rows {
+                        let mut lanes = vec![(first, 1), (second, 1)];
+                        lanes.extend(rows.into_iter().map(|rows| (class, rows)));
+                        into.targets.push((point, BodySynth::Wide { lanes }));
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1223,7 +1256,11 @@ impl Shell {
                 })
                 .collect(),
             drafting: (0..classes)
-                .filter(|class| !self.landing[*class].iter().any(poem_ir::Request::plain))
+                .filter(|class| {
+                    !self.landing[*class]
+                        .iter()
+                        .any(crate::exports::plain_or_masked)
+                })
                 .collect(),
             rs_rungs: self.rs_rungs(),
             decoding: self.decoding.clone(),
@@ -1257,8 +1294,9 @@ impl Shell {
             return None;
         }
         // A load that buffers recurrent rows serves a spec-decoding fire
-        // from a body too: each one-class composition (a verify's lanes, the
-        // prompts beside them) at the rs rungs is recorded once more for
+        // from a body too: each composition at the rs rungs (a verify's
+        // lanes, the prompts beside them, a beam's lanes beside other
+        // sequences' steps and prompt pieces) is recorded once more for
         // lanes that buffer rows, and once more for lanes that replay them
         // (`record::RsBody`), right after its folding body. Every class takes
         // them, not only a drafter's: a guest that drafts for itself (MTP,
@@ -1279,13 +1317,18 @@ impl Shell {
         let targets: Vec<(u32, BodySynth, Treatment)> = targets
             .into_iter()
             .flat_map(|(bucket, target)| {
-                let class = match &target {
-                    BodySynth::Decode { class, .. } | BodySynth::Prefill { class, .. } => {
-                        Some(*class)
-                    }
-                    _ => None,
-                };
-                let buffers = buffering && rungs.contains(&bucket) && class.is_some();
+                // A composition whose lanes buffer or replay their recurrent
+                // rows is one more body: every composition a lattice point
+                // keys, one class or several (a beam's lanes beside other
+                // sequences' steps and prompt pieces).
+                let treated = matches!(
+                    target,
+                    BodySynth::Decode { .. }
+                        | BodySynth::Prefill { .. }
+                        | BodySynth::Mixed { .. }
+                        | BodySynth::Wide { .. }
+                );
+                let buffers = buffering && rungs.contains(&bucket) && treated;
                 let treatments: &[record::RsBody] = if buffers {
                     &[
                         record::RsBody::Folds,
