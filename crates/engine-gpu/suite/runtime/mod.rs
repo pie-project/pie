@@ -1,6 +1,7 @@
 mod fold;
 mod next_tokens;
 mod outputs;
+mod padded_readout;
 mod port;
 mod readout_rows;
 mod roles;
