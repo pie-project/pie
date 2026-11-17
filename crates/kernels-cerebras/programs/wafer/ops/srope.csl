@@ -12,7 +12,8 @@
 // DIRECT (a decode step's: its position any below its cache's, past what digits' tables hold in
 // a root's memory): rot is each table set's frequencies alone, and a call computes each angle
 // p f in f32 (as HF's rotary embedding does), reduced by 2 pi in two parts (Cody-Waite) and its
-// cos / sin by their series to degree 16 / 15 (|error| below 1e-6 over [-pi, pi]).
+// cos / sin by their series to degree 16 / 15 (|error| below 1e-6 over [-pi, pi]), each step a
+// DSD operation over the table set's pairs.
 //
 // Params: rot, rc, rs (the region's tables and its cos / sin of the current position), NROT (a
 // table row's pairs), LV, BITS, DIRECT.
@@ -40,40 +41,59 @@ fn digit(p: u32, lv: u16) u16 {
   return @as(u16, (p >> @as(u16, BITS * (LV - 1 - lv))) & @as(u32, RB - 1));
 }
 
-// 2 pi in two parts (6.28125 exact in a few bits: k C1 exact for the k a position makes) and 1 / 2 pi
+// 2 pi in two parts (6.28125 exact in a few bits: k C1 exact for the k a position makes), 1 / 2 pi,
+// and 1.5 2^23 (added and taken away, it rounds an f32 below 2^22 to the nearest whole)
 const C1: f32 = 6.28125;
 const C2: f32 = 0.0019353071795864769;
 const INV2PI: f32 = 0.15915494309189535;
+const MAGIC: f32 = 12582912.0;
+// sin's series past r (r^3 .. r^15 over r^3, highest first) and cos's past 1 (r^2 .. r^16 over r^2)
+const SIN = [7]f32 { -7.6471637318198164759e-13, 1.6059043836821614599e-10, -2.5052108385441718775e-8,
+  2.7557319223985890653e-6, -1.9841269841269841270e-4, 8.3333333333333333333e-3, -1.6666666666666666667e-1 };
+const COS = [8]f32 { 4.7794773323873852974e-14, -1.1470745597729724714e-11, 2.0876756987868098979e-9,
+  -2.7557319223985890653e-7, 2.4801587301587301587e-5, -1.3888888888888888889e-3, 4.1666666666666666667e-2, -0.5 };
+const ND: u16 = if (DIRECT) NROT else 1;
+var t3: [ND]f32 align(16) = @zeros([ND]f32);
+var t4: [ND]f32 align(16) = @zeros([ND]f32);
+const T3 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{ND} -> t3[i] });
+const T4 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{ND} -> t4[i] });
 
-// a - 2 pi k, k the nearest whole turn (a >= 0: a position times a frequency)
-fn turn(a: f32) f32 {
-  const k = @as(f32, @as(u32, a * INV2PI + 0.5));
-  return (a - k * C1) - k * C2;
-}
-
-fn sin_r(r: f32) f32 {
-  const x2 = r * r;
-  var s: f32 = -7.6471637318198164759e-13;
-  s = s * x2 + 1.6059043836821614599e-10;
-  s = s * x2 - 2.5052108385441718775e-8;
-  s = s * x2 + 2.7557319223985890653e-6;
-  s = s * x2 - 1.9841269841269841270e-4;
-  s = s * x2 + 8.3333333333333333333e-3;
-  s = s * x2 - 1.6666666666666666667e-1;
-  return r + r * x2 * s;
-}
-
-fn cos_r(r: f32) f32 {
-  const x2 = r * r;
-  var c: f32 = 4.7794773323873852974e-14;
-  c = c * x2 - 1.1470745597729724714e-11;
-  c = c * x2 + 2.0876756987868098979e-9;
-  c = c * x2 - 2.7557319223985890653e-7;
-  c = c * x2 + 2.4801587301587301587e-5;
-  c = c * x2 - 1.3888888888888888889e-3;
-  c = c * x2 + 4.1666666666666666667e-2;
-  c = c * x2 - 0.5;
-  return 1.0 + x2 * c;
+// cos / sin of p f for the n frequencies at base, into rc / rs from out, as DSD operations over
+// the n: a = p f; k = round(a / 2 pi); r = a - k C1 - k C2; each series by Horner in r^2
+fn direct(pf: f32, base: u16, out: u16, n: u16) void {
+  const f = @increment_dsd_offset(@set_dsd_length(@set_dsd_base_addr(T1, rot), n), @as(i16, base), f32);
+  const r = @set_dsd_length(T1, n);
+  const k = @set_dsd_length(T2, n);
+  const x2 = @set_dsd_length(T3, n);
+  const acc = @set_dsd_length(T4, n);
+  const cd = @increment_dsd_offset(@set_dsd_length(@set_dsd_base_addr(T1, rc), n), @as(i16, out), f32);
+  const sd = @increment_dsd_offset(@set_dsd_length(@set_dsd_base_addr(T1, rs), n), @as(i16, out), f32);
+  @fmuls(r, f, pf);
+  @fmuls(k, r, INV2PI);
+  @fadds(k, k, MAGIC);
+  @fsubs(k, k, MAGIC);
+  @fmacs(r, r, k, -C1);
+  @fmacs(r, r, k, -C2);
+  @fmuls(x2, r, r);
+  // sin = r + r x2 S(x2)
+  @fmuls(acc, x2, SIN[0]);
+  var i: u16 = 1;
+  while (i < 7) : (i += 1) {
+    @fadds(acc, acc, SIN[i]);
+    if (i < 6) { @fmuls(acc, acc, x2); }
+  }
+  @fmuls(acc, acc, x2);
+  @fmuls(acc, acc, r);
+  @fadds(sd, acc, r);
+  // cos = 1 + x2 C(x2)
+  @fmuls(acc, x2, COS[0]);
+  i = 1;
+  while (i < 8) : (i += 1) {
+    @fadds(acc, acc, COS[i]);
+    if (i < 7) { @fmuls(acc, acc, x2); }
+  }
+  @fmuls(acc, acc, x2);
+  @fadds(cd, acc, 1.0);
 }
 
 // cos / sin of position p for pairs j < n of the table set at base, into rc / rs from out:
@@ -83,13 +103,7 @@ fn tables(p: u32, base: u16, out: u16, n: u16) void {
   if (p == q) { return; }
   if (DIRECT) {
     last[out] = p;
-    const pf = @as(f32, p);
-    var j: u16 = 0;
-    while (j < n) : (j += 1) {
-      const r = turn(pf * rot[base + j]);
-      rc[out + j] = cos_r(r);
-      rs[out + j] = sin_r(r);
-    }
+    direct(@as(f32, p), base, out, n);
     return;
   }
   var from: u16 = 0;

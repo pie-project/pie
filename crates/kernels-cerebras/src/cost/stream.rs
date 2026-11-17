@@ -56,6 +56,12 @@ pub const ALL_REDUCE: f64 = 210.0;
 pub const ROT_CALL: f64 = 170.0;
 pub const ROT_CHANGE: f64 = 429.0;
 pub const ROT_LEVEL: f64 = 152.0;
+/// A decode step's rotation computed at its root (`srope.csl`'s DIRECT, no tables): a row whose
+/// position moved costs [`ROT_DIRECT_OPS`] DSD operations over the table set's pairs (the angle,
+/// its reduction by 2 pi, two series by Horner), each [`ROT_DIRECT_OP`] to issue and [`DSD_ELEM`]
+/// an element.
+pub const ROT_DIRECT_OPS: f64 = 42.0;
+pub const ROT_DIRECT_OP: f64 = 30.0;
 /// The row store: a held word cast out or summed back, a hop of the row chain.
 pub const STORE_WORD: f64 = 1.0;
 pub const CHAIN_HOP: f64 = 2.0;
@@ -78,6 +84,8 @@ pub struct RegionFeatures {
     pub rotations: f64,
     /// The rotation tables' bits a digit (`srope.csl`'s `BITS`; 0 without tables).
     pub rope_bits: f64,
+    /// A rotation computed at the root (`srope.csl`'s DIRECT): its pairs (`NROT`); 0 with tables.
+    pub rope_direct: f64,
 }
 
 impl RegionFeatures {
@@ -97,6 +105,14 @@ impl RegionFeatures {
                 .and_then(|t| t.split(|ch: char| !ch.is_ascii_digit()).next())
                 .and_then(|n| n.parse().ok())
                 .unwrap_or(0.0);
+            if csl[i..].contains(".DIRECT = true") {
+                f.rope_direct = csl[i..]
+                    .split(".NROT = ")
+                    .nth(1)
+                    .and_then(|t| t.split(|ch: char| !ch.is_ascii_digit()).next())
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0.0);
+            }
         }
         for line in csl[at..].lines().skip(1) {
             if line.starts_with('}') {
@@ -149,6 +165,9 @@ impl RegionFeatures {
     pub fn rotation_advance(&self) -> f64 {
         if self.rotations == 0.0 {
             return 0.0;
+        }
+        if self.rope_direct > 0.0 {
+            return ROT_DIRECT_OPS * (ROT_DIRECT_OP + self.rope_direct * DSD_ELEM);
         }
         let d = self.rope_bits.max(1.0).exp2();
         ROT_CHANGE + ROT_LEVEL * d / (d - 1.0)
