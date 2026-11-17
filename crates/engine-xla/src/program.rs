@@ -99,6 +99,8 @@ pub(crate) struct Tally {
 /// step waits on), with the first fault any of them reported.
 pub(crate) struct Latch {
     at: engine::StepDone,
+    /// The step's lanes: every one faulted where the step faults.
+    lanes: u32,
     sink: Option<engine::CompletionSink>,
     holds: std::sync::atomic::AtomicUsize,
     fault: std::sync::Mutex<Option<String>>,
@@ -111,9 +113,14 @@ pub(crate) struct Latch {
 
 impl Latch {
     /// A latch holding once, for the submitter.
-    pub(crate) fn new(at: engine::StepDone, sink: Option<engine::CompletionSink>) -> Arc<Latch> {
+    pub(crate) fn new(
+        at: engine::StepDone,
+        lanes: u32,
+        sink: Option<engine::CompletionSink>,
+    ) -> Arc<Latch> {
         Arc::new(Latch {
             at,
+            lanes,
             sink,
             holds: std::sync::atomic::AtomicUsize::new(1),
             fault: std::sync::Mutex::new(None),
@@ -167,16 +174,10 @@ impl Latch {
             sink(
                 self.at,
                 match fault.clone() {
-                    None => {
-                        let writes =
-                            std::mem::take(&mut *self.writes.lock().expect("writes lock poisoned"));
-                        if writes.is_empty() {
-                            engine::StepOutcome::Committed
-                        } else {
-                            engine::StepOutcome::Wrote(writes)
-                        }
-                    }
-                    Some(why) => engine::StepOutcome::Faulted(why),
+                    None => engine::StepOutcome::wrote(std::mem::take(
+                        &mut *self.writes.lock().expect("writes lock poisoned"),
+                    )),
+                    Some(why) => engine::StepOutcome::unattributed_guest_fault(self.lanes, why),
                 },
             );
         }
@@ -1770,14 +1771,14 @@ mod latch_tests {
             frame: engine::fire::FrameId(1),
             step: 0,
         };
-        let latch = Latch::new(at, None);
+        let latch = Latch::new(at, 1, None);
         latch.hold();
         latch.release(Ok(()));
         let late = std::sync::Arc::clone(&latch);
         let event = std::thread::spawn(move || late.release(Err("the fire failed".into())));
         assert_eq!(latch.wait().as_deref(), Some("the fire failed"));
         event.join().expect("the event thread");
-        let clean = Latch::new(at, None);
+        let clean = Latch::new(at, 1, None);
         clean.release(Ok(()));
         assert_eq!(clean.wait(), None);
     }
@@ -1800,7 +1801,7 @@ mod latch_tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
             into.lock().expect("heard lock").push(outcome);
         });
-        let latch = Latch::new(at, Some(sink));
+        let latch = Latch::new(at, 1, Some(sink));
         latch.hold();
         latch.report(vec![engine::KvWrites::default()]);
         latch.release(Ok(()));
@@ -1810,7 +1811,7 @@ mod latch_tests {
         let heard = heard.lock().expect("heard lock");
         assert_eq!(heard.len(), 1, "the sink heard the step before the settle woke");
         assert!(
-            matches!(heard[0], engine::StepOutcome::Wrote(_)),
+            !heard[0].wrote.is_empty() && heard[0].faulted.is_empty(),
             "with its fold reports: {:?}",
             heard[0]
         );

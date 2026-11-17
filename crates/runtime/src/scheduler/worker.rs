@@ -3155,6 +3155,7 @@ mod tests {
                         },
                         terminal_cells: Vec::new(),
                         completions: Vec::new(),
+                        member_lanes: Vec::new(),
                         instances: vec![::engine::InstanceId(0)],
                     }],
                 },
@@ -3231,6 +3232,7 @@ mod tests {
                     },
                     terminal_cells: Vec::new(),
                     completions: Vec::new(),
+                    member_lanes: Vec::new(),
                     instances: vec![::engine::InstanceId(0)],
                 }],
             },
@@ -3304,7 +3306,7 @@ mod tests {
                         frame: id,
                         step: step as u32,
                     },
-                    ::engine::StepOutcome::Wrote(wrote),
+                    ::engine::StepOutcome::wrote(wrote),
                 );
             }
             Ok(engine::FrameTicket {
@@ -3339,6 +3341,7 @@ mod tests {
                     },
                     terminal_cells: Vec::new(),
                     completions: Vec::new(),
+                    member_lanes: Vec::new(),
                     instances: Vec::new(),
                 }],
             },
@@ -3358,6 +3361,217 @@ mod tests {
         assert_eq!(kept.fold, Some(4), "the fold the engine told");
 
         let (_engine, _channels) = lane.shutdown();
+    }
+
+    /// Why [`LaneFaultEngine`]'s faulting lane faulted.
+    const GUARD: &str = "guest epilogue faulted: stage 0: guard";
+
+    /// An engine whose guest pass of one instance faults: it tells the step
+    /// with that instance's lanes in `faulted` and commits the rest, settling off the
+    /// submit (`asynchronous`) or inside it. With `lost` it refuses the
+    /// whole frame instead, before any lane runs.
+    struct LaneFaultEngine {
+        sink: Option<::engine::CompletionSink>,
+        asynchronous: bool,
+        faulting: Option<::engine::InstanceId>,
+        lost: bool,
+        next: u64,
+    }
+
+    impl engine::Engine for LaneFaultEngine {
+        fn kind(&self) -> &'static str {
+            "lane-fault"
+        }
+
+        fn load(&mut self, _request: engine::LoadRequest) -> engine::Result<engine::Loaded> {
+            Err(engine::Error::Load("no model".into()))
+        }
+
+        fn settles_asynchronously(&self) -> bool {
+            self.asynchronous
+        }
+
+        fn on_complete(&mut self, sink: ::engine::CompletionSink) {
+            self.sink = Some(sink);
+        }
+
+        fn submit(
+            &mut self,
+            frame: &engine::FrameSubmission,
+        ) -> engine::Result<engine::FrameTicket> {
+            if self.lost {
+                return Err(engine::Error::Device("the device is lost".into()));
+            }
+            let id = ::engine::FrameId(self.next);
+            self.next += 1;
+            let sink = self.sink.clone().expect("a sink before the first submit");
+            for (step, fired) in frame.steps.iter().enumerate() {
+                let mut outcome = ::engine::StepOutcome::committed();
+                for attachment in fired
+                    .attachments
+                    .iter()
+                    .filter(|a| Some(a.instance) == self.faulting)
+                {
+                    outcome.fault_lanes(
+                        attachment.lane..attachment.lane + attachment.lanes,
+                        Some(attachment.instance),
+                        GUARD,
+                    );
+                }
+                sink(
+                    ::engine::StepDone {
+                        frame: id,
+                        step: step as u32,
+                    },
+                    outcome,
+                );
+            }
+            Ok(engine::FrameTicket {
+                id,
+                steps: frame.steps.iter().map(|_| Default::default()).collect(),
+            })
+        }
+    }
+
+    /// One step of fires, a lane each, each the pass of its own instance
+    /// of `instances`; and the fires' completions.
+    fn step_of(
+        instances: &[u64],
+    ) -> (crate::engine::FrameFire, Vec<crate::engine::WorkItemCompletion>) {
+        let lanes = u32::try_from(instances.len()).expect("a few lanes");
+        let completions: Vec<_> = (0..lanes)
+            .map(|_| crate::engine::WorkItemCompletion::deferred_with_guard(None))
+            .collect();
+        let instance = |lane: u32| ::engine::InstanceId(instances[lane as usize]);
+        let fire = crate::engine::FrameFire {
+            steps: vec![crate::engine::StepFire {
+                submission: ::engine::Step {
+                    lanes: (0..lanes)
+                        .map(|lane| ::engine::Lane::decode(lane, 0, 1, 0))
+                        .collect(),
+                    attachments: (0..lanes)
+                        .map(|lane| ::engine::Attachment {
+                            lane,
+                            lanes: 1,
+                            instance: instance(lane),
+                            adapter_only: false,
+                        })
+                        .collect(),
+                    media: Vec::new(),
+                    voxels: Vec::new(),
+                },
+                terminal_cells: completions.iter().map(|c| c.terminal_cell_ptr()).collect(),
+                completions: completions.clone(),
+                member_lanes: (0..=lanes).collect(),
+                instances: (0..lanes).map(instance).collect(),
+            }],
+        };
+        (fire, completions)
+    }
+
+    /// Fires `fire` on `lane` and waits out its frame: its answer, and
+    /// each fire's result once it settled.
+    fn fire_and_settle(
+        lane: &Lane,
+        fire: crate::engine::FrameFire,
+        completions: &[crate::engine::WorkItemCompletion],
+    ) -> (std::result::Result<(), String>, Vec<std::result::Result<(), String>>) {
+        let answer = within("the launch is answered", lane.fire(fire, false))
+            .expect("the launch is answered");
+        let answer = match answer {
+            Ok(frame) => within("the frame settles", frame).map_err(|error| format!("{error:#}")),
+            Err(error) => Err(error),
+        };
+        let fires = completions
+            .iter()
+            .map(|completion| {
+                if !completion.is_settled() {
+                    // A frame settled inside `submit` resolves its fires as
+                    // the worker retires it.
+                    completion.resolve_landed("test retire");
+                }
+                within("the fire settles", completion.clone()).map_err(|error| format!("{error:#}"))
+            })
+            .collect();
+        (answer, fires)
+    }
+
+    /// A guest epilogue faulting on one lane of four fails that lane's fire
+    /// alone, by the engine's reason; the other three commit, and fire on.
+    fn one_faulted_lane_fails_its_own_fire_alone(asynchronous: bool) {
+        let mut lane = Lane::spawn(
+            0,
+            Some(Box::new(LaneFaultEngine {
+                sink: None,
+                asynchronous,
+                faulting: Some(::engine::InstanceId(102)),
+                lost: false,
+                next: 0,
+            })),
+            Arc::new(SchedulerStats::default()),
+        );
+        let (fire, completions) = step_of(&[100, 101, 102, 103]);
+        let (frame, fires) = fire_and_settle(&lane, fire, &completions);
+        assert_eq!(frame, Ok(()), "the frame is not failed by one lane's fault");
+        for (at, fired) in fires.iter().enumerate() {
+            if at == 2 {
+                let why = fired.as_ref().expect_err("the faulted lane's fire fails");
+                assert!(why.contains(GUARD), "by the engine's reason: {why}");
+                assert!(why.contains("lane 2"), "naming its lane: {why}");
+                assert!(why.contains("instance 102"), "naming its instance: {why}");
+            } else {
+                assert_eq!(fired, &Ok(()), "lane {at} commits");
+            }
+        }
+
+        // The three go on: their next fires commit, and nothing of theirs
+        // was poisoned by the fourth's fault.
+        let (fire, completions) = step_of(&[100, 101, 103]);
+        let (frame, fires) = fire_and_settle(&lane, fire, &completions);
+        assert_eq!(frame, Ok(()));
+        assert!(fires.iter().all(Result::is_ok), "the three fire on: {fires:?}");
+        let _ = lane.shutdown();
+    }
+
+    #[test]
+    fn a_faulted_lane_fails_its_own_fire_alone_off_the_submit() {
+        one_faulted_lane_fails_its_own_fire_alone(true);
+    }
+
+    #[test]
+    fn a_faulted_lane_fails_its_own_fire_alone_inside_the_submit() {
+        one_faulted_lane_fails_its_own_fire_alone(false);
+    }
+
+    /// A submit refused before any lane ran fails every fire of its frame.
+    #[test]
+    fn a_refused_submit_fails_every_fire_of_its_frame() {
+        let mut lane = Lane::spawn(
+            0,
+            Some(Box::new(LaneFaultEngine {
+                sink: None,
+                asynchronous: true,
+                faulting: None,
+                lost: true,
+                next: 0,
+            })),
+            Arc::new(SchedulerStats::default()),
+        );
+        let (fire, completions) = step_of(&[100, 101, 102, 103]);
+        let answer = within("the launch is answered", lane.fire(fire, false))
+            .expect("the launch is answered");
+        let Err(why) = answer else {
+            panic!("a lost device refuses the frame");
+        };
+        assert!(why.contains("the device is lost"), "{why}");
+        for completion in &completions {
+            assert_eq!(
+                completion.resolve_from_terminal().ok(),
+                Some(crate::engine::completion::WorkItemAttemptOutcome::Failed),
+                "every fire of the refused frame fails"
+            );
+        }
+        let _ = lane.shutdown();
     }
 
     /// What [`HoldingEngine`] answers it holds back once it took a resident

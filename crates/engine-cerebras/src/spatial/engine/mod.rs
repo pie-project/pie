@@ -510,7 +510,7 @@ impl Spatial {
                         frame: id,
                         step: index as u32,
                     },
-                    engine::StepOutcome::Committed,
+                    engine::StepOutcome::committed(),
                 );
             }
             steps.push(FireTicket {

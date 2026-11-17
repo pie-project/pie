@@ -137,6 +137,10 @@ pub struct StepFire {
     pub terminal_cells: Vec<CellPtr>,
     /// The completions those cells are of, resolved once the step lands.
     pub completions: Vec<crate::engine::WorkItemCompletion>,
+    /// Which of the step's lanes are each fire's: fire `i` has lanes
+    /// `member_lanes[i]..member_lanes[i + 1]`, so a lane that faults fails
+    /// its own fire alone.
+    pub member_lanes: Vec<u32>,
     pub instances: Vec<::engine::InstanceId>,
 }
 

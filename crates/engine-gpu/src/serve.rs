@@ -219,6 +219,11 @@ pub struct Launch<'l, B: Serve> {
     pub counts: Airborne,
 
     pub done: Option<Done>,
+
+    /// The step's device-fed token ids: read back once the forward
+    /// landed ([`crate::settle::FedCheck::landed`]), before its count is
+    /// left.
+    pub fed_check: Option<crate::settle::FedCheck>,
 }
 
 /// A guest input's cell: wire bytes on the host, or a cell the device keeps.
@@ -232,6 +237,9 @@ pub enum InputCell<B: Backend> {
         cell: DeviceCell<B>,
         dtype: eta_ir::types::Dtype,
     },
+    /// The lane's guest refused its cell: its lanes fault, and its seat
+    /// holds zeros, which nothing reads.
+    Refused,
 }
 
 /// A cell a guest channel keeps on the device: `bytes` at `at` of `buffer`
@@ -2821,6 +2829,9 @@ impl<B: Serve> Shell<B> {
                 })?;
                 let at = base + offset * seat.row_bytes();
                 match cell {
+                    InputCell::Refused => {
+                        self.inputs[arm].write_input(at, &vec![0u8; bytes as usize])?;
+                    }
                     InputCell::Host { bytes: raw, dtype } => {
                         let landed = input_bytes(raw, *dtype, seat.dtype, bytes).ok_or_else(|| {
                             program(
@@ -2905,6 +2916,21 @@ impl<B: Serve> Shell<B> {
 
     fn harvest_one(&mut self) -> Result<()> {
         B::harvest_one(self)
+    }
+
+    /// Reads token seat row `row` of arm `arm`, as a fed check does once
+    /// the fire there landed.
+    #[must_use]
+    pub fn token_row_reader(&self, arm: usize) -> crate::settle::ReadRow {
+        let (store, tokens) = self.inputs[arm].token_seat();
+        let store = store.clone();
+        Box::new(move |row| {
+            let mut word = [0u8; 4];
+            store
+                .read(tokens + u64::from(row) * 4, &mut word)
+                .ok()
+                .map(|()| u32::from_le_bytes(word))
+        })
     }
 
     /// Takes step `seq`'s host `rows` and gives its arm back.
@@ -3137,6 +3163,7 @@ impl<B: Serve> Shell<B> {
 
         let mut writes: Vec<Option<(i32, i32)>> = Vec::with_capacity(rows as usize);
         let mut feeds: Vec<(u32, &'a DeviceCell<B>)> = Vec::new();
+        let mut fed_lanes: Vec<(u32, u32)> = Vec::new();
         for row in composition.lanes() {
             let source = row.source as usize;
             let seated = &lanes[source];
@@ -3152,6 +3179,7 @@ impl<B: Serve> Shell<B> {
                     ));
                 }
                 feeds.push((row.row_offset, cell));
+                fed_lanes.push((row.source, row.row_offset));
             }
 
             let have = match seated.held {
@@ -4058,6 +4086,8 @@ impl<B: Serve> Shell<B> {
             wrote,
             left: merged(left),
             feeds,
+            fed_lanes,
+            fed_check: None,
             input_copies,
             merge_lands,
             classes: composition
@@ -4225,6 +4255,11 @@ pub struct Prepared<'a, B: Serve> {
     /// ([`crate::store::frozen`]), kept once the fire is on its way.
     left: Vec<(Vec<u32>, Option<u32>)>,
     feeds: Vec<(u32, &'a DeviceCell<B>)>,
+    /// Each device-fed lane: its index among the step's lanes and its row
+    /// in the token seat.
+    pub fed_lanes: Vec<(u32, u32)>,
+    /// The check of what those lanes embedded, where the engine checks it.
+    pub fed_check: Option<crate::settle::FedCheck>,
     input_copies: Vec<InputCopy<'a, B>>,
     merge_lands: Vec<MergeLand>,
     classes: Vec<usize>,
@@ -4259,6 +4294,7 @@ impl<B: Serve> PreparedPhase for Prepared<'_, B> {
 pub struct Enqueued<'a, B: Serve> {
     pending: B::Pending,
     fed: Option<B::Pending>,
+    fed_check: Option<crate::settle::FedCheck>,
     seq: u64,
     arm: usize,
 
@@ -4462,6 +4498,8 @@ struct InputCopy<'a, B: Backend> {
 pub struct Flight<B: Serve> {
     pub seq: u64,
     pub arm: usize,
+    /// Read back at the landing: the arm is given back once it was.
+    pub fed_check: Option<crate::settle::FedCheck>,
     pub rows: Vec<ReadSpan>,
     pub pixels: PixelSpans,
     pub api: B::Flight,
@@ -4513,6 +4551,7 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
                 return Ok(Enqueued {
                     pending,
                     fed,
+                    fed_check: prepared.fed_check.take(),
                     seq,
                     arm: prepared.arm,
                     rows,
@@ -4604,6 +4643,7 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
             keep,
             counts: self.airborne.clone(),
             done: prepared.done.take(),
+            fed_check: prepared.fed_check.clone(),
         };
         let pending = match B::submit(self, frame, &mut prepared, launch) {
             Ok(pending) => pending,
@@ -4620,6 +4660,7 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
         Ok(Enqueued {
             pending,
             fed,
+            fed_check: prepared.fed_check.take(),
             seq,
             arm: prepared.arm,
             rows: layout,
@@ -4636,6 +4677,7 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
         let Enqueued {
             pending,
             fed,
+            fed_check,
             seq,
             arm,
             rows,
@@ -4648,6 +4690,7 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
         self.inflight.push_back(Flight {
             seq,
             arm,
+            fed_check,
             rows,
             pixels,
             api: B::fly(pending, fed),

@@ -19,11 +19,96 @@ pub struct StepDone {
     pub step: u32,
 }
 
+/// How a step landed: what its lanes wrote, and the lanes that faulted.
+/// Every lane not in `faulted` committed, its outputs and its `wrote`
+/// standing as on a step with no fault at all.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StepOutcome {
+    /// What the step's lanes wrote to the KV cache, where they report it.
+    pub wrote: Vec<KvWrites>,
+    /// The lanes that faulted, each once. The runtime fails each one's
+    /// request by its reason, and poisons its instance; no other lane is
+    /// touched.
+    pub faulted: Vec<LaneFault>,
+}
+
+/// A lane of a step that faulted: lane `lane` of the step's
+/// [`crate::fire::Step::lanes`], the instance whose pass faulted where one
+/// did, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StepOutcome {
-    Committed,
-    Wrote(Vec<KvWrites>),
-    Faulted(String),
+pub struct LaneFault {
+    pub lane: u32,
+    pub instance: Option<InstanceId>,
+    pub reason: String,
+}
+
+impl StepOutcome {
+    /// Every lane committed, and none reports what it wrote.
+    #[must_use]
+    pub fn committed() -> StepOutcome {
+        StepOutcome::default()
+    }
+
+    /// Every lane committed, and these are what they wrote.
+    #[must_use]
+    pub fn wrote(wrote: Vec<KvWrites>) -> StepOutcome {
+        StepOutcome {
+            wrote,
+            faulted: Vec::new(),
+        }
+    }
+
+    /// The step was lost on the device after its submit returned (a
+    /// command buffer refused, the device gone): every one of its `lanes`
+    /// faulted, for `reason`.
+    #[must_use]
+    pub fn lost(lanes: u32, reason: impl Into<String>) -> StepOutcome {
+        StepOutcome {
+            wrote: Vec::new(),
+            faulted: every_lane(lanes, reason.into()),
+        }
+    }
+
+    /// SCAFFOLDING, deleted in the sitting every engine attributes its
+    /// guest faults to their lanes: a guest fault this engine cannot yet
+    /// place on the lanes whose pass it was, told as every one of the
+    /// step's `lanes` faulted, as the whole step failed before lanes did.
+    #[must_use]
+    pub fn unattributed_guest_fault(lanes: u32, reason: impl Into<String>) -> StepOutcome {
+        StepOutcome {
+            wrote: Vec::new(),
+            faulted: every_lane(lanes, reason.into()),
+        }
+    }
+
+    /// Lanes `lanes` of `instance`'s pass faulted for `reason`; a lane
+    /// already faulted keeps its first reason.
+    pub fn fault_lanes(
+        &mut self,
+        lanes: std::ops::Range<u32>,
+        instance: Option<InstanceId>,
+        reason: &str,
+    ) {
+        for lane in lanes {
+            if self.faulted.iter().all(|fault| fault.lane != lane) {
+                self.faulted.push(LaneFault {
+                    lane,
+                    instance,
+                    reason: reason.to_string(),
+                });
+            }
+        }
+    }
+}
+
+fn every_lane(lanes: u32, reason: String) -> Vec<LaneFault> {
+    (0..lanes)
+        .map(|lane| LaneFault {
+            lane,
+            instance: None,
+            reason: reason.clone(),
+        })
+        .collect()
 }
 
 /// What one lane wrote to the KV cache in a step, row by row: the token it
@@ -233,10 +318,14 @@ pub trait Engine: Send {
         Err(self.unsupported("register_adapter"))
     }
 
-    /// Submits a frame's steps. A submit that returns `Err`, or a step
-    /// that settles [`StepOutcome::Faulted`], fails its pipeline; the sets
-    /// that pipeline owns cannot be claimed by another. Nothing replays
-    /// from what such a step left. A position an engine keeps by slot
+    /// Submits a frame's steps. A submit that returns `Err` refused the
+    /// frame before any of its lanes ran, and fails the pipeline of every
+    /// lane in it. A fault an engine can place on lanes (a guest pass
+    /// faulting, a guard, a row out of bounds) is not an `Err`: the step
+    /// settles with those lanes in [`StepOutcome::faulted`], each failing
+    /// its own pipeline, and every other lane commits. The sets a failed
+    /// pipeline owns cannot be claimed by another. Nothing replays from
+    /// what such a step left. A position an engine keeps by slot
     /// still goes back where a refused step found it: the slot outlives
     /// the set, and its next tenant must not meet it.
     fn submit(&mut self, frame: &FrameSubmission) -> Result<FrameTicket>;
@@ -366,9 +455,8 @@ pub trait Engine: Send {
 
     /// Where a step's outcome goes. An engine that settles asynchronously
     /// answers every step here. One that settles inside
-    /// [`Engine::submit`] answers through `submit`'s result: of what it
-    /// tells here only what a step's lanes wrote ([`StepOutcome::Wrote`])
-    /// is heard, and it is told before `submit` returns.
+    /// [`Engine::submit`] tells here, before `submit` returns, each step
+    /// whose lanes wrote or faulted; a step it does not tell committed.
     fn on_complete(&mut self, sink: CompletionSink) {
         let _ = sink;
     }

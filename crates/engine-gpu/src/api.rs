@@ -41,6 +41,15 @@ pub struct PendingStep {
     /// step carries them; on an engine that settles inside `submit`, the
     /// frame's settle there tells them.
     pub wrote: Vec<engine::KvWrites>,
+
+    /// The lanes whose guest passes faulted ahead of the forward (a
+    /// prologue, an envelope), where the forward's own completion does not
+    /// carry them, as `wrote`.
+    pub faulted: Vec<engine::LaneFault>,
+
+    /// The check of the step's device-fed token ids, where the forward's
+    /// own completion does not carry it: told with the step once it landed.
+    pub fed: Option<crate::settle::FedCheck>,
 }
 
 /// What a backend crate supplies beside its [`Serve`] to stand behind the
@@ -71,15 +80,22 @@ pub trait Host: Serve {
     fn submitted(gpu: &Gpu<Self>);
 
     /// Before `step` resolves its inputs: the passes whose cells its forward
-    /// reads.
-    fn run_prologues(gpu: &mut Gpu<Self>, step: &Step) -> EngineResult<()>;
+    /// reads. A pass that refuses (its instance poisoned, a guard) faults
+    /// its own attachment's lanes into `faulted`; the others' run on.
+    fn run_prologues(
+        gpu: &mut Gpu<Self>,
+        step: &Step,
+        faulted: &mut engine::StepOutcome,
+    ) -> EngineResult<()>;
 
     /// The tokens, masks and token feeds `step`'s attachments resolve for
-    /// their lanes.
+    /// their lanes. An attachment whose instance refuses its envelope
+    /// faults its own lanes ([`Envelope::refused`]); the others resolve.
     fn envelope(
         gpu: &mut Gpu<Self>,
         step: &Step,
         envelope: &mut Envelope<Self>,
+        faulted: &mut engine::StepOutcome,
     ) -> EngineResult<()>;
 
     /// The guest passes that land with `step`'s rows.
@@ -94,6 +110,113 @@ pub struct Envelope<B: Serve> {
 
     /// A device cell holding the lane's one token ([`Seated::feed`]).
     pub feeds: Vec<Option<crate::serve::DeviceCell<B>>>,
+}
+
+impl<B: Serve> Envelope<B> {
+    /// `attachment`'s instance refused its envelope for `why`: its lanes
+    /// fault, and the forward embeds token 0 for them, rows nothing reads.
+    pub fn refused(
+        &mut self,
+        step: &Step,
+        attachment: &engine::fire::Attachment,
+        why: &str,
+        faulted: &mut engine::StepOutcome,
+    ) {
+        let lanes = attachment_lanes(attachment);
+        for lane in lanes.clone() {
+            let at = lane as usize;
+            if let Some(stated) = step.lanes.get(at) {
+                self.tokens[at] = Some(vec![0; stated.tokens.len()]);
+                self.masks[at] = None;
+                self.feeds[at] = None;
+            }
+        }
+        tracing::warn!(instance = attachment.instance.0, %why, "a guest envelope refused; its lanes fault");
+        faulted.fault_lanes(lanes, Some(attachment.instance), why);
+    }
+}
+
+/// Runs `pass` for each of `attachments`, each on its own: one that
+/// refuses (its instance poisoned, a guard, a stage's fault) faults its own
+/// attachment's lanes into `faulted` by `stage`, and the others run on.
+pub fn each_pass<'a>(
+    attachments: impl IntoIterator<Item = &'a engine::fire::Attachment>,
+    stage: &str,
+    faulted: &mut engine::StepOutcome,
+    mut pass: impl FnMut(&engine::fire::Attachment) -> std::result::Result<(), Refusal>,
+) {
+    for attachment in attachments {
+        if let Err(refused) = pass(attachment) {
+            tracing::warn!(
+                instance = attachment.instance.0,
+                stage,
+                %refused,
+                "a guest pass refused; its lanes fault"
+            );
+            faulted.fault_lanes(
+                attachment_lanes(attachment),
+                Some(attachment.instance),
+                &refused.to_string(),
+            );
+        }
+    }
+}
+
+/// The rows of `trace`'s widest token table, where it embeds any.
+fn token_rows(trace: &Trace) -> Option<u32> {
+    trace
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.op {
+            poem_ir::Operation::Gather(poem_ir::Gather::Embed { vocab, .. }) => Some(*vocab),
+            _ => None,
+        })
+        .max()
+}
+
+/// A lane whose tokens (as its guest resolved them, or as stated) hold an
+/// id at or past `vocab` (an out-of-bounds row the device would read as row
+/// 0) faults by name: the lanes of the attachment it is of, or itself alone.
+fn out_of_range_tokens<B: Serve>(
+    step: &Step,
+    envelope: &mut Envelope<B>,
+    vocab: u32,
+    faulted: &mut engine::StepOutcome,
+) {
+    for (at, lane) in step.lanes.iter().enumerate() {
+        let tokens = envelope.tokens[at].as_deref().unwrap_or(&lane.tokens);
+        let Some(&id) = tokens.iter().find(|&&id| id >= vocab) else {
+            continue;
+        };
+        let lane_at = u32::try_from(at).unwrap_or(u32::MAX);
+        match step
+            .attachments
+            .iter()
+            .find(|attachment| attachment_lanes(attachment).contains(&lane_at))
+        {
+            Some(attachment) => {
+                let why = format!(
+                    "instance {}: token {id} is out of range for a vocabulary of {vocab}",
+                    attachment.instance
+                );
+                envelope.refused(step, attachment, &why, faulted);
+            }
+            None => {
+                envelope.tokens[at] = Some(vec![0; lane.tokens.len()]);
+                faulted.fault_lanes(
+                    lane_at..lane_at + 1,
+                    None,
+                    &format!("token {id} is out of range for a vocabulary of {vocab}"),
+                );
+            }
+        }
+    }
+}
+
+/// The lanes `attachment`'s pass is of.
+#[must_use]
+pub fn attachment_lanes(attachment: &engine::fire::Attachment) -> std::ops::Range<u32> {
+    attachment.lane..attachment.lane + attachment.lanes.max(1)
 }
 
 /// The runtime's engine over a backend's device: one shell, its program
@@ -123,6 +246,9 @@ pub struct Gpu<B: Host> {
     /// The guest pipelines built after the load as of the last count
     /// (`Programs::built_serving`).
     guest_built: u64,
+    /// The rows of the loaded model's widest token table: a token id a
+    /// guest resolves at or past it is out of bounds.
+    vocab: Option<u32>,
 }
 
 impl<B: Host> Gpu<B> {
@@ -142,6 +268,7 @@ impl<B: Host> Gpu<B> {
             handed: None,
             live: engine::live::Live::armed(),
             guest_built: 0,
+            vocab: None,
         }
     }
 
@@ -249,13 +376,20 @@ impl<B: Host> Gpu<B> {
             return;
         };
         for (step, pending) in steps.iter_mut().enumerate() {
-            let wrote = std::mem::take(&mut pending.wrote);
-            if !wrote.is_empty() {
+            let mut outcome = engine::StepOutcome {
+                wrote: std::mem::take(&mut pending.wrote),
+                faulted: std::mem::take(&mut pending.faulted),
+            };
+            // The frame settled: every step's forward landed.
+            if let Some(fed) = pending.fed.take() {
+                outcome = crate::settle::merged(outcome, fed.faults());
+            }
+            if !outcome.wrote.is_empty() || !outcome.faulted.is_empty() {
                 let at = engine::StepDone {
                     frame: *frame,
                     step: step as u32,
                 };
-                (sink)(at, engine::StepOutcome::Wrote(wrote));
+                (sink)(at, outcome);
             }
         }
     }
@@ -514,6 +648,7 @@ where
         if ordinal > 0 {
             return Err(Error::unsupported(B::KIND, "device ordinal selection"));
         }
+        self.vocab = token_rows(&trace);
 
         let Checkpoint::Path(path) = checkpoint else {
             return Err(Error::Load(format!(
@@ -1033,19 +1168,24 @@ fn second_mover<B: Host>(programs: &B::Programs, step: &Step) -> Option<(Channel
 
 impl<B: Host> Gpu<B> {
     /// Fires `submission`'s forward; with `defers` its completion is left
-    /// for the guest pass behind it to report.
+    /// for the guest pass behind it to report. With `meet`, its landing
+    /// waits there for the guest passes the host runs behind it.
     pub fn fire_step(
         &mut self,
         submission: &Step,
         at: engine::StepDone,
         defers: bool,
+        meet: Option<crate::settle::Meet>,
     ) -> EngineResult<(FireTicket, PendingStep)> {
         debug_assert_eq!(
             second_mover::<B>(&self.programs, submission),
             None,
             "a step carries at most one fire moving a given end of a ring"
         );
-        B::run_prologues(self, submission)?;
+        // The lanes whose guest passes refused ahead of the forward: they
+        // fault, and the forward runs for every lane all the same.
+        let mut faulted = engine::StepOutcome::committed();
+        B::run_prologues(self, submission, &mut faulted)?;
         let mut staged: Vec<Vec<u8>> = Vec::new();
         if !submission.media.is_empty() {
             let Some(element) = self.loaded()?.patch_element() else {
@@ -1118,7 +1258,10 @@ impl<B: Host> Gpu<B> {
             masks: vec![None; lanes],
             feeds: vec![None; lanes],
         };
-        B::envelope(self, submission, &mut envelope)?;
+        B::envelope(self, submission, &mut envelope, &mut faulted)?;
+        if let Some(vocab) = self.vocab {
+            out_of_range_tokens(submission, &mut envelope, vocab, &mut faulted);
+        }
         let Envelope {
             tokens: resolved,
             masks: resolved_masks,
@@ -1143,10 +1286,14 @@ impl<B: Host> Gpu<B> {
             let lane = attachment.lane as usize;
             let stated = &submission.lanes[lane];
             if crate::store::frozen::reads_count(&stated.rs, stated.reports) {
-                folds[lane].count = self
-                    .programs
-                    .envelope_fold(attachment.instance)
-                    .map_err(refusal)?;
+                match self.programs.envelope_fold(attachment.instance) {
+                    Ok(count) => folds[lane].count = count,
+                    Err(refused) => faulted.fault_lanes(
+                        attachment_lanes(attachment),
+                        Some(attachment.instance),
+                        &refused.to_string(),
+                    ),
+                }
             }
         }
 
@@ -1156,14 +1303,13 @@ impl<B: Host> Gpu<B> {
             if lane.inputs.is_empty() {
                 continue;
             }
-            let instance = submission
+            // A lane feeding inputs with no attachment is a submission that
+            // names no instance to read them through: the fire as stated is
+            // malformed, not one lane's fault, and it is refused whole.
+            let attachment = submission
                 .attachments
                 .iter()
-                .find(|attachment| {
-                    (attachment.lane..attachment.lane + attachment.lanes.max(1))
-                        .contains(&(at as u32))
-                })
-                .map(|attachment| attachment.instance)
+                .find(|attachment| attachment_lanes(attachment).contains(&(at as u32)))
                 .ok_or_else(|| {
                     Error::Invalid(format!(
                         "lane {at} feeds guest inputs and has no attachment; an input is read \
@@ -1171,10 +1317,19 @@ impl<B: Host> Gpu<B> {
                     ))
                 })?;
             for feed in &lane.inputs {
-                let cell = self
-                    .programs
-                    .input_cell(instance, feed.channel)
-                    .map_err(refusal)?;
+                // A cell its instance refuses is that attachment's fault: its
+                // lanes fault, and the seat takes zeros nothing reads.
+                let cell = match self.programs.input_cell(attachment.instance, feed.channel) {
+                    Ok(cell) => cell,
+                    Err(refused) => {
+                        faulted.fault_lanes(
+                            attachment_lanes(attachment),
+                            Some(attachment.instance),
+                            &refused.to_string(),
+                        );
+                        crate::serve::InputCell::Refused
+                    }
+                };
                 input_cells[at].push((*feed, cell));
             }
         }
@@ -1216,6 +1371,7 @@ impl<B: Host> Gpu<B> {
                 }
             }
         }
+        let vocab = self.vocab;
         let shell = self.loaded_mut()?;
 
         let mut words: Vec<u64> = submission.lanes.iter().map(|lane| lane.word).collect();
@@ -1337,12 +1493,18 @@ impl<B: Host> Gpu<B> {
             .collect();
 
         let wrote;
+        let mut faulted = faulted.faulted;
+        let mut fed = None;
         let landed = {
             use engine::frame::Shell as FrameShell;
             let done = sink.filter(|_| !defers).map(|sink| Done {
                 at,
                 sink,
                 wrote: Vec::new(),
+                lanes: u32::try_from(submission.lanes.len()).unwrap_or(u32::MAX),
+                faulted: std::mem::take(&mut faulted),
+                meet,
+                fed: None,
             });
             let mut prepared = FrameShell::prepare(
                 shell,
@@ -1359,6 +1521,37 @@ impl<B: Host> Gpu<B> {
             )
             .map_err(fault)?;
             wrote = std::mem::take(&mut prepared.wrote);
+            // A lane fed its token on the device is checked once the
+            // forward landed, from what the forward embedded.
+            if let Some(vocab) = vocab
+                && !prepared.fed_lanes.is_empty()
+            {
+                let lanes = prepared
+                    .fed_lanes
+                    .iter()
+                    .map(|&(source, row)| {
+                        let attached = submission
+                            .attachments
+                            .iter()
+                            .find(|attachment| attachment_lanes(attachment).contains(&source));
+                        crate::settle::FedLane {
+                            row,
+                            lanes: attached.map_or(source..source + 1, attachment_lanes),
+                            instance: attached.map(|attachment| attachment.instance),
+                        }
+                    })
+                    .collect();
+                let check = crate::settle::FedCheck::new(
+                    shell.token_row_reader(prepared.arm),
+                    lanes,
+                    vocab,
+                );
+                prepared.fed_check = Some(check.clone());
+                match prepared.done.as_mut() {
+                    Some(done) => done.fed = Some(check),
+                    None => fed = Some(check),
+                }
+            }
             let enqueued = FrameShell::enqueue(shell, prepared).map_err(fault)?;
             FrameShell::settle(shell, enqueued).map_err(fault)?
         };
@@ -1377,6 +1570,8 @@ impl<B: Host> Gpu<B> {
                 landed,
                 rows: None,
                 wrote,
+                faulted,
+                fed,
             },
         ))
     }
@@ -1409,4 +1604,51 @@ pub fn program_attachments(step: &Step) -> impl Iterator<Item = &engine::fire::A
     step.attachments
         .iter()
         .filter(|attachment| !attachment.adapter_only)
+}
+
+#[cfg(test)]
+mod tests {
+    use engine::fire::Attachment;
+    use engine::program::InstanceId;
+
+    use super::each_pass;
+    use crate::program::Refusal;
+
+    /// A step's prologues run each on its own: the one whose instance was
+    /// poisoned in an earlier step refuses and faults its own lanes, by
+    /// name; the other three run, and fault nothing.
+    #[test]
+    fn a_refused_prologue_faults_its_own_lanes_alone() {
+        let attachments: Vec<Attachment> = (0..4u32)
+            .map(|at| Attachment {
+                lane: at * 2,
+                lanes: 2,
+                instance: InstanceId(100 + u64::from(at)),
+                adapter_only: false,
+            })
+            .collect();
+        let mut ran = Vec::new();
+        let mut faulted = engine::StepOutcome::committed();
+        each_pass(&attachments, "prologue", &mut faulted, |attachment| {
+            ran.push(attachment.instance);
+            if attachment.instance == InstanceId(102) {
+                Err(Refusal::Program("instance 102 is poisoned".into()))
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(ran.len(), 4, "every prologue ran");
+        let lanes: Vec<(u32, Option<InstanceId>)> = faulted
+            .faulted
+            .iter()
+            .map(|fault| (fault.lane, fault.instance))
+            .collect();
+        assert_eq!(
+            lanes,
+            [(4, Some(InstanceId(102))), (5, Some(InstanceId(102)))],
+            "the refusing instance's two lanes, and no other"
+        );
+        assert!(faulted.faulted.iter().all(|f| f.reason.contains("poisoned")));
+        assert!(faulted.wrote.is_empty());
+    }
 }
