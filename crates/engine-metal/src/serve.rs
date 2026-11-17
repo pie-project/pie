@@ -1237,13 +1237,14 @@ impl PreparedLoad<'_> {
                         .sum::<usize>(),
                 )
                 .unwrap_or(u32::MAX);
-                // The rungs to the device's fire top
-                // (`engine::roofline::fire_top` over its rates): no rung past
-                // it can be chosen. A device without the rates has none, and
-                // the ruling refuses it by name.
-                let saturated = engine::roofline::Constants::of(&chip.tuned().rates)
-                    .map_or(u32::MAX, |constants| {
-                        engine::roofline::fire_top(&crate::rates::lattice_rows(), &constants)
+                // The model's fire top on this device: the estimate's argmax
+                // of tokens a ns over every lattice rung no wider than the
+                // load's context (`FireEstimate::fire_top`), the one bound on
+                // the rungs a served load offers. A device without the
+                // rates has no estimate, and the ruling refuses it by name.
+                let saturated = engine::load::estimate(&counts, &chip.tuned().rates)
+                    .map_or(u32::MAX, |estimate| {
+                        estimate.fire_top(&crate::rates::lattice_rows(), boot.context)
                     })
                     .max(act.first().map_or(1, |&(tokens, _)| tokens));
                 let candidates: Vec<crate::top::Candidate> = act
