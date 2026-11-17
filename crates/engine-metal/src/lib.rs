@@ -33,6 +33,7 @@ pub mod mapping;
 pub mod mask;
 pub mod program;
 pub mod rates;
+pub mod top;
 pub mod rs;
 pub mod run;
 mod scratch;
@@ -64,7 +65,7 @@ pub use run::{
     StructSlot, WeightRow, WeightTable,
 };
 pub use scratch::Scratch;
-pub use serve::{Attached, Boot, Enqueued, Landed, Lane, Prepared, Seated, Shell, StepView};
+pub use serve::{Top, Attached, Boot, Enqueued, Landed, Lane, Prepared, Seated, Shell, StepView};
 pub use settle::{Airborne, Arms, Done};
 pub use store::Pools;
 pub use weights::{AdapterPlane, BankSeat, Weights};
