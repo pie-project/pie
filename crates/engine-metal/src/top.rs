@@ -84,16 +84,18 @@ pub fn rung_facts(
         .collect()
 }
 
-/// The top rung of `rungs` on `device`, whose profile states `rates`, over
-/// a live range of `live` bytes ([`engine::load::choose`]).
+/// The top rung of `rungs` no wider than `context` on `device`, whose
+/// profile states `rates`, over a live range of `live` bytes
+/// ([`engine::load::choose`]).
 pub fn choose(
     rungs: &[RungFacts],
     live: u64,
+    context: u32,
     rates: &profile::fire::Rates,
     device: &str,
     counts: &Counts,
 ) -> Result<TopRung> {
-    engine::load::choose(rungs, live, rates, device, counts)
+    engine::load::choose(rungs, live, context, rates, device, counts)
         .map(|(top, _)| top)
         .map_err(|refused| Fault::Residency(refused.to_string()))
 }
@@ -169,6 +171,7 @@ mod tests {
         let err = choose(
             &rungs,
             1 << 33,
+            u32::MAX,
             &profile::fire::Rates::default(),
             "Apple X",
             &counts(),
@@ -187,10 +190,10 @@ mod tests {
             launch_ns: Some(5000),
             ..profile::fire::Rates::default()
         };
-        let top = choose(&rungs, 1 << 33, &rated, "Apple X", &counts()).unwrap();
+        let top = choose(&rungs, 1 << 33, u32::MAX, &rated, "Apple X", &counts()).unwrap();
         assert!(matches!(top.tokens, 1024 | 2048));
         let none = rung_facts(&[candidate(1024, 300)], MIB, 256, 200);
-        let err = choose(&none, 1 << 33, &rated, "Apple X", &counts()).unwrap_err();
+        let err = choose(&none, 1 << 33, u32::MAX, &rated, "Apple X", &counts()).unwrap_err();
         assert!(
             err.to_string()
                 .contains("1024 tokens (span 300 MiB): past one buffer"),

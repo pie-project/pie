@@ -1237,21 +1237,13 @@ impl PreparedLoad<'_> {
                         .sum::<usize>(),
                 )
                 .unwrap_or(u32::MAX);
-                // The model's fire top on this device: the estimate's argmax
-                // of tokens a ns over every lattice rung no wider than the
-                // load's context (`FireEstimate::fire_top`), the one bound on
-                // the rungs a served load offers. A device without the
-                // rates has no estimate, and the ruling refuses it by name.
-                let saturated = engine::load::estimate(&counts, &chip.tuned().rates)
-                    .map_or(u32::MAX, |estimate| {
-                        estimate.fire_top(&crate::rates::lattice_rows(), boot.context)
-                    })
-                    .max(act.first().map_or(1, |&(tokens, _)| tokens));
+                // Every rung of the lattice the load lays is weighed, each as
+                // its check fire shapes it (`RungFacts`); the ruling over them
+                // to the load's context is both the served top and the
+                // model's fire top (`engine::load::fire_top`), so the check's
+                // pick and the served bound are one choice.
                 let candidates: Vec<crate::top::Candidate> = act
                     .iter()
-                    // A check's load (`Top::EveryRung`) weighs every rung it
-                    // lays, past the top too: the check times them.
-                    .filter(|&&(tokens, _)| boot.top == Top::EveryRung || tokens <= saturated)
                     .map(|&(tokens, chunks)| crate::top::Candidate {
                         tokens,
                         chunks,
@@ -1270,15 +1262,34 @@ impl PreparedLoad<'_> {
                     budgets.tokens.max_lanes,
                     part_chunks,
                 );
-                (counts, rungs, live, saturated)
+                // The model's fire top, for the check: the same ruling over
+                // the rungs to the context. A device without the rates has no
+                // estimate; its top is the widest rung laid, and a served load
+                // is refused by name below.
+                let fire_top = engine::load::estimate(&counts, &chip.tuned().rates)
+                    .ok()
+                    .and_then(|estimate| {
+                        engine::load::fire_top(&rungs, live, &estimate, boot.context).ok()
+                    })
+                    .map_or_else(
+                        || rungs.iter().map(|r| r.tokens).max().unwrap_or(1),
+                        |top| top.tokens,
+                    );
+                (counts, rungs, live, fire_top)
             })
         } else {
             None
         };
         if let Some((counts, rungs, live, _)) = weighed.as_ref().filter(|_| boot.top == Top::Ruled) {
             let (live, rungs) = (*live, rungs.clone());
-            let pick =
-                crate::top::choose(&rungs, live, &chip.tuned().rates, device.name(), &counts)?;
+            let pick = crate::top::choose(
+                &rungs,
+                live,
+                boot.context,
+                &chip.tuned().rates,
+                device.name(),
+                &counts,
+            )?;
             let asked = budgets.tokens.max_tokens;
             tracing::info!(
                 "{}: {}",
