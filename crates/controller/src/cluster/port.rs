@@ -734,10 +734,17 @@ impl Port {
                 .sites
                 .iter()
                 .map(|w| {
-                    let tier = if pools.contains(w) {
-                        Tier::Host
-                    } else {
-                        Tier::Device
+                    let off = group
+                        .site_tiers
+                        .iter()
+                        .find(|(site, _)| site == w)
+                        .map(|(_, tier)| *tier);
+                    // A pool keeps what it holds in host memory.
+                    let tier = match off {
+                        Some(controller_api::OffDevice::Disk) => Tier::Disk,
+                        Some(controller_api::OffDevice::Host) => Tier::Host,
+                        None if pools.contains(w) => Tier::Host,
+                        None => Tier::Device,
                     };
                     (w.0.to_string(), tier, tokens)
                 })
@@ -882,6 +889,7 @@ mod tests {
         let group = GroupView {
             keys: vec![[1; 32], [2; 32], [3; 32]],
             sites: vec![WorkerId(0)],
+            site_tiers: Vec::new(),
             disk_sites: Vec::new(),
             persist_tokens: None,
         };

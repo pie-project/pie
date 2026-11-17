@@ -965,6 +965,32 @@ impl KvPageTable {
         keys
     }
 
+    /// The sealed pages of the nodes of `ids` that are off the device, by
+    /// key: `false` on the host, `true` on disk.
+    pub fn off_device_key_list(&self, ids: &[NodeId]) -> Vec<(Hash256, bool)> {
+        let mut keys = Vec::new();
+        for node in ids.iter().filter_map(|&id| self.nodes.get(id)) {
+            if let Pages::Owned {
+                page_hashes,
+                backings,
+                ..
+            } = &node.pages
+            {
+                for (key, backing) in page_hashes.iter().zip(backings) {
+                    let on_disk = match backing {
+                        KvPageBacking::Resident(_) => continue,
+                        KvPageBacking::Swapped(_) => false,
+                        KvPageBacking::OnDisk(_) => true,
+                    };
+                    if let Some(key) = key {
+                        keys.push((*key, on_disk));
+                    }
+                }
+            }
+        }
+        keys
+    }
+
     /// A node of sealed pages that came from elsewhere. Grafted `after` the
     /// page it extends, a pass that maps the prefix maps it too: attaching
     /// takes the trie path to a run's last page. With no `after` it starts a

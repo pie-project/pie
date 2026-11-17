@@ -1895,6 +1895,11 @@ impl KvStore {
         self.table.sealed_key_list(ids)
     }
 
+    /// Those of them off the device: `false` on the host, `true` on disk.
+    pub fn off_device_key_list(&self, ids: &[NodeId]) -> Vec<(Hash256, bool)> {
+        self.table.off_device_key_list(ids)
+    }
+
     /// Host slots to land pages in that come from another worker; given
     /// back with [`Self::free_host_slots`] unless an import takes them.
     /// The tokens written to `ws`, as far as every write since is known.
