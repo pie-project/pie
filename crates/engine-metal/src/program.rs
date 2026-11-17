@@ -1632,7 +1632,7 @@ mod tests {
     #[test]
     fn a_beam_step_answers_what_the_interpreter_answers() {
         use eta_compiler::codegen::program::{Backend, emit_program};
-        use eta_compiler::contract::beam_stage;
+        use eta_compiler::contract::{Accuracy, beam_stage};
         use eta_compiler::plan::compile_bound;
         let Ok(context) = Context::bind() else {
             eprintln!("no device: skipping");
@@ -1702,8 +1702,8 @@ mod tests {
                     .take(channel)
                     .expect("a channel reads")
                     .expect("the channel holds a cell");
-                if &got != want {
-                    wrong.push(format!("{}: channel {channel}: {got:02x?} != {want:02x?}", case.name));
+                if let Err(why) = case.agrees(channel, &got, want, Accuracy::METAL_PRECISE, 1) {
+                    wrong.push(why);
                 }
             }
         }
@@ -1793,7 +1793,7 @@ mod tests {
     #[test]
     fn beam_steps_answer_what_the_interpreter_answers() {
         use eta_compiler::codegen::program::{Backend, emit_program};
-        use eta_compiler::contract::{beam_stage, wire};
+        use eta_compiler::contract::{Accuracy, beam_stage, wire};
         use eta_compiler::eval::interp::{Instance, NoKernels, PassInputs, Value};
         use eta_compiler::plan::compile_bound;
         const STEPS: u32 = 16;
@@ -1881,13 +1881,10 @@ mod tests {
                     };
                     let want = wire(&want);
                     let got = plane.instance(id).expect("bound").head_cell(channel).expect("reads");
-                    if got != want {
-                        wrong.push(format!(
-                            "{} step {step}: carried channel {channel}: {:02x?} != {:02x?}",
-                            case.name,
-                            &got[..got.len().min(16)],
-                            &want[..want.len().min(16)]
-                        ));
+                    if let Err(why) =
+                        case.agrees(channel, &got, &want, Accuracy::METAL_PRECISE, step + 1)
+                    {
+                        wrong.push(format!("step {step}: carried {why}"));
                         break 'steps;
                     }
                 }
@@ -1899,11 +1896,10 @@ mod tests {
                         .take(channel)
                         .expect("reads")
                         .expect("a cell");
-                    if got != want {
-                        wrong.push(format!(
-                            "{} step {step}: channel {channel}: {got:02x?} != {want:02x?}",
-                            case.name
-                        ));
+                    if let Err(why) =
+                        case.agrees(channel, &got, &want, Accuracy::METAL_PRECISE, step + 1)
+                    {
+                        wrong.push(format!("step {step}: {why}"));
                         break 'steps;
                     }
                 }
@@ -1917,7 +1913,7 @@ mod tests {
     #[test]
     fn beam_steps_with_a_prompt_past_a_word_answer_what_the_interpreter_answers() {
         use eta_compiler::codegen::program::{Backend, emit_program};
-        use eta_compiler::contract::{beam_stage, wire};
+        use eta_compiler::contract::{Accuracy, beam_stage, wire};
         use eta_compiler::eval::interp::{Instance, NoKernels, PassInputs, Value};
         use eta_compiler::plan::compile_bound;
         const STEPS: u32 = 16;
@@ -2024,13 +2020,10 @@ mod tests {
                     };
                     let want = wire(&want);
                     let got = plane.instance(id).expect("bound").head_cell(channel).expect("reads");
-                    if got != want {
-                        wrong.push(format!(
-                            "{} step {step}: carried channel {channel}: {:02x?} != {:02x?}",
-                            case.name,
-                            &got[..got.len().min(16)],
-                            &want[..want.len().min(16)]
-                        ));
+                    if let Err(why) =
+                        case.agrees(channel, &got, &want, Accuracy::METAL_PRECISE, step + 1)
+                    {
+                        wrong.push(format!("step {step}: carried {why}"));
                         break 'steps;
                     }
                 }
@@ -2042,11 +2035,10 @@ mod tests {
                         .take(channel)
                         .expect("reads")
                         .expect("a cell");
-                    if got != want {
-                        wrong.push(format!(
-                            "{} step {step}: channel {channel}: {got:02x?} != {want:02x?}",
-                            case.name
-                        ));
+                    if let Err(why) =
+                        case.agrees(channel, &got, &want, Accuracy::METAL_PRECISE, step + 1)
+                    {
+                        wrong.push(format!("step {step}: {why}"));
                         break 'steps;
                     }
                 }
