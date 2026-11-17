@@ -20,7 +20,7 @@ const SEARCH_SKIPS: &[&str] = &[
 ];
 
 /// The facts a tuned file assumes: what a kernel's requirement reads.
-const ASSUME: &[&str] = &["vendor", "subgroup", "coopmat", "cores"];
+pub(crate) const ASSUME: &[&str] = &["vendor", "subgroup", "coopmat", "cores"];
 
 /// What a tuned overlay on `base` may assume: its target, and the facts
 /// [`ASSUME`] names as this device reports them.
@@ -819,7 +819,9 @@ fn rates(base: &Profile, say: &mut dyn FnMut(&str)) -> Result<profile::fire::Rat
     )
     .map_err(|e| e.to_string())?;
     let tuning = crate::tuning::Tuning::new(base.clone(), device.limits());
-    let rates = crate::rates::measure_saying(&device, &tuning, say).map_err(|e| e.to_string())?;
+    let rates = crate::rates::measure_saying(&device, &tuning, say)
+        .map_err(|e| e.to_string())?
+        .rates;
     // The matmul path the profile selects on this card, which the rates
     // step measures through.
     let tier = <crate::device::Api as engine_gpu::serve::Serve>::tier(&device);
@@ -1013,14 +1015,7 @@ pub fn run(
         ("checked", format!("\"{}\"", checked.replace('"', "'"))),
     ];
     if steps.rates {
-        provenance.push(engine::rates::provenance(
-            "vulkan",
-            &format!(
-                "the matmul through the profile's path, the host's clock around each frame; \
-                 operands: engine::rates' pattern; at {}",
-                engine::rates::build_commit()
-            ),
-        ));
+        provenance.push(crate::rates::provenance(&name));
     }
     let file = search::assemble(
         crate::chip::registry(),

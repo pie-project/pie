@@ -4,10 +4,9 @@
 //! browser's load (its adapter is masked, so no profile states its rates)
 //! and `pie tune --rates` natively.
 //!
-//! Each kind of work is timed inside a frame: up to [`REPEATS`] of it back
-//! to back (as many as fit [`BURST_NS`] by a first frame of one, so no
-//! submission runs long on a device that kills one past a few seconds)
-//! against one, the median of [`ROUNDS`] after a warm frame (which builds
+//! Each kind of work is timed inside a frame: `n` of it back to back
+//! against one (`n` doubled until a fire's time settles,
+//! `engine::rates::timed_frames`), the median of [`ROUNDS`] after a warm frame (which builds
 //! its pipelines), so the frame's one submit and wait cancel and what is
 //! left is the work's own time beside a dispatch's:
 //! - the backend's own bf16 matmul `m x GEMM_WIDTH x GEMM_WIDTH` at each of
@@ -58,15 +57,6 @@ pub const COPY_BYTES: u64 = 256 << 20;
 /// The matmul a launch is timed with: its work is nothing beside a launch.
 pub const LAUNCH: u32 = 16;
 
-/// The most fires a timed frame carries back to back, against a frame of
-/// one.
-pub const REPEATS: u32 = 16;
-
-/// What a timed frame of repeats may take, by its first frame of one: a
-/// fifth of a second, far inside the couple of seconds past which a mobile
-/// GPU's driver kills a submission.
-pub const BURST_NS: u64 = 200_000_000;
-
 /// Timed frames of each kind; the median is kept.
 pub const ROUNDS: usize = 5;
 
@@ -98,16 +88,23 @@ struct Rig<'a, B: Serve> {
     held: Vec<B::Buffer>,
     /// `engine::rates::operand_pattern`, made once.
     pattern: Option<Vec<u8>>,
+    /// The device's bound on one submission, where it states one: the only
+    /// cap on a timed frame (`engine::rates::timed_frames`).
+    max_submit: Option<std::time::Duration>,
+    /// A frame stopped at `max_submit` before it settled.
+    unsettled: std::cell::Cell<bool>,
 }
 
 impl<'a, B: Serve> Rig<'a, B> {
-    fn new(device: &'a B::Context) -> Self {
+    fn new(device: &'a B::Context, max_submit: Option<std::time::Duration>) -> Self {
         Rig {
             device,
             handles: Handles::<B>::new(),
             pipelines: B::Pipelines::default(),
             held: Vec::new(),
             pattern: None,
+            max_submit,
+            unsettled: std::cell::Cell::new(false),
         }
     }
 
@@ -180,7 +177,9 @@ impl<'a, B: Serve> Rig<'a, B> {
         timer(f)
     }
 
-    /// One `fire`'s time inside a frame: [`REPEATS`] of it against one, the
+    /// One `fire`'s time inside a frame: a frame of `n` of it against one,
+    /// `n` doubled until a fire's time settles (`engine::rates::timed_frames`,
+    /// every engine's rule; the device's `max_submit` the only cap), the
     /// host's clock around each frame's one submit.
     fn each(
         &self,
@@ -194,14 +193,24 @@ impl<'a, B: Serve> Rig<'a, B> {
                 .collect::<Result<Vec<u64>>>()?;
             Ok(median(walls))
         };
-        let (_, first) = self.frame(timer, 1, fire, &nothing)?;
-        // As many repeats as fit the burst by the first frame's time.
-        let repeats = u32::try_from(BURST_NS / first.max(1))
-            .unwrap_or(REPEATS)
-            .clamp(2, REPEATS);
-        self.frame(timer, repeats, fire, &nothing)?;
-        let (one, many) = (wall(1)?, wall(repeats)?);
-        Ok((many.saturating_sub(one) / u64::from(repeats - 1)).max(1))
+        self.frame(timer, 1, fire, &nothing)?;
+        let frames = engine::rates::timed_frames(
+            self.max_submit,
+            None,
+            |n| self.frame(timer, n, fire, &nothing).map(|(_, w)| w as f64),
+            |why| Fault::Device { call: "rates", why },
+        )?;
+        if frames.capped {
+            self.unsettled.set(true);
+        }
+        let count = frames.fires;
+        let one = wall(1)?;
+        if count < 2 {
+            return Ok(one);
+        }
+        self.frame(timer, count, fire, &nothing)?;
+        let many = wall(count)?;
+        Ok((many.saturating_sub(one) / u64::from(count - 1)).max(1))
     }
 }
 
@@ -211,14 +220,16 @@ fn median(mut v: Vec<u64>) -> u64 {
 }
 
 /// The rates of `device`, its kernels under the tactics `tactics` picks at
-/// `tier`.
+/// `tier`, no timed frame past `max_submit` where the device states one
+/// (`engine::rates::timed_frames`).
 pub fn measure<B: Serve, T: Tactics + ?Sized>(
     device: &B::Context,
     tactics: &T,
     tier: kernels_slang::Tier,
     timer: Timer<'_, B>,
-) -> Result<Rates> {
-    measure_saying::<B, T>(device, tactics, tier, timer, &mut |_| {})
+    max_submit: Option<std::time::Duration>,
+) -> Result<engine::rates::Measured> {
+    measure_saying::<B, T>(device, tactics, tier, timer, max_submit, &mut |_| {})
 }
 
 /// [`measure`], saying how the warm-up ended and what each shape reached.
@@ -227,9 +238,10 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     tactics: &T,
     tier: kernels_slang::Tier,
     timer: Timer<'_, B>,
+    max_submit: Option<std::time::Duration>,
     say: &mut dyn FnMut(&str),
-) -> Result<Rates> {
-    let mut rig = Rig::<B>::new(device);
+) -> Result<engine::rates::Measured> {
+    let mut rig = Rig::<B>::new(device, max_submit);
     // The launch first: every rate below takes its dispatches' launches off.
     let (bytes_per_ns, launch_ns) = copy_and_launch(&mut rig, tactics.gemm(tier), timer, say)?;
     rig.release();
@@ -241,16 +253,24 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         engine::rates::WARM_SHAPE.0,
         warmed.rate / 1e3
     ));
-    let w = engine::rates::GEMM_WIDTH;
+    // The matmul curve at each width of `engine::rates::GEMM_WIDTHS` (n = k)
+    // and each octave of `engine::rates::GEMM_ROWS`, through the kernel this
+    // backend picks at that shape (`kernels_slang::linear::gemm::tile_for`);
+    // the rows are multiples of every kernel's row tile, so the estimate's
+    // padding to it (`row_tile`) lies between them.
     let mut gemm = Vec::new();
-    for m in engine::rates::GEMM_ROWS {
-        let rate = matmul(&mut rig, tactics.gemm(tier), timer, (m, w, w), launch)?;
-        rig.release();
-        say(&format!(
-            "[rates]: matmul {m}x{w}x{w}: {:.1} TFLOP/s",
-            rate / 1e3
-        ));
-        gemm.push((m, rate));
+    for w in engine::rates::GEMM_WIDTHS {
+        let mut curve = Vec::new();
+        for m in engine::rates::GEMM_ROWS {
+            let rate = matmul(&mut rig, tactics.gemm(tier), timer, (m, w, w), launch)?;
+            rig.release();
+            say(&format!(
+                "[rates]: matmul {m}x{w}x{w}: {:.1} TFLOP/s",
+                rate / 1e3
+            ));
+            curve.push((m, rate));
+        }
+        gemm.push((w, curve));
     }
     let mut attn = Vec::new();
     for keys in engine::rates::ATTN_KEYS {
@@ -281,15 +301,20 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     let tflops = |curve: Vec<(u32, f64)>| -> Vec<(u32, f64)> {
         curve.into_iter().map(|(x, r)| (x, r / 1e3)).collect()
     };
-    // One width, `engine::rates::GEMM_WIDTH`: a plane of another is read at
-    // it (this backend times no narrower curve yet).
-    Ok(Rates {
-        launch_ns: Some(launch_ns),
-        gemm_tflops_by_rows: Some(vec![(engine::rates::GEMM_WIDTH, tflops(gemm))]),
-        attn_tflops_by_keys: Some(tflops(attn)),
-        hbm_gbps: Some(bytes_per_ns),
-        elementwise_gbps: Some(elementwise),
-        scan_gelems: Some(scan),
+    Ok(engine::rates::Measured {
+        rates: Rates {
+            launch_ns: Some(launch_ns),
+            gemm_tflops_by_rows: Some(
+                gemm.into_iter()
+                    .map(|(w, curve)| (w, tflops(curve)))
+                    .collect(),
+            ),
+            attn_tflops_by_keys: Some(tflops(attn)),
+            hbm_gbps: Some(bytes_per_ns),
+            elementwise_gbps: Some(elementwise),
+            scan_gelems: Some(scan),
+        },
+        unsettled: rig.unsettled.get(),
     })
 }
 
@@ -350,8 +375,20 @@ fn warm<B: Serve>(
     };
     let planes = u32::try_from(weights.len()).unwrap_or(u32::MAX);
     let nothing = |_: &mut B::Frame| Ok(());
+    // A rotation over every plane in one frame, or in frames of as many as
+    // fit under the device's bound on one submission where it states one.
+    let (_, one) = rig.frame(timer, 1, &fire, &nothing)?;
+    let per = rig.max_submit.map_or(planes, |cap| {
+        ((cap.as_nanos() as f64 / (one as f64).max(1.0)).floor() as u32).clamp(1, planes)
+    });
     let warmed = engine::rates::warm_up(|| {
-        let (_, wall) = rig.frame(timer, planes, &fire, &nothing)?;
+        let mut wall = 0u64;
+        let mut left = planes;
+        while left > 0 {
+            let count = per.min(left);
+            wall += rig.frame(timer, count, &fire, &nothing)?.1;
+            left -= count;
+        }
         Ok::<f64, Fault>(gemm_flops(m, n, k) * f64::from(planes) / wall.max(1) as f64)
     })?;
     rig.release();
@@ -650,7 +687,7 @@ pub fn attention_rate<B: Serve, T: Tactics + ?Sized>(
     shape: engine::rates::AttnShape,
     launch: f64,
 ) -> Result<f64> {
-    let mut rig = Rig::<B>::new(device);
+    let mut rig = Rig::<B>::new(device, None);
     attention(&mut rig, tactics, tier, timer, shape, launch)
 }
 
@@ -662,7 +699,7 @@ pub fn gemm_rate<B: Serve>(
     timer: Timer<'_, B>,
     (m, n, k): (u32, u32, u32),
 ) -> Result<f64> {
-    let mut rig = Rig::<B>::new(device);
+    let mut rig = Rig::<B>::new(device, None);
     let act = rig.operand(m, k, Dtype::Bf16)?;
     let w = rig.operand(n, k, Dtype::Bf16)?;
     let y = rig.zeros(m, n, Dtype::Bf16)?;

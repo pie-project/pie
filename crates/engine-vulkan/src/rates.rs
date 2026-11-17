@@ -4,15 +4,66 @@
 
 use engine_gpu::backend::Tactics as _;
 use engine_gpu::error::Result;
-use profile::fire::Rates;
 
 use crate::device::{Api, Context, Frame};
 
+/// The `[provenance]` entry a measurement of `device`'s rates writes beside
+/// them (`engine::rates::provenance`): how Vulkan measured them.
+#[must_use]
+pub fn provenance(device: &str) -> (&'static str, String) {
+    engine::rates::provenance(
+        "vulkan",
+        &format!(
+            "{device}; the matmul through the profile's path, the host's clock around each \
+             frame; operands: engine::rates' pattern; at {}",
+            engine::rates::build_commit()
+        ),
+    )
+}
+
+/// `tuning` with every roofline constant stated
+/// (`engine::rates::rates_at_load`, every engine's rule): as its layers
+/// state them where they state them all; else `device`'s own, measured
+/// before the load is ready, each timed frame under `max_submit` where the
+/// device states one, saved to the user's profile under `profiles`.
+pub fn at_load(
+    device: &Context,
+    tuning: crate::tuning::Tuning,
+    profiles: Option<&std::path::Path>,
+    max_submit: Option<std::time::Duration>,
+) -> Result<crate::tuning::Tuning> {
+    let chip = tuning.profile().clone();
+    let measured = device.chip();
+    let check = |text: &str| {
+        crate::chip::registry()
+            .parse(text, "the measured rates", profile::Strict::User)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    };
+    let save = profiles.map(|profiles| engine::rates::SaveTo {
+        path: crate::chip::SHELF.user_path(profiles, &measured.name),
+        provenance: provenance(&measured.name),
+        check: &check,
+    });
+    let chip = engine::rates::rates_at_load(chip, save, max_submit, |max_submit| {
+        measure(device, &tuning, max_submit).map_err(|e| e.to_string())
+    })
+    .map_err(|why| engine_gpu::error::Fault::Device {
+        call: "rates at load",
+        why,
+    })?;
+    Ok(crate::tuning::Tuning::new(chip, device.limits()))
+}
+
 /// The rates of `device`, under the tactics `tuning` picks.
-pub fn measure(device: &Context, tuning: &crate::tuning::Tuning) -> Result<Rates> {
+pub fn measure(
+    device: &Context,
+    tuning: &crate::tuning::Tuning,
+    max_submit: Option<std::time::Duration>,
+) -> Result<engine::rates::Measured> {
     let tier = <Api as engine_gpu::serve::Serve>::tier(device);
     let timer = |frame: Frame| Ok((None, (frame.commit_timed()? * 1e9) as u64));
-    engine_gpu::rates::measure::<Api, _>(device, tuning, tier, &timer)
+    engine_gpu::rates::measure::<Api, _>(device, tuning, tier, &timer, max_submit)
 }
 
 /// [`measure`], saying how the warm-up ended.
@@ -20,10 +71,10 @@ pub fn measure_saying(
     device: &Context,
     tuning: &crate::tuning::Tuning,
     say: &mut dyn FnMut(&str),
-) -> Result<Rates> {
+) -> Result<engine::rates::Measured> {
     let tier = <Api as engine_gpu::serve::Serve>::tier(device);
     let timer = |frame: Frame| Ok((None, (frame.commit_timed()? * 1e9) as u64));
-    engine_gpu::rates::measure_saying::<Api, _>(device, tuning, tier, &timer, say)
+    engine_gpu::rates::measure_saying::<Api, _>(device, tuning, tier, &timer, None, say)
 }
 
 /// The bf16 matmul rate of `device` at `(m, n, k)`, under the tactic
