@@ -675,9 +675,9 @@ mod tests {
     /// a byte a ns, one flop a ns.
     fn estimate(fixed_ns: u64, per_token_ns: f64) -> FireEstimate {
         FireEstimate {
-            // The lattices up to 10240 and 16384 rows: every rung below.
-            flops_grid: crate::rates::row_lattice(16384)
-                .into_iter()
+            // Every power of two to 16384 rows and 10240: every rung below.
+            flops_grid: (0..=14)
+                .map(|i| 1u32 << i)
                 .chain([10240])
                 .map(|m| (m, 1, 1, 1.0))
                 .collect(),
@@ -862,8 +862,8 @@ mod tests {
         let e = FireEstimate {
             // At depth 64: 1 a ns to 4 rows, then one more each doubling to 5
             // at 64 and past. At depth 256: twice that.
-            flops_grid: crate::rates::row_lattice(8192)
-                .into_iter()
+            flops_grid: (0..=13)
+                .map(|i| 1u32 << i)
                 .flat_map(|m| {
                     let r = (f64::from(m).log2() - 1.0).clamp(1.0, 5.0);
                     [(m, 64, 64, r), (m, 256, 256, 2.0 * r)]

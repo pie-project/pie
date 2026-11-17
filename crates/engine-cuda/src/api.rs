@@ -413,9 +413,59 @@ pub(crate) fn lattice(
     }
 }
 
-/// The rows a fire takes when neither `max_forward_tokens` nor the chip's
-/// profile states them.
+/// The rows a patch ladder is derived from when a load states no tokens.
 pub(crate) const DEFAULT_FORWARD_TOKENS: u32 = 8192;
+
+/// The rung lattice under `engine` up to `top`: [`default_lattice`]'s
+/// points below it and `top` itself. With `top` the card's fire top (the
+/// widest row of its profile's measured grid, [`fire_top_of`]: the grid's
+/// saturation point, `crate::rates::Saturation`), the candidates a load
+/// with no stated buckets weighs and the rows `--rates` times its grid at.
+#[must_use]
+pub(crate) fn rung_lattice(engine: &crate::chip::Engine, top: u32) -> Vec<u32> {
+    default_lattice(
+        top,
+        engine.lattice_steps,
+        engine.prefill_lattice_from,
+        engine.prefill_lattice_steps,
+    )
+}
+
+/// The widest rung of [`rung_lattice`] to `top` at or below `tokens` (its
+/// first where none is): a load asked other tokens (the walk fit,
+/// `engine.fire_rows`, a stated `max_forward_tokens`, a refit) lays no last
+/// point off the grid.
+#[must_use]
+pub(crate) fn on_lattice(engine: &crate::chip::Engine, top: u32, tokens: u32) -> u32 {
+    let lattice = rung_lattice(engine, top);
+    lattice
+        .iter()
+        .rev()
+        .copied()
+        .find(|&rung| rung <= tokens)
+        .unwrap_or(lattice[0])
+}
+
+/// The card's fire top: the widest row its profile's matmul grid states
+/// (`[rates] bf16_flops_per_ns_by_rows_n_k`, timed to the top
+/// the grid saturated at, `crate::rates::Saturation`). A profile with no grid has no
+/// top, and a load on it is refused for its missing rates, by name.
+pub(crate) fn fire_top_of(chip: &profile::Profile, device: &str) -> crate::error::Result<u32> {
+    let rates = chip.rates();
+    rates
+        .bf16_flops_per_ns_by_rows_n_k
+        .as_deref()
+        .and_then(|grid| profile::fire::gemm_rows(grid).last().copied())
+        .ok_or_else(|| {
+            Fault::Card(
+                engine::load::Refused::NoRates {
+                    device: device.to_owned(),
+                    key: "bf16_flops_per_ns_by_rows_n_k",
+                }
+                .to_string(),
+            )
+        })
+}
 
 /// The load's budgets for `trace`: its logit readouts sized to what the
 /// trace drafts, not the general 16 a lane, so a vocab-wide head carves only

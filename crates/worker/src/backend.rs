@@ -78,8 +78,8 @@ impl Fire {
 
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 const METAL_FIRE: Fire = Fire {
-    lanes: 512,
-    tokens: 10240,
+    lanes: runtime::engine::backend::open::METAL_FIRE.0,
+    tokens: runtime::engine::backend::open::METAL_FIRE.1,
 };
 /// The Metal shell has no planner to derive a page from.
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
@@ -155,8 +155,8 @@ fn cuda_budgets(
         .max(page_size);
     engine::Budgets {
         max_lanes: CUDA_FIRE_LANES,
-        // 0: the engine takes its chip's `engine.forward_tokens`, 8192 where
-        // the profile says nothing, and fits the rungs to the card.
+        // 0: the engine takes its fire bound (8192) and fits the rungs to
+        // the card.
         max_tokens: 0,
         buckets: Vec::new(),
         max_adapters: adapter_seats,

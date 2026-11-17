@@ -36,17 +36,40 @@ use poem_ir::Dtype;
 use profile::fire::Rates;
 
 /// The widest fire this backend's grid is timed to: the top of its rung
-/// lattice. Held at the top of the lattice this step timed before (the
-/// shared row list's last, 8192) until the backend's owner states the
-/// widest rung its loads lay; every row a load fires must be a point of
-/// the lattice.
-pub const ROWS_TOP: u32 = 8192;
+/// lattice, the tokens a served Metal load is asked ([`crate::FIRE`]).
+pub const ROWS_TOP: u32 = crate::FIRE.1;
 
-/// The rows the matmul grid is timed at: the rung lattice up to
-/// [`ROWS_TOP`] (`engine::rates::row_lattice`, the one definition).
+/// The rows a Metal load fires, and the matmul grid is timed at: Metal's
+/// one rung lattice, every power of two of rows from 1 to [`ROWS_TOP`] and
+/// that top. A load lays its rungs at these points below its top
+/// (`serve::activation_rungs`), and a top it narrows to is one of them.
 #[must_use]
 pub fn lattice_rows() -> Vec<u32> {
-    engine::rates::row_lattice(ROWS_TOP)
+    let mut rows: Vec<u32> = (0..=ROWS_TOP.ilog2()).map(|i| 1 << i).collect();
+    if rows.last() != Some(&ROWS_TOP) {
+        rows.push(ROWS_TOP);
+    }
+    rows
+}
+
+/// The lattice point below `tokens` a load narrows its fires to (to fit
+/// its arena scratch beside the resident weights): the next rung down, so
+/// every row it fires stays a point of [`lattice_rows`], and no narrower
+/// than the first point holding a token for each of [`crate::FIRE`]'s
+/// lanes, so one fire still carries every lane's decode.
+#[must_use]
+pub fn narrower(tokens: u32) -> u32 {
+    let rows = lattice_rows();
+    let floor = rows
+        .iter()
+        .copied()
+        .find(|&rows| rows >= crate::FIRE.0)
+        .unwrap_or(ROWS_TOP);
+    rows.into_iter()
+        .rev()
+        .find(|&rows| rows < tokens)
+        .unwrap_or(1)
+        .max(floor)
 }
 
 use crate::device::{Buffer, Context, Handles, Pipelines};
@@ -534,4 +557,26 @@ pub fn measure(
         bytes_per_ns: Some(bytes),
         launch_ns: Some(launch),
     })
+}
+
+#[cfg(test)]
+mod lattice_tests {
+    use super::*;
+
+    #[test]
+    fn the_lattice_is_the_powers_of_two_up_to_the_fire_and_the_fire() {
+        let rows = lattice_rows();
+        assert_eq!(rows.first(), Some(&1));
+        assert_eq!(rows[rows.len() - 2..], [8192, crate::FIRE.1]);
+        assert!(rows[..rows.len() - 1].iter().all(|r| r.is_power_of_two()));
+    }
+
+    #[test]
+    fn a_narrowed_top_is_the_next_lattice_point_down() {
+        assert_eq!(narrower(10240), 8192);
+        assert_eq!(narrower(8192), 4096);
+        assert_eq!(narrower(1024), crate::FIRE.0);
+        assert_eq!(narrower(crate::FIRE.0), crate::FIRE.0, "no narrower than a token a lane");
+        assert!(lattice_rows().contains(&narrower(10240)));
+    }
 }

@@ -91,22 +91,13 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         );
     }
     let engine = crate::chip::Engine::of(&chip);
+    // The card's fire top: the widest row its profile's grid was timed at,
+    // its saturation point (`crate::rates::Saturation`): past it no rung's
+    // efficiency improves, so none past it can be chosen.
+    // A load asked nothing fires up to it, and the estimate picks below.
+    let fire_top = crate::api::fire_top_of(&chip, device.name())?;
     if boot.budget.max_tokens == 0 {
-        let params: u64 = boot
-            .trace
-            .params
-            .iter()
-            .map(|p| p.shape.iter().product::<u64>())
-            .sum();
-        boot.budget.max_tokens = match engine.forward_tokens {
-            0 => crate::api::DEFAULT_FORWARD_TOKENS,
-            tokens
-                if params < 2 << 30 || sparse_experts(&boot.trace) || !recurrent(&boot.trace) =>
-            {
-                tokens.max(crate::api::DEFAULT_FORWARD_TOKENS)
-            }
-            tokens => tokens,
-        };
+        boot.budget.max_tokens = fire_top;
         // only where it at least halves the fire: a trunk of few value heads seats enough lanes that the
         // wide fire feeds its experts better (Qwen3.6-35B-A3B pf64 lost 4% at 5120 rows of 8192)
         if let Some(fit) = walk_fire_fit(&boot.trace, engine.walk_fire_rows, device.device().num_sm)
@@ -158,6 +149,12 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     kernels_cuda::disk::install(boot.cache_dir);
 
     let stated_buckets = std::mem::take(&mut boot.budget.buckets);
+    // Unstated, a load's fires are rungs of the lattice its rates were timed
+    // at: asked other tokens (the walk fit, `engine.fire_rows`, a stated
+    // `max_forward_tokens`), its top is the rung at or below them.
+    if stated_buckets.is_empty() {
+        boot.budget.max_tokens = crate::api::on_lattice(&engine, fire_top, boot.budget.max_tokens);
+    }
     boot.budget.buckets = crate::api::lattice(
         stated_buckets.clone(),
         boot.budget.max_tokens,
@@ -361,11 +358,10 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     let working = |tokens: u32, voxels: &Option<poem_compiler::VoxelLadder>| -> u64 {
         laid(tokens, voxels).map_or(u64::MAX, |(bytes, _)| bytes)
     };
-    // The top rung, the ruling's (`crate::top`): of every bucket of the asked
-    // lattice (the rule weighs them all; no floor stands in for it), each
-    // spanning its fire's working set and
-    // needing one sequence and the bodies' floor beside it, over the room
-    // the card has after the weight tier.
+    // The top rung, the ruling's (`crate::top`): of the buckets of the asked
+    // lattice, each spanning its fire's working set and needing one
+    // sequence and the bodies' floor beside it, over the room the card has
+    // after the weight tier: every bucket up to the card's fire top.
     let weighed;
     let tokens = {
         let paging = Paging::of(boot.page_size, boot.context, boot.slots, 1)?;
@@ -374,11 +370,12 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             let (span, launches) = laid(rung, &voxels).unwrap_or((u64::MAX, 0));
             let sequence =
                 crate::store::least_sequence_bytes(&boot.trace, paging.windowed(window, rung))?;
+            let beside = sequence.saturating_add(crate::store::BODIES_FLOOR_BYTES);
             candidates.push(crate::top::Candidate {
                 tokens: rung,
                 span,
                 launches,
-                beside: sequence.saturating_add(crate::store::BODIES_FLOOR_BYTES),
+                beside,
             });
         }
         // The rows the dense product computes at each width: its tile's.
@@ -785,7 +782,7 @@ fn refit(
     let fit = |owed: bool, scoped: bool| -> Result<Option<(u32, u32)>> {
         let mut tokens = asked_tokens;
         while tokens > floor && working_at(asked_lanes, tokens, scoped) > room_at(tokens, owed)? {
-            tokens = (tokens / 2).max(floor);
+            tokens = crate::api::on_lattice(&engine, asked.max_tokens, tokens / 2).max(floor);
         }
         let room = room_at(tokens, owed)?;
         let lanes = crate::store::tokens_within(asked_lanes.min(tokens), 1, room, |lanes| {
@@ -797,7 +794,11 @@ fn refit(
         // sequences), pf1024-512 7.92k -> 10.37k (9.00k), c1024 2.69k -> 2.71k (2.72k).
         let mut tokens = tokens;
         while lanes < asked_lanes && tokens < asked.max_tokens {
-            let wider = tokens.saturating_mul(2).min(asked.max_tokens);
+            let wider = crate::api::on_lattice(
+                &engine,
+                asked.max_tokens,
+                tokens.saturating_mul(2).min(asked.max_tokens),
+            );
             if working_at(lanes, wider, scoped) > room_at(wider, owed)? {
                 break;
             }
@@ -2038,33 +2039,6 @@ impl Staged {
         })?;
         Ok(shell)
     }
-}
-
-/// Whether `trace` carries a recurrent state (a gated delta or Mamba
-/// mixer): the narrower profile fire serves those; a dense attention model's
-/// prefill GEMMs are compute-bound and run best at the full 8192 rows.
-fn recurrent(trace: &poem_ir::Trace) -> bool {
-    trace
-        .nodes
-        .iter()
-        .any(|node| matches!(node.op, poem_ir::Operation::Ssm(_)))
-}
-
-fn sparse_experts(trace: &poem_ir::Trace) -> bool {
-    let dims = |v: poem_ir::ValueId| match &trace.values[v.0 as usize].ty {
-        poem_ir::Ty::Tensor { shape, .. } => shape.clone(),
-        poem_ir::Ty::Struct(_) => Vec::new(),
-    };
-    trace.nodes.iter().any(|node| match node.op {
-        poem_ir::Operation::Linear(poem_ir::Linear::MoeSelect { bank, routes, .. }) => {
-            matches!(
-                (dims(bank).first(), dims(routes).last()),
-                (Some(poem_ir::Dim::Const(experts)), Some(poem_ir::Dim::Const(top_k)))
-                    if *experts > 2 * *top_k
-            )
-        }
-        _ => false,
-    })
 }
 
 fn footprint(shell: &Shell, device_total: u64, free_before: u64) -> Footprint {
