@@ -298,14 +298,12 @@ impl FireEstimate {
         }
     }
 
-    /// The rows past which no rung of `lattice` (ascending) can be chosen,
-    /// by this estimate of the model's own fire: of the lattice's powers of
-    /// two, the first `p` past which a prompt of `2p` tokens runs no more
-    /// than [`crate::rates::AGREEMENT`] more tokens a ns than one of `p`
-    /// (the lattice's widest power of two where every doubling still
-    /// gains). A top rung is the argmax of efficiency times live capacity,
-    /// and live capacity only falls as rows grow, so no rung past it can win.
-    /// On `lattice`, its first row at or past it.
+    /// The rows past which no rung of `lattice` can be chosen, by this
+    /// estimate of the model's own fire: the rung of `lattice` whose prompt
+    /// runs the most tokens a ns (the narrowest of a tie). A top rung is the
+    /// argmax of efficiency times live capacity; past this rung efficiency
+    /// only falls and live capacity only falls as rows grow, so none past it
+    /// can win.
     #[must_use]
     pub fn top(&self, lattice: &[u32]) -> u32 {
         let rate = |tokens: u32| {
@@ -321,23 +319,14 @@ impl FireEstimate {
             };
             f64::from(tokens) / self.ns(&prompt).max(f64::MIN_POSITIVE)
         };
-        let octaves: Vec<u32> = lattice
-            .iter()
-            .copied()
-            .filter(|m| m.is_power_of_two())
-            .collect();
-        let top = octaves
-            .windows(2)
-            .find(|w| rate(w[1]) <= (1.0 + crate::rates::AGREEMENT) * rate(w[0]))
-            .map(|w| w[0])
-            .or(octaves.last().copied())
-            .unwrap_or(1);
-        lattice
-            .iter()
-            .copied()
-            .find(|&m| m >= top)
-            .or(lattice.last().copied())
-            .unwrap_or(top)
+        let mut best: Option<(u32, f64)> = None;
+        for &tokens in lattice {
+            let r = rate(tokens);
+            if best.is_none_or(|(_, b)| r > b) {
+                best = Some((tokens, r));
+            }
+        }
+        best.map_or(1, |(tokens, _)| tokens)
     }
 
     /// The estimated time of a fire at `rung`.
@@ -771,16 +760,29 @@ mod tests {
     }
 
     #[test]
-    fn the_top_is_where_a_doubling_of_the_prompt_stops_paying() {
-        // 1000 ns fixed and 1 ns a token: a doubling from p gains
-        // 2 (1000 + p) / (1000 + 2p), 5.75% from 8192 and 2.96% from 16384.
+    fn the_top_is_the_rung_whose_prompt_runs_fastest() {
+        // 1000 ns fixed, 1 ns a token, and attention growing with the
+        // square of the prompt: tokens a ns rise, then fall.
         let (e, _) = summed(1000, 1.0);
-        let lattice: Vec<u32> = (0..=15).map(|i| 1u32 << i).chain([12000]).collect();
+        let e = FireEstimate {
+            attn_flops_per_row_key: 1e-4,
+            attn_dispatches: 1,
+            attn_head_dim: 1,
+            ..e
+        };
+        let lattice: Vec<u32> = (0..=15).map(|i| 1u32 << i).chain([3000, 6000]).collect();
         let mut lattice = lattice;
         lattice.sort_unstable();
-        assert_eq!(e.top(&lattice), 16384);
-        // A lattice ending before it: its widest power of two.
-        assert_eq!(e.top(&lattice[..12]), 2048);
+        let rate = |t: u32| {
+            let f = f64::from(t);
+            f / (1000.0 + f + f * f * 1e-4 / 0.5)
+        };
+        let want = *lattice
+            .iter()
+            .max_by(|&&a, &&b| rate(a).total_cmp(&rate(b)))
+            .unwrap();
+        assert_eq!(e.top(&lattice), want);
+        assert!(want > 1024 && want < 32768, "{want}");
     }
 
     #[test]

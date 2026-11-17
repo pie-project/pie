@@ -118,6 +118,14 @@ impl Constants {
         };
         let width: Vec<(u32, f64)> = self.gemm_by_rows.iter().map(|(w, c)| (*w, at(c))).collect();
         let square = (f64::from(n) * f64::from(k)).sqrt();
+        // Past the widest width, its last span's slope in log width carries
+        // on (a wider plane fills more tiles); never below the widest's rate.
+        if let [.., (w0, r0), (w1, r1)] = width[..]
+            && square > f64::from(w1)
+        {
+            let slope = (r1 - r0) / (f64::from(w1).ln() - f64::from(w0).ln());
+            return (r1 + slope * (square.ln() - f64::from(w1).ln())).max(r1);
+        }
         profile::fire::interpolate(&width, square).unwrap_or(f64::INFINITY)
     }
 
@@ -250,8 +258,9 @@ mod tests {
         assert_eq!(c.gemm_rate(1024, 1024, 1024), 80_000.0);
         assert!((c.gemm_rate(1024, 2048, 2048) - 120_000.0).abs() < 1e-6);
         assert!((c.gemm_rate(1024, 1024, 4096) - 120_000.0).abs() < 1e-6);
-        // Past the widths: clamped.
-        assert_eq!(c.gemm_rate(1024, 16384, 16384), 160_000.0);
+        // Past the widest width: its last span's slope (1024 to 4096 at 1024
+        // rows, 80 to 160) carries on: 16384 square two more octaves, 240.
+        assert!((c.gemm_rate(1024, 16384, 16384) - 240_000.0).abs() < 1e-6);
         assert!((c.attn_rate(2048) - 225_000.0).abs() < 1e-6);
     }
 
