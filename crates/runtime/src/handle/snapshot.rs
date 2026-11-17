@@ -886,9 +886,29 @@ async fn finish(
 fn sync_disk(dir: &Path) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
-        std::fs::File::open(entry.path())?.sync_all()?;
+        if entry.file_type()?.is_dir() {
+            sync_dir(&entry.path())?;
+            continue;
+        }
+        // Flushing a file asks for write access on Windows; unix takes either.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(entry.path())?
+            .sync_all()?;
     }
+    sync_dir(dir)
+}
+
+/// A directory's entries, synced: unix syncs the directory itself; Windows
+/// opens no directory as a file, and its file system journals the entries.
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::File::open(dir)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// A working set as `name` stands, off the device: the next process to bind
