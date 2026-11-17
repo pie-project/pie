@@ -2,10 +2,11 @@
 //! them, at the shapes every backend times ([`engine::rates`]), each through
 //! the kernel serving dispatches under the device's own tuning:
 //!
-//! * the matmul curve: `linear::gemm::matmul`, `m x GEMM_WIDTH x
-//!   GEMM_WIDTH` at each of [`engine::rates::GEMM_ROWS`], each repeat over
-//!   the next of engine::rates::weights_at's distinct weights so every one
-//!   streams from memory, as a fire's do;
+//! * the matmul curves: `linear::gemm::matmul`, `m x w x w` at each of
+//!   [`engine::rates::GEMM_ROWS`] for each width `w` of
+//!   [`engine::rates::GEMM_WIDTHS`], each repeat over the next of
+//!   engine::rates::weights_at's distinct weights so every one streams from
+//!   memory, as a fire's do;
 //! * the attention curve: `attn::arbiter::prefill` at
 //!   [`engine::rates::ATTN_SHAPE`] over each of [`engine::rates::ATTN_KEYS`]
 //!   keys at d 128 (64 and 256 at the longest keys, said beside it),
@@ -21,8 +22,10 @@
 //!   dispatch's launch (the smallest matmul back to back in one frame).
 //!
 //! Each kernel is timed by the GPU (`Frame::commit_timed`) back to back
-//! with itself, as many to a frame as fill 20 ms, the median of five such
-//! frames after a warm one, over the count: serving runs hundreds of
+//! with itself, as many to a frame as settle a fire's time
+//! (`engine::rates::timed_frames`, under the device's bound on one
+//! submission where it states one), the median of five such frames after a
+//! warm one, over the count: serving runs hundreds of
 //! dispatches a fire, and a frame of one short dispatch times the clock
 //! state the device idled into, not the kernel. The counts that turn the
 //! times into rates are [`engine::rates`]'.
@@ -102,6 +105,11 @@ struct Bench<'a> {
     tuning: &'a Tuning,
     /// `engine::rates::operand_pattern`, made once.
     pattern: Vec<u8>,
+    /// The device's bound on one submission, where it states one: no frame
+    /// past it is laid (`engine::rates::timed_frames`).
+    max_submit: Option<std::time::Duration>,
+    /// Whether a frame the bound stopped before its fire's time settled.
+    capped: std::cell::Cell<bool>,
 }
 
 impl Bench<'_> {
@@ -159,13 +167,16 @@ impl Bench<'_> {
         encode: &dyn Fn(&Sink<'_>, u32) -> Result<(), kernels_metal::Error>,
     ) -> Result<f64, String> {
         self.frame_of(encode, 1)?;
-        let k = engine::rates::timed_frames(
-            None,
+        let frames = engine::rates::timed_frames(
+            self.max_submit,
             None,
             |k| self.frame_of(encode, k).map(|s| s * 1e9),
             |why| why,
-        )?
-        .fires;
+        )?;
+        if frames.capped {
+            self.capped.set(true);
+        }
+        let k = frames.fires;
         self.frame_of(encode, k)?;
         let mut times = Vec::with_capacity(5);
         for _ in 0..5 {
@@ -532,21 +543,20 @@ pub fn at_load(
         check: &check,
     });
     let measure_chip = chip.clone();
-    engine::rates::rates_at_load(chip, save, max_submit, |_max_submit| {
-        Ok(engine::rates::Measured {
-            rates: measure(device, measure_chip, &mut |_| {})?,
-            unsettled: false,
-        })
+    engine::rates::rates_at_load(chip, save, max_submit, |max_submit| {
+        measure(device, measure_chip, max_submit, &mut |_| {})
     })
 }
 
 /// `device`'s rates under the kernel tuning of `profile` (the profile a
-/// load on it runs), saying each as it lands.
+/// load on it runs), saying each as it lands; no frame past `max_submit`,
+/// and `unsettled` where one it stopped had not settled.
 pub fn measure(
     device: &Context,
     profile: profile::Profile,
+    max_submit: Option<std::time::Duration>,
     say: &mut dyn FnMut(&str),
-) -> Result<Rates, String> {
+) -> Result<engine::rates::Measured, String> {
     let tuning = Tuning::new(profile, false, device.cores()).with_family(device.family());
     let mut bench = Bench {
         device,
@@ -554,6 +564,8 @@ pub fn measure(
         pipelines: Pipelines::new(),
         tuning: &tuning,
         pattern: engine::rates::operand_pattern(),
+        max_submit,
+        capped: std::cell::Cell::new(false),
     };
     // The launch first: every rate below takes its dispatches' launches off
     // (engine::rates::rate_from).
@@ -585,30 +597,32 @@ pub fn measure(
             warmed.rate / 1e3
         ));
     }
-    // The matmul curve, m x GEMM_WIDTH x GEMM_WIDTH at each of
-    // engine::rates::GEMM_ROWS, over its planes (engine::rates::weights_at:
-    // 768 MiB, at least 12, so each repeat streams its weight as a layer's
-    // matmul does).
-    let w = engine::rates::GEMM_WIDTH;
-    bench.handles = Handles::new();
-    let plane = operand(&bench.pattern, (w * w) as usize * 2);
-    let weights = (0..engine::rates::weights_at(w, w))
-        .map(|_| {
-            let b = bench.buffer(&plane)?;
-            Ok((bench.tensor(&b, w, w, Dtype::Bf16)?, b))
-        })
-        .collect::<Result<Vec<(Tensor, Buffer)>, String>>()?;
-    let tensors: Vec<Tensor> = weights.iter().map(|(t, _)| *t).collect();
+    // The matmul curves: at each width w of engine::rates::GEMM_WIDTHS,
+    // m x w x w at each of engine::rates::GEMM_ROWS, over its planes
+    // (engine::rates::weights_at: 768 MiB, at least 12, so each repeat
+    // streams its weight as a layer's matmul does).
     let mut gemm = Vec::new();
-    for m in engine::rates::GEMM_ROWS {
-        let rate = bench.matmul_flops(m, w, w, &tensors, gap)?;
-        say(&format!(
-            "  bf16 matmul {m} x {w} x {w}: {:.4} TFLOP/s",
-            rate / 1e3
-        ));
-        gemm.push((m, rate / 1e3));
+    for w in engine::rates::GEMM_WIDTHS {
+        bench.handles = Handles::new();
+        let plane = operand(&bench.pattern, (w * w) as usize * 2);
+        let weights = (0..engine::rates::weights_at(w, w))
+            .map(|_| {
+                let b = bench.buffer(&plane)?;
+                Ok((bench.tensor(&b, w, w, Dtype::Bf16)?, b))
+            })
+            .collect::<Result<Vec<(Tensor, Buffer)>, String>>()?;
+        let tensors: Vec<Tensor> = weights.iter().map(|(t, _)| *t).collect();
+        let mut curve = Vec::new();
+        for m in engine::rates::GEMM_ROWS {
+            let rate = bench.matmul_flops(m, w, w, &tensors, gap)?;
+            say(&format!(
+                "  bf16 matmul {m} x {w} x {w}: {:.4} TFLOP/s",
+                rate / 1e3
+            ));
+            curve.push((m, rate / 1e3));
+        }
+        gemm.push((w, curve));
     }
-    drop(weights);
     // The attention curve at d 128; the other widths at the longest keys.
     let mut attn = Vec::new();
     for keys in engine::rates::ATTN_KEYS {
@@ -639,15 +653,16 @@ pub fn measure(
     ));
     let bytes = bench.bytes_per_ns(gap)?;
     say(&format!("  256 MiB blit: {bytes:.1} GB/s read and write"));
-    Ok(Rates {
-        launch_ns: Some(launch),
-        // One width, `engine::rates::GEMM_WIDTH`: a plane of another is
-        // read at it (this backend times no narrower curve yet).
-        gemm_tflops_by_rows: Some(vec![(engine::rates::GEMM_WIDTH, gemm)]),
-        attn_tflops_by_keys: Some(attn),
-        hbm_gbps: Some(bytes),
-        elementwise_gbps: Some(elementwise),
-        scan_gelems: Some(scan),
+    Ok(engine::rates::Measured {
+        rates: Rates {
+            launch_ns: Some(launch),
+            gemm_tflops_by_rows: Some(gemm),
+            attn_tflops_by_keys: Some(attn),
+            hbm_gbps: Some(bytes),
+            elementwise_gbps: Some(elementwise),
+            scan_gelems: Some(scan),
+        },
+        unsettled: bench.capped.get(),
     })
 }
 

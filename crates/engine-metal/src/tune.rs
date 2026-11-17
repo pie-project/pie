@@ -490,7 +490,7 @@ pub fn rates(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Outco
         "{name}: measuring the rates, starting from {}",
         report.used
     ));
-    let rates = crate::rates::measure(&device, base.clone(), say)?;
+    let rates = crate::rates::measure(&device, base.clone(), None, say)?.rates;
     let tuned = engine::rates::tuned(&rates);
     let seconds = began.elapsed().as_secs_f64();
     let provenance = [
