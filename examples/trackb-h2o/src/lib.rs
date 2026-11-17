@@ -57,8 +57,6 @@ struct Output {
     kv_len: u32,
     page_budget: u32,
     live_pages: u32,
-    layers_observed: u32,
-    layers_per_fire: u32,
     /// Slots inside the live prefix that carry a finite, non-negative score.
     live_scored: usize,
     tail_polluted: usize,
@@ -105,20 +103,10 @@ async fn main(input: Input) -> Result<Output> {
         .into_iter()
         .find(|output| output.name == "attn.scores")
         .ok_or("this model reads out no attention scores")?;
-    let layers = scores.layers.max(1);
-    // The output states how each layer's row factors: a run of `score_kv`
-    // keys per query head. Folding over a head count of the guest's own
-    // misreads a model with another one.
-    let [heads, score_kv] = scores.planes[..] else {
-        return Err(format!(
-            "attn.scores states its row as planes {:?}, not [query heads, keys]",
-            scores.planes
-        ));
-    };
-    let Some(planes) = layers.checked_mul(heads) else {
-        return Err("layers * heads overflows the plane count".into());
-    };
-    let heads_f = heads as f32;
+    // One row a lane: the attention mass a key of the load's context,
+    // summed over the layers and averaged over the query heads; the guest
+    // folds nothing.
+    let score_kv = scores.width;
     let max_tokens = input.max_tokens;
     let temperature = input.temperature;
     let ws = WorkingSet::new();
@@ -177,8 +165,6 @@ async fn main(input: Input) -> Result<Output> {
 
     let mut last_scores: Vec<f32> = Vec::new();
     let mut last_page_mass: Vec<f32> = Vec::new();
-    let mut layers_observed = 0u32;
-    let layers_per_fire = layers;
     let mut last_kv_len = n + 1;
     let mut trace: Vec<(u32, usize)> = Vec::new();
     let mut mass_trace: Vec<f32> = Vec::new();
@@ -220,9 +206,7 @@ async fn main(input: Input) -> Result<Output> {
             tok_out.put(&token);
             rng.put(&(&r + iota(2)));
 
-            // `[planes, kv]` layer-major; dividing by `heads` averages heads and sums layers.
-            let rect = reshape(intrinsics::output(0, "attn.scores"), [planes, score_kv]);
-            let fire_row = &reduce_sum(transpose(&rect)) / heads_f;
+            let fire_row = reshape(intrinsics::output(0, "attn.scores"), [score_kv]);
             let prev = acc.take();
             let folded = &prev + &gather(&fire_row, iota(kv_max));
             scores_out.put(&folded);
@@ -247,7 +231,6 @@ async fn main(input: Input) -> Result<Output> {
                 .with_context(|| format!("@{}", generated.len()))?;
             // The prompt plus every token committed before this fire was live.
             last_kv_len = n + generated.len() as u32;
-            layers_observed += layers_per_fire;
             mass_trace.push(last_scores.iter().filter(|s| s.is_finite()).sum());
             trace.push((
                 last_kv_len,
@@ -361,8 +344,6 @@ async fn main(input: Input) -> Result<Output> {
         kv_len: last_kv_len,
         page_budget,
         live_pages,
-        layers_observed,
-        layers_per_fire,
         live_scored: last_scores[..live]
             .iter()
             .filter(|s| s.is_finite() && **s >= 0.0)

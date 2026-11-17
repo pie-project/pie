@@ -86,7 +86,13 @@ pub struct Tuning {
     /// The decodes (head width, LSE) whose split walk the adapter binds,
     /// as the load held them ([`Tuning::hold_decodes`]).
     splits: Vec<(u32, bool)>,
+    /// The workgroup memory the adapter states a kernel may take.
+    workgroup_bytes: u32,
 }
+
+/// The workgroup memory every WebGPU adapter allows
+/// (`maxComputeWorkgroupStorageSize`'s floor).
+pub const WORKGROUP_BYTES_FLOOR: u32 = 16 << 10;
 
 impl Tuning {
     #[must_use]
@@ -95,7 +101,15 @@ impl Tuning {
             profile,
             cores,
             splits: Vec::new(),
+            workgroup_bytes: WORKGROUP_BYTES_FLOOR,
         }
+    }
+
+    /// With the workgroup memory the adapter states.
+    #[must_use]
+    pub fn with_workgroup_bytes(mut self, bytes: u32) -> Tuning {
+        self.workgroup_bytes = bytes;
+        self
     }
 
     /// Holds the decodes a load walks (`decodes`: head width, LSE) to
@@ -340,6 +354,10 @@ impl engine_gpu::backend::Tactics for Tuning {
 
     fn sdpa_split_groups(&self) -> u32 {
         Tuning::sdpa_split_groups(self)
+    }
+
+    fn workgroup_bytes(&self) -> u32 {
+        self.workgroup_bytes
     }
 }
 

@@ -805,6 +805,12 @@ impl Engine for Metal {
                 .as_ref()
                 .map_or(engine::fire::Serves::NONE, engine::fire::Serves::of),
         )?;
+        if let Some(shell) = self.shell.as_ref() {
+            let facts = &shell.trace().facts;
+            for step in &frame.steps {
+                step.validate_captures(|word| facts.holds(word, poem_ir::Builtin::Scores))?;
+            }
+        }
         let id = FrameId(self.next_frame);
         self.next_frame = self.next_frame.wrapping_add(1);
         // A frame's rows are held while it is the open one: the steps of one

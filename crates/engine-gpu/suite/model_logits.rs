@@ -42,6 +42,21 @@ fn packed(dtype: Dtype) -> bool {
     )
 }
 
+/// The values of the bf16 plane `name` of `count` elements the fixture
+/// writes ([`write_checkpoint`]), as f32: what a host oracle reads for it.
+pub fn seeded_bf16(name: &str, count: usize) -> Vec<f32> {
+    let norm = name.ends_with("norm");
+    let mut seed = fnv(name);
+    (0..count)
+        .map(|_| {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let unit = ((seed >> 33) as f32 / (1u64 << 31) as f32) - 0.5;
+            let value = if norm { 1.0 + 0.05 * unit } else { 0.08 * unit };
+            f32::from_bits(value.to_bits() & 0xffff_0000)
+        })
+        .collect()
+}
+
 /// A checkpoint of `trace`'s own planes seeded by name: norms near one, the
 /// rest small. A packed plane is stored as the bf16 it is quantized from, at
 /// its unpacked shape (its scales are made by the import, so none is
@@ -276,6 +291,20 @@ fn loading() -> std::sync::MutexGuard<'static, ()> {
     LOADING
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// [`load_paged`] for fires of up to `lanes` lanes and `tokens` tokens, a
+/// seat a lane.
+pub fn load_lanes(fixture: &Fixture, page: u32, context: u32, lanes: u32, tokens: u32) -> Option<Shell> {
+    let _alone = loading();
+    let device = DeviceBoot::default();
+    let residency = allowed(&device, engine::load::Residency::default())?;
+    let boot = Boot {
+        budget: Budget::new(lanes, tokens),
+        slots: lanes,
+        ..boot(fixture, page, context, &device, residency)
+    };
+    Some(Shell::load(boot).unwrap_or_else(|why| panic!("the shell loads: {why}")))
 }
 
 /// [`load_paged`] under `residency` (a host tier's budget, say).

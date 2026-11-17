@@ -453,6 +453,10 @@ impl engine_gpu::backend::Tactics for Tuning {
     fn sdpa_split_groups(&self) -> u32 {
         Tuning::sdpa_split_groups(self)
     }
+
+    fn workgroup_bytes(&self) -> u32 {
+        self.limits.shared_bytes
+    }
 }
 
 #[cfg(test)]

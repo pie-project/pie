@@ -58,7 +58,6 @@ struct Output {
     /// Pages the prompt occupies. Only these compete for the budget.
     prompt_pages: u32,
     page_size: u32,
-    layers_observed: u32,
     /// Slots inside the prompt that carry a finite, non-negative score.
     live_scored: usize,
     tail_nonzero: usize,
@@ -101,20 +100,16 @@ async fn main(input: Input) -> Result<Output> {
         .into_iter()
         .find(|output| output.name == "attn.scores")
         .ok_or("this model reads out no attention scores")?;
-    let layers = scores.layers.max(1);
-    // The output states how each layer's row factors: a run of `score_kv`
-    // keys per query head. Folding over a head count of the guest's own
-    // misreads a model with another one.
-    let [heads, score_kv] = scores.planes[..] else {
-        return Err(format!(
-            "attn.scores states its row as planes {:?}, not [query heads, keys]",
-            scores.planes
-        ));
-    };
-    let Some(planes) = layers.checked_mul(heads) else {
-        return Err("layers * heads overflows the plane count".into());
-    };
-    let heads_f = heads as f32;
+    // One row a lane: the attention mass a key of the load's context,
+    // summed over the layers and averaged over the query heads; the guest
+    // folds nothing.
+    let score_kv = scores.width;
+    let score_pages = model::lane_of(&[])?
+        .outputs
+        .into_iter()
+        .find(|output| output.name == "attn.scores.pages")
+        .ok_or("this model reads out no page scores")?
+        .width;
     let max_tokens = input.max_tokens;
     let temperature = input.temperature;
     let ws = WorkingSet::new();
@@ -175,13 +170,11 @@ async fn main(input: Input) -> Result<Output> {
         tok_out_p.put(&token);
         rng_p.put(&(&r + iota(2)));
 
-        // `[planes, kv]` layer-major; dividing by `heads` averages heads and sums layers.
-        let rect = reshape(intrinsics::output(0, "attn.scores"), [planes, score_kv]);
-        let folded = gather(&(&reduce_sum(transpose(&rect)) / heads_f), iota(kv_max));
+        let folded = gather(&reshape(intrinsics::output(0, "attn.scores"), [score_kv]), iota(kv_max));
         scores_out.put(&folded);
 
         // Exact: `kv_max = p_max * page_size`.
-        page_mass_out.put(reduce_sum(reshape(&folded, [p_max, page_size])));
+        page_mass_out.put(gather(&reshape(intrinsics::output(0, "attn.scores.pages"), [score_pages]), iota(p_max)));
     });
 
     fwd_p.submit(&pipe).context("prefill submit")?;
@@ -193,7 +186,6 @@ async fn main(input: Input) -> Result<Output> {
     generated.push(g0 as u32);
 
     let prefill_scores = scores_out.take_host::<Vec<f32>>().await?;
-    let layers_observed = layers;
     let device_page_mass = page_mass_out.take_host::<Vec<f32>>().await?;
 
     let ranked = |p: u32| -> f32 {
@@ -303,7 +295,6 @@ async fn main(input: Input) -> Result<Output> {
         page_budget,
         prompt_pages,
         page_size,
-        layers_observed,
         live_scored: prefill_scores[..live]
             .iter()
             .filter(|s| s.is_finite() && **s >= 0.0)
