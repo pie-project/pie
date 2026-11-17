@@ -197,10 +197,6 @@ fn extents(stated: &BindExtents) -> eta_exec::Extents {
     }
 }
 
-/// The narrowest forward width a load narrows its fires to
-/// so its arena scratch fits beside resident weights.
-const MIN_FITTED_FORWARD_TOKENS: u32 = 512;
-
 const DEFAULT_STATE_SLOTS: u32 = 256;
 
 /// The load's budgets: its logit readouts sized to what `trace` reads, not a
@@ -546,8 +542,7 @@ impl Engine for Metal {
                     top: crate::Top::Ruled,
                 })
                 .map_err(fault)?;
-                let narrower =
-                    crate::rates::narrower(budgets.max_tokens, MIN_FITTED_FORWARD_TOKENS);
+                let narrower = crate::rates::narrower(budgets.max_tokens);
                 if narrower >= budgets.max_tokens
                     || accounting(weights, prepared.arena_bytes()).admit().is_ok()
                     || accounting(weights, 0).admit().is_err()
@@ -572,8 +567,7 @@ impl Engine for Metal {
             match prepared.load() {
                 Ok(shell) => break shell,
                 Err(Fault::FitShort(short)) => {
-                    let narrower =
-                    crate::rates::narrower(budgets.max_tokens, MIN_FITTED_FORWARD_TOKENS);
+                    let narrower = crate::rates::narrower(budgets.max_tokens);
                     if narrower >= budgets.max_tokens {
                         return Err(fault(Fault::FitShort(short)));
                     }

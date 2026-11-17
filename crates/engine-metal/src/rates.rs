@@ -48,13 +48,20 @@ pub fn lattice_rows() -> Vec<u32> {
     engine::rates::row_lattice(ROWS_TOP)
 }
 
-/// The lattice point below `tokens` a load narrows its fires to, no
-/// narrower than `floor`: the next rung down, so every row it fires stays
-/// a point of [`lattice_rows`].
+/// The lattice point below `tokens` a load narrows its fires to (to fit
+/// its arena scratch beside the resident weights): the next rung down, so
+/// every row it fires stays a point of [`lattice_rows`], and no narrower
+/// than the first point holding a token for each of [`crate::FIRE`]'s
+/// lanes, so one fire still carries every lane's decode.
 #[must_use]
-pub fn narrower(tokens: u32, floor: u32) -> u32 {
-    lattice_rows()
-        .into_iter()
+pub fn narrower(tokens: u32) -> u32 {
+    let rows = lattice_rows();
+    let floor = rows
+        .iter()
+        .copied()
+        .find(|&rows| rows >= crate::FIRE.0)
+        .unwrap_or(ROWS_TOP);
+    rows.into_iter()
         .rev()
         .find(|&rows| rows < tokens)
         .unwrap_or(1)
@@ -562,10 +569,10 @@ mod lattice_tests {
 
     #[test]
     fn a_narrowed_top_is_the_next_lattice_point_down() {
-        assert_eq!(narrower(10240, 512), 8192);
-        assert_eq!(narrower(8192, 512), 4096);
-        assert_eq!(narrower(1024, 512), 512);
-        assert_eq!(narrower(512, 512), 512);
-        assert!(lattice_rows().contains(&narrower(10240, 512)));
+        assert_eq!(narrower(10240), 8192);
+        assert_eq!(narrower(8192), 4096);
+        assert_eq!(narrower(1024), crate::FIRE.0);
+        assert_eq!(narrower(crate::FIRE.0), crate::FIRE.0, "no narrower than a token a lane");
+        assert!(lattice_rows().contains(&narrower(10240)));
     }
 }
