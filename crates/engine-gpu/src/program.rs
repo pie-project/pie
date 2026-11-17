@@ -280,16 +280,15 @@ pub fn lane_mask(
 
 /// A row of bool cells as alternating run lengths, the first of cells unset.
 #[must_use]
-pub fn mask_runs(row: &[u8]) -> Vec<u32> {
+pub fn mask_runs(row: &[bool]) -> Vec<u32> {
     let mut runs = Vec::new();
     let mut current = false;
     let mut count = 0u32;
-    if row.first().is_some_and(|&cell| cell != 0) {
+    if row.first().is_some_and(|&cell| cell) {
         runs.push(0);
         current = true;
     }
-    for &cell in row {
-        let value = cell != 0;
+    for &value in row {
         if value == current {
             count += 1;
         } else {
@@ -332,9 +331,11 @@ pub fn decode(
             .map(|c| [c[0], c[1], c[2], c[3]])
     };
     Some(match dtype {
-        Dtype::Bool => {
-            eta_exec::Value::Bool((0..numel).map(|j| (bytes[j / 8] >> (j % 8)) & 1).collect())
-        }
+        Dtype::Bool => eta_exec::Value::Bool(
+            (0..numel)
+                .map(|j| (bytes[j / 8] >> (j % 8)) & 1 != 0)
+                .collect(),
+        ),
         Dtype::I32 => eta_exec::Value::I32(words().map(i32::from_le_bytes).collect()),
         Dtype::U32 => eta_exec::Value::U32(words().map(u32::from_le_bytes).collect()),
         Dtype::F32 => eta_exec::Value::F32(words().map(f32::from_le_bytes).collect()),

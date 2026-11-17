@@ -709,7 +709,11 @@ fn decode(bytes: &[u8], dtype: eta_ir::container::ChanDType, shape: &[u32]) -> O
             .map(|c| [c[0], c[1], c[2], c[3]])
     };
     Some(match dtype {
-        Dtype::Bool => Value::Bool((0..numel).map(|j| (bytes[j / 8] >> (j % 8)) & 1).collect()),
+        Dtype::Bool => Value::Bool(
+            (0..numel)
+                .map(|j| (bytes[j / 8] >> (j % 8)) & 1 != 0)
+                .collect(),
+        ),
         Dtype::I32 => Value::I32(words().map(i32::from_le_bytes).collect()),
         Dtype::U32 => Value::U32(words().map(u32::from_le_bytes).collect()),
         Dtype::F32 => Value::F32(words().map(f32::from_le_bytes).collect()),
@@ -717,16 +721,15 @@ fn decode(bytes: &[u8], dtype: eta_ir::container::ChanDType, shape: &[u32]) -> O
     })
 }
 
-fn runs_of(row: &[u8]) -> Vec<u32> {
+fn runs_of(row: &[bool]) -> Vec<u32> {
     let mut runs = Vec::new();
     let mut current = false;
     let mut count = 0u32;
-    if row.first().is_some_and(|&cell| cell != 0) {
+    if row.first().is_some_and(|&cell| cell) {
         runs.push(0);
         current = true;
     }
-    for &cell in row {
-        let value = cell != 0;
+    for &value in row {
         if value == current {
             count += 1;
         } else {
@@ -817,7 +820,7 @@ impl Plane {
                         value.dtype()
                     )));
                 };
-                out.mask = Some(cells.into_iter().map(|cell| cell != 0).collect());
+                out.mask = Some(cells);
                 continue;
             }
             let slot = match binding.port {

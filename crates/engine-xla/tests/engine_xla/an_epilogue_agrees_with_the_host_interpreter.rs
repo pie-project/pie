@@ -508,7 +508,7 @@ fn sampler_seeds(vocab: u32, seed: u64) -> Vec<(u32, Value)> {
     let n = vocab as usize;
     let mut counts = vec![0.0f32; n];
     let mut present = vec![0.0f32; n];
-    let mut mask = vec![1u8; n];
+    let mut mask = vec![true; n];
     let mut words = vec![u32::MAX; n.div_ceil(32)];
     for (i, u) in noise(seed ^ 0x55, 64, 0.0, n as f32)
         .into_iter()
@@ -518,7 +518,7 @@ fn sampler_seeds(vocab: u32, seed: u64) -> Vec<(u32, Value)> {
         match i % 4 {
             0 => counts[at] += 1.0,
             1 => present[at] = 1.0,
-            2 => mask[at] = 0,
+            2 => mask[at] = false,
             _ => words[at / 32] &= !(1 << (at % 32)),
         }
     }

@@ -406,7 +406,7 @@ fn encode(value: &Value, dtype: Dtype, n: usize, out: &mut Vec<u32>) -> Result<(
             let base = out.len();
             out.resize(base + n.div_ceil(32), 0);
             for (j, &b) in v.iter().enumerate() {
-                if b != 0 {
+                if b {
                     out[base + j / 32] |= 1 << (j % 32);
                 }
             }
@@ -421,7 +421,7 @@ fn decode(words: &[u32], dtype: Dtype, n: usize) -> Value {
         Dtype::I32 => Value::I32(words[..n].iter().map(|&w| w as i32).collect()),
         Dtype::Bool => Value::Bool(
             (0..n)
-                .map(|j| ((words[j / 32] >> (j % 32)) & 1) as u8)
+                .map(|j| (words[j / 32] >> (j % 32)) & 1 != 0)
                 .collect(),
         ),
         _ => Value::U32(words[..n].to_vec()),
@@ -802,7 +802,7 @@ fn const_root(root: &eta_compiler::codegen::launch::LaunchValue) -> Value {
     match root.dtype {
         Dtype::I32 => Value::I32(vec![root.literal_bits as i32]),
         Dtype::U32 => Value::U32(vec![root.literal_bits]),
-        Dtype::Bool => Value::Bool(vec![u8::from(root.literal_bits != 0)]),
+        Dtype::Bool => Value::Bool(vec![root.literal_bits != 0]),
         _ => Value::F32(vec![f32::from_bits(root.literal_bits)]),
     }
 }

@@ -3,7 +3,7 @@
 //!
 //! Every eta value of shape `S` becomes a tensor `[B, S...]`: lane `b` of the
 //! batch is one instance's pass. The semantics are the host interpreter's
-//! (`eta_exec::eval_op`), op by op; where the interpreter is exact (integer
+//! (`eta_compiler::eval::interp::eval_op`), op by op; where the interpreter is exact (integer
 //! arithmetic, comparisons, argmax, orderings and their ties, masks, the
 //! uniform draw's bits) so is this, and float math agrees within rounding.
 //!
