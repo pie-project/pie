@@ -163,6 +163,14 @@ impl Sparse {
         &self.event
     }
 
+    /// EXPERIMENT: the last timeline value the mapping queue was told to
+    /// signal, and whether remaps were issued since.
+    #[must_use]
+    pub fn issued(&self) -> (u64, bool) {
+        let ticks = self.ticks();
+        (ticks.issued, ticks.dirty)
+    }
+
     /// What the timeline has actually reached.
     #[must_use]
     pub fn signalled(&self) -> u64 {

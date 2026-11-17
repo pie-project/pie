@@ -710,6 +710,15 @@ impl Engine for Metal {
                 walked
             }
         };
+        #[cfg(target_vendor = "apple")]
+        if std::env::var_os("PIE_PROBE_CALIBRATE").is_some() {
+            let term = shell.calibrate_driver_resident().map_err(fault)?;
+            eprintln!("calibrate: driver_resident {term:?}");
+        }
+        #[cfg(target_vendor = "apple")]
+        if std::env::var_os("PIE_PROBE_CAL_POOL").is_some() {
+            shell.calibrate_with_pool().map_err(fault)?;
+        }
         shell.seal_pipelines();
         tracing::info!(
             fires,

@@ -2110,6 +2110,12 @@ impl Pools {
 
     /// The bottom run of segments backed for state.
     #[must_use]
+    /// EXPERIMENT: the segments the pool's range holds.
+    #[must_use]
+    pub fn segment_count(&self) -> u32 {
+        self.pool.segments()
+    }
+
     pub fn committed_segments(&self) -> u32 {
         self.pool.committed_segments()
     }

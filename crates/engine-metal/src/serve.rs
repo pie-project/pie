@@ -1184,6 +1184,7 @@ impl PreparedLoad<'_> {
         // What the OS can wire for this process now, and what others hold
         // wired against the machine's limit.
         let wiring = crate::device::wirable::os_memory()
+            .filter(|_| std::env::var_os("PIE_PROBE_LIFT").is_none())
             .map(|os| crate::store::accounting::Wiring::of(os, device.allocated()));
         let accounting = |pool: u64| {
             crate::store::accounting::Accounting::of(
@@ -1709,6 +1710,90 @@ impl Shell {
         self.pools.commit_segments(segments)
     }
 
+    /// EXPERIMENT (calibration prototype): how far under the recommended
+    /// working set this load's own fires need the held bytes to stay. A
+    /// private filler held resident brings held to `recommended - x`; the
+    /// walk's fires run; `x` steps down 64 MiB from 1 GiB until a command
+    /// buffer is refused. Answers the smallest `x` that passed.
+    /// EXPERIMENT: the pool's own segments backed one at a time, the walk
+    /// fired after each, until a command buffer is refused.
+    #[cfg(target_vendor = "apple")]
+    pub fn calibrate_with_pool(&mut self) -> Result<()> {
+        let recommended = self.device.working_set();
+        let max = self.pools.segment_count();
+        let mut last_ok = 0u64;
+        for segments in 1..=max {
+            self.pools.commit_segments(segments)?;
+            let held = self.device.allocated();
+            if held + (512u64 << 20) < recommended {
+                continue;
+            }
+            match self.warm_pipelines() {
+                Ok(_) => last_ok = held,
+                Err(why) => {
+                    eprintln!("calibrate-pool: refused at segments {segments} held {held} recommended {recommended} last ok {last_ok}: {why}");
+                    self.fatal = None;
+                    return Ok(());
+                }
+            }
+        }
+        eprintln!("calibrate-pool: every segment backed; last ok {last_ok} recommended {recommended}");
+        Ok(())
+    }
+
+    #[cfg(target_vendor = "apple")]
+    pub fn calibrate_driver_resident(&mut self) -> Result<Option<u64>> {
+        use objc2_metal::MTLDevice as _;
+        let sparse = self.device.sparse()?;
+        let recommended = self.device.working_set();
+        let step = 64u64 << 20;
+        let mut fillers: Vec<crate::device::alloc::Slab> = Vec::new();
+        let mut x = 1u64 << 30;
+        let mut passed = None;
+        loop {
+            let want = recommended.saturating_sub(x);
+            while self.device.allocated() + step <= want {
+                let slab = self
+                    .device
+                    .device()
+                    .newBufferWithLength_options(step as usize, objc2_metal::MTLResourceOptions::StorageModePrivate)
+                    .ok_or(Fault::Device {
+                        call: "calibration filler",
+                        why: "a 64 MiB private buffer was refused".into(),
+                    })?;
+                sparse.hold(std::iter::once(&slab), true);
+                fillers.push(slab);
+            }
+            let held = self.device.allocated();
+            let walked = self.warm_pipelines();
+            eprintln!(
+                "calibrate: x {x} held {held} recommended {recommended} gap {} {}",
+                recommended.saturating_sub(held),
+                walked.as_ref().map_or_else(|why| format!("refused: {why}"), |_| "ok".into())
+            );
+            match walked {
+                Ok(_) => {
+                    passed = Some(recommended.saturating_sub(held));
+                    if x < step {
+                        break;
+                    }
+                    x -= step;
+                }
+                Err(_) if self.fatal.is_some() => {
+                    self.fatal = None;
+                    break;
+                }
+                Err(why) => {
+                    sparse.hold(fillers.iter(), false);
+                    return Err(why);
+                }
+            }
+        }
+        sparse.hold(fillers.iter(), false);
+        drop(fillers);
+        Ok(passed)
+    }
+
     /// Whether the machine can wire `bytes` more for this process now: the
     /// GPU's wired limit is the machine's (Metal's recommended working set),
     /// and what every process holds wired, this one's included, counts
@@ -1720,7 +1805,7 @@ impl Shell {
     /// ([`Fault::Refused`]): the runtime tells the planner no grow came, as
     /// at the pool's ceiling.
     fn wired_room(&self, bytes: u64) -> Result<()> {
-        if bytes == 0 {
+        if bytes == 0 || std::env::var_os("PIE_PROBE_LIFT").is_some() {
             return Ok(());
         }
         let Some(os) = crate::device::wirable::os_memory() else {
@@ -3197,6 +3282,28 @@ impl Shell {
                         self.ledger(),
                     );
                     eprintln!("metal: fatal: {fatal}");
+                    // EXPERIMENT: what was in flight beside the refused frame.
+                    let mapping = self
+                        .device
+                        .sparse()
+                        .map(|sparse| (sparse.issued(), sparse.signalled()))
+                        .ok();
+                    eprintln!(
+                        "metal: refused-frame: seq {} lanes {} attached {} held at enqueue {} held now {} \
+                         recommended {} depth {} still in flight {:?} mapping (issued, dirty), signalled {:?}",
+                        flight.seq,
+                        flight.lanes,
+                        flight.attached.len(),
+                        flight.held,
+                        self.device.allocated(),
+                        self.device.working_set(),
+                        self.arms.depth(),
+                        self.inflight
+                            .iter()
+                            .map(|other| (other.seq, other.lanes, other.held))
+                            .collect::<Vec<_>>(),
+                        mapping
+                    );
                     self.fatal = Some(fatal.clone());
                     Fault::Device {
                         call,
@@ -5714,6 +5821,8 @@ struct Flight {
     attached: Vec<engine::InstanceId>,
     readbacks: Vec<Option<(String, u32, u64)>>,
     told: Option<Told>,
+    /// EXPERIMENT: what the device held when the frame was enqueued.
+    held: u64,
 }
 
 /// A fire's word to its completion sink, given why its buffer failed.
@@ -5893,6 +6002,7 @@ impl engine::frame::Shell for Shell {
         } = enqueued;
         self.arms.take(arm);
         fire_trace(|| format!("enqueue seq={seq} rows={lanes}"));
+        let held = self.device.allocated();
         self.inflight.push_back(Flight {
             seq,
             arm,
@@ -5901,6 +6011,7 @@ impl engine::frame::Shell for Shell {
             attached,
             readbacks,
             told,
+            held,
         });
         Ok(Landed {
             seq,

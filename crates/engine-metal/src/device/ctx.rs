@@ -1130,6 +1130,26 @@ mod tests {
             wired(),
             step
         );
+        // Many small command buffers first, as a serving process has run
+        // by the time its pool fills (tens of thousands of frames).
+        if let Some(count) = std::env::var("PIE_PROBE_WARMUP_CMDS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            let small = ctx
+                .device()
+                .newBufferWithLength_options(1 << 20, objc2_metal::MTLResourceOptions::StorageModePrivate)
+                .expect("a small buffer");
+            for _ in 0..count {
+                let command = ctx.queue.commandBuffer().expect("a command buffer");
+                let blit = command.blitCommandEncoder().expect("a blit encoder");
+                blit.fillBuffer_range_value(&small, objc2_foundation::NSRange::new(0, 1 << 20), 2);
+                blit.endEncoding();
+                command.commit();
+                command.waitUntilCompleted();
+            }
+            eprintln!("probe: ran {count} small command buffers; held {} wired {}", ctx.allocated(), wired());
+        }
         // A file's pages wrapped without a copy, as the serving file's
         // weights are (`Context::no_copy`), filled with the rest each step.
         let mut _mapping = None;
