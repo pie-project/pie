@@ -503,14 +503,14 @@ impl Spatial {
         let mut steps = Vec::with_capacity(frame.steps.len());
         let mut readouts = Vec::with_capacity(frame.steps.len());
         for (index, step) in frame.steps.iter().enumerate() {
-            let read = self.fire_step(step)?;
+            let (read, outcome) = self.fire_step(step)?;
             if let Some(sink) = &self.sink {
                 sink(
                     engine::StepDone {
                         frame: id,
                         step: index as u32,
                     },
-                    engine::StepOutcome::committed(),
+                    outcome,
                 );
             }
             steps.push(FireTicket {
