@@ -53,20 +53,28 @@ impl std::fmt::Debug for Code {
 }
 
 impl Code {
-    pub fn new(device: &Context, code: &[engine_gpu::guest::Lowered<String>]) -> Result<Code> {
-        let core = device.core().clone();
-        let binds = bind_layout(&core);
-        let layout = core
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("pie guest"),
-                bind_group_layouts: &[Some(&binds)],
-                immediate_size: 0,
-            });
-        core.take_error("create_pipeline_layout")?;
+    /// A program's stages' pipelines built against `core`'s device: on any
+    /// thread (a registration's compile, off the engine's), each build
+    /// checked in an error scope of the thread that builds it.
+    pub(crate) fn new(core: &Arc<Core>, code: &[engine_gpu::guest::Lowered<String>]) -> Result<Code> {
+        let (binds, layout) = crate::guest::validated(core, "create_pipeline_layout", || {
+            let binds = bind_layout(core);
+            let layout = core
+                .device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("pie guest"),
+                    bind_group_layouts: &[Some(&binds)],
+                    immediate_size: 0,
+                });
+            (binds, layout)
+        })
+        .map_err(|why| Fault::Wgpu {
+            what: "create_pipeline_layout",
+            why,
+        })?;
         let stages = code
             .iter()
-            .map(|lowered| build_pipelines(&core, &layout, lowered))
+            .map(|lowered| build_pipelines(core, &layout, lowered))
             .collect::<Result<Vec<_>>>()?;
         Ok(Code {
             binds,

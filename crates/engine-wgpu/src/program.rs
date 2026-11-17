@@ -307,21 +307,82 @@ pub struct Plane {
     tally: Arc<Tally>,
 }
 
+/// A program as its registration's compile left it ([`Plane::prepare`]),
+/// for [`Plane::finish`]: or why the registration is refused.
+pub struct Prepared(Result<Made, Refusal>);
+
+struct Made {
+    adopted: engine_gpu::program::Adopted<crate::device::Api>,
+    /// Its stages' pipelines, where a model is loaded and they lowered.
+    #[cfg(feature = "wgpu")]
+    code: Option<Arc<crate::guest::session::Code>>,
+}
+
 impl Plane {
-    pub fn register(&mut self, registration: &ProgramRegistration) -> Result<ProgramId, Refusal> {
-        let plan = eta_exec::adopt_launch_package(registration.launch.clone())
-            .map_err(|error| Refusal::Program(error.to_string()))?;
-        if !plan.executable {
-            return Err(Refusal::Program(format!(
-                "program 0x{:016x} does not interpret: {}",
-                registration.program_hash,
-                plan.reject_reason.as_deref().unwrap_or("no reason given")
-            )));
-        }
+    /// A registration's first step, on the engine's thread: what its
+    /// compile takes (the device's core). The compile adopts the program,
+    /// lowers its stages and builds their pipelines on whatever thread
+    /// runs it.
+    pub fn prepare(
+        &mut self,
+        registration: &ProgramRegistration,
+        device: Option<&crate::device::Context>,
+    ) -> engine_gpu::program::Compile<Prepared> {
+        let registration = registration.clone();
+        #[cfg(feature = "wgpu")]
+        let core = device.map(|device| Arc::clone(device.core()));
+        #[cfg(not(feature = "wgpu"))]
+        let _ = device;
+        Box::new(move || {
+            let started = std::time::Instant::now();
+            let adopted =
+                match engine_gpu::program::adopt::<crate::device::Api>(&registration) {
+                    Ok(adopted) => adopted,
+                    Err(refusal) => return Prepared(Err(refusal)),
+                };
+            #[cfg(feature = "wgpu")]
+            let code = match (&core, &adopted.form) {
+                (Some(core), Ok(form)) => {
+                    match crate::guest::session::Code::new(core, form.all()) {
+                        Ok(code) => Some(Arc::new(code)),
+                        Err(fault) => {
+                            return Prepared(Err(Refusal::Program(format!(
+                                "program 0x{:016x} does not build on wgpu: {fault}",
+                                registration.program_hash
+                            ))));
+                        }
+                    }
+                }
+                _ => None,
+            };
+            tracing::info!(
+                program = format_args!("0x{:016x}", registration.program_hash),
+                stages = adopted.plan.package.plans.len(),
+                seconds = started.elapsed().as_secs_f64(),
+                "guest program compiled"
+            );
+            Prepared(Ok(Made {
+                adopted,
+                #[cfg(feature = "wgpu")]
+                code,
+            }))
+        })
+    }
+
+    /// A registration's last step, on the engine's thread: the program's
+    /// id, its form and the pipelines its compile built held; a compile
+    /// that refused refuses here.
+    pub fn finish(&mut self, prepared: Prepared) -> Result<ProgramId, Refusal> {
+        let made = prepared.0?;
+        let engine_gpu::program::Adopted { plan, form } = made.adopted;
         self.next_program += 1;
         let id = ProgramId(self.next_program);
 
-        let admitted = self.forms.admit(id, &plan.package);
+        let admitted = self.forms.hold(id, form);
+        #[cfg(feature = "wgpu")]
+        if let Some(code) = made.code {
+            self.codes.insert(id, code);
+        }
         tracing::debug!(
             program = id.0,
             device_form = admitted,
@@ -330,6 +391,20 @@ impl Plane {
         );
         self.programs.insert(id, Arc::new(plan));
         Ok(id)
+    }
+
+    /// Whether `program`'s stages have their pipelines built.
+    #[must_use]
+    pub fn built(&self, program: ProgramId) -> bool {
+        #[cfg(feature = "wgpu")]
+        {
+            self.codes.contains_key(&program)
+        }
+        #[cfg(not(feature = "wgpu"))]
+        {
+            let _ = program;
+            false
+        }
     }
 
     #[must_use]
@@ -973,7 +1048,7 @@ impl Plane {
             Some(code) => Arc::clone(code),
             None => {
                 let code = Arc::new(
-                    crate::guest::session::Code::new(device, compiled.all())
+                    crate::guest::session::Code::new(device.core(), compiled.all())
                         .map_err(|why| format!("its device code did not build: {why}"))?,
                 );
                 self.codes.insert(binding.program, Arc::clone(&code));
@@ -1130,8 +1205,22 @@ fn runs_of(row: &[u8]) -> Vec<u32> {
 }
 
 impl engine_gpu::program::Programs<crate::device::Api> for Plane {
-    fn register(&mut self, registration: &ProgramRegistration) -> Result<ProgramId, Refusal> {
-        Plane::register(self, registration)
+    type Prepared = Prepared;
+
+    fn prepare(
+        &mut self,
+        registration: &ProgramRegistration,
+        device: Option<&crate::device::Context>,
+    ) -> engine_gpu::program::Compile<Prepared> {
+        Plane::prepare(self, registration, device)
+    }
+
+    fn finish(&mut self, prepared: Prepared) -> Result<ProgramId, Refusal> {
+        Plane::finish(self, prepared)
+    }
+
+    fn built(&self, program: ProgramId) -> bool {
+        Plane::built(self, program)
     }
 
     fn load(

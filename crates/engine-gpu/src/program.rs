@@ -56,9 +56,73 @@ pub fn moved_ends(package: &LaunchPackage) -> std::collections::BTreeSet<(u32, b
     ends
 }
 
+/// A program as its registration's compile adopts it, on any thread: its
+/// plan, and its stages lowered to the backend's code or why they do not
+/// (a form a bind refuses by name, not a refusal of the program).
+pub struct Adopted<L: crate::guest::Lower> {
+    pub plan: eta_exec::ExecPlan,
+
+    pub form: Result<crate::guest::Compiled<L>, crate::guest::Refused>,
+}
+
+/// Adopts `registration`'s launch package and lowers its stages: the checks
+/// a registration refuses on, by the program's hash.
+pub fn adopt<L: crate::guest::Lower>(
+    registration: &ProgramRegistration,
+) -> Result<Adopted<L>, Refusal> {
+    let hash = registration.program_hash;
+    let plan = eta_exec::adopt_launch_package(registration.launch.clone())
+        .map_err(|error| Refusal::Program(format!("program 0x{hash:016x} does not adopt: {error}")))?;
+    if !plan.executable {
+        return Err(Refusal::Program(format!(
+            "program 0x{hash:016x} does not interpret: {}",
+            plan.reject_reason.as_deref().unwrap_or("no reason given")
+        )));
+    }
+    let form = crate::guest::Compiled::of(&plan.package);
+    Ok(Adopted { plan, form })
+}
+
+/// A program's registration as it compiles, on any thread
+/// ([`Programs::prepare`]).
+pub type Compile<P> = Box<dyn FnOnce() -> P + Send>;
+
 /// A backend's program plane.
 pub trait Programs<B: Serve>: Default {
-    fn register(&mut self, registration: &ProgramRegistration) -> Result<ProgramId, Refusal>;
+    /// What a registration's compile makes, off the engine's thread, for
+    /// [`Programs::finish`].
+    type Prepared: Send + 'static;
+
+    /// A registration's first step, on the engine's thread and quick: what
+    /// its compile takes of the plane and the device (`device`, where a
+    /// model is loaded). The compile adopts the program, lowers its stages
+    /// and builds their pipelines, and refuses where the registration does,
+    /// on whatever thread runs it, while the engine fires on.
+    fn prepare(
+        &mut self,
+        registration: &ProgramRegistration,
+        device: Option<&B::Context>,
+    ) -> Compile<Self::Prepared>;
+
+    /// A registration's last step, on the engine's thread: what its compile
+    /// made held and the program's id assigned; a compile that refused
+    /// refuses here, by the program's hash.
+    fn finish(&mut self, prepared: Self::Prepared) -> Result<ProgramId, Refusal>;
+
+    /// A registration whole, on the calling thread.
+    fn register(
+        &mut self,
+        registration: &ProgramRegistration,
+        device: Option<&B::Context>,
+    ) -> Result<ProgramId, Refusal> {
+        let compile = self.prepare(registration, device);
+        self.finish(compile())
+    }
+
+    /// Whether `program`'s stages have their pipelines built, as its
+    /// registration builds them where a model is loaded: a bind then builds
+    /// none.
+    fn built(&self, program: ProgramId) -> bool;
 
     fn package(&self, program: ProgramId) -> Option<&LaunchPackage>;
 

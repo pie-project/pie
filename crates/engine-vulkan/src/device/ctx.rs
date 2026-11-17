@@ -1049,6 +1049,13 @@ impl Context {
         &self.pipeline_cache
     }
 
+    /// The pipeline cache, shared: what a registration's compile, off the
+    /// engine's thread, builds through.
+    #[must_use]
+    pub fn pipeline_cache_shared(&self) -> Arc<PipelineCache> {
+        Arc::clone(&self.pipeline_cache)
+    }
+
     #[must_use]
     pub fn enabled(&self) -> Enabled {
         self.core.features

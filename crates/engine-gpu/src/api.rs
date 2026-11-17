@@ -779,7 +779,34 @@ where
     }
 
     fn register_program(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
-        self.programs.register(registration).map_err(refusal)
+        let device = self.shell.as_ref().map(Shell::device);
+        self.programs.register(registration, device).map_err(refusal)
+    }
+
+    /// The program adopted, lowered and its pipelines built in the
+    /// returned compile, off the engine's thread (`Programs::prepare`).
+    fn prepare_program(
+        &mut self,
+        registration: &ProgramRegistration,
+    ) -> EngineResult<engine::ProgramCompile> {
+        let device = self.shell.as_ref().map(Shell::device);
+        let compile = self.programs.prepare(registration, device);
+        Ok(Box::new(move || engine::Prepared(Box::new(compile()))))
+    }
+
+    /// What the compile built held and the program's id assigned
+    /// (`Programs::finish`); a compile that refused refuses here.
+    fn finish_program(&mut self, prepared: engine::Prepared) -> EngineResult<ProgramId> {
+        let Ok(prepared) = prepared
+            .0
+            .downcast::<<B::Programs as Programs<B>>::Prepared>()
+        else {
+            return Err(Error::Program(format!(
+                "a prepared program the {} engine did not prepare",
+                B::KIND
+            )));
+        };
+        self.programs.finish(*prepared).map_err(refusal)
     }
 
     fn register_channel(

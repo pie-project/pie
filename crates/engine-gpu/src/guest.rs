@@ -237,7 +237,13 @@ impl<L: Lower> Default for Forms<L> {
 
 impl<L: Lower> Forms<L> {
     pub fn admit(&mut self, program: ProgramId, package: &LaunchPackage) -> bool {
-        match Compiled::of(package) {
+        self.hold(program, Compiled::of(package))
+    }
+
+    /// Holds `program`'s form as its registration's compile lowered it
+    /// ([`crate::program::adopt`]), or why it has none.
+    pub fn hold(&mut self, program: ProgramId, form: Result<Compiled<L>, Refused>) -> bool {
+        match form {
             Ok(compiled) => {
                 self.compiled.insert(program, Arc::new(compiled));
                 true

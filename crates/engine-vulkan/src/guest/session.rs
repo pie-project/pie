@@ -47,7 +47,7 @@ impl Drop for Built {
 /// Built stages by the hash of their SPIR-V and entry points.
 pub type BuiltStages = std::collections::HashMap<u64, Arc<Built>>;
 
-fn stage_key(lowered: &engine_gpu::guest::Lowered<Vec<u32>>) -> u64 {
+pub fn stage_key(lowered: &engine_gpu::guest::Lowered<Vec<u32>>) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     lowered.code.hash(&mut hasher);
@@ -282,7 +282,11 @@ impl Session {
             let pipelines = match built.get(&stage_key(lowered)) {
                 Some(pipelines) => Arc::clone(pipelines),
                 None => {
-                    let pipelines = Arc::new(build_pipelines(device, lowered)?);
+                    let pipelines = Arc::new(build_pipelines(
+                        device.core(),
+                        device.pipeline_cache(),
+                        lowered,
+                    )?);
                     built.insert(stage_key(lowered), Arc::clone(&pipelines));
                     pipelines
                 }
@@ -843,11 +847,14 @@ fn build_stage(
     })
 }
 
-fn build_pipelines(
-    device: &Context,
+/// A stage's pipelines built against `core`'s device through `cache`: on
+/// any thread (a registration's compile, off the engine's), as Vulkan makes
+/// pipelines and the cache they share without external synchronization.
+pub(crate) fn build_pipelines(
+    core: &Arc<Core>,
+    cache: &crate::device::ctx::PipelineCache,
     lowered: &engine_gpu::guest::Lowered<Vec<u32>>,
 ) -> Result<Built> {
-    let core = device.core();
     // The layout the stage's SPIR-V was checked against when it lowered.
     let bindings: Vec<vk::DescriptorSetLayoutBinding> = crate::guest::stage_layout()
         .into_iter()
@@ -925,7 +932,6 @@ fn build_pipelines(
                 pipelines: Vec::new(),
             });
         }
-        let cache = device.pipeline_cache();
         let built = d.create_compute_pipelines(cache.handle(), &infos, None);
         d.destroy_shader_module(module, None);
         match built {
