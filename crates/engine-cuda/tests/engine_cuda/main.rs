@@ -37,6 +37,7 @@ mod a_beam_step_answers_what_the_interpreter_answers;
 mod a_bidirectional_attention_adds_its_relative_bias_through_the_engine;
 mod a_stated_group_mask_reads_only_the_rows_it_admits;
 mod a_buffer_frees_after_another_context_closes;
+mod a_closed_contexts_kept_memory_serves_the_next;
 #[cfg(feature = "cuda")]
 mod a_capture_survives_a_load_on_another_thread;
 mod a_cell_table_reads_each_rows_patch_and_group;
