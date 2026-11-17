@@ -155,17 +155,6 @@ impl Arena {
         self.reserved
     }
 
-    /// Backs the whole reservation: the `attn.scores` planes over the prefix
-    /// a load commits, once a program reads them.
-    pub fn ensure_whole(&mut self, pools: &mut Pools) -> Result<()> {
-        if self.committed >= self.reserved {
-            return Ok(());
-        }
-        pools.hold_activation(self.reserved, true)?;
-        self.committed = self.reserved;
-        Ok(())
-    }
-
     pub fn ensure(&mut self, pools: &mut Pools, bytes: u64) -> Result<()> {
         if bytes <= self.committed {
             return Ok(());

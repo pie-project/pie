@@ -42,6 +42,29 @@ struct Batch {
 }
 
 impl Program {
+    /// The lanes of its pass it reads captured attention scores of
+    /// (`crate::scores`), from its first: 0 where it reads none.
+    #[must_use]
+    pub fn score_lanes(&self) -> u32 {
+        self.plan
+            .outputs()
+            .iter()
+            .filter(|(name, _)| *name == crate::scores::SCORES)
+            .map(|&(_, lane)| lane + 1)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// What an instance keeps in the pool: its item, and past it a lane's
+    /// score rows of `score_bytes` for each lane it reads them of.
+    fn held(&self, score_bytes: u64) -> Held {
+        let held = Held::of(&self.plan.package.channels);
+        match self.score_lanes() {
+            0 => held,
+            lanes => held.with_scores(u64::from(lanes) * score_bytes),
+        }
+    }
+
     fn batch(&mut self, extents: Extents) -> Result<&mut Batch> {
         if let Some(at) = self
             .batches
@@ -191,6 +214,10 @@ pub struct Plane {
     /// The engine's lane arenas, where a sampler's blocks meet
     /// ([`launch::Arenas`]): laid at load ([`Plane::set_arenas`]).
     arenas: launch::Arenas,
+    /// A lane's captured score rows, which a program reading them keeps
+    /// in its instance's item (`crate::scores`); 0 where the load
+    /// captures none.
+    score_bytes: u64,
 }
 
 /// What a fire of one program at one bind's extents takes of the fire's
@@ -273,6 +300,7 @@ impl Plane {
             term: engine::GuestTerm::default(),
             laid: Vec::new(),
             arenas: launch::Arenas::default(),
+            score_bytes: 0,
         }
     }
 
@@ -283,6 +311,20 @@ impl Plane {
     }
 
     /// The lane arenas the load laid.
+    /// A lane's captured score rows take `bytes` of a reader's item.
+    pub fn set_score_bytes(&mut self, bytes: u64) {
+        self.score_bytes = bytes;
+    }
+
+    /// Where instance `id`'s captured score rows of its pass's lane `lane`
+    /// lie now; `None` for a lane its program reads none of.
+    #[must_use]
+    pub fn score_rows(&self, id: InstanceId, lane: u32) -> Option<u64> {
+        let bound = self.instances.get(&id)?;
+        let lanes = self.programs.get(&bound.program_id)?.score_lanes();
+        (lane < lanes).then_some(bound.scores? + u64::from(lane) * self.score_bytes)
+    }
+
     pub fn set_arenas(&mut self, arenas: launch::Arenas) {
         self.arenas = arenas;
     }
@@ -505,7 +547,9 @@ impl Plane {
             .ok_or_else(|| Fault::program("program::plane", format!("no program {program_id}")))?;
         program.batch(extents)?;
         let program = &*program;
-        let place = slots.place(&Held::of(&program.plan.package.channels), span)?;
+        let held = program.held(self.score_bytes);
+        let place = slots.place(&held, span)?;
+        let scores = held.score_at.map(|at| place.instance + at);
         let endpoints = endpoints_for(&program.plan, adopted, stream)?;
         let held = endpoints.clone();
         let mut session = match Session::bind(
@@ -537,6 +581,7 @@ impl Plane {
                 geometry,
                 ids: ids.to_vec(),
                 slots,
+                scores,
             },
         );
         Ok(id)
@@ -546,7 +591,7 @@ impl Plane {
     pub fn held(&self, program_id: ProgramId) -> Result<Held> {
         self.programs
             .get(&program_id)
-            .map(|program| Held::of(&program.plan.package.channels))
+            .map(|program| program.held(self.score_bytes))
             .ok_or_else(|| Fault::program("program::plane", format!("no program {program_id}")))
     }
 
@@ -557,9 +602,9 @@ impl Plane {
             let Some(program) = self.programs.get(&bound.program_id) else {
                 continue;
             };
-            let place = bound
-                .slots
-                .place(&Held::of(&program.plan.package.channels), span)?;
+            let held = program.held(self.score_bytes);
+            let place = bound.slots.place(&held, span)?;
+            bound.scores = held.score_at.map(|at| place.instance + at);
             bound.session.rebase(&place)?;
         }
         Ok(())
@@ -575,7 +620,9 @@ impl Plane {
         let program = self.programs.get(&bound.program_id).ok_or_else(|| {
             Fault::program("program::plane", format!("instance {id}'s program is gone"))
         })?;
-        let place = slots.place(&Held::of(&program.plan.package.channels), span)?;
+        let held = program.held(self.score_bytes);
+        let place = slots.place(&held, span)?;
+        bound.scores = held.score_at.map(|at| place.instance + at);
         bound.session.rebase(&place)?;
         bound.slots = slots;
         Ok(())
@@ -1132,6 +1179,9 @@ struct Bound {
     geometry: GeometryClass,
     ids: Vec<ChannelId>,
     slots: Slots,
+    /// Where its lane's captured score rows lie now, for a program that
+    /// reads them.
+    scores: Option<u64>,
 }
 
 /// The address of a guest item of the stated bytes in the named slots of a

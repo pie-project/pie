@@ -1,10 +1,8 @@
-use dtype::Dtype;
-
 use crate::attn::kv;
 use crate::attn::plan::PrefillPlan;
 use crate::error::Error;
-use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, kernel, refuse, stated};
-use crate::tensor::{KvPool, RaggedTensor, Tensor};
+use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, kernel, refuse, stated};
+use crate::tensor::{KvPool, RaggedTensor};
 
 const FILE: &str = "attn/score.hip";
 
@@ -29,6 +27,17 @@ fn stamp_for(head_dim: u32) -> Option<u32> {
     STAMPS.into_iter().find(|stamp| head_dim <= *stamp)
 }
 
+/// Where a capture writes: a table of one f32 row address a fire lane
+/// (`lanes` of them), 0 for a lane that captures nothing, and the floats
+/// into each lane's rows its layer's plane starts at. A lane's plane is
+/// `q_heads` runs of `kv_max` keys.
+#[derive(Debug, Clone, Copy)]
+pub struct ScoreRows {
+    pub table: u64,
+    pub lanes: u32,
+    pub plane: u64,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn capture(
     ctx: &Ctx,
@@ -41,7 +50,7 @@ pub fn capture(
     observe: u32,
     lane_offset: u32,
     kv_max: u32,
-    scores: &mut Tensor,
+    rows: ScoreRows,
 ) -> Result<(), Error> {
     const OP: &str = "attn.score_capture";
     plan.accepts(OP, head_dim, Some(kv_heads), None)?;
@@ -54,15 +63,6 @@ pub fn capture(
                  straight out of the pages: it dequantizes nothing, so a quantized or \
                  fp8 pool has no scores to give",
                 pool.keys.dtype
-            ),
-        ));
-    }
-    if scores.dtype != Dtype::F32 {
-        return Err(refuse(
-            OP,
-            format!(
-                "the score rows are {:?}, and a per-key mass is an f32 rectangle",
-                scores.dtype
             ),
         ));
     }
@@ -101,15 +101,13 @@ pub fn capture(
         num_q_heads, plan.shape.num_q_heads,
         "`{OP}` captures one row per query head of the plan it was carved with"
     );
-    if scores.width != num_q_heads.saturating_mul(kv_max)
-        || scores.rows < lane_offset.saturating_add(requests)
-    {
+    if rows.lanes < lane_offset.saturating_add(requests) {
         return Err(refuse(
             OP,
             format!(
-                "the score rows are {} by {}, and {requests} lanes from lane {lane_offset} \
-                 capture {num_q_heads} heads of {kv_max} keys",
-                scores.rows, scores.width
+                "the row table holds {} lanes, and {requests} lanes from lane {lane_offset} \
+                 capture",
+                rows.lanes
             ),
         ));
     }
@@ -146,7 +144,8 @@ pub fn capture(
             pool.page_indices.arg(),
             pool.page_indptr.arg(),
             pool.last_page_lens.arg(),
-            scores.arg(),
+            ArgValue::Ptr(rows.table),
+            i64::try_from(rows.plane).unwrap_or(i64::MAX).arg(),
             page_size.arg(),
             stated(OP, num_q_heads)?.arg(),
             stated(OP, num_kv_heads)?.arg(),

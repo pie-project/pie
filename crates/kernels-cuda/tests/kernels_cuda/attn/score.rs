@@ -2,12 +2,13 @@
 
 //! `attn.score_capture` against the host softmax: each lane's mass over its
 //! first `kv_max` keys, averaged over its last `observe` query rows, a run a
-//! head, written at the lane's row of a `[lanes, heads * kv_max]` plane.
+//! head, written where the row table names each lane's row (none for a
+//! lane the table names 0).
 
 use crate::common::attn_ref::{col, pool, ten};
 use crate::common::spread::agrees;
 use crate::common::{Gpu, Lcg};
-use dtype::Dtype::{Bf16, F32, I32};
+use dtype::Dtype::{Bf16, I32};
 use kernels_cuda::attn::plan::{self, Device, Live, Shape, Toggles, Workspace};
 use kernels_cuda::tensor::{KvPool, RaggedTensor};
 
@@ -123,7 +124,22 @@ fn a_score_capture_lands_each_lanes_mass_at_its_row() {
     .expect("the prefill plans");
     plan.stage(&ctx).expect("the plan uploads");
     let at = gpu.up(&want.iter().map(|_| 9.0f32).collect::<Vec<_>>());
-    let mut scores = ten(at, lane_offset + n, qh * kv_max, F32);
+    // Each capturing lane's row where a `[lanes, heads * kv_max]` plane
+    // would hold it; the lanes before them have no row.
+    let table: Vec<u64> = (0..lane_offset + n)
+        .map(|lane| {
+            if lane < lane_offset {
+                0
+            } else {
+                at + (lane * qh * kv_max * 4) as u64
+            }
+        })
+        .collect();
+    let scores = kernels_cuda::attn::score::ScoreRows {
+        table: gpu.up(&table),
+        lanes: (lane_offset + n) as u32,
+        plane: 0,
+    };
     kernels_cuda::attn::score::capture(
         &ctx,
         qt,
@@ -135,7 +151,7 @@ fn a_score_capture_lands_each_lanes_mass_at_its_row() {
         observe as u32,
         lane_offset as u32,
         kv_max as u32,
-        &mut scores,
+        scores,
     )
     .expect("the capture fires");
     gpu.sync();
@@ -163,7 +179,7 @@ fn a_score_capture_lands_each_lanes_mass_at_its_row() {
                 observe as u32,
                 lane_offset as u32,
                 kv_max as u32,
-                &mut scores,
+                scores,
             )
             .expect("the capture fires");
         },

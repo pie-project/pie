@@ -687,12 +687,29 @@ fn score_capture_averages_the_observed_rows_mass() {
     .unwrap();
     let (observe, lane_offset, kv_max) = (3u32, 1u32, 40u32);
     let rows = lane_offset + n;
-    let mut scores = gpu.tensor(
+    let scores = gpu.tensor(
         &vec![9.0; (rows * hq * kv_max) as usize],
         rows,
         hq * kv_max,
         Dtype::F32,
     );
+    // Each capturing lane's row where a `[lanes, heads * kv_max]` plane
+    // would hold it, as u64s; the lanes before them have no row.
+    let table: Vec<i32> = (0..rows)
+        .map(|lane| {
+            if lane < lane_offset {
+                0
+            } else {
+                scores.ptr + u64::from(lane * hq * kv_max) * 4
+            }
+        })
+        .flat_map(|at| [at as u32 as i32, (at >> 32) as u32 as i32])
+        .collect();
+    let table = kernels_rocm::attn::score::ScoreRows {
+        table: gpu.ints_shaped(&table, rows, 2).ptr,
+        lanes: rows,
+        plane: 0,
+    };
     let scale = 1.0 / (d as f32).sqrt();
     kernels_rocm::attn::score::capture(
         &ctx,
@@ -705,7 +722,7 @@ fn score_capture_averages_the_observed_rows_mass() {
         observe,
         lane_offset,
         kv_max,
-        &mut scores,
+        table,
     )
     .unwrap();
     let got = gpu.read(&scores);
@@ -716,7 +733,6 @@ fn score_capture_averages_the_observed_rows_mass() {
         &[],
         &[out(&scores)],
         |_, pools, _| {
-            let mut scores = scores;
             kernels_rocm::attn::score::capture(
                 &ctx,
                 q,
@@ -728,7 +744,7 @@ fn score_capture_averages_the_observed_rows_mass() {
                 observe,
                 lane_offset,
                 kv_max,
-                &mut scores,
+                table,
             )
             .unwrap();
         },

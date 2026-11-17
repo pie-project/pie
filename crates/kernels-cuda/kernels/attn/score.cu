@@ -11,7 +11,8 @@ __global__ void score_capture(
     const i32* __restrict__ kv_page_indices,
     const i32* __restrict__ kv_page_indptr,
     const i32* __restrict__ kv_last_page_lens,
-    float* __restrict__ scores,
+    const unsigned long long* __restrict__ row_table,
+    long long plane,
     int page_size,
     long long stride_page,
     int num_q_heads,
@@ -35,10 +36,13 @@ __global__ void score_capture(
     float* wm = q_s + head_dim;
     float* wl = wm + WARPS;
 
-    const long long out_row =
-        (static_cast<long long>(lane_offset + request) * num_q_heads + head) *
-        static_cast<long long>(kv_max);
-    float* out = scores + out_row;
+    // Each lane's rows lie where its reader keeps them; 0: no reader, no row.
+    const unsigned long long row = row_table[lane_offset + request];
+    if (row == 0ull) {
+        return;
+    }
+    float* out = reinterpret_cast<float*>(row) + plane +
+                 static_cast<long long>(head) * static_cast<long long>(kv_max);
 
     for (int i = static_cast<int>(threadIdx.x); i < kv_max; i += threads) {
         out[i] = 0.f;

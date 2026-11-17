@@ -1325,6 +1325,16 @@ impl Shell {
         )?;
 
         let exports = Exports::of(&boot.trace, &compiled)?;
+        // A reader's score rows are its instance's; the fire stages only
+        // their addresses, a row a lane of the widest window it lays.
+        let score_rows = crate::scores::ScoreRows::of(
+            &boot.trace,
+            &exports,
+            crate::window::lane_capacity(boot.budget.max_lanes),
+        )?;
+        if let Some(rows) = &score_rows {
+            programs.set_score_bytes(rows.lane_bytes());
+        }
 
         let airborne = crate::settle::Airborne::new();
         let mut pools = pools;
@@ -1422,6 +1432,7 @@ impl Shell {
             adapters: crate::blob::Adapters::new(adapter_seats),
             held: vec![0; boot.slots as usize],
             readout_rows,
+            score_rows,
             // Lent at the stand-in span until laid, as the readout rows
             // are: the size-only walk stages into it and copies nothing.
             expert_staged: expert_staging.at(crate::sizing::STAND_IN),
@@ -1710,9 +1721,9 @@ impl Shell {
     /// The runs of the activation's span a fire stages into and reads out
     /// of, in the order they lie from `inputs_at`: the staged inputs' slab,
     /// the readout rows' table, the voxel store, the rs fold predicates and
-    /// the host-resident experts' staging and the guests' samplers' lane
-    /// arenas, each to [`INPUTS_ALIGN`].
-    fn staged_runs(&self) -> [u64; 6] {
+    /// the host-resident experts' staging, the guests' samplers' lane
+    /// arenas and the score rows' table, each to [`INPUTS_ALIGN`].
+    fn staged_runs(&self) -> [u64; 7] {
         [
             self.inputs.bytes(),
             self.readout_rows.bytes() as u64,
@@ -1720,6 +1731,9 @@ impl Shell {
             self.predicate.bytes(),
             self.expert_staging.bytes(),
             self.lane_arenas_bytes(),
+            self.score_rows
+                .as_ref()
+                .map_or(0, |rows| rows.table_bytes() as u64),
         ]
         .map(|bytes| bytes.next_multiple_of(INPUTS_ALIGN))
     }
@@ -1739,8 +1753,16 @@ impl Shell {
         if let Some(buffers) = &self.buffers {
             buffers.lay_scratch(&mut self.pools)?;
         }
-        let [inputs, readouts, voxels, predicates, experts, arenas] = self.staged_runs();
-        let staged = inputs + readouts + voxels + predicates + experts + arenas;
+        let [
+            inputs,
+            readouts,
+            voxels,
+            predicates,
+            experts,
+            arenas,
+            scores,
+        ] = self.staged_runs();
+        let staged = inputs + readouts + voxels + predicates + experts + arenas + scores;
         self.pools
             .hold_activation_at(self.inputs_at, staged, false)?;
         let base = self.pools.activation_base() + self.inputs_at;
@@ -1758,6 +1780,9 @@ impl Shell {
             at: base + inputs + readouts + voxels + predicates + experts,
             bytes: arenas,
         });
+        if let Some(rows) = self.score_rows.as_mut() {
+            rows.lay(base + inputs + readouts + voxels + predicates + experts + arenas);
+        }
         eprintln!(
             "engine-cuda: guests' samplers meet in {} KiB of lane arenas laid at load ({} \
              lanes a flight on {} units), no lane's",

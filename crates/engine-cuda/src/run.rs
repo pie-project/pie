@@ -409,6 +409,10 @@ pub struct FireBindings {
     pub toggles: Toggles,
 
     pub capture: bool,
+
+    /// Where the fire's capturing lanes write their readers' score rows;
+    /// `None` where the load captures none.
+    pub scores: Option<crate::scores::ScoreSeat>,
 }
 
 #[derive(Clone, Copy, Debug)]

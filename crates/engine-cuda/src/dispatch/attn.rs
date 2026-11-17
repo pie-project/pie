@@ -41,6 +41,18 @@ impl Run<'_> {
             } => {
                 let mut q_rows = self.ragged(*q);
                 q_rows.data = self.windowed(q_rows.data);
+                let rows = self
+                    .bindings()
+                    .scores
+                    .as_ref()
+                    .and_then(|seat| seat.rows(*scores))
+                    .ok_or_else(|| kernels_cuda::Error::Backend {
+                        op: "attn.score_capture",
+                        detail: format!(
+                            "it writes value {}, which is no layer of the load's `attn.scores`",
+                            scores.0
+                        ),
+                    })?;
                 kernels_cuda::attn::score::capture(
                     self.ctx(),
                     q_rows,
@@ -52,7 +64,7 @@ impl Run<'_> {
                     *observe,
                     self.window().span().lane_offset,
                     *kv_max,
-                    &mut self.tensor(*scores),
+                    rows,
                 )
             }
             Attn::Voxel {

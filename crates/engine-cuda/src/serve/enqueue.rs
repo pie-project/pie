@@ -143,6 +143,7 @@ impl Shell {
             rs_scratch,
             predicate: &mut self.predicate,
             readout_rows: &mut self.readout_rows,
+            score_rows: self.score_rows.as_mut(),
             budget: &self.budget,
             fire_lanes,
             owed: &mut self.owed,
@@ -211,6 +212,8 @@ struct FireCtx<'a> {
     rs_scratch: Option<(u64, u64)>,
     predicate: &'a mut Predicate,
     readout_rows: &'a mut Buffer,
+    /// Where the fire's capturing lanes write their readers' rows.
+    score_rows: Option<&'a mut crate::scores::ScoreRows>,
     budget: &'a Budget,
     /// The most lanes a fire carries, as the runtime is told.
     fire_lanes: u32,
@@ -303,6 +306,36 @@ impl Shell {
 }
 
 impl FireCtx<'_> {
+    /// Stages the score rows' table: for each of the fire's lanes, in the
+    /// fire's order, the row its reader keeps for it, and 0 for a lane no
+    /// instance attached in this fire reads scores of. A lane that captures
+    /// has a reader attached (`engine::fire::Step::validate_captures`).
+    fn stage_score_rows(&mut self, p: &Prepared<'_>) -> Result<()> {
+        let Some(table) = self.score_rows.as_deref_mut() else {
+            return Ok(());
+        };
+        let order = p.composition.lanes();
+        let mut at = vec![0u32; order.len()];
+        for (place, row) in order.iter().enumerate() {
+            if let Some(lane) = at.get_mut(row.source as usize) {
+                *lane = u32::try_from(place).unwrap_or(u32::MAX);
+            }
+        }
+        let mut rows = vec![0u64; order.len()];
+        for attached in p.attachments.iter().filter(|a| !a.adapter_only) {
+            for k in 0..attached.lanes {
+                let Some(row) = self.programs.score_rows(attached.instance, k) else {
+                    continue;
+                };
+                let source = (attached.lane + k) as usize;
+                if let Some(&place) = at.get(source) {
+                    rows[place as usize] = row;
+                }
+            }
+        }
+        table.stage(self.device.stream(), &rows)
+    }
+
     fn gate(&mut self, p: &Prepared<'_>) -> Result<()> {
         let lane_count = p.composition.lane_count();
         if p.rs.predicated || p.rs.truncates {
@@ -553,6 +586,7 @@ impl FireCtx<'_> {
             carve_lanes,
         )?;
         self.programs.set_span(span);
+        self.stage_score_rows(p)?;
         if let Some(ep) = self.ep {
             ep.seats(forked)
                 .seat(ep.wire(), p.composition.bucket(), &mut slots);
@@ -726,6 +760,10 @@ impl FireCtx<'_> {
             device: self.device.device(),
             toggles: self.device.toggles(),
             capture: self.graphs.shaped(),
+            scores: self
+                .score_rows
+                .as_deref()
+                .map(crate::scores::ScoreRows::seat),
         };
         let place = At::new();
         let stream = Cell::new(0u32);
@@ -1197,6 +1235,30 @@ impl FireCtx<'_> {
         let storage = storage_of(plane.dtype)?;
         let width = plane.width;
         match out.decl.axis {
+            poem_ir::InputAxis::Lane if name == crate::scores::SCORES => {
+                // The reader's own rows, a layer's plane after another.
+                let (Some(rows), Some(table)) = (
+                    self.programs.score_rows(instance, k),
+                    self.score_rows.as_deref(),
+                ) else {
+                    return Err(Fault::Unbound {
+                        what: format!(
+                            "output `{name}` of lane {k}, which instance {instance}'s rows \
+                             hold none of"
+                        ),
+                    });
+                };
+                self.programs.bind_output(
+                    instance,
+                    name,
+                    k,
+                    rows,
+                    storage,
+                    table.width(),
+                    table.width(),
+                    0,
+                )
+            }
             poem_ir::InputAxis::Lane => {
                 let elem = poem_compiler::arena::elem_bytes(plane.dtype).unwrap_or(0);
                 let stride = match out.values.get(1) {

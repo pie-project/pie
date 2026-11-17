@@ -277,6 +277,9 @@ pub struct Held {
     /// The bytes of each ring that is an item of its own; `None` for the
     /// channels above.
     pub ring_bytes: Vec<Option<u64>>,
+    /// Where a reader of captured scores keeps its lane's rows in the
+    /// instance's item (`crate::scores`); `None` for any other program.
+    pub score_at: Option<u64>,
 }
 
 /// What every cell span in an item starts a whole number of.
@@ -304,7 +307,17 @@ impl Held {
             instance_bytes: at,
             native_at,
             ring_bytes,
+            score_at: None,
         }
+    }
+
+    /// The same item with a lane's score rows of `bytes` past it.
+    #[must_use]
+    pub fn with_scores(mut self, bytes: u64) -> Held {
+        let at = self.instance_bytes.next_multiple_of(CELL_ALIGN);
+        self.score_at = Some(at);
+        self.instance_bytes = at + bytes;
+        self
     }
 }
 

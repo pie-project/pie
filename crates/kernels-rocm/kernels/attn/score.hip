@@ -14,7 +14,8 @@ template <int HEAD_DIM_MAX, int WAVES, bool HND>
 __global__ __launch_bounds__(WAVES * 64) void score_capture(
     const bf16* __restrict__ q, const i32* __restrict__ qo_indptr, const bf16* __restrict__ k_pages,
     const i32* __restrict__ page_indices, const i32* __restrict__ page_indptr,
-    const i32* __restrict__ last_page_lens, float* __restrict__ scores, int page_size,
+    const i32* __restrict__ last_page_lens, const unsigned long long* __restrict__ row_table,
+    long long plane, int page_size,
     int num_q_heads, int num_kv_heads, int head_dim, float sm_scale, int observe, int lane_offset,
     int kv_max, long long stride) {
     static_assert(HEAD_DIM_MAX % kWave == 0, "a lane takes whole elements of the head");
@@ -29,8 +30,11 @@ __global__ __launch_bounds__(WAVES * 64) void score_capture(
     const int ln = lane();
     const int wave = static_cast<int>(threadIdx.x) / kWave;
 
-    float* out = scores + (static_cast<long long>(lane_offset + request) * num_q_heads + head) *
-                              static_cast<long long>(kv_max);
+    // Each lane's rows lie where its reader keeps them; 0: no reader, no row.
+    const unsigned long long row = row_table[lane_offset + request];
+    if (row == 0ull) return;
+    float* out = reinterpret_cast<float*>(row) + plane +
+                 static_cast<long long>(head) * static_cast<long long>(kv_max);
     for (int i = threadIdx.x; i < kv_max; i += blockDim.x) out[i] = 0.f;
 
     const int page_first = page_indptr[request];
