@@ -471,10 +471,13 @@ pub fn init_admission(max_concurrent: Option<usize>) {
             .collect()
     };
     let bind_ahead = limit.map(|n| OrderedSemaphore::after("bind", n, false, earlier(&[&prewarm])));
+    // Execution looks back at bind alone: what waits before bind is bind's
+    // to order, and a process there may wait on bind permits that
+    // execution's own waiters hold.
     let sem = limit.map(|n| {
         // A held process is not started: it waits here, bound, until its
         // row lets it, and the others pass it.
-        OrderedSemaphore::after("execution", n, true, earlier(&[&prewarm, &bind_ahead]))
+        OrderedSemaphore::after("execution", n, true, earlier(&[&bind_ahead]))
     });
     BIND_STAGED_RESERVE.store(
         limit.map_or(0, |n| n.saturating_mul(STAGED_COHORTS)),
