@@ -988,6 +988,10 @@ impl Engine for Metal {
         Ok(id)
     }
 
+    fn close_program(&mut self, program: ProgramId) -> EngineResult<()> {
+        self.loaded_mut()?.close_program(program).map_err(fault)
+    }
+
     fn adapter_key(&self, binding: &engine::InstanceBinding) -> EngineResult<Option<u128>> {
         adapter_key_of(self.loaded()?, binding.program, &binding.seeds)
     }

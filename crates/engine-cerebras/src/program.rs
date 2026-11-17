@@ -123,8 +123,21 @@ impl Plane {
         Ok(id)
     }
 
-    #[must_use]
-    pub fn package(
+    /// Releases `id`, which no instance binds (`Engine::close_program`):
+    /// its id answers nothing after.
+    pub fn close_program(&mut self, id: ProgramId) -> Result<(), Refusal> {
+        if self.instances.values().any(|instance| instance.program == id) {
+            return Err(Refusal::Program(format!(
+                "program {id} still has an instance bound"
+            )));
+        }
+        self.programs.remove(&id).ok_or(Refusal::Closed {
+            what: "program",
+            id: id.0,
+        })?;
+        Ok(())
+    }
+
         &self,
         program: ProgramId,
     ) -> Option<&eta_compiler::codegen::launch::LaunchPackage> {

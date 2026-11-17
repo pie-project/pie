@@ -731,6 +731,10 @@ impl Engine for Rank {
         self.with(|cuda| cuda.finish_program(prepared))
     }
 
+    fn close_program(&mut self, program: ProgramId) -> EngineResult<()> {
+        self.with(|cuda| cuda.close_program(program))
+    }
+
     fn program_facts(&self, program: ProgramId) -> EngineResult<engine::program::ProgramFacts> {
         match self.group.ranks[self.rank].try_lock().ok() {
             Some(rank) => rank.program_facts(program),

@@ -754,11 +754,9 @@ impl Lane {
                 }
             }
             QueuedItem::PrepareProgram { program, response } => {
-                let prepared = backend(engine).and_then(|engine| {
-                    let backend = crate::engine::verbs::codegen_backend(engine);
-                    let plan = &crate::pipeline::program::with_host_codegen(&program, backend);
-                    Ok(engine.prepare_program(plan)?)
-                });
+                // Its host codegen ran off this thread before it was sent.
+                let prepared =
+                    backend(engine).and_then(|engine| Ok(engine.prepare_program(&program)?));
                 let _ = response.send(prepared);
                 LaneCommit::None
             }
@@ -766,9 +764,19 @@ impl Lane {
                 let registered = backend(engine).and_then(|engine| {
                     let program_id = engine.finish_program(prepared)?;
                     // What an instance of it holds in the pool, asked once
-                    // at registration.
-                    if let Some(roles) = roles_of(engine_idx) {
-                        crate::store::roles::learn_program(&roles, &**engine, program_id)?;
+                    // at registration. A program whose facts are not
+                    // learned is released: the registration fails whole.
+                    if let Some(roles) = roles_of(engine_idx)
+                        && let Err(error) =
+                            crate::store::roles::learn_program(&roles, &**engine, program_id)
+                    {
+                        let released = engine.close_program(program_id);
+                        return Err(match released {
+                            Ok(()) => anyhow!("its facts: {error}; released"),
+                            Err(also) => anyhow!(
+                                "its facts: {error}; and releasing program {program_id}: {also}"
+                            ),
+                        });
                     }
                     Ok(program_id)
                 });

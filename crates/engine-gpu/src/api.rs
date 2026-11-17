@@ -839,6 +839,10 @@ where
         self.programs.finish(*prepared).map_err(refusal)
     }
 
+    fn close_program(&mut self, program: ProgramId) -> EngineResult<()> {
+        self.programs.close_program(program).map_err(refusal)
+    }
+
     fn register_channel(
         &mut self,
         registration: &ChannelRegistration,

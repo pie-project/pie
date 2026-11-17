@@ -406,6 +406,10 @@ impl Engine for Spatial {
         self.programs.finish(*adopted).map_err(refusal)
     }
 
+    fn close_program(&mut self, program: ProgramId) -> EngineResult<()> {
+        self.programs.close_program(program).map_err(refusal)
+    }
+
     fn register_channel(
         &mut self,
         registration: &ChannelRegistration,

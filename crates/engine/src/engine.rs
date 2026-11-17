@@ -136,6 +136,11 @@ pub trait Engine: Send {
     /// the program's name.
     fn finish_program(&mut self, prepared: Prepared) -> Result<ProgramId>;
 
+    /// Releases a registered program no instance binds: its id answers
+    /// nothing after. The runtime closes one it could not learn the facts
+    /// of, so no registration that fails leaves a program behind.
+    fn close_program(&mut self, program: ProgramId) -> Result<()>;
+
     /// What an instance of a registered program holds in the pool's
     /// `Instance` and `Channel` slots, asked before the runtime takes them
     /// and binds. The default states none: the engine keeps its tables and

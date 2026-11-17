@@ -331,6 +331,22 @@ impl Plane {
         Ok(id)
     }
 
+    /// Releases `id`, which no instance binds (`Engine::close_program`):
+    /// its id answers nothing after.
+    pub fn close_program(&mut self, id: ProgramId) -> Result<(), Refusal> {
+        if self.instances.values().any(|instance| instance.program == id) {
+            return Err(Refusal::Program(format!(
+                "program {id} still has an instance bound"
+            )));
+        }
+        self.programs.remove(&id).ok_or(Refusal::Closed {
+            what: "program",
+            id: id.0,
+        })?;
+        self.forms.forget(id);
+        Ok(())
+    }
+
     #[must_use]
     pub fn package(
         &self,
@@ -1041,6 +1057,10 @@ impl Plane {
 impl engine_gpu::program::Programs<crate::device::Api> for Plane {
     fn finish(&mut self, prepared: engine_gpu::program::Prepared) -> Result<ProgramId, Refusal> {
         Plane::finish(self, prepared)
+    }
+
+    fn close_program(&mut self, id: ProgramId) -> Result<(), Refusal> {
+        Plane::close_program(self, id)
     }
 
     fn load(
