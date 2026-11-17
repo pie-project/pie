@@ -44,6 +44,10 @@ pub fn spawn(
     Ok(())
 }
 
+pub fn stop() {
+    SERVICE.stop();
+}
+
 /// Install `binary`, which came as `file`, under its name in `namespace`.
 /// It is compiled first: what does not compile is refused, and the name
 /// keeps the build it ran.

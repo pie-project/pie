@@ -89,7 +89,7 @@ public final class PieServer: Sendable {
     /// installed; `home` holds the inferlet cache and defaults to
     /// `<Caches>/pie`. With `listen` (`"127.0.0.1:8080"`) pie's gateway also
     /// serves it there: its WebSocket and the OpenAI-compatible HTTP routes.
-    /// One server per process.
+    /// One server at a time per process.
     public static func start(
         model: URL,
         configuration: Configuration = Configuration(),
@@ -162,8 +162,7 @@ public final class PieServer: Sendable {
     }
 
     /// Stops the runtime and releases the engine's memory; clients fail from
-    /// then on. The runtime boots once per process, so no server can start
-    /// afterwards.
+    /// then on. Another server, of any model, may start afterwards.
     public func shutdown() async {
         try? await Self.blocking { [handle] in pie_server_shutdown(handle.pointer) }
     }

@@ -14,6 +14,15 @@ use fire::{PendingFireQueue, PendingFires, PipelineFailure};
 /// closed. What `pipeline.speculation-advised` reads.
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 
+/// Forgets the boot's programs, claims and fires, for
+/// [`crate::bootstrap::reset`].
+pub(crate) fn reset() {
+    program::reset();
+    coalesce::reset();
+    fire::reset();
+    ACTIVE.store(0, std::sync::atomic::Ordering::Release);
+}
+
 pub struct Pipeline {
     pub fires: PendingFires,
     pub(crate) failure: PipelineFailure,

@@ -19,6 +19,7 @@ pub mod rt;
 pub mod scheduler;
 pub mod server;
 pub(crate) mod service;
+pub(crate) mod slot;
 pub mod store;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod telemetry;

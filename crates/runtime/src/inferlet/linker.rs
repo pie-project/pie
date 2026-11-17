@@ -26,6 +26,10 @@ pub fn spawn(engine: &Engine, fs: FsPolicy, network: NetworkPolicy, memory_limit
         .expect("linker already spawned");
 }
 
+pub fn stop() {
+    SERVICE.stop();
+}
+
 pub async fn instantiate(
     process_id: ProcessId,
     program: &Program,

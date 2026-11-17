@@ -38,6 +38,10 @@ struct Claim<By = WorkingSetId> {
 
 static CLAIMS: LazyLock<Mutex<HashMap<Hash256, Claim>>> = LazyLock::new(Default::default);
 
+pub(crate) fn reset() {
+    CLAIMS.lock().unwrap().clear();
+}
+
 /// How many of `mine`, from the first, others have claimed and not let
 /// lapse by `now`, and when the last of those claims lapses.
 fn claimed_run<By: PartialEq>(

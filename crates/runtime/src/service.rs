@@ -78,6 +78,12 @@ impl<Msg: Send + 'static> Service<Msg> {
     pub fn is_spawned(&self) -> bool {
         self.state.lock().unwrap().is_some()
     }
+
+    /// Drops the sender: the handler ends once its queue drains, and the
+    /// service can be spawned again.
+    pub fn stop(&self) {
+        self.state.lock().unwrap().take();
+    }
 }
 
 pub struct ServiceMap<K, Msg>
@@ -137,6 +143,12 @@ where
     pub fn remove(&self, key: &K) -> bool {
         self.handles.remove(key);
         self.map.remove(key).is_some()
+    }
+
+    /// Drops every sender, as [`Service::stop`] does each one's.
+    pub fn clear(&self) {
+        self.handles.clear();
+        self.map.clear();
     }
 
     pub fn keys(&self) -> Vec<K> {

@@ -16,6 +16,10 @@ pub fn spawn() {
     }
 }
 
+pub fn stop() {
+    SERVICE.stop();
+}
+
 pub fn send(process_id: String, message: String) -> Result<()> {
     SERVICE.send(Message::Deliver {
         process_id,

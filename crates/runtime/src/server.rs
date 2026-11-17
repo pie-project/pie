@@ -6,7 +6,7 @@ pub use data_transfer::InFlightUpload;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
@@ -21,7 +21,7 @@ use crate::service::{ServiceHandler, ServiceMap};
 
 pub type ClientId = u32;
 
-static STATE: OnceLock<Arc<ServerState>> = OnceLock::new();
+static STATE: crate::slot::Slot<Arc<ServerState>> = crate::slot::Slot::new();
 static SESSION_OUTBOX: LazyLock<
     DashMap<ClientId, Arc<TokioMutex<mpsc::Receiver<WireServerMessage>>>>,
 > = LazyLock::new(DashMap::new);
@@ -32,7 +32,7 @@ fn install_state(
     allow_weight_reload: bool,
 ) -> Arc<ServerState> {
     if let Some(state) = STATE.get() {
-        return Arc::clone(state);
+        return state;
     }
 
     let state = Arc::new(ServerState {
@@ -42,13 +42,12 @@ fn install_state(
         allow_weight_reload,
     });
     let _ = STATE.set(Arc::clone(&state));
-    STATE.get().cloned().unwrap_or(state)
+    STATE.get().unwrap_or(state)
 }
 
 fn get_state() -> Result<Arc<ServerState>> {
     STATE
         .get()
-        .cloned()
         .ok_or_else(|| anyhow!("server not initialized; call server::init first"))
 }
 
@@ -57,6 +56,14 @@ fn get_state() -> Result<Arc<ServerState>> {
 pub(crate) fn init(max_upload_bytes: usize, allow_upload: bool, allow_weight_reload: bool) {
     let _ = install_state(max_upload_bytes, allow_upload, allow_weight_reload);
     inbox::spawn();
+}
+
+/// Forgets the boot's settings and sessions, for [`crate::bootstrap::reset`].
+pub(crate) fn reset() {
+    STATE.clear();
+    SESSION_OUTBOX.clear();
+    CLIENT_SERVICES.clear();
+    inbox::stop();
 }
 
 pub const DEFAULT_TENANT: &str = "default";

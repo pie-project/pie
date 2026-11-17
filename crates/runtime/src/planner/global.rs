@@ -5,7 +5,7 @@ use super::{ProcessId, ResidencyPlanner};
 
 type PlannerMap = HashMap<(usize, usize), Arc<ResidencyPlanner>>;
 
-static PRIMARY: OnceLock<Arc<ResidencyPlanner>> = OnceLock::new();
+static PRIMARY: crate::slot::Slot<Arc<ResidencyPlanner>> = crate::slot::Slot::new();
 static PLANNERS: OnceLock<RwLock<PlannerMap>> = OnceLock::new();
 
 pub fn init_planner(model: usize, engine: usize, planner: ResidencyPlanner) {
@@ -49,7 +49,7 @@ pub async fn persist_run(
 
 pub fn planner_for(model: usize, engine: usize) -> Option<Arc<ResidencyPlanner>> {
     if model == 0 && engine == 0 {
-        return PRIMARY.get().cloned();
+        return PRIMARY.get();
     }
     PLANNERS
         .get()?
@@ -67,7 +67,7 @@ pub fn wake(pid: ProcessId) {
     }
 }
 
-pub fn planner() -> Option<&'static Arc<ResidencyPlanner>> {
+pub fn planner() -> Option<Arc<ResidencyPlanner>> {
     PRIMARY.get()
 }
 
@@ -150,6 +150,18 @@ pub fn planner_of(pid: ProcessId) -> Option<Arc<ResidencyPlanner>> {
 pub fn rekey_holders() {
     for planner in planners() {
         planner.rekey_holders();
+    }
+}
+
+/// Forgets the boot's planners and where its processes ran, for
+/// [`crate::bootstrap::reset`].
+pub(crate) fn reset() {
+    PRIMARY.clear();
+    if let Some(planners) = PLANNERS.get() {
+        planners.write().unwrap().clear();
+    }
+    if let Some(held) = ENGINE_OF.get() {
+        held.write().unwrap().clear();
     }
 }
 

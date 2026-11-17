@@ -159,6 +159,16 @@ impl Drop for RungWant {
 static PROCESS_WANTS: std::sync::LazyLock<Mutex<std::collections::HashMap<uuid::Uuid, RungWant>>> =
     std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
+/// Forgets the boot's asks and caps: the next boot's engines start at their
+/// largest rung.
+pub(crate) fn reset() {
+    PROCESS_WANTS.lock().unwrap().clear();
+    RUNG_WANTS.lock().unwrap().clear();
+    for cap in FIRE_CAP.iter().chain(&RUNG_GRANT) {
+        cap.store(u32::MAX, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// Process `pid`'s pass on `engine` asks fires of `rows` (`None`: a pass of
 /// a few rows, a decode, asks nothing): what its process holds the rung
 /// for until its next pass says otherwise, or it ends ([`forget_process`]).

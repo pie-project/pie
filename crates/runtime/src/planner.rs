@@ -36,6 +36,7 @@ pub use acquire::Acquired;
 pub use departure::Departure;
 pub use diagnostics::{PlannerDiagnostics, PlannerQueueEntry};
 pub use error::{PlannerError, StarveCause};
+pub(crate) use global::reset;
 pub use global::{
     assign, engine_of, init_planner, persist_run, place, planner, planner_for, planner_of,
     planners, rekey_holders, release, wake,

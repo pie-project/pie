@@ -22,6 +22,10 @@ static DIALER: RwLock<Option<Arc<dyn Dialer>>> = RwLock::new(None);
 /// The executors the cluster named, by process.
 static NAMED: LazyLock<Mutex<HashMap<ProcessId, Vec<String>>>> = LazyLock::new(Mutex::default);
 
+pub(crate) fn reset() {
+    NAMED.lock().unwrap().clear();
+}
+
 pub fn set_dialer(dialer: Option<Arc<dyn Dialer>>) {
     *DIALER.write().unwrap() = dialer;
 }

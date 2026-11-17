@@ -18,6 +18,11 @@ pub fn version() -> u64 {
     VERSION.load(Ordering::Acquire)
 }
 
+/// The next boot's model starts at version 0.
+pub(crate) fn reset() {
+    VERSION.store(0, Ordering::Release);
+}
+
 pub(crate) type Launching = tokio::sync::RwLockReadGuard<'static, ()>;
 
 pub(crate) fn launching() -> Result<Launching> {
