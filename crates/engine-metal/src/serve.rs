@@ -273,6 +273,10 @@ pub struct Attached {
 }
 
 pub struct Shell {
+    /// Why the device failed a command buffer, once it has: the load fires
+    /// nothing more, and every later fire is refused with this reason
+    /// rather than submitted into a device that has refused one.
+    fatal: Option<String>,
     /// What the load weighed its rungs by, where its profile states rates:
     /// the rungs, the estimate and the live range (`--check-estimate`).
     weighed: Option<crate::top::Weighed>,
@@ -1562,6 +1566,7 @@ impl PreparedLoad<'_> {
             weights,
             rung: arena.floor_tokens(),
             warming: false,
+            fatal: None,
             frozen_ahead: std::collections::HashMap::new(),
             arena,
             pools,
@@ -3105,10 +3110,25 @@ impl Shell {
         if let Err(fault) = waited {
             self.arms.give(flight.arm);
             return Err(match fault {
-                Fault::Device { call, why } => Fault::Device {
-                    call,
-                    why: format!("step {} of this load: {why}", flight.seq),
-                },
+                Fault::Device { call, why } => {
+                    // The device refused a command buffer: what it holds
+                    // for this process against its working set says
+                    // whether the load placed past what it can hold.
+                    let fatal = format!(
+                        "the device failed step {}'s command buffer ({call}: {why}); it held \
+                         {} bytes for this process of a {}-byte working set; the ledger: {}",
+                        flight.seq,
+                        self.device.allocated(),
+                        self.device.working_set(),
+                        self.ledger(),
+                    );
+                    eprintln!("metal: fatal: {fatal}");
+                    self.fatal = Some(fatal.clone());
+                    Fault::Device {
+                        call,
+                        why: fatal,
+                    }
+                }
                 other => other,
             });
         }
@@ -5627,6 +5647,12 @@ impl engine::frame::Shell for Shell {
         Self: 'a,
     {
         let _ = prev;
+        if let Some(why) = &self.fatal {
+            return Err(Fault::Device {
+                call: "fire",
+                why: format!("refused: this load fires nothing more: {why}"),
+            });
+        }
         self.admit_attachments(step.lanes, step.attachments)?;
         self.fire_prologues(step.attachments)?;
         self.stage(step)
