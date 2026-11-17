@@ -32,9 +32,10 @@
 //! window list refs in token order) and [`::engine::fire::Lane::fixed`] (one `[run, cow]`
 //! a piece). `cow == run` writes the record in place; a lane whose record is
 //! shared (a fork, or a snapshot restored, in that fire) writes a fresh
-//! record the engine copies `run` onto first. The copy-on-write records come
-//! out of a reserve of one set per lane a fire runs, which the planner keeps
-//! back from admission (`ResidencyPlanner::cow_lanes`).
+//! record the engine copies `run` onto first. The copy-on-write record is
+//! part of that fire's demand, granted before it runs as any slot is: none
+//! is kept back up front, and one held counts against the planner's state
+//! seats (`ResidencyPlanner::state_seats`).
 //!
 //! Position (CONTRACT-BC item 2): state lies below `total - act_chunks(rung)`;
 //! raising the rung first moves state out of the new activation span
