@@ -272,16 +272,33 @@ mod tests {
         }]
     }
 
-    /// The CUDA regions a program registers, each by its text under one
-    /// symbol: what engine-cuda keys a region's module by.
-    fn regions(traced: &Traced) -> std::collections::BTreeSet<String> {
+    /// The regions `backend`'s emitter gives a program, each by its text
+    /// under one symbol: what engine-cuda keys a region's module by. For
+    /// `wgsl`, the step calls its stages dispatch, each by its module's
+    /// text: the pipelines engine-vulkan and engine-wgpu run it on.
+    fn regions(traced: &Traced, backend: &str) -> std::collections::BTreeSet<String> {
+        use eta_compiler::codegen::wgsl;
         let mut registry =
             super::super::program::Registry::new(std::num::NonZeroUsize::new(1).unwrap());
         let program = registry
             .register(traced.encode(), vec![outputs()], EngineCaps::default())
             .expect("registers");
+        if backend == "wgsl" {
+            let calls = wgsl::step_calls();
+            return program
+                .launch()
+                .plans
+                .iter()
+                .flat_map(|plan| {
+                    wgsl::emit_launch_steps("ptir_step", plan)
+                        .expect("lowers to steps")
+                        .steps
+                })
+                .map(|step| wgsl::step_module("ptir_step", &calls[step.call as usize]))
+                .collect();
+        }
         program
-            .emitted("cuda")
+            .emitted(backend)
             .expect("emits")
             .kernels
             .iter()
@@ -300,23 +317,42 @@ mod tests {
     fn a_standard_request_registers_the_regions_the_prewarm_built() {
         let prewarmed = traces(VOCAB, 16, &outputs(), 8).expect("traces");
         assert_eq!(prewarmed.len(), 2 * sampler::STANDARD.len());
-        let request = Request {
-            temperature: 0.6,
-            knob: 0.5,
-            top_k: 7,
-            seed: 1234,
-            prompt: 37,
-        };
+        let requests = [
+            Request {
+                temperature: 0.7,
+                knob: 0.9,
+                top_k: 7,
+                seed: 1234,
+                prompt: 37,
+            },
+            Request {
+                temperature: 1.3,
+                knob: 0.5,
+                top_k: 20,
+                seed: 7,
+                prompt: 280,
+            },
+        ];
         for ((name, shape), built) in sampler::STANDARD.iter().zip(prewarmed.chunks(2)) {
-            let asked = passes(VOCAB, 16, &outputs(), 8, shape, &request).expect("traces");
-            for (pass, (built, asked)) in ["prompt", "decode"].iter().zip(built.iter().zip(&asked))
-            {
-                let (built, asked) = (regions(&built.1), regions(asked));
-                assert!(!built.is_empty(), "{name} ({pass}) emits no region");
-                assert_eq!(
-                    built, asked,
-                    "{name} ({pass}): a request builds a region the prewarm did not"
-                );
+            for request in &requests {
+                let asked = passes(VOCAB, 16, &outputs(), 8, shape, request).expect("traces");
+                for (pass, (built, asked)) in
+                    ["prompt", "decode"].iter().zip(built.iter().zip(&asked))
+                {
+                    for backend in ["cuda", "wgsl"] {
+                        let (built, asked) = (regions(&built.1, backend), regions(asked, backend));
+                        assert!(
+                            !built.is_empty(),
+                            "{name} ({pass}, {backend}) emits no region"
+                        );
+                        assert_eq!(
+                            built, asked,
+                            "{name} ({pass}, {backend}): a request at temperature {} builds a \
+                             region the prewarm did not",
+                            request.temperature
+                        );
+                    }
+                }
             }
         }
     }
