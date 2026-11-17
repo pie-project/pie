@@ -61,6 +61,10 @@ pub(crate) enum Event {
     PropsChanged(ProcessId, Props, Vec<String>),
     /// One of its fires found this many tokens cached and mapped them in.
     Cached(ProcessId, u64),
+    /// One of its fires wrote `rows` rows and read out `readouts` of them:
+    /// the rows before its first readout are its prompt, each readout a
+    /// token it generates.
+    Fired(ProcessId, u64, u64),
     CacheEmptied(ProcessId, By),
     Started(ProcessId),
     Paused(ProcessId),

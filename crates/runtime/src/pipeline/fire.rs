@@ -3779,6 +3779,21 @@ pub async fn submit_pass_stamped<C: FireContext>(
             cursor.reserved = cursor.reserved.max(end);
         }
         drop(promoted);
+        // What the fire writes and reads out, for the policies' prompt and
+        // generated counts: rows mapped in from the cache are rows of the
+        // prompt too.
+        crate::policy::report(crate::policy::Event::Fired(
+            pid,
+            full.lanes.iter().map(|lane| lane.tokens.len() as u64).sum(),
+            full.lanes
+                .iter()
+                .map(|lane| match &lane.readout {
+                    ::engine::Readout::None => 0,
+                    ::engine::Readout::Last => 1,
+                    ::engine::Readout::Rows(rows) => rows.len() as u64,
+                })
+                .sum(),
+        ));
         if pass_slots.is_some() {
             // It looked, so what it found is measured, nothing included.
             ctx.note_cached(u64::from(supplied));
@@ -5501,13 +5516,14 @@ async fn fire_device_geometry<C: FireContext>(
     let plain_decode =
         !reads_each_other && switched.plain() && plain_decode(&req, lora_program, fire_wide_mask);
     let mut parts = Vec::with_capacity(group_sets.len());
-    for (((((set, (log_seq, log_pages, boundary)), lease), kvtxn), (_, lanes)), &stated) in group_sets
-        .iter()
-        .zip(logged)
-        .zip(leases)
-        .zip(kvtxns)
-        .zip(&groups)
-        .zip(&stated)
+    for (((((set, (log_seq, log_pages, boundary)), lease), kvtxn), (_, lanes)), &stated) in
+        group_sets
+            .iter()
+            .zip(logged)
+            .zip(leases)
+            .zip(kvtxns)
+            .zip(&groups)
+            .zip(&stated)
     {
         // Each lane's mask speaks of the slots from the set's boundary on.
         for &lane in lanes {
@@ -6144,12 +6160,27 @@ mod static_admission_tests {
         // the fires' instances: 1 reserved first, 2 second.
         let cases: [(&str, Submissions); 7] = [
             ("in reservation order", vec![vec![vec![1, 2]]]),
-            ("the seal leaves the earlier frame for later", vec![vec![vec![2]], vec![vec![1]]]),
+            (
+                "the seal leaves the earlier frame for later",
+                vec![vec![vec![2]], vec![vec![1]]],
+            ),
             ("a held prompt waits a wave", vec![vec![vec![2], vec![1]]]),
-            ("the earlier lane stands later in the wave", vec![vec![vec![2, 1]]]),
-            ("a boundary falls between them", vec![vec![vec![2]], vec![vec![1]]]),
-            ("the later is a rider ahead of the framed", vec![vec![vec![2]], vec![vec![1]]]),
-            ("the later is framed ahead of a rider", vec![vec![vec![2]], vec![vec![1]]]),
+            (
+                "the earlier lane stands later in the wave",
+                vec![vec![vec![2, 1]]],
+            ),
+            (
+                "a boundary falls between them",
+                vec![vec![vec![2]], vec![vec![1]]],
+            ),
+            (
+                "the later is a rider ahead of the framed",
+                vec![vec![vec![2]], vec![vec![1]]],
+            ),
+            (
+                "the later is framed ahead of a rider",
+                vec![vec![vec![2]], vec![vec![1]]],
+            ),
         ];
         let limits = crate::engine::SchedulerLimits {
             max_forward_requests: 8,
@@ -7928,7 +7959,12 @@ pub(crate) mod fold_tests {
         cursor: &CursorCell,
         failure: &PipelineFailure,
         fold: &geometry::Fold,
-    ) -> (crate::engine::WorkItemCompletion, u64, PendingFire, Unqueued) {
+    ) -> (
+        crate::engine::WorkItemCompletion,
+        u64,
+        PendingFire,
+        Unqueued,
+    ) {
         let stores = crate::store::registry::get(kv.model, kv.engine);
         let pass = lanes_on(&stores, kv.id, &[cursor]);
         let mut req = request(1);
@@ -8197,10 +8233,7 @@ pub(crate) mod fold_tests {
                 }
                 fork.await?.expect("the fold was placed")
             };
-            assert!(
-                flight.length() == (7, true, 0),
-                "{child:?}"
-            );
+            assert!(flight.length() == (7, true, 0), "{child:?}");
             let pages = {
                 let mut kv = flight.stores.kv.lock();
                 let forked = kv.fork(flight.kv.id).unwrap();
@@ -8280,7 +8313,10 @@ pub(crate) mod fold_tests {
             );
             match ended {
                 "dropped" | "no count" => {
-                    assert_eq!(refused, format!("working set: {}", crate::store::kv::page_table::UNPLACED));
+                    assert_eq!(
+                        refused,
+                        format!("working set: {}", crate::store::kv::page_table::UNPLACED)
+                    );
                     assert!(flight.failure.lock().unwrap().is_none(), "{ended}");
                 }
                 _ => assert!(
@@ -8304,10 +8340,7 @@ pub(crate) mod fold_tests {
         );
         let refused = fork.now_or_never().expect("it never hangs")?;
         let unreported = RsError::DeviceFoldFailed(RsDeviceFold::UNREPORTED.to_string());
-        assert_eq!(
-            refused.map(|_| ()),
-            Err(unreported.to_string())
-        );
+        assert_eq!(refused.map(|_| ()), Err(unreported.to_string()));
         Ok(())
     }
 
@@ -9038,9 +9071,13 @@ mod unfolded_tests {
                         // Anywhere from its state to the furthest row written:
                         // on, or rewound over rows it rejects.
                         let first = folded + pick(end - folded + 1);
-                        let reads =
-                            ::engine::fire::buffered_reads(None, folded, first, ::engine::fire::Lineage::Set)
-                                .unwrap();
+                        let reads = ::engine::fire::buffered_reads(
+                            None,
+                            folded,
+                            first,
+                            ::engine::fire::Lineage::Set,
+                        )
+                        .unwrap();
                         let carried: u32 = reads.iter().map(|span| span.end - span.start).sum();
                         assert!(
                             carried <= fire.stated,
@@ -9407,11 +9444,7 @@ mod unfolded_tests {
             };
             // A count the host knows over a folded length it knows is a
             // slot; the device's count is placed when the fire settles.
-            assert_eq!(
-                matches!(by, Some(FoldBy::Settled { .. })),
-                counts,
-                "{what}"
-            );
+            assert_eq!(matches!(by, Some(FoldBy::Settled { .. })), counts, "{what}");
             assert_eq!(req.lanes[0].reports != 0, counts, "{what}");
             assert_eq!(untagged_device_fold(&req), None, "{what}");
         }
