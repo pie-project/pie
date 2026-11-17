@@ -100,7 +100,7 @@ fn logits(trace: &Trace, container: &Path, mega: bool, prompt: &[u32]) -> Vec<f3
         page_size: PAGE,
         context: CEILING,
         slots: 1,
-        kv_budget: Some(crate::POOL),
+        kv_budget: Some(engine_cuda::store::KvSize::Bytes(crate::POOL)),
         allowance: engine::Allowance::WHOLE,
         context_declared: false,
         ordinal: 0,

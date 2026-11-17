@@ -14,9 +14,9 @@ use crate::exports::{
 use crate::inputs::Inputs;
 use crate::program::Plane as ProgramPlane;
 use crate::record::Bodies as GraphCache;
-use crate::store::Pools;
 use crate::store::kv::{self, Paging};
 use crate::store::rs::Buffers;
+use crate::store::{KvSize, Pools, StatedKv};
 use crate::weights::Weights;
 
 use super::{Boot, Golden, Released, Shell};
@@ -834,21 +834,42 @@ impl Shell {
         // The pool's address space is reserved for every page its bytes
         // could hold, the stated budget or the card's room before the
         // weights land; `Pools::fit_the_card` sizes it within that.
-        let pool_bytes = boot.kv_budget.unwrap_or_else(|| {
-            crate::device::elastic::room_under(ceiling, free_before, device_total)
-        });
-        let paging = Paging::of(
-            boot.page_size,
-            boot.context,
-            boot.slots,
-            crate::store::page_ceiling(&boot.trace, boot.page_size, boot.context, pool_bytes)?,
-        )?
-        .windowed(
-            crate::store::window_of(&boot.trace)?,
-            boot.budget.max_tokens,
-        )
-        .seated(boot.budget.max_lanes)
-        .spare(engine.window_spare);
+        // Stated tokens are the pages they fill; else every page the stated
+        // bytes, or the card's room before the weights land, could hold.
+        let pages = match boot.kv_budget {
+            Some(KvSize::Tokens(tokens)) => {
+                let pages = StatedKv::pages_for(tokens, boot.page_size);
+                let sequence = u64::from(boot.context.div_ceil(boot.page_size.max(1)));
+                if pages < sequence {
+                    return Err(Fault::Residency(format!(
+                        "`[engine.memory] kv_device_tokens = {tokens}` fills {pages} kv pages \
+                         of {} tokens, and one sequence at the {}-token context takes \
+                         {sequence}; state at least {} tokens or a shorter `[engine] \
+                         max_context`",
+                        boot.page_size,
+                        boot.context,
+                        sequence * u64::from(boot.page_size),
+                    )));
+                }
+                pages
+            }
+            stated => crate::store::page_ceiling(
+                &boot.trace,
+                boot.page_size,
+                boot.context,
+                match stated {
+                    Some(KvSize::Bytes(bytes)) => bytes,
+                    _ => crate::device::elastic::room_under(ceiling, free_before, device_total),
+                },
+            )?,
+        };
+        let paging = Paging::of(boot.page_size, boot.context, boot.slots, pages)?
+            .windowed(
+                crate::store::window_of(&boot.trace)?,
+                boot.budget.max_tokens,
+            )
+            .seated(boot.budget.max_lanes)
+            .spare(engine.window_spare);
         // A class attending both ways decodes its planes over all its rows once, at load.
         let decoding = poem_exec::feeds::classes_reading(&boot.trace, &compiled, |def| {
             matches!(def, poem_ir::Def::Weight(w)
@@ -868,7 +889,10 @@ impl Shell {
             decoded_dense,
             &boot.trace,
             paging,
-            boot.kv_budget,
+            match boot.kv_budget {
+                Some(KvSize::Bytes(bytes)) => Some(bytes),
+                _ => None,
+            },
         )?;
 
         if boot.knobs.diagnostics.arm_trace {
@@ -1035,7 +1059,10 @@ impl Shell {
         facts.mark_rows_a_lane(&read_only_by_decoders(&boot.trace, &compiled, &decoding));
         let feeds = Feeds::of(&boot.trace, &compiled);
         let tiers = crate::record::Tiers {
-            plain: plain_of(&landing, &Exports::of(&boot.trace, &compiled, boot.context, boot.page_size)?.outputs),
+            plain: plain_of(
+                &landing,
+                &Exports::of(&boot.trace, &compiled, boot.context, boot.page_size)?.outputs,
+            ),
         };
         let drafting_words: std::collections::HashSet<u64> = compiled
             .classes
@@ -1909,6 +1936,21 @@ impl Staged {
         // driver's lock stalls no fire of this one's), and the pool the
         // runtime is stated is the pool the card backed.
         shell.back_whole()?;
+        if let Some(kv) = shell.pools.stated_kv() {
+            eprintln!(
+                "engine-cuda: kv_device_tokens = {}: the device pool holds {} kv pages of {} \
+                 tokens ({} asked), {} chunks of {} MiB: {} for the kv pages and the shapes \
+                 beside them, {} for the weights held whole",
+                kv.tokens,
+                shell.pools.paging().pages(),
+                kv.page_tokens,
+                kv.pages,
+                kv.chunks(),
+                kv.chunk_bytes >> 20,
+                kv.kv_chunks,
+                kv.weight_chunks,
+            );
+        }
         if arm_trace {
             eprintln!(
                 "[arm-trace] cache rows sized to {} pages ({} MiB, {} sequences at the declared \

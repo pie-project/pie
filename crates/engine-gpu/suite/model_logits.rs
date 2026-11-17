@@ -529,6 +529,166 @@ fn a_windowed_miniature_serves_two_lanes() {
     seats("gemma4-e4b-mini-l1", None);
 }
 
+/// The state chunks `shell`'s pool holds below its activation span.
+fn state_chunks(shell: &Shell) -> u32 {
+    shell.pools().layout().total_chunks - shell.pools().span_chunks()
+}
+
+/// Every seat `shell` lays has its runs below the activation span: a
+/// seat-addressed fire of its last seat names no chunk the pool does not
+/// hold for state.
+fn seats_lie_in_state(shell: &Shell) {
+    let layout = *shell.pools().layout();
+    let state = state_chunks(shell);
+    assert!(
+        1 + layout.seat_chunks() <= state,
+        "{} seats' runs take {} chunks and the pool holds {state} for state",
+        shell.paging().slots,
+        1 + layout.seat_chunks()
+    );
+    for shape in layout.shapes().filter(|shape| shape.seat_slots > 0) {
+        let last = shape.seat_ref(shape.seat_slots - 1).expect("the last seat's ref");
+        assert!(
+            shape.split(last).0 < state,
+            "shape {} names chunk {} past the {state} state chunks",
+            shape.id,
+            shape.split(last).0
+        );
+    }
+}
+
+/// A hybrid load lays the seats its widest seat-addressed fire asks for,
+/// within its pool: a fire of every seat at once, the last among them,
+/// serves. Asked for more seats than its pool holds the runs of, the load
+/// is refused by name, never laid with a seat's record or rs run past the
+/// state chunks (where a fire of it names a chunk the pool does not hold,
+/// or the activation span's).
+#[test]
+fn a_hybrid_load_lays_the_seats_its_widest_seat_addressed_fire_asks_for() {
+    let fixture = fixture("qwen35-tiny", None);
+    let Some(mut shell) = load(&fixture, CONTEXT) else {
+        return;
+    };
+    assert_eq!(shell.paging().slots, SEATS);
+    seats_lie_in_state(&shell);
+    // Every seat at once, as many rows each as the fire's budget shares.
+    let [prompt, _] = prompts();
+    let rows = (shell.budget().max_tokens / SEATS).min(prompt.len() as u32);
+    let prompt = &prompt[..rows as usize];
+    let seated: Vec<Seated<'_>> = (0..SEATS)
+        .map(|seat| Seated {
+            held: Some(0),
+            ..Seated::of(Lane {
+                slot: seat,
+                word: word(&fixture.trace, rows),
+                tokens: prompt,
+            })
+        })
+        .collect();
+    let got = shell
+        .fire_seated(&seated)
+        .unwrap_or_else(|why| panic!("a fire of all {SEATS} seats lands: {why}"));
+    assert_eq!(got.len(), SEATS as usize);
+    assert!(got.iter().all(|row| row.iter().all(|v| v.is_finite())));
+    let laid = *shell.pools().layout();
+    drop(shell);
+
+    // A pool holding the runs of `SEATS` seats, asked for more seats than
+    // its list run alone holds.
+    let list = laid.list.expect("the hybrid pages its attention rows");
+    let asked = SEATS * (2 + laid.seat_chunks()) * list.per_chunk;
+    let _alone = loading();
+    let device = DeviceBoot::default();
+    let Some(residency) = allowed(
+        &device,
+        engine::load::Residency {
+            device_kv_budget: Some(u64::from(1 + laid.seat_chunks()) * laid.chunk_bytes),
+            ..engine::load::Residency::default()
+        },
+    ) else {
+        return;
+    };
+    let refused = match Shell::load(Boot {
+        slots: asked,
+        ..boot(&fixture, PAGE, CONTEXT, &device, residency)
+    }) {
+        Ok(shell) => panic!(
+            "{asked} seats laid over {} state chunks",
+            state_chunks(&shell)
+        ),
+        Err(why) => why.to_string(),
+    };
+    assert!(
+        refused.contains("seats' runs"),
+        "refused for another reason: {refused}"
+    );
+}
+
+/// A served hybrid load (no seats stated, its lanes naming their slots by
+/// ref) lays the seats its own naming walk fires, whatever its budget: a
+/// pool holding a few seats' runs loads, and its seats lie in it. Asked
+/// for a fixed count of seats, a served load at such a budget laid runs
+/// past its pool and was refused at its naming walk ("this fire wants ..
+/// chunks a slot ref may name").
+#[test]
+fn a_served_hybrid_load_lays_the_seats_its_own_fires_take() {
+    use engine::Engine;
+    use engine::load::{Budgets, Checkpoint, LoadRequest};
+    fn contract_for(
+        trace: &Trace,
+        path: &Path,
+    ) -> Result<checkpoint::contract::ModelContract, String> {
+        let source = ztensor::Source::open(path).map_err(|why| why.to_string())?;
+        poem::import::own_contract(&source, &trace.params, 1, backend::PLATFORM)
+            .map_err(|why| why.to_string())
+    }
+    let fixture = fixture("qwen35-tiny", None);
+    let Some(shell) = load(&fixture, CONTEXT) else {
+        return;
+    };
+    // The runs of `SEATS` seats: more than the naming walk's.
+    let laid = *shell.pools().layout();
+    drop(shell);
+    let device = DeviceBoot::default();
+    let Some(residency) = allowed(
+        &device,
+        engine::load::Residency {
+            device_kv_budget: Some(u64::from(1 + laid.seat_chunks()) * laid.chunk_bytes),
+            ..engine::load::Residency::default()
+        },
+    ) else {
+        return;
+    };
+    let _alone = loading();
+    let mut engine = backend::Engine::new(device, contract_for);
+    engine
+        .load(LoadRequest {
+            trace: fixture.trace.clone(),
+            checkpoint: Checkpoint::Path(fixture.container.clone()),
+            budgets: Budgets {
+                max_lanes: SEATS,
+                max_tokens: CONTEXT,
+                buckets: vec![CONTEXT],
+                max_adapters: 0,
+                page_size: PAGE,
+                max_context: CONTEXT,
+                context_declared: false,
+                slots: 0,
+                max_patches: None,
+                max_images: None,
+                max_voxels: None,
+                max_clips: None,
+            },
+            residency,
+            ordinal: 0,
+            frames_in_flight: 1,
+        })
+        .unwrap_or_else(|why| panic!("the served load lays the seats its pool holds: {why}"));
+    let shell = engine.loaded().expect("the shell stands");
+    assert!(shell.paging().slots < SEATS);
+    seats_lie_in_state(shell);
+}
+
 /// Fires `model` at every rung its load admits (one lane of the rung's
 /// rows, every seat sharing them, then a decode of those seats) and holds
 /// each fire to the pipelines the load built: its walks named every kernel

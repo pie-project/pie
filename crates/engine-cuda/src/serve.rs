@@ -548,8 +548,10 @@ impl Shell {
     /// ([`Self::seat_host_kv`]).
     pub const HOST_POOLS: u64 = 4;
 
-    /// Seats this rank's host tier (CONTRACT-BC 22), pinned as it is first
-    /// used, from `stated` bytes shared by `ranks`, within the host memory
+    /// Seats this rank's host tier (CONTRACT-BC 22), committed as it is
+    /// first used, behind the staging `ring` the load pinned before it
+    /// measured the device ([`crate::store::staging_ring_for`]; `None` seats
+    /// no tier), from `stated` bytes shared by `ranks`, within the host memory
     /// the load left: whole chunks of the state pool's size, every shape's
     /// slots parking in them, and as many host kv slots for byte reads
     /// ([`Self::read_host_kv`], a tap's read-out). Unstated, it holds `seats`
@@ -561,6 +563,7 @@ impl Shell {
         seats: u32,
         context: u32,
         ranks: u32,
+        ring: Option<crate::store::Ring>,
     ) -> Result<u32> {
         let ranks = u64::from(ranks.max(1));
         let row = self.state_row_bytes();
@@ -600,7 +603,7 @@ impl Shell {
         // shelf a load does not move through costs nothing.
         self.pools
             .seat_host(u32::try_from(budget.checked_div(page).unwrap_or(0)).unwrap_or(u32::MAX));
-        self.pools.seat_tier(budget, whole)?;
+        self.pools.seat_tier(budget, ring)?;
         Ok(self.pools.host_pages())
     }
     /// Opens this rank's share of `budget` disk kv bytes under `dir`.

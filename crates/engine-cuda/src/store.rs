@@ -1,6 +1,7 @@
 #![allow(unsafe_code)]
 pub mod chunks;
 mod host;
+pub use host::Ring;
 pub mod kv;
 pub mod layout;
 pub mod rs;
@@ -118,6 +119,97 @@ pub struct Fitted {
     pub bodies: u64,
     pub spare: u64,
     pub chunks: u32,
+}
+
+/// What a load states of the device pool, where it states anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvSize {
+    /// The pool's bytes, all of it (a test's).
+    Bytes(u64),
+    /// The kv tokens the pool holds (`[engine.memory] kv_device_tokens`):
+    /// exactly the pages they fill, beside what the pool's other shapes
+    /// take ([`StatedKv`]).
+    Tokens(u64),
+}
+
+/// A pool sized by the kv tokens it holds: the pages they fill, the chunks
+/// those pages take with the shapes every working set binds beside them
+/// (the null chunk, the guest shapes, the windowed pages, the records:
+/// [`chunks_at`]), and the chunks the weights take held whole. The fit
+/// holds exactly these chunks, so the kv list is exactly these pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatedKv {
+    pub tokens: u64,
+    pub page_tokens: u32,
+    pub pages: u64,
+    pub kv_chunks: u32,
+    pub weight_chunks: u32,
+    pub chunk_bytes: u64,
+}
+
+impl StatedKv {
+    /// The pages `tokens` tokens fill, a page of `page_tokens` at a time.
+    #[must_use]
+    pub fn pages_for(tokens: u64, page_tokens: u32) -> u64 {
+        tokens.div_ceil(u64::from(page_tokens.max(1)))
+    }
+
+    fn of(layout: &layout::Layout, paging: &Paging, tokens: u64) -> StatedKv {
+        let pages = StatedKv::pages_for(tokens, paging.page_size);
+        StatedKv {
+            tokens,
+            page_tokens: paging.page_size,
+            pages,
+            kv_chunks: chunks_at(layout, paging, pages, paging.slots),
+            weight_chunks: u32::try_from(layout.weight_chunks()).unwrap_or(u32::MAX),
+            chunk_bytes: layout.chunk_bytes,
+        }
+    }
+
+    #[must_use]
+    pub fn chunks(&self) -> u32 {
+        self.kv_chunks.saturating_add(self.weight_chunks)
+    }
+
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        u64::from(self.chunks()).saturating_mul(self.chunk_bytes)
+    }
+
+    /// Refuses the load where the `room` the card has for the pool
+    /// cannot hold these chunks.
+    fn admit(&self, room: u64) -> Result<()> {
+        if self.bytes() > room {
+            return Err(self.short(room, None));
+        }
+        Ok(())
+    }
+
+    /// The refusal of a pool that cannot be these chunks: `room` bytes
+    /// were what the card had for it, and `fits` the pages it held where
+    /// the fit got that far.
+    fn short(&self, room: u64, fits: Option<u64>) -> Fault {
+        let mib = |bytes: u64| bytes >> 20;
+        let held = fits.map_or(String::new(), |fits| {
+            format!(", where it backs {fits} pages")
+        });
+        Fault::Residency(format!(
+            "`[engine.memory] kv_device_tokens = {}` asks {} kv pages of {} tokens: {} chunks \
+             of {} MiB for them and the shapes every sequence binds beside them, and {} for \
+             the weights held whole, {} MiB in all; the device has {} MiB for the pool {} once \
+             the weight tier, the fires and the graph bodies are down{held}. State fewer \
+             tokens or a larger `budget_device`.",
+            self.tokens,
+            self.pages,
+            self.page_tokens,
+            self.kv_chunks,
+            mib(self.chunk_bytes),
+            self.weight_chunks,
+            mib(self.bytes()),
+            mib(room),
+            crate::device::card::bound(),
+        ))
+    }
 }
 
 /// What `Pools::fit_the_card` takes of the card's room for one working set:
@@ -317,6 +409,42 @@ pub fn declared_context_that_fits(
     Ok(fits.saturating_mul(page_size))
 }
 
+/// The staging ring's bytes for a host tier of this rank, sized from the
+/// trace before the load measures the device: two sequences at `context`
+/// beside their state rows, the most one step moves, within what the tier
+/// may take (the operator's `host` bytes shared by `ranks`, else half of
+/// what the host has free, as [`crate::Shell::seat_host_kv`] bounds its
+/// default), never under two of a one-page sequence's slots
+/// ([`host::staging_ring`]). `None` where no tier is stated.
+pub fn staging_ring_for(
+    trace: &Trace,
+    page_size: u32,
+    context: u32,
+    max_tokens: u32,
+    host: Option<u64>,
+    ranks: u32,
+) -> Result<Option<u64>> {
+    let ranks = u64::from(ranks.max(1));
+    let free = crate::weights::available_memory() / ranks;
+    let budget = match host {
+        Some(0) => return Ok(None),
+        Some(bytes) => (bytes / ranks).min(free),
+        None => free / 2,
+    };
+    let page_size = page_size.max(1);
+    let window = window_of(trace)?;
+    let one = |tokens: u32| -> Result<u64> {
+        let paging =
+            Paging::of(page_size, tokens.max(page_size), 1, 1)?.windowed(window, max_tokens);
+        one_slot_bytes(trace, paging)
+    };
+    Ok(Some(host::staging_ring(
+        one(context)?,
+        one(page_size)?,
+        budget,
+    )))
+}
+
 pub fn one_slot_bytes(trace: &Trace, paging: Paging) -> Result<u64> {
     let mut bytes: u64 = 0;
     for row in &trace.caches {
@@ -389,13 +517,13 @@ pub fn admit_the_card(
     extra_resident: u64,
     trace: &Trace,
     paging: Paging,
-    kv_budget: Option<u64>,
+    kv_bytes: Option<u64>,
 ) -> Result<Accounting> {
     let accounting = Accounting::of(
         device_memory()?.1,
         allowance,
         weight_tier_bytes(trace, weights, extra_resident)?,
-        match kv_budget {
+        match kv_bytes {
             Some(budget) => budget,
             None => one_slot_bytes(trace, paging)?,
         },
@@ -605,9 +733,13 @@ pub struct Pools {
     /// fit cut it to.
     asked_chunks: u32,
     ceiling: u64,
-    /// A load's stated bytes for the cache rows (a test's), never cut to
-    /// fit; `None` fills what the card hands out.
+    /// A load's stated bytes for the pool (a test's, or what
+    /// `stated_kv`'s chunks take), never cut to fit; `None` fills what the
+    /// card hands out.
     budget: Option<u64>,
+    /// The kv tokens the load states the pool holds, and the chunks that
+    /// takes: the fit holds exactly those, or refuses the load.
+    stated_kv: Option<StatedKv>,
     /// The chunks the fit left the cache rows, of the range's.
     fitted: u32,
     /// A graph body names addresses in the range: it is never reserved
@@ -804,7 +936,7 @@ impl Pools {
         ceiling: u64,
         trace: &Trace,
         paging: Paging,
-        budget: Option<u64>,
+        stated: Option<KvSize>,
         facts: &Facts,
         budgets: &poem_compiler::Budgets,
         activation: u64,
@@ -988,17 +1120,29 @@ impl Pools {
             });
         }
         let asked = chunks_at(&layout, &paging, paging.pages(), paging.slots);
+        let stated_kv = match stated {
+            Some(KvSize::Tokens(tokens)) => Some(StatedKv::of(&layout, &paging, tokens)),
+            _ => None,
+        };
+        let budget = match stated {
+            Some(KvSize::Bytes(bytes)) => Some(bytes),
+            Some(KvSize::Tokens(_)) => stated_kv.map(|kv| kv.bytes()),
+            None => None,
+        };
         // The range is every chunk the pool's ceiling backs: the cache
         // rows' demand is `asked`, and what the guests' instances and
         // rings take of the pool is known to no load. A range mapped on
         // demand only reserves the addresses. A stated budget is the
-        // pool's whole, so its range is what was asked.
-        let total = if budget.is_none() && elastic::mapped_on_demand() {
-            let act =
-                u32::try_from(activation.div_ceil(layout.chunk_bytes.max(1))).unwrap_or(u32::MAX);
-            asked.max(chunks::Chunks::ceiling(&pool, &layout, act))
-        } else {
-            asked
+        // pool's whole, so its range is what was asked: the cache rows'
+        // chunks, and with stated tokens the weights' beside them.
+        let total = match (stated_kv, budget) {
+            (Some(kv), _) => kv.chunks(),
+            (None, None) if elastic::mapped_on_demand() => {
+                let act = u32::try_from(activation.div_ceil(layout.chunk_bytes.max(1)))
+                    .unwrap_or(u32::MAX);
+                asked.max(chunks::Chunks::ceiling(&pool, &layout, act))
+            }
+            (None, _) => asked,
         };
         let chunks = chunks::Chunks::reserve(&pool, layout, total, activation)?;
         Ok(Pools {
@@ -1027,6 +1171,7 @@ impl Pools {
             asked_chunks: asked,
             ceiling: paging.pages(),
             budget,
+            stated_kv,
             fitted: total,
             pinned: false,
             stated: None,
@@ -1048,6 +1193,12 @@ impl Pools {
     #[must_use]
     pub fn paging(&self) -> Paging {
         self.paging
+    }
+
+    /// The kv tokens the load stated the pool holds, and its chunks.
+    #[must_use]
+    pub fn stated_kv(&self) -> Option<StatedKv> {
+        self.stated_kv
     }
 
     #[must_use]
@@ -1292,7 +1443,12 @@ impl Pools {
             bodies,
             programs,
             room,
-            limit: self.budget.unwrap_or(room) / unit * unit,
+            // Stated tokens are exactly their chunks, never a map unit's
+            // round number of them.
+            limit: match (self.stated_kv, self.budget) {
+                (Some(_), Some(budget)) => budget,
+                (_, budget) => budget.unwrap_or(room) / unit * unit,
+            },
         }
     }
 
@@ -1350,7 +1506,8 @@ impl Pools {
         self.chunks
             .clear_past_parting(&mut self.pool, self.contiguous)?;
         let fitted = self.fit(bodies, programs, settled, true, resident)?;
-        self.chunks.state_fitted(self.fitted_chunks(), self.contiguous)?;
+        self.chunks
+            .state_fitted(self.fitted_chunks(), self.contiguous)?;
         Ok(fitted)
     }
 
@@ -1446,7 +1603,9 @@ impl Pools {
             limit,
         } = self.working_set(one_slot, bodies, programs, live);
         let held = programs.saturating_add(bodies);
-        if let Some(budget) = self.budget.filter(|&budget| budget > room) {
+        if let Some(kv) = self.stated_kv {
+            kv.admit(room)?;
+        } else if let Some(budget) = self.budget.filter(|&budget| budget > room) {
             return Err(Fault::Residency(
                 engine::fit::Short::Budget { budget, room }.to_string(),
             ));
@@ -1556,6 +1715,9 @@ impl Pools {
         // A pool stated for more than this fit holds keeps the pages of
         // what it stated: the runtime names them, and a count that moved
         // under live tables would not be the one they were laid by.
+        if let Some(kv) = self.stated_kv.filter(|kv| kv.pages != fits) {
+            return Err(kv.short(room, Some(fits)));
+        }
         if self.stated.is_none() {
             self.paging.pages = fits;
         }
@@ -3257,8 +3419,8 @@ impl Pools {
             }));
             first = first.checked_add((atoms as u32).div_ceil(per_chunk))?;
         }
-        // No more chunks than the fit left the pool (a stated
-        // `device_kv_budget` is all of it): the range is limited to them,
+        // No more chunks than the fit left the pool (stated bytes are all
+        // the cache rows'): the range is limited to them,
         // under whatever was seated past it.
         let most = self.fitted_chunks();
         (first < most).then_some(engine::chunk::WeightResidency {
@@ -3795,9 +3957,10 @@ impl Pools {
 
     /// Seats the host tier of `budget` bytes: as many whole chunks of the
     /// state pool's size, in pageable memory the tier commits as moves
-    /// first write it, behind a page-locked staging ring sized for a device
-    /// pool of `device` bytes ([`host::staging_ring`]).
-    pub fn seat_tier(&mut self, budget: u64, device: u64) -> Result<()> {
+    /// first write it, behind the staging `ring` the load pinned before it
+    /// measured the device ([`staging_ring_for`]); a tier of no chunks lets
+    /// it go.
+    pub fn seat_tier(&mut self, budget: u64, ring: Option<Ring>) -> Result<()> {
         // No more than the machine has free, known now: a tier stated larger
         // would fail mid-serve, at the first move past what the host holds.
         let free = crate::weights::available_memory();
@@ -3815,13 +3978,9 @@ impl Pools {
         };
         let chunk = self.chunks.layout().chunk_bytes;
         let chunks = u32::try_from(budget.checked_div(chunk).unwrap_or(0)).unwrap_or(u32::MAX);
-        self.tier = match chunks {
-            0 => None,
-            chunks => Some(host::HostTier::new(
-                chunk,
-                chunks,
-                host::staging_ring(device, budget),
-            )?),
+        self.tier = match (chunks, ring) {
+            (0, _) | (_, None) => None,
+            (chunks, Some(ring)) => Some(host::HostTier::new(chunk, chunks, ring)?),
         };
         Ok(())
     }
@@ -4962,6 +5121,73 @@ mod tests {
     fn store_every_case() {
         a_seat_past_the_slot_count_is_a_row_only_a_slab_can_refuse();
         a_slot_copy_names_the_guest_shapes();
+        stated_tokens_are_exactly_their_pages_beside_the_other_shapes();
+    }
+
+    // `kv_device_tokens` sized from outside the fit missed the list's
+    // chunk rounding and the chunks the other shapes take: 3128 pages where
+    // 3248 were asked. The fit counts them itself.
+    fn stated_tokens_are_exactly_their_pages_beside_the_other_shapes() {
+        const CHUNK: u64 = 2 << 20;
+        let shape = |id, tokens, per_chunk: u32| layout::SlotShape {
+            id,
+            tokens,
+            slot_bytes: CHUNK / u64::from(per_chunk),
+            per_chunk,
+            grain: CHUNK / u64::from(per_chunk),
+            window: None,
+            rows: Vec::new(),
+            pools: Vec::new(),
+        };
+        let layout = layout::Layout {
+            chunk_bytes: CHUNK,
+            segment_chunks: 1,
+            // Seven pages a chunk: no page count of the test's is whole
+            // chunks.
+            list: Some(shape(layout::LIST, 16, 7)),
+            windows: Vec::new(),
+            fixed: None,
+            rs: None,
+            instance: shape(layout::INSTANCE, 0, 512),
+            channel: shape(layout::CHANNEL, 0, 2048),
+            // Ten blocks of a streamed table, three a chunk: four chunks.
+            rows: vec![layout::RowsShape {
+                id: engine::chunk::ShapeId(layout::WEIGHTS),
+                param: 0,
+                slot_bytes: CHUNK / 3,
+                per_chunk: 3,
+                block_rows: 1,
+                row_bytes: CHUNK / 3,
+                rows: 10,
+                blocks: 10,
+                floor: 1,
+            }],
+            experts: Vec::new(),
+        };
+        let paging = Paging::of(16, 4096, 1, 1).expect("a paging");
+        let kv = StatedKv::of(&layout, &paging, 3248 * 16);
+        // 3248 pages, 464 list chunks (3248 / 7 rounded up) beside the null
+        // chunk and a chunk of each guest shape, and the weights' four.
+        assert_eq!(
+            (kv.pages, kv.kv_chunks, kv.weight_chunks, kv.chunks()),
+            (3248, 1 + 2 + 464, 4, 471)
+        );
+        assert_eq!(kv.bytes(), 471 * CHUNK);
+        // The list's chunks hold the asked pages and no fewer: the fit's
+        // page search over them stops at the asked count.
+        assert!(chunks_at(&layout, &paging, 3248, 0) <= kv.kv_chunks);
+        // A token past a whole page is a page more, and here a chunk more.
+        let past = StatedKv::of(&layout, &paging, 3248 * 16 + 1);
+        assert_eq!((past.pages, past.kv_chunks), (3249, 1 + 2 + 465));
+        // The load is refused by the key's name a byte short of the room,
+        // and admitted at it.
+        assert!(kv.admit(kv.bytes()).is_ok());
+        let refused = kv.admit(kv.bytes() - 1).expect_err("a byte short refuses");
+        assert!(
+            refused.to_string().contains("kv_device_tokens = 51968")
+                && refused.to_string().contains("3248 kv pages"),
+            "{refused}"
+        );
     }
 
     // A process that had bound a guest program could not be suspended: its
