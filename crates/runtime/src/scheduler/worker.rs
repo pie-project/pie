@@ -229,8 +229,12 @@ enum SchedulerItem {
     Launch {
         pending: PendingRequest,
     },
-    RegisterProgram {
+    PrepareProgram {
         program: Box<ProgramRegistration>,
+        response: tokio::sync::oneshot::Sender<Result<::engine::ProgramCompile>>,
+    },
+    FinishProgram {
+        prepared: ::engine::Prepared,
         response: tokio::sync::oneshot::Sender<Result<::engine::ProgramId>>,
     },
     /// Asks the engine what its standing guest bytes would be once a
@@ -466,10 +470,18 @@ pub(super) enum QueuedItem {
         process_id: Option<ProcessId>,
         pipeline_id: Option<ProcessId>,
     },
-    /// Registers a program with the engine, and learns what an instance
-    /// of it holds in the pool and what its fires take.
-    RegisterProgram {
+    /// A program's registration, first step: the engine checks it and
+    /// hands back its compile (`Engine::prepare_program`), which runs off
+    /// the lane while the lane fires on.
+    PrepareProgram {
         program: Box<ProgramRegistration>,
+        response: tokio::sync::oneshot::Sender<Result<::engine::ProgramCompile>>,
+    },
+    /// A program's registration, last step: the engine takes what its
+    /// compile made (`Engine::finish_program`), and the lane learns what an
+    /// instance of it holds in the pool.
+    FinishProgram {
+        prepared: ::engine::Prepared,
         response: tokio::sync::oneshot::Sender<Result<::engine::ProgramId>>,
     },
     /// Asks the engine what its standing guest bytes would be once a
@@ -990,6 +1002,24 @@ impl SchedulerHandle {
             .map_err(|_| anyhow!("scheduler channel closed"))
     }
 
+    /// Registers `program`: the lane checks it and hands back its compile,
+    /// which runs on a blocking thread while the lane fires on, and the
+    /// lane then makes it the program. Its instances bind once this
+    /// answers.
+    async fn register(&self, program: ProgramRegistration) -> Result<::engine::ProgramId> {
+        let compile = self
+            .request(|response| SchedulerItem::PrepareProgram {
+                program: Box::new(program),
+                response,
+            })
+            .await??;
+        let prepared = crate::rt::spawn_blocking(compile)
+            .await
+            .map_err(|e| anyhow!("a program's compile did not finish: {e}"))?;
+        self.request(|response| SchedulerItem::FinishProgram { prepared, response })
+            .await?
+    }
+
     pub(crate) fn stats(&self) -> Arc<SchedulerStats> {
         Arc::clone(&self.inner.stats)
     }
@@ -1061,12 +1091,9 @@ impl SchedulerHandle {
                 let program_id = crate::inferlet::process::said(
                     "bind: register the program",
                     pipeline_id.unwrap_or_default(),
-                    self.request(|response| SchedulerItem::RegisterProgram {
-                        program: Box::new(program),
-                        response,
-                    }),
+                    self.register(program),
                 )
-                .await??;
+                .await?;
                 self.inner
                     .program_ids
                     .lock()
@@ -1737,7 +1764,8 @@ impl BatchScheduler {
                 QueuedItem::PreLaunchCopy {
                     plan, pipeline_id, ..
                 } => format!("PreLaunchCopy({}) pipeline {pipeline_id:?}", plan.label()),
-                QueuedItem::RegisterProgram { .. } => "RegisterProgram".to_string(),
+                QueuedItem::PrepareProgram { .. } => "PrepareProgram".to_string(),
+                QueuedItem::FinishProgram { .. } => "FinishProgram".to_string(),
                 QueuedItem::StandingAfter { binding, .. } => {
                     format!("StandingAfter(program {})", binding.program)
                 }
@@ -1936,8 +1964,11 @@ impl BatchScheduler {
             SchedulerItem::LanePark { lane, seq } => {
                 frame_policy.on_lane_park(lane, seq);
             }
-            SchedulerItem::RegisterProgram { program, response } => {
-                pending.push_back(QueuedItem::RegisterProgram { program, response });
+            SchedulerItem::PrepareProgram { program, response } => {
+                pending.push_back(QueuedItem::PrepareProgram { program, response });
+            }
+            SchedulerItem::FinishProgram { prepared, response } => {
+                pending.push_back(QueuedItem::FinishProgram { prepared, response });
             }
             SchedulerItem::StandingAfter { binding, response } => {
                 pending.push_back(QueuedItem::StandingAfter { binding, response });
@@ -2076,7 +2107,8 @@ impl BatchScheduler {
             QueuedItem::CopyTracked { .. }
                 | QueuedItem::HostKv { .. }
                 | QueuedItem::Pool { .. }
-                | QueuedItem::RegisterProgram { .. }
+                | QueuedItem::PrepareProgram { .. }
+                | QueuedItem::FinishProgram { .. }
                 | QueuedItem::StandingAfter { .. }
         )
     }

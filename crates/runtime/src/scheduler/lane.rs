@@ -181,7 +181,10 @@ fn fail_request(request: LaneRequest, why: &str) {
                 QueuedItem::Pool { response, .. } => {
                     let _ = response.send(Err(anyhow!("{why}")));
                 }
-                QueuedItem::RegisterProgram { response, .. } => {
+                QueuedItem::PrepareProgram { response, .. } => {
+                    let _ = response.send(Err(anyhow!("{why}")));
+                }
+                QueuedItem::FinishProgram { response, .. } => {
                     let _ = response.send(Err(anyhow!("{why}")));
                 }
                 QueuedItem::StandingAfter { response, .. } => {
@@ -559,7 +562,8 @@ impl Lane {
             | QueuedItem::CloseChannels { .. }
             | QueuedItem::HostKv { .. }
             | QueuedItem::Pool { .. }
-            | QueuedItem::RegisterProgram { .. }
+            | QueuedItem::PrepareProgram { .. }
+            | QueuedItem::FinishProgram { .. }
             | QueuedItem::StandingAfter { .. } => LaneCommit::None,
         }
     }
@@ -745,11 +749,18 @@ impl Lane {
                     }
                 }
             }
-            QueuedItem::RegisterProgram { program, response } => {
-                let registered = backend(engine).and_then(|engine| {
+            QueuedItem::PrepareProgram { program, response } => {
+                let prepared = backend(engine).and_then(|engine| {
                     let backend = crate::engine::verbs::codegen_backend(engine);
                     let plan = &crate::pipeline::program::with_host_codegen(&program, backend);
-                    let program_id = engine.register_program(plan)?;
+                    Ok(engine.prepare_program(plan)?)
+                });
+                let _ = response.send(prepared);
+                LaneCommit::None
+            }
+            QueuedItem::FinishProgram { prepared, response } => {
+                let registered = backend(engine).and_then(|engine| {
+                    let program_id = engine.finish_program(prepared)?;
                     // What an instance of it holds in the pool, asked once
                     // at registration.
                     if let Some(roles) = roles_of(engine_idx) {
