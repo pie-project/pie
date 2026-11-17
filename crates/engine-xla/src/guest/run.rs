@@ -94,6 +94,61 @@ pub struct Stages {
 /// A rung's stage as a compile thread leaves it.
 type Built = std::sync::Mutex<Option<Result<Arc<Staged>, String>>>;
 
+/// A stage shape a pass can take: the stage, its batch, its carried
+/// channels.
+pub type Want = (usize, Batch, Vec<u32>);
+
+/// The stages `wanted` names, compiled side by side on any thread (a
+/// registration's, off the engine's): in `wanted`'s order. The first
+/// refusal refuses them all.
+pub fn compile_wanted(
+    device: &Device,
+    package: &LaunchPackage,
+    wanted: &[Want],
+    pool_rows: i64,
+) -> Result<Vec<Arc<Staged>>, String> {
+    // Compiles admitted into the host memory free now (held programs
+    // already take theirs), as the warm ladder's are.
+    let admission = Admission::new(available_memory().unwrap_or(u64::MAX));
+    let started = std::time::Instant::now();
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .clamp(1, wanted.len().clamp(1, 8));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let built: Vec<Built> = wanted.iter().map(|_| std::sync::Mutex::new(None)).collect();
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some((at, batch, c)) = wanted.get(i) else {
+                        break;
+                    };
+                    let staged =
+                        stage(device, package, *at, batch.clone(), c, pool_rows, Some(&admission));
+                    if let Ok(mut slot) = built[i].lock() {
+                        *slot = Some(staged);
+                    }
+                }
+            });
+        }
+    });
+    let staged = (built.into_iter())
+        .map(|built| {
+            built
+                .into_inner()
+                .map_err(|_| "a stage compile panicked".to_string())?
+                .ok_or("a stage was never compiled")?
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    tracing::info!(
+        programs = wanted.len(),
+        seconds = started.elapsed().as_secs_f32(),
+        "guest stages compiled"
+    );
+    Ok(staged)
+}
+
 /// Stage `at` of `package` lowered for `batch` and compiled.
 fn stage(
     device: &Device,
@@ -156,12 +211,9 @@ impl Stages {
         Ok(staged)
     }
 
-    /// Compiles every stage of `package` for every shape a pass can take:
-    /// each lane rung up to the widest fire (`top`), each combination of
-    /// the planes its outputs can be read off (the fires the warm ladder
-    /// traced, `plane_reads`), with the `carried` channels in the pool;
-    /// and one lane with none carried (an instance that steps alone).
-    /// Side by side; the first refusal refuses the program.
+    /// Compiles every stage of `package` for every shape a pass can take
+    /// (`Stages::wanted`), in place: a registration whole, on the calling
+    /// thread. The first refusal refuses the program.
     pub fn compile_all(
         &mut self,
         device: &Device,
@@ -169,6 +221,24 @@ impl Stages {
         key: [u8; 32],
         carried: &[u32],
     ) -> Result<(), String> {
+        let wanted = self.wanted(package, key, carried)?;
+        let staged = compile_wanted(device, package, &wanted, self.pool_rows)?;
+        self.install(key, wanted, staged);
+        Ok(())
+    }
+
+    /// Every shape a pass of `package` can take that no stage compiled yet
+    /// serves: each lane rung up to the widest fire (`top`), each
+    /// combination of the planes its outputs can be read off (the fires the
+    /// warm ladder traced, `plane_reads`), with the `carried` channels in
+    /// the pool; and one lane with none carried (an instance that steps
+    /// alone).
+    pub fn wanted(
+        &self,
+        package: &LaunchPackage,
+        key: [u8; 32],
+        carried: &[u32],
+    ) -> Result<Vec<Want>, String> {
         let top = padded(self.top as usize);
         let rungs: Vec<u32> =
             std::iter::successors(Some(1u32), |&r| (r < top).then(|| r.saturating_mul(2)))
@@ -215,47 +285,22 @@ impl Stages {
             let slot = (key, *at, batch.clone(), c.clone());
             !self.map.contains_key(&slot) && seen.insert(slot)
         });
-        let pool_rows = self.pool_rows;
-        // Compiles admitted into the host memory free now (held programs
-        // already take theirs), as the warm ladder's are.
-        let admission = Admission::new(available_memory().unwrap_or(u64::MAX));
-        let started = std::time::Instant::now();
-        let threads = std::thread::available_parallelism()
-            .map_or(1, |n| n.get())
-            .clamp(1, wanted.len().clamp(1, 8));
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        let built: Vec<Built> = wanted.iter().map(|_| std::sync::Mutex::new(None)).collect();
-        std::thread::scope(|scope| {
-            for _ in 0..threads {
-                scope.spawn(|| {
-                    loop {
-                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let Some((at, batch, c)) = wanted.get(i) else {
-                            break;
-                        };
-                        let staged =
-                            stage(device, package, *at, batch.clone(), c, pool_rows, Some(&admission));
-                        if let Ok(mut slot) = built[i].lock() {
-                            *slot = Some(staged);
-                        }
-                    }
-                });
-            }
-        });
+        Ok(wanted)
+    }
+
+    /// The pool's rows, which a stage that carries cells takes.
+    #[must_use]
+    pub fn pool_rows(&self) -> i64 {
+        self.pool_rows
+    }
+
+    /// Stages `compile_wanted` made for `wanted`, held from now on.
+    pub fn install(&mut self, key: [u8; 32], wanted: Vec<Want>, staged: Vec<Arc<Staged>>) {
         let count = wanted.len();
-        for ((at, batch, c), built) in wanted.into_iter().zip(built) {
-            let staged = built
-                .into_inner()
-                .map_err(|_| "a stage compile panicked".to_string())?
-                .ok_or("a stage was never compiled")??;
+        for ((at, batch, c), staged) in wanted.into_iter().zip(staged) {
             self.map.insert((key, at, batch, c), staged);
         }
-        tracing::info!(
-            programs = count,
-            seconds = started.elapsed().as_secs_f32(),
-            "guest stages compiled at registration"
-        );
-        Ok(())
+        tracing::info!(programs = count, "guest stages compiled at registration");
     }
 
     /// What a pass of the program `key` names takes on the device beyond
