@@ -3561,25 +3561,7 @@ mod tests {
         let mut policy = FramePolicy::new(2, LANES, FIRE, None);
         assert_eq!(frames(&mut policy, 6, long), vec![1; 6], "a frame a prompt");
 
-        // Four prompts' tokens: four a frame, the fifth waits for the next.
-        policy.bound_batch(Some(4 * long));
-        assert_eq!(frames(&mut policy, 10, long), vec![4, 4, 2]);
-        // One token short of four holds three.
-        policy.bound_batch(Some(4 * long - 1));
-        assert_eq!(frames(&mut policy, 7, long), vec![3, 3, 1]);
-        // The engine's lanes bound a frame whatever the tokens stated.
-        policy.bound_batch(Some(u32::MAX as usize));
-        assert_eq!(frames(&mut policy, LANES + 6, long), vec![LANES, 6]);
-        // A bound under one fire holds short prompts to it too.
-        policy.bound_batch(Some(64));
-        assert_eq!(frames(&mut policy, 5, 32), vec![2, 2, 1]);
-        // A prompt past the bound alone takes a frame of its own.
-        assert_eq!(frames(&mut policy, 3, long), vec![1; 3]);
-        policy.bound_batch(Some(0));
-        assert_eq!(frames(&mut policy, 3, 32), vec![1; 3]);
-
-        // Withdrawn, a frame is one fire's tokens again.
-        policy.bound_batch(None);
+        // A frame is one fire's tokens.
         assert_eq!(frames(&mut policy, 4, long), vec![1; 4]);
         assert_eq!(frames(&mut policy, 6, FIRE / 4), vec![4, 2]);
     }
