@@ -24,6 +24,17 @@ fn invalid(message: impl Into<String>, param: Option<&str>) -> ApiError {
     )
 }
 
+/// `logit_bias` is refused by name: no sampler here biases a token, and a
+/// bias silently dropped answers what the caller ruled out. An absent, `null`
+/// or empty one asks for nothing and passes.
+fn no_logit_bias(bias: &Option<Value>) -> Result<(), ApiError> {
+    match bias {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::Object(map)) if map.is_empty() => Ok(()),
+        Some(_) => Err(invalid("logit_bias is not supported", Some("logit_bias"))),
+    }
+}
+
 /// The usage of every choice together: the prompt once, every choice's
 /// completion.
 fn usage_of<'a>(outcomes: impl IntoIterator<Item = &'a compat::Outcome>) -> Value {
