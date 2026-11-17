@@ -44,6 +44,8 @@ pub struct TuneRequest<'a> {
     /// Check the estimate alone: time the check models' fires at each rung
     /// width and hold the estimate's pick to the measured best.
     pub check_estimate: bool,
+    /// With `check_estimate`: rung widths dissected beside the picks.
+    pub dissect: &'a [u32],
     /// Run the `[rates]` step alone: the device's rates measured on it.
     pub rates: bool,
 }
@@ -260,7 +262,13 @@ fn tune_cuda(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, 
         });
     }
     let models = pick_models("cuda", req)?;
-    let out = engine_cuda::tune::run(Some(req.profiles), &models, req.check_estimate, say)?;
+    let out = engine_cuda::tune::run(
+        Some(req.profiles),
+        &models,
+        req.check_estimate,
+        req.dissect,
+        say,
+    )?;
     Ok(tuned!(out, wrong: Vec::new()))
 }
 

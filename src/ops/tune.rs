@@ -49,6 +49,12 @@ pub struct TuneArgs {
     #[arg(long, num_args = 0..)]
     pub check_estimate: Option<Vec<String>>,
 
+    /// With `--check-estimate`: also dissect these rung widths (comma
+    /// separated), each printed replayed and walked eagerly node by node
+    /// beside the estimate's picks (CUDA and ROCm).
+    #[arg(long, value_delimiter = ',', requires = "check_estimate")]
+    pub dissect: Vec<u32>,
+
     /// Run the `[rates]` step alone: measure the device's bf16 matmul rate,
     /// its memory bandwidth and a fire's launch cost on it.
     #[arg(long)]
@@ -101,6 +107,7 @@ pub fn run(args: TuneArgs) -> Result<Answer> {
         cache: &cache,
         refit: args.refit,
         check_estimate: args.check_estimate.is_some(),
+        dissect: &args.dissect,
         rates: args.rates,
     };
     let tuned = tune(&req, &mut say).map_err(|e| anyhow!(e))?;
