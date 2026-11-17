@@ -55,6 +55,9 @@ enum Board {
 
 impl ResidencyPlanner {
     pub fn plan(self: &Arc<Self>) {
+        if crate::policy::retention::take_idle_cache_new() {
+            self.sweep_tiers();
+        }
         let on_grow = self.plan_once();
         // The waiters parked behind a grow the walk was promised, now.
         let parked = if on_grow {
@@ -180,13 +183,14 @@ impl ResidencyPlanner {
                     ) {
                         return true;
                     }
-                    // Idle cache a policy keys above the floor moves down
-                    // a tier before any is dropped; the rest is dropped.
-                    if self.demote_idle(count) {
-                        return false;
-                    }
+                    // The device holds the highest keys: idle cache at or
+                    // below the floor (which never moves down) goes first,
+                    // then what is keyed above it moves down a tier.
                     if self.reclaim_idle_once() {
                         continue;
+                    }
+                    if self.demote_idle(count) {
+                        return false;
                     }
                     if self.sweep_stranded(count, false) {
                         return false;
@@ -228,11 +232,11 @@ impl ResidencyPlanner {
                     // state too: what is keyed above the floor moves down a
                     // tier before any is dropped.
                     let as_pages = self.port.rs_as_pages(need);
-                    if as_pages > 0 && self.demote_idle(as_pages) {
-                        return false;
-                    }
                     if self.reclaim_idle_once() || self.reclaim_head_sharing() {
                         continue;
+                    }
+                    if as_pages > 0 && self.demote_idle(as_pages) {
+                        return false;
                     }
                     // And the tails of sets at rest past what their keys
                     // keep, lowest key first, before any set moves whole

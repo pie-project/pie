@@ -197,8 +197,9 @@ pub(crate) fn sweep() {
     if !tiered {
         return;
     }
+    idle_cache_appeared();
     for planner in crate::planner::planners() {
-        planner.sweep_tiers();
+        planner.sweep_wanted();
     }
 }
 

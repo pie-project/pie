@@ -166,6 +166,12 @@ impl PoolPort for RacePool {
     ) -> Option<crate::store::kv::KvResidencyTxn> {
         None
     }
+    fn prepare_demote_now(&self) -> Option<crate::store::kv::KvResidencyTxn> {
+        None
+    }
+    fn drop_disallowed(&self) -> usize {
+        0
+    }
     fn prepare_demote(&self, _room: usize) -> Option<crate::store::kv::KvResidencyTxn> {
         None
     }
@@ -1499,6 +1505,12 @@ impl PoolPort for RingPool {
         _wanted: usize,
     ) -> Option<crate::store::kv::KvResidencyTxn> {
         None
+    }
+    fn prepare_demote_now(&self) -> Option<crate::store::kv::KvResidencyTxn> {
+        None
+    }
+    fn drop_disallowed(&self) -> usize {
+        0
     }
     fn prepare_demote(&self, _room: usize) -> Option<crate::store::kv::KvResidencyTxn> {
         None

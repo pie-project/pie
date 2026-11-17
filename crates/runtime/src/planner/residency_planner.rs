@@ -325,10 +325,12 @@ impl ResidencyPlanner {
         });
     }
 
+    /// The retention table changed: a sweep is wanted at the next plan.
+    pub fn sweep_wanted(self: &Arc<Self>) {
+        self.poke();
+    }
+
     pub(super) fn poke(self: &Arc<Self>) {
-        if crate::policy::retention::take_idle_cache_new() {
-            self.sweep_tiers();
-        }
         match self.drain.get() {
             Some(notify) => notify.notify_one(),
             None => self.plan(),
@@ -408,7 +410,13 @@ impl ResidencyPlanner {
     /// The retention table changed: idle cache its tiers rows allow
     /// nowhere it is goes now, and what they keep off the device moves
     /// down now, with no waiter's want.
-    pub fn sweep_tiers(self: &Arc<Self>) {
+    pub(super) fn sweep_tiers(self: &Arc<Self>) {
+        // A move runs on the runtime: called off it, the sweep waits for
+        // the next plan that runs there.
+        if !crate::rt::has_runtime() {
+            crate::policy::retention::idle_cache_appeared();
+            return;
+        }
         tracing::debug!(target: "pie::retention", busy = self.demoting.load(Ordering::Acquire), "tiers sweep");
         if self.port.drop_disallowed() > 0 {
             self.re_arm_idle_reclaim();
@@ -428,6 +436,7 @@ impl ResidencyPlanner {
     /// A move a tiers row asked for landed: the next group goes, until none
     /// is left.
     fn tiers_done(self: &Arc<Self>, moved: bool) {
+        tracing::debug!(target: "pie::retention", moved, "tiers sweep: demote landed");
         self.demote_done(moved);
         if moved {
             self.sweep_tiers();
