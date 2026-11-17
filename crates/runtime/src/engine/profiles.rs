@@ -266,6 +266,30 @@ tune_grid!(tune_vulkan, engine_vulkan, "vulkan");
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 tune_grid!(tune_metal, engine_metal, "metal");
 
+/// `pie tune metal --rates`: the device's `[rates]` by Metal's rates step.
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
+fn rates_metal(
+    req: &TuneRequest<'_>,
+    say: &mut dyn FnMut(&str),
+) -> Result<engine::rates::Rated, String> {
+    engine_metal::tune::rates(Some(req.profiles), say)
+}
+
+/// `pie tune metal --check-estimate`: Metal's loads of a model for the
+/// check of the estimate.
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
+fn bench_metal<'a>(
+    req: &'a TuneRequest<'a>,
+    artifact: &'a Path,
+    deployment: &'a str,
+) -> Result<Box<dyn engine::load::check::Bench + 'a>, String> {
+    Ok(Box::new(engine_metal::tune::check_bench(
+        Some(req.profiles),
+        artifact,
+        deployment,
+    )?))
+}
+
 #[cfg(feature = "engine-cuda")]
 fn tune_cuda(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String> {
     let models = pick_models("cuda", req)?;
@@ -355,7 +379,13 @@ pub fn backends() -> Vec<Backend> {
         tune: Some(tune_metal),
         #[cfg(not(target_vendor = "apple"))]
         tune: None,
+        #[cfg(target_vendor = "apple")]
+        rates: Some(rates_metal),
+        #[cfg(not(target_vendor = "apple"))]
         rates: None,
+        #[cfg(target_vendor = "apple")]
+        bench: Some(bench_metal),
+        #[cfg(not(target_vendor = "apple"))]
         bench: None,
     });
     out
