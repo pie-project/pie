@@ -488,15 +488,12 @@ impl Roles {
         item.rings = taken.rings;
         item.channels = taken.channels;
         if let Some((key, part, _)) = taken.adapter {
-            let shared = self
-                .items
-                .entry(Owner::Adapter(key))
-                .or_insert_with(|| {
-                    let mut adapter = Item::new(holder, vec![part]);
-                    // Held by its instances alone: freed at the last close.
-                    adapter.open = false;
-                    adapter
-                });
+            let shared = self.items.entry(Owner::Adapter(key)).or_insert_with(|| {
+                let mut adapter = Item::new(holder, vec![part]);
+                // Held by its instances alone: freed at the last close.
+                adapter.open = false;
+                adapter
+            });
             shared.attached.insert(id);
             item.adapter = Some(key);
         }
@@ -603,13 +600,14 @@ impl Roles {
                     })
             }
             Owner::Adapter(_) => {
-                item.attached.iter().any(|id| {
-                    instance(id).is_some_and(|instance| instance.holder == Some(holder))
-                }) && item.attached.iter().all(|id| {
-                    instance(id).is_some_and(|instance| {
-                        instance.holder == Some(holder) || instance.tier != Tier::Device
+                item.attached
+                    .iter()
+                    .any(|id| instance(id).is_some_and(|instance| instance.holder == Some(holder)))
+                    && item.attached.iter().all(|id| {
+                        instance(id).is_some_and(|instance| {
+                            instance.holder == Some(holder) || instance.tier != Tier::Device
+                        })
                     })
-                })
             }
         }
     }

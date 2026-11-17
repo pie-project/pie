@@ -891,7 +891,10 @@ fn a_shared_adapter_is_one_set_of_slots_freed_at_the_last_close() {
     let first = bind(&roles, &mut engine, Vec::new(), 1);
     let second = bind(&roles, &mut engine, Vec::new(), 2);
     let (a, b) = (engine.bindings[0].clone(), engine.bindings[1].clone());
-    assert_eq!(a.adapter_slots, b.adapter_slots, "one adapter, one set of slots");
+    assert_eq!(
+        a.adapter_slots, b.adapter_slots,
+        "one adapter, one set of slots"
+    );
     assert_eq!(
         held(&device) - before,
         2 * INSTANCE_BYTES + ADAPTER_BYTES,
