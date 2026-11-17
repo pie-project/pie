@@ -82,7 +82,7 @@ pub fn layernorm_rope(
     ctx.fire(
         OP,
         // A warp a row where the profile says (`kernel.elemwise.rows_vec`).
-        if ctx.tuning().rows_vec {
+        if ctx.tuning().rows_vec() {
             Fire::at(kernel(
                 INDEX,
                 "::pie::attn::index::index_knorm_rope_warp<::pie::bf16>",
@@ -128,7 +128,7 @@ pub fn rope(
         OP,
         // A thread a (head, pair) where the profile says
         // (`kernel.elemwise.rows_vec`).
-        if ctx.tuning().rows_vec {
+        if ctx.tuning().rows_vec() {
             Fire::at(kernel(
                 INDEX,
                 "::pie::attn::index::index_q_rope_pairs<::pie::bf16>",
@@ -539,7 +539,7 @@ fn ranked(
             return Ok(false);
         }
         #[cfg(feature = "cuda")]
-        if ctx.tuning().index_fp4_tc5 && heads <= 64 {
+        if ctx.tuning().index_fp4_tc5() && heads <= 64 {
             let compact =
                 crate::attn::compressed::pool::compact(keys, ratio.max(1), i64::from(FP4_ROW));
             let s = scored(
@@ -564,10 +564,10 @@ fn ranked(
         }
         let q = fp4_queries(ctx, OP, q)?;
         #[cfg(feature = "cuda")]
-        let tc5 = ctx.tuning().index_tc5 && selection.rows >= TC5_FROM;
+        let tc5 = ctx.tuning().index_tc5() && selection.rows >= TC5_FROM;
         #[cfg(not(feature = "cuda"))]
         let tc5 = false;
-        if !(ctx.tuning().index_mma && heads <= 64) || tc5 {
+        if !(ctx.tuning().index_mma() && heads <= 64) || tc5 {
             let staged = stage_fp4(ctx, OP, keys)?;
             return ranked(
                 ctx,
@@ -609,7 +609,7 @@ fn ranked(
     )?;
 
     #[cfg(feature = "cuda")]
-    if ctx.tuning().index_tc5
+    if ctx.tuning().index_tc5()
         && !fp4
         && head_dim == 128
         && heads <= 64
@@ -638,10 +638,10 @@ fn ranked(
     // (one to four tiles of 16 heads: DeepSeek-V4's indexer is 64 wide).
     // The ranking's selection by radix (`kernel.sdpa.index_radix`) rather
     // than forty bisection passes.
-    let radix = ctx.tuning().index_radix;
+    let radix = ctx.tuning().index_radix();
     let (entry, smem) = match heads {
         // Its slots keep a key's row in a page in 16 bits.
-        h if ctx.tuning().index_mma && head_dim == 128 && h <= 64 && keys.page_size < 1 << 16 => {
+        h if ctx.tuning().index_mma() && head_dim == 128 && h <= 64 && keys.page_size < 1 << 16 => {
             let tiles: u32 = match h.unsigned_abs().div_ceil(16) {
                 1 => 1,
                 2 => 2,

@@ -27,7 +27,7 @@ pub fn fp8_block_gemv(
     const ROWS: u32 = 4;
     let (m, n, k) = (act.rows, y.width, act.width);
     if m == 0
-        || m > ctx.tuning().gemm_fp8_gemv_until
+        || m > ctx.tuning().gemm_fp8_gemv_until()
         || act.dtype != Dtype::Bf16
         || y.dtype != Dtype::Bf16
         || y.rows != m
@@ -66,7 +66,7 @@ pub fn fp8_block_gemv(
                 [n.div_ceil(ROWS * (WARPS / splits)), 1, 1],
                 [WARPS * 32, 1, 1],
             )
-            .programmatic(ctx.tuning().pdl),
+            .programmatic(ctx.tuning().pdl()),
         ),
         &[
             act.arg(),

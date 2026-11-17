@@ -211,7 +211,11 @@ pub fn fit(measured: &Measured) -> Result<(Entries, Vec<Line>), String> {
     }
     Ok((
         vec![(spec.id.to_string(), ladder)],
-        vec![Line { id: spec.id, text }],
+        vec![Line {
+            id: spec.id,
+            text,
+            measured: true,
+        }],
     ))
 }
 

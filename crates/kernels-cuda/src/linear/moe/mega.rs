@@ -199,7 +199,7 @@ pub fn mega_takes(ctx: &Ctx, routes: Tensor) -> bool {
     let count = routes.rows * routes.width;
     gemm_sm100::supported()
         && count > 0
-        && count <= ctx.tuning().moe_mega_until.min(MAX_WIDE_ROUTES)
+        && count <= ctx.tuning().moe_mega_until().min(MAX_WIDE_ROUTES)
 }
 
 /// A bank's codes as its map takes them under `table`: its base and rows
@@ -316,7 +316,7 @@ pub fn mega(
     };
     // A W4A8 fire's weights first; a bf16 one from `kernel.moe.mega_bf16_from`
     // routes, a narrower one streaming its banks faster apart.
-    if (w4 && !first) || (!w4 && count < ctx.tuning().moe_mega_bf16_from) {
+    if (w4 && !first) || (!w4 && count < ctx.tuning().moe_mega_bf16_from()) {
         return Ok(false);
     }
     let Some(sms) = ctx.multiprocessors() else {
@@ -419,7 +419,7 @@ pub fn mega(
     let launch = Launch::grid([sms, 1, 1], [THREADS, 1, 1])
         .smem(smem)
         .cooperative()
-        .programmatic(ctx.tuning().pdl);
+        .programmatic(ctx.tuning().pdl());
     ctx.fire(
         OP,
         Fire::at(kernel(

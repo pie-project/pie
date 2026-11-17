@@ -8,13 +8,12 @@
 //! that must not move a logit (a memory layout, an address) is proven by
 //! the same hashes before and after it.
 //!
-//! A dense product's cuBLAS algorithm is the one the profile's tactic tables
-//! name, or cuBLAS's own pick where they name none; nothing is timed at load,
-//! so every run sums each product in the same order. The probe reads the
-//! user's table under the cache shared across runs (`PIE_GOLDEN_CACHE/profiles`,
-//! the cache by default `pie-golden-cache` under the system's temp dir) over
-//! the device profile's checked-in one. Each model is served twice in its
-//! process, and the second serving is the one hashed.
+//! A dense product's kernel is chosen by its shape alone (a streaming
+//! skeleton for few rows, else cuBLASLt's first heuristic); nothing is timed
+//! at load, so every run sums each product in the same order. The cache is
+//! shared across runs (`PIE_GOLDEN_CACHE`, by default `pie-golden-cache`
+//! under the system's temp dir). Each model is served twice in its process,
+//! and the second serving is the one hashed.
 //!
 //! Run by hand (both are ignored in the suite): first `golden_fixtures`,
 //! which seeds each model's checkpoint into the cache's `fixtures` without a
@@ -107,8 +106,19 @@ fn fnv(name: &str) -> u64 {
     fnv_bytes(FNV, name.as_bytes())
 }
 
-/// The hash of a step's logits, bit for bit.
+/// The hash of a step's logits, bit for bit. `PIE_GOLDEN_LOGITS=<dir>`
+/// also writes each row hashed, in order, as `<n>.f32` (little-endian): two
+/// runs' rows at a step whose top parts, to weigh the parting against the
+/// row's drift.
 fn hash_logits(logits: &[f32]) -> u64 {
+    if let Some(dir) = std::env::var_os("PIE_GOLDEN_LOGITS") {
+        static AT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let at = AT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let bytes: Vec<u8> = logits.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let dir = std::path::PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).expect("the logits directory");
+        std::fs::write(dir.join(format!("{at}.f32")), bytes).expect("a logits row is written");
+    }
     logits
         .iter()
         .fold(FNV, |hash, v| fnv_bytes(hash, &v.to_bits().to_le_bytes()))
@@ -2728,84 +2738,6 @@ fn golden_eager_resume() {
     }
 }
 
-/// A load and its serving time no dense GEMM tactic: two loads of one model
-/// with fresh, empty user tables pick the same tactics (the checked-in
-/// table's, or cuBLAS's own) and serve bit-identical logits, and the
-/// process timed nothing. Under `time_tactics` (as `pie tune` runs) the same
-/// load times what the tables lack, which is the control: a model the
-/// checked-in table does not cover, so there is something to time.
-#[cfg(feature = "cuda")]
-#[test]
-#[ignore = "a probe run by hand: see the module's doc"]
-fn golden_two_fresh_loads_time_nothing() {
-    if !engine_cuda::device::present() {
-        eprintln!("skipping: no CUDA device on this machine");
-        return;
-    }
-    let cache = cache_dir();
-    // A model whose products the checked-in table does not hold, so the
-    // control has something to time: `PIE_GOLDEN_FRESH`.
-    let model =
-        std::env::var("PIE_GOLDEN_FRESH").unwrap_or_else(|_| "qwen38-flash-next-mini".to_string());
-    let fixture = fixture(&model, &cache);
-    let dir_of =
-        |n: u32| std::env::temp_dir().join(format!("pie-fresh-tactics-{}-{n}", std::process::id()));
-    // The probe's homes go when it ends, passing or not.
-    struct Homes<F: Fn(u32) -> std::path::PathBuf>(F);
-    impl<F: Fn(u32) -> std::path::PathBuf> Drop for Homes<F> {
-        fn drop(&mut self) {
-            for n in 0..3 {
-                let _ = std::fs::remove_dir_all((self.0)(n));
-            }
-        }
-    }
-    let _homes = Homes(dir_of);
-    let fresh = |n: u32| {
-        let dir = dir_of(n);
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut knobs = knobs();
-        knobs.profiles = Some(dir);
-        knobs
-    };
-    let serve = |knobs: engine_cuda::Knobs| {
-        let mut shell = load_with(&fixture, &cache, knobs);
-        shell.open(0).expect("slot 0 opens");
-        let prompt: Vec<u32> = (0..64u32).map(|t| (t * 7 + 11) % 1000).collect();
-        let word = fixture.trace.facts.word(&Request::new(64, false));
-        let mut rows = shell
-            .fire_media(
-                &[Seated::of(Lane {
-                    slot: 0,
-                    word,
-                    tokens: &prompt,
-                })],
-                &[],
-                &[],
-            )
-            .expect("the prompt fires");
-        rows.swap_remove(0)
-    };
-    let before = kernels_cuda::linear::gemm::timed();
-    let first = serve(fresh(0));
-    let second = serve(fresh(1));
-    let timed = kernels_cuda::linear::gemm::timed() - before;
-    println!(
-        "golden {model}-fresh-loads: timed {timed} product(s); logits equal: {}",
-        first == second
-    );
-    assert_eq!(timed, 0, "a load timed {timed} dense GEMM product(s)");
-    assert!(first == second, "two fresh loads served different logits");
-    kernels_cuda::linear::gemm::time_tactics(true);
-    let _ = serve(fresh(2));
-    kernels_cuda::linear::gemm::time_tactics(false);
-    let control = kernels_cuda::linear::gemm::timed() - before;
-    println!("golden {model}-fresh-loads: under time_tactics a load timed {control}");
-    assert!(
-        control > 0,
-        "a load under time_tactics timed nothing, so this probe's model shows nothing"
-    );
-}
-
 /// One lane's state after a fire of `tokens` that buffers them all past a
 /// fresh state, then a fire of `next` that replays the first `keep` of them
 /// and folds those (`RsVerb::Buffer` with `fold`), against slots that fold
@@ -3219,5 +3151,71 @@ fn golden_staged_experts() {
             said.contains(&format!("{} bytes of staged experts", staging.bytes())),
             "{model}: and the bytes: {said}"
         );
+    }
+}
+
+/// The decisions `model` reads served over [`SCRIPT`] under the profile the
+/// probe's loads resolve: those a dispatch consulted for its shapes and kinds.
+fn read_set(model: &str, cache: &Path) -> Vec<&'static str> {
+    let (name, facts) = engine_cuda::chip::probe(0).expect("a CUDA device answers");
+    let (profile, _) = engine_cuda::chip::resolve(&name, &facts, knobs().profiles.as_deref());
+    let fixture = fixture(model, cache);
+    let mut knobs = knobs();
+    knobs.chip = Some(profile.clone());
+    let mut shell = load_with(&fixture, cache, knobs);
+    shell.open(0).expect("slot 0 opens");
+    let mut fed = 0u32;
+    let mut last = 0;
+    for step in SCRIPT {
+        let tokens: Vec<u32> = match *step {
+            Step::Prefill(rows) => (fed..fed + rows).map(|t| (t * 7 + 11) % 1000).collect(),
+            Step::Decode => vec![last],
+        };
+        fed += u32::try_from(tokens.len()).expect("a count");
+        last = argmax(&fire(&mut shell, &fixture.trace, &tokens));
+    }
+    drop(shell);
+    profile.read()
+}
+
+/// A kernel decision only a routed, recurrent, MLA, indexed or NVFP4 model
+/// can reach.
+fn family_only(id: &str) -> bool {
+    [
+        "kernel.moe.",
+        "kernel.ssm.",
+        "kernel.mla.",
+        "kernel.sdpa.mla",
+        "kernel.sdpa.index",
+        "kernel.sdpa.compressed",
+    ]
+    .iter()
+    .any(|p| id.starts_with(p))
+        || id.contains("nvfp4")
+}
+
+/// A dense bf16 model reads no routed, recurrent, MLA, indexed or NVFP4
+/// decision, so `pie tune` times none of them on it; a routed model (the
+/// control) reads its routed ones. `PIE_GOLDEN_MODELS` names more models
+/// whose read sets are printed. Fixtures as [`golden_fixtures`].
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn a_dense_model_reads_no_routed_or_recurrent_decision() {
+    let cache = cache_dir();
+    let dense = read_set("qwen3-0.6b", &cache);
+    println!("reads qwen3-0.6b {dense:?}");
+    let stray: Vec<&str> = dense.iter().copied().filter(|id| family_only(id)).collect();
+    assert!(stray.is_empty(), "qwen3-0.6b reads {stray:?}");
+    assert!(dense.contains(&"kernel.gemm.skinny_rows"), "{dense:?}");
+    let routed = read_set("gptoss-20b-mini-u4g64-mxfp4-kv-bf16", &cache);
+    println!("reads gptoss-20b-mini-u4g64-mxfp4-kv-bf16 {routed:?}");
+    assert!(
+        routed.iter().any(|id| id.starts_with("kernel.moe.")),
+        "the routed control reads no routed decision: {routed:?}"
+    );
+    if std::env::var_os("PIE_GOLDEN_MODELS").is_some() {
+        for model in models() {
+            println!("reads {model} {:?}", read_set(&model, &cache));
+        }
     }
 }
