@@ -317,7 +317,7 @@ pub fn backends() -> Vec<Backend> {
         probe: || engine_cuda::chip::probe(0),
         resolve: engine_cuda::chip::resolve,
         tune: Some(tune_cuda),
-        rates: None,
+        rates: Some(|req, say| engine_cuda::tune::rates(Some(req.profiles), say)),
         bench: Some(bench_cuda),
     });
     #[cfg(feature = "vulkan")]

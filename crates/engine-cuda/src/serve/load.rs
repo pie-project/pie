@@ -45,21 +45,43 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // What the card may hold while this load runs, resolved here before the
     // load takes anything: every later reading of its room is under it.
     let ceiling = crate::store::load_ceiling(boot.allowance, true)?;
+    let (major, minor) = device.capability();
+    let measured = crate::chip::facts(
+        u32::try_from(major).unwrap_or(0),
+        u32::try_from(minor).unwrap_or(0),
+        device.device().num_sm,
+    );
+    let (resolved, report) =
+        crate::chip::resolve(device.name(), &measured, boot.knobs.profiles.as_deref());
     let chip = match boot.knobs.chip.clone() {
-        Some(chip) => chip,
+        // A pinned profile pins decisions, not the device: the rates it
+        // leaves unstated are this device's, as its own profile states them.
+        Some(chip) => {
+            let mut tuned = resolved.tuned().clone();
+            tuned.lay(chip.tuned());
+            chip.with_tuned(tuned)
+        }
         None => {
-            let (major, minor) = device.capability();
-            let measured = crate::chip::facts(
-                u32::try_from(major).unwrap_or(0),
-                u32::try_from(minor).unwrap_or(0),
-                device.device().num_sm,
-            );
-            let (chip, report) =
-                crate::chip::resolve(device.name(), &measured, boot.knobs.profiles.as_deref());
             crate::chip::SHELF.tell_untuned(device.name(), &report);
-            chip
+            resolved
         }
     };
+    // A device whose profile lacks the roofline's constants measures them
+    // here, before ready, and keeps them in the user's profile.
+    let room = {
+        let (free, total) = crate::store::device_memory()?;
+        crate::device::elastic::room_under(ceiling, free, total)
+    };
+    let chip = crate::rates::ensure(
+        chip,
+        boot.ordinal,
+        device.name(),
+        &measured,
+        boot.knobs.profiles.as_deref(),
+        boot.cache_dir,
+        room,
+    )
+    .map_err(Fault::Card)?;
     device.set_tuning(kernels_cuda::tuning::Tuning::of(&chip));
     #[cfg(feature = "cuda")]
     {

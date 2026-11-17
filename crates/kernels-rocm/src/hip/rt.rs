@@ -554,6 +554,14 @@ pub unsafe fn hipEventSynchronize(event: Event) -> HipError {
     }
 }
 
+pub unsafe fn hipEventElapsedTime(ms: *mut f32, start: Event, stop: Event) -> HipError {
+    match sys::api() {
+        // SAFETY: forwarded unchanged; the caller holds HIP's contract.
+        Ok(api) => unsafe { (api.hip.hipEventElapsedTime)(ms, start, stop) },
+        Err(_) => hipErrorNotInitialized,
+    }
+}
+
 pub unsafe fn hipEventQuery(event: Event) -> HipError {
     match sys::api() {
         // SAFETY: forwarded unchanged; the caller holds HIP's contract.

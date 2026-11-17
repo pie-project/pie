@@ -21,6 +21,74 @@ pub struct Outcome {
     pub seconds: f64,
 }
 
+/// `pie tune cuda --rates`: GPU 0's roofline constants measured at
+/// `engine::rates`' shapes ([`crate::rates::measure`]), laid over the
+/// profile it runs.
+pub fn rates(
+    profiles: Option<&Path>,
+    say: &mut dyn FnMut(&str),
+) -> Result<engine::rates::Rated, String> {
+    let began = Instant::now();
+    let (name, facts) = crate::chip::probe(0).ok_or("no CUDA device answers")?;
+    let (base, report) = crate::chip::resolve(&name, &facts, profiles);
+    say(&format!("{name}: starting from {}", report.used));
+    let cache = profiles
+        .and_then(Path::parent)
+        .map(|home| home.join("cache"));
+    let measured = crate::rates::measure(0, &base, cache.as_deref())?;
+    let r = measured.rates;
+    let curve = |c: &Option<Vec<(u32, f64)>>| {
+        c.iter()
+            .flatten()
+            .map(|(x, t)| format!("{x} {t:.1}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    say(&format!(
+        "[rates]: matmul TFLOP/s by rows {}; attention by keys {} (at {} keys: {}); per-row ops \
+         {:.0} GB/s, scan {:.0} G elements/s, {:.0} GB/s, launch {} ns",
+        r.gemm_tflops_by_rows
+            .iter()
+            .flatten()
+            .map(|(w, c)| format!("w {w}: {}", curve(&Some(c.clone()))))
+            .collect::<Vec<_>>()
+            .join("; "),
+        curve(&r.attn_tflops_by_keys),
+        engine::rates::ATTN_KEYS[engine::rates::ATTN_KEYS.len() - 1],
+        measured
+            .attn_by_dim
+            .iter()
+            .map(|(d, t)| format!("d {d} {t:.1}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        r.elementwise_gbps.unwrap_or(0.0),
+        r.scan_gelems.unwrap_or(0.0),
+        r.hbm_gbps.unwrap_or(0.0),
+        r.launch_ns.unwrap_or(0),
+    ));
+    let tuned = engine::rates::tuned(&r);
+    let provenance = crate::rates::provenance(&name);
+    let file = search::assemble(
+        crate::chip::registry(),
+        &base,
+        &name,
+        &facts,
+        &tuned,
+        std::slice::from_ref(&provenance),
+        &[crate::chip::ARCH],
+    )?;
+    let block = format!(
+        "{tuned}\n[provenance]\n{} = {}\n",
+        provenance.0, provenance.1
+    );
+    Ok(engine::rates::Rated {
+        device: name,
+        file,
+        block,
+        seconds: began.elapsed().as_secs_f64(),
+    })
+}
+
 /// How a load is shaped: its slots and compiled budget, its patch ladder,
 /// its pages and context.
 pub(crate) struct Shape {
