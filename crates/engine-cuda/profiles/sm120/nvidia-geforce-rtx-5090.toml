@@ -82,13 +82,6 @@ window_spare = false
 # gemma-4-26b-a4b mini c128 5.58k -> 5.70k tok/s
 recording = { use = "bodies", mem_mb = 1024 }
 
-[rates]
-# 209.5 TFLOPS dense bf16 with FP32 accumulation (NVIDIA RTX Blackwell GPU
-# architecture whitepaper; 419 with sparsity).
-bf16_flops_per_ns_by_rows_n_k = [[4096, 4096, 4096, 209500.0]]
-# 1792 GB/s of GDDR7 (RTX 5090 specifications, nvidia.com).
-bytes_per_ns = 1792.0
-
 [provenance]
 source = "pie tune (quick, gptoss-20b) on RunPod; 512-token prompt 27.7 -> 27.1 ms, 1-lane step 2.87 -> 2.80 ms, 4-lane step 4.45 -> 4.23 ms, 8-lane step 6.93 -> 6.79 ms, readout cosine 1.0000"
 measured = [

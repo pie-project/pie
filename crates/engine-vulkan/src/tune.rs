@@ -402,7 +402,7 @@ fn check_estimate(
                     &shell.device,
                     &shell.tuning,
                     shape,
-                    weighed.estimate.launch_ns,
+                    weighed.estimate.rates.launch_ns,
                 );
                 crate::encode::capture_shapes(false);
                 let micro_shapes = crate::encode::take_shapes();
@@ -814,7 +814,7 @@ fn rates(base: &Profile, say: &mut dyn FnMut(&str)) -> Result<profile::fire::Rat
     let device = crate::device::Context::bind(
         &crate::api::DeviceBoot::default(),
         engine::Allowance {
-            budget: Some(engine::rates::step_bytes(crate::FIRE.1)),
+            budget: Some(engine::rates::step_bytes()),
         },
     )
     .map_err(|e| e.to_string())?;
@@ -824,33 +824,20 @@ fn rates(base: &Profile, say: &mut dyn FnMut(&str)) -> Result<profile::fire::Rat
     // step measures through.
     let tier = <crate::device::Api as engine_gpu::serve::Serve>::tier(&device);
     let gemm = engine_gpu::backend::Tactics::gemm(&tuning, tier);
-    for &(m, n, k, rate) in rates
-        .bf16_flops_per_ns_by_rows_n_k
-        .as_deref()
-        .unwrap_or(&[])
-    {
+    for (m, n, k) in engine::rates::GEMM_SHAPES {
         let path =
             kernels_slang::linear::gemm::tile_for(kernels_slang::Target::Spirv, gemm, m, n, k);
         say(&format!(
-            "[rates]: matmul m {m:>5} n {n:>5} k {k:>5}: {:.4} TFLOP/s through {path:?} (tier \
-             {tier:?})",
-            rate / 1e3
+            "[rates]: matmul {m}x{n}x{k} through {path:?} (tier {tier:?})"
         ));
     }
     say(&format!(
-        "[rates]: attention {:.1} TFLOP/s at its widest keys, scan {:.2} G state elements/s, \
+        "[rates]: matmul {:.1} TFLOP/s, attention {:.1} TFLOP/s, scan {:.2} G state elements/s, \
          {:.0} GB/s, launch {:.2} us",
-        rates
-            .attn_flops_per_ns_by_keys_and_dim
-            .as_deref()
-            .and_then(|grid| {
-                let widest = *profile::fire::attn_keys(grid).last()?;
-                profile::fire::attn_flops_at(grid, widest, 128)
-            })
-            .unwrap_or(0.0)
-            / 1e3,
-        rates.scan_at(2048).unwrap_or(0.0),
-        rates.bytes_per_ns.unwrap_or(0.0),
+        rates.gemm_tflops.unwrap_or(0.0),
+        rates.attn_tflops.unwrap_or(0.0),
+        rates.scan_gelems.unwrap_or(0.0),
+        rates.hbm_gbps.unwrap_or(0.0),
         rates.launch_ns.unwrap_or(0) as f64 / 1e3
     ));
     Ok(rates)

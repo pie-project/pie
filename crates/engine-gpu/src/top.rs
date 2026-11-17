@@ -71,14 +71,17 @@ pub fn choose(
     counts: &Counts,
     binding: u64,
 ) -> Result<(TopRung, FireEstimate)> {
-    engine::load::choose(rungs, live, &profile.rates(), device, counts).map_err(|refused| {
-        Fault::Residency(match refused {
-            Refused::NoRung(no) => {
-                format!("{no}; this device binds no more than {} MiB", binding >> 20)
-            }
-            refused @ (Refused::NoRates { .. } | Refused::OffGrid { .. }) => refused.to_string(),
-        })
-    })
+    let machine = crate::rates::machine();
+    engine::load::choose(rungs, live, &profile.rates(), &machine, device, counts).map_err(
+        |refused| {
+            Fault::Residency(match refused {
+                Refused::NoRung(no) => {
+                    format!("{no}; this device binds no more than {} MiB", binding >> 20)
+                }
+                refused @ Refused::NoRates { .. } => refused.to_string(),
+            })
+        },
+    )
 }
 
 #[cfg(test)]
@@ -136,9 +139,8 @@ mod tests {
         );
         // No feasible rung at all: the ruling's refusal, with the binding.
         let none = facts(&[(1024, 300 * MIB)], 200 * MIB);
-        let rated = profile(
-            "api = 1\n[rates]\nbf16_flops_per_ns_by_rows_n_k = [[4096, 4096, 4096, 1.0]]\nattn_flops_per_ns_by_keys_and_dim = [[2048, 128, 1.0]]\nbytes_per_ns = 1.0\n",
-        );
+        let rated =
+            profile("api = 1\n[rates]\ngemm_tflops = 1.0\nattn_tflops = 1.0\nhbm_gbps = 1.0\n");
         let err = choose(&none, 1 << 33, &rated, "Card X", &counts(), 200 * MIB).unwrap_err();
         assert!(
             err.to_string().contains(

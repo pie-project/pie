@@ -25,15 +25,14 @@ pub mod placement;
 pub mod ports;
 pub mod program;
 pub mod rates;
+pub mod roofline;
 pub mod rs;
 pub mod runahead;
 pub mod transfer;
 
 pub use adapter::{AdapterPlane, AdapterRegistration};
 pub use caps::{Capabilities, DeviceFacts, FireLimits, PoolFacts};
-pub use channel::{
-    ChannelId, ChannelRegistration, ChannelSeed, HostMirror, RegisteredChannel,
-};
+pub use channel::{ChannelId, ChannelRegistration, ChannelSeed, HostMirror, RegisteredChannel};
 pub use chunk::{
     ChunkFacts, ChunkRun, ChunkTable, Evacuation, Growth, Pinned, Reserved, ReservedRun,
     ResidentWeight, SegmentFacts, ShapeId, SlotCopy, SlotKind, SlotRole, SlotRun, SlotShape,

@@ -1,73 +1,45 @@
 //! The device's rates measured on the device, through the kernels serving
 //! dispatches (`pie tune cuda --rates`, and on ROCm the same steps over
-//! HIP's): what the top rung's estimate is weighed by.
+//! HIP's): the roofline constants the top rung's estimate is weighed by.
 //!
 //! Each rate is a burst of its kernel launched back to back on the stream,
-//! about [`BURST_NS`] (20 ms) long (`k` launches, `k` sized off one warm launch), as
-//! serving runs a fire's: a lone launch lets the device idle between
-//! timings, and its clock state, not the kernel, sets the number. The burst
-//! is timed by events on the stream, the median of [`ROUNDS`] bursts ([`LAUNCH_ROUNDS`] for the launch) after a
-//! warm one kept, and divided by `k`.
+//! about [`BURST_NS`] (20 ms) long (`k` launches, `k` sized off one warm
+//! launch), as serving runs a fire's: a lone launch lets the device idle
+//! between timings, and its clock state, not the kernel, sets the number.
+//! The burst is timed by events on the stream, the median of [`ROUNDS`]
+//! bursts ([`LAUNCH_ROUNDS`] for the launch) after a warm one kept, and
+//! divided by `k`.
 //!
-//! Every shape is `engine::rates`' lattice, and its counts turn the times
-//! into rates, so the CUDA and ROCm rates mean what every backend's do:
-//! - `bf16_flops_per_ns_by_rows_n_k`: the matmul `m x n x k` at each row
-//!   count of the load's candidate rungs ([`lattice_rows`]) and each column count and depth of [`DEPTHS`]
-//!   through `linear::gemm` (cuBLAS(Lt) on CUDA,
-//!   hipBLASLt/rocBLAS on ROCm) under the GEMM tactics serving runs; its
-//!   launches rotate through `engine::rates::weights_at(n, k)` weight planes, `engine::rates::WEIGHT_BYTES`
-//!   of them, several times what any last-level cache holds, so each reads
-//!   its weight from device memory as a layer's does.
-//! - `attn_flops_per_ns_by_keys_and_dim`: the paged prefill attention at
-//!   [`ATTN_SHAPE`]'s heads over each row of the matmul grid's lattice to
-//!   its saturation point (`engine::rates::attention_at_rows`; a sequence of as many
-//!   rows attending itself) and each head width of `ATTN_DIMS`, causal, in
-//!   pages of [`PAGE`]; its launches rotate through
-//!   `engine::rates::attn_sets_at` sets of q rows and kv pages, so each reads
-//!   them from device memory as a served layer's does.
-//! - `scan_elements_per_ns_by_tokens`: at each of `engine::rates::SCAN_TOKENS`,
-//!   the causal conv and the chunked gated delta
-//!   scan at [`SCAN_SHAPE`].
-//! - `bytes_per_ns`: a [`COPY_BYTES`] device-to-device copy, read plus write.
+//! Every shape is `engine::rates`', and its counts turn the times into
+//! rates, each work as the device runs it (`engine::roofline::Machine`:
+//! its waves over the SMs), so the constants read back through the
+//! roofline give the times measured:
 //! - `launch_ns`: a chain of dependent near-empty kernels captured in one
 //!   graph against one kernel of the chain's whole work, at each length of
 //!   `engine::rates::LAUNCH_CHAINS` (`engine::rates::launch_from`): what a
-//!   dispatch adds to its work inside a recorded body, as serving replays
-//!   them.
+//!   dispatch adds to its work inside a recorded body.
+//! - `gemm_tflops`: the matmul at each of `engine::rates::GEMM_SHAPES`
+//!   through `linear::gemm` (cuBLASLt's first heuristic algorithm on CUDA,
+//!   hipBLASLt's on ROCm), after the warm-up; its launches rotate through
+//!   `engine::rates::weights_at(n, k)` weight planes, past every last-level
+//!   cache. The fastest.
+//! - `attn_tflops`: the paged prefill attention at [`ATTN_SHAPE`]'s heads
+//!   over `engine::rates::ATTN_KEYS` keys, causal, in pages of [`PAGE`], at
+//!   head width 128 (64 and 256 timed and said beside it); its launches
+//!   rotate through `engine::rates::attn_sets_at` sets of q rows and kv
+//!   pages.
+//! - `hbm_gbps`: a [`COPY_BYTES`] device-to-device copy, read plus write.
+//! - `scan_gelems`: the causal conv and the chunked gated delta scan at
+//!   [`SCAN_SHAPE`].
 //!
-//! Every float operand the matmul, attention and scan read (activations,
-//! weight planes, the kv pages, the scan's input, conv weight and states) is
+//! Every float operand the matmul, attention and scan read is
 //! `engine::rates::operand_pattern` repeated, not zeros: some devices run a
 //! compute-bound kernel faster on zeros than on the real data serving runs.
 //! Index and page tables, gates, outputs and workspace stay as laid.
 
 #[cfg_attr(not(feature = "device"), allow(unused_imports))]
-use engine::rates::{ATTN_SHAPE, DEPTHS, SCAN_SHAPE, weights_at};
+use engine::rates::{ATTN_SHAPE, SCAN_SHAPE, weights_at};
 use profile::fire::Rates;
-
-/// The rows the matmul grid walks under `chip`: the chip's rung lattice
-/// ([`crate::api::rung_lattice`] at its `engine.lattice_steps`,
-/// `prefill_lattice_from` and `_steps`) as far as a `u32` of rows reaches,
-/// ascending; the grid ends at the card's saturation point on it
-/// ([`Saturation`]), the top a load's candidates run to.
-#[must_use]
-pub fn lattice_rows(chip: &profile::Profile) -> Vec<u32> {
-    let mut lattice = crate::api::rung_lattice(&crate::chip::Engine::of(chip), u32::MAX);
-    lattice.pop();
-    lattice
-}
-
-/// Where the matmul grid saturates: `rows` the last where an `(n, k)`
-/// shape's cost a row fell more than `profile::AGREEMENT` below the least
-/// before it (`best_gain` the most, at `best_shape`), none doing so from
-/// there through `through`, a doubling or more past it.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Saturation {
-    pub rows: u32,
-    pub through: u32,
-    pub best_gain: f64,
-    pub best_shape: (u32, u32),
-}
 
 /// The kv cache's page, as a served load pages it.
 pub const PAGE: u32 = 16;
@@ -85,15 +57,21 @@ pub const ROUNDS: usize = 5;
 /// burst than a kernel's work (an MI300X VF's 1610 to 1719 ns over 5).
 pub const LAUNCH_ROUNDS: usize = 15;
 
-/// The rates of device `ordinal` under `chip`'s tuning, its matmuls under
-/// the GEMM tactic tables the caller installed
-/// (`kernels_cuda::linear::gemm::install_tactics`, as a served load does),
-/// the kernels' disk cache under `cache` (`$PIE_HOME/cache`).
+/// What a rates step measured: the constants, and the attention's rate at
+/// each head width of `engine::rates::ATTN_DIMS` (TFLOP/s), said beside them.
+pub struct Measured {
+    pub rates: Rates,
+    pub attn_by_dim: Vec<(u32, f64)>,
+    pub gemm_by_shape: Vec<((u32, u32, u32), f64)>,
+}
+
+/// The rates of device `ordinal` under `chip`'s tuning, the kernels' disk
+/// cache under `cache` (`$PIE_HOME/cache`).
 pub fn measure(
     ordinal: i32,
     chip: &profile::Profile,
     cache: Option<&std::path::Path>,
-) -> Result<(Rates, Saturation), String> {
+) -> Result<Measured, String> {
     kernels_cuda::disk::install(cache);
     #[cfg(feature = "device")]
     {
@@ -326,12 +304,10 @@ mod on_device {
         Ok(b)
     }
 
-    pub(super) fn measure(
-        ordinal: i32,
-        chip: &profile::Profile,
-    ) -> Result<(Rates, Saturation), String> {
+    pub(super) fn measure(ordinal: i32, chip: &profile::Profile) -> Result<Measured, String> {
         let mut device = Context::bind(ordinal, None).map_err(say("the device"))?;
         device.set_tuning(kernels_cuda::tuning::Tuning::of(chip));
+        let machine = crate::top::machine(chip, device.device().num_sm);
         let stream = device.stream();
         let clock = Clock::new(stream)?;
         let mut held = Vec::new();
@@ -347,54 +323,35 @@ mod on_device {
             engine::rates::WARM_SHAPE.0,
             warmed.rate / 1e3
         );
-        let (grid, top) = gemm(
-            device.ctx(),
-            &clock,
-            &random,
-            &mut held,
-            &lattice_rows(chip),
-            gap,
-        )?;
-        eprintln!(
-            "[rates]: the grid saturates at {} rows: past it no (n, k) shape's cost a row fell \
-             more than {:.0}% below its least through {} (at it the most {:.1}%, at {} x {})",
-            top.rows,
-            100.0 * profile::AGREEMENT,
-            top.through,
-            100.0 * top.best_gain,
-            top.best_shape.0,
-            top.best_shape.1
-        );
-        // The attention at the grid's rows to its saturation point
-        // (engine::rates::attention_at_rows, every engine's rule): a rung's
-        // prompt attends as many keys as its rows, so its rate is read where
-        // it was timed, not between rows (a kernel's wave quantization moves
-        // it between them).
-        let attn = engine::rates::attention_at_rows(&lattice_rows(chip), top.rows, |at| {
-            attention(
+        let mut gemm_by_shape = Vec::new();
+        for (m, n, k) in engine::rates::GEMM_SHAPES {
+            let mut planes = Planes::lay(&random, (n, k))?;
+            let rate = planes.at(device.ctx(), &clock, &random, &mut held, &machine, m, gap)?;
+            gemm_by_shape.push(((m, n, k), rate));
+        }
+        let gemm = gemm_by_shape
+            .iter()
+            .map(|&(_, rate)| rate)
+            .fold(0.0, f64::max);
+        let mut attn_by_dim = Vec::new();
+        for d in engine::rates::ATTN_DIMS {
+            let rate = attention(
                 &device,
                 &clock,
                 &random,
                 &mut held,
-                at.keys,
-                at.head_dim,
+                &machine,
+                engine::rates::ATTN_KEYS,
+                d,
                 gap,
-            )
-        })?;
-        let mut scan_curve = Vec::with_capacity(engine::rates::SCAN_TOKENS.len());
-        for tokens in engine::rates::SCAN_TOKENS {
-            scan_curve.push((
-                tokens,
-                scan(
-                    device.ctx(),
-                    &clock,
-                    &random,
-                    &mut held,
-                    SCAN_SHAPE.at(tokens),
-                    gap,
-                )?,
-            ));
+            )?;
+            attn_by_dim.push((d, rate));
         }
+        let attn = attn_by_dim
+            .iter()
+            .find(|&&(d, _)| d == 128)
+            .map_or(0.0, |&(_, rate)| rate);
+        let scan = scan(device.ctx(), &clock, &random, &mut held, SCAN_SHAPE, gap)?;
         let bytes = copy(stream, &clock, gap)?;
         device.synchronize().map_err(say("the device"))?;
         eprintln!(
@@ -402,75 +359,19 @@ mod on_device {
             PEAK.load(Ordering::Relaxed) >> 20,
             held.iter().map(|b| b.bytes()).sum::<usize>() >> 20
         );
-        let rates = Rates {
-            bf16_flops_per_ns_by_rows_n_k: Some(grid),
-            attn_flops_per_ns_by_keys_and_dim: Some(attn),
-            scan_elements_per_ns_by_tokens: Some(scan_curve),
-            bytes_per_ns: Some(bytes),
-            launch_ns: Some(launch),
-            ..Rates::default()
-        };
-        Ok((rates, top))
-    }
-
-    /// The matmul grid and its top: every `(n, k)` of [`DEPTHS`] squared,
-    /// at each row of `lattice` ascending up to the card's saturation point
-    /// ([`Saturation`]): the last row where some shape's cost a row (its
-    /// launch and its work over its rows) falls more than
-    /// `profile::AGREEMENT` below the least it took at any row before, with
-    /// none doing so through a doubling of its rows past it (the lattice's
-    /// period: a tile's padding repeats each doubling, so a cost a row
-    /// zigzags within one and a step-to-step gain is not an improvement). A
-    /// top rung is the argmax of efficiency times live capacity, and live
-    /// capacity only falls as rows grow, so no rung past it can be chosen.
-    /// Each shape walks its own rows first (one rotation laid), then every
-    /// shape is filled to the widest row any reached: the walk is
-    /// [`engine::rates::saturate`], the rule every engine's rates step takes.
-    fn gemm(
-        ctx: &Ctx,
-        clock: &Clock,
-        random: &Random,
-        held: &mut Vec<Buffer>,
-        lattice: &[u32],
-        gap: f64,
-    ) -> Result<(Vec<(u32, u32, u32, f64)>, Saturation), String> {
-        // The shapes in engine::rates' spread order, so a drift left after
-        // the warm-up spreads over the grid.
-        let shapes: Vec<(u32, u32)> = DEPTHS
-            .iter()
-            .flat_map(|&k| DEPTHS.iter().map(move |&n| (n, k)))
-            .collect();
-        // The walk is engine::rates::saturate's, one rule for every engine;
-        // a shape's planes are laid at the start of each run of it.
-        let mut planes: Option<Planes> = None;
-        let (rates, top) = engine::rates::saturate(lattice, shapes.len(), |at, row, fresh| {
-            if fresh {
-                planes = None;
-                planes = Some(Planes::lay(random, shapes[at])?);
-            }
-            let m = lattice[row];
-            let rate = planes
-                .as_mut()
-                .expect("laid")
-                .at(ctx, clock, random, held, m, gap)?;
-            let (n, k) = shapes[at];
-            Ok::<_, String>((rate, engine::rates::gemm_cost_per_row(m, n, k, rate, gap)))
-        })?;
-        drop(planes);
-        let mut grid = Vec::with_capacity((top.top + 1) * shapes.len());
-        for (at, &(n, k)) in shapes.iter().enumerate() {
-            for (i, &m) in lattice.iter().enumerate().take(top.top + 1) {
-                grid.push((m, n, k, rates[at][i]));
-            }
-        }
-        grid.sort_by_key(|&(m, n, k, _)| (k, n, m));
-        let saturation = Saturation {
-            rows: top.rows,
-            through: top.through,
-            best_gain: top.best_gain,
-            best_shape: shapes[top.best_shape],
-        };
-        Ok((grid, saturation))
+        // Three significant decimals of the TFLOP/s, a tenth of the rest.
+        let tenth = |v: f64| (v * 10.0).round() / 10.0;
+        Ok(Measured {
+            rates: Rates {
+                launch_ns: Some(launch),
+                gemm_tflops: Some(tenth(gemm / 1e3)),
+                attn_tflops: Some(tenth(attn / 1e3)),
+                hbm_gbps: Some(tenth(bytes)),
+                scan_gelems: Some(tenth(scan)),
+            },
+            attn_by_dim: attn_by_dim.iter().map(|&(d, r)| (d, r / 1e3)).collect(),
+            gemm_by_shape: gemm_by_shape.iter().map(|&(s, r)| (s, r / 1e3)).collect(),
+        })
     }
 
     /// The device warmed (engine::rates::warm_up): bursts of the widest
@@ -506,7 +407,7 @@ mod on_device {
 
     /// One `(n, k)` shape's weight rotation laid (`engine::rates::weights_at`
     /// planes of `WEIGHT_BYTES`), its activations and product laid as wide as
-    /// the widest row asked of it so far.
+    /// the widest row asked of it.
     struct Planes {
         n: u32,
         k: u32,
@@ -532,13 +433,14 @@ mod on_device {
         }
 
         /// The matmul `m x n x k`'s rate, its launches rotating through the
-        /// planes.
+        /// planes: its waves' flops on `machine` over its time.
         fn at(
             &mut self,
             ctx: &Ctx,
             clock: &Clock,
             random: &Random,
             held: &mut Vec<Buffer>,
+            machine: &engine::roofline::Machine,
             m: u32,
             gap: f64,
         ) -> Result<f64, String> {
@@ -571,16 +473,19 @@ mod on_device {
                 ns,
                 engine::rates::GEMM_DISPATCHES,
                 gap,
-                engine::rates::gemm_flops(m, n, k),
+                machine.gemm_flops(m, n, k),
             )
         }
     }
 
+    /// The attention's rate at `keys_n` keys and width `head_dim`: its
+    /// flops, times its work-groups' wave factor on `machine`, over its time.
     fn attention(
         device: &Context,
         clock: &Clock,
         random: &Random,
         held: &mut Vec<Buffer>,
+        machine: &engine::roofline::Machine,
         keys_n: u32,
         head_dim: u32,
         gap: f64,
@@ -723,7 +628,7 @@ mod on_device {
             ns,
             engine::rates::ATTN_DISPATCHES,
             gap,
-            engine::rates::attn_flops(at),
+            engine::rates::attn_flops(at) * machine.attn_wave_factor(1, at.rows, at.q_heads),
         )
     }
 
@@ -894,38 +799,14 @@ mod on_device {
 }
 
 #[cfg(test)]
-mod lattice_tests {
-    #[test]
-    fn the_grid_is_timed_at_the_candidates_a_load_weighs() {
-        // The rows a load with nothing stated weighs (serve::load's
-        // budget_at(asked).buckets): the chip's lattice to its asked tokens.
-        let chip = crate::chip::profile("");
-        let engine = crate::chip::Engine::of(&chip);
-        let weighed = crate::api::lattice(
-            Vec::new(),
-            9742,
-            engine.lattice_steps,
-            engine.prefill_lattice_from,
-            engine.prefill_lattice_steps,
-        );
-        assert_eq!(
-            super::lattice_rows(&chip)[..weighed.len() - 1],
-            weighed[..weighed.len() - 1]
-        );
-        assert_eq!(weighed.first(), Some(&1), "a readout's one row");
-    }
-}
-
-#[cfg(test)]
 mod attention_tests {
     use super::PAGE;
 
     #[test]
     fn the_attention_sets_and_keys_are_the_shared_rule_at_cudas_page() {
         // CUDA path unchanged: 63876a684 sized its sets in place, the q rows
-        // and the kv pages as laid whole against ATTN_SET_BYTES, at least 2,
-        // and took the lattice's rows to the saturation point; the shared
-        // functions at its PAGE give the same.
+        // and the kv pages as laid whole against ATTN_SET_BYTES, at least 2;
+        // the shared function at its PAGE gives the same.
         for (keys, d) in [(1, 64), (17, 128), (2234, 128), (4467, 256)] {
             let at = engine::rates::ATTN_SHAPE.at(keys).with_dim(d);
             let pages = at.rows.div_ceil(PAGE);
@@ -941,9 +822,5 @@ mod attention_tests {
                 "{keys} keys, d {d}"
             );
         }
-        let lattice = super::lattice_rows(&crate::chip::profile(""));
-        let top = lattice[lattice.len() / 2];
-        let inline: Vec<u32> = lattice.iter().copied().take_while(|&r| r <= top).collect();
-        assert_eq!(engine::rates::attn_keys(&lattice, top), inline);
     }
 }

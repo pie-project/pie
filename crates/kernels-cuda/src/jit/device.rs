@@ -80,15 +80,17 @@ pub(crate) fn sizing_take() -> crate::sizing::Footprint {
             sized
                 .asked
                 .into_iter()
-                .map(|((arena, name, region, scope), asked)| crate::sizing::Sized {
-                    key: SlabKey {
-                        arena,
-                        name,
-                        region,
-                        scope,
+                .map(
+                    |((arena, name, region, scope), asked)| crate::sizing::Sized {
+                        key: SlabKey {
+                            arena,
+                            name,
+                            region,
+                            scope,
+                        },
+                        asked,
                     },
-                    asked,
-                })
+                )
                 .collect(),
         )
     })
@@ -118,21 +120,6 @@ pub(crate) fn attach(arena: u32, stream: *mut c_void) {
 /// Forgets the arena's slabs; their memory is the placing caller's.
 pub(crate) fn release(arena: u32) {
     locked().remove(&arena);
-}
-
-pub(crate) fn capture_status(stream: *mut c_void) -> Option<rt::cudaStreamCaptureStatus> {
-    let mut status = rt::cudaStreamCaptureStatus::cudaStreamCaptureStatusNone;
-    // SAFETY: `stream` is a `Ctx`'s stream, live by `Ctx::on`'s contract;
-    // `status` is a local out-pointer.
-    if unsafe { rt::cudaStreamIsCapturing(stream.cast(), &raw mut status) }
-        != rt::cudaError::cudaSuccess
-    {
-        // SAFETY: takes no arguments; it only clears the sticky error the
-        // failed query left on this thread.
-        let _ = unsafe { rt::cudaGetLastError() };
-        return None;
-    }
-    Some(status)
 }
 
 fn scope_of(stream: *mut c_void, region: u32) -> usize {
@@ -256,16 +243,6 @@ pub(crate) fn max_shared_memory_per_block_optin() -> Option<u32> {
             o,
         )
     })
-}
-
-pub(crate) fn properties(ordinal: i32) -> Option<rt::cudaDeviceProp> {
-    // SAFETY: `cudaDeviceProp` is a C struct of integers, arrays and a
-    // UUID, for which all-zero bytes are a valid value.
-    let mut prop: rt::cudaDeviceProp = unsafe { core::mem::zeroed() };
-    // SAFETY: `prop` is a local out-pointer of the struct's own type; a bad
-    // `ordinal` comes back as an error code.
-    let code = unsafe { rt::cudaGetDeviceProperties(&raw mut prop, ordinal) };
-    (code == rt::cudaError::cudaSuccess).then_some(prop)
 }
 
 fn attribute(which: rt::cudaDeviceAttr, ordinal: i32) -> Option<u32> {

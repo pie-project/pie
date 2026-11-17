@@ -417,10 +417,8 @@ pub(crate) fn lattice(
 pub(crate) const DEFAULT_FORWARD_TOKENS: u32 = 8192;
 
 /// The rung lattice under `engine` up to `top`: [`default_lattice`]'s
-/// points below it and `top` itself. With `top` the card's fire top (the
-/// widest row of its profile's measured grid, [`fire_top_of`]: the grid's
-/// saturation point, `crate::rates::Saturation`), the candidates a load
-/// with no stated buckets weighs and the rows `--rates` times its grid at.
+/// points below it and `top` itself. With `top` the card's fire top
+/// ([`fire_top_of`]), the candidates a load with no stated buckets weighs.
 #[must_use]
 pub(crate) fn rung_lattice(engine: &crate::chip::Engine, top: u32) -> Vec<u32> {
     default_lattice(
@@ -446,25 +444,30 @@ pub(crate) fn on_lattice(engine: &crate::chip::Engine, top: u32, tokens: u32) ->
         .unwrap_or(lattice[0])
 }
 
-/// The card's fire top: the widest row its profile's matmul grid states
-/// (`[rates] bf16_flops_per_ns_by_rows_n_k`, timed to the top
-/// the grid saturated at, `crate::rates::Saturation`). A profile with no grid has no
-/// top, and a load on it is refused for its missing rates, by name.
-pub(crate) fn fire_top_of(chip: &profile::Profile, device: &str) -> crate::error::Result<u32> {
-    let rates = chip.rates();
-    rates
-        .bf16_flops_per_ns_by_rows_n_k
-        .as_deref()
-        .and_then(|grid| profile::fire::gemm_rows(grid).last().copied())
-        .ok_or_else(|| {
-            Fault::Card(
-                engine::load::Refused::NoRates {
-                    device: device.to_owned(),
-                    key: "bf16_flops_per_ns_by_rows_n_k",
-                }
-                .to_string(),
-            )
-        })
+/// The card's fire top (`engine::roofline::fire_top`): on its rung lattice
+/// as far as a `u32` of rows reaches, the last row where a dense matmul's
+/// cost a row, by the roofline over its profile's rates on `machine`, still
+/// falls more than `profile::AGREEMENT` below its least before. Past it no
+/// rung's efficiency improves, so none past it can be chosen. A profile
+/// without the matmul rate or the bandwidth has no top, and a load on it is
+/// refused for its missing rates, by name.
+pub(crate) fn fire_top_of(
+    chip: &profile::Profile,
+    machine: &engine::roofline::Machine,
+    device: &str,
+) -> crate::error::Result<u32> {
+    let constants = engine::load::gemm_constants(&chip.rates()).map_err(|key| {
+        Fault::Card(
+            engine::load::Refused::NoRates {
+                device: device.to_owned(),
+                key,
+            }
+            .to_string(),
+        )
+    })?;
+    let mut lattice = rung_lattice(&crate::chip::Engine::of(chip), u32::MAX);
+    lattice.pop();
+    Ok(engine::roofline::fire_top(&lattice, &constants, machine))
 }
 
 /// The load's budgets for `trace`: its logit readouts sized to what the

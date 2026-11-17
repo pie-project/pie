@@ -8,19 +8,16 @@
 //! against one, the median of [`ROUNDS`] after a warm frame (which builds
 //! its pipelines), so the frame's one submit and wait cancel and what is
 //! left is the work's own time beside a dispatch's:
-//! - the backend's own bf16 matmul at each row count of
-//!   the backend's rung lattice (`Serve::rung_lattice`, the rows its loads
-//!   lay fires at) and each column count and depth of
-//!   `engine::rates::DEPTHS`, `m x n x k`, each fire reading the next of
-//!   `engine::rates::weights_at(n, k)`
-//!   weight planes (past the last-level cache), for the matmul grid;
-//! - its prefill attention at `engine::rates::ATTN_SHAPE`'s heads over each
-//!   the lattice's rows to its saturation top (`engine::rates::attention_at_rows`) and head width of `engine::rates::ATTN_DIMS`,
-//!   through the kernel a served fire selects at that shape, for the
-//!   attention grid;
+//! - the backend's own bf16 matmul at each of `engine::rates::GEMM_SHAPES`,
+//!   each fire reading the next of `engine::rates::weights_at(n, k)` weight
+//!   planes (past the last-level cache), the fastest for `gemm_tflops`;
+//! - its prefill attention at `engine::rates::ATTN_SHAPE`'s heads over
+//!   `engine::rates::ATTN_KEYS` keys at each head width of
+//!   `engine::rates::ATTN_DIMS`, through the kernel a served fire selects at
+//!   that shape, 128's for `attn_tflops`;
 //! - its chunked gated-delta scan, the causal conv before it, at
-//!   `engine::rates::SCAN_SHAPE`, for the scan rate;
-//! - a buffer copy of [`COPY_BYTES`], for bytes a nanosecond;
+//!   `engine::rates::SCAN_SHAPE`, for `scan_gelems`;
+//! - a buffer copy of [`COPY_BYTES`], for `hbm_gbps`;
 //! - a chain of dependent narrowest matmuls in one frame (each reading the
 //!   one before's output) against one matmul of the chain's rows, at each
 //!   length of `engine::rates::LAUNCH_CHAINS`, for what a dispatch adds to
@@ -36,7 +33,7 @@
 //! way: one submit each, so neither the clock nor the adapter's span start
 //! biases it.
 
-use engine::rates::{DEPTHS, SCAN_SHAPE, attn_flops, gemm_flops, scan_elements, weights_at};
+use engine::rates::{SCAN_SHAPE, attn_flops, gemm_flops, scan_elements, weights_at};
 use kernels_slang::{KvPool, RaggedTensor, Tensor};
 use poem_ir::Dtype;
 use profile::fire::Rates;
@@ -197,6 +194,15 @@ fn median(mut v: Vec<u64>) -> u64 {
     v[v.len() / 2].max(1)
 }
 
+/// The device the roofline weighs a slang backend's fire on: neither Vulkan
+/// nor WebGPU states its compute units, so it is one unit taking a
+/// one-element tile, and no wave is quantized (a matmul's work is its own
+/// `2 m n k`, an attention's its flops).
+#[must_use]
+pub fn machine() -> engine::roofline::Machine {
+    engine::roofline::Machine::fixed(1, engine::roofline::Tile::of(1, 1), 1)
+}
+
 /// The rates of `device`, its kernels under the tactics `tactics` picks at
 /// `tier`.
 pub fn measure<B: Serve, T: Tactics + ?Sized>(
@@ -208,7 +214,7 @@ pub fn measure<B: Serve, T: Tactics + ?Sized>(
     measure_saying::<B, T>(device, tactics, tier, timer, &mut |_| {})
 }
 
-/// [`measure`], saying how the warm-up ended.
+/// [`measure`], saying how the warm-up ended and what each shape reached.
 pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     device: &B::Context,
     tactics: &T,
@@ -216,6 +222,7 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     timer: Timer<'_, B>,
     say: &mut dyn FnMut(&str),
 ) -> Result<Rates> {
+    let machine = machine();
     let mut rig = Rig::<B>::new(device);
     // The launch first: every rate below takes its dispatches' launches off.
     let (bytes_per_ns, launch_ns) = copy_and_launch(&mut rig, tactics.gemm(tier), timer, say)?;
@@ -228,39 +235,47 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         engine::rates::WARM_SHAPE.0,
         warmed.rate / 1e3
     ));
-    let rows = B::rung_lattice();
-    let (grid, top) = grid(&mut rig, tactics.gemm(tier), timer, launch, &rows)?;
-    say(&format!(
-        "[rates]: the grid saturates at {} rows of a lattice to {}: past it no (n, k) shape's \
-         cost a row fell more than {:.0}% below its least through {} (at it the most {:.1}%)",
-        top.rows,
-        rows.last().copied().unwrap_or(0),
-        100.0 * engine::rates::AGREEMENT,
-        top.through,
-        100.0 * top.best_gain,
-    ));
-    // The attention at the grid's rows to its saturation point
-    // (engine::rates::attention_at_rows, every engine's rule).
-    let attn = engine::rates::attention_at_rows(&rows, top.rows, |shape| {
-        let rate = attention(&mut rig, tactics, tier, timer, shape, launch);
+    let mut gemm = 0.0f64;
+    for (m, n, k) in engine::rates::GEMM_SHAPES {
+        let rate = matmul(
+            &mut rig,
+            tactics.gemm(tier),
+            timer,
+            &machine,
+            (m, n, k),
+            launch,
+        )?;
         rig.release();
-        rate
-    })?;
-    let mut scan_curve = Vec::with_capacity(engine::rates::SCAN_TOKENS.len());
-    for tokens in engine::rates::SCAN_TOKENS {
-        let shape = SCAN_SHAPE.at(tokens);
-        scan_curve.push((
-            tokens,
-            scan(&mut rig, tactics.recurrent(), timer, shape, launch)?,
+        say(&format!(
+            "[rates]: matmul {m}x{n}x{k}: {:.1} TFLOP/s",
+            rate / 1e3
         ));
-        rig.release();
+        gemm = gemm.max(rate);
     }
+    let mut attn = 0.0;
+    for d in engine::rates::ATTN_DIMS {
+        let shape = engine::rates::ATTN_SHAPE
+            .at(engine::rates::ATTN_KEYS)
+            .with_dim(d);
+        let rate = attention(&mut rig, tactics, tier, timer, &machine, shape, launch)?;
+        rig.release();
+        say(&format!(
+            "[rates]: attention {} keys d {d}: {:.1} TFLOP/s",
+            shape.keys,
+            rate / 1e3
+        ));
+        if d == 128 {
+            attn = rate;
+        }
+    }
+    let scan = scan(&mut rig, tactics.recurrent(), timer, SCAN_SHAPE, launch)?;
+    rig.release();
     Ok(Rates {
-        bf16_flops_per_ns_by_rows_n_k: Some(grid),
-        attn_flops_per_ns_by_keys_and_dim: Some(attn),
-        scan_elements_per_ns_by_tokens: Some(scan_curve),
-        bytes_per_ns: Some(bytes_per_ns),
         launch_ns: Some(launch_ns),
+        gemm_tflops: Some(gemm / 1e3),
+        attn_tflops: Some(attn / 1e3),
+        hbm_gbps: Some(bytes_per_ns),
+        scan_gelems: Some(scan),
     })
 }
 
@@ -294,81 +309,40 @@ fn warm<B: Serve>(
     Ok(warmed)
 }
 
-/// The matmul rate at each row count, column count and depth of the
-/// lattice: `(m, n, k, flops a ns)`, ordered by depth, then columns, then
-/// rows. The shapes are timed in [`engine::rates::spread_order`], and each
-/// shape's rows in it too, so a drift left after the warm-up spreads over
-/// the grid.
-fn grid<B: Serve>(
+/// The matmul rate at `(m, n, k)`: its work on `machine` over its time,
+/// each fire reading the next of its weight planes, past the last-level
+/// cache.
+fn matmul<B: Serve>(
     rig: &mut Rig<'_, B>,
     tactic: kernels_slang::linear::gemm::Tactic,
     timer: Timer<'_, B>,
+    machine: &engine::roofline::Machine,
+    (m, n, k): (u32, u32, u32),
     launch: f64,
-    lattice: &[u32],
-) -> Result<(Vec<(u32, u32, u32, f64)>, engine::rates::Saturation)> {
-    let widest = lattice.iter().copied().max().unwrap_or(1);
-    let shapes: Vec<(u32, u32)> = DEPTHS
-        .iter()
-        .flat_map(|&k| DEPTHS.iter().map(move |&n| (n, k)))
-        .collect();
-    // A shape's operands, laid at the start of each run of it: the widest
-    // row's activation and output, and the weight planes each fire reads
-    // the next of, past the last-level cache.
-    let mut laid: Option<(Tensor, Vec<Tensor>, Tensor)> = None;
+) -> Result<f64> {
+    let act = rig.operand(m, k, Dtype::Bf16)?;
+    let weights = (0..weights_at(n, k))
+        .map(|_| rig.operand(n, k, Dtype::Bf16))
+        .collect::<Result<Vec<Tensor>>>()?;
+    let y = rig.zeros(m, n, Dtype::Bf16)?;
     let next = std::cell::Cell::new(0usize);
-    let (rates, top) = engine::rates::saturate(lattice, shapes.len(), |at, row, fresh| {
-        let (n, k) = shapes[at];
-        if fresh {
-            // The last shape's planes go before this shape's are laid.
-            laid = None;
-            rig.release();
-            let act = rig.operand(widest, k, Dtype::Bf16)?;
-            let weights = (0..weights_at(n, k))
-                .map(|_| rig.operand(n, k, Dtype::Bf16))
-                .collect::<Result<Vec<Tensor>>>()?;
-            let y = rig.zeros(widest, n, Dtype::Bf16)?;
-            laid = Some((act, weights, y));
-        }
-        let (act, weights, y) = laid.as_ref().expect("laid");
-        let m = lattice[row];
-        let ns = rig.each(timer, &|sink| {
-            let w = weights[next.get() % weights.len()];
-            next.set(next.get() + 1);
-            kernels_slang::linear::gemm::matmul(
-                sink,
-                tactic,
-                Tensor { rows: m, ..*act },
-                w,
-                Tensor { rows: m, ..*y },
-            )
-            .map_err(fault("rates: matmul"))
-        })?;
-        let rate = engine::rates::rate_from(
-            &format!("matmul {m}x{n}x{k}"),
-            ns as f64,
-            engine::rates::GEMM_DISPATCHES,
-            launch,
-            gemm_flops(m, n, k),
-        )
-        .map_err(|why| Fault::Device { call: "rates", why })?;
-        Ok::<_, Fault>((
-            rate,
-            engine::rates::gemm_cost_per_row(m, n, k, rate, launch),
-        ))
+    let ns = rig.each(timer, &|sink| {
+        let w = weights[next.get() % weights.len()];
+        next.set(next.get() + 1);
+        kernels_slang::linear::gemm::matmul(sink, tactic, act, w, y).map_err(fault("rates: matmul"))
     })?;
-    rig.release();
-    // The grid ends at the saturation point: a load's rungs run to it.
-    let mut out = Vec::with_capacity((top.top + 1) * shapes.len());
-    for (at, &(n, k)) in shapes.iter().enumerate() {
-        for (i, &m) in lattice.iter().enumerate().take(top.top + 1) {
-            out.push((m, n, k, rates[at][i]));
-        }
-    }
-    out.sort_by_key(|&(m, n, k, _)| (k, n, m));
-    Ok((out, top))
+    engine::rates::rate_from(
+        &format!("matmul {m}x{n}x{k}"),
+        ns as f64,
+        engine::rates::GEMM_DISPATCHES,
+        launch,
+        machine.gemm_flops(m, n, k),
+    )
+    .map_err(|why| Fault::Device { call: "rates", why })
 }
 
-/// The prefill attention's rate at `s`: one sequence of `s.rows` rows
+/// The prefill attention's rate at `s` (its work-groups' waves on
+/// `machine` in its work): one sequence of `s.rows` rows
 /// attending itself, causal, its kv laid in pages of [`PAGE`], through the
 /// kernel a served fire takes at that shape (the tactic at its head width,
 /// tiled or walked by [`Tactics::sdpa_tiles`]).
@@ -377,6 +351,7 @@ fn attention<B: Serve, T: Tactics + ?Sized>(
     tactics: &T,
     tier: kernels_slang::Tier,
     timer: Timer<'_, B>,
+    machine: &engine::roofline::Machine,
     s: engine::rates::AttnShape,
     launch: f64,
 ) -> Result<f64> {
@@ -440,7 +415,7 @@ fn attention<B: Serve, T: Tactics + ?Sized>(
         ns as f64,
         engine::rates::ATTN_DISPATCHES,
         launch,
-        attn_flops(s),
+        attn_flops(s) * machine.attn_wave_factor(1, s.rows, s.q_heads),
     )
     .map_err(|why| Fault::Device { call: "rates", why })
 }
@@ -631,7 +606,7 @@ pub fn attention_rate<B: Serve, T: Tactics + ?Sized>(
     launch: f64,
 ) -> Result<f64> {
     let mut rig = Rig::<B>::new(device);
-    attention(&mut rig, tactics, tier, timer, shape, launch)
+    attention(&mut rig, tactics, tier, timer, &machine(), shape, launch)
 }
 
 /// The bf16 matmul rate of `device` at `(m, n, k)` under `tactic`: a check

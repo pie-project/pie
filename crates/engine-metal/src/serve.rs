@@ -1231,16 +1231,18 @@ impl PreparedLoad<'_> {
                         .sum::<usize>(),
                 )
                 .unwrap_or(u32::MAX);
-                // The rungs to the device's saturation point (the rows its
-                // rates grid ends at, `engine::rates::saturate`): no rung past
-                // it can be chosen, and the estimate weighs none it lacks.
-                let saturated = chip
-                    .tuned()
-                    .rates
-                    .bf16_flops_per_ns_by_rows_n_k
-                    .as_deref()
-                    .and_then(|grid| profile::fire::gemm_rows(grid).last().copied())
-                    .unwrap_or(u32::MAX)
+                // The rungs to the device's fire top
+                // (`engine::roofline::fire_top` over its rates): no rung past
+                // it can be chosen. A device without the rates has none, and
+                // the ruling refuses it by name.
+                let saturated = engine::load::gemm_constants(&chip.tuned().rates)
+                    .map_or(u32::MAX, |constants| {
+                        engine::roofline::fire_top(
+                            &crate::rates::lattice_rows(),
+                            &constants,
+                            &crate::rates::machine(),
+                        )
+                    })
                     .max(act.first().map_or(1, |&(tokens, _)| tokens));
                 let candidates: Vec<crate::top::Candidate> = act
                     .iter()
@@ -1540,7 +1542,7 @@ impl PreparedLoad<'_> {
             false => None,
         };
         let weighed = weighed.and_then(|(counts, rungs, live)| {
-            engine::load::estimate(&counts, &chip.tuned().rates)
+            engine::load::estimate(&counts, &chip.tuned().rates, &crate::rates::machine())
                 .ok()
                 .map(|estimate| crate::top::Weighed {
                     rungs,

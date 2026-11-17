@@ -13,8 +13,8 @@ device = "NVIDIA RTX PRO 4500 Blackwell"
 # WGSL's tiled kernel, timed by the adapter's timestamps, 14.1 TFLOPS; the
 # 256 MiB copy 756 GB/s; the launch a dispatch's own cost inside one frame
 # (1024 of the narrowest matmul against one, in-graph), 4.12 us.
-bf16_flops_per_ns_by_rows_n_k = [[4096, 4096, 4096, 14100.0]]
-bytes_per_ns = 756.0
+gemm_tflops = 14.1
+hbm_gbps = 756.0
 launch_ns = 4120
 # Vendor peaks, bounds and not rates: dense bf16 about 202 TFLOPS (NVIDIA
 # and Lenovo publish no bf16 or FP16 tensor figure for this card; 1617

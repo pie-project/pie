@@ -2,10 +2,11 @@
 //! them, at the shapes every backend times ([`engine::rates`]), each through
 //! the kernel serving dispatches under the device's own tuning:
 //!
-//! * the matmul curve: `linear::gemm::matmul` at each of
-//!   the rung lattice ([`lattice_rows`]), each repeat over the next of
+//! * the matmul: `linear::gemm::matmul` at each of
+//!   [`engine::rates::GEMM_SHAPES`], each repeat over the next of
 //!   engine::rates::weights_at's distinct weights so every one streams from memory, as a fire's do;
-//! * attention: `attn::arbiter::prefill` at [`engine::rates::ATTN_SHAPE`],
+//! * attention: `attn::arbiter::prefill` at [`engine::rates::ATTN_SHAPE`]
+//!   over [`engine::rates::ATTN_KEYS`] keys,
 //!   causal, over a bf16 pool of the 16-token pages serving builds, laid
 //!   in engine::rates::attn_page_order's scattered order, each repeat the
 //!   next of engine::rates::attn_sets_at's q / kv sets so each reads cold;
@@ -28,19 +29,27 @@
 //! serving runs, and every backend times the same bytes. Index and page
 //! tables, gates, outputs and the launch probe stay as laid.
 
-use engine::rates::{AttnShape, DEPTHS, SCAN_SHAPE};
+use engine::rates::{AttnShape, SCAN_SHAPE};
 use kernels_metal::linear::gemm;
 use kernels_metal::tensor::{RaggedTensor, RecurrentPool};
 use kernels_metal::{KvPool, PrefillPlan, StateMap, Tensor, Tuning, attn, ssm};
 use poem_ir::Dtype;
 use profile::fire::Rates;
 
-/// The widest fire this backend's grid is timed to: the top of its rung
-/// lattice, the tokens a served Metal load is asked ([`crate::FIRE`]).
+/// The device the roofline weighs a Metal fire on: the matmul and the
+/// attention kernels' work-groups over the GPU's cores are not modelled, so
+/// it is one unit taking a one-element tile, and no wave is quantized (a
+/// matmul's work is its own `2 m n k`; the rates step's counts are the same).
+#[must_use]
+pub fn machine() -> engine::roofline::Machine {
+    engine::roofline::Machine::fixed(1, engine::roofline::Tile::of(1, 1), 1)
+}
+
+/// The widest fire this backend's lattice reaches: the tokens a served
+/// Metal load is asked ([`crate::FIRE`]).
 pub const ROWS_TOP: u32 = crate::FIRE.1;
 
-/// The rows a Metal load fires, and the matmul grid is timed at: Metal's
-/// one rung lattice, every power of two of rows from 1 to [`ROWS_TOP`] and
+/// The rows a Metal load fires: Metal's one rung lattice, every power of two of rows from 1 to [`ROWS_TOP`] and
 /// that top. A load lays its rungs at these points below its top
 /// (`serve::activation_rungs`), and a top it narrows to is one of them.
 #[must_use]
@@ -492,67 +501,35 @@ pub fn measure(
             warmed.rate / 1e3
         ));
     }
-    // The shapes, walked by engine::rates::saturate (the rule every
-    // engine's rates step takes) up to the device's saturation point on the
-    // lattice, at most FIRE.1: the fire a served Metal load is asked, the
-    // ceiling the worker's request sets, not a limit of the device.
-    let lattice = lattice_rows();
-    let shapes: Vec<(u32, u32)> = DEPTHS
-        .iter()
-        .flat_map(|&k| DEPTHS.iter().map(move |&n| (n, k)))
-        .collect();
-    // A shape's planes, laid at the start of each run of it: the planes
-    // every backend rotates through (engine::rates::weights_at: 768 MiB, at
-    // least 12), each its own memory so each repeat streams its weight as a
-    // layer's matmul does; one plane of the operand pattern fills them.
-    let mut laid: Option<(Vec<Tensor>, Vec<Buffer>)> = None;
-    let (rates, top) = engine::rates::saturate(&lattice, shapes.len(), |at, row, fresh| {
-        let (n, k) = shapes[at];
-        if fresh {
-            // The handles let the last shape's planes go (a grid of every
-            // (n, k) holds no more than one shape's).
-            laid = None;
-            bench.handles = Handles::new();
-            let plane = operand(&bench.pattern, (n * k) as usize * 2);
-            let weights = (0..engine::rates::weights_at(n, k))
-                .map(|_| {
-                    let w = bench.buffer(&plane)?;
-                    Ok((bench.tensor(&w, n, k, Dtype::Bf16)?, w))
-                })
-                .collect::<Result<Vec<(Tensor, Buffer)>, String>>()?;
-            laid = Some(weights.into_iter().unzip());
-        }
-        let (tensors, _) = laid.as_ref().expect("laid");
-        let m = lattice[row];
-        let rate = bench.matmul_flops(m, n, k, tensors, gap)?;
+    // The matmul at each of engine::rates::GEMM_SHAPES, each over its own
+    // planes (engine::rates::weights_at: 768 MiB, at least 12, so each
+    // repeat streams its weight as a layer's matmul does); the fastest.
+    let mut gemm = 0.0f64;
+    for (m, n, k) in engine::rates::GEMM_SHAPES {
+        bench.handles = Handles::new();
+        let plane = operand(&bench.pattern, (n * k) as usize * 2);
+        let weights = (0..engine::rates::weights_at(n, k))
+            .map(|_| {
+                let w = bench.buffer(&plane)?;
+                Ok((bench.tensor(&w, n, k, Dtype::Bf16)?, w))
+            })
+            .collect::<Result<Vec<(Tensor, Buffer)>, String>>()?;
+        let tensors: Vec<Tensor> = weights.iter().map(|(t, _)| *t).collect();
+        let rate = bench.matmul_flops(m, n, k, &tensors, gap)?;
         say(&format!(
             "  bf16 matmul {m} x {n} x {k}: {:.4} TFLOP/s",
             rate / 1e3
         ));
-        Ok::<_, String>((rate, engine::rates::gemm_cost_per_row(m, n, k, rate, gap)))
-    })?;
-    drop(laid);
-    say(&format!(
-        "  the grid saturates at {} rows of a lattice to {}: past it no (n, k) shape's cost a \
-         row fell more than {:.0}% below its least through {} (at it the most {:.1}%)",
-        top.rows,
-        lattice.last().copied().unwrap_or(0),
-        100.0 * engine::rates::AGREEMENT,
-        top.through,
-        100.0 * top.best_gain,
-    ));
-    // The grid ends at the saturation point: a load's rungs run to it.
-    let mut grid = Vec::with_capacity((top.top + 1) * shapes.len());
-    for (at, &(n, k)) in shapes.iter().enumerate() {
-        for (i, &m) in lattice.iter().enumerate().take(top.top + 1) {
-            grid.push((m, n, k, rates[at][i]));
-        }
+        gemm = gemm.max(rate);
     }
-    grid.sort_by_key(|&(m, n, k, _)| (k, n, m));
-    // The attention at the grid's rows to its saturation point
-    // (engine::rates::attention_at_rows, every engine's rule).
-    let keys_curve = engine::rates::attention_at_rows(&lattice, top.rows, |shape| {
+    // The attention over engine::rates::ATTN_KEYS keys at each width, 128's
+    // the rate.
+    let mut attn = 0.0;
+    for d in engine::rates::ATTN_DIMS {
         bench.handles = Handles::new();
+        let shape = engine::rates::ATTN_SHAPE
+            .at(engine::rates::ATTN_KEYS)
+            .with_dim(d);
         let rate = bench.attention_flops(shape, gap)?;
         say(&format!(
             "  prefill attention, {0} rows over {0} keys, d {1}: {2:.4} TFLOP/s",
@@ -560,25 +537,23 @@ pub fn measure(
             shape.head_dim,
             rate / 1e3
         ));
-        Ok::<_, String>(rate)
-    })?;
-    bench.handles = Handles::new();
-    let mut scan_curve = Vec::with_capacity(engine::rates::SCAN_TOKENS.len());
-    for tokens in engine::rates::SCAN_TOKENS {
-        scan_curve.push((tokens, bench.scan_elements(tokens, gap)?));
+        if d == 128 {
+            attn = rate;
+        }
     }
-    let scan = scan_curve.iter().map(|&(_, r)| r).fold(0.0, f64::max);
+    bench.handles = Handles::new();
+    let scan = bench.scan_elements(SCAN_SHAPE.tokens, gap)?;
     say(&format!(
         "  gated-delta scan and its conv: {scan:.1} state elements a ns"
     ));
     let bytes = bench.bytes_per_ns(gap)?;
     say(&format!("  256 MiB blit: {bytes:.1} GB/s read and write"));
     Ok(Rates {
-        bf16_flops_per_ns_by_rows_n_k: Some(grid),
-        attn_flops_per_ns_by_keys_and_dim: Some(keys_curve),
-        scan_elements_per_ns_by_tokens: Some(scan_curve),
-        bytes_per_ns: Some(bytes),
         launch_ns: Some(launch),
+        gemm_tflops: Some(gemm / 1e3),
+        attn_tflops: Some(attn / 1e3),
+        hbm_gbps: Some(bytes),
+        scan_gelems: Some(scan),
     })
 }
 

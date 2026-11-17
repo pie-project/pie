@@ -2,24 +2,6 @@ api = 1
 
 # Every MI300X, the virtual function a cloud instance exposes ("AMD Instinct
 # MI300X VF") as the card itself; the rest of the family (MI300A, MI325X)
-# states its own rates.
+# states its own file.
 [target]
 match = { name_contains = ["MI300X"] }
-
-[rates]
-# `pie tune cuda --rates` on this MI300X VF at engine::rates' lattice, each
-# rate a 20 ms burst of its kernel back to back, the median of 5 (the launch
-# of 15). The matmul through hipBLASLt under serving's GEMM tactics; the
-# vendor's 1307 TFLOPS dense bf16 (AMD Instinct MI300X data sheet) is the
-# bound (~63% at 8192 rows). The copy against 5.3 TB/s of HBM3 (~77%). The
-# launch is a kernel's inside a captured hipGraph, as serving replays its
-# bodies. Two runs agree within 1.8% on every key (the matmul within 1.8%,
-# the copy 1.8%, attention, scan and the launch under 0.5%).
-bf16_flops_per_ns_by_rows_n_k = [[16, 4096, 4096, 37781.5], [32, 4096, 4096, 73769.9], [64, 4096, 4096, 139548.9], [128, 4096, 4096, 236568.2], [256, 4096, 4096, 314245.3], [512, 4096, 4096, 442427.1], [1024, 4096, 4096, 505503.8], [2048, 4096, 4096, 670702.2], [4096, 4096, 4096, 718139.4], [8192, 4096, 4096, 824510.9]]
-attn_flops_per_ns_by_keys_and_dim = [[2048, 128, 238285.2]]
-scan_elements_per_ns_by_tokens = [[2048, 3073.2]]
-bytes_per_ns = 4071.0
-launch_ns = 1631
-
-[provenance]
-rates = "pie tune cuda --rates on 2026-11-16 (pie 0.6.0): AMD Instinct MI300X VF; the matmul through hipBLASLt under serving's GEMM tactics, each rate a 20 ms burst on the stream timed by events, the median of 5 (the launch of 15); at commit f5704ee69; at engine::rates' lattice (matmul m x 4096 x 4096, m 16..8192; attention 2048x2048 keys, 16/8 heads of 128; scan 2048 tokens, 16/16 heads of 128x128, conv 4)"

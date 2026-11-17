@@ -79,15 +79,6 @@ prefill_lanes = 64
 # page: gemma-4-31b c128 663 -> 723, gemma-4-26b c1024 2,777 -> 3,728 tok/s, greedy tokens unchanged
 window_spare = true
 
-[rates]
-# Dense bf16: 1617 TFLOPS of FP4 with sparsity (Lenovo Press LP2443) is 808
-# dense, and Blackwell's fifth generation tensor cores run bf16 at a quarter
-# of FP4's rate: 202 TFLOPS. The same figure as engine-vulkan's derived
-# file.
-bf16_flops_per_ns_by_rows_n_k = [[4096, 4096, 4096, 202000.0]]
-# 896 GB/s of GDDR7 (nvidia.com, RTX PRO 4500 Blackwell specifications).
-bytes_per_ns = 896.0
-
 [provenance]
 source = "pie tune (quick, gptoss-20b) on RunPod; 512-token prompt 20.5 -> 20.5 ms, 1-lane step 2.99 -> 2.93 ms, 4-lane step 4.11 -> 4.06 ms, 8-lane step 6.36 -> 5.33 ms, readout cosine 1.0000"
 measured = [

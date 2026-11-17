@@ -1068,15 +1068,19 @@ impl<B: Serve> Shell<B> {
         let (compiled, mut span) = loop {
             let compiled = compile_axes(&boot.trace, &budgets, &profile)?;
             // The rungs the rung lattice offers up to this load's top and the
-            // device's saturation point (the rows its rates grid ends at,
-            // `engine::rates::saturate`): no rung past it can be chosen, and
-            // the estimate never weighs a rung the grid does not state.
-            let saturated = device_profile
-                .rates()
-                .bf16_flops_per_ns_by_rows_n_k
-                .as_deref()
-                .and_then(|grid| profile::fire::gemm_rows(grid).last().copied())
-                .unwrap_or(u32::MAX);
+            // device's fire top (`engine::roofline::fire_top` over its rates):
+            // no rung past it can be chosen. A device without the rates has
+            // none, and the ruling refuses it by name.
+            let saturated = engine::load::gemm_constants(&device_profile.rates()).map_or(
+                u32::MAX,
+                |constants| {
+                    engine::roofline::fire_top(
+                        &B::rung_lattice(),
+                        &constants,
+                        &crate::rates::machine(),
+                    )
+                },
+            );
             let top = budgets.tokens.max_tokens.min(saturated);
             let mut rung_tokens: Vec<u32> = B::rung_lattice()
                 .into_iter()
@@ -1108,13 +1112,17 @@ impl<B: Serve> Shell<B> {
                 &padded,
             );
             if weighed.is_none() {
-                weighed = crate::top::estimate(&counts, &device_profile.rates())
-                    .ok()
-                    .map(|estimate| Weighed {
-                        rungs: rungs.clone(),
-                        estimate,
-                        live,
-                    });
+                weighed = crate::top::estimate(
+                    &counts,
+                    &device_profile.rates(),
+                    &crate::rates::machine(),
+                )
+                .ok()
+                .map(|estimate| Weighed {
+                    rungs: rungs.clone(),
+                    estimate,
+                    live,
+                });
             }
             let pick = match (&chosen, boot.top) {
                 (None, Top::Ruled) => {

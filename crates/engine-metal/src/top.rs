@@ -90,7 +90,7 @@ pub fn choose(
     device: &str,
     counts: &Counts,
 ) -> Result<TopRung> {
-    engine::load::choose(rungs, live, rates, device, counts)
+    engine::load::choose(rungs, live, rates, &crate::rates::machine(), device, counts)
         .map(|(top, _)| top)
         .map_err(|refused| Fault::Residency(refused.to_string()))
 }
@@ -177,16 +177,9 @@ mod tests {
             "{err}"
         );
         let rated = profile::fire::Rates {
-            bf16_flops_per_ns_by_rows_n_k: Some(
-                (0..=14)
-                    .map(|i| 1u32 << i)
-                    .map(|m| (m, 4096, 4096, 5000.0))
-                    .collect(),
-            ),
-            attn_flops_per_ns_by_keys_and_dim: Some(
-                (0..=14).map(|i| (1u32 << i, 128, 2000.0)).collect(),
-            ),
-            bytes_per_ns: Some(400.0),
+            gemm_tflops: Some(5.0),
+            attn_tflops: Some(2.0),
+            hbm_gbps: Some(400.0),
             launch_ns: Some(5000),
             ..profile::fire::Rates::default()
         };

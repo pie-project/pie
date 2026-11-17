@@ -1142,23 +1142,38 @@ mod tests {
         let ancestry = mask(&[false, true, false, true, true]);
         let one = Masking::Rows(vec![ancestry.clone()]);
         // Alone on its set: every buffered slot, the mask unread.
-        assert_eq!(buffered_reads(Some(&one), 2, 6, Lineage::Set).unwrap(), vec![2..6]);
-        assert_eq!(buffered_reads(None, 2, 6, Lineage::Set).unwrap(), vec![2..6]);
+        assert_eq!(
+            buffered_reads(Some(&one), 2, 6, Lineage::Set).unwrap(),
+            vec![2..6]
+        );
+        assert_eq!(
+            buffered_reads(None, 2, 6, Lineage::Set).unwrap(),
+            vec![2..6]
+        );
         // Sharing a set: the ancestry its mask states, as slots.
         let reads = buffered_reads(Some(&one), 2, 6, Lineage::Admitted);
         assert_eq!(reads.unwrap(), vec![3..4, 5..6]);
-        assert_eq!(buffered_reads(None, 2, 6, Lineage::Admitted).unwrap(), vec![2..6]);
+        assert_eq!(
+            buffered_reads(None, 2, 6, Lineage::Admitted).unwrap(),
+            vec![2..6]
+        );
 
         // A row hiding its own lane's earlier row reads it in its recurrence:
         // the own rows run in order. Two rows admitting other buffered slots
         // than each other cannot share one run.
         let blind = mask(&[false, true, false, false, true]);
         let rows = Masking::Rows(vec![ancestry.clone(), blind]);
-        assert_eq!(buffered_reads(Some(&rows), 2, 5, Lineage::Admitted).unwrap(), vec![3..4]);
+        assert_eq!(
+            buffered_reads(Some(&rows), 2, 5, Lineage::Admitted).unwrap(),
+            vec![3..4]
+        );
         let other = mask(&[true, false, false, true, true]);
         let rows = Masking::Rows(vec![ancestry, other]);
         assert!(buffered_reads(Some(&rows), 2, 5, Lineage::Admitted).is_err());
-        assert_eq!(buffered_reads(Some(&rows), 2, 5, Lineage::Set).unwrap(), vec![2..5]);
+        assert_eq!(
+            buffered_reads(Some(&rows), 2, 5, Lineage::Set).unwrap(),
+            vec![2..5]
+        );
     }
 
     #[test]

@@ -20,7 +20,7 @@ pub fn rates(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Outco
     let device = crate::device::Context::bind(
         &crate::api::DeviceBoot::default(),
         engine::Allowance {
-            budget: Some(engine::rates::step_bytes(crate::FIRE.1)),
+            budget: Some(engine::rates::step_bytes()),
         },
     )
     .map_err(|e| e.to_string())?;
@@ -29,25 +29,13 @@ pub fn rates(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Outco
     say(&format!("{}: starting from {}", chip.name, report.used));
     let tuning = crate::tuning::Tuning::new(base.clone(), device.cores());
     let r = crate::rates::measure_saying(&device, &tuning, say).map_err(|e| e.to_string())?;
-    for &(m, n, k, rate) in r.bf16_flops_per_ns_by_rows_n_k.as_deref().unwrap_or(&[]) {
-        say(&format!(
-            "[rates]: matmul m {m:>5} n {n:>5} k {k:>5}: {:.4} TFLOP/s",
-            rate / 1e3
-        ));
-    }
     say(&format!(
-        "[rates]: attention {:.1} TFLOP/s at its widest keys, scan {:.2} G state elements/s, \
+        "[rates]: matmul {:.1} TFLOP/s, attention {:.1} TFLOP/s, scan {:.2} G state elements/s, \
          {:.0} GB/s, launch {:.2} us",
-        r.attn_flops_per_ns_by_keys_and_dim
-            .as_deref()
-            .and_then(|grid| {
-                let widest = *profile::fire::attn_keys(grid).last()?;
-                profile::fire::attn_flops_at(grid, widest, 128)
-            })
-            .unwrap_or(0.0)
-            / 1e3,
-        r.scan_at(2048).unwrap_or(0.0),
-        r.bytes_per_ns.unwrap_or(0.0),
+        r.gemm_tflops.unwrap_or(0.0),
+        r.attn_tflops.unwrap_or(0.0),
+        r.scan_gelems.unwrap_or(0.0),
+        r.hbm_gbps.unwrap_or(0.0),
         r.launch_ns.unwrap_or(0) as f64 / 1e3
     ));
     let tuned = engine::rates::tuned(&r);

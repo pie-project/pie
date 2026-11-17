@@ -358,8 +358,7 @@ fn check(name: &str, mega_takes: bool, device: &str) {
     for count in [1u32, 41, 200] {
         let prompt: Vec<u32> = (0..count).map(|t| (t * 7 + 11) % vocab.min(4096)).collect();
         let run = |tuning| logits(&trace, &container, &profiles, device, tuning, &prompt);
-        // A shape's first load times its tactics (each trial a fire), so the
-        // rows a declined mega-MoE is held to are each a second load's.
+        // The rows a declined mega-MoE is held to are each a second load's.
         let warm = |tuning| {
             run(tuning);
             run(tuning)

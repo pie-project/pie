@@ -77,12 +77,6 @@ seat_to_end = true
 dag_streams = true
 branches = true
 
-[rates]
-# 149.7 TFLOPS dense bf16 (NVIDIA A40 datasheet; 299.4 with sparsity).
-bf16_flops_per_ns_by_rows_n_k = [[4096, 4096, 4096, 149700.0]]
-# 696 GB/s of GDDR6 (A40 datasheet).
-bytes_per_ns = 696.0
-
 [provenance]
 source = "pie tune (quick, gptoss-20b) on RunPod; 512-token prompt 64.9 -> 63.9 ms, 1-lane step 5.60 -> 5.54 ms, 4-lane step 8.86 -> 8.47 ms, 8-lane step 14.19 -> 13.23 ms, readout cosine 1.0000"
 measured = [

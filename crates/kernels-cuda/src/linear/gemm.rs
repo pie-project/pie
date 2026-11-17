@@ -1,7 +1,6 @@
-//! Host-only: the dense products on the vendor's libraries. `cublas` runs
-//! the cuBLAS and cuBLASLt tactics a profile's table names for a bf16
-//! product (`pie tune` times those it lacks); `cublas_lt_fp8` is
-//! cuBLASLt's fp8 product over `act_quant`'s scales.
+//! Host-only: the dense products on the vendor's libraries. `cublas` runs a
+//! bf16 product on cuBLASLt's first heuristic algorithm for its shape;
+//! `cublas_lt_fp8` is cuBLASLt's fp8 product over `act_quant`'s scales.
 
 use crate::error::Error;
 
@@ -14,7 +13,7 @@ use dtype::Dtype;
 #[cfg(feature = "cuda")]
 pub(crate) mod cublas;
 #[cfg(feature = "cuda")]
-pub use cublas::{Tactics, install_tactics, time_tactics, timed, untuned};
+pub use cublas::tile;
 #[cfg(feature = "cuda")]
 pub mod cublas_lt_fp8;
 

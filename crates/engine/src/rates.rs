@@ -1,67 +1,49 @@
 //! What every backend's `pie tune <backend> --rates` times, and how it
-//! counts the work: one lattice of shapes, model-independent, so a profile's
-//! `[rates]` (`profile::fire::Rates`) mean the same on every backend and
-//! the estimate (`crate::load::FireEstimate`) reads them the same way. Each
-//! backend times these shapes through its own kernels and its own clock;
-//! the counts here turn its times into rates, and [`tuned`] and
-//! [`provenance`] write them.
+//! counts the work: a few large shapes, model-independent, whose times give
+//! the device's roofline constants (`profile::fire::Rates`), so a profile's
+//! `[rates]` mean the same on every backend and the estimate
+//! (`crate::load::FireEstimate`, over `crate::roofline`) reads them the
+//! same way. Each backend times these shapes through its own kernels and its
+//! own clock; the counts here (each the work as the device runs it, its
+//! waves over the device's SMs: `crate::roofline::Machine`) turn its times
+//! into rates, and [`tuned`] and [`provenance`] write them.
 //!
-//! - `bf16_flops_per_ns_by_rows_n_k`: a bf16 matmul of `m` rows, `n`
-//!   columns and depth `k` at each `m` of the engine's own rung lattice
-//!   (the rows its loads lay fires at, which its rates step times exactly;
-//!   no lattice is engine::rates') and each `n` and
-//!   each `k` of [`DEPTHS`] (a serving projection is seldom square: a gate
-//!   and up leg runs wide and shallow, a down leg narrow and deep),
-//!   [`gemm_flops`] a matmul over its time.
-//! - `attn_flops_per_ns_by_keys_and_dim`: the backend's prefill attention
-//!   at [`ATTN_SHAPE`]'s heads, one sequence of `keys` rows attending itself
-//!   at each `keys` of the engine's lattice to its saturation top
-//!   ([`attn_keys`]) and head width `d` of [`ATTN_DIMS`]
-//!   ([`AttnShape::at`], [`AttnShape::with_dim`]), its pages laid in the pool
-//!   in [`attn_page_order`], through the attention kernel serving selects at
-//!   that shape, [`attn_flops`] over its time.
-//! - `scan_elements_per_ns_by_tokens`: at each `tokens` of [`SCAN_TOKENS`]
-//!   ([`ScanShape::at`]), over [`scan_sets_at`] cold sets, the backend's
-//!   prefill gated-delta scan and the
-//!   causal conv before it at [`SCAN_SHAPE`], [`scan_elements`] over the two
-//!   together's time.
-//! - `bytes_per_ns`: a copy of device memory, every byte read and written.
 //! - `launch_ns`: what a dispatch adds to its work in a chain of dependent
 //!   ones submitted as serving submits them (a captured graph, one command
 //!   buffer, one encoder): a chain of `n` tiny kernels, each reading the one
 //!   before's output, against one kernel doing the chain's whole work, at
-//!   each `n` of [`LAUNCH_CHAINS`] ([`launch_from`]). Where a backend
-//!   overlaps its launches the gap comes out small; where it serializes
-//!   them, it is what each adds.
+//!   each `n` of [`LAUNCH_CHAINS`] ([`launch_from`]).
+//! - `gemm_tflops`: a bf16 matmul at each of [`GEMM_SHAPES`] (large and
+//!   square-ish, after [`warm_up`]), its waves' flops
+//!   (`crate::roofline::Machine::gemm_flops`) over its time; the fastest.
+//! - `attn_tflops`: the backend's prefill attention at [`ATTN_SHAPE`] over
+//!   [`ATTN_KEYS`] keys (one sequence attending itself, its pages laid in
+//!   [`attn_page_order`]), [`attn_flops`] times its wave factor over its
+//!   time, at head width 128 ([`ATTN_DIMS`]' others stated beside it).
+//! - `hbm_gbps`: a copy of device memory, every byte read and written.
+//! - `scan_gelems`: the prefill gated-delta scan and the causal conv before
+//!   it at [`SCAN_SHAPE`], [`scan_elements`] over the two together's time.
 
-/// The bytes the rates step lays on the device at once, at most, for a
-/// largest fire of `top` rows: the largest of the warm-up's planes and
-/// operands, one grid shape's rotation and operands, one attention point's
-/// cold sets, one scan point's cold sets, and the copy's two buffers. What
-/// the step's device binds, so it needs no load budget.
+/// The bytes the rates step lays on the device at once, at most: the
+/// largest of a matmul shape's rotation and operands, the attention's cold
+/// sets, the scan's cold sets and the copy's two buffers. What the step's
+/// device binds, so it needs no load budget.
 #[must_use]
-pub fn step_bytes(top: u32) -> u64 {
+pub fn step_bytes() -> u64 {
     let bf16 = |elements: u64| elements * 2;
-    let (wm, wn, wk) = WARM_SHAPE;
-    let warm = bf16(u64::from(wm) * u64::from(wk))
-        + weights_at(wn, wk) as u64 * bf16(u64::from(wn) * u64::from(wk))
-        + bf16(u64::from(wm) * u64::from(wn));
-    let rows = u64::from(top.max(1));
-    let grid = DEPTHS
+    let gemm = GEMM_SHAPES
         .iter()
-        .flat_map(|&k| DEPTHS.iter().map(move |&n| (n, k)))
-        .map(|(n, k)| {
-            bf16(rows * u64::from(k))
+        .chain(std::iter::once(&WARM_SHAPE))
+        .map(|&(m, n, k)| {
+            bf16(u64::from(m) * u64::from(k))
                 + weights_at(n, k) as u64 * bf16(u64::from(n) * u64::from(k))
-                + bf16(rows * u64::from(n))
+                + bf16(u64::from(m) * u64::from(n))
         })
         .max()
         .unwrap_or(0);
-    // The attention's keys run to `top`: its sets hold about
-    // ATTN_SET_BYTES at every point, the widest's one set past it.
     let attn = ATTN_DIMS
         .iter()
-        .map(|&d| ATTN_SHAPE.at(top.max(1)).with_dim(d))
+        .map(|&d| ATTN_SHAPE.at(ATTN_KEYS).with_dim(d))
         .map(|s| {
             let q = u64::from(s.rows) * u64::from(s.q_heads * s.head_dim);
             let kv = 2 * u64::from(s.keys.div_ceil(16) * 16) * u64::from(s.kv_heads * s.head_dim);
@@ -69,27 +51,29 @@ pub fn step_bytes(top: u32) -> u64 {
         })
         .max()
         .unwrap_or(0);
-    let scan = SCAN_TOKENS
-        .iter()
-        .map(|&t| {
-            let s = SCAN_SHAPE.at(t);
-            let rows = u64::from(s.tokens) * u64::from(s.channels());
-            let state = u64::from(s.conv_width * s.channels() + s.v_heads * s.k_dim * s.v_dim);
-            scan_sets_at(s) as u64 * (bf16(rows) + 4 * state) + bf16(rows) * 2
-        })
-        .max()
-        .unwrap_or(0);
+    let scan = {
+        let s = SCAN_SHAPE;
+        let rows = u64::from(s.tokens) * u64::from(s.channels());
+        let state = u64::from(s.conv_width * s.channels() + s.v_heads * s.k_dim * s.v_dim);
+        scan_sets_at(s) as u64 * (bf16(rows) + 4 * state) + bf16(rows) * 2
+    };
     let copy = 2 * (256u64 << 20);
-    warm.max(grid).max(attn).max(scan).max(copy)
+    gemm.max(attn).max(scan).max(copy)
 }
 
-/// The depths the matmul grid is measured at (its columns the same): the
-/// contractions of the dense layers served, from a small model's 1024
-/// (Qwen3-0.6B's hidden) through 4096 (Qwen3-8B's) and 8192 (a 30B-class
-/// hidden) to 16384, past the down projections of the 8B and Llama-class
-/// MLPs (12288 and 14336 deep), so none is priced at a clamped point; a
-/// device's rate at the same rows falls with the depth (a narrower
-/// contraction feeds fewer tiles).
+/// The matmuls `gemm_tflops` is the fastest of, `m x n x k`: large and
+/// square-ish, every tile filled over many waves on any device served.
+pub const GEMM_SHAPES: [(u32, u32, u32); 2] = [(4096, 4096, 4096), (8192, 8192, 8192)];
+
+/// The keys (and rows) the attention rate is timed at: long, so its
+/// work-groups fill many waves.
+pub const ATTN_KEYS: u32 = 8192;
+
+/// The depths (and columns) of the matmul shapes the fire top is derived
+/// over (`crate::roofline::fire_top`): the contractions of the dense layers
+/// served, from a small model's 1024 (Qwen3-0.6B's hidden) through 4096
+/// (Qwen3-8B's) and 8192 (a 30B-class hidden) to 16384, past the down
+/// projections of the 8B and Llama-class MLPs (12288 and 14336 deep).
 pub const DEPTHS: [u32; 5] = [1024, 2048, 4096, 8192, 16384];
 
 /// The flops of one matmul of `rows`, `n` columns and depth `k`: two a
@@ -248,21 +232,7 @@ pub fn spread_order(len: usize) -> Vec<usize> {
         .collect()
 }
 
-/// A matmul's cost a row at `m` rows of `n` columns and depth `k`, at
-/// `rate` flops a ns with its launch taken off (`rate_from`): its launch
-/// and its work over its rows. A gap-bound point (`rate` infinite) costs
-/// its launch alone.
-#[must_use]
-pub fn gemm_cost_per_row(m: u32, n: u32, k: u32, rate: f64, launch_ns: f64) -> f64 {
-    let work = if rate.is_finite() && rate > 0.0 {
-        gemm_flops(m, n, k) / rate
-    } else {
-        0.0
-    };
-    (launch_ns + work) / f64::from(m.max(1))
-}
-
-/// Where a matmul grid saturates on its lattice ([`saturate`]): `rows`
+/// Where a matmul's cost a row saturates on a lattice ([`saturate`]): `rows`
 /// (the lattice's `top`-th point) the last where some shape's cost a row
 /// fell more than [`AGREEMENT`] below the least it took at any row before,
 /// none doing so from there through `through`, a doubling or more past it;
@@ -308,12 +278,13 @@ fn doubling_past(lattice: &[u32], i: usize) -> usize {
         .unwrap_or(lattice.len() - 1)
 }
 
-/// The rates step's matmul walk, one rule for every engine: `lattice`
+/// The fire top's walk, one rule for every engine (over the roofline's
+/// costs: `crate::roofline::fire_top`): `lattice`
 /// (the engine's own rung lattice, ascending, up to its ceiling) walked by
 /// each of `shapes` (in [`spread_order`]) ascending, each alone until it
 /// has a doubling of rows measured past its last gain, then every shape
 /// filled to the widest row any reached, until the last gain of any has a
-/// doubling measured past it. A row improves where some shape's cost a row
+/// doubling reached past it. A row improves where some shape's cost a row
 /// falls more than [`AGREEMENT`] below the least it took at any row before
 /// (a tile's padding repeats each doubling, so a cost a row zigzags within
 /// one and a step-to-step gain is no improvement); the top is the last such
@@ -322,10 +293,9 @@ fn doubling_past(lattice: &[u32], i: usize) -> usize {
 /// grow, so no rung past it can be chosen. The walk ends at the ceiling
 /// where it reaches it.
 ///
-/// `measure(shape, row, fresh)` times shape `shape` at `lattice[row]` and
-/// returns its rate and its cost a row ([`gemm_cost_per_row`]); `fresh` is
-/// set on the first row of each run of one shape (where an engine lays its
-/// operands). Returns each shape's rates over the rows it walked, and the
+/// `measure(shape, row, fresh)` prices shape `shape` at `lattice[row]` and
+/// returns a rate and its cost a row; `fresh` is set on the first row of
+/// each run of one shape. Returns each shape's rates over the rows it walked, and the
 /// [`Saturation`].
 pub fn saturate<E>(
     lattice: &[u32],
@@ -415,40 +385,6 @@ pub fn attn_sets_at(shape: AttnShape, page: u32) -> usize {
     ATTN_SET_BYTES.div_ceil((q_bytes + kv_bytes).max(1)).max(2)
 }
 
-/// The keys the attention is timed at, each a sequence of as many rows
-/// attending itself: the engine's own rung lattice to its saturation `top`
-/// (a rung's prompt attends as many keys as its rows, so its rate is read
-/// where it was timed, not between rows, where a kernel's wave quantization
-/// moves it).
-#[must_use]
-pub fn attn_keys(lattice: &[u32], top: u32) -> Vec<u32> {
-    lattice
-        .iter()
-        .copied()
-        .take_while(|&rows| rows <= top)
-        .collect()
-}
-
-/// The rates step's attention, one rule for every engine: at each head
-/// width of [`ATTN_DIMS`] and each of [`attn_keys`] (`lattice` to `top`),
-/// [`ATTN_SHAPE`] at those keys and that width, timed by `measure` (its
-/// rate in flops a ns, the launch taken off). Returns `(keys, d, rate)`
-/// grouped by width, as `attn_flops_per_ns_by_keys_and_dim` states them.
-pub fn attention_at_rows<E>(
-    lattice: &[u32],
-    top: u32,
-    mut measure: impl FnMut(AttnShape) -> Result<f64, E>,
-) -> Result<Vec<(u32, u32, f64)>, E> {
-    let keys = attn_keys(lattice, top);
-    let mut out = Vec::with_capacity(keys.len() * ATTN_DIMS.len());
-    for d in ATTN_DIMS {
-        for &k in &keys {
-            out.push((k, d, measure(ATTN_SHAPE.at(k).with_dim(d))?));
-        }
-    }
-    Ok(out)
-}
-
 /// A prefill attention the attention rate is timed at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AttnShape {
@@ -507,10 +443,10 @@ pub fn attn_page_order(pages: u32) -> Vec<u32> {
         .collect()
 }
 
-/// The head widths the attention grid is measured at: the widths of the
-/// models served (64 for the small and older ones, 128 for most, 256 for
-/// Qwen3.5's and Gemma's global layers), since a kernel's rate a flop moves
-/// with the width its tiles hold.
+/// The head widths the attention is timed at: the widths of the models
+/// served (64 for the small and older ones, 128 for most, 256 for Qwen3.5's
+/// and Gemma's global layers). `attn_tflops` is 128's; the others are
+/// stated beside it, so a width whose rate departs from it shows.
 pub const ATTN_DIMS: [u32; 3] = [64, 128, 256];
 
 impl AttnShape {
@@ -556,11 +492,6 @@ pub struct ScanShape {
     /// The causal conv's taps over the scan's `qkv` channels.
     pub conv_width: u32,
 }
-
-/// The prompt lengths the scan curve is measured at: the attention's keys
-/// (a scan's rate a token grows with the chunk it walks, as a paged
-/// attention's with its keys).
-pub const SCAN_TOKENS: [u32; 6] = [512, 1024, 2048, 4096, 8192, 16384];
 
 /// The scan sets the timed scans of `shape` rotate through: [`ATTN_SET_BYTES`]
 /// of the shape's input rows (bf16) and its conv and scan state (f32), and
@@ -627,12 +558,17 @@ pub fn tuned(rates: &profile::fire::Rates) -> String {
 /// matmul kernel, its clock).
 #[must_use]
 pub fn provenance(backend: &str, how: &str) -> (&'static str, String) {
+    let shapes: Vec<String> = GEMM_SHAPES
+        .iter()
+        .map(|(m, n, k)| format!("{m}x{n}x{k}"))
+        .collect();
     let text = format!(
-        "pie tune {backend} --rates on {} (pie {}): {how}; at engine::rates' lattice (matmul \
-         m x n x k, m the rung lattice to its saturation point, n and k 1024..16384; attention keys \
-         x keys, keys the same rows, {}/{} heads of 64..256; scan {} tokens, {}/{} heads of {}x{}, conv {})",
+        "pie tune {backend} --rates on {} (pie {}): {how}; at engine::rates' shapes (matmul {}; \
+         attention {ATTN_KEYS} keys x keys, {}/{} heads of 128; scan {} tokens, {}/{} heads of \
+         {}x{}, conv {})",
         today(),
         env!("CARGO_PKG_VERSION"),
+        shapes.join(", "),
         ATTN_SHAPE.q_heads,
         ATTN_SHAPE.kv_heads,
         SCAN_SHAPE.tokens,
@@ -798,24 +734,6 @@ mod tests {
     }
 
     #[test]
-    fn the_attention_is_timed_at_the_lattice_rows_to_the_top() {
-        // CUDA's (63876a684): every grid row to the saturation point, each
-        // head width.
-        let lattice = [1, 2, 4, 280, 305, 4096, 4467, 4871];
-        assert_eq!(attn_keys(&lattice, 4467), [1, 2, 4, 280, 305, 4096, 4467]);
-        let mut timed = Vec::new();
-        let points = attention_at_rows(&lattice, 305, |s| {
-            timed.push((s.keys, s.rows, s.head_dim));
-            Ok::<_, ()>(f64::from(s.keys))
-        })
-        .unwrap();
-        assert_eq!(points.len(), 5 * ATTN_DIMS.len());
-        assert!(timed.iter().all(|&(k, r, _)| k == r));
-        assert_eq!(points[0], (1, ATTN_DIMS[0], 1.0));
-        assert_eq!(points[4], (305, ATTN_DIMS[0], 305.0));
-    }
-
-    #[test]
     fn the_walk_stops_a_shape_a_doubling_past_its_last_gain() {
         // One shape flat from 64: the walk times it to 128 (a doubling past
         // its last gain) and no further.
@@ -833,7 +751,7 @@ mod tests {
 
     #[test]
     fn the_lattice_ascends_and_the_counts_are_the_estimates() {
-        assert!(step_bytes(10240) >= 6 << 30, "a 16384^2 rotation");
+        assert!(step_bytes() >= 1 << 30, "an 8192^2 rotation");
         assert!(DEPTHS.windows(2).all(|w| w[0] < w[1]));
         assert_eq!(weights_at(1024, 1024), 384);
         assert_eq!(weights_at(16384, 1024), 24);
@@ -849,7 +767,6 @@ mod tests {
         assert_eq!(SCAN_SHAPE.at(512).tokens, 512);
         assert!(scan_sets_at(SCAN_SHAPE.at(512)) >= 2);
         assert!(scan_sets_at(SCAN_SHAPE.at(512)) > scan_sets_at(SCAN_SHAPE.at(16384)));
-        assert!(SCAN_TOKENS.windows(2).all(|w| w[0] < w[1]));
         for pages in [1, 2, 7, 32, 1024, 7919, 15838] {
             let mut order = attn_page_order(pages);
             let in_order = order.windows(2).all(|w| w[0] < w[1]);
@@ -966,27 +883,22 @@ mod tests {
     #[test]
     fn the_writer_writes_what_the_profile_reads() {
         let rates = profile::fire::Rates {
-            bf16_flops_per_ns_by_rows_n_k: Some(vec![
-                (16, 2048, 1024, 100.0),
-                (8192, 2048, 1024, 900.5),
-            ]),
-            attn_flops_per_ns_by_keys_and_dim: Some(vec![(512, 128, 40.0), (16384, 128, 50.0)]),
-            scan_elements_per_ns_by_tokens: Some(vec![(2048, 7.0)]),
-            bytes_per_ns: Some(800.0),
             launch_ns: Some(3500),
+            gemm_tflops: Some(181.5),
+            attn_tflops: Some(120.0),
+            hbm_gbps: Some(800.0),
+            scan_gelems: Some(7.0),
         };
         assert_eq!(
             tuned(&rates),
-            "[rates]\nbf16_flops_per_ns_by_rows_n_k = [\n  [16, 2048, 1024, 100.0],\n  [8192, 2048, \
-             1024, 900.5],\n]\n\
-             attn_flops_per_ns_by_keys_and_dim = [\n  [512, 128, 40.0],\n  [16384, 128, 50.0],\n]\nscan_elements_per_ns_by_tokens = [[2048, 7.0]]\nbytes_per_ns = 800.0\n\
-             launch_ns = 3500\n"
+            "[rates]\nlaunch_ns = 3500\ngemm_tflops = 181.5\nattn_tflops = 120.0\nhbm_gbps = \
+             800.0\nscan_gelems = 7.0\n"
         );
         let (key, text) = provenance("vulkan", "the matmul through Coopmat");
         assert_eq!(key, "rates");
         assert!(text.starts_with("\"pie tune vulkan --rates on "), "{text}");
         assert!(
-            text.contains("the matmul through Coopmat; at engine::rates' lattice"),
+            text.contains("the matmul through Coopmat; at engine::rates' shapes"),
             "{text}"
         );
     }

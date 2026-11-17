@@ -67,35 +67,13 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         }
     };
     device.set_tuning(kernels_cuda::tuning::Tuning::of(&chip));
-    #[cfg(feature = "cuda")]
-    {
-        let user = boot
-            .knobs
-            .profiles
-            .as_deref()
-            .map(|profiles| crate::chip::user_gemm_table(profiles, device.name()));
-        let tactics = kernels_cuda::linear::gemm::install_tactics(
-            crate::chip::gemm_table(device.name()),
-            user,
-        );
-        if let Some((table, here)) = &tactics.stale {
-            eprintln!(
-                "engine-cuda: a dense GEMM tactic table is not read: it was timed under \
-                 `{table}`, and this is `{here}`; `pie tune` on this machine times it again"
-            );
-        }
-        eprintln!(
-            "engine-cuda: dense GEMM tactics from the profile's tables: {} checked in, {} the \
-             user's; a product they lack runs cuBLAS's own pick, and nothing is timed",
-            tactics.from_profile, tactics.from_user,
-        );
-    }
     let engine = crate::chip::Engine::of(&chip);
-    // The card's fire top: the widest row its profile's grid was timed at,
-    // its saturation point (`crate::rates::Saturation`): past it no rung's
-    // efficiency improves, so none past it can be chosen.
-    // A load asked nothing fires up to it, and the estimate picks below.
-    let fire_top = crate::api::fire_top_of(&chip, device.name())?;
+    // The device the roofline weighs a fire on, and its fire top
+    // (`crate::api::fire_top_of`): past it no rung's efficiency improves, so
+    // none past it can be chosen. A load asked nothing fires up to it, and
+    // the estimate picks below.
+    let machine = crate::top::machine(&chip, device.device().num_sm);
+    let fire_top = crate::api::fire_top_of(&chip, &machine, device.name())?;
     if boot.budget.max_tokens == 0 {
         boot.budget.max_tokens = fire_top;
         // only where it at least halves the fire: a trunk of few value heads seats enough lanes that the
@@ -401,7 +379,14 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             computed,
         );
         let counts = crate::top::counts(&boot.trace)?;
-        let top = crate::top::choose(&rungs, after_weights, &chip.rates(), device.name(), &counts)?;
+        let top = crate::top::choose(
+            &rungs,
+            after_weights,
+            &chip.rates(),
+            &machine,
+            device.name(),
+            &counts,
+        )?;
         eprintln!(
             "engine-cuda: {}",
             engine::load::line_of(
@@ -412,7 +397,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
                 chip.tuned()
             )
         );
-        weighed = engine::load::estimate(&counts, &chip.rates())
+        weighed = engine::load::estimate(&counts, &chip.rates(), &machine)
             .ok()
             .map(|estimate| crate::top::Weighed {
                 rungs: rungs.clone(),
