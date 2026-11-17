@@ -763,6 +763,11 @@ pub struct Shell<B: Serve> {
 
     masked: poem_ir::ClassSet,
 
+    /// The classes whose kv-less lanes may state a group mask: they run a
+    /// ragged attention over attention groups, whose kernel reads the mask
+    /// in an arm of its own ([`Shell::group_masks_of`]).
+    group_masked: poem_ir::ClassSet,
+
     corrected: poem_ir::ClassSet,
 
     /// The classes a decode fire is of: the lattice the load arms
@@ -1121,6 +1126,34 @@ impl<B: Serve> Shell<B> {
             if runs_masked {
                 for class in region.mask.iter() {
                     masked.insert(class);
+                }
+            }
+        }
+
+        let group_packed = |id: ValueId| {
+            matches!(
+                boot.trace.values.get(id.0 as usize).map(|decl| &decl.def),
+                Some(poem_ir::Def::Input(RuntimeInput::Geometry {
+                    kind: poem_ir::GeomKind::GroupIndptr { .. },
+                    ..
+                }))
+            )
+        };
+        let mut group_masked = poem_ir::ClassSet::default();
+        for region in compiled.template() {
+            let runs_grouped = region.nodes.clone().any(|node| {
+                matches!(
+                    boot.trace.nodes.get(node as usize).map(|node| &node.op),
+                    Some(poem_ir::Operation::Attn(poem_ir::Attn::Ragged {
+                        q_indptr,
+                        kv_indptr,
+                        ..
+                    })) if group_packed(*q_indptr) && group_packed(*kv_indptr)
+                )
+            });
+            if runs_grouped {
+                for class in region.mask.iter() {
+                    group_masked.insert(class);
                 }
             }
         }
@@ -1615,6 +1648,7 @@ impl<B: Serve> Shell<B> {
 
             copies: false,
             masked,
+            group_masked,
             corrected,
             decoding,
             decode_shapes,
@@ -5543,6 +5577,10 @@ impl<B: Serve> Shell<Named<B>> {
     /// Stages and walks one fire of `lanes`, each a class and its rows, and
     /// notes into `found` the regions it ran and what each dispatched.
     ///
+    /// With `group_mask`, each lane is kv-less and states a group mask
+    /// admitting every row of its group, as a serving lane of the class
+    /// may ([`Shell::group_masks_of`]).
+    ///
     /// A fire the kernels refuse is answered with the refusal: a serving
     /// fire of these classes is refused in the same words at the same
     /// kernel, before it asks for a pipeline past it, so its regions count
@@ -5550,16 +5588,28 @@ impl<B: Serve> Shell<Named<B>> {
     fn name_fire(
         &mut self,
         lanes: &[(usize, u32)],
+        group_mask: bool,
         found: &mut Found,
     ) -> Result<Option<poem_exec::KernelError>> {
-        let owned = lanes
+        let mut owned = lanes
             .iter()
             .map(|&(class, rows)| self.naming_lane(class, rows))
             .collect::<Result<Vec<NamingLane<Named<B>>>>>()?;
+        if group_mask {
+            for lane in &mut owned {
+                let rows = lane.tokens.len() as u32;
+                lane.mask = Some(Masking::Rows(
+                    (0..rows)
+                        .map(|_| engine::fire::Mask::new(vec![0, rows], u64::from(rows)))
+                        .collect(),
+                ));
+            }
+        }
         let seated: Vec<Seated<'_, Named<B>>> = owned
             .iter()
             .enumerate()
             .map(|(at, lane)| Seated {
+                kv_less: group_mask,
                 mask: lane.mask.as_ref(),
                 adapter: lane.adapter,
                 inputs: &lane.inputs,
@@ -5720,7 +5770,19 @@ impl<B: Serve> Shell<Named<B>> {
             let mut found = Found::new(regions);
             for class in 0..classes {
                 let lanes = self.alone(class, u64::from(tokens));
-                if let Some(refusal) = self.name_fire(&lanes, &mut found)?
+                // A class whose kv-less lanes may state a group mask is
+                // named with one too: the ragged kernel reads it in an arm
+                // of its own.
+                let stated: &[bool] = if self.group_masked.contains(class) {
+                    &[false, true]
+                } else {
+                    &[false]
+                };
+                let mut refused = None;
+                for &group_mask in stated {
+                    refused = refused.or(self.name_fire(&lanes, group_mask, &mut found)?);
+                }
+                if let Some(refusal) = refused
                     && !unservable.iter().any(|held| held.class == class)
                 {
                     tracing::warn!(
@@ -5745,7 +5807,7 @@ impl<B: Serve> Shell<Named<B>> {
                     .collect();
                 for trio in self.cuts(&refused) {
                     let lanes = trio.map(|class| (class, rows));
-                    if let Some(refusal) = self.name_fire(&lanes, &mut found)? {
+                    if let Some(refusal) = self.name_fire(&lanes, false, &mut found)? {
                         mixes.push((trio, refusal));
                     }
                 }
