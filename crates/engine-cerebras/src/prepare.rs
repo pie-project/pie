@@ -343,6 +343,18 @@ fn compile(cfg: &Config, cache: &Cache, trace: &Trace, plan: &Plan, levers: &str
     Ok(dir.join("out"))
 }
 
+/// The steps a request of `trace`'s generative schedule denoises over: its pinned sigmas' (1
+/// where it pins none, or states no schedule).
+fn schedule_steps(trace: &Trace) -> u32 {
+    poem_compiler::catalog::repository()
+        .parse(&trace.name)
+        .and_then(|m| m.try_generative().ok().flatten())
+        .and_then(|g| g.schedule)
+        .map_or(1, |s| {
+            u32::try_from(s.pinned_sigmas.len()).unwrap_or(1).max(1)
+        })
+}
+
 /// A stream model's programs (GENERIC.md M1h), compiled on load into the cache unless it holds
 /// them: each reading of the trace's `reading` switch that the stream compiler lowers, at
 /// `[cerebras.wafer] stream_rows` rows a class, linked by cslc for the fabric the engine runs
@@ -360,11 +372,12 @@ pub fn stream_programs(
     cfg: &Config,
     trace: &Trace,
     host: bool,
+    voxels: Option<u32>,
 ) -> R<Option<Vec<(PathBuf, PathBuf)>>> {
     use kernels_cerebras::stream;
-    let Some(switch) = trace.facts.declared("reading") else {
+    if trace.facts.declared("reading").is_none() {
         return Ok(None);
-    };
+    }
     let rows = cfg
         .wafer
         .stream_rows
@@ -376,34 +389,31 @@ pub fn stream_programs(
         .map_err(io(&cache.root))?;
     let mut names = Vec::new();
     let mut hasher = blake3::Hasher::new();
-    for reading in &switch.values {
-        let o = stream::Options {
-            reading: reading.clone(),
+    // the readings' programs chosen together: each one's regime and shape, the cheapest request
+    // (the schedule's steps of the denoiser) of those that place together on the fabric
+    let wanted = stream::wanted(trace, rows, voxels, schedule_steps(trace));
+    let t0 = std::time::Instant::now();
+    let (chosen, refused) =
+        stream::compile_together(trace, &wanted, &|r| stage.path().join(slug(r)))?;
+    for (reading, e) in &refused {
+        tracing::warn!(reading = %reading, "cerebras: a reading the stream compiler refuses is not served: {e}");
+        let _ = std::fs::remove_dir_all(stage.path().join(slug(reading)));
+    }
+    for (reading, p) in &chosen {
+        tracing::info!(
+            reading = %reading,
             rows,
-            round16: true,
-            upto: None,
-            taps: Vec::new(),
-        };
+            regime = ?p.regime,
+            w = p.w,
+            h = p.h,
+            cycles = p.cycles,
+            s = t0.elapsed().as_secs_f64(),
+            "cerebras: a stream reading compiled"
+        );
+    }
+    for (reading, _) in &chosen {
         let dir = stage.path().join(slug(reading));
-        let t0 = std::time::Instant::now();
-        match stream::compile_reading(trace, &o, &dir) {
-            Ok((w, h)) => {
-                tracing::info!(
-                    reading = %reading,
-                    rows,
-                    w,
-                    h,
-                    s = t0.elapsed().as_secs_f64(),
-                    "cerebras: a stream reading compiled"
-                );
-                names.push(reading.clone());
-            }
-            Err(e) => {
-                tracing::warn!(reading = %reading, "cerebras: a reading the stream compiler refuses is not served: {e}");
-                let _ = std::fs::remove_dir_all(&dir);
-                continue;
-            }
-        }
+        names.push(reading.clone());
         let mut files: Vec<PathBuf> = walk(&dir)?;
         files.sort();
         hasher.update(reading.as_bytes());

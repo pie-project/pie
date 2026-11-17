@@ -257,7 +257,8 @@ impl Engine for CerebrasEngine {
                 } else {
                     // a model the decode program does not run: its stream readings, compiled here
                     let streamed = if self.debug.program.is_none() {
-                        prepare::stream_programs(&self.cfg, &trace, host).map_err(Error::Load)?
+                        prepare::stream_programs(&self.cfg, &trace, host, budgets.max_voxels)
+                            .map_err(Error::Load)?
                     } else {
                         None
                     };
