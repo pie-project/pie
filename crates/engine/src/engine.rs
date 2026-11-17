@@ -105,6 +105,16 @@ pub trait Engine: Send {
         Err(self.unsupported("register_program"))
     }
 
+    /// Builds what registering each of `registrations` would build (a
+    /// backend's compiled guest code), without registering any: the
+    /// runtime's prewarm of the programs its standard samplers register,
+    /// before ready, so a registration of one of them builds nothing
+    /// (`crate::live::Tally::BuiltAfterReady`). The default builds nothing.
+    fn prewarm_programs(&mut self, registrations: &[ProgramRegistration]) -> Result<()> {
+        let _ = registrations;
+        Ok(())
+    }
+
     /// What an instance of a registered program holds in the pool's
     /// `Instance` and `Channel` slots, asked before the runtime takes them
     /// and binds. The default states none: the engine keeps its tables and

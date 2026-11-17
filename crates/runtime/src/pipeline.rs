@@ -4,6 +4,7 @@ pub mod fire;
 pub mod instance;
 pub mod media;
 pub mod program;
+pub mod standard;
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};

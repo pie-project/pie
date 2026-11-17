@@ -66,6 +66,10 @@ pub trait Decision: Sized + Clone + Send + Sync + 'static {
 #[derive(Clone, Debug)]
 pub struct Ladder<T> {
     rungs: Vec<(Region, T)>,
+    /// Per rung, whether its value is a partial alternative: one that may
+    /// not fit a shape its region holds, which then falls to the rungs
+    /// after it.
+    partial: Vec<bool>,
     /// Raised when the ladder is evaluated at a point (`Profile::read`).
     read: Arc<AtomicBool>,
 }
@@ -77,6 +81,15 @@ impl<T: Decision> Ladder<T> {
             rungs: rungs
                 .iter()
                 .map(|r| (r.region.clone(), T::build(&r.pick)))
+                .collect(),
+            partial: rungs
+                .iter()
+                .map(|r| match (&r.pick, T::spec().shape) {
+                    (Pick::Alternative { index, .. }, crate::spec::Shape::Choice(alts)) => {
+                        alts[*index].partial
+                    }
+                    _ => false,
+                })
                 .collect(),
             read: Arc::new(AtomicBool::new(false)),
         }
@@ -142,6 +155,31 @@ impl<T: Decision> Ladder<T> {
             .iter()
             .filter(move |(region, _)| !region.intersect(&cell).is_empty())
             .map(|(_, value)| value)
+    }
+
+    /// Every rung some shape of `cell` picks, in order: one whose region
+    /// meets what the rungs before it leave of the cell. A rung on a
+    /// partial alternative leaves its region to the rungs after it, since
+    /// it may not fit a shape there. For code that must name every value a
+    /// range of shapes picks, and none it never picks.
+    pub fn reached(&self, cell: &[Set]) -> Vec<&T> {
+        self.mark();
+        let space = space(T::spec().vars);
+        let mut left = Region::full(cell);
+        let mut reached = Vec::new();
+        for ((region, value), partial) in self.rungs.iter().zip(&self.partial) {
+            if left.is_empty() {
+                break;
+            }
+            if region.intersect(&left).is_empty() {
+                continue;
+            }
+            reached.push(value);
+            if !partial {
+                left = left.minus(region, &space);
+            }
+        }
+        reached
     }
 
     /// Every value the ladder can pick, for sizing an envelope.

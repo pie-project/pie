@@ -1,4 +1,5 @@
 #![allow(unsafe_code)]
+use std::collections::BTreeMap;
 use std::mem::size_of;
 use std::sync::Arc;
 
@@ -110,6 +111,25 @@ const STORAGE_F32: u32 = 0;
 const STORAGE_BF16: u32 = 1;
 
 const STORAGE_I32: u32 = 2;
+
+/// A seat whose `at` is a table of row addresses (a `ulong` a row), each
+/// row bf16: a lane-0 read whose rows are seated at the instance's lanes,
+/// row r at lane r's seat.
+const STORAGE_BF16_ROWS: u32 = 3;
+
+/// As [`STORAGE_BF16_ROWS`], each row f32.
+const STORAGE_F32_ROWS: u32 = 4;
+
+/// The row tables a stage of `plan` takes: one for each float output read,
+/// `rows` addresses each (the load's readout rows a lane bound them).
+fn row_table_bytes(plan: &LaunchStagePlan, rows: u32) -> u64 {
+    let reads = plan
+        .ops
+        .iter()
+        .filter(|op| op.tag == tags::OUTPUT && op.dtype != Dtype::I32)
+        .count() as u64;
+    (reads * u64::from(rows.max(1)) * 8).max(8)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChannelShape {
@@ -371,6 +391,18 @@ struct Slot {
     base: Buffer,
     offset: u64,
     width: u32,
+    /// Its row pitch, in elements, and how it is stored.
+    stride: u32,
+    storage: u32,
+}
+
+impl Slot {
+    /// The GPU address of row `row` of this seat.
+    fn row_at(&self, row: u32) -> Result<u64> {
+        let element = if matches!(self.storage, STORAGE_BF16 | STORAGE_BF16_ROWS) { 2 } else { 4 };
+        Ok(address_of(&self.base, self.offset)?
+            + u64::from(row) * u64::from(self.stride.max(self.width)) * element)
+    }
 }
 
 /// How a stage reads an output slot: through the readout plane, or its
@@ -437,6 +469,11 @@ struct Grouped {
     row_meta: Held,
     row_indices: Held,
     readout_rows: u32,
+    /// Each readout row's first element on the readout plane, from
+    /// `logits_base`: a row a pitch where the lane's rows lie one after
+    /// another; where the rows are seated at the instance's lanes, each
+    /// row's own, wherever it lies.
+    row_at: Vec<u32>,
     layout_words: Vec<GroupLayout>,
     record: LaneRecord,
 }
@@ -602,6 +639,7 @@ impl Grouped {
             row_meta,
             row_indices,
             readout_rows,
+            row_at: Vec::new(),
             layout_words,
             record,
         }))
@@ -616,7 +654,7 @@ impl Grouped {
     }
 
     fn set_rows(&mut self) -> Result<()> {
-        let bytes: Vec<u8> = (0..self.readout_rows).flat_map(u32::to_le_bytes).collect();
+        let bytes: Vec<u8> = self.row_at.iter().copied().flat_map(u32::to_le_bytes).collect();
         if !bytes.is_empty() {
             self.row_indices.write(0, &bytes)?;
         }
@@ -713,6 +751,14 @@ pub struct Prepared {
     outputs: Vec<Option<Slot>>,
     seats: Vec<OutputSeat>,
     addresses: Held,
+    /// By output slot: the rows the stage's read there covers, and where
+    /// its row table lies in `row_tables` (a float read's).
+    read_rows: Vec<u32>,
+    row_table_at: Vec<Option<u64>>,
+    row_tables: Held,
+    /// Rows past 0 of a lane-0 read, seated at the instance's lanes: row r
+    /// at lane r's seat, by (lane-0 slot, row).
+    row_seats: BTreeMap<(usize, u32), Slot>,
     /// The one slot read through the readout plane.
     readout: Option<usize>,
     /// The stage's names and the slots a lane takes in its table.
@@ -957,6 +1003,7 @@ impl Prepared {
             &mut self.offsets,
             &mut self.status,
             &mut self.addresses,
+            &mut self.row_tables,
         ]
         .into_iter()
         .chain(grouped)
@@ -978,6 +1025,7 @@ impl Prepared {
             &mut self.offsets,
             &mut self.status,
             &mut self.addresses,
+            &mut self.row_tables,
         ]
         .into_iter()
         .chain(grouped)
@@ -1047,7 +1095,8 @@ impl Prepared {
 
     /// The bind-time tables a stage of `plan` takes, in the order `build`
     /// takes them from its [`Tables`]: params, descriptors, offsets, the
-    /// status word and the output addresses and, for a grouped stage, the
+    /// status word, the output addresses and the float reads' row tables
+    /// and, for a grouped stage, the
     /// channel bindings, the lane table (`channels` slots a lane), its
     /// flags, indices, row meta, `rows` readout rows and each fused
     /// region's layout. Counts alone size them, so a program states them
@@ -1060,6 +1109,7 @@ impl Prepared {
             (plan.value_types.len() * size_of::<u32>()).max(size_of::<u32>()) as u64,
             eta_exec::STATUS_BYTES as u64,
             ((plan.output_pitch as usize).max(1) * size_of::<OutputSeat>()) as u64,
+            row_table_bytes(plan, rows),
         ];
         if plan.needs.grouped_valid {
             let shape = LaneShape::of(GROUPED_LANES, channels);
@@ -1114,6 +1164,9 @@ impl Prepared {
         let mut records = Vec::with_capacity(plan.ops.len());
         let pitch = plan.output_pitch as usize;
         let mut reads: Vec<Option<Read>> = vec![None; pitch];
+        let mut read_rows: Vec<u32> = vec![1; pitch];
+        let mut row_table_at: Vec<Option<u64>> = vec![None; pitch];
+        let mut float_reads = 0u64;
         let mut readout = None;
         let mut readout_rows = 0u32;
         let mut result_base = 0u32;
@@ -1177,6 +1230,17 @@ impl Prepared {
                 if let Some(seat) = reads.get_mut(slot) {
                     *seat = Some(read);
                 }
+                if let Some(at) = read_rows.get_mut(slot) {
+                    *at = descriptors
+                        .get(record.o0 as usize)
+                        .map_or(1, |out| out.rows.max(1));
+                }
+                if op.dtype != Dtype::I32 {
+                    if let Some(at) = row_table_at.get_mut(slot) {
+                        *at = Some(float_reads * u64::from(rows.max(1)) * 8);
+                    }
+                    float_reads += 1;
+                }
             }
             records.push(record);
             result_base += u32::from(op.result_count);
@@ -1205,6 +1269,7 @@ impl Prepared {
             .next_multiple_of(SCRATCH_ALIGN);
         let status = tables.take(eta_exec::STATUS_BYTES as u64)?;
         let addresses = tables.take((pitch.max(1) * size_of::<OutputSeat>()) as u64)?;
+        let row_tables = tables.take(row_table_bytes(plan, rows))?;
 
         let lanes = LaneShape::of(
             GROUPED_LANES,
@@ -1234,6 +1299,10 @@ impl Prepared {
             outputs: vec![None; pitch],
             seats: vec![OutputSeat::default(); pitch],
             addresses,
+            read_rows,
+            row_table_at,
+            row_tables,
+            row_seats: BTreeMap::new(),
             readout,
             names: plan.names.clone(),
             output_slots: plan.output_slots,
@@ -1341,7 +1410,10 @@ impl Prepared {
     }
 
     /// Points this stage's reads of output `name` for `lane` at `offset` of
-    /// `base`; an output the stage does not read is let go.
+    /// `base`. A lane past 0 that the stage reads no output at is a row of
+    /// its lane-0 read where that read covers rows: row r is lane r's
+    /// readout row. Returns whether the stage reads the seat; one it does
+    /// not is let go here, and the session refuses a seat no stage reads.
     #[allow(clippy::too_many_arguments)]
     pub fn bind_output(
         &mut self,
@@ -1352,28 +1424,28 @@ impl Prepared {
         dtype: Dtype,
         width: u32,
         stride: u32,
-    ) -> Result<()> {
-        let Some(slot) = self
-            .names
-            .iter()
-            .position(|named| named == name)
-            .map(|index| index + (self.output_slots * lane) as usize)
-        else {
-            return Ok(());
+    ) -> Result<bool> {
+        let Some(named) = self.names.iter().position(|named| named == name) else {
+            return Ok(false);
         };
-        let Some(read) = self.reads.get(slot).copied().flatten() else {
-            return Ok(());
+        let slot = named + (self.output_slots * lane) as usize;
+        let (read, first) = match self.reads.get(slot).copied().flatten() {
+            Some(read) => (read, slot),
+            None => match self.reads.get(named).copied().flatten() {
+                Some(read) if lane > 0 && lane < self.read_rows[named] => (read, named),
+                _ => return Ok(false),
+            },
         };
         let storage = match (read, dtype) {
             (Read::Plane, Dtype::Bf16) | (Read::Floats, Dtype::Bf16) => STORAGE_BF16,
             (Read::Floats, Dtype::F32) => STORAGE_F32,
-            (Read::Ids, Dtype::I32) => STORAGE_I32,
+            (Read::Ids, Dtype::I32) if first == slot => STORAGE_I32,
             _ => {
                 return Err(Fault::program(
                     "program::launch",
                     format!(
-                        "output `{name}` landed as {dtype:?}, which this stage's {read:?} read \
-                         of it has no gather for"
+                        "output `{name}` landed as {dtype:?} at lane {lane}, which this \
+                         stage's {read:?} read of it has no gather for"
                     ),
                 ));
             }
@@ -1384,36 +1456,147 @@ impl Prepared {
                 format!("output `{name}`'s readout rows are not one row after another"),
             ));
         }
-        self.seats[slot] = OutputSeat {
-            at: address_of(base, offset)?,
-            storage,
-            stride,
-        };
-        self.addresses.write(
-            (slot * size_of::<OutputSeat>()) as u64,
-            &record_bytes(&self.seats[slot]),
-        )?;
-        self.outputs[slot] = Some(Slot {
+        let seated = Slot {
             base: base.clone(),
             offset,
             width,
-        });
-        self.regroup()
+            stride,
+            storage,
+        };
+        if first == slot {
+            self.seats[slot] = OutputSeat {
+                at: address_of(base, offset)?,
+                storage,
+                stride,
+            };
+            self.addresses.write(
+                (slot * size_of::<OutputSeat>()) as u64,
+                &record_bytes(&self.seats[slot]),
+            )?;
+            self.outputs[slot] = Some(seated);
+        } else {
+            self.row_seats.insert((first, lane), seated);
+        }
+        self.seat_rows(first)?;
+        self.regroup()?;
+        Ok(true)
+    }
+
+    /// Every seat this stage reads, its lanes' rows among them.
+    #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
+    fn seated(&self) -> impl Iterator<Item = &Slot> {
+        self.outputs.iter().flatten().chain(self.row_seats.values())
+    }
+
+    /// The row seats of the lane-0 read at `first`, by row; empty where
+    /// its rows lie one after another from lane 0's seat.
+    fn rows_of(&self, first: usize) -> Vec<(u32, &Slot)> {
+        self.row_seats
+            .range((first, 0)..(first + 1, 0))
+            .map(|(&(_, row), seat)| (row, seat))
+            .collect()
+    }
+
+    /// Each row's address of the lane-0 read at `first`: row 0 at lane 0's
+    /// seat, a row seated at its lane there, and an unseated row on lane
+    /// 0's pitch.
+    fn row_addresses(&self, first: usize) -> Result<Option<Vec<u64>>> {
+        let seated = self.rows_of(first);
+        let Some(zero) = self.outputs.get(first).and_then(Option::as_ref) else {
+            return Ok(None);
+        };
+        if seated.is_empty() {
+            return Ok(None);
+        }
+        (0..self.read_rows[first])
+            .map(|row| match seated.iter().find(|(at, _)| *at == row) {
+                Some((_, seat)) => seat.row_at(0),
+                None => zero.row_at(row),
+            })
+            .collect::<Result<Vec<u64>>>()
+            .map(Some)
+    }
+
+    /// Seats a float read's rows through its row table where its lanes'
+    /// rows are seated apart: the table holds each row's address and the
+    /// read's seat names the table ([`STORAGE_BF16_ROWS`]).
+    fn seat_rows(&mut self, first: usize) -> Result<()> {
+        if self.reads.get(first).copied().flatten() != Some(Read::Floats) {
+            return Ok(());
+        }
+        let Some(rows) = self.row_addresses(first)? else {
+            return Ok(());
+        };
+        let at = self.row_table_at[first].ok_or_else(|| {
+            Fault::program("program::launch", "a float read with no row table laid for it")
+        })?;
+        let zero = self.outputs[first].as_ref().expect("row_addresses saw lane 0's seat");
+        let storage = if zero.storage == STORAGE_BF16 { STORAGE_BF16_ROWS } else { STORAGE_F32_ROWS };
+        let bytes: Vec<u8> = rows.iter().flat_map(|address| address.to_le_bytes()).collect();
+        self.row_tables.write(at, &bytes)?;
+        self.seats[first] = OutputSeat {
+            at: self.row_tables.address_at(at).ok_or_else(|| {
+                Fault::program("program::launch", "a row table with no GPU address")
+            })?,
+            storage,
+            stride: 0,
+        };
+        self.addresses.write(
+            (first * size_of::<OutputSeat>()) as u64,
+            &record_bytes(&self.seats[first]),
+        )
     }
 
     fn regroup(&mut self) -> Result<()> {
-        let Some(grouped) = self.grouped.as_mut() else {
+        if self.grouped.is_none() {
+            return Ok(());
+        }
+        let Some(slot) = self.readout else {
             return Ok(());
         };
-        let Some(plane) = self.readout.and_then(|slot| self.outputs[slot].as_ref()) else {
+        let Some(plane) = self.outputs[slot].as_ref() else {
             return Ok(());
         };
-        grouped.set_vocab(plane.width)?;
-        grouped.set_logits(
-            address_of(&plane.base, plane.offset)?,
-            0,
-            grouped.readout_rows,
-        )?;
+        let width = plane.width;
+        // Each row's first element on the plane: from lane 0's seat one
+        // after another, or, where the lanes' rows are seated apart, each
+        // row's own from the lowest.
+        let element = |apart: u64| -> Result<u32> {
+            u32::try_from(apart / 2).map_err(|_| {
+                Fault::program(
+                    "program::launch",
+                    format!(
+                        "output `{}`'s rows lie {apart} bytes apart, past a u32 of \
+                         elements the grouped kernels address rows by",
+                        self.names[slot % self.output_slots as usize]
+                    ),
+                )
+            })
+        };
+        let pitch = u64::from(width) * 2;
+        let readout_rows = self.grouped.as_ref().map_or(0, |grouped| grouped.readout_rows);
+        let (base, rows) = match self.row_addresses(slot)? {
+            None => (
+                address_of(&plane.base, plane.offset)?,
+                (0..u64::from(readout_rows))
+                    .map(|row| element(row * pitch))
+                    .collect::<Result<Vec<u32>>>()?,
+            ),
+            Some(addresses) => {
+                let low = addresses.iter().copied().min().unwrap_or(0);
+                (
+                    low,
+                    addresses
+                        .iter()
+                        .map(|&address| element(address - low))
+                        .collect::<Result<Vec<u32>>>()?,
+                )
+            }
+        };
+        let grouped = self.grouped.as_mut().expect("checked above");
+        grouped.set_vocab(width)?;
+        grouped.set_logits(base, 0, grouped.readout_rows)?;
+        grouped.row_at = rows;
         grouped.set_rows()
     }
 
@@ -1550,7 +1733,7 @@ impl Prepared {
             for cell in &self.bound {
                 resident(&cell.slab, MTLResourceUsage::Read | MTLResourceUsage::Write);
             }
-            for held in self.outputs.iter().flatten() {
+            for held in self.seated() {
                 resident(&held.base, MTLResourceUsage::Read);
             }
             let threads = streamed_threads(region.pipeline().maxTotalThreadsPerThreadgroup());
@@ -1583,7 +1766,7 @@ impl Prepared {
 
             let encoder = frame.encoder();
             encoder.setComputePipelineState(region.pipeline());
-            for held in self.outputs.iter().flatten() {
+            for held in self.seated() {
                 let resource: &ProtocolObject<dyn MTLResource> =
                     ProtocolObject::from_ref(&**held.base.slab());
                 encoder.useResource_usage(resource, MTLResourceUsage::Read);
@@ -1617,6 +1800,19 @@ impl Prepared {
                     scratch_at + self.temporary_offset as usize,
                     5,
                 );
+                if let Some(slot) = self.readout
+                    && !self.rows_of(slot).is_empty()
+                {
+                    return Err(Fault::program(
+                        "program::launch",
+                        format!(
+                            "output `{}`'s rows are seated at the instance's lanes, and \
+                             this stage's fused form reads the readout plane's rows one \
+                             after another from lane 0's",
+                            self.names[slot % self.output_slots as usize]
+                        ),
+                    ));
+                }
                 match self.readout.and_then(|slot| self.outputs[slot].as_ref()) {
                     Some(bound) => encoder.setBuffer_offset_atIndex(
                         Some(bound.base.raw()),
@@ -1770,7 +1966,7 @@ impl Prepared {
             for cell in &self.bound {
                 resident(&cell.slab, MTLResourceUsage::Read | MTLResourceUsage::Write);
             }
-            for held in self.outputs.iter().flatten() {
+            for held in self.seated() {
                 resident(&held.base, MTLResourceUsage::Read);
             }
 
@@ -2253,7 +2449,10 @@ impl Batch {
                 u64::from(lane) * size_of::<RowMeta>() as u64,
                 &record_bytes(&meta),
             )?;
-            let rows: Vec<u8> = (0..grouped.readout_rows)
+            let rows: Vec<u8> = grouped
+                .row_at
+                .iter()
+                .copied()
                 .flat_map(u32::to_le_bytes)
                 .collect();
             if !rows.is_empty() {
@@ -2396,7 +2595,7 @@ impl Batch {
                 for cell in &member.bound {
                     resident(&cell.slab, MTLResourceUsage::Read | MTLResourceUsage::Write);
                 }
-                for held in member.outputs.iter().flatten() {
+                for held in member.seated() {
                     resident(&held.base, MTLResourceUsage::Read);
                 }
             }
@@ -2577,7 +2776,7 @@ impl Batch {
                 for cell in &member.bound {
                     resident(&cell.slab, MTLResourceUsage::Read | MTLResourceUsage::Write);
                 }
-                for held in member.outputs.iter().flatten() {
+                for held in member.seated() {
                     resident(&held.base, MTLResourceUsage::Read);
                 }
             }

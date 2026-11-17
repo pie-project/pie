@@ -88,6 +88,9 @@ pub const INTRINSIC_STORAGE_ROW_POINTERS: u32 = 2;
 
 pub const INTRINSIC_STORAGE_RAW_I32: u32 = 3;
 
+/// A table of pointers to f32 rows, a row a lane wherever each lies.
+pub const INTRINSIC_STORAGE_ROW_POINTERS_F32: u32 = 4;
+
 pub const BOOL_STORAGE_NATIVE_BYTES: u32 = 0;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -636,10 +639,10 @@ pub struct Prepared {
     offsets_host: Vec<u8>,
     scratch: u64,
     /// The lanes' intrinsic tables (bases, modes, widths, strides,
-    /// offsets) and pending flags, one span staged in one copy a commit
-    /// (`cell_at` their offsets, `cells_host` its image).
+    /// offsets), pending flags and row tables, one span staged in one copy
+    /// a commit (`cell_at` their offsets, `cells_host` its image).
     cells: u64,
-    cell_at: [usize; 6],
+    cell_at: [usize; 7],
     cells_host: Vec<u8>,
     intrinsic_bases_host: Vec<u64>,
     intrinsic_modes_host: Vec<u32>,
@@ -648,6 +651,14 @@ pub struct Prepared {
     intrinsic_offsets_host: Vec<u32>,
     /// The side-table slots a lane binds ([`eta_ir::op::output_pitch`]).
     pitch: usize,
+    /// Each slot's row table: where it starts among a lane's pointers and
+    /// the rows it holds (0 for a slot no output op reads), for an output
+    /// whose rows are the readout rows of an instance's lanes, each its own
+    /// seat ([`Prepared::bind_rows`]).
+    row_tables: Vec<(u32, u32)>,
+    /// A lane's row-table pointers, every slot's.
+    row_words: u32,
+    row_pointers_host: Vec<u64>,
     /// The outputs this stage reads, an output's slot its index among them
     /// plus `output_slots` a lane.
     names: Vec<String>,
@@ -876,6 +887,30 @@ impl Prepared {
             result_base += u32::from(op.result_count);
         }
 
+        // A slot's row table holds the rows its output op reads, from the
+        // op's own first.
+        let mut row_rows = vec![0u32; plan.output_pitch as usize];
+        let mut base = 0u32;
+        for op in &plan.ops {
+            if op.tag == tags::OUTPUT {
+                let slot = op.name_index + plan.output_slots * op.imm;
+                let rows = descriptors.get(base as usize).map_or(1, |d| d.rows.max(1));
+                if let Some(held) = row_rows.get_mut(slot as usize) {
+                    *held = (*held).max(op.imm2 + rows);
+                }
+            }
+            base += u32::from(op.result_count);
+        }
+        let mut row_words = 0u32;
+        let row_tables: Vec<(u32, u32)> = row_rows
+            .iter()
+            .map(|&rows| {
+                let at = row_words;
+                row_words += rows;
+                (at, rows)
+            })
+            .collect();
+
         let offsets_host: Vec<u8> = scratch_layout
             .values
             .iter()
@@ -895,7 +930,7 @@ impl Prepared {
             offsets_host,
             scratch: 0,
             cells: 0,
-            cell_at: [0; 6],
+            cell_at: [0; 7],
             cells_host: Vec::new(),
             intrinsic_bases_host: Vec::new(),
             intrinsic_modes_host: Vec::new(),
@@ -903,6 +938,9 @@ impl Prepared {
             intrinsic_strides_host: Vec::new(),
             intrinsic_offsets_host: Vec::new(),
             pitch: plan.output_pitch as usize,
+            row_tables,
+            row_words,
+            row_pointers_host: Vec::new(),
             names: plan.names.clone(),
             output_slots: plan.output_slots,
             channel_count,
@@ -941,6 +979,7 @@ impl Prepared {
             + u64::from(self.scratch_stride)
             + words * (size_of::<u64>() + 4 * size_of::<u32>()) as u64
             + u64::from(self.channel_count).max(1)
+            + u64::from(self.row_words) * size_of::<u64>() as u64
     }
 
     /// Lays this stage for `lanes` lanes in the fire's span from `at` up,
@@ -1043,6 +1082,8 @@ impl Prepared {
         self.intrinsic_widths_host.resize(words, 0u32);
         self.intrinsic_strides_host.resize(words, 0u32);
         self.intrinsic_offsets_host.resize(words, 0u32);
+        let rows = self.row_words as usize * lanes as usize;
+        self.row_pointers_host.resize(rows, 0u64);
         let pending = (self.channel_count as usize * lanes as usize).max(1);
         let mut cell_at = 0usize;
         for (cell, bytes) in [
@@ -1052,6 +1093,7 @@ impl Prepared {
             words * size_of::<u32>(),
             words * size_of::<u32>(),
             pending,
+            rows * size_of::<u64>(),
         ]
         .into_iter()
         .enumerate()
@@ -1127,6 +1169,8 @@ impl Prepared {
         self.intrinsic_widths_host[row..row + self.pitch].fill(0);
         self.intrinsic_strides_host[row..row + self.pitch].fill(0);
         self.intrinsic_offsets_host[row..row + self.pitch].fill(0);
+        let words = self.row_words as usize;
+        self.row_pointers_host[lane as usize * words..(lane as usize + 1) * words].fill(0);
         self.filled += 1;
         Ok(lane)
     }
@@ -1162,7 +1206,9 @@ impl Prepared {
         {
             image[at[cell]..at[cell] + bytes.len()].copy_from_slice(bytes);
         }
-        image[at[5]..].fill(0);
+        image[at[5]..at[6]].fill(0);
+        let rows = slice_bytes(&self.row_pointers_host);
+        image[at[6]..at[6] + rows.len()].copy_from_slice(&rows);
         crate::device::stage_raw(stream, self.cells, image)?;
         Ok(())
     }
@@ -1178,6 +1224,56 @@ impl Prepared {
             .checked_add(self.output_slots.checked_mul(lane)?)
     }
 
+    /// Whether this stage reads output `name` of `lane`.
+    #[must_use]
+    pub fn reads(&self, name: &str, lane: u32) -> bool {
+        self.slot_of(name, lane)
+            .and_then(|slot| self.row_tables.get(slot as usize))
+            .is_some_and(|&(_, rows)| rows > 0)
+    }
+
+    /// Binds output slot `slot` of `lane` to rows each its own: row `r` the
+    /// `width` wide row at `rows[r]`, f32 (`bf16` false) or bf16.
+    pub fn bind_rows(
+        &mut self,
+        lane: u32,
+        slot: u32,
+        rows: &[u64],
+        width: u32,
+        bf16: bool,
+    ) -> Result<()> {
+        let Some(&(at, held)) = self.row_tables.get(slot as usize) else {
+            return Err(Fault::program(
+                "program::launch",
+                format!("slot {slot} is past the {} this stage's outputs take", self.pitch),
+            ));
+        };
+        if rows.len() as u64 > u64::from(held) {
+            return Err(Fault::Ceiling {
+                what: "rows a stage's output reads, each its own seat",
+                need: rows.len() as u64,
+                have: u64::from(held),
+            });
+        }
+        if lane >= self.lanes {
+            return Err(Fault::program(
+                "program::launch",
+                format!("lane {lane} is past a batch cut for {}", self.lanes),
+            ));
+        }
+        let first = lane as usize * self.row_words as usize + at as usize;
+        self.row_pointers_host[first..first + rows.len()].copy_from_slice(rows);
+        let table = self.cells
+            + self.cell_at[6] as u64
+            + first as u64 * size_of::<u64>() as u64;
+        let mode = if bf16 {
+            INTRINSIC_STORAGE_ROW_POINTERS
+        } else {
+            INTRINSIC_STORAGE_ROW_POINTERS_F32
+        };
+        self.bind_intrinsic(lane, slot, table, mode, width, width, 0)
+    }
+
     pub fn bind_intrinsic(
         &mut self,
         lane: u32,
@@ -1190,8 +1286,10 @@ impl Prepared {
     ) -> Result<()> {
         let slot = slot as usize;
         if slot >= self.pitch {
-            // A lane this stage reads no intrinsic of.
-            return Ok(());
+            return Err(Fault::program(
+                "program::launch",
+                format!("slot {slot} is past the {} this stage's outputs take", self.pitch),
+            ));
         }
         if lane >= self.lanes {
             return Err(Fault::program(
@@ -1474,8 +1572,10 @@ impl Prepared {
     }
 }
 
-/// The device's multiprocessors, which a sampler fire's blocks may fill.
-fn device_units() -> u32 {
+/// The device's multiprocessors, which a sampler fire's blocks may fill
+/// and its lane arenas are sized by ([`Arenas::bytes_for`]).
+#[must_use]
+pub fn device_units() -> u32 {
     static UNITS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *UNITS.get_or_init(|| {
         #[cfg(feature = "device")]

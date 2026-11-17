@@ -1032,6 +1032,11 @@ impl Engine for Cuda {
         self.refused(registered)
     }
 
+    fn prewarm_programs(&mut self, registrations: &[ProgramRegistration]) -> EngineResult<()> {
+        self.loaded_mut()
+            .and_then(|shell| shell.prewarm_programs(registrations).map_err(fault))
+    }
+
     fn settles_asynchronously(&self) -> bool {
         true
     }

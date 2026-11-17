@@ -1,5 +1,5 @@
 use poem_exec::{DispatchLinear, KernelError};
-use poem_ir::{Linear, Operands};
+use poem_ir::{Linear, Operands, ValueId};
 
 use crate::backend::{Backend, Tactics as _};
 use crate::run::Run;
@@ -54,13 +54,15 @@ impl<B: Backend> Run<'_, B> {
                         block,
                         self.tensor(*y),
                     ),
-                    None => kernels_slang::linear::gemm::matmul(
-                        self.ctx,
-                        self.gemm_tactic(),
-                        self.tensor(*act),
-                        self.tensor(*w),
-                        self.tensor(*y),
-                    ),
+                    None => self.gemm(*act, |tactic| {
+                        kernels_slang::linear::gemm::matmul(
+                            self.ctx,
+                            tactic,
+                            self.tensor(*act),
+                            self.tensor(*w),
+                            self.tensor(*y),
+                        )
+                    }),
                 },
             },
             Linear::Matmul {
@@ -86,13 +88,15 @@ impl<B: Backend> Run<'_, B> {
                         block,
                         self.tensor(*y),
                     ),
-                    None => kernels_slang::linear::gemm::lm_head(
-                        self.ctx,
-                        self.gemm_tactic(),
-                        self.tensor(*act),
-                        self.tensor(*w),
-                        self.tensor(*y),
-                    ),
+                    None => self.gemm(*act, |tactic| {
+                        kernels_slang::linear::gemm::lm_head(
+                            self.ctx,
+                            tactic,
+                            self.tensor(*act),
+                            self.tensor(*w),
+                            self.tensor(*y),
+                        )
+                    }),
                 },
             },
 
@@ -666,13 +670,38 @@ impl<B: Backend> Run<'_, B> {
 }
 
 impl<B: Backend> Run<'_, B> {
-    /// The device's gemm tactic.
-    fn gemm_tactic(&self) -> kernels_slang::linear::gemm::Tactic {
-        self.tuning().gemm(self.tier())
+    /// A dense matmul from `act` into `y` at the device's tactic for the
+    /// rows it lands. A naming sink is told every way it goes: `matmul` at
+    /// each tactic some fire of up to the load's most rows takes.
+    fn gemm(
+        &self,
+        act: ValueId,
+        matmul: impl Fn(kernels_slang::linear::gemm::Tactic) -> Result<(), kernels_slang::Error>,
+    ) -> Result<(), kernels_slang::Error> {
+        let Some(names) = self.ctx.naming() else {
+            return matmul(self.tuning().gemm(self.tier(), self.tensor(act).rows));
+        };
+        // The walk fires at one rung; a fire of the load brings up to the
+        // most rows its rungs hold.
+        let rows = names.most_rows().max(self.tensor(act).rows);
+        names.fork();
+        for (way, tactic) in self
+            .tuning()
+            .gemm_tactics(self.tier(), rows)
+            .into_iter()
+            .enumerate()
+        {
+            if way > 0 {
+                names.or();
+            }
+            matmul(tactic)?;
+        }
+        names.join();
+        Ok(())
     }
 
     /// The `kernel.qmm` rungs a matmul tries, in order, at its rows; to a
-    /// naming sink every rung a batch the capacity holds reaches.
+    /// naming sink every rung a batch of up to the load's most rows reaches.
     fn qmm_ladder(
         &self,
         act: kernels_slang::Tensor,
@@ -681,7 +710,10 @@ impl<B: Backend> Run<'_, B> {
         capacity: u32,
     ) -> Vec<kernels_slang::linear::qmm::Qmm> {
         match self.ctx.naming() {
-            Some(_) => self.tuning().qmm_rungs(capacity, y.width, act.width, bank),
+            Some(names) => {
+                self.tuning()
+                    .qmm_rungs(names.most_rows().max(capacity), y.width, act.width, bank)
+            }
             None => self.tuning().qmm_ladder(act.rows, y.width, act.width, bank),
         }
     }

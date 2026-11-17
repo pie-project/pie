@@ -5131,6 +5131,7 @@ dependencies = [
  "opentelemetry_sdk",
  "parking_lot",
  "pie-client-api",
+ "pie-eta-dsl",
  "pie-eta-ir",
  "pie-poem",
  "pie-poem-compiler",

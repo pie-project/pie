@@ -1075,6 +1075,177 @@ mod tests {
     use eta_dsl::prelude::*;
     use eta_ir::registry::{Axis, EngineCaps, OutputDecl, Port, PortMask};
 
+    /// Every op that moves elements writes a Bool output: a gather of a
+    /// mask's rows (beam's `inherited = gather(mask, parent)`), a gather of
+    /// a 1-D mask, a row gather and a transpose, each a ring the host reads,
+    /// over two fires with different seeds. An op that skipped a Bool store
+    /// would answer the first fire's bits (or zeros), not the second's.
+    #[test]
+    fn bool_outputs_are_written_by_every_op_that_moves_them() {
+        use crate::store::Pools;
+        const ROWS: u32 = 4;
+        const COLS: u32 = 6;
+        const LONG: u32 = 8;
+        let Ok(context) = Context::bind() else {
+            eprintln!("no device: skipping");
+            return;
+        };
+        let leak = |c: Channel| -> &'static Channel { Box::leak(Box::new(c)) };
+        let rows = leak(Channel::seeded([ROWS, COLS], dtype::bool));
+        let line = leak(Channel::seeded([LONG], dtype::bool));
+        let parent = leak(Channel::seeded([ROWS], dtype::u32));
+        let indptr = leak(Channel::from(vec![0u32, 1]));
+        let gathered = leak(Channel::new([ROWS, COLS], dtype::bool).capacity(1));
+        let picked = leak(Channel::new([ROWS], dtype::bool).capacity(1));
+        let by_row = leak(Channel::new([ROWS], dtype::bool).capacity(1));
+        let flipped = leak(Channel::new([COLS, ROWS], dtype::bool).capacity(1));
+        let vocab = 8u32;
+        let logits = OutputDecl {
+            name: "logits".into(),
+            axis: Axis::Row,
+            width: vocab,
+            dtype: eta_ir::Dtype::F32,
+            layers: 0,
+            readout: true,
+        };
+        let mut b = Builder::new(vocab, 16);
+        b.outputs(vec![vec![logits.clone()]]);
+        b.bind_port(Port::EmbedIndptr, indptr);
+        b.stage(Attach::Epilogue, move || {
+            let mask = rows.take();
+            let flat = line.take();
+            let at = parent.read();
+            gathered.put(gather(&mask, &at));
+            picked.put(gather(&flat, &at));
+            by_row.put(gather_row(&mask, &at));
+            flipped.put(transpose(&mask));
+        });
+        rows.note_host_put();
+        line.note_host_put();
+        for reader in [gathered, picked, by_row, flipped] {
+            reader.note_host_take();
+        }
+        let traced = b.build().expect("the program traces");
+        let bound = eta_ir::validate::bind(
+            traced.container().clone(),
+            vec![vec![logits]],
+            EngineCaps {
+                lora: true,
+                attn_page_mask: true,
+            },
+        )
+        .expect("the program binds");
+        let stages = compile_bound(&bound);
+        let backend = Backend::parse("metal").expect("the metal codegen backend");
+        let registration = ProgramRegistration {
+            program_hash: bound.hash,
+            emitted_kernels: emit_program(backend, &stages, &bound),
+            emitter_version: backend.emitter_version(),
+            launch: eta_compiler::codegen::launch::build(&bound, &stages),
+            ..Default::default()
+        };
+        let order = traced.channel_order();
+        let index = |c: &Channel| -> u32 {
+            let at = order.iter().position(|&gid| gid == c.gid()).expect("a channel");
+            u32::try_from(at).expect("a channel index")
+        };
+        let bits = |v: &[bool]| -> Vec<u8> {
+            let mut out = vec![0u8; v.len().div_ceil(8)];
+            for (k, &bit) in v.iter().enumerate() {
+                if bit {
+                    out[k / 8] |= 1 << (k % 8);
+                }
+            }
+            out
+        };
+        // The parents, each a row of the mask and a column of it.
+        let at = [2u32, 0, 3, 2];
+        let mask_of = |salt: u32| -> Vec<bool> {
+            (0..ROWS * COLS).map(|k| (k * 7 + salt) % 3 == 0).collect()
+        };
+        let line_of = |salt: u32| -> Vec<bool> { (0..LONG).map(|k| (k + salt) % 2 == 0).collect() };
+        let want = |mask: &[bool], line: &[bool]| -> [Vec<u8>; 4] {
+            let (r, c) = (ROWS as usize, COLS as usize);
+            let gathered: Vec<bool> =
+                at.iter().flat_map(|&p| mask[p as usize * c..][..c].to_vec()).collect();
+            let picked: Vec<bool> = at.iter().map(|&p| line[p as usize]).collect();
+            let by_row: Vec<bool> = (0..r).map(|row| mask[row * c + at[row] as usize]).collect();
+            let flipped: Vec<bool> = (0..c * r).map(|k| mask[(k % r) * c + k / r]).collect();
+            [bits(&gathered), bits(&picked), bits(&by_row), bits(&flipped)]
+        };
+
+        let pools = Pools::guests_only(&context, CHUNK, 4).expect("a pool");
+        let mut plane = Plane::new();
+        let program = plane.register(&context, &registration).expect("registers");
+        let facts = plane.facts(program, &pools).expect("the program's facts");
+        let count = bound.container.channels.len();
+        let ids: Vec<ChannelId> = (1..=count as u64).map(ChannelId).collect();
+        let (instance, rings) = slots_for(&pools, &facts, 0);
+        let parents: Vec<u8> = at.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let seeds = vec![
+            (index(indptr), [0u32, 1].iter().flat_map(|v| v.to_le_bytes()).collect()),
+            (index(parent), parents),
+            (index(rows), bits(&mask_of(0))),
+            (index(line), bits(&line_of(0))),
+        ];
+        let id = plane
+            .bind(
+                &context,
+                program,
+                &seeds,
+                Extents {
+                    row_count: 1,
+                    sampled_rows: 1,
+                    query_len: 1,
+                    ..Extents::default()
+                },
+                GeometryClass::Host,
+                PortMask::NONE,
+                &ids,
+                session::Pooled {
+                    pools: &pools,
+                    instance: &instance,
+                    rings: &rings,
+                },
+            )
+            .expect("the instance binds");
+        let logits = crate::device::Buffer::zeroed(&context, u64::from(vocab) * 2).expect("a plane");
+        plane
+            .bind_output(id, "logits", 0, &logits, 0, eta_ir::Dtype::Bf16, vocab, vocab)
+            .expect("the logits bind");
+        let readers = [
+            ("gather of rows", index(gathered)),
+            ("gather of a line", index(picked)),
+            ("gather_row", index(by_row)),
+            ("transpose", index(flipped)),
+        ];
+        let mut wrong = Vec::new();
+        for salt in [0u32, 1] {
+            if salt > 0 {
+                let instance = plane.instance_mut(id).expect("bound");
+                assert!(instance.publish(index(rows), &bits(&mask_of(salt))).expect("a put"));
+                assert!(instance.publish(index(line), &bits(&line_of(salt))).expect("a put"));
+            }
+            let fired = plane
+                .fire(&context, id, Attach::Epilogue, &guests(&context))
+                .expect("the stage fires");
+            assert!(matches!(fired, Fired::Committed), "fire {salt}: {fired:?}");
+            let expected = want(&mask_of(salt), &line_of(salt));
+            for ((name, channel), want) in readers.iter().zip(&expected) {
+                let got = plane
+                    .instance_mut(id)
+                    .expect("bound")
+                    .take(*channel)
+                    .expect("a take")
+                    .expect("a cell");
+                if &got != want {
+                    wrong.push(format!("fire {salt}, {name}: {got:02x?} != {want:02x?}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
     /// The select's mode: top-p at a threshold, or top-k.
     #[derive(Clone, Copy, Debug)]
     enum Cut {
@@ -1377,6 +1548,578 @@ mod tests {
             BYTES,
             0,
         )
+    }
+
+/// A contract case's logits as the engine seats them
+    /// (`eta_compiler::contract::Case::seats`): `values`, `rows` rows of
+    /// the vocabulary, laid in a bf16 plane where the case's seats put each
+    /// row (one lane's seat holding every row, or a lane a row, laid last
+    /// first with NaN between), and every seat bound.
+    fn seat_case(
+        context: &Context,
+        plane: &mut Plane,
+        id: InstanceId,
+        case: &eta_compiler::contract::Case,
+        values: &[f32],
+    ) -> crate::device::Buffer {
+        let seats = case.seats();
+        let vocab = case.vocab as usize;
+        // Each row's first element in the plane, in elements: a lane a row
+        // at its own seat, else on the one seat's pitch.
+        let row_at = |row: usize| -> usize {
+            match seats.iter().find(|seat| seat.lane as usize == row) {
+                Some(seat) if seats.len() > 1 => (seat.offset / 4) as usize,
+                _ => (seats[0].offset / 4) as usize + row * seats[0].row_stride as usize,
+            }
+        };
+        let rows = values.len() / vocab;
+        let len = (0..rows).map(|row| row_at(row) + vocab).max().unwrap_or(vocab);
+        let mut laid = vec![0x7fc0u16; len];
+        for row in 0..rows {
+            for (at, x) in values[row * vocab..][..vocab].iter().enumerate() {
+                laid[row_at(row) + at] = (x.to_bits() >> 16) as u16;
+            }
+        }
+        let bytes: Vec<u8> = laid.iter().flat_map(|half| half.to_le_bytes()).collect();
+        let mut buffer =
+            crate::device::Buffer::zeroed(context, bytes.len() as u64).expect("a logits plane");
+        buffer.write(0, &bytes).expect("the logits upload");
+        for seat in &seats {
+            plane
+                .bind_output(
+                    id,
+                    "logits",
+                    seat.lane,
+                    &buffer,
+                    seat.offset / 2,
+                    eta_ir::Dtype::Bf16,
+                    seat.width,
+                    seat.row_stride,
+                )
+                .expect("the logits seat binds");
+        }
+        buffer
+    }
+
+    /// The guest-program contract (`eta_compiler::contract`) on this engine:
+    /// each case's program registered, bound with its seeds, fired over its
+    /// logits, and every channel the host reads exactly what the
+    /// interpreter puts there.
+    #[test]
+    fn a_beam_step_answers_what_the_interpreter_answers() {
+        use eta_compiler::codegen::program::{Backend, emit_program};
+        use eta_compiler::contract::beam_stage;
+        use eta_compiler::plan::compile_bound;
+        let Ok(context) = Context::bind() else {
+            eprintln!("no device: skipping");
+            return;
+        };
+        let mut wrong = Vec::new();
+        for mut case in beam_stage() {
+            // Metal's logits are bf16, and its plane read gathers them so:
+            // each logit is rounded to the nearest bf16 first (ties to even),
+            // and the interpreter answers over the very values the device
+            // reads.
+            for x in &mut case.logits {
+                let b = x.to_bits();
+                *x = f32::from_bits((b + 0x7fff + ((b >> 16) & 1)) & 0xffff_0000);
+            }
+            let stages = compile_bound(&case.bound);
+            let backend = Backend::parse("metal").expect("the metal codegen");
+            let registration = ProgramRegistration {
+                program_hash: 0xbea0_0000 ^ u64::from(case.rows),
+                emitted_kernels: emit_program(backend, &stages, &case.bound),
+                emitter_version: backend.emitter_version(),
+                launch: eta_compiler::codegen::launch::build(&case.bound, &stages),
+                ..Default::default()
+            };
+            let pools = crate::store::Pools::guests_only(&context, CHUNK, 4).expect("a pool");
+            let mut plane = Plane::new();
+            // One lane, one arm, its beams' rows read out.
+            plane.set_flight(1, 1, case.rows);
+            let program = plane
+                .register(&context, &registration)
+                .expect("the program compiles for the device");
+            let facts = plane.facts(program, &pools).expect("the program's facts");
+            let count = case.bound.container.channels.len();
+            let ids: Vec<ChannelId> = (1..=count as u64).map(ChannelId).collect();
+            let (instance, rings) = slots_for(&pools, &facts, 0);
+            let id = plane
+                .bind(
+                    &context,
+                    program,
+                    &case.wire_seeds(),
+                    Extents {
+                        row_count: case.rows,
+                        sampled_rows: case.rows,
+                        query_len: case.rows,
+                        ..Extents::default()
+                    },
+                    GeometryClass::Host,
+                    PortMask::NONE,
+                    &ids,
+                    session::Pooled {
+                        pools: &pools,
+                        instance: &instance,
+                        rings: &rings,
+                    },
+                )
+                .expect("the instance binds");
+            let _logits = seat_case(&context, &mut plane, id, &case, &case.logits);
+            let fired = plane
+                .fire(&context, id, Attach::Epilogue, &guests(&context))
+                .expect("the fire runs");
+            assert!(matches!(fired, Fired::Committed), "{}: {fired:?}", case.name);
+            let want = case.expected();
+            for (&channel, want) in case.readers.iter().zip(&want) {
+                let got = plane
+                    .instance_mut(id)
+                    .expect("the instance")
+                    .take(channel)
+                    .expect("a channel reads")
+                    .expect("the channel holds a cell");
+                if &got != want {
+                    wrong.push(format!("{}: channel {channel}: {got:02x?} != {want:02x?}", case.name));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+/// A seat the program reads nothing at is refused by name at the fire,
+    /// never dropped: beam's step reads its logits at lane 0, `rows` rows,
+    /// so lanes 1.. of those rows are its rows (the LaneARow cases), and a
+    /// seat at lane `rows` is past every row it reads.
+    #[test]
+    fn a_seat_no_read_reaches_is_refused_by_name() {
+        use eta_compiler::codegen::program::{Backend, emit_program};
+        use eta_compiler::contract::beam_stage;
+        use eta_compiler::plan::compile_bound;
+        let Ok(context) = Context::bind() else {
+            eprintln!("no device: skipping");
+            return;
+        };
+        let case = beam_stage().into_iter().next().expect("a case");
+        let stages = compile_bound(&case.bound);
+        let backend = Backend::parse("metal").expect("the metal codegen");
+        let registration = ProgramRegistration {
+            program_hash: 0xbea2_0000 ^ u64::from(case.rows),
+            emitted_kernels: emit_program(backend, &stages, &case.bound),
+            emitter_version: backend.emitter_version(),
+            launch: eta_compiler::codegen::launch::build(&case.bound, &stages),
+            ..Default::default()
+        };
+        let pools = crate::store::Pools::guests_only(&context, CHUNK, 4).expect("a pool");
+        let mut plane = Plane::new();
+        plane.set_flight(1, 1, case.rows);
+        let program = plane.register(&context, &registration).expect("compiles");
+        let facts = plane.facts(program, &pools).expect("the program's facts");
+        let count = case.bound.container.channels.len();
+        let ids: Vec<ChannelId> = (1..=count as u64).map(ChannelId).collect();
+        let (instance, rings) = slots_for(&pools, &facts, 0);
+        let id = plane
+            .bind(
+                &context,
+                program,
+                &case.wire_seeds(),
+                Extents {
+                    row_count: case.rows,
+                    sampled_rows: case.rows,
+                    query_len: case.rows,
+                    ..Extents::default()
+                },
+                GeometryClass::Host,
+                PortMask::NONE,
+                &ids,
+                session::Pooled {
+                    pools: &pools,
+                    instance: &instance,
+                    rings: &rings,
+                },
+            )
+            .expect("binds");
+        let logits = seat_case(&context, &mut plane, id, &case, &case.logits);
+        plane
+            .bind_output(
+                id,
+                "logits",
+                case.rows,
+                &logits,
+                0,
+                eta_ir::Dtype::Bf16,
+                case.vocab,
+                case.vocab,
+            )
+            .expect("a seat binds; the fire refuses it");
+        let why = plane
+            .fire(&context, id, Attach::Epilogue, &guests(&context))
+            .expect_err("a seat no read reaches is refused")
+            .to_string();
+        assert!(
+            why.contains(&format!("`logits` is seated at lane {}", case.rows)),
+            "the refusal names the seat: {why}"
+        );
+    }
+
+    /// [`a_beam_step_answers_what_the_interpreter_answers`] over many steps:
+    /// the stage's own state carried across fires on the device (its scores,
+    /// tokens, the parents' mask rows, slots, positions), each step's logits
+    /// new, every reader each step what the interpreter, stepped alongside,
+    /// puts there.
+    #[test]
+    fn beam_steps_answer_what_the_interpreter_answers() {
+        use eta_compiler::codegen::program::{Backend, emit_program};
+        use eta_compiler::contract::{beam_stage, wire};
+        use eta_compiler::eval::interp::{Instance, NoKernels, PassInputs, Value};
+        use eta_compiler::plan::compile_bound;
+        const STEPS: u32 = 16;
+        let Ok(context) = Context::bind() else {
+            eprintln!("no device: skipping");
+            return;
+        };
+        let bf16 = |x: f32| {
+            let b = x.to_bits();
+            f32::from_bits((b + 0x7fff + ((b >> 16) & 1)) & 0xffff_0000)
+        };
+        let step_logits = |len: usize, step: u32| -> Vec<f32> {
+            let mut state = 0x9e37_79b9_7f4a_7c15u64 ^ u64::from(step).wrapping_mul(0x2545_f491_4f6c_dd1d);
+            (0..len)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    bf16(((state >> 11) as f64 / (1u64 << 53) as f64) as f32 * 16.0 - 8.0)
+                })
+                .collect()
+        };
+        let mut wrong = Vec::new();
+        for case in beam_stage() {
+            let stages = compile_bound(&case.bound);
+            let backend = Backend::parse("metal").expect("the metal codegen");
+            let registration = ProgramRegistration {
+                program_hash: 0xbea1_0000 ^ u64::from(case.rows),
+                emitted_kernels: emit_program(backend, &stages, &case.bound),
+                emitter_version: backend.emitter_version(),
+                launch: eta_compiler::codegen::launch::build(&case.bound, &stages),
+                ..Default::default()
+            };
+            let pools = crate::store::Pools::guests_only(&context, CHUNK, 4).expect("a pool");
+            let mut plane = Plane::new();
+            plane.set_flight(1, 1, case.rows);
+            let program = plane.register(&context, &registration).expect("registers");
+            let facts = plane.facts(program, &pools).expect("facts");
+            let count = case.bound.container.channels.len();
+            let ids: Vec<ChannelId> = (1..=count as u64).map(ChannelId).collect();
+            let (instance, rings) = slots_for(&pools, &facts, 0);
+            let id = plane
+                .bind(
+                    &context,
+                    program,
+                    &case.wire_seeds(),
+                    Extents {
+                        row_count: case.rows,
+                        sampled_rows: case.rows,
+                        query_len: case.rows,
+                        ..Extents::default()
+                    },
+                    GeometryClass::Host,
+                    PortMask::NONE,
+                    &ids,
+                    session::Pooled {
+                        pools: &pools,
+                        instance: &instance,
+                        rings: &rings,
+                    },
+                )
+                .expect("binds");
+            let mut reference = Instance::new(&case.bound, &case.seeds).expect("instantiates");
+            let carve = guests(&context);
+            'steps: for step in 0..STEPS {
+                let values = step_logits(case.logits.len(), step);
+                let _logits = seat_case(&context, &mut plane, id, &case, &values);
+                let fired = plane.fire(&context, id, Attach::Epilogue, &carve).expect("fires");
+                assert!(matches!(fired, Fired::Committed), "{} step {step}: {fired:?}", case.name);
+                let inputs = PassInputs {
+                    outputs: vec![("logits".to_string(), 0, Value::F32(values))],
+                };
+                let stepped = reference
+                    .step(&case.bound, &inputs, &mut NoKernels)
+                    .expect("the interpreter steps");
+                assert!(stepped.committed, "{} step {step}: {:?}", case.name, stepped.missed);
+                // Every channel the stage carries on the device (its mask,
+                // slots, positions, fill), as an engine's port reads it.
+                for channel in 0..case.bound.container.channels.len() as u32 {
+                    if case.readers.contains(&channel) {
+                        continue;
+                    }
+                    let Some(want) = reference.peek(channel) else {
+                        continue;
+                    };
+                    let want = wire(&want);
+                    let got = plane.instance(id).expect("bound").head_cell(channel).expect("reads");
+                    if got != want {
+                        wrong.push(format!(
+                            "{} step {step}: carried channel {channel}: {:02x?} != {:02x?}",
+                            case.name,
+                            &got[..got.len().min(16)],
+                            &want[..want.len().min(16)]
+                        ));
+                        break 'steps;
+                    }
+                }
+                for &channel in &case.readers {
+                    let want = wire(&reference.host_take(&case.bound, channel).expect("a cell"));
+                    let got = plane
+                        .instance_mut(id)
+                        .expect("bound")
+                        .take(channel)
+                        .expect("reads")
+                        .expect("a cell");
+                    if got != want {
+                        wrong.push(format!(
+                            "{} step {step}: channel {channel}: {got:02x?} != {want:02x?}",
+                            case.name
+                        ));
+                        break 'steps;
+                    }
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// [`beam_steps_answer_what_the_interpreter_answers`] with the served
+    /// beam's seeds: a prompt past the mask's first word.
+    #[test]
+    fn beam_steps_with_a_prompt_past_a_word_answer_what_the_interpreter_answers() {
+        use eta_compiler::codegen::program::{Backend, emit_program};
+        use eta_compiler::contract::{beam_stage, wire};
+        use eta_compiler::eval::interp::{Instance, NoKernels, PassInputs, Value};
+        use eta_compiler::plan::compile_bound;
+        const STEPS: u32 = 16;
+        let Ok(context) = Context::bind() else {
+            eprintln!("no device: skipping");
+            return;
+        };
+        let bf16 = |x: f32| {
+            let b = x.to_bits();
+            f32::from_bits((b + 0x7fff + ((b >> 16) & 1)) & 0xffff_0000)
+        };
+        let step_logits = |len: usize, step: u32| -> Vec<f32> {
+            let mut state = 0x9e37_79b9_7f4a_7c15u64 ^ u64::from(step).wrapping_mul(0x2545_f491_4f6c_dd1d);
+            (0..len)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    bf16(((state >> 11) as f64 / (1u64 << 53) as f64) as f32 * 16.0 - 8.0)
+                })
+                .collect()
+        };
+        let mut wrong = Vec::new();
+        for mut case in beam_stage().into_iter().take(1) {
+            // Served seeds over the w2 fixture's shapes: a 33-token prompt,
+            // so the slots the beams write lie past the mask's first word.
+            use eta_compiler::eval::interp::Value as Seed;
+            const N: u32 = 33;
+            let width = case.bound.container.channels[7].shape.dims()[1];
+            let rows = case.rows;
+            for (at, value) in case.seeds.iter_mut() {
+                *value = match *at {
+                    7 => Seed::Bool(
+                        (0..rows)
+                            .flat_map(|lane| (0..width).map(move |p| p < N || p == N + lane))
+                            .collect(),
+                    ),
+                    8 => Seed::U32((N..N + rows).collect()),
+                    9 => Seed::U32(vec![N; rows as usize]),
+                    10 => Seed::U32(vec![N + rows]),
+                    _ => value.clone(),
+                };
+            }
+            let stages = compile_bound(&case.bound);
+            let backend = Backend::parse("metal").expect("the metal codegen");
+            let registration = ProgramRegistration {
+                program_hash: 0xbea4_0000 ^ u64::from(case.rows),
+                emitted_kernels: emit_program(backend, &stages, &case.bound),
+                emitter_version: backend.emitter_version(),
+                launch: eta_compiler::codegen::launch::build(&case.bound, &stages),
+                ..Default::default()
+            };
+            let pools = crate::store::Pools::guests_only(&context, CHUNK, 4).expect("a pool");
+            let mut plane = Plane::new();
+            plane.set_flight(1, 1, case.rows);
+            let program = plane.register(&context, &registration).expect("registers");
+            let facts = plane.facts(program, &pools).expect("facts");
+            let count = case.bound.container.channels.len();
+            let ids: Vec<ChannelId> = (1..=count as u64).map(ChannelId).collect();
+            let (instance, rings) = slots_for(&pools, &facts, 0);
+            let id = plane
+                .bind(
+                    &context,
+                    program,
+                    &case.wire_seeds(),
+                    Extents {
+                        row_count: case.rows,
+                        sampled_rows: case.rows,
+                        query_len: case.rows,
+                        ..Extents::default()
+                    },
+                    GeometryClass::Host,
+                    PortMask::NONE,
+                    &ids,
+                    session::Pooled {
+                        pools: &pools,
+                        instance: &instance,
+                        rings: &rings,
+                    },
+                )
+                .expect("binds");
+            let mut reference = Instance::new(&case.bound, &case.seeds).expect("instantiates");
+            let carve = guests(&context);
+            'steps: for step in 0..STEPS {
+                let values = step_logits(case.logits.len(), step);
+                let _logits = seat_case(&context, &mut plane, id, &case, &values);
+                let fired = plane.fire(&context, id, Attach::Epilogue, &carve).expect("fires");
+                assert!(matches!(fired, Fired::Committed), "{} step {step}: {fired:?}", case.name);
+                let inputs = PassInputs {
+                    outputs: vec![("logits".to_string(), 0, Value::F32(values))],
+                };
+                let stepped = reference
+                    .step(&case.bound, &inputs, &mut NoKernels)
+                    .expect("the interpreter steps");
+                assert!(stepped.committed, "{} step {step}: {:?}", case.name, stepped.missed);
+                // Every channel the stage carries on the device (its mask,
+                // slots, positions, fill), as an engine's port reads it.
+                for channel in 0..case.bound.container.channels.len() as u32 {
+                    if case.readers.contains(&channel) {
+                        continue;
+                    }
+                    let Some(want) = reference.peek(channel) else {
+                        continue;
+                    };
+                    let want = wire(&want);
+                    let got = plane.instance(id).expect("bound").head_cell(channel).expect("reads");
+                    if got != want {
+                        wrong.push(format!(
+                            "{} step {step}: carried channel {channel}: {:02x?} != {:02x?}",
+                            case.name,
+                            &got[..got.len().min(16)],
+                            &want[..want.len().min(16)]
+                        ));
+                        break 'steps;
+                    }
+                }
+                for &channel in &case.readers {
+                    let want = wire(&reference.host_take(&case.bound, channel).expect("a cell"));
+                    let got = plane
+                        .instance_mut(id)
+                        .expect("bound")
+                        .take(channel)
+                        .expect("reads")
+                        .expect("a cell");
+                    if got != want {
+                        wrong.push(format!(
+                            "{} step {step}: channel {channel}: {got:02x?} != {want:02x?}",
+                            case.name
+                        ));
+                        break 'steps;
+                    }
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// The beam step's loop-carried mask, as the engine's `AttnMask` port
+    /// reads it (`ports::resolve`: the cell at the channel's head): the
+    /// epilogue takes and puts it every fire, each step's admitting the
+    /// slot it wrote, so after a fire the head cell is no longer the seed.
+    /// Served, it read the seed every step, and the recurrence replayed one
+    /// row and the attention saw the prompt alone.
+    #[test]
+    fn the_beam_masks_head_cell_is_what_its_epilogue_put() {
+        use eta_compiler::codegen::program::{Backend, emit_program};
+        use eta_compiler::contract::{beam_stage, wire};
+        use eta_compiler::plan::compile_bound;
+        let Ok(context) = Context::bind() else {
+            return;
+        };
+        let mut wrong = Vec::new();
+        for case in beam_stage() {
+            let channels = &case.bound.container.channels;
+            let Some(mask) = channels.iter().position(|decl| {
+                matches!(decl.dtype, eta_ir::container::ChanDType::Concrete(eta_ir::types::Dtype::Bool))
+            }) else {
+                wrong.push(format!("{}: no bool channel to read", case.name));
+                continue;
+            };
+            let seed = case
+                .seeds
+                .iter()
+                .find(|(at, _)| *at as usize == mask)
+                .map(|(_, value)| wire(value))
+                .expect("the mask is seeded");
+            let stages = compile_bound(&case.bound);
+            let backend = Backend::parse("metal").expect("the metal codegen");
+            let registration = ProgramRegistration {
+                program_hash: 0xbea3_0000 ^ u64::from(case.rows),
+                emitted_kernels: emit_program(backend, &stages, &case.bound),
+                emitter_version: backend.emitter_version(),
+                launch: eta_compiler::codegen::launch::build(&case.bound, &stages),
+                ..Default::default()
+            };
+            let pools = crate::store::Pools::guests_only(&context, CHUNK, 4).expect("a pool");
+            let mut plane = Plane::new();
+            plane.set_flight(1, 1, case.rows);
+            let program = plane.register(&context, &registration).expect("registers");
+            let facts = plane.facts(program, &pools).expect("facts");
+            let ids: Vec<ChannelId> = (1..=channels.len() as u64).map(ChannelId).collect();
+            let (instance, rings) = slots_for(&pools, &facts, 0);
+            let id = plane
+                .bind(
+                    &context,
+                    program,
+                    &case.wire_seeds(),
+                    Extents {
+                        row_count: case.rows,
+                        sampled_rows: case.rows,
+                        query_len: case.rows,
+                        ..Extents::default()
+                    },
+                    GeometryClass::DecodeEnvelope,
+                    PortMask::of(&[eta_ir::registry::Port::EmbedTokens, eta_ir::registry::Port::AttnMask]),
+                    &ids,
+                    session::Pooled {
+                        pools: &pools,
+                        instance: &instance,
+                        rings: &rings,
+                    },
+                )
+                .expect("binds");
+            let before = plane.instance(id).expect("bound").head_cell(mask as u32).expect("reads");
+            assert_eq!(before, seed, "{}: the head cell holds the seed at bind", case.name);
+            let _logits = seat_case(&context, &mut plane, id, &case, &case.logits);
+            let carve = guests(&context);
+            for step in 0..3 {
+                plane.fire(&context, id, Attach::Epilogue, &carve).expect("fires");
+                for &reader in &case.readers {
+                    let _ = plane.instance_mut(id).expect("bound").take(reader);
+                }
+                let now = plane.instance(id).expect("bound").head_cell(mask as u32).expect("reads");
+                let envelope = plane.envelope(id).expect("an envelope").expect("decode-envelope bound");
+                let resolved = envelope.mask.clone().unwrap_or_default();
+                let packed: Vec<u8> = resolved
+                    .chunks(8)
+                    .map(|bits| bits.iter().enumerate().fold(0u8, |byte, (at, &on)| byte | (u8::from(on) << at)))
+                    .collect();
+                eprintln!("{} step {step}: head changed {} resolved==head {} resolved==seed {} resolved len {}", case.name, now != seed, packed == now, packed == seed, resolved.len());
+                if now == seed {
+                    wrong.push(format!("{} step {step}: the mask's head cell is still the seed", case.name));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
     fn slots_for(

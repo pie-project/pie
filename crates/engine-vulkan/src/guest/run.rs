@@ -111,42 +111,31 @@ impl<'a> OnDevice<'a> {
             };
             let root = &package.values[global as usize];
             if root.source == ValueOrigin::Output {
-                let seat = self.offered(root).ok_or_else(|| Fault::Program {
-                    at: "guest::run",
-                    why: format!(
-                        "this pass reads output {:?} of lane {}, which the fire read out none of",
-                        root.output, root.lane
-                    ),
-                })?;
                 let (_, held) = self.session.span(at, local).ok_or_else(|| Fault::Program {
                     at: "guest::run",
                     why: format!("the output root {local} is not stage {at}'s"),
                 })?;
                 let values = u32::try_from(held / 4).unwrap_or(0);
-                if values > seat.width {
-                    return Err(Fault::Program {
-                        at: "guest::run",
-                        why: format!(
-                            "this pass reads {values} values of output {:?} and the fire read \
-                             out {}",
-                            root.output, seat.width
-                        ),
-                    });
-                }
+                // Row `r` of a root read at lane `k` is lane `k + r`'s
+                // readout row, each through its own seat.
+                let rows = engine_gpu::guest::run::row_seats(&self.seats, root, values)?;
                 let heap = self.session.heap(at).ok_or_else(|| Fault::Program {
                     at: "guest::run",
                     why: format!("stage {at} has no heap"),
                 })?;
-                let (into, _) = self
+                let (mut into, _) = self
                     .session
                     .span(at, local)
                     .expect("the span was just read");
-                if seat.dtype != Dtype::Bf16 {
-                    let heap = heap.clone();
-                    frame.copy(seat.seat, seat.at, &heap, into, u64::from(values) * 4)?;
-                } else {
-                    self.widen
-                        .encode(&frame, seat.seat, seat.at, heap, into, values)?;
+                for (seat, values) in rows {
+                    if seat.dtype != Dtype::Bf16 {
+                        let heap = heap.clone();
+                        frame.copy(seat.seat, seat.at, &heap, into, u64::from(values) * 4)?;
+                    } else {
+                        self.widen
+                            .encode(&frame, seat.seat, seat.at, heap, into, values)?;
+                    }
+                    into += u64::from(values) * 4;
                 }
                 continue;
             }
@@ -332,12 +321,15 @@ fn keeps(package: &LaunchPackage, channel: u32, bytes: u64) -> bool {
 }
 
 /// Whether a deferred pass keeps `channel`'s puts on the device: every one the
-/// host does not read.
+/// host does not read, at the fire (a `fold` count, an `attn_mask`) or after.
 fn host_reads_not(package: &LaunchPackage, channel: u32) -> bool {
     let read_at_fire = package.ports.iter().any(|binding| {
         binding.channel == channel
             && !binding.is_const
-            && binding.port == eta_ir::registry::Port::Fold
+            && matches!(
+                binding.port,
+                eta_ir::registry::Port::Fold | eta_ir::registry::Port::AttnMask
+            )
     });
     !read_at_fire
         && package

@@ -52,9 +52,12 @@ impl Raw {
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST
         };
-        // The pool's segments hold guest configs a stage binds as a uniform
+        // The pool's segments hold guest configs a stage binds as a uniform,
+        // and a guest stage's own buffers its steps' uniforms
         // (`guest::session`), beside everything bound as storage.
-        if owner == engine_gpu::books::owners::POOL && kind == Memory::Device {
+        if (owner == engine_gpu::books::owners::POOL || owner == engine_gpu::books::owners::GUEST)
+            && kind == Memory::Device
+        {
             usage |= wgpu::BufferUsages::UNIFORM;
         }
         let buffer = core.device.create_buffer(&wgpu::BufferDescriptor {

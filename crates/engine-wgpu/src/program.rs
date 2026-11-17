@@ -291,7 +291,7 @@ impl Guests {
 pub struct Plane {
     programs: BTreeMap<ProgramId, Arc<ExecPlan>>,
 
-    forms: engine_gpu::guest::Forms<crate::device::Api>,
+    forms: engine_gpu::guest::Forms,
 
     channels: BTreeMap<ChannelId, Arc<ChannelState>>,
     instances: BTreeMap<InstanceId, Instance>,
@@ -301,8 +301,15 @@ pub struct Plane {
     #[cfg(feature = "wgpu")]
     widen: Option<Arc<crate::guest::widen::Widen>>,
 
+    /// Every guest pipeline, built at the load (`Programs::load`).
     #[cfg(feature = "wgpu")]
-    codes: BTreeMap<ProgramId, Arc<crate::guest::session::Code>>,
+    library: Option<Arc<crate::guest::session::Library>>,
+
+    /// Each program's stages' step uniforms, made at its first bind and
+    /// shared by every bind after: a round that binds the program afresh
+    /// makes none.
+    #[cfg(feature = "wgpu")]
+    step_args: BTreeMap<ProgramId, Vec<crate::guest::session::StepArgs>>,
 
     tally: Arc<Tally>,
 }
@@ -646,7 +653,15 @@ impl Plane {
                 )));
             }
         };
-        let span = self.lane_span(seat, instance, "embed_tokens", ids.len(), rows, lane_at)?;
+        let indptr = engine_gpu::program::embed_indptr(&seat.plan, &seat.inst);
+        let span = engine_gpu::program::lane_span(
+            &indptr,
+            instance,
+            "embed_tokens",
+            ids.len(),
+            rows,
+            lane_at,
+        )?;
         Ok(Some(ids[span].to_vec()))
     }
 
@@ -655,64 +670,7 @@ impl Plane {
             what: "instance",
             id: instance.0,
         })?;
-        Ok(self.embed_indptr(seat).len().saturating_sub(1).max(1))
-    }
-
-    fn embed_indptr(&self, seat: &Instance) -> Vec<u32> {
-        match seat
-            .plan
-            .package
-            .ports
-            .iter()
-            .find(|binding| binding.port == Port::EmbedIndptr)
-        {
-            Some(binding) if binding.is_const => seat
-                .plan
-                .const_ports
-                .iter()
-                .find(|c| c.port == Port::EmbedIndptr)
-                .map(|c| match &c.value {
-                    Value::U32(v) => v.clone(),
-                    Value::I32(v) => v.iter().map(|&x| x as u32).collect(),
-                    _ => Vec::new(),
-                })
-                .unwrap_or_default(),
-            Some(binding) => match seat.inst.channels[binding.channel as usize].front() {
-                Value::U32(v) => v,
-                Value::I32(v) => v.iter().map(|&x| x as u32).collect(),
-                _ => Vec::new(),
-            },
-            None => Vec::new(),
-        }
-    }
-
-    fn lane_span(
-        &self,
-        seat: &Instance,
-        instance: InstanceId,
-        what: &str,
-        cells: usize,
-        rows: usize,
-        lane_at: usize,
-    ) -> Result<std::ops::Range<usize>, Refusal> {
-        if lane_at == 0 && cells == rows {
-            return Ok(0..rows);
-        }
-        let indptr = self.embed_indptr(seat);
-        let (Some(&start), Some(&end)) = (indptr.get(lane_at), indptr.get(lane_at + 1)) else {
-            return Err(Refusal::Program(format!(
-                "instance {instance}: `{what}` carries {cells} cell(s) for lane {lane_at} of \
-                 {rows} row(s), and the program's `embed_indptr` ({indptr:?}) does not place it"
-            )));
-        };
-        let (start, end) = (start as usize, end as usize);
-        if end < start || end > cells || end - start != rows {
-            return Err(Refusal::Program(format!(
-                "instance {instance}: `{what}` places lane {lane_at} at {start}..{end} of \
-                 {cells} cell(s), and the lane has {rows} row(s)"
-            )));
-        }
-        Ok(start..end)
+        Ok(engine_gpu::program::lane_count(&seat.plan, &seat.inst))
     }
 
     pub fn publish(
@@ -895,12 +853,6 @@ impl Plane {
                 "instance {instance}: the `attn_mask` ring is empty at the fire"
             )));
         }
-        let Value::Bool(cells) = ring.front() else {
-            return Err(Refusal::Program(format!(
-                "instance {instance}: `attn_mask` holds {:?}, not bools",
-                ring.front().dtype()
-            )));
-        };
         let keys = seat
             .plan
             .package
@@ -908,28 +860,9 @@ impl Plane {
             .get(binding.channel as usize)
             .and_then(|decl| decl.shape.last().copied())
             .map_or(0, |keys| keys as usize);
-        if keys == 0 || cells.len() % keys != 0 {
-            return Err(Refusal::Program(format!(
-                "instance {instance}: `attn_mask` holds {} cell(s) over {keys} key(s)",
-                cells.len()
-            )));
-        }
-        let span = self.lane_span(
-            seat,
-            instance,
-            "attn_mask",
-            cells.len() / keys,
-            rows,
-            lane_at,
-        )?;
-        let masks: Vec<engine::fire::Mask> = cells[span.start * keys..span.end * keys]
-            .chunks_exact(keys)
-            .map(|row| engine::fire::Mask::new(runs_of(row), keys as u64))
-            .collect();
-        Ok(Some(match masks.as_slice() {
-            [only] => engine::fire::Masking::Extent(only.clone()),
-            _ => engine::fire::Masking::Rows(masks),
-        }))
+        let indptr = engine_gpu::program::embed_indptr(&seat.plan, &seat.inst);
+        engine_gpu::program::lane_mask(&ring.front(), keys, &indptr, instance, rows, lane_at)
+            .map(Some)
     }
 
     #[cfg(feature = "wgpu")]
@@ -962,6 +895,10 @@ impl Plane {
         if self.widen.is_none() {
             return Err("the plane built no readout widen at the load".to_owned());
         }
+        let library = self
+            .library
+            .clone()
+            .ok_or_else(|| "the plane built no guest pipelines at the load".to_owned())?;
         let extents = eta_exec::Extents {
             row_count: binding.extents.row_count,
             token_count: binding.extents.token_count,
@@ -969,21 +906,25 @@ impl Plane {
             query_len: binding.extents.query_len,
             key_len: binding.extents.key_len,
         };
-        let code = match self.codes.get(&binding.program) {
-            Some(code) => Arc::clone(code),
+        let args = match self.step_args.get(&binding.program) {
+            Some(args) => args.clone(),
             None => {
-                let code = Arc::new(
-                    crate::guest::session::Code::new(device, compiled.all())
-                        .map_err(|why| format!("its device code did not build: {why}"))?,
-                );
-                self.codes.insert(binding.program, Arc::clone(&code));
-                code
+                let args = compiled
+                    .all()
+                    .iter()
+                    .map(|lowered| crate::guest::session::StepArgs::of(device, lowered))
+                    .collect::<engine_gpu::error::Result<Vec<_>>>()
+                    .map_err(|why| format!("its step uniforms did not build: {why}"))?;
+                self.step_args.insert(binding.program, args.clone());
+                args
             }
         };
         crate::guest::session::Session::new(
             device,
             &plan.package.plans,
-            code,
+            compiled.all(),
+            &args,
+            library,
             &extents,
             &crate::guest::session::Tables {
                 pools: place.pools,
@@ -1105,30 +1046,6 @@ impl Plane {
     }
 }
 
-fn runs_of(row: &[u8]) -> Vec<u32> {
-    let mut runs = Vec::new();
-    let mut current = false;
-    let mut count = 0u32;
-    if row.first().is_some_and(|&cell| cell != 0) {
-        runs.push(0);
-        current = true;
-    }
-    for &cell in row {
-        let value = cell != 0;
-        if value == current {
-            count += 1;
-        } else {
-            runs.push(count);
-            current = value;
-            count = 1;
-        }
-    }
-    if !row.is_empty() {
-        runs.push(count);
-    }
-    runs
-}
-
 impl engine_gpu::program::Programs<crate::device::Api> for Plane {
     fn register(&mut self, registration: &ProgramRegistration) -> Result<ProgramId, Refusal> {
         Plane::register(self, registration)
@@ -1140,11 +1057,16 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
     ) -> Result<(), Refusal> {
         #[cfg(feature = "wgpu")]
         {
+            let library = crate::guest::session::Library::build(place.device).map_err(|why| {
+                Refusal::Program(format!("the guest pipelines did not build: {why}"))
+            })?;
+            self.library = Some(Arc::new(library));
             let widen = crate::guest::widen::Widen::new(place.device).map_err(|why| {
                 Refusal::Program(format!("the readout widen did not build: {why}"))
             })?;
             self.widen = Some(Arc::new(widen));
         }
+        // A build with no device builds nothing, and binds no instance.
         #[cfg(not(feature = "wgpu"))]
         let _ = place;
         Ok(())
@@ -1152,6 +1074,20 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
 
     fn package(&self, program: ProgramId) -> Option<&eta_compiler::codegen::launch::LaunchPackage> {
         Plane::package(self, program)
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn built_serving(&self) -> u64 {
+        self.library
+            .as_ref()
+            .map_or(0, |library| library.built_serving())
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn forget_step(&mut self, call: u32) {
+        if let Some(library) = &self.library {
+            library.forget(call);
+        }
     }
 
     fn facts(
@@ -1247,5 +1183,53 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
 
     fn reads(&self, instance: InstanceId) -> Vec<(String, u32)> {
         Plane::reads(self, instance)
+    }
+
+    fn fire_seated(
+        &mut self,
+        device: &crate::device::Context,
+        instance: InstanceId,
+        seats: Vec<Vec<engine_gpu::guest::run::Readout<'_, crate::device::Api>>>,
+    ) -> Result<(), Refusal> {
+        let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
+            what: "instance",
+            id: instance.0,
+        })?;
+        #[cfg(feature = "wgpu")]
+        {
+            seat.gate.settle(instance)?;
+            let widen = self.widen.as_ref().ok_or_else(|| {
+                Refusal::Program(format!(
+                    "instance {instance} has a device half, but the plane built no readout widen"
+                ))
+            })?;
+            let mut half = seat.half.lock().expect("half lock poisoned");
+            let session = &half.session;
+            let unread = engine_gpu::guest::run::unread_seat(
+                &half.plan.package,
+                |at, local| session.span(at, local).map(|(_, held)| held),
+                &seats,
+            )
+            .map_err(|fault| Refusal::Program(fault.to_string()))?;
+            if let Some((output, lane)) = unread {
+                return Err(engine_gpu::program::unread(instance, &output, lane));
+            }
+            half.fire(
+                device,
+                widen,
+                &self.tally,
+                Pass {
+                    seats,
+                    at: Stage::Epilogue,
+                },
+            )
+        }
+        #[cfg(not(feature = "wgpu"))]
+        {
+            let _ = (seat, device, seats);
+            Err(Refusal::Program(format!(
+                "instance {instance}: this build carries no wgpu device, so a guest pass has nowhere to run"
+            )))
+        }
     }
 }

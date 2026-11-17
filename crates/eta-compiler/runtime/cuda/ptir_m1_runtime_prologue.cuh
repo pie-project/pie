@@ -317,17 +317,25 @@ __device__ __forceinline__ float m1_intrinsic_load(
   return __uint_as_float(bits);
 }
 
+// An intrinsic's storage modes: 0 f32 rows `stride` apart, 1 bf16 rows, 2 a
+// table of pointers to bf16 rows, 3 i32 rows, 4 a table of pointers to f32
+// rows (a row a lane, wherever each lies).
+__device__ __forceinline__ bool m1_intrinsic_row_table(m1_u32 mode) {
+  return mode == 2u || mode == 4u;
+}
+
 __device__ __forceinline__ float m1_intrinsic_row_load(
     const m1_u8* input,
     m1_u64 row,
     m1_u32 column,
     m1_u32 stride,
     m1_u32 mode) {
-  if (mode != 2u)
+  if (!m1_intrinsic_row_table(mode))
     return m1_intrinsic_load(
         input, row * (m1_u64)stride + column, mode);
   const m1_u64 row_address =
       reinterpret_cast<const m1_u64*>(input)[row];
+  if (mode == 4u) return reinterpret_cast<const float*>(row_address)[column];
   const m1_u16 value =
       reinterpret_cast<const m1_u16*>(row_address)[column];
   return __uint_as_float((m1_u32)value << 16);
@@ -446,6 +454,10 @@ __device__ __forceinline__ float4 m1_intrinsic_row_load4(
     const m1_u64 index = row * (m1_u64)stride + column;
     return reinterpret_cast<const float4*>(input + index * 4u)[0];
   }
+  if (mode == 4u) {
+    const m1_u8* row_base = reinterpret_cast<const m1_u8*>(reinterpret_cast<const m1_u64*>(input)[row]);
+    return reinterpret_cast<const float4*>(row_base + (m1_u64)column * 4u)[0];
+  }
   const m1_u8* base = input;
   m1_u64 index = row * (m1_u64)stride + column;
   if (mode == 2u) {
@@ -460,9 +472,9 @@ __device__ __forceinline__ float4 m1_intrinsic_row_load4(
 __device__ __forceinline__ bool m1_intrinsic_row_vectorable(
     const m1_u8* input, m1_u64 row, m1_u32 stride, m1_u32 mode) {
   if ((stride & 3u) != 0u) return false;
-  if (mode == 2u) {
+  if (m1_intrinsic_row_table(mode)) {
     const m1_u64 address = reinterpret_cast<const m1_u64*>(input)[row];
-    return (address & 7u) == 0u;
+    return (address & (mode == 4u ? 15u : 7u)) == 0u;
   }
   const m1_u64 element = mode == 0u ? 4u : 2u;
   const m1_u64 address = reinterpret_cast<m1_u64>(input) + row * (m1_u64)stride * element;
@@ -471,7 +483,7 @@ __device__ __forceinline__ bool m1_intrinsic_row_vectorable(
 
 __device__ __forceinline__ const m1_u8* m1_intrinsic_row_base(
     const m1_u8* input, m1_u64 row, m1_u32 stride, m1_u32 mode) {
-  if (mode == 2u) {
+  if (m1_intrinsic_row_table(mode)) {
     return reinterpret_cast<const m1_u8*>(
         reinterpret_cast<const m1_u64*>(input)[row]);
   }
@@ -481,7 +493,7 @@ __device__ __forceinline__ const m1_u8* m1_intrinsic_row_base(
 
 __device__ __forceinline__ float m1_intrinsic_column_load(
     const m1_u8* row_base, m1_u32 column, m1_u32 mode) {
-  if (mode == 0u) return reinterpret_cast<const float*>(row_base)[column];
+  if (mode == 0u || mode == 4u) return reinterpret_cast<const float*>(row_base)[column];
   const m1_u32 bits =
       (m1_u32)reinterpret_cast<const m1_u16*>(row_base)[column] << 16;
   return __uint_as_float(bits);

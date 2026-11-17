@@ -1,5 +1,5 @@
 use eta_compiler::codegen::launch::{LaunchOp, LaunchPlanValue, LaunchStagePlan};
-use eta_compiler::codegen::wgsl::{RUNTIME, WORKGROUP, emit_launch_steps};
+use eta_compiler::codegen::wgsl::{RUNTIME, WORKGROUP, emit_launch_steps, step_calls, step_module};
 use eta_compiler::plan::Dimension;
 use eta_ir::op::tags;
 use eta_ir::types::Dtype;
@@ -124,16 +124,19 @@ fn a_stepwise_module_compiles() {
     // sort's seed, 16 rounds, pre, finish and pack.
     assert_eq!(stepwise.steps.len(), 26, "every rung is its own dispatch");
 
-    let words = compile(&stepwise.source);
-    assert_eq!(words[0], 0x0723_0203, "the first word is the SPIR-V magic");
-
+    // Every call of the closed set is a module of its own, and each compiles.
+    let calls = step_calls();
+    for (at, call) in calls.iter().enumerate() {
+        let words = compile(&step_module("guest_pass", call));
+        assert_eq!(words[0], 0x0723_0203, "call {at} lowers to SPIR-V");
+    }
     for step in &stepwise.steps {
         assert!(
-            stepwise
-                .source
-                .contains(&format!("fn {}(@builtin(global_invocation_id)", step.entry)),
-            "step `{}` names an entry point the module does not declare",
-            step.entry
+            (step.call as usize) < calls.len(),
+            "step `{}` names call {}, past the {} listed",
+            step.entry,
+            step.call,
+            calls.len()
         );
     }
 }

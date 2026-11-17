@@ -93,6 +93,10 @@ pub struct Session {
     prepared: Vec<Option<Prepared>>,
     /// The outputs bound, by name and lane.
     bound: Vec<(String, u32)>,
+    /// Seats past lane 0 that no stage reads (no output there, and past the
+    /// rows of the output's lane-0 read): refused at the next fire, by name,
+    /// never dropped.
+    unread: Vec<(String, u32)>,
     poisoned: bool,
     fires: u64,
     airborne: Option<Vec<usize>>,
@@ -200,6 +204,7 @@ impl Session {
             cursors,
             prepared,
             bound: Vec::new(),
+            unread: Vec::new(),
             poisoned: false,
             fires: 0,
             airborne: None,
@@ -304,6 +309,14 @@ impl Session {
         cursors
     }
 
+    /// The cell at channel `channel`'s head, as the engine's port reads see
+    /// it (`ports::resolve`): for a test of the port's view.
+    #[cfg(test)]
+    pub fn head_cell(&self, channel: u32) -> Result<Vec<u8>> {
+        let head = self.cursors_now()[channel as usize].head;
+        self.rings.read_cell(channel as usize, head)
+    }
+
     #[must_use]
     pub const fn fires(&self) -> u64 {
         self.fires
@@ -395,6 +408,24 @@ impl Session {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Refuses a fire while a seat no stage reads is bound: an output at a
+    /// lane past 0 that the program reads nothing at, nor a row of its
+    /// lane-0 read reaches.
+    pub fn refuse_unread(&self) -> Result<()> {
+        match self.unread.first() {
+            None => Ok(()),
+            Some((name, lane)) => Err(Fault::program(
+                "program::session",
+                format!(
+                    "output `{name}` is seated at lane {lane}, which this program reads \
+                     nothing at: no stage reads `{name}` there, and its lane-0 read covers \
+                     fewer rows than {}",
+                    lane + 1
+                ),
+            )),
+        }
+    }
+
     pub fn bind_output(
         &mut self,
         name: &str,
@@ -405,8 +436,13 @@ impl Session {
         width: u32,
         stride: u32,
     ) -> Result<()> {
+        let mut read = false;
         for prepared in self.prepared.iter_mut().flatten() {
-            prepared.bind_output(name, lane, base, offset, dtype, width, stride)?;
+            read |= prepared.bind_output(name, lane, base, offset, dtype, width, stride)?;
+        }
+        self.unread.retain(|(named, at)| !(named == name && *at == lane));
+        if !read && lane > 0 {
+            self.unread.push((name.to_string(), lane));
         }
         if !self
             .bound
@@ -436,6 +472,7 @@ impl Session {
                  read from, and both fires would report the second's verdict",
             ));
         }
+        self.refuse_unread()?;
         if let Some(refused) = self.gate(compiled, plan, at)? {
             return Ok(refused);
         }
@@ -469,6 +506,7 @@ impl Session {
         compiled: &Compiled,
         plan: &ExecPlan,
     ) -> Result<Option<Fired>> {
+        self.refuse_unread()?;
         if self.airborne.is_some() {
             return Err(Fault::program(
                 "program::session",

@@ -62,10 +62,25 @@ pub trait Programs<B: Serve>: Default {
 
     fn package(&self, program: ProgramId) -> Option<&LaunchPackage>;
 
-    /// Builds what every instance's device half shares (the readout
-    /// widen's pipeline and its config), at the load: binding an instance
-    /// then builds its own stages and nothing else.
+    /// Builds what every instance's device half shares, at the load: the
+    /// pipeline of every call a guest stage can dispatch
+    /// ([`crate::guest::step_calls`]), and the readout widen's pipeline and
+    /// its config. Binding an instance, or registering a program, while
+    /// serving then builds no pipeline.
     fn load(&mut self, place: &Place<'_, B>) -> Result<(), Refusal>;
+
+    /// The pipelines built after the load, at a bind: none, where
+    /// [`Programs::load`] built every one a guest stage can dispatch.
+    fn built_serving(&self) -> u64 {
+        0
+    }
+
+    /// Takes guest step call `call`'s pipeline out, so the next bind that
+    /// dispatches it builds it while serving: the control of
+    /// [`Programs::built_serving`].
+    fn forget_step(&mut self, call: u32) {
+        let _ = call;
+    }
 
     /// What an instance of `program` holds in the pool's `Instance` and
     /// `Channel` slots (`Engine::program_facts`).
@@ -133,6 +148,160 @@ pub trait Programs<B: Serve>: Default {
 
     /// The outputs `instance` reads, each with the lane of its attachment.
     fn reads(&self, instance: InstanceId) -> Vec<(String, u32)>;
+
+    /// Fires `instance`'s epilogue over the output seats bound to it,
+    /// `seats[k]` its lane `k`'s, and waits for it. A seat no row the
+    /// program reads lies in is refused by name before anything runs.
+    fn fire_seated(
+        &mut self,
+        device: &B::Context,
+        instance: InstanceId,
+        seats: Vec<Vec<crate::guest::run::Readout<'_, B>>>,
+    ) -> Result<(), Refusal>;
+}
+
+/// The refusal of a seat no row of the program reads.
+#[must_use]
+pub fn unread(instance: InstanceId, output: &str, lane: usize) -> Refusal {
+    Refusal::Program(format!(
+        "instance {instance}: output `{output}` is bound at lane {lane}, which this program \
+         reads no row of"
+    ))
+}
+
+/// The rows `embed_indptr` places each of an instance's lanes at: its const
+/// value, or the cell its ring holds at the fire; empty when it binds none.
+#[must_use]
+pub fn embed_indptr(plan: &eta_exec::ExecPlan, inst: &eta_exec::InterpInstance) -> Vec<u32> {
+    use eta_ir::registry::Port;
+    let words = |value: &eta_exec::Value| match value {
+        eta_exec::Value::U32(v) => v.clone(),
+        eta_exec::Value::I32(v) => v.iter().map(|&x| x as u32).collect(),
+        _ => Vec::new(),
+    };
+    match plan
+        .package
+        .ports
+        .iter()
+        .find(|binding| binding.port == Port::EmbedIndptr)
+    {
+        Some(binding) if binding.is_const => plan
+            .const_ports
+            .iter()
+            .find(|c| c.port == Port::EmbedIndptr)
+            .map(|c| words(&c.value))
+            .unwrap_or_default(),
+        Some(binding) => inst
+            .channels
+            .get(binding.channel as usize)
+            .filter(|ring| !ring.is_empty())
+            .map(|ring| words(&ring.front()))
+            .unwrap_or_default(),
+        None => Vec::new(),
+    }
+}
+
+/// The lanes an instance's descriptor ports describe: one per
+/// `embed_indptr` bound pair, and one where it binds none.
+#[must_use]
+pub fn lane_count(plan: &eta_exec::ExecPlan, inst: &eta_exec::InterpInstance) -> usize {
+    embed_indptr(plan, inst).len().saturating_sub(1).max(1)
+}
+
+/// Lane `lane_at`'s rows of a port cell of `cells` rows a lane of `rows`
+/// rows reads: all of it for a lone lane, else where `embed_indptr` places it.
+pub fn lane_span(
+    indptr: &[u32],
+    instance: InstanceId,
+    what: &str,
+    cells: usize,
+    rows: usize,
+    lane_at: usize,
+) -> Result<std::ops::Range<usize>, Refusal> {
+    if lane_at == 0 && cells == rows {
+        return Ok(0..rows);
+    }
+    let (Some(&start), Some(&end)) = (indptr.get(lane_at), indptr.get(lane_at + 1)) else {
+        return Err(Refusal::Program(format!(
+            "instance {instance}: `{what}` carries {cells} cell(s) for lane {lane_at} of \
+             {rows} row(s), and the program's `embed_indptr` ({indptr:?}) does not place it"
+        )));
+    };
+    let (start, end) = (start as usize, end as usize);
+    if end < start || end > cells || end - start != rows {
+        return Err(Refusal::Program(format!(
+            "instance {instance}: `{what}` places lane {lane_at} at {start}..{end} of \
+             {cells} cell(s), and the lane has {rows} row(s)"
+        )));
+    }
+    Ok(start..end)
+}
+
+/// Lane `lane_at`'s attention mask out of the `attn_mask` cell `value` of an
+/// instance whose mask channel is `[.., keys]`: a row of runs for each of the
+/// lane's `rows` query rows, one extent where it has one.
+pub fn lane_mask(
+    value: &eta_exec::Value,
+    keys: usize,
+    indptr: &[u32],
+    instance: InstanceId,
+    rows: usize,
+    lane_at: usize,
+) -> Result<engine::fire::Masking, Refusal> {
+    let eta_exec::Value::Bool(cells) = value else {
+        return Err(Refusal::Program(format!(
+            "instance {instance}: `attn_mask` holds {:?}, not bools",
+            value.dtype()
+        )));
+    };
+    if keys == 0 || cells.len() % keys != 0 {
+        return Err(Refusal::Program(format!(
+            "instance {instance}: `attn_mask` holds {} cell(s) over {keys} key(s)",
+            cells.len()
+        )));
+    }
+    let span = lane_span(
+        indptr,
+        instance,
+        "attn_mask",
+        cells.len() / keys,
+        rows,
+        lane_at,
+    )?;
+    let masks: Vec<engine::fire::Mask> = cells[span.start * keys..span.end * keys]
+        .chunks_exact(keys)
+        .map(|row| engine::fire::Mask::new(mask_runs(row), keys as u64))
+        .collect();
+    Ok(match masks.as_slice() {
+        [only] => engine::fire::Masking::Extent(only.clone()),
+        _ => engine::fire::Masking::Rows(masks),
+    })
+}
+
+/// A row of bool cells as alternating run lengths, the first of cells unset.
+#[must_use]
+pub fn mask_runs(row: &[u8]) -> Vec<u32> {
+    let mut runs = Vec::new();
+    let mut current = false;
+    let mut count = 0u32;
+    if row.first().is_some_and(|&cell| cell != 0) {
+        runs.push(0);
+        current = true;
+    }
+    for &cell in row {
+        let value = cell != 0;
+        if value == current {
+            count += 1;
+        } else {
+            runs.push(count);
+            current = value;
+            count = 1;
+        }
+    }
+    if !row.is_empty() {
+        runs.push(count);
+    }
+    runs
 }
 
 /// The elements a cell of `shape` holds (a scalar holds one).

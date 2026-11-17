@@ -64,9 +64,12 @@ impl Raw {
         note_reservation();
         let size = bytes.max(4).next_multiple_of(4);
         let d = &core.device;
-        // The pool's segments hold guest configs a stage binds as a uniform
+        // The pool's segments hold guest configs a stage binds as a uniform,
+        // and a guest stage's own buffers its steps' uniforms
         // (`guest::session`), beside everything bound as storage.
-        let uniform = if owner == engine_gpu::books::owners::POOL {
+        let uniform = if owner == engine_gpu::books::owners::POOL
+            || owner == engine_gpu::books::owners::GUEST
+        {
             vk::BufferUsageFlags::UNIFORM_BUFFER
         } else {
             vk::BufferUsageFlags::empty()

@@ -13,30 +13,43 @@ use engine_gpu::store::Pools;
 use engine_gpu::store::layout::{CHANNEL, INSTANCE};
 
 use engine_gpu::guest::held::{self, consecutive};
-use engine_gpu::guest::session::{BINDINGS, StageTables, groups_for, stage_tables};
+use engine_gpu::guest::session::{
+    BINDINGS, StageTables, groups_for, stage_tables, step_stride, step_uniforms,
+};
 
 /// A span of a pool slot (or run) a guest holds.
 pub type Held = held::Held<crate::device::Api>;
 
-/// A stage's pipelines, which follow from its SPIR-V alone: built once per
-/// distinct stage and shared by every session that runs it, since a mobile
-/// driver takes seconds to build a sampler's worth of them.
-pub struct Built {
+/// Every guest pipeline: one a call of the closed set
+/// ([`engine_gpu::guest::step_calls`]), each from a module of its own, all
+/// on one layout. Built at load, before the engine serves, and shared by
+/// every session: a program registered while serving dispatches these and
+/// builds none. One a bind finds missing it builds then and counts
+/// ([`Library::built_serving`]).
+pub struct Library {
     core: Arc<Core>,
     layout: vk::PipelineLayout,
     set_layout: vk::DescriptorSetLayout,
-    pipelines: Vec<vk::Pipeline>,
+    /// By call; why one is missing where it did not lower or build.
+    pipelines: std::sync::Mutex<Vec<std::result::Result<vk::Pipeline, String>>>,
+    /// Pipelines [`Library::forget`] took out, which a session may still
+    /// dispatch: destroyed with the library.
+    retired: std::sync::Mutex<Vec<vk::Pipeline>>,
+    /// Pipelines built after the load, at a bind.
+    serving: std::sync::atomic::AtomicU64,
 }
 
-impl Drop for Built {
+impl Drop for Library {
     fn drop(&mut self) {
         let d = &self.core.device;
-        // SAFETY: the last `Arc<Built>` is gone with the last session that ran
-        // it; each session settles its frames before it drops, so no pending
-        // command uses these pipelines or layouts.
+        // SAFETY: the last `Arc<Library>` is gone with the plane and every
+        // session that ran its pipelines; each session settles its frames
+        // before it drops, so no pending command uses them.
+        let built = self.pipelines.get_mut().expect("library lock poisoned");
+        let retired = self.retired.get_mut().expect("library lock poisoned");
         unsafe {
-            for &pipeline in &self.pipelines {
-                d.destroy_pipeline(pipeline, None);
+            for pipeline in built.iter().flatten().chain(retired.iter()) {
+                d.destroy_pipeline(*pipeline, None);
             }
             d.destroy_pipeline_layout(self.layout, None);
             d.destroy_descriptor_set_layout(self.set_layout, None);
@@ -44,19 +57,248 @@ impl Drop for Built {
     }
 }
 
-/// Built stages by the hash of their SPIR-V and entry points.
-pub type BuiltStages = std::collections::HashMap<u64, Arc<Built>>;
+impl std::fmt::Debug for Library {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Library")
+            .field("calls", &engine_gpu::guest::step_calls())
+            .field("built", &self.built())
+            .finish()
+    }
+}
 
-fn stage_key(lowered: &engine_gpu::guest::Lowered<Vec<u32>>) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    lowered.code.hash(&mut hasher);
-    lowered.entries.hash(&mut hasher);
-    hasher.finish()
+impl Library {
+    /// Lowers and builds every call, spread over the host's cores: a driver
+    /// takes tens of milliseconds a pipeline.
+    pub fn build(device: &Context) -> Result<Library> {
+        let core = device.core();
+        let bindings: Vec<vk::DescriptorSetLayoutBinding> = crate::guest::stage_layout()
+            .into_iter()
+            .map(|(i, slot)| {
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(i)
+                    .descriptor_type(crate::guest::descriptor_type(slot))
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            })
+            .collect();
+        let d = &core.device;
+        // SAFETY: `d` is live; the create infos and what they borrow are
+        // locals that outlive their calls; the set layout is destroyed if
+        // the pipeline layout is refused.
+        let (set_layout, layout) = unsafe {
+            let set_layout = d
+                .create_descriptor_set_layout(
+                    &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+                    None,
+                )
+                .map_err(|e| core.fault("vkCreateDescriptorSetLayout", e))?;
+            let set_layouts = [set_layout];
+            match d.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts),
+                None,
+            ) {
+                Ok(layout) => (set_layout, layout),
+                Err(e) => {
+                    d.destroy_descriptor_set_layout(set_layout, None);
+                    return Err(core.fault("vkCreatePipelineLayout", e));
+                }
+            }
+        };
+        let lowered = lowered_calls();
+        let calls = lowered.len();
+        let threads = host_threads(calls);
+        let cache = device.pipeline_cache();
+        let handle = cache.handle();
+        let pipelines = spread(calls, threads, |call| {
+            lowered[call]
+                .as_ref()
+                .map_err(Clone::clone)
+                .and_then(|code| build_call(core, handle, layout, code))
+        });
+        cache.built();
+        if let Err(fault) = cache.persist() {
+            tracing::warn!(%fault, "writing the pipeline cache");
+        }
+        for (call, why) in pipelines
+            .iter()
+            .enumerate()
+            .filter_map(|(at, built)| built.as_ref().err().map(|why| (at, why)))
+        {
+            tracing::warn!(call, %why, "a guest step's pipeline did not build");
+        }
+        Ok(Library {
+            core: Arc::clone(core),
+            layout,
+            set_layout,
+            pipelines: std::sync::Mutex::new(pipelines),
+            retired: std::sync::Mutex::default(),
+            serving: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    /// The calls whose pipelines are built.
+    #[must_use]
+    pub fn built(&self) -> usize {
+        let pipelines = self.pipelines.lock().expect("library lock poisoned");
+        pipelines.iter().filter(|built| built.is_ok()).count()
+    }
+
+    /// The pipelines built after the load, each at a bind that found its
+    /// call missing: none, where the load built every call.
+    #[must_use]
+    pub fn built_serving(&self) -> u64 {
+        self.serving.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Takes call `call`'s pipeline out, so the next bind that dispatches
+    /// it builds it: the counter's control.
+    pub fn forget(&self, call: u32) {
+        let mut pipelines = self.pipelines.lock().expect("library lock poisoned");
+        if let Some(slot) = pipelines.get_mut(call as usize) {
+            let was = std::mem::replace(slot, Err("forgotten".to_owned()));
+            if let Ok(pipeline) = was {
+                self.retired
+                    .lock()
+                    .expect("library lock poisoned")
+                    .push(pipeline);
+            }
+        }
+    }
+
+    /// Call `call`'s pipeline; one the load did not build is built now,
+    /// counted, and named.
+    fn pipeline(&self, device: &Context, call: u32) -> Result<vk::Pipeline> {
+        let mut pipelines = self.pipelines.lock().expect("library lock poisoned");
+        let count = pipelines.len();
+        let slot = pipelines
+            .get_mut(call as usize)
+            .ok_or_else(|| Fault::Program {
+                at: "guest::session",
+                why: format!("guest step call {call} is past the {count} the library holds"),
+            })?;
+        if let Ok(pipeline) = slot {
+            return Ok(*pipeline);
+        }
+        let built = lowered_calls()[call as usize]
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|code| {
+                build_call(
+                    &self.core,
+                    device.pipeline_cache().handle(),
+                    self.layout,
+                    code,
+                )
+            });
+        self.serving
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        tracing::error!(
+            call,
+            "a bind built a guest step's pipeline the load did not"
+        );
+        *slot = built.clone();
+        built.map_err(|why| Fault::Program {
+            at: "guest::session",
+            why: format!("guest step call {call} has no pipeline: {why}"),
+        })
+    }
+}
+
+/// The host threads a build of `items` spreads over.
+fn host_threads(items: usize) -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .clamp(1, items.max(1))
+}
+
+/// Every call's SPIR-V, lowered once a process (it names no device), over
+/// the host's cores.
+fn lowered_calls() -> &'static [std::result::Result<Vec<u32>, String>] {
+    static LOWERED: std::sync::OnceLock<Vec<std::result::Result<Vec<u32>, String>>> =
+        std::sync::OnceLock::new();
+    LOWERED.get_or_init(|| {
+        let calls = engine_gpu::guest::step_calls();
+        spread(calls, host_threads(calls), |call| {
+            engine_gpu::guest::step_module(call)
+                .ok_or_else(|| format!("no step call {call}"))
+                .and_then(|source| {
+                    <crate::device::Api as engine_gpu::guest::Lower>::lower(call, source)
+                        .map_err(|why| why.to_string())
+                })
+        })
+    })
+}
+
+/// `work` of every index below `items`, over `threads` host threads, each
+/// taking the next index left: the costly ones (a sort's, a select's) do
+/// not queue behind one another on one thread.
+fn spread<T: Send>(items: usize, threads: usize, work: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut done: Vec<(usize, T)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut mine = Vec::new();
+                    loop {
+                        let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if at >= items {
+                            return mine;
+                        }
+                        mine.push((at, work(at)));
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("a build thread panicked"))
+            .collect()
+    });
+    done.sort_unstable_by_key(|(at, _)| *at);
+    done.into_iter().map(|(_, value)| value).collect()
+}
+
+/// Builds the pipeline of a call's SPIR-V on `layout`.
+fn build_call(
+    core: &Arc<Core>,
+    cache: vk::PipelineCache,
+    layout: vk::PipelineLayout,
+    code: &[u32],
+) -> std::result::Result<vk::Pipeline, String> {
+    let d = &core.device;
+    let name =
+        std::ffi::CString::new(engine_gpu::guest::ENTRY).expect("the entry name holds no nul");
+    // SAFETY: `d` is live and its pipeline cache is internally synchronised;
+    // `code` is SPIR-V naga emitted for `stage_layout`'s bindings, which
+    // `layout` binds; the module is destroyed only after the pipeline is
+    // built from it.
+    unsafe {
+        let module = d
+            .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(code), None)
+            .map_err(|e| core.fault("vkCreateShaderModule", e).to_string())?;
+        let info = vk::ComputePipelineCreateInfo::default()
+            .stage(
+                vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::COMPUTE)
+                    .module(module)
+                    .name(&name),
+            )
+            .layout(layout);
+        let built = d.create_compute_pipelines(cache, &[info], None);
+        d.destroy_shader_module(module, None);
+        built
+            .map(|pipelines| pipelines[0])
+            .map_err(|(_, e)| core.fault("vkCreateComputePipelines", e).to_string())
+    }
 }
 
 struct Stage {
-    built: Arc<Built>,
+    /// Its steps' pipelines, in dispatch order.
+    steps: Vec<vk::Pipeline>,
+    /// Its steps' uniforms, `stride` apart
+    /// ([`engine_gpu::guest::session::STEP_BINDING`]).
+    args: Buffer,
+    stride: u64,
 
     groups: u32,
     set: vk::DescriptorSet,
@@ -200,6 +442,10 @@ pub struct Session {
     status: Buffer,
     stages: Vec<Stage>,
     pool: vk::DescriptorPool,
+    set_layout: vk::DescriptorSetLayout,
+    layout: vk::PipelineLayout,
+    /// What the stages' pipelines and layouts belong to.
+    _library: Arc<Library>,
     /// The `Instance` slots the stages' tables lie in, in binding order,
     /// and whether they are one run.
     slots: Vec<u32>,
@@ -233,9 +479,10 @@ impl Session {
     pub fn new(
         device: &Context,
         plans: &[LaunchStagePlan],
-        code: &[engine_gpu::guest::Lowered<Vec<u32>>],
+        code: &[engine_gpu::guest::Lowered],
+        args: &[StepArgs],
         extents: &Extents,
-        built: &mut BuiltStages,
+        library: &Arc<Library>,
         kept: Kept,
         channels: Vec<engine::channel::ChannelId>,
         tables: &Tables<'_>,
@@ -278,18 +525,20 @@ impl Session {
             held::place_tables(tables.pools, INSTANCE, tables.slots, &bytes, tables.align)?;
         let mut placed = placed.into_iter();
         let mut stages = Vec::with_capacity(plans.len());
-        for ((plan, lowered), resolved) in plans.iter().zip(code).zip(resolved) {
-            let pipelines = match built.get(&stage_key(lowered)) {
-                Some(pipelines) => Arc::clone(pipelines),
-                None => {
-                    let pipelines = Arc::new(build_pipelines(device, lowered)?);
-                    built.insert(stage_key(lowered), Arc::clone(&pipelines));
-                    pipelines
-                }
-            };
+        if args.len() != plans.len() {
+            return Err(Fault::Program {
+                at: "guest::session",
+                why: format!(
+                    "{} stage plans but {} stages' step uniforms",
+                    plans.len(),
+                    args.len()
+                ),
+            });
+        }
+        for (((plan, lowered), resolved), args) in plans.iter().zip(code).zip(resolved).zip(args) {
             let tables = [(); 4].map(|()| placed.next().expect("four tables a stage"));
             stages.push(build_stage(
-                device, plan, lowered, resolved, tables, pipelines,
+                device, plan, lowered, resolved, tables, library, args,
             )?);
         }
 
@@ -299,6 +548,9 @@ impl Session {
                 .descriptor_count((BINDINGS - 1) * stages.len() as u32),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(stages.len() as u32),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
                 .descriptor_count(stages.len() as u32),
         ];
         // A package with no stages holds no sets, and Vulkan has no empty pool.
@@ -324,6 +576,9 @@ impl Session {
             status,
             stages,
             pool,
+            set_layout: library.set_layout,
+            layout: library.layout,
+            _library: Arc::clone(library),
             slots: tables.slots.to_vec(),
             run,
             kept,
@@ -342,7 +597,7 @@ impl Session {
             // it was sized for one set per stage and this runs once, at
             // construction. The layout is the stage's live set layout.
             let set = unsafe {
-                let layouts = [self.stages[at].built.set_layout];
+                let layouts = [self.set_layout];
                 d.allocate_descriptor_sets(
                     &vk::DescriptorSetAllocateInfo::default()
                         .descriptor_pool(self.pool)
@@ -371,6 +626,14 @@ impl Session {
                 (held(offs), vk::DescriptorType::STORAGE_BUFFER),
                 (whole(&stage.heap), vk::DescriptorType::STORAGE_BUFFER),
                 (held(cfg), vk::DescriptorType::UNIFORM_BUFFER),
+                (
+                    (
+                        stage.args.slab().buffer,
+                        0,
+                        u64::from(eta_compiler::codegen::wgsl::STEP_BYTES),
+                    ),
+                    vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
+                ),
             ];
             let infos: Vec<[vk::DescriptorBufferInfo; 1]> = buffers
                 .iter()
@@ -721,19 +984,11 @@ impl Session {
                 &[],
                 &[],
             );
-            d.cmd_bind_descriptor_sets(
-                cmd,
-                vk::PipelineBindPoint::COMPUTE,
-                stage.built.layout,
-                0,
-                &[stage.set],
-                &[],
-            );
 
             let between = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                 .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
-            for (step, &pipeline) in stage.built.pipelines.iter().enumerate() {
+            for (step, &pipeline) in stage.steps.iter().enumerate() {
                 if step > 0 {
                     d.cmd_pipeline_barrier(
                         cmd,
@@ -745,6 +1000,17 @@ impl Session {
                         &[],
                     );
                 }
+                // The step's node, rung and selector, at its own offset.
+                let offset = u32::try_from(step as u64 * stage.stride)
+                    .expect("a stage's step uniforms fit a dynamic offset");
+                d.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    self.layout,
+                    0,
+                    &[stage.set],
+                    &[offset],
+                );
                 d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
                 d.cmd_dispatch(cmd, groups, 1, 1);
             }
@@ -796,13 +1062,37 @@ impl Drop for Session {
     }
 }
 
+/// A stage's step uniforms ([`step_uniforms`]), `stride` apart: what a
+/// program's steps fix, so every bind of the program shares one.
+#[derive(Clone)]
+pub struct StepArgs {
+    buffer: Buffer,
+    stride: u64,
+}
+
+impl StepArgs {
+    pub fn of(device: &Context, lowered: &engine_gpu::guest::Lowered) -> Result<StepArgs> {
+        let stride = step_stride(device.core().limits.min_uniform_buffer_offset_alignment);
+        let uniforms = step_uniforms(&lowered.steps, stride);
+        let mut buffer = Buffer::with(
+            device,
+            uniforms.len() as u64,
+            Memory::Host,
+            engine_gpu::books::owners::GUEST,
+        )?;
+        buffer.write(0, &uniforms)?;
+        Ok(StepArgs { buffer, stride })
+    }
+}
+
 fn build_stage(
     device: &Context,
     plan: &LaunchStagePlan,
-    lowered: &engine_gpu::guest::Lowered<Vec<u32>>,
+    lowered: &engine_gpu::guest::Lowered,
     resolved: StageTables,
     tables: [Held; 4],
-    built: Arc<Built>,
+    library: &Library,
+    args: &StepArgs,
 ) -> Result<Stage> {
     let _ = plan;
     let StageTables {
@@ -811,6 +1101,11 @@ fn build_stage(
         scratch,
         ..
     } = resolved;
+    let steps = lowered
+        .steps
+        .iter()
+        .map(|step| library.pipeline(device, step.call))
+        .collect::<Result<Vec<_>>>()?;
     let heap = Buffer::zeroed(device, scratch, engine_gpu::books::owners::GUEST_STATE)?;
     let staging = Buffer::with(
         device,
@@ -826,7 +1121,9 @@ fn build_stage(
     )?;
 
     Ok(Stage {
-        built,
+        steps,
+        args: args.buffer.clone(),
+        stride: args.stride,
         groups: if lowered.strides_the_grid {
             groups_for(&descriptors, device.cores())
         } else {
@@ -841,113 +1138,4 @@ fn build_stage(
         landing,
         dirty: Vec::new(),
     })
-}
-
-fn build_pipelines(
-    device: &Context,
-    lowered: &engine_gpu::guest::Lowered<Vec<u32>>,
-) -> Result<Built> {
-    let core = device.core();
-    // The layout the stage's SPIR-V was checked against when it lowered.
-    let bindings: Vec<vk::DescriptorSetLayoutBinding> = crate::guest::stage_layout()
-        .into_iter()
-        .map(|(i, slot)| {
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(i)
-                .descriptor_type(crate::guest::descriptor_type(slot))
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE)
-        })
-        .collect();
-    let d = &core.device;
-    // SAFETY: `d` is live; every create info and the arrays and names it
-    // borrows are locals that outlive their call. `lowered.code` is SPIR-V
-    // the guest compiler emitted for these entry points and bindings. Each
-    // failure path destroys exactly what was made before it, and the module
-    // is destroyed only after the pipelines are built from it.
-    unsafe {
-        let set_layout = d
-            .create_descriptor_set_layout(
-                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
-                None,
-            )
-            .map_err(|e| core.fault("vkCreateDescriptorSetLayout", e))?;
-        let set_layouts = [set_layout];
-        let layout = match d.create_pipeline_layout(
-            &vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts),
-            None,
-        ) {
-            Ok(l) => l,
-            Err(e) => {
-                d.destroy_descriptor_set_layout(set_layout, None);
-                return Err(core.fault("vkCreatePipelineLayout", e));
-            }
-        };
-        let module = match d.create_shader_module(
-            &vk::ShaderModuleCreateInfo::default().code(&lowered.code),
-            None,
-        ) {
-            Ok(m) => m,
-            Err(e) => {
-                d.destroy_pipeline_layout(layout, None);
-                d.destroy_descriptor_set_layout(set_layout, None);
-                return Err(core.fault("vkCreateShaderModule", e));
-            }
-        };
-
-        let names: Vec<std::ffi::CString> = lowered
-            .entries
-            .iter()
-            .map(|entry| {
-                std::ffi::CString::new(entry.as_str())
-                    .expect("an emitted entry name is a WGSL identifier and holds no nul")
-            })
-            .collect();
-        let infos: Vec<vk::ComputePipelineCreateInfo> = names
-            .iter()
-            .map(|name| {
-                vk::ComputePipelineCreateInfo::default()
-                    .stage(
-                        vk::PipelineShaderStageCreateInfo::default()
-                            .stage(vk::ShaderStageFlags::COMPUTE)
-                            .module(module)
-                            .name(name),
-                    )
-                    .layout(layout)
-            })
-            .collect();
-        if infos.is_empty() {
-            d.destroy_shader_module(module, None);
-            return Ok(Built {
-                core: Arc::clone(core),
-                layout,
-                set_layout,
-                pipelines: Vec::new(),
-            });
-        }
-        let cache = device.pipeline_cache();
-        let built = d.create_compute_pipelines(cache.handle(), &infos, None);
-        d.destroy_shader_module(module, None);
-        match built {
-            Ok(pipelines) => {
-                // A sampler's stages take seconds to build on a phone; they
-                // reach the file now rather than with the next settle.
-                cache.built();
-                if let Err(fault) = cache.persist() {
-                    tracing::warn!(%fault, "writing the pipeline cache");
-                }
-                Ok(Built {
-                    core: Arc::clone(core),
-                    layout,
-                    set_layout,
-                    pipelines,
-                })
-            }
-            Err((_, e)) => {
-                d.destroy_pipeline_layout(layout, None);
-                d.destroy_descriptor_set_layout(set_layout, None);
-                Err(core.fault("vkCreateComputePipelines", e))
-            }
-        }
-    }
 }
