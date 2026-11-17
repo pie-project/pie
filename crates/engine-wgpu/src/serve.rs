@@ -60,7 +60,8 @@ impl Serve for Api {
         let measured = device.chip();
         let (chip, report) = crate::chip::resolve(&measured, boot.profiles.as_deref());
         crate::chip::SHELF.tell_untuned(&measured.name, &report);
-        let tuning = crate::tuning::Tuning::new(chip, device.cores());
+        let tuning = crate::tuning::Tuning::new(chip, device.cores())
+            .with_workgroup_bytes(device.workgroup_bytes());
         Ok((device, tuning))
     }
 

@@ -99,6 +99,11 @@ pub struct Rooms {
 
     spatial: Option<Room>,
 
+    /// A score capture's normalisers: a maximum and an inverse sum for each
+    /// (capturing lane, query head, observed row), a lane of the rung's
+    /// fires a row.
+    score: Option<Room>,
+
     copy: Option<CopyRoom>,
 
     bytes: u64,
@@ -264,11 +269,34 @@ impl Rooms {
                 Room::lay(&mut at, floats.div_ceil(4).max(1), 4, Dtype::F32)
             });
 
+        let score = trace
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.op {
+                Operation::Attn(Attn::ScoreCapture {
+                    q,
+                    head_dim,
+                    observe,
+                    ..
+                }) => of(*q).map(|rect| (rect.width / (*head_dim).max(1), *observe)),
+                _ => None,
+            })
+            .map(|(heads, observe)| {
+                kernels_slang::attn::score::stats_floats(1, heads, observe)
+            })
+            .max()
+            .filter(|floats| *floats > 0)
+            .map(|floats| {
+                let mut at = 0u64;
+                Room::lay(&mut at, u64::from(narrow.max_lanes), floats, Dtype::F32)
+            });
+
         let union = routed
             .map_or(0, |r| r.y.at + r.y.bytes())
             .max(index.map_or(0, |r| r.at + r.bytes()))
             .max(split.map_or(0, |r| r.part_lse.at + r.part_lse.bytes()))
-            .max(spatial.map_or(0, |r| r.at + r.bytes()));
+            .max(spatial.map_or(0, |r| r.at + r.bytes()))
+            .max(score.map_or(0, |r| r.at + r.bytes()));
 
         let copy =
             copy_ceiling(trace, compiled, map, budget, narrow.max_tokens).map(|bytes| CopyRoom {
@@ -283,6 +311,7 @@ impl Rooms {
             index,
             split,
             spatial,
+            score,
             copy,
             bytes,
         }
@@ -414,6 +443,11 @@ impl<'a, B: Backend> FireScratch<'a, B> {
             })
         };
         Some(mint())
+    }
+
+    /// A score capture's normalisers' room.
+    pub fn score_stats(&self, handles: &Handles<B>) -> Option<Result<Tensor>> {
+        Some(self.bind(handles, self.rooms.score?))
     }
 
     pub fn index_scores(&self, handles: &Handles<B>) -> Option<Result<Tensor>> {
