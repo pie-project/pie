@@ -277,38 +277,45 @@ pub fn unmeasured(rates: &profile::fire::Rates) -> Option<(&'static str, String)
     None
 }
 
-/// The side of the cube the warm-up's matmul first times one fire of, to
-/// size the rest ([`warm_side`]).
+/// The side of the cube the warm-up's size walk ([`warm_side`]) times
+/// first, and the one after it: the walk's first growth is theirs.
 pub const WARM_PROBE: u32 = 1024;
 
-/// How far under the device's bound on one submission the warm-up's one
-/// fire is held: a quarter of it, so a clock that sinks as it warms (a
-/// fire slower than the probe's estimate) still lands well inside it.
-pub const WARM_HEADROOM: f64 = 4.0;
-
-/// The side of the warm-up's cube matmul (`side x side x side`): the widest
-/// of [`WARM_PROBE`], doubled to [`WARM_SHAPE`]'s, whose one fire,
-/// estimated from the probe's (`probe_ns` for a [`WARM_PROBE`] cube, the
-/// time growing with the flops), stays within `max_submit` /
-/// [`WARM_HEADROOM`]; [`WARM_SHAPE`]'s where the device states no bound. A
-/// phone whose GPU faults a submission past its watchdog (KGSL's ~2 s)
-/// warms on a cube its one fire stays well inside it.
-#[must_use]
-pub fn warm_side(probe_ns: f64, max_submit: Option<std::time::Duration>) -> u32 {
+/// The side of the warm-up's cube matmul (`side x side x side`), walked up
+/// by doubling with a real fire timed at each size (`time(side)`, ns):
+/// [`WARM_PROBE`] / 2 and [`WARM_PROBE`] first, then the next size only
+/// while its fire, estimated from the last one timed by the growth the last
+/// two measured (their time ratio, carried forward: not the flops' ratio),
+/// fits `max_submit`; to [`WARM_SHAPE`]'s at most, which it is with no
+/// bound stated (nothing is walked then). The margin is the measurement's:
+/// no factor stands under the bound. A phone whose GPU faults a submission
+/// past its watchdog (KGSL's ~2 s) warms on a cube whose fire fits it.
+pub fn warm_side<E>(
+    max_submit: Option<std::time::Duration>,
+    mut time: impl FnMut(u32) -> Result<f64, E>,
+) -> Result<u32, E> {
     let Some(cap) = max_submit else {
-        return WARM_SHAPE.0;
+        return Ok(WARM_SHAPE.0);
     };
-    let room = cap.as_nanos() as f64 / WARM_HEADROOM;
+    let bound = cap.as_nanos() as f64;
+    let mut before = time(WARM_PROBE / 2)?;
+    let mut last = time(WARM_PROBE)?;
     let mut side = WARM_PROBE;
+    if last > bound {
+        return Ok(WARM_PROBE / 2);
+    }
     while side < WARM_SHAPE.0 {
-        let next = side * 2;
-        let scale = f64::from(next) / f64::from(WARM_PROBE);
-        if probe_ns.max(0.0) * scale.powi(3) > room {
+        let growth = last / before.max(f64::MIN_POSITIVE);
+        if last * growth > bound {
             break;
         }
-        side = next;
+        let next = time(side * 2)?;
+        if next > bound {
+            break;
+        }
+        (before, last, side) = (last, next, side * 2);
     }
-    side
+    Ok(side)
 }
 
 /// The bytes an attention of `shape` moves at least: its queries read and
@@ -1158,22 +1165,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The warm-up's cube is the widest whose one fire, estimated from the
-    /// probe's, stays within a quarter of the device's bound on a submission:
-    /// the Adreno 840's 8192^3 settled at 0.7 TFLOP/s, ~1.57 s a submit
-    /// against KGSL's ~2 s watchdog.
+    /// The warm-up's cube walks up while its next fire, estimated from the
+    /// last by the growth the last two measured, fits the device's bound on
+    /// one submission: the Adreno 840's 8192^3 ran ~1.57 s a submit against
+    /// KGSL's ~2 s watchdog.
     #[test]
-    fn the_warm_up_cube_stays_well_inside_the_bound_on_one_submission() {
+    fn the_warm_up_cube_walks_up_while_its_next_fire_fits_the_bound() {
         let kgsl = Some(std::time::Duration::from_secs(2));
-        // 1024^3 at 0.7 TFLOP/s: ~3.07 ms; 4096^3 ~196 ms, 8192^3 ~1.57 s.
-        let probe = gemm_flops(1024, 1024, 1024) / 700.0;
-        assert_eq!(warm_side(probe, kgsl), 4096);
-        // No bound stated: the widest.
-        assert_eq!(warm_side(probe, None), WARM_SHAPE.0);
-        // A fast card under the same bound: the widest fits.
-        assert_eq!(warm_side(probe / 100.0, kgsl), WARM_SHAPE.0);
-        // A probe past the room itself: the probe's cube, nothing wider.
-        assert_eq!(warm_side(1e10, kgsl), WARM_PROBE);
+        // Each doubling 8x the time, 1024^3 at 3 ms: 8192^3 at ~1.54 s fits.
+        let cubic = |side: u32| 3e6 * (f64::from(side) / 1024.0).powi(3);
+        let mut timed = Vec::new();
+        let side = warm_side(kgsl, |s| {
+            timed.push(s);
+            Ok::<f64, ()>(cubic(s))
+        })
+        .unwrap();
+        assert_eq!(side, 8192);
+        assert_eq!(timed, vec![512, 1024, 2048, 4096, 8192]);
+        // A device slowing past the flops' growth (each doubling 10x, as a
+        // clock sinking under its power cap): 4096^3 at 300 ms, the next
+        // estimated at 3 s, past the bound: it is never fired.
+        let sinking = |side: u32| 3e6 * 10f64.powf((f64::from(side) / 1024.0).log2());
+        let mut timed = Vec::new();
+        let side = warm_side(kgsl, |s| {
+            timed.push(s);
+            Ok::<f64, ()>(sinking(s))
+        })
+        .unwrap();
+        assert_eq!(side, 4096);
+        assert_eq!(timed, vec![512, 1024, 2048, 4096]);
+        // No bound stated: the widest, nothing timed.
+        let side = warm_side(None, |_| -> Result<f64, ()> {
+            panic!("timed with no bound")
+        });
+        assert_eq!(side, Ok(WARM_SHAPE.0));
+        // The probe itself past the bound: the cube under it.
+        assert_eq!(warm_side(kgsl, |_| Ok::<f64, ()>(3e9)), Ok(WARM_PROBE / 2));
     }
 
     /// The attention curve's keys are where its shape is compute-bound on

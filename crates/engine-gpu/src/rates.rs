@@ -449,17 +449,20 @@ fn elementwise<B: Serve>(rig: &mut Rig<'_, B>, timer: Timer<'_, B>, launch: f64)
 /// The device warmed ([`engine::rates::warm_up`]): rotations of a cube
 /// matmul over its planes, each one frame timed by the host's clock around
 /// its one submit, until the rate stops falling. The cube's side is
-/// [`engine::rates::warm_side`]'s: one fire of the
-/// [`engine::rates::WARM_PROBE`] cube timed first, and the widest cube
-/// whose one fire stays well inside the device's bound on a submission
-/// (none stated: [`engine::rates::WARM_SHAPE`]'s).
+/// [`engine::rates::warm_side`]'s: walked up by doubling, a real fire timed
+/// at each size, while the next one's fire, estimated by the growth the
+/// last two measured, fits the device's bound on a submission (none stated:
+/// [`engine::rates::WARM_SHAPE`]'s).
 fn warm<B: Serve>(
     rig: &mut Rig<'_, B>,
     tactic_at: &dyn Fn(u32) -> kernels_slang::linear::gemm::Tactic,
     timer: Timer<'_, B>,
 ) -> Result<(u32, engine::rates::Warmed)> {
-    let probe = {
-        let p = engine::rates::WARM_PROBE;
+    // The cube's side, walked up by real fires under the device's bound on
+    // one submission (`engine::rates::warm_side`): each size's second fire
+    // timed (its first builds and touches).
+    let max_submit = rig.max_submit;
+    let side = engine::rates::warm_side(max_submit, |p| {
         let act = rig.operand(p, p, Dtype::Bf16)?;
         let w = rig.operand(p, p, Dtype::Bf16)?;
         let y = rig.zeros(p, p, Dtype::Bf16)?;
@@ -469,13 +472,11 @@ fn warm<B: Serve>(
                 .map_err(fault("rates: matmul"))
         };
         let nothing = |_: &mut B::Frame| Ok(());
-        // The first fire builds and touches; the second is the probe.
         rig.frame(timer, 1, &fire, &nothing)?;
         let (_, ns) = rig.frame(timer, 1, &fire, &nothing)?;
         rig.release();
-        ns as f64
-    };
-    let side = engine::rates::warm_side(probe, rig.max_submit);
+        Ok::<f64, Fault>(ns as f64)
+    })?;
     let (m, n, k) = (side, side, side);
     let act = rig.operand(m, k, Dtype::Bf16)?;
     let weights = (0..weights_at(n, k))

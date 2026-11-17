@@ -23,9 +23,11 @@ pub fn provenance(device: &str) -> (&'static str, String) {
 
 /// The bound the platform states on one GPU submission, which the rates
 /// step holds each of its frames (and its warm-up's cube) within: on
-/// Android, KGSL's GPU fault timeout (~2 s, as Qualcomm's driver states it;
-/// a submission past it faults the context); none stated elsewhere yet.
-/// Until the device's limits derive it from the platform's watchdog, it is
+/// Android, KGSL's GPU fault timeout of 2 s (source: Qualcomm's msm KGSL
+/// kernel driver, whose dispatcher faults a GPU submission still running
+/// past it and resets the context; the Adreno 840's warm-up of ~1.57 s a
+/// submit ran just under it); none stated elsewhere yet. Until the device's
+/// limits derive it from the platform's watchdog (device-limits-2), it is
 /// this input.
 #[cfg(target_os = "android")]
 pub const STATED_SUBMIT_BOUND: Option<std::time::Duration> =
