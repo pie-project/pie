@@ -241,24 +241,21 @@ pub fn decode(
     // The matrix-core decode takes a group within one 16-column tile; a
     // wider group takes the vector decode.
     let blocks = (info.padded_batch_size as u32).saturating_mul(shape.num_kv_heads);
-    let (entry, threads) = if group <= 16 && shape.head_dim >= 512 {
-        // The widest heads split their columns over the wavefronts: a lane
-        // holding a 512-wide row's every column spills into scratch, which
-        // the HIP runtime allocates late and a load refuses.
-        (
-            format!(
-                "::pie::attn::paged_decode_cols<{}, {group}, {hnd}, {fp8}>",
-                shape.head_dim
-            ),
-            256,
-        )
-    } else if group <= 16 && shape.head_dim.is_multiple_of(32) {
+    let (entry, threads) = if group <= 16 && shape.head_dim.is_multiple_of(32) {
         // A group of eight or more weighs its values on the matrix core too
         // (`PVM`), whose staged value rows hold four wavefronts' rounds at
         // 256-wide heads.
-        let pvm = group >= 8 && shape.head_dim <= 256;
+        // At 512-wide heads every group does: a lane's 512 columns of
+        // vector accumulators, its key row and its value reads spill past
+        // the registers into scratch, while the matrix core's accumulator
+        // tiles sit in the AGPRs and the round's value rows stage in LDS a
+        // column half at a time (on an MI300X, gemma4-e4b's 8/2 heads decode
+        // level with the spilling vector kernel at 1-8 lanes and 7-16%
+        // faster past 2048 keys; 32/4 heads 30-50% faster).
+        let pvm = (group >= 8 && shape.head_dim <= 256) || shape.head_dim >= 512;
         // Eight wavefronts, or four (three or four blocks a CU, not one)
-        // once the grid is two blocks a CU.
+        // once the grid is two blocks a CU; four where the staged rows are
+        // 256 columns wide.
         let waves = if blocks >= 2 * plan.device.num_sm || (pvm && shape.head_dim > 128) {
             4
         } else {
