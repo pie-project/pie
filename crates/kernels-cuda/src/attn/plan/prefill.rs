@@ -249,8 +249,15 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
     };
     let o_indptr = narrow_all(op, "batch_prefill_o_indptr", &o_indptr)?;
 
-    let padded_batch_size = if req.enable_cuda_graph {
+    // A captured grid is laid for the widest plan its replays can take. A
+    // split layout's items reach the grid's split capacity; an unsplit one's
+    // never pass the rows' tiles, so its grid is those tiles: padding it to
+    // the split capacity re-pairs the CTAs on the SMs, and a replay ran
+    // attention up to a fifth slower than the same plan walked.
+    let padded_batch_size = if req.enable_cuda_graph && split_kv {
         u64::from(max_batch_size_if_split).max(total_num_tiles_q)
+    } else if req.enable_cuda_graph {
+        total_num_tiles_q
     } else {
         new_batch_size
     };
@@ -556,5 +563,36 @@ mod tests {
         // A 512-row rung's 16 tiles leave room for two chunks a tile: split.
         let half = captured(&[0, 512], &[0, 32], 512, 256);
         assert!(schedule("test", &half, &Device::L40S).unwrap().split_kv);
+    }
+
+    #[test]
+    fn an_unsplit_captured_grid_is_its_tiles_not_the_split_capacity() {
+        // A 1024-row rung's 32 tiles replay unsplit: its grid is those 32,
+        // as its eager plan's is, not the 35 items a split could take.
+        let wide = schedule(
+            "test",
+            &captured(&[0, 1024], &[0, 64], 1024, 1),
+            &Device::L40S,
+        )
+        .unwrap();
+        assert!(!wide.split_kv);
+        assert_eq!(wide.padded_batch_size, 32);
+        // Over two lanes a lane's tile can straddle: one more item.
+        let two = schedule(
+            "test",
+            &captured(&[0, 1024], &[0, 64], 1024, 2),
+            &Device::L40S,
+        )
+        .unwrap();
+        assert_eq!(two.padded_batch_size, 33);
+        // A split layout still lays the split's capacity.
+        let half = schedule(
+            "test",
+            &captured(&[0, 512], &[0, 32], 512, 1),
+            &Device::L40S,
+        )
+        .unwrap();
+        assert!(half.split_kv);
+        assert_eq!(half.padded_batch_size, 35);
     }
 }
