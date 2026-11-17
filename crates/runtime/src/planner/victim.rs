@@ -1,12 +1,12 @@
 use super::ProcessId;
-use super::rank::Rank;
+use super::rank::VictimOrder;
 use super::reclaim::Reclaim;
 use super::wait::EntryKey;
 
 #[derive(Clone, Copy)]
 pub(super) struct Victim {
     pub(super) pid: ProcessId,
-    pub(super) rank: Rank,
+    pub(super) order: VictimOrder,
     pub(super) e6_fresh: bool,
 }
 
@@ -26,11 +26,11 @@ pub(super) struct VictimSet {
 }
 
 impl VictimSet {
-    pub(super) fn preferred(&self) -> Vec<(ProcessId, Rank)> {
+    pub(super) fn preferred(&self) -> Vec<(ProcessId, VictimOrder)> {
         self.members
             .iter()
             .filter(|v| v.e6_fresh)
-            .map(|v| (v.pid, v.rank))
+            .map(|v| (v.pid, v.order))
             .collect()
     }
 }

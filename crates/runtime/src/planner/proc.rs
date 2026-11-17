@@ -5,7 +5,7 @@ use tokio::sync::Notify;
 
 use super::departure::Departure;
 use super::grant::Demand;
-use super::rank::Rank;
+use super::rank::{Rank, VictimOrder};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Residency {
@@ -17,6 +17,9 @@ pub(super) enum Residency {
 
 pub(super) struct Proc {
     pub(super) seq: u64,
+    /// When it last became resident (admitted or restored), on the same
+    /// count as `seq`: what [`VictimOrder`] reads past the policy's keys.
+    pub(super) came: u64,
     pub(super) key: i64,
     pub(super) held: bool,
     pub(super) state: Residency,
@@ -56,6 +59,8 @@ pub(super) struct Proc {
     /// Its fires stood unsettled past `FIRE_PROGRESS`, and the planner was
     /// told.
     pub(super) fire_lapsed: bool,
+    /// Fires settled since it last became resident.
+    pub(super) landed: u32,
     /// Its last restore found no device room for its parked role slots
     /// (instance tables, rings, guest state): it waits, queued, for a
     /// completion or an eviction to free some, never failed for it.
@@ -74,16 +79,23 @@ impl Proc {
         Rank::of(self.key, self.seq).kept(self.kept)
     }
 
+    /// Its place among victims ([`VictimOrder`]).
+    pub(super) fn victim_order(&self) -> VictimOrder {
+        VictimOrder::of(self.key, self.kept, self.came)
+    }
+
     /// A holder at rest: past every process, whose rank is what goes first,
     /// and the longest parked past all. `order` counts up as holders park.
     pub(super) fn rest(&mut self, order: u64) {
         self.key = i64::MIN;
         self.seq = u64::MAX - order;
+        self.came = self.seq;
     }
 
     pub(super) fn new(seq: u64) -> Self {
         Self {
             seq,
+            came: seq,
             key: 0,
             kept: 0,
             held: false,
@@ -106,6 +118,7 @@ impl Proc {
             fires: 0,
             fired_at: crate::rt::Instant::now(),
             fire_lapsed: false,
+            landed: 0,
             roles_short: false,
         }
     }

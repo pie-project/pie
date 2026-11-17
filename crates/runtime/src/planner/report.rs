@@ -142,10 +142,12 @@ impl ResidencyPlanner {
             handle.unfence();
         }
         let signal = self.with_inner(|inner| {
+            inner.came_back(pid);
             let proc = inner.procs.get_mut(&pid)?;
             debug_assert_eq!(proc.state, Residency::Restoring);
             proc.state = Residency::Resident;
             proc.progressed = false;
+            proc.landed = 0;
             proc.roles_short = false;
             Some(proc.signal.clone())
         });
