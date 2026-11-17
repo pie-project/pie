@@ -87,6 +87,68 @@ pub fn pack_within(p: &Problem, w: u32, h: u32) -> Result<Solution, Miss> {
     })
 }
 
+/// One shape a block may take: its size and its price (what the caller ranks it by: a step's
+/// cycles, a memory's bytes, ...).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Shape {
+    pub w: u32,
+    pub h: u32,
+    pub price: f64,
+}
+
+/// Combinations of shapes tried at most (the cheapest first).
+const COMBOS: usize = 4096;
+
+/// Blocks with no nets between them, each a choice of [`Shape`]s (`alts[i]`: block `i`'s),
+/// packed within `w` x `h`: the cheapest combination (the sum of its shapes' prices) that packs
+/// ([`pack_within`]), as each block's shape index and the solution; else the nearest miss over
+/// the combinations tried. The combinations are tried cheapest first, at most [`COMBOS`].
+pub fn pack_shapes(alts: &[Vec<Shape>], w: u32, h: u32) -> Result<(Vec<usize>, Solution), Miss> {
+    let mut combos: Vec<(f64, Vec<usize>)> = vec![(0.0, Vec::new())];
+    for a in alts {
+        let mut next = Vec::with_capacity(combos.len() * a.len());
+        for (price, pick) in &combos {
+            for (k, sh) in a.iter().enumerate() {
+                let mut p = pick.clone();
+                p.push(k);
+                next.push((price + sh.price, p));
+            }
+        }
+        next.sort_by(|x, y| x.0.total_cmp(&y.0));
+        next.truncate(COMBOS);
+        combos = next;
+    }
+    let mut nearest: Option<Miss> = None;
+    for (_, pick) in combos {
+        let mut x = 0;
+        let rects: Vec<(super::BlockKind, Rect)> = pick
+            .iter()
+            .enumerate()
+            .map(|(i, &k)| {
+                let s = alts[i][k];
+                let r = Rect::new(x, 0, s.w, s.h);
+                x += s.w;
+                (super::BlockKind::Reading(i), r)
+            })
+            .collect();
+        let hh = rects.iter().map(|(_, r)| r.h).max().unwrap_or(0);
+        let Ok(p) = Problem::of(x, hh, rects, &crate::wiring::Wiring::default(), &|_| {
+            super::NetKind::Other
+        }) else {
+            continue;
+        };
+        match pack_within(&p, w, h) {
+            Ok(s) => return Ok((pick, s)),
+            Err(m) => {
+                if nearest.is_none_or(|n| m.dx + m.dy < n.dx + n.dy) {
+                    nearest = Some(m);
+                }
+            }
+        }
+    }
+    Err(nearest.unwrap_or(Miss { dx: 0, dy: 0 }))
+}
+
 /// The orders the packing tries: every order up to 7 blocks; past that, by height and by width.
 fn orders(p: &Problem) -> Vec<Vec<usize>> {
     let n = p.blocks.len();
@@ -245,6 +307,29 @@ mod tests {
         let p = problem(&[(256, 877), (384, 1014), (130, 148)]);
         let s = super::pack_within(&p, 755, 1170).unwrap();
         assert_eq!((s.w, s.h), (640, 1025));
+        // shapes: the cheapest combination that packs (a VAE narrower but dearer)
+        let sh = |w, h, price| super::Shape { w, h, price };
+        let alts = vec![
+            vec![sh(256, 1100, 1.0)],
+            vec![sh(384, 1100, 1.0)],
+            vec![sh(130, 148, 1.0), sh(100, 60, 2.0)],
+        ];
+        let (pick, s) = super::pack_shapes(&alts, 755, 1170).unwrap();
+        assert_eq!(pick, [0, 0, 1]);
+        assert!(s.w <= 755 && s.h <= 1170);
+        assert_eq!(
+            super::pack_shapes(
+                &alts[..2]
+                    .iter()
+                    .cloned()
+                    .chain([vec![sh(130, 148, 1.0)]])
+                    .collect::<Vec<_>>(),
+                755,
+                1170
+            )
+            .unwrap_err(),
+            super::Miss { dx: 15, dy: 0 }
+        );
         let p = problem(&[(256, 1100), (384, 1100), (130, 148)]);
         assert_eq!(
             super::pack_within(&p, 755, 1170).unwrap_err(),
