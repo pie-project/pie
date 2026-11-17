@@ -48,6 +48,16 @@ impl Inner {
         })
     }
 
+    /// `pid` is resident again: the youngest resident, the first victim
+    /// past the policy's keys ([`super::rank::VictimOrder`]).
+    pub(super) fn came_back(&mut self, pid: ProcessId) {
+        let came = self.next_seq;
+        if let Some(proc) = self.procs.get_mut(&pid) {
+            proc.came = came;
+            self.next_seq += 1;
+        }
+    }
+
     /// The pages that, moved out whole, free the runs of chunks `waiter`
     /// asks past its kv: a bind short of guest-state room, or the restore
     /// of a process such a bind suspended ([`super::proc::Proc::bind_room`]).
