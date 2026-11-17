@@ -410,9 +410,9 @@ pub struct FireBindings {
 
     pub capture: bool,
 
-    /// Where the fire's capturing lanes write their readers' score rows;
-    /// `None` where the load captures none.
-    pub scores: Option<crate::scores::ScoreSeat>,
+    /// Where the fire's capturing lanes write their readers' rows; `None`
+    /// where the load captures none.
+    pub score_rows: Option<kernels_cuda::attn::score::CaptureRows>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1656,6 +1656,8 @@ impl<'c> Run<'c> {
             Dim::Patches => row(1),
             Dim::Readouts => return handle,
             Dim::Lanes => return handle,
+            // A capturing lane's rows are its reader's, never a carve's.
+            Dim::Capturing | Dim::ContextTimes(_) | Dim::ContextPages => return handle,
             Dim::LanesPlus(k) => lane(k),
             Dim::Images => lane(0),
             Dim::ImagesPlus(k) => lane(k),

@@ -108,7 +108,12 @@ mod tests {
             let bound = slots[at].is_some();
             match &decl.def {
                 Def::Op(_) | Def::Merge(_) => {
-                    let host = matches!(decl.ty, Ty::Struct(_));
+                    // A host struct, or a capturing lane's row (its reading
+                    // program's guest region holds it), is no arena slot.
+                    let host = match &decl.ty {
+                        Ty::Struct(_) => true,
+                        Ty::Tensor { shape, .. } => shape.first() == Some(&poem_ir::Dim::Capturing),
+                    };
                     assert_eq!(
                         bound,
                         !host,

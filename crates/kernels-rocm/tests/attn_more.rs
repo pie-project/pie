@@ -685,30 +685,43 @@ fn score_capture_averages_the_observed_rows_mass() {
         },
     )
     .unwrap();
-    let (observe, lane_offset, kv_max) = (3u32, 1u32, 40u32);
+    // The context past a lane's keys and short of another's.
+    let (observe, lane_offset, context) = (3u32, 1u32, 40u32);
     let rows = lane_offset + n;
+    let page_rows = context.div_ceil(ps);
     let scores = gpu.tensor(
-        &vec![9.0; (rows * hq * kv_max) as usize],
+        &vec![9.0; (rows * context) as usize],
         rows,
-        hq * kv_max,
+        context,
         Dtype::F32,
     );
-    // Each capturing lane's row where a `[lanes, heads * kv_max]` plane
-    // would hold it, as u64s; the lanes before them have no row.
-    let table: Vec<i32> = (0..rows)
-        .map(|lane| {
-            if lane < lane_offset {
-                0
-            } else {
-                scores.ptr + u64::from(lane * hq * kv_max) * 4
-            }
-        })
-        .flat_map(|at| [at as u32 as i32, (at >> 32) as u32 as i32])
-        .collect();
-    let table = kernels_rocm::attn::score::ScoreRows {
-        table: gpu.ints_shaped(&table, rows, 2).ptr,
+    let paged = gpu.tensor(
+        &vec![0.0; (rows * page_rows) as usize],
+        rows,
+        page_rows,
+        Dtype::F32,
+    );
+    // Each capturing lane's key row and page row, as u64s; the lanes
+    // before them have no row.
+    let table = |base: u64, floats: u32| -> u64 {
+        let words: Vec<i32> = (0..rows)
+            .map(|lane| {
+                if lane < lane_offset {
+                    0
+                } else {
+                    base + u64::from(lane * floats) * 4
+                }
+            })
+            .flat_map(|at| [at as u32 as i32, (at >> 32) as u32 as i32])
+            .collect();
+        gpu.ints_shaped(&words, rows, 2).ptr
+    };
+    let table = kernels_rocm::attn::score::CaptureRows {
+        keys: table(scores.ptr, context),
+        pages: table(paged.ptr, page_rows),
         lanes: rows,
-        plane: 0,
+        context,
+        page_size: ps,
     };
     let scale = 1.0 / (d as f32).sqrt();
     kernels_rocm::attn::score::capture(
@@ -718,11 +731,12 @@ fn score_capture_averages_the_observed_rows_mass() {
         &pool,
         d,
         hk,
+        hq,
         scale,
         observe,
         lane_offset,
-        kv_max,
         table,
+        true,
     )
     .unwrap();
     let got = gpu.read(&scores);
@@ -740,11 +754,12 @@ fn score_capture_averages_the_observed_rows_mass() {
                 &pools[0],
                 d,
                 hk,
+                hq,
                 scale,
                 observe,
                 lane_offset,
-                kv_max,
                 table,
+                true,
             )
             .unwrap();
         },
@@ -753,8 +768,8 @@ fn score_capture_averages_the_observed_rows_mass() {
     for r in 0..n as usize {
         let kv = kv_lens[r] as usize;
         let rows = (observe as usize).min(fresh[r] as usize);
+        let mut want = vec![0f64; context as usize];
         for h in 0..hq as usize {
-            let mut want = vec![0f64; kv_max as usize];
             for w in 0..rows {
                 let t = qo[r + 1] as usize - rows + w;
                 let limit = (kv - rows + w + 1).min(kv);
@@ -771,27 +786,75 @@ fn score_capture_averages_the_observed_rows_mass() {
                 let m = s.iter().copied().fold(f64::MIN, f64::max);
                 let z: f64 = s.iter().map(|x| (x - m).exp()).sum();
                 for (j, x) in s.iter().enumerate() {
-                    if j < kv_max as usize {
-                        want[j] += (x - m).exp() / z / rows as f64;
+                    if j < context as usize {
+                        want[j] += (x - m).exp() / z / (rows * hq as usize) as f64;
                     }
                 }
             }
-            let at = ((lane_offset as usize + r) * hq as usize + h) * kv_max as usize;
-            let want: Vec<f32> = want.iter().map(|&x| x as f32).collect();
-            close_abs(
-                &format!("score req {r} head {h}"),
-                &got[at..at + kv_max as usize],
-                &want,
-                2e-5,
-            );
         }
+        let at = (lane_offset as usize + r) * context as usize;
+        let want: Vec<f32> = want.iter().map(|&x| x as f32).collect();
+        close_abs(
+            &format!("score req {r}"),
+            &got[at..at + context as usize],
+            &want,
+            2e-5,
+        );
     }
     // The lanes before the capture's keep what they held.
     assert!(
-        got[..(lane_offset * hq * kv_max) as usize]
+        got[..(lane_offset * context) as usize]
             .iter()
             .all(|&x| x == 9.0)
     );
+    // The first layer's capture zeroes the row (`agrees` left it poisoned),
+    // the next layer's adds into what it left, and its pages sum it.
+    for zero in [true, false] {
+        kernels_rocm::attn::score::capture(
+            &ctx,
+            q,
+            &built,
+            &pool,
+            d,
+            hk,
+            hq,
+            scale,
+            observe,
+            lane_offset,
+            table,
+            zero,
+        )
+        .unwrap();
+    }
+    kernels_rocm::attn::score::pages(&ctx, table, lane_offset, n).unwrap();
+    let summed = gpu.read(&scores);
+    // The capturing lanes' rows (`agrees` poisons the rest).
+    let capturing = (lane_offset * context) as usize..;
+    for (i, (s, g)) in summed[capturing.clone()]
+        .iter()
+        .zip(&got[capturing])
+        .enumerate()
+    {
+        assert!(
+            (s - 2.0 * g).abs() <= 4e-5,
+            "summed at {i}: {s} against {}",
+            2.0 * g
+        );
+    }
+    let pages = gpu.read(&paged);
+    for lane in lane_offset as usize..rows as usize {
+        let row = &summed[lane * context as usize..(lane + 1) * context as usize];
+        let want: Vec<f32> = row
+            .chunks(ps as usize)
+            .map(|page| page.iter().sum())
+            .collect();
+        close_abs(
+            &format!("pages of lane {lane}"),
+            &pages[lane * page_rows as usize..(lane + 1) * page_rows as usize],
+            &want,
+            1e-5,
+        );
+    }
 }
 
 // ------------------------------------------------------------- dynconv --

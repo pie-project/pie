@@ -26,6 +26,21 @@ impl DispatchAttn for Run<'_> {
 }
 
 impl Run<'_> {
+    /// Where a capturing lane's rows lie: its reader's, through the fire's
+    /// tables (`crate::scores`).
+    fn capture_rows(
+        &self,
+        op: &'static str,
+    ) -> Result<kernels_cuda::attn::score::CaptureRows, kernels_cuda::Error> {
+        self.bindings()
+            .score_rows
+            .ok_or_else(|| kernels_cuda::Error::Backend {
+                op,
+                detail: "this load captures no attention scores, so it laid no row tables"
+                    .to_string(),
+            })
+    }
+
     pub(super) fn attention(&mut self, op: &Attn) -> Result<(), kernels_cuda::Error> {
         match op {
             Attn::ScoreCapture {
@@ -34,25 +49,14 @@ impl Run<'_> {
                 cache,
                 head_dim,
                 kv_heads,
+                q_heads,
                 sm_scale,
                 observe,
-                kv_max,
-                scores,
+                into,
+                ..
             } => {
                 let mut q_rows = self.ragged(*q);
                 q_rows.data = self.windowed(q_rows.data);
-                let rows = self
-                    .bindings()
-                    .scores
-                    .as_ref()
-                    .and_then(|seat| seat.rows(*scores))
-                    .ok_or_else(|| kernels_cuda::Error::Backend {
-                        op: "attn.score_capture",
-                        detail: format!(
-                            "it writes value {}, which is no layer of the load's `attn.scores`",
-                            scores.0
-                        ),
-                    })?;
                 kernels_cuda::attn::score::capture(
                     self.ctx(),
                     q_rows,
@@ -60,11 +64,21 @@ impl Run<'_> {
                     &self.pool(*cache),
                     *head_dim,
                     *kv_heads,
+                    *q_heads,
                     *sm_scale,
                     *observe,
                     self.window().span().lane_offset,
-                    *kv_max,
-                    rows,
+                    self.capture_rows("attn.score_capture")?,
+                    into.is_none(),
+                )
+            }
+            Attn::ScorePages { .. } => {
+                let span = self.window().span();
+                kernels_cuda::attn::score::pages(
+                    self.ctx(),
+                    self.capture_rows("attn.score_pages")?,
+                    span.lane_offset,
+                    span.lanes,
                 )
             }
             Attn::Voxel {

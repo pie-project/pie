@@ -111,9 +111,9 @@ pub struct Shell {
     adapters: crate::blob::Adapters,
     held: Vec<u32>,
     readout_rows: crate::device::Buffer,
-    /// Where a fire's capturing lanes write their readers' score rows:
-    /// `None` where the trace captures none (`crate::scores`).
-    score_rows: Option<crate::scores::ScoreRows>,
+    /// Where a fire's capturing lanes write their readers' rows: `None`
+    /// where the trace captures none (`crate::scores`).
+    capture: Option<crate::scores::CaptureLayout>,
     /// The run a fire stages a host-resident bank's experts in, bounded at
     /// load and laid with the staged inputs (`experts::staging`).
     expert_staging: crate::experts::staging::Staging,
@@ -927,12 +927,12 @@ impl Shell {
         })
     }
 
-    /// Where instance `instance`'s captured score rows of its pass's lane
-    /// `lane` lie now: every layer's plane, one after another
-    /// (`crate::scores`). `None` for a lane its program reads none of.
+    /// Where instance `instance`'s capturing lane's rows lie now: its key
+    /// row of the load's context, then its page row (`crate::scores`).
+    /// `None` for an instance whose program reads none.
     #[must_use]
-    pub fn score_rows(&self, instance: engine::InstanceId, lane: u32) -> Option<u64> {
-        self.programs.score_rows(instance, lane)
+    pub fn score_rows(&self, instance: engine::InstanceId) -> Option<u64> {
+        self.programs.score_rows(instance)
     }
 
     /// The address of a guest item of `bytes` in `refs`, where they lie now.

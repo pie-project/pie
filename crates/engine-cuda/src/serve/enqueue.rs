@@ -143,7 +143,7 @@ impl Shell {
             rs_scratch,
             predicate: &mut self.predicate,
             readout_rows: &mut self.readout_rows,
-            score_rows: self.score_rows.as_mut(),
+            capture: self.capture.as_mut(),
             budget: &self.budget,
             fire_lanes,
             owed: &mut self.owed,
@@ -213,7 +213,7 @@ struct FireCtx<'a> {
     predicate: &'a mut Predicate,
     readout_rows: &'a mut Buffer,
     /// Where the fire's capturing lanes write their readers' rows.
-    score_rows: Option<&'a mut crate::scores::ScoreRows>,
+    capture: Option<&'a mut crate::scores::CaptureLayout>,
     budget: &'a Budget,
     /// The most lanes a fire carries, as the runtime is told.
     fire_lanes: u32,
@@ -306,34 +306,63 @@ impl Shell {
 }
 
 impl FireCtx<'_> {
-    /// Stages the score rows' table: for each of the fire's lanes, in the
-    /// fire's order, the row its reader keeps for it, and 0 for a lane no
-    /// instance attached in this fire reads scores of. A lane that captures
-    /// has a reader attached (`engine::fire::Step::validate_captures`).
-    fn stage_score_rows(&mut self, p: &Prepared<'_>) -> Result<()> {
-        let Some(table) = self.score_rows.as_deref_mut() else {
+    /// Stages the capture rows' tables (`crate::scores`): for each of the
+    /// fire's lanes, in the fire's order, the key row of the reader attached
+    /// at it where its class captures, and 0 for any other. Staged each
+    /// fire, so a row is found wherever its reader's slots lie now. Every
+    /// capturing lane a fire carries has its reader attached
+    /// (`engine::fire::Step::validate_captures`); arming's fires bind no
+    /// reader and name no row.
+    fn lay_capture(&mut self, p: &Prepared<'_>) -> Result<()> {
+        let Some(layout) = self.capture.as_deref_mut() else {
             return Ok(());
         };
-        let order = p.composition.lanes();
-        let mut at = vec![0u32; order.len()];
-        for (place, row) in order.iter().enumerate() {
-            if let Some(lane) = at.get_mut(row.source as usize) {
-                *lane = u32::try_from(place).unwrap_or(u32::MAX);
+        let lanes = p.composition.lanes();
+        let mut keys_at = vec![0u64; lanes.len()];
+        for (at, row) in lanes.iter().enumerate() {
+            if self.arming || !layout.captures(row.class as usize) {
+                continue;
             }
-        }
-        let mut rows = vec![0u64; order.len()];
-        for attached in p.attachments.iter().filter(|a| !a.adapter_only) {
-            for k in 0..attached.lanes {
-                let Some(row) = self.programs.score_rows(attached.instance, k) else {
-                    continue;
-                };
-                let source = (attached.lane + k) as usize;
-                if let Some(&place) = at.get(source) {
-                    rows[place as usize] = row;
-                }
+            let source = row.source;
+            let attached = p
+                .attachments
+                .iter()
+                .find(|attached| {
+                    !attached.adapter_only
+                        && (attached.lane..attached.lane + attached.lanes.max(1)).contains(&source)
+                })
+                .ok_or_else(|| {
+                    Fault::program(
+                        "serve::lay_capture",
+                        format!(
+                            "lane {source} captures its attention scores and no reader is \
+                             attached at it: only the fire that runs a pass's program captures \
+                             (engine::fire::Step::validate_captures refuses this at submit)"
+                        ),
+                    )
+                })?;
+            if attached.lanes > 1 {
+                return Err(Fault::program(
+                    "serve::lay_capture",
+                    format!(
+                        "lane {source} captures its attention scores, and instance {} is \
+                         attached at {} lanes: an instance holds one lane's score rows",
+                        attached.instance, attached.lanes
+                    ),
+                ));
             }
+            keys_at[at] = self.programs.score_rows(attached.instance).ok_or_else(|| {
+                Fault::program(
+                    "serve::lay_capture",
+                    format!(
+                        "lane {source} captures its attention scores, and instance {} attached \
+                         at it reads none of them, so it holds no score rows",
+                        attached.instance
+                    ),
+                )
+            })?;
         }
-        table.stage(self.device.stream(), &rows)
+        layout.stage(self.device.stream(), &keys_at)
     }
 
     fn gate(&mut self, p: &Prepared<'_>) -> Result<()> {
@@ -586,7 +615,7 @@ impl FireCtx<'_> {
             carve_lanes,
         )?;
         self.programs.set_span(span);
-        self.stage_score_rows(p)?;
+        self.lay_capture(p)?;
         if let Some(ep) = self.ep {
             ep.seats(forked)
                 .seat(ep.wire(), p.composition.bucket(), &mut slots);
@@ -760,10 +789,10 @@ impl FireCtx<'_> {
             device: self.device.device(),
             toggles: self.device.toggles(),
             capture: self.graphs.shaped(),
-            scores: self
-                .score_rows
+            score_rows: self
+                .capture
                 .as_deref()
-                .map(crate::scores::ScoreRows::seat),
+                .map(crate::scores::CaptureLayout::seat),
         };
         let place = At::new();
         let stream = Cell::new(0u32);
@@ -1231,34 +1260,40 @@ impl FireCtx<'_> {
         first_voxel: u32,
     ) -> Result<()> {
         let name = &out.decl.name;
+        // A capturing lane's rows are its reader's state, not the arena's:
+        // its key row, then its page row.
+        if crate::scores::captured(name) {
+            let (Some(keys_at), Some(layout)) =
+                (self.programs.score_rows(instance), self.capture.as_deref())
+            else {
+                return Err(Fault::Unbound {
+                    what: format!(
+                        "output `{name}` of lane {k}, which instance {instance} holds no score \
+                         rows for"
+                    ),
+                });
+            };
+            let (keys, pages) = layout.widths();
+            let (at, width) = if name == crate::scores::SCORES {
+                (keys_at, keys)
+            } else {
+                (keys_at + layout.key_bytes(), pages)
+            };
+            return self.programs.bind_output(
+                instance,
+                name,
+                k,
+                at,
+                crate::program::launch::INTRINSIC_STORAGE_F32,
+                width,
+                width,
+                0,
+            );
+        }
         let plane = plane_of(out.values[0], name)?;
         let storage = storage_of(plane.dtype)?;
         let width = plane.width;
         match out.decl.axis {
-            poem_ir::InputAxis::Lane if name == crate::scores::SCORES => {
-                // The reader's own rows, a layer's plane after another.
-                let (Some(rows), Some(table)) = (
-                    self.programs.score_rows(instance, k),
-                    self.score_rows.as_deref(),
-                ) else {
-                    return Err(Fault::Unbound {
-                        what: format!(
-                            "output `{name}` of lane {k}, which instance {instance}'s rows \
-                             hold none of"
-                        ),
-                    });
-                };
-                self.programs.bind_output(
-                    instance,
-                    name,
-                    k,
-                    rows,
-                    storage,
-                    table.width(),
-                    table.width(),
-                    0,
-                )
-            }
             poem_ir::InputAxis::Lane => {
                 let elem = poem_compiler::arena::elem_bytes(plane.dtype).unwrap_or(0);
                 let stride = match out.values.get(1) {

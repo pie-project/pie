@@ -146,6 +146,10 @@ pub struct Forward {
     weights: Vec<Option<Held>>,
     lanes: Vec<Lane>,
     placed: std::collections::BTreeMap<u32, Placed>,
+    /// The keys a lane of the load may hold and its kv page size
+    /// ([`Forward::at_context`]): what a score capture's row is a mass a
+    /// key, or a page, of.
+    context: Option<(u32, u32)>,
 }
 
 fn bf16(x: f32) -> f32 {
@@ -272,7 +276,17 @@ impl Forward {
             weights,
             lanes,
             placed,
+            context: None,
         })
+    }
+
+    /// This forward as a load of `context` keys a lane, in pages of
+    /// `page_size`, runs it: what a score capture's row is a mass a key, or
+    /// a page, of.
+    #[must_use]
+    pub fn at_context(mut self, context: u32, page_size: u32) -> Forward {
+        self.context = Some((context, page_size));
+        self
     }
 
     /// The engine's uniform placement of `experts` over `ranks` ranks of
@@ -336,6 +350,7 @@ impl Forward {
             lanes: &mut self.lanes,
             group: self.group.as_ref(),
             placed: &self.placed,
+            context: self.context,
         };
         let mut aliases = Vec::new();
         for (at, node) in self.trace.nodes.iter().enumerate() {
@@ -434,6 +449,7 @@ struct Run<'a> {
     lanes: &'a mut Vec<Lane>,
     group: Option<&'a Group>,
     placed: &'a std::collections::BTreeMap<u32, Placed>,
+    context: Option<(u32, u32)>,
 }
 
 impl Run<'_> {
@@ -584,20 +600,14 @@ impl Run<'_> {
                 q,
                 cache,
                 head_dim,
+                q_heads,
                 sm_scale,
                 observe,
-                kv_max,
+                into,
                 scores,
                 ..
-            } => self.capture(
-                q,
-                cache,
-                head_dim as usize,
-                sm_scale,
-                observe,
-                kv_max,
-                scores,
-            ),
+            } => self.capture(q, cache, head_dim as usize, q_heads, sm_scale, observe, into, scores),
+            Attn::ScorePages { keys, pages } => self.score_pages(keys, pages),
             Attn::Prefill { mask: Some(_), .. } => {
                 Err("a custom mask, which this forward does not read".into())
             }
@@ -657,30 +667,51 @@ impl Run<'_> {
         Ok(())
     }
 
-    /// The lane's attention mass over its first `kv_max` keys, averaged over
-    /// its last `observe` rows: a `kv_max` run per query head.
+    /// The lane's attention mass a key of its load's context, averaged over
+    /// its last `observe` rows and over the model's `q_heads` query heads
+    /// (this rank's heads attended, each a `1 / q_heads` share), added to
+    /// `into`'s row, or to a zeroed one: one row for the lane (it captures;
+    /// this forward runs one lane).
     #[allow(clippy::too_many_arguments)]
     fn capture(
         &mut self,
         q: ValueId,
         cache: ValueId,
         hd: usize,
+        q_heads: u32,
         scale: f32,
         observe: u32,
-        kv_max: u32,
+        into: Option<ValueId>,
         scores: ValueId,
     ) -> Result<(), String> {
+        let (context, _) = self.context.ok_or(
+            "a score capture is a mass a key of the load's context, and this forward was \
+             given no context (`Forward::at_context`)",
+        )?;
         let Def::Cache(c) = self.trace.values[cache.0 as usize].def else {
             return Err("a score capture over no cache".into());
+        };
+        let context = context as usize;
+        let mut out = match into {
+            Some(into) => {
+                let prior = self.floats(into)?;
+                if prior.v.len() != context {
+                    return Err(format!(
+                        "the row a score capture adds into holds {} keys, and the context {context}",
+                        prior.v.len()
+                    ));
+                }
+                prior.v.to_vec()
+            }
+            None => vec![0.0; context],
         };
         let q = self.floats(q)?;
         let lane = &self.lanes[c as usize];
         let heads = q.width / hd;
         let kv_heads = (lane.k.iter().flatten().next()).map_or(1, |k| k.len() / hd);
         let group = heads / kv_heads.max(1);
-        let kv_max = kv_max as usize;
-        let mut out = vec![0.0; heads * kv_max];
         let observed = (observe as usize).min(q.rows);
+        let share = 1.0 / (observed as f32 * q_heads as f32);
         for t in q.rows - observed..q.rows {
             let p = self.positions[t] as usize;
             for h in 0..heads {
@@ -694,14 +725,30 @@ impl Run<'_> {
                 }
                 let max = s.iter().copied().fold(f32::NEG_INFINITY, f32::max);
                 let sum: f32 = s.iter().map(|s| (s - max).exp()).sum();
-                for (at, s) in s.iter().enumerate().take(kv_max) {
-                    out[h * kv_max + at] += (s - max).exp() / sum / observed as f32;
+                for (at, s) in s.iter().enumerate().take(context) {
+                    out[at] += (s - max).exp() / sum * share;
                 }
             }
         }
         let lanes = usize::from(q.rows > 0);
-        out.truncate(lanes * heads * kv_max);
+        out.truncate(lanes * context);
         self.put(scores, lanes, out)
+    }
+
+    /// The lane's key row `keys` summed a kv page of its load's.
+    fn score_pages(&mut self, keys: ValueId, pages: ValueId) -> Result<(), String> {
+        let (_, page_size) = self.context.ok_or(
+            "a page's score sums the load's pages, and this forward was given no page size \
+             (`Forward::at_context`)",
+        )?;
+        let keys = self.floats(keys)?;
+        let rows = keys.rows;
+        let summed: Vec<f32> = keys
+            .v
+            .chunks(page_size.max(1) as usize)
+            .map(|page| page.iter().sum())
+            .collect();
+        self.put(pages, rows, summed)
     }
 
     fn elemwise(&mut self, op: &Elemwise) -> Result<(), String> {

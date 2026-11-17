@@ -86,6 +86,11 @@ pub struct Plane {
     /// The readout rows a lane may take in one fire: what an instance's
     /// row table is laid for.
     rows: u32,
+    /// The bytes a capturing lane's score rows take
+    /// (`crate::serve::CaptureLayout`): state of each instance of a program
+    /// that reads them out, held in its `Instance` slots after its tables;
+    /// 0 where the load reads out no scores.
+    capture: u64,
     next_program: u64,
     next_instance: u64,
 }
@@ -111,6 +116,7 @@ impl Plane {
             lanes: 64,
             arms: 1,
             rows: 1,
+            capture: 0,
             next_program: 1,
             next_instance: 1,
         }
@@ -266,6 +272,7 @@ impl Plane {
             .get(&program_id)
             .ok_or_else(|| Fault::program("program::plane", format!("no program {program_id}")))?;
         let adopted = self.seats_for(&program.plan, channels)?;
+        let capture = self.capture_of(program);
         let session = match Session::bind(
             &program.compiled,
             &program.plan,
@@ -274,6 +281,7 @@ impl Plane {
             &adopted,
             pooled,
             self.rows,
+            capture,
         ) {
             Ok(session) => session,
             Err(why) => {
@@ -306,6 +314,47 @@ impl Plane {
     /// The most lanes one fire flies, the frames in flight and the
     /// readout rows a lane may take in one fire: what the tables a binding
     /// opens are laid for.
+    /// The bytes a capturing lane's score rows take, held by each instance
+    /// of a program reading them out as its own state.
+    pub fn set_capture(&mut self, bytes: u64) {
+        self.capture = bytes;
+    }
+
+    /// The score-row bytes an instance of `program` holds: the load's rows
+    /// where it reads them out, none where it does not.
+    fn capture_of(&self, program: &Program) -> u64 {
+        if reads_scores(&program.plan) {
+            self.capture
+        } else {
+            0
+        }
+    }
+
+    /// Where `instance`'s score rows lie now (after a park, an unpark or
+    /// an evacuation as before): their buffer and byte offset there, `None`
+    /// where it holds none.
+    pub fn capture_row(
+        &self,
+        instance: InstanceId,
+    ) -> Result<Option<(crate::device::Buffer, u64)>> {
+        Ok(self
+            .session_of(instance)?
+            .capture_row()
+            .map(|(buffer, offset)| (buffer.clone(), offset)))
+    }
+
+    /// Reads `into.len()` bytes of `instance`'s score rows from byte `at`.
+    pub fn read_capture(&self, instance: InstanceId, at: u64, into: &mut [u8]) -> Result<()> {
+        self.session_of(instance)?.read_capture(at, into)
+    }
+
+    fn session_of(&self, instance: InstanceId) -> Result<&Session> {
+        self.instances
+            .get(&instance)
+            .map(|bound| &bound.session)
+            .ok_or_else(|| Fault::program("program::plane", format!("no instance {instance}")))
+    }
+
     pub fn set_flight(&mut self, lanes: u32, arms: usize, rows: u32) {
         self.lanes = lanes.max(1);
         self.arms = arms.max(1);
@@ -402,6 +451,7 @@ impl Plane {
             &program.compiled,
             program.plan.package.channels.len(),
             self.rows,
+            self.capture_of(program),
         );
         let layout = held::TableLayout::of(&sizes, instance_slot);
         if layout.slots > instance_per_chunk {
@@ -686,6 +736,8 @@ impl Plane {
             .programs
             .get(&program)
             .ok_or_else(|| Fault::program("program::plane", format!("no program {program}")))?;
+        // A member reading the scores out holds its lane's score rows in its
+        // instance's slots (`Plane::facts`), not in the fire's term.
         Ok(engine::FireFacts {
             a_lane: Session::scratch_for(&program.compiled, extents)?,
             // Its batch tables stand beside every fire, laid once a set
@@ -1030,6 +1082,13 @@ struct Bound {
 /// handed out from the top down (`next`), never under `floor` (the backed
 /// span's bottom). A stage starts again from the top, since stages fire one
 /// after another and none reads another's scratch.
+/// Whether `plan` reads a capturing lane's score rows out.
+fn reads_scores(plan: &ExecPlan) -> bool {
+    plan.outputs()
+        .into_iter()
+        .any(|(name, _)| matches!(name, "attn.scores" | "attn.scores.pages"))
+}
+
 #[derive(Debug, Clone)]
 pub struct GuestCarve {
     buffer: crate::device::Buffer,

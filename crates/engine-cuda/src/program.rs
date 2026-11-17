@@ -42,26 +42,23 @@ struct Batch {
 }
 
 impl Program {
-    /// The lanes of its pass it reads captured attention scores of
-    /// (`crate::scores`), from its first: 0 where it reads none.
+    /// Whether it reads a capturing lane's rows (`crate::scores`).
     #[must_use]
-    pub fn score_lanes(&self) -> u32 {
+    pub fn reads_scores(&self) -> bool {
         self.plan
             .outputs()
             .iter()
-            .filter(|(name, _)| *name == crate::scores::SCORES)
-            .map(|&(_, lane)| lane + 1)
-            .max()
-            .unwrap_or(0)
+            .any(|(name, _)| crate::scores::captured(name))
     }
 
-    /// What an instance keeps in the pool: its item, and past it a lane's
-    /// score rows of `score_bytes` for each lane it reads them of.
+    /// What an instance keeps in the pool: its item, and past it a
+    /// capturing lane's rows of `score_bytes` where it reads them.
     fn held(&self, score_bytes: u64) -> Held {
         let held = Held::of(&self.plan.package.channels);
-        match self.score_lanes() {
-            0 => held,
-            lanes => held.with_scores(u64::from(lanes) * score_bytes),
+        if self.reads_scores() {
+            held.with_scores(score_bytes)
+        } else {
+            held
         }
     }
 
@@ -214,9 +211,8 @@ pub struct Plane {
     /// The engine's lane arenas, where a sampler's blocks meet
     /// ([`launch::Arenas`]): laid at load ([`Plane::set_arenas`]).
     arenas: launch::Arenas,
-    /// A lane's captured score rows, which a program reading them keeps
-    /// in its instance's item (`crate::scores`); 0 where the load
-    /// captures none.
+    /// A capturing lane's rows, which a program reading them keeps in its
+    /// instance's item (`crate::scores`); 0 where the load captures none.
     score_bytes: u64,
 }
 
@@ -311,18 +307,16 @@ impl Plane {
     }
 
     /// The lane arenas the load laid.
-    /// A lane's captured score rows take `bytes` of a reader's item.
+    /// A capturing lane's rows take `bytes` of a reader's item.
     pub fn set_score_bytes(&mut self, bytes: u64) {
         self.score_bytes = bytes;
     }
 
-    /// Where instance `id`'s captured score rows of its pass's lane `lane`
-    /// lie now; `None` for a lane its program reads none of.
+    /// Where instance `id`'s capturing lane's rows lie now, its key row
+    /// first; `None` for an instance whose program reads none.
     #[must_use]
-    pub fn score_rows(&self, id: InstanceId, lane: u32) -> Option<u64> {
-        let bound = self.instances.get(&id)?;
-        let lanes = self.programs.get(&bound.program_id)?.score_lanes();
-        (lane < lanes).then_some(bound.scores? + u64::from(lane) * self.score_bytes)
+    pub fn score_rows(&self, id: InstanceId) -> Option<u64> {
+        self.instances.get(&id)?.scores
     }
 
     pub fn set_arenas(&mut self, arenas: launch::Arenas) {
