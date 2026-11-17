@@ -1530,13 +1530,15 @@ mod tests {
         ];
         assert_eq!(range.held_past(above), 6 * CHUNK);
         assert_eq!(range.held(above), 4 * CHUNK);
-        // Parted under a committed segment, or inside one, it is refused:
-        // what is backed never moves.
+        // Parted inside a segment, or under committed ones, every byte
+        // keeps its place: only the parted bytes go unbacked.
         let mut range = reserved((RESERVED + ABOVE) * CHUNK, SEGMENT * CHUNK, UNIT);
-        assert!(range.part(3 * CHUNK, CHUNK).is_err());
         range.committed = 2;
-        assert!(range.part(SEGMENT * CHUNK, CHUNK).is_err());
-        assert!(range.part(2 * SEGMENT * CHUNK, CHUNK).is_ok());
+        range.part(3 * CHUNK, CHUNK).unwrap();
+        assert_eq!(
+            laid(2 * SEGMENT * CHUNK, range.parted()),
+            [(0, 3 * CHUNK), (4 * CHUNK, (2 * SEGMENT - 4) * CHUNK)]
+        );
     }
 
     fn a_partial_page_is_a_whole_page() {

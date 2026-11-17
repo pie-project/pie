@@ -1232,7 +1232,7 @@ mod skip_tests {
     #[test]
     fn a_run_up_to_a_mid_segment_skip_lies_below_it_and_none_crosses_it() {
         let _context = crate::device::Context::bind(0, None).expect("a device context");
-        let mut pool = PhysicalPool::open(0, 1 << 30).expect("the pool opens");
+        let mut pool = PhysicalPool::open(0, u64::MAX).expect("the pool opens");
         // Stated in one run from the base (another worker reads it in
         // place): the skip runs mid-segment up to the activation.
         let chunks = fitted(&mut pool, 10, true);
