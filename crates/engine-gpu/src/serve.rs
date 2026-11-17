@@ -1116,10 +1116,16 @@ impl<B: Serve> Shell<B> {
             }
             let pick = match (&chosen, boot.top) {
                 (None, Top::Ruled) => {
+                    let row_tile: engine::roofline::RowTile =
+                        std::sync::Arc::new(move |m, n, k| {
+                            kernels_slang::linear::gemm::tile_for(B::TARGET, gemm, m, n, k)
+                                .row_tile()
+                        });
                     let (pick, _) = crate::top::choose(
                         &rungs,
                         live,
                         &device_profile,
+                        row_tile,
                         &device_name,
                         &counts,
                         binding,

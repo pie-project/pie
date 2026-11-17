@@ -61,17 +61,28 @@ pub fn rung_facts(
 }
 
 /// The top rung of `rungs` for `device`, whose profile is `profile`, over a
-/// live range of `live` bytes ([`engine::load::choose`]); a refusal for no
-/// feasible rung names the binding.
+/// live range of `live` bytes, each matmul's rows padded to the row tile of
+/// the kernel the backend picks at its shape (`row_tile`,
+/// [`engine::load::choose_tiled`]); a refusal for no feasible rung names the
+/// binding.
 pub fn choose(
     rungs: &[RungFacts],
     live: u64,
     profile: &profile::Profile,
+    row_tile: engine::roofline::RowTile,
     device: &str,
     counts: &Counts,
     binding: u64,
 ) -> Result<(TopRung, FireEstimate)> {
-    engine::load::choose(rungs, live, &profile.rates(), device, counts).map_err(|refused| {
+    engine::load::choose_tiled(
+        rungs,
+        live,
+        &profile.rates(),
+        Some(row_tile),
+        device,
+        counts,
+    )
+    .map_err(|refused| {
         Fault::Residency(match refused {
             Refused::NoRung(no) => {
                 format!("{no}; this device binds no more than {} MiB", binding >> 20)
@@ -128,7 +139,16 @@ mod tests {
     fn without_rates_the_load_is_refused_by_name() {
         let rungs = facts(&[(1024, 100 * MIB), (2048, 150 * MIB)], 200 * MIB);
         let bare = profile("api = 1\n");
-        let err = choose(&rungs, 1 << 33, &bare, "Card X", &counts(), 200 * MIB).unwrap_err();
+        let err = choose(
+            &rungs,
+            1 << 33,
+            &bare,
+            std::sync::Arc::new(|_, _, _| 1),
+            "Card X",
+            &counts(),
+            200 * MIB,
+        )
+        .unwrap_err();
         assert!(
             err.to_string()
                 .contains("device Card X has no rates in its profile"),
@@ -140,7 +160,16 @@ mod tests {
             "api = 1\n[rates]\ngemm_tflops_by_rows = [[4096, [[4096, 1.0]]]]\nattn_tflops_by_keys = \
                  [[2048, 1.0]]\nhbm_gbps = 1.0\nelementwise_gbps = 1.0\n",
         );
-        let err = choose(&none, 1 << 33, &rated, "Card X", &counts(), 200 * MIB).unwrap_err();
+        let err = choose(
+            &none,
+            1 << 33,
+            &rated,
+            std::sync::Arc::new(|_, _, _| 1),
+            "Card X",
+            &counts(),
+            200 * MIB,
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains(
                 "1024 tokens (span 300 MiB): past one binding; this device binds no more than \
