@@ -6,7 +6,12 @@ use worker_api::BlobRef;
 pub async fn fetch(blob: &BlobRef) -> Result<Vec<u8>> {
     let url = format!("{}/blob/{}", blob.origin.trim_end_matches('/'), blob.hash);
 
-    let resp = reqwest::get(url.as_str())
+    let client = crate::http::builder()?
+        .build()
+        .context("building HTTP client")?;
+    let resp = client
+        .get(url.as_str())
+        .send()
         .await
         .with_context(|| format!("GET {url}"))?;
     let bytes = match resp.status().as_u16() {
