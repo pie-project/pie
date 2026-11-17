@@ -198,6 +198,12 @@ pub struct RsHandles {
 
 const RS_LANE_BYTES: u64 = size_of::<kernels_cuda::runtime::channel::RsLane>() as u64;
 
+/// The bytes the staged rs lane table of `lanes` lanes takes: what the slab
+/// lays, what a fire writes and what it copies to the device, one figure.
+const fn rs_lane_table_bytes(lanes: u64) -> u64 {
+    lanes * RS_LANE_BYTES
+}
+
 /// A buffering fire's rs tables, as `write_host` stages them.
 #[derive(Debug, Clone, Copy)]
 pub struct RsFire<'a> {
@@ -685,7 +691,7 @@ impl Inputs {
             let replay_cap = rows;
             let pages_cap = (replay_cap + rows).div_ceil(u64::from(tokens.max(1))) + 2 * lanes;
             RsAt {
-                lanes: take(lanes * RS_LANE_BYTES),
+                lanes: take(rs_lane_table_bytes(lanes)),
                 pages: take(pages_cap * 8),
                 pages_cap,
                 replay_tok: take(replay_cap * 4),
@@ -1158,7 +1164,7 @@ impl Inputs {
                 let raw = unsafe {
                     core::slice::from_raw_parts(
                         lanes_tab.as_ptr().cast::<u8>(),
-                        lanes_tab.len() * RS_LANE_BYTES as usize,
+                        rs_lane_table_bytes(lanes_tab.len() as u64) as usize,
                     )
                 };
                 put(at.lanes, raw, "staged rs lanes")?;
@@ -1487,7 +1493,7 @@ impl Inputs {
                 // fire staged them.
                 copy(
                     at.lanes,
-                    table_lanes.max(lanes) as usize * RS_LANE_BYTES as usize,
+                    rs_lane_table_bytes(u64::from(table_lanes.max(lanes))) as usize,
                 )?;
                 copy(at.pages, *pages as usize * 8)?;
                 copy(at.replay_tok, *toks as usize * 4)?;
@@ -1676,5 +1682,25 @@ fn u32_bytes_of(values: &[u32]) -> &[u8] {
     // SAFETY: as [`bytes_of`] — `u32` is `Copy`, no padding or niche.
     unsafe {
         core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), core::mem::size_of_val(values))
+    }
+}
+
+#[cfg(test)]
+mod rs_lane_table_tests {
+    use super::rs_lane_table_bytes;
+    use kernels_cuda::runtime::channel::RsLane;
+
+    /// The staged lane table is the lanes' `RsLane`s byte for byte: what the
+    /// slab lays and a fire copies is what the table's lanes take, every
+    /// field to the last lane's `ext`.
+    #[test]
+    fn the_staged_rs_lane_table_is_its_lanes_whole() {
+        let lanes = [RsLane::INERT; 67];
+        assert_eq!(
+            rs_lane_table_bytes(lanes.len() as u64) as usize,
+            std::mem::size_of_val(&lanes)
+        );
+        let last = std::ptr::addr_of!(lanes[66].ext) as usize - lanes.as_ptr() as usize;
+        assert!(last + 4 <= rs_lane_table_bytes(lanes.len() as u64) as usize);
     }
 }

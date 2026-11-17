@@ -1595,6 +1595,139 @@ fn golden_pair_buffered() {
     }
 }
 
+/// Every lane of a fire replaying its own buffered rows answers as it does
+/// replaying alone, the fire's last lanes too: each lane's whole staged
+/// `RsLane` (where its replay lies and its place in the extended run) is
+/// the one the fire stages, never an earlier fire's left in the table.
+#[test]
+fn every_lane_of_a_wide_replaying_fire_replays_its_own_rows() {
+    use engine::fire::{FoldLen, RsVerb};
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    const FLOOR: f32 = 0.05;
+    const LANES: u32 = 4;
+    let cache = cache_dir();
+    let model = buffered_model();
+    let fixture = fixture(&model, &cache);
+    let mut shell = Shell::load(Boot {
+        trace: fixture.trace.clone(),
+        contract: &fixture.contract,
+        checkpoint: &fixture.container,
+        budget: Budget::new(LANES, TOKENS),
+        patches: None,
+        voxels: None,
+        page_size: PAGE,
+        context: CONTEXT,
+        // As many slots as lanes: a fire's lane table spans the slots, so
+        // the last lanes' tails lie where a short copy stops.
+        slots: LANES,
+        kv_budget: None,
+        allowance: engine::Allowance::WHOLE,
+        context_declared: false,
+        ordinal: 0,
+        // Walked eagerly, as a fire no body carries is (a masked class's,
+        // a beam's): its lane table is staged at its own lanes, not a
+        // body's carve.
+        knobs: engine_cuda::Knobs {
+            pin: Some((engine_cuda::Graphs::Off, Some(engine_cuda::Recording::Off))),
+            ..engine_cuda::Knobs::default()
+        },
+        cache_dir: Some(&cache),
+        runahead: engine::runahead::Runahead::F1,
+        residency: engine_cuda::experts::Plan::default(),
+        world: engine_cuda::World::default(),
+        expert: engine_cuda::World::default(),
+        comm: core::ptr::null_mut(),
+    })
+    .unwrap_or_else(|why| panic!("{model} loads: {why}"));
+    let page = rs_page(&mut shell);
+    // Lane `lane`'s buffered rows: a length and tokens of its own, so each
+    // lane replays apart from every other and lies at its own place.
+    let history = |lane: u32| -> Vec<u32> {
+        (0..3 + 2 * lane)
+            .map(|at| (17 + lane * 53 + at * 37) % 256)
+            .collect()
+    };
+    let buffer = |slot: u32, rows: u32| RsVerb::Buffer {
+        pages: (0..rows.div_ceil(page)).map(|at| slot * 16 + at).collect(),
+        base: 0,
+        folded: 0,
+        fold: FoldLen::Host(0),
+        lineage: engine::fire::Lineage::Set,
+    };
+    let fire = |shell: &mut Shell, lanes: &[(u32, Vec<u32>, RsVerb)]| -> Vec<Vec<f32>> {
+        let seated: Vec<engine_cuda::Seated<'_>> = lanes
+            .iter()
+            .map(|(slot, tokens, rs)| engine_cuda::Seated {
+                rs: rs.clone(),
+                ..engine_cuda::Seated::of(Lane {
+                    slot: *slot,
+                    word: fixture.trace.facts.word(&Request::new(
+                        u32::try_from(tokens.len()).expect("a count"),
+                        false,
+                    )),
+                    tokens,
+                })
+            })
+            .collect();
+        shell.fire_media(&seated, &[], &[]).expect("the fire runs")
+    };
+    // Each lane buffers its history on slot `base + lane`, then replays it
+    // under one more row, alone or (its slot opened anew and its history
+    // buffered again) in one fire with every other lane, after the lone
+    // fires left their lane tables behind.
+    let replay_row = |lane: u32| vec![(200 + lane * 11) % 256];
+    let stage = |shell: &mut Shell, base: u32| {
+        for lane in 0..LANES {
+            let slot = base + lane;
+            shell.open(slot).expect("the slot opens");
+            let rows = history(lane);
+            let k = rows.len() as u32;
+            fire(shell, &[(slot, rows, buffer(slot, k))]);
+        }
+    };
+    stage(&mut shell, 0);
+    let alone: Vec<Vec<f32>> = (0..LANES)
+        .map(|lane| {
+            let k = history(lane).len() as u32;
+            fire(&mut shell, &[(lane, replay_row(lane), buffer(lane, k + 1))]).swap_remove(0)
+        })
+        .collect();
+    stage(&mut shell, 0);
+    let together = fire(
+        &mut shell,
+        &(0..LANES)
+            .map(|lane| {
+                let slot = lane;
+                let k = history(lane).len() as u32;
+                (slot, replay_row(lane), buffer(slot, k + 1))
+            })
+            .collect::<Vec<_>>(),
+    );
+    let spread = |a: &[f32], b: &[f32]| {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max)
+    };
+    let apart: Vec<String> = alone
+        .iter()
+        .zip(&together)
+        .enumerate()
+        .filter_map(|(lane, (a, b))| {
+            let d = spread(a, b);
+            eprintln!("{model}: replaying lane {lane} of {LANES} beside the rest vs alone: {d:.4}");
+            (d > FLOOR).then(|| format!("lane {lane}: {d}"))
+        })
+        .collect();
+    assert!(
+        apart.is_empty(),
+        "{model}: lanes of a wide replaying fire answer apart from alone: {apart:?}"
+    );
+}
+
 fn contract_of(trace: &Trace, path: &Path) -> std::result::Result<ModelContract, String> {
     let source = ztensor::Source::open(path).map_err(|why| why.to_string())?;
     poem::import::own_contract(&source, &trace.params, 1, Platform::Cuda)
