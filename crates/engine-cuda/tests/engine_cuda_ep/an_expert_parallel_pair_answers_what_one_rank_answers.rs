@@ -91,7 +91,7 @@ fn stage(
         page_size: PAGE,
         context: CEILING,
         slots: 2,
-        kv_budget: Some(KV),
+        kv_budget: Some(engine_cuda::store::KvSize::Bytes(KV)),
         allowance: ALLOWANCE,
         context_declared: false,
         ordinal,

@@ -848,6 +848,13 @@ pub struct MemoryConfig {
     /// The most device memory this load takes (`"20GiB"`), per device, for
     /// a device shared with another process. Omit to use the whole device.
     pub budget_device: Option<ByteSize>,
+    /// The tokens of kv the device holds (`3248 * page size`), for a run
+    /// that must compare at a fixed cache: the device pool holds exactly
+    /// the pages they fill, beside the weights and the shapes it always
+    /// holds, and the load is refused where `budget_device` (or the whole
+    /// device) cannot hold that. Omit to size the cache by what the device
+    /// has. cuda only.
+    pub kv_device_tokens: Option<u64>,
     /// The most pinned host memory suspended kv pages and state slots may
     /// take (`"32GiB"`), shared by the tensor-parallel ranks. Omit for every
     /// seat at full context, within half of what the host has free (so
@@ -879,6 +886,7 @@ impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
             budget_device: None,
+            kv_device_tokens: None,
             budget_host: None,
             budget_disk: None,
             disk_path: None,
@@ -901,6 +909,7 @@ impl MemoryConfig {
                 budget: self.budget_device.map(|b| b.as_bytes()),
             },
             device_kv_budget: None,
+            device_kv_tokens: self.kv_device_tokens,
             host_kv_budget: self.budget_host.map(|b| b.as_bytes()),
             kv_seats: None,
             disk_kv_budget: self.budget_disk.map(|b| b.as_bytes()),
@@ -927,6 +936,11 @@ impl MemoryConfig {
                 && self.governor_backoff <= 1.0,
             "engine.memory.governor_backoff must be in (0.0, 1.0]: the share kept each \
              congested stretch, 1.0 to never yield"
+        );
+        ensure!(
+            self.kv_device_tokens != Some(0),
+            "engine.memory.kv_device_tokens = 0 holds no kv; state the tokens the device \
+             holds or omit the key"
         );
         for (key, budget) in [
             ("budget_device", self.budget_device),
@@ -967,6 +981,12 @@ impl EngineConfig {
             "engine.max_context = 0 holds no sequence; omit it for the model's own context"
         );
         self.memory.validate()?;
+        ensure!(
+            self.memory.kv_device_tokens.is_none() || self.kind == EngineKind::Cuda,
+            "engine.memory.kv_device_tokens sizes the cuda engine's device pool; the {} engine \
+             does not size its pool by tokens, so omit the key",
+            self.kind.as_str()
+        );
         match self.kind {
             EngineKind::Cuda => {
                 self.options_as::<CudaEngineOptions>()?;
@@ -1102,7 +1122,7 @@ device = ["metal:0"]
         the_seat_count_is_stated_once_or_derived_from_the_roster();
         an_adapter_past_its_seats_or_on_a_relative_path_is_refused_by_name();
         an_empty_memory_table_is_the_dedicated_machine();
-        the_memory_keys_are_seven_and_prefixed();
+        the_memory_keys_are_eight_and_prefixed();
         the_dispatch_depth_is_bounded_by_the_engine_kind();
         activation_dtype_is_an_unknown_key();
     }
@@ -1140,9 +1160,26 @@ device = ["metal:0"]
             let toml = format!("{MINIMAL_METAL}\n[engine.memory]\n{bad}\n");
             assert!(Config::parse(&toml).is_err(), "{bad} should be refused");
         }
+
+        // The kv tokens reach the cuda engine's load; another engine, which
+        // does not size its pool by them, refuses the key by name.
+        let cuda = MINIMAL_METAL
+            .replace("\"metal\"", "\"cuda\"")
+            .replace("metal:0", "cuda:0");
+        let tokens = format!("{cuda}\n[engine.memory]\nkv_device_tokens = 51968\n");
+        let cfg = Config::parse(&tokens).unwrap();
+        assert_eq!(cfg.engine.memory.residency().device_kv_tokens, Some(51968));
+        let metal = format!("{MINIMAL_METAL}\n[engine.memory]\nkv_device_tokens = 51968\n");
+        let refused = Config::parse(&metal).expect_err("metal refuses the key");
+        assert!(
+            format!("{refused:#}").contains("kv_device_tokens"),
+            "{refused:#}"
+        );
+        let zero = format!("{cuda}\n[engine.memory]\nkv_device_tokens = 0\n");
+        assert!(Config::parse(&zero).is_err(), "zero tokens should be refused");
     }
 
-    fn the_memory_keys_are_seven_and_prefixed() {
+    fn the_memory_keys_are_eight_and_prefixed() {
         let keys: Vec<String> = schema::fields(EngineKind::Cuda)
             .into_iter()
             .map(|field| field.key)
@@ -1152,6 +1189,7 @@ device = ["metal:0"]
             keys,
             [
                 "engine.memory.budget_device",
+                "engine.memory.kv_device_tokens",
                 "engine.memory.budget_host",
                 "engine.memory.budget_disk",
                 "engine.memory.disk_path",
