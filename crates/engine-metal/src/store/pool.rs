@@ -738,6 +738,23 @@ impl Pool {
         Ok(())
     }
 
+    /// The bytes backing the bottom's first `segments` segments adds to what
+    /// is backed now: none where they are committed already.
+    #[must_use]
+    pub fn commit_bytes(&self, segments: u32) -> u64 {
+        u64::from(self.chunks_of(segments).saturating_sub(self.committed_chunks()))
+            * self.chunk_bytes
+    }
+
+    /// The bytes backing the span's top `segments` segments adds to what is
+    /// backed now: none where they are committed already.
+    #[must_use]
+    pub fn span_commit_bytes(&self, segments: u32) -> u64 {
+        u64::from(segments.min(self.span_segments()).saturating_sub(self.span))
+            * u64::from(self.segment_chunks)
+            * self.chunk_bytes
+    }
+
     /// The span's committed segments from the top.
     #[must_use]
     pub fn committed_span(&self) -> u32 {

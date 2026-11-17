@@ -1631,6 +1631,18 @@ impl Pools {
         self.pool.commit_span(segments)
     }
 
+    /// See [`Pool::span_commit_bytes`].
+    #[must_use]
+    pub fn span_commit_bytes(&self, segments: u32) -> u64 {
+        self.pool.span_commit_bytes(segments)
+    }
+
+    /// See [`Pool::commit_bytes`].
+    #[must_use]
+    pub fn commit_bytes(&self, segments: u32) -> u64 {
+        self.pool.commit_bytes(segments)
+    }
+
     /// Gives back the span's segments past the top `segments`.
     ///
     /// # Safety

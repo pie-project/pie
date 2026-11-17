@@ -1705,7 +1705,41 @@ impl Shell {
 
     /// See `Engine::commit_segments`.
     pub fn commit_segments(&mut self, segments: u32) -> Result<()> {
+        self.wired_room(self.pools.commit_bytes(segments))?;
         self.pools.commit_segments(segments)
+    }
+
+    /// Whether the machine can wire `bytes` more for this process now: the
+    /// GPU's wired limit is the machine's (Metal's recommended working set),
+    /// and what every process holds wired, this one's included, counts
+    /// against it. Measured at each grow: what others wire and what the
+    /// kernel wires beside this process's memory move while it serves (an
+    /// M1 Max's driver refused a command buffer with the machine's wired at
+    /// 26.95 GB of a 26.8 GB working set, the others' share up 0.2 GB from
+    /// the load's). A grow past it is refused as the system not backing it
+    /// ([`Fault::Refused`]): the runtime tells the planner no grow came, as
+    /// at the pool's ceiling.
+    fn wired_room(&self, bytes: u64) -> Result<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        let Some(os) = crate::device::wirable::os_memory() else {
+            return Ok(());
+        };
+        let limit = self
+            .device
+            .working_set()
+            .saturating_sub(crate::store::accounting::DRIVER_FLOOR);
+        if os.wired.saturating_add(bytes) > limit {
+            tracing::debug!(
+                bytes,
+                wired = os.wired,
+                limit,
+                "metal: a grow past what the machine can wire is refused"
+            );
+            return Err(Fault::Refused { bytes });
+        }
+        Ok(())
     }
 
     /// See `Engine::weight_residency`: every frame drains, blocks newly
@@ -1821,6 +1855,7 @@ impl Shell {
     /// See `Engine::commit_span`: the top `segments` span segments are
     /// backed before the runtime opens state in them.
     pub fn commit_span(&mut self, segments: u32) -> Result<()> {
+        self.wired_room(self.pools.span_commit_bytes(segments))?;
         self.pools.commit_span(segments)
     }
 
