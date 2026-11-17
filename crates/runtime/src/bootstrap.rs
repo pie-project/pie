@@ -549,6 +549,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     limits: d.limits,
                     device_geometry_port_mask: d.device_geometry_port_mask,
                     kind: "",
+                    codegen_backend: None,
                 },
                 d.engine_backend,
                 d.chunks.eager_rungs,

@@ -439,6 +439,23 @@ struct Lane {
     seed: u64,
 }
 
+/// `suite` bound over its logits, and its registration as the host emits it.
+fn registration(suite: &Suite) -> (BoundTrace, ProgramRegistration) {
+    let bound: BoundTrace = crate::bound::logits(suite.traced.container().clone(), suite.vocab)
+        .unwrap_or_else(|e| panic!("{}: binds: {e:?}", suite.name));
+    let stages = compile_bound(&bound);
+    let backend = Backend::parse(engine_cuda::api::CODEGEN).expect("the engine's codegen backend");
+    let registration = ProgramRegistration {
+        program_hash: bound.hash,
+        emitted_kernels: emit_program(backend, &stages, &bound),
+        emitter_version: backend.emitter_version(),
+        region_analysis: eta_compiler::codegen::cuda::region_analysis::analyze_program(&stages),
+        launch: eta_compiler::codegen::launch::build(&bound, &stages),
+        ..Default::default()
+    };
+    (bound, registration)
+}
+
 fn run(context: &Context, suite: &Suite) -> Vec<String> {
     let at = |name: &str| -> u32 {
         let gid = suite
@@ -455,18 +472,7 @@ fn run(context: &Context, suite: &Suite) -> Vec<String> {
             .unwrap_or_else(|| panic!("{}: channel {name} is not in the trace", suite.name))
             as u32
     };
-    let bound: BoundTrace = crate::bound::logits(suite.traced.container().clone(), suite.vocab)
-        .unwrap_or_else(|e| panic!("{}: binds: {e:?}", suite.name));
-    let stages = compile_bound(&bound);
-    let backend = Backend::parse(engine_cuda::api::CODEGEN).expect("the engine's codegen backend");
-    let registration = ProgramRegistration {
-        program_hash: bound.hash,
-        emitted_kernels: emit_program(backend, &stages, &bound),
-        emitter_version: backend.emitter_version(),
-        region_analysis: eta_compiler::codegen::cuda::region_analysis::analyze_program(&stages),
-        launch: eta_compiler::codegen::launch::build(&bound, &stages),
-        ..Default::default()
-    };
+    let (bound, registration) = registration(suite);
     let mut plane = crate::guest::alone_plane();
     let program = match plane.register(context, &registration) {
         Ok(program) => program,
@@ -635,4 +641,128 @@ fn every_suite_step_agrees_with_the_host_interpreter() {
         failures.len(),
         failures.join("\n")
     );
+}
+
+/// A program's registration compiles off the thread that fires
+/// (`Engine::prepare_program`): a lane of the sampling primitives fires on
+/// while the beam step's regions compile cold on another thread, and the
+/// beam step registers once they have.
+#[test]
+fn a_cold_registration_compiles_while_a_lane_fires() {
+    if !engine_cuda::device::present() {
+        eprintln!("no CUDA device: skipping");
+        return;
+    }
+    let context = Context::bind(0, None).expect("a CUDA context");
+    let serving = sampling_primitives();
+    let (bound, serving_registration) = registration(&serving);
+    let mut plane = crate::guest::alone_plane();
+    let program = plane
+        .register(&context, &serving_registration)
+        .expect("the sampling primitives compile");
+    let count = bound.container.channels.len();
+    let index = |name: &str| {
+        let gid = serving
+            .names
+            .iter()
+            .find(|(n, _)| *n == name)
+            .expect("named")
+            .1;
+        let order = serving.traced.channel_order();
+        order.iter().position(|&g| g == gid).expect("in the trace") as u32
+    };
+    let seeds: Vec<(u32, Vec<u8>)> = serving
+        .seeds
+        .iter()
+        .map(|(name, value)| (index(name), wire_bytes(value)))
+        .collect();
+    let ids: Vec<ChannelId> = (1..=count as u64).map(ChannelId).collect();
+    let lane = plane
+        .bind(
+            program,
+            &seeds,
+            Extents {
+                row_count: 1,
+                sampled_rows: 1,
+                query_len: 1,
+                ..Extents::default()
+            },
+            GeometryClass::Host,
+            eta_ir::registry::PortMask::NONE,
+            false,
+            &vec![None; count],
+            &ids,
+            crate::guest::alone_slots(&plane, program),
+            &crate::guest::alone_span,
+            context.stream(),
+        )
+        .expect("the lane binds");
+    let values = logits(1, serving.vocab, 7);
+    let mut buffer = Buffer::zeroed(values.len() * 4).expect("a logits plane");
+    let bytes: Vec<u8> = values.iter().flat_map(|x| x.to_le_bytes()).collect();
+    buffer.write(0, &bytes).expect("the plane uploads");
+    let fire = |plane: &mut engine_cuda::ProgramPlane| {
+        plane
+            .bind_output(
+                lane,
+                "logits",
+                0,
+                buffer.ptr(),
+                INTRINSIC_STORAGE_F32,
+                serving.vocab,
+                serving.vocab,
+                0,
+            )
+            .expect("the logits bind");
+        let launched = plane.stage(lane, Stage::Epilogue).expect("the lane stages");
+        assert!(
+            matches!(launched, Launched::Airborne),
+            "refused: {launched:?}"
+        );
+        plane.fly(&context).expect("the wave flies");
+        plane.land(&context).expect("the wave lands");
+        context.synchronize().expect("the device synchronizes");
+        let fired = plane.settle_launched(lane).expect("the lane settles");
+        assert!(matches!(fired, Fired::Committed), "{fired:?}");
+        let session = plane.instance_mut(lane).expect("the instance");
+        for &(name, _, _) in &serving.outputs {
+            session.take(index(name)).expect("a channel reads");
+        }
+    };
+    fire(&mut plane);
+    let compiled = plane.stats().compilations;
+
+    let (_, cold) = registration(&beam(4));
+    let mut pending = plane.prepare(&context, &cold).expect("the beam step plans");
+    let began = std::time::Instant::now();
+    let compile = std::thread::spawn(move || {
+        pending.build();
+        (pending, began.elapsed())
+    });
+    let (mut fires, mut longest, mut last) = (0u32, std::time::Duration::ZERO, began);
+    while !compile.is_finished() {
+        fire(&mut plane);
+        fires += 1;
+        longest = longest.max(last.elapsed());
+        last = std::time::Instant::now();
+    }
+    let (pending, built) = compile.join().expect("the compile finishes");
+    let finishing = std::time::Instant::now();
+    let beam = plane.finish(pending).expect("the beam step registers");
+    let finished = finishing.elapsed();
+    eprintln!(
+        "beam step: compiled in {built:?} off the lane, finished in {finished:?}; \
+         the lane fired {fires} times meanwhile, at most {longest:?} apart"
+    );
+    assert!(plane.program(beam).is_some(), "the beam step is registered");
+    assert!(
+        plane.stats().compilations > compiled,
+        "the beam step compiled cold: {:?}",
+        plane.stats()
+    );
+    assert!(
+        fires >= 3 && longest < built / 2,
+        "the lane stalled behind the compile: {fires} fires in {built:?}, at most {longest:?} apart"
+    );
+    fire(&mut plane);
 }

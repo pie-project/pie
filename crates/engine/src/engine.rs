@@ -13,6 +13,14 @@ use crate::program::{
 };
 use crate::transfer::{KvCopy, KvHandle, StateCopy};
 
+/// What a program's compile made, off the engine's thread, for the engine
+/// that prepared it ([`Engine::finish_program`]).
+pub struct Prepared(pub Box<dyn std::any::Any + Send>);
+
+/// A program's compile ([`Engine::prepare_program`]): run once, on any
+/// thread.
+pub type ProgramCompile = Box<dyn FnOnce() -> Prepared + Send>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct StepDone {
     pub frame: FrameId,
@@ -187,6 +195,24 @@ pub trait Engine: Send {
         let _ = registrations;
         Ok(())
     }
+
+    /// A registration in two steps, so the thread that fires does not
+    /// wait out a program's compile: this, on the engine's thread and
+    /// quick, hands back the program's compile, which the runtime runs on a
+    /// worker thread while the engine fires on; [`Engine::finish_program`],
+    /// on the engine's thread again, takes what the compile made and
+    /// answers the program's id. The program binds no instance until then.
+    fn prepare_program(&mut self, registration: &ProgramRegistration) -> Result<ProgramCompile>;
+
+    /// The second half of [`Engine::prepare_program`]: the program's id,
+    /// from what its compile made; a compile that refused refuses here, by
+    /// the program's name.
+    fn finish_program(&mut self, prepared: Prepared) -> Result<ProgramId>;
+
+    /// Releases a registered program no instance binds: its id answers
+    /// nothing after. The runtime closes one it could not learn the facts
+    /// of, so no registration that fails leaves a program behind.
+    fn close_program(&mut self, program: ProgramId) -> Result<()>;
 
     /// What an instance of a registered program holds in the pool's
     /// `Instance` and `Channel` slots, asked before the runtime takes them

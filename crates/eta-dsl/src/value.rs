@@ -938,6 +938,25 @@ pub fn mask_apply(logits: impl AsTensor, mask: impl AsTensor) -> Tensor {
     Tensor::node(expand::mask_apply(&mut sink, il, im), tyl)
 }
 
+/// `logits` with every column whose bit is clear in `words` at -inf: bit
+/// `c % 32` of word `c / 32`, the same words for every row (a grammar
+/// mask, packed). The engines test the bit with shifts, where a test
+/// spelled with integer division compiles a divide per column.
+pub fn mask_apply_packed(logits: impl AsTensor, words: impl AsTensor) -> Tensor {
+    let (logits, logits_type) = logits.to_arg().materialize();
+    let (words, _) = words.to_arg().materialize();
+    Tensor::node(
+        push(
+            Op::MaskApply {
+                logits,
+                mask: words,
+            },
+            &[logits_type],
+        ),
+        logits_type,
+    )
+}
+
 #[track_caller]
 fn append_mask_axis(shape: Shape, len: u32) -> Shape {
     let mut dims = shape.dims().to_vec();
