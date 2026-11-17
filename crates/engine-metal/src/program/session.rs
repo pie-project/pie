@@ -653,6 +653,15 @@ impl Session {
         })
     }
 
+    /// PROBE: every prepared stage's status state word and its slot.
+    pub fn probe_statuses(&self) -> Vec<(u32, Option<u32>)> {
+        self.prepared
+            .iter()
+            .flatten()
+            .filter_map(|prepared| prepared.probe_state())
+            .collect()
+    }
+
     fn verdict(&mut self, plan: &ExecPlan, launched: &[usize], at: Stage) -> Result<Fired> {
         let max_channel = u32::try_from(self.shapes.len().saturating_sub(1)).unwrap_or(u32::MAX);
 

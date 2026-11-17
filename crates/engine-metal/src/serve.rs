@@ -1642,6 +1642,7 @@ impl Shell {
     /// rung's carve.
     #[allow(unsafe_code)]
     pub fn set_rung(&mut self, from: u32, to: u32) -> Result<()> {
+        self.programs.probe_scan(&format!("set_rung {from}->{to} start"));
         let reach = self.span_for(to)?;
         if crate::diag::on().tier_trace {
             eprintln!(
@@ -1841,6 +1842,8 @@ impl Shell {
             self.pools.copy_shape(&mut frame, *shape, &moves)?;
         }
         self.grafted = Some(frame.commit_async(None)?);
+        self.programs
+            .probe_scan(&format!("slot pair copies {:?}", copies.iter().map(|(s, p)| (s.0, p.len())).collect::<Vec<_>>()));
         Ok(())
     }
 
@@ -1863,6 +1866,10 @@ impl Shell {
         let mut frame = self.device.frame()?;
         self.pools.copy_slots(&mut frame, copy)?;
         self.grafted = Some(frame.commit_async(None)?);
+        self.programs.probe_scan(&format!(
+            "copy_slots shape {} {:?}->{:?} {} slots {} runs",
+            copy.shape.0, copy.src, copy.dst, copy.slots.len(), copy.runs.len()
+        ));
         Ok(())
     }
 
@@ -1882,7 +1889,9 @@ impl Shell {
         bytes: &[u8],
     ) -> Result<()> {
         self.drain()?;
-        self.pools.write_tier_slots(slots, bytes)
+        let written = self.pools.write_tier_slots(slots, bytes);
+        self.programs.probe_scan("write_tier_slots");
+        written
     }
 
     /// Builds, before ready, every compute pipeline a fire of this load
@@ -2604,6 +2613,7 @@ impl Shell {
                 self.pools.covered()
             );
         }
+        self.programs.probe_scan(&format!("bind instance {}", id.0));
         Ok(id)
     }
 
@@ -2616,7 +2626,9 @@ impl Shell {
         {
             self.rebind_adapter(*id, adapter)?;
         }
-        self.programs.rebind_slots(&self.pools, rebind)
+        let rebound = self.programs.rebind_slots(&self.pools, rebind);
+        self.programs.probe_scan(&format!("rebind_slots {rebind:?}").chars().take(160).collect::<String>());
+        rebound
     }
 
     /// What a fire holding lanes of `program_id` bound at `extents` lays
@@ -2681,6 +2693,7 @@ impl Shell {
         if !self.programs.batches_laid() {
             self.lay_batches()?;
         }
+        self.programs.probe_scan(&format!("close instance {}", instance_id.0));
         Ok(())
     }
 
@@ -3018,6 +3031,7 @@ impl Shell {
             return Ok(());
         };
         let waited = flight.pending.wait();
+        self.programs.probe_scan("harvest: frame landed");
         // Each attached instance's epilogue, settled once the buffer
         // completed: one that did not commit faults its own lanes alone,
         // and the rest of the step commits.
@@ -5587,8 +5601,10 @@ impl engine::frame::Shell for Shell {
         Self: 'a,
     {
         let _ = prev;
+        self.programs.probe_scan("prepare start");
         self.admit_attachments(step.lanes, step.attachments)?;
         self.fire_prologues(step.attachments)?;
+        self.programs.probe_scan("after prologues");
         self.stage(step)
     }
 
