@@ -487,6 +487,34 @@ impl Plane {
         })
     }
 
+    /// PROBE: names, once each, a status word that holds no state, with the
+    /// operation this scan follows and the last scan that saw it clean.
+    pub fn probe_scan(&self, when: &str) {
+        static SEEN: std::sync::Mutex<Option<(String, std::collections::HashSet<(u64, u32)>)>> =
+            std::sync::Mutex::new(None);
+        let Ok(mut seen) = SEEN.lock() else { return };
+        let (last, bad_seen) = seen.get_or_insert_with(|| (String::from("load"), Default::default()));
+        let mut fresh = Vec::new();
+        for (id, bound) in &self.instances {
+            for (state, slot) in bound.session.probe_statuses() {
+                if state > 3 {
+                    let key = (id.0, slot.unwrap_or(u32::MAX));
+                    if bad_seen.insert(key) {
+                        fresh.push((id.0, slot, state));
+                    }
+                }
+            }
+        }
+        if !fresh.is_empty() {
+            eprintln!(
+                "PROBE-SCAN: bad at '{when}', clean at '{last}' before it: {} new (instance, slot, state) {:?}",
+                fresh.len(),
+                &fresh[..fresh.len().min(6)]
+            );
+        }
+        *last = when.to_string();
+    }
+
     /// Points every pooled table and ring at the chunks their slots sit in
     /// now: after an evacuation moved chunks under unchanged refs.
     pub fn rebind(&mut self, pools: &Pools) -> Result<()> {

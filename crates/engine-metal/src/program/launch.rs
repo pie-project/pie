@@ -2034,6 +2034,13 @@ impl Prepared {
         }
     }
 
+    /// PROBE: the status state word and its slot.
+    pub fn probe_state(&self) -> Option<(u32, Option<u32>)> {
+        let mut bytes = [0u8; 4];
+        self.status.read(0, &mut bytes).ok()?;
+        Some((u32::from_le_bytes(bytes), self.status.slot()))
+    }
+
     pub fn status(&self) -> Result<Status> {
         let mut bytes = [0u8; eta_exec::STATUS_BYTES];
         self.status.read(0, &mut bytes)?;
