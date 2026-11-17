@@ -394,6 +394,7 @@ pub fn time_at(p: &Program, class_rows: &[u32]) -> StreamCost {
                             roots: l.px(),
                             chunk: 0,
                             reps: 1,
+                            per: 1,
                         });
                         // (a region placed on no roots of its own: on all of them)
                         if a.roots == 0 {

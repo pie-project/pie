@@ -69,6 +69,15 @@ pub struct RegionAt {
     pub roots: u32,
     pub chunk: u32,
     pub reps: u32,
+    /// Consecutive roots that run the same chunks (a replicated K / V head's: each replica its
+    /// head's region); 1 elsewhere.
+    #[serde(skip_serializing_if = "is_one")]
+    pub per: u32,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_one(n: &u32) -> bool {
+    *n == 1
 }
 
 impl RegionAt {
@@ -76,6 +85,12 @@ impl RegionAt {
     #[must_use]
     pub fn cover(&self) -> u32 {
         self.chunk * self.reps
+    }
+
+    /// The chunk index root `i` (from `first`) runs.
+    #[must_use]
+    pub fn chunk_of(&self, i: u32) -> u32 {
+        i / self.per.max(1)
     }
 }
 
@@ -134,6 +149,7 @@ impl Layout {
                 roots: 1,
                 chunk: region.width,
                 reps: 1,
+                per: 1,
             };
         }
         at
@@ -154,11 +170,24 @@ impl Layout {
         if span > width {
             // (at the head roots where they hold a value of it head by head, or where none of
             // its values is placed yet: its consumers' head regions place them after it)
+            // the values' heads: one a head root, or (a replicated K / V head's) one over each
+            // run of `per` head roots
+            let units = if self.heads > 0 && span.is_multiple_of(self.heads * width) {
+                self.heads
+            } else if self.heads > 0
+                && span.is_multiple_of(width)
+                && self.heads.is_multiple_of(span / width)
+            {
+                span / width
+            } else {
+                0
+            };
+            let per = self.heads / units.max(1);
             let at_heads = |c: &Cols| {
                 (0..self.heads).all(|h| {
                     self.cols[h as usize]
                         .iter()
-                        .any(|s| s.covers(c.base, c.from + h * (span / self.heads)))
+                        .any(|s| s.covers(c.base, c.from + h / per * (span / units)))
                 })
             };
             let unplaced = |c: &Cols| {
@@ -166,15 +195,15 @@ impl Layout {
                     s.base == c.base.0 && s.from < c.from + c.width && c.from < s.from + s.len
                 })
             };
-            let on = self.heads > 0
+            let on = units > 0
                 && side == Side::Col
-                && span.is_multiple_of(self.heads * width)
                 && (cands.iter().any(at_heads) || cands.iter().all(unplaced));
             return RegionAt {
                 first: 0,
                 roots: if on { self.heads } else { 0 },
                 chunk: width,
-                reps: span / self.heads.max(1) / width,
+                reps: span / units.max(1) / width,
+                per,
             };
         }
         if side == Side::Row {
@@ -185,6 +214,28 @@ impl Layout {
                 roots: self.py,
                 chunk: width.div_ceil(self.py),
                 reps: 1,
+                per: 1,
+            };
+        }
+        // a value every head root holds whole (a K / V head its replicas share): whole at each
+        if self.heads > 1
+            && cands.iter().any(|c| {
+                c.width == width
+                    && (0..self.heads).all(|h| {
+                        self.cols[h as usize].iter().any(|s| {
+                            s.base == c.base.0
+                                && s.from <= c.from
+                                && c.from + width <= s.from + s.len
+                        })
+                    })
+            })
+        {
+            return RegionAt {
+                first: 0,
+                roots: self.heads,
+                chunk: width,
+                reps: 1,
+                per: self.heads,
             };
         }
         if self.heads > 0 && width.is_multiple_of(self.heads) {
@@ -201,6 +252,7 @@ impl Layout {
                     roots: self.heads,
                     chunk,
                     reps: 1,
+                    per: 1,
                 };
             }
         }
@@ -210,6 +262,7 @@ impl Layout {
             roots: rest,
             chunk: width / rest.max(1),
             reps: 1,
+            per: 1,
         }
     }
 }
@@ -386,21 +439,21 @@ fn layout_with(r: &Reader, u: &Unit, py: u32, rest: u32) -> Option<Layout> {
         };
         let w = chain.region.width;
         let at = lay(cols.clone()).region_of(Side::Col, &chain.region, &region_cols(r, chain));
-        if at.roots == 0 || (at.reps == 1 && !w.is_multiple_of(at.roots)) {
+        if at.roots == 0 || (at.reps == 1 && at.chunk != w && !w.is_multiple_of(at.roots)) {
             return None;
         }
         let cover = at.cover();
         for i in 0..at.roots {
-            let root = (at.first + i) as usize;
+            let (root, ci) = ((at.first + i) as usize, at.chunk_of(i));
             for (_, c) in row_params(r, chain) {
                 push(
                     &mut cols,
                     root,
-                    Slice::of(c.base, c.from + i * cover, cover),
+                    Slice::of(c.base, c.from + ci * cover, cover),
                 );
             }
             for o in &chain.outs {
-                push(&mut cols, root, Slice::of(o.value, i * cover, cover));
+                push(&mut cols, root, Slice::of(o.value, ci * cover, cover));
             }
         }
     }

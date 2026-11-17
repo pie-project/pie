@@ -1395,7 +1395,7 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
                 if idx < ra.first || idx >= ra.first + ra.roots {
                     continue;
                 }
-                let ri = idx - ra.first;
+                let ri = ra.chunk_of(idx - ra.first);
                 let c = ra.chunk;
                 // a head region: a head at a time over the root's `reps` heads
                 let reps = ra.reps;
