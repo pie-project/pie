@@ -654,7 +654,7 @@ impl Session {
     }
 
     /// PROBE: every prepared stage's status state word and its slot.
-    pub fn probe_statuses(&self) -> Vec<(u32, Option<u32>)> {
+    pub fn probe_statuses(&self) -> Vec<(u32, Option<u32>, Option<u32>)> {
         self.prepared
             .iter()
             .flatten()

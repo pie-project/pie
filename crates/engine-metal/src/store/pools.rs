@@ -1094,6 +1094,12 @@ impl Pools {
         Ok((physical, index))
     }
 
+    /// PROBE: the physical chunk a kernel reaches through kv page id `id`.
+    pub fn diag_page_chunk(&self, id: u32) -> Option<u32> {
+        let list = *self.shape(LIST).ok()?;
+        Some(self.pool.page_slot(id, list.per_chunk) / list.per_chunk.max(1))
+    }
+
     /// PROBE: the logical and physical chunk slot ref `slot` of `id` sits in.
     pub fn diag_chunk(&self, id: ShapeId, slot: u32) -> Option<(u32, u32)> {
         let shape = *self.shape(id).ok()?;
@@ -2519,4 +2525,47 @@ pub fn diag_last_named(physical: u32) -> Option<(u32, u32)> {
 /// PROBE: where logical chunk `logical` last moved to, if it moved.
 pub fn diag_moved(logical: u32) -> Option<u32> {
     MOVED.lock().ok()?.as_ref()?.get(&logical).copied()
+}
+
+
+/// PROBE: the chunks each page path of the last fires named: (fire, lane,
+/// path, chunks).
+static FIRE_PAGES: std::sync::Mutex<std::collections::VecDeque<(u64, u32, &'static str, Vec<u32>)>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+static FIRE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// PROBE: a new fire's records start.
+pub fn diag_fire_begin() -> u64 {
+    FIRE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+/// PROBE: lane `lane` of the current fire named `chunks` by `path`.
+pub fn diag_fire_pages(lane: u32, path: &'static str, mut chunks: Vec<u32>) {
+    chunks.sort_unstable();
+    chunks.dedup();
+    let fire = FIRE_SEQ.load(std::sync::atomic::Ordering::Relaxed);
+    if let Ok(mut log) = FIRE_PAGES.lock() {
+        log.push_back((fire, lane, path, chunks));
+        while log.len() > 4096 {
+            log.pop_front();
+        }
+    }
+}
+
+/// PROBE: the recorded (fire, lane, path) that named physical chunk `chunk`.
+pub fn diag_who_named(chunk: u32) -> Vec<(u64, u32, &'static str)> {
+    FIRE_PAGES
+        .lock()
+        .map(|log| {
+            log.iter()
+                .filter(|(_, _, _, chunks)| chunks.binary_search(&chunk).is_ok())
+                .map(|&(fire, lane, path, _)| (fire, lane, path))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// PROBE: the current fire's sequence number.
+pub fn diag_fire_now() -> u64 {
+    FIRE_SEQ.load(std::sync::atomic::Ordering::Relaxed)
 }

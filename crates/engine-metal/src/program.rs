@@ -496,11 +496,20 @@ impl Plane {
         let (last, bad_seen) = seen.get_or_insert_with(|| (String::from("load"), Default::default()));
         let mut fresh = Vec::new();
         for (id, bound) in &self.instances {
-            for (state, slot) in bound.session.probe_statuses() {
+            for (state, slot, chunk) in bound.session.probe_statuses() {
                 if state > 3 {
                     let key = (id.0, slot.unwrap_or(u32::MAX));
                     if bad_seen.insert(key) {
                         fresh.push((id.0, slot, state));
+                        if let Some(chunk) = chunk {
+                            let named = crate::store::diag_who_named(chunk);
+                            eprintln!(
+                                "PROBE-PAGES: chunk {chunk} (instance {}'s status) named as a kv page by (fire, lane, path), now fire {}: {:?}",
+                                id.0,
+                                crate::store::diag_fire_now(),
+                                &named[named.len().saturating_sub(12)..]
+                            );
+                        }
                     }
                 }
             }

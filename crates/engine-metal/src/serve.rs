@@ -4007,6 +4007,11 @@ impl Shell {
                 rows: row.rows,
             });
             kv_less.push(seated.kv_less);
+            let probe_path: &'static str = match &device_pages[source] {
+                Some(_) => "translated table",
+                None if seated.kv_less => "kv-less raw table",
+                None => "seat table",
+            };
             tables.push(match &device_pages[source] {
                 Some(pages) => std::borrow::Cow::Owned(self.pools.kv_pages(pages, None)?),
                 None if seated.kv_less => std::borrow::Cow::Borrowed(seated.pages),
@@ -4020,6 +4025,13 @@ impl Shell {
                     )
                 }
             });
+            if let Some(table) = tables.last() {
+                crate::store::diag_fire_pages(
+                    row.source,
+                    probe_path,
+                    table.iter().filter_map(|&page| self.pools.diag_page_chunk(page)).collect(),
+                );
+            }
             // A kv-less lane's mask goes to its group-packed attention, not the paged prefill.
             let masking = if seated.kv_less {
                 None
@@ -4468,6 +4480,17 @@ impl Shell {
             }
         }
         let geometries = geometries;
+        for geometry in &geometries {
+            crate::store::diag_fire_pages(
+                u32::MAX,
+                "write_page (every row)",
+                geometry
+                    .write_page
+                    .iter()
+                    .filter_map(|&page| self.pools.diag_page_chunk(u32::try_from(page.max(0)).unwrap_or(0)))
+                    .collect(),
+            );
+        }
         let pages = geometries
             .first()
             .map_or(0, |geometry| geometry.indices.len() as u32);
@@ -5618,6 +5641,7 @@ impl engine::frame::Shell for Shell {
     {
         let _ = prev;
         self.programs.probe_scan("prepare start");
+        let _ = crate::store::diag_fire_begin();
         self.admit_attachments(step.lanes, step.attachments)?;
         self.fire_prologues(step.attachments)?;
         self.programs.probe_scan("after prologues");

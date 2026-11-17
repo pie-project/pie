@@ -2035,10 +2035,14 @@ impl Prepared {
     }
 
     /// PROBE: the status state word and its slot.
-    pub fn probe_state(&self) -> Option<(u32, Option<u32>)> {
+    pub fn probe_state(&self) -> Option<(u32, Option<u32>, Option<u32>)> {
         let mut bytes = [0u8; 4];
         self.status.read(0, &mut bytes).ok()?;
-        Some((u32::from_le_bytes(bytes), self.status.slot()))
+        Some((
+            u32::from_le_bytes(bytes),
+            self.status.slot(),
+            self.status.diag_chunk.map(|(_, physical)| physical),
+        ))
     }
 
     pub fn status(&self) -> Result<Status> {
