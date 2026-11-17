@@ -1535,10 +1535,12 @@ mod tests {
         let mut range = reserved((RESERVED + ABOVE) * CHUNK, SEGMENT * CHUNK, UNIT);
         range.committed = 2;
         range.part(3 * CHUNK, CHUNK).unwrap();
-        assert_eq!(
-            laid(2 * SEGMENT * CHUNK, range.parted()),
-            [(0, 3 * CHUNK), (4 * CHUNK, (2 * SEGMENT - 4) * CHUNK)]
-        );
+        let backed = range.arena.target_units(&range.wanted(2, &[])).unwrap();
+        let stated: Vec<usize> = units(0, 3 * CHUNK)
+            .chain(units(4 * CHUNK, (2 * SEGMENT - 4) * CHUNK))
+            .map(|unit| unit as usize)
+            .collect();
+        assert_eq!(backed, stated);
     }
 
     fn a_partial_page_is_a_whole_page() {
