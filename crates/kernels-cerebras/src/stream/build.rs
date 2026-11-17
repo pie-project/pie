@@ -414,9 +414,13 @@ pub fn program_py(
     // K / V PEs at once), each count priced like any other choice: every candidate at one
     // replica, the next count over the cheapest few that built (every candidate while none has),
     // up to the count no attention takes
-    let mut rep = 1;
+    // (KV_REP: a debug override, that count alone)
+    let pinned = std::env::var("KV_REP")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok());
+    let mut rep = pinned.unwrap_or(1);
     let mut tries = cands.clone();
-    while rep <= MAX_KV_REP && !tries.is_empty() {
+    while rep <= pinned.unwrap_or(MAX_KV_REP) && !tries.is_empty() {
         let mut built: Vec<(f64, (u32, u32, KvSplit))> = Vec::new();
         let mut applied = false;
         for group in tries.chunks(8) {

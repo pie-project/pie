@@ -286,8 +286,26 @@ fn push(cols: &mut [Vec<Slice>], r: usize, s: Slice) {
     }
 }
 
-fn covered(cols: &[Vec<Slice>], base: ValueId, col: u32) -> bool {
-    cols.iter().flatten().any(|s| s.covers(base, col))
+/// The columns of `c` no root holds yet, in order.
+fn uncovered(cols: &[Vec<Slice>], c: Cols) -> Vec<u32> {
+    let (lo, hi) = (c.from, c.from + c.width);
+    let mut held: Vec<(u32, u32)> = cols
+        .iter()
+        .flatten()
+        .filter(|s| s.base == c.base.0 && s.from < hi && lo < s.from + s.len)
+        .map(|s| (s.from.max(lo), (s.from + s.len).min(hi)))
+        .collect();
+    held.sort_unstable();
+    let mut left = Vec::new();
+    let mut at = lo;
+    for (a, b) in held {
+        if a > at {
+            left.extend(at..a);
+        }
+        at = at.max(b);
+    }
+    left.extend(at..hi);
+    left
 }
 
 /// The layout of `u` with `rest` column roots besides its head roots; `None` where a width does
@@ -387,9 +405,7 @@ fn layout_with(r: &Reader, u: &Unit, py: u32, rest: u32) -> Option<Layout> {
     }
     // what is left: each value's uncovered columns over the rest, evenly
     let spread = |cols: &mut Vec<Vec<Slice>>, c: Cols| -> Option<()> {
-        let left: Vec<u32> = (c.from..c.from + c.width)
-            .filter(|&k| !covered(cols, c.base, k))
-            .collect();
+        let left = uncovered(cols, c);
         if left.is_empty() {
             return Some(());
         }
@@ -658,6 +674,22 @@ fn layout_fewest(r: &Reader, u: &Unit, py: u32, tile: u32, spill: bool, from: u3
         let (per, n) = store_words(r, u, py, l.px());
         (0..l.px()).all(|c| tile_words(u, l, c) + 2 * per * n <= WEIGHT_WORDS)
     };
+    // the head roots' tiles are the rest roots' count's alone (their heads' slices, their head
+    // regions): past the budget at any count, past it at all
+    if let Some(l) = layout_with(r, u, py, MAX_REST).filter(|l| l.heads > 0)
+        && let Some(c) = (0..l.heads).find(|&c| tile_words(u, &l, c) >= tile)
+    {
+        let steps: Vec<(usize, u32)> = (u.steps.iter().enumerate())
+            .filter_map(|(i, s)| tile_dims(s, &l, c).map(|(a, b)| (i, a * b)))
+            .collect();
+        return Err(format!(
+            "{}: head root {c} of {}'s tiles past the budget ({} words of {tile}; step: words \
+             {steps:?})",
+            u.name,
+            l.heads,
+            tile_words(u, &l, c)
+        ));
+    }
     let mut short: Option<(u32, u32)> = None;
     let mut unstored = false;
     // the most rest roots' worst tile: its root, its words, its matvecs' (step: words)
