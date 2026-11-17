@@ -1037,8 +1037,8 @@ impl Fabric {
 
     /// At most `slots(kind)` routes at every PE that runs a kernel: `slots` is the kind's
     /// kernel's route table ([`super::kernel::KernelBuild::route_slots`]; `None`: the program
-    /// builds no kernel for the kind, an error). Idle PEs are not checked here (their words, if
-    /// a kernel reads them, are bounded by [`Fabric::route_words`]).
+    /// builds no kernel for the kind, an error). An idle PE runs the filler, which loads no
+    /// routes: any route laid through it is an error (the link would be cut there).
     pub fn check_route_slots(
         &self,
         floor: &Floor,
@@ -1046,6 +1046,13 @@ impl Fabric {
     ) -> Result<(), String> {
         for (p, role) in floor.roles.iter() {
             if role.is_idle() {
+                // an idle PE runs the filler, which loads no routes: a link through it is cut
+                if let Some(r) = self.routes(p).first() {
+                    return Err(format!(
+                        "fabric: ({}, {}) is idle (no kernel loads its routes) but colour {} routes through it",
+                        p.x, p.y, r.colour.0
+                    ));
+                }
                 continue;
             }
             let kind = role.kind;
@@ -1156,5 +1163,26 @@ mod tests {
             e.contains("colouring:") && e.contains("all 21 colours"),
             "{e}"
         );
+    }
+
+    /// A route laid through an idle PE (the filler loads no routes) is refused; the same link
+    /// through PEs that run a kernel passes.
+    #[test]
+    fn a_route_through_an_idle_pe_is_refused() {
+        use crate::role::{Kind, Place};
+        let a = Class::new("A");
+        let w = Wiring {
+            links: vec![path(a, &[(0, 0), (1, 0), (2, 0)])],
+            notes: Vec::new(),
+        };
+        let mut fl = floor(3, 1);
+        let (_, f) = Fabric::lay_coloured(&fl, &w, vec![(a, 0)]).unwrap();
+        let slots = |_: Kind| Some(4);
+        let e = f.check_route_slots(&fl, &slots).unwrap_err();
+        assert!(e.contains("(0, 0) is idle"), "{e}");
+        for x in 0..3 {
+            *fl.roles.get_mut(Coord::new(x, 0)) = PeRole::new(Kind::RELAY, Place::None);
+        }
+        f.check_route_slots(&fl, &slots).unwrap();
     }
 }
