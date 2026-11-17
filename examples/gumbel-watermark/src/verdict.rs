@@ -65,11 +65,13 @@ pub struct Cycle {
 }
 
 /// Whether the stream of per-step contexts ends in a cycle: past its last
-/// new context it only repeats, with the period between the last context
-/// and its previous occurrence, for at least one whole period. A watermark
-/// that picks each token from its context's keyed noise does exactly this
-/// on a peaked model: the same context draws the same token, which makes
-/// the same next context.
+/// new context it settles into a loop: the shortest period `p` its suffix
+/// repeats with for at least two whole periods, the loop holding every
+/// step past the last new context but for an entry of fewer than `p` old
+/// contexts off the loop.
+/// A watermark that picks each token from its context's keyed noise does
+/// exactly this on a peaked model: the same context draws the same token,
+/// which makes the same next context.
 #[must_use]
 pub fn cycle(contexts: &[u32]) -> Option<Cycle> {
     let mut seen = std::collections::HashSet::new();
@@ -79,26 +81,26 @@ pub fn cycle(contexts: &[u32]) -> Option<Cycle> {
             last_new = Some(at);
         }
     }
-    let last_new = last_new?;
-    let end = contexts.len() - 1;
-    if last_new == end {
-        return None;
+    let first_old = last_new? + 1;
+    let len = contexts.len();
+    let tail = len.saturating_sub(first_old);
+    for period in 1..=tail / 2 {
+        // The loop's start: the step after the last one, scanning back from
+        // the end, that differs from the step a period after it.
+        let start = (first_old..len - period)
+            .rev()
+            .find(|&at| contexts[at] != contexts[at + period])
+            .map_or(first_old, |at| at + 1);
+        // The loop must hold the whole tail but for an entry shorter than
+        // one period, and repeat at least twice.
+        if start - first_old < period && len - start >= 2 * period {
+            return Some(Cycle {
+                distinct: seen.len(),
+                period,
+            });
+        }
     }
-    let last = contexts[end];
-    let previous = contexts[..end].iter().rposition(|&c| c == last)?;
-    let period = end - previous;
-    let tail = last_new + 1..contexts.len();
-    if tail.len() < period
-        || tail
-            .clone()
-            .any(|at| at < period || contexts[at] != contexts[at - period])
-    {
-        return None;
-    }
-    Some(Cycle {
-        distinct: seen.len(),
-        period,
-    })
+    None
 }
 
 /// The verdict's text, and why a cycled stream is too few to judge.
@@ -145,6 +147,41 @@ mod tests {
         assert_eq!(cycle(&stream), None);
         let text = describe(Verdict::of(true, 32, 3.0), 32, 3.0, cycle(&stream));
         assert_eq!(text, "too few contexts to judge: 32 < 100");
+    }
+
+    /// A loop whose step after the last new context is an old context off
+    /// the loop's first pass, and whose period holds a context twice (Mac's
+    /// Qwen3.5 stream: 86 distinct, period 19): still a cycle.
+    #[test]
+    fn a_loop_entered_through_an_old_context_is_a_cycle() {
+        // 80 new contexts, then old context 3 (off the loop), then a loop of
+        // period 19 over old contexts with 40 appearing twice in it.
+        let mut stream: Vec<u32> = (0..80).collect();
+        stream.push(3);
+        let body: Vec<u32> = (41..58).chain([40, 40]).collect();
+        assert_eq!(body.len(), 19);
+        stream.extend(body.iter().cycle().take(256 - stream.len()));
+        let cycled = cycle(&stream);
+        assert_eq!(
+            cycled,
+            Some(Cycle {
+                distinct: 80,
+                period: 19
+            })
+        );
+        let text = describe(Verdict::of(true, 80, 1.0), 80, 1.0, cycled);
+        assert!(
+            text.contains("cycled after 80 distinct contexts (period 19)"),
+            "{text}"
+        );
+    }
+
+    /// A tail that only ends on a repeated pair is no loop.
+    #[test]
+    fn a_trailing_repeat_is_not_a_cycle() {
+        let mut stream: Vec<u32> = (0..40).collect();
+        stream.extend([3, 9, 17, 5, 5]);
+        assert_eq!(cycle(&stream), None);
     }
 
     /// Repeats that do not settle into a loop (a context seen again, then
