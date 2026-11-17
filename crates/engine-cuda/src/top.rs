@@ -99,6 +99,9 @@ pub struct Weighed {
     pub rungs: Vec<RungFacts>,
     pub estimate: engine::load::FireEstimate,
     pub live: u64,
+    /// The model's fire top: the widest rung a load that does not keep every
+    /// rung offers.
+    pub fire_top: u32,
 }
 
 /// The widest feasible rung of `rungs`: the top a load that keeps every

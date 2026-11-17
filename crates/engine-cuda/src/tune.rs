@@ -571,7 +571,17 @@ fn check_estimate_of(
     drop(shell);
     let e = &weighed.estimate;
     let est: Vec<f64> = rungs.iter().map(|r| e.ns(r)).collect();
-    let by_est = engine::load::pick(&rungs, &est, weighed.live).map_err(|e| e.to_string())?;
+    // The estimate picks among the rungs a load lays (to its fire top); the
+    // measured best is of every rung timed, two octaves past it.
+    let offered: Vec<usize> = (0..rungs.len())
+        .filter(|&k| rungs[k].tokens <= weighed.fire_top)
+        .collect();
+    let by_est = engine::load::pick(
+        &offered.iter().map(|&k| rungs[k]).collect::<Vec<_>>(),
+        &offered.iter().map(|&k| est[k]).collect::<Vec<_>>(),
+        weighed.live,
+    )
+    .map_err(|e| e.to_string())?;
     let by_meas = engine::load::pick(&rungs, &meas, weighed.live).map_err(|e| e.to_string())?;
     let scores = engine::load::scored(&rungs, &meas, weighed.live);
     let score = |tokens: u32| {

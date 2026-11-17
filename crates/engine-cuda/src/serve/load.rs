@@ -88,8 +88,20 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // no rung's efficiency improves, so none past it can be chosen. A load asked
     // nothing fires up to it, and the estimate picks below.
     let fire_top = crate::api::fire_top_of(&chip, &boot.trace, device.name())?;
+    // A load that keeps every rung (a check of the estimate) lays them two
+    // octaves past the top, so a top set too low shows in the check.
+    let laid_top = if boot.knobs.every_rung {
+        let mut lattice = crate::api::rung_lattice(&engine, u32::MAX);
+        lattice.pop();
+        lattice
+            .into_iter()
+            .find(|&rung| u64::from(rung) >= 4 * u64::from(fire_top))
+            .unwrap_or(fire_top)
+    } else {
+        fire_top
+    };
     if boot.budget.max_tokens == 0 {
-        boot.budget.max_tokens = fire_top;
+        boot.budget.max_tokens = laid_top;
         // only where it at least halves the fire: a trunk of few value heads seats enough lanes that the
         // wide fire feeds its experts better (Qwen3.6-35B-A3B pf64 lost 4% at 5120 rows of 8192)
         if let Some(fit) = walk_fire_fit(&boot.trace, engine.walk_fire_rows, device.device().num_sm)
@@ -145,7 +157,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // at: asked other tokens (the walk fit, `engine.fire_rows`, a stated
     // `max_forward_tokens`), its top is the rung at or below them.
     if stated_buckets.is_empty() {
-        boot.budget.max_tokens = crate::api::on_lattice(&engine, fire_top, boot.budget.max_tokens);
+        boot.budget.max_tokens = crate::api::on_lattice(&engine, laid_top, boot.budget.max_tokens);
     }
     boot.budget.buckets = crate::api::lattice(
         stated_buckets.clone(),
@@ -423,6 +435,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
                 rungs: rungs.clone(),
                 estimate,
                 live: after_weights,
+                fire_top,
             });
         if boot.knobs.every_rung {
             crate::top::widest(&rungs).unwrap_or(top.tokens)
