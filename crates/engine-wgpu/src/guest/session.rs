@@ -41,11 +41,6 @@ pub struct Tables<'a> {
     pub scores: &'a ScoreSpec,
 }
 
-/// Which bindings the stage reads only: the descriptors, params and place
-/// tables.
-const READ_ONLY: [bool; BINDINGS as usize] =
-    [false, true, true, true, false, false, false, false, false];
-
 const STATUS_SPAN: u64 = eta_exec::STATUS_BYTES as u64;
 
 pub struct Code {
@@ -602,14 +597,10 @@ fn bind_layout(core: &Core) -> wgpu::BindGroupLayout {
         .map(|at| wgpu::BindGroupLayoutEntry {
             binding: at,
             visibility: wgpu::ShaderStages::COMPUTE,
+            // Every binding read_write (`ptir_runtime.wgsl`): the tables
+            // and config lie in the pool's segments the scratch writes.
             ty: wgpu::BindingType::Buffer {
-                ty: if at == CFG_BINDING {
-                    wgpu::BufferBindingType::Uniform
-                } else {
-                    wgpu::BufferBindingType::Storage {
-                        read_only: READ_ONLY[at as usize],
-                    }
-                },
+                ty: wgpu::BufferBindingType::Storage { read_only: false },
                 has_dynamic_offset: false,
                 min_binding_size: None,
             },

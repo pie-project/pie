@@ -160,7 +160,13 @@ impl Raw {
             return on_read(Ok(Vec::new()));
         }
         let core = &self.core;
-        let start = offset & !3;
+        // A mapped range starts on `MAP_ALIGNMENT` (8) bytes, a copy on 4.
+        let grain = if self.kind == Memory::Readback {
+            wgpu::MAP_ALIGNMENT
+        } else {
+            wgpu::COPY_BUFFER_ALIGNMENT
+        };
+        let start = offset - offset % grain;
         let end = (offset + len).next_multiple_of(4).min(self.size);
         let span = end - start;
         let skip = (offset - start) as usize;

@@ -349,14 +349,9 @@ impl Session {
         }
         let status = placed.next().expect("the fault word after the tables");
 
-        let sizes = [
-            vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count((BINDINGS - 1) * stages.len() as u32),
-            vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::UNIFORM_BUFFER)
-                .descriptor_count(stages.len() as u32),
-        ];
+        let sizes = [vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(BINDINGS * stages.len() as u32)];
         // A package with no stages holds no sets, and Vulkan has no empty pool.
         let pool = if stages.is_empty() {
             vk::DescriptorPool::null()
@@ -457,7 +452,7 @@ impl Session {
                 (1, held(descs), vk::DescriptorType::STORAGE_BUFFER),
                 (2, held(params), vk::DescriptorType::STORAGE_BUFFER),
                 (3, held(offs), vk::DescriptorType::STORAGE_BUFFER),
-                (5, held(cfg), vk::DescriptorType::UNIFORM_BUFFER),
+                (5, held(cfg), vk::DescriptorType::STORAGE_BUFFER),
             ];
             for (&binding, &(buffer, range)) in SEGMENT_BINDINGS.iter().zip(&segments) {
                 buffers.push((
