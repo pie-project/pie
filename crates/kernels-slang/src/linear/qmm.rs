@@ -43,7 +43,7 @@ pub enum Qmm {
     /// The tiled kernel at SPIR-V's cooperative-matrix tier, 64 x 64 tiles.
     Coopmat,
     /// The register-tiled kernel (SPIR-V): `bm` rows (32 or 64) a tile, each
-    /// invocation holding a 4 x 4 block; `k16` walks 16 codes a step.
+    /// invocation holding an 8 x 4 block; `k16` walks 16 codes a step.
     RegisterTiled { bm: u32, k16: bool },
     /// The tiled kernel, through workgroup memory; it declines a batch whose
     /// padded row tiles the row capacity cannot hold. A 32-wide column tile
@@ -291,7 +291,7 @@ fn register(ctx: &Ctx<'_>, op: &'static str, b: &Bounds, bm: u32, k16: bool) -> 
     ctx.fire(
         Fire::at(REGISTER, entry)
             .groups([b.n.div_ceil(REGISTER_COLS), b.m.div_ceil(bm), 1])
-            .group([REGISTER_COLS / 4, bm / 4, 1]),
+            .group([REGISTER_COLS / 4, bm / 8, 1]),
         &args(op, b)?,
     )
 }
