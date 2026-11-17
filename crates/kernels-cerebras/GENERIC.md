@@ -2303,8 +2303,8 @@ milestone's tail.
   legal; a decode program's queues are bound from its rcfg at its start, which `Fabric::validate`
   holds to its routes). Memory: each PE's data (its files' arrays, their sizes evaluated from the
   tile's parameters and the files' integer consts, `if` / `@as` / shifts / comparisons included)
-  and code (3,000 B + 24 B a statement, fitted to cslc's ELFs: the GEMM regime's compute PE and
-  tape PE, 1.2 KB and 3.0 KB over), the fullest PE's margin under 48 KB reported; a decode
+  and code (first 3,000 B + 24 B a statement; refitted below, "A PE's memory, refitted"), the
+  fullest PE's margin under 48 KB reported; a decode
   program's memory is its plan's memory model's (`cost::memory::room`: its sizes are comptime
   functions past the check's arithmetic). `wafer-compile build` and `stream` run it on what they
   wrote and fail on an error; `wafer-compile check --dir <program>` prints it.
@@ -2402,6 +2402,63 @@ milestone's tail.
   layers), only a step's absolute time does.
 - A load's fallbacks are the search's next two; `wafer-compile search --cold 1` prices nothing by
   a measurement.
+
+## A PE's memory, refitted
+
+- **The false positive.** G1's Qwen3.5-0.8B `-l4` stream program (the decode units) failed the
+  check at `cy_3_0.csl`: about 41 KB of data and 14 KB of code estimated, so past 48 KB. But cslc links
+  it, and the ELF holds 40,320 B of data and 8,372 B of code: 48,692 B, 460 B to spare. The
+  old estimate (3,000 B + 24 B for each `;` in the file and everything it imports) was off in both
+  directions. Across the linked images below it was 11.3 KB under on a MoE router root
+  (`cy_0_4.csl`, 23,108 B of code: its 62 scalar loops over 16 experts are unrolled) and up
+  to 27.6 KB over (a decode `cy.csl`: every kernel it imports was counted, though one runs).
+- **What cslc compiles** (`check::code`): only the functions reached from a PE's tasks and
+  the `@bind_*_task` / `@export_symbol` arguments. A function that only a comptime block calls
+  runs at compile time and compiles to nothing. Branches whose comptime condition the check
+  evaluates are cut to the branch taken. An `inline fn` counts once per call site.
+  A loop with a known trip count of at most 64, and an unrolled body of at most 4,000
+  characters, counts its body's DSD operations and `if`s that many times.
+- **The fit** (`check::code_bytes`, least squares over the ELFs, `.text` + `.task_table`, plus
+  data past the arrays). Code: 3,091 B for the runtime (task table, memcpy, teardown),
+  plus 21.4 B per statement, 13.3 B per DSD operation, 78.2 B per loop and 12.2 B per `if`.
+  Data: the arrays plus 434 B (the ELFs' median). The data side also gained `const` literal
+  arrays of any type (a grid program's `prog` table) and sizes computed through
+  one-expression helpers (`satt.csl`'s `mx(..)`).
+- **The data:** 686 distinct PE images (893 ELFs) from 52 linked programs, every regime:
+  - stream units: Qwen3.5-0.8B `-l1`/`-l4`/`-l4` at KV replication 2, Qwen3.5-4B `-l2`,
+    Qwen3-0.6B, Llama-3.1-8B `-l2`, Qwen3-30B-A3B mini, a Qwen3 MoE `-l1`;
+  - flux stream and band programs; the GEMM programs (single and batched);
+  - grid and tiled VAE programs;
+  - 12 decode programs.
+
+  Data plus code, estimate minus the ELF, by family:
+
+  | family | PE images | worst under | worst over | rms |
+  |---|---|---|---|---|
+  | stream units (`cy_*`, `cx_*`, `w_*`, `kp_*`, ...) | 230 | -1,471 | +1,068 | 539 |
+  | flux stream | 327 | -2,072 | +1,390 | 591 |
+  | bands | 62 | -2,072 | +2,363 | 872 |
+  | GEMM | 19 | -2,415 | +345 | 984 |
+  | grid | 7 | -1,189 | +2,234 | 1,050 |
+  | tiled | 3 | -1,249 | -354 | 805 |
+  | decode (reported only) | 38 | -4,493 | +7,435 | 2,256 |
+
+  - The decode programs pick each layer's kernel with comptime functions (`nla()`), which the
+    check cannot evaluate, so their memory stays `cost::memory::room`'s. They are not in the fit.
+  - Held out a family at a time, the fit stays within 2.5 KB everywhere but two places:
+    - GEMM, 4.3 KB under;
+    - the units without their own images. Their unrolled router loops then price at 19 KB
+      over, so the units must stay in the fit.
+- **The check.**
+  - The estimate's worst misses are `check::UNDER` = 2,437 B and `check::OVER` = 2,361 B.
+  - A PE past 48 KB by more than `OVER` is an error, since it cannot link.
+  - A PE within `UNDER` of 48 KB is a warning, since it may not link. G1's `cy_3_0` now
+    estimates 49,203 B, which is a warning and not an error.
+  - `check::pe_bytes(files, file, params)` is the same model for a search's candidate, one
+    kind of PE at a time. `PeBytes::fits()` means it fits whatever the miss;
+    `PeBytes::overflows()` means it cannot.
+  - `wafer-compile check --dir <program> --all 1` prints every kind of PE's measures, which is
+    a refit's input.
 
 ## Consolidation, part C: one placement IR
 

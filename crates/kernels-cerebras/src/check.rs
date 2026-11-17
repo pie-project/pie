@@ -10,10 +10,13 @@
 //!   K1's band bug); bound to a colour the PE does not route at all, a warning (a queue a
 //!   program binds and never reads is legal).
 //! - **Memory**: each PE's data (its files' arrays, their sizes evaluated from the tile's
-//!   parameters) and code (an estimate from its statements, [`CODE_BASE`] + [`CODE_PER`] a
-//!   statement, fitted to linked ELFs) within [`PE_BYTES`], the margin reported. Against cslc's
-//!   ELFs (flux2-mini's GEMM program) the estimate is 1.2 KB (compute PE) and 3.0 KB (tape PE)
-//!   over: a margin it reports is at most the real one.
+//!   parameters) and code (what its tasks and exports reach, [`code`], priced by [`code_bytes`]
+//!   as fitted to cslc's ELFs) within [`PE_BYTES`] ([`pe_bytes`], the search's model too). The
+//!   estimate is within [`UNDER`] below and [`OVER`] above the linked ELFs': a PE past
+//!   [`PE_BYTES`] by more than [`OVER`] is an error (it cannot link), one within [`UNDER`] of it
+//!   a warning (it may not).
+
+pub mod code;
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -27,14 +30,75 @@ pub const COLOURS: i64 = 24;
 pub const QUEUES: i64 = 8;
 /// A PE's memory.
 pub const PE_BYTES: i64 = 48 * 1024;
-/// A PE's code past its statements (the runtime, memcpy's handlers, the task table), and a
-/// statement's: fitted to cslc's ELFs (GENERIC.md: the GEMM regime's compute PE 31,174 bytes of
-/// text for its interpreter and regions, its tape PE 4,556).
-pub const CODE_BASE: i64 = 3_000;
-pub const CODE_PER: i64 = 24;
-/// A PE's data past its files' arrays (the runtime's and memcpy's): the GEMM regime's compute
-/// PE's ELF holds 1,430 bytes of data past what its files declare, its tape PE 326.
-pub const DATA_BASE: i64 = 1_500;
+/// A PE's code: its runtime's (the task table, memcpy's handlers, the teardown), and a
+/// statement's, a DSD operation's, a loop's and an `if`'s of what it reaches, fitted by least
+/// squares to cslc's ELFs (GENERIC.md, "A PE's memory, refitted").
+pub const CODE_BASE: f64 = 3_091.0;
+pub const CODE_STATEMENT: f64 = 21.4;
+pub const CODE_DSD: f64 = 13.3;
+pub const CODE_LOOP: f64 = 78.2;
+pub const CODE_IF: f64 = 12.2;
+/// A PE's data past its files' arrays (the runtime's and memcpy's): the ELFs' median.
+pub const DATA_BASE: i64 = 434;
+/// The estimate's worst miss against the ELFs it is fitted to, data and code together: a PE
+/// holds at most [`UNDER`] more than it estimates and at least [`OVER`] less.
+pub const UNDER: i64 = 2_437;
+pub const OVER: i64 = 2_361;
+
+/// A PE's memory as the check estimates it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PeBytes {
+    pub data: i64,
+    pub code: i64,
+}
+
+impl PeBytes {
+    #[must_use]
+    pub fn total(self) -> i64 {
+        self.data + self.code
+    }
+
+    /// It fits whatever the estimate's miss (its estimate [`UNDER`] within [`PE_BYTES`]).
+    #[must_use]
+    pub fn fits(self) -> bool {
+        self.total() + UNDER <= PE_BYTES
+    }
+
+    /// It cannot fit whatever the estimate's miss (past [`PE_BYTES`] by more than [`OVER`]).
+    #[must_use]
+    pub fn overflows(self) -> bool {
+        self.total() - OVER > PE_BYTES
+    }
+}
+
+/// The code bytes of what a PE's code reaches.
+#[must_use]
+pub fn code_bytes(r: &code::Reached) -> i64 {
+    let m = r.measure;
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    let b = CODE_BASE
+        + CODE_STATEMENT * m.statements as f64
+        + CODE_DSD * m.dsd as f64
+        + CODE_LOOP * m.loops as f64
+        + CODE_IF * m.ifs as f64;
+    #[allow(clippy::cast_possible_truncation)]
+    let b = b.round() as i64;
+    b
+}
+
+/// A PE's memory: `file`'s at `params`, its imports read from `files` (what the check finds of
+/// each kind of PE, for a search to price a candidate's PEs alike).
+#[must_use]
+pub fn pe_bytes(
+    files: &BTreeMap<String, String>,
+    file: &str,
+    params: &BTreeMap<String, i64>,
+) -> PeBytes {
+    PeBytes {
+        data: held(files, file, params, 0).data,
+        code: code_bytes(&code::reached(files, file, params)),
+    }
+}
 
 /// The code room a search holds back on every PE beside its data, until the code estimate
 /// bounds cslc's: the most `.text` a stream PE of over 10 KB data links to (Qwen3.5-0.8B -l4's
@@ -555,11 +619,10 @@ impl Layout {
     }
 }
 
-/// What a PE's files hold: data bytes, statements, queue bindings (`input`, id, colour).
+/// What a PE's files hold: data bytes, queue bindings (`input`, id, colour).
 #[derive(Clone, Debug, Default)]
 struct Held {
     data: i64,
-    statements: i64,
     unknown: Vec<String>,
     queues: Vec<(bool, i64, Option<i64>)>,
 }
@@ -573,6 +636,95 @@ fn type_bytes(t: &str) -> i64 {
     } else {
         2
     }
+}
+
+/// A file's one-expression functions (`fn f(a: T, ..) R { return e; }`, a comptime size's
+/// helper): name -> (parameters, expression).
+fn returns(src: &str) -> BTreeMap<String, (Vec<String>, String)> {
+    let mut out = BTreeMap::new();
+    for (at, _) in src.match_indices("fn ") {
+        if at > 0 && src[..at].ends_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
+            continue;
+        }
+        let rest = &src[at + 3..];
+        let Some(open) = rest.find('(') else { continue };
+        let name = rest[..open].trim().to_string();
+        let Some(args) = call_args(rest) else {
+            continue;
+        };
+        let Some(body) = rest.find('{').map(|b| &rest[b + 1..]) else {
+            continue;
+        };
+        let Some(end) = body.find('}') else { continue };
+        let body = body[..end].trim();
+        if let Some(e) = body
+            .strip_prefix("return ")
+            .and_then(|e| e.strip_suffix(';'))
+            && !e.contains(';')
+        {
+            let ps = args
+                .iter()
+                .map(|a| a.split(':').next().unwrap_or("").trim().to_string())
+                .collect();
+            out.insert(name, (ps, e.to_string()));
+        }
+    }
+    out
+}
+
+/// `e` with its calls of `fns` replaced by their expressions over the call's arguments.
+fn inline_calls(e: &str, fns: &BTreeMap<String, (Vec<String>, String)>) -> String {
+    if fns.is_empty() {
+        return e.to_string();
+    }
+    let mut out = e.to_string();
+    for _ in 0..8 {
+        let mut changed = false;
+        for (name, (ps, body)) in fns {
+            let key = format!("{name}(");
+            let Some(at) = out.find(&key) else { continue };
+            if at > 0
+                && out[..at].ends_with(|c: char| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+            {
+                continue;
+            }
+            let Some(args) = call_args(&out[at..]) else {
+                continue;
+            };
+            if args.len() != ps.len() {
+                continue;
+            }
+            // the call's extent: its name to its closing parenthesis
+            let mut depth = 0;
+            let mut end = at;
+            for (i, c) in out[at..].char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = at + i + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let sub: Vec<String> = tokens(body)
+                .into_iter()
+                .map(|t| match ps.iter().position(|p| *p == t) {
+                    Some(i) => format!("({})", args[i]),
+                    None => t,
+                })
+                .collect();
+            out = format!("{}({}){}", &out[..at], sub.join(" "), &out[end..]);
+            changed = true;
+        }
+        if !changed {
+            break;
+        }
+    }
+    out
 }
 
 /// A statement's text from its declaration on (`const`, `param`, `var` opening a line; what a
@@ -606,6 +758,7 @@ fn held(
     };
     let src = uncomment(text);
     let mut env = params.clone();
+    let fns = returns(&src);
     // the file's integer names, in order (a parameter's default where the tile states none)
     for stmt in src.split(';') {
         let s = decl(stmt);
@@ -618,30 +771,35 @@ fn held(
         {
             let name = name.split(':').next().unwrap_or("").trim().to_string();
             if !env.contains_key(&name)
-                && let Some(v) = eval(v, &env)
+                && let Some(v) = eval(&inline_calls(v, &fns), &env)
             {
                 env.insert(name, v);
             }
         }
     }
-    h.statements = src.matches(';').count() as i64;
     let mut qnames: BTreeMap<String, (bool, i64)> = BTreeMap::new();
     for stmt in src.split(';') {
         let s = decl(stmt);
         // arrays: `[N]T` in a var's type or its `@zeros` / `@constants`, a const's literal
-        let is_data = s.starts_with("var ") || (s.starts_with("const ") && s.contains("]f32 {"));
+        let is_data = s.starts_with("var ")
+            || (s.starts_with("const ")
+                && s.split_once('=')
+                    .is_some_and(|(_, v)| v.trim_start().starts_with('[') && v.contains('{')));
         if is_data
             && let Some(open) = s.find('[')
             && !s[open..].starts_with("[*]")
         {
             let close = s[open..].find(']').map(|c| open + c);
-            if let Some(close) = close {
+            // (`[N]T`: a subscript `a[i]` is no array)
+            if let Some(close) = close
+                && s[close + 1..].starts_with(|c: char| c.is_ascii_alphabetic() || c == '@')
+            {
                 let n = &s[open + 1..close];
                 let ty: String = s[close + 1..]
                     .chars()
                     .take_while(|c| c.is_ascii_alphanumeric() || *c == '@' || *c == '(')
                     .collect();
-                match eval(n, &env) {
+                match eval(&inline_calls(n, &fns), &env) {
                     Some(n) => h.data += n * type_bytes(&ty),
                     None => h
                         .unknown
@@ -690,13 +848,15 @@ fn held(
                     .collect();
                 let sub = held(files, name, &p, depth + 1);
                 h.data += sub.data;
-                h.statements += sub.statements;
                 h.unknown.extend(sub.unknown);
             }
         }
     }
     h
 }
+
+/// A kind of PE: its file, parameters, data bytes and what its code reaches.
+pub type Kind = (String, Vec<(String, i64)>, i64, code::Reached);
 
 /// A check's findings.
 #[derive(Clone, Debug, Default)]
@@ -715,6 +875,8 @@ pub struct Report {
     /// functions', past this check's arithmetic: a decode program's, `cost::memory::room`),
     /// in place of the estimate's margin.
     pub model_room: Option<i64>,
+    /// Each distinct PE code: its file, parameters, data bytes and what its code reaches.
+    pub kinds: Vec<Kind>,
 }
 
 impl Report {
@@ -907,8 +1069,11 @@ fn placed_with(
             }
         }
     }
-    for ((f, _), h) in &seen {
-        let code = CODE_BASE + CODE_PER * h.statements;
+    for ((f, p), h) in &seen {
+        let params: BTreeMap<String, i64> = p.iter().cloned().collect();
+        let reached = code::reached(files, f, &params);
+        let code = code_bytes(&reached);
+        rep.kinds.push((f.clone(), p.clone(), h.data, reached));
         if rep
             .fullest
             .as_ref()
@@ -925,11 +1090,19 @@ fn placed_with(
     rep.unknown.dedup();
     // (a decode program's memory is its plan's memory model's, fitted to its links: the
     // estimate here misses its comptime-sized arrays and its code's measure; reported only)
-    if rep.margin() < 0 && !runtime_queues {
-        let (f, d, c) = rep.fullest.clone().unwrap_or_default();
-        rep.errors.push(format!(
-            "`{f}`: {d} B data + ~{c} B code past a PE's {PE_BYTES} B"
-        ));
+    if !runtime_queues && let Some((f, d, c)) = rep.fullest.clone() {
+        let pe = PeBytes { data: d, code: c };
+        if pe.overflows() {
+            rep.errors.push(format!(
+                "`{f}`: {d} B data + ~{c} B code past a PE's {PE_BYTES} B by more than the \
+                 estimate's {OVER} B miss"
+            ));
+        } else if !pe.fits() {
+            rep.warnings.push(format!(
+                "`{f}`: {d} B data + ~{c} B code within the estimate's {UNDER} B miss of a PE's \
+                 {PE_BYTES} B: it may not link"
+            ));
+        }
     }
     rep
 }

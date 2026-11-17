@@ -183,11 +183,21 @@ fn checked(args: &[String]) -> Result<(), String> {
     rep.ok()
 }
 
-/// `check --dir <program dir>`: the static check of an emitted program (a stream program's
-/// directory, or a decode build's `layout/`).
+/// `check --dir <program dir> [--all 1]`: the static check of an emitted program (a stream
+/// program's directory, or a decode build's `layout/`); `--all`, every kind of PE's line.
 fn check(args: &[String]) -> Result<(), String> {
-    let f = flags(args, &["--dir"])?;
+    let f = flags(args, &["--dir", "--all"])?;
     let rep = kernels_cerebras::check::dir(Path::new(get(&f, "--dir").ok_or(USAGE)?))?;
+    if get(&f, "--all").is_some() {
+        // every kind of PE: file, data bytes, its code's measures (a refit's input), parameters
+        for (file, p, d, r) in &rep.kinds {
+            let m = r.measure;
+            println!(
+                "KIND {file} {d} {} {} {} {} {} {p:?}",
+                m.statements, r.functions, m.dsd, m.loops, m.ifs
+            );
+        }
+    }
     println!("{}", rep.line());
     for e in rep.errors.iter().take(20) {
         println!("  error: {e}");
