@@ -21,10 +21,10 @@ const KV_ROW: &str = "kv";
 const PAGE: u32 = 16;
 const LANES: u32 = 4;
 /// The slots of an item: a run, as a guest item past one slot takes.
-const RUN: u32 = 3;
+pub(crate) const RUN: u32 = 3;
 
 /// One attention layer.
-struct Micro;
+pub(crate) struct Micro;
 
 impl ForwardHybrid for Micro {
     fn states(&self) -> StateRows {
@@ -59,7 +59,7 @@ impl ForwardHybrid for Micro {
     }
 }
 
-fn shell(trace: poem::Trace, path: &Path) -> Shell {
+pub(crate) fn shell(trace: poem::Trace, path: &Path) -> Shell {
     let contract = contract_for(&trace, path).expect("the random planes fit the trace");
     Shell::load(Boot {
         voxels: None,
@@ -90,11 +90,11 @@ fn shell(trace: poem::Trace, path: &Path) -> Shell {
 }
 
 /// `RUN` adjacent slot refs from slot `index` of chunk `chunk`.
-fn run(per_chunk: u32, chunk: u32, index: u32) -> Vec<u32> {
+pub(crate) fn run(per_chunk: u32, chunk: u32, index: u32) -> Vec<u32> {
     (0..RUN).map(|at| chunk * per_chunk + index + at).collect()
 }
 
-fn pairs(src: &[u32], dst: &[u32]) -> Vec<(u32, u32)> {
+pub(crate) fn pairs(src: &[u32], dst: &[u32]) -> Vec<(u32, u32)> {
     src.iter().copied().zip(dst.iter().copied()).collect()
 }
 
