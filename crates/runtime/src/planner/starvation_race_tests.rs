@@ -2195,6 +2195,7 @@ async fn a_bind_by_a_suspended_process_waits_for_its_restore() {
         pid,
         || std::future::ready(bind()),
         || planner.wait_resident(pid),
+        |_, _| std::future::ready(Err::<(), String>("no guest state here".into())),
     );
     tokio::pin!(decode);
     assert!(futures::poll!(decode.as_mut()).is_pending(), "it waits");
