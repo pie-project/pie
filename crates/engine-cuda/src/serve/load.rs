@@ -66,6 +66,17 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             resolved
         }
     };
+    // A device whose profile lacks the roofline's constants measures them
+    // here, before ready, and keeps them in the user's profile.
+    let chip = crate::rates::ensure(
+        chip,
+        boot.ordinal,
+        device.name(),
+        &measured,
+        boot.knobs.profiles.as_deref(),
+        boot.cache_dir,
+    )
+    .map_err(crate::error::Fault::Card)?;
     device.set_tuning(kernels_cuda::tuning::Tuning::of(&chip));
     let engine = crate::chip::Engine::of(&chip);
     // The device the roofline weighs a fire on, and its fire top

@@ -41,6 +41,78 @@
 use engine::rates::{ATTN_SHAPE, SCAN_SHAPE, weights_at};
 use profile::fire::Rates;
 
+/// The `[provenance]` entry a measurement of `device`'s rates writes beside
+/// them (`engine::rates::provenance`): how this backend measured them.
+#[must_use]
+pub fn provenance(device: &str) -> (&'static str, String) {
+    let how = format!(
+        "{device}; the matmul through {}'s first heuristic algorithm, each rate a 20 ms burst on \
+         the stream timed by events, the median of 5 (the launch of 15), its work its waves over \
+         the device's SMs; operands: engine::rates' pattern; at {}",
+        if cfg!(feature = "rocm") {
+            "hipBLASLt"
+        } else {
+            "cuBLASLt"
+        },
+        engine::rates::build_commit()
+    );
+    engine::rates::provenance("cuda", &how)
+}
+
+/// `chip` with every roofline constant stated: as it is where its layers
+/// state them all; else the device's own measured here, before the load is
+/// ready (the step `pie tune cuda --rates` runs, seconds long, each timed
+/// submission a burst of about [`BURST_NS`]), each constant a layer states
+/// kept over the measured one, the whole written to the user's profile of
+/// `device` under `profiles` (with its provenance) so later loads read it,
+/// and marked measured this load for the load's line.
+pub fn ensure(
+    chip: profile::Profile,
+    ordinal: i32,
+    device: &str,
+    facts: &profile::Facts,
+    profiles: Option<&std::path::Path>,
+    cache: Option<&std::path::Path>,
+) -> Result<profile::Profile, String> {
+    let stated = chip.rates();
+    if stated.launch_ns.is_some()
+        && stated.gemm_tflops.is_some()
+        && stated.attn_tflops.is_some()
+        && stated.hbm_gbps.is_some()
+        && stated.scan_gelems.is_some()
+    {
+        return Ok(chip);
+    }
+    let began = std::time::Instant::now();
+    let measured = measure(ordinal, &chip, cache)?.rates;
+    let rates = stated.over(measured);
+    eprintln!(
+        "engine-cuda: {device}'s profile states no roofline rates; measured them in {:.1} s",
+        began.elapsed().as_secs_f64()
+    );
+    if let Some(profiles) = profiles {
+        let file = profile::search::assemble(
+            crate::chip::registry(),
+            &chip,
+            device,
+            facts,
+            &engine::rates::tuned(&rates),
+            std::slice::from_ref(&provenance(device)),
+            &[crate::chip::ARCH],
+        )?;
+        let path = crate::chip::SHELF.user_path(profiles, device);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
+        std::fs::write(&path, file).map_err(|e| format!("{}: {e}", path.display()))?;
+        eprintln!("engine-cuda: the rates are written to {}", path.display());
+    }
+    let mut tuned = chip.tuned().clone();
+    tuned.rates = rates;
+    tuned.measured_this_load = true;
+    Ok(chip.with_tuned(tuned))
+}
+
 /// The kv cache's page, as a served load pages it.
 pub const PAGE: u32 = 16;
 

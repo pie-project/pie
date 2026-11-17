@@ -68,18 +68,7 @@ pub fn rates(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Rated
         r.launch_ns.unwrap_or(0),
     ));
     let tuned = engine::rates::tuned(&r);
-    let how = format!(
-        "{name}; the matmul through {}'s first heuristic algorithm, each rate a 20 ms burst on \
-         the stream timed by events, the median of 5 (the launch of 15), its work its waves over \
-         the device's SMs; operands: engine::rates' pattern; at {}",
-        if cfg!(feature = "rocm") {
-            "hipBLASLt"
-        } else {
-            "cuBLASLt"
-        },
-        sitting()
-    );
-    let provenance = engine::rates::provenance("cuda", &how);
+    let provenance = crate::rates::provenance(&name);
     let file = search::assemble(
         crate::chip::registry(),
         &base,
@@ -99,14 +88,6 @@ pub fn rates(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Rated
         block,
         seconds: began.elapsed().as_secs_f64(),
     })
-}
-
-/// The commit this pie was built from, as the build stated it in
-/// `PIE_COMMIT`, else `commit unknown`: never the source tree's `HEAD` at
-/// tune time, which may have moved on since the build.
-fn sitting() -> String {
-    option_env!("PIE_COMMIT")
-        .map_or_else(|| "commit unknown".to_string(), |c| format!("commit {c}"))
 }
 
 /// How a load is shaped: its slots and compiled budget, its patch ladder,
