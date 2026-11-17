@@ -589,39 +589,27 @@ impl Plane {
                 plan.reject_reason.as_deref().unwrap_or("no reason given")
             )));
         }
-        self.next_program += 1;
-        let id = ProgramId(self.next_program);
-
-        if !self.forms.admit(id, &plan.package) {
-            let why = self
-                .forms
-                .refusal(id)
-                .map_or_else(String::new, ToString::to_string);
-            self.forms.forget(id);
-            return Err(Refusal::Program(format!(
+        // A guest runs on the device or is refused here, by name. Nothing
+        // of the plane's is touched until the finish, which assigns the id:
+        // a prepare whose compile never finishes leaves nothing behind.
+        let form = crate::guest::form_of(&plan.package).map_err(|why| {
+            Refusal::Program(format!(
                 "a stage of program 0x{:016x} does not lower on XLA: {why}",
                 registration.program_hash
-            )));
-        }
-        let form = self.forms.get(id).cloned();
-        let wanted = match &form {
-            Some(form) => self.stages.wanted(&plan.package, form.key, &form.pooled()),
-            None => Ok(Vec::new()),
-        };
-        let wanted = match wanted {
-            Ok(wanted) => wanted,
-            Err(why) => {
-                self.forms.forget(id);
-                return Err(Refusal::Program(format!(
+            ))
+        })?;
+        let wanted = self
+            .stages
+            .wanted(&plan.package, form.key, &form.pooled())
+            .map_err(|why| {
+                Refusal::Program(format!(
                     "a stage of program 0x{:016x} does not compile: {why}",
                     registration.program_hash
-                )));
-            }
-        };
+                ))
+            })?;
         Ok(Pending {
-            id,
             hash: registration.program_hash,
-            key: form.map(|form| form.key),
+            form,
             plan: Arc::new(plan),
             wanted,
             pool_rows: self.stages.pool_rows(),
@@ -637,20 +625,22 @@ impl Plane {
         staged: Result<Vec<Arc<crate::guest::run::Staged>>, String>,
     ) -> Result<ProgramId, Refusal> {
         let Pending {
-            id, hash, key, plan, wanted, ..
+            hash,
+            form,
+            plan,
+            wanted,
+            ..
         } = pending;
-        let staged = match staged {
-            Ok(staged) => staged,
-            Err(why) => {
-                self.forms.forget(id);
-                return Err(Refusal::Program(format!(
-                    "a stage of program 0x{hash:016x} does not compile: {why}"
-                )));
-            }
-        };
-        if let Some(key) = key
-            && !staged.is_empty()
-        {
+        let staged = staged.map_err(|why| {
+            Refusal::Program(format!(
+                "a stage of program 0x{hash:016x} does not compile: {why}"
+            ))
+        })?;
+        self.next_program += 1;
+        let id = ProgramId(self.next_program);
+        let key = form.key;
+        self.forms.hold(id, Ok(form));
+        if !staged.is_empty() {
             self.stages.install(key, wanted, staged);
         }
         tracing::debug!(program = id.0, "guest program registered");
@@ -658,8 +648,22 @@ impl Plane {
         Ok(id)
     }
 
-    #[must_use]
-    pub fn package(
+    /// Releases `id`, which no instance binds (`Engine::close_program`):
+    /// its id answers nothing after.
+    pub fn close_program(&mut self, id: ProgramId) -> Result<(), Refusal> {
+        if self.instances.values().any(|instance| instance.program == id) {
+            return Err(Refusal::Program(format!(
+                "program {id} still has an instance bound"
+            )));
+        }
+        self.programs.remove(&id).ok_or(Refusal::Closed {
+            what: "program",
+            id: id.0,
+        })?;
+        self.forms.forget(id);
+        Ok(())
+    }
+
         &self,
         program: ProgramId,
     ) -> Option<&eta_compiler::codegen::launch::LaunchPackage> {
@@ -1941,9 +1945,9 @@ mod latch_tests {
 /// A program a registration prepared ([`Plane::prepare`]): what its
 /// compile, on any thread, compiles, and what [`Plane::finish`] holds.
 pub struct Pending {
-    id: ProgramId,
     hash: u64,
-    key: Option<[u8; 32]>,
+    /// Its form: every stage lowers.
+    form: Arc<crate::guest::Compiled>,
     plan: Arc<ExecPlan>,
     wanted: Vec<crate::guest::run::Want>,
     pool_rows: i64,

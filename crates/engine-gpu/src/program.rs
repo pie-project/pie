@@ -97,6 +97,9 @@ pub trait Programs<B: Serve>: Default {
     /// refuses here.
     fn finish(&mut self, prepared: Prepared) -> Result<ProgramId, Refusal>;
 
+    /// Releases `id`, which no instance binds (`Engine::close_program`).
+    fn close_program(&mut self, id: ProgramId) -> Result<(), Refusal>;
+
     /// A registration whole, on the calling thread.
     fn register(&mut self, registration: &ProgramRegistration) -> Result<ProgramId, Refusal> {
         self.finish(adopt(registration))

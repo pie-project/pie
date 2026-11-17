@@ -2689,6 +2689,11 @@ impl Shell {
         Ok(self.programs.instance_mut(instance_id))
     }
 
+    /// Releases a registered program no instance binds.
+    pub fn close_program(&mut self, id: engine::ProgramId) -> Result<()> {
+        self.programs.close_program(id)
+    }
+
     pub fn close_program_instance(&mut self, instance_id: engine::InstanceId) -> Result<()> {
         self.fence_instances(&[instance_id])?;
         self.programs.close_instance(instance_id)?;

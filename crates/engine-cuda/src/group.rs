@@ -436,6 +436,13 @@ impl Engine for Group {
         Ok(ids.swap_remove(0))
     }
 
+    fn close_program(&mut self, program: ProgramId) -> EngineResult<()> {
+        for rank in 0..self.ranks.len() {
+            self.on(rank, |cuda| cuda.close_program(program))?;
+        }
+        Ok(())
+    }
+
     fn program_facts(&self, program: ProgramId) -> EngineResult<engine::program::ProgramFacts> {
         match self.ranks.first().and_then(|rank| rank.try_lock().ok()) {
             Some(rank) => rank.program_facts(program),

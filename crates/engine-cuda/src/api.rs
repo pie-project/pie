@@ -1060,6 +1060,10 @@ impl Engine for Cuda {
         self.refused(registered)
     }
 
+    fn close_program(&mut self, program: ProgramId) -> EngineResult<()> {
+        self.loaded_mut()?.close_program(program).map_err(fault)
+    }
+
     fn settles_asynchronously(&self) -> bool {
         true
     }

@@ -184,6 +184,10 @@ impl Engine for FakeEngine {
         Err(::engine::Error::unsupported(self.kind(), "finish_program"))
     }
 
+    fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "close_program"))
+    }
+
     fn load(&mut self, _request: LoadRequest) -> ::engine::Result<Loaded> {
         Err(::engine::Error::Load("no model".into()))
     }

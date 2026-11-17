@@ -685,6 +685,10 @@ impl Engine for Xla {
         self.refused(registered)
     }
 
+    fn close_program(&mut self, program: ProgramId) -> EngineResult<()> {
+        self.programs.close_program(program).map_err(refusal)
+    }
+
     /// XLA's readouts ([`engine::Engine::readout_facts`]): every output
     /// lands in a ring laid at load (`Pools::lay_readouts`), inside the
     /// bytes the load reserved, so no term beside the rungs; a sequence
