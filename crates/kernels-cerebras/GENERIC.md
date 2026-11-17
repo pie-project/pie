@@ -2966,31 +2966,50 @@ What follows:
 
 **Decode, measured.** Each of the 9 models' cold candidates (`cold::candidates`, 4,096
 positions) was sorted three ways: refused by the constructor, refused at build (`Program::build`:
-the floor, the wiring, colours, fit), or built. Where a candidate refused only for geometry is cheaper than the first
-that builds, a placer that made it build gains at most the difference.
+the floor, the wiring, colours, fit), or built. Where a candidate refused only for geometry is
+cheaper than the first that builds, a placer that made it build gains at most the difference.
 
 The cold candidates at 4,096 positions are priced by shape alone (`time::step`, the kinds'
-layer cost) and built cheapest first until one builds. A candidate the snake refuses before
-it plans ("N units on X x Y slots") is re-gridded: one unit column, because the price reads
-no grid. The examples `p1_price` / `p1_refusals` are uncommitted scratch.
+layer cost), behind the search's own filter (`search::Search::score`: the positions served,
+the head's rows over the vocabulary, every image's room by `cost::memory` past `STACK_ROOM`
+plus `search::MARGIN`). They are then built cheapest first until one builds. A candidate the
+snake refuses before it plans ("N units on X x Y slots") is re-gridded to one unit column,
+since the price reads no grid. The examples (`p1_price` / `p1_refusals`) are uncommitted
+scratch.
 
-| model | candidates | snake-refused, re-gridded and priced | cheapest priced (re-gridded) | first that builds | cheaper refused for geometry |
-|---|---|---|---|---|---|
-| Qwen3.5 0.8B | 4,220 | 1,651 | 0.2720 (0.2720) | 0.2720 | none |
-| Qwen3.5 4B | 3,617 | 1,184 | 0.4359 (0.4359) | 0.4359 | none |
-| Qwen3.5 9B | 3,206 | 1,184 | 0.4862 (0.4862) | 0.4862 | none |
-| Llama 3.1 8B | 4,698 | 1,619 | 0.4536 (0.4536) | 0.4536 | none |
-| Qwen3-8B | 8,278 | 1,886 | 0.4995 (0.4995) | 0.4995 | none |
-| Gemma 4 E2B | 819 | — | 0.7036 | 0.7062 | none (39 refused for RoPE positions, not geometry) |
-| Gemma 4 E4B | 1,872 | — | 0.8234 | 0.8241 | **-0.08%**: 5 over the wafer (771 wide) |
-| Gemma 4 12B | 59,904 | — | 0.8481 | 0.8515 | **-0.4%**: 42 over the wafer |
-| gpt-oss-20b | 6,690 | — | 0.3835 | 0.4168 | **-8.0%**: 31 over the wafer (two band columns 1,090 wide), 40 odd unit counts, 15 band rules |
+This is on 8f095def6 (its memory model). **An earlier version of this table had no memory
+filter, so it priced partitions whose PEs do not hold their tiles.** That is where the 8%
+"gain" for gpt-oss came from. gpt-oss's 0.3835 ms partition (544 columns, PY 144, 2 to 6 units)
+builds stacked in one column above its band and passes the check, but its room by the memory
+model is -195 KB at 2 units and -41 KB at 6. Its PEs cannot hold it.
 
-- **The snake's refusals hide nothing.** For each `Own` model, the cheapest re-gridded
-  candidate costs exactly the cheapest grid-valid one. The price reads no grid, and every
-  (K, PX, PY) the snake refuses on one grid is laid on another.
-- **A placer's decode payoff by today's price is gpt-oss's 8%.** Gemma 12B (0.4%) and E4B
-  (0.08%) follow; for the rest there is none unless a link term is added.
+| model | candidates | past memory / positions / vocabulary | priced (re-gridded) | cheapest priced | first that builds | cheaper refused for geometry |
+|---|---|---|---|---|---|---|
+| Qwen3.5 0.8B | 4,220 | 2,073 | 899 (416) | 0.2720 | 0.2720 | none |
+| Qwen3.5 4B | 3,617 | 2,031 | 57 (18) | 0.4359 | 0.4359 | none |
+| Qwen3.5 9B | 3,206 | 2,083 | 5 | 0.4937 | 0.4937 | none |
+| Llama 3.1 8B | 4,698 | 2,864 | 10 | 0.4544 | 0.4544 | none |
+| Qwen3-8B | 8,278 | 4,479 | 11 | 0.4995 | 0.4995 | none |
+| Gemma 4 E2B | 819 | 660 | 159 | 0.7036 | 0.7073 | none (11 refused for RoPE positions) |
+| Gemma 4 E4B | 1,872 | 1,627 | 245 | 0.8327 | 0.8327 | none |
+| Gemma 4 12B | 59,904 | 14,832 | 144 | 0.8803 | 0.8936 | **-1.5%**: 12 over the wafer |
+| gpt-oss-20b | 6,690 | 2,590 | 2 | 0.4612 | 0.4612 | none |
+
+**The 12B's near miss.** The candidate is 8 units of 368 x 272 (K 6), with the head east by
+row groups, 52 columns by 1,153 rows: 791 x 1,153 in all.
+- The units and head together take 867k PEs of the 883k the system has (98%).
+- No placement of the units fixes the shape:
+  - two unit columns are 738 wide, and the head needs 53 more;
+  - three unit columns are over 755;
+  - the head is a full-height column fed by CX row groups, so it cannot go under the units.
+
+Only a head of another shape and protocol would take the space, e.g. a band (the `Windows`
+set has none) or a head split over the 78 rows below the units and the 17 columns beside them.
+
+**So under today's kernels, free placement gains no decode model anything by today's price.**
+The snake's refusals hide nothing either: each re-gridded candidate is priced at or above a
+grid-valid one. The only decode gain in reach is the 12B's 1.5%, and it needs a new head
+protocol (high effort, a chip session).
 
 ### P1.b Where adjacency is assumed (inventory)
 
@@ -3259,3 +3278,30 @@ It links for the system fabric: cslc 2.10.1 in the SDK image, `--fabric-dims=762
 
 **flux2-mini** fits side by side (178 x 523). Its combined program is byte-identical to
 origin's, all 201 files.
+
+### P1.c: the router
+
+`place::route::fill`, run on every decode build (`Program::finish`) before the blocks settle.
+
+- **What it routes.** A block states a link it does not lay itself as a `Path` of waypoints:
+  consecutive points that are not adjacent, typically the sender's ramp and the receiver's.
+  `fill` routes each gap.
+- **The method.** A* for each wire, under negotiated congestion (PathFinder):
+  - a PE holds a class at most once (one route per colour);
+  - a PE holds at most its kernel's route table: 16 for a weight PE, 12 for a control or head
+    PE, 4 for an idle PE or a relay;
+  - what the laid links already take at each PE is subtracted first (`Palette::footprint`:
+    every class laid on a colour of its own, as the colouring reads footprints);
+  - over-use is priced up by present and history costs, round by round, for up to 40 rounds.
+- **Idle PEs.** An idle PE a wire crosses becomes a relay (`relay.csl`, 4 route slots).
+- **Existing programs.** None of them states waypoints, so every one is unchanged (the pinned
+  identity tests still pass).
+- **The first user is the band.**
+  - It now takes its last unit above it, not only on it.
+  - The x's way down each MoE column, past the units in between, is routed.
+  - `Program::build_at(plan, origins)` lays the units at a placer's origins
+    (`Floorplan::of_at`).
+- **What it has carried.** The tiny gpt-oss, stacked in one column above its band, routes and
+  passes the check. gpt-oss's 0.3835 ms partition at 2, 4 and 6 units does too: 545 x 435 to
+  545 x 1,015, 0 errors and 0 warnings. That partition is past its PEs' memory (above), so it
+  is a test of the router, not a program.
