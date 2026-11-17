@@ -778,6 +778,29 @@ fn root_words(
     w
 }
 
+/// The code bytes a weight PE's matvecs take at the least (ops/smv.csl's: 3,981 B estimated for
+/// a head's weight PE), and its arrays beside its matvecs' (stamps, its chains' words: 516 B).
+pub const WEIGHT_CODE: i64 = 3_900;
+pub const WEIGHT_FIXED: i64 = 400;
+
+/// A weight PE's bytes as emitted, past a PE by more than the static check's miss
+/// ([`crate::check::PeBytes::overflows`]): each matvec's tile (16-bit, a word unused), its two
+/// 16-bit x buffers and two f32 partial buffers (ops/smv.csl), and [`WEIGHT_CODE`]. A tile of few
+/// rows and many outputs is its partial buffers' as much as its weights' (a head's 4 x 3,039).
+fn weight_over(u: &Unit, l: &Layout, col: u32) -> bool {
+    let data: u32 = u
+        .steps
+        .iter()
+        .filter_map(|s| tile_dims(s, l, col))
+        .map(|(a, b)| 2 * (a * b + 1) + 4 * a + 8 * b)
+        .sum();
+    crate::check::PeBytes {
+        data: i64::from(data) + WEIGHT_FIXED,
+        code: WEIGHT_CODE,
+    }
+    .overflows()
+}
+
 /// [`root_words`] and the code room the search holds back ([`crate::check::CODE_RESERVE`]) past a
 /// PE's bytes by more than the static check's miss ([`crate::check::PeBytes::overflows`]).
 fn root_over(
@@ -884,7 +907,7 @@ fn layout_fewest(r: &Reader, u: &Unit, py: u32, tile: u32, spill: bool, from: u3
         if l.px() == 0 {
             continue;
         }
-        if !(0..l.px()).all(|c| tile_words(u, &l, c) < tile) {
+        if !(0..l.px()).all(|c| tile_words(u, &l, c) < tile && !weight_over(u, &l, c)) {
             let worst = (0..l.px())
                 .max_by_key(|&c| tile_words(u, &l, c))
                 .unwrap_or(0);
