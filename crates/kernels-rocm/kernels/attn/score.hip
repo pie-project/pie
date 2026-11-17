@@ -1,6 +1,7 @@
 #pragma once
 
-// The attention mass a capturing lane's last `observe` rows put on each key
+// The attention mass a capturing lane's last observed rows (`observe_at`, as
+// its program states them) put on each key
 // of the load's context (eviction scores), averaged over the rows and the
 // model's query heads and added into the lane's key row: (1 / (rows * heads))
 // Σ_h Σ_w softmax_j(q_hw·k_j·scale), causal. A block a lane walks its heads
@@ -17,8 +18,9 @@ __global__ __launch_bounds__(WAVES * 64) void score_capture(
     const bf16* __restrict__ q, const i32* __restrict__ qo_indptr, const bf16* __restrict__ k_pages,
     const i32* __restrict__ page_indices, const i32* __restrict__ page_indptr,
     const i32* __restrict__ last_page_lens, const unsigned long long* __restrict__ keys_at,
-    int page_size, int num_q_heads, int num_kv_heads, int head_dim, float sm_scale, int observe,
-    int lane_offset, int context, int model_heads, int zero, long long stride) {
+    const unsigned* __restrict__ observe_at, int page_size, int num_q_heads, int num_kv_heads,
+    int head_dim, float sm_scale, int lane_offset, int context, int model_heads, int zero,
+    long long stride) {
     static_assert(HEAD_DIM_MAX % kWave == 0, "a lane takes whole elements of the head");
     constexpr int VPT = HEAD_DIM_MAX / kWave;
     extern __shared__ float smem[];
@@ -43,6 +45,7 @@ __global__ __launch_bounds__(WAVES * 64) void score_capture(
     const int pages = page_indptr[request + 1] - page_first;
     const int kv_len = pages > 0 ? (pages - 1) * page_size + last_page_lens[request] : 0;
     const int qo_hi = qo_indptr[request + 1];
+    const int observe = static_cast<int>(observe_at[lane_offset + request]);
     const int rows = min(observe, qo_hi - qo_indptr[request]);
     if (pages <= 0 || kv_len <= 0 || rows <= 0) return;
 

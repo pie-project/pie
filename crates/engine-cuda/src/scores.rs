@@ -7,8 +7,9 @@
 //! nothing is backed for them at load or at bind. Each fire stages two
 //! tables of one address a fire lane, in the fire's order, the key row's and
 //! the page row's (0 for a lane that captures nothing, which no kernel
-//! touches), and the score kernels write through them; the reader reads its
-//! own rows.
+//! touches), and a third of the query rows each lane's program observes;
+//! the score kernels write through them, and the reader reads its own
+//! rows.
 
 use kernels_cuda::attn::score::CaptureRows;
 use poem_ir::ClassSet;
@@ -29,14 +30,15 @@ pub fn captured(name: &str) -> bool {
 }
 
 /// The load's capture rows: their widths, the classes that compute them
-/// (a lane of one captures), and the fire's two row tables.
+/// (a lane of one captures), and the fire's tables.
 #[derive(Debug)]
 pub struct CaptureLayout {
     context: u32,
     page_size: u32,
     classes: ClassSet,
-    /// The key rows' table, then the page rows': a run of the activation's
-    /// span laid with the staged inputs (`Shell::staged_runs`).
+    /// The key rows' table, the page rows' (a u64 a lane each), then the
+    /// observed rows' (a u32 a lane): a run of the activation's span laid
+    /// with the staged inputs (`Shell::staged_runs`).
     tables: Buffer,
     lanes: u32,
     /// Whether the tables name a row: a fire with none stages them only to
@@ -67,7 +69,7 @@ impl CaptureLayout {
             context,
             page_size: page_size.max(1),
             classes,
-            tables: Buffer::lent(2 * lanes as usize * size_of::<u64>()),
+            tables: Buffer::lent(lanes as usize * (2 * size_of::<u64>() + size_of::<u32>())),
             lanes,
             named: false,
         })
@@ -115,6 +117,7 @@ impl CaptureLayout {
         CaptureRows {
             keys: self.tables.ptr(),
             pages: self.tables.ptr() + u64::from(self.lanes) * 8,
+            observe: self.tables.ptr() + u64::from(self.lanes) * 16,
             lanes: self.lanes,
             context: self.context,
             page_size: self.page_size,
@@ -123,8 +126,14 @@ impl CaptureLayout {
 
     /// Stages the fire's tables on `stream`: `keys_at[lane]`, the key row of
     /// the fire's lane `lane` (in the fire's order), 0 where it captures
-    /// nothing; its page row right after it.
-    pub fn stage(&mut self, stream: *mut core::ffi::c_void, keys_at: &[u64]) -> Result<()> {
+    /// nothing; its page row right after it; and `observe_at[lane]`, the
+    /// query rows its program observes.
+    pub fn stage(
+        &mut self,
+        stream: *mut core::ffi::c_void,
+        keys_at: &[u64],
+        observe_at: &[u32],
+    ) -> Result<()> {
         if keys_at.len() > self.lanes as usize {
             return Err(Fault::Ceiling {
                 what: "lanes of the score row tables",
@@ -140,10 +149,12 @@ impl CaptureLayout {
         let key_bytes = self.key_bytes();
         let mut bytes = vec![0u8; self.tables.bytes()];
         let pages = self.lanes as usize * 8;
-        for (at, &row) in keys_at.iter().enumerate() {
+        let observed = self.lanes as usize * 16;
+        for (at, (&row, &rows)) in keys_at.iter().zip(observe_at).enumerate() {
             let page = if row == 0 { 0 } else { row + key_bytes };
             bytes[at * 8..at * 8 + 8].copy_from_slice(&row.to_le_bytes());
             bytes[pages + at * 8..pages + at * 8 + 8].copy_from_slice(&page.to_le_bytes());
+            bytes[observed + at * 4..observed + at * 4 + 4].copy_from_slice(&rows.to_le_bytes());
         }
         self.tables.stage(stream, 0, &bytes)
     }

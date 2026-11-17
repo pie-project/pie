@@ -308,7 +308,10 @@ impl Shell {
 impl FireCtx<'_> {
     /// Stages the capture rows' tables (`crate::scores`): for each of the
     /// fire's lanes, in the fire's order, the key row of the reader attached
-    /// at it where its class captures, and 0 for any other. Staged each
+    /// at it where its class captures, and 0 for any other; and the query
+    /// rows its reader's program observes (`Rows(n)` at most the lane's
+    /// rows, `FireRows` all of them). A capturing lane whose program states
+    /// no observation is refused by name. Staged each
     /// fire, so a row is found wherever its reader's slots lie now. Every
     /// capturing lane a fire carries has its reader attached
     /// (`engine::fire::Step::validate_captures`); arming's fires bind no
@@ -319,6 +322,7 @@ impl FireCtx<'_> {
         };
         let lanes = p.composition.lanes();
         let mut keys_at = vec![0u64; lanes.len()];
+        let mut observe_at = vec![0u32; lanes.len()];
         for (at, row) in lanes.iter().enumerate() {
             if self.arming || !layout.captures(row.class as usize) {
                 continue;
@@ -361,8 +365,22 @@ impl FireCtx<'_> {
                     ),
                 )
             })?;
+            observe_at[at] = match self.programs.observe(attached.instance) {
+                Some(eta_ir::container::Observe::Rows(rows)) => rows.min(row.rows),
+                Some(eta_ir::container::Observe::FireRows) => row.rows,
+                None => {
+                    return Err(Fault::program(
+                        "serve::lay_capture",
+                        format!(
+                            "lane {source} captures attention scores and instance {}'s program \
+                             states no observation (`eta_ir::container::Observe`)",
+                            attached.instance
+                        ),
+                    ));
+                }
+            };
         }
-        layout.stage(self.device.stream(), &keys_at)
+        layout.stage(self.device.stream(), &keys_at, &observe_at)
     }
 
     fn gate(&mut self, p: &Prepared<'_>) -> Result<()> {

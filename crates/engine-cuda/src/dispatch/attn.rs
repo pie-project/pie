@@ -51,7 +51,6 @@ impl Run<'_> {
                 kv_heads,
                 q_heads,
                 sm_scale,
-                observe,
                 into,
                 ..
             } => {
@@ -66,7 +65,6 @@ impl Run<'_> {
                     *kv_heads,
                     *q_heads,
                     *sm_scale,
-                    *observe,
                     self.window().span().lane_offset,
                     self.capture_rows("attn.score_capture")?,
                     into.is_none(),

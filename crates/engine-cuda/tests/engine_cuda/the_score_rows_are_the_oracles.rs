@@ -6,8 +6,9 @@
 //! rows a capturing lane and none for a lane that captures nothing: a fire
 //! of 256 lanes, one capturing, answers its plain lanes as a fire of none
 //! does. The rows are the CPU oracle's (`engine_cpu::Forward`): the
-//! attention mass a key of the load's context, summed over the layers and
-//! averaged over the query heads, and that summed a kv page.
+//! attention mass a key of the load's context, over the query rows the
+//! reader's program observes (`Rows(32)`, `Rows(2)`, `FireRows`), summed over
+//! the layers and averaged over the query heads, and that summed a kv page.
 
 use std::path::Path;
 
@@ -18,7 +19,7 @@ use engine_cuda::{Boot, Graphs, Lane, Seated, Shell};
 use eta_compiler::codegen::program::{Backend, emit_program};
 use eta_compiler::plan::compile_bound;
 use eta_exec::Extents;
-use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
+use eta_ir::container::{ChanDType, ChannelDecl, HostRole, Observe, StageProgram, TraceContainer};
 use eta_ir::op::Op;
 use eta_ir::registry::{Axis, GeometryClass, OutputDecl, PortMask, Stage};
 use eta_ir::types::{Dtype as EtaDtype, Shape};
@@ -140,8 +141,9 @@ fn open_all(shell: &mut Shell) {
     }
 }
 
-/// An epilogue reading its lane's key row and summing it into a channel.
-fn reader() -> TraceContainer {
+/// An epilogue reading its lane's key row and summing it into a channel,
+/// observing as `observe` states.
+fn reader(observe: Observe) -> TraceContainer {
     TraceContainer {
         names: vec!["attn.scores".to_string()],
         channels: vec![ChannelDecl {
@@ -167,10 +169,11 @@ fn reader() -> TraceContainer {
         }],
         externs: Vec::new(),
         inputs: Vec::new(),
+        observe: Some(observe),
     }
 }
 
-fn bind(shell: &mut Shell, rows: u32) -> engine::InstanceId {
+fn bind(shell: &mut Shell, rows: u32, observe: Observe, hash: u64) -> engine::InstanceId {
     let decl = OutputDecl {
         name: "attn.scores".into(),
         axis: Axis::Lane,
@@ -179,14 +182,14 @@ fn bind(shell: &mut Shell, rows: u32) -> engine::InstanceId {
         layers: 0,
         readout: false,
     };
-    let bound = eta_ir::validate::bind(reader(), vec![vec![decl]], crate::bound::caps())
+    let bound = eta_ir::validate::bind(reader(observe), vec![vec![decl]], crate::bound::caps())
         .expect("the reader binds");
     let stages = compile_bound(&bound);
     let launch = eta_compiler::codegen::launch::build(&bound, &stages);
     let backend = Backend::parse(engine_cuda::api::CODEGEN).expect("the engine's codegen backend");
     let program = shell
         .register_program(&ProgramRegistration {
-            program_hash: 0x5c07e,
+            program_hash: hash,
             emitted_kernels: emit_program(backend, &stages, &bound),
             emitter_version: backend.emitter_version(),
             region_analysis: eta_compiler::codegen::cuda::region_analysis::analyze_program(&stages),
@@ -303,80 +306,89 @@ fn the_score_rows_are_the_oracles() {
         .fire_media(&seated, &[], &[])
         .expect("the plain fire lands");
 
-    // One capturing lane among 256, its reader attached.
-    open_all(&mut shell);
-    let instance = bind(&mut shell, prompt.len() as u32);
-    let seated: Vec<Seated<'_>> = (0..LANES)
-        .map(|slot| {
-            Seated::of(Lane {
-                slot,
-                word: word(tokens(slot), slot == CAPTURING),
-                tokens: tokens(slot),
+    // One capturing lane among 256, its reader attached, observing its
+    // last 32 rows (all of the prompt's 6), its last 2, and every row.
+    for (observe, hash) in [
+        (Observe::Rows(32), 0x5c07e_u64),
+        (Observe::Rows(2), 0x5c07f),
+        (Observe::FireRows, 0x5c080),
+    ] {
+        // One capturing lane among 256, its reader attached.
+        open_all(&mut shell);
+        let instance = bind(&mut shell, prompt.len() as u32, observe, hash);
+        let seated: Vec<Seated<'_>> = (0..LANES)
+            .map(|slot| {
+                Seated::of(Lane {
+                    slot,
+                    word: word(tokens(slot), slot == CAPTURING),
+                    tokens: tokens(slot),
+                })
             })
+            .collect();
+        let attached = [Attached {
+            lane: CAPTURING,
+            lanes: 1,
+            instance,
+            adapter_only: false,
+        }];
+        let mixed = shell
+            .fire_media(&seated, &attached, &[])
+            .expect("the mixed fire lands");
+        for slot in (0..LANES).filter(|&slot| slot != CAPTURING) {
+            let off = apart(&mixed[slot as usize], &alone[slot as usize]);
+            assert!(
+                off <= 1e-2,
+                "plain lane {slot} beside a capturing one answers {off} away from it in a fire of \
+                 none"
+            );
+        }
+
+        let at = shell
+            .score_rows(instance)
+            .expect("the reader keeps a lane's rows");
+        let pages = CONTEXT.div_ceil(PAGE);
+        let keys = floats(at, CONTEXT);
+        let page_rows = floats(at + u64::from(CONTEXT) * 4, pages);
+
+        // The oracle: the same trace and planes on the host, one lane.
+        let mut oracle = engine_cpu::Forward::new(scored.clone(), None, &|name, count| {
+            let plane = weights.get(name);
+            assert_eq!(plane.len(), count, "plane {name}'s elements");
+            plane.to_vec()
         })
-        .collect();
-    let attached = [Attached {
-        lane: CAPTURING,
-        lanes: 1,
-        instance,
-        adapter_only: false,
-    }];
-    let mixed = shell
-        .fire_media(&seated, &attached, &[])
-        .expect("the mixed fire lands");
-    for slot in (0..LANES).filter(|&slot| slot != CAPTURING) {
-        let off = apart(&mixed[slot as usize], &alone[slot as usize]);
+        .expect("the oracle loads")
+        .at_context(CONTEXT, PAGE)
+        .observing(observe);
+        let outs = oracle
+            .step(&prompt, 0, word(&prompt, true))
+            .expect("the oracle steps");
+        let oracle_row = |name: &str| -> Vec<f32> {
+            match outs.iter().find(|out| out.name == name) {
+                Some(engine_cpu::forward::Output {
+                    values: engine_cpu::forward::Values::F32(v),
+                    ..
+                }) => v.clone(),
+                _ => panic!("the oracle reads out no `{name}`"),
+            }
+        };
+        let (want_keys, want_pages) = (oracle_row("attn.scores"), oracle_row("attn.scores.pages"));
+        let mass: f32 = keys.iter().sum();
+        let (keys_apart, pages_apart) = (apart(&keys, &want_keys), apart(&page_rows, &want_pages));
+        eprintln!(
+            "{observe:?}: the row against the oracle: keys {keys_apart:e}, pages {pages_apart:e} \
+             apart at most, a row of mass {mass} (the layers' count, {LAYERS})"
+        );
         assert!(
-            off <= 1e-2,
-            "plain lane {slot} beside a capturing one answers {off} away from it in a fire of \
-             none"
+            (mass - LAYERS as f32).abs() < 1e-2,
+            "{observe:?}: the key row's mass is {mass}, not the layers' count"
+        );
+        assert!(
+            keys_apart < 2e-2,
+            "{observe:?}: the key row is not the oracle's: {keys_apart} apart"
+        );
+        assert!(
+            pages_apart < 4e-2,
+            "{observe:?}: the page row is not the oracle's: {pages_apart} apart"
         );
     }
-
-    let at = shell
-        .score_rows(instance)
-        .expect("the reader keeps a lane's rows");
-    let pages = CONTEXT.div_ceil(PAGE);
-    let keys = floats(at, CONTEXT);
-    let page_rows = floats(at + u64::from(CONTEXT) * 4, pages);
-
-    // The oracle: the same trace and planes on the host, one lane.
-    let mut oracle = engine_cpu::Forward::new(scored.clone(), None, &|name, count| {
-        let plane = weights.get(name);
-        assert_eq!(plane.len(), count, "plane {name}'s elements");
-        plane.to_vec()
-    })
-    .expect("the oracle loads")
-    .at_context(CONTEXT, PAGE);
-    let outs = oracle
-        .step(&prompt, 0, word(&prompt, true))
-        .expect("the oracle steps");
-    let oracle_row = |name: &str| -> Vec<f32> {
-        match outs.iter().find(|out| out.name == name) {
-            Some(engine_cpu::forward::Output {
-                values: engine_cpu::forward::Values::F32(v),
-                ..
-            }) => v.clone(),
-            _ => panic!("the oracle reads out no `{name}`"),
-        }
-    };
-    let (want_keys, want_pages) = (oracle_row("attn.scores"), oracle_row("attn.scores.pages"));
-    let mass: f32 = keys.iter().sum();
-    let (keys_apart, pages_apart) = (apart(&keys, &want_keys), apart(&page_rows, &want_pages));
-    eprintln!(
-        "the row against the oracle: keys {keys_apart:e}, pages {pages_apart:e} apart at most, a \
-         row of mass {mass} (the layers' count, {LAYERS})"
-    );
-    assert!(
-        (mass - LAYERS as f32).abs() < 1e-2,
-        "the key row's mass is {mass}, not the layers' count"
-    );
-    assert!(
-        keys_apart < 2e-2,
-        "the key row is not the oracle's: {keys_apart} apart"
-    );
-    assert!(
-        pages_apart < 4e-2,
-        "the page row is not the oracle's: {pages_apart} apart"
-    );
 }

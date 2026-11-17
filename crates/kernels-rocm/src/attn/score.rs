@@ -30,11 +30,14 @@ fn stamp_for(head_dim: u32) -> Option<u32> {
 /// Where a fire's capturing lanes keep their rows: two tables of one
 /// address a fire lane (`lanes` of them), its key row's (`context` f32s)
 /// and its page row's (a page of `page_size` keys an f32), 0 for a lane
-/// that captures nothing, which no kernel touches.
+/// that captures nothing, which no kernel touches; and `observe`, a table
+/// of the query rows each fire lane's program observes (a u32, its last
+/// ones).
 #[derive(Debug, Clone, Copy)]
 pub struct CaptureRows {
     pub keys: u64,
     pub pages: u64,
+    pub observe: u64,
     pub lanes: u32,
     pub context: u32,
     pub page_size: u32,
@@ -57,8 +60,8 @@ impl CaptureRows {
 }
 
 /// Each capturing lane's mass a key of the load's context, averaged over
-/// its last `observe` query rows and over the model's `q_heads` (every
-/// rank's), added into its key row: zeroed first where `zero` (the first
+/// the last query rows its program observes ([`CaptureRows::observe`]) and
+/// over the model's `q_heads` (every rank's), added into its key row: zeroed first where `zero` (the first
 /// layer's capture), else the layers before's.
 
 #[allow(clippy::too_many_arguments)]
@@ -71,7 +74,6 @@ pub fn capture(
     kv_heads: u32,
     q_heads: u32,
     sm_scale: f32,
-    observe: u32,
     lane_offset: u32,
     rows: CaptureRows,
     zero: bool,
@@ -108,13 +110,6 @@ pub fn capture(
         return Err(refuse(
             OP,
             format!("{num_q_heads} query heads do not group over {num_kv_heads} kv heads"),
-        ));
-    }
-    if observe == 0 {
-        return Err(refuse(
-            OP,
-            "the observation window is zero rows wide, which is a capture that observes \
-             nothing; the caller states the width it wants, and zero is not one",
         ));
     }
     let context = count(OP, "the load's context", rows.context)?;
@@ -161,12 +156,12 @@ pub fn capture(
             pool.page_indptr.arg(),
             pool.last_page_lens.arg(),
             ArgValue::Ptr(rows.keys),
+            ArgValue::Ptr(rows.observe),
             page_size.arg(),
             stated(OP, num_q_heads)?.arg(),
             stated(OP, num_kv_heads)?.arg(),
             head_dim.arg(),
             sm_scale.arg(),
-            stated(OP, observe)?.arg(),
             stated(OP, lane_offset)?.arg(),
             context.arg(),
             model_heads.arg(),

@@ -3,8 +3,9 @@
 
 namespace pie::attn {
 
-// A capturing lane's mass a key of the load's context, averaged over its
-// last `observe` query rows and over the model's `q_heads`, added into the
+// A capturing lane's mass a key of the load's context, averaged over the
+// last query rows its program observes (`observe_at`, one a fire lane) and
+// over the model's `q_heads`, added into the
 // lane's key row (zeroed first where `zero`, the first layer's capture). A
 // block a lane walks its heads in order, so each key's sum is the heads' in
 // order and no two blocks touch a row. A lane's row is found through
@@ -18,13 +19,13 @@ __global__ void score_capture(
     const i32* __restrict__ kv_page_indptr,
     const i32* __restrict__ kv_last_page_lens,
     const unsigned long long* __restrict__ keys_at,
+    const unsigned* __restrict__ observe_at,
     int page_size,
     long long stride_page,
     int num_q_heads,
     int num_kv_heads,
     int head_dim,
     float sm_scale,
-    int observe,
     int lane_offset,
     int context,
     int model_heads,
@@ -63,6 +64,7 @@ __global__ void score_capture(
     const int qo_lo = static_cast<int>(qo_indptr[request]);
     const int qo_hi = static_cast<int>(qo_indptr[request + 1]);
     const int qo_len = qo_hi - qo_lo;
+    const int observe = static_cast<int>(observe_at[lane_offset + request]);
     const int rows = observe < qo_len ? observe : qo_len;
 
     if (pages <= 0 || kv_len <= 0 || rows <= 0) {

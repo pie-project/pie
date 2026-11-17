@@ -686,7 +686,9 @@ fn score_capture_averages_the_observed_rows_mass() {
     )
     .unwrap();
     // The context past a lane's keys and short of another's.
-    let (observe, lane_offset, context) = (3u32, 1u32, 40u32);
+    let (lane_offset, context) = (1u32, 40u32);
+    // Each lane's observed rows: fewer than its own, past them, and one.
+    let observe = [3u32, 7, 1];
     let rows = lane_offset + n;
     let page_rows = context.div_ceil(ps);
     let scores = gpu.tensor(
@@ -719,6 +721,15 @@ fn score_capture_averages_the_observed_rows_mass() {
     let table = kernels_rocm::attn::score::CaptureRows {
         keys: table(scores.ptr, context),
         pages: table(paged.ptr, page_rows),
+        observe: {
+            let observed: Vec<i32> = (0..rows)
+                .map(|lane| {
+                    lane.checked_sub(lane_offset)
+                        .map_or(0, |r| observe[r as usize] as i32)
+                })
+                .collect();
+            gpu.ints_shaped(&observed, rows, 1).ptr
+        },
         lanes: rows,
         context,
         page_size: ps,
@@ -733,7 +744,6 @@ fn score_capture_averages_the_observed_rows_mass() {
         hk,
         hq,
         scale,
-        observe,
         lane_offset,
         table,
         true,
@@ -756,7 +766,6 @@ fn score_capture_averages_the_observed_rows_mass() {
                 hk,
                 hq,
                 scale,
-                observe,
                 lane_offset,
                 table,
                 true,
@@ -767,7 +776,7 @@ fn score_capture_averages_the_observed_rows_mass() {
     let (d_, g) = (d as usize, (hq / hk) as usize);
     for r in 0..n as usize {
         let kv = kv_lens[r] as usize;
-        let rows = (observe as usize).min(fresh[r] as usize);
+        let rows = (observe[r] as usize).min(fresh[r] as usize);
         let mut want = vec![0f64; context as usize];
         for h in 0..hq as usize {
             for w in 0..rows {
@@ -819,7 +828,6 @@ fn score_capture_averages_the_observed_rows_mass() {
             hk,
             hq,
             scale,
-            observe,
             lane_offset,
             table,
             zero,

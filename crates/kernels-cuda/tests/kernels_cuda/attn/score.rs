@@ -1,7 +1,9 @@
 #![cfg(feature = "cuda")]
 
 //! `attn.score_capture` against the host softmax: each capturing lane's
-//! mass a key of the context, averaged over its last `observe` query rows
+//! mass a key of the context, averaged over the last query rows its
+//! program observes (a table of one a lane: lanes observing differently
+//! share the launch)
 //! and its query heads, added into the key row its table names (none for a
 //! lane the table names 0), zeroed first for the first layer's; and
 //! `attn.score_pages`, that row summed a page.
@@ -21,7 +23,9 @@ fn a_score_capture_lands_each_lanes_mass_at_its_row() {
     // (new rows, cached rows) a lane: a prefill, a decode, a fresh prompt.
     let reqs = [(5usize, 20usize), (1, 33), (2, 0)];
     // The context past a lane's keys and short of another's.
-    let (observe, lane_offset, context) = (3usize, 1usize, 40usize);
+    let (lane_offset, context) = (1usize, 40usize);
+    // Each lane's observed rows: fewer than its own, past them, and one.
+    let observe = [3usize, 7, 1];
     let (width, qw, scale) = (kvh * d, qh * d, (d as f32).sqrt().recip());
     let n = reqs.len();
     let (mut qo, mut kv_indptr, mut kv_len, mut last, mut pages) =
@@ -46,7 +50,7 @@ fn a_score_capture_lands_each_lanes_mass_at_its_row() {
     let mut want = vec![9.0f32; (lane_offset + n) * context];
     for (r, &(new, prefix)) in reqs.iter().enumerate() {
         let len = new + prefix;
-        let seen = observe.min(new);
+        let seen = observe[r].min(new);
         let cell = |t: usize| pages[r][t / PAGE] * PAGE + t % PAGE;
         let at = (lane_offset + r) * context;
         want[at..at + context].fill(0.0);
@@ -145,6 +149,12 @@ fn a_score_capture_lands_each_lanes_mass_at_its_row() {
     let scores = kernels_cuda::attn::score::CaptureRows {
         keys: gpu.up(&table(at, context)),
         pages: gpu.up(&table(page_at, page_rows)),
+        observe: gpu.up(&(0..lane_offset + n)
+            .map(|lane| {
+                lane.checked_sub(lane_offset)
+                    .map_or(0, |r| observe[r] as u32)
+            })
+            .collect::<Vec<u32>>()),
         lanes: (lane_offset + n) as u32,
         context: context as u32,
         page_size: PAGE as u32,
@@ -158,7 +168,6 @@ fn a_score_capture_lands_each_lanes_mass_at_its_row() {
         kvh as u32,
         qh as u32,
         scale,
-        observe as u32,
         lane_offset as u32,
         scores,
         true,
@@ -187,7 +196,6 @@ fn a_score_capture_lands_each_lanes_mass_at_its_row() {
                 kvh as u32,
                 qh as u32,
                 scale,
-                observe as u32,
                 lane_offset as u32,
                 scores,
                 true,
@@ -208,7 +216,6 @@ fn a_score_capture_lands_each_lanes_mass_at_its_row() {
             kvh as u32,
             qh as u32,
             scale,
-            observe as u32,
             lane_offset as u32,
             scores,
             zero,

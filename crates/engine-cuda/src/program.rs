@@ -312,6 +312,14 @@ impl Plane {
         self.score_bytes = bytes;
     }
 
+    /// What instance `id`'s program observes where it reads attention
+    /// scores, as its container states it.
+    #[must_use]
+    pub fn observe(&self, id: InstanceId) -> Option<eta_ir::container::Observe> {
+        let bound = self.instances.get(&id)?;
+        self.programs.get(&bound.program_id)?.plan.package.observe
+    }
+
     /// Where instance `id`'s capturing lane's rows lie now, its key row
     /// first; `None` for an instance whose program reads none.
     #[must_use]
