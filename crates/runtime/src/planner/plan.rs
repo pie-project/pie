@@ -105,6 +105,9 @@ thread_local! {
 
 impl ResidencyPlanner {
     pub fn plan(self: &Arc<Self>) {
+        if crate::policy::retention::take_idle_cache_new() {
+            self.sweep_tiers();
+        }
         // A grant dropped unspent during the pass gave back room the pass
         // may have read before it came: the pass runs again on the pool as
         // it stands ([`super::grant::RoomReturns`]), so the drop, which
@@ -1273,6 +1276,9 @@ impl ResidencyPlanner {
                     if self.reclaim_idle_once() {
                         continue;
                     }
+                    if self.demote_idle(count) {
+                        return false;
+                    }
                     if self.sweep_stranded(count, false) {
                         self.plan_stopped("short of kv: stranded tails swept");
                         return false;
@@ -1324,6 +1330,9 @@ impl ResidencyPlanner {
                     }
                     if self.reclaim_idle_once() || self.reclaim_head_sharing() {
                         continue;
+                    }
+                    if as_pages > 0 && self.demote_idle(as_pages) {
+                        return false;
                     }
                     // And the tails of sets at rest past what their keys
                     // keep, lowest key first, before any set moves whole

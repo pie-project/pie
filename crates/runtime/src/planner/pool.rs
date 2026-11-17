@@ -994,13 +994,9 @@ pub trait PoolPort: Send + Sync + 'static {
     fn prepare_demote(&self, room: usize) -> Option<crate::store::kv::KvResidencyTxn>;
     /// Idle cache a `retention/tiers` row keeps off the device, to move
     /// down now.
-    fn prepare_demote_now(&self) -> Option<crate::store::kv::KvResidencyTxn> {
-        None
-    }
+    fn prepare_demote_now(&self) -> Option<crate::store::kv::KvResidencyTxn>;
     /// Idle cache a `retention/tiers` row allows nowhere it is, dropped now.
-    fn drop_disallowed(&self) -> usize {
-        0
-    }
+    fn drop_disallowed(&self) -> usize;
     /// [`Self::prepare_sweep`] of the tails past the heads `order` names
     /// alone: those heads stay however few pages move.
     fn prepare_tail_sweep(
