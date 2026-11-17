@@ -267,6 +267,10 @@ impl GatewayInbound for InboundServer {
         self.sessions.redirect(req_id);
     }
 
+    async fn started(self, _: tarpc::context::Context, req_id: ReqId) {
+        self.sessions.started(req_id);
+    }
+
     async fn state(
         self,
         _: tarpc::context::Context,

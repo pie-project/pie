@@ -421,7 +421,7 @@ impl Cluster {
         self.send(ProcessEvent::SessionClosed { id });
     }
 
-    /// Its first output arrived.
+    /// Its process started on its worker.
     pub fn started(&self, req: &Request) {
         self.send(ProcessEvent::Started { req: req.req_id.0 });
     }

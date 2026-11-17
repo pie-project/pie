@@ -647,6 +647,7 @@ impl Port {
             tables.workers_default = default.map(parse);
         }
         for (writer, subject, name, value) in delta.notes {
+            tracing::debug!(%writer, subject = %format!("{}/{}", subject.kind(), subject.id()), %name, ?value, "cluster policy note");
             let Subject::Process(id) = subject else {
                 continue;
             };

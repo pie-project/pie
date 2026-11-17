@@ -22,6 +22,10 @@ pub trait GatewayInbound {
 
     async fn redirect(req_id: ReqId);
 
+    /// The process the request launched started on this worker: its
+    /// execution was admitted.
+    async fn started(req_id: ReqId);
+
     /// What a worker that links to no controller (a pool) holds, since its
     /// last report: passed on to the controller's directory. A worker with
     /// a controller reports there itself.

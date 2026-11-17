@@ -232,8 +232,7 @@ pub enum ProcessEvent {
         req: u64,
         worker: WorkerId,
     },
-    /// Its first output reached the gateway: the nearest a gateway sees to
-    /// its start on the worker.
+    /// Its process started on its worker (the worker says so).
     Started {
         req: u64,
     },

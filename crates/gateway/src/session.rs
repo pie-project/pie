@@ -125,7 +125,7 @@ pub trait TurnRouter: Send + Sync + 'static {
     /// A running turn moved to `worker`, or (`None`) could not.
     fn moved(&self, _req: &Request, _worker: Option<WorkerId>, _why: &str) {}
 
-    /// The turn's first output arrived.
+    /// The worker started the turn's process.
     fn started(&self, _req: &Request) {}
 }
 
@@ -445,9 +445,6 @@ impl Sessions {
                 if let ServerMessage::ProcessEvent { process_id, .. }
                 | ServerMessage::File { process_id, .. } = message
                 {
-                    if !turn.emitted {
-                        self.inner.router.started(&turn.request);
-                    }
                     turn.emitted = true;
                     // What the client calls it, if it never had the answer.
                     if turn.process.is_none() {
@@ -562,6 +559,20 @@ impl Sessions {
     pub async fn terminate(&self, req_id: ReqId) {
         if let Some(worker) = self.inner.end(req_id, Outcome::Cancelled, By::Policy) {
             self.inner.router.cancel(worker, req_id).await;
+        }
+    }
+
+    /// The worker says the turn's process started.
+    pub fn started(&self, req_id: ReqId) {
+        let request = self
+            .inner
+            .turns
+            .lock()
+            .unwrap()
+            .get(&req_id)
+            .map(|turn| turn.request.clone());
+        if let Some(request) = request {
+            self.inner.router.started(&request);
         }
     }
 
