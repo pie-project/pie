@@ -784,6 +784,7 @@ dependencies = [
  "futures",
  "ids",
  "pie-client-api",
+ "plex-host",
  "rustix",
  "serde",
  "serde_json",
@@ -794,9 +795,6 @@ dependencies = [
  "toml",
  "tracing",
  "units",
- "wasmparser 0.263.0",
- "wasmtime",
- "wasmtime-wasi",
 ]
 
 [[package]]

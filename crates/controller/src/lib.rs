@@ -313,12 +313,8 @@ impl ControllerHandle {
                 .await
                 .context("reload the cluster policies"),
             None => {
-                let host = start_cluster(
-                    programs,
-                    self.gateway_rx.clone(),
-                    self.directory_rx.clone(),
-                    self.cmd.clone(),
-                )?;
+                let host =
+                    start_cluster(programs, self.gateway_rx.clone(), self.directory_rx.clone())?;
                 *self.cluster.lock().unwrap() = Some(host);
                 Ok(())
             }
@@ -431,12 +427,7 @@ pub fn embed(config: Config) -> ControllerHandle {
         None
     } else {
         match policy_components(&config.cluster_policies).and_then(|programs| {
-            start_cluster(
-                programs,
-                gateway_rx.clone(),
-                directory_rx.clone(),
-                cmd_tx.clone(),
-            )
+            start_cluster(programs, gateway_rx.clone(), directory_rx.clone())
         }) {
             Ok(host) => Some(host),
             Err(error) => {
@@ -467,28 +458,13 @@ fn policy_components(specs: &[String]) -> Result<Vec<(String, Vec<u8>)>> {
         .collect()
 }
 
-/// Starts the cluster policies `programs`, their scale table sent to the
-/// actuator as it changes.
+/// Starts the cluster policies `programs`.
 fn start_cluster(
     programs: Vec<(String, Vec<u8>)>,
     routing: watch::Receiver<RoutingTable>,
     directory: watch::Receiver<DirectoryView>,
-    cmd: mpsc::Sender<Command>,
 ) -> Result<Arc<cluster::Host>> {
-    let host =
-        cluster::Host::start(programs, routing, directory).context("load the cluster policies")?;
-    let mut scale = host.scale_watch();
-    tokio::spawn(async move {
-        while scale.changed().await.is_ok() {
-            let entries = scale.borrow_and_update().clone();
-            if let Some(entries) = entries
-                && cmd.send(Command::DesireScale { entries }).await.is_err()
-            {
-                return;
-            }
-        }
-    });
-    Ok(host)
+    cluster::Host::start(programs, routing, directory).context("load the cluster policies")
 }
 
 /// Publishes the directory whenever a report changed it, at most every

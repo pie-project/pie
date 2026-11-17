@@ -294,10 +294,14 @@ pub enum ProcessEvent {
     Workers(Vec<WorkerId>),
 }
 
-/// Where the cluster policy puts a process.
+/// Where the cluster policy puts a process (`placement/workers`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PlacementView {
-    pub worker: Option<WorkerId>,
+    /// The workers it may run on, best first: the router sends a pending
+    /// process to the first that takes it. Empty holds it at the gateway;
+    /// `None` (no row) leaves the choice to the router. A running process
+    /// stays while the list names its worker, and moves when it does not.
+    pub workers: Option<Vec<WorkerId>>,
     /// Passed on with the process: the worker plane reads `cluster/<name>`.
     pub props: JsonProps,
     /// Workers its passes may run on, best first.
@@ -320,14 +324,6 @@ pub struct ReplicateOrder {
     pub table: String,
 }
 
-/// The order launches leave a gateway's gate in: each process's key (one
-/// not named is 0), and the key below which a process is held.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ScheduleView {
-    pub keys: Vec<(u64, i64)>,
-    pub floor: Option<i64>,
-}
-
 /// The cluster policy's decisions about one gateway's processes,
 /// level-triggered, as of `epoch`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -337,11 +333,9 @@ pub struct GatewayDecisions {
     pub active: bool,
     /// How long a launch waits for the programs to hear it, in ms.
     pub gate_ms: u64,
-    /// The highest arrival `seq` every program has heard, its decisions
-    /// drained; `u64::MAX` with no program to hear it.
+    /// The highest arrival `seq` every policy has heard, its rows
+    /// committed; `u64::MAX` with no policy to hear it.
     pub heard: u64,
-    /// The gate's order. None: arrival order.
-    pub schedule: Option<ScheduleView>,
     pub placements: Vec<(u64, PlacementView)>,
     /// Processes to end, with the reason: refused at the gate, cancelled
     /// once admitted.

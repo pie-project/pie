@@ -27,7 +27,9 @@ pub enum Command {
         id: WorkerId,
         status: WorkerStatus,
     },
-    /// The cluster policies' scale table, whole.
+    /// A scale table, whole. PLEX 1.1 has no scale column, so no cluster
+    /// policy sends one: the actuator keeps what it was given.
+    #[cfg_attr(not(test), allow(dead_code))]
     DesireScale {
         entries: Vec<ScaleEntry>,
     },

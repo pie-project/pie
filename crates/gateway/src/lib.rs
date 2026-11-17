@@ -131,26 +131,52 @@ impl TurnRouter for RouteBackend {
         let placed: Request;
         let (req, preferred) = match router {
             Some(router) => {
-                let (preferred, cluster_props, executors) = router.placement(req);
+                let (workers, cluster_props, executors) = router.placement(req);
                 placed = Request {
                     cluster_props,
                     executors,
                     ..req.clone()
                 };
-                (&placed, preferred)
+                (&placed, workers.map(Placed::List))
             }
             None => {
                 let located = &self.located.lock().unwrap().workers;
                 let preferred = addressed(req).and_then(|process| located.get(process).copied());
-                (req, preferred)
+                (req, preferred.map(Placed::Located))
             }
         };
-        let worker = self
-            .routing
-            .dispatch_with_retry(&self.workers, req, affinity, preferred, pinned)
-            .await
-            .map_err(|_| DispatchFail)?
-            .worker_id;
+        let worker = match preferred {
+            // A placement's list: the first of it that takes the process.
+            Some(Placed::List(list)) => {
+                let mut taken = None;
+                for worker in list {
+                    if pinned.is_some_and(|p| p != worker) {
+                        continue;
+                    }
+                    if let Ok(target) = self
+                        .routing
+                        .dispatch_with_retry(&self.workers, req, affinity, None, Some(worker))
+                        .await
+                    {
+                        taken = Some(target.worker_id);
+                        break;
+                    }
+                }
+                taken.ok_or(DispatchFail)?
+            }
+            Some(Placed::Located(at)) => self
+                .routing
+                .dispatch_with_retry(&self.workers, req, affinity, Some(at), pinned)
+                .await
+                .map_err(|_| DispatchFail)?
+                .worker_id,
+            None => self
+                .routing
+                .dispatch_with_retry(&self.workers, req, affinity, None, pinned)
+                .await
+                .map_err(|_| DispatchFail)?
+                .worker_id,
+        };
         if let Some(router) = router {
             router.dispatched(req, worker);
         }
@@ -372,4 +398,11 @@ pub async fn run(config: Config) -> Result<GatewayHandle> {
 
 pub async fn run_with<C: GatewayControl>(config: Config, control: C) -> Result<GatewayHandle> {
     Ok(bind(config, control).await?.into_handle())
+}
+
+/// Where a launch is to go: a placement's list, best first, or the worker
+/// that holds what it addresses.
+enum Placed {
+    List(Vec<WorkerId>),
+    Located(WorkerId),
 }
