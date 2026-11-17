@@ -23,8 +23,9 @@ pub(super) const HOST_RESERVE_DIVISOR: u32 = 8;
 
 /// The fixed state sets a working set holds, resting or running
 /// (`state-chunk` decision 4). The copy-on-write set a lane's write takes
-/// while a fork or snapshot still reads the first is held apart, once for
-/// the pool: one per lane a fire runs ([`ResidencyPlanner::cow_lanes`]).
+/// while a fork or snapshot still reads the first is no part of it: the
+/// fire that writes it asks for it with the rest of its demand, and once
+/// held it counts against the seats ([`ResidencyPlanner::state_seats`]).
 pub(super) const FIXED_SETS_PER_WORKING_SET: u32 = 1;
 
 /// It suspends no process of its own.
@@ -58,11 +59,9 @@ pub struct ResidencyPlanner {
     /// `PoolFacts::seat_to_end`: see [`super::to_end::ToEnd`].
     seat_to_end: bool,
     to_end_notify: Notify,
-    /// Told when a process charged against the state pool leaves.
-    uncharged: Notify,
-    /// The lanes one fire runs: the copy-on-write sets the state pool keeps
-    /// back from admission.
-    cow_lanes: u32,
+    /// Told when the state pool may seat more: a charged process left, a
+    /// set was let go, or the pool backed more slots.
+    seat_room: Notify,
     /// What its waiters lack that only the policy can free.
     pub(super) short: parking_lot::Mutex<Shortfall>,
     /// Where that is said (`pressure::raise`, for this planner's engine).
@@ -110,8 +109,7 @@ impl ResidencyPlanner {
             seating: parking_lot::Mutex::new(()),
             seat_to_end: false,
             to_end_notify: Notify::new(),
-            uncharged: Notify::new(),
-            cow_lanes: 1,
+            seat_room: Notify::new(),
             short: parking_lot::Mutex::new(Shortfall::default()),
             sink,
             weight_shed: None,
@@ -288,15 +286,6 @@ impl ResidencyPlanner {
     #[must_use]
     pub fn seat_spread(mut self, on: bool) -> Self {
         self.inner.get_mut().to_end.spread = on;
-        self
-    }
-
-    /// The lanes one fire runs (`max_forward_requests`): each may write a
-    /// copy of a fixed set a fork or snapshot still reads, so the state pool
-    /// keeps that many sets back from admission. At least one.
-    #[must_use]
-    pub fn cow_lanes(mut self, lanes: u32) -> Self {
-        self.cow_lanes = lanes.max(1);
         self
     }
 
@@ -733,39 +722,75 @@ impl ResidencyPlanner {
     }
 
     /// The processes the state pool runs at once: each holds
-    /// [`FIXED_SETS_PER_WORKING_SET`] fixed sets, beside the copy-on-write
-    /// sets kept once for a fire's lanes, and at least one runs. `None`
+    /// [`FIXED_SETS_PER_WORKING_SET`] fixed sets, and the sets an admitted
+    /// process holds past those (a fork's copy-on-write sets, a second
+    /// context's) seat no one else while held. At least one runs. `None`
     /// where the model keeps no fixed state.
     pub(super) fn state_seats(&self) -> Option<usize> {
         let (_, total) = self.port.rs_stats();
-        (total.slots > 0).then(|| {
-            (total.slots.saturating_sub(self.cow_lanes) / FIXED_SETS_PER_WORKING_SET).max(1)
-                as usize
-        })
+        if total.slots == 0 {
+            return None;
+        }
+        let (model, engine) = self.port.locus();
+        let charged: Vec<ProcessId> = self.with_inner(|inner| {
+            inner
+                .procs
+                .iter()
+                .filter(|(_, proc)| proc.charged)
+                .map(|(&pid, _)| pid)
+                .collect()
+        });
+        // Read off the planner's lock: the holdings take the store's.
+        let past: u32 = charged
+            .into_iter()
+            .map(|pid| {
+                held_rs_units(pid, model, engine)
+                    .slots
+                    .saturating_sub(FIXED_SETS_PER_WORKING_SET)
+            })
+            .sum();
+        Some((total.slots.saturating_sub(past) / FIXED_SETS_PER_WORKING_SET).max(1) as usize)
     }
 
     /// Holds `pid` back until the state pool has the fixed set it holds
-    /// free of those already charged and the lanes' copy-on-write reserve, so a pool of fixed state never runs
-    /// more working sets than it can write: the runtime frees no state on
-    /// its own to make room for one admitted past it.
+    /// free of those the admitted hold or are owed, so a pool of fixed state
+    /// never runs more working sets than it can write: the runtime frees no
+    /// state on its own to make room for one admitted past it. A fork's
+    /// copy-on-write set is no seat's: its fire asks for it as any demand
+    /// is asked, and waits or is refused by name there.
     async fn admit_state(&self, pid: ProcessId) {
-        let Some(seats) = self.state_seats() else {
-            return;
-        };
         loop {
-            let notified = self.uncharged.notified();
+            let notified = self.seat_room.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            let passed = self.with_inner(|inner| {
+            // Read again on each wake: the pool may have backed more, or a
+            // fork let its copies go.
+            let (_, total) = self.port.rs_stats();
+            if total.slots == 0 {
+                return;
+            }
+            // The holdings are read only where the whole pool would seat it.
+            let most = (total.slots / FIXED_SETS_PER_WORKING_SET).max(1) as usize;
+            let room = self.with_inner(|inner| {
                 let charged = inner.procs.values().filter(|proc| proc.charged).count();
-                let Some(proc) = inner.procs.get_mut(&pid) else {
-                    return true;
-                };
-                if proc.charged || charged < seats {
-                    proc.charged = true;
-                    return true;
-                }
-                false
+                inner
+                    .procs
+                    .get(&pid)
+                    .is_none_or(|proc| proc.charged || charged < most)
+            });
+            let seats = if room { self.state_seats() } else { None };
+            let passed = seats.is_some_and(|seats| {
+                self.with_inner(|inner| {
+                    let charged = inner.procs.values().filter(|proc| proc.charged).count();
+                    let Some(proc) = inner.procs.get_mut(&pid) else {
+                        return true;
+                    };
+                    if proc.charged || charged < seats {
+                        proc.charged = true;
+                        return true;
+                    }
+                    false
+                })
             });
             if passed {
                 return;
@@ -773,6 +798,7 @@ impl ResidencyPlanner {
             if !waits_said(notified).await {
                 let charged = self
                     .with_inner(|inner| inner.procs.values().filter(|proc| proc.charged).count());
+                let seats = seats.unwrap_or(most);
                 tracing::warn!(
                     %pid,
                     seats,
@@ -1167,7 +1193,7 @@ impl ResidencyPlanner {
             (signal, removed, charged)
         });
         if charged {
-            self.uncharged.notify_waiters();
+            self.seat_room.notify_waiters();
         }
         for waiter in &removed {
             if let WaitKind::Allocation { notify, .. } = &waiter.kind {
@@ -1187,6 +1213,8 @@ impl ResidencyPlanner {
 
     pub fn pages_freed(self: &Arc<Self>) {
         self.port.freed();
+        // A set let go or a segment backed: admission reads its seats again.
+        self.seat_room.notify_waiters();
         self.re_arm_idle_reclaim();
         if self.waiters.load(Ordering::Acquire) != 0 {
             self.poke();
