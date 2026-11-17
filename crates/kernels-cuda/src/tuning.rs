@@ -629,16 +629,6 @@ pub struct SdpaIndexSplitUntil(pub u32);
 #[decision(id = "kernel.gemm.narrow_n", constant(range(0..=8)), default = 0, tune = search)]
 pub struct GemmNarrowN(pub u32);
 
-/// Whether a small decode batch still splits its keys across blocks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.decode.split_small", flag, default = false, tune = search)]
-pub struct DecodeSplitSmall;
-
-/// Whether a sliding-window decode splits its keys across blocks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.decode.split_window", flag, default = false, tune = search)]
-pub struct DecodeSplitWindow;
-
 /// Whether a split decode chunk holds at least 128 keys, as the scheduler
 /// once floored it, rather than one page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -706,12 +696,6 @@ pub struct QmmSplitWideMax(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.sdpa.prefill.ctas_per_sm", constant(range(1..=8)), default = 2, tune = search)]
 pub struct PrefillCtasPerSm(pub u32);
-
-/// The most requests an eager decode serves with the static, unsplit
-/// schedule (which skips planning).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.decode.static_max_requests", constant(range(0..=65_536)), default = 512, tune = search)]
-pub struct DecodeStaticMaxRequests(pub u32);
 
 /// The cuBLASLt workspace, in MiB: more unlocks split-K and stream-K
 /// algorithms.
@@ -963,8 +947,6 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeGrouped>()
         .add::<MoeMxfp4Grouped>()
         .add::<MoeMxfp4Wmma>()
-        .add::<DecodeSplitSmall>()
-        .add::<DecodeSplitWindow>()
         .add::<DecodeChunkFloor128>()
         .add::<GemvBf16>()
         .add::<GemvSplitkMaxN>()
@@ -976,7 +958,6 @@ pub fn register(registry: &mut Registry) {
         .add::<QmmSplitThinMax>()
         .add::<QmmSplitWideMax>()
         .add::<PrefillCtasPerSm>()
-        .add::<DecodeStaticMaxRequests>()
         .add::<GemmWorkspaceMb>()
         .add::<GemmHeuristics>()
         .add::<GemmSkinnyRows>()
@@ -1125,8 +1106,6 @@ tuning! {
     moe_grouped: bool = true, on MoeGrouped;
     mxfp4_grouped: bool = true, on MoeMxfp4Grouped;
     mxfp4_wmma: bool = true, on MoeMxfp4Wmma;
-    decode_split_small: bool = false, on DecodeSplitSmall;
-    decode_split_window: bool = false, on DecodeSplitWindow;
     decode_chunk_floor_128: bool = false, on DecodeChunkFloor128;
     /// `kernel.gemv.bf16 = narrow`.
     gemv_narrow: bool = false, is GemvBf16::Narrow;
@@ -1140,7 +1119,6 @@ tuning! {
     qmm_split_thin_max: u32 = 32, get QmmSplitThinMax;
     qmm_split_wide_max: u32 = 16, get QmmSplitWideMax;
     prefill_ctas_per_sm: u32 = 2, get PrefillCtasPerSm;
-    decode_static_max_requests: u32 = 512, get DecodeStaticMaxRequests;
     gemm_workspace_mb: u32 = 8, get GemmWorkspaceMb;
     gemm_heuristics: u32 = 8, get GemmHeuristics;
     gemm_skinny_rows: u32 = 64, get GemmSkinnyRows;

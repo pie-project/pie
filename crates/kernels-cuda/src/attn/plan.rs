@@ -250,15 +250,9 @@ pub fn head_dim_instantiated(head_dim: u32) -> bool {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Toggles {
-    pub force_split_small: bool,
-
-    pub window_split: bool,
-
     pub chunk_floor_128: bool,
 
     pub prefill_ctas_per_sm: u32,
-
-    pub static_max_requests: u32,
 
     pub decode_gqa: crate::attn::decode_gqa::Gate,
 }
@@ -267,11 +261,8 @@ impl Toggles {
     #[must_use]
     pub const fn of(tuning: crate::tuning::Tuning) -> Self {
         Self {
-            force_split_small: tuning.decode_split_small,
-            window_split: tuning.decode_split_window,
             chunk_floor_128: tuning.decode_chunk_floor_128,
             prefill_ctas_per_sm: tuning.prefill_ctas_per_sm,
-            static_max_requests: tuning.decode_static_max_requests,
             decode_gqa: crate::attn::decode_gqa::Gate::of(tuning),
         }
     }
@@ -366,43 +357,33 @@ pub fn plan_decode(
         ),
         _ => 0,
     };
-    let windowed_split = toggles.window_split && window_left >= 0;
-    let built = if !windowed_split
-        && decode::can_use_static_nonsplit(shape.num_requests, enable_cuda_graph, toggles)
-    {
-        decode::static_nonsplit(
-            OP,
-            shape.num_requests,
-            live,
-            shape.page_size,
-            enable_cuda_graph,
-            workspace.int_bytes,
-        )?
-    } else {
-        let req = decode::Request {
-            kv_indptr,
-            batch_size: shape.num_requests,
-            live,
-            num_qo_heads: shape.num_q_heads,
-            gqa_group_size: shape.group_size(),
-            page_size: shape.page_size,
-            head_dim: shape.head_dim,
-            enable_cuda_graph,
-            chunk_floor_128: toggles.chunk_floor_128,
-            window_left: u32::try_from(window_left).ok(),
-            whole: ranks > 0
-                || toggles
-                    .decode_gqa
-                    .whole(shape.head_dim, shape.group_size(), window_left),
-        };
-        decode::plan(
-            OP,
-            &req,
-            max_grid_size,
-            workspace.int_bytes,
-            workspace.float_bytes,
-        )?
+    // An eager decode plans as a body does: its keys split across blocks
+    // only while its lanes' head groups leave the grid unfilled, each split
+    // chunk sized to fill it (`decode::estimate`); one that fills it runs
+    // unsplit.
+    let req = decode::Request {
+        kv_indptr,
+        batch_size: shape.num_requests,
+        live,
+        num_qo_heads: shape.num_q_heads,
+        gqa_group_size: shape.group_size(),
+        page_size: shape.page_size,
+        head_dim: shape.head_dim,
+        enable_cuda_graph,
+        chunk_floor_128: toggles.chunk_floor_128,
+        window_left: u32::try_from(window_left).ok(),
+        whole: ranks > 0
+            || toggles
+                .decode_gqa
+                .whole(shape.head_dim, shape.group_size(), window_left),
     };
+    let built = decode::plan(
+        OP,
+        &req,
+        max_grid_size,
+        workspace.int_bytes,
+        workspace.float_bytes,
+    )?;
 
     let mut info = built.info;
     if info.whole {
