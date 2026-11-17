@@ -167,7 +167,7 @@ template <typename T, int HEAD_DIM_MAX, int SIMDS>
       const device uint*, const device uint*, const device int*,              \
       device float*, const constant int&, const constant int&,                \
       const constant int&, const constant int&, const constant float&,        \
-      const constant int&, const constant int&, PIE_KV_LAYOUT_TYPES           \
+      const device uint*, const constant int&, PIE_KV_LAYOUT_TYPES            \
       const device ulong*, const constant uint&, const constant int&,         \
       const constant uint&, uint3, uint, uint);
 

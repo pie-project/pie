@@ -63,6 +63,7 @@ fn a_load_walks_its_score_capturing_forms() {
     shell.open(0).expect("a slot opens");
     shell
         .fire_seated(&[Seated {
+            observe: Some(eta_ir::container::Observe::Rows(32)),
             held: Some(0),
             ..Seated::of(Lane {
                 slot: 0,
@@ -73,6 +74,7 @@ fn a_load_walks_its_score_capturing_forms() {
         .expect("a prompt capturing its scores is served after the sealed walk");
     shell
         .fire_seated(&[Seated {
+            observe: Some(eta_ir::container::Observe::Rows(32)),
             held: Some(tokens.len() as u32),
             ..Seated::of(Lane {
                 slot: 0,
