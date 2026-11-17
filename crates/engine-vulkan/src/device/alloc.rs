@@ -8,7 +8,7 @@ use engine_gpu::pread::pread_jobs;
 use engine_gpu::Owner;
 use engine_gpu::error::{Fault, Result};
 
-use super::ctx::{Context, Core, STAGING_BYTES, note_reservation};
+use super::ctx::{Context, Core, note_reservation};
 
 pub use engine_gpu::Memory;
 
@@ -63,6 +63,14 @@ impl Raw {
     pub(crate) fn new(core: &Arc<Core>, bytes: u64, kind: Memory, owner: Owner) -> Result<Slab> {
         note_reservation();
         let size = bytes.max(4).next_multiple_of(4);
+        let (max, limit) = core.max_buffer();
+        if size > max {
+            return Err(Fault::Allocation {
+                bytes: size,
+                limit,
+                max,
+            });
+        }
         let d = &core.device;
         // The pool's segments hold guest configs a stage binds as a uniform,
         // and a guest stage's own buffers its steps' uniforms
@@ -205,9 +213,9 @@ impl Raw {
         let base = staging.mapped.expect("staging is mapped");
         let mut at = 0usize;
         while at < bytes.len() {
-            let len = (bytes.len() - at).min(STAGING_BYTES as usize);
+            let len = (bytes.len() - at).min(staging.size as usize);
             // SAFETY: `len` fits both the rest of `bytes` and the mapped
-            // staging slab of `STAGING_BYTES`; the held transfer lock keeps
+            // staging slab; the held transfer lock keeps
             // every other user off the staging slab, and the previous
             // `submit_once` waited for the copy that read it.
             unsafe {
@@ -251,7 +259,7 @@ impl Raw {
         let base = staging.mapped.expect("staging is mapped");
         let mut at = 0usize;
         while at < into.len() {
-            let len = (into.len() - at).min(STAGING_BYTES as usize);
+            let len = (into.len() - at).min(staging.size as usize);
             let region = vk::BufferCopy::default()
                 .src_offset(offset + at as u64)
                 .dst_offset(0)
@@ -516,7 +524,7 @@ impl FileWriter {
         for &(into, from, len) in jobs {
             let mut at = 0u64;
             while at < len {
-                let piece = (len - at).min(STAGING_BYTES);
+                let piece = (len - at).min(staging.size);
                 pieces.push((into + at, from + at, piece));
                 at += piece;
             }
@@ -529,7 +537,7 @@ impl FileWriter {
             while i < pieces.len() {
                 let (into, from, len) = pieces[i];
                 let slot = used.next_multiple_of(4);
-                if slot + len > STAGING_BYTES {
+                if slot + len > staging.size {
                     break;
                 }
                 window.push((base + slot as usize, from, len));

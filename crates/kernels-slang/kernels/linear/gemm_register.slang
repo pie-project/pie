@@ -24,10 +24,15 @@
 [[vk::binding(1)]] StructuredBuffer<uint> w;
 PIE_SLOTS_RW(2, out_);
 
+// `ldy` is the result's row pitch and `y0` the column it lands from: a
+// weight laid in pieces along its rows lands each piece's columns of the
+// whole result (`ldy` = `n`, `y0` = 0 where the weight is whole).
 struct Params {
     int m;
     int n;
     int k;
+    int ldy;
+    int y0;
 };
 PIE_PARAMS(3, Params, pc);
 
@@ -111,7 +116,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         [ForceUnroll] for (uint c = 0u; c < uint(PIE_CN); c++) {
             uint col = col0 + local.x * uint(PIE_CN) + c;
             if (col >= n) continue;
-            slot_put(out_, row * n + col, acc[r][c / 4u][c % 4u]);
+            slot_put(out_, row * uint(pc.ldy) + uint(pc.y0) + col, acc[r][c / 4u][c % 4u]);
         }
     }
 }

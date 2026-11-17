@@ -483,7 +483,10 @@ pub fn fault(fault: Fault) -> Error {
         Fault::Residency(_)
         | Fault::Workgroups { .. }
         | Fault::StorageBuffers { .. }
-        | Fault::StageBuffers { .. } => Error::Impossible(fault.to_string()),
+        | Fault::StageBuffers { .. }
+        | Fault::Allocation { .. }
+        | Fault::WorkgroupMemory { .. }
+        | Fault::Pieces { .. } => Error::Impossible(fault.to_string()),
     }
 }
 

@@ -89,6 +89,9 @@ pub struct Measured {
     pub points: Vec<Point>,
     /// Each candidate that answered wrongly: how many points, and the first.
     pub wrong: Vec<(String, usize, String)>,
+    /// Each point a candidate was not run at, its time extrapolated from a
+    /// smaller row count past the device's submission limit, and why.
+    pub refused: Vec<String>,
 }
 
 impl Measured {
@@ -267,6 +270,7 @@ mod device {
             }
         }
         let today = Tuning::new(base.clone(), limits);
+        let limit = limits.max_submit_ns;
         let mut out = Measured {
             candidates: candidates(),
             ..Measured::default()
@@ -313,6 +317,10 @@ mod device {
             let ho = handles
                 .bind(&out_b, 0, out_b.bytes())
                 .map_err(|e| e.to_string())?;
+            // Each candidate's seconds a launch at the widest row count it
+            // ran so far at this shape, or that it was refused.
+            let mut ran: Vec<Option<(u32, f64, f64)>> = vec![None; kept.len()];
+            let mut stopped = vec![false; kept.len()];
             for &m in &grid.rows {
                 let launch = |sink: &dyn kernels_slang::Encode, t: &Tuning, copy: usize| {
                     kernels_slang::linear::gemm::matmul(
@@ -325,6 +333,18 @@ mod device {
                 };
                 let mut live = Vec::new();
                 for (c, p) in kept.iter().enumerate() {
+                    if stopped[c] {
+                        continue;
+                    }
+                    if let Some(why) =
+                        crate::tune::qmm::refused_at(&format!("{p:?}").to_lowercase(), ran[c], m, limit)
+                    {
+                        let why = format!("{n} x {k}: {why}");
+                        say(&format!("  {why}"));
+                        out.refused.push(why);
+                        stopped[c] = true;
+                        continue;
+                    }
                     let frame = device.frame().map_err(|e| e.to_string())?;
                     let sink = crate::encode::Sink::new(device, &frame, &pipelines, &handles);
                     let launched = launch(&sink, &forced[c], 0).is_ok();
@@ -344,14 +364,15 @@ mod device {
                     }
                     live.push(c);
                 }
-                let times = time(device, &pipelines, &handles, &live, |sink, c, copy| {
+                let times = time(device, &pipelines, &handles, &live, limit, |sink, c, copy| {
                     launch(sink, &forced[c], copy)
                 })?;
                 let all = candidates();
                 let mut row = vec![None; all.len()];
-                for (c, t) in live.iter().zip(times) {
+                for (c, (t, spread)) in live.iter().zip(times) {
                     let i = all.iter().position(|p| *p == kept[*c]).expect("a path");
                     row[i] = Some(t);
+                    ran[*c] = Some((m, t, spread));
                 }
                 let picked = if today.gemm_coopmat(m) {
                     crate::tuning::GemmPath::Coopmat

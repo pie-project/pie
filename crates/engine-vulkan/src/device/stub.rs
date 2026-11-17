@@ -54,6 +54,10 @@ impl Context {
         match self.never {}
     }
 
+    pub fn limit_buffers(&self, _bytes: u64) {
+        match self.never {}
+    }
+
     #[must_use]
     pub fn left(&self) -> u64 {
         match self.never {}

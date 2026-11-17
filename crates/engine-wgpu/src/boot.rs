@@ -53,6 +53,7 @@ fn device_boot(doc: &toml::Table) -> Result<DeviceBoot, String> {
         power_preference: power_preference(doc),
         profiles: profiles(doc)?,
         chunk_bytes: None,
+        max_buffer: None,
     })
 }
 

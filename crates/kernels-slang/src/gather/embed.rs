@@ -58,6 +58,43 @@ pub fn embed(
     )
 }
 
+/// `y[n] = table[ids[n]]` from one piece of a table laid in pieces along
+/// its rows, rows `first ..` of the whole: the rows whose id lies in the
+/// piece land from it, the others are left to the other pieces. Every
+/// piece fired over the same ids lands the bits [`embed`] lands from the
+/// whole table (an id outside `vocab` reads row 0, which the first piece
+/// holds).
+pub fn embed_piece(
+    ctx: &Ctx<'_>,
+    ids: Tensor,
+    piece: Tensor,
+    first: u32,
+    vocab: u32,
+    y: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "gather.embed";
+    debug_assert_eq!(ids.dtype, Dtype::I32, "`{OP}` gathers by i32 token ids");
+    let entry = dtype_dispatch!(OP, piece.dtype, { Bf16 => "gather_embed_piece_bf16" });
+    nonzero(OP, "the row count this embedding table states", vocab)?;
+    nonzero(OP, "the rows a piece of this embedding table holds", piece.rows)?;
+    let words = words(OP, "embedding row", y.width)?;
+    ctx.fire(
+        Fire::at(EMBED, entry).apply(Grid::of(
+            elementwise_rows(OP, words, y.rows)?,
+            [GROUP, 1, 1],
+        )),
+        &[
+            ids.arg(),
+            piece.arg(),
+            y.arg_mut(),
+            stated(OP, y.width)?.arg(),
+            stated(OP, vocab)?.arg(),
+            stated(OP, first)?.arg(),
+            stated(OP, piece.rows)?.arg(),
+        ],
+    )
+}
+
 /// A table the weight cache streams by its rows, as [`embed_tabled`] reads
 /// it: block `b` (`block_rows` rows) lies in pool unit `blocks[b]` (a slot,
 /// `unit_words` words a unit) or, `u32::MAX`, is not held, its rows this

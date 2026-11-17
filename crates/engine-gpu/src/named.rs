@@ -62,6 +62,7 @@ pub struct Facts {
     capacity: u64,
     outside: u64,
     table_align: u64,
+    workgroup: Option<u32>,
     tier: kernels_slang::Tier,
     books: Arc<Books>,
 }
@@ -77,6 +78,7 @@ impl Facts {
             capacity: device.capacity(),
             outside: device.outside().saturating_add(device.books().device()),
             table_align: B::table_align(device),
+            workgroup: B::workgroup_limit(device),
             tier: B::tier(device),
             books: Arc::new(Books::apart()),
         }
@@ -345,7 +347,7 @@ impl<B: Serve> Default for Asked<B> {
 /// thread's recording frame for as long as it lives: what a dispatch does
 /// in the frame's order beside its kernel (a staged table, a settled read)
 /// reaches the frame that records nothing.
-pub struct Naming<'f>(&'f Names, crate::probe::Recording);
+pub struct Naming<'f>(&'f Names, crate::probe::Recording, Option<u32>);
 
 impl Drop for Naming<'_> {
     fn drop(&mut self) {
@@ -372,6 +374,10 @@ impl kernels_slang::Encode for Naming<'_> {
 
     fn naming(&self) -> Option<&dyn kernels_slang::Naming> {
         self.0.naming()
+    }
+
+    fn workgroup_limit(&self) -> Option<u32> {
+        self.2
     }
 }
 
@@ -402,6 +408,10 @@ impl<B: Serve> Serve for Named<B> {
 
     fn table_align(device: &Facts) -> u64 {
         device.table_align
+    }
+
+    fn workgroup_limit(device: &Facts) -> Option<u32> {
+        device.workgroup
     }
 
     /// A naming load is raised over the facts of a device already open.
@@ -443,7 +453,7 @@ impl<B: Serve> Serve for Named<B> {
     }
 
     fn sink<'f>(
-        _device: &'f Facts,
+        device: &'f Facts,
         frame: &'f NoFrame,
         pipelines: &'f Asked<B>,
         _handles: &'f Handles<Named<B>>,
@@ -451,6 +461,7 @@ impl<B: Serve> Serve for Named<B> {
         Naming(
             &pipelines.0,
             crate::probe::set_frame(std::ptr::from_ref(frame)),
+            device.workgroup,
         )
     }
 

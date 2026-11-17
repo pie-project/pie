@@ -17,6 +17,21 @@ mod backend {
     /// The backend's engine.
     pub type Engine = engine_gpu::api::Gpu<Api>;
 
+    /// The device boot a test binds, its profiles where serving reads them
+    /// (`$PIE_HOME/profiles`): the device's resolved and tuned profile, not
+    /// its seeded one alone.
+    pub fn device_boot() -> DeviceBoot {
+        let home = std::env::var_os("PIE_HOME")
+            .filter(|dir| !dir.is_empty())
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".pie")))
+            .unwrap_or_else(|| std::path::PathBuf::from(".pie"));
+        DeviceBoot {
+            profiles: Some(home.join("profiles")),
+            ..DeviceBoot::default()
+        }
+    }
+
     pub const NAME: &str = "vulkan";
     pub const PLATFORM: poem::Platform = poem::Platform::Vulkan;
     /// Kernels compile to SPIR-V: the register-tiled and cooperative-matrix
@@ -45,7 +60,8 @@ mod backend {
     /// over `experts`, and its sort's lanes.
     pub fn moe_rows(device: &Context, pairs: u32, experts: u32) -> (u32, u32, u32) {
         use engine_gpu::backend::Tactics as _;
-        let (profile, _) = engine_vulkan::chip::resolve(&device.chip(), None);
+        let (profile, _) =
+            engine_vulkan::chip::resolve(&device.chip(), device_boot().profiles.as_deref());
         let tuning =
             engine_vulkan::tuning::Tuning::new(profile, engine_vulkan::tuning::Limits::ASSUMED);
         (

@@ -28,6 +28,11 @@ pub struct DeviceBoot {
     /// Diagnostics: the chunk size the pool's recipe aims at, in place of
     /// the profile's (a small one cuts records into pieces).
     pub chunk_bytes: Option<u64>,
+
+    /// Diagnostics: the largest buffer the load makes, lowered to this
+    /// where stated: the device's own limit set smaller, as a smaller
+    /// device states it (a plane past it is laid in pieces).
+    pub max_buffer: Option<u64>,
 }
 
 impl Default for DeviceBoot {
@@ -38,6 +43,7 @@ impl Default for DeviceBoot {
             power_preference: crate::boot::DEFAULT_POWER_PREFERENCE.to_string(),
             profiles: None,
             chunk_bytes: None,
+            max_buffer: None,
         }
     }
 }

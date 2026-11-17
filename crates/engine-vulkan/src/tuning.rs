@@ -13,7 +13,15 @@ pub const FACTS: &[Var] = &[
     Var::fixed("coopmat", Domain::Bool),
     // A discrete GPU (`VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU`).
     Var::fixed("discrete", Domain::Bool),
+    // How bf16 runs: every kernel loads and stores it and computes in f32,
+    // on every device (no device's own bf16 arithmetic is used).
+    Var::fixed("bf16", Domain::Enum(BF16)),
 ];
+
+/// The one way bf16 runs on this engine ([`FACTS`]' `bf16`).
+pub const BF16_EMULATED: &str = "emulated (f32 math)";
+
+const BF16: &[&str] = &[BF16_EMULATED];
 
 pub const AXES: &[&str] = &["rows"];
 
@@ -202,6 +210,9 @@ pub struct Limits {
     pub shared_bytes: u32,
     /// `maxComputeWorkGroupInvocations`.
     pub invocations: u32,
+    /// The longest one submission may run, in nanoseconds, where the
+    /// device's platform states it ([`stated_submit_limit`]).
+    pub max_submit_ns: Option<u64>,
 }
 
 impl Limits {
@@ -211,7 +222,28 @@ impl Limits {
         lanes: 32,
         shared_bytes: 32 << 10,
         invocations: 1024,
+        max_submit_ns: None,
     };
+}
+
+/// Qualcomm KGSL's stated bound on one submission: its legacy dispatcher's
+/// `adreno_drawobj_timeout` (`adreno_dispatch.c:51`).
+const KGSL_DRAWOBJ_TIMEOUT_NS: u64 = 2_000_000_000;
+
+/// The longest one submission may run on a device of `vendor`, as its
+/// platform states it, and the source; `None` where no platform states one.
+/// Vulkan reports no such limit and Adreno's kernel driver exposes none to
+/// read (`KGSL_PROP_IB_TIMEOUT` is gone from its uapi), so the bound is the
+/// driver source's own.
+#[must_use]
+pub fn stated_submit_limit(vendor: &str) -> Option<(u64, &'static str)> {
+    (vendor == "qualcomm").then_some((
+        KGSL_DRAWOBJ_TIMEOUT_NS,
+        "Qualcomm KGSL's adreno_drawobj_timeout, 2000 ms (adreno_dispatch.c:51, \
+         github.com/qualcomm-linux/kgsl gfx-kernel.le.0.0); gen8 (Adreno 8xx) bounds a \
+         submission by the firmware's HFI_FEATURE_BAIL_OUT_TIMER at its default, and \
+         KGSL_PROP_IB_TIMEOUT is gone from the uapi, so no process reads it",
+    ))
 }
 
 #[derive(Clone, Debug)]
@@ -345,6 +377,10 @@ impl engine_gpu::backend::Tactics for Tuning {
         Tuning::profile(self)
     }
 
+    fn max_submit_ns(&self) -> Option<u64> {
+        self.limits.max_submit_ns
+    }
+
     fn qmm_ladder(
         &self,
         rows: u32,
@@ -462,6 +498,17 @@ impl engine_gpu::backend::Tactics for Tuning {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Adreno's bound is KGSL's own, named with its source; no other
+    /// platform states one.
+    #[test]
+    fn a_submission_is_bounded_where_its_platform_states_it() {
+        let (ns, source) = stated_submit_limit("qualcomm").expect("KGSL states one");
+        assert_eq!(ns, 2_000_000_000);
+        assert!(source.contains("adreno_dispatch.c:51"), "{source}");
+        assert_eq!(stated_submit_limit("nvidia"), None);
+        assert_eq!(Limits::ASSUMED.max_submit_ns, None);
+    }
 
     #[test]
     fn the_default_ladder_tiles_from_twelve_rows_and_folds_below() {

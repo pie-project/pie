@@ -525,7 +525,7 @@ impl Context {
             engine_gpu::books::owners::DUMMY,
         )?;
         let context = Context {
-            max_buffer,
+            max_buffer: boot.max_buffer.map_or(max_buffer, |cap| cap.min(max_buffer)),
             core,
             dummy,
             device_index: boot.adapter_index,

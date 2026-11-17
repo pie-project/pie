@@ -29,10 +29,15 @@ PIE_SLOTS_RW(2, y);
 #define PIE_YS(i, f) y[i] = (f)
 #endif
 
+// `ldy` is the result's row pitch and `y0` the column it lands from: a
+// weight laid in pieces along its rows lands each piece's columns of the
+// whole result (`ldy` = `n`, `y0` = 0 where the weight is whole).
 struct Params {
     int m;
     int n;
     int k;
+    int ldy;
+    int y0;
 };
 PIE_PARAMS(3, Params, params);
 
@@ -44,7 +49,7 @@ void main(uint3 gid : SV_DispatchThreadID) {
     uint k = uint(params.k);
     float acc = 0.0;
     for (uint kk = 0u; kk < k; kk++) acc += x[row * k + kk] * PIE_WL(col * k + kk);
-    PIE_YS(row * uint(params.n) + col, acc);
+    PIE_YS(row * uint(params.ldy) + uint(params.y0) + col, acc);
 }
 
 // pie:instantiate linear_gemm_lane_f32_bf16_f32

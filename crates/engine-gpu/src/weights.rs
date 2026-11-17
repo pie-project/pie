@@ -241,19 +241,27 @@ impl<B: Backend> Weights<B> {
         }
         let places = places(trace, &layout)?;
 
-        let spans = |tier: Tier| -> Vec<(u64, u64)> {
-            places
-                .iter()
-                .filter(|p| p.tier == tier)
-                .map(|p| (p.offset, p.reserved))
-                .collect()
-        };
-        let mut store = Store::with(
-            device,
-            &spans(Tier::Device),
-            device.max_buffer(),
-            Memory::Device,
-        )?;
+        // A device plane past the largest buffer lies in pieces along its
+        // rows, where it is one the ops reading it read in pieces.
+        let max_buffer = device.max_buffer();
+        let mut in_pieces = vec![false; places.len()];
+        for (at, place) in places.iter().enumerate() {
+            if place.tier == Tier::Device && place.reserved > max_buffer {
+                pieceable(trace, at, place, &pairings, max_buffer)?;
+                in_pieces[at] = true;
+            }
+        }
+        let spans: Vec<crate::weight_store::Span> = places
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.tier == Tier::Device)
+            .map(|(at, p)| {
+                let row = in_pieces[at].then(|| p.bytes / u64::from(p.rows.max(1)));
+                (p.offset, p.reserved, row)
+            })
+            .collect();
+        let mut store = Store::with(device, &spans, max_buffer, Memory::Device)?;
+        let mut pieces: Vec<(u32, Tensor)> = Vec::new();
 
         let streaming = compile_streaming(&metadata, contract, target)?;
 
@@ -321,6 +329,25 @@ impl<B: Backend> Weights<B> {
                     why: "is a plan param the load contract never published",
                 });
             }
+            if in_pieces[at] {
+                let row = place.bytes / u64::from(place.rows.max(1));
+                let first = u32::try_from(pieces.len()).unwrap_or(u32::MAX);
+                for (handle, from, rows) in
+                    store.bind_pieces(handles, place.offset, place.bytes, row)?
+                {
+                    pieces.push((from, Tensor::new(handle, rows, place.width, place.dtype)));
+                }
+                let count = u32::try_from(pieces.len()).unwrap_or(u32::MAX) - first;
+                tracing::info!(
+                    param = %trace.params[at].name,
+                    bytes = place.bytes,
+                    pieces = count,
+                    max_buffer,
+                    "a plane past the device's largest buffer lies in pieces along its rows"
+                );
+                weight_table.push(Some(WeightRow::Pieces { at: first, count }));
+                continue;
+            }
             let dense = |place: &Place, at: usize| -> Result<Tensor> {
                 let handle = match place.tier {
                     Tier::Device => store.bind(handles, place.offset, place.bytes)?,
@@ -345,6 +372,7 @@ impl<B: Backend> Weights<B> {
         }
 
         let mut gathered_widest = [0u64; 3];
+        let mut gathered_rows = 0u32;
         for at in plan.gathered() {
             if places[at].tier != Tier::Host {
                 continue;
@@ -352,6 +380,7 @@ impl<B: Backend> Weights<B> {
             let row = |place: &Place| crate::experts::row_bytes(place.dtype, place.width);
             match pairings.get(trace.params[at].name.as_str()) {
                 Some(pairing) => {
+                    gathered_rows = gathered_rows.max(places[at].rows);
                     gathered_widest[0] = gathered_widest[0].max(row(&places[at]));
                     gathered_widest[1] = gathered_widest[1].max(row(&places[pairing.scales]));
                     if let Some(b) = pairing.biases {
@@ -373,13 +402,14 @@ impl<B: Backend> Weights<B> {
             handles,
             gathered_widest,
             plan.gathered_demand(max_tokens),
+            gathered_rows,
         )?;
         Ok(Weights {
             store,
             host,
             layout,
             rows,
-            table: WeightTable(weight_table),
+            table: WeightTable(weight_table, pieces),
             banks: banks(trace, &places),
             decoded: Vec::new(),
             cached_bytes: streamed.iter().map(|&at| reserved[at]).sum(),
@@ -529,6 +559,7 @@ impl<B: Backend> Weights<B> {
                 call: "decode_absorbed",
                 why: format!("{}: {why}", param.name),
             })?;
+            derived_fits::<B>(device, &param.name, plane.len() as u64, "decoded at load")?;
             let mut buffer =
                 B::Buffer::zeroed(device, plane.len() as u64, crate::books::owners::DERIVED)?;
             buffer.write(0, &plane)?;
@@ -586,6 +617,7 @@ impl<B: Backend> Weights<B> {
                     }
                 }
             }
+            derived_fits::<B>(device, &param.name, relabelled.len() as u64, "relabelled at load")?;
             let mut buffer = B::Buffer::zeroed(
                 device,
                 relabelled.len() as u64,
@@ -636,10 +668,100 @@ impl<B: Backend> Weights<B> {
             .filter_map(|(at, row)| match row {
                 Some(WeightRow::Dense(plane)) => host.plane(plane.buf).map(|p| (at, p)),
                 Some(WeightRow::Planes(bank)) => host.plane(bank.codes.buf).map(|p| (at, p)),
-                None => None,
+                Some(WeightRow::Pieces { .. }) | None => None,
             })
             .collect()
     }
+}
+
+/// Whether param `at`, a plane past the device's largest buffer, is one a
+/// load lays in pieces along its rows: a dense bf16 plane (no quantized
+/// bank, no adapter bank) every op reading of which reads it in pieces (a
+/// dense matmul's weight, an embedding's whole-row table). Refused by name
+/// where not.
+fn pieceable(
+    trace: &Trace,
+    at: usize,
+    place: &Place,
+    pairings: &BTreeMap<&str, Pairing>,
+    max: u64,
+) -> Result<()> {
+    use poem_ir::{Def, Gather, Linear, Operands as _, Operation};
+    let name = trace.params[at].name.as_str();
+    let refuse = |why: String| Fault::Pieces {
+        name: name.to_string(),
+        bytes: place.bytes,
+        max,
+        why,
+    };
+    let quantized = pairings.contains_key(name)
+        || pairings
+            .values()
+            .any(|p| p.scales == at || p.biases == Some(at));
+    if quantized || trace.params[at].source == ParamSource::Registered {
+        return Err(refuse(
+            "it is a quantized or adapter bank's plane, which no kernel reads in pieces".into(),
+        ));
+    }
+    if place.dtype != Dtype::Bf16 || place.rows == 0 {
+        return Err(refuse(format!(
+            "it is a {:?} plane, and only a bf16 plane is laid in pieces",
+            place.dtype
+        )));
+    }
+    if place.bytes / u64::from(place.rows) > max {
+        return Err(refuse("one of its rows alone is past it".into()));
+    }
+    let reads = |value: poem_ir::ValueId| {
+        matches!(
+            trace.values.get(value.0 as usize).map(|v| &v.def),
+            Some(Def::Weight(w)) if *w as usize == at
+        )
+    };
+    let mut inputs = Vec::new();
+    for node in &trace.nodes {
+        inputs.clear();
+        node.op.inputs(&mut inputs);
+        if !inputs.iter().any(|&v| reads(v)) {
+            continue;
+        }
+        let in_pieces = match &node.op {
+            Operation::Linear(Linear::Matmul { act, w, quant: None, .. }) => {
+                reads(*w) && !reads(*act)
+            }
+            Operation::Gather(Gather::Embed {
+                ids,
+                table,
+                weights: None,
+                scales: None,
+                concat: false,
+                ..
+            }) => reads(*table) && !reads(*ids),
+            _ => false,
+        };
+        if !in_pieces {
+            return Err(refuse(format!(
+                "`{}` reads it, which reads no plane in pieces (a dense matmul's weight and an \
+                 embedding's table are read in pieces)",
+                node.op.name()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A plane a load derives from `name` (`how`), refused by name past the
+/// device's largest buffer: the op that reads it reads it whole.
+fn derived_fits<B: Backend>(device: &B::Context, name: &str, bytes: u64, how: &str) -> Result<()> {
+    if bytes <= device.max_buffer() {
+        return Ok(());
+    }
+    Err(Fault::Pieces {
+        name: name.to_string(),
+        bytes,
+        max: device.max_buffer(),
+        why: format!("its plane {how} is read whole by the op that reads it, never in pieces"),
+    })
 }
 
 #[derive(Debug, Clone, Copy)]

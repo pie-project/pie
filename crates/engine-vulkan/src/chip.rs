@@ -76,7 +76,8 @@ impl Device {
             .word("vendor", self.vendor)
             .int("subgroup", i64::from(self.subgroup))
             .flag("coopmat", self.coopmat)
-            .flag("discrete", self.discrete);
+            .flag("discrete", self.discrete)
+            .word("bf16", crate::tuning::BF16_EMULATED);
         match self.cores {
             Some(cores) => facts.int("cores", i64::from(cores)),
             None => facts,
@@ -118,6 +119,18 @@ mod tests {
 
     use super::*;
     use engine_gpu::backend::Tactics as _;
+
+    #[test]
+    fn the_chip_states_bf16_as_emulated_in_f32() {
+        let facts = device("qualcomm", 64, None, false).facts();
+        assert!(
+            facts
+                .describe()
+                .contains(&"bf16 = emulated (f32 math)".to_string()),
+            "{:?}",
+            facts.describe()
+        );
+    }
 
     #[test]
     fn the_registry_holds_together() {

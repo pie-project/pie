@@ -40,6 +40,11 @@ pub struct DeviceBoot {
     /// Diagnostics: the chunk size the pool's recipe aims at, in place of
     /// the profile's (a small one cuts records into pieces).
     pub chunk_bytes: Option<u64>,
+
+    /// Diagnostics: the largest buffer the load makes, lowered to this
+    /// where stated: the device's own limit set smaller, as a smaller
+    /// device states it (a plane past it is laid in pieces).
+    pub max_buffer: Option<u64>,
 }
 
 pub type Vulkan = engine_gpu::api::Gpu<Api>;

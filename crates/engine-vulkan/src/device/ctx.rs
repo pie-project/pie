@@ -187,6 +187,10 @@ pub(crate) struct Core {
     pub(crate) device_local: u64,
     /// The largest device-local heap, which device reservations take.
     heap: usize,
+    /// The largest buffer a load makes ([`buffer_ceiling`]), and the limit
+    /// that sets it; a boot's `max_buffer` lowers it.
+    max_buffer: AtomicU64,
+    max_buffer_limit: Mutex<&'static str>,
     pub(crate) vendor_id: u32,
     pub(crate) discrete: bool,
     pub(crate) api_version: u32,
@@ -247,6 +251,17 @@ impl Core {
         })
     }
 
+    /// The largest buffer a load makes, and the device limit that sets it.
+    pub(crate) fn max_buffer(&self) -> (u64, &'static str) {
+        (
+            self.max_buffer.load(Ordering::Relaxed),
+            *self
+                .max_buffer_limit
+                .lock()
+                .expect("max buffer lock poisoned"),
+        )
+    }
+
     pub(crate) fn fault(&self, call: &'static str, code: vk::Result) -> Fault {
         Fault::Vulkan {
             what: call,
@@ -292,9 +307,11 @@ impl Core {
 
     pub(crate) fn staging<'a>(self: &Arc<Self>, transfer: &'a mut Transfer) -> Result<&'a Slab> {
         if transfer.staging.is_none() {
+            // No larger than the largest buffer the device makes.
+            let bytes = STAGING_BYTES.min(self.max_buffer().0 & !3);
             transfer.staging = Some(Raw::new(
                 self,
-                STAGING_BYTES,
+                bytes,
                 Memory::Staging,
                 engine_gpu::books::owners::STAGING,
             )?);
@@ -428,7 +445,6 @@ pub struct Context {
     pub(crate) core: Arc<Core>,
     /// The operator's cap on what the load takes, all of it together.
     budget: Option<u64>,
-    max_buffer: u64,
     pub(crate) dummy: Slab,
     pipeline_cache: Arc<PipelineCache>,
     device_index: u32,
@@ -581,14 +597,23 @@ fn has_extension(exts: &[vk::ExtensionProperties], name: &CStr) -> bool {
 /// The largest buffer a load makes: one a single storage descriptor binds
 /// whole (`maxStorageBufferRange`), that one allocation backs
 /// (`maxMemoryAllocationSize`, core 1.1) and that the device creates
-/// (`maxBufferSize`, core 1.3; absent before it). A limit reported as zero
-/// states nothing.
-pub(crate) fn buffer_ceiling(storage_range: u32, allocation: u64, buffer: Option<u64>) -> u64 {
-    [Some(allocation), buffer]
-        .into_iter()
-        .flatten()
-        .filter(|&limit| limit > 0)
-        .fold(u64::from(storage_range), u64::min)
+/// (`maxBufferSize`, core 1.3; absent before it), with the name of the
+/// limit that sets it. A limit reported as zero states nothing.
+pub(crate) fn buffer_ceiling(
+    storage_range: u32,
+    allocation: u64,
+    buffer: Option<u64>,
+) -> (u64, &'static str) {
+    [
+        ("maxMemoryAllocationSize", Some(allocation)),
+        ("maxBufferSize", buffer),
+    ]
+    .into_iter()
+    .filter_map(|(name, limit)| limit.filter(|&l| l > 0).map(|l| (l, name)))
+    .fold(
+        (u64::from(storage_range), "maxStorageBufferRange"),
+        |held, next| if next.0 < held.0 { next } else { held },
+    )
 }
 
 impl Context {
@@ -603,12 +628,32 @@ impl Context {
         // SAFETY: a global query of the loaded entry, with no handles.
         let layers = unsafe { entry.enumerate_instance_layer_properties() }.unwrap_or_default();
         let validation = c"VK_LAYER_KHRONOS_validation";
-        let validated = boot.validation
-            && layers
+        let validated = boot.validation;
+        if validated
+            && !layers
                 .iter()
-                .any(|l| l.layer_name_as_c_str().is_ok_and(|s| s == validation));
+                .any(|l| l.layer_name_as_c_str().is_ok_and(|s| s == validation))
+        {
+            return Err(Fault::NoDevice {
+                detail: "`[vulkan] validation = true` asks for VK_LAYER_KHRONOS_validation, \
+                         which the Vulkan loader does not find installed; install the \
+                         layer or set `validation = false`"
+                    .to_string(),
+            });
+        }
         let (instance, props2) = shared_instance(&entry, validated)?;
-        Self::finish(entry, instance, boot, budget, props2)
+        let context = Self::finish(entry, instance, boot, budget, props2)?;
+        if let Some(bytes) = boot.max_buffer {
+            context.limit_buffers(bytes);
+        }
+        if let Some((ns, source)) = crate::tuning::stated_submit_limit(context.chip().vendor) {
+            tracing::info!(
+                device = %context.name(),
+                max_submit_ms = ns / 1_000_000,
+                "one submission is bounded by {source}"
+            );
+        }
+        Ok(context)
     }
 
     #[allow(
@@ -939,6 +984,8 @@ impl Context {
             cores,
             device_local,
             heap,
+            max_buffer: AtomicU64::new(max_buffer.0),
+            max_buffer_limit: Mutex::new(max_buffer.1),
             vendor_id: props.vendor_id,
             discrete: props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU,
             api_version: props.api_version,
@@ -955,7 +1002,6 @@ impl Context {
         Ok(Context {
             core,
             budget,
-            max_buffer,
             dummy,
             pipeline_cache,
             device_index: boot.device_index,
@@ -989,7 +1035,19 @@ impl Context {
 
     #[must_use]
     pub fn max_buffer(&self) -> u64 {
-        self.max_buffer
+        self.core.max_buffer().0
+    }
+
+    /// Lowers the largest buffer a load makes to `bytes`, as a device whose
+    /// limits are that small states it: what a load lays from now on is
+    /// laid under it, and an allocation past it refused.
+    pub fn limit_buffers(&self, bytes: u64) {
+        self.core.max_buffer.fetch_min(bytes, Ordering::Relaxed);
+        *self
+            .core
+            .max_buffer_limit
+            .lock()
+            .expect("max buffer lock poisoned") = "max_buffer as the boot states it";
     }
 
     #[must_use]
@@ -1026,6 +1084,8 @@ impl Context {
             lanes: self.lanes(),
             shared_bytes: self.core.limits.max_compute_shared_memory_size,
             invocations: self.core.limits.max_compute_work_group_invocations,
+            max_submit_ns: crate::tuning::stated_submit_limit(self.chip().vendor)
+                .map(|(ns, _)| ns),
         }
     }
 
@@ -2074,6 +2134,23 @@ impl Inner {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_buffer_ceiling_names_the_limit_that_sets_it() {
+        // An Adreno 840: 1 GiB allocations under a 2 GiB - 1 storage range.
+        assert_eq!(
+            super::buffer_ceiling(u32::MAX >> 1, 1 << 30, Some(1 << 32)),
+            (1 << 30, "maxMemoryAllocationSize")
+        );
+        assert_eq!(
+            super::buffer_ceiling(1 << 27, 1 << 30, None),
+            (1 << 27, "maxStorageBufferRange")
+        );
+        assert_eq!(
+            super::buffer_ceiling(u32::MAX, 0, Some(1 << 31)),
+            (1 << 31, "maxBufferSize")
+        );
+    }
+
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 

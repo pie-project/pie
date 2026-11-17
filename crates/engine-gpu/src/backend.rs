@@ -190,6 +190,12 @@ pub trait Tactics: std::fmt::Debug {
     /// The profile the device resolved to.
     fn profile(&self) -> &profile::Profile;
 
+    /// The longest one submission may run on this device, in nanoseconds,
+    /// as its profile states it; `None` where no limit is known.
+    fn max_submit_ns(&self) -> Option<u64> {
+        None
+    }
+
     /// The `kernel.qmm` ladder at this shape.
     fn qmm_ladder(
         &self,

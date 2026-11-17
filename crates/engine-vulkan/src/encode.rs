@@ -235,6 +235,10 @@ impl Encode for Sink<'_> {
         Target::Spirv
     }
 
+    fn workgroup_limit(&self) -> Option<u32> {
+        Some(self.device.limits().shared_bytes)
+    }
+
     fn comm(&self, op: &'static str) -> Result<kernels_slang::Comm, Error> {
         let comm = self.comm.ok_or(Error::Unsupported { op })?;
 
