@@ -313,6 +313,21 @@ impl Profile {
         self.pick::<T>(&Anywhere)
     }
 
+    /// The value a decision with no shape variables takes, `None` for a
+    /// flag that is off, without recording a read: for a backend that
+    /// resolves a load's values up front and raises [`Profile::mark`]
+    /// where a dispatch consults one.
+    #[must_use]
+    pub fn peek<T: Decision<At = Anywhere>>(&self) -> Option<&T> {
+        self.ladder::<T>().peek(&Anywhere)
+    }
+
+    /// The flag [`Profile::read`] reports `T` by.
+    #[must_use]
+    pub fn mark<T: Decision>(&self) -> crate::Mark {
+        self.ladder::<T>().mark_of()
+    }
+
     /// The decisions a load has asked anything of so far: evaluated a
     /// ladder at a point, or read a flag by id. A decision a model never
     /// reads cannot change how that model serves.

@@ -26,9 +26,15 @@ impl Shell {
     /// The regions whose attention stages at a prefill's width, and the
     /// width (`crate::window::Staging`).
     pub(crate) fn staging(&self) -> crate::window::Staging<'_> {
+        // A load with no staging attention never asks its width.
+        let stages = self.staging.contains(&true);
         crate::window::Staging {
             regions: &self.staging,
-            from: self.device.ctx().tuning().compressed_prefill_from,
+            from: if stages {
+                self.device.ctx().tuning().compressed_prefill_from()
+            } else {
+                0
+            },
         }
     }
 

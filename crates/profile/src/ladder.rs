@@ -61,6 +61,21 @@ pub trait Decision: Sized + Clone + Send + Sync + 'static {
     }
 }
 
+/// A decision's read flag, held apart from its ladder: raised where a
+/// dispatch consults a value resolved earlier without a read.
+#[derive(Clone, Debug)]
+pub struct Mark(Arc<AtomicBool>);
+
+impl Mark {
+    /// Record that the decision was consulted.
+    #[inline]
+    pub fn raise(&self) {
+        if !self.0.load(Ordering::Relaxed) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
 /// A typed ladder: first rung whose region holds the point and whose value
 /// fits it wins.
 #[derive(Clone, Debug)]
@@ -87,9 +102,20 @@ impl<T: Decision> Ladder<T> {
     }
 
     fn mark(&self) {
-        if !self.read.load(Ordering::Relaxed) {
-            self.read.store(true, Ordering::Relaxed);
-        }
+        Mark(self.read.clone()).raise();
+    }
+
+    /// The flag a read of this ladder raises: for code that resolves a value up
+    /// front ([`Ladder::peek`]) and records the read where it consults it.
+    #[must_use]
+    pub fn mark_of(&self) -> Mark {
+        Mark(self.read.clone())
+    }
+
+    /// The value for `at`, as [`Ladder::at`], without recording a read.
+    #[must_use]
+    pub fn peek(&self, at: &T::At) -> Option<&T> {
+        self.unmarked(at).next()
     }
 
     /// The value for `at`, or `None` where nothing holds: a flag that is off.
@@ -105,6 +131,10 @@ impl<T: Decision> Ladder<T> {
     /// value, so a `when` that compares it does not.
     pub fn candidates<'a>(&'a self, at: &T::At) -> impl Iterator<Item = &'a T> {
         self.mark();
+        self.unmarked(at)
+    }
+
+    fn unmarked<'a>(&'a self, at: &T::At) -> impl Iterator<Item = &'a T> {
         let vars = T::spec().vars;
         // Where a variable is unknown, every point `at` may be.
         let point = (0..vars.len())

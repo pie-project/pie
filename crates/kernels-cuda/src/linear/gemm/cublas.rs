@@ -188,8 +188,8 @@ pub(crate) fn act_x_wt(
     // A prefill's wide product on cuBLAS's own algorithm with a split's
     // partials summed in bf16, as torch runs it by default
     // (`kernel.gemm.bf16_split_from`); the handle is set back at once.
-    if tuning.gemm_bf16_split_from > 0
-        && m >= i32::try_from(tuning.gemm_bf16_split_from).unwrap_or(i32::MAX)
+    if tuning.gemm_bf16_split_from() > 0
+        && m >= i32::try_from(tuning.gemm_bf16_split_from()).unwrap_or(i32::MAX)
     {
         // SAFETY: `handle` is this context's live cuBLAS handle.
         unsafe {
@@ -217,13 +217,13 @@ pub(crate) fn act_x_wt(
     let capturing = capture_status(stream);
     let (plan, tactic, lt_handle, want) = with_device(|device| {
         device.configure(
-            (tuning.gemm_workspace_mb as usize) << 20,
-            tuning.gemm_heuristics as usize,
-            tuning.gemm_narrow_n,
-            tuning.gemm_split_launch_ns,
-            tuning.gemm_rows_m,
-            tuning.gemm_split_launch_from,
-            tuning.gemm_skinny_rows,
+            (tuning.gemm_workspace_mb() as usize) << 20,
+            tuning.gemm_heuristics() as usize,
+            tuning.gemm_narrow_n(),
+            tuning.gemm_split_launch_ns(),
+            tuning.gemm_rows_m(),
+            tuning.gemm_split_launch_from(),
+            tuning.gemm_skinny_rows(),
         );
         let plan = device.plan_for(call);
         let tactic = capturing
@@ -360,13 +360,13 @@ pub(crate) fn anchored(
         .fold(0u64, |mask, i| mask | 1 << i);
     let chosen = with_device(|device| {
         device.configure(
-            (tuning.gemm_workspace_mb as usize) << 20,
-            tuning.gemm_heuristics as usize,
-            tuning.gemm_narrow_n,
-            tuning.gemm_split_launch_ns,
-            tuning.gemm_rows_m,
-            tuning.gemm_split_launch_from,
-            tuning.gemm_skinny_rows,
+            (tuning.gemm_workspace_mb() as usize) << 20,
+            tuning.gemm_heuristics() as usize,
+            tuning.gemm_narrow_n(),
+            tuning.gemm_split_launch_ns(),
+            tuning.gemm_rows_m(),
+            tuning.gemm_split_launch_from(),
+            tuning.gemm_skinny_rows(),
         );
         let call = Call {
             act,
@@ -568,13 +568,13 @@ pub(crate) fn on_lt(
     };
     let (plan, lt_handle, want) = with_device(|device| {
         device.configure(
-            (tuning.gemm_workspace_mb as usize) << 20,
-            tuning.gemm_heuristics as usize,
-            tuning.gemm_narrow_n,
-            tuning.gemm_split_launch_ns,
-            tuning.gemm_rows_m,
-            tuning.gemm_split_launch_from,
-            tuning.gemm_skinny_rows,
+            (tuning.gemm_workspace_mb() as usize) << 20,
+            tuning.gemm_heuristics() as usize,
+            tuning.gemm_narrow_n(),
+            tuning.gemm_split_launch_ns(),
+            tuning.gemm_rows_m(),
+            tuning.gemm_split_launch_from(),
+            tuning.gemm_skinny_rows(),
         );
         (
             device.plan_for(call),
@@ -732,7 +732,7 @@ fn run_tactic(
 ) -> bool {
     // The kernels' own launches read this dispatch's decisions (`kernel.pdl`,
     // `kernel.gemv.bf16`), not a bare stream's defaults.
-    let pdl = tuning.pdl;
+    let pdl = tuning.pdl();
     match tactic {
         Tactic::Gemv => {
             call.m == 1

@@ -34,7 +34,11 @@ pub const SKINNY_M: u32 = 16;
 pub fn rows_computed(tuning: &crate::tuning::Tuning, rows: u32) -> u32 {
     if rows <= crate::linear::skeleton::ROWS_M {
         rows
-    } else if rows <= tuning.gemm_skinny_rows.max(crate::linear::skeleton::ROWS_M) {
+    } else if rows
+        <= tuning
+            .gemm_skinny_rows()
+            .max(crate::linear::skeleton::ROWS_M)
+    {
         rows.next_multiple_of(SKINNY_M)
     } else {
         rows.next_multiple_of(TILE_M)

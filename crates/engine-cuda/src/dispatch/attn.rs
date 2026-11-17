@@ -579,7 +579,7 @@ impl Run<'_> {
             } => {
                 // A floor stays 0 unless the profile turns bounded replay on;
                 // then only the fused kernels read it.
-                if floor.is_some() && self.ctx().tuning().compressed_replay {
+                if floor.is_some() && self.ctx().tuning().compressed_replay() {
                     return Err(kernels_cuda::Error::Backend {
                         op: "attn.prefill",
                         detail: "the window is held above a replay floor, which only the fused \

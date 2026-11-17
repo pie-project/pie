@@ -3086,3 +3086,69 @@ fn golden_staged_experts() {
         );
     }
 }
+
+/// The decisions `model` reads served over [`SCRIPT`] under the profile the
+/// probe's loads resolve: those a dispatch consulted for its shapes and kinds.
+fn read_set(model: &str, cache: &Path) -> Vec<&'static str> {
+    let (name, facts) = engine_cuda::chip::probe(0).expect("a CUDA device answers");
+    let (profile, _) = engine_cuda::chip::resolve(&name, &facts, knobs().profiles.as_deref());
+    let fixture = fixture(model, cache);
+    let mut knobs = knobs();
+    knobs.chip = Some(profile.clone());
+    let mut shell = load_with(&fixture, cache, knobs);
+    shell.open(0).expect("slot 0 opens");
+    let mut fed = 0u32;
+    let mut last = 0;
+    for step in SCRIPT {
+        let tokens: Vec<u32> = match *step {
+            Step::Prefill(rows) => (fed..fed + rows).map(|t| (t * 7 + 11) % 1000).collect(),
+            Step::Decode => vec![last],
+        };
+        fed += u32::try_from(tokens.len()).expect("a count");
+        last = argmax(&fire(&mut shell, &fixture.trace, &tokens));
+    }
+    drop(shell);
+    profile.read()
+}
+
+/// A kernel decision only a routed, recurrent, MLA, indexed or NVFP4 model
+/// can reach.
+fn family_only(id: &str) -> bool {
+    [
+        "kernel.moe.",
+        "kernel.ssm.",
+        "kernel.mla.",
+        "kernel.sdpa.mla",
+        "kernel.sdpa.index",
+        "kernel.sdpa.compressed",
+    ]
+    .iter()
+    .any(|p| id.starts_with(p))
+        || id.contains("nvfp4")
+}
+
+/// A dense bf16 model reads no routed, recurrent, MLA, indexed or NVFP4
+/// decision, so `pie tune` times none of them on it; a routed model (the
+/// control) reads its routed ones. `PIE_GOLDEN_MODELS` names more models
+/// whose read sets are printed. Fixtures as [`golden_fixtures`].
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn a_dense_model_reads_no_routed_or_recurrent_decision() {
+    let cache = cache_dir();
+    let dense = read_set("qwen3-0.6b", &cache);
+    println!("reads qwen3-0.6b {dense:?}");
+    let stray: Vec<&str> = dense.iter().copied().filter(|id| family_only(id)).collect();
+    assert!(stray.is_empty(), "qwen3-0.6b reads {stray:?}");
+    assert!(dense.contains(&"kernel.gemm.skinny_rows"), "{dense:?}");
+    let routed = read_set("gptoss-20b-mini-u4g64-mxfp4-kv-bf16", &cache);
+    println!("reads gptoss-20b-mini-u4g64-mxfp4-kv-bf16 {routed:?}");
+    assert!(
+        routed.iter().any(|id| id.starts_with("kernel.moe.")),
+        "the routed control reads no routed decision: {routed:?}"
+    );
+    if std::env::var_os("PIE_GOLDEN_MODELS").is_some() {
+        for model in models() {
+            println!("reads {model} {:?}", read_set(&model, &cache));
+        }
+    }
+}

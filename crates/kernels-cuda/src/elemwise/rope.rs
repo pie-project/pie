@@ -243,7 +243,7 @@ pub fn partial_last(
     let half = rotary_dim / 2;
     // Four pairs a thread over 16- or 8-byte runs, a block as many heads as
     // fill it, the angles the spread form's.
-    if ctx.tuning().rows_vec
+    if ctx.tuning().rows_vec()
         && half > 0
         && half <= ROTATE_BLOCK
         && rotary_dim.is_multiple_of(8)
@@ -259,7 +259,7 @@ pub fn partial_last(
                     [ROTATE_BLOCK, 1, 1],
                 )
                 .smem(half * 8)
-                .programmatic(ctx.tuning().pdl),
+                .programmatic(ctx.tuning().pdl()),
             ),
             &[
                 q.arg(),

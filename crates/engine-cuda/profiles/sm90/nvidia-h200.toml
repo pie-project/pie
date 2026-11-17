@@ -10,7 +10,8 @@ moe.mxfp4_select_lean = true  # 1.9% faster end to end
 qmm.gemm_from = 12  # 2.1% faster end to end
 qmm.split_thin_max = 16  # 1.2% faster end to end
 qmm.split_warps_per_sm = 80  # 2.3% faster end to end
-ssm.gdn_scan_until = 48  # 1.9% faster end to end
+# ssm.gdn_scan_until = 48 reset to its default: the tune timed it 1.9% faster on gpt-oss-20b,
+# which never reads it here (a recurrent (SSM) path; it has none): the win was noise.
 sdpa.index_mma = true
 sdpa.index_radix = true
 # a paged decode of a group of at most eight query heads on the tensor-core kernel, as the B200:
@@ -81,12 +82,9 @@ bytes_per_ns = 4800.0
 
 [provenance]
 source = "pie tune (quick, gptoss-20b) on RunPod; 512-token prompt 26.2 -> 26.2 ms, 1-lane step 3.06 -> 2.87 ms, 4-lane step 5.16 -> 4.85 ms, 8-lane step 6.21 -> 6.12 ms, readout cosine 1.0000"
+# `measured` names only what gpt-oss-20b, the tune's model, reads on this device: the tune once listed
+# every decision, since a load counted each as read; those it cannot read are dropped (and reset where set).
 measured = [
-  "kernel.attn.qkv_rows_from",
-  "kernel.attn_res.fused_norm",
-  "kernel.elemwise.hc_mma",
-  "kernel.elemwise.hc_tile",
-  "kernel.elemwise.norm_emit",
   "kernel.elemwise.rows_vec",
   "kernel.gemm.affine_mma",
   "kernel.gemm.fp8_gemv_until",
@@ -96,15 +94,9 @@ measured = [
   "kernel.gemm.heuristics",
   "kernel.gemm.rows_m",
   "kernel.gemm.split_rows_from",
-  "kernel.gemm.tc5_raster",
   "kernel.gemm.workspace_mb",
   "kernel.gemv.bf16",
   "kernel.gemv.splitk_max_n",
-  "kernel.mla.expanded_from",
-  "kernel.mla.path",
-  "kernel.moe.affine_grouped",
-  "kernel.moe.affine_grouped_from",
-  "kernel.moe.affine_wmma",
   "kernel.moe.bf16_mma_from",
   "kernel.moe.bf16_mma_until",
   "kernel.moe.group_at",
@@ -116,13 +108,6 @@ measured = [
   "kernel.moe.mxfp4_mma_until",
   "kernel.moe.mxfp4_select_lean",
   "kernel.moe.mxfp4_wmma",
-  "kernel.moe.nvfp4_mma_from",
-  "kernel.moe.nvfp4_mma_until",
-  "kernel.moe.routes_sized",
-  "kernel.moe.tc5",
-  "kernel.moe.tc5_from",
-  "kernel.moe.w4a4_fused_from",
-  "kernel.moe.w4a4_fused_layout",
   "kernel.moe.w4a8_fused_from",
   "kernel.pdl",
   "kernel.qmm.gemm_from",
@@ -142,27 +127,9 @@ measured = [
   "kernel.sdpa.decode.split_window",
   "kernel.sdpa.decode.static_max_requests",
   "kernel.sdpa.fa2_live",
-  "kernel.sdpa.index_fp4_tc5",
-  "kernel.sdpa.index_mma",
-  "kernel.sdpa.index_radix",
-  "kernel.sdpa.index_split_until",
-  "kernel.sdpa.index_tc5",
   "kernel.sdpa.merge_warp",
-  "kernel.sdpa.mla_dense_short",
-  "kernel.sdpa.mla_sparse",
-  "kernel.sdpa.pool_mma",
   "kernel.sdpa.prefill.ctas_per_sm",
-  "kernel.sdpa.prefill.tc5",
   "kernel.sdpa.prefill.wide_sliding",
-  "kernel.sdpa.selected_mma",
-  "kernel.ssm.conv_vec4",
-  "kernel.ssm.gdn_fused_scan",
-  "kernel.ssm.gdn_out_bf16",
-  "kernel.ssm.gdn_scan_until",
-  "kernel.ssm.gdn_step_blocks",
-  "kernel.ssm.gdn_tc5",
-  "kernel.ssm.kda_chunked",
-  "kernel.ssm.kda_step_fused",
   "engine.copies",
   "engine.graphs",
   "engine.host_planes",

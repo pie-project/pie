@@ -16,10 +16,10 @@ pub mod tune;
 pub mod vendor;
 pub mod when;
 
-pub use ladder::{Anywhere, Decision, Ladder, Pick, Point, Rung};
-pub use region::{Region, Set};
+pub use ladder::{Anywhere, Decision, Ladder, Mark, Pick, Point, Rung};
 pub use profile::{Candidate, Facts, Pair, Profile, Report, Source, coord};
 pub use profile_macros::Decision;
+pub use region::{Region, Set};
 pub use registry::{API, Diagnostic, File, Refusal, Registry, Strict, Target};
 pub use shelf::{Shelf, id_of};
 pub use spec::{Alternative, Constant, Domain, Kind, Shape, Sort, Spec, Tune, Value, Var};

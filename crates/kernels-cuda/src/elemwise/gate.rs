@@ -25,7 +25,10 @@ pub fn sigmoid_mul(ctx: &Ctx, gate: Tensor, fan: u32, x: &mut Tensor) -> Result<
         )
     })?;
     nonzero(OP, "the gated rectangle's element count", lanes)?;
-    if ctx.tuning().rows_vec && x.width.is_multiple_of(8) && aligned16(x.ptr) && aligned16(gate.ptr)
+    if ctx.tuning().rows_vec()
+        && x.width.is_multiple_of(8)
+        && aligned16(x.ptr)
+        && aligned16(gate.ptr)
     {
         return ctx.fire(
             OP,
