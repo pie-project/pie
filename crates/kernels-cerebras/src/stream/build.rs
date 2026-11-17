@@ -71,17 +71,23 @@ impl Default for KvSplit {
 /// The most replicas of a K / V head the search tries ([`program_at`]'s `rep`).
 pub const MAX_KV_REP: u32 = 16;
 
-/// `p`'s PEs' memory: each PE's data (the static check's, of `p` as emitted) beside
-/// [`crate::check::CODE_RESERVE`] within a PE.
+/// `p`'s PEs' memory, the static check's model of it as emitted ([`crate::check::PeBytes`]):
+/// refused only past the model's worst miss (a program that links is never refused; one within
+/// the miss, the price picks and its link checks).
 fn fits(p: &Program) -> R<()> {
     let e = crate::emit::stream::emit(p)?;
-    let (room, file) = crate::check::placed(&e.placed, &e.files, None).data_room();
-    if room < 0 {
+    let rep = crate::check::placed(&e.placed, &e.files, None);
+    if let Some((f, d, c)) = rep.codes.iter().find(|(_, data, code)| {
+        crate::check::PeBytes {
+            data: *data,
+            code: *code,
+        }
+        .overflows()
+    }) {
         return Err(format!(
-            "{}: `{file}`'s data {} B past the {} B a PE holds beside its code",
+            "{}: `{f}`: {d} B data + ~{c} B code past a PE's {} B",
             p.trace.name,
-            -room,
-            crate::check::PE_BYTES - crate::check::CODE_RESERVE
+            crate::check::PE_BYTES
         ));
     }
     Ok(())

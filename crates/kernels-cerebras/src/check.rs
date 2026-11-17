@@ -726,17 +726,6 @@ impl Report {
             .map_or(PE_BYTES, |(_, d, c)| PE_BYTES - d - c)
     }
 
-    /// The room the fullest PE's data leaves beside [`CODE_RESERVE`] (bytes; negative past
-    /// it): a search's memory feasibility, the data the check's own.
-    #[must_use]
-    pub fn data_room(&self) -> (i64, String) {
-        self.codes
-            .iter()
-            .map(|(f, d, _)| (PE_BYTES - CODE_RESERVE - d, f.clone()))
-            .min()
-            .unwrap_or((PE_BYTES - CODE_RESERVE, String::new()))
-    }
-
     /// One line: its PEs, routes, margin and findings.
     #[must_use]
     pub fn line(&self) -> String {
