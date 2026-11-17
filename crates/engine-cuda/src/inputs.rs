@@ -442,9 +442,7 @@ fn inject_tokens(
     let words = injects
         .iter()
         .all(|inject| inject.bytes % 4 == 0 && inject.dst_off % 4 == 0);
-    // kernels-rocm has no word gather: ROCm copies each run.
-    if cfg!(feature = "rocm")
-        || injects.len() < GATHERED_INJECTS
+    if injects.len() < GATHERED_INJECTS
         || !words
         || crate::device::alloc::is_capturing(stream)
     {
@@ -453,16 +451,9 @@ fn inject_tokens(
         }
         return Ok(());
     }
-    #[cfg(not(feature = "rocm"))]
-    return gather_injects(device, runs, tokens, injects);
-    #[cfg(feature = "rocm")]
-    {
-        let _ = runs;
-        Ok(())
-    }
+    gather_injects(device, runs, tokens, injects)
 }
 
-#[cfg(not(feature = "rocm"))]
 fn gather_injects(
     device: &crate::device::Context,
     (store, at): (&mut Buffer, u64),
