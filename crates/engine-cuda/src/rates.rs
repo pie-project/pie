@@ -46,26 +46,14 @@ use profile::fire::Rates;
 
 /// The rows the matmul grid is timed at under `chip`: the candidates a load
 /// weighs its top rung among (`serve::load`'s `budget_at(asked).buckets`),
-/// the chip's lattice ([`crate::api::lattice`] at its `engine.lattice_steps`,
-/// `prefill_lattice_from` and `_steps`) up to the tokens a load is asked
-/// when nothing states them: the chip's `engine.forward_tokens`, at least
-/// [`crate::api::DEFAULT_FORWARD_TOKENS`]. A load asked other tokens (a
-/// model the walk fit narrows, a stated `max_forward_tokens`) lays a top
-/// this grid does not state, refused by name.
+/// the chip's rung lattice ([`crate::api::rung_lattice`] at its
+/// `engine.lattice_steps`, `prefill_lattice_from` and `_steps`) up to the
+/// engine's fire bound ([`crate::api::DEFAULT_FORWARD_TOKENS`]). A load
+/// asked other tokens narrows them to a rung of it
+/// ([`crate::api::on_lattice`]).
 #[must_use]
 pub fn lattice_rows(chip: &profile::Profile) -> Vec<u32> {
-    let engine = crate::chip::Engine::of(chip);
-    let top = match engine.forward_tokens {
-        0 => crate::api::DEFAULT_FORWARD_TOKENS,
-        tokens => tokens.max(crate::api::DEFAULT_FORWARD_TOKENS),
-    };
-    crate::api::lattice(
-        Vec::new(),
-        top,
-        engine.lattice_steps,
-        engine.prefill_lattice_from,
-        engine.prefill_lattice_steps,
-    )
+    crate::api::rung_lattice(&crate::chip::Engine::of(chip))
 }
 
 /// The kv cache's page, as a served load pages it.
@@ -812,13 +800,9 @@ mod lattice_tests {
         // budget_at(asked).buckets): the chip's lattice to its asked tokens.
         let chip = crate::chip::profile("");
         let engine = crate::chip::Engine::of(&chip);
-        let asked = match engine.forward_tokens {
-            0 => crate::api::DEFAULT_FORWARD_TOKENS,
-            tokens => tokens.max(crate::api::DEFAULT_FORWARD_TOKENS),
-        };
         let weighed = crate::api::lattice(
             Vec::new(),
-            asked,
+            crate::api::DEFAULT_FORWARD_TOKENS,
             engine.lattice_steps,
             engine.prefill_lattice_from,
             engine.prefill_lattice_steps,

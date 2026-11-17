@@ -255,7 +255,7 @@ fn serve(artifact: &Path, deployment: &str, chip: Profile) -> Result<Serving, St
 pub const CHECK_BOUND: f64 = engine::rates::AGREEMENT;
 
 /// The lanes a served CUDA load is asked (`pie serve`'s); its tokens are
-/// left to the engine (`engine.forward_tokens`, fitted to the card).
+/// left to the engine (its fire bound, fitted to the card).
 const SERVED_LANES: u32 = 512;
 
 /// The fires timed a rung, after two warm ones.

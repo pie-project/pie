@@ -413,9 +413,43 @@ pub(crate) fn lattice(
     }
 }
 
-/// The rows a fire takes when neither `max_forward_tokens` nor the chip's
-/// profile states them.
+/// The engine's fire bound, the most rows one fire lays: the top of its
+/// rung lattice ([`rung_lattice`]) and of the rows `pie tune cuda --rates`
+/// times. Nothing the engine lays fixes a narrower or wider one (its tables,
+/// workspaces and captured bodies are sized to the fire a load lays, and
+/// B200/H200 profiles ran 16384), so it is the fire past which a wider one
+/// adds no throughput where the matmul is compute bound (the L40S's grid
+/// flat from 4096 rows) while its activation arena grows with it, and a
+/// prompt's later chunks wait on a fire twice as long.
 pub(crate) const DEFAULT_FORWARD_TOKENS: u32 = 8192;
+
+/// The rung lattice of a load under `engine`: [`default_lattice`] up to
+/// [`DEFAULT_FORWARD_TOKENS`]. The candidates a load with no stated buckets
+/// weighs its top among, and the rows `pie tune cuda --rates` times its
+/// matmul grid at (`crate::rates::lattice_rows`).
+#[must_use]
+pub(crate) fn rung_lattice(engine: &crate::chip::Engine) -> Vec<u32> {
+    default_lattice(
+        DEFAULT_FORWARD_TOKENS,
+        engine.lattice_steps,
+        engine.prefill_lattice_from,
+        engine.prefill_lattice_steps,
+    )
+}
+
+/// The widest rung of [`rung_lattice`] at or below `tokens` (its first where
+/// none is): a load asked other tokens (the walk fit, `engine.fire_rows`, a
+/// stated `max_forward_tokens`, a refit) lays no last point off the grid.
+#[must_use]
+pub(crate) fn on_lattice(engine: &crate::chip::Engine, tokens: u32) -> u32 {
+    let lattice = rung_lattice(engine);
+    lattice
+        .iter()
+        .rev()
+        .copied()
+        .find(|&rung| rung <= tokens)
+        .unwrap_or(lattice[0])
+}
 
 /// The load's budgets for `trace`: its logit readouts sized to what the
 /// trace drafts, not the general 16 a lane, so a vocab-wide head carves only
