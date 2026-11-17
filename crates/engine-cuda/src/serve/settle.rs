@@ -2,6 +2,7 @@
 use engine::fire::Readout;
 
 use crate::error::{Fault, Result};
+use crate::program::Fired;
 
 use super::{Enqueued, Shell};
 
@@ -41,14 +42,14 @@ struct Tap(*const u32);
 // given back for another to claim.
 unsafe impl Send for Tap {}
 
-fn written(reports: Vec<super::KvReport>, tap: Option<Tap>) -> Vec<engine::KvWrites> {
+fn written(reports: Vec<super::KvReport>, tap: Option<&Tap>) -> Vec<engine::KvWrites> {
     let folds_from = tap_rows(&reports);
     let mut folds = 0usize;
     reports
         .into_iter()
         .map(|report| {
             let rows = report.positions.len();
-            let tokens = report.tokens.unwrap_or_else(|| match &tap {
+            let tokens = report.tokens.unwrap_or_else(|| match tap {
                 // SAFETY: the copy into the tap was ordered before the event
                 // this host function waits on, and spans these rows.
                 Some(Tap(host)) => unsafe {
@@ -58,7 +59,7 @@ fn written(reports: Vec<super::KvReport>, tap: Option<Tap>) -> Vec<engine::KvWri
             });
             let fold = report.fold.or_else(|| {
                 report.fold_at?;
-                let Tap(host) = tap.as_ref()?;
+                let Tap(host) = tap?;
                 folds += 1;
                 // SAFETY: as above; each read-back count follows the rows.
                 Some(unsafe { *host.add(folds_from + folds - 1) })
@@ -87,6 +88,7 @@ fn tap_rows(reports: &[super::KvReport]) -> usize {
         .unwrap_or(0)
 }
 
+#[derive(Clone)]
 pub struct Done {
     pub at: engine::StepDone,
     pub sink: engine::CompletionSink,
@@ -108,18 +110,66 @@ impl Shell {
         } else {
             Vec::new()
         };
+        let lanes = u32::try_from(prepared.lanes.len()).unwrap_or(u32::MAX);
         let slot = prepared.slot.take();
         drop(prepared);
 
-        let at = self.settlement.claim()?;
-        let tap = match self.tap_tokens(at, &reports) {
-            Ok(tap) => tap,
-            Err(fault) => {
-                self.settlement.recycler().give(at);
-                drop(slot);
-                return Err(fault);
+        // The guest passes this step launched that land with it: their
+        // commit words are read where the step lands, each faulting its own
+        // lanes where it did not commit.
+        let seq = self.airborne.next_seq();
+        let mut flying: Vec<super::enqueue::Flying> = Vec::new();
+        for batch in self
+            .owed
+            .iter_mut()
+            .filter(|batch| batch.seq == seq && batch.told.is_none())
+        {
+            batch.told = Some(done.is_some());
+            if done.is_some() {
+                flying.extend(batch.launched.iter().cloned());
+            }
+        }
+        let faults = std::mem::take(&mut self.guest_faults);
+        if done.is_none()
+            && let Some(fault) = faults.first()
+        {
+            let _ = self.device.synchronize();
+            drop(slot);
+            return Err(Fault::program("serve::fire", fault.reason.clone()));
+        }
+
+        // A failure past the enqueue is the step lost on the device: every
+        // lane of it faults.
+        let lost = |done: Option<Done>, fault: Fault| -> Result<()> {
+            match done {
+                Some(done) => {
+                    (done.sink)(
+                        done.at,
+                        engine::StepOutcome::lost(lanes, format!("cuda step lost: {fault}")),
+                    );
+                    Ok(())
+                }
+                None => Err(fault),
             }
         };
+
+        let commits: Vec<u64> = flying.iter().map(|flying| flying.commit).collect();
+        let at = self.settlement.claim()?;
+        let tap = match self.tap_tokens(at, &reports, &commits) {
+            Ok(tap) => tap,
+            Err(fault) => {
+                let _ = self.device.synchronize();
+                self.settlement.recycler().give(at);
+                drop(slot);
+                lost(done, fault)?;
+                return Ok(Settled::default());
+            }
+        };
+        let commits_from = tap_rows(&reports)
+            + reports
+                .iter()
+                .filter(|report| report.fold_at.is_some())
+                .count();
         let airborne = self.airborne.clone();
         airborne.enter();
 
@@ -133,17 +183,35 @@ impl Shell {
             airborne.abandon();
             self.settlement.recycler().give(at);
             drop(slot);
-            return Err(fault);
+            lost(done, fault)?;
+            return Ok(Settled::default());
         }
 
         let recycler = self.settlement.recycler();
+        let told = done.clone();
         let posted = self.device.host_fn(Box::new(move || {
             // Read before the event goes back: its tap is the next step's then.
-            let outcome = if reports.is_empty() {
+            let mut outcome = if reports.is_empty() {
                 engine::StepOutcome::committed()
             } else {
-                engine::StepOutcome::wrote(written(reports, tap))
+                engine::StepOutcome::wrote(written(reports, tap.as_ref()))
             };
+            for fault in faults {
+                outcome.fault_lanes(fault.lanes, Some(fault.instance), &fault.reason);
+            }
+            if let Some(Tap(host)) = tap.as_ref() {
+                for (index, flying) in flying.iter().enumerate() {
+                    // SAFETY: as in `written`; the commit words follow the
+                    // fold counts.
+                    let word = unsafe { *host.add(commits_from + index) };
+                    if word == 0 {
+                        let reason =
+                            super::enqueue::fault_of(Fired::Declined, flying.instance, flying.at)
+                                .expect("a declined pass faults");
+                        outcome.fault_lanes(flying.lanes.clone(), Some(flying.instance), &reason);
+                    }
+                }
+            }
             drop(slot);
             recycler.give(at);
             airborne.leave();
@@ -155,7 +223,8 @@ impl Shell {
             let _ = self.device.synchronize();
             self.airborne.abandon();
             self.settlement.recycler().give(at);
-            return Err(fault);
+            lost(told, fault)?;
+            return Ok(Settled::default());
         }
 
         Ok(Settled {
@@ -170,8 +239,17 @@ impl Shell {
     }
 
     /// In stream order, before the next fire writes its own over them.
-    fn tap_tokens(&mut self, at: u32, reports: &[super::KvReport]) -> Result<Option<Tap>> {
-        let cells: Vec<u64> = reports.iter().filter_map(|report| report.fold_at).collect();
+    fn tap_tokens(
+        &mut self,
+        at: u32,
+        reports: &[super::KvReport],
+        commits: &[u64],
+    ) -> Result<Option<Tap>> {
+        let cells: Vec<u64> = reports
+            .iter()
+            .filter_map(|report| report.fold_at)
+            .chain(commits.iter().copied())
+            .collect();
         if reports.iter().all(|report| report.tokens.is_some()) && cells.is_empty() {
             return Ok(None);
         }

@@ -97,6 +97,14 @@ pub struct Attached {
     pub adapter_only: bool,
 }
 
+impl Attached {
+    /// The step's lanes its pass spans.
+    #[must_use]
+    pub fn span(&self) -> std::ops::Range<u32> {
+        self.lane..self.lane + self.lanes.max(1)
+    }
+}
+
 pub(crate) const MROPE_COORDS: usize = 3;
 
 pub(crate) const PATCH_ROUTE_DROP: i32 = -1;
