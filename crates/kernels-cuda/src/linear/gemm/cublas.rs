@@ -2559,6 +2559,12 @@ pub fn time_tactics(on: bool) {
     TIMING.store(on, std::sync::atomic::Ordering::Release);
 }
 
+/// Whether the products the tables lack are timed now (`time_tactics`).
+#[must_use]
+pub fn timing_tactics() -> bool {
+    TIMING.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// The products met that no table had a tactic for.
 #[must_use]
 pub fn untuned() -> usize {

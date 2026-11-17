@@ -116,6 +116,28 @@ impl Arming {
     }
 }
 
+/// Whether a target captures cold, with no warm fire before: past its
+/// kind's widest bucket, whose fires made what its warm fire would, but for
+/// its products' GEMM tactics, which go by their rows. While `pie tune`
+/// times the products the tables lack, it warms first: a capture times
+/// none, so a cold one would leave every narrower body's products to
+/// cuBLAS's own pick, and `--gemm-only` would never add them to the table.
+fn captures_cold(narrower: bool, verify: bool, timing_tactics: bool) -> bool {
+    narrower && !verify && !timing_tactics
+}
+
+/// Whether the products the tables lack are timed now (`pie tune`).
+fn timing_tactics() -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        kernels_cuda::linear::gemm::timing_tactics()
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        false
+    }
+}
+
 /// A synthetic lane's image and patch counts.
 type LaneMedia = (u32, u32);
 
@@ -1510,9 +1532,7 @@ impl Shell {
             return Ok(());
         }
         self.arm_rs = rs;
-        // Past its kind's widest bucket a target captures cold: the top
-        // bucket's fires made what its warm fire would.
-        self.arm_cold = st.narrower(bucket, &target) && !st.verify;
+        self.arm_cold = captures_cold(st.narrower(bucket, &target), st.verify, timing_tactics());
         let spent = self.cache.body_stats();
         let room = (self.bodies_mem as u64).saturating_sub(spent.census.bytes as u64);
         let spare = self.pools.spare_bytes_for_bodies(room).unwrap_or(u64::MAX);
@@ -2134,4 +2154,21 @@ struct LatticeTargets {
     targets: Vec<(u32, BodySynth, record::RsBody)>,
     top: Option<u32>,
     unfireable: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::captures_cold;
+
+    #[test]
+    fn a_narrower_body_warms_first_while_tactics_are_timed() {
+        // Serving: past the widest bucket a body captures cold.
+        assert!(captures_cold(true, false, false));
+        // `pie tune`: it warms, so its products are timed, not left to
+        // cuBLAS's own pick in the capture.
+        assert!(!captures_cold(true, false, true));
+        // The widest bucket and a verified arming always warm.
+        assert!(!captures_cold(false, false, false));
+        assert!(!captures_cold(true, true, false));
+    }
 }
