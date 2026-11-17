@@ -27,6 +27,21 @@ fn one_hot(width: usize, token: Option<u32>) -> Vec<f32> {
     row
 }
 
+/// The most steps a greedy lane's token loop runs past its row, decided at
+/// load: the config's `lookahead` (`stated`), else 32, where the program has
+/// a token loop (`WL`); 0 where it has none, and a lookahead stated for such
+/// a program is refused rather than every greedy lane at its fire.
+pub(super) fn lookahead_of(stated: Option<usize>, token_loop: bool) -> Result<usize, String> {
+    match (stated, token_loop) {
+        (Some(steps), false) if steps > 0 => Err(format!(
+            "lookahead = {steps}: the wafer program has no token loop (a WL build) to run it"
+        )),
+        (_, false) => Ok(0),
+        (Some(steps), true) => Ok(steps),
+        (None, true) => Ok(32),
+    }
+}
+
 /// The logits a lane of `n` rows asks the model for when `rows` are read:
 /// none, the last row's alone, or every row's.
 fn logits_wanted(rows: &[u32], n: usize) -> wafer::Logits {
@@ -130,7 +145,7 @@ impl Spatial {
         let last_only = rows.len() == 1 && rows[0] as usize + 1 == tokens.len();
         let lookahead = self.lookahead();
         let greedy = greedy && last_only && lookahead > 0;
-        let width = self.readout.as_ref().map_or(0, |(_, w)| *w as usize);
+        let width = self.readout()?.1 as usize;
         let fed: Vec<u32> = history.iter().chain(tokens).copied().collect();
         // The wafer program runs its token loops back to back: the next
         // is posted as one lands, so the wafer runs while rows are answered.
@@ -188,20 +203,12 @@ impl Spatial {
                     .max(ahead.map_or(0, |fires| (fires as usize).min(lookahead)));
                 c.next_loop
             };
-            // A loop runs no further than the lane's pages (debug `loop_room = false`: the
-            // lookahead alone): the rows past a sequence's end are waste.
+            // A loop runs no further than the lane's pages: the rows past a
+            // sequence's end are waste.
             let room = (pages.len() as u32 * self.kv.page_size)
                 .saturating_sub(start + tokens.len() as u32) as usize;
-            let bounded = !posting && self.debug.loop_room.unwrap_or(true) && !pages.is_empty();
+            let bounded = !posting && !pages.is_empty();
             let steps = if bounded { steps.min(room) } else { steps };
-            // With the prompt forced through the loop (debug `force_prompt`), the
-            // waited-for launch is the prompt alone: its first token right after the
-            // prefill, every later loop posted.
-            let steps = if posting && self.debug.force_prompt {
-                0
-            } else {
-                steps
-            };
             tracing::info!(
                 rows = tokens.len(),
                 steps,
@@ -245,10 +252,10 @@ impl Spatial {
         ))
     }
 
-    /// Whether greedy loops are posted back to back (debug `posted = false`: one
-    /// loop at a time).
+    /// Whether greedy loops are posted back to back: wherever a model with a
+    /// token loop is loaded.
     fn loop_posting(&self) -> bool {
-        self.model.is_some() && self.lookahead() > 0 && self.debug.posted.unwrap_or(true)
+        self.model.is_some() && self.lookahead() > 0
     }
 
     /// The posted loop's rows into the cache (waiting for it, or only if it
@@ -263,14 +270,18 @@ impl Spatial {
         self.loop_posted = None;
         let argmax = answer.map_err(Error::Device)?;
         let c = &mut self.kv.cached;
+        // Every change to the cache comes after the posted loop has landed
+        // (`forward` lands it first), and a loop answers its 1 + steps rows:
+        // a loop that lands anywhere else, or empty, means the host's account
+        // of the wafer's sequence and the wafer's own have parted.
         if c.tokens.len() != start || argmax.is_empty() {
-            // The cache moved on (it never does while a loop is out).
-            tracing::warn!(
-                start,
-                held = c.tokens.len(),
-                "spatial: a posted token loop dropped"
-            );
-            return Ok(());
+            return Err(Error::Device(format!(
+                "a posted token loop from position {start} landed on a cache of {} token(s) \
+                 with {} argmax: the host's account of the wafer's sequence has parted from \
+                 the wafer's",
+                c.tokens.len(),
+                argmax.len()
+            )));
         }
         c.tokens.push(token);
         c.tokens.extend_from_slice(&argmax[..argmax.len() - 1]);
@@ -295,11 +306,10 @@ impl Spatial {
         }
         let start = c.tokens.len();
         // A loop's rows come back when it ends: the request's last rows wait
-        // for its whole loop, so posted loops stay short (the config's
-        // `posted_loop`, else the program plan's loop).
-        let plan_loop = self.model()?.posted_loop;
+        // for its whole loop, so posted loops stay short (the program plan's
+        // loop).
+        let most = self.model()?.posted_loop;
         let c = &mut self.kv.cached;
-        let most = self.cfg.posted_loop.unwrap_or(plan_loop);
         c.next_loop = (c.next_loop.max(FIRST_LOOP) * 2)
             .min(lookahead)
             .min(most.max(1));
@@ -315,11 +325,22 @@ impl Spatial {
         Ok(())
     }
 
+    /// The loaded model's readout: the float output its readout rows read,
+    /// and its width (a load refuses a trace without one).
+    fn readout(&self) -> EngineResult<(String, u32)> {
+        self.readout
+            .clone()
+            .ok_or_else(|| Error::Load("the spatial engine has no model loaded".into()))
+    }
+
     /// The most steps a greedy lane's token loop runs past its row (0: none):
-    /// the config's `lookahead`, else 32 once a model is loaded.
+    /// as the load decided it ([`lookahead_of`]); 0 with no model loaded.
     pub(super) fn lookahead(&self) -> usize {
-        let default = if self.model.is_some() { 32 } else { 0 };
-        self.cfg.lookahead.unwrap_or(default)
+        if self.model.is_some() {
+            self.lookahead
+        } else {
+            0
+        }
     }
 
     /// Refuses a lane whose attention is not causal over its own history:
@@ -463,9 +484,7 @@ impl Spatial {
                 (0..a.lanes.max(1)).map(move |k| (a.lane as usize + k as usize, a.instance))
             })
             .collect();
-        let (name, width) = self.readout.clone().ok_or_else(|| {
-            Error::Load("the model reads no float output at its readout rows".into())
-        })?;
+        let (name, width) = self.readout()?;
         let mut logits: Vec<Vec<Vec<f32>>> = Vec::with_capacity(lanes.len());
         let mut read_rows: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
         // Lanes a token loop answered (their row a one-hot of the argmax).
@@ -622,10 +641,27 @@ mod tests {
         let dense = [true, true, true, false, true, true, true, true];
         assert_eq!(first_non_causal(None, Some((&dense, 4)), 10, 12, 2), None);
         let ahead = [true, true, true, true, true, true, true, true];
-        assert_eq!(first_non_causal(None, Some((&ahead, 4)), 10, 12, 2), Some(0));
+        assert_eq!(
+            first_non_causal(None, Some((&ahead, 4)), 10, 12, 2),
+            Some(0)
+        );
         // With no boundary the columns are slots, as before.
         let whole = Masking::Extent(Mask::new(vec![0, 14], 14));
         assert_eq!(first_non_causal(Some(&whole), None, 0, 12, 2), None);
+    }
+
+    /// Whether greedy lanes run the token loop is the load's decision: a
+    /// program without one runs none, and a lookahead stated for it is
+    /// refused at load, not at a greedy lane's fire.
+    #[test]
+    fn the_token_loop_is_decided_at_load() {
+        assert_eq!(lookahead_of(None, true), Ok(32));
+        assert_eq!(lookahead_of(Some(8), true), Ok(8));
+        assert_eq!(lookahead_of(Some(0), true), Ok(0));
+        assert_eq!(lookahead_of(None, false), Ok(0));
+        assert_eq!(lookahead_of(Some(0), false), Ok(0));
+        let refused = lookahead_of(Some(8), false).expect_err("no loop to run it");
+        assert!(refused.contains("no token loop"), "{refused}");
     }
 
     #[test]

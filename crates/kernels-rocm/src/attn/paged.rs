@@ -241,24 +241,26 @@ pub fn decode(
     // The matrix-core decode takes a group within one 16-column tile; a
     // wider group takes the vector decode.
     let blocks = (info.padded_batch_size as u32).saturating_mul(shape.num_kv_heads);
-    let (entry, threads) = if group <= 16 && shape.head_dim >= 512 {
-        // The widest heads split their columns over the wavefronts: a lane
-        // holding a 512-wide row's every column spills into scratch, which
-        // the HIP runtime allocates late and a load refuses.
-        (
-            format!(
-                "::pie::attn::paged_decode_cols<{}, {group}, {hnd}, {fp8}>",
-                shape.head_dim
-            ),
-            256,
-        )
-    } else if group <= 16 && shape.head_dim.is_multiple_of(32) {
-        // A group of eight or more weighs its values on the matrix core too
-        // (`PVM`), whose staged value rows hold four wavefronts' rounds at
-        // 256-wide heads.
-        let pvm = group >= 8 && shape.head_dim <= 256;
+    let (entry, threads) = if group <= 16 && shape.head_dim.is_multiple_of(32) {
+        // The values are weighed on the matrix core too (`PVM`) where a
+        // lane's vector form would cost more: its G·8 accumulators past the
+        // key row's D/32 raws and a round's value reads (D/8 VGPRs each),
+        // 32·G > D, where its G·D/8 FMAs a lane a round exceed the D/16
+        // MFMAs. At the boundary (32·G = D) the two tie and the keys decide
+        // (on an MI300X, D=128 at G=4 over 64 lanes: PVM 15-25% slower
+        // under 128 keys, 4-8% faster past 512), so the vector form keeps
+        // it; past it PVM wins at every length (D=64: 20-61% from G=4;
+        // D=128: 18-30% at G=8). And wherever the vector form's registers
+        // reach half a lane's 256, 8·G + D/4 >= 128, past which it spills
+        // into scratch (every 512-wide head, D=256 at G=8, 128 or 64 at
+        // G=16): there the matrix core's accumulator tiles sit in the
+        // AGPRs, the round's value rows staged in LDS a column half at a
+        // time past 256-wide heads.
+        let (g, d) = (group, shape.head_dim);
+        let pvm = 32 * g > d || 8 * g + d / 4 >= 128;
         // Eight wavefronts, or four (three or four blocks a CU, not one)
-        // once the grid is two blocks a CU.
+        // once the grid is two blocks a CU; four where the staged rows are
+        // 256 columns wide.
         let waves = if blocks >= 2 * plan.device.num_sm || (pvm && shape.head_dim > 128) {
             4
         } else {

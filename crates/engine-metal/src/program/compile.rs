@@ -282,6 +282,11 @@ pub struct Cache {
     programs: Bounded<u64, Compiled>,
     stages: Stages<Stage>,
     negative: Bounded<u64, String>,
+    /// Each region's module by its source text: a program whose
+    /// stages differ from a built one's (another binding, another request
+    /// shape) and whose regions read the same reuses them, as the runtime's
+    /// prewarm of its standard samplers counts on (regions keyed by text).
+    modules: std::collections::HashMap<u64, Arc<Module>>,
     stats: CacheStats,
 }
 
@@ -298,6 +303,7 @@ impl Cache {
             programs: Bounded::new(MAX_PROGRAM_ENTRIES),
             stages: Stages::new(MAX_STAGE_ENTRIES),
             negative: Bounded::new(MAX_NEGATIVE_ENTRIES),
+            modules: std::collections::HashMap::new(),
             stats: CacheStats::default(),
         }
     }
@@ -697,11 +703,21 @@ impl Cache {
         source: &str,
     ) -> std::result::Result<Arc<Module>, Failure> {
         let expanded = expand(source);
+        // Keyed by its text under one symbol (each program names its
+        // regions' entries after itself), as the runtime's prewarm test
+        // compares them; a module keeps its own pipeline, whatever it is
+        // named.
+        let key = eta_ir::fnv1a64(expanded.replace(entry, "ptir_region").as_bytes());
+        if let Some(module) = self.modules.get(&key) {
+            self.stats.memory_hits += 1;
+            return Ok(module.clone());
+        }
         #[cfg(target_vendor = "apple")]
         {
-            let module = Module::build(context.device(), &expanded, entry)?;
+            let module = Arc::new(Module::build(context.device(), &expanded, entry)?);
             self.stats.compilations += 1;
-            Ok(Arc::new(module))
+            self.modules.insert(key, module.clone());
+            Ok(module)
         }
         #[cfg(not(target_vendor = "apple"))]
         {

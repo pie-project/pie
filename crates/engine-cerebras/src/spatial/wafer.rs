@@ -72,21 +72,19 @@ pub struct Wafer {
     pub positions: usize,
     pub vocab: usize,
     pub hidden: usize,
-    /// The program's posted-loop length (its plan's; the config's `posted_loop` overrides it).
+    /// The program's posted-loop length (its plan's `LOOP`).
     pub posted_loop: usize,
 }
 
 impl Wafer {
     /// Loads the compiled `program` (its [`artifact`]) on `platform` through the SDK in
-    /// `sdk_lib`, places `weights` and returns once the model answers; `vocab`: the trace's;
-    /// `force_prompt`: the prompt through the token loop.
+    /// `sdk_lib`, places `weights` and returns once the model answers; `vocab`: the trace's.
     pub fn open(
         program: PathBuf,
         platform: Platform,
         vocab: usize,
         weights: artifact::Weights,
         sdk_lib: PathBuf,
-        force_prompt: bool,
     ) -> R<Wafer> {
         let art = artifact::read(&program)?;
         let posted_loop = art.host.loop_len as usize;
@@ -105,9 +103,7 @@ impl Wafer {
                     rt.load();
                     rt.run();
                     tracing::info!(s = t0.elapsed().as_secs_f64(), "artifact: program loaded");
-                    let mut m = ArtifactModel::open(Box::new(rt), &weights, &art, vocab)?;
-                    m.force = force_prompt;
-                    Ok(m)
+                    ArtifactModel::open(Box::new(rt), &weights, &art, vocab)
                 };
                 let mut m = match open() {
                     Ok(m) => {

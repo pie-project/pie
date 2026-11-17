@@ -97,8 +97,6 @@ pub struct ArtifactModel {
     eps: f32,
     /// `lgt`'s prescale (the plan's: the band head's 2^15 logits; 1 without one).
     lgt_scale: f32,
-    /// Prompt rows forced through the token loop (the debug `force_prompt`).
-    pub force: bool,
 }
 
 /// Where a token's embedding row comes from: the head's tiles (`hemb`, the head's layout:
@@ -148,7 +146,6 @@ impl ArtifactModel {
             embed,
             eps: model.eps,
             lgt_scale: model.logit_scale,
-            force: false,
             hl,
             dev,
         })
@@ -248,12 +245,6 @@ impl ArtifactModel {
 
     /// `tokens` at `start..` one pass a launch (no reads).
     fn feed(&mut self, tokens: &[u32], start: usize) -> R<()> {
-        if self.force && self.hl.token_loop && tokens.len() > 1 {
-            for (i, chunk) in tokens.chunks(self.cap).enumerate() {
-                self.forced(chunk, start + i * self.cap, 0, false)?;
-            }
-            return Ok(());
-        }
         for (i, &t) in tokens.iter().enumerate() {
             self.put_x(t)?;
             self.put_token(t)?;
@@ -261,33 +252,6 @@ impl ArtifactModel {
             self.fed.push(t);
         }
         Ok(())
-    }
-
-    /// `tokens` and `extra` passes past them in one launch
-    /// (the debug `force_prompt`, a build with the head's force table):
-    /// the first token's x from the host, then the root's winner at steps
-    /// s < n - 1 forced to `tokens[s + 1]` (the ring keeps the argmax). The
-    /// ring's first `n + extra` words when `read`.
-    fn forced(&mut self, tokens: &[u32], start: usize, extra: usize, read: bool) -> R<Vec<u32>> {
-        let n = tokens.len();
-        let root = rect(&floor::Rect::new(self.hl.root.x, self.hl.root.y, 1, 1));
-        self.put_x(tokens[0])?;
-        self.put_token(tokens[0])?;
-        if n > 1 {
-            self.dev.put("force", root, n - 1, &tokens[1..])?;
-            self.dev.put("nforce", root, 1, &[(n - 1) as u32])?;
-        }
-        self.launch(n + extra, start)?;
-        if n > 1 {
-            self.dev.put("nforce", root, 1, &[0])?;
-        }
-        self.fed.extend_from_slice(tokens);
-        if !read {
-            return Ok(Vec::new());
-        }
-        let ring = self.ring(n + extra)?;
-        self.fed.extend_from_slice(&ring[n - 1..n - 1 + extra]);
-        Ok(ring)
     }
 
     /// The ring's first `n` winners. An id past the vocabulary (a padded
@@ -318,16 +282,6 @@ impl ArtifactModel {
         let extra = extra
             .min(self.cap - 1)
             .min(self.positions.saturating_sub(start + n));
-        if self.force && n > 1 {
-            // the feed's head in whole launches, its tail and the loop one launch
-            let tail = n.min(self.cap - extra);
-            let head = n - tail;
-            self.feed(&tokens[..head], start)?;
-            let ring = self.forced(&tokens[head..], start + head, extra, true)?;
-            let mut out = vec![0u32; head];
-            out.extend(ring);
-            return Ok(out);
-        }
         self.feed(&tokens[..n - 1], start)?;
         let last = start + n - 1;
         self.put_x(tokens[n - 1])?;

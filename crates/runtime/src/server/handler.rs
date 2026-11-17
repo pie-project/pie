@@ -73,6 +73,16 @@ impl Session {
                         serde_json::Value::from(crate::engine::backend::eager_rungs()),
                     );
 
+                    // Fires whose geometry the host resolved though it is
+                    // not host-derivable: an engine limit or the program's
+                    // class, each named at bind.
+                    stats.insert(
+                        format!("{}.host_geometry_fires", model_name),
+                        serde_json::Value::from(
+                            crate::pipeline::fire::host_geometry::fires(),
+                        ),
+                    );
+
                     let inf = crate::scheduler::get_stats().await;
                     stats.insert(
                         format!("{}.total_batches", model_name),

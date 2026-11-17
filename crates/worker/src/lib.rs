@@ -20,6 +20,8 @@ mod server;
 pub use server::Server;
 
 #[cfg(feature = "net")]
+pub mod http;
+#[cfg(feature = "net")]
 mod link;
 
 pub use config::Config;

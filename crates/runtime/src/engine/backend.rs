@@ -51,6 +51,8 @@ pub struct EngineSpec {
     pub limits: SchedulerLimits,
     pub device_geometry_port_mask: PortMask,
     pub device_domain: MemoryDomain,
+    /// The engine's kind ([`::engine::Engine::kind`]), as bind names it.
+    pub kind: &'static str,
 }
 
 impl EngineSpec {
@@ -187,6 +189,7 @@ pub fn register_engine_backend(
     spec.device_domain = backend
         .device_facts()
         .map_or(MemoryDomain::HostPinned, |facts| facts.domain);
+    spec.kind = backend.kind();
     let live = backend.live();
     engines.push(Some(EngineRegistration {
         spec,
