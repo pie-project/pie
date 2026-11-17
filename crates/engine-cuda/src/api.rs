@@ -445,7 +445,7 @@ pub(crate) fn on_lattice(engine: &crate::chip::Engine, top: u32, tokens: u32) ->
 }
 
 /// The fire top of `trace` on this card (`engine::load::FireEstimate::top`):
-/// on its rung lattice as far as a `u32` of rows reaches, where a doubling
+/// on its rung lattice to `context` ([`probed_rows`]), where a doubling
 /// of the model's prompt stops raising its estimated tokens a ns by more
 /// than `profile::AGREEMENT`, by its profile's measured rates and each
 /// matmul padded to the tile cuBLASLt runs it on. Past it no rung's
@@ -455,6 +455,7 @@ pub(crate) fn on_lattice(engine: &crate::chip::Engine, top: u32, tokens: u32) ->
 pub(crate) fn fire_top_of(
     chip: &profile::Profile,
     trace: &Trace,
+    context: u32,
     device: &str,
 ) -> crate::error::Result<u32> {
     let counts = crate::top::counts(trace)?;
@@ -468,9 +469,15 @@ pub(crate) fn fire_top_of(
         )
     })?;
     estimate.rates = estimate.rates.with_row_tile(crate::top::row_tile(chip));
-    let mut lattice = rung_lattice(&crate::chip::Engine::of(chip), u32::MAX);
-    lattice.pop();
-    Ok(estimate.top(&lattice))
+    Ok(estimate.top(&probed_rows(&crate::chip::Engine::of(chip), context)))
+}
+
+/// The rows the fire top weighs: the rung lattice to `context`, the most
+/// tokens one prompt holds, so no rung is priced at rows no fire can carry
+/// (asked of cuBLASLt's heuristic at 2^30 rows, it divides by zero).
+#[must_use]
+pub(crate) fn probed_rows(engine: &crate::chip::Engine, context: u32) -> Vec<u32> {
+    rung_lattice(engine, context.max(1))
 }
 
 /// The load's budgets for `trace`: its logit readouts sized to what the
@@ -1963,5 +1970,19 @@ pub(crate) fn readout_facts() -> engine::ReadoutFacts {
     engine::ReadoutFacts {
         landing: engine::ReadoutLanding::InSpan,
         store_rows: None,
+    }
+}
+
+#[cfg(test)]
+mod probed_rows_tests {
+    #[test]
+    fn the_fire_top_weighs_no_rows_past_a_prompt() {
+        let engine = crate::chip::Engine::of(&crate::chip::profile(""));
+        for context in [1, 4096, 131_072] {
+            let rows = super::probed_rows(&engine, context);
+            assert_eq!(rows.last(), Some(&context), "{rows:?}");
+            assert!(rows.iter().all(|&m| m <= context));
+            assert!(rows.windows(2).all(|w| w[0] < w[1]));
+        }
     }
 }

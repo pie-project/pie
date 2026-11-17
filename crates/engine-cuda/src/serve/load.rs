@@ -87,7 +87,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // The model's fire top on this card (`crate::api::fire_top_of`): past it
     // no rung's efficiency improves, so none past it can be chosen. A load asked
     // nothing fires up to it, and the estimate picks below.
-    let fire_top = crate::api::fire_top_of(&chip, &boot.trace, device.name())?;
+    let fire_top = crate::api::fire_top_of(&chip, &boot.trace, boot.context, device.name())?;
     // A load that keeps every rung (a check of the estimate) lays them two
     // octaves past the top, so a top set too low shows in the check.
     let laid_top = if boot.knobs.every_rung {
