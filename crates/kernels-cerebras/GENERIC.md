@@ -3312,3 +3312,57 @@ origin's, all 201 files.
   passes the check. gpt-oss's 0.3835 ms partition at 2, 4 and 6 units does too: 545 x 435 to
   545 x 1,015, 0 errors and 0 warnings. That partition is past its PEs' memory (above), so it
   is a test of the router, not a program.
+
+### P1.c: stream units placed, and a link term to price them
+
+- **K / V columns placed apart from their units.** `KvColumn::at(root)` is a placer's root.
+  The column's PEs snake below that root as before. Its links to the block's units become
+  their two ends (`KvColumn::link`), and the router joins them.
+  - Where the layout states routes (`route::fill_layout`), any PE holds one route per colour
+    and an idle PE carries one without a kernel.
+  - `place::stream::stream(problem, stream, solution)` moves the units and K / V columns.
+    `kv_moved(program, dy)` moves every K / V column `dy` rows down. `write` writes a program
+    as `stream::compile` does.
+  - Only five places in `floorplan/stream.rs` changed:
+    - the field `KvColumn::at` (serialized only where set);
+    - its constructor;
+    - an early return in `KvColumn::root`;
+    - an early return in `KvColumn::link`;
+    - the `None` in `Stream::of`'s literal.
+
+    Every program built today is unchanged.
+- **The link term** (`place::cost::stream`). It is reported beside `cost::stream::time`, not
+  in it, at `HOP` = the stream regime's simulator-fitted `CHAIN_HOP` (2 cycles a hop).
+  - *The fill:* each gap of the row stream's longest wire, once a step.
+  - *The attention:* each attending unit's K / V round trip (KI + KO hops, its longest head),
+    once for every row the unit takes. The stream price says a row waits on what comes back
+    to its roots.
+  - *Congestion:* the edges more than one wire between blocks crosses are reported, not
+    priced.
+- **`place::pack_within(problem, w, h) -> Result<Solution, Miss>`** is a cheap fit test for a
+  search over co-resident readings' regimes and shapes. `Miss { dx, dy }` is the nearest
+  miss: the least overrun of the width with the height held, or of the height with the width
+  held. Its Display is "short N rows" or "short N columns".
+
+**The chip calibration** (request `p1cal_kv`, flux2-mini's denoise, 16 rows a class, the
+stream regime, M1j's inputs and CPU golden). Three programs differ only in where their 8
+K / V columns sit:
+
+| program | fabric | stream price | links | predicted step delta (per row) | if the round trips pipeline |
+|---|---|---|---|---|---|
+| kv0 (as laid) | 57 x 62 | 805,021 | 13,276 | 0 | 0 |
+| kv300 (300 rows down) | 57 x 362 | 805,021 | 166,876 | **+153,600** | +1,200 |
+| kv600 (600 rows down) | 57 x 662 | 805,021 | 320,476 | **+307,200** | +2,400 |
+
+All three are checked like this:
+- **Check:** 0 errors, and the same 400 warnings as the program as laid.
+- **Link:** for the system fabric (cslc 2.10.1, 762 x 1,172 at 4, 1): 179, 178 and 183 ELFs.
+- **Dry run:** the host's side (`wafer-bench --entries`) makes byte-identical entries for
+  the three.
+
+The run order is kv0, kv300, kv600, kv0 again, 3 steps each against the golden, with stamps.
+- **What it tells:** the measured step delta against the two predictions says whether a
+  row's K / V round trip is paid a row (the term as written) or hidden by the next rows'
+  (pipelined), and fits `HOP` either way.
+- **Before the run:** the chip measured M1j's step 1 at 1.25M cycles. A delta near +153k
+  cycles a step (+12%) at kv300 confirms the per-row reading at 2 cycles a hop.
