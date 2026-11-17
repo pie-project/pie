@@ -1094,6 +1094,28 @@ impl Pools {
         Ok((physical, index))
     }
 
+    /// PROBE: the delta table as the device holds it, against what it
+    /// should hold; `None` where it agrees (or there is none).
+    pub fn diag_check_deltas(&self) -> Option<String> {
+        let region = self.deltas.as_ref()?;
+        let want = self.pool.deltas();
+        let mut bytes = vec![0u8; want.len() * 8];
+        if let Err(why) = region.read(0, &mut bytes) {
+            return Some(format!("unreadable: {why}"));
+        }
+        let have: Vec<u64> = bytes
+            .chunks_exact(8)
+            .map(|word| u64::from_le_bytes(word.try_into().unwrap_or([0; 8])))
+            .collect();
+        (have != want).then(|| {
+            format!(
+                "the delta table holds {have:#x?}, the buffers' deltas are {want:#x?}; it lies in the tables run {:?} (chunk {} on)",
+                self.table_run,
+                self.layout.chunk_bytes
+            )
+        })
+    }
+
     /// PROBE: publishes the pool's GPU address ranges.
     pub fn diag_publish_parts(&self) {
         self.pool.diag_publish_parts();

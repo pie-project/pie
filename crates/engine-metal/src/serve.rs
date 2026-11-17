@@ -3048,6 +3048,14 @@ impl Shell {
         };
         let waited = flight.pending.wait();
         self.programs.probe_scan("harvest: frame landed");
+        {
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if let Some(why) = self.pools.diag_check_deltas()
+                && !SAID.swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                eprintln!("PROBE-DELTAS: at a frame's harvest: {why}");
+            }
+        }
         // Each attached instance's epilogue, settled once the buffer
         // completed: one that did not commit faults its own lanes alone,
         // and the rest of the step commits.
@@ -5641,6 +5649,14 @@ impl engine::frame::Shell for Shell {
     {
         let _ = prev;
         self.programs.probe_scan("prepare start");
+        {
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if let Some(why) = self.pools.diag_check_deltas()
+                && !SAID.swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                eprintln!("PROBE-DELTAS: at a fire's prepare start: {why}");
+            }
+        }
         let _ = crate::store::diag_fire_begin();
         self.pools.diag_publish_parts();
         self.admit_attachments(step.lanes, step.attachments)?;
