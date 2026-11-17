@@ -90,3 +90,23 @@ on the pool kind (`None` on a shared pool), and handle/snapshot stage by that sp
 shared pool's tier slots (sc/plex11-offload-staging). Once Cerebras states a single-shape shared pool, `with_pages`,
 `with_pool`'s pinned use, `host_pool`, `alloc_host_slots` and the split in handle/snapshot all delete, and every engine
 takes `shared_stores`.
+
+## F14 — The lane sampler's occupancy (sizing done on an MI300X, change parked)
+At 64 lanes the NucleusSample lane-sampler kernel (`sample_lane.cuh`, 512 threads, 124 VGPRs) takes ~274 µs a decode
+step on an MI300X (~8% of a Qwen3-0.6B 64-lane step), 128 µs at one lane (16 blocks), 133 µs at eight.
+- Why so few blocks a lane: `program/launch.rs` `lane_blocks = (units / filled).clamp(1, LANE_SAMPLER_BLOCKS = 16)`
+  assumes one block a CU, and a block's LDS is 60416 B, so an MI300X CU (64 KB) does hold one: 64 lanes get 4 each.
+- The LDS is two structures live for the whole kernel: `M1CutShared` (the exact cut, `fused_block0.cuh`, dynamic,
+  M1_CUT_STATE_BYTES 34816: chunk[2048] u64 16 KB + before[2048] f32 8 KB + weight 2 KB + least 1 KB + ties 4 KB +
+  gaps 2 KB) and `M1Fast` (the fast cut, 2048 buckets, ~22.5 KB). Two blocks a CU needs <= 32 KB: alias M1Fast into
+  M1CutShared (a lifetime audit: the fast cut's results feed the exact fallback, `tree_work = cut.before`) and halve
+  M1_CUT_CHUNK. Both touch the bitwise-exact sampler held to the interpreter (every_suite_step, a_nucleus_cut,
+  a_lane_sampler). Expected: 64 lanes at 9 blocks, ~274 -> ~180 µs, ~3% of the step; one lane gains nothing.
+- Why a lane's blocks must be co-resident: each block writes its partials (bucket counts, sums, minima) into its own
+  exchange half of the lane arena (`M1Lane::buffer`, M1_LANE_HALF 24 KiB a half, by parity) and spins on the lane's
+  arrival counter until every block has written, then reads all of them; a block not resident never arrives.
+- Unexplained: more than 16 blocks a lane deadlocks even a one-lane decode (LANE_SAMPLER_BLOCKS 64; 32 with
+  M1_LANE_ARENAS raised to 32 to match), so something past `starts` / `mains` is sized or indexed for 16. Find it
+  before any occupancy-derived `lane_blocks`; the clamp must then come from one bound `sample_lane.cuh` exports.
+- The 128 µs one-lane floor is the kernel's passes and barrier rounds, not its width: lowering it is a rework of the
+  passes, separate from occupancy.
