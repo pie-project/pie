@@ -242,17 +242,20 @@ pub fn decode(
     // wider group takes the vector decode.
     let blocks = (info.padded_batch_size as u32).saturating_mul(shape.num_kv_heads);
     let (entry, threads) = if group <= 16 && shape.head_dim.is_multiple_of(32) {
-        // A group of eight or more weighs its values on the matrix core too
-        // (`PVM`), whose staged value rows hold four wavefronts' rounds at
-        // 256-wide heads.
-        // At 512-wide heads every group does: a lane's 512 columns of
-        // vector accumulators, its key row and its value reads spill past
-        // the registers into scratch, while the matrix core's accumulator
-        // tiles sit in the AGPRs and the round's value rows stage in LDS a
-        // column half at a time (on an MI300X, gemma4-e4b's 8/2 heads decode
-        // level with the spilling vector kernel at 1-8 lanes and 7-16%
-        // faster past 2048 keys; 32/4 heads 30-50% faster).
-        let pvm = (group >= 8 && shape.head_dim <= 256) || shape.head_dim >= 512;
+        // The values are weighed on the matrix core too (`PVM`) where a
+        // lane's vector form would cost more: its G·8 accumulators at least
+        // the key row's D/32 raws and a round's value reads (D/8 VGPRs
+        // each), 32·G >= D, past which its G·D/8 FMAs a lane a round exceed
+        // the D/16 MFMAs (on an MI300X: D=64 level at G=1, 0-37% faster from
+        // G=2; D=128 level at G=2, 4-8% faster at G=4, 15-24% at G=8; D=256
+        // 5-31% slower at G=2, 0-14% at G=4). And wherever the vector form's
+        // registers reach half a lane's 256, 8·G + D/4 >= 128, past which
+        // it spills into scratch (every 512-wide head, D=256 at G=8, 128 or
+        // 64 at G=16): there the matrix core's accumulator tiles sit in the
+        // AGPRs, the round's value rows staged in LDS a column half at a
+        // time past 256-wide heads.
+        let (g, d) = (group, shape.head_dim);
+        let pvm = 32 * g >= d || 8 * g + d / 4 >= 128;
         // Eight wavefronts, or four (three or four blocks a CU, not one)
         // once the grid is two blocks a CU; four where the staged rows are
         // 256 columns wide.
