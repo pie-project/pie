@@ -47,6 +47,8 @@ struct Acted {
     moves: HashSet<(u64, WorkerId)>,
     /// Copies asked of workers, and when.
     asked: HashMap<(String, WorkerId, bool), Instant>,
+    /// The helpers each running process was last given.
+    helpers: HashMap<u64, Vec<WorkerId>>,
 }
 
 struct Shared {
@@ -387,12 +389,12 @@ impl Cluster {
     }
 
     pub fn dispatched(&self, req: &Request, worker: WorkerId) {
-        self.shared
-            .acted
-            .lock()
-            .unwrap()
-            .running
-            .insert(req.req_id.0, worker);
+        let (_, _, helpers) = self.placement(req);
+        {
+            let mut acted = self.shared.acted.lock().unwrap();
+            acted.running.insert(req.req_id.0, worker);
+            acted.helpers.insert(req.req_id.0, helpers);
+        }
         move_misplaced(&self.shared);
         self.send(ProcessEvent::Dispatched {
             req: req.req_id.0,
@@ -449,6 +451,7 @@ impl Cluster {
         {
             let mut acted = self.shared.acted.lock().unwrap();
             acted.running.remove(&id);
+            acted.helpers.remove(&id);
             acted.cancelled.remove(&id);
             acted.moves.retain(|(of, _)| *of != id);
         }
@@ -480,6 +483,7 @@ fn apply(shared: &Shared, view: GatewayDecisions, fleet: &crate::worker::WorkerR
         }
     }
     carry(&mut acted.asked, view.replicate, fleet);
+    retell_helpers(shared, &mut acted, fleet);
     drop(acted);
     move_misplaced(shared);
     shared.heard.send_replace(view.heard);
@@ -510,6 +514,37 @@ fn move_misplaced(shared: &Shared) {
 
 /// Asks each worker for the copies `orders` names, again after
 /// [`REPLICATE_RETRY`] while the order stands.
+/// A running process whose `placement/helpers` changed hears its new list
+/// on its worker.
+fn retell_helpers(shared: &Shared, acted: &mut Acted, fleet: &crate::worker::WorkerRegistry) {
+    let decided = shared.decided.read().unwrap();
+    let Acted {
+        running, helpers, ..
+    } = acted;
+    for (&id, &worker) in running.iter() {
+        let want = decided
+            .placements
+            .get(&id)
+            .map(|p| p.executors.clone())
+            .unwrap_or_default();
+        if helpers.get(&id) == Some(&want) {
+            continue;
+        }
+        helpers.insert(id, want.clone());
+        let Some(client) = fleet.client(worker) else {
+            continue;
+        };
+        tokio::spawn(async move {
+            if let Err(error) = client
+                .set_executors(tarpc::context::current(), ReqId(id), want)
+                .await
+            {
+                tracing::warn!(req = id, %worker, %error, "new helpers not delivered");
+            }
+        });
+    }
+}
+
 fn carry(
     asked: &mut HashMap<(String, WorkerId, bool), Instant>,
     orders: Vec<ReplicateOrder>,

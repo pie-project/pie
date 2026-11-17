@@ -268,7 +268,8 @@ pub struct PlacementView {
     pub workers: Option<Vec<WorkerId>>,
     /// Passed on with the process: the worker plane reads `cluster/<name>`.
     pub props: JsonProps,
-    /// Workers its passes may run on, best first.
+    /// `placement/helpers`: the workers its prefill passes may run on, best
+    /// first. Empty, or no row: the worker's own configuration decides.
     pub executors: Vec<WorkerId>,
 }
 

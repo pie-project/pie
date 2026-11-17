@@ -27,8 +27,9 @@ use plex_host::runtime::wit::Tier;
 use plex_host::tables::{self, Refusal, Subject, Value};
 use tokio::sync::watch;
 
-/// The columns a cluster of pie gateways enacts.
-const SUPPORTED: &[&str] = &[tables::PLACEMENT_WORKERS];
+/// The columns a cluster of pie gateways enacts. Every worker that links to
+/// a controller can reach its peers, so helpers are always enactable.
+const SUPPORTED: &[&str] = &[tables::PLACEMENT_WORKERS, tables::PLACEMENT_HELPERS];
 
 /// How often the policies hear what the directory and the routing table
 /// hold.
@@ -98,6 +99,10 @@ struct Tables {
     workers: HashMap<String, Vec<WorkerId>>,
     /// The column's default, if a policy set one.
     workers_default: Option<Vec<WorkerId>>,
+    /// `placement/helpers` rows: the workers a process's prefill may run
+    /// on, best first.
+    helpers: HashMap<String, Vec<WorkerId>>,
+    helpers_default: Option<Vec<WorkerId>>,
     /// Notes on a process, passed on with it: the worker plane reads them
     /// as `cluster/note/<writer>/<name>`.
     notes: HashMap<String, BTreeMap<String, String>>,
@@ -277,6 +282,23 @@ fn decisions_of(shared: &Shared, gateway: GatewayId) -> GatewayDecisions {
     for (id, workers) in &tables.workers {
         if let Some(req) = mine(id) {
             placements.entry(req).or_default().workers = Some(workers.clone());
+        }
+    }
+    if let Some(default) = &tables.helpers_default {
+        for &req in shared
+            .live
+            .lock()
+            .unwrap()
+            .get(&gateway)
+            .into_iter()
+            .flatten()
+        {
+            placements.entry(req).or_default().executors = default.clone();
+        }
+    }
+    for (id, helpers) in &tables.helpers {
+        if let Some(req) = mine(id) {
+            placements.entry(req).or_default().executors = helpers.clone();
         }
     }
     for (id, notes) in &tables.notes {
@@ -645,6 +667,19 @@ impl Port {
         }
         if let Some(default) = delta.placement_workers.default {
             tables.workers_default = default.map(parse);
+        }
+        for (id, row) in delta.placement_helpers.rows {
+            match row {
+                Some(list) => {
+                    tables.helpers.insert(id, parse(list));
+                }
+                None => {
+                    tables.helpers.remove(&id);
+                }
+            }
+        }
+        if let Some(default) = delta.placement_helpers.default {
+            tables.helpers_default = default.map(parse);
         }
         for (writer, subject, name, value) in delta.notes {
             tracing::debug!(%writer, subject = %format!("{}/{}", subject.kind(), subject.id()), %name, ?value, "cluster policy note");
