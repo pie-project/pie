@@ -225,7 +225,7 @@ impl<B: Host> Gpu<B> {
                     frame: *frame,
                     step: step as u32,
                 };
-                (sink)(at, engine::StepOutcome::Wrote(wrote));
+                (sink)(at, engine::StepOutcome::wrote(wrote));
             }
         }
     }
@@ -998,12 +998,14 @@ fn second_mover<B: Host>(programs: &B::Programs, step: &Step) -> Option<(Channel
 
 impl<B: Host> Gpu<B> {
     /// Fires `submission`'s forward; with `defers` its completion is left
-    /// for the guest pass behind it to report.
+    /// for the guest pass behind it to report. With `meet`, its landing
+    /// waits there for the guest passes the host runs behind it.
     pub fn fire_step(
         &mut self,
         submission: &Step,
         at: engine::StepDone,
         defers: bool,
+        meet: Option<crate::settle::Meet>,
     ) -> EngineResult<(FireTicket, PendingStep)> {
         debug_assert_eq!(
             second_mover::<B>(&self.programs, submission),
@@ -1286,6 +1288,8 @@ impl<B: Host> Gpu<B> {
                 at,
                 sink,
                 wrote: Vec::new(),
+                lanes: u32::try_from(submission.lanes.len()).unwrap_or(u32::MAX),
+                meet,
             });
             let mut prepared = FrameShell::prepare(
                 shell,

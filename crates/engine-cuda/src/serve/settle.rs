@@ -140,9 +140,9 @@ impl Shell {
         let posted = self.device.host_fn(Box::new(move || {
             // Read before the event goes back: its tap is the next step's then.
             let outcome = if reports.is_empty() {
-                engine::StepOutcome::Committed
+                engine::StepOutcome::committed()
             } else {
-                engine::StepOutcome::Wrote(written(reports, tap))
+                engine::StepOutcome::wrote(written(reports, tap))
             };
             drop(slot);
             recycler.give(at);

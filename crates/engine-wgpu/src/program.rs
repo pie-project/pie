@@ -187,12 +187,22 @@ pub struct Guests {
 struct Attached {
     lane: u32,
     lanes: usize,
+    instance: InstanceId,
     half: Arc<std::sync::Mutex<Half>>,
     held: Held,
 }
 
+/// An attachment's guest pass that faulted: its lanes, its instance, and why.
 #[cfg(feature = "wgpu")]
-pub(crate) type Job = Box<dyn FnOnce() -> Result<(), Refusal> + Send + 'static>;
+#[derive(Debug)]
+pub(crate) struct Faulted {
+    pub lanes: std::ops::Range<u32>,
+    pub instance: InstanceId,
+    pub refusal: Refusal,
+}
+
+#[cfg(feature = "wgpu")]
+pub(crate) type Job = Box<dyn FnOnce() -> Result<(), Faulted> + Send + 'static>;
 
 #[cfg(feature = "wgpu")]
 impl Guests {
@@ -215,6 +225,7 @@ impl Guests {
                 |Attached {
                      lane,
                      lanes,
+                     instance,
                      half,
                      held,
                  }| {
@@ -270,15 +281,22 @@ impl Guests {
                                 seats
                             })
                             .collect();
-                        half.lock().expect("half lock poisoned").fire(
-                            &device,
-                            &widen,
-                            &tally,
-                            Pass {
-                                seats,
-                                at: Stage::Epilogue,
-                            },
-                        )
+                        half.lock()
+                            .expect("half lock poisoned")
+                            .fire(
+                                &device,
+                                &widen,
+                                &tally,
+                                Pass {
+                                    seats,
+                                    at: Stage::Epilogue,
+                                },
+                            )
+                            .map_err(|refusal| Faulted {
+                                lanes: lane..lane + lanes as u32,
+                                instance,
+                                refusal,
+                            })
                     });
                     job
                 },
@@ -843,6 +861,7 @@ impl Plane {
             attached.push(Attached {
                 lane,
                 lanes: (lanes as usize).max(1),
+                instance,
                 half: Arc::clone(&seat.half),
                 held: seat.gate.enter(),
             });

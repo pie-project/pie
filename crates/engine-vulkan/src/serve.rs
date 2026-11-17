@@ -218,14 +218,7 @@ impl Serve for Api {
                     .replay(Some(Box::new(move |refused: Option<String>| {
                         counts.leave();
                         if let Some(done) = done.as_ref() {
-                            let outcome = match &refused {
-                                None => done.settled(),
-                                Some(why) => engine::StepOutcome::Faulted(format!(
-                                    "vulkan replay for frame {} step {}: {why}",
-                                    done.at.frame, done.at.step
-                                )),
-                            };
-                            (done.sink)(done.at, outcome);
+                            done.tell(refused, "vulkan replay");
                         }
                     })))
             });
@@ -282,14 +275,7 @@ impl Serve for Api {
             Box::new(move |refused: Option<String>| {
                 counts.leave();
                 if let Some(done) = done.as_ref() {
-                    let outcome = match &refused {
-                        None => done.settled(),
-                        Some(why) => engine::StepOutcome::Faulted(format!(
-                            "vulkan command buffer for frame {} step {}: {why}",
-                            done.at.frame, done.at.step
-                        )),
-                    };
-                    (done.sink)(done.at, outcome);
+                    done.tell(refused, "vulkan command buffer");
                 }
             });
         match keep {

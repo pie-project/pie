@@ -419,9 +419,7 @@ fn a_kv_only_device_fold_reports_its_count() {
     let heard: std::sync::Arc<std::sync::Mutex<Vec<engine::KvWrites>>> = Default::default();
     let into = std::sync::Arc::clone(&heard);
     model.engine.on_complete(std::sync::Arc::new(move |_, outcome| {
-        if let engine::StepOutcome::Wrote(writes) = outcome {
-            into.lock().expect("heard").extend(writes);
-        }
+        into.lock().expect("heard").extend(outcome.wrote);
     }));
     let mut seq = Seq::new(0);
     let mut lane = |model: &Model, refs: &mut Refs, seed: u64, tag: u64| {

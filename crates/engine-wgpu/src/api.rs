@@ -66,7 +66,7 @@ impl Host for Api {
         step: &Step,
         at: engine::StepDone,
     ) -> EngineResult<(FireTicket, PendingStep)> {
-        gpu.fire_step(step, at, false)
+        gpu.fire_step(step, at, false, None)
     }
 
     fn submitted(_gpu: &Wgpu) {}
