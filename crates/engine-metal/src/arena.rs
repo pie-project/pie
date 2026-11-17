@@ -60,7 +60,11 @@ pub fn io_room((inputs, readout): (u64, u64)) -> u64 {
 
 /// The span's chunks of `chunk_bytes` each rung takes: the `scratch` plane,
 /// `arms` frames' staged regions `io`, its rs scratch `rs` and its carve,
-/// `(tokens, chunks)` ascending.
+/// `(tokens, chunks)` ascending. A rung's span holds every narrower rung's
+/// (the spans nest from the range's top), so its chunks are the most any
+/// rung up to it takes: an arena map is not monotone in rows (Qwen3-14B's
+/// 8192-token carve packs 98 MB under its 4096-token one), and a fire at a
+/// rung touches only its own map, inside that span.
 #[must_use]
 pub fn act_chunks(
     rungs: &[(u32, ArenaMap)],
@@ -70,16 +74,16 @@ pub fn act_chunks(
     arms: u64,
     chunk_bytes: u64,
 ) -> Vec<(u32, u32)> {
+    let mut most = 0u32;
     rungs
         .iter()
         .zip(io)
         .zip(rs)
         .map(|(((tokens, map), &io), &rs)| {
             let bytes = room(scratch) + arms * io_room(io) + room(rs) + room(map.bytes);
-            (
-                *tokens,
-                u32::try_from(bytes.div_ceil(chunk_bytes.max(1))).unwrap_or(u32::MAX),
-            )
+            let chunks = u32::try_from(bytes.div_ceil(chunk_bytes.max(1))).unwrap_or(u32::MAX);
+            most = most.max(chunks);
+            (*tokens, most)
         })
         .collect()
 }
@@ -343,4 +347,41 @@ pub fn capacities(map: &ArenaMap) -> Vec<u32> {
             u32::try_from(bytes / row).unwrap_or(u32::MAX)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn carve(bytes: u64) -> ArenaMap {
+        ArenaMap {
+            placements: Vec::new(),
+            spans: Vec::new(),
+            live_in: Vec::new(),
+            bytes,
+        }
+    }
+
+    /// Qwen3-14B's rungs on an M5 Pro (chunk 2688000, two frames): the
+    /// 8192-token carve packs under the 4096-token one. Each rung states the
+    /// most any rung up to it takes, so the spans ascend and nest, and a
+    /// rung whose own carve is smaller keeps the larger span below it.
+    #[test]
+    fn a_rung_states_the_most_any_rung_up_to_it_takes() {
+        let rungs = vec![
+            (4096, carve(8_000_503_808)),
+            (8192, carve(7_902_068_736)),
+            (10240, carve(8_199_864_320)),
+        ];
+        let io = [(173_801_472, 0), (190_775_296, 0), (199_294_976, 0)];
+        let chunks = act_chunks(&rungs, 0, &io, &[0, 0, 0], 2, 2_688_000);
+        let own = |at: usize| {
+            (room(rungs[at].1.bytes) + 2 * io_room(io[at])).div_ceil(2_688_000) as u32
+        };
+        assert!(own(1) < own(0), "the 8192 rung's own span is the smaller");
+        assert_eq!(chunks[0], (4096, own(0)));
+        assert_eq!(chunks[1], (8192, own(0)), "it keeps the 4096 rung's span");
+        assert_eq!(chunks[2], (10240, own(2)));
+        assert!(chunks.windows(2).all(|pair| pair[0].0 < pair[1].0 && pair[0].1 <= pair[1].1));
+    }
 }
