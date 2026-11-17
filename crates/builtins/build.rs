@@ -39,6 +39,7 @@ fn main() {
     for dep in [
         "crates/inferlet/src",
         "crates/inferlet/wit",
+        "crates/client-api/src",
         "crates/inferlet-macros/src",
         "crates/eta-dsl/src",
         "crates/policy/src",

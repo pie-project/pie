@@ -37,6 +37,19 @@ pub const PROMPT: &str = "prompt";
 /// before the process is admitted.
 pub const RAW_PROMPT: &str = "raw-prompt";
 
+/// The tokens a raw prompt runs as: the model's prefix (a chat render's
+/// BOS), then the text's own, unless the text already spells the prefix (as
+/// vLLM and SGLang read it). One rule, for the compat inferlet that runs the
+/// prompt and the runtime that looks it up while it waits.
+#[must_use]
+pub fn raw_prompt_tokens(prefix: Vec<u32>, body: Vec<u32>) -> Vec<u32> {
+    if body.starts_with(&prefix) {
+        body
+    } else {
+        [prefix, body].concat()
+    }
+}
+
 /// The prompt's token ids (an array of integers), as a program that has them
 /// states them at launch: the runtime looks their prefix up in the cache
 /// before the process is admitted.
@@ -512,5 +525,12 @@ mod tests {
             assert!(props.is_empty());
             assert_eq!(session.as_deref(), Some("conv-1"));
         }
+    }
+
+    #[test]
+    fn a_raw_prompt_gets_the_prefix_once() {
+        assert_eq!(raw_prompt_tokens(vec![1], vec![5, 6]), vec![1, 5, 6]);
+        assert_eq!(raw_prompt_tokens(vec![1], vec![1, 5, 6]), vec![1, 5, 6]);
+        assert_eq!(raw_prompt_tokens(Vec::new(), vec![5]), vec![5]);
     }
 }

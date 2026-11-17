@@ -38,15 +38,10 @@ pub(crate) fn prompt_tokens(props: &Props) -> Option<Vec<u32>> {
     }
     let raw = props.get(props::RAW_PROMPT)?.as_str()?;
     let model = crate::model::model();
-    let body = model.tokenize(raw);
-    // As the compat inferlet builds a raw prompt: the model's prefix first,
-    // unless the text already spells it.
-    let prefix = model.instruct().prefix();
-    Some(if body.starts_with(&prefix) {
-        body
-    } else {
-        [prefix, body].concat()
-    })
+    Some(props::raw_prompt_tokens(
+        model.instruct().prefix(),
+        model.tokenize(raw),
+    ))
 }
 
 /// Each engine's page keys for `tokens`: whole pages from row 0, hashed
