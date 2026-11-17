@@ -1086,6 +1086,169 @@ mod tests {
             "no Apple Silicon GPU has fewer than 7 cores: {cores}"
         );
     }
+
+    /// A probe, run on demand: where the device refuses residency. Private
+    /// buffers of `PIE_PROBE_STEP_MB` (256) are added one at a time; after
+    /// each, one command buffer fills every buffer (all resident at once),
+    /// and the step logs what this process holds (`currentAllocatedSize`),
+    /// the machine's wired pages and Metal's recommended working set, until
+    /// the driver refuses a command buffer. With `PIE_PROBE_HOLD_GB` set,
+    /// it holds that many GB resident instead and waits (the "others"
+    /// another process runs it as).
+    #[test]
+    #[ignore = "a probe: grows until the device refuses residency"]
+    #[cfg(target_vendor = "apple")]
+    fn where_the_device_refuses_residency() {
+        use objc2_metal::{MTLBlitCommandEncoder as _, MTLBuffer as _, MTLCommandBuffer as _, MTLCommandEncoder as _, MTLCommandQueue as _, MTLDevice as _, MTLResidencySet as _};
+        let ctx = super::Context::bind().expect("a device");
+        let mb = 1u64 << 20;
+        let step = std::env::var("PIE_PROBE_STEP_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(256)
+            * mb;
+        let hold = std::env::var("PIE_PROBE_HOLD_GB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok());
+        let wired = || super::super::wirable::os_memory().map_or(0, |os| os.wired);
+        let mut buffers = Vec::new();
+        let target = hold.map_or(u64::MAX, |gb| gb << 30);
+        let fill = |buffers: &Vec<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>| -> Option<String> {
+            let command = ctx.queue.commandBuffer().expect("a command buffer");
+            let blit = command.blitCommandEncoder().expect("a blit encoder");
+            for buffer in buffers {
+                blit.fillBuffer_range_value(buffer, objc2_foundation::NSRange::new(0, buffer.length()), 1);
+            }
+            blit.endEncoding();
+            command.commit();
+            command.waitUntilCompleted();
+            command.error().map(|error| error.localizedDescription().to_string())
+        };
+        eprintln!(
+            "probe: recommended {} wired at start {} step {}",
+            ctx.working_set(),
+            wired(),
+            step
+        );
+        // A file's pages wrapped without a copy, as the serving file's
+        // weights are (`Context::no_copy`), filled with the rest each step.
+        let mut _mapping = None;
+        if let Some(mb_wrapped) = std::env::var("PIE_PROBE_NOCOPY_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            use std::os::fd::AsRawFd as _;
+            let len = mb_wrapped * mb;
+            let path = std::env::temp_dir().join(format!("pie-probe-nocopy-{}", std::process::id()));
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .expect("the probe's file");
+            file.set_len(len).expect("the file's length");
+            // SAFETY: a fresh shared mapping of the whole file, kept alive
+            // (with the file) for the probe's length.
+            let at = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len as usize,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    file.as_raw_fd(),
+                    0,
+                )
+            };
+            assert_ne!(at, libc::MAP_FAILED, "the file maps");
+            let _ = std::fs::remove_file(&path);
+            // SAFETY: the mapping is page aligned, `len` bytes, and outlives
+            // the buffer (both live to the probe's end).
+            let wrapped = unsafe {
+                ctx.no_copy(std::ptr::NonNull::new(at.cast::<u8>()).expect("mapped"), len as usize)
+            }
+            .expect("the wrap");
+            buffers.push(wrapped);
+            _mapping = Some(file);
+            eprintln!(
+                "probe: wrapped {len} file bytes without a copy; held {} wired {}",
+                ctx.allocated(),
+                wired()
+            );
+        }
+        // The pool's way instead: one placement sparse buffer, its tiles
+        // mapped from heaps a step at a time (the residency set the frame
+        // queue carries holds the heaps), every mapped byte filled each step.
+        if std::env::var_os("PIE_PROBE_SPARSE").is_some() {
+            let sparse = ctx.sparse().expect("a Metal 4 device");
+            let arena = super::super::elastic::Arena::new(u64::MAX / 2);
+            let mut elastic = super::super::elastic::create(&sparse, &arena, 30 << 30).expect("a sparse buffer");
+            for n in 1u64.. {
+                let bytes = n * step;
+                if let Err(fault) = super::super::elastic::grow_all(&mut [super::super::elastic::Target {
+                    buffer: &mut elastic,
+                    bytes,
+                }]) {
+                    eprintln!("probe: sparse grow to {bytes} refused: {fault}");
+                    return;
+                }
+                let command = ctx.queue.commandBuffer().expect("a command buffer");
+                let blit = command.blitCommandEncoder().expect("a blit encoder");
+                blit.fillBuffer_range_value(elastic.buffer(), objc2_foundation::NSRange::new(0, bytes as usize), 1);
+                blit.endEncoding();
+                command.commit();
+                command.waitUntilCompleted();
+                let refused = command.error().map(|error| error.localizedDescription().to_string());
+                eprintln!(
+                    "probe: sparse mapped {bytes} held {} elastic {} residency {} wired {} recommended {} {}",
+                    ctx.allocated(),
+                    elastic.held(),
+                    sparse.residency().allocatedSize(),
+                    wired(),
+                    ctx.working_set(),
+                    refused.as_deref().unwrap_or("ok")
+                );
+                if refused.is_some() {
+                    return;
+                }
+            }
+        }
+        loop {
+            let held_now = buffers.len() as u64 * step;
+            if held_now >= target {
+                break;
+            }
+            let Some(buffer) = ctx
+                .device()
+                .newBufferWithLength_options(step as usize, objc2_metal::MTLResourceOptions::StorageModePrivate)
+            else {
+                eprintln!("probe: no buffer at {} buffers", buffers.len());
+                break;
+            };
+            buffers.push(buffer);
+            let refused = fill(&buffers);
+            eprintln!(
+                "probe: buffers {} held {} wired {} recommended {} {}",
+                buffers.len(),
+                ctx.allocated(),
+                wired(),
+                ctx.working_set(),
+                refused.as_deref().unwrap_or("ok")
+            );
+            if refused.is_some() {
+                return;
+            }
+        }
+        if hold.is_some() {
+            eprintln!("probe: holding {} resident; wired {}", ctx.allocated(), wired());
+            loop {
+                if let Some(refused) = fill(&buffers) {
+                    eprintln!("probe: the hold's own fill refused: {refused}");
+                }
+                std::thread::sleep(std::time::Duration::from_secs(5));
+            }
+        }
+    }
 }
 
 /// Declares `slabs` read and written through addresses in `encoder`'s
