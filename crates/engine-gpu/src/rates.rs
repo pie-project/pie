@@ -4,8 +4,9 @@
 //! browser's load (its adapter is masked, so no profile states its rates)
 //! and `pie tune --rates` natively.
 //!
-//! Each kind of work is timed inside a frame: [`REPEATS`] of it back to back
-//! against one, the median of [`ROUNDS`] after a warm frame (which builds
+//! Each kind of work is timed inside a frame: `n` of it back to back
+//! against one (`n` doubled until a fire's time settles,
+//! `engine::rates::timed_frames`), the median of [`ROUNDS`] after a warm frame (which builds
 //! its pipelines), so the frame's one submit and wait cancel and what is
 //! left is the work's own time beside a dispatch's:
 //! - the backend's own bf16 matmul at each of `engine::rates::GEMM_SHAPES`,
@@ -52,9 +53,6 @@ pub const COPY_BYTES: u64 = 256 << 20;
 /// The matmul a launch is timed with: its work is nothing beside a launch.
 pub const LAUNCH: u32 = 16;
 
-/// The fires a timed frame carries back to back, against a frame of one.
-pub const REPEATS: u32 = 16;
-
 /// Timed frames of each kind; the median is kept.
 pub const ROUNDS: usize = 5;
 
@@ -86,19 +84,23 @@ struct Rig<'a, B: Serve> {
     held: Vec<B::Buffer>,
     /// `engine::rates::operand_pattern`, made once.
     pattern: Option<Vec<u8>>,
-    /// The longest one timed frame may run (`engine::rates::frame_budget`).
-    budget: std::time::Duration,
+    /// The device's bound on one submission, where it states one: the only
+    /// cap on a timed frame (`engine::rates::timed_frames`).
+    max_submit: Option<std::time::Duration>,
+    /// A frame stopped at `max_submit` before it settled.
+    unsettled: std::cell::Cell<bool>,
 }
 
 impl<'a, B: Serve> Rig<'a, B> {
-    fn new(device: &'a B::Context, budget: std::time::Duration) -> Self {
+    fn new(device: &'a B::Context, max_submit: Option<std::time::Duration>) -> Self {
         Rig {
             device,
             handles: Handles::<B>::new(),
             pipelines: B::Pipelines::default(),
             held: Vec::new(),
             pattern: None,
-            budget,
+            max_submit,
+            unsettled: std::cell::Cell::new(false),
         }
     }
 
@@ -171,10 +173,10 @@ impl<'a, B: Serve> Rig<'a, B> {
         timer(f)
     }
 
-    /// One `fire`'s time inside a frame: as many of it as the frame budget
-    /// holds (at most [`REPEATS`], `engine::rates::fires_in`) against one,
-    /// the host's clock around each frame's one submit; a fire past half the
-    /// budget is its frame of one alone, no frame running two.
+    /// One `fire`'s time inside a frame: a frame of `n` of it against one,
+    /// `n` doubled until a fire's time settles (`engine::rates::timed_frames`,
+    /// every engine's rule; the device's `max_submit` the only cap), the
+    /// host's clock around each frame's one submit.
     fn each(
         &self,
         timer: Timer<'_, B>,
@@ -188,8 +190,17 @@ impl<'a, B: Serve> Rig<'a, B> {
             Ok(median(walls))
         };
         self.frame(timer, 1, fire, &nothing)?;
+        let frames = engine::rates::timed_frames(
+            self.max_submit,
+            None,
+            |n| self.frame(timer, n, fire, &nothing).map(|(_, w)| w as f64),
+            |why| Fault::Device { call: "rates", why },
+        )?;
+        if frames.capped {
+            self.unsettled.set(true);
+        }
+        let count = frames.fires;
         let one = wall(1)?;
-        let count = engine::rates::fires_in(self.budget, one as f64, REPEATS);
         if count < 2 {
             return Ok(one);
         }
@@ -214,15 +225,16 @@ pub fn machine() -> engine::roofline::Machine {
 }
 
 /// The rates of `device`, its kernels under the tactics `tactics` picks at
-/// `tier`, no timed frame past `budget` (`engine::rates::frame_budget`).
+/// `tier`, no timed frame past `max_submit` where the device states one
+/// (`engine::rates::timed_frames`).
 pub fn measure<B: Serve, T: Tactics + ?Sized>(
     device: &B::Context,
     tactics: &T,
     tier: kernels_slang::Tier,
     timer: Timer<'_, B>,
-    budget: std::time::Duration,
-) -> Result<Rates> {
-    measure_saying::<B, T>(device, tactics, tier, timer, budget, &mut |_| {})
+    max_submit: Option<std::time::Duration>,
+) -> Result<engine::rates::Measured> {
+    measure_saying::<B, T>(device, tactics, tier, timer, max_submit, &mut |_| {})
 }
 
 /// [`measure`], saying how the warm-up ended and what each shape reached.
@@ -231,11 +243,11 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     tactics: &T,
     tier: kernels_slang::Tier,
     timer: Timer<'_, B>,
-    budget: std::time::Duration,
+    max_submit: Option<std::time::Duration>,
     say: &mut dyn FnMut(&str),
-) -> Result<Rates> {
+) -> Result<engine::rates::Measured> {
     let machine = machine();
-    let mut rig = Rig::<B>::new(device, budget);
+    let mut rig = Rig::<B>::new(device, max_submit);
     // The launch first: every rate below takes its dispatches' launches off.
     let (bytes_per_ns, launch_ns) = copy_and_launch(&mut rig, tactics.gemm(tier), timer, say)?;
     rig.release();
@@ -282,12 +294,15 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     }
     let scan = scan(&mut rig, tactics.recurrent(), timer, SCAN_SHAPE, launch)?;
     rig.release();
-    Ok(Rates {
-        launch_ns: Some(launch_ns),
-        gemm_tflops: Some(gemm / 1e3),
-        attn_tflops: Some(attn / 1e3),
-        hbm_gbps: Some(bytes_per_ns),
-        scan_gelems: Some(scan),
+    Ok(engine::rates::Measured {
+        rates: Rates {
+            launch_ns: Some(launch_ns),
+            gemm_tflops: Some(gemm / 1e3),
+            attn_tflops: Some(attn / 1e3),
+            hbm_gbps: Some(bytes_per_ns),
+            scan_gelems: Some(scan),
+        },
+        unsettled: rig.unsettled.get(),
     })
 }
 
@@ -313,10 +328,12 @@ fn warm<B: Serve>(
     };
     let planes = u32::try_from(weights.len()).unwrap_or(u32::MAX);
     let nothing = |_: &mut B::Frame| Ok(());
-    // A rotation over every plane, in frames of as many fires as the frame
-    // budget holds.
+    // A rotation over every plane in one frame, or in frames of as many as
+    // fit under the device's bound on one submission where it states one.
     let (_, one) = rig.frame(timer, 1, &fire, &nothing)?;
-    let per = engine::rates::fires_in(rig.budget, one as f64, planes);
+    let per = rig.max_submit.map_or(planes, |cap| {
+        ((cap.as_nanos() as f64 / (one as f64).max(1.0)).floor() as u32).clamp(1, planes)
+    });
     let warmed = engine::rates::warm_up(|| {
         let mut wall = 0u64;
         let mut left = planes;
@@ -627,7 +644,7 @@ pub fn attention_rate<B: Serve, T: Tactics + ?Sized>(
     shape: engine::rates::AttnShape,
     launch: f64,
 ) -> Result<f64> {
-    let mut rig = Rig::<B>::new(device, engine::rates::BURST);
+    let mut rig = Rig::<B>::new(device, None);
     attention(&mut rig, tactics, tier, timer, &machine(), shape, launch)
 }
 
@@ -639,7 +656,7 @@ pub fn gemm_rate<B: Serve>(
     timer: Timer<'_, B>,
     (m, n, k): (u32, u32, u32),
 ) -> Result<f64> {
-    let mut rig = Rig::<B>::new(device, engine::rates::BURST);
+    let mut rig = Rig::<B>::new(device, None);
     let act = rig.operand(m, k, Dtype::Bf16)?;
     let w = rig.operand(n, k, Dtype::Bf16)?;
     let y = rig.zeros(m, n, Dtype::Bf16)?;

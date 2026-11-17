@@ -13,7 +13,9 @@ fn the_micro_fires_state_rates_and_the_ruling_picks_by_them() {
     };
     let (chip, _) = engine_wgpu::chip::resolve(&device.chip(), None);
     let tuning = engine_wgpu::tuning::Tuning::new(chip.clone(), device.cores());
-    let rates = engine_wgpu::rates::measure(&device, &tuning, engine::rates::BURST).unwrap();
+    let rates = engine_wgpu::rates::measure(&device, &tuning, None)
+        .unwrap()
+        .rates;
     let (flops, bytes, launch) = (
         rates.gemm_flops_per_ns().unwrap(),
         rates.bytes_per_ns().unwrap(),

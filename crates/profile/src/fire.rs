@@ -55,6 +55,20 @@ impl Rates {
         *self == Rates::default()
     }
 
+    /// Only `keys` of `self` (as [`Rates::missing`] names them), the rest
+    /// unstated.
+    #[must_use]
+    pub fn only(&self, keys: &[&str]) -> Rates {
+        let has = |key: &str| keys.contains(&key);
+        Rates {
+            launch_ns: self.launch_ns.filter(|_| has("launch_ns")),
+            gemm_tflops: self.gemm_tflops.filter(|_| has("gemm_tflops")),
+            attn_tflops: self.attn_tflops.filter(|_| has("attn_tflops")),
+            hbm_gbps: self.hbm_gbps.filter(|_| has("hbm_gbps")),
+            scan_gelems: self.scan_gelems.filter(|_| has("scan_gelems")),
+        }
+    }
+
     /// The keys of `[rates]` the roofline weighs a fire by that this states
     /// none of: what a load measures before it is ready
     /// (`engine::rates::rates_at_load`). The one list of them.
@@ -130,6 +144,10 @@ pub struct Tuned {
     /// device), for later loads to read; `None` where it kept them for
     /// itself alone (no profiles directory: a browser's masked adapter).
     pub saved_to: Option<String>,
+    /// A frame of this load's rates step stopped at the device's bound on
+    /// one submission (`max_submit_ms`) before it settled
+    /// (`engine::rates::timed_frames`).
+    pub frame_cut: bool,
 }
 
 impl Tuned {
@@ -138,6 +156,7 @@ impl Tuned {
         self.rates = upper.rates.clone().over(std::mem::take(&mut self.rates));
         self.measured_this_load |= upper.measured_this_load;
         self.saved_to = upper.saved_to.clone().or(self.saved_to.take());
+        self.frame_cut |= upper.frame_cut;
     }
 
     /// `[rates]` as profile TOML, nothing where nothing is stated or the
@@ -165,6 +184,7 @@ mod tests {
             },
             measured_this_load: false,
             saved_to: None,
+            frame_cut: false,
         };
         let up = Tuned {
             rates: Rates {
@@ -174,6 +194,7 @@ mod tests {
             },
             measured_this_load: false,
             saved_to: None,
+            frame_cut: false,
         };
         low.lay(&up);
         assert_eq!(

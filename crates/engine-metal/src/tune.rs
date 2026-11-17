@@ -458,7 +458,7 @@ fn fit(
     Ok((entries, lines))
 }
 
-pub(crate) fn assemble(
+fn assemble(
     base: &Profile,
     device: &str,
     facts: &Facts,

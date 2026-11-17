@@ -28,8 +28,9 @@ pub fn rates(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Outco
     let (base, report) = crate::chip::resolve(&chip, profiles);
     say(&format!("{}: starting from {}", chip.name, report.used));
     let tuning = crate::tuning::Tuning::new(base.clone(), device.cores());
-    let r = crate::rates::measure_saying(&device, &tuning, engine::rates::BURST, say)
-        .map_err(|e| e.to_string())?;
+    let r = crate::rates::measure_saying(&device, &tuning, None, say)
+        .map_err(|e| e.to_string())?
+        .rates;
     say(&format!(
         "[rates]: matmul {:.1} TFLOP/s, attention {:.1} TFLOP/s, scan {:.2} G state elements/s, \
          {:.0} GB/s, launch {:.2} us",

@@ -558,9 +558,16 @@ pub fn measured_line(tuned: &profile::fire::Tuned) -> Option<String> {
         r.hbm_gbps.unwrap_or(0.0),
         r.scan_gelems.unwrap_or(0.0),
     );
+    let cut = if tuned.frame_cut {
+        " (a frame stopped at the device's bound on one submission before it settled)"
+    } else {
+        ""
+    };
     Some(match &tuned.saved_to {
-        Some(path) => format!("measured the roofline at load: {constants}; saved to {path}"),
-        None => format!("measured the roofline at load: {constants}; kept for this load alone"),
+        Some(path) => format!("measured the roofline at load{cut}: {constants}; saved to {path}"),
+        None => {
+            format!("measured the roofline at load{cut}: {constants}; kept for this load alone")
+        }
     })
 }
 
@@ -894,6 +901,7 @@ mod tests {
             },
             measured_this_load: false,
             saved_to: None,
+            frame_cut: false,
         };
         assert_eq!(
             line_of(&top, 2048, 512 * MIB, 2 << 30, &tuned),

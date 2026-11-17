@@ -35,29 +35,20 @@ pub fn at_load(
 ) -> Result<crate::tuning::Tuning> {
     let chip = tuning.profile().clone();
     let measured = device.chip();
-    let facts = measured.facts();
-    let base = chip.clone();
-    let file = |rates: &Rates| {
-        profile::search::assemble(
-            crate::chip::registry(),
-            &base,
-            &measured.name,
-            &facts,
-            &engine::rates::tuned(rates),
-            std::slice::from_ref(&provenance(&measured.name)),
-            crate::tune::ASSUME,
-        )
+    let check = |text: &str| {
+        crate::chip::registry()
+            .parse(text, "the measured rates", profile::Strict::User)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     };
     let save = profiles.map(|profiles| engine::rates::SaveTo {
         path: crate::chip::SHELF.user_path(profiles, &measured.name),
-        file: &file,
+        provenance: provenance(&measured.name),
+        check: &check,
     });
-    let chip = engine::rates::rates_at_load(
-        chip,
-        save,
-        engine::rates::frame_budget(max_submit),
-        |budget| measure(device, &tuning, budget).map_err(|e| e.to_string()),
-    )
+    let chip = engine::rates::rates_at_load(chip, save, max_submit, |max_submit| {
+        measure(device, &tuning, max_submit).map_err(|e| e.to_string())
+    })
     .map_err(|why| engine_gpu::error::Fault::Device {
         call: "rates at load",
         why,
@@ -69,11 +60,11 @@ pub fn at_load(
 pub fn measure(
     device: &Context,
     tuning: &crate::tuning::Tuning,
-    budget: std::time::Duration,
-) -> Result<Rates> {
+    max_submit: Option<std::time::Duration>,
+) -> Result<engine::rates::Measured> {
     let tier = <Api as engine_gpu::serve::Serve>::tier(device);
     let timer = |frame: Frame| Ok((None, (frame.commit_timed()? * 1e9) as u64));
-    engine_gpu::rates::measure::<Api, _>(device, tuning, tier, &timer, budget)
+    engine_gpu::rates::measure::<Api, _>(device, tuning, tier, &timer, max_submit)
 }
 
 /// [`measure`], saying how the warm-up ended.
@@ -81,17 +72,10 @@ pub fn measure_saying(
     device: &Context,
     tuning: &crate::tuning::Tuning,
     say: &mut dyn FnMut(&str),
-) -> Result<Rates> {
+) -> Result<engine::rates::Measured> {
     let tier = <Api as engine_gpu::serve::Serve>::tier(device);
     let timer = |frame: Frame| Ok((None, (frame.commit_timed()? * 1e9) as u64));
-    engine_gpu::rates::measure_saying::<Api, _>(
-        device,
-        tuning,
-        tier,
-        &timer,
-        engine::rates::BURST,
-        say,
-    )
+    engine_gpu::rates::measure_saying::<Api, _>(device, tuning, tier, &timer, None, say)
 }
 
 /// The bf16 matmul rate of `device` at `(m, n, k)`, under the tactic
