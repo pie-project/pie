@@ -988,12 +988,59 @@ impl<B: Serve> Shell<B> {
         let binding = device.max_buffer();
         // The top asked and its rungs' `(tokens, span bytes)`, once bounded.
         let mut unbounded: Option<(u32, Vec<(u32, u64)>)> = None;
+        // The roofline the device's rates state (`engine::roofline`): where
+        // the profile states them all, the top rung is the estimate's pick
+        // (`engine::load::choose_tiled`, each plane's rows padded to the row
+        // tile of the kernel this backend picks at its shape), among the
+        // rungs to the roofline's fire top; a fire never runs past the pick.
+        let device_profile = tuning.profile().clone();
+        let rated = device_profile.rates().complete();
+        let counts = if rated {
+            Some(crate::top::counts(&boot.trace)?)
+        } else {
+            None
+        };
+        let live = counts.as_ref().map_or(0, |counts| {
+            let room = device.left().saturating_sub(counts.weight_bytes);
+            kv_budget
+                .map_or(room, |budget| budget.min(room))
+                .min(binding.saturating_mul(kernels_slang::SEGMENTS as u64))
+        });
+        // The dense tactic at each power of two of rows to the asked top:
+        // a matmul of `m` rows runs the tactic of the widest such row count
+        // at or below it.
+        let gemm_by_rows: std::sync::Arc<Vec<(u32, kernels_slang::linear::gemm::Tactic)>> =
+            std::sync::Arc::new(
+                engine::memory::rungs(1, budgets.tokens.max_tokens.max(1))
+                    .into_iter()
+                    .map(|rows| (rows, tuning.gemm(tier, rows)))
+                    .collect(),
+            );
+        let gemm_at = {
+            let table = std::sync::Arc::clone(&gemm_by_rows);
+            move |rows: u32| {
+                table
+                    .iter()
+                    .rev()
+                    .find(|&&(at, _)| at <= rows)
+                    .or(table.first())
+                    .map(|&(_, tactic)| tactic)
+                    .expect("one row count at least")
+            }
+        };
+        let mut chosen: Option<engine::load::TopRung> = None;
         let (compiled, mut span) = loop {
             let compiled = compile_axes(&boot.trace, &budgets, &profile)?;
             let top = budgets.tokens.max_tokens;
             let mut rung_tokens = engine::memory::rungs(1, top);
             if rung_tokens.last() != Some(&top) {
                 rung_tokens.push(top);
+            }
+            // No rung past the roofline's fire top can be chosen.
+            if rated && let Ok(constants) = engine::roofline::Constants::of(&device_profile.rates())
+            {
+                let fire_top = engine::roofline::fire_top(&rung_tokens, &constants);
+                rung_tokens.retain(|&tokens| tokens <= fire_top);
             }
             let span = Span::plan(
                 &boot.trace,
@@ -1008,7 +1055,58 @@ impl<B: Serve> Shell<B> {
                 .iter()
                 .map(|rung| (rung.tokens, rung.bytes()))
                 .collect();
-            match crate::arena::bound_top(&spans, binding) {
+            // The pick, once: the estimate's over the rungs, each infeasible
+            // past one binding.
+            if let (Some(counts), None) = (counts.as_ref(), chosen.as_ref()) {
+                let launches = u32::try_from(compiled.template().len()).unwrap_or(u32::MAX);
+                let padded = |rows: u32| {
+                    kernels_slang::linear::gemm::padded_rows(
+                        B::TARGET,
+                        gemm_at(rows),
+                        rows,
+                        counts.width,
+                    )
+                };
+                let rungs = crate::top::rung_facts(
+                    &spans,
+                    budgets.tokens.max_lanes,
+                    binding,
+                    launches,
+                    &padded,
+                );
+                let tactic_at = gemm_at.clone();
+                let row_tile: engine::roofline::RowTile = std::sync::Arc::new(move |m, n, k| {
+                    kernels_slang::linear::gemm::tile_for(B::TARGET, tactic_at(m), m, n, k)
+                        .row_tile()
+                });
+                let (pick, _) = crate::top::choose(
+                    &rungs,
+                    live,
+                    &device_profile,
+                    row_tile,
+                    device.name(),
+                    counts,
+                    binding,
+                )?;
+                tracing::info!(
+                    "{}",
+                    crate::top::line_of(
+                        &pick,
+                        pick.tokens,
+                        pick.span_bytes,
+                        live,
+                        device_profile.tuned()
+                    )
+                );
+                chosen = Some(pick);
+            }
+            // The fire bound is the chosen rung where there is one (a fire
+            // never runs past it), else the widest rung one binding holds.
+            let widest = match chosen {
+                Some(pick) => Some(pick.tokens),
+                None => crate::arena::bound_top(&spans, binding),
+            };
+            match widest {
                 Some(widest) if widest < top => {
                     unbounded.get_or_insert((top, spans));
                     budgets.tokens = crate::arena::bounded_budget(&budgets.tokens, widest);
@@ -1954,14 +2052,13 @@ impl<B: Serve> Shell<B> {
 
     #[must_use]
     pub fn classes(&self) -> poem_ir::LaneClasses {
-        let outputs =
-            poem_exec::feeds::class_outputs(
-                &self.trace,
-                &self.compiled,
-                self.paging().context(),
-                self.paging().page_size,
-            )
-                .unwrap_or_default();
+        let outputs = poem_exec::feeds::class_outputs(
+            &self.trace,
+            &self.compiled,
+            self.paging().context(),
+            self.paging().page_size,
+        )
+        .unwrap_or_default();
         poem_exec::feeds::lane_classes(&self.trace, &self.compiled, &outputs)
     }
 
@@ -2217,7 +2314,10 @@ impl<B: Serve> Shell<B> {
     /// Fires `lanes` and reads back every output their programs read, the
     /// host's rows and those a reader on the device takes alike: each read's
     /// lane, output name and values (widened to f32), in the step's order.
-    pub fn fire_outputs(&mut self, lanes: &[Seated<'_, B>]) -> Result<Vec<(u32, String, Vec<f32>)>> {
+    pub fn fire_outputs(
+        &mut self,
+        lanes: &[Seated<'_, B>],
+    ) -> Result<Vec<(u32, String, Vec<f32>)>> {
         use engine::frame::Shell as FrameShell;
         if lanes.iter().any(|lane| !lane.refs) {
             let seats = self.pools.seat_segments();
@@ -2243,7 +2343,11 @@ impl<B: Serve> Shell<B> {
         let _ = self.landed.remove(&landed.seq);
         // Nothing fired since: the arm's seat holds this step's reads.
         let read: Vec<&ReadSpan> = layout.iter().filter(|span| span.rows > 0).collect();
-        let end = read.iter().map(|span| span.at + span.bytes()).max().unwrap_or(0);
+        let end = read
+            .iter()
+            .map(|span| span.at + span.bytes())
+            .max()
+            .unwrap_or(0);
         let mut raw = vec![0u8; usize::try_from(end).unwrap_or(usize::MAX)];
         self.readout[arm].read(0, &mut raw)?;
         Ok(read
@@ -2321,7 +2425,11 @@ impl<B: Serve> Shell<B> {
 
     /// Where `slots` lays each capturing lane's rows: its source lane, and
     /// the bytes of the span's buffer its key row and page row start at.
-    fn capture_rows(&self, composition: &Composition, slots: &SlotTable) -> Vec<(u32, u64, Option<u64>)> {
+    fn capture_rows(
+        &self,
+        composition: &Composition,
+        slots: &SlotTable,
+    ) -> Vec<(u32, u64, Option<u64>)> {
         let Some(rows) = self.span.capture().filter(|_| slots.1.rows() > 0) else {
             return Vec::new();
         };
@@ -3839,10 +3947,9 @@ impl<B: Serve> Shell<B> {
         }));
         // Each capturing lane's rows by their bases in the guest region's
         // key and page rows ([`crate::arena::Span::slots`] binds them).
-        let capture_table = self
-            .span
-            .capture()
-            .map_or_else(Vec::new, |rows| scored.table(&indptr_host, rows.keys, rows.pages));
+        let capture_table = self.span.capture().map_or_else(Vec::new, |rows| {
+            scored.table(&indptr_host, rows.keys, rows.pages)
+        });
         let (readout_rows, readout_layout) =
             readout_table(&composition, lanes, &self.readouts, &scored, |class| {
                 self.readout_for(class)
