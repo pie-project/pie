@@ -428,6 +428,21 @@ pub fn weight_tier_bytes(trace: &Trace, stated: u64, extra_resident: u64) -> Res
 /// loads hold lies outside it. `latch` says a load is resolving its one
 /// ceiling, not a reading ahead of it.
 pub fn load_ceiling(allowance: engine::Allowance, latch: bool) -> Result<u64> {
+    crate::device::card::stated(allowance.budget);
+    if latch
+        && allowance.budget.is_none()
+        && let Some(terms) = crate::device::card::integrated()?
+    {
+        let mib = |bytes: u64| bytes >> 20;
+        eprintln!(
+            "engine-cuda: integrated device: capacity {} MiB = min(dedicated {} MiB - held {} MiB, Windows commit available {} MiB), less the driver's {} MiB floor; the system memory the driver lends it is not counted (state [engine.memory] budget_device to size by it)",
+            mib(terms.free()),
+            mib(terms.dedicated),
+            mib(terms.held),
+            mib(terms.commit_available),
+            mib(elastic::safety_floor_bytes()),
+        );
+    }
     let (free, total) = device_memory()?;
     let held = (total - free).saturating_sub(crate::device::own::before_loads(latch));
     Ok(elastic::ceiling_of(total, held, allowance))
@@ -435,20 +450,7 @@ pub fn load_ceiling(allowance: engine::Allowance, latch: bool) -> Result<u64> {
 
 /// The device's free and total bytes, as the driver reports them now.
 pub fn device_memory() -> Result<(u64, u64)> {
-    #[cfg(feature = "device")]
-    {
-        use crate::device::rt;
-
-        let (mut free, mut total) = (0usize, 0usize);
-        // SAFETY: two live locals; the call only writes them.
-        let asked = unsafe { rt::cudaMemGetInfo(&raw mut free, &raw mut total) };
-        crate::device::ctx::check("cudaMemGetInfo", asked)?;
-        Ok((free as u64, total as u64))
-    }
-    #[cfg(not(feature = "device"))]
-    {
-        Err(Fault::Runtimeless)
-    }
+    crate::device::card::memory()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

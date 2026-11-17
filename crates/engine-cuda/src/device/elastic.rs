@@ -166,18 +166,13 @@ impl PhysicalPool {
     pub fn open(device: i32, ceiling: u64) -> Result<PhysicalPool> {
         #[cfg(feature = "device")]
         {
-            use crate::device::rt;
-
             let granularity = allocation_granularity(device)?;
-            let (mut free, mut total) = (0usize, 0usize);
-            // SAFETY: two live locals; the call only writes them.
-            let asked = unsafe { rt::cudaMemGetInfo(&raw mut free, &raw mut total) };
-            crate::device::ctx::check("cudaMemGetInfo", asked)?;
+            let (free, total) = crate::device::card::memory()?;
             let beside = Beside::read()?;
             if !beside.said.is_empty() {
                 eprintln!("engine-cuda: outside the pool, {}", beside.said);
             }
-            let budget = room_under(ceiling, free as u64, total as u64);
+            let budget = room_under(ceiling, free, total);
             let handle_bytes = align_up(MAP_UNIT_BYTES.max(granularity), granularity);
             let pages = budget / LOGICAL_PAGE_BYTES;
             Ok(PhysicalPool {
@@ -245,13 +240,8 @@ impl PhysicalPool {
     pub fn spare_bytes(&self, reserve: u64) -> Result<u64> {
         #[cfg(feature = "device")]
         {
-            use crate::device::rt;
-
-            let (mut free, mut total) = (0usize, 0usize);
-            // SAFETY: two live locals; the call only writes them.
-            let asked = unsafe { rt::cudaMemGetInfo(&raw mut free, &raw mut total) };
-            crate::device::ctx::check("cudaMemGetInfo", asked)?;
-            Ok(room_under(self.ceiling, free as u64, total as u64).saturating_sub(reserve))
+            let (free, total) = crate::device::card::memory()?;
+            Ok(room_under(self.ceiling, free, total).saturating_sub(reserve))
         }
         #[cfg(not(feature = "device"))]
         {
@@ -313,14 +303,8 @@ impl PhysicalPool {
     pub fn recalibrate(&mut self) -> Result<()> {
         #[cfg(feature = "device")]
         {
-            use crate::device::rt;
-
-            let (mut free, mut total) = (0usize, 0usize);
-            // SAFETY: two live locals; the call only writes them.
-            let asked = unsafe { rt::cudaMemGetInfo(&raw mut free, &raw mut total) };
-            crate::device::ctx::check("cudaMemGetInfo", asked)?;
-            let available =
-                room_under(self.ceiling, free as u64, total as u64) / LOGICAL_PAGE_BYTES;
+            let (free, total) = crate::device::card::memory()?;
+            let available = room_under(self.ceiling, free, total) / LOGICAL_PAGE_BYTES;
             self.recalibrate_to(available);
         }
         Ok(())
