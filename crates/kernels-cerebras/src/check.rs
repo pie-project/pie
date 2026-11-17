@@ -18,6 +18,7 @@
 //!   a warning (it may not).
 
 pub mod code;
+pub mod hazard;
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
@@ -904,6 +905,9 @@ fn placed_with(
     }
     for ((f, p), h) in &seen {
         let params: BTreeMap<String, i64> = p.iter().cloned().collect();
+        for h in hazard::hazards(files, f, &params) {
+            rep.errors.push(h);
+        }
         let reached = code::reached(files, f, &params);
         let code = code_bytes(&reached);
         rep.kinds.push((f.clone(), p.clone(), h.data, reached));

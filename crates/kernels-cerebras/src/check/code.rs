@@ -8,20 +8,27 @@ use super::{call_args, eval, fields, uncomment};
 
 /// A function's (or task's) measures and the names it refers to (`(qualifier, name)`).
 #[derive(Clone, Debug, Default)]
-struct Func {
+pub(super) struct Func {
     inline: bool,
     task: bool,
     measure: Measure,
     refs: Vec<(Option<String>, String)>,
+    /// Its parameters' names, and its body (its comptime branches cut).
+    pub(super) params: Vec<String>,
+    pub(super) body: String,
 }
 
 /// One instance of a file: its functions, the names its declarations and comptime blocks refer
 /// to (its roots), and its imports' instances by alias.
 #[derive(Clone, Debug, Default)]
-struct Module {
-    funcs: BTreeMap<String, Func>,
+pub(super) struct Module {
+    pub(super) funcs: BTreeMap<String, Func>,
     roots: Vec<(Option<String>, String)>,
-    aliases: BTreeMap<String, usize>,
+    pub(super) aliases: BTreeMap<String, usize>,
+    /// Its comptime names' values, and its text outside functions (declarations, comptime
+    /// blocks; branches cut).
+    pub(super) env: BTreeMap<String, i64>,
+    pub(super) outside: String,
 }
 
 /// Code's measures: statements, DSD builtins, loops, `if`s (an unrolled loop's body each
@@ -341,6 +348,14 @@ fn modules(
             {
                 let body: String = cs[open + 1..end].iter().collect();
                 let body = prune(&body, &env);
+                let head: String = cs[i + skip..open].iter().collect();
+                let params = call_args(&head)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|a| a.split(':').next())
+                    .map(|n| n.trim().trim_start_matches("comptime ").trim().to_string())
+                    .filter(|n| !n.is_empty())
+                    .collect();
                 m.funcs.insert(
                     name,
                     Func {
@@ -348,6 +363,8 @@ fn modules(
                         task,
                         measure: measure(&body, &env),
                         refs: refs(&body),
+                        params,
+                        body,
                     },
                 );
                 i = end + 1;
@@ -374,6 +391,7 @@ fn modules(
     // (a function the comptime blocks call runs at compile time: the roots are what they bind
     // to tasks and export)
     let outside = prune(&outside, &env);
+    m.env = env;
     for key in [
         "@bind_local_task(",
         "@bind_data_task(",
@@ -388,6 +406,7 @@ fn modules(
             }
         }
     }
+    m.outside = outside;
     out[me] = m;
     me
 }
@@ -431,13 +450,34 @@ fn declared(
     }
 }
 
-/// What the code of `file` at `params` reaches, its imports read from `files`.
-#[must_use]
-pub fn reached(
+/// A PE's code: its modules (the first its own) and the functions it reaches (module, name),
+/// with each one's call sites.
+pub(super) struct Code {
+    pub(super) modules: Vec<Module>,
+    pub(super) reached: BTreeSet<(usize, String)>,
+    sites: BTreeMap<(usize, String), i64>,
+}
+
+impl Code {
+    /// The function `(q, n)` names from module `at`.
+    pub(super) fn resolve(&self, at: usize, q: Option<&str>, n: &str) -> Option<(usize, String)> {
+        let target = match q {
+            Some(q) => *self.modules[at].aliases.get(q)?,
+            None => at,
+        };
+        self.modules[target]
+            .funcs
+            .contains_key(n)
+            .then(|| (target, n.to_string()))
+    }
+}
+
+/// The code of `file` at `params`, its imports read from `files`.
+pub(super) fn code(
     files: &BTreeMap<String, String>,
     file: &str,
     params: &BTreeMap<String, i64>,
-) -> Reached {
+) -> Code {
     let mut ms = Vec::new();
     modules(files, file, params, &BTreeMap::new(), &mut ms, 0);
     // a reference from module `at` to a function: (module, name)
@@ -478,6 +518,25 @@ pub fn reached(
             }
         }
     }
+    Code {
+        modules: ms,
+        reached: seen,
+        sites,
+    }
+}
+
+/// What the code of `file` at `params` reaches, its imports read from `files`.
+#[must_use]
+pub fn reached(
+    files: &BTreeMap<String, String>,
+    file: &str,
+    params: &BTreeMap<String, i64>,
+) -> Reached {
+    let Code {
+        modules: ms,
+        reached: seen,
+        sites,
+    } = code(files, file, params);
     let mut out = Reached::default();
     for k in &seen {
         let f = &ms[k.0].funcs[&k.1];
