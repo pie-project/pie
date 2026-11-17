@@ -597,8 +597,8 @@ pub(crate) fn buffer_ceiling(storage_range: u32, allocation: u64, buffer: Option
 }
 
 /// The most a load may hold in all, where the system bounds it beside the
-/// device: on Android, what memory has available less lmkd's reserve and
-/// the floor ([`engine_gpu::android`]), plus what this process already
+/// device: on Android, what memory has available less what lmkd keeps
+/// free past it and the floor ([`engine_gpu::android`]), plus what this process already
 /// holds, which that reading counts as taken.
 #[cfg(target_os = "android")]
 fn system_ceiling() -> Result<Option<u64>> {
@@ -610,7 +610,7 @@ fn system_ceiling() -> Result<Option<u64>> {
         floor = engine_gpu::android::SAFETY_FLOOR_BYTES,
         room = room.room,
         held,
-        "the load takes what memory has available less what lmkd keeps free and the floor"
+        "read at bind: the load takes what memory has available, less what lmkd keeps free past it, less the floor"
     );
     Ok(Some(room.room.saturating_add(held)))
 }

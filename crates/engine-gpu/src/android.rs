@@ -1,22 +1,30 @@
-//! What an Android device has for a load: what its memory has free less
-//! what lmkd keeps free by killing processes.
+//! What an Android device has for a load: what its memory has available,
+//! less what lmkd keeps free past that, less the floor.
 //!
 //! A phone's GPU takes its memory from system RAM, and a GPU reservation is
 //! part of the process like any other. The heap the driver reports is all
 //! of RAM, so it says nothing of what is free. And no Android driver reports
 //! `VK_EXT_memory_budget`. What this process may take is what the kernel
-//! counts available, read from `/proc/meminfo`, less the reserve lmkd (the
-//! low-memory killer daemon) defends. Taking that reserve would make lmkd
-//! kill processes to win it back: the user's apps, or this process.
+//! counts available (`MemAvailable` in `/proc/meminfo`), less any reserve
+//! lmkd (the low-memory killer daemon) defends beyond it. Taking that
+//! reserve would make lmkd kill processes to win it back: the user's apps,
+//! or this process.
 //!
-//! lmkd states its reserve one of two ways:
+//! Each reserve counts once. The kernel's `MemAvailable` already leaves out
+//! its `totalreserve`: every zone's high watermark plus its largest
+//! lowmem reserve, capped at what the zone manages. lmkd defends one of
+//! two lines:
 //! - With `ro.lmk.use_minfree_levels` set, it kills at the `minfree` levels
-//!   `sys.lmk.minfree_levels` names, as `pages:adj` pairs. Its reserve is the
-//!   level that guards the lowest adj stated, the foreground app's: below it,
-//!   lmkd kills what the user sees.
-//! - Otherwise (the default since Android 10) it kills on memory pressure
-//!   (PSI) once free memory falls under the zones' high watermarks. Its
-//!   reserve is their sum, read from `/proc/zoneinfo`.
+//!   `sys.lmk.minfree_levels` names, as `pages:adj` pairs. The line it
+//!   defends is the level guarding the lowest adj stated, the foreground
+//!   app's: below it, lmkd kills what the user sees. Only what that level
+//!   exceeds `totalreserve` by is subtracted, read from `/proc/zoneinfo`.
+//! - Otherwise (the default since Android 10, and an SM8850's), lmkd kills
+//!   on memory pressure (PSI) once free memory falls under the zones' high
+//!   watermarks: the line `MemAvailable` has already left out. Nothing more
+//!   is subtracted.
+//!
+//! The floor is the driver's safety floor every backend keeps.
 //!
 //! These are read once, when the device binds. A reading that cannot be
 //! taken is refused by name.
@@ -34,7 +42,8 @@ pub const SAFETY_FLOOR_BYTES: u64 = 64 << 20;
 pub struct Room {
     /// `MemAvailable` from `/proc/meminfo`.
     pub available: u64,
-    /// The bytes lmkd keeps free by killing.
+    /// The bytes lmkd keeps free by killing beyond what `available`
+    /// already leaves out.
     pub defended: u64,
     /// What a load may take: `available` less `defended`, less the floor.
     pub room: u64,
@@ -63,21 +72,64 @@ fn mem_available(meminfo: &str) -> Option<u64> {
     })
 }
 
-/// The sum of every zone's high watermark, in pages, from
-/// `/proc/zoneinfo`'s text: the free memory under which lmkd's pressure
-/// mode kills.
+/// The kernel's `totalreserve`, in pages, from `/proc/zoneinfo`'s text:
+/// for every zone, its high watermark plus its largest lowmem reserve
+/// (`protection`), capped at the pages it manages, as
+/// `calculate_totalreserve_pages` sums it. `MemAvailable` leaves it out.
 #[cfg(any(target_os = "android", test))]
-fn high_watermarks(zoneinfo: &str) -> Option<u64> {
-    let mut zones = 0;
-    let mut pages = 0u64;
-    for line in zoneinfo.lines() {
-        let mut words = line.split_whitespace();
-        if words.next() == Some("high") {
-            pages = pages.checked_add(words.next()?.parse::<u64>().ok()?)?;
-            zones += 1;
+fn total_reserve(zoneinfo: &str) -> Option<u64> {
+    #[derive(Default)]
+    struct Zone {
+        high: Option<u64>,
+        managed: Option<u64>,
+        protection: Option<u64>,
+    }
+    impl Zone {
+        fn reserve(&self) -> Option<u64> {
+            let held = self.high?.checked_add(self.protection?)?;
+            Some(held.min(self.managed?))
         }
     }
-    (zones > 0).then_some(pages)
+    let mut zones: Vec<Zone> = Vec::new();
+    for line in zoneinfo.lines() {
+        if line.starts_with("Node ") {
+            zones.push(Zone::default());
+            continue;
+        }
+        let Some(zone) = zones.last_mut() else {
+            continue;
+        };
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("protection:") {
+            let most = rest
+                .trim()
+                .trim_start_matches('(')
+                .trim_end_matches(')')
+                .split(',')
+                .map(|n| n.trim().parse::<u64>().ok())
+                .collect::<Option<Vec<_>>>()?
+                .into_iter()
+                .max()
+                .unwrap_or(0);
+            zone.protection = Some(most);
+            continue;
+        }
+        let mut words = line.split_whitespace();
+        let slot = match words.next() {
+            Some("high") => &mut zone.high,
+            Some("managed") => &mut zone.managed,
+            _ => continue,
+        };
+        if slot.is_none() {
+            *slot = Some(words.next()?.parse().ok()?);
+        }
+    }
+    if zones.is_empty() {
+        return None;
+    }
+    zones
+        .iter()
+        .try_fold(0u64, |sum, zone| sum.checked_add(zone.reserve()?))
 }
 
 /// The `minfree` level, in pages, that guards the lowest adj in a
@@ -129,15 +181,24 @@ pub fn room() -> Result<Room> {
                     .into(),
             )
         })?;
-        foreground_minfree(&levels).ok_or_else(|| {
+        let minfree = foreground_minfree(&levels).ok_or_else(|| {
             refuse(format!(
                 "sys.lmk.minfree_levels is `{levels}`, not pages:adj pairs"
             ))
-        })?
-    } else {
+        })?;
         let zoneinfo = read("/proc/zoneinfo")?;
-        high_watermarks(&zoneinfo)
-            .ok_or_else(|| refuse("/proc/zoneinfo states no zone's high watermark".into()))?
+        let reserve = total_reserve(&zoneinfo).ok_or_else(|| {
+            refuse(
+                "/proc/zoneinfo does not state every zone's high watermark, protection and \
+                 managed pages"
+                    .into(),
+            )
+        })?;
+        minfree.saturating_sub(reserve)
+    } else {
+        // lmkd's pressure line is the zones' high watermarks, which
+        // `MemAvailable` already leaves out.
+        0
     };
     let defended = defended_pages
         .checked_mul(page)
@@ -170,15 +231,21 @@ mod tests {
     }
 
     #[test]
-    fn high_watermarks_sum_every_zone() {
-        // An SM8850's, abridged.
+    fn total_reserve_sums_high_and_protection_capped_at_managed() {
+        // An SM8850's, abridged: only Normal manages pages.
         let zoneinfo = "Node 0, zone    DMA32\n  pages free     0\n        min      0\n\
-                        low      0\n        high     0\nNode 0, zone   Normal\n\
+                        low      0\n        high     0\n        managed  0\n\
+                        protection: (0, 0, 0)\nNode 0, zone   Normal\n\
                         min      2896\n        low      17023\n        high     31150\n\
+                        managed  2716912\n        protection: (0, 0, 0)\n\
                         Node 0, zone  Movable\n        min      32\n        low      32\n\
-                        high     32\n";
-        assert_eq!(high_watermarks(zoneinfo), Some(31_182));
-        assert_eq!(high_watermarks("Node 0, zone Normal\n"), None);
+                        high     32\n        managed  0\n        protection: (0, 0, 0)\n";
+        assert_eq!(total_reserve(zoneinfo), Some(31_150));
+        let reserved = "Node 0, zone DMA32\n high 100\n managed 5000\n protection: (0, 700, 900)\n\
+                        Node 0, zone Normal\n high 200\n managed 9000\n protection: (0, 0, 0)\n";
+        assert_eq!(total_reserve(reserved), Some(1_000 + 200));
+        assert_eq!(total_reserve("Node 0, zone Normal\n high 5\n"), None);
+        assert_eq!(total_reserve(""), None);
     }
 
     #[test]
@@ -191,10 +258,12 @@ mod tests {
 
     #[test]
     fn room_leaves_the_reserve_and_the_floor() {
-        let room = Room::of(3_692_416 * 1024, 31_182 * 4096);
+        let room = Room::of(3_692_416 * 1024, 0);
+        assert_eq!(room.room, 3_692_416 * 1024 - SAFETY_FLOOR_BYTES);
+        let room = Room::of(3_692_416 * 1024, 4096 * 4096);
         assert_eq!(
             room.room,
-            3_692_416 * 1024 - 31_182 * 4096 - SAFETY_FLOOR_BYTES
+            3_692_416 * 1024 - 4096 * 4096 - SAFETY_FLOOR_BYTES
         );
         assert_eq!(Room::of(1 << 20, 1 << 30).room, 0);
     }
