@@ -235,6 +235,7 @@ impl Cuda {
                 .as_ref()
                 .map_or(engine::Serves::NONE, engine::Serves::of),
         )?;
+        self.validate_captures(frame)?;
         if let Some((replay, shell)) = self.replay.zip(self.shell.as_ref())
             && frame.steps.iter().any(|step| {
                 replay
@@ -1305,6 +1306,19 @@ impl Engine for Cuda {
 }
 
 impl Cuda {
+    /// Refuses a step whose capturing lane no reading program is attached
+    /// at ([`engine::fire::Step::validate_captures`]).
+    fn validate_captures(&self, frame: &FrameSubmission) -> EngineResult<()> {
+        let Some(shell) = self.shell.as_ref() else {
+            return Ok(());
+        };
+        let facts = &shell.trace().facts;
+        for step in &frame.steps {
+            step.validate_captures(|word| facts.holds(word, poem_ir::Builtin::Scores))?;
+        }
+        Ok(())
+    }
+
     /// `result`, its refusal counted ([`engine::live::Tally::Refused`]).
     fn refused<T>(&self, result: EngineResult<T>) -> EngineResult<T> {
         if result.is_err() {
@@ -1319,6 +1333,7 @@ impl Cuda {
                 .as_ref()
                 .map_or(engine::Serves::NONE, engine::Serves::of),
         )?;
+        self.validate_captures(frame)?;
         let id = FrameId(self.next_frame);
         self.next_frame = self.next_frame.wrapping_add(1);
         self.pending = None;
