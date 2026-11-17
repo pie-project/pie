@@ -221,6 +221,12 @@ fn a_registered_channel_carries_one_cell_across_its_instances() {
     counts.push(pass(&mut rig, z, page));
     counts.push(pass(&mut rig, x, page));
     let device1 = rig.engine.guest_passes();
+    // Registration compiled every stage shape these passes took.
+    assert_eq!(
+        rig.engine.guest_fire_compiles(),
+        0,
+        "no pass compiles a guest stage: its registration did"
+    );
 
     let want: Vec<u32> = (1..=counts.len() as u32).map(|k| SEED[1] + k).collect();
     assert_eq!(

@@ -486,17 +486,18 @@ impl Plane {
         self.stages.sink_row = sink_row;
     }
 
-    /// Every plane a fire returns, as a guest stage reads it: what
-    /// registration compiles each stage for.
-    pub fn seat_reads(&mut self, reads: Vec<(String, u32, u32, u32, bool, poem_ir::Dtype)>) {
-        self.stages.plane_reads = reads;
+    /// Every plane a fire of the load can return (`Shell::guest_planes`):
+    /// what a registration checks every output its program reads against
+    /// and compiles each stage for.
+    pub fn seat_planes(&mut self, planes: Vec<(String, u32, u32, u32, bool, poem_ir::Dtype)>) {
+        self.stages.planes = planes;
     }
 
-    /// Every output a fire of the load can return as a plane, by name and
-    /// dtype (`Shell::guest_planes`): what a registration checks every
-    /// output its program reads against.
-    pub fn seat_planes(&mut self, planes: Vec<(String, poem_ir::Dtype)>) {
-        self.stages.planes = planes;
+    /// Guest stages a fire compiled: a shape its program's registration
+    /// did not, which is a defect (a registration is its program's ready).
+    #[must_use]
+    pub fn fire_compiles(&self) -> u64 {
+        self.stages.fire_compiles
     }
 
     /// Registers a program; where every stage lowers (its device form),

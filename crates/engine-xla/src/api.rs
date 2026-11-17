@@ -193,6 +193,14 @@ impl Xla {
         self.programs.tally()
     }
 
+    /// Guest stages compiled inside a fire, past their program's
+    /// registration: zero where every registration compiled every shape a
+    /// fire takes.
+    #[must_use]
+    pub fn guest_fire_compiles(&self) -> u64 {
+        self.programs.fire_compiles()
+    }
+
     #[must_use]
     pub fn capabilities(&self) -> Option<&Capabilities> {
         self.caps.as_ref()
@@ -560,7 +568,6 @@ impl Engine for Xla {
         self.programs.seat_readouts(shell.readouts());
         let (rows, sink_row) = shell.pool_geometry();
         self.programs.seat_pool(rows, sink_row);
-        self.programs.seat_reads(shell.plane_reads());
         self.programs.seat_planes(shell.guest_planes());
         // From here a program a fire waits on, a pass the host interprets,
         // is served worse than the load prepared: counted.
