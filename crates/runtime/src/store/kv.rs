@@ -922,6 +922,7 @@ impl KvStore {
             }
             self.kept += 1;
             self.list(self.kept, path.terminal);
+            retention::idle_cache_appeared();
             self.cache.insert(self.kept, KeptEntry { path, ..entry });
         }
     }
@@ -988,6 +989,58 @@ impl KvStore {
         room: usize,
         keys: impl Keys,
     ) -> Result<Option<KvResidencyTxn>, KvStoreError> {
+        self.prepare_demote_where(room, keys, false)
+    }
+
+    /// The tiers entry `id`'s KV may sit on.
+    fn tiers_of(&self, id: u64, keys: &impl Keys) -> u8 {
+        self.cache.get(&id).map_or(retention::ALL_TIERS, |entry| {
+            keys.tiers_at(entry.owner, self.key_token(entry.path.pages))
+        })
+    }
+
+    /// Idle cache a `retention/tiers` row keeps off the device, moved down
+    /// now, whatever its key and whether or not its room is wanted.
+    pub fn prepare_demote_now(
+        &mut self,
+        keys: impl Keys,
+    ) -> Result<Option<KvResidencyTxn>, KvStoreError> {
+        let room = self.host_pool.available() + self.disk_pool.available();
+        self.prepare_demote_where(room, keys, true)
+    }
+
+    /// Idle cache whose row lets it sit nowhere, or not where it is (on
+    /// the host, a row without the host), dropped now. How many entries.
+    pub fn drop_disallowed(&mut self, keys: impl Keys) -> usize {
+        self.split_at_steps(&keys);
+        let unused: HashSet<NodeId> = self.table.unused_cache_roots().into_iter().collect();
+        let gone: Vec<u64> = self
+            .cache
+            .iter()
+            .filter(|(_, entry)| unused.contains(&entry.path.terminal))
+            .filter(|(id, entry)| {
+                let tiers = self.tiers_of(**id, &keys);
+                let resident = self.table.holds_resident(entry.path.terminal);
+                tiers == 0 || (!resident && tiers & retention::HOST == 0)
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        if gone.is_empty() {
+            return 0;
+        }
+        tracing::debug!(target: "pie::retention", entries = gone.len(), "dropped: their row allows no tier they are on");
+        self.drop_entries(gone, By::Policy, self.current_epoch())
+    }
+
+    /// [`Self::prepare_demote`], or (`now`) only cache whose row keeps it
+    /// off the device and lets it on the host. Cache whose row keeps it off
+    /// the host is never moved down: it is dropped when its room is wanted.
+    fn prepare_demote_where(
+        &mut self,
+        room: usize,
+        keys: impl Keys,
+        now: bool,
+    ) -> Result<Option<KvResidencyTxn>, KvStoreError> {
         // Free slots only: a demote gives up no copy for idle cache.
         let room = room.min(self.host_pool.available() + self.disk_pool.available());
         if room == 0 {
@@ -995,11 +1048,25 @@ impl KvStore {
         }
         self.split_at_steps(&keys);
         self.split_persisted();
-        let mut groups = self.reclaim_order(&keys);
+        let mut groups: Vec<(i64, Vec<u64>)> = self
+            .reclaim_order(&keys)
+            .into_iter()
+            .map(|(key, ids)| {
+                let ids: Vec<u64> = ids
+                    .into_iter()
+                    .filter(|&id| {
+                        let tiers = self.tiers_of(id, &keys);
+                        tiers & retention::HOST != 0 && (!now || tiers & retention::DEVICE == 0)
+                    })
+                    .collect();
+                (key, ids)
+            })
+            .filter(|(_, ids)| !ids.is_empty())
+            .collect();
         for last in [false, true] {
             let mut later = Vec::new();
             for (key, ids) in std::mem::take(&mut groups) {
-                if !retention::above_floor(key) {
+                if !now && !retention::above_floor(key) {
                     continue;
                 }
                 if !last && !self.table.frees_device_pages(&self.roots(&ids)) {
@@ -1526,6 +1593,7 @@ impl KvStore {
         self.kept += 1;
         self.list(self.kept, node);
         tracing::debug!(target: "pie::kv", pages, "imported");
+        retention::idle_cache_appeared();
         self.cache.insert(
             self.kept,
             KeptEntry {
@@ -1747,6 +1815,7 @@ impl KvStore {
         self.kept += 1;
         self.list(self.kept, path.terminal);
         tracing::debug!(target: "pie::kv", pages, decoded, "kept");
+        retention::idle_cache_appeared();
         self.cache.insert(
             self.kept,
             KeptEntry {

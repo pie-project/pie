@@ -332,6 +332,8 @@ struct Columns {
     hold_default: Option<bool>,
     retention: HashMap<(ProcessId, Option<u32>), i64>,
     retention_default: Option<i64>,
+    tiers: HashMap<(ProcessId, Option<u32>), u8>,
+    tiers_default: Option<u8>,
 }
 
 /// A column's rows and default into `rows` and `default`; keys that name
@@ -819,11 +821,17 @@ impl Port {
                 c.hold_default,
             )));
         }
+        let prefix = |(id, tokens): (String, Option<u32>)| Some((pid(id)?, tokens));
         let kept = apply(
             delta.retention_priority,
             &mut c.retention,
             &mut c.retention_default,
-            |(id, tokens): (String, Option<u32>)| Some((pid(id)?, tokens)),
+            prefix,
+        ) | apply(
+            delta.retention_tiers,
+            &mut c.tiers,
+            &mut c.tiers_default,
+            prefix,
         );
         if kept {
             let mut steps: HashMap<ProcessId, Vec<(Option<u64>, i64)>> = HashMap::new();
@@ -833,7 +841,17 @@ impl Port {
                     .or_default()
                     .push((tokens.map(u64::from), key));
             }
-            retention::install(Some(retention::Table::new(steps, c.retention_default)));
+            let mut tiers: HashMap<ProcessId, Vec<(Option<u64>, u8)>> = HashMap::new();
+            for (&(owner, tokens), &set) in &c.tiers {
+                tiers
+                    .entry(owner)
+                    .or_default()
+                    .push((tokens.map(u64::from), set));
+            }
+            retention::install(Some(
+                retention::Table::new(steps, c.retention_default)
+                    .with_tiers(tiers, c.tiers_default),
+            ));
         }
         for (id, reason) in delta.terminate {
             let Some(proc) = pid(id).and_then(|id| self.procs.get(&id)) else {
