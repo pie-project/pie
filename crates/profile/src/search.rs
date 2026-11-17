@@ -54,6 +54,10 @@ pub fn time_fires(
 pub struct Line {
     pub id: &'static str,
     pub text: String,
+    /// The run measured it: compared it on a model that reads it, and
+    /// changed it or kept it under a bar of [`crate::AGREEMENT`] or less. A
+    /// tuned file's `[provenance] measured` lists these alone.
+    pub measured: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -649,7 +653,11 @@ pub fn search(
                 "kept; no check model reads it".to_string()
             };
             say(&format!("{}: {text}", knob.id));
-            lines.push(Line { id: knob.id, text });
+            lines.push(Line {
+                id: knob.id,
+                text,
+                measured: false,
+            });
             continue;
         }
         let plans: Vec<Option<u64>> = (0..names.len())
@@ -796,6 +804,12 @@ pub fn search(
         if best.is_some() {
             best = pick_tied(served_all);
         }
+        // A keep says the incumbent holds only where a change had to beat
+        // no more than the agreement tolerance: past it, the run's noise
+        // hid any difference, and nothing was measured.
+        let measured = best
+            .as_ref()
+            .is_some_and(|(r, .., bar)| r < bar || 1.0 - bar <= crate::AGREEMENT);
         let text = match best {
             Some((r, label, text, got, bar)) if r < bar => {
                 chosen = with_entry(&chosen, knob.id, &label);
@@ -846,7 +860,11 @@ pub fn search(
             format!("{text} ({})", notes.join("; "))
         };
         say(&format!("{}: {text}", knob.id));
-        lines.push(Line { id: knob.id, text });
+        lines.push(Line {
+            id: knob.id,
+            text,
+            measured,
+        });
     }
     Ok((chosen, lines))
 }
@@ -954,6 +972,52 @@ mod tests {
             lines[2].text.contains("no check model reads it"),
             "{lines:?}"
         );
+        // Measured: what was compared and changed; not what no model reads.
+        assert!(lines[0].measured && lines[1].measured, "{lines:?}");
+        assert!(!lines[2].measured, "{lines:?}");
+    }
+
+    /// A bench whose every serving is 10% off the last: noise no change
+    /// can beat within the agreement tolerance.
+    struct Noisy(bool);
+
+    impl Bench for Noisy {
+        fn models(&self) -> Vec<String> {
+            vec!["noisy".into()]
+        }
+        fn file(&self, entries: &[(String, String)]) -> Result<String, String> {
+            Ok(render_overrides(entries))
+        }
+        fn serve(&mut self, _: usize, _: &str) -> Result<Serving, String> {
+            self.0 = !self.0;
+            let t = if self.0 { 100.0 } else { 110.0 };
+            Ok(Serving {
+                prompt: vec![t],
+                steps: vec![vec![t]; 3],
+                readout: vec![1.0, 0.0],
+                read: vec!["kernel.n"],
+                refused: None,
+            })
+        }
+        fn plan(&self, _: usize, _: &str) -> Option<u64> {
+            None
+        }
+    }
+
+    #[test]
+    fn a_keep_under_noise_past_the_agreement_is_not_measured() {
+        let knobs = vec![Knob {
+            id: "kernel.n",
+            current: "10".into(),
+            candidates: vec![("20".into(), String::new())],
+            halfway: false,
+            plan_only: false,
+        }];
+        let (chosen, lines) =
+            search(&mut Noisy(false), Vec::new(), &knobs, "", &mut |_| {}).unwrap();
+        assert!(chosen.is_empty(), "{lines:?}");
+        assert!(lines[0].text.starts_with("kept"), "{lines:?}");
+        assert!(!lines[0].measured, "{lines:?}");
     }
 
     /// A bench whose plan fingerprint covers every decision: `kernel.noop`

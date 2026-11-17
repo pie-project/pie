@@ -801,6 +801,7 @@ pub fn run(
             lines.push(Line {
                 id: k.id,
                 text: "not searched: no model to serve (import one, or pass --check)".to_string(),
+                measured: false,
             });
         }
     } else {
@@ -835,8 +836,11 @@ pub fn run(
             Err(why) => say(&format!("  {deployment} did not serve: {why}")),
         }
     }
+    // Only what the run measured: a decision no check model reads, or one
+    // whose bar the noise pushed past the agreement tolerance, keeps its
+    // line in the report but is not called measured.
     let mut tuned_ids: Vec<String> = Vec::new();
-    for l in lines.iter().filter(|l| !l.text.starts_with("not searched")) {
+    for l in lines.iter().filter(|l| l.measured) {
         let id = format!("\"{}\"", l.id);
         if !tuned_ids.contains(&id) {
             tuned_ids.push(id);
