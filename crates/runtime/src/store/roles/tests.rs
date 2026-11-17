@@ -1007,3 +1007,99 @@ fn a_shared_adapter_parks_only_once_every_holder_has() {
     assert_eq!(held(&device), before);
     assert_eq!(held(&host), 0);
 }
+
+/// A park's copy of an instance's and a channel's slots is in flight (the
+/// engine took it, it has not landed) when the park commits and gives the
+/// device slots back. A new instance bound meanwhile must not take them:
+/// the copy still reads them, and a ring or table the new owner's bind
+/// writes would be what parks. They come back once the copy lands.
+#[test]
+fn slots_a_park_still_copies_are_not_bound_until_the_copy_lands() {
+    use crate::scheduler::lane::CopyEpoch;
+    use crate::scheduler::worker::PreLaunchCopy;
+    use ::engine::transfer::MemoryDomain;
+    let Pools {
+        device,
+        host,
+        roles,
+    } = pools();
+    let kv = Arc::new(parking_lot::Mutex::new(crate::store::kv::KvStore::new(
+        8, [5; 32],
+    )));
+    kv.lock()
+        .fence_pools(vec![Arc::clone(&device), Arc::clone(&host)]);
+    let mut engine = FakeEngine::default();
+    let channel = registered(&roles, &mut engine, 1, 1);
+    let instance = bind(&roles, &mut engine, vec![channel], 1);
+    let parked: Vec<(EngineShape, u32)> = {
+        let roles = roles.lock().unwrap();
+        roles
+            .slots(Owner::Instance(instance))
+            .into_iter()
+            // Its tables; its own ring's slots follow.
+            .take(3)
+            .map(|slot| (INSTANCE, slot))
+            .collect()
+    };
+
+    let park = roles.lock().unwrap().prepare_park(holder(1)).unwrap();
+    let mut landings = Vec::new();
+    for copy in park.copies() {
+        let epoch = CopyEpoch::open_on(
+            &kv,
+            Some(&device),
+            Some(&host),
+            None,
+            &PreLaunchCopy::Slots(::engine::chunk::SlotCopy {
+                shape: copy.shape,
+                src: MemoryDomain::CudaDevice(0),
+                dst: MemoryDomain::HostPinned,
+                slots: copy
+                    .device
+                    .iter()
+                    .copied()
+                    .zip(copy.host.iter().copied())
+                    .collect(),
+                runs: Vec::new(),
+            }),
+        );
+        let (landing, landed) = ::engine::completion::copy_in_flight();
+        epoch.retire_on(&landed);
+        landings.push(landing);
+    }
+    // Committed on the enqueue: the device slots are let go.
+    roles.lock().unwrap().commit(park);
+    kv.lock().retire_idle();
+
+    let instance_pool = device.lock().unwrap().roles().instance.unwrap().pool;
+    let still_out = |device: &Shared| {
+        let pool = device.lock().unwrap();
+        parked
+            .iter()
+            .filter(|(_, slot)| {
+                pool.pool()
+                    .is_held(instance_pool, pool.slot(instance_pool, *slot))
+            })
+            .count()
+    };
+    assert_eq!(still_out(&device), 3, "the instance's tables wait for the copy");
+    // Another process binds now: its tables are elsewhere.
+    let other = bind(&roles, &mut engine, Vec::new(), 2);
+    let others: Vec<u32> = roles
+        .lock()
+        .unwrap()
+        .slots(Owner::Instance(other))
+        .into_iter()
+        .take(3)
+        .collect();
+    assert!(
+        parked.iter().all(|(_, slot)| !others.contains(slot)),
+        "a new instance took slots the park's copy still reads"
+    );
+
+    for landing in landings {
+        landing.landed();
+    }
+    assert_eq!(still_out(&device), 0, "back once the copy landed");
+    roles.lock().unwrap().close_instance(other);
+}

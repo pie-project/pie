@@ -533,6 +533,33 @@ impl Roles {
         }
     }
 
+    /// Notes that a fire at `epoch` names instance `id`: its tables and
+    /// own rings, the channels it is bound to and the adapter it lands,
+    /// where they lie on the device. Once let go, each slot is handed out
+    /// again only after that epoch retires.
+    pub fn touch(&self, id: InstanceId, epoch: u64) {
+        let Some(item) = self.items.get(&Owner::Instance(id)) else {
+            return;
+        };
+        let shared = item
+            .channels
+            .iter()
+            .map(|&channel| Owner::Channel(channel))
+            .chain(item.adapter.map(Owner::Adapter))
+            .filter_map(|owner| self.items.get(&owner));
+        let mut pool = self.device.lock().unwrap();
+        for item in std::iter::once(item).chain(shared) {
+            if item.tier != Tier::Device {
+                continue;
+            }
+            for part in &item.parts {
+                if let Some(shape) = self.shapes.of(part.role) {
+                    pool.touch_pool(shape.pool, part.refs.iter().copied(), epoch);
+                }
+            }
+        }
+    }
+
     // ---- channels ----
 
     /// The slots a channel whose ring `facts` states takes: one run of

@@ -1489,6 +1489,33 @@ impl SlotPool {
         }
     }
 
+    /// [`Self::touch`] of slot refs `refs` of `shape` (ref `r` is slot
+    /// `r % per_chunk` of chunk `r / per_chunk`), each where it is handed
+    /// out for that shape; a ref naming nothing handed out (a stale one, or
+    /// the null chunk's) is passed over. One pass a ref: a fire touches
+    /// every slot its lanes name.
+    pub fn touch_held(&mut self, shape: ShapeId, refs: impl IntoIterator<Item = u32>, epoch: u64) {
+        let Some(state) = self.shapes.get_mut(shape as usize) else {
+            return;
+        };
+        let spc = state.spc();
+        for slot_ref in refs {
+            let (chunk, index) = (slot_ref / spc, slot_ref % spc);
+            let Some(meta) = self.chunks.get(chunk as usize) else {
+                continue;
+            };
+            if meta.shape != shape {
+                continue;
+            }
+            let word = meta.frame as usize * state.words + (index / WORD) as usize;
+            if state.free[word] & (1 << (index % WORD)) != 0 {
+                continue;
+            }
+            let refs = &mut state.refs[(meta.frame * spc + index) as usize];
+            refs.touched = refs.touched.max(epoch);
+        }
+    }
+
     /// Drops `holder`'s reference on each of `slots`. A slot no one holds
     /// any more is handed out again once the later of `epoch` and the last
     /// fire that touched it retires.

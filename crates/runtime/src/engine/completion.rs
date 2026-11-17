@@ -472,6 +472,9 @@ struct WorkItemCompletionState {
     resolution: AtomicU32,
     cancel_requested: AtomicBool,
     native_retired: AtomicBool,
+    /// An engine took the fire ([`WorkItemCompletion::commit_target_epoch`])
+    /// and has not retired it yet.
+    in_engine: AtomicBool,
     message: Mutex<Option<String>>,
     guard: Option<Arc<dyn CompletionLease>>,
     /// Run once the completion resolves (or, never resolved, as the last
@@ -550,6 +553,7 @@ impl WorkItemCompletionState {
             cancel_requested: AtomicBool::new(false),
 
             native_retired: AtomicBool::new(false),
+            in_engine: AtomicBool::new(false),
             message: Mutex::new(None),
             guard,
             on_settled: Mutex::new(Vec::new()),
@@ -572,6 +576,7 @@ impl WorkItemCompletionState {
     fn commit_target_epoch(&self, target_epoch: u64) {
         assert!(target_epoch >= FIRST_COMPLETION_EPOCH);
         self.native_retired.store(false, Ordering::Release);
+        self.in_engine.store(true, Ordering::Release);
         let previous = self.target_epoch.swap(target_epoch, Ordering::AcqRel);
         assert!(
             previous == 0 || target_epoch > previous,
@@ -607,6 +612,7 @@ impl WorkItemCompletionState {
 
     fn mark_native_retired(&self) {
         self.native_retired.store(true, Ordering::Release);
+        self.in_engine.store(false, Ordering::Release);
     }
 
     fn result(&self) -> Option<Result<()>> {
@@ -666,8 +672,25 @@ impl Drop for WorkItemCompletionState {
         if self.native_retired.load(Ordering::Acquire) {
             self.terminal.mark_recyclable();
         }
+        let hooks = std::mem::take(self.on_settled.get_mut().unwrap());
+        let unresolved =
+            self.resolution.load(Ordering::Acquire) == WORK_ITEM_RESOLUTION_PENDING;
+        if unresolved && self.in_engine.load(Ordering::Acquire) {
+            // An engine still runs the fire: its hooks (its epoch, its
+            // leases) must not go before it lands, and dropping them would
+            // run their guards. Kept for good: what they hold is never
+            // handed out again, where running them now could hand it out
+            // under the fire.
+            tracing::error!(
+                hooks = hooks.len(),
+                "a fire's last handle went while its engine still ran it; \
+                 keeping what it holds"
+            );
+            std::mem::forget(hooks);
+            return;
+        }
         // No one holds the work item any more: nothing runs it now.
-        run_settled(std::mem::take(self.on_settled.get_mut().unwrap()));
+        run_settled(hooks);
     }
 }
 
@@ -829,6 +852,9 @@ struct PendingFrame {
     frame_cell: CellPtr,
     wait_id: u64,
     epoch: u64,
+    /// The frame failed after the engine took it: each step fails every
+    /// fire of its own as it lands, no sooner.
+    failed: bool,
 }
 
 /// How a step landed, as far as its fires are concerned: the lanes that
@@ -846,6 +872,11 @@ impl PendingFrame {
     fn land(&mut self, step: usize, landing: Landing) -> Landed {
         let (range, faults, lost) = match landing {
             Landing::Lost => (0..self.steps.len(), Vec::new(), true),
+            Landing::Lanes(_) if self.failed => (
+                step.min(self.steps.len())..(step + 1).min(self.steps.len()),
+                Vec::new(),
+                true,
+            ),
             Landing::Lanes(faults) => (
                 step.min(self.steps.len())..(step + 1).min(self.steps.len()),
                 faults,
@@ -1015,6 +1046,30 @@ impl FrameSettlements {
         completion: &SubmissionCompletion,
         broker: &CompletionBroker,
     ) {
+        self.book(frame, steps, completion, broker, false);
+    }
+
+    /// Books frame `frame`, which failed after the engine took it: its
+    /// fires fail, each step's as it lands. Their leases and epochs stay
+    /// until then, since the device still runs the frame.
+    pub fn expect_failed(
+        &self,
+        frame: engine::FrameId,
+        steps: Vec<LandingStep>,
+        completion: &SubmissionCompletion,
+        broker: &CompletionBroker,
+    ) {
+        self.book(frame, steps, completion, broker, true);
+    }
+
+    fn book(
+        &self,
+        frame: engine::FrameId,
+        steps: Vec<LandingStep>,
+        completion: &SubmissionCompletion,
+        broker: &CompletionBroker,
+        failed: bool,
+    ) {
         let Some(frame_cell) = completion.terminal_cell_ptr() else {
             return;
         };
@@ -1027,6 +1082,7 @@ impl FrameSettlements {
             frame_cell,
             wait_id: completion.wait_id(),
             epoch: completion.target_epoch(),
+            failed,
         };
         let mut landed = Vec::new();
         {
@@ -1089,5 +1145,75 @@ impl FrameSettlements {
         for mut pending in frames {
             pending.land(0, Landing::Lost).publish(broker);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fire the engine took, and a flag its settled hook (its epoch, its
+    /// leases) raises.
+    fn submitted_fire() -> (WorkItemCompletion, Arc<AtomicBool>) {
+        let fire = WorkItemCompletion::deferred_with_guard(None);
+        fire.commit_target_epoch(FIRST_COMPLETION_EPOCH);
+        let ran = Arc::new(AtomicBool::new(false));
+        let hook = Arc::clone(&ran);
+        fire.on_settled(move || hook.store(true, Ordering::Release));
+        (fire, ran)
+    }
+
+    /// A frame that fails after the engine took it (a channel take after
+    /// the submit) resolves nothing and lets no lease go until it lands;
+    /// then its fires fail.
+    #[test]
+    fn an_error_after_submit_keeps_leases_until_the_frame_lands() {
+        let broker = CompletionBroker::new();
+        let settlements = FrameSettlements::new();
+        let (fire, ran) = submitted_fire();
+        let frame = broker.submission_completion(FIRST_COMPLETION_EPOCH);
+        settlements.expect_failed(
+            engine::FrameId(1),
+            vec![LandingStep {
+                cells: vec![fire.terminal_cell_ptr()],
+                completions: vec![fire.clone()],
+                member_lanes: vec![0, 1],
+                wakes: Vec::new(),
+            }],
+            &frame,
+            &broker,
+        );
+        assert!(!fire.is_settled(), "resolved while the frame still runs");
+        assert!(!ran.load(Ordering::Acquire), "a lease went under the frame");
+        assert!(!frame.is_settled());
+
+        settlements.settled(engine::FrameId(1), 0, &engine::StepOutcome::default(), &broker);
+        assert!(ran.load(Ordering::Acquire), "its hooks run once it lands");
+        assert!(
+            matches!(fire.state.result(), Some(Err(_))),
+            "a frame failed after its submit fails its fires as it lands"
+        );
+        assert!(matches!(frame.check(), Some(Err(_))));
+    }
+
+    /// The last handle on a fire the engine still runs going does not run
+    /// its hooks: they hold what the fire names.
+    #[test]
+    fn a_dropped_completion_the_engine_still_runs_keeps_its_hooks() {
+        let (fire, ran) = submitted_fire();
+        drop(fire);
+        assert!(!ran.load(Ordering::Acquire));
+    }
+
+    /// One never submitted runs them as it goes: nothing reads what it
+    /// holds.
+    #[test]
+    fn a_dropped_completion_never_submitted_runs_its_hooks() {
+        let fire = WorkItemCompletion::deferred_with_guard(None);
+        let ran = Arc::new(AtomicBool::new(false));
+        let hook = Arc::clone(&ran);
+        fire.on_settled(move || hook.store(true, Ordering::Release));
+        drop(fire);
+        assert!(ran.load(Ordering::Acquire));
     }
 }
