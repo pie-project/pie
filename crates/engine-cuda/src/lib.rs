@@ -10,8 +10,8 @@ pub mod api;
 pub mod arena;
 pub mod blob;
 pub mod boot;
-pub mod checkpoint_serving;
 pub mod check;
+pub mod checkpoint_serving;
 pub mod chip;
 pub mod comm;
 pub mod device;
@@ -181,8 +181,8 @@ pub use run::{
     PoolSlabs, Run, SlotTable, StructSlot, WeightRow, WeightTable,
 };
 pub use serve::{
-    Armed, Boot, DEFAULT_BODIES_MEGABYTES, Diagnostics, Golden, Graphs, Knobs, Lane, Media,
-    Recording, Seal, Seated, Shell,
+    Armed, Boot, DEFAULT_BODIES_MEGABYTES, Diagnostics, EveryRung, Golden, Graphs, Knobs, Lane,
+    Media, Recording, Seal, Seated, Shell,
 };
 
 pub use blob::{

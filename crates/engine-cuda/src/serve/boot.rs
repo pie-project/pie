@@ -83,6 +83,16 @@ impl Recording {
     }
 }
 
+/// How far a load that keeps every rung ([`Knobs::every_rung`]) lays them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EveryRung {
+    /// To four times the fire top (`engine::load::check::laid_top`): the
+    /// load a check weighs its rungs by.
+    PastTop,
+    /// To these rows: a check's load sized for one kind of its fires.
+    To(u32),
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Knobs {
     pub diagnostics: Diagnostics,
@@ -110,11 +120,10 @@ pub struct Knobs {
     /// none, CUDA's default): an expert-parallel group whose ranks share a
     /// device wires only when its ranks' streams fit them.
     pub work_queues: Option<u32>,
-    /// Lay every rung to four times the fire top rather than the ruling's
-    /// top, keeping the rungs and the estimate weighed
-    /// ([`crate::Shell::weighed`]): what `pie tune --check-estimate` times
-    /// each rung of (`engine::load::check`).
-    pub every_rung: bool,
+    /// Lay every rung rather than the ruling's top, keeping the rungs and
+    /// the estimate weighed ([`crate::Shell::weighed`]): what `pie tune
+    /// --check-estimate` times each rung of (`engine::load::check`).
+    pub every_rung: Option<EveryRung>,
     /// Walk every fire eagerly, nothing captured or recorded: the check of
     /// the estimate's dissection, which drains the device around each node.
     pub walked: bool,

@@ -1,13 +1,15 @@
 //! CUDA's loads for the check of the estimate (`engine::load::check`): a
 //! served-shape load of a model laying every rung to four times its fire
-//! top (`Knobs::every_rung`), its fires replayed as serving runs them or
-//! walked eagerly (`Knobs::walked`) and dissected node by node
+//! top, whose rungs and estimate the check weighs, and loads on the shell
+//! the check sizes for each kind of its fires, every rung to the shell's
+//! rows (`Knobs::every_rung`); their fires replayed as serving runs them
+//! or walked eagerly (`Knobs::walked`) and dissected node by node
 //! ([`crate::dissect`]).
 
 use std::path::{Path, PathBuf};
 
 use engine::load::CheckFire;
-use engine::load::check::{Bench, Dissection, Fired, Loaded, Run, Weighed};
+use engine::load::check::{Bench, Dissection, Fired, Loaded, Run, Shell, Weighed};
 
 use crate::tune::{Shape, load, patches};
 
@@ -15,10 +17,9 @@ use crate::tune::{Shape, load, patches};
 /// left to the engine (its fire top on the card).
 const SERVED_LANES: u32 = 512;
 
-/// The shell a check's first load runs on, before its fires are known: a
-/// slot a served lane, each [`ROOMY_CONTEXT`] long.
-const ROOMY: (u32, u32) = (SERVED_LANES, ROOMY_CONTEXT);
-const ROOMY_CONTEXT: u32 = 32_768;
+/// The context a served-shape load is asked: the most tokens one prompt
+/// holds, so the fire top it weighs is the model's, not a short context's.
+const SERVED_CONTEXT: u32 = 32_768;
 
 /// The page a check's loads lay their cache in.
 const PAGE: u32 = 16;
@@ -43,15 +44,15 @@ pub fn bench(artifact: &Path, deployment: &str, profiles: Option<&Path>) -> Chec
 }
 
 impl Bench for Check {
-    fn load(
-        &mut self,
-        run: Run,
-        shell: Option<(u32, u32)>,
-    ) -> Result<Box<dyn Loaded + '_>, String> {
-        let (slots, context) = shell.unwrap_or(ROOMY);
+    fn load(&mut self, run: Run, shell: Option<Shell>) -> Result<Box<dyn Loaded + '_>, String> {
+        // The served shape: a slot a lane, each one long prompt's context.
+        let (slots, context, every_rung) = match shell {
+            None => (SERVED_LANES, SERVED_CONTEXT, crate::EveryRung::PastTop),
+            Some(shell) => (shell.slots, shell.context, crate::EveryRung::To(shell.rows)),
+        };
         let knobs = crate::Knobs {
             profiles: self.profiles.clone(),
-            every_rung: true,
+            every_rung: Some(every_rung),
             walked: run == Run::Walked,
             ..crate::Knobs::default()
         };

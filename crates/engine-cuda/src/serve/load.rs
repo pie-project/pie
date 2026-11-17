@@ -91,13 +91,15 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     let fire_top = crate::api::fire_top_of(&chip, &boot.trace, boot.context, device.name())?;
     // A load that keeps every rung (a check of the estimate) lays them past
     // the top (`engine::load::check::laid_top`), so a top set too low shows
-    // in the check.
-    let laid_top = if boot.knobs.every_rung {
-        let mut lattice = crate::api::rung_lattice(&engine, u32::MAX);
-        lattice.pop();
-        engine::load::check::laid_top(&lattice, fire_top)
-    } else {
-        fire_top
+    // in the check, or to the rows its fires take.
+    let laid_top = match boot.knobs.every_rung {
+        None => fire_top,
+        Some(super::EveryRung::PastTop) => {
+            let mut lattice = crate::api::rung_lattice(&engine, u32::MAX);
+            lattice.pop();
+            engine::load::check::laid_top(&lattice, fire_top)
+        }
+        Some(super::EveryRung::To(rows)) => rows,
     };
     if boot.budget.max_tokens == 0 {
         boot.budget.max_tokens = laid_top;
@@ -416,7 +418,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
                 live: after_weights,
                 fire_top,
             });
-        if boot.knobs.every_rung {
+        if boot.knobs.every_rung.is_some() {
             crate::top::widest(&rungs).unwrap_or(top.tokens)
         } else {
             top.tokens

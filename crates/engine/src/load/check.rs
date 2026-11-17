@@ -89,13 +89,24 @@ pub struct Dissection {
     pub drain_ns: f64,
 }
 
+/// The shell a check's load lays: `slots` slots of `context` tokens each
+/// (a fire on a fresh slot owns a run of its pages, no runtime page tables
+/// between), every rung of the model's lattice to `rows` laid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Shell {
+    pub slots: u32,
+    pub context: u32,
+    pub rows: u32,
+}
+
 /// An engine's loads of one model, for the check.
 pub trait Bench {
-    /// A load of the model laying every rung to [`laid_top`] of its fire
-    /// top, run as `run`, on `slots` slots of `context` tokens each, or
-    /// (`None`) on the shape a served load is asked.
-    fn load(&mut self, run: Run, shell: Option<(u32, u32)>)
-    -> Result<Box<dyn Loaded + '_>, String>;
+    /// A load of the model run as `run`: on `shell` ([`shell_for`] the fires
+    /// it runs: the prompts on one slot of the widest prompt, the decode
+    /// steps on a slot a lane of a page each), or (`None`) on the shape a
+    /// served load is asked, laying every rung to [`laid_top`] of its fire
+    /// top: the load whose rungs and estimate the check weighs.
+    fn load(&mut self, run: Run, shell: Option<Shell>) -> Result<Box<dyn Loaded + '_>, String>;
 }
 
 /// One load of a [`Bench`].
@@ -109,18 +120,32 @@ pub trait Loaded {
     fn dissect(&mut self, fire: CheckFire) -> Result<Dissection, String>;
 }
 
-/// The `(slots, context)` a load must hold to fire each of `fires`: its
-/// slots the most lanes one fires, its context a lane's keys and new
-/// tokens, in whole pages of `page`.
+/// The [`Shell`] a load must hold to fire each of `fires` (of one kind:
+/// prompts, or decode steps): its slots the most lanes one fires, its
+/// context the keys a lane attends (its new tokens among them, on a fresh
+/// slot) in whole pages of `page`, its rungs
+/// laid to the widest fire's rows. Prompts and decode steps are fired on
+/// shells of their own: one shell for both would lay the decode's lanes
+/// each the widest prompt's pages.
 #[must_use]
-pub fn shell_for(fires: impl IntoIterator<Item = CheckFire>, page: u32) -> (u32, u32) {
-    let (slots, context) = fires.into_iter().fold((1u32, 1u32), |(slots, context), f| {
-        (
-            slots.max(f.lanes),
-            context.max(f.keys_per_lane + f.tokens_per_lane),
-        )
-    });
-    (slots, context.next_multiple_of(page.max(1)))
+pub fn shell_for(fires: impl IntoIterator<Item = CheckFire>, page: u32) -> Shell {
+    let fold = |shell: Shell, f: CheckFire| Shell {
+        slots: shell.slots.max(f.lanes),
+        context: shell.context.max(f.keys_per_lane.max(f.tokens_per_lane)),
+        rows: shell.rows.max(f.rows),
+    };
+    let shell = fires.into_iter().fold(
+        Shell {
+            slots: 1,
+            context: 1,
+            rows: 1,
+        },
+        fold,
+    );
+    Shell {
+        context: shell.context.next_multiple_of(page.max(1)),
+        ..shell
+    }
 }
 
 /// The page a check's shells round their context to.
@@ -228,42 +253,49 @@ pub fn check(
     also: &[u32],
     say: &mut dyn FnMut(&str),
 ) -> Result<Checked, String> {
-    // The rungs come of a load on the served shape; the load each check fire
-    // runs on is then sized from the fires.
-    let size = {
-        let load = bench.load(Run::Replayed, None)?;
-        let weighed = load.weighed()?;
-        shell_for(
-            timed_rungs(&weighed).iter().map(RungFacts::check_fire),
-            PAGE,
-        )
-    };
-    let mut load = bench.load(Run::Replayed, Some(size))?;
-    let weighed = load.weighed()?;
+    // The rungs, the estimate and the live range come of one load on the
+    // served shape; each kind of fire (decode steps, prompts) is then timed
+    // on a load of its own, sized from its fires.
+    let weighed = bench.load(Run::Replayed, None)?.weighed()?;
     let rungs = timed_rungs(&weighed);
     let model = weighed.model.clone();
     say(&format!(
         "timing a fire at each of {} rung widths of {model} (laid to {}, {PAST_TOP}x its fire top \
-         {}) on {} slots of {} tokens",
+         {})",
         rungs.len(),
         weighed.laid,
         weighed.fire_top,
-        size.0,
-        size.1
     ));
-    let mut meas = Vec::with_capacity(rungs.len());
-    for r in &rungs {
-        let f = timed(&mut *load, r.check_fire())?;
-        if !f.replayed {
-            return Err(format!(
-                "a fire of {} tokens of {model} was walked, not replayed: its time is not what \
-                 serving runs, so it is no measurement",
-                r.tokens
-            ));
+    let mut meas = vec![0.0; rungs.len()];
+    for decode in [true, false] {
+        let kind: Vec<usize> = (0..rungs.len())
+            .filter(|&k| rungs[k].decode_shaped() == decode)
+            .collect();
+        if kind.is_empty() {
+            continue;
         }
-        meas.push(f.ns);
+        let shell = shell_for(kind.iter().map(|&k| rungs[k].check_fire()), PAGE);
+        say(&format!(
+            "  {} {} on {} slots of {} tokens, rungs to {}",
+            kind.len(),
+            if decode { "decode steps" } else { "prompts" },
+            shell.slots,
+            shell.context,
+            shell.rows
+        ));
+        let mut load = bench.load(Run::Replayed, Some(shell))?;
+        for &k in &kind {
+            let f = timed(&mut *load, rungs[k].check_fire())?;
+            if !f.replayed {
+                return Err(format!(
+                    "a fire of {} tokens of {model} was walked, not replayed: its time is not \
+                     what serving runs, so it is no measurement",
+                    rungs[k].tokens
+                ));
+            }
+            meas[k] = f.ns;
+        }
     }
-    drop(load);
     let e = &weighed.estimate;
     let est: Vec<f64> = rungs.iter().map(|r| e.ns(r)).collect();
     // The estimate picks among the rungs a load lays (to its fire top); the
@@ -449,7 +481,7 @@ mod tests {
     }
 
     #[test]
-    fn a_shell_holds_every_fire_in_whole_pages() {
+    fn a_shell_holds_its_kind_of_fire_in_whole_pages() {
         let decode = CheckFire {
             rows: 8,
             lanes: 8,
@@ -457,7 +489,22 @@ mod tests {
             keys_per_lane: 1,
             sampled: 8,
         };
-        assert_eq!(shell_for([decode, prompt(100)], 16), (8, 208));
+        assert_eq!(
+            shell_for([decode], 16),
+            Shell {
+                slots: 8,
+                context: 16,
+                rows: 8
+            }
+        );
+        assert_eq!(
+            shell_for([prompt(100), prompt(300)], 16),
+            Shell {
+                slots: 1,
+                context: 304,
+                rows: 300
+            }
+        );
     }
 
     #[test]
