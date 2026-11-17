@@ -138,6 +138,10 @@ pub struct Report {
     pub rejected: Vec<(Source, String)>,
     /// The decisions whose value a layer measured on this device.
     pub measured: Vec<&'static str>,
+    /// How the rates the profile runs were measured on this device, as the
+    /// layer stating them says (`[provenance] rates`); `None` where no layer
+    /// states rates measured on it.
+    pub rates_measured: Option<String>,
 }
 
 impl Report {
@@ -146,6 +150,21 @@ impl Report {
     #[must_use]
     pub fn untuned(&self) -> bool {
         self.measured.is_empty() || !self.rejected.is_empty()
+    }
+
+    /// What was measured on the device, in words: its rates, its decisions,
+    /// each or neither.
+    #[must_use]
+    pub fn what_was_measured(&self) -> String {
+        let decisions = if self.measured.is_empty() {
+            "its kernel decisions untuned".to_string()
+        } else {
+            format!("{} decisions measured on it", self.measured.len())
+        };
+        match &self.rates_measured {
+            Some(how) => format!("rates measured on it ({how}); {decisions}"),
+            None => format!("no rates measured on it; {decisions}"),
+        }
     }
 
     /// The layers applied, topmost first.
@@ -185,9 +204,10 @@ struct Inner {
     entries: BTreeMap<&'static str, Entry>,
 }
 
-/// The resolved profile a load runs under. Cheap to clone.
+/// The resolved profile a load runs under, and the rates and fire times its
+/// layers state. Cheap to clone.
 #[derive(Clone)]
-pub struct Profile(Arc<Inner>);
+pub struct Profile(Arc<Inner>, Arc<crate::fire::Tuned>);
 
 impl std::fmt::Debug for Profile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -217,6 +237,24 @@ impl Profile {
     #[must_use]
     pub fn target(&self) -> &crate::registry::Target {
         &self.0.target
+    }
+
+    /// The rates the layers state ([`crate::fire`]).
+    #[must_use]
+    pub fn tuned(&self) -> &crate::fire::Tuned {
+        &self.1
+    }
+
+    /// The device's rates, each where a layer states it.
+    #[must_use]
+    pub fn rates(&self) -> crate::fire::Rates {
+        self.1.rates.clone()
+    }
+
+    /// This profile with the rates `tuned` states.
+    #[must_use]
+    pub fn with_tuned(&self, tuned: crate::fire::Tuned) -> Profile {
+        Profile(self.0.clone(), Arc::new(tuned))
     }
 
     fn entry(&self, id: &str) -> &Entry {
@@ -273,6 +311,21 @@ impl Profile {
     #[must_use]
     pub fn get<T: Decision<At = Anywhere>>(&self) -> &T {
         self.pick::<T>(&Anywhere)
+    }
+
+    /// The value a decision with no shape variables takes, `None` for a
+    /// flag that is off, without recording a read: for a backend that
+    /// resolves a load's values up front and raises [`Profile::mark`]
+    /// where a dispatch consults one.
+    #[must_use]
+    pub fn peek<T: Decision<At = Anywhere>>(&self) -> Option<&T> {
+        self.ladder::<T>().peek(&Anywhere)
+    }
+
+    /// The flag [`Profile::read`] reports `T` by.
+    #[must_use]
+    pub fn mark<T: Decision>(&self) -> crate::Mark {
+        self.ladder::<T>().mark_of()
     }
 
     /// The decisions a load has asked anything of so far: evaluated a
@@ -356,13 +409,16 @@ impl Registry {
                 )
             })
             .collect();
-        Profile(Arc::new(Inner {
-            backend: self.backend,
-            facts: self.facts,
-            source,
-            target,
-            entries,
-        }))
+        Profile(
+            Arc::new(Inner {
+                backend: self.backend,
+                facts: self.facts,
+                source,
+                target,
+                entries,
+            }),
+            Arc::default(),
+        )
     }
 
     /// Every decision at its registry default.
@@ -379,11 +435,13 @@ impl Registry {
     /// checking facts: for tests and tools that hold a known-good file.
     pub fn load(&self, text: &str, origin: &str) -> Result<Profile, crate::registry::Refusal> {
         let file = self.parse(text, origin, Strict::CheckedIn)?;
-        Ok(self.assemble(
-            &file.entries,
-            file.target,
-            Source::Seeded(origin.to_string()),
-        ))
+        Ok(self
+            .assemble(
+                &file.entries,
+                file.target,
+                Source::Seeded(origin.to_string()),
+            )
+            .with_tuned(file.tuned))
     }
 
     /// Read a partial file, filling what it leaves out from the registry,
@@ -391,7 +449,9 @@ impl Registry {
     /// exercise.
     pub fn load_user(&self, text: &str, origin: &str) -> Result<Profile, crate::registry::Refusal> {
         let file = self.parse(text, origin, Strict::User)?;
-        Ok(self.assemble(&file.entries, file.target, Source::User(origin.to_string())))
+        Ok(self
+            .assemble(&file.entries, file.target, Source::User(origin.to_string()))
+            .with_tuned(file.tuned))
     }
 
     /// The registry defaults with `overrides` (profile TOML after `api = 1`)
@@ -437,7 +497,9 @@ impl Registry {
         for (id, rungs) in over.entries {
             entries.insert(id, rungs);
         }
-        Ok(self.assemble(&entries, target, source))
+        let mut tuned = base.tuned().clone();
+        tuned.lay(&over.tuned);
+        Ok(self.assemble(&entries, target, source).with_tuned(tuned))
     }
 
     /// Admit a parsed layer on the device: every fact it assumes holds,
@@ -601,6 +663,8 @@ impl Registry {
 
     fn resolve_with(&self, layers: &[Candidate], facts: Option<&Facts>) -> (Profile, Report) {
         let mut entries: BTreeMap<&'static str, Vec<Rung>> = BTreeMap::new();
+        let mut tuned = crate::fire::Tuned::default();
+        let mut rates_measured: Option<String> = None;
         let mut measured: BTreeMap<&'static str, bool> = BTreeMap::new();
         let mut target = crate::registry::Target::default();
         // What the checked-in layers below assume, which a checked-in
@@ -654,6 +718,16 @@ impl Registry {
             if !file.target.name_contains.is_empty() {
                 target.name_contains = file.target.name_contains;
             }
+            tuned.lay(&file.tuned);
+            // A layer stating rates says how they were measured, or leaves
+            // the ones below standing as they were.
+            if file.tuned.rates != crate::fire::Rates::default() {
+                rates_measured = file
+                    .provenance
+                    .iter()
+                    .find(|(k, _)| k == "rates")
+                    .map(|(_, v)| v.trim_matches('"').to_string());
+            }
             used.push(layer.source.clone());
         }
         let top = used.last().cloned().unwrap_or(Source::Defaults);
@@ -666,8 +740,12 @@ impl Registry {
                 .filter(|(_, m)| *m)
                 .map(|(id, _)| id)
                 .collect(),
+            rates_measured,
         };
-        (self.assemble(&entries, target, top), report)
+        (
+            self.assemble(&entries, target, top).with_tuned(tuned),
+            report,
+        )
     }
 }
 

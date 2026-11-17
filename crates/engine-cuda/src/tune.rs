@@ -404,6 +404,7 @@ pub fn run(
             lines.push(Line {
                 id: k.id,
                 text: "not searched: no model to serve (import one, or pass --check)".to_string(),
+                measured: false,
             });
         }
     } else {

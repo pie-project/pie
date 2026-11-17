@@ -380,14 +380,24 @@ mod tests {
                 .map(|at| envelope.lane(at, at).expect("a lane").fold())
                 .collect()
         };
-        assert_eq!(folds(&three(vec![4])), [Some(4); 3], "one entry, every lane");
+        assert_eq!(
+            folds(&three(vec![4])),
+            [Some(4); 3],
+            "one entry, every lane"
+        );
         assert_eq!(
             folds(&three(vec![4, 5])),
             [Some(4), Some(5), None],
             "a per-lane list: its own entry, none past the end"
         );
         assert_eq!(folds(&three(vec![4, 5, 6])), [Some(4), Some(5), Some(6)]);
-        assert_eq!(folds(&Envelope { fold: None, ..three(vec![]) }), [None; 3]);
+        assert_eq!(
+            folds(&Envelope {
+                fold: None,
+                ..three(vec![])
+            }),
+            [None; 3]
+        );
     }
 
     /// One source a port: what a decode envelope's program computes on the

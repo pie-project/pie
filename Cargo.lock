@@ -1729,6 +1729,7 @@ dependencies = [
  "eta-compiler",
  "pie-eta-ir",
  "pie-poem-ir",
+ "pie-profile",
  "rustix",
  "serde",
  "serde_json",
