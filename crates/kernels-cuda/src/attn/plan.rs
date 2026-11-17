@@ -265,13 +265,13 @@ pub struct Toggles {
 
 impl Toggles {
     #[must_use]
-    pub const fn of(tuning: crate::tuning::Tuning) -> Self {
+    pub fn of(tuning: crate::tuning::Tuning) -> Self {
         Self {
-            force_split_small: tuning.decode_split_small,
-            window_split: tuning.decode_split_window,
-            chunk_floor_128: tuning.decode_chunk_floor_128,
-            prefill_ctas_per_sm: tuning.prefill_ctas_per_sm,
-            static_max_requests: tuning.decode_static_max_requests,
+            force_split_small: tuning.decode_split_small(),
+            window_split: tuning.decode_split_window(),
+            chunk_floor_128: tuning.decode_chunk_floor_128(),
+            prefill_ctas_per_sm: tuning.prefill_ctas_per_sm(),
+            static_max_requests: tuning.decode_static_max_requests(),
             decode_gqa: crate::attn::decode_gqa::Gate::of(tuning),
         }
     }

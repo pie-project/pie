@@ -14,8 +14,8 @@ pub(crate) fn gemv_kernel(
     n: i32,
     tuning: &crate::tuning::Tuning,
 ) -> (&'static Kernel, bool, u32) {
-    let narrow = tuning.gemv_narrow;
-    if n.unsigned_abs() <= tuning.gemv_splitk_max_n {
+    let narrow = tuning.gemv_narrow();
+    if n.unsigned_abs() <= tuning.gemv_splitk_max_n() {
         let (class, warps) = if narrow { ("4, 2", 4) } else { ("8, 1", 8) };
         (epi.kernel("gemv_splitk_skeleton", class), true, warps)
     } else {
@@ -67,7 +67,8 @@ pub fn gemv(
     };
     ctx.fire(
         OP,
-        Fire::at(kernel).apply(Launch::grid([grid, 1, 1], [32, warps, 1]).programmatic(tuning.pdl)),
+        Fire::at(kernel)
+            .apply(Launch::grid([grid, 1, 1], [32, warps, 1]).programmatic(tuning.pdl())),
         &[
             ArgValue::Ptr(weight),
             ArgValue::Ptr(act),

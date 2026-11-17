@@ -840,7 +840,7 @@ mod on_device {
         // The scan lands bf16 where the device's tuning narrows it, as a
         // served load's trace does (`narrow::gdn_out_bf16`).
         #[cfg(not(feature = "rocm"))]
-        let out = if ctx.tuning().ssm_gdn_out_bf16 {
+        let out = if ctx.tuning().ssm_gdn_out_bf16() {
             Dtype::Bf16
         } else {
             Dtype::F32

@@ -101,8 +101,8 @@ pub(crate) fn act_x_wt(
     // A prefill's wide product on cuBLAS's own algorithm with a split's
     // partials summed in bf16, as torch runs it by default
     // (`kernel.gemm.bf16_split_from`); the handle is set back at once.
-    if tuning.gemm_bf16_split_from > 0
-        && m >= i32::try_from(tuning.gemm_bf16_split_from).unwrap_or(i32::MAX)
+    if tuning.gemm_bf16_split_from() > 0
+        && m >= i32::try_from(tuning.gemm_bf16_split_from()).unwrap_or(i32::MAX)
     {
         // SAFETY: `handle` is this context's live cuBLAS handle.
         unsafe {
@@ -128,7 +128,7 @@ pub(crate) fn act_x_wt(
         }
     }
     let (plan, lt_handle, want) = with_device(|device| {
-        device.configure((tuning.gemm_workspace_mb as usize) << 20);
+        device.configure((tuning.gemm_workspace_mb() as usize) << 20);
         (
             device.plan_for(call),
             device.lt.handle,
@@ -241,7 +241,7 @@ pub(crate) fn on_lt(
         k,
     };
     let (plan, lt_handle, want) = with_device(|device| {
-        device.configure((tuning.gemm_workspace_mb as usize) << 20);
+        device.configure((tuning.gemm_workspace_mb() as usize) << 20);
         (
             device.plan_for(call),
             device.lt.handle,
@@ -978,7 +978,7 @@ pub fn tile_rows(tuning: &crate::tuning::Tuning, m: u32, n: u32, k: u32) -> Opti
         k: i32::try_from(k).ok()?,
     };
     let plan = with_device(|device| {
-        device.configure((tuning.gemm_workspace_mb as usize) << 20);
+        device.configure((tuning.gemm_workspace_mb() as usize) << 20);
         device.plan_for(call)
     })?;
     let algo = &plan.heuristics.first()?.algo;

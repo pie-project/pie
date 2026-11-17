@@ -176,12 +176,12 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         let tuning = kernels_cuda::tuning::Tuning::of(&chip);
         boot.trace = crate::grouped_decode::rewrite_with(
             boot.trace.clone(),
-            tuning.decode_grouped_prefill_from,
-            tuning.decode_grouped_prefill_lse,
-            tuning.decode_grouped_prefill_window,
+            tuning.decode_grouped_prefill_from(),
+            tuning.decode_grouped_prefill_lse(),
+            tuning.decode_grouped_prefill_window(),
             kernels_cuda::attn::decode_gqa::Gate::of(tuning),
         );
-        boot.trace = crate::narrow::gdn_out_bf16(boot.trace.clone(), tuning.ssm_gdn_out_bf16);
+        boot.trace = crate::narrow::gdn_out_bf16(boot.trace.clone(), || tuning.ssm_gdn_out_bf16());
     }
     // A join's independent branches side by side, where the profile forks
     // them onto side streams (`compiler.branches`).
@@ -193,8 +193,8 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // a product's epilogue is its contraction skeleton's.
     #[cfg(not(feature = "rocm"))]
     let anchored = if profile.synth_anchors && boot.world.size == 1 {
-        let skinny =
-            !profile.synth_regions || kernels_cuda::tuning::Tuning::of(&chip).gemm_skinny_rows > 0;
+        let skinny = !profile.synth_regions
+            || kernels_cuda::tuning::Tuning::of(&chip).gemm_skinny_rows() > 0;
         let (folded, anchored) = crate::synth::fold_anchors_with(boot.trace.clone(), skinny);
         boot.trace = folded;
         anchored
@@ -992,7 +992,7 @@ impl Shell {
         // `kernel.gemm.fp8_o_down`: grouped projections on fp8b128, as vLLM
         // reads DeepSeek-V4's `wo_a` (the wide fires on tcgen05).
         #[cfg(feature = "cuda")]
-        if device.ctx().tuning().fp8_o_down && kernels_cuda::linear::gemm_sm100::supported() {
+        if device.ctx().tuning().fp8_o_down() && kernels_cuda::linear::gemm_sm100::supported() {
             weights.requantize_grouped(&boot.trace, device.stream())?;
         }
         // `kernel.gemm.fp8_shadow`: block-FP8 dense planes keep a bf16 copy;
@@ -1000,35 +1000,44 @@ impl Shell {
         // rows carry their own exponents do.
         #[cfg(feature = "cuda")]
         if !kernels_cuda::linear::gemm_sm100::supported()
-            && (device.ctx().tuning().gemm_fp8_shadow
+            && (device.ctx().tuning().gemm_fp8_shadow()
                 || kernels_cuda::linear::moe::fp8_w8a8_capable())
         {
-            let mixed = !device.ctx().tuning().gemm_fp8_shadow;
+            let mixed = !device.ctx().tuning().gemm_fp8_shadow();
             weights.shadow_fp8_dense(&boot.trace, device.stream(), mixed)?;
         }
         // `kernel.gemm.fp8_mx`: block-FP8 dense planes keep 1x32 exponents.
         #[cfg(feature = "cuda")]
-        if device.ctx().tuning().gemm_fp8_mx && !kernels_cuda::linear::gemm_sm100::supported() {
+        if device.ctx().tuning().gemm_fp8_mx() && !kernels_cuda::linear::gemm_sm100::supported() {
             weights.spread_fp8_dense(&boot.trace, device.stream())?;
         }
+        // A load with no MXFP4 bank asks nothing of the copies below.
+        #[cfg(feature = "cuda")]
+        let mxfp4 = boot
+            .trace
+            .params
+            .iter()
+            .any(|param| param.dtype == poem_ir::Dtype::Mxfp4);
         // `kernel.moe.mxfp4_fp8_from`: MXFP4 banks keep a block-FP8 copy.
         #[cfg(feature = "cuda")]
-        if device.ctx().tuning().mxfp4_fp8_from > 0
+        if mxfp4
             && !kernels_cuda::linear::gemm_sm100::supported()
             && kernels_cuda::linear::moe::fp8_w8a8_capable()
+            && device.ctx().tuning().mxfp4_fp8_from() > 0
         {
             weights.shadow_mxfp4_banks(&boot.trace, device.stream())?;
         }
         // `kernel.moe.mxfp4_bf16_from`: MXFP4 banks keep a bf16 copy on Hopper.
         #[cfg(feature = "cuda")]
-        if device.ctx().tuning().mxfp4_bf16_from > 0
+        if mxfp4
             && kernels_cuda::jit::cache::arch() == Some("sm_90")
+            && device.ctx().tuning().mxfp4_bf16_from() > 0
         {
             weights.copy_mxfp4_banks_bf16(
                 &boot.trace,
                 device.stream(),
-                device.ctx().tuning().mxfp4_bf16_down,
-                device.ctx().tuning().mxfp4_bf16_keep,
+                device.ctx().tuning().mxfp4_bf16_down(),
+                device.ctx().tuning().mxfp4_bf16_keep(),
             )?;
         }
         if boot.knobs.diagnostics.arm_trace {
