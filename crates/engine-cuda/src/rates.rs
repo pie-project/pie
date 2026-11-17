@@ -44,16 +44,15 @@
 use engine::rates::{ATTN_DIMS, ATTN_KEYS, ATTN_SHAPE, DEPTHS, SCAN_SHAPE, weights_at};
 use profile::fire::Rates;
 
-/// The rows the matmul grid is timed at under `chip`: the candidates a load
-/// weighs its top rung among (`serve::load`'s `budget_at(asked).buckets`),
-/// the chip's rung lattice ([`crate::api::rung_lattice`] at its
-/// `engine.lattice_steps`, `prefill_lattice_from` and `_steps`) up to the
-/// engine's fire bound ([`crate::api::DEFAULT_FORWARD_TOKENS`]). A load
-/// asked other tokens narrows them to a rung of it
-/// ([`crate::api::on_lattice`]).
+/// The rows the matmul grid is timed at under `chip` on a card whose fire
+/// top is `top` ([`crate::fire_top`]): the candidates a load weighs its top
+/// rung among (`serve::load`'s `budget_at(asked).buckets`), the chip's rung
+/// lattice ([`crate::api::rung_lattice`] at its `engine.lattice_steps`,
+/// `prefill_lattice_from` and `_steps`) up to `top`. A load asked other
+/// tokens narrows them to a rung of it ([`crate::api::on_lattice`]).
 #[must_use]
-pub fn lattice_rows(chip: &profile::Profile) -> Vec<u32> {
-    crate::api::rung_lattice(&crate::chip::Engine::of(chip))
+pub fn lattice_rows(chip: &profile::Profile, top: u32) -> Vec<u32> {
+    crate::api::rung_lattice(&crate::chip::Engine::of(chip), top)
 }
 
 /// The kv cache's page, as a served load pages it.
@@ -81,7 +80,7 @@ pub fn measure(
     ordinal: i32,
     chip: &profile::Profile,
     cache: Option<&std::path::Path>,
-) -> Result<Rates, String> {
+) -> Result<(Rates, crate::fire_top::FireTop), String> {
     kernels_cuda::disk::install(cache);
     #[cfg(feature = "device")]
     {
@@ -314,9 +313,24 @@ mod on_device {
         Ok(b)
     }
 
-    pub(super) fn measure(ordinal: i32, chip: &profile::Profile) -> Result<Rates, String> {
+    pub(super) fn measure(
+        ordinal: i32,
+        chip: &profile::Profile,
+    ) -> Result<(Rates, crate::fire_top::FireTop), String> {
         let mut device = Context::bind(ordinal, None).map_err(say("the device"))?;
         device.set_tuning(kernels_cuda::tuning::Tuning::of(chip));
+        // The card's fire top, the grid's widest row (crate::fire_top).
+        let (_, memory) = crate::store::device_memory().map_err(say("the device's memory"))?;
+        let top = crate::fire_top::derive(chip, device.device().num_sm, memory)?;
+        eprintln!(
+            "[rates]: fire top {} rows: {}'s arena beside its {} MiB of weights and one \
+             sequence ({} MiB) on {} MiB",
+            top.tokens,
+            top.model,
+            top.weights >> 20,
+            top.sequence >> 20,
+            top.memory >> 20
+        );
         let stream = device.stream();
         let clock = Clock::new(stream)?;
         let mut held = Vec::new();
@@ -332,7 +346,7 @@ mod on_device {
             engine::rates::WARM_SHAPE.0,
             warmed.rate / 1e3
         );
-        let rows = lattice_rows(chip);
+        let rows = lattice_rows(chip, top.tokens);
         let grid = gemm(device.ctx(), &clock, &random, &mut held, &rows, gap)?;
         let mut attn = Vec::with_capacity(ATTN_KEYS.len() * ATTN_DIMS.len());
         for d in ATTN_DIMS {
@@ -365,14 +379,15 @@ mod on_device {
             PEAK.load(Ordering::Relaxed) >> 20,
             held.iter().map(|b| b.bytes()).sum::<usize>() >> 20
         );
-        Ok(Rates {
+        let rates = Rates {
             bf16_flops_per_ns_by_rows_n_k: Some(grid),
             attn_flops_per_ns_by_keys_and_dim: Some(attn),
             scan_elements_per_ns_by_tokens: Some(scan_curve),
             bytes_per_ns: Some(bytes),
             launch_ns: Some(launch),
             ..Rates::default()
-        })
+        };
+        Ok((rates, top))
     }
 
     fn gemm(
@@ -802,12 +817,12 @@ mod lattice_tests {
         let engine = crate::chip::Engine::of(&chip);
         let weighed = crate::api::lattice(
             Vec::new(),
-            crate::api::DEFAULT_FORWARD_TOKENS,
+            9742,
             engine.lattice_steps,
             engine.prefill_lattice_from,
             engine.prefill_lattice_steps,
         );
-        assert_eq!(super::lattice_rows(&chip), weighed);
+        assert_eq!(super::lattice_rows(&chip, 9742), weighed);
         assert_eq!(weighed.first(), Some(&1), "a readout's one row");
     }
 }

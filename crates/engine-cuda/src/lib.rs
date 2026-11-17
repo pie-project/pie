@@ -19,6 +19,7 @@ pub mod dissect;
 pub mod ep;
 mod error;
 pub mod experts;
+pub mod fire_top;
 pub mod exports;
 pub mod group;
 #[cfg(not(feature = "rocm"))]

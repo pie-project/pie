@@ -43,7 +43,7 @@ pub fn rates(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Rated
     let cache = profiles
         .and_then(Path::parent)
         .map(|home| home.join("cache"));
-    let r = crate::rates::measure(0, &base, cache.as_deref())?;
+    let (r, top) = crate::rates::measure(0, &base, cache.as_deref())?;
     let grid = r.bf16_flops_per_ns_by_rows_n_k.clone().unwrap_or_default();
     let attn = r
         .attn_flops_per_ns_by_keys_and_dim
@@ -90,12 +90,17 @@ pub fn rates(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Rated
     let tuned = engine::rates::tuned(&r);
     let how = format!(
         "{name}; the matmul through {} under serving's GEMM tactics, each rate a 20 ms burst on \
-         the stream timed by events, the median of 5 (the launch of 15); operands: engine::rates' pattern; at {}",
+         the stream timed by events, the median of 5 (the launch of 15); operands: engine::rates' pattern; rows to the fire top {} on {} MiB ({}'s {} MiB of weights and one sequence of {} MiB beside its arena); at {}",
         if cfg!(feature = "rocm") {
             "hipBLASLt"
         } else {
             "cuBLASLt"
         },
+        top.tokens,
+        top.memory >> 20,
+        top.model,
+        top.weights >> 20,
+        top.sequence >> 20,
         sitting()
     );
     let provenance = engine::rates::provenance("cuda", &how);

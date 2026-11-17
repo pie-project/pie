@@ -413,42 +413,58 @@ pub(crate) fn lattice(
     }
 }
 
-/// The engine's fire bound, the most rows one fire lays: the top of its
-/// rung lattice ([`rung_lattice`]) and of the rows `pie tune cuda --rates`
-/// times. Nothing the engine lays fixes a narrower or wider one (its tables,
-/// workspaces and captured bodies are sized to the fire a load lays, and
-/// B200/H200 profiles ran 16384), so it is the fire past which a wider one
-/// adds no throughput where the matmul is compute bound (the L40S's grid
-/// flat from 4096 rows) while its activation arena grows with it, and a
-/// prompt's later chunks wait on a fire twice as long.
+/// The rows a patch ladder is derived from when a load states no tokens.
 pub(crate) const DEFAULT_FORWARD_TOKENS: u32 = 8192;
 
-/// The rung lattice of a load under `engine`: [`default_lattice`] up to
-/// [`DEFAULT_FORWARD_TOKENS`]. The candidates a load with no stated buckets
-/// weighs its top among, and the rows `pie tune cuda --rates` times its
-/// matmul grid at (`crate::rates::lattice_rows`).
+/// The rung lattice under `engine` up to `top`: [`default_lattice`]'s
+/// points below it and `top` itself. With `top` the card's fire top (the
+/// widest row of its profile's measured grid, [`fire_top_of`], derived at
+/// `pie tune cuda --rates` by `crate::fire_top`), the candidates a load with
+/// no stated buckets weighs and the rows `--rates` times its grid at.
 #[must_use]
-pub(crate) fn rung_lattice(engine: &crate::chip::Engine) -> Vec<u32> {
+pub(crate) fn rung_lattice(engine: &crate::chip::Engine, top: u32) -> Vec<u32> {
     default_lattice(
-        DEFAULT_FORWARD_TOKENS,
+        top,
         engine.lattice_steps,
         engine.prefill_lattice_from,
         engine.prefill_lattice_steps,
     )
 }
 
-/// The widest rung of [`rung_lattice`] at or below `tokens` (its first where
-/// none is): a load asked other tokens (the walk fit, `engine.fire_rows`, a
-/// stated `max_forward_tokens`, a refit) lays no last point off the grid.
+/// The widest rung of [`rung_lattice`] to `top` at or below `tokens` (its
+/// first where none is): a load asked other tokens (the walk fit,
+/// `engine.fire_rows`, a stated `max_forward_tokens`, a refit) lays no last
+/// point off the grid.
 #[must_use]
-pub(crate) fn on_lattice(engine: &crate::chip::Engine, tokens: u32) -> u32 {
-    let lattice = rung_lattice(engine);
+pub(crate) fn on_lattice(engine: &crate::chip::Engine, top: u32, tokens: u32) -> u32 {
+    let lattice = rung_lattice(engine, top);
     lattice
         .iter()
         .rev()
         .copied()
         .find(|&rung| rung <= tokens)
         .unwrap_or(lattice[0])
+}
+
+/// The card's fire top: the widest row its profile's matmul grid states
+/// (`[rates] bf16_flops_per_ns_by_rows_n_k`, timed to the top
+/// `crate::fire_top` derived for the card). A profile with no grid has no
+/// top, and a load on it is refused for its missing rates, by name.
+pub(crate) fn fire_top_of(chip: &profile::Profile, device: &str) -> crate::error::Result<u32> {
+    let rates = chip.rates();
+    rates
+        .bf16_flops_per_ns_by_rows_n_k
+        .as_deref()
+        .and_then(|grid| profile::fire::gemm_rows(grid).last().copied())
+        .ok_or_else(|| {
+            Fault::Card(
+                engine::load::Refused::NoRates {
+                    device: device.to_owned(),
+                    key: "bf16_flops_per_ns_by_rows_n_k",
+                }
+                .to_string(),
+            )
+        })
 }
 
 /// The load's budgets for `trace`: its logit readouts sized to what the

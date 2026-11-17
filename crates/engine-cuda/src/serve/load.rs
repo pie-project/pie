@@ -68,8 +68,12 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     };
     device.set_tuning(kernels_cuda::tuning::Tuning::of(&chip));
     let engine = crate::chip::Engine::of(&chip);
+    // The card's fire top: the widest row its profile's grid was timed at,
+    // derived for this card at `pie tune cuda --rates` (`crate::fire_top`).
+    // A load asked nothing fires up to it, and the estimate picks below.
+    let fire_top = crate::api::fire_top_of(&chip, device.name())?;
     if boot.budget.max_tokens == 0 {
-        boot.budget.max_tokens = crate::api::DEFAULT_FORWARD_TOKENS;
+        boot.budget.max_tokens = fire_top;
         // only where it at least halves the fire: a trunk of few value heads seats enough lanes that the
         // wide fire feeds its experts better (Qwen3.6-35B-A3B pf64 lost 4% at 5120 rows of 8192)
         if let Some(fit) = walk_fire_fit(&boot.trace, engine.walk_fire_rows, device.device().num_sm)
@@ -125,7 +129,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // at: asked other tokens (the walk fit, `engine.fire_rows`, a stated
     // `max_forward_tokens`), its top is the rung at or below them.
     if stated_buckets.is_empty() {
-        boot.budget.max_tokens = crate::api::on_lattice(&engine, boot.budget.max_tokens);
+        boot.budget.max_tokens = crate::api::on_lattice(&engine, fire_top, boot.budget.max_tokens);
     }
     boot.budget.buckets = crate::api::lattice(
         stated_buckets.clone(),
@@ -316,11 +320,12 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     let working = |tokens: u32, voxels: &Option<poem_compiler::VoxelLadder>| -> u64 {
         laid(tokens, voxels).map_or(u64::MAX, |(bytes, _)| bytes)
     };
-    // The top rung, the ruling's (`crate::top`): of every bucket of the asked
-    // lattice (the rule weighs them all; no floor stands in for it), each
-    // spanning its fire's working set and
-    // needing one sequence and the bodies' floor beside it, over the room
-    // the card has after the weight tier.
+    // The top rung, the ruling's (`crate::top`): of the buckets of the asked
+    // lattice, each spanning its fire's working set and needing one
+    // sequence and the bodies' floor beside it, over the room the card has
+    // after the weight tier. Weighed in ascending order up to the first
+    // whose span leaves no room: a span grows with its rows, so every wider
+    // bucket leaves none either, and is neither compiled nor offered.
     let weighed;
     let tokens = {
         let paging = Paging::of(boot.page_size, boot.context, boot.slots, 1)?;
@@ -329,12 +334,16 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             let (span, launches) = laid(rung, &voxels).unwrap_or((u64::MAX, 0));
             let sequence =
                 crate::store::least_sequence_bytes(&boot.trace, paging.windowed(window, rung))?;
+            let beside = sequence.saturating_add(crate::store::BODIES_FLOOR_BYTES);
             candidates.push(crate::top::Candidate {
                 tokens: rung,
                 span,
                 launches,
-                beside: sequence.saturating_add(crate::store::BODIES_FLOOR_BYTES),
+                beside,
             });
+            if span != u64::MAX && span.saturating_add(beside) > after_weights {
+                break;
+            }
         }
         // The rows the dense product computes at each width: its tile's.
         #[cfg(not(feature = "rocm"))]
@@ -740,7 +749,7 @@ fn refit(
     let fit = |owed: bool, scoped: bool| -> Result<Option<(u32, u32)>> {
         let mut tokens = asked_tokens;
         while tokens > floor && working_at(asked_lanes, tokens, scoped) > room_at(tokens, owed)? {
-            tokens = crate::api::on_lattice(&engine, tokens / 2).max(floor);
+            tokens = crate::api::on_lattice(&engine, asked.max_tokens, tokens / 2).max(floor);
         }
         let room = room_at(tokens, owed)?;
         let lanes = crate::store::tokens_within(asked_lanes.min(tokens), 1, room, |lanes| {
@@ -752,8 +761,11 @@ fn refit(
         // sequences), pf1024-512 7.92k -> 10.37k (9.00k), c1024 2.69k -> 2.71k (2.72k).
         let mut tokens = tokens;
         while lanes < asked_lanes && tokens < asked.max_tokens {
-            let wider =
-                crate::api::on_lattice(&engine, tokens.saturating_mul(2).min(asked.max_tokens));
+            let wider = crate::api::on_lattice(
+                &engine,
+                asked.max_tokens,
+                tokens.saturating_mul(2).min(asked.max_tokens),
+            );
             if working_at(lanes, wider, scoped) > room_at(wider, owed)? {
                 break;
             }
