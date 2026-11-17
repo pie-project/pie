@@ -66,15 +66,50 @@ impl Rates {
         *self == Rates::default()
     }
 
+    /// Only `keys` of `self` (as [`Rates::missing`] names them), the rest
+    /// unstated.
+    #[must_use]
+    pub fn only(&self, keys: &[&str]) -> Rates {
+        let has = |key: &str| keys.contains(&key);
+        Rates {
+            launch_ns: self.launch_ns.filter(|_| has("launch_ns")),
+            gemm_tflops_by_rows: self
+                .gemm_tflops_by_rows
+                .clone()
+                .filter(|_| has("gemm_tflops_by_rows")),
+            attn_tflops_by_keys: self
+                .attn_tflops_by_keys
+                .clone()
+                .filter(|_| has("attn_tflops_by_keys")),
+            hbm_gbps: self.hbm_gbps.filter(|_| has("hbm_gbps")),
+            elementwise_gbps: self.elementwise_gbps.filter(|_| has("elementwise_gbps")),
+            scan_gelems: self.scan_gelems.filter(|_| has("scan_gelems")),
+        }
+    }
+
+    /// The keys of `[rates]` the roofline weighs a fire by that this states
+    /// none of: what a load measures before it is ready
+    /// (`engine::rates::rates_at_load`). The one list of them.
+    #[must_use]
+    pub fn missing(&self) -> Vec<&'static str> {
+        [
+            ("launch_ns", self.launch_ns.is_none()),
+            ("gemm_tflops_by_rows", self.gemm_tflops_by_rows.is_none()),
+            ("attn_tflops_by_keys", self.attn_tflops_by_keys.is_none()),
+            ("hbm_gbps", self.hbm_gbps.is_none()),
+            ("elementwise_gbps", self.elementwise_gbps.is_none()),
+            ("scan_gelems", self.scan_gelems.is_none()),
+        ]
+        .into_iter()
+        .filter(|&(_, unstated)| unstated)
+        .map(|(key, _)| key)
+        .collect()
+    }
+
     /// Whether every key is stated.
     #[must_use]
     pub fn complete(&self) -> bool {
-        self.launch_ns.is_some()
-            && self.gemm_tflops_by_rows.is_some()
-            && self.attn_tflops_by_keys.is_some()
-            && self.hbm_gbps.is_some()
-            && self.elementwise_gbps.is_some()
-            && self.scan_gelems.is_some()
+        self.missing().is_empty()
     }
 
     /// `[rates]` as profile TOML.
@@ -142,10 +177,17 @@ pub type FireTable = Vec<(u32, u64)>;
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Tuned {
     pub rates: Rates,
-    /// The rates were measured on the device by this load (a browser's,
-    /// whose masked adapter no profile names), not read from a layer: they
-    /// are this load's alone and are never written.
+    /// The rates were measured on the device by this load, not read from
+    /// a layer (`engine::rates::rates_at_load`): no layer stated them all.
     pub measured_this_load: bool,
+    /// Where this load saved what it measured (the user's profile of the
+    /// device), for later loads to read; `None` where it kept them for
+    /// itself alone (no profiles directory: a browser's masked adapter).
+    pub saved_to: Option<String>,
+    /// A frame of this load's rates step stopped at the device's bound on
+    /// one submission (`max_submit_ms`) before it settled
+    /// (`engine::rates::timed_frames`).
+    pub frame_cut: bool,
 }
 
 impl Tuned {
@@ -153,6 +195,8 @@ impl Tuned {
     pub fn lay(&mut self, upper: &Tuned) {
         self.rates = upper.rates.clone().over(std::mem::take(&mut self.rates));
         self.measured_this_load |= upper.measured_this_load;
+        self.saved_to = upper.saved_to.clone().or(self.saved_to.take());
+        self.frame_cut |= upper.frame_cut;
     }
 
     /// `[rates]` as profile TOML, nothing where nothing is stated or the
@@ -179,6 +223,8 @@ mod tests {
                 ..Rates::default()
             },
             measured_this_load: false,
+            saved_to: None,
+            frame_cut: false,
         };
         let up = Tuned {
             rates: Rates {
@@ -187,6 +233,8 @@ mod tests {
                 ..Rates::default()
             },
             measured_this_load: false,
+            saved_to: None,
+            frame_cut: false,
         };
         low.lay(&up);
         assert_eq!(

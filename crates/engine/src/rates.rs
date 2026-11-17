@@ -245,16 +245,166 @@ pub struct Warmed {
 /// Every backend's rates step calls it first, so its timings start on a
 /// settled clock rather than a cold one.
 pub fn warm_up<E>(mut rotation: impl FnMut() -> Result<f64, E>) -> Result<Warmed, E> {
-    let mut last = rotation()?;
-    let mut rotations = 1;
-    loop {
-        let rate = rotation()?;
-        rotations += 1;
-        if rate >= last {
-            return Ok(Warmed { rotations, rate });
+    // The rule every measurement's frames settle by ([`settle`]), over the
+    // rotation's rate: until it stops moving by AGREEMENT two steps in a
+    // row. A memory-bound measurement warms by it over its own op (its rate
+    // rising through the DVFS levels to the sustained one serving sees).
+    let mut rate = 0.0;
+    let settled = settle(|_| {
+        rate = rotation()?;
+        Ok(Some(rate))
+    })?;
+    Ok(Warmed {
+        rotations: settled.steps,
+        rate,
+    })
+}
+
+/// The longest a [`settle`] runs, in steps: a doubling's frames past it
+/// carry more fires than a `u32` counts.
+pub const SETTLE_STEPS: u32 = 31;
+
+/// How a [`settle`] ended: its steps, the last value, and whether a step it
+/// needed was not taken (`capped`: the measurement's bound on one frame
+/// stopped it before two steps agreed).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Settled {
+    pub steps: u32,
+    pub last: f64,
+    pub capped: bool,
+}
+
+/// The one rule a rates step's measurements settle by: take `step(i)` (a
+/// rotation's rate while the clock moves, a fire's time in frames of
+/// doubling length, `i` from 0) until two successive steps each move it by
+/// less than [`AGREEMENT`], in either direction (three agreeing points: in
+/// a doubling, spanning 4x), or `step` declines to take another (`None`:
+/// capped). Two short frames caught in one state of a bimodal clock agree
+/// with each other, but not with the frame twice as long that leaves it
+/// (an M1's attention at 512 keys read 2.32 to 4.60 TFLOP/s run to run
+/// under a rule of two agreeing points, 4.1 to 4.4 under this one). The
+/// warm-up ([`warm_up`]), a memory-bound measurement's warming
+/// ([`warm_up`] over its own op) and every measurement's frame length
+/// ([`timed_frames`]) take it.
+pub fn settle<E>(mut step: impl FnMut(u32) -> Result<Option<f64>, E>) -> Result<Settled, E> {
+    let Some(mut last) = step(0)? else {
+        return Ok(Settled {
+            steps: 0,
+            last: f64::NAN,
+            capped: true,
+        });
+    };
+    let mut agreed = 0;
+    for i in 1..=SETTLE_STEPS {
+        let Some(next) = step(i)? else {
+            return Ok(Settled {
+                steps: i,
+                last,
+                capped: true,
+            });
+        };
+        // Settled at the second step in a row that moves it by less than
+        // AGREEMENT either way.
+        agreed = if (next - last).abs() < AGREEMENT * last.abs() {
+            agreed + 1
+        } else {
+            0
+        };
+        last = next;
+        if agreed == 2 {
+            return Ok(Settled {
+                steps: i + 1,
+                last,
+                capped: false,
+            });
         }
-        last = rate;
     }
+    Ok(Settled {
+        steps: SETTLE_STEPS + 1,
+        last,
+        capped: false,
+    })
+}
+
+/// Where a measurement's fires are in their rotation of operand sets: one
+/// counter carried across every frame of the measurement, so a short frame
+/// reads the next sets, never the first ones again (a frame restarting at
+/// set 0 re-reads warm weights).
+#[derive(Debug, Default)]
+pub struct Rotation(std::cell::Cell<u64>);
+
+impl Rotation {
+    /// The next fire's set of `sets`.
+    #[must_use]
+    pub fn next(&self, sets: usize) -> usize {
+        let at = self.0.get();
+        self.0.set(at + 1);
+        (at % sets.max(1) as u64) as usize
+    }
+}
+
+/// How long a measurement's timed frame runs: its fires, the time one fire
+/// took in a frame of them, and whether the device's bound on one
+/// submission stopped the doubling before it settled.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Frames {
+    pub fires: u32,
+    pub per_fire_ns: f64,
+    pub capped: bool,
+}
+
+/// A measurement's frame length, the one rule for every engine: frames of
+/// 1, 2, 4, ... fires (`frame(fires)` runs one and returns its ns), doubled
+/// until the time a fire stops moving by more than [`AGREEMENT`]
+/// ([`settle`]): the clock held through the frame and its submission
+/// amortized. `max_submit` (the device's bound on one submission, where it
+/// states one) is the only cap: no frame past it is laid, and `estimate_ns`
+/// (one fire's, where the caller can say) past it is refused by name
+/// without running.
+pub fn timed_frames<E>(
+    max_submit: Option<std::time::Duration>,
+    estimate_ns: Option<f64>,
+    mut frame: impl FnMut(u32) -> Result<f64, E>,
+    refuse: impl FnOnce(String) -> E,
+) -> Result<Frames, E> {
+    let cap = max_submit.map(|d| d.as_nanos() as f64);
+    if let (Some(cap), Some(est)) = (cap, estimate_ns)
+        && est > cap
+    {
+        return Err(refuse(format!(
+            "one fire of about {:.1} ms is past the device's bound of {:.1} ms on one \
+             submission (`max_submit_ms`): no frame of it is laid",
+            est / 1e6,
+            cap / 1e6
+        )));
+    }
+    let mut fires = 1u32;
+    let mut per = f64::NAN;
+    let settled = settle(|i| {
+        let count = 1u32 << i.min(31);
+        if i > 0
+            && let Some(cap) = cap
+            && per * f64::from(count) > cap
+        {
+            return Ok(None);
+        }
+        per = frame(count)? / f64::from(count);
+        fires = count;
+        Ok(Some(per))
+    })?;
+    Ok(Frames {
+        fires,
+        per_fire_ns: settled.last,
+        capped: settled.capped,
+    })
+}
+
+/// What a backend's rates step measured, and whether a frame it needed
+/// stopped at the device's bound on one submission before it settled.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Measured {
+    pub rates: profile::fire::Rates,
+    pub unsettled: bool,
 }
 
 /// The order a rates step times `len` points in: a fixed stride through
@@ -616,6 +766,166 @@ pub fn provenance(backend: &str, how: &str) -> (&'static str, String) {
     ("rates", format!("\"{}\"", text.replace('"', "'")))
 }
 
+/// Where a load saves the rates it measured: the user's profile of the
+/// device (`profile::Shelf::user_path`), with the backend's `[provenance]
+/// rates` entry naming how, and its check that the file still reads (the
+/// backend's registry, strictly as a user's file).
+pub struct SaveTo<'a> {
+    pub path: std::path::PathBuf,
+    pub provenance: (&'static str, String),
+    pub check: &'a dyn Fn(&str) -> Result<(), String>,
+}
+
+/// The user's file of a device, `existing` (none where there is none yet),
+/// with `measured` (only the keys a load measured) added to its `[rates]`
+/// and `provenance` set in its `[provenance]`: nothing else of the file
+/// changes, and nothing of the profile it resolved to is copied into it.
+#[must_use]
+pub fn saved_text(
+    existing: Option<&str>,
+    measured: &profile::fire::Rates,
+    provenance: &(&'static str, String),
+) -> String {
+    let keys: Vec<String> = measured
+        .toml()
+        .lines()
+        .skip(1)
+        .map(str::to_string)
+        .collect();
+    let entry = format!("{} = {}", provenance.0, provenance.1);
+    let mut lines: Vec<String> = existing
+        .unwrap_or("api = 1\n")
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let header =
+        |lines: &[String], name: &str| lines.iter().position(|l| l.trim() == format!("[{name}]"));
+    // The table's lines after `at`, to the next table.
+    let table_end = |lines: &[String], at: usize| {
+        let mut end = lines[at + 1..]
+            .iter()
+            .position(|l| l.trim_start().starts_with('['))
+            .map_or(lines.len(), |i| at + 1 + i);
+        while end > at + 1 && lines[end - 1].trim().is_empty() {
+            end -= 1;
+        }
+        end
+    };
+    match header(&lines, "rates") {
+        Some(at) => {
+            let end = table_end(&lines, at);
+            lines.splice(end..end, keys);
+        }
+        None => {
+            lines.push(String::new());
+            lines.push("[rates]".to_string());
+            lines.extend(keys);
+        }
+    }
+    match header(&lines, "provenance") {
+        Some(at) => {
+            let end = table_end(&lines, at);
+            let key = format!("{} ", provenance.0);
+            let stated = lines[at + 1..end].iter().position(|l| {
+                l.trim_start().starts_with(&key)
+                    || l.trim_start().starts_with(&format!("{}=", provenance.0))
+            });
+            match stated {
+                Some(i) => lines[at + 1 + i] = entry,
+                None => lines.insert(end, entry),
+            }
+        }
+        None => {
+            lines.push(String::new());
+            lines.push("[provenance]".to_string());
+            lines.push(entry);
+        }
+    }
+    let mut text = lines.join("\n");
+    text.push('\n');
+    text
+}
+
+/// The roofline a load weighs its fires by, one rule for every engine: the
+/// rates `chip`'s layers state where they state every one (a checked-in
+/// profile's over a saved one, `profile::Registry::resolve`); else, before
+/// the load is ready, the device's own, measured by `measure` (the backend's
+/// `pie tune --rates` step, seconds long, its frames sized by
+/// [`timed_frames`] under the device's `max_submit` where it states one),
+/// each rate a layer states kept over the measured one, and what was
+/// measured saved to `save` (with its provenance) so later loads read it
+/// and measure nothing. The returned profile's rates are marked measured
+/// this load, where they were saved and whether a frame stopped at the
+/// bound unsettled, and the load line says so (`engine::load::line_of`).
+/// The step runs at the start of the load, its buffers of `room` (what the
+/// load's budget leaves the device, where the engine can say): where that
+/// holds less than it lays at most ([`step_bytes`]) the load is refused.
+pub fn rates_at_load(
+    chip: profile::Profile,
+    save: Option<SaveTo<'_>>,
+    room: Option<u64>,
+    max_submit: Option<std::time::Duration>,
+    measure: impl FnOnce(Option<std::time::Duration>) -> Result<Measured, String>,
+) -> Result<profile::Profile, String> {
+    let stated = chip.rates();
+    if stated.missing().is_empty() {
+        return Ok(chip);
+    }
+    let lacked = stated.missing();
+    // The step lays its buffers before any of the load's: where the load's
+    // budget leaves the device less than it lays at most, the load is
+    // refused by name, never left to wait for memory.
+    let need = step_bytes();
+    if let Some(room) = room
+        && need > room
+    {
+        return Err(format!(
+            "the profile states no roofline rates {lacked:?}, and measuring them needs {} MiB of \
+             device memory where the load's budget leaves {} MiB",
+            need >> 20,
+            room >> 20
+        ));
+    }
+    let Measured {
+        rates: measured,
+        unsettled,
+    } = measure(max_submit)?;
+    let rates = stated.over(measured);
+    if !rates.missing().is_empty() {
+        return Err(format!(
+            "the device's rates step measured no {:?}: nothing weighs a fire by them",
+            rates.missing()
+        ));
+    }
+    // The user's file gains what this load measured, the keys no layer
+    // stated, and how: nothing else.
+    let saved_to = match save {
+        Some(save) => {
+            let existing = std::fs::read_to_string(&save.path).ok();
+            let text = saved_text(existing.as_deref(), &rates.only(&lacked), &save.provenance);
+            (save.check)(&text).map_err(|why| {
+                format!(
+                    "{}: the measured rates would not read back: {why}",
+                    save.path.display()
+                )
+            })?;
+            if let Some(dir) = save.path.parent() {
+                std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+            }
+            std::fs::write(&save.path, text)
+                .map_err(|e| format!("{}: {e}", save.path.display()))?;
+            Some(save.path.display().to_string())
+        }
+        None => None,
+    };
+    let mut tuned = chip.tuned().clone();
+    tuned.rates = rates;
+    tuned.measured_this_load = true;
+    tuned.saved_to = saved_to;
+    tuned.frame_cut = unsettled;
+    Ok(chip.with_tuned(tuned))
+}
+
 /// The commit this pie was built from, as the build stated it in
 /// `PIE_COMMIT`, else `commit unknown`: never the source tree's `HEAD` at
 /// tune time, which may have moved on since the build. A rates step's
@@ -653,6 +963,275 @@ fn civil(days: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A profile of the toy registry stating `rates`.
+    fn chip(rates: profile::fire::Rates) -> profile::Profile {
+        let p = profile::Registry::new("toy", &[], &[]).defaults();
+        let mut tuned = p.tuned().clone();
+        tuned.rates = rates;
+        p.with_tuned(tuned)
+    }
+
+    fn all() -> profile::fire::Rates {
+        profile::fire::Rates {
+            launch_ns: Some(900),
+            gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 100.0), (8192, 200.0)])]),
+            attn_tflops_by_keys: Some(vec![(512, 50.0), (8192, 150.0)]),
+            hbm_gbps: Some(700.0),
+            elementwise_gbps: Some(500.0),
+            scan_gelems: Some(2000.0),
+        }
+    }
+
+    #[test]
+    fn a_load_without_the_constants_measures_saves_and_says_so() {
+        let dir = std::env::temp_dir().join(format!("pie-rates-at-load-{}", std::process::id()));
+        let path = dir.join("vulkan/user/card-x.toml");
+        let check = |_: &str| Ok(());
+        // A checked-in launch, nothing else: the rest measured, the launch
+        // kept, each submission under the budget asked.
+        let stated = profile::fire::Rates {
+            launch_ns: Some(1234),
+            ..profile::fire::Rates::default()
+        };
+        let mut asked = None;
+        let p = rates_at_load(
+            chip(stated),
+            Some(SaveTo {
+                path: path.clone(),
+                provenance: provenance("toy", "a test"),
+                check: &check,
+            }),
+            None,
+            Some(std::time::Duration::from_millis(5)),
+            |max_submit| {
+                asked = max_submit;
+                Ok(Measured {
+                    rates: all(),
+                    unsettled: true,
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(asked, Some(std::time::Duration::from_millis(5)));
+        assert_eq!(p.rates().launch_ns, Some(1234), "the stated value kept");
+        assert_eq!(p.rates().hbm_gbps, Some(700.0));
+        assert!(p.tuned().measured_this_load);
+        assert_eq!(p.tuned().saved_to.as_deref(), Some(path.to_str().unwrap()));
+        // The file holds what was measured and how, not the stated launch.
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("gemm_tflops_by_rows = [\n  [4096, [[256, 100.0], [8192, 200.0]]],\n]"),
+            "{text}"
+        );
+        assert!(!text.contains("launch_ns"), "{text}");
+        assert!(
+            text.contains("[provenance]\nrates = \"pie tune toy --rates on "),
+            "{text}"
+        );
+        // The line says it was measured here and where it went.
+        let line = crate::load::measured_line(p.tuned()).unwrap();
+        assert!(line.starts_with("measured the roofline at load"), "{line}");
+        // A frame the 5 ms bound stopped before it settled: said.
+        assert!(p.tuned().frame_cut);
+        assert!(
+            line.contains("stopped at the device's bound on one submission"),
+            "{line}"
+        );
+        assert!(
+            line.ends_with(&format!("saved to {}", path.display())),
+            "{line}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_next_load_reads_what_the_first_saved_and_measures_nothing() {
+        static SHELF: profile::Shelf = profile::Shelf {
+            backend: "toy",
+            seeded: &[],
+            derived: None,
+        };
+        let registry = profile::Registry::new("toy", &[], &[]);
+        let facts = profile::Facts::of(&registry);
+        let dir = std::env::temp_dir().join(format!("pie-rates-next-{}", std::process::id()));
+        let (first, _) = SHELF.resolve(&registry, "Card X", &facts, Some(&dir));
+        assert!(!first.rates().missing().is_empty());
+        let check = |text: &str| {
+            registry
+                .parse(text, "saved", profile::Strict::User)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        };
+        let measured = rates_at_load(
+            first,
+            Some(SaveTo {
+                path: SHELF.user_path(&dir, "Card X"),
+                provenance: provenance("toy", "a test"),
+                check: &check,
+            }),
+            None,
+            None,
+            |_| {
+                Ok(Measured {
+                    rates: all(),
+                    unsettled: false,
+                })
+            },
+        )
+        .unwrap();
+        assert!(measured.tuned().measured_this_load);
+        // The next load resolves the saved file: every constant stated, so
+        // it measures nothing and its line names no measurement.
+        let (second, _) = SHELF.resolve(&registry, "Card X", &facts, Some(&dir));
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(second.rates(), all());
+        let second = rates_at_load(second, None, None, None, |_| -> Result<_, String> {
+            panic!("measured what the first load saved")
+        })
+        .unwrap();
+        assert!(!second.tuned().measured_this_load);
+    }
+
+    #[test]
+    fn a_saved_file_gains_the_measured_keys_and_their_provenance_alone() {
+        let measured = profile::fire::Rates {
+            hbm_gbps: Some(700.0),
+            ..profile::fire::Rates::default()
+        };
+        let how = ("rates", "\"measured at load\"".to_string());
+        // No file yet: the keys and how, nothing else.
+        assert_eq!(
+            saved_text(None, &measured, &how),
+            "api = 1\n\n[rates]\nhbm_gbps = 700.0\n\n[provenance]\nrates = \"measured at load\"\n"
+        );
+        // A user's file: its decisions kept, its [rates] gaining the key,
+        // its provenance's rates entry replaced, the rest left.
+        let existing = "api = 1\n[engine]\ngraphs = \"on\"\n\n[rates]\nlaunch_ns = 900\n\n[provenance]\nsource = \"me\"\nrates = \"old\"\n";
+        assert_eq!(
+            saved_text(Some(existing), &measured, &how),
+            "api = 1\n[engine]\ngraphs = \"on\"\n\n[rates]\nlaunch_ns = 900\nhbm_gbps = 700.0\n\n[provenance]\nsource = \"me\"\nrates = \"measured at load\"\n"
+        );
+    }
+
+    #[test]
+    fn a_budget_short_of_the_step_is_refused_by_name_and_measures_nothing() {
+        let short = step_bytes() - 1;
+        let err = rates_at_load(
+            chip(profile::fire::Rates::default()),
+            None,
+            Some(short),
+            None,
+            |_| -> Result<_, String> { panic!("measured past a short budget") },
+        )
+        .unwrap_err();
+        assert!(err.contains("measuring them needs"), "{err}");
+    }
+
+    #[test]
+    fn a_load_whose_layers_state_every_constant_measures_nothing() {
+        let p = rates_at_load(chip(all()), None, None, None, |_| -> Result<_, String> {
+            panic!("measured a profile stating every constant")
+        })
+        .unwrap();
+        assert_eq!(p.rates(), all());
+        assert!(!p.tuned().measured_this_load);
+        assert_eq!(crate::load::measured_line(p.tuned()), None);
+    }
+
+    #[test]
+    fn a_frame_doubles_until_a_fire_settles_and_no_further_than_the_cap() {
+        let ms = |n: u64| std::time::Duration::from_millis(n);
+        // A fire of 1 ms behind a 300 us submission: frames of 1, 2, 4, ...
+        // until two agree within AGREEMENT (the submission amortized).
+        let mut laid = Vec::new();
+        let f = timed_frames(
+            None,
+            None,
+            |n| {
+                laid.push(n);
+                Ok::<_, String>(300e3 + 1e6 * f64::from(n))
+            },
+            |why| why,
+        )
+        .unwrap();
+        assert_eq!(laid, [1, 2, 4, 8, 16]);
+        assert_eq!((f.fires, f.capped), (16, false));
+        assert!((f.per_fire_ns - 1.01875e6).abs() < 1.0);
+        // A 3 ms bound stops the doubling at 2 fires, unsettled.
+        let f = timed_frames(
+            Some(ms(3)),
+            None,
+            |n| Ok::<_, String>(300e3 + 1e6 * f64::from(n)),
+            |w| w,
+        )
+        .unwrap();
+        assert_eq!((f.fires, f.capped), (2, true));
+        // One fire estimated past the bound: refused, no frame laid.
+        let e = timed_frames(
+            Some(ms(5)),
+            Some(8e6),
+            |_| -> Result<f64, String> { panic!("laid a frame") },
+            |w| w,
+        )
+        .unwrap_err();
+        assert!(e.contains("past the device's bound of 5.0 ms"), "{e}");
+    }
+
+    #[test]
+    fn the_warm_up_settles_by_the_same_rule() {
+        // Rates falling 20%, 10%, then 2% and 1%: settled at the fifth.
+        let mut rates = [100.0, 80.0, 72.0, 70.6, 70.0].into_iter();
+        let w = warm_up(|| Ok::<_, ()>(rates.next().unwrap())).unwrap();
+        assert_eq!((w.rotations, w.rate), (5, 70.0));
+    }
+
+    #[test]
+    fn a_memory_bound_rate_warms_until_it_stops_rising() {
+        // An M1's per-row ops reading the DVFS levels 146, 175, 217, 262 GB/s
+        // as their own op warms the clock: timed at the sustained 262.
+        let mut rates = [146.0, 175.0, 217.0, 262.0, 263.0, 262.5, 300.0].into_iter();
+        let w = warm_up(|| Ok::<_, ()>(rates.next().unwrap())).unwrap();
+        assert_eq!((w.rotations, w.rate), (6, 262.5));
+    }
+
+    #[test]
+    fn a_short_frame_in_one_clock_state_does_not_settle_the_measurement() {
+        // A bimodal clock: frames under 4 ms (four fires of 1 ms) run in the
+        // slow state, 2 ms a fire, and agree with each other; frames past it
+        // reach the sustained 1 ms. Two agreeing points would stop at the
+        // slow state; three agreeing points span 4x and find the sustained.
+        let mut laid = Vec::new();
+        let f = timed_frames(
+            None,
+            None,
+            |n| {
+                laid.push(n);
+                let per = match n {
+                    1 => 2.0e6,
+                    2 => 1.98e6,
+                    4 => 1.3e6,
+                    _ => 1.0e6,
+                };
+                Ok::<_, String>(per * f64::from(n))
+            },
+            |w| w,
+        )
+        .unwrap();
+        assert_eq!(laid, [1, 2, 4, 8, 16, 32]);
+        assert_eq!((f.fires, f.per_fire_ns), (32, 1.0e6));
+    }
+
+    #[test]
+    fn the_rotation_carries_across_frames() {
+        // Three frames of two fires over five sets: 0 1 | 2 3 | 4 0, never
+        // 0 1 | 0 1 | 0 1.
+        let turn = Rotation::default();
+        let frames: Vec<Vec<usize>> = (0..3)
+            .map(|_| (0..2).map(|_| turn.next(5)).collect())
+            .collect();
+        assert_eq!(frames, [vec![0, 1], vec![2, 3], vec![4, 0]]);
+    }
 
     /// Every shape's cost a row as `f(rows)` over `lattice`.
     fn costs(lattice: &[u32], shapes: usize, f: impl Fn(usize, u32) -> f64) -> Vec<Vec<f64>> {
@@ -887,18 +1466,20 @@ mod tests {
 
     #[test]
     fn the_warm_up_runs_until_its_rate_stops_falling() {
-        // A clock sinking 100, 96, 93, 92 then holding: four rotations to
-        // the first not slower than the one before.
-        let mut rates = [100.0, 96.0, 93.0, 92.0, 92.5, 80.0].into_iter();
+        // A clock sinking 100, 90, 84, then 82 and 82.5: five rotations, to
+        // the second step in a row that moves it by less than AGREEMENT
+        // (the stop rule every measurement settles by; it was the first
+        // rotation not slower than the one before).
+        let mut rates = [100.0, 90.0, 84.0, 82.0, 82.5, 80.0].into_iter();
         let warmed = warm_up(|| Ok::<f64, ()>(rates.next().unwrap())).unwrap();
-        assert_eq!((warmed.rotations, warmed.rate), (5, 92.5));
-        // A warm device: two rotations.
-        let mut rates = [100.0, 100.0].into_iter();
+        assert_eq!((warmed.rotations, warmed.rate), (5, 82.5));
+        // A warm device: three rotations.
+        let mut rates = [100.0, 100.0, 100.0].into_iter();
         assert_eq!(
             warm_up(|| Ok::<f64, ()>(rates.next().unwrap()))
                 .unwrap()
                 .rotations,
-            2
+            3
         );
     }
 
