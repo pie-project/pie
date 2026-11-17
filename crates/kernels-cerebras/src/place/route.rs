@@ -46,9 +46,30 @@ struct Wire {
     to: Coord,
 }
 
+/// How a program holds its routes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Held {
+    /// Loaded by each PE's kernel at its start (a decode program's rcfg): a PE holds its
+    /// kernel's route table, an idle PE a wire crosses becomes a relay.
+    Kernel,
+    /// Stated in the layout (`@set_color_config`: the stream, grid, GEMM and tiled regimes):
+    /// any PE holds a route a colour, an idle one included.
+    Layout,
+}
+
 /// Routes every gap of `w`'s paths (see the module doc); the idle PEs a wire crosses become
 /// relays (`floor`'s relay rectangles, one a PE).
 pub fn fill(floor: &mut Floor, w: &mut Wiring) -> R<()> {
+    fill_held(floor, w, Held::Kernel)
+}
+
+/// [`fill`] for a program whose layout states its routes (a stream program's): every PE holds a
+/// route a colour, and an idle PE needs no kernel to carry one.
+pub fn fill_layout(floor: &mut Floor, w: &mut Wiring) -> R<()> {
+    fill_held(floor, w, Held::Layout)
+}
+
+fn fill_held(floor: &mut Floor, w: &mut Wiring, held: Held) -> R<()> {
     let mut wires: Vec<Wire> = Vec::new();
     for (li, l) in w.links.iter().enumerate() {
         if let Link::Path(p) = l {
@@ -86,7 +107,13 @@ pub fn fill(floor: &mut Floor, w: &mut Wiring) -> R<()> {
     let cap: Vec<u32> = floor
         .roles
         .iter()
-        .map(|(c, r)| slots(r).saturating_sub(fixed[idx(c)].len() as u32))
+        .map(|(c, r)| {
+            let room = match held {
+                Held::Kernel => slots(r),
+                Held::Layout => u32::from(crate::fabric::COLOURS),
+            };
+            room.saturating_sub(fixed[idx(c)].len() as u32)
+        })
         .collect();
     let mut hist = vec![0u64; (fw * fh) as usize];
     let mut routes: Vec<Vec<Coord>> = vec![Vec::new(); wires.len()];
@@ -95,7 +122,7 @@ pub fn fill(floor: &mut Floor, w: &mut Wiring) -> R<()> {
         // present use a PE: wires through it, and of each class
         let mut used: HashMap<usize, (u32, BTreeMap<Class, u32>)> = HashMap::new();
         for (i, wi) in wires.iter().enumerate() {
-            let r = route_one(floor, wi, &fixed, &cap, &hist, &used, pres)?;
+            let r = route_one(floor, wi, &fixed, &cap, &hist, &used, pres, held)?;
             for &c in &r {
                 let e = used.entry(idx(c)).or_default();
                 e.0 += 1;
@@ -145,7 +172,7 @@ pub fn fill(floor: &mut Floor, w: &mut Wiring) -> R<()> {
             }
         }
         for &c in &pts {
-            if floor.roles.get(c).is_idle() {
+            if held == Held::Kernel && floor.roles.get(c).is_idle() {
                 *floor.roles.get_mut(c) = PeRole::new(Kind::RELAY, Place::None);
                 floor.relays.push(Rect::new(c.x, c.y, 1, 1));
             }
@@ -156,6 +183,7 @@ pub fn fill(floor: &mut Floor, w: &mut Wiring) -> R<()> {
 }
 
 /// The cheapest path of `w` (its ends included), within a window around its ends.
+#[allow(clippy::too_many_arguments)]
 fn route_one(
     floor: &Floor,
     w: &Wire,
@@ -164,6 +192,7 @@ fn route_one(
     hist: &[u64],
     used: &HashMap<usize, (u32, BTreeMap<Class, u32>)>,
     pres: u64,
+    held: Held,
 ) -> R<Vec<Coord>> {
     let (fw, fh) = (floor.w, floor.h);
     let mut margin = MARGIN;
@@ -172,7 +201,17 @@ fn route_one(
         let y0 = w.from.y.min(w.to.y).saturating_sub(margin);
         let x1 = (w.from.x.max(w.to.x) + margin).min(fw - 1);
         let y1 = (w.from.y.max(w.to.y) + margin).min(fh - 1);
-        if let Some(r) = astar(floor, w, fixed, cap, hist, used, pres, (x0, y0, x1, y1)) {
+        if let Some(r) = astar(
+            floor,
+            w,
+            fixed,
+            cap,
+            hist,
+            used,
+            pres,
+            held,
+            (x0, y0, x1, y1),
+        ) {
             return Ok(r);
         }
         if x0 == 0 && y0 == 0 && x1 == fw - 1 && y1 == fh - 1 {
@@ -194,6 +233,7 @@ fn astar(
     hist: &[u64],
     used: &HashMap<usize, (u32, BTreeMap<Class, u32>)>,
     pres: u64,
+    held: Held,
     (x0, y0, x1, y1): (u32, u32, u32, u32),
 ) -> Option<Vec<Coord>> {
     let fw = floor.w;
@@ -249,7 +289,7 @@ fn astar(
             if came != 0 && came != dir {
                 cost += TURN;
             }
-            if floor.roles.get(d).is_idle() {
+            if held == Held::Kernel && floor.roles.get(d).is_idle() {
                 cost += IDLE;
             }
             if let Some((k, by)) = used.get(&p) {

@@ -142,6 +142,10 @@ pub struct KvColumn {
     pub units: Vec<usize>,
     pub pya: u32,
     pub sub: u32,
+    /// Its root where a placer put it ([`KvColumn::at`]); `None`: under its first unit's head
+    /// column, as the module doc lays it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at: Option<Coord>,
 }
 
 /// The lane bus: from the lane root (the lane unit's corner) up its CX column, along row 0, and
@@ -213,9 +217,22 @@ pub struct UnitAsk {
 }
 
 impl KvColumn {
+    /// This column with its root at `root` (a placer's): its PEs below it as before, its links
+    /// to the block's units routed.
+    #[must_use]
+    pub fn at(&self, root: Coord) -> KvColumn {
+        KvColumn {
+            at: Some(root),
+            ..self.clone()
+        }
+    }
+
     /// The column's root.
     #[must_use]
     pub fn root(&self, s: &Stream) -> Coord {
+        if let Some(at) = self.at {
+            return at;
+        }
         let u = &s.units[self.units[0]];
         if self.sub > 1 {
             return Coord::new(u.cy(self.head).x, u.y + s.py + 2 + s.turns);
@@ -244,6 +261,10 @@ impl KvColumn {
     #[must_use]
     pub fn link(&self, s: &Stream, k: usize) -> Vec<Coord> {
         let root = self.root(s);
+        if self.at.is_some() {
+            // a placed root: the link's ends, the router's to join ([`crate::place::route`])
+            return vec![s.units[self.units[k]].cy(self.head), root];
+        }
         let u = &s.units[self.units[k]];
         let top = u.cy(self.head);
         let turn = s.units[self.units[0]].y + s.py + 2 + self.head;
@@ -410,6 +431,7 @@ impl Stream {
                         units: blk.clone(),
                         pya,
                         sub,
+                        at: None,
                     });
                 }
             }

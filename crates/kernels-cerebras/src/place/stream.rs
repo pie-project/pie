@@ -60,9 +60,9 @@ pub fn problem(s: &Stream, w: &Wiring) -> R<Problem> {
     Problem::of(s.w, s.h, rects, w, &kind)
 }
 
-/// `s` with its units where `sol` puts them, on `sol`'s fabric. A K / V column sits where its
-/// block's first unit puts it (an origin of its own wants the router: refused here), the lane
-/// bus's receivers move with their units.
+/// `s` with its units where `sol` puts them, on `sol`'s fabric. A K / V column moved with its
+/// block's first unit stays under it; one moved apart takes its own root ([`KvColumn::at`]),
+/// its links routed by [`relay`]. The lane bus's receivers move with their units.
 pub fn stream(p: &Problem, s: &Stream, sol: &Solution) -> R<Stream> {
     let mut out = s.clone();
     out.w = sol.w;
@@ -82,10 +82,11 @@ pub fn stream(p: &Problem, s: &Stream, sol: &Solution) -> R<Stream> {
     for (i, b) in p.blocks.iter().enumerate() {
         if let BlockKind::KvColumn(k) = b.kind {
             let first = s.kv[k].units[0];
-            if Some(sol.delta(p, i)) != delta(first) {
-                return Err(format!(
-                    "place: K / V column {k} moved apart from its first unit wants the router"
-                ));
+            let d = sol.delta(p, i);
+            if Some(d) != delta(first) {
+                // a column placed apart from its first unit: its root where the solution puts
+                // it, its links to the block's units routed ([`relay`])
+                out.kv[k] = s.kv[k].at(super::shift(s.kv[k].root(s), d)?);
             }
         }
     }
@@ -100,10 +101,12 @@ pub fn stream(p: &Problem, s: &Stream, sol: &Solution) -> R<Stream> {
     Ok(out)
 }
 
-/// `prog` re-laid on `s`: its links, palette and fabric.
+/// `prog` re-laid on `s`: its links (the ones `s` states by their ends routed,
+/// [`super::route::fill_layout`]), palette and fabric.
 pub fn relay(prog: &Program, s: Stream) -> R<Program> {
-    let wiring = s.wiring();
-    let floor = s.floor();
+    let mut wiring = s.wiring();
+    let mut floor = s.floor();
+    super::route::fill_layout(&mut floor, &mut wiring)?;
     let palette = Palette::allocate(Vec::new(), &floor, &wiring)?;
     let fabric = Fabric::lay(&floor, &wiring, &palette)?;
     fabric.validate(&floor)?;
@@ -120,6 +123,57 @@ pub fn relay(prog: &Program, s: Stream) -> R<Program> {
         lane_at: prog.lane_at.clone(),
         round16: prog.round16,
     })
+}
+
+/// `prog` with every K / V column moved `dy` rows down from where it is (the units where they
+/// are, the fabric grown to hold it), its links routed: a placement differing from `prog`'s
+/// in its K / V columns alone (the link term's chip calibration).
+pub fn kv_moved(prog: &Program, dy: u32) -> R<Program> {
+    let w = prog.stream.wiring();
+    let p = problem(&prog.stream, &w)?;
+    let mut sol = Solution::pinned(&p);
+    for (i, b) in p.blocks.iter().enumerate() {
+        if matches!(b.kind, BlockKind::KvColumn(_)) {
+            sol.at[i].y += dy;
+        }
+    }
+    sol.h = (0..p.blocks.len())
+        .map(|i| {
+            let r = sol.rect(&p, i);
+            r.y + r.h
+        })
+        .max()
+        .unwrap_or(0)
+        .max(prog.stream.h);
+    relay(prog, stream(&p, &prog.stream, &sol)?)
+}
+
+/// `prog`'s files into `out` as `stream::compile` writes a reading's (its CSL, `fabric.txt`,
+/// `stream.json`, the host's files), its static check run.
+pub fn write(prog: &Program, out: &std::path::Path) -> R<()> {
+    let e = crate::emit::stream::emit(prog)?;
+    std::fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
+    for (name, text) in &e.files {
+        std::fs::write(out.join(name), text).map_err(|e| format!("{name}: {e}"))?;
+    }
+    crate::check::written(&e.placed, &e.files, None);
+    std::fs::write(
+        out.join("fabric.txt"),
+        format!("{} {} {}\n", e.w, e.h, u8::from(prog.round16)),
+    )
+    .map_err(|e| e.to_string())?;
+    let meta = serde_json::json!({
+        "fabric": [e.w, e.h],
+        "py": prog.stream.py,
+        "cost": crate::cost::stream::time(prog),
+        "links": super::cost::stream(prog)?,
+    });
+    std::fs::write(
+        out.join("stream.json"),
+        serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    crate::stream::host::write(prog, &e.arrays, None, out)
 }
 
 #[cfg(test)]
@@ -166,6 +220,45 @@ mod tests {
             pr.nets.len(),
             a.files.len()
         );
+    }
+
+    /// flux2-mini's denoise with its K / V columns 300 rows below their roots' units: every
+    /// K / V link routed, the program laid and checked, the link term's round trips longer by
+    /// the hops moved there and back and its fill alike.
+    #[test]
+    fn k_v_columns_placed_apart_route_and_check() {
+        let t = trace("flux2-mini-bf16-kv-bf16");
+        let s = crate::stream::shape_of(&t, "denoise", 16).unwrap();
+        let p = crate::stream::build::program(&t, s, true).unwrap();
+        let q = super::kv_moved(&p, 300).unwrap_or_else(|e| panic!("{e}"));
+        assert!(q.stream.h >= p.stream.h + 300);
+        let (a, b) = (
+            super::super::cost::stream(&p).unwrap(),
+            super::super::cost::stream(&q).unwrap(),
+        );
+        assert_eq!(a.fill_hops, b.fill_hops);
+        assert_eq!(a.trips.len(), b.trips.len());
+        for (x, y) in a.trips.iter().zip(&b.trips) {
+            assert!(y.hops >= x.hops + 2 * 300, "{x:?} {y:?}");
+        }
+        let e = crate::emit::stream::emit(&p).unwrap();
+        let base = crate::check::placed(&e.placed, &e.files, None);
+        let e = crate::emit::stream::emit(&q).unwrap();
+        let rep = crate::check::placed(&e.placed, &e.files, None);
+        // (the warnings the program had where it was, and no new kind)
+        let kind = |w: &String| w.replace(|c: char| c.is_ascii_digit(), "");
+        let had: std::collections::BTreeSet<String> = base.warnings.iter().map(kind).collect();
+        for w in &rep.warnings {
+            assert!(had.contains(&kind(w)), "a new warning: {w}");
+        }
+        eprintln!("as laid: {}", base.line());
+        eprintln!(
+            "{}; links {:.0} -> {:.0} cycles",
+            rep.line(),
+            a.cycles,
+            b.cycles
+        );
+        rep.ok().unwrap_or_else(|e| panic!("{e}"));
     }
 
     /// The placer pinned to a stream program's own placement reproduces it: flux2-mini's
