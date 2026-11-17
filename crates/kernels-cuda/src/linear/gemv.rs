@@ -83,12 +83,15 @@ pub fn gemv(
 /// A generated body holds no fields; C++ gives the empty struct one byte.
 const NO_FIELDS: u8 = 0;
 
-/// The warps a row of the few-rows kernel splits K over: eight where K
-/// divides so, the most blocks and the fewest dependent loads a lane.
+/// The warps a row of the few-rows kernel splits K over: the most (of
+/// eight) that divide K's eight-element vectors and still give each of a
+/// warp's 32 lanes one of its slice (a split past that leaves lanes idle);
+/// one where none does.
 fn rows_split(k: i32) -> i32 {
+    let vectors = k / 8;
     [8, 4, 2, 1]
         .into_iter()
-        .find(|s| (k / 8) % s == 0)
+        .find(|s| vectors % s == 0 && vectors / s >= 32)
         .unwrap_or(1)
 }
 
