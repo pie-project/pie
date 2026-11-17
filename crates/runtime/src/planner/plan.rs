@@ -155,7 +155,16 @@ impl ResidencyPlanner {
             });
             let fund_by_eviction = match step {
                 Step::Done => return false,
-                Step::EvictForRoles => true,
+                Step::EvictForRoles => {
+                    // Idle cache holds chunks too: one set goes, and the
+                    // restore tries again in what it left, before any
+                    // resident moves for it.
+                    if self.reclaim_idle_once() || self.sweep_stranded(u32::MAX, false) {
+                        self.with_inner(|inner| inner.roles_retry_head());
+                        continue;
+                    }
+                    true
+                }
                 Step::Release(stranded) => {
                     drop(stranded);
                     return false;

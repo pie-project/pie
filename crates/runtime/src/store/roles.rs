@@ -130,6 +130,11 @@ pub enum RolesError {
     AdapterParked,
     #[error("{0}'s state is parked with the instances that hold it")]
     PairParked(FireKey),
+    /// A bind found no device room for its items now, though the budget's
+    /// state chunks hold them: it waits for room given back (a process
+    /// completing, or parked), and binds again ([`bind_when_resident`]).
+    #[error("{0}; the budget holds it, so the bind waits for room")]
+    BindShort(Box<RolesError>),
     /// A parked process's items found no device room now, though the
     /// budget's state chunks hold them: the restore waits, queued, for room
     /// a completion or an eviction frees, and is never failed for it.
@@ -526,6 +531,41 @@ pub struct Roles {
     /// The guest (program, extents) pairs whose room has been stated
     /// ([`Self::take_instance`]): each states it once, at its first bind.
     stated: std::collections::HashSet<FireKey>,
+    /// Told each time guest state's device room is given back
+    /// ([`Self::room_watch`]).
+    freed: Arc<Freed>,
+}
+
+/// Device room given back: a count of the gives, and their event.
+#[derive(Debug, Default)]
+pub struct Freed {
+    gives: std::sync::atomic::AtomicU64,
+    notify: tokio::sync::Notify,
+}
+
+/// A watch on device room given back from when it was taken: what a bind
+/// short of room waits on ([`bind_when_resident`]).
+#[derive(Debug, Clone)]
+pub struct RoomWatch {
+    freed: Arc<Freed>,
+    seen: u64,
+}
+
+impl RoomWatch {
+    /// Ends once device slots have been given back since the watch was
+    /// taken: at once where some were already.
+    pub async fn freed(self) {
+        use std::sync::atomic::Ordering;
+        loop {
+            let notified = self.freed.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.freed.gives.load(Ordering::Acquire) != self.seen {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 impl Roles {
@@ -553,7 +593,31 @@ impl Roles {
             held: Vec::new(),
             chunk_slots,
             stated: std::collections::HashSet::new(),
+            freed: Arc::default(),
         })
+    }
+
+    /// Whether `holder` holds guest state on the device: a bind of its
+    /// short of room would wait on room it holds itself.
+    #[must_use]
+    pub fn holds_guest_state(&self, holder: Holder) -> bool {
+        self.items.values().any(|item| {
+            item.holder == Some(holder)
+                && item.tier == Tier::Device
+                && item
+                    .parts
+                    .iter()
+                    .any(|part| part.dead() && !part.refs.is_empty())
+        })
+    }
+
+    /// A watch on device room given back from now on.
+    #[must_use]
+    pub fn room_watch(&self) -> RoomWatch {
+        RoomWatch {
+            seen: self.freed.gives.load(std::sync::atomic::Ordering::Acquire),
+            freed: Arc::clone(&self.freed),
+        }
     }
 
     fn shape(&self, role: SlotRole) -> Result<FixedShape, RolesError> {
@@ -665,10 +729,17 @@ impl Roles {
         let room = room.with_committable(committable);
         if free.saturating_add(committable) < pieces {
             pool.unwait(GUEST_WAITER);
-            return Err(RolesError::GuestShort {
+            let short = RolesError::GuestShort {
                 what: what(),
                 bytes,
                 room,
+            };
+            let state_chunks = u64::from(device.state_chunks_now());
+            let asks = u64::from(chunks) * u64::from(pieces);
+            return Err(if asks <= state_chunks {
+                RolesError::BindShort(Box::new(short))
+            } else {
+                short
             });
         }
         let slots = u64::from(chunks) * u64::from(pieces) * u64::from(self.chunk_slots);
@@ -736,12 +807,31 @@ impl Roles {
         self.device.lock().unwrap().pool().free_chunk_runs(run)
     }
 
+    /// Gives `parts` back on `on`: a failed take's rollback, which frees no
+    /// room a waiter lacked (a take is all or none).
     fn give(&self, on: &Shared, parts: &[Part]) {
         let mut pool = on.lock().unwrap();
         for part in parts.iter().filter(|part| !part.refs.is_empty()) {
             if let Some(shape) = self.shapes.of(part.role) {
                 pool.give_refs(shape.pool, &part.refs);
             }
+        }
+    }
+
+    /// Gives back `parts` a closed or parked item held on `on`: guest state
+    /// given back on the device is the room a bind short of it waits on
+    /// ([`Self::room_watch`]), and its waiters are told.
+    fn give_freeing(&self, on: &Shared, parts: &[Part]) {
+        self.give(on, parts);
+        if Arc::ptr_eq(on, &self.device)
+            && parts
+                .iter()
+                .any(|part| part.dead() && !part.refs.is_empty())
+        {
+            self.freed
+                .gives
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            self.freed.notify.notify_waiters();
         }
     }
 
@@ -1073,7 +1163,7 @@ impl Roles {
         let item = self.items.remove(&owner).expect("present");
         let on = self.tier(item.tier == Tier::Host);
         if let Some(on) = on {
-            self.give(&on, &item.parts);
+            self.give_freeing(&on, &item.parts);
         }
     }
 
@@ -1256,7 +1346,7 @@ impl Roles {
             item.tier = if txn.out { Tier::Host } else { Tier::Device };
             item.stale = !txn.out;
             if let Some(left) = &left {
-                self.give(left, &old);
+                self.give_freeing(left, &old);
             }
             self.free_if_done(owner);
         }
@@ -1563,6 +1653,8 @@ pub async fn bind_when_resident<T, E, B, W, G>(
     mut bind: impl FnMut() -> B,
     resident: impl Fn() -> W,
     grown: impl Fn(u32, u32) -> G,
+    room: impl Fn() -> Option<RoomWatch>,
+    suspend: impl Fn() -> bool,
 ) -> anyhow::Result<T>
 where
     E: std::fmt::Display,
@@ -1571,10 +1663,33 @@ where
     G: std::future::Future<Output = Result<(), String>>,
 {
     loop {
+        // Taken before the bind: room given back meanwhile is not lost.
+        let watch = room();
         let error = match bind().await {
             Ok(bound) => return Ok(bound),
             Err(error) => error,
         };
+        if matches!(
+            error.downcast_ref::<RolesError>(),
+            Some(RolesError::BindShort(_))
+        ) {
+            // Holding guest state of its own, it would wait on itself: it is
+            // suspended, its state given back, and binds once restored.
+            if suspend() {
+                tracing::debug!(%pid, %error, "a bind short of room suspends its process");
+                if let Err(why) = resident().await {
+                    return Err(error.context(format!(
+                        "its process was suspended for room and is not resident again: {why}"
+                    )));
+                }
+                continue;
+            }
+            if let Some(watch) = watch {
+                tracing::debug!(%pid, %error, "a bind waits for room given back");
+                watch.freed().await;
+                continue;
+            }
+        }
         if let Some(&RolesError::GuestGrow { prefix, run, .. }) = error.downcast_ref::<RolesError>()
         {
             tracing::debug!(%pid, %error, "a bind waits on a segment commit");

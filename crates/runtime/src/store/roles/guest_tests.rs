@@ -152,6 +152,15 @@ fn pools_of(facts: ChunkFacts) -> Pools {
     }
 }
 
+/// The refusal `error` names: the room a bind found short, whether it
+/// waits for room given back (`RolesError::BindShort`) or is refused.
+fn short_of(error: &anyhow::Error) -> Option<&RolesError> {
+    match error.downcast_ref::<RolesError>() {
+        Some(RolesError::BindShort(short)) => Some(short),
+        other => other,
+    }
+}
+
 /// Bytes the pool's slots hold for live state.
 fn held(pool: &Shared) -> u64 {
     pool.lock().unwrap().pool().demand().live
@@ -319,7 +328,7 @@ fn two_hundred_fifty_six_instances_are_counted_at_bind_and_the_257th_is_refused(
     let named = error.to_string();
     assert!(
         matches!(
-            error.downcast_ref::<RolesError>(),
+            short_of(&error),
             Some(RolesError::GuestShort {
                 bytes: 11_200_000,
                 ..
@@ -757,7 +766,7 @@ fn a_run_is_refused_by_name_where_only_scattered_chunks_are_free() {
     let error = bind_as(&roles, &mut engine, program, 1).expect_err("no run of 3 is free");
     let named = error.to_string();
     assert_eq!(
-        error.downcast_ref::<RolesError>(),
+        short_of(&error),
         Some(&RolesError::GuestShort {
             what: format!(
                 "an instance of {}'s scratch",
@@ -820,10 +829,7 @@ fn mixed_runs_bound_and_closed_then_a_long_run_lands_or_is_refused_by_name() {
                     // Refused by name: a run of chunks, or (run 1, a
                     // chunk's slots) a run of slots, short.
                     assert!(
-                        matches!(
-                            error.downcast_ref::<RolesError>(),
-                            Some(RolesError::GuestShort { .. })
-                        ),
+                        matches!(short_of(&error), Some(RolesError::GuestShort { .. })),
                         "{error}"
                     );
                     refused += 1;
@@ -852,7 +858,7 @@ fn mixed_runs_bound_and_closed_then_a_long_run_lands_or_is_refused_by_name() {
         Err(error) => {
             let named = error.to_string();
             assert_eq!(
-                error.downcast_ref::<RolesError>().map(|error| match error {
+                short_of(&error).map(|error| match error {
                     RolesError::GuestShort { room, .. } => *room,
                     other => panic!("{other}"),
                 }),
@@ -966,7 +972,7 @@ async fn a_guest_bind_short_of_a_run_commits_the_next_segment_and_binds() {
     let named = error.to_string();
     assert!(
         matches!(
-            error.downcast_ref::<RolesError>(),
+            short_of(&error),
             Some(RolesError::GuestShort {
                 room: super::GuestRoom::Runs { committable: 0, .. },
                 ..
@@ -1067,4 +1073,182 @@ fn restores_past_the_free_room_wait_and_all_come_back() {
         back += 1;
     }
     assert_eq!(back, 4, "every restore came back");
+}
+
+/// More binds than the device has room for, the pool whole: the bind past
+/// the room is a wait (`RolesError::BindShort`), not a refusal, and a watch
+/// taken before it ends once another instance closes; the bind then lands
+/// in the room given back. A state no budget holds is still refused.
+#[tokio::test(flavor = "current_thread")]
+async fn a_bind_past_the_room_waits_for_room_given_back() {
+    let Pools { roles, .. } = pools(1 + 4 + 12);
+    let mut engine = GuestEngine::new(11_200_000, 0);
+    let mut ids = Vec::new();
+    for by in 1..=4 {
+        ids.push(bind(&roles, &mut engine, by).unwrap());
+    }
+    let watch = roles.lock().unwrap().room_watch();
+    let short = bind(&roles, &mut engine, 5).expect_err("no room");
+    assert!(
+        matches!(
+            short.downcast_ref::<RolesError>(),
+            Some(RolesError::BindShort(_))
+        ),
+        "a wait, not a refusal: {short}"
+    );
+    let freed = watch.clone().freed();
+    tokio::pin!(freed);
+    assert!(
+        futures::poll!(freed.as_mut()).is_pending(),
+        "nothing given back yet"
+    );
+    roles.lock().unwrap().close_instance(ids[0]);
+    freed.await;
+    bind(&roles, &mut engine, 5).expect("room given back: it binds");
+
+    // Twenty chunks of state: no budget of this pool holds it.
+    let mut huge = GuestEngine::new(20 * CHUNK, 0);
+    huge.next = 200;
+    learn_program(&roles, &mut huge, ProgramId(9)).unwrap();
+    let refused = bind_instance(
+        Some(&roles),
+        &mut huge,
+        &InstanceBinding {
+            program: ProgramId(9),
+            ..InstanceBinding::default()
+        },
+        Some(holder(9)),
+        |_| false,
+    )
+    .expect_err("refused");
+    assert!(
+        matches!(
+            refused.downcast_ref::<RolesError>(),
+            Some(RolesError::GuestShort { .. })
+        ),
+        "{refused}"
+    );
+}
+
+/// Twelve processes, each binding two programs' instances in turn (the
+/// first held while the second binds, as a prefill's sampler and a
+/// decode's), under a pool whose room fits five instances. A bind short of
+/// room its process holds part of suspends the process (its guest state
+/// parked, given back); one holding none waits for room given back; a
+/// parked process comes back once room is there, else waits. Every process
+/// finishes, none is refused, and at the end the pool holds what it held
+/// before: nothing a park, a restore or a close took stays held.
+#[test]
+fn processes_cycling_through_park_restore_and_finish_all_finish_and_give_back_all() {
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Stage {
+        First,
+        Second,
+        Parked,
+        Done,
+    }
+    let Pools { device, roles } = pools(1 + 5 + 12);
+    let before = held(&device);
+    let mut first = GuestEngine::new(11_200_000, 0);
+    let mut second = GuestEngine::new(11_200_000, 0);
+    second.next = 10_000;
+    learn_program(&roles, &mut first, ProgramId(1)).unwrap();
+    learn_program(&roles, &mut second, ProgramId(2)).unwrap();
+    let bind_of = |roles: &RolesHandle, engine: &mut GuestEngine, program: u64, by: u128| {
+        bind_instance(
+            Some(roles),
+            engine,
+            &InstanceBinding {
+                program: ProgramId(program),
+                ..InstanceBinding::default()
+            },
+            Some(holder(by)),
+            |_| false,
+        )
+        .map(|bound| bound.id)
+    };
+    let n = 12;
+    let mut stage = vec![Stage::First; n];
+    let mut ids: Vec<Vec<InstanceId>> = vec![Vec::new(); n];
+    let (mut parks, mut waits) = (0, 0);
+    for _round in 0..10_000 {
+        if stage.iter().all(|s| *s == Stage::Done) {
+            break;
+        }
+        for p in 0..n {
+            let by = p as u128 + 1;
+            match stage[p] {
+                Stage::Done => {}
+                Stage::Parked => match {
+                    let unparked = roles.lock().unwrap().prepare_unpark(holder(by));
+                    unparked
+                } {
+                    Ok(Some(txn)) => {
+                        roles.lock().unwrap().commit(txn);
+                        let stale = roles.lock().unwrap().stale(holder(by));
+                        for rebind in stale {
+                            roles.lock().unwrap().rebound(Owner::of(&rebind));
+                        }
+                        stage[p] = Stage::Second;
+                    }
+                    Ok(None) => stage[p] = Stage::Second,
+                    Err(RolesError::UnparkShort(_)) => waits += 1,
+                    Err(other) => panic!("process {p}'s restore failed: {other}"),
+                },
+                Stage::First | Stage::Second => {
+                    let (engine, program) = if stage[p] == Stage::First {
+                        (&mut first, 1)
+                    } else {
+                        (&mut second, 2)
+                    };
+                    match bind_of(&roles, engine, program, by) {
+                        Ok(id) => {
+                            ids[p].push(id);
+                            if stage[p] == Stage::First {
+                                stage[p] = Stage::Second;
+                            } else {
+                                // Both bound: it runs to its end, closing both.
+                                for id in ids[p].drain(..) {
+                                    roles.lock().unwrap().close_instance(id);
+                                }
+                                stage[p] = Stage::Done;
+                            }
+                        }
+                        Err(error) => {
+                            assert!(
+                                matches!(short_of_wait(&error), Some(RolesError::BindShort(_))),
+                                "process {p} refused: {error}"
+                            );
+                            if roles.lock().unwrap().holds_guest_state(holder(by)) {
+                                let park = roles
+                                    .lock()
+                                    .unwrap()
+                                    .prepare_park(holder(by))
+                                    .expect("its state parks");
+                                roles.lock().unwrap().commit(park);
+                                stage[p] = Stage::Parked;
+                                parks += 1;
+                            } else {
+                                waits += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        stage.iter().all(|s| *s == Stage::Done),
+        "every process finishes: {stage:?}"
+    );
+    assert!(
+        parks > 0 && waits > 0,
+        "the budget fit few: {parks} parks, {waits} waits"
+    );
+    assert_eq!(held(&device), before, "all given back");
+    assert_eq!(roles.lock().unwrap().device_bytes(), 0);
+}
+
+fn short_of_wait(error: &anyhow::Error) -> Option<&RolesError> {
+    error.downcast_ref::<RolesError>()
 }

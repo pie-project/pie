@@ -1355,6 +1355,34 @@ impl SlotPool {
         })
     }
 
+    /// Who holds the pool's slots, by kind of holder (the store's own, as
+    /// guest state and role slots are taken, apart), and the chunks free
+    /// and opened: what a stall is read by.
+    #[must_use]
+    pub fn held_census(&self) -> String {
+        let (mut sets, mut cache, mut snapshots, mut weights, mut store) = (0, 0, 0, 0, 0);
+        for (holder, &slots) in &self.holders {
+            match holder {
+                h if *h == super::chunks::STORE => store += slots,
+                Holder::WorkingSet(_) => sets += slots,
+                Holder::CacheEntry(_) => cache += slots,
+                Holder::Snapshot(_) => snapshots += slots,
+                Holder::Weights { .. } => weights += slots,
+            }
+        }
+        format!(
+            "slots: working_sets={sets} cache={cache} snapshots={snapshots} weights={weights} \
+             store={store} ({} holders); chunks: opened={} free={} committed={} total={} \
+             pending={}",
+            self.holders.len(),
+            self.held,
+            self.free_chunks(),
+            self.committed_chunks(),
+            self.total,
+            self.pending.values().map(Vec::len).sum::<usize>(),
+        )
+    }
+
     /// Records that `waiter` is parked short `slots` of `shape`, replacing
     /// what it was short before.
     pub fn wait(&mut self, waiter: u64, shape: ShapeId, slots: u64) {

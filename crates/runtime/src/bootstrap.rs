@@ -615,6 +615,15 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 interval.tick().await;
                 let d = planner.diagnostics();
                 let (lk_n, lk_wait, lk_hold, lk_wmax, lk_hmax) = planner.lock_census();
+                // Who holds the device pool's slots, whatever the queue.
+                if let Some(shared) = crate::store::registry::try_get(arena_model_idx, 0)
+                    .and_then(|stores| stores.shared)
+                {
+                    println!(
+                        "[pool-held] {}",
+                        shared.lock().unwrap().pool().held_census()
+                    );
+                }
                 if d.queue.is_empty() && d.proc_states[1..].iter().all(|&n| n == 0) {
                     continue;
                 }

@@ -379,6 +379,18 @@ impl Inner {
         RestoreGate::Serve
     }
 
+    /// The head restore waiting on room for its roles goes again: room
+    /// was made for it ([`Step::EvictForRoles`](super::plan)).
+    pub(super) fn roles_retry_head(&mut self) {
+        let Some((_, waiter)) = self.unmet_head() else {
+            return;
+        };
+        let pid = waiter.pid;
+        if let Some(proc) = self.procs.get_mut(&pid) {
+            proc.roles_short = false;
+        }
+    }
+
     pub(super) fn fleet_stalled(&self) -> bool {
         if !self.evicting.is_empty() {
             return false;

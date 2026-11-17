@@ -1118,7 +1118,9 @@ impl SchedulerHandle {
                 )
                 .await
                 .map_err(|why| {
-                    anyhow!("pipeline: a program's standing bytes need a wider activation span: {why}")
+                    anyhow!(
+                        "pipeline: a program's standing bytes need a wider activation span: {why}"
+                    )
                 })?;
                 Some(open)
             }
@@ -1171,8 +1173,27 @@ impl SchedulerHandle {
             )
             .await
         };
+        // Short of room the budget holds, with no segment left to commit,
+        // it waits for room given back (a process completing, or parked),
+        // as an admission waits on pages, never refused for it.
+        let room = || {
+            crate::store::registry::try_get(0, engine)
+                .and_then(|stores| stores.roles)
+                .map(|roles| roles.lock().unwrap().room_watch())
+        };
+        // Holding guest state of its own, it is suspended instead: waiting,
+        // it would hold room its own bind lacks.
+        let suspend = || {
+            let holds = crate::store::registry::try_get(0, engine)
+                .and_then(|stores| stores.roles)
+                .is_some_and(|roles| roles.lock().unwrap().holds_guest_state(pid));
+            holds
+                && crate::planner::planner_of(pid)
+                    .is_some_and(|planner| planner.suspend_for_room(pid))
+        };
         let (registered, _, bound) =
-            crate::store::roles::bind_when_resident(pid, lane_bind, resident, grown).await?;
+            crate::store::roles::bind_when_resident(pid, lane_bind, resident, grown, room, suspend)
+                .await?;
         Ok((registered, bound))
     }
 
