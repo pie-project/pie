@@ -85,6 +85,7 @@ poem = { package = "pie-poem", path = "../poem" }
 ztensor = { workspace = true }
 ztensor-compat = { workspace = true }
 tempfile = "3"
+engine-cpu = { path = "../engine-cpu" }
 
 [lints]
 workspace = true

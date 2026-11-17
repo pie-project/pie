@@ -26,17 +26,61 @@ impl DispatchAttn for Run<'_> {
 }
 
 impl Run<'_> {
+    /// Where a capturing lane's rows lie: its reader's, through the fire's
+    /// tables (`crate::scores`).
+    fn capture_rows(
+        &self,
+        op: &'static str,
+    ) -> Result<kernels_cuda::attn::score::CaptureRows, kernels_cuda::Error> {
+        self.bindings()
+            .score_rows
+            .ok_or_else(|| kernels_cuda::Error::Backend {
+                op,
+                detail: "this load captures no attention scores, so it laid no row tables"
+                    .to_string(),
+            })
+    }
+
     pub(super) fn attention(&mut self, op: &Attn) -> Result<(), kernels_cuda::Error> {
         match op {
-            // A capturing lane's rows lie in its reading program's guest
-            // region (`poem_ir::Dim::Capturing`); this backend lays none
-            // yet, so a capturing fire is refused by name.
-            Attn::ScoreCapture { .. } | Attn::ScorePages { .. } => Err(kernels_cuda::Error::Backend {
-                op: "attn.score_capture",
-                detail: "this backend does not yet lay a capturing lane's score rows in its \
-                         reading program's guest region"
-                    .to_string(),
-            }),
+            Attn::ScoreCapture {
+                q,
+                plan,
+                cache,
+                head_dim,
+                kv_heads,
+                q_heads,
+                sm_scale,
+                observe,
+                into,
+                ..
+            } => {
+                let mut q_rows = self.ragged(*q);
+                q_rows.data = self.windowed(q_rows.data);
+                kernels_cuda::attn::score::capture(
+                    self.ctx(),
+                    q_rows,
+                    self.prefill_plan(*plan),
+                    &self.pool(*cache),
+                    *head_dim,
+                    *kv_heads,
+                    *q_heads,
+                    *sm_scale,
+                    *observe,
+                    self.window().span().lane_offset,
+                    self.capture_rows("attn.score_capture")?,
+                    into.is_none(),
+                )
+            }
+            Attn::ScorePages { .. } => {
+                let span = self.window().span();
+                kernels_cuda::attn::score::pages(
+                    self.ctx(),
+                    self.capture_rows("attn.score_pages")?,
+                    span.lane_offset,
+                    span.lanes,
+                )
+            }
             Attn::Voxel {
                 q,
                 k,

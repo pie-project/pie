@@ -498,15 +498,15 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
 /// The token and lane budgets fitted to what the card has with the weights
 /// resident. What a fire's working set takes at those budgets (the
 /// activation arena, the attention workspaces, the decoded-weight tiles, the
-/// guests' programs, the capturing lanes' score planes and the readout
-/// indices) is held to half of the card past the weights, the half `bake`
-/// sizes the token budget against before the weights are down, and to what
-/// leaves one sequence and the bodies' floor beside it. The tile yields
-/// first, held to the widest plane fired at token rows (a plane past it is
-/// served by the fused-dequant arm), then the token budget halves toward its
-/// floor, then the lanes halve toward one, and what their cut frees grows the
-/// token budget back toward `asked`'s, the budget before `bake` cut it at the
-/// asked lanes; `Pools::fit_the_card` still refuses past that.
+/// guests' programs and the readout indices) is held to half of the card
+/// past the weights, the half `bake` sizes the token budget against before
+/// the weights are down, and to what leaves one sequence and the bodies'
+/// floor beside it. The tile yields first, held to the widest plane fired
+/// at token rows (a plane past it is served by the fused-dequant arm), then
+/// the token budget halves toward its floor, then the lanes halve toward
+/// one, and what their cut frees grows the token budget back toward
+/// `asked`'s, the budget before `bake` cut it at the asked lanes;
+/// `Pools::fit_the_card` still refuses past that.
 #[allow(clippy::too_many_arguments)]
 /// Where the weight cache's copy of a streamable weight lies off the device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1174,11 +1174,6 @@ impl Shell {
                 })
                 .collect(),
         );
-        // Committed whole: a fire reading out past one row a lane (a verify
-        // reads every row) would otherwise grow it outside the fit.
-        let unscored = compiled.arena.bytes.max(
-            compiled.arena_forked.as_ref().map_or(0, |forked| forked.bytes),
-        );
         // The activation rungs a pool may drop to (SPEC decision 6), each a
         // bucket's carve laid at the reservation's end.
         let rungs = activation_rungs(&boot.trace, &budgets, &compiled)?;
@@ -1189,18 +1184,14 @@ impl Shell {
                 .map(|(tokens, map)| (*tokens, map.bytes))
                 .collect::<Vec<_>>(),
         );
-        // What each carve laid at the end reads before its scores.
-        let prefixes: Vec<(u64, u64)> = std::iter::once(&compiled.arena)
-            .chain(compiled.arena_forked.as_ref())
-            .chain(rungs.iter().map(|(_, map)| map))
-            .map(|map| (map.bytes, map.bytes))
-            .collect();
-        let mut arena = Arena::reserve(arena_bytes).with_rungs(rungs, prefixes);
-        // The arena is backed here, at load, out of the elastic pool the
-        // allowance leaves past the weights: one it does not hold refuses
-        // the load by name.
+        let mut arena = Arena::reserve(arena_bytes).with_rungs(rungs);
+        // The arena is backed here, at load, whole, out of the elastic pool
+        // the allowance leaves past the weights: every carve a fire lays,
+        // wherever in the span, and a fire reading out past one row a lane
+        // (a verify reads every row), so no fire grows it. One the pool
+        // does not hold refuses the load by name.
         arena
-            .ensure(&mut pools, unscored)
+            .ensure(&mut pools, arena_bytes)
             .map_err(|why| match why {
                 Fault::Ceiling { need, have, .. } | Fault::OutOfMemory { need, have } => {
                     Fault::Residency(format!(
@@ -1330,6 +1321,17 @@ impl Shell {
         )?;
 
         let exports = Exports::of(&boot.trace, &compiled, boot.context, boot.page_size)?;
+        // A capturing lane's rows are its reader's; the fire stages only
+        // their addresses, one a lane of the widest window it lays.
+        let capture = crate::scores::CaptureLayout::of(
+            &exports,
+            boot.context,
+            boot.page_size,
+            crate::window::lane_capacity(boot.budget.max_lanes),
+        );
+        if let Some(layout) = &capture {
+            programs.set_score_bytes(layout.row_bytes());
+        }
 
         let airborne = crate::settle::Airborne::new();
         let mut pools = pools;
@@ -1427,6 +1429,7 @@ impl Shell {
             adapters: crate::blob::Adapters::new(adapter_seats),
             held: vec![0; boot.slots as usize],
             readout_rows,
+            capture,
             // Lent at the stand-in span until laid, as the readout rows
             // are: the size-only walk stages into it and copies nothing.
             expert_staged: expert_staging.at(crate::sizing::STAND_IN),
@@ -1655,9 +1658,6 @@ impl Shell {
                 shell.pools.fresh()
             );
         }
-        // The carves laid at the activation's end, backed where the range
-        // now lies (the fit may have reserved it anew).
-        shell.arena.ensure_rungs(&mut shell.pools)?;
         shell.lay_workspace()?;
         let afforded = fitted.bodies;
         if shell.measuring {
@@ -1706,9 +1706,9 @@ impl Shell {
     /// The runs of the activation's span a fire stages into and reads out
     /// of, in the order they lie from `inputs_at`: the staged inputs' slab,
     /// the readout rows' table, the voxel store, the rs fold predicates and
-    /// the host-resident experts' staging and the guests' samplers' lane
-    /// arenas, each to [`INPUTS_ALIGN`].
-    fn staged_runs(&self) -> [u64; 6] {
+    /// the host-resident experts' staging, the guests' samplers' lane
+    /// arenas and the capture rows' tables, each to [`INPUTS_ALIGN`].
+    fn staged_runs(&self) -> [u64; 7] {
         [
             self.inputs.bytes(),
             self.readout_rows.bytes() as u64,
@@ -1716,6 +1716,9 @@ impl Shell {
             self.predicate.bytes(),
             self.expert_staging.bytes(),
             self.lane_arenas_bytes(),
+            self.capture
+                .as_ref()
+                .map_or(0, |layout| layout.table_bytes() as u64),
         ]
         .map(|bytes| bytes.next_multiple_of(INPUTS_ALIGN))
     }
@@ -1735,8 +1738,16 @@ impl Shell {
         if let Some(buffers) = &self.buffers {
             buffers.lay_scratch(&mut self.pools)?;
         }
-        let [inputs, readouts, voxels, predicates, experts, arenas] = self.staged_runs();
-        let staged = inputs + readouts + voxels + predicates + experts + arenas;
+        let [
+            inputs,
+            readouts,
+            voxels,
+            predicates,
+            experts,
+            arenas,
+            scores,
+        ] = self.staged_runs();
+        let staged = inputs + readouts + voxels + predicates + experts + arenas + scores;
         self.pools
             .hold_activation_at(self.inputs_at, staged, false)?;
         let base = self.pools.activation_base() + self.inputs_at;
@@ -1754,6 +1765,9 @@ impl Shell {
             at: base + inputs + readouts + voxels + predicates + experts,
             bytes: arenas,
         });
+        if let Some(layout) = self.capture.as_mut() {
+            layout.lay(base + inputs + readouts + voxels + predicates + experts + arenas);
+        }
         eprintln!(
             "engine-cuda: guests' samplers meet in {} KiB of lane arenas laid at load ({} \
              lanes a flight on {} units), no lane's",
@@ -1870,9 +1884,6 @@ impl Staged {
                 false,
                 &resident,
             )?;
-            // The fit may have reserved the range anew: the carves laid at
-            // the activation's end are backed where it now lies.
-            shell.arena.ensure_rungs(&mut shell.pools)?;
             shell.pools.state_whole();
             fitted
         } else {
@@ -2013,7 +2024,6 @@ impl Shell {
         let fitted = self
             .pools
             .fit_the_card(hold, self.held_for_fires, false, &resident)?;
-        self.arena.ensure_rungs(&mut self.pools)?;
         self.lay_workspace()?;
         self.bodies_mem = usize::try_from(hold).unwrap_or(usize::MAX);
         self.rearming = true;
