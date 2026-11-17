@@ -784,6 +784,23 @@ impl Shell {
         self.programs.register(&self.device, registration)
     }
 
+    /// A program's registration, first step ([`crate::program::Plane::prepare`]):
+    /// its build runs off the engine's thread.
+    pub fn prepare_program(
+        &mut self,
+        registration: &engine::program::ProgramRegistration,
+    ) -> Result<crate::program::Pending> {
+        self.programs.prepare(&self.device, registration)
+    }
+
+    /// A program's registration, last step ([`crate::program::Plane::finish`]).
+    pub fn finish_program(
+        &mut self,
+        pending: crate::program::Pending,
+    ) -> Result<engine::ProgramId> {
+        self.programs.finish(pending)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn bind_program(
         &mut self,
