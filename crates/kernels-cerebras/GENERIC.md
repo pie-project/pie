@@ -2460,6 +2460,35 @@ milestone's tail.
   - `wafer-compile check --dir <program> --all 1` prints every kind of PE's measures, which is
     a refit's input.
 
+## The GEMM search's time
+
+- **What it cost.** Klein's text program took 251 s to compile on load. Most of
+  it went to two places:
+  - Every GEMM candidate (columns x rows x key-block members) wrote its full weight streams
+    (per column, every GEMM's blocks; a permuted output's runs, column by column).
+  - The emitter cut each tape PE's spans by scanning its column's whole stream from the
+    start, which is quadratic in the tapes.
+
+  Now:
+  - A candidate (`gemm::placed`) counts each column's stream words and the buffers in closed
+    form, with the same refusals.
+  - The kept program alone writes its streams (`gemm::streams`), and they must match the
+    counted words.
+  - A tape PE finds its first span by binary search over the spans' starts (`wat`).
+
+  Klein text now takes 50 s (from 251 s), and its program is identical byte for byte. The
+  flux2-mini GEMM programs (denoise and GQA text) are identical too. About 27% of what remains
+  is the stream search's per-column `covered` scan, which G1's interval sets (62e4d8cda)
+  remove.
+- **Overflow checks in the gates.** The tests now also run with
+  `CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS=true`, which caught two bugs the release gates had
+  wrapped past silently. Both were reached through the cold search's candidates.
+  - **A unit's layer mask** (`runs.rs:216`). A unit of more than 32 layers shifted past a
+    `u32`; the kernels' `KM` is 16 bits anyway. `kernels::layer_mask` now refuses a unit of
+    more than `KM_BITS` (16) layers for the runs, split, stacked and snake sets alike.
+  - **`Plan::validate`** computed the placed hidden size before checking that the row runs
+    are in order. A reversed run underflowed; the order check now comes first.
+
 ## Consolidation, part C: one placement IR
 
 - **Design.** Every regime's program is, to cslc and to the check, the same thing: a rectangle of

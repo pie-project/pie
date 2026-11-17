@@ -247,6 +247,8 @@ pub struct GemmProgram {
     pub arena: u32,
     /// A column's weight stream (column `c`'s spans) and its words.
     pub wstream: Vec<Vec<Span>>,
+    /// Where each span of a column's stream starts (16-bit halves from the column's start).
+    pub wat: Vec<Vec<u64>>,
     pub wwords: u32,
     /// Each column's stream words (an uneven output's columns differ).
     pub wcol: Vec<u32>,
@@ -835,9 +837,17 @@ fn w16(round16: bool) -> u32 {
     if round16 { BF16 } else { HALF }
 }
 
-/// `l` placed at `c` columns and `r` rows of PEs with `kbm` key-block members, or why not.
-#[allow(clippy::too_many_lines)]
+/// `l` placed at `c` columns and `r` rows of PEs with `kbm` key-block members, its weight
+/// streams written, or why not.
 pub fn place(l: &Lowering, c: u32, r: u32, kbm: u32) -> R<GemmProgram> {
+    let mut p = placed(l, c, r, kbm)?;
+    streams(&mut p)?;
+    Ok(p)
+}
+
+/// [`place`] but the weight streams (their words counted, a search's candidate).
+#[allow(clippy::too_many_lines)]
+pub fn placed(l: &Lowering, c: u32, r: u32, kbm: u32) -> R<GemmProgram> {
     let t = &l.trace;
     let per = l.request_rows();
     let total = per * l.batch.max(1);
@@ -1118,8 +1128,152 @@ pub fn place(l: &Lowering, c: u32, r: u32, kbm: u32) -> R<GemmProgram> {
         slots.insert(v, off);
         arena = arena.max(off + n);
     }
+    // each column's weight-stream words and the buffers' sizes, counted (the streams
+    // themselves are written for the program a search keeps: [`streams`])
+    let mut wcol = vec![0u64; c as usize];
+    let (mut wbn, mut xbn) = (2u32, 2u32);
+    for op in &l2.ops {
+        if let GOp::Region(ri) = op {
+            let g = &l2.regs[*ri];
+            for a in &g.args {
+                let add = match a {
+                    RArg::Static { .. } => u64::from(g.chunk),
+                    RArg::One { .. } => 1,
+                    _ => 0,
+                };
+                for w in &mut wcol {
+                    *w += add;
+                }
+            }
+            continue;
+        }
+        let GOp::Gemm {
+            x,
+            from,
+            k,
+            y,
+            x32,
+            lane,
+            ..
+        } = op
+        else {
+            continue;
+        };
+        let yv = &l2.vals[y];
+        let xv = &l2.vals[x];
+        if !xv.free || xv.segs().len() > 1 {
+            seg_off(t, *x, xv, c, *from, *k)?;
+        }
+        let ysegs: Vec<(u32, u32)> = yv
+            .segs()
+            .into_iter()
+            .map(|(f, w)| (f, yv.lwidth(f, w)))
+            .collect();
+        // an output of one segment read only by GEMMs and the host may cut unevenly
+        let un = ysegs.len() == 1 && yv.free && !ysegs[0].1.is_multiple_of(c);
+        for &(_, sw) in &ysegs {
+            if !sw.is_multiple_of(c) && !un {
+                return Err(refuse(
+                    t,
+                    format!("value %{}: a GEMM's output segment of {sw} over {c}", y.0),
+                ));
+            }
+        }
+        let rows = if *lane { 1 } else { tb };
+        // the input's pieces over the columns: the widest, the first odd one
+        let (mut kmax, mut kodd) = (0u32, None);
+        for cp in 0..c {
+            let (k0, k1) = piece(cp, c, *k);
+            let kc = k1 - k0;
+            kmax = kmax.max(kc);
+            if kc % 2 == 1 && kodd.is_none() {
+                kodd = Some(kc);
+            }
+        }
+        if kmax == 0 {
+            continue;
+        }
+        xbn = xbn.max(rows * kmax * if *x32 { 2 } else { 1 });
+        for &(_, sw) in &ysegs {
+            for (ci, wc) in wcol.iter_mut().enumerate() {
+                let (lo, hi) = piece(ci as u32, c, sw);
+                let p = hi - lo;
+                if let Some(kc) = kodd
+                    && p % 2 == 1
+                {
+                    return Err(refuse(
+                        t,
+                        format!("a weight block of {kc} x {p}: an odd count of 16-bit weights"),
+                    ));
+                }
+                wbn = wbn.max(kmax * p / 2);
+                // (every block even: its words the column's whole input times its piece, halved)
+                *wc += u64::from(*k) * u64::from(p) / 2;
+            }
+        }
+    }
+    let _ = (NONE, ONE, CLAMP);
+    let mut p = GemmProgram {
+        l: l2,
+        c,
+        r,
+        tb,
+        row_class,
+        row_req,
+        modules,
+        slots,
+        arena,
+        wstream: Vec::new(),
+        wat: Vec::new(),
+        wwords: 0,
+        wcol: Vec::new(),
+        tape: 0,
+        kbm,
+        band,
+        qchunk,
+        wbn,
+        xbn,
+    };
+    // the program streams in with its weights: each op's words (16-bit, an even count) where
+    // its mark is
+    // the program's own words (each op's, where its mark is): every column's
+    let words = crate::emit::gemm::op_words(&p)?;
+    let own: u64 = words.iter().map(|w| w.len().div_ceil(2) as u64).sum();
+    for wc in &mut wcol {
+        *wc += own;
+    }
+    let wwords = wcol.iter().copied().max().unwrap_or(0);
+    if wwords > u64::from(u32::MAX) {
+        return Err(refuse(t, "a column's weight stream past 2^32 words"));
+    }
+    p.wwords = wwords as u32;
+    p.wcol = wcol.iter().map(|&w| w as u32).collect();
+    p.tape = (wwords.div_ceil(u64::from(TAPE_WORDS)) as u32).max(1);
+    p.wbn = p
+        .wbn
+        .max(words.iter().map(Vec::len).max().unwrap_or(2).div_ceil(2) as u32);
+    Ok(p)
+}
+
+/// The columns' weight streams of `p` (placed by [`placed`]): a column's blocks a GEMM, an
+/// input piece and an output segment each, each op's own words where its mark is; their words
+/// the ones [`placed`] counted.
+#[allow(clippy::too_many_lines)]
+pub fn streams(p: &mut GemmProgram) -> R<()> {
+    let (l2, c, tb) = (&p.l, p.c, p.tb);
+    let t = &l2.trace;
+    let rows_of = |g: &GReg| -> Vec<(ValueId, u32)> {
+        g.args
+            .iter()
+            .filter_map(|a| match a {
+                RArg::Row { v, from } => Some((*v, *from)),
+                _ => None,
+            })
+            .chain(g.outs.iter().map(|o| (*o, 0)))
+            .collect()
+    };
     // the weight stream: a column's blocks a GEMM, an input piece and an output segment each
-    let f16 = w16(l.round16) | PACK;
+    let f16 = w16(l2.round16) | PACK;
     let mut wstream: Vec<Vec<Span>> = vec![Vec::new(); c as usize];
     let mut wcol = vec![0u64; c as usize];
     let (mut wbn, mut xbn) = (2u32, 2u32);
@@ -1254,31 +1408,8 @@ pub fn place(l: &Lowering, c: u32, r: u32, kbm: u32) -> R<GemmProgram> {
         }
         *ws = m;
     }
-    let _ = (NONE, ONE, CLAMP);
-    let mut p = GemmProgram {
-        l: l2,
-        c,
-        r,
-        tb,
-        row_class,
-        row_req,
-        modules,
-        slots,
-        arena,
-        wstream,
-        wwords: 0,
-        wcol: Vec::new(),
-        tape: 0,
-        kbm,
-        band,
-        qchunk,
-        wbn,
-        xbn,
-    };
-    // the program streams in with its weights: each op's words (16-bit, an even count) where
-    // its mark is
-    let words = crate::emit::gemm::op_words(&p)?;
-    for (ws, wc) in p.wstream.iter_mut().zip(wcol.iter_mut()) {
+    let words = crate::emit::gemm::op_words(p)?;
+    for (ws, wc) in wstream.iter_mut().zip(wcol.iter_mut()) {
         let mut out = Vec::with_capacity(ws.len() * 2);
         for s in ws.drain(..) {
             if s[0] != OPMARK {
@@ -1296,17 +1427,32 @@ pub fn place(l: &Lowering, c: u32, r: u32, kbm: u32) -> R<GemmProgram> {
         }
         *ws = out;
     }
-    let wwords = wcol.iter().copied().max().unwrap_or(0);
-    if wwords > u64::from(u32::MAX) {
-        return Err(refuse(t, "a column's weight stream past 2^32 words"));
+    if wcol.iter().zip(&p.wcol).any(|(a, b)| *a != u64::from(*b)) {
+        return Err(refuse(
+            t,
+            "the weight streams' words are not the ones counted",
+        ));
     }
-    p.wwords = wwords as u32;
-    p.wcol = wcol.iter().map(|&w| w as u32).collect();
-    p.tape = (wwords.div_ceil(u64::from(TAPE_WORDS)) as u32).max(1);
-    p.wbn = p
-        .wbn
-        .max(words.iter().map(Vec::len).max().unwrap_or(2).div_ceil(2) as u32);
-    Ok(p)
+    p.wat = wstream.iter().map(|ws| starts(ws)).collect();
+    p.wstream = wstream;
+    Ok(())
+}
+
+/// Where each of a column's spans starts (16-bit halves: a packed element a half, an f32 a
+/// word, starting on a whole word).
+fn starts(ws: &[Span]) -> Vec<u64> {
+    let mut at = 0u64;
+    ws.iter()
+        .map(|s| {
+            let h = if s[5] & PACK != 0 { 1u64 } else { 2 };
+            if h == 2 {
+                at = at.next_multiple_of(2);
+            }
+            let a = at;
+            at += u64::from(s[3]) * u64::from(s[6]) * h;
+            a
+        })
+        .collect()
 }
 
 /// A placeholder in a column's stream for op `row`'s words.
@@ -1320,18 +1466,17 @@ pub fn tape_spans(p: &GemmProgram, ci: u32, ri: u32) -> Vec<Span> {
     let lo = 2 * u64::from(ri) * u64::from(per);
     let hi = (lo + 2 * u64::from(per)).min(2 * u64::from(p.wcol[ci as usize]));
     let mut out: Vec<Span> = Vec::new();
-    let mut at = 0u64; // in halves
-    for s in &p.wstream[ci as usize] {
+    let (ws, at) = (&p.wstream[ci as usize], &p.wat[ci as usize]);
+    // (the spans from the last one starting at or before `lo`, to the first past `hi`)
+    let first = at.partition_point(|&a| a <= lo).saturating_sub(1);
+    for (s, &a) in ws.iter().zip(at).skip(first) {
         let [v, row, col, len, stride, flags, count, step] = *s;
-        // a packed element a half, an f32 a word (starting on a whole word)
         let h = if flags & PACK != 0 { 1u64 } else { 2 };
-        if h == 2 {
-            at = at.next_multiple_of(2);
+        let b = a + u64::from(len) * u64::from(count) * h;
+        if a >= hi {
+            break;
         }
-        let n = u64::from(len) * u64::from(count) * h;
-        let (a, b) = (at, at + n);
-        at = b;
-        if b <= lo || a >= hi {
+        if b <= lo {
             continue;
         }
         // cut at whole elements of the run: (j, i) with element j * len + i
@@ -1403,7 +1548,7 @@ pub fn program(
         if ok_c.get(&c) == Some(&false) {
             continue;
         }
-        match place(&l, c, r, kbm) {
+        match placed(&l, c, r, kbm) {
             Ok(p) if p.fabric().1 > bounds.1 => {
                 ok_c.insert(c, true);
                 why = format!("{c} x {r}: {} rows of tapes past the fabric", p.tape);
@@ -1445,13 +1590,15 @@ pub fn program(
             }
         }
     }
-    best.map(|(_, p)| p).ok_or_else(|| {
+    let mut p = best.map(|(_, p)| p).ok_or_else(|| {
         if why.is_empty() {
             refuse(trace, "no placement")
         } else {
             why
         }
-    })
+    })?;
+    streams(&mut p)?;
+    Ok(p)
 }
 
 /// The batch of at most `most` requests a launch whose program serves a request cheapest (its
