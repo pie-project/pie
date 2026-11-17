@@ -50,6 +50,7 @@ fn the_masked_axis_is_declared_by_gemma_and_qwen_and_by_nobody_else() {
         "minimax-m25-",
         "minimax-m27-",
         "minimax-m3-",
+        "minimax-m31-",
         "muse-glimmer-",
         "muse-spark-",
         "nemotron3-",

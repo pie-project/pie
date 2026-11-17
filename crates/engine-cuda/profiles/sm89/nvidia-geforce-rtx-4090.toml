@@ -10,7 +10,6 @@ mla.expanded_from = 40960  # 1.4% faster end to end
 moe.group_at = 3  # 1.4% faster end to end
 qmm.split_thin_max = 16  # 1.0% faster end to end
 qmm.split_warps_per_sm = 36  # 1.0% faster end to end
-sdpa.decode.static_max_requests = 320  # 2.5% faster end to end
 sdpa.merge_warp = true  # 1.4% faster end to end
 ssm.kda_step_fused = true  # 1.0% faster end to end
 
@@ -136,9 +135,6 @@ measured = [
   "kernel.sdpa.decode.gqa_deep_64",
   "kernel.sdpa.decode.grouped_prefill_lse",
   "kernel.sdpa.decode.grouped_prefill_window",
-  "kernel.sdpa.decode.split_small",
-  "kernel.sdpa.decode.split_window",
-  "kernel.sdpa.decode.static_max_requests",
   "kernel.sdpa.fa2_live",
   "kernel.sdpa.index_fp4_tc5",
   "kernel.sdpa.index_mma",
