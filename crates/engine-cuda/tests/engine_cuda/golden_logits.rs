@@ -506,6 +506,21 @@ fn buffering(mut knobs: engine_cuda::Knobs) -> engine_cuda::Knobs {
 }
 
 fn argmax(logits: &[f32]) -> u32 {
+    // `PIE_GOLDEN_MARGINS`: each top's two best logits, their gap, and a bf16
+    // ulp at the top's magnitude (Contract A's near-tie).
+    if std::env::var_os("PIE_GOLDEN_MARGINS").is_some() {
+        let mut order: Vec<usize> = (0..logits.len()).collect();
+        order.sort_by(|&x, &y| logits[y].total_cmp(&logits[x]));
+        if let [first, second, ..] = order[..] {
+            let (v1, v2) = (logits[first], logits[second]);
+            let ulp = 2f32.powi(v1.abs().max(f32::MIN_POSITIVE).log2().floor() as i32 - 7);
+            println!(
+                "margin {first} {v1:.6} {second} {v2:.6} gap {:.6} ulps {:.2}",
+                v1 - v2,
+                (v1 - v2) / ulp
+            );
+        }
+    }
     let (at, _) = logits
         .iter()
         .enumerate()

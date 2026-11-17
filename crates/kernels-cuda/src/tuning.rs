@@ -1119,9 +1119,33 @@ macro_rules! tuning {
     (@read $p:ident, on $d:ident) => { $p.on::<$d>(&Anywhere) };
     (@read $p:ident, get $d:ident) => { $p.get::<$d>().0 };
     (@read $p:ident, is $d:ident :: $v:ident) => { *$p.get::<$d>() == $d::$v };
+    (@read $p:ident, rates $d:ident) => { $d($p) };
+}
+
+/// The rows under which every dense bf16 product on this device is bound by
+/// its weight's read, by its profile's measured rates: the slowest point of
+/// its matmul curves (flops a ns) over its bandwidth (bytes a ns), a
+/// product of `m` rows doing `m` flops a weight byte. 0 where the profile
+/// states neither.
+#[must_use]
+pub fn ridge_rows(profile: &Profile) -> u32 {
+    let rates = profile.rates();
+    let slowest = rates
+        .gemm_tflops_by_rows
+        .iter()
+        .flatten()
+        .flat_map(|(_, curve)| curve.iter().map(|&(_, t)| t * 1e3))
+        .reduce(f64::min);
+    match (slowest, rates.hbm_gbps) {
+        (Some(flops), Some(bytes)) if bytes > 0.0 => (flops / bytes).floor() as u32,
+        _ => 0,
+    }
 }
 
 tuning! {
+    /// [`ridge_rows`]: the rows under which a dense product streams its
+    /// weight, read off the profile's rates, not a decision.
+    gemm_ridge_rows: u32 = 0, rates ridge_rows;
     moe_grouped: bool = true, on MoeGrouped;
     mxfp4_grouped: bool = true, on MoeMxfp4Grouped;
     mxfp4_wmma: bool = true, on MoeMxfp4Wmma;

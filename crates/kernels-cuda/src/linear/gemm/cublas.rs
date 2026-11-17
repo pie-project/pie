@@ -1,11 +1,14 @@
 #![allow(clippy::too_many_arguments)]
 #![allow(unsafe_code)]
 
-//! The dense bf16 products on cuBLASLt: every product runs cuBLASLt's first
-//! heuristic algorithm for its shape (its own ranking, deterministic for the
-//! shape, the workspace and the library), an anchored region with an
-//! epilogue cuBLASLt lands on that algorithm with it, else the product then
-//! its epilogue on the row skeleton. Nothing is timed and no table is read.
+//! The dense bf16 products: a product bound by its weight's read (fewer
+//! rows than the device's ridge, from its profile's rates) streams the
+//! weight once on the skeleton of fewest rows that covers it, its epilogue
+//! fused; every other runs cuBLASLt's first heuristic algorithm for its shape
+//! (its own ranking, deterministic for the shape, the workspace and the
+//! library), an anchored region with an epilogue cuBLASLt lands on that
+//! algorithm with it, else the product then its epilogue on the row
+//! skeleton. Nothing is timed and no table is read.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -21,7 +24,28 @@ use cudarc::runtime::sys::{cudaGetDevice, cudaGetLastError};
 
 use crate::jit::{Ctx, refuse};
 use crate::linear::skeleton::LtEpilogue;
-use crate::linear::skeleton::{Epilogue, In, MAX_INS, MAX_OUTS, Paging, RowLeg};
+use crate::linear::skeleton::{Epilogue, In, MAX_INS, MAX_OUTS, Paging, RowLeg, Skeleton};
+
+/// The streaming skeleton that serves `m x n x k` with `epi`, where the
+/// product is bound by its weight's read (fewer rows than the device's
+/// ridge, `Tuning::gemm_ridge_rows`): the one of fewest rows that covers it
+/// (the gemv's one row, the few-rows skeleton's sixteen, the skinny's), each
+/// streaming the weight once with the epilogue fused. `None` where the
+/// product is compute-bound or none covers it: cuBLASLt serves it.
+fn streamed(
+    epi: &Epilogue,
+    m: i32,
+    n: i32,
+    k: i32,
+    tuning: &crate::tuning::Tuning,
+) -> Option<Skeleton> {
+    if m >= i32::try_from(tuning.gemm_ridge_rows).unwrap_or(i32::MAX) {
+        return None;
+    }
+    Skeleton::ALL
+        .into_iter()
+        .find(|s| s.covers(epi, m, n, k, tuning))
+}
 
 const fn dev(address: u64) -> *const c_void {
     address as usize as *const c_void
@@ -71,6 +95,10 @@ pub(crate) fn act_x_wt(
     let handle: cublasHandle_t = ctx.cublas(op)?.cast::<cublasContext>();
     let call = Call { act, w, y, m, n, k };
     let tuning = ctx.tuning();
+    // A product bound by its weight's read streams it once.
+    if let Some(skeleton) = streamed(Epilogue::store(), m, n, k, &tuning) {
+        return skeleton.fire(ctx, Epilogue::store(), w, act, &[], &[y], None, m, n, k);
+    }
     // A prefill's wide product on cuBLAS's own algorithm with a split's
     // partials summed in bf16, as torch runs it by default
     // (`kernel.gemm.bf16_split_from`); the handle is set back at once.
@@ -170,6 +198,10 @@ pub(crate) fn anchored(
 ) -> Result<bool, Error> {
     if m <= 0 || n <= 0 || k <= 0 || epi.plain() || ins.len() > MAX_INS || outs.len() > MAX_OUTS {
         return Ok(false);
+    }
+    if let Some(skeleton) = streamed(epi, m, n, k, &ctx.tuning()) {
+        skeleton.fire(ctx, epi, w, act, ins, outs, paging, m, n, k)?;
+        return Ok(true);
     }
     if let [out] = outs
         && epi.parts() == 1
