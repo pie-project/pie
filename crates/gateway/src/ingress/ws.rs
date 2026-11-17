@@ -346,6 +346,7 @@ fn into_turn(payload: ClientMessage) -> TurnInput {
         message: payload,
         blobs: Vec::new(),
         priority: Priority::Normal,
+        resume: None,
     }
 }
 
