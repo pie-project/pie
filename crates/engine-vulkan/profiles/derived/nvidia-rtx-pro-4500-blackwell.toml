@@ -15,7 +15,7 @@ device = "NVIDIA RTX PRO 4500 Blackwell"
 # One point of the matmul curve, the 4096^3 product measured: its rate is
 # read at every row (no curve was timed), and the attention curve and the
 # per-row ops' bandwidth are unstated.
-gemm_tflops_by_rows = [[4096, 26.2]]
+gemm_tflops_by_rows = [[4096, [[4096, 26.2]]]]
 hbm_gbps = 813.0
 launch_ns = 3573
 # Vendor peaks, bounds and not rates: dense bf16 about 202 TFLOPS (NVIDIA

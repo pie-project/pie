@@ -985,13 +985,12 @@ impl<'a> Walk<'a> {
         };
         for (k, v) in t.iter() {
             let slot = match k.get_ref().as_ref() {
-                key @ ("gemm_tflops_by_rows" | "attn_tflops_by_keys") => {
-                    let curve = self.curve(v, key);
-                    if key == "gemm_tflops_by_rows" {
-                        rates.gemm_tflops_by_rows = curve;
-                    } else {
-                        rates.attn_tflops_by_keys = curve;
-                    }
+                "gemm_tflops_by_rows" => {
+                    rates.gemm_tflops_by_rows = self.width_curves(v);
+                    continue;
+                }
+                key @ "attn_tflops_by_keys" => {
+                    rates.attn_tflops_by_keys = self.curve(v, key);
                     continue;
                 }
                 "elementwise_gbps" => &mut rates.elementwise_gbps,
@@ -1035,6 +1034,48 @@ impl<'a> Walk<'a> {
             }
         }
         rates
+    }
+
+    /// `rates.gemm_tflops_by_rows`: `[width, curve]` pairs, a whole positive
+    /// width and a curve of `[rows, TFLOP/s]` each, strictly ascending in
+    /// width.
+    fn width_curves(
+        &mut self,
+        value: &Spanned<DeValue<'_>>,
+    ) -> Option<Vec<(u32, Vec<(u32, f64)>)>> {
+        const WHAT: &str = "`rates.gemm_tflops_by_rows` is a non-empty list of [width, [[rows, \
+                            TFLOP/s], ...]] pairs, ascending in width";
+        let DeValue::Array(widths) = value.get_ref() else {
+            self.err(
+                value.span().start,
+                format!("{WHAT}, not {}", found(value.get_ref())),
+            );
+            return None;
+        };
+        let mut out: Vec<(u32, Vec<(u32, f64)>)> = Vec::with_capacity(widths.len());
+        for entry in widths.iter() {
+            let pair = match entry.get_ref() {
+                DeValue::Array(pair) if pair.len() == 2 => int(pair[0].get_ref())
+                    .and_then(|i| u32::try_from(i).ok())
+                    .filter(|&w| w > 0)
+                    .map(|w| (w, &pair[1])),
+                _ => None,
+            };
+            let Some((width, curve)) = pair.filter(|&(w, _)| out.last().is_none_or(|l| w > l.0))
+            else {
+                self.err(
+                    entry.span().start,
+                    format!("{WHAT}, not {}", found(entry.get_ref())),
+                );
+                return None;
+            };
+            out.push((width, self.curve(curve, "gemm_tflops_by_rows")?));
+        }
+        if out.is_empty() {
+            self.err(value.span().start, format!("{WHAT}, not an empty list"));
+            return None;
+        }
+        Some(out)
     }
 
     /// `rates.<key>`: `[x, rate]` pairs, a whole positive `x` and a positive

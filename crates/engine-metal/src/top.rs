@@ -177,7 +177,7 @@ mod tests {
             "{err}"
         );
         let rated = profile::fire::Rates {
-            gemm_tflops_by_rows: Some(vec![(256, 2.0), (4096, 5.0)]),
+            gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 2.0), (4096, 5.0)])]),
             attn_tflops_by_keys: Some(vec![(2048, 2.0)]),
             hbm_gbps: Some(400.0),
             elementwise_gbps: Some(200.0),

@@ -16,8 +16,8 @@
 //!   graph against one kernel of the chain's whole work, at each length of
 //!   `engine::rates::LAUNCH_CHAINS` (`engine::rates::launch_from`): what a
 //!   dispatch adds to its work inside a recorded body.
-//! - `gemm_tflops_by_rows`: the matmul `m x GEMM_WIDTH x GEMM_WIDTH` at each
-//!   of `engine::rates::GEMM_ROWS` through `linear::gemm` (cuBLASLt's first
+//! - `gemm_tflops_by_rows`: the matmul `m x w x w` at each of
+//!   `engine::rates::GEMM_WIDTHS` and `engine::rates::GEMM_ROWS` through `linear::gemm` (cuBLASLt's first
 //!   heuristic algorithm on CUDA, hipBLASLt's on ROCm), after the warm-up;
 //!   its launches rotate through `engine::rates::weights_at` weight planes,
 //!   past every last-level cache.
@@ -116,6 +116,10 @@ pub const PAGE: u32 = 16;
 pub const COPY_BYTES: usize = 256 << 20;
 
 /// A burst's length.
+// TODO(engine::rates' shared measurement frame, GPU's branch): every burst
+// settles by warm_up's rule (repeats doubling until the per-fire time stops
+// falling by more than AGREEMENT, max_submit the one cap) and this constant
+// goes.
 pub const BURST_NS: f64 = 20e6;
 
 /// Timed bursts of each kind; the median is kept.
@@ -390,14 +394,16 @@ mod on_device {
             engine::rates::WARM_SHAPE.0,
             warmed.rate / 1e3
         );
-        let w = engine::rates::GEMM_WIDTH;
-        let mut planes = Planes::lay(&random, (w, w))?;
         let mut gemm = Vec::new();
-        for m in engine::rates::GEMM_ROWS {
-            let rate = planes.at(device.ctx(), &clock, &random, &mut held, m, gap)?;
-            gemm.push((m, rate));
+        for w in engine::rates::GEMM_WIDTHS {
+            let mut planes = Planes::lay(&random, (w, w))?;
+            let mut curve = Vec::new();
+            for m in engine::rates::GEMM_ROWS {
+                let rate = planes.at(device.ctx(), &clock, &random, &mut held, m, gap)?;
+                curve.push((m, rate));
+            }
+            gemm.push((w, curve));
         }
-        drop(planes);
         let mut attn = Vec::new();
         for keys in engine::rates::ATTN_KEYS {
             let rate = attention(&device, &clock, &random, &mut held, keys, 128, gap)?;
@@ -432,7 +438,11 @@ mod on_device {
         Ok(Measured {
             rates: Rates {
                 launch_ns: Some(launch),
-                gemm_tflops_by_rows: Some(tflops(gemm)),
+                gemm_tflops_by_rows: Some(
+                    gemm.into_iter()
+                        .map(|(w, curve)| (w, tflops(curve)))
+                        .collect(),
+                ),
                 attn_tflops_by_keys: Some(tflops(attn)),
                 hbm_gbps: Some(tenth(bytes)),
                 elementwise_gbps: Some(tenth(elementwise)),

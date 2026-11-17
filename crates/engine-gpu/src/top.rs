@@ -137,7 +137,7 @@ mod tests {
         // No feasible rung at all: the ruling's refusal, with the binding.
         let none = facts(&[(1024, 300 * MIB)], 200 * MIB);
         let rated = profile(
-            "api = 1\n[rates]\ngemm_tflops_by_rows = [[4096, 1.0]]\nattn_tflops_by_keys = \
+            "api = 1\n[rates]\ngemm_tflops_by_rows = [[4096, [[4096, 1.0]]]]\nattn_tflops_by_keys = \
                  [[2048, 1.0]]\nhbm_gbps = 1.0\nelementwise_gbps = 1.0\n",
         );
         let err = choose(&none, 1 << 33, &rated, "Card X", &counts(), 200 * MIB).unwrap_err();

@@ -915,7 +915,7 @@ api = 1
 [target]
 device = "Apple M9"
 [rates]
-gemm_tflops_by_rows = [[256, 20.0], [4096, 50]]   # 50 TFLOP/s wide
+gemm_tflops_by_rows = [[4096, [[256, 20.0], [4096, 50]]]]   # 50 TFLOP/s wide
 attn_tflops_by_keys = [[2048, 20.0]]
 scan_gelems = 3000.0
 hbm_gbps = 400              # 400 GB/s
@@ -945,7 +945,7 @@ fn a_device_file_states_its_rates_and_a_layer_above_replaces_them() {
     assert_eq!(
         p.rates(),
         profile::fire::Rates {
-            gemm_tflops_by_rows: Some(vec![(256, 20.0), (4096, 50.0)]),
+            gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 20.0), (4096, 50.0)])]),
             attn_tflops_by_keys: Some(vec![(2048, 20.0)]),
             scan_gelems: Some(3000.0),
             hbm_gbps: Some(400.0),
@@ -993,8 +993,12 @@ fn rates_are_refused_where_they_do_not_read_and_fire_times_are_no_profiles() {
             "`rates.elementwise_gbps` is a positive number",
         ),
         (
-            "[rates]\ngemm_tflops_by_rows = [[512, 2.0], [256, 1.0]]\n",
+            "[rates]\ngemm_tflops_by_rows = [[4096, [[512, 2.0], [256, 1.0]]]]\n",
             "`rates.gemm_tflops_by_rows` is a non-empty list of [x, rate] pairs, ascending in x",
+        ),
+        (
+            "[rates]\ngemm_tflops_by_rows = [[4096, [[256, 1.0]]], [1024, [[256, 1.0]]]]\n",
+            "a non-empty list of [width, [[rows, TFLOP/s], ...]] pairs, ascending in width",
         ),
         ("[rates]\nattn_tflops_by_keys = []\n", "not an empty list"),
         ("[rates]\ngemm_tflops = 1.0\n", "not `gemm_tflops`"),
@@ -1028,7 +1032,7 @@ fn the_notice_names_rates_measured_on_the_device_and_what_is_untuned() {
     let r = registry();
     let rated = |provenance: &str| {
         format!(
-            "api = 1\n[target]\ndevice = \"Apple M9\"\n[rates]\ngemm_tflops_by_rows = [[4096, 5.0]]\n\
+            "api = 1\n[target]\ndevice = \"Apple M9\"\n[rates]\ngemm_tflops_by_rows = [[4096, [[4096, 5.0]]]]\n\
              hbm_gbps = 300.0\n{provenance}"
         )
     };

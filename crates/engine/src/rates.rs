@@ -12,8 +12,9 @@
 //! - `launch_ns`: what a dispatch adds to its work in a chain of dependent
 //!   ones submitted as serving submits them, at each `n` of
 //!   [`LAUNCH_CHAINS`] ([`launch_from`]).
-//! - `gemm_tflops_by_rows`: a bf16 matmul of [`GEMM_WIDTH`] columns and
-//!   depth at each of [`GEMM_ROWS`], [`gemm_flops`] over its time.
+//! - `gemm_tflops_by_rows`: a bf16 matmul of each of [`GEMM_WIDTHS`]
+//!   columns and depth at each of [`GEMM_ROWS`], [`gemm_flops`] over its
+//!   time.
 //! - `attn_tflops_by_keys`: the backend's prefill attention at
 //!   [`ATTN_SHAPE`]'s heads over each of [`ATTN_KEYS`] keys (one sequence
 //!   attending itself, its pages laid in [`attn_page_order`]),
@@ -62,9 +63,13 @@ pub fn step_bytes() -> u64 {
         .max(copy)
 }
 
-/// The columns and depth of the matmul curve: the catalog's median hidden
-/// width (an 8B-class model's 4096).
-pub const GEMM_WIDTH: u32 = 4096;
+/// The columns and depth the matmul curves are timed at: the catalog's
+/// hidden widths from a small model's 1024 to an 8B-class model's 4096 (a
+/// plane is read at its square width between them, clamped past them).
+pub const GEMM_WIDTHS: [u32; 3] = [1024, 2048, 4096];
+
+/// The widest of [`GEMM_WIDTHS`].
+pub const GEMM_WIDTH: u32 = GEMM_WIDTHS[GEMM_WIDTHS.len() - 1];
 
 /// The rows the matmul curve is timed at: the lattice's octaves a fire's
 /// prompt reaches, 256 to 8192.
@@ -592,10 +597,11 @@ pub fn provenance(backend: &str, how: &str) -> (&'static str, String) {
     let (rows, width) = ELEMENTWISE_SHAPE;
     let text = format!(
         "pie tune {backend} --rates on {} (pie {}): {how}; at engine::rates' shapes (matmul m x \
-         {GEMM_WIDTH} x {GEMM_WIDTH}, m {:?}; attention keys x keys, keys {:?}, {}/{} heads of \
+         w x w, w {:?}, m {:?}; attention keys x keys, keys {:?}, {}/{} heads of \
          128; per-row ops {rows} x {width}; scan {} tokens, {}/{} heads of {}x{}, conv {})",
         today(),
         env!("CARGO_PKG_VERSION"),
+        GEMM_WIDTHS,
         GEMM_ROWS,
         ATTN_KEYS,
         ATTN_SHAPE.q_heads,
@@ -916,7 +922,7 @@ mod tests {
     fn the_writer_writes_what_the_profile_reads() {
         let rates = profile::fire::Rates {
             launch_ns: Some(3500),
-            gemm_tflops_by_rows: Some(vec![(256, 90.0), (8192, 181.5)]),
+            gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 90.0), (8192, 181.5)])]),
             attn_tflops_by_keys: Some(vec![(512, 60.0), (8192, 120.0)]),
             hbm_gbps: Some(800.0),
             elementwise_gbps: Some(500.0),

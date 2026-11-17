@@ -79,10 +79,10 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     .map_err(crate::error::Fault::Card)?;
     device.set_tuning(kernels_cuda::tuning::Tuning::of(&chip));
     let engine = crate::chip::Engine::of(&chip);
-    // The card's fire top (`crate::api::fire_top_of`): past it no rung's
-    // efficiency improves, so none past it can be chosen. A load asked
+    // The model's fire top on this card (`crate::api::fire_top_of`): past it
+    // no rung's efficiency improves, so none past it can be chosen. A load asked
     // nothing fires up to it, and the estimate picks below.
-    let fire_top = crate::api::fire_top_of(&chip, device.name())?;
+    let fire_top = crate::api::fire_top_of(&chip, &boot.trace, device.name())?;
     if boot.budget.max_tokens == 0 {
         boot.budget.max_tokens = fire_top;
         // only where it at least halves the fire: a trunk of few value heads seats enough lanes that the
@@ -388,7 +388,15 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             computed,
         );
         let counts = crate::top::counts(&boot.trace)?;
-        let top = crate::top::choose(&rungs, after_weights, &chip.rates(), device.name(), &counts)?;
+        let row_tile = crate::top::row_tile(&chip);
+        let top = crate::top::choose(
+            &rungs,
+            after_weights,
+            &chip.rates(),
+            Some(row_tile.clone()),
+            device.name(),
+            &counts,
+        )?;
         eprintln!(
             "engine-cuda: {}",
             engine::load::line_of(
@@ -401,6 +409,10 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         );
         weighed = engine::load::estimate(&counts, &chip.rates())
             .ok()
+            .map(|mut estimate| {
+                estimate.rates = estimate.rates.with_row_tile(row_tile);
+                estimate
+            })
             .map(|estimate| crate::top::Weighed {
                 rungs: rungs.clone(),
                 estimate,

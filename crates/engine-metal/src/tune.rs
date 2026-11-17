@@ -929,7 +929,11 @@ fn check_one(
          {:.2} GB\n  rung  measured  estimated | est (ms): launch work weights flops \
          readout attn kv recur elem | device by kind (ms, dispatches timed alone): {}  dispatches  sum  \
          wall-sum\n",
-        e.rates.gemm_by_rows.last().map_or(0.0, |&(_, r)| r),
+        e.rates
+            .gemm_by_rows
+            .last()
+            .and_then(|(_, c)| c.last())
+            .map_or(0.0, |&(_, r)| r),
         e.rates.bytes_per_ns,
         e.rates.launch_ns,
         e.dense_bytes as f64 / 1e9,

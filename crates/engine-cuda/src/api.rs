@@ -444,15 +444,21 @@ pub(crate) fn on_lattice(engine: &crate::chip::Engine, top: u32, tokens: u32) ->
         .unwrap_or(lattice[0])
 }
 
-/// The card's fire top (`engine::roofline::fire_top`): on its rung lattice
-/// as far as a `u32` of rows reaches, where a doubling of a dense matmul's
-/// rows stops cutting its cost a row by more than `profile::AGREEMENT`, by
-/// its profile's measured matmul curve. Past it no
-/// rung's efficiency improves, so none past it can be chosen. A profile
-/// without the matmul rate or the bandwidth has no top, and a load on it is
-/// refused for its missing rates, by name.
-pub(crate) fn fire_top_of(chip: &profile::Profile, device: &str) -> crate::error::Result<u32> {
-    let constants = engine::roofline::Constants::of(&chip.rates()).map_err(|key| {
+/// The fire top of `trace` on this card (`engine::load::FireEstimate::top`):
+/// on its rung lattice as far as a `u32` of rows reaches, where a doubling
+/// of the model's prompt stops raising its estimated tokens a ns by more
+/// than `profile::AGREEMENT`, by its profile's measured rates and each
+/// matmul padded to the tile cuBLASLt runs it on. Past it no rung's
+/// efficiency improves, so none past it can be chosen. A profile without the
+/// rates the model needs has no top, and a load on it is refused for them,
+/// by name.
+pub(crate) fn fire_top_of(
+    chip: &profile::Profile,
+    trace: &Trace,
+    device: &str,
+) -> crate::error::Result<u32> {
+    let counts = crate::top::counts(trace)?;
+    let mut estimate = engine::load::estimate(&counts, &chip.rates()).map_err(|key| {
         Fault::Card(
             engine::load::Refused::NoRates {
                 device: device.to_owned(),
@@ -461,9 +467,10 @@ pub(crate) fn fire_top_of(chip: &profile::Profile, device: &str) -> crate::error
             .to_string(),
         )
     })?;
+    estimate.rates = estimate.rates.with_row_tile(crate::top::row_tile(chip));
     let mut lattice = rung_lattice(&crate::chip::Engine::of(chip), u32::MAX);
     lattice.pop();
-    Ok(engine::roofline::fire_top(&lattice, &constants))
+    Ok(estimate.top(&lattice))
 }
 
 /// The load's budgets for `trace`: its logit readouts sized to what the

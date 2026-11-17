@@ -465,10 +465,11 @@ impl fmt::Display for Refused {
 
 impl std::error::Error for Refused {}
 
-/// The top rung of `rungs` for `device`, whose profile states
-/// `rates`, over a live range of `live` bytes, by the estimate from the
-/// rates alone. A device whose profile states no rates has nothing to weigh
-/// the rungs by, and the load is refused, naming it.
+/// The top rung of `rungs` for `device`, whose profile states `rates`, over
+/// a live range of `live` bytes, by the estimate from the rates alone (its
+/// matmuls padding nothing: [`choose_tiled`] states the backend's tile). A
+/// device whose profile states no rates has nothing to weigh the rungs by,
+/// and the load is refused, naming it.
 pub fn choose(
     rungs: &[RungFacts],
     live: u64,
@@ -476,10 +477,26 @@ pub fn choose(
     device: &str,
     counts: &Counts,
 ) -> Result<(TopRung, FireEstimate), Refused> {
-    let estimate = estimate(counts, rates).map_err(|key| Refused::NoRates {
+    choose_tiled(rungs, live, rates, None, device, counts)
+}
+
+/// [`choose`] with the backend's matmul tile rows (`row_tile`), each
+/// plane's rows padded to its kernel's tile.
+pub fn choose_tiled(
+    rungs: &[RungFacts],
+    live: u64,
+    rates: &profile::fire::Rates,
+    row_tile: Option<crate::roofline::RowTile>,
+    device: &str,
+    counts: &Counts,
+) -> Result<(TopRung, FireEstimate), Refused> {
+    let mut estimate = estimate(counts, rates).map_err(|key| Refused::NoRates {
         device: device.to_owned(),
         key,
     })?;
+    if let Some(tile) = row_tile {
+        estimate.rates = estimate.rates.with_row_tile(tile);
+    }
     let top = super::rung::top_rung(rungs, live, &estimate).map_err(Refused::NoRung)?;
     Ok((top, estimate))
 }
@@ -500,7 +517,8 @@ pub fn line_of(
         "{:.1} TFLOP/s bf16, {:.0} GB/s, launch {} ns",
         r.gemm_tflops_by_rows
             .as_ref()
-            .and_then(|c| c.last())
+            .and_then(|w| w.last())
+            .and_then(|(_, c)| c.last())
             .map_or(0.0, |&(_, t)| t),
         r.hbm_gbps.unwrap_or(0.0),
         r.launch_ns.unwrap_or(0)
@@ -565,7 +583,7 @@ mod tests {
     fn rates() -> profile::fire::Rates {
         profile::fire::Rates {
             launch_ns: Some(5),
-            gemm_tflops_by_rows: Some(vec![(256, 5.0), (4096, 10.0)]),
+            gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 5.0), (4096, 10.0)])]),
             attn_tflops_by_keys: Some(vec![(2048, 7.0)]),
             hbm_gbps: Some(100.0),
             elementwise_gbps: Some(50.0),
@@ -612,7 +630,7 @@ mod tests {
                 e.rates.launch_ns
             ),
             (
-                vec![(256, 5_000.0), (4096, 10_000.0)],
+                vec![(4096, vec![(256, 5_000.0), (4096, 10_000.0)])],
                 vec![(2048, 7_000.0)],
                 100.0,
                 50.0,
@@ -855,7 +873,7 @@ mod tests {
         };
         let tuned = profile::fire::Tuned {
             rates: profile::fire::Rates {
-                gemm_tflops_by_rows: Some(vec![(256, 100.0), (8192, 249.0)]),
+                gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 100.0), (8192, 249.0)])]),
                 hbm_gbps: Some(654.0),
                 launch_ns: Some(1620),
                 ..profile::fire::Rates::default()

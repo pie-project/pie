@@ -60,7 +60,7 @@ norm.rope_from = 1024
 # One point of the matmul curve, the 4096^3 product measured: its rate is
 # read at every row (no curve was timed), and the attention curve and the
 # per-row ops' bandwidth are unstated.
-gemm_tflops_by_rows = [[4096, 834.0]]
+gemm_tflops_by_rows = [[4096, [[4096, 834.0]]]]
 # A 256 MiB elementwise pass (a negate) counted read plus write (0.418 ms); the chip's 1640 GB/s of HBM
 # is the upper bound (78%).
 hbm_gbps = 1283.0

@@ -11,7 +11,7 @@ pub use rung::{
     CheckFire, FireEstimate, GemmShape, NoRung, RungFacts, Terms, TopRung, TopWhy, model_class,
     pick, scored, shape_table, top_rung,
 };
-pub use top::{Counts, Kept, Refused, choose, estimate, line_of, rectangle};
+pub use top::{Counts, Kept, Refused, choose, choose_tiled, estimate, line_of, rectangle};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Budgets {

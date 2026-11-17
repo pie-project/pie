@@ -35,7 +35,8 @@ pub fn rates(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Outco
          launch {:.2} us",
         r.gemm_tflops_by_rows
             .as_ref()
-            .and_then(|c| c.last())
+            .and_then(|w| w.last())
+            .and_then(|(_, c)| c.last())
             .map_or(0.0, |&(_, t)| t),
         r.attn_tflops_by_keys
             .as_ref()

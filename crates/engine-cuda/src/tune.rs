@@ -54,7 +54,12 @@ pub fn rates(profiles: Option<&Path>, say: &mut dyn FnMut(&str)) -> Result<Rated
     say(&format!(
         "[rates]: matmul TFLOP/s by rows {}; attention by keys {} (at {} keys: {}); per-row ops \
          {:.0} GB/s, scan {:.0} G elements/s, {:.0} GB/s, launch {} ns",
-        curve(&r.gemm_tflops_by_rows),
+        r.gemm_tflops_by_rows
+            .iter()
+            .flatten()
+            .map(|(w, c)| format!("w {w}: {}", curve(&Some(c.clone()))))
+            .collect::<Vec<_>>()
+            .join("; "),
         curve(&r.attn_tflops_by_keys),
         engine::rates::ATTN_KEYS[engine::rates::ATTN_KEYS.len() - 1],
         measured

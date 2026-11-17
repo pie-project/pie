@@ -20,7 +20,7 @@ assumes = { cores = 20 }
 # those keys. The grid timed no per-row ops, so elementwise_gbps is unstated
 # (a load here measures it, or `pie tune metal --rates` does).
 launch_ns = 1840
-gemm_tflops_by_rows = [[256, 24.96], [512, 28.84], [1024, 29.89], [2048, 30.15], [4096, 28.56], [8192, 28.44]]
+gemm_tflops_by_rows = [[4096, [[256, 24.96], [512, 28.84], [1024, 29.89], [2048, 30.15], [4096, 28.56], [8192, 28.44]]]]
 attn_tflops_by_keys = [[512, 10.62], [1024, 15.21], [2048, 18.4], [4096, 20.32], [8192, 21.26]]
 hbm_gbps = 275.7
 scan_gelems = 302.5

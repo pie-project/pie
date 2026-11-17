@@ -11,8 +11,11 @@
 //! ```toml
 //! [rates]
 //! launch_ns = 900          # what a dependent dispatch adds to its work
-//! # bf16 matmul TFLOP/s by rows, n = k = 4096
-//! gemm_tflops_by_rows = [[256, 90.0], [1024, 160.0], [4096, 200.0], [8192, 210.0]]
+//! # bf16 matmul TFLOP/s by rows, at each width n = k
+//! gemm_tflops_by_rows = [
+//!   [1024, [[256, 40.0], [8192, 150.0]]],
+//!   [4096, [[256, 90.0], [8192, 210.0]]],
+//! ]
 //! # prefill attention TFLOP/s by keys (one sequence attending itself, d 128)
 //! attn_tflops_by_keys = [[512, 60.0], [2048, 200.0], [8192, 400.0]]
 //! hbm_gbps = 650.0         # a streaming copy, read + write
@@ -27,9 +30,10 @@ use std::fmt::Write as _;
 pub struct Rates {
     /// What a dependent dispatch adds to its work, in nanoseconds.
     pub launch_ns: Option<u64>,
-    /// Dense bf16 matmul TFLOP/s by rows, at `engine::rates::GEMM_WIDTH`
-    /// columns and depth: `(rows, TFLOP/s)`, strictly ascending in rows.
-    pub gemm_tflops_by_rows: Option<Vec<(u32, f64)>>,
+    /// Dense bf16 matmul TFLOP/s by rows at each width (columns and depth
+    /// both): `(width, [(rows, TFLOP/s)])`, ascending in width, each curve
+    /// strictly ascending in rows.
+    pub gemm_tflops_by_rows: Option<Vec<(u32, Vec<(u32, f64)>)>>,
     /// Prefill attention TFLOP/s (the full rectangle's flops, four a query
     /// element a key) by keys, one sequence attending itself: `(keys,
     /// TFLOP/s)`, strictly ascending in keys.
@@ -80,6 +84,17 @@ impl Rates {
         if let Some(v) = self.launch_ns {
             let _ = writeln!(out, "launch_ns = {v}");
         }
+        if let Some(widths) = &self.gemm_tflops_by_rows {
+            let curves: Vec<String> = widths
+                .iter()
+                .map(|(w, c)| {
+                    let points: Vec<String> =
+                        c.iter().map(|(x, r)| format!("[{x}, {r:?}]")).collect();
+                    format!("  [{w}, [{}]],\n", points.join(", "))
+                })
+                .collect();
+            let _ = writeln!(out, "gemm_tflops_by_rows = [\n{}]", curves.concat());
+        }
         let mut curve = |key: &str, v: &Option<Vec<(u32, f64)>>| {
             if let Some(points) = v {
                 let points: Vec<String> = points
@@ -89,7 +104,6 @@ impl Rates {
                 let _ = writeln!(out, "{key} = [{}]", points.join(", "));
             }
         };
-        curve("gemm_tflops_by_rows", &self.gemm_tflops_by_rows);
         curve("attn_tflops_by_keys", &self.attn_tflops_by_keys);
         let mut float = |key: &str, v: Option<f64>| {
             if let Some(v) = v {
@@ -160,7 +174,7 @@ mod tests {
     fn an_upper_layer_replaces_key_by_key() {
         let mut low = Tuned {
             rates: Rates {
-                gemm_tflops_by_rows: Some(vec![(256, 1.0)]),
+                gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 1.0)])]),
                 hbm_gbps: Some(2.0),
                 ..Rates::default()
             },
@@ -178,7 +192,7 @@ mod tests {
         assert_eq!(
             low.rates,
             Rates {
-                gemm_tflops_by_rows: Some(vec![(256, 1.0)]),
+                gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 1.0)])]),
                 hbm_gbps: Some(3.0),
                 launch_ns: Some(7),
                 ..Rates::default()
@@ -191,7 +205,10 @@ mod tests {
     fn the_block_is_a_few_lines() {
         let rates = Rates {
             launch_ns: Some(904),
-            gemm_tflops_by_rows: Some(vec![(256, 90.5), (8192, 210.0)]),
+            gemm_tflops_by_rows: Some(vec![
+                (1024, vec![(256, 40.0), (8192, 150.0)]),
+                (4096, vec![(256, 90.5), (8192, 210.0)]),
+            ]),
             attn_tflops_by_keys: Some(vec![(512, 60.0), (8192, 400.0)]),
             hbm_gbps: Some(654.4),
             elementwise_gbps: Some(450.0),
@@ -200,7 +217,8 @@ mod tests {
         assert!(rates.complete());
         assert_eq!(
             rates.toml(),
-            "[rates]\nlaunch_ns = 904\ngemm_tflops_by_rows = [[256, 90.5], [8192, 210.0]]\n\
+            "[rates]\nlaunch_ns = 904\ngemm_tflops_by_rows = [\n  [1024, [[256, 40.0], [8192, \
+             150.0]]],\n  [4096, [[256, 90.5], [8192, 210.0]]],\n]\n\
              attn_tflops_by_keys = [[512, 60.0], [8192, 400.0]]\nhbm_gbps = 654.4\n\
              elementwise_gbps = 450.0\nscan_gelems = 2684.3\n"
         );

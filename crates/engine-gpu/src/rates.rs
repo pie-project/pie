@@ -278,10 +278,14 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     say(&format!("[rates]: per-row ops: {elementwise:.0} GB/s"));
     let scan = scan(&mut rig, tactics.recurrent(), timer, SCAN_SHAPE, launch)?;
     rig.release();
-    let tflops = |curve: Vec<(u32, f64)>| curve.into_iter().map(|(x, r)| (x, r / 1e3)).collect();
+    let tflops = |curve: Vec<(u32, f64)>| -> Vec<(u32, f64)> {
+        curve.into_iter().map(|(x, r)| (x, r / 1e3)).collect()
+    };
+    // One width, `engine::rates::GEMM_WIDTH`: a plane of another is read at
+    // it (this backend times no narrower curve yet).
     Ok(Rates {
         launch_ns: Some(launch_ns),
-        gemm_tflops_by_rows: Some(tflops(gemm)),
+        gemm_tflops_by_rows: Some(vec![(engine::rates::GEMM_WIDTH, tflops(gemm))]),
         attn_tflops_by_keys: Some(tflops(attn)),
         hbm_gbps: Some(bytes_per_ns),
         elementwise_gbps: Some(elementwise),

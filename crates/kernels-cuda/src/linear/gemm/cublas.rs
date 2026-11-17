@@ -888,3 +888,54 @@ impl Device {
         Some(plan)
     }
 }
+
+/// The rows of the tile a dense bf16 product of `m x n x k` (`act . w^T`)
+/// runs on this device under `tuning`'s workspace: cuBLASLt's first
+/// heuristic algorithm's (cuBLASLt's tile is `n`-major: its `N` is the
+/// product's rows). `None` where cuBLASLt offers none, or names a tile this
+/// does not know.
+#[must_use]
+pub fn tile_rows(tuning: &crate::tuning::Tuning, m: u32, n: u32, k: u32) -> Option<u32> {
+    let call = Call {
+        act: 0,
+        w: 0,
+        y: 0,
+        m: i32::try_from(m).ok()?,
+        n: i32::try_from(n).ok()?,
+        k: i32::try_from(k).ok()?,
+    };
+    let plan = with_device(|device| {
+        device.configure((tuning.gemm_workspace_mb as usize) << 20);
+        device.plan_for(call)
+    })?;
+    let algo = &plan.heuristics.first()?.algo;
+    let mut id: u32 = 0;
+    let mut written: usize = 0;
+    // SAFETY: `algo` is an algorithm cuBLASLt returned; `id` is a u32 local
+    // of the size passed (the enum's) and `written` a local.
+    let asked = unsafe {
+        lt::cublasLtMatmulAlgoConfigGetAttribute(
+            std::ptr::from_ref(algo),
+            lt::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_TILE_ID,
+            std::ptr::from_mut(&mut id).cast(),
+            std::mem::size_of::<u32>(),
+            &raw mut written,
+        )
+    };
+    if asked != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+        clear_error();
+        return None;
+    }
+    // `cublasLtMatmulTile_t` is `repr(u32)` over 0 to its END, every value
+    // between a variant, so an id below END is one; its name spells the tile.
+    if id >= lt::cublasLtMatmulTile_t::CUBLASLT_MATMUL_TILE_END as u32 {
+        return None;
+    }
+    // SAFETY: `id` is below END, and every value from 0 to END is a variant.
+    let tile: lt::cublasLtMatmulTile_t = unsafe { std::mem::transmute(id) };
+    let name = format!("{tile:?}");
+    let (_, rows) = name
+        .strip_prefix("CUBLASLT_MATMUL_TILE_")?
+        .split_once('x')?;
+    rows.parse().ok().filter(|&r| r > 0)
+}

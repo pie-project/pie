@@ -593,7 +593,9 @@ pub fn measure(
     say(&format!("  256 MiB blit: {bytes:.1} GB/s read and write"));
     Ok(Rates {
         launch_ns: Some(launch),
-        gemm_tflops_by_rows: Some(gemm),
+        // One width, `engine::rates::GEMM_WIDTH`: a plane of another is
+        // read at it (this backend times no narrower curve yet).
+        gemm_tflops_by_rows: Some(vec![(engine::rates::GEMM_WIDTH, gemm)]),
         attn_tflops_by_keys: Some(attn),
         hbm_gbps: Some(bytes),
         elementwise_gbps: Some(elementwise),

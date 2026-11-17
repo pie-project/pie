@@ -103,16 +103,37 @@ pub fn widest(rungs: &[RungFacts]) -> Option<u32> {
         .max()
 }
 
+/// The rows of the tile each dense bf16 product pads to under `chip`: the
+/// tile of cuBLASLt's first heuristic algorithm at its shape (on ROCm, and
+/// where cuBLASLt names none, a row's own: nothing padded).
+#[must_use]
+pub fn row_tile(chip: &profile::Profile) -> engine::roofline::RowTile {
+    #[cfg(feature = "cuda")]
+    {
+        let tuning = kernels_cuda::tuning::Tuning::of(chip);
+        std::sync::Arc::new(move |m, n, k| {
+            kernels_cuda::linear::gemm::tile_rows(&tuning, m, n, k).unwrap_or(1)
+        })
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = chip;
+        std::sync::Arc::new(|_, _, _| 1)
+    }
+}
+
 /// The top rung of `rungs` on `device`, whose profile states `rates`, over
-/// a live range of `live` bytes ([`engine::load::choose`]).
+/// a live range of `live` bytes, each matmul padded to `row_tile`
+/// ([`engine::load::choose_tiled`]).
 pub fn choose(
     rungs: &[RungFacts],
     live: u64,
     rates: &profile::fire::Rates,
+    row_tile: Option<engine::roofline::RowTile>,
     device: &str,
     counts: &Counts,
 ) -> Result<TopRung> {
-    engine::load::choose(rungs, live, rates, device, counts)
+    engine::load::choose_tiled(rungs, live, rates, row_tile, device, counts)
         .map(|(top, _)| top)
         .map_err(|refused| Fault::Card(refused.to_string()))
 }
@@ -151,7 +172,7 @@ mod tests {
     /// The L40S device file's rates.
     fn l40s() -> profile::fire::Rates {
         profile::fire::Rates {
-            gemm_tflops_by_rows: Some(vec![(256, 100.0), (8192, 249.0)]),
+            gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 100.0), (8192, 249.0)])]),
             attn_tflops_by_keys: Some(vec![(512, 50.0), (8192, 100.0)]),
             hbm_gbps: Some(654.0),
             elementwise_gbps: Some(400.0),
@@ -182,6 +203,7 @@ mod tests {
             &rungs,
             8 << 30,
             &profile::fire::Rates::default(),
+            None,
             "NVIDIA L40S",
             &counts(),
         )
@@ -215,7 +237,7 @@ mod tests {
         assert_eq!(rungs[0].lanes, 256);
         assert_eq!(rungs[3].infeasible, Some(NO_ROOM));
         assert_eq!(rungs[4].infeasible, Some(NO_PLAN));
-        let top = choose(&rungs, live, &l40s(), "NVIDIA L40S", &counts()).unwrap();
+        let top = choose(&rungs, live, &l40s(), None, "NVIDIA L40S", &counts()).unwrap();
         let estimate = engine::load::estimate(&counts(), &l40s()).unwrap();
         assert_eq!(
             top,
@@ -226,7 +248,7 @@ mod tests {
             candidates[top.tokens.trailing_zeros() as usize - 10].span
         );
         // Every rung refused: the ruling's refusal, each rung named.
-        let err = choose(&rungs[3..], live, &l40s(), "NVIDIA L40S", &counts()).unwrap_err();
+        let err = choose(&rungs[3..], live, &l40s(), None, "NVIDIA L40S", &counts()).unwrap_err();
         assert!(
             err.to_string()
                 .contains(&format!("8192 tokens (span 2400 MiB): {NO_ROOM}")),

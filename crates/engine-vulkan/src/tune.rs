@@ -839,7 +839,8 @@ fn rates(base: &Profile, say: &mut dyn FnMut(&str)) -> Result<profile::fire::Rat
         rates
             .gemm_tflops_by_rows
             .as_ref()
-            .and_then(|c| c.last())
+            .and_then(|w| w.last())
+            .and_then(|(_, c)| c.last())
             .map_or(0.0, |&(_, t)| t),
         rates
             .attn_tflops_by_keys

@@ -108,8 +108,9 @@ impl RungFacts {
 /// dispatches takes its own work and a launch, and a dispatch of the
 /// compiled plan the model's counts name no work for takes a launch. A
 /// dispatch's work is the longer of its compute and its memory traffic: a
-/// matmul plane's flops over the measured matmul rate at its rows
-/// (`crate::roofline::Constants::gemm_rate`)
+/// matmul plane's flops, its rows padded to its kernel's tile, over the
+/// measured matmul rate at its rows and width
+/// (`crate::roofline::Constants::gemm_compute_ns`)
 /// or its read; an attention layer's flops over the measured attention rate
 /// at its keys, or its kv read; a scan layer's state steps; a per-row op's
 /// bytes over the per-row ops' measured bandwidth. `launch_ns` is what a
@@ -117,8 +118,8 @@ impl RungFacts {
 /// (`crate::rates::launch_from`). The terms, summed over the fire (the
 /// work, without the launches):
 ///
-/// `work(r) = Σ_planes max(read, 2 tokens(r) n k / gemm(tokens(r)))
-///       + max(head_read, 2 sampled(r) vocab hidden / gemm(sampled(r)))
+/// `work(r) = Σ_planes max(read, 2 pad(tokens(r)) n k / gemm(tokens(r), √(n k)))
+///       + max(head_read, 2 sampled(r) vocab hidden / gemm(sampled(r), √(vocab hidden)))
 ///       + max(tokens(r) · keys(r) · attn_flops_per_row_key / attn(keys(r)),
 ///             keys(r) · kv_bytes_per_key / bytes_per_ns)
 ///       + tokens(r) · state_elements_per_row / scan_rate
@@ -186,9 +187,16 @@ impl FireEstimate {
         self.gemm_shapes
             .iter()
             .map(|s| {
-                let flops = f64::from(rows) * s.flops_per_row as f64;
+                // The rows the kernel computes: a dense plane's padded to
+                // its tile; a routed bank's flops a row are its picks'.
+                let computed = if s.routed {
+                    rows
+                } else {
+                    self.rates.padded_rows(rows, s.n, s.k)
+                };
+                let flops = f64::from(computed) * s.flops_per_row as f64;
                 let ns = if flops > 0.0 {
-                    flops / self.rates.gemm_rate(rows)
+                    flops / self.rates.gemm_rate(rows, s.n, s.k)
                 } else {
                     0.0
                 };
@@ -232,7 +240,11 @@ impl FireEstimate {
         let head_read = over(self.head_bytes as f64, c.bytes_per_ns);
         let readout = over(
             f64::from(fire.sampled) * self.readout_flops,
-            c.gemm_rate(fire.sampled),
+            c.gemm_rate(
+                fire.sampled,
+                self.readout_flops as u32 / (2 * self.readout_depth.max(1)),
+                self.readout_depth,
+            ),
         );
         if self.readout_flops > 0.0 {
             dispatched += floored(readout.max(head_read), 1);
@@ -284,6 +296,48 @@ impl FireEstimate {
             }
             _ => 0.0,
         }
+    }
+
+    /// The rows past which no rung of `lattice` (ascending) can be chosen,
+    /// by this estimate of the model's own fire: of the lattice's powers of
+    /// two, the first `p` past which a prompt of `2p` tokens runs no more
+    /// than [`crate::rates::AGREEMENT`] more tokens a ns than one of `p`
+    /// (the lattice's widest power of two where every doubling still
+    /// gains). A top rung is the argmax of efficiency times live capacity,
+    /// and live capacity only falls as rows grow, so no rung past it can win.
+    /// On `lattice`, its first row at or past it.
+    #[must_use]
+    pub fn top(&self, lattice: &[u32]) -> u32 {
+        let rate = |tokens: u32| {
+            let prompt = RungFacts {
+                tokens,
+                lanes: 1,
+                keys: tokens,
+                launches: 0,
+                padded_rows: tokens,
+                span_bytes: 0,
+                infeasible: None,
+                fire_lanes: 1,
+            };
+            f64::from(tokens) / self.ns(&prompt).max(f64::MIN_POSITIVE)
+        };
+        let octaves: Vec<u32> = lattice
+            .iter()
+            .copied()
+            .filter(|m| m.is_power_of_two())
+            .collect();
+        let top = octaves
+            .windows(2)
+            .find(|w| rate(w[1]) <= (1.0 + crate::rates::AGREEMENT) * rate(w[0]))
+            .map(|w| w[0])
+            .or(octaves.last().copied())
+            .unwrap_or(1);
+        lattice
+            .iter()
+            .copied()
+            .find(|&m| m >= top)
+            .or(lattice.last().copied())
+            .unwrap_or(top)
     }
 
     /// The estimated time of a fire at `rung`.
@@ -611,11 +665,12 @@ mod tests {
         // every key; the per-row ops at the bandwidth.
         crate::roofline::Constants {
             launch_ns,
-            gemm_by_rows: vec![(1, 2.0)],
+            gemm_by_rows: vec![(1, vec![(1, 2.0)])],
             attn_by_keys: vec![(1, 0.5)],
             bytes_per_ns,
             elementwise_bytes_per_ns: bytes_per_ns,
             scan_elements_per_ns: 2.0,
+            row_tile: std::sync::Arc::new(|_, _, _| 1),
         }
     }
 
@@ -694,7 +749,7 @@ mod tests {
         // tokens cost what 64 do, and the narrow rung does not win.
         let e = FireEstimate {
             rates: crate::roofline::Constants {
-                gemm_by_rows: vec![(16, 0.5), (64, 2.0)],
+                gemm_by_rows: vec![(1, vec![(16, 0.5), (64, 2.0)])],
                 ..constants(0.0, 1.0)
             },
             ..estimate(100, 10.0)
@@ -708,6 +763,19 @@ mod tests {
         assert_eq!(times, [640.0, 640.0]);
         let top = top_rung(&rungs, 1024 * MIB, &e).unwrap();
         assert_eq!(top.tokens, 64);
+    }
+
+    #[test]
+    fn the_top_is_where_a_doubling_of_the_prompt_stops_paying() {
+        // 1000 ns fixed and 1 ns a token: a doubling from p gains
+        // 2 (1000 + p) / (1000 + 2p), 5.75% from 8192 and 2.96% from 16384.
+        let (e, _) = summed(1000, 1.0);
+        let lattice: Vec<u32> = (0..=15).map(|i| 1u32 << i).chain([12000]).collect();
+        let mut lattice = lattice;
+        lattice.sort_unstable();
+        assert_eq!(e.top(&lattice), 16384);
+        // A lattice ending before it: its widest power of two.
+        assert_eq!(e.top(&lattice[..12]), 2048);
     }
 
     #[test]
