@@ -678,8 +678,8 @@ where
         self.programs.facts(program, &place(shell)).map_err(refusal)
     }
 
-    /// A program reading captured attention scores takes the capture
-    /// planes' rows for its lanes beside the fire's carve, in the span.
+    /// A program reading captured attention scores lays its lanes' score
+    /// rows in a fire's guest region: its per-member term.
     fn fire_facts(
         &self,
         program: ProgramId,
@@ -759,6 +759,12 @@ where
                 .as_ref()
                 .map_or(engine::fire::Serves::NONE, engine::fire::Serves::of),
         )?;
+        if let Some(shell) = self.shell.as_ref() {
+            let facts = &shell.trace().facts;
+            for step in &frame.steps {
+                step.validate_captures(|word| facts.holds(word, poem_ir::Builtin::Scores))?;
+            }
+        }
         let id = FrameId(self.next_frame);
         self.next_frame = self.next_frame.wrapping_add(1);
 

@@ -1834,6 +1834,7 @@ dependencies = [
  "block2",
  "checkpoint",
  "engine",
+ "engine-cpu",
  "eta-compiler",
  "eta-exec",
  "kernels-metal",
@@ -1863,6 +1864,7 @@ dependencies = [
  "ash",
  "checkpoint",
  "engine",
+ "engine-cpu",
  "engine-gpu",
  "eta-compiler",
  "eta-exec",
@@ -1888,6 +1890,7 @@ version = "0.6.0"
 dependencies = [
  "checkpoint",
  "engine",
+ "engine-cpu",
  "engine-gpu",
  "eta-compiler",
  "eta-exec",

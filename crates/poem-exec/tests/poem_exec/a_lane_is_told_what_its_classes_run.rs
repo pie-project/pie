@@ -46,7 +46,7 @@ fn classes_of(name: &str) -> (Trace, LaneClasses) {
     }
     let compiled = compile_axes(&trace, &budgets, &DeviceProfile::default())
         .unwrap_or_else(|why| panic!("`{name}` bakes: {why}"));
-    let outputs = poem_exec::feeds::class_outputs(&trace, &compiled)
+    let outputs = poem_exec::feeds::class_outputs(&trace, &compiled, 2048, 16)
         .unwrap_or_else(|why| panic!("`{name}` reads out: {why}"));
     let classes = poem_exec::feeds::lane_classes(&trace, &compiled, &outputs);
     (trace, classes)
