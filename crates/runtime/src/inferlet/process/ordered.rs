@@ -62,7 +62,9 @@ impl OrderedSemaphore {
         Self::after(name, permits, holds, Vec::new())
     }
 
-    /// A gate passed after `upstream`, in that order.
+    /// A gate passed after `upstream`: the gate just before it. (Looking
+    /// further back would bar on processes that wait, at the gate between,
+    /// for permits this gate's waiters hold.)
     pub(crate) fn after(
         name: &'static str,
         permits: usize,
@@ -465,6 +467,47 @@ mod tests {
             .await
             .expect("then it passes")
             .unwrap();
+        schedule::install(None);
+    }
+
+    #[tokio::test]
+    async fn waiters_holding_the_gate_before_are_not_barred_by_who_waits_for_it() {
+        // The stall VTC found: execution's waiters hold every bind permit;
+        // higher keys wait at bind, holding prewarm. Execution has permits
+        // and must use them, or no one moves.
+        let _schedule = schedule::TEST_LOCK.write().await;
+        let (low, high) = (pid(41), pid(42));
+        schedule::install(Some(Table::new(
+            HashMap::from([(low, 1), (high, 9)]),
+            None,
+            HashMap::new(),
+            None,
+        )));
+        let prewarm = OrderedSemaphore::new("prewarm", 1, true);
+        let bind = OrderedSemaphore::after("bind", 1, false, vec![Arc::clone(&prewarm)]);
+        let execution = OrderedSemaphore::after("execution", 1, true, vec![Arc::clone(&bind)]);
+        let low_bound = Arc::clone(&bind).acquire_owned(low).await;
+        let high_warm = Arc::clone(&prewarm).acquire_owned(high).await;
+        let high_waits = tokio::spawn({
+            let bind = Arc::clone(&bind);
+            async move { bind.acquire_owned(high).await }
+        });
+        while bind.lock().waiters.is_empty() {
+            tokio::task::yield_now().await;
+        }
+        let low_runs = tokio::time::timeout(
+            Duration::from_secs(1),
+            Arc::clone(&execution).acquire_owned(low),
+        )
+        .await
+        .expect("execution is not barred by a waiter for the bind permit it holds");
+        drop(low_bound);
+        drop(low_runs);
+        let high_bound = tokio::time::timeout(Duration::from_secs(1), high_waits)
+            .await
+            .unwrap()
+            .unwrap();
+        drop((high_bound, high_warm));
         schedule::install(None);
     }
 
