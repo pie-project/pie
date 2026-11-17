@@ -61,12 +61,16 @@ pub fn provenance(device: &str) -> (&'static str, String) {
 }
 
 /// `chip` with every roofline constant stated: as it is where its layers
-/// state them all; else the device's own measured here, before the load is
-/// ready (the step `pie tune cuda --rates` runs, seconds long, each timed
-/// submission a burst of about [`BURST_NS`]), each constant a layer states
-/// kept over the measured one, the whole written to the user's profile of
-/// `device` under `profiles` (with its provenance) so later loads read it,
-/// and marked measured this load for the load's line.
+/// state them all; else the device's own measured here, at the start of the
+/// load, before any pool or buffer of it is laid (the step `pie tune cuda
+/// --rates` runs, seconds long, each timed submission a burst of about
+/// [`BURST_NS`]), each constant a layer states kept over the measured one,
+/// the whole written to the user's profile of `device` under `profiles`
+/// (with its provenance) so later loads read it, and marked measured this
+/// load for the load's line. The step's buffers come of `room`, what the
+/// load's budget leaves on the device: where it holds less than the step
+/// lays at most (`engine::rates::step_bytes`) the load is refused by name,
+/// never left to wait for memory.
 pub fn ensure(
     chip: profile::Profile,
     ordinal: i32,
@@ -74,14 +78,37 @@ pub fn ensure(
     facts: &profile::Facts,
     profiles: Option<&std::path::Path>,
     cache: Option<&std::path::Path>,
+    room: u64,
+) -> Result<profile::Profile, String> {
+    ensure_by(chip, device, facts, profiles, room, |chip| {
+        measure(ordinal, chip, cache).map(|m| m.rates)
+    })
+}
+
+/// [`ensure`] with the measurement `measure`.
+fn ensure_by(
+    chip: profile::Profile,
+    device: &str,
+    facts: &profile::Facts,
+    profiles: Option<&std::path::Path>,
+    room: u64,
+    measure: impl FnOnce(&profile::Profile) -> Result<Rates, String>,
 ) -> Result<profile::Profile, String> {
     let stated = chip.rates();
     if stated.complete() {
         return Ok(chip);
     }
+    let need = engine::rates::step_bytes();
+    if need > room {
+        return Err(format!(
+            "{device}'s profile states no roofline rates, and measuring them needs {} MiB of \
+             device memory where the load's budget leaves {} MiB",
+            need >> 20,
+            room >> 20
+        ));
+    }
     let began = std::time::Instant::now();
-    let measured = measure(ordinal, &chip, cache)?.rates;
-    let rates = stated.over(measured);
+    let rates = stated.over(measure(&chip)?);
     eprintln!(
         "engine-cuda: {device}'s profile states no roofline rates; measured them in {:.1} s",
         began.elapsed().as_secs_f64()
@@ -943,5 +970,64 @@ mod attention_tests {
                 "{keys} keys, d {d}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod ensure_tests {
+    use super::*;
+
+    fn measured() -> Rates {
+        Rates {
+            launch_ns: Some(900),
+            gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 100.0), (8192, 200.0)])]),
+            attn_tflops_by_keys: Some(vec![(512, 50.0), (8192, 300.0)]),
+            hbm_gbps: Some(600.0),
+            elementwise_gbps: Some(500.0),
+            scan_gelems: Some(2000.0),
+        }
+    }
+
+    #[test]
+    fn a_load_measures_once_and_the_next_reads_what_it_kept() {
+        let home = std::env::temp_dir().join(format!("pie-ensure-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let device = "Roofline Test Card";
+        let facts = crate::chip::facts(8, 9, 142);
+        let room = engine::rates::step_bytes();
+        let (chip, _) = crate::chip::resolve(device, &facts, Some(&home));
+        assert!(!chip.rates().complete(), "no file states this card's rates");
+        let mut times = 0;
+        let first = ensure_by(chip, device, &facts, Some(&home), room, |_| {
+            times += 1;
+            Ok(measured())
+        })
+        .unwrap();
+        assert_eq!((times, first.rates()), (1, measured()));
+        assert!(first.tuned().measured_this_load);
+        // The second load resolves the user's profile the first wrote, and
+        // measures nothing.
+        let (chip, _) = crate::chip::resolve(device, &facts, Some(&home));
+        let second = ensure_by(chip, device, &facts, Some(&home), room, |_| {
+            times += 1;
+            Ok(measured())
+        })
+        .unwrap();
+        std::fs::remove_dir_all(&home).unwrap();
+        assert_eq!((times, second.rates()), (1, measured()));
+        assert!(!second.tuned().measured_this_load);
+    }
+
+    #[test]
+    fn a_budget_short_of_the_step_is_refused_by_name_and_measures_nothing() {
+        let device = "Roofline Test Card";
+        let facts = crate::chip::facts(8, 9, 142);
+        let (chip, _) = crate::chip::resolve(device, &facts, None);
+        let short = engine::rates::step_bytes() - 1;
+        let err = ensure_by(chip, device, &facts, None, short, |_| {
+            panic!("nothing is measured past a short budget")
+        })
+        .unwrap_err();
+        assert!(err.contains("measuring them needs"), "{err}");
     }
 }

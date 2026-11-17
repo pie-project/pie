@@ -68,6 +68,10 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     };
     // A device whose profile lacks the roofline's constants measures them
     // here, before ready, and keeps them in the user's profile.
+    let room = {
+        let (free, total) = crate::store::device_memory()?;
+        crate::device::elastic::room_under(ceiling, free, total)
+    };
     let chip = crate::rates::ensure(
         chip,
         boot.ordinal,
@@ -75,6 +79,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         &measured,
         boot.knobs.profiles.as_deref(),
         boot.cache_dir,
+        room,
     )
     .map_err(crate::error::Fault::Card)?;
     device.set_tuning(kernels_cuda::tuning::Tuning::of(&chip));

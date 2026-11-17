@@ -281,6 +281,7 @@ fn load_every_rung(
     artifact: &Path,
     deployment: &str,
     chip: Profile,
+    profiles: Option<&Path>,
     (slots, context): (u32, u32),
 ) -> Result<(crate::Shell, poem_ir::Trace), String> {
     use poem::Platform;
@@ -317,6 +318,8 @@ fn load_every_rung(
         knobs: crate::Knobs {
             chip: Some(chip),
             every_rung: true,
+            // Rates a load measures are kept beside the user's profiles.
+            profiles: profiles.map(Path::to_path_buf),
             ..crate::Knobs::default()
         },
         cache_dir: None,
@@ -436,12 +439,13 @@ fn dissect(
     artifact: &Path,
     deployment: &str,
     walked: Profile,
+    profiles: Option<&Path>,
     rungs: &[Dissected],
     say: &mut dyn FnMut(&str),
 ) -> Result<(), String> {
     let launch_ns = walked.rates().launch_ns.unwrap_or(0) as f64;
     let fires = rungs.iter().map(|r| prompt(r.tokens));
-    let (mut shell, trace) = load_every_rung(artifact, deployment, walked, sized(fires))?;
+    let (mut shell, trace) = load_every_rung(artifact, deployment, walked, profiles, sized(fires))?;
     // A drained pair around nothing: what each node's drains cost beside
     // its work, taken off every node.
     crate::dissect::start();
@@ -518,6 +522,7 @@ fn check_estimate_of(
     deployment: &str,
     chip: Profile,
     walked: Profile,
+    profiles: Option<&Path>,
     also: &[u32],
     say: &mut dyn FnMut(&str),
 ) -> Result<String, String> {
@@ -537,11 +542,11 @@ fn check_estimate_of(
             .collect();
         Ok((weighed, laid, rungs))
     };
-    let (shell, _) = load_every_rung(artifact, deployment, chip.clone(), ROOMY)?;
+    let (shell, _) = load_every_rung(artifact, deployment, chip.clone(), profiles, ROOMY)?;
     let (_, _, rungs) = checked(&shell)?;
     drop(shell);
     let size = sized(rungs.iter().map(engine::load::RungFacts::check_fire));
-    let (mut shell, trace) = load_every_rung(artifact, deployment, chip.clone(), size)?;
+    let (mut shell, trace) = load_every_rung(artifact, deployment, chip.clone(), profiles, size)?;
     let (weighed, laid, rungs) = checked(&shell)?;
     let model = engine::load::model_class(&trace).to_owned();
     say(&format!(
@@ -643,6 +648,7 @@ fn check_estimate_of(
         artifact,
         deployment,
         chip,
+        profiles,
         sized(dissected.iter().map(|d| prompt(d.tokens))),
     )?;
     for d in &mut dissected {
@@ -657,7 +663,7 @@ fn check_estimate_of(
         d.replayed = ns;
     }
     drop(shell);
-    dissect(artifact, deployment, walked, &dissected, say)?;
+    dissect(artifact, deployment, walked, profiles, &dissected, say)?;
     if short > CHECK_BOUND {
         return Err(format!(
             "the estimate picks rung {} for {model}, {:.1}% below the measured best {}: past \
@@ -818,6 +824,7 @@ pub fn run(
                 deployment,
                 Cuda::profile_of(&today)?,
                 Cuda::profile_of(&walked)?,
+                profiles,
                 dissect,
                 say,
             ) {
