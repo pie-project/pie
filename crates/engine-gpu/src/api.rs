@@ -814,6 +814,31 @@ where
         self.programs.register(registration).map_err(refusal)
     }
 
+    /// The program adopted and its stages lowered in the returned compile,
+    /// off the engine's thread (`program::adopt`); nothing of the plane's
+    /// is touched until the finish.
+    fn prepare_program(
+        &mut self,
+        registration: &ProgramRegistration,
+    ) -> EngineResult<engine::ProgramCompile> {
+        let registration = registration.clone();
+        Ok(Box::new(move || {
+            engine::Prepared(Box::new(crate::program::adopt(&registration)))
+        }))
+    }
+
+    /// The adopted program's id and form held (`Programs::finish`); a
+    /// compile that refused refuses here.
+    fn finish_program(&mut self, prepared: engine::Prepared) -> EngineResult<ProgramId> {
+        let Ok(prepared) = prepared.0.downcast::<crate::program::Prepared>() else {
+            return Err(Error::Program(format!(
+                "a prepared program the {} engine did not prepare",
+                B::KIND
+            )));
+        };
+        self.programs.finish(*prepared).map_err(refusal)
+    }
+
     fn register_channel(
         &mut self,
         registration: &ChannelRegistration,

@@ -156,33 +156,17 @@ pub struct Plane {
 }
 
 impl Plane {
-    pub fn register(&mut self, registration: &ProgramRegistration) -> Result<ProgramId, Refusal> {
-        let plan = eta_exec::adopt_launch_package(registration.launch.clone())
-            .map_err(|error| Refusal::Program(error.to_string()))?;
-        if !plan.executable {
-            return Err(Refusal::Program(format!(
-                "program 0x{:016x} calls a semantic boundary this backend does not implement: {}",
-                registration.program_hash,
-                plan.reject_reason.as_deref().unwrap_or("no reason given")
-            )));
-        }
+    /// A registration's last step, on the engine's thread: the program
+    /// its compile adopted (`engine_gpu::program::adopt`) gets its id and
+    /// its form is held; a compile that refused refuses here.
+    pub fn finish(
+        &mut self,
+        prepared: engine_gpu::program::Prepared,
+    ) -> Result<ProgramId, Refusal> {
+        let engine_gpu::program::Adopted { plan, form } = prepared?;
         self.next_program += 1;
         let id = ProgramId(self.next_program);
-
-        // A guest pass runs on the device whole or not at all, and this
-        // engine runs no other: a program whose stages do not lower has no
-        // form here, refused at registration by name.
-        if !self.forms.admit(id, &plan.package) {
-            let why = self
-                .forms
-                .refusal(id)
-                .map_or_else(|| "no reason given".to_owned(), ToString::to_string);
-            self.forms.forget(id);
-            return Err(Refusal::Program(format!(
-                "program 0x{:016x} has no device form: {why}",
-                registration.program_hash
-            )));
-        }
+        self.forms.hold(id, form);
         tracing::debug!(program = id.0, "guest program registered");
         self.programs.insert(id, Arc::new(plan));
         Ok(id)
@@ -1200,8 +1184,8 @@ impl Plane {
 }
 
 impl engine_gpu::program::Programs<crate::device::Api> for Plane {
-    fn register(&mut self, registration: &ProgramRegistration) -> Result<ProgramId, Refusal> {
-        Plane::register(self, registration)
+    fn finish(&mut self, prepared: engine_gpu::program::Prepared) -> Result<ProgramId, Refusal> {
+        Plane::finish(self, prepared)
     }
 
     fn load(
