@@ -2491,9 +2491,12 @@ milestone's tail.
 
 - **The refit** (`check::CODE_KINDS`): each kind's mean miss added to its code, and its worst
   miss after (`check::miss`) the margin a choice keeps past the stack's room; a kind not refitted
-  keeps `UNDER`. The check warns at a kind's own miss. Klein's tile 2,4 at (64, 256) tight and
-  streamed, gated: 49,175 B estimated (it does not link); at (32, 256) 48,151 B (linked in the
-  combined 1024² program 48,224 B, 928 B of stack).
+  keeps `UNDER`. The check warns at a kind's own miss. `stream::tiled::points` prices each
+  rung of the chunk ladder as the combined program links it (`coresident::gated`) and keeps the
+  first whose every PE leaves the stack's room past its kind's miss; where no tile does, it
+  refuses by name with the nearest (tile, chunks, PE, bytes short). Klein's tile 2,4: at (64,
+  256) tight and streamed 49,175 B estimated (refused: 864 B short); at (32, 256) 48,151 B
+  (linked in the combined 1024² program 48,224 B, 928 B of stack).
 
 ## The GEMM search's time
 
@@ -3418,3 +3421,38 @@ The run order is kv0, kv300, kv600, kv0 again, 3 steps each against the golden, 
   (pipelined), and fits `HOP` either way.
 - **Before the run:** the chip measured M1j's step 1 at 1.25M cycles. A delta near +153k
   cycles a step (+12%) at kv300 confirms the per-row reading at 2 cycles a hop.
+
+## Compile on load: the readings' regimes chosen together
+
+- **The choice.** `stream::points` lists the programs a reading compiles to within a system's
+  fabric: the stream regime's, the GEMM regime's at every (columns, rows of PEs, key block,
+  batch) that places and fits a PE, the tiled regime's at every top tile at the first rung of
+  its chunk ladder (`tiled::CHUNK_LADDER`: the defaults, less staging and block, the op table
+  streamed and the buffers packed tightly, less again) whose every PE, priced as the combined
+  program links it (`coresident::gated`), leaves the stack's room past its kind's miss (A tiled
+  PE's memory, refitted), the rows regime's; those another point is no larger than and no
+  dearer than are dropped. `stream::choose` takes the combination whose request is cheapest
+  (each reading's price times its runs a request: the denoiser the schedule's pinned steps) of
+  those `coresident::fits` places together (P1's `place::pack_within`, the only filter), else
+  refuses by name with the nearest miss (its `Miss`, short rows or columns); a reading no point
+  builds is refused by name (a tiled reading with the nearest tile, chunks, PE and bytes
+  short). `stream::wanted` sizes each reading: its classes at `stream_rows`, a class that reads
+  the latent (and a grid reading's clip) at the rows the load's `max_voxels` make
+  (`grid::voxels_a_row`: the patchify's area). Where each reading's cheapest point fits beside
+  the others the choice is the per-reading one as before.
+- **The tape's words** are the room a tape image leaves as a link measured it
+  (`check::tape_words`: 48 KiB less the image past its tape, `emit::gemm::TAPE_IMAGE_BYTES`
+  4,544 B and `emit::tiled::TAPE_IMAGE_BYTES` 4,556 B, the stack's 768 B and the search's 512
+  B margin: 10,832 and 10,829 words). A GEMM block of an odd count of 16-bit weights is padded to whole
+  words (a zero half after it in the stream), so klein's text builds at 512 columns too.
+- **klein at 1024²** (context 512, latents 4,096, `max_voxels` 16,384): text GEMM 256 x 637
+  (121.8M cycles), denoise GEMM 384 x 1,040 (151.5M a step, 4 steps), VAE tiled at tile 2,4,
+  (32, 256) staged channels and block, op table streamed, packed tightly, 258 x 521 (127.9M):
+  packed 642 x 1,158. It links for the system as the engine compiles it on load (the fullest
+  PEs: the VAE's `tpe.csl` 48,224 B, 928 B of stack; the tapes 47,920 B; the denoise's
+  `gpe.csl` 47,216 B). The choice before the refit took (64, 256) at tile 2,4, which cslc
+  refused (out of PE memory).
+- **Open: the GEMM regime on the chip.** No GEMM-regime program has completed on a system.
+  Klein's 1024² denoise (384 x 576 + 502 tape rows, request 1520) linked, loaded and landed its
+  1.99G words of static arrays, then its first launch never returned (killed at 3,000 s).
+  flux2-mini's GEMM programs have run only on the simulator.

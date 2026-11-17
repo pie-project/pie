@@ -516,6 +516,342 @@ pub fn compile_whole(
     }
 }
 
+/// A regime and shape a reading's program can take.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Regime {
+    /// Rows through units, the stream compiler's own floorplan.
+    Stream,
+    /// The GEMM regime over `c` x `r` PEs, `kbm` key-block members, `batch` requests a launch.
+    Gemm {
+        c: u32,
+        r: u32,
+        kbm: u32,
+        batch: u32,
+    },
+    /// The tiled regime, its top tile `tile` (rows, columns) and its convolutions' staged
+    /// channels and weight block at most.
+    Tiled {
+        tile: (u32, u32),
+        chunks: tiled::Chunks,
+    },
+    /// The rows regime: passes over one unit.
+    Rows,
+}
+
+/// Whether programs of these sizes (w, h) place together, or by how much they miss.
+pub type Fit = dyn Fn(&[(u32, u32)]) -> Result<(), crate::place::pack::Miss>;
+
+/// The readings compiled together with their points, and those refused with why.
+pub type Together = (Vec<(String, Point)>, Vec<(String, String)>);
+
+/// A program a reading can be compiled to: its regime, its fabric and its price (cycles a
+/// request's run of it).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Point {
+    pub regime: Regime,
+    pub w: u32,
+    pub h: u32,
+    pub cycles: f64,
+}
+
+/// Every program `o.reading` compiles to within a system's fabric (a grid reading on the clip
+/// `o.rows` voxels make), each regime at each shape its compiler builds, less those another is
+/// no larger than and no dearer than; or why none is.
+pub fn points(trace: &Trace, o: &Options, class_rows: &[(String, u32)]) -> R<Vec<Point>> {
+    let b = crate::floorplan::stream::Bounds::system();
+    let mut all: Vec<Point> = Vec::new();
+    let mut why: Vec<String> = Vec::new();
+    if grid::is_grid(trace, &o.reading) {
+        let clip = grid::clip_of(trace, &o.reading, o.rows);
+        match tiled::points(trace, &o.reading, clip, o.round16, (b.w, b.h)) {
+            Ok(v) => all.extend(v.into_iter().map(|(cycles, tile, chunks, (w, h))| Point {
+                regime: Regime::Tiled { tile, chunks },
+                w,
+                h,
+                cycles,
+            })),
+            Err(e) => why.push(e),
+        }
+        match grid::program(trace, &o.reading, clip, o.round16) {
+            Ok(g) if g.stream.w <= b.w && g.stream.h <= b.h => all.push(Point {
+                regime: Regime::Rows,
+                w: g.stream.w,
+                h: g.stream.h,
+                cycles: crate::cost::grid::time(&g).cycles,
+            }),
+            Ok(g) => why.push(format!(
+                "the rows regime's {} x {} PEs past the fabric",
+                g.stream.w, g.stream.h
+            )),
+            Err(e) => why.push(e),
+        }
+    } else {
+        let st = shape(
+            trace,
+            &o.reading,
+            &with_rows(program::classes(trace, &o.reading, o.rows), class_rows),
+        )
+        .and_then(|s| {
+            build::program_py(
+                trace, s, o.round16, o.upto, &o.taps, None, None, None, false, b,
+            )
+        });
+        match st {
+            Ok(p) => all.push(Point {
+                regime: Regime::Stream,
+                w: p.stream.w,
+                h: p.stream.h,
+                cycles: crate::cost::stream::expected(&p),
+            }),
+            Err(e) => why.push(e),
+        }
+        for batch in 1..=BATCH_MOST {
+            match gemm::candidates(trace, o, class_rows, None, (b.w, b.h), batch) {
+                Ok((v, w)) => {
+                    if v.is_empty() && !w.is_empty() {
+                        why.push(w);
+                    }
+                    all.extend(v.into_iter().map(|(_, g)| {
+                        let (w, h) = g.fabric();
+                        Point {
+                            regime: Regime::Gemm {
+                                c: g.c,
+                                r: g.r,
+                                kbm: g.kbm,
+                                batch,
+                            },
+                            w,
+                            h,
+                            cycles: crate::cost::gemm::expected(&g) / f64::from(batch),
+                        }
+                    }));
+                }
+                Err(e) => why.push(e),
+            }
+        }
+    }
+    let kept = pareto(all);
+    if kept.is_empty() {
+        return Err(why.join("; "));
+    }
+    Ok(kept)
+}
+
+/// The points no other is as small as and as cheap as (the cheaper on a tie), cheapest first.
+fn pareto(mut all: Vec<Point>) -> Vec<Point> {
+    all.sort_by(|a, b| a.cycles.total_cmp(&b.cycles));
+    let mut kept: Vec<Point> = Vec::new();
+    for p in all {
+        if !kept.iter().any(|k| k.w <= p.w && k.h <= p.h) {
+            kept.push(p);
+        }
+    }
+    kept
+}
+
+/// Compiles `o.reading` at `point` into `out`. Returns the fabric's size.
+pub fn compile_point(
+    trace: &Trace,
+    o: &Options,
+    class_rows: &[(String, u32)],
+    point: &Point,
+    out: &std::path::Path,
+) -> R<(u32, u32)> {
+    let b = crate::floorplan::stream::Bounds::system();
+    match &point.regime {
+        Regime::Stream => {
+            let s = shape(
+                trace,
+                &o.reading,
+                &with_rows(program::classes(trace, &o.reading, o.rows), class_rows),
+            )?;
+            let p = build::program_py(
+                trace, s, o.round16, o.upto, &o.taps, None, None, None, false, b,
+            )?;
+            write_stream(&p, o, out, None)?;
+            Ok((p.stream.w, p.stream.h))
+        }
+        Regime::Gemm { c, r, kbm, batch } => {
+            let g = gemm::program(
+                trace,
+                o,
+                class_rows,
+                Some((*c, *r, *kbm)),
+                (b.w, b.h),
+                *batch,
+            )?;
+            gemm::compile_program(&g, out, None)?;
+            Ok(g.fabric())
+        }
+        Regime::Tiled { tile, chunks } => {
+            let clip = grid::clip_of(trace, &o.reading, o.rows);
+            let p = tiled::program_with(
+                trace,
+                &o.reading,
+                clip,
+                o.round16,
+                *tile,
+                *chunks,
+                Some((b.w, b.h)),
+            )?;
+            tiled::compile_program(&p, out)?;
+            Ok(p.fabric())
+        }
+        Regime::Rows => {
+            let clip = grid::clip_of(trace, &o.reading, o.rows);
+            let g = grid::compile(trace, &o.reading, clip, o.round16, out)?;
+            Ok((g.stream.w, g.stream.h))
+        }
+    }
+}
+
+/// One point a reading (each reading's points, and the runs of it a request makes), the
+/// combination whose request is cheapest (the runs' cycles summed) of those `fit` places
+/// together; `fit` gives the rows a combination falls short by where it does not. Returns
+/// the chosen point of each reading, or the nearest miss by name.
+pub fn choose(readings: &[(String, Vec<Point>, f64)], fit: &Fit) -> R<Vec<usize>> {
+    let mut combos: Vec<(f64, Vec<usize>)> = vec![(0.0, Vec::new())];
+    for (_, pts, runs) in readings {
+        let mut next = Vec::with_capacity(combos.len() * pts.len());
+        for (c, at) in &combos {
+            for (i, p) in pts.iter().enumerate() {
+                let mut a = at.clone();
+                a.push(i);
+                next.push((c + runs * p.cycles, a));
+            }
+        }
+        combos = next;
+    }
+    combos.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut nearest: Option<(crate::place::pack::Miss, f64, Vec<usize>)> = None;
+    for (cy, at) in combos {
+        let sizes: Vec<(u32, u32)> = readings
+            .iter()
+            .zip(&at)
+            .map(|((_, pts, _), &i)| (pts[i].w, pts[i].h))
+            .collect();
+        match fit(&sizes) {
+            Ok(()) => return Ok(at),
+            Err(miss) => {
+                let by = |m: &crate::place::pack::Miss| (m.dy, m.dx);
+                if nearest.as_ref().is_none_or(|(s, _, _)| by(&miss) < by(s)) {
+                    nearest = Some((miss, cy, at));
+                }
+            }
+        }
+    }
+    let Some((miss, cy, at)) = nearest else {
+        return Err("no reading to place".into());
+    };
+    let parts: Vec<String> = readings
+        .iter()
+        .zip(&at)
+        .map(|((name, pts, _), &i)| {
+            let p = &pts[i];
+            format!("{name} {:?} {} x {}", p.regime, p.w, p.h)
+        })
+        .collect();
+    Err(format!(
+        "no combination of the readings' programs fits the fabric together: the nearest ({}; {:.1}M cycles a request) is {miss}",
+        parts.join(", "),
+        cy / 1e6
+    ))
+}
+
+/// A reading compile on load serves: its options (`o.rows` its classes' rows, a grid
+/// reading's the token rows its clip is of), the rows of the classes named in place of those,
+/// and the runs of it a request makes.
+#[derive(Clone, Debug)]
+pub struct Wanted {
+    pub o: Options,
+    pub class_rows: Vec<(String, u32)>,
+    pub runs: f64,
+}
+
+/// The readings `trace` declares as compile on load serves them at `rows` rows a class: where
+/// `voxels` states the latent's voxels, a class (or a grid reading) that reads a voxel input
+/// takes the token rows they make; a whole-sequence reading over the latent runs `steps` times
+/// a request (the schedule's loop), every other once.
+#[must_use]
+pub fn wanted(trace: &Trace, rows: u32, voxels: Option<u32>, steps: u32) -> Vec<Wanted> {
+    let Some(switch) = trace.facts.declared("reading") else {
+        return Vec::new();
+    };
+    let latent_rows = voxels.map(|v| (v / grid::voxels_a_row(trace)).max(1));
+    switch
+        .values
+        .iter()
+        .map(|reading| {
+            let is_grid = grid::is_grid(trace, reading);
+            let classes = program::classes(trace, reading, rows);
+            let latent: Vec<String> = classes
+                .iter()
+                .filter(|c| grid::reads_voxels(trace, c.word))
+                .map(|c| c.name.clone())
+                .collect();
+            let o = Options {
+                reading: reading.clone(),
+                rows: if is_grid {
+                    latent_rows.unwrap_or(rows)
+                } else {
+                    rows
+                },
+                round16: true,
+                upto: None,
+                taps: Vec::new(),
+            };
+            let class_rows = match (is_grid, latent_rows) {
+                (false, Some(n)) => latent.iter().map(|c| (c.clone(), n)).collect(),
+                _ => Vec::new(),
+            };
+            let runs = if !is_grid && !latent.is_empty() {
+                f64::from(steps.max(1))
+            } else {
+                1.0
+            };
+            Wanted {
+                o,
+                class_rows,
+                runs,
+            }
+        })
+        .collect()
+}
+
+/// Compiles the `wanted` readings to run together: each one's [`points`], the cheapest
+/// combination that places together on a system's fabric ([`choose`],
+/// [`coresident::fits`]), each compiled into `dir(reading)`. A reading no point builds is left
+/// out (with why). Returns the compiled readings with their points, and the refused ones.
+pub fn compile_together(
+    trace: &Trace,
+    wanted: &[Wanted],
+    dir: &dyn Fn(&str) -> std::path::PathBuf,
+) -> R<Together> {
+    let mut ok: Vec<(&Wanted, Vec<Point>)> = Vec::new();
+    let mut refused = Vec::new();
+    for w in wanted {
+        match points(trace, &w.o, &w.class_rows) {
+            Ok(p) => ok.push((w, p)),
+            Err(e) => refused.push((w.o.reading.clone(), e)),
+        }
+    }
+    let readings: Vec<(String, Vec<Point>, f64)> = ok
+        .iter()
+        .map(|(w, p)| (w.o.reading.clone(), p.clone(), w.runs))
+        .collect();
+    if readings.is_empty() {
+        return Ok((Vec::new(), refused));
+    }
+    let at = choose(&readings, &coresident::fits)?;
+    let mut out = Vec::new();
+    for ((w, pts), i) in ok.iter().zip(at) {
+        let p = &pts[i];
+        compile_point(trace, &w.o, &w.class_rows, p, &dir(&w.o.reading))?;
+        out.push((w.o.reading.clone(), p.clone()));
+    }
+    Ok((out, refused))
+}
+
 /// A grid reading's regime, by price: the tiled regime's program ([`tiled`]: the image over the
 /// fabric, its top tile searched) and the rows regime's ([`grid`]: passes over one unit), the
 /// cheaper of those that place within a system's fabric. Returns the fabric's size.

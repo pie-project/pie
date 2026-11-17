@@ -1514,6 +1514,33 @@ pub fn program(
     bounds: (u32, u32),
     batch: u32,
 ) -> R<GemmProgram> {
+    let (all, why) = candidates(trace, o, class_rows, pin, bounds, batch)?;
+    let mut p = all
+        .into_iter()
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, p)| p)
+        .ok_or_else(|| {
+            if why.is_empty() {
+                refuse(trace, "no placement")
+            } else {
+                why
+            }
+        })?;
+    streams(&mut p)?;
+    Ok(p)
+}
+
+/// Every (columns, rows of PEs, key block) at `batch` requests a launch whose program places
+/// within `bounds` and fits a PE (or the pinned one), with its price (cycles a step), its weight
+/// streams not yet written; and why the last refused one was refused.
+pub fn candidates(
+    trace: &Trace,
+    o: &Options,
+    class_rows: &[(String, u32)],
+    pin: Option<(u32, u32, u32)>,
+    bounds: (u32, u32),
+    batch: u32,
+) -> R<(Vec<(f64, GemmProgram)>, String)> {
     let mut l = lower(trace, o, class_rows)?;
     l.batch = batch.max(1);
     let total = l.request_rows() * l.batch;
@@ -1535,7 +1562,7 @@ pub fn program(
             }
         }
     }
-    let mut best: Option<(f64, GemmProgram)> = None;
+    let mut all: Vec<(f64, GemmProgram)> = Vec::new();
     let mut why = String::new();
     // the columns first: a candidate's regions print at its chunk
     let mut ok_c: BTreeMap<u32, bool> = BTreeMap::new();
@@ -1568,10 +1595,7 @@ pub fn program(
                     };
                     continue;
                 }
-                let cy = crate::cost::gemm::time(&p).cycles;
-                if best.as_ref().is_none_or(|(b, _)| cy < *b) {
-                    best = Some((cy, p));
-                }
+                all.push((crate::cost::gemm::time(&p).cycles, p));
             }
             Err(e) => {
                 if e.contains("segment of") || e.contains("region ") || e.contains("q of") {
@@ -1585,15 +1609,7 @@ pub fn program(
             }
         }
     }
-    let mut p = best.map(|(_, p)| p).ok_or_else(|| {
-        if why.is_empty() {
-            refuse(trace, "no placement")
-        } else {
-            why
-        }
-    })?;
-    streams(&mut p)?;
-    Ok(p)
+    Ok((all, why))
 }
 
 /// The batch of at most `most` requests a launch whose program serves a request cheapest (its

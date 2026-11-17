@@ -495,6 +495,49 @@ pub fn clip_of(trace: &Trace, reading: &str, rows: u32) -> [u32; 3] {
     [1, s.max(1), s.max(1)]
 }
 
+/// The voxels a token row of the trace's latent holds: the area its patchify of a voxel input
+/// takes a row of (1 where nothing patchifies one).
+#[must_use]
+pub fn voxels_a_row(trace: &Trace) -> u32 {
+    let voxel = |v: &ValueId| {
+        matches!(
+            trace.values[v.0 as usize].def,
+            Def::Input(RuntimeInput::Guest {
+                axis: InputAxis::Voxel,
+                ..
+            })
+        )
+    };
+    trace
+        .nodes
+        .iter()
+        .find_map(|n| match &n.op {
+            Operation::Conv(Conv::Patchify { x, p, .. }) if voxel(x) => Some(p[1] * p[2]),
+            _ => None,
+        })
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// Whether a node `word` runs reads a voxel input (a latent).
+#[must_use]
+pub fn reads_voxels(trace: &Trace, word: u64) -> bool {
+    let mut ins = Vec::new();
+    trace.nodes.iter().filter(|n| n.guard.holds(word)).any(|n| {
+        ins.clear();
+        n.op.inputs(&mut ins);
+        ins.iter().any(|v| {
+            matches!(
+                trace.values[v.0 as usize].def,
+                Def::Input(RuntimeInput::Guest {
+                    axis: InputAxis::Voxel,
+                    ..
+                })
+            )
+        })
+    })
+}
+
 /// The program builder's state.
 struct B<'t> {
     t: &'t Trace,

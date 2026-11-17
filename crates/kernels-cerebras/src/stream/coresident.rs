@@ -21,6 +21,30 @@ const RUN: &str = "fn run() void { timestamp.enable_tsc(); @activate(T_GO); }";
 /// It, gated on the reading launched.
 const GATED: &str = "fn run(rd: u16) void { if (rd == RD) { timestamp.enable_tsc(); @activate(T_GO); } else { sys_mod.unblock_cmd_stream(); } }";
 
+/// A kernel's text as the combined program links it: its `run` gated on the reading launched
+/// (a reading id `RD` its parameter); `None` for a file with no launch entry (a module). A
+/// reading's program is priced so (`check`) wherever it is chosen to run with others: the
+/// gate is code every PE of it holds.
+#[must_use]
+pub fn gated(text: &str) -> Option<String> {
+    text.contains(RUN).then(|| {
+        text.replacen(RUN, GATED, 1).replacen(
+            "param memcpy_params;\n",
+            "param memcpy_params;\nparam RD: u16;\n",
+            1,
+        )
+    })
+}
+
+/// A program's files (name, text) as the combined program links them ([`gated`]).
+#[must_use]
+pub fn gated_files(files: &[(String, String)]) -> Vec<(String, String)> {
+    files
+        .iter()
+        .map(|(n, t)| (n.clone(), gated(t).unwrap_or_else(|| t.clone())))
+        .collect()
+}
+
 /// A reading's place in the combined program.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Placed {
@@ -95,14 +119,9 @@ pub fn combine(root: &Path, names: &[String]) -> R<Vec<Placed>> {
                 continue;
             }
             let t = std::fs::read_to_string(&path).map_err(io(&path))?;
-            if !t.contains(RUN) {
+            let Some(t) = gated(&t) else {
                 continue;
-            }
-            let t = t.replacen(RUN, GATED, 1).replacen(
-                "param memcpy_params;\n",
-                "param memcpy_params;\nparam RD: u16;\n",
-                1,
-            );
+            };
             std::fs::write(&path, t).map_err(io(&path))?;
         }
         let lay = std::fs::read_to_string(dir.join("layout.csl")).map_err(io(&dir))?;
@@ -264,11 +283,41 @@ pub fn combine(root: &Path, names: &[String]) -> R<Vec<Placed>> {
     Ok(placed)
 }
 
+/// Whether readings of these sizes (w, h) are placed together on a system's fabric as
+/// [`combine`] places them ([`crate::place::pack_within`]); where not, by how much they miss.
+pub fn fits(sizes: &[(u32, u32)]) -> Result<(), crate::place::pack::Miss> {
+    use crate::place::{BlockKind, NetKind, Problem, pack};
+    let b = crate::floorplan::stream::Bounds::system();
+    let mut x = 0;
+    let rects = sizes
+        .iter()
+        .enumerate()
+        .map(|(i, &(w, h))| {
+            let r = crate::floor::Rect::new(x, 0, w, h);
+            x += w;
+            (BlockKind::Reading(i), r)
+        })
+        .collect();
+    let h0 = sizes.iter().map(|s| s.1).max().unwrap_or(1);
+    // (a problem that will not form misses by the whole fabric)
+    let whole = pack::Miss { dx: b.w, dy: b.h };
+    let pr = Problem::of(x, h0, rects, &crate::wiring::Wiring::default(), &|_| {
+        NetKind::Other
+    })
+    .map_err(|_| whole)?;
+    pack::pack_within(&pr, b.w, b.h).map(|_| ())
+}
+
 /// The readings' places within the system's fabric: as they are (side by side) where they fit,
 /// else packed in 2D. Returns the program's size.
 fn place(placed: &mut [Placed]) -> R<(u32, u32)> {
-    use crate::place::{BlockKind, NetKind, Problem, pack};
     let b = crate::floorplan::stream::Bounds::system();
+    place_within(placed, b.w, b.h)
+}
+
+/// [`place`] within a `w` x `h` fabric.
+fn place_within(placed: &mut [Placed], w: u32, h: u32) -> R<(u32, u32)> {
+    use crate::place::{BlockKind, NetKind, Problem, pack};
     let rects = placed
         .iter()
         .enumerate()
@@ -286,7 +335,7 @@ fn place(placed: &mut [Placed]) -> R<(u32, u32)> {
     let pr = Problem::of(w0, h0, rects, &crate::wiring::Wiring::default(), &|_| {
         NetKind::Other
     })?;
-    let s = pack::pack(&pr, b.w, b.h)?;
+    let s = pack::pack(&pr, w, h)?;
     for (p, at) in placed.iter_mut().zip(&s.at) {
         p.x = at.x;
         p.y = at.y;

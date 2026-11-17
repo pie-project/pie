@@ -1352,6 +1352,127 @@ pub fn program_upto(
     })
 }
 
+/// A top tile's price (cycles), the tile, its chunks and the program's fabric (w, h).
+pub type TilePoint = (f64, (u32, u32), Chunks, (u32, u32));
+
+/// Every top tile `reading` places on within `bounds`, each at the first of [`CHUNK_LADDER`]
+/// whose every PE, as the combined program links it ([`super::coresident::gated`]), leaves the
+/// stack's room past the estimate's miss for its kind ([`crate::check::miss`]) (a smaller
+/// tile's PEs hold more of the image): its price (cycles), tile, chunks and fabric (w, h). Where
+/// no tile does, why, by its nearest: the tile, chunks and PE that came closest and by how much.
+pub fn points(
+    trace: &Trace,
+    reading: &str,
+    clip: [u32; 3],
+    round16: bool,
+    bounds: (u32, u32),
+) -> R<Vec<TilePoint>> {
+    let base = lower(trace, reading, clip, round16)?;
+    let (h, w) = base.top();
+    let mut out = Vec::new();
+    // the nearest miss: bytes short, and what fell short
+    let mut nearest: Option<(i64, String)> = None;
+    let mut a = 1;
+    while a <= h.min(16) {
+        let mut b = 1;
+        while b <= w.min(16) {
+            for &chunks in CHUNK_LADDER {
+                let mut p = base.clone();
+                if place_with(&mut p, a, b, Some(bounds), chunks).is_err() {
+                    continue;
+                }
+                let Ok(e) = crate::emit::tiled::emit(&p) else {
+                    continue;
+                };
+                let files = super::coresident::gated_files(&e.files);
+                let r = crate::check::placed(&e.placed, &files, None);
+                if r.ok().is_err() {
+                    continue;
+                }
+                // each kind of PE's room past the stack's and its estimate's miss
+                let Some((short, (file, d, c))) = r
+                    .codes
+                    .iter()
+                    .map(|(f, d, c)| {
+                        let text = files.iter().find(|(n, _)| n == f).map(|(_, t)| t.as_str());
+                        let need =
+                            i64::from(crate::build::STACK_ROOM) + crate::check::miss(f, text);
+                        (need - (crate::check::PE_BYTES - d - c), (f.clone(), *d, *c))
+                    })
+                    .max_by_key(|(s, _)| *s)
+                else {
+                    continue;
+                };
+                if short > 0 {
+                    if nearest.as_ref().is_none_or(|(s, _)| short < *s) {
+                        nearest = Some((
+                            short,
+                            format!(
+                                "tile {a},{b} at {chunks:?}: `{file}` {d} B data + ~{c} B code, \
+                                 {short} B short of the stack's {} B and the estimate's miss",
+                                crate::build::STACK_ROOM
+                            ),
+                        ));
+                    }
+                    continue;
+                }
+                out.push((
+                    crate::cost::tiled::time(&p).cycles,
+                    (a, b),
+                    chunks,
+                    p.fabric(),
+                ));
+                break;
+            }
+            b *= 2;
+        }
+        a *= 2;
+    }
+    if out.is_empty() {
+        return Err(format!(
+            "{reading}: no top tile's PEs hold its program as the combined program links it{}",
+            nearest.map_or_else(String::new, |(_, n)| format!(" (the nearest: {n})"))
+        ));
+    }
+    Ok(out)
+}
+
+/// The chunkings a tile is tried at, in turn: the defaults, then less staging and block, then
+/// the op table streamed and the buffers packed tightly, then less again (each a PE's memory for
+/// a little more time: more passes and blocks).
+pub const CHUNK_LADDER: &[Chunks] = &[
+    Chunks {
+        kc: KC,
+        wb: WB_WORDS,
+        stream_ops: false,
+        tight: false,
+    },
+    Chunks {
+        kc: KC / 2,
+        wb: WB_WORDS / 2,
+        stream_ops: false,
+        tight: false,
+    },
+    Chunks {
+        kc: KC,
+        wb: WB_WORDS,
+        stream_ops: true,
+        tight: true,
+    },
+    Chunks {
+        kc: KC / 2,
+        wb: WB_WORDS / 2,
+        stream_ops: true,
+        tight: true,
+    },
+    Chunks {
+        kc: KC / 4,
+        wb: WB_WORDS / 2,
+        stream_ops: true,
+        tight: true,
+    },
+];
+
 /// An order of the arena's first fit: a lifetime's (key, (first op, last op, words)) to its sort
 /// key.
 type Order = dyn Fn(&(Key, (usize, usize, u32))) -> (i64, i64, i64);
