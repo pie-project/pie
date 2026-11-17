@@ -83,29 +83,6 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     )
     .map_err(Fault::Card)?;
     device.set_tuning(kernels_cuda::tuning::Tuning::of(&chip));
-    #[cfg(feature = "cuda")]
-    {
-        let user = boot
-            .knobs
-            .profiles
-            .as_deref()
-            .map(|profiles| crate::chip::user_gemm_table(profiles, device.name()));
-        let tactics = kernels_cuda::linear::gemm::install_tactics(
-            crate::chip::gemm_table(device.name()),
-            user,
-        );
-        if let Some((table, here)) = &tactics.stale {
-            eprintln!(
-                "engine-cuda: a dense GEMM tactic table is not read: it was timed under \
-                 `{table}`, and this is `{here}`; `pie tune` on this machine times it again"
-            );
-        }
-        eprintln!(
-            "engine-cuda: dense GEMM tactics from the profile's tables: {} checked in, {} the \
-             user's; a product they lack runs cuBLAS's own pick, and nothing is timed",
-            tactics.from_profile, tactics.from_user,
-        );
-    }
     let engine = crate::chip::Engine::of(&chip);
     // The model's fire top on this card (`crate::api::fire_top_of`): past it
     // no rung's efficiency improves, so none past it can be chosen. A load

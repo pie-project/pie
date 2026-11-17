@@ -99,9 +99,7 @@ pub(crate) struct Shape {
     pub(crate) context: u32,
 }
 
-/// Load `artifact` under `knobs` (its profile pinned) shaped by `shape`
-/// (from the trace): the products its arming times land in the user's
-/// tactic table under the knobs' profiles.
+/// Load `artifact` under `knobs` shaped by `shape` (from the trace).
 pub(crate) fn load(
     artifact: &Path,
     deployment: &str,
@@ -155,33 +153,7 @@ pub(crate) fn load(
     Ok((shell, trace))
 }
 
-/// The engine boot and load request `pie serve` makes for an artifact when
-/// its config states nothing past the model (the worker builds both).
-pub type Served<'a> =
-    &'a dyn Fn(&Path) -> Result<(crate::DeviceBoot, engine::load::LoadRequest), String>;
-
-/// Load `artifact` under `chip` as `pie serve` does, through the engine's
-/// own load: its arming walks every composition of the lattice a served
-/// load records, so the products it times are the ones serving runs, rung
-/// by rung; the tune's own servings ([`serve`]) cover only their prompt and
-/// lane counts.
-#[cfg(feature = "cuda")]
-fn arm_served(
-    artifact: &Path,
-    chip: &Profile,
-    served: Served<'_>,
-    contract_for: crate::ContractFor,
-) -> Result<(), String> {
-    use engine::Engine;
-    let (mut boot, request) = served(artifact)?;
-    boot.knobs.chip = Some(chip.clone());
-    let mut cuda = crate::open(boot, contract_for)?;
-    cuda.load(request).map_err(|e| e.to_string())?;
-    Ok(())
-}
-
 /// Serve `artifact` under `chip`: a prompt, then steps at each lane count.
-/// The products it times land in the user's tactic table under `profiles`.
 fn serve(
     artifact: &Path,
     deployment: &str,
@@ -322,17 +294,6 @@ pub(crate) fn patches(trace: &poem_ir::Trace, slots: u32) -> Option<poem_compile
     )
 }
 
-/// Stops timing tactics when the tune ends, however it ends.
-#[cfg(feature = "cuda")]
-struct Untime;
-
-#[cfg(feature = "cuda")]
-impl Drop for Untime {
-    fn drop(&mut self) {
-        kernels_cuda::linear::gemm::time_tactics(false);
-    }
-}
-
 struct Cuda<'a> {
     models: &'a [(PathBuf, String)],
     device: &'a str,
@@ -383,73 +344,13 @@ impl Bench for Cuda<'_> {
 
 /// Run the tune on GPU 0: search, check, and assemble the file. `say` hears
 /// progress.
-/// `pie tune cuda --gemm-only`: under today's profile, each model's served
-/// load arms its lattice with timing on, adding what the tactic tables lack
-/// to the user's table; no profile search, and the profile is not changed.
-pub fn gemm_only(
-    profiles: Option<&Path>,
-    models: &[(PathBuf, String)],
-    served: Served<'_>,
-    contract_for: crate::ContractFor,
-    say: &mut dyn FnMut(&str),
-) -> Result<Outcome, String> {
-    let began = Instant::now();
-    let (name, facts) = crate::chip::probe(0).ok_or("no CUDA device answers")?;
-    let (base, report) = crate::chip::resolve(&name, &facts, profiles);
-    say(&format!(
-        "{name}: timing dense GEMM tactics under {}",
-        report.used
-    ));
-    if models.is_empty() {
-        return Err("--gemm-only needs a model to load (import one, or pass --check)".to_string());
-    }
-    #[cfg(feature = "cuda")]
-    {
-        kernels_cuda::linear::gemm::time_tactics(true);
-        let _untime = Untime;
-        let before = kernels_cuda::linear::gemm::timed();
-        for (artifact, deployment) in models {
-            say(&format!(
-                "timing the dense GEMM tactics {deployment}'s served lattice arms"
-            ));
-            arm_served(artifact, &base, served, contract_for)?;
-        }
-        say(&format!(
-            "{} product(s) timed",
-            kernels_cuda::linear::gemm::timed() - before
-        ));
-    }
-    #[cfg(not(feature = "cuda"))]
-    {
-        let _ = (base, name, began, served, contract_for);
-        Err("--gemm-only times cuBLAS tactics, and this build has no CUDA runtime".to_string())
-    }
-    #[cfg(feature = "cuda")]
-    Ok(Outcome {
-        device: name,
-        file: String::new(),
-        lines: Vec::new(),
-        checks: Vec::new(),
-        changed: false,
-        seconds: began.elapsed().as_secs_f64(),
-    })
-}
-
 pub fn run(
     profiles: Option<&Path>,
     models: &[(PathBuf, String)],
-    served: Served<'_>,
-    contract_for: crate::ContractFor,
     say: &mut dyn FnMut(&str),
 ) -> Result<Outcome, String> {
     let began = Instant::now();
     let (name, facts) = crate::chip::probe(0).ok_or("no CUDA device answers")?;
-    // The one place dense GEMM tactics are timed: each serving below adds
-    // the products it meets to the user's table beside their profile.
-    #[cfg(feature = "cuda")]
-    kernels_cuda::linear::gemm::time_tactics(true);
-    #[cfg(feature = "cuda")]
-    let _untime = Untime;
     let sms = facts
         .get("sms")
         .and_then(|v| u32::try_from(v).ok())
@@ -489,17 +390,6 @@ pub fn run(
     let tuned = search::render_overrides(&chosen);
     let today = bench.file(&[])?;
     let draft = bench.file(&chosen)?;
-    // The dense GEMM tactics of the lattice a served load arms, under the
-    // tuned profile: a product the tables lack is timed here or nowhere.
-    #[cfg(feature = "cuda")]
-    for (artifact, deployment) in models {
-        say(&format!(
-            "timing the dense GEMM tactics {deployment}'s served lattice arms"
-        ));
-        arm_served(artifact, &Cuda::profile_of(&draft)?, served, contract_for)?;
-    }
-    #[cfg(not(feature = "cuda"))]
-    let _ = (served, contract_for);
     let mut checks = Vec::new();
     // A file that changes nothing serves as today's does.
     let unchanged = draft == today;

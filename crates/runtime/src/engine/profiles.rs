@@ -60,9 +60,6 @@ pub struct TuneRequest<'a> {
     pub cache: &'a Path,
     /// Fit the kept measurements again instead of measuring.
     pub refit: bool,
-    /// Time only the dense GEMM tactics the checked models' served loads
-    /// arm, with no profile search (CUDA).
-    pub gemm_only: bool,
     /// Check the estimate alone: time the check models' fires at each rung
     /// width and hold the estimate's pick to the measured best.
     pub check_estimate: bool,
@@ -70,10 +67,6 @@ pub struct TuneRequest<'a> {
     pub dissect: &'a [u32],
     /// Run the `[rates]` step alone.
     pub rates: bool,
-    /// The engine boot and load request `pie serve` makes for an artifact,
-    /// which the tune loads to time the GEMM products serving runs.
-    #[cfg(feature = "engine-cuda")]
-    pub served_cuda: engine_cuda::tune::Served<'a>,
 }
 
 /// What a tune produced.
@@ -246,12 +239,6 @@ macro_rules! tune_grid {
     ($name:ident, $engine:ident, $backend:literal) => {
         fn $name(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String> {
             use $engine::tune::{Depth, run};
-            if req.gemm_only {
-                return Err(format!(
-                    "--gemm-only times CUDA's dense GEMM tactics; {} has none to time",
-                    $backend
-                ));
-            }
             let depth = if req.full { Depth::Full } else { Depth::Quick };
             let models = pick_models($backend, req)?;
             let out = run(depth, Some(req.profiles), req.cache, req.refit, &models, say)?;
@@ -269,23 +256,7 @@ tune_grid!(tune_metal, engine_metal, "metal");
 #[cfg(feature = "engine-cuda")]
 fn tune_cuda(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String> {
     let models = pick_models("cuda", req)?;
-    let out = if req.gemm_only {
-        engine_cuda::tune::gemm_only(
-            Some(req.profiles),
-            &models,
-            req.served_cuda,
-            crate::engine::load::contract_for,
-            say,
-        )?
-    } else {
-        engine_cuda::tune::run(
-            Some(req.profiles),
-            &models,
-            req.served_cuda,
-            crate::engine::load::contract_for,
-            say,
-        )?
-    };
+    let out = engine_cuda::tune::run(Some(req.profiles), &models, say)?;
     Ok(tuned!(out, wrong: Vec::new()))
 }
 

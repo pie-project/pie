@@ -40,11 +40,6 @@ pub struct TuneArgs {
     #[arg(long)]
     pub refit: bool,
 
-    /// Time only the dense GEMM tactics each checked model's served load
-    /// arms (CUDA), into the user's table beside their profile, with no
-    /// profile search; the profile is not written.
-    #[arg(long)]
-    pub gemm_only: bool,
 
     /// Check the estimate the load weighs its top rung by: time a fire at
     /// each rung width of these models (by name or substring; the smallest
@@ -95,12 +90,6 @@ pub fn run(args: TuneArgs) -> Result<Answer> {
     let mut say = |line: &str| eprintln!("{}", palette.dim(line));
     let artifacts = crate::paths::pie_home().join("artifacts");
     let cache = crate::paths::pie_home().join("tune");
-    #[cfg(feature = "engine-cuda")]
-    let home = crate::paths::pie_home();
-    #[cfg(feature = "engine-cuda")]
-    let served_cuda = |artifact: &std::path::Path| {
-        worker::backend::served_cuda(artifact, &home).map_err(|e| format!("{e:#}"))
-    };
     let mut check = args.check.clone();
     check.extend(args.check_estimate.iter().flatten().cloned());
     let req = runtime::engine::profiles::TuneRequest {
@@ -111,12 +100,9 @@ pub fn run(args: TuneArgs) -> Result<Answer> {
         no_check: args.no_check,
         cache: &cache,
         refit: args.refit,
-        gemm_only: args.gemm_only,
         check_estimate: args.check_estimate.is_some(),
         dissect: &args.dissect,
         rates: args.rates,
-        #[cfg(feature = "engine-cuda")]
-        served_cuda: &served_cuda,
     };
     // A check of the estimate is a test: it writes nothing.
     if req.check_estimate {
@@ -177,10 +163,6 @@ pub fn run(args: TuneArgs) -> Result<Answer> {
                 "  <- slower or different"
             }
         ));
-    }
-    if args.gemm_only {
-        out.push_str("--gemm-only: the dense GEMM tactics were timed into the user's table; the profile is not written\n");
-        return Ok(text(out));
     }
     if failed && !args.force && !args.dry_run {
         bail!(

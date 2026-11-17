@@ -3,7 +3,7 @@
 //! same registry against AMD's chips, keyed by their gfx version.
 #![allow(unsafe_code)]
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::LazyLock;
 
 use profile::{Anywhere, Decision, Domain, Facts, Profile, Registry, Report, Shelf, Var};
@@ -221,40 +221,8 @@ shelved!(
         "sm120/nvidia-rtx-pro-6000-blackwell-server-edition.toml",
         "sm121.toml",
     ],
-    rocm: ["gfx94.toml"],
+    rocm: ["gfx94.toml", "gfx94/amd-instinct-mi300x.toml"],
 );
-
-/// The checked-in dense GEMM tactic tables, beside the device profiles they
-/// belong to (`sm89/nvidia-l40s.toml` has `sm89/nvidia-l40s.gemm`): what
-/// `pie tune` and loads on that device timed, read before the user's own.
-#[cfg(not(feature = "rocm"))]
-pub const GEMM_TABLES: &[(&str, &str)] = &[
-    (
-        "sm89/nvidia-l40s.gemm",
-        include_str!("../profiles/sm89/nvidia-l40s.gemm"),
-    ),
-    (
-        "sm120/nvidia-rtx-pro-4500-blackwell.gemm",
-        include_str!("../profiles/sm120/nvidia-rtx-pro-4500-blackwell.gemm"),
-    ),
-];
-
-/// The checked-in tactic table of `device`'s profile, if it has one.
-#[cfg(not(feature = "rocm"))]
-#[must_use]
-pub fn gemm_table(device: &str) -> Option<&'static str> {
-    let file = format!("/{}.gemm", profile::id_of(device));
-    GEMM_TABLES
-        .iter()
-        .find(|(path, _)| path.ends_with(&file))
-        .map(|(_, text)| *text)
-}
-
-/// Where the user's tactic table for `device` lives, beside their profile.
-#[must_use]
-pub fn user_gemm_table(profiles: &Path, device: &str) -> PathBuf {
-    SHELF.user_path(profiles, device).with_extension("gemm")
-}
 
 pub static SHELF: Shelf = Shelf {
     backend: "cuda",
@@ -1175,13 +1143,21 @@ mod hip {
 
     #[test]
     fn a_cdna3_gpu_takes_its_family() {
-        for gpu in ["AMD Instinct MI300X", "AMD Instinct MI325X"] {
+        // The MI300X (the card and a cloud VF of it) reads its rates from its
+        // device file; the MI325X has none yet.
+        for (gpu, device) in [
+            ("AMD Instinct MI300X", true),
+            ("AMD Instinct MI300X VF", true),
+            ("AMD Instinct MI325X", false),
+        ] {
             let (profile, report) = resolve(gpu, &facts(9, 4, 304), None);
-            assert_eq!(
-                report.layers,
-                [profile::Source::Seeded("gfx94.toml".into())],
-                "{gpu}"
-            );
+            let mut layers = vec![profile::Source::Seeded("gfx94.toml".into())];
+            if device {
+                layers.push(profile::Source::Seeded(
+                    "gfx94/amd-instinct-mi300x.toml".into(),
+                ));
+            }
+            assert_eq!(report.layers, layers, "{gpu}");
             assert!(report.untuned(), "{gpu}");
             assert_eq!(
                 Engine::of(&profile),
