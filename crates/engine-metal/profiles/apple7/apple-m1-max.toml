@@ -5,24 +5,27 @@ device = "Apple M1 Max"
 assumes = { cores = 24 }
 
 [rates]
-# Measured whole by Metal's rates step under engine::rates' shared rule
-# (frames doubled until two successive doublings agree within AGREEMENT,
-# memory-bound ops warmed until their rate stops rising, operands rotated
-# across frames), three runs on 2026-11-17. The points below a few hundred
-# rows read in more than one of the GPU's clock states from run to run:
-# matmul 256 x 2048 read 3.6 / 4.7 / 2.4, 512 x 1024 4.7 / 4.7 / 2.8, the
-# per-row ops 218 / 261 / 261 GB/s, attention at 512 keys 4.1 / 4.4 / 4.1.
-# Every point from 1024 rows on agreed within 0.5%. These are the third run.
-launch_ns = 6731
+# Each point the median of five whole measurements by Metal's rates step
+# under engine::rates' shared rule (frames doubled until two successive
+# doublings agree, memory-bound ops warmed until their rate stops rising,
+# operands rotated across frames), on 2026-11-17. Every point agreed within
+# 1% across the five but these, each of which read another clock state in
+# one run of five (4-1, none split 3-2):
+#   matmul 512 x 1024: 2.34 / 4.70 / 4.69 / 4.72 / 4.71 TFLOP/s
+#   matmul 256 x 2048: 4.73 / 3.58 / 4.75 / 4.75 / 4.75 TFLOP/s
+#   attention, 512 keys: 4.40 / 4.40 / 3.28 / 4.18 / 4.42 TFLOP/s
+#   per-row ops: 257 / 262 / 263 / 262 / 217 GB/s
+#   launch: 4110 / 6958 / 6957 / 6984 / 6546 ns
+launch_ns = 6957
 gemm_tflops_by_rows = [
-  [1024, [[256, 2.3], [512, 2.8], [1024, 5.0], [2048, 5.1], [4096, 5.2], [8192, 5.2]]],
-  [2048, [[256, 2.4], [512, 5.1], [1024, 5.2], [2048, 5.2], [4096, 5.3], [8192, 5.3]]],
+  [1024, [[256, 2.3], [512, 4.7], [1024, 5.0], [2048, 5.1], [4096, 5.2], [8192, 5.2]]],
+  [2048, [[256, 4.7], [512, 5.1], [1024, 5.2], [2048, 5.2], [4096, 5.3], [8192, 5.3]]],
   [4096, [[256, 5.1], [512, 5.2], [1024, 5.3], [2048, 5.3], [4096, 5.3], [8192, 5.3]]],
 ]
-attn_tflops_by_keys = [[512, 4.1], [1024, 3.9], [2048, 4.3], [4096, 4.8], [8192, 5.6]]
-hbm_gbps = 379.1
-elementwise_gbps = 261.3
+attn_tflops_by_keys = [[512, 4.4], [1024, 3.9], [2048, 4.3], [4096, 4.8], [8192, 5.6]]
+hbm_gbps = 379.4
+elementwise_gbps = 261.6
 scan_gelems = 90.0
 
 [provenance]
-rates = "Metal's rates step (engine-metal rates::measure) on 2026-11-17: each kernel through the dispatch serving runs, timed by the GPU in frames the shared rule settles; the matmul at n = k = 1024, 2048, 4096 over engine::rates::weights_at planes, attention over engine::rates::attn_sets_at sets, the per-row ops warmed; operands: engine::rates' pattern"
+rates = "Metal's rates step (pie tune metal --rates) on 2026-11-17, the median of five runs: each kernel through the dispatch serving runs, timed by the GPU in frames the shared rule settles; the matmul at n = k = 1024, 2048, 4096 over engine::rates::weights_at planes, attention over engine::rates::attn_sets_at sets, the per-row ops warmed; operands: engine::rates' pattern"
