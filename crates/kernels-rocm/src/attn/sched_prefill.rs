@@ -200,12 +200,19 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
     // whose lanes do fill the grid is still split, one chunk a tile
     // (`search_kv_chunk_size`), and the fold has one partial to take. The
     // rows alone decide, so a captured plan keeps its layout across replays.
-    let filling_tiles = if req.enable_cuda_graph {
-        (u64::from(req.total_num_rows) * group).div_ceil(u64::from(cta_tile_q))
+    //
+    // A captured layout splits only where a replay could cut each of those
+    // tiles' prefixes in two at least: past half the grid in tiles, one long
+    // request's replay takes one chunk a tile (as its eager plan does,
+    // unsplit), and the split layout would only add the partials and their
+    // fold. On an MI300X, Qwen3-0.6B's bodies of 2436-4467 rows (39-70 tiles
+    // of a 76-item grid) replayed 8-10% slower than the same fires walked.
+    let filled = if req.enable_cuda_graph {
+        let tiles = (u64::from(req.total_num_rows) * group).div_ceil(u64::from(cta_tile_q));
+        tiles.saturating_mul(2) > u64::from(max_batch_size_if_split)
     } else {
-        total_num_tiles_q
+        total_num_tiles_q >= u64::from(max_batch_size_if_split)
     };
-    let filled = filling_tiles >= u64::from(max_batch_size_if_split);
     let (split_kv, kv_chunk_size_in_pages) = if whole || filled {
         (
             false,
@@ -508,6 +515,25 @@ mod tests {
         assert!(sched.split_kv, "the rung's layout stands across replays");
         assert_eq!(sched.new_batch_size, 256, "one work item a request: one chunk a tile");
         assert!(sched.new_batch_size as usize <= sched.padded_batch_size);
+    }
+
+    #[test]
+    fn a_rung_past_half_the_grid_in_tiles_keeps_its_layout_unsplit() {
+        // On an L40S a 2-a-SM grid holds 35 work items a kv head. A
+        // 1024-row rung's 32 query tiles leave no room to cut a tile's
+        // prefix in two: its one long request replays a chunk a tile, so
+        // the captured layout is unsplit, as that request's eager plan is.
+        let wide = captured(&[0, 1024], &[0, 64], 1024, 256);
+        let sched = schedule("test", &wide, &Device::L40S).unwrap();
+        assert!(!sched.split_kv, "past half the grid in tiles, a split only adds its fold");
+        let eager = Request {
+            enable_cuda_graph: false,
+            ..captured(&[0, 1024], &[0, 64], 1024, 256)
+        };
+        assert!(!schedule("test", &eager, &Device::L40S).unwrap().split_kv);
+        // A 512-row rung's 16 tiles leave room for two chunks a tile: split.
+        let half = captured(&[0, 512], &[0, 32], 512, 256);
+        assert!(schedule("test", &half, &Device::L40S).unwrap().split_kv);
     }
 
     #[test]
