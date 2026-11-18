@@ -111,6 +111,12 @@ the arms' resident code, and the flash / walk crossover decision (it stops
 being a choice). Prerequisite for (e): a mixed fire stops being its own
 program family once attention reads the mix as data.
 
+Carried into a1.3 (the single distribution-driven kernel rewrites the
+flash kernel): its per-step older / mask scaffolding, +111 us a 0.6B
+prefill-2048 fire against 05ae16a48 even with no older keys or flagged
+rows; and the rmsnorm weights' bf16 -> f32 converts that stopped fusing
+once the attention `case` went, +67 us (11-18 profile).
+
 ### (b) Pages off the ladder
 
 Page tables at a fixed maximum capacity (`pages_per_slot` at the load's
