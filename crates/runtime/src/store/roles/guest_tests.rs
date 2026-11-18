@@ -1606,6 +1606,7 @@ async fn a_head_whose_process_ends_while_waiting_lets_the_next_bind() {
                 let roles = roles.clone();
                 move || roles.lock().unwrap().leave_guest_queue(holder(by))
             },
+            |_| {},
         )
     };
     let (long, long_engine) = runs_of(8, 4, 2, 0);
@@ -1668,4 +1669,135 @@ fn a_bind_of_runs_as_long_as_the_head_s_passes_it_and_leaves_its_need() {
         "the next head's need counts at once"
     );
     assert_eq!(roles.lock().unwrap().guest_queue(), vec![holder(200), holder(300)]);
+}
+
+/// A guest bind's wait under `bind_when_resident` for `by`, binding
+/// `program` on `engine`, the planner's serve played by `serve` (what the
+/// planner would do for it: drop cache or park a resident), counting its
+/// calls in `asked`.
+fn waiting_bind<'a>(
+    roles: &'a RolesHandle,
+    device: &'a Shared,
+    engine_id: usize,
+    by: u128,
+    program: ProgramId,
+    engine: std::rc::Rc<std::cell::RefCell<GuestEngine>>,
+    serve: std::rc::Rc<dyn Fn()>,
+    asked: std::rc::Rc<std::cell::Cell<u32>>,
+) -> impl std::future::Future<Output = anyhow::Result<InstanceId>> + 'a {
+    super::bind_when_resident(
+        holder(by),
+        move || std::future::ready(bind_as(roles, &mut engine.borrow_mut(), program, by)),
+        || std::future::pending::<Result<(), String>>(),
+        move |prefix, run| super::grow_for_guest(device, engine_id, prefix, run),
+        move || Some(roles.lock().unwrap().room_watch()),
+        move |run, pieces| roles.lock().unwrap().free_runs(run) >= pieces,
+        |_, _| false,
+        move |_, _| {
+            asked.set(asked.get() + 1);
+            serve();
+            std::future::ready(Ok::<(), String>(()))
+        },
+        move || super::guest_turn(roles, holder(by)),
+        move || roles.lock().unwrap().leave_guest_queue(holder(by)),
+        |_| {},
+    )
+}
+
+/// At the governor's target the walk commits nothing, however many
+/// segments the pool's own limits leave uncommitted: a guest bind short of
+/// runs is short of room the planner makes (BindShort), not a commit's to
+/// wait on (GuestGrow). With the target past what is mapped, it waits on
+/// the commit.
+#[test]
+fn at_the_target_a_guest_bind_short_of_runs_goes_to_the_planner() {
+    use crate::governor::PoolTarget;
+    const ENGINE: usize = 66;
+    let Pools { device, roles } = pools_of(facts_committed(64, 8, 1));
+    let mut grow = crate::store::shared::SharedGrow::new(0, ENGINE, device.clone());
+    fill_with_singles(&roles);
+    let (long, mut long_engine) = runs_of(8, 4, 2, 0);
+    let error = bind_as(&roles, &mut long_engine, long, 1).expect_err("no room");
+    assert!(
+        matches!(short_of_wait(&error), Some(RolesError::BindShort(_))),
+        "at the target it is the planner's: {error}"
+    );
+    roles.lock().unwrap().leave_guest_queue(holder(1));
+    let _ = grow.retarget(u64::from(u32::MAX));
+    let error = bind_as(&roles, &mut long_engine, long, 1).expect_err("no room yet");
+    assert!(
+        matches!(error.downcast_ref::<RolesError>(), Some(RolesError::GuestGrow { .. })),
+        "past it, a commit's: {error}"
+    );
+}
+
+/// GPU's 500-concurrent wedge: the device full at the governor's target, a
+/// guest head short of runs, other guest binds queued behind it. The
+/// planner is asked; its serve (a resident parked) frees the runs; the head
+/// binds; the bind behind it follows. Before, the head waited on a commit
+/// that could not come and no one asked the planner.
+#[tokio::test(flavor = "current_thread")]
+async fn a_guest_head_at_the_target_is_served_by_the_planner_and_the_queue_drains() {
+    const ENGINE: usize = 67;
+    let Pools { device, roles } = pools_of(facts_committed(64, 8, 1));
+    let _grow = crate::store::shared::SharedGrow::new(0, ENGINE, device.clone());
+    // A resident the planner may park, holding two runs of four, then
+    // every other committed chunk filled.
+    let (held_program, mut held_engine) = runs_of(13, 4, 2, 5000);
+    let victim = bind_as(&roles, &mut held_engine, held_program, 7).expect("a resident");
+    fill_with_singles(&roles);
+    let asked = std::rc::Rc::new(std::cell::Cell::new(0u32));
+    let parked: std::rc::Rc<dyn Fn()> = {
+        let roles = roles.clone();
+        let done = std::cell::Cell::new(false);
+        std::rc::Rc::new(move || {
+            if !done.replace(true) {
+                roles.lock().unwrap().close_instance(victim);
+            }
+        })
+    };
+    let (long, long_engine) = runs_of(8, 4, 1, 0);
+    let long_engine = std::rc::Rc::new(std::cell::RefCell::new(long_engine));
+    let (small, small_engine) = runs_of(10, 1, 1, 2000);
+    let small_engine = std::rc::Rc::new(std::cell::RefCell::new(small_engine));
+    let head = waiting_bind(&roles, &device, ENGINE, 1, long, long_engine.clone(), parked.clone(), asked.clone());
+    let behind = waiting_bind(&roles, &device, ENGINE, 2, small, small_engine.clone(), parked, asked.clone());
+    tokio::pin!(head);
+    tokio::pin!(behind);
+    let first = futures::poll!(head.as_mut());
+    assert!(asked.get() >= 1, "the planner is asked for the head");
+    assert!(matches!(first, std::task::Poll::Ready(Ok(_))), "the head binds in the room it made");
+    behind.await.expect("the bind behind it follows");
+    assert_eq!(long_engine.borrow().bindings.len(), 1);
+    assert_eq!(small_engine.borrow().bindings.len(), 1);
+    assert!(roles.lock().unwrap().guest_queue().is_empty(), "the queue drained");
+}
+
+/// The head waits on a commit the target said could come, and the walk
+/// makes none (its target came down after): the planner, asked beside the
+/// commit, makes the room, and the head binds.
+#[tokio::test(flavor = "current_thread")]
+async fn a_guest_head_waiting_on_a_commit_that_does_not_come_is_served_by_the_planner() {
+    use crate::governor::PoolTarget;
+    const ENGINE: usize = 68;
+    let Pools { device, roles } = pools_of(facts_committed(64, 8, 1));
+    let mut grow = crate::store::shared::SharedGrow::new(0, ENGINE, device.clone());
+    let _ = grow.retarget(u64::from(u32::MAX));
+    let (held_program, mut held_engine) = runs_of(13, 4, 2, 5000);
+    let victim = bind_as(&roles, &mut held_engine, held_program, 7).expect("a resident");
+    fill_with_singles(&roles);
+    let asked = std::rc::Rc::new(std::cell::Cell::new(0u32));
+    let parked: std::rc::Rc<dyn Fn()> = {
+        let roles = roles.clone();
+        std::rc::Rc::new(move || roles.lock().unwrap().close_instance(victim))
+    };
+    let (long, long_engine) = runs_of(8, 4, 2, 0);
+    let long_engine = std::rc::Rc::new(std::cell::RefCell::new(long_engine));
+    let prefix = device.lock().unwrap().pool().prefix_segments();
+    let head = waiting_bind(&roles, &device, ENGINE, 1, long, long_engine.clone(), parked, asked.clone());
+    tokio::pin!(head);
+    let polled = futures::poll!(head.as_mut());
+    assert!(asked.get() >= 1, "the planner is asked beside the commit");
+    assert!(matches!(polled, std::task::Poll::Ready(Ok(_))), "the head binds in the room it made");
+    assert_eq!(device.lock().unwrap().pool().prefix_segments(), prefix, "no commit came");
 }

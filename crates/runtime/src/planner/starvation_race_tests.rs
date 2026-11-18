@@ -2204,6 +2204,7 @@ async fn a_bind_by_a_suspended_process_waits_for_its_restore() {
         |_, _| std::future::ready(Err::<(), String>("no guest state here".into())),
         || std::future::ready(()),
         || {},
+        |_| {},
     );
     tokio::pin!(decode);
     assert!(futures::poll!(decode.as_mut()).is_pending(), "it waits");
@@ -2778,4 +2779,45 @@ async fn a_suspended_process_funding_a_span_waits_to_be_resident_before_asking_a
     });
     signal.notify_waiters();
     assert_eq!(asked.await, Ok(false), "resident again, it asks again");
+}
+
+/// AMD's 500-concurrent wedge, run 2: the planner's head the kv
+/// allocation of a prompt not yet seated, the device full, and every other
+/// process waiting at a bind for room. Seated first, only an idle or held
+/// process yields to such a prompt, and a process waiting at a bind was
+/// neither, so the head found no victim and nothing moved. Waiting at a
+/// bind it makes no progress until room comes, so it yields as an idle one
+/// does; past its wait it no longer does.
+#[test]
+fn a_process_waiting_at_a_bind_yields_to_a_prompt_not_yet_seated() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
+    let planner = Arc::new(
+        ResidencyPlanner::new(Arc::new(RacePool::new(0)) as Arc<dyn PoolPort>).seated_first(true),
+    );
+    let (waiting, prompt) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [waiting, prompt] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    planner.with_inner(|inner| {
+        inner.procs.get_mut(&waiting).unwrap().seated = true;
+        inner.enqueue(
+            prompt,
+            allocation(Demand {
+                kv_pages: 16,
+                rs: RsUnits::default(),
+            }),
+        );
+    });
+    let members = |planner: &Arc<ResidencyPlanner>| {
+        planner
+            .victim_set()
+            .map(|set| set.members.iter().map(|victim| victim.pid).collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+    assert!(members(&planner).is_empty(), "a seated lane mid-decode does not yield");
+    planner.set_bind_waiting(waiting, true);
+    assert_eq!(members(&planner), vec![waiting], "waiting at a bind, it yields");
+    planner.set_bind_waiting(waiting, false);
+    assert!(members(&planner).is_empty(), "past its wait, it no longer does");
 }
