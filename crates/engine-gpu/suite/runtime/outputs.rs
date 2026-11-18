@@ -563,8 +563,9 @@ fn a_frame_of_many_steps_settles_every_step_one_frame_in_flight() {
 /// the first fire records and the second replays, and neither counts
 /// `Unrecorded`; where it keeps no recording, each fire walks eagerly and
 /// counts `Eager`. The negative controls: a kernel pipeline the load did not
-/// build, built after it, is counted `BuiltInFire` by the next fire, and
-/// so is a guest step's pipeline a bind builds after the load.
+/// build, built after it, is counted `BuiltInFire` by the next fire; a
+/// guest step's pipeline a bind builds after the load, before any fire of
+/// it, is counted `BuiltAtRegister` and not `BuiltInFire`.
 #[test]
 fn a_pipeline_built_after_the_load_is_counted() {
     use engine::live::Tally;
@@ -688,9 +689,14 @@ fn a_pipeline_built_after_the_load_is_counted() {
         return;
     };
     assert_eq!(
-        engine.live().tallied(Tally::BuiltInFire),
+        engine.live().tallied(Tally::BuiltAtRegister),
         1,
-        "a bind that built a guest step's pipeline after the load is counted"
+        "a bind that built a guest step's pipeline after the load counts it at its registration"
+    );
+    assert_eq!(
+        engine.live().tallied(Tally::BuiltInFire),
+        0,
+        "a guest step's pipeline built at its bind, before any fire of it, is no fire's build"
     );
     drop(engine);
     let _ = std::fs::remove_dir_all(&dir);
