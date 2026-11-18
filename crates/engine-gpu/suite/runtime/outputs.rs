@@ -119,7 +119,54 @@ pub(super) fn contract_for(trace: &Trace, path: &Path) -> Result<ModelContract, 
         .map_err(|why| why.to_string())
 }
 
-fn epilogue() -> TraceContainer {
+/// The outputs `loaded` declares, as a guest binds them.
+pub(super) fn output_decls(loaded: &engine::load::Loaded) -> Vec<OutputDecl> {
+    let mut decls: Vec<OutputDecl> = Vec::new();
+    for decl in loaded.caps.classes.classes.iter().flat_map(|c| &c.outputs) {
+        if decls.iter().any(|seen| seen.name == decl.name) {
+            continue;
+        }
+        decls.push(OutputDecl {
+            name: decl.name.clone(),
+            axis: match decl.axis {
+                InputAxis::Lane => Axis::Lane,
+                InputAxis::Row => Axis::Row,
+                InputAxis::Voxel => Axis::Voxel,
+            },
+            width: decl.width,
+            dtype: match decl.dtype {
+                poem_ir::Dtype::I32 => EtaDtype::I32,
+                _ => EtaDtype::F32,
+            },
+            layers: decl.layers,
+            readout: decl.readout,
+        });
+    }
+    decls
+}
+
+/// `program` registered as `program_hash` against the outputs `decls`.
+pub(super) fn registration_of(
+    decls: &[OutputDecl],
+    program: TraceContainer,
+    program_hash: u64,
+) -> ProgramRegistration {
+    let bound = eta_ir::validate::bind(program, vec![decls.to_vec()], EngineCaps::default())
+        .expect("the program binds");
+    let stages = eta_compiler::plan::compile_bound(&bound);
+    ProgramRegistration {
+        program_hash,
+        launch: eta_compiler::codegen::launch::build(&bound, &stages),
+        ..Default::default()
+    }
+}
+
+/// The epilogue registered against the outputs `loaded` declares.
+pub(super) fn epilogue_registration(loaded: &engine::load::Loaded) -> ProgramRegistration {
+    registration_of(&output_decls(loaded), epilogue(), 0x0e7)
+}
+
+pub(super) fn epilogue() -> TraceContainer {
     let decl = |shape: Shape, dtype: EtaDtype, host_role: HostRole| ChannelDecl {
         shape,
         dtype: ChanDType::Concrete(dtype),
@@ -169,18 +216,20 @@ fn epilogue() -> TraceContainer {
 
 /// The miniature loaded one frame in flight, an instance of the epilogue
 /// bound, and `t` published.
-struct Bound {
-    engine: backend::Engine,
-    instance: engine::InstanceId,
-    channels: Vec<ChannelId>,
-    t_input: u32,
+pub(super) struct Bound {
+    pub(super) engine: backend::Engine,
+    pub(super) instance: engine::InstanceId,
+    pub(super) channels: Vec<ChannelId>,
+    pub(super) t_input: u32,
     /// The word of a pass of [`ROWS`] tokens.
-    word: u64,
-    planes: BTreeMap<String, (Vec<u64>, Vec<f32>)>,
-    dir: std::path::PathBuf,
+    pub(super) word: u64,
+    pub(super) planes: BTreeMap<String, (Vec<u64>, Vec<f32>)>,
+    pub(super) dir: std::path::PathBuf,
+    /// The outputs the load declares.
+    pub(super) decls: Vec<OutputDecl>,
 }
 
-const T: f32 = 0.375;
+pub(super) const T: f32 = 0.375;
 
 /// The tokens of a pass.
 const ROWS: u32 = 3;
@@ -250,7 +299,7 @@ pub(super) fn loaded(tag: &str, model: &impl ForwardHybrid) -> Option<Loaded> {
 }
 
 /// `None` without a device. `tag` names the scratch directory.
-fn bound(tag: &str) -> Option<Bound> {
+pub(super) fn bound(tag: &str) -> Option<Bound> {
     bound_with(tag, |_, _| {})
 }
 
@@ -274,36 +323,9 @@ fn bound_with(
         .position(|input| input.name == "t")
         .expect("the plan reads `t`") as u32;
 
-    let mut decls: Vec<OutputDecl> = Vec::new();
-    for decl in loaded.caps.classes.classes.iter().flat_map(|c| &c.outputs) {
-        if decls.iter().any(|seen| seen.name == decl.name) {
-            continue;
-        }
-        decls.push(OutputDecl {
-            name: decl.name.clone(),
-            axis: match decl.axis {
-                InputAxis::Lane => Axis::Lane,
-                InputAxis::Row => Axis::Row,
-                InputAxis::Voxel => Axis::Voxel,
-            },
-            width: decl.width,
-            dtype: match decl.dtype {
-                poem_ir::Dtype::I32 => EtaDtype::I32,
-                _ => EtaDtype::F32,
-            },
-            layers: decl.layers,
-            readout: decl.readout,
-        });
-    }
-    let bound = eta_ir::validate::bind(epilogue(), vec![decls], EngineCaps::default())
-        .expect("the epilogue binds");
-    let stages = eta_compiler::plan::compile_bound(&bound);
+    let decls = output_decls(&loaded);
     let program = engine
-        .register_program(&ProgramRegistration {
-            program_hash: 0x0e7,
-            launch: eta_compiler::codegen::launch::build(&bound, &stages),
-            ..Default::default()
-        })
+        .register_program(&registration_of(&decls, epilogue(), 0x0e7))
         .expect("the program registers");
     before(&mut engine, program);
     let chunks = &loaded.caps.chunks;
@@ -375,6 +397,7 @@ fn bound_with(
         word: facts.word(&Request::new(rows, false)),
         planes,
         dir,
+        decls,
     })
 }
 
@@ -388,6 +411,7 @@ fn a_guest_reads_lane_layer_and_id_outputs_by_name() {
         word,
         planes,
         dir,
+        ..
     }) = bound("outputs")
     else {
         return;

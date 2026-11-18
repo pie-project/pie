@@ -582,8 +582,20 @@ __device__ __forceinline__ void prefill_item(bool causal, int& bx, int& kv_head)
     if (causal) bx = gridDim.x - 1 - bx;
 }
 
-template <int D, bool HND, bool CAUSAL, bool FP8>
-__global__ __launch_bounds__(512) void paged_prefill_wide(const Paged p) {
+// The masked form's two segments, a request each (`kernels_cuda`'s custom
+// mask): below `origin` its committed run, every key read (and cut at the
+// row's own position unless the word's wide bit is set); from `origin` on its
+// buffer, key j of query row r read where bit r·(kv_len − origin) + (j −
+// origin) of the request's plane is set, the plane from byte indptr[req],
+// least bit first. No origin table: origin 0, wide.
+struct PrefillMask {
+    const u8* bits;
+    const i64* indptr;
+    const u32* origin;
+};
+
+template <int D, bool HND, bool CAUSAL, bool MASK, bool FP8>
+__device__ __forceinline__ void paged_prefill_wide_body(const Paged& p, const PrefillMask& mask) {
     using KV = Kv<FP8>;
     constexpr int BC = prefill_bc<D>();
     constexpr int KS = D / 16;   // d tiles for Oᵀ
@@ -607,11 +619,21 @@ __global__ __launch_bounds__(512) void paged_prefill_wide(const Paged p) {
     const int kv_len = kv_length(p, req);
     const int chunk = *p.kv_chunk_size;
     const int wl = p.window_left >= 0 ? p.window_left : kv_len;
+    // A masked request is cut at each row's position unless its word is wide.
+    int origin = 0;
+    bool causal = CAUSAL;
+    const u8* bits = nullptr;
+    if constexpr (MASK) {
+        const u32 word = mask.origin != nullptr ? mask.origin[req] : 0x80000000u;
+        origin = static_cast<int>(word & 0x7fffffffu);
+        causal = (word >> 31) == 0;
+        bits = mask.bits + mask.indptr[req];
+    }
 
     const int kv_start = max(0, kv_len + (qo_tile * kPrefillTileQ) / G - qo_len - wl);
     const int chunk_start = p.partition ? min(kv_tile * chunk + kv_start, kv_len) : kv_start;
     int chunk_end = p.partition ? min((kv_tile + 1) * chunk + kv_start, kv_len) : kv_len;
-    if (CAUSAL) {
+    if (causal) {
         // No key past the tile's last query is seen by any row of it.
         const int last_token = min(qo_len, ((qo_tile + 1) * kPrefillTileQ + G - 1) / G) - 1;
         chunk_end = min(chunk_end, kv_len - qo_len + last_token + 1);
@@ -641,8 +663,10 @@ __global__ __launch_bounds__(512) void paged_prefill_wide(const Paged p) {
     for (int s = 0; s < KS; ++s) o[s] = mfma_cd{0.f, 0.f, 0.f, 0.f};
     float m = neg_inf(), l = 0.f;
     // The last key this row may see, and the first (the window).
-    const int key_hi = CAUSAL ? kv_len - qo_len + token : kv_len - 1;
+    const int key_hi = causal ? kv_len - qo_len + token : kv_len - 1;
     const int key_lo = kv_len - qo_len + token - wl;
+    // This row's bits of the buffer: key j's at row_bits + (j − origin).
+    const long long row_bits = static_cast<long long>(token) * (kv_len - origin);
 
     // A thread's reads of a tile: K piece c = tid + r·THREADS as (key c /
     // (D/8), columns 8·(c % (D/8))), a wavefront one key's row; V piece c as
@@ -725,7 +749,13 @@ __global__ __launch_bounds__(512) void paged_prefill_wide(const Paged p) {
 #pragma unroll
                 for (int t = 0; t < 4; ++t) {
                     const int key = kv0 + kt * 16 + 4 * quad + t;
-                    const bool seen = row_live && key < chunk_end && key <= key_hi && key >= key_lo;
+                    bool seen = row_live && key < chunk_end && key <= key_hi && key >= key_lo;
+                    if constexpr (MASK) {
+                        if (seen && key >= origin) {
+                            const long long bit = row_bits + (key - origin);
+                            seen = (bits[bit / 8] >> (bit % 8)) & 1u;
+                        }
+                    }
                     s[kt][t] = seen ? s[kt][t] * p.scale_log2 : neg_inf();
                     tile_max = fmaxf(tile_max, s[kt][t]);
                 }
@@ -784,6 +814,16 @@ __global__ __launch_bounds__(512) void paged_prefill_wide(const Paged p) {
     if (quad == 0 && p.lse != nullptr) p.lse[row * p.num_qo_heads + head] = l > 0.f ? m + log2f(l) : neg_inf();
 }
 
+template <int D, bool HND, bool CAUSAL, bool FP8>
+__global__ __launch_bounds__(512) void paged_prefill_wide(const Paged p) {
+    paged_prefill_wide_body<D, HND, CAUSAL, false, FP8>(p, PrefillMask{});
+}
+
+template <int D, bool HND>
+__global__ __launch_bounds__(512) void paged_prefill_wide_masked(const Paged p, const PrefillMask mask) {
+    paged_prefill_wide_body<D, HND, false, true, false>(p, mask);
+}
+
 // MFMA flash attention for heads up to 256, the wide kernel's products with
 // the page table in LDS, the next tile read into registers across an
 // LDS-only barrier (`lds_barrier`), and K / Vᵀ rows padded 8 bytes for the
@@ -800,8 +840,10 @@ constexpr int kSelTokens = 16;
 constexpr int kSelBlocks = 2048;
 constexpr int kSelWords = kSelBlocks / 32;
 
-template <int D, bool HND, bool CAUSAL, bool SEL, bool FP8>
-__device__ __forceinline__ void paged_prefill_body(const Paged& p, const PrefillSel& sel) {
+
+template <int D, bool HND, bool CAUSAL, bool SEL, bool MASK, bool FP8>
+__device__ __forceinline__ void paged_prefill_body(const Paged& p, const PrefillSel& sel,
+                                                   const PrefillMask& mask) {
     using KV = Kv<FP8>;
     constexpr int BC = 32, KT = BC / 16, KP = D / 32, DT = D / 16;
     constexpr int KPAD = D + 4, VPAD = BC + 4;
@@ -829,11 +871,21 @@ __device__ __forceinline__ void paged_prefill_body(const Paged& p, const Prefill
     const int kv_len = kv_length(p, req);
     const int chunk = *p.kv_chunk_size;
     const int wl = p.window_left >= 0 ? p.window_left : kv_len;
+    // A masked request is cut at each row's position unless its word is wide.
+    int origin = 0;
+    bool causal = CAUSAL;
+    const u8* bits = nullptr;
+    if constexpr (MASK) {
+        const u32 word = mask.origin != nullptr ? mask.origin[req] : 0x80000000u;
+        origin = static_cast<int>(word & 0x7fffffffu);
+        causal = (word >> 31) == 0;
+        bits = mask.bits + mask.indptr[req];
+    }
 
     const int kv_start = max(0, kv_len + (qo_tile * kPrefillTileQ) / G - qo_len - wl);
     const int chunk_start = p.partition ? min(kv_tile * chunk + kv_start, kv_len) : kv_start;
     int chunk_end = p.partition ? min((kv_tile + 1) * chunk + kv_start, kv_len) : kv_len;
-    if (CAUSAL) {
+    if (causal) {
         const int last_token = min(qo_len, ((qo_tile + 1) * kPrefillTileQ + G - 1) / G) - 1;
         chunk_end = min(chunk_end, kv_len - qo_len + last_token + 1);
     }
@@ -857,7 +909,9 @@ __device__ __forceinline__ void paged_prefill_body(const Paged& p, const Prefill
 #pragma unroll
     for (int s = 0; s < DT; ++s) o[s] = mfma_zero();
     float m = neg_inf(), l = 0.f;
-    const int key_hi = CAUSAL ? kv_len - qo_len + token : kv_len - 1;
+    const int key_hi = causal ? kv_len - qo_len + token : kv_len - 1;
+    // This row's bits of the buffer: key j's at row_bits + (j − origin).
+    const long long row_bits = static_cast<long long>(token) * (kv_len - origin);
     const int key_lo = kv_len - qo_len + token - wl;
 
     // The tile's tokens' selected blocks, and how many blocks each pools.
@@ -958,6 +1012,12 @@ __device__ __forceinline__ void paged_prefill_body(const Paged& p, const Prefill
                         const int b = key / sel.ratio;
                         seen = seen && (b >= sel_blocks[sel_row] || ((sel_bits[sel_row][b / 32] >> (b % 32)) & 1u));
                     }
+                    if constexpr (MASK) {
+                        if (seen && key >= origin) {
+                            const long long bit = row_bits + (key - origin);
+                            seen = (bits[bit / 8] >> (bit % 8)) & 1u;
+                        }
+                    }
                     s[kt][t] = seen ? rel.score(s[kt][t], key) : neg_inf();
                     tile_max = fmaxf(tile_max, s[kt][t]);
                 }
@@ -1015,12 +1075,17 @@ __device__ __forceinline__ void paged_prefill_body(const Paged& p, const Prefill
 
 template <int D, bool HND, bool CAUSAL, bool FP8>
 __global__ __launch_bounds__(512) void paged_prefill(const Paged p) {
-    paged_prefill_body<D, HND, CAUSAL, false, FP8>(p, PrefillSel{});
+    paged_prefill_body<D, HND, CAUSAL, false, false, FP8>(p, PrefillSel{}, PrefillMask{});
 }
 
 template <int D, bool HND>
 __global__ __launch_bounds__(512) void paged_prefill_selected(const Paged p, const PrefillSel sel) {
-    paged_prefill_body<D, HND, true, true, false>(p, sel);
+    paged_prefill_body<D, HND, true, true, false, false>(p, sel, PrefillMask{});
+}
+
+template <int D, bool HND>
+__global__ __launch_bounds__(512) void paged_prefill_masked(const Paged p, const PrefillMask mask) {
+    paged_prefill_body<D, HND, false, false, true, false>(p, PrefillSel{}, mask);
 }
 
 // ----------------------------------------------------------------- merge --

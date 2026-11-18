@@ -1273,7 +1273,7 @@ impl Shell {
         // maskless one.
         let buffering = self.buffers.is_some();
         let rungs = self.rs_rungs();
-        let group_masked = if self.feeds.ragged.is_empty() {
+        let group_masked = if self.stated_feeds.is_empty() {
             poem_ir::ClassSet::default()
         } else {
             self.group_masked.clone()
@@ -1847,14 +1847,18 @@ impl Shell {
         // The record: written where every rung armed, at what the bodies
         // took and what their captures took; dropped, and said, where a record's
         // allowance armed short of whole.
+        let took = stats.census.bytes as u64;
+        let captured = st.took.unwrap_or(took);
+        if !st.verify {
+            // What this arming took, the allowance a re-arm within the same
+            // load starts from ([`Shell::rearm_bodies`]) and a measuring
+            // load's refit holds: a load with no record to keep (no cache
+            // directory) measures all the same.
+            self.bodies_took = captured.max(took);
+        }
         if let Some(record) = self.bodies_record.as_deref()
             && !st.verify
         {
-            let took = stats.census.bytes as u64;
-            let captured = st.took.unwrap_or(took);
-            // What this arming took, the allowance a re-arm within the same
-            // load starts from ([`Shell::rearm_bodies`]).
-            self.bodies_took = captured.max(took);
             let measured = super::measured::Measured {
                 bytes: took,
                 bodies: stats.census.bodies as u64,
