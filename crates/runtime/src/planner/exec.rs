@@ -617,7 +617,8 @@ pub(super) async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
 /// Tells the engine where `pid`'s unparked instance tables and rings lie
 /// now, on its lane ahead of any fire of theirs: each item's slots
 /// (`Engine::rebind_slots`). An item it refuses stays stale, to be told
-/// again on the next restore.
+/// again on the next restore; one the lane closed since they were read is
+/// not rebound ([`crate::store::roles::rebind`]).
 async fn rebind(engine: usize, roles: &RolesHandle, pid: ProcessId) -> Result<(), String> {
     let stale = roles.lock().unwrap().stale(pid);
     // The lane marks each rebound and replays the host writes held for it.

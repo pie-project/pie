@@ -398,6 +398,8 @@ impl<B: Serve> Serve for Named<B> {
 
     const CHANNEL_CELLS: bool = B::CHANNEL_CELLS;
 
+    const NAMES: bool = true;
+
     const TARGET: kernels_slang::Target = B::TARGET;
 
     fn table_align(device: &Facts) -> u64 {

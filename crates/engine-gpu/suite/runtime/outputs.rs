@@ -279,7 +279,9 @@ pub(super) fn loaded_lanes(tag: &str, model: &impl ForwardHybrid, lanes: u32) ->
                 buckets: vec![tokens],
                 max_adapters: 0,
                 page_size: 16,
-                max_context: 64,
+                // The fire top is a rung a prompt of the context holds
+                // (`engine::load::fire_top`): a context of the fire's tokens.
+                max_context: tokens.max(64),
                 context_declared: false,
                 slots: lanes,
                 max_patches: None,

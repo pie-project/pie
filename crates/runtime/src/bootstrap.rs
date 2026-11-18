@@ -1097,14 +1097,15 @@ mod tests {
     /// a slot's.
     #[test]
     fn the_model_s_record_bytes_say_whether_it_holds_state() {
-        let mut facts = ::engine::chunk::ChunkFacts::degenerate(&::engine::chunk::DegeneratePools {
-            kv_pages: 8,
-            kv_page_size: 16,
-            kv_page_bytes: 4096,
-            state_slots: 4,
-            state_slot_bytes: 1 << 20,
-            ..::engine::chunk::DegeneratePools::default()
-        });
+        let mut facts =
+            ::engine::chunk::ChunkFacts::degenerate(&::engine::chunk::DegeneratePools {
+                kv_pages: 8,
+                kv_page_size: 16,
+                kv_page_bytes: 4096,
+                state_slots: 4,
+                state_slot_bytes: 1 << 20,
+                ..::engine::chunk::DegeneratePools::default()
+            });
         facts.record_bytes = 0;
         let (dense, caps) = read(&facts);
         assert!(!dense && !caps.has_state(), "dense: no rs work");

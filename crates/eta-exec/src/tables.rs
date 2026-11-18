@@ -13,8 +13,8 @@ use eta_compiler::codegen::{wgsl, wgsl_analysis};
 use eta_ir::op::tags;
 
 use crate::{
-    Extents, Launch, Launches, OpParams, SELECT_RESERVE, ValueDesc, describe, lay_out,
-    whole_value_temporaries,
+    Extents, Launch, Launches, OpParams, SELECT_RESERVE, TemporaryNeed, TemporaryRefused,
+    ValueDesc, describe, lay_out, stage_temporaries,
 };
 
 pub const DESC_WORDS: usize = 9;
@@ -108,19 +108,23 @@ impl Stepping {
     }
 
     /// The launches `descriptors` are laid over: below the temporary area
-    /// the one-row select's state, in it what a launch that sorts or
-    /// reduces a whole value takes.
-    #[must_use]
-    pub fn launches(&self, descriptors: &[ValueDesc]) -> Launches<'_> {
-        Launches {
+    /// the one-row select's state, in it the widest of what a launch that
+    /// sorts or reduces a whole value takes and what each region's emitter
+    /// publishes it takes (`needs`, [`stage_temporaries`]).
+    pub fn launches(
+        &self,
+        descriptors: &[ValueDesc],
+        needs: &[TemporaryNeed],
+    ) -> Result<Launches<'_>, TemporaryRefused> {
+        Ok(Launches {
             each: self.launched.iter().map(Launch::of_node).collect(),
             idle: self.idle.clone(),
             staged: self.staged.clone(),
             kept: self.kept.clone(),
             hollow: self.hollow.clone(),
             reserve: SELECT_RESERVE,
-            temporary: whole_value_temporaries(descriptors).unwrap_or(u64::MAX),
-        }
+            temporary: stage_temporaries(descriptors, needs)?,
+        })
     }
 }
 
@@ -175,12 +179,12 @@ pub fn stage_tables(plan: &LaunchStagePlan, extents: &Extents) -> Result<StageTa
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut scratch = lay_out(
-        plan,
-        &descriptors,
-        &Stepping::of(plan).launches(&descriptors),
-    )
-    .map_err(|why| format!("a guest pass's scratch does not fit: {why:?}"))?;
+    let stepping = Stepping::of(plan);
+    let launches = stepping
+        .launches(&descriptors, wgsl::TEMPORARY_NEEDS)
+        .map_err(|why| format!("a guest pass's temporaries are refused: {why}"))?;
+    let mut scratch = lay_out(plan, &descriptors, &launches)
+        .map_err(|why| format!("a guest pass's scratch does not fit: {why:?}"))?;
     alias_reshapes(plan, &mut scratch.values);
 
     let sizes = table_sizes(plan);
