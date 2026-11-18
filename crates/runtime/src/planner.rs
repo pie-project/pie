@@ -29,6 +29,7 @@ mod wait;
 
 #[cfg(test)]
 mod pressure_tests;
+mod admission_tests;
 #[cfg(test)]
 mod seat_tests;
 #[cfg(test)]
@@ -41,8 +42,8 @@ pub use departure::{Departure, DepartureWatch, follow_restart};
 pub use diagnostics::{PlannerDiagnostics, PlannerQueueEntry};
 pub use error::{PlannerError, StarveCause};
 pub use global::{
-    assign, engine_of, init_planner, persist_run, place, planner, planner_for, planner_of,
-    planners, rekey_holders, release, wake,
+    assign, engine_of, init_planner, parked_pids, persist_run, place, planner, planner_for,
+    planner_of, planners, rekey_holders, release, wake,
 };
 pub use grant::{AllocationGrant, Demand};
 pub use in_flight::FireInFlight;

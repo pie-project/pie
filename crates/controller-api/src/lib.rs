@@ -90,6 +90,12 @@ pub struct WorkerStatus {
     /// or ended.
     #[serde(default)]
     pub draining: bool,
+    /// A launch would wait here: the running processes' working sets fill
+    /// the device room, or processes already wait for room or a seat
+    /// (the worker's own admission rule; idle cache is room). What the
+    /// gateway admits by; `kv_pressure_bucket` is a load signal only.
+    #[serde(default)]
+    pub saturated: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

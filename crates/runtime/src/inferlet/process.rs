@@ -1,6 +1,6 @@
 mod ctx;
 pub(crate) mod gate;
-mod ordered;
+pub(crate) mod ordered;
 mod output;
 pub(crate) mod residency;
 pub(crate) mod teardown;
@@ -366,8 +366,15 @@ pub fn init_admission(max_concurrent: Option<usize>) {
     // execution's own waiters hold.
     let sem = limit.map(|n| {
         // A held process is not started: it waits here, bound, until its
-        // row lets it, and the others pass it.
-        OrderedSemaphore::after("execution", n, true, earlier(&[&bind_ahead]))
+        // row lets it, and the others pass it. Past the seats, a process
+        // is admitted while its working set fits beside the running ones'.
+        OrderedSemaphore::admitting(
+            "execution",
+            n,
+            true,
+            earlier(&[&bind_ahead]),
+            Some(Box::new(PlannerRoom)),
+        )
     });
     BIND_STAGED_RESERVE.store(
         limit.map_or(0, |n| n.saturating_mul(STAGED_COHORTS)),
@@ -387,6 +394,36 @@ pub fn init_admission(max_concurrent: Option<usize>) {
         .expect("prewarm admission controller already initialized");
 }
 
+/// The room execution admits by: the device's, as its planner weighs it
+/// ([`crate::planner::ResidencyPlanner::admits`]). A process no planner
+/// holds asks for none.
+struct PlannerRoom;
+
+impl ordered::Room for PlannerRoom {
+    fn device(&self, pid: ProcessId) -> usize {
+        crate::planner::planner_of(pid).map_or(0, |planner| Arc::as_ptr(&planner) as usize)
+    }
+
+    fn fits(&self, pid: ProcessId, holders: &[ProcessId]) -> bool {
+        crate::planner::planner_of(pid).is_none_or(|planner| planner.admits(pid, holders))
+    }
+
+    fn full(&self, holders: &[ProcessId]) -> bool {
+        let planners = crate::planner::planners();
+        !planners.is_empty() && planners.iter().all(|planner| planner.full(holders))
+    }
+}
+
+/// A launch would wait at this worker's admission: what it reports as
+/// saturated, the gateway's rule ([`ordered::OrderedSemaphore::saturated`]).
+/// Idle cache is room: it is reclaimed for the next working set.
+pub fn saturated() -> bool {
+    ADMISSION
+        .get()
+        .and_then(Option::as_ref)
+        .is_some_and(|gate| gate.saturated())
+}
+
 struct AdmissionQueued(ProcessId);
 
 impl AdmissionQueued {
@@ -402,15 +439,28 @@ impl Drop for AdmissionQueued {
     }
 }
 
-static BIND_STAGED_RESERVE: AtomicUsize = AtomicUsize::new(0);
+/// The staged cohort's bind permits are added: once.
+static BIND_STAGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Once execution's seats are all taken, the bind gate takes one more
+/// cohort: as many permits as execution has seats, the execution limit
+/// itself ([`EXECUTION_SLOT_CAPACITY`]), never a number of its own. A
+/// process binds (registers its programs, takes its guest state, sets up
+/// its pipelines, ~46 ms) while it waits for a seat, so a seat that frees
+/// is taken by a process ready to fire, not one that starts its setup
+/// then: bind latency is hidden behind the running cohort instead of
+/// paid at every turnover. It is latency, not memory: a staged bind short
+/// of room waits as any bind does (`store::roles::bind_when_resident`),
+/// and the planner admits by residency.
 fn open_staged_bind_pool() {
-    let reserve = BIND_STAGED_RESERVE.swap(0, Relaxed);
-    if reserve == 0 {
+    if BIND_STAGED.swap(true, Relaxed) {
         return;
     }
+    let Some(Some(seats)) = EXECUTION_SLOT_CAPACITY.get().copied() else {
+        return;
+    };
     if let Some(Some(semaphore)) = BIND_ADMISSION.get() {
-        semaphore.add_permits(reserve);
+        semaphore.add_permits(seats);
     }
 }
 
@@ -458,6 +508,21 @@ pub(crate) fn regrant_admission() {
     }
 }
 
+/// [`regrant_admission`] off the caller's locks, once for a burst of
+/// asks: a planner changed what the gates weigh (a process parked or
+/// un-parked, one running gone to wait on its client). Outside a runtime
+/// no waiter waits to be woken.
+pub(crate) fn regrant_admission_soon() {
+    static PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !crate::rt::has_runtime() || PENDING.swap(true, Relaxed) {
+        return;
+    }
+    crate::rt::spawn(async {
+        PENDING.store(false, Relaxed);
+        regrant_admission();
+    });
+}
+
 pub(crate) async fn ensure_bind_admitted(ctx: &mut ProcessCtx) {
     if ctx.bind_admitted() {
         return;
@@ -473,7 +538,11 @@ pub(crate) async fn ensure_bind_admitted(ctx: &mut ProcessCtx) {
     ctx.admit_bind();
 }
 
-pub(crate) async fn ensure_execution_admitted(ctx: &mut ProcessCtx) {
+/// Takes `ctx`'s execution seat before its first fire, whose landings grow
+/// its working sets by `next_step` pages past what it reserved: it is
+/// admitted, in the policy's order, once that fits the device beside the
+/// running processes' sets.
+pub(crate) async fn ensure_execution_admitted(ctx: &mut ProcessCtx, next_step: u64) {
     ensure_bind_admitted(ctx).await;
     if ctx.execution_admitted() {
         return;
@@ -481,6 +550,9 @@ pub(crate) async fn ensure_execution_admitted(ctx: &mut ProcessCtx) {
     let started = Instant::now();
     let seated = match ADMISSION.get().and_then(|value| value.as_ref()) {
         Some(semaphore) => {
+            if let Some(planner) = crate::planner::planner_of(ctx.id()) {
+                planner.note_next_step(ctx.id(), next_step);
+            }
             let _queued = AdmissionQueued::enter(ctx.id());
             let permit = Arc::clone(semaphore).acquire_owned(ctx.id()).await;
             if semaphore.available_permits() == 0 {

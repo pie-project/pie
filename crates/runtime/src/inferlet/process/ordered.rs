@@ -6,6 +6,11 @@
 //! of higher key waiting at an earlier gate (and not held there): a later
 //! arrival of higher priority is not overtaken by processes that went
 //! through the earlier gates before its row landed.
+//!
+//! A gate may also admit by room ([`Room`]): its top waiter passes only
+//! once the working sets of the processes holding its permits, with the
+//! waiter's own, fit the device; below it, no waiter of the same device
+//! passes. Who is admitted is the policy's order; how many is the room.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -14,15 +19,37 @@ use tokio::sync::oneshot;
 use super::ProcessId;
 use crate::policy::schedule;
 
-#[derive(Debug)]
+/// The room a gate admits by.
+pub(crate) trait Room: Send + Sync {
+    /// The device whose room `pid` is admitted to.
+    fn device(&self, pid: ProcessId) -> usize;
+    /// Whether `pid`'s working set fits beside those of the processes
+    /// holding the gate's permits (`holders`).
+    fn fits(&self, pid: ProcessId, holders: &[ProcessId]) -> bool;
+    /// Whether no next process fits beside `holders` anywhere: their
+    /// working sets fill every device.
+    fn full(&self, holders: &[ProcessId]) -> bool;
+}
+
 pub(crate) struct OrderedSemaphore {
     /// Which gate, for what a long wait says.
     name: &'static str,
     state: Mutex<State>,
+    /// Admits by room as well as by permits.
+    room: Option<Box<dyn Room>>,
     /// The gates a process passes before this one.
     upstream: Vec<Arc<OrderedSemaphore>>,
     /// The gates after this one: they may grant once a waiter here leaves.
     downstream: Mutex<Vec<std::sync::Weak<OrderedSemaphore>>>,
+}
+
+impl std::fmt::Debug for OrderedSemaphore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OrderedSemaphore")
+            .field("name", &self.name)
+            .field("room", &self.room.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 /// How long a waiter waits before it says where, and again after each
@@ -71,8 +98,20 @@ impl OrderedSemaphore {
         holds: bool,
         upstream: Vec<Arc<OrderedSemaphore>>,
     ) -> Arc<Self> {
+        Self::admitting(name, permits, holds, upstream, None)
+    }
+
+    /// [`Self::after`], admitting by `room` as well as by permits.
+    pub(crate) fn admitting(
+        name: &'static str,
+        permits: usize,
+        holds: bool,
+        upstream: Vec<Arc<OrderedSemaphore>>,
+        room: Option<Box<dyn Room>>,
+    ) -> Arc<Self> {
         let gate = Arc::new(Self {
             name,
+            room,
             state: Mutex::new(State {
                 permits,
                 holders: Vec::new(),
@@ -102,6 +141,10 @@ impl OrderedSemaphore {
     /// never the other way round.
     fn bar(&self, here: &State) -> Option<i64> {
         let schedule = schedule::current();
+        // Parked on the planner (for pages, room for a bind, its restore),
+        // a process cannot fire however it ranks: it claims nothing here
+        // until the planner un-parks it, which re-runs the grants.
+        let mut parked: Option<std::collections::HashSet<ProcessId>> = None;
         self.upstream
             .iter()
             .flat_map(|gate| {
@@ -121,6 +164,11 @@ impl OrderedSemaphore {
                     .iter()
                     .filter(|pid| {
                         !here.holders.contains(pid) && !here.waiters.iter().any(|w| w.pid == **pid)
+                    })
+                    .filter(|pid| {
+                        !parked
+                            .get_or_insert_with(crate::planner::parked_pids)
+                            .contains(pid)
                     })
                     .map(|pid| key(*pid))
                     .max();
@@ -155,7 +203,7 @@ impl OrderedSemaphore {
 
     fn grant(&self, state: &mut State) {
         let bar = self.bar(state);
-        state.grant(self.name, bar);
+        state.grant(self.name, bar, self.room.as_deref());
     }
 
     fn release(&self, pid: ProcessId) {
@@ -172,6 +220,20 @@ impl OrderedSemaphore {
 
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().expect("state lock poisoned")
+    }
+
+    /// A process asking now would wait: every seat is taken, a waiter
+    /// not held below the floor already waits (for room, or behind a
+    /// higher key), or the holders' working sets fill the room.
+    pub(crate) fn saturated(&self) -> bool {
+        let state = self.lock();
+        let schedule = schedule::current();
+        state.permits == 0
+            || state
+                .waiters
+                .iter()
+                .any(|w| !state.holds || !schedule.as_ref().is_some_and(|s| s.held(w.pid)))
+            || self.room.as_ref().is_some_and(|room| room.full(&state.holders))
     }
 
     pub(crate) fn available_permits(&self) -> usize {
@@ -259,8 +321,12 @@ impl OrderedSemaphore {
 
 impl State {
     /// Grants while permits last, never to a waiter whose key is below
-    /// `bar`, the highest key waiting at an earlier gate.
-    fn grant(&mut self, gate: &'static str, bar: Option<i64>) {
+    /// `bar`, the highest key waiting at an earlier gate. With `room`, the
+    /// best waiter that does not fit beside the holders passes no one of
+    /// its device: it is next there.
+    fn grant(&mut self, gate: &'static str, bar: Option<i64>, room: Option<&dyn Room>) {
+        let mut full: Vec<usize> = Vec::new();
+        let mut short: Vec<ProcessId> = Vec::new();
         while self.permits > 0 {
             let schedule = schedule::current();
             let key = |pid| schedule.as_ref().map_or(0, |s| s.key(pid));
@@ -270,6 +336,7 @@ impl State {
                 .enumerate()
                 .filter(|(_, w)| !self.holds || !schedule.as_ref().is_some_and(|s| s.held(w.pid)))
                 .filter(|(_, w)| bar.is_none_or(|bar| key(w.pid) >= bar))
+                .filter(|(_, w)| !short.contains(&w.pid))
                 .max_by_key(|(_, w)| {
                     let key = schedule.as_ref().map_or(0, |s| s.key(w.pid));
                     (key, std::cmp::Reverse(w.seq))
@@ -278,6 +345,28 @@ impl State {
             let Some(index) = best else {
                 return;
             };
+            let pid = self.waiters[index].pid;
+            if let Some(room) = room {
+                // A device already full for a better waiter: this one waits
+                // behind it, however little it asks.
+                let device = room.device(pid);
+                let fits = !full.contains(&device) && room.fits(pid, &self.holders);
+                if !fits && !full.contains(&device) {
+                    full.push(device);
+                    tracing::trace!(
+                        target: "pie::admission",
+                        gate,
+                        %pid,
+                        device,
+                        holders = self.holders.len(),
+                        "waits for room"
+                    );
+                }
+                if !fits {
+                    short.push(pid);
+                    continue;
+                }
+            }
             let waiter = self.waiters.swap_remove(index);
             tracing::trace!(
                 target: "pie::admission",

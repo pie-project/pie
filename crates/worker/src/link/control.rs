@@ -339,15 +339,8 @@ pub async fn dial_controller(addr: &str) -> Result<ControlClient> {
     }
 }
 
-fn report_band(status: &WorkerStatus) -> (u8, bool, u32, u32, bool) {
-    let bucket = status.kv_pressure_bucket;
-    let band = if bucket >= 240 {
-        u8::MAX
-    } else if bucket >= 224 {
-        u8::MAX - 1
-    } else {
-        bucket / 16
-    };
+fn report_band(status: &WorkerStatus) -> (u8, bool, u32, u32, bool, bool) {
+    let band = status.kv_pressure_bucket / 16;
     // Seats and the queue move the router's load attrs: report a change
     // in either (the queue by quarters, so a long one is not chattier).
     (
@@ -356,6 +349,8 @@ fn report_band(status: &WorkerStatus) -> (u8, bool, u32, u32, bool) {
         status.running,
         status.waiting.div_ceil(4),
         status.draining,
+        // What the gateway admits by: a flip is reported at once.
+        status.saturated,
     )
 }
 
@@ -440,6 +435,7 @@ pub fn spawn_control_tasks<C: ControlLink>(
                 capacity_tokens,
                 used_tokens,
                 draining: draining(),
+                saturated: runtime::inferlet::process::saturated(),
             };
             let due = match &last {
                 None => true,

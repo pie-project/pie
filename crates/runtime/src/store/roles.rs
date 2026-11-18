@@ -1672,10 +1672,26 @@ impl Roles {
             .values()
             .filter(|item| item.tier != Tier::Host)
             .flat_map(|item| &item.parts)
-            .map(|part| {
-                part.refs.len() as u64 * self.shapes.of(part.role).map_or(0, |s| s.slot_bytes)
-            })
+            .map(|part| self.part_bytes(part))
             .sum()
+    }
+
+    /// Bytes of the slots `holder`'s own items take on the device, or will
+    /// once unparked: its instances' tables, rings and guest state, and the
+    /// channels it registered. What its instances share with others' (an
+    /// adapter, a guest pair's state) is no one's own.
+    #[must_use]
+    pub fn bytes_held_by(&self, holder: Holder) -> u64 {
+        self.items
+            .values()
+            .filter(|item| item.holder == Some(holder))
+            .flat_map(|item| &item.parts)
+            .map(|part| self.part_bytes(part))
+            .sum()
+    }
+
+    fn part_bytes(&self, part: &Part) -> u64 {
+        part.refs.len() as u64 * self.shapes.of(part.role).map_or(0, |s| s.slot_bytes)
     }
 
     /// The slots `owner` holds now, in binding order; none where it holds
