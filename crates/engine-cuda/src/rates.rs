@@ -940,7 +940,10 @@ mod on_device {
             )
         };
         lay(held, fire)?;
-        let ns = clock.burst(ROUNDS, &mut |_| fire().map_err(say("the few-rows matmul")))?;
+        // Its one plane is its own set, touched by its first burst.
+        let ns = clock.burst(ROUNDS, &Touched::default(), 1, &mut |_| {
+            fire().map_err(say("the few-rows matmul"))
+        })?;
         let rate = engine::rates::rate_from(
             &format!("few-rows matmul {m}x{w}x{w}"),
             ns,
