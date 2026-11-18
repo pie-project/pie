@@ -598,7 +598,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         })
         .collect();
 
-    let _ = engine_count;
     let arena_model_idx =
         crate::store::registry::register_model_with_chunks(kv_page_size as u32, &arena_stores);
     // The worker policy reads tier bytes off the stores' slot pools.
@@ -790,6 +789,13 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     for (engine, steered) in governed.into_iter().enumerate() {
         let room = rooms.get_mut(engine).and_then(Option::take);
         crate::governor::run::start(steered, memory_yield, room);
+    }
+    // Each host kv tier's target follows the host's memory pressure by the
+    // same rule and yield.
+    for engine in 0..engine_count {
+        if let Some(host) = crate::store::registry::get(arena_model_idx, engine).host.clone() {
+            crate::governor::host::start(engine, host, memory_yield);
+        }
     }
     active_guard.disarm();
     Ok(BootstrapHandle {

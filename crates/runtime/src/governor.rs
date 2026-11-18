@@ -25,6 +25,7 @@
 //! drops state, and nothing here decides how long idle cache stays: that is
 //! the policy's retention keys' (`policy::retention`).
 
+pub mod host;
 pub mod run;
 pub mod steered;
 
