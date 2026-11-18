@@ -126,6 +126,12 @@ pub struct FireBindings {
     /// lanes'.
     pub readout_indptr: Vec<u32>,
 
+    /// The readout rows the fire's planes take, where its padding lanes'
+    /// rows are left out (a fire whose lanes read more than their last row,
+    /// padded): each plane row's index in `readout_rows`. `None`: the
+    /// planes take `readout_rows` as they are.
+    pub readout_pick: Option<Tensor>,
+
     pub adapter_routes: Option<Tensor>,
     /// The fire's adapters' planes: the pool, and for each registered bank
     /// (by param) its plane's elements and the first pool row of each
