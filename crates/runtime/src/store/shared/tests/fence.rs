@@ -219,3 +219,63 @@ fn a_restore_aborted_under_its_copy_recycles_at_the_copy_s_epoch() {
     }
     with(&mut |kv| kv.release_device_reservation(std::mem::take(&mut rebound)));
 }
+
+/// Opens the epoch of a copy of `refs` of the kv list device to host, as
+/// the lane does.
+fn copy_list(stores: &Stores, host_refs: &[u32], refs: &[u32]) -> CopyEpoch {
+    CopyEpoch::open_on(
+        &stores.kv,
+        stores.shared.as_ref(),
+        stores.host.as_ref(),
+        None,
+        &PreLaunchCopy::Slots(SlotCopy {
+            shape: LIST,
+            src: DEVICE,
+            dst: MemoryDomain::HostPinned,
+            slots: refs.iter().copied().zip(host_refs.iter().copied()).collect(),
+            runs: Vec::new(),
+        }),
+    )
+}
+
+/// A copy the engine refuses enqueued nothing: its epoch closes as the
+/// lane drops it, and a slot let go meanwhile goes back.
+#[test]
+fn a_copy_the_engine_refuses_holds_nothing() {
+    let (shared, host, stores) = fenced();
+    let list = list_pool(&shared);
+    let refs = shared.lock().unwrap().take_refs(list, 1).unwrap();
+    let host_refs = host.lock().unwrap().take_refs(list, 1).unwrap();
+    let epoch = copy_list(&stores, &host_refs, &refs);
+    shared.lock().unwrap().give_refs(list, &refs);
+    retire(&stores);
+    assert!(out(&shared, refs[0]), "fenced while the copy is being handed over");
+    // The engine's `copy_slots` answered Err: the lane drops the epoch.
+    drop(epoch);
+    assert!(!out(&shared, refs[0]), "a refused copy holds nothing");
+    let (current, retired) = crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| {
+        (kv.current_epoch(), kv.retired_through())
+    });
+    assert_eq!(current, retired, "no epoch is left open");
+    host.lock().unwrap().give_refs(list, &host_refs);
+}
+
+/// An engine that drops a copy's landing without resolving it has the copy
+/// fail: its epoch closes, and nothing behind it is fenced for good.
+#[test]
+fn a_copy_whose_landing_is_dropped_closes_its_epoch() {
+    let (shared, host, stores) = fenced();
+    let list = list_pool(&shared);
+    let refs = shared.lock().unwrap().take_refs(list, 1).unwrap();
+    let host_refs = host.lock().unwrap().take_refs(list, 1).unwrap();
+    let epoch = copy_list(&stores, &host_refs, &refs);
+    let (landing, landed) = copy_in_flight();
+    epoch.retire_on(&landed);
+    shared.lock().unwrap().give_refs(list, &refs);
+    retire(&stores);
+    assert!(out(&shared, refs[0]));
+    drop(landing);
+    assert!(matches!(landed.check(), Some(Err(_))), "it failed");
+    assert!(!out(&shared, refs[0]), "and holds nothing");
+    host.lock().unwrap().give_refs(list, &host_refs);
+}
