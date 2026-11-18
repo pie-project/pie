@@ -1120,6 +1120,19 @@ impl SlotPool {
             .then(|| self.logical_to_physical[chunk as usize])
     }
 
+    /// The slots chunk `chunk` (logical) holds or keeps for an epoch: 0 for
+    /// a free chunk.
+    #[must_use]
+    pub fn chunk_used(&self, chunk: u32) -> u32 {
+        self.chunks.get(chunk as usize).map_or(0, |meta| meta.used)
+    }
+
+    /// The physical chunks state may open now ([`Self::free_chunks`]'s).
+    #[must_use]
+    pub fn open_chunks(&self) -> Vec<u32> {
+        self.open.iter_in(0, self.total).collect()
+    }
+
     /// The logical -> physical table the engine keeps: a permutation, free
     /// logical ids included.
     pub fn chunk_table(&self) -> &[u32] {
