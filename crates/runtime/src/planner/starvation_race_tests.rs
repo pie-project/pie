@@ -2779,3 +2779,92 @@ async fn a_suspended_process_funding_a_span_waits_to_be_resident_before_asking_a
     signal.notify_waiters();
     assert_eq!(asked.await, Ok(false), "resident again, it asks again");
 }
+
+/// An evicted process's gate sleeps until its own residency changes: the
+/// planner poked for others, room freed, and time passing (it re-reported
+/// a standing shortfall every 100 ms, waking each waiter ten times a
+/// second) wake it not once. Its restore wakes it, once.
+#[tokio::test(flavor = "current_thread")]
+async fn a_gate_sleeps_through_pokes_for_others_until_its_restore() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (pid, other) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [pid, other] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    planner.with_inner(|inner| inner.procs.get_mut(&pid).unwrap().state = Residency::Evicted);
+    let p = planner.clone();
+    let gate = crate::rt::spawn(async move { p.wait_resident(pid).await });
+    for _ in 0..50 {
+        crate::rt::yield_now().await;
+        planner.poke();
+        planner.pages_freed();
+    }
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    assert!(!gate.is_finished(), "still evicted");
+    assert_eq!(
+        planner.stats.gate_parks.load(Ordering::Relaxed),
+        1,
+        "parked once, woken by nothing of its own"
+    );
+    let signal = planner.with_inner(|inner| {
+        let proc = inner.procs.get_mut(&pid).unwrap();
+        proc.state = Residency::Resident;
+        proc.signal.clone()
+    });
+    signal.notify_waiters();
+    gate.await.expect("the gate ends").expect("resident");
+    assert_eq!(planner.stats.gate_parks.load(Ordering::Relaxed), 1);
+}
+
+/// The hang: a bind short of guest room heads the queue, and the binds of
+/// every other resident wait their turn behind it in the queue of guest
+/// binds, outside the planner's. Counted as running, they kept the fleet
+/// from ever standing still, so no resident was parked for the head, no
+/// restore behind it was served, and nothing completed. Waiting their
+/// turn, they count as parked: the fleet stalls, the planner's victim
+/// choice names one, and the bind is served once its park gives the
+/// chunks back.
+#[tokio::test(flavor = "current_thread")]
+async fn binds_waiting_their_turn_let_the_fleet_stall_for_the_head() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (binder, behind) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [binder, behind] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    let p = planner.clone();
+    let waited = crate::rt::spawn(async move { p.wait_bind_room(binder, 3, 1).await });
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if planner.diagnostics().queue.len() == 1 {
+            break;
+        }
+    }
+    assert_eq!(planner.diagnostics().queue.len(), 1, "the head waits");
+    assert!(
+        !planner.with_inner(|inner| inner.fleet_stalled()),
+        "the other resident counts as running"
+    );
+    let turn = planner.waits_behind(behind);
+    assert!(
+        planner.with_inner(|inner| inner.fleet_stalled()),
+        "waiting its turn, it is parked"
+    );
+    let set = planner.victim_set().expect("the head is short");
+    assert_eq!(set.head_pid, binder);
+    assert_eq!(
+        set.members.iter().map(|v| v.pid).collect::<Vec<_>>(),
+        [behind],
+        "the resident behind is parked for it"
+    );
+    pool.free.lock().extend(0..8);
+    planner.pages_freed();
+    waited.await.expect("the wait ends").expect("served");
+    drop(turn);
+    assert!(!planner.with_inner(|inner| inner.fleet_stalled()));
+}

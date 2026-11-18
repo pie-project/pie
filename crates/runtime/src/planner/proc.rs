@@ -67,6 +67,10 @@ pub(super) struct Proc {
     /// ([`super::wait::WaitKind::BindRoom`]), so it never comes back to be
     /// short again.
     pub(super) bind_room: Option<PendingBind>,
+    /// Binds of its waiting their turn behind another process's guest bind
+    /// ([`super::ResidencyPlanner::waits_behind`]): outside the planner's
+    /// queue, they run nothing, so the fleet stands still around them.
+    pub(super) waits_behind: u32,
 }
 
 /// The guest-state room a suspended process's pending bind asks:
@@ -125,6 +129,7 @@ impl Proc {
             fire_lapsed: false,
             roles_short: false,
             bind_room: None,
+            waits_behind: 0,
         }
     }
 }

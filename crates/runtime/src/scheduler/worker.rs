@@ -1330,11 +1330,15 @@ impl SchedulerHandle {
             }
         };
         // Behind an earlier guest bind, its turn: woken only as a head
-        // leaves, it is not sent again before.
+        // leaves, it is not sent again before. Meanwhile it runs nothing,
+        // and the planner counts it parked: the bind ahead may wait on the
+        // fleet standing still.
         let turn = move || async move {
             if let Some(roles) =
                 crate::store::registry::try_get(0, engine).and_then(|stores| stores.roles)
             {
+                let _behind =
+                    crate::planner::planner_of(pid).map(|planner| planner.waits_behind(pid));
                 crate::store::roles::guest_turn(&roles, pid).await;
             }
         };

@@ -61,6 +61,43 @@ fn planner_every_case() {
     a_younger_restore_still_queues_behind_an_older_allocation();
     returning_host_room_resumes_the_yield();
     a_restore_short_of_room_for_its_roles_waits_then_evicts_once_stalled();
+    a_restore_short_of_roles_behind_binds_waiting_their_turn_evicts();
+}
+
+/// A restore short of room for its roles, the residents' binds all
+/// waiting their turn behind a bind short of guest room: nothing will
+/// complete, so the fleet is stalled and a resident is evicted for it;
+/// once a completion gives room back it is served on that credit.
+fn a_restore_short_of_roles_behind_binds_waiting_their_turn_evicts() {
+    let (mut inner, pids) = fleet(&[
+        (1, Residency::Evicted, true),
+        (2, Residency::Resident, true),
+        (3, Residency::Resident, true),
+    ]);
+    park_restore(&mut inner, pids[0], 4);
+    inner.procs.get_mut(&pids[0]).unwrap().roles_short = true;
+    // One resident's bind waits in the planner's queue for room; the
+    // other's waits its turn behind it.
+    inner.enqueue(
+        pids[1],
+        WaitKind::BindRoom {
+            run: 3,
+            pieces: 1,
+            pages: 3,
+            notify: Arc::new(Notify::new()),
+            served: false,
+        },
+    );
+    assert!(
+        !inner.fleet_stalled(),
+        "control: the one behind counts as running"
+    );
+    assert_eq!(inner.restore_gate(pids[0], 0), RestoreGate::Wait);
+    inner.procs.get_mut(&pids[2]).unwrap().waits_behind = 1;
+    assert!(inner.fleet_stalled());
+    assert_eq!(inner.restore_gate(pids[0], 0), RestoreGate::Evict);
+    inner.completion_credit = 1;
+    assert_eq!(inner.restore_gate(pids[0], 0), RestoreGate::Serve);
 }
 
 /// A restore whose role slots found no room is queued again, a waiter: it

@@ -36,7 +36,7 @@ mod service_order_tests;
 #[cfg(test)]
 mod starvation_race_tests;
 
-pub use acquire::Acquired;
+pub use acquire::{Acquired, WaitsBehind};
 pub use departure::{Departure, DepartureWatch, follow_restart};
 pub use diagnostics::{PlannerDiagnostics, PlannerQueueEntry};
 pub use error::{PlannerError, StarveCause};

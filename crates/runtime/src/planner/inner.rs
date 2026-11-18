@@ -425,8 +425,15 @@ impl Inner {
         self.procs.iter().all(|(pid, proc)| match proc.state {
             // Parked, it is stalled only with no fire of its own in flight:
             // one parked lane beside its peers' running fires waits for them.
+            // A bind of its waiting its turn behind another's guest bind is
+            // parked as well, though not in this queue: it runs nothing
+            // until the bind ahead is served, which may wait on this very
+            // stall (a head short of guest room is funded only once the
+            // fleet stands still).
             Residency::Resident => {
-                !proc.admitted || proc.idle || (parked.contains(pid) && !proc.firing())
+                !proc.admitted
+                    || proc.idle
+                    || ((parked.contains(pid) || proc.waits_behind > 0) && !proc.firing())
             }
             Residency::Evicting | Residency::Restoring => false,
             Residency::Evicted => true,

@@ -270,20 +270,26 @@ impl ResidencyPlanner {
         }
     }
 
-    async fn await_signal(&self, signal: &Notify, settled: impl Fn() -> bool) {
+    /// Sleeps until what a non-resident process waits on changes: its own
+    /// residency (`signal`, told as it is evicted, restored, rolled back or
+    /// gone), or the policy answering pressure with nothing freed, the
+    /// event its short restore gives up on ([`Self::restore_expired`]).
+    /// No clock: a planner poke for another process, or the shortfall
+    /// standing, does not wake it. (On a 100 ms re-report it woke each
+    /// waiter ten times a second while it stayed evicted.)
+    async fn await_residency_change(signal: &Notify, settled: impl Fn() -> bool) {
         let notified = signal.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
+        let answered = crate::policy::pressure::answered();
+        tokio::pin!(answered);
+        answered.as_mut().enable();
         if settled() {
             return;
         }
-        // A restore short of room the policy must make says so again while
-        // it waits, as a parked allocation does.
-        if crate::rt::time::timeout(crate::policy::pressure::AGAIN, notified)
-            .await
-            .is_err()
-        {
-            self.report_short();
+        tokio::select! {
+            () = &mut notified => {}
+            () = &mut answered => {}
         }
     }
 
@@ -372,7 +378,7 @@ impl ResidencyPlanner {
                 crate::scheduler::worker::notify_process_suspend(pid);
             }
             self.stats.gate_parks.fetch_add(1, Ordering::Relaxed);
-            self.await_signal(&signal, || self.is_resident(pid)).await;
+            Self::await_residency_change(&signal, || self.is_resident(pid)).await;
             if let Some(error) = self.restore_expired(pid) {
                 tracing::warn!(%pid, %error, "planner: a short restore gives up");
                 return Err(error);
@@ -477,6 +483,26 @@ impl ResidencyPlanner {
         }
     }
 
+    /// `pid` has a bind waiting its turn behind another process's guest
+    /// bind (the queue of guest binds short of room): until the returned
+    /// guard drops it counts as parked for [`super::inner::Inner::fleet_stalled`].
+    /// The bind ahead, short of room, waits in this queue for the fleet to
+    /// stand still before a resident is parked for it; counted as running,
+    /// the binds behind it held the fleet "moving" for good, and nothing
+    /// was evicted or served.
+    pub fn waits_behind(self: &Arc<Self>, pid: ProcessId) -> WaitsBehind {
+        self.with_inner(|inner| {
+            if let Some(proc) = inner.procs.get_mut(&pid) {
+                proc.waits_behind += 1;
+            }
+        });
+        self.poke();
+        WaitsBehind {
+            planner: Arc::clone(self),
+            pid,
+        }
+    }
+
     /// The head bind's runs stand free: it is told, to take them.
     pub(super) fn serve_bind_room(self: &Arc<Self>, key: EntryKey) {
         let notify = self.with_inner(|inner| {
@@ -492,5 +518,23 @@ impl ResidencyPlanner {
         if let Some(notify) = notify {
             notify.notify_waiters();
         }
+    }
+}
+
+/// A bind of `pid` waiting its turn behind another's
+/// ([`ResidencyPlanner::waits_behind`]); dropped, it runs again.
+pub struct WaitsBehind {
+    planner: Arc<ResidencyPlanner>,
+    pid: ProcessId,
+}
+
+impl Drop for WaitsBehind {
+    fn drop(&mut self) {
+        self.planner.with_inner(|inner| {
+            if let Some(proc) = inner.procs.get_mut(&self.pid) {
+                proc.waits_behind = proc.waits_behind.saturating_sub(1);
+            }
+        });
+        self.planner.poke();
     }
 }

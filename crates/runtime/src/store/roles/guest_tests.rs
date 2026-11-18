@@ -1473,7 +1473,11 @@ async fn a_long_guest_bind_heads_the_queue_and_binds_after_the_commit_while_smal
         ),
         "waits on a commit: {error}"
     );
-    assert_eq!(roles.lock().unwrap().guest_queue(), vec![holder(1)], "it heads the queue");
+    assert_eq!(
+        roles.lock().unwrap().guest_queue(),
+        vec![holder(1)],
+        "it heads the queue"
+    );
     let mut grow = crate::store::shared::SharedGrow::new(0, ENGINE, device.clone());
     let _ = grow.retarget(u64::from(u32::MAX));
     assert_eq!(
@@ -1495,14 +1499,22 @@ async fn a_long_guest_bind_heads_the_queue_and_binds_after_the_commit_while_smal
         );
     }
     assert!(small_engine.bindings.is_empty(), "the engine was not asked");
-    assert_eq!(free_and_live(&device), before, "the free count does not drift");
+    assert_eq!(
+        free_and_live(&device),
+        before,
+        "the free count does not drift"
+    );
 
     // The commit: the head binds in the fresh segment, two runs of four.
     device.lock().unwrap().committed(2);
     bind_as(&roles, &mut long_engine, long, 1).expect("the head binds");
     let pieces = pieces_of(&device, &long_engine.bindings[0].scratch);
     assert_eq!(pieces.len(), 2);
-    assert!(pieces.iter().all(|piece| piece.len() == 4 && piece.iter().all(|&(_, s)| s == 1)));
+    assert!(
+        pieces
+            .iter()
+            .all(|piece| piece.len() == 4 && piece.iter().all(|&(_, s)| s == 1))
+    );
     assert_eq!(
         roles.lock().unwrap().guest_queue(),
         (0..5).map(|by| holder(100 + by)).collect::<Vec<_>>(),
@@ -1516,7 +1528,10 @@ async fn a_long_guest_bind_heads_the_queue_and_binds_after_the_commit_while_smal
     }
     assert!(roles.lock().unwrap().guest_queue().is_empty());
     let demand = device.lock().unwrap().pool().demand();
-    assert_eq!(demand.wanted, demand.live, "no need is counted short any more");
+    assert_eq!(
+        demand.wanted, demand.live,
+        "no need is counted short any more"
+    );
 }
 
 /// Free chunks enough for the head's slots, but scattered by the binds
@@ -1538,16 +1553,26 @@ fn the_walk_commits_for_the_head_s_runs_where_scattered_free_chunks_cover_its_sl
         let pool = device.lock().unwrap();
         (pool.pool().free_chunks(), pool.pool().free_chunk_runs(4))
     };
-    assert!(free >= 13, "{free} free chunks: the head's 8 and the 4 ahead");
+    assert!(
+        free >= 13,
+        "{free} free chunks: the head's 8 and the 4 ahead"
+    );
     assert_eq!(runs, 0, "none of four adjacent");
     let mut grow = crate::store::shared::SharedGrow::new(0, ENGINE, device.clone());
     let _ = grow.retarget(u64::from(u32::MAX));
-    assert_eq!(grow.live_step_for_test(), None, "the scattered room covers the ahead");
+    assert_eq!(
+        grow.live_step_for_test(),
+        None,
+        "the scattered room covers the ahead"
+    );
 
     let (long, mut long_engine) = runs_of(8, 4, 2, 0);
     let error = bind_as(&roles, &mut long_engine, long, 1).expect_err("no run of 4");
     assert!(
-        matches!(error.downcast_ref::<RolesError>(), Some(RolesError::GuestGrow { .. })),
+        matches!(
+            error.downcast_ref::<RolesError>(),
+            Some(RolesError::GuestGrow { .. })
+        ),
         "{error}"
     );
     assert_eq!(
@@ -1556,7 +1581,11 @@ fn the_walk_commits_for_the_head_s_runs_where_scattered_free_chunks_cover_its_sl
         "the walk commits for the head's runs"
     );
     roles.lock().unwrap().leave_guest_queue(holder(1));
-    assert_eq!(grow.live_step_for_test(), None, "with no head, nothing more");
+    assert_eq!(
+        grow.live_step_for_test(),
+        None,
+        "with no head, nothing more"
+    );
 }
 
 /// The head's process ends while it waits: dropping its wait leaves the
@@ -1572,61 +1601,82 @@ async fn a_head_whose_process_ends_while_waiting_lets_the_next_bind() {
     roles.lock().unwrap().close_instance(ids[0]);
     let before = free_and_live(&device);
 
-    let waits = |by: u128, program: ProgramId, engine: std::rc::Rc<std::cell::RefCell<GuestEngine>>| {
-        let device = device.clone();
-        super::bind_when_resident(
-            holder(by),
-            {
-                let roles = roles.clone();
-                move || {
-                    let outcome = bind_as(&roles, &mut engine.borrow_mut(), program, by);
-                    std::future::ready(outcome)
-                }
-            },
-            || std::future::pending::<Result<(), String>>(),
-            move |prefix, run| {
-                let device = device.clone();
-                async move { super::grow_for_guest(&device, ENGINE, prefix, run).await }
-            },
-            {
-                let roles = roles.clone();
-                move || Some(roles.lock().unwrap().room_watch())
-            },
-            |_, _| false,
-            |_, _| false,
-            |_, _| std::future::pending::<Result<(), String>>(),
-            {
-                let roles = roles.clone();
-                move || {
+    let waits =
+        |by: u128, program: ProgramId, engine: std::rc::Rc<std::cell::RefCell<GuestEngine>>| {
+            let device = device.clone();
+            super::bind_when_resident(
+                holder(by),
+                {
                     let roles = roles.clone();
-                    async move { super::guest_turn(&roles, holder(by)).await }
-                }
-            },
-            {
-                let roles = roles.clone();
-                move || roles.lock().unwrap().leave_guest_queue(holder(by))
-            },
-        )
-    };
+                    move || {
+                        let outcome = bind_as(&roles, &mut engine.borrow_mut(), program, by);
+                        std::future::ready(outcome)
+                    }
+                },
+                || std::future::pending::<Result<(), String>>(),
+                move |prefix, run| {
+                    let device = device.clone();
+                    async move { super::grow_for_guest(&device, ENGINE, prefix, run).await }
+                },
+                {
+                    let roles = roles.clone();
+                    move || Some(roles.lock().unwrap().room_watch())
+                },
+                |_, _| false,
+                |_, _| false,
+                |_, _| std::future::pending::<Result<(), String>>(),
+                {
+                    let roles = roles.clone();
+                    move || {
+                        let roles = roles.clone();
+                        async move { super::guest_turn(&roles, holder(by)).await }
+                    }
+                },
+                {
+                    let roles = roles.clone();
+                    move || roles.lock().unwrap().leave_guest_queue(holder(by))
+                },
+            )
+        };
     let (long, long_engine) = runs_of(8, 4, 2, 0);
     let (small, small_engine) = runs_of(10, 1, 1, 2000);
     let small_engine = std::rc::Rc::new(std::cell::RefCell::new(small_engine));
-    let mut head = Box::pin(waits(1, long, std::rc::Rc::new(std::cell::RefCell::new(long_engine))));
+    let mut head = Box::pin(waits(
+        1,
+        long,
+        std::rc::Rc::new(std::cell::RefCell::new(long_engine)),
+    ));
     let next = waits(2, small, small_engine.clone());
     tokio::pin!(next);
-    assert!(futures::poll!(head.as_mut()).is_pending(), "the head waits on a commit");
-    assert!(futures::poll!(next.as_mut()).is_pending(), "the next waits behind it");
-    assert_eq!(roles.lock().unwrap().guest_queue(), vec![holder(1), holder(2)]);
+    assert!(
+        futures::poll!(head.as_mut()).is_pending(),
+        "the head waits on a commit"
+    );
+    assert!(
+        futures::poll!(next.as_mut()).is_pending(),
+        "the next waits behind it"
+    );
+    assert_eq!(
+        roles.lock().unwrap().guest_queue(),
+        vec![holder(1), holder(2)]
+    );
     assert_eq!(free_and_live(&device), before, "nothing taken");
 
     // The head's process ends: its wait is dropped.
     drop(head);
-    assert_eq!(roles.lock().unwrap().guest_queue(), vec![holder(2)], "it left, once");
+    assert_eq!(
+        roles.lock().unwrap().guest_queue(),
+        vec![holder(2)],
+        "it left, once"
+    );
     next.await.expect("the next binds in the free chunk");
     assert_eq!(small_engine.borrow().bindings.len(), 1);
     assert!(roles.lock().unwrap().guest_queue().is_empty());
     let demand = device.lock().unwrap().pool().demand();
-    assert_eq!(demand.wanted, demand.live, "the head's need is no longer counted");
+    assert_eq!(
+        demand.wanted, demand.live,
+        "the head's need is no longer counted"
+    );
 }
 
 /// While the head waits for runs of four, a bind taking whole runs at least
@@ -1645,17 +1695,30 @@ fn a_bind_of_runs_as_long_as_the_head_s_passes_it_and_leaves_its_need() {
     let (four, mut four_engine) = runs_of(11, 4, 1, 3000);
     let error = bind_as(&roles, &mut four_engine, four, 200).expect_err("no room");
     assert!(
-        matches!(error.downcast_ref::<RolesError>(), Some(RolesError::GuestGrow { .. })),
+        matches!(
+            error.downcast_ref::<RolesError>(),
+            Some(RolesError::GuestGrow { .. })
+        ),
         "it passed the head and found no room: {error}"
     );
-    assert_eq!(device.lock().unwrap().guest_head(), Some((4, 2)), "the head's need stands");
-    assert_eq!(roles.lock().unwrap().guest_queue(), vec![holder(1), holder(200)]);
+    assert_eq!(
+        device.lock().unwrap().guest_head(),
+        Some((4, 2)),
+        "the head's need stands"
+    );
+    assert_eq!(
+        roles.lock().unwrap().guest_queue(),
+        vec![holder(1), holder(200)]
+    );
 
     // Shorter pieces queue behind it, taking nothing.
     let (two, mut two_engine) = runs_of(12, 2, 1, 4000);
     let error = bind_as(&roles, &mut two_engine, two, 300).expect_err("behind the head");
     assert!(
-        matches!(error.downcast_ref::<RolesError>(), Some(RolesError::GuestQueued { .. })),
+        matches!(
+            error.downcast_ref::<RolesError>(),
+            Some(RolesError::GuestQueued { .. })
+        ),
         "{error}"
     );
 
@@ -1667,5 +1730,8 @@ fn a_bind_of_runs_as_long_as_the_head_s_passes_it_and_leaves_its_need() {
         Some((4, 1)),
         "the next head's need counts at once"
     );
-    assert_eq!(roles.lock().unwrap().guest_queue(), vec![holder(200), holder(300)]);
+    assert_eq!(
+        roles.lock().unwrap().guest_queue(),
+        vec![holder(200), holder(300)]
+    );
 }
