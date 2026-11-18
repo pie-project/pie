@@ -343,6 +343,18 @@ struct Part {
     run: u32,
 }
 
+/// `parts` as a trace names them: each part's role and slot refs.
+fn traced(parts: &[Part]) -> String {
+    parts
+        .iter()
+        .map(|part| {
+            let dead = if part.dead() { "(dead)" } else { "" };
+            format!("{:?}{dead}{:?}", part.role, part.refs)
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 impl Part {
     /// Guest scratch, dead between fires.
     fn dead(&self) -> bool {
@@ -1383,6 +1395,14 @@ impl Roles {
         let Some(item) = self.items.get_mut(&owner) else {
             return;
         };
+        tracing::debug!(
+            target: "runtime::planner::roles",
+            ?owner,
+            holder = ?item.holder,
+            tier = ?item.tier,
+            parts = %traced(&item.parts),
+            "roles: close instance"
+        );
         item.open = false;
         let shared: Vec<Owner> = item
             .channels
@@ -1441,6 +1461,14 @@ impl Roles {
         let owner = Owner::Channel(id);
         if let Some(item) = self.items.get_mut(&owner) {
             item.open = false;
+            tracing::debug!(
+                target: "runtime::planner::roles",
+                ?owner,
+                holder = ?item.holder,
+                tier = ?item.tier,
+                attached = item.attached.len(),
+                "roles: close channel"
+            );
         }
         self.free_if_done(owner);
     }
@@ -1453,6 +1481,14 @@ impl Roles {
             return;
         }
         let item = self.items.remove(&owner).expect("present");
+        tracing::debug!(
+            target: "runtime::planner::roles",
+            ?owner,
+            holder = ?item.holder,
+            tier = ?item.tier,
+            parts = %traced(&item.parts),
+            "roles: freed, its slots given back"
+        );
         let on = self.tier(item.tier == Tier::Host);
         if let Some(on) = on {
             self.give_freeing(&on, &item.parts);
@@ -1564,6 +1600,26 @@ impl Roles {
                 None => {}
             }
         }
+        for (owner, to) in &items {
+            tracing::debug!(
+                target: "runtime::planner::roles",
+                ?holder,
+                ?owner,
+                from = %traced(&self.items[owner].parts),
+                to = %traced(to),
+                "roles: park takes host slots"
+            );
+        }
+        for (owner, kept) in &shed {
+            tracing::debug!(
+                target: "runtime::planner::roles",
+                ?holder,
+                ?owner,
+                from = %traced(&self.items[owner].parts),
+                kept = %traced(kept),
+                "roles: park sheds dead parts, live ones stay"
+            );
+        }
         (!items.is_empty() || !shed.is_empty()).then(|| {
             let mut txn = self.moving(true, items);
             txn.shed = shed;
@@ -1661,6 +1717,26 @@ impl Roles {
         for (owner, _) in items.iter().chain(&shed) {
             self.items.get_mut(owner).expect("present").tier = Tier::Moving;
         }
+        for (owner, to) in &items {
+            tracing::debug!(
+                target: "runtime::planner::roles",
+                ?holder,
+                ?owner,
+                from = %traced(&self.items[owner].parts),
+                to = %traced(to),
+                "roles: unpark takes device slots"
+            );
+        }
+        for (owner, back) in &shed {
+            tracing::debug!(
+                target: "runtime::planner::roles",
+                ?holder,
+                ?owner,
+                from = %traced(&self.items[owner].parts),
+                to = %traced(back),
+                "roles: unpark takes fresh dead parts"
+            );
+        }
         Ok((!items.is_empty() || !shed.is_empty()).then(|| {
             let mut txn = self.moving(false, items);
             txn.shed = shed;
@@ -1743,6 +1819,14 @@ impl Roles {
                 continue;
             };
             let old = std::mem::replace(&mut item.parts, parts);
+            tracing::debug!(
+                target: "runtime::planner::roles",
+                ?owner,
+                out = txn.out,
+                old = %traced(&old),
+                new = %traced(&item.parts),
+                "roles: commit, dead parts shed or taken back"
+            );
             item.tier = Tier::Device;
             item.shed = txn.out;
             // Back in place: the engine is told its fresh dead parts.
@@ -1760,6 +1844,14 @@ impl Roles {
                 continue;
             };
             let old = std::mem::replace(&mut item.parts, parts);
+            tracing::debug!(
+                target: "runtime::planner::roles",
+                ?owner,
+                out = txn.out,
+                old = %traced(&old),
+                new = %traced(&item.parts),
+                "roles: commit, moved"
+            );
             item.tier = if txn.out { Tier::Host } else { Tier::Device };
             item.stale = !txn.out;
             if let Some(left) = &left {
@@ -1839,7 +1931,7 @@ impl Roles {
                 _ => {}
             }
         }
-        channels
+        let rebinds: Vec<Rebind> = channels
             .into_iter()
             .filter_map(|id| {
                 let item = self.items.get(&Owner::Channel(id))?;
@@ -1875,7 +1967,16 @@ impl Roles {
                         }),
                 })
             }))
-            .collect()
+            .collect();
+        for rebind in &rebinds {
+            tracing::debug!(
+                target: "runtime::planner::roles",
+                ?holder,
+                ?rebind,
+                "roles: rebind after the restore"
+            );
+        }
+        rebinds
     }
 
     /// The `Adapter` slots the instance `item` lands its adapter in.
