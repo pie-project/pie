@@ -191,9 +191,13 @@ impl ResidencyPlanner {
         // The host is short where it is the move's way out: its kv swap is
         // full, or its rows cannot take the state the head lacks (on a
         // shared pool, the state a victim must park to free its chunks).
+        // A host with no rows for that state in all is not short of them:
+        // no policy makes room there, and the head waits on the lanes, whose
+        // finishing gives the device room back.
         let state = victims.deficit.rs.add(victims.rs_short);
         let host_short = self.port.suspend_capable()
-            && ((victims.deficit.pages > 0 && swap_free == 0) || !room.rs.covers(state));
+            && ((victims.deficit.pages > 0 && swap_free == 0)
+                || (!room.rs.covers(state) && self.port.rs_host_stats().1.covers(state)));
         // Kv the head itself lacks waits on the supply first; kv that stands
         // for state it lacks moves now, as nothing else frees its chunks.
         let kv_deficit = victims.deficit.pages.saturating_sub(victims.rs_pages);

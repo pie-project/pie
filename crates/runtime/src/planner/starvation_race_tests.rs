@@ -36,6 +36,11 @@ struct RacePool {
     host_total: u32,
     // A registered model whose RS store backs the slot calls.
     rs_model: Option<usize>,
+    // The kv pages a state slot's chunks hold, as a shared pool counts
+    // them; 0 where state has a pool of its own.
+    slot_pages: u32,
+    // The host's state slots, none free.
+    host_slots: u32,
 }
 
 impl RacePool {
@@ -48,6 +53,8 @@ impl RacePool {
             pulls: parking_lot::Mutex::new(Vec::new()),
             host_total: 0,
             rs_model: None,
+            slot_pages: 0,
+            host_slots: 0,
         }
     }
 
@@ -90,7 +97,11 @@ impl PoolPort for RacePool {
         (0, 0)
     }
     fn rs_host_stats(&self) -> (RsUnits, RsUnits) {
-        Default::default()
+        let total = RsUnits {
+            slots: self.host_slots,
+            ..RsUnits::default()
+        };
+        (RsUnits::default(), total)
     }
     fn reclaim_idle(&self) -> u32 {
         0
@@ -139,6 +150,9 @@ impl PoolPort for RacePool {
     fn reclaim_sharing(&self, working_sets: &[crate::store::rs::RsWorkingSetId]) -> usize {
         self.with_rs(|rs| rs.reclaim_sharing(working_sets, crate::policy::retention::Installed))
             .unwrap_or(0)
+    }
+    fn rs_as_pages(&self, rs: RsUnits) -> u32 {
+        rs.slots.saturating_mul(self.slot_pages)
     }
     fn prepare_sweep(
         &self,
@@ -237,6 +251,58 @@ fn a_head_short_of_state_beside_free_pages_is_funded_by_eviction() {
     );
     assert_eq!(victims.members.len(), 1);
     assert_eq!(victims.members[0].pid, younger);
+}
+
+#[test]
+fn a_prompt_short_of_state_no_host_row_takes_waits_on_the_lanes() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
+    // The Pixel's shared pool, half the Galaxy's: a prompt asks a state
+    // record and a snapshot and finds one record free, the lanes' fires
+    // holding the rest, a younger one's among them. No host row takes state
+    // there, so no move makes room: it is short of the device alone and
+    // waits on the lanes, which give it back as they finish. Read as short
+    // of the host too, it failed at the seat deadline while they still ran.
+    let model = crate::store::registry::register_model(16, &[64], &[3]);
+    let stores = crate::store::registry::get(model, 0);
+    let two = RsUnits {
+        slots: 2,
+        pages: 0,
+        ..RsUnits::default()
+    };
+    let held = stores.rs.lock().unwrap().reserve(two).unwrap();
+    let host_short = |host_slots: u32| {
+        let pool = Arc::new(RacePool {
+            rs_model: Some(model),
+            slot_pages: 11,
+            host_slots,
+            ..RacePool::with_swap(64, 64)
+        });
+        pool.refill_after_stall(64, 0);
+        let planner = Arc::new(ResidencyPlanner::new(pool as Arc<dyn PoolPort>));
+        let (head, younger) = (ProcessId::new_v4(), ProcessId::new_v4());
+        for pid in [head, younger] {
+            planner.register(pid);
+            planner.note_admitted(pid);
+        }
+        let key = planner.with_inner(|inner| {
+            inner.enqueue(
+                head,
+                allocation(Demand {
+                    kv_pages: 0,
+                    rs: two,
+                }),
+            )
+        });
+        planner.plan_eviction();
+        let short = planner.short.lock();
+        assert!(short.since(key.1).is_some(), "short of the device");
+        short.host_short(key.1)
+    };
+    assert!(!host_short(0), "no host row takes state");
+    // A host that holds state, none of it free, is short: a policy may let
+    // a set at rest there go.
+    assert!(host_short(1));
+    stores.rs.lock().unwrap().release_reservation(held);
 }
 
 #[test]
