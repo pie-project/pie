@@ -42,6 +42,10 @@ impl Serve for Api {
     /// takes from there and lands its puts there.
     const CHANNEL_CELLS: bool = false;
 
+    /// A step's guest passes run once it landed (`landing`), and a later
+    /// fire may be on the queue by then: they read the arm's seat.
+    const READS_SPAN: bool = false;
+
     const TARGET: kernels_slang::Target = kernels_slang::Target::Wgsl;
 
     fn table_align(device: &Context) -> u64 {

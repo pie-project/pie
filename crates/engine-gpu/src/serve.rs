@@ -80,6 +80,13 @@ pub trait Serve: Backend {
     /// of a ring lies on the host.
     const CHANNEL_CELLS: bool;
 
+    /// Whether a program reading a fire's outputs on the device runs before
+    /// any later fire on the queue, so it may read them where the fire left
+    /// them in its span (a span no later fire has carved over yet). Else it
+    /// runs once the step landed, after later fires may have been submitted,
+    /// and reads them from the arm's readout seat, a gather of its own.
+    const READS_SPAN: bool;
+
     /// The target the backend's kernels are instantiated for.
     const TARGET: kernels_slang::Target;
 
@@ -605,6 +612,11 @@ pub struct ReadSpan {
     pub own: bool,
     pub hosted: bool,
     pub seated: bool,
+    /// Read by a program on the device where its rows lie, one run of
+    /// them, in the fire's span ([`Serve::READS_SPAN`]): `at` is then the
+    /// run's byte in the span's buffer, laid by the walk (and kept in the
+    /// layout a recording replays), and nothing is copied.
+    pub spanned: bool,
 }
 
 impl ReadSpan {
@@ -622,6 +634,7 @@ impl ReadSpan {
             own: true,
             hosted: false,
             seated: false,
+            spanned: false,
         }
     }
 
@@ -681,6 +694,9 @@ pub struct Shell<B: Serve> {
     /// Every fire walked eagerly, none recorded or replayed: a check's
     /// walked load ([`Shell::walk_every_fire`]).
     walk_only: bool,
+    /// The rows the host has had read back for it, and the bytes copied
+    /// into readout seats, by every fire so far ([`Shell::readout_tally`]).
+    readout_tally: (u64, u64),
     /// The rungs the load laid and the estimate it weighed them by, where
     /// the profile states every `[rates]` key.
     weighed: Option<engine::load::check::Weighed>,
@@ -1707,6 +1723,7 @@ impl<B: Serve> Shell<B> {
             unkept: 0,
             walked: (0, 0),
             walk_only: false,
+            readout_tally: (0, 0),
             weighed,
             pipelines,
             asks,
@@ -2740,6 +2757,30 @@ impl<B: Serve> Shell<B> {
                     landed.seq
                 ),
             })
+    }
+
+    /// The rows the host has had read back for it, and the bytes the fires
+    /// copied into readout seats, since the load.
+    #[must_use]
+    pub fn readout_tally(&self) -> (u64, u64) {
+        self.readout_tally
+    }
+
+    fn tally_reads(&mut self, layout: &[ReadSpan]) {
+        for span in layout {
+            if span.hosted {
+                self.readout_tally.0 += u64::from(span.rows);
+            }
+            if span.seated {
+                self.readout_tally.1 += span.bytes();
+            }
+        }
+    }
+
+    /// The buffer a fire's span lies in: a [`ReadSpan::spanned`] read's
+    /// rows lie there, at its `at`, until a later fire carves over them.
+    pub fn span_buffer(&self) -> Result<&B::Buffer> {
+        self.span.buffer()
     }
 
     /// Readout plane `plane`'s output name.
@@ -4049,9 +4090,14 @@ impl<B: Serve> Shell<B> {
             .capture()
             .map_or_else(Vec::new, |rows| scored.table(&indptr_host, rows.keys, rows.pages));
         let (readout_rows, readout_layout) =
-            readout_table(&composition, lanes, &self.readouts, &scored, |class| {
-                self.readout_for(class)
-            })?;
+            readout_table(
+                &composition,
+                lanes,
+                &self.readouts,
+                &scored,
+                |class| self.readout_for(class),
+                |plane| self.gathers_readout && self.readouts[plane].seam == Kind::Readout,
+            )?;
         let bound = self.inputs[arm].write(
             &self.handles,
             &crate::inputs::Fire {
@@ -4534,12 +4580,15 @@ type ReadoutTable = (Vec<i32>, Vec<ReadSpan>);
 
 /// Each lane's host span (at its index) and then a span of every other
 /// output its program reads, with the readout table the host spans pick.
+/// `gathered(plane)` tells a plane whose table rows the program gathers into
+/// rows of their own, in table order.
 fn readout_table<B: Serve>(
     composition: &Composition,
     lanes: &[Seated<'_, B>],
     planes: &[ReadoutPlane],
     scored: &Scored,
     host_of: impl Fn(usize) -> Option<usize>,
+    gathered: impl Fn(usize) -> bool,
 ) -> Result<ReadoutTable> {
     let span_of = |plane: usize, first: u32, rows: u32, at: u64, direct: bool, lane: u32| {
         let read = &planes[plane];
@@ -4556,18 +4605,28 @@ fn readout_table<B: Serve>(
             own: false,
             hosted: false,
             seated: false,
+            spanned: false,
         }
     };
     // A span is copied into the seat where the host reads it, or where a
-    // program reads it there.
-    let placed = |mut span: ReadSpan, at: &mut u64, hosted: bool, read: bool| {
+    // program reads it there: one a program reads on the device where it
+    // lies in the span, as one run (`run`), is copied nowhere.
+    let placed = |mut span: ReadSpan, at: &mut u64, hosted: bool, read: bool, run: bool| {
         span.hosted = hosted;
-        span.seated = hosted || read;
+        span.spanned = !hosted && read && run && B::READS_SPAN;
+        span.seated = hosted || (read && !span.spanned);
         if span.seated {
             span.at = *at;
             *at += span.bytes();
         }
         span
+    };
+    // Rows the table picks lie as one run where the program gathers them,
+    // or where they follow one another; a span of more layers than one
+    // lies in as many runs.
+    let one_run = |plane: usize, picks: &[i32]| {
+        planes[plane].values.len() == 1
+            && (gathered(plane) || picks.windows(2).all(|w| w[1] == w[0] + 1))
     };
     let mut table: Vec<i32> = Vec::with_capacity(lanes.len());
     let mut layout: Vec<ReadSpan> = (0..lanes.len()).map(ReadSpan::empty).collect();
@@ -4605,6 +4664,7 @@ fn readout_table<B: Serve>(
                 &mut at,
                 hosts,
                 read,
+                plane.values.len() == 1,
             );
             continue;
         }
@@ -4625,6 +4685,9 @@ fn readout_table<B: Serve>(
             _ if plane.seam != Kind::Readout => (first..first + owned).collect(),
             _ => vec![first + owned - 1],
         };
+        let rows: Vec<i32> = (picks.iter())
+            .map(|&at| i32::try_from(at).unwrap_or(i32::MAX))
+            .collect();
         layout[source] = placed(
             ReadSpan {
                 own: true,
@@ -4640,6 +4703,7 @@ fn readout_table<B: Serve>(
             &mut at,
             hosts,
             read,
+            one_run(host, &rows),
         );
         table.extend(
             picks
@@ -4700,7 +4764,13 @@ fn readout_table<B: Serve>(
                 continue;
             }
             let span = span_of(index, first, rows, 0, direct, row.source);
-            layout.push(placed(span, &mut at, hosts, true));
+            let run = if direct {
+                plane.values.len() == 1
+            } else {
+                let picked = &table[first as usize..(first + rows) as usize];
+                one_run(index, picked)
+            };
+            layout.push(placed(span, &mut at, hosts, true, run));
         }
     }
     Ok((table, layout))
@@ -4793,6 +4863,7 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
                 launches,
                 pixels,
             } => {
+                self.tally_reads(&rows);
                 return Ok(Enqueued {
                     pending,
                     fed,
@@ -4813,7 +4884,9 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
         let mut frame = walked.frame.expect("the walk opened a frame");
 
         let mut bases: Vec<Option<Vec<u64>>> = vec![None; self.readouts.len()];
-        for span in (prepared.readout_layout.iter()).filter(|span| span.rows > 0 && span.seated) {
+        for span in (prepared.readout_layout.iter())
+            .filter(|span| span.rows > 0 && (span.seated || span.spanned))
+        {
             let at = span.plane as usize;
             if bases[at].is_some() {
                 continue;
@@ -4847,23 +4920,33 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
 
         // Every read lands in the arm's seat by one copy of all its regions:
         // one pair of barriers a fire, not one a lane.
-        let layout = prepared.readout_layout.clone();
+        let mut layout = prepared.readout_layout.clone();
         let mut regions: Vec<(u64, u64, u64)> = Vec::new();
-        for span in layout.iter().filter(|span| span.rows > 0 && span.seated) {
+        for span in (layout.iter_mut())
+            .filter(|span| span.rows > 0 && (span.seated || span.spanned))
+        {
             let plane = &self.readouts[span.plane as usize];
             let layers = bases[span.plane as usize]
                 .as_deref()
                 .expect("every read plane has a base");
             let row_bytes = u64::from(plane.width) * elem(plane.dtype);
             let gathered = self.gathers_readout && plane.seam == Kind::Readout;
+            let (first, direct) = (span.first, span.direct);
+            // A direct span's rows run from `first` (as `span_copies` lays
+            // them); a gathered plane's rows are the table's, in order.
             let source_row = |k: u32| {
-                let cursor = u64::from(span.first + k);
-                if gathered {
+                let cursor = u64::from(first + k);
+                if gathered || direct {
                     cursor
                 } else {
                     u64::try_from(prepared.readout_rows[cursor as usize]).unwrap_or(0)
                 }
             };
+            if span.spanned {
+                // One run, one layer: its first row's byte in the span.
+                span.at = layers[0] + source_row(0) * row_bytes;
+                continue;
+            }
             regions.extend(
                 span_copies(span, layers, row_bytes, source_row)
                     .into_iter()
@@ -4878,6 +4961,7 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
             )?;
         }
 
+        self.tally_reads(&layout);
         let pixels = self.copy_pixels(&mut frame, &prepared)?;
         self.walked = (
             self.walked.0.max(frame.dispatches()),
@@ -5848,6 +5932,7 @@ mod tests {
             own: true,
             hosted: true,
             seated: true,
+            spanned: false,
         }
     }
 
