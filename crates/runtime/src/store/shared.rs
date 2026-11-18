@@ -319,9 +319,16 @@ pub(crate) fn raise_said(engine: usize, rung: u32, moved: usize, stood: bool) {
 /// is cut at the raised width from its first piece. A cap the walker
 /// lowered behind a rung still up is lifted back to it.
 pub fn raise_now(shared: &Shared, engine: usize, rows: u32) {
+    // Read before the pool's lock: the planner reads the pool under its own.
+    let waits = planner_demand_waits(0, engine);
     let mut pool = shared.lock().unwrap();
     let rungs = pool.rungs();
     let goal = pool.rung_for(rows);
+    // A throughput raise is ordered after every process demand waiting for
+    // room: while one waits it takes no room ([`SharedPool::demand_waits`]).
+    if pool.demand_waits(waits) && pool.pool().act_chunks(goal) > pool.pool().act_reserved() {
+        return;
+    }
     let lifted = |rung: u32| {
         if rungs.last() == Some(&rung) {
             u32::MAX
@@ -360,6 +367,15 @@ pub fn raise_now(shared: &Shared, engine: usize, rows: u32) {
         set_fire_cap(engine, cap);
     }
     drop(pool);
+}
+
+/// Whether a process's demand waits for room on the planner of `model`'s
+/// `engine` (a kv allocation, a restore or a guest bind short of room; a
+/// rise is ordered among them by its own key, not counted). Read before
+/// the pool's lock is taken: the planner reads the pool under its own.
+#[must_use]
+pub fn planner_demand_waits(model: usize, engine: usize) -> bool {
+    crate::planner::planner_for(model, engine).is_some_and(|planner| planner.demand_waits())
 }
 
 /// The most rows a pass still to run on `engine` asks of one fire; 0 where
@@ -523,11 +539,17 @@ pub struct PoolRoom {
     pub chunk_bytes: u64,
     pub total_chunks: u32,
     pub reserved_chunks: u32,
-    /// The activation set aside under the smallest rung.
+    /// The activation's span: the largest rung's, which a rise takes back
+    /// whatever a lowered rung lent of it.
     pub act_chunks: u32,
+    /// The span's chunks the smallest rung lends to state where they can
+    /// be backed: room a grant may use while the rung is down, never room
+    /// the pool promises, since a rise takes them back.
+    pub lent_chunks: u32,
     /// The chunks the weights' pinned slots take.
     pub weight_chunks: u32,
-    /// What is left for kv and state: no move frees more.
+    /// What is left for kv and state below the span: no move frees more,
+    /// and no rung takes it.
     pub state_chunks: u32,
     /// `state_chunks` as kv list slots (pages).
     pub list_slots: u32,
@@ -764,6 +786,14 @@ pub struct SharedPool {
     /// The engine refused the last `commit_span`: no span segment is asked
     /// again until room is freed ([`Self::block_span_commit`]).
     span_commit_blocked: bool,
+    /// The head of the guest binds waiting for room, its need as `(run,
+    /// pieces)`: runs of `run` adjacent chunks inside one segment. The walk
+    /// commits while they do not stand free ([`Self::walk_goal`]), not only
+    /// while their slot count is short.
+    guest_head: Option<(u32, u32)>,
+    /// The governor's segment target the walk steers this pool to, shared
+    /// with it ([`target::SharedGrow`]); `None` where no walk steers it.
+    walk_target: Option<Arc<std::sync::atomic::AtomicU32>>,
     /// The registered programs' fire terms ([`programs`]).
     programs: programs::ProgramFires,
     /// The engine whose rung gate this pool publishes the rung it holds
@@ -1014,6 +1044,8 @@ impl SharedPool {
             told_from: None,
             lowering: None,
             span_commit_blocked: false,
+            guest_head: None,
+            walk_target: None,
             programs: programs::ProgramFires::default(),
             engine: None,
         };
@@ -1183,29 +1215,28 @@ impl SharedPool {
                 u32::try_from(slots.div_ceil(u64::from(spc.max(1)))).unwrap_or(u32::MAX)
             })
             .sum();
-        let act_chunks = pool.act_chunks(0);
         // What state can ever be backed in, not the range: below the span,
         // the chunks under what the engine binds that lie in segments the
-        // pool may map ([`Self::backable_below_span`]); in the span, what
-        // the smallest rung leaves, where it is backed while the engine
-        // holds anything back.
+        // pool may map ([`Self::backable_below_span`]). The kv facts count
+        // the same (`ChunkFacts::kv_device_pages`): what the smallest rung
+        // leaves of the span, where it is backed, is lent, and a rise takes
+        // it back.
         let span_backable = !pool.span_on_demand() || pool.ceiling() >= pool.total_chunks();
-        let lent = if span_backable {
-            pool.act_max()
+        let lent_chunks = if span_backable {
+            pool.act_max().saturating_sub(pool.act_chunks(0))
         } else {
-            act_chunks
+            0
         };
         let state_chunks = self
             .backable_below_span()
-            .saturating_add(lent)
             .saturating_sub(pool.reserved_chunks())
-            .saturating_sub(act_chunks)
             .saturating_sub(weight_chunks);
         PoolRoom {
             chunk_bytes: pool.chunk_bytes(),
             total_chunks: pool.total_chunks(),
             reserved_chunks: pool.reserved_chunks(),
-            act_chunks,
+            act_chunks: pool.act_max(),
+            lent_chunks,
             weight_chunks,
             state_chunks,
             list_slots: self.list.map_or(0, |list| {
@@ -1733,8 +1764,7 @@ impl SharedPool {
     /// rung it holds, and hears a wider one before any fire takes it).
     #[must_use]
     pub fn raise_owed(&self, rung: u32) -> bool {
-        self.pool.act_chunks(rung) > self.pool.act_reserved()
-            || self.pool.rung_of(rung) > self.told
+        self.pool.act_chunks(rung) > self.pool.act_reserved() || self.pool.rung_of(rung) > self.told
     }
 
     /// This pool steers `engine`: the rung it holds is published to the
@@ -2153,7 +2183,16 @@ impl SharedPool {
             .demand()
             .wanted
             .saturating_sub(self.pool.demand().live);
-        let ahead = self.ahead_target(short);
+        let mut ahead = self.ahead_target(short);
+        // The head guest bind's runs: free chunks enough for its slots may
+        // still hold no run of its length, scattered by the binds before
+        // it; a fresh segment holds them whole, so the walk commits one
+        // more while they do not stand free.
+        if let Some((run, pieces)) = self.guest_head
+            && self.pool.free_chunk_runs(run) < pieces
+        {
+            ahead = ahead.max(mapped + 1);
+        }
         tracing::trace!(
             target,
             mapped,
@@ -2185,6 +2224,49 @@ impl SharedPool {
     /// answer.
     pub fn block_span_commit(&mut self, blocked: bool) {
         self.span_commit_blocked = blocked;
+    }
+
+    /// The head guest bind's need, `(run, pieces)`; `None` where none waits
+    /// ([`crate::store::roles::Roles::take_guest`]).
+    pub fn set_guest_head(&mut self, need: Option<(u32, u32)>) {
+        self.guest_head = need;
+    }
+
+    /// The walk's target, shared ([`Self::commit_can_come`]).
+    pub fn walked_to(&mut self, target: Arc<std::sync::atomic::AtomicU32>) {
+        self.walk_target = Some(target);
+    }
+
+    /// Whether the walk would commit a segment now: its goal (a pinned
+    /// count, else the governor's target) is past what is mapped. At the
+    /// target nothing commits, however many segments the pool's own
+    /// limits leave uncommitted. Without a walk (a pool none steers), as
+    /// the pool's limits say.
+    #[must_use]
+    pub fn commit_can_come(&self) -> bool {
+        let Some(target) = &self.walk_target else {
+            return true;
+        };
+        let goal = target::pinned_segments()
+            .unwrap_or_else(|| target.load(std::sync::atomic::Ordering::Acquire));
+        goal > self.mapped_segments()
+    }
+
+    /// The head guest bind's need, `(run, pieces)`, where one waits.
+    #[must_use]
+    pub fn guest_head(&self) -> Option<(u32, u32)> {
+        self.guest_head
+    }
+
+    /// Whether a process's demand waits for room on this pool: a guest
+    /// bind's head here, or (`planner`, read before this pool's lock,
+    /// [`planner_demand_waits`]) a kv allocation or restore. A throughput
+    /// raise (one only cuttable passes want) takes no room while one does,
+    /// and the rung walk lowers toward the narrowest rung the admitted work
+    /// needs, giving room back.
+    #[must_use]
+    pub fn demand_waits(&self, planner: bool) -> bool {
+        planner || self.guest_head.is_some()
     }
 
     /// Whether a refused `commit_span` waits for room to be freed.

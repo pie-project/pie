@@ -592,16 +592,10 @@ pub fn at_load(
     max_submit: Option<std::time::Duration>,
 ) -> Result<profile::Profile, String> {
     let name = device.name().to_string();
-    let check = |text: &str| {
-        crate::chip::registry()
-            .parse(text, "the measured rates", profile::Strict::User)
-            .map(|_| ())
-            .map_err(|e| e.to_string())
-    };
     let save = profiles.map(|profiles| engine::rates::SaveTo {
         path: crate::chip::SHELF.user_path(profiles, &name),
         provenance: provenance(&name),
-        check: &check,
+        registry: crate::chip::registry(),
     });
     let measure_chip = chip.clone();
     engine::rates::rates_at_load(chip, &KEYS, save, None, max_submit, |_max_submit| {

@@ -31,8 +31,8 @@ slots its lanes name into fire-sized planes under local ids and writes back what
 unchanged. Segments are host allocations (commit / release / evacuate are real). Weights are whole on the host
 (uploaded per fire, or kept by a resident fabric server): there is no partial device copy to stream into, so no
 weight shapes are stated and `weight_residency` / `weight_uses` take and report nothing. Host/disk tiers
-(contract 22): host chunks are seated only where `host_kv_budget` is stated (the pool is host DRAM already),
-allocated on first write, any shape; the kv slot file (`r0.kv`, kept with `disk_kv_persistent`) holds kv list
+(contract 22): host chunks are seated only where `[engine.memory] budget_host` is stated (the pool is host DRAM already),
+allocated on first write, any shape; the kv slot file (`r0.kv`, kept with `[engine.memory] disk_persistent`) holds kv list
 slots; `copy_slots` moves device <-> host <-> disk; the legacy `copy_kv` / `copy_state` refuse every host move
 (this engine never served them). No hardware here: lib tests and a host simulation of staging and parking
 against in-place slots; nothing ran on a CS system or the simulator.

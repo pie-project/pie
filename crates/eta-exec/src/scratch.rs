@@ -1,4 +1,5 @@
 use super::extent::ValueDesc;
+pub use eta_compiler::codegen::temporary::TemporaryNeed;
 
 mod lifetime;
 
@@ -156,6 +157,59 @@ pub fn whole_value_temporaries(descriptors: &[ValueDesc]) -> Option<u64> {
         .and_then(|bytes| bytes.checked_mul(TEMPORARIES_PER_ELEMENT))
 }
 
+/// A stage's temporary area: the widest of the whole-value rule
+/// ([`whole_value_temporaries`]) and what each region's emitter publishes
+/// it takes (`needs`, [`TemporaryNeed`]), evaluated against `descriptors`.
+/// An emitter that publishes none passes none. Refused by name where a
+/// need names a value the stage does not hold, or the bytes pass a `u64`.
+pub fn stage_temporaries(
+    descriptors: &[ValueDesc],
+    needs: &[TemporaryNeed],
+) -> Result<u64, TemporaryRefused> {
+    let whole = whole_value_temporaries(descriptors).ok_or(TemporaryRefused::Overflow)?;
+    needs.iter().try_fold(whole, |widest, need| {
+        let rows = match need.per_row {
+            Some((value, bytes)) => u64::from(
+                descriptors
+                    .get(value as usize)
+                    .ok_or(TemporaryRefused::NoValue { value })?
+                    .rows,
+            )
+            .checked_mul(bytes)
+            .ok_or(TemporaryRefused::Overflow)?,
+            None => 0,
+        };
+        let below = if need.above_whole { whole } else { 0 };
+        let bytes = need
+            .fixed
+            .checked_add(rows)
+            .and_then(|bytes| bytes.checked_add(below))
+            .ok_or(TemporaryRefused::Overflow)?;
+        Ok(widest.max(bytes))
+    })
+}
+
+/// Why [`stage_temporaries`] refuses a stage's temporary area.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TemporaryRefused {
+    /// A region's need is a row count of a value the stage does not hold.
+    NoValue { value: u32 },
+    /// The bytes pass a `u64`.
+    Overflow,
+}
+
+impl core::fmt::Display for TemporaryRefused {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NoValue { value } => write!(
+                f,
+                "a region's temporary need counts the rows of value {value}, which the stage does not hold"
+            ),
+            Self::Overflow => write!(f, "a stage's temporary area passes a u64"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Lifetime {
     pub def: u32,
@@ -259,72 +313,42 @@ impl ChunkLayout {
     }
 }
 
+/// Whether value `later`'s bytes may lie over value `earlier`'s, given the
+/// two lifetimes, or `None` where they may lie anywhere over each other.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Vacant {
-    piece: u32,
-    offset: u64,
-    span: u64,
-    launch: u32,
-    class: u64,
-    /// One dead value's own bytes, from its offset: neither cut nor joined
-    /// to another's.
-    whole: bool,
+enum Share {
+    /// Anywhere over each other: one is last read a launch before the
+    /// other is written, or a step before it in a launch of one block.
+    Anywhere,
+    /// Only at one offset: within a launch across blocks, block `b` owns
+    /// row `b` of every value of a class, so a value that takes another's
+    /// bytes there lies at the other's offset, or a block's row would land
+    /// on another block's, which may still be reading it.
+    AtItsOffset,
+    /// Nowhere: their lifetimes overlap, the later may go unwritten in
+    /// part (it keeps bytes no value before it held), or they are rows of
+    /// two classes in one launch.
+    Apart,
 }
 
-/// Bytes for a value written in `launch` of rows `class`: a vacancy a
-/// launch before it, or one its own launch left of the same class. Within a
-/// launch across blocks, block `b` owns row `b` of every value of a class,
-/// so a value takes there only a dead one's own bytes, at its offset: any
-/// other place would lay a block's row over another block's, which may
-/// still be reading it.
-fn take(free: &mut Vec<Vacant>, span: u64, launch: u32, class: u64) -> Option<Placed> {
-    let best = free
-        .iter()
-        .enumerate()
-        .filter(|(_, block)| {
-            block.span >= span
-                && (block.launch < launch
-                    || (class != 0
-                        && block.class == class
-                        && (class == Lifetime::SEQUENTIAL || block.whole)))
-        })
-        .min_by_key(|(_, block)| block.span)
-        .map(|(index, _)| index)?;
-    let Vacant {
-        piece,
-        offset,
-        span: width,
-        ..
-    } = free[best];
-    if width == span {
-        free.remove(best);
+fn share(a: Lifetime, b: Lifetime) -> Share {
+    let (early, late) = if a.last < b.def {
+        (a, b)
+    } else if b.last < a.def {
+        (b, a)
     } else {
-        free[best].offset = offset + span;
-        free[best].span = width - span;
-        free[best].whole = false;
-    }
-    Some(Placed { piece, offset })
-}
-
-fn release(free: &mut Vec<Vacant>, vacant: Vacant) {
-    let at =
-        free.partition_point(|block| (block.piece, block.offset) < (vacant.piece, vacant.offset));
-    free.insert(at, vacant);
-    let joins = |a: &Vacant, b: &Vacant| {
-        a.piece == b.piece
-            && a.offset + a.span == b.offset
-            && a.launch == b.launch
-            && a.class == b.class
+        return Share::Apart;
     };
-    if at + 1 < free.len() && joins(&free[at], &free[at + 1]) {
-        free[at].span += free[at + 1].span;
-        free[at].whole = false;
-        free.remove(at + 1);
-    }
-    if at > 0 && joins(&free[at - 1], &free[at]) {
-        free[at - 1].span += free[at].span;
-        free[at - 1].whole = false;
-        free.remove(at);
+    if !late.reusable {
+        Share::Apart
+    } else if early.launch_last < late.launch_def {
+        Share::Anywhere
+    } else if late.class_def == 0 || early.class_last != late.class_def {
+        Share::Apart
+    } else if late.class_def == Lifetime::SEQUENTIAL {
+        Share::Anywhere
+    } else {
+        Share::AtItsOffset
     }
 }
 
@@ -403,12 +427,15 @@ fn run_for(
     u32::try_from(run.max(span)).map_err(|_| TooLarge::Overflow)
 }
 
-/// `descriptors` laid by `lifetimes` in pieces of at most `limit` bytes: a
-/// value takes the bytes of one whose last reader ran before it is
-/// written, in that one's piece, else a free tail of the first piece with
-/// room, else a new piece. `reserve` bytes lie right below the temporary
-/// area, which holds `temporary` bytes, both in one piece. The caller has
-/// sized `limit` for every item ([`run_for`]).
+/// `descriptors` laid by `lifetimes` in pieces of at most `limit` bytes,
+/// largest first: each value at the lowest offset of the first piece where
+/// it shares bytes only with values it may share them with ([`share`]),
+/// else in a new piece. Two values share bytes only where one is last read
+/// before the other is written, so the bytes laid are what the values live
+/// together at once take, short of the gaps that sizes leave. `reserve`
+/// bytes lie right below the temporary area, which holds `temporary` bytes,
+/// both in one piece past every value. The caller has sized `limit` for
+/// every item ([`run_for`]).
 fn place(
     descriptors: &[ValueDesc],
     lifetimes: &[Lifetime],
@@ -417,66 +444,76 @@ fn place(
     limit: u64,
 ) -> Result<ChunkLayout, TooLarge> {
     let count = descriptors.len();
-    let mut by_def: Vec<usize> = (0..count).collect();
-    by_def.sort_by_key(|&i| {
-        (
-            lifetimes[i].def,
-            core::cmp::Reverse(descriptors[i].device_bytes()),
-            i,
-        )
-    });
-    let mut by_last: Vec<usize> = (0..count).collect();
-    by_last.sort_by_key(|&i| (lifetimes[i].last, i));
-    let mut expired = 0usize;
-
-    let mut free: Vec<Vacant> = Vec::new();
-    let mut values = vec![Placed::default(); count];
     let mut spans = vec![0u64; count];
-    let mut ends = vec![DUMMY_BYTES];
-    let mut step: Option<u32> = None;
+    for (i, descriptor) in descriptors.iter().enumerate() {
+        spans[i] = align_up(descriptor.device_bytes()).ok_or(TooLarge::Overflow)?;
+    }
+    let mut order: Vec<usize> = (0..count).filter(|&i| !lifetimes[i].dead).collect();
+    order.sort_by_key(|&i| (core::cmp::Reverse(spans[i]), lifetimes[i].def, i));
 
-    for &i in &by_def {
-        let life = lifetimes[i];
-        if step != Some(life.def) {
-            while expired < count && lifetimes[by_last[expired]].last < life.def {
-                let dead = by_last[expired];
-                expired += 1;
-                if spans[dead] > 0 {
-                    release(
-                        &mut free,
-                        Vacant {
-                            piece: values[dead].piece,
-                            offset: values[dead].offset,
-                            span: spans[dead],
-                            launch: lifetimes[dead].launch_last,
-                            class: lifetimes[dead].class_last,
-                            whole: true,
-                        },
-                    );
+    let mut values = vec![Placed::default(); count];
+    // Each piece's values, as laid.
+    let mut laid: Vec<Vec<usize>> = Vec::new();
+    let mut ends = vec![DUMMY_BYTES];
+    let mut near: Vec<(u64, u64, bool)> = Vec::new();
+    let mut candidates: Vec<u64> = Vec::new();
+    for &i in &order {
+        let span = spans[i];
+        let mut found = None;
+        // The pieces laid so far, then a new one (piece 0 is open from the
+        // start, with the dummy bytes).
+        for piece in 0..=laid.len().max(1) {
+            let base = if piece == 0 { DUMMY_BYTES } else { 0 };
+            near.clear();
+            candidates.clear();
+            candidates.push(base);
+            for &j in laid.get(piece).map_or(&[][..], Vec::as_slice) {
+                let at = values[j].offset;
+                let one = match share(lifetimes[i], lifetimes[j]) {
+                    Share::Anywhere => continue,
+                    Share::AtItsOffset => true,
+                    Share::Apart => false,
+                };
+                near.push((at, at + spans[j], one));
+                candidates.push(at + spans[j]);
+                if one {
+                    candidates.push(at);
                 }
             }
-            step = Some(life.def);
-        }
-        if life.dead {
-            continue;
-        }
-        let bytes = descriptors[i].device_bytes();
-        let span = align_up(bytes).ok_or(TooLarge::Overflow)?;
-        let taken = if life.reusable {
-            take(&mut free, span, life.launch_def, life.class_def)
-        } else {
-            None
-        };
-        values[i] = match taken {
-            Some(placed) => placed,
-            None => {
-                let (piece, offset) = bump(&mut ends, 0, span, limit)
-                    .ok_or(TooLarge::Overflow)?
-                    .ok_or(TooLarge::Bound { bytes, limit })?;
-                Placed { piece, offset }
+            candidates.sort_unstable();
+            candidates.dedup();
+            let fits = |at: u64| {
+                near.iter().all(|&(start, end, one)| {
+                    end <= at || at + span <= start || (one && start == at)
+                })
+            };
+            if let Some(&at) = candidates
+                .iter()
+                .filter(|&&at| at >= base && at.checked_add(span).is_some_and(|stop| stop <= limit))
+                .find(|&&at| fits(at))
+            {
+                found = Some((piece, at));
+                break;
             }
+        }
+        let Some((piece, offset)) = found else {
+            return Err(TooLarge::Bound {
+                bytes: descriptors[i].device_bytes(),
+                limit,
+            });
         };
-        spans[i] = span;
+        while laid.len() <= piece {
+            laid.push(Vec::new());
+        }
+        laid[piece].push(i);
+        while ends.len() <= piece {
+            ends.push(0);
+        }
+        ends[piece] = ends[piece].max(offset + span);
+        values[i] = Placed {
+            piece: u32::try_from(piece).map_err(|_| TooLarge::Overflow)?,
+            offset,
+        };
     }
 
     let temporary_bytes = align_up(temporary).ok_or(TooLarge::Overflow)?;
@@ -494,6 +531,38 @@ fn place(
         temporary_bytes,
         ends,
     })
+}
+
+/// The most bytes `descriptors`' values alive together take at any step of
+/// `lifetimes` (each value's bytes aligned as a layout lays them): the
+/// least any layout of their values holds.
+#[must_use]
+pub fn most_alive(descriptors: &[ValueDesc], lifetimes: &[Lifetime]) -> u64 {
+    let mut edges: Vec<(u32, bool, u64)> = descriptors
+        .iter()
+        .zip(lifetimes)
+        .filter(|(_, life)| !life.dead)
+        .flat_map(|(descriptor, life)| {
+            let span = align_up(descriptor.device_bytes()).unwrap_or(u64::MAX);
+            // A value is alive from its step through its last: born at
+            // `def`, gone after `last`; at one step births count first.
+            [
+                (life.def, false, span),
+                (life.last.saturating_add(1), true, span),
+            ]
+        })
+        .collect();
+    edges.sort_unstable_by_key(|&(step, gone, _)| (step, !gone));
+    let (mut alive, mut most) = (0u64, 0u64);
+    for (_, gone, span) in edges {
+        if gone {
+            alive -= span;
+        } else {
+            alive = alive.saturating_add(span);
+            most = most.max(alive);
+        }
+    }
+    most
 }
 
 /// Every value live from the first launch to the last, none taking
@@ -598,6 +667,59 @@ mod tests {
         }
     }
 
+    /// The stage's temporary area is the widest of the whole-value rule and
+    /// what each region's emitter publishes: a short vector's select keeps
+    /// its fixed state below the rule's bytes, a top-k takes so much a row
+    /// of its input, an emitter that publishes none takes the rule alone,
+    /// and a need naming a value the stage lacks, or past a u64, is refused
+    /// by name.
+    #[test]
+    fn a_stage_s_temporaries_take_the_widest_published_need() {
+        let short = [desc(16)];
+        let whole = whole_value_temporaries(&short).unwrap();
+        assert_eq!(whole, 16 * 16);
+        assert_eq!(stage_temporaries(&short, &[]), Ok(whole), "none published: the rule");
+        let select = TemporaryNeed {
+            fixed: 51_200,
+            per_row: None,
+            above_whole: true,
+        };
+        assert_eq!(stage_temporaries(&short, &[select]), Ok(51_200 + whole));
+        let mut rows = desc(16);
+        rows.rows = 4;
+        let topk = TemporaryNeed {
+            fixed: 15,
+            per_row: Some((0, 14_360)),
+            above_whole: false,
+        };
+        assert_eq!(stage_temporaries(&[rows], &[topk]), Ok(15 + 4 * 14_360));
+        assert_eq!(
+            stage_temporaries(&short, &[select, topk]),
+            Ok((51_200 + whole).max(15 + 14_360)),
+            "the widest region's"
+        );
+        // A wide value's rule covers a small need.
+        let wide = [desc(1 << 20)];
+        assert_eq!(
+            stage_temporaries(&wide, &[topk]),
+            Ok(whole_value_temporaries(&wide).unwrap())
+        );
+        let stray = TemporaryNeed {
+            per_row: Some((3, 8)),
+            ..TemporaryNeed::default()
+        };
+        assert_eq!(
+            stage_temporaries(&short, &[stray]),
+            Err(TemporaryRefused::NoValue { value: 3 })
+        );
+        let past = TemporaryNeed {
+            fixed: u64::MAX,
+            above_whole: true,
+            ..TemporaryNeed::default()
+        };
+        assert_eq!(stage_temporaries(&short, &[past]), Err(TemporaryRefused::Overflow));
+    }
+
     fn life(def: u32, last: u32) -> Lifetime {
         Lifetime {
             dead: false,
@@ -635,6 +757,7 @@ mod tests {
         a_reserve_lies_below_the_temporary_arena();
         mismatched_lifetimes_fall_back_to_the_naive_layout();
         a_dead_value_takes_no_slot();
+        small_values_leave_room_for_the_wide_ones_that_follow();
         rows_of_one_class_share_only_at_one_offset(None);
         // In pieces of a chunk, a few values a piece: the same rule within
         // each piece, and none past it.
@@ -846,11 +969,12 @@ mod tests {
         let lifetimes = [life(0, 1), life(1, 2), life(2, 3), life(3, 3)];
         let laid = layout_chunked(&descriptors, &lifetimes, 0, 0, PIECES).expect("fits");
         holds(&laid, &descriptors, &lifetimes, 0);
-        assert_eq!(
-            laid.values[2], laid.values[0],
-            "the first was read last a step before"
-        );
         assert_ne!(laid.values[1], laid.values[0]);
+        assert_eq!(
+            laid.ends,
+            [DUMMY_BYTES + 16384 + 32768],
+            "the most alive at once, the last two: {laid:?}"
+        );
     }
 
     /// A segment of one chunk: a value past a chunk is past the segment.
@@ -1196,6 +1320,58 @@ mod tests {
         let eight = layout_chunked(&descriptors, &lifetimes, 1024, 4096, PIECES).expect("fits");
         assert_eq!(one.run, 1);
         assert_eq!(one, eight);
+    }
+
+    /// A sampler's shape: a wide value dead, then a scalar written, then
+    /// two wide values alive with the scalar. The scalar does not cut the
+    /// dead one's bytes so that a wide value no longer fits them: the
+    /// bytes laid are the most alive at once.
+    fn small_values_leave_room_for_the_wide_ones_that_follow() {
+        let descriptors = [desc(1024), desc(1), desc(1024), desc(1024)];
+        let lifetimes = [life(0, 0), life(1, 2), life(2, 2), life(2, 2)];
+        let laid = layout_reusing(&descriptors, &lifetimes, 0, 0).unwrap();
+        let most = most_alive(&descriptors, &lifetimes);
+        assert_eq!(most, 2 * 4096 + ALIGN);
+        assert_eq!(laid.total, DUMMY_BYTES + most, "{laid:?}");
+        assert!(
+            laid.values[2] == laid.values[0] || laid.values[3] == laid.values[0],
+            "a wide value takes the dead one's bytes: {laid:?}"
+        );
+    }
+
+    /// Random stages laid in one piece: two values whose lifetimes overlap
+    /// share no byte, the bytes laid hold the most alive at once, and two
+    /// values with disjoint lifetimes do share where nothing else is laid.
+    #[test]
+    fn disjoint_lifetimes_share_and_overlapping_ones_do_not() {
+        let disjoint = [desc(1024), desc(1024)];
+        let apart = layout_reusing(&disjoint, &[life(0, 0), life(1, 1)], 0, 0).unwrap();
+        assert_eq!(apart.values[0], apart.values[1], "disjoint: one slot");
+        let together = layout_reusing(&disjoint, &[life(0, 1), life(1, 1)], 0, 0).unwrap();
+        assert_ne!(together.values[0], together.values[1], "overlapping: two");
+
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        for _ in 0..4000 {
+            let count = 1 + rng.below(24) as usize;
+            let steps = 1 + rng.below(12) as u32;
+            let descriptors: Vec<ValueDesc> = (0..count)
+                .map(|_| desc(1 + rng.below(4096) as u32))
+                .collect();
+            let lifetimes: Vec<Lifetime> = (0..count)
+                .map(|_| {
+                    let def = rng.below(u64::from(steps)) as u32;
+                    let last = def + rng.below(u64::from(steps - def)) as u32;
+                    Lifetime {
+                        dead: rng.below(10) == 0,
+                        ..life(def, last)
+                    }
+                })
+                .collect();
+            let laid =
+                layout_chunked(&descriptors, &lifetimes, 0, 0, Pieces::new(MAX_BYTES, 1)).unwrap();
+            holds(&laid, &descriptors, &lifetimes, 0);
+            assert!(laid.ends[0] >= DUMMY_BYTES + most_alive(&descriptors, &lifetimes));
+        }
     }
 
     fn a_value_dead_before_the_next_region_hands_its_slot_on() {

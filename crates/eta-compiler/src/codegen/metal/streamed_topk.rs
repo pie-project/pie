@@ -11,6 +11,37 @@ use super::topk::SELECT_MAX_K;
 use super::validate::{is_library, library_op_byte, library_region_valid, used_channel_slots};
 use crate::codegen::op_view::{OpView, result_bases};
 
+/// A row's bytes of the streamed top-k's temporaries, as [`BODY`] lays
+/// them: a 512-bin histogram, a 4-word pick and a 2-word fill a row
+/// (`cand_at`, at most 15 bytes of alignment above them, which
+/// [`streamed_topk_temporary_need`] keeps fixed), then [`SELECT_MAX_K`]
+/// candidates of a key and an index.
+pub const TOPK_ROW_BYTES: u64 = (512 + 4 + 2) * 4 + SELECT_MAX_K as u64 * (8 + 4);
+
+/// What the streamed form of `plan`'s region `region` takes of a lane's
+/// temporary area where it is a top-k library region (the one
+/// [`emit_streamed_topk`] emits): [`TOPK_ROW_BYTES`] a row of its input,
+/// from the area's bottom. `None` for any other region.
+#[must_use]
+pub fn streamed_topk_temporary_need(
+    plan: &crate::codegen::launch::LaunchStagePlan,
+    region: usize,
+) -> Option<crate::codegen::temporary::TemporaryNeed> {
+    let region = plan.fused.get(region)?;
+    if region.kind != crate::plan::RegionKind::Library(LibraryOp::TopK) {
+        return None;
+    }
+    let op = plan.ops.get(*region.nodes.first()? as usize)?;
+    if op.tag != tags::TOP_K {
+        return None;
+    }
+    Some(crate::codegen::temporary::TemporaryNeed {
+        fixed: 15,
+        per_row: Some((*op.args.first()?, TOPK_ROW_BYTES)),
+        above_whole: false,
+    })
+}
+
 const HELPERS: &str = r#"
 inline uint m4_topk_key(float value, thread uint& flag) {
   if (isnan(value)) { flag = 1u; return 0u; }

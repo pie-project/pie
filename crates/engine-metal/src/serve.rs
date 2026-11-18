@@ -1178,10 +1178,13 @@ impl PreparedLoad<'_> {
             + scratch.bytes()
             + arms as u64 * io.last().copied().map_or(0, crate::arena::io_room)
             + ane_fire;
+        // What every other process's GPU memory takes of the working set
+        // they share with this one: none of the load's capacity.
+        let others = device.others_allocated();
         let accounting = |pool: u64| {
             crate::store::accounting::Accounting::of(
                 device.working_set(),
-                outside,
+                outside.saturating_add(others),
                 boot.allowance.budget,
                 model_bytes,
                 fire_bytes,
@@ -1430,6 +1433,15 @@ impl PreparedLoad<'_> {
         {
             let acct = accounting(pool_bytes);
             acct.admit()?;
+            tracing::info!(
+                working_set = acct.working_set,
+                this_process = outside,
+                other_processes = others,
+                floor = crate::store::accounting::DRIVER_FLOOR,
+                capacity = acct.capacity,
+                "metal: capacity = the working set Metal recommends, less what this process and \
+                 every other process's GPU memory hold of it at load, less the floor"
+            );
             if crate::diag::on().tier_trace {
                 eprintln!(
                     "residency: model {} fire {} kv {} of capacity {} (working set {}, outside {})",

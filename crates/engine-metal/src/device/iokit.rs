@@ -1,6 +1,8 @@
 //! The GPU core count, read from the IORegistry. Metal does not publish it;
 //! the AGX accelerator's `gpu-core-count` property does, on every Apple
-//! Silicon GPU.
+//! Silicon GPU. And the system memory the GPU driver has allocated for every
+//! process together (its `PerformanceStatistics`' `Alloc system memory`),
+//! which the working set Metal recommends is shared with.
 #![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_void};
@@ -10,6 +12,7 @@ type IoObject = u32;
 
 const UTF8: u32 = 0x0800_0100;
 const SINT32: isize = 3;
+const SINT64: isize = 4;
 
 #[link(name = "IOKit", kind = "framework")]
 unsafe extern "C" {
@@ -40,6 +43,8 @@ unsafe extern "C" {
     fn CFGetTypeID(cf: CfTypeRef) -> usize;
     fn CFNumberGetValue(number: CfTypeRef, kind: isize, out: *mut c_void) -> bool;
     fn CFRelease(cf: CfTypeRef);
+    fn CFDictionaryGetTypeID() -> usize;
+    fn CFDictionaryGetValue(dict: CfTypeRef, key: CfTypeRef) -> CfTypeRef;
 }
 
 /// The GPU core count of the first AGX accelerator, or `None` when the
@@ -80,6 +85,62 @@ pub(crate) fn gpu_cores() -> Option<u32> {
         }
         if !key.is_null() {
             CFRelease(key);
+        }
+        IOObjectRelease(iterator);
+        found
+    }
+}
+
+/// The system memory the AGX driver has allocated for every process on the
+/// GPU, in bytes (`PerformanceStatistics`' `Alloc system memory`), or
+/// `None` when the registry does not say.
+pub(crate) fn gpu_system_allocated() -> Option<u64> {
+    // SAFETY: as in `gpu_cores`; the statistics dictionary and every key
+    // created here are released here, and the value read from the
+    // dictionary is borrowed from it (Get rule), not released.
+    unsafe {
+        let matching = IOServiceMatching(c"AGXAccelerator".as_ptr());
+        if matching.is_null() {
+            return None;
+        }
+        let mut iterator: IoObject = 0;
+        if IOServiceGetMatchingServices(0, matching, &raw mut iterator) != 0 {
+            return None;
+        }
+        let stats_key =
+            CFStringCreateWithCString(std::ptr::null(), c"PerformanceStatistics".as_ptr(), UTF8);
+        let alloc_key =
+            CFStringCreateWithCString(std::ptr::null(), c"Alloc system memory".as_ptr(), UTF8);
+        let mut found = None;
+        loop {
+            let service = IOIteratorNext(iterator);
+            if service == 0 {
+                break;
+            }
+            let stats = IORegistryEntryCreateCFProperty(service, stats_key, std::ptr::null(), 0);
+            IOObjectRelease(service);
+            if stats.is_null() {
+                continue;
+            }
+            if CFGetTypeID(stats) == CFDictionaryGetTypeID() {
+                let value = CFDictionaryGetValue(stats, alloc_key);
+                let mut bytes: i64 = 0;
+                if !value.is_null()
+                    && CFGetTypeID(value) == CFNumberGetTypeID()
+                    && CFNumberGetValue(value, SINT64, (&raw mut bytes).cast())
+                {
+                    found = u64::try_from(bytes).ok();
+                }
+            }
+            CFRelease(stats);
+            if found.is_some() {
+                break;
+            }
+        }
+        for key in [stats_key, alloc_key] {
+            if !key.is_null() {
+                CFRelease(key);
+            }
         }
         IOObjectRelease(iterator);
         found

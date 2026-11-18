@@ -1119,7 +1119,9 @@ impl SchedulerHandle {
         match &*answered {
             Some(Ok(id)) => Ok(*id),
             Some(Err(why)) => Err(anyhow!("{why}")),
-            None => Err(anyhow!("program 0x{hash:016x}: its registration ended unanswered")),
+            None => Err(anyhow!(
+                "program 0x{hash:016x}: its registration ended unanswered"
+            )),
         }
     }
 
@@ -1318,8 +1320,23 @@ impl SchedulerHandle {
             .await
             .map_err(|why| why.to_string())
         };
+        // However the bind ends, the pool no longer counts its need.
+        let leave = move || {
+            if let Some(roles) =
+                crate::store::registry::try_get(0, engine).and_then(|stores| stores.roles)
+            {
+                roles.lock().unwrap().leave_guest_wait(pid);
+            }
+        };
+        // Waiting at the bind for room, the process is a victim the
+        // planner may park for an older head, as an idle one is.
+        let waiting = move |waits: bool| {
+            if let Some(planner) = crate::planner::planner_of(pid) {
+                planner.set_bind_waiting(pid, waits);
+            }
+        };
         let (registered, _, bound) = crate::store::roles::bind_when_resident(
-            pid, lane_bind, resident, grown, room, fits, suspend, planned,
+            pid, lane_bind, resident, grown, room, fits, suspend, planned, leave, waiting,
         )
         .await?;
         Ok((registered, bound))
@@ -3807,7 +3824,10 @@ mod tests {
     /// of `instances`; and the fires' completions.
     fn step_of(
         instances: &[u64],
-    ) -> (crate::engine::FrameFire, Vec<crate::engine::WorkItemCompletion>) {
+    ) -> (
+        crate::engine::FrameFire,
+        Vec<crate::engine::WorkItemCompletion>,
+    ) {
         let lanes = u32::try_from(instances.len()).expect("a few lanes");
         let completions: Vec<_> = (0..lanes)
             .map(|_| crate::engine::WorkItemCompletion::deferred_with_guard(None))
@@ -3845,7 +3865,10 @@ mod tests {
         lane: &Lane,
         fire: crate::engine::FrameFire,
         completions: &[crate::engine::WorkItemCompletion],
-    ) -> (std::result::Result<(), String>, Vec<std::result::Result<(), String>>) {
+    ) -> (
+        std::result::Result<(), String>,
+        Vec<std::result::Result<(), String>>,
+    ) {
         let answer = within("the launch is answered", lane.fire(fire, false))
             .expect("the launch is answered");
         let answer = match answer {
@@ -3899,7 +3922,10 @@ mod tests {
         let (fire, completions) = step_of(&[100, 101, 103]);
         let (frame, fires) = fire_and_settle(&lane, fire, &completions);
         assert_eq!(frame, Ok(()));
-        assert!(fires.iter().all(Result::is_ok), "the three fire on: {fires:?}");
+        assert!(
+            fires.iter().all(Result::is_ok),
+            "the three fire on: {fires:?}"
+        );
         let _ = lane.shutdown();
     }
 
@@ -4072,13 +4098,15 @@ mod tests {
         let ids = crate::rt::block_on(async {
             let binds = (0..8).map(|_| {
                 let registered = Arc::clone(&registered);
-                handle.program_id_with(ProcessId::default(), registration(0xd0d0), |_, _| {
-                    async move {
+                handle.program_id_with(
+                    ProcessId::default(),
+                    registration(0xd0d0),
+                    |_, _| async move {
                         registered.fetch_add(1, Ordering::SeqCst);
                         tokio::time::sleep(Duration::from_millis(50)).await;
                         Ok(::engine::ProgramId(7))
-                    }
-                })
+                    },
+                )
             });
             futures::future::join_all(binds).await
         });
@@ -4094,13 +4122,15 @@ mod tests {
         assert_eq!(again.expect("found"), ::engine::ProgramId(7));
         let mut colliding = registration(0xd0d0);
         colliding.launch.plans.push(Default::default());
-        let collided = crate::rt::block_on(handle.program_id_with(
-            ProcessId::default(),
-            colliding,
-            |_, _| never_registers(),
-        ));
+        let collided =
+            crate::rt::block_on(
+                handle.program_id_with(ProcessId::default(), colliding, |_, _| never_registers()),
+            );
         assert!(
-            collided.expect_err("refused").to_string().contains("collision"),
+            collided
+                .expect_err("refused")
+                .to_string()
+                .contains("collision"),
             "a hash collision is refused by name"
         );
     }
@@ -4113,13 +4143,15 @@ mod tests {
         let finished = Arc::new(AtomicBool::new(false));
         let done = Arc::clone(&finished);
         crate::rt::block_on(async {
-            let bind = handle.program_id_with(ProcessId::default(), registration(0xc0c0), |_, _| {
-                async move {
+            let bind = handle.program_id_with(
+                ProcessId::default(),
+                registration(0xc0c0),
+                |_, _| async move {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     done.store(true, Ordering::SeqCst);
                     Ok(::engine::ProgramId(9))
-                }
-            });
+                },
+            );
             assert!(
                 crate::rt::time::timeout(Duration::from_millis(10), bind)
                     .await
@@ -4155,7 +4187,12 @@ mod tests {
             assert!(why.contains("0x000000000000bad1"), "by name: {why}");
         }
         assert!(
-            !handle.inner.program_ids.lock().unwrap().contains_key(&0xbad1),
+            !handle
+                .inner
+                .program_ids
+                .lock()
+                .unwrap()
+                .contains_key(&0xbad1),
             "no entry is left"
         );
         let retried = crate::rt::block_on(handle.program_id_with(
