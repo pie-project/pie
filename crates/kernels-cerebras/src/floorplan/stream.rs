@@ -372,7 +372,26 @@ impl Stream {
             x += a.cols + 1;
             w = w.max(x);
         }
-        let h = y + band;
+        // (the fabric ends where its last band's blocks do: a band of units holding no K / V
+        // columns, a decode program's exit, keeps none of the band's K / V rows. Idle rows cost
+        // the chip: 1560's 28-layer decode at 898 rows, 191 of them idle, 2.7-3.2M cycles a
+        // step; the same tiles and routes at 707, 1.44-1.47M)
+        let kv_rows = band - (py + 2);
+        let holds_kv = |u: usize| requests.joint && blocks.iter().any(|b| b.first() == Some(&u));
+        let h = (0..units.len())
+            .map(|u| {
+                units[u].y
+                    + py
+                    + 2
+                    + if holds_kv(u) {
+                        kv_rows
+                    } else {
+                        asks[u].helpers.min(kv_rows)
+                    }
+            })
+            .max()
+            .unwrap_or(0)
+            .max(y + py + 2);
         // (at `sub > 1` the helpers stay above the K / V roots' row)
         let room = if sub > 1 { py + 2 + turns } else { band };
         if let Some(a) = asks.iter().find(|a| py + 2 + a.helpers > room) {
@@ -740,6 +759,42 @@ mod tests {
             lanes: (false, false),
             helpers: 0,
         }
+    }
+
+    /// The fabric ends where its blocks do: a last band of units that hold no K / V columns (a
+    /// decode program's exit) keeps none of the band's K / V rows (1560: Qwen3-0.6B's 28-layer
+    /// decode with 191 such rows idle, 2.7-3.2M cycles a step; cut, the same tiles and routes,
+    /// 1.44-1.47M).
+    #[test]
+    fn a_band_without_k_v_columns_keeps_no_k_v_rows() {
+        let mut asks: Vec<UnitAsk> = (0..4).map(|u| ask(&format!("u{u}"), 9, 2)).collect();
+        asks[3].heads = 0;
+        let blocks = vec![vec![0], vec![1], vec![2]];
+        let requests = Requests {
+            stream: true,
+            joint: true,
+            ..Requests::default()
+        };
+        let (py, pya) = (4, 7);
+        let s = Stream::of(
+            &requests,
+            py,
+            &asks,
+            &blocks,
+            2,
+            pya,
+            1,
+            Bounds { w: 32, h: 60 },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let exit = &s.units[3];
+        assert!(exit.y > 0, "the exit opens a second band");
+        assert_eq!(s.h, exit.y + py + 2);
+        // (the first band keeps its K / V rows; its wiring lays inside the cut fabric)
+        assert!(s.kv.iter().all(|k| k.units[0] < 3));
+        let mut floor = s.floor();
+        let mut wiring = s.wiring();
+        crate::place::route::fill_layout(&mut floor, &mut wiring).unwrap_or_else(|e| panic!("{e}"));
     }
 
     /// The lane bus reaches every root that reads a lane vector, in every band: the first unit

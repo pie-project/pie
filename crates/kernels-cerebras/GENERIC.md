@@ -3739,7 +3739,7 @@ flux2-mini's denoise has few, so its K / V placement hardly matters. That makes 
 worth turning on by default for decode-unit programs once the decode path runs on the chip;
 for stream readings it barely changes the step.
 
-### P1.d: the decode units' price gap (1556, open)
+### P1.d: the decode units' price gap (1556, 1560)
 
 1556 ran Qwen3-0.6B's decode through units on the CS-3, compiled on load, stamps on, every run
 token-exact (16 / 16 against the golden):
@@ -3785,6 +3785,54 @@ Request p2kv (`flux2f/req/p2/p2kv.json`) separates the suspects. It runs six pre
 At 2.08 cycles a hop the term predicts `d4` = on + 7k, `d16` = on + 30k, `off707` = on + 11k.
 The stamps give each PE's start: whether a launch reaches the fabric's PEs at once, or a
 program's idle area delays its start.
+
+**1560 (p2kv).** Six links rc 0. Steps 1-5 a step (cycles); each run held the golden (2 / 2):
+
+| program | PEs | first unit done | a layer | last layer to the step's end | step |
+|---|---|---|---|---|---|
+| off | 700 x 898 | 493k | 48.70k | 1.40M | 2.73-3.21M |
+| off707 | 700 x 707 | 83k | 48.70k | 44k | 1.44-1.47M |
+| on | 700 x 707 | 393k | 48.99k | 517k | 1.72-2.23M |
+| d4 | 700 x 707 | 159k | 49.05k | 44k | 1.50-1.54M |
+| d16 | 700 x 707 | | | | hung at its first launch (killed at 1,500 s) |
+| qfix | 576 x 538 | 109k | 59.7k | ~13k | 1.70-1.74M |
+
+(The columns are step 5's stamps, `tscdecode.py`: unit k's CX roots end at the first unit's end
+plus k layers; the exit unit, the head, follows the last layer.)
+
+- **Every PE starts within a cycle of the others**, in every program. A launch reaches the
+  whole fabric at once, so the idle rows do not delay a start.
+- **The idle rows are the whole of 1556's difference.** off and off707 have the same tiles and
+  routes; the only difference is the 191 filler rows. off707 runs at the annealed program's
+  speed. The time goes at the two ends of the step, both units at the fabric's west edge
+  (x 0): the first layer finishes 410k later, and the exit unit's CX roots finish over a
+  0.6M-cycle staircase, 32 rows at a time, 1.4M after the last layer. Each step's host writes
+  (the entries, every K / V column's row and position words: hundreds of copies) return
+  before they land. The step that follows waits on them at its west-edge units, and a taller
+  fabric waits longer. The 707-row programs show the same ends, smaller and varying from run
+  to run: on's step 5 has 393k at the front and 517k at the end, while 1556's on ran at
+  1.42-1.50M.
+- **The K / V placement and hops cost nothing measurable.** A layer takes 48.70k cycles in
+  off707 (a 16-hop staircase), 48.99k in on (1-3 hops) and 49.05k in d4 (5-7 hops). Run to
+  run noise is about 300 cycles a layer. A layer's 16 heads trip in parallel, so the term's
+  sum over heads (16 x 8 hops x 2.08 = +266 a layer for d4) overstates even the noise. The
+  annealer's 1556 win was its height (it re-derives the fabric from its blocks), not its links.
+- **The floorplan now ends the fabric at its blocks** (`Stream::of`: a band of units that hold
+  no K / V columns keeps none of the band's K / V rows). The search's 28-layer program is
+  off707 byte for byte, measured at 1.44-1.47M with its own placement, so the search alone
+  finds the fast layout. The annealed program is unchanged; the decode templates are
+  untouched.
+- **The query over the cache mis-ranks on its own.** qfix, the pick once the price reads 48
+  entries a PE, is the slower program on the chip: 59.7k cycles a layer against 48.7k. Its
+  sub-2 GQA columns trade a shorter column for twice the q heads a PE. So that patch is not
+  committed. Every measured program prices a layer at about a quarter of its cost: 48.7k against
+  13.3k priced (a 3.7x level the search's choices do not read, since every candidate shares
+  it), and qfix's 59.7k against ~20k. Ranking the two shapes right needs the attention's
+  actual terms (the column's chains, its multicast, the passes), measured by a per-op stamp
+  inside one layer, not one factor.
+- **d16 hung.** It routes, colours and checks clean, but some K / V PEs reach rows 450-451,
+  beside the exit unit's band (its first row is 450). That is a check gap, a shape the
+  annealer has not produced (its 28-layer program ran in 1556 and 1560).
 ### The line windows (check::hazard::lines)
 
 A **line** is a set of colours a PE takes on one input queue that its code rebinds between:

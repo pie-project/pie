@@ -66,7 +66,9 @@ impl Anneal {
 
 /// A decode-unit program's moves a block by default ([`Anneal::unit`]): 1556's A/B on the
 /// CS-3 (Qwen3-0.6B, 28 layers: 954,000 moves in 11.9 s, the step 2.95M -> 1.45M cycles, every
-/// token the golden's).
+/// token the golden's). 1560 put that win on the fabric's height, which the floorplan now cuts
+/// itself; the K / V placement measured within noise (GENERIC.md, "the decode units' price
+/// gap").
 pub const UNIT_PER_BLOCK: u64 = 2000;
 
 /// The penalty a PE of overlap or past the fabric (cycles).
