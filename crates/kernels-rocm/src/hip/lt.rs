@@ -302,6 +302,31 @@ impl Plan {
     }
 }
 
+/// The waves the heuristic's first algorithm for `s` fills on the current
+/// device, as hipBLASLt states them for it (`wavesCount`: its workgroups
+/// over those the device holds at once of its kernel), planning the shape
+/// as a launch of it would. `None` where hipBLASLt offers no algorithm, or
+/// states no waves.
+pub fn waves(s: Shape) -> Result<Option<f64>, Refused> {
+    const CALL: &str = "hipblasLtMatmulAlgoGetHeuristic";
+    let lt = library(CALL)?;
+    let mut devices = registry().lock().expect("lock poisoned");
+    let dev = device_of(lt, &mut devices)?;
+    let handle = dev.handle;
+    let plan = match dev.plans.get(&s) {
+        Some(plan) => plan,
+        None => {
+            let plan = Plan::build(lt, handle, s)?;
+            crate::tally::built();
+            dev.plans.entry(s).or_insert(plan)
+        }
+    };
+    Ok(plan
+        .as_ref()
+        .map(|plan| f64::from(plan.algo.waves))
+        .filter(|&w| w.is_finite() && w > 0.0))
+}
+
 /// Enqueues `y = x · wᵀ (+ bias)` on `stream`. `Ok(false)` when hipBLASLt
 /// offers no algorithm for the shape, which the caller then runs on
 /// rocBLAS; a hipBLASLt that did not load is refused.
