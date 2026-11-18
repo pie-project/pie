@@ -545,6 +545,7 @@ impl Engine for Metal {
                     runahead: engine::runahead::Runahead::of(frames_in_flight),
                     residency: experts::Plan::default(),
                     profiles: self.boot.profiles.clone(),
+                    top: crate::Top::Ruled,
                 })
                 .map_err(fault)?;
                 let narrower = (budgets.max_tokens / 2).max(MIN_FITTED_FORWARD_TOKENS);

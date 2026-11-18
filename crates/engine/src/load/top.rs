@@ -629,6 +629,7 @@ mod tests {
             hbm_gbps: Some(100.0),
             elementwise_gbps: Some(50.0),
             scan_gelems: None,
+            ..profile::fire::Rates::default()
         }
     }
 
