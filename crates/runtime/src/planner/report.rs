@@ -150,7 +150,7 @@ impl ResidencyPlanner {
             debug_assert_eq!(proc.state, Residency::Restoring);
             proc.state = Residency::Resident;
             proc.progressed = false;
-            proc.roles_short = false;
+            proc.roles_short = None;
             // Back with room for it: the bind goes again.
             proc.bind_room = None;
             Some(proc.signal.clone())
@@ -202,13 +202,19 @@ impl ResidencyPlanner {
     /// a budget holds: it is queued again, a waiter like any admission, and
     /// served once a completion frees room or an eviction makes it
     /// ([`super::proc::Proc::roles_short`]). No failure.
-    pub(super) fn requeue_restore_roles(self: &Arc<Self>, pid: ProcessId) {
+    /// `need` is the runs of whole chunks its unpark is short.
+    pub(super) fn requeue_restore_roles(self: &Arc<Self>, pid: ProcessId, need: (u32, u32)) {
+        let pages = self.port.chunks_as_pages(need.0.saturating_mul(need.1));
         self.stats
             .restore_roles_short
             .fetch_add(1, Ordering::Relaxed);
         self.with_inner(|inner| {
             if let Some(proc) = inner.procs.get_mut(&pid) {
-                proc.roles_short = true;
+                proc.roles_short = Some(super::proc::PendingBind {
+                    run: need.0,
+                    pieces: need.1,
+                    pages,
+                });
             }
         });
         self.requeue_restore(pid);

@@ -219,9 +219,20 @@ impl ResidencyPlanner {
         // of adjacent chunks): pages moved anywhere free none of them, so
         // the occupants of the cheapest chunks it could take, each free or
         // emptied whole by evicting them, are the picks, every one of them.
-        let shape = self.with_inner(|inner| match inner.queue.get(&victims.head).map(|w| &w.kind) {
-            Some(WaitKind::BindRoom { run, pieces, .. }) => Some((*run, *pieces)),
-            _ => None,
+        // So is a restore whose role slots are short of runs of chunks
+        // ([`super::proc::Proc::roles_short`]): its unpark retakes its dead
+        // parts fresh, in their class.
+        let shape = self.with_inner(|inner| match inner.queue.get(&victims.head) {
+            Some(waiter) => match &waiter.kind {
+                WaitKind::BindRoom { run, pieces, .. } => Some((*run, *pieces)),
+                WaitKind::Restore { .. } => inner
+                    .procs
+                    .get(&waiter.pid)
+                    .and_then(|proc| proc.roles_short)
+                    .map(|need| (need.run, need.pieces)),
+                WaitKind::Allocation { .. } => None,
+            },
+            None => None,
         });
         let candidates = victims.preferred();
         let map = shape.map(|_| {
