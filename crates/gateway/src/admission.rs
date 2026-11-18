@@ -2,7 +2,6 @@ use controller_api::{Health, RoutingTable};
 
 #[derive(Debug, Clone, Copy)]
 pub struct AdmissionConfig {
-    pub kv_saturate_bucket: u8,
     pub max_inflight_per_worker: u32,
     pub max_queued_launches: usize,
 }
@@ -10,7 +9,6 @@ pub struct AdmissionConfig {
 impl Default for AdmissionConfig {
     fn default() -> Self {
         Self {
-            kv_saturate_bucket: 240,
             max_inflight_per_worker: 1024,
             max_queued_launches: 4096,
         }
@@ -53,9 +51,10 @@ pub fn admit(table: &RoutingTable, cfg: &AdmissionConfig) -> AdmissionDecision {
     if healthy.peek().is_none() {
         return AdmissionDecision::Reject(RejectReason::NoHealthyWorker);
     }
+    // Saturated is the worker's own admission saying a launch would wait
+    // there, not a share of its tiers: idle cache is room it reclaims.
     if healthy.any(|w| {
-        w.coarse_load.kv_pressure_bucket < cfg.kv_saturate_bucket
-            && w.coarse_load.inflight < cfg.max_inflight_per_worker
+        !w.coarse_load.saturated && w.coarse_load.inflight < cfg.max_inflight_per_worker
     }) {
         AdmissionDecision::Admit
     } else {

@@ -1741,6 +1741,7 @@ mod tests {
                     capacity_tokens: 1000,
                     used_tokens: 250,
                     draining: false,
+                    saturated: false,
                 },
             }],
         }

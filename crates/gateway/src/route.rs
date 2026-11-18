@@ -296,7 +296,13 @@ mod tests {
     use std::sync::Mutex;
     use worker_api::Priority;
 
-    fn worker(id: u64, model: &str, health: Health, kv: u8, inflight: u32) -> RoutableWorker {
+    fn worker(
+        id: u64,
+        model: &str,
+        health: Health,
+        saturated: bool,
+        inflight: u32,
+    ) -> RoutableWorker {
         RoutableWorker {
             id: WorkerId(id),
             addr: format!("10.0.0.{id}:7000"),
@@ -305,8 +311,8 @@ mod tests {
             engine: String::new(),
             health,
             coarse_load: WorkerStatus {
-                kv_pressure_bucket: kv,
                 inflight,
+                saturated,
                 ..WorkerStatus::default()
             },
         }
@@ -339,10 +345,10 @@ mod tests {
 
     fn filters_unhealthy_disconnected_and_model() {
         let t = table(vec![
-            worker(1, "m", Health::Unreachable, 0, 0), // unhealthy
-            worker(2, "m", Health::Healthy, 0, 0),     // not connected
-            worker(3, "other", Health::Healthy, 0, 0), // wrong model
-            worker(4, "m", Health::Healthy, 0, 0),     // ✓ only eligible
+            worker(1, "m", Health::Unreachable, false, 0), // unhealthy
+            worker(2, "m", Health::Healthy, false, 0),     // not connected
+            worker(3, "other", Health::Healthy, false, 0), // wrong model
+            worker(4, "m", Health::Healthy, false, 0),     // ✓ only eligible
         ]);
         let conn = connset(&[1, 3, 4]);
         let mut rng = scripted(vec![]);
@@ -353,11 +359,11 @@ mod tests {
     }
 
     fn filters_executor_roles() {
-        let mut prefill = worker(1, "m", Health::Healthy, 0, 0);
+        let mut prefill = worker(1, "m", Health::Healthy, false, 0);
         prefill.role = Role::Prefill;
-        let mut encode = worker(2, "m", Health::Healthy, 0, 0);
+        let mut encode = worker(2, "m", Health::Healthy, false, 0);
         encode.role = Role::Encode;
-        let decode = worker(3, "m", Health::Healthy, 0, 0);
+        let decode = worker(3, "m", Health::Healthy, false, 0);
         let t = table(vec![prefill, encode, decode]);
         let conn = connset(&[1, 2, 3]);
         let mut rng = scripted(vec![]);
@@ -368,7 +374,7 @@ mod tests {
     }
 
     fn empty_when_nothing_eligible() {
-        let t = table(vec![worker(1, "m", Health::Unreachable, 0, 0)]);
+        let t = table(vec![worker(1, "m", Health::Unreachable, false, 0)]);
         let conn = connset(&[1]);
         let mut rng = scripted(vec![]);
         assert!(select_candidates(&t, &conn, Some("m"), Some(1), &mut rng).is_empty());
@@ -417,9 +423,9 @@ mod tests {
 
     #[test]
     fn process_control_survives_resource_saturation_but_launches_do_not() {
-        for (kv, inflight) in [(255, 0), (0, 1024)] {
+        for (saturated, inflight) in [(true, 0), (false, 1024)] {
             let h = handle_with(
-                table(vec![worker(1, "m", Health::Healthy, kv, inflight)]),
+                table(vec![worker(1, "m", Health::Healthy, saturated, inflight)]),
                 &[1],
             );
             let mut request = req();
@@ -456,9 +462,52 @@ mod tests {
         }
     }
 
+    /// The A6000 wedge: a worker whose tiers are full of idle cache (a
+    /// pressure bucket at its top) is not saturated, and admits; one at
+    /// its true capacity holds the launch until a working set frees, then
+    /// admits it.
+    #[tokio::test]
+    async fn a_worker_full_of_idle_cache_admits_and_one_at_capacity_holds_until_room_frees() {
+        let mut idle_full = worker(1, "m", Health::Healthy, false, 0);
+        idle_full.coarse_load.kv_pressure_bucket = u8::MAX;
+        let h = handle_with(table(vec![idle_full.clone()]), &[1]);
+        let mut launch = req();
+        launch.message = ClientMessage::LaunchProcess {
+            corr_id: 1,
+            inferlet: "chat".into(),
+            input: String::new(),
+            capture_outputs: false,
+            props: Default::default(),
+            session: None,
+            files: Default::default(),
+            handles: Default::default(),
+            returns: Default::default(),
+            cluster_props: Default::default(),
+            executors: Vec::new(),
+        };
+        assert_eq!(h.admit_queued(&launch).await, AdmissionDecision::Admit);
+
+        let mut full = idle_full;
+        full.coarse_load.saturated = true;
+        let (routing, rr) = watch::channel(table(vec![full.clone()]));
+        let (_ct, cr) = watch::channel(Arc::new(connset(&[1])));
+        let h = RoutingHandle::new(rr, cr);
+        let held = tokio::spawn({
+            let (h, launch) = (h.clone(), launch.clone());
+            async move { h.admit_queued(&launch).await }
+        });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!held.is_finished(), "held while the worker is at capacity");
+        full.coarse_load.saturated = false;
+        routing.send_replace(table(vec![full]));
+        assert_eq!(held.await.unwrap(), AdmissionDecision::Admit);
+    }
+
     #[tokio::test]
     async fn saturated_launches_queue_in_order_until_the_pool_frees() {
-        let (routing, rr) = watch::channel(table(vec![worker(1, "m", Health::Healthy, 255, 0)]));
+        let (routing, rr) = watch::channel(table(vec![worker(1, "m", Health::Healthy, true, 0)]));
         let (_ct, cr) = watch::channel(Arc::new(connset(&[1])));
         let h = RoutingHandle::new(rr, cr).with_admission(AdmissionConfig {
             max_queued_launches: 3,
@@ -495,13 +544,13 @@ mod tests {
         );
         waiting.remove(1).abort();
         tokio::task::yield_now().await;
-        routing.send_replace(table(vec![worker(1, "m", Health::Healthy, 0, 0)]));
+        routing.send_replace(table(vec![worker(1, "m", Health::Healthy, false, 0)]));
         for task in waiting {
             assert_eq!(task.await.unwrap(), AdmissionDecision::Admit);
         }
         assert_eq!(*order.lock().unwrap(), vec![0, 2]);
 
-        routing.send_replace(table(vec![worker(1, "m", Health::Unreachable, 0, 0)]));
+        routing.send_replace(table(vec![worker(1, "m", Health::Unreachable, false, 0)]));
         assert_eq!(
             h.admit_queued(&launch).await,
             AdmissionDecision::Reject(RejectReason::NoHealthyWorker)
@@ -511,7 +560,7 @@ mod tests {
     #[tokio::test]
     async fn process_control_still_requires_a_healthy_connected_worker() {
         for (health, connected) in [(Health::Unreachable, vec![1]), (Health::Healthy, vec![])] {
-            let h = handle_with(table(vec![worker(1, "m", health, 255, 256)]), &connected);
+            let h = handle_with(table(vec![worker(1, "m", health, true, 256)]), &connected);
             let reg = StubRegistry {
                 answers: Default::default(),
                 calls: Mutex::new(Vec::new()),
@@ -531,7 +580,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_returns_dispatched_on_first_accept() {
-        let t = table(vec![worker(1, "m", Health::Healthy, 0, 0)]);
+        let t = table(vec![worker(1, "m", Health::Healthy, false, 0)]);
         let h = handle_with(t, &[1]);
         let reg = StubRegistry {
             answers: [(
@@ -560,7 +609,7 @@ mod tests {
     async fn dispatch_advances_past_reject_and_transport_error() {
         let t = table(
             (1..=3)
-                .map(|i| worker(i, "m", Health::Healthy, 10, 0))
+                .map(|i| worker(i, "m", Health::Healthy, false, 0))
                 .collect(),
         );
         let h = handle_with(t, &[1, 2, 3]);
@@ -588,7 +637,7 @@ mod tests {
     async fn a_preferred_worker_goes_first_when_it_is_eligible() {
         let t = table(
             (1..=3)
-                .map(|i| worker(i, "m", Health::Healthy, 10, 0))
+                .map(|i| worker(i, "m", Health::Healthy, false, 0))
                 .collect(),
         );
         let h = handle_with(t, &[1, 2, 3]);
@@ -623,7 +672,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_no_candidate_when_none_connected() {
-        let t = table(vec![worker(1, "m", Health::Healthy, 0, 0)]);
+        let t = table(vec![worker(1, "m", Health::Healthy, false, 0)]);
         let h = handle_with(t, &[]);
         let reg = StubRegistry {
             answers: Default::default(),
@@ -640,7 +689,7 @@ mod tests {
     async fn dispatch_exhausted_when_all_reject() {
         let t = table(
             (1..=2)
-                .map(|i| worker(i, "m", Health::Healthy, 10, 0))
+                .map(|i| worker(i, "m", Health::Healthy, false, 0))
                 .collect(),
         );
         let h = handle_with(t, &[1, 2]);

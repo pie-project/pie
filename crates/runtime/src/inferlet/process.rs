@@ -402,6 +402,21 @@ impl ordered::Room for PlannerRoom {
     fn fits(&self, pid: ProcessId, holders: &[ProcessId]) -> bool {
         crate::planner::planner_of(pid).is_none_or(|planner| planner.admits(pid, holders))
     }
+
+    fn full(&self, holders: &[ProcessId]) -> bool {
+        let planners = crate::planner::planners();
+        !planners.is_empty() && planners.iter().all(|planner| planner.full(holders))
+    }
+}
+
+/// A launch would wait at this worker's admission: what it reports as
+/// saturated, the gateway's rule ([`ordered::OrderedSemaphore::saturated`]).
+/// Idle cache is room: it is reclaimed for the next working set.
+pub fn saturated() -> bool {
+    ADMISSION
+        .get()
+        .and_then(Option::as_ref)
+        .is_some_and(|gate| gate.saturated())
 }
 
 struct AdmissionQueued(ProcessId);
