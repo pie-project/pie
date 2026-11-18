@@ -12,7 +12,7 @@ use crate::store::slots::SlotPool;
 use crate::store::weights::port::EnginePort;
 use crate::store::weights::{SlotAccess, WeightFirst};
 
-use super::{Demand, Growth, PoolTarget, Retarget, Signal};
+use super::{Growth, PoolTarget, Retarget, Signal};
 
 /// Today's pools of one engine, and the slots its weight shapes take; or
 /// the shared pool an engine that states one runs on, the weight shapes'
@@ -112,11 +112,6 @@ impl EnginePool {
 }
 
 impl PoolTarget for EnginePool {
-    fn demand(&mut self) -> Demand {
-        self.target_mut()
-            .map_or(Demand { wanted: 0, live: 0 }, PoolTarget::demand)
-    }
-
     fn segment_bytes(&self) -> u64 {
         self.target().map_or(1, PoolTarget::segment_bytes)
     }
@@ -278,10 +273,6 @@ impl<P: PoolTarget + SlotAccess, W: crate::store::weights::WeightPort> Shared<We
 }
 
 impl<P: PoolTarget> PoolTarget for Shared<P> {
-    fn demand(&mut self) -> Demand {
-        self.0.lock().demand()
-    }
-
     fn segment_bytes(&self) -> u64 {
         self.0.lock().segment_bytes()
     }

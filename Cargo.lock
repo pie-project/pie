@@ -1727,6 +1727,7 @@ name = "engine"
 version = "0.6.0"
 dependencies = [
  "eta-compiler",
+ "libc",
  "pie-eta-ir",
  "pie-poem-ir",
  "pie-profile",

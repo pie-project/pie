@@ -44,7 +44,7 @@ use std::collections::{BTreeMap, HashMap};
 use super::slots::{
     Holder, ShapeId, ShapeKind, Slot, SlotError, SlotPool, SlotPoolFacts, SlotShape,
 };
-use crate::governor::{Demand, Growth, PoolTarget, Retarget};
+use crate::governor::{Growth, PoolTarget, Retarget};
 use ::engine::chunk::{
     ChunkFacts, ResidentWeight, WeightAtom, WeightResidency, WeightShape, WeightUses,
 };
@@ -933,14 +933,6 @@ impl<P: PoolTarget + SlotAccess, W: WeightPort> WeightFirst<P, W> {
 }
 
 impl<P: PoolTarget + SlotAccess, W: WeightPort> PoolTarget for WeightFirst<P, W> {
-    fn demand(&mut self) -> Demand {
-        let demand = self.inner.demand();
-        Demand {
-            wanted: demand.wanted.saturating_add(self.cache.unmet_bytes()),
-            live: demand.live,
-        }
-    }
-
     fn segment_bytes(&self) -> u64 {
         self.inner.segment_bytes()
     }

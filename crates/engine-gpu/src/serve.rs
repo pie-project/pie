@@ -1674,8 +1674,10 @@ impl<B: Serve> Shell<B> {
         )?;
         let expert_caches =
             crate::store::experts::ExpertCaches::new(&device, expert_shapes, chunk)?;
-        // The null chunk's segment and the span's stand from the load on.
-        pools.commit_segments(&device, 1)?;
+        // The null chunk's segment and the span's stand from the load on;
+        // a pool laid whole stands whole.
+        let segments = pools.load_segments();
+        pools.commit_segments(&device, segments)?;
         {
             let (buffer, end): (&B::Buffer, u64) =
                 pools.span_place().ok_or_else(|| Fault::Unbound {
