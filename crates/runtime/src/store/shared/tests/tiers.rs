@@ -228,7 +228,7 @@ fn host_cache_goes_on_down_to_disk_and_a_restart_brings_it_back_bitwise() {
     kv.retire_idle();
     bytes.clobber_device();
     assert_eq!(kv.persisted_pages(), 0);
-    assert_eq!(kv.host_cache_pages(), 3);
+    assert_eq!(kv.below_device_cache_pages(), (3, 0));
 
     // The host is short: it goes on down to disk.
     let txn = kv.prepare_spill(1, |_| 1).expect("a spill");
@@ -258,6 +258,11 @@ fn host_cache_goes_on_down_to_disk_and_a_restart_brings_it_back_bitwise() {
         "the host refs are back"
     );
     assert_eq!(kv.persisted_pages(), 3, "journaled");
+    assert_eq!(
+        kv.below_device_cache_pages(),
+        (0, 3),
+        "idle cache on disk is room the pressure report counts"
+    );
     drop(kv);
     drop(shared);
     // A restart: the device and the host are gone; the slot file stays.

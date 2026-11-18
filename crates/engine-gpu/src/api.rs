@@ -616,6 +616,10 @@ where
         self.caps.as_ref().map(|caps| &caps.device)
     }
 
+    fn host_room(&self) -> Option<engine::HostRoom> {
+        crate::backend::Context::host_room(self.shell.as_ref()?.device())
+    }
+
     fn live(&self) -> engine::live::Live {
         self.live.clone()
     }
@@ -836,6 +840,13 @@ where
                 .iter()
                 .filter_map(|value| Some((value.output.as_deref()?, value.lane))),
         ))
+    }
+
+    /// Every registration: a ring the device keeps in its `Channel` slots
+    /// or on the host.
+    fn holds_channel(&self, registration: &ChannelRegistration) -> bool {
+        let _ = registration;
+        true
     }
 
     fn ring_facts(

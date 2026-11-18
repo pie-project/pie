@@ -55,6 +55,20 @@ pub struct Boot<'a> {
     /// `$PIE_HOME/profiles`, where a user's device profiles live; `None`
     /// reads only the checked-in ones.
     pub profiles: Option<std::path::PathBuf>,
+    /// How the top rung is chosen.
+    pub top: Top,
+}
+
+/// How a load chooses the top rung of its fires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Top {
+    /// The ruling (`engine::load::top_rung`) over the estimate from the
+    /// device's measured rates: every served load.
+    #[default]
+    Ruled,
+    /// Every rung one buffer holds, up to the requested fire size: what a
+    /// caller timing each rung lays.
+    EveryRung,
 }
 
 const PATCH_ROUTE_DROP: i32 = -1;
@@ -261,6 +275,9 @@ pub struct Attached {
 }
 
 pub struct Shell {
+    /// What the load weighed its rungs by, where its profile states rates:
+    /// the rungs, the estimate and the live range (`--check-estimate`).
+    weighed: Option<crate::top::Weighed>,
     /// The load's pipeline walk is running ([`Shell::warm_pipelines`]): a
     /// seat-addressed fire backs only what the walk backed for it.
     warming: bool,
@@ -576,6 +593,13 @@ impl Shell {
         let (chip, chip_report) =
             crate::chip::resolve(device.name(), &measured, boot.profiles.as_deref());
         crate::chip::tell_untuned(device.name(), &chip_report);
+        // A device whose profile lacks the roofline's constants measures
+        // them here, before ready, and keeps them in the user's profile.
+        let chip = crate::rates::at_load(&device, chip, &measured, boot.profiles.as_deref(), None)
+            .map_err(|why| Fault::Device {
+                call: "rates at load",
+                why,
+            })?;
         if chip
             .ladder::<kernels_metal::tuning::Qmm>()
             .values()
@@ -634,8 +658,21 @@ impl Shell {
             keepalive,
             budgets,
             compiled,
+            profile,
+            placed: None,
+            ruled: None,
         })
     }
+}
+
+/// What a load placed before its top rung is ruled, which a load narrowed
+/// to the ruled top keeps: the weights do not depend on the fire's size.
+struct Placed {
+    handles: Handles,
+    weights: Weights,
+    ane: Option<crate::ane::Ane>,
+    recipe: poem_compiler::chunk::ChunkRecipe,
+    weight_caches: Vec<crate::store::streamed::Cache>,
 }
 
 /// A load compiled and not yet placed; [`PreparedLoad::load`] places it.
@@ -649,6 +686,12 @@ pub struct PreparedLoad<'a> {
     keepalive: Option<crate::keepalive::KeepAlive>,
     budgets: Budgets,
     compiled: CompiledModel,
+    /// What the axes are compiled under, so a load narrowed to its ruled
+    /// top compiles them again.
+    profile: DeviceProfile,
+    placed: Option<Placed>,
+    /// The top rung the ruling picked, once this load is laid at it.
+    ruled: Option<engine::load::TopRung>,
 }
 
 impl PreparedLoad<'_> {
@@ -672,9 +715,13 @@ impl PreparedLoad<'_> {
             tuning,
             outside,
             keepalive,
-            budgets,
+            mut budgets,
             compiled,
+            profile,
+            placed,
+            ruled,
         } = self;
+        let mut boot = boot;
 
         let facts = kv::probe(&boot.trace)?;
         crate::window::no_schedule_straddles_its_readers(&boot.trace, &compiled)?;
@@ -766,53 +813,73 @@ impl PreparedLoad<'_> {
             }
         }
 
-        let handles = Handles::new();
-        let mut weights = Weights::resident(
-            &device,
-            &handles,
-            &boot.trace,
-            boot.contract,
-            boot.checkpoint,
-            &boot.residency,
-        )?;
-        weights.decode_absorbed(&device, &handles, &boot.trace)?;
-        weights.relabel_conv_weights(&device, &handles, &boot.trace)?;
-        weights.repack_mpp(
-            &device,
-            &handles,
-            &boot.trace,
-            *chip.get::<crate::chip::WeightsLayout>(),
-        )?;
-        let ane = crate::ane::load(&device, &handles, &boot.trace, &weights, &chip).unwrap_or_else(
-            |why| {
-                eprintln!("the Neural Engine stays out of this load: {why}");
-                None
-            },
-        );
-        // The compiler's on-device Metal recipe is the one layout source: the
-        // chunk, the list slot (its tokens are the kv page size), where
-        // every fixed row's pieces lie in a record, and the weight slots.
-        let recipe =
-            crate::chunks::recipe_near(&boot.trace, &budgets, boot.residency.chunk_bytes())?;
-        let weight_caches = if boot.residency.whole_weights() {
-            Vec::new()
-        } else {
-            Shell::weight_caches(
-                &device,
-                &handles,
-                &mut weights,
-                &boot.trace,
-                &recipe,
-                boot.residency.rows_streamed(),
-            )?
+        let Placed {
+            handles,
+            mut weights,
+            ane,
+            recipe,
+            weight_caches,
+        } = match placed {
+            Some(placed) => placed,
+            None => {
+                let handles = Handles::new();
+                let mut weights = Weights::resident(
+                    &device,
+                    &handles,
+                    &boot.trace,
+                    boot.contract,
+                    boot.checkpoint,
+                    &boot.residency,
+                )?;
+                weights.decode_absorbed(&device, &handles, &boot.trace)?;
+                weights.relabel_conv_weights(&device, &handles, &boot.trace)?;
+                weights.repack_mpp(
+                    &device,
+                    &handles,
+                    &boot.trace,
+                    *chip.get::<crate::chip::WeightsLayout>(),
+                )?;
+                let ane = crate::ane::load(&device, &handles, &boot.trace, &weights, &chip)
+                    .unwrap_or_else(|why| {
+                        eprintln!("the Neural Engine stays out of this load: {why}");
+                        None
+                    });
+                // The compiler's on-device Metal recipe is the one layout source: the
+                // chunk, the list slot (its tokens are the kv page size), where
+                // every fixed row's pieces lie in a record, and the weight slots.
+                let recipe = crate::chunks::recipe_near(
+                    &boot.trace,
+                    &budgets,
+                    boot.residency.chunk_bytes(),
+                )?;
+                let weight_caches = if boot.residency.whole_weights() {
+                    Vec::new()
+                } else {
+                    Shell::weight_caches(
+                        &device,
+                        &handles,
+                        &mut weights,
+                        &boot.trace,
+                        &recipe,
+                        boot.residency.rows_streamed(),
+                    )?
+                };
+                // A weight kept apart that no cache takes is read whole, in place.
+                let claimed: std::collections::BTreeSet<usize> = weight_caches
+                    .iter()
+                    .flat_map(|cache| cache.shape.planes.iter().map(|plane| plane.param))
+                    .collect();
+                weights.open_unclaimed(&device, &handles, &claimed)?;
+                handles.seal();
+                Placed {
+                    handles,
+                    weights,
+                    ane,
+                    recipe,
+                    weight_caches,
+                }
+            }
         };
-        // A weight kept apart that no cache takes is read whole, in place.
-        let claimed: std::collections::BTreeSet<usize> = weight_caches
-            .iter()
-            .flat_map(|cache| cache.shape.planes.iter().map(|plane| plane.param))
-            .collect();
-        weights.open_unclaimed(&device, &handles, &claimed)?;
-        handles.seal();
 
         // The kv pool and the recurrent-state buffers beside it: both are
         // wired for the life of the load, in what the device's measured
@@ -1134,6 +1201,123 @@ impl PreparedLoad<'_> {
             arms as u64,
             rows.chunk_bytes,
         );
+        // The top rung (`crate::top`): of the rungs the requested fire size
+        // offers, the one the ruling picks by the estimate from the device's
+        // rates, over the live range kv and activation share at load. A
+        // rung whose span passes what one buffer binds is no rung of this
+        // device: the span lies in the pool's last buffer. Picked narrower
+        // than asked, the axes are compiled again at it and the load laid
+        // again under them (the rung's own carve, scratch and staged rows),
+        // the weights kept: they do not depend on the fire's size.
+        // What the rungs weigh, the load's own top still to choose: under
+        // `Top::EveryRung` too, for `pie tune --check-estimate`, which times
+        // every rung against it.
+        let weighed = if ruled.is_none() {
+            let counts = match boot.top {
+                Top::Ruled => Some(crate::top::counts(&boot.trace)?),
+                Top::EveryRung => crate::top::counts(&boot.trace).ok(),
+            };
+            counts.map(|counts| {
+                let room = accounting(0).pool.saturating_add(fire_bytes);
+                let live = boot.kv_budget.map_or(room, |budget| budget.min(room));
+                // A recording dispatches each node of the plan's launching
+                // regions once, whatever the rung (the rungs share one plan).
+                let launches = u32::try_from(
+                    compiled
+                        .template()
+                        .iter()
+                        .filter(|region| region.launches())
+                        .map(|region| region.nodes.len())
+                        .sum::<usize>(),
+                )
+                .unwrap_or(u32::MAX);
+                // Every rung of the lattice the load lays is weighed, each as
+                // its check fire shapes it (`RungFacts`); the ruling over them
+                // to the load's context is both the served top and the
+                // model's fire top (`engine::load::fire_top`), so the check's
+                // pick and the served bound are one choice.
+                let candidates: Vec<crate::top::Candidate> = act
+                    .iter()
+                    .map(|&(tokens, chunks)| crate::top::Candidate {
+                        tokens,
+                        chunks,
+                        launches,
+                        padded_rows: kernels_metal::linear::gemm::rows_computed(
+                            &tuning,
+                            tokens,
+                            counts.width,
+                            counts.width,
+                        ),
+                    })
+                    .collect();
+                let rungs = crate::top::rung_facts(
+                    &candidates,
+                    rows.chunk_bytes,
+                    budgets.tokens.max_lanes,
+                    part_chunks,
+                );
+                // The model's fire top, for the check: the same ruling over
+                // the rungs to the context. A device without the rates has no
+                // estimate; its top is the widest rung laid, and a served load
+                // is refused by name below.
+                let fire_top = engine::load::estimate(&counts, &chip.tuned().rates)
+                    .ok()
+                    .and_then(|estimate| {
+                        engine::load::fire_top(&rungs, live, &estimate, boot.context).ok()
+                    })
+                    .map_or_else(
+                        || rungs.iter().map(|r| r.tokens).max().unwrap_or(1),
+                        |top| top.tokens,
+                    );
+                (counts, rungs, live, fire_top)
+            })
+        } else {
+            None
+        };
+        if let Some((counts, rungs, live, _)) = weighed.as_ref().filter(|_| boot.top == Top::Ruled) {
+            let (live, rungs) = (*live, rungs.clone());
+            let pick = crate::top::choose(
+                &rungs,
+                live,
+                boot.context,
+                &chip.tuned().rates,
+                device.name(),
+                &counts,
+            )?;
+            let asked = budgets.tokens.max_tokens;
+            tracing::info!(
+                "{}: {}",
+                device.name(),
+                engine::load::line_of(&pick, pick.tokens, pick.span_bytes, live, chip.tuned())
+            );
+            tracing::debug!(act = ?act, ?pick, live, ?counts, "the rungs the top is chosen of");
+            if pick.tokens < asked {
+                budgets.tokens = crate::top::bounded(&budgets.tokens, pick.tokens);
+                boot.budget = budgets.tokens.clone();
+                let compiled = compile_axes(&boot.trace, &budgets, &profile)?;
+                drop(scratch);
+                return PreparedLoad {
+                    boot,
+                    device,
+                    chip,
+                    tuning,
+                    outside,
+                    keepalive,
+                    budgets,
+                    compiled,
+                    profile,
+                    placed: Some(Placed {
+                        handles,
+                        weights,
+                        ane,
+                        recipe,
+                        weight_caches,
+                    }),
+                    ruled: Some(pick),
+                }
+                .load();
+            }
+        }
         let span = act.last().map_or(0, |&(_, chunks)| chunks);
         // One chunk pool holds every kv page and every record (the rs
         // buffer's rows inside it), in what the room holds of whole chunks,
@@ -1371,7 +1555,19 @@ impl PreparedLoad<'_> {
             arms,
         )?;
         let capture_bytes = capture.as_ref().map_or(0, CaptureLayout::member_bytes);
+        let weighed = weighed.and_then(|(counts, rungs, live, fire_top)| {
+            engine::load::estimate(&counts, &chip.tuned().rates)
+                .ok()
+                .map(|estimate| crate::top::Weighed {
+                    rungs,
+                    estimate,
+                    live,
+                    counts,
+                    fire_top,
+                })
+        });
         let shell = Shell {
+            weighed,
             tuning,
             device,
             outside,
@@ -1482,6 +1678,13 @@ impl Shell {
     #[must_use]
     pub fn pool_chunk_facts(&self) -> engine::chunk::ChunkFacts {
         self.pools.chunk_facts()
+    }
+
+    /// Backs every seat's run, its pages and its record: what a caller
+    /// firing seat-addressed lanes directly asks before it opens a seat,
+    /// with no runtime committing ahead of it.
+    pub fn back_seats(&mut self) -> Result<()> {
+        self.pools.commit_seats(0, 0)
     }
 
     /// The chunk pool's layout.
@@ -2287,6 +2490,11 @@ impl Shell {
     #[must_use]
     pub fn voxel_element(&self) -> Option<Dtype> {
         self.voxel_seat.map(|seat| seat.dtype)
+    }
+
+    #[must_use]
+    pub fn weighed(&self) -> Option<&crate::top::Weighed> {
+        self.weighed.as_ref()
     }
 
     #[must_use]
@@ -4381,9 +4589,10 @@ impl Shell {
             workspace: 0,
         };
         // A caller firing directly (every lane seat-addressed) has no
-        // runtime to commit ahead of it: the segments its seats touch back now.
+        // runtime to commit ahead of it: the segments its seats and its
+        // demand touch back now.
         if lanes.iter().all(|seated| !seated.refs) && !self.warming {
-            self.pools.commit_seats()?;
+            self.pools.commit_seats(demand.kv_pages, demand.state_slots)?;
         }
         // Every page and record piece the fire reads or writes is checked
         // backed, ref by ref: a page in an uncommitted chunk under the
@@ -6020,7 +6229,9 @@ fn activation_rungs(
 ) -> Result<Vec<(u32, poem_compiler::ArenaMap)>> {
     let max = budgets.tokens.max_tokens;
     let mut rungs = Vec::new();
-    for tokens in engine::memory::rungs(1, max) {
+    // The lattice's points below the load's top, then the top: the rows a
+    // Metal load fires (`crate::rates::lattice_rows`).
+    for tokens in crate::rates::lattice_rows() {
         if tokens >= max {
             break;
         }

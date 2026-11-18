@@ -306,6 +306,76 @@ pub fn unmeasured(rates: &profile::fire::Rates) -> Option<(&'static str, String)
     None
 }
 
+/// The side of the cube the warm-up's size walk ([`warm_side`]) times
+/// first, and the one after it: the walk's first growth is theirs.
+pub const WARM_PROBE: u32 = 1024;
+
+/// The side of the warm-up's cube matmul (`side x side x side`), walked up
+/// by doubling with a real fire timed at each size (`time(side)`, ns):
+/// [`WARM_PROBE`] / 2 and [`WARM_PROBE`] first, then the next size only
+/// while its fire, estimated from the last one timed by the growth the last
+/// two measured (their time ratio, carried forward: not the flops' ratio),
+/// fits `max_submit`; to [`WARM_SHAPE`]'s at most, which it is with no
+/// bound stated (nothing is walked then). The margin is the measurement's:
+/// no factor stands under the bound. A phone whose GPU faults a submission
+/// past its watchdog (KGSL's ~2 s) warms on a cube whose fire fits it.
+pub fn warm_side<E>(
+    max_submit: Option<std::time::Duration>,
+    mut time: impl FnMut(u32) -> Result<f64, E>,
+) -> Result<u32, E> {
+    let Some(cap) = max_submit else {
+        return Ok(WARM_SHAPE.0);
+    };
+    let bound = cap.as_nanos() as f64;
+    let mut before = time(WARM_PROBE / 2)?;
+    let mut last = time(WARM_PROBE)?;
+    let mut side = WARM_PROBE;
+    if last > bound {
+        return Ok(WARM_PROBE / 2);
+    }
+    while side < WARM_SHAPE.0 {
+        let growth = last / before.max(f64::MIN_POSITIVE);
+        if last * growth > bound {
+            break;
+        }
+        let next = time(side * 2)?;
+        if next > bound {
+            break;
+        }
+        (before, last, side) = (last, next, side * 2);
+    }
+    Ok(side)
+}
+
+/// The bytes an attention of `shape` moves at least: its queries read and
+/// its output written (each row a query element a head), and its keys' and
+/// values' cells read once.
+#[must_use]
+pub fn attn_bytes(shape: AttnShape) -> f64 {
+    let q = 2.0 * f64::from(shape.rows) * f64::from(shape.q_heads * shape.head_dim) * 2.0;
+    let kv = 2.0 * f64::from(shape.keys) * f64::from(shape.kv_heads * shape.head_dim) * 2.0;
+    q + kv
+}
+
+/// The keys of [`ATTN_KEYS`] the attention curve is timed at on a device
+/// whose ridge is `ridge` (its matmul peak, flops a ns, over its bandwidth,
+/// bytes a ns): from the narrowest whose shape ([`ATTN_SHAPE`] at it) is
+/// compute-bound there (its flops a byte at least the ridge) on, so the
+/// rate is the kernel's compute, not its reads; the widest where none is.
+/// The matmul curve's points play no part.
+#[must_use]
+pub fn attn_keys(ridge: f64) -> Vec<u32> {
+    let bound = |keys: u32| {
+        let s = ATTN_SHAPE.at(keys);
+        attn_flops(s) / attn_bytes(s) >= ridge
+    };
+    let from = ATTN_KEYS
+        .iter()
+        .position(|&k| bound(k))
+        .unwrap_or(ATTN_KEYS.len() - 1);
+    ATTN_KEYS[from..].to_vec()
+}
+
 /// The matmul every backend's rates step warms the device with before it
 /// times anything ([`warm_up`]): the widest the grid times, `m x n x k`.
 pub const WARM_SHAPE: (u32, u32, u32) = (8192, 8192, 8192);
@@ -478,6 +548,89 @@ pub fn timed_frames<E>(
         per_fire_ns: settled.last,
         capped: settled.capped,
     })
+}
+
+/// Whether the operand sets one owner lays (a width's weight planes, an
+/// attention's q / kv sets, ...) have been touched on the device yet: held
+/// beside the sets, by whatever lays them, and set by [`touch_once`].
+#[derive(Debug, Default)]
+pub struct Touched(std::cell::Cell<bool>);
+
+impl Touched {
+    #[must_use]
+    pub fn get(&self) -> bool {
+        self.0.get()
+    }
+}
+
+/// A set is touched once, by the first point that rotates it: the first
+/// time a point is timed over the `sets` operand sets `touched` stands
+/// for, every one of them is read once on the device, untimed
+/// ([`touch_sets`]), before the point's frames ([`warmed_frames`]); a
+/// later point over the same sets reads them as they are. A set the
+/// device has never read costs its first fire far more than a warm one (on
+/// an M5 Pro a 256 x 1024 x 1024 matmul over 384 fresh 2 MiB planes ran
+/// 112 us a fire against 25 us once they had been read, so the point read
+/// about 5 or about 30 TFLOP/s run to run by whether its few timed fires
+/// fell on planes read before). Touched once, not before every point: a
+/// rotation before each point is that much more load on the device, and
+/// on the M5 Pro it read the widest matmuls 2-5% under the first set's
+/// rates, heat the measurement had added.
+pub fn touch_once<E>(
+    touched: &Touched,
+    max_submit: Option<std::time::Duration>,
+    sets: u32,
+    frame: &mut impl FnMut(u32) -> Result<f64, E>,
+) -> Result<(), E> {
+    if touched.get() {
+        return Ok(());
+    }
+    touch_sets(max_submit, sets, frame)?;
+    touched.0.set(true);
+    Ok(())
+}
+
+/// Every one of the `sets` operand sets a point's fires rotate through,
+/// read once on the device and untimed: `sets` fires in all, in one frame,
+/// or in frames of as many as fit under `max_submit` where the device
+/// states a bound on one submission.
+pub fn touch_sets<E>(
+    max_submit: Option<std::time::Duration>,
+    sets: u32,
+    frame: &mut impl FnMut(u32) -> Result<f64, E>,
+) -> Result<(), E> {
+    let mut left = sets.max(1);
+    let one = frame(1)?;
+    left -= 1;
+    let per = max_submit.map_or(left, |cap| {
+        ((cap.as_nanos() as f64 / one.max(1.0)) as u32).max(1)
+    });
+    while left > 0 {
+        let n = per.min(left);
+        frame(n)?;
+        left -= n;
+    }
+    Ok(())
+}
+
+/// A timed point's frames, the one rule for every point every engine
+/// times: their length settled by [`timed_frames`], then frames of that
+/// length run until their rate stops moving ([`warm_up`]'s rule), so the
+/// point is timed at the clock it holds under its own load, never in a
+/// state an earlier point or an idle gap left behind. Before this every
+/// point but the memory-bound ones went untimed by it, and on an M5 Pro a
+/// few-microsecond matmul read about 5 or about 34 TFLOP/s run to run.
+/// (Its sets touched first, once: [`touch_once`].)
+pub fn warmed_frames<E>(
+    max_submit: Option<std::time::Duration>,
+    estimate_ns: Option<f64>,
+    mut frame: impl FnMut(u32) -> Result<f64, E>,
+    refuse: impl FnOnce(String) -> E,
+) -> Result<Frames, E> {
+    let frames = timed_frames(max_submit, estimate_ns, &mut frame, refuse)?;
+    let k = frames.fires;
+    warm_up(|| frame(k).map(|ns| f64::from(k) / ns.max(f64::MIN_POSITIVE)))?;
+    Ok(frames)
 }
 
 /// What a backend's rates step measured, and whether a frame it needed
@@ -919,6 +1072,121 @@ fn civil(days: i64) -> (i64, u32, u32) {
 
 #[cfg(test)]
 mod tests {
+    /// A point that starts in a slow clock state and leaves it only under
+    /// its own load: its frames' length settles while it is slow, and the
+    /// point is timed only once frames of that length run at the fast rate,
+    /// whatever the doublings saw. (On an M5 Pro a short matmul read about
+    /// 5 or about 34 TFLOP/s run to run: timed without this, by which state
+    /// the gap before it left.)
+    #[test]
+    fn a_point_is_timed_only_once_its_own_load_has_settled_its_clock() {
+        let calls = std::cell::Cell::new(0u32);
+        // Slow (10 ns a fire) for the frames the doublings settle in, then
+        // fast (1 ns a fire) once its own load has lifted the clock.
+        const SLOW: u32 = 3;
+        let frame = |k: u32| -> Result<f64, String> {
+            calls.set(calls.get() + 1);
+            let per = if calls.get() <= SLOW { 10.0 } else { 1.0 };
+            Ok(per * f64::from(k))
+        };
+        let settled = super::timed_frames(None, None, frame, |why: String| why).expect("it settles");
+        assert_eq!(settled.per_fire_ns, 10.0, "the doublings alone settle in the slow state");
+        calls.set(0);
+        let frames = super::warmed_frames(None, None, frame, |why| why).expect("it settles");
+        let settled_at = calls.get();
+        assert!(settled_at > SLOW + 1, "the warm-up ran past the slow state ({settled_at} frames)");
+        // The next frame of that length reads the fast state.
+        let next = frame(frames.fires).expect("a frame") / f64::from(frames.fires);
+        assert_eq!(next, 1.0, "the point is timed at the clock its load holds");
+    }
+
+    /// Points whose fires are slow on any operand set the device has not
+    /// read yet, their rotation longer than the frames their doublings
+    /// settle in: the first point over the sets touches every one of them,
+    /// so it is timed over touched sets only, at their rate, and a second
+    /// point over the same sets touches none again. (On an M5 Pro a 256 x
+    /// 1024 x 1024 matmul over 384 fresh planes read about 5 or about 30
+    /// TFLOP/s run to run, by whether its timed fires fell on planes read
+    /// before.)
+    #[test]
+    fn a_set_is_touched_once_by_the_first_point_that_rotates_it() {
+        const SETS: usize = 384;
+        // A fire on a set read before takes 1 ns, its first one 20 ns.
+        let rig =
+            |touched: &std::cell::RefCell<Vec<bool>>, turn: &super::Rotation, k: u32| -> f64 {
+                (0..k)
+                    .map(|_| {
+                        let at = turn.next(SETS);
+                        if std::mem::replace(&mut touched.borrow_mut()[at], true) {
+                            1.0
+                        } else {
+                            20.0
+                        }
+                    })
+                    .sum()
+            };
+        let touched = std::cell::RefCell::new(vec![false; SETS]);
+        let owner = super::Touched::default();
+        let fires = std::cell::Cell::new(0u32);
+        let turn = super::Rotation::default();
+        let frame = |k: u32| -> Result<f64, String> {
+            fires.set(fires.get() + k);
+            Ok(rig(&touched, &turn, k))
+        };
+        let mut first = frame;
+        super::touch_once(&owner, None, SETS as u32, &mut first).expect("it touches");
+        assert!(touched.borrow().iter().all(|&t| t), "every set was touched");
+        assert!(owner.get(), "the owner holds that its sets are touched");
+        let frames = super::warmed_frames(None, None, frame, |why| why).expect("it settles");
+        assert_eq!(
+            frames.per_fire_ns, 1.0,
+            "the point settles at the touched sets' rate"
+        );
+        let next = frame(frames.fires).expect("a frame") / f64::from(frames.fires);
+        assert_eq!(next, 1.0, "the timed frames read touched sets only");
+        // A second point over the same sets: no touch again.
+        fires.set(0);
+        let mut second = frame;
+        super::touch_once(&owner, None, SETS as u32, &mut second).expect("it touches");
+        assert_eq!(
+            fires.get(),
+            0,
+            "a later point over the same sets touches none again"
+        );
+        // Untouched (the doublings alone), the point times first touches:
+        // the case this rule closes.
+        let fresh = std::cell::RefCell::new(vec![false; SETS]);
+        let turn = super::Rotation::default();
+        let frame = |k: u32| -> Result<f64, String> { Ok(rig(&fresh, &turn, k)) };
+        let untouched =
+            super::timed_frames(None, None, frame, |why: String| why).expect("it settles");
+        assert_eq!(
+            untouched.per_fire_ns, 20.0,
+            "untouched, the doublings time first touches"
+        );
+    }
+
+    /// The touch keeps each of its frames under the device's bound on one
+    /// submission, and still covers every set once.
+    #[test]
+    fn the_touch_keeps_under_the_submission_bound() {
+        let fires = std::cell::Cell::new(0u32);
+        let longest = std::cell::Cell::new(0u32);
+        let mut frame = |k: u32| -> Result<f64, String> {
+            fires.set(fires.get() + k);
+            longest.set(longest.get().max(k));
+            Ok(f64::from(k) * 1000.0)
+        };
+        super::touch_sets(Some(std::time::Duration::from_micros(10)), 95, &mut frame)
+            .expect("it touches");
+        assert_eq!(fires.get(), 95, "every set touched once");
+        assert!(
+            longest.get() <= 10,
+            "no frame past the bound ({} fires)",
+            longest.get()
+        );
+    }
+
     use super::*;
 
     /// A profile of the toy registry stating `rates`.
@@ -1087,6 +1355,62 @@ mod tests {
         );
     }
 
+    /// The warm-up's cube walks up while its next fire, estimated from the
+    /// last by the growth the last two measured, fits the device's bound on
+    /// one submission: the Adreno 840's 8192^3 ran ~1.57 s a submit against
+    /// KGSL's ~2 s watchdog.
+    #[test]
+    fn the_warm_up_cube_walks_up_while_its_next_fire_fits_the_bound() {
+        let kgsl = Some(std::time::Duration::from_secs(2));
+        // Each doubling 8x the time, 1024^3 at 3 ms: 8192^3 at ~1.54 s fits.
+        let cubic = |side: u32| 3e6 * (f64::from(side) / 1024.0).powi(3);
+        let mut timed = Vec::new();
+        let side = warm_side(kgsl, |s| {
+            timed.push(s);
+            Ok::<f64, ()>(cubic(s))
+        })
+        .unwrap();
+        assert_eq!(side, 8192);
+        assert_eq!(timed, vec![512, 1024, 2048, 4096, 8192]);
+        // A device slowing past the flops' growth (each doubling 10x, as a
+        // clock sinking under its power cap): 4096^3 at 300 ms, the next
+        // estimated at 3 s, past the bound: it is never fired.
+        let sinking = |side: u32| 3e6 * 10f64.powf((f64::from(side) / 1024.0).log2());
+        let mut timed = Vec::new();
+        let side = warm_side(kgsl, |s| {
+            timed.push(s);
+            Ok::<f64, ()>(sinking(s))
+        })
+        .unwrap();
+        assert_eq!(side, 4096);
+        assert_eq!(timed, vec![512, 1024, 2048, 4096]);
+        // No bound stated: the widest, nothing timed.
+        let side = warm_side(None, |_| -> Result<f64, ()> {
+            panic!("timed with no bound")
+        });
+        assert_eq!(side, Ok(WARM_SHAPE.0));
+        // The probe itself past the bound: the cube under it.
+        assert_eq!(warm_side(kgsl, |_| Ok::<f64, ()>(3e9)), Ok(WARM_PROBE / 2));
+    }
+
+    /// The attention curve's keys are where its shape is compute-bound on
+    /// the device (its flops a byte past the ridge), from the device's own
+    /// matmul peak and bandwidth: never where a matmul lattice stopped.
+    #[test]
+    fn the_attention_keys_are_compute_bound_and_their_own() {
+        let intensity = |keys: u32| {
+            let s = ATTN_SHAPE.at(keys);
+            attn_flops(s) / attn_bytes(s)
+        };
+        // A ridge every point clears: the whole curve.
+        assert_eq!(attn_keys(1.0), ATTN_KEYS.to_vec());
+        // A ridge past 512 keys' intensity: from the first past it.
+        let ridge = (intensity(512) + intensity(1024)) / 2.0;
+        assert_eq!(attn_keys(ridge), ATTN_KEYS[1..].to_vec());
+        // None compute-bound: the widest alone, never nothing.
+        assert_eq!(attn_keys(f64::MAX), vec![ATTN_KEYS[ATTN_KEYS.len() - 1]]);
+    }
+
     #[test]
     fn a_budget_short_of_the_step_is_refused_by_name_and_measures_nothing() {
         let short = step_bytes() - 1;
@@ -1204,6 +1528,21 @@ mod tests {
             assert!(err.contains(says), "{err}");
             assert!(!path.exists(), "a refused rate was saved");
         }
+        // Stated in a profile, it is refused by the same key: the roofline
+        // divides by none of it.
+        let stated = profile::fire::Rates {
+            attn_tflops_by_keys: Some(vec![(512, 0.0)]),
+            ..all()
+        };
+        assert_eq!(
+            crate::roofline::Constants::of(&stated).err(),
+            Some("attn_tflops_by_keys")
+        );
+        let nan = profile::fire::Rates {
+            hbm_gbps: Some(f64::NAN),
+            ..all()
+        };
+        assert_eq!(crate::roofline::Constants::of(&nan).err(), Some("hbm_gbps"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -545,6 +545,7 @@ impl Engine for Metal {
                     runahead: engine::runahead::Runahead::of(frames_in_flight),
                     residency: experts::Plan::default(),
                     profiles: self.boot.profiles.clone(),
+                    top: crate::Top::Ruled,
                 })
                 .map_err(fault)?;
                 let narrower = (budgets.max_tokens / 2).max(MIN_FITTED_FORWARD_TOKENS);
@@ -1029,6 +1030,13 @@ impl Engine for Metal {
 
     fn rebind_slots(&mut self, rebind: engine::Rebind) -> EngineResult<()> {
         self.loaded_mut()?.rebind_slots(&rebind).map_err(fault)
+    }
+
+    /// A device channel's ring is a shared ring in its `Channel` slots; a
+    /// channel the host reads or writes is the runtime's, each instance
+    /// holding its own ring of it.
+    fn holds_channel(&self, registration: &ChannelRegistration) -> bool {
+        registration.host_role == eta_ir::container::HostRole::None
     }
 
     fn ring_facts(

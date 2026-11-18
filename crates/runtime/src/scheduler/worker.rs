@@ -63,6 +63,14 @@ pub(crate) fn notify_process_suspend(pid: ProcessId) {
     broadcast(|| SchedulerItem::PipelineLeave(pid, Some(pid), LeaveKind::Suspend, None));
 }
 
+/// `pid` waits on something the frame's firing would free: no frame on
+/// `engine` waits on its lanes until its next submit.
+pub(crate) fn notify_owner_waits(engine: usize, pid: ProcessId) {
+    if let Ok(handle) = crate::scheduler::scheduler_handle(engine) {
+        let _ = handle.send(SchedulerItem::OwnerWaits(pid));
+    }
+}
+
 pub(crate) fn notify_process_resume(pid: ProcessId) {
     broadcast(|| SchedulerItem::ProcessResume(pid));
 }
@@ -283,6 +291,10 @@ enum SchedulerItem {
     AdmissionQueued(ProcessId),
     AdmissionDequeued(ProcessId),
     ProcessResume(ProcessId),
+    /// The process waits on something the frame's firing would free (a
+    /// raise of the activation rung): its lanes go out of the frame
+    /// ([`super::frame::FramePolicy::on_owner_waits`]).
+    OwnerWaits(ProcessId),
     FrameTruncate {
         lane: ProcessId,
         seq: u64,
@@ -1253,8 +1265,63 @@ impl SchedulerHandle {
                 None => Err(crate::planner::PlannerError::Cancelled),
             }
         };
-        let (registered, _, bound) =
-            crate::store::roles::bind_when_resident(pid, lane_bind, resident).await?;
+        // Short of a free run for its guest state, it waits on the walk to
+        // commit a segment, as a kv admission does, never refused while a
+        // segment is left to commit within the budget.
+        let engine = bind.engine_id;
+        let grown = |prefix: u32, run: u32| async move {
+            let shared = crate::store::registry::try_get(0, engine)
+                .and_then(|stores| stores.shared)
+                .ok_or_else(|| format!("engine {engine} has no shared pool to grow"))?;
+            crate::inferlet::process::said(
+                "bind: a segment for its guest state",
+                pid,
+                crate::store::roles::grow_for_guest(&shared, engine, prefix, run),
+            )
+            .await
+        };
+        // Short of room the budget holds, with no segment left to commit,
+        // it waits for room given back (a process completing, or parked),
+        // as an admission waits on pages, never refused for it.
+        let room = || {
+            crate::store::registry::try_get(0, engine)
+                .and_then(|stores| stores.roles)
+                .map(|roles| roles.lock().unwrap().room_watch())
+        };
+        // Whether `pieces` runs of `run` chunks stand free for its state.
+        let fits = |run: u32, pieces: u32| {
+            crate::store::registry::try_get(0, engine)
+                .and_then(|stores| stores.roles)
+                .is_some_and(|roles| roles.lock().unwrap().free_runs(run) >= pieces)
+        };
+        // Holding guest state of its own, it is suspended instead: waiting,
+        // it would hold room its own bind lacks.
+        let suspend = |run: u32, pieces: u32| {
+            let holds = crate::store::registry::try_get(0, engine)
+                .and_then(|stores| stores.roles)
+                .is_some_and(|roles| roles.lock().unwrap().holds_guest_state(pid));
+            holds
+                && crate::planner::planner_of(pid)
+                    .is_some_and(|planner| planner.suspend_for_room(pid, run, pieces))
+        };
+        // Waiting, it is a waiter in the planner's queue: idle cache goes
+        // first, then a resident is parked for it, as for a restore short
+        // of room for its roles.
+        let planned = |run: u32, pieces: u32| async move {
+            let planner = crate::planner::planner_of(pid)
+                .ok_or_else(|| "its process has no planner".to_string())?;
+            crate::inferlet::process::said(
+                "bind: room for its guest state",
+                pid,
+                planner.wait_bind_room(pid, run, pieces),
+            )
+            .await
+            .map_err(|why| why.to_string())
+        };
+        let (registered, _, bound) = crate::store::roles::bind_when_resident(
+            pid, lane_bind, resident, grown, room, fits, suspend, planned,
+        )
+        .await?;
         Ok((registered, bound))
     }
 
@@ -1468,12 +1535,15 @@ impl BatchScheduler {
             let cap = crate::store::shared::fire_cap(engine_id);
             let mut stepped = limits;
             stepped.max_forward_tokens = stepped.max_forward_tokens.min(cap as usize).max(1);
-            // No launch past the cap is submitted from here (`post_frame`
-            // holds it): once none in flight is either, the pool may lower
-            // its rung.
+            // No frame past the cap is sealed from here, and no unframed
+            // launch past it posted (`post_frame` holds it): once none in
+            // flight is either, nor a frame sealed before still to go, the
+            // pool may lower its rung.
+            frame_policy.cap_fires(stepped.max_forward_tokens);
             if in_flight_launches
                 .iter()
                 .all(|batch| batch.rung_rows <= cap as usize)
+                && frame_policy.sealed_widest() <= cap as usize
             {
                 crate::store::shared::grant_rung(engine_id, cap);
             }
@@ -1952,6 +2022,7 @@ impl BatchScheduler {
                             launch.request.tokens(),
                             launch.wire_row_count(),
                             launch.request.sequence_readouts(),
+                            launch.request.rung_rows(),
                         );
                     }
                     Self::queue_attempt(pending, launch);
@@ -1960,6 +2031,9 @@ impl BatchScheduler {
 
             SchedulerItem::ProcessResume(pid) => {
                 frame_policy.on_process_resume(pid);
+            }
+            SchedulerItem::OwnerWaits(pid) => {
+                frame_policy.on_owner_waits(pid);
             }
             SchedulerItem::FrameTruncate {
                 lane,
@@ -2578,6 +2652,17 @@ impl BatchScheduler {
                 }
                 continue;
             }
+            // What the frame posted owes its output from here, and only that.
+            if let Some(batch) = in_flight_launches.back() {
+                frame_policy.on_frame_posted(
+                    batch
+                        .requests
+                        .iter()
+                        .filter(|request| request.frame.is_some())
+                        .filter_map(|request| request.pipeline_id),
+                    now,
+                );
+            }
             if rider_batch {
                 frame_policy.record_rider_wave();
             }
@@ -2646,10 +2731,13 @@ impl BatchScheduler {
         let mut collisions: Vec<(usize, Box<PendingRequest>)> = Vec::new();
         while let Some(item) = pending.pop_front() {
             match item {
-                // Past the pool's activation rung (SPEC decision 6): it waits
-                // until the rung is back.
+                // An unframed launch past the pool's activation rung (SPEC
+                // decision 6) waits until the rung is back. A framed one was
+                // sealed under the cap, and its frame goes whole: the rung is
+                // not lowered under a sealed frame (`FramePolicy::cap_fires`).
                 QueuedItem::Launch(launch)
-                    if launch.request.request.rung_rows() > limits.max_forward_tokens =>
+                    if !launch.framed
+                        && launch.request.request.rung_rows() > limits.max_forward_tokens =>
                 {
                     kept.push_back(QueuedItem::Launch(launch));
                 }
@@ -2900,8 +2988,14 @@ impl BatchScheduler {
     ) {
         match commit {
             LaneCommit::None => {}
-            LaneCommit::BindFinished { pipeline_id } => {
+            LaneCommit::BindFinished { pipeline_id, waits } => {
                 frame_policy.on_bind_completed(pipeline_id);
+                // Waiting for room, its process submits nothing until the
+                // bind lands: its lanes go out of the frame, as a
+                // suspension's do, and come back with its next submit.
+                if waits && let Some(pid) = pipeline_id {
+                    frame_policy.on_owner_waits(pid);
+                }
             }
             LaneCommit::BindInstance {
                 pipeline_id,
@@ -3219,6 +3313,56 @@ mod tests {
         a_launch_waits_for_the_copy_queued_ahead_of_it();
         a_pass_that_only_reorders_lets_the_worker_park();
         what_a_frame_settled_inside_submit_wrote_is_kept_when_it_is_answered();
+        a_step_wider_than_the_rung_the_engine_holds_never_reaches_it();
+    }
+
+    /// The lane refuses by name a step whose token rows (or lanes) pass the
+    /// rung the engine holds, before the engine sees it (this engine panics
+    /// on any submit); one within it goes on to the engine.
+    fn a_step_wider_than_the_rung_the_engine_holds_never_reaches_it() {
+        const ENGINE: usize = 9207;
+        crate::store::shared::set_engine_rows_for_test(ENGINE, 2);
+        let mut lane = Lane::spawn(
+            ENGINE,
+            Some(Box::new(PanickingEngine)),
+            Arc::new(SchedulerStats::default()),
+        );
+        let frame = |lanes: u32| crate::engine::FrameFire {
+            steps: vec![crate::engine::StepFire {
+                submission: ::engine::Step {
+                    lanes: (0..lanes)
+                        .map(|lane| ::engine::Lane::decode(lane, 0, 1, 0))
+                        .collect(),
+                    attachments: Vec::new(),
+                    media: Vec::new(),
+                    voxels: Vec::new(),
+                },
+                terminal_cells: Vec::new(),
+                completions: Vec::new(),
+                member_lanes: Vec::new(),
+                instances: vec![::engine::InstanceId(0); lanes as usize],
+            }],
+        };
+        let answer = |lanes: u32| {
+            let reply = lane.fire(frame(lanes), false);
+            crate::rt::block_on(async {
+                crate::rt::time::timeout(Duration::from_secs(10), reply).await
+            })
+            .expect("answered")
+            .expect("answered")
+        };
+        let Err(wide) = answer(3) else {
+            panic!("past the rung: refused");
+        };
+        assert!(
+            wide.contains("3 token rows") && wide.contains("the rung the engine was told"),
+            "refused by name: {wide}"
+        );
+        let Err(narrow) = answer(2) else {
+            panic!("the engine panics on what reaches it");
+        };
+        assert!(narrow.contains("panic"), "it reached the engine: {narrow}");
+        let _ = lane.shutdown();
     }
 
     /// A browser's single thread lands the batch a close waits on only after
