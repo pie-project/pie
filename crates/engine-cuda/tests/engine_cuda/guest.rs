@@ -2,20 +2,29 @@
 //! and `Channel` slots taken where the engine's facts say, so a test binds
 //! instances and registers channels as a served one is.
 
+#[cfg(feature = "device")]
 use engine::Engine;
+#[cfg(feature = "device")]
+use engine::GuestState;
+use engine::ScratchPlace;
+#[cfg(feature = "device")]
 use engine::channel::{ChannelId, ChannelRegistration};
+#[cfg(feature = "device")]
 use engine::chunk::{ChunkFacts, SlotRole};
-use engine::program::{BoundInstance, Footprint, InstanceBinding, ProgramFacts, RingSlots};
-use engine::{GuestState, ScratchPlace};
+use engine::program::RingSlots;
+#[cfg(feature = "device")]
+use engine::program::{BoundInstance, Footprint, InstanceBinding, ProgramFacts};
 
 /// Slots of one role's shape, handed out from one chunk upward.
 #[derive(Debug, Clone, Copy)]
+#[cfg(feature = "device")]
 struct Shape {
     per_chunk: u32,
     slot_bytes: u64,
     next: u32,
 }
 
+#[cfg(feature = "device")]
 impl Shape {
     fn of(facts: &ChunkFacts, role: SlotRole, chunk: u32) -> Shape {
         let shape = facts
@@ -45,6 +54,7 @@ impl Shape {
 /// The two guest shapes, each in a chunk of its own, and the chunks past
 /// them, whole, for the guest state that lies in runs of chunks.
 #[derive(Debug, Clone)]
+#[cfg(feature = "device")]
 pub struct Guest {
     instance: Shape,
     channel: Shape,
@@ -57,6 +67,7 @@ pub struct Guest {
     pairs: Vec<(String, ScratchPlace)>,
 }
 
+#[cfg(feature = "device")]
 impl Guest {
     /// The guest chunks of a pool whose first `committed` chunks are backed.
     pub fn of(facts: &ChunkFacts, committed: u32) -> Guest {

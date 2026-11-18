@@ -87,6 +87,9 @@ impl Shell {
         };
         let hybrid = self.has_state();
         let mut shapes: Vec<Vec<Want>> = Vec::new();
+        // Where each part of the ladder starts in `shapes`: the load line
+        // states the programs each part adds.
+        let mut parts: Vec<(&str, usize)> = vec![("decode", 0)];
         let mut pages = pad.rung(pad.page_floor).min(cap);
         while pages <= cap {
             // A fire's page bound is its longest lane's: that lane holds more
@@ -110,6 +113,7 @@ impl Shell {
             }
             pages = pad.next(pages);
         }
+        parts.push(("prefill", shapes.len()));
         // A prefill pads its lanes to 16, 32 or 64 by its rows (`canonical_pads`),
         // or to 16 where the load holds fewer lanes than that: one lane at
         // every rung and every lane count its rows can take there.
@@ -142,11 +146,19 @@ impl Shell {
             // Every lane rung whose prompts (two rows at least, a decode's
             // one) fit the rows: a burst of short prompts fires many at once
             // (c64: 64 prompt tails of 3 rows in 256 rows compiled mid-run).
-            for &n in buckets.iter().filter(|&&n| n >= 2 && n <= lanes_cap) {
-                if b / n >= 2 {
-                    // `n - 1` lanes and the padding lane the rest takes (two
-                    // or three lanes pad to four).
-                    shapes.push(vec![fresh(prefill, b / n); (n - 1) as usize]);
+            for &p in buckets.iter().filter(|&&p| p >= 2 && p <= lanes_cap) {
+                // the prompt counts that reach every form rung `p` pads to:
+                // one short of it with the padding lane the rest takes, and
+                // at it, filling the rows exactly (two prompts of 8 rows in
+                // 16 fire as they are, `canonical_pads`)
+                for n in lane_counts(p) {
+                    if b / n >= 2 {
+                        let mut lanes = vec![fresh(prefill, b / n); n as usize];
+                        if n < p {
+                            lanes.pop();
+                        }
+                        shapes.push(lanes);
+                    }
                 }
             }
         }
@@ -181,6 +193,7 @@ impl Shell {
                 }
             }
         }
+        parts.push(("mixed", shapes.len()));
         // Prefills beside decodes: every decode lane rung at every row rung
         // it fits in, and at the padding rung, which a full fire's decode
         // pads overflow into. A fire's prompt lanes pad to a lane rung from
@@ -276,42 +289,72 @@ impl Shell {
                 }
             }
         }
-        // A drafting lane (a load whose model drafts, `draft_depth`) reads
-        // out every row of its window: its prompt at every row rung, and
-        // its verify window (a token and its drafts, as deep as the model
-        // drafts) at every page bound, one lane each (the MTP inferlet:
-        // a 2-row window and a 29-row prompt compiled mid-run). Many
-        // drafting lanes at once fire unpadded, at their own lane counts
-        // (`canonical_pads` takes a lane reading one row): those stay off
-        // the ladder until lanes are data.
+        // Drafting lanes (a load whose model drafts, `draft_depth`) read out
+        // every row: their windows (a token and its drafts, as deep as the
+        // model drafts) at every lane rung and page bound, and their prompts
+        // at every lane rung and row rung the readout store holds (the MTP
+        // inferlet, eight at once: windows of 2 rows over 2 to 8 lanes and
+        // four 29-row prompts compiled mid-run). A fire of `n` lanes pads to
+        // its rung by one-row lanes reading nothing (`canonical_pads`): `n`
+        // at the rung, just past half of it and one short of it reach every
+        // form that rung pads to.
         if let Some(depth) = self.trace().facts.draft_depth {
             let drafts = facts.word(&Request::new(2, false).drafting(true));
             let window = facts.word(&Request::new(1 + depth, false).drafting(true));
-            // (a fire reads out no more rows than the load's store holds, its
-            // padding lane's among them)
+            // (a fire reads out no more rows than the load's store holds)
             let store = self.readout_store_rows().unwrap_or(u32::MAX);
             if plain(self, drafts) && plain(self, window) {
+                self.draft_depth = depth;
+                self.drafting = [drafts, window]
+                    .iter()
+                    .filter_map(|&w| classes.class_of(w & classes.mask))
+                    .collect();
+                let counts = lane_counts;
+                parts.push(("draft windows", shapes.len()));
+                for &p in buckets.iter().filter(|&&p| p <= lanes_cap) {
+                    for n in counts(p) {
+                        if n * (1 + depth) > store {
+                            continue;
+                        }
+                        let mut pages = pad.rung(pad.page_floor).min(cap);
+                        while pages <= cap {
+                            let lane = Want {
+                                word: window,
+                                rows: 1 + depth,
+                                held_pages: pages,
+                                all_rows: true,
+                            };
+                            shapes.push(vec![lane; n as usize]);
+                            pages = pad.next(pages);
+                        }
+                    }
+                }
+                parts.push(("draft prompts", shapes.len()));
                 for &b in buckets
                     .iter()
                     .filter(|&&b| (pad.prefill_floor.max(2)..=widest.min(store)).contains(&b))
                 {
-                    shapes.push(vec![Want {
-                        all_rows: true,
-                        ..fresh(drafts, b - 1)
-                    }]);
-                }
-                let mut pages = pad.rung(pad.page_floor).min(cap);
-                while pages <= cap {
-                    shapes.push(vec![Want {
-                        word: window,
-                        rows: 1 + depth,
-                        held_pages: pages,
-                        all_rows: true,
-                    }]);
-                    pages = pad.next(pages);
+                    for &p in buckets.iter().filter(|&&p| p <= lanes_cap) {
+                        for n in counts(p) {
+                            if b / n < 2 {
+                                continue;
+                            }
+                            let mut lanes = vec![
+                                Want {
+                                    all_rows: true,
+                                    ..fresh(drafts, b / n)
+                                };
+                                n as usize
+                            ];
+                            lanes[0].rows += b % n;
+                            lanes[0].rows -= 1;
+                            shapes.push(lanes);
+                        }
+                    }
                 }
             }
         }
+        let mut added: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
         let started = std::time::Instant::now();
         // Trace every shape (nothing runs), then compile the new programs
         // side by side: a compile is host work, one core each.
@@ -323,8 +366,15 @@ impl Shell {
         let passes = if self.streams_experts() { 2 } else { 1 };
         'passes: for pass in 0..passes {
             self.stage_all = pass == 1;
-            for shape in &shapes {
-                match self.warm_fire(shape) {
+            for (at, shape) in shapes.iter().enumerate() {
+                let before = self.deferred.as_ref().map_or(0, Vec::len);
+                let fired_part = warm_part(&parts, at);
+                let r = self.warm_fire(shape);
+                if pass == 0 {
+                    let new = self.deferred.as_ref().map_or(0, Vec::len) - before;
+                    *added.entry(fired_part).or_insert(0) += new;
+                }
+                match r {
                     Ok(()) => fired += 1,
                     Err(fault) => {
                         failed = Some(fault);
@@ -348,12 +398,14 @@ impl Shell {
         }
         tracing::info!(
             fires = fired,
+            parts = ?added,
             programs = self.traced.len(),
             skipped,
             traced_s,
             s = started.elapsed().as_secs(),
             "xla warm ladder compiled"
         );
+        self.laddered = fired > 0;
         Ok(fired)
     }
 
@@ -633,4 +685,24 @@ fn held_of(want: &Want, page_size: u32) -> u32 {
         return 0;
     }
     (want.held_pages * page_size).saturating_sub(want.rows)
+}
+
+/// The ladder part shape `at` belongs to: the last that starts at or before it.
+fn warm_part<'a>(parts: &[(&'a str, usize)], at: usize) -> &'a str {
+    parts
+        .iter()
+        .rev()
+        .find(|(_, from)| *from <= at)
+        .map_or("decode", |(name, _)| name)
+}
+
+/// The lane counts that reach every form a fire padded to lane rung `p`
+/// takes (`canonical_pads`): at the rung, one short of it, and just past
+/// half of it.
+fn lane_counts(p: u32) -> Vec<u32> {
+    let mut ns = vec![p / 2 + 1, p.saturating_sub(1), p];
+    ns.retain(|&n| n >= 1 && n <= p);
+    ns.sort_unstable();
+    ns.dedup();
+    ns
 }
