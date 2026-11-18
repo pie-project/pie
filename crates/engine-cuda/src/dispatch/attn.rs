@@ -1421,15 +1421,23 @@ impl Run<'_> {
                     .zip(packing(*kv_indptr))
                     .and_then(|(q, kv)| self.group_mask(q, kv));
                 let mask = match (mask, stated) {
+                    (poem_ir::RaggedMask::Stated, Some(stated)) => {
+                        kernels_cuda::attn::ragged::RaggedMask::Custom {
+                            bits: stated.bits,
+                            indptr: stated.indptr,
+                        }
+                    }
                     (
-                        poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal,
-                        Some(stated),
-                    ) => kernels_cuda::attn::ragged::RaggedMask::Custom {
-                        bits: stated.bits,
-                        indptr: stated.indptr,
-                    },
-                    (poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal, None) => {
-                        kernels_cuda::attn::ragged::RaggedMask::None
+                        poem_ir::RaggedMask::None
+                        | poem_ir::RaggedMask::GroupBlockDiagonal
+                        | poem_ir::RaggedMask::Stated,
+                        None,
+                    ) => kernels_cuda::attn::ragged::RaggedMask::None,
+                    (poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal, Some(_)) => {
+                        return Err(kernels_cuda::Error::Backend {
+                            op: "attn.ragged",
+                            detail: STATED_ONLY.to_string(),
+                        });
                     }
                     (poem_ir::RaggedMask::RelativeBias { .. }, Some(_)) => {
                         return Err(kernels_cuda::Error::Backend {
@@ -1475,13 +1483,8 @@ impl Run<'_> {
 
 impl Run<'_> {
     /// The fire's mask bits an attention applies, where its op reads them
-    /// (the plan binds each request's offset and word). ROCm's kernels apply
-    /// none: its classes take no lane stating a mask
-    /// (`exports::masked_classes`), and its arms run maskless.
+    /// (the plan binds each request's offset and word).
     pub(crate) fn applied_masks(&self, mask: Option<poem_ir::ValueId>) -> Option<kernels_cuda::Tensor> {
-        if cfg!(feature = "rocm") {
-            return None;
-        }
         mask.map(|mask| self.tensor(mask))
     }
 
@@ -1543,3 +1546,9 @@ impl Run<'_> {
         }
     }
 }
+
+/// Why a lane's mask over an attention its model does not state one on
+/// (`RaggedMask::Stated`) is refused.
+const STATED_ONLY: &str = "a lane states an attention mask over an attention its model states \
+                           none on: only an attention the model text spells \
+                           `stated_group_mask()` reads a lane's mask";

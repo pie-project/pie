@@ -94,12 +94,45 @@ __device__ __forceinline__ long long kv_token(const Paged& p, int req, int t, in
 
 // ---------------------------------------------------------------- decode --
 
+// A fire's per-lane masks as a decode reads them (`engine-cuda`'s
+// `mask::stage`): request r's word origin[r] (its boundary; bit 31, the wide
+// bit, says nothing to a decode row, its lane's last) and its plane of bits
+// from byte indptr[r]. Its single row reads key t where t < boundary, else
+// bit t - boundary of its plane; a boundary at or past its keys (the word
+// stating none, u32::MAX >> 1) reads no bit.
+struct DecodeMask {
+    const u8* bits;
+    const i64* indptr;
+    const u32* origin;
+};
+
+// One lane's mask, read once a block: its boundary, and its plane only when
+// some key lies past it.
+struct LaneMask {
+    int boundary;
+    const u8* plane;
+
+    __device__ __forceinline__ bool reads(int t) const {
+        return t < boundary || ((plane[(t - boundary) >> 3] >> ((t - boundary) & 7)) & 1u);
+    }
+};
+
+template <bool MASK>
+__device__ __forceinline__ LaneMask lane_mask(const DecodeMask& m, int req, int kv_len) {
+    if constexpr (!MASK) {
+        return LaneMask{0x7fffffff, nullptr};
+    } else {
+        const int boundary = static_cast<int>(m.origin[req] & 0x7fffffffu);
+        return LaneMask{boundary, boundary < kv_len ? m.bits + m.indptr[req] : nullptr};
+    }
+}
+
 // One block per (work item, kv head), WAVES wavefronts splitting the chunk's
 // tokens. Lane i of a wavefront scores token t0 + i for every query head of
 // the GQA group, the wavefront keeps an online softmax per head, and each
 // lane accumulates its D/kWave columns of the output.
-template <int D, int G, int WAVES, bool HND, bool FP8>
-__global__ __launch_bounds__(kWave* WAVES) void paged_decode(const Paged p) {
+template <int D, int G, int WAVES, bool HND, bool FP8, bool MASK>
+__global__ __launch_bounds__(kWave* WAVES) void paged_decode(const Paged p, const DecodeMask dm) {
     using KV = Kv<FP8>;
     constexpr int kCols = D / kWave;
     static_assert(D % kWave == 0, "a decode head is a whole number of lanes wide");
@@ -120,6 +153,7 @@ __global__ __launch_bounds__(kWave* WAVES) void paged_decode(const Paged p) {
 
     // The window keeps keys at or after kv_len - 1 - window_left.
     const int lo = p.window_left >= 0 ? max(start, kv_len - 1 - p.window_left) : start;
+    const LaneMask mask = lane_mask<MASK>(dm, req, kv_len);
 
     const bf16* qrow = p.q + static_cast<long long>(p.q_indptr[req]) * p.q_stride_n;
     for (int i = threadIdx.x; i < G * D; i += blockDim.x) {
@@ -139,7 +173,7 @@ __global__ __launch_bounds__(kWave* WAVES) void paged_decode(const Paged p) {
 
     for (int t0 = lo + wave * kWave; t0 < end; t0 += WAVES * kWave) {
         const int t = t0 + ln;
-        const bool live = t < end;
+        const bool live = t < end && (!MASK || mask.reads(t));
         float s[G];
 #pragma unroll
         for (int g = 0; g < G; ++g) s[g] = 0.f;
@@ -159,7 +193,8 @@ __global__ __launch_bounds__(kWave* WAVES) void paged_decode(const Paged p) {
 #pragma unroll
         for (int g = 0; g < G; ++g) {
             const float m_new = fmaxf(m[g], wave_max(live ? s[g] : neg_inf()));
-            const float alpha = exp2f(m[g] - m_new);
+            // (a wavefront whose keys a lane's mask hides all of keeps none)
+            const float alpha = m_new == neg_inf() ? 1.f : exp2f(m[g] - m_new);
             pr[g] = live ? exp2f(s[g] - m_new) : 0.f;
             l[g] = l[g] * alpha + wave_sum(pr[g]);
             m[g] = m_new;
@@ -244,8 +279,8 @@ __host__ __device__ constexpr int decode_fold_heads(int G, int D, int waves) {
 // accumulator quads for its head instead of G × 8 floats, and a round costs
 // D/16 MFMAs instead of G·D/8 FMAs a lane. The weights round to bf16 for the
 // product, as a prefill's do.
-template <int D, int G, bool HND, int WAVES, bool QL, bool PVM, bool FP8>
-__global__ __launch_bounds__(64 * WAVES) void paged_decode_mfma(const Paged p) {
+template <int D, int G, bool HND, int WAVES, bool QL, bool PVM, bool FP8, bool MASK>
+__global__ __launch_bounds__(64 * WAVES) void paged_decode_mfma(const Paged p, const DecodeMask dm) {
     using KV = Kv<FP8>;
     constexpr int SUB = 16, KT = SUB / 16, KP = D / 32;
     // Elements a value read takes: sixteen e4m3 codes (16 bytes) where the
@@ -294,6 +329,7 @@ __global__ __launch_bounds__(64 * WAVES) void paged_decode_mfma(const Paged p) {
     const int wave = threadIdx.x / kWave, l = lane();
     const int lo = p.window_left >= 0 ? max(start, kv_len - 1 - p.window_left) : start;
     const int g = l % 16, quad = l / 16;
+    const LaneMask mask = lane_mask<MASK>(dm, req, kv_len);
 
     // Qᵀ as B operands: this lane's column is head g, k pairs 8·quad. Held in
     // registers, except under QL: there every wavefront rereads them from
@@ -382,7 +418,7 @@ __global__ __launch_bounds__(64 * WAVES) void paged_decode_mfma(const Paged p) {
 #pragma unroll
             for (int t = 0; t < 4; ++t) {
                 const int key = t0 + kt * 16 + 4 * quad + t;
-                s[kt][t] = key < wend ? rel.score(s[kt][t], key) : neg_inf();
+                s[kt][t] = key < wend && (!MASK || mask.reads(key)) ? rel.score(s[kt][t], key) : neg_inf();
                 tmax = fmaxf(tmax, s[kt][t]);
             }
         tmax = fmaxf(tmax, __shfl_xor(tmax, 16, kWave));
@@ -582,8 +618,20 @@ __device__ __forceinline__ void prefill_item(bool causal, int& bx, int& kv_head)
     if (causal) bx = gridDim.x - 1 - bx;
 }
 
-template <int D, bool HND, bool CAUSAL, bool FP8>
-__global__ __launch_bounds__(512) void paged_prefill_wide(const Paged p) {
+// The masked form's two segments, a request each (`kernels_cuda`'s custom
+// mask): below `origin` its committed run, every key read (and cut at the
+// row's own position unless the word's wide bit is set); from `origin` on its
+// buffer, key j of query row r read where bit r·(kv_len − origin) + (j −
+// origin) of the request's plane is set, the plane from byte indptr[req],
+// least bit first. No origin table: origin 0, wide.
+struct PrefillMask {
+    const u8* bits;
+    const i64* indptr;
+    const u32* origin;
+};
+
+template <int D, bool HND, bool CAUSAL, bool MASK, bool FP8>
+__device__ __forceinline__ void paged_prefill_wide_body(const Paged& p, const PrefillMask& mask) {
     using KV = Kv<FP8>;
     constexpr int BC = prefill_bc<D>();
     constexpr int KS = D / 16;   // d tiles for Oᵀ
@@ -607,11 +655,21 @@ __global__ __launch_bounds__(512) void paged_prefill_wide(const Paged p) {
     const int kv_len = kv_length(p, req);
     const int chunk = *p.kv_chunk_size;
     const int wl = p.window_left >= 0 ? p.window_left : kv_len;
+    // A masked request is cut at each row's position unless its word is wide.
+    int origin = 0;
+    bool causal = CAUSAL;
+    const u8* bits = nullptr;
+    if constexpr (MASK) {
+        const u32 word = mask.origin != nullptr ? mask.origin[req] : 0x80000000u;
+        origin = static_cast<int>(word & 0x7fffffffu);
+        causal = (word >> 31) == 0;
+        bits = mask.bits + mask.indptr[req];
+    }
 
     const int kv_start = max(0, kv_len + (qo_tile * kPrefillTileQ) / G - qo_len - wl);
     const int chunk_start = p.partition ? min(kv_tile * chunk + kv_start, kv_len) : kv_start;
     int chunk_end = p.partition ? min((kv_tile + 1) * chunk + kv_start, kv_len) : kv_len;
-    if (CAUSAL) {
+    if (causal) {
         // No key past the tile's last query is seen by any row of it.
         const int last_token = min(qo_len, ((qo_tile + 1) * kPrefillTileQ + G - 1) / G) - 1;
         chunk_end = min(chunk_end, kv_len - qo_len + last_token + 1);
@@ -641,8 +699,10 @@ __global__ __launch_bounds__(512) void paged_prefill_wide(const Paged p) {
     for (int s = 0; s < KS; ++s) o[s] = mfma_cd{0.f, 0.f, 0.f, 0.f};
     float m = neg_inf(), l = 0.f;
     // The last key this row may see, and the first (the window).
-    const int key_hi = CAUSAL ? kv_len - qo_len + token : kv_len - 1;
+    const int key_hi = causal ? kv_len - qo_len + token : kv_len - 1;
     const int key_lo = kv_len - qo_len + token - wl;
+    // This row's bits of the buffer: key j's at row_bits + (j − origin).
+    const long long row_bits = static_cast<long long>(token) * (kv_len - origin);
 
     // A thread's reads of a tile: K piece c = tid + r·THREADS as (key c /
     // (D/8), columns 8·(c % (D/8))), a wavefront one key's row; V piece c as
@@ -725,7 +785,13 @@ __global__ __launch_bounds__(512) void paged_prefill_wide(const Paged p) {
 #pragma unroll
                 for (int t = 0; t < 4; ++t) {
                     const int key = kv0 + kt * 16 + 4 * quad + t;
-                    const bool seen = row_live && key < chunk_end && key <= key_hi && key >= key_lo;
+                    bool seen = row_live && key < chunk_end && key <= key_hi && key >= key_lo;
+                    if constexpr (MASK) {
+                        if (seen && key >= origin) {
+                            const long long bit = row_bits + (key - origin);
+                            seen = (bits[bit / 8] >> (bit % 8)) & 1u;
+                        }
+                    }
                     s[kt][t] = seen ? s[kt][t] * p.scale_log2 : neg_inf();
                     tile_max = fmaxf(tile_max, s[kt][t]);
                 }
@@ -784,6 +850,16 @@ __global__ __launch_bounds__(512) void paged_prefill_wide(const Paged p) {
     if (quad == 0 && p.lse != nullptr) p.lse[row * p.num_qo_heads + head] = l > 0.f ? m + log2f(l) : neg_inf();
 }
 
+template <int D, bool HND, bool CAUSAL, bool FP8>
+__global__ __launch_bounds__(512) void paged_prefill_wide(const Paged p) {
+    paged_prefill_wide_body<D, HND, CAUSAL, false, FP8>(p, PrefillMask{});
+}
+
+template <int D, bool HND>
+__global__ __launch_bounds__(512) void paged_prefill_wide_masked(const Paged p, const PrefillMask mask) {
+    paged_prefill_wide_body<D, HND, false, true, false>(p, mask);
+}
+
 // MFMA flash attention for heads up to 256, the wide kernel's products with
 // the page table in LDS, the next tile read into registers across an
 // LDS-only barrier (`lds_barrier`), and K / Vᵀ rows padded 8 bytes for the
@@ -800,8 +876,10 @@ constexpr int kSelTokens = 16;
 constexpr int kSelBlocks = 2048;
 constexpr int kSelWords = kSelBlocks / 32;
 
-template <int D, bool HND, bool CAUSAL, bool SEL, bool FP8>
-__device__ __forceinline__ void paged_prefill_body(const Paged& p, const PrefillSel& sel) {
+
+template <int D, bool HND, bool CAUSAL, bool SEL, bool MASK, bool FP8>
+__device__ __forceinline__ void paged_prefill_body(const Paged& p, const PrefillSel& sel,
+                                                   const PrefillMask& mask) {
     using KV = Kv<FP8>;
     constexpr int BC = 32, KT = BC / 16, KP = D / 32, DT = D / 16;
     constexpr int KPAD = D + 4, VPAD = BC + 4;
@@ -829,11 +907,21 @@ __device__ __forceinline__ void paged_prefill_body(const Paged& p, const Prefill
     const int kv_len = kv_length(p, req);
     const int chunk = *p.kv_chunk_size;
     const int wl = p.window_left >= 0 ? p.window_left : kv_len;
+    // A masked request is cut at each row's position unless its word is wide.
+    int origin = 0;
+    bool causal = CAUSAL;
+    const u8* bits = nullptr;
+    if constexpr (MASK) {
+        const u32 word = mask.origin != nullptr ? mask.origin[req] : 0x80000000u;
+        origin = static_cast<int>(word & 0x7fffffffu);
+        causal = (word >> 31) == 0;
+        bits = mask.bits + mask.indptr[req];
+    }
 
     const int kv_start = max(0, kv_len + (qo_tile * kPrefillTileQ) / G - qo_len - wl);
     const int chunk_start = p.partition ? min(kv_tile * chunk + kv_start, kv_len) : kv_start;
     int chunk_end = p.partition ? min((kv_tile + 1) * chunk + kv_start, kv_len) : kv_len;
-    if (CAUSAL) {
+    if (causal) {
         const int last_token = min(qo_len, ((qo_tile + 1) * kPrefillTileQ + G - 1) / G) - 1;
         chunk_end = min(chunk_end, kv_len - qo_len + last_token + 1);
     }
@@ -857,7 +945,9 @@ __device__ __forceinline__ void paged_prefill_body(const Paged& p, const Prefill
 #pragma unroll
     for (int s = 0; s < DT; ++s) o[s] = mfma_zero();
     float m = neg_inf(), l = 0.f;
-    const int key_hi = CAUSAL ? kv_len - qo_len + token : kv_len - 1;
+    const int key_hi = causal ? kv_len - qo_len + token : kv_len - 1;
+    // This row's bits of the buffer: key j's at row_bits + (j − origin).
+    const long long row_bits = static_cast<long long>(token) * (kv_len - origin);
     const int key_lo = kv_len - qo_len + token - wl;
 
     // The tile's tokens' selected blocks, and how many blocks each pools.
@@ -958,6 +1048,12 @@ __device__ __forceinline__ void paged_prefill_body(const Paged& p, const Prefill
                         const int b = key / sel.ratio;
                         seen = seen && (b >= sel_blocks[sel_row] || ((sel_bits[sel_row][b / 32] >> (b % 32)) & 1u));
                     }
+                    if constexpr (MASK) {
+                        if (seen && key >= origin) {
+                            const long long bit = row_bits + (key - origin);
+                            seen = (bits[bit / 8] >> (bit % 8)) & 1u;
+                        }
+                    }
                     s[kt][t] = seen ? rel.score(s[kt][t], key) : neg_inf();
                     tile_max = fmaxf(tile_max, s[kt][t]);
                 }
@@ -1015,12 +1111,17 @@ __device__ __forceinline__ void paged_prefill_body(const Paged& p, const Prefill
 
 template <int D, bool HND, bool CAUSAL, bool FP8>
 __global__ __launch_bounds__(512) void paged_prefill(const Paged p) {
-    paged_prefill_body<D, HND, CAUSAL, false, FP8>(p, PrefillSel{});
+    paged_prefill_body<D, HND, CAUSAL, false, false, FP8>(p, PrefillSel{}, PrefillMask{});
 }
 
 template <int D, bool HND>
 __global__ __launch_bounds__(512) void paged_prefill_selected(const Paged p, const PrefillSel sel) {
-    paged_prefill_body<D, HND, true, true, false>(p, sel);
+    paged_prefill_body<D, HND, true, true, false, false>(p, sel, PrefillMask{});
+}
+
+template <int D, bool HND>
+__global__ __launch_bounds__(512) void paged_prefill_masked(const Paged p, const PrefillMask mask) {
+    paged_prefill_body<D, HND, false, false, true, false>(p, PrefillSel{}, mask);
 }
 
 // ----------------------------------------------------------------- merge --

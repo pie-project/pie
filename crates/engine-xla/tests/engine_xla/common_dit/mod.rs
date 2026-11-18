@@ -153,7 +153,7 @@ impl ForwardHybrid for DoubleBlock {
             &indptr,
             HEAD_DIM,
             SM_SCALE,
-            RaggedMask::GroupBlockDiagonal,
+            RaggedMask::Stated,
         );
         let o = ops::gather::unpack_rows(&o, &perm);
         let (o_txt, o_img) = (

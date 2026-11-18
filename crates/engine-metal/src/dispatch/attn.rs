@@ -799,15 +799,23 @@ impl Run<'_> {
                     return Ok(());
                 }
                 let mask = match (mask, self.group_mask(*q_indptr, *kv_indptr)) {
-                    (RaggedMask::None | RaggedMask::GroupBlockDiagonal, Some(stated)) => {
-                        attn::ragged::RaggedMask::Custom {
-                            bits: stated.bits,
-                            indptr: stated.indptr,
-                        }
+                    (RaggedMask::Stated, Some(stated)) => attn::ragged::RaggedMask::Custom {
+                        bits: stated.bits,
+                        indptr: stated.indptr,
+                    },
+                    (RaggedMask::None | RaggedMask::GroupBlockDiagonal, Some(_)) => {
+                        return Err(kernels_metal::Error::Backend {
+                            op: "attn.ragged",
+                            detail: "a lane states an attention mask over an attention its model states \
+                                     none on: only an attention the model text spells \
+                                     `stated_group_mask()` reads a lane's mask"
+                                .to_string(),
+                        });
                     }
-                    (RaggedMask::None | RaggedMask::GroupBlockDiagonal, None) => {
-                        attn::ragged::RaggedMask::Segments
-                    }
+                    (
+                        RaggedMask::None | RaggedMask::GroupBlockDiagonal | RaggedMask::Stated,
+                        None,
+                    ) => attn::ragged::RaggedMask::Segments,
                     (RaggedMask::RelativeBias { .. }, Some(_)) => {
                         return Err(kernels_metal::Error::Backend {
                             op: "attn.ragged",

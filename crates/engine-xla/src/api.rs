@@ -421,6 +421,13 @@ impl Xla {
     }
 }
 
+/// What a program's compile made off the engine's thread
+/// (`Xla::prepare_program`).
+struct Compiled {
+    pending: crate::program::Pending,
+    staged: std::result::Result<Vec<std::sync::Arc<crate::guest::run::Staged>>, String>,
+}
+
 impl Engine for Xla {
     fn kind(&self) -> &'static str {
         "xla"
@@ -644,6 +651,42 @@ impl Engine for Xla {
             .register(registration, device)
             .map_err(refusal);
         self.refused(registered)
+    }
+
+    /// The program checked and its stage shapes named here; its stages
+    /// compile in the returned compile, off the engine's thread, while
+    /// fires go on (`Plane::prepare`).
+    fn prepare_program(
+        &mut self,
+        registration: &ProgramRegistration,
+    ) -> EngineResult<engine::ProgramCompile> {
+        let pending = self.programs.prepare(registration).map_err(refusal);
+        let pending = self.refused(pending)?;
+        let device = self.shell.as_ref().map(Shell::device_shared);
+        Ok(Box::new(move || {
+            let staged = match &device {
+                Some(device) => pending.compile(device),
+                None => Ok(Vec::new()),
+            };
+            engine::Prepared(Box::new(Compiled { pending, staged }))
+        }))
+    }
+
+    /// The stages a prepared program's compile made held, and the program
+    /// registered (`Plane::finish`).
+    fn finish_program(&mut self, prepared: engine::Prepared) -> EngineResult<ProgramId> {
+        let Ok(compiled) = prepared.0.downcast::<Compiled>() else {
+            return Err(Error::Program(
+                "a prepared program XLA did not prepare".to_string(),
+            ));
+        };
+        let Compiled { pending, staged } = *compiled;
+        let registered = self.programs.finish(pending, staged).map_err(refusal);
+        self.refused(registered)
+    }
+
+    fn close_program(&mut self, program: ProgramId) -> EngineResult<()> {
+        self.programs.close_program(program).map_err(refusal)
     }
 
     /// XLA's readouts ([`engine::Engine::readout_facts`]): every output

@@ -97,6 +97,9 @@ pub struct Shell {
     /// The classes a stated mask reaches as a group's (a ragged attention):
     /// a lane there states one or none.
     group_masked: poem_ir::ClassSet,
+    /// The ragged packings an attention stating a mask reads, a fire's
+    /// group masks staged in their order (`exports::stated_feeds`).
+    stated_feeds: Vec<(poem_ir::Selection, poem_ir::Selection)>,
     wide: poem_ir::ClassSet,
     feeds: crate::exports::Feeds,
     corrected: poem_ir::ClassSet,
@@ -819,6 +822,31 @@ impl Shell {
         self.programs.prewarm(&self.device, registrations)
     }
 
+    /// A program's registration, first step ([`crate::program::Plane::prepare`]):
+    /// its build runs off the engine's thread.
+    pub fn prepare_program(
+        &mut self,
+        registration: &engine::program::ProgramRegistration,
+    ) -> Result<crate::program::Pending> {
+        // The regions it plans to build that no prewarm or earlier
+        // registration built: each a module built after ready.
+        let before = self.programs.built_late();
+        let prepared = self.programs.prepare(&self.device, registration);
+        let late = self.programs.built_late() - before;
+        if late != 0 {
+            self.live.tally(engine::live::Tally::BuiltAfterReady, late);
+        }
+        prepared
+    }
+
+    /// A program's registration, last step ([`crate::program::Plane::finish`]).
+    pub fn finish_program(
+        &mut self,
+        pending: crate::program::Pending,
+    ) -> Result<engine::ProgramId> {
+        self.programs.finish(pending)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn bind_program(
         &mut self,
@@ -1025,6 +1053,11 @@ impl Shell {
     ) -> Result<Option<&mut ProgramSession>> {
         self.reap_landed_guests()?;
         Ok(self.programs.instance_mut(instance_id))
+    }
+
+    /// Releases a registered program no instance binds.
+    pub fn close_program(&mut self, id: engine::ProgramId) -> Result<()> {
+        self.programs.close_program(id)
     }
 
     pub fn close_program_instance(&mut self, instance_id: engine::InstanceId) -> Result<()> {

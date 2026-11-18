@@ -114,6 +114,7 @@ fn fa2_decode(
     o: &mut Tensor,
     lse: Option<&mut Tensor>,
     rel: Option<RelBias>,
+    mask: Option<paged::DecodeMask>,
 ) -> Result<(), Error> {
     dtype_dispatch!(op, q.data.dtype, { Bf16 => () });
     attention_lands(op, q.data, o);
@@ -121,7 +122,7 @@ fn fa2_decode(
     lanes_carry(op, &q, plan.shape.lane_offset, plan.shape.num_requests)?;
 
     if let Some(rel) = rel {
-        if lse.is_some() {
+        if lse.is_some() || mask.is_some() {
             return Err(Error::Unsupported { op });
         }
         // The matrix-core decode where it takes the group and width.
@@ -137,6 +138,7 @@ fn fa2_decode(
                 o,
                 0,
                 Some(rel.walked(q.data.rows, plan.shape.num_q_heads)?),
+                None,
             );
         }
         return rel::walk(
@@ -170,6 +172,7 @@ fn fa2_decode(
         o,
         lse_ptr,
         None,
+        mask,
     )
 }
 
@@ -225,9 +228,6 @@ fn fa2_prefill(
             o,
         );
     }
-    if mask.is_some() {
-        return Err(Error::Unsupported { op });
-    }
     let lse_ptr = match &lse {
         Some(lse) => {
             lse_plane(op, lse, q.data.rows, plan.shape.num_q_heads);
@@ -235,6 +235,24 @@ fn fa2_prefill(
         }
         None => 0,
     };
+    if let Some((bits, indptr)) = mask {
+        return paged::prefill_masked(
+            ctx,
+            op,
+            q,
+            plan,
+            pool,
+            window_left,
+            sm_scale,
+            o,
+            lse_ptr,
+            paged::PrefillMask {
+                bits: bits.ptr,
+                indptr: indptr.ptr,
+                origin: plan.mask_origin.map_or(0, |origin| origin.ptr),
+            },
+        );
+    }
     paged::prefill(
         ctx,
         op,
@@ -249,6 +267,31 @@ fn fa2_prefill(
     )
 }
 
+/// A decode's mask, where the fire stated one: its bits, and the plan's
+/// offsets and words the fire staged beside them; refused by name where the
+/// plan carries neither.
+fn decode_mask(
+    op: &'static str,
+    plan: &DecodePlan,
+    mask: Option<Tensor>,
+) -> Result<Option<paged::DecodeMask>, Error> {
+    let Some(bits) = mask else {
+        return Ok(None);
+    };
+    let (Some(indptr), Some(origin)) = (plan.mask_indptr, plan.mask_origin) else {
+        return Err(refuse(
+            op,
+            "a lane's attention mask reaches a decode whose plan carries no mask offsets or \
+             words (the engine sets them at the plan, where the fire staged them)",
+        ));
+    };
+    Ok(Some(paged::DecodeMask {
+        bits: bits.ptr,
+        indptr: indptr.ptr,
+        origin: origin.ptr,
+    }))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn decode(
     ctx: &Ctx,
@@ -261,16 +304,11 @@ pub fn decode(
     o: &mut Tensor,
     mask: Option<Tensor>,
 ) -> Result<(), Error> {
-    if mask.is_some() {
-        return Err(refuse(
-            "attn.decode",
-            "ROCm's decode applies no lane's attention mask; its classes take none",
-        ));
-    }
     const OP: &str = "attn.decode";
     plan.accepts(OP, head_dim, window)?;
+    let mask = decode_mask(OP, plan, mask)?;
     fa2_decode(
-        ctx, OP, q, plan, pool, window, head_dim, sm_scale, o, None, None,
+        ctx, OP, q, plan, pool, window, head_dim, sm_scale, o, None, None, mask,
     )
 }
 
@@ -287,14 +325,9 @@ pub fn decode_lse(
     lse: &mut Tensor,
     mask: Option<Tensor>,
 ) -> Result<(), Error> {
-    if mask.is_some() {
-        return Err(refuse(
-            "attn.decode",
-            "ROCm's decode applies no lane's attention mask; its classes take none",
-        ));
-    }
     const OP: &str = "attn.decode";
     plan.accepts(OP, head_dim, window)?;
+    let mask = decode_mask(OP, plan, mask)?;
     fa2_decode(
         ctx,
         OP,
@@ -307,6 +340,7 @@ pub fn decode_lse(
         o,
         Some(lse),
         None,
+        mask,
     )
 }
 
@@ -564,6 +598,7 @@ pub fn decode_rel(
         o,
         None,
         Some(rel),
+        None,
     )
 }
 

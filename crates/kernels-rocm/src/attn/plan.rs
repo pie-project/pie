@@ -107,6 +107,12 @@ pub struct DecodePlan {
     pub mask_indptr: Option<Tensor>,
     pub mask_origin: Option<Tensor>,
     pub device: Device,
+    /// The fire's mask offsets (i64, one a request and one past) and words
+    /// (u32 a request), where it staged them: a decode reading a lane's mask
+    /// finds the lane's here. `plan_decode` leaves them `None`; the engine
+    /// sets them.
+    pub mask_indptr: Option<Tensor>,
+    pub mask_origin: Option<Tensor>,
 }
 
 impl DecodePlan {
@@ -370,6 +376,8 @@ pub fn plan_decode(
         mask_indptr: None,
         mask_origin: None,
         device: *device,
+        mask_indptr: None,
+        mask_origin: None,
     })
 }
 
