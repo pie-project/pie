@@ -63,6 +63,7 @@ mod a_guest_slot_parks_on_the_host_and_comes_back;
 #[cfg(feature = "cuda")]
 mod a_joined_projection_answers_what_its_legs_answer;
 mod a_lane_sampler_draws_what_the_interpreter_draws;
+mod a_loads_census_is_its_own_in_either_order;
 mod a_missing_or_misshapen_input_feed_is_refused_by_name;
 mod a_nucleus_cut_agrees_with_the_host_interpreter;
 mod a_padded_row_writes_nothing;
