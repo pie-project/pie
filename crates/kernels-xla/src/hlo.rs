@@ -292,6 +292,59 @@ pub struct Func {
     /// From this many rows a dot's wide activation is laid out before it
     /// (`tuning::DotBarrierRows`; 0 never).
     dot_barrier_rows: i64,
+    /// The values of the pure ops emitted at the body's top level, by their
+    /// text with the names they mint made canonical (`Func::shared`): an op
+    /// emitted again with the same operands is the value it already is.
+    shared: std::collections::HashMap<String, Vec<Val>>,
+}
+
+/// `text` (an op the body emitted, `first` its own id) with every name it
+/// mints (`%N`, `%bN` with `N >= first`) made relative to `first`, and its
+/// locations cut: two emissions of one op over the same operands read the
+/// same.
+fn canonical(text: &str, first: u32) -> String {
+    let mut out = String::with_capacity(text.len());
+    let b = text.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if text[i..].starts_with(" loc(\"") {
+            // a location ends at its closing quote and paren
+            if let Some(end) = text[i + 6..].find("\")") {
+                i += 6 + end + 2;
+                continue;
+            }
+        }
+        if b[i] == b'%' {
+            let mut j = i + 1;
+            let block = j < b.len() && b[j] == b'b';
+            if block {
+                j += 1;
+            }
+            let start = j;
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > start
+                && let Ok(n) = text[start..j].parse::<u32>()
+            {
+                out.push('%');
+                if block {
+                    out.push('b');
+                }
+                if n >= first {
+                    out.push('~');
+                    out.push_str(&(n - first).to_string());
+                } else {
+                    out.push_str(&n.to_string());
+                }
+                i = j;
+                continue;
+            }
+        }
+        out.push(b[i] as char);
+        i += 1;
+    }
+    out
 }
 
 fn list<T: fmt::Display>(xs: &[T]) -> String {
@@ -409,6 +462,7 @@ impl Func {
             materialized: Vec::new(),
             xla_reads: false,
             dot_barrier_rows: 0,
+            shared: std::collections::HashMap::new(),
         }
     }
 
@@ -565,21 +619,32 @@ impl Func {
     /// Emits `op` with generic syntax; one result.
     fn op(&mut self, op: &str, operands: &[Val], attrs: &str, out: Ty) -> Val {
         let operands = &self.solid(operands, op);
-        let id = self.next;
-        self.next += 1;
-        let name = format!("%{id}");
         let attrs = if attrs.is_empty() {
             String::new()
         } else {
             format!(" {{{attrs}}}")
         };
-        let text = format!(
-            "{name} = \"stablehlo.{op}\"({}){attrs} : ({}) -> {out}",
+        let rest = format!(
+            "\"stablehlo.{op}\"({}){attrs} : ({}) -> {out}",
             self.names_of(operands),
             self.tys_of(operands)
         );
-        self.line(&text);
-        self.fresh(name, out)
+        // A pure op at the top level over the same operands is the value it
+        // already is: a fire's values each layer derives alike (its tables'
+        // reads, a lane's ranges, the page lists) are derived once.
+        let top = self.depth == 1;
+        if top && let Some(v) = self.shared.get(&rest) {
+            return v[0];
+        }
+        let id = self.next;
+        self.next += 1;
+        let name = format!("%{id}");
+        self.line(&format!("{name} = {rest}"));
+        let v = self.fresh(name, out);
+        if top {
+            self.shared.insert(rest, vec![v]);
+        }
+        v
     }
 
     /// Emits an op of any dialect (`"chlo.ragged_dot"`) with generic
@@ -610,13 +675,19 @@ impl Func {
         } else {
             format!("({})", list(&outs))
         };
-        let text = format!(
-            "{head} = \"{name}\"({}){attrs} : ({}) -> {results}",
+        let rest = format!(
+            "\"{name}\"({}){attrs} : ({}) -> {results}",
             self.names_of(operands),
             self.tys_of(operands)
         );
-        self.line(&text);
-        outs.into_iter()
+        // A kernel call is never shared: it may write an operand in place.
+        let top = self.depth == 1 && name != "stablehlo.custom_call";
+        if top && let Some(vs) = self.shared.get(&rest) {
+            return vs.clone();
+        }
+        self.line(&format!("{head} = {rest}"));
+        let vs: Vec<Val> = outs
+            .into_iter()
             .enumerate()
             .map(|(i, ty)| {
                 let n = if single {
@@ -626,7 +697,11 @@ impl Func {
                 };
                 self.fresh(n, ty)
             })
-            .collect()
+            .collect();
+        if top {
+            self.shared.insert(rest, vs.clone());
+        }
+        vs
     }
 
     /// `stablehlo.custom_call @target` (API version 1) with a string
@@ -652,6 +727,14 @@ impl Func {
         outs: Vec<Ty>,
         aliases: &[(usize, usize)],
     ) -> Vec<Val> {
+        // An operand a result is written over in place is spent: a value
+        // shared by its op text (`Func::shared`) is no longer what that text
+        // makes, so a later emission of the text is its own value.
+        for &(_, operand) in aliases {
+            if let Some(&v) = operands.get(operand) {
+                self.shared.retain(|_, vs| !vs.contains(&v));
+            }
+        }
         let layout = |t: &Ty| {
             let r = t.rank();
             let order: Vec<i64> = (0..r as i64).rev().collect();
@@ -715,18 +798,27 @@ impl Func {
         } else {
             format!(" {{{attrs}}}")
         };
-        let text = format!(
-            "%{id}:{} = \"stablehlo.{op}\"({}){attrs} : ({}) -> ({})",
-            outs.len(),
+        let rest = format!(
+            "\"stablehlo.{op}\"({}){attrs} : ({}) -> ({})",
             self.names_of(operands),
             self.tys_of(operands),
             list(&outs)
         );
+        let top = self.depth == 1;
+        if top && let Some(vs) = self.shared.get(&rest) {
+            return vs.clone();
+        }
+        let text = format!("%{id}:{} = {rest}", outs.len());
         self.line(&text);
-        outs.into_iter()
+        let vs: Vec<Val> = outs
+            .into_iter()
             .enumerate()
             .map(|(i, ty)| self.fresh(format!("%{id}#{i}"), ty))
-            .collect()
+            .collect();
+        if top {
+            self.shared.insert(rest, vs.clone());
+        }
+        vs
     }
 
     /// Emits an op carrying one region. `region` receives the block arguments
@@ -743,6 +835,8 @@ impl Func {
         let operands = &self.solid(operands, op);
         let id = self.next;
         self.next += 1;
+        let top = self.depth == 1;
+        let from = self.body.len();
         let head = if outs.len() == 1 {
             format!("%{id}")
         } else {
@@ -766,8 +860,16 @@ impl Func {
             list(&outs)
         );
         self.line(&text);
+        // The same op over the same operands, its region alike, emitted at
+        // the top level before: its values (the text just emitted is cut).
+        let key = top.then(|| canonical(&self.body[from..], id));
+        if let Some(vs) = key.as_ref().and_then(|k| self.shared.get(k)) {
+            let vs = vs.clone();
+            self.body.truncate(from);
+            return Ok(vs);
+        }
         let single = outs.len() == 1;
-        Ok(outs
+        let vs: Vec<Val> = outs
             .into_iter()
             .enumerate()
             .map(|(i, ty)| {
@@ -778,7 +880,11 @@ impl Func {
                 };
                 self.fresh(name, ty)
             })
-            .collect())
+            .collect();
+        if let Some(k) = key {
+            self.shared.insert(k, vs.clone());
+        }
+        Ok(vs)
     }
 
     fn block(

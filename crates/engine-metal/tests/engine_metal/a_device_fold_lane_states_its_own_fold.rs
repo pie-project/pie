@@ -153,8 +153,12 @@ fn fire_with_fold(lanes: u32, fold: &[u32]) -> Option<String> {
     let layout = shell.pool_layout();
     let instance = layout.instance.expect("an instance shape");
     let channel = layout.channel.expect("a channel shape");
-    let slots: Vec<u32> = (instance.per_chunk..instance.per_chunk + facts.instance.slots).collect();
-    let mut next = 2 * channel.per_chunk;
+    // From the first chunk no slot holds: past the engine's tables run,
+    // which no slot names, and the seats' runs.
+    let free = layout.free_chunk();
+    let first = free * instance.per_chunk;
+    let slots: Vec<u32> = (first..first + facts.instance.slots).collect();
+    let mut next = (free + 1) * channel.per_chunk;
     let rings: Vec<engine::RingSlots> = facts
         .rings
         .iter()

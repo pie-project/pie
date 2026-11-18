@@ -80,6 +80,13 @@ impl Shelf {
                         text: derived(device, facts),
                     });
                 }
+                // A device the derived profile serves keeps what is its
+                // own (its rates and fire times) in `derived/<id>.toml`.
+                for (path, text) in self.devices(DERIVED_DIR) {
+                    if target(registry, text).is_some_and(|t| names(&t, device)) {
+                        layers.push(seeded(path, text));
+                    }
+                }
             }
         }
         layers.extend(self.user(device, profiles));
@@ -225,10 +232,25 @@ impl Shelf {
         }
         for (name, _) in self.seeded.iter().filter(|(n, _)| n.contains('/')) {
             let (dir, _) = name.split_once('/').expect("a device file");
-            if name.matches('/').count() > 1 || !families.iter().any(|(f, _)| stem(f) == dir) {
+            let filed = dir == DERIVED_DIR || families.iter().any(|(f, _)| stem(f) == dir);
+            if name.matches('/').count() > 1 || !filed {
                 return Err(format!(
                     "{name} is not in the directory of a family file: a device file is <family>/<device>.toml beside <family>.toml"
                 ));
+            }
+        }
+        // A device the derived profile serves: its file names it, is filed
+        // under its id, and is read over nothing.
+        for (name, text) in self.devices(DERIVED_DIR) {
+            let file = read(name, text, None)?;
+            let Some(device) = &file.target.device else {
+                return Err(format!(
+                    "{name} is a device file of the derived profile, and names no device"
+                ));
+            };
+            let filed = format!("{DERIVED_DIR}/{}.toml", id_of(device));
+            if filed != name {
+                return Err(format!("{name} names `{device}`, filed as {filed}"));
             }
         }
         for (family, family_file) in &families {
@@ -262,6 +284,9 @@ fn seeded(path: &str, text: &str) -> Candidate {
         text: text.to_string(),
     }
 }
+
+/// Where a device the derived profile serves keeps its own file.
+const DERIVED_DIR: &str = "derived";
 
 /// `apple9` of `apple9.toml`.
 fn stem(path: &str) -> &str {

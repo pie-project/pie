@@ -40,7 +40,7 @@ pub(crate) fn split_kv_a_norm(
             PREP,
             &format!("::pie::attn::mla::mla_latents<{t}, 256>"),
         ))
-        .apply(rms(kv_a.rows).programmatic(ctx.tuning().pdl)),
+        .apply(rms(kv_a.rows).programmatic(ctx.tuning().pdl())),
         &[
             kv_a.arg(),
             weight.arg(),
@@ -83,7 +83,7 @@ pub fn split_q_b(
                 PREP,
                 &format!("::pie::attn::mla::mla_split_q_b_vec8<{t}>"),
             ))
-            .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1]).programmatic(ctx.tuning().pdl)),
+            .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1]).programmatic(ctx.tuning().pdl())),
             &[
                 q_b.arg(),
                 q_nope.arg(),

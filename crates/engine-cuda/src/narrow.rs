@@ -4,10 +4,15 @@
 
 use poem_ir::{Dtype, Elemwise, Operands, Operation, Ssm, Trace, Ty};
 
-/// The rewrite, or the trace as it was when `on` is false.
+/// The rewrite, or the trace as it was when `on` says no; asked only of a
+/// trace with a chunked walk, so a model without one never reads it.
 #[must_use]
-pub fn gdn_out_bf16(mut trace: Trace, on: bool) -> Trace {
-    if !on {
+pub fn gdn_out_bf16(mut trace: Trace, on: impl FnOnce() -> bool) -> Trace {
+    let walks = trace
+        .nodes
+        .iter()
+        .any(|node| matches!(node.op, Operation::Ssm(Ssm::GatedDeltaChunked { .. })));
+    if !walks || !on() {
         return trace;
     }
     let mut readers = vec![0u32; trace.values.len()];

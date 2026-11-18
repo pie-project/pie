@@ -23,10 +23,8 @@ impl Replay {
     /// (`kernel.sdpa.compressed_replay`) and its trace reads the floor.
     #[must_use]
     pub fn of(shell: &Shell) -> Option<Replay> {
-        if !shell.tuning().compressed_replay {
-            return None;
-        }
-        Replay::in_trace(shell.trace())
+        let replay = Replay::in_trace(shell.trace())?;
+        shell.tuning().compressed_replay().then_some(replay)
     }
 
     /// The replay `trace` states: its `encode` fact and its floored

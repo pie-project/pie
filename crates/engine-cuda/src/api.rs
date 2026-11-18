@@ -414,9 +414,36 @@ pub(crate) fn lattice(
     }
 }
 
-/// The rows a fire takes when neither `max_forward_tokens` nor the chip's
-/// profile states them.
+/// The rows a patch ladder is derived from when a load states no tokens.
 pub(crate) const DEFAULT_FORWARD_TOKENS: u32 = 8192;
+
+/// The rung lattice under `engine` up to `top`: [`default_lattice`]'s
+/// points below it and `top` itself. With `top` the load's context, the
+/// candidates a load with no stated buckets weighs its fire top among.
+#[must_use]
+pub(crate) fn rung_lattice(engine: &crate::chip::Engine, top: u32) -> Vec<u32> {
+    default_lattice(
+        top,
+        engine.lattice_steps,
+        engine.prefill_lattice_from,
+        engine.prefill_lattice_steps,
+    )
+}
+
+/// The widest rung of [`rung_lattice`] to `top` at or below `tokens` (its
+/// first where none is): a load asked other tokens (the walk fit,
+/// `engine.fire_rows`, a stated `max_forward_tokens`, a refit) lays no last
+/// point off the grid.
+#[must_use]
+pub(crate) fn on_lattice(engine: &crate::chip::Engine, top: u32, tokens: u32) -> u32 {
+    let lattice = rung_lattice(engine, top);
+    lattice
+        .iter()
+        .rev()
+        .copied()
+        .find(|&rung| rung <= tokens)
+        .unwrap_or(lattice[0])
+}
 
 /// The load's budgets for `trace`: its logit readouts sized to what the
 /// trace drafts, not the general 16 a lane, so a vocab-wide head carves only
@@ -606,17 +633,49 @@ impl Engine for Cuda {
             width_free(&trace.name),
         )?;
         let (contract, plan) = self.settle(&trace, &path, &residency)?;
+        let kv_budget = match (residency.device_kv_budget, residency.device_kv_tokens) {
+            (Some(_), Some(_)) => {
+                return Err(Error::Load(
+                    "the load states the device pool both in bytes (`device_kv_budget`) and \
+                     in kv tokens (`[engine.memory] kv_device_tokens`); state one"
+                        .into(),
+                ));
+            }
+            (Some(bytes), None) => Some(crate::store::KvSize::Bytes(bytes)),
+            (None, Some(tokens)) => Some(crate::store::KvSize::Tokens(tokens)),
+            (None, None) => None,
+        };
+        // Every rank on the host seats its own tier: a tensor-parallel
+        // group's and each expert-parallel rank's.
+        let ranks = self.boot.world.size * self.expert.size;
+        let max_tokens = if budgets.max_tokens == 0 {
+            16_384
+        } else {
+            budgets.max_tokens
+        };
+        // The host tier's staging ring is page-locked here, before anything
+        // measures the device: on an integrated device the ring and the
+        // device draw on the same memory, and what the ring holds is then
+        // gone from the driver's free bytes and Windows' commit alike. A
+        // ring that cannot be pinned refuses the load, here and not after
+        // ready.
+        let ring = crate::store::staging_ring_for(
+            &trace,
+            budgets.page_size,
+            budgets.max_context,
+            max_tokens,
+            residency.host_kv_budget,
+            ranks,
+        )
+        .and_then(|bytes| bytes.map(crate::store::Ring::pin).transpose())
+        .map_err(fault)?;
         let mut budgets = budgets;
-        if budgets.context_declared && residency.device_kv_budget.is_none() {
+        if budgets.context_declared && kv_budget.is_none() {
             let fits = crate::store::declared_context_that_fits(
                 &trace,
                 budgets.page_size,
                 budgets.max_context,
-                if budgets.max_tokens == 0 {
-                    16_384
-                } else {
-                    budgets.max_tokens
-                },
+                max_tokens,
                 residency.device,
                 plan.device_demand(),
             )
@@ -649,9 +708,9 @@ impl Engine for Cuda {
             voxels,
             page_size: budgets.page_size,
             context: budgets.max_context,
-            context_declared: budgets.context_declared && residency.device_kv_budget.is_none(),
+            context_declared: budgets.context_declared && kv_budget.is_none(),
             slots: budgets.slots,
-            kv_budget: residency.device_kv_budget,
+            kv_budget,
             allowance: residency.device,
             ordinal: if ordinal >= 0 {
                 ordinal
@@ -690,9 +749,8 @@ impl Engine for Cuda {
                 residency.host_kv_budget,
                 residency.kv_seats.unwrap_or(budgets.max_lanes),
                 budgets.max_context,
-                // Every rank on the host seats its own: a tensor-parallel
-                // group's and each expert-parallel rank's.
-                self.boot.world.size * self.expert.size,
+                ranks,
+                ring,
             )
             .map_err(fault)?;
         let kv_handle = if residency.kv_export {
@@ -1028,6 +1086,40 @@ impl Engine for Cuda {
     fn prewarm_programs(&mut self, registrations: &[ProgramRegistration]) -> EngineResult<()> {
         self.loaded_mut()
             .and_then(|shell| shell.prewarm_programs(registrations).map_err(fault))
+    }
+
+    /// The program adopted and its build planned here; its regions compile
+    /// (NVRTC, or the kernel cache's files) in the returned compile, off
+    /// the engine's thread, while fires go on. Their modules load into the
+    /// context at [`Engine::finish_program`].
+    fn prepare_program(
+        &mut self,
+        registration: &ProgramRegistration,
+    ) -> EngineResult<engine::ProgramCompile> {
+        let prepared = self
+            .loaded_mut()
+            .and_then(|shell| shell.prepare_program(registration).map_err(fault));
+        let mut pending = self.refused(prepared)?;
+        Ok(Box::new(move || {
+            pending.build();
+            engine::Prepared(Box::new(pending))
+        }))
+    }
+
+    fn finish_program(&mut self, prepared: engine::Prepared) -> EngineResult<ProgramId> {
+        let Ok(pending) = prepared.0.downcast::<crate::program::Pending>() else {
+            return Err(Error::Program(
+                "a prepared program CUDA did not prepare".to_string(),
+            ));
+        };
+        let registered = self
+            .loaded_mut()
+            .and_then(|shell| shell.finish_program(*pending).map_err(fault));
+        self.refused(registered)
+    }
+
+    fn close_program(&mut self, program: ProgramId) -> EngineResult<()> {
+        self.loaded_mut()?.close_program(program).map_err(fault)
     }
 
     fn settles_asynchronously(&self) -> bool {

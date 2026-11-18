@@ -62,6 +62,12 @@ impl Serve for Api {
         crate::chip::SHELF.tell_untuned(&measured.name, &report);
         let tuning = crate::tuning::Tuning::new(chip, device.cores())
             .with_workgroup_bytes(device.workgroup_bytes());
+        // A device whose profile lacks the roofline's constants measures
+        // them here, before ready, and keeps them in the user's profile (a
+        // browser masks its adapter, so no profile states its rates, and
+        // keeps them for its load alone). No bound on one submission is
+        // stated on wgpu yet.
+        let tuning = crate::rates::at_load(&device, tuning, boot.profiles.as_deref(), None)?;
         Ok((device, tuning))
     }
 

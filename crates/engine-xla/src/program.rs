@@ -565,6 +565,21 @@ impl Plane {
         registration: &ProgramRegistration,
         device: Option<&crate::device::Device>,
     ) -> Result<ProgramId, Refusal> {
+        let pending = self.prepare(registration)?;
+        let staged = match device {
+            Some(device) => pending.compile(device),
+            None => Ok(Vec::new()),
+        };
+        self.finish(pending, staged)
+    }
+
+    /// A registration's first step, on the engine's thread: the program
+    /// interprets and every stage lowers (else refused by name), and the
+    /// stage shapes its passes take are named; nothing compiles yet. Its
+    /// compile ([`Pending::compile`]) runs on any thread, and
+    /// [`Plane::finish`] makes it the program. Until then no instance of
+    /// it binds.
+    pub fn prepare(&mut self, registration: &ProgramRegistration) -> Result<Pending, Refusal> {
         let plan = eta_exec::adopt_launch_package(registration.launch.clone())
             .map_err(|error| Refusal::Program(error.to_string()))?;
         if !plan.executable {
@@ -574,34 +589,79 @@ impl Plane {
                 plan.reject_reason.as_deref().unwrap_or("no reason given")
             )));
         }
-        self.next_program += 1;
-        let id = ProgramId(self.next_program);
-
-        if !self.forms.admit(id, &plan.package) {
-            let why = self
-                .forms
-                .refusal(id)
-                .map_or_else(String::new, ToString::to_string);
-            self.forms.forget(id);
-            return Err(Refusal::Program(format!(
+        // A guest runs on the device or is refused here, by name. Nothing
+        // of the plane's is touched until the finish, which assigns the id:
+        // a prepare whose compile never finishes leaves nothing behind.
+        let form = crate::guest::form_of(&plan.package).map_err(|why| {
+            Refusal::Program(format!(
                 "a stage of program 0x{:016x} does not lower on XLA: {why}",
                 registration.program_hash
-            )));
-        }
-        if let (Some(device), Some(form)) = (device, self.forms.get(id).cloned())
-            && let Err(why) =
-                self.stages
-                    .compile_all(device, &plan.package, form.key, &form.pooled())
-        {
-            self.forms.forget(id);
-            return Err(Refusal::Program(format!(
-                "a stage of program 0x{:016x} does not compile: {why}",
-                registration.program_hash
-            )));
+            ))
+        })?;
+        let wanted = self
+            .stages
+            .wanted(&plan.package, form.key, &form.pooled())
+            .map_err(|why| {
+                Refusal::Program(format!(
+                    "a stage of program 0x{:016x} does not compile: {why}",
+                    registration.program_hash
+                ))
+            })?;
+        Ok(Pending {
+            hash: registration.program_hash,
+            form,
+            plan: Arc::new(plan),
+            wanted,
+            pool_rows: self.stages.pool_rows(),
+        })
+    }
+
+    /// A registration's last step, on the engine's thread: the stages its
+    /// compile made held, and the program registered; a compile that
+    /// refused refuses it.
+    pub fn finish(
+        &mut self,
+        pending: Pending,
+        staged: Result<Vec<Arc<crate::guest::run::Staged>>, String>,
+    ) -> Result<ProgramId, Refusal> {
+        let Pending {
+            hash,
+            form,
+            plan,
+            wanted,
+            ..
+        } = pending;
+        let staged = staged.map_err(|why| {
+            Refusal::Program(format!(
+                "a stage of program 0x{hash:016x} does not compile: {why}"
+            ))
+        })?;
+        self.next_program += 1;
+        let id = ProgramId(self.next_program);
+        let key = form.key;
+        self.forms.hold(id, Ok(form));
+        if !staged.is_empty() {
+            self.stages.install(key, wanted, staged);
         }
         tracing::debug!(program = id.0, "guest program registered");
-        self.programs.insert(id, Arc::new(plan));
+        self.programs.insert(id, plan);
         Ok(id)
+    }
+
+    /// Releases `id`, which no instance binds (`Engine::close_program`):
+    /// its id answers nothing after.
+    pub fn close_program(&mut self, id: ProgramId) -> Result<(), Refusal> {
+        if self.instances.values().any(|instance| instance.program == id) {
+            return Err(Refusal::Program(format!(
+                "program {id} still has an instance bound"
+            )));
+        }
+        self.programs.remove(&id).ok_or(Refusal::Closed {
+            what: "program",
+            id: id.0,
+        })?;
+        self.forms.forget(id);
+        Ok(())
     }
 
     #[must_use]
@@ -1881,5 +1941,30 @@ mod latch_tests {
         );
         drop(heard);
         event.join().expect("the event thread");
+    }
+}
+
+/// A program a registration prepared ([`Plane::prepare`]): what its
+/// compile, on any thread, compiles, and what [`Plane::finish`] holds.
+pub struct Pending {
+    hash: u64,
+    /// Its form: every stage lowers.
+    form: Arc<crate::guest::Compiled>,
+    plan: Arc<ExecPlan>,
+    wanted: Vec<crate::guest::run::Want>,
+    pool_rows: i64,
+}
+
+impl Pending {
+    /// Every stage shape the program's passes take, compiled on `device`
+    /// (on whatever thread calls this).
+    pub fn compile(
+        &self,
+        device: &crate::device::Device,
+    ) -> Result<Vec<Arc<crate::guest::run::Staged>>, String> {
+        if self.wanted.is_empty() {
+            return Ok(Vec::new());
+        }
+        crate::guest::run::compile_wanted(device, &self.plan.package, &self.wanted, self.pool_rows)
     }
 }

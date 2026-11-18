@@ -1787,9 +1787,21 @@ impl Shell {
         // the classes do (a mixed bucket-256 fire's two classes rung 256
         // each), and the carve a fire of the bucket takes (the forked arena,
         // an activation rung) holds no more readout rows than its tokens.
+        // An unlisted ladder (a class no plain request lands, as a DiT's) is
+        // the whole-bucket body: every class present at the bucket.
+        let whole: Vec<(u32, u32)>;
+        let rungs = if ladder.rungs().is_empty() {
+            whole = token_axis
+                .classes
+                .present_in_order()
+                .map(|class| (class, token_axis.bucket))
+                .collect();
+            whole.as_slice()
+        } else {
+            ladder.rungs()
+        };
         let (last_rows, every_row) =
-            ladder
-                .rungs()
+            rungs
                 .iter()
                 .fold((0, 0), |(last, every), &(class, rung)| {
                     match self.exports.readback(class as usize) {
@@ -2047,8 +2059,9 @@ impl Shell {
         })
     }
 
-    /// A fire's group masks, one a ragged attention in the load's order
-    /// (`Inputs::stage_group_masks` stages the `i`th in the `i`th stretch),
+    /// A fire's group masks, one a packing an attention stating a mask
+    /// reads, in the load's order (`Shell::stated_feeds`;
+    /// `Inputs::stage_group_masks` stages the `i`th in the `i`th stretch),
     /// or none where no lane states one and `every` is not asked: a fire
     /// with a mask reads one in every ragged attention (a body is captured
     /// reading them all), its lanes stating none admitting every row of
@@ -2086,11 +2099,12 @@ impl Shell {
         if !every && stated.iter().all(Option::is_none) {
             return Ok(Vec::new());
         }
-        if self.feeds.ragged.is_empty() {
+        if self.stated_feeds.is_empty() {
             return Err(Fault::program(
                 "serve::mask",
-                "a kv-less lane states an attention mask and this model packs no attention \
-                 group; the mask applies to group-packed `attention.ragged` only",
+                "a kv-less lane states an attention mask and this model states none on any \
+                 attention: only a group-packed `attention.ragged` its text spells \
+                 `stated_group_mask()` reads one",
             ));
         }
         let patch = self
@@ -2129,7 +2143,7 @@ impl Shell {
                 })
         };
         let mut staged = Vec::new();
-        for &(q, kv) in &self.feeds.ragged {
+        for &(q, kv) in &self.stated_feeds {
             // An attention none of the fire's lanes reach reads no row of
             // its stretch.
             let mask = poem_exec::fire::group_mask(

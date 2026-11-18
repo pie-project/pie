@@ -68,4 +68,3 @@ pub struct RegisteredChannel {
     #[serde(skip)]
     pub mirror: Option<HostMirror>,
 }
-

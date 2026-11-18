@@ -81,7 +81,7 @@ fn shell(trace: poem::Trace, path: &Path, runahead: Runahead) -> Shell {
         page_size: PAGE,
         context: 256,
         slots: MAX_BEAMS,
-        kv_budget: Some(crate::POOL),
+        kv_budget: Some(engine_cuda::store::KvSize::Bytes(crate::POOL)),
         allowance: engine::Allowance::WHOLE,
         context_declared: false,
         ordinal: 0,

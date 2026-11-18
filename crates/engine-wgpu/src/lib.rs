@@ -1,11 +1,13 @@
 pub mod api;
 pub mod boot;
+pub mod check;
 pub mod chip;
 pub mod device;
 pub mod encode;
 pub mod guest;
 mod landing;
 pub mod program;
+pub mod rates;
 pub mod serve;
 pub mod tuning;
 

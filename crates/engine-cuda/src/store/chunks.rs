@@ -475,7 +475,8 @@ impl Chunks {
         // anew inside that allocation by every fit after that fits in it;
         // only a fit that needs more (a measuring load's, past the least
         // range it armed over) allocates it again.
-        if self.range.flat_allocated() && u64::from(total) + u64::from(self.act) <= self.room_chunks()
+        if self.range.flat_allocated()
+            && u64::from(total) + u64::from(self.act) <= self.room_chunks()
         {
             return self.relay(pool, total, self.act, self.act_asked, held);
         }
