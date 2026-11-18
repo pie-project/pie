@@ -943,7 +943,7 @@ impl PreparedLoad<'_> {
         )?;
         let page_tables = rows.tables.len();
         let arms = boot.runahead.frames().max(1);
-        let gathers = fallback::gathers(&boot.trace, &compiled);
+        let gathers = fallback::gathers(&boot.trace, &compiled, fallback::Carries::default());
         let patch_seat = boot.patches.as_ref().and_then(|ladder| {
             boot.trace.values.iter().find_map(|decl| {
                 let (poem_ir::Def::Input(RuntimeInput::Patches), Ty::Tensor { shape, dtype }) =

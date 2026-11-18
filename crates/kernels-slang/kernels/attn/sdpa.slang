@@ -5,8 +5,8 @@
 #include "prim/pool.slang"
 
 // Paged attention over a KV cache, bf16 two a word, causal (an optional
-// sliding window, an optional per-row byte mask from its lane's committed
-// boundary on). Decode reads one query row a workgroup (per head): the
+// sliding window, each row's byte mask from its lane's committed boundary on,
+// per-row data: a row stating none reads every key in the same kernel). Decode reads one query row a workgroup (per head): the
 // workgroup's subgroups (the subgroup tier, SPIR-V only) or 32-lane strips
 // (the baseline, reduced through workgroup memory) each walk a share of the
 // keys with an online softmax and fold at the end. The subgroup tier reads a
@@ -145,9 +145,11 @@ void main(uint3 gid : SV_DispatchThreadID) {
 [[vk::binding(3)]] StructuredBuffer<int> req_of_token;
 [[vk::binding(4)]] StructuredBuffer<uint> kv_page_indices;
 [[vk::binding(5)]] StructuredBuffer<uint> kv_page_indptr;
-// A row's mask word: its enable flag in bits 0-1 (nonzero: the row reads
-// its mask) and its lane's committed boundary in bits 2-31, the key its
-// plane's column 0 is.
+// A row's mask entry, two words at `2 row`: the key its plane's column 0 is
+// (its lane's committed boundary; `MASK_NONE`, past every key, states no
+// mask), then the byte its columns start at in the plane, read only by a key
+// past the boundary.
+static const uint MASK_NONE = 0x7fffffffu;
 [[vk::binding(7)]] StructuredBuffer<uint> attention_mask_words;
 #if defined(SDPA_NARROW_STORAGE)
 [[vk::binding(6)]] StructuredBuffer<uint8_t> attention_mask;
@@ -193,7 +195,6 @@ struct Params {
     int page_size;
     int n_kv_heads;
     float scale;
-    uint attention_mask_stride;
     int window;
     int n_q_heads;
 #if defined(PIE_SELECTED)
@@ -221,29 +222,29 @@ uint page_row(int req, int kp) {
         + uint(kp % params.page_size) * uint(params.n_kv_heads) * uint(PIE_HEAD_DIM);
 }
 
-// Whether row `row`'s mask admits key `kp`. A row's mask speaks of the keys
-// from its lane's committed boundary on: every key below it is committed and
-// read under the model's own bounds alone, and the plane's column `c` is key
-// `origin + c`. An unmasked row admits every key.
-bool mask_admits(uint row, uint kp) {
-    uint word = attention_mask_words[row];
-    if ((word & 3u) == 0u) {
-        return true;
-    }
-    uint origin = word >> 2;
+// Row `row`'s boundary, read once a row: `MASK_NONE` where it states no mask.
+uint mask_origin(uint row) {
+    return attention_mask_words[2u * row];
+}
+
+// Whether row `row`'s mask admits key `kp`, `origin` its boundary. A row's
+// mask speaks of the keys from its lane's committed boundary on: every key
+// below it is committed and read under the model's own bounds alone, and the
+// row's column `c` is key `origin + c`, which its causal bound keeps inside
+// the row's columns. Only a key past the boundary reads the row's offset and
+// its byte, so a row stating no mask touches no plane.
+bool mask_admits(uint row, uint origin, uint kp) {
     if (kp < origin) {
         return true;
     }
-    uint column = kp - origin;
-    return column < params.attention_mask_stride
-        && mask_byte(row * params.attention_mask_stride + column) != 0u;
+    return mask_byte(attention_mask_words[2u * row + 1u] + (kp - origin)) != 0u;
 }
 
-bool keeps(uint row, int kp, int q_pos, int start) {
+bool keeps(uint row, uint origin, int kp, int q_pos, int start) {
     if (kp > q_pos || kp < start) {
         return false;
     }
-    return mask_admits(row, uint(kp));
+    return mask_admits(row, origin, uint(kp));
 }
 
 int window_start(int q_pos) {
@@ -287,6 +288,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 
     int req = live ? req_of_token[row] : 0;
     int q_pos = live ? position_ids[row] : -1;
+    uint origin = live ? mask_origin(row) : MASK_NONE;
     int start = window_start(q_pos);
     uint q_base = row_base(row, q_head);
     int kv_head = int(q_head) / params.gqa_factor;
@@ -321,7 +323,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     int page_at = -1;
     uint k_seg = 0u, k_page = 0u, v_seg = 0u, v_page = 0u;
     for (int kp = 0; kp <= last; kp++) {
-        bool take = live && keeps(row, kp, q_pos, start);
+        bool take = live && keeps(row, origin, kp, q_pos, start);
         float partial = 0.0;
         uint k_at = 0u, v_at = 0u;
         uint vw[PAIRS_PER_LANE];
@@ -451,6 +453,7 @@ float bf16_of(uint16_t h) {
 void decode_walk(uint row, uint q_head, uint tid, int k_lo, int k_hi, int q_pos, int start,
                  out float merged_max, out float merged_sum, out uint subgroups) {
     int req = req_of_token[row];
+    uint origin = mask_origin(row);
     uint base_row = row_base(row, q_head);
     int kv_head = int(q_head) / params.gqa_factor;
 
@@ -502,7 +505,7 @@ void decode_walk(uint row, uint q_head, uint tid, int k_lo, int k_hi, int q_pos,
 #else
             int kp = k_lo + n;
 #endif
-            if (!keeps(row, kp, q_pos, start)) {
+            if (!keeps(row, origin, kp, q_pos, start)) {
                 continue;
             }
             uint base = page_row(req, kp) + uint(kv_head) * uint(PIE_HEAD_DIM);
@@ -657,6 +660,7 @@ groupshared int sdpa_pos;
 void decode_walk(uint row, uint q_head, uint tid, int k_lo, int k_hi, int q_pos, int start,
                  out float merged_max, out float merged_sum, out uint walkers) {
     int req = req_of_token[row];
+    uint origin = mask_origin(row);
     uint base_row = row_base(row, q_head);
     int kv_head = int(q_head) / params.gqa_factor;
 
@@ -701,10 +705,10 @@ void decode_walk(uint row, uint q_head, uint tid, int k_lo, int k_hi, int q_pos,
         } else {
             kp = nblocks * params.ratio + (n - sel_end);
         }
-        bool take = n < steps && kp >= 0 && keeps(row, kp, q_pos, start);
+        bool take = n < steps && kp >= 0 && keeps(row, origin, kp, q_pos, start);
 #else
         int kp = k_lo + n;
-        bool take = n < steps && keeps(row, kp, q_pos, start);
+        bool take = n < steps && keeps(row, origin, kp, q_pos, start);
 #endif
         uint base = 0u;
         float partial = 0.0;

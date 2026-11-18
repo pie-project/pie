@@ -1214,21 +1214,23 @@ impl<B: Serve> Shell<B> {
 
         let mut masked = poem_ir::ClassSet::default();
         for region in compiled.template() {
+            // The attentions that read the fire's masks, each row its own
+            // entry: a decode or a prefill stating them, whole or over a
+            // selection's blocks (`dispatch::attn`). A lane stating no mask
+            // runs them too, reading every key its bounds give.
             let runs_masked = region.nodes.clone().any(|node| {
                 matches!(
                     boot.trace.nodes.get(node as usize).map(|node| &node.op),
                     Some(poem_ir::Operation::Attn(
                         poem_ir::Attn::Prefill {
                             mask: Some(_),
-                            selection: None,
                             bias: None,
-                            lse: None,
+                            selected: None | Some(poem_ir::Blocks { per_head: false, .. }),
                             ..
-                        } | poem_ir::Attn::Prefill {
+                        } | poem_ir::Attn::Decode {
                             mask: Some(_),
-                            selection: None,
                             bias: None,
-                            lse: Some(_),
+                            selected: None | Some(poem_ir::Blocks { per_head: false, .. }),
                             ..
                         }
                     ))
@@ -1283,7 +1285,7 @@ impl<B: Serve> Shell<B> {
 
         let arms = boot.runahead.frames().max(1);
 
-        let gathers = fallback::gathers(&boot.trace, &compiled);
+        let gathers = fallback::gathers(&boot.trace, &compiled, crate::window::CARRIES);
 
         let patch_seat = boot.patches.as_ref().and_then(|ladder| {
             boot.trace.values.iter().find_map(|decl| {
@@ -3805,6 +3807,7 @@ impl<B: Serve> Shell<B> {
             .iter()
             .position(|&rows| rows == composition.bucket())
             .unwrap_or(0) as u32;
+        let staged = crate::mask::stage(&masks)?;
         let mut windows = Windows::of(
             &self.trace,
             &self.compiled,
@@ -3815,18 +3818,18 @@ impl<B: Serve> Shell<B> {
             crate::window::Copies {
                 bucket,
 
-                enabled: self.copies && masks.iter().all(|lane| lane.mask.is_none()),
+                // A mask is per-row data: a copied window carries its rows'.
+                enabled: self.copies,
                 page_tables: &geometries,
                 positions: &positions,
                 rotations: &rotations,
                 request_of_token: &request_of_token,
+                mask_words: staged.as_ref().map_or(&[], |staged| &staged.words),
             },
             &[],
             &[],
         )?;
         let boundaries = windows.packed();
-
-        let staged = crate::mask::stage(&masks)?;
 
         let patch_rows = composition.patch_rows() as usize;
         let mut patch_payload: Vec<u8> = Vec::new();
@@ -4229,8 +4232,7 @@ impl<B: Serve> Shell<B> {
             tables: FireTables {
                 request_of_token: bound.request_of_token,
                 mask: bound.mask,
-                mask_enabled: bound.mask_enabled,
-                mask_stride: bound.mask_stride,
+                mask_words: bound.mask_words,
             },
 
             group_of_lane: bound.group_of_lane,
@@ -5439,10 +5441,10 @@ impl<B: Serve> Shell<Named<B>> {
     /// The fires that cut a mask into runs. A fire's rows go in the class
     /// order, so a mask the order leaves in more than one run is cut by
     /// three lanes in the order's turn, the middle one outside the mask.
-    /// Each such mask gives one with no lane masked, where the shell may
-    /// move the mask's rows together and launch once, and one with a lane
-    /// masked, where it launches a run at a time. Token rows only: a patch
-    /// or voxel mask in runs is a fire the shell refuses.
+    /// Each such mask gives one, where the shell may move the mask's rows
+    /// together and launch once, whether or not its lanes state attention
+    /// masks (per-row data a copied window carries). Token rows only: a
+    /// patch or voxel mask in runs is a fire the shell refuses.
     ///
     /// A mask's three are classes whose fires the kernels admit where there
     /// are such: a class in `refused` only where no other three cut it.
@@ -5466,35 +5468,31 @@ impl<B: Serve> Shell<Named<B>> {
                 continue;
             }
             seen.push(&region.mask);
-            for masked in [false, true] {
-                let three = |admitted: bool| {
-                    for (first, &a) in order.iter().enumerate() {
-                        if !region.mask.contains(a as usize) {
+            let three = |admitted: bool| {
+                for (first, &a) in order.iter().enumerate() {
+                    if !region.mask.contains(a as usize) {
+                        continue;
+                    }
+                    for (between, &b) in order.iter().enumerate().skip(first + 1) {
+                        if region.mask.contains(b as usize) {
                             continue;
                         }
-                        for (between, &b) in order.iter().enumerate().skip(first + 1) {
-                            if region.mask.contains(b as usize) {
-                                continue;
-                            }
-                            for &c in &order[between + 1..] {
-                                let trio = [a as usize, b as usize, c as usize];
-                                if region.mask.contains(c as usize)
-                                    && trio.iter().any(|class| self.masked.contains(*class))
-                                        == masked
-                                    && !(admitted && trio.iter().any(|class| refused[*class]))
-                                {
-                                    return Some(trio);
-                                }
+                        for &c in &order[between + 1..] {
+                            let trio = [a as usize, b as usize, c as usize];
+                            if region.mask.contains(c as usize)
+                                && !(admitted && trio.iter().any(|class| refused[*class]))
+                            {
+                                return Some(trio);
                             }
                         }
                     }
-                    None
-                };
-                if let Some(trio) = three(true).or_else(|| three(false))
-                    && !cuts.contains(&trio)
-                {
-                    cuts.push(trio);
                 }
+                None
+            };
+            if let Some(trio) = three(true).or_else(|| three(false))
+                && !cuts.contains(&trio)
+            {
+                cuts.push(trio);
             }
         }
         cuts
