@@ -649,11 +649,6 @@ impl Engine for Cuda {
         // Every rank on the host seats its own tier: a tensor-parallel
         // group's and each expert-parallel rank's.
         let ranks = self.boot.world.size * self.expert.size;
-        let max_tokens = if budgets.max_tokens == 0 {
-            16_384
-        } else {
-            budgets.max_tokens
-        };
         // The host tier's staging ring is page-locked here, before anything
         // measures the device: on an integrated device the ring and the
         // device draw on the same memory, and what the ring holds is then
@@ -664,7 +659,6 @@ impl Engine for Cuda {
             &trace,
             budgets.page_size,
             budgets.max_context,
-            max_tokens,
             residency.host_kv_budget,
             ranks,
         )
@@ -676,7 +670,6 @@ impl Engine for Cuda {
                 &trace,
                 budgets.page_size,
                 budgets.max_context,
-                max_tokens,
                 residency.device,
                 plan.device_demand(),
             )
