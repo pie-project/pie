@@ -1094,14 +1094,17 @@ impl Reading {
         Ok(())
     }
 
-    /// The static arrays' words ([`Reading::statics`]) written, once a load.
+    /// The static arrays' words ([`Reading::statics`]) written, once a load: an array `words`
+    /// leaves out its file's (as [`Reading::write_static`] writes it; one with no words on file
+    /// refused, never left unwritten: a PE waiting on it hangs the launch).
     pub fn write_statics(&self, rt: &mut dyn Fabric, words: &[Option<Vec<u32>>]) -> R<()> {
-        for (a, w) in self.h2d.iter().zip(words) {
-            if a.group.is_some() {
+        for (k, a) in self.h2d.iter().enumerate() {
+            if a.group.is_some() || a.entry.is_some() {
                 continue;
             }
-            if let Some(w) = w {
-                rt.write(a, w)?;
+            match words.get(k).and_then(Option::as_ref) {
+                Some(w) => rt.write(a, w)?,
+                None => rt.write(a, &npy_words(a.file()?)?.1)?,
             }
         }
         Ok(())
