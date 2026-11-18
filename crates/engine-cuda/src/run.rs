@@ -2555,7 +2555,11 @@ impl<'c> Run<'c> {
         })
     }
 
-    pub(crate) fn planning(&self, geom: ValueId, plan: ValueId) -> Planning<'_> {
+    pub(crate) fn planning(
+        &self,
+        geom: ValueId,
+        plan: ValueId,
+    ) -> Result<Planning<'_>, kernels_cuda::Error> {
         let at = geom.0 as usize;
         let Def::Input(RuntimeInput::Geometry { kind }) = &self.values[at].def else {
             panic!(
@@ -2626,15 +2630,26 @@ impl<'c> Run<'c> {
                 gathered.kv_len_host.as_slice(),
             ),
             None => {
+                // The window's own lanes of the fire's tables, or the fire
+                // fails by name: the whole table from lane 0 in their place
+                // plans each lane on another's pages.
                 let first = span.lane_offset as usize;
                 let lanes = ceiling.map_or(span.lanes, |(_, lanes)| lanes) as usize;
+                let short = |table: &str, len: usize, want: usize| kernels_cuda::Error::Backend {
+                    op: "run::planning",
+                    detail: format!(
+                        "the window's lanes {first}..{} need {table} entries through {want}, \
+                         and the fire's table holds {len}",
+                        first + lanes,
+                    ),
+                };
                 (
-                    seat.kv_indptr
-                        .get(first..=first + lanes)
-                        .unwrap_or(&seat.kv_indptr),
+                    seat.kv_indptr.get(first..=first + lanes).ok_or_else(|| {
+                        short("kv_indptr", seat.kv_indptr.len(), first + lanes + 1)
+                    })?,
                     seat.kv_len
                         .get(first..first + lanes)
-                        .unwrap_or(&seat.kv_len),
+                        .ok_or_else(|| short("kv_len", seat.kv_len.len(), first + lanes))?,
                 )
             }
         };
@@ -2671,7 +2686,7 @@ impl<'c> Run<'c> {
             rows >= live.rows,
             "a row carve is never narrower than the fire"
         );
-        Planning {
+        Ok(Planning {
             kv_indptr,
             kv_len,
             shape,
@@ -2679,7 +2694,7 @@ impl<'c> Run<'c> {
             rows,
             window: schedule.window,
             workspace: schedule.workspace,
-        }
+        })
     }
 
     pub(crate) fn declared(&self, id: ValueId) -> StructKind {
