@@ -15,6 +15,9 @@
 //!   overlapping elements, not the same ones (the fabric's "src dest operand overlap"), where
 //!   both DSDs' extents are known: a DSD a `var` holds is its initialiser where nothing the PE
 //!   reaches sets it (ops/satt.csl's exp view, unset where a paged column skipped its init).
+//!
+//! And over a GEMM-regime program's op sequence ([`lines`]), the windows a queue rebound among
+//! a line's colours (GENERIC.md, "The line windows") leaves open: H1-H3 below.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -598,6 +601,170 @@ fn body_overlaps(
     }
 }
 
+/// A PE's input queue the GEMM regime's code rebinds among colours, and the function that does:
+/// a line (H1-H3, GENERIC.md "The line windows").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Line {
+    pub queue: u32,
+    pub colours: BTreeSet<String>,
+    pub func: String,
+}
+
+/// The body of `fn name(` in `text` (its braces' inside), if there is one.
+fn body<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    let at = text.find(&format!("fn {name}("))?;
+    let open = at + text[at..].find('{')?;
+    let mut depth = 0usize;
+    for (i, ch) in text[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&text[open + 1..open + i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The lines of `pe` (a GEMM PE's code): every input queue a function rebinds to more than
+/// one named colour (`fab.iqc(q, C_..)`), by the function that does.
+#[must_use]
+pub fn line_queues(pe: &str) -> Vec<Line> {
+    let mut by: BTreeMap<(u32, String), BTreeSet<String>> = BTreeMap::new();
+    for func in ["gemm", "attend"] {
+        let Some(b) = body(pe, func) else { continue };
+        for frag in b.split("fab.iqc(").skip(1) {
+            let Some(end) = frag.find(')') else { continue };
+            let args: Vec<&str> = frag[..end].split(',').map(str::trim).collect();
+            if let [q, c] = args[..]
+                && let Ok(q) = q.parse::<u32>()
+                && c.starts_with("C_")
+            {
+                by.entry((q, func.to_string()))
+                    .or_default()
+                    .insert(c.to_string());
+            }
+        }
+    }
+    by.into_iter()
+        .filter(|(_, c)| c.len() > 1)
+        .map(|((queue, func), colours)| Line {
+            queue,
+            colours,
+            func,
+        })
+        .collect()
+}
+
+/// The attention ends in a row-wide ordering point: an all-reduce over the row after its last
+/// key block (`gseg.allred(.., false)` or `gseg.all_reduce(`), so no PE of the row leaves it
+/// before every other has reached its end.
+fn attention_orders_row(pe: &str) -> bool {
+    body(pe, "attend").is_some_and(|b| {
+        let tail = b.rfind("gseg.allred(").map_or("", |i| &b[i..]);
+        let last = tail.find(';').map_or(tail, |e| &tail[..e]);
+        b.contains("gseg.all_reduce(")
+            || last.trim_end_matches(')').trim().ends_with("false")
+            || b.contains("row_barrier(")
+    })
+}
+
+/// The row-line windows of a GEMM-regime program `p` whose PEs run `pe` (`emit::gemm::GPE_OPS`),
+/// one line each: where a queue rebound among a line's colours can meet a wavelet of a colour it
+/// is not bound to (the wavelet holds the PE's ramp, and what the PE waits on behind it never
+/// comes: 1550, v13).
+///
+/// The ops order a row's PEs (`row`: none leaves before every other has reached it, but for
+/// its own tail), let parts of it drift apart without bound (`skew`), or neither:
+/// - a GEMM its classes run: the row line, every PE reading every other's piece (`row`);
+/// - a region with an all-reduce over the row (`row`); head reductions alone over a band
+///   leave a band a reduction's tail apart, no more than a GEMM's own tail: neither;
+/// - the attention: its key blocks over a band's reductions, the bands' drift growing with
+///   them (`skew`), unless it ends in a row-wide ordering point (`row`);
+/// - the host's ins and outs: neither.
+///
+/// A window only a tail's drift can reach (one GEMM after another, the chip's c4 and v14) ran
+/// on the chip; one the attention's drift reaches (v13, v15) hung.
+///
+/// - **H1** (inside an op): a rebind no later sender is ordered after (a PE of no words, west
+///   of one with, rebinds to `XB` at its turn) is open only while the row is skewed: H2's
+///   condition covers it.
+/// - **H2** (between ops): a row-line op a class runs while an op since the last row-wide
+///   ordering point is `skew`: its first pieces can reach PEs still in that op, on the colour
+///   the line left them bound to.
+/// - **H2** (column line): two attentions with no op between (the column line leaves `KB`
+///   bound, the next starts on `KF`).
+/// - **H3** (no overtaking): covered by H2's ordering point.
+///
+/// A line on queues of its own (no queue rebound) has no window: nothing here.
+#[must_use]
+pub fn lines(p: &crate::stream::gemm::GemmProgram, pe: &str) -> Vec<String> {
+    use crate::stream::gemm::GOp;
+    let ls = line_queues(pe);
+    let row_line = ls.iter().find(|l| l.func == "gemm");
+    let col_line = ls.iter().find(|l| l.func == "attend");
+    let att_row = attention_orders_row(pe);
+    let mut out = Vec::new();
+    let classes: BTreeSet<usize> = p.row_class.iter().copied().collect();
+    // (a region's all-reduces over the row, as printed)
+    let reduces = |r: usize| p.l.regs[r].printed.as_ref().map_or(0, |x| x.all_reduces);
+    for &c in &classes {
+        let bit = 1u16 << c;
+        // (the last op since a row-wide ordering point that couples only a band)
+        let mut skew: Option<(usize, &str)> = None;
+        let mut last_attend: Option<usize> = None;
+        for (i, op) in p.l.ops.iter().enumerate() {
+            match op {
+                GOp::Gemm { mask, .. } if mask & bit != 0 => {
+                    if let (Some(l), Some((j, why))) = (row_line, skew) {
+                        out.push(format!(
+                            "class {c}: op {i}, a GEMM's row line (iq{} rebound {:?}), follows op \
+                             {j} ({why}) with no row-wide ordering point between: its first \
+                             pieces can reach PEs still in op {j} on a colour iq{} is not bound \
+                             to (H2)",
+                            l.queue, l.colours, l.queue
+                        ));
+                    }
+                    skew = None;
+                }
+                GOp::Region(r) if p.l.regs[*r].mask & bit != 0 && reduces(*r) > 0 => {
+                    skew = None;
+                }
+                GOp::Attend { .. } => {
+                    if let (Some(l), Some(j)) = (col_line, last_attend)
+                        && j + 1 == i
+                    {
+                        out.push(format!(
+                            "op {i}: an attention right after op {j}'s: the column line (iq{} \
+                             rebound {:?}) leaves its PEs on the last colour while the next \
+                             starts on the first (H2)",
+                            l.queue, l.colours
+                        ));
+                    }
+                    last_attend = Some(i);
+                    if att_row {
+                        skew = None;
+                    } else {
+                        skew = Some((
+                            i,
+                            "the attention: its key blocks over a band's reductions, a drift \
+                             growing with its key blocks",
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -648,5 +815,80 @@ mod tests {
         );
         assert!(h.iter().any(|l| l.contains("a data task")));
         assert!(h.iter().any(|l| l.contains("activation at startup")));
+    }
+
+    /// flux2-mini's denoise in the GEMM regime, laid at 32 x 8 PEs, key blocks of 8 (as `m2`),
+    /// as emitted.
+    fn mini_gemm() -> crate::stream::gemm::GemmProgram {
+        let o = crate::stream::Options {
+            reading: "denoise".into(),
+            rows: 16,
+            round16: false,
+            upto: None,
+            taps: Vec::new(),
+            anneal: Default::default(),
+        };
+        let t = poem_compiler::catalog::repository()
+            .parse("flux2-mini-bf16-kv-bf16")
+            .unwrap()
+            .trace(poem_ir::Platform::Cerebras);
+        let l = crate::stream::gemm::lower(&t, &o, &[]).unwrap_or_else(|e| panic!("{e}"));
+        crate::stream::gemm::placed(&l, 32, 8, 8).unwrap_or_else(|e| panic!("{}", e.text()))
+    }
+
+    /// The GEMM PE's lines: the row line (iq2, `XF` / `XB`) in its GEMM, the column line (iq6,
+    /// `KF` / `KB`) in its attention.
+    #[test]
+    fn the_gemm_pes_lines() {
+        let ls = line_queues(crate::emit::gemm::GPE_OPS);
+        let named: Vec<(u32, &str, Vec<&str>)> = ls
+            .iter()
+            .map(|l| {
+                (
+                    l.queue,
+                    l.func.as_str(),
+                    l.colours.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            named,
+            vec![
+                (2, "gemm", vec!["C_XB", "C_XF"]),
+                (6, "attend", vec!["C_KB", "C_KF"])
+            ]
+        );
+    }
+
+    /// As emitted, every GEMM after an attention (the row line rebound on iq2, the attention's
+    /// band-local reductions between) is a window (1550: c5 and c2 at v13 hung); with a row-wide
+    /// all-reduce at the attention's end (v14) or the row line on queues of its own (v16), none.
+    #[test]
+    fn the_row_lines_windows_open_as_emitted_and_shut_by_v14_or_v16() {
+        let p = mini_gemm();
+        let pe = crate::emit::gemm::GPE_OPS;
+        let open = lines(&p, pe);
+        assert!(
+            !open.is_empty() && open.iter().all(|w| w.contains("(H2)")),
+            "{open:?}"
+        );
+        eprintln!("{} windows; {}", open.len(), open[0]);
+        // v14: a one-word row all-reduce after the last key block
+        let end = "  t = 0;\n  while (t < TB) : (t += 1) {\n    @fmuls(md(oo + t * lo, nc), md(oo + t * lo, nc), math.recip(ll[t]));";
+        assert!(pe.contains(end));
+        let v14 = pe.replace(end, &format!("  gseg.allred(md(RT, 1), 1, false);\n{end}"));
+        assert_eq!(lines(&p, &v14), Vec::<String>::new(), "v14");
+        // v16: XF and XB each on a queue bound once (no rebinding in the GEMM)
+        let v16 = pe
+            .replace("if (cp == X) { fab.iqc(2, C_XB); }", "")
+            .replace(
+                "  fab.iqc(2, C_XF);\n  if ((fl & 1) != 0)",
+                "  if ((fl & 1) != 0)",
+            );
+        assert!(
+            line_queues(&v16).iter().all(|l| l.func != "gemm"),
+            "v16 rebinds"
+        );
+        assert_eq!(lines(&p, &v16), Vec::<String>::new(), "v16");
     }
 }

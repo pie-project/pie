@@ -473,7 +473,8 @@ fn reg_fn(p: &GemmProgram) -> String {
     o
 }
 
-const GPE_OPS: &str = include_str!("gemm_pe.csl");
+/// The GEMM regime's PE ops (`gemm_pe.csl`): every PE's code but its config and its modules.
+pub const GPE_OPS: &str = include_str!("gemm_pe.csl");
 
 /// `gseg.csl`: the all-reduces of the array's rows and heads' bands.
 fn gseg_file() -> String {

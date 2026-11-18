@@ -3721,6 +3721,56 @@ Decode units have many pairs (a layer's every head), so the term is a few percen
 flux2-mini's denoise has few, so its K / V placement hardly matters. That makes the annealer
 worth turning on by default for decode-unit programs once the decode path runs on the chip;
 for stream readings it barely changes the step.
+### The line windows (check::hazard::lines)
+
+A **line** is a set of colours a PE takes on one input queue that its code rebinds between:
+the GEMM regime's row line (`XF` / `XB` on iq2, `gemm`) and column line (`KF` / `KB` on iq6,
+`attend`). `gseg`'s iq5 (`RB` / `BB`) is rebound too, but a broadcast follows its chain, so
+every PE has rebound before it comes. A wavelet that reaches a PE's ramp on a colour none of
+its queues is bound to stops there and holds the ramp: nothing behind it, the column's
+weights included, reaches the PE until the queue is rebound, and if the PE waits on what is
+behind, the row stops. Chip runs 1543, 1550 and 1551 confirmed this mechanism, and
+`place::flow`'s ramp mode predicted all four outcomes:
+
+| variant | what it changes | `place::flow` | chip (c5, c2) |
+|---|---|---|---|
+| v13 | iq2 rebound right after the last old-colour piece | holds | hung |
+| v14 | a one-word row all-reduce at each attention's end | clean | ran (12.7M, 16.2M cycles) |
+| v15 | v13 and a row all-reduce after each GEMM, words not packed west | holds | hung |
+| v16 | `XF` and `XB` on queues of their own, never rebound | clean | ran, 2% faster than v14 |
+
+**The rule** (`check::hazard::lines(p, pe)`: a GEMM-regime program's ops and its PE code; a
+refusal of the program where any is open):
+- **Lines** are read off the PE code: every input queue a function rebinds to more than one
+  named colour (`fab.iqc(q, C_..)`). A line on queues of its own (v16) has no window.
+- **The ops**, per class, either order a row's PEs (no PE leaves before every other has
+  reached it, but for its own tail), let parts of the row drift apart without bound
+  (`skew`), or neither:
+  - a GEMM the class runs is the row line itself, every PE reading every other's piece: it
+    orders the row;
+  - a region with an all-reduce over the row orders it; head reductions over a band leave a
+    band one reduction's tail apart, no more than a GEMM's own tail: neither;
+  - the attention runs its key blocks over a band's reductions, so the bands drift apart by
+    a key block each (`place::flow`: a slow band falls 9 chunks behind at kbm 8, 5 at 16).
+    It is `skew`, unless it ends in a row-wide ordering point (v14);
+  - the host's ins and outs do neither.
+- **H1** (inside an op): a rebind no later sender is ordered after, such as a PE of no words
+  west of one with, rebinding to `XB` at its turn. Its window is reachable only while the row
+  is skewed, so H2 covers it.
+- **H2** (between ops): a row-line op a class runs while an op since the last row-wide
+  ordering point is `skew`. Its first pieces can reach PEs still in that op, on the colour the
+  line left them bound to. A window only a tail's drift reaches (one GEMM after another) ran on
+  the chip (c4; v14's c5 and c2), so it is not one.
+  - For the column line: two attentions with no op between.
+- **H3** (no overtaking): a later op's piece passing an earlier op's on one colour. H2's
+  ordering point covers it.
+
+As emitted today, every GEMM after an attention is an H2 window: flux2-mini's denoise has 8,
+and klein's at c5 and c2 have 50. With v14's barrier or v16's queues, none
+(`check::hazard::tests::the_row_lines_windows_open_as_emitted_and_shut_by_v14_or_v16`). The
+refusal (`stream::gemm::placed`, a `Refusal::Window` given before any other reason) lands
+with v16 in the emitter: until then it refuses every GEMM-regime program with an attention.
+
 ## G4: column-side segments, a weight PE's memory, a root's scratch pool
 
 ### G4.1 The column roots' segment all-reduce
