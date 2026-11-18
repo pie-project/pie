@@ -29,7 +29,6 @@ mod common_dit;
 mod common_encoder;
 #[cfg(feature = "device")]
 mod common_two_axis;
-#[cfg(feature = "device")]
 mod guest;
 
 mod a_bank_says_which_site_it_corrects;
