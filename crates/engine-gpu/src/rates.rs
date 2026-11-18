@@ -642,7 +642,7 @@ fn warm<B: Serve>(
     })?;
     tracing::debug!(side, walk_worst = worst, "warm-up walk: the cube");
     loop {
-        match warm_at(rig, side, tactic_at, timer)? {
+        match warm_at(rig, side, tactic_at, timer, worst)? {
             Some(warmed) => {
                 // The clock settled (the rotations agreed, `settle`'s rule):
                 // from here every frame's time against its estimate counts.
@@ -673,6 +673,7 @@ fn warm_at<B: Serve>(
     side: u32,
     tactic_at: &dyn Fn(u32) -> kernels_slang::linear::gemm::Tactic,
     timer: Timer<'_, B>,
+    walk_worst: f64,
 ) -> Result<Option<engine::rates::Warmed>> {
     let (m, n, k) = (side, side, side);
     let act = rig.operand(m, k, Dtype::Bf16)?;
@@ -696,12 +697,24 @@ fn warm_at<B: Serve>(
     // bound at the last fire's time and the worst ratio the rotations' own
     // frames ran against their estimates (the clock sinking as it warms),
     // all of a rotation's where it states none; 0 where not one fits.
+    // An unsettled clock swings (the Adreno 840's fire ran 182 to 318 ms
+    // within seconds), so a frame is sized from the slowest fire this
+    // rotation has measured, not the last, at the worst ratio the walk
+    // measured a fire's time against its estimate: both measurements, no
+    // chosen margin. Sized from the last fire at a ratio of 1, a frame
+    // estimated at 1824 ms took 2001 ms and the next lost the device.
     let rotations = std::cell::Cell::new(engine::rates::Admission {
         settled: true,
+        worst: walk_worst.max(1.0),
         ..engine::rates::Admission::new(rig.max_submit)
     });
+    let slowest = std::cell::Cell::new(rig.per_fire.get());
+    let per_fire = || match (slowest.get(), rig.per_fire.get()) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    };
     let fits = |left: u32| -> u32 {
-        match (rotations.get().bound, rig.per_fire.get()) {
+        match (rotations.get().bound, per_fire()) {
             (Some(cap), Some(per)) => {
                 ((cap.as_nanos() as f64 / (per.max(1.0) * rotations.get().worst)).floor() as u32)
                     .min(left)
@@ -724,8 +737,9 @@ fn warm_at<B: Serve>(
                     why: format!("warm-up: a {side}^3 fire no longer fits the bound"),
                 });
             }
-            let estimate = rig.per_fire.get().map(|p| p * f64::from(count));
+            let estimate = per_fire().map(|p| p * f64::from(count));
             let took = rig.frame(timer, count, &fire, &nothing)?.1;
+            slowest.set(per_fire());
             let mut r = rotations.get();
             r.landed(estimate, took as f64, true);
             rotations.set(r);
