@@ -18,7 +18,10 @@
 //! prefix among them, in a choice's `prompt_logprobs` in vLLM's shape.
 //! Either costs a prefill read out row by row, apart from the prefix cache.
 //!
-//! Refused with 400: more than one prompt, token-array prompts and
+//! A prompt may be token ids (one array, or an array of one array), used as
+//! they are.
+//!
+//! Refused with 400: more than one prompt, `echo` on token ids, and
 //! `suffix`. Anything a thinking model emits as a thinking block is returned
 //! as text: this API has no other place for it.
 
@@ -82,27 +85,41 @@ impl Parsed {
 fn parse(body: Value) -> Result<Parsed, ApiError> {
     let body: Body =
         serde_json::from_value(body).map_err(|e| invalid(format!("request body: {e}"), None))?;
-    let prompt = match body.prompt {
-        None | Some(Value::Null) => String::new(),
-        Some(Value::String(s)) => s,
+    let ids = |items: &[Value]| -> Option<Vec<u32>> {
+        items
+            .iter()
+            .map(|v| v.as_u64().and_then(|t| u32::try_from(t).ok()))
+            .collect()
+    };
+    let (prompt, prompt_tokens) = match body.prompt {
+        None | Some(Value::Null) => (String::new(), None),
+        Some(Value::String(s)) => (s, None),
         Some(Value::Array(items)) => match items.as_slice() {
-            [Value::String(s)] => s.clone(),
-            [] => String::new(),
-            [_, _, ..] => {
-                return Err(invalid(
-                    "only one prompt per request is supported",
-                    Some("prompt"),
-                ));
-            }
+            [Value::String(s)] => (s.clone(), None),
+            [] => (String::new(), None),
+            [Value::Array(one)] => match ids(one) {
+                Some(tokens) => (String::new(), Some(tokens)),
+                None => return Err(invalid("token ids must be integers", Some("prompt"))),
+            },
+            items if items.iter().all(Value::is_number) => match ids(items) {
+                Some(tokens) => (String::new(), Some(tokens)),
+                None => return Err(invalid("token ids must be integers", Some("prompt"))),
+            },
             _ => {
                 return Err(invalid(
-                    "token-array prompts are not supported; send text",
+                    "only one prompt per request is supported",
                     Some("prompt"),
                 ));
             }
         },
         Some(_) => return Err(invalid("`prompt` must be a string", Some("prompt"))),
     };
+    if prompt_tokens.is_some() && body.echo {
+        return Err(invalid(
+            "`echo` with a token-array prompt is not supported",
+            Some("echo"),
+        ));
+    }
     let n = choices(body.n)?;
     let logprobs = match body.logprobs {
         None | Some(Value::Null) => None,
@@ -116,7 +133,10 @@ fn parse(body: Value) -> Result<Parsed, ApiError> {
         return Err(invalid("`suffix` is not supported", Some("suffix")));
     }
     let mut req = Request::new(Vec::new());
-    req.raw_prompt = Some(prompt.clone());
+    match prompt_tokens {
+        Some(tokens) => req.prompt_tokens = Some(tokens),
+        None => req.raw_prompt = Some(prompt.clone()),
+    }
     req.stream = body.stream;
     req.max_tokens = body.max_tokens.unwrap_or(16);
     req.ignore_eos = body.ignore_eos;
@@ -170,6 +190,7 @@ fn finish_reason(finish: Finish) -> &'static str {
     match finish {
         Finish::Stop | Finish::StopSequence | Finish::ToolCalls => "stop",
         Finish::Length => "length",
+        Finish::Abort => "abort",
     }
 }
 
@@ -388,6 +409,9 @@ pub async fn serve(envelope: Envelope) -> Result<String, String> {
                 Value::Null
             };
             let mut choice = json!({"index": index, "text": text, "logprobs": logprobs, "finish_reason": finish_reason(outcome.finish)});
+            if let Some(reason) = &outcome.stop_reason {
+                choice["stop_reason"] = json!(reason);
+            }
             if let Some(top) = parsed.prompt_logprobs {
                 choice["prompt_logprobs"] = crate::vllm_prompt_logprobs(scored, top as usize);
             }

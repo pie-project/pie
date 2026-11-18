@@ -166,6 +166,12 @@ impl PoolPort for RacePool {
     ) -> Option<crate::store::kv::KvResidencyTxn> {
         None
     }
+    fn prepare_demote_now(&self) -> Option<crate::store::kv::KvResidencyTxn> {
+        None
+    }
+    fn drop_disallowed(&self) -> usize {
+        0
+    }
     fn prepare_demote(&self, _room: usize) -> Option<crate::store::kv::KvResidencyTxn> {
         None
     }
@@ -1500,6 +1506,12 @@ impl PoolPort for RingPool {
     ) -> Option<crate::store::kv::KvResidencyTxn> {
         None
     }
+    fn prepare_demote_now(&self) -> Option<crate::store::kv::KvResidencyTxn> {
+        None
+    }
+    fn drop_disallowed(&self) -> usize {
+        0
+    }
     fn prepare_demote(&self, _room: usize) -> Option<crate::store::kv::KvResidencyTxn> {
         None
     }
@@ -2397,6 +2409,12 @@ impl BindRoomPool {
 }
 
 impl PoolPort for BindRoomPool {
+    fn prepare_demote_now(&self) -> Option<crate::store::kv::KvResidencyTxn> {
+        None
+    }
+    fn drop_disallowed(&self) -> usize {
+        0
+    }
     fn chunk_stats(&self) -> ChunkStats {
         ChunkStats {
             pages: (self.free.lock().len() as u32, self.total),

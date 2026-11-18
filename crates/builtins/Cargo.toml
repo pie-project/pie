@@ -11,5 +11,10 @@ repository = "https://github.com/pie-project/pie"
 # policy hosts' own tests.
 test-policies = []
 
+[build-dependencies]
+# Makes the built PLEX 1.1 policies components (they target
+# wasm32-unknown-unknown); the version wit-bindgen 0.58 embeds for.
+wit-component = "0.251"
+
 [lints]
 workspace = true

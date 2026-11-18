@@ -22,6 +22,10 @@ pub trait GatewayInbound {
 
     async fn redirect(req_id: ReqId);
 
+    /// The process the request launched started on this worker: its
+    /// execution was admitted.
+    async fn started(req_id: ReqId);
+
     /// What a worker that links to no controller (a pool) holds, since its
     /// last report: passed on to the controller's directory. A worker with
     /// a controller reports there itself.
@@ -33,6 +37,10 @@ pub trait WorkerControl {
     async fn dispatch(req: Request) -> Accepted;
 
     async fn cancel(req_id: ReqId);
+
+    /// The workers the request's process may prefill on, best first, from
+    /// now on (empty: the worker's own configuration decides).
+    async fn set_executors(req_id: ReqId, executors: Vec<WorkerId>);
 
     async fn set_priority(req_id: ReqId, p: Priority);
 

@@ -197,6 +197,24 @@ impl Engine for GuestEngine {
         "fake-guests"
     }
 
+    fn prepare_program(
+        &mut self,
+        _registration: &::engine::program::ProgramRegistration,
+    ) -> ::engine::Result<::engine::ProgramCompile> {
+        Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
+    }
+
+    fn finish_program(
+        &mut self,
+        _prepared: ::engine::Prepared,
+    ) -> ::engine::Result<::engine::ProgramId> {
+        Err(::engine::Error::unsupported(self.kind(), "finish_program"))
+    }
+
+    fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "close_program"))
+    }
+
     fn load(&mut self, _request: LoadRequest) -> ::engine::Result<Loaded> {
         Err(::engine::Error::Load("no model".into()))
     }
@@ -1162,8 +1180,8 @@ fn processes_cycling_through_park_restore_and_finish_all_finish_and_give_back_al
         let taken = take_bind(Some(roles), engine, &binding, |_| false)?;
         registrations.set(registrations.get() + 1);
         bind_taken(Some(roles), engine, &binding, Some(holder(by)), taken)
-        .map(|bound| bound.id)
-        .inspect_err(|_| rollbacks.set(rollbacks.get() + 1))
+            .map(|bound| bound.id)
+            .inspect_err(|_| rollbacks.set(rollbacks.get() + 1))
     };
     let n = 12;
     let mut stage = vec![Stage::First; n];

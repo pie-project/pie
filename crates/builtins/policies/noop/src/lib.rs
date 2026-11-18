@@ -1,8 +1,11 @@
-//! Installs nothing: it must behave as no policy at all.
+//! Writes nothing: it must behave as no policy at all (a free baseline
+//! arm, PLEX 1.1 principle 2).
+
+use plex::prelude::*;
 
 #[derive(Default)]
 struct Noop;
 
-impl policy::worker::Policy for Noop {}
+impl Policy for Noop {}
 
-policy::worker!(Noop);
+plex::export!(Noop);
