@@ -335,15 +335,10 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         copy_and_launch(&mut rig, tactics.gemm(tier, LAUNCH), timer, say)?;
     rig.release();
     let launch = launch_ns as f64;
-    let warmed = warm(
-        &mut rig,
-        tactics.gemm(tier, engine::rates::WARM_SHAPE.0),
-        timer,
-    )?;
+    let (side, warmed) = warm(&mut rig, &|rows| tactics.gemm(tier, rows), timer)?;
     say(&format!(
-        "[rates]: warm-up: {} rotations of the {}^3 matmul, settled at {:.1} TFLOP/s",
+        "[rates]: warm-up: {} rotations of the {side}^3 matmul, settled at {:.1} TFLOP/s",
         warmed.rotations,
-        engine::rates::WARM_SHAPE.0,
         warmed.rate / 1e3
     ));
     // The matmul curve at each width of `engine::rates::GEMM_WIDTHS` (n = k)
@@ -395,8 +390,15 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         engine::rates::FEW_ROWS,
         few_row / 1e3
     ));
+    // The attention curve at its own keys: from the narrowest whose shape
+    // is compute-bound on this device (its matmul peak over its bandwidth),
+    // whatever rows the matmul curve reached.
+    let peak = gemm
+        .iter()
+        .flat_map(|(_, curve)| curve.iter().map(|&(_, rate)| rate))
+        .fold(0.0, f64::max);
     let mut attn = Vec::new();
-    for keys in engine::rates::ATTN_KEYS {
+    for keys in engine::rates::attn_keys(peak / bytes_per_ns.max(f64::MIN_POSITIVE)) {
         let shape = engine::rates::ATTN_SHAPE.at(keys);
         let rate = attention(&mut rig, tactics, tier, timer, shape, launch)?;
         rig.release();
@@ -406,7 +408,9 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         ));
         attn.push((keys, rate));
     }
-    let longest = engine::rates::ATTN_KEYS[engine::rates::ATTN_KEYS.len() - 1];
+    let longest = attn
+        .last()
+        .map_or(engine::rates::ATTN_KEYS[0], |&(keys, _)| keys);
     for d in engine::rates::ATTN_DIMS.into_iter().filter(|&d| d != 128) {
         let shape = engine::rates::ATTN_SHAPE.at(longest).with_dim(d);
         let rate = attention(&mut rig, tactics, tier, timer, shape, launch)?;
@@ -426,21 +430,30 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     let tflops = |curve: Vec<(u32, f64)>| -> Vec<(u32, f64)> {
         curve.into_iter().map(|(x, r)| (x, r / 1e3)).collect()
     };
+    let rates = Rates {
+        launch_ns: Some(launch_ns),
+        gemm_tflops_by_rows: Some(
+            gemm.into_iter()
+                .map(|(w, curve)| (w, tflops(curve)))
+                .collect(),
+        ),
+        attn_tflops_by_keys: Some(tflops(attn)),
+        hbm_gbps: Some(bytes_per_ns),
+        elementwise_gbps: Some(elementwise),
+        scan_gelems: Some(scan),
+        few_row_tflops: Some(few_row / 1e3),
+        workgroups_per_core: Some(workgroups_per_core),
+    };
+    // A rate that settled at nothing is refused by name, never saved or
+    // divided by.
+    if let Some((key, why)) = engine::rates::unmeasured(&rates) {
+        return Err(Fault::Device {
+            call: "rates",
+            why: format!("measured `[rates] {key}` {why}"),
+        });
+    }
     Ok(engine::rates::Measured {
-        rates: Rates {
-            launch_ns: Some(launch_ns),
-            gemm_tflops_by_rows: Some(
-                gemm.into_iter()
-                    .map(|(w, curve)| (w, tflops(curve)))
-                    .collect(),
-            ),
-            attn_tflops_by_keys: Some(tflops(attn)),
-            hbm_gbps: Some(bytes_per_ns),
-            elementwise_gbps: Some(elementwise),
-            scan_gelems: Some(scan),
-            few_row_tflops: Some(few_row / 1e3),
-            workgroups_per_core: Some(workgroups_per_core),
-        },
+        rates,
         unsettled: rig.unsettled.get(),
     })
 }
@@ -480,20 +493,44 @@ fn elementwise<B: Serve>(rig: &mut Rig<'_, B>, timer: Timer<'_, B>, launch: f64)
     .map_err(|why| Fault::Device { call: "rates", why })
 }
 
-/// The device warmed ([`engine::rates::warm_up`]): rotations of
-/// [`engine::rates::WARM_SHAPE`] over its planes, each one frame timed by
-/// the host's clock around its one submit, until the rate stops falling.
+/// The device warmed ([`engine::rates::warm_up`]): rotations of a cube
+/// matmul over its planes, each one frame timed by the host's clock around
+/// its one submit, until the rate stops falling. The cube's side is
+/// [`engine::rates::warm_side`]'s: walked up by doubling, a real fire timed
+/// at each size, while the next one's fire, estimated by the growth the
+/// last two measured, fits the device's bound on a submission (none stated:
+/// [`engine::rates::WARM_SHAPE`]'s).
 fn warm<B: Serve>(
     rig: &mut Rig<'_, B>,
-    tactic: kernels_slang::linear::gemm::Tactic,
+    tactic_at: &dyn Fn(u32) -> kernels_slang::linear::gemm::Tactic,
     timer: Timer<'_, B>,
-) -> Result<engine::rates::Warmed> {
-    let (m, n, k) = engine::rates::WARM_SHAPE;
+) -> Result<(u32, engine::rates::Warmed)> {
+    // The cube's side, walked up by real fires under the device's bound on
+    // one submission (`engine::rates::warm_side`): each size's second fire
+    // timed (its first builds and touches).
+    let max_submit = rig.max_submit;
+    let side = engine::rates::warm_side(max_submit, |p| {
+        let act = rig.operand(p, p, Dtype::Bf16)?;
+        let w = rig.operand(p, p, Dtype::Bf16)?;
+        let y = rig.zeros(p, p, Dtype::Bf16)?;
+        let tactic = tactic_at(p);
+        let fire = |sink: &kernels_slang::Ctx<'_>| {
+            kernels_slang::linear::gemm::matmul(sink, tactic, act, w, y)
+                .map_err(fault("rates: matmul"))
+        };
+        let nothing = |_: &mut B::Frame| Ok(());
+        rig.frame(timer, 1, &fire, &nothing)?;
+        let (_, ns) = rig.frame(timer, 1, &fire, &nothing)?;
+        rig.release();
+        Ok::<f64, Fault>(ns as f64)
+    })?;
+    let (m, n, k) = (side, side, side);
     let act = rig.operand(m, k, Dtype::Bf16)?;
     let weights = (0..weights_at(n, k))
         .map(|_| rig.operand(n, k, Dtype::Bf16))
         .collect::<Result<Vec<Tensor>>>()?;
     let y = rig.zeros(m, n, Dtype::Bf16)?;
+    let tactic = tactic_at(m);
     let next = std::cell::Cell::new(0usize);
     let fire = |sink: &kernels_slang::Ctx<'_>| {
         let w = weights[next.get() % weights.len()];
@@ -519,7 +556,7 @@ fn warm<B: Serve>(
         Ok::<f64, Fault>(gemm_flops(m, n, k) * f64::from(planes) / wall.max(1) as f64)
     })?;
     rig.release();
-    Ok(warmed)
+    Ok((side, warmed))
 }
 
 /// The matmul rate at `(m, n, k)`, each fire reading the next of its

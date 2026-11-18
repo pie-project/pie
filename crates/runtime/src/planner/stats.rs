@@ -17,6 +17,8 @@ pub struct PlannerStats {
     pub restore_faults: AtomicU64,
     pub restores: AtomicU64,
     pub restore_failures: AtomicU64,
+    /// Restores queued again for want of device room for their role slots.
+    pub restore_roles_short: AtomicU64,
     pub gate_parks: AtomicU64,
     pub hog_failures: AtomicU64,
     pub starvations: AtomicU64,

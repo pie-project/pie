@@ -314,6 +314,7 @@ fn fault(fault: Fault) -> Error {
             "this fire wants {need} {what} and the load reserved {have}"
         )),
         Fault::Fragmented { .. } | Fault::Integrity { .. } => Error::Device(fault.to_string()),
+        Fault::Overcarved { .. } => Error::Invalid(fault.to_string()),
         Fault::Straddled { .. } | Fault::Recipe(_) => Error::Load(fault.to_string()),
         Fault::Mask { .. }
         | Fault::MaskRows { .. }
@@ -943,6 +944,13 @@ impl Engine for Cuda {
                 .map_err(fault),
             None => Ok(engine::program::FireFacts::default()),
         }
+    }
+
+    /// Every registration: a device channel's ring in its `Channel` slots,
+    /// a host one's in the mirror it publishes.
+    fn holds_channel(&self, registration: &ChannelRegistration) -> bool {
+        let _ = registration;
+        true
     }
 
     fn ring_facts(

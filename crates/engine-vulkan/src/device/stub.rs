@@ -50,6 +50,11 @@ impl Context {
     }
 
     #[must_use]
+    pub fn host_room(&self) -> Option<engine::HostRoom> {
+        match self.never {}
+    }
+
+    #[must_use]
     pub fn max_buffer(&self) -> u64 {
         match self.never {}
     }

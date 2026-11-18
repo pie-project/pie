@@ -48,6 +48,7 @@ mod a_conv_decoder_fires_over_a_voxel_input;
 mod a_declined_mega_moe_answers_what_its_legs_answer;
 mod a_decode_envelope_packs_its_device_mask_into_each_lane;
 mod a_dit_plan_loads_at_a_sixty_four_k_row_ceiling;
+mod a_dropped_shell_takes_its_queues_with_it;
 mod a_double_block_fires_two_streams_through_the_engine;
 #[cfg(feature = "cuda")]
 mod a_fired_router_and_mega_moe_answer_what_their_legs_answer;
@@ -74,6 +75,7 @@ mod a_regions_own_values_outlive_its_last_pass;
 mod a_repacked_projection_serves_what_the_row_major_one_serves;
 mod a_schedule_is_carved_where_it_is_launched;
 mod a_second_fire_reads_the_input_cells_it_was_handed;
+mod a_served_models_lanes_answer_as_each_lane_alone;
 mod a_shared_adapter_is_one_slot_and_one_load;
 mod a_shifted_body_admits_the_split_that_moved;
 mod a_stored_k_quant_row_serves_as_stored;

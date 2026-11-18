@@ -469,6 +469,12 @@ impl Engine for Group {
         }
     }
 
+    /// As each rank: rank 0's answer, which every rank shares.
+    fn holds_channel(&self, registration: &ChannelRegistration) -> bool {
+        let _ = registration;
+        true
+    }
+
     fn ring_facts(
         &self,
         registration: &ChannelRegistration,

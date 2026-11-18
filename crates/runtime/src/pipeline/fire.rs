@@ -1102,6 +1102,12 @@ impl RungAsk {
     /// refused the raise: a fire wider than the rung waits for the raise
     /// its pass funds, never on a rung that does not come.
     async fn wait(&self, width: u32) -> Result<(), String> {
+        // Until the raise, the process submits nothing: no frame waits on
+        // its lanes (the frame's firing frees what the raise is funded
+        // with; the frame is not what funds it).
+        if crate::store::shared::fire_cap(self.engine) < width {
+            crate::scheduler::worker::notify_owner_waits(self.engine, self.pid);
+        }
         crate::inferlet::process::said(
             "enqueue: the activation rung",
             self.pid,
