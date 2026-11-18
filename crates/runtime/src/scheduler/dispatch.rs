@@ -145,10 +145,13 @@ impl TierKind {
 
 impl TierMove {
     pub(crate) fn label(&self) -> String {
+        // A shared pool's move names its shape: a park's and a restore's
+        // groups of role slots read apart by it, not by their order.
         let kind = match self.kind {
-            TierKind::Kv | TierKind::KvSlots(_) => "kv",
-            TierKind::RsSlots(_) => "rs-slots",
-            TierKind::RoleSlots(_) => "role-slots",
+            TierKind::Kv => "kv".to_string(),
+            TierKind::KvSlots(shape) => format!("kv shape {}", shape.0),
+            TierKind::RsSlots(shape) => format!("rs-slots shape {}", shape.0),
+            TierKind::RoleSlots(shape) => format!("role-slots shape {}", shape.0),
         };
         let way = if self.out { "to" } else { "from" };
         match self.source {
