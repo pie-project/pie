@@ -47,7 +47,9 @@
 //! h2d files they replace (`<k>.npy`) and runs nothing: `tools/wafer/stream/run.py --entries`
 //! takes them. `--rows 1`: one step at the inputs' own timestep, the rows read back held to the
 //! capture the program was compiled from (`host.json`'s refs; a program cut at `--stages` reads
-//! back no velocity).
+//! back no velocity); a value with no capture (a tiled program's pixels), with `--checkpoint`,
+//! to engine-cpu's value at the same step (`READING_CPU`: rel L2, cosine, PSNR as 8-bit pixels
+//! in [-1, 1]; `--save-rows` also writes it, `<value>.cpu.f32`).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -661,6 +663,9 @@ fn reading(get: &HashMap<String, String>) -> Result<bool, String> {
     // `--checkpoint <dir>`: the static arrays and the entries' weights from the checkpoint, landed
     // through the import contract as the engine lands it (a reading whose entries read weights,
     // a VAE's latent normalisation, runs only so)
+    // (and, with `--rows 1`, engine-cpu's forward over the checkpoint: a value read back with no
+    // capture held to engine-cpu's own, as `READING_CPU`)
+    let mut cpu: Option<engine_cpu::Forward> = None;
     let made: Option<Vec<Option<Vec<u32>>>> = match get.get("checkpoint") {
         Some(c) => {
             let ckpt = std::fs::canonicalize(c).map_err(|e| format!("--checkpoint: {e}"))?;
@@ -674,6 +679,9 @@ fn reading(get: &HashMap<String, String>) -> Result<bool, String> {
             let mut weights = engine_cpu::Forward::new(trace.clone(), None, &of)?;
             let statics = reading.statics(&mut weights, &reading.step(&trace, None, &[]))?;
             host = engine_cpu::Forward::host_for(trace.clone(), &of, &reading.entry_values())?;
+            if get.contains_key("rows") {
+                cpu = Some(weights);
+            }
             println!(
                 "READING {} landed and its statics made in {:.0} s",
                 reading.model,
@@ -788,6 +796,50 @@ fn reading(get: &HashMap<String, String>) -> Result<bool, String> {
                 );
             }
             let Some((_, file)) = reading.refs.iter().find(|(r, _)| *r == c.value.0) else {
+                // no capture (a tiled program's): engine-cpu's value at the same step, from the
+                // checkpoint, where there is one (rel L2, cosine and, for an image in [-1, 1],
+                // its PSNR as 8-bit pixels)
+                if let Some(f) = cpu.as_mut() {
+                    let t1 = std::time::Instant::now();
+                    let want = f.stream_values(&step, &[], &[c.value])?.remove(0);
+                    let want = match want.values {
+                        engine_cpu::forward::Values::F32(w) => w,
+                        engine_cpu::forward::Values::I32(w) => {
+                            w.into_iter().map(|x| x as f32).collect()
+                        }
+                    };
+                    if want.len() != v.len() {
+                        return Err(format!(
+                            "value %{}: engine-cpu's {} words, the program's {}",
+                            c.value.0,
+                            want.len(),
+                            v.len()
+                        ));
+                    }
+                    let (rel, cos) = rel_cos(v, &want);
+                    let mse = v
+                        .iter()
+                        .zip(&want)
+                        .map(|(x, y)| {
+                            let (x, y) =
+                                (f64::from(x.clamp(-1.0, 1.0)), f64::from(y.clamp(-1.0, 1.0)));
+                            ((x - y) / 2.0).powi(2)
+                        })
+                        .sum::<f64>()
+                        / v.len().max(1) as f64;
+                    if let Some(dir) = get.get("save-rows") {
+                        let p = Path::new(dir).join(format!("{}.cpu.f32", c.value.0));
+                        let b: Vec<u8> = want.iter().flat_map(|x| x.to_le_bytes()).collect();
+                        std::fs::write(&p, b).map_err(|e| format!("{}: {e}", p.display()))?;
+                    }
+                    ok &= rel <= 3e-2 && cos >= 0.999;
+                    println!(
+                        "READING_CPU {}",
+                        json!({"value": c.value.0, "rows": c.rows, "rel_l2": rel, "cosine": cos,
+                            "psnr_db": -10.0 * mse.log10(), "cycles": cycles,
+                            "cpu_s": t1.elapsed().as_secs_f64()})
+                    );
+                }
                 continue;
             };
             let (_, want) = kernels_cerebras::npy::read_f32_or_i32(file)?;
