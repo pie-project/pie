@@ -769,9 +769,9 @@ async fn restore(
             );
             // Room the budget holds but nothing has freed yet: the restore
             // waits, queued, as an admission does.
-            if matches!(error, crate::store::roles::RolesError::UnparkShort(_)) {
+            if let Some(need) = error.unpark_runs() {
                 tracing::debug!(%pid, %error, "planner: a restore waits for room for its roles");
-                planner.requeue_restore_roles(pid);
+                planner.requeue_restore_roles(pid, need);
                 return;
             }
             // Its pair is on its way back with another process's restore:
@@ -797,7 +797,7 @@ async fn restore(
     {
         abort(model, engine, Move::Restore { kv, rs, roles });
         tracing::debug!(%pid, "planner: a restore waits for room for its pending bind");
-        planner.requeue_restore_roles(pid);
+        planner.requeue_restore_roles(pid, (need.run, need.pieces));
         return;
     }
     let mut guard = MoveGuard::new(model, engine, Move::Restore { kv, rs, roles });

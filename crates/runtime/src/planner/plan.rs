@@ -42,7 +42,9 @@ enum Step {
     },
     /// The head is a restore whose role slots found no room, and nothing
     /// else will free any: a resident process is evicted for it.
-    EvictForRoles,
+    /// The head restore's role slots are short of `need`, `(run, pieces)`
+    /// runs of whole chunks.
+    EvictForRoles { need: (u32, u32) },
     /// The head is a restore of a process a bind short of guest-state
     /// room suspended, its kv gathered: it waits for the room that bind
     /// asks as the bind would ([`Self::BindRoom`]).
@@ -173,7 +175,7 @@ impl ResidencyPlanner {
                         _ => match inner.restore_gate(pid, spare) {
                             RestoreGate::Serve => Step::ServeRestore { key, pid },
                             RestoreGate::Wait => Step::Done,
-                            RestoreGate::Evict => Step::EvictForRoles,
+                            RestoreGate::Evict(need) => Step::EvictForRoles { need },
                         },
                     },
                 }
@@ -225,7 +227,13 @@ impl ResidencyPlanner {
                     }
                     true
                 }
-                Step::EvictForRoles => {
+                Step::EvictForRoles { need: (run, pieces) } => {
+                    // Its runs stand free (a completion or a commit gave
+                    // them back): it goes again.
+                    if self.port.guest_room_free(run, pieces) {
+                        self.with_inner(|inner| inner.roles_retry_head());
+                        continue;
+                    }
                     // Idle cache holds chunks too: one set goes, and the
                     // restore tries again in what it left, before any
                     // resident moves for it.
@@ -233,6 +241,18 @@ impl ResidencyPlanner {
                         self.with_inner(|inner| inner.roles_retry_head());
                         continue;
                     }
+                    // A grow the walk will make holds its runs: it waits on
+                    // that, moving no one.
+                    let grow = Demand {
+                        kv_pages: self.port.chunks_as_pages(run.saturating_mul(pieces)),
+                        rs: RsUnits::default(),
+                    };
+                    if self.wait_on_grow(no_grow, grow) {
+                        return true;
+                    }
+                    // Else the occupants of the chunks it could take move
+                    // for it (`plan_eviction`'s chunk branch), under the
+                    // key rule.
                     true
                 }
                 Step::Release(stranded) => {

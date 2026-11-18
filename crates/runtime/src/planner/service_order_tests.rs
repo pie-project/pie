@@ -114,9 +114,11 @@ fn a_rise_is_served_in_its_process_s_key_order_beside_kv_waiters() {
 
 /// A restore whose role slots found no room is queued again, a waiter: it
 /// is not served on spare pages alone (the room it lacks is not pages),
-/// goes again on a completion's credit, and, the fleet stalled with
-/// nothing completing, has a resident evicted for it. Without the flag the
-/// same spare pages serve it.
+/// goes again on a completion's credit, waits while the fleet decodes (a
+/// completion frees room soon; funding it then thrashed, 3x the wall on the
+/// M1's beam stress), and has room made for its runs (`Evict`, its need
+/// named) once the fleet is stalled, a fleet of processes waiting at binds
+/// included (AMD's 7-minute stall).
 fn a_restore_short_of_room_for_its_roles_waits_then_evicts_once_stalled() {
     let (mut inner, pids) = fleet(&[
         (1, Residency::Evicted, true),
@@ -128,12 +130,16 @@ fn a_restore_short_of_room_for_its_roles_waits_then_evicts_once_stalled() {
         RestoreGate::Serve,
         "control"
     );
-    inner.procs.get_mut(&pids[0]).unwrap().roles_short = true;
+    inner.procs.get_mut(&pids[0]).unwrap().roles_short = Some(super::proc::PendingBind {
+        run: 3,
+        pieces: 1,
+        pages: 3,
+    });
     assert!(!inner.fleet_stalled());
     assert_eq!(
         inner.restore_gate(pids[0], 64),
         RestoreGate::Wait,
-        "spare pages are no room"
+        "spare pages are no room; the fleet decodes"
     );
     inner.completion_credit = 1;
     assert_eq!(
@@ -142,11 +148,11 @@ fn a_restore_short_of_room_for_its_roles_waits_then_evicts_once_stalled() {
         "a completion's credit"
     );
     assert_eq!(inner.completion_credit, 0);
-    // The resident waits on an allocation too: nothing will complete, so
-    // it is evicted for the restore.
-    park_allocation(&mut inner, pids[1], 1);
-    assert!(inner.fleet_stalled());
-    assert_eq!(inner.restore_gate(pids[0], 0), RestoreGate::Evict);
+    // The resident waits at a bind for room: it makes no progress, so the
+    // fleet is stalled and the restore's runs are funded.
+    inner.procs.get_mut(&pids[1]).unwrap().bind_waiting = true;
+    assert!(inner.fleet_waits_at_binds(), "the fleet waits at binds");
+    assert_eq!(inner.restore_gate(pids[0], 0), RestoreGate::Evict((3, 1)));
 }
 
 fn a_restore_yields_the_head_to_a_younger_allocation() {

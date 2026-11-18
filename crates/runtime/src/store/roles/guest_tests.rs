@@ -1817,3 +1817,57 @@ fn a_process_s_guest_chunk_slots_are_its_scratch_on_the_device() {
     park(&roles, 1);
     assert!(roles.lock().unwrap().guest_chunk_slots(&[holder(1)]).is_empty());
 }
+
+/// The Spark's beam restores (dbe9c0e93): fragmented Instance chunks, a
+/// parked guest's freed run filled by another bind, then its restore. The
+/// unpark is short and waits, naming the runs of chunks it needs (what the
+/// planner funds, `RolesError::unpark_runs`), never refused; once room
+/// comes it lands.
+#[test]
+fn a_restore_short_of_its_run_waits_with_its_need_and_lands_once_room_comes() {
+    let Pools { device, roles } = pools_no_host(facts_in(64, 8));
+    let (program, mut engine) = runs_of(13, 4, 1, 0);
+    let mut bound = Vec::new();
+    for by in 1.. {
+        match bind_or_leave(&roles, &mut engine, program, by) {
+            Ok(id) => bound.push((by, id)),
+            Err(_) => break,
+        }
+    }
+    assert!(bound.len() >= 2, "{} bound", bound.len());
+    let (parked, _) = bound[0];
+    park(&roles, parked);
+    let (other, mut other_engine) = runs_of(14, 4, 1, 9000);
+    let landed = bind_as(&roles, &mut other_engine, other, 999).expect("the freed run is taken");
+    assert_eq!(device.lock().unwrap().pool().free_chunk_runs(4), 0, "no run of 4 left");
+
+    let error = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(parked))
+        .expect_err("short of its run");
+    assert!(matches!(error, RolesError::UnparkShort(_)), "it waits: {error}");
+    assert_eq!(error.unpark_runs(), Some((4, 1)), "its need, named: {error}");
+
+    roles.lock().unwrap().close_instance(landed);
+    let unpark = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(parked))
+        .expect("room came")
+        .expect("something comes back");
+    roles.lock().unwrap().commit(unpark);
+    assert!(roles.lock().unwrap().holds_guest_state(holder(parked)));
+}
+
+/// A Channel item that must lie in one run, short of it at a restore,
+/// waits too, its need one whole chunk (any free chunk holds the run).
+#[test]
+fn a_restore_short_of_a_channel_run_waits_for_one_chunk() {
+    let short = RolesError::UnparkShort(Box::new(RolesError::NoRun {
+        role: SlotRole::Channel,
+        slots: 2,
+    }));
+    assert_eq!(short.unpark_runs(), Some((1, 1)));
+    assert!(RolesError::NoRun { role: SlotRole::Channel, slots: 2 }.unpark_runs().is_none(), "only a waiting unpark names one");
+}

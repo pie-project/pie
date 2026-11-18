@@ -3113,3 +3113,59 @@ async fn a_set_registered_mid_eviction_prefills_only_after_the_restore() {
     }
     assert!(planner.grant_now(pid, Demand::default()).is_some());
 }
+
+/// AMD's stall on adc4c1506 (7+ minutes, `head_kind=restore`,
+/// `restore_roles_short` climbing, 143 processes at a bind): the head
+/// restore had its kv pages and was short only of an Instance run, and it
+/// waited for the fleet to stall, which a fleet of processes waiting at a
+/// bind never did (they were neither idle nor parked in the planner). A
+/// bind waiter makes no progress: such a fleet is stalled, and the restore's
+/// runs are funded as a bind's are, the chunks' occupant (younger, at a
+/// bind) moved for it. (Funding a restore while the fleet decodes thrashed:
+/// 3x the wall on the M1's beam stress, 15,578 role waits.)
+#[tokio::test(flavor = "current_thread")]
+async fn a_restore_short_only_of_an_instance_run_is_funded_once_the_fleet_waits_at_binds() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (restoring, decoding) = (ProcessId::new_v4(), ProcessId::new_v4());
+    // The restoring process first: older, ranked ahead.
+    for pid in [restoring, decoding] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    planner.with_inner(|inner| {
+        let other = inner.procs.get_mut(&decoding).unwrap();
+        other.progressed = true;
+        other.bind_waiting = true;
+        let proc = inner.procs.get_mut(&restoring).unwrap();
+        proc.state = Residency::Evicted;
+        proc.roles_short = Some(super::proc::PendingBind {
+            run: 3,
+            pieces: 1,
+            pages: 3,
+        });
+        inner.enqueue(
+            restoring,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        );
+    });
+    *pool.occupant.lock() = Some(decoding);
+    assert!(
+        planner.with_inner(|inner| inner.fleet_waits_at_binds()),
+        "the fleet waits at binds"
+    );
+    planner.poke();
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if planner.stats.evictions_started.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+    }
+    assert!(
+        planner.stats.evictions_started.load(Ordering::Relaxed) > 0,
+        "the chunks' occupant is moved for the restore's run"
+    );
+}

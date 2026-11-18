@@ -62,9 +62,10 @@ pub(super) struct Proc {
     /// told.
     pub(super) fire_lapsed: bool,
     /// Its last restore found no device room for its parked role slots
-    /// (instance tables, rings, guest state): it waits, queued, for a
-    /// completion or an eviction to free some, never failed for it.
-    pub(super) roles_short: bool,
+    /// (instance tables, rings, guest state): the runs of whole chunks it
+    /// is short, and the pages that frees. It waits, queued, for a
+    /// completion, a commit or an eviction to free them, never failed for it.
+    pub(super) roles_short: Option<PendingBind>,
     /// Suspended by a bind of its short of guest-state room
     /// ([`super::ResidencyPlanner::suspend_for_room`]): the room that bind
     /// asks. Its restore is served only once that room stands free beside
@@ -129,7 +130,7 @@ impl Proc {
             fires: 0,
             fired_at: crate::rt::Instant::now(),
             fire_lapsed: false,
-            roles_short: false,
+            roles_short: None,
             bind_room: None,
         }
     }
