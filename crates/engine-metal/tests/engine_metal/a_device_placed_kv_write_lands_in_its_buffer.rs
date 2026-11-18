@@ -155,22 +155,26 @@ fn serve(
                 }
             })
             .collect();
+        let extents = eta_exec::Extents {
+            row_count: PROMPT,
+            token_count: PROMPT,
+            sampled_rows: 1,
+            query_len: PROMPT,
+            ..eta_exec::Extents::default()
+        };
+        let (scratch, pair) = crate::guest_places(shell, program, &extents, 0);
         let id = shell
             .bind_program(
                 program,
                 &[],
-                eta_exec::Extents {
-                    row_count: PROMPT,
-                    token_count: PROMPT,
-                    sampled_rows: 1,
-                    query_len: PROMPT,
-                    ..eta_exec::Extents::default()
-                },
+                extents,
                 GeometryClass::DeviceGeometry,
                 PortMask::NONE,
                 &[engine::ChannelId(7)],
                 &slots,
                 &rings,
+                &scratch,
+                &pair,
             )
             .expect("the device-geometry instance binds");
         let lane = Seated {
