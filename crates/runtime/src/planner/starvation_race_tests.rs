@@ -2833,29 +2833,14 @@ fn a_process_waiting_at_a_bind_yields_to_a_prompt_not_yet_seated() {
     let members = |planner: &Arc<ResidencyPlanner>| {
         planner
             .victim_set()
-            .map(|set| {
-                set.members
-                    .iter()
-                    .map(|victim| victim.pid)
-                    .collect::<Vec<_>>()
-            })
+            .map(|set| set.members.iter().map(|victim| victim.pid).collect::<Vec<_>>())
             .unwrap_or_default()
     };
-    assert!(
-        members(&planner).is_empty(),
-        "a seated lane mid-decode does not yield"
-    );
+    assert!(members(&planner).is_empty(), "a seated lane mid-decode does not yield");
     planner.set_bind_waiting(waiting, true);
-    assert_eq!(
-        members(&planner),
-        vec![waiting],
-        "waiting at a bind, it yields"
-    );
+    assert_eq!(members(&planner), vec![waiting], "waiting at a bind, it yields");
     planner.set_bind_waiting(waiting, false);
-    assert!(
-        members(&planner).is_empty(),
-        "past its wait, it no longer does"
-    );
+    assert!(members(&planner).is_empty(), "past its wait, it no longer does");
 }
 
 /// AMD's 500-concurrent wedge: a bind short of room waited for the fleet
@@ -2869,11 +2854,7 @@ async fn a_bind_short_of_room_is_funded_while_the_fleet_decodes() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
     let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
     let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
-    let (binder, holder, decoding) = (
-        ProcessId::new_v4(),
-        ProcessId::new_v4(),
-        ProcessId::new_v4(),
-    );
+    let (binder, holder, decoding) = (ProcessId::new_v4(), ProcessId::new_v4(), ProcessId::new_v4());
     for pid in [binder, holder, decoding] {
         planner.register(pid);
         planner.note_admitted(pid);
@@ -2889,8 +2870,7 @@ async fn a_bind_short_of_room_is_funded_while_the_fleet_decodes() {
         }
     }
     assert!(
-        !planner.with_inner(|inner| inner.fleet_stalled())
-            || planner.stats.evictions_started.load(Ordering::Relaxed) > 0,
+        !planner.with_inner(|inner| inner.fleet_stalled()) || planner.stats.evictions_started.load(Ordering::Relaxed) > 0,
         "a process decodes beside the bind"
     );
     assert!(
@@ -2928,10 +2908,7 @@ async fn a_waiting_bind_is_quoted_again_when_the_rung_moves() {
             break;
         }
     }
-    assert!(
-        waited.is_finished(),
-        "quoted again on the rung's move, and served"
-    );
+    assert!(waited.is_finished(), "quoted again on the rung's move, and served");
     waited.await.expect("the wait ends").expect("served");
 }
 
@@ -2945,11 +2922,7 @@ async fn an_older_process_waiting_at_a_bind_is_moved_for_the_head_s_chunks() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
     let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
     let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
-    let (holder, binder, decoding) = (
-        ProcessId::new_v4(),
-        ProcessId::new_v4(),
-        ProcessId::new_v4(),
-    );
+    let (holder, binder, decoding) = (ProcessId::new_v4(), ProcessId::new_v4(), ProcessId::new_v4());
     // The holder first: older, ranked ahead of the binder.
     for pid in [holder, binder, decoding] {
         planner.register(pid);
