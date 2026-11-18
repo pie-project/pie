@@ -413,36 +413,40 @@ impl Lane {
             }
             engine.on_tapped(crate::offload::stream::sink());
             if engine.settles_asynchronously() {
-                engine.on_complete(std::sync::Arc::new(move |at: engine::StepDone, mut outcome: engine::StepOutcome| {
-                    // What lanes wrote is kept before their step is published
-                    // settled, so the fires that asked find it.
-                    let writes = std::mem::take(&mut outcome.wrote);
-                    if !writes.is_empty() {
-                        crate::pipeline::fire::record_kv_writes(writes);
-                    }
-                    let _ = landed_tx.send(LaneRequest::Landed {
-                        frame: at.frame,
-                        step: at.step,
-                        outcome,
-                    });
-                }));
+                engine.on_complete(std::sync::Arc::new(
+                    move |at: engine::StepDone, mut outcome: engine::StepOutcome| {
+                        // What lanes wrote is kept before their step is published
+                        // settled, so the fires that asked find it.
+                        let writes = std::mem::take(&mut outcome.wrote);
+                        if !writes.is_empty() {
+                            crate::pipeline::fire::record_kv_writes(writes);
+                        }
+                        let _ = landed_tx.send(LaneRequest::Landed {
+                            frame: at.frame,
+                            step: at.step,
+                            outcome,
+                        });
+                    },
+                ));
             } else {
                 // A frame settled inside `submit` answers through its
                 // result. What its lanes wrote, and which faulted, is told
                 // here before `submit` returns, so it is kept before the
                 // frame's cells settle.
                 let faulted = Arc::clone(&inline_faults);
-                engine.on_complete(std::sync::Arc::new(move |at: engine::StepDone, outcome: engine::StepOutcome| {
-                    if !outcome.wrote.is_empty() {
-                        crate::pipeline::fire::record_kv_writes(outcome.wrote);
-                    }
-                    if !outcome.faulted.is_empty() {
-                        faulted
-                            .lock()
-                            .unwrap()
-                            .push((at.step as usize, outcome.faulted));
-                    }
-                }));
+                engine.on_complete(std::sync::Arc::new(
+                    move |at: engine::StepDone, outcome: engine::StepOutcome| {
+                        if !outcome.wrote.is_empty() {
+                            crate::pipeline::fire::record_kv_writes(outcome.wrote);
+                        }
+                        if !outcome.faulted.is_empty() {
+                            faulted
+                                .lock()
+                                .unwrap()
+                                .push((at.step as usize, outcome.faulted));
+                        }
+                    },
+                ));
             }
         }
         let mut stash: Option<LaneRequest> = None;
@@ -885,9 +889,9 @@ impl Lane {
                         "scheduler RPC cancelled before resource creation"
                     );
                     return LaneCommit::BindFinished {
-                            pipeline_id,
-                            waits: false,
-                        };
+                        pipeline_id,
+                        waits: false,
+                    };
                 }
                 let engine = match backend(engine) {
                     Ok(engine) => engine,
@@ -971,18 +975,11 @@ impl Lane {
                     Lane::release_registered_channel_wait_slots(&registered);
                     Self::release_wait_slots([bind.pacing_wait_id]);
                     return LaneCommit::BindFinished {
-                            pipeline_id,
-                            waits: false,
-                        };
+                        pipeline_id,
+                        waits: false,
+                    };
                 }
-                match Self::bind(
-                    engine,
-                    channels,
-                    &bind,
-                    roles.as_ref(),
-                    pipeline_id,
-                    taken,
-                ) {
+                match Self::bind(engine, channels, &bind, roles.as_ref(), pipeline_id, taken) {
                     Ok((bound, standing)) => {
                         // Its program can be in a fire until it closes, and
                         // the engine's standing guest bytes are its total.

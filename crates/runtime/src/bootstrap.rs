@@ -1137,14 +1137,15 @@ mod tests {
     /// size, a record's and not a slot's, and it skips the cap.
     #[test]
     fn the_model_s_record_bytes_say_whether_it_holds_state() {
-        let mut facts = ::engine::chunk::ChunkFacts::degenerate(&::engine::chunk::DegeneratePools {
-            kv_pages: 8,
-            kv_page_size: 16,
-            kv_page_bytes: 4096,
-            state_slots: 4,
-            state_slot_bytes: 1 << 20,
-            ..::engine::chunk::DegeneratePools::default()
-        });
+        let mut facts =
+            ::engine::chunk::ChunkFacts::degenerate(&::engine::chunk::DegeneratePools {
+                kv_pages: 8,
+                kv_page_size: 16,
+                kv_page_bytes: 4096,
+                state_slots: 4,
+                state_slot_bytes: 1 << 20,
+                ..::engine::chunk::DegeneratePools::default()
+            });
         facts.record_bytes = 0;
         let (dense, caps) = read(&facts);
         assert!(!dense && !caps.has_state(), "dense: no rs work");
@@ -1154,10 +1155,22 @@ mod tests {
         let (hybrid, caps) = read(&facts);
         assert!(hybrid && caps.has_state());
         assert_eq!(caps.state_size, 3000, "a record's bytes, not the slot's");
-        assert_eq!(seat_cap(512, hybrid, Some(45)), 512, "hybrid: admitted by its planner");
+        assert_eq!(
+            seat_cap(512, hybrid, Some(45)),
+            512,
+            "hybrid: admitted by its planner"
+        );
 
-        assert_eq!(seat_cap(512, false, None), 512, "no seated-first pool, no cap");
-        assert_eq!(seat_cap(16, false, Some(45)), 16, "a cap under the seats stands");
+        assert_eq!(
+            seat_cap(512, false, None),
+            512,
+            "no seated-first pool, no cap"
+        );
+        assert_eq!(
+            seat_cap(16, false, Some(45)),
+            16,
+            "a cap under the seats stands"
+        );
         assert_eq!(seat_cap(512, false, Some(0)), 1, "one sequence at least");
     }
 }

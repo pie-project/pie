@@ -55,8 +55,7 @@ impl Session {
                     // the model counted it: summed, and each engine's.
                     let lives = crate::engine::backend::lives();
                     for tally in ::engine::live::Tally::ALL {
-                        let each: Vec<u64> =
-                            lives.iter().map(|live| live.tallied(tally)).collect();
+                        let each: Vec<u64> = lives.iter().map(|live| live.tallied(tally)).collect();
                         stats.insert(
                             format!("{}.engine.{}", model_name, tally.name()),
                             serde_json::Value::from(each.iter().sum::<u64>()),
@@ -78,9 +77,7 @@ impl Session {
                     // class, each named at bind.
                     stats.insert(
                         format!("{}.host_geometry_fires", model_name),
-                        serde_json::Value::from(
-                            crate::pipeline::fire::host_geometry::fires(),
-                        ),
+                        serde_json::Value::from(crate::pipeline::fire::host_geometry::fires()),
                     );
 
                     let inf = crate::scheduler::get_stats().await;

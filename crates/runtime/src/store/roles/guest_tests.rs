@@ -1180,8 +1180,8 @@ fn processes_cycling_through_park_restore_and_finish_all_finish_and_give_back_al
         let taken = take_bind(Some(roles), engine, &binding, |_| false)?;
         registrations.set(registrations.get() + 1);
         bind_taken(Some(roles), engine, &binding, Some(holder(by)), taken)
-        .map(|bound| bound.id)
-        .inspect_err(|_| rollbacks.set(rollbacks.get() + 1))
+            .map(|bound| bound.id)
+            .inspect_err(|_| rollbacks.set(rollbacks.get() + 1))
     };
     let n = 12;
     let mut stage = vec![Stage::First; n];
