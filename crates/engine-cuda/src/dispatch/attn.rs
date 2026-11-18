@@ -1389,7 +1389,10 @@ impl Run<'_> {
                         | poem_ir::RaggedMask::Stated,
                         None,
                     ) => kernels_cuda::attn::ragged::RaggedMask::None,
-                    (poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal, Some(_)) => {
+                    (
+                        poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal,
+                        Some(_),
+                    ) => {
                         return Err(kernels_cuda::Error::Backend {
                             op: "attn.ragged",
                             detail: STATED_ONLY.to_string(),

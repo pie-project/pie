@@ -1800,26 +1800,23 @@ impl Shell {
         } else {
             ladder.rungs()
         };
-        let (last_rows, every_row) =
-            rungs
-                .iter()
-                .fold((0, 0), |(last, every), &(class, rung)| {
-                    match self.exports.readback(class as usize) {
-                        Some(out) if !out.decl.readout => (last, every + rung),
-                        None if !self.exports.reads_readout_rows() => (last, every + rung),
-                        _ if !self.landing[class as usize]
-                            .iter()
-                            .any(poem_ir::Request::plain) =>
-                        {
-                            let per_lane = self.budget.readouts_per_lane.max(1);
-                            (
-                                last,
-                                every + rung.min(lane_ceiling.saturating_mul(per_lane)),
-                            )
-                        }
-                        _ => (last + rung.min(lane_ceiling), every),
-                    }
-                });
+        let (last_rows, every_row) = rungs.iter().fold((0, 0), |(last, every), &(class, rung)| {
+            match self.exports.readback(class as usize) {
+                Some(out) if !out.decl.readout => (last, every + rung),
+                None if !self.exports.reads_readout_rows() => (last, every + rung),
+                _ if !self.landing[class as usize]
+                    .iter()
+                    .any(poem_ir::Request::plain) =>
+                {
+                    let per_lane = self.budget.readouts_per_lane.max(1);
+                    (
+                        last,
+                        every + rung.min(lane_ceiling.saturating_mul(per_lane)),
+                    )
+                }
+                _ => (last + rung.min(lane_ceiling), every),
+            }
+        });
         let readout_ceiling = (last_rows.min(max_lanes) + every_row).min(composition.bucket());
         let readouts_fit = readout_rows.len() <= readout_ceiling as usize;
         let lanes_fit = composition.lane_count() <= crate::window::lane_capacity(max_lanes);

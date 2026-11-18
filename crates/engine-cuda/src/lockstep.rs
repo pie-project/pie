@@ -893,7 +893,10 @@ impl Engine for Rank {
         self.with(|cuda| cuda.evacuate(evacuation))
     }
 
-    fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<engine::CopyCompletion> {
+    fn copy_slots(
+        &mut self,
+        copy: &engine::chunk::SlotCopy,
+    ) -> EngineResult<engine::CopyCompletion> {
         self.with(|cuda| cuda.copy_slots(copy))
     }
 

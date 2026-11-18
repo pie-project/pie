@@ -1297,7 +1297,10 @@ impl Prepared {
         let Some(&(at, held)) = self.row_tables.get(slot as usize) else {
             return Err(Fault::program(
                 "program::launch",
-                format!("slot {slot} is past the {} this stage's outputs take", self.pitch),
+                format!(
+                    "slot {slot} is past the {} this stage's outputs take",
+                    self.pitch
+                ),
             ));
         };
         if rows.len() as u64 > u64::from(held) {
@@ -1315,9 +1318,7 @@ impl Prepared {
         }
         let first = lane as usize * self.row_words as usize + at as usize;
         self.row_pointers_host[first..first + rows.len()].copy_from_slice(rows);
-        let table = self.cells
-            + self.cell_at[6] as u64
-            + first as u64 * size_of::<u64>() as u64;
+        let table = self.cells + self.cell_at[6] as u64 + first as u64 * size_of::<u64>() as u64;
         let mode = if bf16 {
             INTRINSIC_STORAGE_ROW_POINTERS
         } else {
@@ -1340,7 +1341,10 @@ impl Prepared {
         if slot >= self.pitch {
             return Err(Fault::program(
                 "program::launch",
-                format!("slot {slot} is past the {} this stage's outputs take", self.pitch),
+                format!(
+                    "slot {slot} is past the {} this stage's outputs take",
+                    self.pitch
+                ),
             ));
         }
         if lane >= self.lanes {
@@ -1979,7 +1983,10 @@ mod tests {
                 let package = shipped::package(traced, vocab);
                 let shapes: Vec<ChannelShape> =
                     package.channels.iter().map(ChannelShape::of).collect();
-                Some(Prepared::build(&package.plans[0], &shapes, Extents::default()).expect("builds"))
+                Some(
+                    Prepared::build(&package.plans[0], &shapes, Extents::default())
+                        .expect("builds"),
+                )
             })
             .collect();
         let strides: Vec<u64> = stages
@@ -2240,7 +2247,8 @@ mod tests {
     /// gather buffers with it however few blocks it runs on.
     #[test]
     fn the_lane_arenas_hold_every_launch_s_lanes() {
-        let (stage, _) = shipped::compiled(&shipped::all(shipped::QWEN_VOCAB)[0].1, shipped::QWEN_VOCAB);
+        let (stage, _) =
+            shipped::compiled(&shipped::all(shipped::QWEN_VOCAB)[0].1, shipped::QWEN_VOCAB);
         let stage = &stage[0];
         let region = stage
             .fused

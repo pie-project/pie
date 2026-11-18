@@ -644,7 +644,13 @@ pub fn dead_marks() -> usize {
         .iter()
         .map(|entry| entry.stream)
         .collect();
-    let dead = |fence: &Fence| fence.0.iter().filter(|mark| !live.contains(&mark.stream)).count();
+    let dead = |fence: &Fence| {
+        fence
+            .0
+            .iter()
+            .filter(|mark| !live.contains(&mark.stream))
+            .count()
+    };
     pool::fences(&dead) + recycle::fences(&dead) + heap::fences(&dead)
 }
 

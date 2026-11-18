@@ -180,7 +180,9 @@ mod mixed_readout {
         .expect("the model loads");
         let word = |n: usize| trace.facts.word(&poem::Request::new(n as u32, false));
         let prompt = |salt: u32, n: u32| -> Vec<u32> {
-            (0..n).map(|i| 1000 + (i * 7919 + salt * 104_729) % 20_000).collect()
+            (0..n)
+                .map(|i| 1000 + (i * 7919 + salt * 104_729) % 20_000)
+                .collect()
         };
         for slot in 0..8 {
             shell.open(slot).expect("a slot opens");
@@ -189,36 +191,78 @@ mod mixed_readout {
         for (slot, salt) in [(0, 0), (4, 0), (1, 1), (5, 1), (2, 2), (6, 2)] {
             let tokens = prompt(salt, 96);
             shell
-                .fire(&[engine_cuda::Lane { slot, word: word(tokens.len()), tokens: &tokens }])
+                .fire(&[engine_cuda::Lane {
+                    slot,
+                    word: word(tokens.len()),
+                    tokens: &tokens,
+                }])
                 .expect("a prompt fires");
         }
         let fresh = prompt(9, 40);
         let next = [[11u32], [12], [13]];
         let mixed = shell
             .fire(&[
-                engine_cuda::Lane { slot: 0, word: word(1), tokens: &next[0] },
-                engine_cuda::Lane { slot: 3, word: word(fresh.len()), tokens: &fresh },
-                engine_cuda::Lane { slot: 1, word: word(1), tokens: &next[1] },
-                engine_cuda::Lane { slot: 2, word: word(1), tokens: &next[2] },
+                engine_cuda::Lane {
+                    slot: 0,
+                    word: word(1),
+                    tokens: &next[0],
+                },
+                engine_cuda::Lane {
+                    slot: 3,
+                    word: word(fresh.len()),
+                    tokens: &fresh,
+                },
+                engine_cuda::Lane {
+                    slot: 1,
+                    word: word(1),
+                    tokens: &next[1],
+                },
+                engine_cuda::Lane {
+                    slot: 2,
+                    word: word(1),
+                    tokens: &next[2],
+                },
             ])
             .expect("the mixed fire serves");
-        let alone: Vec<Vec<f32>> = [(4u32, &next[0][..]), (7, &fresh[..]), (5, &next[1][..]), (6, &next[2][..])]
-            .iter()
-            .map(|&(slot, tokens)| {
-                shell
-                    .fire(&[engine_cuda::Lane { slot, word: word(tokens.len()), tokens }])
-                    .expect("a lane fires alone")
-                    .swap_remove(0)
-            })
-            .collect();
+        let alone: Vec<Vec<f32>> = [
+            (4u32, &next[0][..]),
+            (7, &fresh[..]),
+            (5, &next[1][..]),
+            (6, &next[2][..]),
+        ]
+        .iter()
+        .map(|&(slot, tokens)| {
+            shell
+                .fire(&[engine_cuda::Lane {
+                    slot,
+                    word: word(tokens.len()),
+                    tokens,
+                }])
+                .expect("a lane fires alone")
+                .swap_remove(0)
+        })
+        .collect();
         for (lane, (a, b)) in alone.iter().zip(&mixed).enumerate() {
-            let worst = a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+            let worst = a
+                .iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0f32, f32::max);
             let top = |row: &[f32]| {
-                row.iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).map_or(0, |(at, _)| at)
+                row.iter()
+                    .enumerate()
+                    .max_by(|x, y| x.1.total_cmp(y.1))
+                    .map_or(0, |(at, _)| at)
             };
-            println!("{deployment}: lane {lane} worst {worst} top {} / {}", top(a), top(b));
-            assert!(worst < 0.5, "lane {lane}'s last row is not its own ({worst})");
+            println!(
+                "{deployment}: lane {lane} worst {worst} top {} / {}",
+                top(a),
+                top(b)
+            );
+            assert!(
+                worst < 0.5,
+                "lane {lane}'s last row is not its own ({worst})"
+            );
         }
     }
 }
-

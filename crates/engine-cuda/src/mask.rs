@@ -77,7 +77,11 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
             // under the causal bound: all of them committed, as far as the
             // kernel asks.
             None if !lane.wide => {
-                origins.push(word(u64::from(lane.have) + u64::from(lane.rows), false, at)?);
+                origins.push(word(
+                    u64::from(lane.have) + u64::from(lane.rows),
+                    false,
+                    at,
+                )?);
             }
             None => {
                 origins.push(word(u64::from(folded), true, at)?);
@@ -213,8 +217,16 @@ mod tests {
         ])
         .unwrap()
         .unwrap();
-        assert_eq!(staged.origins, vec![10, 6], "the boundary; all six committed");
-        assert_eq!(staged.indptr, vec![0, 1, 1], "eight bits, and none for the plain lane");
+        assert_eq!(
+            staged.origins,
+            vec![10, 6],
+            "the boundary; all six committed"
+        );
+        assert_eq!(
+            staged.indptr,
+            vec![0, 1, 1],
+            "eight bits, and none for the plain lane"
+        );
         for q in 0..2u64 {
             for c in 0..4u64 {
                 let want = c >= 1 && c <= 2 + q;
@@ -240,7 +252,14 @@ mod tests {
             wide: false,
         }]);
         assert!(
-            matches!(refused, Err(Fault::Mask { stated: 3, extent: 4, .. })),
+            matches!(
+                refused,
+                Err(Fault::Mask {
+                    stated: 3,
+                    extent: 4,
+                    ..
+                })
+            ),
             "{refused:?}"
         );
     }

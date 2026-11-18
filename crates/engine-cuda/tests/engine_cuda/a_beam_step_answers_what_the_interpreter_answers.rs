@@ -71,8 +71,14 @@ fn fired(case: &Case, seats: &[Seat]) -> Result<Vec<Vec<u8>>, String> {
             )
             .expect("the logits bind");
     }
-    let fired = plane.fire(&context, instance).map_err(|why| why.to_string())?;
-    assert!(matches!(fired, Fired::Committed), "{}: {fired:?}", case.name);
+    let fired = plane
+        .fire(&context, instance)
+        .map_err(|why| why.to_string())?;
+    assert!(
+        matches!(fired, Fired::Committed),
+        "{}: {fired:?}",
+        case.name
+    );
     let session = plane.instance_mut(instance).expect("the instance");
     Ok(case
         .readers
@@ -103,7 +109,10 @@ fn a_beam_step_answers_what_the_interpreter_answers() {
     // lanes 0 and 3 of an output read at lane 0 are no rows 0 and 1.
     let case = &beam_stage()[0];
     let mut seats = case.seats();
-    seats.push(Seat { lane: 3, ..seats[0] });
+    seats.push(Seat {
+        lane: 3,
+        ..seats[0]
+    });
     let refused = fired(case, &seats).expect_err("a seat past the rows is refused");
     assert!(refused.contains("bound at lane 3"), "{refused}");
 }
