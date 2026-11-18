@@ -1,0 +1,41 @@
+api = 1
+
+[target]
+device = "Apple M5 Pro"
+
+[rates]
+# Each point the median of five whole measurements by Metal's rates step
+# under engine::rates' shared rule, on 2026-11-18 (by Mac Pro, on
+# sc/mac-roofline-7-r2 ee62a4dcd). Every point agreed within 1% across the
+# five but these:
+#   launch: 6937 / 7903 / 7793 / 7942 / 7741 ns
+#   matmul 256 x 2048: 5.52 / 7.97 / 5.95 / 5.50 / 5.54 TFLOP/s
+#   matmul 512 x 2048: 29.30 / 29.67 / 29.56 / 29.68 / 29.51
+#   matmul 512 x 4096: 29.33 / 29.18 / 29.23 / 29.13 / 28.45
+#   matmul 2048 x 4096: 30.18 / 30.03 / 30.05 / 30.22 / 29.83
+#   matmul 4096 x 4096: 28.51 / 28.39 / 28.48 / 28.48 / 28.17
+#   matmul 8192 x 4096: 28.42 / 28.39 / 28.30 / 28.34 / 27.80
+#   attention, 2048 keys: 14.66 / 14.57 / 14.52 / 14.83 / 14.59
+#   attention, 4096 keys: 16.01 / 16.04 / 15.78 / 16.00 / 16.00
+# and these, two-moded on this device (a fast and a slow state, split 2-3
+# or 3-2 across the runs, not one outlier): their median stands until the
+# rates step settles them.
+#   matmul 256 x 1024: 4.97 / 34.35 / 5.09 / 34.06 / 5.11
+#   matmul 512 x 1024: 5.52 / 30.91 / 13.23 / 30.85 / 19.44
+#   matmul 1024 x 1024: 32.30 / 32.68 / 14.97 / 32.76 / 22.94
+#   attention, 512 keys: 10.77 / 10.87 / 6.79 / 10.81 / 7.82
+launch_ns = 7793
+gemm_tflops_by_rows = [
+  [1024, [[256, 5.1], [512, 19.4], [1024, 32.3], [2048, 31.9], [4096, 31.3], [8192, 30.3]]],
+  [2048, [[256, 5.5], [512, 29.6], [1024, 30.7], [2048, 31.2], [4096, 30.5], [8192, 28.8]]],
+  [4096, [[256, 25.0], [512, 29.2], [1024, 29.9], [2048, 30.0], [4096, 28.5], [8192, 28.3]]],
+]
+attn_tflops_by_keys = [[512, 10.8], [1024, 12.6], [2048, 14.6], [4096, 16.0], [8192, 19.0]]
+hbm_gbps = 276.3
+elementwise_gbps = 283.4
+scan_gelems = 305.3
+few_row_tflops = 24.91
+workgroups_per_core = 2.42
+
+[provenance]
+rates = "Metal's rates step (pie tune metal --rates) on 2026-11-18, the median of five runs: each kernel through the dispatch serving runs, timed by the GPU in frames the shared rule settles; the matmul at n = k = 1024, 2048, 4096 over engine::rates::weights_at planes, attention over engine::rates::attn_sets_at sets, the per-row ops warmed; the few-row matmul at m = 4 to 256 over n = k = 4096, its most flops over time; workgroups a core from the matmul's first curve rows over as few columns as launch one workgroup a core or fewer, against the curve's rate there; operands: engine::rates' pattern"
