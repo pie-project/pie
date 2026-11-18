@@ -29,6 +29,11 @@ pub(super) struct Proc {
     pub(super) holder: bool,
     /// Waiting on its client: a victim for anyone, however old it is.
     pub(super) idle: bool,
+    /// Waiting at a bind for room (a commit, room given back, the planner's
+    /// serve, or its turn behind a guest bind's head): it makes no progress
+    /// until room comes, its refused bind holds nothing, and parked it binds
+    /// once restored, so it yields as an idle process does.
+    pub(super) bind_waiting: bool,
     /// What an idle eviction freed; it asks for it back only once it wakes.
     pub(super) parked: Option<Demand>,
     /// Parked below the floor, it gave its execution seat back: it takes
@@ -112,6 +117,7 @@ impl Proc {
             resident: Arc::new(AtomicBool::new(true)),
             holder: false,
             idle: false,
+            bind_waiting: false,
             parked: None,
             seatless: false,
             reseating: false,

@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{Gpu, close_bf16, round_bf16, values};
+use common::{Gpu, close_abs, close_bf16, round_bf16, values};
 use dtype::Dtype;
 use kernels_rocm::linear::gemm;
 
@@ -343,6 +343,62 @@ fn the_live_lm_head_multiplies_the_live_rows() {
         let got = gpu.read(&y);
         let rows = (live * n) as usize;
         close_bf16(&format!("live {live}"), &got[..rows], &want[..rows], 2.0);
+        assert!(
+            got[rows..].iter().all(|&v| v == 3.0),
+            "live {live}: a padding row was written"
+        );
+    }
+}
+
+/// The live lm head over a vocabulary past 2^16 rows whose size is no
+/// multiple of a launch's macro tile (Qwen3's 151936: 64 rows past MT0 192,
+/// 48 past MT0 176) writes every column of every live row, as the dense lm
+/// head does: the grouped kernels drop such a partial last tile, so each
+/// launch covers it with a group of its own.
+#[test]
+fn the_live_lm_head_writes_the_last_columns_of_a_wide_vocabulary() {
+    let Some(gpu) = Gpu::open() else { return };
+    if kernels_rocm::hip::lt_grouped::library(Dtype::Bf16).is_err() {
+        return;
+    }
+    let mut t = kernels_rocm::tuning::Tuning::DEFAULT;
+    t.gemm_live_from = 129;
+    let ctx = gpu.ctx().with_tuning(t);
+    let (m, n, k) = (192u32, 151_936u32, 256u32);
+    let a: Vec<f32> = values((m * k) as usize, 41, 1.0)
+        .into_iter()
+        .map(round_bf16)
+        .collect();
+    let w: Vec<f32> = values((n * k) as usize, 42, 0.05)
+        .into_iter()
+        .map(round_bf16)
+        .collect();
+    let (at, wt) = (
+        gpu.tensor(&a, m, k, Dtype::Bf16),
+        gpu.tensor(&w, n, k, Dtype::Bf16),
+    );
+    let mut dense = gpu.tensor(&vec![0.0; (m * n) as usize], m, n, Dtype::Bf16);
+    gpu.laid(&gpu.ctx(), |ctx| gemm::lm_head(ctx, at, wt, &mut dense))
+        .unwrap();
+    let want = gpu.read(&dense);
+    // A count each launch takes: up to MT1 32, up to 128, past it.
+    for live in [7u32, 100, 150, 192] {
+        let count = gpu.upload(&[live], 1, 1, Dtype::I32);
+        let mut y = gpu.tensor(&vec![3.0; (m * n) as usize], m, n, Dtype::Bf16);
+        gpu.laid(&ctx, |ctx| {
+            gemm::lm_head_live(ctx, at, wt, count.ptr, &mut y)
+        })
+        .unwrap();
+        let got = gpu.read(&y);
+        let rows = (live * n) as usize;
+        // Two kernels' roundings of the same products; an unwritten
+        // column holds 3.0.
+        close_abs(
+            &format!("live {live} of a {n}-wide vocabulary"),
+            &got[..rows],
+            &want[..rows],
+            0.1,
+        );
         assert!(
             got[rows..].iter().all(|&v| v == 3.0),
             "live {live}: a padding row was written"

@@ -534,7 +534,15 @@ pub(super) async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
         };
         (rs, short)
     };
-    if kv.is_none() && rs.is_none() {
+    // The process's instance tables and rings park with its state where the
+    // host has room; what it lacks stays on the device, never dropped. Its
+    // guest scratch, dead between fires, is given back whatever lies below:
+    // a process with nothing else to move still frees its Instance chunks.
+    let roles = stores
+        .roles
+        .as_ref()
+        .and_then(|roles| roles.lock().unwrap().prepare_park(pid));
+    if kv.is_none() && rs.is_none() && roles.is_none() {
         if !rs_short.is_zero() {
             // The host lacks rows for its state: nothing moves and nothing
             // is dropped; the head stays parked and the host is short.
@@ -547,12 +555,6 @@ pub(super) async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
         planner.eviction_found_nothing(pid);
         return;
     }
-    // The process's instance tables and rings park with its state where the
-    // host has room; what it lacks stays on the device, never dropped.
-    let roles = stores
-        .roles
-        .as_ref()
-        .and_then(|roles| roles.lock().unwrap().prepare_park(pid));
     let prepared_at = began.elapsed();
     let mut guard = MoveGuard::new(model, engine, Move::Suspend { kv, rs, roles });
     if let Err(error) = guard.copy(&planner, pid).await {

@@ -1806,6 +1806,19 @@ impl KvStore {
         self.note_change(terminal, true);
     }
 
+    /// The device pages of `working_sets` that would leave the device
+    /// with them: resident, read by none of the running working sets
+    /// outside them, pinned by nothing ([`KvPageTable::movable_resident_pages`]).
+    pub fn movable_resident_pages(
+        &self,
+        working_sets: &HashSet<WorkingSetId>,
+    ) -> Vec<PhysicalKvPageId> {
+        self.table
+            .movable_resident_pages(working_sets)
+            .map(|pages| pages.into_iter().map(|(_, page)| page).collect())
+            .unwrap_or_default()
+    }
+
     pub fn owner_of(&self, ws: WorkingSetId) -> Option<ProcessId> {
         self.table
             .owner(ws)
