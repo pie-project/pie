@@ -1121,6 +1121,19 @@ impl Pools {
         self.pool.diag_publish_parts();
     }
 
+    /// PROBE: the chunk a kernel would reach through kv page id `id` were its
+    /// buffer's delta 0: its chunk in its buffer, counted from the first.
+    pub fn diag_page_chunk_without_delta(&self, id: u32) -> Option<u32> {
+        let list = *self.shape(LIST).ok()?;
+        let ids = self.pool.page_ids();
+        let local = id & ((1u32 << ids.part_shift.min(31)) - 1);
+        let slot = match ids.shift {
+            None => local,
+            Some(shift) => (local >> shift) * list.per_chunk + (local & ((1 << shift) - 1)),
+        };
+        Some(slot / list.per_chunk.max(1))
+    }
+
     /// PROBE: the physical chunk a kernel reaches through kv page id `id`.
     pub fn diag_page_chunk(&self, id: u32) -> Option<u32> {
         let list = *self.shape(LIST).ok()?;

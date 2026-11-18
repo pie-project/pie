@@ -3054,6 +3054,14 @@ impl Shell {
                 && !SAID.swap(true, std::sync::atomic::Ordering::Relaxed)
             {
                 eprintln!("PROBE-DELTAS: at a frame's harvest: {why}");
+                for chunk in 1..=self.pools.layout().tables {
+                    let named = crate::store::diag_who_named(chunk);
+                    eprintln!(
+                        "PROBE-DELTAS: tables chunk {chunk} named as a kv page by (fire, lane, path), now fire {}: {:?}",
+                        crate::store::diag_fire_now(),
+                        &named[named.len().saturating_sub(12)..]
+                    );
+                }
             }
         }
         // Each attached instance's epilogue, settled once the buffer
@@ -4489,6 +4497,20 @@ impl Shell {
         }
         let geometries = geometries;
         for geometry in &geometries {
+            if self.pools.parts() > 1 {
+                crate::store::diag_fire_pages(
+                    u32::MAX,
+                    "write_page were its buffer's delta 0 (every row)",
+                    geometry
+                        .write_page
+                        .iter()
+                        .filter_map(|&page| {
+                            self.pools
+                                .diag_page_chunk_without_delta(u32::try_from(page.max(0)).unwrap_or(0))
+                        })
+                        .collect(),
+                );
+            }
             crate::store::diag_fire_pages(
                 u32::MAX,
                 "write_page (every row)",
@@ -5655,6 +5677,14 @@ impl engine::frame::Shell for Shell {
                 && !SAID.swap(true, std::sync::atomic::Ordering::Relaxed)
             {
                 eprintln!("PROBE-DELTAS: at a fire's prepare start: {why}");
+                for chunk in 1..=self.pools.layout().tables {
+                    let named = crate::store::diag_who_named(chunk);
+                    eprintln!(
+                        "PROBE-DELTAS: tables chunk {chunk} named as a kv page by (fire, lane, path), now fire {}: {:?}",
+                        crate::store::diag_fire_now(),
+                        &named[named.len().saturating_sub(12)..]
+                    );
+                }
             }
         }
         let _ = crate::store::diag_fire_begin();
