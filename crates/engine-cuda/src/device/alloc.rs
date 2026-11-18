@@ -918,6 +918,29 @@ pub(crate) fn commit_anon(at: *mut u8, bytes: usize) -> bool {
     !unsafe { VirtualAlloc(at.cast(), bytes, MEM_COMMIT, PAGE_READWRITE) }.is_null()
 }
 
+/// Gives the OS back the committed pages of `bytes` at `at`, inside a
+/// [`reserve_anon`] span nothing reads before writing anew: the span stays
+/// reserved, and [`commit_anon`] (unix: the next write) commits it again.
+/// Returns the bytes given back.
+#[cfg(unix)]
+pub(crate) fn decommit_anon(at: *mut u8, bytes: usize) -> u64 {
+    // SAFETY: the caller's own reservation, read by nothing before it is
+    // written again (the contract above).
+    unsafe { engine::host::give_back(at, bytes) as u64 }
+}
+
+#[cfg(windows)]
+pub(crate) fn decommit_anon(at: *mut u8, bytes: usize) -> u64 {
+    use windows_sys::Win32::System::Memory::{MEM_DECOMMIT, VirtualFree};
+    // SAFETY: decommitting pages of the caller's own reservation, which
+    // stays reserved for `commit_anon`.
+    if unsafe { VirtualFree(at.cast(), bytes, MEM_DECOMMIT) } != 0 {
+        bytes as u64
+    } else {
+        0
+    }
+}
+
 /// Drops the resident pages of `bytes` at `at`, whole pages of a read-only
 /// file mapping whose contents were copied elsewhere: a later read faults
 /// them back in from the file. The advice is unix's; elsewhere the OS trims

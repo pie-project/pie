@@ -35,6 +35,23 @@ impl Host {
         }
     }
 
+    /// Gives the OS back the pages of every chunk at and past `from`
+    /// (`Engine::release_host_chunks`): the runtime holds none of them open,
+    /// and every copy into the tier landed before it returned. Each is
+    /// committed again as a copy first writes it. Returns the bytes given
+    /// back.
+    pub fn give_back(&mut self, from: u32) -> u64 {
+        let start = usize::try_from(u64::from(from) * self.chunk_bytes)
+            .unwrap_or(usize::MAX)
+            .min(self.bytes.len());
+        let tail = &mut self.bytes[start..];
+        // SAFETY: the tier's own heap memory past `from`, which the runtime
+        // opens again only to write it.
+        #[allow(unsafe_code)]
+        let given = unsafe { engine::host::give_back(tail.as_mut_ptr(), tail.len()) };
+        given as u64
+    }
+
     #[must_use]
     pub fn chunks(&self) -> u32 {
         self.chunks

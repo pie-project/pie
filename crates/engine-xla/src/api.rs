@@ -958,6 +958,10 @@ impl Engine for Xla {
         )))
     }
 
+    fn release_host_chunks(&mut self, from: u32) -> EngineResult<u64> {
+        Ok(self.loaded_mut()?.release_host_chunks(from))
+    }
+
     fn release_segments(&mut self, segments: u32) -> EngineResult<()> {
         if segments >= 1 {
             return Ok(());

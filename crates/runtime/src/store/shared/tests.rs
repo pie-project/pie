@@ -286,7 +286,7 @@ fn walk_segments(
 
 /// The facts without the ring: a model whose state is fixed records, its
 /// unfolded rows in an rs list (CONTRACT-BC 18), the shapes' last.
-fn fixed_facts() -> ChunkFacts {
+pub(crate) fn fixed_facts() -> ChunkFacts {
     let mut facts = facts();
     facts.shapes.retain(|shape| shape.id != RING);
     facts.shapes.push(Facts {

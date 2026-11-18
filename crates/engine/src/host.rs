@@ -242,3 +242,140 @@ mod tests {
         assert_eq!(host_kv_ceiling(&boxed, 1), 52 * GIB - SAFETY_FLOOR_BYTES);
     }
 }
+
+/// Gives the OS back the resident pages of `bytes` at `at`: the whole pages
+/// inside the span (a part page at either end stays). The memory stays
+/// mapped and usable; the next write faults a page in again, so a tier
+/// that gives a chunk back commits it as it fills, as it did the first
+/// time. Linux drops the pages (`MADV_DONTNEED`: they read zero after);
+/// macOS marks them reusable (`MADV_FREE_REUSABLE`: out of the process's
+/// footprint at once, their bytes unspecified after). Returns the bytes
+/// given back; none where the OS states no such advice.
+///
+/// # Safety
+///
+/// `[at, at + bytes)` is private anonymous memory the caller owns, and
+/// nothing reads it before it is written anew.
+#[must_use]
+#[allow(unsafe_code)]
+pub unsafe fn give_back(at: *mut u8, bytes: usize) -> usize {
+    #[cfg(unix)]
+    {
+        // SAFETY: a query of the page size.
+        let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(4096);
+        let start = (at as usize).next_multiple_of(page);
+        let end = (at as usize).saturating_add(bytes) / page * page;
+        if end <= start {
+            return 0;
+        }
+        #[cfg(target_os = "linux")]
+        let advice = libc::MADV_DONTNEED;
+        #[cfg(target_vendor = "apple")]
+        let advice = libc::MADV_FREE_REUSABLE;
+        #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+        let advice = libc::MADV_DONTNEED;
+        // SAFETY: whole pages inside memory the caller owns and will not
+        // read before writing (the contract above).
+        let done = unsafe { libc::madvise(start as *mut libc::c_void, end - start, advice) };
+        if done == 0 { end - start } else { 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (at, bytes);
+        0
+    }
+}
+
+#[cfg(all(test, unix))]
+#[allow(unsafe_code)]
+mod give_back_tests {
+    /// The resident pages of `len` bytes at `at` (`mincore`).
+    fn resident(at: *mut u8, len: usize) -> usize {
+        // SAFETY: a query of the page size.
+        let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+        let mut vec = vec![0u8; len.div_ceil(page)];
+        // SAFETY: `vec` holds one byte a page of the span, which is mapped.
+        let done = unsafe { libc::mincore(at.cast(), len, vec.as_mut_ptr().cast()) };
+        assert_eq!(done, 0, "mincore");
+        vec.iter().filter(|&&v| v & 1 != 0).count()
+    }
+
+    /// The process's physical footprint (what Activity Monitor and the
+    /// memory-pressure accounting count), on macOS.
+    #[cfg(target_vendor = "apple")]
+    fn footprint() -> u64 {
+        let mut info: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is a `rusage_info_v4`, the flavor asked for.
+        let done = unsafe {
+            libc::proc_pid_rusage(
+                std::process::id() as i32,
+                libc::RUSAGE_INFO_V4,
+                (&raw mut info).cast(),
+            )
+        };
+        assert_eq!(done, 0, "proc_pid_rusage");
+        info.ri_phys_footprint
+    }
+
+    /// A tier's chunk, written (its pages committed), given back: its pages
+    /// are no longer resident (Linux) or in the footprint (macOS), and it
+    /// takes writes again.
+    #[test]
+    fn a_written_span_given_back_holds_no_resident_pages() {
+        let len = 4 << 20;
+        // SAFETY: a fresh private anonymous mapping, unmapped below.
+        let at = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(at, libc::MAP_FAILED);
+        let at = at.cast::<u8>();
+        // SAFETY: the mapping's own bytes.
+        unsafe { std::ptr::write_bytes(at, 0xa5, len) };
+        let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+        assert_eq!(resident(at, len), len / page, "written: every page resident");
+        #[cfg(target_vendor = "apple")]
+        let before = footprint();
+        // SAFETY: the mapping is ours and nothing reads it before writing.
+        let given = unsafe { super::give_back(at, len) };
+        assert_eq!(given, len, "whole pages, all of them");
+        #[cfg(target_os = "linux")]
+        assert_eq!(resident(at, len), 0, "no page resident after");
+        // macOS keeps reusable pages mapped until the system takes them
+        // (mincore still shows them), and takes them out of the footprint at
+        // once.
+        #[cfg(target_vendor = "apple")]
+        {
+            let after = footprint();
+            assert!(
+                before.saturating_sub(after) >= len as u64 * 3 / 4,
+                "the footprint drops by the span: {before} -> {after}"
+            );
+        }
+        // SAFETY: writes into the mapping, which stays usable.
+        unsafe { std::ptr::write_bytes(at, 0x5a, len) };
+        // SAFETY: the mapping's own bytes, just written.
+        assert_eq!(unsafe { *at.add(len - 1) }, 0x5a, "it takes writes again");
+        // SAFETY: unmapping the mapping made above, once.
+        unsafe { libc::munmap(at.cast(), len) };
+    }
+
+    /// A span short of a page gives nothing back, and a span's part pages
+    /// stay.
+    #[test]
+    fn only_whole_pages_go() {
+        let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+        let mut buf = vec![1u8; 3 * page];
+        let at = buf.as_mut_ptr();
+        let off = at.align_offset(page);
+        // SAFETY: inside `buf`, which nothing reads before writing again.
+        assert_eq!(unsafe { super::give_back(at.wrapping_add(off + 1), page) }, 0);
+        drop(buf);
+    }
+}

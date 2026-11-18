@@ -326,6 +326,10 @@ pub(crate) enum PoolOp {
     CommitSegments(u32),
     /// A shared pool gives back segments `n..` (`Engine::release_segments`).
     ReleaseSegments(u32),
+    /// The host tier gives the OS back the pages of its chunks `n..`
+    /// (`Engine::release_host_chunks`): its governor's target fell under
+    /// them, and none is open.
+    ReleaseHostChunks(u32),
     /// The activation rung moves (`Engine::set_rung`), where the span is
     /// backed on demand: a raise before any fire of the wider rung, a lower
     /// as a notice after its retire fence.

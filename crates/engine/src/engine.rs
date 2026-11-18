@@ -418,6 +418,18 @@ pub trait Engine: Send {
         Err(self.unsupported("release_segments"))
     }
 
+    /// Gives the host back the pages of every host-tier chunk at and past
+    /// `from` ([`crate::host::give_back`]): the runtime holds none of them
+    /// open, every move that named them has landed or lands before this
+    /// returns, and it opens none of them again until its ceiling rises
+    /// past them (a chunk opened again commits as it fills, as the first
+    /// time). Returns the bytes given back; an engine with no host tier
+    /// holds none.
+    fn release_host_chunks(&mut self, from: u32) -> Result<u64> {
+        let _ = from;
+        Ok(0)
+    }
+
     /// Backs the top `segments` segments of the span under the largest
     /// rung's activation, counted from the top of the pool, ahead of the
     /// runtime opening any chunk of theirs for state; never on a fire's

@@ -1049,6 +1049,17 @@ impl Lane {
                     match op {
                         PoolOp::CommitSegments(segments) => engine.commit_segments(segments),
                         PoolOp::ReleaseSegments(segments) => engine.release_segments(segments),
+                        PoolOp::ReleaseHostChunks(from) => {
+                            engine.release_host_chunks(from).map(|bytes| {
+                                tracing::info!(
+                                    engine = engine_idx,
+                                    from,
+                                    given_mib = bytes >> 20,
+                                    "the host kv tier gives the OS back the pages of its chunks \
+                                     past its target"
+                                );
+                            })
+                        }
                         PoolOp::CommitSpan(segments) => engine.commit_span(segments),
                         PoolOp::Rung { from, to } => engine.set_rung(from, to),
                         PoolOp::ReleaseSpan(segments) => engine.release_span(segments),

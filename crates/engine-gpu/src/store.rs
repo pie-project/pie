@@ -1649,6 +1649,27 @@ impl<B: Backend> Pools<B> {
 
     /// Gives back every segment at and past `segments`. The caller drained
     /// every frame, and the runtime evacuated what they held.
+    /// Gives the OS back the host tier's memory of every chunk at and past
+    /// `from` (`Engine::release_host_chunks`): mapped blocks wholly past it
+    /// go (a block is the commit unit; one straddling `from` stays, and is
+    /// allocated again on its next copy), and heap memory gives back its
+    /// pages. Returns the bytes given back.
+    pub fn release_host(&mut self, from: u32) -> u64 {
+        let offset = u64::from(from).saturating_mul(self.layout.chunk_bytes);
+        match &mut self.host {
+            HostChunks::Mapped(blocks) => blocks.release_from(offset),
+            HostChunks::Heap(heap) => {
+                let start = usize::try_from(offset).unwrap_or(usize::MAX).min(heap.len());
+                let tail = &mut heap[start..];
+                // SAFETY: the tier's own heap memory past `from`, which the
+                // runtime opens again only to write it.
+                #[allow(unsafe_code)]
+                let given = unsafe { engine::host::give_back(tail.as_mut_ptr(), tail.len()) };
+                given as u64
+            }
+        }
+    }
+
     pub fn release_segments(&mut self, segments: u32) {
         self.pool.release_segments(segments);
     }
@@ -1713,6 +1734,18 @@ impl<B: Backend> HostBlocks<B> {
                 have: self.bytes,
             }),
         }
+    }
+
+    /// Drops every block wholly at or past `offset`, the bytes it held.
+    fn release_from(&mut self, offset: u64) -> u64 {
+        let first = usize::try_from(offset.div_ceil(self.block)).unwrap_or(usize::MAX);
+        let mut given = 0;
+        for index in first..self.blocks.len() {
+            if self.blocks[index].take().is_some() {
+                given += self.block.min(self.bytes - index as u64 * self.block);
+            }
+        }
+        given
     }
 
     /// The block and offset of a span, where a copy has reached it.

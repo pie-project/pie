@@ -160,6 +160,11 @@ impl Shell {
         self.pools.release_segments(segments)
     }
 
+    /// See `Engine::release_host_chunks`.
+    pub fn release_host_chunks(&mut self, from: u32) -> crate::Result<u64> {
+        self.pools.release_host_chunks(from)
+    }
+
     /// See `Engine::evacuate`: the copy and the table change are ordered on
     /// the stream behind every fire enqueued so far and before the next.
     pub fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> crate::Result<()> {

@@ -1219,6 +1219,14 @@ impl SlotPool {
     }
 
     /// The shape logical chunk `chunk` is open for.
+    /// Whether chunk `chunk` holds nothing and owes nothing: no shape open
+    /// on it, and no slot of it waiting on a fire to retire.
+    #[must_use]
+    pub fn chunk_quiet(&self, chunk: u32) -> bool {
+        self.chunk_shape(chunk).is_none()
+            && !self.pending.values().flatten().any(|slot| slot.chunk == chunk)
+    }
+
     pub fn chunk_shape(&self, chunk: u32) -> Option<ShapeId> {
         Some(self.chunks[chunk as usize].shape).filter(|&shape| shape != NO_SHAPE)
     }

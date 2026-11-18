@@ -618,6 +618,14 @@ impl Engine for Group {
         self.lead(move |rank| rank.release_segments(segments))
     }
 
+    /// Every rank gives back its own host tier's pages: their sum.
+    fn release_host_chunks(&mut self, from: u32) -> EngineResult<u64> {
+        Ok(self
+            .each(move |rank| rank.release_host_chunks(from))?
+            .into_iter()
+            .sum())
+    }
+
     /// Every rank moves the same chunks and rebases its guests' rings.
     fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {
         let evacuation = evacuation.clone();

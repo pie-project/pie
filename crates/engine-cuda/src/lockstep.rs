@@ -888,6 +888,10 @@ impl Engine for Rank {
         self.with(|cuda| cuda.release_segments(segments))
     }
 
+    fn release_host_chunks(&mut self, from: u32) -> EngineResult<u64> {
+        self.with(|cuda| cuda.release_host_chunks(from))
+    }
+
     /// Every rank moves the same chunks and rebases its guests' rings.
     fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {
         self.with(|cuda| cuda.evacuate(evacuation))

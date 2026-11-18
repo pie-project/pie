@@ -2578,6 +2578,13 @@ impl<B: Serve> Shell<B> {
             .collect()
     }
 
+    /// See `Engine::release_host_chunks`: once every frame has landed, no
+    /// copy reads or writes the chunks whose memory goes.
+    pub fn release_host_chunks(&mut self, from: u32) -> Result<u64> {
+        self.drain()?;
+        Ok(self.pools.release_host(from))
+    }
+
     pub fn drain(&mut self) -> Result<()> {
         while !self.inflight.is_empty() {
             self.harvest_one()?;

@@ -1310,6 +1310,12 @@ impl Shell {
         &self.pools
     }
 
+    /// See `Engine::release_host_chunks`: copies into the host tier land
+    /// before `copy_tier` returns, so none is in flight.
+    pub fn release_host_chunks(&mut self, from: u32) -> u64 {
+        self.host.give_back(from)
+    }
+
     /// Seats the host tier, `host` bytes of whole chunks (`None`: the tier's
     /// ceiling by the shared rule, [`engine::host::host_kv_ceiling`]; the
     /// tier is calloc'd, so it commits as copies land), and the slot file

@@ -143,6 +143,27 @@ impl std::fmt::Debug for HostTier {
 unsafe impl Send for HostTier {}
 
 impl HostTier {
+    /// Gives the OS back the pages of every committed chunk at and past
+    /// `from` (`Engine::release_host_chunks`): the runtime holds none of
+    /// them open, and the store settled every move first. Each is committed
+    /// again as a move first writes it. Returns the bytes given back.
+    pub fn give_back(&mut self, from: u32) -> u64 {
+        let mut given = 0;
+        for chunk in from..self.chunks {
+            let committed = &self.committed[chunk as usize];
+            if !committed.load(Ordering::Relaxed) {
+                continue;
+            }
+            let at = u64::from(chunk) * self.chunk_bytes;
+            let bytes = self.chunk_bytes.min(self.len as u64 - at);
+            // SAFETY: the chunk lies inside this tier's own reservation, and
+            // no move reads or writes it (the store settled them).
+            given += alloc::decommit_anon(unsafe { self.base.add(at as usize) }, bytes as usize);
+            committed.store(false, Ordering::Relaxed);
+        }
+        given
+    }
+
     /// A tier of `chunks` chunks of `chunk_bytes`, reserved, each committed
     /// when a span first names it, behind the pinned staging `ring`
     /// ([`staging_ring`]).

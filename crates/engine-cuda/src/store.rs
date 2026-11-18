@@ -4640,6 +4640,13 @@ impl Pools {
     }
 
     /// Waits, on the host, for every move still landing.
+    /// See `Engine::release_host_chunks`: no move still landing reads or
+    /// writes a chunk whose pages go.
+    pub fn release_host_chunks(&mut self, from: u32) -> Result<u64> {
+        self.settle_swaps()?;
+        Ok(self.tier.as_mut().map_or(0, |tier| tier.give_back(from)))
+    }
+
     pub fn settle_swaps(&mut self) -> Result<()> {
         for swap in self.swaps.drain(..) {
             swap.landed.settle()?;

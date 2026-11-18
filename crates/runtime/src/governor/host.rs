@@ -12,22 +12,68 @@
 //! ([`crate::store::slots::SlotPool::set_ceiling`]). A tier holding chunks
 //! past its target with no room to give them back tells the policy
 //! `tier-pressure` on the host, as the device's governor does on the
-//! device; the policy decides what leaves.
+//! device; the policy decides what leaves (PLEX order: idle cache first).
+//! Once none past the target is open, the engine gives the OS back their
+//! pages ([`::engine::Engine::release_host_chunks`]): the tier's resident
+//! memory comes down with its target, and nothing touches those chunks
+//! again until the target rises past them.
 
-use super::{Governor, Growth, Limits, PoolTarget, Reader, Retarget, Signal, TICK, Yield};
+use super::{Governor, Growth, Limits, PoolTarget, Reader, Retarget, Signal, Source, TICK, Yield};
 use crate::policy::pressure::{self, Tier};
 use crate::store::shared::Shared;
 
 /// One engine's host tier: its shared pool of host chunks.
 pub struct HostTier {
     pool: Shared,
+    /// The engine gave back the pages of every chunk from this one on, and
+    /// the cap has not risen past it since: none of them holds a page.
+    returned: Option<u32>,
 }
 
 impl HostTier {
     #[must_use]
     pub const fn new(pool: Shared) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            returned: None,
+        }
     }
+
+    /// After a turn: the chunk from which the engine should give the OS
+    /// back its pages, where the cap fell under what was given back last
+    /// (or nothing was) and every chunk from the cap on is quiet (none
+    /// open, none owed to a fire). A cap risen past what was given back
+    /// moves it up to the cap: the chunks under it may open, and commit,
+    /// again; those from it on still hold no page.
+    pub fn to_return(&mut self) -> Option<u32> {
+        let pool = self.pool.lock().unwrap();
+        let slots = pool.pool();
+        let (cap, total) = (slots.ceiling(), slots.total_chunks());
+        decide_return(&mut self.returned, cap, total, |chunk| slots.chunk_quiet(chunk))
+    }
+}
+
+/// [`HostTier::to_return`]'s rule, over the cap, the tier's chunks and
+/// whether a chunk is quiet.
+fn decide_return(
+    returned: &mut Option<u32>,
+    cap: u32,
+    total: u32,
+    quiet: impl Fn(u32) -> bool,
+) -> Option<u32> {
+    // A cap risen past what went back: the chunks under it may open (and
+    // commit) again, those from it on still hold no page.
+    if returned.is_some_and(|from| cap > from) {
+        *returned = Some(cap);
+    }
+    if cap >= total || returned.is_some_and(|from| from <= cap) {
+        return None;
+    }
+    if !(cap..total).all(quiet) {
+        return None;
+    }
+    *returned = Some(cap);
+    Some(cap)
 }
 
 impl PoolTarget for HostTier {
@@ -115,14 +161,17 @@ pub fn start(engine: usize, pool: Shared, yields: Yield) {
         );
         return;
     }
-    let Some(reader) = Reader::of_this_system() else {
-        tracing::info!(
-            engine,
-            ceiling_mib = limits.hard_limit >> 20,
-            "this system states no memory pressure: it reads 0, and the host kv tier's target \
-             is its ceiling"
-        );
-        return;
+    let reader = match Source::of_this_system() {
+        Ok(source) => Reader::new(source),
+        Err(why) => {
+            tracing::info!(
+                engine,
+                ceiling_mib = limits.hard_limit >> 20,
+                %why,
+                "this system states no memory pressure: the host kv tier's target is its ceiling"
+            );
+            return;
+        }
     };
     tracing::info!(
         engine,
@@ -157,6 +206,19 @@ async fn watch(engine: usize, mut tier: HostTier, mut governor: Governor, mut re
                 pressure::relieve(Tier::Host, source(engine));
             }
             Signal::Eased => {}
+        }
+        // Nothing past the target is open: their pages go back to the OS.
+        if let Some(from) = tier.to_return() {
+            let op = crate::scheduler::worker::PoolOp::ReleaseHostChunks(from);
+            if let Err(why) = crate::scheduler::pool(engine, op).await {
+                tracing::warn!(
+                    engine,
+                    from,
+                    %why,
+                    "the host kv tier's pages past its target could not be given back"
+                );
+                tier.returned = None;
+            }
         }
     }
 }
@@ -248,5 +310,180 @@ mod tests {
         assert_eq!(tier.cap, 50);
         tier.open = 40;
         assert_eq!(turn(&mut governor, &mut tier, 1.0), Signal::Eased);
+    }
+}
+
+#[cfg(test)]
+mod return_tests {
+    use super::*;
+
+    /// The rule: once the cap falls under what was given back (or nothing
+    /// was), and every chunk from the cap on is quiet, the chunks from the
+    /// cap on go back, once; a chunk still owed holds it; a cap risen past
+    /// what went back counts only the chunks from the new cap as given
+    /// back, so a later fall gives back what the rise let open.
+    #[test]
+    fn chunks_past_a_falling_cap_go_back_once_each_fall() {
+        let mut returned = None;
+        assert_eq!(decide_return(&mut returned, 8, 8, |_| true), None, "at the ceiling: nothing");
+        assert_eq!(decide_return(&mut returned, 5, 8, |chunk| chunk != 6), None, "chunk 6 owed");
+        assert_eq!(decide_return(&mut returned, 5, 8, |_| true), Some(5));
+        assert_eq!(decide_return(&mut returned, 5, 8, |_| true), None, "once");
+        assert_eq!(decide_return(&mut returned, 3, 8, |_| true), Some(3), "a further fall");
+        assert_eq!(decide_return(&mut returned, 6, 8, |_| true), None, "a rise gives nothing back");
+        assert_eq!(returned, Some(6), "chunks 3..6 may open again; 6.. still hold nothing");
+        assert_eq!(decide_return(&mut returned, 4, 8, |_| true), Some(4), "a fall after the rise");
+    }
+
+    /// The tier's own memory as an engine holds it: one anonymous mapping
+    /// of its chunks, committed as copies write it, and
+    /// `Engine::release_host_chunks` as an engine answers it.
+    #[allow(unsafe_code)]
+    struct HostMemory {
+        at: *mut u8,
+        chunk: usize,
+        chunks: usize,
+    }
+
+    #[allow(unsafe_code)]
+    impl HostMemory {
+        fn new(chunk: usize, chunks: usize) -> Self {
+            // SAFETY: a fresh private anonymous mapping, unmapped on drop.
+            let at = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    chunk * chunks,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANON,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(at, libc::MAP_FAILED);
+            Self { at: at.cast(), chunk, chunks }
+        }
+
+        /// A move to the host writes chunk `chunk`.
+        fn write(&mut self, chunk: usize) {
+            // SAFETY: inside the mapping.
+            unsafe { std::ptr::write_bytes(self.at.add(chunk * self.chunk), 0xa5, self.chunk) };
+        }
+
+        fn release_host_chunks(&mut self, from: u32) -> u64 {
+            let from = from as usize;
+            // SAFETY: the tier's own memory; the runtime opens none of these
+            // chunks before writing them again.
+            let given = unsafe {
+                ::engine::host::give_back(self.at.add(from * self.chunk), (self.chunks - from) * self.chunk)
+            };
+            given as u64
+        }
+
+        /// Its resident bytes (Linux), or the process's footprint (macOS:
+        /// pages given back as reusable leave the footprint, not the map).
+        fn resident(&self) -> u64 {
+            #[cfg(target_os = "linux")]
+            {
+                // SAFETY: a query of the page size.
+                let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+                let len = self.chunk * self.chunks;
+                let mut vec = vec![0u8; len.div_ceil(page)];
+                // SAFETY: one byte a page of the live mapping.
+                assert_eq!(unsafe { libc::mincore(self.at.cast(), len, vec.as_mut_ptr().cast()) }, 0);
+                (vec.iter().filter(|&&v| v & 1 != 0).count() * page) as u64
+            }
+            #[cfg(target_vendor = "apple")]
+            {
+                let mut info: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
+                // SAFETY: `info` is the flavor asked for.
+                let done = unsafe {
+                    libc::proc_pid_rusage(
+                        std::process::id() as i32,
+                        libc::RUSAGE_INFO_V4,
+                        (&raw mut info).cast(),
+                    )
+                };
+                assert_eq!(done, 0);
+                info.ri_phys_footprint
+            }
+        }
+    }
+
+    #[allow(unsafe_code)]
+    impl Drop for HostMemory {
+        fn drop(&mut self) {
+            // SAFETY: the mapping `new` made, once.
+            unsafe { libc::munmap(self.at.cast(), self.chunk * self.chunks) };
+        }
+    }
+
+    /// A pressure file at 1, yield 1: the target falls to nothing, under
+    /// the chunks the tier holds. While a chunk past it is open the tier
+    /// says so (the policy's `tier-pressure`) and gives nothing back; once
+    /// the policy has let them go, the engine gives the OS back the pages
+    /// of every chunk past the target, and the tier's resident memory
+    /// comes down with it.
+    #[test]
+    fn a_pressure_file_drives_the_target_under_held_and_the_tier_s_pages_go_back() {
+        let mut facts = crate::store::shared::tests::fixed_facts();
+        facts.host_chunks = 8;
+        let host = crate::store::shared::Tiers::of(&facts)
+            .unwrap()
+            .host
+            .expect("a host tier");
+        let (chunk, shape, spc) = {
+            let pool = host.lock().unwrap();
+            let shape = (0..facts.shapes.len() as u16)
+                .find(|&s| pool.pool().shape(s).is_some_and(|f| f.slots_per_chunk >= 1))
+                .expect("a shape");
+            let spc = pool.pool().shape(shape).unwrap().slots_per_chunk;
+            (pool.pool().chunk_bytes(), shape, spc)
+        };
+        let holder = crate::store::slots::Holder::WorkingSet(1);
+        // Six chunks' worth of suspended state lands on the host.
+        let slots = host
+            .lock()
+            .unwrap()
+            .pool_mut()
+            .acquire(holder, shape, u64::from(spc) * 6)
+            .expect("room on the host");
+        let mut memory = HostMemory::new(usize::try_from(chunk).unwrap(), 8);
+        let mut opened: Vec<u32> = slots.iter().map(|slot| slot.chunk).collect();
+        opened.dedup();
+        for &c in &opened {
+            memory.write(c as usize);
+        }
+        let full = memory.resident();
+
+        let dir = std::env::temp_dir().join(format!("pie-host-return-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("pressure");
+        std::fs::write(&file, "1.0").unwrap();
+        let mut reader = Reader::new(Source::File(file));
+        let mut tier = HostTier::new(host.clone());
+        let mut governor = Governor::new(Limits::of(&tier), Yield::new(1.0).unwrap());
+
+        // Held past the target: the policy is told, nothing goes back.
+        assert!(matches!(
+            turn(&mut governor, &mut tier, reader.read()),
+            Signal::TierPressure { .. }
+        ));
+        assert_eq!(tier.to_return(), None, "its chunks are open");
+
+        // The policy lets the state go (the disk takes it): the tier eases,
+        // and every chunk past the target goes back to the OS.
+        host.lock().unwrap().pool_mut().release(holder, &slots, 0);
+        assert!(matches!(turn(&mut governor, &mut tier, reader.read()), Signal::Eased));
+        let from = tier.to_return().expect("chunks past the target go back");
+        assert_eq!(from, 0, "the target is nothing at full pressure and yield 1");
+        let given = memory.release_host_chunks(from);
+        assert_eq!(given, chunk * 8, "every chunk's pages");
+        let after = memory.resident();
+        assert!(
+            full.saturating_sub(after) >= chunk * opened.len() as u64 * 3 / 4,
+            "the tier's resident memory comes down: {full} -> {after}"
+        );
+        assert_eq!(tier.to_return(), None, "once");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
