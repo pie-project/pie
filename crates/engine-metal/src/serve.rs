@@ -333,7 +333,6 @@ pub struct Shell {
     patch_fold: u32,
     drops_patch_rows: bool,
     states_mrope: bool,
-    gathers_readout: bool,
     feeds: crate::feeds::Feeds,
 
     copies: bool,
@@ -907,11 +906,6 @@ impl PreparedLoad<'_> {
             })
         });
         let states_mrope = declared_width(&boot.trace, RuntimeInput::MropePositions) > 0;
-        let gathers_readout = boot
-            .trace
-            .values
-            .iter()
-            .any(|decl| matches!(&decl.def, poem_ir::Def::Input(RuntimeInput::ReadoutRows)));
         let patch_fold = patch_fold(&boot.trace);
         let drops_patch_rows = boot
             .trace
@@ -1424,7 +1418,6 @@ impl PreparedLoad<'_> {
             patch_fold,
             drops_patch_rows,
             states_mrope,
-            gathers_readout,
             feeds,
             page_tables,
             copies: false,
@@ -2456,7 +2449,9 @@ impl Shell {
         }
         let (offset, width, dtype) = self.plane_row(p, out.values[0])?;
         let element = poem_compiler::arena::elem_bytes(dtype).unwrap_or(0);
-        let at = if self.gathers_readout {
+        // An output gathered at the readout rows holds the lane at its index
+        // among them; one written over every token row, at its own last row.
+        let at = if out.decl.readout {
             p.readout_first
                 .get(row.source as usize)
                 .copied()
@@ -3283,8 +3278,10 @@ impl Shell {
         lane_rows: &[u32],
         owed: &mut Vec<engine::InstanceId>,
     ) -> Result<()> {
-        // A lane's readout row: its gathered first, else its first named row, else its last.
-        let row_of = |lane: usize| -> Result<u32> {
+        // A lane's row of an output: for one gathered at the readout rows,
+        // its first among them; for one written over every token row, its
+        // first named row, else its last.
+        let row_of = |lane: usize, gathered: bool| -> Result<u32> {
             let owned = lane_rows.get(lane).copied().unwrap_or(0);
             if owned == 0 {
                 return Err(Fault::Ceiling {
@@ -3293,7 +3290,7 @@ impl Shell {
                     have: 0,
                 });
             }
-            if self.gathers_readout {
+            if gathered {
                 if prepared.readout_count.get(lane).copied().unwrap_or(0) == 0 {
                     return Err(Fault::Ceiling {
                         what: "readout rows in the lane an epilogue is attached to",
@@ -3425,7 +3422,7 @@ impl Shell {
         out: usize,
         at: usize,
         fire_lane: usize,
-        row_of: &dyn Fn(usize) -> Result<u32>,
+        row_of: &dyn Fn(usize, bool) -> Result<u32>,
     ) -> Result<(u64, u32, Dtype, u32)> {
         let output = &self.outputs[out];
         let name = &output.decl.name;
@@ -3455,7 +3452,12 @@ impl Shell {
                 }
                 (at_row(fire_lane as u64), width, dtype, stride)
             }
-            poem_ir::InputAxis::Row => (at_row(u64::from(row_of(at)?)), width, dtype, width),
+            poem_ir::InputAxis::Row => (
+                at_row(u64::from(row_of(at, output.decl.readout)?)),
+                width,
+                dtype,
+                width,
+            ),
             poem_ir::InputAxis::Voxel if output.grid.is_some() => {
                 let (offset, width, dtype) = self.grid_seat(prepared, at, out)?;
                 (offset, width, dtype, width)
