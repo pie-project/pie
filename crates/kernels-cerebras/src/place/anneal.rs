@@ -616,7 +616,9 @@ pub fn stream(p: &Program, moves: u64, seed: u64, units: bool) -> R<(Program, Re
         .filter(|(e, c)| *e < e0 - 1e-9 && *c != start)
         .take(TRIES)
     {
-        match placed(p, &pr, cand, b) {
+        // (laid as the emitter lays it: a placement whose blocks share a PE refused here, not
+        // kept to hang the chip)
+        match placed(p, &pr, cand, b).and_then(|q| crate::emit::stream::emit(&q).map(|_| q)) {
             Ok(q) => {
                 let l = super::cost::stream(&q)?.cycles;
                 if l <= seed_links {

@@ -222,6 +222,32 @@ mod tests {
         );
     }
 
+    /// A placement whose blocks share a PE is refused where it is laid (1560's d16: a K / V
+    /// column's last PE on the exit unit's weight PE routed, coloured and checked clean, and
+    /// hung the chip): flux2-mini's denoise with a K / V column's foot moved onto a unit.
+    #[test]
+    fn blocks_that_share_a_pe_are_refused() {
+        let t = trace("flux2-mini-bf16-kv-bf16");
+        let s = crate::stream::shape_of(&t, "denoise", 16).unwrap();
+        let p = crate::stream::build::program(&t, s, true).unwrap();
+        let pr = super::problem(&p.stream, &p.stream.wiring()).unwrap();
+        let mut sol = Solution::pinned(&pr);
+        let kv = (pr.blocks.iter())
+            .position(|b| matches!(b.kind, super::BlockKind::KvColumn(_)))
+            .expect("a K / V column");
+        let unit = (pr.blocks.iter())
+            .position(|b| matches!(b.kind, super::BlockKind::StreamUnit(u) if u > 0))
+            .expect("a unit");
+        // (the column's last PE one row into the unit's top row)
+        let (r, h) = (sol.rect(&pr, unit), pr.blocks[kv].rect.h);
+        sol.at[kv] = crate::floor::Coord::new(r.x + r.w / 2, r.y + 1 + r.h / 2 - h.min(r.h / 2));
+        let got = super::stream(&pr, &p.stream, &sol)
+            .and_then(|q| super::relay(&p, q))
+            .and_then(|q| crate::emit::stream::emit(&q).map(|_| ()));
+        let e = got.expect_err("an overlap laid");
+        assert!(e.contains("two blocks overlap"), "{e}");
+    }
+
     /// flux2-mini's denoise with its K / V columns 300 rows below their roots' units: every
     /// K / V link routed, the program laid and checked, the link term's round trips longer by
     /// the hops moved there and back and its fill alike.

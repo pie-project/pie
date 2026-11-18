@@ -419,7 +419,7 @@ pub fn emit(p: &Program) -> R<Emitted> {
                 let c = su.w(col, row);
                 // (no row index: a column's PEs differ only in their chains' colours and their
                 // config words, so they share a few images)
-                tiles.insert(c, (name.clone(), weight_params(p, ui, c)));
+                put(&mut tiles, c, (name.clone(), weight_params(p, ui, c)))?;
                 let mut words = cfg.clone();
                 words[0] = weight_role(p, c);
                 if !wsc.is_empty() {
@@ -468,7 +468,7 @@ pub fn emit(p: &Program) -> R<Emitted> {
                 }
             }
             let c = su.cx(j);
-            tiles.insert(c, (name, root_params(p, ui, c, Side::Row)));
+            put(&mut tiles, c, (name, root_params(p, ui, c, Side::Row)))?;
             for a in &cx_arrays {
                 arrays.push(rebind(a, c, j, b));
             }
@@ -480,7 +480,7 @@ pub fn emit(p: &Program) -> R<Emitted> {
             files.push((name.clone(), text));
             files.extend(regions);
             let c = su.cy(i);
-            tiles.insert(c, (name, root_params(p, ui, c, Side::Col)));
+            put(&mut tiles, c, (name, root_params(p, ui, c, Side::Col)))?;
             for a in &cy_arrays {
                 arrays.push(rebind(a, c, i, b));
             }
@@ -503,7 +503,7 @@ pub fn emit(p: &Program) -> R<Emitted> {
                             ("C_HR".into(), recv),
                         ],
                     );
-                    tiles.insert(c, (name.clone(), params));
+                    put(&mut tiles, c, (name.clone(), params))?;
                     arrays.extend(cfg_array(c, &[k + 1, role]));
                 }
             }
@@ -519,7 +519,7 @@ pub fn emit(p: &Program) -> R<Emitted> {
         };
         files.push((rname.clone(), rtext));
         let root = kc.root(s);
-        tiles.insert(root, (rname, kv_root_params(p, kc, root)));
+        put(&mut tiles, root, (rname, kv_root_params(p, kc, root)))?;
         if let Some(sk) = kv_joint(p, ks).sink {
             // the root's heads' sink logits, its step's first position
             let (qh, ..) = kv_consts(p, ks);
@@ -583,7 +583,7 @@ pub fn emit(p: &Program) -> R<Emitted> {
         for i in 0..kc.pya {
             let c = kc.pe(s, i);
             let (params, role) = kv_pe_params(p, c);
-            tiles.insert(c, (pname.clone(), params));
+            put(&mut tiles, c, (pname.clone(), params))?;
             arrays.extend(cfg_array(c, &[i, role]));
             if let Some(n) = rows_of(p) {
                 // a decode step's rows' (lane slot, state slot, position)
@@ -614,7 +614,8 @@ pub fn emit(p: &Program) -> R<Emitted> {
             _ => return Err("stream: the lane root sends no bus".into()),
         };
         files.push(("lane_root.csl".into(), lane_root_file(p.lane_words)));
-        tiles.insert(
+        put(
+            &mut tiles,
             c,
             (
                 "lane_root.csl".into(),
@@ -623,7 +624,7 @@ pub fn emit(p: &Program) -> R<Emitted> {
                     ("C_BO".into(), u32::from(bus)),
                 ],
             ),
-        );
+        )?;
     }
     files.push(("filler.csl".into(), filler_file()));
     for y in 0..s.h {
@@ -820,6 +821,21 @@ type RootFile = (String, String, Vec<HostArray>, Vec<(String, String)>);
 
 /// Every PE's kernel file and params.
 pub(crate) type Tiles = BTreeMap<Coord, (String, Vec<(String, u32)>)>;
+
+/// `tile` at `c`, refused where another block's PE is already there: two blocks' rectangles
+/// overlapping leave the later one's code on the PE and the earlier block a PE short, which
+/// routes, colours and checks clean and hangs the chip (1560's d16: a K / V column's last PE
+/// on the exit unit's weight PE, the head's matvec one PE short).
+fn put(tiles: &mut Tiles, c: Coord, tile: (String, Vec<(String, u32)>)) -> R<()> {
+    if let Some((was, _)) = tiles.get(&c) {
+        return Err(format!(
+            "stream: ({}, {}) is {was}'s and {}'s: two blocks overlap",
+            c.x, c.y, tile.0
+        ));
+    }
+    tiles.insert(c, tile);
+    Ok(())
+}
 
 /// A weight column's file: its matvecs (step, tile rows, tile cols) in step order.
 /// The values a step makes that its row roots hold over the barrier (in the order the roots

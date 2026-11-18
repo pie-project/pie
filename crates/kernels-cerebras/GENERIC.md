@@ -3830,9 +3830,27 @@ plus k layers; the exit unit, the head, follows the last layer.)
   it), and qfix's 59.7k against ~20k. Ranking the two shapes right needs the attention's
   actual terms (the column's chains, its multicast, the passes), measured by a per-op stamp
   inside one layer, not one factor.
-- **d16 hung.** It routes, colours and checks clean, but some K / V PEs reach rows 450-451,
-  beside the exit unit's band (its first row is 450). That is a check gap, a shape the
-  annealer has not produced (its 28-layer program ran in 1556 and 1560).
+- **d16 hung: two blocks on one PE.** The K / V column at x 76 (its root at row 275, 175
+  PEs) ends at row 450, which is the exit unit's top row, and its weight PE there. The
+  emitter's tile map took the later block's code, so the exit's head matvec ran one weight PE
+  short (25,343 of 25,344 `w_28` tiles) and waited forever. Routes, colours and the check
+  were all clean, since each tile on its own is consistent. The emitter now refuses a PE that
+  two blocks claim (`emit::stream::put`: "(76, 450) is w_28's and kp's: two blocks overlap").
+  The annealer lays every candidate through the emitter before keeping it, so it skips such
+  a placement instead of keeping it. `place::stream::tests::blocks_that_share_a_pe_are_refused`
+  covers both.
+- **Where the idle rows' time goes is device time, inside the launch.** In every 1560 run the
+  wall clock is the stamps' span plus a constant to 0.2 ms: 17.2 ms at 898 rows, 15.1 ms at
+  707, 15.5 ms at 576 x 538, 8.6 ms for 1556's 150 x 449 program. The host's part (reading
+  the stamps, 3 words a PE, the logits and the argmax back) grows with the fabric, never with
+  the step. Step 0, just after the statics and page tables are written, shows the same two
+  ends in every program (about 0.4M at the front, a staircase to about 1M at the exit); off
+  never decays from it, while the 707-row programs do. The engine's host side waits only in
+  blocking SDK calls: `sdk::Runtime::memcpy_h2d` (which returns before its words land on a
+  system, M1k) and `sdk::Runtime::launch`. That fits writes still landing during the step,
+  but does not prove it. A decisive and cheap test is a fence before the launch: one word read
+  back from the last-written PE, as `Runtime::land` already does for the simulator. A served
+  step reads no stamps (`units.rs`), so its wall clock is closer to the span.
 ### The line windows (check::hazard::lines)
 
 A **line** is a set of colours a PE takes on one input queue that its code rebinds between:
