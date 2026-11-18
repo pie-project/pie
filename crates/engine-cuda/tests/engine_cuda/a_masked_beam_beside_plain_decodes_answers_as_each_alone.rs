@@ -292,3 +292,42 @@ fn a_mask_adds_no_body() {
         "a model opening the mask arms the bodies (resident, armed) the maskless one does"
     );
 }
+
+/// A prompt and its decodes answer alike whether the model opens the mask or
+/// not: a lane stating none reads through the masked arms as the plain ones.
+#[test]
+fn a_maskless_lane_answers_through_the_masked_arms_as_through_the_plain_ones() {
+    if !engine_cuda::device::present() {
+        eprintln!("no CUDA device: skipping");
+        return;
+    }
+    let serve = |mask: bool| -> Vec<Vec<f32>> {
+        let trace = trace_hybrid("mask-data-micro", &Micro { mask }, Platform::Cuda);
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let path = Weights::random(&trace, 2207).write(dir.path());
+        let mut shell = shell(trace.clone(), &path, Graphs::On);
+        let pages: Vec<u32> = (0..256 / PAGE).collect();
+        let word = |rows: u32| trace.facts.word(&Request::new(rows, false));
+        shell.open(0).expect("a slot opens");
+        let mut out = Vec::new();
+        let prompt: Vec<u32> = (0..PROMPT).map(|t| (t * 7 + 11) % VOCAB).collect();
+        let mut held = 0;
+        for tokens in [prompt, vec![5], vec![9], vec![17]] {
+            let seated = [Seated {
+                pages: &pages,
+                held: Some(held),
+                ..Seated::of(Lane { slot: 0, word: word(tokens.len() as u32), tokens: &tokens })
+            }];
+            out.push(shell.fire_rows(&seated, &[Readout::Last]).expect("fires").swap_remove(0));
+            held += tokens.len() as u32;
+        }
+        out
+    };
+    let (masked, plain) = (serve(true), serve(false));
+    for (step, (a, b)) in masked.iter().zip(&plain).enumerate() {
+        let worst = a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+        let span = b.iter().copied().fold(f32::MIN, f32::max) - b.iter().copied().fold(f32::MAX, f32::min);
+        eprintln!("step {step}: worst {worst} of a span {span}");
+        assert!(worst <= span * 1e-2, "step {step}: the masked arms answer otherwise ({worst})");
+    }
+}
