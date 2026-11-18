@@ -29,11 +29,29 @@ tracing = "0.1"
 
 naga = { version = "30", default-features = false, features = ["wgsl-in"], optional = true }
 
-# Native builds exist only for the gate tests, on wgpu's Vulkan backend.
+# Native builds run on wgpu's Vulkan backend off Apple, DX12 on Windows and
+# Metal on Apple; each backend's native handles state the device memory.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 wgpu = { version = "30", default-features = false, features = [
     "wgsl",
     "vulkan",
+    "dx12",
+    "metal",
+], optional = true }
+
+# wgpu's Vulkan backend, off Apple.
+[target.'cfg(not(any(target_arch = "wasm32", target_vendor = "apple")))'.dependencies]
+ash = { version = "0.38", default-features = false, features = ["std"], optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", default-features = false, features = [
+    "Win32_Graphics_Dxgi",
+], optional = true }
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+objc2-metal = { version = "0.3", default-features = false, features = [
+    "std",
+    "MTLDevice",
 ], optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -55,6 +73,9 @@ default = []
 wgpu = [
     "dep:wgpu",
     "dep:naga",
+    "dep:ash",
+    "dep:windows",
+    "dep:objc2-metal",
     "kernels-slang/wgsl",
     "kernels-slang/probe",
 ]
