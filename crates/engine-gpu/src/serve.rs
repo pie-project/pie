@@ -1046,32 +1046,57 @@ impl<B: Serve> Shell<B> {
                 .map_or(room, |budget| budget.min(room))
                 .min(binding.saturating_mul(kernels_slang::SEGMENTS as u64))
         });
-        // The dense tactic at each power of two of rows to the asked top:
-        // a matmul of `m` rows runs the tactic of the widest such row count
-        // at or below it.
+        // The profile's dense path at each power of two of rows to the asked
+        // top: a matmul of `m` rows runs the path of the widest such row
+        // count at or below it, or the vector kernel where the roofline
+        // prices it cheaper at its shape (`crate::tactic::gemm_at`, the
+        // dispatch's own rule).
         let gemm_by_rows: std::sync::Arc<Vec<(u32, kernels_slang::linear::gemm::Tactic)>> =
             std::sync::Arc::new(
                 engine::memory::rungs(1, budgets.tokens.max_tokens.max(1))
                     .into_iter()
-                    .map(|rows| (rows, tuning.gemm(tier, rows)))
+                    .map(|rows| (rows, tuning.gemm_path(tier, rows)))
                     .collect(),
             );
+        // Weighed only where the profile states every rate (`rated`): the
+        // choice reads them, refused by name where one is missing.
+        let no_rate = |key: &str| {
+            Fault::Residency(format!(
+                "{}: the profile states no `[rates] {key}` (or states it at nothing), which the \
+                 choice of each matmul's kernel weighs by",
+                device.name()
+            ))
+        };
+        let roofline = if rated {
+            let constants =
+                engine::roofline::Constants::of(&device_profile.rates()).map_err(no_rate)?;
+            constants.few_row_rate().map_err(no_rate)?;
+            Some(constants)
+        } else {
+            None
+        };
         let gemm_at = {
             let table = std::sync::Arc::clone(&gemm_by_rows);
-            move |rows: u32| {
-                table
+            move |m: u32, n: u32, k: u32| {
+                let path = table
                     .iter()
                     .rev()
-                    .find(|&&(at, _)| at <= rows)
+                    .find(|&&(at, _)| at <= m)
                     .or(table.first())
                     .map(|&(_, tactic)| tactic)
-                    .expect("one row count at least")
+                    .expect("one row count at least");
+                match &roofline {
+                    Some(rates) => crate::tactic::gemm_at(B::TARGET, path, m, n, k, rates)
+                        .expect("every rate the choice reads is stated (checked above)"),
+                    None => path,
+                }
             }
         };
         let row_tile: engine::roofline::RowTile = {
             let tactic_at = gemm_at.clone();
             std::sync::Arc::new(move |m, n, k| {
-                kernels_slang::linear::gemm::tile_for(B::TARGET, tactic_at(m), m, n, k).row_tile()
+                kernels_slang::linear::gemm::tile_for(B::TARGET, tactic_at(m, n, k), m, n, k)
+                    .row_tile()
             })
         };
         let mut chosen: Option<engine::load::TopRung> = None;
@@ -1109,12 +1134,8 @@ impl<B: Serve> Shell<B> {
             if let (Some(counts), None) = (counts.as_ref(), chosen.as_ref()) {
                 let launches = u32::try_from(compiled.template().len()).unwrap_or(u32::MAX);
                 let padded = |rows: u32| {
-                    kernels_slang::linear::gemm::padded_rows(
-                        B::TARGET,
-                        gemm_at(rows),
-                        rows,
-                        counts.width,
-                    )
+                    let w = counts.width;
+                    kernels_slang::linear::gemm::padded_rows(B::TARGET, gemm_at(rows, w, w), rows, w)
                 };
                 let rungs = crate::top::rung_facts(
                     &spans,

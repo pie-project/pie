@@ -54,7 +54,7 @@ impl<B: Backend> Run<'_, B> {
                         block,
                         self.tensor(*y),
                     ),
-                    None => self.gemm(*act, |tactic| {
+                    None => self.gemm(*act, *w, |tactic| {
                         kernels_slang::linear::gemm::matmul(
                             self.ctx,
                             tactic,
@@ -88,7 +88,7 @@ impl<B: Backend> Run<'_, B> {
                         block,
                         self.tensor(*y),
                     ),
-                    None => self.gemm(*act, |tactic| {
+                    None => self.gemm(*act, *w, |tactic| {
                         kernels_slang::linear::gemm::lm_head(
                             self.ctx,
                             tactic,
@@ -676,10 +676,24 @@ impl<B: Backend> Run<'_, B> {
     fn gemm(
         &self,
         act: ValueId,
+        w: ValueId,
         matmul: impl Fn(kernels_slang::linear::gemm::Tactic) -> Result<(), kernels_slang::Error>,
     ) -> Result<(), kernels_slang::Error> {
         let Some(names) = self.ctx.naming() else {
-            return matmul(self.tuning().gemm(self.tier(), self.tensor(act).rows));
+            let (m, w) = (self.tensor(act).rows, self.tensor(w));
+            // The vector kernel or the profile's tile, by the roofline at
+            // the fire's rows (`crate::tactic::gemm_at`).
+            let tactic = self
+                .tuning()
+                .gemm(self.tier(), m, w.rows, w.width)
+                .map_err(|key| kernels_slang::Error::Backend {
+                    op: "linear.matmul",
+                    detail: format!(
+                        "the device's profile states no `[rates] {key}` (or states it at \
+                         nothing): the choice between the vector kernel and the tile weighs by it"
+                    ),
+                })?;
+            return matmul(tactic);
         };
         // The walk fires at one rung; a fire of the load brings up to the
         // most rows its rungs hold.

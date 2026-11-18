@@ -147,7 +147,16 @@ pub fn gemm_rate(
 ) -> Result<f64> {
     let tier = <Api as engine_gpu::serve::Serve>::tier(device);
     let timer = |frame: Frame| Ok((None, (frame.commit_timed()? * 1e9) as u64));
-    engine_gpu::rates::gemm_rate::<Api>(device, tuning.gemm(tier, mnk.0), &timer, mnk)
+    let (m, n, k) = mnk;
+    let tactic = tuning
+        .gemm(tier, m, n, k)
+        .map_err(|key| engine_gpu::error::Fault::Device {
+            call: "gemm rate",
+            why: format!(
+                "the profile states no `[rates] {key}`, which the matmul's kernel weighs by"
+            ),
+        })?;
+    engine_gpu::rates::gemm_rate::<Api>(device, tactic, &timer, mnk)
 }
 
 /// The attention rate of `device` at `shape`, through the kernel a served

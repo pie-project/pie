@@ -13,7 +13,7 @@
 //!   `engine::rates::GEMM_ROWS`, each fire reading the next of
 //!   `engine::rates::weights_at` weight planes (past the last-level cache),
 //!   for `gemm_tflops_by_rows`;
-//! - the same matmul at each of `engine::rates::FEW_ROWS` (4 to 256) of each
+//! - the vector matmul at each of `engine::rates::FEW_ROWS` (4 to 256) of each
 //!   width, through the kernel serving picks at those rows, its rows padded
 //!   to that kernel's tile, for `few_row_tflops`
 //!   (`engine::rates::few_row_rate`);
@@ -451,10 +451,10 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     let mut rig = Rig::<B>::new(device, max_submit);
     // The launch first: every rate below takes its dispatches' launches off.
     let (bytes_per_ns, launch_ns) =
-        copy_and_launch(&mut rig, tactics.gemm(tier, LAUNCH), timer, say)?;
+        copy_and_launch(&mut rig, tactics.gemm_path(tier, LAUNCH), timer, say)?;
     rig.release();
     let launch = launch_ns as f64;
-    let (side, warmed) = warm(&mut rig, &|rows| tactics.gemm(tier, rows), timer)?;
+    let (side, warmed) = warm(&mut rig, &|rows| tactics.gemm_path(tier, rows), timer)?;
     say(&format!(
         "[rates]: warm-up: {} rotations of the {side}^3 matmul, settled at {:.1} TFLOP/s",
         warmed.rotations,
@@ -469,7 +469,13 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     for w in engine::rates::GEMM_WIDTHS {
         let mut curve = Vec::new();
         for m in engine::rates::GEMM_ROWS {
-            let rate = matmul(&mut rig, tactics.gemm(tier, m), timer, (m, w, w), launch);
+            let rate = matmul(
+                &mut rig,
+                tactics.gemm_path(tier, m),
+                timer,
+                (m, w, w),
+                launch,
+            );
             rig.release();
             let Some(rate) = dropped(&rig, rate, say)? else {
                 continue;
@@ -485,20 +491,25 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
             gemm.push((w, curve));
         }
     }
-    // The few-row matmul at `engine::rates::FEW_ROWS` of each width, through
-    // the kernel serving picks at each (`tile_for`), its rows padded to that
-    // kernel's tile: `few_row_tflops` (`engine::rates::few_row_rate`).
+    // The few-row path, the vector kernel, at `engine::rates::FEW_ROWS` of
+    // each width: `few_row_tflops` (`engine::rates::few_row_rate`), its reads
+    // a pass a block of rows (`gemm::passes`). The choice between it and the
+    // tile at a fire's rows weighs by it (`crate::tactic`).
     let mut few = Vec::new();
     for w in engine::rates::GEMM_WIDTHS {
         for m in engine::rates::FEW_ROWS {
-            let tactic = tactics.gemm(tier, m);
-            let tile = kernels_slang::linear::gemm::tile_for(B::TARGET, tactic, m, w, w).row_tile();
+            let tactic = kernels_slang::linear::gemm::Tactic {
+                vector: true,
+                ..tactics.gemm_path(tier, m)
+            };
+            let kind = kernels_slang::linear::gemm::tile_for(B::TARGET, tactic, m, w, w);
             let ns = matmul_ns(&mut rig, tactic, timer, (m, w, w))?;
             rig.release();
             few.push(engine::rates::FewRow {
                 rows: m,
                 width: w,
-                padded: m.div_ceil(tile.max(1)) * tile.max(1),
+                padded: m,
+                passes: kernels_slang::linear::gemm::passes(kind, m),
                 ns: ns as f64,
             });
         }

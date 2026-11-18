@@ -321,7 +321,7 @@ mod device {
                 let launch = |sink: &dyn kernels_slang::Encode, t: &Tuning, copy: usize| {
                     kernels_slang::linear::gemm::matmul(
                         sink,
-                        t.gemm(kernels_slang::Tier::Baseline, m),
+                        t.gemm_path(kernels_slang::Tier::Baseline, m),
                         Tensor::new(ha, m, k, Dtype::Bf16),
                         Tensor::new(hw[copy % hw.len()], n, k, Dtype::Bf16),
                         Tensor::new(ho, m, n, Dtype::Bf16),

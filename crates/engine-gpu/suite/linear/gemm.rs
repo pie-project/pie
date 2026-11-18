@@ -66,6 +66,9 @@ fn the_dense_matmuls_answer_the_reference() {
     if gpu.coopmat() {
         cases.push((70, 64, 96, kernels_slang::Tier::Coopmat));
     }
+    // Each shape through the tile and the vector kernel: either may serve
+    // any rows (the engine's roofline chooses), the vector kernel over
+    // several blocks of rows past its first.
     for (m, n, k, tier) in cases {
         if !crate::gpu::lands(n) {
             continue;
@@ -73,22 +76,28 @@ fn the_dense_matmuls_answer_the_reference() {
         let (x, xr) = gpu.up(&noise(1 + m as u64, m * k));
         let (w, wr) = gpu.up(&noise(2 + n as u64, n * k));
         let (xt, wt) = (t(x, m, k, Dtype::Bf16), t(w, n, k, Dtype::Bf16));
-        let op: fn(f64) -> f64 = if tier == kernels_slang::Tier::Coopmat {
-            half
-        } else {
-            |v| v
-        };
-        let want = reference(&xr, &wr, (m, n, k), op);
-        landed(
-            &mut gpu,
-            &format!("gemm {m} x {n} x {k} at {}", tier.name()),
-            &|g| vec![(g.zeros(m * n), m * n, false)],
-            std::slice::from_ref(&want),
-            &|g, o| {
-                let y = t(o[0].0, m, n, Dtype::Bf16);
-                g.run(|c| gemm::matmul(c, Tactic { tier }, xt, wt, y));
-            },
-        );
+        for vector in [false, true] {
+            let op: fn(f64) -> f64 = if tier == kernels_slang::Tier::Coopmat && !vector {
+                half
+            } else {
+                |v| v
+            };
+            let want = reference(&xr, &wr, (m, n, k), op);
+            landed(
+                &mut gpu,
+                &format!(
+                    "gemm {m} x {n} x {k} at {}{}",
+                    tier.name(),
+                    if vector { ", vector" } else { "" }
+                ),
+                &|g| vec![(g.zeros(m * n), m * n, false)],
+                std::slice::from_ref(&want),
+                &|g, o| {
+                    let y = t(o[0].0, m, n, Dtype::Bf16);
+                    g.run(|c| gemm::matmul(c, Tactic { tier, vector }, xt, wt, y));
+                },
+            );
+        }
     }
     // The f32 lane form.
     let (m, n, k) = (3usize, 20usize, 33usize);

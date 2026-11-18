@@ -32,6 +32,7 @@ pub mod scratch;
 pub mod serve;
 pub mod settle;
 pub mod store;
+pub mod tactic;
 pub mod check;
 pub mod top;
 pub mod tuning;

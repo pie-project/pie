@@ -287,18 +287,31 @@ impl engine_gpu::backend::Tactics for Tuning {
     }
 
     /// The vector kernel folds by shuffles where the adapter's subgroups
-    /// hold a 32-lane strip.
-    fn gemm(&self, tier: kernels_slang::Tier, _rows: u32) -> kernels_slang::linear::gemm::Tactic {
-        kernels_slang::linear::gemm::Tactic { tier }
+    /// hold a 32-lane strip; the tile is the one WGSL's rows take.
+    fn gemm_path(
+        &self,
+        tier: kernels_slang::Tier,
+        _rows: u32,
+    ) -> kernels_slang::linear::gemm::Tactic {
+        kernels_slang::linear::gemm::Tactic {
+            tier,
+            vector: false,
+        }
     }
 
-    /// One tactic at every row count.
+    fn target(&self) -> kernels_slang::Target {
+        kernels_slang::Target::Wgsl
+    }
+
+    /// The tile and the vector kernel, at every row count.
     fn gemm_tactics(
         &self,
         tier: kernels_slang::Tier,
         _capacity: u32,
     ) -> Vec<kernels_slang::linear::gemm::Tactic> {
-        vec![kernels_slang::linear::gemm::Tactic { tier }]
+        [false, true]
+            .map(|vector| kernels_slang::linear::gemm::Tactic { tier, vector })
+            .to_vec()
     }
 
     fn batch(&self, pairs: u32, experts: u32) -> kernels_slang::linear::moe::select::Batch {

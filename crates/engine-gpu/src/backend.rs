@@ -219,11 +219,36 @@ pub trait Tactics: std::fmt::Debug {
 
     fn kquant(&self) -> kernels_slang::linear::kquant::Tactic;
 
-    /// The dense matmul tactic for a fire of `rows` activation rows.
-    fn gemm(&self, tier: kernels_slang::Tier, rows: u32) -> kernels_slang::linear::gemm::Tactic;
+    /// The tile a dense matmul of `rows` activation rows takes, as the
+    /// profile's path names it (no vector kernel: [`Tactics::gemm`] weighs
+    /// that against it).
+    fn gemm_path(
+        &self,
+        tier: kernels_slang::Tier,
+        rows: u32,
+    ) -> kernels_slang::linear::gemm::Tactic;
+
+    /// The dense matmul tactic for a fire of `m x n x k`: the profile's
+    /// path, or the vector kernel where the device's roofline prices it
+    /// cheaper ([`crate::tactic::gemm_at`]); the key of a rate the choice
+    /// needs and the profile leaves unstated.
+    fn gemm(
+        &self,
+        tier: kernels_slang::Tier,
+        m: u32,
+        n: u32,
+        k: u32,
+    ) -> std::result::Result<kernels_slang::linear::gemm::Tactic, &'static str> {
+        let rates = engine::roofline::Constants::of(&self.profile().rates())?;
+        crate::tactic::gemm_at(self.target(), self.gemm_path(tier, m), m, n, k, &rates)
+    }
+
+    /// The kernels' target the backend fires.
+    fn target(&self) -> kernels_slang::Target;
 
     /// Every dense matmul tactic some fire of 1 to `capacity` rows takes:
-    /// [`Tactics::gemm`]'s answers over those rows, each once.
+    /// each path the profile takes over those rows, and the vector kernel
+    /// at each ([`Tactics::gemm`] may choose it at any rows), each once.
     fn gemm_tactics(
         &self,
         tier: kernels_slang::Tier,

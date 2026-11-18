@@ -118,6 +118,7 @@ fn gemm_tactic(coopmat: bool) -> kernels_slang::linear::gemm::Tactic {
         } else {
             kernels_slang::Tier::Baseline
         },
+        vector: false,
     }
 }
 
@@ -384,8 +385,16 @@ impl engine_gpu::backend::Tactics for Tuning {
     }
 
     /// Cooperative-matrix tiles where the profile takes them at `rows`.
-    fn gemm(&self, _tier: kernels_slang::Tier, rows: u32) -> kernels_slang::linear::gemm::Tactic {
+    fn gemm_path(
+        &self,
+        _tier: kernels_slang::Tier,
+        rows: u32,
+    ) -> kernels_slang::linear::gemm::Tactic {
         gemm_tactic(self.gemm_coopmat(rows))
+    }
+
+    fn target(&self) -> kernels_slang::Target {
+        kernels_slang::Target::Spirv
     }
 
     /// The tactic of each path the profile takes over those rows.
@@ -396,9 +405,15 @@ impl engine_gpu::backend::Tactics for Tuning {
     ) -> Vec<kernels_slang::linear::gemm::Tactic> {
         let mut tactics = Vec::new();
         for path in self.gemm_paths(capacity) {
-            let tactic = gemm_tactic(path == GemmPath::Coopmat);
-            if !tactics.contains(&tactic) {
-                tactics.push(tactic);
+            let tile = gemm_tactic(path == GemmPath::Coopmat);
+            let vector = kernels_slang::linear::gemm::Tactic {
+                vector: true,
+                ..tile
+            };
+            for tactic in [tile, vector] {
+                if !tactics.contains(&tactic) {
+                    tactics.push(tactic);
+                }
             }
         }
         tactics
@@ -547,7 +562,12 @@ mod tests {
                 .flat_map(kernels)
                 .collect();
             for rows in 1..=capacity {
-                for kernel in kernels(t.gemm(tier, rows)) {
+                let path = t.gemm_path(tier, rows);
+                let vector = gemm::Tactic {
+                    vector: true,
+                    ..path
+                };
+                for kernel in [path, vector].into_iter().flat_map(kernels) {
                     assert!(
                         named.contains(&kernel),
                         "a fire of {rows} rows takes {kernel:?}, which a load of up to \

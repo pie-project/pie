@@ -125,6 +125,9 @@ pub struct FewRow {
     pub rows: u32,
     pub width: u32,
     pub padded: u32,
+    /// The times its kernel reads the plane (a vector kernel once a block
+    /// of rows, a tile once).
+    pub passes: u32,
     pub ns: f64,
 }
 
@@ -136,10 +139,10 @@ impl FewRow {
         gemm_flops(self.padded, self.width, self.width)
     }
 
-    /// The bytes of its weight plane, read once.
+    /// The bytes its kernel reads of its weight plane: the plane a pass.
     #[must_use]
     pub fn plane_bytes(&self) -> f64 {
-        2.0 * f64::from(self.width) * f64::from(self.width)
+        2.0 * f64::from(self.width) * f64::from(self.width) * f64::from(self.passes.max(1))
     }
 }
 
@@ -1781,6 +1784,7 @@ mod tests {
             rows,
             width,
             padded: rows.div_ceil(32) * 32,
+            passes: 1,
             ns,
         };
         let compute = |rows: u32, w: u32| 900.0 + gemm_flops(rows.div_ceil(32) * 32, w, w) / 4.0;
