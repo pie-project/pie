@@ -616,6 +616,10 @@ where
         self.caps.as_ref().map(|caps| &caps.device)
     }
 
+    fn host_room(&self) -> Option<engine::HostRoom> {
+        crate::backend::Context::host_room(self.shell.as_ref()?.device())
+    }
+
     fn live(&self) -> engine::live::Live {
         self.live.clone()
     }

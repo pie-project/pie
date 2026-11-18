@@ -627,6 +627,20 @@ fn host_ceiling(name: &str, shares_host: bool, memory_budget: bool) -> Result<Op
     Ok(Some(room.room.saturating_add(held)))
 }
 
+/// What the host can still give the process now, as [`host_ceiling`]
+/// reads it at bind.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn read_host_room() -> std::result::Result<i64, String> {
+    engine_gpu::host_memory::room()
+        .map(|room| room.net())
+        .map_err(|fault| fault.to_string())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn read_host_room() -> std::result::Result<i64, String> {
+    Err("this host has no reader of its available memory".to_string())
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 #[allow(clippy::unnecessary_wraps)]
 fn host_ceiling(_name: &str, _shares_host: bool, _memory_budget: bool) -> Result<Option<u64>> {
@@ -1055,6 +1069,15 @@ impl Context {
     #[must_use]
     pub fn outside(&self) -> u64 {
         self.core.outside()
+    }
+
+    /// Where the device shares the host's memory (a ceiling was read at
+    /// bind), the reader of what the host can still give the process, the
+    /// bind's reading taken afresh ([`host_ceiling`]).
+    #[must_use]
+    pub fn host_room(&self) -> Option<engine::HostRoom> {
+        self.core.ceiling?;
+        Some(std::sync::Arc::new(read_host_room))
     }
 
     #[must_use]
