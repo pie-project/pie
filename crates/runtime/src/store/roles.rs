@@ -165,12 +165,6 @@ pub enum RolesError {
         run: u32,
         prefix: u32,
     },
-    /// An earlier guest bind waits for room (`head`, the queue's head): a
-    /// bind needing guest room waits behind it, in arrival order, and
-    /// takes none ahead of it ([`Roles::take_guest`]). It binds again once
-    /// the head binds or leaves ([`Roles::leave_guest_queue`]).
-    #[error("a guest bind waits for room ahead of this one (process {head}); this one waits behind it")]
-    GuestQueued { head: Holder },
     #[error(
         "no chunk has {slots} adjacent free {role:?} slots for an item that must lie in one run"
     )]
@@ -196,7 +190,7 @@ pub fn waits_for_room(error: &anyhow::Error) -> bool {
     matches!(
         error.downcast_ref::<RolesError>(),
         Some(
-            RolesError::BindShort(_) | RolesError::GuestGrow { .. } | RolesError::GuestQueued { .. }
+            RolesError::BindShort(_) | RolesError::GuestGrow { .. }
         )
     )
 }
@@ -601,17 +595,11 @@ pub struct Roles {
     /// Told each time guest state's device room is given back
     /// ([`Self::room_watch`]).
     freed: Arc<Freed>,
-    /// The guest binds waiting for room, in arrival order: only the head
-    /// takes guest room, and the walk's demand counts its need
-    /// ([`Self::take_guest`]). A bind leaves it once it binds, is refused
-    /// by name, or its process is gone ([`Self::leave_guest_queue`]).
-    /// Each with its need, `(run, pieces)`: a new head's is counted at
-    /// once, before it binds again.
-    guest_queue: std::collections::VecDeque<(Holder, (u32, u32))>,
-    /// Told each time the queue's head leaves ([`Self::turn_watch`]): the
-    /// binds behind it look whether their turn has come, and only the new
-    /// head binds again.
-    turns: Arc<Freed>,
+    /// The process whose guest bind's need the pool counts toward the
+    /// walk's goal ([`GUEST_WAITER`]): the last bind short of room that
+    /// waits on a commit. Its need is no longer counted once it binds, is
+    /// refused, or its process is gone ([`Self::leave_guest_wait`]).
+    guest_waiter: Option<Holder>,
 }
 
 /// Device room given back: a count of the gives, and their event.
@@ -672,8 +660,7 @@ impl Roles {
             chunk_slots,
             stated: std::collections::HashSet::new(),
             freed: Arc::default(),
-            guest_queue: std::collections::VecDeque::new(),
-            turns: Arc::default(),
+            guest_waiter: None,
         })
     }
 
@@ -817,9 +804,7 @@ impl Roles {
     /// budget would, the pool counts it short ([`GUEST_WAITER`]) and the
     /// bind waits on a commit ([`RolesError::GuestGrow`]); else it is
     /// refused by name, with what it asked and what was free.
-    /// Only the queue's head (`heads`) is counted short in the pool and
-    /// drives the walk; a bind passing it ([`Self::passes_head`]) leaves
-    /// the head's need as it is.
+    /// Counted short in the pool where `heads`, driving the walk.
     fn take_scratch(
         &self,
         bytes: u64,
@@ -964,80 +949,17 @@ impl Roles {
         self.freed.notify.notify_waiters();
     }
 
-    /// `holder`'s guest bind leaves the queue of binds waiting for room:
-    /// it bound, was refused by name, or its process is gone. Where it was
-    /// the head, the pool no longer counts its need, and the next bind is
-    /// told to look again: the one place a waiter leaves.
-    pub fn leave_guest_queue(&mut self, holder: Holder) {
-        let head = self.guest_queue.front().is_some_and(|(queued, _)| *queued == holder);
-        self.guest_queue.retain(|(queued, _)| *queued != holder);
-        if head {
-            // The next head's need counts at once: the walk commits for it,
-            // and the binds behind it pass it or not by it.
-            let next = self.guest_queue.front().map(|&(_, need)| need);
-            let shape = self.shape(SlotRole::Instance).ok();
-            let mut device = self.device.lock().unwrap();
-            device.pool_mut().unwait(GUEST_WAITER);
-            match (next, shape) {
-                (Some((run, pieces)), Some(shape)) => {
-                    let slots = u64::from(run) * u64::from(pieces) * u64::from(self.chunk_slots);
-                    device.pool_mut().wait(GUEST_WAITER, shape.pool, slots);
-                    device.set_guest_head(Some((run, pieces)));
-                }
-                _ => device.set_guest_head(None),
-            }
-            drop(device);
-            self.turns
-                .gives
-                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-            self.turns.notify.notify_waiters();
-        }
-    }
-
-    /// Whether `holder`'s guest bind waits behind another in the queue:
-    /// not its turn yet ([`Self::turn_watch`]).
-    #[must_use]
-    pub fn waits_turn(&self, holder: Holder) -> bool {
-        self.guest_queue.front().is_some_and(|(head, _)| *head != holder)
-            && self.queued(holder)
-    }
-
-    /// A watch on the queue's head leaving from now on: taken under the
-    /// same lock as [`Self::waits_turn`], no turn is lost between them.
-    #[must_use]
-    pub fn turn_watch(&self) -> RoomWatch {
-        RoomWatch {
-            seen: self.turns.gives.load(std::sync::atomic::Ordering::Acquire),
-            freed: Arc::clone(&self.turns),
-        }
-    }
-
-    /// The guest binds waiting for room, head first; for a test.
-    #[cfg(test)]
-    #[must_use]
-    pub fn guest_queue(&self) -> Vec<Holder> {
-        self.guest_queue.iter().map(|&(holder, _)| holder).collect()
-    }
-
-    fn queued(&self, holder: Holder) -> bool {
-        self.guest_queue.iter().any(|(queued, _)| *queued == holder)
-    }
-
-    /// `holder`'s guest bind joins the queue's end with its need, where it
-    /// is not in it.
-    fn join_guest_queue(&mut self, holder: Holder, state: &GuestState) {
-        if self.queued(holder) {
+    /// `holder`'s guest bind no longer waits: it bound, was refused, or
+    /// its process is gone. Where the pool counts its need, it counts it no
+    /// more, so the walk commits for no one gone.
+    pub fn leave_guest_wait(&mut self, holder: Holder) {
+        if self.guest_waiter != Some(holder) {
             return;
         }
-        let run = state.chunks_a_piece();
-        let need = [state.per_instance, state.per_pair]
-            .into_iter()
-            .filter(|&bytes| bytes > 0)
-            .filter_map(|bytes| self.scratch_part(bytes, run).ok())
-            .map(|part| part.chunk_runs())
-            .max()
-            .unwrap_or((1, 1));
-        self.guest_queue.push_back((holder, need));
+        self.guest_waiter = None;
+        let mut device = self.device.lock().unwrap();
+        device.pool_mut().unwait(GUEST_WAITER);
+        device.set_guest_head(None);
     }
 
     /// Gives back `parts` a closed or parked item held on `on`: guest state
@@ -1222,62 +1144,29 @@ impl Roles {
     /// [`RolesError::GuestGrow`]) waits for room with nothing to undo. A
     /// channel it binds parked with its process refuses it first, as
     /// [`Self::take_instance`] would.
-    /// As [`Self::take_guest_now`], for `holder`'s bind, in the queue of
-    /// guest binds waiting for room: while an earlier one waits (the
-    /// head), a bind needing guest room takes none ahead of it and waits
-    /// behind it ([`RolesError::GuestQueued`]); a bind short of room joins
-    /// the queue, and one that takes its room, or is refused by name,
-    /// leaves it. Without a holder (no process to wait), nothing queues.
+    /// As [`Self::take_guest_now`], for `holder`'s bind. Every bind takes
+    /// room as it comes, none waiting behind another: a smaller one never
+    /// takes a longer run's chunks ([`crate::store::slots`] size classes).
+    /// The first bind short of room that waits on a commit has its need
+    /// counted toward the walk's goal until it binds or leaves; one short
+    /// meanwhile leaves that need as it is, and waits on the commit and the
+    /// planner as it does (the planner asks the walk for its need too).
     pub fn take_guest(
         &mut self,
         channels: &[ChannelId],
         (pair, state): (FireKey, GuestState),
         holder: Option<Holder>,
     ) -> Result<GuestTaken, RolesError> {
-        let queued = holder.filter(|_| state.per_instance > 0 || state.per_pair > 0);
-        let mut heads = true;
-        if let Some(holder) = queued
-            && let Some(&(head, _)) = self.guest_queue.front()
-            && head != holder
-        {
-            if !self.passes_head(&state) {
-                self.join_guest_queue(holder, &state);
-                return Err(RolesError::GuestQueued { head });
-            }
-            heads = false;
-        }
+        let heads = holder.is_none_or(|holder| self.guest_waiter.is_none_or(|counted| counted == holder));
         let taken = self.take_guest_now(channels, (pair, state), heads);
-        if let Some(holder) = queued {
+        if let Some(holder) = holder.filter(|_| heads) {
             match &taken {
-                Err(RolesError::GuestGrow { .. } | RolesError::BindShort(_)) => {
-                    self.join_guest_queue(holder, &state);
-                }
-                _ => self.leave_guest_queue(holder),
+                Err(RolesError::GuestGrow { .. }) => self.guest_waiter = Some(holder),
+                _ if self.guest_waiter == Some(holder) => self.guest_waiter = None,
+                _ => {}
             }
         }
         taken
-    }
-
-    /// Whether a guest bind of `state` may take room while the queue's head
-    /// waits: every piece it takes is a whole run of at least the head's
-    /// run length, so it breaks no run the head needs into shorter ones
-    /// (what starved the head, binds of shorter pieces carving each
-    /// committed segment). One of slots in a chunk, or of shorter runs,
-    /// waits behind the head. Binds of runs as long compete with the head
-    /// as they did before the queue: none of them makes another's runs
-    /// shorter, and the walk commits for the head while its runs are short.
-    fn passes_head(&self, state: &GuestState) -> bool {
-        let Some((head_run, _)) = self.device.lock().unwrap().guest_head() else {
-            return false;
-        };
-        let run = state.chunks_a_piece();
-        [state.per_instance, state.per_pair]
-            .into_iter()
-            .filter(|&bytes| bytes > 0)
-            .all(|bytes| {
-                self.scratch_part(bytes, run)
-                    .is_ok_and(|part| part.pieces > 0 && part.chunks >= head_run)
-            })
     }
 
     fn take_guest_now(
@@ -2329,13 +2218,10 @@ pub fn bind_taken(
 /// segment, the event the refusal named, exactly as a fire held back by a
 /// suspension is sent after its restore.
 ///
-/// Waiting behind an earlier guest bind ([`RolesError::GuestQueued`]), it
-/// waits for its turn (`turn`: it heads the queue, or is no longer in
-/// it), told only as a head leaves ([`Roles::leave_guest_queue`]), and is
-/// not sent again before. However the wait ends (bound, refused, or
-/// dropped with its process), it leaves the queue (`leave`).
+/// However the wait ends (bound, refused, or dropped with its process),
+/// its need is no longer counted (`leave`, [`Roles::leave_guest_wait`]).
 #[allow(clippy::too_many_arguments)]
-pub async fn bind_when_resident<T, E, B, W, G, P, Q>(
+pub async fn bind_when_resident<T, E, B, W, G, P>(
     pid: Holder,
     mut bind: impl FnMut() -> B,
     resident: impl Fn() -> W,
@@ -2344,7 +2230,6 @@ pub async fn bind_when_resident<T, E, B, W, G, P, Q>(
     fits: impl Fn(u32, u32) -> bool,
     suspend: impl Fn(u32, u32) -> bool,
     planned: impl Fn(u32, u32) -> P,
-    turn: impl Fn() -> Q,
     leave: impl Fn(),
     waiting: impl Fn(bool),
 ) -> anyhow::Result<T>
@@ -2354,7 +2239,6 @@ where
     W: std::future::Future<Output = Result<(), E>>,
     G: std::future::Future<Output = Result<(), String>>,
     P: std::future::Future<Output = Result<(), String>>,
-    Q: std::future::Future<Output = ()>,
 {
     /// Runs its `leave` on drop: the wait's every end, its process gone
     /// (the future dropped) too.
@@ -2384,13 +2268,6 @@ where
             Ok(bound) => return Ok(bound),
             Err(error) => error,
         };
-        if let Some(RolesError::GuestQueued { head }) = error.downcast_ref::<RolesError>() {
-            let head = *head;
-            tracing::debug!(%pid, %head, "a guest bind waits behind an earlier one");
-            waits();
-            turn().await;
-            continue;
-        }
         if let Some(RolesError::PairParked(key)) = error.downcast_ref::<RolesError>()
             && let Some(watch) = &watch
         {
@@ -2407,8 +2284,8 @@ where
             // room for this bind (`run`, `pieces`) beside its own.
             if suspend(run, pieces) {
                 tracing::debug!(%pid, %error, "a bind short of room suspends its process");
-                // Waiting for its restore, not for room: it holds no place
-                // ahead of the binds behind it, and queues again on return.
+                // Waiting for its restore, not for room: its need is not
+                // counted meanwhile.
                 leave();
                 if let Err(why) = resident().await {
                     return Err(error.context(format!(
@@ -2502,23 +2379,6 @@ where
                 "its process was suspended and is not resident again: {why}"
             )));
         }
-    }
-}
-
-/// Waits for `holder`'s turn in `roles`' queue of guest binds waiting for
-/// room: it heads the queue, or is no longer in it. Woken only as a head
-/// leaves ([`Roles::turn_watch`]), it looks under the roles' lock, so a
-/// turn is never lost and the binds behind it are not sent again.
-pub async fn guest_turn(roles: &RolesHandle, holder: Holder) {
-    loop {
-        let watch = {
-            let roles = roles.lock().unwrap();
-            if !roles.waits_turn(holder) {
-                return;
-            }
-            roles.turn_watch()
-        };
-        watch.freed().await;
     }
 }
 
