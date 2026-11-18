@@ -198,7 +198,27 @@ pub fn embed_banked(
         ids.rows, y.rows,
         "the token ids handed over are the rows this gather lands"
     );
-    banked(ctx, OP, ids, table, vocab, y, y.rows, y.width)
+    banked(ctx, OP, ids, table, 0, vocab, y, y.rows, y.width)
+}
+
+/// [`embed_banked`] from one run of a table's rows: `table` holds its rows
+/// `first ..`, `vocab` of them. An id in the run lands its row; one outside
+/// lands zeros from the first run alone (`first` 0), so the runs of a table
+/// landed in order land every id as the whole table would.
+pub fn embed_banked_rows(
+    ctx: &Ctx<'_>,
+    ids: Tensor,
+    table: Bank,
+    first: u32,
+    vocab: u32,
+    y: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "gather.embed";
+    debug_assert_eq!(
+        ids.rows, y.rows,
+        "the token ids handed over are the rows this gather lands"
+    );
+    banked(ctx, OP, ids, table, first, vocab, y, y.rows, y.width)
 }
 
 /// [`embed_concat`] from an affine-quantized bank.
@@ -211,7 +231,7 @@ pub fn embed_concat_banked(
 ) -> Result<(), Error> {
     const OP: &str = "gather.embed";
     let (slices, width) = concat_slices(OP, ids, y)?;
-    banked(ctx, OP, ids, table, vocab, y, slices, width)
+    banked(ctx, OP, ids, table, 0, vocab, y, slices, width)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -220,6 +240,7 @@ fn banked(
     op: &'static str,
     ids: Tensor,
     table: Bank,
+    first: u32,
     vocab: u32,
     y: Tensor,
     slices: u32,
@@ -278,6 +299,7 @@ fn banked(
             y.arg_mut(),
             stated(op, width)?.arg(),
             stated(op, vocab)?.arg(),
+            stated(op, first)?.arg(),
         ],
     )
 }

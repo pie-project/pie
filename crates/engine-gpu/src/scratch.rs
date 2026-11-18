@@ -8,7 +8,7 @@ use poem_ir::{Attn, Def, Dim, Dtype, Gather, Linear, Operation, Trace, Ty, Value
 
 use crate::store::kv::Paging;
 
-use crate::backend::{Backend, Buffer as _, Tactics as _};
+use crate::backend::{Backend, Buffer as _, Context as _, Tactics as _};
 use crate::error::Result;
 use crate::handles::Handles;
 use crate::run::PoolSlabs;
@@ -106,6 +106,10 @@ pub struct Scratch<B: Backend> {
     split: Option<SplitRooms>,
 
     spatial: Option<Room>,
+
+    /// The logits a projection whose bank outgrows one binding lands a run
+    /// of its rows at a time, side by side, before they take their columns.
+    logits: Option<Room>,
 
     copy: Option<CopyRoom>,
 
@@ -274,11 +278,42 @@ impl<B: Backend> Scratch<B> {
                 Room::lay(&mut at, floats.div_ceil(4).max(1), 4, Dtype::F32)
             });
 
+        let planes = crate::weights::plane_bytes(trace)?;
+        let logits = trace
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.op {
+                Operation::Linear(Linear::Matmul {
+                    w, y, logits: true, ..
+                }) => match trace.values.get(w.0 as usize).map(|decl| &decl.def) {
+                    Some(Def::Weight(at))
+                        if planes
+                            .get(*at as usize)
+                            .is_some_and(|bytes| *bytes > device.max_buffer()) =>
+                    {
+                        of(*y)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .max_by_key(|rect| rect.bytes)
+            .map(|rect| {
+                let mut at = 0u64;
+                Room::lay(
+                    &mut at,
+                    u64::from(rect.rows),
+                    u64::from(rect.width),
+                    rect.dtype,
+                )
+            });
+
         let union = routed
             .map_or(0, |r| r.y.at + r.y.bytes())
             .max(index.map_or(0, |r| r.at + r.bytes()))
             .max(split.map_or(0, |r| r.part_lse.at + r.part_lse.bytes()))
-            .max(spatial.map_or(0, |r| r.at + r.bytes()));
+            .max(spatial.map_or(0, |r| r.at + r.bytes()))
+            .max(logits.map_or(0, |r| r.at + r.bytes()));
 
         let copy = copy_ceiling(trace, compiled, budget).map(|bytes| CopyRoom {
             at: union.next_multiple_of(ALIGN),
@@ -335,6 +370,7 @@ impl<B: Backend> Scratch<B> {
             index,
             split,
             spatial,
+            logits,
             copy,
             pool,
             ple,
@@ -412,6 +448,12 @@ impl<B: Backend> Scratch<B> {
             })
         };
         Some(mint())
+    }
+
+    /// The room a projection whose bank outgrows one binding lands its
+    /// logits in a run of rows at a time.
+    pub fn logits(&self, handles: &Handles<B>) -> Option<Result<Tensor>> {
+        Some(self.logits?.bind(handles, &self.plane))
     }
 
     pub fn index_scores(&self, handles: &Handles<B>) -> Option<Result<Tensor>> {

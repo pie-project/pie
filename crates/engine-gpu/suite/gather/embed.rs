@@ -194,5 +194,62 @@ fn the_embeddings_answer_the_reference() {
             &want,
             &format!("embed concat bank {shape}"),
         );
+
+        // The bank in two runs of its rows: the first lands an id outside
+        // it as zeros, the second leaves it.
+        let (wpr, gpr) = (hidden / per_word, hidden / group);
+        let sv: Vec<f32> = noise(group as u64, groups)
+            .iter()
+            .map(|v| v * 0.1)
+            .collect();
+        let bv = noise(group as u64 + 1, groups);
+        let mut runs = Vec::new();
+        for (a, b) in [(0usize, 6usize), (6, VOCAB)] {
+            let rows = (b - a) as u32;
+            runs.push((
+                a as u32,
+                Bank {
+                    codes: Tensor::new(
+                        gpu.up_u32(&cv[a * wpr..b * wpr]),
+                        rows,
+                        wpr as u32,
+                        Dtype::U32,
+                    ),
+                    scales: Tensor::new(
+                        gpu.up(&sv[a * gpr..b * gpr]).0,
+                        rows,
+                        gpr as u32,
+                        Dtype::Bf16,
+                    ),
+                    biases: Some(Tensor::new(
+                        gpu.up(&bv[a * gpr..b * gpr]).0,
+                        rows,
+                        gpr as u32,
+                        Dtype::Bf16,
+                    )),
+                    group: group as u32,
+                    bits: bits as u32,
+                },
+            ));
+        }
+        let (y, _) = gpu.up(&noise(99, n * hidden));
+        gpu.run(|c| {
+            for &(first, bank) in &runs {
+                kernels_slang::gather::embed::embed_banked_rows(
+                    c,
+                    it,
+                    bank,
+                    first,
+                    bank.codes.rows,
+                    yt(y, n, hidden),
+                )?;
+            }
+            Ok(())
+        });
+        close(
+            &gpu.down(y, n * hidden),
+            &want,
+            &format!("embed bank {shape} in two runs"),
+        );
     }
 }
