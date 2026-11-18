@@ -126,7 +126,16 @@ fn the_bf16_selects_land_the_same_bits_through_any_table() {
                 let mut y = t(f.y, tokens * top, n, Bf16);
                 if arm.starts_with("held") || arm.starts_with("tiled") || arm.starts_with("wide") {
                     let took = moe::select_bf16_held(
-                        &ctx, "test", x, bank, ex as u32, r, &mut y, glu, table,
+                        &ctx,
+                        "test",
+                        x,
+                        bank,
+                        ex as u32,
+                        r,
+                        &mut y,
+                        glu,
+                        table,
+                        !arm.starts_with("held"),
                     )
                     .expect("the select fires");
                     assert!(took, "{arm}: the held select takes the fire");

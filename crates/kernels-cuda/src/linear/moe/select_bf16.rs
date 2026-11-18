@@ -162,13 +162,6 @@ pub(super) fn select_bf16_mma(
 /// bank as fast.
 pub(super) const FP8_GEMM_FROM: u32 = 8192;
 
-/// From this many routes a fire (with K in whole 64s), a bf16 select is the
-/// tiled GEMM (`moe_select_bf16_gemm`), a CTA 64 of an expert's routes: a
-/// batch's routes crowd onto a few hot experts as often as not, and its
-/// tiles stream a hot expert's rows once a 64 routes, near the card's rate
-/// with the routes spread.
-pub(super) const BF16_GEMM_FROM: u32 = 256;
-
 /// The fewest routes an expert averages that Hopper's warp-specialized
 /// wgmma GEMM (`moe_select_bf16_wsgemm`) takes a tiled bf16 select at:
 /// a prefill's, in slices of 128.
@@ -176,8 +169,8 @@ pub(super) const BF16_WSGEMM_FROM: u32 = 64;
 
 /// A routed select over a bf16 bank (`experts x n x k` at `bank`) on mma.sync
 /// (`linear/moe_w8.cuh`): the register-held `moe_select_bf16_held`, each
-/// expert's rows streamed once a slice of its routes, or from
-/// `BF16_GEMM_FROM` routes the tiled `moe_select_bf16_gemm`; the GLU in its
+/// expert's rows streamed once a slice of its routes, or where `tiled` the
+/// tiled `moe_select_bf16_gemm` (the [`Leg::Tiled`] leg); the GLU in its
 /// epilogue where `glu` says. `Ok(false)` for a fire it does not take.
 #[allow(clippy::too_many_arguments)]
 pub fn select_bf16_held(
@@ -190,6 +183,7 @@ pub fn select_bf16_held(
     y: &mut Tensor,
     glu: Option<crate::linear::gemm_sm100::Glu>,
     table: ExpertTable,
+    tiled: bool,
 ) -> Result<bool, Error> {
     const THREADS: u32 = 128;
     const DEPTH: u32 = 2;
@@ -210,7 +204,7 @@ pub fn select_bf16_held(
         && (crate::linear::gemm_sm100::supported()
             || (hopper_wgmma()
                 && fan.route_count.div_ceil(experts.clamp(1, EXPERT_CAP)) < BF16_WSGEMM_FROM)
-            || fan.route_count < BF16_GEMM_FROM
+            || !tiled
             || !x.width.is_multiple_of(64))
     {
         return Ok(false);
@@ -227,7 +221,7 @@ pub fn select_bf16_held(
     // the mma.sync kernels below, whose loads go through it.
     if hopper_wgmma()
         && !table.streams()
-        && fan.route_count >= BF16_GEMM_FROM
+        && tiled
         && fan.route_count.div_ceil(experts) >= BF16_WSGEMM_FROM
         && x.width.is_multiple_of(64)
         && (0..=6).contains(&code)
@@ -295,7 +289,7 @@ pub fn select_bf16_held(
         experts,
         y,
         glu.is_some(),
-        fan.route_count >= BF16_GEMM_FROM && x.width.is_multiple_of(64),
+        tiled && x.width.is_multiple_of(64),
         // bf16 codes stream twice an fp8 bank's bytes: deeper K splits keep
         // more of them in flight (Hy4's decode +2%).
         8,

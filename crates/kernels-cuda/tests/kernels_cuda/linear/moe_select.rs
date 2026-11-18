@@ -614,6 +614,7 @@ fn the_bf16_prefill_selects_answer_the_routed_dot() {
             &mut y,
             glu,
             RES,
+            true,
         )
         .expect("the select fires");
         assert!(took, "{what}: the select takes the fire");

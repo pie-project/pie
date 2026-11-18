@@ -110,52 +110,144 @@ pub fn matmul_select(
                 (experts, Planes::Dense),
             );
         }
-        // Where there are no tcgen05 GEMMs, a batch whose experts fill their
-        // tiles (past 12 routes an expert, `BF16_GEMM_FROM` routes a fire) on
-        // the tiled mma.sync GEMM. Fewer routes an expert take the pipelined
-        // select or the per-route GEMV below, which measured ahead of the
-        // register-held kernel there (Gemma 4 26B-A4B's 128 experts at 64
-        // rows, 196 against 146 us a select; every decode measured).
-        let tiled = fan.route_count >= BF16_GEMM_FROM
-            && x.width.is_multiple_of(64)
-            && fan.route_count.div_ceil(bank.rows.max(1)) > 12;
-        // A streamed bank's table may name mapped host memory, which the
-        // tcgen05 GEMM's TMA cannot read: it takes the tiled GEMM anywhere,
-        // whose loads go through the table as global addresses.
-        if (!crate::linear::gemm_sm100::supported() || experts.streams())
-            && tiled
-            && bank.dtype == Dtype::Bf16
-            && select_bf16_held(ctx, OP, x, bank.ptr, bank.rows, routes, y, None, experts)?
-        {
-            return Ok(());
-        }
-        if let Some(count) = grouped_worth(ctx, x, bank, y, &fan, experts) {
-            return select_grouped(ctx, OP, x, bank, routes, y, count, experts);
-        }
-        // Bf16 experts under a captured graph have no grouped path (tcgen05 is
-        // Blackwell's, cuBLAS is not graph-capturable); the per-route GEMV
-        // re-reads each expert once a route. The grouped mma.sync kernel reads
-        // it once a slice.
-        // Its staging is cp.async through the expert table, which reads a
-        // streamed bank's mapped host entries as any global address: a
-        // streamed prefill reads each expert once a slice, not once a route.
-        if bf16_mma_spans(ctx, fan.route_count)
-            && fan.route_count > fan.top_k.unsigned_abs()
-            && x.dtype == Dtype::Bf16
-            && bank.dtype == Dtype::Bf16
-            && x.width.is_multiple_of(64)
-            && y.width.is_multiple_of(8)
-            && bank.rows >= 1
-            && u64::from(bank.width) == u64::from(x.width) * u64::from(y.width)
-        {
-            // On Hopper, wgmma over the same staging (sm_90a).
-            if hopper_wgmma() && y.width.is_multiple_of(128) && !experts.streams() {
-                return select_bf16_wgmma(ctx, OP, x, bank, routes, y, &fan, bank.rows, experts);
-            }
-            return select_bf16_mma(ctx, OP, x, bank, routes, y, &fan, bank.rows, experts);
-        }
+        let leg = cheapest(ctx, x, bank, routes, y, experts)?;
+        matmul_select_on(ctx, leg, x, bank, routes, y, experts)
     }
+    #[cfg(not(feature = "cuda"))]
     select_gemv(ctx, OP, x, bank, routes, y, experts)
+}
+
+/// A bf16 or f16 routed select's legs below the grouped tcgen05 GEMM: each
+/// reads an expert's weight rows once a slice of its routes, a slice as
+/// wide as the leg's tile.
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Leg {
+    /// The tiled mma.sync GEMM (`moe_select_bf16_gemm`), an expert's routes
+    /// in slices of 64 (128 where its experts average 128), or on Hopper the
+    /// warp-specialized wgmma GEMM.
+    Tiled,
+    /// The register-held mma.sync kernel (`moe_select_bf16_held`), slices of
+    /// 8, 16 or 32 routes.
+    Held,
+    /// cuBLAS's batched GEMM over blocks of an expert's routes, staged in
+    /// and out.
+    Grouped,
+    /// The graph-safe grouped mma.sync kernel (`moe_select_bf16_mma`, on
+    /// Hopper `moe_select_bf16_wgmma`), slices of 8 to 64 routes.
+    Mma,
+    /// One GEMV a route: each route reads its expert's rows.
+    Gemv,
+}
+
+/// The legs that can take a select of `x` over `bank` into `y` (`staged`:
+/// under a live window's stage): each one's predicate is what its kernel can
+/// launch, never what it is worth. The per-route GEMV takes any.
+#[cfg(feature = "cuda")]
+#[must_use]
+pub fn legs(x: Tensor, bank: Tensor, y: &Tensor, experts: ExpertTable, staged: bool) -> Vec<Leg> {
+    let bf16 = x.dtype == Dtype::Bf16 && bank.dtype == Dtype::Bf16 && y.dtype == Dtype::Bf16;
+    let plane = u64::from(bank.width) == u64::from(x.width) * u64::from(y.width);
+    // Where the grouped tcgen05 GEMM reads a resident bank the mma.sync
+    // GEMMs do not; a streamed table's mapped host entries go through them.
+    let mma_sync = !crate::linear::gemm_sm100::supported() || experts.streams();
+    let mut legs = Vec::new();
+    if bf16 && mma_sync && x.width.is_multiple_of(64) && bank.ptr.is_multiple_of(16) {
+        legs.push(Leg::Tiled);
+    }
+    if bf16 && mma_sync && x.width.is_multiple_of(32) && bank.ptr.is_multiple_of(16) {
+        legs.push(Leg::Held);
+    }
+    if !experts.streams()
+        && !staged
+        && matches!(x.dtype, Dtype::Bf16 | Dtype::F16)
+        && bank.dtype == x.dtype
+        && (1..=MAX_EXPERTS).contains(&bank.rows)
+        && plane
+    {
+        legs.push(Leg::Grouped);
+    }
+    if bf16 && x.width.is_multiple_of(64) && y.width.is_multiple_of(8) && bank.rows >= 1 && plane {
+        legs.push(Leg::Mma);
+    }
+    legs.push(Leg::Gemv);
+    legs
+}
+
+/// [`matmul_select`] on `leg`, one of [`legs`].
+#[cfg(feature = "cuda")]
+pub fn matmul_select_on(
+    ctx: &Ctx,
+    leg: Leg,
+    x: Tensor,
+    bank: Tensor,
+    routes: Tensor,
+    y: &mut Tensor,
+    experts: ExpertTable,
+) -> Result<(), Error> {
+    const OP: &str = "linear.moe_select";
+    let fan = selected(OP, x, routes, y)?;
+    match leg {
+        Leg::Tiled | Leg::Held => {
+            let tiled = leg == Leg::Tiled;
+            if select_bf16_held(
+                ctx, OP, x, bank.ptr, bank.rows, routes, y, None, experts, tiled,
+            )? {
+                Ok(())
+            } else {
+                Err(refuse(
+                    OP,
+                    format!("the {leg:?} leg declined a fire `legs` gave it"),
+                ))
+            }
+        }
+        Leg::Grouped => select_grouped(ctx, OP, x, bank, routes, y, bank.rows, experts),
+        Leg::Mma if hopper_wgmma() && y.width.is_multiple_of(128) && !experts.streams() => {
+            select_bf16_wgmma(ctx, OP, x, bank, routes, y, &fan, bank.rows, experts)
+        }
+        Leg::Mma => select_bf16_mma(ctx, OP, x, bank, routes, y, &fan, bank.rows, experts),
+        Leg::Gemv => select_gemv(ctx, OP, x, bank, routes, y, experts),
+    }
+}
+
+/// The leg [`matmul_select`] takes: the tiled GEMM past 12 routes an
+/// expert and 256 a fire, else cuBLAS's grouped GEMM where it is worth
+/// staging, else the grouped mma.sync select over its profile's span, else
+/// the per-route GEMV.
+#[cfg(feature = "cuda")]
+pub fn cheapest(
+    ctx: &Ctx,
+    x: Tensor,
+    bank: Tensor,
+    routes: Tensor,
+    y: &Tensor,
+    experts: ExpertTable,
+) -> Result<Leg, Error> {
+    const OP: &str = "linear.moe_select";
+    let fan = selected(OP, x, routes, y)?;
+    let legs = legs(
+        x,
+        bank,
+        y,
+        experts,
+        !matches!(ctx.stage(), ArgValue::Ptr(0)),
+    );
+    let tiled = fan.route_count >= 256
+        && x.width.is_multiple_of(64)
+        && fan.route_count.div_ceil(bank.rows.max(1)) > 12;
+    if tiled && legs.contains(&Leg::Tiled) {
+        return Ok(Leg::Tiled);
+    }
+    if legs.contains(&Leg::Grouped) && grouped_worth(ctx, x, bank, y, &fan, experts).is_some() {
+        return Ok(Leg::Grouped);
+    }
+    if legs.contains(&Leg::Mma)
+        && bf16_mma_spans(ctx, fan.route_count)
+        && fan.route_count > fan.top_k.unsigned_abs()
+    {
+        return Ok(Leg::Mma);
+    }
+    Ok(Leg::Gemv)
 }
 
 /// Whether this device is Hopper (sm_90), whose arch-specific target has
@@ -639,8 +731,7 @@ pub(super) struct SelectPlan {
 }
 
 /// The [`SelectPlan`] of a select of `fan` over `experts` landing `y`
-/// (`glu` where it lands a GLU), on the tiled GEMM where `gemm` and its
-/// experts average more than 12 routes.
+/// (`glu` where it lands a GLU), on the tiled GEMM where `gemm`.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn select_plan(
@@ -656,10 +747,10 @@ pub(super) fn select_plan(
     wide: Option<u32>,
 ) -> Result<SelectPlan, Error> {
     let nb: u32 = match fan.route_count.div_ceil(experts) {
+        _ if gemm => 8,
         0..=4 => 1,
         5..=12 => 2,
-        _ if !gemm => 4,
-        _ => 8,
+        _ => 4,
     };
     let order = route_order_sliced(
         ctx,

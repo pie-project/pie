@@ -774,7 +774,8 @@ pub fn select_fp8_w8a16(
         experts,
         y,
         glu.is_some(),
-        fan.route_count >= FP8_GEMM_FROM,
+        // The tiled GEMM where its experts average more than 12 routes.
+        fan.route_count >= FP8_GEMM_FROM && fan.route_count.div_ceil(experts) > 12,
         ctx.tuning().fp8_mma_fill(),
         None,
     )?;
