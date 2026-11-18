@@ -40,7 +40,7 @@
 //! Index and page tables, gates, outputs and workspace stay as laid.
 
 #[cfg_attr(not(feature = "device"), allow(unused_imports))]
-use engine::rates::{ATTN_SHAPE, SCAN_SHAPE, weights_at};
+use engine::rates::{ATTN_SHAPE, SCAN_SHAPE, Touched, weights_at};
 use profile::fire::Rates;
 
 /// The `[rates]` keys this backend's estimate weighs a fire by (of
@@ -293,16 +293,23 @@ mod on_device {
         fn burst(
             &self,
             rounds: usize,
+            touched: &Touched,
             sets: usize,
             once: &mut dyn FnMut(usize) -> Result<(), String>,
         ) -> Result<f64, String> {
             let turn = engine::rates::Rotation::default();
             let mut fire = |k: usize| (0..k).try_for_each(|_| once(turn.next(usize::MAX)));
+            // Its sets touched once, by the first burst over them.
+            engine::rates::touch_once(
+                touched,
+                None,
+                u32::try_from(sets).unwrap_or(u32::MAX),
+                &mut |k| self.time(&mut || fire(k as usize)),
+            )?;
             self.time(&mut || fire(1))?;
             let k = engine::rates::warmed_frames(
                 None,
                 None,
-                u32::try_from(sets).unwrap_or(u32::MAX),
                 |k| self.time(&mut || fire(k as usize)),
                 |why| why,
             )?
@@ -516,7 +523,7 @@ mod on_device {
             )
         };
         lay(held, || fire(0))?;
-        let ns = clock.burst(ROUNDS, sets, &mut |i| {
+        let ns = clock.burst(ROUNDS, &Touched::default(), sets, &mut |i| {
             fire(i).map_err(say("the per-row ops"))
         })?;
         engine::rates::rate_from(
@@ -566,6 +573,8 @@ mod on_device {
         n: u32,
         k: u32,
         weights: Vec<Buffer>,
+        /// The planes touched once, by the first matmul over them.
+        touched: Touched,
         act: Option<Buffer>,
         y: Option<Buffer>,
         rows: u32,
@@ -580,6 +589,7 @@ mod on_device {
                 n,
                 k,
                 weights,
+                touched: Touched::default(),
                 act: None,
                 y: None,
                 rows: 0,
@@ -620,7 +630,9 @@ mod on_device {
                 )
             };
             lay(held, || fire(0))?;
-            let ns = clock.burst(ROUNDS, planes, &mut |i| fire(i).map_err(say("the matmul")))?;
+            let ns = clock.burst(ROUNDS, &self.touched, planes, &mut |i| {
+                fire(i).map_err(say("the matmul"))
+            })?;
             engine::rates::rate_from(
                 &format!("matmul {m}x{n}x{k}"),
                 ns,
@@ -773,7 +785,9 @@ mod on_device {
             )
         };
         lay(held, || fire(0))?;
-        let ns = clock.burst(ROUNDS, sets, &mut |i| fire(i).map_err(say("the attention")))?;
+        let ns = clock.burst(ROUNDS, &Touched::default(), sets, &mut |i| {
+            fire(i).map_err(say("the attention"))
+        })?;
         engine::rates::rate_from(
             &format!("attention {}x{} d {}", at.rows, at.keys, at.head_dim),
             ns,
@@ -867,7 +881,9 @@ mod on_device {
             )
         };
         lay(held, || fire(0))?;
-        let ns = clock.burst(ROUNDS, sets, &mut |i| fire(i).map_err(say("the scan")))?;
+        let ns = clock.burst(ROUNDS, &Touched::default(), sets, &mut |i| {
+            fire(i).map_err(say("the scan"))
+        })?;
         engine::rates::rate_from(
             &format!("scan of {} tokens", shape.tokens),
             ns,
@@ -880,7 +896,7 @@ mod on_device {
     fn copy(stream: *mut c_void, clock: &Clock, gap: f64) -> Result<f64, String> {
         let from = zeroed(COPY_BYTES)?;
         let into = zeroed(COPY_BYTES)?;
-        let ns = clock.burst(ROUNDS, 1, &mut |_| {
+        let ns = clock.burst(ROUNDS, &Touched::default(), 1, &mut |_| {
             crate::device::copy_d2d(stream, into.ptr(), from.ptr(), COPY_BYTES)
                 .map_err(say("the copy"))
         })?;
@@ -921,7 +937,7 @@ mod on_device {
             let exec = graph
                 .instantiate(stream)
                 .map_err(say("the launch's graph"))?;
-            clock.burst(LAUNCH_ROUNDS, 1, &mut |_| {
+            clock.burst(LAUNCH_ROUNDS, &Touched::default(), 1, &mut |_| {
                 exec.launch(stream).map_err(say("the launch's graph"))
             })
         };

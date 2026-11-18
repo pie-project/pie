@@ -550,15 +550,50 @@ pub fn timed_frames<E>(
     })
 }
 
+/// Whether the operand sets one owner lays (a width's weight planes, an
+/// attention's q / kv sets, ...) have been touched on the device yet: held
+/// beside the sets, by whatever lays them, and set by [`touch_once`].
+#[derive(Debug, Default)]
+pub struct Touched(std::cell::Cell<bool>);
+
+impl Touched {
+    #[must_use]
+    pub fn get(&self) -> bool {
+        self.0.get()
+    }
+}
+
+/// A set is touched once, by the first point that rotates it: the first
+/// time a point is timed over the `sets` operand sets `touched` stands
+/// for, every one of them is read once on the device, untimed
+/// ([`touch_sets`]), before the point's frames ([`warmed_frames`]); a
+/// later point over the same sets reads them as they are. A set the
+/// device has never read costs its first fire far more than a warm one (on
+/// an M5 Pro a 256 x 1024 x 1024 matmul over 384 fresh 2 MiB planes ran
+/// 112 us a fire against 25 us once they had been read, so the point read
+/// about 5 or about 30 TFLOP/s run to run by whether its few timed fires
+/// fell on planes read before). Touched once, not before every point: a
+/// rotation before each point is that much more load on the device, and
+/// on the M5 Pro it read the widest matmuls 2-5% under the first set's
+/// rates, heat the measurement had added.
+pub fn touch_once<E>(
+    touched: &Touched,
+    max_submit: Option<std::time::Duration>,
+    sets: u32,
+    frame: &mut impl FnMut(u32) -> Result<f64, E>,
+) -> Result<(), E> {
+    if touched.get() {
+        return Ok(());
+    }
+    touch_sets(max_submit, sets, frame)?;
+    touched.0.set(true);
+    Ok(())
+}
+
 /// Every one of the `sets` operand sets a point's fires rotate through,
-/// touched once on the device and untimed: `sets` fires in all, in one
-/// frame, or in frames of as many as fit under `max_submit` where the
-/// device states a bound on one submission. A set the device has never
-/// read costs its first fire far more than a warm one (on an M5 Pro a
-/// 256 x 1024 x 1024 matmul over 384 fresh 2 MiB planes ran 112 us a fire
-/// against 25 us once they had been read), so a point whose timed fires
-/// fall on sets no fire has touched yet times that first touch, not the
-/// kernel.
+/// read once on the device and untimed: `sets` fires in all, in one frame,
+/// or in frames of as many as fit under `max_submit` where the device
+/// states a bound on one submission.
 pub fn touch_sets<E>(
     max_submit: Option<std::time::Duration>,
     sets: u32,
@@ -579,23 +614,19 @@ pub fn touch_sets<E>(
 }
 
 /// A timed point's frames, the one rule for every point every engine
-/// times: every operand set it rotates through touched once
-/// ([`touch_sets`]), their length settled by [`timed_frames`], then frames
-/// of that length run until their rate stops moving ([`warm_up`]'s rule),
-/// so the point is timed at the clock it holds under its own load over
-/// sets the device has read before, never in a state an earlier point, an
-/// idle gap or a fresh allocation left behind. Before this every point but
-/// the memory-bound ones went untimed by it, and on an M5 Pro a
+/// times: their length settled by [`timed_frames`], then frames of that
+/// length run until their rate stops moving ([`warm_up`]'s rule), so the
+/// point is timed at the clock it holds under its own load, never in a
+/// state an earlier point or an idle gap left behind. Before this every
+/// point but the memory-bound ones went untimed by it, and on an M5 Pro a
 /// few-microsecond matmul read about 5 or about 34 TFLOP/s run to run.
-/// `sets` is the rotation's length (1 where nothing rotates).
+/// (Its sets touched first, once: [`touch_once`].)
 pub fn warmed_frames<E>(
     max_submit: Option<std::time::Duration>,
     estimate_ns: Option<f64>,
-    sets: u32,
     mut frame: impl FnMut(u32) -> Result<f64, E>,
     refuse: impl FnOnce(String) -> E,
 ) -> Result<Frames, E> {
-    touch_sets(max_submit, sets, &mut frame)?;
     let frames = timed_frames(max_submit, estimate_ns, &mut frame, refuse)?;
     let k = frames.fires;
     warm_up(|| frame(k).map(|ns| f64::from(k) / ns.max(f64::MIN_POSITIVE)))?;
@@ -1061,7 +1092,7 @@ mod tests {
         let settled = super::timed_frames(None, None, frame, |why: String| why).expect("it settles");
         assert_eq!(settled.per_fire_ns, 10.0, "the doublings alone settle in the slow state");
         calls.set(0);
-        let frames = super::warmed_frames(None, None, 1, frame, |why| why).expect("it settles");
+        let frames = super::warmed_frames(None, None, frame, |why| why).expect("it settles");
         let settled_at = calls.get();
         assert!(settled_at > SLOW + 1, "the warm-up ran past the slow state ({settled_at} frames)");
         // The next frame of that length reads the fast state.
@@ -1069,14 +1100,16 @@ mod tests {
         assert_eq!(next, 1.0, "the point is timed at the clock its load holds");
     }
 
-    /// A point whose fires are slow on any operand set the device has not
-    /// read yet, its rotation longer than the frames its doublings settle
-    /// in: warmed_frames touches every set first, so the point is timed
-    /// over touched sets only, at their rate. (On an M5 Pro a 256 x 1024 x
-    /// 1024 matmul over 384 fresh planes read about 5 or about 30 TFLOP/s
-    /// run to run, by whether its timed fires fell on planes read before.)
+    /// Points whose fires are slow on any operand set the device has not
+    /// read yet, their rotation longer than the frames their doublings
+    /// settle in: the first point over the sets touches every one of them,
+    /// so it is timed over touched sets only, at their rate, and a second
+    /// point over the same sets touches none again. (On an M5 Pro a 256 x
+    /// 1024 x 1024 matmul over 384 fresh planes read about 5 or about 30
+    /// TFLOP/s run to run, by whether its timed fires fell on planes read
+    /// before.)
     #[test]
-    fn a_point_is_timed_only_over_sets_the_device_has_touched() {
+    fn a_set_is_touched_once_by_the_first_point_that_rotates_it() {
         const SETS: usize = 384;
         // A fire on a set read before takes 1 ns, its first one 20 ns.
         let rig =
@@ -1093,17 +1126,33 @@ mod tests {
                     .sum()
             };
         let touched = std::cell::RefCell::new(vec![false; SETS]);
+        let owner = super::Touched::default();
+        let fires = std::cell::Cell::new(0u32);
         let turn = super::Rotation::default();
-        let frame = |k: u32| -> Result<f64, String> { Ok(rig(&touched, &turn, k)) };
-        let frames =
-            super::warmed_frames(None, None, SETS as u32, frame, |why| why).expect("it settles");
+        let frame = |k: u32| -> Result<f64, String> {
+            fires.set(fires.get() + k);
+            Ok(rig(&touched, &turn, k))
+        };
+        let mut first = frame;
+        super::touch_once(&owner, None, SETS as u32, &mut first).expect("it touches");
         assert!(touched.borrow().iter().all(|&t| t), "every set was touched");
+        assert!(owner.get(), "the owner holds that its sets are touched");
+        let frames = super::warmed_frames(None, None, frame, |why| why).expect("it settles");
         assert_eq!(
             frames.per_fire_ns, 1.0,
             "the point settles at the touched sets' rate"
         );
         let next = frame(frames.fires).expect("a frame") / f64::from(frames.fires);
         assert_eq!(next, 1.0, "the timed frames read touched sets only");
+        // A second point over the same sets: no touch again.
+        fires.set(0);
+        let mut second = frame;
+        super::touch_once(&owner, None, SETS as u32, &mut second).expect("it touches");
+        assert_eq!(
+            fires.get(),
+            0,
+            "a later point over the same sets touches none again"
+        );
         // Untouched (the doublings alone), the point times first touches:
         // the case this rule closes.
         let fresh = std::cell::RefCell::new(vec![false; SETS]);

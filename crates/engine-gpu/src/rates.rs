@@ -38,7 +38,7 @@
 //! way: one submit each, so neither the clock nor the adapter's span start
 //! biases it.
 
-use engine::rates::{SCAN_SHAPE, attn_flops, gemm_flops, scan_elements, weights_at};
+use engine::rates::{SCAN_SHAPE, Touched, attn_flops, gemm_flops, scan_elements, weights_at};
 use kernels_slang::{KvPool, RaggedTensor, Tensor};
 use poem_ir::Dtype;
 use profile::fire::Rates;
@@ -198,6 +198,7 @@ impl<'a, B: Serve> Rig<'a, B> {
     fn each(
         &self,
         timer: Timer<'_, B>,
+        touched: &Touched,
         sets: usize,
         fire: &dyn Fn(&kernels_slang::Ctx<'_>) -> Result<()>,
     ) -> Result<u64> {
@@ -208,11 +209,17 @@ impl<'a, B: Serve> Rig<'a, B> {
                 .collect::<Result<Vec<u64>>>()?;
             Ok(median(walls))
         };
+        // Its sets touched once, by the first point over them.
+        engine::rates::touch_once(
+            touched,
+            self.max_submit,
+            u32::try_from(sets).unwrap_or(u32::MAX),
+            &mut |n| self.frame(timer, n, fire, &nothing).map(|(_, w)| w as f64),
+        )?;
         self.frame(timer, 1, fire, &nothing)?;
         let frames = engine::rates::warmed_frames(
             self.max_submit,
             None,
-            u32::try_from(sets).unwrap_or(u32::MAX),
             |n| self.frame(timer, n, fire, &nothing).map(|(_, w)| w as f64),
             |why| Fault::Device { call: "rates", why },
         )?;
@@ -420,7 +427,7 @@ fn elementwise<B: Serve>(rig: &mut Rig<'_, B>, timer: Timer<'_, B>, launch: f64)
         })
         .collect::<Result<Vec<(Tensor, Tensor, Tensor, Tensor)>>>()?;
     let next = std::cell::Cell::new(0usize);
-    let ns = rig.each(timer, sets.len(), &|sink| {
+    let ns = rig.each(timer, &Touched::default(), sets.len(), &|sink| {
         let (x, normed, packed, y) = sets[next.get() % sets.len()];
         next.set(next.get() + 1);
         kernels_slang::elemwise::norm::rmsnorm(sink, x, weight, 1e-6, normed)
@@ -518,7 +525,7 @@ fn matmul<B: Serve>(
         .collect::<Result<Vec<Tensor>>>()?;
     let y = rig.zeros(m, n, Dtype::Bf16)?;
     let next = std::cell::Cell::new(0usize);
-    let ns = rig.each(timer, weights.len(), &|sink| {
+    let ns = rig.each(timer, &Touched::default(), weights.len(), &|sink| {
         let w = weights[next.get() % weights.len()];
         next.set(next.get() + 1);
         kernels_slang::linear::gemm::matmul(sink, tactic, act, w, y).map_err(fault("rates: matmul"))
@@ -587,7 +594,7 @@ fn attention<B: Serve, T: Tactics + ?Sized>(
         mask_stride: MASK_STRIDE,
     };
     let scale = 1.0 / (s.head_dim as f32).sqrt();
-    let ns = rig.each(timer, sets.len(), &|sink| {
+    let ns = rig.each(timer, &Touched::default(), sets.len(), &|sink| {
         let (q, pool) = &sets[next.get() % sets.len()];
         let (q, pool) = (*q, pool);
         next.set(next.get() + 1);
@@ -644,7 +651,7 @@ fn scan<B: Serve>(
         })
         .collect::<Result<Vec<_>>>()?;
     let next = std::cell::Cell::new(0usize);
-    let ns = rig.each(timer, sets.len(), &|sink| {
+    let ns = rig.each(timer, &Touched::default(), sets.len(), &|sink| {
         let (raw, conv_state, scan_state) = &sets[next.get() % sets.len()];
         let raw = *raw;
         next.set(next.get() + 1);
@@ -819,7 +826,7 @@ pub fn gemm_rate<B: Serve>(
     let act = rig.operand(m, k, Dtype::Bf16)?;
     let w = rig.operand(n, k, Dtype::Bf16)?;
     let y = rig.zeros(m, n, Dtype::Bf16)?;
-    let ns = rig.each(timer, 1, &|sink| {
+    let ns = rig.each(timer, &Touched::default(), 1, &|sink| {
         kernels_slang::linear::gemm::matmul(sink, tactic, act, w, y).map_err(fault("rates: matmul"))
     })?;
     Ok(2.0 * f64::from(m) * f64::from(n) * f64::from(k) / ns as f64)

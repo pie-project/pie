@@ -35,7 +35,7 @@
 //! serving runs, and every backend times the same bytes. Index and page
 //! tables, gates, outputs and the launch probe stay as laid.
 
-use engine::rates::{AttnShape, SCAN_SHAPE};
+use engine::rates::{AttnShape, SCAN_SHAPE, Touched};
 use kernels_metal::linear::gemm;
 use kernels_metal::tensor::{RaggedTensor, RecurrentPool};
 use kernels_metal::{KvPool, PrefillPlan, StateMap, Tensor, Tuning, attn, ssm};
@@ -201,17 +201,26 @@ impl Bench<'_> {
     /// device idled into between frames, not the kernel (bimodal on an M5
     /// Pro at m = 64..2048 of the matmul ladder; 5 ms frames read the m = 16
     /// matmul 26% apart run to run on an M1 Max, 20 ms within 0.25%).
+    /// `sets` the operand sets `encode` rotates through, touched once by
+    /// the first point over them (`engine::rates::touch_once`; `touched`
+    /// held beside them by whoever laid them).
     fn timed(
         &self,
+        touched: &Touched,
         sets: usize,
         encode: &dyn Fn(&Sink<'_>, u32) -> Result<(), kernels_metal::Error>,
     ) -> Result<f64, String> {
         let turn = engine::rates::Rotation::default();
+        engine::rates::touch_once(
+            touched,
+            None,
+            u32::try_from(sets).unwrap_or(u32::MAX),
+            &mut |k| self.frame_of(&turn, encode, k),
+        )?;
         self.frame_of(&turn, encode, 1)?;
         let k = engine::rates::warmed_frames(
             None,
             None,
-            u32::try_from(sets).unwrap_or(u32::MAX),
             |k| self.frame_of(&turn, encode, k).map(|s| s * 1e9),
             |why| why,
         )?
@@ -225,13 +234,14 @@ impl Bench<'_> {
     }
 
     /// An `m × k × k` matmul's rate, each repeat over the next of `weights`
-    /// (`k × k` each).
+    /// (`k × k` each), `touched` held beside them.
     fn matmul_flops(
         &self,
         m: u32,
         n: u32,
         k: u32,
         weights: &[Tensor],
+        touched: &Touched,
         gap: f64,
     ) -> Result<f64, String> {
         let (a, y) = (
@@ -245,7 +255,7 @@ impl Bench<'_> {
         // Each repeat reads the next weight: serving streams a layer's from
         // memory, and one weight repeated would sit in the system cache,
         // by a share that changes run to run (2x at m = 16 on an M5 Pro).
-        let seconds = self.timed(weights.len(), &|sink, at_k| {
+        let seconds = self.timed(touched, weights.len(), &|sink, at_k| {
             gemm::matmul(
                 sink,
                 self.tuning,
@@ -288,7 +298,7 @@ impl Bench<'_> {
             ));
             held.extend([x, normed, packed, y]);
         }
-        let seconds = self.timed(sets.len(), &|sink, at| {
+        let seconds = self.timed(&Touched::default(), sets.len(), &|sink, at| {
             let (x, normed, packed, y) = sets[at as usize % sets.len()];
             kernels_metal::elemwise::norm::rmsnorm(sink, x, wt, 1e-6, normed)?;
             kernels_metal::linear::mlp::swiglu(sink, packed, width, y)
@@ -372,7 +382,7 @@ impl Bench<'_> {
         let indptr = self.tensor(&q_indptr, 2, 1, Dtype::I32)?;
         let o = self.tensor(&out, rows, q_heads * d, Dtype::Bf16)?;
         let scale = 1.0 / (d as f32).sqrt();
-        let seconds = self.timed(sets_of.len(), &|sink, at| {
+        let seconds = self.timed(&Touched::default(), sets_of.len(), &|sink, at| {
             let (q, page_indices) = sets_of[at as usize % sets_of.len()];
             attn::arbiter::prefill(
                 sink,
@@ -447,7 +457,7 @@ impl Bench<'_> {
         let weight = self.tensor(&weight, channels, CONV, Dtype::Bf16)?;
         let gates = self.tensor(&gates, TOKENS, 2 * HEADS, Dtype::F32)?;
         let y = self.tensor(&y, TOKENS, HEADS * DV, Dtype::F32)?;
-        let seconds = self.timed(1, &|sink, _| {
+        let seconds = self.timed(&Touched::default(), 1, &|sink, _| {
             ssm::causal_conv1d_chunked(sink, x, weight, &pool, CONV, 1, convolved)?;
             ssm::gated_delta_chunked(
                 sink,
@@ -526,7 +536,7 @@ impl Bench<'_> {
         );
         // One dispatch of the chain, timed back to back: each reads the
         // output of the one before.
-        let link = self.timed(2, &|sink, i| {
+        let link = self.timed(&Touched::default(), 2, &|sink, i| {
             let (from, into) = if i % 2 == 0 { (at, yt) } else { (yt, at) };
             gemm::matmul(sink, self.tuning, from, wt, into)
         })?;
@@ -540,7 +550,9 @@ impl Bench<'_> {
                 self.tensor(&wa, 32 * n, 32, Dtype::Bf16)?,
                 self.tensor(&wy, 32 * n, 32, Dtype::Bf16)?,
             );
-            let one = self.timed(1, &|sink, _| gemm::matmul(sink, self.tuning, wat, wt, wyt))?;
+            let one = self.timed(&Touched::default(), 1, &|sink, _| {
+                gemm::matmul(sink, self.tuning, wat, wt, wyt)
+            })?;
             gaps.push((
                 n,
                 engine::rates::launch_from(link * 1e9 * f64::from(n), one * 1e9, n),
@@ -638,7 +650,9 @@ pub fn measure(
             })
             .collect::<Result<Vec<(Tensor, Buffer)>, String>>()?;
         let tensors: Vec<Tensor> = weights.iter().map(|(t, _)| *t).collect();
-        let warmed = engine::rates::warm_up(|| bench.matmul_flops(m, n, k, &tensors, 0.0))?;
+        let touched = Touched::default();
+        let warmed =
+            engine::rates::warm_up(|| bench.matmul_flops(m, n, k, &tensors, &touched, 0.0))?;
         say(&format!(
             "  warm-up: {} rotations of the {m}^3 matmul, settled at {:.2} TFLOP/s",
             warmed.rotations,
@@ -662,9 +676,11 @@ pub fn measure(
             })
             .collect::<Result<Vec<(Tensor, Buffer)>, String>>()?;
         let tensors: Vec<Tensor> = weights.iter().map(|(t, _)| *t).collect();
+        // The width's planes, touched once by its first point.
+        let touched = Touched::default();
         let mut curve = Vec::new();
         for m in engine::rates::GEMM_ROWS {
-            let rate = bench.matmul_flops(m, w, w, &tensors, gap)?;
+            let rate = bench.matmul_flops(m, w, w, &tensors, &touched, gap)?;
             say(&format!(
                 "  bf16 matmul {m} x {w} x {w}: {:.4} TFLOP/s",
                 rate / 1e3
@@ -681,7 +697,7 @@ pub fn measure(
             // any of the rows reads.
             let mut most = 0f64;
             for m in FEW_ROWS {
-                let rate = bench.matmul_flops(m, w, w, &tensors, gap)?;
+                let rate = bench.matmul_flops(m, w, w, &tensors, &touched, gap)?;
                 say(&format!(
                     "  bf16 matmul {m} x {w} x {w} (few rows): {:.4} TFLOP/s",
                     rate / 1e3
@@ -718,7 +734,7 @@ pub fn measure(
                 .iter()
                 .map(|(_, b)| bench.tensor(b, n, w, Dtype::Bf16))
                 .collect::<Result<_, String>>()?;
-            let rate = bench.matmul_flops(m, n, w, &narrow, gap)?;
+            let rate = bench.matmul_flops(m, n, w, &narrow, &touched, gap)?;
             let flops = engine::rates::gemm_flops(m, n, w);
             let groups = u32::try_from(groups).map_err(|e| e.to_string())?;
             per_core = engine::rates::workgroups_per_core(groups, cores, flops / rate, flops / full);
