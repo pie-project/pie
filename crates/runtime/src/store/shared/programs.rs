@@ -715,9 +715,7 @@ pub async fn take_raise(
                 super::ask_walk(mover.engine());
                 None
             }
-            Some(at)
-                if pool.pool().act_chunks(at) <= pool.pool().act_reserved()
-                    || pool.copying().is_some() =>
+            Some(at) if !pool.raise_owed(at) || pool.copying().is_some() =>
             {
                 None
             }
