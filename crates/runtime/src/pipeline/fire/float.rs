@@ -319,6 +319,7 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         .get_mut(&fwd)?
         .bound_instance
         .reserve_completion();
+    epoch.stamp(&completion);
     let ticket_reservation = TicketReservation::new(&cells, &accesses);
     ticket_reservation.apply_to(&mut req);
     let lora_program = lora_program_of(ctx, &fwd)?;

@@ -1160,6 +1160,45 @@ mod tests {
         assert!(pool.clear_of_carve(11, 11).is_err());
     }
 
+    /// A copy answers only once it has landed (CONTRACT-BC 23). The queue is
+    /// held, so a slot copy committed behind it is certainly in flight; its
+    /// completion must not resolve then. A new owner of the destination
+    /// writes its status by host only once the completion resolves, as the
+    /// runtime hands a slot on, and that write survives the copy. Answered
+    /// at enqueue, as the staging placeholder was, the write landed first
+    /// and the copy overwrote it: Metal's c64 top-p epilogue faults.
+    #[test]
+    fn a_slot_copy_answers_only_once_it_has_landed() {
+        let device = Context::bind().expect("a device");
+        let mut pool = Pool::reserve(&device, CHUNK, 12, 4, 3, u64::MAX).expect("a pool");
+        pool.commit_segments(2).expect("the bottom");
+        let copied = [0xbeu8; 64];
+        let status = [1u8, 0, 0, 0, 0, 0, 0, 0];
+        pool.write(CHUNK, &copied).expect("the copy's source");
+        pool.write(2 * CHUNK, &[0u8; 64]).expect("its destination");
+
+        let hold = device.hold_queue().expect("the queue held");
+        let mut frame = device.frame().expect("a frame");
+        pool.copy(&mut frame, CHUNK, 2 * CHUNK, 64).expect("a copy");
+        let (pending, landed) = frame.commit_copy().expect("committed");
+        let early = landed.is_resolved();
+        if early {
+            // The destination handed on at once: its new owner writes.
+            pool.write(2 * CHUNK, &status).expect("the new owner's status");
+        }
+        hold.release();
+        pending.wait().expect("the copy lands");
+        assert!(!early, "the copy answered while it was still in flight");
+        assert_eq!(landed.check().map(|outcome| outcome.is_ok()), Some(true), "landed");
+        let mut seen = [0u8; 64];
+        pool.read(2 * CHUNK, &mut seen).expect("a read");
+        assert_eq!(seen, copied, "the copy's bytes, in place once it answered");
+        pool.write(2 * CHUNK, &status).expect("the new owner's status, after the landing");
+        let mut word = [0u8; 8];
+        pool.read(2 * CHUNK, &mut word).expect("a read");
+        assert_eq!(word, status, "the new owner's status survives the copy");
+    }
+
     #[test]
     fn the_span_is_backed_on_demand_from_the_top_and_the_bottom_grows_under_it() {
         assert_eq!(top_first(12, 4, 3), 8, "the segment the span starts in");

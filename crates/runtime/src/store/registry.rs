@@ -228,6 +228,11 @@ pub fn shared_stores(
     if let Some(identity) = crate::model::identity() {
         kv.set_domain(identity.domain());
     }
+    kv.fence_pools(
+        std::iter::once(Arc::clone(shared))
+            .chain(tiers.host.iter().cloned())
+            .collect(),
+    );
     let rs = RsStore::shared(shared, tiers.host.as_ref());
     kv.set_keeps(kv_sharing() && records == 0 && !rs.is_window());
     kv.set_page_size(kv_page_size);

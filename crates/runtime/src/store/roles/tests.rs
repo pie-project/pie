@@ -163,6 +163,9 @@ pub(crate) struct FakeEngine {
     adapter: Footprint,
     /// The key of the adapter the next binding lands ([`Engine::adapter_key`]).
     key: Option<u128>,
+    /// Runs inside `bind_instance`, as the engine binds: what the runtime
+    /// may do meanwhile, the roles' lock let go (a planner's park).
+    on_bind: Option<Box<dyn FnMut() + Send>>,
 }
 
 impl Engine for FakeEngine {
@@ -280,6 +283,9 @@ impl Engine for FakeEngine {
     }
 
     fn bind_instance(&mut self, binding: &InstanceBinding) -> ::engine::Result<BoundInstance> {
+        if let Some(hook) = self.on_bind.as_mut() {
+            hook();
+        }
         self.next += 1;
         self.bindings.push(binding.clone());
         Ok(BoundInstance {
@@ -1104,6 +1110,225 @@ fn a_shared_adapter_parks_only_once_every_holder_has() {
     }
     assert_eq!(held(&device), before);
     assert_eq!(held(&host), 0);
+}
+
+/// A park's copy of an instance's and a channel's slots is in flight (the
+/// engine took it, it has not landed) when the park commits and gives the
+/// device slots back. A new instance bound meanwhile must not take them:
+/// the copy still reads them, and a ring or table the new owner's bind
+/// writes would be what parks. They come back once the copy lands.
+#[test]
+fn slots_a_park_still_copies_are_not_bound_until_the_copy_lands() {
+    use crate::scheduler::lane::CopyEpoch;
+    use crate::scheduler::worker::PreLaunchCopy;
+    use ::engine::transfer::MemoryDomain;
+    let Pools {
+        device,
+        host,
+        roles,
+    } = pools();
+    let kv = Arc::new(parking_lot::Mutex::new(crate::store::kv::KvStore::new(
+        8, [5; 32],
+    )));
+    kv.lock()
+        .fence_pools(vec![Arc::clone(&device), Arc::clone(&host)]);
+    let mut engine = FakeEngine::default();
+    let channel = registered(&roles, &mut engine, 1, 1);
+    let instance = bind(&roles, &mut engine, vec![channel], 1);
+    let parked: Vec<(EngineShape, u32)> = {
+        let roles = roles.lock().unwrap();
+        roles
+            .slots(Owner::Instance(instance))
+            .into_iter()
+            // Its tables; its own ring's slots follow.
+            .take(3)
+            .map(|slot| (INSTANCE, slot))
+            .collect()
+    };
+
+    let park = roles.lock().unwrap().prepare_park(holder(1)).unwrap();
+    let mut landings = Vec::new();
+    for copy in park.copies() {
+        let epoch = CopyEpoch::open_on(
+            &kv,
+            Some(&device),
+            Some(&host),
+            None,
+            &PreLaunchCopy::Slots(::engine::chunk::SlotCopy {
+                shape: copy.shape,
+                src: MemoryDomain::CudaDevice(0),
+                dst: MemoryDomain::HostPinned,
+                slots: copy
+                    .device
+                    .iter()
+                    .copied()
+                    .zip(copy.host.iter().copied())
+                    .collect(),
+                runs: Vec::new(),
+            }),
+        );
+        let (landing, landed) = ::engine::completion::copy_in_flight();
+        epoch.retire_on(&landed);
+        landings.push(landing);
+    }
+    // Committed on the enqueue: the device slots are let go.
+    roles.lock().unwrap().commit(park);
+    kv.lock().retire_idle();
+
+    let instance_pool = device.lock().unwrap().roles().instance.unwrap().pool;
+    let still_out = |device: &Shared| {
+        let pool = device.lock().unwrap();
+        parked
+            .iter()
+            .filter(|(_, slot)| {
+                pool.pool()
+                    .is_held(instance_pool, pool.slot(instance_pool, *slot))
+            })
+            .count()
+    };
+    assert_eq!(still_out(&device), 3, "the instance's tables wait for the copy");
+    // Another process binds now: its tables are elsewhere.
+    let other = bind(&roles, &mut engine, Vec::new(), 2);
+    let others: Vec<u32> = roles
+        .lock()
+        .unwrap()
+        .slots(Owner::Instance(other))
+        .into_iter()
+        .take(3)
+        .collect();
+    assert!(
+        parked.iter().all(|(_, slot)| !others.contains(slot)),
+        "a new instance took slots the park's copy still reads"
+    );
+
+    for landing in landings {
+        landing.landed();
+    }
+    assert_eq!(still_out(&device), 0, "back once the copy landed");
+    roles.lock().unwrap().close_instance(other);
+}
+
+/// A park and commit of `by`'s items, run as the engine binds.
+fn park_during_bind(roles: &RolesHandle, by: u128) -> Box<dyn FnMut() + Send> {
+    let roles = Arc::clone(roles);
+    Box::new(move || {
+        let mut roles = roles.lock().unwrap();
+        if let Some(park) = roles.prepare_park(holder(by)) {
+            roles.commit(park);
+        }
+    })
+}
+
+/// The slot refs of `owner` and whether it lies on the device.
+fn where_is(roles: &RolesHandle, owner: Owner) -> (Vec<u32>, bool) {
+    let roles = roles.lock().unwrap();
+    let on_device = roles
+        .items
+        .get(&owner)
+        .is_some_and(|item| item.tier == super::Tier::Device);
+    (roles.slots(owner), on_device)
+}
+
+/// A bind on channel C runs while its registrar parks (the planner's evict,
+/// off the lane, the roles' lock let go for the engine's bind): the new
+/// instance is not yet attached to C, but its bind is, so C stays where the
+/// engine adopts it, on the device, its slots its own.
+#[test]
+fn a_channel_a_bind_attaches_to_does_not_park_under_it() {
+    let Pools { device, roles, .. } = pools();
+    let mut engine = FakeEngine::default();
+    let channel = registered(&roles, &mut engine, 1, 1);
+    let _first = bind(&roles, &mut engine, vec![channel], 1);
+    let (was, _) = where_is(&roles, Owner::Channel(channel));
+    assert_eq!(was.len(), 2);
+
+    engine.on_bind = Some(park_during_bind(&roles, 1));
+    let second = bind(&roles, &mut engine, vec![channel], 2);
+    engine.on_bind = None;
+    assert_eq!(
+        where_is(&roles, Owner::Channel(channel)),
+        (was.clone(), true),
+        "the channel a bind adopted moved under it"
+    );
+    let channel_pool = device.lock().unwrap().roles().channel.unwrap().pool;
+    let next = device.lock().unwrap().take_refs(channel_pool, 4).unwrap();
+    assert!(
+        next.iter().all(|slot| !was.contains(slot)),
+        "a following take got the slots the bound instance reads"
+    );
+    device.lock().unwrap().give_refs(channel_pool, &next);
+    roles.lock().unwrap().close_instance(second);
+}
+
+/// The same for a shared adapter: a bind reusing an adapter's slots while
+/// the adapter's only holder parks keeps it on the device.
+#[test]
+fn an_adapter_a_bind_reuses_does_not_park_under_it() {
+    let Pools { device, roles, .. } = pools();
+    let mut engine = adapting(7);
+    let _first = bind(&roles, &mut engine, Vec::new(), 1);
+    let (was, _) = where_is(&roles, Owner::Adapter(7));
+    assert_eq!(was.len(), 4);
+
+    engine.on_bind = Some(park_during_bind(&roles, 1));
+    let second = bind(&roles, &mut engine, Vec::new(), 2);
+    engine.on_bind = None;
+    assert_eq!(engine.bindings[1].adapter_slots, was, "the bind reused it");
+    assert_eq!(
+        where_is(&roles, Owner::Adapter(7)),
+        (was.clone(), true),
+        "the adapter a bind reused moved under it"
+    );
+    let adapter_pool = device.lock().unwrap().roles().adapter.unwrap().pool;
+    let next = device.lock().unwrap().take_refs(adapter_pool, 4).unwrap();
+    assert!(
+        next.iter().all(|slot| !was.contains(slot)),
+        "a following take got the adapter's slots"
+    );
+    device.lock().unwrap().give_refs(adapter_pool, &next);
+    roles.lock().unwrap().close_instance(second);
+}
+
+/// An item a bind attached to found gone at `bound` is a broken contract,
+/// refused by name; nothing of the bind is kept.
+#[test]
+fn a_bind_over_a_gone_item_is_refused_by_name() {
+    let Pools { device, roles, .. } = pools();
+    let mut engine = FakeEngine::default();
+    let channel = registered(&roles, &mut engine, 1, 1);
+    learn_program(&roles, &mut engine, PROGRAM).unwrap();
+    let before = held(&device);
+    let taken = roles
+        .lock()
+        .unwrap()
+        .take_instance(
+            PROGRAM,
+            &[channel],
+            |id| id == channel,
+            None,
+            super::GuestTaken::default(),
+        )
+        .unwrap();
+    roles.lock().unwrap().items.remove(&Owner::Channel(channel));
+    let refused = roles
+        .lock()
+        .unwrap()
+        .bound(InstanceId(41), Some(holder(1)), taken)
+        .expect_err("bound over a gone channel");
+    assert!(
+        matches!(
+            refused,
+            RolesError::Unattached {
+                owner: Owner::Channel(id),
+                why: "gone",
+                ..
+            } if id == channel
+        ),
+        "{refused}"
+    );
+    assert!(refused.to_string().contains("gone"), "{refused}");
+    assert!(roles.lock().unwrap().slots(Owner::Instance(InstanceId(41))).is_empty());
+    assert!(held(&device) <= before, "the bind's slots went back");
 }
 
 /// TPU's handles e2e (XLA, a 237-page pool): a restored process's

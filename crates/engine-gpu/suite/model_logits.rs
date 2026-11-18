@@ -1096,6 +1096,163 @@ fn state_lent_in_the_span_outlives_a_narrow_rungs_fires() {
 /// from a boundary at 0, its committed columns set; the mask is read (it
 /// lands other logits than all set), and one short of its buffer and rows
 /// is refused for that extent.
+/// Waits up to `limit` for `completion` to resolve, polling it as a future
+/// would be: woken by whatever resolves it, never by a drain.
+fn landed_within(
+    completion: engine::CopyCompletion,
+    limit: std::time::Duration,
+) -> Option<engine::Result<()>> {
+    use std::future::Future as _;
+    struct Unpark(std::thread::Thread);
+    impl std::task::Wake for Unpark {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let waker = std::task::Waker::from(std::sync::Arc::new(Unpark(std::thread::current())));
+    let mut cx = std::task::Context::from_waker(&waker);
+    let mut completion = std::pin::pin!(completion);
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        if let std::task::Poll::Ready(outcome) = completion.as_mut().poll(&mut cx) {
+            return Some(outcome);
+        }
+        let left = deadline.checked_duration_since(std::time::Instant::now())?;
+        std::thread::park_timeout(left);
+    }
+}
+
+/// A device copy's completion resolves from its own submission's landing
+/// (CONTRACT-BC 23): queued behind a long frame it stands unresolved while
+/// that frame holds the queue, and once the frame has landed it resolves on
+/// its own, with no drain, and with its bytes in place.
+#[test]
+fn a_device_copy_resolves_once_its_submission_lands() {
+    use engine::chunk::SlotCopy;
+    use engine::transfer::MemoryDomain;
+    use std::time::{Duration, Instant};
+    let fixture = fixture("qwen3-micro-text", None);
+    let Some(mut shell) = load_with(
+        &fixture,
+        PAGE,
+        CONTEXT,
+        Some(64 << 10),
+        engine::load::Residency {
+            host_kv_budget: Some(256 << 20),
+            ..engine::load::Residency::default()
+        },
+    ) else {
+        return;
+    };
+    let device = <backend::Api as engine_gpu::api::Host>::domain(&DeviceBoot::default());
+    let facts = shell.pool_chunk_facts();
+    let list = facts
+        .shapes
+        .iter()
+        .find(|shape| shape.id == LIST)
+        .expect("a kv list");
+    let (per, total) = (list.slots_per_chunk, facts.total_chunks);
+    assert!(total >= 2, "two chunks to copy between: {total}");
+    let src: Vec<u32> = ((total - 1) * per..total * per).collect();
+    let dst: Vec<u32> = ((total - 2) * per..(total - 1) * per).collect();
+    let slots = per;
+    let host_in: Vec<u32> = (0..slots).collect();
+    let host_out: Vec<u32> = (slots..2 * slots).collect();
+    let pattern: Vec<u8> = (0..u64::from(slots) * list.slot_bytes)
+        .map(|at| (at.wrapping_mul(2_654_435_761) >> 11) as u8 | 1)
+        .collect();
+    let pairs = |from: &[u32], to: &[u32]| from.iter().copied().zip(to.iter().copied()).collect();
+    shell
+        .write_tier_slots(&[(LIST, host_in.clone())], &pattern)
+        .expect("the host slots take the pattern");
+    let staged = shell
+        .copy_slots(&SlotCopy {
+            shape: LIST,
+            src: MemoryDomain::HostPinned,
+            dst: device,
+            slots: pairs(&host_in, &src),
+            runs: Vec::new(),
+        })
+        .expect("the pattern goes up");
+    assert!(
+        matches!(staged.check(), Some(Ok(()))),
+        "a copy from the host has landed once it answers"
+    );
+
+    // A frame that holds the queue: copies over a scratch buffer, doubled
+    // until one takes a while on this device.
+    const HALF: u64 = 32 << 20;
+    let scratch = backend::Buffer::zeroed(shell.device(), 2 * HALF, engine_gpu::books::owners::TEST)
+        .expect("the scratch buffer");
+    let hold = |on: &Context, copies: u32| {
+        let mut frame = on.frame().expect("a frame");
+        for k in 0..copies {
+            let (from, into) = if k % 2 == 0 { (0, HALF) } else { (HALF, 0) };
+            frame
+                .copy(&scratch, from, &scratch, into, HALF)
+                .expect("a scratch copy");
+        }
+        frame
+    };
+    let long = Duration::from_millis(200);
+    let mut copies = 16u32;
+    let held = loop {
+        let started = Instant::now();
+        hold(shell.device(), copies).commit().expect("the holding frame lands");
+        let took = started.elapsed();
+        if took >= long || copies >= 1 << 16 {
+            break took;
+        }
+        copies *= 2;
+    };
+    assert!(held >= long, "{copies} copies of {HALF} bytes held the queue {held:?}");
+
+    let started = Instant::now();
+    let holding = hold(shell.device(), copies)
+        .commit_async(None)
+        .expect("the holding frame goes");
+    let copied = shell
+        .copy_slots(&SlotCopy {
+            shape: LIST,
+            src: device,
+            dst: device,
+            slots: pairs(&src, &dst),
+            runs: Vec::new(),
+        })
+        .expect("the device copy goes");
+    let asked = started.elapsed();
+    let early = copied.check();
+    assert!(
+        asked < held / 4,
+        "the copy went {asked:?} after the holding frame, which takes {held:?}"
+    );
+    assert!(
+        early.is_none(),
+        "the copy resolved {early:?} behind a frame still holding the queue"
+    );
+    holding.wait().expect("the holding frame lands");
+    let landed = landed_within(copied, Duration::from_secs(30));
+    assert!(
+        matches!(landed, Some(Ok(()))),
+        "the copy resolved {landed:?} once the frame before it landed"
+    );
+
+    shell
+        .copy_slots(&SlotCopy {
+            shape: LIST,
+            src: device,
+            dst: MemoryDomain::HostPinned,
+            slots: pairs(&dst, &host_out),
+            runs: Vec::new(),
+        })
+        .expect("the copied slots read back");
+    let back = shell
+        .read_tier_slots(&[(LIST, host_out)])
+        .expect("the host slots read");
+    let first = back.iter().zip(&pattern).position(|(a, b)| a != b);
+    assert_eq!(first, None, "the landed copy's bytes differ");
+}
+
 #[test]
 fn a_masked_fire_after_a_partial_fold_admits_the_committed_keys() {
     let fixture = fixture("qwen3-micro-text", None);

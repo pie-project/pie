@@ -410,6 +410,24 @@ impl Context {
     #[cfg(not(target_vendor = "apple"))]
     pub(crate) fn reach_indirectly(&self, _slabs: Vec<super::alloc::Slab>) {}
 
+    /// Test builds: holds this context's queue behind a command buffer that
+    /// waits on an event, so whatever is committed after it stays in
+    /// flight until [`QueueHold::release`].
+    #[cfg(all(test, target_vendor = "apple"))]
+    pub(crate) fn hold_queue(&self) -> Result<QueueHold> {
+        let event = self.device.newSharedEvent().ok_or(Fault::Device {
+            call: "newSharedEvent",
+            why: "the device would not open a shared event".to_string(),
+        })?;
+        let buffer = self.queue.commandBuffer().ok_or(Fault::Device {
+            call: "commandBuffer",
+            why: "the queue would not open a command buffer".to_string(),
+        })?;
+        buffer.encodeWaitForEvent_value(ProtocolObject::from_ref(&*event), 1);
+        buffer.commit();
+        Ok(QueueHold { event })
+    }
+
     pub fn frame(&self) -> Result<Frame> {
         #[cfg(target_vendor = "apple")]
         {
@@ -854,6 +872,28 @@ impl Frame {
         }
     }
 
+    /// Commits a copy's frame without waiting, and answers the runtime's end
+    /// of the copy (CONTRACT-BC 23): landed once the device retired this
+    /// buffer and every head it flushed, failed with the device's reason.
+    /// The [`Pending`] lets a drain wait the copy out on the host.
+    pub fn commit_copy(self) -> Result<(Pending, engine::CopyCompletion)> {
+        let (landing, completion) = engine::completion::copy_in_flight();
+        let landing = std::sync::Mutex::new(Some(landing));
+        let answer = move |refused: Option<String>| {
+            let landing = landing
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            match (landing, refused) {
+                (Some(landing), None) => landing.landed(),
+                (Some(landing), Some(why)) => landing.failed(why),
+                (None, _) => {}
+            }
+        };
+        let pending = self.commit_async(Some(Box::new(answer)))?;
+        Ok((pending, completion))
+    }
+
     #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
     pub fn commit_async(
         mut self,
@@ -941,6 +981,21 @@ unsafe impl Send for Pending {}
 impl std::fmt::Debug for Pending {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Pending").finish()
+    }
+}
+
+/// Test builds: a queue held behind an event ([`Context::hold_queue`]).
+#[cfg(all(test, target_vendor = "apple"))]
+pub(crate) struct QueueHold {
+    event: Retained<ProtocolObject<dyn objc2_metal::MTLSharedEvent>>,
+}
+
+#[cfg(all(test, target_vendor = "apple"))]
+impl QueueHold {
+    /// Lets the queue run again.
+    pub(crate) fn release(self) {
+        use objc2_metal::MTLSharedEvent;
+        self.event.setSignaledValue(1);
     }
 }
 

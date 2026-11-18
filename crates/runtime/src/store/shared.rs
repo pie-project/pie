@@ -1859,6 +1859,28 @@ impl SharedPool {
         None
     }
 
+    /// Notes that device work at `epoch` (a fire, or a copy) names `refs`
+    /// of engine shape `engine`, a state or role shape's: once let go, each
+    /// is handed out again only after that epoch retires
+    /// ([`SlotPool::touch`]). Refs naming no slot handed out are passed
+    /// over, as is a shape the pool does not lay.
+    pub fn touch(&mut self, engine: EngineShape, refs: impl IntoIterator<Item = u32>, epoch: u64) {
+        let Some(shape) = self.pool_shape(engine).or_else(|| {
+            self.roles
+                .iter()
+                .find(|shape| shape.id == engine)
+                .map(|shape| shape.pool)
+        }) else {
+            return;
+        };
+        self.touch_pool(shape, refs, epoch);
+    }
+
+    /// [`Self::touch`] by the pool's own shape id.
+    pub fn touch_pool(&mut self, shape: ShapeId, refs: impl IntoIterator<Item = u32>, epoch: u64) {
+        self.pool.touch_held(shape, refs, epoch);
+    }
+
     /// The pool shape of engine shape `engine`, a state shape's.
     fn pool_shape(&self, engine: EngineShape) -> Option<ShapeId> {
         self.list

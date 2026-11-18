@@ -258,6 +258,7 @@ impl ResidencyPlanner {
 
     pub(super) fn victim_set(&self) -> Option<VictimSet> {
         let (free, _) = self.port.device_stats();
+        let arriving = self.port.device_arriving();
         let (rs_free, rs_total) = self.port.rs_stats();
         let rs_growth = self.rs_growth();
         let (mut victims, spare) = self.with_inner(|inner| {
@@ -272,13 +273,16 @@ impl ResidencyPlanner {
             // In-flight moves past what the head's own kv takes free chunks
             // for its state too.
             let spare = expected.pages.saturating_sub(missing);
+            // Pages arriving come back as the work in flight lands: the
+            // head is short only past them (of a fleet still running).
+            let arriving = if inner.fleet_stalled() { 0 } else { arriving };
             // A bind short of room is short the pages that, moved out
             // whole, free its chunks: free pages are no runs of chunks. So
             // is the restore of a process such a bind suspended.
             let room = inner.room_pages(waiter).saturating_sub(expected.pages);
             let deficit = Reclaim {
                 pages: missing
-                    .saturating_sub(expected.pages.saturating_add(free))
+                    .saturating_sub(expected.pages.saturating_add(free + arriving))
                     .saturating_add(room),
                 rs: waiter
                     .rs_need()
@@ -442,6 +446,7 @@ impl ResidencyPlanner {
 
     pub(super) fn supply_stalled(&self) -> bool {
         let (free, _) = self.port.device_stats();
+        let arriving = self.port.device_arriving();
         self.with_inner(|inner| {
             let accum = inner.accum.len() as u32;
             if inner.kill_in_flight() {
@@ -450,7 +455,10 @@ impl ResidencyPlanner {
             if inner.unmet_head().is_none() {
                 return false;
             }
-            let expected = inner.expected_reclaim().pages;
+            // Arriving pages land with the work in flight; a stalled fleet
+            // has none that lands.
+            let arriving = if inner.fleet_stalled() { 0 } else { arriving };
+            let expected = inner.expected_reclaim().pages + arriving;
             let supply = free + accum + expected;
             if inner.queued_quantum() > supply {
                 return true;
@@ -460,6 +468,19 @@ impl ResidencyPlanner {
                     .unmet_head()
                     .is_some_and(|(_, head)| head.kv_need() > accum + expected)
         })
+    }
+
+    /// Whether pages arriving (let go, waiting only on device work in
+    /// flight) cover `missing`: the head waits for their landing. Not once
+    /// the fleet has stalled, where nothing of it is in flight to land.
+    pub(super) fn arrivals_cover(&self, missing: u32) -> bool {
+        let arriving = self.port.device_arriving();
+        if arriving == 0 || arriving < missing || self.is_wedged() {
+            return false;
+        }
+        self.stats.arrival_waits.fetch_add(1, Ordering::Relaxed);
+        ptrace!("plan waits on arriving pages missing={missing} arriving={arriving}");
+        true
     }
 
     pub(super) fn is_wedged(&self) -> bool {

@@ -11,6 +11,7 @@ pub mod adapter;
 pub mod caps;
 pub mod channel;
 pub mod chunk;
+pub mod completion;
 #[cfg(any(unix, windows, target_arch = "wasm32"))]
 pub mod disk;
 pub mod engine;
@@ -38,6 +39,7 @@ pub use chunk::{
     ResidentWeight, SegmentFacts, ShapeId, SlotCopy, SlotKind, SlotRole, SlotRun, SlotShape,
     WeightAtom, WeightKind, WeightResidency, WeightShape, WeightUses,
 };
+pub use completion::{CopyCompletion, CopyLanding};
 pub use engine::{
     CompletionSink, Engine, HostRoom, KvWrites, LaneFault, Prepared, ProgramCompile, StepDone,
     StepOutcome, TapGroups, TapSink, Tapped,

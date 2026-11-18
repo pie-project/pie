@@ -182,6 +182,162 @@ fn unassigned_ref(engine_idx: usize, frame: &crate::engine::FrameFire) -> Option
     })
 }
 
+/// Notes that the steps of `frame`, about to be submitted (`submitted`),
+/// name the slots they do: each lane's tables, record, slot copies, buffer
+/// pages and snapshots, and the instances attached (their tables, rings
+/// and adapters). Touched at the newest epoch the frame's own fires hold
+/// (each fire's `FireEpoch`, stamped on its completion before it was
+/// submitted): a slot let go waits until those fires, and every older
+/// epoch, retire, which is once the frame has landed, and not for the fires
+/// opened since for frames still to come. One locked pass over the pool.
+fn touch_frame(
+    engine_idx: usize,
+    roles: Option<&crate::store::roles::RolesHandle>,
+    frame: &crate::engine::FrameFire,
+    submitted: &::engine::FrameSubmission,
+) {
+    let Some(stores) = crate::store::registry::try_get(0, engine_idx) else {
+        return;
+    };
+    let Some(shared) = &stores.shared else {
+        return;
+    };
+    let fires = frame.steps.iter().flat_map(|step| &step.completions);
+    debug_assert!(
+        fires.clone().all(|fire| fire.kv_epoch() > 0),
+        "a fire reached the lane with no epoch of its own"
+    );
+    let epoch = fires.map(crate::engine::WorkItemCompletion::kv_epoch).max().unwrap_or(0);
+    {
+        let mut pool = shared.lock().unwrap();
+        let rs_list = pool.rs_list().map(|shape| shape.id);
+        for lane in submitted.steps.iter().flat_map(|step| &step.lanes) {
+            for (shape, refs) in &lane.tables {
+                pool.touch(*shape, refs.iter().copied(), epoch);
+            }
+            for (shape, pairs) in lane.record.pieces().iter().chain(&lane.slot_copies) {
+                pool.touch(*shape, pairs.iter().flatten().copied(), epoch);
+            }
+            if let (Some(rs_list), ::engine::RsVerb::Buffer { pages, .. }) = (rs_list, &lane.rs) {
+                pool.touch(rs_list, pages.iter().copied(), epoch);
+            }
+            for snapshot in &lane.rs_snapshots {
+                for (shape, refs) in &snapshot.fixed {
+                    pool.touch(*shape, refs.iter().copied(), epoch);
+                }
+            }
+        }
+    }
+    if let Some(roles) = roles {
+        let roles = roles.lock().unwrap();
+        for step in &submitted.steps {
+            for attachment in &step.attachments {
+                roles.touch(attachment.instance, epoch);
+            }
+        }
+    }
+}
+
+/// A copy's own epoch in its engine's kv store: opened as the copy is
+/// handed to the engine, the slots it names touched at it, and closed once
+/// the copy has landed ([`::engine::CopyCompletion`]), or, refused, as it
+/// drops.
+pub(crate) struct CopyEpoch {
+    kv: Arc<parking_lot::Mutex<crate::store::kv::KvStore>>,
+    seq: u64,
+    /// Whose planner is told what the epoch's close frees.
+    engine_idx: Option<usize>,
+}
+
+impl CopyEpoch {
+    /// `None` where the engine has no stores registered (nothing to
+    /// fence).
+    fn open(engine_idx: usize, plan: &PreLaunchCopy) -> Option<Self> {
+        let stores = crate::store::registry::try_get(0, engine_idx)?;
+        Some(Self::open_on(
+            &stores.kv,
+            stores.shared.as_ref(),
+            stores.host.as_ref(),
+            Some(engine_idx),
+            plan,
+        ))
+    }
+
+    /// Opens the epoch of `plan` in `kv`, touching what it names in
+    /// `device` (the engine's shared pool) and `host` (its host tier).
+    pub(crate) fn open_on(
+        kv: &Arc<parking_lot::Mutex<crate::store::kv::KvStore>>,
+        device: Option<&crate::store::shared::Shared>,
+        host: Option<&crate::store::shared::Shared>,
+        engine_idx: Option<usize>,
+        plan: &PreLaunchCopy,
+    ) -> Self {
+        use ::engine::transfer::MemoryDomain;
+        let seq = crate::store::registry::with_kv_lock(kv, "copy-epoch", |kv| kv.begin_copy());
+        let pool_of = |domain: MemoryDomain| match domain {
+            MemoryDomain::LocalDisk => None,
+            MemoryDomain::HostPinned => host,
+            _ => device,
+        };
+        match plan {
+            PreLaunchCopy::Slots(copy) => {
+                let src = copy
+                    .slots
+                    .iter()
+                    .map(|&(src, _)| src)
+                    .chain(copy.runs.iter().map(|run| run.src));
+                if let Some(pool) = pool_of(copy.src) {
+                    pool.lock().unwrap().touch(copy.shape, src, seq);
+                }
+                let dst = copy
+                    .slots
+                    .iter()
+                    .map(|&(_, dst)| dst)
+                    .chain(copy.runs.iter().map(|run| run.dst));
+                if let Some(pool) = pool_of(copy.dst) {
+                    pool.lock().unwrap().touch(copy.shape, dst, seq);
+                }
+            }
+            PreLaunchCopy::Kv(copy) => {
+                for (domain, refs) in [(copy.src, &copy.src_page_ids), (copy.dst, &copy.dst_page_ids)]
+                {
+                    if let Some(pool) = pool_of(domain) {
+                        let mut pool = pool.lock().unwrap();
+                        if let Some(list) = pool.list() {
+                            pool.touch_pool(list.pool, refs.iter().copied(), seq);
+                        }
+                    }
+                }
+            }
+            // A state copy names the rs store's ids, which fence on its
+            // own epochs.
+            PreLaunchCopy::State(_) => {}
+        }
+        Self {
+            kv: Arc::clone(kv),
+            seq,
+            engine_idx,
+        }
+    }
+
+    /// Closes the epoch once the copy `landed` waits on has landed.
+    pub(crate) fn retire_on(self, landed: &::engine::CopyCompletion) {
+        landed.on_landed(move |_| drop(self));
+    }
+}
+
+impl Drop for CopyEpoch {
+    fn drop(&mut self) {
+        crate::store::registry::with_kv_lock(&self.kv, "copy-epoch", |kv| kv.settle(self.seq));
+        if let Some(planner) = self
+            .engine_idx
+            .and_then(|engine| crate::planner::planner_for(0, engine))
+        {
+            planner.pages_freed();
+        }
+    }
+}
+
 fn backend(engine: &mut Option<EngineBox>) -> Result<&mut EngineBox> {
     engine.as_mut().ok_or_else(|| anyhow!(NO_BACKEND))
 }
@@ -686,6 +842,7 @@ impl Lane {
             steps = submitted.steps.len(),
             "submitting a frame to the engine"
         );
+        touch_frame(engine_idx, roles, frame, &submitted);
         let ticket = match engine.submit(&submitted) {
             Ok(ticket) => ticket,
             Err(error) if error.is_retryable() => {
@@ -713,6 +870,11 @@ impl Lane {
                     .collect(),
             );
         }
+        // The engine took the frame: from here a failure fails its fires
+        // only once the frame has landed. Failed now, their leases and
+        // epochs would go while the device still runs the frame, and what
+        // it names would be handed out under it.
+        let mut failed_after_submit: Option<String> = None;
         let mut wakes: Vec<Vec<u64>> = vec![Vec::new(); submitted.steps.len()];
         for (step, woken) in submitted.steps.iter().zip(&mut wakes) {
             for attachment in &step.attachments {
@@ -721,12 +883,16 @@ impl Lane {
                 if let Err(error) = crate::store::roles::pump(roles, instance, Pump::Out, || {
                     channels.pump_out_with(engine.as_mut(), instance, deferred)
                 }) {
-                    return Err(format!("channel take: {error}"));
+                    failed_after_submit.get_or_insert_with(|| format!("channel take: {error}"));
                 }
             }
         }
 
         if !asynchronous {
+            // The frame landed inside `submit`: nothing of it runs on.
+            if let Some(why) = failed_after_submit {
+                return Err(why);
+            }
             // The lanes the engine told faulted fail their own fires; every
             // other fire of the frame commits.
             let faulted = std::mem::take(&mut *inline_faults.lock().unwrap());
@@ -764,8 +930,42 @@ impl Lane {
                 wakes,
             })
             .collect();
-        settlements.expect(ticket.id, steps, &completion, broker);
+        match failed_after_submit {
+            None => settlements.expect(ticket.id, steps, &completion, broker),
+            Some(why) => {
+                tracing::error!(
+                    frame = ticket.id.0,
+                    %why,
+                    "a submitted frame failed; its fires fail once it lands"
+                );
+                settlements.expect_failed(ticket.id, steps, &completion, broker);
+            }
+        }
         Ok(completion)
+    }
+
+    /// Hands `plan` to the engine under an epoch of its own, which the
+    /// slots it names are touched at and which retires once the copy has
+    /// landed: a slot it names let go meanwhile is not handed out under it.
+    /// What answers is the copy's landing, not its enqueue.
+    fn copy(
+        engine_idx: usize,
+        engine: &mut Option<EngineBox>,
+        plan: PreLaunchCopy,
+    ) -> Result<SubmissionCompletion> {
+        let engine = backend(engine)?;
+        let epoch = CopyEpoch::open(engine_idx, &plan);
+        let landed = match &plan {
+            PreLaunchCopy::Kv(plan) => engine.copy_kv(plan),
+            PreLaunchCopy::State(plan) => engine.copy_state(plan),
+            PreLaunchCopy::Slots(plan) => engine.copy_slots(plan),
+        };
+        // Refused, it enqueued nothing: the epoch closes as it drops.
+        let landed = landed.map_err(anyhow::Error::from)?;
+        if let Some(epoch) = epoch {
+            epoch.retire_on(&landed);
+        }
+        Ok(SubmissionCompletion::copy(landed))
     }
 
     fn execute_control(
@@ -798,14 +998,7 @@ impl Lane {
                 ..
             } => {
                 let operation = plan.label();
-                let submitted = backend(engine).and_then(|engine| {
-                    crate::engine::verbs::settled(match plan {
-                        PreLaunchCopy::Kv(plan) => engine.copy_kv(&plan),
-                        PreLaunchCopy::State(plan) => engine.copy_state(&plan),
-                        PreLaunchCopy::Slots(plan) => engine.copy_slots(&plan),
-                    })
-                });
-                match submitted {
+                match Self::copy(engine_idx, engine, plan) {
                     Ok(completion) => LaneCommit::AsyncControl {
                         result: Ok(completion),
                     },
@@ -1029,13 +1222,7 @@ impl Lane {
                 }
             }
             QueuedItem::CopyTracked { plan, completion } => {
-                match backend(engine).and_then(|engine| {
-                    crate::engine::verbs::settled(match plan {
-                        PreLaunchCopy::Kv(plan) => engine.copy_kv(&plan),
-                        PreLaunchCopy::State(plan) => engine.copy_state(&plan),
-                        PreLaunchCopy::Slots(plan) => engine.copy_slots(&plan),
-                    })
-                }) {
+                match Self::copy(engine_idx, engine, plan) {
                     Ok(native_completion) => LaneCommit::AsyncControl {
                         result: Ok(native_completion),
                     },
@@ -1076,9 +1263,11 @@ impl Lane {
                         .write_host_kv(&slots, &bytes)
                         .map(|()| Vec::new())
                         .map_err(Into::into),
+                    // The read is ordered after the copy on the engine, and
+                    // waits it out (read_host_kv drains).
                     HostKvOp::CopyRead(copy, slots) => engine
                         .copy_kv(&copy)
-                        .and_then(|()| engine.read_host_kv(&slots))
+                        .and_then(|_copied| engine.read_host_kv(&slots))
                         .map_err(Into::into),
                     HostKvOp::Read(slots) => engine.read_host_kv(&slots).map_err(Into::into),
                     HostKvOp::ReadState(slots, pages) => {
