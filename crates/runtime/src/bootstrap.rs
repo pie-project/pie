@@ -540,11 +540,24 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         }
     }
     let engine_count = engine_configs.len();
-    // Each engine's reader of the host's room, where its device shares the
-    // host's memory: its governor holds its pool within it.
-    let rooms: Vec<Option<::engine::HostRoom>> = engine_configs
+    // Each engine's share of the host's room, where its device shares the
+    // host's memory: its governor holds its pool within it. Every engine of
+    // this process is on one host, so they share one ledger of its room (the
+    // first reader stated reads it for all), and each pool's grant is
+    // debited before the next reads: N pools are granted the room once.
+    let readers: Vec<Option<::engine::HostRoom>> = engine_configs
         .iter()
         .map(|d| d.engine_backend.host_room())
+        .collect();
+    let host = readers
+        .iter()
+        .flatten()
+        .next()
+        .cloned()
+        .map(crate::governor::run::HostShare::new);
+    let mut rooms: Vec<Option<crate::governor::run::PoolRoom>> = readers
+        .iter()
+        .map(|reader| reader.as_ref().and(host.as_ref()).map(|host| host.pool()))
         .collect();
     let engines: Vec<usize> = engine_configs
         .into_iter()
@@ -757,7 +770,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         grow.start();
     }
     for (engine, steered) in governed.into_iter().enumerate() {
-        let room = rooms.get(engine).cloned().flatten();
+        let room = rooms.get_mut(engine).and_then(Option::take);
         crate::governor::run::start(steered, memory_tolerance, room);
     }
     active_guard.disarm();
