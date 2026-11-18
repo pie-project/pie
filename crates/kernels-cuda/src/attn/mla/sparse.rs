@@ -87,14 +87,14 @@ pub(super) fn fire(
     if fp8
         && s.heads != 64
         && s.heads > 0
-        && ctx.tuning().mla_sparse
+        && ctx.tuning().mla_sparse()
         && supported()
         && pool.packed()
     {
         return Some(by_sixty_four(ctx, op, s, o));
     }
     let cells = pool.keys.rows;
-    let fits = ctx.tuning().mla_sparse
+    let fits = ctx.tuning().mla_sparse()
         && supported()
         && s.heads == 64
         && s.kv_lora_rank == 512
@@ -255,7 +255,7 @@ fn by_sixty_four(ctx: &Ctx, op: &'static str, s: &Shape<'_>, o: &mut Tensor) -> 
 /// One 64-head pass, refused where the pass would not serve.
 fn passed(ctx: &Ctx, op: &'static str, s: &Shape<'_>, o: &mut Tensor) -> Result<(), Error> {
     let pool = s.pool;
-    let fits = ctx.tuning().mla_sparse
+    let fits = ctx.tuning().mla_sparse()
         && supported()
         && pool.page_size > 0
         && pool.keys.rows > 0
@@ -418,7 +418,7 @@ fn launch(ctx: &Ctx, op: &'static str, s: &Shape<'_>, o: &mut Tensor) -> Result<
         part_o,
         part_lse,
         splits: int(splits),
-        dense: i32::from(ctx.tuning().mla_dense_short),
+        dense: i32::from(ctx.tuning().mla_dense_short()),
         kv: pool.keys.ptr,
         kv_width: int(pool.keys.width),
     };
@@ -458,7 +458,7 @@ fn launch(ctx: &Ctx, op: &'static str, s: &Shape<'_>, o: &mut Tensor) -> Result<
     ctx.fire(
         op,
         Fire::at(kernel(SPARSE_SM100, "::pie::attn::mla::mla_sparse_fold"))
-            .apply(Launch::grid([rows, 64, 1], [128, 1, 1]).programmatic(ctx.tuning().pdl)),
+            .apply(Launch::grid([rows, 64, 1], [128, 1, 1]).programmatic(ctx.tuning().pdl())),
         &[
             ArgValue::Ptr(part_o),
             ArgValue::Ptr(part_lse),

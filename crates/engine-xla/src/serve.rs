@@ -339,7 +339,9 @@ pub struct Shell {
     /// Token-declared values on a readout-rowed path (`crate::rows`), and
     /// a readout-rowed value that tells their rows.
     readout_rowed: (std::sync::Arc<Vec<bool>>, Option<ValueId>),
-    device: Device,
+    /// Shared: a guest program's registration compiles its stages off the
+    /// engine thread (`Engine::prepare_program`) while fires go on.
+    device: std::sync::Arc<Device>,
 }
 
 impl std::fmt::Debug for Shell {
@@ -1036,7 +1038,7 @@ impl Shell {
             pad,
             seats: engine.seats,
             tpu,
-            device,
+            device: std::sync::Arc::new(device),
             handles,
             trace: boot.trace,
             compiled,
@@ -1129,6 +1131,13 @@ impl Shell {
     #[must_use]
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    /// The device, shared: what a registration's compile, off the engine
+    /// thread, holds.
+    #[must_use]
+    pub fn device_shared(&self) -> std::sync::Arc<Device> {
+        std::sync::Arc::clone(&self.device)
     }
 
     /// The device and the pool buffer at once: a guest pass's programs take
@@ -3258,7 +3267,16 @@ impl Shell {
             slots, caches, bindings, windows, descriptor, readout_t, n, planes, rs, stage,
             lands, pixels,
         )?;
-        Ok((self.device.program(&text, sig)?, probed))
+        let fire = || {
+            let rows: Vec<u32> = descriptor.lanes.iter().map(|l| l.rows).collect();
+            format!(
+                "rows {} bucket {} lanes {} lane rows {rows:?}",
+                descriptor.rows,
+                descriptor.bucket,
+                descriptor.lanes.len()
+            )
+        };
+        Ok((self.device.program_for(&text, sig, &fire)?, probed))
     }
 
     /// The values a trace's unweighted per-head rms norms read, with their head

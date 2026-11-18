@@ -19,12 +19,12 @@ struct Builtin {
 }
 
 fn main() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let root = manifest_dir()
         .join("../..")
         .canonicalize()
         .expect("repository root");
-    let inferlets = Path::new(env!("CARGO_MANIFEST_DIR")).join("inferlets");
-    let policies = Path::new(env!("CARGO_MANIFEST_DIR")).join("policies");
+    let inferlets = manifest_dir().join("inferlets");
+    let policies = manifest_dir().join("policies");
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     let target_dir = env::var_os("PIE_BUILTINS_TARGET_DIR").map(PathBuf::from);
 
@@ -172,4 +172,13 @@ fn build(workspace: &Path, target_dir: &Path, builtins: &[Builtin]) {
             workspace.display()
         );
     }
+}
+
+/// This crate's directory, read when the build script runs: a path baked in
+/// when the script was compiled would name another checkout's crate where
+/// worktrees share a target directory.
+fn manifest_dir() -> std::path::PathBuf {
+    std::env::var_os("CARGO_MANIFEST_DIR")
+        .expect("cargo sets CARGO_MANIFEST_DIR for a build script")
+        .into()
 }

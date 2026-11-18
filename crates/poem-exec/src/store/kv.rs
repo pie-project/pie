@@ -230,6 +230,39 @@ pub fn width_of(trace: &Trace, value: ValueId) -> Result<u64> {
     Ok(width)
 }
 
+/// What a key an attention attends costs a row, all layers together: `(the
+/// flops, the kv bytes read)`. Four flops a query element (the scores'
+/// product and the values'), the widest query a kv row is read by (a row
+/// read by a prefill and a decode attention alike counts once), and every
+/// plane of each kv row read at its element's size.
+pub fn attention_counts(trace: &Trace) -> Result<(u64, u64)> {
+    let mut query = std::collections::BTreeMap::new();
+    for node in &trace.nodes {
+        let Some(read) = reads(&node.op) else {
+            continue;
+        };
+        let Some(row) = row_of(trace, read.cache) else {
+            continue;
+        };
+        let width = width_of(trace, read.q)?;
+        let seat = query.entry(row).or_insert(0u64);
+        *seat = (*seat).max(width);
+    }
+    let kv_bytes_per_key = query
+        .keys()
+        .filter_map(|&row| match trace.caches.get(row) {
+            Some(CacheRow::Kv { planes, dtype, .. }) => Some(
+                planes.iter().sum::<u64>() * poem_compiler::arena::elem_bytes(*dtype).unwrap_or(2),
+            ),
+            _ => None,
+        })
+        .sum();
+    Ok((
+        query.values().sum::<u64>().saturating_mul(4),
+        kv_bytes_per_key,
+    ))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Paging {
     pub page_size: u32,

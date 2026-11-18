@@ -276,8 +276,14 @@ impl ResidencyPlanner {
             // Pages arriving come back as the work in flight lands: the
             // head is short only past them (of a fleet still running).
             let arriving = if inner.fleet_stalled() { 0 } else { arriving };
+            // A bind short of room is short the pages that, moved out
+            // whole, free its chunks: free pages are no runs of chunks. So
+            // is the restore of a process such a bind suspended.
+            let room = inner.room_pages(waiter).saturating_sub(expected.pages);
             let deficit = Reclaim {
-                pages: missing.saturating_sub(expected.pages.saturating_add(free + arriving)),
+                pages: missing
+                    .saturating_sub(expected.pages.saturating_add(free + arriving))
+                    .saturating_add(room),
                 rs: waiter
                     .rs_need()
                     .add(inner.seating_reserve(waiter.pid, rs_growth, waiter.rs_need(), rs_total))
@@ -325,7 +331,10 @@ impl ResidencyPlanner {
                     head,
                     head_pid: waiter.pid,
                     deficit,
-                    rs_pages: 0,
+                    // The bind's runs are state the head lacks, not kv to
+                    // wait on the supply for: moved now, as nothing else
+                    // frees their chunks.
+                    rs_pages: room,
                     rs_short: RsUnits::default(),
                     restore: matches!(waiter.kind, WaitKind::Restore { .. }),
                     members,
@@ -339,7 +348,9 @@ impl ResidencyPlanner {
         let as_pages = self.port.rs_as_pages(victims.deficit.rs);
         if as_pages > 0 {
             victims.rs_short = victims.deficit.rs;
-            victims.rs_pages = as_pages.saturating_sub(spare);
+            victims.rs_pages = victims
+                .rs_pages
+                .saturating_add(as_pages.saturating_sub(spare));
             victims.deficit.pages = victims.deficit.pages.saturating_add(victims.rs_pages);
             victims.deficit.rs = RsUnits::default();
             if victims.deficit == Reclaim::default() {
@@ -405,7 +416,7 @@ impl ResidencyPlanner {
                 .unmet_head()
                 .and_then(|(key, waiter)| match waiter.kind {
                     WaitKind::Allocation { .. } => Some((key, waiter.pid)),
-                    WaitKind::Restore { .. } => None,
+                    WaitKind::Restore { .. } | WaitKind::BindRoom { .. } => None,
                 })
         }) else {
             return false;
@@ -464,7 +475,7 @@ impl ResidencyPlanner {
     /// the fleet has stalled, where nothing of it is in flight to land.
     pub(super) fn arrivals_cover(&self, missing: u32) -> bool {
         let arriving = self.port.device_arriving();
-        if arriving < missing || self.is_wedged() {
+        if arriving == 0 || arriving < missing || self.is_wedged() {
             return false;
         }
         self.stats.arrival_waits.fetch_add(1, Ordering::Relaxed);
@@ -498,8 +509,13 @@ impl ResidencyPlanner {
                     let Some((head, waiter)) = inner.unmet_head() else {
                         return (None, Vec::new());
                     };
+                    // Its kv, and the pages that free the runs a bind short
+                    // of room asks, as the victim set counts them.
                     let missing = waiter.kv_need().saturating_sub(inner.accum.len() as u32);
-                    let deficit = missing.saturating_sub(inner.expected_reclaim().pages);
+                    let expected = inner.expected_reclaim().pages;
+                    let deficit = missing.saturating_sub(expected).saturating_add(
+                        inner.room_pages(waiter).saturating_sub(expected),
+                    );
                     if deficit == 0 {
                         return (None, Vec::new());
                     }

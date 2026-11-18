@@ -1,0 +1,27 @@
+api = 1
+
+# Every MI300X, the virtual function a cloud instance exposes ("AMD Instinct
+# MI300X VF") as the card itself; the rest of the family (MI300A, MI325X)
+# states its own file.
+[target]
+match = { name_contains = ["MI300X"] }
+
+[rates]
+# `pie tune cuda --rates` on this MI300X VF (6 s): the launch a captured
+# dependent chain's per-node gap; the matmul's efficiency curve at n = k =
+# 1024, 2048 and 4096 over six row octaves through hipBLASLt's first
+# heuristic algorithm (ROCm pads no row tile: the curve carries it);
+# attention by keys; HBM and elementwise bandwidth; the gated delta scan.
+launch_ns = 1523
+gemm_tflops_by_rows = [
+  [1024, [[256, 113.5], [512, 167.9], [1024, 276.2], [2048, 319.1], [4096, 391.3], [8192, 444.4]]],
+  [2048, [[256, 200.3], [512, 281.8], [1024, 359.3], [2048, 394.8], [4096, 425.1], [8192, 565.0]]],
+  [4096, [[256, 267.9], [512, 364.8], [1024, 407.3], [2048, 519.4], [4096, 549.3], [8192, 620.9]]],
+]
+attn_tflops_by_keys = [[512, 65.3], [1024, 134.9], [2048, 222.5], [4096, 361.9], [8192, 521.9]]
+hbm_gbps = 4176.7
+elementwise_gbps = 2513.6
+scan_gelems = 3021.3
+
+[provenance]
+rates = "pie tune cuda --rates on 2026-11-17 (pie 0.6.0): AMD Instinct MI300X VF; the matmul through hipBLASLt's first heuristic algorithm, each rate a 20 ms burst on the stream timed by events, the median of 5 (the launch of 15); operands: engine::rates' pattern; at commit f71a714a5; at engine::rates' shapes (matmul m x w x w, w [1024, 2048, 4096], m [256, 512, 1024, 2048, 4096, 8192]; attention keys x keys, keys [512, 1024, 2048, 4096, 8192], 16/8 heads of 128; per-row ops 2048 x 4096; scan 2048 tokens, 16/16 heads of 128x128, conv 4)"

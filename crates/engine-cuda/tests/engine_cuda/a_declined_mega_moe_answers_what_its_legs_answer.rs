@@ -136,6 +136,15 @@ fn a_declined_mega_moe_answers_what_its_legs_answer() {
         eprintln!("skipping: no CUDA device on this machine");
         return;
     }
+    // A backend whose fusions hold no mega-MoE (ROCm) never forms one, so
+    // it has no declined one to answer for.
+    if !engine_cuda::FUSIONS
+        .iter()
+        .any(|rule| rule.kernel() == "fused.moe_mega")
+    {
+        eprintln!("skipping: this backend forms no `fused.moe_mega`");
+        return;
+    }
     for name in ROWS {
         let row = poem_compiler::catalog::deployment(name)
             .unwrap_or_else(|| panic!("`{name}` is listed"));

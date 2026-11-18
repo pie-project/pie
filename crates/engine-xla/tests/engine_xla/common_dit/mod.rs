@@ -153,7 +153,7 @@ impl ForwardHybrid for DoubleBlock {
             &indptr,
             HEAD_DIM,
             SM_SCALE,
-            RaggedMask::GroupBlockDiagonal,
+            RaggedMask::Stated,
         );
         let o = ops::gather::unpack_rows(&o, &perm);
         let (o_txt, o_img) = (
@@ -704,6 +704,8 @@ impl Rig {
                 instance_slots: Vec::new(),
                 ring_slots: Vec::new(),
                 adapter_slots: Vec::new(),
+                scratch: engine::ScratchPlace::None,
+                pair: engine::ScratchPlace::None,
                 extents: engine::program::BindExtents {
                     row_count: rows,
                     token_count: rows,

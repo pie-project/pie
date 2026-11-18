@@ -173,6 +173,24 @@ impl Engine for FakeEngine {
         "fake-roles"
     }
 
+    fn prepare_program(
+        &mut self,
+        _registration: &::engine::program::ProgramRegistration,
+    ) -> ::engine::Result<::engine::ProgramCompile> {
+        Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
+    }
+
+    fn finish_program(
+        &mut self,
+        _prepared: ::engine::Prepared,
+    ) -> ::engine::Result<::engine::ProgramId> {
+        Err(::engine::Error::unsupported(self.kind(), "finish_program"))
+    }
+
+    fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "close_program"))
+    }
+
     fn load(&mut self, _request: LoadRequest) -> ::engine::Result<Loaded> {
         Err(::engine::Error::Load("no model".into()))
     }
@@ -235,6 +253,10 @@ impl Engine for FakeEngine {
                 contiguous: false,
             },
         }))
+    }
+
+    fn holds_channel(&self, _registration: &ChannelRegistration) -> bool {
+        !self.no_channels
     }
 
     fn adapter_key(&self, _binding: &InstanceBinding) -> ::engine::Result<Option<u128>> {
@@ -453,6 +475,8 @@ fn a_park_and_unpark_moves_through_the_host_and_rebinds_the_new_refs() {
             slots: now[3..].to_vec(),
         }],
         adapter: Vec::new(),
+        scratch: ::engine::ScratchPlace::None,
+        pair: ::engine::ScratchPlace::None,
     }));
     assert!(engine.rebinds.contains(&Rebind::Channel {
         id: channel,
@@ -849,6 +873,80 @@ fn a_channel_the_engine_did_not_register_leaves_its_ring_to_the_instance() {
     assert_eq!(rings, vec![(0, 1), (1, 3)]);
 }
 
+/// Binds an instance on channel 0 as a lane binds one that registers the
+/// channel in the same bind: everything taken first, the rings by what the
+/// engine holds ([`super::held_by`]), then the registration, then the bind.
+/// The binding and the bytes of the pool it holds.
+fn bind_registering(engine: &mut FakeEngine) -> (InstanceBinding, u64) {
+    let Pools { device, roles, .. } = pools();
+    let before = held(&device);
+    let plans = vec![ChannelRegistration {
+        id: ChannelId(1),
+        capacity: 20,
+        host_role: eta_ir::container::HostRole::Writer,
+        ..ChannelRegistration::default()
+    }];
+    learn_program(&roles, engine, PROGRAM).unwrap();
+    let held_ids = super::held_by(engine, &plans);
+    let binding = InstanceBinding {
+        program: PROGRAM,
+        channels: vec![plans[0].id],
+        ..InstanceBinding::default()
+    };
+    let taken = super::take_bind(Some(&roles), engine, &binding, |id| held_ids.contains(&id)).unwrap();
+    let mut rings = super::take_rings(Some(&roles), engine, &plans).unwrap().into_iter();
+    super::register_taken(
+        Some(&roles),
+        engine,
+        &plans[0],
+        Some(holder(1)),
+        rings.next().flatten(),
+        |engine, plan| crate::engine::verbs::register_channel(engine, 0, plan),
+    )
+    .unwrap();
+    super::bind_taken(Some(&roles), engine, &binding, Some(holder(1)), taken).unwrap();
+    (engine.bindings.last().unwrap().clone(), held(&device) - before)
+}
+
+/// A bind that registers its channel takes the instance's rings by what
+/// the engine holds. Counted as the registration's because this bind
+/// registers it, a channel the engine answers `Unsupported` (Metal, a host
+/// channel) left the instance's ring of it with no slots, and every bind
+/// was refused ("a ring of 2 cells of 448 bytes takes 1 channel slot(s)
+/// and the binding names 0").
+#[test]
+fn a_channel_registered_in_the_same_bind_leaves_its_ring_to_the_instance_where_the_engine_does_not_hold_it()
+ {
+    // Held: ring 0 is the registration's, in the slots its ring took, and
+    // the instance takes only its own ring 1 beside its tables.
+    let mut engine = FakeEngine::default();
+    let (bound, bytes) = bind_registering(&mut engine);
+    let rings: Vec<(u32, usize)> = bound
+        .ring_slots
+        .iter()
+        .map(|ring| (ring.channel, ring.slots.len()))
+        .collect();
+    assert_eq!(rings, vec![(1, 3)]);
+    assert_eq!(engine.registrations[0].slots.len(), 2, "the registration's ring");
+    assert_eq!(bytes, 3 * 4 * KIB + (3 + 2) * KIB, "no ring is taken twice");
+
+    // Not held: the registration takes nothing, and ring 0 takes slots of
+    // the instance's own.
+    let mut engine = FakeEngine {
+        no_channels: true,
+        ..FakeEngine::default()
+    };
+    let (bound, bytes) = bind_registering(&mut engine);
+    let rings: Vec<(u32, usize)> = bound
+        .ring_slots
+        .iter()
+        .map(|ring| (ring.channel, ring.slots.len()))
+        .collect();
+    assert_eq!(rings, vec![(0, 1), (1, 3)]);
+    assert!(engine.registrations.is_empty());
+    assert_eq!(bytes, 3 * 4 * KIB + (1 + 3) * KIB);
+}
+
 /// An engine whose program lands an adapter of four planes, a slot each,
 /// keyed `key`.
 fn adapting(key: u128) -> FakeEngine {
@@ -1203,7 +1301,13 @@ fn a_bind_over_a_gone_item_is_refused_by_name() {
     let taken = roles
         .lock()
         .unwrap()
-        .take_instance(PROGRAM, &[channel], |id| id == channel, None)
+        .take_instance(
+            PROGRAM,
+            &[channel],
+            |id| id == channel,
+            None,
+            super::GuestTaken::default(),
+        )
         .unwrap();
     roles.lock().unwrap().items.remove(&Owner::Channel(channel));
     let refused = roles
@@ -1225,4 +1329,64 @@ fn a_bind_over_a_gone_item_is_refused_by_name() {
     assert!(refused.to_string().contains("gone"), "{refused}");
     assert!(roles.lock().unwrap().slots(Owner::Instance(InstanceId(41))).is_empty());
     assert!(held(&device) <= before, "the bind's slots went back");
+}
+
+/// TPU's handles e2e (XLA, a 237-page pool): a restored process's
+/// register+bind found no run for a ring that must lie in one ("no chunk
+/// has 1 adjacent free Channel slots") and failed. A registration short
+/// of a run the budget holds waits for room ([`RolesError::BindShort`],
+/// one free chunk its room), with nothing registered and nothing taken;
+/// once a chunk is let go it registers into a run.
+#[test]
+fn a_ring_short_of_a_run_waits_for_a_chunk_and_registers_nothing() {
+    let Pools { device, roles, .. } = pools();
+    let mut engine = FakeEngine {
+        ring: Some(run_ring(2)),
+        ..FakeEngine::default()
+    };
+    let (shape, list) = {
+        let pool = device.lock().unwrap();
+        (
+            pool.roles().channel.unwrap().pool,
+            pool.list().unwrap().pool,
+        )
+    };
+    // One chunk of the shape with no two free slots side by side, every
+    // other chunk taken by kv.
+    let mut kv = Vec::new();
+    {
+        let mut pool = device.lock().unwrap();
+        let whole = pool.take_refs(shape, u64::from(PER_CHUNK)).unwrap();
+        let freed: Vec<u32> = whole.iter().copied().step_by(2).collect();
+        pool.give_refs(shape, &freed);
+        while let Some(refs) = pool.take_refs(list, 1) {
+            kv.extend(refs);
+        }
+    }
+    let before = held(&device);
+    let plan = ChannelRegistration {
+        id: ChannelId(1),
+        ..ChannelRegistration::default()
+    };
+    let error = register_channel(Some(&roles), &mut engine, &plan, None, |engine, plan| {
+        Ok(engine.register_channel(plan)?)
+    })
+    .unwrap_err();
+    let short = error.downcast_ref::<RolesError>().expect("named");
+    assert!(
+        matches!(short, RolesError::BindShort(inner) if matches!(**inner, RolesError::NoRun { .. })),
+        "{error}"
+    );
+    assert_eq!(short.room_runs(), Some((1, 1)), "it waits for a chunk");
+    assert!(super::waits_for_room(&error));
+    assert!(engine.registrations.is_empty(), "nothing registered");
+    assert_eq!(held(&device), before, "nothing taken");
+    // A kv chunk let go: the ring registers into a run.
+    let freed: Vec<u32> = kv.drain(..16).collect();
+    device.lock().unwrap().give_refs(list, &freed);
+    register_channel(Some(&roles), &mut engine, &plan, None, |engine, plan| {
+        Ok(engine.register_channel(plan)?)
+    })
+    .expect("it registers once a chunk is free");
+    assert!(adjacent(&engine.registrations[0].slots, PER_CHUNK));
 }

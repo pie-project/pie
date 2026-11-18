@@ -226,7 +226,8 @@ fn smem(rows: Option<(Rows, Rows)>) -> u32 {
     // either where a block holds 99 KiB (sm_86, sm_89, sm_120); else six
     // of quantized rows (five below sm_90) and the one they widen into,
     // four of bf16. A raw key holds the wider format's data and scales.
-    let small = crate::jit::max_shared_memory_per_block_optin().is_some_and(|bytes| bytes < 128 << 10);
+    let small =
+        crate::jit::max_shared_memory_per_block_optin().is_some_and(|bytes| bytes < 128 << 10);
     let stages = if small {
         2
     } else if crate::jit::compute_capability_major().is_some_and(|major| major < 9) {

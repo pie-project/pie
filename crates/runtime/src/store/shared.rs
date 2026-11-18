@@ -84,6 +84,10 @@ struct RungGate {
     /// the cap once no step past it is (the scheduler holds back a launch
     /// past the cap), so the walker may lower the pool's rung behind it.
     grant: std::sync::atomic::AtomicU32,
+    /// The rows of the rung the engine holds ([`SharedPool::engine_rung`],
+    /// `u32::MAX` at the largest and where no pool steers the engine): no
+    /// step wider reaches it ([`engine_rows`]).
+    held: std::sync::atomic::AtomicU32,
     /// The event every wait on the activation rung waits on: the fire cap
     /// moved, a raise was applied, copied or refused, the rung was lowered,
     /// segments were committed, or room was freed (a fire retired).
@@ -113,6 +117,7 @@ fn rung_gate(engine: usize) -> &'static RungGate {
             Box::leak(Box::new(RungGate {
                 cap: std::sync::atomic::AtomicU32::new(u32::MAX),
                 grant: std::sync::atomic::AtomicU32::new(u32::MAX),
+                held: std::sync::atomic::AtomicU32::new(u32::MAX),
                 event: tokio::sync::Notify::new(),
                 walk: tokio::sync::Notify::new(),
             }))
@@ -174,11 +179,31 @@ pub(crate) fn set_fire_cap_for_test(engine: usize, tokens: u32) {
     set_fire_cap(engine, tokens);
 }
 
+/// Publishes the rows of the rung `engine` holds as a steering pool
+/// would: for a test of what the lane refuses.
+#[cfg(test)]
+pub(crate) fn set_engine_rows_for_test(engine: usize, rows: u32) {
+    rung_gate(engine)
+        .held
+        .store(rows, std::sync::atomic::Ordering::Release);
+}
+
 fn set_fire_cap(engine: usize, tokens: u32) {
     rung_gate(engine)
         .cap
         .store(tokens, std::sync::atomic::Ordering::Release);
     rung_changed(engine);
+}
+
+/// The rows a step on `engine` may take: the rung the engine holds
+/// ([`SharedPool::engine_rung`]), `u32::MAX` at the largest rung and where
+/// no pool steers it. The lane refuses a step wider by name before the
+/// engine stages it.
+#[must_use]
+pub fn engine_rows(engine: usize) -> u32 {
+    rung_gate(engine)
+        .held
+        .load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// The scheduler of `engine` has no step wider than `cap` in flight, and
@@ -304,7 +329,7 @@ pub fn raise_now(shared: &Shared, engine: usize, rows: u32) {
             rung
         }
     };
-    if pool.pool().act_chunks(goal) > pool.pool().act_reserved() {
+    if pool.raise_owed(goal) {
         let Some(at) = pool.raise_at(goal) else {
             return;
         };
@@ -312,15 +337,22 @@ pub fn raise_now(shared: &Shared, engine: usize, rows: u32) {
             return;
         };
         let stood = pool.stands_at(at);
-        if pool.raise_waits(&evacuation) || pool.raise_applied(&evacuation).is_err() {
+        if pool.raise_waits(&evacuation) {
+            // The engine hears it first: the walk's to take.
+            drop(pool);
+            ask_walk(engine);
+            return;
+        }
+        if pool.raise_applied(&evacuation).is_err() {
             return;
         }
         raise_said(engine, at, 0, stood);
         rung_changed(engine);
     }
-    // The rung holds `goal` now: fires may take its width, once a raise's
-    // copy is the engine's.
-    if pool.copying().is_some() {
+    // The rung holds `goal` now, and the engine was told it: fires may
+    // take its width, once a raise's copy is the engine's and no lower's
+    // narrow is under way.
+    if pool.copying().is_some() || pool.lowering() {
         return;
     }
     let cap = lifted(goal);
@@ -404,9 +436,12 @@ impl RungWalk {
         // The walk moves by what the goal's activation takes against what
         // is set aside now. Rungs whose activation takes as many chunks are
         // one class: the pool sets aside the same span for each, so a move
-        // within a class only caps fires, never lowers or raises (and a
-        // cap down there, freeing nothing, is one the walker leaves:
-        // `SharedGrow::walk_rung`). A
+        // down within a class only caps fires, never lowers (and a cap
+        // down there, freeing nothing, is one the walker leaves:
+        // `SharedGrow::walk_rung`). A move up past the rung the engine was
+        // told is a raise even within a class: the engine lays a fire's
+        // inputs for the rung it holds, so it hears the wider one before
+        // any fire takes it ([`SharedPool::raise_owed`]). A
         // program's fire term registered or dropped since moves the span a
         // rung takes ([`programs`]).
         let want = pool.pool().act_chunks(goal);
@@ -441,7 +476,7 @@ impl RungWalk {
             });
         }
         self.lowering = None;
-        if want > have {
+        if pool.raise_owed(goal) {
             // Never under the rung the engine holds: only a lower, above,
             // brings it down ([`SharedPool::raise_at`]).
             let rung = pool.raise_at(goal).unwrap_or(goal);
@@ -721,11 +756,19 @@ pub struct SharedPool {
     /// [`Self::told`] before the raise whose copy is the engine's to take:
     /// what a refused raise goes back to.
     told_from: Option<u32>,
+    /// The rung a lower has told the engine and the engine has not yet
+    /// come down to ([`Self::lower_notice`]): until its narrow lands the
+    /// engine holds [`Self::told`], so that rung's activation stays set
+    /// aside, no raise is taken past it and no cap is lifted.
+    lowering: Option<u32>,
     /// The engine refused the last `commit_span`: no span segment is asked
     /// again until room is freed ([`Self::block_span_commit`]).
     span_commit_blocked: bool,
     /// The registered programs' fire terms ([`programs`]).
     programs: programs::ProgramFires,
+    /// The engine whose rung gate this pool publishes the rung it holds
+    /// to ([`Self::steers`], [`engine_rows`]).
+    engine: Option<usize>,
 }
 
 /// The fence epoch a raise's moved-off chunks wait on until the engine has
@@ -969,8 +1012,10 @@ impl SharedPool {
             raise_from: None,
             told: 0,
             told_from: None,
+            lowering: None,
             span_commit_blocked: false,
             programs: programs::ProgramFires::default(),
+            engine: None,
         };
         // The engine holds the rung the pool starts at.
         shared.told = shared.pool.rung();
@@ -1038,6 +1083,16 @@ impl SharedPool {
     #[must_use]
     pub fn roles(&self) -> RoleShapes {
         self.roles
+    }
+
+    /// The kv list slots that, moved out whole, free `chunks` chunks: what
+    /// a guest bind short of room is short, in pages
+    /// (`planner::PoolPort::chunks_as_pages`).
+    #[must_use]
+    pub fn list_slots_for_chunks(&self, chunks: u32) -> u64 {
+        self.list.map_or(0, |list| {
+            u64::from(chunks) * u64::from(list.slots_per_chunk)
+        })
     }
 
     /// The kv list slots whose chunks, let go whole, hold `rs` of the state
@@ -1251,6 +1306,14 @@ impl SharedPool {
         }
     }
 
+    /// The slots a chunk of pool shape `shape` holds (1 where it is none).
+    #[must_use]
+    pub fn chunk_slots(&self, shape: ShapeId) -> u32 {
+        self.pool
+            .shape(shape)
+            .map_or(1, |s| s.slots_per_chunk.max(1))
+    }
+
     /// `n` fresh slots of `shape` for the store, as slot refs; none when
     /// they do not all fit.
     pub fn take_refs(&mut self, shape: ShapeId, n: u64) -> Option<Vec<u32>> {
@@ -1262,6 +1325,19 @@ impl SharedPool {
     /// refs in order ([`SlotPool::acquire_run`]).
     pub fn take_run(&mut self, shape: ShapeId, n: u64) -> Result<Vec<u32>, SlotError> {
         let slots = self.pool.acquire_run(STORE, shape, n)?;
+        Ok(slots.iter().map(|&slot| self.pool.slot_ref(slot)).collect())
+    }
+
+    /// `pieces` runs of `run` adjacent whole chunks of `shape` for the
+    /// store, each inside one segment, as slot refs in order
+    /// ([`SlotPool::acquire_chunk_runs`]).
+    pub fn take_chunk_runs(
+        &mut self,
+        shape: ShapeId,
+        run: u32,
+        pieces: u32,
+    ) -> Result<Vec<u32>, SlotError> {
+        let slots = self.pool.acquire_chunk_runs(STORE, shape, run, pieces)?;
         Ok(slots.iter().map(|&slot| self.pool.slot_ref(slot)).collect())
     }
 
@@ -1617,6 +1693,12 @@ impl SharedPool {
         if self.told_unfit() {
             return None;
         }
+        // A lower's narrow under way: the engine holds the rung it was told
+        // before, and a raise past it would tell it a rung while it comes
+        // down; it waits for the narrow to land.
+        if self.lowering.is_some() && self.pool.rung_of(rung) > self.told {
+            return None;
+        }
         Some(if self.told > self.pool.rung_of(rung) {
             self.told
         } else {
@@ -1630,7 +1712,45 @@ impl SharedPool {
     fn tell(&mut self, rung: u32) -> Option<(u32, u32)> {
         let to = self.pool.rung_of(rung);
         let from = std::mem::replace(&mut self.told, to);
+        self.publish_held();
         (from != to && self.tells_rungs()).then_some((from, to))
+    }
+
+    /// The rung a step may take on the engine now: the one it was told and
+    /// has taken. A raise counts once the engine has it (its notice landed
+    /// and its copy taken, [`Self::raise_copied`]); a lower from the moment
+    /// its notice is sent ([`Self::lower_notice`]), so a fire handed out
+    /// after it never passes the narrower rung.
+    #[must_use]
+    pub fn engine_rung(&self) -> u32 {
+        let taken = self.told_from.unwrap_or(self.told);
+        self.lowering.map_or(taken, |to| to.min(taken))
+    }
+
+    /// Whether fires of `rung` wait on a raise: its activation takes more
+    /// than is set aside, or the engine was told a narrower rung (a rung of
+    /// the same chunk class too: the engine lays a fire's inputs for the
+    /// rung it holds, and hears a wider one before any fire takes it).
+    #[must_use]
+    pub fn raise_owed(&self, rung: u32) -> bool {
+        self.pool.act_chunks(rung) > self.pool.act_reserved()
+            || self.pool.rung_of(rung) > self.told
+    }
+
+    /// This pool steers `engine`: the rung it holds is published to the
+    /// engine's lane from here ([`engine_rows`]).
+    pub fn steers(&mut self, engine: usize) {
+        self.engine = Some(engine);
+        self.publish_held();
+    }
+
+    fn publish_held(&self) {
+        if let Some(engine) = self.engine {
+            rung_gate(engine).held.store(
+                self.lifted(self.engine_rung()),
+                std::sync::atomic::Ordering::Release,
+            );
+        }
     }
 
     /// The cap fires start at: the rung the pool starts at, lifted. The
@@ -1661,6 +1781,7 @@ impl SharedPool {
             self.told = told;
         }
         self.copying = None;
+        self.publish_held();
     }
 
     /// The engine has taken a raise's copy, carried by the fire at `epoch`
@@ -1671,6 +1792,7 @@ impl SharedPool {
         self.copying = None;
         self.raise_from = None;
         self.told_from = None;
+        self.publish_held();
     }
 
     /// The rung fires may not pass while a raise's copy is the engine's to
@@ -1875,6 +1997,53 @@ impl SharedPool {
     /// engine holding a wider rung is brought down to it (a guest term
     /// grew past the rung it holds, [`Self::told_unfit`]): what is set
     /// aside stays, and a raise at `rung` follows.
+    /// The first half of a lower that brings the engine down: the notice it
+    /// is sent (`Engine::set_rung(from, to)`), with nothing given back yet.
+    /// The engine holds [`Self::told`] until that notice lands, laying its
+    /// guests' tables and covering a bind's term at that rung, so what is
+    /// set aside for it stays until [`Self::lower_landed`] (a bind funded
+    /// meanwhile is funded at the rung the engine holds). A lower that
+    /// tells the engine nothing is taken at once ([`Self::lower_rung`]).
+    pub fn lower_notice(&mut self, rung: u32) -> Result<Option<(u32, u32)>, RungError> {
+        let to = self.pool.rung_of(rung);
+        let tells = self.tells_rungs() && self.told != to;
+        if !tells {
+            return self.lower_rung(rung);
+        }
+        if self.pool.act_chunks(rung) > self.pool.act_reserved() && self.told <= to {
+            return Err(RungError::Pool(SlotError::Occupied { rung, chunks: 0 }));
+        }
+        self.lowering = Some(to);
+        self.publish_held();
+        Ok(Some((self.told, to)))
+    }
+
+    /// The engine took a lower's notice ([`Self::lower_notice`]) and holds
+    /// `rung`'s from here: what it set aside above is given back. Where
+    /// the pool cannot lower now, what is set aside stays; the engine's
+    /// rung is still the one it holds.
+    pub fn lower_landed(&mut self, rung: u32) -> Result<(), RungError> {
+        self.lowering = None;
+        let lowered = self.lower_rung(rung).map(|_| ());
+        if lowered.is_err() {
+            let _ = self.tell(rung);
+        }
+        lowered
+    }
+
+    /// The engine refused a lower's notice: it holds the rung it held, and
+    /// nothing was given back.
+    pub fn lower_refused(&mut self) {
+        self.lowering = None;
+        self.publish_held();
+    }
+
+    /// Whether a lower's notice is under way ([`Self::lower_notice`]).
+    #[must_use]
+    pub fn lowering(&self) -> bool {
+        self.lowering.is_some()
+    }
+
     pub fn lower_rung(&mut self, rung: u32) -> Result<Option<(u32, u32)>, RungError> {
         if self.pool.act_chunks(rung) > self.pool.act_reserved() {
             if !self.tells_rungs() || self.told <= self.pool.rung_of(rung) {

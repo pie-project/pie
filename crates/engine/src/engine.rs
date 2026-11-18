@@ -9,10 +9,18 @@ use crate::error::{Error, Result};
 use crate::fire::{FrameId, FrameSubmission, FrameTicket, MediaEncode, Step};
 use crate::load::{LoadRequest, Loaded};
 use crate::program::{
-    BindExtents, BoundInstance, FireFacts, InstanceBinding, InstanceId, ProgramFacts, ProgramId,
+    BindExtents, BoundInstance, FireFacts, GuestState, InstanceBinding, InstanceId, ProgramFacts, ProgramId,
     ProgramRegistration, ReadoutFacts, Rebind, RingFacts,
 };
 use crate::transfer::{KvCopy, KvHandle, StateCopy};
+
+/// What a program's compile made, off the engine's thread, for the engine
+/// that prepared it ([`Engine::finish_program`]).
+pub struct Prepared(pub Box<dyn std::any::Any + Send>);
+
+/// A program's compile ([`Engine::prepare_program`]): run once, on any
+/// thread.
+pub type ProgramCompile = Box<dyn FnOnce() -> Prepared + Send>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct StepDone {
@@ -189,6 +197,24 @@ pub trait Engine: Send {
         Ok(())
     }
 
+    /// A registration in two steps, so the thread that fires does not
+    /// wait out a program's compile: this, on the engine's thread and
+    /// quick, hands back the program's compile, which the runtime runs on a
+    /// worker thread while the engine fires on; [`Engine::finish_program`],
+    /// on the engine's thread again, takes what the compile made and
+    /// answers the program's id. The program binds no instance until then.
+    fn prepare_program(&mut self, registration: &ProgramRegistration) -> Result<ProgramCompile>;
+
+    /// The second half of [`Engine::prepare_program`]: the program's id,
+    /// from what its compile made; a compile that refused refuses here, by
+    /// the program's name.
+    fn finish_program(&mut self, prepared: Prepared) -> Result<ProgramId>;
+
+    /// Releases a registered program no instance binds: its id answers
+    /// nothing after. The runtime closes one it could not learn the facts
+    /// of, so no registration that fails leaves a program behind.
+    fn close_program(&mut self, program: ProgramId) -> Result<()>;
+
     /// What an instance of a registered program holds in the pool's
     /// `Instance` and `Channel` slots, asked before the runtime takes them
     /// and binds. The default states none: the engine keeps its tables and
@@ -219,6 +245,19 @@ pub trait Engine: Send {
         Ok(FireFacts::default())
     }
 
+    /// What `program` bound at `extents` holds as state ([`GuestState`]):
+    /// each instance's scratch and the pair's, taken in the `Instance` role
+    /// at the bind ([`crate::ScratchPlace`]), held while bound, and told to
+    /// the engine in the binding ([`InstanceBinding::scratch`],
+    /// [`InstanceBinding::pair`]) and in every [`Rebind::Instance`]. Asked
+    /// at every bind, on the lane, before it is sent. The default states
+    /// none: an engine that lays its guests' scratch in the fire's span
+    /// ([`Self::fire_facts`]) states it there until it moves it here.
+    fn guest_state(&self, program: ProgramId, extents: &BindExtents) -> Result<GuestState> {
+        let _ = (program, extents);
+        Ok(GuestState::default())
+    }
+
     /// What the rows a fire reads out take ([`ReadoutFacts`]): the bytes a
     /// row beside the model's activation, or none where they land inside
     /// the span already, and the rows a fixed store holds, if any. Asked
@@ -245,6 +284,20 @@ pub trait Engine: Send {
     fn standing_after(&self, binding: &InstanceBinding) -> Result<u64> {
         let _ = binding;
         Ok(0)
+    }
+
+    /// Whether [`Engine::register_channel`] takes `registration`: the
+    /// engine then holds the channel's ring (in its `Channel` slots, or
+    /// itself, as a host mirror), and an instance bound on the channel
+    /// reads that ring. `false` where it answers `Unsupported`: the runtime
+    /// keeps the channel alone, and each instance holds its own ring in
+    /// slots of its own ([`InstanceBinding::ring_slots`]). A fact of the
+    /// registration, asked before anything of a bind is taken, so a bind
+    /// that registers a channel takes its instance's rings by it. The
+    /// default holds none, as the default `register_channel` takes none.
+    fn holds_channel(&self, registration: &ChannelRegistration) -> bool {
+        let _ = registration;
+        false
     }
 
     /// The `Channel` slots a registered channel's ring takes, asked before

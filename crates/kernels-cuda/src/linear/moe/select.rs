@@ -179,14 +179,14 @@ pub(crate) fn tc5_worth(
     tokens: u32,
     routes: u32,
 ) -> bool {
-    ctx.tuning().moe_tc5
-        && (tokens >= ctx.tuning().moe_tc5_from || routes >= 2 * count || routes > MAX_GRID_Y)
+    crate::linear::gemm_sm100::supported()
         && x.dtype == Dtype::Bf16
         && bank == Dtype::Bf16
         && !experts.streams()
         && x.width.is_multiple_of(64)
         && y.width.is_multiple_of(64)
-        && crate::linear::gemm_sm100::supported()
+        && ctx.tuning().moe_tc5()
+        && (tokens >= ctx.tuning().moe_tc5_from() || routes >= 2 * count || routes > MAX_GRID_Y)
 }
 
 /// `y[route] = x[route or its token] . W[routes[route]]^T` on one grouped
@@ -288,7 +288,7 @@ pub(super) fn grouped_worth(
     fan: &Selected,
     experts: ExpertTable,
 ) -> Option<u32> {
-    if !ctx.tuning().moe_grouped {
+    if !ctx.tuning().moe_grouped() {
         return None;
     }
     if experts.streams() || !matches!(ctx.stage(), ArgValue::Ptr(0)) {
@@ -305,7 +305,7 @@ pub(super) fn grouped_worth(
         return None;
     }
     let per_expert = fan.route_count.div_ceil(count);
-    if per_expert < ctx.tuning().moe_group_at {
+    if per_expert < ctx.tuning().moe_group_at() {
         return None;
     }
     let block = block_rows(per_expert);
@@ -574,7 +574,7 @@ pub(crate) fn select_gemv(
                 [y.width.div_ceil(GEMV_WARPS * ROWS), grid_y, grid_z],
                 [WARP, GEMV_WARPS, 1],
             )
-            .programmatic(ctx.tuning().pdl),
+            .programmatic(ctx.tuning().pdl()),
         ),
         &[
             routes.arg(),

@@ -168,7 +168,7 @@ pub(crate) fn fold(ctx: &Ctx, op: &'static str, split: &Partials) -> Result<bool
     // With sinks the warp fold takes every batch: it lands them in the same
     // pass, which outweighs the staged merge's edge on a narrow batch.
     let pairs = split.max_seq_len.saturating_mul(split.num_heads);
-    if ctx.tuning().merge_warp
+    if ctx.tuning().merge_warp()
         && head_dim.is_multiple_of(64)
         && (pairs >= num_sms * 8 || split.sinks != 0)
     {
@@ -188,7 +188,7 @@ pub(crate) fn fold(ctx: &Ctx, op: &'static str, split: &Partials) -> Result<bool
         Fire::at(merge).apply(
             Launch::grid([blocks, 1, 1], [bdx, bdy, 1])
                 .smem(smem)
-                .programmatic(ctx.tuning().pdl),
+                .programmatic(ctx.tuning().pdl()),
         ),
         &[
             ArgValue::Ptr(split.tmp_v),

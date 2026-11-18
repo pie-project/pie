@@ -27,7 +27,7 @@ constant bool pie_fc_pages = is_function_constant_defined(pie_fc_k_page) &&
 // its page in that buffer under them, and a kernel reaches buffer `b` from
 // the plane bound in the first by buffer `b`'s address less the first's:
 // entry `b` of the delta table at device address `pie_fc_part_table` (bytes,
-// wrapping), which lies in the pool's first buffer. Function constants,
+// wrapping), a buffer of its own outside the pool. Function constants,
 // fixed for a load, so a pool of one buffer compiles to `page * stride`,
 // bit for bit.
 constant bool pie_fc_pool_split [[function_constant(2)]];

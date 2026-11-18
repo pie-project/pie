@@ -1303,10 +1303,12 @@ impl Pools {
     }
 
     /// The page table of [`Pools::tables`] the rows in the window list
-    /// (`windowed`) or in the kv list read.
+    /// (`windowed`) or in the kv list read. A load with no window list (its
+    /// window holds the whole context, so it keeps none) reads windowed rows
+    /// from the kv list's table.
     #[must_use]
     pub fn table_of(&self, windowed: bool) -> usize {
-        usize::from(windowed && self.layout.kv().is_some())
+        usize::from(windowed && self.layout.kv().is_some() && self.layout.window().is_some())
     }
 
     #[must_use]

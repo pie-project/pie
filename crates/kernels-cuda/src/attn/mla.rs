@@ -403,7 +403,7 @@ fn dispatch_dense(
     // A rope part other than 64 wide (GLM-5.3-Flash's none) is the naive
     // kernel's too: the FA2 arms read a 64-wide one beside the latent.
     // An fp8 pool is the naive arm's tensor-core kernel's, which widens it.
-    if ctx.tuning().mla_naive
+    if ctx.tuning().mla_naive()
         || window.is_some()
         || layer.kv_lora_rank != 512
         || layer.rope_dim != 64

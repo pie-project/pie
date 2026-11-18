@@ -66,6 +66,18 @@ pub fn retire_stream(ordinal: i32, stream: *mut core::ffi::c_void, destroy: impl
     if let Some(slot) = usize::try_from(ordinal).ok().and_then(|at| STREAMS.get(at)) {
         slot.store(next, Ordering::Release);
     }
+    // What the stream enqueued lands before it goes, and no kept fence
+    // outlives it holding a mark of it: a mark's event belongs to the stream
+    // it was recorded on, and a query of it once the stream is destroyed
+    // reads freed state (on ROCm, a lock no thread holds). Every fence the
+    // stores can see then marks only live streams.
+    // SAFETY: the stream is live till `destroy`, and no recorder can reach
+    // it while `LIVE` is write-held.
+    unsafe { rt::cudaStreamSynchronize(stream.cast()) };
+    let stream = stream as usize;
+    pool::forget_stream(stream);
+    recycle::forget_stream(stream);
+    heap::forget_stream(stream);
     destroy();
 }
 
@@ -137,7 +149,11 @@ pub(crate) fn adopted(device: i32) -> bool {
 }
 
 /// An event recorded on a stream, destroyed once its last holder lets go.
-struct Mark(rt::cudaEvent_t);
+struct Mark {
+    event: rt::cudaEvent_t,
+    /// The stream the event was recorded on, which it belongs to.
+    stream: usize,
+}
 
 // SAFETY: the event is a process-wide device object, destroyed once.
 unsafe impl Send for Mark {}
@@ -154,7 +170,10 @@ impl Mark {
         {
             return None;
         }
-        let mark = Mark(event);
+        let mark = Mark {
+            event,
+            stream: stream as usize,
+        };
         // SAFETY: the event is the mark's own; the caller keeps `stream` live.
         (unsafe { rt::cudaEventRecord(event, stream.cast()) } == rt::cudaError::cudaSuccess)
             .then_some(mark)
@@ -162,14 +181,14 @@ impl Mark {
 
     fn landed(&self) -> bool {
         // SAFETY: the event is this mark's own.
-        unsafe { rt::cudaEventQuery(self.0) == rt::cudaError::cudaSuccess }
+        unsafe { rt::cudaEventQuery(self.event) == rt::cudaError::cudaSuccess }
     }
 }
 
 impl Drop for Mark {
     fn drop(&mut self) {
         // SAFETY: the event is this mark's own, destroyed once.
-        unsafe { rt::cudaEventDestroy(self.0) };
+        unsafe { rt::cudaEventDestroy(self.event) };
     }
 }
 
@@ -198,6 +217,12 @@ impl Fence {
 
     pub(crate) fn landed(&self) -> bool {
         self.0.iter().all(|mark| mark.landed())
+    }
+
+    /// Lets go of the marks recorded on `stream`, which has landed and is
+    /// being retired ([`retire_stream`]).
+    fn forget_stream(&mut self, stream: usize) {
+        self.0.retain(|mark| mark.stream != stream);
     }
 }
 
@@ -310,6 +335,25 @@ pub mod pool {
         Some((words, mirror, cells))
     }
 
+    /// `count` summed over every kept endpoint's fence.
+    pub(super) fn fences(count: &dyn Fn(&Fence) -> usize) -> usize {
+        let pool = POOL.lock().expect("pool lock poisoned");
+        pool.iter()
+            .flat_map(|map| map.values())
+            .flatten()
+            .map(|entry| count(&entry.fence))
+            .sum()
+    }
+
+    /// Drops `stream`'s marks from every kept endpoint's fence
+    /// ([`super::retire_stream`]).
+    pub(super) fn forget_stream(stream: usize) {
+        let mut pool = POOL.lock().expect("pool lock poisoned");
+        for entry in pool.iter_mut().flat_map(|map| map.values_mut()).flatten() {
+            entry.fence.forget_stream(stream);
+        }
+    }
+
     /// Keeps `held` for `key`'s shape behind a fence on the compute
     /// streams; frees it (by dropping) when the pool is full or the fence
     /// will not record.
@@ -364,6 +408,25 @@ pub(crate) mod recycle {
 
     fn kept() -> std::sync::MutexGuard<'static, Shelf> {
         KEPT.lock().expect("kept lock poisoned")
+    }
+
+    /// `count` summed over every kept buffer's fence.
+    pub(super) fn fences(count: &dyn Fn(&Fence) -> usize) -> usize {
+        let kept = kept();
+        kept.iter()
+            .flat_map(|map| map.values())
+            .flatten()
+            .map(|entry| count(&entry.fence))
+            .sum()
+    }
+
+    /// Drops `stream`'s marks from every kept buffer's fence
+    /// ([`super::retire_stream`]).
+    pub(super) fn forget_stream(stream: usize) {
+        let mut kept = kept();
+        for entry in kept.iter_mut().flat_map(|map| map.values_mut()).flatten() {
+            entry.fence.forget_stream(stream);
+        }
     }
 
     /// `bytes` of device memory: a kept buffer whose last reader has
@@ -568,6 +631,21 @@ static HEAP_MARK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsiz
 #[must_use]
 pub fn kept_bytes() -> usize {
     recycle::kept_bytes()
+}
+
+/// The marks the kept stores' fences hold of streams no live context owns:
+/// none, since a context's close lets go of every mark of its stream
+/// ([`retire_stream`]), and a take queries only live streams' events.
+#[must_use]
+pub fn dead_marks() -> usize {
+    let live: Vec<usize> = LIVE
+        .read()
+        .expect("live lock poisoned")
+        .iter()
+        .map(|entry| entry.stream)
+        .collect();
+    let dead = |fence: &Fence| fence.0.iter().filter(|mark| !live.contains(&mark.stream)).count();
+    pool::fences(&dead) + recycle::fences(&dead) + heap::fences(&dead)
 }
 
 /// Small memory carved from chunks made ahead and kept: pinned (a channel's
@@ -842,6 +920,26 @@ pub(crate) mod heap {
             ask_ahead(heap, key);
         }
         Ok(())
+    }
+
+    /// `count` summed over every kept cell's fence.
+    pub(super) fn fences(count: &dyn Fn(&Fence) -> usize) -> usize {
+        let all = locked(&heaps().heaps);
+        all.values()
+            .flat_map(|heap| heap.free.iter().flatten())
+            .map(|kept| count(&kept.fence))
+            .sum()
+    }
+
+    /// Drops `stream`'s marks from every kept cell's fence
+    /// ([`super::retire_stream`]).
+    pub(super) fn forget_stream(stream: usize) {
+        let mut all = locked(&heaps().heaps);
+        for heap in all.values_mut() {
+            for kept in heap.free.iter_mut().flatten() {
+                kept.fence.forget_stream(stream);
+            }
+        }
     }
 
     /// A cell of `class`: a freed one whose last reader has landed, else one

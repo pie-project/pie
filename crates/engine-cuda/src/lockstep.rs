@@ -720,6 +720,21 @@ impl Engine for Rank {
         self.with(|cuda| cuda.register_program(registration))
     }
 
+    fn prepare_program(
+        &mut self,
+        registration: &ProgramRegistration,
+    ) -> EngineResult<engine::ProgramCompile> {
+        self.with(|cuda| cuda.prepare_program(registration))
+    }
+
+    fn finish_program(&mut self, prepared: engine::Prepared) -> EngineResult<ProgramId> {
+        self.with(|cuda| cuda.finish_program(prepared))
+    }
+
+    fn close_program(&mut self, program: ProgramId) -> EngineResult<()> {
+        self.with(|cuda| cuda.close_program(program))
+    }
+
     fn program_facts(&self, program: ProgramId) -> EngineResult<engine::program::ProgramFacts> {
         match self.group.ranks[self.rank].try_lock().ok() {
             Some(rank) => rank.program_facts(program),
@@ -744,6 +759,12 @@ impl Engine for Rank {
                 "a rank is busy: a program's fire facts are asked between frames".to_string(),
             )),
         }
+    }
+
+    /// As the CUDA engine it steps.
+    fn holds_channel(&self, registration: &ChannelRegistration) -> bool {
+        let _ = registration;
+        true
     }
 
     fn ring_facts(

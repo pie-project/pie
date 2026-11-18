@@ -1,7 +1,7 @@
 //! The hardware-dependent decisions the CUDA kernels read, and [`Tuning`]:
 //! the values one load runs under.
 
-use profile::{Anywhere, Decision, Profile, Registry};
+use profile::{Decision, Profile, Registry};
 
 /// Whether routed matmuls over bf16 or f16 banks take the grouped GEMM once
 /// an expert's routes pay for it; off, every route reads its expert alone.
@@ -629,16 +629,6 @@ pub struct SdpaIndexSplitUntil(pub u32);
 #[decision(id = "kernel.gemm.narrow_n", constant(range(0..=8)), default = 0, tune = search)]
 pub struct GemmNarrowN(pub u32);
 
-/// Whether a small decode batch still splits its keys across blocks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.decode.split_small", flag, default = false, tune = search)]
-pub struct DecodeSplitSmall;
-
-/// Whether a sliding-window decode splits its keys across blocks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.decode.split_window", flag, default = false, tune = search)]
-pub struct DecodeSplitWindow;
-
 /// Whether a split decode chunk holds at least 128 keys, as the scheduler
 /// once floored it, rather than one page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -706,12 +696,6 @@ pub struct QmmSplitWideMax(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.sdpa.prefill.ctas_per_sm", constant(range(1..=8)), default = 2, tune = search)]
 pub struct PrefillCtasPerSm(pub u32);
-
-/// The most requests an eager decode serves with the static, unsplit
-/// schedule (which skips planning).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.decode.static_max_requests", constant(range(0..=65_536)), default = 512, tune = search)]
-pub struct DecodeStaticMaxRequests(pub u32);
 
 /// The cuBLASLt workspace, in MiB: more unlocks split-K and stream-K
 /// algorithms.
@@ -963,8 +947,6 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeGrouped>()
         .add::<MoeMxfp4Grouped>()
         .add::<MoeMxfp4Wmma>()
-        .add::<DecodeSplitSmall>()
-        .add::<DecodeSplitWindow>()
         .add::<DecodeChunkFloor128>()
         .add::<GemvBf16>()
         .add::<GemvSplitkMaxN>()
@@ -976,7 +958,6 @@ pub fn register(registry: &mut Registry) {
         .add::<QmmSplitThinMax>()
         .add::<QmmSplitWideMax>()
         .add::<PrefillCtasPerSm>()
-        .add::<DecodeStaticMaxRequests>()
         .add::<GemmWorkspaceMb>()
         .add::<GemmHeuristics>()
         .add::<GemmSkinnyRows>()
@@ -1097,36 +1078,98 @@ pub fn register(registry: &mut Registry) {
 
 /// [`Tuning`]'s fields, each with its registry default and its read off a
 /// profile: `on D` a flag decision, `get D` a constant one's value, `is
-/// D::V` whether a choice decision picks `V`.
+/// D::V` whether a choice decision picks `V`. Each field has an accessor of
+/// its name that records the decision as read on the profile it came from:
+/// a decision counts as read only where a dispatch consults it for the
+/// loaded model's shapes, so `pie tune` times it only on models it can move.
 macro_rules! tuning {
     ($($(#[$doc:meta])* $field:ident: $ty:ty = $default:expr, $how:ident $($decision:ident)::+;)*) => {
-        /// The kernel decisions one load runs under, read once from its profile.
+        /// The kernel decisions one load runs under, resolved once from its
+        /// profile; dispatch reads them through the accessors, which record
+        /// the read (a field read directly records nothing: for tests and
+        /// for code that sizes rather than dispatches).
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         pub struct Tuning {
             $($(#[$doc])* pub $field: $ty,)*
+            /// The profile's read flags, one a field: `None` for values
+            /// built by hand.
+            pub reads: Reads,
         }
+
+        #[allow(non_camel_case_types)]
+        enum Field { $($field,)* }
 
         impl Tuning {
             /// The registry defaults; a test holds the two equal.
-            pub const DEFAULT: Tuning = Tuning { $($field: $default,)* };
+            pub const DEFAULT: Tuning = Tuning { $($field: $default,)* reads: Reads(None) };
 
+            /// `profile`'s values, unread until a dispatch consults one.
             #[must_use]
             pub fn of(profile: &Profile) -> Tuning {
-                Tuning { $($field: tuning!(@read profile, $how $($decision)::+),)* }
+                let marks = vec![$(tuning!(@mark profile, $how $($decision)::+),)*];
+                Tuning {
+                    $($field: tuning!(@peek profile, $how $($decision)::+),)*
+                    reads: Reads(Some(Box::leak(marks.into_boxed_slice()))),
+                }
             }
+
+            $(
+                #[doc = concat!("`", stringify!($field), "`, recorded as read.")]
+                #[must_use]
+                #[inline]
+                pub fn $field(&self) -> $ty {
+                    self.reads.raise(Field::$field as usize);
+                    self.$field
+                }
+            )*
         }
     };
-    (@read $p:ident, on $d:ident) => { $p.on::<$d>(&Anywhere) };
-    (@read $p:ident, get $d:ident) => { $p.get::<$d>().0 };
-    (@read $p:ident, is $d:ident :: $v:ident) => { *$p.get::<$d>() == $d::$v };
+    (@peek $p:ident, on $d:ident) => { $p.peek::<$d>().is_some() };
+    (@peek $p:ident, get $d:ident) => { $p.peek::<$d>().expect("a constant is total").0 };
+    (@peek $p:ident, is $d:ident :: $v:ident) => {
+        *$p.peek::<$d>().expect("a choice is total") == $d::$v
+    };
+    (@mark $p:ident, $how:ident $d:ident $(:: $v:ident)?) => { $p.mark::<$d>() };
+}
+
+/// Where a [`Tuning`]'s reads land: its profile's read flags, one a field,
+/// held for the life of the process (a load's tuning is copied onto every
+/// stream it opens). Equal whatever it holds: two tunings with the same
+/// values are the same tuning.
+#[derive(Clone, Copy, Default)]
+pub struct Reads(Option<&'static [profile::Mark]>);
+
+impl Reads {
+    #[inline]
+    fn raise(self, field: usize) {
+        if let Some(marks) = self.0 {
+            marks[field].raise();
+        }
+    }
+}
+
+impl PartialEq for Reads {
+    fn eq(&self, _: &Reads) -> bool {
+        true
+    }
+}
+
+impl Eq for Reads {}
+
+impl std::fmt::Debug for Reads {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "Reads(profile)"
+        } else {
+            "Reads(none)"
+        })
+    }
 }
 
 tuning! {
     moe_grouped: bool = true, on MoeGrouped;
     mxfp4_grouped: bool = true, on MoeMxfp4Grouped;
     mxfp4_wmma: bool = true, on MoeMxfp4Wmma;
-    decode_split_small: bool = false, on DecodeSplitSmall;
-    decode_split_window: bool = false, on DecodeSplitWindow;
     decode_chunk_floor_128: bool = false, on DecodeChunkFloor128;
     /// `kernel.gemv.bf16 = narrow`.
     gemv_narrow: bool = false, is GemvBf16::Narrow;
@@ -1140,7 +1183,6 @@ tuning! {
     qmm_split_thin_max: u32 = 32, get QmmSplitThinMax;
     qmm_split_wide_max: u32 = 16, get QmmSplitWideMax;
     prefill_ctas_per_sm: u32 = 2, get PrefillCtasPerSm;
-    decode_static_max_requests: u32 = 512, get DecodeStaticMaxRequests;
     gemm_workspace_mb: u32 = 8, get GemmWorkspaceMb;
     gemm_heuristics: u32 = 8, get GemmHeuristics;
     gemm_skinny_rows: u32 = 64, get GemmSkinnyRows;

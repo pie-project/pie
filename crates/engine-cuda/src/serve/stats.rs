@@ -26,9 +26,15 @@ impl Shell {
     /// The regions whose attention stages at a prefill's width, and the
     /// width (`crate::window::Staging`).
     pub(crate) fn staging(&self) -> crate::window::Staging<'_> {
+        // A load with no staging attention never asks its width.
+        let stages = self.staging.contains(&true);
         crate::window::Staging {
             regions: &self.staging,
-            from: self.device.ctx().tuning().compressed_prefill_from,
+            from: if stages {
+                self.device.ctx().tuning().compressed_prefill_from()
+            } else {
+                0
+            },
         }
     }
 
@@ -92,6 +98,13 @@ impl Shell {
     #[must_use]
     pub fn mode(&self) -> Graphs {
         self.graphs
+    }
+
+    /// The rungs this load weighed its top by and the estimate it weighed
+    /// them with: what a check of the estimate reads.
+    #[must_use]
+    pub fn weighed(&self) -> Option<&crate::top::Weighed> {
+        self.weighed.as_ref()
     }
 
     #[must_use]

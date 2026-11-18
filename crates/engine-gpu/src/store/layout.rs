@@ -332,6 +332,23 @@ impl Layout {
         self.shapes().map(Slots::seat_chunks).sum()
     }
 
+    /// Refused by name where the seats' runs (past the null chunk) pass the
+    /// `state` chunks the pool holds below its activation span: a
+    /// seat-addressed fire of the last seat would name a chunk the pool
+    /// does not hold for state.
+    pub fn seats_within(&self, state: u32) -> Result<()> {
+        let need = 1 + u64::from(self.seat_chunks());
+        if need > u64::from(state) {
+            return Err(Fault::Ceiling {
+                what: "chunks the seats' runs take below the activation span (each seat the \
+                       load is asked for takes a full-context run of every slot shape)",
+                need,
+                have: u64::from(state),
+            });
+        }
+        Ok(())
+    }
+
     /// What an rs-list page id counts: `gcd(chunk, rs slot)`.
     #[must_use]
     pub fn rs_stride(&self) -> u64 {
@@ -476,6 +493,59 @@ impl Layout {
             disk_kept: false,
             weights: Vec::new(),
             record_bytes: 0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Layout;
+    use crate::error::Fault;
+
+    /// Qwen3.5-0.8B's layout on a 32 GB card: 2304000-byte chunks, kv pages
+    /// ten a chunk, a record a chunk a piece (nine pieces), rs slots ten a
+    /// chunk, a 4096-token context of 16-row pages, and a pool of 4915
+    /// chunks whose top 1295 are the activation span. Laid for 256 seats
+    /// (what a served load asked for) the runs span 15412 chunks and seat
+    /// 0's first record piece is chunk 6555, past the pool, which the card
+    /// refused at the naming walk's first recurrent lane; such a layout is
+    /// now refused by name at the load. Laid for the seats the load's
+    /// widest seat-addressed fire takes, every seat's last ref of every
+    /// shape lies below the span.
+    #[test]
+    fn the_seats_a_load_lays_lie_in_its_pool_or_the_load_is_refused() {
+        let (chunk, total, span) = (2_304_000u64, 4915u32, 1295u32);
+        let lay = |seats: u32| {
+            Layout::new(chunk, total, 1639, 16, [230_400, 2_304_000], 9, seats, 256)
+                .and_then(|layout| layout.with_rs(226_304, 1, 256))
+                .unwrap()
+        };
+        let served = lay(256);
+        assert_eq!(served.seat_chunks(), 6554 + 2304 + 6554);
+        assert_eq!(served.fixed.unwrap().seat_chunk, 6555, "past the pool");
+        assert!(matches!(
+            served.seats_within(total - span),
+            Err(Fault::Ceiling {
+                need: 15413,
+                have: 3620,
+                ..
+            })
+        ));
+
+        let widest = lay(3);
+        widest.seats_within(total - span).unwrap();
+        for shape in widest.shapes().filter(|shape| shape.seat_slots > 0) {
+            let last = shape.seat_ref(shape.seat_slots - 1).unwrap();
+            assert!(
+                shape.split(last).0 < total - span,
+                "shape {} names chunk {} past the state chunks",
+                shape.id,
+                shape.split(last).0
+            );
+            assert!(matches!(
+                shape.seat_ref(shape.seat_slots),
+                Err(Fault::Ceiling { .. })
+            ));
         }
     }
 }

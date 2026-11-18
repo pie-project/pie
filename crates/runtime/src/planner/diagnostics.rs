@@ -43,6 +43,7 @@ pub struct PlannerDiagnostics {
     pub restore_faults_total: u64,
     pub restores_total: u64,
     pub restore_failures_total: u64,
+    pub restore_roles_short_total: u64,
     pub gate_parks_total: u64,
     pub arrival_waits_total: u64,
     pub device_pages_arriving: u32,
@@ -172,6 +173,7 @@ impl ResidencyPlanner {
             restore_faults_total: self.stats.restore_faults.load(Relaxed),
             restores_total: self.stats.restores.load(Relaxed),
             restore_failures_total: self.stats.restore_failures.load(Relaxed),
+            restore_roles_short_total: self.stats.restore_roles_short.load(Relaxed),
             gate_parks_total: self.stats.gate_parks.load(Relaxed),
             arrival_waits_total: self.stats.arrival_waits.load(Relaxed),
             device_pages_arriving: self.port.device_arriving(),
@@ -225,6 +227,12 @@ impl ResidencyPlanner {
                         WaitKind::Restore { demand } => {
                             format!("restore kv={} rs={}", demand.kv_pages, demand.rs)
                         }
+                        WaitKind::BindRoom {
+                            run,
+                            pieces,
+                            served,
+                            ..
+                        } => format!("bind room {pieces} runs of {run} served={served}"),
                     };
                     format!("{key:?} pid={} {kind}", waiter.pid)
                 })
