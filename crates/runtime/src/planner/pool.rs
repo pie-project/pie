@@ -42,6 +42,12 @@ pub trait PoolPort: Send + Sync + 'static {
     fn reclaim_idle(&self) -> u32;
     /// Called until it frees nothing, without freeing them.
     fn reclaimable_idle(&self) -> u32;
+    /// The host and disk slots only idle cache holds, `(host, disk)`: below
+    /// the device what the next demand may take by dropping them, so the
+    /// pressure report counts them as room, as [`Self::reclaimable_idle`]
+    /// is on the device. Every port states it; a pool with no tier below
+    /// the device states `(0, 0)`.
+    fn idle_below_device(&self) -> (u32, u32);
     fn suspend_capable(&self) -> bool;
     fn locus(&self) -> (usize, usize);
     /// The rs units a seated lane may still claim as it decodes: a window
@@ -269,6 +275,12 @@ impl PoolPort for RegistryPool {
         });
         *last = Some((crate::rt::Instant::now(), pages));
         pages
+    }
+
+    fn idle_below_device(&self) -> (u32, u32) {
+        self.with_kv_tagged("planner-idle-below-device", |kv| {
+            kv.below_device_cache_pages()
+        })
     }
 
     fn suspend_capable(&self) -> bool {
