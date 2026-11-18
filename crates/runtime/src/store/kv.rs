@@ -1028,7 +1028,12 @@ impl KvStore {
                     continue;
                 }
                 pages.truncate(room);
-                tracing::debug!(target: "pie::kv", pages = pages.len(), "demote");
+                let owners: Vec<String> = ids
+                    .iter()
+                    .filter_map(|id| self.cache.get(id).and_then(|entry| entry.owner))
+                    .map(|owner| owner.to_string())
+                    .collect();
+                tracing::debug!(target: "pie::kv", pages = pages.len(), key, last, ?owners, "demote");
                 let records = self.demote_records(&ids, pages.iter().map(|&(at, _)| at), key);
                 // A run split over the tiers would leave its disk tail
                 // following on from pages a restart loses: a persistent
