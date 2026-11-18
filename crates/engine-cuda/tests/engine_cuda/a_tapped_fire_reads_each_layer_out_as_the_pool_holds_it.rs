@@ -121,7 +121,7 @@ fn a_tapped_fire_reads_each_layer_out_as_the_pool_holds_it() {
         .and_then(|bytes| bytes.map(engine_cuda::store::Ring::pin).transpose())
         .expect("the staging ring pins");
     shell
-        .seat_host_kv(None, 1, CONTEXT, 1, ring)
+        .seat_host_kv(None, 1, ring)
         .expect("a host tier seats");
     let groups = shell.tap_groups().expect("a full-attention load taps");
     let told: Arc<Mutex<Vec<engine::Tapped>>> = Arc::default();

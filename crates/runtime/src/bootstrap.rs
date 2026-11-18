@@ -514,28 +514,46 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     let seat_to_end = !engine_configs.is_empty() && engine_configs.iter().all(|d| d.seat_to_end);
     let seat_spread = seat_to_end && engine_configs.iter().all(|d| d.seat_spread);
     if let Some(d) = engine_configs.first() {
-        if kv_swap_capable && crate::store::shared::SharedPool::states_shared(&d.chunks) {
-            // A shared pool states its tiers in chunks, not in the page
-            // fields its engine leaves at 0.
-            tracing::info!(
-                device_pages = d.chunks.kv_device_pages(),
-                host_chunks = d.chunks.host_chunks,
-                disk_chunks = d.chunks.disk_chunks,
-                chunk_bytes = d.chunks.chunk_bytes,
-                "kv tiers: suspended kv goes to the host, then the disk"
-            );
-        } else if kv_swap_capable {
-            tracing::info!(
-                device_pages = d.chunks.kv_device_pages(),
-                host_pages = d.chunks.kv_host_pages(),
-                disk_pages = d.chunks.kv_disk_pages(),
-                "kv tiers: suspended kv goes to the host, then the disk"
-            );
+        let shared = crate::store::shared::SharedPool::states_shared(&d.chunks);
+        // A shared pool states its tiers in chunks, not in the page fields
+        // its engine leaves at 0.
+        let (host, disk) = if shared {
+            (
+                u64::from(d.chunks.host_chunks),
+                u64::from(d.chunks.disk_chunks),
+            )
         } else {
+            (
+                u64::from(d.chunks.kv_host_pages()),
+                u64::from(d.chunks.kv_disk_pages()),
+            )
+        };
+        let tiers = match (host > 0, disk > 0) {
+            (true, true) => "kv tiers: suspended kv goes to the host, then the disk",
+            (true, false) => "kv tiers: suspended kv goes to the host; no disk tier",
+            (false, true) => "kv tiers: no host tier; suspended kv goes to the disk",
+            (false, false) => "",
+        };
+        if tiers.is_empty() {
             tracing::warn!(
                 device_pages = d.chunks.kv_device_pages(),
                 "no host or disk kv tier: pie cannot compute kv again, so kv \
                  pressure restarts processes"
+            );
+        } else if shared {
+            tracing::info!(
+                device_pages = d.chunks.kv_device_pages(),
+                host_chunks = host,
+                disk_chunks = disk,
+                chunk_bytes = d.chunks.chunk_bytes,
+                "{tiers}"
+            );
+        } else {
+            tracing::info!(
+                device_pages = d.chunks.kv_device_pages(),
+                host_pages = host,
+                disk_pages = disk,
+                "{tiers}"
             );
         }
     }

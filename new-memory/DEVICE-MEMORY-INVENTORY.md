@@ -118,6 +118,15 @@ Chosen numbers still in XLA's sizing path (TPU's audit at 7c114fc69; on TPU's li
 
 Fixed sizes: activation rungs 256 / 1024 / 4096; chunk 16 MiB (CUDA, ROCm, XLA target) or 4 MiB (Vulkan/wgpu); segments 64 MiB (Metal), 1 GiB (CUDA), a quarter of the pool (Vulkan/wgpu); default state slots 256; attention workspace grant at least 64 MiB float + 1 MiB int; slab grain 8 MiB / 256 KiB; hipBLASLt workspace 128 MiB; rocBLAS grouped cap 512 MiB; staged experts cap 1.5 GiB; recycle shelf 8 GiB; device heap 256 MiB chunks; Vulkan staging 256 MiB; upload batches 64 MiB; guest scratch cap 4 GiB; ring cap 64; rs replay 16; rs snapshots 4.
 
+### The host kv tier (ruled 2026-11-18)
+
+Removed, on every engine (CUDA too): `HOST_POOLS = 4` (the unstated tier held at most four device pools' worth) and "within half of the host's room" (half held back for other loads). Both were chosen numbers.
+
+The rule now (`engine::host`):
+- The host tier's ceiling is what the host can give: the smaller of `MemAvailable` and the memory cgroup's room (v2 `memory.max` / `memory.current` / `memory.stat`, else v1's), the cgroup's reclaimable file pages netted out of its usage, less `SAFETY_FLOOR_BYTES`, shared by ranks (`host_kv_ceiling`). A stated `budget_host` wins. A reading that cannot be taken is refused by name (Linux); where no reader is built, no tier is derived and the load says so.
+- The tier is seated at its ceiling and commits as it fills, on every engine: CUDA an anonymous reservation and a shelf pinned chunk by chunk (only its staging ring, two held sequences, is pinned at load); engine-gpu mapped host blocks of a pool segment allocated on their first copy (Vulkan) or calloc'd process memory (wgpu); XLA calloc'd process memory. A device whose memory is the host's (unified Metal; integrated, CPU or Android GPUs) seats none unless one is stated, and says so at load.
+- Its live target follows OS host-memory pressure with the device's `[engine.memory] yield` key: target = floor + (ceiling − floor) × (1 − yield × host_pressure), host pressure the OS's own reading (PSI memory on Linux; 0, stated, where there is none). With yield = 0 (the default) the target is the ceiling. The formula and the pressure reader are the governor's (sc/np-governor-yield); until they land the tier stands at its ceiling.
+
 ## 6. Defects and risks found along the way
 
 Checked by re-reading the code:

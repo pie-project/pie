@@ -434,9 +434,9 @@ pub fn declared_context_that_fits(
 /// The staging ring's bytes for a host tier of this rank, sized from the
 /// trace before the load measures the device: two sequences at `context`
 /// beside their state rows, the most one step moves, within what the tier
-/// may take (the operator's `host` bytes shared by `ranks`, else half of
-/// what the host has free, as [`crate::Shell::seat_host_kv`] bounds its
-/// default), never under two of a one-page sequence's slots
+/// may take (the operator's `host` bytes shared by `ranks`, else the
+/// tier's ceiling, [`engine::host::host_kv_ceiling`], as
+/// [`crate::Shell::seat_host_kv`] seats it), never under two of a one-page sequence's slots
 /// ([`host::staging_ring`]). A sequence moves between steps, as it is held
 /// between fires: a windowed row its window alone, no fire's rows past it
 /// (`Paging::held`). `None` where no tier is stated.
@@ -452,7 +452,10 @@ pub fn staging_ring_for(
     let budget = match host {
         Some(0) => return Ok(None),
         Some(bytes) => (bytes / ranks).min(free),
-        None => free / 2,
+        None => engine::host::host_kv_ceiling(
+            &crate::weights::host_memory(),
+            u32::try_from(ranks).unwrap_or(u32::MAX),
+        ),
     };
     let page_size = page_size.max(1);
     let window = window_of(trace)?;

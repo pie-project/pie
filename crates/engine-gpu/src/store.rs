@@ -615,18 +615,15 @@ impl<B: Backend> Pools<B> {
         let list_slots = layout.list.map_or(0, |list| {
             u64::from(list.per_chunk) * u64::from(layout.total_chunks)
         });
+        let _ = device;
+        // The tier is seated at its ceiling and commits as it fills: mapped
+        // host memory a segment of chunks at a time, on its first copy;
+        // process memory calloc'd, its pages touched as copies land.
         let host = if B::MAPS_HOST {
-            HostChunks::Mapped(
-                (host_chunks > 0)
-                    .then(|| {
-                        B::Buffer::host(
-                            device,
-                            u64::from(host_chunks) * layout.chunk_bytes,
-                            crate::books::owners::HOST_POOL,
-                        )
-                    })
-                    .transpose()?,
-            )
+            HostChunks::Mapped(HostBlocks::new(
+                u64::from(host_chunks) * layout.chunk_bytes,
+                u64::from(layout.segment_chunks.max(1)) * layout.chunk_bytes,
+            ))
         } else {
             HostChunks::Heap(vec![
                 0u8;
@@ -1345,12 +1342,8 @@ impl<B: Backend> Pools<B> {
             }
             (src, MemoryDomain::HostPinned) if here(src) => {
                 let bytes = self.shape(copy.shape)?.slot_bytes;
-                let host = match &self.host {
-                    HostChunks::Mapped(host) => host.as_ref().ok_or(Fault::Ceiling {
-                        what: "host chunks of the state pool",
-                        need: 1,
-                        have: 0,
-                    })?,
+                match &self.host {
+                    HostChunks::Mapped(_) => {}
                     HostChunks::Heap(_) => {
                         let bytes = usize::try_from(bytes).unwrap_or(0);
                         for &(slot, at) in &copy.slots {
@@ -1365,27 +1358,23 @@ impl<B: Backend> Pools<B> {
                         }
                         return Ok(());
                     }
-                };
+                }
                 for &(slot, at) in &copy.slots {
-                    let (buffer, local) = self.pool.locate(self.slot_offset(copy.shape, slot)?)?;
-                    frame.copy(
-                        buffer,
-                        local,
-                        host,
-                        self.host_offset(copy.shape, at)?,
-                        bytes,
-                    )?;
+                    let from = self.slot_offset(copy.shape, slot)?;
+                    let to = self.host_offset(copy.shape, at)?;
+                    let HostChunks::Mapped(blocks) = &mut self.host else {
+                        unreachable!("matched above")
+                    };
+                    let (host, to) = blocks.backed(device, to, bytes)?;
+                    let (buffer, local) = self.pool.locate(from)?;
+                    frame.copy(buffer, local, host, to, bytes)?;
                 }
                 Ok(())
             }
             (MemoryDomain::HostPinned, dst) if here(dst) => {
                 let bytes = self.shape(copy.shape)?.slot_bytes;
-                let host = match &self.host {
-                    HostChunks::Mapped(host) => host.as_ref().ok_or(Fault::Ceiling {
-                        what: "host chunks of the state pool",
-                        need: 1,
-                        have: 0,
-                    })?,
+                match &self.host {
+                    HostChunks::Mapped(_) => {}
                     HostChunks::Heap(_) => {
                         let bytes = usize::try_from(bytes).unwrap_or(0);
                         for &(at, slot) in &copy.slots {
@@ -1399,16 +1388,16 @@ impl<B: Backend> Pools<B> {
                         }
                         return Ok(());
                     }
-                };
+                }
                 for &(at, slot) in &copy.slots {
-                    let (buffer, local) = self.pool.locate(self.slot_offset(copy.shape, slot)?)?;
-                    frame.copy(
-                        host,
-                        self.host_offset(copy.shape, at)?,
-                        buffer,
-                        local,
-                        bytes,
-                    )?;
+                    let to = self.slot_offset(copy.shape, slot)?;
+                    let from = self.host_offset(copy.shape, at)?;
+                    let HostChunks::Mapped(blocks) = &mut self.host else {
+                        unreachable!("matched above")
+                    };
+                    let (host, from) = blocks.backed(device, from, bytes)?;
+                    let (buffer, local) = self.pool.locate(to)?;
+                    frame.copy(host, from, buffer, local, bytes)?;
                 }
                 Ok(())
             }
@@ -1447,12 +1436,8 @@ impl<B: Backend> Pools<B> {
     /// caller has drained every frame.
     pub fn read_tier_slots(&self, slots: &[(ShapeId, Vec<u32>)]) -> Result<Vec<u8>> {
         let spans = self.tier_spans(slots)?;
-        let host = match &self.host {
-            HostChunks::Mapped(host) => host.as_ref().ok_or(Fault::Ceiling {
-                what: "host chunks of the state pool",
-                need: 1,
-                have: 0,
-            })?,
+        let blocks = match &self.host {
+            HostChunks::Mapped(blocks) => blocks,
             HostChunks::Heap(host) => {
                 let mut out = Vec::new();
                 for (offset, len) in spans {
@@ -1474,9 +1459,12 @@ impl<B: Backend> Pools<B> {
         let mut out = vec![0u8; usize::try_from(total).unwrap_or(usize::MAX)];
         let mut at = 0usize;
         for (offset, len) in spans {
-            let len = usize::try_from(len).unwrap_or(usize::MAX);
-            host.read(offset, &mut out[at..at + len])?;
-            at += len;
+            // A block no copy has reached holds zeros, as fresh memory does.
+            if let Some((host, local)) = blocks.at(offset, len)? {
+                let len = usize::try_from(len).unwrap_or(usize::MAX);
+                host.read(local, &mut out[at..at + len])?;
+            }
+            at += usize::try_from(len).unwrap_or(usize::MAX);
         }
         Ok(out)
     }
@@ -1485,7 +1473,12 @@ impl<B: Backend> Pools<B> {
     /// [`Self::read_tier_slots`] returns them, into host tier slots; refused
     /// whole when the byte count differs. The caller has drained every
     /// frame.
-    pub fn write_tier_slots(&mut self, slots: &[(ShapeId, Vec<u32>)], bytes: &[u8]) -> Result<()> {
+    pub fn write_tier_slots(
+        &mut self,
+        device: &B::Context,
+        slots: &[(ShapeId, Vec<u32>)],
+        bytes: &[u8],
+    ) -> Result<()> {
         let spans = self.tier_spans(slots)?;
         let need: u64 = spans.iter().map(|&(_, len)| len).sum();
         if bytes.len() as u64 != need {
@@ -1502,12 +1495,8 @@ impl<B: Backend> Pools<B> {
                 self.frozen.written(frozen::Tier::Host, refs);
             }
         }
-        let host = match &mut self.host {
-            HostChunks::Mapped(host) => host.as_mut().ok_or(Fault::Ceiling {
-                what: "host chunks of the state pool",
-                need: 1,
-                have: 0,
-            })?,
+        let blocks = match &mut self.host {
+            HostChunks::Mapped(blocks) => blocks,
             HostChunks::Heap(host) => {
                 let have = host.len() as u64;
                 if let Some(&(offset, len)) =
@@ -1531,8 +1520,9 @@ impl<B: Backend> Pools<B> {
         };
         let mut at = 0usize;
         for (offset, len) in spans {
+            let (host, local) = blocks.backed_mut(device, offset, len)?;
             let len = usize::try_from(len).unwrap_or(usize::MAX);
-            host.write(offset, &bytes[at..at + len])?;
+            host.write(local, &bytes[at..at + len])?;
             at += len;
         }
         Ok(())
@@ -1667,8 +1657,85 @@ impl<B: Backend> Pools<B> {
 /// and written through the queue.
 #[derive(Debug)]
 enum HostChunks<B: Backend> {
-    Mapped(Option<B::Buffer>),
+    Mapped(HostBlocks<B>),
     Heap(Vec<u8>),
+}
+
+/// Mapped host chunks, a block of `block` bytes (a segment of the device
+/// pool's chunks: its commit unit) allocated on the first copy that names
+/// it, so the tier, seated at its ceiling, holds only what has been moved
+/// to it. Host memory, not the device's: the device's ledger is untouched,
+/// and every block lies within the tier the load stated.
+#[derive(Debug)]
+struct HostBlocks<B: Backend> {
+    bytes: u64,
+    block: u64,
+    blocks: Vec<Option<B::Buffer>>,
+}
+
+impl<B: Backend> HostBlocks<B> {
+    fn new(bytes: u64, block: u64) -> HostBlocks<B> {
+        let block = block.max(1);
+        let count = usize::try_from(bytes.div_ceil(block)).unwrap_or(usize::MAX);
+        HostBlocks {
+            bytes,
+            block,
+            blocks: std::iter::repeat_with(|| None).take(count).collect(),
+        }
+    }
+
+    /// The block `len` bytes from `offset` lie in, and where in it; refused
+    /// where they pass the tier or cross a block (a slot lies in one chunk,
+    /// and a block is whole chunks).
+    fn place(&self, offset: u64, len: u64) -> Result<(usize, u64)> {
+        let end = offset.checked_add(len).filter(|&end| end <= self.bytes);
+        let index = offset / self.block;
+        let local = offset % self.block;
+        match end {
+            Some(_) if local + len <= self.block => {
+                Ok((usize::try_from(index).unwrap_or(usize::MAX), local))
+            }
+            _ => Err(Fault::Ceiling {
+                what: "bytes of the host chunks (one block)",
+                need: offset.saturating_add(len),
+                have: self.bytes,
+            }),
+        }
+    }
+
+    /// The block and offset of a span, where a copy has reached it.
+    fn at(&self, offset: u64, len: u64) -> Result<Option<(&B::Buffer, u64)>> {
+        let (index, local) = self.place(offset, len)?;
+        Ok(self.blocks[index].as_ref().map(|buffer| (buffer, local)))
+    }
+
+    /// The block and offset of a span, the block allocated now if no copy
+    /// has reached it.
+    fn backed(&mut self, device: &B::Context, offset: u64, len: u64) -> Result<(&B::Buffer, u64)> {
+        let (index, local) = self.place(offset, len)?;
+        let bytes = self.block.min(self.bytes - index as u64 * self.block);
+        let block = match &mut self.blocks[index] {
+            Some(block) => block,
+            empty => empty.insert(B::Buffer::host(
+                device,
+                bytes,
+                crate::books::owners::HOST_POOL,
+            )?),
+        };
+        Ok((block, local))
+    }
+
+    fn backed_mut(
+        &mut self,
+        device: &B::Context,
+        offset: u64,
+        len: u64,
+    ) -> Result<(&mut B::Buffer, u64)> {
+        self.backed(device, offset, len)?;
+        let (index, local) = self.place(offset, len)?;
+        let block = self.blocks[index].as_mut().ok_or(Fault::Deviceless)?;
+        Ok((block, local))
+    }
 }
 
 /// The bytes a batched spill stages at once.

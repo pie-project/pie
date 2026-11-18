@@ -14,7 +14,7 @@
 //! as v1's near-2^63 "unlimited", leaves the host to decide.
 //!
 //! An engine that has a host tier and is told no budget for it seats
-//! [`default_host_kv`] of this. A phone's or an integrated GPU's device
+//! [`host_kv_ceiling`] of this. A phone's or an integrated GPU's device
 //! memory is the host's and is sized by its own rule (lmkd's defended line,
 //! `engine-gpu`'s `host_memory`). This one is for a tier beside a device
 //! that has memory of its own.
@@ -142,42 +142,15 @@ fn field(text: &str, key: &str) -> Option<u64> {
     })
 }
 
-/// Device pools' worth of host kv the unstated default seats at most:
-/// pinned pages cost the driver ~0.2 s a GiB to give back when the process
-/// dies, holding every other process on the host meanwhile (128 GiB
-/// pinned: ~25 s), and an agent trace that suspends whole programs for long
-/// tool waits peaked at 1.7 pools; the disk tier takes what is past it.
-pub const HOST_POOLS: u64 = 4;
-
-/// The host kv tier a load seats when no budget is stated, and how it was
-/// reached.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HostKv {
-    /// What the host can give ([`HostMemory::free`]) less the floor.
-    pub free: u64,
-    /// What is left to other loads: half of `free`, since workers sharing
-    /// a host each seat theirs as they boot and the first must not take
-    /// the room the next one needs.
-    pub held_back: u64,
-    /// The tier's bytes.
-    pub budget: u64,
-}
-
-/// The unstated host kv tier: at least one device pool's worth (`pool`
-/// bytes), up to the bytes the load's `seated` sequences take at full
-/// context and at most [`HOST_POOLS`] pools, within half of what `host`
-/// can give past the floor ([`SAFETY_FLOOR_BYTES`]), shared by `ranks`.
+/// The host kv tier's ceiling: what the host can give
+/// ([`HostMemory::free`]) less the floor ([`SAFETY_FLOOR_BYTES`]), shared
+/// by `ranks`. A tier is seated at its ceiling and commits as it fills
+/// (every engine's tier is reserved, never touched ahead); its live target
+/// under host-memory pressure is the governor's, by the same `yield` rule
+/// as the device's (`new-memory/DEVICE-MEMORY-INVENTORY.md`).
 #[must_use]
-pub fn default_host_kv(host: &HostMemory, pool: u64, seated: u64, ranks: u32) -> HostKv {
-    let free = host.free().saturating_sub(SAFETY_FLOOR_BYTES) / u64::from(ranks.max(1));
-    let half = free / 2;
-    HostKv {
-        free,
-        held_back: free - half,
-        budget: pool
-            .max(seated.min(pool.saturating_mul(HOST_POOLS)))
-            .min(half),
-    }
+pub fn host_kv_ceiling(host: &HostMemory, ranks: u32) -> u64 {
+    host.free().saturating_sub(SAFETY_FLOOR_BYTES) / u64::from(ranks.max(1))
 }
 
 #[cfg(test)]
@@ -250,20 +223,13 @@ mod tests {
     }
 
     #[test]
-    fn the_default_tier_is_a_pool_up_to_its_seats_within_half_the_room() {
+    fn the_ceiling_is_the_hosts_room_past_the_floor_shared_by_ranks() {
         let host = HostMemory {
             available: 100 * GIB + SAFETY_FLOOR_BYTES,
             cgroup: None,
         };
-        // Seats past one pool, under four: the seats.
-        let kv = default_host_kv(&host, 10 * GIB, 25 * GIB, 1);
-        assert_eq!((kv.free, kv.held_back, kv.budget), (100 * GIB, 50 * GIB, 25 * GIB));
-        // Seats under one pool: one pool.
-        assert_eq!(default_host_kv(&host, 10 * GIB, 2 * GIB, 1).budget, 10 * GIB);
-        // Seats past four pools: four.
-        assert_eq!(default_host_kv(&host, 10 * GIB, 90 * GIB, 1).budget, 40 * GIB);
-        // Within half the room, shared by ranks.
-        assert_eq!(default_host_kv(&host, 10 * GIB, 90 * GIB, 2).budget, 25 * GIB);
+        assert_eq!(host_kv_ceiling(&host, 1), 100 * GIB);
+        assert_eq!(host_kv_ceiling(&host, 2), 50 * GIB);
         // A cgroup under the host's available decides.
         let boxed = HostMemory {
             available: 230 * GIB,
@@ -273,8 +239,6 @@ mod tests {
                 reclaimable: 30 * GIB,
             }),
         };
-        let kv = default_host_kv(&boxed, 20 * GIB, 60 * GIB, 1);
-        assert_eq!(kv.free, 52 * GIB - SAFETY_FLOOR_BYTES);
-        assert_eq!(kv.budget, (52 * GIB - SAFETY_FLOOR_BYTES) / 2);
+        assert_eq!(host_kv_ceiling(&boxed, 1), 52 * GIB - SAFETY_FLOOR_BYTES);
     }
 }

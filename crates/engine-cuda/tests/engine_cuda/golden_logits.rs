@@ -945,7 +945,7 @@ fn served_offloaded(fixture: &Fixture, cache: &Path, offload: bool) -> Vec<(u64,
         .and_then(|bytes| bytes.map(engine_cuda::store::Ring::pin).transpose())
         .expect("the staging ring pins");
     shell
-        .seat_host_kv(host, 1, CONTEXT, 1, ring)
+        .seat_host_kv(host, 1, ring)
         .expect("the host tier seats");
     if stated.is_some() {
         std::thread::sleep(std::time::Duration::from_secs(2));

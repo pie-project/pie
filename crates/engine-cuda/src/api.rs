@@ -741,8 +741,6 @@ impl Engine for Cuda {
         shell
             .seat_host_kv(
                 residency.host_kv_budget,
-                residency.kv_seats.unwrap_or(budgets.max_lanes),
-                budgets.max_context,
                 ranks,
                 ring,
             )

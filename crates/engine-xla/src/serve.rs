@@ -1310,10 +1310,10 @@ impl Shell {
         &self.pools
     }
 
-    /// Seats the host tier, `host` bytes of whole chunks (`None`: as many as
-    /// the device pool holds, within what the host can give by the shared
-    /// rule, [`engine::host::default_host_kv`]), and the slot file `disk`
-    /// names (`(dir, bytes, persistent)`), kv list slots.
+    /// Seats the host tier, `host` bytes of whole chunks (`None`: the tier's
+    /// ceiling by the shared rule, [`engine::host::host_kv_ceiling`]; the
+    /// tier is calloc'd, so it commits as copies land), and the slot file
+    /// `disk` names (`(dir, bytes, persistent)`), kv list slots.
     pub fn seat_tiers(
         &mut self,
         host: Option<u64>,
@@ -1323,24 +1323,22 @@ impl Shell {
         let chunks = match host {
             Some(bytes) => u32::try_from(bytes / chunk.max(1)).unwrap_or(u32::MAX),
             None => {
-                let pool = u64::from(self.pools.chunks().saturating_sub(2)) * chunk;
                 let host = engine::host::HostMemory::read().map_err(|why| Fault::Device {
                     call: "reading the host's memory for the host kv tier",
                     why,
                 })?;
-                let kv = engine::host::default_host_kv(&host, pool, pool, 1);
+                let ceiling = engine::host::host_kv_ceiling(&host, 1);
                 tracing::info!(
                     available = host.available,
                     cgroup_max = host.cgroup.map(|group| group.max),
                     cgroup_current = host.cgroup.map(|group| group.current),
                     cgroup_reclaimable = host.cgroup.map(|group| group.reclaimable),
-                    free = kv.free,
-                    held_back = kv.held_back,
-                    pool,
-                    budget = kv.budget,
-                    "the host kv tier is the device pool's worth within what the host can give"
+                    floor = engine::SAFETY_FLOOR_BYTES,
+                    ceiling,
+                    "the host kv tier is its ceiling, what the host can give past the floor; \
+                     it commits as it fills"
                 );
-                u32::try_from(kv.budget / chunk.max(1)).unwrap_or(u32::MAX)
+                u32::try_from(ceiling / chunk.max(1)).unwrap_or(u32::MAX)
             }
         };
         self.host = crate::store::tier::Host::new(chunks, chunk);

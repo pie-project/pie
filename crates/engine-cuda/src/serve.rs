@@ -468,10 +468,6 @@ impl Shell {
         0
     }
 
-    fn state_row_bytes(&self) -> u64 {
-        self.pools.state_slot_bytes()
-    }
-
     /// Copies full pages and token cells in the full kv rows. A windowed
     /// row's pages are named by the fire that reads them, so cells moved
     /// between pages here would leave its copy behind.
@@ -556,68 +552,45 @@ impl Shell {
     /// no tier), from `stated` bytes shared by `ranks`, within the host memory
     /// the load left: whole chunks of the state pool's size, every shape's
     /// slots parking in them, and as many host kv slots for byte reads
-    /// ([`Self::read_host_kv`], a tap's read-out). Unstated, it holds `seats`
-    /// sequences at `context` tokens beside every state row, and at least
-    /// one device pool's worth.
+    /// ([`Self::read_host_kv`], a tap's read-out). Unstated, the tier's
+    /// ceiling by the shared rule ([`engine::host::host_kv_ceiling`]).
     pub fn seat_host_kv(
         &mut self,
         stated: Option<u64>,
-        seats: u32,
-        context: u32,
         ranks: u32,
         ring: Option<crate::store::Ring>,
     ) -> Result<u32> {
         let ranks = u64::from(ranks.max(1));
-        let row = self.state_row_bytes();
-        let rows = if row > 0 {
-            self.pools.paging().slots
-        } else {
-            0
-        };
         let page = self.pools.paged_page_bytes();
-        let pages = self.pools.paging().pages();
-        let window_page = self.pools.window_page_bytes();
-        let window_pages = if window_page > 0 {
-            self.pools.paging().window_pages()
-        } else {
-            0
-        };
-        let whole = u64::from(rows) * row + pages * page + window_pages * window_page;
-        let page_tokens = u64::from(self.pools.paging().page_size.max(1));
-        let seated = u64::from(rows) * row
-            + u64::from(seats) * u64::from(context).div_ceil(page_tokens) * page;
-        // Unstated, the shared rule ([`engine::host::default_host_kv`]):
-        // a device pool's worth up to the seats, at most
-        // [`engine::host::HOST_POOLS`] pools, within half of what the host
-        // can give.
+        // Unstated, the host tier's ceiling by the shared rule
+        // ([`engine::host::host_kv_ceiling`]): what the host can give past
+        // the floor. It commits as it fills (an anonymous reservation and a
+        // shelf pinned chunk by chunk); only the staging ring is pinned at
+        // load.
         let budget = match stated {
             Some(bytes) => (bytes / ranks).min(crate::weights::available_memory() / ranks),
             None => {
                 let host = crate::weights::host_memory();
-                let kv = engine::host::default_host_kv(
-                    &host,
-                    whole,
-                    seated,
-                    u32::try_from(ranks).unwrap_or(u32::MAX),
-                );
+                let ceiling =
+                    engine::host::host_kv_ceiling(&host, u32::try_from(ranks).unwrap_or(u32::MAX));
                 let group = host.cgroup;
                 eprintln!(
-                    "engine-cuda: the host kv tier is {} MiB, derived from what the host can \
-                     give: MemAvailable {} MiB, cgroup max / current / reclaimable {} MiB, \
-                     {} MiB free past the floor, {} MiB held back for other loads, a device \
-                     pool {} MiB, its seats {} MiB",
-                    kv.budget >> 20,
+                    "engine-cuda: the host kv tier's ceiling is {} MiB, what the host can give \
+                     past the floor: MemAvailable {} MiB, cgroup max / current / reclaimable {}, \
+                     shared by {ranks} rank(s); it commits as it fills",
+                    ceiling >> 20,
                     host.available >> 20,
                     group.map_or_else(
                         || "none".to_string(),
-                        |g| format!("{} / {} / {}", g.max >> 20, g.current >> 20, g.reclaimable >> 20)
+                        |g| format!(
+                            "{} / {} / {} MiB",
+                            g.max >> 20,
+                            g.current >> 20,
+                            g.reclaimable >> 20
+                        )
                     ),
-                    kv.free >> 20,
-                    kv.held_back >> 20,
-                    whole >> 20,
-                    seated >> 20,
                 );
-                kv.budget
+                ceiling
             }
         };
         // Both from the one budget, pinned as they are first touched: the
