@@ -205,7 +205,7 @@ fn a_guest_slot_parks_on_the_host_and_comes_back() {
     );
 
     let ring =
-        engine_cuda::store::staging_ring_for(shell.trace(), PAGE, 256, 256, Some(crate::POOL), 1)
+        engine_cuda::store::staging_ring_for(shell.trace(), PAGE, 256, Some(crate::POOL), 1)
             .and_then(|bytes| bytes.map(engine_cuda::store::Ring::pin).transpose())
             .expect("the staging ring pins");
     shell

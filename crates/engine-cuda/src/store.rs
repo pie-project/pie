@@ -370,15 +370,17 @@ pub fn declared_context_that_fits(
     trace: &Trace,
     page_size: u32,
     declared: u32,
-    max_tokens: u32,
     allowance: engine::Allowance,
     weights: u64,
 ) -> Result<u32> {
     let page_size = page_size.max(1);
     let window = window_of(trace)?;
+    // A sequence as it is held between fires: a windowed row its window
+    // alone; a fire's rows past it are the activations' half, weighed per
+    // rung once the rung is ruled (`window_fire_bytes`).
     let one = |pages: u32| -> Result<u64> {
-        let paging = Paging::of(page_size, pages.saturating_mul(page_size), 1, 1)?
-            .windowed(window, max_tokens);
+        let paging =
+            Paging::of(page_size, pages.saturating_mul(page_size), 1, 1)?.held(window);
         one_slot_bytes(trace, paging)
     };
     let ceiling = load_ceiling(allowance, false)?;
@@ -408,12 +410,13 @@ pub fn declared_context_that_fits(
 /// may take (the operator's `host` bytes shared by `ranks`, else half of
 /// what the host has free, as [`crate::Shell::seat_host_kv`] bounds its
 /// default), never under two of a one-page sequence's slots
-/// ([`host::staging_ring`]). `None` where no tier is stated.
+/// ([`host::staging_ring`]). A sequence moves between steps, as it is held
+/// between fires: a windowed row its window alone, no fire's rows past it
+/// (`Paging::held`). `None` where no tier is stated.
 pub fn staging_ring_for(
     trace: &Trace,
     page_size: u32,
     context: u32,
-    max_tokens: u32,
     host: Option<u64>,
     ranks: u32,
 ) -> Result<Option<u64>> {
@@ -427,8 +430,7 @@ pub fn staging_ring_for(
     let page_size = page_size.max(1);
     let window = window_of(trace)?;
     let one = |tokens: u32| -> Result<u64> {
-        let paging =
-            Paging::of(page_size, tokens.max(page_size), 1, 1)?.windowed(window, max_tokens);
+        let paging = Paging::of(page_size, tokens.max(page_size), 1, 1)?.held(window);
         one_slot_bytes(trace, paging)
     };
     Ok(Some(host::staging_ring(
