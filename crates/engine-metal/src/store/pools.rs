@@ -1648,6 +1648,13 @@ impl Pools {
         self.pool.read(offset, into)
     }
 
+    /// `from` written at `offset` of the pool's buffer, on the host; for a
+    /// test that lays bytes it then reads back.
+    #[cfg(test)]
+    pub fn write_span(&mut self, offset: u64, from: &[u8]) -> Result<()> {
+        self.pool.write(offset, from)
+    }
+
     /// Backs the range's top `bytes` for a fire's carve ([`Pool::cover`]).
     pub fn cover(&mut self, bytes: u64) -> Result<()> {
         self.pool.cover(bytes)

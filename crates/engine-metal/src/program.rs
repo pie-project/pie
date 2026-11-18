@@ -1645,16 +1645,18 @@ mod tests {
     /// Fires the cut over `values` (stored as bf16), with the registration's
     /// kernels of `dropped` kinds left out (so a region takes a later form:
     /// grouped without its streamed kernel, fused without either), returning
-    /// the mask and the fire's wall time.
+    /// the mask, the fire's wall time, and whether the bytes past the
+    /// instance's value scratch (a canary laid before the timed fire) are
+    /// as laid: no kernel of the stage wrote past its lane's scratch.
     fn fire_cut(
         values: &[f32],
         cut: Cut,
         dropped: &[eta_compiler::codegen::program::KernelKind],
-    ) -> (Vec<bool>, std::time::Duration) {
+    ) -> (Vec<bool>, std::time::Duration, bool) {
         use crate::store::Pools;
         let vocab = u32::try_from(values.len()).expect("a vocabulary");
         let context = Context::bind().expect("a Metal 4 device");
-        let pools = Pools::guests_only(&context, 64 << 20, 4).expect("a pool");
+        let mut pools = Pools::guests_only(&context, 64 << 20, 4).expect("a pool");
         let mut plane = Plane::new();
         // One lane fires: the most a fire of this test flies.
         plane.set_flight(1, 1, 1);
@@ -1697,6 +1699,27 @@ mod tests {
         let _ = plane.instance_mut(id).expect("bound").take(mask).expect("the take");
         let (channel, seed) = &seeds[0];
         plane.instance_mut(id).expect("bound").publish(*channel, seed).expect("the reseed");
+        // The canary: up to 64 KiB past the instance's scratch, in its
+        // buffer.
+        // The pool is placement sparse: the canary is written and read
+        // through its host runs, by its offset in the pool.
+        let canary = {
+            let bound = plane.instances.get(&id).expect("bound");
+            let at = bound.scratch.first().expect("its scratch").clone();
+            let piece = pools
+                .guest_pieces(&bound.scratch_place)
+                .expect("its pieces")
+                .into_iter()
+                .find(|piece| at.offset >= piece.local && at.offset < piece.local + piece.bytes)
+                .expect("its scratch's piece");
+            let program = plane.programs.get(&program).expect("registered");
+            let bytes = session::Session::scratch_for(&program.compiled, &bound.extents)
+                .expect("its scratch's bytes");
+            let from = piece.global + (at.offset - piece.local) + bytes;
+            let laid: Vec<u8> = (0..64u64 << 10).map(|i| (i as u8) ^ 0xA5).collect();
+            (from, laid)
+        };
+        pools.write_span(canary.0, &canary.1).expect("the canary");
         let began = std::time::Instant::now();
         let fired = plane.fire(&context, id, Attach::Epilogue).expect("the stage fires");
         let took = began.elapsed();
@@ -1713,7 +1736,10 @@ mod tests {
             .iter()
             .map(|word| i32::from_le_bytes(*word) != 0)
             .collect();
-        (mask, took)
+        let (from, laid) = canary;
+        let mut now = vec![0u8; laid.len()];
+        pools.read_span(from, &mut now).expect("the canary's read");
+        (mask, took, now == laid)
     }
 
     /// Probabilities from a seeded generator, `spread` deciding how flat:
@@ -1757,7 +1783,7 @@ mod tests {
             ("fused", &[KernelKind::Streamed, KernelKind::Grouped][..]),
         ] {
             for (values, cut) in &cases {
-                let (got, _) = fire_cut(values, *cut, dropped);
+                let (got, _, _) = fire_cut(values, *cut, dropped);
                 let want = reference(values, *cut);
                 assert_eq!(
                     got.iter().filter(|&&t| t).count(),
@@ -1780,6 +1806,86 @@ mod tests {
         );
     }
 
+    /// Top-k and top-p over short vectors, under what a streamed select
+    /// (`select_count` x 51,200 B) or a streamed top-k (`rows` x (2,072 +
+    /// 12 x 1,024) B) keeps in its temporaries: the whole-value rule alone
+    /// sized those areas at 16 B an element, so the kernel wrote past its
+    /// lane's temporary into what lay next. The stage's temporary now takes
+    /// what each region's emitter publishes it needs
+    /// (`eta_exec::stage_temporaries`), and every form cuts as its rule
+    /// names.
+    #[test]
+    fn a_cut_over_a_short_vector_keeps_within_its_temporaries() {
+        use eta_compiler::codegen::program::KernelKind;
+        for vocab in [16usize, 64, 255, 900] {
+            let values = distribution(vocab, 0.05, vocab as u64);
+            let mut cuts = vec![Cut::P(0.5), Cut::P(0.9), Cut::P(1.0)];
+            cuts.extend([1i32, 7, vocab as i32 / 2, vocab as i32].map(Cut::K));
+            for (form, dropped) in [
+                ("streamed", &[][..]),
+                ("grouped", &[KernelKind::Streamed][..]),
+                ("fused", &[KernelKind::Streamed, KernelKind::Grouped][..]),
+            ] {
+                for cut in &cuts {
+                    let (got, _, kept) = fire_cut(&values, *cut, dropped);
+                    assert_eq!(got, reference(&values, *cut), "{form} {cut:?} over {vocab}");
+                    assert!(kept, "{form} {cut:?} over {vocab}: it wrote past its scratch");
+                }
+            }
+        }
+    }
+
+    /// Each streamed region's published temporary need is what its kernel
+    /// lays: a top-p's or top-k's selects end at the fixed bytes it
+    /// publishes (the last select's state starts one select below them).
+    #[test]
+    fn each_streamed_region_publishes_the_temporaries_its_kernel_lays() {
+        use eta_compiler::codegen::program::KernelKind;
+        let context = Context::bind().expect("a Metal 4 device");
+        let mut plane = Plane::new();
+        for cut in [Cut::P(0.9), Cut::K(7)] {
+            let (registration, ..) = select_registration(64, cut);
+            let program = plane.register(&context, &registration).expect("registers");
+            let compiled = &plane.programs.get(&program).expect("registered").compiled;
+            let mut streamed = 0;
+            for (stage, plan) in compiled.plans.iter().enumerate() {
+                let regions = &compiled.stages[stage].regions;
+                let needs = launch::temporary_needs(plan, regions);
+                for (region, need) in regions
+                    .iter()
+                    .filter(|region| region.form == compile::Form::Streamed)
+                    .zip(needs)
+                {
+                    streamed += 1;
+                    let source = &registration
+                        .emitted_kernels
+                        .iter()
+                        .find(|kernel| {
+                            kernel.kind == KernelKind::Streamed
+                                && kernel.stage_index as usize == stage
+                                && kernel.region_index == region.region_index
+                        })
+                        .expect("its streamed kernel")
+                        .source;
+                    // Top-p and top-k alike are selects (a pivot threshold
+                    // by mass or by rank) in this program.
+                    assert!(need.above_whole && need.fixed > 0, "{cut:?}: {need:?}");
+                    assert_eq!(need.fixed % 51_200, 0, "{need:?}");
+                    let last = need.fixed - 51_200;
+                    assert!(
+                        source.contains(&format!("temporary + {last}u")),
+                        "{cut:?}: the last select"
+                    );
+                    assert!(
+                        !source.contains(&format!("temporary + {}u", need.fixed)),
+                        "{cut:?}: no select past the need"
+                    );
+                }
+            }
+            assert!(streamed > 0, "{cut:?}: a streamed region");
+        }
+    }
+
     /// A flat distribution's nucleus of ~10^4 and ~10^5 tokens over a
     /// 151,936-token vocabulary: the cut's time, printed (the select once
     /// walked a token at a time past 3 x 1024 candidates).
@@ -1789,7 +1895,7 @@ mod tests {
         for (spread, label) in [(1.0e-4f64, "~10^4"), (1.0e-6, "~10^5")] {
             let values = distribution(vocab, spread, 9);
             let want = reference(&values, Cut::P(0.95));
-            let (got, took) = fire_cut(&values, Cut::P(0.95), &[]);
+            let (got, took, _) = fire_cut(&values, Cut::P(0.95), &[]);
             let taken = got.iter().filter(|&&t| t).count();
             let running = running_sum_reference(&values, 0.95).iter().filter(|&&t| t).count();
             eprintln!(
